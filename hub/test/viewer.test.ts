@@ -427,4 +427,46 @@ describe('viewer', () => {
     const res = await viewerRoute(new Request(url.toString()), url, { ENVIRONMENT: 'production' } as Env);
     expect(res.status).toBe(403);
   });
+
+  it('gates the preview viewer behind the DEV_AUTH bearer (publicly reachable previews)', async () => {
+    const url = new URL('https://sessions.vza.net/');
+    const previewEnv = { ...testEnv, ENVIRONMENT: 'preview', DEV_AUTH: 'preview-secret-123' } as unknown as Env;
+
+    // No header → 401.
+    const noHeader = await viewerRoute(new Request(url.toString()), url, previewEnv);
+    expect(noHeader.status).toBe(401);
+
+    // Wrong bearer → 401.
+    const wrong = await viewerRoute(
+      new Request(url.toString(), { headers: { authorization: 'Bearer nope' } }),
+      url,
+      previewEnv,
+    );
+    expect(wrong.status).toBe(401);
+
+    // Correct bearer → the page serves.
+    const ok = await viewerRoute(
+      new Request(url.toString(), { headers: { authorization: 'Bearer preview-secret-123' } }),
+      url,
+      previewEnv,
+    );
+    expect(ok.status).toBe(200);
+    expect(await ok.text()).toContain('Recent sessions');
+
+    // Missing/empty DEV_AUTH secret denies even with a bearer header.
+    const noSecret = { ...testEnv, ENVIRONMENT: 'preview', DEV_AUTH: undefined } as unknown as Env;
+    const denied = await viewerRoute(
+      new Request(url.toString(), { headers: { authorization: 'Bearer preview-secret-123' } }),
+      url,
+      noSecret,
+    );
+    expect(denied.status).toBe(401);
+  });
+
+  it('leaves the development viewer open (never publicly reachable)', async () => {
+    const url = new URL('https://sessions.vza.net/');
+    const devEnv = { ...testEnv, ENVIRONMENT: 'development' } as unknown as Env;
+    const res = await viewerRoute(new Request(url.toString()), url, devEnv);
+    expect(res.status).toBe(200);
+  });
 });

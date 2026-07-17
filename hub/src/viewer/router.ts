@@ -1,11 +1,13 @@
+import { previewBearerOk } from '../auth/identity';
 import { blobEndpoint } from './blob';
 import { machinesPage } from './machines';
 import { searchPage } from './search';
 import { sessionPage } from './session';
 
 /**
- * Host-routed viewer. Auth (passkeys) lands in M3; until then production is closed
- * and dev/preview is open so the UI can be exercised without credentials.
+ * Host-routed viewer. Auth (passkeys) lands in M3; until then production is closed. Local development is
+ * open (never publicly reachable). PR previews ARE publicly reachable and bind real -preview D1/R2, so they
+ * require the same DEV_AUTH bearer the API uses — otherwise anyone with the preview URL could read transcripts.
  */
 export async function viewerRoute(request: Request, url: URL, env: Env): Promise<Response> {
   if (env.ENVIRONMENT === 'production') {
@@ -13,6 +15,9 @@ export async function viewerRoute(request: Request, url: URL, env: Env): Promise
       status: 403,
       headers: { 'content-type': 'text/plain; charset=utf-8' },
     });
+  }
+  if (env.ENVIRONMENT === 'preview' && !previewBearerOk(request, env)) {
+    return new Response('unauthorized', { status: 401, headers: { 'content-type': 'text/plain; charset=utf-8' } });
   }
   if (request.method !== 'GET') return new Response('method not allowed', { status: 405 });
 

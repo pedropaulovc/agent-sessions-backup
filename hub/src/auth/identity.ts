@@ -4,6 +4,15 @@ export type Identity =
   | { kind: 'anonymous' };
 
 /**
+ * PR previews (Workers Builds) are publicly reachable and bind real -preview D1/R2, so both the API
+ * and the viewer gate on a shared secret there. A missing/empty DEV_AUTH secret denies rather than
+ * silently trusting the request. Used by machineIdentity() and the viewer router.
+ */
+export function previewBearerOk(request: Request, env: Env): boolean {
+  return !!env.DEV_AUTH && request.headers.get('authorization') === `Bearer ${env.DEV_AUTH}`;
+}
+
+/**
  * Resolve the caller of a machine-API request.
  *
  * Production: Cloudflare mTLS — cert must be verified at the edge (WAF blocks
@@ -37,10 +46,7 @@ export async function machineIdentity(request: Request, env: Env): Promise<Ident
 
   if (env.ENVIRONMENT === 'development') return devHeaderIdentity(request, env);
 
-  if (env.ENVIRONMENT === 'preview') {
-    const auth = request.headers.get('authorization');
-    if (env.DEV_AUTH && auth === `Bearer ${env.DEV_AUTH}`) return devHeaderIdentity(request, env);
-  }
+  if (env.ENVIRONMENT === 'preview' && previewBearerOk(request, env)) return devHeaderIdentity(request, env);
 
   // 'production', or any unrecognized/missing value — fail closed.
   return { kind: 'anonymous' };
