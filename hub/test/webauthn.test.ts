@@ -19,6 +19,32 @@ const okDeps = {
   verifyAuthentication: async () => ({ verified: true, authenticationInfo: { newCounter: 7 } }),
 } as unknown as WebAuthnDeps;
 
+// Deps whose crypto step throws, as SimpleWebAuthn does on malformed authenticator data.
+const throwingDeps = {
+  verifyRegistration: async () => {
+    throw new Error('malformed authenticator data');
+  },
+  verifyAuthentication: async () => {
+    throw new Error('malformed authenticator data');
+  },
+} as unknown as WebAuthnDeps;
+
+/** okDeps that also records the options object each verifier was called with. */
+function capturingDeps(): { deps: WebAuthnDeps; calls: { reg?: { requireUserVerification?: boolean }; auth?: { requireUserVerification?: boolean } } } {
+  const calls: { reg?: { requireUserVerification?: boolean }; auth?: { requireUserVerification?: boolean } } = {};
+  const deps = {
+    verifyRegistration: async (opts: { requireUserVerification?: boolean }) => {
+      calls.reg = opts;
+      return { verified: true, registrationInfo: { credential: { id: 'cred-1', publicKey: new Uint8Array([1, 2, 3, 4]), counter: 0, transports: ['internal'] } } };
+    },
+    verifyAuthentication: async (opts: { requireUserVerification?: boolean }) => {
+      calls.auth = opts;
+      return { verified: true, authenticationInfo: { newCounter: 7 } };
+    },
+  } as unknown as WebAuthnDeps;
+  return { deps, calls };
+}
+
 function post(path: string, body: unknown, origin = VIEWER, cookie?: string): Request {
   const headers: Record<string, string> = { 'content-type': 'application/json', origin };
   if (cookie) headers.cookie = cookie;
@@ -52,6 +78,7 @@ describe('passkey auth', () => {
   // Storage persists across tests in a file; each case controls its own credential count.
   beforeEach(async () => {
     await testEnv.DB.prepare('DELETE FROM credentials').run();
+    await testEnv.DB.prepare('DELETE FROM webauthn_challenges').run();
   });
 
   it('bootstraps the first passkey with the SETUP_TOKEN when zero credentials exist', async () => {
@@ -155,5 +182,104 @@ describe('passkey auth', () => {
     const res = await SELF.fetch(`${VIEWER}/login`);
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('text/html');
+  });
+
+  it('rejects a ceremony on a non-viewer host in preview, but allows it on VIEWER_HOST', async () => {
+    const preview = { ...testEnv, ENVIRONMENT: 'preview' } as Env;
+
+    // Alternate host (e.g. the workers.dev preview URL): 403, so it can't mint a
+    // credential scoped to the wrong rpID and brick setup on the real viewer host.
+    const alt = 'https://sessions-hub.workers.dev';
+    const altReq = new Request(`${alt}/webauthn/register/options`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: alt },
+      body: JSON.stringify({ setup: SETUP }),
+    });
+    const altRes = await webauthnRoute(altReq, new URL(altReq.url), preview, okDeps);
+    expect(altRes?.status).toBe(403);
+    expect(await altRes!.json()).toEqual({ error: 'bad_host' });
+
+    // Same preview env on the pinned viewer host: passes the gate and reaches auth logic.
+    const okReq = post('/webauthn/register/options', { setup: SETUP });
+    const okRes = await webauthnRoute(okReq, new URL(okReq.url), preview, okDeps);
+    expect(okRes?.status).toBe(200);
+  });
+
+  it('allows a ceremony on localhost in development (host fallback for wrangler dev)', async () => {
+    const local = 'http://localhost:8787';
+    const req = new Request(`${local}/webauthn/register/options`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', origin: local },
+      body: JSON.stringify({ setup: SETUP }),
+    });
+    // testEnv.ENVIRONMENT === 'development'
+    const res = await webauthnRoute(req, new URL(req.url), testEnv, okDeps);
+    expect(res?.status).toBe(200);
+  });
+
+  it('closes the pre-minted-challenge race: a second setup verify is rejected and does not enroll', async () => {
+    // Two option calls while the table is empty — both mint valid register challenges.
+    const c1 = ((await (await call(post('/webauthn/register/options', { setup: SETUP }))).json()) as { challenge: string }).challenge;
+    const c2 = ((await (await call(post('/webauthn/register/options', { setup: SETUP }))).json()) as { challenge: string }).challenge;
+    expect(c1).not.toBe(c2);
+
+    const first = await call(post('/webauthn/register/verify', fakeResponse(c1, 'webauthn.create')), okDeps);
+    expect(first.status).toBe(200);
+
+    // The second pre-minted challenge is still consumable, but the atomic insert guard
+    // (WHERE COUNT(*)=0) refuses to enroll a second unauthenticated credential.
+    const second = await call(post('/webauthn/register/verify', fakeResponse(c2, 'webauthn.create')), okDeps);
+    expect(second.status).toBe(403);
+    expect(await second.json()).toEqual({ error: 'setup_disabled' });
+
+    const count = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM credentials').first<{ n: number }>();
+    expect(count?.n).toBe(1);
+  });
+
+  it('returns 400 (not 500) when the registration verifier throws on malformed data', async () => {
+    const { challenge } = (await (await call(post('/webauthn/register/options', { setup: SETUP }))).json()) as { challenge: string };
+    const res = await call(post('/webauthn/register/verify', fakeResponse(challenge, 'webauthn.create')), throwingDeps);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'verification_failed' });
+  });
+
+  it('returns 400 (not 500) when the authentication verifier throws on malformed data', async () => {
+    await insertCredential('cred-1');
+    const { challenge } = (await (await call(post('/webauthn/auth/options', {}))).json()) as { challenge: string };
+    const res = await call(post('/webauthn/auth/verify', fakeResponse(challenge, 'webauthn.get')), throwingDeps);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'verification_failed' });
+  });
+
+  it('single-uses an auth challenge in D1 (a replayed verify fails)', async () => {
+    await insertCredential('cred-1');
+    const { challenge } = (await (await call(post('/webauthn/auth/options', {}))).json()) as { challenge: string };
+    const first = await call(post('/webauthn/auth/verify', fakeResponse(challenge, 'webauthn.get')), okDeps);
+    expect(first.status).toBe(200);
+    const replay = await call(post('/webauthn/auth/verify', fakeResponse(challenge, 'webauthn.get')), okDeps);
+    expect(replay.status).toBe(400);
+    expect(await replay.json()).toEqual({ error: 'bad_challenge' });
+  });
+
+  it('requires user verification in both options and enforces it in both verifiers', async () => {
+    const regOpt = (await (await call(post('/webauthn/register/options', { setup: SETUP }))).json()) as {
+      challenge: string;
+      authenticatorSelection?: { userVerification?: string };
+    };
+    expect(regOpt.authenticatorSelection?.userVerification).toBe('required');
+
+    const cap = capturingDeps();
+    const rv = await call(post('/webauthn/register/verify', fakeResponse(regOpt.challenge, 'webauthn.create')), cap.deps);
+    expect(rv.status).toBe(200);
+    expect(cap.calls.reg?.requireUserVerification).toBe(true);
+
+    const authOpt = (await (await call(post('/webauthn/auth/options', {}))).json()) as {
+      challenge: string;
+      userVerification?: string;
+    };
+    expect(authOpt.userVerification).toBe('required');
+    const av = await call(post('/webauthn/auth/verify', fakeResponse(authOpt.challenge, 'webauthn.get')), cap.deps);
+    expect(av.status).toBe(200);
+    expect(cap.calls.auth?.requireUserVerification).toBe(true);
   });
 });

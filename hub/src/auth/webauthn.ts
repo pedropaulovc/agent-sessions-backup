@@ -1,21 +1,25 @@
 /**
  * Passkey (WebAuthn) auth for the viewer host.
  *
- * ## rpID / origin derivation
- * WebAuthn binds a credential to an rpID (a registrable-domain suffix of the page
- * origin) and verifies the assertion's origin server-side. We derive BOTH from the
- * incoming request URL — `rpID = url.hostname`, `expectedOrigin = url.origin` — rather
- * than from env.VIEWER_HOST. Why:
- *   - The viewer is host-routed: the router only reaches here for the viewer host, so
- *     on a real request `url.hostname` IS the viewer host. Deriving from the request
- *     therefore matches production exactly.
- *   - In `wrangler dev` the page is served from localhost:8787, and under the vitest
- *     workers pool it is served from the test host (sessions.vza.net via SELF). A
- *     hardcoded VIEWER_HOST would disagree with the browser's actual origin and every
- *     ceremony would fail the origin check. The browser already refuses to mint or
- *     offer a credential whose rpID isn't a suffix of the page origin, so trusting the
- *     request hostname adds no attack surface: a forged Host on some other domain can
- *     only produce credentials scoped to that other domain, never to the viewer's.
+ * ## rpID / origin derivation — pinned to VIEWER_HOST outside development
+ * WebAuthn binds a credential to an rpID (a registrable-domain suffix of the page origin)
+ * and verifies the assertion's origin server-side.
+ *
+ * In production/preview we pin BOTH to `env.VIEWER_HOST` (`rpID = VIEWER_HOST`,
+ * `origin = https://VIEWER_HOST`) and 403 every `/webauthn/*` ceremony whose
+ * `url.hostname` isn't the viewer host. The worker is reachable on non-API hostnames too
+ * (the router sends every host other than `env.API_HOST` to the viewer, and the zone
+ * routes are still commented in wrangler.jsonc), so deriving the rpID from `url.hostname`
+ * would let a first setup on an alternate host — e.g. the `*.workers.dev` preview URL —
+ * mint the sole credential scoped to the WRONG rpID. Because credentials are counted
+ * globally, that bricks setup on the real viewer host (`sessions.vza.net`), where the
+ * alternate-host passkey can't be offered, until the DB is manually cleaned up. Pinning
+ * the ceremony host closes that lockout.
+ *
+ * In development (`ENVIRONMENT === 'development'`) we keep the `url.hostname` / `url.origin`
+ * fallback: `wrangler dev` serves from localhost:8787 and the vitest workers pool serves
+ * from the test host, and a hardcoded VIEWER_HOST would disagree with the browser's actual
+ * origin and fail every origin check.
  */
 
 import {
@@ -56,8 +60,15 @@ interface CredentialRow {
   transports: string | null;
 }
 
-function rp(url: URL): { rpID: string; origin: string } {
-  return { rpID: url.hostname, origin: url.origin };
+/** True when this host is allowed to run a passkey ceremony (pinned to VIEWER_HOST outside dev). */
+function ceremonyHostOk(url: URL, env: Env): boolean {
+  if (env.ENVIRONMENT === 'development') return true;
+  return url.hostname === env.VIEWER_HOST;
+}
+
+function rp(url: URL, env: Env): { rpID: string; origin: string } {
+  if (env.ENVIRONMENT === 'development') return { rpID: url.hostname, origin: url.origin };
+  return { rpID: env.VIEWER_HOST, origin: `https://${env.VIEWER_HOST}` };
 }
 
 async function countCredentials(env: Env): Promise<number> {
@@ -78,13 +89,29 @@ function challengeOf(response: { response: { clientDataJSON: string } }): string
   return clientData.challenge;
 }
 
-/** Read + delete (single-use) a stored challenge of the expected kind. */
+/** Persist a single-use challenge in D1, pruning any that have already expired. */
+async function storeChallenge(env: Env, challenge: string, kind: 'register' | 'auth'): Promise<void> {
+  const now = Date.now();
+  await env.DB.prepare('DELETE FROM webauthn_challenges WHERE expires_at <= ?1').bind(now).run();
+  await env.DB.prepare(
+    'INSERT INTO webauthn_challenges (challenge, kind, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)',
+  )
+    .bind(challenge, kind, now, now + CHALLENGE_TTL * 1000)
+    .run();
+}
+
+/**
+ * Atomically consume (delete) a stored challenge of the expected kind. D1 serializes
+ * writes, so `changes === 1` is a strongly-consistent single-use signal: concurrent
+ * verifies can't both win, and a replay after consumption finds nothing to delete.
+ */
 async function consumeChallenge(env: Env, challenge: string, kind: 'register' | 'auth'): Promise<boolean> {
-  const key = `chal:${challenge}`;
-  const raw = await env.KV.get(key);
-  if (!raw) return false;
-  await env.KV.delete(key);
-  return raw === kind;
+  const result = await env.DB.prepare(
+    'DELETE FROM webauthn_challenges WHERE challenge = ?1 AND kind = ?2 AND expires_at > ?3',
+  )
+    .bind(challenge, kind, Date.now())
+    .run();
+  return result.meta.changes === 1;
 }
 
 /** Dispatch the viewer's auth surface. Returns null for paths it does not own. */
@@ -104,6 +131,10 @@ export async function webauthnRoute(
     const clear = await destroySession(request, env);
     return new Response(null, { status: 302, headers: { location: '/login', 'set-cookie': clear } });
   }
+
+  // Pin every credential ceremony to the viewer host so an alternate host (e.g. the
+  // workers.dev preview URL) can't mint the sole credential scoped to the wrong rpID.
+  if (path.startsWith('/webauthn/') && !ceremonyHostOk(url, env)) return json({ error: 'bad_host' }, 403);
 
   if (path === '/webauthn/register/options' && request.method === 'POST') return registerOptions(request, url, env);
   if (path === '/webauthn/register/verify' && request.method === 'POST') return registerVerify(request, url, env, deps);
@@ -130,7 +161,7 @@ async function registerOptions(request: Request, url: URL, env: Env): Promise<Re
   const setup = body.setup ?? url.searchParams.get('setup');
   if (!(await authorizeRegistration(request, env, setup))) return json({ error: 'forbidden' }, 403);
 
-  const { rpID } = rp(url);
+  const { rpID } = rp(url, env);
   const existing = await env.DB.prepare('SELECT credential_id, transports FROM credentials').all<{
     credential_id: string;
     transports: string | null;
@@ -146,45 +177,78 @@ async function registerOptions(request: Request, url: URL, env: Env): Promise<Re
       id: c.credential_id,
       transports: parseTransports(c.transports),
     })),
-    authenticatorSelection: { residentKey: 'preferred', userVerification: 'preferred' },
+    // UV required: the viewer's ONLY factor is the passkey, so a possession-only
+    // (user-presence) authenticator must not be enrolled or accepted.
+    authenticatorSelection: { residentKey: 'preferred', userVerification: 'required' },
   });
 
-  await env.KV.put(`chal:${options.challenge}`, 'register', { expirationTtl: CHALLENGE_TTL });
+  await storeChallenge(env, options.challenge, 'register');
   return json(options);
 }
 
 async function registerVerify(request: Request, url: URL, env: Env, deps: WebAuthnDeps): Promise<Response> {
   if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
   const response = (await request.json()) as RegistrationResponseJSON;
-  const { rpID, origin } = rp(url);
+  const { rpID, origin } = rp(url, env);
+
+  // An authenticated session skips the setup guard (owner adding another device); the
+  // setup-token path is only for the first credential and is enforced atomically below.
+  const authorized = (await readSession(request, env)) !== null;
 
   const challenge = challengeOf(response);
   if (!(await consumeChallenge(env, challenge, 'register'))) return json({ error: 'bad_challenge' }, 400);
 
-  const verification = await deps.verifyRegistration({
-    response,
-    expectedChallenge: challenge,
-    expectedOrigin: origin,
-    expectedRPID: rpID,
-    requireUserVerification: false,
-  });
+  // SimpleWebAuthn throws on malformed authenticator data / bad attestation. This is a
+  // public unauthenticated surface, so a throw must surface as a 400, never a 500.
+  let verification;
+  try {
+    verification = await deps.verifyRegistration({
+      response,
+      expectedChallenge: challenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
+      // UV required: reject an enrollment whose authenticator didn't verify the user.
+      requireUserVerification: true,
+    });
+  } catch {
+    return json({ error: 'verification_failed' }, 400);
+  }
   if (!verification.verified || !verification.registrationInfo) return json({ verified: false }, 400);
 
   const cred = verification.registrationInfo.credential;
-  await env.DB.prepare(
+  const transports = cred.transports ? JSON.stringify(cred.transports) : null;
+
+  if (authorized) {
+    await env.DB.prepare(
+      `INSERT INTO credentials (credential_id, user_id, public_key, counter, transports, last_used_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+       ON CONFLICT (credential_id) DO UPDATE SET counter = excluded.counter`,
+    )
+      .bind(cred.id, OWNER, cred.publicKey, cred.counter, transports)
+      .run();
+    return json({ verified: true });
+  }
+
+  // Setup-token path: re-check the credential count AT INSERT TIME, atomically. D1
+  // serializes writes, so a conditional `INSERT ... SELECT ... WHERE COUNT(*)=0` closes
+  // the race where two challenges were minted while the table was empty — the second
+  // insert lands 0 rows and we report setup_disabled instead of silently enrolling a
+  // second unauthenticated credential.
+  const result = await env.DB.prepare(
     `INSERT INTO credentials (credential_id, user_id, public_key, counter, transports, last_used_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-     ON CONFLICT (credential_id) DO UPDATE SET counter = excluded.counter`,
+     SELECT ?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+     WHERE (SELECT COUNT(*) FROM credentials) = 0`,
   )
-    .bind(cred.id, OWNER, cred.publicKey, cred.counter, cred.transports ? JSON.stringify(cred.transports) : null)
+    .bind(cred.id, OWNER, cred.publicKey, cred.counter, transports)
     .run();
+  if (result.meta.changes === 0) return json({ error: 'setup_disabled' }, 403);
 
   return json({ verified: true });
 }
 
 async function authOptions(request: Request, url: URL, env: Env): Promise<Response> {
   if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
-  const { rpID } = rp(url);
+  const { rpID } = rp(url, env);
   const creds = await env.DB.prepare('SELECT credential_id, transports FROM credentials').all<{
     credential_id: string;
     transports: string | null;
@@ -192,21 +256,22 @@ async function authOptions(request: Request, url: URL, env: Env): Promise<Respon
 
   const options = await generateAuthenticationOptions({
     rpID,
-    userVerification: 'preferred',
+    // UV required: possession alone must not mint the viewer's only auth factor.
+    userVerification: 'required',
     allowCredentials: creds.results.map((c) => ({
       id: c.credential_id,
       transports: parseTransports(c.transports),
     })),
   });
 
-  await env.KV.put(`chal:${options.challenge}`, 'auth', { expirationTtl: CHALLENGE_TTL });
+  await storeChallenge(env, options.challenge, 'auth');
   return json(options);
 }
 
 async function authVerify(request: Request, url: URL, env: Env, deps: WebAuthnDeps): Promise<Response> {
   if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
   const response = (await request.json()) as AuthenticationResponseJSON;
-  const { rpID, origin } = rp(url);
+  const { rpID, origin } = rp(url, env);
 
   const challenge = challengeOf(response);
   if (!(await consumeChallenge(env, challenge, 'auth'))) return json({ error: 'bad_challenge' }, 400);
@@ -218,19 +283,27 @@ async function authVerify(request: Request, url: URL, env: Env, deps: WebAuthnDe
     .first<CredentialRow>();
   if (!row) return json({ error: 'unknown_credential' }, 400);
 
-  const verification = await deps.verifyAuthentication({
-    response,
-    expectedChallenge: challenge,
-    expectedOrigin: origin,
-    expectedRPID: rpID,
-    requireUserVerification: false,
-    credential: {
-      id: row.credential_id,
-      publicKey: new Uint8Array(row.public_key),
-      counter: row.counter,
-      transports: parseTransports(row.transports),
-    },
-  });
+  // SimpleWebAuthn throws on bad signatures, counter regressions, or decode errors. This
+  // is a public unauthenticated surface, so a throw must surface as a 400, never a 500.
+  let verification;
+  try {
+    verification = await deps.verifyAuthentication({
+      response,
+      expectedChallenge: challenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
+      // UV required: possession alone must not mint the viewer's only auth factor.
+      requireUserVerification: true,
+      credential: {
+        id: row.credential_id,
+        publicKey: new Uint8Array(row.public_key),
+        counter: row.counter,
+        transports: parseTransports(row.transports),
+      },
+    });
+  } catch {
+    return json({ error: 'verification_failed' }, 400);
+  }
   if (!verification.verified) return json({ verified: false }, 400);
 
   await env.DB.prepare(
