@@ -77,8 +77,15 @@ echo "$DEPLOY_OUT"
 GATEWAY_URL=$(printf '%s\n' "$DEPLOY_OUT" | grep -oE 'https://sessions-telemetry-gateway\.[a-z0-9-]+\.workers\.dev' | head -1 || true)
 GATEWAY_URL="${GATEWAY_URL:-https://sessions-telemetry-gateway.pedro-18e.workers.dev}"
 
+# Write to a fresh temp file created under umask 077, then mv it over the target.
+# umask only governs the mode of NEWLY created files, so a bare `> "$ENV_FILE"`
+# onto a pre-existing 0644 cf-observability.env would leave the bearer
+# world-readable. The temp-then-mv guarantees 0600 regardless of any prior file,
+# and the mv is atomic so no reader ever sees a half-written secret.
 mkdir -p "$(dirname "$ENV_FILE")"
-(umask 077; cat > "$ENV_FILE" <<EOF
+ENV_TMP=$(mktemp "${TMPDIR:-/tmp}/agent-backup-cfobs.XXXXXX")
+chmod 600 "$ENV_TMP"
+(umask 077; cat > "$ENV_TMP" <<EOF
 # Cloudflare account-level observability destinations — MANUAL DASHBOARD STEP.
 # Written by infra/cf/deploy-gateway.sh. GITIGNORED (infra/out/) — contains the
 # INGEST_BEARER secret; never commit. Account-level observability destinations
@@ -106,6 +113,7 @@ GATEWAY_LOGS_ENDPOINT=$GATEWAY_URL/v1/logs
 GATEWAY_TRACES_ENDPOINT=$GATEWAY_URL/v1/traces
 EOF
 )
+mv "$ENV_TMP" "$ENV_FILE"
 
 echo ""
 echo "Deployed $GATEWAY_URL"

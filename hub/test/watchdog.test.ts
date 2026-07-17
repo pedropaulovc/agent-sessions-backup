@@ -55,7 +55,20 @@ describe('watchdog', () => {
     expect(ages.map((e) => e.machine).sort()).toEqual(['amet-linux', 'win-host']);
     expect(ages.find((e) => e.machine === 'win-host')?.age_seconds).toBe(700000);
     expect(events.find((e) => e.event === 'hub.d1.db_size_bytes')?.bytes).toBe(123456);
+    const run = events.find((e) => e.event === 'hub.watchdog.run');
+    expect(run?.machine_count).toBe(2);
     expect(events.some((e) => e.event === 'hub.watchdog.warn')).toBe(false);
+  });
+
+  it('emits the hub.watchdog.run beacon and no heartbeat_age rows on an empty roster', async () => {
+    const events = captureLogs();
+    await runWatchdog(makeEnv({ machines: [], size: { bytes: 4096 } }));
+    // Liveness beacon present even with zero machines — a fresh deploy before any
+    // enrollment must not read as a dead pipeline (missed-heartbeat.kql keys its
+    // pipeline-silent leg on this event's absence, not on missing ages).
+    const run = events.find((e) => e.event === 'hub.watchdog.run');
+    expect(run?.machine_count).toBe(0);
+    expect(events.some((e) => e.event === 'hub.machine.heartbeat_age')).toBe(false);
   });
 
   it('emits a bytes:-1 sentinel + warn when the size probe throws', async () => {

@@ -19,27 +19,36 @@
 // needed (provision.sh's default window covers it).
 //
 // Pipeline-dead detection (the other half of "dead-man"): if the gateway, the
-// observability export destination, or the watchdog itself stops delivering
-// logs, the 30m window has NO hub.machine.heartbeat_age rows at all — a bare
-// stale-machine query would then return zero rows and provision.sh's
-// `count > 0` rule would read that outage as HEALTHY. So we union in a synthetic
-// `__pipeline_silent__` row whenever the window is empty, making pipeline
-// silence fire the same single alert (the email's machine value says which
-// case: a real machine_id vs. __pipeline_silent__). NOTE: this means the alert
-// also fires until the account-level observability destinations are wired and
-// sessions-hub is redeployed to export (see infra/cf/telemetry.md) — which is
-// correct, the pipeline genuinely isn't delivering telemetry until then.
+// observability export destination, or the watchdog cron itself stops delivering
+// logs, the 30m window has NO watchdog output at all — a bare stale-machine
+// query would then return zero rows and provision.sh's `count > 0` rule would
+// read that outage as HEALTHY. So we union in a synthetic `__pipeline_silent__`
+// row whenever the window contains no `hub.watchdog.run` beacon.
+//
+// Crucially the silence check keys on the `hub.watchdog.run` BEACON, not on the
+// count of heartbeat_age rows: the watchdog emits the beacon every run even with
+// an empty machine roster, so a fresh deploy before any machine enrols (a
+// legitimate live state) stays quiet instead of false-paging. The beacon is
+// absent only when the cron/gateway/export path is genuinely dead.
+//
+// The email's machine value says which case fired: a real machine_id (stale
+// collector) vs. __pipeline_silent__ (telemetry pipeline down). NOTE: the
+// pipeline_silent row does fire until the account-level observability
+// destinations are wired and sessions-hub is redeployed to export (see
+// infra/cf/telemetry.md) — correct, telemetry genuinely isn't flowing until then.
 
-let ages = OTelLogs
+let stale_machines = OTelLogs
     | where TimeGenerated > ago(30m)
     | extend body = todynamic(Body)
     | where body.event == "hub.machine.heartbeat_age"
-    | extend machine = tostring(body.machine), age_seconds = tolong(body.age_seconds);
-let stale_machines = ages
+    | extend machine = tostring(body.machine), age_seconds = tolong(body.age_seconds)
     | summarize arg_max(TimeGenerated, age_seconds) by machine
     | where age_seconds > 72 * 3600
     | project machine, age_seconds;
-let pipeline_silent = ages
+let pipeline_silent = OTelLogs
+    | where TimeGenerated > ago(30m)
+    | extend body = todynamic(Body)
+    | where body.event == "hub.watchdog.run"
     | summarize n = count()
     | where n == 0
     | project machine = "__pipeline_silent__", age_seconds = tolong(-1);

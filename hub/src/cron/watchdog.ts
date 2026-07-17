@@ -7,6 +7,14 @@
 // age every 15 minutes. infra/azure/alerts/missed-heartbeat.kql thresholds on
 // the latest emitted age per machine (age > 72h) over a short scan window.
 //
+// It ALSO emits an unconditional `hub.watchdog.run` beacon every run (even with
+// zero enrolled machines). That beacon — not the presence of per-machine ages —
+// is what missed-heartbeat.kql's pipeline-silent leg keys on: a fresh deploy
+// with an empty roster is a legitimate live state, so liveness must be signalled
+// independently of roster contents or the alert false-pages until the first
+// machine enrolls. Absence of the beacon means the cron/gateway/export path
+// itself is dead (the real dead-man condition).
+//
 // Why not an absence JOIN over raw hub.heartbeat events instead: Azure
 // scheduled-query rules cap `overrideQueryTimeRange` at 2880 min (48h), which is
 // shorter than the 72h heartbeat tolerance — a machine silent >48h would fall
@@ -23,28 +31,40 @@ interface MachineAgeRow {
 }
 
 export async function runWatchdog(env: Env): Promise<void> {
+  // Roster read is guarded so a D1 failure doesn't suppress the liveness beacon
+  // below — an alive-but-D1-degraded hub should still read as "pipeline alive"
+  // (the roster failure surfaces as its own warn), not as a dead pipeline.
   // COALESCE(last_seen_at, created_at): a machine enrolled but never heard from
   // still gets an age (from enrollment), so a collector that never came up is
   // caught by the same alert rather than being invisible.
-  const rows = await env.DB.prepare(
-    `SELECT machine_id,
-            COALESCE(last_seen_at, created_at) AS last_ref,
-            CAST((julianday('now') - julianday(COALESCE(last_seen_at, created_at))) * 86400 AS INTEGER) AS age_seconds
-     FROM machines`,
-  ).all<MachineAgeRow>();
+  let machineCount = 0;
+  try {
+    const rows = await env.DB.prepare(
+      `SELECT machine_id,
+              COALESCE(last_seen_at, created_at) AS last_ref,
+              CAST((julianday('now') - julianday(COALESCE(last_seen_at, created_at))) * 86400 AS INTEGER) AS age_seconds
+       FROM machines`,
+    ).all<MachineAgeRow>();
+    machineCount = rows.results.length;
 
-  for (const m of rows.results) {
-    console.log(
-      JSON.stringify({
-        event: 'hub.machine.heartbeat_age',
-        machine: m.machine_id,
-        age_seconds: m.age_seconds,
-        last_seen_at: m.last_ref,
-      }),
-    );
+    for (const m of rows.results) {
+      console.log(
+        JSON.stringify({
+          event: 'hub.machine.heartbeat_age',
+          machine: m.machine_id,
+          age_seconds: m.age_seconds,
+          last_seen_at: m.last_ref,
+        }),
+      );
+    }
+  } catch (e) {
+    console.log(JSON.stringify({ event: 'hub.watchdog.warn', tag: 'machines-roster-unavailable', error: String(e) }));
   }
 
-  console.log(JSON.stringify({ event: 'hub.watchdog', machines: rows.results.length }));
+  // Unconditional liveness beacon (see the header). Emitted regardless of roster
+  // size or a roster-read failure — its mere presence in the window tells
+  // missed-heartbeat.kql the pipeline is alive.
+  console.log(JSON.stringify({ event: 'hub.watchdog.run', machine_count: machineCount }));
 
   // D1 size gauge (plan wants an alert at ~7 GB). If the PRAGMA-backed
   // table-valued functions aren't available on D1 (or return nothing), emit an
