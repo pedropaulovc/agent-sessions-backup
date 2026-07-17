@@ -117,11 +117,22 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
 def _process_item(cfg, st: State, transport: Transport, scanner: Scanner, item: ScanItem) -> ItemResult:
     row = st.get_file(item.store, item.relpath)
     # Fast path: identical size+mtime and last upload succeeded -> no hash, no upload.
-    if row and row.size == item.size and row.mtime_ns == item.mtime_ns and row.status == "ok":
+    # SQLite snapshots are EXCLUDED from the fast path: a WAL commit can change DB content
+    # while the main file's size+mtime stay identical, so we always snapshot+hash and let
+    # hash-idempotency below skip the upload when the (deterministic) snapshot is unchanged.
+    if (not item.is_snapshot and row and row.size == item.size
+            and row.mtime_ns == item.mtime_ns and row.status == "ok"):
         st.touch_seen(item.store, item.relpath)
         return ItemResult(changed=False)
 
-    data = read_exact(item.source_path, item.size)
+    try:
+        data = read_exact(item.source_path, item.size)
+    except OSError as e:
+        # File vanished/changed perms between scan and read: record and keep going.
+        if row:
+            st.upsert_file(row.store, row.relpath, row.size, row.mtime_ns, row.sha256,
+                           "error", error=f"read failed: {e}")
+        return ItemResult(error=f"{item.relpath}: read failed: {e}")
     sha = hash_bytes(data)
 
     if row and row.sha256 == sha and row.status == "ok":
@@ -196,11 +207,19 @@ def _do_backfill(cfg, st: State, concurrency: int, dry_run: bool) -> int:
     transport = Transport(build_auth(cfg), parallel_max=concurrency)
     scanner = Scanner(cfg.effective_excludes())
     records: list[BackfillRecord] = []
+    read_errors: list[dict] = []
     try:
         processed = 0
         for store, root in cfg.store_roots().items():
             for item in scanner.scan_store(store, root):
-                data = read_exact(item.source_path, item.size)
+                try:
+                    data = read_exact(item.source_path, item.size)
+                except OSError as e:
+                    read_errors.append({
+                        "level": "error", "code": "read_failed",
+                        "message": f"{item.relpath}: {e}"[:500], "count": 1, "store": store,
+                    })
+                    continue
                 sha = hash_bytes(data)
                 body_path = _materialize(scanner, data)
                 records.append(BackfillRecord(store, item.relpath, sha, len(data),
@@ -214,6 +233,9 @@ def _do_backfill(cfg, st: State, concurrency: int, dry_run: bool) -> int:
     finally:
         scanner.close()
 
+    if read_errors:
+        st.buffer_events(read_errors)  # surfaced on the next run's heartbeat
+    summary["read_errors"] = len(read_errors)
     print(json.dumps(summary))
     return 0
 

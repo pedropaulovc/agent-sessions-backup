@@ -49,6 +49,19 @@ def test_load_missing_raises(tmp_path):
         config.load(tmp_path / "nope.toml")
 
 
+def test_sqlite_sidecar_excludes_match_full_filenames():
+    from agent_collector.scanner import path_matches
+    for pat in ("*-wal", "*-shm", "*-journal"):
+        assert pat in config.DEFAULT_EXCLUDES
+    # Real sidecars append to the FULL filename, not just *.sqlite-*.
+    assert path_matches("state.db-wal", "*-wal")
+    assert path_matches("cache.vscdb-shm", "*-shm")
+    assert path_matches("foo.db-journal", "*-journal")
+    assert path_matches("todos.sqlite-wal", "*-wal")
+    # the DB itself is NOT excluded by these
+    assert not path_matches("todos.sqlite", "*-wal")
+
+
 def test_effective_excludes_extends_defaults(tmp_path):
     path = tmp_path / "config.toml"
     config.enroll("http://x", dev=True, path=path, machine_id="m1")

@@ -5,9 +5,10 @@ DevAuth adds the x-dev-machine header; MtlsAuth raises NotImplementedError for n
 
 Backfill fast path (upload_batch): one curl invocation per 50 URLs using a --config file
 of `--next`-separated request blocks, run with `--parallel --parallel-max N`. Bodies are
-discarded (output=/dev/null) and a global `-w "%{url_effective} %{http_code}\\n"` prints one
-self-describing status line per transfer, so ordering under --parallel doesn't matter: we
-map url -> code. Any ambiguous/failed line falls back to a sequential retrying put().
+discarded (output=/dev/null) and a PER-BLOCK `write-out "%{url_effective} %{http_code}\\n"`
+prints one self-describing status line per transfer (a global -w only fires for the first
+transfer under --parallel), so ordering doesn't matter: we map url -> code. Any
+ambiguous/failed line falls back to a sequential retrying put().
 """
 
 from __future__ import annotations
@@ -21,6 +22,14 @@ from pathlib import Path
 
 BACKOFF = (0.5, 2.0, 8.0)
 BATCH_SIZE = 50
+
+# Timeouts so one stuck transfer can never hold the overlap lock forever.
+CONNECT_TIMEOUT = 10          # seconds to establish the connection
+MAX_TIME = 600                # seconds for a single transfer (curl --max-time)
+SUBPROCESS_MARGIN = 30        # subprocess timeout sits this far above curl's own bound
+
+# HTTP statuses worth retrying (transient); everything else 4xx is permanent.
+RETRY_STATUSES = frozenset({408, 429})
 
 
 class AuthStrategy:
@@ -53,11 +62,12 @@ class MtlsAuth(AuthStrategy):
 
 
 def _retryable(returncode: int, status: int) -> bool:
-    if returncode != 0:
-        return True  # curl network-level failure
-    if status == 429:
-        return True
-    return 500 <= status < 600
+    # A parsed HTTP status is authoritative: --fail-with-body exits nonzero (rc 22) on any
+    # 4xx, but a permanent 4xx must NOT be retried. Only fall back to returncode when there
+    # is no HTTP response at all (status 0 = connection/network failure).
+    if status:
+        return status in RETRY_STATUSES or 500 <= status < 600
+    return returncode != 0
 
 
 def _split_status(stdout: str) -> tuple[int, str]:
@@ -80,10 +90,22 @@ class Transport:
     def curl_available(curl: str = "curl") -> bool:
         return shutil.which(curl) is not None
 
+    # Common flags on every single-transfer curl call: fail-with-body for 4xx/5xx, the
+    # http_code writeout, and the connect/transfer timeouts.
+    _COMMON = (
+        "-sS", "--fail-with-body", "-w", "\n%{http_code}",
+        "--connect-timeout", str(CONNECT_TIMEOUT), "--max-time", str(MAX_TIME),
+    )
+
     def _run(self, argv: list[str]) -> tuple[int, int, str]:
-        proc = subprocess.run(
-            [self.curl, *argv], capture_output=True, text=True
-        )
+        try:
+            proc = subprocess.run(
+                [self.curl, *argv], capture_output=True, text=True,
+                timeout=MAX_TIME + SUBPROCESS_MARGIN,
+            )
+        except subprocess.TimeoutExpired:
+            # Belt above curl's own --max-time: treat as a network failure (status 0).
+            return 124, 0, "curl subprocess timed out"
         status, body = _split_status(proc.stdout)
         return proc.returncode, status, body
 
@@ -99,13 +121,10 @@ class Transport:
         return status, body
 
     def get(self, url: str) -> tuple[int, str]:
-        return self._run_retry(
-            ["-sS", "--fail-with-body", "-w", "\n%{http_code}", url]
-        )
+        return self._run_retry([*self._COMMON, url])
 
     def put(self, url: str, body_path: Path, headers: dict[str, str]) -> tuple[int, str]:
-        argv = ["-sS", "--fail-with-body", "-w", "\n%{http_code}",
-                "--upload-file", str(body_path)]
+        argv = [*self._COMMON, "--upload-file", str(body_path)]
         for k, v in headers.items():
             argv += ["-H", f"{k}: {v}"]
         argv += self.auth.curl_args()
@@ -117,7 +136,7 @@ class Transport:
             json.dump(obj, f)
             body_file = f.name
         try:
-            argv = ["-sS", "--fail-with-body", "-w", "\n%{http_code}", "-X", "POST",
+            argv = [*self._COMMON, "-X", "POST",
                     "-H", "content-type: application/json",
                     "--data-binary", f"@{body_file}"]
             for k, v in (headers or {}).items():
@@ -149,6 +168,8 @@ class Transport:
                 f'upload-file = "{up.body_path}"',
                 'output = "/dev/null"',
                 'write-out = "%{url_effective} %{http_code}\\n"',
+                f"connect-timeout = {CONNECT_TIMEOUT}",
+                f"max-time = {MAX_TIME}",
             ]
             for k, v in up.headers.items():
                 block.append(f'header = "{k}: {v}"')
@@ -162,12 +183,19 @@ class Transport:
         with tempfile.NamedTemporaryFile("w", suffix=".curl", delete=False) as f:
             f.write(config_text)
             cfg_path = f.name
+        # Each transfer is bounded by max-time; the whole batch runs in waves of
+        # parallel_max, so bound the subprocess above the worst-case wall time.
+        waves = -(-len(chunk) // max(self.parallel_max, 1))
+        batch_timeout = waves * MAX_TIME + SUBPROCESS_MARGIN
         try:
             proc = subprocess.run(
                 [self.curl, "-sS", "--parallel", "--parallel-max",
                  str(self.parallel_max), "--config", cfg_path],
-                capture_output=True, text=True,
+                capture_output=True, text=True, timeout=batch_timeout,
             )
+        except subprocess.TimeoutExpired:
+            # Whole batch is unknown; caller retries each url sequentially via put().
+            return {up.url: 0 for up in chunk}
         finally:
             Path(cfg_path).unlink(missing_ok=True)
 

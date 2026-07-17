@@ -82,3 +82,36 @@ def test_get_healthz(hub):
 def test_mtls_auth_not_implemented():
     with pytest.raises(NotImplementedError):
         MtlsAuth("tpm").curl_args()
+
+
+def test_permanent_4xx_not_retried(tmp_path, hub, monkeypatch):
+    # If backoff were entered, this would sleep; keep it fast so a regression is obvious.
+    monkeypatch.setattr(transport_mod, "BACKOFF", (0.01, 0.01, 0.01))
+    t = Transport(DevAuth("m1"))
+    body, _real = _write_body(tmp_path, "b1", b"payload")
+    # Declared hash != actual body -> hub returns a permanent 400.
+    status, _ = _put(t, hub, "m1", "claude", "a.jsonl", body, "0" * 64)
+    assert status == 400
+    assert hub.put_attempts == 1  # exactly one attempt, no retry on 4xx
+
+
+def test_timeout_flags_present():
+    assert "--connect-timeout" in Transport._COMMON
+    assert "--max-time" in Transport._COMMON
+
+
+def test_subprocess_timeout_maps_to_status_zero(monkeypatch):
+    def boom(*a, **k):
+        raise transport_mod.subprocess.TimeoutExpired(cmd="curl", timeout=1)
+    monkeypatch.setattr(transport_mod.subprocess, "run", boom)
+    rc, status, _body = Transport(DevAuth("m1"))._run(["-sS", "http://127.0.0.1:1/x"])
+    assert status == 0 and rc != 0  # no HTTP response -> treated as network failure
+
+
+def test_retryable_decides_from_status_alone():
+    # rc 22 (curl --fail-with-body on 4xx) must NOT retry a permanent 400/404.
+    assert transport_mod._retryable(22, 400) is False
+    assert transport_mod._retryable(22, 404) is False
+    assert transport_mod._retryable(22, 429) is True
+    assert transport_mod._retryable(0, 503) is True
+    assert transport_mod._retryable(7, 0) is True   # no HTTP response -> network failure

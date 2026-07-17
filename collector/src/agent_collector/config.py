@@ -29,8 +29,14 @@ DEFAULT_EXCLUDES: list[str] = [
     ".last-cleanup",
     "statsig/**",
     "telemetry/**",
-    "*.sqlite-wal",
-    "*.sqlite-shm",
+    # SQLite sidecars append to the FULL filename (state.db-wal, cache.vscdb-shm,
+    # foo-journal), not just *.sqlite-*; match generically. False positives are
+    # implausible in ~/.claude and ~/.codex, and the DB itself is still captured
+    # (snapshotted). The snapshot reads committed WAL content, so change detection
+    # sees sidecar writes even though the sidecars are never uploaded.
+    "*-wal",
+    "*-shm",
+    "*-journal",
     "*.lock",
     "ide/**",
     "shell-snapshots/**",

@@ -20,6 +20,8 @@ class FakeHub:
         self.files: dict[tuple[str, str, str], dict] = {}
         self.heartbeats: list[dict] = []
         self.checks: list[dict] = []
+        self.put_attempts = 0
+        self.post_attempts = 0
         self.flaky_500_remaining = 0
         self.flaky_methods = {"PUT", "POST"}
         self._server: ThreadingHTTPServer | None = None
@@ -85,6 +87,7 @@ def _make_handler(hub: FakeHub):
             return self._json(404, {"error": "not_found"})
 
         def do_PUT(self):
+            hub.put_attempts += 1
             body = self._read_body()
             if hub._should_fail("PUT"):
                 return self._json(500, {"error": "flaky"})
@@ -118,6 +121,7 @@ def _make_handler(hub: FakeHub):
             return self._json(201, {"status": "stored"})
 
         def do_POST(self):
+            hub.post_attempts += 1
             body = self._read_body()
             if hub._should_fail("POST"):
                 return self._json(500, {"error": "flaky"})

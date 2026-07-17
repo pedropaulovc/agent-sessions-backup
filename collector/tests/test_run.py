@@ -1,11 +1,13 @@
 import hashlib
 import json
 import os
+import sqlite3
 import types
 
 import pytest
 
 from agent_collector import config, run as run_mod
+from agent_collector.scanner import Scanner, ScanItem
 from agent_collector.state import State, OverlapLock
 from agent_collector.transport import Transport, DevAuth
 
@@ -107,6 +109,27 @@ def test_backfill_uses_check_and_uploads_only_missing(tmp_path, hub):
     assert hub.files[("m1", "claude", "b.jsonl")]["body"] == b"needs upload"
 
 
+def test_backfill_read_error_skips_file_and_continues(tmp_path, hub, monkeypatch):
+    root = tmp_path / "claude"
+    root.mkdir()
+    (root / "a.jsonl").write_text("boom")
+    (root / "b.jsonl").write_text("ok")
+    cfg = _cfg(hub, root)
+    real_read = run_mod.read_exact
+
+    def flaky_read(path, size):
+        if path.name == "a.jsonl":
+            raise PermissionError("chmodded after scan")
+        return real_read(path, size)
+
+    monkeypatch.setattr(run_mod, "read_exact", flaky_read)
+    with State(tmp_path / "state.db") as st:
+        run_mod._do_backfill(cfg, st, concurrency=2, dry_run=False)
+        assert st.pending_event_count() == 1  # read error buffered for next heartbeat
+    assert ("m1", "claude", "b.jsonl") in hub.files
+    assert ("m1", "claude", "a.jsonl") not in hub.files
+
+
 def test_backfill_dry_run_uploads_nothing(tmp_path, hub):
     root = tmp_path / "claude"
     root.mkdir()
@@ -115,6 +138,86 @@ def test_backfill_dry_run_uploads_nothing(tmp_path, hub):
     with State(tmp_path / "state.db") as st:
         run_mod._do_backfill(cfg, st, concurrency=2, dry_run=True)
     assert hub.files == {}
+
+
+def test_snapshot_item_never_fast_paths_on_identical_metadata(tmp_path, hub):
+    # Regression for the P1: a DB snapshot whose (size, mtime_ns) are IDENTICAL to state
+    # but whose content changed (WAL commit) must still upload. is_snapshot skips the fast
+    # path and re-hashes; hash-idempotency then decides.
+    cfg = _cfg(hub, tmp_path / "claude")
+    transport = Transport(DevAuth("m1"))
+    scanner = Scanner([])
+    snap = tmp_path / "snap.sqlite"
+    key = ("m1", "claude", "todos.sqlite")
+    try:
+        with State(tmp_path / "state.db") as st:
+            snap.write_bytes(b"X" * 100)
+            item1 = ScanItem("claude", "todos.sqlite", 100, 555, snap, True)
+            run_mod._process_item(cfg, st, transport, scanner, item1)
+            sha1 = hub.files[key]["sha256"]
+
+            # Content changes but size (100) and mtime_ns (555) stay identical.
+            snap.write_bytes(b"Y" * 100)
+            item2 = ScanItem("claude", "todos.sqlite", 100, 555, snap, True)
+            res = run_mod._process_item(cfg, st, transport, scanner, item2)
+    finally:
+        scanner.close()
+    assert res.uploaded is True
+    assert hub.files[key]["sha256"] != sha1
+
+
+def test_wal_db_commit_reuploaded(tmp_path, hub):
+    root = tmp_path / "claude"
+    root.mkdir()
+    db = root / "todos.sqlite"
+    writer = sqlite3.connect(db)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("CREATE TABLE t(x)")
+    writer.execute("INSERT INTO t VALUES('a')")
+    writer.commit()
+    cfg = _cfg(hub, root)
+    key = ("m1", "claude", "todos.sqlite")
+    try:
+        with State(tmp_path / "state.db") as st:
+            run_mod._do_run(cfg, st)
+            sha_a = hub.files[key]["sha256"]
+            writer.execute("INSERT INTO t VALUES('b')")
+            writer.commit()
+            with State(tmp_path / "state.db") as st2:
+                run_mod._do_run(cfg, st2)
+    finally:
+        writer.close()
+    assert hub.files[key]["sha256"] != sha_a  # changed DB re-snapshotted and uploaded
+    # the uploaded snapshot is a valid DB reflecting the new row
+    out = tmp_path / "out.sqlite"
+    out.write_bytes(hub.files[key]["body"])
+    conn = sqlite3.connect(out)
+    assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 2
+    conn.close()
+
+
+def test_read_race_records_error_and_continues(tmp_path, hub, monkeypatch):
+    root = tmp_path / "claude"
+    root.mkdir()
+    (root / "a.jsonl").write_text("vanishes")
+    (root / "b.jsonl").write_text("survives")
+    cfg = _cfg(hub, root)
+
+    real_read = run_mod.read_exact
+
+    def flaky_read(path, size):
+        if path.name == "a.jsonl":
+            raise FileNotFoundError("gone between scan and read")
+        return real_read(path, size)
+
+    monkeypatch.setattr(run_mod, "read_exact", flaky_read)
+    with State(tmp_path / "state.db") as st:
+        rc = run_mod._do_run(cfg, st)
+    assert rc == 0  # run completed despite the read failure
+    assert ("m1", "claude", "b.jsonl") in hub.files      # other file still uploaded
+    assert ("m1", "claude", "a.jsonl") not in hub.files
+    events = hub.heartbeats[-1]["events"]
+    assert any("read failed" in e["message"] for e in events)
 
 
 def test_run_lock_prevents_overlap(tmp_path, hub, tmp_env, monkeypatch):

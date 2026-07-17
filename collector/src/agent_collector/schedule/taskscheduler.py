@@ -21,21 +21,26 @@ def _script_path() -> Path:
     return config_mod.config_dir() / "agent-collector-task.ps1"
 
 
-def _exec_start() -> str:
+def _action_parts() -> tuple[str, str]:
+    """(-Execute, -Argument): the executable path only, then its arguments separately.
+
+    Never fold arguments into -Execute — Task Scheduler treats -Execute as a single
+    program path. Paths with spaces are safe inside the single-quoted PS literal.
+    """
     exe = shutil.which("agent-collector")
     if exe:
-        return exe
-    return f'"{sys.executable}" -m agent_collector.cli'
+        return exe, "run --once"
+    return sys.executable, "-m agent_collector.cli run --once"
 
 
 def _install_script(interval: int) -> str:
-    cmd = _exec_start()
+    execute, argument = _action_parts()
     return (
-        f"$action = New-ScheduledTaskAction -Execute '{cmd}' -Argument 'run --once'\n"
+        f"$action = New-ScheduledTaskAction -Execute '{execute}' -Argument '{argument}'\n"
         f"$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) "
-        f"-RepetitionInterval (New-TimeSpan -Minutes {interval})\n"
-        "$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable "
+        f"-RepetitionInterval (New-TimeSpan -Minutes {interval}) "
         "-RandomDelay (New-TimeSpan -Minutes 5)\n"
+        "$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable\n"
         f"Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $action "
         "-Trigger $trigger -Settings $settings -Force\n"
     )

@@ -80,6 +80,11 @@ def hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+# SQLite-family databases we snapshot rather than read live. _snapshot_sqlite falls back
+# to a raw read if the file is not actually a valid DB, so this list can be liberal.
+DB_SUFFIXES = (".sqlite", ".sqlite3", ".db", ".vscdb")
+
+
 class Scanner:
     def __init__(self, excludes: list[str]):
         self.excludes = excludes
@@ -120,7 +125,7 @@ class Scanner:
             st = path.stat()
         except OSError:
             return None
-        if path.name.endswith(".sqlite"):
+        if path.name.endswith(DB_SUFFIXES):
             self._snap_seq += 1
             dst = self.tmp_root / f"snap-{self._snap_seq}.sqlite"
             if _snapshot_sqlite(path, dst):
