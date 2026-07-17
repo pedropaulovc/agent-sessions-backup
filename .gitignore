@@ -1,0 +1,14 @@
+node_modules/
+.wrangler/
+dist/
+*.log
+.dev.vars
+.env
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+collector/.coverage
+infra/out/
+.DS_Store

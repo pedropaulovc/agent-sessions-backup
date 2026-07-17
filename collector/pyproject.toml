@@ -1,0 +1,19 @@
+[project]
+name = "agent-collector"
+version = "0.1.0"
+description = "Per-machine collector: incremental session-file uploads, heartbeats, web capture"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+agent-collector = "agent_collector.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_collector"]

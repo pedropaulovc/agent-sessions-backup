@@ -1,0 +1,46 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sessions-hub",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "limits": { "cpu_ms": 300000 },
+  // Zone routes activated in M3 once the vza.net zone is verified:
+  // "routes": [
+  //   { "pattern": "api.sessions.vza.net/*", "zone_name": "vza.net" },
+  //   { "pattern": "sessions.vza.net/*", "zone_name": "vza.net" }
+  // ],
+  "vars": {
+    "ENVIRONMENT": "development",
+    "API_HOST": "api.sessions.vza.net",
+    "VIEWER_HOST": "sessions.vza.net"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "sessions-index",
+      "database_id": "placeholder-until-m3",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [{ "binding": "RAW", "bucket_name": "agent-sessions-raw" }],
+  "kv_namespaces": [{ "binding": "KV", "id": "placeholder-until-m3" }],
+  "queues": {
+    "producers": [{ "binding": "PARSE_QUEUE", "queue": "parse" }],
+    "consumers": [
+      {
+        "queue": "parse",
+        "max_batch_size": 5,
+        "max_retries": 3,
+        "max_concurrency": 2,
+        "dead_letter_queue": "parse-dlq"
+      }
+    ]
+  },
+  "triggers": { "crons": ["*/15 * * * *", "30 4 * * *"] },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+  // secrets: SETUP_TOKEN (passkey bootstrap), CF_API_TOKEN (cert renewal)
+}
