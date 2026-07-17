@@ -235,18 +235,30 @@ function extractUsage(msg: Record<string, unknown>, requestId?: string): TurnUsa
   };
 }
 
-/** Walk the parentUuid chain back from the last message; everything on it is the main path. */
+/**
+ * Resolve each turn's main-path membership. Only user/assistant turns carrying a uuid participate in the
+ * parentUuid branching structure, so only they can be "rewound" (off the main path). System turns — and any
+ * turn with no uuid — are not branch points; they always stay on the main path (dropping/dimming them would be
+ * wrong). Among the branch candidates, the main path is the parentUuid chain walked back from the last
+ * user/assistant message; every other branch candidate is an abandoned branch.
+ */
 function markMainPath(turns: NormalizedTurn[], lastUuid: string | undefined): void {
-  if (!lastUuid) return;
-  const byId = new Map<string, NormalizedTurn>();
-  for (const t of turns) if (t.id) byId.set(t.id, t);
-  let cursor: string | undefined = lastUuid;
-  let guard = turns.length + 1;
-  while (cursor && guard-- > 0) {
-    const turn = byId.get(cursor);
-    if (!turn) break;
-    turn.onMainPath = true;
-    cursor = turn.parentId;
+  const onChain = new Set<string>();
+  if (lastUuid) {
+    const byId = new Map<string, NormalizedTurn>();
+    for (const t of turns) if (t.id) byId.set(t.id, t);
+    let cursor: string | undefined = lastUuid;
+    let guard = turns.length + 1;
+    while (cursor && guard-- > 0) {
+      const turn = byId.get(cursor);
+      if (!turn) break;
+      onChain.add(cursor);
+      cursor = turn.parentId;
+    }
+  }
+  for (const t of turns) {
+    const branchCandidate = t.id !== undefined && (t.role === 'user' || t.role === 'assistant');
+    t.onMainPath = !branchCandidate || onChain.has(t.id!);
   }
 }
 

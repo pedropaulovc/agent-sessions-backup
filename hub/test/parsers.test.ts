@@ -7,6 +7,7 @@ import {
   CODEX_SESSION_ID,
   ccAssistantLine,
   ccNoiseLines,
+  ccSystemLine,
   ccUserLine,
   codexLines,
   toStream,
@@ -104,6 +105,21 @@ describe('parseClaudeCode', () => {
     expect(byText('abandoned').onMainPath).toBe(false);
     expect(byText('rewind winner').onMainPath).toBe(true);
     expect(byText('first question').onMainPath).toBe(true);
+  });
+
+  it('keeps non-branching system turns on the main path (not rewound, not hidden)', async () => {
+    const lines = [
+      ccUserLine({ uuid: 'u1', text: 'first question' }),
+      // A system turn that is NOT linked into the user/assistant parentUuid chain.
+      ccSystemLine(CC_SESSION_ID, { uuid: 'sys1', text: 'system reminder, not a branch' }),
+      ccAssistantLine({ uuid: 'a1', parentUuid: 'u1', text: 'the answer' }),
+    ];
+    const s = await parseClaudeCode(readJsonlLines(toStream(lines)), CC_SESSION_ID);
+    const system = s.turns.find((t) => t.role === 'system')!;
+    expect(system).toBeTruthy();
+    // Even though the last-message chain (a1 → u1) never reaches it, it stays main-path.
+    expect(system.onMainPath).toBe(true);
+    expect(s.turns.every((t) => t.onMainPath)).toBe(true);
   });
 
   it('caps oversized blocks and flags truncation', async () => {

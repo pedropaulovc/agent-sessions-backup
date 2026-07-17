@@ -330,9 +330,14 @@ function fmtNum(n: number | null): string {
   return (n ?? 0).toLocaleString('en-US');
 }
 
-/** Cache-busting version token for blob URLs: first 12 hex of the canonical file's content hash. */
+/**
+ * Cache-busting version token for blob URLs: first 12 hex of the canonical file's content hash.
+ * Only a real sha-256 qualifies — reindex stores the literal 'unknown' for checksum-less R2 objects,
+ * which must NOT mint a stable token (it would pin different bytes to one immutable-cached URL). An empty
+ * token leaves the blob response revalidatable (no-cache) so later reindexes always refetch.
+ */
 export function blobVersionOf(contentHash: string | null | undefined): string {
-  return contentHash ? contentHash.slice(0, 12) : '';
+  return contentHash && /^[0-9a-f]{64}$/i.test(contentHash) ? contentHash.slice(0, 12) : '';
 }
 
 function blobUrl(sessionId: string, blockId: number, version: string): string {

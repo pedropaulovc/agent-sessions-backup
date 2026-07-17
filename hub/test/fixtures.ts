@@ -247,6 +247,20 @@ export function ccLine(sessionId: string, o: CcLineOpts): string {
   return JSON.stringify(envelope);
 }
 
+/** A Claude Code `type:"system"` envelope — carries text via top-level `content`, not linked into the uuid chain. */
+export function ccSystemLine(sessionId: string, o: { uuid?: string; text: string; ts?: string }): string {
+  return JSON.stringify({
+    type: 'system',
+    content: o.text,
+    cwd: '/home/tester/src/demo',
+    sessionId,
+    version: '2.1.99',
+    gitBranch: 'main',
+    ...(o.uuid ? { uuid: o.uuid } : {}),
+    timestamp: o.ts ?? '2026-07-01T10:00:03.000Z',
+  });
+}
+
 /** Linear alternating user/assistant chain of `turns` turns — all on the main path. */
 export function ccLinearSession(sessionId: string, turns: number): string {
   const lines: string[] = [];

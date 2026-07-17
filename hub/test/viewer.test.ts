@@ -2,7 +2,8 @@ import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import worker from '../src/index';
 import { viewerRoute } from '../src/viewer/router';
-import { ccLine, ccLinearSession, TINY_PNG_B64 } from './fixtures';
+import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures';
+import { blobVersionOf } from '../src/viewer/session';
 
 const testEnv = env as unknown as Env;
 
@@ -11,6 +12,8 @@ const BIG_SESSION = 'bbbbbbbb-2222-4222-8222-222222222222';
 const LONG_SESSION = 'cccccccc-3333-4333-8333-333333333333';
 const BLOB_SESSION = 'dddddddd-4444-4444-8444-444444444444';
 const REWIND_SESSION = 'eeeeeeee-5555-4555-8555-555555555555';
+const SYSTEM_SESSION = 'ffffffff-6666-4666-8666-666666666666';
+const UNVER_SESSION = '99999999-7777-4777-8777-777777777777';
 
 // Hostile transcript payloads: an SVG with inline script and an HTML "document".
 const SVG_XSS_B64 = btoa('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>');
@@ -136,6 +139,20 @@ describe('viewer', () => {
     expect(rewindRes.status).toBe(201);
     rewindFileId = ((await rewindRes.json()) as { file_id: number }).file_id;
     rewindR2Key = `raw/testbox-wsl/claude-projects/${rewindRelpath}`;
+
+    // u1 → a1 with an unlinked system turn in the middle (not part of the parentUuid chain).
+    const systemContent = [
+      ccLine(SYSTEM_SESSION, { uuid: 'u1', parentUuid: null, role: 'user', text: 'user asks something' }),
+      ccSystemLine(SYSTEM_SESSION, { uuid: 'sys1', text: 'SYSTEMREMINDER injected context' }),
+      ccLine(SYSTEM_SESSION, { uuid: 'a1', parentUuid: 'u1', role: 'assistant', text: 'assistant answers' }),
+    ].join('\n');
+    expect((await putFile('claude-projects', `-home-tester-src-demo/${SYSTEM_SESSION}.jsonl`, systemContent)).status).toBe(201);
+
+    expect(
+      (await putFile('claude-projects', `-home-tester-src-demo/${UNVER_SESSION}.jsonl`,
+        ccLine(UNVER_SESSION, { uuid: 'v1', parentUuid: null, role: 'user', image: { mediaType: 'image/png', data: TINY_PNG_B64 } }),
+      )).status,
+    ).toBe(201);
 
     await drainQueue();
   });
@@ -297,6 +314,51 @@ describe('viewer', () => {
     const ok = await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}/blob/${block!.id}?v=${v}`);
     expect(ok.status).toBe(200);
     expect(ok.headers.get('cache-control')).toContain('immutable');
+  });
+
+  it('keeps an unlinked system turn visible in effective view and undimmed in chronological', async () => {
+    const chrono = await (await SELF.fetch(`https://sessions.vza.net/s/${SYSTEM_SESSION}?view=chronological`)).text();
+    expect(chrono).toContain('SYSTEMREMINDER');
+    // The system turn's <article> must not carry the rewound class.
+    expect(chrono).toMatch(/<article[^>]*class="turn system"/);
+    expect(chrono).not.toMatch(/<article[^>]*class="turn system[^"]*rewound"/);
+
+    const effective = await (await SELF.fetch(`https://sessions.vza.net/s/${SYSTEM_SESSION}?view=effective`)).text();
+    expect(effective).toContain('SYSTEMREMINDER'); // not hidden
+  });
+
+  it('blobVersionOf tokenizes real sha-256 hashes and rejects unknown/short values', () => {
+    const validHash = 'a'.repeat(64);
+    expect(blobVersionOf(validHash)).toBe('aaaaaaaaaaaa');
+    expect(blobVersionOf(validHash).length).toBe(12);
+    expect(blobVersionOf('unknown')).toBe('');
+    expect(blobVersionOf('')).toBe('');
+    expect(blobVersionOf(null)).toBe('');
+    expect(blobVersionOf('xyz')).toBe('');
+    expect(blobVersionOf('g'.repeat(64))).toBe(''); // non-hex
+  });
+
+  it('serves a checksum-less blob revalidatable (no immutable, no redirect loop)', async () => {
+    // Simulate admin reindex having stored 'unknown' for an object R2 could not checksum.
+    await testEnv.DB.prepare(
+      `UPDATE files SET content_hash = 'unknown'
+       WHERE id = (SELECT canonical_file_id FROM sessions WHERE session_id = ?1)`,
+    )
+      .bind(UNVER_SESSION)
+      .run();
+
+    // The renderer must not mint a ?v= token for it.
+    const html = await (await SELF.fetch(`https://sessions.vza.net/s/${UNVER_SESSION}`)).text();
+    const m = html.match(new RegExp(`/s/${UNVER_SESSION}/blob/(\\d+)("|\\?)`));
+    expect(m).toBeTruthy();
+    expect(html).not.toContain('?v=unknown');
+    expect(html).not.toMatch(new RegExp(`/s/${UNVER_SESSION}/blob/\\d+\\?v=`));
+
+    // Versionless fetch: served directly (no redirect) but revalidatable, never immutable.
+    const res = await SELF.fetch(`https://sessions.vza.net/s/${UNVER_SESSION}/blob/${m![1]}`, { redirect: 'manual' });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('cache-control')).toBe('no-cache');
+    expect(res.headers.get('cache-control')).not.toContain('immutable');
   });
 
   it('blob endpoint round-trips a base64 png', async () => {
