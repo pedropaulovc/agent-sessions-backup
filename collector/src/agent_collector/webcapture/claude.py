@@ -1,9 +1,11 @@
-"""claude.ai capture: resolve the org -> list conversations -> fetch changed ones as raw trees.
+"""claude.ai capture: resolve the orgs -> list conversations -> fetch changed ones as raw trees.
 
-Uses the in-page CDP fetch (cookies included): /api/organizations to find the org and detect an
-expired login, {org}/chat_conversations to page the list by updated_at, and each changed
-conversation with ?tree=True&rendering_mode=raw so the full branch tree + unrendered content
-blocks are staged verbatim for the hub to parse.
+Uses the in-page CDP fetch (cookies included): /api/organizations to find EVERY chat-capable org
+and detect an expired login, {org}/chat_conversations to page each org's list by updated_at, and
+each changed conversation with ?tree=True&rendering_mode=raw so the full branch tree + unrendered
+content blocks are staged verbatim for the hub to parse. A Claude account can belong to multiple
+workspaces, so all of them are captured (conversation uuids are globally unique, so the per-conv
+watermark needs no org key).
 """
 
 from __future__ import annotations
@@ -20,12 +22,20 @@ BASE = "https://claude.ai"
 def capture_claude(transport: CdpTransport, state, staging_root: Path, events: list[dict]) -> CaptureResult:
     res = CaptureResult(product="claude")
 
-    org_id = _resolve_org(transport)
-    if org_id is None:
+    org_ids = _resolve_orgs(transport)
+    if not org_ids:
         res.logged_in = False
         events.append(login_expired_event("claude"))
         return res
 
+    staging_root.mkdir(parents=True, exist_ok=True)
+    for org_id in org_ids:
+        _capture_org(transport, state, staging_root, events, org_id, res)
+    return res
+
+
+def _capture_org(transport: CdpTransport, state, staging_root: Path, events: list[dict], org_id: str, res: CaptureResult) -> None:
+    """List + fetch one org's changed conversations, accumulating into `res`."""
     status, body = transport.fetch(f"{BASE}/api/organizations/{org_id}/chat_conversations")
     convs = _parse_list(body) if status == 200 else None
     if status != 200 or convs is None:
@@ -34,25 +44,38 @@ def capture_claude(transport: CdpTransport, state, staging_root: Path, events: l
         res.errors += 1
         events.append({
             "level": "warn", "code": "webcapture_list_failed",
-            "message": f"claude conversation list HTTP {status}", "count": 1, "store": "claude-web",
+            "message": f"claude conversation list HTTP {status} for org {org_id}", "count": 1, "store": "claude-web",
         })
-        return res
+        return
 
     changed = []
+    missing_ts = 0
     for c in convs:
         if not isinstance(c, dict):
             continue  # a non-object array item (layout drift) must not raise .get()
         conv_id = c.get("uuid")
-        updated = c.get("updated_at")
-        if not conv_id or not updated:
+        if not conv_id:
+            continue
+        # Fall back to created_at when updated_at is absent/renamed. An id-bearing item with NEITHER
+        # timestamp is layout drift, not "unchanged": count it (surfaced below) instead of silently
+        # dropping it and reporting a clean run that captured nothing.
+        ts = c.get("updated_at") or c.get("created_at")
+        if not ts:
+            missing_ts += 1
             continue
         res.checked += 1
-        prev = state.get_webcapture_watermark("claude", conv_id)
-        if prev is None or str(updated) > prev:
-            changed.append((conv_id, str(updated)))
-    res.changed = len(changed)
+        prev = state.get_webcapture_watermark("claude", conv_id)  # conv uuids are globally unique
+        if prev is None or str(ts) > prev:
+            changed.append((conv_id, str(ts)))
+    if missing_ts:
+        res.errors += 1
+        events.append({
+            "level": "warn", "code": "webcapture_list_failed",
+            "message": f"claude list for org {org_id}: {missing_ts} item(s) with no updated_at/created_at (layout drift)",
+            "count": missing_ts, "store": "claude-web",
+        })
+    res.changed += len(changed)
 
-    staging_root.mkdir(parents=True, exist_ok=True)
     for conv_id, updated in changed:
         # Reject a non-UUID id before it reaches EITHER the fetch URL or the `{conv_id}.json`
         # staging path — a '/', '..' or absolute-path id (API drift / hostile endpoint) would
@@ -81,7 +104,6 @@ def capture_claude(transport: CdpTransport, state, staging_root: Path, events: l
         (staging_root / f"{conv_id}.json").write_text(body, encoding="utf-8")
         state.set_webcapture_watermark("claude", conv_id, updated)
         res.captured += 1
-    return res
 
 
 def _parse_list(body: str):
@@ -108,24 +130,22 @@ def _valid_conversation(body: str) -> bool:
     return isinstance(data, dict) and isinstance(data.get("chat_messages"), list)
 
 
-def _resolve_org(transport: CdpTransport) -> str | None:
-    """The org uuid to capture, or None when signed out. Prefers an org whose capabilities
-    include chat; falls back to the first org with a uuid."""
+def _resolve_orgs(transport: CdpTransport) -> list[str]:
+    """Every chat-capable org uuid to capture, or [] when signed out. A Claude account can belong to
+    several workspaces; capturing only the first would silently skip the rest. Falls back to all
+    uuid-bearing orgs when none advertise the chat capability, so a capability-key rename doesn't
+    look like a sign-out."""
     status, body = transport.fetch(f"{BASE}/api/organizations")
     if status != 200 or not body:
-        return None
+        return []
     try:
         orgs = json.loads(body)
     except json.JSONDecodeError:
-        return None
+        return []
     if not isinstance(orgs, list) or not orgs:
-        return None
+        return []
     dict_orgs = [o for o in orgs if isinstance(o, dict)]  # skip non-object items (layout drift)
-    for org in dict_orgs:
-        caps = org.get("capabilities") or []
-        if org.get("uuid") and "chat" in caps:
-            return org["uuid"]
-    for org in dict_orgs:
-        if org.get("uuid"):
-            return org["uuid"]
-    return None
+    chat = [o["uuid"] for o in dict_orgs if o.get("uuid") and "chat" in (o.get("capabilities") or [])]
+    if chat:
+        return chat
+    return [o["uuid"] for o in dict_orgs if o.get("uuid")]

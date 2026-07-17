@@ -85,6 +85,7 @@ def _logged_in(status: int, body: str) -> bool:
 
 def _list_changed(transport: CdpTransport, state, res: CaptureResult, events: list[dict]) -> list[tuple[str, str]]:
     changed: list[tuple[str, str]] = []
+    missing_ts = 0
     offset = 0
     while True:
         url = f"{BASE}/backend-api/conversations?offset={offset}&limit={PAGE_LIMIT}&order=updated"
@@ -114,8 +115,14 @@ def _list_changed(transport: CdpTransport, state, res: CaptureResult, events: li
             if not isinstance(it, dict):
                 continue
             conv_id = it.get("id")
-            update_time = it.get("update_time")
-            if not isinstance(conv_id, str) or not update_time:
+            if not isinstance(conv_id, str):
+                continue
+            # Fall back to create_time when update_time is absent/renamed. An id-bearing item with
+            # NEITHER timestamp is layout drift, not "unchanged": count it (surfaced after the loop)
+            # rather than silently dropping every item and reporting a clean run that captured nothing.
+            update_time = it.get("update_time") or it.get("create_time")
+            if not update_time:
+                missing_ts += 1
                 continue
             res.checked += 1
             prev = state.get_webcapture_watermark("chatgpt", conv_id)
@@ -125,6 +132,13 @@ def _list_changed(transport: CdpTransport, state, res: CaptureResult, events: li
         total = data.get("total")
         if not items or (isinstance(total, int) and offset >= total):
             break
+    if missing_ts:
+        res.errors += 1
+        events.append({
+            "level": "warn", "code": "webcapture_list_failed",
+            "message": f"chatgpt list: {missing_ts} item(s) with no update_time/create_time (layout drift)",
+            "count": missing_ts, "store": "chatgpt-web",
+        })
     res.changed = len(changed)
     return changed
 

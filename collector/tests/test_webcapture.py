@@ -317,6 +317,101 @@ def test_cmd_webcapture_cdp_error_one_product_still_runs_other(tmp_env):
         assert st.pending_event_count() >= 1  # the CdpError was buffered for the next heartbeat
 
 
+def test_claude_captures_all_chat_capable_orgs(tmp_path):
+    # Round 5 Fix 1: a multi-workspace account must have EVERY chat-capable org captured, not just
+    # the first. conv uuids are globally unique, so the per-conv watermark needs no org key.
+    o1 = "11111111-1111-4111-8111-111111111111"
+    o2 = "22222222-2222-4222-8222-222222222222"
+    k1 = "aaaaaaaa-1111-4111-8111-111111111111"
+    k2 = "bbbbbbbb-2222-4222-8222-222222222222"
+    transport = FakeCdpTransport({
+        f"{CLAUDE}/api/organizations": (200, json.dumps([
+            {"uuid": o1, "capabilities": ["chat"]},
+            {"uuid": o2, "capabilities": ["chat"]},
+        ])),
+        f"{CLAUDE}/api/organizations/{o1}/chat_conversations": (200, json.dumps([{"uuid": k1, "updated_at": "2026-07-01T10:00:00Z"}])),
+        f"{CLAUDE}/api/organizations/{o1}/chat_conversations/{k1}?tree=True&rendering_mode=raw": (200, json.dumps({"uuid": k1, "chat_messages": []})),
+        f"{CLAUDE}/api/organizations/{o2}/chat_conversations": (200, json.dumps([{"uuid": k2, "updated_at": "2026-07-01T11:00:00Z"}])),
+        f"{CLAUDE}/api/organizations/{o2}/chat_conversations/{k2}?tree=True&rendering_mode=raw": (200, json.dumps({"uuid": k2, "chat_messages": []})),
+    })
+    events: list[dict] = []
+    staging = tmp_path / "claude-web"
+    with State(tmp_path / "state.db") as st:
+        res = capture_claude(transport, st, staging, events)
+        assert res.logged_in and res.checked == 2 and res.captured == 2  # BOTH orgs
+        assert (staging / f"{k1}.json").exists() and (staging / f"{k2}.json").exists()
+    assert events == []
+
+
+def test_chatgpt_falls_back_to_create_time_and_flags_missing_timestamps(tmp_path):
+    # Round 5 Fix 3: an item with only create_time is still captured (first capture); an id-bearing
+    # item with NEITHER timestamp emits a list_failed event instead of a silent clean run.
+    transport = FakeCdpTransport({
+        f"{CGPT}/api/auth/session": (200, json.dumps({"user": {"id": "u"}})),
+        f"{CGPT}/backend-api/conversations": (200, json.dumps({
+            "items": [
+                {"id": "only-ct", "create_time": "2026-07-01T09:00:00Z"},  # no update_time
+                {"id": "no-ts"},  # neither timestamp -> drift
+            ],
+            "total": 2,
+        })),
+        f"{CGPT}/backend-api/conversation/only-ct": (200, _conv_json("only-ct")),
+    })
+    events: list[dict] = []
+    staging = tmp_path / "chatgpt-web"
+    with State(tmp_path / "state.db") as st:
+        res = capture_chatgpt(transport, st, staging, events)
+        assert res.captured == 1  # only-ct captured via the create_time fallback
+        assert (staging / "only-ct.json").exists()
+    assert any(e["code"] == "webcapture_list_failed" for e in events)  # the no-ts item was flagged, not silent
+
+
+def test_claude_falls_back_to_created_at_and_flags_missing_timestamps(tmp_path):
+    org = "11111111-1111-4111-8111-111111111111"
+    ct = "aaaaaaaa-1111-4111-8111-111111111111"
+    transport = FakeCdpTransport({
+        f"{CLAUDE}/api/organizations": (200, json.dumps([{"uuid": org, "capabilities": ["chat"]}])),
+        f"{CLAUDE}/api/organizations/{org}/chat_conversations": (200, json.dumps([
+            {"uuid": ct, "created_at": "2026-07-01T09:00:00Z"},  # no updated_at
+            {"uuid": "bbbbbbbb-2222-4222-8222-222222222222"},  # neither -> drift
+        ])),
+        f"{CLAUDE}/api/organizations/{org}/chat_conversations/{ct}?tree=True&rendering_mode=raw": (200, json.dumps({"uuid": ct, "chat_messages": []})),
+    })
+    events: list[dict] = []
+    staging = tmp_path / "claude-web"
+    with State(tmp_path / "state.db") as st:
+        res = capture_claude(transport, st, staging, events)
+        assert res.captured == 1  # captured via the created_at fallback
+        assert (staging / f"{ct}.json").exists()
+    assert any(e["code"] == "webcapture_list_failed" for e in events)
+
+
+def test_cmd_webcapture_transport_close_failure_does_not_mask_results(tmp_env):
+    # Round 5 Fix 2: a transport.close() that raises (already-broken socket) must not drop buffered
+    # events or skip the other product — cleanup can't mask the capture result.
+    class _ClosesBadly:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def fetch(self, url):
+            return self._inner.fetch(url)
+
+        def close(self):
+            raise RuntimeError("socket already closed")
+
+    path = config.config_path()
+    config.enroll("http://localhost:8787", dev=True, path=path, machine_id="webhost")
+
+    def factory(origin):
+        inner = _chatgpt_transport() if origin == PRODUCTS["chatgpt"][0] else _claude_transport()
+        return _ClosesBadly(inner)
+
+    rc = cmd_webcapture(types.SimpleNamespace(config=str(path), product=None, host="127.0.0.1", port=9222), transport_factory=factory)
+    assert rc == 0  # both products captured cleanly despite every close() raising
+    assert (config.webcapture_dir() / "chatgpt-web" / "c1.json").exists()
+    assert (config.webcapture_dir() / "claude-web" / "k1.json").exists()
+
+
 def test_cdp_list_targets_non_json_or_non_list_becomes_cdp_error(monkeypatch):
     # Round 4 Fix 4: /json returning HTML (a non-Chrome service on --port), or a 200 JSON object
     # instead of a list, must raise CdpError — not a bare JSONDecodeError, and not a value that later

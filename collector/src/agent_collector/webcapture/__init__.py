@@ -99,5 +99,11 @@ def _run_products(cfg, st: State, products: list[str], store_roots: dict, transp
             })
             results.append(CaptureResult(product=product, logged_in=False, errors=1))
         finally:
-            transport.close()
+            # An already-broken DevTools socket can make close() raise. That must NEVER escape here:
+            # it would drop the events accumulated so far AND skip the remaining product(s). Cleanup
+            # can't mask the capture result — swallow it (noted to the console).
+            try:
+                transport.close()
+            except Exception as e:  # noqa: BLE001 - a cleanup failure must not mask the capture result
+                print(f"[warn] {product} transport close failed: {e}", file=sys.stderr)
     return results, events
