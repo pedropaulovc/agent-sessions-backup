@@ -46,18 +46,25 @@ export async function runWatchdog(env: Env): Promise<void> {
 
   console.log(JSON.stringify({ event: 'hub.watchdog', machines: rows.results.length }));
 
-  // Best-effort D1 size gauge (plan wants an alert at ~7 GB). Guarded: if the
-  // PRAGMA-backed table-valued functions aren't available on D1, skip the metric
-  // rather than failing the whole watchdog run — the heartbeat-age emission above
-  // is the load-bearing part.
+  // D1 size gauge (plan wants an alert at ~7 GB). If the PRAGMA-backed
+  // table-valued functions aren't available on D1 (or return nothing), emit an
+  // explicit FAILING signal `bytes: -1` rather than dropping the metric — this
+  // run never crashes on it (heartbeat-age above is load-bearing), but a silent
+  // drop would make d1-size.kql see zero size rows exactly when the probe breaks
+  // while heartbeat_age keeps missed-heartbeat.kql "healthy". d1-size.kql fires
+  // on `bytes < 0` too, so a broken probe is alertable. The human-readable warn
+  // is kept alongside the sentinel.
   try {
     const size = await env.DB.prepare(
       `SELECT (SELECT page_count FROM pragma_page_count()) * (SELECT page_size FROM pragma_page_size()) AS bytes`,
     ).first<{ bytes: number }>();
-    if (size?.bytes != null) {
-      console.log(JSON.stringify({ event: 'hub.d1.db_size_bytes', bytes: size.bytes }));
+    const bytes = size?.bytes ?? -1;
+    console.log(JSON.stringify({ event: 'hub.d1.db_size_bytes', bytes }));
+    if (bytes < 0) {
+      console.log(JSON.stringify({ event: 'hub.watchdog.warn', tag: 'd1-size-unavailable', error: 'probe returned no bytes' }));
     }
   } catch (e) {
+    console.log(JSON.stringify({ event: 'hub.d1.db_size_bytes', bytes: -1 }));
     console.log(JSON.stringify({ event: 'hub.watchdog.warn', tag: 'd1-size-unavailable', error: String(e) }));
   }
 }

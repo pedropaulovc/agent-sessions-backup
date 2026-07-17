@@ -66,10 +66,15 @@ fi
 printf '%s' "$INGEST_BEARER" | npx wrangler secret put INGEST_BEARER --config "$CONFIG"
 
 # Capture deploy output so we can read the real deployed workers.dev URL rather
-# than hard-coding the subdomain.
+# than hard-coding the subdomain. The extraction MUST be non-fatal: under
+# `set -euo pipefail` a grep miss (custom-domain route, or a wrangler output
+# format change) returns non-zero and would abort the script here — AFTER the
+# Worker secret is already set but BEFORE cf-observability.env is written, i.e.
+# exactly the bearer-loss failure this script exists to prevent. `|| true` keeps
+# it alive so the `${GATEWAY_URL:-<default>}` fallback on the next line runs.
 DEPLOY_OUT=$(npx wrangler deploy --config "$CONFIG" 2>&1)
 echo "$DEPLOY_OUT"
-GATEWAY_URL=$(printf '%s\n' "$DEPLOY_OUT" | grep -oE 'https://sessions-telemetry-gateway\.[a-z0-9-]+\.workers\.dev' | head -1)
+GATEWAY_URL=$(printf '%s\n' "$DEPLOY_OUT" | grep -oE 'https://sessions-telemetry-gateway\.[a-z0-9-]+\.workers\.dev' | head -1 || true)
 GATEWAY_URL="${GATEWAY_URL:-https://sessions-telemetry-gateway.pedro-18e.workers.dev}"
 
 mkdir -p "$(dirname "$ENV_FILE")"
