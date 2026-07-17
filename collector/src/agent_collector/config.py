@@ -207,20 +207,15 @@ def load(path: Path | str | None = None) -> Config:
     )
 
 
-def _resolve_machine_id(override: str | None, path: Path) -> str:
-    """Pick the machine_id to write: explicit override > an existing config's id > computed
-    default. Preserving an already-configured id is what keeps mTLS re-enrollment consistent:
-    enroll-cert.sh signs the cert for the id `agent-collector machine-id` reported (the
-    configured one), so resetting to the default here would make the cert identity and the
-    collector's upload URLs diverge and every upload would 401 as machine_mismatch."""
-    if override is not None:
-        return override
-    if path.exists():
-        try:
-            return load(path).machine_id
-        except (OSError, KeyError, ValueError, tomllib.TOMLDecodeError):
-            pass  # unreadable/legacy config -> fall through to the computed default
-    return default_machine_id()
+def _load_if_exists(path: Path) -> Config | None:
+    """The current config at `path`, or None if absent/unreadable. Lets enroll re-use an
+    existing box's settings instead of resetting them."""
+    if not path.exists():
+        return None
+    try:
+        return load(path)
+    except (OSError, KeyError, ValueError, tomllib.TOMLDecodeError):
+        return None  # unreadable/legacy config -> treat as a fresh enroll
 
 
 def enroll(
@@ -233,11 +228,32 @@ def enroll(
 ) -> Config:
     """Write a collector config. `dev=True` writes dev auth (x-dev-machine); otherwise a
     file-based mTLS config, which requires both a client cert and key path (produced by
-    infra/cf/enroll-cert.sh). TPM-backed mTLS enrollment lands in M4."""
+    infra/cf/enroll-cert.sh). TPM-backed mTLS enrollment lands in M4.
+
+    Re-enrolling an existing box (e.g. dev -> mTLS for production) only swaps the auth
+    material, hub_url, and machine_id. Every OTHER field — stores, exclude globs,
+    include_windows_mounts — is carried over from the existing config so a customized
+    collector doesn't silently revert to defaults and stop backing up its custom roots.
+
+    machine_id resolution: explicit override > existing config's id > computed default.
+    Preserving the existing id keeps mTLS consistent — enroll-cert.sh signs the cert for the
+    id `agent-collector machine-id` reports (the configured one), so resetting to the default
+    would make cert identity and upload URLs diverge and every upload 401 as machine_mismatch.
+    """
     path = Path(path) if path else config_path()
-    resolved_id = _resolve_machine_id(machine_id, path)
+    existing = _load_if_exists(path)
+    resolved_id = (
+        machine_id if machine_id is not None
+        else existing.machine_id if existing is not None
+        else default_machine_id()
+    )
+    carried = dict(
+        stores=dict(existing.stores) if existing is not None else dict(DEFAULT_STORES),
+        exclude=list(existing.exclude) if existing is not None else [],
+        include_windows_mounts=existing.include_windows_mounts if existing is not None else False,
+    )
     if dev:
-        cfg = Config(machine_id=resolved_id, hub_url=hub_url.rstrip("/"), auth="dev")
+        cfg = Config(machine_id=resolved_id, hub_url=hub_url.rstrip("/"), auth="dev", **carried)
     else:
         if not (client_cert_path and client_key_path):
             raise ValueError(
@@ -253,6 +269,7 @@ def enroll(
             # default) would make MtlsAuth fail its file-existence check before every upload.
             client_cert_path=str(Path(client_cert_path).expanduser().resolve()),
             client_key_path=str(Path(client_key_path).expanduser().resolve()),
+            **carried,
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_dump_toml(cfg))

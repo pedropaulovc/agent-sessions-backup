@@ -146,6 +146,42 @@ def test_build_upload_config_dev_still_emits_header(tmp_path):
     assert 'header = "x-dev-machine: m1"' in cfg
 
 
+def test_get_sends_mtls_cert_on_health_probe(tmp_path, monkeypatch):
+    # doctor's /healthz GET must carry the client cert, else the WAF blocks it and a
+    # correctly-enrolled production collector reports the hub unreachable.
+    cert = tmp_path / "c.pem"
+    key = tmp_path / "c.key"
+    cert.write_text("c")
+    key.write_text("k")
+    t = Transport(MtlsAuth(client_cert_path=str(cert), client_key_path=str(key)))
+    captured = {}
+
+    def fake_run(argv):
+        captured["argv"] = argv
+        return 0, 200, ""
+
+    monkeypatch.setattr(t, "_run", fake_run)
+    status, _ = t.get("https://api.sessions.vza.net/healthz")
+    assert status == 200
+    argv = captured["argv"]
+    assert "--cert" in argv and str(cert) in argv
+    assert "--key" in argv and str(key) in argv
+
+
+def test_get_sends_dev_header_on_health_probe(monkeypatch):
+    # positive control: the header-based auth path still rides the GET probe.
+    t = Transport(DevAuth("m1"))
+    captured = {}
+
+    def fake_run(argv):
+        captured["argv"] = argv
+        return 0, 200, ""
+
+    monkeypatch.setattr(t, "_run", fake_run)
+    t.get("https://api.sessions.vza.net/healthz")
+    assert "x-dev-machine: m1" in captured["argv"]
+
+
 def test_parse_curl_version():
     p = transport_mod._parse_curl_version
     assert p("curl 7.68.0 (x86_64-pc-linux-gnu) libcurl/7.68.0") == (7, 68, 0)

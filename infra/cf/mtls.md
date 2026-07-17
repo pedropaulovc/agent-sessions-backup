@@ -94,6 +94,12 @@ sets `is_admin=1` (needed for `POST /api/v1/admin/reindex`); drop it for ordinar
 machines. Pass the id explicitly as the first arg only on a box where the collector isn't
 installed yet. The private key never leaves the box; the signed cert is not secret.
 
+The D1 upsert needs a **wrangler login with D1 access** — the just-in-time `CF_API_TOKEN`
+is zone-SSL only. Run `enroll-cert.sh` on an authenticated admin box (this one), or, if you
+mint the cert on a fresh remote box, the script prints the exact `wrangler d1 execute`
+command to run from an admin box instead. (M4 replaces this with hub-mediated
+self-registration via `POST /api/v1/certs/renew`, so no wrangler login is needed per box.)
+
 Verify end-to-end (the cert/key basenames use the resolved machine_id):
 
 ```
@@ -109,6 +115,7 @@ wrote):
 
 ```
 agent-collector enroll --hub https://api.sessions.vza.net \
+  --machine-id "$MID" \
   --client-cert ~/.config/agent-collector/$MID.client.pem \
   --client-key  ~/.config/agent-collector/$MID.client.key
 ```

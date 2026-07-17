@@ -92,7 +92,20 @@ SQL="INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, key_protect
      VALUES ('$MACHINE_ID', '$OS_TAG', '$HOSTNAME_VAL', '$FP', 'software', $IS_ADMIN)
      ON CONFLICT (machine_id) DO UPDATE SET cert_fp_sha256=excluded.cert_fp_sha256,
        key_protection=excluded.key_protection, is_admin=excluded.is_admin;"
-CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID" npx --yes wrangler d1 execute "$DB_NAME" --remote --command "$SQL"
+# The D1 upsert needs a wrangler login with D1 access — NOT the just-in-time CF_API_TOKEN,
+# which is zone-SSL only (and wrangler reads CLOUDFLARE_API_TOKEN, not CF_API_TOKEN, anyway).
+# On an authenticated admin box, run it; on a fresh collector box, print the SQL to run from
+# such a box. M4 replaces this with hub-mediated self-registration (POST /api/v1/certs/renew).
+REGISTER_CMD="CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID npx wrangler d1 execute $DB_NAME --remote --command \"$SQL\""
+if npx --yes wrangler whoami >/dev/null 2>&1; then
+  CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID" npx --yes wrangler d1 execute "$DB_NAME" --remote --command "$SQL"
+else
+  echo "    wrangler is not authenticated here, and the zone-SSL CF_API_TOKEN can't reach D1." >&2
+  echo "    Register the cert from an admin box where 'npx wrangler whoami' works, by running:" >&2
+  echo >&2
+  echo "  $REGISTER_CMD" >&2
+  echo >&2
+fi
 
 echo
 echo "Done. Test the mTLS path with:"
@@ -100,6 +113,6 @@ echo "  curl --cert $CRT --key $KEY https://api.sessions.vza.net/api/v1/machines
 echo
 echo "Then point the collector at the mTLS API (writes auth=mtls + these paths):"
 echo "  agent-collector enroll --hub https://api.sessions.vza.net \\"
-echo "    --client-cert $CRT --client-key $KEY"
+echo "    --machine-id \"$MACHINE_ID\" --client-cert $CRT --client-key $KEY"
 echo
 echo "Key stays on this box only ($KEY); the signed cert is not secret."

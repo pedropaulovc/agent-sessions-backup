@@ -240,7 +240,12 @@ class Transport:
         return status, body
 
     def get(self, url: str) -> tuple[int, str]:
-        return self._run_retry([*self._COMMON, url])
+        # Attach the auth strategy's curl args like put()/post_json() do. The only GET is
+        # doctor's /healthz probe against the API host, where the WAF rule blocks every
+        # uncertified request — a certless probe would report a correctly-enrolled production
+        # collector as "hub unreachable". The client cert is not a secret to withhold from a
+        # health check, and sending it makes doctor validate the real production auth path.
+        return self._run_retry([*self._COMMON, *self.auth.curl_args(), url])
 
     def put(self, url: str, body_path: Path, headers: dict[str, str]) -> tuple[int, str]:
         argv = [*self._COMMON, "--upload-file", str(body_path)]

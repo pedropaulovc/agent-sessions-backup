@@ -82,6 +82,32 @@ def test_enroll_mtls_preserves_existing_machine_id(tmp_path):
     assert config.load(path).machine_id == "my-custom-box"
 
 
+def test_enroll_mtls_preserves_custom_stores_and_excludes(tmp_path):
+    # A customized collector must keep backing up its custom roots / WSL policy after the
+    # dev -> mTLS production re-enroll; only auth material + hub_url + machine_id change.
+    path = tmp_path / "config.toml"
+    cert = tmp_path / "c.pem"
+    key = tmp_path / "c.key"
+    cert.write_text("c")
+    key.write_text("k")
+    path.write_text(
+        'machine_id = "box"\nhub_url = "http://h"\nauth = "dev"\n'
+        "include_windows_mounts = true\n"
+        'exclude = ["*.secret"]\n\n'
+        '[stores]\nclaude = "~/.claude"\nmystore = "~/custom"\n'
+    )
+    config.enroll(
+        "https://api", dev=False, path=path,
+        client_cert_path=str(cert), client_key_path=str(key),
+    )
+    loaded = config.load(path)
+    assert loaded.auth == "mtls"
+    assert loaded.machine_id == "box"
+    assert loaded.stores == {"claude": "~/.claude", "mystore": "~/custom"}
+    assert loaded.exclude == ["*.secret"]
+    assert loaded.include_windows_mounts is True
+
+
 def test_enroll_explicit_machine_id_wins_over_existing(tmp_path):
     path = tmp_path / "config.toml"
     config.enroll("http://h", dev=True, path=path, machine_id="old-box")
