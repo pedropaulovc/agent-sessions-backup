@@ -26,11 +26,24 @@ from typing import Iterator
 SNAPSHOT_DEADLINE_S = 30.0
 SNAPSHOT_PAGES = 128  # copy this many pages per backup step, so the progress abort fires often
 
-# Three-state snapshot outcome (a bare False conflated "not a DB" with "locked", which made
-# the caller raw-upload a live, WAL-inconsistent database).
+# Snapshot outcomes. Only NOT_A_DB is safe to raw-capture; LOCKED/FAILED are real databases
+# we couldn't snapshot this run, so they are skipped (never raw-upload a WAL-inconsistent DB).
 SNAPSHOT_OK = "ok"
-SNAPSHOT_NOT_A_DB = "not_a_db"      # -> raw capture is safe (it isn't really a database)
-SNAPSHOT_LOCKED = "locked_timeout"  # -> skip this run + emit an event (never raw-upload it)
+SNAPSHOT_NOT_A_DB = "not_a_db"       # source isn't a database -> raw capture is safe
+SNAPSHOT_LOCKED = "locked_timeout"   # source held (BEGIN EXCLUSIVE) -> skip + event
+SNAPSHOT_FAILED = "snapshot_failed"  # valid DB but backup failed (e.g. dst ENOSPC) -> skip + event
+
+SQLITE_NOTADB = 26  # sqlite_errorcode for "file is not a database"
+
+
+def _is_not_a_db_error(e: sqlite3.Error) -> bool:
+    """True only for the "file is not a database" error, distinguishing a genuine non-DB from
+    any other failure (locked, I/O, disk full). Uses sqlite_errorcode (Python 3.11+), falling
+    back to a message sniff on the floor version."""
+    code = getattr(e, "sqlite_errorcode", None)
+    if code is not None:
+        return code == SQLITE_NOTADB
+    return "not a database" in str(e).lower()
 
 # A directory is pruned during the walk iff a direct child file would be excluded. This
 # neutral probe name can't accidentally match a filename glob (*.key, *-wal, .credentials…)
@@ -41,13 +54,19 @@ _DIR_PROBE = "\x00"
 def path_matches(relpath: str, pattern: str) -> bool:
     """Exclude match on a POSIX relpath. Superset of fnmatch so security excludes never
     silently miss: matches the full path AND the basename, and treats a leading ``**/`` as
-    an optional prefix (so ``**/oauth*`` also catches a root-level ``oauth.json``)."""
+    an optional prefix (so ``**/oauth*`` also catches a root-level ``oauth.json``).
+
+    Matching is CASE-INSENSITIVE (both sides lowercased, fnmatchcase to avoid Windows double
+    normalization), so ``ID_RSA.PEM`` / ``AUTH.JSON`` are excluded by ``*.pem`` / ``auth.json``
+    on Linux too — differently-cased credential files must never slip through."""
+    relpath = relpath.lower()
+    pattern = pattern.lower()
     base = relpath.rsplit("/", 1)[-1]
     candidates = {pattern}
     if pattern.startswith("**/"):
         candidates.add(pattern[3:])
     for pat in candidates:
-        if fnmatch.fnmatch(relpath, pat) or fnmatch.fnmatch(base, pat):
+        if fnmatch.fnmatchcase(relpath, pat) or fnmatch.fnmatchcase(base, pat):
             return True
     return False
 
@@ -71,20 +90,21 @@ class ScanItem:
 
 def _snapshot_sqlite(src: Path, dst: Path, deadline_s: float = SNAPSHOT_DEADLINE_S) -> str:
     """Bounded consistent snapshot via the backup API. Returns one of SNAPSHOT_OK /
-    SNAPSHOT_NOT_A_DB / SNAPSHOT_LOCKED.
+    SNAPSHOT_NOT_A_DB / SNAPSHOT_LOCKED / SNAPSHOT_FAILED.
 
     The progress callback fires after every backup step, including on SQLITE_BUSY retries,
     so a source held in BEGIN EXCLUSIVE hits the deadline and aborts (SNAPSHOT_LOCKED)
-    instead of hanging while the run holds the overlap lock. A file that simply isn't a
-    database raises sqlite3.Error (SNAPSHOT_NOT_A_DB) and is raw-captured instead.
+    instead of hanging while the run holds the overlap lock. Only a genuine "file is not a
+    database" error is SNAPSHOT_NOT_A_DB (safe to raw-capture); any OTHER post-open failure
+    (dst ENOSPC, I/O error, ...) is SNAPSHOT_FAILED so the live DB is never raw-uploaded.
     """
     # Percent-encode the path: an unencoded '?' or '#' in the filename is parsed as a URI
     # query/fragment, so 'weird?name.sqlite' would open an EMPTY 'weird' DB (silent data loss).
     uri = "file:" + urllib.parse.quote(src.as_posix(), safe="/:") + "?mode=ro"
     try:
         src_conn = sqlite3.connect(uri, uri=True, timeout=deadline_s)
-    except sqlite3.Error:
-        return SNAPSHOT_NOT_A_DB
+    except sqlite3.Error as e:
+        return SNAPSHOT_NOT_A_DB if _is_not_a_db_error(e) else SNAPSHOT_FAILED
     deadline = time.monotonic() + deadline_s
 
     def _progress(_status, _remaining, _total):
@@ -101,8 +121,8 @@ def _snapshot_sqlite(src: Path, dst: Path, deadline_s: float = SNAPSHOT_DEADLINE
             dst_conn.close()
     except TimeoutError:
         return SNAPSHOT_LOCKED
-    except sqlite3.Error:
-        return SNAPSHOT_NOT_A_DB
+    except sqlite3.Error as e:
+        return SNAPSHOT_NOT_A_DB if _is_not_a_db_error(e) else SNAPSHOT_FAILED
     finally:
         src_conn.close()
     return SNAPSHOT_OK
@@ -221,12 +241,18 @@ class Scanner:
             if outcome == SNAPSHOT_OK:
                 snap_size = dst.stat().st_size
                 return ScanItem(store, relpath, snap_size, st.st_mtime_ns, dst, True)
-            if outcome == SNAPSHOT_LOCKED:
-                # A real DB we couldn't snapshot in time: skip it — never raw-upload a live,
-                # WAL-inconsistent database. Retried next run; surfaced in the heartbeat.
+            if outcome in (SNAPSHOT_LOCKED, SNAPSHOT_FAILED):
+                # A real DB we couldn't snapshot this run (locked, or backup failed e.g. dst
+                # full): skip it — never raw-upload a live, WAL-inconsistent database. Retried
+                # next run; surfaced in the heartbeat.
+                code, why = (
+                    ("snapshot_timeout", "SQLite locked; snapshot timed out")
+                    if outcome == SNAPSHOT_LOCKED
+                    else ("snapshot_failed", "SQLite snapshot backup failed")
+                )
                 self.events.append({
-                    "level": "warn", "code": "snapshot_timeout",
-                    "message": f"{relpath}: SQLite locked; snapshot timed out, skipped this run",
+                    "level": "warn", "code": code,
+                    "message": f"{relpath}: {why}, skipped this run",
                     "count": 1, "store": store,
                 })
                 return None

@@ -120,6 +120,16 @@ class Config:
     exclude: list[str] = field(default_factory=list)
     source: Path | None = None
 
+    def __post_init__(self) -> None:
+        # machine_id and each store name are single URL path segments in the files API; a '/'
+        # would shift the segments the hub parses. Reject it here (clear error) in addition to
+        # encoding in file_url (defense in both places).
+        if "/" in self.machine_id:
+            raise ValueError(f"machine_id must not contain '/': {self.machine_id!r}")
+        for name in self.stores:
+            if "/" in name:
+                raise ValueError(f"store name must not contain '/': {name!r}")
+
     def store_roots(self) -> dict[str, Path]:
         """Resolved roots to actually scan. Under WSL with include_windows_mounts=false,
         roots resolving under /mnt/<drive>/ are dropped so a WSL install never captures the

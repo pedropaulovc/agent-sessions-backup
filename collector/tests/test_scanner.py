@@ -6,9 +6,10 @@ import time
 import pytest
 
 from agent_collector import config
+from agent_collector import scanner as scanner_mod
 from agent_collector.scanner import (
     Scanner, path_matches, read_exact, hash_bytes, hash_file_prefix, _snapshot_sqlite,
-    SNAPSHOT_OK, SNAPSHOT_NOT_A_DB, SNAPSHOT_LOCKED,
+    SNAPSHOT_OK, SNAPSHOT_NOT_A_DB, SNAPSHOT_LOCKED, SNAPSHOT_FAILED,
 )
 
 
@@ -156,6 +157,63 @@ def test_uppercase_db_suffix_is_snapshotted(tmp_path):
     finally:
         scanner.close()
     assert items["State.DB"].is_snapshot is True
+
+
+def test_path_matches_case_insensitive():
+    # differently-cased credential files must not slip past the built-in security excludes
+    assert path_matches("AUTH.JSON", "auth.json")
+    assert path_matches("secrets/ID_RSA.PEM", "*.pem")
+    assert path_matches("OAuth-Token.txt", "**/oauth*")
+    assert path_matches("id_rsa.pem", "*.PEM")  # uppercase pattern normalized too
+
+
+def test_uppercase_credential_files_excluded(tmp_path):
+    root = tmp_path / ".claude"
+    root.mkdir()
+    (root / "AUTH.JSON").write_text("secret")
+    (root / "ID_RSA.PEM").write_text("key")
+    (root / "OAuth-Token.txt").write_text("token")
+    (root / "keep.jsonl").write_text("{}")
+    scanner = Scanner(config.DEFAULT_EXCLUDES)
+    try:
+        found = {it.relpath for it in scanner.scan_store("claude", root)}
+    finally:
+        scanner.close()
+    assert found == {"keep.jsonl"}
+
+
+def test_snapshot_dst_failure_is_snapshot_failed(tmp_path):
+    src = tmp_path / "real.sqlite"
+    c = sqlite3.connect(src)
+    c.execute("CREATE TABLE t(x)")
+    c.commit()
+    c.close()
+    # dst parent dir missing -> a valid DB whose backup can't complete (post-open failure)
+    assert _snapshot_sqlite(src, tmp_path / "missing_dir" / "snap.sqlite") == SNAPSHOT_FAILED
+    # a genuine non-DB is still classified NOT_A_DB (safe to raw-capture)
+    garbage = tmp_path / "junk.db"
+    garbage.write_bytes(b"not a database at all")
+    assert _snapshot_sqlite(garbage, tmp_path / "g.sqlite") == SNAPSHOT_NOT_A_DB
+
+
+def test_snapshot_failed_db_skipped_with_event_garbage_raw_captured(tmp_path, monkeypatch):
+    root = tmp_path / ".claude"
+    root.mkdir()
+    (root / "real.sqlite").write_bytes(b"")
+    (root / "notes.db").write_bytes(b"just text, not sqlite")
+
+    def fake_snapshot(src, dst, deadline_s):
+        return SNAPSHOT_FAILED if src.name == "real.sqlite" else SNAPSHOT_NOT_A_DB
+
+    monkeypatch.setattr(scanner_mod, "_snapshot_sqlite", fake_snapshot)
+    scanner = Scanner([])
+    try:
+        items = {it.relpath: it for it in scanner.scan_store("claude", root)}
+    finally:
+        scanner.close()
+    assert "real.sqlite" not in items          # backup failed -> skipped, never raw-uploaded
+    assert items["notes.db"].is_snapshot is False  # not-a-db -> raw-captured
+    assert "snapshot_failed" in {e["code"] for e in scanner.events}
 
 
 def test_snapshot_outcomes_ok_and_not_a_db(tmp_path):

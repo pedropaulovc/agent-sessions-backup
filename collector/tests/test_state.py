@@ -1,4 +1,25 @@
+import os
+import sqlite3
+
+import pytest
+
 from agent_collector.state import State, OverlapLock
+
+
+def test_overlap_lock_raises_on_non_contention_error(tmp_path):
+    if os.name == "nt" or (hasattr(os, "geteuid") and os.geteuid() == 0):
+        pytest.skip("permission-based test needs a non-root POSIX host")
+    db = tmp_path / "state.db"
+    first = OverlapLock(db)
+    assert first.acquire() is True  # creates the sibling lock DB file
+    first.release()
+    lockfile = db.with_name(db.name + ".lock")
+    os.chmod(lockfile, 0o400)  # read-only: BEGIN IMMEDIATE write fails (SQLITE_READONLY)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            OverlapLock(db).acquire()  # not contention -> fail loudly, don't skip silently
+    finally:
+        os.chmod(lockfile, 0o600)
 
 
 def test_machine_id_change_reoffers_files_and_records_event(tmp_path):

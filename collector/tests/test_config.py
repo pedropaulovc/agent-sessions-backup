@@ -113,6 +113,26 @@ def test_wsl_symlink_root_kept_when_include_windows_mounts(tmp_path, monkeypatch
     assert roots["claude"] == link  # unresolved path kept as scan root (stable relpaths)
 
 
+def test_store_name_with_slash_rejected():
+    with pytest.raises(ValueError):
+        config.Config(machine_id="m", hub_url="http://x", stores={"foo/bar": "~/.x"})
+
+
+def test_machine_id_with_slash_rejected():
+    with pytest.raises(ValueError):
+        config.Config(machine_id="a/b", hub_url="http://x")
+
+
+def test_load_rejects_slash_in_store(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'machine_id = "m"\nhub_url = "http://x"\nauth = "dev"\n'
+        'include_windows_mounts = false\n\n[stores]\n"foo/bar" = "~/.x"\n'
+    )
+    with pytest.raises(ValueError):
+        config.load(path)
+
+
 def test_effective_excludes_extends_defaults(tmp_path):
     path = tmp_path / "config.toml"
     config.enroll("http://x", dev=True, path=path, machine_id="m1")

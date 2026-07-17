@@ -33,8 +33,13 @@ def build_auth(cfg: config_mod.Config):
 
 
 def file_url(hub_url: str, machine_id: str, store: str, relpath: str) -> str:
+    # machine_id and store are single path segments (encode '/' too); relpath keeps its '/'
+    # separators. Otherwise a '/' in machine_id/store would shift the URL segments and the
+    # hub would parse a different (machine, store, relpath) than local state / files/check.
+    machine = urllib.parse.quote(machine_id, safe="")
+    store_seg = urllib.parse.quote(store, safe="")
     encoded = urllib.parse.quote(relpath, safe="/")
-    return f"{hub_url}/api/v1/files/{machine_id}/{store}/{encoded}"
+    return f"{hub_url}/api/v1/files/{machine}/{store_seg}/{encoded}"
 
 
 def mtime_iso(mtime_ns: int) -> str:
@@ -250,7 +255,7 @@ def _do_backfill(cfg, st: State, concurrency: int, dry_run: bool) -> int:
     transport = Transport(build_auth(cfg), parallel_max=concurrency)
     scanner = Scanner(cfg.effective_excludes())
     totals = {"scanned": 0, "already_present": 0, "uploaded": 0, "failed": 0,
-              "bytes_uploaded": 0, "would_upload": 0, "read_errors": 0}
+              "bytes_uploaded": 0, "would_upload": 0, "read_errors": 0, "check_failures": 0}
     events = _windows_mount_events(cfg)
     try:
         # Bounded chunks: hash the chunk, ask the hub what it lacks (files/check),
@@ -267,7 +272,8 @@ def _do_backfill(cfg, st: State, concurrency: int, dry_run: bool) -> int:
         st.buffer_events(events)  # read/mount warnings surfaced on the next heartbeat
     summary = {"mode": "backfill", "scanned": totals["scanned"],
                "already_present": totals["already_present"],
-               "read_errors": totals["read_errors"]}
+               "read_errors": totals["read_errors"],
+               "check_failures": totals["check_failures"]}
     if dry_run:
         summary["dry_run"] = True
         summary["would_upload"] = totals["would_upload"]
@@ -277,8 +283,9 @@ def _do_backfill(cfg, st: State, concurrency: int, dry_run: bool) -> int:
         summary["bytes_uploaded"] = totals["bytes_uploaded"]
     print(json.dumps(summary))
     # Nonzero when the backfill was incomplete, so scripts/operators don't move on: upload
-    # failures, per-file read/staging errors, or an error-level traversal event.
-    incomplete = (totals["failed"] or totals["read_errors"]
+    # failures, per-file read/staging errors, a files/check failure (the only source of truth
+    # in dry-run), or an error-level traversal event.
+    incomplete = (totals["failed"] or totals["read_errors"] or totals["check_failures"]
                   or any(e["level"] == "error" for e in events))
     return 1 if incomplete else 0
 
@@ -306,7 +313,8 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
         hashed.append((item, sha))
 
     missing = _check_missing_chunk(cfg, transport,
-                                   [(it.store, it.relpath, sha) for it, sha in hashed])
+                                   [(it.store, it.relpath, sha) for it, sha in hashed],
+                                   totals, events)
 
     to_upload: list[tuple[ScanItem, str]] = []
     for item, sha in hashed:
@@ -368,12 +376,19 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
         _cleanup_snapshot(item)
 
 
-def _check_missing_chunk(cfg, transport: Transport, triples) -> set[tuple[str, str]]:
+def _check_missing_chunk(cfg, transport: Transport, triples, totals: dict,
+                         events: list[dict]) -> set[tuple[str, str]]:
     if not triples:
         return set()
     body = {"files": [{"store": s, "relpath": r, "sha256": h} for s, r, h in triples]}
     status, resp = transport.post_json(f"{cfg.hub_url}/api/v1/files/check", body)
     if status != 200:
+        # files/check is the ONLY source of truth in dry-run; a non-200 must fail the command,
+        # not silently report everything as would_upload. Non-dry-run still falls back to the
+        # conservative treat-all-missing PUTs, but the failure is surfaced either way.
+        totals["check_failures"] += 1
+        events.append({"level": "error", "code": "check_failed",
+                       "message": f"files/check HTTP {status}", "count": 1})
         return {(s, r) for s, r, _ in triples}  # conservative: treat all as missing
     return {(m["store"], m["relpath"]) for m in json.loads(resp).get("missing", [])}
 

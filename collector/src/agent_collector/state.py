@@ -58,6 +58,19 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
+SQLITE_BUSY = 5
+SQLITE_LOCKED = 6
+
+
+def _is_lock_contention(e: sqlite3.OperationalError) -> bool:
+    """True only for SQLITE_BUSY/SQLITE_LOCKED (another collector holds the lock). Anything
+    else (read-only DB, full filesystem, corruption) is a real failure, not benign overlap."""
+    code = getattr(e, "sqlite_errorcode", None)
+    if code is not None:
+        return code in (SQLITE_BUSY, SQLITE_LOCKED)
+    return "is locked" in str(e).lower()  # floor-version fallback ("database is locked")
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
@@ -325,9 +338,11 @@ class OverlapLock:
             conn.execute("CREATE TABLE IF NOT EXISTS lock (id INTEGER PRIMARY KEY)")
             conn.execute("BEGIN IMMEDIATE")
             conn.execute("INSERT OR REPLACE INTO lock (id) VALUES (1)")
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as e:
             conn.close()
-            return False
+            if _is_lock_contention(e):
+                return False  # another collector holds the lock -> benign overlap, exit 0
+            raise  # read-only/full lock filesystem etc. -> fail loudly, don't silently stop
         self.conn = conn
         return True
 

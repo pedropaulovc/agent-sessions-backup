@@ -130,6 +130,27 @@ def test_backfill_read_error_skips_file_and_continues(tmp_path, hub, monkeypatch
     assert ("m1", "claude", "a.jsonl") not in hub.files
 
 
+def test_file_url_encodes_machine_and_store_segments():
+    url = run_mod.file_url("http://h", "od/d", "st ore", "a b/c.jsonl")
+    # machine_id and store are single segments (/ encoded); relpath keeps its separators
+    assert url == "http://h/api/v1/files/od%2Fd/st%20ore/a%20b/c.jsonl"
+
+
+def test_backfill_dry_run_fails_when_check_fails(tmp_path, hub, monkeypatch, capsys):
+    import agent_collector.transport as transport_mod
+    monkeypatch.setattr(transport_mod, "BACKOFF", (0.0, 0.0, 0.0))
+    root = tmp_path / "claude"
+    root.mkdir()
+    (root / "a.jsonl").write_text("x")
+    cfg = _cfg(hub, root)
+    hub.flaky_500_remaining = 999  # files/check returns 500
+    with State(tmp_path / "state.db") as st:
+        rc = run_mod._do_backfill(cfg, st, concurrency=2, dry_run=True)
+    assert rc == 1  # check is the only truth in dry-run -> its failure fails the command
+    assert '"check_failures": 1' in capsys.readouterr().out
+    assert hub.files == {}  # dry-run still uploads nothing
+
+
 def test_backfill_dry_run_uploads_nothing(tmp_path, hub):
     root = tmp_path / "claude"
     root.mkdir()
