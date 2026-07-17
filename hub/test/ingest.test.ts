@@ -139,6 +139,41 @@ describe('ingest pipeline end-to-end', () => {
     expect(sessionCount!.n).toBe(1);
   });
 
+  it('reindex reproduces the same dedupe decision as normal ingest (regression: reindex used to drop harness/session_id)', async () => {
+    const blocksBefore = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
+      .bind(CC_SESSION_ID)
+      .first<{ n: number }>();
+
+    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/admin/reindex', {
+      method: 'POST',
+      headers: { 'x-dev-machine': 'testbox-wsl', 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(res.status).toBe(200);
+    await drainQueue();
+
+    const states = await testEnv.DB.prepare(
+      'SELECT machine_id, parse_state FROM files WHERE session_id = ?1 ORDER BY machine_id',
+    )
+      .bind(CC_SESSION_ID)
+      .all<{ machine_id: string; parse_state: string }>();
+    const byMachine = Object.fromEntries(states.results.map((r) => [r.machine_id, r.parse_state]));
+    expect(Object.values(byMachine).filter((s) => s === 'parsed')).toHaveLength(1);
+    expect(Object.values(byMachine).filter((s) => s === 'superseded')).toHaveLength(1);
+    expect(byMachine['testbox-wsl']).toBe('parsed');
+    expect(byMachine['testbox-win']).toBe('superseded');
+
+    const sessionCount = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM sessions WHERE session_id = ?1')
+      .bind(CC_SESSION_ID)
+      .first<{ n: number }>();
+    expect(sessionCount!.n).toBe(1);
+
+    const blocksAfter = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
+      .bind(CC_SESSION_ID)
+      .first<{ n: number }>();
+    expect(blocksAfter!.n).toBe(blocksBefore!.n);
+  });
+
   it('serves the normalized session and raw passthrough', async () => {
     const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${CC_SESSION_ID}`, {
       headers: { 'x-dev-machine': 'testbox-wsl' },

@@ -1,4 +1,5 @@
 import type { Identity } from '../auth/identity';
+import { detect } from '../ingest/detect';
 
 /** POST /api/v1/heartbeat */
 export async function heartbeat(request: Request, env: Env, identity: Identity): Promise<Response> {
@@ -116,13 +117,24 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
       )
         .bind(machineId)
         .run();
+      const det = detect(store, relpath);
       const row = await env.DB.prepare(
-        `INSERT INTO files (machine_id, store, relpath, r2_key, size, content_hash, parse_state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending')
-         ON CONFLICT (machine_id, store, relpath) DO UPDATE SET parse_state = 'pending', size = excluded.size
+        `INSERT INTO files (machine_id, store, relpath, r2_key, size, content_hash, harness, session_id, parse_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')
+         ON CONFLICT (machine_id, store, relpath) DO UPDATE SET
+           parse_state = 'pending', size = excluded.size, harness = excluded.harness, session_id = excluded.session_id
          RETURNING id`,
       )
-        .bind(machineId, store, relpath, obj.key, obj.size, obj.checksums?.sha256 ? hex(obj.checksums.sha256) : 'unknown')
+        .bind(
+          machineId,
+          store,
+          relpath,
+          obj.key,
+          obj.size,
+          obj.checksums?.sha256 ? hex(obj.checksums.sha256) : 'unknown',
+          det.harness,
+          det.sessionId ?? null,
+        )
         .first<{ id: number }>();
       await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: obj.key, reason: 'reindex' });
       enqueued++;
