@@ -974,3 +974,91 @@ describe('a recovery chain continues past a second failure that is a zero-turn p
     expect(sessionRecovered?.index_state).toBe('ready');
   });
 });
+
+describe('a recovery kick leaves the candidate pending, not terminal, so a dropped recover message is self-healed by files/check', () => {
+  const SESSION_ID = '55555555-6666-4444-8444-000000000009';
+  const CONTENT_A = [
+    ccUserLine({ uuid: 'kick-u1', text: 'unique-marker-kick searchable content from A' }),
+    ccAssistantLine({ uuid: 'kick-a1', parentUuid: 'kick-u1', text: 'unique-marker-kick response from A' }),
+  ].join('\n');
+  const CONTENT_B = [
+    ccUserLine({ uuid: 'kick-u2', text: 'unique-marker-kick searchable content from B' }),
+    ccAssistantLine({ uuid: 'kick-a2', parentUuid: 'kick-u2', text: 'unique-marker-kick response from B' }),
+  ].join('\n');
+
+  beforeAll(async () => {
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('kick-a', 'linux', 0) ON CONFLICT (machine_id) DO UPDATE SET priority = 0",
+      ),
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('kick-b', 'linux', 1) ON CONFLICT (machine_id) DO UPDATE SET priority = 1",
+      ),
+    ]);
+  });
+
+  it('the kicked candidate is pending BEFORE its recover message is sent; a dropped delivery is still repaired by files/check', async () => {
+    const resA = await putFile('kick-a', 'claude-projects', `kick-a-path/${SESSION_ID}.jsonl`, CONTENT_A);
+    expect(resA.status).toBe(201);
+    const fileIdA = ((await resA.json()) as { file_id: number }).file_id;
+    const r2KeyA = `raw/kick-a/claude-projects/kick-a-path/${SESSION_ID}.jsonl`;
+    await deliverOne(fileIdA, r2KeyA);
+
+    const resB = await putFile('kick-b', 'claude-projects', `kick-b-path/${SESSION_ID}.jsonl`, CONTENT_B);
+    expect(resB.status).toBe(201);
+    const fileIdB = ((await resB.json()) as { file_id: number }).file_id;
+    const r2KeyB = `raw/kick-b/claude-projects/kick-b-path/${SESSION_ID}.jsonl`;
+    await deliverOne(fileIdB, r2KeyB);
+    const rowB1 = await testEnv.DB.prepare('SELECT parse_state, content_hash FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string; content_hash: string }>();
+    expect(rowB1?.parse_state).toBe('superseded'); // A (priority 0) beat B (priority 1)
+
+    // Canonical A's R2 object goes missing — its next parse throws, errors the session, and
+    // kicks B (the only other candidate, currently 'superseded' — a terminal state) for recovery.
+    await testEnv.RAW.delete(r2KeyA);
+    await deliverOne(fileIdA, r2KeyA);
+
+    // Regression assertion: the kick must flip B's row to 'pending' BEFORE sending its recover
+    // message, not leave it at the terminal 'superseded' it was at going in. Without
+    // markPendingAndEnqueue's flip, this stays 'superseded'.
+    const rowB2 = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string }>();
+    expect(rowB2?.parse_state).toBe('pending');
+
+    // Simulate the recover message getting dropped/dead-lettered: never deliver it. B's owning
+    // machine's periodic resync (files/check) must see a non-terminal row and re-enqueue it
+    // itself — a terminal 'superseded' row would have read as "present, nothing to do" and never
+    // self-healed.
+    const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
+    try {
+      const checkRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+        method: 'POST',
+        headers: { 'x-dev-machine': 'kick-b', 'content-type': 'application/json' },
+        body: JSON.stringify({
+          files: [{ store: 'claude-projects', relpath: `kick-b-path/${SESSION_ID}.jsonl`, sha256: `sha256:${rowB1!.content_hash}` }],
+        }),
+      });
+      expect(checkRes.status).toBe(200);
+      const body = (await checkRes.json()) as { missing: Array<{ store: string; relpath: string }> };
+      expect(body.missing).toHaveLength(0); // bytes present, hash matches
+      expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({ file_id: fileIdB, r2_key: r2KeyB }));
+    } finally {
+      sendSpy.mockRestore();
+    }
+
+    // The self-healed message actually indexes the file and recovers the session.
+    await deliverOne(fileIdB, r2KeyB, rowB1!.content_hash, 'recover');
+    const recovered = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string }>();
+    expect(recovered?.parse_state).toBe('parsed');
+
+    const session = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(session?.canonical_file_id).toBe(fileIdB);
+    expect(session?.index_state).toBe('ready');
+  });
+});

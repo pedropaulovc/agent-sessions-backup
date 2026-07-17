@@ -1,5 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
+import { markPendingAndEnqueue } from '../queue';
 import { hex } from './ops';
 
 const TERMINAL_PARSE_STATES = new Set(['parsed', 'skipped', 'superseded']);
@@ -63,9 +64,13 @@ export async function putFile(
     }
     // A non-terminal state (a dropped/failed queue message) never finished indexing in the
     // first place; a just-restored object needs its (possibly different) bytes revalidated even
-    // if the row was previously 'parsed'. Either way: re-enqueue.
+    // if the row was previously 'parsed'. Either way: re-enqueue. markPendingAndEnqueue flips
+    // parse_state to 'pending' BEFORE sending — otherwise a restored row that was terminal
+    // (e.g. 'parsed'/'skipped') would stay terminal while its parse message is in flight, and if
+    // PARSE_QUEUE.send fails (or the message is later dropped), a client retry would see
+    // 'unchanged' with the now-correct checksum and never requeue, same for files/check.
     if (!TERMINAL_PARSE_STATES.has(existing.parse_state) || restored) {
-      await env.PARSE_QUEUE.send({ file_id: existing.id, r2_key: existing.r2_key, reason: 'upload', content_hash: existing.content_hash });
+      await markPendingAndEnqueue(existing, 'upload', env);
       return Response.json({ status: 'unchanged', file_id: existing.id, requeued: true, restored });
     }
     return Response.json({ status: 'unchanged', file_id: existing.id });
@@ -159,7 +164,7 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
       // non-terminal parse_state (lost/exhausted queue message) would otherwise never get
       // reindexed: the collector sees "present" and never re-uploads, so nothing else requeues it.
       if (!TERMINAL_PARSE_STATES.has(row.parse_state)) {
-        await env.PARSE_QUEUE.send({ file_id: row.id, r2_key: row.r2_key, reason: 'upload', content_hash: row.content_hash });
+        await markPendingAndEnqueue(row, 'upload', env);
       }
     }
   }

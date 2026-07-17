@@ -45,13 +45,15 @@ async function drainQueue(): Promise<void> {
 }
 
 /** Deliver a single, explicitly-specified message — bypasses the parse_state='pending' filter
- * drainQueue() uses, for tests that need to redeliver a file regardless of its current row state. */
-async function deliverOne(fileId: number, r2Key: string): Promise<void> {
+ * drainQueue() uses, for tests that need to redeliver a file regardless of its current row state.
+ * An explicit contentHash simulates redelivering a message enqueued for a since-superseded
+ * upload — the consumer's hash guards use it to detect the row has since moved on. */
+async function deliverOne(fileId: number, r2Key: string, contentHash?: string): Promise<void> {
   const message = {
     id: String(fileId),
     timestamp: new Date(),
     attempts: 1,
-    body: { file_id: fileId, r2_key: r2Key, reason: 'upload' as const },
+    body: { file_id: fileId, r2_key: r2Key, reason: 'upload' as const, ...(contentHash !== undefined ? { content_hash: contentHash } : {}) },
     ack() {},
     retry() {},
   };
@@ -203,11 +205,13 @@ describe('upload unchanged fast-path re-enqueues stuck files', () => {
     expect(reuploadBody.status).toBe('unchanged');
     expect(reuploadBody.requeued).toBe(true);
 
-    // The row itself isn't touched by the response handler — only a queue message was sent.
-    const stillError = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+    // The response handler flips the row to 'pending' BEFORE sending the parse message (round 17:
+    // a row with an outstanding message must be non-terminal, so files/check and this same fast
+    // path can self-heal a lost/dead-lettered delivery) — no longer left at the stale 'error'.
+    const nowPending = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
       .bind(fileId)
       .first<{ parse_state: string }>();
-    expect(stillError?.parse_state).toBe('error');
+    expect(nowPending?.parse_state).toBe('pending');
 
     const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
     await deliverOne(fileId, r2Key);
@@ -320,6 +324,57 @@ describe('upload unchanged fast-path re-enqueues stuck files', () => {
       .bind(TERMINAL_RESTORE_SESSION_ID)
       .first<{ index_state: string }>();
     expect(recoveredSession?.index_state).toBe('ready');
+  });
+
+  it('a restored terminal row is pending IMMEDIATELY after the response, not left terminal while its parse message is in flight — and a repeat same-hash reupload before delivery still requeues', async () => {
+    const PENDING_RESTORE_SESSION_ID = '44444444-5555-4444-8444-999999999999';
+    const pendingRestoreRelpath = `pending-restore-demo/${PENDING_RESTORE_SESSION_ID}.jsonl`;
+    const pendingRestoreContent = `${ccUserLine({ uuid: 'pr-u1', text: 'pending restore test content' })}\n`;
+
+    const first = await putFile('claude-projects', pendingRestoreRelpath, pendingRestoreContent);
+    expect(first.status).toBe(201);
+    const fileId = ((await first.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    const parsedRow = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(parsedRow?.parse_state).toBe('parsed'); // terminal going in
+
+    // Lose the backing R2 object without touching the D1 row at all: parse_state stays 'parsed'.
+    const r2Key = `raw/${MACHINE}/claude-projects/${pendingRestoreRelpath}`;
+    await testEnv.RAW.delete(r2Key);
+
+    const reupload = await putFile('claude-projects', pendingRestoreRelpath, pendingRestoreContent);
+    expect(reupload.status).toBe(200);
+    const reuploadBody = (await reupload.json()) as { status: string; requeued?: boolean; restored?: boolean };
+    expect(reuploadBody.requeued).toBe(true);
+    expect(reuploadBody.restored).toBe(true);
+
+    // Regression assertion: the row must be 'pending' IMMEDIATELY after the response, not still
+    // 'parsed' while its freshly-sent parse message is in flight. Without markPendingAndEnqueue's
+    // flip, a send failure (or a later dropped/dead-lettered message) would leave the row
+    // terminal forever — a same-hash retry or files/check would both read a 'parsed' row as
+    // "done, nothing to do" and never repair it.
+    const nowPending = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(nowPending?.parse_state).toBe('pending');
+
+    // Simulate the just-sent parse message getting lost: don't deliver it. A second same-hash
+    // reupload before delivery must still see a non-terminal row and requeue via the plain
+    // non-terminal branch — no restore needed this time, since the object is already correct.
+    const secondReupload = await putFile('claude-projects', pendingRestoreRelpath, pendingRestoreContent);
+    expect(secondReupload.status).toBe(200);
+    const secondBody = (await secondReupload.json()) as { status: string; requeued?: boolean; restored?: boolean };
+    expect(secondBody.requeued).toBe(true);
+    expect(secondBody.restored).toBe(false);
+
+    await deliverOne(fileId, r2Key);
+    const recovered = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(recovered?.parse_state).toBe('parsed');
   });
 
   it('re-upload of a hash-matching row whose R2 object is PRESENT but CORRUPT (wrong bytes at the same key) also restores it, not just a missing object', async () => {
@@ -874,6 +929,79 @@ describe('subagent meta linking, both arrival orders', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { session: { parentToolUseId?: string } };
     expect(body.session.parentToolUseId).toBe('toolu_meta_first');
+  });
+});
+
+describe('subagent meta parse is guarded by content_hash (regression: a stale in-flight meta parse could overwrite a fresher upload\'s link and mark the row parsed)', () => {
+  const PROJECT_SLUG2 = '-home-tester-src-subagent-hash-guard';
+  const SUBAGENT_PARENT2 = '99999999-8888-4444-8444-888888888888';
+  const SUBAGENT_HASHGUARD = 'cccccccc-1111-4444-8444-222222222222';
+
+  function subagentTranscript(tag: string): string {
+    return `${[
+      ccUserLine({ uuid: `${tag}-u1`, text: 'subagent task' }),
+      ccAssistantLine({ uuid: `${tag}-a1`, parentUuid: `${tag}-u1`, text: 'subagent result' }),
+    ].join('\n')}\n`;
+  }
+  function subagentMeta(toolUseId: string): string {
+    return JSON.stringify({ toolUseId, agentType: 'general-purpose' });
+  }
+  async function parentToolUseId(sessionId: string): Promise<string | null | undefined> {
+    const row = await testEnv.DB.prepare('SELECT parent_tool_use_id FROM sessions WHERE session_id = ?1')
+      .bind(sessionId)
+      .first<{ parent_tool_use_id: string | null }>();
+    return row?.parent_tool_use_id;
+  }
+
+  it('a stale meta message (content_hash no longer matches) does not overwrite the link or mark the row parsed; the fresh message still links correctly', async () => {
+    const metaRelpath = `${PROJECT_SLUG2}/${SUBAGENT_PARENT2}/subagents/agent-${SUBAGENT_HASHGUARD}.meta.json`;
+    const transcriptRelpath = `${PROJECT_SLUG2}/${SUBAGENT_PARENT2}/subagents/agent-${SUBAGENT_HASHGUARD}.jsonl`;
+
+    const transcriptRes = await putFile('claude-projects', transcriptRelpath, subagentTranscript('hg'));
+    expect(transcriptRes.status).toBe(201);
+    await drainQueue();
+
+    const metaRes1 = await putFile('claude-projects', metaRelpath, subagentMeta('toolu_stale'));
+    expect(metaRes1.status).toBe(201);
+    const metaFileId = ((await metaRes1.json()) as { file_id: number }).file_id;
+    const metaR2Key = `raw/${MACHINE}/claude-projects/${metaRelpath}`;
+    await deliverOne(metaFileId, metaR2Key);
+    expect(await parentToolUseId(SUBAGENT_HASHGUARD)).toBe('toolu_stale');
+
+    const staleRow = await testEnv.DB.prepare('SELECT content_hash FROM files WHERE id = ?1')
+      .bind(metaFileId)
+      .first<{ content_hash: string }>();
+    const staleHash = staleRow!.content_hash;
+
+    // Re-upload the meta with a DIFFERENT toolUseId — this changes the row's content_hash and
+    // enqueues a fresh message for it, but the row is deliberately never drained here: we want
+    // to redeliver the STALE (pre-reupload) message explicitly instead, simulating a delayed/
+    // reordered delivery racing the fresh upload's own message.
+    const metaRes2 = await putFile('claude-projects', metaRelpath, subagentMeta('toolu_fresh'));
+    expect(metaRes2.status).toBe(201);
+
+    // Redeliver the OLD message, still carrying the now-stale content_hash. Without the guard,
+    // linkSubagentMeta would re-read R2 live (now holding the FRESH bytes, since the fresh
+    // upload already landed) and — worse — mark the row 'parsed' for content a fresher message
+    // already owns. With the guard, the whole branch is skipped on mismatch.
+    await deliverOne(metaFileId, metaR2Key, staleHash);
+
+    // Link must NOT have been touched by the stale delivery — still whatever the last genuine
+    // write left it at ('toolu_stale'), since the fresh message hasn't been delivered yet.
+    expect(await parentToolUseId(SUBAGENT_HASHGUARD)).toBe('toolu_stale');
+    const rowAfterStale = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(metaFileId)
+      .first<{ parse_state: string }>();
+    expect(rowAfterStale?.parse_state).toBe('pending'); // not marked parsed by the stale delivery
+
+    // Now deliver the FRESH message (drainQueue picks up the still-pending row) — it should link
+    // correctly and mark the row parsed.
+    await drainQueue();
+    expect(await parentToolUseId(SUBAGENT_HASHGUARD)).toBe('toolu_fresh');
+    const rowAfterFresh = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(metaFileId)
+      .first<{ parse_state: string }>();
+    expect(rowAfterFresh?.parse_state).toBe('parsed');
   });
 });
 

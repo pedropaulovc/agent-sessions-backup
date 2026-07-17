@@ -3,6 +3,7 @@ import { readJsonlLines } from './jsonl';
 import type { NormalizedSession } from './normalize';
 import { parseClaudeCode } from './parsers/claude-code';
 import { parseCodex } from './parsers/codex';
+import { markPendingAndEnqueue } from '../queue';
 
 interface FileRow {
   id: number;
@@ -14,6 +15,7 @@ interface FileRow {
   mtime: string | null;
   harness: string | null;
   session_id: string | null;
+  content_hash: string;
 }
 
 export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: Env): Promise<void> {
@@ -66,11 +68,13 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
           // previously-superseded one, freed up now that this file is 'error') and kick its parse
           // so the session can recover automatically instead of staying errored until a manual
           // reindex. Runs on every retry attempt too; harmless — the hash-guarded markParsed and
-          // idempotent writeSession absorb duplicate recovery attempts.
+          // idempotent writeSession absorb duplicate recovery attempts. markPendingAndEnqueue
+          // flips the candidate to 'pending' before sending — chooseRecoveryCandidate can return a
+          // 'superseded' (terminal) file, and leaving it terminal while its recovery message is
+          // in flight would strand the session if that message is ever dropped/dead-lettered:
+          // files/check only re-enqueues non-terminal rows.
           const recovery = await chooseRecoveryCandidate(fileRow.session_id, msg.body.file_id, env);
-          if (recovery) {
-            await env.PARSE_QUEUE.send({ file_id: recovery.id, r2_key: recovery.r2_key, reason: 'recover', content_hash: recovery.content_hash });
-          }
+          if (recovery) await markPendingAndEnqueue(recovery, 'recover', env);
         }
       }
       msg.retry();
@@ -80,7 +84,7 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
 
 async function parseOne(job: ParseMessage, env: Env): Promise<void> {
   const file = await env.DB.prepare(
-    'SELECT id, machine_id, store, relpath, r2_key, size, mtime, harness, session_id FROM files WHERE id = ?1',
+    'SELECT id, machine_id, store, relpath, r2_key, size, mtime, harness, session_id, content_hash FROM files WHERE id = ?1',
   )
     .bind(job.file_id)
     .first<FileRow>();
@@ -89,12 +93,20 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
   const det = detect(file.store, file.relpath);
 
   if (det.kind === 'subagent-meta') {
+    // job.content_hash (when present) guards against a stale in-flight parse: if a re-upload
+    // changed this row's content_hash before this message got a chance to run, a fresher message
+    // already handles the current content. Reading R2 now and writing its metadata (or marking
+    // this row 'parsed') would describe the EARLIER upload, not the current one — overwriting
+    // parent_tool_use_id with stale data and, since the write is otherwise unconditional, leaving
+    // no self-healing path if the fresher message is ever lost (files/check only re-enqueues
+    // non-terminal rows). Skip the whole branch on mismatch; the fresher message handles it.
+    if (job.content_hash !== undefined && file.content_hash !== job.content_hash) return;
     await linkSubagentMeta(file, env);
-    await markParsed(file.id, env, 'parsed');
+    await markParsed(file.id, env, 'parsed', undefined, undefined, job.content_hash);
     return;
   }
   if (!det.sessionId || (det.harness !== 'claude-code' && det.harness !== 'codex')) {
-    await markParsed(file.id, env, 'skipped');
+    await markParsed(file.id, env, 'skipped', undefined, undefined, job.content_hash);
     return;
   }
 
@@ -165,11 +177,11 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
       if (session?.canonical_file_id === file.id || job.reason === 'recover') {
         // If a valid duplicate exists (even a previously-superseded one — this file's demise
         // frees it up again), kick its parse so the session recovers automatically instead of
-        // staying errored until a manual reindex.
+        // staying errored until a manual reindex. See the catch path above for why
+        // markPendingAndEnqueue (not a raw send) matters: the candidate can be terminal
+        // ('superseded'), and it must not stay that way while its recovery message is in flight.
         const recovery = await chooseRecoveryCandidate(det.sessionId, file.id, env);
-        if (recovery) {
-          await env.PARSE_QUEUE.send({ file_id: recovery.id, r2_key: recovery.r2_key, reason: 'recover', content_hash: recovery.content_hash });
-        }
+        if (recovery) await markPendingAndEnqueue(recovery, 'recover', env);
       }
     }
     return;
