@@ -106,12 +106,35 @@ echo ""
 echo "=== Data Collection Endpoint ==="
 # UNVERIFIED: `az monitor data-collection endpoint create` syntax confirmed against
 # Microsoft Learn's "Configure Azure Monitor pipeline with CLI" doc; not run live here.
-az monitor data-collection endpoint show --name "$DCE_NAME" --resource-group "$RG_NAME" --only-show-errors >/dev/null 2>&1 \
-    || az monitor data-collection endpoint create --name "$DCE_NAME" --resource-group "$RG_NAME" \
+if ! az monitor data-collection endpoint show --name "$DCE_NAME" --resource-group "$RG_NAME" --only-show-errors >/dev/null 2>&1; then
+    az monitor data-collection endpoint create --name "$DCE_NAME" --resource-group "$RG_NAME" \
         --location "$LOCATION" --public-network-access "Enabled" --only-show-errors >/dev/null
+    DCE_ACTION="created"
+else
+    # A bare existence check accepts an existing DCE with public network
+    # access disabled (e.g. left over from an earlier private-link attempt)
+    # and still hands back its public ingestion URL below — which a
+    # Cloudflare Worker running outside Azure's network can never reach, even
+    # though provisioning prints OK. `properties.networkAcls.publicNetworkAccess`
+    # is doc-verified (learn.microsoft.com/azure/templates/microsoft.insights/
+    # 2023-03-11/datacollectionendpoints); the typed show command flattens
+    # `properties.*` to the top level, same as the already-working
+    # `--query logsIngestion.endpoint` below, so `--query
+    # networkAcls.publicNetworkAccess` reads it. `update` documents the same
+    # `--public-network-access` flag as `create`, so fixing drift doesn't need
+    # to fall back to `az rest`.
+    CURRENT_PNA=$(az monitor data-collection endpoint show --name "$DCE_NAME" --resource-group "$RG_NAME" --query networkAcls.publicNetworkAccess -o tsv)
+    if [ "$CURRENT_PNA" != "Enabled" ]; then
+        az monitor data-collection endpoint update --name "$DCE_NAME" --resource-group "$RG_NAME" \
+            --public-network-access "Enabled" --only-show-errors >/dev/null
+        DCE_ACTION="updated (publicNetworkAccess was $CURRENT_PNA)"
+    else
+        DCE_ACTION="unchanged"
+    fi
+fi
 DCE_ID=$(az monitor data-collection endpoint show --name "$DCE_NAME" --resource-group "$RG_NAME" --query id -o tsv)
 DCE_LOGS_INGESTION=$(az monitor data-collection endpoint show --name "$DCE_NAME" --resource-group "$RG_NAME" --query logsIngestion.endpoint -o tsv)
-echo "OK: $DCE_NAME ($DCE_ID)"
+echo "OK: $DCE_NAME ($DCE_ACTION) ($DCE_ID)"
 
 echo ""
 echo "=== Data Collection Rule (native OTLP ingestion: logs + traces) ==="
@@ -394,16 +417,18 @@ echo "=== Availability Test (webtest) ==="
 # resource in the portal UI) follow the long-standing classic-webtest schema;
 # not exercised against a live subscription in this environment.
 WEBTEST_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/microsoft.insights/webtests/$WEBTEST_NAME"
-if ! az rest --method get --url "https://management.azure.com${WEBTEST_ID}?api-version=2022-06-15" --only-show-errors >/dev/null 2>&1; then
-    REQUEST_GUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
-    TEST_GUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
-    WEBTEST_XML="<WebTest Name=\"$WEBTEST_NAME\" Id=\"$TEST_GUID\" Enabled=\"True\" CssProjectStructure=\"\" CssIteration=\"\" Timeout=\"30\" WorkItemIds=\"\" xmlns=\"http://microsoft.com/schemas/VisualStudio/TeamTest/2010\" Description=\"\" CredentialUserName=\"\" CredentialPassword=\"\" PreAuthenticate=\"True\" Proxy=\"default\" StopOnError=\"False\" RecordedResultFile=\"\" ResultsLocale=\"\"><Items><Request Method=\"GET\" Guid=\"$REQUEST_GUID\" Version=\"1.1\" Url=\"$HEALTHZ_URL\" ThinkTime=\"0\" Timeout=\"30\" ParseDependentRequests=\"False\" FollowRedirects=\"True\" RecordResult=\"True\" Cache=\"False\" ResponseTimeGoal=\"0\" Encoding=\"utf-8\" ExpectedHttpStatusCode=\"200\" ExpectedResponseUrl=\"\" ReportingName=\"\" IgnoreHttpStatusCode=\"False\" /></Items></WebTest>"
-    WEBTEST_XML_ESCAPED=$(printf '%s' "$WEBTEST_XML" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+WEBTEST_URL="https://management.azure.com${WEBTEST_ID}?api-version=2022-06-15"
 
-    # See the DCR_RULE_FILE mktemp comment above — same BSD-mktemp requirement.
-    WEBTEST_BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/agent-backup-webtest.XXXXXX")
-    trap 'rm -f "$WEBTEST_BODY_FILE"' EXIT
-    cat > "$WEBTEST_BODY_FILE" <<EOF
+REQUEST_GUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
+TEST_GUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
+WEBTEST_XML="<WebTest Name=\"$WEBTEST_NAME\" Id=\"$TEST_GUID\" Enabled=\"True\" CssProjectStructure=\"\" CssIteration=\"\" Timeout=\"30\" WorkItemIds=\"\" xmlns=\"http://microsoft.com/schemas/VisualStudio/TeamTest/2010\" Description=\"\" CredentialUserName=\"\" CredentialPassword=\"\" PreAuthenticate=\"True\" Proxy=\"default\" StopOnError=\"False\" RecordedResultFile=\"\" ResultsLocale=\"\"><Items><Request Method=\"GET\" Guid=\"$REQUEST_GUID\" Version=\"1.1\" Url=\"$HEALTHZ_URL\" ThinkTime=\"0\" Timeout=\"30\" ParseDependentRequests=\"False\" FollowRedirects=\"True\" RecordResult=\"True\" Cache=\"False\" ResponseTimeGoal=\"0\" Encoding=\"utf-8\" ExpectedHttpStatusCode=\"200\" ExpectedResponseUrl=\"\" ReportingName=\"\" IgnoreHttpStatusCode=\"False\" /></Items></WebTest>"
+WEBTEST_XML_ESCAPED=$(printf '%s' "$WEBTEST_XML" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
+
+# See the DCR_RULE_FILE mktemp comment above — same BSD-mktemp requirement.
+WEBTEST_BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/agent-backup-webtest.XXXXXX")
+WEBTEST_CURRENT_FILE=$(mktemp "${TMPDIR:-/tmp}/agent-backup-webtest-current.XXXXXX")
+trap 'rm -f "$WEBTEST_BODY_FILE" "$WEBTEST_CURRENT_FILE"' EXIT
+cat > "$WEBTEST_BODY_FILE" <<EOF
 {
   "location": "$LOCATION",
   "kind": "ping",
@@ -428,12 +453,36 @@ if ! az rest --method get --url "https://management.azure.com${WEBTEST_ID}?api-v
   }
 }
 EOF
-    az rest --method put --url "https://management.azure.com${WEBTEST_ID}?api-version=2022-06-15" \
-        --body "@$WEBTEST_BODY_FILE" --only-show-errors >/dev/null
-    rm -f "$WEBTEST_BODY_FILE"
-    trap - EXIT
+
+# Show-or-create-or-update-on-drift: a bare existence check would leave an
+# already-created webtest permanently pinned to whatever HEALTHZ_URL was set
+# on its FIRST run — e.g. the documented pre-M3 workers.dev override — with
+# every later re-run (post-M3, without the override) printing OK while Azure
+# keeps pinging the stale URL. Compare the URL embedded in the existing
+# test's Configuration.WebTest XML against the desired HEALTHZ_URL and PUT on
+# drift, same pattern as the DCR and scheduled-query alerts above.
+if az rest --method get --url "$WEBTEST_URL" --only-show-errors -o json > "$WEBTEST_CURRENT_FILE" 2>/dev/null; then
+    CURRENT_HEALTHZ_URL=$(python3 -c "
+import json, re
+with open('$WEBTEST_CURRENT_FILE') as f:
+    current = json.load(f)
+xml = current.get('properties', {}).get('Configuration', {}).get('WebTest', '')
+m = re.search(r'Url=\"([^\"]*)\"', xml)
+print(m.group(1) if m else '')
+")
+    if [ "$CURRENT_HEALTHZ_URL" = "$HEALTHZ_URL" ]; then
+        WEBTEST_ACTION="unchanged"
+    else
+        az rest --method put --url "$WEBTEST_URL" --body "@$WEBTEST_BODY_FILE" --only-show-errors >/dev/null
+        WEBTEST_ACTION="updated (was $CURRENT_HEALTHZ_URL)"
+    fi
+else
+    az rest --method put --url "$WEBTEST_URL" --body "@$WEBTEST_BODY_FILE" --only-show-errors >/dev/null
+    WEBTEST_ACTION="created"
 fi
-echo "OK: $WEBTEST_NAME (pings $HEALTHZ_URL)"
+rm -f "$WEBTEST_BODY_FILE" "$WEBTEST_CURRENT_FILE"
+trap - EXIT
+echo "OK: $WEBTEST_NAME ($WEBTEST_ACTION) (pings $HEALTHZ_URL)"
 
 echo ""
 echo "=== Availability Metric Alert ==="
@@ -466,6 +515,7 @@ echo "Managed Identity ID:    $MI_CLIENT_ID"
 echo "DCR resource ID:        $DCR_ID"
 echo "OTLP logs endpoint:     $OTLP_LOGS_ENDPOINT"
 echo "OTLP traces endpoint:   $OTLP_TRACES_ENDPOINT"
+echo "OIDC issuer URL:        $ISSUER_URL"
 
 OUTPUT_FILE="$REPO_ROOT/infra/out/azure.env"
 mkdir -p "$(dirname "$OUTPUT_FILE")"
@@ -477,6 +527,7 @@ OTLP_TRACES_ENDPOINT=$OTLP_TRACES_ENDPOINT
 GATEWAY_FEDERATION_SUBJECT=$FED_SUBJECT
 DCR_RESOURCE_ID=$DCR_ID
 LOG_ANALYTICS_WORKSPACE_ID=$LAW_ID
+OIDC_ISSUER_URL=$ISSUER_URL
 EOF
 echo ""
 echo "Written to: $OUTPUT_FILE"

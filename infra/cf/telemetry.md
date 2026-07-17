@@ -64,7 +64,13 @@ consistently; don't mix the two conventions in the same session.
    real custom domain.
 5. Fill `hub/wrangler.telemetry-gateway.jsonc`'s `vars` from
    `infra/out/azure.env`: `TENANT_ID`, `APP_CLIENT_ID`, `OTLP_TRACES_ENDPOINT`,
-   `OTLP_LOGS_ENDPOINT`, and set `OIDC_SIGNING_KID` to the kid from step 2.
+   `OTLP_LOGS_ENDPOINT`, **and `OIDC_ISSUER_URL`** (also written to
+   `azure.env` by step 4 — it must be byte-for-byte the same `<issuer-url>`
+   you passed to `provision.sh`, since that's the issuer the federated
+   credential in step 4 trusts; a mismatch here means every Entra token
+   exchange fails silently, no telemetry ever reaches Azure, and nothing
+   in this runbook surfaces the failure). Set `OIDC_SIGNING_KID` to the kid
+   from step 2.
 6. Set the private key from step 1 as a classic Worker secret named
    `OIDC_SIGNING_KEY` on the gateway. This is **not** a Cloudflare Secrets
    Store binding: Secrets Store caps values at 1024 bytes
