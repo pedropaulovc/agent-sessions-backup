@@ -251,6 +251,36 @@ describe('passkey auth', () => {
     expect(await res.json()).toEqual({ error: 'verification_failed' });
   });
 
+  it('returns 400 (not 500) when a verify body is not valid JSON — both endpoints', async () => {
+    for (const path of ['/webauthn/register/verify', '/webauthn/auth/verify']) {
+      const req = new Request(`${VIEWER}${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: VIEWER },
+        body: 'not json at all {',
+      });
+      const res = await call(req, okDeps);
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: 'bad_request' });
+    }
+  });
+
+  it('returns 400 (not 500) when clientDataJSON is not decodable — both endpoints', async () => {
+    // Structurally valid JSON, but clientDataJSON is not base64url-of-JSON, so the
+    // challenge extraction throws before any verifier runs.
+    const bad = {
+      id: 'cred-1',
+      rawId: 'AA',
+      type: 'public-key',
+      clientExtensionResults: {},
+      response: { clientDataJSON: '@@@not-base64@@@', attestationObject: 'AA', authenticatorData: 'AA', signature: 'AA' },
+    };
+    for (const path of ['/webauthn/register/verify', '/webauthn/auth/verify']) {
+      const res = await call(post(path, bad), okDeps);
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: 'bad_request' });
+    }
+  });
+
   it('single-uses an auth challenge in D1 (a replayed verify fails)', async () => {
     await insertCredential('cred-1');
     const { challenge } = (await (await call(post('/webauthn/auth/options', {}))).json()) as { challenge: string };

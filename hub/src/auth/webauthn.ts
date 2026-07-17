@@ -89,6 +89,23 @@ function challengeOf(response: { response: { clientDataJSON: string } }): string
   return clientData.challenge;
 }
 
+/**
+ * Parse a verify body and pull out its echoed challenge. Both steps — `request.json()`
+ * and the base64url/JSON decode of clientDataJSON — run before any verifier and both
+ * throw on garbage input; this is a public unauthenticated surface, so a malformed body
+ * must surface as a JSON 400 (via the null return), never an uncaught 500.
+ */
+async function readVerifyBody<T extends { response: { clientDataJSON: string } }>(
+  request: Request,
+): Promise<{ response: T; challenge: string } | null> {
+  try {
+    const response = (await request.json()) as T;
+    return { response, challenge: challengeOf(response) };
+  } catch {
+    return null;
+  }
+}
+
 /** Persist a single-use challenge in D1, pruning any that have already expired. */
 async function storeChallenge(env: Env, challenge: string, kind: 'register' | 'auth'): Promise<void> {
   const now = Date.now();
@@ -188,14 +205,15 @@ async function registerOptions(request: Request, url: URL, env: Env): Promise<Re
 
 async function registerVerify(request: Request, url: URL, env: Env, deps: WebAuthnDeps): Promise<Response> {
   if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
-  const response = (await request.json()) as RegistrationResponseJSON;
+  const parsed = await readVerifyBody<RegistrationResponseJSON>(request);
+  if (!parsed) return json({ error: 'bad_request' }, 400);
+  const { response, challenge } = parsed;
   const { rpID, origin } = rp(url, env);
 
   // An authenticated session skips the setup guard (owner adding another device); the
   // setup-token path is only for the first credential and is enforced atomically below.
   const authorized = (await readSession(request, env)) !== null;
 
-  const challenge = challengeOf(response);
   if (!(await consumeChallenge(env, challenge, 'register'))) return json({ error: 'bad_challenge' }, 400);
 
   // SimpleWebAuthn throws on malformed authenticator data / bad attestation. This is a
@@ -270,10 +288,11 @@ async function authOptions(request: Request, url: URL, env: Env): Promise<Respon
 
 async function authVerify(request: Request, url: URL, env: Env, deps: WebAuthnDeps): Promise<Response> {
   if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
-  const response = (await request.json()) as AuthenticationResponseJSON;
+  const parsed = await readVerifyBody<AuthenticationResponseJSON>(request);
+  if (!parsed) return json({ error: 'bad_request' }, 400);
+  const { response, challenge } = parsed;
   const { rpID, origin } = rp(url, env);
 
-  const challenge = challengeOf(response);
   if (!(await consumeChallenge(env, challenge, 'auth'))) return json({ error: 'bad_challenge' }, 400);
 
   const row = await env.DB.prepare(

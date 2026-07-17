@@ -568,6 +568,46 @@ describe('viewer', () => {
     expect(res.headers.get('location')).toBe('/login');
   });
 
+  it('preview: a DEV_AUTH bearer authorizes and is issued a short-lived preview cookie', async () => {
+    const url = new URL('https://sessions.vza.net/');
+    const previewEnv = { ...testEnv, ENVIRONMENT: 'preview', DEV_AUTH: 'preview-secret' } as unknown as Env;
+    const res = await viewerRoute(
+      new Request(url.toString(), { headers: { authorization: 'Bearer preview-secret' } }),
+      url,
+      previewEnv,
+    );
+    expect(res.status).toBe(200);
+    const setCookie = res.headers.get('set-cookie') ?? '';
+    expect(setCookie).toContain('__Host-preview-auth=preview-secret');
+    expect(setCookie).toContain('HttpOnly');
+    expect(setCookie).toContain('Secure');
+  });
+
+  it('preview: the issued preview cookie authorizes subsequent requests (no bearer needed)', async () => {
+    const url = new URL('https://sessions.vza.net/');
+    const previewEnv = { ...testEnv, ENVIRONMENT: 'preview', DEV_AUTH: 'preview-secret' } as unknown as Env;
+    const res = await viewerRoute(
+      new Request(url.toString(), { headers: { cookie: '__Host-preview-auth=preview-secret' } }),
+      url,
+      previewEnv,
+    );
+    expect(res.status).toBe(200);
+    // A cookie request is already authenticated — no need to re-issue.
+    expect(res.headers.get('set-cookie')).toBeNull();
+  });
+
+  it('production ignores DEV_AUTH entirely (a bearer still redirects to /login)', async () => {
+    const url = new URL('https://sessions.vza.net/');
+    const prodEnv = { ...testEnv, ENVIRONMENT: 'production', DEV_AUTH: 'preview-secret' } as unknown as Env;
+    const res = await viewerRoute(
+      new Request(url.toString(), { headers: { authorization: 'Bearer preview-secret' } }),
+      url,
+      prodEnv,
+    );
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
+  });
+
   it('leaves the development viewer open (never publicly reachable)', async () => {
     const url = new URL('https://sessions.vza.net/');
     const devEnv = { ...testEnv, ENVIRONMENT: 'development' } as unknown as Env;
