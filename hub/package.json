@@ -16,5 +16,8 @@
     "typescript": "^5.9.0",
     "vitest": "^4.1.0",
     "wrangler": "^4.111.0"
+  },
+  "dependencies": {
+    "@simplewebauthn/server": "13.3.2"
   }
 }
