@@ -45,13 +45,15 @@ async function drainQueue(): Promise<void> {
 /** Deliver a single, explicitly-specified message — for tests that need to redeliver a
  * particular file regardless of its current parse_state (drainQueue only picks up 'pending').
  * An explicit contentHash simulates a message enqueued for a since-superseded upload — the
- * consumer's markParsed guard uses it to detect the row has since moved on. */
-async function deliverOne(fileId: number, r2Key: string, contentHash?: string): Promise<void> {
+ * consumer's markParsed guard uses it to detect the row has since moved on. An explicit reason
+ * simulates redelivering the exact message a prior recovery enqueue sent (reason: 'recover'),
+ * which the consumer's catch path treats differently on failure than a plain 'upload' retry. */
+async function deliverOne(fileId: number, r2Key: string, contentHash?: string, reason: ParseMessage['reason'] = 'upload'): Promise<void> {
   const message = {
     id: String(fileId),
     timestamp: new Date(),
     attempts: 1,
-    body: { file_id: fileId, r2_key: r2Key, reason: 'upload' as const, ...(contentHash !== undefined ? { content_hash: contentHash } : {}) },
+    body: { file_id: fileId, r2_key: r2Key, reason, ...(contentHash !== undefined ? { content_hash: contentHash } : {}) },
     ack() {},
     retry() {},
   };
@@ -769,6 +771,108 @@ describe('a canonical parse that throws (not just zero-turn) also recovers via a
       .bind(SESSION_ID)
       .first<{ canonical_file_id: number; index_state: string }>();
     expect(sessionRecovered?.canonical_file_id).toBe(fileIdB);
+    expect(sessionRecovered?.index_state).toBe('ready');
+  });
+});
+
+describe('a recovery chain continues past a second failure (regression: canonical_file_id still points at the ORIGINAL failed file while a kicked duplicate is being recovery-parsed, so that duplicate throwing too made the guarded UPDATE match nothing and silently stopped the chain)', () => {
+  const SESSION_ID = '44444444-5555-4444-8444-000000000002';
+  const CONTENT_A = [
+    ccUserLine({ uuid: 'chain-u1', text: 'unique-marker-chain searchable content from A' }),
+    ccAssistantLine({ uuid: 'chain-a1', parentUuid: 'chain-u1', text: 'unique-marker-chain response from A' }),
+  ].join('\n');
+  const CONTENT_B = [
+    ccUserLine({ uuid: 'chain-u2', text: 'unique-marker-chain searchable content from B' }),
+    ccAssistantLine({ uuid: 'chain-a2', parentUuid: 'chain-u2', text: 'unique-marker-chain response from B' }),
+  ].join('\n');
+  const CONTENT_C = [
+    ccUserLine({ uuid: 'chain-u3', text: 'unique-marker-chain searchable content from C' }),
+    ccAssistantLine({ uuid: 'chain-a3', parentUuid: 'chain-u3', text: 'unique-marker-chain response from C' }),
+  ].join('\n');
+
+  beforeAll(async () => {
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('chain-a', 'linux', 0) ON CONFLICT (machine_id) DO UPDATE SET priority = 0",
+      ),
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('chain-b', 'linux', 1) ON CONFLICT (machine_id) DO UPDATE SET priority = 1",
+      ),
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('chain-c', 'linux', 2) ON CONFLICT (machine_id) DO UPDATE SET priority = 2",
+      ),
+    ]);
+  });
+
+  it('canonical A fails, kicked duplicate B ALSO fails (its object is also missing) → the chain continues to a third copy C, which recovers the session', async () => {
+    const resA = await putFile('chain-a', 'claude-projects', `chain-a-path/${SESSION_ID}.jsonl`, CONTENT_A);
+    expect(resA.status).toBe(201);
+    const fileIdA = ((await resA.json()) as { file_id: number }).file_id;
+    const r2KeyA = `raw/chain-a/claude-projects/chain-a-path/${SESSION_ID}.jsonl`;
+    await deliverOne(fileIdA, r2KeyA);
+
+    const resB = await putFile('chain-b', 'claude-projects', `chain-b-path/${SESSION_ID}.jsonl`, CONTENT_B);
+    expect(resB.status).toBe(201);
+    const fileIdB = ((await resB.json()) as { file_id: number }).file_id;
+    const r2KeyB = `raw/chain-b/claude-projects/chain-b-path/${SESSION_ID}.jsonl`;
+    await deliverOne(fileIdB, r2KeyB);
+    const rowB1 = await testEnv.DB.prepare('SELECT parse_state, content_hash FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string; content_hash: string }>();
+    expect(rowB1?.parse_state).toBe('superseded'); // A (priority 0) beat B (priority 1)
+
+    const resC = await putFile('chain-c', 'claude-projects', `chain-c-path/${SESSION_ID}.jsonl`, CONTENT_C);
+    expect(resC.status).toBe(201);
+    const fileIdC = ((await resC.json()) as { file_id: number }).file_id;
+    const r2KeyC = `raw/chain-c/claude-projects/chain-c-path/${SESSION_ID}.jsonl`;
+    await deliverOne(fileIdC, r2KeyC);
+    const rowC1 = await testEnv.DB.prepare('SELECT parse_state, content_hash FROM files WHERE id = ?1')
+      .bind(fileIdC)
+      .first<{ parse_state: string; content_hash: string }>();
+    expect(rowC1?.parse_state).toBe('superseded'); // A (priority 0) beat C (priority 2) too
+
+    // Canonical A's R2 object goes missing — its next parse throws, errors the session, and
+    // kicks the best other candidate. Between B (priority 1) and C (priority 2), B is preferred.
+    const sendSpyA = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
+    await testEnv.RAW.delete(r2KeyA);
+    await deliverOne(fileIdA, r2KeyA);
+    expect(sendSpyA).toHaveBeenCalledWith(expect.objectContaining({ file_id: fileIdB, reason: 'recover' }));
+    sendSpyA.mockRestore();
+
+    const sessionAfterA = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(sessionAfterA?.index_state).toBe('error');
+    expect(sessionAfterA?.canonical_file_id).toBe(fileIdA); // untouched — B's recovery hasn't run yet
+
+    // B's object is ALSO missing — its recovery-parse attempt throws too. canonical_file_id
+    // still points at A (never got to update it), so the guarded UPDATE alone would match
+    // nothing here; the reason: 'recover' fallback is what keeps the chain going to C.
+    const sendSpyB = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
+    await testEnv.RAW.delete(r2KeyB);
+    await deliverOne(fileIdB, r2KeyB, rowB1!.content_hash, 'recover');
+
+    const rowB2 = await testEnv.DB.prepare('SELECT parse_state, parse_error FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string; parse_error: string | null }>();
+    expect(rowB2?.parse_state).toBe('error');
+    expect(rowB2?.parse_error).toContain('r2_object_missing');
+
+    expect(sendSpyB).toHaveBeenCalledWith(expect.objectContaining({ file_id: fileIdC, reason: 'recover' }));
+    sendSpyB.mockRestore();
+
+    // C is still intact — deliver its recovery message and the session should fully recover.
+    await deliverOne(fileIdC, r2KeyC, rowC1!.content_hash, 'recover');
+
+    const rowC2 = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdC)
+      .first<{ parse_state: string }>();
+    expect(rowC2?.parse_state).toBe('parsed');
+
+    const sessionRecovered = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(sessionRecovered?.canonical_file_id).toBe(fileIdC);
     expect(sessionRecovered?.index_state).toBe('ready');
   });
 });

@@ -42,24 +42,35 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
       // permanently destroying the last copy of a session that a transient/permanent read
       // failure happened to hit. search()/getSession()/listSessions() all surface index_state in
       // their response shape, so callers can filter or flag on it themselves.
-      const updated = await env.DB.prepare(
-        `UPDATE sessions SET index_state = 'error'
-         WHERE session_id = (SELECT session_id FROM files WHERE id = ?1 AND session_id IS NOT NULL)
-           AND (canonical_file_id IS NULL OR canonical_file_id = ?1)
-         RETURNING session_id`,
-      )
+      const fileRow = await env.DB.prepare('SELECT session_id FROM files WHERE id = ?1 AND session_id IS NOT NULL')
         .bind(msg.body.file_id)
         .first<{ session_id: string }>();
-      if (updated) {
-        // This file was (or would have been) canonical for the session — the same recovery this
-        // gets in the zero-turn branch: look for another valid duplicate (even a previously-
-        // superseded one, freed up now that this file is 'error') and kick its parse so the
-        // session can recover automatically instead of staying errored until a manual reindex.
-        // Runs on every retry attempt too; harmless — the hash-guarded markParsed and idempotent
-        // writeSession absorb duplicate recovery attempts.
-        const recovery = await chooseRecoveryCandidate(updated.session_id, msg.body.file_id, env);
-        if (recovery) {
-          await env.PARSE_QUEUE.send({ file_id: recovery.id, r2_key: recovery.r2_key, reason: 'recover', content_hash: recovery.content_hash });
+      if (fileRow) {
+        const updated = await env.DB.prepare(
+          `UPDATE sessions SET index_state = 'error'
+           WHERE session_id = ?1 AND (canonical_file_id IS NULL OR canonical_file_id = ?2)
+           RETURNING session_id`,
+        )
+          .bind(fileRow.session_id, msg.body.file_id)
+          .first<{ session_id: string }>();
+        // A recovery-kicked duplicate (reason: 'recover') failing does NOT match the guard above:
+        // canonical_file_id still points at the session's ORIGINAL canonical file until some
+        // recovery attempt actually succeeds, so this predicate would otherwise halt the chain the
+        // moment a second (or third...) candidate also throws. Continue unconditionally for
+        // 'recover' messages instead. Termination is guaranteed — each failed attempt flips exactly
+        // one file to 'error', and chooseRecoveryCandidate excludes error/skipped files, so the
+        // candidate pool strictly shrinks every time.
+        if (updated || msg.body.reason === 'recover') {
+          // This file was (or would have been) canonical for the session, or is itself a recovery
+          // attempt that just failed — either way, look for another valid duplicate (even a
+          // previously-superseded one, freed up now that this file is 'error') and kick its parse
+          // so the session can recover automatically instead of staying errored until a manual
+          // reindex. Runs on every retry attempt too; harmless — the hash-guarded markParsed and
+          // idempotent writeSession absorb duplicate recovery attempts.
+          const recovery = await chooseRecoveryCandidate(fileRow.session_id, msg.body.file_id, env);
+          if (recovery) {
+            await env.PARSE_QUEUE.send({ file_id: recovery.id, r2_key: recovery.r2_key, reason: 'recover', content_hash: recovery.content_hash });
+          }
         }
       }
       msg.retry();

@@ -487,4 +487,59 @@ describe('parseCodex', () => {
     expect(postCompactionUsage.blocks).toHaveLength(0); // usage-only turn, no indexable block
     expect(postCompactionUsage.usage?.inputTokens).toBe(200);
   });
+
+  it('a token_count after a top-level world_state marker also opens a fresh usage-only turn (regression: only the event_msg/context_compacted marker reset lastAssistant, not the top-level compacted/world_state shape)', async () => {
+    const lines = [
+      { timestamp: '2026-07-09T11:00:00.000Z', type: 'session_meta', payload: { session_id: CODEX_SESSION_ID, cwd: '/x' } },
+      { timestamp: '2026-07-09T11:00:01.000Z', type: 'turn_context', payload: { turn_id: 't1', model: 'gpt-test-9' } },
+      {
+        timestamp: '2026-07-09T11:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'world_state test question' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      {
+        timestamp: '2026-07-09T11:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'pre-world_state answer' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      // Usage A — belongs to the reply above.
+      {
+        timestamp: '2026-07-09T11:00:04.000Z',
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 10 } } },
+      },
+      // Top-level marker shape (not event_msg/context_compacted).
+      { timestamp: '2026-07-09T11:00:05.000Z', type: 'world_state', payload: {} },
+      // Usage B — with no indexable reply of its own.
+      {
+        timestamp: '2026-07-09T11:00:06.000Z',
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 200, output_tokens: 20 } } },
+      },
+    ].map((o) => JSON.stringify(o));
+
+    const s = await parseCodex(readJsonlLines(toStream(lines)), CODEX_SESSION_ID);
+    const roles = s.turns.map((t) => t.role);
+    expect(roles).toEqual(['user', 'assistant', 'system', 'assistant']);
+
+    const preMarkerReply = s.turns[1]!;
+    expect(preMarkerReply.blocks.map((b) => b.text)).toEqual(['pre-world_state answer']);
+    expect(preMarkerReply.usage?.inputTokens).toBe(100); // untouched by the post-marker token_count
+
+    expect(s.turns[2]!.compaction?.kind).toBe('codex-window');
+
+    const postMarkerUsage = s.turns[3]!;
+    expect(postMarkerUsage.blocks).toHaveLength(0); // usage-only turn, no indexable block
+    expect(postMarkerUsage.usage?.inputTokens).toBe(200);
+  });
 });
