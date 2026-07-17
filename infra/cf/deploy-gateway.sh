@@ -136,16 +136,41 @@ EOF
     mv "$tmp" "$target"
 }
 
-# Prints the live worker's current (latest) deployment id, or empty if the worker
-# doesn't exist / wrangler can't reach it. Every `wrangler deploy` mints a fresh
-# id (verified: a no-op redeploy changes it), so this is the recovery signal.
+# Looks up the live worker's current (latest) deployment id. Every `wrangler
+# deploy` mints a fresh id (verified: a no-op redeploy changes it), so it is the
+# recovery signal. CRUCIAL: an empty result must NOT be ambiguous between "worker
+# confirmed absent" and "lookup failed", or recovery could delete .pending on a
+# transient error. So the contract is EXIT-STATUS based:
+#   exit 0, stdout <id>   -> lookup succeeded, worker has this latest deployment
+#   exit 0, stdout empty  -> lookup succeeded, worker CONFIRMED to have none
+#   exit 1                -> lookup FAILED (network/auth/API/parse); output meaningless
+# wrangler exits 0 even on absent/auth errors (verified), so we classify by
+# content: a JSON array is authoritative; otherwise only the specific "does not
+# exist" API message (with empty stdout) confirms absence — everything else fails.
 get_live_version() {
-    npx wrangler deployments list --config "$CONFIG" --json 2>/dev/null | node -e '
+    local raw stderr_file node_out
+    stderr_file=$(mktemp "${TMPDIR:-/tmp}/agent-backup-wrangler-err.XXXXXX")
+    raw=$(npx wrangler deployments list --config "$CONFIG" --json 2>"$stderr_file") || true
+    if node_out=$(printf '%s' "$raw" | node -e '
 let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
-  try { const a = JSON.parse(s); process.stdout.write(a.length ? String(a[a.length - 1].id) : ""); }
-  catch (e) { process.stdout.write(""); }
+  let a; try { a = JSON.parse(s); } catch (e) { process.exit(2); }
+  if (!Array.isArray(a)) process.exit(2);
+  process.stdout.write(a.length ? String(a[a.length - 1].id) : "");
+  process.exit(0);
 });
-' 2>/dev/null || true
+' 2>/dev/null); then
+        rm -f "$stderr_file"
+        printf '%s' "$node_out"
+        return 0
+    fi
+    # stdout wasn't a JSON array. Only the definitive "worker does not exist" API
+    # message (and no stdout payload) confirms a genuinely absent worker.
+    if [ -z "$raw" ] && grep -qiE 'does not exist|not exist on your account' "$stderr_file"; then
+        rm -f "$stderr_file"
+        return 0
+    fi
+    rm -f "$stderr_file"
+    return 1
 }
 
 # Promotes the pending file to cf-observability.env: strips the recovery-only
@@ -198,32 +223,47 @@ if [ -f "$PENDING_FILE" ]; then
         exit 1
     fi
     RECORDED_VERSION=$(grep '^PENDING_PRE_DEPLOY_VERSION=' "$PENDING_FILE" | head -1 | cut -d= -f2- || true)
-    CURRENT_VERSION=$(get_live_version)
-    if [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" != "$RECORDED_VERSION" ]; then
-        promote_pending
-        echo "  Live deployment id advanced ('$RECORDED_VERSION' -> '$CURRENT_VERSION'): that"
-        echo "  deploy DID publish. Promoted pending state to $ENV_FILE. Continuing."
-    elif [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" = "$RECORDED_VERSION" ]; then
+    # If the lookup itself FAILED (network/auth/API), we must NOT touch .pending —
+    # deleting it could destroy the only durable copy of a published bearer/kid. A
+    # branch that consumes .pending is reachable only after a confirmed-good lookup.
+    if ! CURRENT_VERSION=$(get_live_version); then
+        echo "ERROR: couldn't determine the live worker's deployment id (lookup failed —" >&2
+        echo "network/auth/API error). Leaving $PENDING_FILE untouched. Re-run once" >&2
+        echo "connectivity/auth is restored, or resolve by hand: compare 'wrangler deployments" >&2
+        echo "list' against PENDING_PRE_DEPLOY_VERSION='$RECORDED_VERSION' in $PENDING_FILE — a" >&2
+        echo "newer deployment => it published (strip that line onto $ENV_FILE); same/none => rm it." >&2
+        exit 1
+    fi
+    # Lookup succeeded: CURRENT_VERSION is authoritative (an id, or empty = the
+    # worker is CONFIRMED to have no deployment).
+    if [ "$CURRENT_VERSION" = "$RECORDED_VERSION" ]; then
         rm -f "$PENDING_FILE"
         echo "  Live deployment id unchanged ('$CURRENT_VERSION'): that deploy did NOT publish;"
         echo "  the previous $ENV_FILE is still the live state. Discarded stale $PENDING_FILE."
-    elif [ -z "$CURRENT_VERSION" ] && [ -z "$RECORDED_VERSION" ]; then
-        rm -f "$PENDING_FILE"
-        echo "  Worker still has no deployment (absent before and after): that first deploy did"
-        echo "  NOT publish. Discarded stale $PENDING_FILE."
+    elif [ -n "$CURRENT_VERSION" ]; then
+        promote_pending
+        echo "  Live deployment id advanced ('$RECORDED_VERSION' -> '$CURRENT_VERSION'): that"
+        echo "  deploy DID publish. Promoted pending state to $ENV_FILE. Continuing."
     else
         echo "ERROR: can't resolve $PENDING_FILE — it recorded pre-deploy deployment id" >&2
-        echo "'$RECORDED_VERSION' but the live worker returns none now (deleted, or wrangler" >&2
-        echo "couldn't reach it). Resolve by hand: check 'wrangler deployments list' — if a" >&2
-        echo "deployment newer than the recorded id exists, the pending state published (strip" >&2
-        echo "its PENDING_PRE_DEPLOY_VERSION line onto $ENV_FILE); otherwise rm it. Then re-run." >&2
+        echo "'$RECORDED_VERSION' but the live worker is now confirmed to have NO deployment" >&2
+        echo "(the worker was deleted or rolled back). Resolve by hand: if you still want that" >&2
+        echo "pending state, redeploy from it; otherwise rm $PENDING_FILE. Then re-run." >&2
         exit 1
     fi
 fi
 
-# Probe worker existence. `wrangler deployments list` exits 0 for a deployed
-# worker, non-zero for an unknown name (verified both ways against wrangler 4.111).
-if npx wrangler deployments list --config "$CONFIG" >/dev/null 2>&1; then
+# One authoritative deployment lookup drives BOTH worker-existence and the
+# pre-deploy recovery baseline. Using get_live_version (not a raw wrangler exit
+# code) matters: wrangler exits 0 on an auth/API failure too, so a bare probe
+# would mislabel a transient failure as "worker absent" and fire the fresh-worker
+# guard with a wrong message. A lookup failure here is fatal — we won't guess.
+if ! LIVE_VERSION=$(get_live_version); then
+    echo "ERROR: couldn't determine the live worker's deployment state (lookup failed —" >&2
+    echo "network/auth/API error). Fix connectivity/auth and re-run." >&2
+    exit 1
+fi
+if [ -n "$LIVE_VERSION" ]; then
     WORKER_EXISTS=yes
 else
     WORKER_EXISTS=no
@@ -362,9 +402,11 @@ else
     echo "Gateway worker not found — first deploy will create it with its secrets."
 fi
 
-# Record the live deployment id NOW (before deploy) so recovery can tell whether a
-# later crash's deploy published. Empty if the worker doesn't exist yet.
-PRE_DEPLOY_VERSION=$(get_live_version)
+# Reuse the authoritative lookup from the existence check above as the recovery
+# baseline (nothing has deployed since, so it's still current). Recorded in
+# .pending so a later crash's recovery can tell whether this deploy published;
+# empty means the worker was confirmed to have no deployment yet.
+PRE_DEPLOY_VERSION="$LIVE_VERSION"
 
 # Write the pending state BEFORE the deploy. cf-observability.env (the deployed
 # state) is left untouched. If the deploy publishes but the script then dies, this

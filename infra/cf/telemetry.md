@@ -111,10 +111,14 @@ consistently; don't mix the two conventions in the same session.
      **current deployment id** against the one recorded in `.pending` — every
      `wrangler deploy` mints a new id, so a *changed* id means the deploy *did*
      publish (it promotes `.pending`) and an *unchanged* id means it did *not* (it
-     discards `.pending`); an ambiguous case stops with manual instructions. The
-     decision is by deployment id, not the bearer, precisely so it stays correct
-     during a signing-key rotation (where the bearer is reused and so can't tell
-     the two apart). You normally never see `.pending` — it self-heals next run.
+     discards `.pending`). The decision is by deployment id, not the bearer,
+     precisely so it stays correct during a signing-key rotation (where the bearer
+     is reused and so can't tell the two apart). If the id lookup itself **fails**
+     (network/auth/API error — distinguished from a genuinely absent worker), the
+     script leaves `.pending` **untouched** and stops with instructions rather than
+     risk deleting the only durable copy of a published bearer/kid; re-run once
+     connectivity is restored. You normally never see `.pending` — it self-heals
+     next run.
 
      To deliberately **rotate** the bearer (e.g. it leaked), run
      `./infra/cf/deploy-gateway.sh --rotate-bearer`: it mints a fresh bearer even
