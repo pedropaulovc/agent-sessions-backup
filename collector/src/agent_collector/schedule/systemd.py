@@ -2,14 +2,26 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-UNIT_DIR = Path.home() / ".config" / "systemd" / "user"
-SERVICE = UNIT_DIR / "agent-collector.service"
-TIMER = UNIT_DIR / "agent-collector.timer"
+
+def _unit_dir() -> Path:
+    # Read XDG_CONFIG_HOME at call time: systemd --user looks under
+    # $XDG_CONFIG_HOME/systemd/user, not a hardcoded ~/.config, when the var is set.
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "systemd" / "user"
+
+
+def _service_path() -> Path:
+    return _unit_dir() / "agent-collector.service"
+
+
+def _timer_path() -> Path:
+    return _unit_dir() / "agent-collector.timer"
 
 
 def _sd_quote(arg: str) -> str:
@@ -67,11 +79,12 @@ def _systemctl(*args: str) -> bool:
 
 
 def install(interval: int = 15) -> int:
-    UNIT_DIR.mkdir(parents=True, exist_ok=True)
-    SERVICE.write_text(_service_unit())
-    TIMER.write_text(_timer_unit(interval))
-    print(f"wrote {SERVICE}")
-    print(f"wrote {TIMER}")
+    service, timer = _service_path(), _timer_path()
+    service.parent.mkdir(parents=True, exist_ok=True)
+    service.write_text(_service_unit())
+    timer.write_text(_timer_unit(interval))
+    print(f"wrote {service}")
+    print(f"wrote {timer}")
     reloaded = _systemctl("daemon-reload")
     enabled = _systemctl("enable", "--now", "agent-collector.timer")
     if not (reloaded and enabled):
@@ -91,7 +104,7 @@ def install(interval: int = 15) -> int:
 
 def uninstall() -> int:
     _systemctl("disable", "--now", "agent-collector.timer")
-    for unit in (TIMER, SERVICE):
+    for unit in (_timer_path(), _service_path()):
         if unit.exists():
             unit.unlink()
             print(f"removed {unit}")

@@ -65,7 +65,7 @@ def cmd_run(args) -> int:
         print("another collector run holds the lock; exiting cleanly", file=sys.stderr)
         return 0
     try:
-        with State() as st:
+        with State(machine_id=cfg.machine_id) as st:
             return _do_run(cfg, st)
     finally:
         lock.release()
@@ -236,7 +236,7 @@ def cmd_backfill(args) -> int:
         print("another collector run holds the lock; exiting cleanly", file=sys.stderr)
         return 0
     try:
-        with State() as st:
+        with State(machine_id=cfg.machine_id) as st:
             return _do_backfill(cfg, st, concurrency, dry_run)
     finally:
         lock.release()

@@ -88,12 +88,18 @@ def test_systemd_timer_uses_elapsed_timers_for_any_interval():
     assert "RandomizedDelaySec=300" in unit and "Persistent=true" in unit
 
 
-def test_systemd_install_fails_when_activation_fails(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(systemd, "UNIT_DIR", tmp_path)
-    monkeypatch.setattr(systemd, "SERVICE", tmp_path / "agent-collector.service")
-    monkeypatch.setattr(systemd, "TIMER", tmp_path / "agent-collector.timer")
+def test_systemd_unit_dir_honors_xdg_config_home(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    assert systemd._unit_dir() == tmp_path / "systemd" / "user"
+    assert systemd._timer_path() == tmp_path / "systemd" / "user" / "agent-collector.timer"
+
+
+def test_systemd_install_writes_units_under_xdg_and_fails_on_activation(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     monkeypatch.setattr(systemd, "_systemctl", lambda *a: False)
     rc = systemd.install(15)
     assert rc == 1
     assert "systemctl --user" in capsys.readouterr().err
-    assert (tmp_path / "agent-collector.timer").exists()  # unit files still written
+    # unit files written where systemctl --user actually looks (XDG_CONFIG_HOME/systemd/user)
+    assert (tmp_path / "systemd" / "user" / "agent-collector.timer").exists()
+    assert (tmp_path / "systemd" / "user" / "agent-collector.service").exists()

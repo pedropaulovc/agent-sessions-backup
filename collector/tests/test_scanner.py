@@ -141,6 +141,23 @@ def test_snapshot_bounded_when_source_locked(tmp_path):
     assert elapsed < 10  # bounded by the deadline, not hanging on the exclusive lock
 
 
+def test_uppercase_db_suffix_is_snapshotted(tmp_path):
+    # State.DB is a real SQLite DB; a case-sensitive check would raw-upload it (WAL-stale).
+    root = tmp_path / ".claude"
+    root.mkdir()
+    db = root / "State.DB"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE t(x)")
+    c.commit()
+    c.close()
+    scanner = Scanner([])
+    try:
+        items = {it.relpath: it for it in scanner.scan_store("claude", root)}
+    finally:
+        scanner.close()
+    assert items["State.DB"].is_snapshot is True
+
+
 def test_snapshot_outcomes_ok_and_not_a_db(tmp_path):
     db = tmp_path / "real.sqlite"
     c = sqlite3.connect(db)

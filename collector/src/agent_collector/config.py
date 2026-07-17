@@ -87,6 +87,19 @@ def _is_windows_mount(path: Path) -> bool:
     )
 
 
+def _root_is_windows_mount(path: Path) -> bool:
+    """Guard decision: catch both a literal /mnt/<drive> root AND a symlink that resolves
+    under one (os.walk follows a symlinked top root, so ~/.claude -> /mnt/c/... would still
+    be captured). Resolve only for the decision; the caller scans the unresolved path so
+    relpaths stay stable."""
+    if _is_windows_mount(path):
+        return True
+    try:
+        return _is_windows_mount(path.resolve())
+    except OSError:
+        return False
+
+
 def config_dir() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME")
     base = Path(xdg) if xdg else Path.home() / ".config"
@@ -114,16 +127,16 @@ class Config:
         roots = {name: Path(root).expanduser() for name, root in self.stores.items()}
         if not self._drop_windows_mounts():
             return roots
-        return {n: p for n, p in roots.items() if not _is_windows_mount(p)}
+        return {n: p for n, p in roots.items() if not _root_is_windows_mount(p)}
 
     def dropped_store_roots(self) -> dict[str, Path]:
         """Roots excluded by the WSL windows-mount guard, so callers can surface a warning."""
         if not self._drop_windows_mounts():
             return {}
         return {
-            n: Path(r).expanduser()
+            n: p
             for n, r in self.stores.items()
-            if _is_windows_mount(Path(r).expanduser())
+            if _root_is_windows_mount(p := Path(r).expanduser())
         }
 
     def _drop_windows_mounts(self) -> bool:

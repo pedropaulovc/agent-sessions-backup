@@ -86,6 +86,33 @@ def test_non_wsl_keeps_mount_roots(monkeypatch):
     assert cfg.dropped_store_roots() == {}
 
 
+def _symlink_to_mnt(tmp_path):
+    link = tmp_path / "claude_link"
+    try:
+        link.symlink_to("/mnt/c/Users/fake/.claude")  # target need not exist to resolve
+    except (OSError, NotImplementedError):
+        pytest.skip("filesystem cannot create symlinks")
+    return link
+
+
+def test_wsl_symlink_root_to_mnt_is_dropped(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "detect_platform_tag", lambda: "wsl")
+    link = _symlink_to_mnt(tmp_path)
+    cfg = config.Config(machine_id="m", hub_url="http://x", stores={"claude": str(link)})
+    assert "claude" not in cfg.store_roots()          # symlink resolves under /mnt/c -> dropped
+    assert set(cfg.dropped_store_roots()) == {"claude"}
+
+
+def test_wsl_symlink_root_kept_when_include_windows_mounts(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "detect_platform_tag", lambda: "wsl")
+    link = _symlink_to_mnt(tmp_path)
+    cfg = config.Config(machine_id="m", hub_url="http://x",
+                        include_windows_mounts=True, stores={"claude": str(link)})
+    roots = cfg.store_roots()
+    assert "claude" in roots
+    assert roots["claude"] == link  # unresolved path kept as scan root (stable relpaths)
+
+
 def test_effective_excludes_extends_defaults(tmp_path):
     path = tmp_path / "config.toml"
     config.enroll("http://x", dev=True, path=path, machine_id="m1")

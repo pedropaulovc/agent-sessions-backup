@@ -1,6 +1,36 @@
 from agent_collector.state import State, OverlapLock
 
 
+def test_machine_id_change_reoffers_files_and_records_event(tmp_path):
+    db = tmp_path / "state.db"
+    with State(db, machine_id="A") as st:
+        st.upsert_file("claude", "a.jsonl", 10, 123, "deadbeef", "ok",
+                       uploaded_size=10, uploaded_at="2026-01-01T00:00:00Z")
+        assert st.machine_id_changed is False  # first init just records the id
+
+    # reopen as B: hub namespace changed -> re-offer every file + buffer an event
+    with State(db, machine_id="B") as st:
+        assert st.machine_id_changed is True
+        row = st.get_file("claude", "a.jsonl")
+        assert row.status == "pending"  # size+mtime fast path defeated -> re-uploaded
+        _ids, events = st.drain_events()
+        assert any(e["code"] == "machine_id_changed" for e in events)
+
+    # reopen as A again after B was stored -> same reset semantics
+    with State(db, machine_id="A") as st:
+        assert st.machine_id_changed is True
+
+
+def test_machine_id_unchanged_is_noop(tmp_path):
+    db = tmp_path / "state.db"
+    with State(db, machine_id="A") as st:
+        st.upsert_file("claude", "a.jsonl", 10, 123, "deadbeef", "ok")
+    with State(db, machine_id="A") as st:
+        assert st.machine_id_changed is False
+        assert st.get_file("claude", "a.jsonl").status == "ok"
+        assert st.pending_event_count() == 0
+
+
 def test_upsert_and_get(tmp_path):
     with State(tmp_path / "state.db") as st:
         assert st.get_file("claude", "a.jsonl") is None

@@ -50,6 +50,11 @@ CREATE TABLE IF NOT EXISTS pending_events (
   store TEXT,
   created_at TEXT NOT NULL
 ) STRICT;
+
+CREATE TABLE IF NOT EXISTS meta (
+  key TEXT PRIMARY KEY,
+  value TEXT
+) STRICT;
 """
 
 
@@ -82,7 +87,7 @@ class FileRow:
 
 
 class State:
-    def __init__(self, path: Path | None = None):
+    def __init__(self, path: Path | None = None, machine_id: str | None = None):
         self.path = path or state_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path)
@@ -93,6 +98,39 @@ class State:
         self.conn.execute("PRAGMA synchronous = NORMAL")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        self.machine_id_changed = False
+        if machine_id is not None:
+            self._reconcile_machine_id(machine_id)
+
+    def _reconcile_machine_id(self, machine_id: str) -> None:
+        """The hub object key includes machine_id, so a state DB carried across a re-enroll
+        would keep old rows 'uploaded' and the new namespace would never receive the corpus.
+        On a change, re-offer every file (status='pending' defeats the size+mtime fast path;
+        files/check then cheaply resyncs whatever the hub already has) and buffer an event."""
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key = 'machine_id'"
+        ).fetchone()
+        stored = row["value"] if row else None
+        if stored is None:
+            self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('machine_id', ?)", (machine_id,)
+            )
+            self.conn.commit()
+            return
+        if stored == machine_id:
+            return
+        self.conn.execute("UPDATE files SET status = 'pending', error = NULL")
+        self.conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'machine_id'", (machine_id,)
+        )
+        self.conn.commit()
+        self.buffer_events([{
+            "level": "warn", "code": "machine_id_changed",
+            "message": f"machine_id changed {stored!r} -> {machine_id!r}; "
+                       "re-offering all files to the new hub namespace",
+            "count": 1,
+        }])
+        self.machine_id_changed = True
 
     def close(self) -> None:
         self.conn.close()

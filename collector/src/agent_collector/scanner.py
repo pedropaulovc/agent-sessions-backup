@@ -214,7 +214,7 @@ class Scanner:
             st = path.stat()
         except OSError:
             return None
-        if path.name.endswith(DB_SUFFIXES):
+        if path.name.lower().endswith(DB_SUFFIXES):  # case-insensitive: State.DB is a DB too
             self._snap_seq += 1
             dst = self.tmp_root / f"snap-{self._snap_seq}.sqlite"
             outcome = _snapshot_sqlite(path, dst, self.snapshot_deadline_s)
