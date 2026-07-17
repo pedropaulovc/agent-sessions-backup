@@ -65,7 +65,7 @@ def cmd_run(args) -> int:
         print("another collector run holds the lock; exiting cleanly", file=sys.stderr)
         return 0
     try:
-        with State(machine_id=cfg.machine_id) as st:
+        with State(machine_id=cfg.machine_id, hub_url=cfg.hub_url) as st:
             return _do_run(cfg, st)
     finally:
         lock.release()
@@ -89,6 +89,10 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
                 scanned += 1
                 stats[store]["files_seen"] += 1
                 res = _process_item(cfg, st, transport, scanner, item)
+                # Snapshots bypass the fast path every run, so release each DB snapshot temp
+                # file immediately — several large DBs would otherwise pile up under tmp_root
+                # for the whole run and risk ENOSPC before later files are processed.
+                _cleanup_snapshot(item)
                 if res.changed:
                     changed += 1
                 if res.uploaded:
@@ -236,7 +240,7 @@ def cmd_backfill(args) -> int:
         print("another collector run holds the lock; exiting cleanly", file=sys.stderr)
         return 0
     try:
-        with State(machine_id=cfg.machine_id) as st:
+        with State(machine_id=cfg.machine_id, hub_url=cfg.hub_url) as st:
             return _do_backfill(cfg, st, concurrency, dry_run)
     finally:
         lock.release()
@@ -272,7 +276,11 @@ def _do_backfill(cfg, st: State, concurrency: int, dry_run: bool) -> int:
         summary["failed"] = totals["failed"]
         summary["bytes_uploaded"] = totals["bytes_uploaded"]
     print(json.dumps(summary))
-    return 0
+    # Nonzero when the backfill was incomplete, so scripts/operators don't move on: upload
+    # failures, per-file read/staging errors, or an error-level traversal event.
+    incomplete = (totals["failed"] or totals["read_errors"]
+                  or any(e["level"] == "error" for e in events))
+    return 1 if incomplete else 0
 
 
 def _record_file_error(events, totals, item, e, code: str = "read_failed") -> None:

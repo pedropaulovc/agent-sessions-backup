@@ -87,7 +87,8 @@ class FileRow:
 
 
 class State:
-    def __init__(self, path: Path | None = None, machine_id: str | None = None):
+    def __init__(self, path: Path | None = None, machine_id: str | None = None,
+                 hub_url: str | None = None):
         self.path = path or state_path()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path)
@@ -99,38 +100,50 @@ class State:
         self.conn.executescript(SCHEMA)
         self.conn.commit()
         self.machine_id_changed = False
-        if machine_id is not None:
-            self._reconcile_machine_id(machine_id)
+        self.hub_url_changed = False
+        if machine_id is not None or hub_url is not None:
+            self._reconcile_identity(machine_id, hub_url)
 
-    def _reconcile_machine_id(self, machine_id: str) -> None:
-        """The hub object key includes machine_id, so a state DB carried across a re-enroll
-        would keep old rows 'uploaded' and the new namespace would never receive the corpus.
-        On a change, re-offer every file (status='pending' defeats the size+mtime fast path;
-        files/check then cheaply resyncs whatever the hub already has) and buffer an event."""
-        row = self.conn.execute(
-            "SELECT value FROM meta WHERE key = 'machine_id'"
-        ).fetchone()
-        stored = row["value"] if row else None
-        if stored is None:
-            self.conn.execute(
-                "INSERT INTO meta (key, value) VALUES ('machine_id', ?)", (machine_id,)
-            )
-            self.conn.commit()
-            return
-        if stored == machine_id:
+    def _reconcile_identity(self, machine_id: str | None, hub_url: str | None) -> None:
+        """Scope the local fast-path state by the hub IDENTITY (machine_id + hub_url). The hub
+        object key includes machine_id, and re-pointing at a different hub_url is a different
+        backend — either would leave 'ok' rows satisfying the size+mtime fast path so the new
+        namespace never receives the corpus. On a change, re-offer every file (status='pending'
+        defeats the fast path; files/check cheaply resyncs what the hub already has) and buffer
+        an event. hub_url is normalized (trailing slash stripped) so a cosmetic edit is a no-op.
+        """
+        hub_url = hub_url.rstrip("/") if hub_url is not None else None
+        events: list[dict] = []
+        m_changed = self._reconcile_meta_key("machine_id", machine_id, "machine_id_changed", events)
+        h_changed = self._reconcile_meta_key("hub_url", hub_url, "hub_url_changed", events)
+        if not (m_changed or h_changed):
+            self.conn.commit()  # persist any first-time meta inserts
             return
         self.conn.execute("UPDATE files SET status = 'pending', error = NULL")
-        self.conn.execute(
-            "UPDATE meta SET value = ? WHERE key = 'machine_id'", (machine_id,)
-        )
         self.conn.commit()
-        self.buffer_events([{
-            "level": "warn", "code": "machine_id_changed",
-            "message": f"machine_id changed {stored!r} -> {machine_id!r}; "
-                       "re-offering all files to the new hub namespace",
+        self.buffer_events(events)
+        self.machine_id_changed = m_changed
+        self.hub_url_changed = h_changed
+
+    def _reconcile_meta_key(self, key: str, value: str | None, code: str,
+                            events_out: list[dict]) -> bool:
+        """Return True if a stored meta value changed (records the new value + an event)."""
+        if value is None:
+            return False
+        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        stored = row["value"] if row else None
+        if stored is None:
+            self.conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (key, value))
+            return False
+        if stored == value:
+            return False
+        self.conn.execute("UPDATE meta SET value = ? WHERE key = ?", (value, key))
+        events_out.append({
+            "level": "warn", "code": code,
+            "message": f"{key} changed {stored!r} -> {value!r}; re-offering all files",
             "count": 1,
-        }])
-        self.machine_id_changed = True
+        })
+        return True
 
     def close(self) -> None:
         self.conn.close()

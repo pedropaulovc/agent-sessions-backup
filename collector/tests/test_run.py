@@ -140,6 +140,56 @@ def test_backfill_dry_run_uploads_nothing(tmp_path, hub):
     assert hub.files == {}
 
 
+def test_backfill_returns_nonzero_on_upload_failure(tmp_path, hub, monkeypatch):
+    import agent_collector.transport as transport_mod
+    monkeypatch.setattr(transport_mod, "BACKOFF", (0.0, 0.0, 0.0))
+    root = tmp_path / "claude"
+    root.mkdir()
+    (root / "a.jsonl").write_text("x")
+    cfg = _cfg(hub, root)
+    hub.flaky_500_remaining = 999  # every request 500 -> upload can't succeed
+    with State(tmp_path / "state.db") as st:
+        rc = run_mod._do_backfill(cfg, st, concurrency=2, dry_run=False)
+    assert rc == 1  # scripts must see the incomplete backfill
+
+
+def test_backfill_returns_zero_on_clean_run(tmp_path, hub):
+    root = tmp_path / "claude"
+    root.mkdir()
+    (root / "a.jsonl").write_text("x")
+    cfg = _cfg(hub, root)
+    with State(tmp_path / "state.db") as st:
+        rc = run_mod._do_backfill(cfg, st, concurrency=2, dry_run=False)
+    assert rc == 0
+    assert ("m1", "claude", "a.jsonl") in hub.files
+
+
+def test_run_releases_snapshot_after_each_item(tmp_path, hub, monkeypatch):
+    root = tmp_path / "claude"
+    root.mkdir()
+    for name in ("one.sqlite", "two.sqlite"):
+        c = sqlite3.connect(root / name)
+        c.execute("CREATE TABLE t(x)")
+        c.commit()
+        c.close()
+    cfg = _cfg(hub, root)
+
+    snap_counts = []
+    real = run_mod._process_item
+
+    def spy(cfg_, st_, tr_, scanner_, item_):
+        # snapshot temp files present when each item STARTS processing
+        snap_counts.append(len(list(scanner_.tmp_root.glob("snap-*.sqlite"))))
+        return real(cfg_, st_, tr_, scanner_, item_)
+
+    monkeypatch.setattr(run_mod, "_process_item", spy)
+    with State(tmp_path / "state.db") as st:
+        run_mod._do_run(cfg, st)
+    # Each item's snapshot is released before the next is created; without the fix the second
+    # item would start with 2 snapshots (the first left behind).
+    assert snap_counts == [1, 1]
+
+
 def test_snapshot_item_never_fast_paths_on_identical_metadata(tmp_path, hub):
     # Regression for the P1: a DB snapshot whose (size, mtime_ns) are IDENTICAL to state
     # but whose content changed (WAL commit) must still upload. is_snapshot skips the fast

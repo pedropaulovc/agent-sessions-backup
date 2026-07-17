@@ -31,6 +31,31 @@ def test_machine_id_unchanged_is_noop(tmp_path):
         assert st.pending_event_count() == 0
 
 
+def test_hub_url_change_reoffers_files_and_records_event(tmp_path):
+    db = tmp_path / "state.db"
+    with State(db, machine_id="A", hub_url="http://hub-a") as st:
+        st.upsert_file("claude", "a.jsonl", 10, 123, "deadbeef", "ok")
+        assert st.hub_url_changed is False
+
+    # same machine, different hub backend -> re-offer every file + event
+    with State(db, machine_id="A", hub_url="http://hub-b") as st:
+        assert st.hub_url_changed is True
+        assert st.machine_id_changed is False
+        assert st.get_file("claude", "a.jsonl").status == "pending"
+        _ids, events = st.drain_events()
+        assert any(e["code"] == "hub_url_changed" for e in events)
+
+
+def test_hub_url_trailing_slash_is_noop(tmp_path):
+    db = tmp_path / "state.db"
+    with State(db, machine_id="A", hub_url="http://hub-a") as st:
+        st.upsert_file("claude", "a.jsonl", 10, 123, "deadbeef", "ok")
+    with State(db, machine_id="A", hub_url="http://hub-a/") as st:  # cosmetic edit only
+        assert st.hub_url_changed is False
+        assert st.get_file("claude", "a.jsonl").status == "ok"
+        assert st.pending_event_count() == 0
+
+
 def test_upsert_and_get(tmp_path):
     with State(tmp_path / "state.db") as st:
         assert st.get_file("claude", "a.jsonl") is None
