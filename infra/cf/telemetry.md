@@ -87,14 +87,39 @@ consistently; don't mix the two conventions in the same session.
    fails silently until you notice no data arriving.
 10. In `hub/wrangler.jsonc`, uncomment/add under `observability`:
     ```jsonc
-    "logs": { "destinations": ["agent-backup-azure-logs"] },
-    "traces": { "destinations": ["agent-backup-azure-traces"] }
+    "logs": { "enabled": true, "destinations": ["agent-backup-azure-logs"] },
+    "traces": { "enabled": true, "destinations": ["agent-backup-azure-traces"] }
     ```
-    and redeploy `sessions-hub`.
+    (export is per-signal — a destinations array with no `enabled: true` next
+    to it exports nothing; this matches the comment already in
+    `hub/wrangler.jsonc`) and redeploy `sessions-hub`.
 11. Verify: trigger a request against the hub, then query `OTelLogs` /
     `OTelTraces` (or whatever the actual table names turn out to be — see the
     ASSUMPTION comments in `infra/azure/alerts/*.kql`) in the Log Analytics
     workspace for the new data.
+
+## What the alerts do (and don't) cover
+
+Only `sessions-hub` gets `observability.logs`/`traces` destinations pointed at
+the gateway (step 10 above). `sessions-telemetry-gateway` itself has none, and
+must not — it IS the `/v1/{logs,traces}` sink those destinations post to, so
+having it export its own telemetry back to itself would be a recursion loop.
+Don't add `observability` destinations to `hub/wrangler.telemetry-gateway.jsonc`.
+
+Consequence: `infra/azure/alerts/collector-errors.kql` only ever sees
+`collector.event` records that originate in the **hub** (e.g. machine-side
+collector errors relayed through it) — never the gateway's own
+upstream-forward failures (Entra auth breaking, the DCR endpoint rejecting
+requests, etc.), even though that log line uses the same event name and shape
+(see the comment on it in `hub/gateway/telemetry-gateway.ts`). A gateway
+outage instead shows up as an **absence** of data in Azure altogether —
+including the hub's own `hub.heartbeat` events, since those are relayed
+through the same broken gateway — which is what
+`infra/azure/alerts/missed-heartbeat.kql`'s absence alert and the independent
+`/healthz` availability webtest (`infra/azure/provision.sh`, doesn't touch the
+Azure telemetry pipeline at all) are for. If gateway-specific diagnostics ever
+need to reach Azure, that requires a separate non-recursive sink, not
+`sessions-hub`'s destinations.
 
 ## Rotating the signing key
 
