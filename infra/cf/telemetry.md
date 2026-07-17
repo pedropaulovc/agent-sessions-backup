@@ -97,19 +97,27 @@ consistently; don't mix the two conventions in the same session.
      with instructions rather than deploying a broken gateway.
    - **`INGEST_BEARER`**: reuses the value already in
      `infra/out/cf-observability.env` if present, else mints one
-     (`openssl rand -hex 32`), includes it in the same deploy, and writes it to
-     that gitignored file (0600, atomic temp+mv) — written BEFORE the deploy so
-     the bearer survives even if the deploy dies. This is the fix for the "Worker
-     secrets are write-only, so the dashboard step can't recover the bearer"
-     trap — the file is the durable copy step 9 reads from. To deliberately
-     **rotate** the bearer (e.g. it leaked), run `./infra/cf/deploy-gateway.sh
-     --rotate-bearer`: it mints a fresh bearer even when the file already holds
-     one, and first copies the current file to `cf-observability.env.prev` (same
-     0600 discipline) so the OLD bearer survives if the rotation deploy fails
-     before publishing — **recovery is `mv infra/out/cf-observability.env.prev
-     infra/out/cf-observability.env`**. On a successful rotation `.prev` is
-     removed automatically (the old bearer is dead), so a lingering `.prev`
-     unambiguously means a rotation failed mid-flight. After any rotation you
+     (`openssl rand -hex 32`), and includes it in the same deploy. This is the fix
+     for the "Worker secrets are write-only, so the dashboard step can't recover
+     the bearer" trap — the file is the durable copy step 9 reads from.
+
+     **State model:** `cf-observability.env` always reflects the **deployed**
+     state; it is never overwritten until a deploy has actually published. New
+     values are written to `cf-observability.env.pending` (0600) *before* the
+     deploy, and promoted over `cf-observability.env` (atomic `mv`) only *after*
+     the deploy succeeds. The one window `.pending` guards is "deploy published but
+     the script died before promoting": on the next run, if `.pending` exists, the
+     script probes the live worker with its bearer — a synthetic OTLP post that
+     returns **204** means the deploy *did* publish (it promotes `.pending`), a
+     **200** no-op means it did *not* (it discards `.pending`); anything
+     inconclusive stops with manual instructions. You normally never see
+     `.pending` — it self-heals on the next run.
+
+     To deliberately **rotate** the bearer (e.g. it leaked), run
+     `./infra/cf/deploy-gateway.sh --rotate-bearer`: it mints a fresh bearer even
+     when the file already holds one. The old bearer stays live in
+     `cf-observability.env` until the new one is deployed and promoted, so a failed
+     rotation never loses it — nothing to restore by hand. After any rotation you
      MUST update the dashboard destinations (step 9) with the new bearer, or the
      gateway 200-no-ops every post from the old-bearer destinations.
 
@@ -202,12 +210,15 @@ Follow the exact sequence documented in that file's header comment — summary:
    `ACTIVE_KID` changed.
 
    The script records the shipped `OIDC_SIGNING_KID` in
-   `infra/out/cf-observability.env` and, on the next run, refuses to deploy a
-   **changed** kid unless `OIDC_KEY_FILE` is supplied — that catches the classic
-   half-rotation (bumping `OIDC_SIGNING_KID` but forgetting the new key, which
-   would ship the new kid over the old private key and make Entra reject every
-   assertion). So step 3 must always pass `OIDC_KEY_FILE`; that's not optional
-   during a kid change.
+   `infra/out/cf-observability.env` and guards both halves of the rotation trap:
+   it refuses a **changed** kid without `OIDC_KEY_FILE` (bumping the kid but
+   forgetting the new key ships the new kid over the old private key), and it
+   refuses a **new key under an unchanged kid** — it cross-checks the provided
+   key's public modulus against the issuer's published JWK for the configured kid
+   (`GET $OIDC_ISSUER_URL/.well-known/jwks.json`) and errors on a mismatch, since a
+   new key needs a new kid + an issuer JWKS update. Either way Entra would reject
+   every assertion. So step 3 must always pass `OIDC_KEY_FILE` **and** bump the kid
+   (with the issuer publishing the new kid first, step 1); that's not optional.
 4. Once the gateway is signing with the new kid (immediately, since step 3 is one
    version), remove the old key from `PUBLIC_JWKS` and redeploy the issuer.
 

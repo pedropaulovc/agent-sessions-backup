@@ -43,9 +43,10 @@
 // Roster-read failure (third leg): the watchdog stamps `roster_ok:false` on its
 // beacon when the D1 roster read throws — the beacon still goes out (pipeline is
 // alive) but NO heartbeat_age rows are emitted that run, so stale-machine
-// detection is blind. A healthy-looking beacon would otherwise mask that, so we
-// fire a `__roster_unavailable__` row when the latest beacon in the window has
-// roster_ok == false.
+// detection is blind. We fire `__roster_unavailable__` when ANY beacon in the
+// window has roster_ok == false — not just the latest: a transient roster failure
+// that recovers before evaluation still left stale-machine monitoring blind for
+// that stretch, and arg_max on the latest beacon alone would erase it.
 //
 // The email's machine value says which case fired: a real machine_id (stale
 // collector), __pipeline_silent__ (telemetry pipeline down), or
@@ -89,8 +90,9 @@ let roster_unavailable = otel
     | extend body = todynamic(Body)
     | where body.event == "hub.watchdog.run"
     | extend roster_ok = tobool(body.roster_ok)
-    | summarize arg_max(TimeGenerated, roster_ok)
     | where roster_ok == false
+    | summarize n = count()
+    | where n > 0
     | project machine = "__roster_unavailable__", age_seconds = tolong(-1);
 // pipeline_silent only catches a FULLY empty window. A mid-window outage that
 // recovers before evaluation (beacon 09:15, silence to 09:55, eval 10:00) leaves
