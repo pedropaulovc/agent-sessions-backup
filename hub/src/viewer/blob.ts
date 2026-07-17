@@ -106,7 +106,17 @@ function extractMediaAt(envelope: Record<string, unknown>, blockIndex: number): 
   return null;
 }
 
-/** True when blocksFrom() would emit a block for this content item (must match claude-code.ts exactly). */
+/**
+ * True when the parser's blocksFrom() would emit a block for this content item, so extractMediaAt counts
+ * block_index the same way the indexer did. This MUST stay case-for-case identical to blocksFrom() in
+ * claude-code.ts — any drift silently misaligns block_index and 404s (or mis-serves) media. Pinned mapping:
+ *   text     -> yields only when str(raw.text) is non-empty
+ *   thinking -> yields only when str(raw.thinking) is non-empty
+ *   tool_use / tool_result / image / document -> always yield
+ *   default (unknown types, e.g. server_tool_use) -> parser's default now yields a capped-JSON TEXT block,
+ *     so it MUST count here too (a prior version returned false and dropped media after an unknown item).
+ * (blocksFrom also `continue`s on non-object items; extractMediaAt applies that same isObj() guard.)
+ */
 function yieldsBlock(raw: Record<string, unknown>): boolean {
   switch (raw.type) {
     case 'text':
@@ -119,7 +129,7 @@ function yieldsBlock(raw: Record<string, unknown>): boolean {
     case 'document':
       return true;
     default:
-      return false;
+      return true;
   }
 }
 

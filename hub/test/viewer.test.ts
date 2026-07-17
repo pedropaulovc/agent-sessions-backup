@@ -14,6 +14,7 @@ const BLOB_SESSION = 'dddddddd-4444-4444-8444-444444444444';
 const REWIND_SESSION = 'eeeeeeee-5555-4555-8555-555555555555';
 const SYSTEM_SESSION = 'ffffffff-6666-4666-8666-666666666666';
 const UNVER_SESSION = '99999999-7777-4777-8777-777777777777';
+const UNKNOWN_MEDIA_SESSION = '88888888-8888-4888-8888-888888888888';
 
 // Hostile transcript payloads: an SVG with inline script and an HTML "document".
 const SVG_XSS_B64 = btoa('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>');
@@ -151,6 +152,18 @@ describe('viewer', () => {
     expect(
       (await putFile('claude-projects', `-home-tester-src-demo/${UNVER_SESSION}.jsonl`,
         ccLine(UNVER_SESSION, { uuid: 'v1', parentUuid: null, role: 'user', image: { mediaType: 'image/png', data: TINY_PNG_B64 } }),
+      )).status,
+    ).toBe(201);
+
+    // An unknown content item (server_tool_use) BEFORE the image: the parser emits a text block for the
+    // unknown item, so the image is indexed at block_index 1 — the blob extractor must count it identically.
+    expect(
+      (await putFile('claude-projects', `-home-tester-src-demo/${UNKNOWN_MEDIA_SESSION}.jsonl`,
+        ccLine(UNKNOWN_MEDIA_SESSION, {
+          uuid: 'um1', parentUuid: null, role: 'assistant',
+          unknownFirst: 'server_tool_use',
+          image: { mediaType: 'image/png', data: TINY_PNG_B64 },
+        }),
       )).status,
     ).toBe(201);
 
@@ -412,6 +425,31 @@ describe('viewer', () => {
   it('blob endpoint 404s for an unknown block', async () => {
     const res = await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}/blob/99999999`);
     expect(res.status).toBe(404);
+  });
+
+  it('serves media that follows an unknown content item in the same message', async () => {
+    // The image is stored at block_index 1 (the unknown item took index 0); the blob extractor must
+    // count the unknown item too, or it would test the image against index 0 and 404.
+    const img = await testEnv.DB.prepare(
+      "SELECT id, block_index FROM blocks WHERE session_id = ?1 AND btype = 'image'",
+    )
+      .bind(UNKNOWN_MEDIA_SESSION)
+      .first<{ id: number; block_index: number }>();
+    expect(img!.block_index).toBe(1); // proves the unknown item consumed index 0
+
+    const hash = await testEnv.DB.prepare(
+      'SELECT f.content_hash AS h FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1',
+    )
+      .bind(UNKNOWN_MEDIA_SESSION)
+      .first<{ h: string }>();
+    const res = await SELF.fetch(
+      `https://sessions.vza.net/s/${UNKNOWN_MEDIA_SESSION}/blob/${img!.id}?v=${hash!.h.slice(0, 12)}`,
+    );
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('image/png');
+    const got = new Uint8Array(await res.arrayBuffer());
+    const want = Uint8Array.from(atob(TINY_PNG_B64), (c) => c.charCodeAt(0));
+    expect([...got]).toEqual([...want]);
   });
 
   it('machines page lists the dev machine and corpus totals', async () => {

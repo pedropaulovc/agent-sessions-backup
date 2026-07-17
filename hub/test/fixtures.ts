@@ -201,12 +201,15 @@ interface CcLineOpts {
   toolResult?: { toolUseId: string; content: string; isError?: boolean };
   image?: { mediaType: string; data: string };
   document?: { mediaType: string; data: string };
+  /** An unknown/unsupported content item prepended to the content array (e.g. 'server_tool_use'). */
+  unknownFirst?: string;
   ts?: string;
 }
 
 /** Parametrized Claude Code envelope builder (any session id, either role). Mirrors real on-disk shape. */
 export function ccLine(sessionId: string, o: CcLineOpts): string {
   const content: unknown[] = [];
+  if (o.unknownFirst) content.push({ type: o.unknownFirst, payload: { note: 'unsupported content item' } });
   if (o.thinking) content.push({ type: 'thinking', thinking: o.thinking, signature: 'sig' });
   if (o.text) content.push({ type: 'text', text: o.text });
   if (o.toolUse) content.push({ type: 'tool_use', id: o.toolUse.id, name: o.toolUse.name, input: o.toolUse.input });
