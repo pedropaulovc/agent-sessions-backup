@@ -542,4 +542,70 @@ describe('parseCodex', () => {
     expect(postMarkerUsage.blocks).toHaveLength(0); // usage-only turn, no indexable block
     expect(postMarkerUsage.usage?.inputTokens).toBe(200);
   });
+
+  it('a token_count after a developer-role message also opens a fresh usage-only turn instead of overwriting the pre-boundary assistant reply (regression: openTurn only reset lastAssistant for role=user, not developer/system)', async () => {
+    const lines = [
+      { timestamp: '2026-07-09T12:00:00.000Z', type: 'session_meta', payload: { session_id: CODEX_SESSION_ID, cwd: '/x' } },
+      { timestamp: '2026-07-09T12:00:01.000Z', type: 'turn_context', payload: { turn_id: 't1', model: 'gpt-test-9' } },
+      {
+        timestamp: '2026-07-09T12:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'developer boundary test question' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      {
+        timestamp: '2026-07-09T12:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'pre-developer-boundary answer' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      // Usage A — belongs to the reply above.
+      {
+        timestamp: '2026-07-09T12:00:04.000Z',
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 10 } } },
+      },
+      // A developer-role input message opens a new (non-assistant) turn.
+      {
+        timestamp: '2026-07-09T12:00:05.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'developer',
+          content: [{ type: 'input_text', text: 'developer instruction injected mid-session' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't2' },
+        },
+      },
+      // The reply to whatever follows produced only encrypted reasoning — this token_count is
+      // the only signal of that call, and must not land on the pre-developer-boundary reply.
+      {
+        timestamp: '2026-07-09T12:00:06.000Z',
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 200, output_tokens: 20 } } },
+      },
+    ].map((o) => JSON.stringify(o));
+
+    const s = await parseCodex(readJsonlLines(toStream(lines)), CODEX_SESSION_ID);
+    const roles = s.turns.map((t) => t.role);
+    expect(roles).toEqual(['user', 'assistant', 'developer', 'assistant']);
+
+    const preBoundaryReply = s.turns[1]!;
+    expect(preBoundaryReply.blocks.map((b) => b.text)).toEqual(['pre-developer-boundary answer']);
+    expect(preBoundaryReply.usage?.inputTokens).toBe(100); // untouched by the post-boundary token_count
+
+    const developerTurn = s.turns[2]!;
+    expect(developerTurn.blocks.map((b) => b.text)).toEqual(['developer instruction injected mid-session']);
+
+    const postBoundaryUsage = s.turns[3]!;
+    expect(postBoundaryUsage.blocks).toHaveLength(0); // usage-only turn, no indexable block
+    expect(postBoundaryUsage.usage?.inputTokens).toBe(200);
+  });
 });

@@ -143,6 +143,6 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
   return Response.json({ enqueued });
 }
 
-function hex(buf: ArrayBuffer): string {
+export function hex(buf: ArrayBuffer): string {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }

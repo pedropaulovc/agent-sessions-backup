@@ -1,5 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
+import { hex } from './ops';
 
 const TERMINAL_PARSE_STATES = new Set(['parsed', 'skipped', 'superseded']);
 
@@ -121,19 +122,32 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
     )
       .bind(...binds)
       .all<{ id: number; store: string; relpath: string; r2_key: string; parse_state: string; content_hash: string }>();
-    const have = new Map(rows.results.map((r) => [`${r.store}\n${r.relpath}`, r]));
-    // A matched D1 row is not proof the raw bytes still exist — head every match in this chunk
-    // (bounded to ≤50, parallel) so a row whose R2 object was lost/corrupted (independent of
-    // parse_state — even a 'parsed' row can point at a since-deleted object) gets reported
-    // missing instead of present. That's what makes the collector re-send the bytes; the upload
-    // path's same-hash restore logic then repairs R2 from that re-upload.
+    // Keyed by store+relpath+hash, not just path: the D1 query above ORs together each item's
+    // OWN (store, relpath, hash) condition, so a returned row only proves THAT SPECIFIC hash
+    // matched. Keying by path alone would let one item's match get reused by a sibling item in
+    // the same batch requesting a DIFFERENT hash for the same path (e.g. a collector scan racing
+    // a local rewrite), wrongly reporting the changed file as present.
+    const have = new Map(rows.results.map((r) => [`${r.store}\n${r.relpath}\n${r.content_hash}`, r]));
+    // A matched D1 row is not proof the raw bytes still exist OR are still correct — head every
+    // match in this chunk (bounded to ≤50, parallel) and compare R2's own sha256 checksum
+    // (present because every PUT through this API passes {sha256}) against the row's
+    // content_hash. A missing object, a missing checksum (shouldn't happen via our PUT path, but
+    // conservative if it ever does), or a mismatch (e.g. the object was overwritten/replaced by
+    // something outside this API) are all reported missing — a matching D1 row alone no longer
+    // proves the right bytes are actually sitting in R2. That's what makes the collector re-send
+    // the bytes; the upload path's same-hash restore logic then repairs R2 from that re-upload.
     const heads = await Promise.all(
-      [...have.values()].map(async (r): Promise<[number, boolean]> => [r.id, (await env.RAW.head(r.r2_key)) !== null]),
+      [...have.values()].map(async (r): Promise<[number, boolean]> => {
+        const obj = await env.RAW.head(r.r2_key);
+        const checksum = obj?.checksums.sha256 ? hex(obj.checksums.sha256) : undefined;
+        return [r.id, checksum === r.content_hash];
+      }),
     );
-    const objectPresent = new Map(heads);
+    const objectVerified = new Map(heads);
     for (const it of chunk) {
-      const row = have.get(`${it.store}\n${it.relpath}`);
-      if (!row || !objectPresent.get(row.id)) {
+      const hash = it.sha256.replace(/^sha256:/, '').toLowerCase();
+      const row = have.get(`${it.store}\n${it.relpath}\n${hash}`);
+      if (!row || !objectVerified.get(row.id)) {
         missing.push({ store: it.store, relpath: it.relpath });
         continue;
       }

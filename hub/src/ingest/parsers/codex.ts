@@ -59,10 +59,12 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
     if (!current) {
       current = { index: session.turns.length, onMainPath: true, role, ts, blocks: [] };
       currentTurnId = turnId;
-      // A new user turn means whatever assistant call preceded it is done; a token_count that
-      // arrives after this (for a reply with no indexable block, e.g. encrypted-reasoning-only)
-      // must open a fresh usage-only turn instead of overwriting this now-stale prior usage.
-      if (role === 'user') lastAssistant = undefined;
+      // A new user/developer/system turn means whatever assistant call preceded it is done; a
+      // token_count that arrives after this (for a reply with no indexable block, e.g.
+      // encrypted-reasoning-only) must open a fresh usage-only turn instead of overwriting this
+      // now-stale prior usage. NOT 'tool': a token_count after a tool-result turn legitimately
+      // reports the call that produced the tool_use, so lastAssistant must survive it.
+      if (role === 'user' || role === 'developer' || role === 'system') lastAssistant = undefined;
       if (role === 'assistant') {
         current.model = currentModel;
         lastAssistant = current;

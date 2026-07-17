@@ -670,6 +670,63 @@ describe('files/check re-enqueues unindexed matches instead of only reporting th
     const body = (await checkRes.json()) as { missing: Array<{ store: string; relpath: string }> };
     expect(body.missing).toHaveLength(0);
   });
+
+  it('a matched row whose R2 object was overwritten with different bytes (same key, no checksum) is reported MISSING, not present (regression: HEAD existence alone does not prove the bytes are correct)', async () => {
+    const CHECK_SESSION_ID5 = 'd0000000-0000-4000-8000-000000000007';
+    const content = `${ccUserLine({ uuid: 'ck5-u1', text: 'files check checksum-mismatch test' })}\n`;
+    const relpath = `check-demo/${CHECK_SESSION_ID5}.jsonl`;
+    const res = await putFile('claude-projects', relpath, content);
+    expect(res.status).toBe(201);
+    await drainQueue();
+
+    // Directly overwrite the R2 object with different bytes, bypassing the upload API entirely
+    // (e.g. a bad manual restore/replacement outside our PUT path) and without a sha256 checksum
+    // option — HEAD still succeeds (the object exists), but its checksum is now absent/wrong.
+    const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
+    await testEnv.RAW.put(r2Key, new TextEncoder().encode('completely different bytes, no sha256 option'));
+
+    const sha256 = await sha256Hex(new TextEncoder().encode(content));
+    const checkRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+      method: 'POST',
+      headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
+      body: JSON.stringify({ files: [{ store: 'claude-projects', relpath, sha256: `sha256:${sha256}` }] }),
+    });
+    expect(checkRes.status).toBe(200);
+    const body = (await checkRes.json()) as { missing: Array<{ store: string; relpath: string }> };
+    expect(body.missing).toEqual([{ store: 'claude-projects', relpath }]);
+  });
+
+  it('a batch with the same path twice under different hashes only treats the D1-matching hash as present (regression: the have map was keyed by path only, so a match on one hash let a sibling item requesting a DIFFERENT, unmatched hash for the same path read as present too)', async () => {
+    const CHECK_SESSION_ID6 = 'd0000000-0000-4000-8000-000000000008';
+    const oldContent = `${ccUserLine({ uuid: 'ck6-u1', text: 'files check dup-path old content' })}\n`;
+    const newContent = `${ccUserLine({ uuid: 'ck6-u1', text: 'files check dup-path NEW content' })}\n`;
+    const relpath = `check-demo/${CHECK_SESSION_ID6}.jsonl`;
+    const res = await putFile('claude-projects', relpath, oldContent);
+    expect(res.status).toBe(201);
+    await drainQueue();
+
+    const oldSha = await sha256Hex(new TextEncoder().encode(oldContent));
+    const newSha = await sha256Hex(new TextEncoder().encode(newContent));
+
+    // D1 still only has the OLD hash for this path (the collector hasn't actually uploaded the
+    // new bytes yet) — a batch requesting both hashes for the same path simulates a scan racing
+    // a local rewrite.
+    const checkRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+      method: 'POST',
+      headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
+      body: JSON.stringify({
+        files: [
+          { store: 'claude-projects', relpath, sha256: `sha256:${oldSha}` },
+          { store: 'claude-projects', relpath, sha256: `sha256:${newSha}` },
+        ],
+      }),
+    });
+    expect(checkRes.status).toBe(200);
+    const body = (await checkRes.json()) as { missing: Array<{ store: string; relpath: string }> };
+    // The old-hash item matches D1's actual row and is present; the new-hash item does NOT
+    // match (D1 still has the old bytes) and must be reported missing.
+    expect(body.missing).toEqual([{ store: 'claude-projects', relpath }]);
+  });
 });
 
 describe('reindex refreshes content_hash', () => {
