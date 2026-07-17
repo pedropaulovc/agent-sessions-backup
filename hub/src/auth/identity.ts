@@ -14,6 +14,13 @@ export type Identity =
  * is only trusted alongside a matching `authorization: Bearer ${env.DEV_AUTH}` header,
  * so a preview deployment doesn't grant unauthenticated admin access to anyone who finds
  * its URL. A missing/empty DEV_AUTH secret denies rather than silently trusting the header.
+ *
+ * `env.ENVIRONMENT` is an explicit allowlist, not a set of special cases carved out of an
+ * otherwise-open default: only 'development' and 'preview' (with a verified bearer) ever
+ * reach the dev-header path. Anything else — 'production', an unrecognized value, or a
+ * missing binding (e.g. a `wrangler deploy` using the checked-in default without an
+ * environment override) — falls through to the closed default of anonymous. This way a
+ * misconfigured deploy fails closed instead of accidentally granting admin.
  */
 export async function machineIdentity(request: Request, env: Env): Promise<Identity> {
   const tls = (request.cf as { tlsClientAuth?: { certVerified?: string; certFingerprintSHA256?: string } } | undefined)
@@ -28,22 +35,25 @@ export async function machineIdentity(request: Request, env: Env): Promise<Ident
     return { kind: 'machine', machineId: row.machine_id, isAdmin: row.is_admin === 1 };
   }
 
-  if (env.ENVIRONMENT === 'production') return { kind: 'anonymous' };
+  if (env.ENVIRONMENT === 'development') return devHeaderIdentity(request, env);
 
   if (env.ENVIRONMENT === 'preview') {
     const auth = request.headers.get('authorization');
-    if (!env.DEV_AUTH || auth !== `Bearer ${env.DEV_AUTH}`) return { kind: 'anonymous' };
+    if (env.DEV_AUTH && auth === `Bearer ${env.DEV_AUTH}`) return devHeaderIdentity(request, env);
   }
 
-  const dev = request.headers.get('x-dev-machine');
-  if (dev) {
-    await env.DB.prepare(
-      `INSERT INTO machines (machine_id, os, hostname) VALUES (?1, ?2, ?1)
-       ON CONFLICT (machine_id) DO NOTHING`,
-    )
-      .bind(dev, request.headers.get('x-dev-os') ?? 'linux')
-      .run();
-    return { kind: 'machine', machineId: dev, isAdmin: true };
-  }
+  // 'production', or any unrecognized/missing value — fail closed.
   return { kind: 'anonymous' };
+}
+
+async function devHeaderIdentity(request: Request, env: Env): Promise<Identity> {
+  const dev = request.headers.get('x-dev-machine');
+  if (!dev) return { kind: 'anonymous' };
+  await env.DB.prepare(
+    `INSERT INTO machines (machine_id, os, hostname) VALUES (?1, ?2, ?1)
+     ON CONFLICT (machine_id) DO NOTHING`,
+  )
+    .bind(dev, request.headers.get('x-dev-os') ?? 'linux')
+    .run();
+  return { kind: 'machine', machineId: dev, isAdmin: true };
 }

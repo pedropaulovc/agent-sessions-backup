@@ -362,6 +362,35 @@ describe('upload requires an actual size header', () => {
       .first();
     expect(row).toBeNull();
   });
+
+  it('an upload declaring a wrong-but-integer size header still records the real R2 byte count, not the declared one (regression: files.size drives canonical dedupe, so trusting a bad header could pick the wrong raw file even though R2 stored the true bytes)', async () => {
+    const bytes = new TextEncoder().encode('{"type":"user"}\n'); // 16 real bytes
+    const relpath = 'wrong-size-demo/f0000000-0000-4000-8000-000000000003.jsonl';
+    // A collector reporting a declared size (content-length, or x-file-size for a chunked
+    // upload with no content-length) that doesn't match what it actually sends — the
+    // scenario the finding describes for streamed/chunked uploads. R2 verifies the checksum
+    // server-side but not the declared length against a header, so this is the only way to
+    // reliably get a real byte mismatch to actually land in R2 in this test harness.
+    const res = await SELF.fetch(
+      `https://api.sessions.vza.net/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent(relpath)}`,
+      {
+        method: 'PUT',
+        headers: {
+          'x-dev-machine': MACHINE,
+          'x-content-hash': `sha256:${await sha256Hex(bytes)}`,
+          'content-length': '99999', // deliberately wrong but a valid safe integer
+        },
+        body: bytes,
+      },
+    );
+    expect(res.status).toBe(201);
+
+    const row = await testEnv.DB.prepare('SELECT size FROM files WHERE machine_id = ?1 AND relpath = ?2')
+      .bind(MACHINE, relpath)
+      .first<{ size: number }>();
+    expect(row?.size).toBe(bytes.length);
+    expect(row?.size).not.toBe(99999);
+  });
 });
 
 describe('date-only "to" bound is inclusive of the whole day', () => {
@@ -612,5 +641,21 @@ describe('search cursor decoding rejects non-integer offsets (regression: a fini
     expect(withBadCursor.status).toBe(200);
     const badCursorPage = (await withBadCursor.json()) as { hits: Array<{ session_id: string }> };
     expect(badCursorPage.hits).toEqual(firstPage.hits);
+  });
+
+  it('a cursor that is not valid base64 at all (e.g. "not-base64!") is treated as offset 0, not a 500 (atob throws)', async () => {
+    const withoutCursor = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=bound', {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    expect(withoutCursor.status).toBe(200);
+    const firstPage = (await withoutCursor.json()) as { hits: Array<{ session_id: string }> };
+    expect(firstPage.hits.length).toBeGreaterThan(0);
+
+    const withInvalidCursor = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=bound&cursor=not-base64!', {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    expect(withInvalidCursor.status).toBe(200);
+    const invalidCursorPage = (await withInvalidCursor.json()) as { hits: Array<{ session_id: string }> };
+    expect(invalidCursorPage.hits).toEqual(firstPage.hits);
   });
 });

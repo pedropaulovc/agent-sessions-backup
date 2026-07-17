@@ -52,9 +52,15 @@ export async function putFile(
   }
 
   const r2Key = `raw/${machineId}/${store}/${relpath}`;
-  // R2 verifies the checksum server-side: a corrupt/truncated body never lands.
+  // R2 verifies the checksum server-side: a corrupt/truncated body never lands. Its returned
+  // object's .size is the authoritative byte count — the x-file-size/content-length header
+  // above is only an early sanity gate (rejects an obviously-bad value before we touch R2);
+  // for a streamed/chunked upload the declared header could still be a wrong-but-integer
+  // value, and files.size drives canonical-copy dedupe, so trusting a mismatched header over
+  // what R2 actually stored could pick the wrong raw file as canonical.
+  let put: R2Object;
   try {
-    await env.RAW.put(r2Key, request.body, { sha256 });
+    put = await env.RAW.put(r2Key, request.body, { sha256 });
   } catch (e) {
     return Response.json({ error: 'checksum_or_write_failure', detail: String(e) }, { status: 400 });
   }
@@ -69,7 +75,7 @@ export async function putFile(
        uploaded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
      RETURNING id`,
   )
-    .bind(machineId, store, relpath, r2Key, size, mtime, sha256, det.harness, det.sessionId ?? null)
+    .bind(machineId, store, relpath, r2Key, put.size, mtime, sha256, det.harness, det.sessionId ?? null)
     .first<{ id: number }>();
 
   await env.DB.prepare('UPDATE machines SET last_upload_at = strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE machine_id = ?1')
@@ -78,7 +84,7 @@ export async function putFile(
   await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
 
   console.log(
-    JSON.stringify({ event: 'access.upload', machine: machineId, key: r2Key, bytes: size, status: existing ? 'updated' : 'created' }),
+    JSON.stringify({ event: 'access.upload', machine: machineId, key: r2Key, bytes: put.size, status: existing ? 'updated' : 'created' }),
   );
   return Response.json({ status: 'stored', file_id: row!.id }, { status: 201 });
 }

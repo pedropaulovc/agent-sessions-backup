@@ -57,6 +57,21 @@ describe('machineIdentity', () => {
     );
     expect(identity).toEqual({ kind: 'anonymous' });
   });
+
+  it('fails closed on an unrecognized ENVIRONMENT value, even with a dev header (an un-configured deploy must not accidentally grant admin)', async () => {
+    const identity = await machineIdentity(
+      reqWith({ 'x-dev-machine': 'staging-box' }),
+      envWith({ ENVIRONMENT: 'staging' as Env['ENVIRONMENT'] }),
+    );
+    expect(identity).toEqual({ kind: 'anonymous' });
+  });
+
+  it('fails closed when ENVIRONMENT is missing entirely, even with a dev header (the checked-in wrangler.jsonc default must not be admin-open)', async () => {
+    const env = envWith({});
+    delete (env as { ENVIRONMENT?: string }).ENVIRONMENT;
+    const identity = await machineIdentity(reqWith({ 'x-dev-machine': 'unconfigured-box' }), env);
+    expect(identity).toEqual({ kind: 'anonymous' });
+  });
 });
 
 describe('preview auth over HTTP', () => {

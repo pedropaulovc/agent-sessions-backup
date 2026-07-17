@@ -10,8 +10,12 @@
   //   { "pattern": "api.sessions.vza.net/*", "zone_name": "vza.net" },
   //   { "pattern": "sessions.vza.net/*", "zone_name": "vza.net" }
   // ],
+  // Fail-closed default: an un-configured `wrangler deploy` (no env override) must NOT
+  // accept the x-dev-machine dev-auth header (see src/auth/identity.ts). Local development
+  // overrides this via `npm run dev` (--var ENVIRONMENT:development); vitest overrides it
+  // via vitest.config.ts's miniflare bindings, independent of this file.
   "vars": {
-    "ENVIRONMENT": "development",
+    "ENVIRONMENT": "production",
     "API_HOST": "api.sessions.vza.net",
     "VIEWER_HOST": "sessions.vza.net"
   },
