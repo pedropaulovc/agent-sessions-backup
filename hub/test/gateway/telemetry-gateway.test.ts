@@ -117,6 +117,33 @@ describe('telemetry-gateway fetch handler', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2); // token exchange + upstream forward
   });
 
+  it('does not throw when the upstream DCR responds with a bodyless 204 (Response forbids a body on null-body statuses)', async () => {
+    const pem = await pemFromGeneratedKeyPair();
+    const env = makeEnv(pem);
+
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('login.microsoftonline.com')) {
+        return new Response(JSON.stringify({ access_token: 'fake-entra-token', expires_in: 3600 }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        });
+      }
+      // Azure's DCR ingestion endpoint returning a bodyless success response.
+      return new Response(null, { status: 204 });
+    });
+
+    const req = new Request('https://gateway.example/v1/traces', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.INGEST_BEARER}` },
+      body: JSON.stringify({ resourceSpans: [{ scopeSpans: [{ spans: [{ name: 's' }] }] }] }),
+    });
+
+    const res = await gateway.fetch(req, env as never, ctx);
+    expect(res.status).toBe(204);
+    expect(await res.text()).toBe('');
+  });
+
   it('answers 200 without calling fetch for an empty body', async () => {
     const env = makeEnv('unused');
     const req = new Request('https://gateway.example/v1/logs', {

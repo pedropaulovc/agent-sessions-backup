@@ -153,7 +153,12 @@ async function forwardOtlp(
     }));
   }
 
-  return new Response(upstreamBody, {
+  // fetch/Response forbids a non-null body on 204/205/304 responses — even an
+  // empty string throws. Azure's DCR ingestion endpoint can return a bodyless
+  // 204 on success, which would otherwise turn into an unhandled Worker
+  // exception here.
+  const NULL_BODY_STATUSES = new Set([204, 205, 304]);
+  return new Response(NULL_BODY_STATUSES.has(upstream.status) ? null : upstreamBody, {
     status: upstream.status,
     headers: { "Content-Type": "application/json" },
   });
