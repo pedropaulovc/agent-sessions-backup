@@ -98,6 +98,34 @@ describe('parseChatgptWeb', () => {
     expect(s.turns).toHaveLength(0);
     expect(s.stats.parseErrorLines).toBe(1);
   });
+
+  it('an out-of-range create_time does not throw — turns still index, valid bounds preserved (round 8 sweep)', () => {
+    // create_time is float SECONDS: 1e20 s * 1000 is beyond the representable Date range, so
+    // new Date(...).toISOString() throws RangeError. Pre-fix that aborted the whole conversation
+    // parse (and, via parseExportArchive's loop, the whole archive). isoFromEpochSeconds drops the
+    // bad value; the turn still indexes via its text, it just doesn't extend the started/ended bounds.
+    // Infinity survives JSON as null (JSON has no non-finite), exercising the non-finite guard too.
+    const raw = chatgptWebConversation({
+      id: 'conv-badts',
+      title: 'bad ts',
+      createTime: 1e20, // conversation-level fallback bounds are bogus as well
+      updateTime: 1e20,
+      turns: [
+        { node: 'n1', parent: 'root-node', role: 'user', text: 'first valid', createTime: 1_700_000_000 },
+        { node: 'n2', parent: 'n1', role: 'assistant', text: 'out of range stamp', createTime: 1e20, model: 'gpt-test-4o' },
+        { node: 'n3', parent: 'n2', role: 'user', text: 'non finite stamp', createTime: Infinity },
+        { node: 'n4', parent: 'n3', role: 'assistant', text: 'last valid', createTime: 1_700_000_200, model: 'gpt-test-4o' },
+      ],
+      currentNode: 'n4',
+    });
+    const s = parseChatgptWeb(raw, 'conv-badts');
+    expect(s.turns).toHaveLength(4); // no throw; every turn indexed
+    expect(s.turns[1]!.ts).toBeUndefined(); // 1e20 dropped
+    expect(s.turns[2]!.ts).toBeUndefined(); // non-finite dropped
+    // Bounds come only from the two valid turns, never the bogus 1e20 conversation fallback.
+    expect(s.startedAt).toBe(new Date(1_700_000_000 * 1000).toISOString());
+    expect(s.endedAt).toBe(new Date(1_700_000_200 * 1000).toISOString());
+  });
 });
 
 describe('parseClaudeWeb', () => {
@@ -291,6 +319,28 @@ describe('parseExportArchive', () => {
     expect(archive.valid).toBe(false);
     expect(archive.error).toMatch(/recognized|layout/i);
     expect(archive.sessions).toHaveLength(0);
+  });
+
+  it('an out-of-range timestamp in one conversation does not sink the whole archive (round 8 sweep)', () => {
+    // A single bogus create_time (1e20 s) used to throw RangeError inside the per-conversation loop,
+    // failing parseExportArchive entirely and erroring EVERY conversation in the ZIP. The guarded
+    // helper drops the bad bound so the archive stays valid and every conversation still fans out.
+    const zip = chatgptExportZip([
+      { id: 'arch-good', title: 'Good', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'good conversation' }] },
+      {
+        id: 'arch-badts',
+        title: 'BadTs',
+        createTime: 1e20,
+        updateTime: 1e20,
+        turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'still indexable text', createTime: 1e20 }],
+      },
+    ]);
+    const archive = parseExportArchive(zip);
+    expect(archive.valid).toBe(true);
+    expect(archive.sessions.map((s) => s.id).sort()).toEqual(['arch-badts', 'arch-good']);
+    const bad = archive.sessions.find((s) => s.id === 'arch-badts')!;
+    expect(bad.turns).toHaveLength(1); // the conversation still indexes its turn
+    expect(bad.turns[0]!.ts).toBeUndefined(); // the out-of-range stamp was dropped, not fatal
   });
 
   it('a non-empty conversations.json where every row lacks an id is INVALID (round 4 Fix 3)', () => {

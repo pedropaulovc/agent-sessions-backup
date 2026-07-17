@@ -1,5 +1,6 @@
 import { CAPS, cap, type NormalizedBlock, type NormalizedSession, type NormalizedTurn, type Role } from '../normalize';
 import { locateKeyOffsets } from './web-offsets';
+import { isoFromEpochSeconds } from './timestamps';
 
 /**
  * ChatGPT web-capture parser (one conversation = one JSON document, as returned by
@@ -58,7 +59,7 @@ export function parseChatgptWeb(raw: string, sessionId: string): NormalizedSessi
     const model = str(meta?.model_slug) ?? str(meta?.default_model_slug);
     if (model && role === 'assistant') models.set(model, (models.get(model) ?? 0) + 1);
 
-    const ts = epochToIso(message.create_time);
+    const ts = isoFromEpochSeconds(message.create_time);
     if (ts) {
       if (!session.startedAt || ts < session.startedAt) session.startedAt = ts;
       if (!session.endedAt || ts > session.endedAt) session.endedAt = ts;
@@ -78,8 +79,8 @@ export function parseChatgptWeb(raw: string, sessionId: string): NormalizedSessi
 
   session.models = [...models.keys()];
   session.primaryModel = mostFrequent(models);
-  session.startedAt ??= epochToIso(conv.create_time);
-  session.endedAt ??= epochToIso(conv.update_time);
+  session.startedAt ??= isoFromEpochSeconds(conv.create_time);
+  session.endedAt ??= isoFromEpochSeconds(conv.update_time);
   if (!session.title) {
     const firstUser = session.turns.find((t) => t.role === 'user')?.blocks.find((b) => b.text)?.text;
     if (firstUser) session.title = firstUser.slice(0, 120);
@@ -217,12 +218,6 @@ function partsText(parts: unknown): string {
     .filter(Boolean)
     .join('\n')
     .trim();
-}
-
-function epochToIso(v: unknown): string | undefined {
-  if (typeof v !== 'number' || !Number.isFinite(v)) return undefined;
-  // ChatGPT create_time/update_time are float seconds since epoch.
-  return new Date(v * 1000).toISOString();
 }
 
 function mostFrequent(counts: Map<string, number>): string | undefined {

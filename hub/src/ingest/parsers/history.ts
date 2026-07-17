@@ -1,5 +1,6 @@
 import type { JsonlLine } from '../jsonl';
 import { CAPS, cap, type NormalizedSession, type NormalizedTurn } from '../normalize';
+import { isoFromEpochMs } from './timestamps';
 
 /**
  * Claude Code / Codex `history.jsonl` prompt-log parser.
@@ -69,22 +70,12 @@ export async function parsePromptLog(
 
 /** Accept an epoch-ms number (or numeric string) or an already-ISO string; return ISO or undefined. */
 function normalizeTs(v: unknown): string | undefined {
-  if (typeof v === 'number' && Number.isFinite(v)) return isoOrUndefined(v);
+  if (typeof v === 'number') return isoFromEpochMs(v);
   if (typeof v === 'string' && v.length > 0) {
-    if (/^\d+$/.test(v)) return isoOrUndefined(Number(v));
+    if (/^\d+$/.test(v)) return isoFromEpochMs(Number(v));
     return v;
   }
   return undefined;
-}
-
-/** ISO string for an epoch-ms value, or undefined if it's out of the representable Date range. */
-function isoOrUndefined(ms: number): string | undefined {
-  const d = new Date(ms);
-  // An epoch beyond ±8.64e15 ms (e.g. a bogus 1e20) yields an Invalid Date, and calling
-  // toISOString() on it throws RangeError — which would abort parsing the WHOLE file. Treat it as
-  // simply having no usable timestamp: the row still indexes (via its prompt text), just without
-  // contributing to started/ended bounds.
-  return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
 }
 
 function str(v: unknown): string | undefined {
