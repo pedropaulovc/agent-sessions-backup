@@ -736,4 +736,46 @@ describe('prompt-log file rows upgrade a legacy NULL session_id on re-upload (ro
     expect(body2.status).toBe('unchanged');
     expect(body2.requeued).toBeUndefined();
   });
+
+  it('files/check restamps a legacy skipped/NULL-session row and re-enqueues it, not just reporting present (round 9)', async () => {
+    const content = historyLines([{ display: 'legacy check prompt iota', timestamp: 1_700_000_000_000 }]).join('\n');
+    await putText('legacy3box', 'claude', 'history.jsonl', content);
+    await drainQueue();
+    // Simulate a legacy row: terminal 'skipped', NULL harness/session_id, and no session indexed.
+    await testEnv.DB.prepare("UPDATE files SET session_id = NULL, harness = NULL, parse_state = 'skipped' WHERE machine_id = 'legacy3box' AND relpath = 'history.jsonl'").run();
+    await testEnv.DB.prepare("DELETE FROM sessions WHERE session_id = 'promptlog:legacy3box:claude'").run();
+
+    // The collector's periodic resync sends files/check with the SAME hash. The bytes are present
+    // (not missing), but before round 9 checkFiles() only re-enqueued NON-terminal rows — a terminal
+    // 'skipped' NULL-identity row would be reported present and never indexed via this path. It must
+    // now restamp + re-enqueue exactly like the PUT same-hash branch (shared restampIfStale helper).
+    const sha256 = await sha256Hex(new TextEncoder().encode(content));
+    const checkReq = () =>
+      SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+        method: 'POST',
+        headers: { 'x-dev-machine': 'legacy3box', 'content-type': 'application/json' },
+        body: JSON.stringify({ files: [{ store: 'claude', relpath: 'history.jsonl', sha256: `sha256:${sha256}` }] }),
+      });
+    const checkRes = await checkReq();
+    expect(checkRes.status).toBe(200);
+    expect(((await checkRes.json()) as { missing: unknown[] }).missing).toHaveLength(0); // present, not missing
+
+    const row = await testEnv.DB.prepare(
+      "SELECT harness, session_id, parse_state FROM files WHERE machine_id = 'legacy3box' AND relpath = 'history.jsonl'",
+    ).first<{ harness: string; session_id: string; parse_state: string }>();
+    expect(row?.harness).toBe('prompt-log'); // restamped in place
+    expect(row?.session_id).toBe('promptlog:legacy3box:claude');
+    expect(row?.parse_state).toBe('pending'); // markPendingAndEnqueue flipped it off terminal
+    await drainQueue();
+    expect(
+      await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'promptlog:legacy3box:claude'").first<{ index_state: string }>(),
+    ).toMatchObject({ index_state: 'ready' });
+
+    // A healthy terminal row still short-circuits: a second check leaves it 'parsed' (a re-enqueue
+    // would have flipped it back to 'pending').
+    expect(((await (await checkReq()).json()) as { missing: unknown[] }).missing).toHaveLength(0);
+    expect(
+      await testEnv.DB.prepare("SELECT parse_state FROM files WHERE machine_id = 'legacy3box' AND relpath = 'history.jsonl'").first<{ parse_state: string }>(),
+    ).toMatchObject({ parse_state: 'parsed' });
+  });
 });
