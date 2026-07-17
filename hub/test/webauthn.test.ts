@@ -29,6 +29,14 @@ const throwingDeps = {
   },
 } as unknown as WebAuthnDeps;
 
+/** okDeps whose authentication verifier reports a specific newCounter. */
+function authDepsWithCounter(newCounter: number): WebAuthnDeps {
+  return {
+    verifyRegistration: (okDeps as unknown as { verifyRegistration: unknown }).verifyRegistration,
+    verifyAuthentication: async () => ({ verified: true, authenticationInfo: { newCounter } }),
+  } as unknown as WebAuthnDeps;
+}
+
 /** okDeps that also records the options object each verifier was called with. */
 function capturingDeps(): { deps: WebAuthnDeps; calls: { reg?: { requireUserVerification?: boolean }; auth?: { requireUserVerification?: boolean } } } {
   const calls: { reg?: { requireUserVerification?: boolean }; auth?: { requireUserVerification?: boolean } } = {};
@@ -279,6 +287,59 @@ describe('passkey auth', () => {
       expect(res.status).toBe(400);
       expect(await res.json()).toEqual({ error: 'bad_request' });
     }
+  });
+
+  it('returns 400 when clientDataJSON decodes to JSON without a string challenge — both endpoints', async () => {
+    // Structurally valid, decodable clientDataJSON of `{}`: challengeOf returns undefined,
+    // which must not reach D1 .bind(...) as an undefined value (that would 500).
+    const emptyClientData = isoBase64URL.fromUTF8String(JSON.stringify({}));
+    const stub = isoBase64URL.fromUTF8String('stub');
+    const body = {
+      id: 'cred-1',
+      rawId: stub,
+      type: 'public-key',
+      clientExtensionResults: {},
+      response: { clientDataJSON: emptyClientData, attestationObject: stub, authenticatorData: stub, signature: stub },
+    };
+    for (const path of ['/webauthn/register/verify', '/webauthn/auth/verify']) {
+      const res = await call(post(path, body), okDeps);
+      expect(res.status).toBe(400);
+      expect(await res.json()).toEqual({ error: 'bad_request' });
+    }
+  });
+
+  it('rejects an auth verify with a missing credential id and does NOT consume the challenge', async () => {
+    await insertCredential('cred-1');
+    const { challenge } = (await (await call(post('/webauthn/auth/options', {}))).json()) as { challenge: string };
+
+    // Valid challenge, but no `id` → 400 before consumeChallenge / the credentials query.
+    const noId = fakeResponse(challenge, 'webauthn.get');
+    delete (noId as { id?: unknown }).id;
+    const bad = await call(post('/webauthn/auth/verify', noId), okDeps);
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toEqual({ error: 'bad_request' });
+
+    // The same challenge still verifies → the failed request left it unconsumed.
+    const good = await call(post('/webauthn/auth/verify', fakeResponse(challenge, 'webauthn.get')), okDeps);
+    expect(good.status).toBe(200);
+  });
+
+  it('keeps the stored counter monotonic (a lower newCounter cannot regress it)', async () => {
+    await insertCredential('cred-1'); // starts at counter 0
+
+    const c1 = ((await (await call(post('/webauthn/auth/options', {}))).json()) as { challenge: string }).challenge;
+    const r1 = await call(post('/webauthn/auth/verify', fakeResponse(c1, 'webauthn.get')), authDepsWithCounter(5));
+    expect(r1.status).toBe(200);
+
+    // A later ceremony that commits a LOWER newCounter (out-of-order concurrent logins).
+    const c2 = ((await (await call(post('/webauthn/auth/options', {}))).json()) as { challenge: string }).challenge;
+    const r2 = await call(post('/webauthn/auth/verify', fakeResponse(c2, 'webauthn.get')), authDepsWithCounter(3));
+    expect(r2.status).toBe(200); // login still succeeds; the counter update is simply a no-op
+
+    const row = await testEnv.DB.prepare('SELECT counter FROM credentials WHERE credential_id = ?1')
+      .bind('cred-1')
+      .first<{ counter: number }>();
+    expect(row?.counter).toBe(5);
   });
 
   it('single-uses an auth challenge in D1 (a replayed verify fails)', async () => {

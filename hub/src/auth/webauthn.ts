@@ -83,9 +83,9 @@ function json(data: unknown, status = 200, extraHeaders?: Record<string, string>
   });
 }
 
-/** The base64url challenge the browser echoes back inside clientDataJSON. */
-function challengeOf(response: { response: { clientDataJSON: string } }): string {
-  const clientData = JSON.parse(isoBase64URL.toUTF8String(response.response.clientDataJSON)) as { challenge: string };
+/** The base64url challenge the browser echoes back inside clientDataJSON, if present. */
+function challengeOf(response: { response: { clientDataJSON: string } }): string | undefined {
+  const clientData = JSON.parse(isoBase64URL.toUTF8String(response.response.clientDataJSON)) as { challenge?: string };
   return clientData.challenge;
 }
 
@@ -93,14 +93,18 @@ function challengeOf(response: { response: { clientDataJSON: string } }): string
  * Parse a verify body and pull out its echoed challenge. Both steps — `request.json()`
  * and the base64url/JSON decode of clientDataJSON — run before any verifier and both
  * throw on garbage input; this is a public unauthenticated surface, so a malformed body
- * must surface as a JSON 400 (via the null return), never an uncaught 500.
+ * must surface as a JSON 400 (via the null return), never an uncaught 500. A body that
+ * decodes cleanly but omits a string `challenge` (e.g. clientDataJSON of `{}`) also
+ * returns null: an undefined challenge would otherwise reach D1 `.bind(...)` and 500.
  */
 async function readVerifyBody<T extends { response: { clientDataJSON: string } }>(
   request: Request,
 ): Promise<{ response: T; challenge: string } | null> {
   try {
     const response = (await request.json()) as T;
-    return { response, challenge: challengeOf(response) };
+    const challenge = challengeOf(response);
+    if (typeof challenge !== 'string' || challenge.length === 0) return null;
+    return { response, challenge };
   } catch {
     return null;
   }
@@ -293,6 +297,11 @@ async function authVerify(request: Request, url: URL, env: Env, deps: WebAuthnDe
   const { response, challenge } = parsed;
   const { rpID, origin } = rp(url, env);
 
+  // Guard the credential id BEFORE consuming the challenge: it's bound into D1 below, and a
+  // missing/non-string id would raise a bind type error (500). Validating first also means a
+  // request that fails this check does not burn the single-use challenge.
+  if (typeof response.id !== 'string' || response.id.length === 0) return json({ error: 'bad_request' }, 400);
+
   if (!(await consumeChallenge(env, challenge, 'auth'))) return json({ error: 'bad_challenge' }, 400);
 
   const row = await env.DB.prepare(
@@ -325,8 +334,14 @@ async function authVerify(request: Request, url: URL, env: Env, deps: WebAuthnDe
   }
   if (!verification.verified) return json({ verified: false }, 400);
 
+  // Monotonic counter: the `AND counter < ?1` guard keeps the stored value from regressing
+  // when two ceremonies for the same authenticator commit out of order (both read the old
+  // value; the lower newCounter must not overwrite a higher one already committed) — a
+  // regression would weaken clone/replay detection. A zero-change result is fine: login
+  // still succeeds, and authenticators that don't implement counters legitimately stay at 0
+  // (SimpleWebAuthn returns newCounter 0, so `counter < 0` never fires — no false regression).
   await env.DB.prepare(
-    "UPDATE credentials SET counter = ?1, last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE credential_id = ?2",
+    "UPDATE credentials SET counter = ?1, last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE credential_id = ?2 AND counter < ?1",
   )
     .bind(verification.authenticationInfo.newCounter, row.credential_id)
     .run();
