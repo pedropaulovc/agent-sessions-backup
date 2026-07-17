@@ -48,6 +48,11 @@ DEFAULT_STORES: dict[str, str] = {
     "codex": "~/.codex",
 }
 
+# Staging stores the webcapture host writes into (CDP JSON) or an operator drops export ZIPs
+# into. They are ordinary `stores` entries on that host so the normal run/backfill scan uploads
+# them with zero special-casing; other machines never have them, so nothing else changes.
+WEBCAPTURE_STORES = ("chatgpt-web", "claude-web", "export-inbox")
+
 VALID_AUTH = ("dev", "mtls")
 
 
@@ -104,6 +109,17 @@ def config_dir() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME")
     base = Path(xdg) if xdg else Path.home() / ".config"
     return base / "agent-collector"
+
+
+def data_dir() -> Path:
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+    return base / "agent-collector"
+
+
+def webcapture_dir() -> Path:
+    """Local root under which webcapture stages raw conversation JSON (one subdir per store)."""
+    return data_dir() / "webcapture"
 
 
 def config_path() -> Path:
@@ -275,3 +291,26 @@ def enroll(
     path.write_text(_dump_toml(cfg))
     cfg.source = path
     return cfg
+
+
+def save(cfg: Config, path: Path | str | None = None) -> None:
+    """Persist a config back to disk (round-trips every field via _dump_toml)."""
+    path = Path(path) if path else (cfg.source or config_path())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_dump_toml(cfg))
+    cfg.source = path
+
+
+def ensure_webcapture_stores(cfg: Config, path: Path | str | None = None) -> list[str]:
+    """Register the webcapture staging stores in the config (idempotent) so the normal run
+    path uploads them. Returns the store names newly added (persists the config if any were).
+    The roots point under webcapture_dir(); the directories are created by the caller."""
+    base = webcapture_dir()
+    added: list[str] = []
+    for name in WEBCAPTURE_STORES:
+        if name not in cfg.stores:
+            cfg.stores[name] = str(base / name)
+            added.append(name)
+    if added:
+        save(cfg, path)
+    return added

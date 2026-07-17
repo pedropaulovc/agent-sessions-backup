@@ -11,6 +11,7 @@ import sys
 from . import config as config_mod
 from . import run as run_mod
 from . import schedule
+from .webcapture import cmd_webcapture
 
 
 def _cmd_enroll(args) -> int:
@@ -101,8 +102,14 @@ def build_parser() -> argparse.ArgumentParser:
     p_doctor.add_argument("--config", default=None)
     p_doctor.set_defaults(func=run_mod.cmd_doctor)
 
-    p_web = sub.add_parser("webcapture", help="(later milestone)")
-    p_web.set_defaults(func=_not_implemented("webcapture"))
+    p_web = sub.add_parser("webcapture", help="CDP-capture ChatGPT/Claude conversations into staging")
+    p_web.add_argument("--product", choices=("chatgpt", "claude"), help="capture only this product (default: both)")
+    p_web.add_argument("--host", default="127.0.0.1", help="Chrome DevTools host (default 127.0.0.1)")
+    p_web.add_argument("--port", type=int, default=9222, help="Chrome --remote-debugging-port (default 9222)")
+    p_web.add_argument("--once", action="store_true", help="single pass (default)")
+    p_web.add_argument("--config", default=None, help="config path override")
+    p_web.set_defaults(func=cmd_webcapture)
+
     p_renew = sub.add_parser("renew", help="(later milestone)")
     p_renew.set_defaults(func=_not_implemented("renew"))
 
