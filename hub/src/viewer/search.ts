@@ -1,5 +1,6 @@
 import { runSearch, type SearchHit } from '../api/search';
 import { esc, page, q } from './layout';
+import { TURNS_PER_PAGE } from './session';
 
 const FILTERS = [
   { param: 'harness', col: 'harness', label: 'Harness' },
@@ -113,8 +114,11 @@ function renderHit(h: SearchHit): string {
   ]
     .filter(Boolean)
     .join('');
+  // Deep-link to the page (turn_index bucket) that holds the matching turn, anchored at that turn.
+  const hitPage = Math.floor(h.block.turn_index / TURNS_PER_PAGE) + 1;
+  const href = `/s/${q(h.session_id)}?page=${hitPage}#t${h.block.turn_index}`;
   return `<div class="hit">` +
-    `<div class="title"><a href="/s/${q(h.session_id)}">${esc(title)}</a></div>` +
+    `<div class="title"><a href="${esc(href)}">${esc(title)}</a></div>` +
     `<div class="snip">${sanitizeSnippet(h.snippet)}</div>` +
     `<div class="meta">${meta}</div>` +
     `</div>`;

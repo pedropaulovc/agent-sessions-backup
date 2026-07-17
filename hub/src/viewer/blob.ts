@@ -1,5 +1,10 @@
 /** GET /s/{id}/blob/{block_id} — serve a single image/document by range-reading its source line from R2. */
 
+// Only these raster types are safe to render inline from the viewer origin. Everything else —
+// documents, SVG, text/html, unknown/absent — is transcript-controlled and could execute script
+// same-origin, so it is forced to a download with an inert content-type.
+const INLINE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+
 interface BlockRow {
   byte_start: number | null;
   byte_len: number | null;
@@ -43,12 +48,23 @@ export async function blobEndpoint(sessionId: string, blockId: string, env: Env)
     return notFound();
   }
 
-  return new Response(bytes as BufferSource, {
-    headers: {
-      'content-type': media.mediaType || 'application/octet-stream',
-      'cache-control': 'private, max-age=31536000, immutable',
-    },
-  });
+  const mime = media.mediaType.toLowerCase();
+  const inlineSafe = row.btype === 'image' && INLINE_IMAGE_TYPES.has(mime);
+
+  const headers: Record<string, string> = {
+    'cache-control': 'private, max-age=31536000, immutable',
+    'x-content-type-options': 'nosniff',
+  };
+  if (inlineSafe) {
+    headers['content-type'] = mime;
+    // Belt-and-suspenders: even a raster type renders in a scriptless sandbox.
+    headers['content-security-policy'] = 'sandbox';
+  } else {
+    headers['content-type'] = 'application/octet-stream';
+    headers['content-disposition'] = `attachment; filename="blob-${id}"`;
+  }
+
+  return new Response(bytes as BufferSource, { headers });
 }
 
 /**

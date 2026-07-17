@@ -200,6 +200,7 @@ interface CcLineOpts {
   toolUse?: { id: string; name: string; input: unknown };
   toolResult?: { toolUseId: string; content: string; isError?: boolean };
   image?: { mediaType: string; data: string };
+  document?: { mediaType: string; data: string };
   ts?: string;
 }
 
@@ -218,6 +219,7 @@ export function ccLine(sessionId: string, o: CcLineOpts): string {
     });
   }
   if (o.image) content.push({ type: 'image', source: { type: 'base64', media_type: o.image.mediaType, data: o.image.data } });
+  if (o.document) content.push({ type: 'document', source: { type: 'base64', media_type: o.document.mediaType, data: o.document.data } });
 
   const envelope: Record<string, unknown> = {
     parentUuid: o.parentUuid ?? null,

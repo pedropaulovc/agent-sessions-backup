@@ -4,7 +4,8 @@ import { parseClaudeCode } from '../ingest/parsers/claude-code';
 import { parseCodex } from '../ingest/parsers/codex';
 import { esc, pageFoot, pageHead, q } from './layout';
 
-const PAGE_SIZE = 200;
+/** Turns per page. Pages are turn_index buckets [(p-1)*SIZE, p*SIZE), so a block's page is floor(turn_index/SIZE)+1. */
+export const TURNS_PER_PAGE = 200;
 
 interface SessionMeta {
   session_id: string;
@@ -48,13 +49,15 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
     .first<{ store: string; relpath: string; r2_key: string }>();
 
   const view: View = url.searchParams.get('view') === 'effective' ? 'effective' : 'chronological';
-  const totalTurns = (
-    await env.DB.prepare('SELECT COUNT(DISTINCT turn_index) AS n FROM blocks WHERE session_id = ?1')
+  const maxTurn = (
+    await env.DB.prepare('SELECT MAX(turn_index) AS m FROM blocks WHERE session_id = ?1')
       .bind(sessionId)
-      .first<{ n: number }>()
-  )?.n ?? 0;
-  const totalPages = Math.max(1, Math.ceil(totalTurns / PAGE_SIZE));
+      .first<{ m: number | null }>()
+  )?.m ?? null;
+  const totalPages = maxTurn === null ? 1 : Math.floor(maxTurn / TURNS_PER_PAGE) + 1;
   const page = clampPage(url.searchParams.get('page'), totalPages);
+  const lo = (page - 1) * TURNS_PER_PAGE;
+  const hi = page * TURNS_PER_PAGE;
 
   const children = await env.DB.prepare(
     `SELECT session_id, title FROM sessions WHERE parent_session_id = ?1 ORDER BY started_at`,
@@ -62,8 +65,18 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
     .bind(sessionId)
     .all<{ session_id: string; title: string | null }>();
 
-  const startByte = await turnStartByte(env, sessionId, (page - 1) * PAGE_SIZE);
-  const endByte = await turnStartByte(env, sessionId, page * PAGE_SIZE);
+  // Page = turn_index bucket. Byte window co-monotonic with turn_index (file order), so it covers exactly [lo, hi).
+  const startByte = await firstByteFrom(env, sessionId, lo);
+  const endByte = await firstByteFrom(env, sessionId, hi);
+
+  // Authoritative global turn_index per content turn on this page, in order — zipped onto the parsed turns for anchors.
+  const pageTurnIndexes = (
+    await env.DB.prepare(
+      `SELECT DISTINCT turn_index FROM blocks WHERE session_id = ?1 AND turn_index >= ?2 AND turn_index < ?3 ORDER BY turn_index`,
+    )
+      .bind(sessionId, lo, hi)
+      .all<{ turn_index: number }>()
+  ).results.map((r) => r.turn_index);
 
   // Media block ids for this byte window, so <img>/<a> can point at the blob endpoint.
   const mediaIds = await loadMediaIds(env, sessionId, startByte, endByte);
@@ -85,8 +98,12 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
           controller.enqueue(encoder.encode('<p class="warn">Raw transcript unavailable (R2 object missing).</p>'));
         } else {
           let rendered = 0;
+          let contentIdx = 0; // advances once per content turn, to zip authoritative turn_index anchors
           for (const turn of parsed.turns) {
-            const html = renderTurn(turn, sessionId, view, mediaIds);
+            const isContent = !turn.compaction && turn.blocks.length > 0;
+            const turnIndex = isContent ? pageTurnIndexes[contentIdx] : undefined;
+            if (isContent) contentIdx++;
+            const html = renderTurn(turn, sessionId, view, mediaIds, turnIndex);
             if (html) {
               controller.enqueue(encoder.encode(html));
               rendered++;
@@ -107,21 +124,13 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
   return new Response(stream, { headers: { 'content-type': 'text/html; charset=utf-8' } });
 }
 
-/** Byte offset of the first block of the (ordinal+1)-th content turn, or undefined past the end. */
-async function turnStartByte(env: Env, sessionId: string, ordinal: number): Promise<number | undefined> {
-  if (ordinal <= 0) {
-    const first = await env.DB.prepare(
-      'SELECT MIN(byte_start) AS bs FROM blocks WHERE session_id = ?1',
-    )
-      .bind(sessionId)
-      .first<{ bs: number | null }>();
-    return first?.bs ?? 0;
-  }
+/** Byte offset of the first block at or after turn_index `from`, or undefined when none exists (past the end). */
+async function firstByteFrom(env: Env, sessionId: string, from: number): Promise<number | undefined> {
   const row = await env.DB.prepare(
-    `SELECT MIN(byte_start) AS bs FROM blocks WHERE session_id = ?1 GROUP BY turn_index ORDER BY turn_index LIMIT 1 OFFSET ?2`,
+    'SELECT MIN(byte_start) AS bs FROM blocks WHERE session_id = ?1 AND turn_index >= ?2',
   )
-    .bind(sessionId, ordinal)
-    .first<{ bs: number }>();
+    .bind(sessionId, from)
+    .first<{ bs: number | null }>();
   return row?.bs ?? undefined;
 }
 
@@ -163,7 +172,13 @@ async function parseRange(
   return harness === 'codex' ? parseCodex(lines, sessionId) : parseClaudeCode(lines, sessionId);
 }
 
-function renderTurn(turn: NormalizedTurn, sessionId: string, view: View, mediaIds: Map<string, number>): string {
+function renderTurn(
+  turn: NormalizedTurn,
+  sessionId: string,
+  view: View,
+  mediaIds: Map<string, number>,
+  turnIndex: number | undefined,
+): string {
   if (turn.compaction) {
     return `<div class="divider">── context compacted ──</div>`;
   }
@@ -172,11 +187,13 @@ function renderTurn(turn: NormalizedTurn, sessionId: string, view: View, mediaId
 
   const rewound = view === 'chronological' && !turn.onMainPath;
   const cls = `turn ${esc(turn.role)}${rewound ? ' rewound' : ''}`;
+  // Stable anchor id (present in every view) so search-hit deep links can scroll to the matching turn.
+  const anchor = turnIndex === undefined ? '' : ` id="t${turnIndex}"`;
   const model = turn.model ? `<span class="chip">${esc(turn.model)}</span>` : '';
   const ts = turn.ts ? `<span class="muted small">${esc(turn.ts)}</span>` : '';
   const head = `<div class="turnhead"><span class="role">${esc(turn.role)}</span>${model}${ts}</div>`;
   const body = turn.blocks.map((b, bi) => renderBlock(b, bi, sessionId, mediaIds)).join('');
-  return `<article class="${cls}">${head}<div class="body">${body}</div></article>`;
+  return `<article${anchor} class="${cls}">${head}<div class="body">${body}</div></article>`;
 }
 
 function renderBlock(b: NormalizedBlock, bi: number, sessionId: string, mediaIds: Map<string, number>): string {

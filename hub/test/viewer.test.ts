@@ -8,6 +8,26 @@ const testEnv = env as unknown as Env;
 
 const SEARCH_SESSION = 'aaaaaaaa-1111-4111-8111-111111111111';
 const BIG_SESSION = 'bbbbbbbb-2222-4222-8222-222222222222';
+const LONG_SESSION = 'cccccccc-3333-4333-8333-333333333333';
+const BLOB_SESSION = 'dddddddd-4444-4444-8444-444444444444';
+
+// Hostile transcript payloads: an SVG with inline script and an HTML "document".
+const SVG_XSS_B64 = btoa('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>');
+const HTML_DOC_B64 = btoa('<!doctype html><script>alert(2)</script>');
+
+// A long session with a unique sentinel planted in a turn past the first page (turn_index 250).
+function longSessionWithSentinel(sessionId: string, turns: number, sentinelAt: number): string {
+  const lines: string[] = [];
+  let parent: string | null = null;
+  for (let i = 0; i < turns; i++) {
+    const uuid = `L-${i}`;
+    const role = i % 2 === 0 ? 'user' : 'assistant';
+    const text = i === sentinelAt ? 'zzuniquesentinel marker word' : `filler content line ${i}`;
+    lines.push(ccLine(sessionId, { uuid, parentUuid: parent, role, text }));
+    parent = uuid;
+  }
+  return lines.join('\n');
+}
 
 async function sha256Hex(data: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', data as BufferSource);
@@ -60,6 +80,15 @@ describe('viewer', () => {
   beforeAll(async () => {
     expect((await putFile('claude-projects', `-home-tester-src-demo/${SEARCH_SESSION}.jsonl`, SEARCH_CONTENT)).status).toBe(201);
     expect((await putFile('claude-projects', `-home-tester-src-demo/${BIG_SESSION}.jsonl`, ccLinearSession(BIG_SESSION, 450))).status).toBe(201);
+    expect(
+      (await putFile('claude-projects', `-home-tester-src-demo/${LONG_SESSION}.jsonl`, longSessionWithSentinel(LONG_SESSION, 260, 250))).status,
+    ).toBe(201);
+    const blobContent = [
+      ccLine(BLOB_SESSION, { uuid: 'b1', parentUuid: null, role: 'user', image: { mediaType: 'image/png', data: TINY_PNG_B64 } }),
+      ccLine(BLOB_SESSION, { uuid: 'b2', parentUuid: 'b1', role: 'user', image: { mediaType: 'image/svg+xml', data: SVG_XSS_B64 } }),
+      ccLine(BLOB_SESSION, { uuid: 'b3', parentUuid: 'b2', role: 'user', document: { mediaType: 'text/html', data: HTML_DOC_B64 } }),
+    ].join('\n');
+    expect((await putFile('claude-projects', `-home-tester-src-demo/${BLOB_SESSION}.jsonl`, blobContent)).status).toBe(201);
     await drainQueue();
   });
 
@@ -123,6 +152,22 @@ describe('viewer', () => {
     expect(p3).toContain('turn number 449 content');
   });
 
+  it('deep-links a search hit past page 1 to the right page with a turn anchor', async () => {
+    const res = await SELF.fetch('https://sessions.vza.net/?q=zzuniquesentinel');
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // turn_index 250 → page floor(250/200)+1 = 2, anchored at #t250.
+    expect(html).toContain(`/s/${LONG_SESSION}?page=2#t250`);
+
+    // The anchor target actually exists in the rendered page (default chronological view).
+    const p2 = await (await SELF.fetch(`https://sessions.vza.net/s/${LONG_SESSION}?page=2`)).text();
+    expect(p2).toContain('id="t250"');
+    expect(p2).toContain('zzuniquesentinel');
+    // And it is NOT on page 1.
+    const p1 = await (await SELF.fetch(`https://sessions.vza.net/s/${LONG_SESSION}`)).text();
+    expect(p1).not.toContain('id="t250"');
+  });
+
   it('blob endpoint round-trips a base64 png', async () => {
     const block = await testEnv.DB.prepare("SELECT id FROM blocks WHERE session_id = ?1 AND btype = 'image'")
       .bind(SEARCH_SESSION)
@@ -135,6 +180,40 @@ describe('viewer', () => {
     const got = new Uint8Array(await res.arrayBuffer());
     const want = Uint8Array.from(atob(TINY_PNG_B64), (c) => c.charCodeAt(0));
     expect([...got]).toEqual([...want]);
+  });
+
+  it('serves inert images inline but forces hostile MIME (svg, documents) to a download', async () => {
+    const imgs = await testEnv.DB.prepare(
+      "SELECT id FROM blocks WHERE session_id = ?1 AND btype = 'image' ORDER BY byte_start",
+    )
+      .bind(BLOB_SESSION)
+      .all<{ id: number }>();
+    const [pngId, svgId] = imgs.results.map((r) => r.id);
+    const doc = await testEnv.DB.prepare("SELECT id FROM blocks WHERE session_id = ?1 AND btype = 'document'")
+      .bind(BLOB_SESSION)
+      .first<{ id: number }>();
+
+    // PNG: inline, but with nosniff + a scriptless sandbox CSP.
+    const png = await SELF.fetch(`https://sessions.vza.net/s/${BLOB_SESSION}/blob/${pngId}`);
+    expect(png.status).toBe(200);
+    expect(png.headers.get('content-type')).toBe('image/png');
+    expect(png.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(png.headers.get('content-security-policy')).toBe('sandbox');
+    expect(png.headers.get('content-disposition')).toBeNull();
+
+    // SVG masquerading as an image: never inline — forced to an octet-stream attachment.
+    const svg = await SELF.fetch(`https://sessions.vza.net/s/${BLOB_SESSION}/blob/${svgId}`);
+    expect(svg.status).toBe(200);
+    expect(svg.headers.get('content-type')).toBe('application/octet-stream');
+    expect(svg.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(svg.headers.get('content-disposition')).toContain('attachment');
+
+    // Document (text/html here): attachment, octet-stream.
+    const d = await SELF.fetch(`https://sessions.vza.net/s/${BLOB_SESSION}/blob/${doc!.id}`);
+    expect(d.status).toBe(200);
+    expect(d.headers.get('content-type')).toBe('application/octet-stream');
+    expect(d.headers.get('content-disposition')).toContain('attachment');
+    expect(d.headers.get('content-security-policy')).toBeNull();
   });
 
   it('blob endpoint 404s for an unknown block', async () => {
