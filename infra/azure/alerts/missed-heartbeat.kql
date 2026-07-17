@@ -20,10 +20,19 @@
 //
 // Pipeline-dead detection (the other half of "dead-man"): if the gateway, the
 // observability export destination, or the watchdog cron itself stops delivering
-// logs, the 30m window has NO watchdog output at all — a bare stale-machine
+// logs, the liveness window has NO watchdog output at all — a bare stale-machine
 // query would then return zero rows and provision.sh's `count > 0` rule would
 // read that outage as HEALTHY. So we union in a synthetic `__pipeline_silent__`
 // row whenever the window contains no `hub.watchdog.run` beacon.
+//
+// Liveness-leg lookback = 1h, matching the rule's hourly evaluation cadence
+// (provision.sh: evaluation-frequency == window-size == 1h for missed-heartbeat).
+// A shorter lookback than the cadence leaves an unobserved gap each hour — a
+// total-pipeline outage that starts and recovers inside that gap would never be
+// seen. Tiling the 1h lookback to the 1h cadence closes it. Only the two liveness
+// legs (pipeline_silent, roster_unavailable) need this; stale_machines keeps its
+// 30m arg_max window because it keys on the re-emitted age_seconds gauge, not on
+// the presence/absence of rows.
 //
 // Crucially the silence check keys on the `hub.watchdog.run` BEACON, not on the
 // count of heartbeat_age rows: the watchdog emits the beacon every run even with
@@ -69,14 +78,14 @@ let stale_machines = otel
     | where age_seconds > 72 * 3600
     | project machine, age_seconds;
 let pipeline_silent = otel
-    | where TimeGenerated > ago(30m)
+    | where TimeGenerated > ago(1h)
     | extend body = todynamic(Body)
     | where body.event == "hub.watchdog.run"
     | summarize n = count()
     | where n == 0
     | project machine = "__pipeline_silent__", age_seconds = tolong(-1);
 let roster_unavailable = otel
-    | where TimeGenerated > ago(30m)
+    | where TimeGenerated > ago(1h)
     | extend body = todynamic(Body)
     | where body.event == "hub.watchdog.run"
     | extend roster_ok = tobool(body.roster_ok)

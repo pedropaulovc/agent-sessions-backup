@@ -99,12 +99,22 @@ EOF
     mv "$tmp" "$ENV_FILE"
 }
 
-cd "$REPO_ROOT/hub"
-
-if [ -n "${OIDC_KEY_FILE:-}" ] && [ ! -f "$OIDC_KEY_FILE" ]; then
-    echo "OIDC_KEY_FILE=$OIDC_KEY_FILE does not exist" >&2
-    exit 1
+# Resolve OIDC_KEY_FILE to an absolute path NOW, while we're still in the
+# caller's cwd. The documented workflow is `OIDC_KEY_FILE=key.pem
+# ./infra/cf/deploy-gateway.sh` from the repo root, but this script cd's into
+# hub/ before it reads the key — a relative path would then resolve against hub/
+# and the file would appear to vanish, blocking the required first deploy.
+# `cd dirname && pwd` is the portable (bash 3.2, no realpath dependency)
+# absolute-path trick; do the existence check here too, against the caller's cwd.
+if [ -n "${OIDC_KEY_FILE:-}" ]; then
+    if [ ! -f "$OIDC_KEY_FILE" ]; then
+        echo "OIDC_KEY_FILE=$OIDC_KEY_FILE does not exist" >&2
+        exit 1
+    fi
+    OIDC_KEY_FILE="$(cd "$(dirname "$OIDC_KEY_FILE")" && pwd)/$(basename "$OIDC_KEY_FILE")"
 fi
+
+cd "$REPO_ROOT/hub"
 
 # Probe worker existence FIRST — both guards below key off it. `wrangler
 # deployments list` exits 0 for a deployed worker, non-zero for an unknown name
@@ -133,18 +143,26 @@ if [ "$WORKER_EXISTS" = no ] && [ -z "${OIDC_KEY_FILE:-}" ]; then
     exit 1
 fi
 
-# Bearer determination.
-#  - Local env file with a bearer  -> reuse it (the safe, common re-run path).
+# Bearer determination. --rotate-bearer is checked FIRST: its whole purpose is
+# to replace a leaked/compromised bearer from the normal operator box, which is
+# exactly the box that HAS the env file — so a reuse-first order would make the
+# flag a silent no-op on the one machine where it matters. When set, always mint
+# fresh; the env rewrite below propagates the new value.
+#  - --rotate-bearer            -> always mint fresh (rewrite propagates it).
+#  - Local env file with bearer  -> reuse it (the safe, common re-run path).
 #  - No local bearer, worker EXISTS -> the dashboard destinations already carry a
 #    bearer this machine can't see. Minting a new one here would leave them
 #    sending the old value, so the gateway would 200-no-op every post until
 #    someone noticed. Hard-error with the two legitimate recoveries instead.
-#  - No local bearer, worker ABSENT (or --rotate-bearer) -> generate fresh;
-#    nothing downstream depends on a prior value.
-if [ -f "$ENV_FILE" ] && grep -q '^INGEST_BEARER=' "$ENV_FILE"; then
+#  - No local bearer, worker ABSENT -> generate fresh; nothing depends on a prior
+#    value.
+if [ "$ROTATE_BEARER" = yes ]; then
+    INGEST_BEARER=$(openssl rand -hex 32)
+    BEARER_SOURCE="rotated (--rotate-bearer) — UPDATE the dashboard destinations after this"
+elif [ -f "$ENV_FILE" ] && grep -q '^INGEST_BEARER=' "$ENV_FILE"; then
     INGEST_BEARER=$(grep '^INGEST_BEARER=' "$ENV_FILE" | head -1 | cut -d= -f2-)
     BEARER_SOURCE="reused from $ENV_FILE"
-elif [ "$WORKER_EXISTS" = yes ] && [ "$ROTATE_BEARER" = no ]; then
+elif [ "$WORKER_EXISTS" = yes ]; then
     echo "ERROR: the gateway worker already exists but $ENV_FILE is missing, so this" >&2
     echo "machine has no copy of the live INGEST_BEARER. The account-level dashboard" >&2
     echo "destinations are already sending the existing bearer; generating a new one" >&2
@@ -157,11 +175,7 @@ elif [ "$WORKER_EXISTS" = yes ] && [ "$ROTATE_BEARER" = no ]; then
     exit 1
 else
     INGEST_BEARER=$(openssl rand -hex 32)
-    if [ "$ROTATE_BEARER" = yes ]; then
-        BEARER_SOURCE="rotated (--rotate-bearer) — UPDATE the dashboard destinations after this"
-    else
-        BEARER_SOURCE="generated fresh (new worker)"
-    fi
+    BEARER_SOURCE="generated fresh (new worker)"
 fi
 echo "INGEST_BEARER: $BEARER_SOURCE"
 
