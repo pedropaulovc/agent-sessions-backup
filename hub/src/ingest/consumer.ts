@@ -319,6 +319,17 @@ async function parseExportInto(file: FileRow, env: Env, contentHash?: string): P
     if (recheck?.content_hash !== contentHash) return;
   }
 
+  // A corrupt / missing-conversations.json / non-array archive is NOT a well-formed export: keep
+  // whatever sessions this file already owns (preservation-first) but mark the file 'error' with
+  // the reason, so /status surfaces it instead of silently reporting the replacement as parsed.
+  // (An empty-but-valid array is `valid` and falls through to normal write + cleanup, clearing
+  // everything this file used to own.)
+  if (!archive.valid) {
+    await markParsed(file.id, env, 'error', file.size, archive.error ?? 'invalid export archive', contentHash);
+    console.log(JSON.stringify({ event: 'parse.export.error', file_id: file.id, error: archive.error }));
+    return;
+  }
+
   // Session ids we actually WROTE this parse (turns > 0 and not owned by a live CDP capture). A
   // conversation that is present in the new archive but now parses to zero turns is deliberately
   // NOT kept, so its stale rows get cleared below (same as the single-session empty-parse path).
@@ -335,14 +346,15 @@ async function parseExportInto(file: FileRow, env: Env, contentHash?: string): P
     written.add(session.id);
   }
 
-  // A re-uploaded archive that drops (or now-empties) a conversation must not leave its old
+  // A re-uploaded VALID archive that drops (or now-empties) a conversation must not leave its old
   // session behind: the ZIP's files row has session_id NULL, so the normal
   // reparse-clears-stale-rows path never touches per-conversation sessions. Delete any session
   // still owned by THIS file that we did NOT just (re)write — matching delete+reinsert reparse
-  // semantics (derived rows + this session row; raw R2 untouched). Skipped when the whole archive
-  // failed to parse (harness unknown), so a transient corrupt re-upload can't wipe good data.
+  // semantics (derived rows + this session row; raw R2 untouched). Runs unconditionally now: the
+  // invalid case already returned above, so a well-formed empty array correctly clears everything
+  // this file owned, while a corrupt re-upload never reaches here.
   const recovered = new Set<string>();
-  if (archive.harness !== 'unknown') {
+  {
     const owned = await env.DB.prepare('SELECT session_id FROM sessions WHERE canonical_file_id = ?1')
       .bind(file.id)
       .all<{ session_id: string }>();

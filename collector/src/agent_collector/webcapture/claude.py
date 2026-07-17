@@ -40,6 +40,8 @@ def capture_claude(transport: CdpTransport, state, staging_root: Path, events: l
 
     changed = []
     for c in convs:
+        if not isinstance(c, dict):
+            continue  # a non-object array item (layout drift) must not raise .get()
         conv_id = c.get("uuid")
         updated = c.get("updated_at")
         if not conv_id or not updated:
@@ -106,8 +108,12 @@ def _resolve_org(transport: CdpTransport) -> str | None:
         return None
     if not isinstance(orgs, list) or not orgs:
         return None
-    for org in orgs:
+    dict_orgs = [o for o in orgs if isinstance(o, dict)]  # skip non-object items (layout drift)
+    for org in dict_orgs:
         caps = org.get("capabilities") or []
         if org.get("uuid") and "chat" in caps:
             return org["uuid"]
-    return orgs[0].get("uuid")
+    for org in dict_orgs:
+        if org.get("uuid"):
+            return org["uuid"]
+    return None

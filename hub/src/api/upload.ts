@@ -116,6 +116,10 @@ export async function putFile(
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')
      ON CONFLICT (machine_id, store, relpath) DO UPDATE SET
        size = excluded.size, mtime = excluded.mtime, content_hash = excluded.content_hash,
+       -- Refresh harness/session_id too: a row created before machine-scoped prompt-log ids
+       -- existed (or before a detect() change) would otherwise keep a stale/NULL session_id even
+       -- after re-upload, so canonical/recovery queries that join on files.session_id miss it.
+       harness = excluded.harness, session_id = excluded.session_id,
        parse_state = 'pending', parse_error = NULL,
        uploaded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
      RETURNING id`,

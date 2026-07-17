@@ -4,76 +4,89 @@ import { parseChatgptWeb } from './chatgpt-web';
 import { parseClaudeWeb } from './claude-web';
 
 export interface ExportArchive {
+  /**
+   * True iff a `conversations.json` was found and parsed as a JSON array — an EMPTY array is a
+   * legitimately empty export (valid), distinct from a corrupt/missing archive (invalid). The
+   * consumer runs stale-session cleanup only for valid archives and marks invalid ones 'error'
+   * with `error`, so an unreadable replacement never silently reports as parsed.
+   */
+  valid: boolean;
   harness: Harness;
   sessions: NormalizedSession[];
-  /** Conversations seen in the archive that produced no session id (skip-and-count, never fatal). */
+  /** Conversations skipped (no id, or an unrecognized layout) — counted, never fatal. */
   skipped: number;
+  /** Why the archive is invalid (present iff !valid) — surfaced as files.parse_error. */
+  error?: string;
+}
+
+/** `conversations.json` at the archive root or any nested path (case-insensitive). */
+const CONVERSATIONS_RE = /(^|\/)conversations\.json$/i;
+
+/** Exported for tests: the unzip filter predicate — only matching entries are ever inflated. */
+export function isConversationsEntry(name: string): boolean {
+  return CONVERSATIONS_RE.test(name);
 }
 
 /**
  * Official-export ZIP parser (one-time backfill dropped into `export-inbox/`).
  *
  * Both products ship a `conversations.json` array inside the ZIP: ChatGPT conversations carry a
- * `mapping` tree, claude.ai conversations carry `chat_messages` — the very same shapes the CDP
- * web parsers already handle, so each conversation is re-serialized and run through the matching
- * web parser, keyed by its own conversation id. Layout drift (missing file, wrong nesting, an
- * unparseable conversation) is tolerated with skip-and-count; a single bad conversation never
- * sinks the archive.
+ * `mapping` tree, claude.ai conversations carry `chat_messages` — the same shapes the CDP web
+ * parsers already handle, so each conversation is re-serialized and run through the matching web
+ * parser, keyed by its own conversation id. Only `conversations.json` is inflated (fflate
+ * `filter`), so an attachment-heavy export never decompresses gigabytes of image blobs just to
+ * read one JSON file. Layout drift is tolerated with skip-and-count; a single bad conversation
+ * never sinks the archive.
  */
 export function parseExportArchive(bytes: Uint8Array): ExportArchive {
-  const files = safeUnzip(bytes);
-  const convsRaw = findConversationsJson(files);
-  if (!convsRaw) return { harness: 'unknown', sessions: [], skipped: 0 };
-
+  const convsRaw = extractConversationsJson(bytes);
+  if (convsRaw === undefined) {
+    return invalid('no conversations.json found in export archive (unreadable ZIP or missing file)');
+  }
   let list: unknown;
   try {
     list = JSON.parse(convsRaw);
   } catch {
-    return { harness: 'unknown', sessions: [], skipped: 0 };
+    return invalid('conversations.json is not valid JSON');
   }
-  const conversations = Array.isArray(list) ? list : isObj(list) ? [list] : [];
+  if (!Array.isArray(list)) {
+    return invalid('conversations.json is not a JSON array');
+  }
 
-  const harness = detectLayout(conversations);
-  if (harness === 'unknown') return { harness, sessions: [], skipped: conversations.length };
-
+  // Valid from here — an empty array is a well-formed, empty export (the consumer clears whatever
+  // this file used to own). Layout is inferred from the conversations that exist.
+  const harness = detectLayout(list);
   const sessions: NormalizedSession[] = [];
   let skipped = 0;
-  for (const conv of conversations) {
-    if (!isObj(conv)) {
-      skipped++;
-      continue;
-    }
-    const id = conversationId(conv, harness);
-    if (!id) {
+  for (const conv of list) {
+    const id = isObj(conv) ? conversationId(conv, harness) : undefined;
+    if (harness === 'unknown' || !isObj(conv) || !id) {
       skipped++;
       continue;
     }
     const text = JSON.stringify(conv);
-    const session = harness === 'chatgpt-web' ? parseChatgptWeb(text, id) : parseClaudeWeb(text, id);
-    sessions.push(session);
+    sessions.push(harness === 'chatgpt-web' ? parseChatgptWeb(text, id) : parseClaudeWeb(text, id));
   }
-  return { harness, sessions, skipped };
+  return { valid: true, harness, sessions, skipped };
 }
 
-function safeUnzip(bytes: Uint8Array): Record<string, Uint8Array> {
+function invalid(error: string): ExportArchive {
+  return { valid: false, harness: 'unknown', sessions: [], skipped: 0, error };
+}
+
+/** Inflate ONLY conversations.json (fflate filter runs before decompression), then decode it. */
+function extractConversationsJson(bytes: Uint8Array): string | undefined {
+  let files: Record<string, Uint8Array>;
   try {
-    return unzipSync(bytes);
+    files = unzipSync(bytes, { filter: (file) => isConversationsEntry(file.name) });
   } catch {
-    return {};
+    return undefined; // not a readable ZIP
   }
-}
-
-/** The `conversations.json` entry (root or nested), or the first array-shaped *.json as a fallback. */
-function findConversationsJson(files: Record<string, Uint8Array>): string | undefined {
-  const decoder = new TextDecoder('utf-8');
-  const named = Object.keys(files).find((p) => p.endsWith('conversations.json'));
-  if (named) return decoder.decode(files[named]);
-  for (const [path, data] of Object.entries(files)) {
-    if (!path.endsWith('.json')) continue;
-    const text = decoder.decode(data);
-    if (text.trimStart().startsWith('[')) return text;
-  }
-  return undefined;
+  const names = Object.keys(files);
+  if (names.length === 0) return undefined;
+  // Prefer the least-nested match (a root conversations.json over one inside a subdir).
+  names.sort((a, b) => a.length - b.length);
+  return new TextDecoder('utf-8').decode(files[names[0]!]);
 }
 
 function detectLayout(conversations: unknown[]): Harness {

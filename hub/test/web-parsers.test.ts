@@ -3,7 +3,7 @@ import { readJsonlLines } from '../src/ingest/jsonl';
 import { parseChatgptWeb } from '../src/ingest/parsers/chatgpt-web';
 import { parseClaudeWeb } from '../src/ingest/parsers/claude-web';
 import { parsePromptLog } from '../src/ingest/parsers/history';
-import { parseExportArchive } from '../src/ingest/parsers/export-inbox';
+import { isConversationsEntry, parseExportArchive } from '../src/ingest/parsers/export-inbox';
 import { toStream } from './fixtures';
 import {
   chatgptExportZip,
@@ -237,8 +237,36 @@ describe('parseExportArchive', () => {
     expect(archive.sessions[0]!.harness).toBe('claude-web');
   });
 
-  it('tolerates a ZIP without conversations.json and a corrupt ZIP (no throw, no sessions)', () => {
-    expect(parseExportArchive(emptyExportZip()).sessions).toHaveLength(0);
-    expect(parseExportArchive(new Uint8Array([1, 2, 3, 4])).sessions).toHaveLength(0);
+  it('treats a well-formed empty conversations.json array as VALID (empty), distinct from corrupt', () => {
+    const emptyArray = parseExportArchive(chatgptExportZip([]));
+    expect(emptyArray.valid).toBe(true);
+    expect(emptyArray.sessions).toHaveLength(0);
+
+    const noConvFile = parseExportArchive(emptyExportZip());
+    expect(noConvFile.valid).toBe(false);
+    expect(noConvFile.error).toMatch(/conversations\.json/);
+
+    const corrupt = parseExportArchive(new Uint8Array([1, 2, 3, 4]));
+    expect(corrupt.valid).toBe(false);
+    expect(corrupt.error).toBeTruthy();
+  });
+
+  it('inflates only conversations.json — a large ancillary entry does not sink the parse', () => {
+    // A large attachment blob alongside a small conversations.json; the fflate filter must skip it.
+    const zip = chatgptExportZip(
+      [{ id: 'big-a', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'small conversation' }] }],
+      { 'attachments/huge.bin': 'x'.repeat(200_000) },
+    );
+    const archive = parseExportArchive(zip);
+    expect(archive.valid).toBe(true);
+    expect(archive.sessions.map((s) => s.id)).toEqual(['big-a']);
+  });
+
+  it('isConversationsEntry matches root/nested conversations.json only', () => {
+    expect(isConversationsEntry('conversations.json')).toBe(true);
+    expect(isConversationsEntry('export/conversations.json')).toBe(true);
+    expect(isConversationsEntry('Conversations.JSON')).toBe(true);
+    expect(isConversationsEntry('user.json')).toBe(false);
+    expect(isConversationsEntry('attachments/image.png')).toBe(false);
   });
 });

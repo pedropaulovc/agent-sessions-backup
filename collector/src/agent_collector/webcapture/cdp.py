@@ -66,7 +66,13 @@ class ChromeCdpTransport:
         ws_url = target.get("webSocketDebuggerUrl")
         if not ws_url:
             raise CdpError(f"target for {self.origin} has no webSocketDebuggerUrl")
-        self._ws = websocket.create_connection(ws_url, timeout=self.timeout, max_size=None)
+        try:
+            # create_connection raises websocket/OS exceptions (tab closed, handshake failed), none
+            # of which _run_products catches — normalize to CdpError so capture of the OTHER product
+            # still runs and a heartbeat event is still buffered.
+            self._ws = websocket.create_connection(ws_url, timeout=self.timeout, max_size=None)
+        except Exception as e:  # noqa: BLE001 - any connect failure is an operational capture error
+            raise CdpError(f"websocket connect to {self.origin} tab failed: {e}") from e
 
     def _list_targets(self) -> list[dict]:
         url = f"http://{self.host}:{self.port}/json"
@@ -94,21 +100,26 @@ class ChromeCdpTransport:
     def _eval(self, expression: str) -> str:
         self._msg_id += 1
         mid = self._msg_id
-        self._ws.send(json.dumps({
-            "id": mid,
-            "method": "Runtime.evaluate",
-            "params": {"expression": expression, "awaitPromise": True, "returnByValue": True},
-        }))
-        while True:
-            msg = json.loads(self._ws.recv())
-            if msg.get("id") != mid:
-                continue  # skip unrelated CDP events on the same socket
-            if "error" in msg:
-                raise CdpError(f"CDP evaluate failed: {msg['error']}")
-            result = msg.get("result", {})
-            if result.get("exceptionDetails"):
-                raise CdpError(f"in-page fetch threw: {result['exceptionDetails']}")
-            return result.get("result", {}).get("value", "")
+        try:
+            self._ws.send(json.dumps({
+                "id": mid,
+                "method": "Runtime.evaluate",
+                "params": {"expression": expression, "awaitPromise": True, "returnByValue": True},
+            }))
+            while True:
+                msg = json.loads(self._ws.recv())
+                if msg.get("id") != mid:
+                    continue  # skip unrelated CDP events on the same socket
+                if "error" in msg:
+                    raise CdpError(f"CDP evaluate failed: {msg['error']}")
+                result = msg.get("result", {})
+                if result.get("exceptionDetails"):
+                    raise CdpError(f"in-page fetch threw: {result['exceptionDetails']}")
+                return result.get("result", {}).get("value", "")
+        except CdpError:
+            raise
+        except Exception as e:  # noqa: BLE001 - a dropped/broken socket mid-eval is a capture error
+            raise CdpError(f"CDP evaluate transport error on {self.origin}: {e}") from e
 
     def close(self) -> None:
         if self._ws is not None:

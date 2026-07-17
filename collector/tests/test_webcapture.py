@@ -251,6 +251,72 @@ def test_cmd_webcapture_list_failure_still_runs_other_product_and_buffers_event(
         assert st.pending_event_count() >= 1  # the list failure was buffered for the next heartbeat
 
 
+def test_claude_list_and_org_skip_non_dict_items(tmp_path):
+    # Round 3 Fix 3+6: non-object items in the org list AND the conversation list must be skipped,
+    # not raise .get() out of the whole command.
+    transport = FakeCdpTransport({
+        f"{CLAUDE}/api/organizations": (200, json.dumps(["nope", 42, {"uuid": "org1", "capabilities": ["chat"]}])),
+        f"{CLAUDE}/api/organizations/org1/chat_conversations": (200, json.dumps(["str-item", {"uuid": "k1", "updated_at": "t"}])),
+        f"{CLAUDE}/api/organizations/org1/chat_conversations/k1?tree=True&rendering_mode=raw": (200, json.dumps({"uuid": "k1", "chat_messages": []})),
+    })
+    events: list[dict] = []
+    with State(tmp_path / "state.db") as st:
+        res = capture_claude(transport, st, tmp_path / "claude-web", events)
+    assert res.logged_in and res.captured == 1 and res.checked == 1  # only the one real conv
+
+
+def test_claude_org_list_all_non_dict_signs_out_cleanly(tmp_path):
+    transport = FakeCdpTransport({f"{CLAUDE}/api/organizations": (200, json.dumps(["a", "b"]))})
+    events: list[dict] = []
+    with State(tmp_path / "state.db") as st:
+        res = capture_claude(transport, st, tmp_path / "claude-web", events)
+    assert res.logged_in is False
+    assert any(e["code"] == "webcapture_login_expired" for e in events)
+
+
+def test_cdp_connect_failure_becomes_cdp_error(monkeypatch):
+    # Round 3 Fix 4: a websocket handshake failure is wrapped as CdpError (which _run_products
+    # catches) rather than a raw websocket exception that aborts the whole run.
+    import sys
+    import types as _types
+    from agent_collector.webcapture.cdp import ChromeCdpTransport, CdpError
+
+    def _raise(*_a, **_k):
+        raise RuntimeError("websocket handshake failed")
+
+    monkeypatch.setitem(sys.modules, "websocket", _types.SimpleNamespace(create_connection=_raise))
+    tr = ChromeCdpTransport("https://chatgpt.com", host="127.0.0.1", port=9222)
+    monkeypatch.setattr(tr, "_list_targets", lambda: [
+        {"type": "page", "url": "https://chatgpt.com/", "webSocketDebuggerUrl": "ws://127.0.0.1:9222/dev"},
+    ])
+    with pytest.raises(CdpError):
+        tr.fetch("https://chatgpt.com/api/auth/session")
+
+
+def test_cmd_webcapture_cdp_error_one_product_still_runs_other(tmp_env):
+    # A CdpError capturing ChatGPT must not abort the Claude capture.
+    from agent_collector.webcapture.cdp import CdpError
+
+    class _Raising:
+        def fetch(self, url):
+            raise CdpError("chrome tab closed")
+
+        def close(self):
+            pass
+
+    path = config.config_path()
+    config.enroll("http://localhost:8787", dev=True, path=path, machine_id="webhost")
+
+    def factory(origin):
+        return _Raising() if origin == PRODUCTS["chatgpt"][0] else _claude_transport()
+
+    rc = cmd_webcapture(types.SimpleNamespace(config=str(path), product=None, host="127.0.0.1", port=9222), transport_factory=factory)
+    assert rc == 1  # a Chrome/CDP failure is a real error for a hand-run (nonzero exit)...
+    assert (config.webcapture_dir() / "claude-web" / "k1.json").exists()  # ...but Claude still captured
+    with State() as st:
+        assert st.pending_event_count() >= 1  # the CdpError was buffered for the next heartbeat
+
+
 def test_fake_transport_prefix_matches_query_variants():
     t = FakeCdpTransport({"https://x/list": (200, "base")})
     assert t.fetch("https://x/list?offset=100") == (200, "base")  # longest-prefix match

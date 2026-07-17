@@ -309,4 +309,59 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     expect(row?.canon).toBe(ex1Id); // recovered, now owned by the older archive
     expect(row?.title).toBe('from-ex1');
   });
+
+  it('a re-uploaded VALID empty archive clears every conversation it owned (round 3 Fix 1)', async () => {
+    const relpath = 'chatgpt-export-emptyarray.zip';
+    const full = chatgptExportZip([
+      { id: 'ea-a', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'emptyarray-marker one' }] },
+      { id: 'ea-b', title: 'B', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'emptyarray-marker two' }] },
+    ]);
+    expect((await put('webbox', 'export-inbox', relpath, full)).status).toBe(201);
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id IN ('ea-a','ea-b')").first<{ n: number }>()).toMatchObject({ n: 2 });
+
+    // A well-formed but empty conversations.json array is VALID and clears everything this file owned.
+    expect((await put('webbox', 'export-inbox', relpath, chatgptExportZip([]))).status).toBe(201);
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id IN ('ea-a','ea-b')").first<{ n: number }>()).toMatchObject({ n: 0 });
+    const fileState = await testEnv.DB.prepare("SELECT parse_state FROM files WHERE relpath = ?1 AND store = 'export-inbox'").bind(relpath).first<{ parse_state: string }>();
+    expect(fileState?.parse_state).toBe('parsed');
+  });
+
+  it('a corrupt replacement archive is marked error and keeps the old sessions (round 3 Fix 7)', async () => {
+    const relpath = 'chatgpt-export-corrupt.zip';
+    const good = chatgptExportZip([{ id: 'corrupt-keep', title: 'Keep', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'corrupt-marker preserved' }] }]);
+    expect((await put('webbox', 'export-inbox', relpath, good)).status).toBe(201);
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'corrupt-keep'").first<{ n: number }>()).toMatchObject({ n: 1 });
+
+    // Re-upload unreadable bytes at the same path: preservation-first keeps the old session, but
+    // the file is flagged 'error' so /status surfaces it (never silently 'parsed').
+    expect((await put('webbox', 'export-inbox', relpath, new Uint8Array([0x50, 0x4b, 3, 4, 9, 9, 9, 9]))).status).toBe(201);
+    await drainQueue();
+
+    const fileRow = await testEnv.DB.prepare("SELECT parse_state, parse_error FROM files WHERE relpath = ?1 AND store = 'export-inbox'").bind(relpath).first<{ parse_state: string; parse_error: string | null }>();
+    expect(fileRow?.parse_state).toBe('error');
+    expect(fileRow?.parse_error).toBeTruthy();
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'corrupt-keep'").first<{ n: number }>()).toMatchObject({ n: 1 });
+  });
+});
+
+describe('prompt-log file rows upgrade a legacy NULL session_id on re-upload (round 3 Fix 2)', () => {
+  it('a changed-hash re-upload stamps harness/session_id via the ON CONFLICT update', async () => {
+    await putText('legacybox', 'claude', 'history.jsonl', historyLines([{ display: 'legacy prompt zeta', timestamp: 1_700_000_000_000 }]).join('\n'));
+    await drainQueue();
+
+    // Simulate a row created before machine-scoped prompt-log ids existed.
+    await testEnv.DB.prepare("UPDATE files SET session_id = NULL, harness = NULL WHERE machine_id = 'legacybox' AND relpath = 'history.jsonl'").run();
+
+    await putText('legacybox', 'claude', 'history.jsonl', historyLines([
+      { display: 'legacy prompt zeta', timestamp: 1_700_000_000_000 },
+      { display: 'legacy prompt eta', timestamp: 1_700_000_100_000 },
+    ]).join('\n'));
+
+    const row = await testEnv.DB.prepare("SELECT harness, session_id FROM files WHERE machine_id = 'legacybox' AND relpath = 'history.jsonl'").first<{ harness: string; session_id: string }>();
+    expect(row?.harness).toBe('prompt-log');
+    expect(row?.session_id).toBe('promptlog:legacybox:claude');
+  });
 });
