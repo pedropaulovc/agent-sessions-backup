@@ -20,9 +20,14 @@
 # *** UNVERIFIED SECTIONS — see the inline "UNVERIFIED" comments below and the
 # task report. The DCE/DCR-with-OTLP-streams shape and the availability webtest
 # ARM shape are built from Microsoft Learn docs + a working sibling project's
-# *output* (youtube-mirror's infra/federation.md), not from a run of this exact
-# script against a live subscription — nobody has run `az` in this environment.
-# Confirm both live at M4 deploy before trusting this script end to end. ***
+# *output* (youtube-mirror's infra/federation.md); flag names have been checked
+# against this environment's real `az --help` output where noted, but none of
+# these commands have been run against a live subscription. Confirm both live
+# at M4 deploy before trusting this script end to end. ***
+#
+# Portability: this script targets bash, but avoids bash-4-only features
+# (`declare -A` associative arrays) since macOS ships bash 3.2 as /bin/bash by
+# default and this script's shebang doesn't pin a newer one.
 
 set -euo pipefail
 
@@ -229,26 +234,33 @@ echo "OK: $AG_NAME ($AG_ID)"
 
 echo ""
 echo "=== Scheduled Query Alerts (from infra/azure/alerts/*.kql) ==="
-declare -A ALERT_WINDOWS=(
-    [missed-heartbeat]="1h"
-    [collector-errors]="1h"
-    [parse-errors]="15m"
-)
+# Bash 3.2 (macOS's default /bin/bash — this script has no bash4+ shebang pin)
+# has no associative arrays; `declare -A` aborts the whole script before a
+# single alert is created. A case statement is portable to both.
+alert_window_for() {
+    case "$1" in
+        missed-heartbeat) echo "1h" ;;
+        collector-errors) echo "1h" ;;
+        parse-errors) echo "15m" ;;
+        *) echo "15m" ;;
+    esac
+}
+
 for kql_file in "$REPO_ROOT"/infra/azure/alerts/*.kql; do
     [ -e "$kql_file" ] || continue
     base_name=$(basename "$kql_file" .kql)
     alert_name="agent-backup-$base_name"
-    window="${ALERT_WINDOWS[$base_name]:-15m}"
+    window=$(alert_window_for "$base_name")
+    query=$(cat "$kql_file")
 
+    # --skip-query-validation: this script can run before the gateway has ever
+    # forwarded any OTLP data, so the workspace may have no OTelLogs table yet
+    # (and infra/azure/alerts/*.kql's own header comments flag the table/
+    # column names themselves as unverified assumptions). Without this flag,
+    # `az monitor scheduled-query create`/`update` validates the KQL against
+    # the current workspace schema and fails outright on a fresh workspace,
+    # aborting the rest of provisioning.
     if ! az monitor scheduled-query show --name "$alert_name" --resource-group "$RG_NAME" --only-show-errors >/dev/null 2>&1; then
-        query=$(cat "$kql_file")
-        # --skip-query-validation: this script runs before the gateway has ever
-        # forwarded any OTLP data, so the workspace has no OTelLogs table yet
-        # (and infra/azure/alerts/*.kql's own header comments flag the table/
-        # column names themselves as unverified assumptions). Without this
-        # flag, `az monitor scheduled-query create` validates the KQL against
-        # the current workspace schema and fails outright on a fresh
-        # workspace, aborting the rest of provisioning.
         az monitor scheduled-query create --name "$alert_name" --resource-group "$RG_NAME" \
             --scopes "$LAW_ID" --location "$LOCATION" \
             --condition "count 'Placeholder_1' > 0" \
@@ -256,8 +268,47 @@ for kql_file in "$REPO_ROOT"/infra/azure/alerts/*.kql; do
             --description "agent-sessions-backup: $base_name (see infra/azure/alerts/$base_name.kql)" \
             --evaluation-frequency "$window" --window-size "$window" \
             --severity 2 --action-groups "$AG_ID" --skip-query-validation true --only-show-errors >/dev/null
+        alert_action="created"
+    else
+        # A bare existence check means editing a .kql file and rerunning this
+        # script never pushes the change to Azure — the script would print OK
+        # while the stale/broken query keeps evaluating. Compare the deployed
+        # query text (command substitution strips trailing newlines on both
+        # sides, so that alone won't cause a spurious mismatch) and update on
+        # drift.
+        CURRENT_QUERY=$(az monitor scheduled-query show --name "$alert_name" --resource-group "$RG_NAME" --query "criteria.allOf[0].query" -o tsv)
+        if [ "$CURRENT_QUERY" != "$query" ]; then
+            az monitor scheduled-query update --name "$alert_name" --resource-group "$RG_NAME" \
+                --condition "count 'Placeholder_1' > 0" \
+                --condition-query Placeholder_1="$query" \
+                --skip-query-validation true --only-show-errors >/dev/null
+            alert_action="updated"
+        else
+            alert_action="unchanged"
+        fi
     fi
-    echo "OK: $alert_name (window=$window)"
+
+    # missed-heartbeat.kql looks back ago(14d)/ago(72h), but scheduled-query
+    # rules default the query time range to WindowSize*NumberOfEvaluationPeriods
+    # (1h here), so without an explicit override the absence join only ever
+    # sees ~1h of data and quiet machines never produce a row. Neither
+    # `az monitor scheduled-query create` nor `update` exposes a flag for this
+    # (checked --help in this environment: no such option in the
+    # scheduled-query CLI extension) — set it directly via `az rest` PATCH on
+    # the ARM resource. ARM property: properties.overrideQueryTimeRange (ISO
+    # 8601 duration), confirmed against Microsoft's scheduledQueryRules
+    # template reference (learn.microsoft.com/azure/templates/microsoft.insights/
+    # scheduledqueryrules). The PATCH is idempotent, so it's applied
+    # unconditionally on every run rather than trying to read back and compare
+    # the current value first.
+    if [ "$base_name" = "missed-heartbeat" ]; then
+        RULE_ID=$(az monitor scheduled-query show --name "$alert_name" --resource-group "$RG_NAME" --query id -o tsv)
+        az rest --method patch --url "https://management.azure.com${RULE_ID}?api-version=2022-06-15" \
+            --body '{"properties":{"overrideQueryTimeRange":"P14D"}}' --only-show-errors >/dev/null
+        echo "  overrideQueryTimeRange=P14D (missed-heartbeat needs 14d/72h of history; window/eval-frequency alone only cover 1h)"
+    fi
+
+    echo "OK: $alert_name ($alert_action, window=$window)"
 done
 
 echo ""
