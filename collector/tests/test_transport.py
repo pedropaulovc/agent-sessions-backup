@@ -108,6 +108,27 @@ def test_subprocess_timeout_maps_to_status_zero(monkeypatch):
     assert status == 0 and rc != 0  # no HTTP response -> treated as network failure
 
 
+def test_curl_config_quote_roundtrips_backslashes_and_quotes():
+    q = transport_mod._curl_config_quote
+    assert q(r"C:\Users\a") == r"C:\\Users\\a"
+    assert q('a"b') == r"a\"b"
+    assert q(r'C:\x"y') == r"C:\\x\"y"
+
+
+def test_upload_config_escapes_windows_paths_and_uses_null_device(monkeypatch):
+    import os as _os
+    monkeypatch.setattr(_os, "devnull", "NUL")  # simulate the Windows null device
+    t = Transport(DevAuth("m1"))
+    up = Upload("http://h/api/v1/files/m1/claude/a.jsonl",
+                r"C:\Users\pedro\AppData\Local\Temp\body.bin",
+                {"x-content-hash": "sha256:00"})
+    text = t._build_upload_config([up])
+    escaped = r"C:\\Users\\pedro\\AppData\\Local\\Temp\\body.bin"  # each backslash doubled
+    assert f'upload-file = "{escaped}"' in text
+    assert 'output = "NUL"' in text                       # platform null device
+    assert 'write-out = "%{url_effective} %{http_code}\\n"' in text  # per-block
+
+
 def test_retryable_decides_from_status_alone():
     # rc 22 (curl --fail-with-body on 4xx) must NOT retry a permanent 400/404.
     assert transport_mod._retryable(22, 400) is False

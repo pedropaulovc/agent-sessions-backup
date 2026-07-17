@@ -14,11 +14,22 @@ ambiguous/failed line falls back to a sequential retrying put().
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import tempfile
 import time
 from pathlib import Path
+
+
+def _curl_config_quote(value: str) -> str:
+    """Escape a value for a double-quoted curl --config entry.
+
+    curl treats backslash as an escape inside quoted config values, so an unescaped
+    Windows path (C:\\Users\\...) gets mangled and the upload file can't be found. Escape
+    backslashes first, then double-quotes.
+    """
+    return value.replace("\\", "\\\\").replace('"', '\\"')
 
 BACKOFF = (0.5, 2.0, 8.0)
 BATCH_SIZE = 50
@@ -158,27 +169,35 @@ class Transport:
             result.update(self._upload_config(chunk))
         return result
 
-    def _upload_config(self, chunk: list["Upload"]) -> dict[str, int]:
+    def _build_upload_config(self, chunk: list["Upload"]) -> str:
         # write-out MUST be per-block: a global -w only fires for the first transfer
         # under --parallel, so every request carries its own self-describing status line.
+        # Quoted values are escaped (curl config treats \\ as an escape) so Windows temp
+        # paths like C:\Users\... survive; bodies go to the platform null device (NUL on
+        # Windows, /dev/null elsewhere).
+        q = _curl_config_quote
+        null_device = os.devnull
         blocks = []
         for up in chunk:
             block = [
-                f'url = "{up.url}"',
-                f'upload-file = "{up.body_path}"',
-                'output = "/dev/null"',
+                f'url = "{q(up.url)}"',
+                f'upload-file = "{q(up.body_path)}"',
+                f'output = "{q(null_device)}"',
                 'write-out = "%{url_effective} %{http_code}\\n"',
                 f"connect-timeout = {CONNECT_TIMEOUT}",
                 f"max-time = {MAX_TIME}",
             ]
             for k, v in up.headers.items():
-                block.append(f'header = "{k}: {v}"')
+                block.append(f'header = "{q(k)}: {q(v)}"')
             for arg in self.auth.curl_args():
                 if arg == "-H":
                     continue
-                block.append(f'header = "{arg}"')
+                block.append(f'header = "{q(arg)}"')
             blocks.append("\n".join(block))
-        config_text = "\n--next\n".join(blocks) + "\n"
+        return "\n--next\n".join(blocks) + "\n"
+
+    def _upload_config(self, chunk: list["Upload"]) -> dict[str, int]:
+        config_text = self._build_upload_config(chunk)
 
         with tempfile.NamedTemporaryFile("w", suffix=".curl", delete=False) as f:
             f.write(config_text)

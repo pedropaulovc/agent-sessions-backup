@@ -220,6 +220,72 @@ def test_read_race_records_error_and_continues(tmp_path, hub, monkeypatch):
     assert any("read failed" in e["message"] for e in events)
 
 
+def test_wsl_mount_root_skipped_and_event_emitted(tmp_path, hub, monkeypatch):
+    monkeypatch.setattr(config, "detect_platform_tag", lambda: "wsl")
+    root = tmp_path / "claude"
+    root.mkdir()
+    (root / "a.jsonl").write_text("x")
+    cfg = config.Config(machine_id="m1", hub_url=hub.url, auth="dev",
+                        stores={"claude": str(root), "win": "/mnt/c/Users/x/.claude"})
+    with State(tmp_path / "state.db") as st:
+        run_mod._do_run(cfg, st)
+    events = hub.heartbeats[-1]["events"]
+    assert any(e["code"] == "windows_mount_skipped" and e["store"] == "win" for e in events)
+    assert ("m1", "claude", "a.jsonl") in hub.files  # the WSL-side store still captured
+
+
+def test_backfill_batches_and_frees_temp_bodies(tmp_path, hub, monkeypatch):
+    # Small chunk size so multiple chunks run; assert only missing bodies are materialized
+    # and the scanner temp dir is empty of body files after each chunk (no whole-corpus copy).
+    monkeypatch.setattr(run_mod, "BACKFILL_CHUNK", 2)
+    root = tmp_path / "claude"
+    root.mkdir()
+    for i in range(5):
+        (root / f"f{i}.jsonl").write_text(f"content-{i}")
+    cfg = _cfg(hub, root)
+
+    materialized = []
+    real_materialize = run_mod._materialize
+
+    def counting_materialize(scanner, data):
+        p = real_materialize(scanner, data)
+        materialized.append(p)
+        return p
+
+    monkeypatch.setattr(run_mod, "_materialize", counting_materialize)
+    with State(tmp_path / "state.db") as st:
+        run_mod._do_backfill(cfg, st, concurrency=2, dry_run=False)
+
+    assert len({("m1", "claude", f"f{i}.jsonl") for i in range(5)} & set(hub.files)) == 5
+    assert len(materialized) == 5           # every missing file materialized exactly once
+    for p in materialized:
+        assert not os.path.exists(p)        # each body deleted after its upload
+
+
+def test_backfill_present_files_never_materialized(tmp_path, hub, monkeypatch):
+    root = tmp_path / "claude"
+    root.mkdir()
+    (root / "a.jsonl").write_bytes(b"already there")
+    cfg = _cfg(hub, root)
+    # Pre-seed the hub so a.jsonl is present.
+    t = Transport(DevAuth("m1"))
+    sha_a = hashlib.sha256(b"already there").hexdigest()
+    t.put(f"{hub.url}/api/v1/files/m1/claude/a.jsonl", root / "a.jsonl",
+          {"x-content-hash": f"sha256:{sha_a}", "x-file-mtime": "2026-01-01T00:00:00Z"})
+
+    calls = {"n": 0}
+    real_materialize = run_mod._materialize
+
+    def counting(scanner, data):
+        calls["n"] += 1
+        return real_materialize(scanner, data)
+
+    monkeypatch.setattr(run_mod, "_materialize", counting)
+    with State(tmp_path / "state.db") as st:
+        run_mod._do_backfill(cfg, st, concurrency=2, dry_run=False)
+    assert calls["n"] == 0  # present file's body never written to disk
+
+
 def test_run_lock_prevents_overlap(tmp_path, hub, tmp_env, monkeypatch):
     # enroll writes a real config the CLI path will load
     path = config.config_path()

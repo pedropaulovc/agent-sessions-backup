@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import config as config_mod
 from . import __version__
-from .scanner import Scanner, ScanItem, read_exact, hash_bytes
+from .scanner import Scanner, ScanItem, read_exact, hash_bytes, hash_file_prefix
 from .state import State, OverlapLock, now_iso, state_path
 from .transport import Transport, DevAuth, MtlsAuth, Upload
 
@@ -78,7 +78,7 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
         name: {"files_seen": 0, "files_uploaded": 0, "bytes_uploaded": 0}
         for name in cfg.stores
     }
-    events: list[dict] = []
+    events: list[dict] = _windows_mount_events(cfg)
     scanned = changed = uploaded = total_bytes = errors = 0
 
     scanner = Scanner(cfg.effective_excludes())
@@ -173,19 +173,48 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
 
 
 # ---------------------------------------------------------------------- backfill
-def _chunks(seq, n):
-    for i in range(0, len(seq), n):
-        yield seq[i:i + n]
+BACKFILL_CHUNK = 500  # <= hub files/check batch limit (1000)
 
 
-@dataclass
-class BackfillRecord:
-    store: str
-    relpath: str
-    sha: str
-    size: int
-    mtime_ns: int
-    body_path: str
+def _windows_mount_events(cfg) -> list[dict]:
+    """Warning events for store roots dropped by the WSL windows-mount guard, so the skip
+    is visible in the heartbeat (doctor already prints it)."""
+    return [
+        {"level": "warn", "code": "windows_mount_skipped",
+         "message": f"store {name!r} root {root} under /mnt skipped "
+                    "(include_windows_mounts=false)",
+         "count": 1, "store": name}
+        for name, root in cfg.dropped_store_roots().items()
+    ]
+
+
+def _safe_unlink(path) -> None:
+    try:
+        Path(path).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _cleanup_snapshot(item: ScanItem) -> None:
+    """Delete a DB snapshot temp file once we're done with it, bounding temp use."""
+    if item.is_snapshot:
+        _safe_unlink(item.source_path)
+
+
+def _iter_store_items(cfg, scanner: Scanner):
+    for store, root in cfg.store_roots().items():
+        yield from scanner.scan_store(store, root)
+
+
+def _chunked(iterable, n):
+    batch = []
+    for x in iterable:
+        batch.append(x)
+        if len(batch) == n:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
 
 
 def cmd_backfill(args) -> int:
@@ -206,109 +235,121 @@ def cmd_backfill(args) -> int:
 def _do_backfill(cfg, st: State, concurrency: int, dry_run: bool) -> int:
     transport = Transport(build_auth(cfg), parallel_max=concurrency)
     scanner = Scanner(cfg.effective_excludes())
-    records: list[BackfillRecord] = []
-    read_errors: list[dict] = []
+    totals = {"scanned": 0, "already_present": 0, "uploaded": 0, "failed": 0,
+              "bytes_uploaded": 0, "would_upload": 0, "read_errors": 0}
+    events = _windows_mount_events(cfg)
     try:
-        processed = 0
-        for store, root in cfg.store_roots().items():
-            for item in scanner.scan_store(store, root):
-                try:
-                    data = read_exact(item.source_path, item.size)
-                except OSError as e:
-                    read_errors.append({
-                        "level": "error", "code": "read_failed",
-                        "message": f"{item.relpath}: {e}"[:500], "count": 1, "store": store,
-                    })
-                    continue
-                sha = hash_bytes(data)
-                body_path = _materialize(scanner, data)
-                records.append(BackfillRecord(store, item.relpath, sha, len(data),
-                                              item.mtime_ns, body_path))
-                processed += 1
-                if processed % 100 == 0:
-                    print(f"hashed {processed} files...", file=sys.stderr)
-
-        missing = _check_missing(cfg, transport, records)
-        summary = _upload_missing(cfg, st, transport, records, missing, dry_run)
+        # Bounded chunks: hash the chunk, ask the hub what it lacks (files/check),
+        # materialize ONLY the missing bodies, upload, then delete them before the next
+        # chunk. Peak temp/disk stays ~one chunk of missing files, never the whole corpus.
+        for chunk in _chunked(_iter_store_items(cfg, scanner), BACKFILL_CHUNK):
+            _backfill_chunk(cfg, st, transport, scanner, chunk, totals, events, dry_run)
     finally:
         scanner.close()
 
-    if read_errors:
-        st.buffer_events(read_errors)  # surfaced on the next run's heartbeat
-    summary["read_errors"] = len(read_errors)
+    if events:
+        st.buffer_events(events)  # read/mount warnings surfaced on the next heartbeat
+    summary = {"mode": "backfill", "scanned": totals["scanned"],
+               "already_present": totals["already_present"],
+               "read_errors": totals["read_errors"]}
+    if dry_run:
+        summary["dry_run"] = True
+        summary["would_upload"] = totals["would_upload"]
+    else:
+        summary["uploaded"] = totals["uploaded"]
+        summary["failed"] = totals["failed"]
+        summary["bytes_uploaded"] = totals["bytes_uploaded"]
     print(json.dumps(summary))
     return 0
 
 
-def _check_missing(cfg, transport: Transport, records: list[BackfillRecord]) -> set[tuple[str, str]]:
-    missing: set[tuple[str, str]] = set()
-    url = f"{cfg.hub_url}/api/v1/files/check"
-    for batch in _chunks(records, 500):
-        body = {"files": [{"store": r.store, "relpath": r.relpath, "sha256": r.sha}
-                          for r in batch]}
-        status, resp = transport.post_json(url, body)
-        if status != 200:
-            # Conservative: if check fails, treat the whole batch as missing.
-            for r in batch:
-                missing.add((r.store, r.relpath))
+def _record_read_error(events, totals, item, e) -> None:
+    totals["read_errors"] += 1
+    events.append({"level": "error", "code": "read_failed",
+                   "message": f"{item.relpath}: {e}"[:500], "count": 1, "store": item.store})
+
+
+def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
+                    items, totals: dict, events: list[dict], dry_run: bool) -> None:
+    # Hash pass: stream each file's prefix (no bytes held, nothing written to disk).
+    hashed: list[tuple[ScanItem, str]] = []
+    for item in items:
+        totals["scanned"] += 1
+        if totals["scanned"] % 100 == 0:
+            print(f"hashed {totals['scanned']} files...", file=sys.stderr)
+        try:
+            sha = hash_file_prefix(item.source_path, item.size)
+        except OSError as e:
+            _record_read_error(events, totals, item, e)
+            _cleanup_snapshot(item)
             continue
-        for m in json.loads(resp).get("missing", []):
-            missing.add((m["store"], m["relpath"]))
-    return missing
+        hashed.append((item, sha))
 
+    missing = _check_missing_chunk(cfg, transport,
+                                   [(it.store, it.relpath, sha) for it, sha in hashed])
 
-def _upload_missing(cfg, st: State, transport: Transport, records, missing, dry_run) -> dict:
-    to_upload = [r for r in records if (r.store, r.relpath) in missing]
-    present = [r for r in records if (r.store, r.relpath) not in missing]
-
-    # Files the hub already has: record locally as ok so run mode fast-paths them.
-    for r in present:
-        st.upsert_file(r.store, r.relpath, r.size, r.mtime_ns, r.sha, "ok",
-                       uploaded_size=r.size)
+    to_upload: list[tuple[ScanItem, str]] = []
+    for item, sha in hashed:
+        if (item.store, item.relpath) in missing:
+            to_upload.append((item, sha))
+            continue
+        # Hub already has it: record ok locally so run mode fast-paths it. No disk write.
+        st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "ok",
+                       uploaded_size=item.size)
+        totals["already_present"] += 1
+        _cleanup_snapshot(item)
 
     if dry_run:
-        return {
-            "mode": "backfill", "dry_run": True, "scanned": len(records),
-            "already_present": len(present), "would_upload": len(to_upload),
-        }
+        totals["would_upload"] += len(to_upload)
+        for item, _sha in to_upload:
+            _cleanup_snapshot(item)
+        return
 
-    uploads = [
-        Upload(
-            file_url(cfg.hub_url, cfg.machine_id, r.store, r.relpath),
-            r.body_path,
-            {"x-content-hash": f"sha256:{r.sha}", "x-file-mtime": mtime_iso(r.mtime_ns)},
-        )
-        for r in to_upload
-    ]
+    # Materialize ONLY the missing bodies, upload, then delete each body.
+    bodies = []  # (item, sha2, body_path, nbytes, headers)
+    uploads = []
+    for item, _sha in to_upload:
+        try:
+            data = read_exact(item.source_path, item.size)
+        except OSError as e:
+            _record_read_error(events, totals, item, e)
+            _cleanup_snapshot(item)
+            continue
+        sha2 = hash_bytes(data)  # authoritative bytes+hash pair actually sent
+        body_path = _materialize(scanner, data)
+        headers = {"x-content-hash": f"sha256:{sha2}",
+                   "x-file-mtime": mtime_iso(item.mtime_ns)}
+        url = file_url(cfg.hub_url, cfg.machine_id, item.store, item.relpath)
+        bodies.append((item, sha2, body_path, len(data), headers))
+        uploads.append(Upload(url, body_path, headers))
+
     codes = transport.upload_batch(uploads) if uploads else {}
-
-    uploaded = failed = 0
-    bytes_up = 0
-    for r in to_upload:
-        url = file_url(cfg.hub_url, cfg.machine_id, r.store, r.relpath)
+    for item, sha2, body_path, nbytes, headers in bodies:
+        url = file_url(cfg.hub_url, cfg.machine_id, item.store, item.relpath)
         code = codes.get(url, 0)
         if code not in (200, 201):
-            # Ambiguous/failed under --parallel: retry sequentially with backoff.
-            code, _body = transport.put(url, Path(r.body_path),
-                                        {"x-content-hash": f"sha256:{r.sha}",
-                                         "x-file-mtime": mtime_iso(r.mtime_ns)})
+            code, _b = transport.put(url, Path(body_path), headers)
         if code in (200, 201):
-            uploaded += 1
-            bytes_up += r.size
-            st.upsert_file(r.store, r.relpath, r.size, r.mtime_ns, r.sha, "ok",
-                           uploaded_size=r.size, uploaded_at=now_iso())
+            totals["uploaded"] += 1
+            totals["bytes_uploaded"] += nbytes
+            st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha2, "ok",
+                           uploaded_size=nbytes, uploaded_at=now_iso())
         else:
-            failed += 1
-            st.upsert_file(r.store, r.relpath, r.size, r.mtime_ns, r.sha, "error",
-                           error=f"backfill HTTP {code}")
-        done = uploaded + failed
-        if done % 100 == 0:
-            print(f"uploaded {done}/{len(to_upload)}...", file=sys.stderr)
+            totals["failed"] += 1
+            st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha2,
+                           "error", error=f"backfill HTTP {code}")
+        _safe_unlink(body_path)
+        _cleanup_snapshot(item)
 
-    return {
-        "mode": "backfill", "scanned": len(records), "already_present": len(present),
-        "uploaded": uploaded, "failed": failed, "bytes_uploaded": bytes_up,
-    }
+
+def _check_missing_chunk(cfg, transport: Transport, triples) -> set[tuple[str, str]]:
+    if not triples:
+        return set()
+    body = {"files": [{"store": s, "relpath": r, "sha256": h} for s, r, h in triples]}
+    status, resp = transport.post_json(f"{cfg.hub_url}/api/v1/files/check", body)
+    if status != 200:
+        return {(s, r) for s, r, _ in triples}  # conservative: treat all as missing
+    return {(m["store"], m["relpath"]) for m in json.loads(resp).get("missing", [])}
 
 
 # ------------------------------------------------------------------------ status
@@ -390,6 +431,8 @@ def cmd_doctor(args) -> int:
         if cfg.include_windows_mounts:
             print("[warn] WSL + include_windows_mounts=true: Windows-mount roots will be scanned")
         else:
-            print("[ok]   WSL detected; include_windows_mounts=false (no /mnt/c scanning)")
+            print("[ok]   WSL detected; include_windows_mounts=false (no /mnt/<drive> scanning)")
+            for name, root in cfg.dropped_store_roots().items():
+                print(f"[ok]   store {name!r} root {root} skipped (under /mnt)")
 
     return 0 if ok else 1

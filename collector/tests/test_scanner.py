@@ -1,8 +1,12 @@
 import hashlib
+import os
 import sqlite3
+import time
 
 from agent_collector import config
-from agent_collector.scanner import Scanner, path_matches, read_exact, hash_bytes
+from agent_collector.scanner import (
+    Scanner, path_matches, read_exact, hash_bytes, hash_file_prefix, _snapshot_sqlite,
+)
 
 
 def _tree(root):
@@ -110,3 +114,66 @@ def test_sqlite_snapshot_and_sidecar_exclusion(tmp_path):
         snap_conn.close()
     finally:
         scanner.close()
+
+
+def test_snapshot_bounded_when_source_locked(tmp_path):
+    # A DB held in BEGIN EXCLUSIVE must not hang backup() forever; the deadline aborts and
+    # _snapshot_sqlite returns False so the file is skipped this run.
+    db = tmp_path / "locked.sqlite"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE t(x)")
+    c.execute("INSERT INTO t VALUES('a')")
+    c.commit()
+    c.close()
+    holder = sqlite3.connect(db, isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        start = time.monotonic()
+        ok = _snapshot_sqlite(db, tmp_path / "snap.sqlite", deadline_s=0.5)
+        elapsed = time.monotonic() - start
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert ok is False
+    assert elapsed < 10  # bounded by the deadline, not hanging on the exclusive lock
+
+
+def test_hash_file_prefix_matches_read_exact(tmp_path):
+    f = tmp_path / "f.bin"
+    f.write_bytes(b"A" * 200)
+    # streams the first `size` bytes; prefix semantics identical to read_exact
+    assert hash_file_prefix(f, 120) == hash_bytes(read_exact(f, 120))
+    assert hash_file_prefix(f, 200) == hash_bytes(b"A" * 200)
+
+
+def test_scan_prunes_excluded_directories(tmp_path):
+    root = tmp_path / ".claude"
+    (root / "cache" / "deep").mkdir(parents=True)
+    (root / "cache" / "deep" / "big.bin").write_text("x")
+    (root / "statsig").mkdir()
+    (root / "statsig" / "events.json").write_text("x")
+    (root / "projects" / "slug").mkdir(parents=True)
+    (root / "projects" / "slug" / "s.jsonl").write_text("{}")
+
+    real_walk = os.walk
+    walked = []
+
+    def counting_walk(top, **kw):
+        for dirpath, dirnames, filenames in real_walk(top, **kw):
+            walked.append(dirpath)
+            yield dirpath, dirnames, filenames
+
+    import agent_collector.scanner as scanner_mod
+    scanner = Scanner(config.DEFAULT_EXCLUDES)
+    orig = scanner_mod.os.walk
+    scanner_mod.os.walk = counting_walk
+    try:
+        found = {item.relpath for item in scanner.scan_store("claude", root)}
+    finally:
+        scanner_mod.os.walk = orig
+        scanner.close()
+
+    assert found == {"projects/slug/s.jsonl"}
+    # excluded dirs are pruned: os.walk never descends into cache/deep or statsig
+    assert not any(d.endswith("deep") for d in walked)
+    assert not any(d.endswith("statsig") for d in walked)

@@ -1,6 +1,7 @@
 import re
 import sys
 
+from agent_collector import schedule
 from agent_collector.schedule import taskscheduler
 
 
@@ -41,3 +42,17 @@ def test_randomdelay_on_trigger_not_settings(monkeypatch):
     assert "-RandomDelay" in trigger        # belongs on the trigger
     assert "-RandomDelay" not in settings   # would throw before Register-ScheduledTask
     assert "-StartWhenAvailable" in settings
+
+
+def test_macos_install_fails_loudly(monkeypatch, capsys):
+    monkeypatch.setattr("agent_collector.config.detect_platform_tag", lambda: "darwin")
+    rc = schedule.install(15)
+    assert rc != 0
+    assert "launchd" in capsys.readouterr().err.lower()
+
+
+def test_macos_uninstall_fails_loudly(monkeypatch, capsys):
+    monkeypatch.setattr("agent_collector.config.detect_platform_tag", lambda: "darwin")
+    rc = schedule.uninstall()
+    assert rc != 0
+    assert "launchd" in capsys.readouterr().err.lower()

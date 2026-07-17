@@ -62,6 +62,30 @@ def test_sqlite_sidecar_excludes_match_full_filenames():
     assert not path_matches("todos.sqlite", "*-wal")
 
 
+def test_wsl_drops_windows_mount_roots(monkeypatch):
+    monkeypatch.setattr(config, "detect_platform_tag", lambda: "wsl")
+    cfg = config.Config(machine_id="m", hub_url="http://x",
+                        stores={"claude": "~/.claude", "win": "/mnt/c/Users/x/.claude"})
+    roots = cfg.store_roots()
+    assert "win" not in roots and "claude" in roots
+    assert set(cfg.dropped_store_roots()) == {"win"}
+
+
+def test_wsl_include_windows_mounts_true_keeps_them(monkeypatch):
+    monkeypatch.setattr(config, "detect_platform_tag", lambda: "wsl")
+    cfg = config.Config(machine_id="m", hub_url="http://x", include_windows_mounts=True,
+                        stores={"win": "/mnt/c/x"})
+    assert "win" in cfg.store_roots()
+    assert cfg.dropped_store_roots() == {}
+
+
+def test_non_wsl_keeps_mount_roots(monkeypatch):
+    monkeypatch.setattr(config, "detect_platform_tag", lambda: "linux")
+    cfg = config.Config(machine_id="m", hub_url="http://x", stores={"win": "/mnt/c/x"})
+    assert "win" in cfg.store_roots()
+    assert cfg.dropped_store_roots() == {}
+
+
 def test_effective_excludes_extends_defaults(tmp_path):
     path = tmp_path / "config.toml"
     config.enroll("http://x", dev=True, path=path, machine_id="m1")

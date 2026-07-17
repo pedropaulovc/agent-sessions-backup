@@ -76,6 +76,17 @@ def default_machine_id() -> str:
     return f"{socket.gethostname()}-{detect_platform_tag()}"
 
 
+def _is_windows_mount(path: Path) -> bool:
+    """True for /mnt/<single-drive-letter>/... — the WSL view of a Windows drive."""
+    parts = path.parts
+    return (
+        len(parts) >= 3
+        and parts[1] == "mnt"
+        and len(parts[2]) == 1
+        and parts[2].isalpha()
+    )
+
+
 def config_dir() -> Path:
     xdg = os.environ.get("XDG_CONFIG_HOME")
     base = Path(xdg) if xdg else Path.home() / ".config"
@@ -97,7 +108,26 @@ class Config:
     source: Path | None = None
 
     def store_roots(self) -> dict[str, Path]:
-        return {name: Path(root).expanduser() for name, root in self.stores.items()}
+        """Resolved roots to actually scan. Under WSL with include_windows_mounts=false,
+        roots resolving under /mnt/<drive>/ are dropped so a WSL install never captures the
+        Windows side as the WSL machine (see dropped_store_roots for what was skipped)."""
+        roots = {name: Path(root).expanduser() for name, root in self.stores.items()}
+        if not self._drop_windows_mounts():
+            return roots
+        return {n: p for n, p in roots.items() if not _is_windows_mount(p)}
+
+    def dropped_store_roots(self) -> dict[str, Path]:
+        """Roots excluded by the WSL windows-mount guard, so callers can surface a warning."""
+        if not self._drop_windows_mounts():
+            return {}
+        return {
+            n: Path(r).expanduser()
+            for n, r in self.stores.items()
+            if _is_windows_mount(Path(r).expanduser())
+        }
+
+    def _drop_windows_mounts(self) -> bool:
+        return not self.include_windows_mounts and detect_platform_tag() == "wsl"
 
     def effective_excludes(self) -> list[str]:
         return DEFAULT_EXCLUDES + list(self.exclude)
