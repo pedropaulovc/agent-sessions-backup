@@ -1,7 +1,6 @@
 import { detect } from '../ingest/detect';
-import { readJsonlLines } from '../ingest/jsonl';
-import { parseClaudeCode } from '../ingest/parsers/claude-code';
-import { parseCodex } from '../ingest/parsers/codex';
+import { parseObject } from '../ingest/parse';
+import { parseExportArchive } from '../ingest/parsers/export-inbox';
 import type { NormalizedSession } from '../ingest/normalize';
 
 interface SessionRow {
@@ -26,9 +25,12 @@ export async function loadNormalized(sessionId: string, env: Env): Promise<Norma
   const obj = await env.RAW.get(file.r2_key);
   if (!obj) return null;
   const det = detect(file.store, file.relpath);
-  const lines = readJsonlLines(obj.body);
-  const parsed =
-    det.harness === 'codex' ? await parseCodex(lines, sessionId) : await parseClaudeCode(lines, sessionId);
+  if (det.kind === 'export-archive') {
+    // The canonical object is a multi-conversation ZIP; re-extract just this session by id.
+    const archive = parseExportArchive(new Uint8Array(await obj.arrayBuffer()));
+    return archive.sessions.find((s) => s.id === sessionId) ?? null;
+  }
+  const parsed = await parseObject(det.harness, sessionId, obj);
   if (det.parentSessionId) parsed.parentSessionId = det.parentSessionId;
   // The queue consumer links parent_tool_use_id onto the sessions row (via the sibling
   // .meta.json), but a plain reparse of the JSONL here never reproduces it — the transcript

@@ -1,8 +1,7 @@
 import { detect } from './detect';
-import { readJsonlLines } from './jsonl';
 import type { NormalizedSession } from './normalize';
-import { parseClaudeCode } from './parsers/claude-code';
-import { parseCodex } from './parsers/codex';
+import { SINGLE_SESSION_HARNESSES, parseObject } from './parse';
+import { parseExportArchive } from './parsers/export-inbox';
 import { markPendingAndEnqueue } from '../queue';
 
 interface FileRow {
@@ -121,14 +120,18 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
   // skip this check entirely, same as every other hash guard in this file.
   if (job.content_hash !== undefined && file.content_hash !== job.content_hash) return;
 
-  const det = detect(file.store, file.relpath);
+  const det = detect(file.store, file.relpath, file.machine_id);
 
   if (det.kind === 'subagent-meta') {
     await linkSubagentMeta(file, env);
     await markParsed(file.id, env, 'parsed', undefined, undefined, job.content_hash);
     return;
   }
-  if (!det.sessionId || (det.harness !== 'claude-code' && det.harness !== 'codex')) {
+  if (det.kind === 'export-archive') {
+    await parseExportInto(file, env, job.content_hash);
+    return;
+  }
+  if (!det.sessionId || !SINGLE_SESSION_HARNESSES.has(det.harness)) {
     await markParsed(file.id, env, 'skipped', undefined, undefined, job.content_hash);
     return;
   }
@@ -152,9 +155,7 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
   const obj = await env.RAW.get(file.r2_key);
   if (!obj) throw new Error(`r2_object_missing:${file.r2_key}`);
 
-  const lines = readJsonlLines(obj.body);
-  const parsed =
-    det.harness === 'claude-code' ? await parseClaudeCode(lines, det.sessionId) : await parseCodex(lines, det.sessionId);
+  const parsed = await parseObject(det.harness, det.sessionId, obj);
   if (det.parentSessionId) parsed.parentSessionId = det.parentSessionId;
 
   if (parsed.turns.length === 0) {
@@ -290,6 +291,44 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
       lines: parsed.stats.lines,
       parse_error_lines: parsed.stats.parseErrorLines,
       skipped: parsed.stats.skippedLineTypes,
+    }),
+  );
+}
+
+/**
+ * Ingest an official-export ZIP: fan it out into per-conversation sessions. The archive itself
+ * is not a single session (files.session_id stays NULL, so it never enters canonical dedupe), and
+ * export only BACKFILLS — a conversation already owned by a live CDP capture (chatgpt-web/
+ * claude-web store) is left untouched, so re-running an old export can't overwrite fresher
+ * captured content. A conversation captured LATER by CDP still wins automatically: its own file
+ * (session_id set) becomes canonical and its writeSession overwrites the export-written row.
+ */
+async function parseExportInto(file: FileRow, env: Env, contentHash?: string): Promise<void> {
+  const obj = await env.RAW.get(file.r2_key);
+  if (!obj) throw new Error(`r2_object_missing:${file.r2_key}`);
+  const archive = parseExportArchive(new Uint8Array(await obj.arrayBuffer()));
+
+  let written = 0;
+  for (const session of archive.sessions) {
+    if (session.turns.length === 0) continue;
+    const existing = await env.DB.prepare(
+      `SELECT f.store FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
+    )
+      .bind(session.id)
+      .first<{ store: string }>();
+    if (existing && (existing.store === 'chatgpt-web' || existing.store === 'claude-web')) continue;
+    await writeSession(session, file, env);
+    written++;
+  }
+  await markParsed(file.id, env, 'parsed', file.size, null, contentHash);
+  console.log(
+    JSON.stringify({
+      event: 'parse.export',
+      file_id: file.id,
+      harness: archive.harness,
+      conversations: archive.sessions.length,
+      written,
+      skipped: archive.skipped,
     }),
   );
 }
