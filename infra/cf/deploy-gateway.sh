@@ -94,59 +94,75 @@ EOF
     mv "$tmp" "$ENV_FILE"
 }
 
-# Persist the bearer BEFORE touching Worker secrets. `wrangler secret put`
-# deploys a new worker version immediately, so if any later step (the deploy, the
-# URL extraction, anything) dies, the live worker already holds this write-only
-# bearer — without this early write there'd be no local copy to recover it from.
+# Persist the bearer BEFORE the deploy that sets secrets. `wrangler deploy
+# --secrets-file` publishes a new worker version immediately, so if the deploy or
+# the URL extraction dies afterward, the live worker already holds this
+# write-only bearer — this early write is the only local copy to recover it from.
 write_env_file
 echo "Wrote $ENV_FILE (pre-deploy, URL=$GATEWAY_URL)"
 
 cd "$REPO_ROOT/hub"
 
-# First-deploy bootstrap. `wrangler secret put` fails (error 10007) if the worker
-# has never been deployed on this account, so on a fresh account — or after the
-# worker was deleted — we must deploy once BEFORE setting any secret. The
-# fresh-setup path only appears to "just work" today because the worker already
-# exists. `wrangler deployments list` is the existence probe: it exits 0 for a
-# deployed worker and non-zero for an unknown worker name (verified both ways
-# against wrangler 4.111 — existing gateway config → exit 0; a scratch config
-# with a nonexistent name → exit 1). The initial deploy carries no secrets, which
-# is fine: a brand-new worker has no traffic (no observability destinations point
-# at it yet) until this script finishes wiring it. The bearer is already
-# persisted to cf-observability.env above, so this ordering adds no bearer-loss
-# window. (`wrangler deploy --secrets-file` exists in 4.111 and could fold
-# secrets into a single atomic deploy, but the fresh-worker path can't be
-# validated here without creating a throwaway worker, so we use the probe +
-# bootstrap-deploy sequence, which is fully verifiable.)
-if npx wrangler deployments list --config "$CONFIG" >/dev/null 2>&1; then
-    echo "Gateway worker exists — setting secrets directly."
-else
-    echo "Gateway worker not found — bootstrapping with an initial (secret-less) deploy before setting secrets."
-    npx wrangler deploy --config "$CONFIG"
+if [ -n "${OIDC_KEY_FILE:-}" ] && [ ! -f "$OIDC_KEY_FILE" ]; then
+    echo "OIDC_KEY_FILE=$OIDC_KEY_FILE does not exist" >&2
+    exit 1
 fi
 
-# Optional: (re)set the OIDC signing private key. Piped via stdin, never on the
-# command line / interactive prompt (avoids scrollback capture).
-if [ -n "${OIDC_KEY_FILE:-}" ]; then
-    if [ ! -f "$OIDC_KEY_FILE" ]; then
-        echo "OIDC_KEY_FILE=$OIDC_KEY_FILE does not exist" >&2
+# Fresh-worker guard. `wrangler deploy --secrets-file` creates the worker if
+# absent AND sets its secrets in the SAME atomic version — but a brand-new gateway
+# deployed WITHOUT OIDC_SIGNING_KEY can't sign the Azure assertion, so every
+# authorized request fails at signing. When the existence probe says the worker is
+# absent, OIDC_KEY_FILE is therefore mandatory. `wrangler deployments list` is the
+# probe: exit 0 for a deployed worker, non-zero for an unknown name (verified both
+# ways against wrangler 4.111). For an EXISTING worker OIDC_KEY_FILE is optional —
+# --secrets-file is additive (verified live: a deploy listing only INGEST_BEARER
+# left OIDC_SIGNING_KEY intact), so an omitted key preserves the live one.
+if npx wrangler deployments list --config "$CONFIG" >/dev/null 2>&1; then
+    echo "Gateway worker exists — deploying with additive secrets."
+else
+    if [ -z "${OIDC_KEY_FILE:-}" ]; then
+        echo "ERROR: the gateway worker does not exist yet and OIDC_KEY_FILE is not set." >&2
+        echo "A fresh gateway cannot sign Azure assertions without OIDC_SIGNING_KEY, and" >&2
+        echo "--secrets-file only sets the secrets you give it (it never invents one)." >&2
+        echo "Generate a keypair (node scripts/generate-gateway-key.mjs > key.pem), add its" >&2
+        echo "public JWK to gateway/oidc-issuer.ts + set OIDC_SIGNING_KID, then re-run with" >&2
+        echo "OIDC_KEY_FILE=key.pem ./infra/cf/deploy-gateway.sh" >&2
         exit 1
     fi
-    echo "Setting OIDC_SIGNING_KEY from $OIDC_KEY_FILE"
-    npx wrangler secret put OIDC_SIGNING_KEY --config "$CONFIG" < "$OIDC_KEY_FILE"
+    echo "Gateway worker not found — first deploy will create it with its secrets."
 fi
 
-# printf (no trailing newline) so the secret value is exactly the bearer.
-printf '%s' "$INGEST_BEARER" | npx wrangler secret put INGEST_BEARER --config "$CONFIG"
+# Build the secrets bundle: INGEST_BEARER always, OIDC_SIGNING_KEY only when a key
+# file is given. One temp file, 0600, removed on exit even if the deploy fails —
+# it holds the RSA private key. python3 (already a dep of these scripts) JSON-
+# encodes the multi-line PEM safely; no secret value ever touches the command line.
+SECRETS_JSON=$(mktemp "${TMPDIR:-/tmp}/agent-backup-secrets.XXXXXX")
+chmod 600 "$SECRETS_JSON"
+trap 'rm -f "$SECRETS_JSON"' EXIT
+INGEST_BEARER="$INGEST_BEARER" OIDC_KEY_FILE="${OIDC_KEY_FILE:-}" python3 -c '
+import json, os
+secrets = {"INGEST_BEARER": os.environ["INGEST_BEARER"]}
+key_file = os.environ.get("OIDC_KEY_FILE")
+if key_file:
+    with open(key_file) as f:
+        secrets["OIDC_SIGNING_KEY"] = f.read()
+print(json.dumps(secrets))
+' > "$SECRETS_JSON"
 
-# Capture deploy output so we can read the real deployed workers.dev URL rather
-# than the pre-deploy default. The extraction MUST be non-fatal: under
-# `set -euo pipefail` a grep miss (custom-domain route, or a wrangler output
-# format change) returns non-zero and would abort the script — `|| true` keeps
-# it alive so the `${GATEWAY_URL:-<default>}` fallback runs. (The bearer is
-# already persisted above regardless, so a death here loses nothing.)
-DEPLOY_OUT=$(npx wrangler deploy --config "$CONFIG" 2>&1)
+# ONE atomic deploy: code + secrets land in a single worker version. There is no
+# secret-put-deploys-a-version-first window, so a key rotation (new key + new
+# OIDC_SIGNING_KID var + code, all in this deploy) is a single version flip — the
+# live worker never signs with the new key while still advertising old code/kid.
+# Capture output to read the real deployed URL.
+DEPLOY_OUT=$(npx wrangler deploy --config "$CONFIG" --secrets-file "$SECRETS_JSON" 2>&1)
 echo "$DEPLOY_OUT"
+rm -f "$SECRETS_JSON"
+trap - EXIT
+
+# URL extraction MUST be non-fatal: under `set -euo pipefail` a grep miss
+# (custom-domain route, or a wrangler output format change) returns non-zero and
+# would abort the script — `|| true` keeps it alive so the fallback runs. (The
+# bearer is already persisted above, so a death here loses nothing.)
 GATEWAY_URL=$(printf '%s\n' "$DEPLOY_OUT" | grep -oE 'https://sessions-telemetry-gateway\.[a-z0-9-]+\.workers\.dev' | head -1 || true)
 GATEWAY_URL="${GATEWAY_URL:-https://sessions-telemetry-gateway.pedro-18e.workers.dev}"
 

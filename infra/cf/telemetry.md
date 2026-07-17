@@ -78,23 +78,30 @@ consistently; don't mix the two conventions in the same session.
    ```
    OIDC_KEY_FILE=/tmp/gateway-key.pem ./infra/cf/deploy-gateway.sh
    ```
-   What it does, all idempotent (safe to re-run):
-   - **`OIDC_SIGNING_KEY`** (only when `OIDC_KEY_FILE` is passed): sets the
-     private key from step 1 as a **classic** Worker secret via stdin (never the
-     interactive prompt, which risks a paste in scrollback). Classic Worker
-     secret, **not** a Secrets Store binding: Secrets Store caps values at 1024
-     bytes (developers.cloudflare.com/secrets-store/manage-secrets/) but a PKCS#8
+   It bundles both secrets into a single **atomic** `wrangler deploy
+   --secrets-file` (code + secrets land in one worker version — no
+   secret-put-publishes-a-version-first window), all idempotent (safe to re-run):
+   - **`OIDC_SIGNING_KEY`** (included only when `OIDC_KEY_FILE` is passed): the
+     private key from step 1, JSON-encoded into the temp secrets file (0600,
+     deleted on exit) — never on the command line or an interactive prompt. It
+     lands as a **classic** Worker secret, **not** a Secrets Store binding:
+     Secrets Store caps values at 1024 bytes
+     (developers.cloudflare.com/secrets-store/manage-secrets/) but a PKCS#8
      RSA-2048 PEM is ~1.7KB; classic Worker secrets allow up to 5KB
      (developers.cloudflare.com/workers/platform/limits/). See
-     `hub/gateway/telemetry-gateway.ts`'s header for the citation.
+     `hub/gateway/telemetry-gateway.ts`'s header for the citation. On an EXISTING
+     worker the key is **optional** — `--secrets-file` is additive (omitted
+     secrets are preserved), so leaving it off keeps the live key. On a **fresh**
+     worker (the existence probe finds none) it is **required**: a gateway with no
+     `OIDC_SIGNING_KEY` can't sign the Azure assertion, so the script errors out
+     with instructions rather than deploying a broken gateway.
    - **`INGEST_BEARER`**: reuses the value already in
      `infra/out/cf-observability.env` if present, else mints one
-     (`openssl rand -hex 32`), sets it as a Worker secret, and (re)writes it to
-     that gitignored file (umask 077) alongside the gateway's `/v1/{logs,traces}`
-     endpoints. This is the fix for the "Worker secrets are write-only, so the
-     dashboard step can't recover the bearer" trap — the file is the durable
-     copy step 9 reads from.
-   - Deploys `sessions-telemetry-gateway`.
+     (`openssl rand -hex 32`), includes it in the same deploy, and writes it to
+     that gitignored file (0600, atomic temp+mv) — written BEFORE the deploy so
+     the bearer survives even if the deploy dies. This is the fix for the "Worker
+     secrets are write-only, so the dashboard step can't recover the bearer"
+     trap — the file is the durable copy step 9 reads from.
 
    Then delete the temp key — `rm -f /tmp/gateway-key.pem`. (`shred`/secure-delete
    is largely theater on modern SSD/FileVault/BitLocker volumes, so a plain `rm`
@@ -102,12 +109,6 @@ consistently; don't mix the two conventions in the same session.
    see "Rotating the signing key" below.) Two Cloudflare accounts are visible to
    the wrangler token, so the script pins `CLOUDFLARE_ACCOUNT_ID` to the
    vza.net-owning account (`18ef3246…`); override the env var if that changes.
-
-   To run the individual steps by hand instead of the script: `npx wrangler
-   secret put OIDC_SIGNING_KEY --config hub/wrangler.telemetry-gateway.jsonc <
-   /tmp/gateway-key.pem`, then `... secret put INGEST_BEARER ...`, then `npx
-   wrangler deploy --config hub/wrangler.telemetry-gateway.jsonc` — but you must
-   then record the bearer in `infra/out/cf-observability.env` yourself.
 9. Create the account-level observability destinations (one for logs, one for
    traces — **these are shared across every worker on the account**, so use
    names that won't collide with anything else, e.g. `agent-backup-azure-logs`
@@ -174,14 +175,27 @@ The issuer publishes a **JWKS array** (`PUBLIC_JWKS` in
 `hub/gateway/oidc-issuer.ts`), not a single key, specifically so a rotation can
 carry the old and new key at once while caches (Entra's included) catch up.
 Follow the exact sequence documented in that file's header comment — summary:
-add the new key to `PUBLIC_JWKS` and deploy (without touching `ACTIVE_KID`),
-wait out the `/.well-known/jwks.json` cache window (`JWKS_CACHE_CONTROL`,
-currently 5 minutes), then flip `OIDC_SIGNING_KID` + `ACTIVE_KID` + the
-`OIDC_SIGNING_KEY` Worker secret together and redeploy both workers, then
-remove the old key from `PUBLIC_JWKS`. Never remove an old key from
-`PUBLIC_JWKS` before the
-gateway has been redeployed to sign with the new one — that's the one order
-that breaks verification for tokens minted in the gap.
+
+1. Add the new public JWK to `PUBLIC_JWKS` (keep the old one) and deploy the
+   **issuer** — `npx wrangler deploy --config hub/wrangler.oidc-issuer.jsonc` —
+   WITHOUT touching `ACTIVE_KID`. Old + new keys now coexist in the JWKS.
+2. Wait out the `/.well-known/jwks.json` cache window (`JWKS_CACHE_CONTROL`,
+   currently 5 minutes) so Entra's cached copy has the new key.
+3. Flip the **gateway** to the new key. Set `OIDC_SIGNING_KID` (in
+   `hub/wrangler.telemetry-gateway.jsonc`) and `ACTIVE_KID` (in the issuer) to
+   the new kid, then run `OIDC_KEY_FILE=/path/new-key.pem
+   ./infra/cf/deploy-gateway.sh`. Because that script deploys code + the new
+   `OIDC_SIGNING_KEY` in a **single atomic `wrangler deploy --secrets-file`
+   version**, the gateway never lands in the broken in-between state the old
+   `secret put`-then-`deploy` flow could leave — signing with the new key while
+   still serving code/kid from the previous version. Redeploy the issuer too if
+   `ACTIVE_KID` changed.
+4. Once the gateway is signing with the new kid (immediately, since step 3 is one
+   version), remove the old key from `PUBLIC_JWKS` and redeploy the issuer.
+
+Never remove an old key from `PUBLIC_JWKS` before the gateway has been redeployed
+to sign with the new one — that's the one order that breaks verification for
+tokens minted in the gap.
 
 ## Trap: destinations are account-level
 
