@@ -55,22 +55,14 @@
   "triggers": { "crons": ["*/15 * * * *", "30 4 * * *"] },
   "observability": {
     "enabled": true,
-    "head_sampling_rate": 1
-    // M4: sessions-telemetry-gateway IS deployed
-    // (https://sessions-telemetry-gateway.pedro-18e.workers.dev). To finish the
-    // export, add here:
-    // "logs": { "enabled": true, "destinations": ["agent-backup-azure-logs"] },
-    // "traces": { "enabled": true, "destinations": ["agent-backup-azure-traces"] }
-    // — but ONLY AFTER the two account-level destinations exist, or this deploy
-    // exports nowhere. Destinations are ACCOUNT-level (not per-worker) and can be
-    // created ONLY in the dashboard: the wrangler OAuth token gets HTTP 403 on
-    // every /accounts/{id}/workers/observability/* API path (confirmed
-    // 2026-07-17), so this is a manual step for the account owner (Workers &
-    // Pages → Observability → Pipelines → Add destination). Type "Logs"/"Traces",
-    // OTLP Endpoint https://sessions-telemetry-gateway.pedro-18e.workers.dev/v1/{logs,traces},
-    // custom header Authorization: Bearer <INGEST_BEARER>. The exact bearer +
-    // endpoints are in the gitignored infra/out/cf-observability.env. Full steps
-    // + shared-account trap in infra/cf/telemetry.md.
+    "head_sampling_rate": 1,
+    // The two destinations are ACCOUNT-level and dashboard-only (the wrangler OAuth
+    // token 403s on every /workers/observability/* API path, confirmed 2026-07-17);
+    // they must exist before this deploys or the export goes nowhere. Endpoints point
+    // at sessions-telemetry-gateway with the INGEST_BEARER header — values in the
+    // gitignored infra/out/cf-observability.env, full steps in infra/cf/telemetry.md.
+    "logs": { "enabled": true, "destinations": ["agent-backup-azure-logs"], "invocation_logs": true },
+    "traces": { "enabled": true, "destinations": ["agent-backup-azure-traces"] }
   },
   // PR preview isolation. Workers Builds runs non-production branches with
   // `wrangler versions upload`, which uses the TOP-LEVEL bindings unless an env is
@@ -90,6 +82,10 @@
       // so without this a preview deploy would REASSIGN the production custom domains
       // (api./sessions.vza.net) to sessions-hub-preview. Previews serve from workers.dev.
       "routes": [],
+      // Preview URLs are off by default (verified: every *.workers.dev probe of this worker
+      // 404s without it). PR builds upload versions with `--env preview`; this exposes each
+      // version's <hash>-sessions-hub-preview.pedro-18e.workers.dev URL, gated by DEV_AUTH.
+      "preview_urls": true,
       "vars": {
         "ENVIRONMENT": "preview",
         "API_HOST": "api.sessions.vza.net",

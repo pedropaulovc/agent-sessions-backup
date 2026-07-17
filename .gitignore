@@ -13,3 +13,9 @@ collector/.coverage
 infra/out/
 .DS_Store
 .claude/worktrees/
+
+# local secrets — never commit
+.env.local
+*.pfx
+*.cer
+*.client.key
