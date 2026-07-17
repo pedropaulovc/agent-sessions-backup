@@ -47,6 +47,12 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
     // subtype). The later filter explicitly keeps t.usage turns, so flush must not drop them.
     if (current && (current.blocks.length > 0 || current.usage)) session.turns.push(current);
     current = undefined;
+    // A representation pair (event_msg + response_item for one logical message) is always
+    // adjacent within a single turn — so an unpaired occurrence left pending at a turn boundary
+    // is never going to be paired and must not survive to wrongly consume an unrelated, later
+    // genuine repeat of the same (role, text) in a different turn/exchange.
+    pendingFromResponseItem.clear();
+    pendingFromEventMsg.clear();
   };
   const openTurn = (role: Role, ts: string | undefined, turnId: string | undefined) => {
     if (current && (current.role !== role || (turnId && currentTurnId && turnId !== currentTurnId))) flush();
@@ -166,8 +172,14 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       case 'message': {
         const role = (str(p.role) as Role) ?? 'assistant';
         const text = contentText(p.content);
-        if (!text || !shouldIndexMessage('response_item', role, text)) break;
+        if (!text) break;
+        // Resolve/open the turn BEFORE the dedupe check: if this message starts a new turn,
+        // opening it flushes and clears the pending-pairing maps for the turn being left. Doing
+        // that first means a message that itself opens a new turn gets to register its own
+        // pending count in the FRESH map, instead of registering then immediately having its own
+        // turn-opening flush wipe it out.
         const turn = openTurn(role === 'developer' ? 'developer' : role, ts, turnId);
+        if (!shouldIndexMessage('response_item', role, text)) break;
         const c = cap(text, CAPS.text);
         turn.blocks.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });
         if (!firstUserText && role === 'user') firstUserText = text.slice(0, 120);
@@ -239,8 +251,11 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       case 'agent_message': {
         const text = str(p.message) ?? contentText(p.message);
         const role: Role = p.type === 'user_message' ? 'user' : 'assistant';
-        if (!text || !shouldIndexMessage('event_msg', role, text)) break;
+        if (!text) break;
+        // Open the turn before the dedupe check — see the matching comment in the
+        // response_item/message case above.
         const turn = openTurn(role, ts, undefined);
+        if (!shouldIndexMessage('event_msg', role, text)) break;
         const c = cap(text, CAPS.text);
         turn.blocks.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });
         if (!firstUserText && role === 'user') firstUserText = text.slice(0, 120);

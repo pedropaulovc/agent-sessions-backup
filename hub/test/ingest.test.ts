@@ -43,13 +43,15 @@ async function drainQueue(): Promise<void> {
 }
 
 /** Deliver a single, explicitly-specified message — for tests that need to redeliver a
- * particular file regardless of its current parse_state (drainQueue only picks up 'pending'). */
-async function deliverOne(fileId: number, r2Key: string): Promise<void> {
+ * particular file regardless of its current parse_state (drainQueue only picks up 'pending').
+ * An explicit contentHash simulates a message enqueued for a since-superseded upload — the
+ * consumer's markParsed guard uses it to detect the row has since moved on. */
+async function deliverOne(fileId: number, r2Key: string, contentHash?: string): Promise<void> {
   const message = {
     id: String(fileId),
     timestamp: new Date(),
     attempts: 1,
-    body: { file_id: fileId, r2_key: r2Key, reason: 'upload' as const },
+    body: { file_id: fileId, r2_key: r2Key, reason: 'upload' as const, ...(contentHash !== undefined ? { content_hash: contentHash } : {}) },
     ack() {},
     retry() {},
   };
@@ -527,5 +529,162 @@ describe('a zero-turn parse (every line malformed) never becomes canonical over 
       .first<{ canonical_file_id: number; index_state: string }>();
     expect(session?.canonical_file_id).toBe(fileIdB);
     expect(session?.index_state).toBe('ready');
+  });
+});
+
+describe('a stale parse message (content_hash no longer matches) does not mark the row parsed for content it did not parse', () => {
+  it('the stale message is a no-op on the files row; the fresh message parses normally', async () => {
+    const SESSION_ID = '22222222-3333-4444-8444-000000000001';
+    const relpath = `stale-hash-demo/${SESSION_ID}.jsonl`;
+    const CONTENT_OLD = [
+      ccUserLine({ uuid: 'stale-u1', text: 'first version of the content' }),
+      ccAssistantLine({ uuid: 'stale-a1', parentUuid: 'stale-u1', text: 'first version response' }),
+    ].join('\n');
+    const CONTENT_NEW = [
+      ccUserLine({ uuid: 'stale-u2', text: 'second, newer version of the content' }),
+      ccAssistantLine({ uuid: 'stale-a2', parentUuid: 'stale-u2', text: 'second version response' }),
+    ].join('\n');
+
+    const resOld = await putFile('stalehash', 'claude-projects', relpath, CONTENT_OLD);
+    expect(resOld.status).toBe(201);
+    const fileId = ((await resOld.json()) as { file_id: number }).file_id;
+    const oldHash = await sha256Hex(new TextEncoder().encode(CONTENT_OLD));
+    const r2Key = `raw/stalehash/claude-projects/${relpath}`;
+
+    // Re-upload the SAME (machine, store, relpath) with different content — same files row, new
+    // hash, new R2 bytes. The row is 'pending' again, now for the NEW content.
+    const resNew = await putFile('stalehash', 'claude-projects', relpath, CONTENT_NEW);
+    expect(resNew.status).toBe(201);
+    const newHash = await sha256Hex(new TextEncoder().encode(CONTENT_NEW));
+    const rowAfterReupload = await testEnv.DB.prepare('SELECT parse_state, content_hash FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string; content_hash: string }>();
+    expect(rowAfterReupload?.parse_state).toBe('pending');
+    expect(rowAfterReupload?.content_hash).toBe(newHash);
+
+    // Deliver the STALE message — as if it had been enqueued for the OLD upload and only now
+    // reaches the consumer, after the re-upload already changed the row's content_hash.
+    await deliverOne(fileId, r2Key, oldHash);
+    const rowAfterStale = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(rowAfterStale?.parse_state).toBe('pending'); // untouched — not misleadingly marked 'parsed'
+
+    // Deliver the FRESH message — hash matches, parses normally.
+    await deliverOne(fileId, r2Key, newHash);
+    const rowAfterFresh = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(rowAfterFresh?.parse_state).toBe('parsed');
+  });
+});
+
+describe('a canonical file reparsed to zero turns clears the stale index and recovers via a duplicate', () => {
+  const SESSION_ID = '33333333-4444-4444-8444-000000000001';
+  const CONTENT_VALID_A = [
+    ccUserLine({ uuid: 'recover-u1', text: 'unique-marker-alpha searchable content' }),
+    ccAssistantLine({ uuid: 'recover-a1', parentUuid: 'recover-u1', text: 'unique-marker-alpha response' }),
+  ].join('\n');
+  const CONTENT_VALID_B = [
+    ccUserLine({ uuid: 'recover-u2', text: 'unique-marker-alpha searchable content from B' }),
+    ccAssistantLine({ uuid: 'recover-a2', parentUuid: 'recover-u2', text: 'unique-marker-alpha response from B' }),
+  ].join('\n');
+  const CONTENT_GARBAGE = ['not valid json at all {{{', 'still garbage ]]] not json'].join('\n');
+
+  beforeAll(async () => {
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('recover-a', 'linux', 0) ON CONFLICT (machine_id) DO UPDATE SET priority = 0",
+      ),
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('recover-b', 'linux', 1) ON CONFLICT (machine_id) DO UPDATE SET priority = 1",
+      ),
+    ]);
+  });
+
+  it('canonical A goes to garbage: old blocks/FTS/usage are cleared, index_state=error, and the re-enqueued duplicate B recovers the session', async () => {
+    const resA = await putFile('recover-a', 'claude-projects', `recover-a-path/${SESSION_ID}.jsonl`, CONTENT_VALID_A);
+    expect(resA.status).toBe(201);
+    const fileIdA = ((await resA.json()) as { file_id: number }).file_id;
+    const r2KeyA = `raw/recover-a/claude-projects/recover-a-path/${SESSION_ID}.jsonl`;
+    await deliverOne(fileIdA, r2KeyA);
+
+    const sessionAfterA = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(sessionAfterA?.canonical_file_id).toBe(fileIdA);
+    expect(sessionAfterA?.index_state).toBe('ready');
+
+    // Confirm the original content is actually searchable before we blow it away.
+    const searchBefore = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-alpha', {
+      headers: { 'x-dev-machine': 'recover-a' },
+    });
+    const bodyBefore = (await searchBefore.json()) as { hits: Array<{ session_id: string }> };
+    expect(bodyBefore.hits.some((h) => h.session_id === SESSION_ID)).toBe(true);
+
+    // A lower-priority duplicate exists too — it loses to A (already canonical+parsed) and gets
+    // superseded, but it's still a valid parseable copy sitting in the wings.
+    const resB = await putFile('recover-b', 'claude-projects', `recover-b-path/${SESSION_ID}.jsonl`, CONTENT_VALID_B);
+    expect(resB.status).toBe(201);
+    const fileIdB = ((await resB.json()) as { file_id: number }).file_id;
+    const r2KeyB = `raw/recover-b/claude-projects/recover-b-path/${SESSION_ID}.jsonl`;
+    await deliverOne(fileIdB, r2KeyB);
+    const rowB1 = await testEnv.DB.prepare('SELECT parse_state, content_hash FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string; content_hash: string }>();
+    expect(rowB1?.parse_state).toBe('superseded');
+
+    const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
+
+    // The canonical file A gets re-uploaded as garbage.
+    const resGarbage = await putFile('recover-a', 'claude-projects', `recover-a-path/${SESSION_ID}.jsonl`, CONTENT_GARBAGE);
+    expect(resGarbage.status).toBe(201);
+    await deliverOne(fileIdA, r2KeyA);
+
+    const rowA = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdA)
+      .first<{ parse_state: string }>();
+    expect(rowA?.parse_state).toBe('error');
+
+    const sessionAfterGarbage = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(sessionAfterGarbage?.index_state).toBe('error');
+    expect(sessionAfterGarbage?.canonical_file_id).toBe(fileIdA); // kept so raw access still resolves
+
+    const blocksLeft = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ n: number }>();
+    expect(blocksLeft?.n).toBe(0);
+
+    const searchAfterGarbage = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-alpha', {
+      headers: { 'x-dev-machine': 'recover-a' },
+    });
+    const bodyAfterGarbage = (await searchAfterGarbage.json()) as { hits: Array<{ session_id: string }> };
+    expect(bodyAfterGarbage.hits.some((h) => h.session_id === SESSION_ID)).toBe(false);
+
+    // Raw access still resolves — it just now serves the (garbage) current bytes.
+    const rawAfterGarbage = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${SESSION_ID}/raw`, {
+      headers: { 'x-dev-machine': 'recover-a' },
+    });
+    expect(rawAfterGarbage.status).toBe(200);
+
+    // The recovery machinery should have automatically enqueued B's parse.
+    expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({ file_id: fileIdB, reason: 'recover' }));
+    sendSpy.mockRestore();
+
+    // Deliver that recovery message ourselves (the test harness doesn't auto-drain sends).
+    await deliverOne(fileIdB, r2KeyB, rowB1!.content_hash);
+
+    const rowB2 = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string }>();
+    expect(rowB2?.parse_state).toBe('parsed');
+
+    const sessionRecovered = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(sessionRecovered?.canonical_file_id).toBe(fileIdB);
+    expect(sessionRecovered?.index_state).toBe('ready');
   });
 });

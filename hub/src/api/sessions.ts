@@ -131,7 +131,10 @@ export async function listSessions(url: URL, env: Env): Promise<Response> {
 /** Clamp a user-supplied limit to [1, max], falling back to dflt for missing/non-positive/NaN input. */
 export function clampLimit(raw: string | null, dflt: number, max: number): number {
   const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), max) : dflt;
+  // Flooring a positive fraction below 1 (e.g. limit=0.5) would otherwise produce 0: search then
+  // runs with LIMIT 0, returns no hits, and still emits a cursor for the next (equally empty)
+  // page — a caller that follows cursors loops forever. Clamp the floored value up to 1 too.
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.max(1, Math.floor(n)), max) : dflt;
 }
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;

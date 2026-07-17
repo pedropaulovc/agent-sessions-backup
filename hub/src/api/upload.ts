@@ -28,7 +28,11 @@ export async function putFile(
   // canonical-copy size tiebreaker to a smaller duplicate that did provide a size.
   if (sizeHeader === null) return Response.json({ error: 'missing_content_length' }, { status: 400 });
   const size = Number(sizeHeader);
-  if (!Number.isFinite(size) || size < 0) return Response.json({ error: 'missing_content_length' }, { status: 400 });
+  // A fractional size (e.g. x-file-size: 1.5, only reachable via the chunked-upload header since
+  // content-length itself can't carry a fraction) would otherwise pass Number.isFinite, land the
+  // body in R2, and only then 500 at the INSERT — files.size is STRICT INTEGER — leaving an
+  // orphaned R2 object with no files row and no parse message. Reject before RAW.put.
+  if (!Number.isSafeInteger(size) || size < 0) return Response.json({ error: 'missing_content_length' }, { status: 400 });
   if (!request.body) return Response.json({ error: 'missing_body' }, { status: 400 });
 
   const existing = await env.DB.prepare(
@@ -41,7 +45,7 @@ export async function putFile(
     // indexing (a dropped/failed queue message), the file would otherwise sit
     // unindexed forever while files/check reports it as present. Re-enqueue.
     if (!TERMINAL_PARSE_STATES.has(existing.parse_state)) {
-      await env.PARSE_QUEUE.send({ file_id: existing.id, r2_key: existing.r2_key, reason: 'upload' });
+      await env.PARSE_QUEUE.send({ file_id: existing.id, r2_key: existing.r2_key, reason: 'upload', content_hash: existing.content_hash });
       return Response.json({ status: 'unchanged', file_id: existing.id, requeued: true });
     }
     return Response.json({ status: 'unchanged', file_id: existing.id });
@@ -71,7 +75,7 @@ export async function putFile(
   await env.DB.prepare('UPDATE machines SET last_upload_at = strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE machine_id = ?1')
     .bind(machineId)
     .run();
-  await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload' });
+  await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
 
   console.log(
     JSON.stringify({ event: 'access.upload', machine: machineId, key: r2Key, bytes: size, status: existing ? 'updated' : 'created' }),
@@ -92,10 +96,10 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
     const binds: unknown[] = [identity.machineId];
     for (const it of chunk) binds.push(it.store, it.relpath, it.sha256.replace(/^sha256:/, '').toLowerCase());
     const rows = await env.DB.prepare(
-      `SELECT id, store, relpath, r2_key, parse_state FROM files WHERE machine_id = ?1 AND (${conditions.join(' OR ')})`,
+      `SELECT id, store, relpath, r2_key, parse_state, content_hash FROM files WHERE machine_id = ?1 AND (${conditions.join(' OR ')})`,
     )
       .bind(...binds)
-      .all<{ id: number; store: string; relpath: string; r2_key: string; parse_state: string }>();
+      .all<{ id: number; store: string; relpath: string; r2_key: string; parse_state: string; content_hash: string }>();
     const have = new Map(rows.results.map((r) => [`${r.store}\n${r.relpath}`, r]));
     for (const it of chunk) {
       const row = have.get(`${it.store}\n${it.relpath}`);
@@ -107,7 +111,7 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
       // non-terminal parse_state (lost/exhausted queue message) would otherwise never get
       // reindexed: the collector sees "present" and never re-uploads, so nothing else requeues it.
       if (!TERMINAL_PARSE_STATES.has(row.parse_state)) {
-        await env.PARSE_QUEUE.send({ file_id: row.id, r2_key: row.r2_key, reason: 'upload' });
+        await env.PARSE_QUEUE.send({ file_id: row.id, r2_key: row.r2_key, reason: 'upload', content_hash: row.content_hash });
       }
     }
   }

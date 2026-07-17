@@ -119,6 +119,7 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
         .bind(machineId)
         .run();
       const det = detect(store, relpath);
+      const contentHash = obj.checksums?.sha256 ? hex(obj.checksums.sha256) : 'unknown';
       const row = await env.DB.prepare(
         `INSERT INTO files (machine_id, store, relpath, r2_key, size, content_hash, harness, session_id, parse_state)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')
@@ -127,18 +128,9 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
            content_hash = excluded.content_hash
          RETURNING id`,
       )
-        .bind(
-          machineId,
-          store,
-          relpath,
-          obj.key,
-          obj.size,
-          obj.checksums?.sha256 ? hex(obj.checksums.sha256) : 'unknown',
-          det.harness,
-          det.sessionId ?? null,
-        )
+        .bind(machineId, store, relpath, obj.key, obj.size, contentHash, det.harness, det.sessionId ?? null)
         .first<{ id: number }>();
-      await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: obj.key, reason: 'reindex' });
+      await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: obj.key, reason: 'reindex', content_hash: contentHash });
       enqueued++;
     }
     cursor = page.truncated ? page.cursor : undefined;

@@ -32,7 +32,11 @@
         "queue": "parse",
         "max_batch_size": 5,
         "max_retries": 3,
-        "max_concurrency": 2,
+        // Serial, not concurrent: closes the canonical-selection TOCTOU window between the
+        // post-parse recheck and the write (consumer.ts) rather than just narrowing it. Parse
+        // throughput is a few files per 15-minute batch at steady state, and backfill tolerates
+        // serial processing — this is not a throughput-sensitive path.
+        "max_concurrency": 1,
         "dead_letter_queue": "parse-dlq"
       }
     ]

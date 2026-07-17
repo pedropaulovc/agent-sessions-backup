@@ -70,7 +70,11 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
   // has actually proven it can parse — would ack this message and, if the preferred copy then
   // fails permanently, leave the session unindexed with no valid copy left to recover it from.
   // Parse this file anyway; if a higher-priority copy parses successfully later, it supersedes
-  // this one at that point (see the supersede-losers step below).
+  // this one at that point (see the supersede-losers step below). With max_concurrency: 1 on the
+  // parse queue (wrangler.jsonc) there's no other consumer running concurrently, so this and the
+  // post-parse recheck below only matter across retries/redeliveries of THIS message, not a
+  // concurrent writer — the canonical decision can still go stale between a retry attempt and an
+  // intervening successful delivery of another copy.
   if (canonical !== null && canonical.id !== file.id && canonical.parseState === 'parsed') {
     await env.DB.prepare("UPDATE files SET parse_state = 'superseded' WHERE id = ?1").bind(file.id).run();
     return;
@@ -92,12 +96,39 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
     // canonical-eligible (chooseCanonical deprioritizes both below), so a valid duplicate — if
     // one exists — remains free to become or stay canonical.
     const state = parsed.stats.parseErrorLines > 0 ? 'error' : 'skipped';
-    await env.DB.prepare(
-      `UPDATE files SET parse_state = ?2, parsed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), parsed_size = ?3, parse_error = ?4
-       WHERE id = ?1`,
-    )
-      .bind(file.id, state, file.size, state === 'error' ? `empty_parse:${parsed.stats.parseErrorLines}/${parsed.stats.lines} lines malformed` : null)
-      .run();
+    const parseError = state === 'error' ? `empty_parse:${parsed.stats.parseErrorLines}/${parsed.stats.lines} lines malformed` : null;
+    const { updated } = await markParsed(file.id, env, state, file.size, parseError, job.content_hash);
+    // A re-upload can change this row's content_hash while this parse was reading the OLD R2
+    // body. If the row no longer matches the hash this message was enqueued for, a fresher
+    // message already re-enqueued the new content — leave everything else alone.
+    if (!updated) return;
+
+    if (det.sessionId) {
+      const session = await env.DB.prepare('SELECT canonical_file_id FROM sessions WHERE session_id = ?1')
+        .bind(det.sessionId)
+        .first<{ canonical_file_id: number | null }>();
+      if (session?.canonical_file_id === file.id) {
+        // This file WAS the session's canonical, and the search index still reflects its OLD,
+        // actually-parseable content — now stale, since the current bytes produced nothing.
+        // Clear the derived rows (keep the sessions row itself so facets/raw access still
+        // resolve) and mark the session errored.
+        await env.DB.batch([
+          env.DB.prepare(
+            `INSERT INTO blocks_fts (blocks_fts, rowid, text) SELECT 'delete', id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL`,
+          ).bind(det.sessionId),
+          env.DB.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(det.sessionId),
+          env.DB.prepare('DELETE FROM usage WHERE session_id = ?1').bind(det.sessionId),
+          env.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(det.sessionId),
+        ]);
+        // If a valid duplicate exists (even a previously-superseded one — this file's demise
+        // frees it up again), kick its parse so the session recovers automatically instead of
+        // staying errored until a manual reindex.
+        const recovery = await chooseRecoveryCandidate(det.sessionId, file.id, env);
+        if (recovery) {
+          await env.PARSE_QUEUE.send({ file_id: recovery.id, r2_key: recovery.r2_key, reason: 'recover', content_hash: recovery.content_hash });
+        }
+      }
+    }
     return;
   }
 
@@ -109,13 +140,15 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
     if (meta?.toolUseId) parsed.parentToolUseId = meta.toolUseId;
   }
 
-  // With the queue's max_concurrency > 1, another copy of this same session can run through
-  // parseOne concurrently and finish (winning canonical) in the gap between the pre-parse check
-  // above and this point — the pre-parse check alone is stale by the time we're ready to write.
+  // The parse queue runs with max_concurrency: 1 (wrangler.jsonc), so there's no other consumer
+  // executing concurrently — this recheck is no longer closing a live concurrent-writer race.
+  // What it still covers: this exact message being retried (e.g. after a transient failure past
+  // this point on a previous attempt) with another, better copy having successfully delivered
+  // and completed in between — the pre-parse check at the top of this function only reflects
+  // state as of THIS attempt's start, which can be stale by the time a retry reaches here.
   // Recheck immediately before writeSession: if some other, already-parsed copy is now the
   // preferred candidate, drop this file's write entirely instead of clobbering the good session
-  // with a worse duplicate. D1 gives no cross-statement transaction here, so the race window
-  // shrinks but doesn't close completely; a reindex self-heals if it's ever actually hit.
+  // with a worse duplicate. A reindex self-heals if this is ever actually hit.
   const postParseCanonical = await chooseCanonical(det.sessionId, env);
   if (postParseCanonical !== null && postParseCanonical.id !== file.id && postParseCanonical.parseState === 'parsed') {
     await env.DB.prepare("UPDATE files SET parse_state = 'superseded' WHERE id = ?1").bind(file.id).run();
@@ -124,7 +157,13 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
 
   await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(det.sessionId).run();
   await writeSession(parsed, file, env);
-  await markParsed(file.id, env, 'parsed', file.size);
+  // Guarded by content_hash: if a re-upload changed this row's hash while writeSession above was
+  // running off the OLD R2 body, don't claim 'parsed' for content that's no longer current — the
+  // newer upload already enqueued its own fresh parse. The stale write to sessions/blocks/usage
+  // above is superseded moments later when that fresh parse completes (writeSession is a full
+  // delete+reinsert per session_id), so it's a harmless transient rather than a lasting error.
+  const { updated } = await markParsed(file.id, env, 'parsed', file.size, undefined, job.content_hash);
+  if (!updated) return;
   // Only the file the recheck just confirmed as the preferred candidate gets to supersede other
   // parsed duplicates. A worse-priority file that wrote because the preferred copy was still
   // unparsed must not claim that role — the preferred copy supersedes this one itself once IT
@@ -170,6 +209,28 @@ async function chooseCanonical(sessionId: string, env: Env): Promise<{ id: numbe
   return row ? { id: row.id, parseState: row.parse_state } : null;
 }
 
+/**
+ * Find another file to re-parse after `excludeFileId` (the session's former canonical) just
+ * turned out to be garbage. Unlike chooseCanonical, this DOES consider 'superseded' files —
+ * a duplicate that lost to `excludeFileId` while it still looked good is exactly the kind of
+ * copy that should get a second chance now. 'error'/'skipped' copies are still excluded; they
+ * wouldn't produce anything better.
+ */
+async function chooseRecoveryCandidate(
+  sessionId: string,
+  excludeFileId: number,
+  env: Env,
+): Promise<{ id: number; r2_key: string; content_hash: string } | null> {
+  const row = await env.DB.prepare(
+    `SELECT f.id, f.r2_key, f.content_hash FROM files f JOIN machines m ON m.machine_id = f.machine_id
+     WHERE f.session_id = ?1 AND f.id != ?2 AND f.parse_state NOT IN ('error', 'skipped')
+     ORDER BY (f.parse_state = 'superseded') ASC, m.priority ASC, f.size DESC, f.mtime DESC, f.id ASC LIMIT 1`,
+  )
+    .bind(sessionId, excludeFileId)
+    .first<{ id: number; r2_key: string; content_hash: string }>();
+  return row ?? null;
+}
+
 async function linkSubagentMeta(file: FileRow, env: Env): Promise<void> {
   const obj = await env.RAW.get(file.r2_key);
   if (!obj) return;
@@ -201,13 +262,32 @@ async function readSiblingMeta(r2Key: string, env: Env): Promise<{ toolUseId?: s
   }
 }
 
-async function markParsed(fileId: number, env: Env, state: string, parsedSize?: number): Promise<void> {
-  await env.DB.prepare(
-    `UPDATE files SET parse_state = ?2, parsed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), parsed_size = ?3, parse_error = NULL
-     WHERE id = ?1`,
-  )
-    .bind(fileId, state, parsedSize ?? null)
-    .run();
+/**
+ * When `requireContentHash` is given, the UPDATE only applies if the row's content_hash still
+ * matches — otherwise a re-upload changed the row's content while THIS message's parse was
+ * reading the OLD R2 body, and writing 'parsed'/'error'/'skipped' now would describe content
+ * that's no longer there. `updated: false` tells the caller to leave everything else alone; the
+ * newer upload already enqueued its own fresh parse for the current bytes. Omitting
+ * `requireContentHash` keeps the unconditional legacy behavior (messages enqueued before this
+ * field existed, or call sites where matching content isn't the point, e.g. subagent-meta links).
+ */
+async function markParsed(
+  fileId: number,
+  env: Env,
+  state: string,
+  parsedSize?: number,
+  parseError?: string | null,
+  requireContentHash?: string,
+): Promise<{ updated: boolean }> {
+  const guarded = requireContentHash !== undefined;
+  const sql = `UPDATE files SET parse_state = ?2, parsed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), parsed_size = ?3, parse_error = ?4
+     WHERE id = ?1${guarded ? ' AND content_hash = ?5' : ''}`;
+  const stmt = env.DB.prepare(sql);
+  const result = await (guarded
+    ? stmt.bind(fileId, state, parsedSize ?? null, parseError ?? null, requireContentHash)
+    : stmt.bind(fileId, state, parsedSize ?? null, parseError ?? null)
+  ).run();
+  return { updated: !guarded || (result.meta?.changes ?? 0) > 0 };
 }
 
 /** Replace a session's index rows atomically-enough: FTS delete → blocks delete → reinsert → FTS rebuild from blocks. */

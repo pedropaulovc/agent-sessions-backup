@@ -74,6 +74,11 @@ describe('clampLimit', () => {
     expect(clampLimit('1e9', 20, 100)).toBe(100);
     expect(clampLimit('3.7', 20, 100)).toBe(3);
   });
+
+  it('a fractional limit below 1 floors to 1, not 0 (regression: limit=0.5 produced LIMIT 0 — empty pages plus a cursor that loops forever)', () => {
+    expect(clampLimit('0.5', 20, 100)).toBe(1);
+    expect(clampLimit('0.1', 20, 100)).toBe(1);
+  });
 });
 
 describe('search/listSessions limit clamp over HTTP (regression: NaN/negative used to reach SQL as LIMIT NaN / LIMIT -1)', () => {
@@ -310,6 +315,40 @@ describe('upload requires an actual size header', () => {
     expect(res.status).toBe(400);
     const json = (await res.json()) as { error: string };
     expect(json.error).toBe('missing_content_length');
+  });
+
+  it('a fractional x-file-size (e.g. 1.5) is rejected before the body ever reaches R2 (regression: it passed Number.isFinite, the body landed in R2, and only the STRICT INTEGER insert then 500d — an orphaned object with no files row and no parse message)', async () => {
+    const bytes = new TextEncoder().encode('{"type":"user"}\n');
+    const relpath = 'fractional-size-demo/f0000000-0000-4000-8000-000000000002.jsonl';
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+    const res = await SELF.fetch(
+      `https://api.sessions.vza.net/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent(relpath)}`,
+      {
+        method: 'PUT',
+        headers: {
+          'x-dev-machine': MACHINE,
+          'x-content-hash': `sha256:${await sha256Hex(bytes)}`,
+          'x-file-size': '1.5',
+        },
+        body: stream,
+        duplex: 'half',
+      } as RequestInit,
+    );
+    expect(res.status).toBe(400);
+    const json = (await res.json()) as { error: string };
+    expect(json.error).toBe('missing_content_length');
+
+    const obj = await testEnv.RAW.get(`raw/${MACHINE}/claude-projects/${relpath}`);
+    expect(obj).toBeNull();
+    const row = await testEnv.DB.prepare('SELECT id FROM files WHERE machine_id = ?1 AND relpath = ?2')
+      .bind(MACHINE, relpath)
+      .first();
+    expect(row).toBeNull();
   });
 });
 

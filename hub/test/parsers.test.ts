@@ -274,6 +274,44 @@ describe('parseCodex', () => {
     expect(userTexts).toEqual([text, text]);
   });
 
+  it('an unpaired message does not survive past its own turn to wrongly consume a later, unrelated repeat (regression: session-wide pending counters let a later event_msg "continue" get silently eaten by an unpaired response_item "continue" from an earlier turn)', async () => {
+    const text = 'continue';
+    const lines = [
+      { timestamp: '2026-07-09T10:00:00.000Z', type: 'session_meta', payload: { session_id: CODEX_SESSION_ID, cwd: '/x' } },
+      { timestamp: '2026-07-09T10:00:01.000Z', type: 'turn_context', payload: { turn_id: 't1', model: 'gpt-test-9' } },
+      // Turn 1: response_item 'continue' with NO event_msg pair — this occurrence is left
+      // permanently unpaired.
+      {
+        timestamp: '2026-07-09T10:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      // The assistant's reply closes turn 1 (role change flushes it).
+      {
+        timestamp: '2026-07-09T10:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'on it' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      // A later, unrelated turn: the user says "continue" again, this time only as event_msg —
+      // it must be indexed, not silently consumed by the stale unpaired occurrence from turn 1.
+      { timestamp: '2026-07-09T10:00:04.000Z', type: 'event_msg', payload: { type: 'user_message', message: text } },
+    ].map((o) => JSON.stringify(o));
+
+    const s = await parseCodex(readJsonlLines(toStream(lines)), CODEX_SESSION_ID);
+    const userTexts = s.turns.filter((t) => t.role === 'user').flatMap((t) => t.blocks.map((b) => b.text));
+    expect(userTexts).toEqual([text, text]);
+  });
+
   it('dedupes an event_msg/response_item representation pair but still indexes a genuine third repeat (regression: pairing must consume exactly the duplicate wire form, not every subsequent equal string)', async () => {
     const text = 'the widget test passes now';
     const lines = [
