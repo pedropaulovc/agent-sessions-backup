@@ -312,14 +312,20 @@ echo "OK: $WEBTEST_NAME (pings $HEALTHZ_URL)"
 
 echo ""
 echo "=== Availability Metric Alert ==="
-# UNVERIFIED: the `availabilityResults/availabilityPercentage` metric + the
-# `webtest/name` dimension filter are the standard portal-generated shape for
-# "alert when an availability test fails"; not exercised live here.
+# The `availabilityResults/availabilityPercentage` metric's dimension is
+# `availabilityResult/name` (not `webtest/name`) — doc-verified against
+# Microsoft's supported-metrics reference for microsoft.insights/components:
+# https://learn.microsoft.com/en-us/azure/azure-monitor/reference/supported-metrics/microsoft-insights-components-metrics
+# (Category: Availability). `az monitor metrics alert create` validates
+# dimension names against this list, so the wrong name would have failed
+# provisioning outright here; the end-to-end alert (does it actually fire when
+# the webtest fails) remains UNVERIFIED until M4 — only the dimension name
+# itself is doc-verified, not a live run of this command.
 AVAIL_ALERT_NAME="agent-backup-healthz-availability"
 if ! az monitor metrics alert show --name "$AVAIL_ALERT_NAME" --resource-group "$RG_NAME" --only-show-errors >/dev/null 2>&1; then
     az monitor metrics alert create --name "$AVAIL_ALERT_NAME" --resource-group "$RG_NAME" \
         --scopes "$AI_RESOURCE_ID" \
-        --condition "avg availabilityResults/availabilityPercentage < 100 where webtest/name includes $WEBTEST_NAME" \
+        --condition "avg availabilityResults/availabilityPercentage < 100 where availabilityResult/name includes $WEBTEST_NAME" \
         --window-size 5m --evaluation-frequency 1m --severity 1 \
         --description "agent-sessions-backup: $HEALTHZ_URL availability test failing" \
         --action "$AG_ID" --only-show-errors >/dev/null
