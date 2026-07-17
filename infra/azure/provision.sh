@@ -3,7 +3,10 @@
 #
 # Provisions Azure observability resources for agent-sessions-backup (idempotent
 # — every resource is show-or-create, safe to re-run). Requires: az CLI with an
-# active login session (`az login`).
+# active login session (`az login`). The application-insights,
+# monitor-control-service, and scheduled-query CLI extensions are installed
+# automatically by this script if missing (see "Azure CLI Extensions" below) —
+# no manual `az extension add` needed first.
 #
 # <issuer-url> is sessions-oidc-issuer's deployed public URL (see
 # infra/cf/telemetry.md step 3), e.g. https://sessions-oidc-issuer.<account>.workers.dev
@@ -55,6 +58,23 @@ AG_NAME="ag-pedro-email"
 WEBTEST_NAME="agent-backup-healthz"
 HEALTHZ_URL="https://sessions.vza.net/healthz"
 
+echo "=== Azure CLI Extensions ==="
+# A fresh az CLI install has none of these; `az monitor app-insights`,
+# `az monitor data-collection`, and `az monitor scheduled-query` fail outright
+# without them. Since every "does it exist" check below is a `show` that falls
+# through to `create` under `set -euo pipefail`, a missing extension aborts
+# the whole script on the first command that needs it — well before the
+# DCE/DCR even get created. Installed explicitly here (rather than via
+# `az config set extension.use_dynamic_install=yes_without_prompt`, which
+# would silently change az CLI's global behavior for every future invocation
+# on this machine, not just this script) so a fresh CLI just works.
+for ext in application-insights monitor-control-service scheduled-query; do
+    az extension show -n "$ext" >/dev/null 2>&1 \
+        || az extension add -n "$ext" --only-show-errors -y >/dev/null
+done
+echo "OK: application-insights, monitor-control-service, scheduled-query"
+
+echo ""
 echo "=== Resource Group ==="
 az group show --name "$RG_NAME" --only-show-errors >/dev/null 2>&1 \
     || az group create --name "$RG_NAME" --location "$LOCATION" --only-show-errors >/dev/null
@@ -110,7 +130,10 @@ echo "=== Data Collection Rule (native OTLP ingestion: logs + traces) ==="
 # equivalent "managed-ai-..." DCE/DCR pair) and copy its endpoint URLs into
 # infra/out/azure.env by hand rather than trusting this script's output.
 if ! az monitor data-collection rule show --name "$DCR_NAME" --resource-group "$RG_NAME" --only-show-errors >/dev/null 2>&1; then
-    DCR_RULE_FILE=$(mktemp)
+    # A bare `mktemp` (no template) is a GNU-ism — BSD mktemp (macOS's default,
+    # matching this script's bash-3.2 portability elsewhere) requires an
+    # explicit template and exits non-zero without one.
+    DCR_RULE_FILE=$(mktemp "${TMPDIR:-/tmp}/agent-backup-dcr.XXXXXX")
     trap 'rm -f "$DCR_RULE_FILE"' EXIT
     cat > "$DCR_RULE_FILE" <<EOF
 {
@@ -327,7 +350,8 @@ if ! az rest --method get --url "https://management.azure.com${WEBTEST_ID}?api-v
     WEBTEST_XML="<WebTest Name=\"$WEBTEST_NAME\" Id=\"$TEST_GUID\" Enabled=\"True\" CssProjectStructure=\"\" CssIteration=\"\" Timeout=\"30\" WorkItemIds=\"\" xmlns=\"http://microsoft.com/schemas/VisualStudio/TeamTest/2010\" Description=\"\" CredentialUserName=\"\" CredentialPassword=\"\" PreAuthenticate=\"True\" Proxy=\"default\" StopOnError=\"False\" RecordedResultFile=\"\" ResultsLocale=\"\"><Items><Request Method=\"GET\" Guid=\"$REQUEST_GUID\" Version=\"1.1\" Url=\"$HEALTHZ_URL\" ThinkTime=\"0\" Timeout=\"30\" ParseDependentRequests=\"False\" FollowRedirects=\"True\" RecordResult=\"True\" Cache=\"False\" ResponseTimeGoal=\"0\" Encoding=\"utf-8\" ExpectedHttpStatusCode=\"200\" ExpectedResponseUrl=\"\" ReportingName=\"\" IgnoreHttpStatusCode=\"False\" /></Items></WebTest>"
     WEBTEST_XML_ESCAPED=$(printf '%s' "$WEBTEST_XML" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
 
-    WEBTEST_BODY_FILE=$(mktemp)
+    # See the DCR_RULE_FILE mktemp comment above — same BSD-mktemp requirement.
+    WEBTEST_BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/agent-backup-webtest.XXXXXX")
     trap 'rm -f "$WEBTEST_BODY_FILE"' EXIT
     cat > "$WEBTEST_BODY_FILE" <<EOF
 {
