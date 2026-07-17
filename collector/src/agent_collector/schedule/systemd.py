@@ -12,11 +12,18 @@ SERVICE = UNIT_DIR / "agent-collector.service"
 TIMER = UNIT_DIR / "agent-collector.timer"
 
 
+def _sd_quote(arg: str) -> str:
+    """Double-quote an Exec* argument so systemd doesn't split a path at its spaces.
+    systemd strips the quotes and unescapes \\\\ and \\" inside them."""
+    escaped = arg.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
 def _exec_start() -> str:
     exe = shutil.which("agent-collector")
     if exe:
-        return f"{exe} run --once"
-    return f"{sys.executable} -m agent_collector.cli run --once"
+        return f"{_sd_quote(exe)} run --once"
+    return f"{_sd_quote(sys.executable)} -m agent_collector.cli run --once"
 
 
 def _service_unit() -> str:
@@ -32,11 +39,14 @@ def _service_unit() -> str:
 
 
 def _timer_unit(interval: int) -> str:
+    # Elapsed timers honor "minutes between runs" for ANY interval. OnCalendar=*:0/N breaks
+    # for values that don't divide 60 (e.g. 45 -> :45,:00 gives a 15-min gap; 90 is invalid).
     return (
         "[Unit]\n"
         "Description=Run agent-collector periodically\n\n"
         "[Timer]\n"
-        f"OnCalendar=*:0/{interval}\n"
+        f"OnBootSec={interval}min\n"
+        f"OnUnitActiveSec={interval}min\n"
         "RandomizedDelaySec=300\n"
         "Persistent=true\n\n"
         "[Install]\n"
@@ -62,8 +72,17 @@ def install(interval: int = 15) -> int:
     TIMER.write_text(_timer_unit(interval))
     print(f"wrote {SERVICE}")
     print(f"wrote {TIMER}")
-    _systemctl("daemon-reload")
-    _systemctl("enable", "--now", "agent-collector.timer")
+    reloaded = _systemctl("daemon-reload")
+    enabled = _systemctl("enable", "--now", "agent-collector.timer")
+    if not (reloaded and enabled):
+        print(
+            "[FAIL] wrote unit files but could not activate the timer via systemctl --user. "
+            "Finish manually:\n"
+            "  systemctl --user daemon-reload\n"
+            "  systemctl --user enable --now agent-collector.timer",
+            file=sys.stderr,
+        )
+        return 1
     if shutil.which("loginctl"):
         subprocess.run(["loginctl", "enable-linger"], capture_output=True, text=True)
         print("enabled linger so the timer runs while logged out")

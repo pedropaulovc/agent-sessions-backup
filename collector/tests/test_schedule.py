@@ -2,7 +2,7 @@ import re
 import sys
 
 from agent_collector import schedule
-from agent_collector.schedule import taskscheduler
+from agent_collector.schedule import systemd, taskscheduler
 
 
 def _action_line(script: str) -> str:
@@ -56,3 +56,35 @@ def test_macos_uninstall_fails_loudly(monkeypatch, capsys):
     rc = schedule.uninstall()
     assert rc != 0
     assert "launchd" in capsys.readouterr().err.lower()
+
+
+def test_systemd_execstart_quotes_spaced_path(monkeypatch):
+    monkeypatch.setattr(systemd.shutil, "which", lambda _n: "/opt/my tools/agent-collector")
+    unit = systemd._service_unit()
+    assert 'ExecStart="/opt/my tools/agent-collector" run --once' in unit
+
+
+def test_systemd_execstart_module_fallback_quotes_python(monkeypatch):
+    monkeypatch.setattr(systemd.shutil, "which", lambda _n: None)
+    monkeypatch.setattr(systemd.sys, "executable", "/py path/python")
+    unit = systemd._service_unit()
+    assert 'ExecStart="/py path/python" -m agent_collector.cli run --once' in unit
+
+
+def test_systemd_timer_uses_elapsed_timers_for_any_interval():
+    unit = systemd._timer_unit(45)  # 45 doesn't divide 60; OnCalendar=*:0/45 would misbehave
+    assert "OnBootSec=45min" in unit
+    assert "OnUnitActiveSec=45min" in unit
+    assert "OnCalendar" not in unit
+    assert "RandomizedDelaySec=300" in unit and "Persistent=true" in unit
+
+
+def test_systemd_install_fails_when_activation_fails(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(systemd, "UNIT_DIR", tmp_path)
+    monkeypatch.setattr(systemd, "SERVICE", tmp_path / "agent-collector.service")
+    monkeypatch.setattr(systemd, "TIMER", tmp_path / "agent-collector.timer")
+    monkeypatch.setattr(systemd, "_systemctl", lambda *a: False)
+    rc = systemd.install(15)
+    assert rc == 1
+    assert "systemctl --user" in capsys.readouterr().err
+    assert (tmp_path / "agent-collector.timer").exists()  # unit files still written

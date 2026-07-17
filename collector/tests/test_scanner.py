@@ -6,6 +6,7 @@ import time
 from agent_collector import config
 from agent_collector.scanner import (
     Scanner, path_matches, read_exact, hash_bytes, hash_file_prefix, _snapshot_sqlite,
+    SNAPSHOT_OK, SNAPSHOT_NOT_A_DB, SNAPSHOT_LOCKED,
 )
 
 
@@ -118,7 +119,7 @@ def test_sqlite_snapshot_and_sidecar_exclusion(tmp_path):
 
 def test_snapshot_bounded_when_source_locked(tmp_path):
     # A DB held in BEGIN EXCLUSIVE must not hang backup() forever; the deadline aborts and
-    # _snapshot_sqlite returns False so the file is skipped this run.
+    # _snapshot_sqlite reports SNAPSHOT_LOCKED so the file is skipped this run.
     db = tmp_path / "locked.sqlite"
     c = sqlite3.connect(db)
     c.execute("CREATE TABLE t(x)")
@@ -129,13 +130,58 @@ def test_snapshot_bounded_when_source_locked(tmp_path):
     holder.execute("BEGIN EXCLUSIVE")
     try:
         start = time.monotonic()
-        ok = _snapshot_sqlite(db, tmp_path / "snap.sqlite", deadline_s=0.5)
+        outcome = _snapshot_sqlite(db, tmp_path / "snap.sqlite", deadline_s=0.5)
         elapsed = time.monotonic() - start
     finally:
         holder.execute("ROLLBACK")
         holder.close()
-    assert ok is False
+    assert outcome == SNAPSHOT_LOCKED  # distinct from not_a_db, so caller can skip not raw-upload
     assert elapsed < 10  # bounded by the deadline, not hanging on the exclusive lock
+
+
+def test_snapshot_outcomes_ok_and_not_a_db(tmp_path):
+    db = tmp_path / "real.sqlite"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE t(x)")
+    c.commit()
+    c.close()
+    assert _snapshot_sqlite(db, tmp_path / "ok.sqlite") == SNAPSHOT_OK
+    garbage = tmp_path / "junk.db"
+    garbage.write_bytes(b"not a database at all")
+    assert _snapshot_sqlite(garbage, tmp_path / "no.sqlite") == SNAPSHOT_NOT_A_DB
+
+
+def test_locked_db_skipped_with_event_garbage_db_raw_captured(tmp_path):
+    root = tmp_path / ".claude"
+    root.mkdir()
+    # a real DB, locked EXCLUSIVE -> must be skipped (not raw-uploaded) + snapshot_timeout event
+    locked = root / "locked.sqlite"
+    c = sqlite3.connect(locked)
+    c.execute("CREATE TABLE t(x)")
+    c.commit()
+    c.close()
+    holder = sqlite3.connect(locked, isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    # a non-DB file with a .db suffix -> raw-captured
+    garbage = root / "notes.db"
+    garbage.write_bytes(b"just text, not sqlite")
+
+    scanner = Scanner([])
+    scanner.snapshot_deadline_s = 0.3  # short deadline so the locked DB aborts fast
+    try:
+        items = {it.relpath: it for it in scanner.scan_store("claude", root)}
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+        scanner.close()
+
+    assert "locked.sqlite" not in items  # skipped, never raw-uploaded
+    assert "notes.db" in items
+    assert items["notes.db"].is_snapshot is False  # garbage .db raw-captured
+    codes = {e["code"] for e in scanner.events}
+    assert "snapshot_timeout" in codes
+    ev = next(e for e in scanner.events if e["code"] == "snapshot_timeout")
+    assert ev["store"] == "claude" and "locked.sqlite" in ev["message"]
 
 
 def test_hash_file_prefix_matches_read_exact(tmp_path):
@@ -177,3 +223,32 @@ def test_scan_prunes_excluded_directories(tmp_path):
     # excluded dirs are pruned: os.walk never descends into cache/deep or statsig
     assert not any(d.endswith("deep") for d in walked)
     assert not any(d.endswith("statsig") for d in walked)
+
+
+def test_walk_error_recorded_as_event(tmp_path):
+    root = tmp_path / ".claude"
+    (root / "projects").mkdir(parents=True)
+    (root / "projects" / "a.jsonl").write_text("{}")
+
+    real_walk = os.walk
+
+    def erroring_walk(top, topdown=True, onerror=None, followlinks=False):
+        if onerror:  # simulate an unreadable subtree os.walk would otherwise drop silently
+            err = OSError(13, "Permission denied")
+            err.filename = str(top) + "/secret"
+            onerror(err)
+        yield from real_walk(top, topdown=topdown, onerror=onerror, followlinks=followlinks)
+
+    import agent_collector.scanner as scanner_mod
+    scanner = Scanner([])
+    orig = scanner_mod.os.walk
+    scanner_mod.os.walk = erroring_walk
+    try:
+        found = {it.relpath for it in scanner.scan_store("claude", root)}
+    finally:
+        scanner_mod.os.walk = orig
+        scanner.close()
+
+    assert "projects/a.jsonl" in found  # scan continues past the error
+    ev = next(e for e in scanner.events if e["code"] == "walk_error")
+    assert ev["store"] == "claude" and "secret" in ev["message"]

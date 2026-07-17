@@ -25,6 +25,12 @@ from typing import Iterator
 SNAPSHOT_DEADLINE_S = 30.0
 SNAPSHOT_PAGES = 128  # copy this many pages per backup step, so the progress abort fires often
 
+# Three-state snapshot outcome (a bare False conflated "not a DB" with "locked", which made
+# the caller raw-upload a live, WAL-inconsistent database).
+SNAPSHOT_OK = "ok"
+SNAPSHOT_NOT_A_DB = "not_a_db"      # -> raw capture is safe (it isn't really a database)
+SNAPSHOT_LOCKED = "locked_timeout"  # -> skip this run + emit an event (never raw-upload it)
+
 # A directory is pruned during the walk iff a direct child file would be excluded. This
 # neutral probe name can't accidentally match a filename glob (*.key, *-wal, .credentials…)
 # but still matches every subtree pattern (cache/**) and the oauth* candidate.
@@ -62,19 +68,19 @@ class ScanItem:
     is_snapshot: bool
 
 
-def _snapshot_sqlite(src: Path, dst: Path, deadline_s: float = SNAPSHOT_DEADLINE_S) -> bool:
-    """Bounded consistent snapshot via the backup API.
+def _snapshot_sqlite(src: Path, dst: Path, deadline_s: float = SNAPSHOT_DEADLINE_S) -> str:
+    """Bounded consistent snapshot via the backup API. Returns one of SNAPSHOT_OK /
+    SNAPSHOT_NOT_A_DB / SNAPSHOT_LOCKED.
 
-    Returns False if src is not a valid DB OR the backup can't complete within deadline_s
-    (e.g. the source is held in BEGIN EXCLUSIVE) — the caller skips the file this run and
-    retries next run rather than hanging while holding the overlap lock. The progress
-    callback fires after every backup step, including on SQLITE_BUSY retries, so a locked
-    source still hits the deadline and aborts.
+    The progress callback fires after every backup step, including on SQLITE_BUSY retries,
+    so a source held in BEGIN EXCLUSIVE hits the deadline and aborts (SNAPSHOT_LOCKED)
+    instead of hanging while the run holds the overlap lock. A file that simply isn't a
+    database raises sqlite3.Error (SNAPSHOT_NOT_A_DB) and is raw-captured instead.
     """
     try:
         src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=deadline_s)
     except sqlite3.Error:
-        return False
+        return SNAPSHOT_NOT_A_DB
     deadline = time.monotonic() + deadline_s
 
     def _progress(_status, _remaining, _total):
@@ -89,11 +95,13 @@ def _snapshot_sqlite(src: Path, dst: Path, deadline_s: float = SNAPSHOT_DEADLINE
                 src_conn.backup(dst_conn, pages=SNAPSHOT_PAGES, progress=_progress, sleep=0.1)
         finally:
             dst_conn.close()
-    except (sqlite3.Error, TimeoutError):
-        return False
+    except TimeoutError:
+        return SNAPSHOT_LOCKED
+    except sqlite3.Error:
+        return SNAPSHOT_NOT_A_DB
     finally:
         src_conn.close()
-    return True
+    return SNAPSHOT_OK
 
 
 def read_exact(path: Path, size: int) -> bytes:
@@ -135,10 +143,14 @@ class Scanner:
         self._tmp = tempfile.TemporaryDirectory(prefix="agent-collector-")
         self.tmp_root = Path(self._tmp.name)
         self._snap_seq = 0
+        self.snapshot_deadline_s = SNAPSHOT_DEADLINE_S  # overridable in tests
         # store -> pattern -> count
         self.excluded_counts: dict[str, dict[str, int]] = defaultdict(
             lambda: defaultdict(int)
         )
+        # Heartbeat warning events raised during the walk (snapshot_timeout, walk_error).
+        # Drained by run/backfill so they reach the hub, and printed by doctor.
+        self.events: list[dict] = []
 
     def close(self) -> None:
         self._tmp.cleanup()
@@ -152,10 +164,21 @@ class Scanner:
     def scan_store(self, store: str, root: Path) -> Iterator[ScanItem]:
         if not root.exists():
             return
+
+        def _onerror(err: OSError) -> None:
+            # os.walk silently drops an unreadable/vanished subtree without a callback;
+            # surface it so capture-all never loses transcripts without a signal.
+            self.events.append({
+                "level": "error", "code": "walk_error",
+                "message": f"{getattr(err, 'filename', root)}: {err} "
+                           f"(errno={getattr(err, 'errno', None)})"[:500],
+                "count": 1, "store": store,
+            })
+
         # os.walk(topdown=True) so we can PRUNE excluded directories in-place before
         # descending — never pay the I/O of walking cache/**, statsig/**, etc. Names are
         # sorted at each level for deterministic order.
-        for dirpath, dirnames, filenames in os.walk(root, topdown=True):
+        for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=_onerror):
             rel_dir = Path(dirpath).relative_to(root)
             rel_prefix = "" if str(rel_dir) == "." else rel_dir.as_posix() + "/"
 
@@ -190,10 +213,20 @@ class Scanner:
         if path.name.endswith(DB_SUFFIXES):
             self._snap_seq += 1
             dst = self.tmp_root / f"snap-{self._snap_seq}.sqlite"
-            if _snapshot_sqlite(path, dst):
+            outcome = _snapshot_sqlite(path, dst, self.snapshot_deadline_s)
+            if outcome == SNAPSHOT_OK:
                 snap_size = dst.stat().st_size
                 return ScanItem(store, relpath, snap_size, st.st_mtime_ns, dst, True)
-            # Not a real DB: fall through and capture raw bytes.
+            if outcome == SNAPSHOT_LOCKED:
+                # A real DB we couldn't snapshot in time: skip it — never raw-upload a live,
+                # WAL-inconsistent database. Retried next run; surfaced in the heartbeat.
+                self.events.append({
+                    "level": "warn", "code": "snapshot_timeout",
+                    "message": f"{relpath}: SQLite locked; snapshot timed out, skipped this run",
+                    "count": 1, "store": store,
+                })
+                return None
+            # SNAPSHOT_NOT_A_DB: it isn't really a database, so raw-capture the bytes.
         return ScanItem(store, relpath, st.st_size, st.st_mtime_ns, path, False)
 
     def top_excluded(self, store: str, n: int = 10) -> list[tuple[str, int]]:

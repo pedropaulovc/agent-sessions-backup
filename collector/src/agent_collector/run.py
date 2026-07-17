@@ -102,6 +102,9 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
                         "level": "error", "code": "upload_failed",
                         "message": res.error[:500], "count": 1, "store": store,
                     })
+        # Traversal/snapshot warnings (walk_error, snapshot_timeout) raised during the walk.
+        events.extend(scanner.events)
+        errors += sum(1 for e in scanner.events if e["level"] == "error")
     finally:
         scanner.close()
 
@@ -244,6 +247,8 @@ def _do_backfill(cfg, st: State, concurrency: int, dry_run: bool) -> int:
         # chunk. Peak temp/disk stays ~one chunk of missing files, never the whole corpus.
         for chunk in _chunked(_iter_store_items(cfg, scanner), BACKFILL_CHUNK):
             _backfill_chunk(cfg, st, transport, scanner, chunk, totals, events, dry_run)
+        # Traversal/snapshot warnings (walk_error, snapshot_timeout) raised during the walk.
+        events.extend(scanner.events)
     finally:
         scanner.close()
 
@@ -423,6 +428,9 @@ def cmd_doctor(args) -> int:
             print(f"[ok]   store {store!r}: {included} files to capture, {excluded} excluded ({root})")
             for pat, n in scanner.top_excluded(store, 5):
                 print(f"           excluded {n:>5}  {pat}")
+        for e in scanner.events:
+            mark = "FAIL" if e["level"] == "error" else "warn"
+            print(f"[{mark}] {e['code']}: {e['message']}")
     finally:
         scanner.close()
 

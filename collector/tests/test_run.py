@@ -286,6 +286,29 @@ def test_backfill_present_files_never_materialized(tmp_path, hub, monkeypatch):
     assert calls["n"] == 0  # present file's body never written to disk
 
 
+def test_run_surfaces_walk_error_in_heartbeat(tmp_path, hub, monkeypatch):
+    import agent_collector.scanner as scanner_mod
+    root = tmp_path / "claude"
+    root.mkdir()
+    (root / "a.jsonl").write_text("x")
+    real_walk = scanner_mod.os.walk
+
+    def erroring_walk(top, topdown=True, onerror=None, followlinks=False):
+        if onerror:
+            err = OSError(13, "Permission denied")
+            err.filename = str(top) + "/secret"
+            onerror(err)
+        yield from real_walk(top, topdown=topdown, onerror=onerror, followlinks=followlinks)
+
+    monkeypatch.setattr(scanner_mod.os, "walk", erroring_walk)
+    cfg = _cfg(hub, root)
+    with State(tmp_path / "state.db") as st:
+        run_mod._do_run(cfg, st)
+    events = hub.heartbeats[-1]["events"]
+    assert any(e["code"] == "walk_error" for e in events)
+    assert ("m1", "claude", "a.jsonl") in hub.files  # scan continued, file uploaded
+
+
 def test_run_lock_prevents_overlap(tmp_path, hub, tmp_env, monkeypatch):
     # enroll writes a real config the CLI path will load
     path = config.config_path()
