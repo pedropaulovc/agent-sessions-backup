@@ -17,6 +17,8 @@ const SYSTEM_SESSION = 'ffffffff-6666-4666-8666-666666666666';
 const UNVER_SESSION = '99999999-7777-4777-8777-777777777777';
 const UNKNOWN_MEDIA_SESSION = '88888888-8888-4888-8888-888888888888';
 const CODEX_TAIL_SESSION = '77777777-9999-4999-8999-999999999999';
+const REPO_SESSION = '66666666-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const REPO_URL = 'https://github.com/tester/facetdemo';
 
 // Hostile transcript payloads: an SVG with inline script and an HTML "document".
 const SVG_XSS_B64 = btoa('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>');
@@ -88,6 +90,16 @@ function codexTrailingCompaction(sessionId: string, contentTurns: number): strin
   }
   lines.push(JSON.stringify({ timestamp: ts, type: 'event_msg', payload: { type: 'context_compacted' } }));
   return lines.join('\n');
+}
+
+/** Minimal codex rollout carrying a git repository_url (only codex sessions populate repo_url) + one message. */
+function codexWithRepo(sessionId: string, repoUrl: string, text: string): string {
+  const ts = '2026-07-02T09:00:00.000Z';
+  return [
+    JSON.stringify({ timestamp: ts, type: 'session_meta', payload: { session_id: sessionId, cwd: '/home/tester/src/demo', cli_version: '0.150.0', git: { repository_url: repoUrl, branch: 'main' } } }),
+    JSON.stringify({ timestamp: ts, type: 'turn_context', payload: { model: 'gpt-test-2' } }),
+    JSON.stringify({ timestamp: ts, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }], internal_chat_message_metadata_passthrough: { turn_id: 't1' } } }),
+  ].join('\n');
 }
 
 async function sha256Hex(data: Uint8Array): Promise<string> {
@@ -199,6 +211,13 @@ describe('viewer', () => {
       )).status,
     ).toBe(201);
 
+    // Codex session with a repo_url + a distinctive search token, so the repo facet appears on the search page.
+    expect(
+      (await putFile('codex-sessions', `2026/07/02/rollout-2026-07-02T09-00-00-${REPO_SESSION}.jsonl`,
+        codexWithRepo(REPO_SESSION, REPO_URL, 'facetsentinelword in the repo transcript'),
+      )).status,
+    ).toBe(201);
+
     await drainQueue();
   });
 
@@ -217,6 +236,21 @@ describe('viewer', () => {
     const html = await res.text();
     expect(html).toContain('Recent sessions');
     expect(html).toContain(`/s/${BIG_SESSION}`);
+  });
+
+  it('marks a selected repo facet active with a toggle-off link that drops the repo param', async () => {
+    const res = await SELF.fetch(
+      `https://sessions.vza.net/?q=facetsentinelword&repo=${encodeURIComponent(REPO_URL)}`,
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    // The selected repo facet renders as active (✓) and its <li> carries the active class.
+    const m = html.match(/<li class="active"><a href="([^"]*)">✓ [^<]*facetdemo/);
+    expect(m).toBeTruthy();
+    // Its toggle link clears the repo param (so a second click removes the filter) while keeping the query.
+    const href = m![1]!;
+    expect(href).not.toContain('repo=');
+    expect(href).toContain('q=facetsentinelword');
   });
 
   it('session page renders turns with role classes', async () => {

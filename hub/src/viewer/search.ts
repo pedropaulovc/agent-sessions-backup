@@ -39,8 +39,12 @@ interface RecentRow {
 export async function searchPage(url: URL, env: Env): Promise<Response> {
   const p = url.searchParams;
   const query = p.get('q')?.trim() ?? '';
+  // Active filters drive both the <select> pre-selection (FILTERS) and the facet active/toggle-off state
+  // (every facet param, e.g. repo, which has no matching select). Union both so a selected repo facet
+  // renders active and its link clears the param instead of re-applying it.
   const active: Record<string, string> = {};
-  for (const f of FILTERS) if (p.get(f.param)) active[f.param] = p.get(f.param)!;
+  const activeParams = new Set<string>([...FILTERS.map((f) => f.param), ...Object.values(FACET_PARAM)]);
+  for (const param of activeParams) if (p.get(param)) active[param] = p.get(param)!;
 
   const options = await filterOptions(env);
   const form = renderForm(query, active, options);
