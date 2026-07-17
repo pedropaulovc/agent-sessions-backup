@@ -1,5 +1,5 @@
 import { detect } from '../ingest/detect';
-import { parseObject } from '../ingest/parse';
+import { isWebHarness, parseObject } from '../ingest/parse';
 import { extractConversationById, parseExportArchive } from '../ingest/parsers/export-inbox';
 import type { ExportArchive } from '../ingest/parsers/export-inbox';
 import type { NormalizedSession } from '../ingest/normalize';
@@ -89,6 +89,17 @@ export async function getSessionRaw(sessionId: string, request: Request, env: En
     if (conv === undefined) return Response.json({ error: 'not_found' }, { status: 404 });
     console.log(JSON.stringify({ event: 'access.raw', session: sessionId, range: null }));
     return new Response(conv, { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } });
+  }
+
+  // A chatgpt-web/claude-web session's canonical is ONE JSON document, not byte-addressable JSONL
+  // (detect() calls it kind='session', so without this it would fall through to the Range path
+  // below). Honoring a Range would hand back an invalid JSON fragment, and application/x-ndjson
+  // mislabels it — serve the whole body as application/json, ignoring Range.
+  if (isWebHarness(det.harness)) {
+    const obj = await env.RAW.get(file.r2_key);
+    if (!obj) return Response.json({ error: 'r2_object_missing' }, { status: 404 });
+    console.log(JSON.stringify({ event: 'access.raw', session: sessionId, range: null }));
+    return new Response(obj.body, { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } });
   }
 
   const rangeHeader = request.headers.get('range');

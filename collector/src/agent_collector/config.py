@@ -159,7 +159,14 @@ class Config:
         """Resolved roots to actually scan. Under WSL with include_windows_mounts=false,
         roots resolving under /mnt/<drive>/ are dropped so a WSL install never captures the
         Windows side as the WSL machine (see dropped_store_roots for what was skipped)."""
-        roots = {name: Path(root).expanduser() for name, root in self.stores.items()}
+        stores = dict(self.stores)
+        # Always expose the webcapture staging stores (setdefault: a custom configured root wins).
+        # This is the load-layer fix for the "registered only at enroll/webcapture" hole: an
+        # already-enrolled collector that upgrades and drops an export ZIP, or a webcapture host, is
+        # scanned without a re-enroll. Missing dirs are simply skipped by run/scanner (root.exists()).
+        for name in WEBCAPTURE_STORES:
+            stores.setdefault(name, str(webcapture_dir() / name))
+        roots = {name: Path(root).expanduser() for name, root in stores.items()}
         if not self._drop_windows_mounts():
             return roots
         return {n: p for n, p in roots.items() if not _root_is_windows_mount(p)}

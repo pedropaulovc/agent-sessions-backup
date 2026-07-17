@@ -28,7 +28,7 @@ def capture_chatgpt(transport: CdpTransport, state, staging_root: Path, events: 
         events.append(login_expired_event("chatgpt"))
         return res
 
-    changed = _list_changed(transport, state, res, events)
+    changed = _list_changed(transport, state, res, events, staging_root)
     staging_root.mkdir(parents=True, exist_ok=True)
     for conv_id, update_time in changed:
         # Reject a non-UUID id before it reaches EITHER the fetch URL or the `{conv_id}.json`
@@ -83,7 +83,7 @@ def _logged_in(status: int, body: str) -> bool:
     return isinstance(data, dict) and bool(data.get("user"))
 
 
-def _list_changed(transport: CdpTransport, state, res: CaptureResult, events: list[dict]) -> list[tuple[str, str]]:
+def _list_changed(transport: CdpTransport, state, res: CaptureResult, events: list[dict], staging_root: Path) -> list[tuple[str, str]]:
     changed: list[tuple[str, str]] = []
     missing_ts = 0
     offset = 0
@@ -126,7 +126,12 @@ def _list_changed(transport: CdpTransport, state, res: CaptureResult, events: li
                 continue
             res.checked += 1
             prev = state.get_webcapture_watermark("chatgpt", conv_id)
-            if prev is None or str(update_time) > prev:
+            # Re-fetch when the watermark advanced OR the local staged file is gone (deleted, or the
+            # staging root moved): a watermark-only check would treat an unchanged-but-unstaged
+            # conversation as captured and it could never be uploaded until it changed remotely.
+            # Re-staging an already-uploaded conv is harmless — the hub dedupes by content hash.
+            staged_missing = valid_conv_id(conv_id) and not (staging_root / f"{conv_id}.json").exists()
+            if prev is None or str(update_time) > prev or staged_missing:
                 changed.append((conv_id, str(update_time)))
         offset += len(items)
         total = data.get("total")

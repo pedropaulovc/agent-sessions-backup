@@ -65,7 +65,12 @@ def _capture_org(transport: CdpTransport, state, staging_root: Path, events: lis
             continue
         res.checked += 1
         prev = state.get_webcapture_watermark("claude", conv_id)  # conv uuids are globally unique
-        if prev is None or str(ts) > prev:
+        # Re-fetch when the watermark advanced OR the local staged file is gone (deleted, or the
+        # staging root moved): a watermark-only check would strand an unchanged-but-unstaged
+        # conversation, unable to upload until it changed remotely. Re-staging is harmless (hub
+        # dedupes by content hash).
+        staged_missing = valid_conv_id(conv_id) and not (staging_root / f"{conv_id}.json").exists()
+        if prev is None or str(ts) > prev or staged_missing:
             changed.append((conv_id, str(ts)))
     if missing_ts:
         res.errors += 1

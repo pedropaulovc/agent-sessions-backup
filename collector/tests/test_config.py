@@ -135,6 +135,38 @@ def test_enroll_mtls_resolves_relative_cert_paths(tmp_path, monkeypatch):
     assert config.load(path).client_cert_path == str((tmp_path / "c.pem").resolve())
 
 
+def test_store_roots_always_includes_webcapture_stores(tmp_path):
+    # Round 6 Fix 2: even a config that never registered the webcapture stores (an already-enrolled
+    # collector that upgraded) exposes them via store_roots(), so a dropped export ZIP is scanned
+    # without a re-enroll.
+    cfg = config.Config(machine_id="m", hub_url="http://h", stores={"claude": "~/.claude"})
+    roots = cfg.store_roots()
+    for name in config.WEBCAPTURE_STORES:
+        assert name in roots
+    # A custom configured root still wins over the injected default (setdefault semantics).
+    custom = config.Config(machine_id="m", hub_url="http://h", stores={"export-inbox": "/custom/inbox"})
+    assert str(custom.store_roots()["export-inbox"]) == "/custom/inbox"
+
+
+def test_run_scans_a_dropped_export_zip_without_explicit_registration(tmp_env):
+    # Round 6 Fix 2 (end-to-end at the scan layer): a config that never registered export-inbox still
+    # scans a ZIP dropped into the default inbox, because store_roots() injects it.
+    from agent_collector.scanner import Scanner
+
+    inbox = config.webcapture_dir() / "export-inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    (inbox / "backup.zip").write_bytes(b"PK\x03\x04 a real file on disk (contents irrelevant here)")
+    cfg = config.Config(machine_id="m", hub_url="http://h", stores=dict(config.DEFAULT_STORES))
+    assert "export-inbox" not in cfg.stores  # never explicitly registered
+
+    found = []
+    with Scanner(cfg.effective_excludes()) as sc:
+        for store, root in cfg.store_roots().items():
+            for item in sc.scan_store(store, root):
+                found.append((store, item.relpath))
+    assert ("export-inbox", "backup.zip") in found
+
+
 def test_load_missing_raises(tmp_path):
     with pytest.raises(FileNotFoundError):
         config.load(tmp_path / "nope.toml")

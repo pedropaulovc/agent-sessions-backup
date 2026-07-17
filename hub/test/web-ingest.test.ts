@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { env as testEnvRaw } from 'cloudflare:test';
 import worker from '../src/index';
 import { chatgptExportZip, chatgptWebConversation, claudeWebConversation, historyLines, unrecognizedExportZip } from './web-fixtures';
+import { ccUserLine } from './fixtures';
 
 const CLAUDE_ROOT = '00000000-0000-4000-8000-000000000000';
 
@@ -508,6 +509,82 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     expect(fileRow?.parse_state).toBe('error');
     expect(fileRow?.parse_error).toBeTruthy();
     expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'corrupt-keep'").first<{ n: number }>()).toMatchObject({ n: 1 });
+  });
+
+  it('raw for a chatgpt-web session ignores Range and serves application/json; a JSONL canonical still honors Range (round 6 Fix 1)', async () => {
+    const conv = chatgptWebConversation({ id: 'rawweb-1', title: 'T', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'rawweb marker alpha content' }] });
+    expect((await putText('webbox', 'chatgpt-web', 'rawweb-1.json', conv)).status).toBe(201);
+    await drainQueue();
+
+    // A Range on a web-capture (single-JSON) session must be IGNORED — otherwise the client gets an
+    // invalid JSON fragment mislabeled application/x-ndjson.
+    const web = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions/rawweb-1/raw', {
+      headers: { 'x-dev-machine': 'webbox', range: 'bytes=0-9' },
+    });
+    expect(web.status).toBe(200); // NOT 206
+    expect(web.headers.get('content-type')).toContain('application/json');
+    expect(web.headers.get('content-range')).toBeNull();
+    const text = await web.text();
+    expect((JSON.parse(text) as { conversation_id?: string }).conversation_id).toBe('rawweb-1'); // full valid JSON, not 10 bytes
+
+    // Control: a real JSONL canonical still honors Range (206 + content-range).
+    const sid = '77777777-2222-4333-8444-555555555555';
+    const jsonl = `${ccUserLine({ uuid: 'rr1', text: 'jsonl range control content here' })}\n`;
+    expect((await putText('webbox', 'claude-projects', `-home-tester-src-rawrange/${sid}.jsonl`, jsonl)).status).toBe(201);
+    await drainQueue();
+    const jl = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${sid}/raw`, {
+      headers: { 'x-dev-machine': 'webbox', range: 'bytes=0-9' },
+    });
+    expect(jl.status).toBe(206);
+    expect(jl.headers.get('content-range')).toBeTruthy();
+  });
+
+  it('a changed-hash archive re-upload flips its owned sessions to parsing before the reparse (round 6 Fix 5)', async () => {
+    const relpath = 'reparse-flip.zip';
+    const v1 = chatgptExportZip([{ id: 'flip-a', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'flipmarker v1' }] }]);
+    expect((await put('webbox', 'export-inbox', relpath, v1)).status).toBe(201);
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'flip-a'").first<{ index_state: string }>()).toMatchObject({ index_state: 'ready' });
+
+    // Re-upload with NEW bytes and DON'T drain: the upload handler must flip the archive's owned
+    // sessions to 'parsing' immediately (det.sessionId is undefined for an archive, so the
+    // single-session flip doesn't cover it), not leave them 'ready' over the now-overwritten ZIP.
+    const v2 = chatgptExportZip([{ id: 'flip-a', title: 'A2', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'flipmarker v2 changed' }] }]);
+    expect((await put('webbox', 'export-inbox', relpath, v2)).status).toBe(201);
+    expect(await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'flip-a'").first<{ index_state: string }>()).toMatchObject({ index_state: 'parsing' });
+
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'flip-a'").first<{ index_state: string }>()).toMatchObject({ index_state: 'ready' });
+  });
+
+  it('an archive whose R2 object is missing on reparse errors its owned sessions and kicks recovery (round 6 Fix 4)', async () => {
+    const ex1 = chatgptExportZip([{ id: 'r2m-x', title: 'x-from-1', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'r2mmarker x from one' }] }]);
+    const r1 = await put('webbox', 'export-inbox', 'r2m-ex1.zip', ex1);
+    const ex1Id = ((await r1.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    const ex2 = chatgptExportZip([
+      { id: 'r2m-x', title: 'x-from-2', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'r2mmarker x from two' }] },
+      { id: 'r2m-y', title: 'y-from-2', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'r2mmarker y only in two' }] },
+    ]);
+    const r2 = await put('webbox', 'export-inbox', 'r2m-ex2.zip', ex2);
+    const ex2Id = ((await r2.json()) as { file_id: number }).file_id;
+    const ex2Key = 'raw/webbox/export-inbox/r2m-ex2.zip';
+    await drainQueue();
+
+    // Delete ex2's raw object, then reparse it (a reindex). The generic catch can't flip archive
+    // sessions (files.session_id NULL); parseExportInto must error the owned sessions + kick recovery.
+    await testEnv.RAW.delete(ex2Key);
+    await deliverOne(ex2Id, ex2Key);
+    await drainAll();
+
+    // Y lived only in ex2 -> honestly 'error'. X still lives in ex1 -> recovered to 'ready' on ex1.
+    expect(await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'r2m-y'").first<{ index_state: string }>()).toMatchObject({ index_state: 'error' });
+    const afterX = await testEnv.DB.prepare(
+      `SELECT s.index_state, f.id AS canon FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = 'r2m-x'`,
+    ).first<{ index_state: string; canon: number }>();
+    expect(afterX?.index_state).toBe('ready');
+    expect(afterX?.canon).toBe(ex1Id);
   });
 
   it('an invalid replacement flips owned sessions to error and a sibling archive recovers the overlap (round 4 Fix 10)', async () => {

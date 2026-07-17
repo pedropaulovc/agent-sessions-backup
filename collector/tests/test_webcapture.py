@@ -317,6 +317,30 @@ def test_cmd_webcapture_cdp_error_one_product_still_runs_other(tmp_env):
         assert st.pending_event_count() >= 1  # the CdpError was buffered for the next heartbeat
 
 
+def test_chatgpt_restages_a_deleted_local_file_even_when_unchanged(tmp_path):
+    # Round 6 Fix 3: a conversation whose staged file was lost locally (deleted, or the staging root
+    # moved) is re-fetched even when its remote watermark is unchanged — otherwise it can never be
+    # uploaded until it changes remotely.
+    staging = tmp_path / "chatgpt-web"
+    with State(tmp_path / "state.db") as st:
+        res1 = capture_chatgpt(_chatgpt_transport(), st, staging, [])
+        assert res1.captured == 2 and (staging / "c1.json").exists()
+        (staging / "c1.json").unlink()  # local file lost; remote is UNCHANGED (same watermark)
+        res2 = capture_chatgpt(_chatgpt_transport(), st, staging, [])
+        assert res2.captured == 1  # only c1 re-fetched (c2 is still staged)
+        assert (staging / "c1.json").exists()
+
+
+def test_claude_restages_a_deleted_local_file_even_when_unchanged(tmp_path):
+    staging = tmp_path / "claude-web"
+    with State(tmp_path / "state.db") as st:
+        res1 = capture_claude(_claude_transport(), st, staging, [])
+        assert res1.captured == 1 and (staging / "k1.json").exists()
+        (staging / "k1.json").unlink()  # local file lost; remote UNCHANGED
+        res2 = capture_claude(_claude_transport(), st, staging, [])
+        assert res2.captured == 1 and (staging / "k1.json").exists()
+
+
 def test_claude_captures_all_chat_capable_orgs(tmp_path):
     # Round 5 Fix 1: a multi-workspace account must have EVERY chat-capable org captured, not just
     # the first. conv uuids are globally unique, so the per-conv watermark needs no org key.

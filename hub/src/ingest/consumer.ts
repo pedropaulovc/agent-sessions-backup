@@ -303,9 +303,45 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
  * captured content. A conversation captured LATER by CDP still wins automatically: its own file
  * (session_id set) becomes canonical and its writeSession overwrites the export-written row.
  */
+/**
+ * Fail an export file the preservation-first way: mark the file 'error' (hash-guarded), and if we
+ * still own the row, flip every session it is canonical for to index_state='error' (their raw ZIP
+ * can no longer reconstruct them — loadNormalized/raw return null), then kick the sibling-archive
+ * recovery so an overlapping export copy can re-claim any of them. Shared by the corrupt/invalid
+ * path and the missing-R2-object path; both leave archive rows (files.session_id NULL) that the
+ * generic consumer catch can't flip on its own.
+ */
+async function failExportFile(file: FileRow, env: Env, contentHash: string | undefined, reason: string): Promise<void> {
+  const { updated } = await markParsed(file.id, env, 'error', file.size, reason, contentHash);
+  // A fresher re-upload already owns this row (hash moved on) — its message handles the state.
+  if (!updated) return;
+  const owned = await env.DB.prepare('SELECT session_id FROM sessions WHERE canonical_file_id = ?1')
+    .bind(file.id)
+    .all<{ session_id: string }>();
+  for (const { session_id } of owned.results) {
+    await env.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(session_id).run();
+  }
+  if (owned.results.length > 0) {
+    const others = await env.DB.prepare(
+      `SELECT id, r2_key, content_hash FROM files WHERE machine_id = ?1 AND store = ?2 AND id != ?3 AND parse_state != 'error'`,
+    )
+      .bind(file.machine_id, file.store, file.id)
+      .all<{ id: number; r2_key: string; content_hash: string }>();
+    for (const other of others.results) await markPendingAndEnqueue(other, 'recover', env);
+  }
+  console.log(JSON.stringify({ event: 'parse.export.error', file_id: file.id, error: reason, owned_errored: owned.results.length }));
+}
+
 async function parseExportInto(file: FileRow, env: Env, contentHash?: string): Promise<void> {
   const obj = await env.RAW.get(file.r2_key);
-  if (!obj) throw new Error(`r2_object_missing:${file.r2_key}`);
+  if (!obj) {
+    // The raw ZIP is gone (e.g. a reindex after the R2 object was deleted). Do NOT throw into the
+    // generic consumer catch: it flips sessions by files.session_id, which is NULL for an archive
+    // row, so the sessions this ZIP is canonical for would keep a stale 'ready' state that
+    // loadNormalized()/raw can no longer reconstruct. Handle it like an invalid archive instead.
+    await failExportFile(file, env, contentHash, `r2_object_missing:${file.r2_key}`);
+    return;
+  }
   const archive = parseExportArchive(new Uint8Array(await obj.arrayBuffer()));
 
   // Stale-parse guard (mirrors the single-session path): a re-upload can change this row's
@@ -320,37 +356,11 @@ async function parseExportInto(file: FileRow, env: Env, contentHash?: string): P
   }
 
   // A corrupt / missing-conversations.json / non-array archive is NOT a well-formed export: keep
-  // whatever sessions this file already owns (preservation-first) but mark the file 'error' with
-  // the reason, so /status surfaces it instead of silently reporting the replacement as parsed.
-  // (An empty-but-valid array is `valid` and falls through to normal write + cleanup, clearing
-  // everything this file used to own.)
+  // whatever sessions this file owns (preservation-first) but error the file + its owned sessions,
+  // so /status surfaces it instead of silently reporting the replacement as parsed. (An empty-but-
+  // valid array is `valid` and falls through to normal write + cleanup, clearing what it owned.)
   if (!archive.valid) {
-    const { updated } = await markParsed(file.id, env, 'error', file.size, archive.error ?? 'invalid export archive', contentHash);
-    // A fresher re-upload already owns this row (hash moved on) — its message handles the state.
-    if (!updated) return;
-    // Preservation-first keeps the session ROWS this file owns (their blocks/usage may be the last
-    // surviving trace of the conversation), but the canonical R2 object can no longer reconstruct
-    // them — loadNormalized() over the corrupt ZIP now returns null. Flip those sessions to
-    // index_state='error' so search / sessions advertise honest state, not a 'ready' row whose raw
-    // is unreconstructable.
-    const owned = await env.DB.prepare('SELECT session_id FROM sessions WHERE canonical_file_id = ?1')
-      .bind(file.id)
-      .all<{ session_id: string }>();
-    for (const { session_id } of owned.results) {
-      await env.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(session_id).run();
-    }
-    // Kick the same sibling-archive recovery as the valid-drop path: another export file on this
-    // machine that still contains these conversations re-claims them (its writeSession makes itself
-    // canonical + index_state='ready'). A conversation with no other surviving copy stays 'error'.
-    if (owned.results.length > 0) {
-      const others = await env.DB.prepare(
-        `SELECT id, r2_key, content_hash FROM files WHERE machine_id = ?1 AND store = ?2 AND id != ?3 AND parse_state != 'error'`,
-      )
-        .bind(file.machine_id, file.store, file.id)
-        .all<{ id: number; r2_key: string; content_hash: string }>();
-      for (const other of others.results) await markPendingAndEnqueue(other, 'recover', env);
-    }
-    console.log(JSON.stringify({ event: 'parse.export.error', file_id: file.id, error: archive.error, owned_errored: owned.results.length }));
+    await failExportFile(file, env, contentHash, archive.error ?? 'invalid export archive');
     return;
   }
 

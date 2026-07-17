@@ -156,6 +156,15 @@ export async function putFile(
     await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1 AND canonical_file_id = ?2")
       .bind(det.sessionId, row!.id)
       .run();
+  } else if (det.kind === 'export-archive') {
+    // An export ZIP fans out to many per-conversation sessions and carries no det.sessionId, so the
+    // single-session flip above never runs. A changed-hash re-upload already overwrote the ZIP; flip
+    // every session this archive is canonical for to 'parsing' so /search and /sessions stop
+    // advertising the OLD bytes' blocks as 'ready' until the reparse lands (or, if the message is
+    // dropped, the sessions are visibly stuck 'parsing' — alertable — instead of silently stale).
+    await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE canonical_file_id = ?1")
+      .bind(row!.id)
+      .run();
   }
   await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
 
