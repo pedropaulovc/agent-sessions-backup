@@ -328,8 +328,10 @@ def cmd_doctor(args) -> int:
         return 1
 
     try:
+        # Opening State runs the schema DDL and commits, which proves writability
+        # without polluting the runs table that `status` reports as the last run.
         with State() as st:
-            st.start_run("doctor")
+            st.pending_event_count()
         print(f"[ok]   state DB writable: {state_path()}")
     except Exception as e:  # noqa: BLE001
         print(f"[FAIL] state DB: {e}")
