@@ -5,11 +5,18 @@
   "compatibility_date": "2026-07-01",
   "compatibility_flags": ["nodejs_compat"],
   "limits": { "cpu_ms": 300000 },
-  // Zone routes activated in M3 once the vza.net zone is verified:
-  // "routes": [
-  //   { "pattern": "api.sessions.vza.net/*", "zone_name": "vza.net" },
-  //   { "pattern": "sessions.vza.net/*", "zone_name": "vza.net" }
-  // ],
+  // Routes activated in M3. Implemented as Workers Custom Domains (not zone
+  // `routes` with `zone_name`) because the deploy credential is an OAuth token
+  // without a dns_records scope: custom domains are provisioned through the
+  // Workers API (Cloudflare manages the proxied DNS record + edge cert itself),
+  // whereas a zone route requires a pre-existing proxied DNS record we cannot
+  // create with this token. Both hostnames stay fully proxied on the vza.net
+  // zone, so API Shield mTLS + the WAF cert-verified rule apply identically.
+  "routes": [
+    { "pattern": "api.sessions.vza.net", "custom_domain": true },
+    { "pattern": "sessions.vza.net", "custom_domain": true }
+  ],
+  "account_id": "18ef3246e9f36d1560485ef53889c0ab",
   // Fail-closed default: an un-configured `wrangler deploy` (no env override) must NOT
   // accept the x-dev-machine dev-auth header (see src/auth/identity.ts). Local development
   // overrides this via `npm run dev` (--var ENVIRONMENT:development); vitest overrides it
@@ -23,12 +30,12 @@
     {
       "binding": "DB",
       "database_name": "sessions-index",
-      "database_id": "placeholder-until-m3",
+      "database_id": "5ff65cf3-89c8-4fe6-a3c2-a370293ecea6",
       "migrations_dir": "migrations"
     }
   ],
   "r2_buckets": [{ "binding": "RAW", "bucket_name": "agent-sessions-raw" }],
-  "kv_namespaces": [{ "binding": "KV", "id": "placeholder-until-m3" }],
+  "kv_namespaces": [{ "binding": "KV", "id": "61505c2df55242daa2f572c188819961" }],
   "queues": {
     "producers": [{ "binding": "PARSE_QUEUE", "queue": "parse" }],
     "consumers": [
