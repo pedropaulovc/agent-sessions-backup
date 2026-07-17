@@ -1,3 +1,4 @@
+import { consumeParseBatch } from './ingest/consumer';
 import { route } from './router';
 
 export default {
@@ -5,12 +6,8 @@ export default {
     return route(request, env, ctx);
   },
 
-  async queue(batch: MessageBatch<ParseMessage>, _env: Env): Promise<void> {
-    // M1: parse consumer. Until then, fail loudly so nothing lands in DLQ silently.
-    for (const msg of batch.messages) {
-      console.log(JSON.stringify({ event: 'parse.skipped', file_id: msg.body.file_id }));
-      msg.ack();
-    }
+  async queue(batch: MessageBatch<ParseMessage>, env: Env): Promise<void> {
+    await consumeParseBatch(batch, env);
   },
 
   async scheduled(_controller: ScheduledController, _env: Env, _ctx: ExecutionContext): Promise<void> {

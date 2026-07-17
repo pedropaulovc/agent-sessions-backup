@@ -9,8 +9,8 @@ describe('scaffold', () => {
     expect(body.ok).toBe(true);
   });
 
-  it('501s unimplemented API routes', async () => {
+  it('401s unauthenticated API requests', async () => {
     const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=x');
-    expect(res.status).toBe(501);
+    expect(res.status).toBe(401);
   });
 });
