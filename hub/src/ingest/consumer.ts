@@ -325,8 +325,32 @@ async function parseExportInto(file: FileRow, env: Env, contentHash?: string): P
   // (An empty-but-valid array is `valid` and falls through to normal write + cleanup, clearing
   // everything this file used to own.)
   if (!archive.valid) {
-    await markParsed(file.id, env, 'error', file.size, archive.error ?? 'invalid export archive', contentHash);
-    console.log(JSON.stringify({ event: 'parse.export.error', file_id: file.id, error: archive.error }));
+    const { updated } = await markParsed(file.id, env, 'error', file.size, archive.error ?? 'invalid export archive', contentHash);
+    // A fresher re-upload already owns this row (hash moved on) — its message handles the state.
+    if (!updated) return;
+    // Preservation-first keeps the session ROWS this file owns (their blocks/usage may be the last
+    // surviving trace of the conversation), but the canonical R2 object can no longer reconstruct
+    // them — loadNormalized() over the corrupt ZIP now returns null. Flip those sessions to
+    // index_state='error' so search / sessions advertise honest state, not a 'ready' row whose raw
+    // is unreconstructable.
+    const owned = await env.DB.prepare('SELECT session_id FROM sessions WHERE canonical_file_id = ?1')
+      .bind(file.id)
+      .all<{ session_id: string }>();
+    for (const { session_id } of owned.results) {
+      await env.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(session_id).run();
+    }
+    // Kick the same sibling-archive recovery as the valid-drop path: another export file on this
+    // machine that still contains these conversations re-claims them (its writeSession makes itself
+    // canonical + index_state='ready'). A conversation with no other surviving copy stays 'error'.
+    if (owned.results.length > 0) {
+      const others = await env.DB.prepare(
+        `SELECT id, r2_key, content_hash FROM files WHERE machine_id = ?1 AND store = ?2 AND id != ?3 AND parse_state != 'error'`,
+      )
+        .bind(file.machine_id, file.store, file.id)
+        .all<{ id: number; r2_key: string; content_hash: string }>();
+      for (const other of others.results) await markPendingAndEnqueue(other, 'recover', env);
+    }
+    console.log(JSON.stringify({ event: 'parse.export.error', file_id: file.id, error: archive.error, owned_errored: owned.results.length }));
     return;
   }
 

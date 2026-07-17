@@ -509,6 +509,38 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     expect(fileRow?.parse_error).toBeTruthy();
     expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'corrupt-keep'").first<{ n: number }>()).toMatchObject({ n: 1 });
   });
+
+  it('an invalid replacement flips owned sessions to error and a sibling archive recovers the overlap (round 4 Fix 10)', async () => {
+    // ex1 has X; ex2 has X and Y. ex2 becomes canonical for both.
+    const ex1 = chatgptExportZip([{ id: 'inv-x', title: 'x-from-1', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'invmarker x from one' }] }]);
+    const r1 = await put('webbox', 'export-inbox', 'inv-ex1.zip', ex1);
+    const ex1Id = ((await r1.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    const ex2 = chatgptExportZip([
+      { id: 'inv-x', title: 'x-from-2', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'invmarker x from two' }] },
+      { id: 'inv-y', title: 'y-from-2', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'invmarker y only in two' }] },
+    ]);
+    expect((await put('webbox', 'export-inbox', 'inv-ex2.zip', ex2)).status).toBe(201);
+    await drainQueue();
+    const beforeX = await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'inv-x'").first<{ index_state: string }>();
+    expect(beforeX?.index_state).toBe('ready');
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'inv-y'").first<{ n: number }>()).toMatchObject({ n: 1 });
+
+    // Replace ex2 with unreadable bytes: preservation keeps the rows, but they can no longer be
+    // reconstructed, so both owned sessions flip to 'error' and the sibling recovery is kicked.
+    expect((await put('webbox', 'export-inbox', 'inv-ex2.zip', new Uint8Array([0x50, 0x4b, 3, 4, 1, 2, 3, 4]))).status).toBe(201);
+    await drainAll();
+
+    // Y lived only in ex2 -> stays 'error' (honest: its only raw copy is corrupt, not a 'ready' lie).
+    expect(await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'inv-y'").first<{ index_state: string }>()).toMatchObject({ index_state: 'error' });
+    // X still lives in ex1 -> recovered to 'ready', canonical back to the older archive.
+    const afterX = await testEnv.DB.prepare(
+      `SELECT s.index_state, f.id AS canon FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = 'inv-x'`,
+    ).first<{ index_state: string; canon: number }>();
+    expect(afterX?.index_state).toBe('ready');
+    expect(afterX?.canon).toBe(ex1Id);
+  });
 });
 
 describe('prompt-log file rows upgrade a legacy NULL session_id on re-upload (round 3 Fix 2)', () => {

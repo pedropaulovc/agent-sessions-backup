@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import sys
-from pathlib import Path
 from typing import Callable
 
 from .. import config as config_mod
@@ -39,9 +38,13 @@ def cmd_webcapture(args, transport_factory: TransportFactory | None = None) -> i
         def transport_factory(origin: str) -> CdpTransport:  # noqa: E306
             return ChromeCdpTransport(origin, host=host, port=port)
 
-    # Register + create the staging stores so the next `run` uploads whatever we write.
+    # Register the staging stores so the next `run` uploads whatever we write, then resolve the
+    # capture roots from cfg.store_roots() — the SAME source `run`/the scanner use. Building each
+    # root from a freshly recomputed webcapture_dir() would diverge from a custom configured root
+    # (or an XDG_DATA_HOME change made after the stores were first persisted), so captures would
+    # land where the scanner never looks and never upload.
     config_mod.ensure_webcapture_stores(cfg, cfg.source)
-    base = config_mod.webcapture_dir()
+    store_roots = cfg.store_roots()
 
     lock = OverlapLock()
     if not lock.acquire():
@@ -49,7 +52,7 @@ def cmd_webcapture(args, transport_factory: TransportFactory | None = None) -> i
         return 0
     try:
         with State() as st:
-            results, events = _run_products(cfg, st, products, base, transport_factory)
+            results, events = _run_products(cfg, st, products, store_roots, transport_factory)
             if events:
                 st.buffer_events(events)  # login-expiry / fetch failures ride the next heartbeat
     finally:
@@ -62,7 +65,7 @@ def cmd_webcapture(args, transport_factory: TransportFactory | None = None) -> i
     return 1 if any_login_expired else 0
 
 
-def _run_products(cfg, st: State, products: list[str], base: Path, transport_factory: TransportFactory):
+def _run_products(cfg, st: State, products: list[str], store_roots: dict, transport_factory: TransportFactory):
     results: list[CaptureResult] = []
     events: list[dict] = []
     for product in products:
@@ -71,7 +74,7 @@ def _run_products(cfg, st: State, products: list[str], base: Path, transport_fac
             print(f"unknown product {product!r} (expected chatgpt|claude)", file=sys.stderr)
             continue
         origin, store, capture = spec
-        staging_root = base / store
+        staging_root = store_roots[store]
         transport = transport_factory(origin)
         try:
             results.append(capture(transport, st, staging_root, events))
@@ -82,6 +85,17 @@ def _run_products(cfg, st: State, products: list[str], base: Path, transport_fac
             events.append({
                 "level": "error", "code": "webcapture_cdp_error",
                 "message": f"{product}: {e}"[:500], "count": 1, "store": store,
+            })
+            results.append(CaptureResult(product=product, logged_in=False, errors=1))
+        except OSError as e:
+            # A full/unwritable staging disk makes mkdir()/write_text() raise OSError, which is NOT a
+            # CdpError — without this it would abort the whole command before the OTHER product runs
+            # and before any heartbeat event is buffered. Record it like a CDP failure so scheduled
+            # captures never fail silently, and keep going.
+            print(f"[FAIL] {product} webcapture staging I/O: {e}", file=sys.stderr)
+            events.append({
+                "level": "error", "code": "webcapture_io_error",
+                "message": f"{product}: staging write failed: {e}"[:500], "count": 1, "store": store,
             })
             results.append(CaptureResult(product=product, logged_in=False, errors=1))
         finally:

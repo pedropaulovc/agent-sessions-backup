@@ -422,12 +422,74 @@ def test_state_watermark_roundtrip_and_upsert(tmp_path):
         assert st.get_webcapture_watermark("claude", "c1") is None
 
 
+def test_webcapture_writes_to_configured_store_root_not_default(tmp_env):
+    # Round 4 Fix 8: a custom configured chatgpt-web root must receive the staged capture (so the
+    # subsequent `run`, which scans cfg.store_roots(), uploads it) — not a recomputed default base.
+    path = config.config_path()
+    config.enroll("http://localhost:8787", dev=True, path=path, machine_id="webhost")
+    custom = tmp_env / "custom-cgpt-root"
+    cfg = config.load(path)
+    cfg.stores["chatgpt-web"] = str(custom)
+    config.save(cfg, path)
+
+    def factory(origin):
+        return _chatgpt_transport() if origin == PRODUCTS["chatgpt"][0] else _claude_transport()
+
+    rc = cmd_webcapture(types.SimpleNamespace(config=str(path), product="chatgpt", host="127.0.0.1", port=9222), transport_factory=factory)
+    assert rc == 0
+    assert (custom / "c1.json").exists()  # written under the configured root
+    assert not (config.webcapture_dir() / "chatgpt-web" / "c1.json").exists()  # NOT the recomputed default
+
+
+def test_webcapture_staging_io_error_is_buffered_and_other_product_runs(tmp_env):
+    # Round 4 Fix 9: an unwritable chatgpt-web staging root (OSError on mkdir) buffers an event and
+    # does NOT abort the Claude capture.
+    path = config.config_path()
+    config.enroll("http://localhost:8787", dev=True, path=path, machine_id="webhost")
+    # Point chatgpt-web at a path UNDER a regular file so mkdir(parents=True) raises NotADirectoryError.
+    blocker = tmp_env / "blocker-file"
+    blocker.write_text("i am a file, not a dir")
+    cfg = config.load(path)
+    cfg.stores["chatgpt-web"] = str(blocker / "sub" / "chatgpt-web")
+    config.save(cfg, path)
+
+    def factory(origin):
+        return _chatgpt_transport() if origin == PRODUCTS["chatgpt"][0] else _claude_transport()
+
+    rc = cmd_webcapture(types.SimpleNamespace(config=str(path), product=None, host="127.0.0.1", port=9222), transport_factory=factory)
+    assert rc == 1  # the staging I/O failure is surfaced as a real error for the hand-run...
+    assert (config.webcapture_dir() / "claude-web" / "k1.json").exists()  # ...but Claude still captured
+    with State() as st:
+        assert st.pending_event_count() >= 1  # the I/O failure was buffered for the next heartbeat
+
+
+def test_enroll_registers_export_inbox_store_dev_and_mtls(tmp_path):
+    # Round 4 Fix 11: export-inbox is registered on enroll (dev AND mTLS) so an export-only operator
+    # gets it scanned without ever running webcapture; the web-capture stores stay webcapture-only.
+    dev_path = tmp_path / "dev.toml"
+    config.enroll("http://h", dev=True, path=dev_path, machine_id="m")
+    dev_cfg = config.load(dev_path)
+    assert "export-inbox" in dev_cfg.store_roots()
+    assert "chatgpt-web" not in dev_cfg.stores and "claude-web" not in dev_cfg.stores
+
+    mtls_path = tmp_path / "mtls.toml"
+    cert = tmp_path / "c.pem"
+    cert.write_text("x")
+    key = tmp_path / "k.pem"
+    key.write_text("x")
+    config.enroll("http://h", dev=False, path=mtls_path, machine_id="m", client_cert_path=str(cert), client_key_path=str(key))
+    mtls_cfg = config.load(mtls_path)
+    assert "export-inbox" in mtls_cfg.store_roots()
+
+
 def test_ensure_webcapture_stores_is_idempotent_and_preserves_existing(tmp_path):
     path = tmp_path / "config.toml"
     config.enroll("http://h", dev=True, path=path, machine_id="m")
     cfg = config.load(path)
     added = config.ensure_webcapture_stores(cfg, path)
-    assert set(added) == set(config.WEBCAPTURE_STORES)
+    # export-inbox is already registered by enroll (Fix 11), so ensure_webcapture_stores newly adds
+    # only the two web-capture stores; the full set is still present afterwards (asserted below).
+    assert set(added) == {"chatgpt-web", "claude-web"}
     # Persisted, and the original stores survive.
     reloaded = config.load(path)
     assert reloaded.stores["claude"] == "~/.claude"

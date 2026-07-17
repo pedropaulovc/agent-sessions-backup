@@ -53,6 +53,11 @@ DEFAULT_STORES: dict[str, str] = {
 # them with zero special-casing; other machines never have them, so nothing else changes.
 WEBCAPTURE_STORES = ("chatgpt-web", "claude-web", "export-inbox")
 
+# The export-inbox staging store is registered on EVERY enroll (see _ensure_export_inbox), not just
+# webcapture hosts: an operator can drop an official export ZIP into it and have `run`/`backfill`
+# upload it without ever running CDP capture. The web-capture stores stay webcapture-only.
+EXPORT_INBOX_STORE = "export-inbox"
+
 VALID_AUTH = ("dev", "mtls")
 
 
@@ -268,6 +273,9 @@ def enroll(
         exclude=list(existing.exclude) if existing is not None else [],
         include_windows_mounts=existing.include_windows_mounts if existing is not None else False,
     )
+    # Register the export-inbox store so an export-only operator (drops a ZIP, runs `run`/`backfill`,
+    # never CDP) still gets it scanned + uploaded. setdefault preserves a custom configured root.
+    carried["stores"].setdefault(EXPORT_INBOX_STORE, str(webcapture_dir() / EXPORT_INBOX_STORE))
     if dev:
         cfg = Config(machine_id=resolved_id, hub_url=hub_url.rstrip("/"), auth="dev", **carried)
     else:

@@ -35,7 +35,9 @@ def test_enroll_and_load_roundtrip(tmp_path):
     loaded = config.load(path)
     assert loaded.machine_id == "m1"
     assert loaded.auth == "dev"
-    assert loaded.stores == config.DEFAULT_STORES
+    # enroll registers the export-inbox store (Fix 11); the DEFAULT_STORES are otherwise intact.
+    assert {k: loaded.stores[k] for k in config.DEFAULT_STORES} == config.DEFAULT_STORES
+    assert "export-inbox" in loaded.stores
     # Security defaults always apply even though the file lists no excludes.
     assert ".credentials.json" in loaded.effective_excludes()
 
@@ -103,7 +105,9 @@ def test_enroll_mtls_preserves_custom_stores_and_excludes(tmp_path):
     loaded = config.load(path)
     assert loaded.auth == "mtls"
     assert loaded.machine_id == "box"
-    assert loaded.stores == {"claude": "~/.claude", "mystore": "~/custom"}
+    assert loaded.stores["claude"] == "~/.claude"
+    assert loaded.stores["mystore"] == "~/custom"
+    assert "export-inbox" in loaded.stores  # registered on enroll (Fix 11), custom roots preserved
     assert loaded.exclude == ["*.secret"]
     assert loaded.include_windows_mounts is True
 
