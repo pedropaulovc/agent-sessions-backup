@@ -11,7 +11,13 @@
 // signal, e.g. a scheduled query against D1 via a small status-reporting
 // endpoint rather than Log Analytics).
 
-OTelLogs
+// `otel` wraps OTelLogs in `union isfuzzy=true` so a missing table (before the
+// first OTLP log lands) degrades to empty instead of erroring the whole rule —
+// see missed-heartbeat.kql's "Missing-table guard" note for the full rationale.
+let otel = union isfuzzy=true
+    (datatable(TimeGenerated:datetime, Body:string)[]),
+    (OTelLogs | project TimeGenerated, Body);
+otel
 | where TimeGenerated > ago(15m)
 | extend body = todynamic(Body)
 | where body.event == "parse.error"

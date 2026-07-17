@@ -44,8 +44,23 @@
 // pipeline_silent row does fire until the account-level observability
 // destinations are wired and sessions-hub is redeployed to export (see
 // infra/cf/telemetry.md) — correct, telemetry genuinely isn't flowing until then.
+//
+// Missing-table guard (`otel`): the OTelLogs table doesn't exist until the FIRST
+// OTLP log lands. A bare `OTelLogs` reference then fails to RESOLVE at evaluation
+// time (a SemanticError, distinct from returning zero rows) — and a rule whose
+// query errors never fires, so the pipeline_silent dead-man would be blind during
+// exactly the bootstrap / total-export-outage window it exists for
+// (skip-query-validation only lets the rule be created, not evaluated). Wrapping
+// the table in `union isfuzzy=true (empty datatable), (OTelLogs | ...)` degrades
+// a missing table to the empty datatable instead of erroring, so every leg still
+// evaluates and pipeline_silent still synthesizes its row. Verified live: the
+// isfuzzy union returns identical results against the real table and returns the
+// datatable side (no error) when the unioned table name doesn't exist.
 
-let stale_machines = OTelLogs
+let otel = union isfuzzy=true
+    (datatable(TimeGenerated:datetime, Body:string)[]),
+    (OTelLogs | project TimeGenerated, Body);
+let stale_machines = otel
     | where TimeGenerated > ago(30m)
     | extend body = todynamic(Body)
     | where body.event == "hub.machine.heartbeat_age"
@@ -53,14 +68,14 @@ let stale_machines = OTelLogs
     | summarize arg_max(TimeGenerated, age_seconds) by machine
     | where age_seconds > 72 * 3600
     | project machine, age_seconds;
-let pipeline_silent = OTelLogs
+let pipeline_silent = otel
     | where TimeGenerated > ago(30m)
     | extend body = todynamic(Body)
     | where body.event == "hub.watchdog.run"
     | summarize n = count()
     | where n == 0
     | project machine = "__pipeline_silent__", age_seconds = tolong(-1);
-let roster_unavailable = OTelLogs
+let roster_unavailable = otel
     | where TimeGenerated > ago(30m)
     | extend body = todynamic(Body)
     | where body.event == "hub.watchdog.run"

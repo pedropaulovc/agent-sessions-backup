@@ -22,7 +22,13 @@
 // No pipeline-silent sentinel is needed here: total telemetry silence is already
 // covered by missed-heartbeat.kql's __pipeline_silent__ row.
 
-OTelLogs
+// `otel` wraps OTelLogs in `union isfuzzy=true` so a missing table (before the
+// first OTLP log lands) degrades to empty instead of erroring the whole rule —
+// see missed-heartbeat.kql's "Missing-table guard" note for the full rationale.
+let otel = union isfuzzy=true
+    (datatable(TimeGenerated:datetime, Body:string)[]),
+    (OTelLogs | project TimeGenerated, Body);
+otel
 | where TimeGenerated > ago(1h)
 | extend body = todynamic(Body)
 | where body.event == "hub.d1.db_size_bytes"

@@ -24,7 +24,13 @@
 // table/column names once real data flows, and confirm `level` (not `severity`
 // or the OTLP-native SeverityText column) is the field the JSON payload uses.
 
-OTelLogs
+// `otel` wraps OTelLogs in `union isfuzzy=true` so a missing table (before the
+// first OTLP log lands) degrades to empty instead of erroring the whole rule —
+// see missed-heartbeat.kql's "Missing-table guard" note for the full rationale.
+let otel = union isfuzzy=true
+    (datatable(TimeGenerated:datetime, Body:string)[]),
+    (OTelLogs | project TimeGenerated, Body);
+otel
 | where TimeGenerated > ago(1h)
 | extend body = todynamic(Body)
 | where body.event == "collector.event" and body.level == "error"
