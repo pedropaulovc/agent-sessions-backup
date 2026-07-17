@@ -82,14 +82,16 @@ def _parse_list(body: str):
 
 
 def _valid_conversation(body: str) -> bool:
-    """True only for a JSON object shaped like a claude.ai conversation (chat_messages / uuid)."""
+    """True only for a conversation carrying the message tree. `chat_messages` must be a list (an
+    empty list is a legitimately empty conversation; a uuid-only metadata body — missing the key —
+    is not, and must not be staged + watermarked as if captured)."""
     if not body:
         return False
     try:
         data = json.loads(body)
     except json.JSONDecodeError:
         return False
-    return isinstance(data, dict) and ("chat_messages" in data or "uuid" in data)
+    return isinstance(data, dict) and isinstance(data.get("chat_messages"), list)
 
 
 def _resolve_org(transport: CdpTransport) -> str | None:

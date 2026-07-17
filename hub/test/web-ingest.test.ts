@@ -43,6 +43,28 @@ async function drainQueue(): Promise<void> {
   await worker.queue({ queue: 'parse', messages, ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>, testEnv);
 }
 
+/** Drain repeatedly until nothing is pending — a recover enqueue flips a sibling file back to pending. */
+async function drainAll(): Promise<void> {
+  for (let i = 0; i < 10; i++) {
+    const n = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM files WHERE parse_state = 'pending'").first<{ n: number }>();
+    if ((n?.n ?? 0) === 0) return;
+    await drainQueue();
+  }
+}
+
+/** Deliver one explicit message (optionally with a specific content_hash to simulate a stale delivery). */
+async function deliverOne(fileId: number, r2Key: string, contentHash?: string): Promise<void> {
+  const message = {
+    id: String(fileId),
+    timestamp: new Date(),
+    attempts: 1,
+    body: { file_id: fileId, r2_key: r2Key, reason: 'upload' as const, ...(contentHash !== undefined ? { content_hash: contentHash } : {}) },
+    ack() {},
+    retry() {},
+  };
+  await worker.queue({ queue: 'parse', messages: [message], ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>, testEnv);
+}
+
 describe('chatgpt-web ingest end-to-end', () => {
   const CONV_ID = 'cgpt-ingest-1';
   beforeAll(async () => {
@@ -214,5 +236,77 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     const ids = ((await search.json()) as { hits: Array<{ session_id: string }> }).hits.map((h) => h.session_id);
     expect(ids).toContain('stale-a');
     expect(ids).not.toContain('stale-b');
+  });
+
+  it('clears a conversation that is still present but now parses to zero turns (round 2 Fix 1)', async () => {
+    const relpath = 'chatgpt-export-empty.zip';
+    const both = chatgptExportZip([
+      { id: 'zt-a', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'zeroturn-marker alpha kept' }] },
+      { id: 'zt-b', title: 'B', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'zeroturn-marker beta present' }] },
+    ]);
+    expect((await put('webbox', 'export-inbox', relpath, both)).status).toBe(201);
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'zt-b'").first<{ n: number }>()).toMatchObject({ n: 1 });
+
+    // Re-upload: B is still present in the archive but its conversation now has no turns.
+    const emptied = chatgptExportZip([
+      { id: 'zt-a', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'zeroturn-marker alpha kept' }] },
+      { id: 'zt-b', title: 'B', turns: [] },
+    ]);
+    expect((await put('webbox', 'export-inbox', relpath, emptied)).status).toBe(201);
+    await drainQueue();
+
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'zt-b'").first<{ n: number }>()).toMatchObject({ n: 0 });
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM blocks WHERE session_id = 'zt-b'").first<{ n: number }>()).toMatchObject({ n: 0 });
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'zt-a'").first<{ n: number }>()).toMatchObject({ n: 1 });
+  });
+
+  it('a stale export message (hash moved on) does not publish the old archive sessions (round 2 Fix 2)', async () => {
+    const relpath = 'chatgpt-export-race.zip';
+    const v1 = chatgptExportZip([{ id: 'race-conv', title: 'export-v1', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'race version one' }] }]);
+    const r1 = await put('webbox', 'export-inbox', relpath, v1);
+    const fileId = ((await r1.json()) as { file_id: number }).file_id;
+    const r2Key = 'raw/webbox/export-inbox/chatgpt-export-race.zip';
+    const v1Hash = await sha256Hex(v1);
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT title FROM sessions WHERE session_id = 'race-conv'").first<{ title: string }>()).toMatchObject({ title: 'export-v1' });
+
+    // Re-upload v2 (same path, new bytes) so the row's content_hash moves on; leave it pending.
+    const v2 = chatgptExportZip([{ id: 'race-conv', title: 'export-v2', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'race version two' }] }]);
+    expect((await put('webbox', 'export-inbox', relpath, v2)).status).toBe(201);
+
+    // A STALE message carrying v1's hash reaches the consumer after the re-upload: it must recheck
+    // the row hash, see it moved on, and NOT re-publish v1's content.
+    await deliverOne(fileId, r2Key, v1Hash);
+    expect(await testEnv.DB.prepare("SELECT parse_state FROM files WHERE id = ?1").bind(fileId).first<{ parse_state: string }>()).toMatchObject({ parse_state: 'pending' });
+
+    // The fresh message parses v2 normally.
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT title FROM sessions WHERE session_id = 'race-conv'").first<{ title: string }>()).toMatchObject({ title: 'export-v2' });
+  });
+
+  it('recovers a conversation from an older overlapping archive when the newer one drops it (round 2 Fix 3)', async () => {
+    const first = chatgptExportZip([{ id: 'ovl-conv', title: 'from-ex1', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'overlap-marker from archive one' }] }]);
+    const r1 = await put('webbox', 'export-inbox', 'export-ovl-1.zip', first);
+    const ex1Id = ((await r1.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    // A later archive also contains the conversation and takes ownership of the single session row.
+    const second = chatgptExportZip([{ id: 'ovl-conv', title: 'from-ex2', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'overlap-marker from archive two' }] }]);
+    expect((await put('webbox', 'export-inbox', 'export-ovl-2.zip', second)).status).toBe(201);
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT title FROM sessions WHERE session_id = 'ovl-conv'").first<{ title: string }>()).toMatchObject({ title: 'from-ex2' });
+
+    // Re-upload the later archive WITHOUT the conversation. It's deleted, but ex1 still has it —
+    // the recover fan-out re-enqueues ex1, whose reparse re-claims the conversation.
+    const secondEmpty = chatgptExportZip([{ id: 'ovl-other', title: 'unrelated', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'unrelated conversation content' }] }]);
+    expect((await put('webbox', 'export-inbox', 'export-ovl-2.zip', secondEmpty)).status).toBe(201);
+    await drainAll();
+
+    const row = await testEnv.DB.prepare(
+      `SELECT s.title, f.id AS canon FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = 'ovl-conv'`,
+    ).first<{ title: string; canon: number }>();
+    expect(row?.canon).toBe(ex1Id); // recovered, now owned by the older archive
+    expect(row?.title).toBe('from-ex1');
   });
 });

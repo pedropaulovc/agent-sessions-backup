@@ -88,11 +88,22 @@ def _list_changed(transport: CdpTransport, state, res: CaptureResult, events: li
                 "message": f"chatgpt conversation list HTTP {status} at offset {offset}", "count": 1, "store": "chatgpt-web",
             })
             break
-        items = data.get("items") or []
+        items = data.get("items")
+        if not isinstance(items, list):
+            # 200 with a non-array `items` (interstitial wrapper / layout drift): a capture error,
+            # not a `.get` on a non-dict that raises out of the whole command.
+            res.errors += 1
+            events.append({
+                "level": "warn", "code": "webcapture_list_failed",
+                "message": f"chatgpt conversation list has non-array items at offset {offset}", "count": 1, "store": "chatgpt-web",
+            })
+            break
         for it in items:
+            if not isinstance(it, dict):
+                continue
             conv_id = it.get("id")
             update_time = it.get("update_time")
-            if not conv_id or not update_time:
+            if not isinstance(conv_id, str) or not update_time:
                 continue
             res.checked += 1
             prev = state.get_webcapture_watermark("chatgpt", conv_id)

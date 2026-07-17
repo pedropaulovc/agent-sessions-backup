@@ -197,6 +197,40 @@ def test_claude_list_and_conversation_html_are_errors(tmp_path):
     assert any(e["code"] == "webcapture_fetch_failed" for e in events2)
 
 
+def test_chatgpt_list_non_array_items_is_an_error_not_a_crash(tmp_path):
+    # Round 2 Fix 4: a 200 JSON object whose `items` isn't an array must not `.get` on a non-dict.
+    transport = FakeCdpTransport({
+        f"{CGPT}/api/auth/session": (200, json.dumps({"user": {"id": "u"}})),
+        f"{CGPT}/backend-api/conversations": (200, json.dumps({"items": "nope", "total": 0})),
+    })
+    events: list[dict] = []
+    with State(tmp_path / "state.db") as st:
+        res = capture_chatgpt(transport, st, tmp_path / "chatgpt-web", events)
+    assert res.errors == 1 and res.captured == 0
+    assert any(e["code"] == "webcapture_list_failed" for e in events)
+
+
+def test_claude_uuid_only_body_is_not_captured(tmp_path):
+    # Round 2 Fix 5: a 200 body with metadata but no chat_messages list must not stage/watermark.
+    transport = FakeCdpTransport({
+        f"{CLAUDE}/api/organizations": (200, json.dumps([{"uuid": "org1", "capabilities": ["chat"]}])),
+        f"{CLAUDE}/api/organizations/org1/chat_conversations": (200, json.dumps([{"uuid": "k1", "updated_at": "t"}])),
+        f"{CLAUDE}/api/organizations/org1/chat_conversations/k1?tree=True&rendering_mode=raw": (200, json.dumps({"uuid": "k1"})),
+    })
+    events: list[dict] = []
+    staging = tmp_path / "claude-web"
+    with State(tmp_path / "state.db") as st:
+        res = capture_claude(transport, st, staging, events)
+        assert res.captured == 0 and res.errors == 1
+        assert not (staging / "k1.json").exists()
+        assert st.get_webcapture_watermark("claude", "k1") is None
+    assert any(e["code"] == "webcapture_fetch_failed" for e in events)
+    # An empty chat_messages list, by contrast, is a legitimately empty conversation -> captured.
+    from agent_collector.webcapture.claude import _valid_conversation
+    assert _valid_conversation(json.dumps({"uuid": "k1", "chat_messages": []})) is True
+    assert _valid_conversation(json.dumps({"uuid": "k1"})) is False
+
+
 def test_cmd_webcapture_list_failure_still_runs_other_product_and_buffers_event(tmp_env):
     # Fix 4 at the command level: a malformed ChatGPT list must not abort the Claude capture.
     path = config.config_path()
