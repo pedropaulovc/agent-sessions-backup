@@ -45,8 +45,22 @@ export async function putFile(
     // indexing (a dropped/failed queue message), the file would otherwise sit
     // unindexed forever while files/check reports it as present. Re-enqueue.
     if (!TERMINAL_PARSE_STATES.has(existing.parse_state)) {
+      // A non-terminal state (most commonly 'error') can mean the row's own raw R2 object is
+      // missing or corrupt — e.g. the flagship r2_object_missing parse failure. Just requeuing
+      // would retry against the same absent object and fail again, even though the collector
+      // just handed us a full copy of the bytes. Confined to this rare recovery branch (one
+      // extra R2 head call) so the common unchanged/terminal path stays a single D1 read.
+      let restored = false;
+      if (!(await env.RAW.head(existing.r2_key))) {
+        try {
+          await env.RAW.put(existing.r2_key, request.body, { sha256 });
+        } catch (e) {
+          return Response.json({ error: 'checksum_or_write_failure', detail: String(e) }, { status: 400 });
+        }
+        restored = true;
+      }
       await env.PARSE_QUEUE.send({ file_id: existing.id, r2_key: existing.r2_key, reason: 'upload', content_hash: existing.content_hash });
-      return Response.json({ status: 'unchanged', file_id: existing.id, requeued: true });
+      return Response.json({ status: 'unchanged', file_id: existing.id, requeued: true, restored });
     }
     return Response.json({ status: 'unchanged', file_id: existing.id });
   }

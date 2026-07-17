@@ -225,6 +225,57 @@ describe('upload unchanged fast-path re-enqueues stuck files', () => {
     expect(body.status).toBe('unchanged');
     expect(body.requeued).toBeUndefined();
   });
+
+  it('re-upload of a hash-matching row errored because its R2 object was lost restores the object before requeueing, and the session recovers', async () => {
+    const RESTORE_SESSION_ID = '44444444-5555-4444-8444-666666666666';
+    const restoreRelpath = `restore-demo/${RESTORE_SESSION_ID}.jsonl`;
+    const restoreContent = `${ccUserLine({ uuid: 'r-u1', text: 'restore test content' })}\n`;
+
+    const first = await putFile('claude-projects', restoreRelpath, restoreContent);
+    expect(first.status).toBe(201);
+    const fileId = ((await first.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    const parsedRow = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(parsedRow?.parse_state).toBe('parsed');
+
+    // Simulate the flagship failure this recovers from: the row's own raw R2 object is gone
+    // (lost/corrupted), and the row got marked 'error' as a result (e.g. by a reparse attempt).
+    const r2Key = `raw/${MACHINE}/claude-projects/${restoreRelpath}`;
+    await testEnv.RAW.delete(r2Key);
+    await testEnv.DB.prepare("UPDATE files SET parse_state = 'error' WHERE id = ?1").bind(fileId).run();
+    expect(await testEnv.RAW.head(r2Key)).toBeNull();
+
+    // The collector re-sends the identical bytes (same hash) — the unchanged fast path must
+    // notice the object is missing and restore it before requeueing, not just requeue a parse
+    // that will hit the same missing object again.
+    const reupload = await putFile('claude-projects', restoreRelpath, restoreContent);
+    expect(reupload.status).toBe(200);
+    const reuploadBody = (await reupload.json()) as { status: string; file_id: number; requeued?: boolean; restored?: boolean };
+    expect(reuploadBody.status).toBe('unchanged');
+    expect(reuploadBody.requeued).toBe(true);
+    expect(reuploadBody.restored).toBe(true);
+
+    const restoredObj = await testEnv.RAW.head(r2Key);
+    expect(restoredObj).not.toBeNull();
+
+    // The response handler only sent a queue message and never touched parse_state (still
+    // 'error'), so drainQueue()'s pending-only filter wouldn't pick this row up — deliver the
+    // message explicitly, same as the existing stuck-file requeue test above.
+    await deliverOne(fileId, r2Key);
+
+    const recoveredFile = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(recoveredFile?.parse_state).toBe('parsed');
+
+    const recoveredSession = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+      .bind(RESTORE_SESSION_ID)
+      .first<{ index_state: string }>();
+    expect(recoveredSession?.index_state).toBe('ready');
+  });
 });
 
 describe('failed reparse surfaces as session index_state=error', () => {
