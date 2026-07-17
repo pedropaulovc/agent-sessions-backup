@@ -98,5 +98,8 @@ function encodeCursor(offset: number): string {
 function decodeCursor(cursor: string | null): number {
   if (!cursor) return 0;
   const n = Number(atob(cursor));
-  return Number.isFinite(n) && n >= 0 ? n : 0;
+  // A finite non-integer (e.g. a hand-edited cursor decoding to 1.5) would otherwise pass
+  // through into the SQL OFFSET, which SQLite rejects with a datatype mismatch — 500 instead
+  // of just resetting to the first page.
+  return Number.isSafeInteger(n) && n >= 0 ? n : 0;
 }

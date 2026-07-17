@@ -162,6 +162,15 @@ describe('getSessionRaw range handling', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('content-range')).toBeNull();
   });
+
+  it('falls back to a full 200 for an inverted range (end < start) instead of forwarding a negative length to R2 (regression: bytes=100-50 computed {offset:100, length:-49})', async () => {
+    const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${RANGE_SESSION_ID}/raw`, {
+      headers: { 'x-dev-machine': MACHINE, range: 'bytes=100-50' },
+    });
+    expect(res.status).toBe(200);
+    const body = await res.text();
+    expect(body.length).toBe(content.length);
+  });
 });
 
 describe('upload unchanged fast-path re-enqueues stuck files', () => {
@@ -534,5 +543,23 @@ describe('subagent meta linking, both arrival orders', () => {
     expect(res.status).toBe(200);
     const body = (await res.json()) as { session: { parentToolUseId?: string } };
     expect(body.session.parentToolUseId).toBe('toolu_meta_first');
+  });
+});
+
+describe('search cursor decoding rejects non-integer offsets (regression: a finite non-integer cursor reached SQL OFFSET and 500\'d)', () => {
+  it('a hand-edited cursor decoding to 1.5 is treated as offset 0 (first page), not a 500', async () => {
+    const withoutCursor = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=bound', {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    expect(withoutCursor.status).toBe(200);
+    const firstPage = (await withoutCursor.json()) as { hits: Array<{ session_id: string }> };
+    expect(firstPage.hits.length).toBeGreaterThan(0);
+
+    const withBadCursor = await SELF.fetch(`https://api.sessions.vza.net/api/v1/search?q=bound&cursor=${btoa('1.5')}`, {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    expect(withBadCursor.status).toBe(200);
+    const badCursorPage = (await withBadCursor.json()) as { hits: Array<{ session_id: string }> };
+    expect(badCursorPage.hits).toEqual(firstPage.hits);
   });
 });

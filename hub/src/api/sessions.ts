@@ -152,6 +152,12 @@ function parseRange(header: string): R2Range | undefined {
   const m = header.match(/^bytes=(\d+)-(\d*)$/);
   if (!m) return undefined;
   const offset = Number(m[1]);
-  const end = m[2] ? Number(m[2]) : undefined;
-  return end !== undefined ? { offset, length: end - offset + 1 } : { offset };
+  if (!Number.isSafeInteger(offset)) return undefined;
+  if (!m[2]) return { offset };
+  const end = Number(m[2]);
+  // An inverted range (bytes=100-50) would otherwise compute a negative length and get
+  // forwarded to R2 as a "valid" partial request — fall back to a full 200 instead, the same
+  // way an unparseable Range header is already treated.
+  if (!Number.isSafeInteger(end) || end < offset) return undefined;
+  return { offset, length: end - offset + 1 };
 }
