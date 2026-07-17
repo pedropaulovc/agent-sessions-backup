@@ -214,7 +214,7 @@ describe('parseCodex', () => {
     expect(s.turns[0]!.usage?.cacheReadTokens).toBe(1);
   });
 
-  it('dedupes event_msg messages by full text, not just a shared prefix (regression: prefix-only key dropped distinct pasted-log messages)', async () => {
+  it('indexes distinct event_msg messages sharing a long prefix, not just their prefix (regression: prefix-only key dropped distinct pasted-log messages)', async () => {
     const sharedPrefix = 'A'.repeat(300); // longer than the old 256-char prefix key
     const firstText = `${sharedPrefix} first-tail`;
     const secondText = `${sharedPrefix} second-tail-DIFFERENT`;
@@ -223,8 +223,6 @@ describe('parseCodex', () => {
       { timestamp: '2026-07-04T10:00:01.000Z', type: 'turn_context', payload: { turn_id: 't1', model: 'gpt-test-4' } },
       { timestamp: '2026-07-04T10:00:02.000Z', type: 'event_msg', payload: { type: 'agent_message', message: firstText } },
       { timestamp: '2026-07-04T10:00:03.000Z', type: 'event_msg', payload: { type: 'agent_message', message: secondText } },
-      // A genuine duplicate of the first message must still be deduped.
-      { timestamp: '2026-07-04T10:00:04.000Z', type: 'event_msg', payload: { type: 'agent_message', message: firstText } },
     ].map((o) => JSON.stringify(o));
 
     const s = await parseCodex(readJsonlLines(toStream(lines)), CODEX_SESSION_ID);
@@ -232,6 +230,85 @@ describe('parseCodex', () => {
     expect(texts).toHaveLength(2);
     expect(texts).toContain(firstText);
     expect(texts).toContain(secondText);
+  });
+
+  it('does NOT dedupe a genuine same-text repeat within the SAME wire representation (regression: session-global dedupe dropped repeated user/assistant text like "continue" or "ok")', async () => {
+    const text = 'continue';
+    const lines = [
+      { timestamp: '2026-07-06T10:00:00.000Z', type: 'session_meta', payload: { session_id: CODEX_SESSION_ID, cwd: '/x' } },
+      { timestamp: '2026-07-06T10:00:01.000Z', type: 'turn_context', payload: { turn_id: 't1', model: 'gpt-test-6' } },
+      {
+        timestamp: '2026-07-06T10:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      {
+        timestamp: '2026-07-06T10:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'on it' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      {
+        timestamp: '2026-07-06T10:00:04.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't2' },
+        },
+      },
+    ].map((o) => JSON.stringify(o));
+
+    const s = await parseCodex(readJsonlLines(toStream(lines)), CODEX_SESSION_ID);
+    const userTexts = s.turns.filter((t) => t.role === 'user').flatMap((t) => t.blocks.map((b) => b.text));
+    expect(userTexts).toEqual([text, text]);
+  });
+
+  it('dedupes an event_msg/response_item representation pair but still indexes a genuine third repeat (regression: pairing must consume exactly the duplicate wire form, not every subsequent equal string)', async () => {
+    const text = 'the widget test passes now';
+    const lines = [
+      { timestamp: '2026-07-07T10:00:00.000Z', type: 'session_meta', payload: { session_id: CODEX_SESSION_ID, cwd: '/x' } },
+      { timestamp: '2026-07-07T10:00:01.000Z', type: 'turn_context', payload: { turn_id: 't1', model: 'gpt-test-7' } },
+      // Pair 1: event_msg then the equivalent response_item — must collapse to one block.
+      { timestamp: '2026-07-07T10:00:02.000Z', type: 'event_msg', payload: { type: 'agent_message', message: text } },
+      {
+        timestamp: '2026-07-07T10:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      // A genuine third occurrence of the exact same text (e.g. the assistant says it again
+      // later) must still be indexed, and its own event_msg twin still gets paired off it.
+      { timestamp: '2026-07-07T10:00:04.000Z', type: 'event_msg', payload: { type: 'agent_message', message: text } },
+      {
+        timestamp: '2026-07-07T10:00:05.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't2' },
+        },
+      },
+    ].map((o) => JSON.stringify(o));
+
+    const s = await parseCodex(readJsonlLines(toStream(lines)), CODEX_SESSION_ID);
+    const texts = s.turns.flatMap((t) => t.blocks.filter((b) => b.type === 'text').map((b) => b.text));
+    expect(texts).toEqual([text, text]);
   });
 
   it('dedupes when event_msg arrives before the equivalent response_item/message (regression: response_item path recorded but never checked seenMessageHashes)', async () => {
@@ -255,5 +332,67 @@ describe('parseCodex', () => {
     const s = await parseCodex(readJsonlLines(toStream(lines)), CODEX_SESSION_ID);
     const texts = s.turns.flatMap((t) => t.blocks.filter((b) => b.type === 'text').map((b) => b.text));
     expect(texts).toEqual([text]);
+  });
+
+  it('a token_count with no indexable block for the current call opens a fresh usage-only turn instead of overwriting the previous call (regression: lastAssistant stayed stale across a new user turn)', async () => {
+    const lines = [
+      { timestamp: '2026-07-08T10:00:00.000Z', type: 'session_meta', payload: { session_id: CODEX_SESSION_ID, cwd: '/x' } },
+      { timestamp: '2026-07-08T10:00:01.000Z', type: 'turn_context', payload: { turn_id: 't1', model: 'gpt-test-8' } },
+      {
+        timestamp: '2026-07-08T10:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'first question' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      {
+        timestamp: '2026-07-08T10:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'first answer' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      {
+        timestamp: '2026-07-08T10:00:04.000Z',
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 10 } } },
+      },
+      // New user turn — whatever assistant call preceded it is done.
+      {
+        timestamp: '2026-07-08T10:00:05.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'second question' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't2' },
+        },
+      },
+      // The reply to the second question produced only encrypted reasoning — no indexable
+      // response_item/message — so this token_count is the only signal of that call.
+      {
+        timestamp: '2026-07-08T10:00:06.000Z',
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 200, output_tokens: 20 } } },
+      },
+    ].map((o) => JSON.stringify(o));
+
+    const s = await parseCodex(readJsonlLines(toStream(lines)), CODEX_SESSION_ID);
+    const roles = s.turns.map((t) => t.role);
+    expect(roles).toEqual(['user', 'assistant', 'user', 'assistant']);
+
+    const firstAssistant = s.turns[1]!;
+    expect(firstAssistant.blocks.map((b) => b.text)).toEqual(['first answer']);
+    expect(firstAssistant.usage?.inputTokens).toBe(100); // untouched by the second token_count
+
+    const secondAssistant = s.turns[3]!;
+    expect(secondAssistant.blocks).toHaveLength(0); // usage-only turn, no indexable block
+    expect(secondAssistant.usage?.inputTokens).toBe(200);
   });
 });

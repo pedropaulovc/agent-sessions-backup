@@ -33,7 +33,13 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
   let currentTurnId: string | undefined;
   let lastAssistant: NormalizedTurn | undefined;
   let firstUserText: string | undefined;
-  const seenMessageHashes = new Set<string>();
+  // Codex represents one logical message TWICE on the wire: once as event_msg/user_message|
+  // agent_message, once as response_item/message. These two maps pair up that duplicate
+  // representation (by source, so a genuine same-text repeat within the SAME source — e.g. the
+  // user typing "continue" twice, both as response_item — is never mistaken for a pairing and
+  // both instances get indexed). See shouldIndexMessage below.
+  const pendingFromResponseItem = new Map<string, number>();
+  const pendingFromEventMsg = new Map<string, number>();
 
   const flush = () => {
     // A turn can be usage-only: token_count is the only billable event before EOF/role change
@@ -47,6 +53,10 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
     if (!current) {
       current = { index: session.turns.length, onMainPath: true, role, ts, blocks: [] };
       currentTurnId = turnId;
+      // A new user turn means whatever assistant call preceded it is done; a token_count that
+      // arrives after this (for a reply with no indexable block, e.g. encrypted-reasoning-only)
+      // must open a fresh usage-only turn instead of overwriting this now-stale prior usage.
+      if (role === 'user') lastAssistant = undefined;
       if (role === 'assistant') {
         current.model = currentModel;
         lastAssistant = current;
@@ -54,6 +64,26 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
     }
     return current;
   };
+
+  /**
+   * A message text arriving from `source` is indexed unless the OTHER source already has an
+   * unconsumed occurrence of the same (role, text) waiting to be paired — in which case this
+   * is presumed to be that occurrence's duplicate wire representation, and it's consumed
+   * (skipped) instead of indexed again. Consecutive occurrences from the SAME source always
+   * index (they're genuine repeats, not representation pairs).
+   */
+  function shouldIndexMessage(source: 'response_item' | 'event_msg', role: Role, text: string): boolean {
+    const key = `${role}:${messageKey(text)}`;
+    const mine = source === 'response_item' ? pendingFromResponseItem : pendingFromEventMsg;
+    const other = source === 'response_item' ? pendingFromEventMsg : pendingFromResponseItem;
+    const otherPending = other.get(key) ?? 0;
+    if (otherPending > 0) {
+      other.set(key, otherPending - 1);
+      return false;
+    }
+    mine.set(key, (mine.get(key) ?? 0) + 1);
+    return true;
+  }
 
   for await (const line of lines) {
     session.stats.lines++;
@@ -136,11 +166,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       case 'message': {
         const role = (str(p.role) as Role) ?? 'assistant';
         const text = contentText(p.content);
-        // Same message can arrive as event_msg/user_message|agent_message first and as this
-        // response_item second (or vice versa, handled in handleEventMsg) — check before
-        // recording, not just record, so whichever form arrives second doesn't double-index.
-        if (!text || seenMessageHashes.has(messageKey(text))) break;
-        rememberMessage(text);
+        if (!text || !shouldIndexMessage('response_item', role, text)) break;
         const turn = openTurn(role === 'developer' ? 'developer' : role, ts, turnId);
         const c = cap(text, CAPS.text);
         turn.blocks.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });
@@ -212,9 +238,8 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       case 'user_message':
       case 'agent_message': {
         const text = str(p.message) ?? contentText(p.message);
-        if (!text || seenMessageHashes.has(messageKey(text))) break;
-        rememberMessage(text);
         const role: Role = p.type === 'user_message' ? 'user' : 'assistant';
+        if (!text || !shouldIndexMessage('event_msg', role, text)) break;
         const turn = openTurn(role, ts, undefined);
         const c = cap(text, CAPS.text);
         turn.blocks.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });
@@ -237,10 +262,6 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         // task_started/task_complete/patch_apply_end/…: presence only.
         break;
     }
-  }
-
-  function rememberMessage(text: string) {
-    seenMessageHashes.add(messageKey(text));
   }
 }
 

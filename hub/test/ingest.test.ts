@@ -475,3 +475,57 @@ describe('canonical selection recheck guards against a concurrent-write race (qu
     expect(sessionFinal?.index_state).toBe('ready');
   });
 });
+
+describe('a zero-turn parse (every line malformed) never becomes canonical over a valid duplicate', () => {
+  const GARBAGE_CONTENT = ['not valid json at all {{{', 'still garbage ]]] not json', 'more garbage ###'].join('\n');
+  const VALID_CONTENT = [
+    ccUserLine({ uuid: 'garbage-u1', text: 'zero-turn canonical test' }),
+    ccAssistantLine({ uuid: 'garbage-a1', parentUuid: 'garbage-u1', text: 'zero-turn canonical response' }),
+  ].join('\n');
+
+  beforeAll(async () => {
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('garbage-a', 'linux', 0) ON CONFLICT (machine_id) DO UPDATE SET priority = 0",
+      ),
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('garbage-b', 'linux', 1) ON CONFLICT (machine_id) DO UPDATE SET priority = 1",
+      ),
+    ]);
+  });
+
+  it('the garbage copy is marked error (not parsed) and the lower-priority valid duplicate becomes/stays canonical', async () => {
+    const SESSION_ID = '11111111-2222-4444-8444-000000000099';
+
+    const resA = await putFile('garbage-a', 'claude-projects', `garbage-a/${SESSION_ID}.jsonl`, GARBAGE_CONTENT);
+    expect(resA.status).toBe(201);
+    const fileIdA = ((await resA.json()) as { file_id: number }).file_id;
+    const r2KeyA = `raw/garbage-a/claude-projects/garbage-a/${SESSION_ID}.jsonl`;
+    await deliverOne(fileIdA, r2KeyA);
+
+    const rowA = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdA)
+      .first<{ parse_state: string }>();
+    expect(rowA?.parse_state).toBe('error');
+    const sessionAfterA = await testEnv.DB.prepare('SELECT session_id FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first();
+    expect(sessionAfterA).toBeNull(); // nothing indexable was ever written
+
+    const resB = await putFile('garbage-b', 'claude-projects', `valid-b/${SESSION_ID}.jsonl`, VALID_CONTENT);
+    expect(resB.status).toBe(201);
+    const fileIdB = ((await resB.json()) as { file_id: number }).file_id;
+    const r2KeyB = `raw/garbage-b/claude-projects/valid-b/${SESSION_ID}.jsonl`;
+    await deliverOne(fileIdB, r2KeyB);
+
+    const rowB = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string }>();
+    expect(rowB?.parse_state).toBe('parsed');
+    const session = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(session?.canonical_file_id).toBe(fileIdB);
+    expect(session?.index_state).toBe('ready');
+  });
+});

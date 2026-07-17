@@ -84,6 +84,23 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
     det.harness === 'claude-code' ? await parseClaudeCode(lines, det.sessionId) : await parseCodex(lines, det.sessionId);
   if (det.parentSessionId) parsed.parentSessionId = det.parentSessionId;
 
+  if (parsed.turns.length === 0) {
+    // Every line was malformed or an unsupported envelope shape — nothing indexable came out of
+    // this parse. Marking it 'parsed' anyway would let it win canonical selection (by priority)
+    // over a lower-priority duplicate that DID produce a real session, permanently losing that
+    // session's content with no automatic recovery path. Neither 'error' nor 'skipped' is
+    // canonical-eligible (chooseCanonical deprioritizes both below), so a valid duplicate — if
+    // one exists — remains free to become or stay canonical.
+    const state = parsed.stats.parseErrorLines > 0 ? 'error' : 'skipped';
+    await env.DB.prepare(
+      `UPDATE files SET parse_state = ?2, parsed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), parsed_size = ?3, parse_error = ?4
+       WHERE id = ?1`,
+    )
+      .bind(file.id, state, file.size, state === 'error' ? `empty_parse:${parsed.stats.parseErrorLines}/${parsed.stats.lines} lines malformed` : null)
+      .run();
+    return;
+  }
+
   // The sibling .meta.json may have already been parsed (and found no sessions row yet,
   // see linkSubagentMeta below) — read it directly so meta-before-transcript ordering
   // doesn't lose the link. Transcript-before-meta is covered by linkSubagentMeta below.
@@ -133,18 +150,20 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
 }
 
 /**
- * Prefer a non-errored copy first (an errored copy only wins if every candidate has
- * errored — otherwise a permanently-failed copy could win canonical selection and get a
- * good duplicate from another machine marked superseded before it's ever parsed), then
- * lowest machine priority, then largest file, then newest mtime. Returns the preferred file
- * id and its current parse_state — callers must not treat "preferred" as "supersede everyone
- * else" until that file has actually proven it can parse (parse_state = 'parsed').
+ * Prefer a real copy first — neither 'error' nor 'skipped' (a zero-turn parse: every line
+ * malformed or unsupported) wins over an actual 'parsed'/'pending' candidate, only wins if
+ * EVERY candidate is error/skipped — otherwise a permanently-failed or empty copy could win
+ * canonical selection and get a good duplicate from another machine marked superseded before
+ * it's ever parsed. Then lowest machine priority, then largest file, then newest mtime.
+ * Returns the preferred file id and its current parse_state — callers must not treat
+ * "preferred" as "supersede everyone else" until that file has actually proven it can parse
+ * (parse_state = 'parsed').
  */
 async function chooseCanonical(sessionId: string, env: Env): Promise<{ id: number; parseState: string } | null> {
   const row = await env.DB.prepare(
     `SELECT f.id, f.parse_state FROM files f JOIN machines m ON m.machine_id = f.machine_id
      WHERE f.session_id = ?1 AND f.parse_state != 'superseded'
-     ORDER BY (f.parse_state = 'error') ASC, m.priority ASC, f.size DESC, f.mtime DESC, f.id ASC LIMIT 1`,
+     ORDER BY (f.parse_state IN ('error', 'skipped')) ASC, m.priority ASC, f.size DESC, f.mtime DESC, f.id ASC LIMIT 1`,
   )
     .bind(sessionId)
     .first<{ id: number; parse_state: string }>();
