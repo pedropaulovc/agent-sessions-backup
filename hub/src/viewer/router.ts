@@ -5,19 +5,24 @@ import { searchPage } from './search';
 import { sessionPage } from './session';
 
 /**
- * Host-routed viewer. Auth (passkeys) lands in M3; until then production is closed. Local development is
- * open (never publicly reachable). PR previews ARE publicly reachable and bind real -preview D1/R2, so they
- * require the same DEV_AUTH bearer the API uses — otherwise anyone with the preview URL could read transcripts.
+ * Host-routed viewer. Access is an explicit fail-closed allowlist mirroring the API's machineIdentity:
+ * only 'development' (never publicly reachable) and 'preview' with a verified DEV_AUTH bearer may serve.
+ * 'production' is closed until passkeys land (M3); any unrecognized/missing ENVIRONMENT — e.g. a deploy
+ * using the checked-in default without an override — also fails closed rather than exposing transcripts.
  */
 export async function viewerRoute(request: Request, url: URL, env: Env): Promise<Response> {
-  if (env.ENVIRONMENT === 'production') {
+  if (env.ENVIRONMENT === 'development') {
+    // open — never publicly reachable
+  } else if (env.ENVIRONMENT === 'preview') {
+    if (!previewBearerOk(request, env)) {
+      return new Response('unauthorized', { status: 401, headers: { 'content-type': 'text/plain; charset=utf-8' } });
+    }
+  } else {
+    // 'production', an unrecognized value, or a missing binding — closed until passkeys (M3).
     return new Response('auth not yet configured', {
       status: 403,
       headers: { 'content-type': 'text/plain; charset=utf-8' },
     });
-  }
-  if (env.ENVIRONMENT === 'preview' && !previewBearerOk(request, env)) {
-    return new Response('unauthorized', { status: 401, headers: { 'content-type': 'text/plain; charset=utf-8' } });
   }
   if (request.method !== 'GET') return new Response('method not allowed', { status: 405 });
 

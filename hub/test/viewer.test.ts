@@ -469,4 +469,20 @@ describe('viewer', () => {
     const res = await viewerRoute(new Request(url.toString()), url, devEnv);
     expect(res.status).toBe(200);
   });
+
+  it('fails closed on an unrecognized or missing ENVIRONMENT (mirrors the API allowlist)', async () => {
+    const url = new URL('https://sessions.vza.net/');
+    // Even with a DEV_AUTH bearer, a non-allowlisted ENVIRONMENT never serves.
+    const bogus = { ...testEnv, ENVIRONMENT: 'staging', DEV_AUTH: 'x' } as unknown as Env;
+    const bogusRes = await viewerRoute(
+      new Request(url.toString(), { headers: { authorization: 'Bearer x' } }),
+      url,
+      bogus,
+    );
+    expect(bogusRes.status).toBe(403);
+
+    const missing = { ...testEnv, ENVIRONMENT: undefined } as unknown as Env;
+    const missingRes = await viewerRoute(new Request(url.toString()), url, missing);
+    expect(missingRes.status).toBe(403);
+  });
 });
