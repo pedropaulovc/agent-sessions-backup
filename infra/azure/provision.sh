@@ -183,21 +183,29 @@ echo "=== Federated Credential ==="
 # Not a pure show-or-create: a re-run with a different <issuer-url> (e.g. the
 # issuer worker got redeployed to a new workers.dev subdomain) must actually
 # update the existing credential, or Entra keeps trusting the OLD issuer and
-# every token exchange starts failing with no error surfaced here.
+# every token exchange starts failing with no error surfaced here. The drift
+# check compares issuer, subject, AND audiences — Entra matches all three
+# against the assertion (whose aud is always "api://AzureADTokenExchange"), so
+# a credential that matches on issuer+subject but has a stale/wrong audience
+# would otherwise be treated as fine while token exchange keeps failing.
+FED_AUDIENCE="api://AzureADTokenExchange"
 EXISTING_ISSUER=$(az identity federated-credential show --name "$FED_CRED_NAME" --identity-name "$MI_NAME" --resource-group "$RG_NAME" --query issuer -o tsv 2>/dev/null || true)
 if [ -z "$EXISTING_ISSUER" ]; then
     az identity federated-credential create --name "$FED_CRED_NAME" --identity-name "$MI_NAME" --resource-group "$RG_NAME" \
-        --issuer "$ISSUER_URL" --subject "$FED_SUBJECT" --audiences "api://AzureADTokenExchange" --only-show-errors >/dev/null
-    echo "OK: $FED_CRED_NAME created (issuer=$ISSUER_URL, subject=$FED_SUBJECT)"
+        --issuer "$ISSUER_URL" --subject "$FED_SUBJECT" --audiences "$FED_AUDIENCE" --only-show-errors >/dev/null
+    echo "OK: $FED_CRED_NAME created (issuer=$ISSUER_URL, subject=$FED_SUBJECT, audiences=$FED_AUDIENCE)"
 else
     EXISTING_SUBJECT=$(az identity federated-credential show --name "$FED_CRED_NAME" --identity-name "$MI_NAME" --resource-group "$RG_NAME" --query subject -o tsv)
-    if [ "$EXISTING_ISSUER" != "$ISSUER_URL" ] || [ "$EXISTING_SUBJECT" != "$FED_SUBJECT" ]; then
-        echo "Drift detected: existing issuer=$EXISTING_ISSUER subject=$EXISTING_SUBJECT — updating to issuer=$ISSUER_URL subject=$FED_SUBJECT"
+    # audiences is an array; join it deterministically rather than relying on
+    # -o tsv's array formatting, so a single-element comparison is unambiguous.
+    EXISTING_AUDIENCES=$(az identity federated-credential show --name "$FED_CRED_NAME" --identity-name "$MI_NAME" --resource-group "$RG_NAME" --query "join(',', audiences)" -o tsv)
+    if [ "$EXISTING_ISSUER" != "$ISSUER_URL" ] || [ "$EXISTING_SUBJECT" != "$FED_SUBJECT" ] || [ "$EXISTING_AUDIENCES" != "$FED_AUDIENCE" ]; then
+        echo "Drift detected: existing issuer=$EXISTING_ISSUER subject=$EXISTING_SUBJECT audiences=$EXISTING_AUDIENCES — updating to issuer=$ISSUER_URL subject=$FED_SUBJECT audiences=$FED_AUDIENCE"
         az identity federated-credential update --name "$FED_CRED_NAME" --identity-name "$MI_NAME" --resource-group "$RG_NAME" \
-            --issuer "$ISSUER_URL" --subject "$FED_SUBJECT" --audiences "api://AzureADTokenExchange" --only-show-errors >/dev/null
-        echo "OK: $FED_CRED_NAME updated (issuer=$ISSUER_URL, subject=$FED_SUBJECT)"
+            --issuer "$ISSUER_URL" --subject "$FED_SUBJECT" --audiences "$FED_AUDIENCE" --only-show-errors >/dev/null
+        echo "OK: $FED_CRED_NAME updated (issuer=$ISSUER_URL, subject=$FED_SUBJECT, audiences=$FED_AUDIENCE)"
     else
-        echo "OK: $FED_CRED_NAME already matches (issuer=$ISSUER_URL, subject=$FED_SUBJECT)"
+        echo "OK: $FED_CRED_NAME already matches (issuer=$ISSUER_URL, subject=$FED_SUBJECT, audiences=$FED_AUDIENCE)"
     fi
 fi
 
@@ -234,13 +242,20 @@ for kql_file in "$REPO_ROOT"/infra/azure/alerts/*.kql; do
 
     if ! az monitor scheduled-query show --name "$alert_name" --resource-group "$RG_NAME" --only-show-errors >/dev/null 2>&1; then
         query=$(cat "$kql_file")
+        # --skip-query-validation: this script runs before the gateway has ever
+        # forwarded any OTLP data, so the workspace has no OTelLogs table yet
+        # (and infra/azure/alerts/*.kql's own header comments flag the table/
+        # column names themselves as unverified assumptions). Without this
+        # flag, `az monitor scheduled-query create` validates the KQL against
+        # the current workspace schema and fails outright on a fresh
+        # workspace, aborting the rest of provisioning.
         az monitor scheduled-query create --name "$alert_name" --resource-group "$RG_NAME" \
             --scopes "$LAW_ID" --location "$LOCATION" \
             --condition "count 'Placeholder_1' > 0" \
             --condition-query Placeholder_1="$query" \
             --description "agent-sessions-backup: $base_name (see infra/azure/alerts/$base_name.kql)" \
             --evaluation-frequency "$window" --window-size "$window" \
-            --severity 2 --action-groups "$AG_ID" --only-show-errors >/dev/null
+            --severity 2 --action-groups "$AG_ID" --skip-query-validation true --only-show-errors >/dev/null
     fi
     echo "OK: $alert_name (window=$window)"
 done
