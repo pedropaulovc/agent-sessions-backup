@@ -26,6 +26,14 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
       await env.DB.prepare("UPDATE files SET parse_state = 'error', parse_error = ?2 WHERE id = ?1")
         .bind(msg.body.file_id, String(e).slice(0, 2000))
         .run();
+      // Otherwise a failed reparse leaves index_state='parsing' forever and /api/v1/status
+      // never surfaces the error. No-op when the file has no session_id (nothing was ever indexed).
+      await env.DB.prepare(
+        `UPDATE sessions SET index_state = 'error'
+         WHERE session_id = (SELECT session_id FROM files WHERE id = ?1 AND session_id IS NOT NULL)`,
+      )
+        .bind(msg.body.file_id)
+        .run();
       msg.retry();
     }
   }
@@ -67,6 +75,14 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
     det.harness === 'claude-code' ? await parseClaudeCode(lines, det.sessionId) : await parseCodex(lines, det.sessionId);
   if (det.parentSessionId) parsed.parentSessionId = det.parentSessionId;
 
+  // The sibling .meta.json may have already been parsed (and found no sessions row yet,
+  // see linkSubagentMeta below) — read it directly so meta-before-transcript ordering
+  // doesn't lose the link. Transcript-before-meta is covered by linkSubagentMeta below.
+  if (det.kind === 'subagent') {
+    const meta = await readSiblingMeta(file.r2_key, env);
+    if (meta?.toolUseId) parsed.parentToolUseId = meta.toolUseId;
+  }
+
   await writeSession(parsed, file, env);
   await markParsed(file.id, env, 'parsed', file.size);
 
@@ -103,12 +119,27 @@ async function linkSubagentMeta(file: FileRow, env: Env): Promise<void> {
     const meta = (await obj.json()) as { toolUseId?: string; agentType?: string };
     const agentId = file.relpath.split('/').pop()?.replace(/^agent-/, '').replace(/\.meta\.json$/, '');
     if (agentId && meta.toolUseId) {
+      // No-op (0 rows) if the subagent transcript hasn't been parsed into a sessions row
+      // yet — that ordering is covered by the sibling-meta read in parseOne above instead.
       await env.DB.prepare('UPDATE sessions SET parent_tool_use_id = ?2 WHERE session_id = ?1')
         .bind(agentId, meta.toolUseId)
         .run();
     }
   } catch {
     // Malformed meta is non-fatal; the transcript itself still indexes.
+  }
+}
+
+/** Read the .meta.json sibling of a subagent transcript's r2_key (agent-X.jsonl -> agent-X.meta.json), if present. */
+async function readSiblingMeta(r2Key: string, env: Env): Promise<{ toolUseId?: string; agentType?: string } | null> {
+  if (!r2Key.endsWith('.jsonl')) return null;
+  const metaKey = `${r2Key.slice(0, -'.jsonl'.length)}.meta.json`;
+  const obj = await env.RAW.get(metaKey);
+  if (!obj) return null;
+  try {
+    return (await obj.json()) as { toolUseId?: string; agentType?: string };
+  } catch {
+    return null;
   }
 }
 

@@ -48,13 +48,23 @@ export async function getSessionRaw(sessionId: string, request: Request, env: En
     .bind(sessionId)
     .first<{ r2_key: string }>();
   if (!file) return Response.json({ error: 'not_found' }, { status: 404 });
-  const range = request.headers.get('range') ?? undefined;
-  const obj = range ? await env.RAW.get(file.r2_key, { range: parseRange(range) }) : await env.RAW.get(file.r2_key);
+  const rangeHeader = request.headers.get('range');
+  // A present-but-unparseable Range header (e.g. the suffix form `bytes=-500`, which
+  // parseRange doesn't support) must fall back to a full 200 — never claim 206 while
+  // actually serving the whole body.
+  const parsedRange = rangeHeader ? parseRange(rangeHeader) : undefined;
+  const obj = parsedRange ? await env.RAW.get(file.r2_key, { range: parsedRange }) : await env.RAW.get(file.r2_key);
   if (!obj) return Response.json({ error: 'r2_object_missing' }, { status: 404 });
-  console.log(JSON.stringify({ event: 'access.raw', session: sessionId, range: range ?? null }));
+  console.log(JSON.stringify({ event: 'access.raw', session: sessionId, range: rangeHeader ?? null }));
+  const headers: Record<string, string> = { 'content-type': 'application/x-ndjson; charset=utf-8' };
+  const servedRange = obj.range;
+  if (parsedRange && servedRange && 'offset' in servedRange && servedRange.offset !== undefined && servedRange.length !== undefined) {
+    const start = servedRange.offset;
+    headers['content-range'] = `bytes ${start}-${start + servedRange.length - 1}/${obj.size}`;
+  }
   return new Response(obj.body, {
-    status: range ? 206 : 200,
-    headers: { 'content-type': 'application/x-ndjson; charset=utf-8' },
+    status: parsedRange ? 206 : 200,
+    headers,
   });
 }
 
@@ -74,7 +84,7 @@ export async function listSessions(url: URL, env: Env): Promise<Response> {
   if (p.get('machine')) add((n) => `machine_id = ?${n}`, p.get('machine'));
   if (p.get('repo')) add((n) => `repo_url = ?${n}`, p.get('repo'));
   const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
-  const limit = Math.min(Number(p.get('limit') ?? 200), 1000);
+  const limit = clampLimit(p.get('limit'), 200, 1000);
 
   const rows = await env.DB.prepare(
     `SELECT * FROM sessions ${where} ORDER BY started_at DESC LIMIT ${limit}`,
@@ -111,6 +121,12 @@ export async function listSessions(url: URL, env: Env): Promise<Response> {
       'x-indexed-through': indexedThrough?.t ?? '',
     },
   });
+}
+
+/** Clamp a user-supplied limit to [1, max], falling back to dflt for missing/non-positive/NaN input. */
+export function clampLimit(raw: string | null, dflt: number, max: number): number {
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), max) : dflt;
 }
 
 function parseRange(header: string): R2Range | undefined {

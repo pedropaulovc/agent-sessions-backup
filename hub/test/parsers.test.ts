@@ -141,6 +141,19 @@ describe('parseCodex', () => {
     expect(finalAssistant.usage?.reasoningTokens).toBe(20);
     expect(finalAssistant.usage?.cacheReadTokens).toBe(500);
 
+    // response_item-derived turns carry the envelope's own timestamp (regression: these used
+    // to always land as undefined, so consumer.ts wrote NULL into usage.ts / blocks.ts and
+    // usage day-grouping broke for every codex session).
+    expect(s.turns.map((t) => t.ts)).toEqual([
+      '2026-07-02T09:00:02.000Z', // user message
+      '2026-07-02T09:00:03.000Z', // reasoning opens the assistant turn
+      '2026-07-02T09:00:05.000Z', // function_call_output opens the tool turn
+      '2026-07-02T09:00:06.000Z', // assistant message opens the final assistant turn
+      '2026-07-02T09:00:09.000Z', // compaction marker
+    ]);
+    // The usage row consumer.ts writes for this turn uses turn.ts — now non-null.
+    expect(finalAssistant.ts).toBe('2026-07-02T09:00:06.000Z');
+
     // The duplicate event_msg/agent_message must NOT create a second text block.
     const assistantTexts = s.turns.filter((t) => t.role === 'assistant').flatMap((t) => t.blocks.filter((b) => b.type === 'text'));
     expect(assistantTexts).toHaveLength(1);

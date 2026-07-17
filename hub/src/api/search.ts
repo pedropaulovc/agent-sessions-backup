@@ -1,9 +1,11 @@
+import { clampLimit } from './sessions';
+
 const FACET_COLUMNS = ['harness', 'machine_id', 'os', 'primary_model', 'repo_url'] as const;
 
 /** GET /api/v1/search — FTS over blocks with session-level filters and facet counts. */
 export async function search(url: URL, env: Env): Promise<Response> {
   const q = url.searchParams.get('q')?.trim() ?? '';
-  const limit = Math.min(Number(url.searchParams.get('limit') ?? 20), 100);
+  const limit = clampLimit(url.searchParams.get('limit'), 20, 100);
   const offset = decodeCursor(url.searchParams.get('cursor'));
   const wantFacets = url.searchParams.get('facets') === '1';
 

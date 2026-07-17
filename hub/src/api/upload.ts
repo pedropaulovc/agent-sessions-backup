@@ -1,6 +1,8 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
 
+const TERMINAL_PARSE_STATES = new Set(['parsed', 'skipped', 'superseded']);
+
 /** PUT /api/v1/files/{machine_id}/{store}/{relpath...} */
 export async function putFile(
   request: Request,
@@ -25,11 +27,18 @@ export async function putFile(
   if (!request.body) return Response.json({ error: 'missing_body' }, { status: 400 });
 
   const existing = await env.DB.prepare(
-    'SELECT id, content_hash FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
+    'SELECT id, content_hash, parse_state, r2_key FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
   )
     .bind(machineId, store, relpath)
-    .first<{ id: number; content_hash: string }>();
+    .first<{ id: number; content_hash: string; parse_state: string; r2_key: string }>();
   if (existing && existing.content_hash === sha256) {
+    // A matching hash normally means nothing to do, but if the row never finished
+    // indexing (a dropped/failed queue message), the file would otherwise sit
+    // unindexed forever while files/check reports it as present. Re-enqueue.
+    if (!TERMINAL_PARSE_STATES.has(existing.parse_state)) {
+      await env.PARSE_QUEUE.send({ file_id: existing.id, r2_key: existing.r2_key, reason: 'upload' });
+      return Response.json({ status: 'unchanged', file_id: existing.id, requeued: true });
+    }
     return Response.json({ status: 'unchanged', file_id: existing.id });
   }
 

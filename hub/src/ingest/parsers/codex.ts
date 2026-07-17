@@ -89,7 +89,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         break;
       }
       case 'response_item': {
-        handleResponseItem(payload, at);
+        handleResponseItem(payload, ts, at);
         break;
       }
       case 'event_msg': {
@@ -124,7 +124,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
   session.turns.forEach((t, i) => (t.index = i));
   return session;
 
-  function handleResponseItem(p: Record<string, unknown>, at: { byteStart: number; byteLen: number }) {
+  function handleResponseItem(p: Record<string, unknown>, ts: string | undefined, at: { byteStart: number; byteLen: number }) {
     const meta = isObj(p.internal_chat_message_metadata_passthrough)
       ? p.internal_chat_message_metadata_passthrough
       : undefined;
@@ -135,7 +135,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         const text = contentText(p.content);
         if (!text) break;
         rememberMessageHash(text);
-        const turn = openTurn(role === 'developer' ? 'developer' : role, undefined, turnId);
+        const turn = openTurn(role === 'developer' ? 'developer' : role, ts, turnId);
         const c = cap(text, CAPS.text);
         turn.blocks.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });
         if (!firstUserText && role === 'user') firstUserText = text.slice(0, 120);
@@ -145,7 +145,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         // Often only encrypted_content is present — index summary text when it exists.
         const text = contentText(p.summary) || contentText(p.content);
         if (!text) break;
-        const turn = openTurn('assistant', undefined, turnId);
+        const turn = openTurn('assistant', ts, turnId);
         const c = cap(text, CAPS.thinking);
         turn.blocks.push({ type: 'thinking', text: c.text, truncated: c.truncated, ...at });
         break;
@@ -154,7 +154,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       case 'custom_tool_call': {
         const name = str(p.name) ?? 'tool';
         const args = str(p.arguments) ?? str(p.input) ?? '';
-        const turn = openTurn('assistant', undefined, turnId);
+        const turn = openTurn('assistant', ts, turnId);
         const c = cap(`${name} ${args}`, CAPS.tool_use);
         turn.blocks.push({
           type: 'tool_use',
@@ -170,7 +170,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       case 'custom_tool_call_output': {
         const out = p.output;
         const text = typeof out === 'string' ? out : contentText(out) || safeJson(out);
-        const turn = openTurn('tool', undefined, turnId);
+        const turn = openTurn('tool', ts, turnId);
         const c = cap(text, CAPS.tool_result);
         turn.blocks.push({
           type: 'tool_result',
