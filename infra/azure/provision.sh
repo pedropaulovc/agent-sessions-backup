@@ -341,6 +341,7 @@ alert_window_for() {
     case "$1" in
         missed-heartbeat) echo "1h" ;;
         collector-errors) echo "1h" ;;
+        d1-size) echo "1h" ;;
         parse-errors) echo "15m" ;;
         *) echo "15m" ;;
     esac

@@ -71,34 +71,43 @@ consistently; don't mix the two conventions in the same session.
    exchange fails silently, no telemetry ever reaches Azure, and nothing
    in this runbook surfaces the failure). Set `OIDC_SIGNING_KID` to the kid
    from step 2.
-6. Set the private key from step 1 as a classic Worker secret named
-   `OIDC_SIGNING_KEY` on the gateway. This is **not** a Cloudflare Secrets
-   Store binding: Secrets Store caps values at 1024 bytes
-   (developers.cloudflare.com/secrets-store/manage-secrets/), but a PKCS#8
-   RSA-2048 PEM is ~1.7KB in every encoding, so it doesn't fit there. Classic
-   Worker secrets allow up to 5KB
-   (developers.cloudflare.com/workers/platform/limits/), which does fit — see
-   `hub/gateway/telemetry-gateway.ts`'s header for the full citation. Pipe the
-   file in via stdin redirection rather than the interactive prompt (which
-   risks a paste ending up in terminal scrollback/session logging):
+6–8. Set the secrets and deploy the gateway with the idempotent
+   **`./infra/cf/deploy-gateway.sh`** — it owns the whole
+   secret-lifecycle-plus-deploy so nothing is lost or has to be reconstructed by
+   hand:
    ```
-   npx wrangler secret put OIDC_SIGNING_KEY \
-     --config hub/wrangler.telemetry-gateway.jsonc < /tmp/gateway-key.pem
+   OIDC_KEY_FILE=/tmp/gateway-key.pem ./infra/cf/deploy-gateway.sh
    ```
-   Then delete the temp file — `rm -f /tmp/gateway-key.pem`. (`shred`/secure-
-   delete is largely theater on modern SSDs and FileVault/BitLocker-encrypted
-   volumes regardless of OS, so a plain `rm` is the realistic bar here; if you
-   suspect the key was exposed during the setup window, rotate it instead of
-   relying on deletion — see "Rotating the signing key" below.)
-7. Pick a random `INGEST_BEARER` value (e.g. `openssl rand -hex 32`) and set
-   it as a wrangler secret on the gateway:
-   ```
-   npx wrangler secret put INGEST_BEARER --config hub/wrangler.telemetry-gateway.jsonc
-   ```
-8. Deploy the gateway:
-   ```
-   npx wrangler deploy --config hub/wrangler.telemetry-gateway.jsonc
-   ```
+   What it does, all idempotent (safe to re-run):
+   - **`OIDC_SIGNING_KEY`** (only when `OIDC_KEY_FILE` is passed): sets the
+     private key from step 1 as a **classic** Worker secret via stdin (never the
+     interactive prompt, which risks a paste in scrollback). Classic Worker
+     secret, **not** a Secrets Store binding: Secrets Store caps values at 1024
+     bytes (developers.cloudflare.com/secrets-store/manage-secrets/) but a PKCS#8
+     RSA-2048 PEM is ~1.7KB; classic Worker secrets allow up to 5KB
+     (developers.cloudflare.com/workers/platform/limits/). See
+     `hub/gateway/telemetry-gateway.ts`'s header for the citation.
+   - **`INGEST_BEARER`**: reuses the value already in
+     `infra/out/cf-observability.env` if present, else mints one
+     (`openssl rand -hex 32`), sets it as a Worker secret, and (re)writes it to
+     that gitignored file (umask 077) alongside the gateway's `/v1/{logs,traces}`
+     endpoints. This is the fix for the "Worker secrets are write-only, so the
+     dashboard step can't recover the bearer" trap — the file is the durable
+     copy step 9 reads from.
+   - Deploys `sessions-telemetry-gateway`.
+
+   Then delete the temp key — `rm -f /tmp/gateway-key.pem`. (`shred`/secure-delete
+   is largely theater on modern SSD/FileVault/BitLocker volumes, so a plain `rm`
+   is the realistic bar; if you suspect the key leaked during setup, rotate it —
+   see "Rotating the signing key" below.) Two Cloudflare accounts are visible to
+   the wrangler token, so the script pins `CLOUDFLARE_ACCOUNT_ID` to the
+   vza.net-owning account (`18ef3246…`); override the env var if that changes.
+
+   To run the individual steps by hand instead of the script: `npx wrangler
+   secret put OIDC_SIGNING_KEY --config hub/wrangler.telemetry-gateway.jsonc <
+   /tmp/gateway-key.pem`, then `... secret put INGEST_BEARER ...`, then `npx
+   wrangler deploy --config hub/wrangler.telemetry-gateway.jsonc` — but you must
+   then record the bearer in `infra/out/cf-observability.env` yourself.
 9. Create the account-level observability destinations (one for logs, one for
    traces — **these are shared across every worker on the account**, so use
    names that won't collide with anything else, e.g. `agent-backup-azure-logs`

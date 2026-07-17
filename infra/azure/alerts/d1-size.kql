@@ -1,0 +1,22 @@
+// Fires when the D1 index database approaches its 10 GB hard cap — threshold at
+// 7 GB (the plan's warning level, where the escape hatches kick in: tighten
+// truncation caps -> drop tool_use input from FTS -> shard blocks+FTS by year).
+//
+// Source: the hub watchdog cron (*/15) emits, once per run, a structured log
+//   { event: "hub.d1.db_size_bytes", bytes: <n> }
+// (hub/src/cron/watchdog.ts, best-effort via PRAGMA page_count * page_size).
+// Workers observability ships it to Log Analytics OTelLogs (Body = that JSON) —
+// same path and column as missed-heartbeat.kql (verified live 2026-07-17).
+//
+// A 1h window comfortably contains a watchdog emission (it runs every 15 min);
+// we take the most recent reported size and fire if it exceeds 7 GiB. Unlike
+// missed-heartbeat.kql this needs no pipeline-silent sentinel: absence of a size
+// reading is already covered by that alert's __pipeline_silent__ row.
+
+OTelLogs
+| where TimeGenerated > ago(1h)
+| extend body = todynamic(Body)
+| where body.event == "hub.d1.db_size_bytes"
+| summarize arg_max(TimeGenerated, bytes = tolong(body.bytes))
+| where bytes > 7 * 1024 * 1024 * 1024
+| project TimeGenerated, bytes
