@@ -89,7 +89,7 @@ async function chooseCanonical(sessionId: string, env: Env): Promise<number | nu
   const row = await env.DB.prepare(
     `SELECT f.id FROM files f JOIN machines m ON m.machine_id = f.machine_id
      WHERE f.session_id = ?1 AND f.parse_state != 'superseded'
-     ORDER BY m.priority ASC, f.size DESC, f.mtime DESC LIMIT 1`,
+     ORDER BY m.priority ASC, f.size DESC, f.mtime DESC, f.id ASC LIMIT 1`,
   )
     .bind(sessionId)
     .first<{ id: number }>();
