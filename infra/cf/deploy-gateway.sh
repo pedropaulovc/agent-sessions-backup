@@ -59,6 +59,22 @@ done
 
 export CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-18ef3246e9f36d1560485ef53889c0ab}"
 
+# A leftover .prev means a PRIOR rotation didn't complete: it holds the still-live
+# old bearer while cf-observability.env holds a new, possibly-undeployed one.
+# Rotating again now would overwrite .prev — destroying the only copy of that live
+# bearer. Refuse until the operator resolves the prior rotation explicitly.
+if [ "$ROTATE_BEARER" = yes ] && [ -f "$ENV_FILE.prev" ]; then
+    echo "ERROR: $ENV_FILE.prev exists — a previous rotation did not complete, and it" >&2
+    echo "holds the still-live previous bearer. Rotating again would overwrite the only" >&2
+    echo "copy of it. Resolve the prior rotation first, then re-run:" >&2
+    echo "  - to ABANDON that rotation and keep the old bearer:" >&2
+    echo "      mv '$ENV_FILE.prev' '$ENV_FILE'" >&2
+    echo "  - if that rotation actually succeeded and you have ALREADY updated the" >&2
+    echo "    dashboard destinations (telemetry.md step 9) with the new bearer:" >&2
+    echo "      rm '$ENV_FILE.prev'" >&2
+    exit 1
+fi
+
 # Best-known URL for the FIRST env-file write (before the worker is deployed).
 # Replaced with the real deployed URL after a successful deploy.
 GATEWAY_URL="https://sessions-telemetry-gateway.pedro-18e.workers.dev"
@@ -99,6 +115,11 @@ write_env_file() {
 INGEST_BEARER=$INGEST_BEARER
 GATEWAY_LOGS_ENDPOINT=$GATEWAY_URL/v1/logs
 GATEWAY_TRACES_ENDPOINT=$GATEWAY_URL/v1/traces
+# The OIDC signing kid this deploy shipped (from $CONFIG's OIDC_SIGNING_KID var).
+# The next run compares the config's kid to this: a changed kid is a key rotation,
+# and deploying a new kid without the matching new private key (OIDC_KEY_FILE)
+# makes Entra reject every assertion — so that combination is refused.
+OIDC_SIGNING_KID=$CONFIG_KID
 EOF
     )
     mv "$tmp" "$ENV_FILE"
@@ -145,6 +166,40 @@ if [ "$WORKER_EXISTS" = no ] && [ -z "${OIDC_KEY_FILE:-}" ]; then
     echo "  (umask 077; node scripts/generate-gateway-key.mjs > key.pem)" >&2
     echo "add its public JWK to gateway/oidc-issuer.ts + set OIDC_SIGNING_KID, then re-run:" >&2
     echo "  OIDC_KEY_FILE=key.pem ./infra/cf/deploy-gateway.sh" >&2
+    exit 1
+fi
+
+# Kid-rotation guard. The gateway stamps OIDC_SIGNING_KID (a $CONFIG var) into the
+# JWT header; Entra fetches the matching public JWK by that kid and verifies the
+# signature. Changing the kid in the config is therefore a KEY rotation: if the
+# new kid ships without the matching new private key (OIDC_KEY_FILE), the gateway
+# advertises the new kid while still signing with the OLD key, and Entra rejects
+# every assertion (kid says one key, signature is another). We record the shipped
+# kid in cf-observability.env and refuse a kid change that omits the key. Parsed
+# with a regex (not a JSON lib) because $CONFIG is JSONC — comments + trailing
+# commas that json.load chokes on.
+CONFIG_KID=$(OIDC_CONFIG="$CONFIG" python3 -c '
+import os, re
+s = open(os.environ["OIDC_CONFIG"]).read()
+m = re.search(r"\"OIDC_SIGNING_KID\"\s*:\s*\"([^\"]+)\"", s)
+print(m.group(1) if m else "")
+')
+if [ -z "$CONFIG_KID" ]; then
+    echo "ERROR: could not read OIDC_SIGNING_KID from $CONFIG" >&2
+    exit 1
+fi
+RECORDED_KID=""
+if [ -f "$ENV_FILE" ]; then
+    RECORDED_KID=$(grep '^OIDC_SIGNING_KID=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)
+fi
+if [ -n "$RECORDED_KID" ] && [ "$CONFIG_KID" != "$RECORDED_KID" ] && [ -z "${OIDC_KEY_FILE:-}" ]; then
+    echo "ERROR: OIDC_SIGNING_KID changed ($RECORDED_KID -> $CONFIG_KID) but no OIDC_KEY_FILE" >&2
+    echo "was given. A kid change is a key rotation: deploying the new kid without the" >&2
+    echo "matching new private key makes the gateway sign with the OLD key under the NEW" >&2
+    echo "kid, and Entra rejects every assertion. Re-run with the new key so both land in" >&2
+    echo "the same version:" >&2
+    echo "  OIDC_KEY_FILE=<new-key.pem> ./infra/cf/deploy-gateway.sh" >&2
+    echo "(See telemetry.md 'Rotating the signing key' for the full sequence.)" >&2
     exit 1
 fi
 

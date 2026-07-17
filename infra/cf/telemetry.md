@@ -200,6 +200,14 @@ Follow the exact sequence documented in that file's header comment — summary:
    `secret put`-then-`deploy` flow could leave — signing with the new key while
    still serving code/kid from the previous version. Redeploy the issuer too if
    `ACTIVE_KID` changed.
+
+   The script records the shipped `OIDC_SIGNING_KID` in
+   `infra/out/cf-observability.env` and, on the next run, refuses to deploy a
+   **changed** kid unless `OIDC_KEY_FILE` is supplied — that catches the classic
+   half-rotation (bumping `OIDC_SIGNING_KID` but forgetting the new key, which
+   would ship the new kid over the old private key and make Entra reject every
+   assertion). So step 3 must always pass `OIDC_KEY_FILE`; that's not optional
+   during a kid change.
 4. Once the gateway is signing with the new kid (immediately, since step 3 is one
    version), remove the old key from `PUBLIC_JWKS` and redeploy the issuer.
 

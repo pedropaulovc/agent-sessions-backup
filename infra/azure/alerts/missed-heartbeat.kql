@@ -92,5 +92,27 @@ let roster_unavailable = otel
     | summarize arg_max(TimeGenerated, roster_ok)
     | where roster_ok == false
     | project machine = "__roster_unavailable__", age_seconds = tolong(-1);
+// pipeline_silent only catches a FULLY empty window. A mid-window outage that
+// recovers before evaluation (beacon 09:15, silence to 09:55, eval 10:00) leaves
+// beacons in the 1h window, so silence-by-emptiness misses it. pipeline_gap does
+// gap analysis instead: take the run beacons, inject the window's own edges
+// (window start and now()) so a hole at either end counts, order them, and take
+// the largest consecutive gap. Fire __pipeline_gap__ (age_seconds = gap length in
+// seconds) when that gap exceeds 35m — two missed 15-min beacons — so one delayed
+// tick stays quiet. Guarded to real beacons present (edges - 2 > 0); the fully
+// empty window is left to pipeline_silent, the clearer "nothing at all" signal.
+let pipeline_gap = union
+        (otel
+            | where TimeGenerated > ago(1h)
+            | extend body = todynamic(Body)
+            | where body.event == "hub.watchdog.run"
+            | project TimeGenerated),
+        (print TimeGenerated = ago(1h)),
+        (print TimeGenerated = now())
+    | order by TimeGenerated asc
+    | serialize gap = TimeGenerated - prev(TimeGenerated)
+    | summarize max_gap = max(gap), edges_plus_real = count()
+    | where (edges_plus_real - 2) > 0 and max_gap > 35m
+    | project machine = "__pipeline_gap__", age_seconds = tolong(max_gap / 1s);
 stale_machines
-| union pipeline_silent, roster_unavailable
+| union pipeline_silent, roster_unavailable, pipeline_gap
