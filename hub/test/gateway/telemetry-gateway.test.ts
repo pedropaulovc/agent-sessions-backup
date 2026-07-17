@@ -24,7 +24,7 @@ function makeEnv(privateKeyPem: string) {
     OTLP_LOGS_ENDPOINT: 'https://dce.example.westus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-1/streams/Microsoft-OTLP-Logs/otlp/v1/logs',
     OIDC_ISSUER_URL: 'https://sessions-oidc-issuer.example.workers.dev',
     OIDC_SIGNING_KID: 'test-kid',
-    OIDC_SIGNING_KEY: { get: async () => privateKeyPem },
+    OIDC_SIGNING_KEY: privateKeyPem,
     GATEWAY_FEDERATION_SUBJECT: 'cf-worker:sessions-telemetry-gateway',
     INGEST_BEARER: 'test-bearer-secret',
   };

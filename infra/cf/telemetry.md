@@ -54,19 +54,30 @@ consistently; don't mix the two conventions in the same session.
    credential specifically, show-or-create-or-update — see the script comment
    — so re-running after the issuer URL changes actually fixes the drift
    instead of leaving Entra trusting a stale issuer).
+
+   The availability webtest defaults to pinging `https://sessions.vza.net/healthz`,
+   which only resolves once the M3 zone routes in `hub/wrangler.jsonc` are
+   uncommented and deployed. If you're running this script before M3, override
+   with a live `workers.dev` URL instead:
+   `HEALTHZ_URL=https://sessions-hub.<account>.workers.dev/healthz ./infra/azure/provision.sh <issuer-url>`,
+   then re-run without the override once M3 lands so the webtest points at the
+   real custom domain.
 5. Fill `hub/wrangler.telemetry-gateway.jsonc`'s `vars` from
    `infra/out/azure.env`: `TENANT_ID`, `APP_CLIENT_ID`, `OTLP_TRACES_ENDPOINT`,
    `OTLP_LOGS_ENDPOINT`, and set `OIDC_SIGNING_KID` to the kid from step 2.
-6. Create a Secrets Store (if one doesn't already exist:
-   `npx wrangler secrets-store store create agent-backup --remote`), then put
-   the private key from step 1 into it and bind it as `OIDC_SIGNING_KEY`
-   (`store_id`/`secret_name` in `hub/wrangler.telemetry-gateway.jsonc` must
-   match). Pipe the file in via stdin redirection rather than `--value` (which
-   leaves the key in plain text in shell history) or the interactive prompt
-   (which risks a paste ending up in terminal scrollback/session logging):
+6. Set the private key from step 1 as a classic Worker secret named
+   `OIDC_SIGNING_KEY` on the gateway. This is **not** a Cloudflare Secrets
+   Store binding: Secrets Store caps values at 1024 bytes
+   (developers.cloudflare.com/secrets-store/manage-secrets/), but a PKCS#8
+   RSA-2048 PEM is ~1.7KB in every encoding, so it doesn't fit there. Classic
+   Worker secrets allow up to 5KB
+   (developers.cloudflare.com/workers/platform/limits/), which does fit — see
+   `hub/gateway/telemetry-gateway.ts`'s header for the full citation. Pipe the
+   file in via stdin redirection rather than the interactive prompt (which
+   risks a paste ending up in terminal scrollback/session logging):
    ```
-   npx wrangler secrets-store secret create <store-id> --remote \
-     --name agent-backup-oidc-signing-key --scopes workers < /tmp/gateway-key.pem
+   npx wrangler secret put OIDC_SIGNING_KEY \
+     --config hub/wrangler.telemetry-gateway.jsonc < /tmp/gateway-key.pem
    ```
    Then delete the temp file — `rm -f /tmp/gateway-key.pem`. (`shred`/secure-
    delete is largely theater on modern SSDs and FileVault/BitLocker-encrypted
@@ -144,8 +155,9 @@ Follow the exact sequence documented in that file's header comment — summary:
 add the new key to `PUBLIC_JWKS` and deploy (without touching `ACTIVE_KID`),
 wait out the `/.well-known/jwks.json` cache window (`JWKS_CACHE_CONTROL`,
 currently 5 minutes), then flip `OIDC_SIGNING_KID` + `ACTIVE_KID` + the
-Secrets Store entry together and redeploy both workers, then remove the old
-key from `PUBLIC_JWKS`. Never remove an old key from `PUBLIC_JWKS` before the
+`OIDC_SIGNING_KEY` Worker secret together and redeploy both workers, then
+remove the old key from `PUBLIC_JWKS`. Never remove an old key from
+`PUBLIC_JWKS` before the
 gateway has been redeployed to sign with the new one — that's the one order
 that breaks verification for tokens minted in the gap.
 

@@ -3,11 +3,18 @@
 // bearer minted via workload-identity federation. Zero Azure secrets: no
 // connection string or instrumentation key is ever configured anywhere — the
 // only credential material is the RSA private key in the OIDC_SIGNING_KEY
-// Secrets Store entry, which never leaves Cloudflare.
+// secret, which never leaves Cloudflare.
 //
 // Ported from youtube-mirror's worker/telemetry-gateway.ts (the DCR/OTLP-
 // protobuf path — NOT twitter-mirror's Application-Insights-Breeze
 // track-envelope translator, which targets a different, non-DCR ingestion API).
+//
+// OIDC_SIGNING_KEY is a classic Worker secret (`wrangler secret put`), NOT a
+// Cloudflare Secrets Store binding — Secrets Store caps values at 1024 bytes
+// (developers.cloudflare.com/secrets-store/manage-secrets/), and a PKCS#8
+// RSA-2048 PEM is ~1.7KB, so it doesn't fit there in any encoding. Classic
+// Worker secrets allow up to 5KB (developers.cloudflare.com/workers/platform/
+// limits/, "Environment variables"), which does fit. See infra/cf/telemetry.md.
 
 import { signAssertion } from "./oidc-sign";
 import { encodeLogsRequest, encodeTraceRequest } from "./otlp-protobuf";
@@ -21,11 +28,12 @@ interface Env {
   OTLP_TRACES_ENDPOINT: string;
   OTLP_LOGS_ENDPOINT: string;
   // Shared federation identity (see infra/cf/telemetry.md + infra/azure/provision.sh).
-  // OIDC_SIGNING_KEY is a Secrets Store binding holding the RSA private key whose
-  // public half sessions-oidc-issuer publishes.
+  // OIDC_SIGNING_KEY holds the RSA private key whose public half
+  // sessions-oidc-issuer publishes — a plain Worker secret string (see the
+  // file header comment for why this isn't a Secrets Store binding).
   OIDC_ISSUER_URL: string;
   OIDC_SIGNING_KID: string;
-  OIDC_SIGNING_KEY: { get(): Promise<string> };
+  OIDC_SIGNING_KEY: string;
   GATEWAY_FEDERATION_SUBJECT: string;
   INGEST_BEARER: string;
 }
@@ -42,7 +50,7 @@ export async function getEntraToken(env: Env): Promise<string> {
     subject: env.GATEWAY_FEDERATION_SUBJECT,
     audience: "api://AzureADTokenExchange",
     kid: env.OIDC_SIGNING_KID,
-    privateKeyPem: await env.OIDC_SIGNING_KEY.get(),
+    privateKeyPem: env.OIDC_SIGNING_KEY,
   });
 
   const body = new URLSearchParams({

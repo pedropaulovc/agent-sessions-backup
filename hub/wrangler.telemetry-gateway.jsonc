@@ -9,13 +9,10 @@
   // managed identity, not an app registration); TENANT_ID is the Entra tenant.
   // GATEWAY_FEDERATION_SUBJECT must match the `subject` on the identity's
   // federated credential (infra/azure/provision.sh: cf-worker:sessions-telemetry-gateway).
-  // INGEST_BEARER is a wrangler secret, set separately (see infra/cf/telemetry.md).
-  // OIDC_SIGNING_KEY is the shared RSA private key, bound from the Secrets Store
-  // below (generate with scripts/generate-gateway-key.mjs). The OTLP_*_ENDPOINT
-  // values are the live Azure Monitor DCR ingestion endpoints for the
-  // Microsoft-OTLP-Logs / Microsoft-OTLP-Traces streams (infra/azure/provision.sh
-  // output) — a DCR immutable ID is not a credential; auth is the Entra bearer
-  // minted via the federated credential.
+  // The OTLP_*_ENDPOINT values are the live Azure Monitor DCR ingestion endpoints
+  // for the Microsoft-OTLP-Logs / Microsoft-OTLP-Traces streams (infra/azure/
+  // provision.sh output) — a DCR immutable ID is not a credential; auth is the
+  // Entra bearer minted via the federated credential.
   //
   // PLACEHOLDER — every value below is filled in by infra/azure/provision.sh's
   // output (infra/out/azure.env) at M4 deploy time.
@@ -27,15 +24,17 @@
     "OIDC_ISSUER_URL": "https://sessions-oidc-issuer.<account>.workers.dev",
     "GATEWAY_FEDERATION_SUBJECT": "cf-worker:sessions-telemetry-gateway",
     "OIDC_SIGNING_KID": "<kid-from-generate-gateway-key>"
-  },
-  "secrets_store_secrets": [
-    {
-      "binding": "OIDC_SIGNING_KEY",
-      "store_id": "<secrets-store-id>",
-      "secret_name": "agent-backup-oidc-signing-key"
-    }
-  ]
-  // secrets: INGEST_BEARER — set with `wrangler secret put INGEST_BEARER --config wrangler.telemetry-gateway.jsonc`;
-  // must equal the Authorization: Bearer value configured on the account-level
-  // observability destinations that point at this worker (see infra/cf/telemetry.md).
+  }
+  // secrets (both plain `wrangler secret put`, NOT Secrets Store bindings —
+  // see infra/cf/telemetry.md):
+  //   OIDC_SIGNING_KEY — the RSA private key from scripts/generate-gateway-key.mjs.
+  //     NOT bound via secrets_store_secrets: Cloudflare Secrets Store caps values
+  //     at 1024 bytes (developers.cloudflare.com/secrets-store/manage-secrets/),
+  //     but a PKCS#8 RSA-2048 PEM is ~1.7KB in every encoding, so it can't fit
+  //     there. Classic Worker secrets allow up to 5KB
+  //     (developers.cloudflare.com/workers/platform/limits/), which does fit —
+  //     set with `wrangler secret put OIDC_SIGNING_KEY --config wrangler.telemetry-gateway.jsonc < key.pem`.
+  //   INGEST_BEARER — set with `wrangler secret put INGEST_BEARER --config wrangler.telemetry-gateway.jsonc`;
+  //     must equal the Authorization: Bearer value configured on the account-level
+  //     observability destinations that point at this worker (see infra/cf/telemetry.md).
 }

@@ -4,9 +4,11 @@
 // Usage:
 //   node scripts/generate-gateway-key.mjs > private-key.pem
 //
-// stdout: the PKCS#8 PEM private key — pipe straight into the Secrets Store
-// (`wrangler secrets-store secret create` or `put`) as OIDC_SIGNING_KEY. Never
-// commit it.
+// stdout: the PKCS#8 PEM private key — pipe straight into a classic Worker
+// secret as OIDC_SIGNING_KEY (`wrangler secret put OIDC_SIGNING_KEY --config
+// hub/wrangler.telemetry-gateway.jsonc`). NOT a Cloudflare Secrets Store
+// binding: Secrets Store caps values at 1024 bytes, but this PEM is ~1.7KB —
+// see hub/gateway/telemetry-gateway.ts's header. Never commit it.
 //
 // stderr: the public JWK (with a fresh `kid`) — paste into
 // hub/gateway/oidc-issuer.ts's PUBLIC_JWK, and set that same `kid` as

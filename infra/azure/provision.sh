@@ -44,6 +44,7 @@ if [ -z "${1:-}" ]; then
 fi
 
 ISSUER_URL="$1"
+SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 
 RG_NAME="rg-agent-backup"
 LOCATION="westus2"
@@ -56,7 +57,13 @@ FED_CRED_NAME="cf-worker-federation"
 FED_SUBJECT="cf-worker:sessions-telemetry-gateway"
 AG_NAME="ag-pedro-email"
 WEBTEST_NAME="agent-backup-healthz"
-HEALTHZ_URL="https://sessions.vza.net/healthz"
+# sessions.vza.net/healthz only resolves once the M3 zone routes in
+# hub/wrangler.jsonc are uncommented and deployed (currently commented out —
+# see that file). If you're running this script before M3, override with a
+# workers.dev URL that's live today, e.g.:
+#   HEALTHZ_URL=https://sessions-hub.<account>.workers.dev/healthz ./infra/azure/provision.sh <issuer-url>
+# and re-run after M3 lands to point the webtest at the real custom domain.
+HEALTHZ_URL="${HEALTHZ_URL:-https://sessions.vza.net/healthz}"
 
 echo "=== Azure CLI Extensions ==="
 # A fresh az CLI install has none of these; `az monitor app-insights`,
@@ -108,34 +115,55 @@ echo "OK: $DCE_NAME ($DCE_ID)"
 
 echo ""
 echo "=== Data Collection Rule (native OTLP ingestion: logs + traces) ==="
-# UNVERIFIED: this is the riskiest resource in this script — not exercised
-# against a live subscription. Per Microsoft Learn's current manual-OTLP-
-# ingestion ARM template (learn.microsoft.com/azure/azure-monitor/containers/
-# opentelemetry-protocol-ingestion, "Option 2: Manual resource orchestration",
-# backed by github.com/microsoft/AzureMonitorCommunity's
-# OTLP_DCE_DCR_ARM_Template.txt), the DCR must declare an explicit
-# `directDataSources` entry per signal (there is no such thing as a bare
-# built-in "Microsoft-OTLP-Logs"/"Microsoft-OTLP-Traces" *stream* usable
-# directly in dataFlows — those names are only the OTLP *ingestion route*
-# segment in the URL the worker POSTs to; see OTLP_LOGS_ENDPOINT below). The
-# actual DCR-internal stream ids the directDataSources declare — and that
-# dataFlows must route to a destination — are `Microsoft-OTel-Logs` for logs
-# and `Microsoft-OTel-Traces-{Spans,Events,Resources}` for traces (three
-# separate stream ids for one signal; the community template always lists all
-# three together). Each directDataSources entry also needs a `references`
-# block naming an Application Insights resource to enrich against (we already
-# create ai-agent-backup for this). If DCR creation rejects this shape or the
-# stream ids have since changed, the fallback is: create ai-agent-backup with
-# "OTLP support: On" via the portal instead (which auto-provisions an
-# equivalent "managed-ai-..." DCE/DCR pair) and copy its endpoint URLs into
+# Verified: the `monitor-control-service` CLI extension's typed `data-
+# collection rule` commands (create/update/show) are pinned to api-version
+# 2023-03-11 (`az extension show -n monitor-control-service`'s changelog:
+# "1.1.0: Update api-version to 2023-03-11", no later bump since — confirmed
+# against this environment's installed 1.2.0). `directDataSources`, the
+# property this DCR needs for native OTLP ingestion, only exists starting at
+# api-version 2024-03-11 (confirmed live: `az provider show --namespace
+# Microsoft.Insights --query "resourceTypes[?resourceType=='dataCollectionRules'].apiVersions"`
+# lists 2024-03-11 — and a newer 2025-05-11 — as valid versions for this
+# resource type, with 2023-03-11 predating `directDataSources`). Feeding
+# `directDataSources` through `--rule-file` into a 2023-03-11-pinned typed
+# command risks the extension's generated model silently dropping the
+# unrecognized key rather than erroring — the worst failure mode, since the
+# script would report OK with a DCR that has no ingestion path wired. So this
+# DCR is created/updated via `az rest` straight against the ARM resource,
+# pinned to api-version=2024-03-11 (the version the OTLP-ingestion template
+# below targets), instead of the typed command.
+#
+# Per Microsoft Learn's current manual-OTLP-ingestion ARM template
+# (learn.microsoft.com/azure/azure-monitor/containers/opentelemetry-protocol-
+# ingestion, "Option 2: Manual resource orchestration", backed by
+# github.com/microsoft/AzureMonitorCommunity's OTLP_DCE_DCR_ARM_Template.txt),
+# the DCR must declare an explicit `directDataSources` entry per signal
+# (there is no such thing as a bare built-in "Microsoft-OTLP-Logs"/
+# "Microsoft-OTLP-Traces" *stream* usable directly in dataFlows — those names
+# are only the OTLP *ingestion route* segment in the URL the worker POSTs to;
+# see OTLP_LOGS_ENDPOINT below). The actual DCR-internal stream ids the
+# directDataSources declare — and that dataFlows must route to a destination
+# — are `Microsoft-OTel-Logs` for logs and `Microsoft-OTel-Traces-{Spans,
+# Events,Resources}` for traces (three separate stream ids for one signal;
+# the community template always lists all three together). Each
+# directDataSources entry also needs a `references` block naming an
+# Application Insights resource to enrich against (we already create
+# ai-agent-backup for this). If this PUT rejects the shape or the stream ids
+# have since changed, the fallback is: create ai-agent-backup with "OTLP
+# support: On" via the portal instead (which auto-provisions an equivalent
+# "managed-ai-..." DCE/DCR pair) and copy its endpoint URLs into
 # infra/out/azure.env by hand rather than trusting this script's output.
-if ! az monitor data-collection rule show --name "$DCR_NAME" --resource-group "$RG_NAME" --only-show-errors >/dev/null 2>&1; then
-    # A bare `mktemp` (no template) is a GNU-ism — BSD mktemp (macOS's default,
-    # matching this script's bash-3.2 portability elsewhere) requires an
-    # explicit template and exits non-zero without one.
-    DCR_RULE_FILE=$(mktemp "${TMPDIR:-/tmp}/agent-backup-dcr.XXXXXX")
-    trap 'rm -f "$DCR_RULE_FILE"' EXIT
-    cat > "$DCR_RULE_FILE" <<EOF
+DCR_API_VERSION="2024-03-11"
+DCR_RESOURCE_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Insights/dataCollectionRules/$DCR_NAME"
+DCR_URL="https://management.azure.com${DCR_RESOURCE_ID}?api-version=${DCR_API_VERSION}"
+
+# A bare `mktemp` (no template) is a GNU-ism — BSD mktemp (macOS's default,
+# matching this script's bash-3.2 portability elsewhere) requires an explicit
+# template and exits non-zero without one.
+DCR_RULE_FILE=$(mktemp "${TMPDIR:-/tmp}/agent-backup-dcr.XXXXXX")
+DCR_CURRENT_FILE=$(mktemp "${TMPDIR:-/tmp}/agent-backup-dcr-current.XXXXXX")
+trap 'rm -f "$DCR_RULE_FILE" "$DCR_CURRENT_FILE"' EXIT
+cat > "$DCR_RULE_FILE" <<EOF
 {
   "location": "$LOCATION",
   "properties": {
@@ -179,13 +207,36 @@ if ! az monitor data-collection rule show --name "$DCR_NAME" --resource-group "$
   }
 }
 EOF
-    az monitor data-collection rule create --name "$DCR_NAME" --resource-group "$RG_NAME" \
-        --location "$LOCATION" --rule-file "$DCR_RULE_FILE" --only-show-errors >/dev/null
-    rm -f "$DCR_RULE_FILE"
-    trap - EXIT
+
+# Show-or-create-or-update-on-drift, same pattern as the federated credential
+# and scheduled-query alerts above: GET first (a missing DCR fails the GET,
+# meaning create); if it exists, compare the live `properties` against the
+# desired body and PUT only when they differ, so editing this script's DCR
+# shape and re-running actually pushes the change instead of a bare
+# existence check silently leaving the old shape in place.
+if az rest --method get --url "$DCR_URL" --only-show-errors -o json > "$DCR_CURRENT_FILE" 2>/dev/null; then
+    if python3 -c "
+import json, sys
+with open('$DCR_RULE_FILE') as f:
+    desired = json.load(f)['properties']
+with open('$DCR_CURRENT_FILE') as f:
+    current = json.load(f)['properties']
+sys.exit(0 if desired == current else 1)
+"; then
+        DCR_ACTION="unchanged"
+    else
+        az rest --method put --url "$DCR_URL" --body "@$DCR_RULE_FILE" --only-show-errors >/dev/null
+        DCR_ACTION="updated (drift detected)"
+    fi
+else
+    az rest --method put --url "$DCR_URL" --body "@$DCR_RULE_FILE" --only-show-errors >/dev/null
+    DCR_ACTION="created"
 fi
-DCR_ID=$(az monitor data-collection rule show --name "$DCR_NAME" --resource-group "$RG_NAME" --query id -o tsv)
-DCR_IMMUTABLE_ID=$(az monitor data-collection rule show --name "$DCR_NAME" --resource-group "$RG_NAME" --query immutableId -o tsv)
+rm -f "$DCR_RULE_FILE" "$DCR_CURRENT_FILE"
+trap - EXIT
+
+DCR_ID=$(az rest --method get --url "$DCR_URL" --only-show-errors --query id -o tsv)
+DCR_IMMUTABLE_ID=$(az rest --method get --url "$DCR_URL" --only-show-errors --query properties.immutableId -o tsv)
 # The URL route segment is "Microsoft-OTLP-{Logs,Traces}" (the OTLP wire
 # protocol endpoint name), NOT the DCR-internal "Microsoft-OTel-*" stream ids
 # declared above — those are two different names for two different layers.
@@ -194,7 +245,7 @@ DCR_IMMUTABLE_ID=$(az monitor data-collection rule show --name "$DCR_NAME" --res
 # own docs are inconsistently cased on this point.
 OTLP_LOGS_ENDPOINT="${DCE_LOGS_INGESTION}/dataCollectionRules/${DCR_IMMUTABLE_ID}/streams/Microsoft-OTLP-Logs/otlp/v1/logs"
 OTLP_TRACES_ENDPOINT="${DCE_LOGS_INGESTION}/dataCollectionRules/${DCR_IMMUTABLE_ID}/streams/Microsoft-OTLP-Traces/otlp/v1/traces"
-echo "OK: $DCR_NAME ($DCR_ID)"
+echo "OK: $DCR_NAME ($DCR_ACTION) ($DCR_ID)"
 echo "  logs endpoint:   $OTLP_LOGS_ENDPOINT"
 echo "  traces endpoint: $OTLP_TRACES_ENDPOINT"
 
@@ -342,7 +393,6 @@ echo "=== Availability Test (webtest) ==="
 # `hidden-link:<appInsightsId>` tag (which associates the test with the AI
 # resource in the portal UI) follow the long-standing classic-webtest schema;
 # not exercised against a live subscription in this environment.
-SUBSCRIPTION_ID=$(az account show --query id -o tsv)
 WEBTEST_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/microsoft.insights/webtests/$WEBTEST_NAME"
 if ! az rest --method get --url "https://management.azure.com${WEBTEST_ID}?api-version=2022-06-15" --only-show-errors >/dev/null 2>&1; then
     REQUEST_GUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
