@@ -15,6 +15,7 @@ import os
 import sqlite3
 import tempfile
 import time
+import urllib.parse
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,8 +78,11 @@ def _snapshot_sqlite(src: Path, dst: Path, deadline_s: float = SNAPSHOT_DEADLINE
     instead of hanging while the run holds the overlap lock. A file that simply isn't a
     database raises sqlite3.Error (SNAPSHOT_NOT_A_DB) and is raw-captured instead.
     """
+    # Percent-encode the path: an unencoded '?' or '#' in the filename is parsed as a URI
+    # query/fragment, so 'weird?name.sqlite' would open an EMPTY 'weird' DB (silent data loss).
+    uri = "file:" + urllib.parse.quote(src.as_posix(), safe="/:") + "?mode=ro"
     try:
-        src_conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True, timeout=deadline_s)
+        src_conn = sqlite3.connect(uri, uri=True, timeout=deadline_s)
     except sqlite3.Error:
         return SNAPSHOT_NOT_A_DB
     deadline = time.monotonic() + deadline_s

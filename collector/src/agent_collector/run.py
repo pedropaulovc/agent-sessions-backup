@@ -143,7 +143,14 @@ def _process_item(cfg, st: State, transport: Transport, scanner: Scanner, item: 
         st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "ok")
         return ItemResult(changed=True)
 
-    body_path = _materialize(scanner, data)
+    try:
+        body_path = _materialize(scanner, data)
+    except OSError as e:
+        # Temp dir full/unwritable (ENOSPC) mid-staging: record and keep going so the run
+        # still finishes and heartbeats, rather than aborting all remaining files.
+        st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "error",
+                       error=f"stage failed: {e}")
+        return ItemResult(changed=True, error=f"{item.relpath}: stage failed: {e}")
     url = file_url(cfg.hub_url, cfg.machine_id, item.store, item.relpath)
     headers = {"x-content-hash": f"sha256:{sha}", "x-file-mtime": mtime_iso(item.mtime_ns)}
     status, body = transport.put(url, Path(body_path), headers)
@@ -268,9 +275,9 @@ def _do_backfill(cfg, st: State, concurrency: int, dry_run: bool) -> int:
     return 0
 
 
-def _record_read_error(events, totals, item, e) -> None:
+def _record_file_error(events, totals, item, e, code: str = "read_failed") -> None:
     totals["read_errors"] += 1
-    events.append({"level": "error", "code": "read_failed",
+    events.append({"level": "error", "code": code,
                    "message": f"{item.relpath}: {e}"[:500], "count": 1, "store": item.store})
 
 
@@ -285,7 +292,7 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
         try:
             sha = hash_file_prefix(item.source_path, item.size)
         except OSError as e:
-            _record_read_error(events, totals, item, e)
+            _record_file_error(events, totals, item, e)
             _cleanup_snapshot(item)
             continue
         hashed.append((item, sha))
@@ -317,11 +324,17 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
         try:
             data = read_exact(item.source_path, item.size)
         except OSError as e:
-            _record_read_error(events, totals, item, e)
+            _record_file_error(events, totals, item, e)
             _cleanup_snapshot(item)
             continue
         sha2 = hash_bytes(data)  # authoritative bytes+hash pair actually sent
-        body_path = _materialize(scanner, data)
+        try:
+            body_path = _materialize(scanner, data)
+        except OSError as e:
+            # Temp dir full/unwritable mid-staging: skip this file, keep going.
+            _record_file_error(events, totals, item, e, code="write_failed")
+            _cleanup_snapshot(item)
+            continue
         headers = {"x-content-hash": f"sha256:{sha2}",
                    "x-file-mtime": mtime_iso(item.mtime_ns)}
         url = file_url(cfg.hub_url, cfg.machine_id, item.store, item.relpath)
@@ -429,8 +442,9 @@ def cmd_doctor(args) -> int:
             for pat, n in scanner.top_excluded(store, 5):
                 print(f"           excluded {n:>5}  {pat}")
         for e in scanner.events:
-            mark = "FAIL" if e["level"] == "error" else "warn"
-            print(f"[{mark}] {e['code']}: {e['message']}")
+            is_error = e["level"] == "error"
+            ok = ok and not is_error  # traversal errors mean the capture-all scan is incomplete
+            print(f"[{'FAIL' if is_error else 'warn'}] {e['code']}: {e['message']}")
     finally:
         scanner.close()
 

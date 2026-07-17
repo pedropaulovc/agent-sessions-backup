@@ -25,6 +25,15 @@ def test_console_script_execute_and_argument_split(monkeypatch):
     assert "run --once" not in execute
 
 
+def test_apostrophe_in_path_doubled_in_ps_literal(monkeypatch):
+    monkeypatch.setattr(taskscheduler.shutil, "which",
+                        lambda _n: r"C:\Users\O'Neil\agent-collector.exe")
+    script = taskscheduler._install_script(15)
+    # single-quoted PS literal: an apostrophe must be doubled ('') or the string terminates early
+    assert r"C:\Users\O''Neil\agent-collector.exe" in script
+    assert r"C:\Users\O'Neil\agent-collector.exe" not in script  # un-doubled form must be gone
+
+
 def test_module_fallback_execute_is_python_only(monkeypatch):
     monkeypatch.setattr(taskscheduler.shutil, "which", lambda _n: None)
     script = taskscheduler._install_script(15)

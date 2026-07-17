@@ -309,6 +309,72 @@ def test_run_surfaces_walk_error_in_heartbeat(tmp_path, hub, monkeypatch):
     assert ("m1", "claude", "a.jsonl") in hub.files  # scan continued, file uploaded
 
 
+def test_run_materialize_oserror_skips_file_and_continues(tmp_path, hub, monkeypatch):
+    root = tmp_path / "claude"
+    root.mkdir()
+    (root / "a.jsonl").write_bytes(b"aaa")
+    (root / "b.jsonl").write_bytes(b"bbb")
+    cfg = _cfg(hub, root)
+    real = run_mod._materialize
+
+    def flaky(scanner, data):
+        if data == b"aaa":
+            raise OSError(28, "No space left on device")
+        return real(scanner, data)
+
+    monkeypatch.setattr(run_mod, "_materialize", flaky)
+    with State(tmp_path / "state.db") as st:
+        rc = run_mod._do_run(cfg, st)
+    assert rc == 0  # run finished despite the staging failure
+    assert ("m1", "claude", "b.jsonl") in hub.files
+    assert ("m1", "claude", "a.jsonl") not in hub.files
+    assert any("stage failed" in e["message"] for e in hub.heartbeats[-1]["events"])
+
+
+def test_backfill_materialize_oserror_skips_file_and_continues(tmp_path, hub, monkeypatch):
+    root = tmp_path / "claude"
+    root.mkdir()
+    (root / "a.jsonl").write_bytes(b"aaa")
+    (root / "b.jsonl").write_bytes(b"bbb")
+    cfg = _cfg(hub, root)
+    real = run_mod._materialize
+
+    def flaky(scanner, data):
+        if data == b"aaa":
+            raise OSError(28, "No space left on device")
+        return real(scanner, data)
+
+    monkeypatch.setattr(run_mod, "_materialize", flaky)
+    with State(tmp_path / "state.db") as st:
+        run_mod._do_backfill(cfg, st, concurrency=2, dry_run=False)
+        assert st.pending_event_count() >= 1  # write_failed buffered for next heartbeat
+    assert ("m1", "claude", "b.jsonl") in hub.files
+    assert ("m1", "claude", "a.jsonl") not in hub.files
+
+
+def test_doctor_fails_on_walk_error(tmp_path, hub, tmp_env, monkeypatch):
+    import agent_collector.scanner as scanner_mod
+    # config/state/hub checks all PASS, so only the walk error can make doctor fail.
+    path = config.config_path()
+    config.enroll(hub.url, dev=True, path=path, machine_id="m1")
+    claude = tmp_path / "home" / ".claude"
+    claude.mkdir(parents=True)
+    (claude / "s.jsonl").write_text("{}")
+
+    real_walk = scanner_mod.os.walk
+
+    def erroring_walk(top, topdown=True, onerror=None, followlinks=False):
+        if onerror:
+            err = OSError(13, "Permission denied")
+            err.filename = str(top) + "/secret"
+            onerror(err)
+        yield from real_walk(top, topdown=topdown, onerror=onerror, followlinks=followlinks)
+
+    monkeypatch.setattr(scanner_mod.os, "walk", erroring_walk)
+    rc = run_mod.cmd_doctor(types.SimpleNamespace(config=str(path)))
+    assert rc == 1  # traversal error => incomplete scan => nonzero exit
+
+
 def test_run_lock_prevents_overlap(tmp_path, hub, tmp_env, monkeypatch):
     # enroll writes a real config the CLI path will load
     path = config.config_path()

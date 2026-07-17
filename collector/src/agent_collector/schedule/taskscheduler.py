@@ -21,6 +21,12 @@ def _script_path() -> Path:
     return config_mod.config_dir() / "agent-collector-task.ps1"
 
 
+def _ps_quote(value: str) -> str:
+    """Escape a value for a single-quoted PowerShell literal by doubling apostrophes, so a
+    path like C:\\Users\\O'Neil\\... doesn't terminate the string early."""
+    return value.replace("'", "''")
+
+
 def _action_parts() -> tuple[str, str]:
     """(-Execute, -Argument): the executable path only, then its arguments separately.
 
@@ -36,18 +42,19 @@ def _action_parts() -> tuple[str, str]:
 def _install_script(interval: int) -> str:
     execute, argument = _action_parts()
     return (
-        f"$action = New-ScheduledTaskAction -Execute '{execute}' -Argument '{argument}'\n"
+        f"$action = New-ScheduledTaskAction -Execute '{_ps_quote(execute)}' "
+        f"-Argument '{_ps_quote(argument)}'\n"
         f"$trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) "
         f"-RepetitionInterval (New-TimeSpan -Minutes {interval}) "
         "-RandomDelay (New-TimeSpan -Minutes 5)\n"
         "$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable\n"
-        f"Register-ScheduledTask -TaskName '{TASK_NAME}' -Action $action "
+        f"Register-ScheduledTask -TaskName '{_ps_quote(TASK_NAME)}' -Action $action "
         "-Trigger $trigger -Settings $settings -Force\n"
     )
 
 
 def _uninstall_script() -> str:
-    return f"Unregister-ScheduledTask -TaskName '{TASK_NAME}' -Confirm:$false\n"
+    return f"Unregister-ScheduledTask -TaskName '{_ps_quote(TASK_NAME)}' -Confirm:$false\n"
 
 
 def _write_and_maybe_run(script: str, verb: str) -> int:

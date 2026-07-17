@@ -3,6 +3,8 @@ import os
 import sqlite3
 import time
 
+import pytest
+
 from agent_collector import config
 from agent_collector.scanner import (
     Scanner, path_matches, read_exact, hash_bytes, hash_file_prefix, _snapshot_sqlite,
@@ -149,6 +151,29 @@ def test_snapshot_outcomes_ok_and_not_a_db(tmp_path):
     garbage = tmp_path / "junk.db"
     garbage.write_bytes(b"not a database at all")
     assert _snapshot_sqlite(garbage, tmp_path / "no.sqlite") == SNAPSHOT_NOT_A_DB
+
+
+@pytest.mark.parametrize("name", ["weird?name.sqlite", "hash#name.sqlite"])
+def test_snapshot_uri_delimiters_in_filename(tmp_path, name):
+    # Codex repro: an unencoded '?'/'#' in the path is parsed as a URI query/fragment, so
+    # the snapshot would come from an EMPTY 'weird'/'hash' DB. Assert the real tables survive.
+    src = tmp_path / name
+    try:
+        c = sqlite3.connect(src)
+    except sqlite3.OperationalError:
+        pytest.skip("filesystem rejects this filename")
+    c.execute("CREATE TABLE marker(x)")
+    c.execute("INSERT INTO marker VALUES('present')")
+    c.commit()
+    c.close()
+
+    dst = tmp_path / "snap.sqlite"
+    assert _snapshot_sqlite(src, dst) == SNAPSHOT_OK
+    snap = sqlite3.connect(dst)
+    try:
+        assert snap.execute("SELECT x FROM marker").fetchone()[0] == "present"
+    finally:
+        snap.close()
 
 
 def test_locked_db_skipped_with_event_garbage_db_raw_captured(tmp_path):
