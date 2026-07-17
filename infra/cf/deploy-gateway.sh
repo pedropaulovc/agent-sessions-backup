@@ -15,6 +15,7 @@
 # Usage:
 #   ./infra/cf/deploy-gateway.sh                 # reuse/generate bearer, deploy
 #   OIDC_KEY_FILE=/path/key.pem ./infra/cf/deploy-gateway.sh   # also set OIDC_SIGNING_KEY
+#   ./infra/cf/deploy-gateway.sh --rotate-bearer # mint a NEW bearer on purpose
 #
 # Env:
 #   CLOUDFLARE_ACCOUNT_ID  defaults to the vza.net-owning account (two accounts
@@ -23,6 +24,14 @@
 #   OIDC_KEY_FILE          optional path to the RSA private key PEM from
 #                          scripts/generate-gateway-key.mjs; when set, its
 #                          OIDC_SIGNING_KEY secret is (re)uploaded too.
+#
+# Flags:
+#   --rotate-bearer        deliberately mint a fresh INGEST_BEARER even though
+#                          the worker already exists and no local env file holds
+#                          the current one. Only pass this when you INTEND to
+#                          rotate — you must then update the account-level
+#                          dashboard destinations (telemetry.md step 9) with the
+#                          new bearer, or the gateway will 200-no-op every post.
 #
 # Idempotent: re-running reuses the existing bearer from cf-observability.env and
 # just redeploys. Portable to bash 3.2 (no bash4-only features), matching
@@ -35,19 +44,15 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CONFIG="wrangler.telemetry-gateway.jsonc"
 ENV_FILE="$REPO_ROOT/infra/out/cf-observability.env"
 
-export CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-18ef3246e9f36d1560485ef53889c0ab}"
+ROTATE_BEARER=no
+for arg in "$@"; do
+    case "$arg" in
+        --rotate-bearer) ROTATE_BEARER=yes ;;
+        *) echo "unknown argument: $arg (only --rotate-bearer is accepted)" >&2; exit 1 ;;
+    esac
+done
 
-# Reuse an already-issued bearer if we have one, else mint a fresh one. This is
-# what makes the script safe to re-run: the destinations in the dashboard keep
-# working across redeploys because the bearer doesn't churn.
-if [ -f "$ENV_FILE" ] && grep -q '^INGEST_BEARER=' "$ENV_FILE"; then
-    INGEST_BEARER=$(grep '^INGEST_BEARER=' "$ENV_FILE" | head -1 | cut -d= -f2-)
-    BEARER_SOURCE="reused from $ENV_FILE"
-else
-    INGEST_BEARER=$(openssl rand -hex 32)
-    BEARER_SOURCE="generated fresh"
-fi
-echo "INGEST_BEARER: $BEARER_SOURCE"
+export CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-18ef3246e9f36d1560485ef53889c0ab}"
 
 # Best-known URL for the FIRST env-file write (before the worker is deployed).
 # Replaced with the real deployed URL after a successful deploy.
@@ -94,13 +99,6 @@ EOF
     mv "$tmp" "$ENV_FILE"
 }
 
-# Persist the bearer BEFORE the deploy that sets secrets. `wrangler deploy
-# --secrets-file` publishes a new worker version immediately, so if the deploy or
-# the URL extraction dies afterward, the live worker already holds this
-# write-only bearer — this early write is the only local copy to recover it from.
-write_env_file
-echo "Wrote $ENV_FILE (pre-deploy, URL=$GATEWAY_URL)"
-
 cd "$REPO_ROOT/hub"
 
 if [ -n "${OIDC_KEY_FILE:-}" ] && [ ! -f "$OIDC_KEY_FILE" ]; then
@@ -108,29 +106,77 @@ if [ -n "${OIDC_KEY_FILE:-}" ] && [ ! -f "$OIDC_KEY_FILE" ]; then
     exit 1
 fi
 
+# Probe worker existence FIRST — both guards below key off it. `wrangler
+# deployments list` exits 0 for a deployed worker, non-zero for an unknown name
+# (verified both ways against wrangler 4.111).
+if npx wrangler deployments list --config "$CONFIG" >/dev/null 2>&1; then
+    WORKER_EXISTS=yes
+else
+    WORKER_EXISTS=no
+fi
+
 # Fresh-worker guard. `wrangler deploy --secrets-file` creates the worker if
 # absent AND sets its secrets in the SAME atomic version — but a brand-new gateway
 # deployed WITHOUT OIDC_SIGNING_KEY can't sign the Azure assertion, so every
-# authorized request fails at signing. When the existence probe says the worker is
-# absent, OIDC_KEY_FILE is therefore mandatory. `wrangler deployments list` is the
-# probe: exit 0 for a deployed worker, non-zero for an unknown name (verified both
-# ways against wrangler 4.111). For an EXISTING worker OIDC_KEY_FILE is optional —
-# --secrets-file is additive (verified live: a deploy listing only INGEST_BEARER
-# left OIDC_SIGNING_KEY intact), so an omitted key preserves the live one.
-if npx wrangler deployments list --config "$CONFIG" >/dev/null 2>&1; then
+# authorized request fails at signing. When the worker is absent, OIDC_KEY_FILE is
+# therefore mandatory. For an EXISTING worker it's optional — --secrets-file is
+# additive (verified live: a deploy listing only INGEST_BEARER left
+# OIDC_SIGNING_KEY intact), so an omitted key preserves the live one.
+if [ "$WORKER_EXISTS" = no ] && [ -z "${OIDC_KEY_FILE:-}" ]; then
+    echo "ERROR: the gateway worker does not exist yet and OIDC_KEY_FILE is not set." >&2
+    echo "A fresh gateway cannot sign Azure assertions without OIDC_SIGNING_KEY, and" >&2
+    echo "--secrets-file only sets the secrets you give it (it never invents one)." >&2
+    echo "Generate a keypair with private perms:" >&2
+    echo "  (umask 077; node scripts/generate-gateway-key.mjs > key.pem)" >&2
+    echo "add its public JWK to gateway/oidc-issuer.ts + set OIDC_SIGNING_KID, then re-run:" >&2
+    echo "  OIDC_KEY_FILE=key.pem ./infra/cf/deploy-gateway.sh" >&2
+    exit 1
+fi
+
+# Bearer determination.
+#  - Local env file with a bearer  -> reuse it (the safe, common re-run path).
+#  - No local bearer, worker EXISTS -> the dashboard destinations already carry a
+#    bearer this machine can't see. Minting a new one here would leave them
+#    sending the old value, so the gateway would 200-no-op every post until
+#    someone noticed. Hard-error with the two legitimate recoveries instead.
+#  - No local bearer, worker ABSENT (or --rotate-bearer) -> generate fresh;
+#    nothing downstream depends on a prior value.
+if [ -f "$ENV_FILE" ] && grep -q '^INGEST_BEARER=' "$ENV_FILE"; then
+    INGEST_BEARER=$(grep '^INGEST_BEARER=' "$ENV_FILE" | head -1 | cut -d= -f2-)
+    BEARER_SOURCE="reused from $ENV_FILE"
+elif [ "$WORKER_EXISTS" = yes ] && [ "$ROTATE_BEARER" = no ]; then
+    echo "ERROR: the gateway worker already exists but $ENV_FILE is missing, so this" >&2
+    echo "machine has no copy of the live INGEST_BEARER. The account-level dashboard" >&2
+    echo "destinations are already sending the existing bearer; generating a new one" >&2
+    echo "here would make the gateway 200-no-op every post until the dashboard is" >&2
+    echo "updated by hand. Choose one:" >&2
+    echo "  1. Copy infra/out/cf-observability.env from the machine that first deployed" >&2
+    echo "     the gateway (it holds the live bearer), then re-run this script." >&2
+    echo "  2. If you INTEND to rotate the bearer, re-run with --rotate-bearer and then" >&2
+    echo "     update the dashboard destinations (telemetry.md step 9) with the new one." >&2
+    exit 1
+else
+    INGEST_BEARER=$(openssl rand -hex 32)
+    if [ "$ROTATE_BEARER" = yes ]; then
+        BEARER_SOURCE="rotated (--rotate-bearer) — UPDATE the dashboard destinations after this"
+    else
+        BEARER_SOURCE="generated fresh (new worker)"
+    fi
+fi
+echo "INGEST_BEARER: $BEARER_SOURCE"
+
+if [ "$WORKER_EXISTS" = yes ]; then
     echo "Gateway worker exists — deploying with additive secrets."
 else
-    if [ -z "${OIDC_KEY_FILE:-}" ]; then
-        echo "ERROR: the gateway worker does not exist yet and OIDC_KEY_FILE is not set." >&2
-        echo "A fresh gateway cannot sign Azure assertions without OIDC_SIGNING_KEY, and" >&2
-        echo "--secrets-file only sets the secrets you give it (it never invents one)." >&2
-        echo "Generate a keypair (node scripts/generate-gateway-key.mjs > key.pem), add its" >&2
-        echo "public JWK to gateway/oidc-issuer.ts + set OIDC_SIGNING_KID, then re-run with" >&2
-        echo "OIDC_KEY_FILE=key.pem ./infra/cf/deploy-gateway.sh" >&2
-        exit 1
-    fi
     echo "Gateway worker not found — first deploy will create it with its secrets."
 fi
+
+# Persist the bearer BEFORE the deploy that sets secrets. `wrangler deploy
+# --secrets-file` publishes a new worker version immediately, so if the deploy or
+# the URL extraction dies afterward, the live worker already holds this
+# write-only bearer — this early write is the only local copy to recover it from.
+write_env_file
+echo "Wrote $ENV_FILE (pre-deploy, URL=$GATEWAY_URL)"
 
 # Build the secrets bundle: INGEST_BEARER always, OIDC_SIGNING_KEY only when a key
 # file is given. One temp file, 0600, removed on exit even if the deploy fails —
