@@ -6,6 +6,7 @@ import { runWatchdog } from '../src/cron/watchdog';
 // (PRAGMA page_count/page_size) vs. the machines roster query.
 function makeEnv(opts: {
   machines: Array<{ machine_id: string; last_ref: string | null; age_seconds: number | null }>;
+  rosterThrows?: boolean;
   size?: { throws?: boolean; bytes?: number | null };
 }): Env {
   return {
@@ -19,7 +20,12 @@ function makeEnv(opts: {
             },
           };
         }
-        return { all: async () => ({ results: opts.machines }) };
+        return {
+          all: async () => {
+            if (opts.rosterThrows) throw new Error('no such table: machines');
+            return { results: opts.machines };
+          },
+        };
       },
     },
   } as unknown as Env;
@@ -57,6 +63,7 @@ describe('watchdog', () => {
     expect(events.find((e) => e.event === 'hub.d1.db_size_bytes')?.bytes).toBe(123456);
     const run = events.find((e) => e.event === 'hub.watchdog.run');
     expect(run?.machine_count).toBe(2);
+    expect(run?.roster_ok).toBe(true);
     expect(events.some((e) => e.event === 'hub.watchdog.warn')).toBe(false);
   });
 
@@ -68,7 +75,19 @@ describe('watchdog', () => {
     // pipeline-silent leg on this event's absence, not on missing ages).
     const run = events.find((e) => e.event === 'hub.watchdog.run');
     expect(run?.machine_count).toBe(0);
+    expect(run?.roster_ok).toBe(true);
     expect(events.some((e) => e.event === 'hub.machine.heartbeat_age')).toBe(false);
+  });
+
+  it('stamps roster_ok:false on the beacon (and emits no ages) when the roster read throws', async () => {
+    const events = captureLogs();
+    await runWatchdog(makeEnv({ machines: [], rosterThrows: true, size: { bytes: 4096 } }));
+    const run = events.find((e) => e.event === 'hub.watchdog.run');
+    // Beacon still goes out (pipeline is alive) but flags the blind spot so
+    // missed-heartbeat.kql fires __roster_unavailable__ instead of reading healthy.
+    expect(run?.roster_ok).toBe(false);
+    expect(events.some((e) => e.event === 'hub.machine.heartbeat_age')).toBe(false);
+    expect(events.some((e) => e.event === 'hub.watchdog.warn' && e.tag === 'machines-roster-unavailable')).toBe(true);
   });
 
   it('emits a bytes:-1 sentinel + warn when the size probe throws', async () => {

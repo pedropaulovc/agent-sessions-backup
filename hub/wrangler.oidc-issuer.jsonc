@@ -1,6 +1,11 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "sessions-oidc-issuer",
+  // Pin the account: ISSUER_URL below hard-codes the pedro-18e subdomain and
+  // Azure's federated credential trusts exactly that URL, so a bare deploy must
+  // never land on a different account the wrangler token can also see (two are
+  // visible). Same account as hub/wrangler.jsonc + wrangler.telemetry-gateway.jsonc.
+  "account_id": "18ef3246e9f36d1560485ef53889c0ab",
   "main": "gateway/oidc-issuer.ts",
   "compatibility_date": "2026-07-01",
   "compatibility_flags": ["nodejs_compat"],

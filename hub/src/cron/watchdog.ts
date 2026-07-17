@@ -38,6 +38,7 @@ export async function runWatchdog(env: Env): Promise<void> {
   // still gets an age (from enrollment), so a collector that never came up is
   // caught by the same alert rather than being invisible.
   let machineCount = 0;
+  let rosterOk = true;
   try {
     const rows = await env.DB.prepare(
       `SELECT machine_id,
@@ -58,13 +59,20 @@ export async function runWatchdog(env: Env): Promise<void> {
       );
     }
   } catch (e) {
+    // Roster read failed: no heartbeat_age rows this run, so stale-machine
+    // monitoring is blind. Stamp roster_ok:false on the beacon below so
+    // missed-heartbeat.kql can fire a __roster_unavailable__ row — a healthy
+    // beacon alone would otherwise read as "pipeline alive, all machines fine".
+    rosterOk = false;
     console.log(JSON.stringify({ event: 'hub.watchdog.warn', tag: 'machines-roster-unavailable', error: String(e) }));
   }
 
   // Unconditional liveness beacon (see the header). Emitted regardless of roster
   // size or a roster-read failure — its mere presence in the window tells
-  // missed-heartbeat.kql the pipeline is alive.
-  console.log(JSON.stringify({ event: 'hub.watchdog.run', machine_count: machineCount }));
+  // missed-heartbeat.kql the pipeline is alive; roster_ok distinguishes "alive
+  // and roster readable" from "alive but roster read failed" (the latter blinds
+  // stale-machine detection and must itself alert).
+  console.log(JSON.stringify({ event: 'hub.watchdog.run', machine_count: machineCount, roster_ok: rosterOk }));
 
   // D1 size gauge (plan wants an alert at ~7 GB). If the PRAGMA-backed
   // table-valued functions aren't available on D1 (or return nothing), emit an

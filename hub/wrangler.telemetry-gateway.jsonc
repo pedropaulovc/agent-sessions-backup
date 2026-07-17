@@ -1,6 +1,11 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "sessions-telemetry-gateway",
+  // Pin the account (two are visible to the wrangler token): this worker's URL
+  // is what the Cloudflare observability destinations POST to and its OIDC_ISSUER_URL
+  // is the pedro-18e issuer Azure federates against — a deploy to the wrong
+  // account would silently break the pipeline. Same account as hub/wrangler.jsonc.
+  "account_id": "18ef3246e9f36d1560485ef53889c0ab",
   "main": "gateway/telemetry-gateway.ts",
   "compatibility_date": "2026-07-01",
   "compatibility_flags": ["nodejs_compat"],

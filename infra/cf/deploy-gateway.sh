@@ -49,43 +49,21 @@ else
 fi
 echo "INGEST_BEARER: $BEARER_SOURCE"
 
-cd "$REPO_ROOT/hub"
+# Best-known URL for the FIRST env-file write (before the worker is deployed).
+# Replaced with the real deployed URL after a successful deploy.
+GATEWAY_URL="https://sessions-telemetry-gateway.pedro-18e.workers.dev"
 
-# Optional: (re)set the OIDC signing private key. Piped via stdin, never on the
-# command line / interactive prompt (avoids scrollback capture).
-if [ -n "${OIDC_KEY_FILE:-}" ]; then
-    if [ ! -f "$OIDC_KEY_FILE" ]; then
-        echo "OIDC_KEY_FILE=$OIDC_KEY_FILE does not exist" >&2
-        exit 1
-    fi
-    echo "Setting OIDC_SIGNING_KEY from $OIDC_KEY_FILE"
-    npx wrangler secret put OIDC_SIGNING_KEY --config "$CONFIG" < "$OIDC_KEY_FILE"
-fi
-
-# printf (no trailing newline) so the secret value is exactly the bearer.
-printf '%s' "$INGEST_BEARER" | npx wrangler secret put INGEST_BEARER --config "$CONFIG"
-
-# Capture deploy output so we can read the real deployed workers.dev URL rather
-# than hard-coding the subdomain. The extraction MUST be non-fatal: under
-# `set -euo pipefail` a grep miss (custom-domain route, or a wrangler output
-# format change) returns non-zero and would abort the script here — AFTER the
-# Worker secret is already set but BEFORE cf-observability.env is written, i.e.
-# exactly the bearer-loss failure this script exists to prevent. `|| true` keeps
-# it alive so the `${GATEWAY_URL:-<default>}` fallback on the next line runs.
-DEPLOY_OUT=$(npx wrangler deploy --config "$CONFIG" 2>&1)
-echo "$DEPLOY_OUT"
-GATEWAY_URL=$(printf '%s\n' "$DEPLOY_OUT" | grep -oE 'https://sessions-telemetry-gateway\.[a-z0-9-]+\.workers\.dev' | head -1 || true)
-GATEWAY_URL="${GATEWAY_URL:-https://sessions-telemetry-gateway.pedro-18e.workers.dev}"
-
-# Write to a fresh temp file created under umask 077, then mv it over the target.
-# umask only governs the mode of NEWLY created files, so a bare `> "$ENV_FILE"`
-# onto a pre-existing 0644 cf-observability.env would leave the bearer
-# world-readable. The temp-then-mv guarantees 0600 regardless of any prior file,
-# and the mv is atomic so no reader ever sees a half-written secret.
-mkdir -p "$(dirname "$ENV_FILE")"
-ENV_TMP=$(mktemp "${TMPDIR:-/tmp}/agent-backup-cfobs.XXXXXX")
-chmod 600 "$ENV_TMP"
-(umask 077; cat > "$ENV_TMP" <<EOF
+# Writes cf-observability.env atomically at mode 0600 from the current
+# $GATEWAY_URL + $INGEST_BEARER. Called TWICE (see below). Temp-then-mv because
+# umask only governs the mode of NEWLY created files — a bare redirect onto a
+# pre-existing 0644 file would leave the bearer world-readable — and the mv is
+# atomic so no reader ever sees a half-written secret.
+write_env_file() {
+    mkdir -p "$(dirname "$ENV_FILE")"
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/agent-backup-cfobs.XXXXXX")
+    chmod 600 "$tmp"
+    (umask 077; cat > "$tmp" <<EOF
 # Cloudflare account-level observability destinations — MANUAL DASHBOARD STEP.
 # Written by infra/cf/deploy-gateway.sh. GITIGNORED (infra/out/) — contains the
 # INGEST_BEARER secret; never commit. Account-level observability destinations
@@ -112,8 +90,46 @@ INGEST_BEARER=$INGEST_BEARER
 GATEWAY_LOGS_ENDPOINT=$GATEWAY_URL/v1/logs
 GATEWAY_TRACES_ENDPOINT=$GATEWAY_URL/v1/traces
 EOF
-)
-mv "$ENV_TMP" "$ENV_FILE"
+    )
+    mv "$tmp" "$ENV_FILE"
+}
+
+# Persist the bearer BEFORE touching Worker secrets. `wrangler secret put`
+# deploys a new worker version immediately, so if any later step (the deploy, the
+# URL extraction, anything) dies, the live worker already holds this write-only
+# bearer — without this early write there'd be no local copy to recover it from.
+write_env_file
+echo "Wrote $ENV_FILE (pre-deploy, URL=$GATEWAY_URL)"
+
+cd "$REPO_ROOT/hub"
+
+# Optional: (re)set the OIDC signing private key. Piped via stdin, never on the
+# command line / interactive prompt (avoids scrollback capture).
+if [ -n "${OIDC_KEY_FILE:-}" ]; then
+    if [ ! -f "$OIDC_KEY_FILE" ]; then
+        echo "OIDC_KEY_FILE=$OIDC_KEY_FILE does not exist" >&2
+        exit 1
+    fi
+    echo "Setting OIDC_SIGNING_KEY from $OIDC_KEY_FILE"
+    npx wrangler secret put OIDC_SIGNING_KEY --config "$CONFIG" < "$OIDC_KEY_FILE"
+fi
+
+# printf (no trailing newline) so the secret value is exactly the bearer.
+printf '%s' "$INGEST_BEARER" | npx wrangler secret put INGEST_BEARER --config "$CONFIG"
+
+# Capture deploy output so we can read the real deployed workers.dev URL rather
+# than the pre-deploy default. The extraction MUST be non-fatal: under
+# `set -euo pipefail` a grep miss (custom-domain route, or a wrangler output
+# format change) returns non-zero and would abort the script — `|| true` keeps
+# it alive so the `${GATEWAY_URL:-<default>}` fallback runs. (The bearer is
+# already persisted above regardless, so a death here loses nothing.)
+DEPLOY_OUT=$(npx wrangler deploy --config "$CONFIG" 2>&1)
+echo "$DEPLOY_OUT"
+GATEWAY_URL=$(printf '%s\n' "$DEPLOY_OUT" | grep -oE 'https://sessions-telemetry-gateway\.[a-z0-9-]+\.workers\.dev' | head -1 || true)
+GATEWAY_URL="${GATEWAY_URL:-https://sessions-telemetry-gateway.pedro-18e.workers.dev}"
+
+# Rewrite with the real deployed URL now that we have it.
+write_env_file
 
 echo ""
 echo "Deployed $GATEWAY_URL"
