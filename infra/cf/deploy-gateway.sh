@@ -26,12 +26,17 @@
 #                          OIDC_SIGNING_KEY secret is (re)uploaded too.
 #
 # Flags:
-#   --rotate-bearer        deliberately mint a fresh INGEST_BEARER even though
-#                          the worker already exists and no local env file holds
-#                          the current one. Only pass this when you INTEND to
-#                          rotate — you must then update the account-level
-#                          dashboard destinations (telemetry.md step 9) with the
-#                          new bearer, or the gateway will 200-no-op every post.
+#   --rotate-bearer        deliberately mint a fresh INGEST_BEARER even when a
+#                          local env file already holds one (its whole point is
+#                          replacing a leaked bearer from the normal operator
+#                          box, which is exactly the box that HAS the file). The
+#                          current file is first copied to cf-observability.env
+#                          .prev (0600) so the OLD bearer survives a failed
+#                          rotation — recovery is `mv ...env.prev ...env`; .prev
+#                          is removed on a successful deploy. You must then update
+#                          the account-level dashboard destinations (telemetry.md
+#                          step 9) with the new bearer, or the gateway 200-no-ops
+#                          every post.
 #
 # Idempotent: re-running reuses the existing bearer from cf-observability.env and
 # just redeploys. Portable to bash 3.2 (no bash4-only features), matching
@@ -185,6 +190,23 @@ else
     echo "Gateway worker not found — first deploy will create it with its secrets."
 fi
 
+# Rotation only: preserve the OLD bearer before the pre-deploy write overwrites
+# it. Until this deploy actually publishes, the live worker AND the dashboard
+# destinations still run the OLD bearer — but the write below replaces the env
+# file's copy of it with the new one. If the secrets build (key-read) or the
+# deploy (bundling/auth) then fails before publishing, the old bearer's only
+# durable copy would be gone (worker secrets are write-only). .prev is that
+# safety net; recovery is `mv cf-observability.env.prev cf-observability.env`.
+# Same 0600 temp-then-mv discipline as write_env_file. Removed on success below.
+if [ "$ROTATE_BEARER" = yes ] && [ -f "$ENV_FILE" ]; then
+    prev_tmp=$(mktemp "${TMPDIR:-/tmp}/agent-backup-cfobs-prev.XXXXXX")
+    chmod 600 "$prev_tmp"
+    cat "$ENV_FILE" > "$prev_tmp"
+    mv "$prev_tmp" "$ENV_FILE.prev"
+    echo "Rotation: backed up the previous bearer to $ENV_FILE.prev"
+    echo "  (if this deploy fails before publishing, restore it: mv '$ENV_FILE.prev' '$ENV_FILE')"
+fi
+
 # Persist the bearer BEFORE the deploy that sets secrets. `wrangler deploy
 # --secrets-file` publishes a new worker version immediately, so if the deploy or
 # the URL extraction dies afterward, the live worker already holds this
@@ -229,6 +251,18 @@ GATEWAY_URL="${GATEWAY_URL:-https://sessions-telemetry-gateway.pedro-18e.workers
 # Rewrite with the real deployed URL now that we have it.
 write_env_file
 
+# Deploy published (set -e would have aborted above on any failure), so the OLD
+# bearer is now dead — the .prev safety net has done its job. Drop it so a
+# lingering .prev unambiguously means "a rotation failed mid-flight, restore me".
+if [ "$ROTATE_BEARER" = yes ] && [ -f "$ENV_FILE.prev" ]; then
+    rm -f "$ENV_FILE.prev"
+    echo "Rotation deploy succeeded — removed $ENV_FILE.prev (old bearer is now dead)."
+fi
+
 echo ""
 echo "Deployed $GATEWAY_URL"
 echo "Wrote $ENV_FILE (INGEST_BEARER + destination endpoints for the dashboard step)"
+if [ "$ROTATE_BEARER" = yes ]; then
+    echo "ROTATED: update the account-level dashboard destinations (telemetry.md step 9)"
+    echo "  with the new INGEST_BEARER now, or the gateway will 200-no-op every post."
+fi

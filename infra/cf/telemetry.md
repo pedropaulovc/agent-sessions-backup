@@ -101,7 +101,17 @@ consistently; don't mix the two conventions in the same session.
      that gitignored file (0600, atomic temp+mv) — written BEFORE the deploy so
      the bearer survives even if the deploy dies. This is the fix for the "Worker
      secrets are write-only, so the dashboard step can't recover the bearer"
-     trap — the file is the durable copy step 9 reads from.
+     trap — the file is the durable copy step 9 reads from. To deliberately
+     **rotate** the bearer (e.g. it leaked), run `./infra/cf/deploy-gateway.sh
+     --rotate-bearer`: it mints a fresh bearer even when the file already holds
+     one, and first copies the current file to `cf-observability.env.prev` (same
+     0600 discipline) so the OLD bearer survives if the rotation deploy fails
+     before publishing — **recovery is `mv infra/out/cf-observability.env.prev
+     infra/out/cf-observability.env`**. On a successful rotation `.prev` is
+     removed automatically (the old bearer is dead), so a lingering `.prev`
+     unambiguously means a rotation failed mid-flight. After any rotation you
+     MUST update the dashboard destinations (step 9) with the new bearer, or the
+     gateway 200-no-ops every post from the old-bearer destinations.
 
    Then delete the temp key — `rm -f /tmp/gateway-key.pem`. (`shred`/secure-delete
    is largely theater on modern SSD/FileVault/BitLocker volumes, so a plain `rm`
