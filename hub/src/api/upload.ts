@@ -5,6 +5,15 @@ import { hex } from './ops';
 
 const TERMINAL_PARSE_STATES = new Set(['parsed', 'skipped', 'superseded']);
 
+/** R2 customMetadata values must be strings, and the x-file-mtime header is optional — build the
+ * {mtime} customMetadata object only when we actually have one to record. reindex() reads this
+ * back (see ops.ts) to restore files.mtime for R2 objects whose D1 row was lost/wiped; a legacy
+ * object written before this existed (or an upload that never sent x-file-mtime) simply has no
+ * customMetadata, and reindex treats that as mtime IS NULL rather than failing. */
+function r2MtimeMetadata(mtime: string | null): Record<string, string> | undefined {
+  return mtime !== null ? { mtime } : undefined;
+}
+
 /** PUT /api/v1/files/{machine_id}/{store}/{relpath...} */
 export async function putFile(
   request: Request,
@@ -56,7 +65,7 @@ export async function putFile(
     const headChecksum = head?.checksums.sha256 ? hex(head.checksums.sha256) : undefined;
     if (!head || headChecksum !== existing.content_hash) {
       try {
-        await env.RAW.put(existing.r2_key, request.body, { sha256 });
+        await env.RAW.put(existing.r2_key, request.body, { sha256, customMetadata: r2MtimeMetadata(mtime) });
       } catch (e) {
         return Response.json({ error: 'checksum_or_write_failure', detail: String(e) }, { status: 400 });
       }
@@ -93,7 +102,7 @@ export async function putFile(
   // what R2 actually stored could pick the wrong raw file as canonical.
   let put: R2Object;
   try {
-    put = await env.RAW.put(r2Key, bodyBuf, { sha256 });
+    put = await env.RAW.put(r2Key, bodyBuf, { sha256, customMetadata: r2MtimeMetadata(mtime) });
   } catch (e) {
     return Response.json({ error: 'checksum_or_write_failure', detail: String(e) }, { status: 400 });
   }
@@ -158,12 +167,14 @@ export async function putFile(
  * request runs to detect and repair it.
  */
 export async function convergeR2WithRow(fileId: number, r2Key: string, sha256: string, body: ArrayBuffer, env: Env): Promise<void> {
-  const current = await env.DB.prepare('SELECT content_hash FROM files WHERE id = ?1').bind(fileId).first<{ content_hash: string }>();
+  const current = await env.DB.prepare('SELECT content_hash, mtime FROM files WHERE id = ?1')
+    .bind(fileId)
+    .first<{ content_hash: string; mtime: string | null }>();
   if (current?.content_hash !== sha256) return;
   const head = await env.RAW.head(r2Key);
   const headChecksum = head?.checksums.sha256 ? hex(head.checksums.sha256) : undefined;
   if (headChecksum === sha256) return;
-  await env.RAW.put(r2Key, body, { sha256 });
+  await env.RAW.put(r2Key, body, { sha256, customMetadata: r2MtimeMetadata(current.mtime) });
 }
 
 /** POST /api/v1/files/check — batch resync: which of these does the hub NOT have? */

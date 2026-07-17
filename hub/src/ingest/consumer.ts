@@ -25,9 +25,27 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
       msg.ack();
     } catch (e) {
       console.log(JSON.stringify({ event: 'parse.error', file_id: msg.body.file_id, error: String(e) }));
-      await env.DB.prepare("UPDATE files SET parse_state = 'error', parse_error = ?2 WHERE id = ?1")
-        .bind(msg.body.file_id, String(e).slice(0, 2000))
-        .run();
+      // Guarded by content_hash (when the message carries one): a throw partway through parseOne
+      // for a stale message must not clobber a row a re-upload has already moved on from — the
+      // fresh message owns that row now and is responsible for its own success/failure outcome.
+      // Without this guard, a slow/retried stale delivery throwing (e.g. r2_object_missing on an
+      // R2 key a re-upload since overwrote) could flip a row the fresh parse already marked
+      // 'parsed' back to 'error', or race the fresh parse's own writes.
+      const guarded = msg.body.content_hash !== undefined;
+      const errStmt = env.DB.prepare(
+        `UPDATE files SET parse_state = 'error', parse_error = ?2 WHERE id = ?1${guarded ? ' AND content_hash = ?3' : ''}`,
+      );
+      const errUpdate = await (guarded
+        ? errStmt.bind(msg.body.file_id, String(e).slice(0, 2000), msg.body.content_hash)
+        : errStmt.bind(msg.body.file_id, String(e).slice(0, 2000))
+      ).run();
+      if (guarded && (errUpdate.meta?.changes ?? 0) === 0) {
+        // The row has already moved on — the fresh message owns it. Skip the session-error flip
+        // and recovery-kick below entirely: they exist to recover from THIS file's failure, and
+        // this file's failure is stale (its bytes/row no longer describe current reality).
+        msg.retry();
+        continue;
+      }
       // Otherwise a failed reparse leaves index_state='parsing' forever and /api/v1/status never
       // surfaces the error. No-op when the file has no session_id (nothing was ever indexed), and
       // — guarded — when a DIFFERENT file is already the session's canonical: that means some
@@ -221,6 +239,18 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
     return;
   }
 
+  // Recheck immediately before the index_state flip + writeSession: everything from R2.get()
+  // through chooseBestParsed above is async and can take a while (large transcripts, D1
+  // round-trips), so a re-upload can land at any point in that window. Catching it here — as
+  // close to the write as the code structure allows — narrows, but per the belt-and-braces check
+  // after writeSession below, doesn't have to fully close, the remaining gap.
+  if (job.content_hash !== undefined) {
+    const recheck = await env.DB.prepare('SELECT content_hash FROM files WHERE id = ?1')
+      .bind(file.id)
+      .first<{ content_hash: string }>();
+    if (recheck?.content_hash !== job.content_hash) return;
+  }
+
   await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(det.sessionId).run();
   await writeSession(parsed, file, env);
   // Guarded by content_hash: if a re-upload changed this row's hash while writeSession above was
@@ -229,7 +259,18 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
   // above is superseded moments later when that fresh parse completes (writeSession is a full
   // delete+reinsert per session_id), so it's a harmless transient rather than a lasting error.
   const { updated } = await markParsed(file.id, env, 'parsed', file.size, undefined, job.content_hash);
-  if (!updated) return;
+  if (!updated) {
+    // The recheck above passed, but the row moved on during writeSession itself (R2 read /
+    // insert-heavy write can take a while). writeSession unconditionally just wrote this file's
+    // OLD content and flipped index_state to 'ready' (see writeSession's ON CONFLICT clause) —
+    // belt-and-braces: flip it back to 'parsing' so the session doesn't advertise stale content
+    // as ready while the fresh message (which owns this row now) does its own rewrite. Safe to
+    // do unconditionally: the parse queue runs with max_concurrency: 1 (wrangler.jsonc), so the
+    // fresh message's own parseOne cannot be running concurrently with this one — it hasn't had
+    // a chance to write its own 'ready' yet, so there's nothing legitimate to clobber here.
+    await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(det.sessionId).run();
+    return;
+  }
   // The recheck above already proved nothing PARSED outranks this file, so it's safe to claim the
   // supersede-others role unconditionally here (max_concurrency: 1 means nothing else could have
   // become 'parsed' in between). A worse-priority file that wrote because the preferred copy was

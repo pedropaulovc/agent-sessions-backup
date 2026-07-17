@@ -106,7 +106,7 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
   let cursor: string | undefined;
   let enqueued = 0;
   do {
-    const page: R2Objects = await env.RAW.list({ prefix, cursor, limit: 500 });
+    const page: R2Objects = await env.RAW.list({ prefix, cursor, limit: 500, include: ['customMetadata'] });
     for (const obj of page.objects) {
       const parts = obj.key.split('/'); // raw/{machine}/{store}/{relpath...}
       if (parts.length < 4 || parts[0] !== 'raw') continue;
@@ -120,16 +120,32 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
         .run();
       const det = detect(store, relpath);
       const contentHash = obj.checksums?.sha256 ? hex(obj.checksums.sha256) : 'unknown';
+      // R2 doesn't carry files.mtime natively — it's the SOURCE file's mtime, recorded as
+      // customMetadata on the object by upload.ts's PUT calls (see r2MtimeMetadata there). A
+      // legacy object written before that existed simply has no customMetadata; fall back to
+      // NULL rather than clobbering a row's already-known mtime with a wrong value on reindex.
+      const mtime = obj.customMetadata?.mtime ?? null;
       const row = await env.DB.prepare(
-        `INSERT INTO files (machine_id, store, relpath, r2_key, size, content_hash, harness, session_id, parse_state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')
+        `INSERT INTO files (machine_id, store, relpath, r2_key, size, mtime, content_hash, harness, session_id, parse_state)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')
          ON CONFLICT (machine_id, store, relpath) DO UPDATE SET
-           parse_state = 'pending', size = excluded.size, harness = excluded.harness, session_id = excluded.session_id,
-           content_hash = excluded.content_hash
+           parse_state = 'pending', size = excluded.size, mtime = COALESCE(excluded.mtime, files.mtime),
+           harness = excluded.harness, session_id = excluded.session_id, content_hash = excluded.content_hash
          RETURNING id`,
       )
-        .bind(machineId, store, relpath, obj.key, obj.size, contentHash, det.harness, det.sessionId ?? null)
+        .bind(machineId, store, relpath, obj.key, obj.size, mtime, contentHash, det.harness, det.sessionId ?? null)
         .first<{ id: number }>();
+      if (det.sessionId) {
+        // Mirrors upload.ts's canonical-reupload fix: this upsert just flipped the row back to
+        // 'pending' (unconditionally, above) and is about to enqueue a fresh parse — if this file
+        // is the session's CURRENT canonical, sessions.index_state (and the blocks/FTS it
+        // advertises) would otherwise stay 'ready', describing whatever this file parsed to
+        // BEFORE this reindex, until the queue consumer gets around to it. No-op for a brand-new
+        // session (no sessions row yet) or a non-canonical duplicate.
+        await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1 AND canonical_file_id = ?2")
+          .bind(det.sessionId, row!.id)
+          .run();
+      }
       await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: obj.key, reason: 'reindex', content_hash: contentHash });
       enqueued++;
     }

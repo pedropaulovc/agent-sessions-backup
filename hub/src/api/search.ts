@@ -30,7 +30,17 @@ export async function search(url: URL, env: Env): Promise<Response> {
 
   // Returns null (rather than throwing) on invalid FTS5 syntax, so the two-step fallback below
   // can tell "this match string didn't work" apart from a genuine infra error without a second
-  // layer of try/catch at each call site.
+  // layer of try/catch at each call site. Only recognized FTS5 syntax-error signatures are
+  // swallowed — anything else (a missing blocks_fts table after a bad migration, a transient D1
+  // failure) rethrows, so a real outage surfaces as an error instead of a deceptive 200 with
+  // empty hits that makes the corpus look merely unmatched. Signatures captured empirically
+  // against this D1/SQLite build (see the regression tests), not guessed: 'unterminated string'
+  // (odd/NUL-broken quoting), 'fts5: syntax error' (stray operators/punctuation), 'unknown
+  // special query' (a bare '*'), and 'no such column:' — safe to include here specifically
+  // because this query's SQL template never references a user-controlled column name outside the
+  // MATCH clause, so that message can only come from FTS5's own column-filter syntax (e.g.
+  // q="badcol:term") rejecting bad user input, never a genuine schema mismatch on this fixed SQL.
+  const FTS5_SYNTAX_ERROR = /unterminated string|fts5: syntax error|unknown special query|no such column:/i;
   const run = async (match: string) => {
     try {
       return await env.DB.prepare(
@@ -46,7 +56,8 @@ export async function search(url: URL, env: Env): Promise<Response> {
       )
         .bind(match, ...binds)
         .all();
-    } catch {
+    } catch (e) {
+      if (!FTS5_SYNTAX_ERROR.test(String(e))) throw e;
       return null;
     }
   };

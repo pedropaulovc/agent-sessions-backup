@@ -132,6 +132,44 @@ describe('search handles a query whose quoted-phrase fallback is ALSO invalid FT
   });
 });
 
+describe('search only swallows recognized FTS5 syntax errors, not genuine D1/infra failures (regression: the catch-and-return-null in run() masked ANY error as "invalid query" — a dropped blocks_fts table or a transient D1 outage would 200 with fake-empty results instead of surfacing as a failure)', () => {
+  it('a genuine non-FTS D1 error (e.g. a missing table) is NOT swallowed — it still throws/500s', async () => {
+    const originalPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
+      if (sql.includes('FROM blocks_fts') && sql.includes('ORDER BY rank')) {
+        // Empirically-captured real D1 error message shape for a missing table, fabricated here
+        // to simulate infra breakage without actually dropping the real schema (storage isolation
+        // in this test pool is per-FILE, not per-test — a real DROP/RENAME would corrupt every
+        // other test in this file, verified directly with a disposable probe and reverted).
+        return {
+          bind: () => ({
+            all: async () => {
+              throw new Error('D1_ERROR: no such table: blocks_fts: SQLITE_ERROR');
+            },
+          }),
+        } as unknown as D1PreparedStatement;
+      }
+      return originalPrepare(sql);
+    });
+    try {
+      await expect(
+        SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=anything', { headers: { 'x-dev-machine': MACHINE } }),
+      ).rejects.toThrow(/no such table/i);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('a recognized FTS5 syntax error (a bad column filter) still swallows to 200 with empty hits, not a 500', async () => {
+    const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/search?q=${encodeURIComponent('nosuchcol:term')}`, {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { hits: unknown[] };
+    expect(body.hits).toEqual([]);
+  });
+});
+
 describe('search/listSessions limit clamp over HTTP (regression: NaN/negative used to reach SQL as LIMIT NaN / LIMIT -1)', () => {
   it('search: a non-numeric limit no longer 500s', async () => {
     const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=zzznonexistentzzz&limit=abc', {
@@ -1061,6 +1099,153 @@ describe('reindex refreshes content_hash', () => {
   });
 });
 
+describe("reindex over a canonical file whose stored hash differs from the R2 object's checksum marks the session parsing immediately (regression: sessions.index_state stayed 'ready' — advertising whatever this file parsed to BEFORE the reindex — until the requeued parse eventually ran, mirroring the same gap upload.ts's changed-hash path was fixed for)", () => {
+  it("reindex flips the session to index_state='parsing' synchronously, before the requeued parse ever runs", async () => {
+    const REINDEX_SESSION_ID = 'e0000000-0000-4000-8000-000000000006';
+    const relpath = `reindex-parsing-demo/${REINDEX_SESSION_ID}.jsonl`;
+    const content = `${ccUserLine({ uuid: 'ri-u1', text: 'reindex parsing-flip test content' })}\n`;
+    const res = await putFile('claude-projects', relpath, content);
+    expect(res.status).toBe(201);
+    const fileId = ((await res.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    const before = await testEnv.DB.prepare(
+      `SELECT s.index_state, s.canonical_file_id FROM sessions s WHERE s.session_id = ?1`,
+    )
+      .bind(REINDEX_SESSION_ID)
+      .first<{ index_state: string; canonical_file_id: number }>();
+    expect(before?.index_state).toBe('ready');
+    expect(before?.canonical_file_id).toBe(fileId);
+
+    // Desync the stored hash from what the R2 object actually checksums to — simulates the same
+    // "stored content_hash no longer matches reality" case the existing content_hash-refresh test
+    // above uses, which reindex's upsert always corrects on every run regardless of parse_state.
+    await testEnv.DB.prepare("UPDATE files SET content_hash = 'deadbeef' WHERE id = ?1").bind(fileId).run();
+
+    const reindexRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/admin/reindex', {
+      method: 'POST',
+      headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(reindexRes.status).toBe(200);
+
+    // Checked BEFORE draining the queue: the flip must happen synchronously inside reindex()
+    // itself, not only once the eventual reparse completes.
+    const during = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+      .bind(REINDEX_SESSION_ID)
+      .first<{ index_state: string }>();
+    expect(during?.index_state).toBe('parsing');
+
+    await drainQueue();
+    const after = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+      .bind(REINDEX_SESSION_ID)
+      .first<{ index_state: string }>();
+    expect(after?.index_state).toBe('ready');
+  });
+});
+
+describe("reindex restores files.mtime from R2 customMetadata (regression: reindex's upsert never touched the mtime column at all, so a wiped/reinserted row always came back with mtime=NULL, and R2 objects PUT before this fix carry no mtime metadata to restore from)", () => {
+  it('an upload with an x-file-mtime header survives a wiped files row: reindex restores the original mtime from the R2 object', async () => {
+    const SESSION_ID = 'e0000000-0000-4000-8000-000000000007';
+    const relpath = `mtime-restore-demo/${SESSION_ID}.jsonl`;
+    const content = `${ccUserLine({ uuid: 'mr-u1', text: 'mtime restore test content' })}\n`;
+    const ORIGINAL_MTIME = '2020-03-14T15:09:26Z';
+
+    const body = new TextEncoder().encode(content);
+    const putRes = await SELF.fetch(`https://api.sessions.vza.net/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent(relpath)}`, {
+      method: 'PUT',
+      headers: {
+        'x-dev-machine': MACHINE,
+        'x-content-hash': `sha256:${await sha256Hex(body)}`,
+        'x-file-mtime': ORIGINAL_MTIME,
+        'content-length': String(body.length),
+      },
+      body,
+    });
+    expect(putRes.status).toBe(201);
+    const fileId = ((await putRes.json()) as { file_id: number }).file_id;
+    const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
+
+    const uploaded = await testEnv.DB.prepare('SELECT mtime FROM files WHERE id = ?1').bind(fileId).first<{ mtime: string | null }>();
+    expect(uploaded?.mtime).toBe(ORIGINAL_MTIME);
+
+    // Simulate the row being lost entirely (e.g. a D1 restore from an older backup, or manual
+    // repair) — reindex is the documented recovery path for exactly this: it re-derives
+    // everything it can from R2 and reinserts. Before this fix, mtime was NOT one of those things.
+    await testEnv.DB.prepare('DELETE FROM files WHERE id = ?1').bind(fileId).run();
+    const gone = await testEnv.DB.prepare('SELECT id FROM files WHERE id = ?1').bind(fileId).first();
+    expect(gone).toBeNull();
+
+    const reindexRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/admin/reindex', {
+      method: 'POST',
+      headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(reindexRes.status).toBe(200);
+
+    const restored = await testEnv.DB.prepare('SELECT mtime FROM files WHERE r2_key = ?1').bind(r2Key).first<{ mtime: string | null }>();
+    expect(restored?.mtime).toBe(ORIGINAL_MTIME);
+  });
+});
+
+describe('reindex-restored mtimes drive the canonical-copy tiebreak correctly (regression: with mtime always NULL post-reindex, the size/priority tiebreak fell through to an arbitrary id-ASC order, potentially keeping an OLDER duplicate canonical over a genuinely newer one)', () => {
+  it('after both duplicates\' mtimes are lost and reindex restores them from R2, the NEWER-mtime copy is canonical, not the lower-id (older, first-uploaded) one', async () => {
+    const SESSION_ID = 'e0000000-0000-4000-8000-000000000008';
+    // Byte-identical content for both copies — real duplicate uploads of the same session are
+    // typically identical bytes; this also trivially satisfies the "equal size" precondition the
+    // tiebreak needs to actually reach mtime rather than resolving on size first.
+    const content = `${ccUserLine({ uuid: 'dm-u1', text: 'duplicate mtime tiebreak content' })}\n`;
+    const OLD_MTIME = '2019-01-01T00:00:00Z';
+    const NEW_MTIME = '2026-01-01T00:00:00Z';
+
+    async function putWithMtime(relpath: string, mtime: string): Promise<number> {
+      const body = new TextEncoder().encode(content);
+      const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent(relpath)}`, {
+        method: 'PUT',
+        headers: {
+          'x-dev-machine': MACHINE,
+          'x-content-hash': `sha256:${await sha256Hex(body)}`,
+          'x-file-mtime': mtime,
+          'content-length': String(body.length),
+        },
+        body,
+      });
+      expect(res.status).toBe(201);
+      return ((await res.json()) as { file_id: number }).file_id;
+    }
+
+    // Older copy uploaded (and thus assigned its row id) FIRST, so an id-ASC fallback would wrongly
+    // pick it over the genuinely newer copy — a real distinguishing test, not one that happens to
+    // pass either way.
+    const oldFileId = await putWithMtime(`dup-mtime-demo/copy-old/${SESSION_ID}.jsonl`, OLD_MTIME);
+    const newFileId = await putWithMtime(`dup-mtime-demo/copy-new/${SESSION_ID}.jsonl`, NEW_MTIME);
+    expect(oldFileId).toBeLessThan(newFileId);
+
+    // Simulate both rows' mtime having been lost (same scenario the previous test exercises
+    // directly) — wipe it in place rather than deleting the rows, so this test isolates the
+    // tiebreak logic from the restore-after-delete mechanics already covered above.
+    await testEnv.DB.prepare('UPDATE files SET mtime = NULL WHERE id IN (?1, ?2)').bind(oldFileId, newFileId).run();
+
+    const reindexRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/admin/reindex', {
+      method: 'POST',
+      headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(reindexRes.status).toBe(200);
+    await drainQueue();
+
+    const oldRow = await testEnv.DB.prepare('SELECT mtime FROM files WHERE id = ?1').bind(oldFileId).first<{ mtime: string | null }>();
+    const newRow = await testEnv.DB.prepare('SELECT mtime FROM files WHERE id = ?1').bind(newFileId).first<{ mtime: string | null }>();
+    expect(oldRow?.mtime).toBe(OLD_MTIME);
+    expect(newRow?.mtime).toBe(NEW_MTIME);
+
+    const session = await testEnv.DB.prepare('SELECT canonical_file_id FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number }>();
+    expect(session?.canonical_file_id).toBe(newFileId);
+  });
+});
+
 describe('subagent meta linking, both arrival orders', () => {
   const PROJECT_SLUG = '-home-tester-src-subagent-demo';
   const SUBAGENT_PARENT = '99999999-8888-4444-8444-777777777777';
@@ -1354,5 +1539,149 @@ describe('a stale message (redelivered after a re-upload changed the row\'s hash
     });
     const bodyV2 = (await searchV2.json()) as { hits: Array<{ session_id: string }> };
     expect(bodyV2.hits.some((h) => h.session_id === SESSION_ID)).toBe(true);
+  });
+});
+
+describe('a re-upload landing strictly between the pre-writeSession recheck and writeSession itself does not leave the session stuck advertising stale content as ready (regression: the recheck alone still had a residual window between "checked" and "wrote" — writeSession unconditionally sets index_state=ready, so a race landing in that exact gap left old content marked ready until the fresh message happened to be delivered)', () => {
+  it('index_state ends "parsing" (not stale "ready") right after the raced-out parse, and the fresh message then lands "ready" with the new content', async () => {
+    const SESSION_ID = 'e0000000-0000-4000-8000-000000000004';
+    const relpath = `residual-race-demo/${SESSION_ID}.jsonl`;
+    const CONTENT_V1 = `${ccUserLine({ uuid: 'rr-u1', text: 'unique-marker-residualrace-v1 original content' })}\n`;
+    const CONTENT_V2 = `${ccUserLine({ uuid: 'rr-u2', text: 'unique-marker-residualrace-v2 replaced content' })}\n`;
+
+    const res1 = await putFile('claude-projects', relpath, CONTENT_V1);
+    expect(res1.status).toBe(201);
+    const fileId = ((await res1.json()) as { file_id: number }).file_id;
+    const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
+    const rowV1 = await testEnv.DB.prepare('SELECT content_hash FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ content_hash: string }>();
+    const hashV1 = rowV1!.content_hash;
+
+    // Intercept the EXACT recheck query parseOne runs immediately before flipping index_state to
+    // 'parsing' and calling writeSession — and, right as that check observes the still-current
+    // hashV1 (so the check itself legitimately passes), perform a REAL re-upload. This lands the
+    // race exactly in the gap the check can't see: strictly after "checked", strictly before
+    // "wrote". Only fires once (armed), and is disarmed before awaiting the re-upload so the
+    // re-upload's own DB calls (including its own identically-worded content_hash lookup in
+    // convergeR2WithRow) pass straight through to the real implementation.
+    const originalPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    let armed = true;
+    const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
+      if (armed && sql === 'SELECT content_hash FROM files WHERE id = ?1') {
+        armed = false;
+        return {
+          bind: (id: number) => ({
+            first: async () => {
+              expect(id).toBe(fileId);
+              const res2 = await putFile('claude-projects', relpath, CONTENT_V2);
+              expect(res2.status).toBe(201);
+              return { content_hash: hashV1 };
+            },
+          }),
+        } as unknown as D1PreparedStatement;
+      }
+      return originalPrepare(sql);
+    });
+
+    try {
+      await deliverOne(fileId, r2Key, hashV1);
+    } finally {
+      spy.mockRestore();
+    }
+
+    const session = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ index_state: string }>();
+    expect(session?.index_state).toBe('parsing');
+
+    // The re-upload's own fresh message is still pending (never drained above) — draining it now
+    // completes the recovery: the session lands 'ready' with the NEW content, not the stale V1
+    // blocks the raced-out parse wrote moments earlier.
+    await drainQueue();
+    const sessionAfter = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ index_state: string }>();
+    expect(sessionAfter?.index_state).toBe('ready');
+
+    const searchV2 = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-residualrace-v2', {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    const bodyV2 = (await searchV2.json()) as { hits: Array<{ session_id: string }> };
+    expect(bodyV2.hits.some((h) => h.session_id === SESSION_ID)).toBe(true);
+  });
+});
+
+describe("consumeParseBatch's catch path is guarded by content_hash (regression: a throwing stale delivery could clobber a row/session a re-upload already moved past — flipping the row to parse_state='error' and the session to index_state='error'/recovery-kicked even though a fresh message already owns that row)", () => {
+  it('a throwing parse whose row hash moved on mid-flight leaves the newer row untouched (still pending), fires no session-error flip, and kicks no recovery', async () => {
+    const SESSION_ID = 'e0000000-0000-4000-8000-000000000005';
+    const relpath = `catch-race-demo/${SESSION_ID}.jsonl`;
+    const CONTENT_V1 = `${ccUserLine({ uuid: 'cr-u1', text: 'unique-marker-catchrace-v1 original content' })}\n`;
+    const CONTENT_V2 = `${ccUserLine({ uuid: 'cr-u2', text: 'unique-marker-catchrace-v2 replaced content' })}\n`;
+
+    const res1 = await putFile('claude-projects', relpath, CONTENT_V1);
+    expect(res1.status).toBe(201);
+    const fileId = ((await res1.json()) as { file_id: number }).file_id;
+    const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
+    await drainQueue();
+
+    const rowV1 = await testEnv.DB.prepare('SELECT content_hash FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ content_hash: string }>();
+    const hashV1 = rowV1!.content_hash;
+
+    // Intercept the R2 read parseOne performs right after the upfront hash guard passes (this
+    // message still carries the CURRENT hashV1 at invocation time, so it gets past that guard) —
+    // and, right as it's about to read, land a real re-upload (changes the row's hash and enqueues
+    // a fresh message, never drained here) then force this read to fail. That reproduces a throw
+    // racing a concurrent hash change: by the time the catch block runs, the row has already moved
+    // on to a hash this message doesn't carry.
+    const originalGet = testEnv.RAW.get.bind(testEnv.RAW);
+    let armed = true;
+    const spy = vi.spyOn(testEnv.RAW, 'get').mockImplementation(async (key: string, ...rest: unknown[]): Promise<R2ObjectBody | null> => {
+      if (armed && key === r2Key) {
+        armed = false;
+        const res2 = await putFile('claude-projects', relpath, CONTENT_V2);
+        expect(res2.status).toBe(201);
+        return null;
+      }
+      return (originalGet as (key: string, ...rest: unknown[]) => Promise<R2ObjectBody | null>)(key, ...rest);
+    });
+
+    try {
+      await deliverOne(fileId, r2Key, hashV1);
+    } finally {
+      spy.mockRestore();
+    }
+
+    // The row has moved on (re-upload landed) — the throwing delivery's catch-path error UPDATE
+    // must be a no-op: the row stays exactly what the fresh (never-drained) message left it as,
+    // i.e. 'pending' with no parse_error, NOT flipped to 'error'.
+    const fileRow = await testEnv.DB.prepare('SELECT parse_state, parse_error FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string; parse_error: string | null }>();
+    expect(fileRow?.parse_state).toBe('pending');
+    expect(fileRow?.parse_error).toBeNull();
+
+    // No session-error flip, no recovery kick: index_state must still read whatever the re-upload
+    // (upload.ts's canonical-reupload fix) left it as — 'parsing' — never 'error'.
+    const sessionRow = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ index_state: string }>();
+    expect(sessionRow?.index_state).toBe('parsing');
+
+    // The fresh message still indexes correctly once drained — nothing about the guarded catch
+    // path left the row stuck.
+    await drainQueue();
+    const sessionAfter = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ index_state: string }>();
+    expect(sessionAfter?.index_state).toBe('ready');
+
+    const searchV2After = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-catchrace-v2', {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    const bodyV2After = (await searchV2After.json()) as { hits: Array<{ session_id: string }> };
+    expect(bodyV2After.hits.some((h) => h.session_id === SESSION_ID)).toBe(true);
   });
 });
