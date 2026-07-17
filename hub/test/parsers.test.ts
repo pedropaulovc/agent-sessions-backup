@@ -184,4 +184,24 @@ describe('parseCodex', () => {
     expect(s.turns[0]!.usage?.reasoningTokens).toBe(3);
     expect(s.turns[0]!.usage?.cacheReadTokens).toBe(1);
   });
+
+  it('dedupes event_msg messages by full text, not just a shared prefix (regression: prefix-only key dropped distinct pasted-log messages)', async () => {
+    const sharedPrefix = 'A'.repeat(300); // longer than the old 256-char prefix key
+    const firstText = `${sharedPrefix} first-tail`;
+    const secondText = `${sharedPrefix} second-tail-DIFFERENT`;
+    const lines = [
+      { timestamp: '2026-07-04T10:00:00.000Z', type: 'session_meta', payload: { session_id: CODEX_SESSION_ID, cwd: '/x' } },
+      { timestamp: '2026-07-04T10:00:01.000Z', type: 'turn_context', payload: { turn_id: 't1', model: 'gpt-test-4' } },
+      { timestamp: '2026-07-04T10:00:02.000Z', type: 'event_msg', payload: { type: 'agent_message', message: firstText } },
+      { timestamp: '2026-07-04T10:00:03.000Z', type: 'event_msg', payload: { type: 'agent_message', message: secondText } },
+      // A genuine duplicate of the first message must still be deduped.
+      { timestamp: '2026-07-04T10:00:04.000Z', type: 'event_msg', payload: { type: 'agent_message', message: firstText } },
+    ].map((o) => JSON.stringify(o));
+
+    const s = await parseCodex(readJsonlLines(toStream(lines)), CODEX_SESSION_ID);
+    const texts = s.turns.flatMap((t) => t.blocks.filter((b) => b.type === 'text').map((b) => b.text));
+    expect(texts).toHaveLength(2);
+    expect(texts).toContain(firstText);
+    expect(texts).toContain(secondText);
+  });
 });

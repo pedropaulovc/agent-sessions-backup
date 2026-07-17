@@ -79,8 +79,6 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
   const obj = await env.RAW.get(file.r2_key);
   if (!obj) throw new Error(`r2_object_missing:${file.r2_key}`);
 
-  await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(det.sessionId).run();
-
   const lines = readJsonlLines(obj.body);
   const parsed =
     det.harness === 'claude-code' ? await parseClaudeCode(lines, det.sessionId) : await parseCodex(lines, det.sessionId);
@@ -94,15 +92,31 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
     if (meta?.toolUseId) parsed.parentToolUseId = meta.toolUseId;
   }
 
+  // With the queue's max_concurrency > 1, another copy of this same session can run through
+  // parseOne concurrently and finish (winning canonical) in the gap between the pre-parse check
+  // above and this point — the pre-parse check alone is stale by the time we're ready to write.
+  // Recheck immediately before writeSession: if some other, already-parsed copy is now the
+  // preferred candidate, drop this file's write entirely instead of clobbering the good session
+  // with a worse duplicate. D1 gives no cross-statement transaction here, so the race window
+  // shrinks but doesn't close completely; a reindex self-heals if it's ever actually hit.
+  const postParseCanonical = await chooseCanonical(det.sessionId, env);
+  if (postParseCanonical !== null && postParseCanonical.id !== file.id && postParseCanonical.parseState === 'parsed') {
+    await env.DB.prepare("UPDATE files SET parse_state = 'superseded' WHERE id = ?1").bind(file.id).run();
+    return;
+  }
+
+  await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(det.sessionId).run();
   await writeSession(parsed, file, env);
   await markParsed(file.id, env, 'parsed', file.size);
-  // A lower-priority duplicate may have parsed earlier (while this, the preferred copy, was
-  // still pending) and become canonical in the interim. writeSession's delete+reinsert already
-  // replaced its session content with this file's; explicitly demote it now so files.parse_state
-  // reflects reality instead of leaving a stale 'parsed' duplicate lying around.
-  await env.DB.prepare("UPDATE files SET parse_state = 'superseded' WHERE session_id = ?1 AND id != ?2 AND parse_state = 'parsed'")
-    .bind(det.sessionId, file.id)
-    .run();
+  // Only the file the recheck just confirmed as the preferred candidate gets to supersede other
+  // parsed duplicates. A worse-priority file that wrote because the preferred copy was still
+  // unparsed must not claim that role — the preferred copy supersedes this one itself once IT
+  // completes and runs its own recheck.
+  if (postParseCanonical === null || postParseCanonical.id === file.id) {
+    await env.DB.prepare("UPDATE files SET parse_state = 'superseded' WHERE session_id = ?1 AND id != ?2 AND parse_state = 'parsed'")
+      .bind(det.sessionId, file.id)
+      .run();
+  }
 
   console.log(
     JSON.stringify({

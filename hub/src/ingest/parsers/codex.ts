@@ -137,7 +137,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         const role = (str(p.role) as Role) ?? 'assistant';
         const text = contentText(p.content);
         if (!text) break;
-        rememberMessageHash(text);
+        rememberMessage(text);
         const turn = openTurn(role === 'developer' ? 'developer' : role, ts, turnId);
         const c = cap(text, CAPS.text);
         turn.blocks.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });
@@ -209,8 +209,8 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       case 'user_message':
       case 'agent_message': {
         const text = str(p.message) ?? contentText(p.message);
-        if (!text || seenMessageHashes.has(hashPrefix(text))) break;
-        rememberMessageHash(text);
+        if (!text || seenMessageHashes.has(messageKey(text))) break;
+        rememberMessage(text);
         const role: Role = p.type === 'user_message' ? 'user' : 'assistant';
         const turn = openTurn(role, ts, undefined);
         const c = cap(text, CAPS.text);
@@ -236,13 +236,26 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
     }
   }
 
-  function rememberMessageHash(text: string) {
-    seenMessageHashes.add(hashPrefix(text));
+  function rememberMessage(text: string) {
+    seenMessageHashes.add(messageKey(text));
   }
 }
 
-function hashPrefix(text: string): string {
-  return text.slice(0, 256);
+// Dedupe key over the FULL text, not just a prefix — two distinct messages sharing a long
+// common prefix (e.g. pasted logs with the same header) must both be indexed. Length + a 32-bit
+// FNV-1a digest keeps memory flat per message while making an accidental collision between two
+// genuinely different messages astronomically unlikely.
+function messageKey(text: string): string {
+  return `${text.length}:${fnv1a32(text)}`;
+}
+
+function fnv1a32(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16);
 }
 
 function contentText(content: unknown): string {

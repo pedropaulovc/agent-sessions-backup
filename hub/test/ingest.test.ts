@@ -1,5 +1,5 @@
 import { env, SELF } from 'cloudflare:test';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { CC_SESSION_ID, ccAssistantLine, ccNoiseLines, ccUserLine } from './fixtures';
 
@@ -397,5 +397,81 @@ describe('canonical selection does not supersede a valid duplicate behind a stil
       .first<{ canonical_file_id: number; index_state: string }>();
     expect(session2?.canonical_file_id).toBe(fileIdB);
     expect(session2?.index_state).toBe('ready');
+  });
+});
+
+describe('canonical selection recheck guards against a concurrent-write race (queue max_concurrency > 1)', () => {
+  const CONTENT = [
+    ccUserLine({ uuid: 'canon3-u1', text: 'concurrent race canonical test' }),
+    ccAssistantLine({ uuid: 'canon3-a1', parentUuid: 'canon3-u1', text: 'concurrent race canonical response' }),
+  ].join('\n');
+
+  beforeAll(async () => {
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('canon3-a', 'linux', 0) ON CONFLICT (machine_id) DO UPDATE SET priority = 0",
+      ),
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('canon3-b', 'linux', 1) ON CONFLICT (machine_id) DO UPDATE SET priority = 1",
+      ),
+    ]);
+  });
+
+  it('a worse-priority copy whose pre-parse check already passed must not clobber canonical once the preferred copy finishes first', async () => {
+    const SESSION_ID = '99999999-0000-4444-8444-000000000001';
+
+    const resA = await putFile('canon3-a', 'claude-projects', `race-a/${SESSION_ID}.jsonl`, CONTENT);
+    expect(resA.status).toBe(201);
+    const fileIdA = ((await resA.json()) as { file_id: number }).file_id;
+    const r2KeyA = `raw/canon3-a/claude-projects/race-a/${SESSION_ID}.jsonl`;
+
+    const resB = await putFile('canon3-b', 'claude-projects', `race-b/${SESSION_ID}.jsonl`, CONTENT);
+    expect(resB.status).toBe(201);
+    const fileIdB = ((await resB.json()) as { file_id: number }).file_id;
+    const r2KeyB = `raw/canon3-b/claude-projects/race-b/${SESSION_ID}.jsonl`;
+
+    // Hold B's R2 fetch open — this happens right after B's pre-parse canonical check (which
+    // passes, since A is still 'pending' at that point) but before B has parsed or written
+    // anything. While B is blocked there, drive A to full completion. This deterministically
+    // reproduces the interleaving a real concurrent consumer (max_concurrency: 2) can hit,
+    // without depending on real scheduler timing.
+    const originalGet = testEnv.RAW.get.bind(testEnv.RAW);
+    let releaseB!: () => void;
+    const bHeld = new Promise<void>((resolve) => {
+      releaseB = resolve;
+    });
+    const getSpy = vi.spyOn(testEnv.RAW, 'get').mockImplementation(async (key: unknown, ...rest: unknown[]) => {
+      if (key === r2KeyB) await bHeld;
+      return originalGet(key as string, ...(rest as []));
+    });
+
+    const bPromise = deliverOne(fileIdB, r2KeyB);
+    await deliverOne(fileIdA, r2KeyA);
+
+    const rowAMid = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdA)
+      .first<{ parse_state: string }>();
+    expect(rowAMid?.parse_state).toBe('parsed');
+    const sessionMid = await testEnv.DB.prepare('SELECT canonical_file_id FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number }>();
+    expect(sessionMid?.canonical_file_id).toBe(fileIdA);
+
+    releaseB();
+    await bPromise;
+    getSpy.mockRestore();
+
+    // B's post-parse recheck must have caught A already being the parsed, better-priority
+    // canonical, and discarded B's write instead of overwriting the session.
+    const rowB = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string }>();
+    expect(rowB?.parse_state).toBe('superseded');
+
+    const sessionFinal = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(sessionFinal?.canonical_file_id).toBe(fileIdA);
+    expect(sessionFinal?.index_state).toBe('ready');
   });
 });
