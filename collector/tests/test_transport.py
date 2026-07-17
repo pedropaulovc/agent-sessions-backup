@@ -84,6 +84,44 @@ def test_mtls_auth_not_implemented():
         MtlsAuth("tpm").curl_args()
 
 
+def test_parse_curl_version():
+    p = transport_mod._parse_curl_version
+    assert p("curl 7.68.0 (x86_64-pc-linux-gnu) libcurl/7.68.0") == (7, 68, 0)
+    assert p("curl 8.5.0 (x86_64) libcurl/8.5.0") == (8, 5, 0)
+    assert p("curl 7.76 (x86_64)") == (7, 76, 0)  # missing patch -> 0
+    assert p("not curl output") is None
+
+
+def test_check_curl_version_raises_when_too_old():
+    t = Transport(DevAuth("m1"))
+    t._probe_curl_version = lambda: (7, 68, 0)
+    with pytest.raises(RuntimeError) as ei:
+        t.check_curl_version()
+    msg = str(ei.value)
+    assert "7.68" in msg and "7.76.0" in msg and "--fail-with-body" in msg
+
+
+def test_check_curl_version_passes_when_new_enough():
+    t = Transport(DevAuth("m1"))
+    t._probe_curl_version = lambda: (7, 76, 0)
+    assert t.check_curl_version() == (7, 76, 0)
+
+
+def test_check_curl_version_raises_when_undetectable():
+    t = Transport(DevAuth("m1"))
+    t._probe_curl_version = lambda: None
+    with pytest.raises(RuntimeError):
+        t.check_curl_version()
+
+
+def test_request_fails_loudly_on_old_curl(hub):
+    # A too-old curl must NOT silently return status 0; the request path raises instead.
+    t = Transport(DevAuth("m1"))
+    t._probe_curl_version = lambda: (7, 68, 0)
+    with pytest.raises(RuntimeError):
+        t.get(f"{hub.url}/healthz")
+
+
 def test_permanent_4xx_not_retried(tmp_path, hub, monkeypatch):
     # If backoff were entered, this would sleep; keep it fast so a regression is obvious.
     monkeypatch.setattr(transport_mod, "BACKOFF", (0.01, 0.01, 0.01))
@@ -104,7 +142,9 @@ def test_subprocess_timeout_maps_to_status_zero(monkeypatch):
     def boom(*a, **k):
         raise transport_mod.subprocess.TimeoutExpired(cmd="curl", timeout=1)
     monkeypatch.setattr(transport_mod.subprocess, "run", boom)
-    rc, status, _body = Transport(DevAuth("m1"))._run(["-sS", "http://127.0.0.1:1/x"])
+    t = Transport(DevAuth("m1"))
+    t._curl_version_ok = True  # skip the version probe; this test is about the transfer timeout
+    rc, status, _body = t._run(["-sS", "http://127.0.0.1:1/x"])
     assert status == 0 and rc != 0  # no HTTP response -> treated as network failure
 
 

@@ -446,6 +446,18 @@ def test_doctor_fails_on_walk_error(tmp_path, hub, tmp_env, monkeypatch):
     assert rc == 1  # traversal error => incomplete scan => nonzero exit
 
 
+def test_doctor_reports_old_curl_as_fail(tmp_path, hub, tmp_env, monkeypatch, capsys):
+    import agent_collector.transport as transport_mod
+    monkeypatch.setattr(transport_mod.Transport, "_probe_curl_version",
+                        lambda self: (7, 68, 0))  # simulate Ubuntu 20.04 curl
+    path = config.config_path()
+    config.enroll(hub.url, dev=True, path=path, machine_id="m1")
+    rc = run_mod.cmd_doctor(types.SimpleNamespace(config=str(path)))
+    out = capsys.readouterr().out
+    assert "[FAIL] curl" in out and "7.76.0" in out
+    assert rc == 1
+
+
 def test_run_lock_prevents_overlap(tmp_path, hub, tmp_env, monkeypatch):
     # enroll writes a real config the CLI path will load
     path = config.config_path()

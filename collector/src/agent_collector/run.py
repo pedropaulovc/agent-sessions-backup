@@ -21,7 +21,7 @@ from . import config as config_mod
 from . import __version__
 from .scanner import Scanner, ScanItem, read_exact, hash_bytes, hash_file_prefix
 from .state import State, OverlapLock, now_iso, state_path
-from .transport import Transport, DevAuth, MtlsAuth, Upload
+from .transport import Transport, DevAuth, MtlsAuth, Upload, MIN_CURL_VERSION
 
 
 def build_auth(cfg: config_mod.Config):
@@ -441,8 +441,16 @@ def cmd_doctor(args) -> int:
         print(f"[FAIL] state DB: {e}")
         ok = False
 
+    transport = Transport(build_auth(cfg))
     try:
-        transport = Transport(build_auth(cfg))
+        version = transport.check_curl_version()
+        print(f"[ok]   curl {'.'.join(map(str, version))} (>= "
+              f"{'.'.join(map(str, MIN_CURL_VERSION))})")
+    except Exception as e:  # noqa: BLE001
+        print(f"[FAIL] curl: {e}")
+        ok = False
+
+    try:
         status, _body = transport.get(f"{cfg.hub_url}/healthz")
         mark = "ok" if status == 200 else "FAIL"
         ok = ok and status == 200

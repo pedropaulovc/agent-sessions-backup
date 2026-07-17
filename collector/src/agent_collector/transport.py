@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -41,6 +42,20 @@ SUBPROCESS_MARGIN = 30        # subprocess timeout sits this far above curl's ow
 
 # HTTP statuses worth retrying (transient); everything else 4xx is permanent.
 RETRY_STATUSES = frozenset({408, 429})
+
+# --fail-with-body (which every single-transfer call depends on to see 4xx/5xx status via a
+# nonzero exit) landed in curl 7.76.0. Older system curl (e.g. Ubuntu 20.04's 7.68) would
+# silently return status 0 for every request, so we probe the version and fail loudly.
+MIN_CURL_VERSION = (7, 76, 0)
+_CURL_FLAG_REQUIRING_MIN = "--fail-with-body"
+
+
+def _parse_curl_version(version_output: str) -> tuple[int, int, int] | None:
+    """Parse the first line of `curl --version`, e.g. 'curl 7.68.0 (x86_64-...) libcurl/...'."""
+    m = re.match(r"\s*curl\s+(\d+)\.(\d+)(?:\.(\d+))?", version_output)
+    if not m:
+        return None
+    return (int(m.group(1)), int(m.group(2)), int(m.group(3) or 0))
 
 
 class AuthStrategy:
@@ -96,10 +111,46 @@ class Transport:
         self.auth = auth
         self.curl = curl
         self.parallel_max = parallel_max
+        self._curl_version_ok = False  # cached: probe once per Transport instance
 
     @staticmethod
     def curl_available(curl: str = "curl") -> bool:
         return shutil.which(curl) is not None
+
+    def _probe_curl_version(self) -> tuple[int, int, int] | None:
+        """Run `curl --version` and parse it. Seam for tests to monkeypatch."""
+        try:
+            proc = subprocess.run([self.curl, "--version"], capture_output=True, text=True,
+                                  timeout=CONNECT_TIMEOUT)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        first = proc.stdout.splitlines()[0] if proc.stdout else ""
+        return _parse_curl_version(first)
+
+    def check_curl_version(self) -> tuple[int, int, int]:
+        """Return the detected curl version, or raise RuntimeError if it's too old (or
+        undetectable) for the flags every request depends on."""
+        version = self._probe_curl_version()
+        if version is None:
+            raise RuntimeError(
+                f"could not determine the version of curl ({self.curl!r}); "
+                f"{_CURL_FLAG_REQUIRING_MIN} needs curl >= "
+                f"{'.'.join(map(str, MIN_CURL_VERSION))}"
+            )
+        if version < MIN_CURL_VERSION:
+            raise RuntimeError(
+                f"system curl {'.'.join(map(str, version))} is too old: "
+                f"{_CURL_FLAG_REQUIRING_MIN} requires curl >= "
+                f"{'.'.join(map(str, MIN_CURL_VERSION))} (e.g. Ubuntu 20.04 ships 7.68). "
+                "Upgrade curl on this machine."
+            )
+        return version
+
+    def _ensure_curl_version(self) -> None:
+        if self._curl_version_ok:
+            return
+        self.check_curl_version()  # raises if too old
+        self._curl_version_ok = True
 
     # Common flags on every single-transfer curl call: fail-with-body for 4xx/5xx, the
     # http_code writeout, and the connect/transfer timeouts.
@@ -109,6 +160,7 @@ class Transport:
     )
 
     def _run(self, argv: list[str]) -> tuple[int, int, str]:
+        self._ensure_curl_version()  # fail loudly on curl too old for --fail-with-body
         try:
             proc = subprocess.run(
                 [self.curl, *argv], capture_output=True, text=True,
@@ -163,6 +215,7 @@ class Transport:
 
         Callers should retry any url whose code is not a clear 200/201 via put().
         """
+        self._ensure_curl_version()
         result: dict[str, int] = {}
         for start in range(0, len(uploads), BATCH_SIZE):
             chunk = uploads[start:start + BATCH_SIZE]
