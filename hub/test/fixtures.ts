@@ -187,6 +187,96 @@ export function codexLines(): string[] {
   );
 }
 
+/** A valid 1x1 transparent PNG, base64-encoded — used to round-trip the blob endpoint. */
+export const TINY_PNG_B64 =
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+interface CcLineOpts {
+  uuid: string;
+  parentUuid?: string | null;
+  role: 'user' | 'assistant';
+  text?: string;
+  thinking?: string;
+  toolUse?: { id: string; name: string; input: unknown };
+  toolResult?: { toolUseId: string; content: string; isError?: boolean };
+  image?: { mediaType: string; data: string };
+  document?: { mediaType: string; data: string };
+  /** An unknown/unsupported content item prepended to the content array (e.g. 'server_tool_use'). */
+  unknownFirst?: string;
+  ts?: string;
+}
+
+/** Parametrized Claude Code envelope builder (any session id, either role). Mirrors real on-disk shape. */
+export function ccLine(sessionId: string, o: CcLineOpts): string {
+  const content: unknown[] = [];
+  if (o.unknownFirst) content.push({ type: o.unknownFirst, payload: { note: 'unsupported content item' } });
+  if (o.thinking) content.push({ type: 'thinking', thinking: o.thinking, signature: 'sig' });
+  if (o.text) content.push({ type: 'text', text: o.text });
+  if (o.toolUse) content.push({ type: 'tool_use', id: o.toolUse.id, name: o.toolUse.name, input: o.toolUse.input });
+  if (o.toolResult) {
+    content.push({
+      type: 'tool_result',
+      tool_use_id: o.toolResult.toolUseId,
+      content: o.toolResult.content,
+      ...(o.toolResult.isError ? { is_error: true } : {}),
+    });
+  }
+  if (o.image) content.push({ type: 'image', source: { type: 'base64', media_type: o.image.mediaType, data: o.image.data } });
+  if (o.document) content.push({ type: 'document', source: { type: 'base64', media_type: o.document.mediaType, data: o.document.data } });
+
+  const envelope: Record<string, unknown> = {
+    parentUuid: o.parentUuid ?? null,
+    isSidechain: false,
+    userType: 'external',
+    cwd: '/home/tester/src/demo',
+    sessionId,
+    version: '2.1.99',
+    gitBranch: 'main',
+    type: o.role,
+    message:
+      o.role === 'assistant'
+        ? {
+            id: 'msg_test',
+            role: 'assistant',
+            model: 'claude-test-1',
+            content,
+            usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 2, service_tier: 'standard' },
+          }
+        : { role: 'user', content },
+    uuid: o.uuid,
+    timestamp: o.ts ?? '2026-07-01T10:00:00.000Z',
+  };
+  if (o.role === 'assistant') envelope.requestId = 'req_test123';
+  return JSON.stringify(envelope);
+}
+
+/** A Claude Code `type:"system"` envelope — carries text via top-level `content`, not linked into the uuid chain. */
+export function ccSystemLine(sessionId: string, o: { uuid?: string; text: string; ts?: string }): string {
+  return JSON.stringify({
+    type: 'system',
+    content: o.text,
+    cwd: '/home/tester/src/demo',
+    sessionId,
+    version: '2.1.99',
+    gitBranch: 'main',
+    ...(o.uuid ? { uuid: o.uuid } : {}),
+    timestamp: o.ts ?? '2026-07-01T10:00:03.000Z',
+  });
+}
+
+/** Linear alternating user/assistant chain of `turns` turns — all on the main path. */
+export function ccLinearSession(sessionId: string, turns: number): string {
+  const lines: string[] = [];
+  let parent: string | null = null;
+  for (let i = 0; i < turns; i++) {
+    const uuid = `t-${i}`;
+    const role = i % 2 === 0 ? 'user' : 'assistant';
+    lines.push(ccLine(sessionId, { uuid, parentUuid: parent, role, text: `turn number ${i} content` }));
+    parent = uuid;
+  }
+  return lines.join('\n');
+}
+
 export function toStream(lines: string[]): ReadableStream<Uint8Array> {
   const body = new TextEncoder().encode(lines.join('\n') + '\n');
   return new ReadableStream({

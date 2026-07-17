@@ -445,8 +445,8 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
   ]);
 
   const insertBlock = db.prepare(
-    `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, byte_start, byte_len, truncated, text)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
+    `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, byte_start, byte_len, truncated, text, on_main_path)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`,
   );
   const insertUsage = db.prepare(
     `INSERT INTO usage (session_id, turn_index, ts, model, service_tier, input_tokens, output_tokens, reasoning_tokens,
@@ -478,6 +478,30 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
           b.byteLen,
           b.truncated ? 1 : 0,
           b.text ?? null,
+          turn.onMainPath ? 1 : 0,
+        ),
+      );
+    }
+    // Blockless compaction markers (codex) still get one text-less 'compaction' row so pagination and byte
+    // windows account for the turn — otherwise a divider at a page boundary or after the last content block
+    // is silently dropped. text stays NULL, so it never enters FTS; the viewer renders the divider from the
+    // parsed turn, not this row.
+    if (turn.blocks.length === 0 && turn.compaction && turn.byteStart !== undefined && turn.byteLen !== undefined) {
+      stmts.push(
+        insertBlock.bind(
+          s.id,
+          file.id,
+          turn.index,
+          0,
+          turn.role,
+          'compaction',
+          null,
+          turn.ts ?? null,
+          turn.byteStart,
+          turn.byteLen,
+          0,
+          null,
+          turn.onMainPath ? 1 : 0,
         ),
       );
     }

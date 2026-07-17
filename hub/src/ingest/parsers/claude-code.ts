@@ -33,6 +33,9 @@ export async function parseClaudeCode(
   let customTitle: string | undefined;
   let firstUserText: string | undefined;
   let lastMessageUuid: string | undefined;
+  // uuid -> parentUuid for EVERY envelope that builds a turn (kept or dropped), so the main-path walk can
+  // start from the last envelope and traverse through turns that yielded no blocks to the nearest kept ancestor.
+  const envelopeParent = new Map<string, string | undefined>();
 
   for await (const line of lines) {
     session.stats.lines++;
@@ -82,6 +85,7 @@ export async function parseClaudeCode(
       ts,
       blocks: [],
     };
+    if (turn.id) envelopeParent.set(turn.id, turn.parentId);
 
     if (type === 'assistant' && msg) {
       const model = str(msg.model);
@@ -112,7 +116,7 @@ export async function parseClaudeCode(
     if (turn.blocks.length > 0 || turn.usage) session.turns.push(turn);
   }
 
-  markMainPath(session.turns, lastMessageUuid);
+  markMainPath(session.turns, lastMessageUuid, envelopeParent);
   session.models = [...models];
   session.primaryModel = session.models[0];
   session.title = customTitle ?? aiTitle ?? firstUserText;
@@ -235,18 +239,32 @@ function extractUsage(msg: Record<string, unknown>, requestId?: string): TurnUsa
   };
 }
 
-/** Walk the parentUuid chain back from the last message; everything on it is the main path. */
-function markMainPath(turns: NormalizedTurn[], lastUuid: string | undefined): void {
-  if (!lastUuid) return;
+/**
+ * Resolve each turn's main-path membership. Only user/assistant turns carrying a uuid participate in the
+ * parentUuid branching structure, so only they can be "rewound" (off the main path). System turns — and any
+ * turn with no uuid — are not branch points; they always stay on the main path (dropping/dimming them would be
+ * wrong). Among the branch candidates, the main path is the parentUuid chain walked back from the last
+ * user/assistant message; every other branch candidate is an abandoned branch.
+ */
+function markMainPath(
+  turns: NormalizedTurn[],
+  lastUuid: string | undefined,
+  envelopeParent: Map<string, string | undefined>,
+): void {
   const byId = new Map<string, NormalizedTurn>();
   for (const t of turns) if (t.id) byId.set(t.id, t);
+  // Walk the FULL parentUuid chain from the last envelope (via the all-envelopes map, so a uuid-bearing tail
+  // that yielded no turn — empty/unsupported content — doesn't strand the walk); mark each KEPT turn we pass.
+  const onChain = new Set<string>();
   let cursor: string | undefined = lastUuid;
-  let guard = turns.length + 1;
+  let guard = envelopeParent.size + 1;
   while (cursor && guard-- > 0) {
-    const turn = byId.get(cursor);
-    if (!turn) break;
-    turn.onMainPath = true;
-    cursor = turn.parentId;
+    if (byId.has(cursor)) onChain.add(cursor);
+    cursor = envelopeParent.get(cursor);
+  }
+  for (const t of turns) {
+    const branchCandidate = t.id !== undefined && (t.role === 'user' || t.role === 'assistant');
+    t.onMainPath = !branchCandidate || onChain.has(t.id!);
   }
 }
 

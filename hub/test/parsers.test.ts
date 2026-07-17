@@ -6,7 +6,9 @@ import {
   CC_SESSION_ID,
   CODEX_SESSION_ID,
   ccAssistantLine,
+  ccLine,
   ccNoiseLines,
+  ccSystemLine,
   ccUserLine,
   codexLines,
   toStream,
@@ -104,6 +106,34 @@ describe('parseClaudeCode', () => {
     expect(byText('abandoned').onMainPath).toBe(false);
     expect(byText('rewind winner').onMainPath).toBe(true);
     expect(byText('first question').onMainPath).toBe(true);
+  });
+
+  it('keeps non-branching system turns on the main path (not rewound, not hidden)', async () => {
+    const lines = [
+      ccUserLine({ uuid: 'u1', text: 'first question' }),
+      // A system turn that is NOT linked into the user/assistant parentUuid chain.
+      ccSystemLine(CC_SESSION_ID, { uuid: 'sys1', text: 'system reminder, not a branch' }),
+      ccAssistantLine({ uuid: 'a1', parentUuid: 'u1', text: 'the answer' }),
+    ];
+    const s = await parseClaudeCode(readJsonlLines(toStream(lines)), CC_SESSION_ID);
+    const system = s.turns.find((t) => t.role === 'system')!;
+    expect(system).toBeTruthy();
+    // Even though the last-message chain (a1 → u1) never reaches it, it stays main-path.
+    expect(system.onMainPath).toBe(true);
+    expect(s.turns.every((t) => t.onMainPath)).toBe(true);
+  });
+
+  it('keeps main-path intact when the transcript ends with a uuid-bearing empty (dropped) turn', async () => {
+    const lines = [
+      ccUserLine({ uuid: 'u1', text: 'question one' }),
+      ccAssistantLine({ uuid: 'a1', parentUuid: 'u1', text: 'answer one' }),
+      // Trailing envelope: has a uuid + parentUuid but empty content, so it yields no blocks and is dropped.
+      // The main-path walk must still reach the kept ancestors instead of stranding on the missing tail.
+      ccLine(CC_SESSION_ID, { uuid: 'uEmpty', parentUuid: 'a1', role: 'user' }),
+    ];
+    const s = await parseClaudeCode(readJsonlLines(toStream(lines)), CC_SESSION_ID);
+    expect(s.turns.map((t) => t.id)).toEqual(['u1', 'a1']); // empty tail dropped
+    expect(s.turns.every((t) => t.onMainPath)).toBe(true); // nothing wrongly hidden
   });
 
   it('caps oversized blocks and flags truncation', async () => {

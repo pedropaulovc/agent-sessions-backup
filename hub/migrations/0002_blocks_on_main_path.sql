@@ -1,0 +1,14 @@
+-- Persist each turn's main-path membership at index time so the viewer never has to
+-- recompute it from a partial (per-page) parse — a rewind crossing a page boundary
+-- can't be resolved from the page's byte window alone.
+--
+-- The DEFAULT 1 only backfills EXISTING rows (indexed before this migration) as "main path",
+-- which is wrong for any Claude session that already has an abandoned branch: effective view
+-- would keep showing it, chronological view would stop dimming it, until the flag is recomputed.
+-- There is no SQL backfill (the value is derived from the parentUuid chain in the raw transcript,
+-- not from anything in D1) — the fix is a reindex. Per the project's reindex-from-R2 invariant,
+-- running POST /api/v1/admin/reindex re-parses every canonical object and rewrites on_main_path
+-- correctly. No production D1 exists yet (M3 provisions the database and populates it from R2 from
+-- scratch, so every row is computed by this migration's writer, not defaulted); this note stands as
+-- the standing requirement should this migration ever land on top of pre-existing rows.
+ALTER TABLE blocks ADD COLUMN on_main_path INTEGER NOT NULL DEFAULT 1;

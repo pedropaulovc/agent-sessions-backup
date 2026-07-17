@@ -2,12 +2,36 @@ import { clampLimit, normalizeToBound } from './sessions';
 
 const FACET_COLUMNS = ['harness', 'machine_id', 'os', 'primary_model', 'repo_url'] as const;
 
-/** GET /api/v1/search — FTS over blocks with session-level filters and facet counts. */
-export async function search(url: URL, env: Env): Promise<Response> {
+export interface SearchHit {
+  session_id: string;
+  snippet: string;
+  block: { turn_index: number; block_index: number; role: string; btype: string; tool_name: string | null; ts: string | null };
+  session: {
+    harness: string;
+    machine_id: string | null;
+    os: string | null;
+    cwd: string | null;
+    repo_url: string | null;
+    primary_model: string | null;
+    title: string | null;
+    started_at: string | null;
+    index_state: string;
+  };
+}
+
+export interface SearchResult {
+  hits: SearchHit[];
+  facets?: Record<string, Record<string, number>>;
+  cursor?: string;
+  error?: string;
+}
+
+/** Core FTS search over blocks with session-level filters and optional facet counts. Shared by the API and the viewer. */
+export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } = {}): Promise<SearchResult> {
   const q = url.searchParams.get('q')?.trim() ?? '';
   const limit = clampLimit(url.searchParams.get('limit'), 20, 100);
   const offset = decodeCursor(url.searchParams.get('cursor'));
-  const wantFacets = url.searchParams.get('facets') === '1';
+  const wantFacets = opts.facets ?? url.searchParams.get('facets') === '1';
 
   const filters: string[] = [];
   const binds: unknown[] = [];
@@ -26,7 +50,7 @@ export async function search(url: URL, env: Env): Promise<Response> {
   if (p.get('to')) addFilter('s.started_at <= ?', normalizeToBound(p.get('to')!));
   const where = filters.length ? `AND ${filters.join(' AND ')}` : '';
 
-  if (!q) return Response.json({ error: 'missing_q' }, { status: 400 });
+  if (!q) return { hits: [], error: 'missing_q' };
 
   // Returns null (rather than throwing) on invalid FTS5 syntax, so the two-step fallback below
   // can tell "this match string didn't work" apart from a genuine infra error without a second
@@ -101,20 +125,27 @@ export async function search(url: URL, env: Env): Promise<Response> {
   }
   const results = rows?.results ?? [];
 
-  const hits = results.slice(0, limit).map((r) => ({
-    session_id: r.session_id,
-    snippet: r.snip,
-    block: { turn_index: r.turn_index, block_index: r.block_index, role: r.role, btype: r.btype, tool_name: r.tool_name, ts: r.ts },
+  const hits: SearchHit[] = results.slice(0, limit).map((r) => ({
+    session_id: r.session_id as string,
+    snippet: r.snip as string,
+    block: {
+      turn_index: r.turn_index as number,
+      block_index: r.block_index as number,
+      role: r.role as string,
+      btype: r.btype as string,
+      tool_name: (r.tool_name as string | null) ?? null,
+      ts: (r.ts as string | null) ?? null,
+    },
     session: {
-      harness: r.harness,
-      machine_id: r.machine_id,
-      os: r.os,
-      cwd: r.cwd,
-      repo_url: r.repo_url,
-      primary_model: r.primary_model,
-      title: r.title,
-      started_at: r.started_at,
-      index_state: r.index_state,
+      harness: r.harness as string,
+      machine_id: (r.machine_id as string | null) ?? null,
+      os: (r.os as string | null) ?? null,
+      cwd: (r.cwd as string | null) ?? null,
+      repo_url: (r.repo_url as string | null) ?? null,
+      primary_model: (r.primary_model as string | null) ?? null,
+      title: (r.title as string | null) ?? null,
+      started_at: (r.started_at as string | null) ?? null,
+      index_state: r.index_state as string,
     },
   }));
 
@@ -138,11 +169,18 @@ export async function search(url: URL, env: Env): Promise<Response> {
     for (const col of FACET_COLUMNS) facets[col] = {};
   }
 
-  return Response.json({
+  return {
     hits,
     facets: wantFacets ? facets : undefined,
     cursor: results.length > limit ? encodeCursor(offset + limit) : undefined,
-  });
+  };
+}
+
+/** GET /api/v1/search — FTS over blocks with session-level filters and facet counts. */
+export async function search(url: URL, env: Env): Promise<Response> {
+  const result = await runSearch(url, env);
+  if (result.error) return Response.json({ error: result.error }, { status: 400 });
+  return Response.json({ hits: result.hits, facets: result.facets, cursor: result.cursor });
 }
 
 function encodeCursor(offset: number): string {

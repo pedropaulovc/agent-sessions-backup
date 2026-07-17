@@ -3,6 +3,7 @@ import { checkFiles, putFile } from './api/upload';
 import { heartbeat, listMachines, reindex, status, usage } from './api/ops';
 import { search } from './api/search';
 import { getSession, getSessionRaw, listSessions } from './api/sessions';
+import { viewerRoute } from './viewer/router';
 
 export async function route(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
@@ -16,6 +17,7 @@ export async function route(request: Request, env: Env, _ctx: ExecutionContext):
   }
   return viewerRoute(request, url, env);
 }
+
 
 async function apiRoute(request: Request, url: URL, env: Env): Promise<Response> {
   const identity = await machineIdentity(request, env);
@@ -44,11 +46,4 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
   if (path === '/api/v1/admin/reindex' && method === 'POST') return reindex(request, env, identity);
 
   return Response.json({ error: 'not_found' }, { status: 404 });
-}
-
-async function viewerRoute(_request: Request, url: URL, _env: Env): Promise<Response> {
-  // M2 fills in: search UI, session renderer, machines page, login.
-  return new Response(`sessions-hub — ${url.pathname}`, {
-    headers: { 'content-type': 'text/plain; charset=utf-8' },
-  });
 }
