@@ -321,6 +321,56 @@ describe('upload unchanged fast-path re-enqueues stuck files', () => {
       .first<{ index_state: string }>();
     expect(recoveredSession?.index_state).toBe('ready');
   });
+
+  it('re-upload of a hash-matching row whose R2 object is PRESENT but CORRUPT (wrong bytes at the same key) also restores it, not just a missing object', async () => {
+    const CHECKSUM_RESTORE_SESSION_ID = '44444444-5555-4444-8444-888888888888';
+    const checksumRelpath = `checksum-restore-demo/${CHECKSUM_RESTORE_SESSION_ID}.jsonl`;
+    const checksumContent = `${ccUserLine({ uuid: 'csr-u1', text: 'checksum restore test content' })}\n`;
+
+    const first = await putFile('claude-projects', checksumRelpath, checksumContent);
+    expect(first.status).toBe(201);
+    const fileId = ((await first.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    const parsedRow = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(parsedRow?.parse_state).toBe('parsed');
+
+    // Corrupt the R2 object IN PLACE without touching the D1 row: same key, different bytes,
+    // no sha256 option (simulating a bad manual restore/replacement outside this API). HEAD
+    // still succeeds — this is exactly what a naive "does the object exist" check would miss.
+    const r2Key = `raw/${MACHINE}/claude-projects/${checksumRelpath}`;
+    await testEnv.RAW.put(r2Key, new TextEncoder().encode('corrupted bytes, wrong content entirely'));
+    expect(await testEnv.RAW.head(r2Key)).not.toBeNull(); // present...
+    const corruptedObj = await testEnv.RAW.get(r2Key);
+    expect(await corruptedObj?.text()).not.toContain('checksum restore test content'); // ...but wrong
+
+    // The collector re-sends the SAME (correct) bytes it always had — same hash from D1's
+    // perspective, hitting the unchanged fast path — which must detect the checksum mismatch
+    // and restore the correct bytes rather than trusting HEAD's mere existence.
+    const reupload = await putFile('claude-projects', checksumRelpath, checksumContent);
+    expect(reupload.status).toBe(200);
+    const reuploadBody = (await reupload.json()) as { status: string; requeued?: boolean; restored?: boolean };
+    expect(reuploadBody.status).toBe('unchanged');
+    expect(reuploadBody.requeued).toBe(true);
+    expect(reuploadBody.restored).toBe(true);
+
+    const restoredObj = await testEnv.RAW.get(r2Key);
+    expect(await restoredObj?.text()).toBe(checksumContent);
+
+    await deliverOne(fileId, r2Key);
+
+    const recoveredFile = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(recoveredFile?.parse_state).toBe('parsed');
+
+    const recoveredSession = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+      .bind(CHECKSUM_RESTORE_SESSION_ID)
+      .first<{ index_state: string }>();
+    expect(recoveredSession?.index_state).toBe('ready');
+  });
 });
 
 describe('failed reparse surfaces as session index_state=error', () => {

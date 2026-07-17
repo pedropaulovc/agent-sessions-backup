@@ -42,14 +42,18 @@ export async function putFile(
     .bind(machineId, store, relpath)
     .first<{ id: number; content_hash: string; parse_state: string; r2_key: string }>();
   if (existing && existing.content_hash === sha256) {
-    // A matching hash normally means nothing to do — but the raw R2 object can be lost or
-    // corrupt independent of parse_state (e.g. the flagship r2_object_missing failure, or R2
-    // pruned out from under us), even for a row already 'parsed'. Head it on every same-hash
-    // resync, not just non-terminal ones, and restore from the request body if it's gone — this
-    // path only fires on a resync (not steady-state uploads), so the extra R2 op is cheap
-    // relative to leaving /raw and normalized session loads permanently broken.
+    // A matching hash normally means nothing to do — but the raw R2 object can be lost, missing,
+    // OR CORRUPT (present at the key with the wrong bytes — e.g. a bad manual restore outside
+    // this API) independent of parse_state, even for a row already 'parsed'. Head it on every
+    // same-hash resync, not just non-terminal ones, and compare R2's own sha256 checksum against
+    // existing.content_hash: restore from the request body on absence OR mismatch/missing
+    // checksum, mirroring the same verification files/check does. This path only fires on a
+    // resync (not steady-state uploads), so the extra R2 op is cheap relative to leaving /raw and
+    // normalized session loads permanently reading wrong or missing bytes.
     let restored = false;
-    if (!(await env.RAW.head(existing.r2_key))) {
+    const head = await env.RAW.head(existing.r2_key);
+    const headChecksum = head?.checksums.sha256 ? hex(head.checksums.sha256) : undefined;
+    if (!head || headChecksum !== existing.content_hash) {
       try {
         await env.RAW.put(existing.r2_key, request.body, { sha256 });
       } catch (e) {

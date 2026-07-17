@@ -154,6 +154,15 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
           env.DB.prepare('DELETE FROM usage WHERE session_id = ?1').bind(det.sessionId),
           env.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(det.sessionId),
         ]);
+      }
+      // A recovery-kicked duplicate (reason: 'recover') parsing to zero turns instead of throwing
+      // doesn't match the canonical check above: canonical_file_id still points at the session's
+      // ORIGINAL canonical file until some recovery attempt actually succeeds — same reasoning as
+      // the catch path's 'recover' continuation. The session's index_state is already 'error'
+      // from that original failure, so there's nothing of THIS file's to clear; just continue the
+      // chain. Termination is guaranteed the same way: chooseRecoveryCandidate excludes
+      // error/skipped files, and this parse just flipped this one to error/skipped above.
+      if (session?.canonical_file_id === file.id || job.reason === 'recover') {
         // If a valid duplicate exists (even a previously-superseded one — this file's demise
         // frees it up again), kick its parse so the session recovers automatically instead of
         // staying errored until a manual reindex.
