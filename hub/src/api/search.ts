@@ -30,17 +30,42 @@ export async function search(url: URL, env: Env): Promise<Response> {
 
   // Returns null (rather than throwing) on invalid FTS5 syntax, so the two-step fallback below
   // can tell "this match string didn't work" apart from a genuine infra error without a second
-  // layer of try/catch at each call site. Only recognized FTS5 syntax-error signatures are
-  // swallowed — anything else (a missing blocks_fts table after a bad migration, a transient D1
-  // failure) rethrows, so a real outage surfaces as an error instead of a deceptive 200 with
-  // empty hits that makes the corpus look merely unmatched. Signatures captured empirically
-  // against this D1/SQLite build (see the regression tests), not guessed: 'unterminated string'
-  // (odd/NUL-broken quoting), 'fts5: syntax error' (stray operators/punctuation), 'unknown
-  // special query' (a bare '*'), and 'no such column:' — safe to include here specifically
-  // because this query's SQL template never references a user-controlled column name outside the
-  // MATCH clause, so that message can only come from FTS5's own column-filter syntax (e.g.
-  // q="badcol:term") rejecting bad user input, never a genuine schema mismatch on this fixed SQL.
-  const FTS5_SYNTAX_ERROR = /unterminated string|fts5: syntax error|unknown special query|no such column:/i;
+  // layer of try/catch at each call site.
+  //
+  // Classification used to be a regex over the caught error's message (see git history), but
+  // 'no such column: X' is genuinely ambiguous by message alone: FTS5 emits it for a bad
+  // column-filter in the user's MATCH text (e.g. q="badcol:term") AND SQLite emits the exact same
+  // shape for a real schema break on the query's own hardcoded outer-SELECT columns (e.g. after a
+  // bad migration references s.primary_model before it exists) — a regex swallows both, hiding a
+  // real outage as an empty result set. Classify deterministically instead: on any failure, run a
+  // probe against FIXED minimal SQL (SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?1 LIMIT
+  // 1) that exercises ONLY the user's match text, nothing else about this query's shape.
+  //   - Probe succeeds → the real query's failure had nothing to do with the user's MATCH text
+  //     (it's schema/infra on the outer query) → rethrow the original error.
+  //   - Probe ALSO throws → run a control probe with a known-good MATCH ('"x"').
+  //       - Control succeeds → blocks_fts itself is fine; the user's match text specifically is
+  //         invalid FTS5 syntax → swallow (return null).
+  //       - Control ALSO throws → blocks_fts/D1 itself is down, unrelated to any specific match
+  //         text → rethrow the original error.
+  // Verified empirically (see the regression tests) that this probe throws identically to the
+  // real query for every captured bad-MATCH case (NUL byte, bare '*', 'badcol:term', a lone
+  // unescaped quote, NEAR(/parens/backslash/AND/OR/NOT/-/^/:), and that it does NOT throw when
+  // the real query's failure is a genuine bad column on the outer SELECT — FTS5 parses MATCH
+  // arguments when the cursor opens (i.e. at .all() time), not at statement prepare, so a minimal
+  // probe sharing only the MATCH clause reproduces exactly the same class of failure the real
+  // query would hit from that same text, no more and no less.
+  const ftsProbeOk = async (match: string): Promise<boolean> => {
+    try {
+      await env.DB.prepare('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?1 LIMIT 1').bind(match).all();
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const isInvalidUserQuery = async (match: string): Promise<boolean> => {
+    if (await ftsProbeOk(match)) return false; // failure wasn't about this match text at all
+    return ftsProbeOk('"x"'); // control: does blocks_fts work at all for a known-good match?
+  };
   const run = async (match: string) => {
     try {
       return await env.DB.prepare(
@@ -57,7 +82,7 @@ export async function search(url: URL, env: Env): Promise<Response> {
         .bind(match, ...binds)
         .all();
     } catch (e) {
-      if (!FTS5_SYNTAX_ERROR.test(String(e))) throw e;
+      if (!(await isInvalidUserQuery(match))) throw e;
       return null;
     }
   };

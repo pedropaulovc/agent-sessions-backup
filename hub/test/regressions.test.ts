@@ -132,7 +132,7 @@ describe('search handles a query whose quoted-phrase fallback is ALSO invalid FT
   });
 });
 
-describe('search only swallows recognized FTS5 syntax errors, not genuine D1/infra failures (regression: the catch-and-return-null in run() masked ANY error as "invalid query" — a dropped blocks_fts table or a transient D1 outage would 200 with fake-empty results instead of surfacing as a failure)', () => {
+describe('search classifies a failed query deterministically via a probe against the user\'s own MATCH text, not a message regex (regression: a plain regex over the caught error masked ANY error matching a recognized shape as "invalid query" — including "no such column:", which FTS5 emits for a bad column-filter in user input AND SQLite emits for a genuine bad column on the query\'s own hardcoded outer SELECT after a bad migration. The regex could not tell these apart and silently swallowed the second, real-outage case into a fake-empty 200)', () => {
   it('a genuine non-FTS D1 error (e.g. a missing table) is NOT swallowed — it still throws/500s', async () => {
     const originalPrepare = testEnv.DB.prepare.bind(testEnv.DB);
     const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
@@ -140,7 +140,10 @@ describe('search only swallows recognized FTS5 syntax errors, not genuine D1/inf
         // Empirically-captured real D1 error message shape for a missing table, fabricated here
         // to simulate infra breakage without actually dropping the real schema (storage isolation
         // in this test pool is per-FILE, not per-test — a real DROP/RENAME would corrupt every
-        // other test in this file, verified directly with a disposable probe and reverted).
+        // other test in this file, verified directly with a disposable probe and reverted). The
+        // probe query (a different, narrower SQL string) is left unmocked, so it runs for real
+        // against the actually-intact schema and succeeds — correctly telling the classifier this
+        // failure had nothing to do with the user's match text.
         return {
           bind: () => ({
             all: async () => {
@@ -160,13 +163,72 @@ describe('search only swallows recognized FTS5 syntax errors, not genuine D1/inf
     }
   });
 
-  it('a recognized FTS5 syntax error (a bad column filter) still swallows to 200 with empty hits, not a 500', async () => {
+  it('a genuinely invalid FTS5 match (a bad column filter) still swallows to 200 with empty hits, not a 500', async () => {
     const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/search?q=${encodeURIComponent('nosuchcol:term')}`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { hits: unknown[] };
     expect(body.hits).toEqual([]);
+  });
+
+  it('the AMBIGUOUS "no such column:" shape on the outer query is NOT swallowed when it\'s a genuine schema break, not a bad MATCH filter (regression: the old message regex could not distinguish this from FTS5\'s own column-filter rejection and swallowed it)', async () => {
+    const originalPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
+      if (sql.includes('FROM blocks_fts') && sql.includes('ORDER BY rank')) {
+        // Same message SHAPE ("no such column:") the FTS5 column-filter case produces, but here
+        // it's fabricated as coming from the query's own outer SELECT (e.g. s.primary_model after
+        // a bad migration) — a case the message-regex approach could not distinguish from user
+        // input at all. The probe SQL (a different, narrower string) is left unmocked and runs for
+        // real: since blocks_fts itself is intact and the match text ('anything') is valid FTS5,
+        // the probe succeeds, correctly telling the classifier this wasn't about the match text.
+        return {
+          bind: () => ({
+            all: async () => {
+              throw new Error('D1_ERROR: no such column: s.primary_model: SQLITE_ERROR');
+            },
+          }),
+        } as unknown as D1PreparedStatement;
+      }
+      return originalPrepare(sql);
+    });
+    try {
+      await expect(
+        SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=anything', { headers: { 'x-dev-machine': MACHINE } }),
+      ).rejects.toThrow(/no such column/i);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('a full D1/blocks_fts outage (main query AND both probes all fail) still rethrows the original error, not a fake-empty 200', async () => {
+    const originalPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    const PROBE_SQL = 'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?1 LIMIT 1';
+    const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
+      const isMainQuery = sql.includes('FROM blocks_fts') && sql.includes('ORDER BY rank');
+      const isProbe = sql === PROBE_SQL;
+      if (isMainQuery || isProbe) {
+        // Everything that touches blocks_fts fails identically — simulates the table (or the
+        // whole D1 database) being genuinely down, not just a bad match string. Neither the
+        // classifier's own probe NOR its control probe (same SQL, different bind value) can
+        // succeed here, so this must rethrow rather than conclude "just an invalid query".
+        return {
+          bind: () => ({
+            all: async () => {
+              throw new Error('D1_ERROR: database is locked: SQLITE_BUSY');
+            },
+          }),
+        } as unknown as D1PreparedStatement;
+      }
+      return originalPrepare(sql);
+    });
+    try {
+      await expect(
+        SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=anything', { headers: { 'x-dev-machine': MACHINE } }),
+      ).rejects.toThrow(/database is locked/i);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 
