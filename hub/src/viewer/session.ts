@@ -43,10 +43,13 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
   if (!meta) return notFound();
 
   const file = await env.DB.prepare(
-    `SELECT f.store, f.relpath, f.r2_key FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
+    `SELECT f.store, f.relpath, f.r2_key, f.content_hash FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
   )
     .bind(sessionId)
-    .first<{ store: string; relpath: string; r2_key: string }>();
+    .first<{ store: string; relpath: string; r2_key: string; content_hash: string }>();
+  // Cache-busting token for blob URLs: block ids (rowids) are reused across reindexes, so the
+  // 1-year immutable cache is keyed on the canonical file's content hash prefix.
+  const blobVersion = blobVersionOf(file?.content_hash);
 
   const view: View = url.searchParams.get('view') === 'effective' ? 'effective' : 'chronological';
   const maxTurn = (
@@ -69,14 +72,17 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
   const startByte = await firstByteFrom(env, sessionId, lo);
   const endByte = await firstByteFrom(env, sessionId, hi);
 
-  // Authoritative global turn_index per content turn on this page, in order — zipped onto the parsed turns for anchors.
-  const pageTurnIndexes = (
+  // Authoritative per-content-turn (turn_index, on_main_path) for this page, in order — zipped onto the parsed
+  // turns for anchors and for dimming/hiding. on_main_path is persisted at index time (whole-session view),
+  // so it stays correct even when a rewind crosses a page boundary that a partial parse can't see.
+  const pageTurns = (
     await env.DB.prepare(
-      `SELECT DISTINCT turn_index FROM blocks WHERE session_id = ?1 AND turn_index >= ?2 AND turn_index < ?3 ORDER BY turn_index`,
+      `SELECT turn_index, MAX(on_main_path) AS on_main_path FROM blocks
+       WHERE session_id = ?1 AND turn_index >= ?2 AND turn_index < ?3 GROUP BY turn_index ORDER BY turn_index`,
     )
       .bind(sessionId, lo, hi)
-      .all<{ turn_index: number }>()
-  ).results.map((r) => r.turn_index);
+      .all<{ turn_index: number; on_main_path: number }>()
+  ).results.map((r) => ({ turnIndex: r.turn_index, onMainPath: r.on_main_path === 1 }));
 
   // Media block ids for this byte window, so <img>/<a> can point at the blob endpoint.
   const mediaIds = await loadMediaIds(env, sessionId, startByte, endByte);
@@ -98,12 +104,15 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
           controller.enqueue(encoder.encode('<p class="warn">Raw transcript unavailable (R2 object missing).</p>'));
         } else {
           let rendered = 0;
-          let contentIdx = 0; // advances once per content turn, to zip authoritative turn_index anchors
+          let contentIdx = 0; // advances once per content turn, to zip authoritative D1 rows onto parsed turns
           for (const turn of parsed.turns) {
             const isContent = !turn.compaction && turn.blocks.length > 0;
-            const turnIndex = isContent ? pageTurnIndexes[contentIdx] : undefined;
+            const zip = isContent ? pageTurns[contentIdx] : undefined;
             if (isContent) contentIdx++;
-            const html = renderTurn(turn, sessionId, view, mediaIds, turnIndex);
+            // Prefer the persisted main-path flag; fall back to the parser's per-page guess only when the
+            // D1 zip has no matching row (e.g. compaction markers, which have no blocks rows).
+            const onMainPath = zip ? zip.onMainPath : turn.onMainPath;
+            const html = renderTurn(turn, sessionId, view, mediaIds, zip?.turnIndex, onMainPath, blobVersion);
             if (html) {
               controller.enqueue(encoder.encode(html));
               rendered++;
@@ -178,25 +187,27 @@ function renderTurn(
   view: View,
   mediaIds: Map<string, number>,
   turnIndex: number | undefined,
+  onMainPath: boolean,
+  blobVersion: string,
 ): string {
   if (turn.compaction) {
     return `<div class="divider">── context compacted ──</div>`;
   }
-  if (view === 'effective' && !turn.onMainPath) return '';
+  if (view === 'effective' && !onMainPath) return '';
   if (turn.blocks.length === 0) return '';
 
-  const rewound = view === 'chronological' && !turn.onMainPath;
+  const rewound = view === 'chronological' && !onMainPath;
   const cls = `turn ${esc(turn.role)}${rewound ? ' rewound' : ''}`;
   // Stable anchor id (present in every view) so search-hit deep links can scroll to the matching turn.
   const anchor = turnIndex === undefined ? '' : ` id="t${turnIndex}"`;
   const model = turn.model ? `<span class="chip">${esc(turn.model)}</span>` : '';
   const ts = turn.ts ? `<span class="muted small">${esc(turn.ts)}</span>` : '';
   const head = `<div class="turnhead"><span class="role">${esc(turn.role)}</span>${model}${ts}</div>`;
-  const body = turn.blocks.map((b, bi) => renderBlock(b, bi, sessionId, mediaIds)).join('');
+  const body = turn.blocks.map((b, bi) => renderBlock(b, bi, sessionId, mediaIds, blobVersion)).join('');
   return `<article${anchor} class="${cls}">${head}<div class="body">${body}</div></article>`;
 }
 
-function renderBlock(b: NormalizedBlock, bi: number, sessionId: string, mediaIds: Map<string, number>): string {
+function renderBlock(b: NormalizedBlock, bi: number, sessionId: string, mediaIds: Map<string, number>, blobVersion: string): string {
   const trunc = b.truncated ? `<div class="truncnote">… truncated for indexing</div>` : '';
   switch (b.type) {
     case 'text':
@@ -216,13 +227,13 @@ function renderBlock(b: NormalizedBlock, bi: number, sessionId: string, mediaIds
     case 'image': {
       const id = mediaIds.get(`${b.byteStart}:${bi}`);
       if (id === undefined) return `<div class="muted small">[image${b.mediaType ? ` ${esc(b.mediaType)}` : ''} unavailable]</div>`;
-      return `<img class="media" loading="lazy" src="/s/${q(sessionId)}/blob/${id}" alt="image">`;
+      return `<img class="media" loading="lazy" src="${blobUrl(sessionId, id, blobVersion)}" alt="image">`;
     }
     case 'document': {
       const id = mediaIds.get(`${b.byteStart}:${bi}`);
       const label = `document${b.mediaType ? ` (${esc(b.mediaType)})` : ''}`;
       if (id === undefined) return `<div class="muted small">[${label} unavailable]</div>`;
-      return `<div><a href="/s/${q(sessionId)}/blob/${id}">📄 ${label}</a></div>`;
+      return `<div><a href="${blobUrl(sessionId, id, blobVersion)}">📄 ${label}</a></div>`;
     }
     default:
       return '';
@@ -317,6 +328,16 @@ function prettyToolInput(text: string, name: string): string {
 
 function fmtNum(n: number | null): string {
   return (n ?? 0).toLocaleString('en-US');
+}
+
+/** Cache-busting version token for blob URLs: first 12 hex of the canonical file's content hash. */
+export function blobVersionOf(contentHash: string | null | undefined): string {
+  return contentHash ? contentHash.slice(0, 12) : '';
+}
+
+function blobUrl(sessionId: string, blockId: number, version: string): string {
+  const base = `/s/${q(sessionId)}/blob/${blockId}`;
+  return version ? `${base}?v=${version}` : base;
 }
 
 function notFound(): Response {

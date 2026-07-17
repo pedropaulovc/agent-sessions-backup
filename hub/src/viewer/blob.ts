@@ -1,4 +1,6 @@
-/** GET /s/{id}/blob/{block_id} — serve a single image/document by range-reading its source line from R2. */
+/** GET /s/{id}/blob/{block_id}?v={hash} — serve a single image/document by range-reading its source line from R2. */
+
+import { blobVersionOf } from './session';
 
 // Only these raster types are safe to render inline from the viewer origin. Everything else —
 // documents, SVG, text/html, unknown/absent — is transcript-controlled and could execute script
@@ -11,14 +13,15 @@ interface BlockRow {
   block_index: number;
   btype: string;
   r2_key: string;
+  content_hash: string;
 }
 
-export async function blobEndpoint(sessionId: string, blockId: string, env: Env): Promise<Response> {
+export async function blobEndpoint(sessionId: string, blockId: string, url: URL, env: Env): Promise<Response> {
   const id = Number(blockId);
   if (!Number.isInteger(id) || id < 0) return notFound();
 
   const row = await env.DB.prepare(
-    `SELECT b.byte_start, b.byte_len, b.block_index, b.btype, f.r2_key
+    `SELECT b.byte_start, b.byte_len, b.block_index, b.btype, f.r2_key, f.content_hash
      FROM blocks b JOIN files f ON f.id = b.file_id
      WHERE b.id = ?1 AND b.session_id = ?2`,
   )
@@ -26,6 +29,14 @@ export async function blobEndpoint(sessionId: string, blockId: string, env: Env)
     .first<BlockRow>();
   if (!row || row.byte_start === null || row.byte_len === null) return notFound();
   if (row.btype !== 'image' && row.btype !== 'document') return notFound();
+
+  // block ids are reused rowids, so the URL is versioned by the canonical file's content hash. A stale/absent
+  // `v` (e.g. cached HTML after a reindex) redirects to the current URL; only an exact match earns immutable.
+  const currentVersion = blobVersionOf(row.content_hash);
+  const suppliedV = url.searchParams.get('v');
+  if (currentVersion && suppliedV !== currentVersion) {
+    return Response.redirect(new URL(`${url.pathname}?v=${currentVersion}`, url).toString(), 302);
+  }
 
   const obj = await env.RAW.get(row.r2_key, { range: { offset: row.byte_start, length: row.byte_len } });
   if (!obj) return notFound();
@@ -52,7 +63,8 @@ export async function blobEndpoint(sessionId: string, blockId: string, env: Env)
   const inlineSafe = row.btype === 'image' && INLINE_IMAGE_TYPES.has(mime);
 
   const headers: Record<string, string> = {
-    'cache-control': 'private, max-age=31536000, immutable',
+    // We only reach here version-matched (mismatches redirected above); an unversionable file gets no-cache.
+    'cache-control': currentVersion ? 'private, max-age=31536000, immutable' : 'no-cache',
     'x-content-type-options': 'nosniff',
   };
   if (inlineSafe) {

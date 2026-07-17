@@ -21,7 +21,7 @@ export async function viewerRoute(request: Request, url: URL, env: Env): Promise
   if (path === '/machines') return machinesPage(env);
 
   const blob = path.match(/^\/s\/([^/]+)\/blob\/([^/]+)$/);
-  if (blob) return blobEndpoint(decodeURIComponent(blob[1]!), decodeURIComponent(blob[2]!), env);
+  if (blob) return blobEndpoint(decodeURIComponent(blob[1]!), decodeURIComponent(blob[2]!), url, env);
 
   const session = path.match(/^\/s\/([^/]+)\/?$/);
   if (session) return sessionPage(decodeURIComponent(session[1]!), url, env);

@@ -404,8 +404,8 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
   ]);
 
   const insertBlock = db.prepare(
-    `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, byte_start, byte_len, truncated, text)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
+    `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, byte_start, byte_len, truncated, text, on_main_path)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`,
   );
   const insertUsage = db.prepare(
     `INSERT INTO usage (session_id, turn_index, ts, model, service_tier, input_tokens, output_tokens, reasoning_tokens,
@@ -437,6 +437,7 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
           b.byteLen,
           b.truncated ? 1 : 0,
           b.text ?? null,
+          turn.onMainPath ? 1 : 0,
         ),
       );
     }
