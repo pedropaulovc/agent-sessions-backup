@@ -90,17 +90,22 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
     .first<FileRow>();
   if (!file) return;
 
+  // Reject a stale message at the source, before any R2 read or write: if this row's
+  // content_hash has already moved on from what this message was enqueued for, a re-upload beat
+  // this delivery and a fresher message already owns the current bytes. Catching this here — not
+  // only in the per-branch hash-guarded markParsed calls below — matters most for the main parse
+  // path, where writeSession() is otherwise unconditional: without this early return, a stale
+  // parse could replace a session's blocks/FTS/usage with OLD content and flip index_state back
+  // to 'ready' BEFORE markParsed ever notices the mismatch, serving stale search/session reads
+  // even while the files row correctly stays 'pending'. The hash-guarded markParsed calls below
+  // stay in place as defense in depth (e.g. a mismatch introduced mid-parse, after this check
+  // already passed). Messages enqueued before content_hash existed carry it as undefined and
+  // skip this check entirely, same as every other hash guard in this file.
+  if (job.content_hash !== undefined && file.content_hash !== job.content_hash) return;
+
   const det = detect(file.store, file.relpath);
 
   if (det.kind === 'subagent-meta') {
-    // job.content_hash (when present) guards against a stale in-flight parse: if a re-upload
-    // changed this row's content_hash before this message got a chance to run, a fresher message
-    // already handles the current content. Reading R2 now and writing its metadata (or marking
-    // this row 'parsed') would describe the EARLIER upload, not the current one — overwriting
-    // parent_tool_use_id with stale data and, since the write is otherwise unconditional, leaving
-    // no self-healing path if the fresher message is ever lost (files/check only re-enqueues
-    // non-terminal rows). Skip the whole branch on mismatch; the fresher message handles it.
-    if (job.content_hash !== undefined && file.content_hash !== job.content_hash) return;
     await linkSubagentMeta(file, env);
     await markParsed(file.id, env, 'parsed', undefined, undefined, job.content_hash);
     return;
@@ -201,11 +206,17 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
   // this point on a previous attempt) with another, better copy having successfully delivered
   // and completed in between — the pre-parse check at the top of this function only reflects
   // state as of THIS attempt's start, which can be stale by the time a retry reaches here.
-  // Recheck immediately before writeSession: if some other, already-parsed copy is now the
-  // preferred candidate, drop this file's write entirely instead of clobbering the good session
-  // with a worse duplicate. A reindex self-heals if this is ever actually hit.
-  const postParseCanonical = await chooseCanonical(det.sessionId, env);
-  if (postParseCanonical !== null && postParseCanonical.id !== file.id && postParseCanonical.parseState === 'parsed') {
+  // Recheck immediately before writeSession, but against the best ALREADY-PARSED candidate, not
+  // chooseCanonical()'s single preferred row — that row can be merely 'pending' (e.g. A pending
+  // at priority 0, B parsed and canonical at priority 1): chooseCanonical returns A (better
+  // priority, regardless of state), so a naive `.parseState === 'parsed'` check on IT would miss
+  // that B is the best PROVEN copy and let a lower-priority C clobber B anyway. chooseBestParsed
+  // only considers 'parsed' rows, with this file folded into the same ranking, so it correctly
+  // says "no" both when nothing beats this file AND when this file (not yet parsed) is itself the
+  // best of the bunch (e.g. better-priority A parsing after worse-priority B already did — A must
+  // proceed and later supersede B, not supersede itself).
+  const outranking = await chooseBestParsed(det.sessionId, file.id, env);
+  if (outranking !== null) {
     await env.DB.prepare("UPDATE files SET parse_state = 'superseded' WHERE id = ?1").bind(file.id).run();
     return;
   }
@@ -219,15 +230,14 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
   // delete+reinsert per session_id), so it's a harmless transient rather than a lasting error.
   const { updated } = await markParsed(file.id, env, 'parsed', file.size, undefined, job.content_hash);
   if (!updated) return;
-  // Only the file the recheck just confirmed as the preferred candidate gets to supersede other
-  // parsed duplicates. A worse-priority file that wrote because the preferred copy was still
-  // unparsed must not claim that role — the preferred copy supersedes this one itself once IT
-  // completes and runs its own recheck.
-  if (postParseCanonical === null || postParseCanonical.id === file.id) {
-    await env.DB.prepare("UPDATE files SET parse_state = 'superseded' WHERE session_id = ?1 AND id != ?2 AND parse_state = 'parsed'")
-      .bind(det.sessionId, file.id)
-      .run();
-  }
+  // The recheck above already proved nothing PARSED outranks this file, so it's safe to claim the
+  // supersede-others role unconditionally here (max_concurrency: 1 means nothing else could have
+  // become 'parsed' in between). A worse-priority file that wrote because the preferred copy was
+  // still unparsed must not claim that role — the preferred copy supersedes this one itself once
+  // IT completes and runs its own recheck; that's exactly the case the recheck above filters out.
+  await env.DB.prepare("UPDATE files SET parse_state = 'superseded' WHERE session_id = ?1 AND id != ?2 AND parse_state = 'parsed'")
+    .bind(det.sessionId, file.id)
+    .run();
 
   console.log(
     JSON.stringify({
@@ -262,6 +272,39 @@ async function chooseCanonical(sessionId: string, env: Env): Promise<{ id: numbe
     .bind(sessionId)
     .first<{ id: number; parse_state: string }>();
   return row ? { id: row.id, parseState: row.parse_state } : null;
+}
+
+/**
+ * Whether some OTHER candidate already marked 'parsed' for this session outranks `fileId` under
+ * the same tie-break order as chooseCanonical (priority ASC, size DESC, mtime DESC, id ASC) —
+ * null if none does. Unlike chooseCanonical, this only considers 'parsed' rows: a still-pending
+ * row can rank ahead of an already-parsed one under chooseCanonical's ordering even though it
+ * hasn't proven anything yet (e.g. A pending at priority 0, B parsed and canonical at priority 1)
+ * — a naive "is chooseCanonical's top pick parsed?" check would then miss that B is the best
+ * PROVEN copy and let a worse-priority C clobber B anyway.
+ *
+ * `fileId` is folded into the ranking itself (via UNION with its own row) rather than compared
+ * against separately, so this also correctly answers "no" when fileId — though not yet marked
+ * parsed — is actually the best copy once you account for it (e.g. better-priority A parsing
+ * after worse-priority B already did): A must proceed and supersede B afterward, not supersede
+ * itself just because SOME other parsed row happens to exist.
+ */
+async function chooseBestParsed(sessionId: string, fileId: number, env: Env): Promise<{ id: number } | null> {
+  const row = await env.DB.prepare(
+    `SELECT id FROM (
+       SELECT f.id AS id, m.priority AS priority, f.size AS size, f.mtime AS mtime
+       FROM files f JOIN machines m ON m.machine_id = f.machine_id
+       WHERE f.session_id = ?1 AND f.parse_state = 'parsed' AND f.id != ?2
+       UNION ALL
+       SELECT f2.id AS id, m2.priority AS priority, f2.size AS size, f2.mtime AS mtime
+       FROM files f2 JOIN machines m2 ON m2.machine_id = f2.machine_id
+       WHERE f2.id = ?2
+     )
+     ORDER BY priority ASC, size DESC, mtime DESC, id ASC LIMIT 1`,
+  )
+    .bind(sessionId, fileId)
+    .first<{ id: number }>();
+  return row && row.id !== fileId ? { id: row.id } : null;
 }
 
 /**
@@ -444,7 +487,13 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
            git_branch = excluded.git_branch, models = excluded.models, primary_model = excluded.primary_model,
            title = COALESCE(excluded.title, sessions.title), started_at = excluded.started_at, ended_at = excluded.ended_at,
            parent_session_id = COALESCE(excluded.parent_session_id, sessions.parent_session_id),
-           parent_tool_use_id = COALESCE(sessions.parent_tool_use_id, excluded.parent_tool_use_id),
+           -- excluded wins when non-null: a transcript reparse reads the CURRENT sibling meta live
+           -- (readSiblingMeta above), so a corrected .meta.json shows up here as a fresh, non-null
+           -- excluded.parent_tool_use_id and must overwrite the stale stored value. Only fall back
+           -- to the stored value when THIS write has no metadata of its own to offer (excluded is
+           -- NULL) — e.g. a transcript reparse whose sibling meta hasn't landed (or was deleted),
+           -- where linkSubagentMeta's own targeted UPDATE remains the source of truth instead.
+           parent_tool_use_id = COALESCE(excluded.parent_tool_use_id, sessions.parent_tool_use_id),
            is_sidechain = excluded.is_sidechain, turn_count = excluded.turn_count, block_count = excluded.block_count,
            tokens_in = excluded.tokens_in, tokens_out = excluded.tokens_out,
            tokens_reasoning = excluded.tokens_reasoning, tokens_cached = excluded.tokens_cached,

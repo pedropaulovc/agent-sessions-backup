@@ -316,6 +316,9 @@ describe('canonical selection does not supersede a valid duplicate behind a stil
       testEnv.DB.prepare(
         "INSERT INTO machines (machine_id, os, priority) VALUES ('canon2-b', 'linux', 1) ON CONFLICT (machine_id) DO UPDATE SET priority = 1",
       ),
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('canon2-c', 'linux', 2) ON CONFLICT (machine_id) DO UPDATE SET priority = 2",
+      ),
     ]);
   });
 
@@ -401,6 +404,54 @@ describe('canonical selection does not supersede a valid duplicate behind a stil
       .first<{ canonical_file_id: number; index_state: string }>();
     expect(session2?.canonical_file_id).toBe(fileIdB);
     expect(session2?.index_state).toBe('ready');
+  });
+
+  it('A pending (best priority), B parsed and canonical (worse priority), C (worst priority) delivers: C is superseded behind B, not the other way around (regression: the post-parse recheck compared against chooseCanonical\'s single preferred row, which can be the still-pending A, masking the already-proven B)', async () => {
+    const SESSION_ID = '77777777-8888-4444-8444-000000000003';
+
+    // A (best priority) is uploaded but never delivered — stays 'pending' throughout this test.
+    const resA = await putFile('canon2-a', 'claude-projects', `pend3-a/${SESSION_ID}.jsonl`, CONTENT);
+    expect(resA.status).toBe(201);
+
+    // B (worse priority than A, better than C) delivers and parses — becomes canonical.
+    const resB = await putFile('canon2-b', 'claude-projects', `pend3-b/${SESSION_ID}.jsonl`, CONTENT);
+    expect(resB.status).toBe(201);
+    const fileIdB = ((await resB.json()) as { file_id: number }).file_id;
+    const r2KeyB = `raw/canon2-b/claude-projects/pend3-b/${SESSION_ID}.jsonl`;
+    await deliverOne(fileIdB, r2KeyB);
+    const rowB1 = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string }>();
+    expect(rowB1?.parse_state).toBe('parsed');
+    const session1 = await testEnv.DB.prepare('SELECT canonical_file_id FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number }>();
+    expect(session1?.canonical_file_id).toBe(fileIdB);
+
+    // C (worst priority) delivers. chooseCanonical's single preferred row is still-pending A —
+    // a naive `.parseState === 'parsed'` check on THAT row would see 'pending' and wrongly let C
+    // through to writeSession(), clobbering B. The fix must instead notice that B (an actually
+    // PARSED row) already outranks C and supersede C on the spot.
+    const resC = await putFile('canon2-c', 'claude-projects', `pend3-c/${SESSION_ID}.jsonl`, CONTENT);
+    expect(resC.status).toBe(201);
+    const fileIdC = ((await resC.json()) as { file_id: number }).file_id;
+    const r2KeyC = `raw/canon2-c/claude-projects/pend3-c/${SESSION_ID}.jsonl`;
+    await deliverOne(fileIdC, r2KeyC);
+
+    const rowC = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdC)
+      .first<{ parse_state: string }>();
+    expect(rowC?.parse_state).toBe('superseded');
+
+    const rowB2 = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string }>();
+    expect(rowB2?.parse_state).toBe('parsed'); // untouched — B stays canonical
+
+    const session2 = await testEnv.DB.prepare('SELECT canonical_file_id FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number }>();
+    expect(session2?.canonical_file_id).toBe(fileIdB); // session content unchanged
   });
 });
 

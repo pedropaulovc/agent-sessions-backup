@@ -1027,6 +1027,60 @@ describe('subagent meta parse is guarded by content_hash (regression: a stale in
   });
 });
 
+describe('a transcript reparse that reads a CORRECTED sibling meta repairs a stale parent_tool_use_id link (regression: the sessions upsert\'s COALESCE kept the OLD stored value over a fresh non-null one)', () => {
+  const PROJECT_SLUG3 = '-home-tester-src-subagent-repair';
+  const SUBAGENT_PARENT3 = '99999999-8888-4444-8444-999999999999';
+  const SUBAGENT_REPAIR = 'dddddddd-1111-4444-8444-222222222222';
+
+  function subagentTranscript(tag: string): string {
+    return `${[
+      ccUserLine({ uuid: `${tag}-u1`, text: 'subagent task' }),
+      ccAssistantLine({ uuid: `${tag}-a1`, parentUuid: `${tag}-u1`, text: 'subagent result' }),
+    ].join('\n')}\n`;
+  }
+  function subagentMeta(toolUseId: string): string {
+    return JSON.stringify({ toolUseId, agentType: 'general-purpose' });
+  }
+  async function parentToolUseId(sessionId: string): Promise<string | null | undefined> {
+    const row = await testEnv.DB.prepare('SELECT parent_tool_use_id FROM sessions WHERE session_id = ?1')
+      .bind(sessionId)
+      .first<{ parent_tool_use_id: string | null }>();
+    return row?.parent_tool_use_id;
+  }
+
+  it('reparsing the transcript after the meta is corrected overwrites the stale link with the corrected one', async () => {
+    const metaRelpath = `${PROJECT_SLUG3}/${SUBAGENT_PARENT3}/subagents/agent-${SUBAGENT_REPAIR}.meta.json`;
+    const transcriptRelpath = `${PROJECT_SLUG3}/${SUBAGENT_PARENT3}/subagents/agent-${SUBAGENT_REPAIR}.jsonl`;
+    const transcriptR2Key = `raw/${MACHINE}/claude-projects/${transcriptRelpath}`;
+
+    // Link meta v1 and index the transcript.
+    const metaRes1 = await putFile('claude-projects', metaRelpath, subagentMeta('toolu_v1'));
+    expect(metaRes1.status).toBe(201);
+    await drainQueue();
+
+    const transcriptRes = await putFile('claude-projects', transcriptRelpath, subagentTranscript('repair'));
+    expect(transcriptRes.status).toBe(201);
+    const transcriptFileId = ((await transcriptRes.json()) as { file_id: number }).file_id;
+    await deliverOne(transcriptFileId, transcriptR2Key);
+
+    expect(await parentToolUseId(SUBAGENT_REPAIR)).toBe('toolu_v1');
+
+    // Correct the meta file (new tool id) — this alone doesn't touch the sessions row (its own
+    // fresh message is never drained here; we care about the TRANSCRIPT reparse path).
+    const metaRes2 = await putFile('claude-projects', metaRelpath, subagentMeta('toolu_v2'));
+    expect(metaRes2.status).toBe(201);
+    expect(await parentToolUseId(SUBAGENT_REPAIR)).toBe('toolu_v1'); // still stale — meta's own message hasn't run
+
+    // Reparse the transcript (e.g. via a resync/reindex) — parseOne's subagent branch reads the
+    // sibling meta LIVE from R2 (readSiblingMeta), so it picks up the corrected tool id and writes
+    // it into `parsed.parentToolUseId`. The sessions upsert must let that fresh, non-null value
+    // win over the stale one already stored, not keep the stale one just because it's non-null.
+    await deliverOne(transcriptFileId, transcriptR2Key);
+
+    expect(await parentToolUseId(SUBAGENT_REPAIR)).toBe('toolu_v2');
+  });
+});
+
 describe('search cursor decoding rejects non-integer offsets (regression: a finite non-integer cursor reached SQL OFFSET and 500\'d)', () => {
   it('a hand-edited cursor decoding to 1.5 is treated as offset 0 (first page), not a 500', async () => {
     const withoutCursor = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=bound', {
@@ -1058,5 +1112,75 @@ describe('search cursor decoding rejects non-integer offsets (regression: a fini
     expect(withInvalidCursor.status).toBe(200);
     const invalidCursorPage = (await withInvalidCursor.json()) as { hits: Array<{ session_id: string }> };
     expect(invalidCursorPage.hits).toEqual(firstPage.hits);
+  });
+});
+
+describe('a stale message (redelivered after a re-upload changed the row\'s hash) is rejected at the source — no session write at all, row untouched; the fresh message indexes normally', () => {
+  it('a redelivered pre-reupload message makes zero writes: blocks/search still show the OLD content, the row is not marked parsed; the fresh message then indexes the NEW content', async () => {
+    const SESSION_ID = 'e0000000-0000-4000-8000-000000000003';
+    const relpath = `stale-write-demo/${SESSION_ID}.jsonl`;
+    const CONTENT_V1 = `${ccUserLine({ uuid: 'sw-u1', text: 'unique-marker-stalewrite-v1 original content' })}\n`;
+    const CONTENT_V2 = `${ccUserLine({ uuid: 'sw-u2', text: 'unique-marker-stalewrite-v2 replaced content' })}\n`;
+
+    const res1 = await putFile('claude-projects', relpath, CONTENT_V1);
+    expect(res1.status).toBe(201);
+    const fileId = ((await res1.json()) as { file_id: number }).file_id;
+    const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
+    await deliverOne(fileId, r2Key);
+
+    const rowV1 = await testEnv.DB.prepare('SELECT content_hash, parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ content_hash: string; parse_state: string }>();
+    expect(rowV1?.parse_state).toBe('parsed');
+    const oldHash = rowV1!.content_hash;
+
+    const searchV1Before = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-stalewrite-v1', {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    const bodyV1Before = (await searchV1Before.json()) as { hits: Array<{ session_id: string }> };
+    expect(bodyV1Before.hits.some((h) => h.session_id === SESSION_ID)).toBe(true);
+
+    // Re-upload with different content — changes content_hash and enqueues a FRESH message, but
+    // we deliberately never drain it here.
+    const res2 = await putFile('claude-projects', relpath, CONTENT_V2);
+    expect(res2.status).toBe(201);
+
+    // Redeliver the STALE (pre-reupload) message, still carrying the now-superseded oldHash —
+    // simulates a delayed/reordered delivery racing the fresh upload's own message.
+    await deliverOne(fileId, r2Key, oldHash);
+
+    // No writes at all: the row is not marked parsed by the stale delivery...
+    const rowAfterStale = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(rowAfterStale?.parse_state).toBe('pending');
+
+    // ...and the session/blocks content is UNCHANGED (still V1) — the stale delivery must be
+    // rejected before it ever calls writeSession, not just before markParsed.
+    const searchV1After = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-stalewrite-v1', {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    const bodyV1After = (await searchV1After.json()) as { hits: Array<{ session_id: string }> };
+    expect(bodyV1After.hits.some((h) => h.session_id === SESSION_ID)).toBe(true);
+
+    const searchV2NotYet = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-stalewrite-v2', {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    const bodyV2NotYet = (await searchV2NotYet.json()) as { hits: Array<{ session_id: string }> };
+    expect(bodyV2NotYet.hits.some((h) => h.session_id === SESSION_ID)).toBe(false);
+
+    // The fresh message (still pending, since the stale delivery made no writes) now indexes the
+    // current (V2) content correctly.
+    await drainQueue();
+    const rowFresh = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(rowFresh?.parse_state).toBe('parsed');
+
+    const searchV2 = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-stalewrite-v2', {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    const bodyV2 = (await searchV2.json()) as { hits: Array<{ session_id: string }> };
+    expect(bodyV2.hits.some((h) => h.session_id === SESSION_ID)).toBe(true);
   });
 });
