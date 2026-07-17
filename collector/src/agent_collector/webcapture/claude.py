@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 from .cdp import CdpTransport
-from .result import CaptureResult, login_expired_event
+from .result import CaptureResult, login_expired_event, valid_conv_id
 
 BASE = "https://claude.ai"
 
@@ -54,6 +54,18 @@ def capture_claude(transport: CdpTransport, state, staging_root: Path, events: l
 
     staging_root.mkdir(parents=True, exist_ok=True)
     for conv_id, updated in changed:
+        # Reject a non-UUID id before it reaches EITHER the fetch URL or the `{conv_id}.json`
+        # staging path — a '/', '..' or absolute-path id (API drift / hostile endpoint) would
+        # otherwise escape staging_root. Buffer a fetch-failed event and leave the watermark so a
+        # since-corrected id is retried next run.
+        if not valid_conv_id(conv_id):
+            res.errors += 1
+            events.append({
+                "level": "warn", "code": "webcapture_fetch_failed",
+                "message": f"claude conversation id rejected (not a uuid): {conv_id!r}",
+                "count": 1, "store": "claude-web",
+            })
+            continue
         url = f"{BASE}/api/organizations/{org_id}/chat_conversations/{conv_id}?tree=True&rendering_mode=raw"
         status, body = transport.fetch(url)
         # Validate before staging + advancing the watermark: a 200 interstitial/HTML page must not

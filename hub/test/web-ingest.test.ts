@@ -2,7 +2,7 @@ import { SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { env as testEnvRaw } from 'cloudflare:test';
 import worker from '../src/index';
-import { chatgptExportZip, chatgptWebConversation, claudeWebConversation, historyLines } from './web-fixtures';
+import { chatgptExportZip, chatgptWebConversation, claudeWebConversation, historyLines, unrecognizedExportZip } from './web-fixtures';
 
 const CLAUDE_ROOT = '00000000-0000-4000-8000-000000000000';
 
@@ -326,6 +326,170 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id IN ('ea-a','ea-b')").first<{ n: number }>()).toMatchObject({ n: 0 });
     const fileState = await testEnv.DB.prepare("SELECT parse_state FROM files WHERE relpath = ?1 AND store = 'export-inbox'").bind(relpath).first<{ parse_state: string }>();
     expect(fileState?.parse_state).toBe('parsed');
+  });
+
+  it('a non-empty archive with an unrecognized layout is marked error and keeps old sessions (round 4 Fix 3)', async () => {
+    const relpath = 'chatgpt-export-drift.zip';
+    const good = chatgptExportZip([{ id: 'drift-keep', title: 'Keep', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'drift-marker preserved' }] }]);
+    expect((await put('webbox', 'export-inbox', relpath, good)).status).toBe(201);
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'drift-keep'").first<{ n: number }>()).toMatchObject({ n: 1 });
+
+    // Re-upload a NON-empty conversations.json whose layout drifted (no mapping/chat_messages). This
+    // must NOT be treated as an empty export (which would wipe drift-keep); it is flagged 'error'.
+    expect((await put('webbox', 'export-inbox', relpath, unrecognizedExportZip())).status).toBe(201);
+    await drainQueue();
+
+    const fileRow = await testEnv.DB.prepare("SELECT parse_state, parse_error FROM files WHERE relpath = ?1 AND store = 'export-inbox'").bind(relpath).first<{ parse_state: string; parse_error: string | null }>();
+    expect(fileRow?.parse_state).toBe('error');
+    expect(fileRow?.parse_error).toBeTruthy();
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'drift-keep'").first<{ n: number }>()).toMatchObject({ n: 1 });
+  });
+
+  it('an export backfill recovers a conversation whose live web capture is in error state (round 4 Fix 2)', async () => {
+    const CONV = 'rec-web-1';
+    // A live CDP capture lands and indexes the conversation first.
+    const live = chatgptWebConversation({
+      id: CONV,
+      title: 'Live original',
+      turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'recover-marker live original' }],
+    });
+    expect((await putText('webbox', 'chatgpt-web', `${CONV}.json`, live)).status).toBe(201);
+    await drainQueue();
+
+    // The live session then goes bad (e.g. a later reparse failed): index_state='error'. Its file
+    // stays canonical, and archive rows have session_id NULL, so chooseRecoveryCandidate() can't see
+    // an export backfill — the export write itself must be allowed to recover it.
+    await testEnv.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(CONV).run();
+
+    const zip = chatgptExportZip([{ id: CONV, title: 'Export recovered', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'recover-marker from export backfill' }] }]);
+    expect((await put('webbox', 'export-inbox', 'rec-web.zip', zip)).status).toBe(201);
+    await drainQueue();
+
+    const row = await testEnv.DB.prepare(
+      `SELECT s.title, s.index_state, f.store FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
+    )
+      .bind(CONV)
+      .first<{ title: string; index_state: string; store: string }>();
+    expect(row?.index_state).toBe('ready'); // recovered, no longer errored
+    expect(row?.store).toBe('export-inbox'); // the export took ownership to fill the gap
+    expect(row?.title).toBe('Export recovered');
+  });
+
+  it('bulk NDJSON parses a shared export archive once, not once per conversation (round 4 Fix 5)', async () => {
+    const zip = chatgptExportZip([
+      { id: 'cache-a', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'cachemarker alpha' }] },
+      { id: 'cache-b', title: 'B', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'cachemarker beta' }] },
+      { id: 'cache-c', title: 'C', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'cachemarker gamma' }] },
+    ]);
+    expect((await put('cachebox', 'export-inbox', 'cache.zip', zip)).status).toBe(201);
+    await drainQueue();
+
+    // Spy on the R2 reads while streaming the bulk NDJSON: the three sibling conversations share one
+    // ZIP, so the per-request archive cache must fetch + parse it exactly once (pre-fix: 3 times).
+    const zipKey = 'raw/cachebox/export-inbox/cache.zip';
+    const realGet = testEnv.RAW.get.bind(testEnv.RAW);
+    let zipGets = 0;
+    (testEnv.RAW as unknown as { get: unknown }).get = (key: string, opts?: unknown) => {
+      if (key === zipKey) zipGets++;
+      return (realGet as (k: string, o?: unknown) => unknown)(key, opts);
+    };
+    try {
+      const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions?format=ndjson&machine=cachebox', {
+        headers: { 'x-dev-machine': 'cachebox' },
+      });
+      const body = await res.text();
+      // All three conversations were actually emitted (so the count is meaningful).
+      for (const id of ['cache-a', 'cache-b', 'cache-c']) expect(body).toContain(id);
+    } finally {
+      (testEnv.RAW as unknown as { get: unknown }).get = realGet;
+    }
+    expect(zipGets).toBe(1);
+  });
+
+  it('raw for an archive-backed session returns only that conversation, not the whole ZIP (round 4 Fix 7)', async () => {
+    const zip = chatgptExportZip([
+      { id: 'raw-a', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'rawmarker-alpha only in A' }] },
+      { id: 'raw-b', title: 'B', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'rawmarker-beta only in B' }] },
+    ]);
+    expect((await put('webbox', 'export-inbox', 'raw.zip', zip)).status).toBe(201);
+    await drainQueue();
+
+    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions/raw-a/raw', { headers: { 'x-dev-machine': 'webbox' } });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('application/json');
+    const text = await res.text();
+    const obj = JSON.parse(text) as { conversation_id?: string }; // a single conversation object, not a ZIP
+    expect(obj.conversation_id).toBe('raw-a');
+    expect(text).toContain('rawmarker-alpha');
+    expect(text).not.toContain('rawmarker-beta'); // sibling conversation B must not leak
+  });
+
+  it('a re-upload landing after the write loop does not let a stale parse delete a dropped conversation — markParsed runs before cleanup (round 4 Fix 1)', async () => {
+    const relpath = 'chatgpt-export-reorder.zip';
+    const r2Key = 'raw/webbox/export-inbox/chatgpt-export-reorder.zip';
+    // The archive owns A and B.
+    const withBoth = chatgptExportZip([
+      { id: 'reorder-a', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'reorder-marker alpha' }] },
+      { id: 'reorder-b', title: 'B', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'reorder-marker beta' }] },
+    ]);
+    const r1 = await put('webbox', 'export-inbox', relpath, withBoth);
+    const fileId = ((await r1.json()) as { file_id: number }).file_id;
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id IN ('reorder-a','reorder-b')").first<{ n: number }>()).toMatchObject({ n: 2 });
+
+    // Re-upload the SAME path with only A (drops B), leaving it pending. R2 now holds [A] and the
+    // row's content_hash has moved on; the file still OWNS both A and B in sessions until cleanup.
+    const withOnlyA = chatgptExportZip([
+      { id: 'reorder-a', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'reorder-marker alpha' }] },
+    ]);
+    expect((await put('webbox', 'export-inbox', relpath, withOnlyA)).status).toBe(201);
+    const withOnlyAHash = await sha256Hex(withOnlyA);
+
+    // Deliver a message carrying withOnlyA's hash — it passes the early recheck and writes A off the
+    // current R2 bytes ([A]). Then simulate ANOTHER re-upload landing mid-parse (after the write
+    // loop) by mutating the row's content_hash the first time the parse reaches its post-write-loop
+    // step. With the fix that step is the guarded markParsed, which now fails and skips cleanup, so
+    // B survives for the fresh parse; pre-fix, cleanup ran first and deleted B before markParsed
+    // noticed — leaving no row if that fresh parse were delayed/dropped.
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    let mutated = false;
+    const mutateOnce = async () => {
+      if (mutated) return;
+      mutated = true;
+      await realPrepare('UPDATE files SET content_hash = ?2 WHERE id = ?1').bind(fileId, 'sha256:reuploaded-mid-parse').run();
+    };
+    const wrapBound = (bound: { run: () => unknown; all: () => unknown; first: (c?: string) => unknown; bind: (...a: unknown[]) => unknown }): unknown => ({
+      run: async () => {
+        await mutateOnce();
+        return bound.run();
+      },
+      all: async () => {
+        await mutateOnce();
+        return bound.all();
+      },
+      first: async (c?: string) => {
+        await mutateOnce();
+        return bound.first(c);
+      },
+      bind: (...a: unknown[]) => wrapBound(bound.bind(...a) as never),
+    });
+    (testEnv.DB as unknown as { prepare: unknown }).prepare = (sql: string) => {
+      const stmt = realPrepare(sql);
+      const isPostWriteLoopStep =
+        sql.includes('UPDATE files SET parse_state') || sql.includes('SELECT session_id FROM sessions WHERE canonical_file_id');
+      if (mutated || !isPostWriteLoopStep) return stmt;
+      return { bind: (...a: unknown[]) => wrapBound(stmt.bind(...a) as never) };
+    };
+    try {
+      await deliverOne(fileId, r2Key, withOnlyAHash);
+    } finally {
+      (testEnv.DB as unknown as { prepare: unknown }).prepare = realPrepare;
+    }
+
+    // The stale parse must NOT have deleted B — it waits for the fresh (current-hash) parse.
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'reorder-b'").first<{ n: number }>()).toMatchObject({ n: 1 });
+    expect(mutated).toBe(true); // the injection actually fired at the post-write-loop step
   });
 
   it('a corrupt replacement archive is marked error and keeps the old sessions (round 3 Fix 7)', async () => {

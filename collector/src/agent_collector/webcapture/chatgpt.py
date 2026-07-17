@@ -13,7 +13,7 @@ import json
 from pathlib import Path
 
 from .cdp import CdpTransport
-from .result import CaptureResult, login_expired_event
+from .result import CaptureResult, login_expired_event, valid_conv_id
 
 BASE = "https://chatgpt.com"
 PAGE_LIMIT = 100
@@ -31,6 +31,18 @@ def capture_chatgpt(transport: CdpTransport, state, staging_root: Path, events: 
     changed = _list_changed(transport, state, res, events)
     staging_root.mkdir(parents=True, exist_ok=True)
     for conv_id, update_time in changed:
+        # Reject a non-UUID id before it reaches EITHER the fetch URL or the `{conv_id}.json`
+        # staging path — a '/', '..' or absolute-path id (API drift / hostile endpoint) would
+        # otherwise escape staging_root. Never silent: a fetch-failed event is buffered and the
+        # watermark is left untouched, so a since-corrected id is retried next run.
+        if not valid_conv_id(conv_id):
+            res.errors += 1
+            events.append({
+                "level": "warn", "code": "webcapture_fetch_failed",
+                "message": f"chatgpt conversation id rejected (not a uuid): {conv_id!r}",
+                "count": 1, "store": "chatgpt-web",
+            })
+            continue
         status, body = transport.fetch(f"{BASE}/backend-api/conversation/{conv_id}")
         # Validate the body is a real conversation BEFORE staging + advancing the watermark: a 200
         # sign-in/interstitial HTML page would otherwise be staged and the watermark advanced, so

@@ -12,6 +12,7 @@ import {
   claudeWebConversation,
   emptyExportZip,
   historyLines,
+  unrecognizedExportZip,
 } from './web-fixtures';
 
 /** Every turn's [byteStart, byteLen) slice of the raw must contain the given anchor, and turn
@@ -260,6 +261,24 @@ describe('parseExportArchive', () => {
     const archive = parseExportArchive(zip);
     expect(archive.valid).toBe(true);
     expect(archive.sessions.map((s) => s.id)).toEqual(['big-a']);
+  });
+
+  it('a non-empty conversations.json with an unrecognized layout is INVALID, not empty (round 4 Fix 3)', () => {
+    // A populated array where detectLayout() finds neither `mapping` nor `chat_messages` must NOT
+    // be reported as a valid-but-empty export: the consumer would then treat it as a genuine empty
+    // export and wipe every session the file previously owned. It's an error (old sessions kept).
+    const archive = parseExportArchive(unrecognizedExportZip());
+    expect(archive.valid).toBe(false);
+    expect(archive.error).toMatch(/recognized|layout/i);
+    expect(archive.sessions).toHaveLength(0);
+  });
+
+  it('a non-empty conversations.json where every row lacks an id is INVALID (round 4 Fix 3)', () => {
+    // Layout IS recognized (a `mapping` is present) but no row carries a usable conversation id, so
+    // nothing is parseable — still not an empty export.
+    const archive = parseExportArchive(chatgptExportZip([{ id: '', title: 'no id', turns: [] }]));
+    expect(archive.valid).toBe(false);
+    expect(archive.error).toBeTruthy();
   });
 
   it('isConversationsEntry matches root/nested conversations.json only', () => {

@@ -67,11 +67,50 @@ export function parseExportArchive(bytes: Uint8Array): ExportArchive {
     const text = JSON.stringify(conv);
     sessions.push(harness === 'chatgpt-web' ? parseChatgptWeb(text, id) : parseClaudeWeb(text, id));
   }
+
+  // A well-formed EMPTY array is a legitimately empty export (valid — the consumer clears whatever
+  // this file used to own). But a NON-empty conversations.json that yielded zero recognized
+  // conversations — the layout drifted so detectLayout() returned 'unknown', or every row lacked a
+  // usable id — is NOT an empty export: treating it as valid-but-empty would make the consumer's
+  // cleanup delete every session this file previously owned. Mark it invalid so the old sessions
+  // are preserved and the file is flagged 'error' instead.
+  if (list.length > 0 && sessions.length === 0) {
+    return invalid(
+      harness === 'unknown'
+        ? 'conversations.json has entries but no recognized ChatGPT/Claude layout (export format drift)'
+        : 'conversations.json has entries but none carried a usable conversation id',
+    );
+  }
   return { valid: true, harness, sessions, skipped };
 }
 
 function invalid(error: string): ExportArchive {
   return { valid: false, harness: 'unknown', sessions: [], skipped: 0, error };
+}
+
+/**
+ * Extract the raw JSON of a SINGLE conversation (by its conversation id) from an export ZIP —
+ * the source-of-truth slice for one archive-backed session. Used by GET .../{id}/raw so it serves
+ * only that conversation, never the whole multi-conversation ZIP (other conversations + attachment
+ * blobs). Returns the re-serialized conversation object, or undefined if the archive is unreadable
+ * or no conversation matches. Reuses the same conversations.json-only inflation as the full parse.
+ */
+export function extractConversationById(bytes: Uint8Array, id: string): string | undefined {
+  const convsRaw = extractConversationsJson(bytes);
+  if (convsRaw === undefined) return undefined;
+  let list: unknown;
+  try {
+    list = JSON.parse(convsRaw);
+  } catch {
+    return undefined;
+  }
+  if (!Array.isArray(list)) return undefined;
+  const harness = detectLayout(list);
+  if (harness === 'unknown') return undefined;
+  for (const conv of list) {
+    if (isObj(conv) && conversationId(conv, harness) === id) return JSON.stringify(conv);
+  }
+  return undefined;
 }
 
 /** Inflate ONLY conversations.json (fflate filter runs before decompression), then decode it. */

@@ -330,29 +330,55 @@ async function parseExportInto(file: FileRow, env: Env, contentHash?: string): P
     return;
   }
 
-  // Session ids we actually WROTE this parse (turns > 0 and not owned by a live CDP capture). A
-  // conversation that is present in the new archive but now parses to zero turns is deliberately
-  // NOT kept, so its stale rows get cleared below (same as the single-session empty-parse path).
+  // Session ids we actually WROTE this parse (turns > 0 and not owned by a HEALTHY live CDP
+  // capture). A conversation present in the new archive but now parsing to zero turns is
+  // deliberately NOT kept, so its stale rows get cleared below (same as the single-session
+  // empty-parse path).
   const written = new Set<string>();
   for (const session of archive.sessions) {
     if (session.turns.length === 0) continue;
     const existing = await env.DB.prepare(
-      `SELECT f.store FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
+      `SELECT f.store, s.index_state FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
     )
       .bind(session.id)
-      .first<{ store: string }>();
-    if (existing && (existing.store === 'chatgpt-web' || existing.store === 'claude-web')) continue;
+      .first<{ store: string; index_state: string }>();
+    // Skip only a HEALTHY live capture: a chatgpt-web/claude-web canonical whose index_state is
+    // 'ready'. If that live session is instead 'error'/'parsing' (or absent), let this export write
+    // RECOVER it — export archive rows carry files.session_id = NULL, so chooseRecoveryCandidate()
+    // can never see this backfill copy, and re-skipping would strand the session empty/errored
+    // despite a usable export. A later successful web reparse (canonical = its own file) overwrites
+    // this export-written row again, so the live capture still wins once it is healthy.
+    const healthyLiveCapture =
+      existing && (existing.store === 'chatgpt-web' || existing.store === 'claude-web') && existing.index_state === 'ready';
+    if (healthyLiveCapture) continue;
     await writeSession(session, file, env);
     written.add(session.id);
   }
 
-  // A re-uploaded VALID archive that drops (or now-empties) a conversation must not leave its old
-  // session behind: the ZIP's files row has session_id NULL, so the normal
-  // reparse-clears-stale-rows path never touches per-conversation sessions. Delete any session
-  // still owned by THIS file that we did NOT just (re)write — matching delete+reinsert reparse
-  // semantics (derived rows + this session row; raw R2 untouched). Runs unconditionally now: the
-  // invalid case already returned above, so a well-formed empty array correctly clears everything
-  // this file owned, while a corrupt re-upload never reaches here.
+  // Guarded markParsed FIRST — before any destructive cleanup. markParsed's `UPDATE ... WHERE
+  // content_hash = ?` is atomic, so a re-upload that changed this row's bytes after the write loop
+  // makes updated=false. Running the stale-session deletes only AFTER we confirm we still own the
+  // row closes the window Codex flagged: otherwise a stale parse could delete a conversation the
+  // NEW bytes still contain, leaving no row for a delayed/dropped fresh parse to restore.
+  const { updated } = await markParsed(file.id, env, 'parsed', file.size, null, contentHash);
+  if (!updated) {
+    // The fresh message owns the current bytes now. Flip what we wrote off the OLD ZIP back to
+    // 'parsing' (don't advertise stale content as ready) and skip cleanup entirely — the fresh
+    // parse does its own write + cleanup against the current bytes. upload.ts can't do this flip
+    // for an archive, whose files row has no session_id. Safe under queue max_concurrency:1.
+    for (const id of written) {
+      await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(id).run();
+    }
+    return;
+  }
+
+  // We still own the row → safe to clear stale sessions. A re-uploaded VALID archive that drops (or
+  // now-empties) a conversation must not leave its old session behind: the ZIP's files row has
+  // session_id NULL, so the normal reparse-clears-stale-rows path never touches per-conversation
+  // sessions. Delete any session still owned by THIS file that we did NOT just (re)write — matching
+  // delete+reinsert reparse semantics (derived rows + this session row; raw R2 untouched). A
+  // well-formed empty array correctly clears everything this file owned; the invalid case already
+  // returned above, so a corrupt re-upload never reaches here.
   const recovered = new Set<string>();
   {
     const owned = await env.DB.prepare('SELECT session_id FROM sessions WHERE canonical_file_id = ?1')
@@ -386,17 +412,6 @@ async function parseExportInto(file: FileRow, env: Env, contentHash?: string): P
     for (const other of others.results) await markPendingAndEnqueue(other, 'recover', env);
   }
 
-  // Guarded markParsed: if a re-upload changed this row's hash while we were writing off the OLD
-  // ZIP bytes, the fresh message owns the rewrite — flip the sessions we just wrote back to
-  // 'parsing' so they don't advertise stale content as ready (upload.ts can't do this for an
-  // archive, whose files row has no session_id). Safe under queue max_concurrency:1.
-  const { updated } = await markParsed(file.id, env, 'parsed', file.size, null, contentHash);
-  if (!updated) {
-    for (const id of written) {
-      await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(id).run();
-    }
-    return;
-  }
   console.log(
     JSON.stringify({
       event: 'parse.export',

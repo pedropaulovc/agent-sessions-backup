@@ -1,6 +1,7 @@
 import { detect } from '../ingest/detect';
 import { parseObject } from '../ingest/parse';
-import { parseExportArchive } from '../ingest/parsers/export-inbox';
+import { extractConversationById, parseExportArchive } from '../ingest/parsers/export-inbox';
+import type { ExportArchive } from '../ingest/parsers/export-inbox';
 import type { NormalizedSession } from '../ingest/normalize';
 
 interface SessionRow {
@@ -13,8 +14,20 @@ interface SessionRow {
   [k: string]: unknown;
 }
 
-/** Build the NormalizedSession by stream-parsing the canonical R2 object (D1 holds metadata only). */
-export async function loadNormalized(sessionId: string, env: Env): Promise<NormalizedSession | null> {
+/**
+ * Build the NormalizedSession by stream-parsing the canonical R2 object (D1 holds metadata only).
+ *
+ * `archiveCache` (optional, per-request) memoizes parsed export ZIPs by r2_key. In the NDJSON bulk
+ * path many sibling sessions share ONE export archive; without the cache each row re-fetches and
+ * re-parses the same ZIP, so a single 200-conversation export triggers 200 full archive reads in
+ * one response. With it, each archive is fetched + parsed once per request. Non-archive sessions
+ * ignore it.
+ */
+export async function loadNormalized(
+  sessionId: string,
+  env: Env,
+  archiveCache?: Map<string, ExportArchive>,
+): Promise<NormalizedSession | null> {
   const file = await env.DB.prepare(
     `SELECT f.store, f.relpath, f.r2_key, s.parent_tool_use_id FROM sessions s JOIN files f ON f.id = s.canonical_file_id
      WHERE s.session_id = ?1`,
@@ -22,14 +35,21 @@ export async function loadNormalized(sessionId: string, env: Env): Promise<Norma
     .bind(sessionId)
     .first<{ store: string; relpath: string; r2_key: string; parent_tool_use_id: string | null }>();
   if (!file) return null;
-  const obj = await env.RAW.get(file.r2_key);
-  if (!obj) return null;
   const det = detect(file.store, file.relpath);
   if (det.kind === 'export-archive') {
-    // The canonical object is a multi-conversation ZIP; re-extract just this session by id.
-    const archive = parseExportArchive(new Uint8Array(await obj.arrayBuffer()));
+    // The canonical object is a multi-conversation ZIP; re-extract just this session by id, reusing
+    // an already-parsed archive from the per-request cache when present (see the doc comment).
+    let archive = archiveCache?.get(file.r2_key);
+    if (!archive) {
+      const obj = await env.RAW.get(file.r2_key);
+      if (!obj) return null;
+      archive = parseExportArchive(new Uint8Array(await obj.arrayBuffer()));
+      archiveCache?.set(file.r2_key, archive);
+    }
     return archive.sessions.find((s) => s.id === sessionId) ?? null;
   }
+  const obj = await env.RAW.get(file.r2_key);
+  if (!obj) return null;
   const parsed = await parseObject(det.harness, sessionId, obj);
   if (det.parentSessionId) parsed.parentSessionId = det.parentSessionId;
   // The queue consumer links parent_tool_use_id onto the sessions row (via the sibling
@@ -50,11 +70,27 @@ export async function getSession(sessionId: string, env: Env): Promise<Response>
 
 export async function getSessionRaw(sessionId: string, request: Request, env: Env): Promise<Response> {
   const file = await env.DB.prepare(
-    `SELECT f.r2_key FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
+    `SELECT f.store, f.relpath, f.r2_key FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
   )
     .bind(sessionId)
-    .first<{ r2_key: string }>();
+    .first<{ store: string; relpath: string; r2_key: string }>();
   if (!file) return Response.json({ error: 'not_found' }, { status: 404 });
+
+  // An archive-backed session's canonical object is the WHOLE export ZIP (every other conversation
+  // and its attachment blobs). Streaming it raw would leak all of that under one session's id;
+  // extract and serve ONLY this conversation's JSON instead. Byte-range semantics are meaningless
+  // for a single JSON document pulled out of a ZIP, so Range is ignored here — it stays supported
+  // for real JSONL canonicals below, whose byte offsets address the served file directly.
+  const det = detect(file.store, file.relpath);
+  if (det.kind === 'export-archive') {
+    const obj = await env.RAW.get(file.r2_key);
+    if (!obj) return Response.json({ error: 'r2_object_missing' }, { status: 404 });
+    const conv = extractConversationById(new Uint8Array(await obj.arrayBuffer()), sessionId);
+    if (conv === undefined) return Response.json({ error: 'not_found' }, { status: 404 });
+    console.log(JSON.stringify({ event: 'access.raw', session: sessionId, range: null }));
+    return new Response(conv, { status: 200, headers: { 'content-type': 'application/json; charset=utf-8' } });
+  }
+
   const rangeHeader = request.headers.get('range');
   // A present-but-unparseable Range header (e.g. the suffix form `bytes=-500`, which
   // parseRange doesn't support) must fall back to a full 200 — never claim 206 while
@@ -112,10 +148,12 @@ export async function listSessions(url: URL, env: Env): Promise<Response> {
 
   const encoder = new TextEncoder();
   const sessions = rows.results;
+  // One archive parse per export ZIP per request, shared across all its conversations' rows.
+  const archiveCache = new Map<string, ExportArchive>();
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       for (const row of sessions) {
-        const normalized = await loadNormalized(row.session_id, env).catch(() => null);
+        const normalized = await loadNormalized(row.session_id, env, archiveCache).catch(() => null);
         controller.enqueue(encoder.encode(`${JSON.stringify({ meta: row, session: normalized })}\n`));
       }
       controller.close();

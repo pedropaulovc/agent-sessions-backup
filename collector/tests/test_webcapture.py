@@ -317,6 +317,94 @@ def test_cmd_webcapture_cdp_error_one_product_still_runs_other(tmp_env):
         assert st.pending_event_count() >= 1  # the CdpError was buffered for the next heartbeat
 
 
+def test_cdp_list_targets_non_json_or_non_list_becomes_cdp_error(monkeypatch):
+    # Round 4 Fix 4: /json returning HTML (a non-Chrome service on --port), or a 200 JSON object
+    # instead of a list, must raise CdpError — not a bare JSONDecodeError, and not a value that later
+    # makes _connect() call .get on a string. _run_products only catches CdpError, so anything else
+    # would abort the whole command before the other product runs.
+    from agent_collector.webcapture import cdp as cdp_mod
+    from agent_collector.webcapture.cdp import ChromeCdpTransport, CdpError
+
+    class _Resp:
+        def __init__(self, data):
+            self._data = data
+
+        def read(self):
+            return self._data.encode("utf-8")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_a):
+            return False
+
+    tr = ChromeCdpTransport("https://chatgpt.com", host="127.0.0.1", port=9222)
+
+    monkeypatch.setattr(cdp_mod.urllib.request, "urlopen", lambda *_a, **_k: _Resp("<html>not chrome</html>"))
+    with pytest.raises(CdpError):
+        tr._list_targets()
+
+    # A 200 JSON object (not a list of target dicts) is equally invalid.
+    monkeypatch.setattr(cdp_mod.urllib.request, "urlopen", lambda *_a, **_k: _Resp(json.dumps({"not": "a list"})))
+    with pytest.raises(CdpError):
+        tr._list_targets()
+
+    # A list containing a non-dict target is also rejected (iterating it later would .get on a str).
+    monkeypatch.setattr(cdp_mod.urllib.request, "urlopen", lambda *_a, **_k: _Resp(json.dumps(["nope"])))
+    with pytest.raises(CdpError):
+        tr._list_targets()
+
+    # A well-formed list of target objects passes through unchanged.
+    good = [{"type": "page", "url": "https://chatgpt.com/", "webSocketDebuggerUrl": "ws://x"}]
+    monkeypatch.setattr(cdp_mod.urllib.request, "urlopen", lambda *_a, **_k: _Resp(json.dumps(good)))
+    assert tr._list_targets() == good
+
+
+def test_valid_conv_id_accepts_uuids_rejects_traversal():
+    # Round 4 Fix 6: the shared guard admits every real (UUID) id and any safe path segment, but
+    # rejects anything that could escape staging_root when used verbatim as a filename.
+    from agent_collector.webcapture.result import valid_conv_id
+
+    assert valid_conv_id("6867a0e1-1234-4abc-8def-0123456789ab")  # a real UUID id
+    assert valid_conv_id("c1")  # a synthetic short id is still a safe segment
+    for bad in ("../evil", "a/b", "/abs", "..", ".", "a\\b", "", None, 123, "a b"):
+        assert not valid_conv_id(bad)
+
+
+def test_chatgpt_rejects_path_traversal_conversation_id(tmp_path):
+    # Round 4 Fix 6: a conversation id that isn't a safe path segment must be rejected BEFORE the
+    # conversation fetch and BEFORE any path join — a fetch-failed event, no watermark advance, and
+    # no file written outside staging.
+    transport = FakeCdpTransport({
+        f"{CGPT}/api/auth/session": (200, json.dumps({"user": {"id": "u"}})),
+        f"{CGPT}/backend-api/conversations": (200, json.dumps({"items": [{"id": "../evil", "update_time": "t"}], "total": 1})),
+    })
+    events: list[dict] = []
+    staging = tmp_path / "chatgpt-web"
+    with State(tmp_path / "state.db") as st:
+        res = capture_chatgpt(transport, st, staging, events)
+        assert res.captured == 0 and res.errors == 1
+        assert st.get_webcapture_watermark("chatgpt", "../evil") is None
+    assert any(e["code"] == "webcapture_fetch_failed" for e in events)
+    assert not any("/backend-api/conversation/" in u for u in transport.calls)  # the bad id never fetched
+    assert not (tmp_path / "evil.json").exists()  # nothing escaped staging_root
+
+
+def test_claude_rejects_path_traversal_conversation_id(tmp_path):
+    transport = FakeCdpTransport({
+        f"{CLAUDE}/api/organizations": (200, json.dumps([{"uuid": "org1", "capabilities": ["chat"]}])),
+        f"{CLAUDE}/api/organizations/org1/chat_conversations": (200, json.dumps([{"uuid": "../../etc/passwd", "updated_at": "t"}])),
+    })
+    events: list[dict] = []
+    staging = tmp_path / "claude-web"
+    with State(tmp_path / "state.db") as st:
+        res = capture_claude(transport, st, staging, events)
+        assert res.captured == 0 and res.errors == 1
+        assert st.get_webcapture_watermark("claude", "../../etc/passwd") is None
+    assert any(e["code"] == "webcapture_fetch_failed" for e in events)
+    assert not any("etc/passwd" in u for u in transport.calls)  # the bad id never fetched
+
+
 def test_fake_transport_prefix_matches_query_variants():
     t = FakeCdpTransport({"https://x/list": (200, "base")})
     assert t.fetch("https://x/list?offset=100") == (200, "base")  # longest-prefix match

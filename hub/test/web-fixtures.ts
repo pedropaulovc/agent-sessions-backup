@@ -180,3 +180,14 @@ export function claudeExportZip(convs: ClaudeConvOpts[]): Uint8Array {
 export function emptyExportZip(): Uint8Array {
   return zipSync({ 'readme.txt': strToU8('no conversations here') });
 }
+
+/**
+ * A ZIP whose conversations.json is a NON-empty array of objects with no recognized layout (no
+ * `mapping`, no `chat_messages`) — export format drift. Distinct from an empty array: it must be
+ * treated as INVALID (so the consumer preserves the old sessions), never as an empty export.
+ */
+export function unrecognizedExportZip(): Uint8Array {
+  return zipSync({
+    'conversations.json': strToU8(JSON.stringify([{ foo: 'bar' }, { note: 'no mapping or chat_messages here' }])),
+  });
+}

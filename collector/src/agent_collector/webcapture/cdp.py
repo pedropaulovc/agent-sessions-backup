@@ -78,9 +78,23 @@ class ChromeCdpTransport:
         url = f"http://{self.host}:{self.port}/json"
         try:
             with urllib.request.urlopen(url, timeout=self.timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
+                raw = resp.read().decode("utf-8")
         except OSError as e:
             raise CdpError(f"cannot reach Chrome DevTools at {url}: {e}") from e
+        # A 200 from a non-Chrome local service (or a Chrome behind a proxy that returns HTML) makes
+        # this decode raise JSONDecodeError, or yields a dict/scalar; iterating a dict in _connect()
+        # then calls .get on a string. _run_products only catches CdpError, so anything else here
+        # would abort the whole command before the OTHER product runs — validate and wrap it.
+        try:
+            targets = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise CdpError(
+                f"Chrome DevTools /json at {url} returned non-JSON "
+                f"(is --port pointing at Chrome?): {e}"
+            ) from e
+        if not isinstance(targets, list) or not all(isinstance(t, dict) for t in targets):
+            raise CdpError(f"Chrome DevTools /json at {url} did not return a list of target objects")
+        return targets
 
     def fetch(self, url: str) -> tuple[int, str]:
         self._connect()
