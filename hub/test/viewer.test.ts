@@ -2,6 +2,7 @@ import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import worker from '../src/index';
 import { viewerRoute } from '../src/viewer/router';
+import { previewBearerOk } from '../src/auth/identity';
 import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures';
 import { blobVersionOf } from '../src/viewer/session';
 
@@ -15,6 +16,7 @@ const REWIND_SESSION = 'eeeeeeee-5555-4555-8555-555555555555';
 const SYSTEM_SESSION = 'ffffffff-6666-4666-8666-666666666666';
 const UNVER_SESSION = '99999999-7777-4777-8777-777777777777';
 const UNKNOWN_MEDIA_SESSION = '88888888-8888-4888-8888-888888888888';
+const CODEX_TAIL_SESSION = '77777777-9999-4999-8999-999999999999';
 
 // Hostile transcript payloads: an SVG with inline script and an HTML "document".
 const SVG_XSS_B64 = btoa('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>');
@@ -62,6 +64,29 @@ function longSessionWithSentinel(sessionId: string, turns: number, sentinelAt: n
     lines.push(ccLine(sessionId, { uuid, parentUuid: parent, role, text }));
     parent = uuid;
   }
+  return lines.join('\n');
+}
+
+/** Codex rollout with `contentTurns` user turns followed by a trailing context_compacted marker (last turn). */
+function codexTrailingCompaction(sessionId: string, contentTurns: number): string {
+  const ts = '2026-07-02T09:00:00.000Z';
+  const lines: string[] = [
+    JSON.stringify({ timestamp: ts, type: 'session_meta', payload: { session_id: sessionId, cwd: '/home/tester/src/demo', cli_version: '0.150.0' } }),
+    JSON.stringify({ timestamp: ts, type: 'turn_context', payload: { model: 'gpt-test-2' } }),
+  ];
+  for (let i = 0; i < contentTurns; i++) {
+    lines.push(JSON.stringify({
+      timestamp: ts,
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [{ type: 'input_text', text: `codex content turn ${i}` }],
+        internal_chat_message_metadata_passthrough: { turn_id: `t${i}` },
+      },
+    }));
+  }
+  lines.push(JSON.stringify({ timestamp: ts, type: 'event_msg', payload: { type: 'context_compacted' } }));
   return lines.join('\n');
 }
 
@@ -167,6 +192,13 @@ describe('viewer', () => {
       )).status,
     ).toBe(201);
 
+    // Codex session: 200 content turns (indices 0..199) then a trailing compaction marker (index 200 → page 2).
+    expect(
+      (await putFile('codex-sessions', `2026/07/02/rollout-2026-07-02T09-00-00-${CODEX_TAIL_SESSION}.jsonl`,
+        codexTrailingCompaction(CODEX_TAIL_SESSION, 200),
+      )).status,
+    ).toBe(201);
+
     await drainQueue();
   });
 
@@ -228,6 +260,34 @@ describe('viewer', () => {
     const p3 = await (await SELF.fetch(`https://sessions.vza.net/s/${BIG_SESSION}?page=3`)).text();
     expect(p3).toContain('page 3 / 3');
     expect(p3).toContain('turn number 449 content');
+  });
+
+  it('paginates a trailing compaction marker onto its own page and renders the divider there', async () => {
+    // The marker turn (turn_index 200) has no content blocks; the indexer persists a text-less
+    // btype=compaction row so the page count and byte window include it.
+    const row = await testEnv.DB.prepare(
+      "SELECT id, turn_index, text FROM blocks WHERE session_id = ?1 AND btype = 'compaction'",
+    )
+      .bind(CODEX_TAIL_SESSION)
+      .first<{ id: number; turn_index: number; text: string | null }>();
+    expect(row).toBeTruthy();
+    expect(row!.turn_index).toBe(200);
+    expect(row!.text).toBeNull(); // text-less → excluded by the FTS insert's `WHERE text IS NOT NULL`
+
+    // The text-less compaction rows did not desync the external-content FTS index.
+    await expect(
+      testEnv.DB.prepare("INSERT INTO blocks_fts(blocks_fts) VALUES('integrity-check')").run(),
+    ).resolves.toBeTruthy();
+
+    // Page count includes the marker's page…
+    const p1 = await (await SELF.fetch(`https://sessions.vza.net/s/${CODEX_TAIL_SESSION}`)).text();
+    expect(p1).toContain('page 1 / 2');
+    expect(p1).not.toContain('context compacted');
+
+    // …and the divider renders on the final page (it would be dropped without the persisted row).
+    const p2 = await (await SELF.fetch(`https://sessions.vza.net/s/${CODEX_TAIL_SESSION}?page=2`)).text();
+    expect(p2).toContain('page 2 / 2');
+    expect(p2).toContain('context compacted');
   });
 
   it('deep-links a search hit past page 1 to the right page with a turn anchor', async () => {
@@ -522,5 +582,47 @@ describe('viewer', () => {
     const missing = { ...testEnv, ENVIRONMENT: undefined } as unknown as Env;
     const missingRes = await viewerRoute(new Request(url.toString()), url, missing);
     expect(missingRes.status).toBe(403);
+  });
+
+  it('issues a browser cookie on bearer auth so preview navigations/subresources stay authorized', async () => {
+    const url = new URL('https://sessions.vza.net/');
+    const secret = 'preview-secret-123';
+    const previewEnv = { ...testEnv, ENVIRONMENT: 'preview', DEV_AUTH: secret } as unknown as Env;
+
+    // First request with the bearer serves AND sets the persistence cookie.
+    const first = await viewerRoute(
+      new Request(url.toString(), { headers: { authorization: `Bearer ${secret}` } }),
+      url,
+      previewEnv,
+    );
+    expect(first.status).toBe(200);
+    const setCookie = first.headers.get('set-cookie') ?? '';
+    expect(setCookie).toContain(`__Host-preview-auth=${secret}`);
+    expect(setCookie).toContain('HttpOnly');
+    expect(setCookie).toContain('Secure');
+    expect(setCookie).toContain('SameSite=Strict');
+    expect(setCookie).toContain('Path=/');
+
+    // Follow-up carrying ONLY the cookie (no Authorization header) still serves.
+    const followUp = await viewerRoute(
+      new Request(url.toString(), { headers: { cookie: `__Host-preview-auth=${secret}` } }),
+      url,
+      previewEnv,
+    );
+    expect(followUp.status).toBe(200);
+    // A cookie-authorized request does not re-issue the cookie (only the bearer path does).
+    expect(followUp.headers.get('set-cookie')).toBeNull();
+
+    // Wrong cookie value → 401.
+    const badCookie = await viewerRoute(
+      new Request(url.toString(), { headers: { cookie: '__Host-preview-auth=wrong' } }),
+      url,
+      previewEnv,
+    );
+    expect(badCookie.status).toBe(401);
+
+    // The machine API gate (previewBearerOk) ignores the cookie — bearer header only.
+    expect(previewBearerOk(new Request(url.toString(), { headers: { cookie: `__Host-preview-auth=${secret}` } }), previewEnv)).toBe(false);
+    expect(previewBearerOk(new Request(url.toString(), { headers: { authorization: `Bearer ${secret}` } }), previewEnv)).toBe(true);
   });
 });

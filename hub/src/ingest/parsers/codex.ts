@@ -72,7 +72,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
     }
     return current;
   };
-  const pushCompactionMarker = (ts: string | undefined) => {
+  const pushCompactionMarker = (ts: string | undefined, at: { byteStart: number; byteLen: number }) => {
     flush();
     // Otherwise a token_count arriving after this marker (the compaction request's own usage)
     // would reuse the pre-compaction reply as its target — silently overwriting that turn's real
@@ -86,6 +86,10 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       role: 'system',
       ts,
       compaction: { kind: 'codex-window' },
+      // Record the marker line's offsets so the index writer can persist a text-less block row for this
+      // otherwise-blockless turn — pagination/byte-windows must account for the divider.
+      byteStart: at.byteStart,
+      byteLen: at.byteLen,
       blocks: [],
     });
   };
@@ -156,7 +160,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       }
       case 'compacted':
       case 'world_state': {
-        pushCompactionMarker(ts);
+        pushCompactionMarker(ts, at);
         break;
       }
       default:
@@ -273,7 +277,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         break;
       }
       case 'context_compacted': {
-        pushCompactionMarker(ts);
+        pushCompactionMarker(ts, at);
         break;
       }
       default:

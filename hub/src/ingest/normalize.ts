@@ -48,6 +48,10 @@ export interface NormalizedTurn {
   model?: string;
   usage?: TurnUsage;
   compaction?: { kind: 'codex-window' | 'claude-compact'; replacesTurns?: [number, number] };
+  /** Source line offsets for a blockless marker turn (compaction). Lets the index writer persist a row
+   * so pagination/byte-windows account for the turn even though it yields no content blocks. */
+  byteStart?: number;
+  byteLen?: number;
   blocks: NormalizedBlock[];
 }
 

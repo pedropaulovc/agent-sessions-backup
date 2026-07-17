@@ -116,6 +116,9 @@ function extractMediaAt(envelope: Record<string, unknown>, blockIndex: number): 
  *   default (unknown types, e.g. server_tool_use) -> parser's default now yields a capped-JSON TEXT block,
  *     so it MUST count here too (a prior version returned false and dropped media after an unknown item).
  * (blocksFrom also `continue`s on non-object items; extractMediaAt applies that same isObj() guard.)
+ * Note: the synthetic btype='compaction' block rows the indexer writes for codex marker turns are NOT
+ * produced by blocksFrom and never carry media, so they don't affect this claude-content parity — and the
+ * blob endpoint rejects any non-image/document btype before it reaches here.
  */
 function yieldsBlock(raw: Record<string, unknown>): boolean {
   switch (raw.type) {

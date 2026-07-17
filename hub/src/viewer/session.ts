@@ -72,13 +72,17 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
   const startByte = await firstByteFrom(env, sessionId, lo);
   const endByte = await firstByteFrom(env, sessionId, hi);
 
-  // Authoritative per-content-turn (turn_index, on_main_path) for this page, in order — zipped onto the parsed
-  // turns for anchors and for dimming/hiding. on_main_path is persisted at index time (whole-session view),
-  // so it stays correct even when a rewind crosses a page boundary that a partial parse can't see.
+  // Authoritative per-CONTENT-turn (turn_index, on_main_path) for this page, in order — zipped onto the parsed
+  // content turns for anchors and for dimming/hiding. on_main_path is persisted at index time (whole-session
+  // view), so it stays correct even when a rewind crosses a page boundary that a partial parse can't see.
+  // Compaction marker rows are excluded here so the zip stays aligned with parsed content turns (the render
+  // loop advances only on content turns); they still count in maxTurn/firstByteFrom so their dividers aren't
+  // paginated away.
   const pageTurns = (
     await env.DB.prepare(
       `SELECT turn_index, MAX(on_main_path) AS on_main_path FROM blocks
-       WHERE session_id = ?1 AND turn_index >= ?2 AND turn_index < ?3 GROUP BY turn_index ORDER BY turn_index`,
+       WHERE session_id = ?1 AND turn_index >= ?2 AND turn_index < ?3 AND btype != 'compaction'
+       GROUP BY turn_index ORDER BY turn_index`,
     )
       .bind(sessionId, lo, hi)
       .all<{ turn_index: number; on_main_path: number }>()

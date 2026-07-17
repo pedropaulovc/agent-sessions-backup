@@ -441,6 +441,29 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
         ),
       );
     }
+    // Blockless compaction markers (codex) still get one text-less 'compaction' row so pagination and byte
+    // windows account for the turn — otherwise a divider at a page boundary or after the last content block
+    // is silently dropped. text stays NULL, so it never enters FTS; the viewer renders the divider from the
+    // parsed turn, not this row.
+    if (turn.blocks.length === 0 && turn.compaction && turn.byteStart !== undefined && turn.byteLen !== undefined) {
+      stmts.push(
+        insertBlock.bind(
+          s.id,
+          file.id,
+          turn.index,
+          0,
+          turn.role,
+          'compaction',
+          null,
+          turn.ts ?? null,
+          turn.byteStart,
+          turn.byteLen,
+          0,
+          null,
+          turn.onMainPath ? 1 : 0,
+        ),
+      );
+    }
     const u = turn.usage;
     if (u) {
       totals.in += u.inputTokens ?? 0;
