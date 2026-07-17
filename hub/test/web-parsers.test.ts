@@ -75,15 +75,15 @@ describe('parseChatgptWeb', () => {
     expect(byText('question').onMainPath).toBe(true);
   });
 
-  it('extracts multimodal text and image asset pointers', () => {
+  it('extracts multimodal text and renders image asset pointers as inert placeholders (no blob-backed media)', () => {
     const raw = chatgptWebConversation({
       id: 'conv-cgpt-3',
       turns: [{ node: 'n1', parent: 'root-node', role: 'user', multimodal: ['look at this', { image: 'abc123' }] }],
     });
     const s = parseChatgptWeb(raw, 'conv-cgpt-3');
-    const types = s.turns[0]!.blocks.map((b) => b.type);
-    expect(types).toContain('text');
-    expect(types).toContain('image');
+    // Web media is a reference, not inline bytes: only text blocks, never a blob-backed 'image'.
+    expect(s.turns[0]!.blocks.every((b) => b.type === 'text')).toBe(true);
+    expect(s.turns[0]!.blocks.map((b) => b.text)).toEqual(['look at this', '[image]']);
   });
 
   it('counts unknown content types without crashing (empty conversation yields no turns)', () => {

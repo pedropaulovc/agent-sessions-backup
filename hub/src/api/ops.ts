@@ -118,7 +118,7 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
       )
         .bind(machineId)
         .run();
-      const det = detect(store, relpath);
+      const det = detect(store, relpath, machineId);
       const contentHash = obj.checksums?.sha256 ? hex(obj.checksums.sha256) : 'unknown';
       // R2 doesn't carry files.mtime natively — it's the SOURCE file's mtime, recorded as
       // customMetadata on the object by upload.ts's PUT calls (see r2MtimeMetadata there). A

@@ -145,7 +145,11 @@ function* blocksFrom(
         if (!isObj(part)) continue;
         const pt = str(part.content_type);
         if (pt === 'image_asset_pointer' || pt === 'audio_asset_pointer' || pt === 'video_container_asset_pointer') {
-          yield { type: 'image', mediaType: pt.replace('_asset_pointer', ''), ...at };
+          // Web-capture media is an asset-pointer REFERENCE (file-service://…), not inline base64 —
+          // there are no bytes in this document to serve, so emit an inert text placeholder rather
+          // than a blob-backed media block that the blob endpoint (which byte-range reads JSONL)
+          // could only 404 on. See web-offsets.ts on why web offsets aren't byte-sliceable.
+          yield block('text', `[${pt.replace('_asset_pointer', '')}]`, CAPS.text, at);
           continue;
         }
         const ptext = str(part.text);

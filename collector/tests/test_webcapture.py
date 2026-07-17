@@ -140,6 +140,83 @@ def test_cmd_webcapture_signed_out_returns_nonzero_and_buffers_event(tmp_env):
         assert st.pending_event_count() >= 1  # login-expiry events buffered for the next heartbeat
 
 
+def test_chatgpt_list_html_interstitial_is_an_error_not_a_crash(tmp_path):
+    # Fix 4: a 200 non-JSON list body must become a capture error, not an unhandled json.loads.
+    transport = FakeCdpTransport({
+        f"{CGPT}/api/auth/session": (200, json.dumps({"user": {"id": "u"}})),
+        f"{CGPT}/backend-api/conversations": (200, "<html>sign in</html>"),
+    })
+    events: list[dict] = []
+    with State(tmp_path / "state.db") as st:
+        res = capture_chatgpt(transport, st, tmp_path / "chatgpt-web", events)
+    assert res.errors == 1 and res.captured == 0
+    assert any(e["code"] == "webcapture_list_failed" for e in events)
+
+
+def test_chatgpt_conversation_html_interstitial_does_not_stage_or_advance_watermark(tmp_path):
+    # Fix 5: a 200 HTML conversation body must not be staged, and the watermark must not advance
+    # (or the bad conversation is never re-fetched until it changes again).
+    transport = FakeCdpTransport({
+        f"{CGPT}/api/auth/session": (200, json.dumps({"user": {"id": "u"}})),
+        f"{CGPT}/backend-api/conversations": (200, json.dumps({"items": [{"id": "c1", "update_time": "t"}], "total": 1})),
+        f"{CGPT}/backend-api/conversation/c1": (200, "<html>sign in</html>"),
+    })
+    events: list[dict] = []
+    staging = tmp_path / "chatgpt-web"
+    with State(tmp_path / "state.db") as st:
+        res = capture_chatgpt(transport, st, staging, events)
+        assert res.captured == 0 and res.errors == 1
+        assert not (staging / "c1.json").exists()
+        assert st.get_webcapture_watermark("chatgpt", "c1") is None
+    assert any(e["code"] == "webcapture_fetch_failed" for e in events)
+
+
+def test_claude_list_and_conversation_html_are_errors(tmp_path):
+    # Fix 4/5 for the Claude path: list HTML -> list_failed; conversation HTML -> no watermark.
+    list_html = FakeCdpTransport({
+        f"{CLAUDE}/api/organizations": (200, json.dumps([{"uuid": "org1", "capabilities": ["chat"]}])),
+        f"{CLAUDE}/api/organizations/org1/chat_conversations": (200, "<html/>"),
+    })
+    events: list[dict] = []
+    with State(tmp_path / "state.db") as st:
+        res = capture_claude(list_html, st, tmp_path / "claude-web", events)
+    assert res.errors == 1 and any(e["code"] == "webcapture_list_failed" for e in events)
+
+    conv_html = FakeCdpTransport({
+        f"{CLAUDE}/api/organizations": (200, json.dumps([{"uuid": "org1", "capabilities": ["chat"]}])),
+        f"{CLAUDE}/api/organizations/org1/chat_conversations": (200, json.dumps([{"uuid": "k1", "updated_at": "t"}])),
+        f"{CLAUDE}/api/organizations/org1/chat_conversations/k1?tree=True&rendering_mode=raw": (200, "<html/>"),
+    })
+    events2: list[dict] = []
+    staging = tmp_path / "claude-web"
+    with State(tmp_path / "state2.db") as st:
+        res = capture_claude(conv_html, st, staging, events2)
+        assert res.captured == 0 and res.errors == 1
+        assert not (staging / "k1.json").exists()
+        assert st.get_webcapture_watermark("claude", "k1") is None
+    assert any(e["code"] == "webcapture_fetch_failed" for e in events2)
+
+
+def test_cmd_webcapture_list_failure_still_runs_other_product_and_buffers_event(tmp_env):
+    # Fix 4 at the command level: a malformed ChatGPT list must not abort the Claude capture.
+    path = config.config_path()
+    config.enroll("http://localhost:8787", dev=True, path=path, machine_id="webhost")
+
+    def factory(origin):
+        if origin == PRODUCTS["chatgpt"][0]:
+            return FakeCdpTransport({
+                f"{CGPT}/api/auth/session": (200, json.dumps({"user": {"id": "u"}})),
+                f"{CGPT}/backend-api/conversations": (200, "<html>interstitial</html>"),
+            })
+        return _claude_transport()
+
+    rc = cmd_webcapture(types.SimpleNamespace(config=str(path), product=None, host="127.0.0.1", port=9222), transport_factory=factory)
+    assert rc == 0  # neither product signed out; the list error is a warning, not a login failure
+    assert (config.webcapture_dir() / "claude-web" / "k1.json").exists()  # claude still captured
+    with State() as st:
+        assert st.pending_event_count() >= 1  # the list failure was buffered for the next heartbeat
+
+
 def test_fake_transport_prefix_matches_query_variants():
     t = FakeCdpTransport({"https://x/list": (200, "base")})
     assert t.fetch("https://x/list?offset=100") == (200, "base")  # longest-prefix match

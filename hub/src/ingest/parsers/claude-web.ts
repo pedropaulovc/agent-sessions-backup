@@ -131,9 +131,13 @@ function* blocksFrom(
         break;
       }
       case 'image': {
+        // claude.ai raw images are file/attachment REFERENCES, not inline base64 in this
+        // document — nothing byte-servable here, so emit an inert text placeholder instead of a
+        // blob-backed media block the blob endpoint (JSONL byte-range reader) would 404 on.
         const source = isObj(item.source) ? item.source : undefined;
+        const kind = str(source?.media_type) ?? 'image';
         emitted++;
-        yield { type: 'image', mediaType: str(source?.media_type), ...at };
+        yield block('text', `[${kind}]`, CAPS.text, at);
         break;
       }
       default: {

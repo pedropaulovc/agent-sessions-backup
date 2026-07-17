@@ -320,6 +320,31 @@ async function parseExportInto(file: FileRow, env: Env, contentHash?: string): P
     await writeSession(session, file, env);
     written++;
   }
+
+  // A re-uploaded archive that drops a conversation must not leave its old session behind: the
+  // ZIP's files row has session_id NULL (it's an archive, not one session), so the normal
+  // reparse-clears-stale-rows path never touches per-conversation sessions. Delete any session
+  // still owned by THIS file whose conversation is absent from the new archive — matching the
+  // delete+reinsert reparse semantics (only derived rows + this session row; raw R2 is untouched,
+  // and older archive FILES at other paths keep their own sessions). Skipped only when the whole
+  // archive failed to parse (harness unknown), so a transient corrupt re-upload can't wipe good data.
+  if (archive.harness !== 'unknown') {
+    const keep = new Set(archive.sessions.map((s) => s.id));
+    const owned = await env.DB.prepare('SELECT session_id FROM sessions WHERE canonical_file_id = ?1')
+      .bind(file.id)
+      .all<{ session_id: string }>();
+    for (const { session_id } of owned.results) {
+      if (keep.has(session_id)) continue;
+      await env.DB.batch([
+        env.DB.prepare(
+          `INSERT INTO blocks_fts (blocks_fts, rowid, text) SELECT 'delete', id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL`,
+        ).bind(session_id),
+        env.DB.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(session_id),
+        env.DB.prepare('DELETE FROM usage WHERE session_id = ?1').bind(session_id),
+        env.DB.prepare('DELETE FROM sessions WHERE session_id = ?1').bind(session_id),
+      ]);
+    }
+  }
   await markParsed(file.id, env, 'parsed', file.size, null, contentHash);
   console.log(
     JSON.stringify({

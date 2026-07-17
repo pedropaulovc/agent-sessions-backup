@@ -107,7 +107,10 @@ export async function putFile(
     return Response.json({ error: 'checksum_or_write_failure', detail: String(e) }, { status: 400 });
   }
 
-  const det = detect(store, relpath);
+  // machineId is required so machine-global files (history.jsonl, identical relpath fleet-wide)
+  // get a machine-scoped session_id stamped on the row — otherwise canonical/recovery/parsing
+  // queries (which look files up BY session_id) can't find them.
+  const det = detect(store, relpath, machineId);
   const row = await env.DB.prepare(
     `INSERT INTO files (machine_id, store, relpath, r2_key, size, mtime, content_hash, harness, session_id, parse_state)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')

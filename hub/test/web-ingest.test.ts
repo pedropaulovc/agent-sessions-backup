@@ -4,6 +4,8 @@ import { env as testEnvRaw } from 'cloudflare:test';
 import worker from '../src/index';
 import { chatgptExportZip, chatgptWebConversation, claudeWebConversation, historyLines } from './web-fixtures';
 
+const CLAUDE_ROOT = '00000000-0000-4000-8000-000000000000';
+
 const testEnv = testEnvRaw as unknown as Env;
 
 async function sha256Hex(data: Uint8Array): Promise<string> {
@@ -96,6 +98,48 @@ describe('prompt-log ingest is machine-scoped (two machines, two sessions)', () 
     const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=gamma', { headers: { 'x-dev-machine': 'boxA' } });
     expect(((await res.json()) as { hits: unknown[] }).hits.length).toBe(1);
   });
+
+  it('stamps the machine-scoped session id onto the files row and flips it to parsing on changed re-upload', async () => {
+    // Fix 2: upload/reindex must pass machine_id to detect() so files.session_id is populated —
+    // otherwise canonical/recovery/parsing-flip queries (keyed on session_id) can't find the row.
+    const fileRow = await testEnv.DB.prepare("SELECT session_id FROM files WHERE machine_id = 'boxA' AND relpath = 'history.jsonl'").first<{ session_id: string }>();
+    expect(fileRow?.session_id).toBe('promptlog:boxA:claude');
+
+    // A changed-hash re-upload of the canonical prompt log flips its session to 'parsing' (needs
+    // the row's session_id to be non-null to match).
+    await putText('boxA', 'claude', 'history.jsonl', historyLines([
+      { display: 'boxA unique prompt gamma', timestamp: 1_700_000_000_000 },
+      { display: 'boxA follow-up epsilon', timestamp: 1_700_000_500_000 },
+    ]).join('\n'));
+    const mid = await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'promptlog:boxA:claude'").first<{ index_state: string }>();
+    expect(mid?.index_state).toBe('parsing');
+    await drainQueue();
+    const done = await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'promptlog:boxA:claude'").first<{ index_state: string }>();
+    expect(done?.index_state).toBe('ready');
+  });
+});
+
+describe('claude-web image blocks render as inert placeholders, never blob-backed media (Fix 3)', () => {
+  it('indexes an image reference as searchable text with no btype=image row', async () => {
+    const CONV = 'cw-image-1';
+    const conv = claudeWebConversation({
+      uuid: CONV,
+      name: 'Screenshot chat',
+      messages: [
+        { uuid: 'm1', parent: CLAUDE_ROOT, sender: 'human', content: [
+          { type: 'text', text: 'what is in this screenshot' },
+          { type: 'image', source: { type: 'base64', media_type: 'image/png' } },
+        ] },
+      ],
+    });
+    expect((await putText('webbox', 'claude-web', `${CONV}.json`, conv)).status).toBe(201);
+    await drainQueue();
+
+    const media = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1 AND btype IN ('image','document')").bind(CONV).first<{ n: number }>();
+    expect(media?.n).toBe(0); // no blob-backed media rows -> the blob endpoint is never asked
+    const placeholder = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1 AND text = '[image/png]'").bind(CONV).first<{ n: number }>();
+    expect(placeholder?.n).toBe(1);
+  });
 });
 
 describe('export ZIP ingest fans out and only backfills gaps', () => {
@@ -143,5 +187,32 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     expect(row?.store).toBe('chatgpt-web'); // still owned by the live capture
     expect(row?.title).toBe('Live capture');
     expect(row?.turn_count).toBe(2);
+  });
+
+  it('re-uploading an archive without a conversation clears that conversation stale session (Fix 1)', async () => {
+    const relpath = 'chatgpt-export-stale.zip';
+    const withBoth = chatgptExportZip([
+      { id: 'stale-a', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'stale-marker alpha kept' }] },
+      { id: 'stale-b', title: 'B', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'stale-marker beta dropped' }] },
+    ]);
+    expect((await put('webbox', 'export-inbox', relpath, withBoth)).status).toBe(201);
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id IN ('stale-a','stale-b')").first<{ n: number }>()).toMatchObject({ n: 2 });
+
+    // Re-upload the SAME path with only conversation A. B must be fully removed.
+    const withOnlyA = chatgptExportZip([
+      { id: 'stale-a', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'stale-marker alpha kept' }] },
+    ]);
+    expect((await put('webbox', 'export-inbox', relpath, withOnlyA)).status).toBe(201);
+    await drainQueue();
+
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'stale-b'").first<{ n: number }>()).toMatchObject({ n: 0 });
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM blocks WHERE session_id = 'stale-b'").first<{ n: number }>()).toMatchObject({ n: 0 });
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'stale-a'").first<{ n: number }>()).toMatchObject({ n: 1 });
+
+    const search = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=stale-marker', { headers: { 'x-dev-machine': 'webbox' } });
+    const ids = ((await search.json()) as { hits: Array<{ session_id: string }> }).hits.map((h) => h.session_id);
+    expect(ids).toContain('stale-a');
+    expect(ids).not.toContain('stale-b');
   });
 });
