@@ -103,15 +103,18 @@ consistently; don't mix the two conventions in the same session.
 
      **State model:** `cf-observability.env` always reflects the **deployed**
      state; it is never overwritten until a deploy has actually published. New
-     values are written to `cf-observability.env.pending` (0600) *before* the
-     deploy, and promoted over `cf-observability.env` (atomic `mv`) only *after*
-     the deploy succeeds. The one window `.pending` guards is "deploy published but
-     the script died before promoting": on the next run, if `.pending` exists, the
-     script probes the live worker with its bearer — a synthetic OTLP post that
-     returns **204** means the deploy *did* publish (it promotes `.pending`), a
-     **200** no-op means it did *not* (it discards `.pending`); anything
-     inconclusive stops with manual instructions. You normally never see
-     `.pending` — it self-heals on the next run.
+     values (plus the live worker's current deployment id) are written to
+     `cf-observability.env.pending` (0600) *before* the deploy, and promoted over
+     `cf-observability.env` only *after* the deploy succeeds. The one window
+     `.pending` guards is "deploy published but the script died before promoting":
+     on the next run, if `.pending` exists, the script compares the live worker's
+     **current deployment id** against the one recorded in `.pending` — every
+     `wrangler deploy` mints a new id, so a *changed* id means the deploy *did*
+     publish (it promotes `.pending`) and an *unchanged* id means it did *not* (it
+     discards `.pending`); an ambiguous case stops with manual instructions. The
+     decision is by deployment id, not the bearer, precisely so it stays correct
+     during a signing-key rotation (where the bearer is reused and so can't tell
+     the two apart). You normally never see `.pending` — it self-heals next run.
 
      To deliberately **rotate** the bearer (e.g. it leaked), run
      `./infra/cf/deploy-gateway.sh --rotate-bearer`: it mints a fresh bearer even

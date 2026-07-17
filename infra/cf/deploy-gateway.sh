@@ -10,12 +10,16 @@
 # STATE MODEL (the important bit). cf-observability.env always reflects the
 # DEPLOYED state — it is never overwritten until a deploy has actually published.
 # New values (a rotated bearer, a new kid) are computed in memory and written to
-# cf-observability.env.pending FIRST, then the deploy runs, then .pending is
-# promoted over cf-observability.env (atomic mv). The only window .pending guards
-# is "deploy published but the script died before promoting": on the next run, if
-# .pending exists, we probe the live worker with .pending's bearer — 204 means the
-# deploy DID publish (promote it), a 200 no-op means it did NOT (discard it). That
-# single rule replaces the older bearer-first write + .prev backup + their guards.
+# cf-observability.env.pending FIRST (along with the live worker's current
+# deployment id at that moment), then the deploy runs, then .pending is promoted
+# over cf-observability.env. The only window .pending guards is "deploy published
+# but the script died before promoting": on the next run, if .pending exists, we
+# compare the live worker's CURRENT deployment id against the one recorded in
+# .pending — every `wrangler deploy` mints a new deployment id, so a changed id
+# means the crashed deploy DID publish (promote it) and an unchanged id means it
+# did NOT (discard it). This is deterministic even during a signing-key rotation,
+# where the bearer is reused and so can't tell the two apart. It replaces the
+# older bearer-first write + .prev backup + their guards.
 #
 # Usage:
 #   ./infra/cf/deploy-gateway.sh                 # reuse/generate bearer, deploy
@@ -65,6 +69,10 @@ export CLOUDFLARE_ACCOUNT_ID="${CLOUDFLARE_ACCOUNT_ID:-18ef3246e9f36d1560485ef53
 
 # Best-known URL until the deploy reports the real one.
 GATEWAY_URL="https://sessions-telemetry-gateway.pedro-18e.workers.dev"
+
+# The live deployment id captured just before the deploy; recorded in .pending so
+# recovery can tell whether a crashed deploy published. Set for real below.
+PRE_DEPLOY_VERSION=""
 
 # Reads a "name": "value" var out of $CONFIG. Regex, not a JSON lib, because the
 # wrangler config is JSONC — comments + trailing commas that json.load chokes on.
@@ -119,25 +127,37 @@ GATEWAY_TRACES_ENDPOINT=$GATEWAY_URL/v1/traces
 # The next run compares the config's kid to this recorded (deployed) kid: a change
 # is a key rotation and is refused unless OIDC_KEY_FILE accompanies it.
 OIDC_SIGNING_KID=$CONFIG_KID
+# The live worker's deployment id at the moment this pending file was written, i.e.
+# BEFORE the deploy. Recovery compares it to the current live id to decide whether
+# the crashed deploy published. Stripped from cf-observability.env on promotion.
+PENDING_PRE_DEPLOY_VERSION=$PRE_DEPLOY_VERSION
 EOF
     )
     mv "$tmp" "$target"
 }
 
-# Posts a minimal valid OTLP log to the gateway with $2 as the bearer and prints
-# the HTTP status. 204 = the worker accepts this bearer (a matching secret is
-# live); 200 = the gateway's no-op path (wrong bearer, or nothing forwarded);
-# anything else (000 on a connection error, 404, 5xx) = inconclusive. node's
-# global fetch (Node 18+, already required by wrangler) keeps this dependency-free.
-probe_status() {
-    OIDC_PROBE_URL="$1" OIDC_PROBE_BEARER="$2" node -e '
-const url = process.env.OIDC_PROBE_URL, bearer = process.env.OIDC_PROBE_BEARER;
-const now = String(BigInt(Date.now()) * 1000000n);
-const body = JSON.stringify({ resourceLogs: [ { scopeLogs: [ { logRecords: [ { timeUnixNano: now, body: { stringValue: "deploy-gateway recovery probe" } } ] } ] } ] });
-fetch(url + "/v1/logs", { method: "POST", headers: { "Content-Type": "application/json", Authorization: "Bearer " + bearer }, body })
-  .then(r => { console.log(r.status); process.exit(0); })
-  .catch(() => { console.log("000"); process.exit(0); });
-' 2>/dev/null || echo "000"
+# Prints the live worker's current (latest) deployment id, or empty if the worker
+# doesn't exist / wrangler can't reach it. Every `wrangler deploy` mints a fresh
+# id (verified: a no-op redeploy changes it), so this is the recovery signal.
+get_live_version() {
+    npx wrangler deployments list --config "$CONFIG" --json 2>/dev/null | node -e '
+let s = ""; process.stdin.on("data", d => s += d).on("end", () => {
+  try { const a = JSON.parse(s); process.stdout.write(a.length ? String(a[a.length - 1].id) : ""); }
+  catch (e) { process.stdout.write(""); }
+});
+' 2>/dev/null || true
+}
+
+# Promotes the pending file to cf-observability.env: strips the recovery-only
+# PENDING_PRE_DEPLOY_VERSION line (env records only deployed state) and removes
+# .pending. The write is atomic (temp-then-mv at 0600).
+promote_pending() {
+    local tmp
+    tmp=$(mktemp "${TMPDIR:-/tmp}/agent-backup-cfobs.XXXXXX")
+    chmod 600 "$tmp"
+    grep -v '^PENDING_PRE_DEPLOY_VERSION=' "$PENDING_FILE" > "$tmp"
+    mv "$tmp" "$ENV_FILE"
+    rm -f "$PENDING_FILE"
 }
 
 # Resolve OIDC_KEY_FILE to an absolute path NOW, while still in the caller's cwd.
@@ -164,32 +184,39 @@ fi
 
 # --- Recovery: resolve a leftover .pending BEFORE doing anything else. Its
 # presence means a previous run died around its deploy; we can't run any mode
-# blind over that ambiguity (a normal deploy would reuse whichever bearer happens
-# to be in env, which may or may not be the live one). Probe to decide. ---
+# blind over that ambiguity. Decide by DEPLOYMENT ID, not by the bearer: the
+# bearer is reused across a signing-key rotation, so a bearer probe can't tell a
+# published-new-kid deploy from an unpublished one — the deployment id can, since
+# every `wrangler deploy` mints a fresh one. ---
 if [ -f "$PENDING_FILE" ]; then
     echo "Found $PENDING_FILE — a previous run died around its deploy; resolving first."
-    PENDING_BEARER=$(grep '^INGEST_BEARER=' "$PENDING_FILE" | head -1 | cut -d= -f2- || true)
-    if [ -z "$PENDING_BEARER" ]; then
-        echo "ERROR: $PENDING_FILE has no INGEST_BEARER line; can't tell what was deploying." >&2
-        echo "Inspect and remove it by hand, then re-run." >&2
+    if ! grep -q '^PENDING_PRE_DEPLOY_VERSION=' "$PENDING_FILE"; then
+        echo "ERROR: $PENDING_FILE has no PENDING_PRE_DEPLOY_VERSION line (written by an older" >&2
+        echo "version of this script). Resolve by hand: if 'wrangler deployments list' shows a" >&2
+        echo "deployment newer than when you last ran a deploy, the pending state published ->" >&2
+        echo "strip its PENDING_PRE_DEPLOY_VERSION line onto $ENV_FILE; otherwise rm it." >&2
         exit 1
     fi
-    PENDING_STATUS=$(probe_status "$GATEWAY_URL" "$PENDING_BEARER")
-    if [ "$PENDING_STATUS" = "204" ]; then
-        mv "$PENDING_FILE" "$ENV_FILE"
-        echo "  Live worker ACCEPTS the pending bearer (204): that deploy DID publish."
-        echo "  Promoted $PENDING_FILE -> $ENV_FILE. Continuing."
-    elif [ "$PENDING_STATUS" = "200" ]; then
+    RECORDED_VERSION=$(grep '^PENDING_PRE_DEPLOY_VERSION=' "$PENDING_FILE" | head -1 | cut -d= -f2- || true)
+    CURRENT_VERSION=$(get_live_version)
+    if [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" != "$RECORDED_VERSION" ]; then
+        promote_pending
+        echo "  Live deployment id advanced ('$RECORDED_VERSION' -> '$CURRENT_VERSION'): that"
+        echo "  deploy DID publish. Promoted pending state to $ENV_FILE. Continuing."
+    elif [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" = "$RECORDED_VERSION" ]; then
         rm -f "$PENDING_FILE"
-        echo "  Live worker REJECTS the pending bearer (200 no-op): that deploy did NOT publish;"
+        echo "  Live deployment id unchanged ('$CURRENT_VERSION'): that deploy did NOT publish;"
         echo "  the previous $ENV_FILE is still the live state. Discarded stale $PENDING_FILE."
+    elif [ -z "$CURRENT_VERSION" ] && [ -z "$RECORDED_VERSION" ]; then
+        rm -f "$PENDING_FILE"
+        echo "  Worker still has no deployment (absent before and after): that first deploy did"
+        echo "  NOT publish. Discarded stale $PENDING_FILE."
     else
-        echo "ERROR: probing the live worker to resolve $PENDING_FILE was inconclusive" >&2
-        echo "(status: $PENDING_STATUS). Resolve by hand, then re-run — send a synthetic OTLP" >&2
-        echo "post to $GATEWAY_URL/v1/logs with the bearer in $PENDING_FILE:" >&2
-        echo "  - 204 (accepted): the deploy published -> mv '$PENDING_FILE' '$ENV_FILE'" >&2
-        echo "  - anything else (200 no-op, 404, connection error): it did not publish ->" >&2
-        echo "      rm '$PENDING_FILE'" >&2
+        echo "ERROR: can't resolve $PENDING_FILE — it recorded pre-deploy deployment id" >&2
+        echo "'$RECORDED_VERSION' but the live worker returns none now (deleted, or wrangler" >&2
+        echo "couldn't reach it). Resolve by hand: check 'wrangler deployments list' — if a" >&2
+        echo "deployment newer than the recorded id exists, the pending state published (strip" >&2
+        echo "its PENDING_PRE_DEPLOY_VERSION line onto $ENV_FILE); otherwise rm it. Then re-run." >&2
         exit 1
     fi
 fi
@@ -241,20 +268,38 @@ if [ -n "$RECORDED_KID" ] && [ "$CONFIG_KID" != "$RECORDED_KID" ] && [ -z "${OID
     exit 1
 fi
 
-# Key/kid cross-check. The opposite trap: a NEW key with an UNCHANGED kid silently
-# replaces the live signing key, so the old kid then advertises a public key that
-# no longer matches the signature and Entra rejects everything. Compare the
-# provided key's public modulus against the issuer's published JWK for the
-# configured kid: a MISMATCH under an unchanged kid is the bug; a genuine re-upload
-# of the current key (MATCH) or a brand-new kid the issuer already publishes
-# (KID_ABSENT here means it isn't the current kid's key — allowed, that's a real
-# rotation) both pass.
-if [ -n "${OIDC_KEY_FILE:-}" ] && [ -n "$CONFIG_ISSUER_URL" ]; then
+# Key/kid cross-check. Rotations are ISSUER-FIRST (telemetry.md): by the time the
+# gateway ships a kid, the issuer's published jwks.json MUST already advertise that
+# exact key for it. So the ONLY acceptable state when a key is supplied is: the
+# issuer publishes a JWK for the configured kid AND its modulus matches this key
+# (MATCH). Everything else is a hard error before deploy —
+#   - MISMATCH: a different key published under this kid → a new key needs a NEW
+#     kid + issuer update, not a silent replacement.
+#   - KID_ABSENT: the issuer doesn't publish this kid yet → the issuer wasn't
+#     deployed first; the gateway would advertise a kid Entra can't resolve.
+#   - fetch failure / missing issuer URL: we can't prove the issuer is ready, and
+#     a gateway that ships a kid the issuer doesn't serve breaks every exchange.
+# (The gateway always needs the issuer up, so there is no reachable case where the
+# issuer is legitimately unfetchable at deploy time.)
+if [ -n "${OIDC_KEY_FILE:-}" ]; then
+    if [ -z "$CONFIG_ISSUER_URL" ]; then
+        echo "ERROR: OIDC_KEY_FILE was given but OIDC_ISSUER_URL is missing from $CONFIG, so the" >&2
+        echo "key can't be cross-checked against the issuer's published JWKS. Refusing to deploy." >&2
+        exit 1
+    fi
     JWKS_TMP=$(mktemp "${TMPDIR:-/tmp}/agent-backup-jwks.XXXXXX")
-    if OIDC_ISS="$CONFIG_ISSUER_URL" node -e '
+    if ! OIDC_ISS="$CONFIG_ISSUER_URL" node -e '
 fetch(process.env.OIDC_ISS + "/.well-known/jwks.json").then(r => r.text()).then(t => { process.stdout.write(t); process.exit(0); }).catch(() => process.exit(1));
 ' > "$JWKS_TMP" 2>/dev/null; then
-        KEY_MATCH=$(node -e '
+        rm -f "$JWKS_TMP"
+        echo "ERROR: could not fetch $CONFIG_ISSUER_URL/.well-known/jwks.json to verify the" >&2
+        echo "provided key. Rotations are issuer-first: the issuer must be deployed and already" >&2
+        echo "publishing kid '$CONFIG_KID' BEFORE the gateway ships it. Deploy the issuer first," >&2
+        echo "confirm its jwks.json advertises the kid, then re-run. (telemetry.md 'Rotating the" >&2
+        echo "signing key'.)" >&2
+        exit 1
+    fi
+    KEY_MATCH=$(node -e '
 const fs = require("fs"), crypto = require("crypto");
 const providedN = crypto.createPublicKey(fs.readFileSync(process.argv[1])).export({ format: "jwk" }).n;
 const jwks = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
@@ -262,21 +307,24 @@ const jwk = (jwks.keys || []).find(k => k.kid === process.argv[3]);
 if (!jwk) { console.log("KID_ABSENT"); process.exit(0); }
 console.log(jwk.n === providedN ? "MATCH" : "MISMATCH");
 ' "$OIDC_KEY_FILE" "$JWKS_TMP" "$CONFIG_KID")
-        if [ "$KEY_MATCH" = "MISMATCH" ]; then
-            rm -f "$JWKS_TMP"
-            echo "ERROR: OIDC_KEY_FILE's public key does not match the issuer's published JWK for" >&2
-            echo "kid '$CONFIG_KID', and the kid is unchanged. Uploading this key would make the" >&2
-            echo "gateway sign with a key the issuer never advertises for that kid, so Entra would" >&2
-            echo "reject every assertion. A NEW key requires a NEW kid + an issuer JWKS update:" >&2
-            echo "add the new public JWK (new kid) to gateway/oidc-issuer.ts, deploy the issuer," >&2
-            echo "bump OIDC_SIGNING_KID here, then re-run. (telemetry.md 'Rotating the signing key'.)" >&2
-            exit 1
-        fi
-    else
-        echo "WARNING: could not fetch $CONFIG_ISSUER_URL/.well-known/jwks.json to cross-check" >&2
-        echo "the provided key against the published kid; proceeding without that check." >&2
-    fi
     rm -f "$JWKS_TMP"
+    if [ "$KEY_MATCH" = "KID_ABSENT" ]; then
+        echo "ERROR: the issuer at $CONFIG_ISSUER_URL does not publish a JWK for kid" >&2
+        echo "'$CONFIG_KID' yet. Rotations are ISSUER-FIRST: add the new public JWK (this kid) to" >&2
+        echo "gateway/oidc-issuer.ts and deploy the issuer BEFORE deploying the gateway with this" >&2
+        echo "kid, or the gateway advertises a kid Entra can't resolve and rejects every" >&2
+        echo "assertion. (telemetry.md 'Rotating the signing key'.)" >&2
+        exit 1
+    fi
+    if [ "$KEY_MATCH" = "MISMATCH" ]; then
+        echo "ERROR: the issuer publishes a JWK for kid '$CONFIG_KID' but its modulus differs" >&2
+        echo "from OIDC_KEY_FILE. Uploading this key would make the gateway sign with a key the" >&2
+        echo "issuer never advertises for that kid, so Entra rejects every assertion. A NEW key" >&2
+        echo "requires a NEW kid + an issuer JWKS update, not a silent replacement: add the new" >&2
+        echo "public JWK (new kid) to gateway/oidc-issuer.ts, deploy the issuer, bump" >&2
+        echo "OIDC_SIGNING_KID here, then re-run. (telemetry.md 'Rotating the signing key'.)" >&2
+        exit 1
+    fi
 fi
 
 # Bearer determination.
@@ -314,9 +362,13 @@ else
     echo "Gateway worker not found — first deploy will create it with its secrets."
 fi
 
+# Record the live deployment id NOW (before deploy) so recovery can tell whether a
+# later crash's deploy published. Empty if the worker doesn't exist yet.
+PRE_DEPLOY_VERSION=$(get_live_version)
+
 # Write the pending state BEFORE the deploy. cf-observability.env (the deployed
 # state) is left untouched. If the deploy publishes but the script then dies, this
-# file is the record the next run's recovery probes and promotes.
+# file is the record the next run's recovery resolves by deployment id.
 write_state_file "$PENDING_FILE"
 echo "Wrote $PENDING_FILE (pending state; $ENV_FILE untouched until the deploy publishes)."
 
@@ -352,9 +404,9 @@ GATEWAY_URL=$(printf '%s\n' "$DEPLOY_OUT" | grep -oE 'https://sessions-telemetry
 GATEWAY_URL="${GATEWAY_URL:-https://sessions-telemetry-gateway.pedro-18e.workers.dev}"
 
 # Deploy published (set -e would have aborted on failure). Rewrite the pending file
-# with the real URL, then promote it over the deployed-state file in one atomic mv.
+# with the real URL, then promote it (strips the recovery-only version line).
 write_state_file "$PENDING_FILE"
-mv "$PENDING_FILE" "$ENV_FILE"
+promote_pending
 
 echo ""
 echo "Deployed $GATEWAY_URL"
