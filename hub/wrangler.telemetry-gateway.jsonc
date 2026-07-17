@@ -1,6 +1,11 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "sessions-telemetry-gateway",
+  // Pin the account (two are visible to the wrangler token): this worker's URL
+  // is what the Cloudflare observability destinations POST to and its OIDC_ISSUER_URL
+  // is the pedro-18e issuer Azure federates against — a deploy to the wrong
+  // account would silently break the pipeline. Same account as hub/wrangler.jsonc.
+  "account_id": "18ef3246e9f36d1560485ef53889c0ab",
   "main": "gateway/telemetry-gateway.ts",
   "compatibility_date": "2026-07-01",
   "compatibility_flags": ["nodejs_compat"],
@@ -14,16 +19,19 @@
   // provision.sh output) — a DCR immutable ID is not a credential; auth is the
   // Entra bearer minted via the federated credential.
   //
-  // PLACEHOLDER — every value below is filled in by infra/azure/provision.sh's
-  // output (infra/out/azure.env) at M4 deploy time.
+  // Filled from infra/azure/provision.sh's output (infra/out/azure.env) at M4
+  // deploy. These are resource identifiers, not secrets. The DCR immutable id
+  // embedded in the OTLP endpoints (dcr-cf864bca...) is stable across idempotent
+  // re-runs of provision.sh; if the DCR is ever recreated, re-run provision.sh
+  // and copy the new endpoints from azure.env.
   "vars": {
-    "TENANT_ID": "<tenant-id-from-provision-output>",
-    "APP_CLIENT_ID": "<mi-agent-backup-cloudflare-wu2-client-id>",
-    "OTLP_TRACES_ENDPOINT": "<dcr-traces-endpoint-from-provision-output>",
-    "OTLP_LOGS_ENDPOINT": "<dcr-logs-endpoint-from-provision-output>",
-    "OIDC_ISSUER_URL": "https://sessions-oidc-issuer.<account>.workers.dev",
+    "TENANT_ID": "6f10d2eb-7cce-444c-bf11-d6fe61d7b8f8",
+    "APP_CLIENT_ID": "39e31290-fc09-4ab4-83bf-018433c2ef2e",
+    "OTLP_TRACES_ENDPOINT": "https://dce-agent-backup-payj.westus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-cf864bcaac834a3da25f1ae1fa86a408/streams/Microsoft-OTLP-Traces/otlp/v1/traces",
+    "OTLP_LOGS_ENDPOINT": "https://dce-agent-backup-payj.westus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-cf864bcaac834a3da25f1ae1fa86a408/streams/Microsoft-OTLP-Logs/otlp/v1/logs",
+    "OIDC_ISSUER_URL": "https://sessions-oidc-issuer.pedro-18e.workers.dev",
     "GATEWAY_FEDERATION_SUBJECT": "cf-worker:sessions-telemetry-gateway",
-    "OIDC_SIGNING_KID": "<kid-from-generate-gateway-key>"
+    "OIDC_SIGNING_KID": "3f2d383f"
   }
   // secrets (both plain `wrangler secret put`, NOT Secrets Store bindings —
   // see infra/cf/telemetry.md):

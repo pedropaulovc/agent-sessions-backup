@@ -71,51 +71,93 @@ consistently; don't mix the two conventions in the same session.
    exchange fails silently, no telemetry ever reaches Azure, and nothing
    in this runbook surfaces the failure). Set `OIDC_SIGNING_KID` to the kid
    from step 2.
-6. Set the private key from step 1 as a classic Worker secret named
-   `OIDC_SIGNING_KEY` on the gateway. This is **not** a Cloudflare Secrets
-   Store binding: Secrets Store caps values at 1024 bytes
-   (developers.cloudflare.com/secrets-store/manage-secrets/), but a PKCS#8
-   RSA-2048 PEM is ~1.7KB in every encoding, so it doesn't fit there. Classic
-   Worker secrets allow up to 5KB
-   (developers.cloudflare.com/workers/platform/limits/), which does fit — see
-   `hub/gateway/telemetry-gateway.ts`'s header for the full citation. Pipe the
-   file in via stdin redirection rather than the interactive prompt (which
-   risks a paste ending up in terminal scrollback/session logging):
+6–8. Set the secrets and deploy the gateway with the idempotent
+   **`./infra/cf/deploy-gateway.sh`** — it owns the whole
+   secret-lifecycle-plus-deploy so nothing is lost or has to be reconstructed by
+   hand:
    ```
-   npx wrangler secret put OIDC_SIGNING_KEY \
-     --config hub/wrangler.telemetry-gateway.jsonc < /tmp/gateway-key.pem
+   OIDC_KEY_FILE=/tmp/gateway-key.pem ./infra/cf/deploy-gateway.sh
    ```
-   Then delete the temp file — `rm -f /tmp/gateway-key.pem`. (`shred`/secure-
-   delete is largely theater on modern SSDs and FileVault/BitLocker-encrypted
-   volumes regardless of OS, so a plain `rm` is the realistic bar here; if you
-   suspect the key was exposed during the setup window, rotate it instead of
-   relying on deletion — see "Rotating the signing key" below.)
-7. Pick a random `INGEST_BEARER` value (e.g. `openssl rand -hex 32`) and set
-   it as a wrangler secret on the gateway:
-   ```
-   npx wrangler secret put INGEST_BEARER --config hub/wrangler.telemetry-gateway.jsonc
-   ```
-8. Deploy the gateway:
-   ```
-   npx wrangler deploy --config hub/wrangler.telemetry-gateway.jsonc
-   ```
+   It bundles both secrets into a single **atomic** `wrangler deploy
+   --secrets-file` (code + secrets land in one worker version — no
+   secret-put-publishes-a-version-first window), all idempotent (safe to re-run):
+   - **`OIDC_SIGNING_KEY`** (included only when `OIDC_KEY_FILE` is passed): the
+     private key from step 1, JSON-encoded into the temp secrets file (0600,
+     deleted on exit) — never on the command line or an interactive prompt. It
+     lands as a **classic** Worker secret, **not** a Secrets Store binding:
+     Secrets Store caps values at 1024 bytes
+     (developers.cloudflare.com/secrets-store/manage-secrets/) but a PKCS#8
+     RSA-2048 PEM is ~1.7KB; classic Worker secrets allow up to 5KB
+     (developers.cloudflare.com/workers/platform/limits/). See
+     `hub/gateway/telemetry-gateway.ts`'s header for the citation. On an EXISTING
+     worker the key is **optional** — `--secrets-file` is additive (omitted
+     secrets are preserved), so leaving it off keeps the live key. On a **fresh**
+     worker (the existence probe finds none) it is **required**: a gateway with no
+     `OIDC_SIGNING_KEY` can't sign the Azure assertion, so the script errors out
+     with instructions rather than deploying a broken gateway.
+   - **`INGEST_BEARER`**: reuses the value already in
+     `infra/out/cf-observability.env` if present, else mints one
+     (`openssl rand -hex 32`), and includes it in the same deploy. This is the fix
+     for the "Worker secrets are write-only, so the dashboard step can't recover
+     the bearer" trap — the file is the durable copy step 9 reads from.
+
+     **State model:** `cf-observability.env` always reflects the **deployed**
+     state; it is never overwritten until a deploy has actually published. New
+     values (plus the live worker's current deployment id) are written to
+     `cf-observability.env.pending` (0600) *before* the deploy, and promoted over
+     `cf-observability.env` only *after* the deploy succeeds. The one window
+     `.pending` guards is "deploy published but the script died before promoting":
+     on the next run, if `.pending` exists, the script compares the live worker's
+     **current deployment id** against the one recorded in `.pending` — every
+     `wrangler deploy` mints a new id, so a *changed* id means the deploy *did*
+     publish (it promotes `.pending`) and an *unchanged* id means it did *not* (it
+     discards `.pending`). The decision is by deployment id, not the bearer,
+     precisely so it stays correct during a signing-key rotation (where the bearer
+     is reused and so can't tell the two apart). If the id lookup itself **fails**
+     (network/auth/API error — distinguished from a genuinely absent worker), the
+     script leaves `.pending` **untouched** and stops with instructions rather than
+     risk deleting the only durable copy of a published bearer/kid; re-run once
+     connectivity is restored. You normally never see `.pending` — it self-heals
+     next run.
+
+     To deliberately **rotate** the bearer (e.g. it leaked), run
+     `./infra/cf/deploy-gateway.sh --rotate-bearer`: it mints a fresh bearer even
+     when the file already holds one. The old bearer stays live in
+     `cf-observability.env` until the new one is deployed and promoted, so a failed
+     rotation never loses it — nothing to restore by hand. After any rotation you
+     MUST update the dashboard destinations (step 9) with the new bearer, or the
+     gateway 200-no-ops every post from the old-bearer destinations.
+
+   Then delete the temp key — `rm -f /tmp/gateway-key.pem`. (`shred`/secure-delete
+   is largely theater on modern SSD/FileVault/BitLocker volumes, so a plain `rm`
+   is the realistic bar; if you suspect the key leaked during setup, rotate it —
+   see "Rotating the signing key" below.) Two Cloudflare accounts are visible to
+   the wrangler token, so the script pins `CLOUDFLARE_ACCOUNT_ID` to the
+   vza.net-owning account (`18ef3246…`); override the env var if that changes.
 9. Create the account-level observability destinations (one for logs, one for
    traces — **these are shared across every worker on the account**, so use
    names that won't collide with anything else, e.g. `agent-backup-azure-logs`
-   / `agent-backup-azure-traces`). As of this writing there is no wrangler
-   subcommand or public API for this (confirmed: `wrangler observability`
-   doesn't exist in wrangler 4.111) — it's dashboard-only:
+   / `agent-backup-azure-traces`). There is no wrangler subcommand or usable
+   public API for this: `wrangler observability` doesn't exist (wrangler 4.111),
+   and every `/accounts/{id}/workers/observability/*` REST path returns **HTTP
+   403** with the wrangler OAuth token (confirmed 2026-07-17 — the token is valid
+   for `workers/scripts` etc. but carries no observability-destination scope).
+   **This is therefore a manual dashboard step — MUST be done by the account
+   owner:**
    [Workers & Pages → Observability → Pipelines → Add destination](https://developers.cloudflare.com/workers/observability/exporting-opentelemetry-data/#creating-a-destination)
    - Destination Name: `agent-backup-azure-logs`, Destination Type: **Logs**,
-     OTLP Endpoint: `https://sessions-telemetry-gateway.<account>.workers.dev/v1/logs`,
+     OTLP Endpoint: `https://sessions-telemetry-gateway.pedro-18e.workers.dev/v1/logs`,
      Custom Header: `Authorization: Bearer <INGEST_BEARER>`
    - Destination Name: `agent-backup-azure-traces`, Destination Type: **Traces**,
-     OTLP Endpoint: `https://sessions-telemetry-gateway.<account>.workers.dev/v1/traces`,
+     OTLP Endpoint: `https://sessions-telemetry-gateway.pedro-18e.workers.dev/v1/traces`,
      Custom Header: `Authorization: Bearer <INGEST_BEARER>`
 
-   The header value must equal the `INGEST_BEARER` secret set in step 7 — the
-   gateway 200-no-ops (rather than erroring) on any mismatch, so a typo here
-   fails silently until you notice no data arriving.
+   The exact `<INGEST_BEARER>` value (the secret already set on the gateway in
+   step 7) and both endpoint URLs are written to the gitignored
+   `infra/out/cf-observability.env` at deploy time — copy them from there. The
+   header value must equal that `INGEST_BEARER` secret — the gateway 200-no-ops
+   (rather than erroring) on any mismatch, so a typo here fails silently until
+   you notice no data arriving.
 10. In `hub/wrangler.jsonc`, uncomment/add under `observability`:
     ```jsonc
     "logs": { "enabled": true, "destinations": ["agent-backup-azure-logs"] },
@@ -158,14 +200,38 @@ The issuer publishes a **JWKS array** (`PUBLIC_JWKS` in
 `hub/gateway/oidc-issuer.ts`), not a single key, specifically so a rotation can
 carry the old and new key at once while caches (Entra's included) catch up.
 Follow the exact sequence documented in that file's header comment — summary:
-add the new key to `PUBLIC_JWKS` and deploy (without touching `ACTIVE_KID`),
-wait out the `/.well-known/jwks.json` cache window (`JWKS_CACHE_CONTROL`,
-currently 5 minutes), then flip `OIDC_SIGNING_KID` + `ACTIVE_KID` + the
-`OIDC_SIGNING_KEY` Worker secret together and redeploy both workers, then
-remove the old key from `PUBLIC_JWKS`. Never remove an old key from
-`PUBLIC_JWKS` before the
-gateway has been redeployed to sign with the new one — that's the one order
-that breaks verification for tokens minted in the gap.
+
+1. Add the new public JWK to `PUBLIC_JWKS` (keep the old one) and deploy the
+   **issuer** — `npx wrangler deploy --config hub/wrangler.oidc-issuer.jsonc` —
+   WITHOUT touching `ACTIVE_KID`. Old + new keys now coexist in the JWKS.
+2. Wait out the `/.well-known/jwks.json` cache window (`JWKS_CACHE_CONTROL`,
+   currently 5 minutes) so Entra's cached copy has the new key.
+3. Flip the **gateway** to the new key. Set `OIDC_SIGNING_KID` (in
+   `hub/wrangler.telemetry-gateway.jsonc`) and `ACTIVE_KID` (in the issuer) to
+   the new kid, then run `OIDC_KEY_FILE=/path/new-key.pem
+   ./infra/cf/deploy-gateway.sh`. Because that script deploys code + the new
+   `OIDC_SIGNING_KEY` in a **single atomic `wrangler deploy --secrets-file`
+   version**, the gateway never lands in the broken in-between state the old
+   `secret put`-then-`deploy` flow could leave — signing with the new key while
+   still serving code/kid from the previous version. Redeploy the issuer too if
+   `ACTIVE_KID` changed.
+
+   The script records the shipped `OIDC_SIGNING_KID` in
+   `infra/out/cf-observability.env` and guards both halves of the rotation trap:
+   it refuses a **changed** kid without `OIDC_KEY_FILE` (bumping the kid but
+   forgetting the new key ships the new kid over the old private key), and it
+   refuses a **new key under an unchanged kid** — it cross-checks the provided
+   key's public modulus against the issuer's published JWK for the configured kid
+   (`GET $OIDC_ISSUER_URL/.well-known/jwks.json`) and errors on a mismatch, since a
+   new key needs a new kid + an issuer JWKS update. Either way Entra would reject
+   every assertion. So step 3 must always pass `OIDC_KEY_FILE` **and** bump the kid
+   (with the issuer publishing the new kid first, step 1); that's not optional.
+4. Once the gateway is signing with the new kid (immediately, since step 3 is one
+   version), remove the old key from `PUBLIC_JWKS` and redeploy the issuer.
+
+Never remove an old key from `PUBLIC_JWKS` before the gateway has been redeployed
+to sign with the new one — that's the one order that breaks verification for
+tokens minted in the gap.
 
 ## Trap: destinations are account-level
 

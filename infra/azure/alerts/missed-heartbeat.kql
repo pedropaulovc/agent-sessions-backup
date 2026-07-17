@@ -1,31 +1,120 @@
-// Absence alert: fires when a machine that heartbeated in the last 14 days has
-// gone quiet for the last 72 hours (collector down, network partition, TPM cert
-// expired, etc).
+// Dead-man's-switch: fires when any machine's last heartbeat is older than the
+// 72h tolerance, OR when the whole telemetry pipeline goes silent.
 //
-// The hub emits structured JSON via console.log({ event: "hub.heartbeat", machine_id: ... }).
-// Workers observability ships this as an OTLP log record whose Body is that JSON
-// string. This DCR (infra/azure/provision.sh) lands OTLP logs in the Log
-// Analytics **OTelLogs** table (the native-OTLP-ingestion schema; confirmed
-// empirically for the sibling youtube-mirror project's identical DCR/OTLP-Logs
-// setup — see its memory/telemetry-destinations-shared-account.md).
+// Data source is the hub watchdog cron (*/15), NOT raw heartbeats. The watchdog
+// (hub/src/cron/watchdog.ts) iterates the D1 `machines` roster and emits, for
+// EVERY machine — including long-silent ones — a structured log:
+//   { event: "hub.machine.heartbeat_age", machine: <id>, age_seconds: <n> }
+// Workers observability ships this as an OTLP log whose Body is that JSON string;
+// this project's DCR (infra/azure/provision.sh) lands OTLP logs in the Log
+// Analytics **OTelLogs** table (confirmed live 2026-07-17: a synthetic OTLP log
+// through the gateway landed in OTelLogs with the JSON in the `Body` column).
 //
-// ASSUMPTION TO VERIFY AT M4 DEPLOY: once real data flows, confirm (a) the
-// table is actually OTelLogs (not the classic AppTraces/traces table — that
-// schema only applies to the Application-Insights-Breeze SDK ingestion path,
-// which this project does NOT use), (b) the JSON body lands in a column named
-// Body (vs. Message or LogMessage), and (c) `machine_id` is the field name the
-// M1 heartbeat handler actually stamps into the log payload. Adjust column/field
-// names below to match.
+// Why a gauge and not an absence JOIN over hub.heartbeat: Azure scheduled-query
+// rules cap overrideQueryTimeRange at 2880 min (48h), shorter than the 72h
+// tolerance, so a machine silent >48h would drop out of any self-referential
+// baseline and the alert would self-silence. The watchdog re-emits a fresh,
+// growing age for a dead machine every 15 min, so a short scan window always has
+// current data and the alert never self-silences. No overrideQueryTimeRange is
+// needed (provision.sh's default window covers it).
+//
+// Pipeline-dead detection (the other half of "dead-man"): if the gateway, the
+// observability export destination, or the watchdog cron itself stops delivering
+// logs, the liveness window has NO watchdog output at all — a bare stale-machine
+// query would then return zero rows and provision.sh's `count > 0` rule would
+// read that outage as HEALTHY. So we union in a synthetic `__pipeline_silent__`
+// row whenever the window contains no `hub.watchdog.run` beacon.
+//
+// Liveness-leg lookback = 1h, matching the rule's hourly evaluation cadence
+// (provision.sh: evaluation-frequency == window-size == 1h for missed-heartbeat).
+// A shorter lookback than the cadence leaves an unobserved gap each hour — a
+// total-pipeline outage that starts and recovers inside that gap would never be
+// seen. Tiling the 1h lookback to the 1h cadence closes it. Only the two liveness
+// legs (pipeline_silent, roster_unavailable) need this; stale_machines keeps its
+// 30m arg_max window because it keys on the re-emitted age_seconds gauge, not on
+// the presence/absence of rows.
+//
+// Crucially the silence check keys on the `hub.watchdog.run` BEACON, not on the
+// count of heartbeat_age rows: the watchdog emits the beacon every run even with
+// an empty machine roster, so a fresh deploy before any machine enrols (a
+// legitimate live state) stays quiet instead of false-paging. The beacon is
+// absent only when the cron/gateway/export path is genuinely dead.
+//
+// Roster-read failure (third leg): the watchdog stamps `roster_ok:false` on its
+// beacon when the D1 roster read throws — the beacon still goes out (pipeline is
+// alive) but NO heartbeat_age rows are emitted that run, so stale-machine
+// detection is blind. We fire `__roster_unavailable__` when ANY beacon in the
+// window has roster_ok == false — not just the latest: a transient roster failure
+// that recovers before evaluation still left stale-machine monitoring blind for
+// that stretch, and arg_max on the latest beacon alone would erase it.
+//
+// The email's machine value says which case fired: a real machine_id (stale
+// collector), __pipeline_silent__ (telemetry pipeline down), or
+// __roster_unavailable__ (hub alive but can't read its machine table). NOTE: the
+// pipeline_silent row does fire until the account-level observability
+// destinations are wired and sessions-hub is redeployed to export (see
+// infra/cf/telemetry.md) — correct, telemetry genuinely isn't flowing until then.
+//
+// Missing-table guard (`otel`): the OTelLogs table doesn't exist until the FIRST
+// OTLP log lands. A bare `OTelLogs` reference then fails to RESOLVE at evaluation
+// time (a SemanticError, distinct from returning zero rows) — and a rule whose
+// query errors never fires, so the pipeline_silent dead-man would be blind during
+// exactly the bootstrap / total-export-outage window it exists for
+// (skip-query-validation only lets the rule be created, not evaluated). Wrapping
+// the table in `union isfuzzy=true (empty datatable), (OTelLogs | ...)` degrades
+// a missing table to the empty datatable instead of erroring, so every leg still
+// evaluates and pipeline_silent still synthesizes its row. Verified live: the
+// isfuzzy union returns identical results against the real table and returns the
+// datatable side (no error) when the unioned table name doesn't exist.
 
-let heartbeats = OTelLogs
-    | where todynamic(Body).event == "hub.heartbeat"
-    | extend machine_id = tostring(todynamic(Body).machine_id);
-let seen_recently = heartbeats
-    | where TimeGenerated > ago(14d)
-    | summarize by machine_id;
-let seen_last_72h = heartbeats
-    | where TimeGenerated > ago(72h)
-    | summarize by machine_id;
-seen_recently
-| join kind=leftanti seen_last_72h on machine_id
-| project machine_id
+let otel = union isfuzzy=true
+    (datatable(TimeGenerated:datetime, Body:string)[]),
+    (OTelLogs | project TimeGenerated, Body);
+let stale_machines = otel
+    | where TimeGenerated > ago(30m)
+    | extend body = todynamic(Body)
+    | where body.event == "hub.machine.heartbeat_age"
+    | extend machine = tostring(body.machine), age_seconds = tolong(body.age_seconds)
+    | summarize arg_max(TimeGenerated, age_seconds) by machine
+    | where age_seconds > 72 * 3600
+    | project machine, age_seconds;
+let pipeline_silent = otel
+    | where TimeGenerated > ago(1h)
+    | extend body = todynamic(Body)
+    | where body.event == "hub.watchdog.run"
+    | summarize n = count()
+    | where n == 0
+    | project machine = "__pipeline_silent__", age_seconds = tolong(-1);
+let roster_unavailable = otel
+    | where TimeGenerated > ago(1h)
+    | extend body = todynamic(Body)
+    | where body.event == "hub.watchdog.run"
+    | extend roster_ok = tobool(body.roster_ok)
+    | where roster_ok == false
+    | summarize n = count()
+    | where n > 0
+    | project machine = "__roster_unavailable__", age_seconds = tolong(-1);
+// pipeline_silent only catches a FULLY empty window. A mid-window outage that
+// recovers before evaluation (beacon 09:15, silence to 09:55, eval 10:00) leaves
+// beacons in the 1h window, so silence-by-emptiness misses it. pipeline_gap does
+// gap analysis instead: take the run beacons, inject the window's own edges
+// (window start and now()) so a hole at either end counts, order them, and take
+// the largest consecutive gap. Fire __pipeline_gap__ (age_seconds = gap length in
+// seconds) when that gap exceeds 35m — two missed 15-min beacons — so one delayed
+// tick stays quiet. Guarded to real beacons present (edges - 2 > 0); the fully
+// empty window is left to pipeline_silent, the clearer "nothing at all" signal.
+let pipeline_gap = union
+        (otel
+            | where TimeGenerated > ago(1h)
+            | extend body = todynamic(Body)
+            | where body.event == "hub.watchdog.run"
+            | project TimeGenerated),
+        (print TimeGenerated = ago(1h)),
+        (print TimeGenerated = now())
+    | order by TimeGenerated asc
+    | serialize gap = TimeGenerated - prev(TimeGenerated)
+    | summarize max_gap = max(gap), edges_plus_real = count()
+    | where (edges_plus_real - 2) > 0 and max_gap > 35m
+    | project machine = "__pipeline_gap__", age_seconds = tolong(max_gap / 1s);
+stale_machines
+| union pipeline_silent, roster_unavailable, pipeline_gap

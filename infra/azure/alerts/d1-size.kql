@@ -1,0 +1,38 @@
+// Fires when the D1 index database approaches its 10 GB hard cap (threshold at
+// 7 GiB — the plan's warning level, where the escape hatches kick in: tighten
+// truncation caps -> drop tool_use input from FTS -> shard blocks+FTS by year)
+// OR when the size probe itself is broken.
+//
+// Source: the hub watchdog cron (*/15) emits, once per run, a structured log
+//   { event: "hub.d1.db_size_bytes", bytes: <n> }
+// (hub/src/cron/watchdog.ts). On a healthy probe `bytes` is the real size; if
+// the PRAGMA probe fails or returns nothing the watchdog emits `bytes: -1` as
+// an explicit failing signal (rather than dropping the metric, which would make
+// this alert blind exactly when the probe breaks while heartbeat_age keeps
+// missed-heartbeat.kql "healthy"). So this fires on `bytes < 0` (probe broken)
+// as well as `bytes > 7 GiB` (cap approaching); the email's bytes value
+// distinguishes the two. Workers observability ships it to Log Analytics
+// OTelLogs (Body = that JSON) — same path/column as missed-heartbeat.kql
+// (verified live 2026-07-17).
+//
+// A 1h window comfortably contains a watchdog emission (it runs every 15 min);
+// we take the most recent reported size. `bytes` is pulled out with `extend`
+// before the `arg_max` (rather than aliased inside it) for clarity — both forms
+// execute (verified live against a synthetic 8 GB row), this one is unambiguous.
+// No pipeline-silent sentinel is needed here: total telemetry silence is already
+// covered by missed-heartbeat.kql's __pipeline_silent__ row.
+
+// `otel` wraps OTelLogs in `union isfuzzy=true` so a missing table (before the
+// first OTLP log lands) degrades to empty instead of erroring the whole rule —
+// see missed-heartbeat.kql's "Missing-table guard" note for the full rationale.
+let otel = union isfuzzy=true
+    (datatable(TimeGenerated:datetime, Body:string)[]),
+    (OTelLogs | project TimeGenerated, Body);
+otel
+| where TimeGenerated > ago(1h)
+| extend body = todynamic(Body)
+| where body.event == "hub.d1.db_size_bytes"
+| extend bytes = tolong(body.bytes)
+| summarize arg_max(TimeGenerated, bytes)
+| where bytes < 0 or bytes > 7 * 1024 * 1024 * 1024
+| project TimeGenerated, bytes
