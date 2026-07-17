@@ -56,17 +56,21 @@
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
-    // M4: once sessions-telemetry-gateway is deployed, add
-    // "logs": { "enabled": true, "destinations": ["agent-backup-azure-logs"] } and
-    // "traces": { "enabled": true, "destinations": ["agent-backup-azure-traces"] } here.
-    // Destinations are ACCOUNT-level (not per-worker) and, as of this writing,
-    // dashboard-only — no wrangler/API command creates them. Create them once in
-    // the Cloudflare dashboard (Workers & Pages → Observability → Pipelines → Add
-    // destination): Destination Type "Logs" / "Traces", OTLP Endpoint
-    // https://sessions-telemetry-gateway.<account>.workers.dev/v1/{logs,traces},
-    // custom header Authorization: Bearer <INGEST_BEARER>. Then reference the
-    // destination names above. Full steps + trap (destinations are shared with
-    // every worker on this Cloudflare account) in infra/cf/telemetry.md.
+    // M4: sessions-telemetry-gateway IS deployed
+    // (https://sessions-telemetry-gateway.pedro-18e.workers.dev). To finish the
+    // export, add here:
+    // "logs": { "enabled": true, "destinations": ["agent-backup-azure-logs"] },
+    // "traces": { "enabled": true, "destinations": ["agent-backup-azure-traces"] }
+    // — but ONLY AFTER the two account-level destinations exist, or this deploy
+    // exports nowhere. Destinations are ACCOUNT-level (not per-worker) and can be
+    // created ONLY in the dashboard: the wrangler OAuth token gets HTTP 403 on
+    // every /accounts/{id}/workers/observability/* API path (confirmed
+    // 2026-07-17), so this is a manual step for the account owner (Workers &
+    // Pages → Observability → Pipelines → Add destination). Type "Logs"/"Traces",
+    // OTLP Endpoint https://sessions-telemetry-gateway.pedro-18e.workers.dev/v1/{logs,traces},
+    // custom header Authorization: Bearer <INGEST_BEARER>. The exact bearer +
+    // endpoints are in the gitignored infra/out/cf-observability.env. Full steps
+    // + shared-account trap in infra/cf/telemetry.md.
   },
   // PR preview isolation. Workers Builds runs non-production branches with
   // `wrangler versions upload`, which uses the TOP-LEVEL bindings unless an env is

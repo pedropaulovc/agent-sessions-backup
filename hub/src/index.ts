@@ -1,3 +1,4 @@
+import { runWatchdog } from './cron/watchdog';
 import { consumeParseBatch } from './ingest/consumer';
 import { route } from './router';
 
@@ -10,7 +11,12 @@ export default {
     await consumeParseBatch(batch, env);
   },
 
-  async scheduled(_controller: ScheduledController, _env: Env, _ctx: ExecutionContext): Promise<void> {
-    // M4: watchdog + prune + audit-log polling.
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    // */15 = observability watchdog (per-machine heartbeat-age gauge + D1 size).
+    // 30 4 * * * = daily prune (M4/later — not yet implemented).
+    // Audit-log polling (CF Audit Logs API) is a later M4 step, wired here once added.
+    if (controller.cron === '*/15 * * * *') {
+      ctx.waitUntil(runWatchdog(env));
+    }
   },
 } satisfies ExportedHandler<Env, ParseMessage>;

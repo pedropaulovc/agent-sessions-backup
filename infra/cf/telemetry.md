@@ -102,20 +102,27 @@ consistently; don't mix the two conventions in the same session.
 9. Create the account-level observability destinations (one for logs, one for
    traces — **these are shared across every worker on the account**, so use
    names that won't collide with anything else, e.g. `agent-backup-azure-logs`
-   / `agent-backup-azure-traces`). As of this writing there is no wrangler
-   subcommand or public API for this (confirmed: `wrangler observability`
-   doesn't exist in wrangler 4.111) — it's dashboard-only:
+   / `agent-backup-azure-traces`). There is no wrangler subcommand or usable
+   public API for this: `wrangler observability` doesn't exist (wrangler 4.111),
+   and every `/accounts/{id}/workers/observability/*` REST path returns **HTTP
+   403** with the wrangler OAuth token (confirmed 2026-07-17 — the token is valid
+   for `workers/scripts` etc. but carries no observability-destination scope).
+   **This is therefore a manual dashboard step — MUST be done by the account
+   owner:**
    [Workers & Pages → Observability → Pipelines → Add destination](https://developers.cloudflare.com/workers/observability/exporting-opentelemetry-data/#creating-a-destination)
    - Destination Name: `agent-backup-azure-logs`, Destination Type: **Logs**,
-     OTLP Endpoint: `https://sessions-telemetry-gateway.<account>.workers.dev/v1/logs`,
+     OTLP Endpoint: `https://sessions-telemetry-gateway.pedro-18e.workers.dev/v1/logs`,
      Custom Header: `Authorization: Bearer <INGEST_BEARER>`
    - Destination Name: `agent-backup-azure-traces`, Destination Type: **Traces**,
-     OTLP Endpoint: `https://sessions-telemetry-gateway.<account>.workers.dev/v1/traces`,
+     OTLP Endpoint: `https://sessions-telemetry-gateway.pedro-18e.workers.dev/v1/traces`,
      Custom Header: `Authorization: Bearer <INGEST_BEARER>`
 
-   The header value must equal the `INGEST_BEARER` secret set in step 7 — the
-   gateway 200-no-ops (rather than erroring) on any mismatch, so a typo here
-   fails silently until you notice no data arriving.
+   The exact `<INGEST_BEARER>` value (the secret already set on the gateway in
+   step 7) and both endpoint URLs are written to the gitignored
+   `infra/out/cf-observability.env` at deploy time — copy them from there. The
+   header value must equal that `INGEST_BEARER` secret — the gateway 200-no-ops
+   (rather than erroring) on any mismatch, so a typo here fails silently until
+   you notice no data arriving.
 10. In `hub/wrangler.jsonc`, uncomment/add under `observability`:
     ```jsonc
     "logs": { "enabled": true, "destinations": ["agent-backup-azure-logs"] },

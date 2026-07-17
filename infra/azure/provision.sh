@@ -20,13 +20,15 @@
 #     federation subject, matching youtube-mirror's pattern
 #   - an action group + KQL-based scheduled-query alerts + an availability test
 #
-# *** UNVERIFIED SECTIONS — see the inline "UNVERIFIED" comments below and the
-# task report. The DCE/DCR-with-OTLP-streams shape and the availability webtest
-# ARM shape are built from Microsoft Learn docs + a working sibling project's
-# *output* (youtube-mirror's infra/federation.md); flag names have been checked
-# against this environment's real `az --help` output where noted, but none of
-# these commands have been run against a live subscription. Confirm both live
-# at M4 deploy before trusting this script end to end. ***
+# *** VERIFIED LIVE 2026-07-17 against subscription "Pay-As-You-Go Dev/Test":
+# the full script runs clean end to end (exit 0, idempotent on re-run) and
+# stands up rg-agent-backup with the DCE/DCR (ARM-deployed — see the DCR section
+# for why a raw `az rest` PUT of directDataSources fails), managed identity +
+# federated credential, Metrics Publisher role, action group, all three
+# scheduled-query alerts, the /healthz webtest, and the availability metric
+# alert. The OTLP federation path is proven: a synthetic OTLP log POSTed through
+# sessions-telemetry-gateway mints an Entra token via the federated credential
+# and is accepted by the DCR (HTTP 204). ***
 #
 # Portability: this script targets bash, but avoids bash-4-only features
 # (`declare -A` associative arrays) since macOS ships bash 3.2 as /bin/bash by
@@ -103,172 +105,173 @@ AI_RESOURCE_ID=$(az monitor app-insights component show --app "$AI_NAME" --resou
 echo "OK: $AI_NAME ($AI_RESOURCE_ID)"
 
 echo ""
-echo "=== Data Collection Endpoint ==="
-# UNVERIFIED: `az monitor data-collection endpoint create` syntax confirmed against
-# Microsoft Learn's "Configure Azure Monitor pipeline with CLI" doc; not run live here.
-if ! az monitor data-collection endpoint show --name "$DCE_NAME" --resource-group "$RG_NAME" --only-show-errors >/dev/null 2>&1; then
-    az monitor data-collection endpoint create --name "$DCE_NAME" --resource-group "$RG_NAME" \
-        --location "$LOCATION" --public-network-access "Enabled" --only-show-errors >/dev/null
-    DCE_ACTION="created"
-else
-    # A bare existence check accepts an existing DCE with public network
-    # access disabled (e.g. left over from an earlier private-link attempt)
-    # and still hands back its public ingestion URL below — which a
-    # Cloudflare Worker running outside Azure's network can never reach, even
-    # though provisioning prints OK. `properties.networkAcls.publicNetworkAccess`
-    # is doc-verified (learn.microsoft.com/azure/templates/microsoft.insights/
-    # 2023-03-11/datacollectionendpoints); the typed show command flattens
-    # `properties.*` to the top level, same as the already-working
-    # `--query logsIngestion.endpoint` below, so `--query
-    # networkAcls.publicNetworkAccess` reads it. `update` documents the same
-    # `--public-network-access` flag as `create`, so fixing drift doesn't need
-    # to fall back to `az rest`.
-    CURRENT_PNA=$(az monitor data-collection endpoint show --name "$DCE_NAME" --resource-group "$RG_NAME" --query networkAcls.publicNetworkAccess -o tsv)
-    if [ "$CURRENT_PNA" != "Enabled" ]; then
-        az monitor data-collection endpoint update --name "$DCE_NAME" --resource-group "$RG_NAME" \
-            --public-network-access "Enabled" --only-show-errors >/dev/null
-        DCE_ACTION="updated (publicNetworkAccess was $CURRENT_PNA)"
-    else
-        DCE_ACTION="unchanged"
-    fi
-fi
-DCE_ID=$(az monitor data-collection endpoint show --name "$DCE_NAME" --resource-group "$RG_NAME" --query id -o tsv)
-DCE_LOGS_INGESTION=$(az monitor data-collection endpoint show --name "$DCE_NAME" --resource-group "$RG_NAME" --query logsIngestion.endpoint -o tsv)
-echo "OK: $DCE_NAME ($DCE_ACTION) ($DCE_ID)"
-
-echo ""
-echo "=== Data Collection Rule (native OTLP ingestion: logs + traces) ==="
-# Verified: the `monitor-control-service` CLI extension's typed `data-
-# collection rule` commands (create/update/show) are pinned to api-version
-# 2023-03-11 (`az extension show -n monitor-control-service`'s changelog:
-# "1.1.0: Update api-version to 2023-03-11", no later bump since — confirmed
-# against this environment's installed 1.2.0). `directDataSources`, the
-# property this DCR needs for native OTLP ingestion, only exists starting at
-# api-version 2024-03-11 (confirmed live: `az provider show --namespace
-# Microsoft.Insights --query "resourceTypes[?resourceType=='dataCollectionRules'].apiVersions"`
-# lists 2024-03-11 — and a newer 2025-05-11 — as valid versions for this
-# resource type, with 2023-03-11 predating `directDataSources`). Feeding
-# `directDataSources` through `--rule-file` into a 2023-03-11-pinned typed
-# command risks the extension's generated model silently dropping the
-# unrecognized key rather than erroring — the worst failure mode, since the
-# script would report OK with a DCR that has no ingestion path wired. So this
-# DCR is created/updated via `az rest` straight against the ARM resource,
-# pinned to api-version=2024-03-11 (the version the OTLP-ingestion template
-# below targets), instead of the typed command.
-#
-# Per Microsoft Learn's current manual-OTLP-ingestion ARM template
+echo "=== Data Collection Endpoint + Rule (native OTLP ingestion: logs + traces) ==="
+# The DCE and DCR are deployed together via an ARM template — Microsoft's
+# documented "manual resource orchestration" path for native OTLP/DCR ingestion
 # (learn.microsoft.com/azure/azure-monitor/containers/opentelemetry-protocol-
-# ingestion, "Option 2: Manual resource orchestration", backed by
-# github.com/microsoft/AzureMonitorCommunity's OTLP_DCE_DCR_ARM_Template.txt),
-# the DCR must declare an explicit `directDataSources` entry per signal
-# (there is no such thing as a bare built-in "Microsoft-OTLP-Logs"/
-# "Microsoft-OTLP-Traces" *stream* usable directly in dataFlows — those names
-# are only the OTLP *ingestion route* segment in the URL the worker POSTs to;
-# see OTLP_LOGS_ENDPOINT below). The actual DCR-internal stream ids the
-# directDataSources declare — and that dataFlows must route to a destination
-# — are `Microsoft-OTel-Logs` for logs and `Microsoft-OTel-Traces-{Spans,
-# Events,Resources}` for traces (three separate stream ids for one signal;
-# the community template always lists all three together). Each
-# directDataSources entry also needs a `references` block naming an
-# Application Insights resource to enrich against (we already create
-# ai-agent-backup for this). If this PUT rejects the shape or the stream ids
-# have since changed, the fallback is: create ai-agent-backup with "OTLP
-# support: On" via the portal instead (which auto-provisions an equivalent
-# "managed-ai-..." DCE/DCR pair) and copy its endpoint URLs into
-# infra/out/azure.env by hand rather than trusting this script's output.
-DCR_API_VERSION="2024-03-11"
-DCR_RESOURCE_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Insights/dataCollectionRules/$DCR_NAME"
-DCR_URL="https://management.azure.com${DCR_RESOURCE_ID}?api-version=${DCR_API_VERSION}"
-
-# A bare `mktemp` (no template) is a GNU-ism — BSD mktemp (macOS's default,
-# matching this script's bash-3.2 portability elsewhere) requires an explicit
-# template and exits non-zero without one.
-DCR_RULE_FILE=$(mktemp "${TMPDIR:-/tmp}/agent-backup-dcr.XXXXXX")
-DCR_CURRENT_FILE=$(mktemp "${TMPDIR:-/tmp}/agent-backup-dcr-current.XXXXXX")
-trap 'rm -f "$DCR_RULE_FILE" "$DCR_CURRENT_FILE"' EXIT
-cat > "$DCR_RULE_FILE" <<EOF
+# ingestion, "Option 2", backed by the community template Azure Services/Azure
+# Monitor/OpenTelemetry/OTLP_DCE_DCR_ARM_Template.txt). Trimmed to logs + traces
+# only: Cloudflare Workers observability emits no metrics, so no Azure Monitor
+# Workspace / Custom-Metrics-Otel stream is wired. Destination is
+# law-agent-backup so the scheduled-query alerts below (scoped to that
+# workspace) actually see the data — as opposed to enabling "OTLP support: On"
+# on the App Insights component (Option 1), which auto-provisions a *separate*
+# managed Log Analytics workspace the alerts would then have to be re-scoped to.
+#
+# Why an ARM deployment and not a raw `az rest` PUT: a direct PUT of a body
+# carrying `directDataSources` (even pinned to api-version 2024-03-11) is
+# rejected with `InvalidPayload: Application Insights reference
+# 'applicationInsightsResource' is not used` — the direct-resource write path
+# does not consume the reference the way an ARM deployment does. The template
+# below declares BOTH `dataSources` (AMA path) and `directDataSources` (the
+# OTel-Collector-direct path the gateway uses), each enriching against the
+# `applicationInsightsResource` reference, exactly as Microsoft's community
+# template does; that shape deploys cleanly and was verified live.
+# `az deployment group create` is natively idempotent (incremental mode), so
+# re-running converges without the manual show-or-create-or-update drift dance.
+#
+# Two distinct name layers, both load-bearing: the DCR-internal stream ids
+# (`Microsoft-OTel-Logs`, `Microsoft-OTel-Traces-{Spans,Events,Resources}`) that
+# dataSources/directDataSources/dataFlows reference, versus the OTLP URL route
+# segment (`Microsoft-OTLP-{Logs,Traces}`) the worker POSTs to (see
+# OTLP_LOGS_ENDPOINT below). Verified against the managed DCR a sibling project
+# (youtube-mirror) provisions via the portal "OTLP support: On" toggle.
+DCR_TEMPLATE_FILE=$(mktemp "${TMPDIR:-/tmp}/agent-backup-otlp-dcr-arm.XXXXXX")
+trap 'rm -f "$DCR_TEMPLATE_FILE"' EXIT
+cat > "$DCR_TEMPLATE_FILE" <<'ARMEOF'
 {
-  "location": "$LOCATION",
-  "properties": {
-    "dataCollectionEndpointId": "$DCE_ID",
-    "references": {
-      "applicationInsights": [
-        { "resourceId": "$AI_RESOURCE_ID", "name": "applicationInsightsResource" }
-      ]
-    },
-    "directDataSources": {
-      "otelLogs": [
-        {
-          "streams": ["Microsoft-OTel-Logs"],
-          "enrichWithResourceAttributes": ["*"],
-          "enrichWithReference": "applicationInsightsResource",
-          "replaceResourceIdWithReference": true,
-          "name": "otelLogsDataSourceDirect"
-        }
-      ],
-      "otelTraces": [
-        {
-          "streams": ["Microsoft-OTel-Traces-Spans", "Microsoft-OTel-Traces-Events", "Microsoft-OTel-Traces-Resources"],
-          "enrichWithResourceAttributes": ["*"],
-          "enrichWithReference": "applicationInsightsResource",
-          "replaceResourceIdWithReference": true,
-          "name": "otelTracesDataSourceDirect"
-        }
-      ]
-    },
-    "destinations": {
-      "logAnalytics": [
-        { "workspaceResourceId": "$LAW_ID", "name": "lawDestination" }
-      ]
-    },
-    "dataFlows": [
-      {
-        "streams": ["Microsoft-OTel-Logs", "Microsoft-OTel-Traces-Spans", "Microsoft-OTel-Traces-Events", "Microsoft-OTel-Traces-Resources"],
-        "destinations": ["lawDestination"]
+  "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
+  "contentVersion": "1.0.0.0",
+  "parameters": {
+    "dataCollectionRuleName": { "type": "string" },
+    "dataCollectionEndpointName": { "type": "string" },
+    "location": { "type": "string" },
+    "applicationInsightsResourceId": { "type": "string" },
+    "logAnalyticsWorkspaceResourceId": { "type": "string" }
+  },
+  "resources": [
+    {
+      "type": "Microsoft.Insights/dataCollectionEndpoints",
+      "apiVersion": "2024-03-11",
+      "name": "[parameters('dataCollectionEndpointName')]",
+      "location": "[parameters('location')]",
+      "properties": {
+        "description": "OTLP telemetry ingestion endpoint (agent-sessions-backup)",
+        "networkAcls": { "publicNetworkAccess": "Enabled" }
       }
-    ]
+    },
+    {
+      "type": "Microsoft.Insights/dataCollectionRules",
+      "apiVersion": "2024-03-11",
+      "name": "[parameters('dataCollectionRuleName')]",
+      "location": "[parameters('location')]",
+      "dependsOn": [
+        "[resourceId('Microsoft.Insights/dataCollectionEndpoints', parameters('dataCollectionEndpointName'))]"
+      ],
+      "properties": {
+        "description": "OTLP logs + traces from sessions-telemetry-gateway -> law-agent-backup",
+        "dataCollectionEndpointId": "[resourceId('Microsoft.Insights/dataCollectionEndpoints', parameters('dataCollectionEndpointName'))]",
+        "references": {
+          "applicationInsights": [
+            { "resourceId": "[parameters('applicationInsightsResourceId')]", "name": "applicationInsightsResource" }
+          ]
+        },
+        "dataSources": {
+          "otelLogs": [
+            {
+              "streams": ["Microsoft-OTel-Logs"],
+              "enrichWithResourceAttributes": ["*"],
+              "enrichWithReference": "applicationInsightsResource",
+              "replaceResourceIdWithReference": true,
+              "name": "otelLogsDataSource"
+            }
+          ],
+          "otelTraces": [
+            {
+              "streams": ["Microsoft-OTel-Traces-Spans", "Microsoft-OTel-Traces-Events", "Microsoft-OTel-Traces-Resources"],
+              "enrichWithResourceAttributes": ["*"],
+              "enrichWithReference": "applicationInsightsResource",
+              "replaceResourceIdWithReference": true,
+              "name": "otelTracesDataSource"
+            }
+          ]
+        },
+        "directDataSources": {
+          "otelLogs": [
+            {
+              "streams": ["Microsoft-OTel-Logs"],
+              "enrichWithResourceAttributes": ["*"],
+              "enrichWithReference": "applicationInsightsResource",
+              "replaceResourceIdWithReference": true,
+              "name": "otelLogsDataSourceDirect"
+            }
+          ],
+          "otelTraces": [
+            {
+              "streams": ["Microsoft-OTel-Traces-Spans", "Microsoft-OTel-Traces-Events", "Microsoft-OTel-Traces-Resources"],
+              "enrichWithResourceAttributes": ["*"],
+              "enrichWithReference": "applicationInsightsResource",
+              "replaceResourceIdWithReference": true,
+              "name": "otelTracesDataSourceDirect"
+            }
+          ]
+        },
+        "destinations": {
+          "logAnalytics": [
+            { "workspaceResourceId": "[parameters('logAnalyticsWorkspaceResourceId')]", "name": "lawDestination" }
+          ]
+        },
+        "dataFlows": [
+          {
+            "streams": ["Microsoft-OTel-Logs", "Microsoft-OTel-Traces-Spans", "Microsoft-OTel-Traces-Events", "Microsoft-OTel-Traces-Resources"],
+            "destinations": ["lawDestination"]
+          }
+        ]
+      }
+    }
+  ],
+  "outputs": {
+    "dataCollectionRuleId": {
+      "type": "string",
+      "value": "[resourceId('Microsoft.Insights/dataCollectionRules', parameters('dataCollectionRuleName'))]"
+    },
+    "dataCollectionRuleImmutableId": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Insights/dataCollectionRules', parameters('dataCollectionRuleName')), '2024-03-11', 'full').properties.immutableId]"
+    },
+    "dataCollectionEndpointLogsIngestion": {
+      "type": "string",
+      "value": "[reference(resourceId('Microsoft.Insights/dataCollectionEndpoints', parameters('dataCollectionEndpointName')), '2024-03-11', 'full').properties.logsIngestion.endpoint]"
+    }
   }
 }
-EOF
+ARMEOF
 
-# Show-or-create-or-update-on-drift, same pattern as the federated credential
-# and scheduled-query alerts above: GET first (a missing DCR fails the GET,
-# meaning create); if it exists, compare the live `properties` against the
-# desired body and PUT only when they differ, so editing this script's DCR
-# shape and re-running actually pushes the change instead of a bare
-# existence check silently leaving the old shape in place.
-if az rest --method get --url "$DCR_URL" --only-show-errors -o json > "$DCR_CURRENT_FILE" 2>/dev/null; then
-    if python3 -c "
-import json, sys
-with open('$DCR_RULE_FILE') as f:
-    desired = json.load(f)['properties']
-with open('$DCR_CURRENT_FILE') as f:
-    current = json.load(f)['properties']
-sys.exit(0 if desired == current else 1)
-"; then
-        DCR_ACTION="unchanged"
-    else
-        az rest --method put --url "$DCR_URL" --body "@$DCR_RULE_FILE" --only-show-errors >/dev/null
-        DCR_ACTION="updated (drift detected)"
-    fi
-else
-    az rest --method put --url "$DCR_URL" --body "@$DCR_RULE_FILE" --only-show-errors >/dev/null
-    DCR_ACTION="created"
-fi
-rm -f "$DCR_RULE_FILE" "$DCR_CURRENT_FILE"
+DCR_DEPLOY_OUT=$(az deployment group create --resource-group "$RG_NAME" --name "agent-backup-otlp-dcr" \
+    --template-file "$DCR_TEMPLATE_FILE" \
+    --parameters \
+        dataCollectionEndpointName="$DCE_NAME" \
+        dataCollectionRuleName="$DCR_NAME" \
+        location="$LOCATION" \
+        applicationInsightsResourceId="$AI_RESOURCE_ID" \
+        logAnalyticsWorkspaceResourceId="$LAW_ID" \
+    --query properties.outputs -o json --only-show-errors)
+rm -f "$DCR_TEMPLATE_FILE"
 trap - EXIT
 
-DCR_ID=$(az rest --method get --url "$DCR_URL" --only-show-errors --query id -o tsv)
-DCR_IMMUTABLE_ID=$(az rest --method get --url "$DCR_URL" --only-show-errors --query properties.immutableId -o tsv)
+DCR_ID=$(echo "$DCR_DEPLOY_OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["dataCollectionRuleId"]["value"])')
+DCR_IMMUTABLE_ID=$(echo "$DCR_DEPLOY_OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["dataCollectionRuleImmutableId"]["value"])')
+DCE_LOGS_INGESTION=$(echo "$DCR_DEPLOY_OUT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["dataCollectionEndpointLogsIngestion"]["value"])')
+
 # The URL route segment is "Microsoft-OTLP-{Logs,Traces}" (the OTLP wire
 # protocol endpoint name), NOT the DCR-internal "Microsoft-OTel-*" stream ids
-# declared above — those are two different names for two different layers.
-# Casing matches a known-working sibling deployment (youtube-mirror's
-# federation.md), which uses "dataCollectionRules" (capital C, R); Microsoft's
-# own docs are inconsistently cased on this point.
+# declared above — two different names for two different layers. Casing matches
+# a known-working sibling deployment (youtube-mirror), which uses
+# "dataCollectionRules" (capital C, R); Microsoft's own docs are inconsistently
+# cased here, but the capitalized form is what actually ingests.
 OTLP_LOGS_ENDPOINT="${DCE_LOGS_INGESTION}/dataCollectionRules/${DCR_IMMUTABLE_ID}/streams/Microsoft-OTLP-Logs/otlp/v1/logs"
 OTLP_TRACES_ENDPOINT="${DCE_LOGS_INGESTION}/dataCollectionRules/${DCR_IMMUTABLE_ID}/streams/Microsoft-OTLP-Traces/otlp/v1/traces"
-echo "OK: $DCR_NAME ($DCR_ACTION) ($DCR_ID)"
+echo "OK: $DCE_NAME + $DCR_NAME ($DCR_ID)"
 echo "  logs endpoint:   $OTLP_LOGS_ENDPOINT"
 echo "  traces endpoint: $OTLP_TRACES_ENDPOINT"
 
@@ -385,25 +388,17 @@ for kql_file in "$REPO_ROOT"/infra/azure/alerts/*.kql; do
         fi
     fi
 
-    # missed-heartbeat.kql looks back ago(14d)/ago(72h), but scheduled-query
-    # rules default the query time range to WindowSize*NumberOfEvaluationPeriods
-    # (1h here), so without an explicit override the absence join only ever
-    # sees ~1h of data and quiet machines never produce a row. Neither
-    # `az monitor scheduled-query create` nor `update` exposes a flag for this
-    # (checked --help in this environment: no such option in the
-    # scheduled-query CLI extension) — set it directly via `az rest` PATCH on
-    # the ARM resource. ARM property: properties.overrideQueryTimeRange (ISO
-    # 8601 duration), confirmed against Microsoft's scheduledQueryRules
-    # template reference (learn.microsoft.com/azure/templates/microsoft.insights/
-    # scheduledqueryrules). The PATCH is idempotent, so it's applied
-    # unconditionally on every run rather than trying to read back and compare
-    # the current value first.
-    if [ "$base_name" = "missed-heartbeat" ]; then
-        RULE_ID=$(az monitor scheduled-query show --name "$alert_name" --resource-group "$RG_NAME" --query id -o tsv)
-        az rest --method patch --url "https://management.azure.com${RULE_ID}?api-version=2022-06-15" \
-            --body '{"properties":{"overrideQueryTimeRange":"P14D"}}' --only-show-errors >/dev/null
-        echo "  overrideQueryTimeRange=P14D (missed-heartbeat needs 14d/72h of history; window/eval-frequency alone only cover 1h)"
-    fi
+    # No overrideQueryTimeRange is set for any alert. An earlier design tried
+    # P14D for missed-heartbeat (its old absence-JOIN form needed a 14d
+    # baseline), but Azure rejects it: overrideQueryTimeRange maxes at 2880 min
+    # (48h) — "Supported granularities are: 5,10,15,30,45,60,120,180,240,300,
+    # 360,720,1440,2880". That 48h cap is itself shorter than the 72h heartbeat
+    # tolerance, which is exactly why missed-heartbeat.kql was rewritten to
+    # threshold on the hub watchdog's per-machine `hub.machine.heartbeat_age`
+    # gauge (re-emitted every 15 min for every machine, dead or alive) over a
+    # short ago(30m) window instead of a self-referential absence JOIN. With the
+    # gauge form, the rule's default query range (WindowSize) already covers the
+    # ago(30m) the query needs — no override required.
 
     echo "OK: $alert_name ($alert_action, window=$window)"
 done

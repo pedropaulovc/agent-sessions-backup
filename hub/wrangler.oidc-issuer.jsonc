@@ -10,9 +10,11 @@
   // credential `issuer` (infra/azure/provision.sh). The kid in the embedded JWK
   // (gateway/oidc-issuer.ts) must match OIDC_SIGNING_KID on the gateway.
   //
-  // PLACEHOLDER — replace <account> with the real workers.dev subdomain (or the
-  // custom route, if one is set up) at M4 deploy time; see infra/cf/telemetry.md.
+  // ISSUER_URL is this worker's own deployed URL (workers.dev subdomain
+  // pedro-18e, account 18ef3246e9f36d1560485ef53889c0ab). Must stay byte-for-byte
+  // identical to sessions-telemetry-gateway's OIDC_ISSUER_URL and the Azure
+  // federated-credential `issuer` (infra/azure/provision.sh argument).
   "vars": {
-    "ISSUER_URL": "https://sessions-oidc-issuer.<account>.workers.dev"
+    "ISSUER_URL": "https://sessions-oidc-issuer.pedro-18e.workers.dev"
   }
 }

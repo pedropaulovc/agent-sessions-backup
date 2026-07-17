@@ -1,31 +1,34 @@
-// Absence alert: fires when a machine that heartbeated in the last 14 days has
-// gone quiet for the last 72 hours (collector down, network partition, TPM cert
-// expired, etc).
+// Dead-man's-switch: fires when any machine's last heartbeat is older than the
+// 72h tolerance.
 //
-// The hub emits structured JSON via console.log({ event: "hub.heartbeat", machine_id: ... }).
-// Workers observability ships this as an OTLP log record whose Body is that JSON
-// string. This DCR (infra/azure/provision.sh) lands OTLP logs in the Log
-// Analytics **OTelLogs** table (the native-OTLP-ingestion schema; confirmed
-// empirically for the sibling youtube-mirror project's identical DCR/OTLP-Logs
-// setup — see its memory/telemetry-destinations-shared-account.md).
+// Data source is the hub watchdog cron (*/15), NOT raw heartbeats. The watchdog
+// (hub/src/cron/watchdog.ts) iterates the D1 `machines` roster and emits, for
+// EVERY machine — including long-silent ones — a structured log:
+//   { event: "hub.machine.heartbeat_age", machine: <id>, age_seconds: <n> }
+// Workers observability ships this as an OTLP log whose Body is that JSON string;
+// this project's DCR (infra/azure/provision.sh) lands OTLP logs in the Log
+// Analytics **OTelLogs** table (confirmed empirically for the sibling
+// youtube-mirror project's identical DCR/OTLP-Logs setup).
 //
-// ASSUMPTION TO VERIFY AT M4 DEPLOY: once real data flows, confirm (a) the
-// table is actually OTelLogs (not the classic AppTraces/traces table — that
-// schema only applies to the Application-Insights-Breeze SDK ingestion path,
-// which this project does NOT use), (b) the JSON body lands in a column named
-// Body (vs. Message or LogMessage), and (c) `machine_id` is the field name the
-// M1 heartbeat handler actually stamps into the log payload. Adjust column/field
-// names below to match.
+// Why a gauge and not an absence JOIN over hub.heartbeat: Azure scheduled-query
+// rules cap overrideQueryTimeRange at 2880 min (48h), shorter than the 72h
+// tolerance, so a machine silent >48h would drop out of any self-referential
+// baseline and the alert would self-silence. The watchdog re-emits a fresh,
+// growing age for a dead machine every 15 min, so a short scan window always has
+// current data and the alert never self-silences. No overrideQueryTimeRange is
+// needed (provision.sh's default window covers it).
+//
+// ASSUMPTION TO VERIFY AT M4 DEPLOY: once real data flows, confirm the table is
+// OTelLogs (not the classic AppTraces/traces table — that schema is the
+// Application-Insights-Breeze SDK path, which this project does NOT use) and the
+// JSON body lands in a column named Body (vs. Message/LogMessage). The `machine`
+// / `age_seconds` field names match hub/src/cron/watchdog.ts.
 
-let heartbeats = OTelLogs
-    | where todynamic(Body).event == "hub.heartbeat"
-    | extend machine_id = tostring(todynamic(Body).machine_id);
-let seen_recently = heartbeats
-    | where TimeGenerated > ago(14d)
-    | summarize by machine_id;
-let seen_last_72h = heartbeats
-    | where TimeGenerated > ago(72h)
-    | summarize by machine_id;
-seen_recently
-| join kind=leftanti seen_last_72h on machine_id
-| project machine_id
+OTelLogs
+| where TimeGenerated > ago(30m)
+| extend body = todynamic(Body)
+| where body.event == "hub.machine.heartbeat_age"
+| extend machine = tostring(body.machine), age_seconds = tolong(body.age_seconds)
+| summarize arg_max(TimeGenerated, age_seconds) by machine
+| where age_seconds > 72 * 3600
+| project machine, age_seconds
