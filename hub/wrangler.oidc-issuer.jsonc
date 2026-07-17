@@ -1,0 +1,18 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "sessions-oidc-issuer",
+  "main": "gateway/oidc-issuer.ts",
+  "compatibility_date": "2026-07-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "upload_source_maps": true,
+  // Public OIDC issuer. ISSUER_URL must equal this worker's own public URL and
+  // match: sessions-telemetry-gateway's OIDC_ISSUER_URL, and the Azure federated-
+  // credential `issuer` (infra/azure/provision.sh). The kid in the embedded JWK
+  // (gateway/oidc-issuer.ts) must match OIDC_SIGNING_KID on the gateway.
+  //
+  // PLACEHOLDER — replace <account> with the real workers.dev subdomain (or the
+  // custom route, if one is set up) at M4 deploy time; see infra/cf/telemetry.md.
+  "vars": {
+    "ISSUER_URL": "https://sessions-oidc-issuer.<account>.workers.dev"
+  }
+}

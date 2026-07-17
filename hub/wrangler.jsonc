@@ -41,6 +41,17 @@
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1
+    // M4: once sessions-telemetry-gateway is deployed, add
+    // "logs": { "enabled": true, "destinations": ["agent-backup-azure-logs"] } and
+    // "traces": { "enabled": true, "destinations": ["agent-backup-azure-traces"] } here.
+    // Destinations are ACCOUNT-level (not per-worker) and, as of this writing,
+    // dashboard-only — no wrangler/API command creates them. Create them once in
+    // the Cloudflare dashboard (Workers & Pages → Observability → Pipelines → Add
+    // destination): Destination Type "Logs" / "Traces", OTLP Endpoint
+    // https://sessions-telemetry-gateway.<account>.workers.dev/v1/{logs,traces},
+    // custom header Authorization: Bearer <INGEST_BEARER>. Then reference the
+    // destination names above. Full steps + trap (destinations are shared with
+    // every worker on this Cloudflare account) in infra/cf/telemetry.md.
   }
   // secrets: SETUP_TOKEN (passkey bootstrap), CF_API_TOKEN (cert renewal)
 }
