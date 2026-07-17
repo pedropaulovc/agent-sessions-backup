@@ -1,4 +1,4 @@
-import { clampLimit } from './sessions';
+import { clampLimit, normalizeToBound } from './sessions';
 
 const FACET_COLUMNS = ['harness', 'machine_id', 'os', 'primary_model', 'repo_url'] as const;
 
@@ -23,7 +23,7 @@ export async function search(url: URL, env: Env): Promise<Response> {
   if (p.get('repo')) addFilter('s.repo_url = ?', p.get('repo'));
   if (p.get('cwd')) addFilter('s.cwd = ?', p.get('cwd'));
   if (p.get('from')) addFilter('s.started_at >= ?', p.get('from'));
-  if (p.get('to')) addFilter('s.started_at <= ?', p.get('to'));
+  if (p.get('to')) addFilter('s.started_at <= ?', normalizeToBound(p.get('to')!));
   const where = filters.length ? `AND ${filters.join(' AND ')}` : '';
 
   if (!q) return Response.json({ error: 'missing_q' }, { status: 400 });

@@ -1,5 +1,5 @@
 import { env, SELF } from 'cloudflare:test';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { clampLimit } from '../src/api/sessions';
 import { CODEX_SESSION_ID, ccAssistantLine, ccUserLine, codexLines } from './fixtures';
@@ -270,6 +270,205 @@ describe('failed reparse surfaces as session index_state=error', () => {
       .first<{ parse_state: string; parse_error: string | null }>();
     expect(fileRow?.parse_state).toBe('error');
     expect(fileRow?.parse_error).toContain('r2_object_missing');
+  });
+});
+
+describe('upload requires an actual size header', () => {
+  it('PUT with neither Content-Length nor x-file-size returns 400 missing_content_length (regression: Number(null) is 0, not NaN, so this silently passed as a 0-byte file)', async () => {
+    const bytes = new TextEncoder().encode('{"type":"user"}\n');
+    // A plain Uint8Array body has a known length, and fetch() auto-computes Content-Length for
+    // it regardless of what headers we pass — that doesn't reproduce the bug. A streaming body
+    // (unknown length up front) is what actually arrives without a Content-Length header, i.e.
+    // the literal "chunked/streaming uploads" case the finding describes.
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(bytes);
+        controller.close();
+      },
+    });
+    const res = await SELF.fetch(
+      `https://api.sessions.vza.net/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent('no-size-demo/f0000000-0000-4000-8000-000000000001.jsonl')}`,
+      {
+        method: 'PUT',
+        headers: {
+          'x-dev-machine': MACHINE,
+          'x-content-hash': `sha256:${await sha256Hex(bytes)}`,
+        },
+        body: stream,
+        duplex: 'half',
+      } as RequestInit,
+    );
+    expect(res.status).toBe(400);
+    const json = (await res.json()) as { error: string };
+    expect(json.error).toBe('missing_content_length');
+  });
+});
+
+describe('date-only "to" bound is inclusive of the whole day', () => {
+  const DATE_SESSION_ID = '019f0000-1111-7000-8000-000000000def';
+
+  beforeAll(async () => {
+    const lines = [
+      { timestamp: '2026-07-17T09:00:00.000Z', type: 'session_meta', payload: { session_id: DATE_SESSION_ID, cwd: '/x' } },
+      { timestamp: '2026-07-17T09:00:01.000Z', type: 'turn_context', payload: { turn_id: 't1', model: 'gpt-test-4' } },
+      {
+        timestamp: '2026-07-17T09:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'date bound test content' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      {
+        timestamp: '2026-07-17T09:00:03.000Z',
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 5, output_tokens: 1 } } },
+      },
+    ].map((o) => JSON.stringify(o));
+
+    const relpath = `2026/07/17/rollout-2026-07-17T09-00-00-${DATE_SESSION_ID}.jsonl`;
+    const res = await putFile('codex-sessions', relpath, `${lines.join('\n')}\n`);
+    expect(res.status).toBe(201);
+    await drainQueue();
+
+    // Sanity check the fixture itself actually indexed a usage row and a started_at on that date
+    // before testing the date-bound query logic against it.
+    const usageRows = await testEnv.DB.prepare('SELECT ts FROM usage WHERE session_id = ?1').bind(DATE_SESSION_ID).all();
+    expect(usageRows.results.length).toBeGreaterThan(0);
+  });
+
+  it('usage: from=to=<date> is non-empty (regression: to=<date> lexicographically excluded the whole day against full ISO timestamps)', async () => {
+    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/usage?group_by=day&from=2026-07-17&to=2026-07-17', {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { rows: Array<{ bucket: string; calls: number }> };
+    const bucket = body.rows.find((r) => r.bucket === '2026-07-17');
+    expect(bucket).toBeTruthy();
+    expect(bucket!.calls).toBeGreaterThan(0);
+  });
+
+  it('search: to=<date-only> includes a session started that same day', async () => {
+    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=bound&from=2026-07-17&to=2026-07-17', {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { hits: Array<{ session_id: string }> };
+    expect(body.hits.some((h) => h.session_id === DATE_SESSION_ID)).toBe(true);
+  });
+
+  it('listSessions: to=<date-only> includes a session started that same day', async () => {
+    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions?from=2026-07-17&to=2026-07-17', {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { sessions: Array<{ session_id: string }> };
+    expect(body.sessions.some((s) => s.session_id === DATE_SESSION_ID)).toBe(true);
+  });
+});
+
+describe('files/check re-enqueues unindexed matches instead of only reporting them present', () => {
+  it('a matched row stuck at parse_state=pending is reported present AND gets a parse message sent', async () => {
+    const CHECK_SESSION_ID = 'd0000000-0000-4000-8000-000000000003';
+    const content = `${ccUserLine({ uuid: 'ck-u1', text: 'files check requeue test' })}\n`;
+    const relpath = `check-demo/${CHECK_SESSION_ID}.jsonl`;
+    const res = await putFile('claude-projects', relpath, content);
+    expect(res.status).toBe(201);
+    const fileId = ((await res.json()) as { file_id: number }).file_id;
+    const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
+    // Deliberately never drained: the row sits at parse_state='pending', simulating a queue
+    // message that was lost before it ever reached the consumer.
+    const stillPending = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(stillPending?.parse_state).toBe('pending');
+
+    const sha256 = await sha256Hex(new TextEncoder().encode(content));
+    const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
+    try {
+      const checkRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+        method: 'POST',
+        headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
+        body: JSON.stringify({ files: [{ store: 'claude-projects', relpath, sha256: `sha256:${sha256}` }] }),
+      });
+      expect(checkRes.status).toBe(200);
+      const body = (await checkRes.json()) as { missing: Array<{ store: string; relpath: string }> };
+      // Reported present (a matching hash means the bytes exist), not missing.
+      expect(body.missing).toHaveLength(0);
+      // ...but since it was never actually indexed, files/check must have re-enqueued it itself.
+      expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({ file_id: fileId, r2_key: r2Key }));
+    } finally {
+      sendSpy.mockRestore();
+    }
+
+    // Prove the enqueued message actually indexes the file (drainQueue only re-derives from
+    // files/parse_state='pending', which was already true before the check call — deliverOne
+    // exercises the specific message files/check would have sent, independent of that).
+    await deliverOne(fileId, r2Key);
+    const parsedRow = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(parsedRow?.parse_state).toBe('parsed');
+  });
+
+  it('a matched row already parsed is reported present and does NOT get re-enqueued', async () => {
+    const CHECK_SESSION_ID2 = 'd0000000-0000-4000-8000-000000000004';
+    const content = `${ccUserLine({ uuid: 'ck2-u1', text: 'files check no-requeue test' })}\n`;
+    const relpath = `check-demo/${CHECK_SESSION_ID2}.jsonl`;
+    const res = await putFile('claude-projects', relpath, content);
+    expect(res.status).toBe(201);
+    await drainQueue();
+
+    const sha256 = await sha256Hex(new TextEncoder().encode(content));
+    const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
+    try {
+      const checkRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+        method: 'POST',
+        headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
+        body: JSON.stringify({ files: [{ store: 'claude-projects', relpath, sha256: `sha256:${sha256}` }] }),
+      });
+      expect(checkRes.status).toBe(200);
+      const body = (await checkRes.json()) as { missing: Array<{ store: string; relpath: string }> };
+      expect(body.missing).toHaveLength(0);
+      expect(sendSpy).not.toHaveBeenCalled();
+    } finally {
+      sendSpy.mockRestore();
+    }
+  });
+});
+
+describe('reindex refreshes content_hash', () => {
+  it('an existing row with a stale/unknown content_hash gets refreshed to the real sha256 on reindex', async () => {
+    const HASH_SESSION_ID = 'e0000000-0000-4000-8000-000000000002';
+    const content = `${ccUserLine({ uuid: 'h-u1', text: 'hash refresh test' })}\n`;
+    const relpath = `hash-demo/${HASH_SESSION_ID}.jsonl`;
+    const res = await putFile('claude-projects', relpath, content);
+    expect(res.status).toBe(201);
+    const fileId = ((await res.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    const realHash = await sha256Hex(new TextEncoder().encode(content));
+
+    await testEnv.DB.prepare("UPDATE files SET content_hash = 'unknown' WHERE id = ?1").bind(fileId).run();
+    const before = await testEnv.DB.prepare('SELECT content_hash FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ content_hash: string }>();
+    expect(before?.content_hash).toBe('unknown');
+
+    const reindexRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/admin/reindex', {
+      method: 'POST',
+      headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
+      body: '{}',
+    });
+    expect(reindexRes.status).toBe(200);
+    await drainQueue();
+
+    const after = await testEnv.DB.prepare('SELECT content_hash FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ content_hash: string }>();
+    expect(after?.content_hash).toBe(realHash);
   });
 });
 

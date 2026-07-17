@@ -22,7 +22,12 @@ export async function putFile(
   if (!m) return Response.json({ error: 'missing_or_bad_x_content_hash' }, { status: 400 });
   const sha256 = m[1]!.toLowerCase();
   const mtime = request.headers.get('x-file-mtime');
-  const size = Number(request.headers.get('content-length') ?? request.headers.get('x-file-size'));
+  const sizeHeader = request.headers.get('content-length') ?? request.headers.get('x-file-size');
+  // Number(null) is 0, not NaN — without the explicit presence check, a chunked/streaming
+  // upload with neither header would silently record as a 0-byte file, which then loses the
+  // canonical-copy size tiebreaker to a smaller duplicate that did provide a size.
+  if (sizeHeader === null) return Response.json({ error: 'missing_content_length' }, { status: 400 });
+  const size = Number(sizeHeader);
   if (!Number.isFinite(size) || size < 0) return Response.json({ error: 'missing_content_length' }, { status: 400 });
   if (!request.body) return Response.json({ error: 'missing_body' }, { status: 400 });
 
@@ -87,12 +92,24 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
     const binds: unknown[] = [identity.machineId];
     for (const it of chunk) binds.push(it.store, it.relpath, it.sha256.replace(/^sha256:/, '').toLowerCase());
     const rows = await env.DB.prepare(
-      `SELECT store, relpath FROM files WHERE machine_id = ?1 AND (${conditions.join(' OR ')})`,
+      `SELECT id, store, relpath, r2_key, parse_state FROM files WHERE machine_id = ?1 AND (${conditions.join(' OR ')})`,
     )
       .bind(...binds)
-      .all<{ store: string; relpath: string }>();
-    const have = new Set(rows.results.map((r) => `${r.store}\n${r.relpath}`));
-    for (const it of chunk) if (!have.has(`${it.store}\n${it.relpath}`)) missing.push({ store: it.store, relpath: it.relpath });
+      .all<{ id: number; store: string; relpath: string; r2_key: string; parse_state: string }>();
+    const have = new Map(rows.results.map((r) => [`${r.store}\n${r.relpath}`, r]));
+    for (const it of chunk) {
+      const row = have.get(`${it.store}\n${it.relpath}`);
+      if (!row) {
+        missing.push({ store: it.store, relpath: it.relpath });
+        continue;
+      }
+      // The raw bytes are already in R2 — a matching hash means present, but a row stuck at a
+      // non-terminal parse_state (lost/exhausted queue message) would otherwise never get
+      // reindexed: the collector sees "present" and never re-uploads, so nothing else requeues it.
+      if (!TERMINAL_PARSE_STATES.has(row.parse_state)) {
+        await env.PARSE_QUEUE.send({ file_id: row.id, r2_key: row.r2_key, reason: 'upload' });
+      }
+    }
   }
   return Response.json({ missing });
 }

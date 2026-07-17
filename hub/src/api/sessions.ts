@@ -79,7 +79,7 @@ export async function listSessions(url: URL, env: Env): Promise<Response> {
   };
   // A session is "in range" if any part of it overlaps [from, to].
   if (p.get('from')) add((n) => `(ended_at >= ?${n} OR started_at >= ?${n})`, p.get('from'));
-  if (p.get('to')) add((n) => `started_at <= ?${n}`, p.get('to'));
+  if (p.get('to')) add((n) => `started_at <= ?${n}`, normalizeToBound(p.get('to')!));
   if (p.get('harness')) add((n) => `harness = ?${n}`, p.get('harness'));
   if (p.get('machine')) add((n) => `machine_id = ?${n}`, p.get('machine'));
   if (p.get('repo')) add((n) => `repo_url = ?${n}`, p.get('repo'));
@@ -127,6 +127,20 @@ export async function listSessions(url: URL, env: Env): Promise<Response> {
 export function clampLimit(raw: string | null, dflt: number, max: number): number {
   const n = Number(raw);
   return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), max) : dflt;
+}
+
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * A date-only `to` bound (e.g. `2026-07-17`) compared against full ISO timestamps
+ * (`2026-07-17T09:00:00.000Z`) with `<=` lexicographically excludes the entire day, since
+ * any time-of-day suffix sorts after the bare date. Expand it to end-of-day so `to` is
+ * inclusive of the whole day, matching the intuitive "through this date" meaning. `from`
+ * bounds don't need this: a date-only `from` compared with `>=` already includes the whole
+ * day correctly.
+ */
+export function normalizeToBound(raw: string): string {
+  return DATE_ONLY_RE.test(raw) ? `${raw}T23:59:59.999Z` : raw;
 }
 
 function parseRange(header: string): R2Range | undefined {

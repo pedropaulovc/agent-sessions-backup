@@ -26,11 +26,16 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
       await env.DB.prepare("UPDATE files SET parse_state = 'error', parse_error = ?2 WHERE id = ?1")
         .bind(msg.body.file_id, String(e).slice(0, 2000))
         .run();
-      // Otherwise a failed reparse leaves index_state='parsing' forever and /api/v1/status
-      // never surfaces the error. No-op when the file has no session_id (nothing was ever indexed).
+      // Otherwise a failed reparse leaves index_state='parsing' forever and /api/v1/status never
+      // surfaces the error. No-op when the file has no session_id (nothing was ever indexed), and
+      // — guarded — when a DIFFERENT file is already the session's canonical: that means some
+      // other valid copy already indexed successfully and remains the source of truth, so this
+      // failure (of a copy that was never canonical, or has since been superseded) must not
+      // clobber a perfectly good session back to 'error'.
       await env.DB.prepare(
         `UPDATE sessions SET index_state = 'error'
-         WHERE session_id = (SELECT session_id FROM files WHERE id = ?1 AND session_id IS NOT NULL)`,
+         WHERE session_id = (SELECT session_id FROM files WHERE id = ?1 AND session_id IS NOT NULL)
+           AND (canonical_file_id IS NULL OR canonical_file_id = ?1)`,
       )
         .bind(msg.body.file_id)
         .run();
@@ -59,8 +64,14 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
     return;
   }
 
-  const canonicalId = await chooseCanonical(det.sessionId, env);
-  if (canonicalId !== null && canonicalId !== file.id) {
+  const canonical = await chooseCanonical(det.sessionId, env);
+  // Only supersede this file in favor of an ALREADY-PARSED canonical. If the preferred copy is
+  // still pending (or errored), superseding this valid duplicate now — before the preferred copy
+  // has actually proven it can parse — would ack this message and, if the preferred copy then
+  // fails permanently, leave the session unindexed with no valid copy left to recover it from.
+  // Parse this file anyway; if a higher-priority copy parses successfully later, it supersedes
+  // this one at that point (see the supersede-losers step below).
+  if (canonical !== null && canonical.id !== file.id && canonical.parseState === 'parsed') {
     await env.DB.prepare("UPDATE files SET parse_state = 'superseded' WHERE id = ?1").bind(file.id).run();
     return;
   }
@@ -85,6 +96,13 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
 
   await writeSession(parsed, file, env);
   await markParsed(file.id, env, 'parsed', file.size);
+  // A lower-priority duplicate may have parsed earlier (while this, the preferred copy, was
+  // still pending) and become canonical in the interim. writeSession's delete+reinsert already
+  // replaced its session content with this file's; explicitly demote it now so files.parse_state
+  // reflects reality instead of leaving a stale 'parsed' duplicate lying around.
+  await env.DB.prepare("UPDATE files SET parse_state = 'superseded' WHERE session_id = ?1 AND id != ?2 AND parse_state = 'parsed'")
+    .bind(det.sessionId, file.id)
+    .run();
 
   console.log(
     JSON.stringify({
@@ -104,17 +122,19 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
  * Prefer a non-errored copy first (an errored copy only wins if every candidate has
  * errored — otherwise a permanently-failed copy could win canonical selection and get a
  * good duplicate from another machine marked superseded before it's ever parsed), then
- * lowest machine priority, then largest file, then newest mtime. Returns canonical file id.
+ * lowest machine priority, then largest file, then newest mtime. Returns the preferred file
+ * id and its current parse_state — callers must not treat "preferred" as "supersede everyone
+ * else" until that file has actually proven it can parse (parse_state = 'parsed').
  */
-async function chooseCanonical(sessionId: string, env: Env): Promise<number | null> {
+async function chooseCanonical(sessionId: string, env: Env): Promise<{ id: number; parseState: string } | null> {
   const row = await env.DB.prepare(
-    `SELECT f.id FROM files f JOIN machines m ON m.machine_id = f.machine_id
+    `SELECT f.id, f.parse_state FROM files f JOIN machines m ON m.machine_id = f.machine_id
      WHERE f.session_id = ?1 AND f.parse_state != 'superseded'
      ORDER BY (f.parse_state = 'error') ASC, m.priority ASC, f.size DESC, f.mtime DESC, f.id ASC LIMIT 1`,
   )
     .bind(sessionId)
-    .first<{ id: number }>();
-  return row?.id ?? null;
+    .first<{ id: number; parse_state: string }>();
+  return row ? { id: row.id, parseState: row.parse_state } : null;
 }
 
 async function linkSubagentMeta(file: FileRow, env: Env): Promise<void> {

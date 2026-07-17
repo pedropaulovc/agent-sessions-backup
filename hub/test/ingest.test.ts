@@ -297,3 +297,105 @@ describe('canonical selection ignores an errored copy (regression: an errored pr
     expect(rowA2?.parse_state).toBe('superseded');
   });
 });
+
+describe('canonical selection does not supersede a valid duplicate behind a still-pending preferred copy', () => {
+  const CONTENT = [
+    ccUserLine({ uuid: 'canon2-u1', text: 'pending-preferred canonical test' }),
+    ccAssistantLine({ uuid: 'canon2-a1', parentUuid: 'canon2-u1', text: 'pending-preferred canonical response' }),
+  ].join('\n');
+
+  beforeAll(async () => {
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('canon2-a', 'linux', 0) ON CONFLICT (machine_id) DO UPDATE SET priority = 0",
+      ),
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('canon2-b', 'linux', 1) ON CONFLICT (machine_id) DO UPDATE SET priority = 1",
+      ),
+    ]);
+  });
+
+  it('B (worse priority, delivered first) parses and indexes while A (better priority) is still pending; A catching up later supersedes B', async () => {
+    const SESSION_ID = '77777777-8888-4444-8444-000000000001';
+
+    // A is uploaded but its queue message is deliberately never delivered here — it just sits
+    // 'pending', simulating the message not having run yet (not lost, just not-yet-processed).
+    const resA = await putFile('canon2-a', 'claude-projects', `pend-a/${SESSION_ID}.jsonl`, CONTENT);
+    expect(resA.status).toBe(201);
+    const fileIdA = ((await resA.json()) as { file_id: number }).file_id;
+    const r2KeyA = `raw/canon2-a/claude-projects/pend-a/${SESSION_ID}.jsonl`;
+
+    // B's message is delivered first (e.g. its queue consumer just happened to run sooner).
+    const resB = await putFile('canon2-b', 'claude-projects', `pend-b/${SESSION_ID}.jsonl`, CONTENT);
+    expect(resB.status).toBe(201);
+    const fileIdB = ((await resB.json()) as { file_id: number }).file_id;
+    const r2KeyB = `raw/canon2-b/claude-projects/pend-b/${SESSION_ID}.jsonl`;
+    await deliverOne(fileIdB, r2KeyB);
+
+    // B must have parsed and indexed the session — NOT been superseded behind pending A.
+    const rowB1 = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string }>();
+    expect(rowB1?.parse_state).toBe('parsed');
+    const session1 = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(session1?.canonical_file_id).toBe(fileIdB);
+    expect(session1?.index_state).toBe('ready');
+
+    // A eventually delivers and parses (it "is" the preferred candidate for its own processing —
+    // chooseCanonical always resolves to a file's own id when comparing against itself for the
+    // best-priority slot), which supersedes B via the supersede-losers step.
+    await deliverOne(fileIdA, r2KeyA);
+    const rowA = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdA)
+      .first<{ parse_state: string }>();
+    expect(rowA?.parse_state).toBe('parsed');
+    const rowB2 = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string }>();
+    expect(rowB2?.parse_state).toBe('superseded');
+    const session2 = await testEnv.DB.prepare('SELECT canonical_file_id FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number }>();
+    expect(session2?.canonical_file_id).toBe(fileIdA);
+  });
+
+  it('A pending-then-error, B already indexed: the session stays indexed (index_state stays ready, not clobbered to error)', async () => {
+    const SESSION_ID = '77777777-8888-4444-8444-000000000002';
+
+    const resA = await putFile('canon2-a', 'claude-projects', `pend2-a/${SESSION_ID}.jsonl`, CONTENT);
+    expect(resA.status).toBe(201);
+    const fileIdA = ((await resA.json()) as { file_id: number }).file_id;
+    const r2KeyA = `raw/canon2-a/claude-projects/pend2-a/${SESSION_ID}.jsonl`;
+
+    const resB = await putFile('canon2-b', 'claude-projects', `pend2-b/${SESSION_ID}.jsonl`, CONTENT);
+    expect(resB.status).toBe(201);
+    const fileIdB = ((await resB.json()) as { file_id: number }).file_id;
+    const r2KeyB = `raw/canon2-b/claude-projects/pend2-b/${SESSION_ID}.jsonl`;
+    await deliverOne(fileIdB, r2KeyB);
+
+    const session1 = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(session1?.canonical_file_id).toBe(fileIdB);
+    expect(session1?.index_state).toBe('ready');
+
+    // A's R2 object is gone by the time its (still-pending) message finally delivers — it fails,
+    // but it was never the session's actual canonical (B already is), so the session must not
+    // be marked index_state='error' over A's unrelated failure.
+    await testEnv.RAW.delete(r2KeyA);
+    await deliverOne(fileIdA, r2KeyA);
+
+    const rowA = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdA)
+      .first<{ parse_state: string }>();
+    expect(rowA?.parse_state).toBe('error');
+
+    const session2 = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(session2?.canonical_file_id).toBe(fileIdB);
+    expect(session2?.index_state).toBe('ready');
+  });
+});

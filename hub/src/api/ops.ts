@@ -1,5 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
+import { normalizeToBound } from './sessions';
 
 /** POST /api/v1/heartbeat */
 export async function heartbeat(request: Request, env: Env, identity: Identity): Promise<Response> {
@@ -75,7 +76,7 @@ export async function usage(url: URL, env: Env): Promise<Response> {
     filters.push(`u.ts >= ?${binds.length}`);
   }
   if (url.searchParams.get('to')) {
-    binds.push(url.searchParams.get('to'));
+    binds.push(normalizeToBound(url.searchParams.get('to')!));
     filters.push(`u.ts <= ?${binds.length}`);
   }
   const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
@@ -122,7 +123,8 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
         `INSERT INTO files (machine_id, store, relpath, r2_key, size, content_hash, harness, session_id, parse_state)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'pending')
          ON CONFLICT (machine_id, store, relpath) DO UPDATE SET
-           parse_state = 'pending', size = excluded.size, harness = excluded.harness, session_id = excluded.session_id
+           parse_state = 'pending', size = excluded.size, harness = excluded.harness, session_id = excluded.session_id,
+           content_hash = excluded.content_hash
          RETURNING id`,
       )
         .bind(
