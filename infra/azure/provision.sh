@@ -82,20 +82,28 @@ DCE_LOGS_INGESTION=$(az monitor data-collection endpoint show --name "$DCE_NAME"
 echo "OK: $DCE_NAME ($DCE_ID)"
 
 echo ""
-echo "=== Data Collection Rule (Microsoft-OTLP-Logs + Microsoft-OTLP-Traces) ==="
-# UNVERIFIED: this is the riskiest resource in this script. `Microsoft-OTLP-Logs`
-# and `Microsoft-OTLP-Traces` are Microsoft **built-in** stream names (no
-# streamDeclarations needed, unlike Custom-* streams) per Azure Monitor's native
-# OTLP ingestion docs (learn.microsoft.com/azure/azure-monitor/containers/
-# opentelemetry-protocol-ingestion, "Construct endpoint URLs" section) — that doc's
-# own worked example DCR was created via the Azure portal ("Create an Application
-# Insights resource" with "OTLP support: On"), NOT this manual az/rule-file path.
-# If this DCR create call rejects the built-in stream names (e.g. demands a
-# streamDeclaration, or the stream names differ from what's shown here), the
-# fallback is: create ai-agent-backup with "OTLP support: On" via the portal
-# (or `az rest` PATCH once the exact property is confirmed), which auto-provisions
-# an equivalent "managed-ai-..." DCE/DCR pair — copy its endpoint URLs into
-# infra/out/azure.env by hand instead of relying on this script's output.
+echo "=== Data Collection Rule (native OTLP ingestion: logs + traces) ==="
+# UNVERIFIED: this is the riskiest resource in this script — not exercised
+# against a live subscription. Per Microsoft Learn's current manual-OTLP-
+# ingestion ARM template (learn.microsoft.com/azure/azure-monitor/containers/
+# opentelemetry-protocol-ingestion, "Option 2: Manual resource orchestration",
+# backed by github.com/microsoft/AzureMonitorCommunity's
+# OTLP_DCE_DCR_ARM_Template.txt), the DCR must declare an explicit
+# `directDataSources` entry per signal (there is no such thing as a bare
+# built-in "Microsoft-OTLP-Logs"/"Microsoft-OTLP-Traces" *stream* usable
+# directly in dataFlows — those names are only the OTLP *ingestion route*
+# segment in the URL the worker POSTs to; see OTLP_LOGS_ENDPOINT below). The
+# actual DCR-internal stream ids the directDataSources declare — and that
+# dataFlows must route to a destination — are `Microsoft-OTel-Logs` for logs
+# and `Microsoft-OTel-Traces-{Spans,Events,Resources}` for traces (three
+# separate stream ids for one signal; the community template always lists all
+# three together). Each directDataSources entry also needs a `references`
+# block naming an Application Insights resource to enrich against (we already
+# create ai-agent-backup for this). If DCR creation rejects this shape or the
+# stream ids have since changed, the fallback is: create ai-agent-backup with
+# "OTLP support: On" via the portal instead (which auto-provisions an
+# equivalent "managed-ai-..." DCE/DCR pair) and copy its endpoint URLs into
+# infra/out/azure.env by hand rather than trusting this script's output.
 if ! az monitor data-collection rule show --name "$DCR_NAME" --resource-group "$RG_NAME" --only-show-errors >/dev/null 2>&1; then
     DCR_RULE_FILE=$(mktemp)
     trap 'rm -f "$DCR_RULE_FILE"' EXIT
@@ -104,14 +112,41 @@ if ! az monitor data-collection rule show --name "$DCR_NAME" --resource-group "$
   "location": "$LOCATION",
   "properties": {
     "dataCollectionEndpointId": "$DCE_ID",
+    "references": {
+      "applicationInsights": [
+        { "resourceId": "$AI_RESOURCE_ID", "name": "applicationInsightsResource" }
+      ]
+    },
+    "directDataSources": {
+      "otelLogs": [
+        {
+          "streams": ["Microsoft-OTel-Logs"],
+          "enrichWithResourceAttributes": ["*"],
+          "enrichWithReference": "applicationInsightsResource",
+          "replaceResourceIdWithReference": true,
+          "name": "otelLogsDataSourceDirect"
+        }
+      ],
+      "otelTraces": [
+        {
+          "streams": ["Microsoft-OTel-Traces-Spans", "Microsoft-OTel-Traces-Events", "Microsoft-OTel-Traces-Resources"],
+          "enrichWithResourceAttributes": ["*"],
+          "enrichWithReference": "applicationInsightsResource",
+          "replaceResourceIdWithReference": true,
+          "name": "otelTracesDataSourceDirect"
+        }
+      ]
+    },
     "destinations": {
       "logAnalytics": [
         { "workspaceResourceId": "$LAW_ID", "name": "lawDestination" }
       ]
     },
     "dataFlows": [
-      { "streams": ["Microsoft-OTLP-Logs"], "destinations": ["lawDestination"] },
-      { "streams": ["Microsoft-OTLP-Traces"], "destinations": ["lawDestination"] }
+      {
+        "streams": ["Microsoft-OTel-Logs", "Microsoft-OTel-Traces-Spans", "Microsoft-OTel-Traces-Events", "Microsoft-OTel-Traces-Resources"],
+        "destinations": ["lawDestination"]
+      }
     ]
   }
 }
@@ -123,6 +158,12 @@ EOF
 fi
 DCR_ID=$(az monitor data-collection rule show --name "$DCR_NAME" --resource-group "$RG_NAME" --query id -o tsv)
 DCR_IMMUTABLE_ID=$(az monitor data-collection rule show --name "$DCR_NAME" --resource-group "$RG_NAME" --query immutableId -o tsv)
+# The URL route segment is "Microsoft-OTLP-{Logs,Traces}" (the OTLP wire
+# protocol endpoint name), NOT the DCR-internal "Microsoft-OTel-*" stream ids
+# declared above — those are two different names for two different layers.
+# Casing matches a known-working sibling deployment (youtube-mirror's
+# federation.md), which uses "dataCollectionRules" (capital C, R); Microsoft's
+# own docs are inconsistently cased on this point.
 OTLP_LOGS_ENDPOINT="${DCE_LOGS_INGESTION}/dataCollectionRules/${DCR_IMMUTABLE_ID}/streams/Microsoft-OTLP-Logs/otlp/v1/logs"
 OTLP_TRACES_ENDPOINT="${DCE_LOGS_INGESTION}/dataCollectionRules/${DCR_IMMUTABLE_ID}/streams/Microsoft-OTLP-Traces/otlp/v1/traces"
 echo "OK: $DCR_NAME ($DCR_ID)"
@@ -139,10 +180,26 @@ echo "OK: $MI_NAME (clientId=$MI_CLIENT_ID)"
 
 echo ""
 echo "=== Federated Credential ==="
-az identity federated-credential show --name "$FED_CRED_NAME" --identity-name "$MI_NAME" --resource-group "$RG_NAME" --only-show-errors >/dev/null 2>&1 \
-    || az identity federated-credential create --name "$FED_CRED_NAME" --identity-name "$MI_NAME" --resource-group "$RG_NAME" \
+# Not a pure show-or-create: a re-run with a different <issuer-url> (e.g. the
+# issuer worker got redeployed to a new workers.dev subdomain) must actually
+# update the existing credential, or Entra keeps trusting the OLD issuer and
+# every token exchange starts failing with no error surfaced here.
+EXISTING_ISSUER=$(az identity federated-credential show --name "$FED_CRED_NAME" --identity-name "$MI_NAME" --resource-group "$RG_NAME" --query issuer -o tsv 2>/dev/null || true)
+if [ -z "$EXISTING_ISSUER" ]; then
+    az identity federated-credential create --name "$FED_CRED_NAME" --identity-name "$MI_NAME" --resource-group "$RG_NAME" \
         --issuer "$ISSUER_URL" --subject "$FED_SUBJECT" --audiences "api://AzureADTokenExchange" --only-show-errors >/dev/null
-echo "OK: $FED_CRED_NAME (issuer=$ISSUER_URL, subject=$FED_SUBJECT)"
+    echo "OK: $FED_CRED_NAME created (issuer=$ISSUER_URL, subject=$FED_SUBJECT)"
+else
+    EXISTING_SUBJECT=$(az identity federated-credential show --name "$FED_CRED_NAME" --identity-name "$MI_NAME" --resource-group "$RG_NAME" --query subject -o tsv)
+    if [ "$EXISTING_ISSUER" != "$ISSUER_URL" ] || [ "$EXISTING_SUBJECT" != "$FED_SUBJECT" ]; then
+        echo "Drift detected: existing issuer=$EXISTING_ISSUER subject=$EXISTING_SUBJECT — updating to issuer=$ISSUER_URL subject=$FED_SUBJECT"
+        az identity federated-credential update --name "$FED_CRED_NAME" --identity-name "$MI_NAME" --resource-group "$RG_NAME" \
+            --issuer "$ISSUER_URL" --subject "$FED_SUBJECT" --audiences "api://AzureADTokenExchange" --only-show-errors >/dev/null
+        echo "OK: $FED_CRED_NAME updated (issuer=$ISSUER_URL, subject=$FED_SUBJECT)"
+    else
+        echo "OK: $FED_CRED_NAME already matches (issuer=$ISSUER_URL, subject=$FED_SUBJECT)"
+    fi
+fi
 
 echo ""
 echo "=== Role Assignment (Monitoring Metrics Publisher on the DCR) ==="
