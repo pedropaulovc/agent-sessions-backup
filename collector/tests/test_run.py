@@ -446,6 +446,73 @@ def test_doctor_fails_on_walk_error(tmp_path, hub, tmp_env, monkeypatch):
     assert rc == 1  # traversal error => incomplete scan => nonzero exit
 
 
+def test_materialize_unlinks_body_when_write_fails(tmp_path, hub, monkeypatch):
+    # A failed body write must not leave a *.body temp behind in the scanner tmp dir.
+    root = tmp_path / "claude"
+    root.mkdir()
+    cfg = _cfg(hub, root)
+    scanner = Scanner([])
+    try:
+        real_fdopen = os.fdopen
+
+        def exploding_fdopen(fd, *a, **k):
+            f = real_fdopen(fd, *a, **k)
+            f.write = lambda _data: (_ for _ in ()).throw(OSError(28, "No space left on device"))
+            return f
+
+        monkeypatch.setattr(run_mod.os, "fdopen", exploding_fdopen)
+        with pytest.raises(OSError):
+            run_mod._materialize(scanner, b"payload")
+        assert list(scanner.tmp_root.glob("*.body")) == []  # partial temp cleaned up on failure
+    finally:
+        scanner.close()
+
+
+def test_doctor_cleans_up_db_snapshots_mid_scan(tmp_path, hub, tmp_env, monkeypatch):
+    # doctor snapshots real DBs while counting them; each snapshot must be deleted as it goes
+    # so a store full of DBs doesn't blow up temp usage during a preflight.
+    path = config.config_path()
+    config.enroll(hub.url, dev=True, path=path, machine_id="m1")
+    claude = tmp_path / "home" / ".claude"
+    claude.mkdir(parents=True)
+    db = claude / "sessions.sqlite"
+    c = sqlite3.connect(db)
+    c.execute("CREATE TABLE t(x)")
+    c.commit()
+    c.close()
+
+    snap_paths = []
+    real_cleanup = run_mod._cleanup_snapshot
+
+    def spy(item):
+        if item.is_snapshot:
+            snap_paths.append(item.source_path)
+        real_cleanup(item)
+
+    monkeypatch.setattr(run_mod, "_cleanup_snapshot", spy)
+    rc = run_mod.cmd_doctor(types.SimpleNamespace(config=str(path)))
+    assert rc == 0
+    assert snap_paths, "the .sqlite DB should have been snapshotted during doctor"
+    for p in snap_paths:
+        assert not os.path.exists(p)  # each snapshot deleted mid-scan, not left to accumulate
+
+
+def test_backfill_nonzero_when_db_snapshot_locked(tmp_path, hub, monkeypatch):
+    # A DB we skip because its snapshot timed out was NOT captured this run -> incomplete ->
+    # backfill must exit nonzero even though nothing errored outright.
+    import agent_collector.scanner as scanner_mod
+    root = tmp_path / "claude"
+    root.mkdir()
+    (root / "live.sqlite").write_bytes(b"")
+
+    monkeypatch.setattr(scanner_mod, "_snapshot_sqlite",
+                        lambda src, dst, deadline_s: scanner_mod.SNAPSHOT_LOCKED)
+    cfg = _cfg(hub, root)
+    with State(tmp_path / "state.db") as st:
+        rc = run_mod._do_backfill(cfg, st, concurrency=2, dry_run=False)
+    assert rc == 1  # snapshot_timeout event gates the exit code
+
+
 def test_doctor_reports_old_curl_as_fail(tmp_path, hub, tmp_env, monkeypatch, capsys):
     import agent_collector.transport as transport_mod
     monkeypatch.setattr(transport_mod.Transport, "_probe_curl_version",

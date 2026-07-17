@@ -97,16 +97,42 @@ def install(interval: int = 15) -> int:
         )
         return 1
     if shutil.which("loginctl"):
-        subprocess.run(["loginctl", "enable-linger"], capture_output=True, text=True)
-        print("enabled linger so the timer runs while logged out")
+        linger = subprocess.run(["loginctl", "enable-linger"], capture_output=True, text=True)
+        if linger.returncode == 0:
+            print("enabled linger so the timer runs while logged out")
+        else:
+            # The timer is installed and active, so this is not a hard failure (rc stays 0),
+            # but without linger it only fires while a login session is open. Say so plainly.
+            print(
+                "[warn] could not enable linger: "
+                f"{linger.stderr.strip()}\n"
+                "  The timer will only run while you are logged in. To fix, retry:\n"
+                "  loginctl enable-linger",
+                file=sys.stderr,
+            )
     return 0
 
 
 def uninstall() -> int:
-    _systemctl("disable", "--now", "agent-collector.timer")
+    # Disable first. If systemctl can't disable the timer, do NOT delete the unit files: a
+    # leftover-but-disabled unit is recoverable, but deleting files while the timer stays
+    # enabled leaves systemd referencing units that no longer exist. Fail loudly instead.
+    if not _systemctl("disable", "--now", "agent-collector.timer"):
+        print(
+            "[FAIL] could not disable the timer via systemctl --user; kept unit files. "
+            "Finish manually:\n"
+            "  systemctl --user disable --now agent-collector.timer\n"
+            "  rm -f " + " ".join(str(u) for u in (_timer_path(), _service_path())) + "\n"
+            "  systemctl --user daemon-reload",
+            file=sys.stderr,
+        )
+        return 1
     for unit in (_timer_path(), _service_path()):
         if unit.exists():
             unit.unlink()
             print(f"removed {unit}")
-    _systemctl("daemon-reload")
+    if not _systemctl("daemon-reload"):
+        print("[warn] removed unit files but daemon-reload failed; run "
+              "'systemctl --user daemon-reload' manually", file=sys.stderr)
+        return 1
     return 0

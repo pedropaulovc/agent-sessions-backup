@@ -216,6 +216,28 @@ def test_snapshot_failed_db_skipped_with_event_garbage_raw_captured(tmp_path, mo
     assert "snapshot_failed" in {e["code"] for e in scanner.events}
 
 
+def test_failed_snapshot_dst_is_cleaned_up(tmp_path, monkeypatch):
+    # sqlite3.connect(dst) creates the dst file before backup runs, so a LOCKED/FAILED
+    # outcome leaves a partial snapshot behind unless _make_item unlinks it. Model that: the
+    # fake writes dst then reports failure, and no snap-*.sqlite may survive the scan.
+    root = tmp_path / ".claude"
+    root.mkdir()
+    (root / "real.sqlite").write_bytes(b"")
+
+    def fake_snapshot(src, dst, deadline_s):
+        dst.write_bytes(b"partial snapshot")  # what sqlite3.connect(dst) would leave behind
+        return SNAPSHOT_FAILED
+
+    monkeypatch.setattr(scanner_mod, "_snapshot_sqlite", fake_snapshot)
+    scanner = Scanner([])
+    tmp_root = scanner.tmp_root
+    try:
+        list(scanner.scan_store("claude", root))
+        assert list(tmp_root.glob("snap-*.sqlite")) == []  # dropped mid-scan, not accumulated
+    finally:
+        scanner.close()
+
+
 def test_snapshot_outcomes_ok_and_not_a_db(tmp_path):
     db = tmp_path / "real.sqlite"
     c = sqlite3.connect(db)

@@ -88,6 +88,13 @@ class ScanItem:
     is_snapshot: bool
 
 
+def _safe_unlink(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _snapshot_sqlite(src: Path, dst: Path, deadline_s: float = SNAPSHOT_DEADLINE_S) -> str:
     """Bounded consistent snapshot via the backup API. Returns one of SNAPSHOT_OK /
     SNAPSHOT_NOT_A_DB / SNAPSHOT_LOCKED / SNAPSHOT_FAILED.
@@ -244,7 +251,9 @@ class Scanner:
             if outcome in (SNAPSHOT_LOCKED, SNAPSHOT_FAILED):
                 # A real DB we couldn't snapshot this run (locked, or backup failed e.g. dst
                 # full): skip it — never raw-upload a live, WAL-inconsistent database. Retried
-                # next run; surfaced in the heartbeat.
+                # next run; surfaced in the heartbeat. Drop the partial snapshot dst that
+                # sqlite3.connect created so failed snapshots don't accumulate in tmp_root.
+                _safe_unlink(dst)
                 code, why = (
                     ("snapshot_timeout", "SQLite locked; snapshot timed out")
                     if outcome == SNAPSHOT_LOCKED

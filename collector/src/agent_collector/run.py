@@ -24,6 +24,13 @@ from .state import State, OverlapLock, now_iso, state_path
 from .transport import Transport, DevAuth, MtlsAuth, Upload, MIN_CURL_VERSION
 
 
+# Warn-level scanner event codes that still mean a file was NOT captured this run (the DB was
+# locked or its snapshot failed, so we skipped it). They gate backfill's exit code so an
+# operator doesn't treat an incomplete pass as done. windows_mount_skipped is deliberately
+# excluded: dropping /mnt/<drive> roots is expected policy, not an incomplete capture.
+_SKIPPED_CODES = frozenset({"snapshot_timeout", "snapshot_failed"})
+
+
 def build_auth(cfg: config_mod.Config):
     if cfg.auth == "dev":
         return DevAuth(cfg.machine_id)
@@ -49,8 +56,12 @@ def mtime_iso(mtime_ns: int) -> str:
 
 def _materialize(scanner: Scanner, data: bytes) -> str:
     fd, path = tempfile.mkstemp(dir=scanner.tmp_root, suffix=".body")
-    with os.fdopen(fd, "wb") as f:
-        f.write(data)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+    except OSError:
+        _safe_unlink(path)
+        raise
     return path
 
 
@@ -284,9 +295,11 @@ def _do_backfill(cfg, st: State, concurrency: int, dry_run: bool) -> int:
     print(json.dumps(summary))
     # Nonzero when the backfill was incomplete, so scripts/operators don't move on: upload
     # failures, per-file read/staging errors, a files/check failure (the only source of truth
-    # in dry-run), or an error-level traversal event.
+    # in dry-run), an error-level traversal event, or a DB we skipped because its snapshot
+    # timed out / failed (those files never got captured this run — that's incomplete too).
     incomplete = (totals["failed"] or totals["read_errors"] or totals["check_failures"]
-                  or any(e["level"] == "error" for e in events))
+                  or any(e["level"] == "error" for e in events)
+                  or any(e["code"] in _SKIPPED_CODES for e in events))
     return 1 if incomplete else 0
 
 
@@ -467,7 +480,10 @@ def cmd_doctor(args) -> int:
             if not root.exists():
                 print(f"[warn] store {store!r} root missing: {root}")
                 continue
-            included = sum(1 for _ in scanner.scan_store(store, root))
+            included = 0
+            for item in scanner.scan_store(store, root):
+                included += 1
+                _cleanup_snapshot(item)  # doctor snapshots DBs too; delete each snap as we go
             excluded = sum(scanner.excluded_counts.get(store, {}).values())
             print(f"[ok]   store {store!r}: {included} files to capture, {excluded} excluded ({root})")
             for pat, n in scanner.top_excluded(store, 5):

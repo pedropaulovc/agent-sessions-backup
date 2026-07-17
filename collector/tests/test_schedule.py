@@ -1,5 +1,6 @@
 import re
 import sys
+import types
 
 from agent_collector import schedule
 from agent_collector.schedule import systemd, taskscheduler
@@ -103,3 +104,35 @@ def test_systemd_install_writes_units_under_xdg_and_fails_on_activation(tmp_path
     # unit files written where systemctl --user actually looks (XDG_CONFIG_HOME/systemd/user)
     assert (tmp_path / "systemd" / "user" / "agent-collector.timer").exists()
     assert (tmp_path / "systemd" / "user" / "agent-collector.service").exists()
+
+
+def test_systemd_install_warns_when_enable_linger_fails(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setattr(systemd, "_systemctl", lambda *a: True)  # timer activates fine
+    monkeypatch.setattr(systemd.shutil, "which", lambda _n: "/usr/bin/loginctl")
+    monkeypatch.setattr(systemd.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(returncode=1, stderr="Not authorized"))
+    rc = systemd.install(15)
+    # Linger is best-effort: the timer is active, so a linger failure must NOT fail install.
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "could not enable linger" in err
+    assert "only run while you are logged in" in err
+    assert "loginctl enable-linger" in err
+
+
+def test_systemd_uninstall_keeps_files_and_fails_when_disable_fails(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+    timer, service = systemd._timer_path(), systemd._service_path()
+    timer.parent.mkdir(parents=True, exist_ok=True)
+    timer.write_text("[Timer]\n")
+    service.write_text("[Service]\n")
+    monkeypatch.setattr(systemd, "_systemctl", lambda *a: False)  # disable fails
+    rc = systemd.uninstall()
+    assert rc == 1
+    # Files must be KEPT: deleting units while the timer stays enabled dangles the reference.
+    assert timer.exists()
+    assert service.exists()
+    err = capsys.readouterr().err
+    assert "could not disable the timer" in err
+    assert "kept unit files" in err
