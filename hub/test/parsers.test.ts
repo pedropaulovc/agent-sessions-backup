@@ -114,6 +114,35 @@ describe('parseClaudeCode', () => {
     expect(block.text!.length).toBe(16 * 1024);
     expect(block.truncated).toBe(true);
   });
+
+  it('preserves a message whose content is ONLY an unrecognized block type instead of dropping the turn (regression: server_tool_use etc. yielded nothing, so the blockless turn vanished from sessions + FTS)', async () => {
+    const line = JSON.stringify({
+      parentUuid: null,
+      isSidechain: false,
+      cwd: '/home/tester/src/demo',
+      sessionId: CC_SESSION_ID,
+      version: '2.1.99',
+      gitBranch: 'main',
+      type: 'assistant',
+      requestId: 'req_unknown_block',
+      message: {
+        id: 'msg_unknown_block',
+        role: 'assistant',
+        model: 'claude-test-1',
+        content: [{ type: 'server_tool_use', id: 'stu_1', name: 'web_search', input: { query: 'flurbo' } }],
+      },
+      uuid: 'unknown-block-a1',
+      timestamp: '2026-07-01T10:00:05.000Z',
+    });
+
+    const s = await parseClaudeCode(readJsonlLines(toStream([line])), CC_SESSION_ID);
+    expect(s.turns).toHaveLength(1);
+    expect(s.turns[0]!.blocks).toHaveLength(1);
+    expect(s.turns[0]!.blocks[0]!.type).toBe('text');
+    expect(s.turns[0]!.blocks[0]!.text).toContain('server_tool_use');
+    expect(s.turns[0]!.blocks[0]!.text).toContain('web_search');
+    expect(s.stats.skippedLineTypes['content:server_tool_use']).toBe(1);
+  });
 });
 
 describe('parseCodex', () => {
@@ -203,5 +232,28 @@ describe('parseCodex', () => {
     expect(texts).toHaveLength(2);
     expect(texts).toContain(firstText);
     expect(texts).toContain(secondText);
+  });
+
+  it('dedupes when event_msg arrives before the equivalent response_item/message (regression: response_item path recorded but never checked seenMessageHashes)', async () => {
+    const text = 'the widget test passes now, in this exact wording';
+    const lines = [
+      { timestamp: '2026-07-05T10:00:00.000Z', type: 'session_meta', payload: { session_id: CODEX_SESSION_ID, cwd: '/x' } },
+      { timestamp: '2026-07-05T10:00:01.000Z', type: 'turn_context', payload: { turn_id: 't1', model: 'gpt-test-5' } },
+      { timestamp: '2026-07-05T10:00:02.000Z', type: 'event_msg', payload: { type: 'agent_message', message: text } },
+      {
+        timestamp: '2026-07-05T10:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+    ].map((o) => JSON.stringify(o));
+
+    const s = await parseCodex(readJsonlLines(toStream(lines)), CODEX_SESSION_ID);
+    const texts = s.turns.flatMap((t) => t.blocks.filter((b) => b.type === 'text').map((b) => b.text));
+    expect(texts).toEqual([text]);
   });
 });

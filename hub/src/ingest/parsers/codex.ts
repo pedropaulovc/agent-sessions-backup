@@ -136,7 +136,10 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       case 'message': {
         const role = (str(p.role) as Role) ?? 'assistant';
         const text = contentText(p.content);
-        if (!text) break;
+        // Same message can arrive as event_msg/user_message|agent_message first and as this
+        // response_item second (or vice versa, handled in handleEventMsg) — check before
+        // recording, not just record, so whichever form arrives second doesn't double-index.
+        if (!text || seenMessageHashes.has(messageKey(text))) break;
         rememberMessage(text);
         const turn = openTurn(role === 'developer' ? 'developer' : role, ts, turnId);
         const c = cap(text, CAPS.text);

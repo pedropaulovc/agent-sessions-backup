@@ -524,4 +524,15 @@ describe('subagent meta linking, both arrival orders', () => {
 
     expect(await parentToolUseId(SUBAGENT_B)).toBe('toolu_meta_second');
   });
+
+  it('the API response for a linked subagent session carries parentToolUseId (regression: loadNormalized reparsed the JSONL and never hydrated it from the sessions row)', async () => {
+    expect(await parentToolUseId(SUBAGENT_A)).toBe('toolu_meta_first');
+
+    const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${SUBAGENT_A}`, {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { session: { parentToolUseId?: string } };
+    expect(body.session.parentToolUseId).toBe('toolu_meta_first');
+  });
 });

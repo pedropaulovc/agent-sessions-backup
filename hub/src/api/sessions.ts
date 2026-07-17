@@ -17,11 +17,11 @@ interface SessionRow {
 /** Build the NormalizedSession by stream-parsing the canonical R2 object (D1 holds metadata only). */
 export async function loadNormalized(sessionId: string, env: Env): Promise<NormalizedSession | null> {
   const file = await env.DB.prepare(
-    `SELECT f.store, f.relpath, f.r2_key FROM sessions s JOIN files f ON f.id = s.canonical_file_id
+    `SELECT f.store, f.relpath, f.r2_key, s.parent_tool_use_id FROM sessions s JOIN files f ON f.id = s.canonical_file_id
      WHERE s.session_id = ?1`,
   )
     .bind(sessionId)
-    .first<{ store: string; relpath: string; r2_key: string }>();
+    .first<{ store: string; relpath: string; r2_key: string; parent_tool_use_id: string | null }>();
   if (!file) return null;
   const obj = await env.RAW.get(file.r2_key);
   if (!obj) return null;
@@ -30,6 +30,11 @@ export async function loadNormalized(sessionId: string, env: Env): Promise<Norma
   const parsed =
     det.harness === 'codex' ? await parseCodex(lines, sessionId) : await parseClaudeCode(lines, sessionId);
   if (det.parentSessionId) parsed.parentSessionId = det.parentSessionId;
+  // The queue consumer links parent_tool_use_id onto the sessions row (via the sibling
+  // .meta.json), but a plain reparse of the JSONL here never reproduces it — the transcript
+  // itself doesn't carry its own tool_use_id. Without this, /api/v1/sessions/{subagent} and
+  // bulk NDJSON silently omit it even after the consumer successfully linked it.
+  if (file.parent_tool_use_id) parsed.parentToolUseId = file.parent_tool_use_id;
   return parsed;
 }
 

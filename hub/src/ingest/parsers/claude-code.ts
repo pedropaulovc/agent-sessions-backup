@@ -93,7 +93,7 @@ export async function parseClaudeCode(
     }
 
     const content = msg?.content ?? o.content;
-    for (const block of blocksFrom(content, o, line)) turn.blocks.push(block);
+    for (const block of blocksFrom(content, o, line, session.stats)) turn.blocks.push(block);
 
     if (type === 'system' && turn.blocks.length === 0) {
       const text = str(o.content) ?? str(o.summary);
@@ -119,7 +119,12 @@ export async function parseClaudeCode(
   return session;
 }
 
-function* blocksFrom(content: unknown, envelope: Record<string, unknown>, line: JsonlLine): Generator<NormalizedBlock> {
+function* blocksFrom(
+  content: unknown,
+  envelope: Record<string, unknown>,
+  line: JsonlLine,
+  stats: NormalizedSession['stats'],
+): Generator<NormalizedBlock> {
   const at = { byteStart: line.byteStart, byteLen: line.byteLen };
   const list: unknown[] =
     typeof content === 'string' ? [{ type: 'text', text: content }] : Array.isArray(content) ? content : [];
@@ -178,9 +183,17 @@ function* blocksFrom(content: unknown, envelope: Record<string, unknown>, line: 
         yield { type: 'document', mediaType: str(source?.media_type), ...at };
         break;
       }
-      default:
-        // Unknown block types (server_tool_use, …): index their JSON shape cheaply.
+      default: {
+        // Unknown block types (server_tool_use, …): a message whose content is ONLY one of
+        // these would otherwise yield no blocks, and the caller drops blockless/usage-less
+        // turns entirely — silently disappearing that turn from sessions and FTS. Preserve
+        // the raw shape cheaply instead of dropping it.
+        const key = `content:${String(raw.type)}`;
+        stats.skippedLineTypes[key] = (stats.skippedLineTypes[key] ?? 0) + 1;
+        const c = cap(safeJson(raw), CAPS.tool_use);
+        yield { type: 'text', text: c.text, truncated: c.truncated, ...at };
         break;
+      }
     }
   }
 }
