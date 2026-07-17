@@ -143,6 +143,13 @@ async function forwardOtlp(
 
   const upstreamBody = await upstream.text();
   if (!upstream.ok) {
+    // This worker has no observability.logs/traces destinations of its own
+    // (see hub/wrangler.telemetry-gateway.jsonc) and must not — it IS the
+    // /v1/{logs,traces} sink, so exporting its own logs back to itself would
+    // be a recursion loop. This line is visible via `wrangler tail`/the
+    // Cloudflare dashboard only; it never reaches Azure/OTelLogs, so
+    // infra/azure/alerts/collector-errors.kql cannot see it (see that file's
+    // header for how gateway-side failures are actually detected).
     console.log(JSON.stringify({
       event: "collector.event",
       level: "error",
