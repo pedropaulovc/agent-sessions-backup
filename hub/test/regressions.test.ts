@@ -83,6 +83,28 @@ describe('clampLimit', () => {
   });
 });
 
+describe('the local queue simulator does not auto-deliver PARSE_QUEUE messages on its own timer (regression: a real, uncontrolled background flush raced tests that deliberately leave a row pending, e.g. CI intermittently indexing a file the test never explicitly delivered)', () => {
+  it('an uploaded file stays parse_state=pending across a real-time window well past the local queue\'s default auto-flush, since nothing here ever calls drainQueue/deliverOne', async () => {
+    const content = `${ccUserLine({ uuid: 'noauto-u1', text: 'no automatic delivery test content' })}\n`;
+    const relpath = 'noauto-demo/f0000000-0000-4000-8000-0000000000aa.jsonl';
+    const res = await putFile('claude-projects', relpath, content);
+    expect(res.status).toBe(201);
+    const fileId = ((await res.json()) as { file_id: number }).file_id;
+
+    // The local queue simulator was observed auto-flushing a pending message well under 1.5s of
+    // real wall-clock time when the consumer's max_batch_timeout is left at its (short) local
+    // default. vitest.config.ts overrides queueConsumers.parse to the config maximums
+    // (maxBatchTimeout: 60s, maxBatchSize: 100) specifically so this can't happen — this test
+    // waits past the previously-observed auto-flush window to prove that override is in effect.
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    const row = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(row?.parse_state).toBe('pending');
+  }, 10000);
+});
+
 describe('search/listSessions limit clamp over HTTP (regression: NaN/negative used to reach SQL as LIMIT NaN / LIMIT -1)', () => {
   it('search: a non-numeric limit no longer 500s', async () => {
     const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=zzznonexistentzzz&limit=abc', {
