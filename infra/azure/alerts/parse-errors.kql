@@ -1,0 +1,18 @@
+// Fires when the parse queue consumer logs a parse.error event within the last
+// 15 minutes (malformed raw session file, unexpected harness format, etc — see
+// hub/migrations/0001_init.sql's `parse_error` column, which M1's queue
+// consumer is expected to also mirror into a structured console.log).
+//
+// See missed-heartbeat.kql for the OTelLogs/Body-as-JSON assumption this query
+// shares. ASSUMPTION TO VERIFY AT M4 DEPLOY: confirm the table/column names
+// once real data flows, and confirm the M1 parse consumer actually emits
+// `{ event: "parse.error", ... }` (as opposed to only writing parse_error to D1
+// without a matching structured log — if so, this alert needs a different
+// signal, e.g. a scheduled query against D1 via a small status-reporting
+// endpoint rather than Log Analytics).
+
+OTelLogs
+| where TimeGenerated > ago(15m)
+| extend body = todynamic(Body)
+| where body.event == "parse.error"
+| project TimeGenerated, body

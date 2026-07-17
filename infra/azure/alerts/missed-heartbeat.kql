@@ -1,0 +1,31 @@
+// Absence alert: fires when a machine that heartbeated in the last 14 days has
+// gone quiet for the last 72 hours (collector down, network partition, TPM cert
+// expired, etc).
+//
+// The hub emits structured JSON via console.log({ event: "hub.heartbeat", machine_id: ... }).
+// Workers observability ships this as an OTLP log record whose Body is that JSON
+// string. This DCR (infra/azure/provision.sh) lands OTLP logs in the Log
+// Analytics **OTelLogs** table (the native-OTLP-ingestion schema; confirmed
+// empirically for the sibling youtube-mirror project's identical DCR/OTLP-Logs
+// setup — see its memory/telemetry-destinations-shared-account.md).
+//
+// ASSUMPTION TO VERIFY AT M4 DEPLOY: once real data flows, confirm (a) the
+// table is actually OTelLogs (not the classic AppTraces/traces table — that
+// schema only applies to the Application-Insights-Breeze SDK ingestion path,
+// which this project does NOT use), (b) the JSON body lands in a column named
+// Body (vs. Message or LogMessage), and (c) `machine_id` is the field name the
+// M1 heartbeat handler actually stamps into the log payload. Adjust column/field
+// names below to match.
+
+let heartbeats = OTelLogs
+    | where todynamic(Body).event == "hub.heartbeat"
+    | extend machine_id = tostring(todynamic(Body).machine_id);
+let seen_recently = heartbeats
+    | where TimeGenerated > ago(14d)
+    | summarize by machine_id;
+let seen_last_72h = heartbeats
+    | where TimeGenerated > ago(72h)
+    | summarize by machine_id;
+seen_recently
+| join kind=leftanti seen_last_72h on machine_id
+| project machine_id
