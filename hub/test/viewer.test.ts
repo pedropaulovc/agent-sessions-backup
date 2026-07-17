@@ -2,7 +2,6 @@ import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import worker from '../src/index';
 import { viewerRoute } from '../src/viewer/router';
-import { previewBearerOk } from '../src/auth/identity';
 import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures';
 import { blobVersionOf } from '../src/viewer/session';
 
@@ -554,45 +553,19 @@ describe('viewer', () => {
     expect(html).toContain('sessions ·');
   });
 
-  it('returns 403 in production (auth not yet configured)', async () => {
+  it('redirects to /login in production when unauthenticated', async () => {
     const url = new URL('https://sessions.vza.net/');
     const res = await viewerRoute(new Request(url.toString()), url, { ENVIRONMENT: 'production' } as Env);
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
   });
 
-  it('gates the preview viewer behind the DEV_AUTH bearer (publicly reachable previews)', async () => {
+  it('redirects to /login in preview when unauthenticated (publicly reachable previews)', async () => {
     const url = new URL('https://sessions.vza.net/');
-    const previewEnv = { ...testEnv, ENVIRONMENT: 'preview', DEV_AUTH: 'preview-secret-123' } as unknown as Env;
-
-    // No header → 401.
-    const noHeader = await viewerRoute(new Request(url.toString()), url, previewEnv);
-    expect(noHeader.status).toBe(401);
-
-    // Wrong bearer → 401.
-    const wrong = await viewerRoute(
-      new Request(url.toString(), { headers: { authorization: 'Bearer nope' } }),
-      url,
-      previewEnv,
-    );
-    expect(wrong.status).toBe(401);
-
-    // Correct bearer → the page serves.
-    const ok = await viewerRoute(
-      new Request(url.toString(), { headers: { authorization: 'Bearer preview-secret-123' } }),
-      url,
-      previewEnv,
-    );
-    expect(ok.status).toBe(200);
-    expect(await ok.text()).toContain('Recent sessions');
-
-    // Missing/empty DEV_AUTH secret denies even with a bearer header.
-    const noSecret = { ...testEnv, ENVIRONMENT: 'preview', DEV_AUTH: undefined } as unknown as Env;
-    const denied = await viewerRoute(
-      new Request(url.toString(), { headers: { authorization: 'Bearer preview-secret-123' } }),
-      url,
-      noSecret,
-    );
-    expect(denied.status).toBe(401);
+    const previewEnv = { ...testEnv, ENVIRONMENT: 'preview' } as unknown as Env;
+    const res = await viewerRoute(new Request(url.toString()), url, previewEnv);
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/login');
   });
 
   it('leaves the development viewer open (never publicly reachable)', async () => {
@@ -602,61 +575,17 @@ describe('viewer', () => {
     expect(res.status).toBe(200);
   });
 
-  it('fails closed on an unrecognized or missing ENVIRONMENT (mirrors the API allowlist)', async () => {
+  it('fails closed on an unrecognized or missing ENVIRONMENT (any non-development value is gated)', async () => {
     const url = new URL('https://sessions.vza.net/');
-    // Even with a DEV_AUTH bearer, a non-allowlisted ENVIRONMENT never serves.
-    const bogus = { ...testEnv, ENVIRONMENT: 'staging', DEV_AUTH: 'x' } as unknown as Env;
-    const bogusRes = await viewerRoute(
-      new Request(url.toString(), { headers: { authorization: 'Bearer x' } }),
-      url,
-      bogus,
-    );
-    expect(bogusRes.status).toBe(403);
+    // A non-allowlisted ENVIRONMENT is treated like preview/production: no session → redirect to /login.
+    const bogus = { ...testEnv, ENVIRONMENT: 'staging' } as unknown as Env;
+    const bogusRes = await viewerRoute(new Request(url.toString()), url, bogus);
+    expect(bogusRes.status).toBe(302);
+    expect(bogusRes.headers.get('location')).toBe('/login');
 
     const missing = { ...testEnv, ENVIRONMENT: undefined } as unknown as Env;
     const missingRes = await viewerRoute(new Request(url.toString()), url, missing);
-    expect(missingRes.status).toBe(403);
-  });
-
-  it('issues a browser cookie on bearer auth so preview navigations/subresources stay authorized', async () => {
-    const url = new URL('https://sessions.vza.net/');
-    const secret = 'preview-secret-123';
-    const previewEnv = { ...testEnv, ENVIRONMENT: 'preview', DEV_AUTH: secret } as unknown as Env;
-
-    // First request with the bearer serves AND sets the persistence cookie.
-    const first = await viewerRoute(
-      new Request(url.toString(), { headers: { authorization: `Bearer ${secret}` } }),
-      url,
-      previewEnv,
-    );
-    expect(first.status).toBe(200);
-    const setCookie = first.headers.get('set-cookie') ?? '';
-    expect(setCookie).toContain(`__Host-preview-auth=${secret}`);
-    expect(setCookie).toContain('HttpOnly');
-    expect(setCookie).toContain('Secure');
-    expect(setCookie).toContain('SameSite=Strict');
-    expect(setCookie).toContain('Path=/');
-
-    // Follow-up carrying ONLY the cookie (no Authorization header) still serves.
-    const followUp = await viewerRoute(
-      new Request(url.toString(), { headers: { cookie: `__Host-preview-auth=${secret}` } }),
-      url,
-      previewEnv,
-    );
-    expect(followUp.status).toBe(200);
-    // A cookie-authorized request does not re-issue the cookie (only the bearer path does).
-    expect(followUp.headers.get('set-cookie')).toBeNull();
-
-    // Wrong cookie value → 401.
-    const badCookie = await viewerRoute(
-      new Request(url.toString(), { headers: { cookie: '__Host-preview-auth=wrong' } }),
-      url,
-      previewEnv,
-    );
-    expect(badCookie.status).toBe(401);
-
-    // The machine API gate (previewBearerOk) ignores the cookie — bearer header only.
-    expect(previewBearerOk(new Request(url.toString(), { headers: { cookie: `__Host-preview-auth=${secret}` } }), previewEnv)).toBe(false);
-    expect(previewBearerOk(new Request(url.toString(), { headers: { authorization: `Bearer ${secret}` } }), previewEnv)).toBe(true);
+    expect(missingRes.status).toBe(302);
+    expect(missingRes.headers.get('location')).toBe('/login');
   });
 });
