@@ -33,6 +33,33 @@ def _curl_config_quote(value: str) -> str:
     """
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
+
+def _auth_config_directives(auth_args: list[str], q) -> list[str]:
+    """Translate an auth strategy's command-line curl args into curl --config directives.
+
+    curl's config file names options by their long form without dashes (`-H "x"` ->
+    `header = "x"`, `--cert P` -> `cert = "P"`), so serializing the flags verbatim as
+    `header = ...` (the old behavior) turned `--cert`/`--key` into bogus header lines and
+    the parallel batch upload ran without a client cert. Every auth flag we emit takes
+    exactly one value, so consume the args in (flag, value) pairs and map generically:
+    `-H`/`--header` -> `header`, any other `--long` -> `long`. Unknown short flags raise
+    rather than silently mis-serialize again."""
+    directives: list[str] = []
+    i = 0
+    while i < len(auth_args):
+        flag = auth_args[i]
+        value = auth_args[i + 1] if i + 1 < len(auth_args) else ""
+        if flag in ("-H", "--header"):
+            name = "header"
+        elif flag.startswith("--"):
+            name = flag[2:]
+        else:
+            raise ValueError(f"cannot serialize curl auth flag {flag!r} into a --config directive")
+        directives.append(f'{name} = "{q(value)}"')
+        i += 2
+    return directives
+
+
 BACKOFF = (0.5, 2.0, 8.0)
 BATCH_SIZE = 50
 
@@ -271,10 +298,7 @@ class Transport:
             ]
             for k, v in up.headers.items():
                 block.append(f'header = "{q(k)}: {q(v)}"')
-            for arg in self.auth.curl_args():
-                if arg == "-H":
-                    continue
-                block.append(f'header = "{q(arg)}"')
+            block.extend(_auth_config_directives(self.auth.curl_args(), q))
             blocks.append("\n".join(block))
         return "\n--next\n".join(blocks) + "\n"
 

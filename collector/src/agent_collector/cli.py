@@ -33,6 +33,17 @@ def _cmd_enroll(args) -> int:
     return 0
 
 
+def _cmd_machine_id(_args) -> int:
+    # The id the collector actually stamps on upload URLs: the config's machine_id if enrolled,
+    # else the computed default. Enrollment (enroll-cert.sh) must sign a cert for THIS id or
+    # uploads fail machine_mismatch (e.g. default is host-wsl on WSL, not host-linux).
+    try:
+        print(config_mod.load().machine_id)
+    except FileNotFoundError:
+        print(config_mod.default_machine_id())
+    return 0
+
+
 def _cmd_install(args) -> int:
     return schedule.install(args.interval)
 
@@ -58,6 +69,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_enroll.add_argument("--client-cert", help="mTLS: path to the PEM client cert (from enroll-cert.sh)")
     p_enroll.add_argument("--client-key", help="mTLS: path to the client private key (from enroll-cert.sh)")
     p_enroll.set_defaults(func=_cmd_enroll)
+
+    p_mid = sub.add_parser("machine-id", help="print this machine's collector id (config override or computed default)")
+    p_mid.set_defaults(func=_cmd_machine_id)
 
     p_install = sub.add_parser("install", help="install periodic scheduler")
     p_install.add_argument("--interval", type=int, default=15, help="minutes between runs")

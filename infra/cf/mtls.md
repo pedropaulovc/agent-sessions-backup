@@ -77,24 +77,29 @@ edge before it reaches the Worker.
 
 ## Step 3 — enroll each machine (repeatable)
 
-Run the helper with the enrollment token. For this box (WSL2, software key):
+Run the helper with the enrollment token. With no machine_id argument it enrolls the id
+the collector actually uses — `agent-collector machine-id` (config override, else the
+computed default). This matters: on WSL the default is `<host>-wsl`, not `<host>-linux`,
+and a cert signed for the wrong id 401s every upload as `machine_mismatch`.
 
 ```
 CF_API_TOKEN=<token from above> \
-  infra/cf/enroll-cert.sh $(hostname)-linux --admin --out ~/.config/agent-collector
+  infra/cf/enroll-cert.sh --admin --out ~/.config/agent-collector
 ```
 
-It generates an EC P-256 software key + CSR, has the managed CA sign it, computes the
-SHA-256 fingerprint the way `cf.tlsClientAuth.certFingerprintSHA256` reports it, and
-upserts the `machines` row via `wrangler d1 execute --remote`. `--admin` sets
-`is_admin=1` (needed for `POST /api/v1/admin/reindex`); drop it for ordinary machines.
-The private key never leaves the box; the signed cert is not secret.
+It resolves the machine_id, generates an EC P-256 software key + CSR, has the managed CA
+sign it, computes the SHA-256 fingerprint the way `cf.tlsClientAuth.certFingerprintSHA256`
+reports it, and upserts the `machines` row via `wrangler d1 execute --remote`. `--admin`
+sets `is_admin=1` (needed for `POST /api/v1/admin/reindex`); drop it for ordinary
+machines. Pass the id explicitly as the first arg only on a box where the collector isn't
+installed yet. The private key never leaves the box; the signed cert is not secret.
 
-Verify end-to-end:
+Verify end-to-end (the cert/key basenames use the resolved machine_id):
 
 ```
-curl --cert ~/.config/agent-collector/$(hostname)-linux.client.pem \
-     --key  ~/.config/agent-collector/$(hostname)-linux.client.key \
+MID=$(agent-collector machine-id)
+curl --cert ~/.config/agent-collector/$MID.client.pem \
+     --key  ~/.config/agent-collector/$MID.client.key \
      https://api.sessions.vza.net/api/v1/machines
 ```
 
@@ -104,8 +109,8 @@ wrote):
 
 ```
 agent-collector enroll --hub https://api.sessions.vza.net \
-  --client-cert ~/.config/agent-collector/$(hostname)-linux.client.pem \
-  --client-key  ~/.config/agent-collector/$(hostname)-linux.client.key
+  --client-cert ~/.config/agent-collector/$MID.client.pem \
+  --client-key  ~/.config/agent-collector/$MID.client.key
 ```
 
 (or set `auth`, `client_cert_path`, and `client_key_path` in `config.toml` by hand). The

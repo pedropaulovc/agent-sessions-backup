@@ -67,6 +67,56 @@
     // custom header Authorization: Bearer <INGEST_BEARER>. Then reference the
     // destination names above. Full steps + trap (destinations are shared with
     // every worker on this Cloudflare account) in infra/cf/telemetry.md.
+  },
+  // PR preview isolation. Workers Builds runs non-production branches with
+  // `wrangler versions upload`, which uses the TOP-LEVEL bindings unless an env is
+  // selected — i.e. a preview would run unreviewed PR code against PRODUCTION D1/R2/
+  // KV/queues. Non-production Builds MUST set the deploy command to `--env preview`
+  // (see infra/cf/deploy.md). This block redeclares EVERY binding against the -preview
+  // resource set — wrangler does NOT inherit bindings into named environments, so each
+  // must be restated — and pins ENVIRONMENT='preview', which turns on the DEV_AUTH
+  // bearer gate (src/auth/identity.ts) so the public *.workers.dev preview URL is not
+  // unauthenticated. `--env preview` also names the worker `sessions-hub-preview`, a
+  // separate Worker from production. No routes/custom domains: previews serve from their
+  // workers.dev version URL, where zone mTLS/WAF don't apply (hence the bearer gate).
+  // DEV_AUTH is a per-env secret: `wrangler secret put DEV_AUTH --env preview`.
+  "env": {
+    "preview": {
+      // Empty on purpose: unlike bindings, `routes` IS inherited into named environments,
+      // so without this a preview deploy would REASSIGN the production custom domains
+      // (api./sessions.vza.net) to sessions-hub-preview. Previews serve from workers.dev.
+      "routes": [],
+      "vars": {
+        "ENVIRONMENT": "preview",
+        "API_HOST": "api.sessions.vza.net",
+        "VIEWER_HOST": "sessions.vza.net"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "sessions-index-preview",
+          "database_id": "8f2cd488-0060-4f32-8025-f5b461c9fe0a",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "r2_buckets": [{ "binding": "RAW", "bucket_name": "agent-sessions-raw-preview" }],
+      "kv_namespaces": [{ "binding": "KV", "id": "eda3b8a8ba1e416fa65e98d0c266a4bb" }],
+      "queues": {
+        "producers": [{ "binding": "PARSE_QUEUE", "queue": "parse-preview" }],
+        "consumers": [
+          {
+            "queue": "parse-preview",
+            "max_batch_size": 5,
+            "max_retries": 3,
+            "max_concurrency": 1,
+            "dead_letter_queue": "parse-dlq-preview"
+          }
+        ]
+      },
+      "triggers": { "crons": ["*/15 * * * *", "30 4 * * *"] },
+      "observability": { "enabled": true, "head_sampling_rate": 1 }
+    }
   }
-  // secrets: SETUP_TOKEN (passkey bootstrap), CF_API_TOKEN (cert renewal)
+  // secrets: SETUP_TOKEN (passkey bootstrap), CF_API_TOKEN (cert renewal);
+  // preview env: DEV_AUTH (bearer gate) via `wrangler secret put DEV_AUTH --env preview`
 }

@@ -29,7 +29,13 @@ ACCOUNT_ID="18ef3246e9f36d1560485ef53889c0ab" # Pedro@vezza.com.br's Account
 DB_NAME="sessions-index"
 API="https://api.cloudflare.com/client/v4"
 
-MACHINE_ID="${1:?usage: enroll-cert.sh <machine_id> [--admin] [--out DIR]}"; shift || true
+# machine_id: optional leading positional. If omitted, derive it from the collector itself
+# (`agent-collector machine-id`) so the cert is signed for the EXACT id the collector stamps
+# on upload URLs — on WSL that's <host>-wsl, not <host>-linux, and a mismatch 401s as
+# machine_mismatch. Pass it explicitly only when enrolling a box where the collector isn't
+# installed yet.
+MACHINE_ID=""
+if [ $# -gt 0 ] && [ "${1#-}" = "$1" ]; then MACHINE_ID="$1"; shift; fi
 IS_ADMIN=0
 OUT_DIR="."
 while [ $# -gt 0 ]; do
@@ -39,6 +45,12 @@ while [ $# -gt 0 ]; do
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
+if [ -z "$MACHINE_ID" ]; then
+  MACHINE_ID="$(agent-collector machine-id 2>/dev/null)" || true
+  [ -n "$MACHINE_ID" ] || { echo "no machine_id: pass it as the first arg, or install agent-collector so 'agent-collector machine-id' works" >&2; exit 2; }
+fi
+# os facet mirrors the platform suffix the collector encodes into machine_id (host-<platform>).
+OS_TAG="${MACHINE_ID##*-}"
 : "${CF_API_TOKEN:?set CF_API_TOKEN to a zone-scoped token with Client Certificates:Edit}"
 
 mkdir -p "$OUT_DIR"
@@ -77,7 +89,7 @@ echo "==> cert fingerprint (SHA-256): $FP"
 echo "==> registering machine '$MACHINE_ID' (is_admin=$IS_ADMIN) in $DB_NAME"
 HOSTNAME_VAL="$(hostname)"
 SQL="INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, key_protection, is_admin)
-     VALUES ('$MACHINE_ID', 'linux', '$HOSTNAME_VAL', '$FP', 'software', $IS_ADMIN)
+     VALUES ('$MACHINE_ID', '$OS_TAG', '$HOSTNAME_VAL', '$FP', 'software', $IS_ADMIN)
      ON CONFLICT (machine_id) DO UPDATE SET cert_fp_sha256=excluded.cert_fp_sha256,
        key_protection=excluded.key_protection, is_admin=excluded.is_admin;"
 CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID" npx --yes wrangler d1 execute "$DB_NAME" --remote --command "$SQL"

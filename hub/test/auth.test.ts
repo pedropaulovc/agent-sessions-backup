@@ -96,11 +96,17 @@ describe('machineIdentity', () => {
 
     // The fix: certVerified stays 'SUCCESS' for a revoked cert, so without the certRevoked
     // check the still-enrolled row would keep authenticating. It must fall through to anonymous.
-    const revoked = await machineIdentity(
+    // '1' is Cloudflare's documented revoked value; 'true' is accepted too (doc-drift belt).
+    const revoked1 = await machineIdentity(
+      reqWithCert({ certVerified: 'SUCCESS', certRevoked: '1', certFingerprintSHA256: fp }),
+      prod,
+    );
+    expect(revoked1).toEqual({ kind: 'anonymous' });
+    const revokedTrue = await machineIdentity(
       reqWithCert({ certVerified: 'SUCCESS', certRevoked: 'true', certFingerprintSHA256: fp }),
       prod,
     );
-    expect(revoked).toEqual({ kind: 'anonymous' });
+    expect(revokedTrue).toEqual({ kind: 'anonymous' });
   });
 });
 

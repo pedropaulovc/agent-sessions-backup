@@ -109,6 +109,43 @@ def test_mtls_missing_key_file_errors(tmp_path):
         MtlsAuth(client_cert_path=str(cert), client_key_path=str(tmp_path / "absent.key")).curl_args()
 
 
+def test_auth_config_directives_maps_options_not_headers():
+    from agent_collector.transport import _auth_config_directives
+
+    q = lambda s: s  # noqa: E731 — identity quoter for the assertion
+    # mTLS options become curl config directives, NOT headers (the bug was header = "--cert").
+    assert _auth_config_directives(["--cert", "/c", "--key", "/k"], q) == ['cert = "/c"', 'key = "/k"']
+    # the header path (DevAuth) still maps to a header directive.
+    assert _auth_config_directives(["-H", "x-dev-machine: m1"], q) == ['header = "x-dev-machine: m1"']
+    # an unmapped short flag fails loudly rather than silently mis-serializing again.
+    with pytest.raises(ValueError):
+        _auth_config_directives(["-x", "v"], q)
+
+
+def test_build_upload_config_mtls_emits_cert_key_not_bogus_headers(tmp_path):
+    cert = tmp_path / "box.client.pem"
+    key = tmp_path / "box.client.key"
+    cert.write_text("cert")
+    key.write_text("key")
+    t = Transport(MtlsAuth(client_cert_path=str(cert), client_key_path=str(key)))
+    up = Upload("https://api.example/x", str(tmp_path / "body"), {"x-content-hash": "sha256:ab"})
+    cfg = t._build_upload_config([up])
+    assert f'cert = "{cert}"' in cfg
+    assert f'key = "{key}"' in cfg
+    # Regression guard: pre-fix these went through the "everything is a header" path.
+    assert 'header = "--cert"' not in cfg
+    assert 'header = "--key"' not in cfg
+    # Real request headers still serialize as headers (positive control for the header path).
+    assert 'header = "x-content-hash: sha256:ab"' in cfg
+
+
+def test_build_upload_config_dev_still_emits_header(tmp_path):
+    t = Transport(DevAuth("m1"))
+    up = Upload("https://api.example/x", str(tmp_path / "body"), {})
+    cfg = t._build_upload_config([up])
+    assert 'header = "x-dev-machine: m1"' in cfg
+
+
 def test_parse_curl_version():
     p = transport_mod._parse_curl_version
     assert p("curl 7.68.0 (x86_64-pc-linux-gnu) libcurl/7.68.0") == (7, 68, 0)
