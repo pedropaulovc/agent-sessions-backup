@@ -103,6 +103,28 @@ echo "Wrote $ENV_FILE (pre-deploy, URL=$GATEWAY_URL)"
 
 cd "$REPO_ROOT/hub"
 
+# First-deploy bootstrap. `wrangler secret put` fails (error 10007) if the worker
+# has never been deployed on this account, so on a fresh account — or after the
+# worker was deleted — we must deploy once BEFORE setting any secret. The
+# fresh-setup path only appears to "just work" today because the worker already
+# exists. `wrangler deployments list` is the existence probe: it exits 0 for a
+# deployed worker and non-zero for an unknown worker name (verified both ways
+# against wrangler 4.111 — existing gateway config → exit 0; a scratch config
+# with a nonexistent name → exit 1). The initial deploy carries no secrets, which
+# is fine: a brand-new worker has no traffic (no observability destinations point
+# at it yet) until this script finishes wiring it. The bearer is already
+# persisted to cf-observability.env above, so this ordering adds no bearer-loss
+# window. (`wrangler deploy --secrets-file` exists in 4.111 and could fold
+# secrets into a single atomic deploy, but the fresh-worker path can't be
+# validated here without creating a throwaway worker, so we use the probe +
+# bootstrap-deploy sequence, which is fully verifiable.)
+if npx wrangler deployments list --config "$CONFIG" >/dev/null 2>&1; then
+    echo "Gateway worker exists — setting secrets directly."
+else
+    echo "Gateway worker not found — bootstrapping with an initial (secret-less) deploy before setting secrets."
+    npx wrangler deploy --config "$CONFIG"
+fi
+
 # Optional: (re)set the OIDC signing private key. Piped via stdin, never on the
 # command line / interactive prompt (avoids scrollback capture).
 if [ -n "${OIDC_KEY_FILE:-}" ]; then
