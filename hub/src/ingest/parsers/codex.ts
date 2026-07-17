@@ -36,7 +36,10 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
   const seenMessageHashes = new Set<string>();
 
   const flush = () => {
-    if (current && current.blocks.length > 0) session.turns.push(current);
+    // A turn can be usage-only: token_count is the only billable event before EOF/role change
+    // (e.g. every response item in it was skipped — encrypted-reasoning-only, unsupported
+    // subtype). The later filter explicitly keeps t.usage turns, so flush must not drop them.
+    if (current && (current.blocks.length > 0 || current.usage)) session.turns.push(current);
     current = undefined;
   };
   const openTurn = (role: Role, ts: string | undefined, turnId: string | undefined) => {

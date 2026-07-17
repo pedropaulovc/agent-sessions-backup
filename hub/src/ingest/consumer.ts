@@ -100,12 +100,17 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
   );
 }
 
-/** Prefer lowest machine priority, then largest file, then newest mtime. Returns canonical file id. */
+/**
+ * Prefer a non-errored copy first (an errored copy only wins if every candidate has
+ * errored — otherwise a permanently-failed copy could win canonical selection and get a
+ * good duplicate from another machine marked superseded before it's ever parsed), then
+ * lowest machine priority, then largest file, then newest mtime. Returns canonical file id.
+ */
 async function chooseCanonical(sessionId: string, env: Env): Promise<number | null> {
   const row = await env.DB.prepare(
     `SELECT f.id FROM files f JOIN machines m ON m.machine_id = f.machine_id
      WHERE f.session_id = ?1 AND f.parse_state != 'superseded'
-     ORDER BY m.priority ASC, f.size DESC, f.mtime DESC, f.id ASC LIMIT 1`,
+     ORDER BY (f.parse_state = 'error') ASC, m.priority ASC, f.size DESC, f.mtime DESC, f.id ASC LIMIT 1`,
   )
     .bind(sessionId)
     .first<{ id: number }>();

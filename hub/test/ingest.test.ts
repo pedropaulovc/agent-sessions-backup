@@ -42,6 +42,23 @@ async function drainQueue(): Promise<void> {
   await worker.queue({ queue: 'parse', messages, ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>, testEnv);
 }
 
+/** Deliver a single, explicitly-specified message — for tests that need to redeliver a
+ * particular file regardless of its current parse_state (drainQueue only picks up 'pending'). */
+async function deliverOne(fileId: number, r2Key: string): Promise<void> {
+  const message = {
+    id: String(fileId),
+    timestamp: new Date(),
+    attempts: 1,
+    body: { file_id: fileId, r2_key: r2Key, reason: 'upload' as const },
+    ack() {},
+    retry() {},
+  };
+  await worker.queue(
+    { queue: 'parse', messages: [message], ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>,
+    testEnv,
+  );
+}
+
 const SESSION_CONTENT = [
   ...ccNoiseLines(),
   ccUserLine({ uuid: 'u1', text: 'find the melting point of gallium in our notes' }),
@@ -214,5 +231,69 @@ describe('ingest pipeline end-to-end', () => {
       body: 'x',
     });
     expect(res.status).toBe(401);
+  });
+});
+
+describe('canonical selection ignores an errored copy (regression: an errored preferred-priority copy used to win, superseding a good duplicate unparsed)', () => {
+  const CANON_SESSION_ID = '66666666-7777-4444-8444-999999999999';
+  const CONTENT = [
+    ccUserLine({ uuid: 'canon-u1', text: 'canonical selection test' }),
+    ccAssistantLine({ uuid: 'canon-a1', parentUuid: 'canon-u1', text: 'canonical selection response' }),
+  ].join('\n');
+
+  beforeAll(async () => {
+    // Lower priority number wins ties — machine A would normally beat machine B — but A's copy
+    // will end up errored, so B must win despite its worse (higher) priority number.
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('canon-a', 'linux', 0) ON CONFLICT (machine_id) DO UPDATE SET priority = 0",
+      ),
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('canon-b', 'linux', 1) ON CONFLICT (machine_id) DO UPDATE SET priority = 1",
+      ),
+    ]);
+  });
+
+  it('a valid duplicate from a worse-priority machine becomes canonical and parses when the better-priority copy is errored', async () => {
+    // Machine A uploads first; its R2 object is deleted before the queue ever delivers it, so
+    // its one and only parse attempt genuinely fails with r2_object_missing (parse_state='error'),
+    // mirroring a permanently-failed copy after retries are exhausted.
+    const resA = await putFile('canon-a', 'claude-projects', `demo-a/${CANON_SESSION_ID}.jsonl`, CONTENT);
+    expect(resA.status).toBe(201);
+    const fileIdA = ((await resA.json()) as { file_id: number }).file_id;
+    const r2KeyA = `raw/canon-a/claude-projects/demo-a/${CANON_SESSION_ID}.jsonl`;
+    await testEnv.RAW.delete(r2KeyA);
+    await drainQueue();
+
+    const rowA1 = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdA)
+      .first<{ parse_state: string }>();
+    expect(rowA1?.parse_state).toBe('error');
+
+    // Machine B uploads a valid duplicate of the same session.
+    const resB = await putFile('canon-b', 'claude-projects', `demo-b/${CANON_SESSION_ID}.jsonl`, CONTENT);
+    expect(resB.status).toBe(201);
+    const fileIdB = ((await resB.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    const rowB = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string }>();
+    expect(rowB?.parse_state).toBe('parsed');
+
+    const session = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(CANON_SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(session?.canonical_file_id).toBe(fileIdB);
+    expect(session?.index_state).toBe('ready');
+
+    // A retry of A's message (Cloudflare Queues would redeliver it automatically up to
+    // max_retries) now sees B as the non-errored canonical and marks A superseded — chooseCanonical
+    // runs before the R2 fetch, so this doesn't depend on A's (deleted) object at all.
+    await deliverOne(fileIdA, r2KeyA);
+    const rowA2 = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdA)
+      .first<{ parse_state: string }>();
+    expect(rowA2?.parse_state).toBe('superseded');
   });
 });

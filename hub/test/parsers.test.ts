@@ -160,4 +160,28 @@ describe('parseCodex', () => {
 
     expect(s.turns[4]!.compaction?.kind).toBe('codex-window');
   });
+
+  it('keeps a usage-only turn when token_count is the only billable event before EOF (regression: flush dropped 0-block turns even with usage set)', async () => {
+    const lines = [
+      { timestamp: '2026-07-03T10:00:00.000Z', type: 'session_meta', payload: { session_id: CODEX_SESSION_ID, cwd: '/x' } },
+      { timestamp: '2026-07-03T10:00:01.000Z', type: 'turn_context', payload: { turn_id: 't1', model: 'gpt-test-3' } },
+      {
+        timestamp: '2026-07-03T10:00:02.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            last_token_usage: { input_tokens: 42, output_tokens: 7, reasoning_output_tokens: 3, cached_input_tokens: 1 },
+          },
+        },
+      },
+    ].map((o) => JSON.stringify(o));
+
+    const s = await parseCodex(readJsonlLines(toStream(lines)), CODEX_SESSION_ID);
+    expect(s.turns).toHaveLength(1);
+    expect(s.turns[0]!.blocks).toHaveLength(0);
+    expect(s.turns[0]!.usage?.inputTokens).toBe(42);
+    expect(s.turns[0]!.usage?.reasoningTokens).toBe(3);
+    expect(s.turns[0]!.usage?.cacheReadTokens).toBe(1);
+  });
 });
