@@ -276,6 +276,51 @@ describe('upload unchanged fast-path re-enqueues stuck files', () => {
       .first<{ index_state: string }>();
     expect(recoveredSession?.index_state).toBe('ready');
   });
+
+  it('re-upload of a hash-matching row that is TERMINAL (already parsed) but whose R2 object was lost also restores the object and re-parses', async () => {
+    const TERMINAL_RESTORE_SESSION_ID = '44444444-5555-4444-8444-777777777777';
+    const terminalRelpath = `terminal-restore-demo/${TERMINAL_RESTORE_SESSION_ID}.jsonl`;
+    const terminalContent = `${ccUserLine({ uuid: 'tr-u1', text: 'terminal restore test content' })}\n`;
+
+    const first = await putFile('claude-projects', terminalRelpath, terminalContent);
+    expect(first.status).toBe(201);
+    const fileId = ((await first.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    const parsedRow = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(parsedRow?.parse_state).toBe('parsed'); // terminal — the row itself is NOT touched
+
+    // Lose the backing R2 object without touching the D1 row at all: parse_state stays 'parsed'.
+    const r2Key = `raw/${MACHINE}/claude-projects/${terminalRelpath}`;
+    await testEnv.RAW.delete(r2Key);
+    expect(await testEnv.RAW.head(r2Key)).toBeNull();
+
+    // A resync (e.g. the collector's periodic files/check) re-sends the identical bytes. The
+    // terminal unchanged path must still notice the object is gone and restore + reparse it,
+    // not just return the cheap "nothing to do" response it used to for a terminal row.
+    const reupload = await putFile('claude-projects', terminalRelpath, terminalContent);
+    expect(reupload.status).toBe(200);
+    const reuploadBody = (await reupload.json()) as { status: string; requeued?: boolean; restored?: boolean };
+    expect(reuploadBody.status).toBe('unchanged');
+    expect(reuploadBody.requeued).toBe(true);
+    expect(reuploadBody.restored).toBe(true);
+
+    expect(await testEnv.RAW.head(r2Key)).not.toBeNull();
+
+    await deliverOne(fileId, r2Key);
+
+    const recoveredFile = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(recoveredFile?.parse_state).toBe('parsed');
+
+    const recoveredSession = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+      .bind(TERMINAL_RESTORE_SESSION_ID)
+      .first<{ index_state: string }>();
+    expect(recoveredSession?.index_state).toBe('ready');
+  });
 });
 
 describe('failed reparse surfaces as session index_state=error', () => {
@@ -576,6 +621,54 @@ describe('files/check re-enqueues unindexed matches instead of only reporting th
     } finally {
       sendSpy.mockRestore();
     }
+  });
+
+  it('a matched row that is terminal (parsed) but whose R2 object was lost is reported MISSING, not present', async () => {
+    const CHECK_SESSION_ID3 = 'd0000000-0000-4000-8000-000000000005';
+    const content = `${ccUserLine({ uuid: 'ck3-u1', text: 'files check lost-object test' })}\n`;
+    const relpath = `check-demo/${CHECK_SESSION_ID3}.jsonl`;
+    const res = await putFile('claude-projects', relpath, content);
+    expect(res.status).toBe(201);
+    await drainQueue();
+    const fileId = ((await res.json()) as { file_id: number }).file_id;
+    const parsedRow = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(parsedRow?.parse_state).toBe('parsed'); // terminal
+
+    // Lose the backing R2 object without touching the D1 row at all — a matched, terminal row
+    // that would previously have been reported present regardless.
+    const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
+    await testEnv.RAW.delete(r2Key);
+
+    const sha256 = await sha256Hex(new TextEncoder().encode(content));
+    const checkRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+      method: 'POST',
+      headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
+      body: JSON.stringify({ files: [{ store: 'claude-projects', relpath, sha256: `sha256:${sha256}` }] }),
+    });
+    expect(checkRes.status).toBe(200);
+    const body = (await checkRes.json()) as { missing: Array<{ store: string; relpath: string }> };
+    expect(body.missing).toEqual([{ store: 'claude-projects', relpath }]);
+  });
+
+  it('a matched row whose R2 object is intact is still reported present (positive control for the head check)', async () => {
+    const CHECK_SESSION_ID4 = 'd0000000-0000-4000-8000-000000000006';
+    const content = `${ccUserLine({ uuid: 'ck4-u1', text: 'files check intact-object test' })}\n`;
+    const relpath = `check-demo/${CHECK_SESSION_ID4}.jsonl`;
+    const res = await putFile('claude-projects', relpath, content);
+    expect(res.status).toBe(201);
+    await drainQueue();
+
+    const sha256 = await sha256Hex(new TextEncoder().encode(content));
+    const checkRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+      method: 'POST',
+      headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
+      body: JSON.stringify({ files: [{ store: 'claude-projects', relpath, sha256: `sha256:${sha256}` }] }),
+    });
+    expect(checkRes.status).toBe(200);
+    const body = (await checkRes.json()) as { missing: Array<{ store: string; relpath: string }> };
+    expect(body.missing).toHaveLength(0);
   });
 });
 

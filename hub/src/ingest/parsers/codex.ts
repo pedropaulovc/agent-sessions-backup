@@ -263,6 +263,11 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       }
       case 'context_compacted': {
         flush();
+        // Otherwise a token_count arriving after this marker (the compaction request's own
+        // usage) would reuse the pre-compaction reply as its target — silently overwriting that
+        // turn's real usage instead of landing on a fresh usage-only turn. Same reset flush()
+        // already does for a new user turn (see openTurn above).
+        lastAssistant = undefined;
         session.turns.push({
           index: session.turns.length,
           onMainPath: true,

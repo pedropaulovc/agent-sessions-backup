@@ -433,4 +433,58 @@ describe('parseCodex', () => {
     expect(secondAssistant.blocks).toHaveLength(0); // usage-only turn, no indexable block
     expect(secondAssistant.usage?.inputTokens).toBe(200);
   });
+
+  it('a token_count after a context_compacted marker opens a fresh usage-only turn instead of overwriting the pre-compaction reply (regression: lastAssistant stayed stale across the compaction marker)', async () => {
+    const lines = [
+      { timestamp: '2026-07-09T10:00:00.000Z', type: 'session_meta', payload: { session_id: CODEX_SESSION_ID, cwd: '/x' } },
+      { timestamp: '2026-07-09T10:00:01.000Z', type: 'turn_context', payload: { turn_id: 't1', model: 'gpt-test-9' } },
+      {
+        timestamp: '2026-07-09T10:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'compaction test question' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      {
+        timestamp: '2026-07-09T10:00:03.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'pre-compaction answer' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      // Usage A — belongs to the reply above.
+      {
+        timestamp: '2026-07-09T10:00:04.000Z',
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 10 } } },
+      },
+      { timestamp: '2026-07-09T10:00:05.000Z', type: 'event_msg', payload: { type: 'context_compacted' } },
+      // Usage B — the compaction request's own usage, with no indexable reply of its own.
+      {
+        timestamp: '2026-07-09T10:00:06.000Z',
+        type: 'event_msg',
+        payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 200, output_tokens: 20 } } },
+      },
+    ].map((o) => JSON.stringify(o));
+
+    const s = await parseCodex(readJsonlLines(toStream(lines)), CODEX_SESSION_ID);
+    const roles = s.turns.map((t) => t.role);
+    expect(roles).toEqual(['user', 'assistant', 'system', 'assistant']);
+
+    const preCompactionReply = s.turns[1]!;
+    expect(preCompactionReply.blocks.map((b) => b.text)).toEqual(['pre-compaction answer']);
+    expect(preCompactionReply.usage?.inputTokens).toBe(100); // untouched by the post-compaction token_count
+
+    expect(s.turns[2]!.compaction?.kind).toBe('codex-window');
+
+    const postCompactionUsage = s.turns[3]!;
+    expect(postCompactionUsage.blocks).toHaveLength(0); // usage-only turn, no indexable block
+    expect(postCompactionUsage.usage?.inputTokens).toBe(200);
+  });
 });

@@ -41,24 +41,25 @@ export async function putFile(
     .bind(machineId, store, relpath)
     .first<{ id: number; content_hash: string; parse_state: string; r2_key: string }>();
   if (existing && existing.content_hash === sha256) {
-    // A matching hash normally means nothing to do, but if the row never finished
-    // indexing (a dropped/failed queue message), the file would otherwise sit
-    // unindexed forever while files/check reports it as present. Re-enqueue.
-    if (!TERMINAL_PARSE_STATES.has(existing.parse_state)) {
-      // A non-terminal state (most commonly 'error') can mean the row's own raw R2 object is
-      // missing or corrupt — e.g. the flagship r2_object_missing parse failure. Just requeuing
-      // would retry against the same absent object and fail again, even though the collector
-      // just handed us a full copy of the bytes. Confined to this rare recovery branch (one
-      // extra R2 head call) so the common unchanged/terminal path stays a single D1 read.
-      let restored = false;
-      if (!(await env.RAW.head(existing.r2_key))) {
-        try {
-          await env.RAW.put(existing.r2_key, request.body, { sha256 });
-        } catch (e) {
-          return Response.json({ error: 'checksum_or_write_failure', detail: String(e) }, { status: 400 });
-        }
-        restored = true;
+    // A matching hash normally means nothing to do — but the raw R2 object can be lost or
+    // corrupt independent of parse_state (e.g. the flagship r2_object_missing failure, or R2
+    // pruned out from under us), even for a row already 'parsed'. Head it on every same-hash
+    // resync, not just non-terminal ones, and restore from the request body if it's gone — this
+    // path only fires on a resync (not steady-state uploads), so the extra R2 op is cheap
+    // relative to leaving /raw and normalized session loads permanently broken.
+    let restored = false;
+    if (!(await env.RAW.head(existing.r2_key))) {
+      try {
+        await env.RAW.put(existing.r2_key, request.body, { sha256 });
+      } catch (e) {
+        return Response.json({ error: 'checksum_or_write_failure', detail: String(e) }, { status: 400 });
       }
+      restored = true;
+    }
+    // A non-terminal state (a dropped/failed queue message) never finished indexing in the
+    // first place; a just-restored object needs its (possibly different) bytes revalidated even
+    // if the row was previously 'parsed'. Either way: re-enqueue.
+    if (!TERMINAL_PARSE_STATES.has(existing.parse_state) || restored) {
       await env.PARSE_QUEUE.send({ file_id: existing.id, r2_key: existing.r2_key, reason: 'upload', content_hash: existing.content_hash });
       return Response.json({ status: 'unchanged', file_id: existing.id, requeued: true, restored });
     }
@@ -121,9 +122,18 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
       .bind(...binds)
       .all<{ id: number; store: string; relpath: string; r2_key: string; parse_state: string; content_hash: string }>();
     const have = new Map(rows.results.map((r) => [`${r.store}\n${r.relpath}`, r]));
+    // A matched D1 row is not proof the raw bytes still exist — head every match in this chunk
+    // (bounded to ≤50, parallel) so a row whose R2 object was lost/corrupted (independent of
+    // parse_state — even a 'parsed' row can point at a since-deleted object) gets reported
+    // missing instead of present. That's what makes the collector re-send the bytes; the upload
+    // path's same-hash restore logic then repairs R2 from that re-upload.
+    const heads = await Promise.all(
+      [...have.values()].map(async (r): Promise<[number, boolean]> => [r.id, (await env.RAW.head(r.r2_key)) !== null]),
+    );
+    const objectPresent = new Map(heads);
     for (const it of chunk) {
       const row = have.get(`${it.store}\n${it.relpath}`);
-      if (!row) {
+      if (!row || !objectPresent.get(row.id)) {
         missing.push({ store: it.store, relpath: it.relpath });
         continue;
       }
