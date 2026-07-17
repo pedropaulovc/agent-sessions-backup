@@ -207,6 +207,22 @@ def load(path: Path | str | None = None) -> Config:
     )
 
 
+def _resolve_machine_id(override: str | None, path: Path) -> str:
+    """Pick the machine_id to write: explicit override > an existing config's id > computed
+    default. Preserving an already-configured id is what keeps mTLS re-enrollment consistent:
+    enroll-cert.sh signs the cert for the id `agent-collector machine-id` reported (the
+    configured one), so resetting to the default here would make the cert identity and the
+    collector's upload URLs diverge and every upload would 401 as machine_mismatch."""
+    if override is not None:
+        return override
+    if path.exists():
+        try:
+            return load(path).machine_id
+        except (OSError, KeyError, ValueError, tomllib.TOMLDecodeError):
+            pass  # unreadable/legacy config -> fall through to the computed default
+    return default_machine_id()
+
+
 def enroll(
     hub_url: str,
     dev: bool,
@@ -218,8 +234,10 @@ def enroll(
     """Write a collector config. `dev=True` writes dev auth (x-dev-machine); otherwise a
     file-based mTLS config, which requires both a client cert and key path (produced by
     infra/cf/enroll-cert.sh). TPM-backed mTLS enrollment lands in M4."""
+    path = Path(path) if path else config_path()
+    resolved_id = _resolve_machine_id(machine_id, path)
     if dev:
-        cfg = Config(machine_id=machine_id or default_machine_id(), hub_url=hub_url.rstrip("/"), auth="dev")
+        cfg = Config(machine_id=resolved_id, hub_url=hub_url.rstrip("/"), auth="dev")
     else:
         if not (client_cert_path and client_key_path):
             raise ValueError(
@@ -227,13 +245,15 @@ def enroll(
                 "infra/cf/enroll-cert.sh first). Use --dev for the dev-header config instead."
             )
         cfg = Config(
-            machine_id=machine_id or default_machine_id(),
+            machine_id=resolved_id,
             hub_url=hub_url.rstrip("/"),
             auth="mtls",
-            client_cert_path=str(Path(client_cert_path).expanduser()),
-            client_key_path=str(Path(client_key_path).expanduser()),
+            # Absolute (resolve()), not just expanduser(): scheduled systemd/Task Scheduler
+            # runs start from a different cwd, so a relative path (enroll-cert.sh's `--out .`
+            # default) would make MtlsAuth fail its file-existence check before every upload.
+            client_cert_path=str(Path(client_cert_path).expanduser().resolve()),
+            client_key_path=str(Path(client_key_path).expanduser().resolve()),
         )
-    path = Path(path) if path else config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_dump_toml(cfg))
     cfg.source = path

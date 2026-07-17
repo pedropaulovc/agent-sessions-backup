@@ -20,6 +20,7 @@ def _cmd_enroll(args) -> int:
     cfg = config_mod.enroll(
         args.hub,
         dev=args.dev,
+        machine_id=args.machine_id,
         client_cert_path=args.client_cert,
         client_key_path=args.client_key,
     )
@@ -68,6 +69,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_enroll.add_argument("--dev", action="store_true", help="dev auth (x-dev-machine header)")
     p_enroll.add_argument("--client-cert", help="mTLS: path to the PEM client cert (from enroll-cert.sh)")
     p_enroll.add_argument("--client-key", help="mTLS: path to the client private key (from enroll-cert.sh)")
+    p_enroll.add_argument("--machine-id", help="override machine_id (default: keep existing config's, else computed)")
     p_enroll.set_defaults(func=_cmd_enroll)
 
     p_mid = sub.add_parser("machine-id", help="print this machine's collector id (config override or computed default)")
