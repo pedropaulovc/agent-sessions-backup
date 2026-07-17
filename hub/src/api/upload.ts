@@ -47,11 +47,20 @@ export async function putFile(
   if (!request.body) return Response.json({ error: 'missing_body' }, { status: 400 });
 
   const existing = await env.DB.prepare(
-    'SELECT id, content_hash, parse_state, r2_key FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
+    'SELECT id, content_hash, parse_state, r2_key, harness, session_id FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
   )
     .bind(machineId, store, relpath)
-    .first<{ id: number; content_hash: string; parse_state: string; r2_key: string }>();
+    .first<{ id: number; content_hash: string; parse_state: string; r2_key: string; harness: string | null; session_id: string | null }>();
   if (existing && existing.content_hash === sha256) {
+    // A legacy row (created before a detect() change / before machine-scoped prompt-log ids) can
+    // sit terminal 'skipped' with a stale/NULL harness/session_id even though its bytes are
+    // unchanged. The cheap unchanged path below never re-runs detect(), so re-run it here and, when
+    // the stored identity is stale (or a 'skipped' row is now recognized), restamp those columns and
+    // re-enqueue so the file finally indexes. detect() is pure/cheap, only reached on a resync.
+    const det = detect(store, relpath, machineId);
+    const identityStale = det.harness !== existing.harness || (det.sessionId ?? null) !== existing.session_id;
+    const skippedButNowRecognized = existing.parse_state === 'skipped' && det.harness !== 'unknown';
+    const restampNeeded = identityStale || skippedButNowRecognized;
     // A matching hash normally means nothing to do — but the raw R2 object can be lost, missing,
     // OR CORRUPT (present at the key with the wrong bytes — e.g. a bad manual restore outside
     // this API) independent of parse_state, even for a row already 'parsed'. Head it on every
@@ -78,9 +87,14 @@ export async function putFile(
     // (e.g. 'parsed'/'skipped') would stay terminal while its parse message is in flight, and if
     // PARSE_QUEUE.send fails (or the message is later dropped), a client retry would see
     // 'unchanged' with the now-correct checksum and never requeue, same for files/check.
-    if (!TERMINAL_PARSE_STATES.has(existing.parse_state) || restored) {
+    if (restampNeeded) {
+      await env.DB.prepare('UPDATE files SET harness = ?2, session_id = ?3 WHERE id = ?1')
+        .bind(existing.id, det.harness, det.sessionId ?? null)
+        .run();
+    }
+    if (restampNeeded || restored || !TERMINAL_PARSE_STATES.has(existing.parse_state)) {
       await markPendingAndEnqueue(existing, 'upload', env);
-      return Response.json({ status: 'unchanged', file_id: existing.id, requeued: true, restored });
+      return Response.json({ status: 'unchanged', file_id: existing.id, requeued: true, restored, restamped: restampNeeded });
     }
     return Response.json({ status: 'unchanged', file_id: existing.id });
   }

@@ -128,7 +128,7 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
     return;
   }
   if (det.kind === 'export-archive') {
-    await parseExportInto(file, env, job.content_hash);
+    await parseExportInto(file, env, job.reason, job.content_hash);
     return;
   }
   if (!det.sessionId || !SINGLE_SESSION_HARNESSES.has(det.harness)) {
@@ -332,7 +332,7 @@ async function failExportFile(file: FileRow, env: Env, contentHash: string | und
   console.log(JSON.stringify({ event: 'parse.export.error', file_id: file.id, error: reason, owned_errored: owned.results.length }));
 }
 
-async function parseExportInto(file: FileRow, env: Env, contentHash?: string): Promise<void> {
+async function parseExportInto(file: FileRow, env: Env, reason: ParseMessage['reason'], contentHash?: string): Promise<void> {
   const obj = await env.RAW.get(file.r2_key);
   if (!obj) {
     // The raw ZIP is gone (e.g. a reindex after the R2 object was deleted). Do NOT throw into the
@@ -372,10 +372,11 @@ async function parseExportInto(file: FileRow, env: Env, contentHash?: string): P
   for (const session of archive.sessions) {
     if (session.turns.length === 0) continue;
     const existing = await env.DB.prepare(
-      `SELECT f.store, s.index_state FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
+      `SELECT f.store, f.parse_state AS canon_state, s.index_state, s.canonical_file_id
+       FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
     )
       .bind(session.id)
-      .first<{ store: string; index_state: string }>();
+      .first<{ store: string; canon_state: string; index_state: string; canonical_file_id: number }>();
     // Skip only a HEALTHY live capture: a chatgpt-web/claude-web canonical whose index_state is
     // 'ready'. If that live session is instead 'error'/'parsing' (or absent), let this export write
     // RECOVER it — export archive rows carry files.session_id = NULL, so chooseRecoveryCandidate()
@@ -385,6 +386,15 @@ async function parseExportInto(file: FileRow, env: Env, contentHash?: string): P
     const healthyLiveCapture =
       existing && (existing.store === 'chatgpt-web' || existing.store === 'claude-web') && existing.index_state === 'ready';
     if (healthyLiveCapture) continue;
+    // A reason='recover' parse fills GAPS: it must only CLAIM orphaned/broken sessions, never
+    // clobber one already healthily owned by a DIFFERENT (e.g. newer) archive. The recover fan-out
+    // re-enqueues every sibling archive without knowing WHICH conversation was lost, so an older
+    // archive's stale copy of a still-healthy conversation would otherwise overwrite it. Generalize
+    // the healthy-web-capture skip: skip any conversation whose live session is 'ready' and
+    // canonically owned by another non-error file. (An 'upload'/'reindex' parse still wins normally.)
+    const healthyOtherOwner =
+      existing && existing.index_state === 'ready' && existing.canonical_file_id !== file.id && existing.canon_state !== 'error';
+    if (reason === 'recover' && healthyOtherOwner) continue;
     await writeSession(session, file, env);
     written.add(session.id);
   }

@@ -213,6 +213,26 @@ describe('parsePromptLog (history.jsonl)', () => {
     expect(s.turns[0]!.blocks[0]!.text!.length).toBe(16 * 1024);
     expect(s.turns[0]!.blocks[0]!.truncated).toBe(true);
   });
+
+  it('an out-of-range numeric timestamp does not throw — the row still indexes, valid bounds preserved (round 7 Fix 5)', async () => {
+    // 1e20 ms is beyond the representable Date range: new Date(1e20).toISOString() throws RangeError,
+    // which pre-fix aborted the WHOLE file. It must be treated as simply having no usable timestamp.
+    const s = await parsePromptLog(
+      readJsonlLines(
+        toStream(
+          historyLines([
+            { display: 'valid one', timestamp: 1_700_000_000_000 },
+            { display: 'bad ts row', timestamp: 1e20 },
+            { display: 'valid two', timestamp: 1_700_000_100_000 },
+          ]),
+        ),
+      ),
+      'pl',
+    );
+    expect(s.turns).toHaveLength(3); // no throw; all three prompts (incl. the bad-ts one) indexed
+    expect(s.startedAt).toBe(new Date(1_700_000_000_000).toISOString());
+    expect(s.endedAt).toBe(new Date(1_700_000_100_000).toISOString()); // the bad ts didn't extend bounds
+  });
 });
 
 describe('parseExportArchive', () => {

@@ -274,6 +274,46 @@ def test_claude_org_list_all_non_dict_signs_out_cleanly(tmp_path):
     assert any(e["code"] == "webcapture_login_expired" for e in events)
 
 
+def test_cdp_attaches_to_exact_origin_not_lookalike(monkeypatch):
+    # Round 7 Fix 4: tab selection compares the parsed ORIGIN, not a URL-string prefix — a lookalike
+    # like https://chatgpt.com.evil/ (which startswith the configured origin) must NOT win, or the
+    # capture JS runs in a hostile page's context.
+    import sys
+    import types as _types
+    from agent_collector.webcapture.cdp import ChromeCdpTransport, CdpError
+
+    captured = {}
+
+    def _fake_connect(url, **_kw):
+        captured["url"] = url
+        return _types.SimpleNamespace(send=lambda *_a: None, recv=lambda: "{}", close=lambda: None)
+
+    monkeypatch.setitem(sys.modules, "websocket", _types.SimpleNamespace(create_connection=_fake_connect))
+    tr = ChromeCdpTransport("https://chatgpt.com")
+    monkeypatch.setattr(tr, "_list_targets", lambda: [
+        {"type": "page", "url": "https://chatgpt.com.evil/phish", "webSocketDebuggerUrl": "ws://evil"},
+        {"type": "page", "url": "https://chatgpt.com/", "webSocketDebuggerUrl": "ws://real"},
+    ])
+    tr._connect()
+    assert captured["url"] == "ws://real"  # attached to the exact-origin tab, never the lookalike
+
+
+def test_cdp_no_matching_origin_raises_cdp_error(monkeypatch):
+    # A list with only a lookalike origin -> no tab matches -> CdpError (the signed-out/no-tab path),
+    # never an attach to the lookalike.
+    import sys
+    import types as _types
+    from agent_collector.webcapture.cdp import ChromeCdpTransport, CdpError
+
+    monkeypatch.setitem(sys.modules, "websocket", _types.SimpleNamespace(create_connection=lambda *_a, **_k: None))
+    tr = ChromeCdpTransport("https://chatgpt.com")
+    monkeypatch.setattr(tr, "_list_targets", lambda: [
+        {"type": "page", "url": "https://chatgpt.com.evil/phish", "webSocketDebuggerUrl": "ws://evil"},
+    ])
+    with pytest.raises(CdpError):
+        tr._connect()
+
+
 def test_cdp_connect_failure_becomes_cdp_error(monkeypatch):
     # Round 3 Fix 4: a websocket handshake failure is wrapped as CdpError (which _run_products
     # catches) rather than a raw websocket exception that aborts the whole run.

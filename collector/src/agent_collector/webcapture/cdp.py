@@ -15,6 +15,21 @@ from __future__ import annotations
 import json
 import urllib.request
 from typing import Protocol, runtime_checkable
+from urllib.parse import urlparse
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _origin_key(url: str) -> tuple[str, str, int | None] | None:
+    """(scheme, host, port) with default ports normalized, or None if the URL has no scheme/host.
+    Used to compare a tab's ORIGIN exactly — a prefix match on the URL string would let a lookalike
+    like https://chatgpt.com.evil/ (which startswith the configured origin) win tab selection and
+    run the capture JS in a hostile page's context."""
+    p = urlparse(url)
+    if not p.scheme or not p.hostname:
+        return None
+    port = p.port if p.port is not None else _DEFAULT_PORTS.get(p.scheme.lower())
+    return (p.scheme.lower(), p.hostname.lower(), port)
 
 
 @runtime_checkable
@@ -54,8 +69,9 @@ class ChromeCdpTransport:
             ) from e
 
         targets = self._list_targets()
+        want = _origin_key(self.origin)
         target = next(
-            (t for t in targets if t.get("type") == "page" and str(t.get("url", "")).startswith(self.origin)),
+            (t for t in targets if t.get("type") == "page" and _origin_key(str(t.get("url", ""))) == want),
             None,
         )
         if target is None:

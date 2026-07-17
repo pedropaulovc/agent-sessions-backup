@@ -9,6 +9,19 @@ const CLAUDE_ROOT = '00000000-0000-4000-8000-000000000000';
 
 const testEnv = testEnvRaw as unknown as Env;
 
+// The recover fan-out enqueues sibling archives with reason:'recover', and that reason rides in the
+// queue MESSAGE, not the DB. drainQueue below rebuilds messages by polling pending files, so on its
+// own it would stamp every redelivery 'upload' and silently downgrade a recover parse into an
+// authoritative one (masking the fix that gates clobbering on reason). Capture the real reason per
+// file from PARSE_QUEUE.send — every enqueue path (upload, reindex, recover) goes through it — and
+// let drainQueue replay it.
+const enqueuedReason = new Map<number, ParseMessage['reason']>();
+const realQueueSend = testEnv.PARSE_QUEUE.send.bind(testEnv.PARSE_QUEUE);
+testEnv.PARSE_QUEUE.send = (async (msg: ParseMessage) => {
+  enqueuedReason.set(msg.file_id, msg.reason);
+  return realQueueSend(msg);
+}) as typeof testEnv.PARSE_QUEUE.send;
+
 async function sha256Hex(data: Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', data as BufferSource);
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
@@ -36,7 +49,7 @@ async function drainQueue(): Promise<void> {
     id: String(r.id),
     timestamp: new Date(),
     attempts: 1,
-    body: { file_id: r.id, r2_key: r.r2_key, reason: 'upload' as const },
+    body: { file_id: r.id, r2_key: r.r2_key, reason: enqueuedReason.get(r.id) ?? 'upload' },
     ack() {},
     retry() {},
   }));
@@ -587,6 +600,65 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     expect(afterX?.canon).toBe(ex1Id);
   });
 
+  it('a recover parse claims only orphaned conversations, never clobbering one owned by a newer archive (round 7 Fix 1)', async () => {
+    // ex1 (older) and ex2 (newer) both contain A; ex2 takes ownership on upload (last write wins).
+    const ex1 = chatgptExportZip([
+      { id: 'rc-a', title: 'A-from-ex1', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'recover-a from ex1' }] },
+      { id: 'rc-b', title: 'B-from-ex1', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'recover-b only in ex1 originally' }] },
+    ]);
+    const r1 = await put('webbox', 'export-inbox', 'rc-ex1.zip', ex1);
+    const ex1Id = ((await r1.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    const ex2 = chatgptExportZip([
+      { id: 'rc-a', title: 'A-from-ex2', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'recover-a from ex2 (newer)' }] },
+      { id: 'rc-b', title: 'B-from-ex2', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'recover-b from ex2 (newer)' }] },
+    ]);
+    const r2 = await put('webbox', 'export-inbox', 'rc-ex2.zip', ex2);
+    const ex2Id = ((await r2.json()) as { file_id: number }).file_id;
+    await drainQueue();
+    // ex2 owns both A and B now.
+    expect(await testEnv.DB.prepare(`SELECT canonical_file_id AS c FROM sessions WHERE session_id = 'rc-a'`).first<{ c: number }>()).toMatchObject({ c: ex2Id });
+
+    // Re-upload ex2 WITHOUT B: B is dropped -> recovery fan-out re-enqueues ex1. ex1's recover parse
+    // still contains A, but A is healthily owned by ex2 -> it must NOT be clobbered with ex1's copy.
+    const ex2onlyA = chatgptExportZip([{ id: 'rc-a', title: 'A-from-ex2', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'recover-a from ex2 (newer)' }] }]);
+    expect((await put('webbox', 'export-inbox', 'rc-ex2.zip', ex2onlyA)).status).toBe(201);
+    await drainAll();
+
+    // A keeps ex2's content + ownership (the recover parse skipped it).
+    const a = await testEnv.DB.prepare(
+      `SELECT s.title, f.id AS canon FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = 'rc-a'`,
+    ).first<{ title: string; canon: number }>();
+    expect(a?.title).toBe('A-from-ex2');
+    expect(a?.canon).toBe(ex2Id);
+    // B was orphaned by ex2's drop and recovered from ex1 (the only surviving copy).
+    const b = await testEnv.DB.prepare(
+      `SELECT f.id AS canon FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = 'rc-b'`,
+    ).first<{ canon: number }>();
+    expect(b?.canon).toBe(ex1Id);
+  });
+
+  it('reindex flips an archive-backed session to parsing before the queue drains (round 7 Fix 3)', async () => {
+    const zip = chatgptExportZip([{ id: 'reidx-a', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'reindex flip marker' }] }]);
+    const relpath = 'reidx-arch.zip';
+    expect((await put('webbox', 'export-inbox', relpath, zip)).status).toBe(201);
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'reidx-a'").first<{ index_state: string }>()).toMatchObject({ index_state: 'ready' });
+
+    // Reindex ONLY this archive's R2 prefix. det.sessionId is undefined for an archive, so the flip
+    // must come from the export-archive branch — its owned session goes 'parsing' before the drain.
+    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/admin/reindex', {
+      method: 'POST',
+      headers: { 'x-dev-machine': 'webbox', 'content-type': 'application/json' },
+      body: JSON.stringify({ prefix: 'raw/webbox/export-inbox/reidx-arch.zip' }),
+    });
+    expect(res.status).toBe(200);
+    expect(await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'reidx-a'").first<{ index_state: string }>()).toMatchObject({ index_state: 'parsing' });
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'reidx-a'").first<{ index_state: string }>()).toMatchObject({ index_state: 'ready' });
+  });
+
   it('an invalid replacement flips owned sessions to error and a sibling archive recovers the overlap (round 4 Fix 10)', async () => {
     // ex1 has X; ex2 has X and Y. ex2 becomes canonical for both.
     const ex1 = chatgptExportZip([{ id: 'inv-x', title: 'x-from-1', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'invmarker x from one' }] }]);
@@ -636,5 +708,32 @@ describe('prompt-log file rows upgrade a legacy NULL session_id on re-upload (ro
     const row = await testEnv.DB.prepare("SELECT harness, session_id FROM files WHERE machine_id = 'legacybox' AND relpath = 'history.jsonl'").first<{ harness: string; session_id: string }>();
     expect(row?.harness).toBe('prompt-log');
     expect(row?.session_id).toBe('promptlog:legacybox:claude');
+  });
+
+  it('a SAME-hash re-upload restamps a legacy skipped/NULL-session row and enqueues a parse; a healthy row short-circuits (round 7 Fix 2)', async () => {
+    const content = historyLines([{ display: 'legacy same-hash prompt theta', timestamp: 1_700_000_000_000 }]).join('\n');
+    await putText('legacy2box', 'claude', 'history.jsonl', content);
+    await drainQueue();
+    // Simulate a legacy row: terminal 'skipped', NULL harness/session_id, and no session row indexed.
+    await testEnv.DB.prepare("UPDATE files SET session_id = NULL, harness = NULL, parse_state = 'skipped' WHERE machine_id = 'legacy2box' AND relpath = 'history.jsonl'").run();
+    await testEnv.DB.prepare("DELETE FROM sessions WHERE session_id = 'promptlog:legacy2box:claude'").run();
+
+    // Same bytes (same hash): the cheap unchanged path would skip it forever; instead it must
+    // re-run detect(), restamp harness/session_id, and re-enqueue.
+    const res = await putText('legacy2box', 'claude', 'history.jsonl', content);
+    const body = (await res.json()) as { status: string; requeued?: boolean; restamped?: boolean };
+    expect(body.requeued).toBe(true);
+    expect(body.restamped).toBe(true);
+    const row = await testEnv.DB.prepare("SELECT harness, session_id FROM files WHERE machine_id = 'legacy2box' AND relpath = 'history.jsonl'").first<{ harness: string; session_id: string }>();
+    expect(row?.harness).toBe('prompt-log');
+    expect(row?.session_id).toBe('promptlog:legacy2box:claude');
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'promptlog:legacy2box:claude'").first<{ index_state: string }>()).toMatchObject({ index_state: 'ready' });
+
+    // A genuinely unchanged, healthy row now short-circuits (no restamp, no requeue).
+    const res2 = await putText('legacy2box', 'claude', 'history.jsonl', content);
+    const body2 = (await res2.json()) as { status: string; requeued?: boolean };
+    expect(body2.status).toBe('unchanged');
+    expect(body2.requeued).toBeUndefined();
   });
 });

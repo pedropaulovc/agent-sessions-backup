@@ -69,12 +69,22 @@ export async function parsePromptLog(
 
 /** Accept an epoch-ms number (or numeric string) or an already-ISO string; return ISO or undefined. */
 function normalizeTs(v: unknown): string | undefined {
-  if (typeof v === 'number' && Number.isFinite(v)) return new Date(v).toISOString();
+  if (typeof v === 'number' && Number.isFinite(v)) return isoOrUndefined(v);
   if (typeof v === 'string' && v.length > 0) {
-    if (/^\d+$/.test(v)) return new Date(Number(v)).toISOString();
+    if (/^\d+$/.test(v)) return isoOrUndefined(Number(v));
     return v;
   }
   return undefined;
+}
+
+/** ISO string for an epoch-ms value, or undefined if it's out of the representable Date range. */
+function isoOrUndefined(ms: number): string | undefined {
+  const d = new Date(ms);
+  // An epoch beyond ±8.64e15 ms (e.g. a bogus 1e20) yields an Invalid Date, and calling
+  // toISOString() on it throws RangeError — which would abort parsing the WHOLE file. Treat it as
+  // simply having no usable timestamp: the row still indexes (via its prompt text), just without
+  // contributing to started/ended bounds.
+  return Number.isNaN(d.getTime()) ? undefined : d.toISOString();
 }
 
 function str(v: unknown): string | undefined {
