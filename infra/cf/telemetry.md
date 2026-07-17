@@ -11,36 +11,48 @@ side and `infra/azure/federation.md`-equivalent notes inline in
 |---|---|---|
 | Issuer worker | `hub/gateway/oidc-issuer.ts`, `hub/wrangler.oidc-issuer.jsonc` | Publishes `/.well-known/openid-configuration` + `/.well-known/jwks.json`. Azure Entra trusts this instead of a client secret. |
 | Gateway worker | `hub/gateway/telemetry-gateway.ts`, `hub/wrangler.telemetry-gateway.jsonc` | Receives OTLP/JSON from Workers observability at `/v1/logs` and `/v1/traces`, transcodes to OTLP/protobuf, forwards to the Azure Monitor DCR endpoints with a self-minted Entra bearer. |
-| Observability destinations | Cloudflare account-level (dashboard or `wrangler observability destinations`) | Where `sessions-hub`'s Workers observability actually ships logs/traces. Point them at the gateway's `/v1/{logs,traces}`. |
+| Observability destinations | Cloudflare account-level, dashboard-only (no wrangler/API command exists for this) | Where `sessions-hub`'s Workers observability actually ships logs/traces. Point them at the gateway's `/v1/{logs,traces}`. |
 
 ## Deploy order (M4)
 
+All commands below are written to run from the **repo root** (`agent-sessions-backup/`,
+the parent of `hub/`), matching how you'd normally have this repo checked out — every
+`wrangler` invocation explicitly passes `--config hub/wrangler.*.jsonc` accordingly. If
+you'd rather `cd hub` first, drop the `hub/` prefix from every `--config` path
+consistently; don't mix the two conventions in the same session.
+
 1. `node scripts/generate-gateway-key.mjs > /tmp/gateway-key.pem` — capture the
    stderr public JWK too.
-2. Paste the public JWK into `hub/gateway/oidc-issuer.ts`'s `PUBLIC_JWK`
-   (replacing the placeholder), and note its `kid`.
+2. Add the public JWK to `hub/gateway/oidc-issuer.ts`'s `PUBLIC_JWKS` array
+   (replacing the placeholder entry) and set `ACTIVE_KID` to its `kid` — see
+   that file's header comment for the full key-rotation sequence if you're
+   replacing an already-live key rather than bootstrapping the first one.
 3. Deploy the issuer worker first (its URL is needed for the Azure federated
    credential and for the gateway's `OIDC_ISSUER_URL`):
    ```
-   npx wrangler deploy --config wrangler.oidc-issuer.jsonc
+   npx wrangler deploy --config hub/wrangler.oidc-issuer.jsonc
    ```
-   Update `ISSUER_URL` in `wrangler.oidc-issuer.jsonc` to match the real
+   Update `ISSUER_URL` in `hub/wrangler.oidc-issuer.jsonc` to match the real
    deployed URL (workers.dev subdomain or custom route) and redeploy if it
    changed.
-4. Run `infra/azure/provision.sh <issuer-url>` (the issuer URL from step 3).
+4. Run `./infra/azure/provision.sh <issuer-url>` (the issuer URL from step 3).
    This creates the resource group, workspace-based Application Insights, the
-   DCE/DCR with `Microsoft-OTLP-Logs`/`Microsoft-OTLP-Traces` streams, the
-   user-assigned managed identity + federated credential, the action group,
-   and the KQL-based alerts. Outputs land in `infra/out/azure.env`
-   (gitignored) — **this file, not this doc, is the source of truth for the
-   actual values**.
+   DCE/DCR with native OTLP ingestion (logs + traces), the user-assigned
+   managed identity + federated credential, the action group, and the
+   KQL-based alerts. Outputs land in `infra/out/azure.env` (gitignored) —
+   **this file, not this doc, is the source of truth for the actual values**.
+   Safe to re-run: every resource is show-or-create (or, for the federated
+   credential specifically, show-or-create-or-update — see the script comment
+   — so re-running after the issuer URL changes actually fixes the drift
+   instead of leaving Entra trusting a stale issuer).
 5. Fill `hub/wrangler.telemetry-gateway.jsonc`'s `vars` from
    `infra/out/azure.env`: `TENANT_ID`, `APP_CLIENT_ID`, `OTLP_TRACES_ENDPOINT`,
    `OTLP_LOGS_ENDPOINT`, and set `OIDC_SIGNING_KID` to the kid from step 2.
 6. Create a Secrets Store (if one doesn't already exist:
    `npx wrangler secrets-store store create agent-backup --remote`), then put
    the private key from step 1 into it and bind it as `OIDC_SIGNING_KEY`
-   (`store_id`/`secret_name` in the wrangler config must match):
+   (`store_id`/`secret_name` in `hub/wrangler.telemetry-gateway.jsonc` must
+   match):
    ```
    npx wrangler secrets-store secret create <store-id> --remote \
      --name agent-backup-oidc-signing-key --scopes workers
@@ -50,11 +62,11 @@ side and `infra/azure/federation.md`-equivalent notes inline in
 7. Pick a random `INGEST_BEARER` value (e.g. `openssl rand -hex 32`) and set
    it as a wrangler secret on the gateway:
    ```
-   npx wrangler secret put INGEST_BEARER --config wrangler.telemetry-gateway.jsonc
+   npx wrangler secret put INGEST_BEARER --config hub/wrangler.telemetry-gateway.jsonc
    ```
 8. Deploy the gateway:
    ```
-   npx wrangler deploy --config wrangler.telemetry-gateway.jsonc
+   npx wrangler deploy --config hub/wrangler.telemetry-gateway.jsonc
    ```
 9. Create the account-level observability destinations (one for logs, one for
    traces — **these are shared across every worker on the account**, so use
@@ -86,14 +98,22 @@ side and `infra/azure/federation.md`-equivalent notes inline in
 
 ## Rotating the signing key
 
-Re-run `scripts/generate-gateway-key.mjs`, update the issuer worker's
-`PUBLIC_JWK` + redeploy, update `OIDC_SIGNING_KID` + the Secrets Store entry on
-the gateway + redeploy. Both must change together — a stale `kid` on either
-side breaks the JWKS lookup.
+The issuer publishes a **JWKS array** (`PUBLIC_JWKS` in
+`hub/gateway/oidc-issuer.ts`), not a single key, specifically so a rotation can
+carry the old and new key at once while caches (Entra's included) catch up.
+Follow the exact sequence documented in that file's header comment — summary:
+add the new key to `PUBLIC_JWKS` and deploy (without touching `ACTIVE_KID`),
+wait out the `/.well-known/jwks.json` cache window (`JWKS_CACHE_CONTROL`,
+currently 5 minutes), then flip `OIDC_SIGNING_KID` + `ACTIVE_KID` + the
+Secrets Store entry together and redeploy both workers, then remove the old
+key from `PUBLIC_JWKS`. Never remove an old key from `PUBLIC_JWKS` before the
+gateway has been redeployed to sign with the new one — that's the one order
+that breaks verification for tokens minted in the gap.
 
 ## Trap: destinations are account-level
 
 If this Cloudflare account ever hosts another project's Workers observability
 export, its destinations live in the same shared namespace as
 `agent-backup-azure-{logs,traces}`. Double-check destination names don't
-collide before creating them (`npx wrangler observability destinations list`).
+collide before creating them — there's no CLI to list them either; check the
+dashboard (Workers & Pages → Observability → Pipelines).
