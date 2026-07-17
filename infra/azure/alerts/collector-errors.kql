@@ -1,0 +1,29 @@
+// Fires when sessions-hub logs a collector.event with level=error within the
+// last hour — i.e. machine-side collector errors that a collector reported
+// and the hub relayed into its own structured logs.
+//
+// This does NOT catch sessions-telemetry-gateway's own upstream-forward
+// failures (see the `collector.event`/level=error log line in
+// hub/gateway/telemetry-gateway.ts), even though that line uses the same
+// event name. Per the deploy runbook (infra/cf/telemetry.md), only
+// sessions-hub has observability.logs/traces destinations configured — the
+// gateway does not, and MUST NOT: the gateway IS the /v1/{logs,traces} sink,
+// so exporting its own logs back to itself would be a recursion loop. That
+// log line exists for local `wrangler tail`/dashboard visibility only; it
+// never reaches OTelLogs. Gateway-side failures (Entra auth breaking, the
+// DCR endpoint rejecting requests, etc.) instead manifest as an ABSENCE of
+// data in Azure — including the hub's own hub.heartbeat events, which are
+// relayed through the same gateway — so they're caught by
+// missed-heartbeat.kql's absence alert and by the independent
+// /healthz availability webtest (infra/azure/provision.sh), not by this query.
+//
+// See missed-heartbeat.kql for the OTelLogs/Body-as-JSON assumption this query
+// shares. ASSUMPTION TO VERIFY AT M4 DEPLOY: confirm the table/column names
+// once real data flows, and confirm `level` (not `severity` or the OTLP-native
+// SeverityText column) is the field the JSON payload actually uses.
+
+OTelLogs
+| where TimeGenerated > ago(1h)
+| extend body = todynamic(Body)
+| where body.event == "collector.event" and body.level == "error"
+| project TimeGenerated, body
