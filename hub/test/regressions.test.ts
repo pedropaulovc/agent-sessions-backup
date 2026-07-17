@@ -2,6 +2,8 @@ import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { clampLimit } from '../src/api/sessions';
+import { hex } from '../src/api/ops';
+import { convergeR2WithRow } from '../src/api/upload';
 import { CODEX_SESSION_ID, ccAssistantLine, ccUserLine, codexLines } from './fixtures';
 
 const testEnv = env as unknown as Env;
@@ -103,6 +105,31 @@ describe('the local queue simulator does not auto-deliver PARSE_QUEUE messages o
       .first<{ parse_state: string }>();
     expect(row?.parse_state).toBe('pending');
   }, 10000);
+});
+
+describe('search handles a query whose quoted-phrase fallback is ALSO invalid FTS5 (regression: some queries made even the fallback throw an uncaught error, 500ing instead of returning empty results)', () => {
+  // Note: the literal repro suggested in review (q='"', a lone double quote) does NOT actually
+  // reproduce on this D1/FTS5 build — verified directly: MATCH '"' throws "unterminated string"
+  // on the first attempt as expected, but its escaped fallback `""""` (four quotes) parses fine
+  // (FTS5 treats it as balanced/escaped quoting, not a second syntax error) and returns zero rows,
+  // no exception. A NUL byte (q='\0') genuinely reproduces the described class instead: verified
+  // both the raw MATCH and its quoted-escaped form (`"\0"`, still unterminated — the embedded NUL
+  // breaks SQLite's string-literal scanning even inside the added quotes) throw. Using that as the
+  // regression input since it's the one that actually exercises the fallback-also-throws path this
+  // fix addresses.
+  it('a NUL-byte query returns 200 with empty hits/facets, not an uncaught exception', async () => {
+    const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/search?q=${encodeURIComponent('\0')}&facets=1`, {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { hits: unknown[]; facets?: Record<string, Record<string, number>>; cursor?: string };
+    expect(body.hits).toEqual([]);
+    expect(body.cursor).toBeUndefined();
+    // Facets are still present (facets=1 was requested) but empty for every column — the facets
+    // query also runs against FTS5 and would hit the identical invalid-syntax error otherwise.
+    expect(body.facets).toBeDefined();
+    for (const counts of Object.values(body.facets ?? {})) expect(counts).toEqual({});
+  });
 });
 
 describe('search/listSessions limit clamp over HTTP (regression: NaN/negative used to reach SQL as LIMIT NaN / LIMIT -1)', () => {
@@ -447,6 +474,151 @@ describe('upload unchanged fast-path re-enqueues stuck files', () => {
       .bind(CHECKSUM_RESTORE_SESSION_ID)
       .first<{ index_state: string }>();
     expect(recoveredSession?.index_state).toBe('ready');
+  });
+});
+
+describe('a changed-hash re-upload of a session\'s canonical file marks the session parsing immediately (regression: sessions.index_state stayed \'ready\' — advertising the OLD, now-overwritten bytes — until the queue consumer eventually ran)', () => {
+  it('re-uploading the canonical file with DIFFERENT bytes flips index_state to \'parsing\' before any delivery; draining reparses and the session shows the new content', async () => {
+    const CANON_REUPLOAD_SESSION_ID = 'f0000000-0000-4000-8000-0000000000bb';
+    const relpath = `canon-reupload-demo/${CANON_REUPLOAD_SESSION_ID}.jsonl`;
+    const CONTENT_V1 = `${ccUserLine({ uuid: 'cr-u1', text: 'unique-marker-canonreupload-v1' })}\n`;
+    const CONTENT_V2 = `${ccUserLine({ uuid: 'cr-u2', text: 'unique-marker-canonreupload-v2' })}\n`;
+
+    const res1 = await putFile('claude-projects', relpath, CONTENT_V1);
+    expect(res1.status).toBe(201);
+    const fileId = ((await res1.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    const session1 = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(CANON_REUPLOAD_SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(session1?.canonical_file_id).toBe(fileId);
+    expect(session1?.index_state).toBe('ready');
+
+    // Re-upload the SAME path with DIFFERENT bytes — a changed-hash upload, not the same-hash
+    // fast path. The response returns before any parse message is delivered.
+    const res2 = await putFile('claude-projects', relpath, CONTENT_V2);
+    expect(res2.status).toBe(201);
+
+    const session2 = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+      .bind(CANON_REUPLOAD_SESSION_ID)
+      .first<{ index_state: string }>();
+    expect(session2?.index_state).toBe('parsing'); // not still 'ready' advertising the old bytes
+
+    await drainQueue();
+
+    const session3 = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+      .bind(CANON_REUPLOAD_SESSION_ID)
+      .first<{ index_state: string }>();
+    expect(session3?.index_state).toBe('ready');
+
+    const search = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-canonreupload-v2', {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    const searchBody = (await search.json()) as { hits: Array<{ session_id: string }> };
+    expect(searchBody.hits.some((h) => h.session_id === CANON_REUPLOAD_SESSION_ID)).toBe(true);
+  });
+
+  it('re-uploading a NON-canonical duplicate with different bytes does NOT touch the session\'s index_state', async () => {
+    const NONCANON_SESSION_ID = 'f0000000-0000-4000-8000-0000000000cc';
+    // The file basename must be exactly the session UUID for detect() to recognize it as a
+    // claude-code session file — two duplicates of the same session live at the same basename
+    // under different directories, matching the existing canon2-a/canon2-b test pattern.
+    const relpathA = `noncanon-demo/copy-a/${NONCANON_SESSION_ID}.jsonl`;
+    const relpathB = `noncanon-demo/copy-b/${NONCANON_SESSION_ID}.jsonl`;
+    const CONTENT_A = `${ccUserLine({ uuid: 'nc-a1', text: 'noncanon reupload test content, copy A' })}\n`;
+    const CONTENT_B = `${ccUserLine({ uuid: 'nc-b1', text: 'noncanon reupload test content, copy B' })}\n`;
+    const CONTENT_B_V2 = `${ccUserLine({ uuid: 'nc-b2', text: 'noncanon reupload test content, copy B v2' })}\n`;
+
+    const resA = await putFile('claude-projects', relpathA, CONTENT_A);
+    expect(resA.status).toBe(201);
+    const fileIdA = ((await resA.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    const resB = await putFile('claude-projects', relpathB, CONTENT_B);
+    expect(resB.status).toBe(201);
+    const fileIdB = ((await resB.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    const sessionBefore = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(NONCANON_SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(sessionBefore?.index_state).toBe('ready');
+
+    // Whichever of A/B did NOT win canonical selection is the duplicate this test re-uploads —
+    // determined dynamically (same machine/priority for both, so the tiebreak isn't the point).
+    const canonicalFileId = sessionBefore!.canonical_file_id;
+    const [dupRelpath, dupContentV2] =
+      canonicalFileId === fileIdA ? [relpathB, CONTENT_B_V2] : [relpathA, `${ccUserLine({ uuid: 'nc-a2', text: 'noncanon reupload test content, copy A v2' })}\n`];
+
+    // Re-upload the duplicate (NOT the canonical file) with different bytes — must not flip the
+    // session's index_state, since the canonical row (and its indexed content) is untouched.
+    const resDup2 = await putFile('claude-projects', dupRelpath, dupContentV2);
+    expect(resDup2.status).toBe(201);
+    const dupFileId = ((await resDup2.json()) as { file_id: number }).file_id;
+    expect(dupFileId).not.toBe(canonicalFileId);
+
+    const sessionAfter = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+      .bind(NONCANON_SESSION_ID)
+      .first<{ index_state: string }>();
+    expect(sessionAfter?.index_state).toBe('ready'); // untouched
+  });
+});
+
+describe('R2/D1 convergence after overlapping changed-hash uploads for the same path (regression: interleaved writes could leave files.content_hash describing bytes R2 no longer holds at r2Key)', () => {
+  it('when the row shows a hash that no longer matches what R2 holds, converging restores R2 to match the row, and the row\'s (correct) content then parses', async () => {
+    const CONVERGE_SESSION_ID = 'f0000000-0000-4000-8000-0000000000dd';
+    const relpath = `converge-demo/${CONVERGE_SESSION_ID}.jsonl`;
+    const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
+    const CONTENT_A = `${ccUserLine({ uuid: 'cv-a1', text: 'unique-marker-converge-a copy A content' })}\n`;
+    const CONTENT_B = `${ccUserLine({ uuid: 'cv-b1', text: 'unique-marker-converge-b copy B content' })}\n`;
+
+    // "put A's body" then "put B's body" for the same path — a real changed-hash upload each
+    // time, so both fully run their own PUT+upsert+convergence (which is a no-op for each in
+    // isolation, since nothing raced them). After this, R2 holds B's bytes and the row shows B's
+    // hash — genuinely converged so far.
+    const resA = await putFile('claude-projects', relpath, CONTENT_A);
+    expect(resA.status).toBe(201);
+    const fileId = ((await resA.json()) as { file_id: number }).file_id;
+    const hashA = await sha256Hex(new TextEncoder().encode(CONTENT_A));
+
+    const resB = await putFile('claude-projects', relpath, CONTENT_B);
+    expect(resB.status).toBe(201);
+    const hashB = await sha256Hex(new TextEncoder().encode(CONTENT_B));
+
+    const afterB = await testEnv.DB.prepare('SELECT content_hash FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ content_hash: string }>();
+    expect(afterB?.content_hash).toBe(hashB);
+    expect(await (await testEnv.RAW.get(r2Key))?.text()).toBe(CONTENT_B);
+
+    // Simulate the lost interleaving directly: "A's upsert" ran AFTER B's (D1 row ends up showing
+    // A's hash again) but A's own R2 PUT happened BEFORE B's (R2 still holds B's bytes) — exactly
+    // the end-state a real race between two overlapping requests could produce. Only the D1 row is
+    // touched here; R2 is deliberately left at B's bytes to reproduce the mismatch.
+    await testEnv.DB.prepare('UPDATE files SET content_hash = ?2, size = ?3 WHERE id = ?1')
+      .bind(fileId, hashA, CONTENT_A.length)
+      .run();
+
+    // Invoke the verification step for the last upserter (A, whose hash the row now shows) — the
+    // exact function every putFile request runs on its own way out.
+    await convergeR2WithRow(fileId, r2Key, hashA, new TextEncoder().encode(CONTENT_A).buffer as ArrayBuffer, testEnv);
+
+    // R2 now matches the row: A's bytes, A's checksum.
+    const converged = await testEnv.RAW.get(r2Key);
+    expect(await converged?.text()).toBe(CONTENT_A);
+    const convergedHead = await testEnv.RAW.head(r2Key);
+    const convergedChecksum = convergedHead?.checksums.sha256 ? hex(convergedHead.checksums.sha256) : undefined;
+    expect(convergedChecksum).toBe(hashA);
+
+    // The right message parses: deliver against the row's (now R2-matching) hash and confirm the
+    // session shows A's content, not B's.
+    await deliverOne(fileId, r2Key, hashA);
+    const search = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-converge-a', {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    const searchBody = (await search.json()) as { hits: Array<{ session_id: string }> };
+    expect(searchBody.hits.some((h) => h.session_id === CONVERGE_SESSION_ID)).toBe(true);
   });
 });
 

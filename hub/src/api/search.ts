@@ -28,32 +28,44 @@ export async function search(url: URL, env: Env): Promise<Response> {
 
   if (!q) return Response.json({ error: 'missing_q' }, { status: 400 });
 
-  const run = async (match: string) =>
-    env.DB.prepare(
-      `SELECT b.session_id, b.turn_index, b.block_index, b.role, b.btype, b.tool_name, b.ts,
-              snippet(blocks_fts, 0, '<mark>', '</mark>', '…', 16) AS snip,
-              bm25(blocks_fts) AS rank,
-              s.harness, s.machine_id, s.os, s.cwd, s.repo_url, s.primary_model, s.title, s.started_at, s.index_state
-       FROM blocks_fts
-       JOIN blocks b ON b.id = blocks_fts.rowid
-       JOIN sessions s ON s.session_id = b.session_id
-       WHERE blocks_fts MATCH ?1 ${where}
-       ORDER BY rank LIMIT ${limit + 1} OFFSET ${offset}`,
-    )
-      .bind(match, ...binds)
-      .all();
+  // Returns null (rather than throwing) on invalid FTS5 syntax, so the two-step fallback below
+  // can tell "this match string didn't work" apart from a genuine infra error without a second
+  // layer of try/catch at each call site.
+  const run = async (match: string) => {
+    try {
+      return await env.DB.prepare(
+        `SELECT b.session_id, b.turn_index, b.block_index, b.role, b.btype, b.tool_name, b.ts,
+                snippet(blocks_fts, 0, '<mark>', '</mark>', '…', 16) AS snip,
+                bm25(blocks_fts) AS rank,
+                s.harness, s.machine_id, s.os, s.cwd, s.repo_url, s.primary_model, s.title, s.started_at, s.index_state
+         FROM blocks_fts
+         JOIN blocks b ON b.id = blocks_fts.rowid
+         JOIN sessions s ON s.session_id = b.session_id
+         WHERE blocks_fts MATCH ?1 ${where}
+         ORDER BY rank LIMIT ${limit + 1} OFFSET ${offset}`,
+      )
+        .bind(match, ...binds)
+        .all();
+    } catch {
+      return null;
+    }
+  };
 
-  let rows;
-  let effectiveMatch = q;
-  try {
-    rows = await run(q);
-  } catch {
-    // User query wasn't valid FTS5 syntax — retry as a quoted phrase.
-    effectiveMatch = `"${q.replaceAll('"', '""')}"`;
-    rows = await run(effectiveMatch);
+  // User query wasn't valid FTS5 syntax — retry as a quoted phrase. That fallback can ALSO be
+  // invalid (e.g. q is a single '"', producing an unterminated `""""` that FTS5 rejects too) —
+  // a garbage query should read as "no results", not a 500. effectiveMatch stays null in that
+  // case so the facets query below (which also runs against FTS5) doesn't inherit a match string
+  // already known to be broken.
+  let rows = await run(q);
+  let effectiveMatch: string | null = q;
+  if (!rows) {
+    const quoted = `"${q.replaceAll('"', '""')}"`;
+    rows = await run(quoted);
+    effectiveMatch = rows ? quoted : null;
   }
+  const results = rows?.results ?? [];
 
-  const hits = rows.results.slice(0, limit).map((r) => ({
+  const hits = results.slice(0, limit).map((r) => ({
     session_id: r.session_id,
     snippet: r.snip,
     block: { turn_index: r.turn_index, block_index: r.block_index, role: r.role, btype: r.btype, tool_name: r.tool_name, ts: r.ts },
@@ -71,7 +83,10 @@ export async function search(url: URL, env: Env): Promise<Response> {
   }));
 
   const facets: Record<string, Record<string, number>> = {};
-  if (wantFacets) {
+  // effectiveMatch is null when even the quoted-phrase fallback was invalid FTS5 — a query this
+  // facets clause would ALSO reject. Skip it and report empty facets rather than retrying with a
+  // match string already known to be broken.
+  if (wantFacets && effectiveMatch !== null) {
     for (const col of FACET_COLUMNS) {
       const fr = await env.DB.prepare(
         `SELECT s.${col} AS v, COUNT(DISTINCT s.session_id) AS n
@@ -83,12 +98,14 @@ export async function search(url: URL, env: Env): Promise<Response> {
         .all<{ v: string; n: number }>();
       facets[col] = Object.fromEntries(fr.results.map((r) => [r.v, r.n]));
     }
+  } else if (wantFacets) {
+    for (const col of FACET_COLUMNS) facets[col] = {};
   }
 
   return Response.json({
     hits,
     facets: wantFacets ? facets : undefined,
-    cursor: rows.results.length > limit ? encodeCursor(offset + limit) : undefined,
+    cursor: results.length > limit ? encodeCursor(offset + limit) : undefined,
   });
 }
 

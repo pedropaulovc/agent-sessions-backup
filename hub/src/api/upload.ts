@@ -77,6 +77,14 @@ export async function putFile(
   }
 
   const r2Key = `raw/${machineId}/${store}/${relpath}`;
+  // Buffer the body up front rather than streaming it straight into RAW.put: the convergence
+  // check below (see convergeR2WithRow) may need to re-PUT these exact bytes a second time if a
+  // concurrent request's write interleaves with this one, and request.body is a single-use
+  // stream — RAW.put already consumes it on the first PUT, so a second PUT needs its own copy.
+  // Uploads are small today (well under 35MB); the isolate's 128MB memory limit gives comfortable
+  // headroom — revisit (e.g. switch to a content-addressed key, avoiding the rewrite entirely) if
+  // upload sizes grow enough for this to matter.
+  const bodyBuf = await request.arrayBuffer();
   // R2 verifies the checksum server-side: a corrupt/truncated body never lands. Its returned
   // object's .size is the authoritative byte count — the x-file-size/content-length header
   // above is only an early sanity gate (rejects an obviously-bad value before we touch R2);
@@ -85,7 +93,7 @@ export async function putFile(
   // what R2 actually stored could pick the wrong raw file as canonical.
   let put: R2Object;
   try {
-    put = await env.RAW.put(r2Key, request.body, { sha256 });
+    put = await env.RAW.put(r2Key, bodyBuf, { sha256 });
   } catch (e) {
     return Response.json({ error: 'checksum_or_write_failure', detail: String(e) }, { status: 400 });
   }
@@ -103,15 +111,59 @@ export async function putFile(
     .bind(machineId, store, relpath, r2Key, put.size, mtime, sha256, det.harness, det.sessionId ?? null)
     .first<{ id: number }>();
 
+  // Two overlapping changed-hash uploads for the SAME path can interleave their R2 writes and D1
+  // upserts arbitrarily — this request's RAW.put above can land before or after a concurrent
+  // request's, independent of upsert order. That can leave files.content_hash describing bytes
+  // R2 no longer holds at r2Key. Re-check right after our own upsert: if the row still shows
+  // THIS request's hash, our upsert was the most recent (or only) writer and is authoritative for
+  // what R2 SHOULD hold — restore it if a concurrent request's later R2 write clobbered ours in
+  // between. If the row shows a DIFFERENT hash, some other request's upsert won after ours; THAT
+  // request runs this exact same check on its own way out, so it (not us) owns convergence here.
+  // Either way, a genuinely stale parse message is rejected at the source by the consumer's
+  // content_hash guard, so no reparse can process the wrong bytes even in the brief window before
+  // convergence completes.
+  await convergeR2WithRow(row!.id, r2Key, sha256, bodyBuf, env);
+
   await env.DB.prepare('UPDATE machines SET last_upload_at = strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE machine_id = ?1')
     .bind(machineId)
     .run();
+  if (det.sessionId) {
+    // A changed-hash re-upload of the session's CURRENT canonical file just overwrote the raw
+    // object out from under the derived rows: files.parse_state flips to 'pending' above, but
+    // sessions.index_state (and the blocks/FTS it advertises) would otherwise stay 'ready' —
+    // describing the OLD bytes — until the queue consumer actually gets around to reparsing. If
+    // that message is delayed or dropped, /search and /sessions keep serving stale-but-labeled-
+    // ready content indefinitely. Flip to 'parsing' now: an honest in-progress signal, and if the
+    // message never arrives, the session is visibly stuck 'parsing' (already alertable via
+    // /status) instead of silently stale-'ready'. No-op for a brand-new session (no sessions row
+    // yet) or a non-canonical duplicate (canonical_file_id != this file's id).
+    await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1 AND canonical_file_id = ?2")
+      .bind(det.sessionId, row!.id)
+      .run();
+  }
   await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
 
   console.log(
     JSON.stringify({ event: 'access.upload', machine: machineId, key: r2Key, bytes: put.size, status: existing ? 'updated' : 'created' }),
   );
   return Response.json({ status: 'stored', file_id: row!.id }, { status: 201 });
+}
+
+/**
+ * See the convergence comment at its call site above. Exported for tests, which simulate the
+ * interleaved end-state directly (R2 holding one request's bytes, the row showing a different
+ * request's hash) rather than racing real concurrent requests — there's no thread-level
+ * concurrency to race in a single-isolate test environment, but the resulting DB/R2 state is
+ * identical to what a real interleaving would produce, and this function is exactly what each
+ * request runs to detect and repair it.
+ */
+export async function convergeR2WithRow(fileId: number, r2Key: string, sha256: string, body: ArrayBuffer, env: Env): Promise<void> {
+  const current = await env.DB.prepare('SELECT content_hash FROM files WHERE id = ?1').bind(fileId).first<{ content_hash: string }>();
+  if (current?.content_hash !== sha256) return;
+  const head = await env.RAW.head(r2Key);
+  const headChecksum = head?.checksums.sha256 ? hex(head.checksums.sha256) : undefined;
+  if (headChecksum === sha256) return;
+  await env.RAW.put(r2Key, body, { sha256 });
 }
 
 /** POST /api/v1/files/check — batch resync: which of these does the hub NOT have? */
