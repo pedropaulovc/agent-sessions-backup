@@ -27,6 +27,18 @@ export default defineConfig(async () => {
     ],
     test: {
       setupFiles: ['./test/apply-migrations.ts'],
+      // These are workers-pool INTEGRATION tests: a single `it` routinely drives several full
+      // miniflare round-trips (HTTP PUT -> R2 -> D1, then a queue-consumer parse writing blocks +
+      // FTS5 + sessions + usage). A clean local run of the heaviest of them (e.g. the subagent
+      // meta-linking pair: 2x putFile + 2x drainQueue) is ~1.7s. vitest's 5s default is a
+      // UNIT-test budget: under the CPU contention of CI (or many test files running in parallel
+      // in the shared pool) those round-trips fan out and the same test spikes past 5s, timing out
+      // nondeterministically — whichever heavy test happens to land in the contention window, not
+      // any one test in particular (reproduced: 5/6 full-suite runs under load timed out, on two
+      // different subagent tests). Give the whole integration suite a budget sized for that
+      // contention rather than peppering `}, N)` onto individual heavy tests (which only moves the
+      // flake to the next-heaviest one). Still bounded, so a genuinely hung test fails in time.
+      testTimeout: 15000,
     },
   };
 });
