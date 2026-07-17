@@ -82,6 +82,10 @@
       // so without this a preview deploy would REASSIGN the production custom domains
       // (api./sessions.vza.net) to sessions-hub-preview. Previews serve from workers.dev.
       "routes": [],
+      // Preview URLs are off by default (verified: every *.workers.dev probe of this worker
+      // 404s without it). PR builds upload versions with `--env preview`; this exposes each
+      // version's <hash>-sessions-hub-preview.pedro-18e.workers.dev URL, gated by DEV_AUTH.
+      "preview_urls": true,
       "vars": {
         "ENVIRONMENT": "preview",
         "API_HOST": "api.sessions.vza.net",
