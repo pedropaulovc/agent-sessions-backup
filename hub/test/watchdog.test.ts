@@ -2,28 +2,33 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { runWatchdog } from '../src/cron/watchdog';
 
 // runWatchdog only touches env.DB, so a hand-rolled stub exercises every branch
-// without the workers D1. `prepare` dispatches on the SQL: the size query
-// (PRAGMA page_count/page_size) vs. the machines roster query.
+// without the workers D1. `prepare` dispatches on the SQL: the machines roster
+// query (SELECT ... FROM machines) vs. the size probe (SELECT 1). The size probe
+// reads bytes off the D1 result's `meta.size_after` (see watchdog.ts), so the
+// stub models meta: a numeric size_after (real bytes), an absent size_after, or a
+// throw (e.g. the production SQLITE_AUTH the PRAGMA form hit).
 function makeEnv(opts: {
   machines: Array<{ machine_id: string; last_ref: string | null; age_seconds: number | null }>;
   rosterThrows?: boolean;
-  size?: { throws?: boolean; bytes?: number | null };
+  size?: { throws?: boolean; bytes?: number; sizeAfterAbsent?: boolean };
 }): Env {
   return {
     DB: {
       prepare(sql: string) {
-        if (sql.includes('page_count')) {
+        if (sql.includes('machines')) {
           return {
-            first: async () => {
-              if (opts.size?.throws) throw new Error('no such function: pragma_page_count');
-              return { bytes: opts.size?.bytes ?? null };
+            all: async () => {
+              if (opts.rosterThrows) throw new Error('no such table: machines');
+              return { results: opts.machines };
             },
           };
         }
+        // Size probe (`SELECT 1`): watchdog reads probe.meta.size_after.
         return {
-          all: async () => {
-            if (opts.rosterThrows) throw new Error('no such table: machines');
-            return { results: opts.machines };
+          run: async () => {
+            if (opts.size?.throws) throw new Error('D1_ERROR: not authorized: SQLITE_AUTH');
+            const meta = opts.size?.sizeAfterAbsent ? {} : { size_after: opts.size?.bytes ?? 0 };
+            return { success: true, results: [], meta };
           },
         };
       },
@@ -90,17 +95,24 @@ describe('watchdog', () => {
     expect(events.some((e) => e.event === 'hub.watchdog.warn' && e.tag === 'machines-roster-unavailable')).toBe(true);
   });
 
-  it('emits a bytes:-1 sentinel + warn when the size probe throws', async () => {
+  it('emits a bytes:-1 sentinel + warn when the size probe throws (e.g. SQLITE_AUTH)', async () => {
     const events = captureLogs();
     await runWatchdog(makeEnv({ machines: [], size: { throws: true } }));
     expect(events.find((e) => e.event === 'hub.d1.db_size_bytes')?.bytes).toBe(-1);
     expect(events.some((e) => e.event === 'hub.watchdog.warn' && e.tag === 'd1-size-unavailable')).toBe(true);
   });
 
-  it('emits a bytes:-1 sentinel when the size probe returns no bytes', async () => {
+  it('emits real bytes from meta.size_after when present', async () => {
     const events = captureLogs();
-    await runWatchdog(makeEnv({ machines: [], size: { bytes: null } }));
+    await runWatchdog(makeEnv({ machines: [], size: { bytes: 5701632 } }));
+    expect(events.find((e) => e.event === 'hub.d1.db_size_bytes')?.bytes).toBe(5701632);
+    expect(events.some((e) => e.event === 'hub.watchdog.warn' && e.tag === 'd1-size-unavailable')).toBe(false);
+  });
+
+  it('emits a bytes:-1 sentinel + warn when the D1 result has no meta.size_after', async () => {
+    const events = captureLogs();
+    await runWatchdog(makeEnv({ machines: [], size: { sizeAfterAbsent: true } }));
     expect(events.find((e) => e.event === 'hub.d1.db_size_bytes')?.bytes).toBe(-1);
-    expect(events.some((e) => e.event === 'hub.watchdog.warn')).toBe(true);
+    expect(events.some((e) => e.event === 'hub.watchdog.warn' && e.tag === 'd1-size-unavailable')).toBe(true);
   });
 });
