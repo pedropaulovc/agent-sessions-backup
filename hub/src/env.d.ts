@@ -14,5 +14,10 @@ interface Env {
 interface ParseMessage {
   file_id: number;
   r2_key: string;
-  reason: 'upload' | 'reindex';
+  reason: 'upload' | 'reindex' | 'recover';
+  /** The files row's content_hash as of enqueue time. Lets the consumer detect a re-upload that
+   * changed the row's hash while this message's parse was in flight, and avoid marking the row
+   * 'parsed' for content it didn't actually parse. Optional so legacy in-flight messages (enqueued
+   * before this field existed) still process with today's unconditional behavior. */
+  content_hash?: string;
 }

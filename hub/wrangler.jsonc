@@ -10,8 +10,12 @@
   //   { "pattern": "api.sessions.vza.net/*", "zone_name": "vza.net" },
   //   { "pattern": "sessions.vza.net/*", "zone_name": "vza.net" }
   // ],
+  // Fail-closed default: an un-configured `wrangler deploy` (no env override) must NOT
+  // accept the x-dev-machine dev-auth header (see src/auth/identity.ts). Local development
+  // overrides this via `npm run dev` (--var ENVIRONMENT:development); vitest overrides it
+  // via vitest.config.ts's miniflare bindings, independent of this file.
   "vars": {
-    "ENVIRONMENT": "development",
+    "ENVIRONMENT": "production",
     "API_HOST": "api.sessions.vza.net",
     "VIEWER_HOST": "sessions.vza.net"
   },
@@ -32,7 +36,11 @@
         "queue": "parse",
         "max_batch_size": 5,
         "max_retries": 3,
-        "max_concurrency": 2,
+        // Serial, not concurrent: closes the canonical-selection TOCTOU window between the
+        // post-parse recheck and the write (consumer.ts) rather than just narrowing it. Parse
+        // throughput is a few files per 15-minute batch at steady state, and backfill tolerates
+        // serial processing — this is not a throughput-sensitive path.
+        "max_concurrency": 1,
         "dead_letter_queue": "parse-dlq"
       }
     ]
