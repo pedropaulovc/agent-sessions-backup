@@ -688,3 +688,87 @@ describe('a canonical file reparsed to zero turns clears the stale index and rec
     expect(sessionRecovered?.index_state).toBe('ready');
   });
 });
+
+describe('a canonical parse that throws (not just zero-turn) also recovers via a duplicate', () => {
+  const SESSION_ID = '44444444-5555-4444-8444-000000000001';
+  const CONTENT_VALID_A = [
+    ccUserLine({ uuid: 'throwrecover-u1', text: 'unique-marker-beta searchable content' }),
+    ccAssistantLine({ uuid: 'throwrecover-a1', parentUuid: 'throwrecover-u1', text: 'unique-marker-beta response' }),
+  ].join('\n');
+  const CONTENT_VALID_B = [
+    ccUserLine({ uuid: 'throwrecover-u2', text: 'unique-marker-beta searchable content from B' }),
+    ccAssistantLine({ uuid: 'throwrecover-a2', parentUuid: 'throwrecover-u2', text: 'unique-marker-beta response from B' }),
+  ].join('\n');
+
+  beforeAll(async () => {
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('throwrecover-a', 'linux', 0) ON CONFLICT (machine_id) DO UPDATE SET priority = 0",
+      ),
+      testEnv.DB.prepare(
+        "INSERT INTO machines (machine_id, os, priority) VALUES ('throwrecover-b', 'linux', 1) ON CONFLICT (machine_id) DO UPDATE SET priority = 1",
+      ),
+    ]);
+  });
+
+  it("canonical A's R2 object goes missing: the catch path errors the session and automatically re-enqueues superseded duplicate B, which recovers it", async () => {
+    const resA = await putFile('throwrecover-a', 'claude-projects', `throwrecover-a-path/${SESSION_ID}.jsonl`, CONTENT_VALID_A);
+    expect(resA.status).toBe(201);
+    const fileIdA = ((await resA.json()) as { file_id: number }).file_id;
+    const r2KeyA = `raw/throwrecover-a/claude-projects/throwrecover-a-path/${SESSION_ID}.jsonl`;
+    await deliverOne(fileIdA, r2KeyA);
+
+    const sessionAfterA = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(sessionAfterA?.canonical_file_id).toBe(fileIdA);
+    expect(sessionAfterA?.index_state).toBe('ready');
+
+    const resB = await putFile('throwrecover-b', 'claude-projects', `throwrecover-b-path/${SESSION_ID}.jsonl`, CONTENT_VALID_B);
+    expect(resB.status).toBe(201);
+    const fileIdB = ((await resB.json()) as { file_id: number }).file_id;
+    const r2KeyB = `raw/throwrecover-b/claude-projects/throwrecover-b-path/${SESSION_ID}.jsonl`;
+    await deliverOne(fileIdB, r2KeyB);
+    const rowB1 = await testEnv.DB.prepare('SELECT parse_state, content_hash FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string; content_hash: string }>();
+    expect(rowB1?.parse_state).toBe('superseded'); // A was already canonical+parsed
+
+    const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
+
+    // Simulate loss of the canonical's backing R2 object — its next parse attempt throws
+    // r2_object_missing instead of producing a zero-turn parse.
+    await testEnv.RAW.delete(r2KeyA);
+    await deliverOne(fileIdA, r2KeyA);
+
+    const rowA = await testEnv.DB.prepare('SELECT parse_state, parse_error FROM files WHERE id = ?1')
+      .bind(fileIdA)
+      .first<{ parse_state: string; parse_error: string | null }>();
+    expect(rowA?.parse_state).toBe('error');
+    expect(rowA?.parse_error).toContain('r2_object_missing');
+
+    const sessionAfterThrow = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(sessionAfterThrow?.index_state).toBe('error');
+    expect(sessionAfterThrow?.canonical_file_id).toBe(fileIdA); // kept — old rows are the only surviving trace
+
+    // The catch path should have automatically enqueued B's parse.
+    expect(sendSpy).toHaveBeenCalledWith(expect.objectContaining({ file_id: fileIdB, reason: 'recover' }));
+    sendSpy.mockRestore();
+
+    // Deliver that recovery message ourselves (the test harness doesn't auto-drain sends).
+    await deliverOne(fileIdB, r2KeyB, rowB1!.content_hash);
+
+    const rowB2 = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileIdB)
+      .first<{ parse_state: string }>();
+    expect(rowB2?.parse_state).toBe('parsed');
+
+    const sessionRecovered = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ canonical_file_id: number; index_state: string }>();
+    expect(sessionRecovered?.canonical_file_id).toBe(fileIdB);
+    expect(sessionRecovered?.index_state).toBe('ready');
+  });
+});

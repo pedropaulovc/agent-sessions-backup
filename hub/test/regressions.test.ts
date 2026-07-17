@@ -258,6 +258,18 @@ describe('failed reparse surfaces as session index_state=error', () => {
       .bind(POISON_SESSION_ID)
       .first<{ index_state: string }>();
     expect(sessionRow?.index_state).toBe('error');
+
+    // The catch path deliberately keeps the OLD blocks/blocks_fts/usage rows rather than
+    // deleting them (unlike parseOne's zero-turn branch): a throw here means we couldn't even
+    // read the raw content, so those rows may be the only surviving trace of the session. The
+    // stale hit must still carry index_state='error' so callers can tell it's not current.
+    const search = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=poison', {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    expect(search.status).toBe(200);
+    const searchBody = (await search.json()) as { hits: Array<{ session_id: string; session: { index_state: string } }> };
+    const hit = searchBody.hits.find((h) => h.session_id === POISON_SESSION_ID);
+    expect(hit?.session.index_state).toBe('error');
   });
 
   it('the catch-path UPDATE is a guarded no-op when the stored session_id is NULL (never crashes)', async () => {

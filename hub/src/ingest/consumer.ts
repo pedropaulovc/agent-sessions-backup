@@ -32,13 +32,36 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
       // other valid copy already indexed successfully and remains the source of truth, so this
       // failure (of a copy that was never canonical, or has since been superseded) must not
       // clobber a perfectly good session back to 'error'.
-      await env.DB.prepare(
+      //
+      // Deliberately does NOT clear the session's old blocks/blocks_fts/usage rows here (unlike
+      // the zero-turn branch in parseOne, which DOES clear them). The two cases differ: zero-turn
+      // means we successfully read the new content and know it's genuinely empty; a throw here
+      // (the flagship case is r2_object_missing) means we could NOT read the raw content at
+      // all — the existing index rows may be the ONLY surviving trace of the session. This
+      // system is preservation-first: serving stale-but-labeled (index_state='error') data beats
+      // permanently destroying the last copy of a session that a transient/permanent read
+      // failure happened to hit. search()/getSession()/listSessions() all surface index_state in
+      // their response shape, so callers can filter or flag on it themselves.
+      const updated = await env.DB.prepare(
         `UPDATE sessions SET index_state = 'error'
          WHERE session_id = (SELECT session_id FROM files WHERE id = ?1 AND session_id IS NOT NULL)
-           AND (canonical_file_id IS NULL OR canonical_file_id = ?1)`,
+           AND (canonical_file_id IS NULL OR canonical_file_id = ?1)
+         RETURNING session_id`,
       )
         .bind(msg.body.file_id)
-        .run();
+        .first<{ session_id: string }>();
+      if (updated) {
+        // This file was (or would have been) canonical for the session — the same recovery this
+        // gets in the zero-turn branch: look for another valid duplicate (even a previously-
+        // superseded one, freed up now that this file is 'error') and kick its parse so the
+        // session can recover automatically instead of staying errored until a manual reindex.
+        // Runs on every retry attempt too; harmless — the hash-guarded markParsed and idempotent
+        // writeSession absorb duplicate recovery attempts.
+        const recovery = await chooseRecoveryCandidate(updated.session_id, msg.body.file_id, env);
+        if (recovery) {
+          await env.PARSE_QUEUE.send({ file_id: recovery.id, r2_key: recovery.r2_key, reason: 'recover', content_hash: recovery.content_hash });
+        }
+      }
       msg.retry();
     }
   }
