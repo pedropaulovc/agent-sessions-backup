@@ -35,7 +35,7 @@ def build_auth(cfg: config_mod.Config):
     if cfg.auth == "dev":
         return DevAuth(cfg.machine_id)
     if cfg.auth == "mtls":
-        return MtlsAuth()
+        return MtlsAuth(client_cert_path=cfg.client_cert_path, client_key_path=cfg.client_key_path)
     raise ValueError(f"unknown auth mode {cfg.auth!r} (expected dev|mtls)")
 
 

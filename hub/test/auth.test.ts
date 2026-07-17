@@ -12,6 +12,12 @@ function reqWith(headers: Record<string, string>): Request {
   return new Request('https://api.sessions.vza.net/api/v1/status', { headers });
 }
 
+function reqWithCert(tlsClientAuth: Record<string, string>): Request {
+  return new Request('https://api.sessions.vza.net/api/v1/status', {
+    cf: { tlsClientAuth },
+  } as unknown as RequestInit);
+}
+
 describe('machineIdentity', () => {
   it('development: trusts x-dev-machine with no bearer required', async () => {
     const identity = await machineIdentity(reqWith({ 'x-dev-machine': 'devbox' }), envWith({ ENVIRONMENT: 'development' }));
@@ -71,6 +77,36 @@ describe('machineIdentity', () => {
     delete (env as { ENVIRONMENT?: string }).ENVIRONMENT;
     const identity = await machineIdentity(reqWith({ 'x-dev-machine': 'unconfigured-box' }), env);
     expect(identity).toEqual({ kind: 'anonymous' });
+  });
+
+  it('rejects a verified-but-REVOKED cert even when its fingerprint is enrolled', async () => {
+    const fp = 'aa11revoketestfingerprint';
+    await testEnv.DB.prepare(
+      `INSERT INTO machines (machine_id, os, cert_fp_sha256, is_admin) VALUES ('revoked-box', 'linux', ?1, 1)
+       ON CONFLICT (machine_id) DO UPDATE SET cert_fp_sha256 = excluded.cert_fp_sha256`,
+    )
+      .bind(fp)
+      .run();
+    const prod = envWith({ ENVIRONMENT: 'production' });
+
+    // Positive control: the same enrolled cert, NOT revoked, authenticates as the machine —
+    // proving the cf.tlsClientAuth path is reached and the fingerprint maps.
+    const ok = await machineIdentity(reqWithCert({ certVerified: 'SUCCESS', certFingerprintSHA256: fp }), prod);
+    expect(ok).toEqual({ kind: 'machine', machineId: 'revoked-box', isAdmin: true });
+
+    // The fix: certVerified stays 'SUCCESS' for a revoked cert, so without the certRevoked
+    // check the still-enrolled row would keep authenticating. It must fall through to anonymous.
+    // '1' is Cloudflare's documented revoked value; 'true' is accepted too (doc-drift belt).
+    const revoked1 = await machineIdentity(
+      reqWithCert({ certVerified: 'SUCCESS', certRevoked: '1', certFingerprintSHA256: fp }),
+      prod,
+    );
+    expect(revoked1).toEqual({ kind: 'anonymous' });
+    const revokedTrue = await machineIdentity(
+      reqWithCert({ certVerified: 'SUCCESS', certRevoked: 'true', certFingerprintSHA256: fp }),
+      prod,
+    );
+    expect(revokedTrue).toEqual({ kind: 'anonymous' });
   });
 });
 

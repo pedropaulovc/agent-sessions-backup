@@ -1,7 +1,8 @@
 """Transport: subprocess curl (system curl on Linux + Windows).
 
-Auth is a strategy so the mTLS variants can slot in later without touching call sites.
-DevAuth adds the x-dev-machine header; MtlsAuth raises NotImplementedError for now.
+Auth is a strategy so the mTLS variants slot in without touching call sites.
+DevAuth adds the x-dev-machine header; MtlsAuth presents a file-based client cert+key
+(--cert/--key) for software keys, and raises NotImplementedError for TPM keys (M4).
 
 Backfill fast path (upload_batch): one curl invocation per 50 URLs using a --config file
 of `--next`-separated request blocks, run with `--parallel --parallel-max N`. Bodies are
@@ -31,6 +32,33 @@ def _curl_config_quote(value: str) -> str:
     backslashes first, then double-quotes.
     """
     return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _auth_config_directives(auth_args: list[str], q) -> list[str]:
+    """Translate an auth strategy's command-line curl args into curl --config directives.
+
+    curl's config file names options by their long form without dashes (`-H "x"` ->
+    `header = "x"`, `--cert P` -> `cert = "P"`), so serializing the flags verbatim as
+    `header = ...` (the old behavior) turned `--cert`/`--key` into bogus header lines and
+    the parallel batch upload ran without a client cert. Every auth flag we emit takes
+    exactly one value, so consume the args in (flag, value) pairs and map generically:
+    `-H`/`--header` -> `header`, any other `--long` -> `long`. Unknown short flags raise
+    rather than silently mis-serialize again."""
+    directives: list[str] = []
+    i = 0
+    while i < len(auth_args):
+        flag = auth_args[i]
+        value = auth_args[i + 1] if i + 1 < len(auth_args) else ""
+        if flag in ("-H", "--header"):
+            name = "header"
+        elif flag.startswith("--"):
+            name = flag[2:]
+        else:
+            raise ValueError(f"cannot serialize curl auth flag {flag!r} into a --config directive")
+        directives.append(f'{name} = "{q(value)}"')
+        i += 2
+    return directives
+
 
 BACKOFF = (0.5, 2.0, 8.0)
 BATCH_SIZE = 50
@@ -72,19 +100,47 @@ class DevAuth(AuthStrategy):
 
 
 class MtlsAuth(AuthStrategy):
-    """Placeholder: mTLS lands in a later milestone (TPM keygen -> CSR -> managed CA)."""
+    """mTLS client-cert auth. `software` keys (WSL/software fallback) present a PEM cert +
+    key file to curl (`--cert`/`--key`); the files are produced by infra/cf/enroll-cert.sh
+    and their paths live in the collector config (client_cert_path/client_key_path).
 
-    def __init__(self, key_protection: str = "software"):
+    TPM-backed keys (key_protection != "software") still raise NotImplementedError: the
+    private key never leaves the TPM, so curl must reference a provider/engine key handle
+    rather than a file — that lands in M4 with the per-platform TPM backends.
+    """
+
+    def __init__(
+        self,
+        client_cert_path: str | None = None,
+        client_key_path: str | None = None,
+        key_protection: str = "software",
+    ):
+        self.client_cert_path = client_cert_path
+        self.client_key_path = client_key_path
         self.key_protection = key_protection
 
     def curl_args(self) -> list[str]:
-        raise NotImplementedError(
-            f"mTLS transport (key_protection={self.key_protection!r}) is not implemented "
-            "yet; it lands in a later milestone. For TPM-backed keys the private key never "
-            "leaves the TPM, so curl must be invoked with an engine/provider that references "
-            "the key handle — wire that here when the mTLS milestone starts. Use auth=\"dev\" "
-            "for now."
-        )
+        if self.key_protection != "software":
+            raise NotImplementedError(
+                f"TPM-backed mTLS (key_protection={self.key_protection!r}) is not implemented "
+                "yet; it lands in M4. The TPM key can't be handed to curl as a file — curl must "
+                "reference the provider/engine key handle. Use key_protection=\"software\" (a "
+                "file-based cert+key from infra/cf/enroll-cert.sh) until then."
+            )
+        cert, key = self.client_cert_path, self.client_key_path
+        if not cert or not key:
+            missing = "client_key_path" if cert else ("client_cert_path" if key else "client_cert_path and client_key_path")
+            raise ValueError(
+                f"mTLS auth requires both client_cert_path and client_key_path in the config; "
+                f"missing {missing}. Run infra/cf/enroll-cert.sh, then set both paths (see mtls.md)."
+            )
+        for label, path in (("client_cert_path", cert), ("client_key_path", key)):
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"mTLS {label} points at {path!r}, which does not exist. Re-run "
+                    "infra/cf/enroll-cert.sh to (re)generate the cert/key, or fix the config path."
+                )
+        return ["--cert", cert, "--key", key]
 
 
 def _retryable(returncode: int, status: int) -> bool:
@@ -184,7 +240,12 @@ class Transport:
         return status, body
 
     def get(self, url: str) -> tuple[int, str]:
-        return self._run_retry([*self._COMMON, url])
+        # Attach the auth strategy's curl args like put()/post_json() do. The only GET is
+        # doctor's /healthz probe against the API host, where the WAF rule blocks every
+        # uncertified request — a certless probe would report a correctly-enrolled production
+        # collector as "hub unreachable". The client cert is not a secret to withhold from a
+        # health check, and sending it makes doctor validate the real production auth path.
+        return self._run_retry([*self._COMMON, *self.auth.curl_args(), url])
 
     def put(self, url: str, body_path: Path, headers: dict[str, str]) -> tuple[int, str]:
         argv = [*self._COMMON, "--upload-file", str(body_path)]
@@ -242,10 +303,7 @@ class Transport:
             ]
             for k, v in up.headers.items():
                 block.append(f'header = "{q(k)}: {q(v)}"')
-            for arg in self.auth.curl_args():
-                if arg == "-H":
-                    continue
-                block.append(f'header = "{q(arg)}"')
+            block.extend(_auth_config_directives(self.auth.curl_args(), q))
             blocks.append("\n".join(block))
         return "\n--next\n".join(blocks) + "\n"
 

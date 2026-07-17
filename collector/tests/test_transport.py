@@ -79,9 +79,107 @@ def test_get_healthz(hub):
     assert '"ok": true' in body or '"ok":true' in body
 
 
-def test_mtls_auth_not_implemented():
+def test_mtls_tpm_key_not_implemented():
+    # TPM-backed keys can't be handed to curl as a file; that lands in M4.
     with pytest.raises(NotImplementedError):
-        MtlsAuth("tpm").curl_args()
+        MtlsAuth(key_protection="tpm").curl_args()
+
+
+def test_mtls_software_returns_cert_and_key_args(tmp_path):
+    cert = tmp_path / "box.client.pem"
+    key = tmp_path / "box.client.key"
+    cert.write_text("cert")
+    key.write_text("key")
+    args = MtlsAuth(client_cert_path=str(cert), client_key_path=str(key)).curl_args()
+    assert args == ["--cert", str(cert), "--key", str(key)]
+
+
+def test_mtls_missing_one_path_errors():
+    # Only a cert, no key -> a clear config error, not a cryptic curl failure.
+    with pytest.raises(ValueError, match="client_key_path"):
+        MtlsAuth(client_cert_path="/x/box.pem").curl_args()
+    with pytest.raises(ValueError, match="client_cert_path"):
+        MtlsAuth(client_key_path="/x/box.key").curl_args()
+
+
+def test_mtls_missing_key_file_errors(tmp_path):
+    cert = tmp_path / "box.client.pem"
+    cert.write_text("cert")
+    with pytest.raises(FileNotFoundError, match="client_key_path"):
+        MtlsAuth(client_cert_path=str(cert), client_key_path=str(tmp_path / "absent.key")).curl_args()
+
+
+def test_auth_config_directives_maps_options_not_headers():
+    from agent_collector.transport import _auth_config_directives
+
+    q = lambda s: s  # noqa: E731 — identity quoter for the assertion
+    # mTLS options become curl config directives, NOT headers (the bug was header = "--cert").
+    assert _auth_config_directives(["--cert", "/c", "--key", "/k"], q) == ['cert = "/c"', 'key = "/k"']
+    # the header path (DevAuth) still maps to a header directive.
+    assert _auth_config_directives(["-H", "x-dev-machine: m1"], q) == ['header = "x-dev-machine: m1"']
+    # an unmapped short flag fails loudly rather than silently mis-serializing again.
+    with pytest.raises(ValueError):
+        _auth_config_directives(["-x", "v"], q)
+
+
+def test_build_upload_config_mtls_emits_cert_key_not_bogus_headers(tmp_path):
+    cert = tmp_path / "box.client.pem"
+    key = tmp_path / "box.client.key"
+    cert.write_text("cert")
+    key.write_text("key")
+    t = Transport(MtlsAuth(client_cert_path=str(cert), client_key_path=str(key)))
+    up = Upload("https://api.example/x", str(tmp_path / "body"), {"x-content-hash": "sha256:ab"})
+    cfg = t._build_upload_config([up])
+    assert f'cert = "{cert}"' in cfg
+    assert f'key = "{key}"' in cfg
+    # Regression guard: pre-fix these went through the "everything is a header" path.
+    assert 'header = "--cert"' not in cfg
+    assert 'header = "--key"' not in cfg
+    # Real request headers still serialize as headers (positive control for the header path).
+    assert 'header = "x-content-hash: sha256:ab"' in cfg
+
+
+def test_build_upload_config_dev_still_emits_header(tmp_path):
+    t = Transport(DevAuth("m1"))
+    up = Upload("https://api.example/x", str(tmp_path / "body"), {})
+    cfg = t._build_upload_config([up])
+    assert 'header = "x-dev-machine: m1"' in cfg
+
+
+def test_get_sends_mtls_cert_on_health_probe(tmp_path, monkeypatch):
+    # doctor's /healthz GET must carry the client cert, else the WAF blocks it and a
+    # correctly-enrolled production collector reports the hub unreachable.
+    cert = tmp_path / "c.pem"
+    key = tmp_path / "c.key"
+    cert.write_text("c")
+    key.write_text("k")
+    t = Transport(MtlsAuth(client_cert_path=str(cert), client_key_path=str(key)))
+    captured = {}
+
+    def fake_run(argv):
+        captured["argv"] = argv
+        return 0, 200, ""
+
+    monkeypatch.setattr(t, "_run", fake_run)
+    status, _ = t.get("https://api.sessions.vza.net/healthz")
+    assert status == 200
+    argv = captured["argv"]
+    assert "--cert" in argv and str(cert) in argv
+    assert "--key" in argv and str(key) in argv
+
+
+def test_get_sends_dev_header_on_health_probe(monkeypatch):
+    # positive control: the header-based auth path still rides the GET probe.
+    t = Transport(DevAuth("m1"))
+    captured = {}
+
+    def fake_run(argv):
+        captured["argv"] = argv
+        return 0, 200, ""
+
+    monkeypatch.setattr(t, "_run", fake_run)
+    t.get("https://api.sessions.vza.net/healthz")
+    assert "x-dev-machine: m1" in captured["argv"]
 
 
 def test_parse_curl_version():

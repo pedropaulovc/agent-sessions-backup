@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -39,9 +40,95 @@ def test_enroll_and_load_roundtrip(tmp_path):
     assert ".credentials.json" in loaded.effective_excludes()
 
 
-def test_enroll_non_dev_not_implemented(tmp_path):
-    with pytest.raises(NotImplementedError):
+def test_enroll_mtls_without_paths_errors(tmp_path):
+    # Non-dev enrollment needs both cert and key; otherwise a clear error, not a broken config.
+    with pytest.raises(ValueError, match="--client-cert and --client-key"):
         config.enroll("http://x", dev=False, path=tmp_path / "c.toml")
+
+
+def test_enroll_mtls_roundtrip(tmp_path):
+    path = tmp_path / "config.toml"
+    cert = tmp_path / "box.client.pem"
+    key = tmp_path / "box.client.key"
+    cfg = config.enroll(
+        "https://api.sessions.vza.net",
+        dev=False,
+        path=path,
+        machine_id="m1",
+        client_cert_path=str(cert),
+        client_key_path=str(key),
+    )
+    assert cfg.auth == "mtls"
+    loaded = config.load(path)
+    assert loaded.auth == "mtls"
+    assert loaded.client_cert_path == str(cert.resolve())
+    assert loaded.client_key_path == str(key.resolve())
+
+
+def test_enroll_mtls_preserves_existing_machine_id(tmp_path):
+    # Re-enrolling for mTLS must keep the id enroll-cert.sh already signed the cert for,
+    # not reset it to default_machine_id() (that would diverge -> machine_mismatch).
+    path = tmp_path / "config.toml"
+    cert = tmp_path / "c.pem"
+    key = tmp_path / "c.key"
+    cert.write_text("c")
+    key.write_text("k")
+    config.enroll("http://h", dev=True, path=path, machine_id="my-custom-box")
+    cfg = config.enroll(
+        "https://api", dev=False, path=path,
+        client_cert_path=str(cert), client_key_path=str(key),
+    )
+    assert cfg.machine_id == "my-custom-box"
+    assert config.load(path).machine_id == "my-custom-box"
+
+
+def test_enroll_mtls_preserves_custom_stores_and_excludes(tmp_path):
+    # A customized collector must keep backing up its custom roots / WSL policy after the
+    # dev -> mTLS production re-enroll; only auth material + hub_url + machine_id change.
+    path = tmp_path / "config.toml"
+    cert = tmp_path / "c.pem"
+    key = tmp_path / "c.key"
+    cert.write_text("c")
+    key.write_text("k")
+    path.write_text(
+        'machine_id = "box"\nhub_url = "http://h"\nauth = "dev"\n'
+        "include_windows_mounts = true\n"
+        'exclude = ["*.secret"]\n\n'
+        '[stores]\nclaude = "~/.claude"\nmystore = "~/custom"\n'
+    )
+    config.enroll(
+        "https://api", dev=False, path=path,
+        client_cert_path=str(cert), client_key_path=str(key),
+    )
+    loaded = config.load(path)
+    assert loaded.auth == "mtls"
+    assert loaded.machine_id == "box"
+    assert loaded.stores == {"claude": "~/.claude", "mystore": "~/custom"}
+    assert loaded.exclude == ["*.secret"]
+    assert loaded.include_windows_mounts is True
+
+
+def test_enroll_explicit_machine_id_wins_over_existing(tmp_path):
+    path = tmp_path / "config.toml"
+    config.enroll("http://h", dev=True, path=path, machine_id="old-box")
+    cfg = config.enroll("http://h", dev=True, path=path, machine_id="new-box")
+    assert cfg.machine_id == "new-box"
+
+
+def test_enroll_mtls_resolves_relative_cert_paths(tmp_path, monkeypatch):
+    # enroll-cert.sh defaults to --out . (relative); scheduled jobs run from another cwd,
+    # so the stored config must hold absolute paths.
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "c.pem").write_text("c")
+    (tmp_path / "c.key").write_text("k")
+    path = tmp_path / "config.toml"
+    cfg = config.enroll(
+        "https://api", dev=False, path=path, machine_id="m1",
+        client_cert_path="c.pem", client_key_path="c.key",
+    )
+    assert Path(cfg.client_cert_path).is_absolute()
+    assert Path(cfg.client_key_path).is_absolute()
+    assert config.load(path).client_cert_path == str((tmp_path / "c.pem").resolve())
 
 
 def test_load_missing_raises(tmp_path):

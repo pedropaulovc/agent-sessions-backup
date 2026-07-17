@@ -32,9 +32,19 @@ export function previewBearerOk(request: Request, env: Env): boolean {
  * misconfigured deploy fails closed instead of accidentally granting admin.
  */
 export async function machineIdentity(request: Request, env: Env): Promise<Identity> {
-  const tls = (request.cf as { tlsClientAuth?: { certVerified?: string; certFingerprintSHA256?: string } } | undefined)
-    ?.tlsClientAuth;
-  if (tls?.certVerified === 'SUCCESS' && tls.certFingerprintSHA256) {
+  const tls = (
+    request.cf as { tlsClientAuth?: { certVerified?: string; certRevoked?: string; certFingerprintSHA256?: string } } | undefined
+  )?.tlsClientAuth;
+  // certVerified stays 'SUCCESS' for a REVOKED but otherwise-valid cert — Cloudflare exposes
+  // revocation as the separate certRevoked flag — so a decommissioned or compromised machine
+  // whose row still exists in `machines` could otherwise keep authenticating. Reject revoked
+  // certs here too; the edge WAF rule is the first line, this is defense in depth.
+  // The client-certificate variables doc says certRevoked is the string '1' (revoked) / '0'
+  // (not) — https://developers.cloudflare.com/ssl/client-certificates/client-certificate-variables/
+  // — so '1' is the primary case; we also treat 'true' as revoked to be robust to doc drift
+  // (fail closed on any truthy-looking value rather than admit a revoked cert).
+  const revoked = tls?.certRevoked === '1' || tls?.certRevoked === 'true';
+  if (tls?.certVerified === 'SUCCESS' && !revoked && tls.certFingerprintSHA256) {
     const row = await env.DB.prepare(
       'SELECT machine_id, is_admin FROM machines WHERE cert_fp_sha256 = ?1',
     )
