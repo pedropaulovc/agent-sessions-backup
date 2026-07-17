@@ -39,9 +39,29 @@ def test_enroll_and_load_roundtrip(tmp_path):
     assert ".credentials.json" in loaded.effective_excludes()
 
 
-def test_enroll_non_dev_not_implemented(tmp_path):
-    with pytest.raises(NotImplementedError):
+def test_enroll_mtls_without_paths_errors(tmp_path):
+    # Non-dev enrollment needs both cert and key; otherwise a clear error, not a broken config.
+    with pytest.raises(ValueError, match="--client-cert and --client-key"):
         config.enroll("http://x", dev=False, path=tmp_path / "c.toml")
+
+
+def test_enroll_mtls_roundtrip(tmp_path):
+    path = tmp_path / "config.toml"
+    cert = tmp_path / "box.client.pem"
+    key = tmp_path / "box.client.key"
+    cfg = config.enroll(
+        "https://api.sessions.vza.net",
+        dev=False,
+        path=path,
+        machine_id="m1",
+        client_cert_path=str(cert),
+        client_key_path=str(key),
+    )
+    assert cfg.auth == "mtls"
+    loaded = config.load(path)
+    assert loaded.auth == "mtls"
+    assert loaded.client_cert_path == str(cert)
+    assert loaded.client_key_path == str(key)
 
 
 def test_load_missing_raises(tmp_path):

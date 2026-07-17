@@ -42,11 +42,19 @@ Associate the managed CA with `api.sessions.vza.net` so the edge requests a clie
 cert during the TLS handshake (without this, `cf.tlsClientAuth` is never populated).
 
 Dashboard path: **SSL/TLS → Client Certificates → Hosts** → add `api.sessions.vza.net`
-(and toggle "mTLS" for that hostname). API equivalent:
+(and toggle "mTLS" for that hostname). The dashboard only adds the host, so it is the
+safe option.
+
+The API endpoint is **Replace** Hostname Associations, not append — a bare PUT with just
+this host silently drops mTLS from any sibling host already associated on the zone. So
+read the current list first and PUT the **union**:
 
 ```
+# 1. read existing associations
+GET /zones/{zone}/certificate_authorities/hostname_associations
+# 2. PUT the existing hostnames PLUS api.sessions.vza.net (union of the two)
 PUT /zones/{zone}/certificate_authorities/hostname_associations
-  { "hostnames": ["api.sessions.vza.net"] }
+  { "hostnames": ["<each existing host>", "api.sessions.vza.net"] }
 ```
 
 Do **not** associate `sessions.vza.net` — the viewer uses passkeys, never client certs.
@@ -56,12 +64,16 @@ Do **not** associate `sessions.vza.net` — the viewer uses passkeys, never clie
 Dashboard: **Security → WAF → Custom rules → Create rule**, scoped to the api host:
 
 ```
-Field:  (http.host eq "api.sessions.vza.net" and not cf.tls_client_auth.cert_verified)
+Field:  (http.host eq "api.sessions.vza.net" and (not cf.tls_client_auth.cert_verified or cf.tls_client_auth.cert_revoked))
 Action: Block
 ```
 
-This is belt-and-suspenders — the Worker already returns 401 for an unmapped/absent
-cert — but it drops uncertified traffic at the edge before it reaches the Worker.
+The `cert_revoked` predicate matters: Cloudflare keeps `cert_verified` **true** for a
+revoked-but-otherwise-valid cert and reports revocation only via the separate
+`cert_revoked` field, so a rule checking `cert_verified` alone would still admit a
+revoked machine cert. This is belt-and-suspenders — the Worker also rejects unmapped,
+absent, and revoked certs (`src/auth/identity.ts`) — but it drops that traffic at the
+edge before it reaches the Worker.
 
 ## Step 3 — enroll each machine (repeatable)
 
@@ -86,8 +98,20 @@ curl --cert ~/.config/agent-collector/$(hostname)-linux.client.pem \
      https://api.sessions.vza.net/api/v1/machines
 ```
 
-Once this returns JSON (not 401), the upload → parse → search round-trip is unblocked
-and the collector can be pointed at `https://api.sessions.vza.net`.
+Once this returns JSON (not 401), point the collector at the mTLS API by writing an
+mTLS config (sets `auth = "mtls"` plus the two cert/key paths `enroll-cert.sh` just
+wrote):
+
+```
+agent-collector enroll --hub https://api.sessions.vza.net \
+  --client-cert ~/.config/agent-collector/$(hostname)-linux.client.pem \
+  --client-key  ~/.config/agent-collector/$(hostname)-linux.client.key
+```
+
+(or set `auth`, `client_cert_path`, and `client_key_path` in `config.toml` by hand). The
+transport then presents the cert via `curl --cert/--key`; TPM-backed keys remain M4. With
+that config in place `agent-collector run` / `backfill` upload over mTLS — the round-trip
+and the 6 GB backfill are unblocked.
 
 ## Notes
 

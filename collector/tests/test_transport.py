@@ -79,9 +79,34 @@ def test_get_healthz(hub):
     assert '"ok": true' in body or '"ok":true' in body
 
 
-def test_mtls_auth_not_implemented():
+def test_mtls_tpm_key_not_implemented():
+    # TPM-backed keys can't be handed to curl as a file; that lands in M4.
     with pytest.raises(NotImplementedError):
-        MtlsAuth("tpm").curl_args()
+        MtlsAuth(key_protection="tpm").curl_args()
+
+
+def test_mtls_software_returns_cert_and_key_args(tmp_path):
+    cert = tmp_path / "box.client.pem"
+    key = tmp_path / "box.client.key"
+    cert.write_text("cert")
+    key.write_text("key")
+    args = MtlsAuth(client_cert_path=str(cert), client_key_path=str(key)).curl_args()
+    assert args == ["--cert", str(cert), "--key", str(key)]
+
+
+def test_mtls_missing_one_path_errors():
+    # Only a cert, no key -> a clear config error, not a cryptic curl failure.
+    with pytest.raises(ValueError, match="client_key_path"):
+        MtlsAuth(client_cert_path="/x/box.pem").curl_args()
+    with pytest.raises(ValueError, match="client_cert_path"):
+        MtlsAuth(client_key_path="/x/box.key").curl_args()
+
+
+def test_mtls_missing_key_file_errors(tmp_path):
+    cert = tmp_path / "box.client.pem"
+    cert.write_text("cert")
+    with pytest.raises(FileNotFoundError, match="client_key_path"):
+        MtlsAuth(client_cert_path=str(cert), client_key_path=str(tmp_path / "absent.key")).curl_args()
 
 
 def test_parse_curl_version():

@@ -118,6 +118,10 @@ class Config:
     include_windows_mounts: bool = False
     stores: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_STORES))
     exclude: list[str] = field(default_factory=list)
+    # File-based mTLS material (auth="mtls", software keys): PEM cert + private key that
+    # curl presents via --cert/--key. Written by infra/cf/enroll-cert.sh. Absent for dev auth.
+    client_cert_path: str | None = None
+    client_key_path: str | None = None
     source: Path | None = None
 
     def __post_init__(self) -> None:
@@ -167,6 +171,10 @@ def _dump_toml(cfg: Config) -> str:
         f'auth = "{_toml_escape(cfg.auth)}"',
         f"include_windows_mounts = {str(cfg.include_windows_mounts).lower()}",
     ]
+    if cfg.client_cert_path:
+        lines.append(f'client_cert_path = "{_toml_escape(cfg.client_cert_path)}"')
+    if cfg.client_key_path:
+        lines.append(f'client_key_path = "{_toml_escape(cfg.client_key_path)}"')
     if cfg.exclude:
         items = ", ".join(f'"{_toml_escape(p)}"' for p in cfg.exclude)
         lines.append(f"exclude = [{items}]")
@@ -193,23 +201,39 @@ def load(path: Path | str | None = None) -> Config:
         include_windows_mounts=bool(data.get("include_windows_mounts", False)),
         stores=dict(data.get("stores") or DEFAULT_STORES),
         exclude=list(data.get("exclude") or []),
+        client_cert_path=data.get("client_cert_path"),
+        client_key_path=data.get("client_key_path"),
         source=path,
     )
 
 
-def enroll(hub_url: str, dev: bool, path: Path | str | None = None, machine_id: str | None = None) -> Config:
-    """Write a dev-mode config. mTLS enrollment lands in a later milestone."""
-    if not dev:
-        raise NotImplementedError(
-            "Only --dev enrollment is supported now; mTLS enrollment (TPM keygen -> CSR -> "
-            "Cloudflare managed CA) lands in a later milestone."
+def enroll(
+    hub_url: str,
+    dev: bool,
+    path: Path | str | None = None,
+    machine_id: str | None = None,
+    client_cert_path: str | None = None,
+    client_key_path: str | None = None,
+) -> Config:
+    """Write a collector config. `dev=True` writes dev auth (x-dev-machine); otherwise a
+    file-based mTLS config, which requires both a client cert and key path (produced by
+    infra/cf/enroll-cert.sh). TPM-backed mTLS enrollment lands in M4."""
+    if dev:
+        cfg = Config(machine_id=machine_id or default_machine_id(), hub_url=hub_url.rstrip("/"), auth="dev")
+    else:
+        if not (client_cert_path and client_key_path):
+            raise ValueError(
+                "mTLS enrollment needs both --client-cert and --client-key (run "
+                "infra/cf/enroll-cert.sh first). Use --dev for the dev-header config instead."
+            )
+        cfg = Config(
+            machine_id=machine_id or default_machine_id(),
+            hub_url=hub_url.rstrip("/"),
+            auth="mtls",
+            client_cert_path=str(Path(client_cert_path).expanduser()),
+            client_key_path=str(Path(client_key_path).expanduser()),
         )
     path = Path(path) if path else config_path()
-    cfg = Config(
-        machine_id=machine_id or default_machine_id(),
-        hub_url=hub_url.rstrip("/"),
-        auth="dev",
-    )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_dump_toml(cfg))
     cfg.source = path

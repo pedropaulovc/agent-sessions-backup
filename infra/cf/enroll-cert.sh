@@ -85,4 +85,9 @@ CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID" npx --yes wrangler d1 execute "$DB_NAME" --r
 echo
 echo "Done. Test the mTLS path with:"
 echo "  curl --cert $CRT --key $KEY https://api.sessions.vza.net/api/v1/machines"
+echo
+echo "Then point the collector at the mTLS API (writes auth=mtls + these paths):"
+echo "  agent-collector enroll --hub https://api.sessions.vza.net \\"
+echo "    --client-cert $CRT --client-key $KEY"
+echo
 echo "Key stays on this box only ($KEY); the signed cert is not secret."

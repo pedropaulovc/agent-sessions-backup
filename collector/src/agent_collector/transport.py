@@ -1,7 +1,8 @@
 """Transport: subprocess curl (system curl on Linux + Windows).
 
-Auth is a strategy so the mTLS variants can slot in later without touching call sites.
-DevAuth adds the x-dev-machine header; MtlsAuth raises NotImplementedError for now.
+Auth is a strategy so the mTLS variants slot in without touching call sites.
+DevAuth adds the x-dev-machine header; MtlsAuth presents a file-based client cert+key
+(--cert/--key) for software keys, and raises NotImplementedError for TPM keys (M4).
 
 Backfill fast path (upload_batch): one curl invocation per 50 URLs using a --config file
 of `--next`-separated request blocks, run with `--parallel --parallel-max N`. Bodies are
@@ -72,19 +73,47 @@ class DevAuth(AuthStrategy):
 
 
 class MtlsAuth(AuthStrategy):
-    """Placeholder: mTLS lands in a later milestone (TPM keygen -> CSR -> managed CA)."""
+    """mTLS client-cert auth. `software` keys (WSL/software fallback) present a PEM cert +
+    key file to curl (`--cert`/`--key`); the files are produced by infra/cf/enroll-cert.sh
+    and their paths live in the collector config (client_cert_path/client_key_path).
 
-    def __init__(self, key_protection: str = "software"):
+    TPM-backed keys (key_protection != "software") still raise NotImplementedError: the
+    private key never leaves the TPM, so curl must reference a provider/engine key handle
+    rather than a file — that lands in M4 with the per-platform TPM backends.
+    """
+
+    def __init__(
+        self,
+        client_cert_path: str | None = None,
+        client_key_path: str | None = None,
+        key_protection: str = "software",
+    ):
+        self.client_cert_path = client_cert_path
+        self.client_key_path = client_key_path
         self.key_protection = key_protection
 
     def curl_args(self) -> list[str]:
-        raise NotImplementedError(
-            f"mTLS transport (key_protection={self.key_protection!r}) is not implemented "
-            "yet; it lands in a later milestone. For TPM-backed keys the private key never "
-            "leaves the TPM, so curl must be invoked with an engine/provider that references "
-            "the key handle — wire that here when the mTLS milestone starts. Use auth=\"dev\" "
-            "for now."
-        )
+        if self.key_protection != "software":
+            raise NotImplementedError(
+                f"TPM-backed mTLS (key_protection={self.key_protection!r}) is not implemented "
+                "yet; it lands in M4. The TPM key can't be handed to curl as a file — curl must "
+                "reference the provider/engine key handle. Use key_protection=\"software\" (a "
+                "file-based cert+key from infra/cf/enroll-cert.sh) until then."
+            )
+        cert, key = self.client_cert_path, self.client_key_path
+        if not cert or not key:
+            missing = "client_key_path" if cert else ("client_cert_path" if key else "client_cert_path and client_key_path")
+            raise ValueError(
+                f"mTLS auth requires both client_cert_path and client_key_path in the config; "
+                f"missing {missing}. Run infra/cf/enroll-cert.sh, then set both paths (see mtls.md)."
+            )
+        for label, path in (("client_cert_path", cert), ("client_key_path", key)):
+            if not os.path.exists(path):
+                raise FileNotFoundError(
+                    f"mTLS {label} points at {path!r}, which does not exist. Re-run "
+                    "infra/cf/enroll-cert.sh to (re)generate the cert/key, or fix the config path."
+                )
+        return ["--cert", cert, "--key", key]
 
 
 def _retryable(returncode: int, status: int) -> bool:

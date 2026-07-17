@@ -14,11 +14,22 @@ from . import schedule
 
 
 def _cmd_enroll(args) -> int:
-    cfg = config_mod.enroll(args.hub, dev=args.dev)
+    if not args.dev and not (args.client_cert or args.client_key):
+        print("enroll: pass --dev, or --client-cert/--client-key for mTLS", file=sys.stderr)
+        return 2
+    cfg = config_mod.enroll(
+        args.hub,
+        dev=args.dev,
+        client_cert_path=args.client_cert,
+        client_key_path=args.client_key,
+    )
     print(f"wrote {cfg.source}")
     print(f"  machine_id: {cfg.machine_id}")
     print(f"  hub_url:    {cfg.hub_url}")
     print(f"  auth:       {cfg.auth}")
+    if cfg.auth == "mtls":
+        print(f"  client_cert_path: {cfg.client_cert_path}")
+        print(f"  client_key_path:  {cfg.client_key_path}")
     return 0
 
 
@@ -41,9 +52,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="agent-collector")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_enroll = sub.add_parser("enroll", help="write config (dev mode only for now)")
-    p_enroll.add_argument("--hub", required=True, help="hub base URL, e.g. http://localhost:8787")
+    p_enroll = sub.add_parser("enroll", help="write config (--dev, or --client-cert/--client-key for mTLS)")
+    p_enroll.add_argument("--hub", required=True, help="hub base URL, e.g. https://api.sessions.vza.net")
     p_enroll.add_argument("--dev", action="store_true", help="dev auth (x-dev-machine header)")
+    p_enroll.add_argument("--client-cert", help="mTLS: path to the PEM client cert (from enroll-cert.sh)")
+    p_enroll.add_argument("--client-key", help="mTLS: path to the client private key (from enroll-cert.sh)")
     p_enroll.set_defaults(func=_cmd_enroll)
 
     p_install = sub.add_parser("install", help="install periodic scheduler")
