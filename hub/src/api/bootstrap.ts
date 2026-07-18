@@ -20,9 +20,13 @@ export const DEFAULT_COLLECTOR_CONFIG = {
   // under the decimal cap. Keep this number in lockstep with that collector constant — one source
   // of truth; when the collector's is exported into the shared config, reference it here.
   max_upload_bytes: 90_000_000,
-  // Per-store capture toggles. Absent store => collector uses its own default (on).
+  // Per-store capture toggles. Absent store => collector uses its own default (on). These keys MUST be
+  // the collector's actual store names, or a fleet override silently no-ops. Source of truth:
+  // collector/src/agent_collector/config.py — DEFAULT_STORES ('claude', 'codex') + WEBCAPTURE_STORES
+  // ('chatgpt-web', 'claude-web', 'export-inbox'). Note the local Claude Code store key is 'claude'
+  // (the harness dir ~/.claude), NOT 'claude-code'. fleet-endpoints.test.ts asserts this ⊆ that set.
   stores: {
-    'claude-code': true,
+    claude: true,
     codex: true,
     'chatgpt-web': true,
     'claude-web': true,

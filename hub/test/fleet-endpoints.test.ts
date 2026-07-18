@@ -84,7 +84,7 @@ describe('GET /api/v1/bootstrap', () => {
     expect(cfg.schema_version).toBe(COLLECTOR_CONFIG_SCHEMA_VERSION);
     expect(cfg.scan_interval_seconds).toBe(DEFAULT_COLLECTOR_CONFIG.scan_interval_seconds);
     expect(cfg.max_upload_bytes).toBe(DEFAULT_COLLECTOR_CONFIG.max_upload_bytes);
-    expect((cfg.stores as Record<string, boolean>)['claude-code']).toBe(true);
+    expect((cfg.stores as Record<string, boolean>)['claude']).toBe(true); // collector's local Claude Code store key
   });
 
   it('401s a non-machine identity', async () => {
@@ -118,6 +118,21 @@ describe('GET /api/v1/bootstrap', () => {
     } finally {
       await testEnv.DB.prepare("DELETE FROM meta WHERE key = 'collector_config'").run();
     }
+  });
+
+  it('every per-store toggle key is a real collector store name (fleet-config contract)', () => {
+    // A toggle under a key the collector doesn't scan silently no-ops — the whole point of bootstrap is
+    // central capture control, so the keys MUST be the collector's actual store names. The local Claude
+    // Code store is keyed 'claude' (the ~/.claude dir), NOT the harness name 'claude-code'. Cross-language
+    // (hub is TS, collector is Python), so mirror the set with a pointer instead of a shared import.
+    // Source of truth: collector/src/agent_collector/config.py — DEFAULT_STORES {'claude','codex'} +
+    // WEBCAPTURE_STORES ('chatgpt-web','claude-web','export-inbox').
+    const COLLECTOR_STORES = new Set(['claude', 'codex', 'chatgpt-web', 'claude-web', 'export-inbox']);
+    for (const key of Object.keys(DEFAULT_COLLECTOR_CONFIG.stores)) {
+      expect(COLLECTOR_STORES.has(key)).toBe(true);
+    }
+    expect(Object.keys(DEFAULT_COLLECTOR_CONFIG.stores)).toContain('claude'); // the real local Claude Code store
+    expect(Object.keys(DEFAULT_COLLECTOR_CONFIG.stores)).not.toContain('claude-code'); // harness name, not a store
   });
 });
 
@@ -560,6 +575,50 @@ describe('POST /api/v1/certs/renew', () => {
     expect(res.status).toBe(200); // recovery on the in-grace prev
     expect((await row('nonadm-grace'))?.cert_fp_sha256).toBe(await certFingerprint(fakeCertPem('ng-new')));
   });
+
+  type LogEvent = { event?: string; result?: string; cert_id?: string };
+  const renewLogEvents = (logs: ReturnType<typeof vi.spyOn>): LogEvent[] =>
+    logs.mock.calls.map((c: unknown[]) => { try { return JSON.parse(c[0] as string) as LogEvent; } catch { return {} as LogEvent; } });
+
+  it('a malformed signed cert (fingerprint throws) revokes the minted id by hand and 502s', async () => {
+    // CF returns success:true but a PEM-less certificate → certFingerprint throws AFTER signed.id exists.
+    // No fingerprint means it can't be queued (retired_certs is fp-keyed), so the hub goes straight to a
+    // direct revoke of signed.id + a distinct hub.certs.fingerprint_failed event. The machine is untouched.
+    await seedMachine('fp-fail', { fp: 'fpf-cur', certId: 'fpf-cid' });
+    const deletes: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') { deletes.push(String(input).split('/').pop()!); return new Response(JSON.stringify({ success: true, result: { status: 'pending_revocation' } }), { status: 200 }); }
+      return new Response(JSON.stringify({ success: true, result: { id: 'fpf-new-id', certificate: 'NOT-A-PEM', expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    const logs = vi.spyOn(console, 'log');
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('fp-fail', false, 'fpf-cur'));
+    const events = renewLogEvents(logs);
+    logs.mockRestore();
+    expect(res.status).toBe(502);
+    expect(events.some((e) => e.event === 'hub.certs.fingerprint_failed')).toBe(true);
+    expect(deletes).toContain('fpf-new-id'); // revoked the minted-but-unusable cert by its id
+    expect(events.some((e) => e.event === 'hub.certs.orphan_revoke_failed')).toBe(false); // revoke confirmed
+    expect((await row('fp-fail'))?.cert_fp_sha256).toBe('fpf-cur'); // machine unchanged
+  });
+
+  it('a malformed signed cert whose revoke is REJECTED logs orphan_revoke_failed (result failed)', async () => {
+    // Same fingerprint failure, but the direct revoke returns HTTP-200 {success:false} — surfaced as
+    // revokeClientCert → 'failed', NOT a throw. revokeOrphanCert must treat that enum the same as a throw
+    // and emit the distinct, alertable orphan_revoke_failed so the leaked live cert is actionable.
+    await seedMachine('fp-fail2', { fp: 'fpf2-cur', certId: 'fpf2-cid' });
+    vi.stubGlobal('fetch', vi.fn(async (_i: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return new Response(JSON.stringify({ success: false }), { status: 200 });
+      return new Response(JSON.stringify({ success: true, result: { id: 'fpf2-new-id', certificate: 'NOT-A-PEM', expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    const logs = vi.spyOn(console, 'log');
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('fp-fail2', false, 'fpf2-cur'));
+    const orphan = renewLogEvents(logs).filter((e) => e.event === 'hub.certs.orphan_revoke_failed');
+    logs.mockRestore();
+    expect(res.status).toBe(502);
+    expect(orphan).toHaveLength(1);
+    expect(orphan[0]!.result).toBe('failed'); // success:false surfaced, not swallowed as terminal
+    expect(orphan[0]!.cert_id).toBe('fpf2-new-id');
+  });
 });
 
 describe('POST /api/v1/admin/machines', () => {
@@ -796,6 +855,50 @@ describe('POST /api/v1/admin/machines', () => {
     const res = await adminMachines(reqJson({ machine_id: 'q-done-claimant', cert_fp_sha256: 'q-done-fp' }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(200);
     expect((await row('q-done-claimant'))?.cert_fp_sha256).toBe('q-done-fp');
+  });
+
+  it('409s a body cert_id already owned as another machine\'s current cert_id', async () => {
+    // A CA id is a REVOKE handle. Attaching machine A's id to B would make B's next rotation revoke A's
+    // live cert (an A-side lockout). Reject before any write.
+    await seedMachine('idown-a', { fp: 'ida-fp', certId: 'shared-cid' });
+    const res = await adminMachines(reqJson({ machine_id: 'idown-b', cert_fp_sha256: 'idb-fp', cert_id: 'shared-cid' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string; machine_id: string }).error).toBe('cert_id_in_use');
+    expect(await row('idown-b')).toBeNull(); // B never created
+  });
+
+  it('409s a body cert_id already owned as another machine\'s prev_cert_id', async () => {
+    await seedMachine('idprev-a', { fp: 'idpa-cur', certId: 'idpa-cur-id', prevFp: 'idpa-prev', prevCertId: 'shared-prev-cid', revokeAt: '2999-01-01T00:00:00.000Z' });
+    const res = await adminMachines(reqJson({ machine_id: 'idprev-b', cert_fp_sha256: 'idpb-fp', cert_id: 'shared-prev-cid' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('cert_id_in_use');
+  });
+
+  it('409s a body cert_id sitting in an un-revoked retired_certs row (mid-revocation)', async () => {
+    await testEnv.DB.prepare("INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('idq-fp', 'queued-cid', 'idq-owner', '2000-01-01T00:00:00.000Z')").run();
+    const res = await adminMachines(reqJson({ machine_id: 'idq-b', cert_fp_sha256: 'idqb-fp', cert_id: 'queued-cid' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('cert_id_in_use');
+  });
+
+  it('allows a body cert_id whose only retired_certs row is already REVOKED', async () => {
+    await testEnv.DB.prepare("INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, revoked_at) VALUES ('idr-fp', 'revoked-cid', 'idr-owner', '2000-01-01T00:00:00.000Z', '2000-01-02T00:00:00.000Z')").run();
+    const res = await adminMachines(reqJson({ machine_id: 'idr-b', cert_fp_sha256: 'idrb-fp', cert_id: 'revoked-cid' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(200); // a confirmed-revoked id is dead — reattaching it revokes nothing live
+    expect((await row('idr-b'))?.cert_id).toBe('revoked-cid');
+  });
+
+  it('positive control: a body cert_id owned by NO other row attaches cleanly', async () => {
+    const res = await adminMachines(reqJson({ machine_id: 'idfree-b', cert_fp_sha256: 'idfree-fp', cert_id: 'fresh-unique-cid' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(200);
+    expect((await row('idfree-b'))?.cert_id).toBe('fresh-unique-cid');
+  });
+
+  it("allows re-supplying a machine's OWN existing cert_id (self is not a clash)", async () => {
+    await seedMachine('idself', { fp: 'idself-fp', certId: 'idself-cid' });
+    const res = await adminMachines(reqJson({ machine_id: 'idself', cert_fp_sha256: 'idself-fp', cert_id: 'idself-cid' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(200); // the ownership check excludes machine_id == this row
+    expect((await row('idself'))?.cert_id).toBe('idself-cid');
   });
 
   it('an admin cert swap reserves BOTH the displaced current and prev in the queue', async () => {

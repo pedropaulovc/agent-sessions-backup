@@ -265,6 +265,21 @@ export async function pollRetired(env: Env, certId: string): Promise<'revoked' |
  * queue INSERT throws (transient D1), fall back to a direct best-effort revoke so it isn't left live.
  * If BOTH fail the cert is leaked-but-loudly-logged (alertable) — strictly better than a silent
  * strand. */
+/** Best-effort DIRECT revoke of a minted cert we can't (or won't) queue. A CA DELETE that returns
+ * success:false surfaces as revokeClientCert → 'failed' WITHOUT throwing, which leaves the cert live
+ * exactly like a thrown error would — so both the 'failed' enum and a throw emit the distinct,
+ * alertable hub.certs.orphan_revoke_failed (a leaked live cert must be actionable). Never throws. */
+async function revokeOrphanCert(env: Env, certId: string, machineId: string): Promise<void> {
+  try {
+    const result = await revokeClientCert(env, certId);
+    if (result !== 'revoked' && result !== 'pending_revocation') {
+      console.log(JSON.stringify({ event: 'hub.certs.orphan_revoke_failed', machine: machineId, cert_id: certId, result }));
+    }
+  } catch (e) {
+    console.log(JSON.stringify({ event: 'hub.certs.orphan_revoke_failed', machine: machineId, cert_id: certId, error: String(e) }));
+  }
+}
+
 async function reclaimOrphan(env: Env, fingerprint: string, certId: string, machineId: string): Promise<void> {
   try {
     await retireCert(env, fingerprint, certId, machineId);
@@ -272,11 +287,7 @@ async function reclaimOrphan(env: Env, fingerprint: string, certId: string, mach
   } catch (e) {
     console.log(JSON.stringify({ event: 'hub.certs.orphan_queue_failed', machine: machineId, cert_id: certId, error: String(e) }));
   }
-  try {
-    await revokeClientCert(env, certId);
-  } catch (e) {
-    console.log(JSON.stringify({ event: 'hub.certs.orphan_revoke_failed', machine: machineId, cert_id: certId, error: String(e) }));
-  }
+  await revokeOrphanCert(env, certId, machineId);
 }
 
 /** POST /api/v1/certs/renew — a still-valid machine cert requests its own successor. The body
@@ -333,7 +344,18 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
     console.log(JSON.stringify({ event: 'hub.certs.sign_failed', machine: identity.machineId, error: String(e) }));
     return Response.json({ error: 'cf_sign_failed' }, { status: 502 });
   }
-  const newFp = await certFingerprint(signed.certificate);
+  let newFp: string;
+  try {
+    newFp = await certFingerprint(signed.certificate);
+  } catch (e) {
+    // CF returned success:true but a malformed / PEM-less certificate. We hold signed.id but have NO
+    // fingerprint, and retired_certs is keyed on fingerprint — so this cert can't be QUEUED. Go straight
+    // to a best-effort direct revoke (no placeholder fp invented) plus a loud, distinct event. Near-never,
+    // but a stranded live cert must never be the silent failure mode.
+    console.log(JSON.stringify({ event: 'hub.certs.fingerprint_failed', machine: identity.machineId, cert_id: signed.id, error: String(e) }));
+    await revokeOrphanCert(env, signed.id, identity.machineId);
+    return Response.json({ error: 'cf_sign_failed' }, { status: 502 });
+  }
 
   const authFp = identity.certFp ?? null;
   const onCurrent = authFp !== null && authFp === cur?.cert_fp_sha256;

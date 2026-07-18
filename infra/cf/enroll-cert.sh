@@ -132,6 +132,35 @@ except Exception:
   fi
 }
 
+# Parse a wrangler `d1 execute --json` payload and print the machines row's fingerprint (empty if no
+# row). Scans every statement's results for the `fp` field so it's robust to statement ordering.
+# Prints ONLY the fp on stdout; returns non-zero if the JSON can't be parsed.
+parse_fp() {  # $1 = wrangler --json output
+  python3 - "$1" <<'PY'
+import json,sys
+try:
+    d=json.loads(sys.argv[1])
+except Exception as e:
+    sys.stderr.write("could not parse wrangler --json output: %s\n" % e); sys.exit(1)
+fp=""
+for stmt in (d if isinstance(d, list) else []):
+    for r in (stmt.get("results") or []):
+        if r.get("fp"):
+            fp=str(r["fp"])
+print(fp)
+PY
+}
+
+# Fresh, SELECT-only read of the machines row's fingerprint — used to VERIFY reality after an ambiguous
+# write. Prints the fp on stdout (empty if no row); returns non-zero if the read OR the parse fails, so
+# the caller can distinguish "provably not ours" from "couldn't tell".
+read_row_fp() {
+  local json
+  json="$(CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID" npx --yes wrangler d1 execute "$DB_NAME" --remote --json \
+      --command "SELECT cert_fp_sha256 AS fp FROM machines WHERE machine_id='$MACHINE_ID';" 2>/dev/null)" || return 1
+  parse_fp "$json"
+}
+
 # FRESH ENROLLMENT ONLY. This inserts a brand-new machines row and deliberately does NOT overwrite an
 # existing row's cert. Re-enrolling (rotating an already-registered machine's cert) is a DISPLACEMENT — the
 # old cert must be reserved in retired_certs and revoked while the new one goes current — and that has to be
@@ -160,27 +189,34 @@ if npx --yes wrangler whoami >/dev/null 2>&1; then
   # before aborting rather than leaking it under set -e.
   if ! CUR_JSON="$(CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID" npx --yes wrangler d1 execute "$DB_NAME" --remote --json \
       --command "$INSERT_SQL SELECT cert_fp_sha256 AS fp FROM machines WHERE machine_id='$MACHINE_ID';")"; then
-    echo "    D1 registration failed (auth, lock/outage, or a rejected statement) — machine NOT registered." >&2
-    revoke_unused_cert
+    # The combined INSERT;SELECT exited non-zero, but --command runs multiple ';' statements WITHOUT a
+    # transaction: the INSERT may have COMMITTED before the SELECT/output failed. Revoking blindly could
+    # kill a cert the row now points at — a fresh-enrollment lockout. So VERIFY with a separate fresh read
+    # and revoke ONLY if the row provably does NOT carry our fp. If the verify itself fails we can't tell,
+    # so do NOT revoke — uncertainty must fail toward a leak (recoverable), never a lockout (round-9 rule).
+    echo "    D1 registration command failed (auth, lock/outage, or a rejected/partial statement)." >&2
+    echo "    The INSERT may or may not have committed — verifying the row before deciding on revoke..." >&2
+    if VERIFY_FP="$(read_row_fp)"; then
+      if [ "$VERIFY_FP" = "$FP" ]; then
+        echo "    Verified: the row DID register with THIS cert — enrollment actually succeeded. NOT revoking." >&2
+        echo "    enrolled: $MACHINE_ID -> $FP"
+        exit 0
+      fi
+      echo "    Verified: the machines row does NOT carry this cert (found: ${VERIFY_FP:-<no row>}) — it was never installed." >&2
+      revoke_unused_cert
+      exit 1
+    fi
+    echo "    Could NOT verify the row (the follow-up read also failed) — NOT revoking; a possibly-registered cert must not be revoked." >&2
+    echo "    Resolve manually:" >&2
+    echo "      1) Check the row: CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID npx wrangler d1 execute $DB_NAME --remote --command \"SELECT cert_fp_sha256 FROM machines WHERE machine_id='$MACHINE_ID';\"" >&2
+    echo "      2) If it shows $FP, enrollment succeeded — do nothing." >&2
+    echo "      3) If it shows a different fp or no row, this cert is unused — revoke it:" >&2
+    echo "         curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$CERT_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\"" >&2
     exit 1
   fi
   # A parse failure here means wrangler returned 0 but unexpected output — the insert likely DID apply, so
   # abort loudly WITHOUT revoking (revoking a possibly-registered cert would lock the machine out).
-  CUR_FP="$(python3 - "$CUR_JSON" <<'PY'
-import json,sys
-try:
-    d=json.loads(sys.argv[1])
-except Exception as e:
-    sys.stderr.write("could not parse wrangler --json output: %s\n" % e); sys.exit(1)
-fp=""
-# The SELECT is the last statement; scan every statement's results for the fp field to be robust to ordering.
-for stmt in (d if isinstance(d, list) else []):
-    for r in (stmt.get("results") or []):
-        if r.get("fp"):
-            fp=str(r["fp"])
-print(fp)
-PY
-)" || { echo "    could not verify the machines row after insert" >&2; exit 1; }
+  CUR_FP="$(parse_fp "$CUR_JSON")" || { echo "    could not parse the machines row after insert" >&2; exit 1; }
   if [ "$CUR_FP" != "$FP" ]; then
     echo >&2
     echo "    ABORT: machine '$MACHINE_ID' is already enrolled with a DIFFERENT fingerprint:" >&2
@@ -190,7 +226,10 @@ PY
     echo "    This script only does FRESH enrollment. To ROTATE an existing machine's cert, use the hub's" >&2
     echo "    admin endpoint — it swaps the fingerprint and retires the old cert atomically:" >&2
     echo "      POST https://api.sessions.vza.net/api/v1/admin/machines  (with an admin client cert)" >&2
-    echo "        { \"machine_id\": \"$MACHINE_ID\", \"cert_fp_sha256\": \"$FP\", \"cert_id\": \"$CERT_ID\" }" >&2
+    echo "        { \"machine_id\": \"$MACHINE_ID\", \"cert_fp_sha256\": \"<fingerprint-of-a-FRESHLY-minted-cert>\", \"cert_id\": \"<id-of-that-fresh-cert>\" }" >&2
+    echo >&2
+    echo "    Do NOT install THIS run's cert — it is being revoked below. Mint a NEW cert first: re-run this" >&2
+    echo "    script AFTER the admin swap, or let the collector renew (POST /api/v1/certs/renew)." >&2
     echo >&2
     revoke_unused_cert
     exit 1

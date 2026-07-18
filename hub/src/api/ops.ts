@@ -112,6 +112,24 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
       if (clash) return Response.json({ error: 'fingerprint_in_use', machine_id: clash.machine_id }, { status: 409 });
     }
 
+    // A body-supplied cert_id is a CA handle used to REVOKE — attaching machine A's id to machine B would
+    // make B's next rotation revoke A's live cert (an A-side lockout). Reject if this id is already owned:
+    // any OTHER machine's current/prev cert_id, OR an un-revoked retired_certs row (that id is mid-
+    // revocation — attaching it anywhere is wrong). Only body-supplied ids are checked; ids carried from
+    // THIS row's own existing/prev columns below are already ours. Cheap indexed-ish SELECTs in the read
+    // phase, before any write.
+    if (body.cert_id) {
+      const idClash = await env.DB.prepare(
+        `SELECT machine_id FROM machines WHERE (cert_id = ?1 OR prev_cert_id = ?1) AND machine_id != ?2
+         UNION
+         SELECT machine_id FROM retired_certs WHERE cert_id = ?1 AND revoked_at IS NULL
+         LIMIT 1`,
+      )
+        .bind(body.cert_id, body.machine_id)
+        .first<{ machine_id: string }>();
+      if (idClash) return Response.json({ error: 'cert_id_in_use', machine_id: idClash.machine_id }, { status: 409 });
+    }
+
     // Read-merge-write so a partial upsert preserves unspecified columns instead of resetting the
     // NOT NULL ones (os/key_protection/is_admin/priority) to their table defaults.
     const existing = await env.DB.prepare(
