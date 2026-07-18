@@ -29,7 +29,7 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
   // run a single INVOCATION-LEVEL budget across every message — export AND normal transcript — not just a
   // one-export-slice guard: an export slice plus a few chatty normal writes could otherwise still breach
   // the cap. Each parseOne reports the work it did; we accumulate it, and once the invocation crosses
-  // INVOCATION_STATEMENT_BUDGET we DEFER every remaining message (ack + re-enqueue a fresh copy) rather
+  // INVOCATION_SUBREQUEST_BUDGET we DEFER every remaining message (ack + re-enqueue a fresh copy) rather
   // than run it here. Exports RESERVE their worst-case budget up front (on ATTEMPT, before parseOne), so a
   // slice that throws after doing work still can't free the invocation for a second heavy op — this
   // subsumes the round-2 one-export-slice-per-invocation rule. Deferral is NOT a failure: a fresh
@@ -46,14 +46,14 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
     const isExport = isExportArchiveKey(msg.body.r2_key);
     if (isExport) {
       invocationSpent += EXPORT_QUERY_BUDGET; // reserve worst-case on ATTEMPT, before any work
-      if (invocationSpent >= INVOCATION_STATEMENT_BUDGET) deferRest = true;
+      if (invocationSpent >= INVOCATION_SUBREQUEST_BUDGET) deferRest = true;
     }
     try {
       const spent = await parseOne(msg.body, env);
       msg.ack();
       if (!isExport) {
         invocationSpent += spent;
-        if (invocationSpent >= INVOCATION_STATEMENT_BUDGET) deferRest = true;
+        if (invocationSpent >= INVOCATION_SUBREQUEST_BUDGET) deferRest = true;
       }
     } catch (e) {
       if (e instanceof ExportCleanupPending) {
@@ -134,6 +134,12 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
           if (recovery) await markPendingAndEnqueue(recovery, 'recover', env);
         }
       }
+      // This message threw AFTER doing an unknown amount of D1 work (a chatty transcript can throw well
+      // past writeSession's delete/insert batches), and parseOne returns no subrequest count on the throw
+      // path — so we can't charge the invocation budget precisely. Conservatively DEFER the rest of the
+      // batch: a failed heavy write must not be followed by more D1 work that re-hits the ~1000-subrequest
+      // cap this budget guards (Codex round 5 finding 3). Deferral re-enqueues fresh copies, losing nothing.
+      deferRest = true;
       msg.retry();
     }
   }
@@ -160,10 +166,10 @@ function isExportArchiveKey(r2Key: string): boolean {
   return detect(parts[2]!, parts.slice(3).join('/')).kind === 'export-archive';
 }
 
-// parseOne returns the approximate D1 statement count it issued, so consumeParseBatch can hold a single
-// invocation-wide budget across every message in the batch (see INVOCATION_STATEMENT_BUDGET). The count
-// is dominated by writeSession / parseExportInto; the surrounding lookups/guards are folded in as small
-// fixed terms — precision isn't needed, the budget is a coarse per-invocation gate.
+// parseOne returns the approximate D1 SUBREQUEST count it issued (each .first / .run / db.batch is one),
+// so consumeParseBatch can hold a single invocation-wide budget across every message in the batch (see
+// INVOCATION_SUBREQUEST_BUDGET). The count is dominated by writeSession / parseExportInto; the surrounding
+// lookups/guards are folded in as small fixed terms — precision isn't needed, the budget is a coarse gate.
 async function parseOne(job: ParseMessage, env: Env): Promise<number> {
   const file = await env.DB.prepare(
     'SELECT id, machine_id, store, relpath, r2_key, size, mtime, harness, session_id, content_hash FROM files WHERE id = ?1',
@@ -194,7 +200,7 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
   }
   if (det.kind === 'export-archive') {
     // The one-export-slice-per-invocation reservation is applied by consumeParseBatch before we get here;
-    // the actual per-invocation statement count comes back from parseExportInto for the batch budget.
+    // the actual per-invocation subrequest count comes back from parseExportInto for the batch budget.
     return 2 + (await parseExportInto(file, env, job.reason, job.content_hash, job.offset ?? 0, job.cleanup_cursor));
   }
   if (!det.sessionId || !SINGLE_SESSION_HARNESSES.has(det.harness)) {
@@ -405,50 +411,48 @@ async function failExportFile(file: FileRow, env: Env, contentHash: string | und
 }
 
 // An export ZIP fans out to one writeSession per conversation. Writing all of a large archive (the prod
-// trigger: 783 conversations) in one consumer invocation blows the ~1000 D1-queries-per-invocation cap
+// trigger: 783 conversations) in one consumer invocation blows the ~1000-SUBREQUESTS-per-invocation cap
 // — and the original code marked the file 'parsed' AFTER an unbounded write loop, so a run that silently
 // stopped short still ended 'parsed' with a partial index: a silent data gap. We slice each invocation
 // and re-enqueue a continuation (offset advanced) until every conversation is written, THEN a budgeted
 // CLEANUP phase drains stale sessions, and only when cleanup completes does the file mark 'parsed'. The
-// slice is bounded by ACTUAL D1 STATEMENTS, not conversation count: Cloudflare caps STATEMENTS per
-// invocation (one db.batch sends many), and a chatty conversation with thousands of blocks fans out to
-// that many insert statements — so we accumulate writeSession's real statement count against
-// EXPORT_QUERY_BUDGET and cut the slice when it's spent. Against the ~1000-statement cap, a 500 budget
-// leaves headroom for one over-budget conversation to finish alone. EXPORT_MAX_CONVERSATIONS_PER_SLICE
-// caps the count too (bounds the all-skips case, where each conversation still costs one lookup query).
-export const EXPORT_QUERY_BUDGET = 500;
-export const EXPORT_MAX_CONVERSATIONS_PER_SLICE = 100;
-// The per-invocation budget consumeParseBatch shares across the whole batch (export + normal writes).
-export const INVOCATION_STATEMENT_BUDGET = 500;
-// A single conversation estimated above this many statements gets its OWN invocation (its writeSession
+// slice is bounded by ACTUAL D1 SUBREQUESTS (each db.batch / .first / .run is ONE subrequest — see the
+// counting-model note on writeSession), not conversation count: we accumulate writeSession's subrequest
+// count against EXPORT_QUERY_BUDGET and cut the slice when it's spent. Against the ~1000 cap, an 800
+// budget leaves headroom for one over-budget conversation plus the post-loop meta reads. Budgets are
+// `let` so tests can dial them down (__setExportBudgetsForTest) to exercise slicing with small fixtures.
+export let EXPORT_QUERY_BUDGET = 800;
+export const EXPORT_MAX_CONVERSATIONS_PER_SLICE = 200;
+// The per-invocation subrequest budget consumeParseBatch shares across the whole batch (export + normal).
+export let INVOCATION_SUBREQUEST_BUDGET = 800;
+// A single conversation estimated above this many SUBREQUESTS gets its OWN invocation (its writeSession
 // can't be split), so it never rides alongside other work into the ~1000 cap. Measured max realistic
-// export conversation is 304 blocks (~310 statements) — see the PR thread — so this is defensive.
-export const EXPORT_OVERSIZED_CEILING = 800;
-// Only a conversation whose REAL subrequest cost exceeds this can't be written even alone under the
-// ~1000 subrequest cap (~80k blocks). The destructive skip path is gated on this, never the statement
-// estimate, so we never discard a large-but-writable conversation.
-export const EXPORT_OVERSIZED_SUBREQUEST_CAP = 900;
+// export conversation is 304 blocks (~7 subrequests) — see the PR thread — so this is defensive.
+export let EXPORT_OVERSIZED_CEILING = 700;
+// Only a conversation whose subrequest cost exceeds this can't be written even alone under the ~1000 cap
+// (~90k blocks — effectively unreachable). The destructive skip path is gated on this, so it never
+// discards a large-but-writable conversation.
+export let EXPORT_OVERSIZED_SUBREQUEST_CAP = 900;
 
-/** Estimate the D1 statement count writeSession will issue for a session, WITHOUT writing — mirrors its
- * `6 + stmts.length` (delete batch 3 + machine SELECT 1 + session/FTS 2, plus one insert per block /
- * compaction marker / usage row). Lets the export slicer preflight an oversized conversation. */
-function estimateWriteStatements(s: NormalizedSession): number {
+/** Test-only: dial the export/invocation subrequest budgets down so slicing/cleanup/deferral can be
+ * exercised with tiny fixtures instead of thousands of conversations. */
+export function __setExportBudgetsForTest(o: { slice?: number; invocation?: number; ceiling?: number; cap?: number }): void {
+  if (o.slice !== undefined) EXPORT_QUERY_BUDGET = o.slice;
+  if (o.invocation !== undefined) INVOCATION_SUBREQUEST_BUDGET = o.invocation;
+  if (o.ceiling !== undefined) EXPORT_OVERSIZED_CEILING = o.ceiling;
+  if (o.cap !== undefined) EXPORT_OVERSIZED_SUBREQUEST_CAP = o.cap;
+}
+
+/** Real per-invocation SUBREQUEST cost of writeSession WITHOUT writing (each db.batch is ONE subrequest):
+ * delete batch (1) + ceil(rows/90) insert batches + machine SELECT (1) + session/FTS batch (1), where
+ * rows = one per block / compaction marker / usage row. Lets the export slicer preflight a conversation. */
+function estimateWriteSubrequests(s: NormalizedSession): number {
   let rows = 0;
   for (const turn of s.turns) {
     rows += turn.blocks.length;
     if (turn.blocks.length === 0 && turn.compaction && turn.byteStart !== undefined && turn.byteLen !== undefined) rows += 1;
     if (turn.usage) rows += 1;
   }
-  return 6 + rows;
-}
-
-/** Real per-invocation SUBREQUEST cost of writeSession (each db.batch is ONE subrequest): delete batch +
- * ceil(rows/90) insert batches + machine SELECT + session/FTS batch. Only a conversation that can't fit
- * under the ~1000 SUBREQUEST cap even alone is genuinely unwritable — we gate the destructive skip path
- * on THIS, never the (far more conservative) statement estimate, so we never discard a writable
- * conversation. Measured max is 304 blocks → ~7 subrequests, so the skip path is dead code today. */
-function estimateWriteSubrequests(s: NormalizedSession): number {
-  const rows = estimateWriteStatements(s) - 6;
   return 3 + Math.ceil(rows / 90);
 }
 
@@ -548,31 +552,36 @@ async function parseExportInto(
         existing && existing.index_state === 'ready' && existing.canonical_file_id !== file.id && existing.canon_state !== 'error';
       if (reason === 'recover' && healthyOtherOwner) continue;
 
-      // Preflight the conversation's write cost. writeSession is atomic per conversation (no
+      // Preflight the conversation's SUBREQUEST cost. writeSession is atomic per conversation (no
       // intra-conversation cursor), so a single oversized conversation can't be sliced — it must either
       // run ALONE in its own invocation, or, if it can't fit even alone, be recorded and skipped.
-      const estStmts = estimateWriteStatements(session);
-      if (estimateWriteSubrequests(session) > EXPORT_OVERSIZED_SUBREQUEST_CAP) {
-        // Cannot fit under the real per-invocation SUBREQUEST cap even alone. Record loudly and skip
+      const estSubreq = estimateWriteSubrequests(session);
+      if (estSubreq > EXPORT_OVERSIZED_SUBREQUEST_CAP) {
+        // Cannot fit under the ~1000 SUBREQUEST cap even alone (~90k blocks). Record loudly and skip
         // (preservation-first: the raw ZIP stays in R2, nothing silently dropped); flip any existing row
-        // for it to 'error'. Measured max export conversation is 304 blocks, so this never fires today.
+        // for it to 'error'. Measured max export conversation is 304 blocks (~7 subrequests) — never today.
         await env.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(session.id).run();
         spent += 1;
-        console.log(JSON.stringify({ event: 'parse.export.oversized_conversation', file_id: file.id, session: session.id, est_statements: estStmts }));
+        console.log(JSON.stringify({ event: 'parse.export.oversized_conversation', file_id: file.id, session: session.id, est_subrequests: estSubreq }));
         continue;
       }
-      if (estStmts > EXPORT_OVERSIZED_CEILING && spent > 0) {
-        // Big enough to deserve its own invocation and this slice already did work — cut BEFORE it so the
-        // continuation runs it alone (spent 0) next invocation, keeping its writeSession clear of the cap.
+      if (estSubreq > EXPORT_OVERSIZED_CEILING && written.size > 0) {
+        // Big enough to deserve its own invocation and this slice already WROTE a conversation — cut BEFORE
+        // it so the continuation runs it alone next invocation, keeping its writeSession clear of the cap.
+        // Gate on written.size, NOT spent: `spent` was already bumped by THIS conversation's ownership
+        // lookup, so `spent > 0` is true even when the oversized conversation is the FIRST in the slice —
+        // which would break without advancing idx and re-enqueue the SAME offset forever (archive stuck
+        // pending). written.size is 0 until a PRIOR conversation is written, so a leading oversized
+        // conversation falls through and is written ALONE (it still fits under the cap), making progress.
         break;
       }
 
-      // Track this session BEFORE the write, not after: if writeSession throws mid-write (old FTS/blocks
-      // already deleted, partial new rows inserted, session row not yet upserted), the catch's
-      // revertSlice must flip THIS session to 'parsing' too — otherwise its prior 'ready'/canonical row
-      // survives over a half-rewritten index for a file the generic catch can only mark 'error'. The
-      // skip-paths above (empty / healthy live capture / healthy other owner) return before this line, so
-      // they never enter `written`.
+      // Track the conversations this slice commits to writing: `written.size` gates the oversized cut above
+      // (a leading oversized conversation must still be written) and is reported in the slice/superseded
+      // logs. The skip-paths above (empty / healthy live capture / healthy other owner) return before this
+      // line, so they never enter `written`. A mid-write throw is reverted by revertOwnedReady (a whole-file
+      // 'ready' → 'parsing' sweep), which flips this conversation's prior 'ready' row too without needing
+      // `written`, so the ordering here no longer matters for correctness.
       written.add(session.id);
       spent += await writeSession(session, file, env);
       // Cut once the query budget is spent — but only AFTER writing this conversation, so a single
@@ -583,7 +592,9 @@ async function parseExportInto(
       }
     }
   } catch (e) {
-    await revertSlice(written, env);
+    // Any throw mid-slice abandons the whole archive to 'error' — revert THIS slice AND earlier slices'
+    // published rows so no partial export is left searchable (Codex round 5 finding 2).
+    await revertOwnedReady(file, env);
     throw e;
   }
   const sliceEnd = idx;
@@ -591,15 +602,15 @@ async function parseExportInto(
 
   // Post-write hash recheck (mirrors the pre-write guard, but covers the window DURING this slice's
   // writes): a re-upload landing after the pre-check but before here changed this row's bytes, so the
-  // sessions we just wrote came from the OLD ZIP. Revert them to 'parsing' (don't leave them
-  // 'ready'/canonical over stale bytes), enqueue NO continuation and do NOT markParsed — the fresh
-  // message owns the current bytes and does its own full write + cleanup. Runs on every slice AND every
-  // cleanup-phase invocation (where `written` is empty, so revertSlice is a no-op), so the stale-delete
-  // guard below always sees fresh bytes.
+  // sessions we just wrote came from the OLD ZIP. Revert EVERY 'ready' row this file owns to 'parsing'
+  // (not just this invocation's writes — the write phase may span invocations, so earlier slices' rows are
+  // stale over the new bytes too), enqueue NO continuation and do NOT markParsed — the fresh message owns
+  // the current bytes and does its own full write + cleanup. Runs on every slice AND every cleanup-phase
+  // invocation, so the stale-delete guard below always sees fresh bytes.
   if (contentHash !== undefined) {
     const recheck = await env.DB.prepare('SELECT content_hash FROM files WHERE id = ?1').bind(file.id).first<{ content_hash: string }>();
     if (recheck?.content_hash !== contentHash) {
-      await revertSlice(written, env);
+      await revertOwnedReady(file, env);
       console.log(JSON.stringify({ event: 'parse.export.superseded', file_id: file.id, offset, written: written.size }));
       return spent;
     }
@@ -614,11 +625,12 @@ async function parseExportInto(
     try {
       await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: contentHash, offset: sliceEnd });
     } catch (e) {
-      // The continuation couldn't be enqueued — this slice's sessions must NOT stay 'ready' over an
-      // archive we won't finish. Revert them to 'parsing' FIRST, then rethrow so the generic consumer
-      // catch marks the file 'error' and retries. The file must never end terminal with partial
-      // 'ready' rows from it.
-      await revertSlice(written, env);
+      // The continuation couldn't be enqueued — this archive's sessions must NOT stay 'ready' over an
+      // archive we won't finish. Revert this slice AND every earlier slice's published rows (the write
+      // phase may span invocations) FIRST, then rethrow so the generic consumer catch marks the file
+      // 'error' and retries. The file must never end terminal with partial 'ready' rows (Codex round 5
+      // finding 2).
+      await revertOwnedReady(file, env);
       throw e;
     }
     console.log(
@@ -630,11 +642,11 @@ async function parseExportInto(
   // ── CLEANUP PHASE (budgeted + resumable) ─────────────────────────────────────────────────────────
   // Every conversation is written; now reconcile the sessions this file used to own but the archive no
   // longer contains (dropped / now-empty conversations). This is the DELETE side of the same cap the
-  // write phase guards: a valid replacement archive that dropped hundreds of conversations issues up to
-  // four D1 statements per stale session, which — done unbounded, AFTER markParsed as the old code did —
-  // re-hits the ~1000-statement/invocation cap over an already-'parsed' file, silently leaving stale
-  // sessions half-deleted. So cleanup runs as budgeted chunks (sharing THIS invocation's remaining
-  // statement budget) over a deterministic session_id cursor, and markParsed happens ONLY once cleanup
+  // write phase guards: a valid replacement archive that dropped hundreds of conversations issues one
+  // delete-batch SUBREQUEST per stale session, which — done unbounded, AFTER markParsed as the old code
+  // did — re-hits the ~1000-subrequest/invocation cap over an already-'parsed' file, silently leaving
+  // stale sessions half-deleted. So cleanup runs as budgeted chunks (sharing THIS invocation's remaining
+  // subrequest budget) over a deterministic session_id cursor, and markParsed happens ONLY once cleanup
   // fully drains. Invariant: parse_state='parsed' ⇒ every conversation written AND stale cleanup done.
   //
   // The hash recheck just above guards each cleanup invocation, so we only ever delete against bytes we
@@ -690,7 +702,7 @@ async function parseExportInto(
     if (contentHash !== undefined) {
       const recheck = await env.DB.prepare('SELECT content_hash FROM files WHERE id = ?1').bind(file.id).first<{ content_hash: string }>();
       if (recheck?.content_hash !== contentHash) {
-        await revertSlice(written, env);
+        await revertOwnedReady(file, env);
         console.log(JSON.stringify({ event: 'parse.export.superseded', file_id: file.id, phase: 'cleanup', cursor }));
         return spent;
       }
@@ -715,7 +727,7 @@ async function parseExportInto(
           bindCleanup(env.DB.prepare(`DELETE FROM usage WHERE session_id = ?1${cleanupGuardSql}`), session_id),
           bindCleanup(env.DB.prepare(`DELETE FROM sessions WHERE session_id = ?1${cleanupGuardSql}`), session_id),
         ]);
-        spent += 4;
+        spent += 1; // one db.batch = one subrequest, regardless of the 4 statements inside it
       } else {
         await bindCleanup(env.DB.prepare(`UPDATE sessions SET index_state = 'error' WHERE session_id = ?1${cleanupGuardSql}`), session_id).run();
         spent += 1;
@@ -794,7 +806,7 @@ async function parseExportInto(
   // and let the fresh parse own the current bytes end to end.
   const { updated } = await markParsed(file.id, env, 'parsed', file.size, null, contentHash);
   if (!updated) {
-    await revertSlice(written, env);
+    await revertOwnedReady(file, env);
     return spent;
   }
 
@@ -947,21 +959,32 @@ async function markParsed(
   return { updated: !guarded || (result.meta?.changes ?? 0) > 0 };
 }
 
-/** Flip a set of just-written export sessions back to index_state='parsing' — used whenever a slice
- * must abandon its writes: a re-upload changed the file's bytes mid-slice, the continuation couldn't
- * be enqueued, or the final markParsed lost the row to a fresher upload. Batched (chunks of 90) so the
- * revert stays within the slice's D1-query budget headroom rather than one round trip per session. */
-async function revertSlice(written: Set<string>, env: Env): Promise<void> {
-  if (written.size === 0) return;
-  const stmts = [...written].map((id) => env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(id));
-  for (const chunk of chunkArr(stmts, 90)) await env.DB.batch(chunk);
+/** Revert every 'ready' session this file is canonical for back to index_state='parsing', in ONE
+ * subrequest. Used on every export-abandonment path — a re-upload changed the bytes mid-slice, the
+ * continuation couldn't be enqueued, the final markParsed lost the row to a fresher upload, or a
+ * hash-mismatch supersede. The export write phase spans invocations, so a per-id revert of only THIS
+ * invocation's `written` set would strand EARLIER slices' 'ready'/canonical rows searchable under a file
+ * that's erroring or being superseded — a partial export advertised as complete (the silent-under-
+ * production class this guards). The whole-file predicate reverts every slice this file ever wrote with no
+ * id bookkeeping; a new in-flight conversation that threw before its session upsert has no 'ready' row to
+ * catch, so nothing is lost. */
+async function revertOwnedReady(file: FileRow, env: Env): Promise<void> {
+  await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE canonical_file_id = ?1 AND index_state = 'ready'").bind(file.id).run();
 }
 
 /** Replace a session's index rows atomically-enough: FTS delete → blocks delete → reinsert → FTS
- * rebuild from blocks. Returns the number of D1 STATEMENTS it issued (Cloudflare caps STATEMENTS per
- * invocation, and one db.batch() sends many) so the export slicer can budget by ACTUAL D1 work — a
- * chatty conversation with thousands of blocks fans out to that many insert statements and costs far
- * more than the ~5-query mean. */
+ * rebuild from blocks. Returns the number of D1 SUBREQUESTS it issued (one per db.batch / .first / .run
+ * call) so the export slicer can budget by the ACTUAL per-invocation limit.
+ *
+ * COUNTING MODEL — the ~1000/invocation cap counts SUBREQUESTS, not SQL statements: a `db.batch([...])`
+ * of any size is ONE subrequest (a single round trip). Positive control (measured 2026-07-18, prod
+ * `sessions-index`): a claude-code session (id shape aaaaaaaa-…) with 7,686 blocks — ≈7,692 STATEMENTS
+ * but only ≈89 batches/SUBREQUESTS — exists fully, written atomically by ONE writeSession invocation;
+ * that is impossible under a 1,000-STATEMENT cap, so the statement-cap model is falsified. Corroboration:
+ * the original export under-produced at ~245 conversations (~5 subrequests each ≈ 1,000), and PR #14's
+ * 1101 was fixed by BATCHING unbatched per-object writes (fewer subrequests). So cost = delete batch (1)
+ * + one batch per 90-block insert chunk + machine SELECT (1) + session/FTS batch (1). See
+ * memory/d1-invocation-limits.md. */
 async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Promise<number> {
   const db = env.DB;
 
@@ -1129,10 +1152,10 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
       .bind(s.id),
   ]);
 
-  // Count STATEMENTS, not batch calls — the D1 per-invocation cap is per query, and one db.batch()
-  // sends many. Delete batch = 3 statements; the insert chunks carry `stmts.length` prepared inserts
-  // (one per block / compaction marker / usage row); machine SELECT = 1; session+FTS batch = 2.
-  return 6 + stmts.length;
+  // SUBREQUESTS (see the counting-model note above): delete batch (1) + one batch per 90-block insert
+  // chunk (insertChunks.length) + machine SELECT (1) + session/FTS batch (1). A db.batch of N statements
+  // is ONE subrequest, so a chatty conversation's cost grows with its BATCH count, not its statement count.
+  return 3 + insertChunks.length;
 }
 
 function chunkArr<T>(arr: T[], n: number): T[][] {

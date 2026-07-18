@@ -121,26 +121,20 @@ async function putFile(store: string, relpath: string, content: string): Promise
 }
 
 async function drainQueue(): Promise<void> {
-  // consumeParseBatch holds a per-invocation statement budget across the whole batch and DEFERS
-  // (re-enqueues) any message past it — so a single big transcript can push the rest of a large batch to a
-  // later delivery. Prod redelivers those; mirror that here by re-delivering pending files until none
-  // remain (each invocation resolves at least its first message, so this terminates; the cap is a safety net).
-  for (let i = 0; i < 50; i++) {
-    const pending = await testEnv.DB.prepare("SELECT id, r2_key FROM files WHERE parse_state = 'pending'").all<{
-      id: number;
-      r2_key: string;
-    }>();
-    if (pending.results.length === 0) return;
-    const messages = pending.results.map((r) => ({
-      id: String(r.id),
-      timestamp: new Date(),
-      attempts: 1,
-      body: { file_id: r.id, r2_key: r.r2_key, reason: 'upload' as const },
-      ack() {},
-      retry() {},
-    }));
-    await worker.queue({ queue: 'parse', messages, ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>, testEnv);
-  }
+  const pending = await testEnv.DB.prepare("SELECT id, r2_key FROM files WHERE parse_state = 'pending'").all<{
+    id: number;
+    r2_key: string;
+  }>();
+  const messages = pending.results.map((r) => ({
+    id: String(r.id),
+    timestamp: new Date(),
+    attempts: 1,
+    body: { file_id: r.id, r2_key: r.r2_key, reason: 'upload' as const },
+    ack() {},
+    retry() {},
+  }));
+  if (messages.length === 0) return;
+  await worker.queue({ queue: 'parse', messages, ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>, testEnv);
 }
 
 /** Redeliver one file to the consumer regardless of its parse_state — simulates an admin reindex. */

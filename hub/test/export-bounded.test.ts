@@ -1,10 +1,23 @@
 import { SELF, env as testEnvRaw } from 'cloudflare:test';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import worker from '../src/index';
-import { EXPORT_OVERSIZED_CEILING, EXPORT_QUERY_BUDGET } from '../src/ingest/consumer';
+import { __setExportBudgetsForTest } from '../src/ingest/consumer';
 import { CLAUDE_WEB_ROOT, claudeExportZip, claudeWebConversation, type ClaudeConvOpts, type ClaudeWebMessage } from './web-fixtures';
 
 const testEnv = testEnvRaw as unknown as Env;
+
+// The prod slice/invocation budgets (~800 subrequests) leave far too much headroom to trigger slicing,
+// cleanup-chunking or deferral with tiny synthetic fixtures. So each test dials the SUBREQUEST budgets down
+// via __setExportBudgetsForTest — small enough that a handful of 2-block conversations (~5 subrequests
+// each) span multiple slices. `budgets()` resets ALL four knobs every call (so tests are order-independent
+// no matter what the previous one set), with a small default a test overrides per case. afterAll restores
+// prod values. NOTE: the cost accounting is SUBREQUESTS (each db.batch/.first/.run is ONE), not statements —
+// see the counting-model note on writeSession; a 180-block conversation costs ~5 subrequests, not ~180.
+const PROD_BUDGETS = { slice: 800, invocation: 800, ceiling: 700, cap: 900 };
+function budgets(o: { slice?: number; invocation?: number; ceiling?: number; cap?: number } = {}): void {
+  __setExportBudgetsForTest({ slice: 20, invocation: 20, ceiling: 700, cap: 900, ...o });
+}
+afterAll(() => __setExportBudgetsForTest(PROD_BUDGETS));
 
 // Capture continuation re-enqueues so we can deliver them one slice at a time and assert the file is
 // never 'parsed' until the LAST slice lands.
@@ -33,8 +46,10 @@ function conv(tag: string, i: number): ClaudeConvOpts {
   };
 }
 
-// A conversation with `msgs` messages → ~msgs blocks, so writeSession fans out to many insert batches
-// and costs far more than the ~5-query mean — used to exercise the DYNAMIC (query-count) slice budget.
+// A conversation with `msgs` messages → ~msgs blocks. writeSession fans the blocks into ceil(blocks/90)
+// INSERT batches, so its SUBREQUEST cost is 3 + ceil(blocks/90) — a 200-block conversation is ~6
+// subrequests, NOT ~200. Used to exercise the oversized-conversation ceiling/cap and to prove the slice
+// budget counts subrequests, not statements.
 function heavyConv(tag: string, i: number, msgs: number): ClaudeConvOpts {
   const messages: ClaudeWebMessage[] = [];
   let parent = '00000000-0000-4000-8000-000000000000';
@@ -199,10 +214,12 @@ async function deliverChain(
 
 describe('large export ingest is bounded and never marks parsed until every conversation is written', () => {
   it('writes the archive in bounded slices; the file stays pending until the FINAL slice (silent-gap guard)', async () => {
-    // More than one statement-budget slice of small conversations, so the parse spans several
-    // invocations. The exact slice boundary depends on per-conversation D1 statement counts, so we
-    // drive the whole continuation chain and assert the INVARIANT rather than a fixed offset.
-    const total = 130;
+    // More than one subrequest-budget slice of small conversations (each ~5 subrequests, slice budget 20 →
+    // ~4/slice), so the parse spans several invocations. The exact slice boundary depends on
+    // per-conversation D1 cost, so we drive the whole continuation chain and assert the INVARIANT rather
+    // than a fixed offset.
+    budgets({ slice: 20, invocation: 20 });
+    const total = 12;
     const { fileId, hash, r2Key } = await uploadArchive('a', total);
 
     // The upload enqueued the initial parse (offset 0). Follow every continuation to completion.
@@ -225,7 +242,8 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('a run whose continuation never arrives leaves the file pending, never parsed (incomplete ≠ parsed)', async () => {
-    const total = 130; // more than one statement-budget slice, so slice 1 is non-final
+    budgets({ slice: 20, invocation: 20 });
+    const total = 12; // more than one subrequest-budget slice, so slice 1 is non-final
     const { fileId, hash, r2Key } = await uploadArchive('b', total);
 
     sent.length = 0;
@@ -243,11 +261,12 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('processes at most ONE export slice per invocation; a second export is deferred by ACK + re-enqueue, not retry (round 1 finding 1 / round 3 finding 2)', async () => {
-    // Two export files delivered in ONE batch (max_batch_size:5 in prod). Each slice is ~500 D1
-    // statements; running both in one invocation would breach the ~1000/invocation cap. Only the first
-    // runs; the second is DEFERRED — but a deferral is not a failure, so it must ACK + re-enqueue a fresh
-    // copy (resetting the retry budget), never msg.retry() (which burns max_retries and can DLQ a message
-    // that never failed).
+    // Two export files delivered in ONE batch (max_batch_size:5 in prod). Each export RESERVES the full
+    // slice budget on attempt; with slice == invocation budget, the first export alone crosses the
+    // invocation cap, so the second is DEFERRED — but a deferral is not a failure, so it must ACK +
+    // re-enqueue a fresh copy (resetting the retry budget), never msg.retry() (which burns max_retries and
+    // can DLQ a message that never failed).
+    budgets({ slice: 20, invocation: 20 });
     const f1 = await uploadArchive('one', 3);
     const f2 = await uploadArchive('two', 3);
 
@@ -285,7 +304,8 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('reverts a slice whose file bytes change mid-write; no continuation, not parsed (round 1 finding 2)', async () => {
-    const total = 130; // multi-slice so a continuation would normally follow slice 1
+    budgets({ slice: 20, invocation: 20 });
+    const total = 12; // multi-slice so a continuation would normally follow slice 1
     const { fileId, hash, r2Key } = await uploadArchive('hr', total);
 
     // Make the POST-write content_hash recheck observe a mismatch while the PRE-write check still
@@ -328,7 +348,8 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('a continuation-enqueue failure reverts the slice and never leaves partial ready rows (round 1 finding 3)', async () => {
-    const total = 130;
+    budgets({ slice: 20, invocation: 20 });
+    const total = 12;
     const { fileId, hash, r2Key } = await uploadArchive('cf', total);
 
     // Make the continuation send throw. parseExportInto must revert this slice's writes and rethrow,
@@ -347,37 +368,64 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(await readyCount(fileId)).toBe(0); // no partial 'ready' rows survived the failed slice
   });
 
-  it('budgets the slice by D1 STATEMENTS, not batch calls: a few heavy conversations exhaust it (round 3 finding 1)', async () => {
-    // Each conversation carries ~200 blocks, so writeSession issues ~200 INSERT statements (plus deletes
-    // and the session write) — far past the ~5-statement mean. Under the OLD batch-call accounting a
-    // 200-block conversation "cost" only ~6, so ~70+ of these would fit one 500 slice; counting real
-    // statements, only a handful do. `total` is small but strictly greater than one slice, so a
-    // statement-budgeted slice MUST stop short and enqueue a continuation.
+  it('a LATER slice failure reverts EARLIER slices ready rows too, never leaving a partial export searchable (round 5 finding 2)', async () => {
+    // The write phase spans invocations. Deliver slice 1 normally (a prefix becomes 'ready'), then make
+    // slice 2's continuation-send fail. The generic catch marks the file 'error'; the abandon path must
+    // revert BOTH slice 2's writes AND slice 1's earlier 'ready' rows — otherwise a partial export stays
+    // searchable under an errored file (the silent-under-production class this whole PR fights).
+    budgets({ slice: 20, invocation: 20 });
     const total = 12;
-    const { fileId, hash, r2Key } = await uploadConvs('heavy', Array.from({ length: total }, (_u, i) => heavyConv('heavy', i, 200)));
+    const { fileId, hash, r2Key } = await uploadArchive('r5rev', total);
+
+    // Slice 1 (offset 0): writes a prefix and enqueues a continuation; the file stays pending.
+    sent.length = 0;
+    await deliver({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: hash });
+    const cont = sent.find((m) => m.file_id === fileId && typeof m.offset === 'number' && m.offset > 0);
+    expect(cont).toBeDefined();
+    const firstSliceReady = await readyCount(fileId);
+    expect(firstSliceReady).toBeGreaterThan(0); // slice 1 published some 'ready' rows
+
+    // Slice 2 (offset > 0): its OWN continuation-send throws → abandon → generic catch marks 'error'.
+    const realSend = testEnv.PARSE_QUEUE.send;
+    testEnv.PARSE_QUEUE.send = (async () => {
+      throw new Error('queue send failed on later slice');
+    }) as typeof testEnv.PARSE_QUEUE.send;
+    try {
+      await deliver(cont!);
+    } finally {
+      testEnv.PARSE_QUEUE.send = realSend;
+    }
+
+    // POSITIVE CONTROL: with the abandon path reverting only THIS invocation's `written`, slice 1's
+    // `firstSliceReady` rows survive as 'ready' under the errored file. The owned-ready sweep reverts them
+    // too → zero 'ready' rows for an incomplete, errored export.
+    expect(await fileState(fileId)).toBe('error');
+    expect(await readyCount(fileId)).toBe(0); // BOTH slices reverted, not just the failing one
+  });
+
+  it('budgets the slice by D1 SUBREQUESTS (batch calls), not statements: many-block conversations still fit one slice (round 3 finding 1, subrequest revert)', async () => {
+    // Each conversation carries ~180 blocks. writeSession fans them into ceil(180/90)=2 INSERT batches, so
+    // its SUBREQUEST cost is ~5 (delete batch + 2 insert batches + machine SELECT + session/FTS batch) —
+    // NOT ~180. The slice budget is 150 subrequests, so all three conversations (~7 subrequests each incl.
+    // the ownership lookup) land in ONE slice with room to spare. Under the pre-revert STATEMENT accounting
+    // a single 180-block conversation "cost" ~180 and would blow a 150-unit slice by itself.
+    budgets({ slice: 150, invocation: 150 });
+    const total = 3;
+    const { fileId, hash, r2Key } = await uploadConvs('sub', Array.from({ length: total }, (_u, i) => heavyConv('sub', i, 180)));
 
     sent.length = 0;
     await deliver({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: hash });
 
-    // POSITIVE CONTROL for statement-counting: revert writeSession to returning batch-call count and all
-    // 12 conversations write in one slice → 'parsed', no continuation. Counting statements cuts the slice
-    // to a handful, so the file stays pending with a continuation at a small offset.
-    expect(await fileState(fileId)).toBe('pending');
-    const cont = sent.find((m) => m.file_id === fileId && typeof m.offset === 'number');
-    expect(cont).toBeDefined();
-    const offset = cont!.offset!;
-    expect(offset).toBeGreaterThan(0);
-    expect(offset).toBeLessThan(10); // a handful — impossible under batch-call accounting (which fits all 12)
-    expect(await ownedSessions(fileId)).toBe(offset); // only the budgeted prefix was written
-    // The statements the budget actually counted are dominated by block inserts: written blocks reached
-    // the budget (minus the fixed ~7/conversation overhead), which is exactly the statement-math gate.
-    const blocks = await testEnv.DB.prepare(
-      "SELECT COALESCE(SUM(block_count), 0) AS b FROM sessions WHERE canonical_file_id = ?1 AND index_state = 'ready'",
-    ).bind(fileId).first<{ b: number }>();
-    expect(blocks!.b).toBeGreaterThanOrEqual(EXPORT_QUERY_BUDGET - offset * 7);
+    // POSITIVE CONTROL for subrequest counting: revert writeSession/estimate to a per-STATEMENT count and a
+    // single 180-block conversation exhausts the 150-unit slice, forcing a continuation at offset 1.
+    // Counting subrequests, all three land in one slice → parsed, no continuation.
+    expect(await fileState(fileId)).toBe('parsed');
+    expect(await ownedSessions(fileId)).toBe(total);
+    expect(sent.some((m) => m.file_id === fileId && typeof m.offset === 'number')).toBe(false);
   });
 
   it('reverts every session already written when writeSession throws mid-slice; the file is never parsed (round 2 finding 1b)', async () => {
+    budgets({ slice: 20, invocation: 20 });
     const { fileId, hash, r2Key } = await uploadArchive('wf', 5);
 
     // Each small conversation issues 3 DB.batch calls in writeSession (block delete, block insert,
@@ -399,7 +447,8 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(sent.some((m) => m.file_id === fileId && typeof m.offset === 'number')).toBe(false); // no continuation
   });
 
-  it('adds the current conversation to the revert set BEFORE writing, so a mid-conversation throw clears its prior ready row (round 3 finding 4)', async () => {
+  it('a mid-conversation throw reverts its prior ready row to parsing, never leaving it ready over a half-rewritten index (round 3 finding 4)', async () => {
+    budgets({ slice: 20, invocation: 20 });
     const convId = 'bnd-f4-conv-0';
     const { fileId, hash, r2Key } = await uploadArchive('f4', 1); // single conversation
 
@@ -409,8 +458,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
 
     // Reparse the SAME bytes (reason 'reindex', same hash → not stale-rejected). Throw on the 2nd DB.batch
     // of the invocation = the conversation's INSERT batch, AFTER its DELETE batch already dropped the old
-    // blocks/FTS. Its prior sessions row is still 'ready'. Only if the id was added to `written` BEFORE the
-    // write does revertSlice flip it back to 'parsing'.
+    // blocks/FTS. Its prior sessions row is still 'ready' over a now half-rewritten index.
     const restore = throwOnNthBatch(2);
     try {
       await deliver({ file_id: fileId, r2_key: r2Key, reason: 'reindex', content_hash: hash });
@@ -418,13 +466,15 @@ describe('large export ingest is bounded and never marks parsed until every conv
       restore();
     }
 
-    // POSITIVE CONTROL for written.add-before-write: with the add AFTER the await, the throw skips it and
-    // the conversation keeps its stale 'ready' row over a half-rewritten (blocks-deleted) index.
+    // POSITIVE CONTROL for the abandonment revert: the throw's revertOwnedReady sweep (whole-file 'ready' →
+    // 'parsing') must catch this conversation's prior 'ready' row; disable the sweep and it keeps its stale
+    // 'ready' row over the half-rewritten (blocks-deleted) index while the file goes 'error'.
     expect(await fileState(fileId)).toBe('error');
     expect(await sessionState(convId)).toBe('parsing');
   });
 
   it('reserves the export budget before parsing, so a slice that throws does not free the budget for a second export in the same batch (round 2 finding 2)', async () => {
+    budgets({ slice: 20, invocation: 20 });
     const f1 = await uploadArchive('rb1', 5); // throws mid-slice
     const f2 = await uploadArchive('rb2', 3); // must stay untouched
 
@@ -475,19 +525,23 @@ describe('large export ingest is bounded and never marks parsed until every conv
   // Runs LAST: its stale-session cleanup fan-out re-enqueues sibling export files (all share the
   // 'export-inbox' store), flipping them to 'pending' — harmless once earlier tests have asserted.
   it('bounds the final stale-session cleanup and marks parsed ONLY once it fully drains (round 3 finding 3)', async () => {
-    // Parse a large archive so the file owns many sessions, then replace it with a much smaller valid
-    // archive that DROPS most conversations. The dropped sessions must be cleaned in budgeted chunks
-    // (≤4 statements each) across several invocations — never one unbounded pass after markParsed.
-    const big = Array.from({ length: 300 }, (_u, i) => conv('cln', i));
+    // Parse a large archive (at a big budget so it lands in one fast slice) so the file owns many
+    // sessions, then replace it with a much smaller valid archive that DROPS most conversations. At a small
+    // reparse budget the dropped sessions must be cleaned in budgeted chunks (one delete SUBREQUEST each)
+    // across several invocations — never one unbounded pass after markParsed.
+    budgets({ slice: 800, invocation: 800 });
+    const big = Array.from({ length: 30 }, (_u, i) => conv('cln', i));
     const first = await uploadConvs('cln', big);
     await deliverChain({ file_id: first.fileId, r2_key: first.r2Key, reason: 'upload', content_hash: first.hash });
     expect(await fileState(first.fileId)).toBe('parsed');
-    expect(await ownedSessions(first.fileId)).toBe(300);
+    expect(await ownedSessions(first.fileId)).toBe(30);
 
-    // Replace the archive in place (same machine/relpath → same file id, new bytes) with 5 conversations.
-    const small = Array.from({ length: 5 }, (_u, i) => conv('cln', i));
+    // Replace the archive in place (same machine/relpath → same file id, new bytes) with 2 conversations,
+    // and shrink the budget so cleanup of the ~28 stale sessions must span multiple invocations.
+    const small = Array.from({ length: 2 }, (_u, i) => conv('cln', i));
     const replaced = await uploadConvs('cln', small);
     expect(replaced.fileId).toBe(first.fileId); // updated the same file row, not a new one
+    budgets({ slice: 8, invocation: 8 });
 
     // Drive the reparse only until cleanup FIRST needs a continuation (stale rows still remain).
     const reparse: ParseMessage = { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash };
@@ -498,22 +552,24 @@ describe('large export ingest is bounded and never marks parsed until every conv
     // budgeted phase that gates markParsed, the file is STILL 'pending' with stale rows outstanding.
     expect(stopped.stoppedCont).toBeDefined(); // cleanup needed more than one budgeted chunk
     expect(await fileState(replaced.fileId)).toBe('pending');
-    expect(await ownedSessions(replaced.fileId)).toBeGreaterThan(5); // stale sessions not yet fully removed
+    expect(await ownedSessions(replaced.fileId)).toBeGreaterThan(2); // stale sessions not yet fully removed
 
     // Resume from the cleanup continuation and drain the rest.
     const rest = await deliverChain(stopped.stoppedCont!);
     expect(rest.deliveries).toBeGreaterThan(1); // cleanup itself spanned multiple invocations
     expect(await fileState(replaced.fileId)).toBe('parsed'); // parsed ONLY after cleanup fully drained
-    expect(await ownedSessions(replaced.fileId)).toBe(5); // exactly the kept conversations; zero stale rows
-    expect(await stateCount(replaced.fileId, 'ready')).toBe(5);
+    expect(await ownedSessions(replaced.fileId)).toBe(2); // exactly the kept conversations; zero stale rows
+    expect(await stateCount(replaced.fileId, 'ready')).toBe(2);
   });
 
   it('defers an oversized conversation to its own invocation instead of writing it mid-slice (round 4 finding 2)', async () => {
-    // A conversation estimated above EXPORT_OVERSIZED_CEILING can't be sliced (writeSession is atomic per
-    // conversation), so when it appears after other work in a slice it must be cut to its OWN invocation —
-    // keeping its writeSession clear of the per-invocation cap. (Measured max real export conversation is
-    // 304 blocks, well under the ceiling, so this guard is defensive; here we force it with a big fixture.)
-    const convs = [conv('ovz', 0), conv('ovz', 1), heavyConv('ovz', 2, EXPORT_OVERSIZED_CEILING + 50), conv('ovz', 3)];
+    // A conversation estimated above EXPORT_OVERSIZED_CEILING (dialed to 5 subrequests here) can't be
+    // sliced (writeSession is atomic per conversation), so when it appears after other work in a slice it
+    // must be cut to its OWN invocation — keeping its writeSession clear of the per-invocation cap. The
+    // 200-block conversation estimates at ceil(200/90)+3 = 6 subrequests > 5; the small ones are ~4.
+    // (Measured max real export conversation is 304 blocks ≈ 7 subrequests, so in prod this is defensive.)
+    budgets({ slice: 20, invocation: 20, ceiling: 5 });
+    const convs = [conv('ovz', 0), conv('ovz', 1), heavyConv('ovz', 2, 200), conv('ovz', 3)];
     const { fileId, hash, r2Key } = await uploadConvs('ovz', convs);
 
     sent.length = 0;
@@ -529,7 +585,48 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(await ownedSessions(fileId)).toBe(2); // only the two small conversations written this slice
   });
 
+  it('records an unwritable oversized conversation and skips it, keeping the rest of the slice (round 4 finding 2, cap path)', async () => {
+    // A conversation whose estimate exceeds the hard SUBREQUEST CAP can't be written even alone under the
+    // ~1000 cap (~90k blocks in prod). Here cap=5 makes the 200-block conversation (est 6) unwritable; it is
+    // SKIPPED with a loud parse.export.oversized_conversation log (any existing row flipped to 'error')
+    // while the small conversations before and after it still write. Nothing is silently dropped — the raw
+    // ZIP stays in R2 for a later parser fix.
+    budgets({ slice: 20, invocation: 20, ceiling: 5, cap: 5 });
+    const { fileId, hash, r2Key } = await uploadConvs('cap', [conv('cap', 0), heavyConv('cap', 1, 200), conv('cap', 2)]);
+
+    sent.length = 0;
+    await deliver({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: hash });
+
+    // POSITIVE CONTROL: raise the cap above the estimate and all three write to 'ready'. At cap 5 the
+    // oversized conversation is never published, both small ones are, and the slice still completes (a skip
+    // is not a failure), so the file parses.
+    expect(await sessionState('bnd-cap-conv-1')).not.toBe('ready'); // oversized: never published
+    expect(await sessionState('bnd-cap-conv-0')).toBe('ready');
+    expect(await sessionState('bnd-cap-conv-2')).toBe('ready');
+    expect(await fileState(fileId)).toBe('parsed');
+  });
+
+  it('writes a LEADING oversized conversation alone instead of looping on the same offset forever (round 5 finding 1)', async () => {
+    // When a continuation STARTS on an oversized conversation (it is the FIRST in the slice), the ceiling
+    // cut must NOT fire: nothing has been written yet, so cutting here would re-enqueue the SAME offset and
+    // the archive would stay pending forever. The single 200-block conversation (est 6 > ceiling 5, but
+    // ≤ cap) must be written ALONE, making progress.
+    budgets({ slice: 20, invocation: 20, ceiling: 5, cap: 900 });
+    const { fileId, hash, r2Key } = await uploadConvs('lead', [heavyConv('lead', 0, 200)]);
+
+    sent.length = 0;
+    await deliver({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: hash });
+
+    // POSITIVE CONTROL: gate the ceiling cut on `spent > 0` (the pre-fix condition) and this conversation's
+    // own ownership lookup already made spent > 0, so the loop breaks without advancing idx → a continuation
+    // at the SAME offset 0, looping forever with nothing written. Gating on written.size writes it alone.
+    expect(await fileState(fileId)).toBe('parsed');
+    expect(await ownedSessions(fileId)).toBe(1);
+    expect(sent.some((m) => m.file_id === fileId && m.offset === 0)).toBe(false); // no same-offset re-enqueue
+  });
+
   it('holds a SINGLE invocation-wide budget: an export slice defers a normal transcript in the same batch (round 4 finding 4)', async () => {
+    budgets({ slice: 20, invocation: 20 });
     const exp = await uploadArchive('inv1', 3);
     const web = await uploadClaudeWeb('inv1', 4); // a NON-export single session (normal write path)
 
@@ -552,6 +649,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('processes a whole batch of cheap non-export transcripts without deferring (round 4 finding 4)', async () => {
+    budgets({ slice: 100, invocation: 100 });
     const a = await uploadClaudeWeb('inv2a', 2);
     const b = await uploadClaudeWeb('inv2b', 2);
     const c = await uploadClaudeWeb('inv2c', 2);
@@ -570,14 +668,47 @@ describe('large export ingest is bounded and never marks parsed until every conv
     }
   });
 
+  it('defers the rest of the batch when a normal transcript throws mid-write, so its D1 work is not followed by more (round 5 finding 3)', async () => {
+    // A non-export transcript reports its subrequest cost only on SUCCESS; if it throws after writeSession
+    // has issued batches, we can't charge the invocation budget precisely — so the batch must DEFER every
+    // later message rather than run more D1 work that could re-hit the ~1000-subrequest cap.
+    budgets({ slice: 20, invocation: 20 });
+    const w1 = await uploadClaudeWeb('r5a', 2); // its write throws
+    const w2 = await uploadClaudeWeb('r5b', 2); // must be deferred, not run
+
+    const flags: Record<number, { acked: boolean; retried: boolean }> = {};
+    // Throw on the FIRST db.batch of the invocation = w1's writeSession delete batch. (parseOne's pre-write
+    // work uses .first/.run, not .batch, so batch #1 is inside w1's writeSession.)
+    const restore = throwOnNthBatch(1);
+    sent.length = 0;
+    try {
+      await worker.queue(
+        { queue: 'parse', messages: [batchMsg(w1, flags), batchMsg(w2, flags)], ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>,
+        testEnv,
+      );
+    } finally {
+      restore();
+    }
+
+    // POSITIVE CONTROL: without `deferRest = true` in the generic catch, w2 runs in the same invocation
+    // right after w1's failed heavy write. The defer re-enqueues w2 fresh (ack, not retry) with zero writes.
+    expect(flags[w1.fileId]!.retried).toBe(true); // w1 threw → consumer catch retries it
+    expect(flags[w2.fileId]).toEqual({ acked: true, retried: false }); // deferred by ack + re-enqueue
+    expect(sent.some((m) => m.file_id === w2.fileId && m.offset === undefined)).toBe(true);
+    expect(await fileState(w2.fileId)).toBe('pending');
+    expect(await ownedSessions(w2.fileId)).toBe(0); // NO write ran for w2
+  });
+
   // Destructive cleanup fan-out (kicks sibling export-inbox files to 'pending') — kept near the end.
   it('a cleanup-continuation send failure leaves the file pending, not error, and retries the cleanup page (round 4 finding 1)', async () => {
-    const first = await uploadConvs('csf', Array.from({ length: 300 }, (_u, i) => conv('csf', i)));
+    budgets({ slice: 800, invocation: 800 });
+    const first = await uploadConvs('csf', Array.from({ length: 30 }, (_u, i) => conv('csf', i)));
     await deliverChain({ file_id: first.fileId, r2_key: first.r2Key, reason: 'upload', content_hash: first.hash });
-    expect(await ownedSessions(first.fileId)).toBe(300);
+    expect(await ownedSessions(first.fileId)).toBe(30);
 
-    // Replace with 3 conversations → ~297 stale to clean across multiple budgeted chunks.
+    // Replace with 3 conversations → ~27 stale to clean; a small budget makes cleanup need a continuation.
     const replaced = await uploadConvs('csf', Array.from({ length: 3 }, (_u, i) => conv('csf', i)));
+    budgets({ slice: 20, invocation: 20 });
     const flags: Record<number, { acked: boolean; retried: boolean }> = {};
     const msg = batchMsg(replaced, flags);
 
@@ -608,12 +739,15 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('cleanup deletes are atomic hash-guarded: a hash flip between the recheck and the delete batch no-ops them (round 4 finding 3)', async () => {
+    budgets({ slice: 800, invocation: 800 });
     const first = await uploadConvs('atom', Array.from({ length: 5 }, (_u, i) => conv('atom', i)));
     await deliverChain({ file_id: first.fileId, r2_key: first.r2Key, reason: 'upload', content_hash: first.hash });
     expect(await ownedSessions(first.fileId)).toBe(5);
 
-    // Replace with 1 conversation → 4 stale to delete.
+    // Replace with 1 conversation → 4 stale to delete; a small budget still writes it + reaches cleanup in
+    // one invocation, so the per-page recheck (the 3rd content_hash read) is where we flip the hash.
     const replaced = await uploadConvs('atom', [conv('atom', 0)]);
+    budgets({ slice: 20, invocation: 20 });
 
     // Let the pre-write and post-write and per-page rechecks all read the CURRENT (matching) hash, then flip
     // the stored hash right after the per-page recheck (the 3rd `SELECT content_hash` read) — i.e. a
