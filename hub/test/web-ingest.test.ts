@@ -827,8 +827,67 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     await drainAll();
 
     expect(await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1').bind(fileId).first<{ parse_state: string }>()).toMatchObject({ parse_state: 'parsed' });
-    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'sk-keep'").first<{ n: number }>()).toMatchObject({ n: 1 }); // retained
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'sk-keep'").first<{ n: number }>()).toMatchObject({ n: 1 }); // retained (not deleted)
     expect(await testEnv.DB.prepare("SELECT title FROM sessions WHERE session_id = 'sk-good'").first<{ title: string }>()).toMatchObject({ title: 'Good v2' }); // updated
+  });
+
+  it('when cleanup is skipped, a genuinely-absent conversation is flipped to error, not left stale-ready (round 13)', async () => {
+    const v1 = chatgptExportZip([
+      { id: 'r13-good', title: 'G', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'r13 good v1' }] },
+      { id: 'r13-absent', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'r13 absent original' }] },
+    ]);
+    expect((await put('r13box', 'export-inbox', 'r13.zip', v1)).status).toBe(201);
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'r13-absent'").first<{ index_state: string }>()).toMatchObject({ index_state: 'ready' });
+
+    // v2 DROPS r13-absent and carries a malformed (skipped) row -> the destructive cleanup is skipped
+    // (round 12). r13-absent must NOT stay 'ready' pointing at a ZIP that no longer contains it: its
+    // row is kept (no destructive delete) but flipped to 'error' so the API honestly can't-serve it,
+    // and recovery is kicked. No sibling holds it here, so it stays 'error'.
+    const v2 = chatgptExportZip([
+      { id: 'r13-good', title: 'G2', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'r13 good v2' }] },
+      { id: '', title: 'Malformed', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'idless row' }] },
+    ]);
+    expect((await put('r13box', 'export-inbox', 'r13.zip', v2)).status).toBe(201);
+    await drainAll();
+
+    expect(await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'r13-absent'").first<{ index_state: string }>()).toMatchObject({ index_state: 'error' });
+    // Row retained (not deleted), but the API honestly reports the canonical can't produce it.
+    const api = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions/r13-absent', { headers: { 'x-dev-machine': 'r13box' } });
+    expect(api.status).toBe(200);
+    expect(((await api.json()) as { session: unknown }).session).toBeNull();
+    // The good conversation, present in v2, stays healthy.
+    expect(await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'r13-good'").first<{ index_state: string }>()).toMatchObject({ index_state: 'ready' });
+  });
+
+  it('a sibling archive re-claims a skip-orphaned session (flipped to error) and restores it to ready (round 13)', async () => {
+    // An older sibling archive on a DIFFERENT machine also holds the conversation.
+    const sib = chatgptExportZip([{ id: 'r13b-conv', title: 'from sibling', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'r13b sibling copy' }] }]);
+    const rS = await put('r13b-sib', 'export-inbox', 'sib.zip', sib);
+    const sibId = ((await rS.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    // Main archive (newer) takes ownership of the shared conversation, then drops it with a skipped row.
+    const v1 = chatgptExportZip([
+      { id: 'r13b-good', title: 'G', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'r13b good' }] },
+      { id: 'r13b-conv', title: 'from main', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'r13b main copy' }] },
+    ]);
+    await put('r13b-main', 'export-inbox', 'main.zip', v1);
+    await drainQueue();
+    const v2 = chatgptExportZip([
+      { id: 'r13b-good', title: 'G2', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'r13b good v2' }] },
+      { id: '', title: 'Malformed', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'idless row' }] },
+    ]);
+    await put('r13b-main', 'export-inbox', 'main.zip', v2);
+    await drainAll();
+
+    // main's skip-cleanup flipped r13b-conv to 'error' + kicked recovery; the sibling on the other
+    // machine re-claims it -> back to 'ready', canonical the sibling's file.
+    const after = await testEnv.DB.prepare(
+      `SELECT s.index_state, f.id AS canon FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = 'r13b-conv'`,
+    ).first<{ index_state: string; canon: number }>();
+    expect(after?.index_state).toBe('ready');
+    expect(after?.canon).toBe(sibId);
   });
 
   it('the single-session API read extracts only the target conversation from an archive, not the whole ZIP (round 12 Fix 4)', async () => {

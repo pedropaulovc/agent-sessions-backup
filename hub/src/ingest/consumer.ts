@@ -442,33 +442,45 @@ async function parseExportInto(file: FileRow, env: Env, reason: ParseMessage['re
   // delete+reinsert reparse semantics (derived rows + this session row; raw R2 untouched). A
   // well-formed empty array correctly clears everything this file owned; the invalid case already
   // returned above, so a corrupt re-upload never reaches here.
-  // A conversation PRESENT in the replacement archive but skipped (malformed / id field renamed
-  // away) is left out of `written`, yet it must NOT be treated as a deletion: an id-less skipped row
-  // can't be matched back to the prior session it may correspond to, so deleting un-written owned
-  // sessions while ANY row was skipped could destroy a still-present-but-malformed conversation. Run
-  // the destructive cleanup only when EVERY row parsed (archive.skipped === 0), so genuine absence is
-  // still deleted; otherwise retain the un-written sessions (preservation-first).
+  // Reconcile the sessions this file used to own but did NOT just (re)write. Two regimes:
+  //  - archive.skipped === 0 (every row parsed): an un-written owned session is a GENUINE deletion —
+  //    delete its derived rows + session row (matching delete+reinsert reparse semantics; raw R2
+  //    untouched). A well-formed empty array clears everything this file owned; the invalid case
+  //    already returned above, so a corrupt re-upload never reaches here.
+  //  - archive.skipped > 0 (a row was malformed / id renamed away): we can't match an id-less skipped
+  //    row back to the prior session it may correspond to, so we must NOT delete (round-12's
+  //    no-destructive-delete stance). But leaving the session 'ready' would advertise blocks its
+  //    canonical (the NEW archive) can no longer produce — /api/v1/sessions/{id} returns null and
+  //    /raw 404s while search still lists stale rows. Flip it to index_state='error' instead (rows
+  //    kept for discoverability, state honestly says the canonical can't serve it).
+  // Either way the session is added to `recovered`, kicking the sibling-archive fan-out below so a
+  // cross-machine or older archive that still holds the conversation re-claims it (reason:'recover'
+  // guards against clobbering a healthy owner).
   const recovered = new Set<string>();
-  if (archive.skipped === 0) {
+  {
     const owned = await env.DB.prepare('SELECT session_id FROM sessions WHERE canonical_file_id = ?1')
       .bind(file.id)
       .all<{ session_id: string }>();
     for (const { session_id } of owned.results) {
       if (written.has(session_id)) continue;
-      await env.DB.batch([
-        env.DB.prepare(
-          `INSERT INTO blocks_fts (blocks_fts, rowid, text) SELECT 'delete', id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL`,
-        ).bind(session_id),
-        env.DB.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(session_id),
-        env.DB.prepare('DELETE FROM usage WHERE session_id = ?1').bind(session_id),
-        env.DB.prepare('DELETE FROM sessions WHERE session_id = ?1').bind(session_id),
-      ]);
+      if (archive.skipped === 0) {
+        await env.DB.batch([
+          env.DB.prepare(
+            `INSERT INTO blocks_fts (blocks_fts, rowid, text) SELECT 'delete', id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL`,
+          ).bind(session_id),
+          env.DB.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(session_id),
+          env.DB.prepare('DELETE FROM usage WHERE session_id = ?1').bind(session_id),
+          env.DB.prepare('DELETE FROM sessions WHERE session_id = ?1').bind(session_id),
+        ]);
+      } else {
+        await env.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(session_id).run();
+      }
       recovered.add(session_id);
     }
   }
 
-  // Overlapping archives: a session we just deleted may still live in ANOTHER export file that once
-  // lost ownership to this one (archives keep no files.session_id duplicates for the normal recovery
+  // Overlapping archives: a session we just deleted OR flipped to 'error' may still live in ANOTHER
+  // export file that once lost ownership to this one (archives keep no files.session_id duplicates for the normal recovery
   // path to pick from). Re-enqueue the other export-inbox files — on ANY machine, since conversation
   // ids are globally unique per account and a same-account export can be uploaded from a different
   // collector — so their reparse re-claims any conversation they still contain; a transient absence
