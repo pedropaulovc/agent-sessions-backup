@@ -42,10 +42,15 @@ function stubList(pages: R2Object[][]) {
   });
 }
 
-async function seedCursor(value: string): Promise<void> {
+async function seedCursor(cursor: string | null, prefix = 'raw/'): Promise<void> {
   await testEnv.DB.prepare("INSERT INTO meta (key, value) VALUES ('reindex_cursor', ?1) ON CONFLICT (key) DO UPDATE SET value = ?1")
-    .bind(value)
+    .bind(JSON.stringify({ prefix, cursor }))
     .run();
+}
+
+async function readCursor(): Promise<{ prefix: string; cursor: string | null }> {
+  const row = await testEnv.DB.prepare("SELECT value FROM meta WHERE key = 'reindex_cursor'").first<{ value: string }>();
+  return JSON.parse(row!.value);
 }
 
 async function fileCount(machine: string): Promise<number> {
@@ -99,8 +104,7 @@ describe('admin reindex batches D1 writes + queue sends to fit the whole corpus 
     expect(sent).toBe(150);
 
     expect(await fileCount('reindexbox')).toBe(150);
-    const cursor = await testEnv.DB.prepare("SELECT value FROM meta WHERE key = 'reindex_cursor'").first<{ value: string }>();
-    expect(cursor!.value).toBe('done'); // completed run parks at 'done' so the next call starts fresh
+    expect(await readCursor()).toEqual({ prefix: 'raw/', cursor: null }); // completed run parks at null so the next call starts fresh
   });
 
   it('resumes from a persisted cursor, processing only the tail (crash-resume, not restart)', async () => {
@@ -111,7 +115,7 @@ describe('admin reindex batches D1 writes + queue sends to fit the whole corpus 
       Array.from({ length: 40 }, () => sessionObject('tailbox')), // page 1 — the unfinished tail
     ];
     const listSpy = stubList(pages);
-    await seedCursor('1');
+    await seedCursor('1', 'raw/');
 
     const res = await reindex(reindexRequest(), testEnv, admin);
     expect(res.status).toBe(200);
@@ -125,15 +129,67 @@ describe('admin reindex batches D1 writes + queue sends to fit the whole corpus 
     expect(await fileCount('tailbox')).toBe(40); // only the tail
   });
 
-  it('treats a completed run (cursor = done) as a fresh start from the beginning', async () => {
-    await seedCursor('done');
+  it('treats a completed run (cursor = null) as a fresh start from the beginning', async () => {
+    await seedCursor(null);
     const pages = [Array.from({ length: 5 }, () => sessionObject('freshbox'))];
     const listSpy = stubList(pages);
 
     const res = await reindex(reindexRequest(), testEnv, admin);
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ enqueued: 5, done: true });
-    expect(listSpy.mock.calls[0]![0]?.cursor).toBeUndefined(); // started over, not resumed from 'done'
+    expect(listSpy.mock.calls[0]![0]?.cursor).toBeUndefined(); // started over, not resumed from a completed run
     expect(await fileCount('freshbox')).toBe(5);
+  });
+
+  it('does NOT resume a saved cursor from a different prefix — a targeted reindex starts fresh (round 2 finding 1)', async () => {
+    // A crashed full-corpus run left a live cursor scoped to prefix A. A later reindex of prefix B must
+    // ignore it and start B from the beginning, not replay A's opaque, prefix-scoped R2 token.
+    await seedCursor('deep-into-A', 'raw/machine-A/');
+    const pages = [Array.from({ length: 7 }, () => sessionObject('bbox'))];
+    const listSpy = stubList(pages);
+
+    const res = await reindex(reindexRequest('raw/machine-B/'), testEnv, admin);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ enqueued: 7, done: true });
+
+    // Positive control: without the prefix guard, resumeCursor would hand back 'deep-into-A' and the
+    // first list() would carry it — skipping B's start. It must be undefined (fresh) and prefix B.
+    expect(listSpy.mock.calls[0]![0]?.cursor).toBeUndefined();
+    expect(listSpy.mock.calls[0]![0]?.prefix).toBe('raw/machine-B/');
+    expect(await fileCount('bbox')).toBe(7);
+    expect(await readCursor()).toEqual({ prefix: 'raw/machine-B/', cursor: null }); // now tagged with B
+
+    // Same-prefix resume still works: re-seed A's cursor and reindex A → the token IS replayed.
+    await seedCursor('deep-into-A', 'raw/machine-A/');
+    const listSpyA = stubList([Array.from({ length: 3 }, () => sessionObject('abox'))]);
+    listSpyA.mockClear(); // spyOn reuses the underlying spy — drop the earlier prefix-B calls
+    await reindex(reindexRequest('raw/machine-A/'), testEnv, admin);
+    expect(listSpyA.mock.calls[0]![0]?.cursor).toBe('deep-into-A');
+  });
+
+  it('splits sendBatch chunks by serialized size, not just count, when R2 keys are long (round 2 finding 2)', async () => {
+    // 100 objects whose keys are ~4KB each: by count alone they'd pack into one 100-message sendBatch
+    // of ~400KB, over the Queues 256KB cap. The size budget must split them into multiple sub-cap chunks.
+    const longSuffix = 'x'.repeat(4000);
+    const pages = [Array.from({ length: 100 }, () => fakeObject(`raw/longbox/misc/${crypto.randomUUID()}-${longSuffix}.bin`))];
+    stubList(pages);
+    const sendBatchSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'sendBatch');
+
+    const res = await reindex(reindexRequest(), testEnv, admin);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ enqueued: 100, done: true });
+
+    // More than one chunk (count alone would have been exactly one), and every chunk's serialized
+    // payload stays under the 256KB Queues hard cap.
+    expect(sendBatchSpy.mock.calls.length).toBeGreaterThan(1);
+    let sent = 0;
+    for (const call of sendBatchSpy.mock.calls) {
+      const chunk = call[0] as { body: unknown }[];
+      expect(chunk.length).toBeLessThanOrEqual(100);
+      expect(JSON.stringify(chunk).length).toBeLessThan(256_000);
+      sent += chunk.length;
+    }
+    expect(sent).toBe(100);
+    expect(await fileCount('longbox')).toBe(100);
   });
 });

@@ -105,7 +105,8 @@ export async function usage(url: URL, env: Env): Promise<Response> {
  * structured so one page costs a FIXED handful of subrequests regardless of page size:
  *   - all the D1 writes for a page collapse into two env.DB.batch() calls (each batch is a single
  *     round trip to D1 — one subrequest — not one per statement);
- *   - the re-enqueues go through PARSE_QUEUE.sendBatch() in chunks of 100 (the Queues per-call cap).
+ *   - the re-enqueues go through PARSE_QUEUE.sendBatch() in chunks bounded by both the 100-message
+ *     count cap and a serialized-size budget (Queues rejects a >256KB batch).
  * At R2's max page size of 1000 that is ~14 subrequests/page × ~35 pages ≈ 490 for the whole corpus,
  * so it now completes in ONE invocation. The reindex_cursor is read on entry (not just written) so a
  * run that does outgrow one invocation — or one that crashes — resumes from its last persisted page
@@ -115,11 +116,14 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
   const body = (await request.json().catch(() => ({}))) as { prefix?: string };
   const prefix = body.prefix ?? 'raw/';
 
-  // Resume: a crashed/paused run leaves reindex_cursor at the last R2 page it finished. Re-entering
-  // with a live (non-'done') cursor picks up there; a fresh run — or one after a completed 'done' —
-  // starts from the beginning. The cursor is R2's own opaque, prefix-scoped list token.
+  // Resume: a crashed/paused run leaves reindex_cursor at the last R2 page it finished, tagged with
+  // the prefix it was walking. Re-entering with a live cursor for the SAME prefix picks up there; a
+  // fresh run, a completed run (cursor null), or a run for a DIFFERENT prefix starts from the
+  // beginning. The prefix tag matters because the cursor is R2's own opaque token, scoped to the
+  // prefix that produced it — replaying a full-corpus cursor against a targeted `raw/machineX/`
+  // reindex would skip the start of the requested prefix or fail outright.
   const saved = await env.DB.prepare("SELECT value FROM meta WHERE key = 'reindex_cursor'").first<{ value: string }>();
-  let cursor: string | undefined = saved && saved.value !== 'done' ? saved.value : undefined;
+  let cursor = resumeCursor(saved?.value, prefix);
 
   let enqueued = 0;
   do {
@@ -189,26 +193,66 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
       }
       if (flipStmts.length > 0) await env.DB.batch(flipStmts);
 
-      // Re-enqueue via sendBatch (≤100 messages/call) instead of one send per file.
+      // Re-enqueue via sendBatch instead of one send per file. Chunks are bounded by BOTH the 100-message
+      // count cap AND a serialized-size budget: Cloudflare Queues rejects a sendBatch whose total payload
+      // exceeds 256KB, and 100 messages with long R2 keys can blow past that — which would throw here and
+      // wedge this page forever. queueChunks keeps each chunk under ~200KB, leaving envelope margin.
       const messages = items.map((i, k) => ({
         body: { file_id: ids[k]!, r2_key: i.key, reason: 'reindex' as const, content_hash: i.contentHash },
       }));
-      for (let start = 0; start < messages.length; start += 100) {
-        await env.PARSE_QUEUE.sendBatch(messages.slice(start, start + 100));
+      for (const chunk of queueChunks(messages)) {
+        await env.PARSE_QUEUE.sendBatch(chunk);
       }
       enqueued += items.length;
     }
 
     cursor = page.truncated ? page.cursor : undefined;
     // Persist AFTER this page's sends so a crash re-processes at most one page — and reindexing a page
-    // is idempotent (upserts + re-enqueue), so the overlap is harmless.
+    // is idempotent (upserts + re-enqueue), so the overlap is harmless. Tag it with the prefix so a
+    // later reindex of a different prefix doesn't resume from this token (see resumeCursor).
     await env.DB.prepare("INSERT INTO meta (key, value) VALUES ('reindex_cursor', ?1) ON CONFLICT (key) DO UPDATE SET value = ?1")
-      .bind(cursor ?? 'done')
+      .bind(JSON.stringify({ prefix, cursor: cursor ?? null }))
       .run();
   } while (cursor);
 
   console.log(JSON.stringify({ event: 'hub.reindex', enqueued }));
   return Response.json({ enqueued, done: true });
+}
+
+/** The persisted reindex cursor is a live R2 list token only when it belongs to the prefix being walked
+ * now; anything else (fresh run, completed run with cursor null, a different prefix, or a legacy/plain
+ * value) means start from the beginning. */
+export function resumeCursor(saved: string | undefined, prefix: string): string | undefined {
+  if (!saved) return undefined;
+  try {
+    const parsed = JSON.parse(saved) as { prefix?: string; cursor?: string | null };
+    if (parsed.prefix === prefix && parsed.cursor) return parsed.cursor;
+  } catch {
+    // Legacy plain-string value from before cursors were prefix-tagged — treat as no resume.
+  }
+  return undefined;
+}
+
+/** Split queue messages into sendBatch chunks bounded by BOTH the 100-message count cap and a
+ * serialized-size budget (Cloudflare Queues rejects a sendBatch whose total payload exceeds 256KB).
+ * SIZE_CAP is conservative and each message's size is over-estimated (envelope overhead added) so the
+ * real serialized array stays comfortably under the hard limit even with long R2 keys. */
+export function queueChunks<T>(messages: { body: T }[], sizeCap = 200_000): { body: T }[][] {
+  const chunks: { body: T }[][] = [];
+  let chunk: { body: T }[] = [];
+  let bytes = 0;
+  for (const m of messages) {
+    const size = JSON.stringify(m.body).length + 32; // +32 for per-message array/envelope overhead
+    if (chunk.length > 0 && (chunk.length >= 100 || bytes + size > sizeCap)) {
+      chunks.push(chunk);
+      chunk = [];
+      bytes = 0;
+    }
+    chunk.push(m);
+    bytes += size;
+  }
+  if (chunk.length > 0) chunks.push(chunk);
+  return chunks;
 }
 
 export function hex(buf: ArrayBuffer): string {
