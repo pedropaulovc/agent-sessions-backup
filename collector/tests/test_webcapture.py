@@ -96,6 +96,55 @@ def test_claude_resolves_org_and_captures_with_tree(tmp_path):
     assert events == []
 
 
+def test_claude_conversation_list_is_paginated(tmp_path, monkeypatch):
+    # Round 10 Fix 4: chat_conversations is paginated — a bare fetch returns only page 1 and hides
+    # older conversations. Force a tiny page size so 3 conversations span two pages (a full page 1,
+    # a short page 2) and assert BOTH pages were listed, checked, and captured.
+    from agent_collector.webcapture import claude as claude_mod
+
+    monkeypatch.setattr(claude_mod, "_LIST_PAGE", 2)
+    org = "org1"
+    page1 = [{"uuid": "p1a", "updated_at": "t1"}, {"uuid": "p1b", "updated_at": "t2"}]
+    page2 = [{"uuid": "p2a", "updated_at": "t3"}]
+    conv = lambda uid: (200, json.dumps({"uuid": uid, "chat_messages": []}))
+    transport = FakeCdpTransport({
+        f"{CLAUDE}/api/organizations": (200, json.dumps([{"uuid": org, "capabilities": ["chat"]}])),
+        f"{CLAUDE}/api/organizations/{org}/chat_conversations?limit=2&offset=0": (200, json.dumps(page1)),
+        f"{CLAUDE}/api/organizations/{org}/chat_conversations?limit=2&offset=2": (200, json.dumps(page2)),
+        f"{CLAUDE}/api/organizations/{org}/chat_conversations/p1a?tree=True&rendering_mode=raw": conv("p1a"),
+        f"{CLAUDE}/api/organizations/{org}/chat_conversations/p1b?tree=True&rendering_mode=raw": conv("p1b"),
+        f"{CLAUDE}/api/organizations/{org}/chat_conversations/p2a?tree=True&rendering_mode=raw": conv("p2a"),
+    })
+    staging = tmp_path / "claude-web"
+    events: list[dict] = []
+    with State(tmp_path / "state.db") as st:
+        res = capture_claude(transport, st, staging, events)
+    assert res.checked == 3 and res.captured == 3  # page 2's conversation is not lost
+    for uid in ("p1a", "p1b", "p2a"):
+        assert (staging / f"{uid}.json").exists()
+    # Both list pages were actually fetched, in order.
+    assert transport.calls.count(f"{CLAUDE}/api/organizations/{org}/chat_conversations?limit=2&offset=0") == 1
+    assert transport.calls.count(f"{CLAUDE}/api/organizations/{org}/chat_conversations?limit=2&offset=2") == 1
+    assert events == []
+
+
+def test_claude_empty_first_page_is_zero_not_error(tmp_path, monkeypatch):
+    # An empty first page means the org has zero conversations — a clean run, not a list failure.
+    from agent_collector.webcapture import claude as claude_mod
+
+    monkeypatch.setattr(claude_mod, "_LIST_PAGE", 2)
+    org = "org1"
+    transport = FakeCdpTransport({
+        f"{CLAUDE}/api/organizations": (200, json.dumps([{"uuid": org, "capabilities": ["chat"]}])),
+        f"{CLAUDE}/api/organizations/{org}/chat_conversations?limit=2&offset=0": (200, json.dumps([])),
+    })
+    events: list[dict] = []
+    with State(tmp_path / "state.db") as st:
+        res = capture_claude(transport, st, tmp_path / "claude-web", events)
+    assert res.checked == 0 and res.captured == 0 and res.errors == 0
+    assert events == []
+
+
 def test_claude_signed_out_emits_login_event(tmp_path):
     transport = FakeCdpTransport({f"{CLAUDE}/api/organizations": (401, "")})
     events: list[dict] = []

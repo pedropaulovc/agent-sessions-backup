@@ -364,6 +364,20 @@ async function parseExportInto(file: FileRow, env: Env, reason: ParseMessage['re
     return;
   }
 
+  // A NON-empty archive (recognized layout, conversations present) that parses to zero turns across
+  // EVERY conversation is content-shape drift — mapping/chat_messages present but all blocks an
+  // unsupported shape — not a genuinely empty export. Writing it would leave `written` empty and the
+  // cleanup below would then DELETE every session this file owns, destroying good content over a
+  // temporary parser gap. Treat it like an invalid archive: error the file, preserve existing
+  // sessions, skip the destructive cleanup. A well-formed EMPTY array (archive.sessions.length === 0)
+  // is a legitimate empty export and still falls through to clear what it owned; a MIXED archive with
+  // at least one turn-bearing conversation writes normally.
+  const totalTurns = archive.sessions.reduce((n, s) => n + s.turns.length, 0);
+  if (archive.sessions.length > 0 && totalTurns === 0) {
+    await failExportFile(file, env, contentHash, 'export archive parsed to zero turns across all conversations (content-shape drift)');
+    return;
+  }
+
   // Session ids we actually WROTE this parse (turns > 0 and not owned by a HEALTHY live CDP
   // capture). A conversation present in the new archive but now parsing to zero turns is
   // deliberately NOT kept, so its stale rows get cleared below (same as the single-session

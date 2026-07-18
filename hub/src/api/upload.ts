@@ -179,19 +179,16 @@ export async function putFile(
     // ready content indefinitely. Flip to 'parsing' now: an honest in-progress signal, and if the
     // message never arrives, the session is visibly stuck 'parsing' (already alertable via
     // /status) instead of silently stale-'ready'. No-op for a brand-new session (no sessions row
-    // yet) or a non-canonical duplicate (canonical_file_id != this file's id).
-    await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1 AND canonical_file_id = ?2")
-      .bind(det.sessionId, row!.id)
-      .run();
+    // yet) or a non-canonical duplicate (canonical_file_id != this file's id). Hash-guarded against
+    // the concurrent-upsert-loser race — see flipOwnedSessionsToParsing.
+    await flipOwnedSessionsToParsing(row!.id, det.sessionId, sha256, env);
   } else if (det.kind === 'export-archive') {
     // An export ZIP fans out to many per-conversation sessions and carries no det.sessionId, so the
     // single-session flip above never runs. A changed-hash re-upload already overwrote the ZIP; flip
     // every session this archive is canonical for to 'parsing' so /search and /sessions stop
     // advertising the OLD bytes' blocks as 'ready' until the reparse lands (or, if the message is
     // dropped, the sessions are visibly stuck 'parsing' — alertable — instead of silently stale).
-    await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE canonical_file_id = ?1")
-      .bind(row!.id)
-      .run();
+    await flipOwnedSessionsToParsing(row!.id, null, sha256, env);
   }
   await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
 
@@ -209,6 +206,38 @@ export async function putFile(
  * identical to what a real interleaving would produce, and this function is exactly what each
  * request runs to detect and repair it.
  */
+/**
+ * Flip the sessions a just-reuploaded file owns to index_state='parsing' — but ONLY while the file
+ * row still carries THIS upload's content_hash. Two concurrent changed-hash uploads for the same
+ * path upsert the SAME row; the upsert LOSER can reach the flip after the winner's hash already owns
+ * the row (and the winner may have parsed it back to 'ready'). An unguarded flip would knock those
+ * sessions to 'parsing' while the loser's stale queue message is rejected by parseOne's content_hash
+ * guard — stranding them 'parsing' forever. The EXISTS makes the check+flip atomic in one statement.
+ * sessionId set = single-session harness (filter by session_id too); null = export archive (fans out
+ * to every session it's canonical for). Exported so tests can drive the loser end-state directly (row
+ * hash already advanced to another request's) the same way convergeR2WithRow's tests do.
+ */
+export async function flipOwnedSessionsToParsing(
+  fileId: number,
+  sessionId: string | null,
+  sha256: string,
+  env: Env,
+): Promise<void> {
+  if (sessionId !== null) {
+    await env.DB.prepare(
+      "UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1 AND canonical_file_id = ?2 AND EXISTS (SELECT 1 FROM files WHERE id = ?2 AND content_hash = ?3)",
+    )
+      .bind(sessionId, fileId, sha256)
+      .run();
+    return;
+  }
+  await env.DB.prepare(
+    "UPDATE sessions SET index_state = 'parsing' WHERE canonical_file_id = ?1 AND EXISTS (SELECT 1 FROM files WHERE id = ?1 AND content_hash = ?2)",
+  )
+    .bind(fileId, sha256)
+    .run();
+}
+
 export async function convergeR2WithRow(fileId: number, r2Key: string, sha256: string, body: ArrayBuffer, env: Env): Promise<void> {
   const current = await env.DB.prepare('SELECT content_hash, mtime FROM files WHERE id = ?1')
     .bind(fileId)

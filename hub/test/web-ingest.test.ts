@@ -2,6 +2,7 @@ import { SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { env as testEnvRaw } from 'cloudflare:test';
 import worker from '../src/index';
+import { flipOwnedSessionsToParsing } from '../src/api/upload';
 import { chatgptExportZip, chatgptWebConversation, claudeWebConversation, historyLines, unrecognizedExportZip } from './web-fixtures';
 import { ccUserLine } from './fixtures';
 
@@ -689,6 +690,93 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     ).first<{ index_state: string; canon: number }>();
     expect(afterX?.index_state).toBe('ready');
     expect(afterX?.canon).toBe(ex1Id);
+  });
+
+  it('the parsing-flip is hash-guarded: a concurrent-upsert loser cannot revert a winner\'s ready sessions (round 10 Fix 1)', async () => {
+    const zip = chatgptExportZip([{ id: 'flipguard-a', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'flip guard marker' }] }]);
+    const r = await put('webbox', 'export-inbox', 'flipguard.zip', zip);
+    const fileId = ((await r.json()) as { file_id: number }).file_id;
+    await drainQueue();
+    const sess = "SELECT index_state FROM sessions WHERE session_id = 'flipguard-a'";
+    expect(await testEnv.DB.prepare(sess).first<{ index_state: string }>()).toMatchObject({ index_state: 'ready' });
+    const winnerHash = (await testEnv.DB.prepare('SELECT content_hash FROM files WHERE id = ?1').bind(fileId).first<{ content_hash: string }>())!.content_hash;
+
+    // LOSER: an in-flight upload whose hash differs from the row's current (winner) hash — a
+    // concurrent winner upserted after it, so by the time it reaches the flip the row no longer
+    // carries its hash. The guard must make the flip a no-op; the winner's session stays 'ready'.
+    await flipOwnedSessionsToParsing(fileId, null, 'f'.repeat(64), testEnv);
+    expect(await testEnv.DB.prepare(sess).first<{ index_state: string }>()).toMatchObject({ index_state: 'ready' });
+
+    // WINNER (row hash matches) DOES flip its owned sessions — the guard only blocks the loser.
+    await flipOwnedSessionsToParsing(fileId, null, winnerHash, testEnv);
+    expect(await testEnv.DB.prepare(sess).first<{ index_state: string }>()).toMatchObject({ index_state: 'parsing' });
+  });
+
+  it('a non-empty archive that parses to zero turns everywhere errors the file and preserves existing sessions (round 10 Fix 2)', async () => {
+    // Own machine + unique ids: this exercises the failExportFile path, whose recover fan-out
+    // re-enqueues every OTHER export-inbox file on the SAME machine. On the shared 'webbox' that would
+    // reparse ~20 sibling archives from other tests (slow, and any id overlap could reclaim a session).
+    const v1 = chatgptExportZip([
+      { id: 'r10zt-a', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'r10zt A has real content' }] },
+      { id: 'r10zt-b', title: 'B', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'r10zt B has real content' }] },
+    ]);
+    const r1 = await put('r10box', 'export-inbox', 'zeroturn.zip', v1);
+    const fileId = ((await r1.json()) as { file_id: number }).file_id;
+    await drainQueue();
+    expect(
+      await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id IN ('r10zt-a','r10zt-b') AND index_state = 'ready'").first<{ n: number }>(),
+    ).toMatchObject({ n: 2 });
+
+    // Re-upload (changed hash) where BOTH conversations now parse to zero turns — content-shape drift
+    // (layout still recognized, all blocks unsupported), NOT a genuine empty export. It must error the
+    // file and PRESERVE the existing sessions, never run the destructive cleanup that would delete them.
+    const v2 = chatgptExportZip([
+      { id: 'r10zt-a', title: 'A', turns: [] },
+      { id: 'r10zt-b', title: 'B', turns: [] },
+    ]);
+    expect((await put('r10box', 'export-inbox', 'zeroturn.zip', v2)).status).toBe(201);
+    await drainAll();
+
+    expect(await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1').bind(fileId).first<{ parse_state: string }>()).toMatchObject({ parse_state: 'error' });
+    const rows = await testEnv.DB.prepare("SELECT session_id, index_state FROM sessions WHERE session_id IN ('r10zt-a','r10zt-b')").all<{ session_id: string; index_state: string }>();
+    expect(rows.results.map((r) => `${r.session_id}:${r.index_state}`).sort()).toEqual(['r10zt-a:error', 'r10zt-b:error']); // rows intact (not deleted), flipped to error
+  });
+
+  it('a MIXED archive (one empty conversation, one with turns) still parses the turn-bearing one (round 10 Fix 2)', async () => {
+    const zip = chatgptExportZip([
+      { id: 'mix-empty', title: 'E', turns: [] },
+      { id: 'mix-full', title: 'F', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'mix full content' }] },
+    ]);
+    const r = await put('webbox', 'export-inbox', 'mixed.zip', zip);
+    const fileId = ((await r.json()) as { file_id: number }).file_id;
+    await drainQueue();
+    expect(await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1').bind(fileId).first<{ parse_state: string }>()).toMatchObject({ parse_state: 'parsed' });
+    expect(await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'mix-full'").first<{ index_state: string }>()).toMatchObject({ index_state: 'ready' });
+    // The empty conversation produced no session (0 turns -> skipped in the write loop), which is fine.
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'mix-empty'").first<{ n: number }>()).toMatchObject({ n: 0 });
+  });
+
+  it('renders an archive-backed session by extracting only its conversation, not the whole archive (round 10 Fix 3)', async () => {
+    const zip = chatgptExportZip(
+      [
+        { id: 'view-target', title: 'Target', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'TARGETONLYMARKER content' }] },
+        { id: 'view-sibling', title: 'Sibling', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'SIBLINGMARKER should not appear' }] },
+      ],
+      { 'attachments/poison.bin': 'x'.repeat(50_000) }, // ancillary entry that must never be inflated
+    );
+    await put('webbox', 'export-inbox', 'viewpage.zip', zip);
+    await drainQueue();
+
+    const page = await SELF.fetch('https://sessions.vza.net/s/view-target', { headers: { 'x-dev-machine': 'webbox' } });
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain('TARGETONLYMARKER');
+    expect(html).not.toContain('SIBLINGMARKER'); // the sibling conversation is never surfaced
+
+    // The normalized API for the archive-backed session returns exactly the target's single turn.
+    const api = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions/view-target', { headers: { 'x-dev-machine': 'webbox' } });
+    const body = (await api.json()) as { session: { turns: unknown[] } };
+    expect(body.session.turns.length).toBe(1);
   });
 });
 

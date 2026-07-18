@@ -18,6 +18,9 @@ from .result import CaptureResult, login_expired_event, valid_conv_id
 
 BASE = "https://claude.ai"
 
+_LIST_PAGE = 100  # claude.ai chat_conversations is paginated; conversations requested per page
+_MAX_PAGES = 1000  # defensive bound (100k convs) so a broken server can't loop us forever
+
 
 def capture_claude(transport: CdpTransport, state, staging_root: Path, events: list[dict]) -> CaptureResult:
     res = CaptureResult(product="claude")
@@ -36,15 +39,14 @@ def capture_claude(transport: CdpTransport, state, staging_root: Path, events: l
 
 def _capture_org(transport: CdpTransport, state, staging_root: Path, events: list[dict], org_id: str, res: CaptureResult) -> None:
     """List + fetch one org's changed conversations, accumulating into `res`."""
-    status, body = transport.fetch(f"{BASE}/api/organizations/{org_id}/chat_conversations")
-    convs = _parse_list(body) if status == 200 else None
-    if status != 200 or convs is None:
-        # Non-200 or a 200 that isn't a JSON array (auth/interstitial page, layout drift): a
-        # capture error, not an unhandled json.loads that aborts the whole webcapture command.
+    convs = _list_conversations(transport, org_id)
+    if convs is None:
+        # A non-200 or a 200 that isn't a JSON array (auth/interstitial page, layout drift) on ANY
+        # page: a capture error, not an unhandled json.loads that aborts the whole webcapture command.
         res.errors += 1
         events.append({
             "level": "warn", "code": "webcapture_list_failed",
-            "message": f"claude conversation list HTTP {status} for org {org_id}", "count": 1, "store": "claude-web",
+            "message": f"claude conversation list failed for org {org_id}", "count": 1, "store": "claude-web",
         })
         return
 
@@ -109,6 +111,30 @@ def _capture_org(transport: CdpTransport, state, staging_root: Path, events: lis
         (staging_root / f"{conv_id}.json").write_text(body, encoding="utf-8")
         state.set_webcapture_watermark("claude", conv_id, updated)
         res.captured += 1
+
+
+def _list_conversations(transport: CdpTransport, org_id: str):
+    """Page through one org's FULL conversation list. chat_conversations is paginated — a bare fetch
+    returns only the first page and silently hides older conversations — so loop by limit/offset
+    until a short (fewer than a full page) or empty page. Returns the accumulated list, or None on
+    ANY page's HTTP error or non-array body so the caller reports the org's list as failed (same
+    posture the single fetch had). An empty first page returns [] (zero conversations, not an error)."""
+    all_convs: list = []
+    offset = 0
+    for _ in range(_MAX_PAGES):
+        status, body = transport.fetch(
+            f"{BASE}/api/organizations/{org_id}/chat_conversations?limit={_LIST_PAGE}&offset={offset}"
+        )
+        if status != 200:
+            return None
+        page = _parse_list(body)
+        if page is None:
+            return None
+        all_convs.extend(page)
+        if len(page) < _LIST_PAGE:
+            return all_convs
+        offset += len(page)
+    return None  # too many pages — treat as a list failure rather than looping forever
 
 
 def _parse_list(body: str):
