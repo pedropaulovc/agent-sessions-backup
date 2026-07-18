@@ -25,4 +25,10 @@ interface ParseMessage {
    * 'parsed' for content it didn't actually parse. Optional so legacy in-flight messages (enqueued
    * before this field existed) still process with today's unconditional behavior. */
   content_hash?: string;
+  /** Export-archive continuation cursor: the index of the first conversation this invocation should
+   * write. An export ZIP fans out to hundreds of per-conversation writes (~5 D1 queries each), which
+   * would blow the ~1000-queries/invocation cap in one shot — so parseExportInto processes a bounded
+   * slice, then re-enqueues itself with offset advanced until the whole archive is written. Absent =
+   * start at 0. Only meaningful for export-archive files. */
+  offset?: number;
 }

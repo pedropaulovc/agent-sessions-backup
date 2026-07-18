@@ -128,7 +128,7 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
     return;
   }
   if (det.kind === 'export-archive') {
-    await parseExportInto(file, env, job.reason, job.content_hash);
+    await parseExportInto(file, env, job.reason, job.content_hash, job.offset ?? 0);
     return;
   }
   if (!det.sessionId || !SINGLE_SESSION_HARNESSES.has(det.harness)) {
@@ -337,7 +337,16 @@ async function failExportFile(file: FileRow, env: Env, contentHash: string | und
   console.log(JSON.stringify({ event: 'parse.export.error', file_id: file.id, error: reason, owned_errored: owned.results.length }));
 }
 
-async function parseExportInto(file: FileRow, env: Env, reason: ParseMessage['reason'], contentHash?: string): Promise<void> {
+// An export ZIP fans out to one writeSession per conversation, ~5 D1 queries each. Writing all of a
+// large archive (the prod trigger: 783 conversations) in one consumer invocation blows the ~1000
+// D1-queries-per-invocation cap — and the original code marked the file 'parsed' AFTER an unbounded
+// write loop, so a run that silently stopped short still ended 'parsed' with a partial index: a
+// silent data gap. We bound each invocation to this many conversations and re-enqueue a continuation
+// (offset advanced) until the last slice, which alone marks 'parsed' and runs cleanup. 100 × ~5 ≈ 500
+// queries/invocation, comfortably under the cap even for conversations heavier than the ~5-query mean.
+export const EXPORT_CONVERSATIONS_PER_INVOCATION = 100;
+
+async function parseExportInto(file: FileRow, env: Env, reason: ParseMessage['reason'], contentHash?: string, offset = 0): Promise<void> {
   const obj = await env.RAW.get(file.r2_key);
   if (!obj) {
     // The raw ZIP is gone (e.g. a reindex after the R2 object was deleted). Do NOT throw into the
@@ -387,8 +396,11 @@ async function parseExportInto(file: FileRow, env: Env, reason: ParseMessage['re
   // capture). A conversation present in the new archive but now parsing to zero turns is
   // deliberately NOT kept, so its stale rows get cleared below (same as the single-session
   // empty-parse path).
+  // Process only this invocation's bounded slice of conversations (see EXPORT_CONVERSATIONS_PER_INVOCATION).
+  const sliceEnd = Math.min(offset + EXPORT_CONVERSATIONS_PER_INVOCATION, archive.sessions.length);
+  const isFinalSlice = sliceEnd >= archive.sessions.length;
   const written = new Set<string>();
-  for (const session of archive.sessions) {
+  for (const session of archive.sessions.slice(offset, sliceEnd)) {
     if (session.turns.length === 0) continue;
     const existing = await env.DB.prepare(
       `SELECT f.store, f.parse_state AS canon_state, s.index_state, s.canonical_file_id
@@ -416,6 +428,19 @@ async function parseExportInto(file: FileRow, env: Env, reason: ParseMessage['re
     if (reason === 'recover' && healthyOtherOwner) continue;
     await writeSession(session, file, env);
     written.add(session.id);
+  }
+
+  // Not the last slice: re-enqueue the continuation (offset advanced) and STOP — deliberately WITHOUT
+  // markParsed and WITHOUT cleanup. The file stays 'pending' until the final slice writes the last
+  // conversation, so a crash, a dropped continuation, or an over-cap invocation can never leave the
+  // file 'parsed' over a partially-written archive (the silent-data-gap guard). Under queue
+  // max_concurrency:1 the continuation runs after this message acks, serially.
+  if (!isFinalSlice) {
+    await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: contentHash, offset: sliceEnd });
+    console.log(
+      JSON.stringify({ event: 'parse.export.slice', file_id: file.id, offset, slice_end: sliceEnd, total: archive.sessions.length, written: written.size }),
+    );
+    return;
   }
 
   // Guarded markParsed FIRST — before any destructive cleanup. markParsed's `UPDATE ... WHERE
@@ -456,13 +481,20 @@ async function parseExportInto(file: FileRow, env: Env, reason: ParseMessage['re
   // Either way the session is added to `recovered`, kicking the sibling-archive fan-out below so a
   // cross-machine or older archive that still holds the conversation re-claims it (reason:'recover'
   // guards against clobbering a healthy owner).
+  // The keep-set is derived from the WHOLE archive, not this invocation's `written` slice: with the
+  // bounded continuation, owned sessions include conversations written by EARLIER slices, so keying
+  // cleanup off `written` (final slice only) would wrongly delete them. A conversation the archive
+  // still contains with turns > 0 is one this parse wrote (in some slice) or skipped to a healthier
+  // owner (which then isn't canonically owned by this file, so the loop below never touches it) — so
+  // "owned by this file AND not a non-empty conversation in the archive" is exactly the stale set.
+  const keep = new Set(archive.sessions.filter((s) => s.turns.length > 0).map((s) => s.id));
   const recovered = new Set<string>();
   {
     const owned = await env.DB.prepare('SELECT session_id FROM sessions WHERE canonical_file_id = ?1')
       .bind(file.id)
       .all<{ session_id: string }>();
     for (const { session_id } of owned.results) {
-      if (written.has(session_id)) continue;
+      if (keep.has(session_id)) continue;
       if (archive.skipped === 0) {
         await env.DB.batch([
           env.DB.prepare(
