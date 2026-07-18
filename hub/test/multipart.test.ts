@@ -2,6 +2,7 @@ import { env, SELF } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import worker from '../src/index';
 import { convergeMultipartRow } from '../src/api/upload';
+import { runPrune } from '../src/cron/prune';
 import { ccAssistantLine, ccUserLine } from './fixtures';
 
 const testEnv = env as unknown as Env;
@@ -291,16 +292,19 @@ describe('multipart review fixes', () => {
     return res.json();
   }
 
-  it('files/check does NOT report a completed multipart object as missing (customMetadata.sha256 fallback)', async () => {
+  it('a completed multipart canonical object has a NATIVE checksum and files/check does not report it missing', async () => {
     const bytes = new Uint8Array(6 * MIB).fill(5);
     const hash = await sha256Hex(bytes);
     const relpath = 'fc/mp.bin';
     expect((await multipartStore('fc-box', 'claude', relpath, bytes, 5 * MIB)).complete!.status).toBe(201);
 
-    // Positive control: a completed multipart object has NO native checksums.sha256...
+    // The canonical object is written by the staging->canonical put({sha256}), so it carries a NATIVE
+    // checksum (not a trusted metadata string) — the whole point of the staging redesign.
     const obj = await testEnv.RAW.head(`raw/fc-box/claude/${relpath}`);
-    expect(obj!.checksums.sha256).toBeUndefined();
-    expect(obj!.customMetadata?.sha256).toBe(hash); // ...but the verified hash is in customMetadata
+    const nativeHex = obj!.checksums.sha256
+      ? [...new Uint8Array(obj!.checksums.sha256)].map((b) => b.toString(16).padStart(2, '0')).join('')
+      : undefined;
+    expect(nativeHex).toBe(hash);
 
     const present = await checkFiles('fc-box', [{ store: 'claude', relpath, sha256: hash }]);
     expect(present.missing).toEqual([]); // not re-uploaded on every backfill
@@ -309,6 +313,64 @@ describe('multipart review fixes', () => {
     await testEnv.RAW.delete(`raw/fc-box/claude/${relpath}`);
     const gone = await checkFiles('fc-box', [{ store: 'claude', relpath, sha256: hash }]);
     expect(gone.missing).toEqual([{ store: 'claude', relpath }]);
+  });
+
+  it('PRESERVATION: a mismatched multipart complete leaves the previous canonical object intact', async () => {
+    // Upload v1 normally.
+    const v1 = new TextEncoder().encode(bigSession('dddddddd-1111-4222-8333-444444444444', 'ruthenium', 6 * MIB));
+    const relpath = 'preserve/keep.jsonl';
+    expect((await multipartStore('preserve-box', 'claude', relpath, v1, 5 * MIB)).complete!.status).toBe(201);
+    const v1Hash = await sha256Hex(v1);
+
+    // Now a NEW upload for the same path whose parts don't hash to the declared hash: create with the
+    // (correct) v2 hash but upload v1's bytes as the parts. Complete must 422 AND leave canonical = v1.
+    const v2 = new Uint8Array(6 * MIB).fill(200);
+    const v2Hash = await sha256Hex(v2);
+    const cr = await createMp('preserve-box', 'claude', relpath, v2.length, v2Hash);
+    const { upload_id } = await cr.json<any>();
+    // upload v1's bytes (5MiB + remainder) under the v2 upload
+    const p1 = await putPart('preserve-box', 'claude', relpath, upload_id, 1, v1.subarray(0, 5 * MIB), 5 * MIB, false);
+    const p2 = await putPart('preserve-box', 'claude', relpath, upload_id, 2, v1.subarray(5 * MIB), 5 * MIB, true);
+    const parts = [await p1.json<any>(), await p2.json<any>()].map((j) => ({ part_number: j.part_number, etag: j.etag }));
+    const comp = await completeMp('preserve-box', 'claude', relpath, upload_id, parts, v2Hash, v2.length);
+    expect(comp.status).toBe(422);
+
+    // The previous canonical object (v1) is byte-identical and intact — the backup was NOT destroyed.
+    const canonical = await testEnv.RAW.get(`raw/preserve-box/claude/${relpath}`);
+    expect(await sha256Hex(new Uint8Array(await canonical!.arrayBuffer()))).toBe(v1Hash);
+    // And no staging object was left behind.
+    const staging = await testEnv.RAW.head(`mpu-staging/preserve-box/claude/${relpath}`);
+    expect(staging).toBeNull();
+  });
+
+  it('canonical is not overwritten until verification passes: an in-flight upload leaves the old object', async () => {
+    const v1 = new Uint8Array(6 * MIB).fill(11);
+    const v1Hash = await sha256Hex(v1);
+    const relpath = 'staging/vis.bin';
+    expect((await multipartStore('vis-box', 'claude', relpath, v1, 5 * MIB)).complete!.status).toBe(201);
+
+    // Open a new upload and push a part, but do NOT complete — canonical must still be v1.
+    const v2 = new Uint8Array(6 * MIB).fill(22);
+    const cr = await createMp('vis-box', 'claude', relpath, v2.length, await sha256Hex(v2));
+    const { upload_id } = await cr.json<any>();
+    await putPart('vis-box', 'claude', relpath, upload_id, 1, v2.subarray(0, 5 * MIB), 5 * MIB, false);
+
+    const mid = await testEnv.RAW.get(`raw/vis-box/claude/${relpath}`);
+    expect(await sha256Hex(new Uint8Array(await mid!.arrayBuffer()))).toBe(v1Hash); // still the old bytes
+    await abortMp('vis-box', 'claude', relpath, upload_id);
+  });
+
+  it('rejects a create for a file larger than R2 single-put finalize limit (5 GiB)', async () => {
+    const res = await SELF.fetch(`${fileUrl('big-box', 'claude', 'huge.bin')}?uploads`, {
+      method: 'POST',
+      headers: {
+        'x-dev-machine': 'big-box',
+        'x-content-hash': `sha256:${'a'.repeat(64)}`,
+        'x-file-size': String(5 * 1024 * 1024 * 1024 + 1),
+      },
+    });
+    expect(res.status).toBe(400);
+    expect((await res.json<any>()).error).toBe('file_too_large');
   });
 
   it('create re-opens a fresh upload (not unchanged) when the same-hash R2 object is missing/corrupt', async () => {
@@ -329,12 +391,13 @@ describe('multipart review fixes', () => {
     expect((await reopened.json<any>()).status).toBe('created');
   });
 
-  it('convergeMultipartRow realigns a D1 row to the object R2 actually holds and re-enqueues', async () => {
-    // Simulate the interleaved end state of two changed-hash completes: the D1 row carries hash HA,
-    // but R2's object at the key is the OTHER writer's (its verified hash HB in customMetadata).
+  it('convergeMultipartRow realigns a D1 row (hash, size, mtime) to the object R2 actually holds and re-enqueues', async () => {
+    // Simulate the interleaved end state of two changed-hash completes: the D1 row carries hash HA and
+    // a stale size, but R2's object at the key is the OTHER writer's (native checksum HB, different size).
     const key = 'raw/converge-box/claude/c.bin';
     const HA = 'a'.repeat(64);
-    const HB = 'b'.repeat(64);
+    const otherBytes = new Uint8Array(64).fill(9); // the surviving R2 object's bytes
+    const HB = await sha256Hex(otherBytes);
     await testEnv.DB.prepare("INSERT INTO machines (machine_id, os) VALUES ('converge-box','linux') ON CONFLICT (machine_id) DO NOTHING").run();
     const row = await testEnv.DB.prepare(
       `INSERT INTO files (machine_id, store, relpath, r2_key, size, mtime, content_hash, parse_state)
@@ -342,20 +405,40 @@ describe('multipart review fixes', () => {
     )
       .bind(key, HA)
       .first<{ id: number }>();
-    // R2 holds the OTHER upload's object, identified by customMetadata.sha256 = HB.
-    await testEnv.RAW.put(key, new Uint8Array(16).fill(9), { customMetadata: { sha256: HB, mtime: '2026-07-02T00:00:00Z' } });
+    // R2 holds the OTHER upload's object with a NATIVE checksum (put({sha256})), size 64, mtime differs.
+    await testEnv.RAW.put(key, otherBytes, { sha256: HB, customMetadata: { mtime: '2026-07-02T00:00:00Z' } });
 
     const converged = await convergeMultipartRow(row!.id, key, HA, testEnv);
     expect(converged).toBe(true);
-    const after = await testEnv.DB.prepare('SELECT content_hash, parse_state, mtime FROM files WHERE id = ?1')
+    const after = await testEnv.DB.prepare('SELECT content_hash, parse_state, mtime, size FROM files WHERE id = ?1')
       .bind(row!.id)
-      .first<{ content_hash: string; parse_state: string; mtime: string }>();
+      .first<{ content_hash: string; parse_state: string; mtime: string; size: number }>();
     expect(after!.content_hash).toBe(HB); // row now describes what R2 actually holds
     expect(after!.parse_state).toBe('pending'); // re-enqueued for a reparse
     expect(after!.mtime).toBe('2026-07-02T00:00:00Z');
+    expect(after!.size).toBe(otherBytes.length); // size realigned (chooseCanonical orders by size DESC)
 
     // Positive control: when R2 already matches the row, convergence is a no-op.
     const noop = await convergeMultipartRow(row!.id, key, HB, testEnv);
     expect(noop).toBe(false);
+  });
+
+  it('prune sweeps stale staging objects but never touches canonical raw/ data', async () => {
+    const stagingKey = 'mpu-staging/prune-box/claude/leaked.bin';
+    const canonicalKey = 'raw/prune-box/claude/keep.bin';
+    await testEnv.RAW.put(stagingKey, new Uint8Array(8).fill(1));
+    await testEnv.RAW.put(canonicalKey, new Uint8Array(8).fill(2));
+
+    // Run with "now" 8 days in the future so the just-written staging object counts as stale.
+    await runPrune(testEnv, Date.now() + 8 * 24 * 60 * 60 * 1000);
+    expect(await testEnv.RAW.head(stagingKey)).toBeNull(); // swept
+    expect(await testEnv.RAW.head(canonicalKey)).not.toBeNull(); // raw/ data untouched
+
+    // A fresh staging object survives a present-time prune.
+    const fresh = 'mpu-staging/prune-box/claude/fresh.bin';
+    await testEnv.RAW.put(fresh, new Uint8Array(8).fill(3));
+    await runPrune(testEnv);
+    expect(await testEnv.RAW.head(fresh)).not.toBeNull();
+    await testEnv.RAW.delete(fresh);
   });
 });

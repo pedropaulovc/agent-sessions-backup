@@ -1,6 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { markPendingAndEnqueue } from '../queue';
-import { hex, objectSha256 } from './ops';
+import { objectSha256 } from './ops';
 import { TERMINAL_PARSE_STATES, recordUploadedObject, restampIfStale } from './upload';
 
 // R2 multipart part rules (developers.cloudflare.com/r2/objects/multipart-objects): every part
@@ -10,13 +10,26 @@ import { TERMINAL_PARSE_STATES, recordUploadedObject, restampIfStale } from './u
 // R2's own complete-time check is the backstop.
 export const MIN_PART_SIZE = 5 * 1024 * 1024; // 5 MiB
 export const MAX_PART_NUMBER = 10000;
+// R2's single put() (used for the staging->canonical copy below) caps at 5 GiB
+// (developers.cloudflare.com/r2/platform/limits). A file larger than this can't be finalized onto the
+// canonical key, so we refuse it at create. The realistic corpus max is single-digit GB.
+export const MAX_SINGLE_PUT_BYTES = 5 * 1024 * 1024 * 1024;
 
-/** customMetadata for a multipart object: the source mtime AND the whole-object sha256. R2 records
- * checksums.sha256 only for a single put({sha256}); a multipart object has none, so we persist the
- * hash here for files/check, reindex, and convergence to read back (objectSha256). It is trustworthy
- * because completeMultipart verifies the assembled object against it before the object is kept. */
-function r2Metadata(mtime: string | null, sha256: string): Record<string, string> {
-  return mtime !== null ? { mtime, sha256 } : { sha256 };
+function r2MtimeMetadata(mtime: string | null): Record<string, string> | undefined {
+  return mtime !== null ? { mtime } : undefined;
+}
+
+/**
+ * Multipart uploads assemble onto a STAGING key, never straight onto the canonical raw key, so an
+ * unverified/corrupt assembly can never overwrite the previous good backup. The staging namespace is
+ * a sibling of raw/ (NOT under it) so prefix-scoped reindex — which walks raw/ — never mistakes a
+ * staging object for real data. Path-based (not upload-unique) is safe: a machine's collector runs
+ * are serialized by its overlap lock and the path is machine-scoped, so two completes for the same
+ * key can't race; and even if they did, the canonical put({sha256}) verifies against the declared
+ * hash, so a stale staging object can only cause a retry, never corruption.
+ */
+function stagingKey(machineId: string, store: string, relpath: string): string {
+  return `mpu-staging/${machineId}/${store}/${relpath}`;
 }
 
 /** Parse+validate the whole-object headers (identical contract to the simple PUT): the sha256 the
@@ -61,7 +74,11 @@ export async function createMultipart(
 
   const parsed = parseObjectHeaders(request);
   if ('error' in parsed) return Response.json({ error: parsed.error }, { status: 400 });
-  const { sha256, mtime } = parsed;
+  const { sha256, mtime, size } = parsed;
+  // The staging->canonical finalize is a single put(), capped at 5 GiB. Refuse a larger file up front.
+  if (size > MAX_SINGLE_PUT_BYTES) {
+    return Response.json({ error: 'file_too_large', max_bytes: MAX_SINGLE_PUT_BYTES, got: size }, { status: 400 });
+  }
 
   const key = r2Key(machineId, store, relpath);
   const existing = await env.DB.prepare(
@@ -89,13 +106,14 @@ export async function createMultipart(
     // else: R2 missing/corrupt — fall through to open a fresh multipart so the collector repairs it.
   }
 
+  // Assemble onto the STAGING key (no metadata — staging is throwaway; the canonical put sets it).
   let mpu: R2MultipartUpload;
   try {
-    mpu = await env.RAW.createMultipartUpload(key, { customMetadata: r2Metadata(mtime, sha256) });
+    mpu = await env.RAW.createMultipartUpload(stagingKey(machineId, store, relpath));
   } catch (e) {
     return Response.json({ error: 'create_multipart_failed', detail: String(e) }, { status: 400 });
   }
-  console.log(JSON.stringify({ event: 'access.multipart_create', machine: machineId, key, size: parsed.size }));
+  console.log(JSON.stringify({ event: 'access.multipart_create', machine: machineId, key, size }));
   return Response.json({ status: 'created', upload_id: mpu.uploadId, key, min_part_size: MIN_PART_SIZE }, { status: 201 });
 }
 
@@ -142,7 +160,7 @@ export async function uploadPart(
 
   let uploaded: R2UploadedPart;
   try {
-    uploaded = await env.RAW.resumeMultipartUpload(r2Key(machineId, store, relpath), uploadId).uploadPart(partNumber, body);
+    uploaded = await env.RAW.resumeMultipartUpload(stagingKey(machineId, store, relpath), uploadId).uploadPart(partNumber, body);
   } catch (e) {
     // A bad/expired uploadId or an R2 error — the collector aborts and retries from create.
     return Response.json({ error: 'upload_part_failed', detail: String(e) }, { status: 400 });
@@ -153,10 +171,15 @@ export async function uploadPart(
 /**
  * POST /api/v1/files/{machine}/{store}/{relpath}?uploadId=<id> — finish the multipart upload.
  * Headers carry the whole-object contract (x-content-hash / x-file-mtime / x-file-size); body is
- * {parts:[{part_number, etag}, ...]}. After R2 assembles the object we stream it back through a
- * DigestStream and compare the whole-object sha256 to x-content-hash: on mismatch we delete the
- * object and return 422 (collector retries); on match we upsert files + enqueue the parse via the
- * shared recordUploadedObject, identical to the simple path.
+ * {parts:[{part_number, etag}, ...]}.
+ *
+ * The multipart assembles onto the STAGING key. We then stream-copy staging -> canonical with a single
+ * put({sha256}): R2 verifies the whole-object checksum server-side during the copy (the integrity
+ * gate) AND records a NATIVE checksums.sha256 on the canonical object. A mismatch makes the put throw
+ * ATOMICALLY — the previous canonical object (the prior backup) is left completely intact — and we
+ * return 422 for the collector to retry. Only on a verified copy do we upsert files + enqueue the
+ * parse (shared recordUploadedObject), identical to the simple path. The staging object is always
+ * deleted (success or failure); a crash between complete and delete leaks one, swept by the prune cron.
  */
 export async function completeMultipart(
   request: Request,
@@ -180,55 +203,62 @@ export async function completeMultipart(
   if (parts.length === 0) return Response.json({ error: 'no_parts' }, { status: 400 });
   const r2Parts = parts.map((p) => ({ partNumber: p.part_number, etag: p.etag }));
 
-  const key = r2Key(machineId, store, relpath);
+  const canonicalKey = r2Key(machineId, store, relpath);
+  const stagKey = stagingKey(machineId, store, relpath);
   const existing = await env.DB.prepare('SELECT id FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3')
     .bind(machineId, store, relpath)
     .first<{ id: number }>();
 
-  let completed: R2Object;
   try {
-    completed = await env.RAW.resumeMultipartUpload(key, uploadId).complete(r2Parts);
+    await env.RAW.resumeMultipartUpload(stagKey, uploadId).complete(r2Parts);
   } catch (e) {
-    // Bad etags / part-size rule / unknown-or-expired uploadId / R2 error. The upload is still pending
-    // (or already gone); the collector aborts + retries, and R2 auto-aborts a leftover after 7 days.
+    // Bad etags / part-size rule / unknown-or-expired uploadId / R2 error. Nothing landed on canonical.
+    // The collector aborts + retries; R2 auto-aborts a leftover incomplete upload after 7 days.
     return Response.json({ error: 'complete_failed', detail: String(e) }, { status: 400 });
   }
 
-  // Whole-object verification: stream the assembled object through a DigestStream (never buffers the
-  // whole 100MB+ body) and compare to the declared hash. R2's simple PUT verifies server-side via
-  // {sha256}; multipart has no equivalent, so this is the integrity gate.
-  const obj = await env.RAW.get(key);
-  if (!obj) return Response.json({ error: 'object_missing_after_complete' }, { status: 500 });
-  const digestStream = new crypto.DigestStream('SHA-256');
-  await obj.body.pipeTo(digestStream);
-  const actual = hex(await digestStream.digest);
-  if (actual !== sha256) {
-    // Corrupt/mismatched assembly: delete the object (the multipart is already completed, so there is
-    // nothing left to abort). Collector retries from a fresh create.
-    await env.RAW.delete(key);
-    console.log(JSON.stringify({ event: 'access.multipart_mismatch', machine: machineId, key, expected: sha256, actual }));
-    return Response.json({ error: 'checksum_mismatch', expected: sha256, actual }, { status: 422 });
+  const staged = await env.RAW.get(stagKey);
+  if (!staged) return Response.json({ error: 'staging_missing_after_complete' }, { status: 500 });
+
+  // Verify-and-finalize in one pass: put({sha256}) verifies the whole object server-side while copying
+  // staging -> canonical, and gives canonical a native checksum. On mismatch R2 throws WITHOUT touching
+  // the existing canonical object (verified empirically — see the preservation test).
+  let putOk = false;
+  let putError: unknown;
+  try {
+    await env.RAW.put(canonicalKey, staged.body, { sha256, customMetadata: r2MtimeMetadata(mtime) });
+    putOk = true;
+  } catch (e) {
+    putError = e;
+  }
+  await env.RAW.delete(stagKey).catch(() => {}); // staging is throwaway either way
+  if (!putOk) {
+    console.log(JSON.stringify({ event: 'access.multipart_mismatch', machine: machineId, key: canonicalKey, expected: sha256, error: String(putError) }));
+    return Response.json({ error: 'checksum_mismatch', expected: sha256, detail: String(putError) }, { status: 422 });
   }
 
   return recordUploadedObject(env, {
     machineId,
     store,
     relpath,
-    r2Key: key,
-    size: completed.size,
+    r2Key: canonicalKey,
+    size: staged.size,
     mtime,
     sha256,
     existed: existing != null,
+    // Canonical is now a single verified put with a native checksum, exactly like the simple path — but
+    // we have no ArrayBuffer body to re-PUT, so converge on OBSERVED R2 state (see convergeMultipartRow).
     convergeBody: null,
-    // No body to re-PUT — converge D1 onto whatever object survived in R2 (see convergeMultipartRow).
     convergeObservedR2: true,
   });
 }
 
 /**
  * DELETE /api/v1/files/{machine}/{store}/{relpath}?uploadId=<id> — abort a multipart upload.
- * Idempotent: an unknown/already-gone uploadId still returns 200 so the collector's retry/give-up
- * path never has to special-case a missing upload. R2 also auto-aborts anything left after 7 days.
+ * Aborts the staging multipart AND deletes any staging object a prior complete may have left (both
+ * best-effort). Idempotent: an unknown/already-gone uploadId still returns 200 so the collector's
+ * retry/give-up path never has to special-case a missing upload. R2 also auto-aborts an incomplete
+ * upload after 7 days, and the prune cron sweeps a leaked staging object.
  */
 export async function abortMultipart(
   env: Env,
@@ -242,12 +272,15 @@ export async function abortMultipart(
   if (!ownsPath(identity, machineId)) return Response.json({ error: 'machine_mismatch' }, { status: 403 });
 
   const uploadId = params.get('uploadId')!;
+  const stagKey = stagingKey(machineId, store, relpath);
+  let aborted = true;
   try {
-    await env.RAW.resumeMultipartUpload(r2Key(machineId, store, relpath), uploadId).abort();
+    await env.RAW.resumeMultipartUpload(stagKey, uploadId).abort();
   } catch (e) {
-    // Already completed/aborted/expired at R2 — treat as success (nothing left to abort).
+    // Already completed/aborted/expired at R2 — nothing left to abort.
+    aborted = false;
     console.log(JSON.stringify({ event: 'access.multipart_abort_warn', machine: machineId, upload_id: uploadId, error: String(e) }));
-    return Response.json({ status: 'gone' });
   }
-  return Response.json({ status: 'aborted' });
+  await env.RAW.delete(stagKey).catch(() => {}); // drop a staging object a completed-but-uncopied upload left
+  return Response.json({ status: aborted ? 'aborted' : 'gone' });
 }

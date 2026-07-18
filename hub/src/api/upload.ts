@@ -269,11 +269,13 @@ export async function convergeMultipartRow(fileId: number, r2Key: string, sha256
   // No object (a concurrent delete) or R2 already matches our row: nothing to realign.
   if (!r2Hash || r2Hash === sha256) return false;
   // R2 holds a different upload's object. Point the row at what R2 actually holds and reparse it.
+  // Realign size too (from head.size): chooseCanonical orders duplicates by `size DESC`, so a stale
+  // size from the losing upload would corrupt canonical selection and leave metadata for the wrong object.
   const mtime = head!.customMetadata?.mtime ?? null;
   const updated = await env.DB.prepare(
-    "UPDATE files SET content_hash = ?2, mtime = ?3, parse_state = 'pending', parse_error = NULL WHERE id = ?1 AND content_hash = ?4 RETURNING id",
+    "UPDATE files SET content_hash = ?2, mtime = ?3, size = ?4, parse_state = 'pending', parse_error = NULL WHERE id = ?1 AND content_hash = ?5 RETURNING id",
   )
-    .bind(fileId, r2Hash, mtime, sha256)
+    .bind(fileId, r2Hash, mtime, head!.size, sha256)
     .first<{ id: number }>();
   if (!updated) return false; // lost the row to the other writer in the meantime
   await env.PARSE_QUEUE.send({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: r2Hash });
@@ -381,9 +383,9 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
     const heads = await Promise.all(
       [...have.values()].map(async (r): Promise<[number, boolean]> => {
         const obj = await env.RAW.head(r.r2_key);
-        // objectSha256 falls back to customMetadata.sha256 for multipart-written objects, which have
-        // no native checksums.sha256 — without it, every completed-multipart file would report
-        // 'missing' here forever and the collector would re-upload it on every backfill/resync.
+        // objectSha256 reads R2's native checksum, present on every canonical object (simple PUT and
+        // the multipart staging->canonical copy both use put({sha256})) — a real verification of the
+        // stored bytes. A missing object, a legacy no-checksum object, or a mismatch all report missing.
         return [r.id, objectSha256(obj) === r.content_hash];
       }),
     );

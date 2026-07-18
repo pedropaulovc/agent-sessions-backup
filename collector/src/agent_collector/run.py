@@ -39,6 +39,11 @@ MULTIPART_MAX_ATTEMPTS = 3
 # refuse up front rather than upload thousands of parts only to fail on part 10001.
 MULTIPART_MAX_PARTS = 10000
 
+# The hub finalizes a multipart upload with a single R2 put (staging -> canonical), capped at 5 GiB
+# (developers.cloudflare.com/r2/platform/limits). A larger file can't be finalized, so refuse it up
+# front rather than upload gigabytes only for complete to fail. The realistic corpus max is a few GB.
+MULTIPART_MAX_FILE_BYTES = 5 * 1024 * 1024 * 1024
+
 
 def _effective_part_size(size: int, configured: int, ceiling: int) -> tuple[int | None, str | None]:
     """(part_size, None) or (None, refusal_reason). Grows the part size just enough to keep the part
@@ -324,6 +329,9 @@ def _upload_multipart(cfg, transport: Transport, item: ScanItem, sha: str) -> tu
     opened an upload but didn't complete is aborted before retrying (and on final give-up) so no
     dangling multipart is left. Returns (MULTIPART_*, detail)."""
     base_url = file_url(cfg.hub_url, cfg.machine_id, item.store, item.relpath)
+    if item.size > MULTIPART_MAX_FILE_BYTES:
+        return MULTIPART_FAILED, (f"file of {item.size} bytes exceeds the {MULTIPART_MAX_FILE_BYTES}-byte "
+                                  "R2 single-put finalize limit; not uploaded")
     part_size, refusal = _effective_part_size(
         item.size, cfg.multipart_part_size_bytes, cfg.multipart_threshold_bytes)
     if part_size is None:

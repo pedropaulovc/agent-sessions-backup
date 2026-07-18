@@ -150,9 +150,9 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
         store,
         relpath,
         det: detect(store, relpath, machineId),
-        // Multipart-written objects carry NO checksums.sha256 (R2 only records it for a single
-        // put({sha256})); the completed-multipart path stashes the verified hash in customMetadata
-        // instead. Prefer the native checksum, fall back to that metadata, then 'unknown'.
+        // Every canonical object is written by a single put({sha256}) (simple PUT, or the multipart
+        // staging->canonical copy), so R2 carries a native checksum; 'unknown' only for a legacy
+        // pre-{sha256} object.
         contentHash: objectSha256(obj) ?? 'unknown',
         mtime: obj.customMetadata?.mtime ?? null,
         size: obj.size,
@@ -274,15 +274,12 @@ export function hex(buf: ArrayBuffer): string {
 }
 
 /**
- * The sha256 (hex) an R2 object hashes to, or undefined if unknowable. A single put({sha256}) makes
- * R2 record it natively as checksums.sha256; a multipart-completed object has NO native checksum, so
- * the complete path stashes the DigestStream-verified hash in customMetadata.sha256. Prefer the
- * native checksum, fall back to that metadata. The metadata is trustworthy because a surviving
- * completed-multipart object had its whole-object hash verified against it (mismatch → deleted)
- * before it became visible — see completeMultipart.
+ * The sha256 (hex) an R2 canonical object hashes to, or undefined if it has no native checksum. EVERY
+ * object under raw/ is written by a single put({sha256}) — the simple PUT directly, the multipart path
+ * via its verified staging->canonical copy — so R2 records checksums.sha256 natively and this is a real
+ * verification of the stored bytes (not a trusted metadata string). A legacy object written before the
+ * PUT path set {sha256} simply returns undefined, which the callers treat as "can't verify → missing".
  */
 export function objectSha256(obj: R2Object | null | undefined): string | undefined {
-  if (!obj) return undefined;
-  if (obj.checksums?.sha256) return hex(obj.checksums.sha256);
-  return obj.customMetadata?.sha256?.toLowerCase();
+  return obj?.checksums?.sha256 ? hex(obj.checksums.sha256) : undefined;
 }
