@@ -316,3 +316,161 @@ export function encodeTraceRequest(json: Json): Uint8Array {
   for (const rs of (json.resourceSpans as Json[]) ?? []) pushMessageField(out, 1, encodeResourceSpans(rs));
   return Uint8Array.from(out);
 }
+
+// ---------------------------------------------------------------------------
+// Size-bounded chunking.
+//
+// Azure Monitor's Logs Ingestion API caps a single POST at ~1 MB uncompressed;
+// an oversized OTLP batch gets HTTP 413. Because Cloudflare Workers observability
+// head-of-line retries a failed export batch forever, ONE 413 wedges the entire
+// pipeline (this happened during the 6 GB backfill's access-log burst). So the
+// gateway splits a batch into chunks whose protobuf stays under the cap and posts
+// them one at a time. These encoders return that list of ready-to-POST chunks,
+// each a valid `ExportLogsServiceRequest` / `ExportTraceServiceRequest`.
+//
+// Splitting is at record granularity (logRecords / spans), re-emitting the
+// enclosing resource + scope framing per chunk. `dropped` counts records that
+// couldn't be made to fit even alone (the degenerate case); logs truncate their
+// body string first, spans are dropped — either way one poison record can never
+// permanently wedge a chunk.
+
+const RECORD_FIELD = 2; // ScopeLogs.log_records / ScopeSpans.spans
+
+function varintSize(value: number): number {
+  let v = value >>> 0;
+  let size = 1;
+  while (v > 0x7f) {
+    size++;
+    v >>>= 7;
+  }
+  return size;
+}
+
+// Bytes a record adds to its scope container: tag (1 byte for field 2) + length
+// varint + the record's own bytes.
+function recordFieldSize(contentLength: number): number {
+  return 1 + varintSize(contentLength) + contentLength;
+}
+
+// Builds one request (single ResourceX → single ScopeX → the given records),
+// wire-identical to encodeResourceLogs/encodeScopeLogs (field numbers 1/2/3).
+function buildRequest(
+  encRes: number[] | null,
+  encScope: number[] | null,
+  resSchemaUrl: string | null,
+  scopeSchemaUrl: string | null,
+  records: number[][],
+): Uint8Array {
+  const scope: number[] = [];
+  if (encScope) pushMessageField(scope, 1, encScope);
+  for (const r of records) pushMessageField(scope, RECORD_FIELD, r);
+  if (scopeSchemaUrl) pushStringField(scope, 3, scopeSchemaUrl);
+
+  const resource: number[] = [];
+  if (encRes) pushMessageField(resource, 1, encRes);
+  pushMessageField(resource, 2, scope);
+  if (resSchemaUrl) pushStringField(resource, 3, resSchemaUrl);
+
+  const req: number[] = [];
+  pushMessageField(req, 1, resource);
+  return Uint8Array.from(req);
+}
+
+interface SignalSpec {
+  scopeKey: string; // 'scopeLogs' | 'scopeSpans'
+  recordKey: string; // 'logRecords' | 'spans'
+  encodeRecord: (r: Json) => number[];
+  // Shrink an over-cap record to fit `budget` protobuf bytes, or return null to drop it.
+  degrade: (r: Json, budget: number) => Json | null;
+}
+
+export interface ChunkResult {
+  chunks: Uint8Array[];
+  dropped: number;
+}
+
+function chunkSignal(resourceItems: Json[], spec: SignalSpec, maxBytes: number): ChunkResult {
+  const chunks: Uint8Array[] = [];
+  let dropped = 0;
+
+  for (const ri of resourceItems ?? []) {
+    const encRes = ri.resource ? encodeResource(ri.resource as Json) : null;
+    const resSchema = ri.schemaUrl ? String(ri.schemaUrl) : null;
+
+    for (const sc of (ri[spec.scopeKey] as Json[]) ?? []) {
+      const encScope = sc.scope ? encodeScope(sc.scope as Json) : null;
+      const scopeSchema = sc.schemaUrl ? String(sc.schemaUrl) : null;
+      // Framing cost of an empty chunk for this resource+scope. The outer length
+      // prefixes grow a few bytes as records are added; maxBytes sits ~100 KB
+      // below Azure's ~1 MB ceiling, which absorbs that slack.
+      const base = buildRequest(encRes, encScope, resSchema, scopeSchema, []).length;
+
+      let recs: number[][] = [];
+      let size = base;
+      const flush = () => {
+        if (recs.length === 0) return;
+        chunks.push(buildRequest(encRes, encScope, resSchema, scopeSchema, recs));
+        recs = [];
+        size = base;
+      };
+
+      for (const rec of (sc[spec.recordKey] as Json[]) ?? []) {
+        let enc = spec.encodeRecord(rec);
+        let field = recordFieldSize(enc.length);
+        if (base + field > maxBytes) {
+          // Degenerate: this record can't fit even in a chunk of its own.
+          const degraded = spec.degrade(rec, maxBytes - base - 64);
+          if (degraded) {
+            enc = spec.encodeRecord(degraded);
+            field = recordFieldSize(enc.length);
+          }
+          if (!degraded || base + field > maxBytes) {
+            dropped++;
+            continue;
+          }
+        }
+        if (recs.length > 0 && size + field > maxBytes) flush();
+        recs.push(enc);
+        size += field;
+      }
+      flush();
+    }
+  }
+
+  return { chunks, dropped };
+}
+
+// Logs: truncate the body string (the usual giant field) so the record fits.
+function degradeLogRecord(lr: Json, budget: number): Json | null {
+  const body = lr.body as Json | undefined;
+  if (!body || typeof body !== "object" || body.stringValue === undefined) return null;
+  const marker = "…[gateway-truncated]";
+  const original = String(body.stringValue);
+  const keep = Math.max(0, budget - marker.length - 256); // leave room for other fields
+  return {
+    ...lr,
+    body: { stringValue: original.slice(0, keep) + marker },
+    attributes: [
+      ...((lr.attributes as Json[]) ?? []),
+      { key: "gateway.truncated", value: { boolValue: true } },
+    ],
+  };
+}
+
+export function encodeLogsChunks(json: Json, maxBytes: number): ChunkResult {
+  return chunkSignal(
+    (json.resourceLogs as Json[]) ?? [],
+    { scopeKey: "scopeLogs", recordKey: "logRecords", encodeRecord: encodeLogRecord, degrade: degradeLogRecord },
+    maxBytes,
+  );
+}
+
+export function encodeTraceChunks(json: Json, maxBytes: number): ChunkResult {
+  // A single span rarely approaches the cap and has no one dominant string to
+  // truncate, so an unfittable span is dropped (with a self-log upstream).
+  return chunkSignal(
+    (json.resourceSpans as Json[]) ?? [],
+    { scopeKey: "scopeSpans", recordKey: "spans", encodeRecord: encodeSpan, degrade: () => null },
+    maxBytes,
+  );
+}

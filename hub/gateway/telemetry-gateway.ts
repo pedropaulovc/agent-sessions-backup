@@ -17,7 +17,7 @@
 // limits/, "Environment variables"), which does fit. See infra/cf/telemetry.md.
 
 import { signAssertion } from "./oidc-sign";
-import { encodeLogsRequest, encodeTraceRequest } from "./otlp-protobuf";
+import { encodeLogsChunks, encodeTraceChunks, type ChunkResult } from "./otlp-protobuf";
 
 interface Env {
   TENANT_ID: string;
@@ -93,15 +93,31 @@ export async function getEntraToken(env: Env): Promise<string> {
 
 // Cloudflare's Workers-observability OTLP exporter ships OTLP/HTTP JSON. Azure
 // Monitor's managed OTLP/DCR ingestion endpoints only accept protobuf (JSON →
-// HTTP 415), so we transcode per signal before forwarding. `encode` maps the
-// parsed OTLP JSON to protobuf wire bytes.
-type OtlpEncoder = (json: Record<string, unknown>) => Uint8Array;
+// HTTP 415), so we transcode per signal before forwarding. `chunk` maps the
+// parsed OTLP JSON to a list of protobuf wire chunks, each under the DCR cap.
+type OtlpChunker = (json: Record<string, unknown>, maxBytes: number) => ChunkResult;
+
+// Azure Monitor's Logs Ingestion API caps a single POST at ~1 MB uncompressed —
+// an oversized batch gets 413, and Cloudflare head-of-line retries the same batch
+// forever, so a single 413 wedges the whole export (observed during the 6 GB
+// backfill's access-log burst). We split each batch into chunks below this cap;
+// 900 KB leaves comfortable margin under the ~1 MB ceiling.
+const MAX_DCR_BYTES = 900_000;
+
+// This worker has no observability.logs/traces destinations of its own (see
+// hub/wrangler.telemetry-gateway.jsonc) and must not — it IS the /v1/{logs,traces}
+// sink, so exporting its own logs back to itself would be a recursion loop. These
+// console lines are visible via `wrangler tail`/the dashboard only; they never
+// reach Azure/OTelLogs (see infra/azure/alerts/collector-errors.kql's header).
+function logGatewayEvent(fields: Record<string, unknown>): void {
+  console.log(JSON.stringify({ event: "collector.event", level: "error", ...fields }));
+}
 
 async function forwardOtlp(
   request: Request,
   env: Env,
   endpoint: string,
-  encode: OtlpEncoder,
+  chunk: OtlpChunker,
 ): Promise<Response> {
   // The Cloudflare Workers OTLP exporter authenticates to us with a shared bearer
   // (set on the observability destination). Reject anything else, but answer 200 so
@@ -133,50 +149,57 @@ async function forwardOtlp(
     return new Response("OK", { status: 200 });
   }
 
-  const payload = encode(JSON.parse(jsonText) as Record<string, unknown>);
-  if (payload.byteLength === 0) {
-    return new Response("OK", { status: 200 });
+  const { chunks, dropped } = chunk(JSON.parse(jsonText) as Record<string, unknown>, MAX_DCR_BYTES);
+  if (dropped > 0) {
+    logGatewayEvent({ tag: "gateway-record-dropped", endpoint, dropped });
+  }
+  if (chunks.length === 0) {
+    // Valid but empty batch — nothing to forward.
+    return new Response(null, { status: 204 });
   }
 
-  const token = await getEntraToken(env);
-
-  const upstream = await fetch(endpoint, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-protobuf",
-      Authorization: `Bearer ${token}`,
-    },
-    body: payload,
-  });
-
-  const upstreamBody = await upstream.text();
-  if (!upstream.ok) {
-    // This worker has no observability.logs/traces destinations of its own
-    // (see hub/wrangler.telemetry-gateway.jsonc) and must not — it IS the
-    // /v1/{logs,traces} sink, so exporting its own logs back to itself would
-    // be a recursion loop. This line is visible via `wrangler tail`/the
-    // Cloudflare dashboard only; it never reaches Azure/OTelLogs, so
-    // infra/azure/alerts/collector-errors.kql cannot see it (see that file's
-    // header for how gateway-side failures are actually detected).
-    console.log(JSON.stringify({
-      event: "collector.event",
-      level: "error",
-      tag: "gateway-upstream-error",
-      endpoint,
-      status: upstream.status,
-      body: upstreamBody.slice(0, 500),
-    }));
+  // We ALWAYS return success to Cloudflare once we've started dispatching, even if
+  // individual chunk POSTs fail. CF head-of-line retries a failed batch forever, so
+  // propagating a 413/5xx would re-wedge the entire pipeline; a rare dropped chunk
+  // (logged for `wrangler tail`) beats a stalled export. Same philosophy as the
+  // auth-mismatch 200 above.
+  let token: string;
+  try {
+    token = await getEntraToken(env);
+  } catch (e) {
+    logGatewayEvent({ tag: "gateway-token-error", endpoint, error: String(e) });
+    return new Response(null, { status: 204 });
   }
 
-  // fetch/Response forbids a non-null body on 204/205/304 responses — even an
-  // empty string throws. Azure's DCR ingestion endpoint can return a bodyless
-  // 204 on success, which would otherwise turn into an unhandled Worker
-  // exception here.
-  const NULL_BODY_STATUSES = new Set([204, 205, 304]);
-  return new Response(NULL_BODY_STATUSES.has(upstream.status) ? null : upstreamBody, {
-    status: upstream.status,
-    headers: { "Content-Type": "application/json" },
-  });
+  for (let i = 0; i < chunks.length; i++) {
+    try {
+      const upstream = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/x-protobuf", Authorization: `Bearer ${token}` },
+        body: chunks[i],
+      });
+      if (!upstream.ok) {
+        const body = await upstream.text();
+        logGatewayEvent({
+          tag: "gateway-upstream-error",
+          endpoint,
+          status: upstream.status,
+          chunk: `${i + 1}/${chunks.length}`,
+          bytes: chunks[i]!.byteLength,
+          body: body.slice(0, 500),
+        });
+      }
+    } catch (e) {
+      logGatewayEvent({
+        tag: "gateway-upstream-exception",
+        endpoint,
+        chunk: `${i + 1}/${chunks.length}`,
+        error: String(e),
+      });
+    }
+  }
+
+  return new Response(null, { status: 204 });
 }
 
 export default {
@@ -189,8 +212,8 @@ export default {
     // Workers observability emits only logs + traces (no metrics), so only those
     // two routes are wired.
     if (request.method === "POST") {
-      if (path === "/v1/traces") return forwardOtlp(request, env, env.OTLP_TRACES_ENDPOINT, encodeTraceRequest);
-      if (path === "/v1/logs") return forwardOtlp(request, env, env.OTLP_LOGS_ENDPOINT, encodeLogsRequest);
+      if (path === "/v1/traces") return forwardOtlp(request, env, env.OTLP_TRACES_ENDPOINT, encodeTraceChunks);
+      if (path === "/v1/logs") return forwardOtlp(request, env, env.OTLP_LOGS_ENDPOINT, encodeLogsChunks);
     }
 
     return new Response("OK", { status: 200 });
