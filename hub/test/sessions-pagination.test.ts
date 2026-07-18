@@ -32,20 +32,27 @@ async function putFile(machine: string, store: string, relpath: string, content:
 }
 
 async function drainQueue(): Promise<void> {
-  const pending = await testEnv.DB.prepare("SELECT id, r2_key FROM files WHERE parse_state = 'pending'").all<{
-    id: number;
-    r2_key: string;
-  }>();
-  const messages = pending.results.map((r) => ({
-    id: String(r.id),
-    timestamp: new Date(),
-    attempts: 1,
-    body: { file_id: r.id, r2_key: r.r2_key, reason: 'upload' as const },
-    ack() {},
-    retry() {},
-  }));
-  if (messages.length === 0) return;
-  await worker.queue({ queue: 'parse', messages, ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>, testEnv);
+  // consumeParseBatch DEFERS (re-enqueues) an export whose per-invocation budget reservation would overflow
+  // once earlier messages in the same batch have already spent budget — so a batch that mixes normal files
+  // with an export leaves the export 'pending' for a later invocation. Prod redelivers those; mirror it by
+  // re-delivering pending files until none remain (each invocation runs at least its first message, so an
+  // export eventually leads a batch and runs; the cap is a safety net).
+  for (let i = 0; i < 50; i++) {
+    const pending = await testEnv.DB.prepare("SELECT id, r2_key FROM files WHERE parse_state = 'pending'").all<{
+      id: number;
+      r2_key: string;
+    }>();
+    if (pending.results.length === 0) return;
+    const messages = pending.results.map((r) => ({
+      id: String(r.id),
+      timestamp: new Date(),
+      attempts: 1,
+      body: { file_id: r.id, r2_key: r.r2_key, reason: 'upload' as const },
+      ack() {},
+      retry() {},
+    }));
+    await worker.queue({ queue: 'parse', messages, ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>, testEnv);
+  }
 }
 
 function get(qs: string): Promise<Response> {
