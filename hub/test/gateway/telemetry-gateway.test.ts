@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import gateway from '../../gateway/telemetry-gateway';
+import gateway, { resetTokenCache } from '../../gateway/telemetry-gateway';
 
 // Unit tests for the gateway's own request handling (bearer check, transcode,
 // forward). The outbound `fetch` (both the Entra token exchange and the DCR
@@ -36,6 +36,9 @@ describe('telemetry-gateway fetch handler', () => {
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
+    // The Entra token is cached at module scope; clear it so each test exercises the
+    // token path from scratch (the token-failure test depends on no cached token).
+    resetTokenCache();
     fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
   });
@@ -66,7 +69,7 @@ describe('telemetry-gateway fetch handler', () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it('transcodes a valid-bearer OTLP JSON payload to protobuf and forwards with an Entra bearer', async () => {
+  it('transcodes a valid-bearer OTLP JSON payload to protobuf and forwards with an Entra bearer (204 to CF regardless of upstream status)', async () => {
     const pem = await pemFromGeneratedKeyPair();
     const env = makeEnv(pem);
 
@@ -113,7 +116,10 @@ describe('telemetry-gateway fetch handler', () => {
     });
 
     const res = await gateway.fetch(req, env as never, ctx);
-    expect(res.status).toBe(202);
+    // The gateway now returns 204 to Cloudflare once chunks are dispatched — never
+    // propagating the upstream status — so a DCR failure can't head-of-line-wedge
+    // CF's retry queue. The upstream here (202) still gets exactly one forward.
+    expect(res.status).toBe(204);
     expect(fetchMock).toHaveBeenCalledTimes(2); // token exchange + upstream forward
   });
 
@@ -162,5 +168,198 @@ describe('telemetry-gateway fetch handler', () => {
     const res = await gateway.fetch(req, env as never, ctx);
     expect(res.status).toBe(200);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('splits an oversized batch into multiple DCR POSTs and returns 204', async () => {
+    const pem = await pemFromGeneratedKeyPair();
+    const env = makeEnv(pem);
+
+    let upstreamPosts = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('login.microsoftonline.com')) {
+        return new Response(JSON.stringify({ access_token: 'fake-entra-token', expires_in: 3600 }), { status: 200 });
+      }
+      upstreamPosts++;
+      expect((init?.body as Uint8Array).byteLength).toBeLessThanOrEqual(1_000_000); // under Azure's cap
+      return new Response(null, { status: 204 });
+    });
+
+    // 6 × ~300 KB log records ≈ 1.8 MB > the 900 KB chunk cap.
+    const bigBody = `{"event":"http.access","blob":"${'a'.repeat(300_000)}"}`;
+    const otlpJson = {
+      resourceLogs: [
+        {
+          resource: { attributes: [{ key: 'service.name', value: { stringValue: 'sessions-hub' } }] },
+          scopeLogs: [
+            {
+              logRecords: Array.from({ length: 6 }, (_, i) => ({
+                timeUnixNano: String(1782964800000000000n + BigInt(i)),
+                body: { stringValue: bigBody },
+              })),
+            },
+          ],
+        },
+      ],
+    };
+
+    const req = new Request('https://gateway.example/v1/logs', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.INGEST_BEARER}` },
+      body: JSON.stringify(otlpJson),
+    });
+
+    const res = await gateway.fetch(req, env as never, ctx);
+    expect(res.status).toBe(204);
+    expect(upstreamPosts).toBeGreaterThan(1); // batch was split
+  });
+
+  it('returns 204 to Cloudflare even when the DCR rejects a chunk with 413 — poison drop (never head-of-line-wedge)', async () => {
+    const pem = await pemFromGeneratedKeyPair();
+    const env = makeEnv(pem);
+
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('login.microsoftonline.com')) {
+        return new Response(JSON.stringify({ access_token: 'fake-entra-token', expires_in: 3600 }), { status: 200 });
+      }
+      // Simulate today's outage: the DCR rejects the payload as too large.
+      return new Response('payload too large', { status: 413 });
+    });
+
+    const req = new Request('https://gateway.example/v1/logs', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.INGEST_BEARER}` },
+      body: JSON.stringify({
+        resourceLogs: [{ scopeLogs: [{ logRecords: [{ body: { stringValue: '{"event":"x"}' } }] }] }],
+      }),
+    });
+
+    const res = await gateway.fetch(req, env as never, ctx);
+    // A 413 is poison — no retry can ever land it — so we drop the chunk and still
+    // ack, letting CF advance its queue instead of retrying the 413 forever.
+    expect(res.status).toBe(204);
+  });
+
+  it('returns 503 and dispatches NOTHING when the Entra token exchange fails (transient, keep retryable)', async () => {
+    const pem = await pemFromGeneratedKeyPair();
+    const env = makeEnv(pem);
+
+    let dcrPosts = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('login.microsoftonline.com')) {
+        // Azure AD momentarily unavailable — no access_token in the body.
+        return new Response(JSON.stringify({ error: 'temporarily_unavailable', error_description: 'try later' }), {
+          status: 503,
+        });
+      }
+      dcrPosts++;
+      return new Response(null, { status: 204 });
+    });
+
+    const req = new Request('https://gateway.example/v1/logs', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.INGEST_BEARER}` },
+      body: JSON.stringify({
+        resourceLogs: [{ scopeLogs: [{ logRecords: [{ body: { stringValue: '{"event":"x"}' } }] }] }],
+      }),
+    });
+
+    const res = await gateway.fetch(req, env as never, ctx);
+    // The batch is valid — only the token minting failed — so CF should retry it.
+    expect(res.status).toBe(503);
+    expect(dcrPosts).toBe(0); // nothing forwarded without a token
+  });
+
+  it('posts every chunk but returns 503 when one chunk hits a transient 429 (redeliver the batch)', async () => {
+    const pem = await pemFromGeneratedKeyPair();
+    const env = makeEnv(pem);
+
+    let dcrPosts = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('login.microsoftonline.com')) {
+        return new Response(JSON.stringify({ access_token: 'fake-entra-token', expires_in: 3600 }), { status: 200 });
+      }
+      dcrPosts++;
+      // First chunk gets throttled (transient); the rest succeed.
+      return dcrPosts === 1
+        ? new Response('slow down', { status: 429 })
+        : new Response(null, { status: 204 });
+    });
+
+    // 6 × ~300 KB records → splits into multiple chunks so we can prove the loop keeps
+    // going past the throttled first chunk.
+    const bigBody = `{"event":"http.access","blob":"${'a'.repeat(300_000)}"}`;
+    const otlpJson = {
+      resourceLogs: [
+        {
+          resource: { attributes: [{ key: 'service.name', value: { stringValue: 'sessions-hub' } }] },
+          scopeLogs: [
+            {
+              logRecords: Array.from({ length: 6 }, (_, i) => ({
+                timeUnixNano: String(1782964800000000000n + BigInt(i)),
+                body: { stringValue: bigBody },
+              })),
+            },
+          ],
+        },
+      ],
+    };
+
+    const req = new Request('https://gateway.example/v1/logs', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.INGEST_BEARER}` },
+      body: JSON.stringify(otlpJson),
+    });
+
+    const res = await gateway.fetch(req, env as never, ctx);
+    // Transient → CF must redeliver the whole batch (duplicates-over-loss).
+    expect(res.status).toBe(503);
+    expect(dcrPosts).toBeGreaterThan(1); // did NOT bail after the 429 — posted the rest
+  });
+
+  it('treats a chunk 408 (request timeout) as transient → posts the rest and returns 503', async () => {
+    const pem = await pemFromGeneratedKeyPair();
+    const env = makeEnv(pem);
+
+    let dcrPosts = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('login.microsoftonline.com')) {
+        return new Response(JSON.stringify({ access_token: 'fake-entra-token', expires_in: 3600 }), { status: 200 });
+      }
+      dcrPosts++;
+      // A timeout says nothing about payload validity — must stay retryable.
+      return dcrPosts === 1 ? new Response('timeout', { status: 408 }) : new Response(null, { status: 204 });
+    });
+
+    const bigBody = `{"event":"http.access","blob":"${'a'.repeat(300_000)}"}`;
+    const otlpJson = {
+      resourceLogs: [
+        {
+          resource: { attributes: [{ key: 'service.name', value: { stringValue: 'sessions-hub' } }] },
+          scopeLogs: [
+            {
+              logRecords: Array.from({ length: 6 }, (_, i) => ({
+                timeUnixNano: String(1782964800000000000n + BigInt(i)),
+                body: { stringValue: bigBody },
+              })),
+            },
+          ],
+        },
+      ],
+    };
+
+    const req = new Request('https://gateway.example/v1/logs', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.INGEST_BEARER}` },
+      body: JSON.stringify(otlpJson),
+    });
+
+    const res = await gateway.fetch(req, env as never, ctx);
+    expect(res.status).toBe(503);
+    expect(dcrPosts).toBeGreaterThan(1); // did NOT bail after the 408
   });
 });
