@@ -238,9 +238,22 @@ export async function recordUploadedObject(
     // dropped, the sessions are visibly stuck 'parsing' — alertable — instead of silently stale).
     await flipOwnedSessionsToParsing(row!.id, null, sha256, env);
   }
-  await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
-
-  if (opts.convergeObservedR2) await convergeMultipartRow(row!.id, r2Key, sha256, env);
+  // Enqueue the parse — but for the multipart path, converge FIRST so we never send a message that
+  // describes bytes R2 no longer holds. Two racing completes for one path can leave this row's upsert
+  // winning D1 while R2 ends up holding the OTHER upload's object; convergeMultipartRow detects that,
+  // realigns the row to the surviving object, and enqueues a parse for ITS hash. Sending our own
+  // sha256 message FIRST (the old order) could let the consumer parse the other object's bytes under
+  // our hash before convergence repaired the row — or forever, if convergence threw mid-way. So:
+  //   - convergence realigned + enqueued -> DON'T also send the stale-sha message (exactly one msg);
+  //   - convergence made no change (no race / R2 already matches) -> send our hash as usual;
+  //   - convergence threw -> nothing sent at all; the queue retry / next complete repairs it (that's
+  //     the point of ordering converge ahead of the send).
+  // The simple path has no observed-R2 convergence (convergeR2WithRow above only restores bytes, never
+  // changes the row hash), so realigned is always false there and it enqueues our hash.
+  const realigned = opts.convergeObservedR2 === true && (await convergeMultipartRow(row!.id, r2Key, sha256, env));
+  if (!realigned) {
+    await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
+  }
 
   console.log(
     JSON.stringify({ event: 'access.upload', machine: machineId, key: r2Key, bytes: size, status: existed ? 'updated' : 'created' }),
@@ -255,11 +268,15 @@ export async function recordUploadedObject(
  * the same key each write their object then upsert their row; the R2-last-writer and D1-last-writer
  * can differ, leaving files.content_hash describing bytes R2 no longer holds. After our own upsert we
  * HEAD the key: if it still carries THIS complete's hash (we are the current D1 owner) but R2 holds a
- * DIFFERENT object (identified by its verified customMetadata.sha256), realign the row to the R2 hash
- * and re-enqueue a parse for it. Guarded on our own hash so the OTHER writer — which runs this same
- * check — owns convergence once its upsert wins the row; the consumer's content_hash guard makes the
- * (possibly duplicate) re-enqueue idempotent. Exported for tests, which drive the interleaved end
+ * DIFFERENT object (identified by its native checksums.sha256), realign the row to the R2 hash and
+ * enqueue a parse for it. Guarded on our own hash so the OTHER writer — which runs this same check —
+ * owns convergence once its upsert wins the row. Exported for tests, which drive the interleaved end
  * state directly (row hash == ours, R2 object == the other writer's) the same way convergeR2WithRow does.
+ *
+ * Returns true when it realigned the row (and enqueued a parse for the observed R2 hash), false when
+ * there was nothing to realign. recordUploadedObject runs this BEFORE its own parse-queue send and,
+ * on a true return, SKIPS that send — so a realigned row is parsed under the R2 hash exactly once and
+ * the stale-sha message is never emitted at all (not merely rejected later by the consumer guard).
  */
 export async function convergeMultipartRow(fileId: number, r2Key: string, sha256: string, env: Env): Promise<boolean> {
   const row = await env.DB.prepare('SELECT content_hash FROM files WHERE id = ?1').bind(fileId).first<{ content_hash: string }>();

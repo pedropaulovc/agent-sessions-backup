@@ -1,7 +1,7 @@
 import { env, SELF } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import worker from '../src/index';
-import { convergeMultipartRow } from '../src/api/upload';
+import { convergeMultipartRow, recordUploadedObject } from '../src/api/upload';
 import { runPrune } from '../src/cron/prune';
 import { ccAssistantLine, ccUserLine } from './fixtures';
 
@@ -482,6 +482,92 @@ describe('multipart review fixes', () => {
     // Positive control: when R2 already matches the row, convergence is a no-op.
     const noop = await convergeMultipartRow(row!.id, key, HB, testEnv);
     expect(noop).toBe(false);
+  });
+
+  // Capture every parse-queue message recordUploadedObject (and the convergence it calls) emits, so we
+  // can assert exactly which content_hash gets enqueued — the ordering the round-5 fix is about.
+  async function withSendSpy<T>(fn: (sends: Array<{ content_hash: string }>) => Promise<T>): Promise<T> {
+    const q = testEnv.PARSE_QUEUE as any;
+    const orig = q.send.bind(q);
+    const sends: Array<{ content_hash: string }> = [];
+    q.send = async (msg: any, o?: any) => { sends.push(msg); return orig(msg, o); };
+    try {
+      return await fn(sends);
+    } finally {
+      q.send = orig;
+    }
+  }
+
+  function recordMultipartOpts(machineId: string, relpath: string, sha256: string, size: number) {
+    return {
+      machineId, store: 'claude', relpath, r2Key: `raw/${machineId}/claude/${relpath}`,
+      size, mtime: '2026-07-01T00:00:00Z', sha256, existed: false,
+      convergeBody: null, convergeObservedR2: true,
+    };
+  }
+
+  async function ensureMachine(machineId: string): Promise<void> {
+    await testEnv.DB.prepare(
+      "INSERT INTO machines (machine_id, os) VALUES (?1, 'linux') ON CONFLICT (machine_id) DO NOTHING",
+    ).bind(machineId).run();
+  }
+
+  it('ORDERING non-race: converge sees a matching R2 object, exactly one parse message with our sha', async () => {
+    const bytes = new Uint8Array(32).fill(3);
+    const sha = await sha256Hex(bytes);
+    const relpath = 'order/match.bin';
+    // R2 already holds OUR object (native checksum == sha): convergence must be a no-op.
+    await ensureMachine('order-box');
+    await testEnv.RAW.put(`raw/order-box/claude/${relpath}`, bytes, { sha256: sha });
+
+    const sends = await withSendSpy(async (s) => {
+      await recordUploadedObject(testEnv, recordMultipartOpts('order-box', relpath, sha, bytes.length));
+      return s;
+    });
+    expect(sends).toHaveLength(1); // reorder didn't break the happy path
+    expect(sends[0]!.content_hash).toBe(sha);
+  });
+
+  it('ORDERING race: R2 holds sha B while the row upsert carried sha A — never enqueue A, enqueue B', async () => {
+    const bytesB = new Uint8Array(48).fill(7);
+    const shaB = await sha256Hex(bytesB);
+    const shaA = 'a'.repeat(64); // this upload's declared hash — but R2 holds B (the other racer's object)
+    const relpath = 'order/race.bin';
+    await ensureMachine('race2-box');
+    await testEnv.RAW.put(`raw/race2-box/claude/${relpath}`, bytesB, { sha256: shaB });
+
+    const sends = await withSendSpy(async (s) => {
+      await recordUploadedObject(testEnv, recordMultipartOpts('race2-box', relpath, shaA, 10));
+      return s;
+    });
+    // The stale-sha (A) message is NEVER emitted; the only parse enqueued carries the surviving R2 hash B.
+    expect(sends.map((m) => m.content_hash)).not.toContain(shaA);
+    expect(sends).toHaveLength(1);
+    expect(sends[0]!.content_hash).toBe(shaB);
+    // Row was realigned to what R2 actually holds.
+    const row = await testEnv.DB.prepare('SELECT content_hash FROM files WHERE machine_id = ?1 AND relpath = ?2')
+      .bind('race2-box', relpath)
+      .first<{ content_hash: string }>();
+    expect(row!.content_hash).toBe(shaB);
+  });
+
+  it('ORDERING converge-throws: no parse message is enqueued (queue retry / next complete repairs)', async () => {
+    const relpath = 'order/throws.bin';
+    const shaA = 'c'.repeat(64);
+    await ensureMachine('throw-box');
+    await testEnv.RAW.put(`raw/throw-box/claude/${relpath}`, new Uint8Array(16).fill(5)); // head() is stubbed to throw before any checksum read
+
+    const realHead = testEnv.RAW.head.bind(testEnv.RAW);
+    (testEnv.RAW as any).head = async () => { throw new Error('boom'); };
+    try {
+      const sends = await withSendSpy(async (s) => {
+        await expect(recordUploadedObject(testEnv, recordMultipartOpts('throw-box', relpath, shaA, 16))).rejects.toThrow('boom');
+        return s;
+      });
+      expect(sends).toHaveLength(0); // converge threw before the send — nothing enqueued
+    } finally {
+      (testEnv.RAW as any).head = realHead;
+    }
   });
 
   it('prune sweeps stale staging objects but never touches canonical raw/ data', async () => {
