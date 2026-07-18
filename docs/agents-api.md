@@ -106,6 +106,32 @@ reasoning_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h
 Raw token counts only — the hub has no pricing table, so there's no dollar figure anywhere
 in this response. Compute cost yourself if you need it, and caveat that it's an estimate.
 
+**`cache_read_tokens` and `reasoning_tokens` are not safe to sum into a total uniformly** —
+their relationship to `input_tokens`/`output_tokens` is provider-specific:
+
+- Anthropic (claude-code): `cache_read_tokens` is DISJOINT from `input_tokens` (a cache hit
+  is billed/reported separately) — a real total adds it. `reasoning_tokens` is never
+  populated for this harness (checked `hub/src/ingest/parsers/claude-code.ts` — no
+  `reasoningTokens` field), always 0.
+- OpenAI (codex): checked `hub/src/ingest/parsers/codex.ts` — `cache_read_tokens` comes from
+  `cached_input_tokens`, a SUBSET of `input_tokens`, and `reasoning_tokens` comes from
+  `reasoning_output_tokens`, a SUBSET of `output_tokens` (OpenAI's Responses API reports both
+  as breakdowns of, not additions to, the input/output totals). Adding either on top
+  double-counts. Verified against `hub/test/fixtures.ts`'s codex usage fixture: input=900,
+  cached=500, output=80, reasoning=20 — the true total is 980 (900+80), not 1000 (reasoning
+  double-counted) and not 1480 (both double-counted).
+
+This response has no explicit provider field; the client (`UsageRow.total_tokens` in
+`client/src/agent_sessions_client/models.py`) discriminates by whether `bucket` looks like an
+Anthropic model name (starts with `claude`), which only works when the request used
+`group_by=model` — verified against production usage rows on 2026-07-18 (every claude-code
+model starts with `claude`, every codex model doesn't). For any other `group_by`, `bucket`
+mixes providers under one aggregate and there's no correct per-row answer, so the client falls
+back to the conservative OpenAI-style treatment (cache_read and reasoning excluded) for those
+rows — undercount beats double-count for a spend ranking. If you're computing this yourself
+instead of using the client, replicate the same heuristic and caveat, or cross-reference
+`harness` via `/api/v1/sessions` to discriminate properly.
+
 **No `machine`/`harness` filter.** Only `group_by`/`from`/`to` are accepted (see "Known
 contract gaps" below) — if you're building a per-machine or per-harness token report, you
 must fetch the fleet-wide rows and either accept that scope or cross-reference against

@@ -228,6 +228,30 @@ def test_truncated_content_length_raises_hub_error():
             resp.json()
 
 
+def test_error_body_stall_raises_hub_error_with_status_preserved():
+    # e.read() inside get()'s HTTPError handler reads the error body over the same
+    # connection as a success body, and can stall the same way — TimeoutError there
+    # previously escaped past every HubError-only handler. Status/reason must still survive
+    # even when the body itself can't be read.
+    class ErrorThenStallHandler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # silence
+            pass
+
+        def do_GET(self):
+            self.send_response(500)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", "1000")
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(0.5)  # never writes the body
+
+    with _running_server(ErrorThenStallHandler) as url:
+        client = HubClient(bearer_config(url), timeout=0.05)
+        with pytest.raises(HubError) as exc_info:
+            client.get("/api/v1/status")
+        assert exc_info.value.status == 500
+
+
 def test_read_bytes_body_stall_after_headers_raises_hub_error():
     # get_session_raw()'s primitive — same wrapping as json()/iter_lines(), via _read_body().
     class HeadersThenStallHandler(BaseHTTPRequestHandler):

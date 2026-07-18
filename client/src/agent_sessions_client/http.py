@@ -144,7 +144,15 @@ class HubClient:
         try:
             fp = urllib.request.urlopen(request, timeout=self._timeout, context=self._ssl_context)
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
+            # e.read() here reads the error response's body over the same connection as a
+            # success body — it can stall or truncate exactly like _read_body() can (see that
+            # method's comment). Unlike a success body, we already have a status/reason to
+            # report even if the body itself is unreadable, so degrade to a placeholder body
+            # instead of losing the HubError(status=...) shape entirely.
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except (TimeoutError, OSError, http.client.HTTPException):
+                body = "<body unavailable>"
             raise HubError(e.code, e.reason, body) from e
         except TimeoutError as e:
             # A connect-phase timeout comes back wrapped in URLError, but a READ-phase stall

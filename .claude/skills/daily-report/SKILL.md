@@ -23,8 +23,12 @@ machine API. Full endpoint contract, auth modes, and known gaps: `docs/agents-ap
 2. **If the CLI isn't available** (no `client/` checkout, or you need a breakdown the built-in
    report doesn't produce), call the API directly per `docs/agents-api.md`. The three calls the
    built-in report makes:
-   - `GET /api/v1/sessions?from=<date>&to=<date>` — session-level meta (counts, cwd, model,
-     block/turn counts, duration). Meta-only, no R2 read, fast.
+   - `GET /api/v1/sessions?from=<date>&to=<date>&limit=1000` — session-level meta (counts,
+     cwd, model, block/turn counts, duration). Meta-only, no R2 read, fast. Don't omit
+     `limit`: the hub defaults to 200 rows, well under the 1000 hard cap the shipped CLI
+     requests — an omitted `limit` on a busy day undercounts long before hitting the real
+     cap. Even at 1000, a result landing exactly on the limit may still be truncated (no
+     pagination on this endpoint yet) — see step 3.
    - `GET /api/v1/usage?group_by=model&from=<date>&to=<date>` — token spend by model.
    - `GET /api/v1/status` — per-machine `indexed_through`, to check freshness before trusting
      the counts above.

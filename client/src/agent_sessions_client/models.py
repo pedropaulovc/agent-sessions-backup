@@ -157,14 +157,46 @@ class UsageRow:
 
     @property
     def total_tokens(self) -> int:
-        return (
-            self.input_tokens
-            + self.output_tokens
-            + self.reasoning_tokens
-            + self.cache_read_tokens
-            + self.cache_creation_5m_tokens
-            + self.cache_creation_1h_tokens
-        )
+        """Provider-aware token total — `cache_read_tokens` AND `reasoning_tokens` mean
+        different things per provider and can't be summed uniformly on top of
+        `input_tokens`/`output_tokens`:
+
+        - Anthropic (claude-code): `cache_read_tokens` is DISJOINT from `input_tokens` (a
+          cache hit is billed/reported separately) — must be added. `reasoning_tokens` is
+          never populated for this harness (see `hub/src/ingest/parsers/claude-code.ts`, no
+          `reasoningTokens` field) — always 0, so whether it's "added" is moot; kept additive
+          here on the theory that if Anthropic ever reports a genuinely separate thinking-
+          token count, it'd behave like cache_read (a disjoint category), not like codex's
+          reasoning count.
+        - OpenAI (codex): checked `hub/src/ingest/parsers/codex.ts` — `cacheReadTokens` comes
+          from `cached_input_tokens`, a SUBSET of `input_tokens`, and `reasoningTokens` comes
+          from `reasoning_output_tokens`, a SUBSET of `output_tokens` (OpenAI's Responses API
+          reports both as breakdowns of, not additions to, `input_tokens`/`output_tokens`).
+          Adding either on top double-counts. Verified against production and against
+          `hub/test/fixtures.ts`'s codex usage fixture: input=900/cached=500/output=80/
+          reasoning=20 has a real total of 980 (900+80), not 1000 (900+80+20, reasoning
+          double-counted) and not 1480 (also double-counting cache_read).
+
+        The only per-row discriminator this dataclass has is `bucket`, which is the model
+        name ONLY when the request used `group_by=model` (the daily-report CLI always does —
+        see cli.py). For any other `group_by` (day/machine/repo), `bucket` mixes rows from
+        multiple providers under one aggregate, so there is no correct per-row answer;
+        treating it as Anthropic-additive would be right for the Anthropic share and wrong
+        for the OpenAI share. This falls back to the conservative (OpenAI-style, cache_read
+        and reasoning excluded) treatment whenever `bucket` doesn't look like an Anthropic
+        model name (i.e. doesn't start with `claude`) — undercounting a mixed/unresolved
+        bucket is safer than double-counting it, since this value feeds "biggest spender"
+        rankings. Verified against production usage rows (2026-07-18): every claude-code-
+        harness model starts with `claude` (e.g. `claude-fable-5`); every codex-harness model
+        does not (`gpt-5.x`, `gpt-5.x-codex`). Future provider/model-naming drift could break
+        this — if a new provider's model names start with `claude` (unlikely) or an Anthropic
+        model line drops the prefix, this heuristic needs revisiting.
+        """
+        is_anthropic_like = bool(self.bucket) and self.bucket.startswith("claude")
+        total = self.input_tokens + self.output_tokens + self.cache_creation_5m_tokens + self.cache_creation_1h_tokens
+        if is_anthropic_like:
+            total += self.cache_read_tokens + self.reasoning_tokens
+        return total
 
 
 @dataclass(frozen=True)
