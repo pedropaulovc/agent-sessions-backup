@@ -1,5 +1,5 @@
 import { SELF } from 'cloudflare:test';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { env as testEnvRaw } from 'cloudflare:test';
 import worker from '../src/index';
 import { flipOwnedSessionsToParsing } from '../src/api/upload';
@@ -65,6 +65,35 @@ async function drainAll(): Promise<void> {
     if ((n?.n ?? 0) === 0) return;
     await drainQueue();
   }
+}
+
+// vitest-pool-workers isolates storage per FILE, not per test, so every export-inbox file an earlier
+// test uploaded lingers in the shared DB. The recover fan-out (consumer.ts) is store-scoped and
+// machine-agnostic — `FROM files WHERE store='export-inbox' AND id != self AND parse_state != 'error'`
+// — so with N accumulated archives every drainAll() re-parses all N siblings, and each reparse that
+// drops a conversation kicks yet another fan-out: the file's wall time grew superlinearly as recovery
+// tests piled up. Wiping the export-inbox files (and the sessions they own) before each test bounds
+// every fan-out to the purpose-built fixtures that test itself uploads, restoring hermetic isolation
+// without weakening any assertion. Non-export sessions (live chatgpt-web/claude-web) are untouched:
+// their canonical is not an export-inbox row, and the fan-out never selects their store.
+async function resetExportState(): Promise<void> {
+  const owned = await testEnv.DB.prepare(
+    "SELECT session_id FROM sessions WHERE canonical_file_id IN (SELECT id FROM files WHERE store = 'export-inbox')",
+  ).all<{ session_id: string }>();
+  const stmts = [];
+  for (const { session_id } of owned.results) {
+    stmts.push(
+      testEnv.DB.prepare(
+        "INSERT INTO blocks_fts (blocks_fts, rowid, text) SELECT 'delete', id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL",
+      ).bind(session_id),
+      testEnv.DB.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(session_id),
+      testEnv.DB.prepare('DELETE FROM usage WHERE session_id = ?1').bind(session_id),
+      testEnv.DB.prepare('DELETE FROM sessions WHERE session_id = ?1').bind(session_id),
+    );
+  }
+  stmts.push(testEnv.DB.prepare("DELETE FROM files WHERE store = 'export-inbox'"));
+  await testEnv.DB.batch(stmts);
+  enqueuedReason.clear();
 }
 
 /** Deliver one explicit message (optionally with a specific content_hash to simulate a stale delivery). */
@@ -180,6 +209,8 @@ describe('claude-web image blocks render as inert placeholders, never blob-backe
 });
 
 describe('export ZIP ingest fans out and only backfills gaps', () => {
+  beforeEach(resetExportState);
+
   it('indexes every conversation in the archive as its own session', async () => {
     const zip = chatgptExportZip([
       { id: 'exp-ingest-a', title: 'A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'archived alpha topic' }] },
