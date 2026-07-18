@@ -525,6 +525,42 @@ def test_doctor_reports_old_curl_as_fail(tmp_path, hub, tmp_env, monkeypatch, ca
     assert rc == 1
 
 
+# A realistic 40-hex SHA-1 cert thumbprint (normalize_thumbprint now requires exactly 40 hex).
+_TP = "A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0"
+
+
+def _cert_store_probe(monkeypatch, capsys, ps_stdout):
+    # Drive _doctor_cert_store off-Windows by faking the platform and the powershell probe's stdout.
+    monkeypatch.setattr(run_mod.sys, "platform", "win32")
+    monkeypatch.setattr(run_mod.subprocess, "run",
+                        lambda *a, **k: types.SimpleNamespace(stdout=ps_stdout, stderr="", returncode=0))
+    ok = run_mod._doctor_cert_store(_TP)
+    return ok, capsys.readouterr().out
+
+
+def test_doctor_cert_store_ok(monkeypatch, capsys):
+    # Positive control: cert present with a private key and comfortable expiry passes.
+    ok, out = _cert_store_probe(monkeypatch, capsys, "364\n")
+    assert ok is True
+    assert "[ok]" in out and "364d" in out
+
+
+def test_doctor_cert_store_missing_fails(monkeypatch, capsys):
+    # Positive control (negative outcome): a cert not in the store is a hard failure.
+    ok, out = _cert_store_probe(monkeypatch, capsys, "MISSING\n")
+    assert ok is False
+    assert "[FAIL]" in out and "not found" in out
+
+
+def test_doctor_cert_store_no_private_key_fails(monkeypatch, capsys):
+    # The gap: a cert in CurrentUser\My WITHOUT its private key (imported the .pem/.crt instead of the
+    # PFX) must fail doctor with an actionable message, not pass and fail cryptically on first upload.
+    # Revert the NOPRIVKEY branch and this flips to a passing warn (int('NOPRIVKEY') path), failing here.
+    ok, out = _cert_store_probe(monkeypatch, capsys, "NOPRIVKEY\n")
+    assert ok is False
+    assert "[FAIL]" in out and "NO private key" in out and "--import-pfx" in out
+
+
 def test_run_lock_prevents_overlap(tmp_path, hub, tmp_env, monkeypatch):
     # enroll writes a real config the CLI path will load
     path = config.config_path()

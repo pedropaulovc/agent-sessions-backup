@@ -153,17 +153,18 @@ cert signed for the wrong id 401s every Windows upload as `machine_mismatch`.
 
 ```bash
 MID=amet-windows
+OUT=~/.config/agent-collector
 CF_API_TOKEN=<token from "Mint the enrollment token" above> \
-  infra/cf/enroll-cert.sh "$MID" --admin --out ~/.config/agent-collector
+  infra/cf/enroll-cert.sh "$MID" --admin --out "$OUT"
 ```
 
-**Bundle the cert+key into a PFX** — still in WSL/bash, from the `$MID.client.pem` /
+**Bundle the cert+key into a PFX** — still in WSL/bash, from the `$OUT/$MID.client.pem` /
 `.client.key` that just got written. Export the password so it stays out of argv:
 
 ```bash
 export AC_PFX_PW='choose-a-transfer-password'
-openssl pkcs12 -export -inkey "$MID.client.key" -in "$MID.client.pem" \
-  -out "$MID.client.pfx" -passout env:AC_PFX_PW
+openssl pkcs12 -export -inkey "$OUT/$MID.client.key" -in "$OUT/$MID.client.pem" \
+  -out "$OUT/$MID.client.pfx" -passout env:AC_PFX_PW
 ```
 
 **Import it on Windows** — in PowerShell on the host (note `$env:` assignment and the
@@ -190,11 +191,11 @@ Windows model); the PEM key on the WSL disk is a redundant, exportable copy that
 contradicts it. The PFX was already deleted by the import; shred the leftover key too:
 
 ```bash
-shred -u "$MID.client.key"    # or: rm -P on *BSD/macOS
+shred -u "$OUT/$MID.client.key"    # or: rm -P on *BSD/macOS
 ```
 
-The `$MID.client.pem` **cert** is public (it's just the signed certificate, not the key)
-and may stay in `~/.config/agent-collector` for reference or re-bundling.
+The `$OUT/$MID.client.pem` **cert** is public (it's just the signed certificate, not the
+key) and may stay in `~/.config/agent-collector` for reference or re-bundling.
 
 ## Notes
 

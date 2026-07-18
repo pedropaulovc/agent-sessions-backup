@@ -673,7 +673,9 @@ def _doctor_cert_store(thumbprint: str) -> bool:
         return True
     ps = (
         "$c = Get-Item ('Cert:\\CurrentUser\\My\\' + $env:AC_TP) -ErrorAction SilentlyContinue; "
-        "if ($null -eq $c) { 'MISSING' } else { [int]($c.NotAfter - (Get-Date)).TotalDays }"
+        "if ($null -eq $c) { 'MISSING' } "
+        "elseif (-not $c.HasPrivateKey) { 'NOPRIVKEY' } "
+        "else { [int]($c.NotAfter - (Get-Date)).TotalDays }"
     )
     env = {**os.environ, "AC_TP": tp}
     try:
@@ -685,6 +687,13 @@ def _doctor_cert_store(thumbprint: str) -> bool:
     out = proc.stdout.strip().splitlines()[-1].strip() if proc.stdout.strip() else ""
     if out in ("", "MISSING"):
         print(f"[FAIL] mTLS cert not found in Cert:\\CurrentUser\\My ({short}); re-enroll with --import-pfx")
+        return False
+    if out == "NOPRIVKEY":
+        # Cert present but no associated private key — Schannel can't complete the handshake, so the
+        # first upload would fail with an opaque error. Happens when the .pem/.crt was imported instead
+        # of the PFX. Point at the fix rather than letting doctor pass and the upload fail cryptically.
+        print(f"[FAIL] mTLS cert {short} is in Cert:\\CurrentUser\\My but has NO private key; "
+              f"import the PFX (not the .pem/.crt) via enroll --import-pfx")
         return False
     try:
         days = int(out)
