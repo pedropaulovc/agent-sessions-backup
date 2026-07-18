@@ -58,7 +58,7 @@ export async function status(env: Env): Promise<Response> {
   });
 }
 
-/** GET /api/v1/usage?group_by=day|model|machine|repo&from&to */
+/** GET /api/v1/usage?group_by=day|model|machine|repo&from&to&machine&harness */
 export async function usage(url: URL, env: Env): Promise<Response> {
   const groupBy = url.searchParams.get('group_by') ?? 'day';
   const groupExpr: Record<string, string> = {
@@ -78,6 +78,17 @@ export async function usage(url: URL, env: Env): Promise<Response> {
   if (url.searchParams.get('to')) {
     binds.push(normalizeToBound(url.searchParams.get('to')!));
     filters.push(`u.ts <= ?${binds.length}`);
+  }
+  // The join to `sessions` already exists (for the machine/repo group_by exprs above), so a
+  // machine/harness filter is just two more WHERE terms on the already-joined table — no
+  // schema change, no extra join.
+  if (url.searchParams.get('machine')) {
+    binds.push(url.searchParams.get('machine'));
+    filters.push(`s.machine_id = ?${binds.length}`);
+  }
+  if (url.searchParams.get('harness')) {
+    binds.push(url.searchParams.get('harness'));
+    filters.push(`s.harness = ?${binds.length}`);
   }
   const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
   const rows = await env.DB.prepare(
