@@ -22,8 +22,20 @@ class FakeHub:
         self.checks: list[dict] = []
         self.put_attempts = 0
         self.post_attempts = 0
+        self.part_attempts = 0
         self.flaky_500_remaining = 0
         self.flaky_methods = {"PUT", "POST"}
+        # In-flight multipart uploads: upload_id -> {machine, store, relpath, sha256, mtime, size, parts}
+        self.multipart: dict[str, dict] = {}
+        self._mp_seq = 0
+        self.aborts: list[str] = []
+        self.completes = 0
+        # When > 0, complete returns 422 (as if the reassembled bytes failed verification) and
+        # decrements — exercises the collector's verify-failure retry/abort loop.
+        self.flaky_multipart_mismatch_remaining = 0
+        # When set, complete always returns this status and LEAVES the upload pending (so the
+        # collector's abort is observable) — exercises the give-up/abort path.
+        self.force_complete_status: int | None = None
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -86,20 +98,40 @@ def _make_handler(hub: FakeHub):
                 })
             return self._json(404, {"error": "not_found"})
 
-        def do_PUT(self):
-            hub.put_attempts += 1
-            body = self._read_body()
-            if hub._should_fail("PUT"):
-                return self._json(500, {"error": "flaky"})
-            m = self.path.split("/")
-            # /api/v1/files/{machine}/{store}/{relpath...}
+        def _split_path(self):
+            """(path, query-dict) — query values are single strings. keep_blank_values so the
+            valueless `?uploads` flag survives (parse_qs drops it otherwise)."""
+            parts = urllib.parse.urlsplit(self.path)
+            query = {k: v[0] for k, v in urllib.parse.parse_qs(parts.query, keep_blank_values=True).items()}
+            return parts.path, query
+
+        def _files_target(self, path):
+            """(machine, store, relpath) from /api/v1/files/{machine}/{store}/{relpath...}, or None."""
+            m = path.split("/")
             try:
                 idx = m.index("files")
             except ValueError:
+                return None
+            if len(m) < idx + 4:
+                return None
+            return (
+                urllib.parse.unquote(m[idx + 1]),
+                urllib.parse.unquote(m[idx + 2]),
+                urllib.parse.unquote("/".join(m[idx + 3:])),
+            )
+
+        def do_PUT(self):
+            path, query = self._split_path()
+            body = self._read_body()
+            if "uploadId" in query:
+                return self._multipart_part(path, query, body)
+            hub.put_attempts += 1
+            if hub._should_fail("PUT"):
+                return self._json(500, {"error": "flaky"})
+            target = self._files_target(path)
+            if target is None:
                 return self._json(404, {"error": "not_found"})
-            machine = urllib.parse.unquote(m[idx + 1])
-            store = urllib.parse.unquote(m[idx + 2])
-            relpath = urllib.parse.unquote("/".join(m[idx + 3:]))
+            machine, store, relpath = target
 
             hdr = self.headers.get("x-content-hash", "")
             if not hdr.startswith("sha256:"):
@@ -120,13 +152,39 @@ def _make_handler(hub: FakeHub):
             }
             return self._json(201, {"status": "stored"})
 
+        def _multipart_part(self, path, query, body):
+            """PUT ?uploadId&partNumber — stash the part bytes for later reassembly."""
+            hub.part_attempts += 1
+            if hub._should_fail("PUT"):
+                return self._json(500, {"error": "flaky"})
+            up = hub.multipart.get(query.get("uploadId", ""))
+            if up is None:
+                return self._json(400, {"error": "unknown_upload"})
+            part_no = int(query.get("partNumber", "0"))
+            up["parts"][part_no] = body
+            return self._json(200, {"part_number": part_no, "etag": hashlib.sha256(body).hexdigest()[:16]})
+
+        def do_DELETE(self):
+            path, query = self._split_path()
+            up_id = query.get("uploadId", "")
+            if up_id in hub.multipart:
+                hub.multipart.pop(up_id, None)
+                hub.aborts.append(up_id)
+                return self._json(200, {"status": "aborted"})
+            return self._json(200, {"status": "gone"})
+
         def do_POST(self):
-            hub.post_attempts += 1
+            path, query = self._split_path()
             body = self._read_body()
+            if "uploads" in query:
+                return self._multipart_create(path, query)
+            if "uploadId" in query:
+                return self._multipart_complete(path, query, body)
+            hub.post_attempts += 1
             if hub._should_fail("POST"):
                 return self._json(500, {"error": "flaky"})
             obj = json.loads(body or b"{}")
-            if self.path == "/api/v1/files/check":
+            if path == "/api/v1/files/check":
                 hub.checks.append(obj)
                 machine = self.headers.get("x-dev-machine", "")
                 items = obj.get("files", [])
@@ -140,9 +198,60 @@ def _make_handler(hub: FakeHub):
                     if not have or have["sha256"] != sha:
                         missing.append({"store": it["store"], "relpath": it["relpath"]})
                 return self._json(200, {"missing": missing})
-            if self.path == "/api/v1/heartbeat":
+            if path == "/api/v1/heartbeat":
                 hub.heartbeats.append(obj)
                 return self._json(200, {"ok": True})
             return self._json(404, {"error": "not_found"})
+
+        def _multipart_create(self, path, query):
+            """POST ?uploads — open an upload (or 200-unchanged short-circuit on a matching hash)."""
+            if hub._should_fail("POST"):
+                return self._json(500, {"error": "flaky"})
+            target = self._files_target(path)
+            if target is None:
+                return self._json(404, {"error": "not_found"})
+            machine, store, relpath = target
+            hdr = self.headers.get("x-content-hash", "")
+            if not hdr.startswith("sha256:"):
+                return self._json(400, {"error": "missing_or_bad_x_content_hash"})
+            declared = hdr.split(":", 1)[1].lower()
+            existing = hub.files.get((machine, store, relpath))
+            if existing and existing["sha256"] == declared:
+                return self._json(200, {"status": "unchanged"})
+            hub._mp_seq += 1
+            up_id = f"upload-{hub._mp_seq}"
+            hub.multipart[up_id] = {
+                "machine": machine, "store": store, "relpath": relpath,
+                "sha256": declared, "mtime": self.headers.get("x-file-mtime"),
+                "size": int(self.headers.get("x-file-size", "0")), "parts": {},
+            }
+            return self._json(201, {"status": "created", "upload_id": up_id, "key": path})
+
+        def _multipart_complete(self, path, query, body):
+            """POST ?uploadId — reassemble parts in order, verify sha256, store or 422."""
+            hub.completes += 1
+            up_id = query.get("uploadId", "")
+            up = hub.multipart.get(up_id)
+            if up is None:
+                return self._json(404, {"error": "unknown_upload"})
+            if hub.force_complete_status is not None:
+                # Leave the upload pending so the collector's abort has something to release.
+                return self._json(hub.force_complete_status, {"error": "forced"})
+            if hub.flaky_multipart_mismatch_remaining > 0:
+                # Simulate a verify failure: hub deletes the object + tracking row, collector retries.
+                hub.flaky_multipart_mismatch_remaining -= 1
+                hub.multipart.pop(up_id, None)
+                return self._json(422, {"error": "checksum_mismatch"})
+            assembled = b"".join(up["parts"][n] for n in sorted(up["parts"]))
+            actual = hashlib.sha256(assembled).hexdigest()
+            if actual != up["sha256"]:
+                hub.multipart.pop(up_id, None)
+                return self._json(422, {"error": "checksum_mismatch",
+                                        "expected": up["sha256"], "actual": actual})
+            hub.files[(up["machine"], up["store"], up["relpath"])] = {
+                "sha256": up["sha256"], "body": assembled, "mtime": up["mtime"],
+            }
+            hub.multipart.pop(up_id, None)
+            return self._json(201, {"status": "stored"})
 
     return Handler

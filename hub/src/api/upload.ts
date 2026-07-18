@@ -3,7 +3,7 @@ import { detect } from '../ingest/detect';
 import { markPendingAndEnqueue } from '../queue';
 import { hex } from './ops';
 
-const TERMINAL_PARSE_STATES = new Set(['parsed', 'skipped', 'superseded']);
+export const TERMINAL_PARSE_STATES = new Set(['parsed', 'skipped', 'superseded']);
 
 /** R2 customMetadata values must be strings, and the x-file-mtime header is optional — build the
  * {mtime} customMetadata object only when we actually have one to record. reindex() reads this
@@ -21,7 +21,7 @@ function r2MtimeMetadata(mtime: string | null): Record<string, string> | undefin
  * place. Returns whether a restamp was applied so BOTH resync paths can fold it into their
  * re-enqueue decision (a terminal-but-restamped row must still be requeued to finally index).
  * detect() is pure/cheap and only reached on a resync, never a steady-state upload. */
-async function restampIfStale(
+export async function restampIfStale(
   row: { id: number; parse_state: string; harness: string | null; session_id: string | null },
   store: string,
   relpath: string,
@@ -120,9 +120,10 @@ export async function putFile(
   // check below (see convergeR2WithRow) may need to re-PUT these exact bytes a second time if a
   // concurrent request's write interleaves with this one, and request.body is a single-use
   // stream — RAW.put already consumes it on the first PUT, so a second PUT needs its own copy.
-  // Uploads are small today (well under 35MB); the isolate's 128MB memory limit gives comfortable
-  // headroom — revisit (e.g. switch to a content-addressed key, avoiding the rewrite entirely) if
-  // upload sizes grow enough for this to matter.
+  // This simple path only runs for files under the collector's multipart threshold (default
+  // 90MB, kept below Cloudflare's 100MB request-body cap — see multipart.ts); the isolate's
+  // 128MB memory limit gives headroom. Larger files never reach here: the collector routes them
+  // through the streamed multipart path instead.
   const bodyBuf = await request.arrayBuffer();
   // R2 verifies the checksum server-side: a corrupt/truncated body never lands. Its returned
   // object's .size is the authoritative byte count — the x-file-size/content-length header
@@ -137,6 +138,45 @@ export async function putFile(
     return Response.json({ error: 'checksum_or_write_failure', detail: String(e) }, { status: 400 });
   }
 
+  return recordUploadedObject(env, {
+    machineId,
+    store,
+    relpath,
+    r2Key,
+    size: put.size,
+    mtime,
+    sha256,
+    existed: existing != null,
+    // Simple path only: pass the buffered body so recordUploadedObject can converge R2 against a
+    // concurrent same-path writer (see convergeR2WithRow). The multipart path passes null — it
+    // controls its own object and never races a second full-file writer for the same 100MB file.
+    convergeBody: bodyBuf,
+  });
+}
+
+/**
+ * Shared finalize for a raw object that has just landed in R2 (via the simple PUT or a completed
+ * multipart upload): upsert the files row, converge R2 against a concurrent same-path writer (simple
+ * path only), stamp last_upload, flip any owned session to 'parsing', enqueue the parse, and return
+ * the 201 stored response. Keeping this in ONE place is what makes a >=90MB multipart upload index
+ * byte-identically to a <90MB simple PUT — the only difference between the two paths is how the bytes
+ * reach R2, never what happens after.
+ */
+export async function recordUploadedObject(
+  env: Env,
+  opts: {
+    machineId: string;
+    store: string;
+    relpath: string;
+    r2Key: string;
+    size: number;
+    mtime: string | null;
+    sha256: string;
+    existed: boolean;
+    convergeBody: ArrayBuffer | null;
+  },
+): Promise<Response> {
+  const { machineId, store, relpath, r2Key, size, mtime, sha256, existed, convergeBody } = opts;
   // machineId is required so machine-global files (history.jsonl, identical relpath fleet-wide)
   // get a machine-scoped session_id stamped on the row — otherwise canonical/recovery/parsing
   // queries (which look files up BY session_id) can't find them.
@@ -154,7 +194,7 @@ export async function putFile(
        uploaded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
      RETURNING id`,
   )
-    .bind(machineId, store, relpath, r2Key, put.size, mtime, sha256, det.harness, det.sessionId ?? null)
+    .bind(machineId, store, relpath, r2Key, size, mtime, sha256, det.harness, det.sessionId ?? null)
     .first<{ id: number }>();
 
   // Two overlapping changed-hash uploads for the SAME path can interleave their R2 writes and D1
@@ -167,8 +207,9 @@ export async function putFile(
   // request runs this exact same check on its own way out, so it (not us) owns convergence here.
   // Either way, a genuinely stale parse message is rejected at the source by the consumer's
   // content_hash guard, so no reparse can process the wrong bytes even in the brief window before
-  // convergence completes.
-  await convergeR2WithRow(row!.id, r2Key, sha256, bodyBuf, env);
+  // convergence completes. The multipart path passes convergeBody=null (no concurrent full-file
+  // writer to race, and it never buffers the whole object) and skips this.
+  if (convergeBody !== null) await convergeR2WithRow(row!.id, r2Key, sha256, convergeBody, env);
 
   await env.DB.prepare('UPDATE machines SET last_upload_at = strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE machine_id = ?1')
     .bind(machineId)
@@ -196,7 +237,7 @@ export async function putFile(
   await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
 
   console.log(
-    JSON.stringify({ event: 'access.upload', machine: machineId, key: r2Key, bytes: put.size, status: existing ? 'updated' : 'created' }),
+    JSON.stringify({ event: 'access.upload', machine: machineId, key: r2Key, bytes: size, status: existed ? 'updated' : 'created' }),
   );
   return Response.json({ status: 'stored', file_id: row!.id }, { status: 201 });
 }

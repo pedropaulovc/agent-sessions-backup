@@ -19,9 +19,19 @@ from pathlib import Path
 
 from . import config as config_mod
 from . import __version__
-from .scanner import Scanner, ScanItem, read_exact, hash_bytes, hash_file_prefix
+from .scanner import Scanner, ScanItem, read_exact, read_range, hash_bytes, hash_file_prefix
 from .state import State, OverlapLock, now_iso, state_path
 from .transport import Transport, DevAuth, MtlsAuth, Upload, MIN_CURL_VERSION
+
+# Multipart upload outcomes (enum, not a bool pair — a large file's fate is a small state machine:
+# it either uploaded fresh bytes, matched bytes the hub already had, or failed).
+MULTIPART_UPLOADED = "uploaded"
+MULTIPART_UNCHANGED = "unchanged"
+MULTIPART_FAILED = "failed"
+
+# A verify-failure (hub reassembled the wrong bytes) or a transient error retries the whole
+# create->parts->complete this many times before giving up and surfacing a heartbeat error.
+MULTIPART_MAX_ATTEMPTS = 3
 
 
 # Warn-level scanner event codes that still mean a file was NOT captured this run (the DB was
@@ -148,6 +158,12 @@ def _process_item(cfg, st: State, transport: Transport, scanner: Scanner, item: 
         st.touch_seen(item.store, item.relpath)
         return ItemResult(changed=False)
 
+    # Large files can't go through a single PUT: Cloudflare rejects a >100MB request body at the
+    # edge with HTTP 413 before it reaches the Worker. Route them to the chunked multipart path,
+    # which also never buffers the whole file (streaming hash + byte-range part reads).
+    if item.size >= cfg.multipart_threshold_bytes:
+        return _process_large_item(cfg, st, transport, item, row)
+
     try:
         data = read_exact(item.source_path, item.size)
     except OSError as e:
@@ -188,6 +204,120 @@ def _process_item(cfg, st: State, transport: Transport, scanner: Scanner, item: 
     st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "error",
                    error=f"{status}: {body[:400]}")
     return ItemResult(changed=True, error=f"{item.relpath}: HTTP {status} {body[:200]}")
+
+
+def _process_large_item(cfg, st: State, transport: Transport, item: ScanItem,
+                        row) -> ItemResult:
+    """Run-mode path for a file at/above the multipart threshold. Hashes by streaming (no full
+    read), skips the wire when the hash is unchanged, else uploads via multipart. Memory stays
+    bounded to one part throughout."""
+    try:
+        sha = hash_file_prefix(item.source_path, item.size)
+    except OSError as e:
+        if row:
+            st.upsert_file(row.store, row.relpath, row.size, row.mtime_ns, row.sha256,
+                           "error", error=f"read failed: {e}")
+        return ItemResult(error=f"{item.relpath}: read failed: {e}")
+
+    if row and row.sha256 == sha and row.status == "ok":
+        # Content identical though metadata changed: refresh state, skip the wire.
+        st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "ok")
+        return ItemResult(changed=True)
+
+    result, detail = _upload_multipart(cfg, transport, item, sha)
+    if result == MULTIPART_UPLOADED:
+        st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "ok",
+                       uploaded_size=item.size, uploaded_at=now_iso())
+        return ItemResult(changed=True, uploaded=True, bytes=item.size)
+    if result == MULTIPART_UNCHANGED:  # hub already had these exact bytes (dedup)
+        st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "ok",
+                       uploaded_size=item.size, uploaded_at=now_iso())
+        return ItemResult(changed=True)
+
+    st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "error",
+                   error=f"multipart: {detail}"[:400])
+    return ItemResult(changed=True, error=f"{item.relpath}: multipart failed: {detail}")
+
+
+def _multipart_query(base_url: str, upload_id: str, extra: str = "") -> str:
+    return f"{base_url}?uploadId={urllib.parse.quote(upload_id, safe='')}{extra}"
+
+
+def _multipart_create(transport: Transport, base_url: str, sha: str, mtime: str,
+                      size: int) -> tuple[str | None, int, str]:
+    """Open a multipart upload. Returns (upload_id, status, body). upload_id is None both when the
+    hub already had these bytes (status 200) and on any error — the caller keys off status."""
+    headers = {"x-content-hash": f"sha256:{sha}", "x-file-mtime": mtime, "x-file-size": str(size)}
+    status, body = transport.request("POST", base_url + "?uploads", headers)
+    if status == 201:
+        try:
+            return json.loads(body)["upload_id"], 201, body
+        except (ValueError, KeyError, TypeError):
+            return None, status, body
+    return None, status, body
+
+
+def _multipart_send_parts(transport: Transport, base_url: str, item: ScanItem, upload_id: str,
+                          part_size: int, size: int) -> tuple[list[dict] | None, str | None]:
+    """Upload every part sequentially via byte-range reads. Returns (parts, None) on success or
+    (None, error_detail) on the first failure. Each part except the last is exactly part_size;
+    the last carries the remainder and is flagged so the hub accepts it below the 5MiB floor."""
+    num_parts = max(1, -(-size // part_size))
+    parts: list[dict] = []
+    for i in range(num_parts):
+        offset = i * part_size
+        length = min(part_size, size - offset)
+        data = read_range(item.source_path, offset, length)
+        if len(data) != length:
+            return None, f"short read on part {i + 1}: got {len(data)} want {length}"
+        part_no = i + 1
+        headers = {"x-part-is-last": "1"} if i == num_parts - 1 else {}
+        url = _multipart_query(base_url, upload_id, f"&partNumber={part_no}")
+        status, body = transport.put_part(url, data, headers)
+        if status not in (200, 201):
+            return None, f"part {part_no} HTTP {status}: {body[:200]}"
+        try:
+            etag = json.loads(body)["etag"]
+        except (ValueError, KeyError, TypeError):
+            return None, f"part {part_no} bad response: {body[:200]}"
+        parts.append({"part_number": part_no, "etag": etag})
+    return parts, None
+
+
+def _multipart_abort(transport: Transport, base_url: str, upload_id: str) -> None:
+    """Best-effort release of a dangling upload; the hub's abort is idempotent and the daily prune
+    cron sweeps anything that still slips through, so a failure here is not fatal."""
+    try:
+        transport.request("DELETE", _multipart_query(base_url, upload_id))
+    except Exception:  # noqa: BLE001 - abort is best-effort cleanup, never fail the run over it
+        pass
+
+
+def _upload_multipart(cfg, transport: Transport, item: ScanItem, sha: str) -> tuple[str, str | None]:
+    """create -> parts -> complete, retried whole up to MULTIPART_MAX_ATTEMPTS. Any attempt that
+    opened an upload but didn't complete is aborted before retrying (and on final give-up) so no
+    dangling multipart is left. Returns (MULTIPART_*, detail)."""
+    base_url = file_url(cfg.hub_url, cfg.machine_id, item.store, item.relpath)
+    part_size = cfg.multipart_part_size_bytes
+    mtime = mtime_iso(item.mtime_ns)
+    last_error: str | None = None
+    for _attempt in range(MULTIPART_MAX_ATTEMPTS):
+        upload_id, status, body = _multipart_create(transport, base_url, sha, mtime, item.size)
+        if status == 200:  # hub already holds these exact bytes
+            return MULTIPART_UNCHANGED, None
+        if upload_id is None:  # transient create failure -> retry
+            last_error = f"create HTTP {status}: {body[:200]}"
+            continue
+
+        parts, detail = _multipart_send_parts(transport, base_url, item, upload_id, part_size, item.size)
+        if parts is not None:
+            status, body = transport.post_json(_multipart_query(base_url, upload_id), {"parts": parts})
+            if status in (200, 201):
+                return MULTIPART_UPLOADED, None
+            detail = f"complete HTTP {status}: {body[:200]}"
+        last_error = detail
+        _multipart_abort(transport, base_url, upload_id)  # release before retrying
+    return MULTIPART_FAILED, last_error or "multipart upload failed"
 
 
 def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: list[dict]) -> bool:
@@ -346,10 +476,29 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
             _cleanup_snapshot(item)
         return
 
-    # Materialize ONLY the missing bodies, upload, then delete each body.
+    # Large files can't ride the parallel single-PUT batch (Cloudflare 413s a >100MB body); upload
+    # each sequentially via multipart, reusing the streaming hash from the pass above. Small files
+    # take the existing parallel batch path unchanged.
+    large = [(it, sha) for it, sha in to_upload if it.size >= cfg.multipart_threshold_bytes]
+    small = [(it, sha) for it, sha in to_upload if it.size < cfg.multipart_threshold_bytes]
+    for item, sha in large:
+        result, detail = _upload_multipart(cfg, transport, item, sha)
+        if result in (MULTIPART_UPLOADED, MULTIPART_UNCHANGED):
+            if result == MULTIPART_UPLOADED:
+                totals["uploaded"] += 1
+                totals["bytes_uploaded"] += item.size
+            st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "ok",
+                           uploaded_size=item.size, uploaded_at=now_iso())
+        else:
+            totals["failed"] += 1
+            st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "error",
+                           error=f"backfill multipart: {detail}"[:400])
+        _cleanup_snapshot(item)
+
+    # Materialize ONLY the missing small bodies, upload, then delete each body.
     bodies = []  # (item, sha2, body_path, nbytes, headers)
     uploads = []
-    for item, _sha in to_upload:
+    for item, _sha in small:
         try:
             data = read_exact(item.source_path, item.size)
         except OSError as e:

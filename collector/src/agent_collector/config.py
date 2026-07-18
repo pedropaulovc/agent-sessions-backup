@@ -131,6 +131,17 @@ def config_path() -> Path:
     return config_dir() / "config.toml"
 
 
+# Files at/above this size use the R2 multipart upload path instead of a single PUT. Default 90MB
+# sits safely below Cloudflare's 100MB request-body cap (a single PUT of a >=100MB body is rejected
+# at the edge with HTTP 413 before it ever reaches the Worker). Part size is the fixed chunk each
+# part carries; R2 requires every part except the last to be >=5MiB and the same size, so a fixed
+# part size satisfies both rules by construction. 25MB keeps each buffered part well under the hub
+# isolate's 128MB limit.
+DEFAULT_MULTIPART_THRESHOLD_MB = 90.0
+DEFAULT_MULTIPART_PART_SIZE_MB = 25.0
+MIN_PART_SIZE_BYTES = 5 * 1024 * 1024  # R2 hard floor for non-final parts
+
+
 @dataclass
 class Config:
     machine_id: str
@@ -143,6 +154,10 @@ class Config:
     # curl presents via --cert/--key. Written by infra/cf/enroll-cert.sh. Absent for dev auth.
     client_cert_path: str | None = None
     client_key_path: str | None = None
+    # Multipart tuning (MB, float so tests can use sub-MB values). Files >= threshold upload via
+    # the chunked multipart path; each part carries part_size bytes (last part the remainder).
+    multipart_threshold_mb: float = DEFAULT_MULTIPART_THRESHOLD_MB
+    multipart_part_size_mb: float = DEFAULT_MULTIPART_PART_SIZE_MB
     source: Path | None = None
     # Base dir the webcapture staging stores (WEBCAPTURE_STORES) resolve under in
     # store_roots() when a store isn't already in `stores`. None (default, and what every
@@ -156,6 +171,14 @@ class Config:
     # (or any other field) into this slot — every existing call site uses keyword args, and
     # this ordering keeps a future positional mistake impossible rather than merely unlikely.
     staging_base: str | None = None
+
+    @property
+    def multipart_threshold_bytes(self) -> int:
+        return int(self.multipart_threshold_mb * 1024 * 1024)
+
+    @property
+    def multipart_part_size_bytes(self) -> int:
+        return int(self.multipart_part_size_mb * 1024 * 1024)
 
     def __post_init__(self) -> None:
         # machine_id and each store name are single URL path segments in the files API; a '/'
@@ -221,6 +244,14 @@ def _dump_toml(cfg: Config) -> str:
         lines.append(f"exclude = [{items}]")
     else:
         lines.append("# exclude = []  # extra globs, applied on top of built-in security excludes")
+    # Only emit multipart tuning when it differs from the default, so a stock config stays clean but
+    # a customized threshold/part-size round-trips through save().
+    if cfg.multipart_threshold_mb != DEFAULT_MULTIPART_THRESHOLD_MB:
+        lines.append(f"multipart_threshold_mb = {cfg.multipart_threshold_mb}")
+    else:
+        lines.append(f"# multipart_threshold_mb = {DEFAULT_MULTIPART_THRESHOLD_MB}  # files >= this use the multipart upload path")
+    if cfg.multipart_part_size_mb != DEFAULT_MULTIPART_PART_SIZE_MB:
+        lines.append(f"multipart_part_size_mb = {cfg.multipart_part_size_mb}")
     lines.append("")
     lines.append("[stores]")
     for name, root in cfg.stores.items():
@@ -244,6 +275,8 @@ def load(path: Path | str | None = None) -> Config:
         exclude=list(data.get("exclude") or []),
         client_cert_path=data.get("client_cert_path"),
         client_key_path=data.get("client_key_path"),
+        multipart_threshold_mb=float(data.get("multipart_threshold_mb", DEFAULT_MULTIPART_THRESHOLD_MB)),
+        multipart_part_size_mb=float(data.get("multipart_part_size_mb", DEFAULT_MULTIPART_PART_SIZE_MB)),
         source=path,
     )
 
@@ -292,6 +325,8 @@ def enroll(
         stores=dict(existing.stores) if existing is not None else dict(DEFAULT_STORES),
         exclude=list(existing.exclude) if existing is not None else [],
         include_windows_mounts=existing.include_windows_mounts if existing is not None else False,
+        multipart_threshold_mb=existing.multipart_threshold_mb if existing is not None else DEFAULT_MULTIPART_THRESHOLD_MB,
+        multipart_part_size_mb=existing.multipart_part_size_mb if existing is not None else DEFAULT_MULTIPART_PART_SIZE_MB,
     )
     # Register the export-inbox store so an export-only operator (drops a ZIP, runs `run`/`backfill`,
     # never CDP) still gets it scanned + uploaded. setdefault preserves a custom configured root.

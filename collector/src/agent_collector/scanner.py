@@ -141,6 +141,15 @@ def read_exact(path: Path, size: int) -> bytes:
         return f.read(size)
 
 
+def read_range(path: Path, offset: int, length: int) -> bytes:
+    """Read a byte slice [offset, offset+length) — one multipart part — without materializing the
+    whole file. The file is append-only and we only ever read within the [0, size) prefix captured
+    at scan time, so every slice is stable even if the live file keeps growing."""
+    with open(path, "rb") as f:
+        f.seek(offset)
+        return f.read(length)
+
+
 def hash_file_prefix(path: Path, size: int) -> str:
     """Stream the first `size` bytes and return their sha256 without holding them in memory.
 
