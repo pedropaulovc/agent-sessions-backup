@@ -895,6 +895,57 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(await fileState(replaced.fileId)).toBe('pending');
   });
 
+  it('kicks sibling archives BEFORE deleting stale sessions, so a flip failure deletes nothing and loses no sibling (round 6 finding 4, kick-before-delete)', async () => {
+    budgets({ slice: 800, invocation: 800 });
+    // A sibling export in the same 'export-inbox' store, so fileA's cleanup fan-out has a sibling to kick.
+    const sib = await uploadConvs('r6kbd-sib', [conv('r6kbdsib', 0), conv('r6kbdsib', 1)]);
+    await deliverChain({ file_id: sib.fileId, r2_key: sib.r2Key, reason: 'upload', content_hash: sib.hash });
+    expect(await fileState(sib.fileId)).toBe('parsed');
+
+    // fileA: big, then replaced small so its reparse cleanup deletes 4 stale sessions (fires the fan-out).
+    const fileA = await uploadConvs('r6kbd', Array.from({ length: 6 }, (_u, i) => conv('r6kbd', i)));
+    await deliverChain({ file_id: fileA.fileId, r2_key: fileA.r2Key, reason: 'upload', content_hash: fileA.hash });
+    const replaced = await uploadConvs('r6kbd', Array.from({ length: 2 }, (_u, i) => conv('r6kbd', i)));
+
+    // Make the flip of SIB SPECIFICALLY (markPendingAndEnqueue's `UPDATE ... WHERE id = ?1`, no
+    // content_hash — distinct from forcePending's guarded UPDATE) throw ONCE. Targeting sib's id keeps the
+    // test hermetic against the other export-inbox siblings the fan-out also kicks in the full-suite run.
+    const FLIP_SQL = "UPDATE files SET parse_state = 'pending' WHERE id = ?1";
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    let sibFlipThrown = false;
+    testEnv.DB.prepare = ((sql: string) => {
+      const stmt = realPrepare(sql);
+      if (sql !== FLIP_SQL) return stmt;
+      const realBind = stmt.bind.bind(stmt);
+      stmt.bind = (...a: unknown[]) => {
+        if (a[0] === sib.fileId && !sibFlipThrown) {
+          return { run: async () => { sibFlipThrown = true; throw new Error('D1 outage on sibling flip'); } } as unknown as D1PreparedStatement;
+        }
+        return realBind(...a);
+      };
+      return stmt;
+    }) as typeof testEnv.DB.prepare;
+    try {
+      // First cleanup delivery: the kick's flip throws BEFORE any stale delete → retryable, nothing deleted.
+      await deliver({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
+
+      // POSITIVE CONTROL for kick-BEFORE-delete: because the kick runs before the first delete, a flip
+      // failure leaves every stale session intact (fileA still owns all 6). Under the old delete-then-kick
+      // order the 4 stale rows would already be gone here, and the flip failure would strand the sibling
+      // terminal — the exact silent-drop this reorder eliminates.
+      expect(await fileState(replaced.fileId)).toBe('pending');
+      expect(await ownedSessions(replaced.fileId)).toBe(6); // nothing deleted before the kick succeeded
+
+      // Retry (flip works now): siblings flipped 'pending' FIRST, THEN stale deleted → fileA parsed.
+      await deliverChain({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
+    } finally {
+      testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
+    }
+    expect(await fileState(replaced.fileId)).toBe('parsed');
+    expect(await ownedSessions(replaced.fileId)).toBe(2);
+    expect(await fileState(sib.fileId)).toBe('pending'); // sibling kicked for reparse, never stranded terminal
+  });
+
   it('cleanup deletes are atomic hash-guarded: a hash flip between the recheck and the delete batch no-ops them (round 4 finding 3)', async () => {
     budgets({ slice: 800, invocation: 800 });
     const first = await uploadConvs('atom', Array.from({ length: 5 }, (_u, i) => conv('atom', i)));

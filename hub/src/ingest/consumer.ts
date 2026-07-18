@@ -718,6 +718,7 @@ async function runExportParse(
     contentHash !== undefined ? stmt.bind(sessionId, file.id, contentHash) : stmt.bind(sessionId);
   let cursor = cleanupCursor ?? '';
   const recovered = new Set<string>();
+  let kicked = false; // kick sibling archives ONCE per invocation, before the first stale delete
   let cleanupComplete = false;
   while (spent < EXPORT_QUERY_BUDGET) {
     const page = await env.DB.prepare(
@@ -752,6 +753,14 @@ async function runExportParse(
       }
       cursor = session_id; // advance past every row we've decided on (kept OR reconciled)
       if (keep.has(session_id)) continue;
+      // This session is stale and about to be reconciled. Kick sibling archives FIRST (once per
+      // invocation), BEFORE any delete, so an overlapping archive always has a 'pending' message to
+      // re-claim it — the delete can never outrun the recovery (round 6 finding 4). A flip failure raises
+      // ExportRetry here, with nothing deleted yet, so the retry re-runs the page cleanly.
+      if (!kicked) {
+        spent += await kickSiblings(file, env);
+        kicked = true;
+      }
       if (archive.skipped === 0) {
         await env.DB.batch([
           bindCleanup(
@@ -778,41 +787,9 @@ async function runExportParse(
     }
   }
 
-  // Overlapping archives: a session we just deleted OR flipped to 'error' may still live in ANOTHER
-  // export file that once lost ownership to this one (archives keep no files.session_id duplicates for
-  // the normal recovery path to pick from). Re-enqueue the other export-inbox files — on ANY machine,
-  // since conversation ids are globally unique per account and a same-account export can be uploaded from
-  // a different collector — so their reparse re-claims any conversation they still contain; a transient
-  // absence self-heals. Exports are few (one-time backfills), so this fan-out is cheap and rare. Kicked
-  // per cleanup invocation that reconciled something (idempotent: markPendingAndEnqueue re-flips+re-sends).
-  if (recovered.size > 0) {
-    // The sibling SELECT is NOT swallowed: if it throws, let it reach the retryable wrapper (this file goes
-    // 'pending', the cleanup page retries) — swallowing it would let THIS file reach 'parsed' with the
-    // recovered session gone and no sibling kicked (round 6 finding 4).
-    const others = await env.DB.prepare(
-      `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state != 'error'`,
-    )
-      .bind(file.store, file.id)
-      .all<{ id: number; r2_key: string; content_hash: string }>();
-    // markPendingAndEnqueue flips a sibling to 'pending' THEN sends. Keep going through all siblings so one
-    // failure doesn't skip the rest, but distinguish the two failure modes on catch: a SEND failure leaves
-    // the sibling safely 'pending' (files/check re-enqueues it — swallow), while a FLIP failure leaves it
-    // terminal with nothing to re-enqueue it — so retry the whole idempotent cleanup page.
-    let flipFailed = false;
-    for (const other of others.results) {
-      try {
-        await markPendingAndEnqueue(other, 'recover', env);
-      } catch (e) {
-        const row = await env.DB.prepare('SELECT parse_state FROM files WHERE id = ?1').bind(other.id).first<{ parse_state: string }>();
-        console.log(JSON.stringify({ event: 'parse.export.recover_kick_failed', file_id: file.id, sibling: other.id, sibling_state: row?.parse_state ?? null, error: String(e) }));
-        if (row?.parse_state !== 'pending') flipFailed = true;
-      }
-    }
-    if (flipFailed) {
-      await forcePending(file, env, contentHash);
-      throw new ExportRetry('recovery fan-out: a sibling flip failed');
-    }
-  }
+  // Overlapping archives are recovered by kickSiblings ABOVE (called before the first delete of each
+  // invocation), not here — deleting a session before its sibling has a 'pending' recovery message would
+  // reintroduce the window where a lost flip strands the sibling terminal with its rows gone (finding 4).
 
   // Cleanup exhausted the budget with stale rows still remaining: re-enqueue a CLEANUP continuation
   // (offset pinned at the archive length marks the cleanup phase; cleanup_cursor resumes the scan) and
@@ -1044,6 +1021,39 @@ async function raiseExportRetry(file: FileRow, env: Env, written: Set<string>, c
   await forcePending(file, env, contentHash);
   console.log(JSON.stringify({ event: 'parse.export.transient', file_id: file.id, error: String(e) }));
   throw new ExportRetry(String(e));
+}
+
+/** Re-enqueue the sibling export-inbox files (ANY machine — conversation ids are globally unique per
+ * account, and a same-account export can be uploaded from a different collector) so their reparse re-claims
+ * any conversation THIS file is about to delete as stale. Called BEFORE the first delete of a cleanup
+ * invocation (see the call site): a session must never be removed before an overlapping archive has a
+ * NON-terminal ('pending') message to recover it — otherwise a lost flip on the final reconciliation would
+ * strand a sibling terminal with its rows gone, silently dropping them from the index (round 6 finding 4).
+ * Returns the subrequest cost so the cleanup budget still bounds the invocation. markPendingAndEnqueue flips
+ * a sibling to 'pending' THEN sends: a SEND failure after the flip is safe (files/check re-enqueues the
+ * 'pending' row), so it's swallowed; a FLIP failure leaves the sibling terminal, so raise ExportRetry — and
+ * because nothing has been deleted yet, the retry re-runs the whole idempotent cleanup page cleanly. */
+async function kickSiblings(file: FileRow, env: Env): Promise<number> {
+  const others = await env.DB.prepare(
+    `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state != 'error'`,
+  )
+    .bind(file.store, file.id)
+    .all<{ id: number; r2_key: string; content_hash: string }>();
+  let spent = 1; // the sibling SELECT
+  let flipFailed = false;
+  for (const other of others.results) {
+    try {
+      await markPendingAndEnqueue(other, 'recover', env);
+      spent += 2; // flip UPDATE + queue send
+    } catch (e) {
+      const row = await env.DB.prepare('SELECT parse_state FROM files WHERE id = ?1').bind(other.id).first<{ parse_state: string }>();
+      spent += 3; // the attempted flip/send + the state re-check
+      console.log(JSON.stringify({ event: 'parse.export.recover_kick_failed', file_id: file.id, sibling: other.id, sibling_state: row?.parse_state ?? null, error: String(e) }));
+      if (row?.parse_state !== 'pending') flipFailed = true;
+    }
+  }
+  if (flipFailed) throw new ExportRetry('recovery fan-out: a sibling flip failed');
+  return spent;
 }
 
 /** Replace a session's index rows atomically-enough: FTS delete → blocks delete → reinsert → FTS
