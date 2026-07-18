@@ -41,6 +41,26 @@ export async function listMachines(env: Env): Promise<Response> {
  * machine row (register a fingerprint, set priority/is_admin/…) and returns the full roster.
  * There is deliberately NO delete path — decommissioning revokes the cert, it doesn't drop the row
  * (which files/sessions FK-reference). */
+/** Validate the cert fields BEFORE any cert logic, so a malformed value can't slip past the truthy
+ * guards below (which skip on "") into a store or a swap. cert_id, if present, must be a non-empty
+ * string (a "" would be skipped by `if (body.cert_id)` yet stored by `?? existing`, and settle/prune
+ * treat "" as missing → the real cert never gets revoked). cert_fp_sha256, if present, must be 64 hex
+ * chars — a blank/garbage value would flip fpChanged, retire+revoke the REAL certs, and store a value no
+ * CF fingerprint can ever match (permanent lockout by typo). Accept uppercase and normalize to lowercase
+ * IN PLACE (cf.tlsClientAuth's fp is lowercase hex). Returns a 422 Response on any violation, else null. */
+function validateCertFields(body: { cert_id?: string; cert_fp_sha256?: string }): Response | null {
+  if (body.cert_id !== undefined && (typeof body.cert_id !== 'string' || body.cert_id.trim() === '')) {
+    return Response.json({ error: 'invalid_cert_id' }, { status: 422 });
+  }
+  if (body.cert_fp_sha256 !== undefined) {
+    if (typeof body.cert_fp_sha256 !== 'string' || !/^[0-9a-f]{64}$/.test(body.cert_fp_sha256.toLowerCase())) {
+      return Response.json({ error: 'invalid_cert_fp' }, { status: 422 });
+    }
+    body.cert_fp_sha256 = body.cert_fp_sha256.toLowerCase();
+  }
+  return null;
+}
+
 export async function adminMachines(request: Request, env: Env, identity: Identity): Promise<Response> {
   if (identity.kind !== 'machine' || !identity.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
 
@@ -54,6 +74,9 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     is_admin?: boolean;
     priority?: number;
   };
+
+  const invalidCert = validateCertFields(body);
+  if (invalidCert) return invalidCert;
 
   if (body.machine_id) {
     // Two write paths. A request carrying NO cert fields (cert_fp_sha256/cert_id) is a metadata edit
@@ -188,15 +211,27 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
       return Response.json({ error: 'cert_id_requires_fingerprint', machine_id: body.machine_id }, { status: 422 });
     }
 
-    // Verify an admin-supplied cert_id actually belongs to — and is an ACTIVE cert for — the fingerprint
-    // it's being attached to. A wrong/foreign id would be stored as current, copied to prev on the next
-    // rotation, and then the prune would revoke/404 that handle and stamp the REAL fingerprint's
-    // reservation revoked while the actual cert stays CA-valid and reusable. And a fp-matching id whose CA
-    // status is already pending_revocation/revoked would install a machine on a dying cert. Fetch the cert
-    // by id: a mismatch / 404 / unresolvable id → 422 cert_id_fingerprint_mismatch; a non-active status →
-    // 422 cert_id_not_active. Only meaningful with CF creds (the admin worker always has them in prod);
-    // when unconfigured we can't reach the CA and skip — the same deploy state in which renew can't mint.
-    if (body.cert_id && certFp && env.CF_ZONE_ID && env.CF_CLIENT_CERT_TOKEN) {
+    // Verify a body-supplied cert_id that is GENUINELY NEW to this row — i.e. not equal to its own current
+    // or prev handle (those are trusted D1 state for this machine: an idempotent resubmit of the current
+    // id, or a rollback reattaching the prev's own id, needs no CA reach). A genuinely new id could be a
+    // wrong/foreign/dead handle; stored as current it's copied to prev on the next rotation, and the prune
+    // then revokes/404s it and stamps the REAL fingerprint's reservation revoked while the actual cert
+    // stays CA-valid and reusable.
+    const attachingNewCertId =
+      body.cert_id !== undefined && body.cert_id !== (existing?.cert_id ?? null) && body.cert_id !== (existing?.prev_cert_id ?? null);
+    if (attachingNewCertId && certFp && body.cert_id !== undefined) {
+      // FAIL CLOSED when we can't reach the CA to verify: the pre-secret deployment window is exactly when
+      // an arbitrary/dead handle can slip in unverified and later be carried to prev + mis-revoked. 503
+      // (not 422): the request may be perfectly valid — the deploy state just can't verify it yet. In this
+      // same window renew can't mint either, so no legitimate cert_id attach arises from the fleet; only a
+      // raw admin poke can, and that's precisely what must fail closed.
+      if (!env.CF_ZONE_ID || !env.CF_CLIENT_CERT_TOKEN) {
+        console.log(JSON.stringify({ event: 'hub.admin.machines.cert_id_unverifiable', machine: body.machine_id, cert_id: body.cert_id }));
+        return Response.json({ error: 'cert_id_verification_unavailable', cert_id: body.cert_id }, { status: 503 });
+      }
+      // Fetch the cert by id: a mismatch / 404 / unresolvable id → 422 cert_id_fingerprint_mismatch; a
+      // fp-match whose CA status is already pending_revocation/revoked → 422 cert_id_not_active (installing
+      // a machine on a dying cert).
       const ca = await getClientCertFingerprint(env, body.cert_id);
       if (ca === 'not_found' || ca === 'unknown' || ca.fp !== certFp) {
         console.log(JSON.stringify({ event: 'hub.admin.machines.cert_id_unverified', machine: body.machine_id, cert_id: body.cert_id, ca_result: typeof ca === 'string' ? ca : ca.fp }));
