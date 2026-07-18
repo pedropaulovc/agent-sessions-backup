@@ -97,74 +97,118 @@ export async function usage(url: URL, env: Env): Promise<Response> {
   return Response.json({ group_by: groupBy, rows: rows.results });
 }
 
-/** POST /api/v1/admin/reindex — walk R2, upsert files rows, re-enqueue everything. */
+/** POST /api/v1/admin/reindex — walk R2, upsert files rows, re-enqueue everything.
+ *
+ * Per-object subrequests are the constraint here: a Worker invocation gets ~1000 subrequests, and the
+ * 34.7K-object corpus used to spend ~4 per object (machines upsert + files upsert + parsing-flip +
+ * queue send), so the do/while blew the limit and 1101'd on the first page. Everything below is
+ * structured so one page costs a FIXED handful of subrequests regardless of page size:
+ *   - all the D1 writes for a page collapse into two env.DB.batch() calls (each batch is a single
+ *     round trip to D1 — one subrequest — not one per statement);
+ *   - the re-enqueues go through PARSE_QUEUE.sendBatch() in chunks of 100 (the Queues per-call cap).
+ * At R2's max page size of 1000 that is ~14 subrequests/page × ~35 pages ≈ 490 for the whole corpus,
+ * so it now completes in ONE invocation. The reindex_cursor is read on entry (not just written) so a
+ * run that does outgrow one invocation — or one that crashes — resumes from its last persisted page
+ * instead of restarting from zero and failing identically. */
 export async function reindex(request: Request, env: Env, identity: Identity): Promise<Response> {
   if (identity.kind !== 'machine' || !identity.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
   const body = (await request.json().catch(() => ({}))) as { prefix?: string };
   const prefix = body.prefix ?? 'raw/';
 
-  let cursor: string | undefined;
+  // Resume: a crashed/paused run leaves reindex_cursor at the last R2 page it finished. Re-entering
+  // with a live (non-'done') cursor picks up there; a fresh run — or one after a completed 'done' —
+  // starts from the beginning. The cursor is R2's own opaque, prefix-scoped list token.
+  const saved = await env.DB.prepare("SELECT value FROM meta WHERE key = 'reindex_cursor'").first<{ value: string }>();
+  let cursor: string | undefined = saved && saved.value !== 'done' ? saved.value : undefined;
+
   let enqueued = 0;
   do {
-    const page: R2Objects = await env.RAW.list({ prefix, cursor, limit: 500, include: ['customMetadata'] });
+    const page: R2Objects = await env.RAW.list({ prefix, cursor, limit: 1000, include: ['customMetadata'] });
+
+    type Item = { key: string; machineId: string; store: string; relpath: string; det: ReturnType<typeof detect>; contentHash: string; mtime: string | null; size: number };
+    const items: Item[] = [];
     for (const obj of page.objects) {
       const parts = obj.key.split('/'); // raw/{machine}/{store}/{relpath...}
       if (parts.length < 4 || parts[0] !== 'raw') continue;
       const machineId = parts[1]!;
       const store = parts[2]!;
       const relpath = parts.slice(3).join('/');
-      await env.DB.prepare(
-        `INSERT INTO machines (machine_id, os) VALUES (?1, 'unknown') ON CONFLICT (machine_id) DO NOTHING`,
-      )
-        .bind(machineId)
-        .run();
-      const det = detect(store, relpath, machineId);
-      const contentHash = obj.checksums?.sha256 ? hex(obj.checksums.sha256) : 'unknown';
       // R2 doesn't carry files.mtime natively — it's the SOURCE file's mtime, recorded as
       // customMetadata on the object by upload.ts's PUT calls (see r2MtimeMetadata there). A
       // legacy object written before that existed simply has no customMetadata; fall back to
       // NULL rather than clobbering a row's already-known mtime with a wrong value on reindex.
-      const mtime = obj.customMetadata?.mtime ?? null;
-      const row = await env.DB.prepare(
-        `INSERT INTO files (machine_id, store, relpath, r2_key, size, mtime, content_hash, harness, session_id, parse_state)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')
-         ON CONFLICT (machine_id, store, relpath) DO UPDATE SET
-           parse_state = 'pending', size = excluded.size, mtime = COALESCE(excluded.mtime, files.mtime),
-           harness = excluded.harness, session_id = excluded.session_id, content_hash = excluded.content_hash
-         RETURNING id`,
-      )
-        .bind(machineId, store, relpath, obj.key, obj.size, mtime, contentHash, det.harness, det.sessionId ?? null)
-        .first<{ id: number }>();
-      if (det.sessionId) {
-        // Mirrors upload.ts's canonical-reupload fix: this upsert just flipped the row back to
-        // 'pending' (unconditionally, above) and is about to enqueue a fresh parse — if this file
-        // is the session's CURRENT canonical, sessions.index_state (and the blocks/FTS it
-        // advertises) would otherwise stay 'ready', describing whatever this file parsed to
-        // BEFORE this reindex, until the queue consumer gets around to it. No-op for a brand-new
-        // session (no sessions row yet) or a non-canonical duplicate.
-        await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1 AND canonical_file_id = ?2")
-          .bind(det.sessionId, row!.id)
-          .run();
-      } else if (det.kind === 'export-archive') {
-        // An export ZIP has no det.sessionId (it fans out to many per-conversation sessions), so the
-        // flip above never covers it. Mirror upload.ts: this reindex flipped the file to 'pending';
-        // flip every session it is canonical for to 'parsing' so they stop advertising 'ready' over
-        // bytes about to be reparsed.
-        await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE canonical_file_id = ?1")
-          .bind(row!.id)
-          .run();
-      }
-      await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: obj.key, reason: 'reindex', content_hash: contentHash });
-      enqueued++;
+      items.push({
+        key: obj.key,
+        machineId,
+        store,
+        relpath,
+        det: detect(store, relpath, machineId),
+        contentHash: obj.checksums?.sha256 ? hex(obj.checksums.sha256) : 'unknown',
+        mtime: obj.customMetadata?.mtime ?? null,
+        size: obj.size,
+      });
     }
+
+    if (items.length > 0) {
+      // One batch, executed sequentially in a transaction: distinct machine parents first (files.machine_id
+      // is a FK), then every files upsert RETURNING id. We read the ids straight back out of the batch
+      // results to drive the flips and the queue sends — no per-row round trip.
+      const machineIds = [...new Set(items.map((i) => i.machineId))];
+      const machineStmts = machineIds.map((m) =>
+        env.DB.prepare(`INSERT INTO machines (machine_id, os) VALUES (?1, 'unknown') ON CONFLICT (machine_id) DO NOTHING`).bind(m),
+      );
+      const fileStmts = items.map((i) =>
+        env.DB.prepare(
+          `INSERT INTO files (machine_id, store, relpath, r2_key, size, mtime, content_hash, harness, session_id, parse_state)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')
+           ON CONFLICT (machine_id, store, relpath) DO UPDATE SET
+             parse_state = 'pending', size = excluded.size, mtime = COALESCE(excluded.mtime, files.mtime),
+             harness = excluded.harness, session_id = excluded.session_id, content_hash = excluded.content_hash
+           RETURNING id`,
+        ).bind(i.machineId, i.store, i.relpath, i.key, i.size, i.mtime, i.contentHash, i.det.harness, i.det.sessionId ?? null),
+      );
+      const results = await env.DB.batch<{ id: number }>([...machineStmts, ...fileStmts]);
+      const ids = results.slice(machineStmts.length).map((r) => r.results[0]!.id);
+
+      // Mirror upload.ts's canonical-reupload fix in a second batch, now that we hold each row id: the
+      // upserts above flipped every file back to 'pending', so any session those files are CURRENTLY
+      // canonical for must leave 'ready' (it otherwise keeps advertising blocks/FTS from the pre-reindex
+      // parse until the consumer catches up). A session id matches its own canonical; an export ZIP has
+      // no det.sessionId (it fans out to many sessions) so it flips every session it owns. Brand-new
+      // sessions and non-canonical duplicates simply match nothing.
+      const flipStmts = [];
+      for (let k = 0; k < items.length; k++) {
+        const { det } = items[k]!;
+        if (det.sessionId) {
+          flipStmts.push(
+            env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1 AND canonical_file_id = ?2").bind(det.sessionId, ids[k]!),
+          );
+        } else if (det.kind === 'export-archive') {
+          flipStmts.push(env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE canonical_file_id = ?1").bind(ids[k]!));
+        }
+      }
+      if (flipStmts.length > 0) await env.DB.batch(flipStmts);
+
+      // Re-enqueue via sendBatch (≤100 messages/call) instead of one send per file.
+      const messages = items.map((i, k) => ({
+        body: { file_id: ids[k]!, r2_key: i.key, reason: 'reindex' as const, content_hash: i.contentHash },
+      }));
+      for (let start = 0; start < messages.length; start += 100) {
+        await env.PARSE_QUEUE.sendBatch(messages.slice(start, start + 100));
+      }
+      enqueued += items.length;
+    }
+
     cursor = page.truncated ? page.cursor : undefined;
+    // Persist AFTER this page's sends so a crash re-processes at most one page — and reindexing a page
+    // is idempotent (upserts + re-enqueue), so the overlap is harmless.
     await env.DB.prepare("INSERT INTO meta (key, value) VALUES ('reindex_cursor', ?1) ON CONFLICT (key) DO UPDATE SET value = ?1")
       .bind(cursor ?? 'done')
       .run();
   } while (cursor);
 
   console.log(JSON.stringify({ event: 'hub.reindex', enqueued }));
-  return Response.json({ enqueued });
+  return Response.json({ enqueued, done: true });
 }
 
 export function hex(buf: ArrayBuffer): string {

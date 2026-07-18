@@ -1,0 +1,139 @@
+import { env } from 'cloudflare:test';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { reindex } from '../src/api/ops';
+import type { Identity } from '../src/auth/identity';
+
+const testEnv = env as unknown as Env;
+const admin: Identity = { kind: 'machine', machineId: 'reindexbox', isAdmin: true };
+
+function reindexRequest(prefix?: string): Request {
+  return new Request('https://api.sessions.vza.net/api/v1/admin/reindex', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(prefix ? { prefix } : {}),
+  });
+}
+
+/** A minimal R2 object the reindex walker understands: it only reads key/size/checksums/customMetadata. */
+function fakeObject(key: string): R2Object {
+  return { key, size: 10, checksums: {}, customMetadata: {} } as unknown as R2Object;
+}
+
+/** A claude-code session object (detect() gives it a sessionId, exercising the parsing-flip batch). */
+function sessionObject(machine: string): R2Object {
+  return fakeObject(`raw/${machine}/claude/proj/${crypto.randomUUID()}.jsonl`);
+}
+
+/**
+ * Replace RAW.list with a fake that serves pre-split pages and honors the opaque cursor (here just the
+ * next page index as a string) exactly like R2 would — so both the fresh multi-page walk and the
+ * resume-from-cursor path drive real code. Returns the vi mock so callers can inspect the cursors it saw.
+ */
+function stubList(pages: R2Object[][]) {
+  return vi.spyOn(testEnv.RAW, 'list').mockImplementation(async (opts?: R2ListOptions) => {
+    const idx = opts?.cursor ? Number(opts.cursor) : 0;
+    const truncated = idx < pages.length - 1;
+    return {
+      objects: pages[idx] ?? [],
+      truncated,
+      cursor: truncated ? String(idx + 1) : undefined,
+      delimitedPrefixes: [],
+    } as unknown as R2Objects;
+  });
+}
+
+async function seedCursor(value: string): Promise<void> {
+  await testEnv.DB.prepare("INSERT INTO meta (key, value) VALUES ('reindex_cursor', ?1) ON CONFLICT (key) DO UPDATE SET value = ?1")
+    .bind(value)
+    .run();
+}
+
+async function fileCount(machine: string): Promise<number> {
+  const row = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM files WHERE machine_id = ?1 AND parse_state = 'pending'").bind(machine).first<{ n: number }>();
+  return row!.n;
+}
+
+afterEach(() => vi.restoreAllMocks());
+
+describe('admin reindex batches D1 writes + queue sends to fit the whole corpus in one invocation', () => {
+  it('re-enqueues every object across pages using DB.batch + sendBatch (never a per-object send)', async () => {
+    // 150 objects across two pages (100 + 50). The bug fired ~4 subrequests/object; the fix collapses
+    // each page's writes into DB.batch() calls and its sends into sendBatch() chunks of ≤100.
+    const pages = [
+      Array.from({ length: 100 }, () => sessionObject('reindexbox')),
+      Array.from({ length: 50 }, () => sessionObject('reindexbox')),
+    ];
+    const listSpy = stubList(pages);
+    const batchSpy = vi.spyOn(testEnv.DB, 'batch'); // calls through — real rows are written
+    const sendBatchSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'sendBatch');
+    const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
+
+    const res = await reindex(reindexRequest(), testEnv, admin);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ enqueued: 150, done: true });
+
+    // Fresh run (no live cursor) starts at page 0, then follows the cursor to page 1.
+    expect(listSpy.mock.calls.length).toBe(2);
+    expect(listSpy.mock.calls[0]![0]?.cursor).toBeUndefined();
+    expect(listSpy.mock.calls[1]![0]?.cursor).toBe('1');
+
+    // Positive controls — both revert paths of the fix trip an assertion here:
+    //  - revert sendBatch → per-object PARSE_QUEUE.send(): sendSpy fires 150× and the next line fails.
+    //  - revert the files DB.batch → per-row .first(): the largest batch shrinks from page 0's
+    //    "1 machine + 100 files" (101) to just the 100-statement flips batch, tripping the >=101 below.
+    expect(sendSpy).not.toHaveBeenCalled();
+    // O(pages), not O(objects): 2 pages × {files batch, flips batch} = 4, nowhere near 150.
+    expect(batchSpy.mock.calls.length).toBeLessThanOrEqual(4);
+    const biggestBatch = Math.max(...batchSpy.mock.calls.map((c) => (c[0] as unknown[]).length));
+    expect(biggestBatch).toBeGreaterThanOrEqual(101); // page 0's 100 files + their machine parent, one round trip
+
+    // Every sendBatch chunk is within the Queues 100-message cap, and together they cover all 150.
+    let sent = 0;
+    for (const call of sendBatchSpy.mock.calls) {
+      const chunk = call[0] as { body: { reason: string } }[];
+      expect(chunk.length).toBeLessThanOrEqual(100);
+      expect(chunk.length).toBeGreaterThan(0);
+      expect(chunk[0]!.body.reason).toBe('reindex');
+      sent += chunk.length;
+    }
+    expect(sent).toBe(150);
+
+    expect(await fileCount('reindexbox')).toBe(150);
+    const cursor = await testEnv.DB.prepare("SELECT value FROM meta WHERE key = 'reindex_cursor'").first<{ value: string }>();
+    expect(cursor!.value).toBe('done'); // completed run parks at 'done' so the next call starts fresh
+  });
+
+  it('resumes from a persisted cursor, processing only the tail (crash-resume, not restart)', async () => {
+    // A prior invocation crashed after page 0, leaving the cursor at page 1. Re-entry must skip the
+    // head and process only the tail — the original bug re-walked from zero and died identically.
+    const pages = [
+      Array.from({ length: 100 }, () => sessionObject('headbox')), // page 0 — already done, must be skipped
+      Array.from({ length: 40 }, () => sessionObject('tailbox')), // page 1 — the unfinished tail
+    ];
+    const listSpy = stubList(pages);
+    await seedCursor('1');
+
+    const res = await reindex(reindexRequest(), testEnv, admin);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ enqueued: 40, done: true });
+
+    // The first (and only) list call resumes at the saved cursor — the head page is never fetched.
+    expect(listSpy.mock.calls.length).toBe(1);
+    expect(listSpy.mock.calls[0]![0]?.cursor).toBe('1');
+
+    expect(await fileCount('headbox')).toBe(0); // head never reprocessed
+    expect(await fileCount('tailbox')).toBe(40); // only the tail
+  });
+
+  it('treats a completed run (cursor = done) as a fresh start from the beginning', async () => {
+    await seedCursor('done');
+    const pages = [Array.from({ length: 5 }, () => sessionObject('freshbox'))];
+    const listSpy = stubList(pages);
+
+    const res = await reindex(reindexRequest(), testEnv, admin);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ enqueued: 5, done: true });
+    expect(listSpy.mock.calls[0]![0]?.cursor).toBeUndefined(); // started over, not resumed from 'done'
+    expect(await fileCount('freshbox')).toBe(5);
+  });
+});
