@@ -1,0 +1,159 @@
+"""ChatGPT capture: auth check -> paginate the conversation list -> fetch changed conversations.
+
+Reads first-party endpoints via the in-page CDP fetch (cookies included): /api/auth/session to
+detect an expired login, backend-api/conversations to page the list by update watermark, and
+backend-api/conversation/{id} for each conversation whose update_time moved past what we last
+captured. The raw conversation JSON is staged verbatim (the hub parses it); watermarks live in
+the state DB so a re-run only refetches what changed.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+from .cdp import CdpTransport
+from .result import CaptureResult, login_expired_event, valid_conv_id
+
+BASE = "https://chatgpt.com"
+PAGE_LIMIT = 100
+
+
+def capture_chatgpt(transport: CdpTransport, state, staging_root: Path, events: list[dict]) -> CaptureResult:
+    res = CaptureResult(product="chatgpt")
+
+    status, body = transport.fetch(f"{BASE}/api/auth/session")
+    if not _logged_in(status, body):
+        res.logged_in = False
+        events.append(login_expired_event("chatgpt"))
+        return res
+
+    changed = _list_changed(transport, state, res, events, staging_root)
+    staging_root.mkdir(parents=True, exist_ok=True)
+    for conv_id, update_time in changed:
+        # Reject a non-UUID id before it reaches EITHER the fetch URL or the `{conv_id}.json`
+        # staging path — a '/', '..' or absolute-path id (API drift / hostile endpoint) would
+        # otherwise escape staging_root. Never silent: a fetch-failed event is buffered and the
+        # watermark is left untouched, so a since-corrected id is retried next run.
+        if not valid_conv_id(conv_id):
+            res.errors += 1
+            events.append({
+                "level": "warn", "code": "webcapture_fetch_failed",
+                "message": f"chatgpt conversation id rejected (not a uuid): {conv_id!r}",
+                "count": 1, "store": "chatgpt-web",
+            })
+            continue
+        status, body = transport.fetch(f"{BASE}/backend-api/conversation/{conv_id}")
+        # Validate the body is a real conversation BEFORE staging + advancing the watermark: a 200
+        # sign-in/interstitial HTML page would otherwise be staged and the watermark advanced, so
+        # the conversation would never be re-fetched until it changed again.
+        if status != 200 or not _valid_conversation(body):
+            res.errors += 1
+            events.append({
+                "level": "warn", "code": "webcapture_fetch_failed",
+                "message": f"chatgpt conversation {conv_id}: HTTP {status} or non-conversation body",
+                "count": 1, "store": "chatgpt-web",
+            })
+            continue
+        (staging_root / f"{conv_id}.json").write_text(body, encoding="utf-8")
+        state.set_webcapture_watermark("chatgpt", conv_id, update_time)
+        res.captured += 1
+    return res
+
+
+def _valid_conversation(body: str) -> bool:
+    """True only for a JSON object shaped like a ChatGPT conversation (has a `mapping`)."""
+    if not body:
+        return False
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return False
+    return isinstance(data, dict) and isinstance(data.get("mapping"), dict)
+
+
+def _logged_in(status: int, body: str) -> bool:
+    if status != 200 or not body:
+        return False
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return False
+    # A signed-out session returns `{}`; a signed-in one carries a `user` object.
+    return isinstance(data, dict) and bool(data.get("user"))
+
+
+def _list_changed(transport: CdpTransport, state, res: CaptureResult, events: list[dict], staging_root: Path) -> list[tuple[str, str]]:
+    changed: list[tuple[str, str]] = []
+    missing_ts = 0
+    offset = 0
+    while True:
+        url = f"{BASE}/backend-api/conversations?offset={offset}&limit={PAGE_LIMIT}&order=updated"
+        status, body = transport.fetch(url)
+        data = _parse_list(body) if status == 200 else None
+        if status != 200 or data is None:
+            # A non-200, or a 200 that isn't a JSON object (auth/interstitial page, layout drift):
+            # convert to a capture error instead of letting json.loads raise out of the whole
+            # command (which would abort the OTHER product and skip buffering this event).
+            res.errors += 1
+            events.append({
+                "level": "warn", "code": "webcapture_list_failed",
+                "message": f"chatgpt conversation list HTTP {status} at offset {offset}", "count": 1, "store": "chatgpt-web",
+            })
+            break
+        items = data.get("items")
+        if not isinstance(items, list):
+            # 200 with a non-array `items` (interstitial wrapper / layout drift): a capture error,
+            # not a `.get` on a non-dict that raises out of the whole command.
+            res.errors += 1
+            events.append({
+                "level": "warn", "code": "webcapture_list_failed",
+                "message": f"chatgpt conversation list has non-array items at offset {offset}", "count": 1, "store": "chatgpt-web",
+            })
+            break
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            conv_id = it.get("id")
+            if not isinstance(conv_id, str):
+                continue
+            # Fall back to create_time when update_time is absent/renamed. An id-bearing item with
+            # NEITHER timestamp is layout drift, not "unchanged": count it (surfaced after the loop)
+            # rather than silently dropping every item and reporting a clean run that captured nothing.
+            update_time = it.get("update_time") or it.get("create_time")
+            if not update_time:
+                missing_ts += 1
+                continue
+            res.checked += 1
+            prev = state.get_webcapture_watermark("chatgpt", conv_id)
+            # Re-fetch when the watermark advanced OR the local staged file is gone (deleted, or the
+            # staging root moved): a watermark-only check would treat an unchanged-but-unstaged
+            # conversation as captured and it could never be uploaded until it changed remotely.
+            # Re-staging an already-uploaded conv is harmless — the hub dedupes by content hash.
+            staged_missing = valid_conv_id(conv_id) and not (staging_root / f"{conv_id}.json").exists()
+            if prev is None or str(update_time) > prev or staged_missing:
+                changed.append((conv_id, str(update_time)))
+        offset += len(items)
+        total = data.get("total")
+        if not items or (isinstance(total, int) and offset >= total):
+            break
+    if missing_ts:
+        res.errors += 1
+        events.append({
+            "level": "warn", "code": "webcapture_list_failed",
+            "message": f"chatgpt list: {missing_ts} item(s) with no update_time/create_time (layout drift)",
+            "count": missing_ts, "store": "chatgpt-web",
+        })
+    res.changed = len(changed)
+    return changed
+
+
+def _parse_list(body: str):
+    """The conversation-list payload as a dict, or None if the body isn't a JSON object."""
+    if not body:
+        return None
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None

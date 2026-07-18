@@ -118,7 +118,7 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
       )
         .bind(machineId)
         .run();
-      const det = detect(store, relpath);
+      const det = detect(store, relpath, machineId);
       const contentHash = obj.checksums?.sha256 ? hex(obj.checksums.sha256) : 'unknown';
       // R2 doesn't carry files.mtime natively — it's the SOURCE file's mtime, recorded as
       // customMetadata on the object by upload.ts's PUT calls (see r2MtimeMetadata there). A
@@ -144,6 +144,14 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
         // session (no sessions row yet) or a non-canonical duplicate.
         await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1 AND canonical_file_id = ?2")
           .bind(det.sessionId, row!.id)
+          .run();
+      } else if (det.kind === 'export-archive') {
+        // An export ZIP has no det.sessionId (it fans out to many per-conversation sessions), so the
+        // flip above never covers it. Mirror upload.ts: this reindex flipped the file to 'pending';
+        // flip every session it is canonical for to 'parsing' so they stop advertising 'ready' over
+        // bytes about to be reparsed.
+        await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE canonical_file_id = ?1")
+          .bind(row!.id)
           .run();
       }
       await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: obj.key, reason: 'reindex', content_hash: contentHash });

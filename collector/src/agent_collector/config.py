@@ -48,6 +48,16 @@ DEFAULT_STORES: dict[str, str] = {
     "codex": "~/.codex",
 }
 
+# Staging stores the webcapture host writes into (CDP JSON) or an operator drops export ZIPs
+# into. They are ordinary `stores` entries on that host so the normal run/backfill scan uploads
+# them with zero special-casing; other machines never have them, so nothing else changes.
+WEBCAPTURE_STORES = ("chatgpt-web", "claude-web", "export-inbox")
+
+# The export-inbox staging store is registered on EVERY enroll (see _ensure_export_inbox), not just
+# webcapture hosts: an operator can drop an official export ZIP into it and have `run`/`backfill`
+# upload it without ever running CDP capture. The web-capture stores stay webcapture-only.
+EXPORT_INBOX_STORE = "export-inbox"
+
 VALID_AUTH = ("dev", "mtls")
 
 
@@ -106,6 +116,17 @@ def config_dir() -> Path:
     return base / "agent-collector"
 
 
+def data_dir() -> Path:
+    xdg = os.environ.get("XDG_DATA_HOME")
+    base = Path(xdg) if xdg else Path.home() / ".local" / "share"
+    return base / "agent-collector"
+
+
+def webcapture_dir() -> Path:
+    """Local root under which webcapture stages raw conversation JSON (one subdir per store)."""
+    return data_dir() / "webcapture"
+
+
 def config_path() -> Path:
     return config_dir() / "config.toml"
 
@@ -138,7 +159,14 @@ class Config:
         """Resolved roots to actually scan. Under WSL with include_windows_mounts=false,
         roots resolving under /mnt/<drive>/ are dropped so a WSL install never captures the
         Windows side as the WSL machine (see dropped_store_roots for what was skipped)."""
-        roots = {name: Path(root).expanduser() for name, root in self.stores.items()}
+        stores = dict(self.stores)
+        # Always expose the webcapture staging stores (setdefault: a custom configured root wins).
+        # This is the load-layer fix for the "registered only at enroll/webcapture" hole: an
+        # already-enrolled collector that upgrades and drops an export ZIP, or a webcapture host, is
+        # scanned without a re-enroll. Missing dirs are simply skipped by run/scanner (root.exists()).
+        for name in WEBCAPTURE_STORES:
+            stores.setdefault(name, str(webcapture_dir() / name))
+        roots = {name: Path(root).expanduser() for name, root in stores.items()}
         if not self._drop_windows_mounts():
             return roots
         return {n: p for n, p in roots.items() if not _root_is_windows_mount(p)}
@@ -252,6 +280,9 @@ def enroll(
         exclude=list(existing.exclude) if existing is not None else [],
         include_windows_mounts=existing.include_windows_mounts if existing is not None else False,
     )
+    # Register the export-inbox store so an export-only operator (drops a ZIP, runs `run`/`backfill`,
+    # never CDP) still gets it scanned + uploaded. setdefault preserves a custom configured root.
+    carried["stores"].setdefault(EXPORT_INBOX_STORE, str(webcapture_dir() / EXPORT_INBOX_STORE))
     if dev:
         cfg = Config(machine_id=resolved_id, hub_url=hub_url.rstrip("/"), auth="dev", **carried)
     else:
@@ -275,3 +306,26 @@ def enroll(
     path.write_text(_dump_toml(cfg))
     cfg.source = path
     return cfg
+
+
+def save(cfg: Config, path: Path | str | None = None) -> None:
+    """Persist a config back to disk (round-trips every field via _dump_toml)."""
+    path = Path(path) if path else (cfg.source or config_path())
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_dump_toml(cfg))
+    cfg.source = path
+
+
+def ensure_webcapture_stores(cfg: Config, path: Path | str | None = None) -> list[str]:
+    """Register the webcapture staging stores in the config (idempotent) so the normal run
+    path uploads them. Returns the store names newly added (persists the config if any were).
+    The roots point under webcapture_dir(); the directories are created by the caller."""
+    base = webcapture_dir()
+    added: list[str] = []
+    for name in WEBCAPTURE_STORES:
+        if name not in cfg.stores:
+            cfg.stores[name] = str(base / name)
+            added.append(name)
+    if added:
+        save(cfg, path)
+    return added

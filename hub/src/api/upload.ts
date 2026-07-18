@@ -14,6 +14,30 @@ function r2MtimeMetadata(mtime: string | null): Record<string, string> | undefin
   return mtime !== null ? { mtime } : undefined;
 }
 
+/** A legacy row (created before a detect() change / before machine-scoped prompt-log ids) can sit
+ * TERMINAL 'skipped' with a stale/NULL harness/session_id even though its bytes are unchanged. On
+ * any same-hash resync — a PUT of identical bytes OR a files/check batch — re-run detect() and, when
+ * the stored identity is stale (or a 'skipped' row is now recognized), restamp those columns in
+ * place. Returns whether a restamp was applied so BOTH resync paths can fold it into their
+ * re-enqueue decision (a terminal-but-restamped row must still be requeued to finally index).
+ * detect() is pure/cheap and only reached on a resync, never a steady-state upload. */
+async function restampIfStale(
+  row: { id: number; parse_state: string; harness: string | null; session_id: string | null },
+  store: string,
+  relpath: string,
+  machineId: string,
+  env: Env,
+): Promise<boolean> {
+  const det = detect(store, relpath, machineId);
+  const identityStale = det.harness !== row.harness || (det.sessionId ?? null) !== row.session_id;
+  const skippedButNowRecognized = row.parse_state === 'skipped' && det.harness !== 'unknown';
+  if (!identityStale && !skippedButNowRecognized) return false;
+  await env.DB.prepare('UPDATE files SET harness = ?2, session_id = ?3 WHERE id = ?1')
+    .bind(row.id, det.harness, det.sessionId ?? null)
+    .run();
+  return true;
+}
+
 /** PUT /api/v1/files/{machine_id}/{store}/{relpath...} */
 export async function putFile(
   request: Request,
@@ -47,29 +71,35 @@ export async function putFile(
   if (!request.body) return Response.json({ error: 'missing_body' }, { status: 400 });
 
   const existing = await env.DB.prepare(
-    'SELECT id, content_hash, parse_state, r2_key FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
+    'SELECT id, content_hash, parse_state, r2_key, harness, session_id FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
   )
     .bind(machineId, store, relpath)
-    .first<{ id: number; content_hash: string; parse_state: string; r2_key: string }>();
+    .first<{ id: number; content_hash: string; parse_state: string; r2_key: string; harness: string | null; session_id: string | null }>();
   if (existing && existing.content_hash === sha256) {
+    // Restamp a legacy row whose stored identity drifted (see restampIfStale) before deciding
+    // whether this unchanged upload still needs a re-enqueue.
+    const restamped = await restampIfStale(existing, store, relpath, machineId, env);
     // A matching hash normally means nothing to do — but the raw R2 object can be lost, missing,
-    // OR CORRUPT (present at the key with the wrong bytes — e.g. a bad manual restore outside
-    // this API) independent of parse_state, even for a row already 'parsed'. Head it on every
-    // same-hash resync, not just non-terminal ones, and compare R2's own sha256 checksum against
-    // existing.content_hash: restore from the request body on absence OR mismatch/missing
-    // checksum, mirroring the same verification files/check does. This path only fires on a
-    // resync (not steady-state uploads), so the extra R2 op is cheap relative to leaving /raw and
-    // normalized session loads permanently reading wrong or missing bytes.
+    // OR CORRUPT (present at the key with the wrong bytes — e.g. a bad manual restore outside this
+    // API) independent of parse_state, even for a row already 'parsed'. Restore from the request
+    // body on absence OR checksum mismatch, mirroring files/check's verification. Route it through
+    // convergeR2WithRow (same idiom the changed-hash path uses on its way out) so the restore is
+    // HASH-GUARDED: a stale same-hash retry of OLD bytes that raced a changed-hash upload which
+    // already advanced the row + converged R2 to the new bytes bails instead of clobbering R2 with
+    // the old body. This path only fires on a resync (not steady-state uploads), so buffering the
+    // body + the extra R2 op is cheap relative to leaving /raw and session loads reading wrong bytes.
     let restored = false;
-    const head = await env.RAW.head(existing.r2_key);
-    const headChecksum = head?.checksums.sha256 ? hex(head.checksums.sha256) : undefined;
-    if (!head || headChecksum !== existing.content_hash) {
-      try {
-        await env.RAW.put(existing.r2_key, request.body, { sha256, customMetadata: r2MtimeMetadata(mtime) });
-      } catch (e) {
-        return Response.json({ error: 'checksum_or_write_failure', detail: String(e) }, { status: 400 });
-      }
-      restored = true;
+    let bodyBuf: ArrayBuffer;
+    try {
+      bodyBuf = await request.arrayBuffer();
+    } catch (e) {
+      return Response.json({ error: 'body_read_failure', detail: String(e) }, { status: 400 });
+    }
+    try {
+      restored = await convergeR2WithRow(existing.id, existing.r2_key, existing.content_hash, bodyBuf, env);
+    } catch (e) {
+      // R2 rejects a body whose bytes don't match the declared sha256 (corrupt/truncated retry).
+      return Response.json({ error: 'checksum_or_write_failure', detail: String(e) }, { status: 400 });
     }
     // A non-terminal state (a dropped/failed queue message) never finished indexing in the
     // first place; a just-restored object needs its (possibly different) bytes revalidated even
@@ -78,9 +108,9 @@ export async function putFile(
     // (e.g. 'parsed'/'skipped') would stay terminal while its parse message is in flight, and if
     // PARSE_QUEUE.send fails (or the message is later dropped), a client retry would see
     // 'unchanged' with the now-correct checksum and never requeue, same for files/check.
-    if (!TERMINAL_PARSE_STATES.has(existing.parse_state) || restored) {
+    if (restamped || restored || !TERMINAL_PARSE_STATES.has(existing.parse_state)) {
       await markPendingAndEnqueue(existing, 'upload', env);
-      return Response.json({ status: 'unchanged', file_id: existing.id, requeued: true, restored });
+      return Response.json({ status: 'unchanged', file_id: existing.id, requeued: true, restored, restamped });
     }
     return Response.json({ status: 'unchanged', file_id: existing.id });
   }
@@ -107,12 +137,19 @@ export async function putFile(
     return Response.json({ error: 'checksum_or_write_failure', detail: String(e) }, { status: 400 });
   }
 
-  const det = detect(store, relpath);
+  // machineId is required so machine-global files (history.jsonl, identical relpath fleet-wide)
+  // get a machine-scoped session_id stamped on the row — otherwise canonical/recovery/parsing
+  // queries (which look files up BY session_id) can't find them.
+  const det = detect(store, relpath, machineId);
   const row = await env.DB.prepare(
     `INSERT INTO files (machine_id, store, relpath, r2_key, size, mtime, content_hash, harness, session_id, parse_state)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')
      ON CONFLICT (machine_id, store, relpath) DO UPDATE SET
        size = excluded.size, mtime = excluded.mtime, content_hash = excluded.content_hash,
+       -- Refresh harness/session_id too: a row created before machine-scoped prompt-log ids
+       -- existed (or before a detect() change) would otherwise keep a stale/NULL session_id even
+       -- after re-upload, so canonical/recovery queries that join on files.session_id miss it.
+       harness = excluded.harness, session_id = excluded.session_id,
        parse_state = 'pending', parse_error = NULL,
        uploaded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
      RETURNING id`,
@@ -145,10 +182,16 @@ export async function putFile(
     // ready content indefinitely. Flip to 'parsing' now: an honest in-progress signal, and if the
     // message never arrives, the session is visibly stuck 'parsing' (already alertable via
     // /status) instead of silently stale-'ready'. No-op for a brand-new session (no sessions row
-    // yet) or a non-canonical duplicate (canonical_file_id != this file's id).
-    await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1 AND canonical_file_id = ?2")
-      .bind(det.sessionId, row!.id)
-      .run();
+    // yet) or a non-canonical duplicate (canonical_file_id != this file's id). Hash-guarded against
+    // the concurrent-upsert-loser race — see flipOwnedSessionsToParsing.
+    await flipOwnedSessionsToParsing(row!.id, det.sessionId, sha256, env);
+  } else if (det.kind === 'export-archive') {
+    // An export ZIP fans out to many per-conversation sessions and carries no det.sessionId, so the
+    // single-session flip above never runs. A changed-hash re-upload already overwrote the ZIP; flip
+    // every session this archive is canonical for to 'parsing' so /search and /sessions stop
+    // advertising the OLD bytes' blocks as 'ready' until the reparse lands (or, if the message is
+    // dropped, the sessions are visibly stuck 'parsing' — alertable — instead of silently stale).
+    await flipOwnedSessionsToParsing(row!.id, null, sha256, env);
   }
   await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
 
@@ -166,15 +209,53 @@ export async function putFile(
  * identical to what a real interleaving would produce, and this function is exactly what each
  * request runs to detect and repair it.
  */
-export async function convergeR2WithRow(fileId: number, r2Key: string, sha256: string, body: ArrayBuffer, env: Env): Promise<void> {
+/**
+ * Flip the sessions a just-reuploaded file owns to index_state='parsing' — but ONLY while the file
+ * row still carries THIS upload's content_hash. Two concurrent changed-hash uploads for the same
+ * path upsert the SAME row; the upsert LOSER can reach the flip after the winner's hash already owns
+ * the row (and the winner may have parsed it back to 'ready'). An unguarded flip would knock those
+ * sessions to 'parsing' while the loser's stale queue message is rejected by parseOne's content_hash
+ * guard — stranding them 'parsing' forever. The EXISTS makes the check+flip atomic in one statement.
+ * sessionId set = single-session harness (filter by session_id too); null = export archive (fans out
+ * to every session it's canonical for). Exported so tests can drive the loser end-state directly (row
+ * hash already advanced to another request's) the same way convergeR2WithRow's tests do.
+ */
+export async function flipOwnedSessionsToParsing(
+  fileId: number,
+  sessionId: string | null,
+  sha256: string,
+  env: Env,
+): Promise<void> {
+  if (sessionId !== null) {
+    await env.DB.prepare(
+      "UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1 AND canonical_file_id = ?2 AND EXISTS (SELECT 1 FROM files WHERE id = ?2 AND content_hash = ?3)",
+    )
+      .bind(sessionId, fileId, sha256)
+      .run();
+    return;
+  }
+  await env.DB.prepare(
+    "UPDATE sessions SET index_state = 'parsing' WHERE canonical_file_id = ?1 AND EXISTS (SELECT 1 FROM files WHERE id = ?1 AND content_hash = ?2)",
+  )
+    .bind(fileId, sha256)
+    .run();
+}
+
+// Returns whether it (re)wrote R2. The `content_hash !== sha256` guard is load-bearing for BOTH
+// callers: a changed-hash upload converging on its way out, AND a same-hash restore — a stale
+// same-hash retry of OLD bytes that raced a changed-hash upload which already advanced the row and
+// converged R2 to the new bytes must NOT write the old body back (the row no longer carries its
+// hash), or R2 would serve old content while D1 claims the new hash.
+export async function convergeR2WithRow(fileId: number, r2Key: string, sha256: string, body: ArrayBuffer, env: Env): Promise<boolean> {
   const current = await env.DB.prepare('SELECT content_hash, mtime FROM files WHERE id = ?1')
     .bind(fileId)
     .first<{ content_hash: string; mtime: string | null }>();
-  if (current?.content_hash !== sha256) return;
+  if (current?.content_hash !== sha256) return false;
   const head = await env.RAW.head(r2Key);
   const headChecksum = head?.checksums.sha256 ? hex(head.checksums.sha256) : undefined;
-  if (headChecksum === sha256) return;
+  if (headChecksum === sha256) return false;
   await env.RAW.put(r2Key, body, { sha256, customMetadata: r2MtimeMetadata(current.mtime) });
+  return true;
 }
 
 /** POST /api/v1/files/check — batch resync: which of these does the hub NOT have? */
@@ -190,10 +271,19 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
     const binds: unknown[] = [identity.machineId];
     for (const it of chunk) binds.push(it.store, it.relpath, it.sha256.replace(/^sha256:/, '').toLowerCase());
     const rows = await env.DB.prepare(
-      `SELECT id, store, relpath, r2_key, parse_state, content_hash FROM files WHERE machine_id = ?1 AND (${conditions.join(' OR ')})`,
+      `SELECT id, store, relpath, r2_key, parse_state, content_hash, harness, session_id FROM files WHERE machine_id = ?1 AND (${conditions.join(' OR ')})`,
     )
       .bind(...binds)
-      .all<{ id: number; store: string; relpath: string; r2_key: string; parse_state: string; content_hash: string }>();
+      .all<{
+        id: number;
+        store: string;
+        relpath: string;
+        r2_key: string;
+        parse_state: string;
+        content_hash: string;
+        harness: string | null;
+        session_id: string | null;
+      }>();
     // Keyed by store+relpath+hash, not just path: the D1 query above ORs together each item's
     // OWN (store, relpath, hash) condition, so a returned row only proves THAT SPECIFIC hash
     // matched. Keying by path alone would let one item's match get reused by a sibling item in
@@ -223,10 +313,13 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
         missing.push({ store: it.store, relpath: it.relpath });
         continue;
       }
-      // The raw bytes are already in R2 — a matching hash means present, but a row stuck at a
-      // non-terminal parse_state (lost/exhausted queue message) would otherwise never get
-      // reindexed: the collector sees "present" and never re-uploads, so nothing else requeues it.
-      if (!TERMINAL_PARSE_STATES.has(row.parse_state)) {
+      // The raw bytes are already in R2 — a matching hash means present, but the row still needs a
+      // re-enqueue in two cases the collector can't see (it got "present" and won't re-upload):
+      //  - a non-terminal parse_state (lost/exhausted queue message) that never finished indexing;
+      //  - a TERMINAL legacy row whose identity we just restamped (same as the PUT same-hash branch)
+      //    — otherwise a 'skipped' history.jsonl row with NULL harness/session_id stays unindexed.
+      const restamped = await restampIfStale(row, row.store, row.relpath, identity.machineId, env);
+      if (restamped || !TERMINAL_PARSE_STATES.has(row.parse_state)) {
         await markPendingAndEnqueue(row, 'upload', env);
       }
     }

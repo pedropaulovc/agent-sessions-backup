@@ -1,7 +1,12 @@
 import { readJsonlLines } from '../ingest/jsonl';
+import { isWebHarness } from '../ingest/parse';
 import type { NormalizedBlock, NormalizedSession, NormalizedTurn } from '../ingest/normalize';
+import { parseChatgptWeb } from '../ingest/parsers/chatgpt-web';
 import { parseClaudeCode } from '../ingest/parsers/claude-code';
+import { parseClaudeWeb } from '../ingest/parsers/claude-web';
 import { parseCodex } from '../ingest/parsers/codex';
+import { parseConversationById } from '../ingest/parsers/export-inbox';
+import { parsePromptLog } from '../ingest/parsers/history';
 import { esc, pageFoot, pageHead, q } from './layout';
 
 /** Turns per page. Pages are turn_index buckets [(p-1)*SIZE, p*SIZE), so a block's page is floor(turn_index/SIZE)+1. */
@@ -173,6 +178,29 @@ async function parseRange(
   endByte: number | undefined,
   env: Env,
 ): Promise<NormalizedSession | null> {
+  // Single-document formats (web conversations, export archives) can't be byte-range read — a
+  // slice of one JSON object doesn't parse. Read the whole object and window by turn offset
+  // instead (offsets are monotonic with turn_index, so the same [startByte, endByte) still
+  // selects exactly this page's turns). Conversation-sized files make the full reparse cheap.
+  if (file.store === 'export-inbox') {
+    const obj = await env.RAW.get(file.r2_key);
+    if (!obj) return null;
+    // Extract + parse ONLY this conversation, not the whole archive: parseExportArchive() would
+    // inflate and parse every conversation in the ZIP (potentially hundreds) on every page view. The
+    // shared parseConversationById reuses the same conversations.json-only inflation as /raw and
+    // parses the conversation from the identical JSON.stringify(conv) ingest used, so the stored
+    // per-conversation byte offsets still line up with windowTurns.
+    const full = parseConversationById(new Uint8Array(await obj.arrayBuffer()), sessionId);
+    return full ? windowTurns(full, startByte, endByte) : null;
+  }
+  if (isWebHarness(harness)) {
+    const obj = await env.RAW.get(file.r2_key);
+    if (!obj) return null;
+    const text = await obj.text();
+    const full = harness === 'chatgpt-web' ? parseChatgptWeb(text, sessionId) : parseClaudeWeb(text, sessionId);
+    return windowTurns(full, startByte, endByte);
+  }
+
   const range =
     startByte === undefined
       ? undefined
@@ -182,7 +210,24 @@ async function parseRange(
   const obj = range ? await env.RAW.get(file.r2_key, { range }) : await env.RAW.get(file.r2_key);
   if (!obj) return null;
   const lines = readJsonlLines(obj.body, startByte ?? 0);
-  return harness === 'codex' ? parseCodex(lines, sessionId) : parseClaudeCode(lines, sessionId);
+  if (harness === 'codex') return parseCodex(lines, sessionId);
+  if (harness === 'prompt-log') return parsePromptLog(lines, sessionId);
+  return parseClaudeCode(lines, sessionId);
+}
+
+/**
+ * Restrict a whole-document parse to the turns of one page. Turn byte offsets are monotonic with
+ * turn_index, and [startByte, endByte) came from the same D1 blocks (firstByteFrom), so filtering
+ * by the first block's byte offset reproduces exactly the JSONL byte-window contract: the page's
+ * content turns, in order, for the render loop to zip against its authoritative D1 rows.
+ */
+function windowTurns(s: NormalizedSession, startByte: number | undefined, endByte: number | undefined): NormalizedSession {
+  if (startByte === undefined) return s;
+  s.turns = s.turns.filter((t) => {
+    const bs = t.blocks[0]?.byteStart ?? t.byteStart ?? 0;
+    return bs >= startByte && (endByte === undefined || bs < endByte);
+  });
+  return s;
 }
 
 function renderTurn(

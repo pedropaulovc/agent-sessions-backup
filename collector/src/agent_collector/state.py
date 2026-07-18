@@ -51,6 +51,14 @@ CREATE TABLE IF NOT EXISTS pending_events (
   created_at TEXT NOT NULL
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS webcapture_convs (
+  product TEXT NOT NULL,          -- chatgpt | claude
+  conv_id TEXT NOT NULL,
+  updated_at TEXT NOT NULL,       -- the conversation's server-side update watermark last captured
+  captured_at TEXT NOT NULL,
+  PRIMARY KEY (product, conv_id)
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT
@@ -316,6 +324,27 @@ class State:
         return int(
             self.conn.execute("SELECT COUNT(*) FROM pending_events").fetchone()[0]
         )
+
+    # -- webcapture watermarks --------------------------------------------
+    def get_webcapture_watermark(self, product: str, conv_id: str) -> str | None:
+        """The conversation's last-captured update watermark, or None if never captured."""
+        row = self.conn.execute(
+            "SELECT updated_at FROM webcapture_convs WHERE product = ? AND conv_id = ?",
+            (product, conv_id),
+        ).fetchone()
+        return row["updated_at"] if row else None
+
+    def set_webcapture_watermark(self, product: str, conv_id: str, updated_at: str) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO webcapture_convs (product, conv_id, updated_at, captured_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (product, conv_id) DO UPDATE SET
+              updated_at = excluded.updated_at, captured_at = excluded.captured_at
+            """,
+            (product, conv_id, updated_at, now_iso()),
+        )
+        self.conn.commit()
 
 
 class OverlapLock:

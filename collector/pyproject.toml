@@ -5,6 +5,10 @@ description = "Per-machine collector: incremental session-file uploads, heartbea
 requires-python = ">=3.12"
 dependencies = []
 
+[project.optional-dependencies]
+# Only the webcapture host needs a websocket client; the base collector stays dependency-free.
+webcapture = ["websocket-client>=1.7"]
+
 [project.scripts]
 agent-collector = "agent_collector.cli:main"
 
