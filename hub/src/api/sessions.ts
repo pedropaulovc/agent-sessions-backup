@@ -126,7 +126,38 @@ export async function getSessionRaw(sessionId: string, request: Request, env: En
   });
 }
 
-/** GET /api/v1/sessions — metadata list, or format=ndjson streaming full normalized sessions. */
+/**
+ * `indexed_through` scoped to the request's own machine/harness filter (not the whole
+ * fleet), so a caller filtering to one machine or harness gets a freshness signal that
+ * actually describes the data they asked for: machine filter -> that machine's own
+ * last_seen_at; harness filter -> MIN over machines that have EVER produced a session of
+ * that harness (a machine with zero sessions of the filtered harness can't make the signal
+ * look stale for a report that will never include it); no filter -> fleet-wide MIN, same as
+ * before. `machine` wins if both are given — it's the more specific, unambiguous filter.
+ */
+async function computeIndexedThrough(env: Env, p: URLSearchParams): Promise<string | null> {
+  const machine = p.get('machine');
+  const harness = p.get('harness');
+  const row = await (machine
+    ? env.DB.prepare(`SELECT MIN(COALESCE(last_seen_at, created_at)) AS t FROM machines WHERE machine_id = ?1`).bind(machine)
+    : harness
+      ? env.DB
+          .prepare(
+            `SELECT MIN(COALESCE(last_seen_at, created_at)) AS t FROM machines
+             WHERE machine_id IN (SELECT DISTINCT machine_id FROM sessions WHERE harness = ?1)`,
+          )
+          .bind(harness)
+      : env.DB.prepare(`SELECT MIN(COALESCE(last_seen_at, created_at)) AS t FROM machines`)
+  ).first<{ t: string | null }>();
+  return row?.t ?? null;
+}
+
+/** GET /api/v1/sessions — metadata list (one page + cursor), or format=ndjson streaming the
+ * COMPLETE filtered set of full normalized sessions across as many internal pages as needed
+ * (that's the point of the bulk format — a daily-report caller shouldn't have to paginate a
+ * stream). `limit` is a page-size cap either way (default 200, hard max 1000 via
+ * clampLimit); for JSON it bounds one response's `sessions` array, for ndjson it's the
+ * internal per-page fetch size only — it does not cap how many lines the stream emits. */
 export async function listSessions(url: URL, env: Env): Promise<Response> {
   const p = url.searchParams;
   const filters: string[] = [];
@@ -143,44 +174,79 @@ export async function listSessions(url: URL, env: Env): Promise<Response> {
   if (p.get('repo')) add((n) => `repo_url = ?${n}`, p.get('repo'));
   const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
   const limit = clampLimit(p.get('limit'), 200, 1000);
+  // started_at alone isn't a stable sort key — real data can share a timestamp (bulk
+  // backfill, synthetic/imported sessions), which would let OFFSET-based paging skip or
+  // repeat rows across a page boundary that lands mid-tie. session_id as a tiebreak makes
+  // the ordering total, so paging is deterministic regardless of how many sessions share a
+  // started_at.
+  const orderBy = 'ORDER BY started_at DESC, session_id ASC';
 
-  const rows = await env.DB.prepare(
-    `SELECT * FROM sessions ${where} ORDER BY started_at DESC LIMIT ${limit}`,
-  )
-    .bind(...binds)
-    .all<SessionRow>();
-
-  const indexedThrough = await env.DB.prepare(
-    `SELECT MIN(COALESCE(last_seen_at, created_at)) AS t FROM machines`,
-  ).first<{ t: string | null }>();
+  const indexedThrough = await computeIndexedThrough(env, p);
 
   if (p.get('format') !== 'ndjson') {
+    const offset = decodeCursor(p.get('cursor'));
+    const rows = await env.DB.prepare(`SELECT * FROM sessions ${where} ${orderBy} LIMIT ${limit + 1} OFFSET ${offset}`)
+      .bind(...binds)
+      .all<SessionRow>();
+    const hasMore = rows.results.length > limit;
+    const page = hasMore ? rows.results.slice(0, limit) : rows.results;
     return Response.json(
-      { sessions: rows.results, indexed_through: indexedThrough?.t ?? null },
-      { headers: { 'x-indexed-through': indexedThrough?.t ?? '' } },
+      { sessions: page, indexed_through: indexedThrough, cursor: hasMore ? encodeCursor(offset + limit) : undefined },
+      { headers: { 'x-indexed-through': indexedThrough ?? '' } },
     );
   }
 
   const encoder = new TextEncoder();
-  const sessions = rows.results;
-  // One archive parse per export ZIP per request, shared across all its conversations' rows.
+  // One archive parse per export ZIP per request, shared across all its conversations' rows
+  // AND across every internal page below (a ZIP's sessions can span a page boundary).
   const archiveCache = new Map<string, ExportArchive>();
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      for (const row of sessions) {
-        const normalized = await loadNormalized(row.session_id, env, archiveCache).catch(() => null);
-        controller.enqueue(encoder.encode(`${JSON.stringify({ meta: row, session: normalized })}\n`));
+      let offset = 0;
+      let total = 0;
+      for (;;) {
+        const rows = await env.DB.prepare(`SELECT * FROM sessions ${where} ${orderBy} LIMIT ${limit} OFFSET ${offset}`)
+          .bind(...binds)
+          .all<SessionRow>();
+        for (const row of rows.results) {
+          const normalized = await loadNormalized(row.session_id, env, archiveCache).catch(() => null);
+          controller.enqueue(encoder.encode(`${JSON.stringify({ meta: row, session: normalized })}\n`));
+        }
+        total += rows.results.length;
+        if (rows.results.length < limit) break; // last page was short -> exhausted
+        offset += limit;
       }
+      console.log(JSON.stringify({ event: 'access.bulk', count: total }));
       controller.close();
     },
   });
-  console.log(JSON.stringify({ event: 'access.bulk', count: sessions.length }));
   return new Response(stream, {
     headers: {
       'content-type': 'application/x-ndjson; charset=utf-8',
-      'x-indexed-through': indexedThrough?.t ?? '',
+      'x-indexed-through': indexedThrough ?? '',
     },
   });
+}
+
+/** Opaque pagination cursor: a base64-encoded OFFSET. Shared by /api/v1/sessions and
+ * /api/v1/search (search.ts imports these) so both endpoints' cursors have the identical
+ * shape and failure behavior — a hand-edited or stale cursor resets to the first page
+ * instead of 500ing. Lives here (not search.ts) because sessions.ts is the base
+ * query-helpers module search.ts already imports from (clampLimit, normalizeToBound);
+ * putting it there instead would make the two files import each other. */
+export function encodeCursor(offset: number): string {
+  return btoa(String(offset));
+}
+export function decodeCursor(cursor: string | null): number {
+  if (!cursor) return 0;
+  let decoded: string;
+  try {
+    decoded = atob(cursor);
+  } catch {
+    return 0;
+  }
+  const n = Number(decoded);
+  return Number.isSafeInteger(n) && n >= 0 ? n : 0;
 }
 
 /** Clamp a user-supplied limit to [1, max], falling back to dflt for missing/non-positive/NaN input. */
