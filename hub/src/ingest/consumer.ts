@@ -61,12 +61,26 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
       }
       invocationSpent += EXPORT_QUERY_BUDGET; // reserve worst-case on ATTEMPT, before any work
       if (invocationSpent >= INVOCATION_SUBREQUEST_BUDGET) deferRest = true;
+    } else {
+      // Same reserve-on-attempt for a NORMAL transcript (Codex round 8): the invocation budget used to be
+      // charged only AFTER parseOne returned, so a chatty transcript could enter the write path with almost
+      // no headroom and issue hundreds of D1 batches past the cap the guard exists to enforce. Reserve
+      // NORMAL_RESERVE up front; if that would cross the cap AND work already ran this invocation, DEFER.
+      // The invocationSpent > 0 guard is the same first-message livelock exception exports use — the
+      // first/sole message of an invocation must always run, or a single reservation over the cap would
+      // defer it forever. The reservation is reconciled to the actual cost on return below.
+      if (invocationSpent > 0 && invocationSpent + NORMAL_RESERVE >= INVOCATION_SUBREQUEST_BUDGET) {
+        await deferMessage(msg, env);
+        deferRest = true;
+        continue;
+      }
+      invocationSpent += NORMAL_RESERVE; // reserve worst-case on ATTEMPT, before any work
     }
     try {
       const spent = await parseOne(msg.body, env);
       msg.ack();
       if (!isExport) {
-        invocationSpent += spent;
+        invocationSpent += spent - NORMAL_RESERVE; // release the up-front reserve, charge the ACTUAL cost
         if (invocationSpent >= INVOCATION_SUBREQUEST_BUDGET) deferRest = true;
       }
     } catch (e) {
@@ -220,7 +234,16 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
   if (det.kind === 'export-archive') {
     // The one-export-slice-per-invocation reservation is applied by consumeParseBatch before we get here;
     // the actual per-invocation subrequest count comes back from parseExportInto for the batch budget.
-    return 2 + (await parseExportInto(file, env, job.reason, job.content_hash, job.offset ?? 0, job.cleanup_cursor));
+    //
+    // PIN the guard hash (Codex round 8): a LEGACY message enqueued before ParseMessage carried
+    // content_hash arrives with job.content_hash undefined. Propagating that undefined through a multi-slice
+    // export parse disables EVERY per-slice recheck, cleanup guard and markParsed guard for the whole parse,
+    // so a mid-parse re-upload could resume an old-ZIP offset against new bytes or run unguarded cleanup — a
+    // real silent gap. Fall back to the file row's hash as loaded at THIS parse's start (file was read once
+    // above, before any R2 read), so continuations are pinned to the bytes this parse actually read. NOT a
+    // fresh read at send time, which would pin to post-re-upload bytes and defeat the guard. Only the first
+    // legacy slice is unguarded; every continuation it enqueues carries this hash.
+    return 2 + (await parseExportInto(file, env, job.reason, job.content_hash ?? file.content_hash, job.offset ?? 0, job.cleanup_cursor));
   }
   if (!det.sessionId || !SINGLE_SESSION_HARNESSES.has(det.harness)) {
     await markParsed(file.id, env, 'skipped', undefined, undefined, job.content_hash);
@@ -444,6 +467,13 @@ export let EXPORT_QUERY_BUDGET = 800;
 export const EXPORT_MAX_CONVERSATIONS_PER_SLICE = 200;
 // The per-invocation subrequest budget consumeParseBatch shares across the whole batch (export + normal).
 export let INVOCATION_SUBREQUEST_BUDGET = 800;
+// Worst-case subrequest reservation for a SINGLE normal (non-export) transcript, mirroring the export
+// reserve-on-attempt. A normal parse writes one session; the largest real session measured (a 7,686-block
+// prod claude-code transcript) costs writeSession ~89 subrequests (3 + ceil(7686/90)) plus a few detection
+// reads — call it ~92. 128 covers that with headroom while staying small enough that several normal parses
+// still share one invocation. Reserved before parseOne so a chatty transcript can't enter the write path
+// with too little headroom and blow the ~1000 cap; the actual cost parseOne reports replaces the reserve.
+export let NORMAL_RESERVE = 128;
 // A single conversation estimated above this many SUBREQUESTS gets its OWN invocation (its writeSession
 // can't be split), so it never rides alongside other work into the ~1000 cap. Measured max realistic
 // export conversation is 304 blocks (~7 subrequests) — see the PR thread — so this is defensive.
@@ -455,11 +485,12 @@ export let EXPORT_OVERSIZED_SUBREQUEST_CAP = 900;
 
 /** Test-only: dial the export/invocation subrequest budgets down so slicing/cleanup/deferral can be
  * exercised with tiny fixtures instead of thousands of conversations. */
-export function __setExportBudgetsForTest(o: { slice?: number; invocation?: number; ceiling?: number; cap?: number }): void {
+export function __setExportBudgetsForTest(o: { slice?: number; invocation?: number; ceiling?: number; cap?: number; normalReserve?: number }): void {
   if (o.slice !== undefined) EXPORT_QUERY_BUDGET = o.slice;
   if (o.invocation !== undefined) INVOCATION_SUBREQUEST_BUDGET = o.invocation;
   if (o.ceiling !== undefined) EXPORT_OVERSIZED_CEILING = o.ceiling;
   if (o.cap !== undefined) EXPORT_OVERSIZED_SUBREQUEST_CAP = o.cap;
+  if (o.normalReserve !== undefined) NORMAL_RESERVE = o.normalReserve;
 }
 
 /** Real per-invocation SUBREQUEST cost of writeSession WITHOUT writing (each db.batch is ONE subrequest):
@@ -758,6 +789,26 @@ async function runExportParse(
       // re-claim it — the delete can never outrun the recovery (round 6 finding 4). A flip failure raises
       // ExportRetry here, with nothing deleted yet, so the retry re-runs the page cleanly.
       if (!kicked) {
+        // Guard the kick on CURRENT-hash ownership, the same guard the deletes carry (Codex round 8). The
+        // kick's recover fan-out is a queue SEND — it can't ride inside the delete's atomic content_hash
+        // batch — so if a changed-hash re-upload has landed, we must NOT enqueue recover work for sessions
+        // the fresh upload now owns (it flips them to 'parsing', and reason:'recover' only skips OTHER
+        // owners that are 'ready', so an older sibling could re-claim and serve stale content). Re-read the
+        // hash immediately before kicking (1 subrequest, once per invocation); a mismatch means the fresh
+        // message owns the file — revert this file's 'ready' rows to 'parsing' (stop serving stale content
+        // at once) and return WITHOUT kicking, exactly as the per-page recheck above does. The residual
+        // window (a re-upload landing DURING kickSiblings itself) can't be closed atomically, but it's
+        // self-healing: the fresh upload's own parse message (queue retries + files/check re-enqueuing any
+        // non-terminal row) runs and chooseCanonical re-claims — a transient stale read, never a terminal gap.
+        if (contentHash !== undefined) {
+          const owns = await env.DB.prepare('SELECT content_hash FROM files WHERE id = ?1').bind(file.id).first<{ content_hash: string }>();
+          spent += 1;
+          if (owns?.content_hash !== contentHash) {
+            await revertOwnedReady(file, env);
+            console.log(JSON.stringify({ event: 'parse.export.superseded', file_id: file.id, phase: 'cleanup-kick', cursor }));
+            return spent;
+          }
+        }
         spent += await kickSiblings(file, env);
         kicked = true;
       }

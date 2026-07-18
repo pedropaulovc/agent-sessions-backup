@@ -13,9 +13,9 @@ const testEnv = testEnvRaw as unknown as Env;
 // no matter what the previous one set), with a small default a test overrides per case. afterAll restores
 // prod values. NOTE: the cost accounting is SUBREQUESTS (each db.batch/.first/.run is ONE), not statements —
 // see the counting-model note on writeSession; a 180-block conversation costs ~5 subrequests, not ~180.
-const PROD_BUDGETS = { slice: 800, invocation: 800, ceiling: 700, cap: 900 };
-function budgets(o: { slice?: number; invocation?: number; ceiling?: number; cap?: number } = {}): void {
-  __setExportBudgetsForTest({ slice: 20, invocation: 20, ceiling: 700, cap: 900, ...o });
+const PROD_BUDGETS = { slice: 800, invocation: 800, ceiling: 700, cap: 900, normalReserve: 128 };
+function budgets(o: { slice?: number; invocation?: number; ceiling?: number; cap?: number; normalReserve?: number } = {}): void {
+  __setExportBudgetsForTest({ slice: 20, invocation: 20, ceiling: 700, cap: 900, normalReserve: 8, ...o });
 }
 afterAll(() => __setExportBudgetsForTest(PROD_BUDGETS));
 
@@ -704,7 +704,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('processes a whole batch of cheap non-export transcripts without deferring (round 4 finding 4)', async () => {
-    budgets({ slice: 100, invocation: 100 });
+    budgets({ slice: 100, invocation: 100, normalReserve: 16 });
     const a = await uploadClaudeWeb('inv2a', 2);
     const b = await uploadClaudeWeb('inv2b', 2);
     const c = await uploadClaudeWeb('inv2c', 2);
@@ -1075,6 +1075,113 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(await fileState(fileId)).toBe('pending'); // non-terminal, NOT 'error'
     // revertSlice ran fine, so this slice's writes were rolled back to 'parsing'.
     expect(await readyCount(fileId)).toBe(0);
+  });
+
+  it('reserves the invocation budget before a NORMAL parse, deferring the next when headroom is short (round 8)', async () => {
+    // NORMAL_RESERVE (18) is nearly the whole invocation budget (20), so after the first transcript runs and
+    // charges its actual cost, the reservation for a second normal parse crosses the cap → it must be
+    // DEFERRED before ever entering parseOne (reserve-on-attempt), not started and caught post-hoc.
+    budgets({ invocation: 20, normalReserve: 18 });
+    const heavy = await uploadClaudeWeb('r8heavy', 12);
+    const next = await uploadClaudeWeb('r8next', 2);
+
+    const flags: Record<number, { acked: boolean; retried: boolean }> = {};
+    sent.length = 0;
+    await worker.queue(
+      { queue: 'parse', messages: [batchMsg(heavy, flags), batchMsg(next, flags)], ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>,
+      testEnv,
+    );
+
+    // The first (sole-eligible) message always runs — the livelock exception. `next` is deferred: ACKed and
+    // re-enqueued as a fresh copy, with parseOne never invoked for it.
+    expect(await fileState(heavy.fileId)).toBe('parsed');
+    expect(flags[next.fileId]).toEqual({ acked: true, retried: false });
+    // POSITIVE CONTROL: without reserve-on-attempt, `next` enters parseOne and writes its session before the
+    // post-hoc budget check fires. Reserving first defers it untouched — no session, file still 'pending'.
+    expect(await ownedSessions(next.fileId)).toBe(0);
+    expect(await fileState(next.fileId)).toBe('pending');
+    expect(sent.some((m) => m.file_id === next.fileId && m.offset === undefined)).toBe(true); // fresh re-enqueue
+  });
+
+  it('pins the file hash onto continuations of a legacy (no-hash) export message (round 8)', async () => {
+    budgets({ slice: 8, invocation: 8 });
+    const up = await uploadConvs('r8f2', Array.from({ length: 6 }, (_u, i) => conv('r8f2', i)));
+
+    // Deliver the FIRST slice as a LEGACY message: content_hash undefined, as if enqueued before the field
+    // existed. It writes a slice and enqueues a continuation.
+    sent.length = 0;
+    await deliver({ file_id: up.fileId, r2_key: up.r2Key, reason: 'upload' });
+    const cont = sent.find((m) => m.file_id === up.fileId && typeof m.offset === 'number');
+    expect(cont).toBeDefined();
+
+    // POSITIVE CONTROL: without the pin, this continuation carries content_hash undefined, disabling every
+    // per-slice recheck / cleanup guard for the rest of the parse. The pin stamps the file's parse-start hash.
+    expect(cont!.content_hash).toBe(up.hash);
+
+    // Re-upload DIFFERENT bytes to the SAME row between slices → its hash moves on. Delivering the pinned
+    // continuation now trips the pre-write hash recheck (active ONLY because of the pin) and no-ops: the stale
+    // slice does not resume against the new bytes and does not mark the file 'parsed' — the fresh upload owns it.
+    const reup = await uploadConvs('r8f2', Array.from({ length: 3 }, (_u, i) => conv('r8f2', i)));
+    expect(reup.fileId).toBe(up.fileId); // same machine+relpath → same row, new hash
+    await deliver(cont!);
+    expect(await fileState(up.fileId)).toBe('pending'); // guard fired; NOT falsely 'parsed'
+  });
+
+  it('skips the sibling kick when the hash changes just before it, sending no stale recover work (round 8)', async () => {
+    budgets({ slice: 800, invocation: 800 });
+    const sib = await uploadConvs('r8f1-sib', [conv('r8f1sib', 0), conv('r8f1sib', 1)]);
+    await deliverChain({ file_id: sib.fileId, r2_key: sib.r2Key, reason: 'upload', content_hash: sib.hash });
+    expect(await fileState(sib.fileId)).toBe('parsed');
+
+    const fileA = await uploadConvs('r8f1', Array.from({ length: 8 }, (_u, i) => conv('r8f1', i)));
+    await deliverChain({ file_id: fileA.fileId, r2_key: fileA.r2Key, reason: 'upload', content_hash: fileA.hash });
+    const replaced = await uploadConvs('r8f1', Array.from({ length: 2 }, (_u, i) => conv('r8f1', i)));
+
+    // Drive to the first cleanup continuation: writes done, nothing deleted or kicked yet.
+    budgets({ slice: 8, invocation: 8 });
+    const { stoppedCont } = await deliverChain(
+      { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash },
+      { stopAtCleanup: true },
+    );
+    expect(stoppedCont).toBeDefined();
+
+    // Simulate a changed-hash re-upload landing in the narrow window AFTER the per-page recheck passes but
+    // BEFORE the kick: flip ONLY the kick-guard's own hash read (the last content_hash read of this cleanup
+    // invocation) to a mismatch. Earlier reads (pre-write, post-write, per-page) still return the real hash.
+    const HASH_SQL = 'SELECT content_hash FROM files WHERE id = ?1';
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    let reads = 0;
+    const FLIP_ON = 4;
+    testEnv.DB.prepare = ((sql: string) => {
+      const stmt = realPrepare(sql);
+      if (sql !== HASH_SQL) return stmt;
+      const realBind = stmt.bind.bind(stmt);
+      stmt.bind = (...a: unknown[]) => {
+        const bound = realBind(...a);
+        const realFirst = bound.first.bind(bound);
+        (bound as unknown as Record<string, unknown>).first = async (...x: unknown[]) => {
+          reads++;
+          if (reads === FLIP_ON) return { content_hash: 'sha256:changed-by-a-concurrent-reupload' };
+          return (realFirst as (...y: unknown[]) => unknown)(...x);
+        };
+        return bound;
+      };
+      return stmt;
+    }) as typeof testEnv.DB.prepare;
+
+    sent.length = 0;
+    try {
+      await deliver(stoppedCont!);
+    } finally {
+      testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
+    }
+
+    // POSITIVE CONTROL: the kick fires BEFORE the first delete, so without the pre-kick hash guard the
+    // sibling recover message goes out even though the delete then no-ops on the changed hash — leaving the
+    // sibling to re-claim and serve stale content. The guard skips the kick entirely (zero recover sends) and
+    // reverts this file's owned rows, letting the fresh upload's message own the reparse.
+    expect(sent.some((m) => m.file_id === sib.fileId && m.reason === 'recover')).toBe(false);
+    expect(await fileState(sib.fileId)).toBe('parsed'); // sibling untouched, never kicked to 'pending'
   });
 
   it('cleanup deletes are atomic hash-guarded: a hash flip between the recheck and the delete batch no-ops them (round 4 finding 3)', async () => {
