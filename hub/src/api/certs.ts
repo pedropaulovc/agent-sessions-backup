@@ -3,7 +3,7 @@ import { hex } from './ops';
 
 // Grace window a rotated-out cert stays valid after its successor is minted, before the
 // daily prune revokes it at the managed CA. Long enough that an offline collector can come
-// back and renew on its own current cert; see migrations/0004_cert_rotation.sql.
+// back and renew on its own current cert; see migrations/0005_cert_rotation.sql.
 export const CERT_GRACE_DAYS = 7;
 
 /** SHA-256 of the leaf certificate's DER, lowercase hex, no colons — byte-for-byte what

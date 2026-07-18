@@ -243,7 +243,7 @@ and retry — no lockout). The zone id is a non-secret var (`CF_ZONE_ID` in `hub
 
 ### Deploy note — apply the D1 migration
 
-`hub/migrations/0004_cert_rotation.sql` adds the rotation columns (`cert_id`, `prev_cert_fp_sha256`,
+`hub/migrations/0005_cert_rotation.sql` adds the rotation columns (`cert_id`, `prev_cert_fp_sha256`,
 `prev_cert_id`, `cert_revoke_at`). Apply it to each remote D1 at deploy time:
 
 ```
