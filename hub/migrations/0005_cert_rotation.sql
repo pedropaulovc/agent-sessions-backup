@@ -37,6 +37,12 @@ ALTER TABLE machines ADD COLUMN cert_revoke_at TEXT;
 --                      fingerprint returns to the reusable pool.
 --   cert_id NULL     = the CA id was never recorded (pre-M4/enroll rows) — it can't be revoked here,
 --                      so the row stays reserved (logged for manual cleanup) until the cert expires.
+--   claimed_at       = two-phase claim: the daily prune stamps this BEFORE it calls the CA's async
+--                      DELETE, so an admin rollback racing the drain can't un-queue + reinstate the
+--                      fingerprint mid-revoke (adminMachines' un-queue requires claimed_at IS NULL and
+--                      its rollback CAS 409s if a claimed reservation of the reinstated fp exists). The
+--                      prune re-claims a stale claim (older than an hour — longer than any run) next
+--                      day, so a failed revoke is retried rather than wedged.
 --
 -- retired certs NEVER authenticate — machineIdentity still matches only the current or in-grace prev
 -- fingerprint. This table is reservation + revoke bookkeeping only.
@@ -45,7 +51,8 @@ CREATE TABLE retired_certs (
   cert_id     TEXT,
   machine_id  TEXT NOT NULL,
   retired_at  TEXT NOT NULL,
-  revoked_at  TEXT
+  revoked_at  TEXT,
+  claimed_at  TEXT
 ) STRICT;
 
 -- The hot lookup is "is this fingerprint still reserved?" — a partial index over the pending rows.

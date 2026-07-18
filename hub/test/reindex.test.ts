@@ -4,7 +4,7 @@ import { MAX_PAGES_PER_INVOCATION, reindex } from '../src/api/ops';
 import type { Identity } from '../src/auth/identity';
 
 const testEnv = env as unknown as Env;
-const admin: Identity = { kind: 'machine', machineId: 'reindexbox', isAdmin: true };
+const admin: Identity = { kind: 'machine', machineId: 'reindexbox', isAdmin: true, certSlot: 'current' };
 
 /** Spy on sendBatch that records calls but never enqueues — a full 100-message chunk equals the vitest
  * queue's maxBatchSize and would let the real local consumer auto-flush and race these assertions. */

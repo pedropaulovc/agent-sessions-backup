@@ -233,13 +233,18 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
       // current cert serialize — the first flips current, the second's WHERE no longer matches
       // (changes === 0) and it 409s, rather than last-writer-wins stranding the winner's cert. The
       // guarded queue INSERT co-commits with the swap so a displaced in-grace prev is never dropped.
+      // The CAS also pins the observed cert_id (IS, so NULL matches NULL): if an admin attaches a CA id
+      // to this fingerprint between our read and here, the stale observed id no longer matches and we
+      // 409 rather than move a stale NULL into prev_cert_id (which would make the old cert an
+      // unrevocable unknown-id reservation at prune despite the id now being known). The retry re-reads
+      // the fresh id and carries it into prev correctly.
       effectiveRevokeAt = new Date(Date.now() + CERT_GRACE_DAYS * 86_400_000).toISOString();
       const swap = env.DB.prepare(
         `UPDATE machines
            SET prev_cert_fp_sha256 = ?2, prev_cert_id = ?3, cert_revoke_at = ?4,
                cert_fp_sha256 = ?5, cert_id = ?6
-         WHERE machine_id = ?1 AND cert_fp_sha256 = ?7`,
-      ).bind(identity.machineId, cur!.cert_fp_sha256, cur!.cert_id, effectiveRevokeAt, newFp, signed.id, authFp);
+         WHERE machine_id = ?1 AND cert_fp_sha256 = ?7 AND cert_id IS ?8`,
+      ).bind(identity.machineId, cur!.cert_fp_sha256, cur!.cert_id, effectiveRevokeAt, newFp, signed.id, authFp, cur!.cert_id);
       const stmts = [swap];
       if (displaced.fp) stmts.push(queueRetiredIfDisplaced(env, displaced.fp, displaced.id, identity.machineId, newFp));
       const results = await env.DB.batch(stmts);

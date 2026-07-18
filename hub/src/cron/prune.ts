@@ -81,6 +81,14 @@ export async function runDailyPrune(env: Env): Promise<void> {
     `SELECT fingerprint, cert_id, machine_id FROM retired_certs WHERE revoked_at IS NULL`,
   ).all<{ fingerprint: string; cert_id: string | null; machine_id: string }>();
 
+  // Two-phase claim so an admin rollback can't un-queue + reinstate a fingerprint in the window between
+  // this SELECT materializing a row and the loop reaching its CA revoke. Before ANY CA call we stamp
+  // claimed_at; if that UPDATE changes nothing the row was un-queued (or claimed by another run) and we
+  // skip it — never revoking a cert an admin may have just made current. adminMachines' un-queue
+  // requires claimed_at IS NULL and its rollback CAS 409s against a claimed reservation, so the two
+  // sides serialize in D1. A claim older than an hour (longer than any run) is stale — from a prior or
+  // crashed run — and is re-claimable, so a revoke that failed last time is retried, not wedged.
+  const claimStaleBefore = new Date(Date.now() - 60 * 60 * 1000).toISOString();
   for (const r of reserved.results) {
     if (!r.cert_id) {
       // Unknown CA id — can't revoke, and NULL id ≠ revoked, so keep it reserved. Logged each run so
@@ -88,7 +96,27 @@ export async function runDailyPrune(env: Env): Promise<void> {
       console.log(JSON.stringify({ event: 'hub.prune.unknown_id_reservation', machine: r.machine_id, fingerprint: r.fingerprint }));
       continue;
     }
+    const claim = await env.DB.prepare(
+      `UPDATE retired_certs SET claimed_at = ?4
+         WHERE fingerprint = ?1 AND machine_id = ?2 AND revoked_at IS NULL
+           AND (claimed_at IS NULL OR claimed_at <= ?3)`,
+    )
+      .bind(r.fingerprint, r.machine_id, claimStaleBefore, new Date().toISOString())
+      .run();
+    if ((claim.meta.changes ?? 0) === 0) {
+      // Un-queued/reinstated by an admin, or already claimed this run — don't touch the CA.
+      console.log(JSON.stringify({ event: 'hub.prune.claim_skipped', machine: r.machine_id, fingerprint: r.fingerprint }));
+      continue;
+    }
     const outcome = await pollRetired(env, r.cert_id);
+    if (outcome !== 'revoked') {
+      // Not settled this run (still pending, or the poll failed). Release the claim so the NEXT run
+      // re-attempts — otherwise a held claim would skip it forever. A 'revoked' outcome leaves
+      // revoked_at stamped (terminal), so it's already out of the reserved set.
+      await env.DB.prepare('UPDATE retired_certs SET claimed_at = NULL WHERE fingerprint = ?1 AND machine_id = ?2 AND revoked_at IS NULL')
+        .bind(r.fingerprint, r.machine_id)
+        .run();
+    }
     if (outcome === 'pending') console.log(JSON.stringify({ event: 'hub.prune.revoke_pending', machine: r.machine_id, cert_id: r.cert_id }));
     else if (outcome === 'failed') console.log(JSON.stringify({ event: 'hub.prune.revoke_failed', machine: r.machine_id, cert_id: r.cert_id }));
   }

@@ -21,7 +21,7 @@ function reqWithCert(tlsClientAuth: Record<string, string>): Request {
 describe('machineIdentity', () => {
   it('development: trusts x-dev-machine with no bearer required', async () => {
     const identity = await machineIdentity(reqWith({ 'x-dev-machine': 'devbox' }), envWith({ ENVIRONMENT: 'development' }));
-    expect(identity).toEqual({ kind: 'machine', machineId: 'devbox', isAdmin: true });
+    expect(identity).toEqual({ kind: 'machine', machineId: 'devbox', isAdmin: true, certSlot: 'current' });
   });
 
   it('preview: denies x-dev-machine without a bearer token (would otherwise be unauthenticated admin on a public URL)', async () => {
@@ -53,7 +53,7 @@ describe('machineIdentity', () => {
       reqWith({ 'x-dev-machine': 'previewbox', authorization: 'Bearer shh' }),
       envWith({ ENVIRONMENT: 'preview', DEV_AUTH: 'shh' }),
     );
-    expect(identity).toEqual({ kind: 'machine', machineId: 'previewbox', isAdmin: true });
+    expect(identity).toEqual({ kind: 'machine', machineId: 'previewbox', isAdmin: true, certSlot: 'current' });
   });
 
   it('production: never trusts x-dev-machine, bearer or not (mTLS only)', async () => {
@@ -92,8 +92,9 @@ describe('machineIdentity', () => {
     // Positive control: the same enrolled cert, NOT revoked, authenticates as the machine —
     // proving the cf.tlsClientAuth path is reached and the fingerprint maps.
     const ok = await machineIdentity(reqWithCert({ certVerified: 'SUCCESS', certFingerprintSHA256: fp }), prod);
-    // certFp echoes the authenticating fingerprint (threaded through for the certs/renew CAS).
-    expect(ok).toEqual({ kind: 'machine', machineId: 'revoked-box', isAdmin: true, certFp: fp });
+    // certFp echoes the authenticating fingerprint (threaded through for the certs/renew CAS);
+    // certSlot is 'current' since fp is the row's current cert (not an in-grace previous one).
+    expect(ok).toEqual({ kind: 'machine', machineId: 'revoked-box', isAdmin: true, certFp: fp, certSlot: 'current' });
 
     // The fix: certVerified stays 'SUCCESS' for a revoked cert, so without the certRevoked
     // check the still-enrolled row would keep authenticating. It must fall through to anonymous.

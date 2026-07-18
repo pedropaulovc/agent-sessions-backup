@@ -169,6 +169,11 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     // columns. The retirement INSERTs run in the SAME db.batch, each guarded on the swap having landed
     // (current is now certFp) — so a lost/interrupted retire can't strand a displaced cert, and a CAS
     // miss queues nothing.
+    //
+    // The CAS also 409s if the reinstated fp sits CLAIMED in retired_certs (revoked_at NULL,
+    // claimed_at NOT NULL): the prune stamps claimed_at right before its async CA revoke, so a claimed
+    // reservation means a drain is mid-revoke of that cert — reinstating it as current would race the
+    // DELETE and lock the machine out. 409 instead; the admin re-reads reality after the drain settles.
     const observedFp = existing?.cert_fp_sha256 ?? null;
     const observedPrevFp = existing?.prev_cert_fp_sha256 ?? null;
     const observedRevokeAt = existing?.cert_revoke_at ?? null;
@@ -178,15 +183,17 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
        ON CONFLICT (machine_id) DO UPDATE SET
          os = ?2, hostname = ?3, cert_fp_sha256 = ?4, key_protection = ?5, is_admin = ?6, priority = ?7,
          cert_id = ?8, prev_cert_fp_sha256 = ?9, prev_cert_id = ?10, cert_revoke_at = ?11
-       WHERE machines.cert_fp_sha256 IS ?12 AND machines.prev_cert_fp_sha256 IS ?13 AND machines.cert_revoke_at IS ?14`,
+       WHERE machines.cert_fp_sha256 IS ?12 AND machines.prev_cert_fp_sha256 IS ?13 AND machines.cert_revoke_at IS ?14
+         AND NOT EXISTS (SELECT 1 FROM retired_certs WHERE fingerprint = ?4 AND machine_id = ?1 AND revoked_at IS NULL AND claimed_at IS NOT NULL)`,
     ).bind(body.machine_id, os, hostname, certFp, keyProtection, isAdmin, priority, certId, prevFp, prevId, revokeAt, observedFp, observedPrevFp, observedRevokeAt);
 
     // Belt-and-braces for a reservation that predates our read: if the clash pre-check passed but a prune
     // then queued certFp (this row's expiring prev) into retired_certs before we read `existing`, the swap
     // above can still land certFp as current while it sits reserved — the next drain would revoke it.
-    // Reinstating a cert must atomically un-queue it: DELETE this machine's un-revoked reservation of
-    // certFp, guarded on the swap having landed (current is now certFp) so a CAS miss deletes nothing. A
-    // no-op when there is no such reservation (the common case).
+    // Reinstating a cert must atomically un-queue it: DELETE this machine's UNCLAIMED un-revoked
+    // reservation of certFp, guarded on the swap having landed (current is now certFp) so a CAS miss
+    // deletes nothing. claimed_at IS NULL so we never yank a reservation out from under a mid-revoke
+    // prune (that case already 409'd at the CAS above). A no-op when there is no such reservation.
     const stmts = [
       swap,
       ...displaced.map((d) => queueRetiredIfDisplaced(env, d.fp, d.id, body.machine_id!, certFp!)),
@@ -194,7 +201,7 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
         ? [
             env.DB.prepare(
               `DELETE FROM retired_certs
-                 WHERE fingerprint = ?1 AND machine_id = ?2 AND revoked_at IS NULL
+                 WHERE fingerprint = ?1 AND machine_id = ?2 AND revoked_at IS NULL AND claimed_at IS NULL
                    AND EXISTS (SELECT 1 FROM machines WHERE machine_id = ?2 AND cert_fp_sha256 = ?1)`,
             ).bind(certFp, body.machine_id),
           ]

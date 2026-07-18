@@ -82,8 +82,16 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
   if (path === '/api/v1/machines' && method === 'GET') return listMachines(env);
   if (path === '/api/v1/status' && method === 'GET') return status(env);
   if (path === '/api/v1/usage' && method === 'GET') return usage(url, env);
-  if (path === '/api/v1/admin/reindex' && method === 'POST') return reindex(request, env, identity);
-  if (path === '/api/v1/admin/machines' && method === 'POST') return adminMachines(request, env, identity);
+  // Admin routes require the CURRENT cert slot, not an in-grace previous one: a rotated-out admin cert
+  // must not run fleet-wide writes/reindex during its 7-day grace window (identity.ts certSlot).
+  if (path === '/api/v1/admin/reindex' && method === 'POST') {
+    if (identity.certSlot !== 'current') return Response.json({ error: 'admin_requires_current_cert' }, { status: 403 });
+    return reindex(request, env, identity);
+  }
+  if (path === '/api/v1/admin/machines' && method === 'POST') {
+    if (identity.certSlot !== 'current') return Response.json({ error: 'admin_requires_current_cert' }, { status: 403 });
+    return adminMachines(request, env, identity);
+  }
 
   return Response.json({ error: 'not_found' }, { status: 404 });
 }

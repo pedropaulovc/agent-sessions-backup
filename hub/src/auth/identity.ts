@@ -2,7 +2,10 @@ export type Identity =
   // certFp is the client-cert fingerprint that authenticated this request (current OR an
   // in-grace previous fp). certs/renew compare-and-swaps on it so a concurrent renew can't
   // strand a cert; absent for dev/preview header identities, which never rotate certs.
-  | { kind: 'machine'; machineId: string; isAdmin: boolean; certFp?: string }
+  // certSlot says WHICH fingerprint matched: 'current' or an in-grace 'grace' (previous) cert.
+  // Admin routes require 'current' — a rotated-out admin cert must not run fleet writes during its
+  // 7-day grace window. Uploads/heartbeat/renew accept either. Dev/preview identities are 'current'.
+  | { kind: 'machine'; machineId: string; isAdmin: boolean; certFp?: string; certSlot: 'current' | 'grace' }
   | { kind: 'human' }
   | { kind: 'anonymous' };
 
@@ -55,14 +58,16 @@ export async function machineIdentity(request: Request, env: Env): Promise<Ident
     // cert keeps authenticating until the +7d prune revokes it. This is the single place
     // every machine-authenticated route (uploads, heartbeat, renew itself) resolves identity.
     const row = await env.DB.prepare(
-      `SELECT machine_id, is_admin FROM machines
-       WHERE cert_fp_sha256 = ?1
-          OR (prev_cert_fp_sha256 = ?1 AND cert_revoke_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
+      `SELECT machine_id, is_admin,
+              CASE WHEN cert_fp_sha256 = ?1 THEN 'current' ELSE 'grace' END AS cert_slot
+         FROM machines
+        WHERE cert_fp_sha256 = ?1
+           OR (prev_cert_fp_sha256 = ?1 AND cert_revoke_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
     )
       .bind(tls.certFingerprintSHA256)
-      .first<{ machine_id: string; is_admin: number }>();
+      .first<{ machine_id: string; is_admin: number; cert_slot: 'current' | 'grace' }>();
     if (!row) return { kind: 'anonymous' };
-    return { kind: 'machine', machineId: row.machine_id, isAdmin: row.is_admin === 1, certFp: tls.certFingerprintSHA256 };
+    return { kind: 'machine', machineId: row.machine_id, isAdmin: row.is_admin === 1, certFp: tls.certFingerprintSHA256, certSlot: row.cert_slot };
   }
 
   if (env.ENVIRONMENT === 'development') return devHeaderIdentity(request, env);
@@ -82,5 +87,5 @@ async function devHeaderIdentity(request: Request, env: Env): Promise<Identity> 
   )
     .bind(dev, request.headers.get('x-dev-os') ?? 'linux')
     .run();
-  return { kind: 'machine', machineId: dev, isAdmin: true };
+  return { kind: 'machine', machineId: dev, isAdmin: true, certSlot: 'current' };
 }
