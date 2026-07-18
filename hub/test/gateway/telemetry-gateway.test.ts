@@ -320,6 +320,106 @@ describe('telemetry-gateway fetch handler', () => {
     expect(dcrPosts).toBeGreaterThan(1); // did NOT bail after the 429 — posted the rest
   });
 
+  it('acks a large batch immediately with 204 and forwards every chunk via waitUntil', async () => {
+    const pem = await pemFromGeneratedKeyPair();
+    const env = makeEnv(pem);
+
+    // A ctx whose waitUntil captures the deferred work so the test can settle it.
+    const deferred: Promise<unknown>[] = [];
+    const bigCtx = { waitUntil: (p: Promise<unknown>) => deferred.push(p) } as unknown as ExecutionContext;
+
+    let dcrPosts = 0;
+    const bodyBytes: number[] = [];
+    fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('login.microsoftonline.com')) {
+        return new Response(JSON.stringify({ access_token: 'fake-entra-token', expires_in: 3600 }), { status: 200 });
+      }
+      dcrPosts++;
+      bodyBytes.push((init?.body as Uint8Array).byteLength);
+      return new Response(null, { status: 204 });
+    });
+
+    // 20 × ~300 KB → well over the 3-chunk synchronous threshold → ack-then-forward.
+    const bigBody = `{"event":"http.access","blob":"${'a'.repeat(300_000)}"}`;
+    const otlpJson = {
+      resourceLogs: [
+        {
+          resource: { attributes: [{ key: 'service.name', value: { stringValue: 'sessions-hub' } }] },
+          scopeLogs: [
+            {
+              logRecords: Array.from({ length: 20 }, (_, i) => ({
+                timeUnixNano: String(1782964800000000000n + BigInt(i)),
+                body: { stringValue: bigBody },
+              })),
+            },
+          ],
+        },
+      ],
+    };
+
+    const req = new Request('https://gateway.example/v1/logs', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.INGEST_BEARER}` },
+      body: JSON.stringify(otlpJson),
+    });
+
+    const res = await gateway.fetch(req, env as never, bigCtx);
+    // Ack came back before any DCR forwarding — CF can't context-cancel what it acked.
+    expect(res.status).toBe(204);
+    expect(deferred.length).toBe(1);
+    expect(dcrPosts).toBe(0); // nothing forwarded synchronously
+    // Now drain the waitUntil work: every chunk posts, each under Azure's cap.
+    await Promise.all(deferred);
+    expect(dcrPosts).toBeGreaterThan(3); // more than the sync threshold → many chunks
+    for (const b of bodyBytes) expect(b).toBeLessThanOrEqual(1_000_000);
+  });
+
+  it('classifies per chunk under the parallel pool: a 413 among several is dropped, batch still 204', async () => {
+    const pem = await pemFromGeneratedKeyPair();
+    const env = makeEnv(pem);
+
+    let dcrPosts = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('login.microsoftonline.com')) {
+        return new Response(JSON.stringify({ access_token: 'fake-entra-token', expires_in: 3600 }), { status: 200 });
+      }
+      dcrPosts++;
+      // One chunk is poison (413), the rest succeed. Poison must NOT flip the batch
+      // to 503 — unlike the transient 429 case — so it stays a drop + 204.
+      return dcrPosts === 1 ? new Response('too large', { status: 413 }) : new Response(null, { status: 204 });
+    });
+
+    // 6 × ~300 KB → 3 chunks (synchronous path), posted through the concurrency pool.
+    const bigBody = `{"event":"http.access","blob":"${'a'.repeat(300_000)}"}`;
+    const otlpJson = {
+      resourceLogs: [
+        {
+          resource: { attributes: [{ key: 'service.name', value: { stringValue: 'sessions-hub' } }] },
+          scopeLogs: [
+            {
+              logRecords: Array.from({ length: 6 }, (_, i) => ({
+                timeUnixNano: String(1782964800000000000n + BigInt(i)),
+                body: { stringValue: bigBody },
+              })),
+            },
+          ],
+        },
+      ],
+    };
+
+    const req = new Request('https://gateway.example/v1/logs', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.INGEST_BEARER}` },
+      body: JSON.stringify(otlpJson),
+    });
+
+    const res = await gateway.fetch(req, env as never, ctx);
+    expect(res.status).toBe(204); // 413 = poison drop, not a retry
+    expect(dcrPosts).toBeGreaterThan(1); // all chunks attempted despite the drop
+  });
+
   it('treats a chunk 408 (request timeout) as transient → posts the rest and returns 503', async () => {
     const pem = await pemFromGeneratedKeyPair();
     const env = makeEnv(pem);
