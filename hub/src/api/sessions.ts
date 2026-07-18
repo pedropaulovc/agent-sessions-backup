@@ -131,9 +131,12 @@ export async function getSessionRaw(sessionId: string, request: Request, env: En
  * fleet), so a caller filtering to one machine or harness gets a freshness signal that
  * actually describes the data they asked for: machine filter -> that machine's own
  * last_seen_at; harness filter -> MIN over machines that have EVER produced a session of
- * that harness (a machine with zero sessions of the filtered harness can't make the signal
- * look stale for a report that will never include it); no filter -> fleet-wide MIN, same as
- * before. `machine` wins if both are given — it's the more specific, unambiguous filter.
+ * that harness, OR that have a `files` row detected as that harness even before it's
+ * parsed into a `sessions` row (upload.ts/detect.ts stamp `files.harness` at upload time,
+ * ahead of the queue consumer) — otherwise a machine with pending/error files of the
+ * filtered harness would be invisible to this query and make the signal look fresher than
+ * the data it's still missing; no filter -> fleet-wide MIN, same as before. `machine` wins
+ * if both are given — it's the more specific, unambiguous filter.
  */
 async function computeIndexedThrough(env: Env, p: URLSearchParams): Promise<string | null> {
   const machine = p.get('machine');
@@ -144,7 +147,11 @@ async function computeIndexedThrough(env: Env, p: URLSearchParams): Promise<stri
       ? env.DB
           .prepare(
             `SELECT MIN(COALESCE(last_seen_at, created_at)) AS t FROM machines
-             WHERE machine_id IN (SELECT DISTINCT machine_id FROM sessions WHERE harness = ?1)`,
+             WHERE machine_id IN (
+               SELECT machine_id FROM sessions WHERE harness = ?1
+               UNION
+               SELECT machine_id FROM files WHERE harness = ?1
+             )`,
           )
           .bind(harness)
       : env.DB.prepare(`SELECT MIN(COALESCE(last_seen_at, created_at)) AS t FROM machines`)
@@ -152,19 +159,77 @@ async function computeIndexedThrough(env: Env, p: URLSearchParams): Promise<stri
   return row?.t ?? null;
 }
 
-/** GET /api/v1/sessions — metadata list (one page + cursor), or format=ndjson streaming the
- * COMPLETE filtered set of full normalized sessions across as many internal pages as needed
- * (that's the point of the bulk format — a daily-report caller shouldn't have to paginate a
- * stream). `limit` is a page-size cap either way (default 200, hard max 1000 via
- * clampLimit); for JSON it bounds one response's `sessions` array, for ndjson it's the
- * internal per-page fetch size only — it does not cap how many lines the stream emits. */
+/** A page of `sessions`, keyed by (started_at, session_id) — see SessionsCursor. */
+interface SessionsCursor {
+  startedAt: string;
+  sessionId: string;
+}
+
+/**
+ * Keyset pagination cursor for /api/v1/sessions: encodes the LAST ROW ALREADY SEEN
+ * (started_at, session_id), not an offset. `/api/v1/search` still uses an offset cursor
+ * (encodeCursor/decodeCursor below, unchanged) — its FTS5 bm25-ranked ordering has no
+ * natural keyset column pair, so migrating it is a separate discussion (tracked on task
+ * #11), not done here.
+ *
+ * Why keyset, not offset: this endpoint runs against an ACTIVELY INGESTING corpus. An
+ * offset cursor is "skip N rows of the CURRENT ordering" — if a new session is ingested
+ * between two page fetches with a started_at that sorts ahead of the caller's position, it
+ * shifts every row after it by one, so the next page (still "skip N") either repeats a row
+ * the caller already saw or skips one it never saw. A keyset cursor instead says "give me
+ * rows after THIS SPECIFIC BOUNDARY" — a new row can only ever land before or after that
+ * boundary in the total (started_at DESC, session_id ASC) order, never invalidate it. This
+ * also kills OFFSET's O(n) scan-and-discard cost on a page far into a large result set.
+ */
+function encodeSessionsCursor(c: SessionsCursor): string {
+  return btoa(JSON.stringify([c.startedAt, c.sessionId]));
+}
+function decodeSessionsCursor(cursor: string | null): SessionsCursor | null {
+  if (!cursor) return null;
+  try {
+    const decoded: unknown = JSON.parse(atob(cursor));
+    if (Array.isArray(decoded) && decoded.length === 2 && typeof decoded[0] === 'string' && typeof decoded[1] === 'string') {
+      return { startedAt: decoded[0], sessionId: decoded[1] };
+    }
+  } catch {
+    // Invalid base64, invalid JSON, or the wrong shape (e.g. a stale offset-style cursor
+    // from before this change) — fail open to the first page, same as the offset cursor
+    // below and /api/v1/search's cursor: never 500 on a garbage/hand-edited cursor.
+  }
+  return null;
+}
+
+/** Matches `ORDER BY started_at DESC, session_id ASC` (see listSessions): strictly-newer
+ * started_at, OR equal started_at with a strictly-greater session_id (the ASC tiebreak
+ * direction). Appends its binds to `binds` and returns the SQL fragment to AND into WHERE. */
+function keysetFilter(cursor: SessionsCursor, binds: unknown[]): string {
+  binds.push(cursor.startedAt, cursor.startedAt, cursor.sessionId);
+  const n = binds.length;
+  return `(started_at < ?${n - 2} OR (started_at = ?${n - 1} AND session_id > ?${n}))`;
+}
+
+// Each ndjson row costs ~2-3 subrequests in loadNormalized (a D1 lookup, an R2 read, and
+// sometimes an additional archive fetch) against a Worker invocation's ~1000 subrequest
+// budget — plus the pagination SELECTs themselves. 300 leaves comfortable headroom rather
+// than looping to exhaustion regardless of corpus size (which was itself the bug: unbounded
+// per-invocation work that a large machine/day/fleet could blow the budget on mid-stream,
+// aborting a "complete" export partway through with no way to tell the caller it was cut off).
+export const NDJSON_MAX_ROWS_PER_REQUEST = 300;
+
+/** GET /api/v1/sessions — metadata list (one page + cursor), or format=ndjson streaming up
+ * to NDJSON_MAX_ROWS_PER_REQUEST rows. If more match than that cap, the ndjson stream ends
+ * with one control line `{"cursor": "..."}` (no `meta`/`session` keys, so it's
+ * distinguishable from a normal row) instead of silently truncating — callers resume with
+ * `?cursor=...&format=ndjson` for the remainder. `limit` is the internal per-DB-query page
+ * size either way (default 200, hard max 1000 via clampLimit) — it does not change the
+ * ndjson total cap. */
 export async function listSessions(url: URL, env: Env): Promise<Response> {
   const p = url.searchParams;
-  const filters: string[] = [];
-  const binds: unknown[] = [];
+  const baseFilters: string[] = [];
+  const baseBinds: unknown[] = [];
   const add = (template: (n: number) => string, v: unknown) => {
-    binds.push(v);
-    filters.push(template(binds.length));
+    baseBinds.push(v);
+    baseFilters.push(template(baseBinds.length));
   };
   // A session is "in range" if any part of it overlaps [from, to].
   if (p.get('from')) add((n) => `(ended_at >= ?${n} OR started_at >= ?${n})`, p.get('from'));
@@ -172,26 +237,37 @@ export async function listSessions(url: URL, env: Env): Promise<Response> {
   if (p.get('harness')) add((n) => `harness = ?${n}`, p.get('harness'));
   if (p.get('machine')) add((n) => `machine_id = ?${n}`, p.get('machine'));
   if (p.get('repo')) add((n) => `repo_url = ?${n}`, p.get('repo'));
-  const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
   const limit = clampLimit(p.get('limit'), 200, 1000);
   // started_at alone isn't a stable sort key — real data can share a timestamp (bulk
-  // backfill, synthetic/imported sessions), which would let OFFSET-based paging skip or
-  // repeat rows across a page boundary that lands mid-tie. session_id as a tiebreak makes
-  // the ordering total, so paging is deterministic regardless of how many sessions share a
-  // started_at.
+  // backfill, synthetic/imported sessions). session_id as a tiebreak makes the ordering
+  // total, which both makes paging deterministic AND is what the keyset cursor above keys
+  // off of — a non-total order would make "rows after this boundary" ambiguous.
   const orderBy = 'ORDER BY started_at DESC, session_id ASC';
 
   const indexedThrough = await computeIndexedThrough(env, p);
 
+  /** One page's query for `fetchLimit` rows after `cursor` (or from the top if null),
+   * respecting the base filters above. Rebuilds WHERE per call since the keyset boundary
+   * changes page to page (unlike a fixed OFFSET, which was the whole problem). */
+  const pageQuery = (cursor: SessionsCursor | null, fetchLimit: number): { sql: string; binds: unknown[] } => {
+    const filters = [...baseFilters];
+    const binds = [...baseBinds];
+    if (cursor) filters.push(keysetFilter(cursor, binds));
+    const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+    return { sql: `SELECT * FROM sessions ${where} ${orderBy} LIMIT ${fetchLimit}`, binds };
+  };
+
   if (p.get('format') !== 'ndjson') {
-    const offset = decodeCursor(p.get('cursor'));
-    const rows = await env.DB.prepare(`SELECT * FROM sessions ${where} ${orderBy} LIMIT ${limit + 1} OFFSET ${offset}`)
-      .bind(...binds)
-      .all<SessionRow>();
+    const cursor = decodeSessionsCursor(p.get('cursor'));
+    const { sql, binds } = pageQuery(cursor, limit + 1);
+    const rows = await env.DB.prepare(sql).bind(...binds).all<SessionRow>();
     const hasMore = rows.results.length > limit;
     const page = hasMore ? rows.results.slice(0, limit) : rows.results;
+    const last = page.at(-1);
+    const nextCursor =
+      hasMore && last ? encodeSessionsCursor({ startedAt: last.started_at as string, sessionId: last.session_id }) : undefined;
     return Response.json(
-      { sessions: page, indexed_through: indexedThrough, cursor: hasMore ? encodeCursor(offset + limit) : undefined },
+      { sessions: page, indexed_through: indexedThrough, cursor: nextCursor },
       { headers: { 'x-indexed-through': indexedThrough ?? '' } },
     );
   }
@@ -200,23 +276,37 @@ export async function listSessions(url: URL, env: Env): Promise<Response> {
   // One archive parse per export ZIP per request, shared across all its conversations' rows
   // AND across every internal page below (a ZIP's sessions can span a page boundary).
   const archiveCache = new Map<string, ExportArchive>();
+  let cursor = decodeSessionsCursor(p.get('cursor'));
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
-      let offset = 0;
-      let total = 0;
-      for (;;) {
-        const rows = await env.DB.prepare(`SELECT * FROM sessions ${where} ${orderBy} LIMIT ${limit} OFFSET ${offset}`)
-          .bind(...binds)
-          .all<SessionRow>();
+      let emitted = 0;
+      let lastRow: SessionRow | undefined;
+      let cappedOut = false;
+      while (emitted < NDJSON_MAX_ROWS_PER_REQUEST) {
+        const fetchLimit = Math.min(limit, NDJSON_MAX_ROWS_PER_REQUEST - emitted);
+        const { sql, binds } = pageQuery(cursor, fetchLimit);
+        const rows = await env.DB.prepare(sql).bind(...binds).all<SessionRow>();
         for (const row of rows.results) {
           const normalized = await loadNormalized(row.session_id, env, archiveCache).catch(() => null);
           controller.enqueue(encoder.encode(`${JSON.stringify({ meta: row, session: normalized })}\n`));
         }
-        total += rows.results.length;
-        if (rows.results.length < limit) break; // last page was short -> exhausted
-        offset += limit;
+        emitted += rows.results.length;
+        const last = rows.results.at(-1);
+        if (last) {
+          lastRow = last;
+          cursor = { startedAt: last.started_at as string, sessionId: last.session_id };
+        }
+        if (rows.results.length < fetchLimit) break; // short page -> exhausted, not just capped
+        if (emitted >= NDJSON_MAX_ROWS_PER_REQUEST) {
+          cappedOut = true;
+          break;
+        }
       }
-      console.log(JSON.stringify({ event: 'access.bulk', count: total }));
+      if (cappedOut && lastRow) {
+        const trailer = { cursor: encodeSessionsCursor({ startedAt: lastRow.started_at as string, sessionId: lastRow.session_id }) };
+        controller.enqueue(encoder.encode(`${JSON.stringify(trailer)}\n`));
+      }
+      console.log(JSON.stringify({ event: 'access.bulk', count: emitted, truncated: cappedOut }));
       controller.close();
     },
   });
@@ -228,12 +318,11 @@ export async function listSessions(url: URL, env: Env): Promise<Response> {
   });
 }
 
-/** Opaque pagination cursor: a base64-encoded OFFSET. Shared by /api/v1/sessions and
- * /api/v1/search (search.ts imports these) so both endpoints' cursors have the identical
- * shape and failure behavior — a hand-edited or stale cursor resets to the first page
- * instead of 500ing. Lives here (not search.ts) because sessions.ts is the base
- * query-helpers module search.ts already imports from (clampLimit, normalizeToBound);
- * putting it there instead would make the two files import each other. */
+/** Opaque pagination cursor: a base64-encoded OFFSET. /api/v1/search (search.ts imports
+ * these) still uses this — see encodeSessionsCursor's comment above for why
+ * /api/v1/sessions moved to a keyset cursor instead. Lives here (not search.ts) because
+ * sessions.ts is the base query-helpers module search.ts already imports from (clampLimit,
+ * normalizeToBound); putting it there instead would make the two files import each other. */
 export function encodeCursor(offset: number): string {
   return btoa(String(offset));
 }
