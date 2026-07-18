@@ -38,4 +38,20 @@ interface ParseMessage {
    * `session_id > cleanup_cursor`. Absent on the first cleanup pass (starts at ''). markParsed runs
    * only once cleanup drains — so 'parsed' means every conversation written AND stale cleanup done. */
   cleanup_cursor?: string;
+  /** Export-archive cleanup SUB-phase (only meaningful with offset === archive.sessions.length):
+   *  - 'scan' (or absent on first cleanup entry) — walk this file's owned sessions looking for the first
+   *    STALE one (owned, not in the archive). No sibling is touched and nothing is deleted while the scan
+   *    finds only kept rows, so a clean re-parse (no dropped conversations) never kicks a sibling.
+   *  - 'reserve' — a stale session was found; flip every sibling archive to 'pending' as a durable
+   *    recovery RESERVATION, BEFORE any stale delete. No queue send here.
+   *  - 'delete' — reservation is complete (every overlapping sibling is at least 'pending'); now delete
+   *    the stale sessions and, once drained, best-effort send the recover messages.
+   * Splitting flip-early / send-late is what keeps a recover message from ever existing before all the
+   * deletes commit (round 11) — see the cleanup phase in consumer.ts. */
+  cleanup_phase?: 'scan' | 'reserve' | 'delete';
+  /** Reservation-phase cursor: the last files.id already flipped to 'pending' by the sibling fan-out.
+   * The next reserve continuation resumes at `id > kick_cursor`, so pages advance by id independent of
+   * parse_state — a sibling that churns back to 'parsed' behind the cursor can't re-trigger a re-flip
+   * (kills the livelock). Present only on 'reserve' continuations. */
+  kick_cursor?: number;
 }

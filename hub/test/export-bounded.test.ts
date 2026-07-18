@@ -885,23 +885,22 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(await ownedSessions(replaced.fileId)).toBe(2);
   });
 
-  it('a recovery fan-out SELECT failure is retryable, not swallowed into a false parsed (round 6 finding 4)', async () => {
-    // The sibling-recovery fan-out runs only when cleanup actually reconciled a stale session. A D1 outage
-    // in its initial SELECT must NOT be swallowed (which would let THIS file reach 'parsed' with the
-    // recovered session gone and no sibling kicked) — it propagates to the retryable wrapper → 'pending'.
+  it('a reservation SELECT failure is retryable, not swallowed into a false parsed (round 6 finding 4)', async () => {
+    // The sibling RESERVE pass runs only after the scan finds a stale session. A D1 outage in its sibling
+    // SELECT must NOT be swallowed (which would let THIS file reach 'parsed' with the stale session deleted
+    // and no sibling reserved) — it propagates to the retryable wrapper → 'pending'.
     budgets({ slice: 800, invocation: 800 });
     const first = await uploadConvs('r6f4', Array.from({ length: 6 }, (_u, i) => conv('r6f4', i)));
     await deliverChain({ file_id: first.fileId, r2_key: first.r2Key, reason: 'upload', content_hash: first.hash });
     expect(await ownedSessions(first.fileId)).toBe(6);
     const replaced = await uploadConvs('r6f4', Array.from({ length: 2 }, (_u, i) => conv('r6f4', i)));
-    budgets({ slice: 20, invocation: 20 });
 
-    // Make the sibling-recovery SELECT throw (it fires only after cleanup reconciled ≥1 stale session).
+    // Make the RESERVE-phase sibling SELECT throw (it fires only after the scan hits the first stale session).
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
-    const SIBLING_SQL = `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state = 'parsed' ORDER BY id ASC LIMIT ?3`;
+    const RESERVE_SQL = "SELECT id, content_hash FROM files WHERE store = ?1 AND id != ?2 AND id > ?3 AND parse_state = 'parsed' ORDER BY id ASC LIMIT ?4";
     testEnv.DB.prepare = ((sql: string) => {
-      if (sql === SIBLING_SQL) {
-        return { bind: () => ({ all: async () => { throw new Error('D1 outage on sibling recovery SELECT'); } }) } as unknown as D1PreparedStatement;
+      if (sql === RESERVE_SQL) {
+        return { bind: () => ({ all: async () => { throw new Error('D1 outage on reservation SELECT'); } }) } as unknown as D1PreparedStatement;
       }
       return realPrepare(sql);
     }) as typeof testEnv.DB.prepare;
@@ -911,103 +910,114 @@ describe('large export ingest is bounded and never marks parsed until every conv
       testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
     }
 
-    // POSITIVE CONTROL: before round 6 the SELECT throw was swallowed and the file still reached 'parsed'.
-    // Now it propagates to the wrapper → the file rests 'pending' (re-enqueueable), never falsely parsed.
+    // POSITIVE CONTROL: a swallowed reservation SELECT throw would let the file reach 'parsed' with stale
+    // rows deleted and no sibling reserved. It propagates to the wrapper → the file rests 'pending', never
+    // falsely parsed — and because the throw is in the RESERVE pass (before any delete), nothing was deleted.
     expect(await fileState(replaced.fileId)).toBe('pending');
+    expect(await ownedSessions(replaced.fileId)).toBe(6); // reservation failed before any delete
   });
 
-  it('kicks sibling archives BEFORE deleting stale sessions, so a flip failure deletes nothing and loses no sibling (round 6 finding 4, kick-before-delete)', async () => {
+  it('reserves sibling archives BEFORE deleting stale sessions, so a reservation-flip failure deletes nothing and loses no sibling (round 6 finding 4, reserve-before-delete)', async () => {
     budgets({ slice: 800, invocation: 800 });
-    // A sibling export in the same 'export-inbox' store, so fileA's cleanup fan-out has a sibling to kick.
+    // A sibling export in the same 'export-inbox' store, so fileA's reservation has a sibling to flip.
     const sib = await uploadConvs('r6kbd-sib', [conv('r6kbdsib', 0), conv('r6kbdsib', 1)]);
     await deliverChain({ file_id: sib.fileId, r2_key: sib.r2Key, reason: 'upload', content_hash: sib.hash });
     expect(await fileState(sib.fileId)).toBe('parsed');
 
-    // fileA: big, then replaced small so its reparse cleanup deletes 4 stale sessions (fires the fan-out).
+    // fileA: big, then replaced small so its reparse cleanup deletes 4 stale sessions (fires the reservation).
     const fileA = await uploadConvs('r6kbd', Array.from({ length: 6 }, (_u, i) => conv('r6kbd', i)));
     await deliverChain({ file_id: fileA.fileId, r2_key: fileA.r2Key, reason: 'upload', content_hash: fileA.hash });
     const replaced = await uploadConvs('r6kbd', Array.from({ length: 2 }, (_u, i) => conv('r6kbd', i)));
 
-    // Make the flip of SIB SPECIFICALLY (markPendingAndEnqueue's `UPDATE ... WHERE id = ?1`, no
-    // content_hash — distinct from forcePending's guarded UPDATE) throw ONCE. Targeting sib's id keeps the
-    // test hermetic against the other export-inbox siblings the fan-out also kicks in the full-suite run.
-    const FLIP_SQL = "UPDATE files SET parse_state = 'pending' WHERE id = ?1";
+    // Make the db.batch that reserves SIB (the hash-pinned reserve flip, bound to sib.fileId) throw ONCE.
+    // Tag sib's flip statement in a WeakSet and trip the batch only when it carries that statement — keeps the
+    // test hermetic against the other export-inbox siblings the same reservation also flips in a full-suite run.
+    const FLIP_SQL = "UPDATE files SET parse_state = 'pending' WHERE id = ?1 AND parse_state = 'parsed' AND content_hash = ?2";
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+    const sibFlip = new WeakSet<object>();
     let sibFlipThrown = false;
     testEnv.DB.prepare = ((sql: string) => {
       const stmt = realPrepare(sql);
       if (sql !== FLIP_SQL) return stmt;
       const realBind = stmt.bind.bind(stmt);
       stmt.bind = (...a: unknown[]) => {
-        if (a[0] === sib.fileId && !sibFlipThrown) {
-          return { run: async () => { sibFlipThrown = true; throw new Error('D1 outage on sibling flip'); } } as unknown as D1PreparedStatement;
-        }
-        return realBind(...a);
+        const bound = realBind(...a);
+        if (a[0] === sib.fileId) sibFlip.add(bound as object);
+        return bound;
       };
       return stmt;
     }) as typeof testEnv.DB.prepare;
+    testEnv.DB.batch = ((stmts: unknown[]) => {
+      if (!sibFlipThrown && Array.isArray(stmts) && stmts.some((s) => sibFlip.has(s as object))) {
+        sibFlipThrown = true;
+        throw new Error('D1 outage on sibling reservation flip');
+      }
+      return realBatch(stmts as never);
+    }) as typeof testEnv.DB.batch;
     try {
-      // First cleanup delivery: the kick's flip throws BEFORE any stale delete → retryable, nothing deleted.
+      // First cleanup delivery: the reservation flip throws BEFORE any stale delete → retryable, nothing deleted.
       await deliver({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
 
-      // POSITIVE CONTROL for kick-BEFORE-delete: because the kick runs before the first delete, a flip
-      // failure leaves every stale session intact (fileA still owns all 6). Under the old delete-then-kick
-      // order the 4 stale rows would already be gone here, and the flip failure would strand the sibling
-      // terminal — the exact silent-drop this reorder eliminates.
+      // POSITIVE CONTROL for reserve-BEFORE-delete: because the reservation runs (and must fully commit)
+      // before the first delete, a flip failure leaves every stale session intact (fileA still owns all 6).
+      // "Delete a stale session before its sibling is at least 'pending'" is exactly what this ordering kills.
       expect(await fileState(replaced.fileId)).toBe('pending');
-      expect(await ownedSessions(replaced.fileId)).toBe(6); // nothing deleted before the kick succeeded
+      expect(await ownedSessions(replaced.fileId)).toBe(6); // nothing deleted before the reservation committed
 
-      // Retry (flip works now): siblings flipped 'pending' FIRST, THEN stale deleted → fileA parsed.
+      // Retry (flip works now): siblings reserved 'pending' FIRST, THEN stale deleted → fileA parsed.
       await deliverChain({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
     } finally {
       testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
+      testEnv.DB.batch = realBatch as typeof testEnv.DB.batch;
     }
     expect(await fileState(replaced.fileId)).toBe('parsed');
     expect(await ownedSessions(replaced.fileId)).toBe(2);
-    expect(await fileState(sib.fileId)).toBe('pending'); // sibling kicked for reparse, never stranded terminal
+    expect(await fileState(sib.fileId)).toBe('pending'); // sibling reserved + recovered, never stranded terminal
   });
 
-  it('a multi-page cleanup kicks each sibling exactly once, not once per continuation (round 7 finding 1)', async () => {
+  it('enqueues NO recover message until cleanup fully drains; siblings sit reserved as pending meanwhile (round 11, flip-early/send-late ordering)', async () => {
     budgets({ slice: 800, invocation: 800 });
-    // A sibling export in the same 'export-inbox' store that fileA's cleanup fan-out will kick.
-    const sib = await uploadConvs('r7f1-sib', [conv('r7f1sib', 0), conv('r7f1sib', 1)]);
+    // A sibling export in the same 'export-inbox' store that fileA's reservation will flip to 'pending'.
+    const sib = await uploadConvs('r11ord-sib', [conv('r11ordsib', 0)]);
     await deliverChain({ file_id: sib.fileId, r2_key: sib.r2Key, reason: 'upload', content_hash: sib.hash });
     expect(await fileState(sib.fileId)).toBe('parsed');
 
-    // fileA: big, then replaced small so its reparse cleanup deletes ~10 stale sessions over MULTIPLE pages.
-    const fileA = await uploadConvs('r7f1', Array.from({ length: 12 }, (_u, i) => conv('r7f1', i)));
+    // fileA: big, then replaced small so its reparse deletes ~10 stale sessions across MANY invocations.
+    const fileA = await uploadConvs('r11ord', Array.from({ length: 12 }, (_u, i) => conv('r11ord', i)));
     await deliverChain({ file_id: fileA.fileId, r2_key: fileA.r2Key, reason: 'upload', content_hash: fileA.hash });
-    const replaced = await uploadConvs('r7f1', Array.from({ length: 2 }, (_u, i) => conv('r7f1', i)));
+    const replaced = await uploadConvs('r11ord', Array.from({ length: 2 }, (_u, i) => conv('r11ord', i)));
 
-    // Count the recover fan-out sends aimed at THIS sibling specifically (hermetic against the other
-    // export-inbox siblings the full-suite DB also carries — those don't touch sib.fileId).
+    // Recover sends aimed at THIS sibling specifically (hermetic against the other export-inbox siblings the
+    // full-suite DB also carries — those don't touch sib.fileId).
     const sibRecoverSends = (): number => sent.filter((m) => m.file_id === sib.fileId && m.reason === 'recover').length;
 
-    // Drive the WRITE phase to completion and stop at the first cleanup continuation: no delete or kick has
-    // run yet, so the sibling is still 'parsed' and un-kicked (kickSiblings fires only in the cleanup loop).
-    budgets({ slice: 8, invocation: 8 });
-    const { stoppedCont } = await deliverChain(
-      { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash },
-      { stopAtCleanup: true },
-    );
-    expect(stoppedCont).toBeDefined();
-    expect(await fileState(sib.fileId)).toBe('parsed'); // not kicked during the write phase
-
-    // Cleanup page 1: the first stale delete fires the fan-out ONCE, flipping the sibling 'parsed' → 'pending'.
-    sent.length = 0;
-    await deliver(stoppedCont!);
-    expect(sibRecoverSends()).toBe(1); // POSITIVE CONTROL: page 1 kicks the sibling
-    expect(await fileState(sib.fileId)).toBe('pending');
-    const contB = sent.find((m) => m.file_id === replaced.fileId && typeof m.offset === 'number');
-    expect(contB).toBeDefined(); // cleanup didn't drain in one page — there IS a second continuation
-
-    // Cleanup page 2: kickSiblings runs again (the per-invocation `kicked` flag reset), but the query now
-    // selects only parse_state='parsed' siblings, so the already-flipped 'pending' sibling is excluded and
-    // issues ZERO further flip/send subrequests. Under the old `parse_state != 'error'` query it would be
-    // re-kicked on every continuation — O(pages × siblings) duplicate recover work that could re-hit the cap.
-    sent.length = 0;
-    await deliver(contB!);
-    expect(sibRecoverSends()).toBe(0); // finding 1 fix: no re-kick on the second page
+    // Tight budget so cleanup (reserve + ~10 deletes) spans MANY invocations. Drive every continuation,
+    // asserting on each pre-completion invocation that the sibling is reserved 'pending' but NO recover
+    // message has gone out yet.
+    budgets({ slice: 6, invocation: 6, kickPage: 50 });
+    let msg: ParseMessage = { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash };
+    let sawReservedPending = false;
+    let recoverBeforeParsed = 0;
+    for (let i = 0; i < 80; i++) {
+      sent.length = 0;
+      await deliver(msg);
+      if ((await fileState(replaced.fileId)) !== 'parsed') {
+        recoverBeforeParsed += sibRecoverSends(); // must stay 0 until cleanup completes
+        if ((await fileState(sib.fileId)) === 'pending') sawReservedPending = true; // reserved, not yet messaged
+      }
+      const cont = sent.find((m) => m.file_id === replaced.fileId && typeof m.offset === 'number');
+      if (!cont) break;
+      msg = cont;
+    }
+    // ORDERING (round 11): the sibling is RESERVED ('pending') during cleanup, but NO recover message is
+    // enqueued until cleanup fully drains and the file is 'parsed'. POSITIVE CONTROL — under the old
+    // flip+send-together kick, page-1 recover messages went out mid-cleanup (recoverBeforeParsed > 0), racing
+    // ahead of the cleanup continuation so a recover parse could skip a still-owned stale row and never re-claim it.
+    expect(await fileState(replaced.fileId)).toBe('parsed');
+    expect(sawReservedPending).toBe(true); // sibling reserved during cleanup
+    expect(recoverBeforeParsed).toBe(0); // zero recover sends before cleanupComplete
+    expect(sibRecoverSends()).toBeGreaterThan(0); // recover message only in the final (post-parsed) invocation
   });
 
   it('a revertSlice failure during rollback still raises ExportRetry, never a terminal error (round 7 finding 2)', async () => {
@@ -1258,66 +1268,24 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(await fileState(b.fileId)).toBe('parsed');
   });
 
-  it('compensates a sibling whose recover send throws, so ExportRetry re-kicks it (round 9 finding 3b)', async () => {
+  it('a recover send failure after cleanup leaves the sibling reserved as pending; the file stays parsed, no compensation (round 11, send-late best-effort)', async () => {
     budgets({ slice: 800, invocation: 800, kickPage: 500 });
-    const sib = await uploadConvs('r9f3b-sib', [conv('r9f3bsib', 0), conv('r9f3bsib', 1)]);
+    const sib = await uploadConvs('r11sl-sib', [conv('r11slsib', 0), conv('r11slsib', 1)]);
     await deliverChain({ file_id: sib.fileId, r2_key: sib.r2Key, reason: 'upload', content_hash: sib.hash });
     expect(await fileState(sib.fileId)).toBe('parsed');
 
-    const fileA = await uploadConvs('r9f3b', Array.from({ length: 4 }, (_u, i) => conv('r9f3b', i)));
+    const fileA = await uploadConvs('r11sl', Array.from({ length: 4 }, (_u, i) => conv('r11sl', i)));
     await deliverChain({ file_id: fileA.fileId, r2_key: fileA.r2Key, reason: 'upload', content_hash: fileA.hash });
-    const replaced = await uploadConvs('r9f3b', [conv('r9f3b', 0)]);
+    const replaced = await uploadConvs('r11sl', [conv('r11sl', 0)]);
 
-    // Make the recover SEND to sib throw exactly once (its flip lands first, THEN the send throws).
+    // Make the SEND-LATE recover message to sib throw. Unlike the deleted flip+send compensation, this runs
+    // AFTER markParsed: sib is already reserved 'pending', so a lost send just leaves it 'pending' for
+    // files/check to heal — nothing to compensate, and the file must stay terminally 'parsed'.
     const realSend = testEnv.PARSE_QUEUE.send;
-    let sibSends = 0;
-    let sendThrown = false;
+    let sibRecoverSends = 0;
     testEnv.PARSE_QUEUE.send = (async (m: ParseMessage) => {
       if (m.file_id === sib.fileId && m.reason === 'recover') {
-        sibSends += 1;
-        if (!sendThrown) {
-          sendThrown = true;
-          throw new Error('queue send outage on recover');
-        }
-      }
-      return (realSend as (b: ParseMessage) => Promise<unknown>)(m);
-    }) as typeof testEnv.PARSE_QUEUE.send;
-    try {
-      // First delivery: cleanup kicks sib → flip 'pending' → send throws → compensate to 'parsed' → ExportRetry.
-      await deliver({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
-      expect(await fileState(replaced.fileId)).toBe('pending'); // retryable
-      expect(await fileState(sib.fileId)).toBe('parsed'); // compensated — NOT left stranded 'pending'
-      // Retry: re-kick sib (2nd send, succeeds) and drain cleanup.
-      await deliverChain({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
-    } finally {
-      testEnv.PARSE_QUEUE.send = realSend;
-    }
-    // POSITIVE CONTROL: swallowing the send failure left sib 'pending' with no message and flipFailed=false,
-    // so it was never re-kicked (send count 1). Compensation + ExportRetry re-kick it (send count 2).
-    expect(sibSends).toBe(2);
-    expect(await fileState(sib.fileId)).toBe('pending'); // kicked for reparse (2nd send landed)
-  });
-
-  it('does not revert a sibling re-uploaded between the failed recover kick and the compensation (round 10 finding 1, hash-guarded compensation)', async () => {
-    budgets({ slice: 800, invocation: 800, kickPage: 500 });
-    const sib = await uploadConvs('r10f1-sib', [conv('r10f1sib', 0)]);
-    await deliverChain({ file_id: sib.fileId, r2_key: sib.r2Key, reason: 'upload', content_hash: sib.hash });
-    expect(await fileState(sib.fileId)).toBe('parsed');
-
-    const fileA = await uploadConvs('r10f1', Array.from({ length: 4 }, (_u, i) => conv('r10f1', i)));
-    await deliverChain({ file_id: fileA.fileId, r2_key: fileA.r2Key, reason: 'upload', content_hash: fileA.hash });
-    const replaced = await uploadConvs('r10f1', [conv('r10f1', 0)]);
-
-    // When the recover send to sib throws, the flip has already landed (sib 'pending' with the OLD hash).
-    // RACE a fresh re-upload of sib in right there (new bytes → new hash, its OWN 'upload' message enqueued
-    // via realSend) so the compensation that follows the throw sees a 'pending' row holding FRESH bytes.
-    const realSend = testEnv.PARSE_QUEUE.send;
-    let freshHash = '';
-    let raced = false;
-    testEnv.PARSE_QUEUE.send = (async (m: ParseMessage) => {
-      if (m.file_id === sib.fileId && m.reason === 'recover' && !raced) {
-        raced = true;
-        freshHash = await reuploadRawExport('r10f1-sib', claudeExportZip([conv('r10f1sib', 0), conv('r10f1sib', 1)]));
+        sibRecoverSends += 1;
         throw new Error('queue send outage on recover');
       }
       return (realSend as (b: ParseMessage) => Promise<unknown>)(m);
@@ -1327,57 +1295,112 @@ describe('large export ingest is bounded and never marks parsed until every conv
     } finally {
       testEnv.PARSE_QUEUE.send = realSend;
     }
-
-    // POSITIVE CONTROL: without `AND content_hash = ?` on the compensation, it reverts sib to 'parsed',
-    // burying the fresh re-upload's pending bytes as terminal 'parsed' (and if that upload's own send were
-    // lost, files/check would treat it complete and never reparse). Hash-guarded, the revert no-ops: sib
-    // stays 'pending' with the FRESH hash, so its own upload parse still runs.
-    expect(freshHash).not.toBe(sib.hash);
-    const row = await testEnv.DB.prepare('SELECT parse_state, content_hash FROM files WHERE id = ?1').bind(sib.fileId).first<{ parse_state: string; content_hash: string }>();
-    expect(row?.parse_state).toBe('pending');
-    expect(row?.content_hash).toBe(freshHash);
+    // POSITIVE CONTROL: the old flip+send-together kick raised ExportRetry on a recover send failure (file →
+    // 'pending', re-kick + compensation). Send-late is best-effort: the send was attempted and failed, but the
+    // file rests terminally 'parsed' (cleanup already committed) and the sibling stays a durable 'pending'
+    // reservation files/check heals — never reverted, never stranded terminal.
+    expect(sibRecoverSends).toBeGreaterThan(0); // the send was attempted
+    expect(await fileState(replaced.fileId)).toBe('parsed'); // terminal, NOT reverted to pending
+    expect(await fileState(sib.fileId)).toBe('pending'); // reserved + healable
   });
 
-  it('bounds the sibling recovery fan-out to one page per cleanup invocation (round 9 finding 4)', async () => {
+  it('the reservation flip is hash-pinned: a sibling re-uploaded (new hash) since the reserve SELECT is never flipped (round 10 hash pin, on the reserve flip)', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    // sib parsed at hashV1, then re-uploaded + reparsed to hashV2 (fresh content, still 'parsed').
+    const sib = await uploadConvs('r10hp-sib', [conv('r10hpsib', 0)]);
+    await deliverChain({ file_id: sib.fileId, r2_key: sib.r2Key, reason: 'upload', content_hash: sib.hash });
+    const hashV1 = sib.hash;
+    const hashV2 = await reuploadRawExport('r10hp-sib', claudeExportZip([conv('r10hpsib', 0), conv('r10hpsib', 1)]));
+    await deliverChain({ file_id: sib.fileId, r2_key: sib.r2Key, reason: 'upload', content_hash: hashV2 });
+    expect(await fileState(sib.fileId)).toBe('parsed');
+    expect(hashV2).not.toBe(hashV1);
+
+    const fileA = await uploadConvs('r10hp', Array.from({ length: 4 }, (_u, i) => conv('r10hp', i)));
+    await deliverChain({ file_id: fileA.fileId, r2_key: fileA.r2Key, reason: 'upload', content_hash: fileA.hash });
+    const replaced = await uploadConvs('r10hp', [conv('r10hp', 0)]);
+
+    // Hook the reserve SELECT to hand back sib's STALE hashV1 (simulating a SELECT that read sib before its
+    // re-upload) while the live DB has sib parsed at hashV2. The hash-pinned flip must then no-op on sib.
+    const RESERVE_SQL = "SELECT id, content_hash FROM files WHERE store = ?1 AND id != ?2 AND id > ?3 AND parse_state = 'parsed' ORDER BY id ASC LIMIT ?4";
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    testEnv.DB.prepare = ((sql: string) => {
+      const stmt = realPrepare(sql);
+      if (sql !== RESERVE_SQL) return stmt;
+      const realBind = stmt.bind.bind(stmt);
+      stmt.bind = (...a: unknown[]) => {
+        const bound = realBind(...a);
+        const realAll = bound.all.bind(bound);
+        (bound as unknown as Record<string, unknown>).all = async (...x: unknown[]) => {
+          const res = await (realAll as (...y: unknown[]) => Promise<{ results: { id: number; content_hash: string }[] }>)(...x);
+          return { ...res, results: res.results.map((r) => (r.id === sib.fileId ? { ...r, content_hash: hashV1 } : r)) };
+        };
+        return bound;
+      };
+      return stmt;
+    }) as typeof testEnv.DB.prepare;
+    try {
+      await deliverChain({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
+    } finally {
+      testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
+    }
+
+    // POSITIVE CONTROL: without `AND content_hash = ?` on the reserve flip, sib (parsed at hashV2) would flip
+    // to 'pending' — burying its fresh content as a stale reservation. Hash-pinned to the stale hashV1, the
+    // flip no-ops: sib stays 'parsed' at hashV2, untouched.
+    const row = await testEnv.DB.prepare('SELECT parse_state, content_hash FROM files WHERE id = ?1').bind(sib.fileId).first<{ parse_state: string; content_hash: string }>();
+    expect(row?.parse_state).toBe('parsed');
+    expect(row?.content_hash).toBe(hashV2);
+  });
+
+  it('bounds the sibling reservation to a budgeted page span, never flipping all siblings in one invocation (round 9 finding 4)', async () => {
     budgets({ slice: 800, invocation: 800 });
-    // main owns 4 sessions, then re-uploaded small so its reparse cleanup reconciles 3 stale (fires fan-out).
+    // main owns 4 sessions, then re-uploaded small so its reparse cleanup reconciles 3 stale (fires reservation).
     const main = await uploadConvs('r9f4-main', Array.from({ length: 4 }, (_u, i) => conv('r9f4main', i)));
     await deliverChain({ file_id: main.fileId, r2_key: main.r2Key, reason: 'upload', content_hash: main.hash });
     const replaced = await uploadConvs('r9f4-main', [conv('r9f4main', 0)]); // enqueues reparse; delivered below
 
-    // Six sibling archives with DISTINCT conversations. Every export UPLOAD kicks parsed siblings back to
-    // 'pending', so upload them ALL first (none parsed yet → no cross-kicking), THEN parse them — leaving all
-    // six 'parsed' at the moment we drive replaced's cleanup (a delivery, not an upload, so it won't churn them).
+    // Six sibling archives with DISTINCT conversations. Every export UPLOAD reservation flips PARSED siblings
+    // to 'pending', so upload them ALL first (none parsed yet → no cross-flipping), THEN parse them — leaving
+    // all six 'parsed' when we drive replaced's cleanup (a delivery, not an upload, so it won't churn them).
     const SIB_COUNT = 6;
     const sibUploads = [];
     for (let i = 0; i < SIB_COUNT; i++) sibUploads.push(await uploadConvs(`r9f4-sib${i}`, [conv(`r9f4sib${i}`, 0)]));
     for (const s of sibUploads) await deliverChain({ file_id: s.fileId, r2_key: s.r2Key, reason: 'upload', content_hash: s.hash });
     const sibs = sibUploads.map((s) => s.fileId);
-    for (const id of sibs) expect(await fileState(id)).toBe('parsed'); // all six parsed at kick time
+    for (const id of sibs) expect(await fileState(id)).toBe('parsed'); // all six parsed at reservation time
 
-    const recoverToSibs = (): number => sent.filter((m) => m.reason === 'recover' && sibs.includes(m.file_id)).length;
+    const pendingSibs = async (): Promise<Set<number>> => {
+      const s = new Set<number>();
+      for (const id of sibs) if ((await fileState(id)) === 'pending') s.add(id);
+      return s;
+    };
 
-    // Tight budget so the fan-out (2 subrequests/sibling) cannot flip all six siblings in one invocation;
-    // drive every continuation, tracking the MOST siblings kicked in any single invocation and the total.
-    budgets({ slice: 8, invocation: 8, kickPage: 2 });
+    // Tight budget + tiny reserve page so the RESERVE pass cannot flip all six siblings in one invocation;
+    // drive every continuation, tracking the MOST of OUR siblings newly reserved in any single invocation.
+    budgets({ slice: 6, invocation: 6, kickPage: 2 });
     let msg: ParseMessage = { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash };
-    let maxSibKicksInOneInvocation = 0;
-    let totalSibKicks = 0;
-    for (let i = 0; i < 60; i++) {
+    let prev = await pendingSibs();
+    let maxNewlyReservedInOneInvocation = 0;
+    let totalNewlyReserved = 0;
+    for (let i = 0; i < 200; i++) {
       sent.length = 0;
       await deliver(msg);
-      const k = recoverToSibs();
-      maxSibKicksInOneInvocation = Math.max(maxSibKicksInOneInvocation, k);
-      totalSibKicks += k;
+      const now = await pendingSibs();
+      let newly = 0;
+      for (const id of now) if (!prev.has(id)) newly += 1;
+      maxNewlyReservedInOneInvocation = Math.max(maxNewlyReservedInOneInvocation, newly);
+      totalNewlyReserved += newly;
+      prev = now;
       const cont = sent.find((m) => m.file_id === replaced.fileId && typeof m.offset === 'number');
       if (!cont) break;
       msg = cont;
     }
-    // POSITIVE CONTROL: the unbounded fan-out kicks ALL six siblings in ONE invocation (max 6). Paged and
-    // budget-cut, no single invocation can flip all of them — the fan-out spans continuations, and every
-    // sibling is kicked exactly once (total 6) and ends 'pending'.
-    expect(maxSibKicksInOneInvocation).toBeLessThan(SIB_COUNT);
-    expect(totalSibKicks).toBe(SIB_COUNT);
+    // POSITIVE CONTROL: an unbounded reservation flips ALL six siblings in ONE invocation (max 6). Paged at
+    // kickPage=2 and budget-cut, no single invocation reserves all of them — the reservation spans
+    // continuations, and every sibling is reserved exactly once (total 6) and ends 'pending'.
+    expect(await fileState(replaced.fileId)).toBe('parsed');
+    expect(maxNewlyReservedInOneInvocation).toBeLessThan(SIB_COUNT);
+    expect(totalNewlyReserved).toBe(SIB_COUNT);
     for (const id of sibs) expect(await fileState(id)).toBe('pending');
   });
 
@@ -1503,6 +1526,47 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(await canonicalOwner(xId)).toBe(a.fileId);
     expect(await sessionState(xId)).toBe('ready');
     expect(await fileState(b.fileId)).toBe('parsed');
+  });
+
+  it('skips an older archive claiming a conversation whose NEWER owner is still parsing, not just ready (round 11 finding 3608613136)', async () => {
+    budgets({ slice: 800, invocation: 800 });
+    const convTag = 'r11mtp';
+    // A = the NEWER archive (later mtime): owns X, then X forced to 'parsing' (A mid-reparse, not yet ready).
+    const a = await uploadConvs('r11mtp-a', [conv(convTag, 0)], '2026-07-02T12:00:00Z');
+    await deliverChain({ file_id: a.fileId, r2_key: a.r2Key, reason: 'upload', content_hash: a.hash });
+    const xId = `bnd-${convTag}-conv-0`;
+    expect(await canonicalOwner(xId)).toBe(a.fileId);
+    await testEnv.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(xId).run();
+
+    // B = an OLDER archive (earlier mtime) containing X, healed as reason 'upload'. It must NOT steal X even
+    // though A's row is 'parsing' (mid-reparse) rather than 'ready'.
+    const b = await uploadConvs('r11mtp-b', [conv(convTag, 0)], '2026-07-01T12:00:00Z');
+    await deliver({ file_id: b.fileId, r2_key: b.r2Key, reason: 'upload', content_hash: b.hash });
+
+    // POSITIVE CONTROL: gating the mtime skip on healthyOtherOwner (index_state='ready') let B claim X while
+    // A was 'parsing'. Gated on otherOwner (any non-error state), the strictly-newer-owner skip fires — X
+    // keeps A's ownership. Revert the guard from `otherOwner` to `healthyOtherOwner` → B claims X → fails.
+    expect(await canonicalOwner(xId)).toBe(a.fileId);
+    expect(await fileState(b.fileId)).toBe('parsed'); // B completes, owning nothing
+  });
+
+  it('a NEWER archive still claims a conversation whose OLDER owner is parsing (round 11 finding 3608613136, directional positive control)', async () => {
+    budgets({ slice: 800, invocation: 800 });
+    const convTag = 'r11mtn';
+    // A = the OLDER archive (earlier mtime): owns X, then X forced to 'parsing'.
+    const a = await uploadConvs('r11mtn-a', [conv(convTag, 0)], '2026-07-01T12:00:00Z');
+    await deliverChain({ file_id: a.fileId, r2_key: a.r2Key, reason: 'upload', content_hash: a.hash });
+    const xId = `bnd-${convTag}-conv-0`;
+    expect(await canonicalOwner(xId)).toBe(a.fileId);
+    await testEnv.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(xId).run();
+
+    // B = a NEWER archive: it MUST claim X (newer wins) despite A's row being 'parsing' — the guard is
+    // directional, only blocking strictly-OLDER archives, never a genuinely newer upload.
+    const b = await uploadConvs('r11mtn-b', [conv(convTag, 0)], '2026-07-02T12:00:00Z');
+    await deliverChain({ file_id: b.fileId, r2_key: b.r2Key, reason: 'upload', content_hash: b.hash });
+
+    expect(await canonicalOwner(xId)).toBe(b.fileId); // newer archive claimed it
+    expect(await sessionState(xId)).toBe('ready');
   });
 
   it('cleanup deletes are atomic hash-guarded: a hash flip between the recheck and the delete batch no-ops them (round 4 finding 3)', async () => {
