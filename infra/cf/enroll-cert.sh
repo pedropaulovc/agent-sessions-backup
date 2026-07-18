@@ -75,6 +75,30 @@ CRT="$OUT_DIR/${MACHINE_ID}.client.pem"
 # survives an aborted re-enroll intact.)
 CRT_TMP="$CRT.new"
 
+# FAIL EARLY on an unresolved prior enrollment. When a previous run hit the ambiguous D1-failure path
+# (wrangler exited non-zero AND the follow-up verify read also failed), it deliberately LEFT $CRT_TMP
+# behind as a possibly-REGISTERED PEM — the row may or may not carry this cert. Silently overwriting it
+# now defeats that safeguard: if that earlier INSERT actually committed, this run reads the row's OLD
+# fingerprint, revokes THIS run's freshly-minted cert (correct), but has already clobbered the registered
+# PEM — leaving the machine registered to a cert no longer on disk. So refuse to run and make the operator
+# resolve the ambiguity by comparing the registered fingerprint to this temp cert's; the two exits below
+# ($CRT_TMP either promoted or deleted) are the only ways past this guard.
+if [ -f "$CRT_TMP" ]; then
+  TMP_FP="$(openssl x509 -in "$CRT_TMP" -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}' || true)"
+  echo "ABORT: an unresolved enrollment cert from a previous run is still at $CRT_TMP" >&2
+  echo "  A prior run left it after an ambiguous D1 write (couldn't confirm whether the row registered it)." >&2
+  echo "  Resolve it BEFORE re-enrolling — overwriting it could strand this machine on a revoked cert:" >&2
+  echo "  1) Read the registered fingerprint from D1:" >&2
+  echo "       CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID npx wrangler d1 execute $DB_NAME --remote \\" >&2
+  echo "         --command \"SELECT cert_fp_sha256 FROM machines WHERE machine_id='$MACHINE_ID';\"" >&2
+  echo "  2) Compare it to THIS temp cert's fingerprint: ${TMP_FP:-<unparseable — treat as 'differs', go to 3b>}" >&2
+  echo "  3a) MATCH -> enrollment actually succeeded; promote the temp cert and you're done (do NOT re-run):" >&2
+  echo "        mv $CRT_TMP $CRT" >&2
+  echo "  3b) DIFFERS or no row -> this temp cert is unused; delete it, then re-run this script:" >&2
+  echo "        rm -f $CRT_TMP" >&2
+  exit 1
+fi
+
 echo "==> generating software EC P-256 key + CSR (WSL2/no-TPM fallback)"
 umask 077
 [ -f "$KEY" ] || openssl ecparam -name prime256v1 -genkey -noout -out "$KEY"

@@ -23,7 +23,12 @@ export async function heartbeat(request: Request, env: Env, identity: Identity):
   ]);
   console.log(JSON.stringify({ event: 'hub.heartbeat', machine: identity.machineId }));
   for (const e of body.events ?? []) {
-    console.log(JSON.stringify({ event: 'collector.event', machine: identity.machineId, ...e }));
+    // Nest the machine-supplied event under `payload` — NEVER spread it at top level. Spreading let a
+    // collector set `event`/`machine` itself and forge a hub log line (e.g. hub.certs.cf_auth_failed) to
+    // page us with a fake dead-token alert or bury a real one. `event` and `machine` (from the cert
+    // identity) stay hub-controlled; nothing in `payload` can collide with them. collector-errors.kql
+    // reads body.payload.{level,code,message} to match.
+    console.log(JSON.stringify({ event: 'collector.event', machine: identity.machineId, payload: e }));
   }
   return Response.json({ ok: true });
 }
@@ -77,6 +82,13 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
 
   const invalidCert = validateCertFields(body);
   if (invalidCert) return invalidCert;
+
+  // is_admin is a PRIVILEGE flag. A form serializing it as the string "false" is truthy, so the
+  // `body.is_admin ? 1 : 0` below would grant admin — a privilege escalation by serialization bug.
+  // Require an actual boolean; reject anything else before it can reach the integer conversion.
+  if (body.is_admin !== undefined && typeof body.is_admin !== 'boolean') {
+    return Response.json({ error: 'invalid_is_admin' }, { status: 422 });
+  }
 
   if (body.machine_id) {
     // Two write paths. A request carrying NO cert fields (cert_fp_sha256/cert_id) is a metadata edit

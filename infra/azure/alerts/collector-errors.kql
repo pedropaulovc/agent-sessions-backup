@@ -19,10 +19,15 @@
 //
 // See missed-heartbeat.kql for the OTelLogs/Body-as-JSON assumption this query
 // shares. The hub relays each collector error as
-// { event: "collector.event", machine: <id>, level, code, message, ... }
-// (hub/src/api/ops.ts). ASSUMPTION TO VERIFY AT M4 DEPLOY: confirm the
-// table/column names once real data flows, and confirm `level` (not `severity`
-// or the OTLP-native SeverityText column) is the field the JSON payload uses.
+// { event: "collector.event", machine: <id>, payload: { level, code, message, ... } }
+// (hub/src/api/ops.ts). The machine-supplied fields are NESTED under `payload` on
+// purpose: `event` and `machine` are hub-controlled (machine from the cert
+// identity), so a collector cannot forge `event: "hub.certs.cf_auth_failed"` (or
+// any hub event) to spoof an alert — its fields can only ever land inside
+// `payload`. That is why this query reads level/code/message from body.payload.*,
+// not body.*. ASSUMPTION TO VERIFY AT M4 DEPLOY: confirm the table/column names
+// once real data flows, and confirm `level` (not `severity` or the OTLP-native
+// SeverityText column) is the field the nested JSON payload uses.
 
 // `otel` wraps OTelLogs in `union isfuzzy=true` so a missing table (before the
 // first OTLP log lands) degrades to empty instead of erroring the whole rule —
@@ -33,6 +38,6 @@ let otel = union isfuzzy=true
 otel
 | where TimeGenerated > ago(1h)
 | extend body = todynamic(Body)
-| where body.event == "collector.event" and body.level == "error"
-| extend machine = tostring(body.machine), code = tostring(body.code), message = tostring(body.message)
-| project TimeGenerated, machine, level = tostring(body.level), code, message
+| where body.event == "collector.event" and body.payload.level == "error"
+| extend machine = tostring(body.machine), code = tostring(body.payload.code), message = tostring(body.payload.message)
+| project TimeGenerated, machine, level = tostring(body.payload.level), code, message

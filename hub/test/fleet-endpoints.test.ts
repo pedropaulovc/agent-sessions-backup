@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { machineIdentity, type Identity } from '../src/auth/identity';
 import { bootstrap, COLLECTOR_CONFIG_SCHEMA_VERSION, DEFAULT_COLLECTOR_CONFIG } from '../src/api/bootstrap';
 import { renewCert, certFingerprint, settleRetired, revokeClientCert, pollRetired } from '../src/api/certs';
-import { adminMachines } from '../src/api/ops';
+import { adminMachines, heartbeat } from '../src/api/ops';
 import { runDailyPrune } from '../src/cron/prune';
 import { route } from '../src/router';
 
@@ -711,6 +711,22 @@ describe('POST /api/v1/admin/machines', () => {
     expect(r?.is_admin).toBe(1); // preserved
   });
 
+  it('422s a string is_admin flag instead of granting admin by truthiness', async () => {
+    // A full-row form serializing is_admin as the string "false" is truthy — accepting it would store 1
+    // and GRANT admin. Require an actual boolean; reject the string before any write.
+    const res = await adminMachines(reqJson({ machine_id: 'ia-str', is_admin: 'false' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as { error: string }).error).toBe('invalid_is_admin');
+    expect(await row('ia-str')).toBeNull(); // never created
+  });
+
+  it('is_admin: false CLEARS the admin flag (positive control: true sets it)', async () => {
+    await adminMachines(reqJson({ machine_id: 'ia-clear', is_admin: true, priority: 4 }), testEnv, machine('am-admin', true));
+    expect((await row('ia-clear'))?.is_admin).toBe(1); // set by boolean true
+    await adminMachines(reqJson({ machine_id: 'ia-clear', is_admin: false }), testEnv, machine('am-admin', true));
+    expect((await row('ia-clear'))?.is_admin).toBe(0); // cleared by boolean false, not left truthy
+  });
+
   it('409s a duplicate CURRENT fingerprint (explicit pre-check, not a UNIQUE-violation catch)', async () => {
     await adminMachines(reqJson({ machine_id: 'am-a', cert_fp_sha256: hexfp('fp-dup') }), testEnv, machine('am-admin', true));
     const res = await adminMachines(reqJson({ machine_id: 'am-b', cert_fp_sha256: hexfp('fp-dup') }), testEnv, machine('am-admin', true));
@@ -1278,6 +1294,40 @@ describe('POST /api/v1/admin/machines', () => {
     expect((await row('cas-race'))?.cert_fp_sha256).toBe('cas-B'); // renewed cert survived
     // CAS miss => the guarded retirement INSERTs in the same batch queued nothing.
     expect(await retired('cas-A')).toBeNull();
+  });
+});
+
+describe('POST /api/v1/heartbeat collector-event relay', () => {
+  function hbReq(events: unknown[]): Request {
+    return new Request('https://api.sessions.vza.net/api/v1/heartbeat', {
+      method: 'POST',
+      body: JSON.stringify({ collector_version: 'test', events }),
+      headers: { 'content-type': 'application/json' },
+    });
+  }
+
+  it('nests collector-supplied fields under payload so a collector cannot forge a hub event', async () => {
+    // A malicious/buggy collector puts event:'hub.certs.cf_auth_failed' + machine:'evil' in its event.
+    // The relayed log line must keep event='collector.event' (hub-set) and machine from the cert identity;
+    // the forged values can only ever appear INSIDE payload, where the alert queries never read them.
+    await seedMachine('hb-spoof', { fp: hexfp('hb-fp') });
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { logs.push(String(args[0])); });
+    const res = await heartbeat(
+      hbReq([{ level: 'error', code: 'c', message: 'm', event: 'hub.certs.cf_auth_failed', machine: 'evil' }]),
+      testEnv,
+      machine('hb-spoof'),
+    );
+    spy.mockRestore();
+    expect(res.status).toBe(200);
+    const parsed = logs.map((l) => JSON.parse(l) as Record<string, unknown>);
+    const relayed = parsed.find((o) => o.event === 'collector.event') as { event: string; machine: string; payload: Record<string, unknown> };
+    expect(relayed.event).toBe('collector.event'); // hub-controlled, NOT the forged value
+    expect(relayed.machine).toBe('hb-spoof'); // from the cert identity, NOT 'evil'
+    expect(relayed.payload.event).toBe('hub.certs.cf_auth_failed'); // forged value quarantined in payload
+    expect(relayed.payload.level).toBe('error'); // real collector fields still present under payload
+    // positive control: NO emitted line carries the forged event at top level (nothing to page on)
+    expect(parsed.some((o) => o.event === 'hub.certs.cf_auth_failed')).toBe(false);
   });
 });
 
