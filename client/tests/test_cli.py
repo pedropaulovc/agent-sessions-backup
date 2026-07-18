@@ -116,6 +116,17 @@ def test_daily_report_invalid_calendar_date_rejected(hub, capsys):
     assert hub.requests == []
 
 
+def test_daily_report_malformed_hub_url_returns_error_not_traceback(capsys, monkeypatch):
+    # A malformed --hub-url (no scheme) makes urllib.request.Request() raise ValueError deep
+    # inside HubClient.get(), past the CLI's HubError-only handler for API calls — must be
+    # caught at config-load time instead, before any request is attempted.
+    monkeypatch.delenv("AGENT_SESSIONS_BEARER_TOKEN", raising=False)
+    monkeypatch.delenv("AGENT_SESSIONS_DEV_MACHINE", raising=False)
+    rc = main(["daily-report", "--hub-url", "not-a-url", "--bearer-token", "tok", "--dev-machine", "m"])
+    assert rc == 2
+    assert "error:" in capsys.readouterr().err
+
+
 def test_daily_report_connection_failure_returns_error(capsys):
     rc = main(
         [

@@ -1,7 +1,7 @@
 from agent_sessions_client.models import UsageRow
 
 
-def usage_row(bucket, *, input_tokens=0, output_tokens=0, reasoning_tokens=0, cache_read_tokens=0, cache_creation_5m_tokens=0, cache_creation_1h_tokens=0):
+def usage_row(bucket, *, group_by="model", input_tokens=0, output_tokens=0, reasoning_tokens=0, cache_read_tokens=0, cache_creation_5m_tokens=0, cache_creation_1h_tokens=0):
     return UsageRow(
         bucket=bucket,
         calls=1,
@@ -11,6 +11,7 @@ def usage_row(bucket, *, input_tokens=0, output_tokens=0, reasoning_tokens=0, ca
         cache_read_tokens=cache_read_tokens,
         cache_creation_5m_tokens=cache_creation_5m_tokens,
         cache_creation_1h_tokens=cache_creation_1h_tokens,
+        group_by=group_by,
     )
 
 
@@ -56,3 +57,19 @@ def test_total_tokens_synthetic_placeholder_bucket_is_harmless():
     # misclassifying it as non-additive changes nothing.
     row = usage_row("<synthetic>")
     assert row.total_tokens == 0
+
+
+def test_total_tokens_group_by_machine_with_claude_prefixed_bucket_stays_conservative():
+    # A machine_id (group_by=machine) or repo path (group_by=repo) can coincidentally start
+    # with 'claude' for reasons unrelated to the Anthropic model-name heuristic (e.g. a
+    # machine literally named 'claude-box') — the prefix check must only ever fire for
+    # group_by=model, or this row (which could be entirely Codex-only traffic) gets its
+    # cache_read/reasoning double-counted.
+    row = usage_row("claude-box", group_by="machine", input_tokens=900, output_tokens=80, reasoning_tokens=20, cache_read_tokens=500)
+    assert row.total_tokens == 980  # NOT 900 + 80 + 20 + 500 = 1500
+
+
+def test_total_tokens_group_by_model_with_claude_prefix_still_additive():
+    # Sanity check that the group_by gate doesn't break the real, intended case.
+    row = usage_row("claude-sonnet-5", group_by="model", input_tokens=100, output_tokens=200, cache_read_tokens=50)
+    assert row.total_tokens == 100 + 200 + 50

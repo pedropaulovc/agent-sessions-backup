@@ -141,9 +141,15 @@ class UsageRow:
     cache_read_tokens: int
     cache_creation_5m_tokens: int
     cache_creation_1h_tokens: int
+    # The `group_by` this row was fetched with — needed by total_tokens below to know whether
+    # `bucket` is actually a model name (see that property's docstring). Defaults to "model"
+    # so directly-constructed rows (as in existing tests that only ever use model buckets)
+    # keep the additive-when-claude-prefixed behavior without every call site having to pass
+    # it; from_row() below always sets it explicitly from the real request/response.
+    group_by: str = "model"
 
     @classmethod
-    def from_row(cls, row: dict) -> UsageRow:
+    def from_row(cls, row: dict, *, group_by: str) -> UsageRow:
         return cls(
             bucket=row.get("bucket"),
             calls=row.get("calls") or 0,
@@ -153,6 +159,7 @@ class UsageRow:
             cache_read_tokens=row.get("cache_read_tokens") or 0,
             cache_creation_5m_tokens=row.get("cache_creation_5m_tokens") or 0,
             cache_creation_1h_tokens=row.get("cache_creation_1h_tokens") or 0,
+            group_by=group_by,
         )
 
     @property
@@ -178,21 +185,25 @@ class UsageRow:
           double-counted) and not 1480 (also double-counting cache_read).
 
         The only per-row discriminator this dataclass has is `bucket`, which is the model
-        name ONLY when the request used `group_by=model` (the daily-report CLI always does —
-        see cli.py). For any other `group_by` (day/machine/repo), `bucket` mixes rows from
-        multiple providers under one aggregate, so there is no correct per-row answer;
-        treating it as Anthropic-additive would be right for the Anthropic share and wrong
-        for the OpenAI share. This falls back to the conservative (OpenAI-style, cache_read
-        and reasoning excluded) treatment whenever `bucket` doesn't look like an Anthropic
-        model name (i.e. doesn't start with `claude`) — undercounting a mixed/unresolved
-        bucket is safer than double-counting it, since this value feeds "biggest spender"
-        rankings. Verified against production usage rows (2026-07-18): every claude-code-
-        harness model starts with `claude` (e.g. `claude-fable-5`); every codex-harness model
-        does not (`gpt-5.x`, `gpt-5.x-codex`). Future provider/model-naming drift could break
-        this — if a new provider's model names start with `claude` (unlikely) or an Anthropic
-        model line drops the prefix, this heuristic needs revisiting.
+        name ONLY when `group_by` (see the field above) is `"model"` (the daily-report CLI
+        always uses `group_by=model` — see cli.py). For any other `group_by`
+        (day/machine/repo), `bucket` mixes rows from multiple providers under one aggregate,
+        so there is no correct per-row answer; treating it as Anthropic-additive would be
+        right for the Anthropic share and wrong for the OpenAI share — and worse, `bucket`
+        could coincidentally start with `claude` for an unrelated reason (a machine_id like
+        `claude-box`, a repo path under `claude-tools/`), corrupting a mixed or even
+        entirely-Codex aggregate. The claude-prefix check below is therefore gated on
+        `group_by == "model"` first; every other grouping unconditionally gets the
+        conservative (OpenAI-style, cache_read and reasoning excluded) treatment —
+        undercounting a mixed/unresolved bucket is safer than double-counting it, since this
+        value feeds "biggest spender" rankings. Verified against production usage rows
+        (2026-07-18): every claude-code-harness model starts with `claude` (e.g.
+        `claude-fable-5`); every codex-harness model does not (`gpt-5.x`, `gpt-5.x-codex`).
+        Future provider/model-naming drift could break this — if a new provider's model names
+        start with `claude` (unlikely) or an Anthropic model line drops the prefix, this
+        heuristic needs revisiting.
         """
-        is_anthropic_like = bool(self.bucket) and self.bucket.startswith("claude")
+        is_anthropic_like = self.group_by == "model" and bool(self.bucket) and self.bucket.startswith("claude")
         total = self.input_tokens + self.output_tokens + self.cache_creation_5m_tokens + self.cache_creation_1h_tokens
         if is_anthropic_like:
             total += self.cache_read_tokens + self.reasoning_tokens

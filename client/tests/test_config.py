@@ -54,6 +54,22 @@ def test_bearer_wins_over_mtls_config_when_both_present(tmp_path):
     assert config.auth_mode is AuthMode.BEARER
 
 
+def test_bearer_mode_still_uses_configured_hub_url_from_file(tmp_path):
+    # Bearer mode used to return before ever reading config_path, so a non-default hub_url
+    # configured there (e.g. pointing local/preview runs away from production) was silently
+    # ignored — bearer credentials would target DEFAULT_HUB_URL instead.
+    config_path = tmp_path / "config.toml"
+    config_path.write_text('hub_url = "https://preview-from-file.example"\n')
+    config = load_config(config_path=config_path, bearer_token="tok", dev_machine="m1")
+    assert config.auth_mode is AuthMode.BEARER
+    assert config.hub_url == "https://preview-from-file.example"
+
+
+def test_malformed_hub_url_rejected():
+    with pytest.raises(ValueError, match="invalid hub_url"):
+        load_config(hub_url="not-a-url", bearer_token="tok", dev_machine="m")
+
+
 def test_client_config_coerces_plain_string_auth_mode():
     # AuthMode subclasses str, so a caller (ClientConfig is exported) passing the plain string
     # "bearer" instead of AuthMode.BEARER must behave identically — not silently skip the `is

@@ -160,7 +160,14 @@ class SessionsApi:
         """GET /api/v1/usage?group_by=day|model|machine|repo&from&to"""
         resp = self._client.get("/api/v1/usage", {"group_by": group_by, "from": from_, "to": to})
         body = resp.json()
-        return UsageReport(group_by=body["group_by"], rows=[UsageRow.from_row(r) for r in body.get("rows", [])])
+        # Thread the response's own group_by (not the request kwarg — same value in practice,
+        # but this is what the hub actually says it grouped by) into every row: UsageRow.
+        # total_tokens needs it to know whether `bucket` is safe to treat as a model name.
+        resolved_group_by = body["group_by"]
+        return UsageReport(
+            group_by=resolved_group_by,
+            rows=[UsageRow.from_row(r, group_by=resolved_group_by) for r in body.get("rows", [])],
+        )
 
     def status(self) -> HubStatus:
         """GET /api/v1/status — per-machine index-completeness introspection."""

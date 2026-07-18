@@ -241,8 +241,9 @@ CERT=~/.config/agent-collector/amet-wsl.client.pem
 KEY=~/.config/agent-collector/amet-wsl.client.key
 BASE=https://api.sessions.vza.net
 
-# today's sessions, meta only (cheap)
-curl --cert $CERT --key $KEY "$BASE/api/v1/sessions?from=2026-07-18&to=2026-07-18"
+# today's sessions, meta only (cheap) — limit=1000 to match the CLI's request and hit the
+# real cap, not the hub's 200-row default (which would silently undercount on a busy day)
+curl --cert $CERT --key $KEY "$BASE/api/v1/sessions?from=2026-07-18&to=2026-07-18&limit=1000"
 
 # streaming NDJSON with full parsed content (expensive per row)
 curl --cert $CERT --key $KEY "$BASE/api/v1/sessions?from=2026-07-18&format=ndjson"
