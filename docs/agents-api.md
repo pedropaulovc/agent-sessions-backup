@@ -54,11 +54,23 @@ on demand and emits one `{"meta": {...}, "session": <NormalizedSession>}` line p
 Much more expensive per row — only use it when you actually need turn content, not just
 counts.
 
-**There is no pagination on this endpoint** — no `cursor`/`offset`, just the hard 1000-row
-`limit` cap (`clampLimit()` in `hub/src/api/sessions.ts`). If a query returns exactly
-`limit` rows, treat it as possibly truncated and narrow the window (split by machine, by
-harness, or into smaller time ranges) rather than trusting the count. `/api/v1/search`, by
-contrast, *does* support a `cursor` — don't confuse the two.
+**This endpoint paginates with a keyset `cursor`**, not an offset. The JSON response is
+`{sessions: [...], indexed_through, cursor}` — `cursor` is present only when more rows match
+than fit in this page (internal page size = `limit`, default 200, hard max 1000 via
+`clampLimit()`); when absent, you've seen everything. Pass it back as `?cursor=...` (plus the
+same filters) to fetch the next page. The cursor encodes the last row's
+`(started_at, session_id)` boundary rather than a row offset, so pages stay correct even while
+the hub is actively ingesting new sessions concurrently (an offset would repeat or skip rows
+under concurrent inserts; a keyset boundary can't be invalidated that way).
+
+`format=ndjson` has its own, tighter cap: each request streams at most
+`NDJSON_MAX_ROWS_PER_REQUEST` (300) rows regardless of `limit`. If more rows match, the last
+line of the stream is a control line `{"cursor": "..."}` — no `meta`/`session` keys, so it's
+distinguishable from a normal row — instead of the stream just silently stopping. Re-request
+with `?cursor=...&format=ndjson` (same filters) to continue; a natural end-of-results page
+(fewer than the cap) has no trailer line. `client/`'s `SessionsApi.list_sessions()` and
+`iter_sessions_ndjson()` both follow this transparently — see "Python client" below — so you
+only need to hand-roll cursor-following if you're calling the HTTP API directly.
 
 The response's `X-Indexed-Through` header (mirrored as `indexed_through` in the JSON body)
 is `MIN(COALESCE(last_seen_at, created_at))` across **every machine in the fleet**,
@@ -186,8 +198,9 @@ the plan, until they're reconciled:
   all, unlike `/api/v1/sessions` and `/api/v1/search`. A report scoped to one machine or
   harness still gets fleet-wide token totals from this endpoint; say so rather than
   presenting them as scoped (see the CLI's behavior above).
-- `/api/v1/sessions` has no cursor/pagination at all; the plan's endpoint list implies more
-  uniform pagination across endpoints than exists.
+- `/api/v1/sessions`'s cursor is a keyset boundary `(started_at, session_id)`, not the opaque
+  offset cursor `/api/v1/search` uses — the two endpoints' `cursor` params are not
+  interchangeable or shaped the same, despite sharing a param name.
 - `GET /api/v1/bootstrap`, `POST /api/v1/certs/renew`, and `POST /api/v1/admin/machines`
   (from the plan's API-contract section) aren't implemented. Only `POST /api/v1/admin/reindex`
   exists under `/admin`, and it requires `isAdmin` on the calling machine's cert.
@@ -212,7 +225,7 @@ config = load_config()  # reads ~/.config/agent-collector/config.toml by default
 api = SessionsApi(HubClient(config))
 
 page = api.list_sessions(from_="2026-07-18", to="2026-07-18")
-print(page.indexed_through, page.truncated, len(page.sessions))
+print(page.indexed_through, len(page.sessions))  # follows the hub's cursor internally; complete set
 
 usage = api.usage(group_by="model", from_="2026-07-18", to="2026-07-18")
 for row in usage.rows:
@@ -242,7 +255,9 @@ KEY=~/.config/agent-collector/amet-wsl.client.key
 BASE=https://api.sessions.vza.net
 
 # today's sessions, meta only (cheap) — limit=1000 to match the CLI's request and hit the
-# real cap, not the hub's 200-row default (which would silently undercount on a busy day)
+# hard per-page cap, not the hub's 200-row default (which would need more page fetches on a
+# busy day). If the response has a "cursor", more rows matched than fit in this page — pass
+# it back as &cursor=... to continue.
 curl --cert $CERT --key $KEY "$BASE/api/v1/sessions?from=2026-07-18&to=2026-07-18&limit=1000"
 
 # streaming NDJSON with full parsed content (expensive per row)
