@@ -61,14 +61,20 @@ harness, or into smaller time ranges) rather than trusting the count. `/api/v1/s
 contrast, *does* support a `cursor` — don't confuse the two.
 
 The response's `X-Indexed-Through` header (mirrored as `indexed_through` in the JSON body)
-is `MIN(last_seen_at)` across **every machine in the fleet**, regardless of your
-`machine`/`harness` filter — see "Known contract gaps" below before treating it as a
-per-filter freshness signal.
+is `MIN(COALESCE(last_seen_at, created_at))` across **every machine in the fleet**,
+regardless of your `machine`/`harness` filter — see "Known contract gaps" below before
+treating it as a per-filter freshness signal. The `created_at` fallback matters for a machine
+that has enrolled but never actually heartbeated: don't read its `indexed_through` as "synced
+through T," it's just enrollment time. This is easy to hit in dev/preview environments, where
+ANY authenticated request from an unrecognized `x-dev-machine` auto-registers a `machines` row
+for it (see `hub/src/auth/identity.ts::devHeaderIdentity`) without that machine ever having
+sent a heartbeat — including a plain read like this one.
 
 ### `GET /api/v1/sessions/{id}`
 One session, fully parsed: `{meta: <sessions row>, session: <NormalizedSession|null>}`.
-`session` is `null` if the canonical R2 object went missing (rare; means data loss, not a
-parse failure — those still return the row with `index_state='error'`).
+`session` is `null` if the canonical R2 object went missing (rare — actual data loss, not a
+parse failure). Either way the row's `index_state` is `'error'`; see `index_state` below for
+why the two aren't distinguishable from `meta` alone, and how to tell them apart via `/raw`.
 
 ### `GET /api/v1/sessions/{id}/raw`
 The response shape depends on what the session's canonical file actually is
@@ -126,9 +132,18 @@ counts for date D": compare its `indexed_through` to D's end-of-day bound.
 
 ### `index_state`
 Every session row carries `index_state`: `parsing` (queued/reparsing — block/FTS content may
-be stale or absent), `ready` (fully indexed), `error` (parse failed; the raw file is still
-safe in R2, just not searchable/renderable). A report that counts sessions should count
-`error` ones too (as "present but not analyzable"), not silently drop them.
+be stale or absent), `ready` (fully indexed), `error` (parse failed). A report that counts
+sessions should count `error` ones too (as "present but not analyzable"), not silently drop
+them.
+
+`error` does NOT reliably mean the raw file is still safe in R2. Usually it does — a malformed
+line or an empty parse leaves the canonical object untouched, just unindexed. But
+`hub/src/ingest/consumer.ts` also flips a session to `error` when the canonical R2 object
+itself is gone (`r2_object_missing`, e.g. deleted out from under the row) — actual data loss,
+not a parse failure. The `sessions` row exposed by this API doesn't carry a field that
+distinguishes the two cases. If you need to know, fetch `GET /api/v1/sessions/{id}/raw`: a 404
+there on an `error` session means the object is gone — treat that as loss and don't retry-loop
+on it, it will not come back.
 
 ## Known contract gaps (plan vs. deployed hub, as of 2026-07-18)
 

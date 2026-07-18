@@ -6,6 +6,7 @@ backed keys aren't file-based; this client never touches a TPM key).
 
 from __future__ import annotations
 
+import http.client
 import json
 import ssl
 import urllib.error
@@ -62,6 +63,12 @@ class HubResponse:
             raise HubError(None, f"timed out reading response body: {e}") from e
         except OSError as e:
             raise HubError(None, str(e)) from e
+        except http.client.HTTPException as e:
+            # A 200 that advertises a Content-Length longer than what actually arrives (hub
+            # or proxy closes early) raises http.client.IncompleteRead here, which is NOT an
+            # OSError — it'd otherwise slip past the wrapper above same as BadStatusLine does
+            # in get() (see that except clause's comment).
+            raise HubError(None, str(e)) from e
         finally:
             self._fp.close()
 
@@ -77,6 +84,10 @@ class HubResponse:
         except TimeoutError as e:
             raise HubError(None, f"timed out reading response body: {e}") from e
         except OSError as e:
+            raise HubError(None, str(e)) from e
+        except http.client.HTTPException as e:
+            # See _read_body()'s matching except clause — IncompleteRead (or another
+            # HTTPException) mid-stream isn't an OSError and would otherwise bypass this.
             raise HubError(None, str(e)) from e
         finally:
             self._fp.close()
@@ -144,6 +155,12 @@ class HubClient:
             raise HubError(None, f"timed out after {self._timeout}s") from e
         except urllib.error.URLError as e:
             raise HubError(None, str(e.reason)) from e
+        except (OSError, http.client.HTTPException) as e:
+            # A connection accepted then reset before valid headers arrive raises
+            # ConnectionResetError (an OSError) or http.client.BadStatusLine (an
+            # HTTPException) directly — urlopen doesn't wrap either in URLError like it
+            # does for the more common connect-refused/DNS-failure cases above.
+            raise HubError(None, str(e)) from e
         headers = {k.lower(): v for k, v in fp.headers.items()}
         return HubResponse(status=fp.status, headers=headers, _fp=fp)
 

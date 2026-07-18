@@ -186,6 +186,48 @@ def test_ndjson_body_stall_after_headers_raises_hub_error():
             list(resp.iter_lines())
 
 
+def test_connection_reset_before_headers_raises_hub_error():
+    # get()'s except clauses only covered HTTPError/TimeoutError/URLError. A connection
+    # accepted then closed before any status line arrives raises http.client.RemoteDisconnected
+    # directly (a ConnectionResetError/BadStatusLine subclass, so both an OSError AND an
+    # HTTPException) rather than being wrapped in URLError like connect-refused/DNS failures.
+    class SilentCloseHandler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # silence
+            pass
+
+        def do_GET(self):
+            self.connection.close()
+
+    with _running_server(SilentCloseHandler) as url:
+        client = HubClient(bearer_config(url))
+        with pytest.raises(HubError):
+            client.get("/api/v1/status")
+
+
+def test_truncated_content_length_raises_hub_error():
+    # If a 200 advertises a Content-Length longer than what's actually sent before the
+    # connection closes, HTTPResponse.read() raises http.client.IncompleteRead — an
+    # HTTPException, NOT an OSError — so it bypassed _read_body()'s OSError-only wrapper.
+    class TruncatedContentLengthHandler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # silence
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", "1000")
+            self.end_headers()
+            self.wfile.write(b'{"ok": true}')  # far short of the advertised 1000 bytes
+            self.wfile.flush()
+            self.connection.close()
+
+    with _running_server(TruncatedContentLengthHandler) as url:
+        client = HubClient(bearer_config(url))
+        resp = client.get("/api/v1/status")  # headers arrive fine; get() returns normally
+        with pytest.raises(HubError):
+            resp.json()
+
+
 def test_read_bytes_body_stall_after_headers_raises_hub_error():
     # get_session_raw()'s primitive — same wrapping as json()/iter_lines(), via _read_body().
     class HeadersThenStallHandler(BaseHTTPRequestHandler):
