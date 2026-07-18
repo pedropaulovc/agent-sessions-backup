@@ -111,6 +111,20 @@ type OtlpChunker = (json: Record<string, unknown>, maxBytes: number) => ChunkRes
 // 900 KB leaves comfortable margin under the ~1 MB ceiling.
 const MAX_DCR_BYTES = 900_000;
 
+// A backlog flush chunks one CF export batch into many DCR POSTs. Posting them
+// strictly sequentially (each ~hundreds of ms) blows past CF's client timeout —
+// the exporter cancels the request mid-flight (`context canceled`) and the batch
+// wedges on latency instead of size. Two levers:
+//   - post chunks with bounded concurrency (the token is fetched once, cached),
+//     taking a ~50-chunk flush from ~30 s to a few seconds;
+//   - for a large batch, ack CF *before* forwarding and finish in waitUntil, so CF
+//     can't cancel work we've already accepted (waitUntil grants ~30 s past the
+//     response). Small steady-state batches stay fully synchronous (see below).
+const PARALLEL_CHUNK_POSTS = 6;
+// At/under this chunk count the forward stays synchronous and keeps the exact
+// 503-on-transient / 204-on-success contract. Above it we ack-then-forward.
+const SYNC_CHUNK_THRESHOLD = 3;
+
 // This worker has no observability.logs/traces destinations of its own (see
 // hub/wrangler.telemetry-gateway.jsonc) and must not — it IS the /v1/{logs,traces}
 // sink, so exporting its own logs back to itself would be a recursion loop. These
@@ -120,9 +134,77 @@ function logGatewayEvent(fields: Record<string, unknown>): void {
   console.log(JSON.stringify({ event: "collector.event", level: "error", ...fields }));
 }
 
+// Post every chunk to the DCR endpoint with bounded concurrency, classifying each
+// failure. Returns whether the batch should be retried (any TRANSIENT failure).
+// `ackedEarly` only affects the log disposition: once CF is ack'd we can't retry,
+// so a transient failure there is logged-and-lost rather than "retry-batch".
+async function postChunks(
+  chunks: Uint8Array[],
+  endpoint: string,
+  token: string,
+  ackedEarly: boolean,
+): Promise<boolean> {
+  let retryable = false;
+  let next = 0; // single-threaded event loop → next++ between awaits is atomic
+  const worker = async (): Promise<void> => {
+    for (;;) {
+      const i = next++;
+      if (i >= chunks.length) return;
+      const bytes = chunks[i]!;
+      try {
+        const upstream = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/x-protobuf", Authorization: `Bearer ${token}` },
+          body: bytes,
+        });
+        if (upstream.ok) continue;
+
+        const body = await upstream.text();
+        const poison = upstream.status === 413;
+        // 408 (request timeout) says nothing about payload validity — retry it like
+        // 429/5xx/network. Only a hard 413 is treated as poison.
+        const transient = upstream.status === 408 || upstream.status === 429 || upstream.status >= 500;
+        if (transient) retryable = true;
+        // Non-transient, non-413 responses (400/401/403…) can't be fixed by retrying
+        // the same bytes, so we drop them rather than wedge the pipeline — logged for
+        // `wrangler tail` and, being persistent config faults, surfaced by the
+        // collector-error alert rather than swallowed.
+        logGatewayEvent({
+          tag: poison ? "gateway-chunk-dropped" : "gateway-upstream-error",
+          endpoint,
+          status: upstream.status,
+          disposition: poison
+            ? "dropped-poison"
+            : transient
+              ? ackedEarly ? "lost-after-ack" : "retry-batch"
+              : "dropped-nonretryable",
+          chunk: `${i + 1}/${chunks.length}`,
+          bytes: bytes.byteLength,
+          body: body.slice(0, 500),
+        });
+      } catch (e) {
+        // Network-level failure (fetch rejected) — transient by nature, keep retryable.
+        retryable = true;
+        logGatewayEvent({
+          tag: "gateway-upstream-exception",
+          endpoint,
+          chunk: `${i + 1}/${chunks.length}`,
+          disposition: ackedEarly ? "lost-after-ack" : "retry-batch",
+          error: String(e),
+        });
+      }
+    }
+  };
+
+  const width = Math.min(PARALLEL_CHUNK_POSTS, chunks.length);
+  await Promise.all(Array.from({ length: width }, () => worker()));
+  return retryable;
+}
+
 async function forwardOtlp(
   request: Request,
   env: Env,
+  ctx: ExecutionContext,
   endpoint: string,
   chunk: OtlpChunker,
 ): Promise<Response> {
@@ -165,18 +247,13 @@ async function forwardOtlp(
     return new Response(null, { status: 204 });
   }
 
-  // The always-204 ack is for POISON only — a payload no retry can ever land. A
-  // transient failure (the batch is fine, the upstream is momentarily unhappy) must
-  // stay retryable, or we silently lose valid telemetry. So:
-  //   - token exchange fails      → 503, NOTHING dispatched, CF retries the batch;
-  //   - all chunks 2xx            → 204;
-  //   - a chunk 413s despite chunking (cap anomaly / truncation edge) → poison:
-  //       log + drop that chunk, keep the batch ack'd (this is the class that
-  //       wedged us today; retrying it forever is exactly the bug);
-  //   - a chunk gets a TRANSIENT failure (429 / 5xx / network) → finish the rest,
-  //       then 503 so CF redelivers.
-  // Token exchange failure can't wedge: the batch is valid and chunking already
-  // bounds every future POST under the cap, so redelivery always makes progress.
+  // Mint/refresh the Entra token SYNCHRONOUSLY for BOTH paths, before any 204. It's
+  // ~200 ms worst case and usually a cache hit — well inside the pre-ack budget
+  // (~0.9 s of parse/encode on a 6 MB batch), so it doesn't threaten the context-
+  // cancel margin. Doing it up front means a transient Entra failure returns 503
+  // with NOTHING dispatched (CF retries the whole batch, same as the small-batch
+  // contract) instead of silently dropping a large batch inside waitUntil after
+  // we've already ack'd — where the only signal would be a tail-only console line.
   let token: string;
   try {
     token = await getEntraToken(env);
@@ -185,53 +262,26 @@ async function forwardOtlp(
     return new Response("token exchange failed", { status: 503 });
   }
 
-  // Duplicates-over-loss is a deliberate trade: on a 503 CF redelivers the WHOLE
-  // batch, re-posting chunks that already landed. Duplicate log rows are harmless to
-  // our alert queries (absence / arg_max / gap semantics all tolerate repeats),
-  // whereas a LOST beacon is precisely the false-alarm failure mode the dead-man
-  // alerts exist to catch — so we accept duplicates to avoid loss.
-  let retryable = false;
-  for (let i = 0; i < chunks.length; i++) {
-    try {
-      const upstream = await fetch(endpoint, {
-        method: "POST",
-        headers: { "Content-Type": "application/x-protobuf", Authorization: `Bearer ${token}` },
-        body: chunks[i],
-      });
-      if (upstream.ok) continue;
-
-      const body = await upstream.text();
-      const poison = upstream.status === 413;
-      // 408 (request timeout) says nothing about payload validity — retry it like
-      // 429/5xx/network. Only a hard 413 is treated as poison.
-      const transient = upstream.status === 408 || upstream.status === 429 || upstream.status >= 500;
-      if (transient) retryable = true;
-      // Non-transient, non-413 responses (400/401/403…) can't be fixed by retrying
-      // the same bytes, so we drop them rather than wedge the pipeline — logged for
-      // `wrangler tail` and, being persistent config faults, surfaced by the
-      // collector-error alert rather than swallowed.
-      logGatewayEvent({
-        tag: poison ? "gateway-chunk-dropped" : "gateway-upstream-error",
-        endpoint,
-        status: upstream.status,
-        disposition: poison ? "dropped-poison" : transient ? "retry-batch" : "dropped-nonretryable",
-        chunk: `${i + 1}/${chunks.length}`,
-        bytes: chunks[i]!.byteLength,
-        body: body.slice(0, 500),
-      });
-    } catch (e) {
-      // Network-level failure (fetch rejected) — transient by nature, keep retryable.
-      retryable = true;
-      logGatewayEvent({
-        tag: "gateway-upstream-exception",
-        endpoint,
-        chunk: `${i + 1}/${chunks.length}`,
-        disposition: "retry-batch",
-        error: String(e),
-      });
-    }
+  // LARGE batch (backlog flush): ack CF immediately and finish the chunked forward
+  // in waitUntil, so CF can't context-cancel it mid-flight. The token is already in
+  // hand, so the ONLY class that can't surface as 503 here is a TRANSIENT DCR chunk
+  // failure — logged-and-lost (disposition "lost-after-ack"). Acceptable: the
+  // alternative is wedging on CF's client timeout, and a backlog flush is exactly
+  // where duplicates-vs-loss tilts toward "don't re-send the whole giant batch".
+  if (chunks.length > SYNC_CHUNK_THRESHOLD) {
+    ctx.waitUntil(postChunks(chunks, endpoint, token, true));
+    return new Response(null, { status: 204 });
   }
 
+  // SMALL steady-state batch: fully synchronous, exact prior contract —
+  //   - all chunks 2xx → 204;
+  //   - a chunk 413s (cap anomaly / truncation edge) → poison: log + drop, stay ack'd;
+  //   - a chunk gets a TRANSIENT failure (408/429/5xx/network) → 503 so CF redelivers.
+  // Duplicates-over-loss is deliberate: a 503 redelivers the whole batch, re-posting
+  // landed chunks, but duplicate rows are harmless to the alert queries (absence /
+  // arg_max / gap semantics tolerate repeats) while a LOST beacon is the exact
+  // false-alarm mode the dead-man alerts guard against.
+  const retryable = await postChunks(chunks, endpoint, token, false);
   if (retryable) {
     return new Response("upstream transient failure — retry", { status: 503 });
   }
@@ -239,7 +289,7 @@ async function forwardOtlp(
 }
 
 export default {
-  async fetch(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     const path = url.pathname;
 
@@ -248,8 +298,8 @@ export default {
     // Workers observability emits only logs + traces (no metrics), so only those
     // two routes are wired.
     if (request.method === "POST") {
-      if (path === "/v1/traces") return forwardOtlp(request, env, env.OTLP_TRACES_ENDPOINT, encodeTraceChunks);
-      if (path === "/v1/logs") return forwardOtlp(request, env, env.OTLP_LOGS_ENDPOINT, encodeLogsChunks);
+      if (path === "/v1/traces") return forwardOtlp(request, env, ctx, env.OTLP_TRACES_ENDPOINT, encodeTraceChunks);
+      if (path === "/v1/logs") return forwardOtlp(request, env, ctx, env.OTLP_LOGS_ENDPOINT, encodeLogsChunks);
     }
 
     return new Response("OK", { status: 200 });
