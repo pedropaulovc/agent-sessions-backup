@@ -53,7 +53,7 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
     if (method === 'POST' && params.has('uploads')) return createMultipart(request, env, identity, machineId, store, relpath);
     if (method === 'PUT' && params.has('uploadId')) return uploadPart(request, env, identity, machineId, store, relpath, params);
     if (method === 'POST' && params.has('uploadId')) return completeMultipart(request, env, identity, machineId, store, relpath, params);
-    if (method === 'DELETE' && params.has('uploadId')) return abortMultipart(env, identity, machineId, params);
+    if (method === 'DELETE' && params.has('uploadId')) return abortMultipart(env, identity, machineId, store, relpath, params);
     if (method === 'PUT') return putFile(request, env, identity, machineId, store, relpath);
   }
   if (path === '/api/v1/heartbeat' && method === 'POST') return heartbeat(request, env, identity);

@@ -238,18 +238,22 @@ def _make_handler(hub: FakeHub):
                 # Leave the upload pending so the collector's abort has something to release.
                 return self._json(hub.force_complete_status, {"error": "forced"})
             if hub.flaky_multipart_mismatch_remaining > 0:
-                # Simulate a verify failure: hub deletes the object + tracking row, collector retries.
+                # Simulate a verify failure: hub deletes the object, collector retries.
                 hub.flaky_multipart_mismatch_remaining -= 1
                 hub.multipart.pop(up_id, None)
                 return self._json(422, {"error": "checksum_mismatch"})
+            # The whole-object hash is re-declared on the complete request (stateless contract),
+            # falling back to the create-time value only if a caller omits it.
+            hdr = self.headers.get("x-content-hash", "")
+            expected = hdr.split(":", 1)[1].lower() if hdr.startswith("sha256:") else up["sha256"]
             assembled = b"".join(up["parts"][n] for n in sorted(up["parts"]))
             actual = hashlib.sha256(assembled).hexdigest()
-            if actual != up["sha256"]:
+            if actual != expected:
                 hub.multipart.pop(up_id, None)
                 return self._json(422, {"error": "checksum_mismatch",
-                                        "expected": up["sha256"], "actual": actual})
+                                        "expected": expected, "actual": actual})
             hub.files[(up["machine"], up["store"], up["relpath"])] = {
-                "sha256": up["sha256"], "body": assembled, "mtime": up["mtime"],
+                "sha256": expected, "body": assembled, "mtime": up["mtime"],
             }
             hub.multipart.pop(up_id, None)
             return self._json(201, {"status": "stored"})

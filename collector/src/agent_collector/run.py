@@ -271,7 +271,11 @@ def _multipart_send_parts(transport: Transport, base_url: str, item: ScanItem, u
         if len(data) != length:
             return None, f"short read on part {i + 1}: got {len(data)} want {length}"
         part_no = i + 1
-        headers = {"x-part-is-last": "1"} if i == num_parts - 1 else {}
+        # x-part-size lets the hub enforce R2's uniform-part-size rule server-side (every non-final
+        # part == part_size); x-part-is-last flags the (possibly-smaller) tail so it isn't rejected.
+        headers = {"x-part-size": str(part_size)}
+        if i == num_parts - 1:
+            headers["x-part-is-last"] = "1"
         url = _multipart_query(base_url, upload_id, f"&partNumber={part_no}")
         status, body = transport.put_part(url, data, headers)
         if status not in (200, 201):
@@ -311,7 +315,12 @@ def _upload_multipart(cfg, transport: Transport, item: ScanItem, sha: str) -> tu
 
         parts, detail = _multipart_send_parts(transport, base_url, item, upload_id, part_size, item.size)
         if parts is not None:
-            status, body = transport.post_json(_multipart_query(base_url, upload_id), {"parts": parts})
+            # complete re-declares the whole-object contract (hash/mtime/size) so the hub verifies
+            # the reassembled object against the same sha256 the upload was opened with.
+            complete_headers = {
+                "x-content-hash": f"sha256:{sha}", "x-file-mtime": mtime, "x-file-size": str(item.size),
+            }
+            status, body = transport.post_json(_multipart_query(base_url, upload_id), {"parts": parts}, complete_headers)
             if status in (200, 201):
                 return MULTIPART_UPLOADED, None
             detail = f"complete HTTP {status}: {body[:200]}"

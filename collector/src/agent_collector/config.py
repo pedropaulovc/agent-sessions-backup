@@ -133,12 +133,13 @@ def config_path() -> Path:
 
 # Files at/above this size use the R2 multipart upload path instead of a single PUT. Default 90MB
 # sits safely below Cloudflare's 100MB request-body cap (a single PUT of a >=100MB body is rejected
-# at the edge with HTTP 413 before it ever reaches the Worker). Part size is the fixed chunk each
-# part carries; R2 requires every part except the last to be >=5MiB and the same size, so a fixed
-# part size satisfies both rules by construction. 25MB keeps each buffered part well under the hub
-# isolate's 128MB limit.
+# at the edge with HTTP 413 before it ever reaches the Worker — the cap is the ZONE plan's, which
+# Workers Paid does not raise). Part size is the fixed chunk each part carries; R2 requires every
+# part except the last to be >=5MiB and the SAME size, so a fixed part size satisfies both rules by
+# construction. 64MiB stays under the edge cap (with header overhead) and the hub isolate's 128MB
+# limit while keeping the part count low.
 DEFAULT_MULTIPART_THRESHOLD_MB = 90.0
-DEFAULT_MULTIPART_PART_SIZE_MB = 25.0
+DEFAULT_MULTIPART_PART_SIZE_MB = 64.0
 MIN_PART_SIZE_BYTES = 5 * 1024 * 1024  # R2 hard floor for non-final parts
 
 
