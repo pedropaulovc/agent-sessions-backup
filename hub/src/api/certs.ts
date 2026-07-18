@@ -25,12 +25,24 @@ interface SignedCert {
   expires_on: string;
 }
 
+// A 401/403 from the CF API is operationally distinct from a transient error or a per-cert rejection:
+// it means CF_CLIENT_CERT_TOKEN is expired, revoked, or under-scoped, so EVERY sign/revoke/poll will
+// keep failing until the token is rotated. Emit a dedicated event (separate from the generic
+// sign_failed / *_error logs) so an alert can page on a dead token instead of it hiding as a stream of
+// per-call failures that look like ordinary CF flakiness. Returns whether it was an auth failure.
+function reportCfAuthFailure(res: Response, op: 'sign' | 'revoke' | 'status', certId: string | null): boolean {
+  if (res.status !== 401 && res.status !== 403) return false;
+  console.log(JSON.stringify({ event: 'hub.certs.cf_auth_failed', op, cert_id: certId, http_status: res.status }));
+  return true;
+}
+
 async function signClientCert(env: Env, csr: string): Promise<SignedCert> {
   const res = await fetch(`https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/client_certificates`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${env.CF_CLIENT_CERT_TOKEN}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({ csr, validity_days: 365 }),
   });
+  reportCfAuthFailure(res, 'sign', null);
   const data = (await res.json()) as { success?: boolean; result?: SignedCert; errors?: unknown };
   if (!data.success || !data.result) {
     throw new Error(`cf client_certificates sign failed: ${JSON.stringify(data.errors)}`);
@@ -53,6 +65,7 @@ export async function revokeClientCert(env: Env, certId: string): Promise<Revoke
     `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/client_certificates/${certId}`,
     { method: 'DELETE', headers: { Authorization: `Bearer ${env.CF_CLIENT_CERT_TOKEN}` } },
   );
+  reportCfAuthFailure(res, 'revoke', certId);
   const data = (await res.json().catch(() => ({}))) as { success?: boolean; result?: { status?: string } };
   if (!data.success) return 'failed';
   return data.result?.status === 'revoked' ? 'revoked' : 'pending_revocation';
@@ -71,6 +84,7 @@ async function getClientCertStatus(env: Env, certId: string): Promise<CertStatus
     console.log(JSON.stringify({ event: 'hub.certs.status_error', cert_id: certId, error: String(e) }));
     return 'unknown';
   }
+  reportCfAuthFailure(res, 'status', certId);
   if (res.status === 404) return 'not_found';
   const data = (await res.json().catch(() => ({}))) as { success?: boolean; result?: { status?: CertStatus } };
   if (!data.success || !data.result?.status) return 'unknown';

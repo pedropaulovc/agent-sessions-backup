@@ -241,6 +241,21 @@ cd hub && npx wrangler secret put CF_CLIENT_CERT_TOKEN
 Until it's set the endpoint returns `503 cert_renewal_unavailable` (collectors keep their current cert
 and retry — no lockout). The zone id is a non-secret var (`CF_ZONE_ID` in `hub/wrangler.jsonc`).
 
+Mint it narrowly and track its expiry:
+
+- **Scope:** zone `vza.net` only (never account-wide).
+- **Permission:** the single **SSL and Certificates · Edit** — nothing broader.
+- **Expiry:** set `expires_on` ~1 year out and rotate it **before** it lapses. The CF API has no
+  inbound OIDC/workload-identity federation for API tokens (open feature request since 2023,
+  community thread 492897), so this bearer token — not a federated credential — is what mints and
+  revokes every mTLS client cert; an expired or revoked token silently breaks renewals and the daily
+  revoke prune.
+
+That failure mode is now alertable: the hub emits a distinct `hub.certs.cf_auth_failed` event on any
+401/403 from the CF API (sign / revoke / status paths), and `infra/azure/alerts/cf-auth-failed.kql`
+pages on it — so a dead token becomes an email, not a slow-burning outage. Rotating the secret
+(`wrangler secret put CF_CLIENT_CERT_TOKEN`) clears it.
+
 ### Deploy note — apply the D1 migration
 
 `hub/migrations/0005_cert_rotation.sql` adds the rotation columns (`cert_id`, `prev_cert_fp_sha256`,

@@ -2,7 +2,7 @@ import { env } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { machineIdentity, type Identity } from '../src/auth/identity';
 import { bootstrap, COLLECTOR_CONFIG_SCHEMA_VERSION, DEFAULT_COLLECTOR_CONFIG } from '../src/api/bootstrap';
-import { renewCert, certFingerprint, settleRetired } from '../src/api/certs';
+import { renewCert, certFingerprint, settleRetired, revokeClientCert, pollRetired } from '../src/api/certs';
 import { adminMachines } from '../src/api/ops';
 import { runDailyPrune } from '../src/cron/prune';
 import { route } from '../src/router';
@@ -1256,5 +1256,72 @@ describe('settleRetired claim invariant (CLASS A)', () => {
     const outcome = await settleRetired(cfEnv, 'no-such-reservation-id');
     expect(outcome).toBe('skipped');
     expect(fetchMock).not.toHaveBeenCalled(); // never touched the CA
+  });
+});
+
+describe('CF API auth failures are distinctly alertable', () => {
+  // A 401/403 from the CF API means CF_CLIENT_CERT_TOKEN is expired/revoked/under-scoped — EVERY
+  // sign/revoke/poll fails until it's rotated. The hub emits hub.certs.cf_auth_failed (separate from the
+  // generic sign_failed / *_error logs) so infra/azure/alerts/cf-auth-failed.kql can page on a dead token.
+  const authFail = (status: number) =>
+    vi.fn(async () => new Response(JSON.stringify({ success: false, errors: [{ code: 10000, message: 'Authentication error' }] }), { status }));
+
+  function authEvents(logs: ReturnType<typeof vi.spyOn>): Array<{ event?: string; op?: string; http_status?: number }> {
+    return logs.mock.calls
+      .map((c: unknown[]) => { try { return JSON.parse(c[0] as string); } catch { return {}; } })
+      .filter((e: { event?: string }) => e.event === 'hub.certs.cf_auth_failed');
+  }
+
+  it('a 403 on the sign POST logs the event (op sign) and still 502s the renew', async () => {
+    await seedMachine('cf-sign', { fp: 'cf-sign-cur', certId: 'cf-sign-cid' });
+    vi.stubGlobal('fetch', authFail(403));
+    const logs = vi.spyOn(console, 'log');
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('cf-sign', false, 'cf-sign-cur'));
+    expect(res.status).toBe(502);
+    const events = authEvents(logs);
+    logs.mockRestore();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.op).toBe('sign');
+    expect(events[0]!.http_status).toBe(403);
+  });
+
+  it('a 401 on the revoke DELETE logs the event (op revoke) and reports failed', async () => {
+    vi.stubGlobal('fetch', authFail(401));
+    const logs = vi.spyOn(console, 'log');
+    const result = await revokeClientCert(cfEnv, 'cf-revoke-id');
+    const events = authEvents(logs);
+    logs.mockRestore();
+    expect(result).toBe('failed');
+    expect(events).toHaveLength(1);
+    expect(events[0]!.op).toBe('revoke');
+    expect(events[0]!.http_status).toBe(401);
+  });
+
+  it('a 403 on the status GET (poll) logs the event (op status)', async () => {
+    await testEnv.DB.prepare(
+      "INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('cf-status-fp', 'cf-status-id', 'cf-status-m', '2000-01-01T00:00:00.000Z')",
+    ).run();
+    vi.stubGlobal('fetch', authFail(403));
+    const logs = vi.spyOn(console, 'log');
+    await pollRetired(cfEnv, 'cf-status-id');
+    const events = authEvents(logs);
+    logs.mockRestore();
+    expect(events).toHaveLength(1);
+    expect(events[0]!.op).toBe('status');
+    expect(events[0]!.http_status).toBe(403);
+  });
+
+  it('positive control: a 200 sign logs NO cf_auth_failed event', async () => {
+    await seedMachine('cf-ok', { fp: 'cf-ok-cur', certId: 'cf-ok-cid' });
+    vi.stubGlobal('fetch', vi.fn(async (_i: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return new Response(JSON.stringify({ success: true, result: { status: 'pending_revocation' } }), { status: 200 });
+      return new Response(JSON.stringify({ success: true, result: { id: 'cf-ok-new', certificate: fakeCertPem('cf-ok-new'), expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    const logs = vi.spyOn(console, 'log');
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('cf-ok', false, 'cf-ok-cur'));
+    const events = authEvents(logs);
+    logs.mockRestore();
+    expect(res.status).toBe(200);
+    expect(events).toHaveLength(0); // a healthy token never trips the alert
   });
 });
