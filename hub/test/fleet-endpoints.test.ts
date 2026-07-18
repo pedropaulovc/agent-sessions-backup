@@ -476,6 +476,63 @@ describe('POST /api/v1/admin/machines', () => {
     expect(r?.cert_revoke_at).toBeNull();
   });
 
+  it('interleave: a prune draining the in-grace prev between read and swap 409s the rollback (widened CAS)', async () => {
+    // Admin rolls am-race back to its in-grace prev rb2-A. Between adminMachines reading the row and its
+    // swap, runDailyPrune drains rb2-A into retired_certs (reserved) and clears the prev/revoke columns.
+    // The widened CAS (prev_cert_fp_sha256 + cert_revoke_at, not just current) must MISS so we 409 rather
+    // than reinstate a just-queued cert the same prune would then revoke. The machine keeps its working
+    // current cert; the reservation is left for the prune to revoke.
+    await seedMachine('am-race', { fp: 'rb2-B', certId: 'cert-rb2-B', prevFp: 'rb2-A', prevCertId: 'cert-rb2-A', revokeAt: '2999-01-01T00:00:00.000Z' });
+    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+    const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementationOnce(async (stmts) => {
+      // The "prune" fires after the row read but before this swap commits.
+      await testEnv.DB.prepare("INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('rb2-A', 'cert-rb2-A', 'am-race', '2000-01-01T00:00:00.000Z')").run();
+      await testEnv.DB.prepare("UPDATE machines SET prev_cert_fp_sha256 = NULL, prev_cert_id = NULL, cert_revoke_at = NULL WHERE machine_id = 'am-race'").run();
+      return realBatch(stmts);
+    });
+    const res = await adminMachines(reqJson({ machine_id: 'am-race', cert_fp_sha256: 'rb2-A' }), testEnv, machine('am-admin', true));
+    spy.mockRestore();
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('concurrent_rotation');
+    const r = await row('am-race');
+    expect(r?.cert_fp_sha256).toBe('rb2-B'); // NOT rolled back onto the just-queued cert
+    expect((await retired('rb2-A'))?.revoked_at).toBeNull(); // reservation intact for the prune to revoke
+  });
+
+  it('rollback atomically un-queues a reservation of the reinstated fp created after the clash pre-check', async () => {
+    // The clash pre-check passes (rb3-A not yet queued); then a prune queues rb3-A into retired_certs
+    // (reserved) before the swap. Reinstating rb3-A as current must DELETE that reservation in the SAME
+    // batch as the swap — otherwise the prune's drain revokes the now-current cert. Guarded on the swap
+    // having landed, so a CAS miss would delete nothing.
+    await seedMachine('am-unq', { fp: 'rb3-B', certId: 'cert-rb3-B', prevFp: 'rb3-A', prevCertId: 'cert-rb3-A', revokeAt: '2999-01-01T00:00:00.000Z' });
+    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+    let batchLen = 0;
+    const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementationOnce(async (stmts) => {
+      batchLen = stmts.length;
+      await testEnv.DB.prepare("INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('rb3-A', 'cert-rb3-A', 'am-unq', '2000-01-01T00:00:00.000Z')").run();
+      return realBatch(stmts);
+    });
+    const res = await adminMachines(reqJson({ machine_id: 'am-unq', cert_fp_sha256: 'rb3-A' }), testEnv, machine('am-admin', true));
+    spy.mockRestore();
+    expect(res.status).toBe(200);
+    expect((await row('am-unq'))?.cert_fp_sha256).toBe('rb3-A'); // reinstated as current
+    expect(await retired('rb3-A')).toBeNull(); // reservation removed atomically with the swap
+    expect((await retired('rb3-B'))?.revoked_at).toBeNull(); // old current queued as usual
+    expect(batchLen).toBe(3); // swap + retire(old current rb3-B) + un-queue(rb3-A)
+  });
+
+  it('positive control: a normal rollback with no stale reservation leaves the un-queue a no-op', async () => {
+    await seedMachine('am-unq2', { fp: 'rb4-B', certId: 'cert-rb4-B', prevFp: 'rb4-A', prevCertId: 'cert-rb4-A', revokeAt: '2999-01-01T00:00:00.000Z' });
+    const res = await adminMachines(reqJson({ machine_id: 'am-unq2', cert_fp_sha256: 'rb4-A' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(200);
+    const r = await row('am-unq2');
+    expect(r?.cert_fp_sha256).toBe('rb4-A'); // reinstated
+    expect(r?.cert_id).toBe('cert-rb4-A'); // carried from prev_cert_id
+    expect(r?.prev_cert_fp_sha256).toBeNull();
+    expect(await retired('rb4-A')).toBeNull(); // nothing to un-queue; still absent
+    expect((await retired('rb4-B'))?.cert_id).toBe('cert-rb4-B'); // old current queued as before
+  });
+
   it('same-fp upsert preserves an active rotation window', async () => {
     await seedMachine('am-keep', { fp: 'keep-B', certId: 'cert-keep-B', prevFp: 'keep-A', prevCertId: 'cert-keep-A', revokeAt: '2999-01-01T00:00:00.000Z' });
     await adminMachines(reqJson({ machine_id: 'am-keep', priority: 7 }), testEnv, machine('am-admin', true)); // no fp change

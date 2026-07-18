@@ -9,9 +9,9 @@
 --
 -- cert_id is the CA's client-certificate id for the CURRENT cert — the handle renew/prune use to
 -- revoke it. It is recorded by every write path that mints a cert: POST /certs/renew, the admin
--- endpoint, AND enroll-cert.sh (which now stores result.id and retires any displaced cert on
--- re-enroll). Only pre-M4 LEGACY rows enrolled before this migration have cert_id NULL — they have
--- no id to revoke.
+-- endpoint, AND enroll-cert.sh (which stores result.id on its FRESH-only insert; rotation/displacement
+-- is routed through the admin endpoint, so the shell path never retires a cert). Only pre-M4 LEGACY rows
+-- enrolled before this migration have cert_id NULL — they have no id to revoke.
 -- The hub stops honoring the old fingerprint at cert_revoke_at regardless, but because a
 -- NULL id means "id unknown" (the cert may still be CA-valid until its ~1yr expiry), NOT
 -- "revoked", the prune does NOT free such a fingerprint: it clears only cert_revoke_at and

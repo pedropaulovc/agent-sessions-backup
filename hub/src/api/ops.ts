@@ -160,22 +160,46 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
       displaced.push({ fp: existing.prev_cert_fp_sha256, id: existing.prev_cert_id });
     }
 
-    // CAS on the current fingerprint we just observed. If a renew rotated the cert between our read
-    // and this write, the DO UPDATE WHERE no longer matches (changes === 0) and we 409 rather than
-    // clobber the renewed chain. IS (not =) so a NULL observed fp matches a still-NULL current one.
-    // The retirement INSERTs run in the SAME db.batch as the swap, each guarded on the swap having
-    // landed (current is now certFp) — so a lost/interrupted retire can't strand a displaced cert,
-    // and a CAS miss queues nothing.
+    // CAS on the FULL rotation state we observed — current fp, prev fp, AND the revoke window — not just
+    // the current fp. The extra columns matter for rollback: if runDailyPrune drains this row's in-grace
+    // prev into retired_certs and clears prev_cert_fp_sha256/cert_revoke_at between our read and this
+    // write, a current-fp-only CAS would still reinstate that just-queued cert as current, and the same
+    // prune's drain would then revoke the now-current cert — a lockout. Checking prev + revoke_at makes
+    // that swap 409 so the admin re-reads reality. IS (not =) so NULL observed values match still-NULL
+    // columns. The retirement INSERTs run in the SAME db.batch, each guarded on the swap having landed
+    // (current is now certFp) — so a lost/interrupted retire can't strand a displaced cert, and a CAS
+    // miss queues nothing.
     const observedFp = existing?.cert_fp_sha256 ?? null;
+    const observedPrevFp = existing?.prev_cert_fp_sha256 ?? null;
+    const observedRevokeAt = existing?.cert_revoke_at ?? null;
     const swap = env.DB.prepare(
       `INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, key_protection, is_admin, priority, cert_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at)
        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
        ON CONFLICT (machine_id) DO UPDATE SET
          os = ?2, hostname = ?3, cert_fp_sha256 = ?4, key_protection = ?5, is_admin = ?6, priority = ?7,
          cert_id = ?8, prev_cert_fp_sha256 = ?9, prev_cert_id = ?10, cert_revoke_at = ?11
-       WHERE machines.cert_fp_sha256 IS ?12`,
-    ).bind(body.machine_id, os, hostname, certFp, keyProtection, isAdmin, priority, certId, prevFp, prevId, revokeAt, observedFp);
-    const stmts = [swap, ...displaced.map((d) => queueRetiredIfDisplaced(env, d.fp, d.id, body.machine_id!, certFp!))];
+       WHERE machines.cert_fp_sha256 IS ?12 AND machines.prev_cert_fp_sha256 IS ?13 AND machines.cert_revoke_at IS ?14`,
+    ).bind(body.machine_id, os, hostname, certFp, keyProtection, isAdmin, priority, certId, prevFp, prevId, revokeAt, observedFp, observedPrevFp, observedRevokeAt);
+
+    // Belt-and-braces for a reservation that predates our read: if the clash pre-check passed but a prune
+    // then queued certFp (this row's expiring prev) into retired_certs before we read `existing`, the swap
+    // above can still land certFp as current while it sits reserved — the next drain would revoke it.
+    // Reinstating a cert must atomically un-queue it: DELETE this machine's un-revoked reservation of
+    // certFp, guarded on the swap having landed (current is now certFp) so a CAS miss deletes nothing. A
+    // no-op when there is no such reservation (the common case).
+    const stmts = [
+      swap,
+      ...displaced.map((d) => queueRetiredIfDisplaced(env, d.fp, d.id, body.machine_id!, certFp!)),
+      ...(fpChanged && certFp
+        ? [
+            env.DB.prepare(
+              `DELETE FROM retired_certs
+                 WHERE fingerprint = ?1 AND machine_id = ?2 AND revoked_at IS NULL
+                   AND EXISTS (SELECT 1 FROM machines WHERE machine_id = ?2 AND cert_fp_sha256 = ?1)`,
+            ).bind(certFp, body.machine_id),
+          ]
+        : []),
+    ];
 
     let results;
     try {
