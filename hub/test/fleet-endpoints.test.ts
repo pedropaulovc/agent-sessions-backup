@@ -347,6 +347,88 @@ describe('POST /api/v1/admin/machines', () => {
     expect(r?.prev_cert_id).toBe('cert-keep-A');
     expect(r?.cert_revoke_at).toBe('2999-01-01T00:00:00.000Z');
   });
+
+  it("409s a fingerprint that is another machine's out-of-grace prev cert still awaiting revoke (pending prev_cert_id)", async () => {
+    // Grace expired (revoke_at in the past) but the daily prune hasn't cleared prev_cert_id yet, so
+    // that CA cert is still live and its next prune will revoke it — reusing the fp would strand the
+    // new holder. The plain `cert_revoke_at > now` predicate would miss this; `prev_cert_id NOT NULL` catches it.
+    await seedMachine('am-exp', { fp: 'am-exp-cur', prevFp: 'am-exp-prev', prevCertId: 'am-exp-previd', revokeAt: '2000-01-01T00:00:00.000Z' });
+    const res = await adminMachines(reqJson({ machine_id: 'am-exp-other', cert_fp_sha256: 'am-exp-prev' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { machine_id: string }).machine_id).toBe('am-exp');
+  });
+
+  it('allows reusing an out-of-grace prev fp once its revoke is done (prev_cert_id cleared → nothing left to revoke)', async () => {
+    await seedMachine('am-safe', { fp: 'am-safe-cur', prevFp: 'am-safe-prev', revokeAt: '2000-01-01T00:00:00.000Z' }); // prevCertId omitted -> NULL (revoke already done)
+    const res = await adminMachines(reqJson({ machine_id: 'am-safe-other', cert_fp_sha256: 'am-safe-prev' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(200);
+    expect((await row('am-safe-other'))?.cert_fp_sha256).toBe('am-safe-prev');
+  });
+
+  it('metadata-only edit never writes cert columns, so a renew that lands mid-edit is not clobbered', async () => {
+    // Reproduces the read-modify-write race: the handler reads the row, a renew rotates the cert
+    // before the write lands. The fix routes cert-free edits down a write path that omits the cert
+    // columns entirely, so the renewed chain survives instead of being rolled back to the snapshot.
+    await seedMachine('meta-race', { fp: 'meta-A', certId: 'cid-A' });
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
+      const stmt = realPrepare(sql);
+      if (!sql.includes('is_admin, priority FROM machines WHERE machine_id = ?1')) return stmt;
+      const realBind = stmt.bind.bind(stmt);
+      (stmt as unknown as { bind: (...a: unknown[]) => unknown }).bind = (...b: unknown[]) => {
+        const bound = (realBind as (...a: unknown[]) => { first: (...f: unknown[]) => Promise<unknown> })(...b);
+        const realFirst = bound.first.bind(bound);
+        bound.first = async (...f: unknown[]) => {
+          const r = await realFirst(...f);
+          await realPrepare('UPDATE machines SET cert_fp_sha256 = ?2, cert_id = ?3, prev_cert_fp_sha256 = ?4 WHERE machine_id = ?1')
+            .bind('meta-race', 'meta-B', 'cid-B', 'meta-A')
+            .run();
+          return r;
+        };
+        return bound;
+      };
+      return stmt;
+    });
+    const res = await adminMachines(reqJson({ machine_id: 'meta-race', priority: 3 }), testEnv, machine('am-admin', true));
+    spy.mockRestore();
+    expect(res.status).toBe(200);
+    const r = await row('meta-race');
+    expect(r?.priority).toBe(3); // metadata change applied
+    expect(r?.cert_fp_sha256).toBe('meta-B'); // renewed cert survived, NOT rolled back to meta-A
+    expect(r?.cert_id).toBe('cid-B');
+    expect(r?.prev_cert_fp_sha256).toBe('meta-A'); // renew's grace prev survived
+  });
+
+  it('cert-field edit racing a renew 409s (CAS on the observed fp) instead of clobbering the renewed chain', async () => {
+    // Same interleave, but the admin request DOES carry cert fields. The write CASes on the fp the
+    // handler observed; because a renew advanced current under it, the WHERE misses (changes === 0)
+    // and we return concurrent_rotation rather than overwriting the renewed cert.
+    await seedMachine('cas-race', { fp: 'cas-A', certId: 'cid-A' });
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
+      const stmt = realPrepare(sql);
+      if (!sql.includes('prev_cert_fp_sha256, prev_cert_id, cert_revoke_at')) return stmt;
+      const realBind = stmt.bind.bind(stmt);
+      (stmt as unknown as { bind: (...a: unknown[]) => unknown }).bind = (...b: unknown[]) => {
+        const bound = (realBind as (...a: unknown[]) => { first: (...f: unknown[]) => Promise<unknown> })(...b);
+        const realFirst = bound.first.bind(bound);
+        bound.first = async (...f: unknown[]) => {
+          const r = await realFirst(...f);
+          await realPrepare('UPDATE machines SET cert_fp_sha256 = ?2, cert_id = ?3 WHERE machine_id = ?1')
+            .bind('cas-race', 'cas-B', 'cid-B')
+            .run();
+          return r;
+        };
+        return bound;
+      };
+      return stmt;
+    });
+    const res = await adminMachines(reqJson({ machine_id: 'cas-race', cert_fp_sha256: 'cas-C', cert_id: 'cid-C' }), testEnv, machine('am-admin', true));
+    spy.mockRestore();
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('concurrent_rotation');
+    expect((await row('cas-race'))?.cert_fp_sha256).toBe('cas-B'); // renewed cert survived
+  });
 });
 
 describe('daily prune (cert revoke)', () => {

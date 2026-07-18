@@ -55,16 +55,57 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
   };
 
   if (body.machine_id) {
-    // Reject a fingerprint already live on ANOTHER machine — as its current cert OR its in-grace
-    // previous cert. A managed cert fingerprint is unique per machine; letting two rows share one
-    // would make machineIdentity's unordered .first() authenticate as whichever row it returned.
-    // This subsumes the plain current-fp UNIQUE collision into an explicit 409 (clearer than a
-    // constraint-violation catch) and additionally catches the prev-in-grace collision the UNIQUE
-    // index alone misses.
+    // Two write paths. A request carrying NO cert fields (cert_fp_sha256/cert_id) is a metadata edit
+    // (priority, is_admin, hostname, …) and MUST NOT touch the cert/rotation columns: otherwise a
+    // partial edit that snapshotted the row before a concurrent renew landed would write the stale
+    // fingerprint back and lock the machine out of its freshly-installed cert. A request that DOES
+    // carry cert fields owns the cert columns and CASes on the fingerprint it observed.
+    const touchesCert = body.cert_fp_sha256 !== undefined || body.cert_id !== undefined;
+
+    if (!touchesCert) {
+      // Metadata-only upsert: read-merge-write the NOT NULL non-cert columns, leaving every cert/
+      // rotation column exactly as it stands in the row (untouched on conflict, defaulted on insert).
+      const existing = await env.DB.prepare(
+        `SELECT os, hostname, key_protection, is_admin, priority FROM machines WHERE machine_id = ?1`,
+      )
+        .bind(body.machine_id)
+        .first<{ os: string; hostname: string | null; key_protection: string; is_admin: number; priority: number }>();
+      const os = body.os ?? existing?.os ?? 'unknown';
+      const hostname = body.hostname ?? existing?.hostname ?? null;
+      const keyProtection = body.key_protection ?? existing?.key_protection ?? 'software';
+      const isAdmin = body.is_admin !== undefined ? (body.is_admin ? 1 : 0) : existing?.is_admin ?? 0;
+      const priority = body.priority ?? existing?.priority ?? 100;
+      await env.DB.prepare(
+        `INSERT INTO machines (machine_id, os, hostname, key_protection, is_admin, priority)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (machine_id) DO UPDATE SET
+           os = ?2, hostname = ?3, key_protection = ?4, is_admin = ?5, priority = ?6`,
+      )
+        .bind(body.machine_id, os, hostname, keyProtection, isAdmin, priority)
+        .run();
+      console.log(JSON.stringify({ event: 'hub.admin.machine_upsert', machine: body.machine_id, is_admin: isAdmin }));
+      const rows = await env.DB.prepare(
+        `SELECT machine_id, os, hostname, key_protection, is_admin, priority, collector_version, last_seen_at, last_upload_at, created_at
+         FROM machines ORDER BY machine_id`,
+      ).all();
+      return Response.json({ machines: rows.results });
+    }
+
+    // Reject a fingerprint already live on ANOTHER machine — as its current cert, its in-grace
+    // previous cert, OR a previous cert that is out of grace but still carries a pending cert_id
+    // (its revoke hasn't run yet: before the next daily prune, or after a failed CF DELETE). In that
+    // last case the old row's prune will still revoke prev_cert_id at the CA, which would invalidate
+    // this fingerprint if we let it become current here. Only a prev fp with prev_cert_id already
+    // NULL (nothing left to revoke) is safe to reuse. A managed cert fingerprint is unique per
+    // machine; letting two rows share one would make machineIdentity's unordered .first()
+    // authenticate as whichever row it returned. This subsumes the plain current-fp UNIQUE collision
+    // into an explicit 409 (clearer than a constraint-violation catch).
     if (body.cert_fp_sha256) {
       const clash = await env.DB.prepare(
         `SELECT machine_id FROM machines
-          WHERE (cert_fp_sha256 = ?1 OR (prev_cert_fp_sha256 = ?1 AND cert_revoke_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+          WHERE (cert_fp_sha256 = ?1
+                 OR (prev_cert_fp_sha256 = ?1
+                     AND (cert_revoke_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now') OR prev_cert_id IS NOT NULL)))
             AND machine_id != ?2`,
       )
         .bind(body.cert_fp_sha256, body.machine_id)
@@ -101,20 +142,30 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     const prevId = fpChanged ? null : existing?.prev_cert_id ?? null;
     const revokeAt = fpChanged ? null : existing?.cert_revoke_at ?? null;
 
+    // CAS on the current fingerprint we just observed. If a renew rotated the cert between our read
+    // and this write, the DO UPDATE WHERE no longer matches (changes === 0) and we 409 rather than
+    // clobber the renewed chain. IS (not =) so a NULL observed fp matches a still-NULL current one.
+    const observedFp = existing?.cert_fp_sha256 ?? null;
+    let res;
     try {
-      await env.DB.prepare(
+      res = await env.DB.prepare(
         `INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, key_protection, is_admin, priority, cert_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT (machine_id) DO UPDATE SET
            os = ?2, hostname = ?3, cert_fp_sha256 = ?4, key_protection = ?5, is_admin = ?6, priority = ?7,
-           cert_id = ?8, prev_cert_fp_sha256 = ?9, prev_cert_id = ?10, cert_revoke_at = ?11`,
+           cert_id = ?8, prev_cert_fp_sha256 = ?9, prev_cert_id = ?10, cert_revoke_at = ?11
+         WHERE machines.cert_fp_sha256 IS ?12`,
       )
-        .bind(body.machine_id, os, hostname, certFp, keyProtection, isAdmin, priority, certId, prevFp, prevId, revokeAt)
+        .bind(body.machine_id, os, hostname, certFp, keyProtection, isAdmin, priority, certId, prevFp, prevId, revokeAt, observedFp)
         .run();
     } catch (e) {
       // cert_fp_sha256 is UNIQUE — a concurrent write could still race the pre-check above. Surface
       // a 409 rather than a bare 500 so the admin caller sees it's a duplicate, not a hub fault.
       return Response.json({ error: 'machine_upsert_conflict', detail: String(e) }, { status: 409 });
+    }
+    // A fresh insert reports changes === 1; only a conflict whose CAS WHERE failed reports 0.
+    if (existing && res.meta.changes === 0) {
+      return Response.json({ error: 'concurrent_rotation', machine_id: body.machine_id }, { status: 409 });
     }
     if (fpChanged && existing && (existing.cert_id || existing.prev_cert_fp_sha256)) {
       console.log(JSON.stringify({ event: 'hub.admin.machines.rotation_reset', machine: body.machine_id, dropped_cert_id: existing.cert_id, dropped_prev_cert_id: existing.prev_cert_id }));
