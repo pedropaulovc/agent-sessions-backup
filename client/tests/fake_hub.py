@@ -21,6 +21,11 @@ class FakeHub:
         self.sessions: list[dict] = []  # rows shaped like the hub's `sessions` table
         self.normalized: dict[str, dict] = {}  # session_id -> NormalizedSession body
         self.indexed_through: str | None = None
+        # Overrides `indexed_through` per /api/v1/sessions request, by 0-based request index
+        # (index clamps to the last entry once exhausted) — lets a test simulate a machine
+        # finishing its sync mid-pagination (e.g. a stale value on page 1, fresh on page 2).
+        # None (the default) means every request just uses `indexed_through` above.
+        self.indexed_through_by_request: list[str | None] | None = None
         self.search_hits: list[dict] = []
         self.usage_rows: list[dict] = []
         self.status_machines: list[dict] = []
@@ -115,6 +120,15 @@ class FakeHub:
     def _ndjson_page(self, params: dict[str, list[str]]) -> tuple[list[dict], str | None]:
         return self._paginate(self._filtered_sessions_all(params), params, self.ndjson_max_rows_per_request)
 
+    def _indexed_through_for_current_request(self) -> str | None:
+        """The `indexed_through`/`x-indexed-through` value for the /api/v1/sessions request
+        currently being handled — see `indexed_through_by_request`'s docstring."""
+        if self.indexed_through_by_request is None:
+            return self.indexed_through
+        session_requests = [r for r in self.requests if r["path"] == "/api/v1/sessions"]
+        idx = min(len(session_requests) - 1, len(self.indexed_through_by_request) - 1)
+        return self.indexed_through_by_request[idx]
+
 
 def _make_handler(hub: FakeHub):
     class Handler(BaseHTTPRequestHandler):
@@ -155,7 +169,8 @@ def _make_handler(hub: FakeHub):
             self._json(404, {"error": "not_found"})
 
         def _handle_sessions(self, params: dict[str, list[str]]) -> None:
-            headers = {"x-indexed-through": hub.indexed_through or ""}
+            indexed_through = hub._indexed_through_for_current_request()
+            headers = {"x-indexed-through": indexed_through or ""}
             if params.get("format") == ["ndjson"]:
                 rows, next_cursor = hub._ndjson_page(params)
                 self.send_response(200)
@@ -172,7 +187,7 @@ def _make_handler(hub: FakeHub):
                     self.wfile.write((json.dumps({"cursor": next_cursor}) + "\n").encode())
                 return
             page, next_cursor = hub._sessions_page(params)
-            body: dict = {"sessions": page, "indexed_through": hub.indexed_through}
+            body: dict = {"sessions": page, "indexed_through": indexed_through}
             if next_cursor:
                 body["cursor"] = next_cursor
             self._json(200, body, headers)

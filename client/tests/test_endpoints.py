@@ -58,6 +58,27 @@ def test_list_sessions_past_server_cap_still_returns_everything(hub):
     assert len(page.sessions) == total
 
 
+def test_list_sessions_keeps_stalest_indexed_through_across_pages(hub):
+    # A machine finishing its sync WHILE a multi-page call is in flight must not make the
+    # final indexed_through look fresher than page 1 saw — keyset paging never revisits rows
+    # inserted ahead of an already-consumed cursor boundary, so a later page's fresher value
+    # would silently mask an undercount. The result must carry the EARLIEST value seen.
+    hub.sessions = [make_session_row(f"s{i:02d}") for i in range(8)]
+    hub.indexed_through_by_request = ["2026-07-18T01:00:00.000Z", "2026-07-18T23:59:59.999Z"]
+    page = api_for(hub).list_sessions(limit=5)
+    session_requests = [r for r in hub.requests if r["path"] == "/api/v1/sessions"]
+    assert len(session_requests) == 2  # sanity: this test only means something with >1 page
+    assert page.indexed_through == "2026-07-18T01:00:00.000Z"
+
+
+def test_list_sessions_none_indexed_through_on_any_page_wins(hub):
+    # None ("never synced") from ANY page must dominate the result, even a later, fresher one.
+    hub.sessions = [make_session_row(f"s{i:02d}") for i in range(8)]
+    hub.indexed_through_by_request = [None, "2026-07-18T23:59:59.999Z"]
+    page = api_for(hub).list_sessions(limit=5)
+    assert page.indexed_through is None
+
+
 def test_list_sessions_default_limit_matches_hub_cap(hub):
     hub.sessions = []
     api_for(hub).list_sessions()
@@ -100,6 +121,18 @@ def test_iter_sessions_ndjson_follows_trailer_cursor_across_requests(hub):
     assert "cursor" not in session_requests[0]["params"]
     assert session_requests[1]["params"]["cursor"] == ["s09"]
     assert session_requests[2]["params"]["cursor"] == ["s19"]
+
+
+def test_iter_sessions_ndjson_keeps_stalest_indexed_through_across_requests(hub):
+    # Same keyset-pagination hazard as list_sessions() — a fresher header on a later request
+    # must not overwrite a stale one seen earlier in the stream.
+    hub.sessions = [make_session_row(f"s{i:02d}") for i in range(15)]
+    hub.indexed_through_by_request = ["2026-07-18T01:00:00.000Z", "2026-07-18T23:59:59.999Z"]
+    api = api_for(hub)
+    list(api.iter_sessions_ndjson())  # drain the generator
+    session_requests = [r for r in hub.requests if r["path"] == "/api/v1/sessions"]
+    assert len(session_requests) == 2  # sanity: 15 rows at the default 10/request cap
+    assert api.last_indexed_through == "2026-07-18T01:00:00.000Z"
 
 
 def test_iter_sessions_ndjson_no_trailer_when_exactly_at_cap(hub):

@@ -29,6 +29,24 @@ from .models import (
 MAX_SESSIONS_LIMIT = 1000
 
 
+def _earlier_indexed_through(a: str | None, b: str | None) -> str | None:
+    """The earlier ("stalest") of two `indexed_through` ISO timestamps — None always wins
+    (treated as earlier than any real timestamp, since it means "never synced").
+
+    Used to fold multiple pages of a paginated call into one `indexed_through` value. Keyset
+    pagination never revisits a page once its boundary has advanced past it, so if a machine
+    finishes syncing WHILE a multi-page call is in flight, later pages report a fresher
+    `indexed_through` than earlier ones even though rows that machine ingested in between
+    could have sorted ahead of a cursor boundary already consumed — those rows are silently
+    missing from the result, exactly when the fresher-looking later value would suppress the
+    staleness caveat that should catch it. Keeping the minimum across all pages instead means
+    the caveat still fires whenever ANY page saw a not-fully-synced fleet.
+    """
+    if a is None or b is None:
+        return None
+    return min(a, b)
+
+
 class SessionsApi:
     """Typed wrapper over one HubClient. Construct once, reuse across calls."""
 
@@ -52,11 +70,14 @@ class SessionsApi:
         keeps re-requesting with `?cursor=...` until a response has none, so the returned
         `SessionsPage` always holds the COMPLETE set of matching sessions — callers never see
         a partial page or need to know the hub's internal per-request page size (`limit`).
-        `indexed_through` on the returned page is from the last page fetched (the freshest
-        read of the two, though in practice it rarely changes mid-pagination).
+        `indexed_through` on the returned page is the EARLIEST (stalest) value seen across all
+        pages, not just the last one — see _earlier_indexed_through's docstring for why a
+        machine finishing its sync mid-pagination must not silently mask an undercount from
+        rows keyset paging already skipped past.
         """
         sessions: list[SessionMeta] = []
         indexed_through: str | None = None
+        first_page = True
         cursor: str | None = None
         while True:
             resp = self._client.get(
@@ -73,7 +94,9 @@ class SessionsApi:
             )
             body = resp.json()
             sessions.extend(SessionMeta.from_row(r) for r in body.get("sessions", []))
-            indexed_through = body.get("indexed_through") or None
+            page_indexed_through = body.get("indexed_through") or None
+            indexed_through = page_indexed_through if first_page else _earlier_indexed_through(indexed_through, page_indexed_through)
+            first_page = False
             cursor = body.get("cursor") or None
             if not cursor:
                 break
@@ -101,10 +124,14 @@ class SessionsApi:
         another request with `?cursor=...` to keep streaming — callers get the full matching
         set without knowing the cap exists. Sets self.last_indexed_through from each request's
         response header as it starts, so callers may read it as soon as the first item of the
-        CURRENT page comes back; once the generator is fully exhausted, it reflects the last
-        page fetched.
+        CURRENT page comes back. Once more than one request has fired, the value is the
+        EARLIEST (stalest) header seen so far, not just the latest — see
+        _earlier_indexed_through's docstring for why (same keyset-pagination hazard as
+        list_sessions()) — so it can only get staler as pagination continues, never look
+        artificially fresher.
         """
         cursor: str | None = None
+        first_page = True
         while True:
             resp = self._client.get(
                 "/api/v1/sessions",
@@ -119,7 +146,11 @@ class SessionsApi:
                     "cursor": cursor,
                 },
             )
-            self.last_indexed_through = resp.header("x-indexed-through") or None
+            page_indexed_through = resp.header("x-indexed-through") or None
+            self.last_indexed_through = (
+                page_indexed_through if first_page else _earlier_indexed_through(self.last_indexed_through, page_indexed_through)
+            )
+            first_page = False
             cursor = None
             for line in resp.iter_lines():
                 row = json.loads(line)
