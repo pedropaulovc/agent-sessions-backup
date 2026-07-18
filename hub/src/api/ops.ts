@@ -48,6 +48,7 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     os?: string;
     hostname?: string;
     cert_fp_sha256?: string;
+    cert_id?: string;
     key_protection?: string;
     is_admin?: boolean;
     priority?: number;
@@ -74,29 +75,49 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     // Read-merge-write so a partial upsert preserves unspecified columns instead of resetting the
     // NOT NULL ones (os/key_protection/is_admin/priority) to their table defaults.
     const existing = await env.DB.prepare(
-      'SELECT os, hostname, cert_fp_sha256, key_protection, is_admin, priority FROM machines WHERE machine_id = ?1',
+      `SELECT os, hostname, cert_fp_sha256, cert_id, key_protection, is_admin, priority,
+              prev_cert_fp_sha256, prev_cert_id, cert_revoke_at
+         FROM machines WHERE machine_id = ?1`,
     )
       .bind(body.machine_id)
-      .first<{ os: string; hostname: string | null; cert_fp_sha256: string | null; key_protection: string; is_admin: number; priority: number }>();
+      .first<{ os: string; hostname: string | null; cert_fp_sha256: string | null; cert_id: string | null; key_protection: string; is_admin: number; priority: number; prev_cert_fp_sha256: string | null; prev_cert_id: string | null; cert_revoke_at: string | null }>();
     const os = body.os ?? existing?.os ?? 'unknown';
     const hostname = body.hostname ?? existing?.hostname ?? null;
     const certFp = body.cert_fp_sha256 ?? existing?.cert_fp_sha256 ?? null;
     const keyProtection = body.key_protection ?? existing?.key_protection ?? 'software';
     const isAdmin = body.is_admin !== undefined ? (body.is_admin ? 1 : 0) : existing?.is_admin ?? 0;
     const priority = body.priority ?? existing?.priority ?? 100;
+
+    // When the admin swaps in a DIFFERENT current fingerprint, the row's rotation metadata
+    // (cert_id + the prev/grace triple) belongs to the OLD cert and is now stale — a later prune
+    // could revoke a cert that's current again (rollback case) and a later renew would CAS against a
+    // dead cert_id. Reset it: adopt the body's cert_id (or NULL) and clear the grace window. We do
+    // NOT revoke the dropped cert here — the admin may be reinstating exactly that fingerprint — so
+    // it just ages out at the CA's 1-year validity; log what was dropped. Unchanged fp → keep the
+    // active rotation window untouched.
+    const fpChanged = certFp !== (existing?.cert_fp_sha256 ?? null);
+    const certId = fpChanged ? body.cert_id ?? null : existing?.cert_id ?? null;
+    const prevFp = fpChanged ? null : existing?.prev_cert_fp_sha256 ?? null;
+    const prevId = fpChanged ? null : existing?.prev_cert_id ?? null;
+    const revokeAt = fpChanged ? null : existing?.cert_revoke_at ?? null;
+
     try {
       await env.DB.prepare(
-        `INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, key_protection, is_admin, priority)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        `INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, key_protection, is_admin, priority, cert_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT (machine_id) DO UPDATE SET
-           os = ?2, hostname = ?3, cert_fp_sha256 = ?4, key_protection = ?5, is_admin = ?6, priority = ?7`,
+           os = ?2, hostname = ?3, cert_fp_sha256 = ?4, key_protection = ?5, is_admin = ?6, priority = ?7,
+           cert_id = ?8, prev_cert_fp_sha256 = ?9, prev_cert_id = ?10, cert_revoke_at = ?11`,
       )
-        .bind(body.machine_id, os, hostname, certFp, keyProtection, isAdmin, priority)
+        .bind(body.machine_id, os, hostname, certFp, keyProtection, isAdmin, priority, certId, prevFp, prevId, revokeAt)
         .run();
     } catch (e) {
-      // cert_fp_sha256 is UNIQUE — reusing another machine's fingerprint conflicts. Surface a 409
-      // rather than a bare 500 so the admin caller sees it's a duplicate, not a hub fault.
+      // cert_fp_sha256 is UNIQUE — a concurrent write could still race the pre-check above. Surface
+      // a 409 rather than a bare 500 so the admin caller sees it's a duplicate, not a hub fault.
       return Response.json({ error: 'machine_upsert_conflict', detail: String(e) }, { status: 409 });
+    }
+    if (fpChanged && existing && (existing.cert_id || existing.prev_cert_fp_sha256)) {
+      console.log(JSON.stringify({ event: 'hub.admin.machines.rotation_reset', machine: body.machine_id, dropped_cert_id: existing.cert_id, dropped_prev_cert_id: existing.prev_cert_id }));
     }
     console.log(JSON.stringify({ event: 'hub.admin.machine_upsert', machine: body.machine_id, is_admin: isAdmin }));
   }

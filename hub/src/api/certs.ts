@@ -81,33 +81,55 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
   }
   const newFp = await certFingerprint(signed.certificate);
 
-  const cur = await env.DB.prepare('SELECT cert_fp_sha256, cert_id FROM machines WHERE machine_id = ?1')
+  const cur = await env.DB.prepare('SELECT cert_fp_sha256, cert_id, cert_revoke_at FROM machines WHERE machine_id = ?1')
     .bind(identity.machineId)
-    .first<{ cert_fp_sha256: string | null; cert_id: string | null }>();
+    .first<{ cert_fp_sha256: string | null; cert_id: string | null; cert_revoke_at: string | null }>();
 
-  // ISO8601 with millis + 'Z' — the exact shape strftime('%Y-%m-%dT%H:%M:%fZ') produces, so the
-  // identity guard's lexicographic `cert_revoke_at > now` compares chronologically.
-  const revokeAt = new Date(Date.now() + CERT_GRACE_DAYS * 86_400_000).toISOString();
+  const authFp = identity.certFp ?? null;
+  const onCurrent = authFp !== null && authFp === cur?.cert_fp_sha256;
 
-  // Compare-and-swap on the fingerprint that authenticated THIS request: the swap only lands
-  // while that fp is still current. Two renews racing off the same cert therefore serialize —
-  // the first flips current to its new fp, the second's WHERE no longer matches (changes === 0)
-  // and it loses. Without this, last-writer-wins would overwrite the winner's current/prev and
-  // strand the loser's just-issued cert in neither slot → a locked-out machine.
-  const swap = await env.DB.prepare(
-    `UPDATE machines
-       SET prev_cert_fp_sha256 = ?2, prev_cert_id = ?3, cert_revoke_at = ?4,
-           cert_fp_sha256 = ?5, cert_id = ?6
-     WHERE machine_id = ?1 AND cert_fp_sha256 = ?7`,
-  )
-    .bind(identity.machineId, cur?.cert_fp_sha256 ?? null, cur?.cert_id ?? null, revokeAt, newFp, signed.id, identity.certFp ?? null)
-    .run();
+  let changes = 0;
+  let effectiveRevokeAt: string | null;
+  if (onCurrent) {
+    // NORMAL rotation: authenticated on the CURRENT cert. Retire it into a fresh grace window.
+    // ISO8601 millis+'Z' matches strftime('%Y-%m-%dT%H:%M:%fZ') so the identity guard compares
+    // chronologically. Compare-and-swap on the authenticating fp: two renews racing off the same
+    // current cert serialize — the first flips current, the second's WHERE no longer matches
+    // (changes === 0) and it 409s, rather than last-writer-wins stranding the winner's cert.
+    effectiveRevokeAt = new Date(Date.now() + CERT_GRACE_DAYS * 86_400_000).toISOString();
+    const res = await env.DB.prepare(
+      `UPDATE machines
+         SET prev_cert_fp_sha256 = ?2, prev_cert_id = ?3, cert_revoke_at = ?4,
+             cert_fp_sha256 = ?5, cert_id = ?6
+       WHERE machine_id = ?1 AND cert_fp_sha256 = ?7`,
+    )
+      .bind(identity.machineId, cur!.cert_fp_sha256, cur!.cert_id, effectiveRevokeAt, newFp, signed.id, authFp)
+      .run();
+    changes = res.meta.changes ?? 0;
+  } else {
+    // RECOVERY: authenticated on the IN-GRACE PREVIOUS cert. The successor from an earlier renewal
+    // was never installed (lost response), so the machine is stuck holding the old cert and would
+    // otherwise die at cert_revoke_at with no path forward. Replace the orphaned successor (the
+    // current slot) with this new cert WITHOUT touching the prev slot or its cert_revoke_at — grace
+    // must NOT extend, or repeated prev-auth renews would keep an old cert alive forever. Guarded on
+    // the observed current fp too so concurrent recoveries serialize. Keep the ORIGINAL revoke_at.
+    effectiveRevokeAt = cur?.cert_revoke_at ?? null;
+    const res = await env.DB.prepare(
+      `UPDATE machines
+         SET cert_fp_sha256 = ?2, cert_id = ?3
+       WHERE machine_id = ?1 AND prev_cert_fp_sha256 = ?4 AND cert_fp_sha256 = ?5
+         AND cert_revoke_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+    )
+      .bind(identity.machineId, newFp, signed.id, authFp, cur?.cert_fp_sha256 ?? null)
+      .run();
+    changes = res.meta.changes ?? 0;
+  }
 
-  if (swap.meta.changes === 0) {
-    // A competing rotation already advanced the current fp (or this request authenticated on an
-    // already-retired prev cert). The cert we just minted is an orphan — best-effort revoke it so
-    // it doesn't linger at the CA (it otherwise ages out at the 1-year validity). Never let a
-    // revoke failure mask the 409.
+  if (changes === 0) {
+    // Normal path: a competing rotation advanced current. Recovery path: the grace window closed or
+    // the row moved under us. Either way the cert we just minted is an orphan — best-effort revoke
+    // it so it doesn't linger at the CA (else it ages out at 1-year validity). Never let a revoke
+    // failure mask the 409.
     try {
       await revokeClientCert(env, signed.id);
     } catch (e) {
@@ -116,13 +138,23 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
     return Response.json({ error: 'renew_conflict' }, { status: 409 });
   }
 
-  console.log(JSON.stringify({ event: 'hub.certs.renewed', machine: identity.machineId, revoke_at: revokeAt }));
+  // Recovery displaced the orphaned successor (the old current) — best-effort revoke it too. On the
+  // normal path the old current moved into the grace window and must stay valid, so we never touch it.
+  if (!onCurrent && cur?.cert_id) {
+    try {
+      await revokeClientCert(env, cur.cert_id);
+    } catch (e) {
+      console.log(JSON.stringify({ event: 'hub.certs.orphan_revoke_failed', machine: identity.machineId, cert_id: cur.cert_id, error: String(e) }));
+    }
+  }
+
+  console.log(JSON.stringify({ event: 'hub.certs.renewed', machine: identity.machineId, recovery: !onCurrent, revoke_at: effectiveRevokeAt }));
   return Response.json({
     ok: true,
     certificate: signed.certificate,
     fingerprint: newFp,
     cert_id: signed.id,
     expires_on: signed.expires_on,
-    prev_revoke_at: revokeAt,
+    prev_revoke_at: effectiveRevokeAt,
   });
 }

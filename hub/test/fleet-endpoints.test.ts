@@ -170,18 +170,9 @@ describe('POST /api/v1/certs/renew', () => {
     expect(await machineIdentity(reqWithCert(fpC), prodEnv)).toMatchObject({ machineId: 'renew-2' });
   });
 
-  it('serializes concurrent renews off the same cert: loser 409s + orphan revoked, winner chain intact', async () => {
-    await seedMachine('renew-race', { fp: 'rr-fpA', certId: 'rr-cert-A' });
-    // Two requests that both authenticated while rr-fpA was current (resolved before either swaps).
-    const id1 = await machineIdentity(reqWithCert('rr-fpA'), prodEnv);
-    const id2 = await machineIdentity(reqWithCert('rr-fpA'), prodEnv);
-
-    // Sign returns B then C on successive calls; DELETE (orphan revoke) succeeds and is recorded.
-    const signed = [
-      { id: 'rr-cert-B', certificate: fakeCertPem('rr-B') },
-      { id: 'rr-cert-C', certificate: fakeCertPem('rr-C') },
-    ];
-    let signIdx = 0;
+  // Sign-sequence stub: returns the given fake certs on successive sign POSTs and records DELETEs.
+  function stubSignAndRevoke(seeds: Array<{ seed: string; id: string }>) {
+    let i = 0;
     const deletes: string[] = [];
     vi.stubGlobal(
       'fetch',
@@ -191,23 +182,58 @@ describe('POST /api/v1/certs/renew', () => {
           deletes.push(url.split('/').pop()!);
           return new Response(JSON.stringify({ success: true }), { status: 200 });
         }
-        return new Response(JSON.stringify({ success: true, result: { expires_on: '2027-01-01T00:00:00Z', ...signed[signIdx++]! } }), { status: 200 });
+        const s = seeds[i++]!;
+        return new Response(JSON.stringify({ success: true, result: { id: s.id, certificate: fakeCertPem(s.seed), expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
       }),
     );
-    const fpB = await certFingerprint(fakeCertPem('rr-B'));
-    const fpC = await certFingerprint(fakeCertPem('rr-C'));
+    return { deletes };
+  }
 
-    // Winner advances current A -> B. Loser's swap then finds current is no longer A -> 409.
-    expect((await renewCert(reqJson({ csr: 'c1' }), cfEnv, id1)).status).toBe(200);
-    expect((await renewCert(reqJson({ csr: 'c2' }), cfEnv, id2)).status).toBe(409);
+  it('recovers a lost-response renewal: a retry on the in-grace prev cert yields a working successor, grace clock unchanged, orphan revoked', async () => {
+    // Renewed once (current = B) but the response was lost, so the machine still holds A — now the
+    // in-grace prev — with revoke_at in the future.
+    await seedMachine('renew-lost', { fp: 'lost-B', certId: 'cert-B', prevFp: 'lost-A', prevCertId: 'cert-A', revokeAt: '2999-01-01T00:00:00.000Z' });
+    const id = await machineIdentity(reqWithCert('lost-A'), prodEnv); // authenticates on the in-grace prev
+    expect(id).toMatchObject({ kind: 'machine', machineId: 'renew-lost', certFp: 'lost-A' });
 
-    expect(deletes).toContain('rr-cert-C'); // the loser's just-signed cert was revoked, not stranded
-    const r = await row('renew-race');
-    expect(r?.cert_fp_sha256).toBe(fpB); // winner's chain
-    expect(r?.prev_cert_fp_sha256).toBe('rr-fpA');
-    expect(await machineIdentity(reqWithCert('rr-fpA'), prodEnv)).toMatchObject({ machineId: 'renew-race' });
-    expect(await machineIdentity(reqWithCert(fpB), prodEnv)).toMatchObject({ machineId: 'renew-race' });
-    expect(await machineIdentity(reqWithCert(fpC), prodEnv)).toEqual({ kind: 'anonymous' }); // C never installed
+    const { deletes } = stubSignAndRevoke([{ seed: 'lost-C', id: 'cert-C' }]);
+    const fpC = await certFingerprint(fakeCertPem('lost-C'));
+
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, id);
+    expect(res.status).toBe(200);
+    const out = (await res.json()) as { fingerprint: string; prev_revoke_at: string };
+    expect(out.fingerprint).toBe(fpC);
+    expect(out.prev_revoke_at).toBe('2999-01-01T00:00:00.000Z'); // grace clock NOT extended
+
+    const r = await row('renew-lost');
+    expect(r?.cert_fp_sha256).toBe(fpC); // orphaned successor B replaced by C
+    expect(r?.prev_cert_fp_sha256).toBe('lost-A'); // prev slot untouched
+    expect(r?.cert_revoke_at).toBe('2999-01-01T00:00:00.000Z'); // original window kept
+    expect(deletes).toContain('cert-B'); // displaced successor revoked
+    expect(await machineIdentity(reqWithCert('lost-A'), prodEnv)).toMatchObject({ machineId: 'renew-lost' });
+    expect(await machineIdentity(reqWithCert(fpC), prodEnv)).toMatchObject({ machineId: 'renew-lost' });
+  });
+
+  it('repeated prev-auth retries do not extend the grace clock (no immortal old cert)', async () => {
+    await seedMachine('renew-lost2', { fp: 'l2-B', certId: 'cert-l2-B', prevFp: 'l2-A', prevCertId: 'cert-l2-A', revokeAt: '2999-01-01T00:00:00.000Z' });
+    stubSignAndRevoke([{ seed: 'l2-C', id: 'cert-l2-C' }, { seed: 'l2-D', id: 'cert-l2-D' }]);
+    // Retry twice, each still holding l2-A (the in-grace prev).
+    await renewCert(reqJson({ csr: 'c1' }), cfEnv, await machineIdentity(reqWithCert('l2-A'), prodEnv));
+    await renewCert(reqJson({ csr: 'c2' }), cfEnv, await machineIdentity(reqWithCert('l2-A'), prodEnv));
+    const r = await row('renew-lost2');
+    expect(r?.cert_revoke_at).toBe('2999-01-01T00:00:00.000Z'); // never extended
+    expect(r?.prev_cert_fp_sha256).toBe('l2-A'); // prev unchanged
+    expect(r?.cert_fp_sha256).toBe(await certFingerprint(fakeCertPem('l2-D'))); // latest successor
+  });
+
+  it('409s a recovery whose grace window has already closed, revoking the just-signed orphan', async () => {
+    await seedMachine('renew-expired', { fp: 're-B', certId: 'cert-re-B', prevFp: 're-A', prevCertId: 'cert-re-A', revokeAt: '2000-01-01T00:00:00.000Z' });
+    const { deletes } = stubSignAndRevoke([{ seed: 're-C', id: 'cert-re-C' }]);
+    // Construct the identity directly on the expired prev fp (machineIdentity would deny it).
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('renew-expired', false, 're-A'));
+    expect(res.status).toBe(409);
+    expect(deletes).toContain('cert-re-C'); // orphan revoked
+    expect((await row('renew-expired'))?.cert_fp_sha256).toBe('re-B'); // unchanged
   });
 
   it('stops honoring the previous fp once its revoke_at has passed', async () => {
@@ -288,6 +314,38 @@ describe('POST /api/v1/admin/machines', () => {
     const res = await adminMachines(reqJson({ machine_id: 'am-other', cert_fp_sha256: 'am-grace-prev' }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(409);
     expect(((await res.json()) as { machine_id: string }).machine_id).toBe('am-grace');
+  });
+
+  it('resets rotation metadata when the current fingerprint changes (prune then finds nothing to revoke)', async () => {
+    await seedMachine('am-rot', { fp: 'am-rot-cur', certId: 'am-rot-certid', prevFp: 'am-rot-prev', prevCertId: 'am-rot-previd', revokeAt: '2000-01-01T00:00:00.000Z' });
+    await adminMachines(reqJson({ machine_id: 'am-rot', cert_fp_sha256: 'am-rot-new' }), testEnv, machine('am-admin', true));
+    const r = await row('am-rot');
+    expect(r?.cert_fp_sha256).toBe('am-rot-new');
+    expect(r?.cert_id).toBeNull(); // no body cert_id given -> reset to NULL
+    expect(r?.prev_cert_fp_sha256).toBeNull(); // grace window cleared -> prune's WHERE won't match
+    expect(r?.prev_cert_id).toBeNull();
+    expect(r?.cert_revoke_at).toBeNull();
+  });
+
+  it('rollback: setting cert_fp back to the in-grace prev clears the window so prune never revokes the reinstated cert', async () => {
+    await seedMachine('am-rollback', { fp: 'rb-B', certId: 'cert-rb-B', prevFp: 'rb-A', prevCertId: 'cert-rb-A', revokeAt: '2999-01-01T00:00:00.000Z' });
+    const res = await adminMachines(reqJson({ machine_id: 'am-rollback', cert_fp_sha256: 'rb-A' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(200);
+    const r = await row('am-rollback');
+    expect(r?.cert_fp_sha256).toBe('rb-A'); // reinstated as current
+    expect(r?.prev_cert_fp_sha256).toBeNull(); // no longer scheduled for revoke
+    expect(r?.cert_revoke_at).toBeNull();
+  });
+
+  it('same-fp upsert preserves an active rotation window', async () => {
+    await seedMachine('am-keep', { fp: 'keep-B', certId: 'cert-keep-B', prevFp: 'keep-A', prevCertId: 'cert-keep-A', revokeAt: '2999-01-01T00:00:00.000Z' });
+    await adminMachines(reqJson({ machine_id: 'am-keep', priority: 7 }), testEnv, machine('am-admin', true)); // no fp change
+    const r = await row('am-keep');
+    expect(r?.priority).toBe(7);
+    expect(r?.cert_id).toBe('cert-keep-B'); // preserved
+    expect(r?.prev_cert_fp_sha256).toBe('keep-A'); // preserved
+    expect(r?.prev_cert_id).toBe('cert-keep-A');
+    expect(r?.cert_revoke_at).toBe('2999-01-01T00:00:00.000Z');
   });
 });
 
