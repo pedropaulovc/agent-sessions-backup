@@ -10,7 +10,7 @@ const testEnv = env as unknown as Env;
 const cfEnv = { ...testEnv, CF_ZONE_ID: 'zone-1', CF_CLIENT_CERT_TOKEN: 'cf-token' } as Env;
 const prodEnv = { ...testEnv, ENVIRONMENT: 'production' } as Env;
 
-const machine = (machineId: string, isAdmin = false): Identity => ({ kind: 'machine', machineId, isAdmin });
+const machine = (machineId: string, isAdmin = false, certFp?: string): Identity => ({ kind: 'machine', machineId, isAdmin, certFp });
 
 function reqJson(body: unknown): Request {
   return new Request('https://api.sessions.vza.net/api/v1/x', {
@@ -122,7 +122,8 @@ describe('POST /api/v1/certs/renew', () => {
     stubSign({ id: 'r1-cert-B', certificate: fakeCertPem('r1-B') });
     const expectedFp = await certFingerprint(fakeCertPem('r1-B'));
 
-    const res = await renewCert(reqJson({ csr: 'csr-body' }), cfEnv, machine('renew-1'));
+    // Authenticated on the current cert (r1-fpA) — the CAS conditions the swap on this fp.
+    const res = await renewCert(reqJson({ csr: 'csr-body' }), cfEnv, machine('renew-1', false, 'r1-fpA'));
     expect(res.status).toBe(200);
     const out = (await res.json()) as { fingerprint: string; cert_id: string };
     expect(out.fingerprint).toBe(expectedFp);
@@ -167,6 +168,46 @@ describe('POST /api/v1/certs/renew', () => {
     expect(await machineIdentity(reqWithCert('r2-fpA'), prodEnv)).toEqual({ kind: 'anonymous' });
     expect(await machineIdentity(reqWithCert(fpB), prodEnv)).toMatchObject({ machineId: 'renew-2' });
     expect(await machineIdentity(reqWithCert(fpC), prodEnv)).toMatchObject({ machineId: 'renew-2' });
+  });
+
+  it('serializes concurrent renews off the same cert: loser 409s + orphan revoked, winner chain intact', async () => {
+    await seedMachine('renew-race', { fp: 'rr-fpA', certId: 'rr-cert-A' });
+    // Two requests that both authenticated while rr-fpA was current (resolved before either swaps).
+    const id1 = await machineIdentity(reqWithCert('rr-fpA'), prodEnv);
+    const id2 = await machineIdentity(reqWithCert('rr-fpA'), prodEnv);
+
+    // Sign returns B then C on successive calls; DELETE (orphan revoke) succeeds and is recorded.
+    const signed = [
+      { id: 'rr-cert-B', certificate: fakeCertPem('rr-B') },
+      { id: 'rr-cert-C', certificate: fakeCertPem('rr-C') },
+    ];
+    let signIdx = 0;
+    const deletes: string[] = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (init?.method === 'DELETE') {
+          deletes.push(url.split('/').pop()!);
+          return new Response(JSON.stringify({ success: true }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ success: true, result: { expires_on: '2027-01-01T00:00:00Z', ...signed[signIdx++]! } }), { status: 200 });
+      }),
+    );
+    const fpB = await certFingerprint(fakeCertPem('rr-B'));
+    const fpC = await certFingerprint(fakeCertPem('rr-C'));
+
+    // Winner advances current A -> B. Loser's swap then finds current is no longer A -> 409.
+    expect((await renewCert(reqJson({ csr: 'c1' }), cfEnv, id1)).status).toBe(200);
+    expect((await renewCert(reqJson({ csr: 'c2' }), cfEnv, id2)).status).toBe(409);
+
+    expect(deletes).toContain('rr-cert-C'); // the loser's just-signed cert was revoked, not stranded
+    const r = await row('renew-race');
+    expect(r?.cert_fp_sha256).toBe(fpB); // winner's chain
+    expect(r?.prev_cert_fp_sha256).toBe('rr-fpA');
+    expect(await machineIdentity(reqWithCert('rr-fpA'), prodEnv)).toMatchObject({ machineId: 'renew-race' });
+    expect(await machineIdentity(reqWithCert(fpB), prodEnv)).toMatchObject({ machineId: 'renew-race' });
+    expect(await machineIdentity(reqWithCert(fpC), prodEnv)).toEqual({ kind: 'anonymous' }); // C never installed
   });
 
   it('stops honoring the previous fp once its revoke_at has passed', async () => {
@@ -235,10 +276,18 @@ describe('POST /api/v1/admin/machines', () => {
     expect(r?.is_admin).toBe(1); // preserved
   });
 
-  it('409s a duplicate fingerprint rather than a bare 500', async () => {
+  it('409s a duplicate CURRENT fingerprint (explicit pre-check, not a UNIQUE-violation catch)', async () => {
     await adminMachines(reqJson({ machine_id: 'am-a', cert_fp_sha256: 'fp-dup' }), testEnv, machine('am-admin', true));
     const res = await adminMachines(reqJson({ machine_id: 'am-b', cert_fp_sha256: 'fp-dup' }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('fingerprint_in_use');
+  });
+
+  it("409s a fingerprint that is another machine's IN-GRACE previous cert (UNIQUE index misses this axis)", async () => {
+    await seedMachine('am-grace', { fp: 'am-grace-cur', prevFp: 'am-grace-prev', prevCertId: 'x', revokeAt: '2999-01-01T00:00:00.000Z' });
+    const res = await adminMachines(reqJson({ machine_id: 'am-other', cert_fp_sha256: 'am-grace-prev' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { machine_id: string }).machine_id).toBe('am-grace');
   });
 });
 
@@ -290,6 +339,28 @@ describe('daily prune (cert revoke)', () => {
     await runDailyPrune(cfEnv);
     expect(fetchMock).not.toHaveBeenCalled();
     expect((await row('prune-3'))?.prev_cert_fp_sha256).toBe('old3');
+  });
+
+  it('a renew landing between prune select and clear survives (conditional clear no-ops)', async () => {
+    await seedMachine('prune-race', { fp: 'pr-cur', prevFp: 'pr-old', prevCertId: 'pr-cert-old', revokeAt: '2000-01-01T00:00:00.000Z' });
+    // The DELETE (revoke) succeeds, but simulates a concurrent renew that lands between prune's
+    // SELECT and its clear — repopulating prev with a FRESH grace window. The conditional clear
+    // (keyed on the OLD prev fp + revoke_at) must then no-op, leaving the fresh window intact.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        expect(init?.method).toBe('DELETE');
+        await testEnv.DB.prepare(
+          `UPDATE machines SET prev_cert_fp_sha256 = 'pr-fresh', prev_cert_id = 'pr-cert-fresh', cert_revoke_at = '2999-01-01T00:00:00.000Z' WHERE machine_id = 'prune-race'`,
+        ).run();
+        return new Response(JSON.stringify({ success: true }), { status: 200 });
+      }),
+    );
+    await runDailyPrune(cfEnv);
+    const r = await row('prune-race');
+    expect(r?.prev_cert_fp_sha256).toBe('pr-fresh'); // fresh window survived the stale clear
+    expect(r?.prev_cert_id).toBe('pr-cert-fresh');
+    expect(r?.cert_revoke_at).toBe('2999-01-01T00:00:00.000Z');
   });
 
   it('clears columns without a CA call when there is no prev_cert_id (pre-M4 enrolled cert)', async () => {

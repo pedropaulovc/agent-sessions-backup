@@ -54,6 +54,23 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
   };
 
   if (body.machine_id) {
+    // Reject a fingerprint already live on ANOTHER machine — as its current cert OR its in-grace
+    // previous cert. A managed cert fingerprint is unique per machine; letting two rows share one
+    // would make machineIdentity's unordered .first() authenticate as whichever row it returned.
+    // This subsumes the plain current-fp UNIQUE collision into an explicit 409 (clearer than a
+    // constraint-violation catch) and additionally catches the prev-in-grace collision the UNIQUE
+    // index alone misses.
+    if (body.cert_fp_sha256) {
+      const clash = await env.DB.prepare(
+        `SELECT machine_id FROM machines
+          WHERE (cert_fp_sha256 = ?1 OR (prev_cert_fp_sha256 = ?1 AND cert_revoke_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')))
+            AND machine_id != ?2`,
+      )
+        .bind(body.cert_fp_sha256, body.machine_id)
+        .first<{ machine_id: string }>();
+      if (clash) return Response.json({ error: 'fingerprint_in_use', machine_id: clash.machine_id }, { status: 409 });
+    }
+
     // Read-merge-write so a partial upsert preserves unspecified columns instead of resetting the
     // NOT NULL ones (os/key_protection/is_admin/priority) to their table defaults.
     const existing = await env.DB.prepare(

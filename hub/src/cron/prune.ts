@@ -46,11 +46,11 @@ import { revokeClientCert } from '../api/certs';
  * hub never recorded — has nothing to revoke, so we just clear the columns. */
 export async function runDailyPrune(env: Env): Promise<void> {
   const due = await env.DB.prepare(
-    `SELECT machine_id, prev_cert_id FROM machines
+    `SELECT machine_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at FROM machines
       WHERE prev_cert_fp_sha256 IS NOT NULL
         AND cert_revoke_at IS NOT NULL
         AND cert_revoke_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
-  ).all<{ machine_id: string; prev_cert_id: string | null }>();
+  ).all<{ machine_id: string; prev_cert_fp_sha256: string; prev_cert_id: string | null; cert_revoke_at: string }>();
 
   for (const row of due.results) {
     if (row.prev_cert_id) {
@@ -65,9 +65,16 @@ export async function runDailyPrune(env: Env): Promise<void> {
         continue; // keep the row; retry next run
       }
     }
+    // Clear ONLY the exact grace window we selected and revoked. A renew that landed between the
+    // SELECT above and here has already repopulated prev_cert_fp_sha256/cert_revoke_at with a
+    // FRESH window (and revoked cert), so this conditional UPDATE no-ops rather than wiping the
+    // new grace state — the next daily run handles the fresh window on its own schedule.
     await env.DB.prepare(
-      `UPDATE machines SET prev_cert_fp_sha256 = NULL, prev_cert_id = NULL, cert_revoke_at = NULL WHERE machine_id = ?1`,
-    ).bind(row.machine_id).run();
+      `UPDATE machines SET prev_cert_fp_sha256 = NULL, prev_cert_id = NULL, cert_revoke_at = NULL
+        WHERE machine_id = ?1 AND prev_cert_fp_sha256 = ?2 AND cert_revoke_at = ?3`,
+    )
+      .bind(row.machine_id, row.prev_cert_fp_sha256, row.cert_revoke_at)
+      .run();
     console.log(JSON.stringify({ event: 'hub.prune.revoked', machine: row.machine_id, cert_id: row.prev_cert_id ?? null }));
   }
 }

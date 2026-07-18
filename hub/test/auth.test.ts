@@ -92,7 +92,8 @@ describe('machineIdentity', () => {
     // Positive control: the same enrolled cert, NOT revoked, authenticates as the machine —
     // proving the cf.tlsClientAuth path is reached and the fingerprint maps.
     const ok = await machineIdentity(reqWithCert({ certVerified: 'SUCCESS', certFingerprintSHA256: fp }), prod);
-    expect(ok).toEqual({ kind: 'machine', machineId: 'revoked-box', isAdmin: true });
+    // certFp echoes the authenticating fingerprint (threaded through for the certs/renew CAS).
+    expect(ok).toEqual({ kind: 'machine', machineId: 'revoked-box', isAdmin: true, certFp: fp });
 
     // The fix: certVerified stays 'SUCCESS' for a revoked cert, so without the certRevoked
     // check the still-enrolled row would keep authenticating. It must fall through to anonymous.

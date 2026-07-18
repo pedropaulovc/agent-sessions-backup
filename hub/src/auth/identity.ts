@@ -1,5 +1,8 @@
 export type Identity =
-  | { kind: 'machine'; machineId: string; isAdmin: boolean }
+  // certFp is the client-cert fingerprint that authenticated this request (current OR an
+  // in-grace previous fp). certs/renew compare-and-swaps on it so a concurrent renew can't
+  // strand a cert; absent for dev/preview header identities, which never rotate certs.
+  | { kind: 'machine'; machineId: string; isAdmin: boolean; certFp?: string }
   | { kind: 'human' }
   | { kind: 'anonymous' };
 
@@ -59,7 +62,7 @@ export async function machineIdentity(request: Request, env: Env): Promise<Ident
       .bind(tls.certFingerprintSHA256)
       .first<{ machine_id: string; is_admin: number }>();
     if (!row) return { kind: 'anonymous' };
-    return { kind: 'machine', machineId: row.machine_id, isAdmin: row.is_admin === 1 };
+    return { kind: 'machine', machineId: row.machine_id, isAdmin: row.is_admin === 1, certFp: tls.certFingerprintSHA256 };
   }
 
   if (env.ENVIRONMENT === 'development') return devHeaderIdentity(request, env);

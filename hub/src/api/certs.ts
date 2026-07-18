@@ -89,14 +89,32 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
   // identity guard's lexicographic `cert_revoke_at > now` compares chronologically.
   const revokeAt = new Date(Date.now() + CERT_GRACE_DAYS * 86_400_000).toISOString();
 
-  await env.DB.prepare(
+  // Compare-and-swap on the fingerprint that authenticated THIS request: the swap only lands
+  // while that fp is still current. Two renews racing off the same cert therefore serialize —
+  // the first flips current to its new fp, the second's WHERE no longer matches (changes === 0)
+  // and it loses. Without this, last-writer-wins would overwrite the winner's current/prev and
+  // strand the loser's just-issued cert in neither slot → a locked-out machine.
+  const swap = await env.DB.prepare(
     `UPDATE machines
        SET prev_cert_fp_sha256 = ?2, prev_cert_id = ?3, cert_revoke_at = ?4,
            cert_fp_sha256 = ?5, cert_id = ?6
-     WHERE machine_id = ?1`,
+     WHERE machine_id = ?1 AND cert_fp_sha256 = ?7`,
   )
-    .bind(identity.machineId, cur?.cert_fp_sha256 ?? null, cur?.cert_id ?? null, revokeAt, newFp, signed.id)
+    .bind(identity.machineId, cur?.cert_fp_sha256 ?? null, cur?.cert_id ?? null, revokeAt, newFp, signed.id, identity.certFp ?? null)
     .run();
+
+  if (swap.meta.changes === 0) {
+    // A competing rotation already advanced the current fp (or this request authenticated on an
+    // already-retired prev cert). The cert we just minted is an orphan — best-effort revoke it so
+    // it doesn't linger at the CA (it otherwise ages out at the 1-year validity). Never let a
+    // revoke failure mask the 409.
+    try {
+      await revokeClientCert(env, signed.id);
+    } catch (e) {
+      console.log(JSON.stringify({ event: 'hub.certs.orphan_revoke_failed', machine: identity.machineId, cert_id: signed.id, error: String(e) }));
+    }
+    return Response.json({ error: 'renew_conflict' }, { status: 409 });
+  }
 
   console.log(JSON.stringify({ event: 'hub.certs.renewed', machine: identity.machineId, revoke_at: revokeAt }));
   return Response.json({

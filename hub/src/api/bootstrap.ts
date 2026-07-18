@@ -13,9 +13,13 @@ export const DEFAULT_COLLECTOR_CONFIG = {
   schema_version: COLLECTOR_CONFIG_SCHEMA_VERSION,
   scan_interval_seconds: 900, // filesystem rescan cadence (15m)
   heartbeat_interval_seconds: 900,
-  // Hard cap the collector honors per single-file upload. 100 MiB is Cloudflare's request
-  // body ceiling on this plan; files above it route through the multipart path (m7-upload).
-  max_upload_bytes: 100 * 1024 * 1024,
+  // Threshold at/above which the collector routes a file through the multipart path instead of a
+  // single PUT. Cloudflare's request-body cap is 100 *decimal* MB (100_000_000, not 104_857_600),
+  // so a `100 * 1024 * 1024` value would still 413 files in the 100.0–104.9 MB band. Set to
+  // 90_000_000 to match m7-upload's collector default (multipart_threshold_mb = 90), leaving margin
+  // under the decimal cap. Keep this number in lockstep with that collector constant — one source
+  // of truth; when the collector's is exported into the shared config, reference it here.
+  max_upload_bytes: 90_000_000,
   // Per-store capture toggles. Absent store => collector uses its own default (on).
   stores: {
     'claude-code': true,
