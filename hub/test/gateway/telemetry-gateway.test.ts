@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import gateway from '../../gateway/telemetry-gateway';
+import gateway, { resetTokenCache } from '../../gateway/telemetry-gateway';
 
 // Unit tests for the gateway's own request handling (bearer check, transcode,
 // forward). The outbound `fetch` (both the Entra token exchange and the DCR
@@ -36,6 +36,9 @@ describe('telemetry-gateway fetch handler', () => {
   let fetchMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
+    // The Entra token is cached at module scope; clear it so each test exercises the
+    // token path from scratch (the token-failure test depends on no cached token).
+    resetTokenCache();
     fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
   });
@@ -211,7 +214,7 @@ describe('telemetry-gateway fetch handler', () => {
     expect(upstreamPosts).toBeGreaterThan(1); // batch was split
   });
 
-  it('returns 204 to Cloudflare even when the DCR rejects a chunk with 413 (never head-of-line-wedge)', async () => {
+  it('returns 204 to Cloudflare even when the DCR rejects a chunk with 413 — poison drop (never head-of-line-wedge)', async () => {
     const pem = await pemFromGeneratedKeyPair();
     const env = makeEnv(pem);
 
@@ -233,7 +236,87 @@ describe('telemetry-gateway fetch handler', () => {
     });
 
     const res = await gateway.fetch(req, env as never, ctx);
-    // CF must see success so it advances its queue instead of retrying the 413 forever.
+    // A 413 is poison — no retry can ever land it — so we drop the chunk and still
+    // ack, letting CF advance its queue instead of retrying the 413 forever.
     expect(res.status).toBe(204);
+  });
+
+  it('returns 503 and dispatches NOTHING when the Entra token exchange fails (transient, keep retryable)', async () => {
+    const pem = await pemFromGeneratedKeyPair();
+    const env = makeEnv(pem);
+
+    let dcrPosts = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('login.microsoftonline.com')) {
+        // Azure AD momentarily unavailable — no access_token in the body.
+        return new Response(JSON.stringify({ error: 'temporarily_unavailable', error_description: 'try later' }), {
+          status: 503,
+        });
+      }
+      dcrPosts++;
+      return new Response(null, { status: 204 });
+    });
+
+    const req = new Request('https://gateway.example/v1/logs', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.INGEST_BEARER}` },
+      body: JSON.stringify({
+        resourceLogs: [{ scopeLogs: [{ logRecords: [{ body: { stringValue: '{"event":"x"}' } }] }] }],
+      }),
+    });
+
+    const res = await gateway.fetch(req, env as never, ctx);
+    // The batch is valid — only the token minting failed — so CF should retry it.
+    expect(res.status).toBe(503);
+    expect(dcrPosts).toBe(0); // nothing forwarded without a token
+  });
+
+  it('posts every chunk but returns 503 when one chunk hits a transient 429 (redeliver the batch)', async () => {
+    const pem = await pemFromGeneratedKeyPair();
+    const env = makeEnv(pem);
+
+    let dcrPosts = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('login.microsoftonline.com')) {
+        return new Response(JSON.stringify({ access_token: 'fake-entra-token', expires_in: 3600 }), { status: 200 });
+      }
+      dcrPosts++;
+      // First chunk gets throttled (transient); the rest succeed.
+      return dcrPosts === 1
+        ? new Response('slow down', { status: 429 })
+        : new Response(null, { status: 204 });
+    });
+
+    // 6 × ~300 KB records → splits into multiple chunks so we can prove the loop keeps
+    // going past the throttled first chunk.
+    const bigBody = `{"event":"http.access","blob":"${'a'.repeat(300_000)}"}`;
+    const otlpJson = {
+      resourceLogs: [
+        {
+          resource: { attributes: [{ key: 'service.name', value: { stringValue: 'sessions-hub' } }] },
+          scopeLogs: [
+            {
+              logRecords: Array.from({ length: 6 }, (_, i) => ({
+                timeUnixNano: String(1782964800000000000n + BigInt(i)),
+                body: { stringValue: bigBody },
+              })),
+            },
+          ],
+        },
+      ],
+    };
+
+    const req = new Request('https://gateway.example/v1/logs', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.INGEST_BEARER}` },
+      body: JSON.stringify(otlpJson),
+    });
+
+    const res = await gateway.fetch(req, env as never, ctx);
+    // Transient → CF must redeliver the whole batch (duplicates-over-loss).
+    expect(res.status).toBe(503);
+    expect(dcrPosts).toBeGreaterThan(1); // did NOT bail after the 429 — posted the rest
   });
 });

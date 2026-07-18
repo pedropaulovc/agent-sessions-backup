@@ -40,6 +40,13 @@ interface Env {
 
 let tokenCache: { token: string; expiresAt: number } | null = null;
 
+// Test-only: the token cache is module-level (shared across `fetch` invocations
+// within a worker isolate, which is the point), so tests that exercise the
+// token-failure path must clear it first or they'd hit a cached token.
+export function resetTokenCache(): void {
+  tokenCache = null;
+}
+
 export async function getEntraToken(env: Env): Promise<string> {
   if (tokenCache && Date.now() < tokenCache.expiresAt) {
     return tokenCache.token;
@@ -158,19 +165,32 @@ async function forwardOtlp(
     return new Response(null, { status: 204 });
   }
 
-  // We ALWAYS return success to Cloudflare once we've started dispatching, even if
-  // individual chunk POSTs fail. CF head-of-line retries a failed batch forever, so
-  // propagating a 413/5xx would re-wedge the entire pipeline; a rare dropped chunk
-  // (logged for `wrangler tail`) beats a stalled export. Same philosophy as the
-  // auth-mismatch 200 above.
+  // The always-204 ack is for POISON only — a payload no retry can ever land. A
+  // transient failure (the batch is fine, the upstream is momentarily unhappy) must
+  // stay retryable, or we silently lose valid telemetry. So:
+  //   - token exchange fails      → 503, NOTHING dispatched, CF retries the batch;
+  //   - all chunks 2xx            → 204;
+  //   - a chunk 413s despite chunking (cap anomaly / truncation edge) → poison:
+  //       log + drop that chunk, keep the batch ack'd (this is the class that
+  //       wedged us today; retrying it forever is exactly the bug);
+  //   - a chunk gets a TRANSIENT failure (429 / 5xx / network) → finish the rest,
+  //       then 503 so CF redelivers.
+  // Token exchange failure can't wedge: the batch is valid and chunking already
+  // bounds every future POST under the cap, so redelivery always makes progress.
   let token: string;
   try {
     token = await getEntraToken(env);
   } catch (e) {
     logGatewayEvent({ tag: "gateway-token-error", endpoint, error: String(e) });
-    return new Response(null, { status: 204 });
+    return new Response("token exchange failed", { status: 503 });
   }
 
+  // Duplicates-over-loss is a deliberate trade: on a 503 CF redelivers the WHOLE
+  // batch, re-posting chunks that already landed. Duplicate log rows are harmless to
+  // our alert queries (absence / arg_max / gap semantics all tolerate repeats),
+  // whereas a LOST beacon is precisely the false-alarm failure mode the dead-man
+  // alerts exist to catch — so we accept duplicates to avoid loss.
+  let retryable = false;
   for (let i = 0; i < chunks.length; i++) {
     try {
       const upstream = await fetch(endpoint, {
@@ -178,27 +198,41 @@ async function forwardOtlp(
         headers: { "Content-Type": "application/x-protobuf", Authorization: `Bearer ${token}` },
         body: chunks[i],
       });
-      if (!upstream.ok) {
-        const body = await upstream.text();
-        logGatewayEvent({
-          tag: "gateway-upstream-error",
-          endpoint,
-          status: upstream.status,
-          chunk: `${i + 1}/${chunks.length}`,
-          bytes: chunks[i]!.byteLength,
-          body: body.slice(0, 500),
-        });
-      }
+      if (upstream.ok) continue;
+
+      const body = await upstream.text();
+      const poison = upstream.status === 413;
+      const transient = upstream.status === 429 || upstream.status >= 500;
+      if (transient) retryable = true;
+      // Non-transient, non-413 responses (400/401/403…) can't be fixed by retrying
+      // the same bytes, so we drop them rather than wedge the pipeline — logged for
+      // `wrangler tail` and, being persistent config faults, surfaced by the
+      // collector-error alert rather than swallowed.
+      logGatewayEvent({
+        tag: poison ? "gateway-chunk-dropped" : "gateway-upstream-error",
+        endpoint,
+        status: upstream.status,
+        disposition: poison ? "dropped-poison" : transient ? "retry-batch" : "dropped-nonretryable",
+        chunk: `${i + 1}/${chunks.length}`,
+        bytes: chunks[i]!.byteLength,
+        body: body.slice(0, 500),
+      });
     } catch (e) {
+      // Network-level failure (fetch rejected) — transient by nature, keep retryable.
+      retryable = true;
       logGatewayEvent({
         tag: "gateway-upstream-exception",
         endpoint,
         chunk: `${i + 1}/${chunks.length}`,
+        disposition: "retry-batch",
         error: String(e),
       });
     }
   }
 
+  if (retryable) {
+    return new Response("upstream transient failure — retry", { status: 503 });
+  }
   return new Response(null, { status: 204 });
 }
 
