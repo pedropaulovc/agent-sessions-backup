@@ -102,7 +102,7 @@ async function ownedSessions(fileId: number): Promise<number> {
   return r!.n;
 }
 
-async function uploadConvs(tag: string, convs: ClaudeConvOpts[]): Promise<{ fileId: number; hash: string; r2Key: string }> {
+async function uploadConvs(tag: string, convs: ClaudeConvOpts[], mtime = '2026-07-01T12:00:00Z'): Promise<{ fileId: number; hash: string; r2Key: string }> {
   const zip = claudeExportZip(convs);
   const hash = await sha256Hex(zip);
   const relpath = `claude-export-${tag}.zip`;
@@ -112,7 +112,7 @@ async function uploadConvs(tag: string, convs: ClaudeConvOpts[]): Promise<{ file
     headers: {
       'x-dev-machine': machine,
       'x-content-hash': `sha256:${hash}`,
-      'x-file-mtime': '2026-07-01T12:00:00Z',
+      'x-file-mtime': mtime,
       'content-length': String(zip.length),
     },
     body: zip,
@@ -1383,6 +1383,86 @@ describe('large export ingest is bounded and never marks parsed until every conv
     // POSITIVE CONTROL: a corrupt archive whose reconciliation throws must not oscillate pending forever — a
     // transient throw converges. The retry's failExportFile succeeds and the file rests terminal 'error'.
     expect(await fileState(up.fileId)).toBe('error');
+  });
+
+  it('flips owned sessions to error in bounded db.batch chunks, never one subrequest per row (round 9 finding 5, batching)', async () => {
+    budgets({ slice: 800, invocation: 800 });
+    // N spans two chunks of 90, so the flip is 2 subrequests batched but would be 100 unbatched — the
+    // O(N)-subrequest tail that, running AFTER markParsed('error') commits, throws past the ~1000 cap for a
+    // corrupt re-upload of an archive owning ~950+ conversations and then never re-runs (the file is already
+    // 'error', so markParsed returns updated=false and failExportFile early-returns): the owned rows strand.
+    const N = 100;
+    const up = await uploadConvs('r9f5b', Array.from({ length: N }, (_u, i) => conv('r9f5b', i)));
+    await deliverChain({ file_id: up.fileId, r2_key: up.r2Key, reason: 'upload', content_hash: up.hash });
+    expect(await ownedSessions(up.fileId)).toBe(N);
+    const corruptHash = await reuploadRawExport('r9f5b', new TextEncoder().encode('not a zip at all'));
+
+    // Tag every prepared owned-session flip statement; count how many execute via db.batch (chunked) vs a
+    // direct per-row .run(). The batched code path uses ONLY db.batch; the reverted per-row loop uses .run().
+    const FLIP_SQL = "UPDATE sessions SET index_state = 'error' WHERE session_id = ?1";
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+    let flipRunCalls = 0;
+    let flipBatchCalls = 0;
+    const tagged = new WeakSet<object>();
+    testEnv.DB.prepare = ((sql: string) => {
+      const stmt = realPrepare(sql);
+      if (sql !== FLIP_SQL) return stmt;
+      const realBind = stmt.bind.bind(stmt);
+      stmt.bind = (...a: unknown[]) => {
+        const bound = realBind(...a);
+        tagged.add(bound as object);
+        const realRun = bound.run.bind(bound);
+        (bound as unknown as Record<string, unknown>).run = (...x: unknown[]) => {
+          flipRunCalls++;
+          return (realRun as (...y: unknown[]) => unknown)(...x);
+        };
+        return bound;
+      };
+      return stmt;
+    }) as typeof testEnv.DB.prepare;
+    testEnv.DB.batch = ((stmts: unknown[]) => {
+      if (Array.isArray(stmts) && stmts.some((s) => tagged.has(s as object))) flipBatchCalls++;
+      return realBatch(stmts as never);
+    }) as typeof testEnv.DB.batch;
+    try {
+      await deliver({ file_id: up.fileId, r2_key: up.r2Key, reason: 'upload', content_hash: corruptHash });
+    } finally {
+      testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
+      testEnv.DB.batch = realBatch as typeof testEnv.DB.batch;
+    }
+
+    // Reconciliation ran: the file rests terminal 'error' and all N owned rows were flipped.
+    expect(await fileState(up.fileId)).toBe('error');
+    expect(await stateCount(up.fileId, 'error')).toBe(N);
+    // POSITIVE CONTROL: the flip went out in ceil(N/90) db.batch chunks (each ONE subrequest) and NEVER via a
+    // per-row .run(). Reverting to the per-row loop makes flipRunCalls === N and flipBatchCalls === 0, failing
+    // both — that unbatched loop is the O(N)-subrequest deterministic throw path finding 5 flagged.
+    expect(flipRunCalls).toBe(0);
+    expect(flipBatchCalls).toBe(Math.ceil(N / 90));
+  });
+
+  it('an older healed archive cannot steal a conversation owned by a newer archive; last-write-wins holds on equal mtime (round 9 finding 3a, mtime guard)', async () => {
+    budgets({ slice: 800, invocation: 800 });
+    const convTag = 'mtx';
+    // A = the NEWER archive (later file mtime): uploads and owns X healthily.
+    const a = await uploadConvs('mt-a', [conv(convTag, 0)], '2026-07-02T12:00:00Z');
+    await deliverChain({ file_id: a.fileId, r2_key: a.r2Key, reason: 'upload', content_hash: a.hash });
+    const xId = `bnd-${convTag}-conv-0`;
+    expect(await canonicalOwner(xId)).toBe(a.fileId);
+    expect(await sessionState(xId)).toBe('ready');
+
+    // B = an OLDER archive (earlier file mtime) that also contains X. This is the files/check heal path:
+    // everything this PR forces to 'pending' is re-parsed as reason 'upload'. Delivered AFTER A, B would win
+    // on execution order under plain last-write-wins — the mtime guard must stop it stealing the newer copy.
+    const b = await uploadConvs('mt-b', [conv(convTag, 0)], '2026-07-01T12:00:00Z');
+    await deliver({ file_id: b.fileId, r2_key: b.r2Key, reason: 'upload', content_hash: b.hash });
+
+    // POSITIVE CONTROL: without the guard, B's 'upload' parse claims X (execution order wins). The guard skips
+    // it because A is STRICTLY newer, so X keeps A's ownership; B still completes, just owning nothing.
+    expect(await canonicalOwner(xId)).toBe(a.fileId);
+    expect(await sessionState(xId)).toBe('ready');
+    expect(await fileState(b.fileId)).toBe('parsed');
   });
 
   it('cleanup deletes are atomic hash-guarded: a hash flip between the recheck and the delete batch no-ops them (round 4 finding 3)', async () => {

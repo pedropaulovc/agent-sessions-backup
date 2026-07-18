@@ -426,6 +426,11 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
  * path and the missing-R2-object path; both leave archive rows (files.session_id NULL) that the
  * generic consumer catch can't flip on its own.
  */
+// Owned-session error flips in failExportFile go out in db.batch chunks of this many statements — one
+// subrequest per chunk (mirrors writeSession's 90-row INSERT batching), keeping reconciliation of an
+// archive that owned thousands of conversations comfortably under the ~1000 subrequest cap.
+const FAIL_FLIP_CHUNK = 90;
+
 async function failExportFile(file: FileRow, env: Env, contentHash: string | undefined, reason: string): Promise<void> {
   const { updated } = await markParsed(file.id, env, 'error', file.size, reason, contentHash);
   // A fresher re-upload already owns this row (hash moved on) — its message handles the state.
@@ -433,8 +438,16 @@ async function failExportFile(file: FileRow, env: Env, contentHash: string | und
   const owned = await env.DB.prepare('SELECT session_id FROM sessions WHERE canonical_file_id = ?1')
     .bind(file.id)
     .all<{ session_id: string }>();
-  for (const { session_id } of owned.results) {
-    await env.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(session_id).run();
+  // Flip every owned session to 'error' in db.batch CHUNKS, not one .run() per row. A corrupt re-upload of
+  // an archive that owned N conversations otherwise costs N subrequests here (one per row) — and this runs
+  // AFTER markParsed('error') has committed, so once it breaches the ~1000 cap it throws, the retry finds the
+  // file already 'error' (markParsed returns updated=false → early return above), and the flip/fan-out never
+  // re-run: the owned rows stay stranded pointing at an errored file, FOREVER. Batched at 90/chunk, a batch is
+  // ONE subrequest regardless of statement count, so ~950 owned rows cost ceil(950/90)=11 subrequests — safely
+  // bounded under the cap, so failExportFile always completes and the file rests terminal 'error' (round 9 finding 5).
+  for (let i = 0; i < owned.results.length; i += FAIL_FLIP_CHUNK) {
+    const chunk = owned.results.slice(i, i + FAIL_FLIP_CHUNK);
+    await env.DB.batch(chunk.map(({ session_id }) => env.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(session_id)));
   }
   if (owned.results.length > 0) {
     // Recover from export files on ANY machine, not just this one. Export rows carry
@@ -510,6 +523,18 @@ function estimateWriteSubrequests(s: NormalizedSession): number {
     if (turn.usage) rows += 1;
   }
   return 3 + Math.ceil(rows / 90);
+}
+
+/** True only when the current owner archive is STRICTLY newer than ours by file mtime. Equal, NULL, or
+ * unparseable mtimes return false → the caller falls through to last-write-wins (see the ownership decision
+ * in runExportParse). Compared as parsed timestamps rather than lexically so mixed ISO precisions can't
+ * misorder. */
+function isOwnerNewer(ownerMtime: string | null, ourMtime: string | null): boolean {
+  if (ownerMtime === null || ourMtime === null) return false;
+  const owner = Date.parse(ownerMtime);
+  const ours = Date.parse(ourMtime);
+  if (Number.isNaN(owner) || Number.isNaN(ours)) return false;
+  return owner > ours;
 }
 
 /** Export-aware retryable wrapper around the whole parse. ANY throw out of runExportParse is a transient
@@ -615,11 +640,11 @@ async function runExportParse(
       // lookup gates on prior work only, so a leading oversized conversation (spentBefore 0) still runs alone.
       const spentBefore = spent;
       const existing = await env.DB.prepare(
-        `SELECT f.store, f.parse_state AS canon_state, s.index_state, s.canonical_file_id
+        `SELECT f.store, f.parse_state AS canon_state, f.mtime AS owner_mtime, s.index_state, s.canonical_file_id
          FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
       )
         .bind(session.id)
-        .first<{ store: string; canon_state: string; index_state: string; canonical_file_id: number }>();
+        .first<{ store: string; canon_state: string; owner_mtime: string | null; index_state: string; canonical_file_id: number }>();
       spent += 1; // the ownership lookup above
       // Skip only a HEALTHY live capture: a chatgpt-web/claude-web canonical whose index_state is
       // 'ready'. If that live session is instead 'error'/'parsing' (or absent), let this export write
@@ -638,11 +663,19 @@ async function runExportParse(
       // canonically owned by another non-error file. An 'upload'/'reindex' parse still wins normally —
       // last-write-wins ownership is deliberate (web-ingest round 2/7/12 tests), so this stays gated on
       // reason==='recover'. (Round 9 finding 3b keeps a lost recover SEND from silently degrading a
-      // recover into a files/check 'upload' reparse; a stale upload displacing a newer owner is a
-      // separate, narrower concern — see the PR thread.)
+      // recover into a files/check 'upload' reparse.)
       const healthyOtherOwner =
         existing && existing.index_state === 'ready' && existing.canonical_file_id !== file.id && existing.canon_state !== 'error';
       if (reason === 'recover' && healthyOtherOwner) continue;
+      // mtime guard (round 9 finding 3a) — applies to EVERY reason, not just recover. This PR forces many
+      // archives to 'pending' (ExportRetry, dropped continuations); files/check then HEALS each as reason
+      // 'upload' and re-parses it. Without this, a healed OLDER archive re-executing AFTER a newer archive
+      // already claimed a conversation would win on execution order alone and overwrite the newer content.
+      // So skip claiming a healthy conversation whose current owner archive is STRICTLY newer than ours (by
+      // file mtime). Ties and unknown (NULL/unparseable) mtimes fall through to last-write-wins: only a
+      // strictly-OLDER archive displacing a strictly-newer one is the bug — a genuinely newer upload still
+      // steals from older owners (web-ingest round 2/7/12 last-write-wins tests, all same-mtime, still hold).
+      if (healthyOtherOwner && isOwnerNewer(existing!.owner_mtime, file.mtime)) continue;
 
       // Preflight the conversation's SUBREQUEST cost. writeSession is atomic per conversation (no
       // intra-conversation cursor), so a single oversized conversation can't be sliced — it must either
