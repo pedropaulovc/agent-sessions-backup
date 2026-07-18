@@ -45,10 +45,21 @@ MULTIPART_MAX_PARTS = 10000
 MULTIPART_MAX_FILE_BYTES = 5 * 1024 * 1024 * 1024
 
 
+def _oversize_refusal(size: int) -> str | None:
+    """Refusal reason if `size` exceeds R2's 5GiB single-put finalize limit, else None. Callers check
+    this BEFORE hashing so an unshippable multi-GB file isn't streamed end-to-end every run only to be
+    refused; the recorded error state then keeps subsequent runs to a cheap size check."""
+    if size > MULTIPART_MAX_FILE_BYTES:
+        return (f"file of {size} bytes exceeds the {MULTIPART_MAX_FILE_BYTES}-byte R2 single-put "
+                "finalize limit; not uploaded")
+    return None
+
+
 def _effective_part_size(size: int, configured: int, ceiling: int) -> tuple[int | None, str | None]:
     """(part_size, None) or (None, refusal_reason). Grows the part size just enough to keep the part
     count <= MULTIPART_MAX_PARTS, but never above `ceiling` (the multipart threshold, itself below the
-    100MB edge cap)."""
+    100MB edge cap). `configured` and `ceiling` are already floored at R2's 5MiB minimum by the config
+    loader (see config._normalize_multipart), so a legal part is always produced."""
     needed = -(-size // MULTIPART_MAX_PARTS)  # ceil(size / 10000)
     if needed > ceiling:
         return None, (f"file of {size} bytes needs >= {needed}-byte parts to stay under "
@@ -233,6 +244,14 @@ def _process_large_item(cfg, st: State, transport: Transport, item: ScanItem,
     """Run-mode path for a file at/above the multipart threshold. Hashes by streaming (no full
     read), skips the wire when the hash is unchanged, else uploads via multipart. Memory stays
     bounded to one part throughout."""
+    refusal = _oversize_refusal(item.size)
+    if refusal is not None:
+        # Unshippable — record the failure WITHOUT hashing the multi-GB file (every run would repeat
+        # that full read). status='error' isn't fast-path-eligible, so a later run re-enters here and
+        # re-refuses on the cheap size check alone, until size/mtime changes.
+        st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns,
+                       row.sha256 if row else "", "error", error=f"multipart: {refusal}"[:400])
+        return ItemResult(changed=True, error=f"{item.relpath}: multipart failed: {refusal}")
     try:
         sha = hash_file_prefix(item.source_path, item.size)
     except OSError as e:
@@ -329,9 +348,8 @@ def _upload_multipart(cfg, transport: Transport, item: ScanItem, sha: str) -> tu
     opened an upload but didn't complete is aborted before retrying (and on final give-up) so no
     dangling multipart is left. Returns (MULTIPART_*, detail)."""
     base_url = file_url(cfg.hub_url, cfg.machine_id, item.store, item.relpath)
-    if item.size > MULTIPART_MAX_FILE_BYTES:
-        return MULTIPART_FAILED, (f"file of {item.size} bytes exceeds the {MULTIPART_MAX_FILE_BYTES}-byte "
-                                  "R2 single-put finalize limit; not uploaded")
+    # Oversize (>5GiB) is refused by both callers BEFORE hashing (see _oversize_refusal); by here the
+    # file is known-shippable, so we only need the part-size fit check.
     part_size, refusal = _effective_part_size(
         item.size, cfg.multipart_part_size_bytes, cfg.multipart_threshold_bytes)
     if part_size is None:
@@ -489,6 +507,17 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
         totals["scanned"] += 1
         if totals["scanned"] % 100 == 0:
             print(f"hashed {totals['scanned']} files...", file=sys.stderr)
+        refusal = _oversize_refusal(item.size)
+        if refusal is not None:
+            # Unshippable — skip it BEFORE hashing (don't stream a multi-GB file just to refuse it).
+            events.append({"level": "error", "code": "file_too_large",
+                           "message": f"{item.relpath}: {refusal}"[:500], "count": 1, "store": item.store})
+            if not dry_run:
+                totals["failed"] += 1
+                st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, "", "error",
+                               error=f"backfill multipart: {refusal}"[:400])
+            _cleanup_snapshot(item)
+            continue
         try:
             sha = hash_file_prefix(item.source_path, item.size)
         except OSError as e:

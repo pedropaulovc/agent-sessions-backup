@@ -1,6 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { markPendingAndEnqueue } from '../queue';
-import { objectSha256 } from './ops';
+import { hex, objectSha256 } from './ops';
 import { TERMINAL_PARSE_STATES, recordUploadedObject, restampIfStale } from './upload';
 
 // R2 multipart part rules (developers.cloudflare.com/r2/objects/multipart-objects): every part
@@ -32,10 +32,18 @@ function r2MtimeMetadata(mtime: string | null): Record<string, string> | undefin
  * own, same as every other convergence guard here. The nonce is generated at create time (the R2
  * uploadId doesn't exist until createMultipartUpload returns, so it can't be part of the key it
  * creates); create round-trips it to the collector inside the opaque upload token (see uploadToken).
- * The prune sweep still lists the mpu-staging/ prefix, so the nonce suffix doesn't affect it.
+ *
+ * FIXED-SHAPE: the key is NOT the (arbitrarily long) relpath verbatim — it's a 64-hex digest of
+ * store/relpath + nonce. A canonical raw/ key can sit near R2's 1024-byte object-key limit
+ * (developers.cloudflare.com/r2/platform/limits); reusing that relpath under the longer mpu-staging/
+ * prefix plus a UUID could cross the limit and make a long-but-valid path unbackupable exactly when
+ * it's large. The digest bounds the length regardless of relpath. machineId stays in the prefix so
+ * prune attribution is readable; the prune sweep still lists the mpu-staging/ prefix. part/complete/
+ * abort recompute the same key from (machineId, store, relpath) in the URL and the token's nonce.
  */
-function stagingKey(machineId: string, store: string, relpath: string, nonce: string): string {
-  return `mpu-staging/${machineId}/${store}/${relpath}.${nonce}`;
+async function stagingKey(machineId: string, store: string, relpath: string, nonce: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(`${store}/${relpath}\0${nonce}`));
+  return `mpu-staging/${machineId}/${hex(digest)}`;
 }
 
 /**
@@ -134,7 +142,7 @@ export async function createMultipart(
   const nonce = crypto.randomUUID();
   let mpu: R2MultipartUpload;
   try {
-    mpu = await env.RAW.createMultipartUpload(stagingKey(machineId, store, relpath, nonce));
+    mpu = await env.RAW.createMultipartUpload(await stagingKey(machineId, store, relpath, nonce));
   } catch (e) {
     return Response.json({ error: 'create_multipart_failed', detail: String(e) }, { status: 400 });
   }
@@ -189,7 +197,7 @@ export async function uploadPart(
 
   let uploaded: R2UploadedPart;
   try {
-    const stagKey = stagingKey(machineId, store, relpath, token.nonce);
+    const stagKey = await stagingKey(machineId, store, relpath, token.nonce);
     uploaded = await env.RAW.resumeMultipartUpload(stagKey, token.r2UploadId).uploadPart(partNumber, body);
   } catch (e) {
     // A bad/expired uploadId or an R2 error — the collector aborts and retries from create.
@@ -235,7 +243,7 @@ export async function completeMultipart(
   const r2Parts = parts.map((p) => ({ partNumber: p.part_number, etag: p.etag }));
 
   const canonicalKey = r2Key(machineId, store, relpath);
-  const stagKey = stagingKey(machineId, store, relpath, token.nonce);
+  const stagKey = await stagingKey(machineId, store, relpath, token.nonce);
   const existing = await env.DB.prepare('SELECT id FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3')
     .bind(machineId, store, relpath)
     .first<{ id: number }>();
@@ -305,7 +313,7 @@ export async function abortMultipart(
   // A malformed token can't identify a staging object; there's nothing to abort. Idempotent 'gone'.
   const token = parseUploadToken(params.get('uploadId') ?? '');
   if (!token) return Response.json({ status: 'gone' });
-  const stagKey = stagingKey(machineId, store, relpath, token.nonce);
+  const stagKey = await stagingKey(machineId, store, relpath, token.nonce);
   let aborted = true;
   try {
     await env.RAW.resumeMultipartUpload(stagKey, token.r2UploadId).abort();

@@ -406,6 +406,21 @@ describe('multipart review fixes', () => {
     expect(staging.objects).toHaveLength(0);
   });
 
+  it('handles a near-limit relpath: fixed-shape staging key keeps create + complete under R2 key limit', async () => {
+    // A canonical raw/ key that fits under R2's 1024-byte object-key limit, but whose relpath is long
+    // enough that the OLD verbatim staging key (mpu-staging/<m>/<store>/<relpath>.<uuid>) would cross
+    // it — so create would 400 exactly for a long-but-valid path once it goes multipart. The hashed
+    // fixed-shape staging key stays short regardless, so both create and complete succeed.
+    const relpath = 'deep/' + 'x'.repeat(980) + '.bin';
+    expect(`raw/longpath-box/claude/${relpath}`.length).toBeLessThan(1024);
+    const bytes = new Uint8Array(6 * MIB).fill(7);
+    const res = await multipartStore('longpath-box', 'claude', relpath, bytes, 5 * MIB);
+    expect(res.createStatus).toBe(201);
+    expect(res.complete!.status).toBe(201);
+    const canonical = await testEnv.RAW.get(`raw/longpath-box/claude/${relpath}`);
+    expect(await sha256Hex(new Uint8Array(await canonical!.arrayBuffer()))).toBe(await sha256Hex(bytes));
+  });
+
   it('rejects a create for a file larger than R2 single-put finalize limit (5 GiB)', async () => {
     const res = await SELF.fetch(`${fileUrl('big-box', 'claude', 'huge.bin')}?uploads`, {
       method: 'POST',

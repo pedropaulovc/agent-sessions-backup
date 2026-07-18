@@ -142,6 +142,14 @@ DEFAULT_MULTIPART_THRESHOLD_MB = 90.0
 DEFAULT_MULTIPART_PART_SIZE_MB = 64.0
 MIN_PART_SIZE_BYTES = 5 * 1024 * 1024  # R2 hard floor for non-final parts
 
+# The multipart threshold is ALSO the part-size ceiling (a large file grows its part size up to the
+# threshold to stay under 10000 parts). A threshold below the 5MiB part floor can't produce a legal
+# part, so it's a hard config error. And the threshold must stay below Cloudflare's ~100MB edge
+# body cap: any file AT/ABOVE the threshold goes multipart, so a threshold above the cap would route
+# cap..threshold files to a simple PUT that 413s at the edge. Clamp to this safe ceiling — below
+# 100MB with headroom for request headers — and above the 90MB default so a stock config is untouched.
+MAX_MULTIPART_THRESHOLD_BYTES = 95_000_000
+
 
 @dataclass
 class Config:
@@ -267,6 +275,10 @@ def load(path: Path | str | None = None) -> Config:
             f"No config at {path}. Run: agent-collector enroll --hub <URL> --dev"
         )
     data = tomllib.loads(path.read_text())
+    threshold_mb, part_size_mb = _normalize_multipart(
+        float(data.get("multipart_threshold_mb", DEFAULT_MULTIPART_THRESHOLD_MB)),
+        float(data.get("multipart_part_size_mb", DEFAULT_MULTIPART_PART_SIZE_MB)),
+    )
     return Config(
         machine_id=data["machine_id"],
         hub_url=data["hub_url"].rstrip("/"),
@@ -276,10 +288,47 @@ def load(path: Path | str | None = None) -> Config:
         exclude=list(data.get("exclude") or []),
         client_cert_path=data.get("client_cert_path"),
         client_key_path=data.get("client_key_path"),
-        multipart_threshold_mb=float(data.get("multipart_threshold_mb", DEFAULT_MULTIPART_THRESHOLD_MB)),
-        multipart_part_size_mb=float(data.get("multipart_part_size_mb", DEFAULT_MULTIPART_PART_SIZE_MB)),
+        multipart_threshold_mb=threshold_mb,
+        multipart_part_size_mb=part_size_mb,
         source=path,
     )
+
+
+def _normalize_multipart(threshold_mb: float, part_size_mb: float) -> tuple[float, float]:
+    """Validate + normalize the multipart tuning at config-load time (not in Config.__post_init__:
+    tests build Config directly with sub-MB values, and this normalization is a property of a
+    USER-authored config, not of every in-memory Config). Returns the effective (threshold, part_size)
+    in MB, or raises ValueError on an unusable threshold. Three cases:
+      - threshold below R2's 5MiB part floor -> REJECT (the threshold is also the part-size ceiling, so
+        no legal part could ever be sent; a clear error beats every large upload failing on the wire);
+      - threshold above the safe sub-100MB ceiling -> CLAMP down + warn (else cap..threshold files ride
+        the simple PUT and Cloudflare 413s them at the edge before the Worker sees them);
+      - part size below the 5MiB floor -> CLAMP up + warn (else the hub rejects every non-final part
+        with bad_or_small_part_size)."""
+    floor_mb = MIN_PART_SIZE_BYTES / (1024 * 1024)
+    cap_mb = MAX_MULTIPART_THRESHOLD_BYTES / (1024 * 1024)
+    if int(threshold_mb * 1024 * 1024) < MIN_PART_SIZE_BYTES:
+        raise ValueError(
+            f"multipart_threshold_mb={threshold_mb} is below R2's {floor_mb:.0f} MB (5 MiB) minimum "
+            f"part size, so no legal multipart part could be sent; set it to at least {floor_mb:.0f} MB "
+            f"(default {DEFAULT_MULTIPART_THRESHOLD_MB})"
+        )
+    if int(threshold_mb * 1024 * 1024) > MAX_MULTIPART_THRESHOLD_BYTES:
+        print(
+            f"warning: multipart_threshold_mb={threshold_mb} exceeds the safe {cap_mb:.1f} MB ceiling "
+            f"below Cloudflare's ~100MB edge cap; clamping to {cap_mb:.1f} MB so large files still "
+            "route to multipart instead of failing a simple PUT with 413",
+            file=sys.stderr,
+        )
+        threshold_mb = cap_mb
+    if int(part_size_mb * 1024 * 1024) < MIN_PART_SIZE_BYTES:
+        print(
+            f"warning: multipart_part_size_mb={part_size_mb} is below R2's {floor_mb:.0f} MB (5 MiB) "
+            f"minimum part size; clamping to {floor_mb:.0f} MB",
+            file=sys.stderr,
+        )
+        part_size_mb = floor_mb
+    return threshold_mb, part_size_mb
 
 
 def _load_if_exists(path: Path) -> Config | None:

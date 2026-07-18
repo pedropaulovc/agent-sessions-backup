@@ -244,6 +244,38 @@ def test_multipart_refuses_unshippable_file_without_sending(tmp_env, hub):
     assert hub.part_attempts == 0 and not hub.multipart  # nothing was opened or sent
 
 
+def test_oversize_file_refused_before_hashing_and_sticks(tmp_env, hub, monkeypatch):
+    """A file over R2's 5GiB single-put limit is refused WITHOUT hashing (no multi-GB re-read every
+    run just to fail), the error state is recorded, and a second run re-refuses on the cheap size
+    check alone — never hashing, never opening an upload. Size is stubbed; no real 5GiB fixture."""
+    root = tmp_env / "claude"
+    root.mkdir()
+    (root / "huge.bin").write_bytes(b"x" * 16)  # real tiny file; size is stubbed oversized below
+    cfg = _cfg(hub, root)
+
+    calls = {"hash": 0}
+    real_hash = run_mod.hash_file_prefix
+    monkeypatch.setattr(run_mod, "hash_file_prefix",
+                        lambda p, s: (calls.__setitem__("hash", calls["hash"] + 1), real_hash(p, s))[1])
+
+    item = types.SimpleNamespace(
+        store="claude", relpath="huge.bin", source_path=root / "huge.bin",
+        size=run_mod.MULTIPART_MAX_FILE_BYTES + 1, mtime_ns=1_000_000_000_000, is_snapshot=False,
+    )
+    transport = Transport(DevAuth("m1"))
+    with State(tmp_env / "state.db") as st:
+        r1 = run_mod._process_large_item(cfg, st, transport, item, st.get_file("claude", "huge.bin"))
+        assert r1.error is not None and not r1.uploaded
+        row = st.get_file("claude", "huge.bin")
+        assert row.status == "error" and "single-put" in (row.error or "")
+        # Second run: still refused, still no hash.
+        r2 = run_mod._process_large_item(cfg, st, transport, item, st.get_file("claude", "huge.bin"))
+        assert r2.error is not None
+
+    assert calls["hash"] == 0  # never hashed the oversized file, on either run
+    assert hub.part_attempts == 0 and not hub.multipart  # nothing opened or sent
+
+
 def test_multipart_unchanged_shortcircuit_skips_reupload(tmp_env, hub):
     """When the hub already holds the bytes, create returns 200 unchanged and no parts are sent."""
     root = tmp_env / "claude"
