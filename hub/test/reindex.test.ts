@@ -67,39 +67,34 @@ async function fileCount(machine: string): Promise<number> {
 afterEach(() => vi.restoreAllMocks());
 
 describe('admin reindex batches D1 writes + queue sends to fit the whole corpus in one invocation', () => {
-  it('re-enqueues every object across pages using DB.batch + sendBatch (never a per-object send)', async () => {
-    // 150 objects across two pages (100 + 50). The bug fired ~4 subrequests/object; the fix collapses
-    // each page's writes into DB.batch() calls and its sends into sendBatch() chunks of ≤100.
-    const pages = [
-      Array.from({ length: 100 }, () => sessionObject('reindexbox')),
-      Array.from({ length: 50 }, () => sessionObject('reindexbox')),
-    ];
+  it('re-enqueues a page via DB.batch + sendBatch (never a per-object send)', async () => {
+    // One page of 100 objects (a slice fits one invocation). The bug fired ~4 subrequests/object; the
+    // fix collapses the page's writes into DB.batch() calls and its sends into sendBatch() chunks of ≤100.
+    const pages = [Array.from({ length: 100 }, () => sessionObject('reindexbox'))];
     const listSpy = stubList(pages);
     const batchSpy = vi.spyOn(testEnv.DB, 'batch'); // calls through — real rows are written
     const sendBatchSpy = stubSendBatch();
     const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
 
     const res = await reindex(reindexRequest(), testEnv, admin);
-    expect(res.status).toBe(200);
-    expect(await res.json()).toMatchObject({ enqueued: 150, done: true });
+    expect(res.status).toBe(200); // only page, so done:true → 200
+    expect(await res.json()).toMatchObject({ enqueued: 100, done: true });
 
-    // Fresh run (no live cursor) starts at page 0, then follows the cursor to page 1. Two pages fit in
-    // one invocation (MAX_PAGES_PER_INVOCATION is 2), so it finishes done:true.
-    expect(listSpy.mock.calls.length).toBe(2);
+    // Fresh run (no live cursor) starts at page 0.
+    expect(listSpy.mock.calls.length).toBe(1);
     expect(listSpy.mock.calls[0]![0]?.cursor).toBeUndefined();
-    expect(listSpy.mock.calls[1]![0]?.cursor).toBe('1');
 
     // Positive controls — both revert paths of the fix trip an assertion here:
-    //  - revert sendBatch → per-object PARSE_QUEUE.send(): sendSpy fires 150× and the next line fails.
-    //  - revert the files DB.batch → per-row .first(): the largest batch shrinks from page 0's
+    //  - revert sendBatch → per-object PARSE_QUEUE.send(): sendSpy fires 100× and the next line fails.
+    //  - revert the files DB.batch → per-row .first(): the largest batch shrinks from the page's
     //    "1 machine + 100 files" (101) to just the 100-statement flips batch, tripping the >=101 below.
     expect(sendSpy).not.toHaveBeenCalled();
-    // O(pages), not O(objects): 2 pages × {files batch, flips batch} = 4, nowhere near 150.
-    expect(batchSpy.mock.calls.length).toBeLessThanOrEqual(4);
+    // O(1) batches per page ({files batch, flips batch}), not O(objects).
+    expect(batchSpy.mock.calls.length).toBeLessThanOrEqual(2);
     const biggestBatch = Math.max(...batchSpy.mock.calls.map((c) => (c[0] as unknown[]).length));
-    expect(biggestBatch).toBeGreaterThanOrEqual(101); // page 0's 100 files + their machine parent, one round trip
+    expect(biggestBatch).toBeGreaterThanOrEqual(101); // the page's 100 files + their machine parent, one round trip
 
-    // Every sendBatch chunk is within the Queues 100-message cap, and together they cover all 150.
+    // The sendBatch chunk is within the Queues 100-message cap and covers all 100.
     let sent = 0;
     for (const call of sendBatchSpy.mock.calls) {
       const chunk = call[0] as { body: { reason: string } }[];
@@ -108,9 +103,9 @@ describe('admin reindex batches D1 writes + queue sends to fit the whole corpus 
       expect(chunk[0]!.body.reason).toBe('reindex');
       sent += chunk.length;
     }
-    expect(sent).toBe(150);
+    expect(sent).toBe(100);
 
-    expect(await fileCount('reindexbox')).toBe(150);
+    expect(await fileCount('reindexbox')).toBe(100);
     expect(await readCursor()).toEqual({ prefix: 'raw/', cursor: null }); // completed run parks at null so the next call starts fresh
   });
 
@@ -236,6 +231,7 @@ describe('admin reindex batches D1 writes + queue sends to fit the whole corpus 
     stubSendBatch();
 
     const first = await reindex(reindexRequest(), testEnv, admin);
+    expect(first.status).toBe(202); // partial progress — NOT 200, so a status-only caller can't stop early
     const firstBody = (await first.json()) as { enqueued: number; done: boolean; cursor: string | null };
     expect(firstBody.done).toBe(false); // more pages remain — caller must loop
     expect(firstBody.enqueued).toBe(MAX_PAGES_PER_INVOCATION * 4);
@@ -246,10 +242,35 @@ describe('admin reindex batches D1 writes + queue sends to fit the whole corpus 
     // Second invocation resumes from the persisted cursor and finishes the tail.
     listSpy.mockClear();
     const second = await reindex(reindexRequest(), testEnv, admin);
+    expect(second.status).toBe(200); // done → 200
     const secondBody = (await second.json()) as { enqueued: number; done: boolean; cursor: string | null };
     expect(secondBody.done).toBe(true);
     expect(secondBody.cursor).toBeNull();
     expect(listSpy.mock.calls[0]![0]?.cursor).toBe(String(MAX_PAGES_PER_INVOCATION)); // resumed, not restarted
     expect(await fileCount('loopbox')).toBe(pageCount * 4); // all pages processed across the two calls
+  });
+
+  it('keeps one page under the D1 statement budget even when every object is on a distinct machine (round 4 finding 1)', async () => {
+    // Worst case for the per-invocation budget: a full page whose objects each carry a NEW machine id, so
+    // the batch runs a machine upsert AND a files upsert AND a flip per object (~3×PAGE_SIZE statements).
+    // Two such pages would breach the ~1000 D1-query cap, so exactly one page is taken per invocation.
+    const heavyPage = (tag: string) => Array.from({ length: 200 }, (_unused, i) => sessionObject(`${tag}-m${i}`));
+    // Three pages so page 1 is still truncated: a MAX_PAGES=2 regression stays done:false (202) and thus
+    // fails on the budget assertion below rather than short-circuiting on status.
+    const pages = [heavyPage('p0'), heavyPage('p1'), [sessionObject('tail')]];
+    stubList(pages);
+    const batchSpy = vi.spyOn(testEnv.DB, 'batch'); // calls through
+    stubSendBatch();
+
+    const res = await reindex(reindexRequest(), testEnv, admin);
+    expect(res.status).toBe(202); // one heavy page done, more remain
+    expect(await res.json()).toMatchObject({ enqueued: 200, done: false });
+
+    // The invocation's batched D1 statements (200 distinct machines + 200 files + 200 flips = 600) stay
+    // under a conservative 800 cap. Positive control: bumping MAX_PAGES_PER_INVOCATION back to 2 would
+    // process BOTH heavy pages (~1200 statements) and breach this.
+    const totalStatements = batchSpy.mock.calls.reduce((n, c) => n + (c[0] as unknown[]).length, 0);
+    expect(totalStatements).toBeLessThanOrEqual(800);
+    expect(totalStatements).toBeGreaterThanOrEqual(600); // proves the machine upserts ARE included, not skipped
   });
 });

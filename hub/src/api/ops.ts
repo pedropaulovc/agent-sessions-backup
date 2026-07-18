@@ -97,21 +97,22 @@ export async function usage(url: URL, env: Env): Promise<Response> {
   return Response.json({ group_by: groupBy, rows: rows.results });
 }
 
-// A Worker invocation gets ~1000 subrequests, and every D1 query counts — including each statement in
-// a batch. Reindexing an object costs 2 D1 statements (files upsert + parsing-flip), so the whole
-// 34.7K-object corpus can NOT fit in one invocation at any batch granularity. Instead we make the
-// resumable cursor the primary mechanism: each call processes a bounded slice, persists the cursor,
-// and returns {done:false} until the corpus is exhausted; the caller (the drill script) loops until
-// {done:true}. PAGE_SIZE × MAX_PAGES_PER_INVOCATION bounds the worst case to ~2×(200+200) + machines +
-// list + sendBatch ≈ 850 D1/queue subrequests per call, comfortably under 1000.
+// A Worker invocation gets ~1000 subrequests, and EVERY D1 query counts — including each statement in a
+// batch. One page's worst case is ~3 statements per object: a machine upsert (when every object is on a
+// distinct machine), the files upsert, and the parsing-flip — so a 200-object page is ~600 statements +
+// list + sendBatch + cursor persist ≈ 605, safely under 1000. Two such pages would breach it, so we take
+// exactly ONE page per invocation and make the resumable cursor the primary mechanism: each call
+// persists the cursor and returns {done:false} until the corpus is exhausted; the caller (the drill
+// script) loops until {done:true}. Bumping MAX_PAGES_PER_INVOCATION would reintroduce the budget breach.
 export const PAGE_SIZE = 200;
-export const MAX_PAGES_PER_INVOCATION = 2;
+export const MAX_PAGES_PER_INVOCATION = 1;
 
 /** POST /api/v1/admin/reindex — walk a BOUNDED slice of R2, upsert files rows, re-enqueue them, and
- * report progress. Response: `{ enqueued, done, cursor }` (200). When `done` is false the caller must
- * call again (the server resumes from the persisted cursor); when true the corpus (for this prefix) is
- * fully re-enqueued. The reindex_cursor is read on entry so a crash or a bounded stop both resume from
- * the last persisted page rather than restarting from zero. */
+ * report progress. Response is `{ enqueued, done, cursor }` with status **202 Accepted** while more
+ * slices remain (done:false) and **200 OK** only when the corpus (for this prefix) is fully
+ * re-enqueued (done:true). The 202 keeps a status-only caller from mistaking a partial slice for
+ * success. The caller re-invokes until it sees 200/done:true; the server resumes from the persisted
+ * cursor on entry, so a crash or a bounded stop both continue rather than restarting from zero. */
 export async function reindex(request: Request, env: Env, identity: Identity): Promise<Response> {
   if (identity.kind !== 'machine' || !identity.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
   const body = (await request.json().catch(() => ({}))) as { prefix?: string };
@@ -222,7 +223,8 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
   }
 
   console.log(JSON.stringify({ event: 'hub.reindex', enqueued, done }));
-  return Response.json({ enqueued, done, cursor: cursor ?? null });
+  // 202 (not 200) while slices remain, so a status-only caller can't mistake a partial run for success.
+  return Response.json({ enqueued, done, cursor: cursor ?? null }, { status: done ? 200 : 202 });
 }
 
 /** The persisted reindex cursor is a live R2 list token only when it belongs to the prefix being walked
