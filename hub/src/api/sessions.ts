@@ -126,33 +126,42 @@ export async function getSessionRaw(sessionId: string, request: Request, env: En
   });
 }
 
+// The only harnesses a pending/error `files.harness = 'unknown'` export-inbox row (see
+// computeIndexedThrough below) can EVER resolve to — must match detectLayout() in
+// hub/src/ingest/parsers/export-inbox.ts (parseExportArchive only ever returns
+// 'chatgpt-web', 'claude-web', or 'unknown'). Adding a new export-able harness there means
+// adding it here too, or that harness's freshness reads will wrongly ignore pending exports
+// that could resolve to it.
+const EXPORT_ARCHIVE_HARNESSES = new Set<string>(['chatgpt-web', 'claude-web']);
+
 /**
  * `indexed_through` scoped to the request's own machine/harness filter (not the whole
  * fleet), so a caller filtering to one machine or harness gets a freshness signal that
  * actually describes the data they asked for: machine filter -> that machine's own
  * last_seen_at; harness filter -> MIN over machines that have EVER produced a session of
  * that harness, OR that have an UNRESOLVED (`pending`/`error`) `files` row detected as that
- * harness (or as `'unknown'` — see below) even before it's parsed into a `sessions` row
- * (upload.ts/detect.ts stamp `files.harness` at upload time, ahead of the queue consumer) —
- * otherwise a machine with a pending/error file of the filtered harness would be invisible
- * to this query and make the signal look fresher than the data it's still missing. `parsed`
- * files are excluded because their sessions are already covered by the `sessions` arm above;
- * `superseded`/`skipped` files are excluded because they're terminal and can NEVER produce a
- * sessions row — an unfiltered files arm let a machine whose only harness-X file was a
- * lower-priority `superseded` duplicate drag the harness-X MIN stale forever, even though
- * nothing on that machine could ever appear in `/api/v1/sessions?harness=X`.
+ * harness (or, for chatgpt-web/claude-web only, as `'unknown'` — see below) even before it's
+ * parsed into a `sessions` row (upload.ts/detect.ts stamp `files.harness` at upload time,
+ * ahead of the queue consumer) — otherwise a machine with a pending/error file of the
+ * filtered harness would be invisible to this query and make the signal look fresher than
+ * the data it's still missing. `parsed` files are excluded because their sessions are
+ * already covered by the `sessions` arm above; `superseded`/`skipped` files are excluded
+ * because they're terminal and can NEVER produce a sessions row — an unfiltered files arm
+ * let a machine whose only harness-X file was a lower-priority `superseded` duplicate drag
+ * the harness-X MIN stale forever, even though nothing on that machine could ever appear in
+ * `/api/v1/sessions?harness=X`.
  *
  * `harness = 'unknown'`: `detect()` (hub/src/ingest/detect.ts) stamps a `.zip` upload to
- * export-inbox as `harness: 'unknown'` — its real per-conversation harness(es) (chatgpt-web,
- * claude-web, or a mix) aren't known until `parseExportArchive()` actually reads
- * `conversations.json`. A pending/error 'unknown' file could turn out to contain sessions of
- * ANY harness, so its machine's staleness must count against EVERY harness-scoped freshness
- * read until the parse resolves it — the alternative (excluding it) would let an entire
- * unparsed archive hide behind an optimistic freshness signal for the harness it actually
- * contains. This is intentionally conservative: it also drags freshness for harnesses the
- * archive turns out NOT to contain, but honest-under-uncertainty beats optimistic here, and
- * the state is transient — once parsed, the file's `harness` (or its constituent sessions)
- * resolves to a real value and this arm stops matching it.
+ * export-inbox as `harness: 'unknown'` — its real per-conversation harness isn't known until
+ * `parseExportArchive()` (hub/src/ingest/parsers/export-inbox.ts) actually reads
+ * `conversations.json`, but that parser only ever recognizes ChatGPT/Claude web exports
+ * (EXPORT_ARCHIVE_HARNESSES above) — it can never produce a codex or claude-code session. So
+ * a pending/error 'unknown' file only needs to count against chatgpt-web/claude-web
+ * freshness, not every harness: including it for codex/claude-code would make those reports
+ * look stale over data that structurally cannot exist. Within that web-harness scope this is
+ * still intentionally conservative (it also drags freshness for the OTHER web harness the
+ * archive turns out not to contain) — honest-under-uncertainty beats optimistic, and the
+ * state is transient until the parse resolves it.
  *
  * No filter -> fleet-wide MIN, same as before. `machine` wins if both are given — it's the
  * more specific, unambiguous filter.
@@ -169,7 +178,7 @@ async function computeIndexedThrough(env: Env, p: URLSearchParams): Promise<stri
              WHERE machine_id IN (
                SELECT machine_id FROM sessions WHERE harness = ?1
                UNION
-               SELECT machine_id FROM files WHERE (harness = ?1 OR harness = 'unknown') AND parse_state IN ('pending', 'error')
+               SELECT machine_id FROM files WHERE (harness = ?1${EXPORT_ARCHIVE_HARNESSES.has(harness) ? " OR harness = 'unknown'" : ''}) AND parse_state IN ('pending', 'error')
              )`,
           )
           .bind(harness)

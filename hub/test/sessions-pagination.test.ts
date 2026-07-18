@@ -487,11 +487,18 @@ describe('X-Indexed-Through and /api/v1/usage respect the request machine/harnes
     await testEnv.DB.prepare('UPDATE machines SET last_seen_at = ?1 WHERE machine_id = ?2').bind(WEBZIP_TS, WEBZIP_MACHINE).run();
 
     // Included for harness=claude-web even though this ZIP will turn out to be chatgpt-web
-    // content — a pending 'unknown' file could contain sessions of ANY harness, so it must
-    // count against every harness-scoped freshness read until parsed (conservative by design).
+    // content — a pending 'unknown' file could contain sessions of the OTHER web harness, so
+    // it must count against every WEB-harness-scoped freshness read until parsed.
     const before = await get('harness=claude-web');
     const bodyBefore = (await before.json()) as { indexed_through: string };
     expect(bodyBefore.indexed_through).toBe(WEBZIP_TS);
+
+    // NOT included for harness=codex (round-4 finding): parseExportArchive only ever
+    // resolves an 'unknown' export to chatgpt-web or claude-web, never codex, so a stuck web
+    // export must not make codex's freshness report stale over data that cannot exist there.
+    const beforeCodex = await get('harness=codex');
+    const bodyBeforeCodex = (await beforeCodex.json()) as { indexed_through: string };
+    expect(bodyBeforeCodex.indexed_through).not.toBe(WEBZIP_TS);
 
     await drainQueue();
     const parsedFileRow = await testEnv.DB.prepare('SELECT harness, parse_state FROM files WHERE machine_id = ?1')
