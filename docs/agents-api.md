@@ -71,10 +71,22 @@ One session, fully parsed: `{meta: <sessions row>, session: <NormalizedSession|n
 parse failure — those still return the row with `index_state='error'`).
 
 ### `GET /api/v1/sessions/{id}/raw`
-Canonical file bytes, passthrough from R2. `Range` is honored only for plain JSONL
-canonicals (byte-addressable); export-ZIP-backed and chatgpt-web/claude-web sessions always
-return the whole document (200), never a partial range, since their canonical object isn't
-byte-addressable per-session.
+The response shape depends on what the session's canonical file actually is
+(`hub/src/api/sessions.ts::getSessionRaw`):
+
+- **Plain JSONL canonical** (claude-code, codex): a true R2 passthrough of the raw file
+  bytes. `Range` is honored (206 partial content) since JSONL is byte-addressable.
+- **Export-archive-backed session** (from an operator-dropped export ZIP in
+  `export-inbox`): **not** a passthrough of anything — the canonical R2 object is the whole
+  ZIP (every conversation in that export plus attachments), and returning it under one
+  session's id would leak every other conversation. The hub extracts and returns **only that
+  one conversation's JSON** via `extractConversationById`. Always 200, `Range` ignored
+  (meaningless for an extracted fragment) — if you need the raw ZIP bytes themselves,
+  this endpoint doesn't serve them.
+- **chatgpt-web/claude-web session**: the canonical R2 object already IS that one
+  conversation's JSON document (one file per session, unlike the archive case), so this is a
+  passthrough — just of a much smaller object. Always 200, `Range` ignored (a JSON document
+  isn't meant to be range-read).
 
 ### `GET /api/v1/search`
 Params: `q` (FTS5 MATCH syntax — invalid syntax is retried as a quoted literal phrase, then

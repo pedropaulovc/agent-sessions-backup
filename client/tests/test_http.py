@@ -1,6 +1,8 @@
 import ssl
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -123,3 +125,83 @@ def test_read_timeout_raises_hub_error():
     finally:
         server.shutdown()
         server.server_close()
+
+
+@contextmanager
+def _running_server(handler_cls: type[BaseHTTPRequestHandler]) -> Iterator[str]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler_cls)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield f"http://127.0.0.1:{port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_json_body_stall_after_headers_raises_hub_error():
+    # HubClient.get()'s own try/except only covers urlopen() itself — the connect phase and
+    # response headers. A server that sends 200 + headers and then stalls before any body
+    # bytes must still raise HubError, not a raw TimeoutError, even though by the time the
+    # stall happens get() has already returned a HubResponse to the caller.
+    class HeadersThenStallHandler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # silence
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(0.5)
+            self.wfile.write(b'{"ok": true}')
+
+    with _running_server(HeadersThenStallHandler) as url:
+        client = HubClient(bearer_config(url), timeout=0.05)
+        resp = client.get("/api/v1/status")  # headers arrive fine; get() returns normally
+        with pytest.raises(HubError):
+            resp.json()
+
+
+def test_ndjson_body_stall_after_headers_raises_hub_error():
+    # Same failure mode as test_json_body_stall_after_headers_raises_hub_error, but for the
+    # streaming iterator path (iter_sessions_ndjson's underlying primitive).
+    class HeadersThenStallHandler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # silence
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("content-type", "application/x-ndjson")
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(0.5)
+            self.wfile.write(b'{"meta": {}}\n')
+
+    with _running_server(HeadersThenStallHandler) as url:
+        client = HubClient(bearer_config(url), timeout=0.05)
+        resp = client.get("/api/v1/sessions", {"format": "ndjson"})
+        with pytest.raises(HubError):
+            list(resp.iter_lines())
+
+
+def test_read_bytes_body_stall_after_headers_raises_hub_error():
+    # get_session_raw()'s primitive — same wrapping as json()/iter_lines(), via _read_body().
+    class HeadersThenStallHandler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # silence
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("content-type", "application/json")
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(0.5)
+            self.wfile.write(b"raw bytes")
+
+    with _running_server(HeadersThenStallHandler) as url:
+        client = HubClient(bearer_config(url), timeout=0.05)
+        resp = client.get("/api/v1/sessions/abc/raw")
+        with pytest.raises(HubError):
+            resp.read_bytes()

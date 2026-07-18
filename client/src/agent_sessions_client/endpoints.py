@@ -106,13 +106,14 @@ class SessionsApi:
         return SessionMeta.from_row(body["meta"]), body.get("session")
 
     def get_session_raw(self, session_id: str) -> bytes:
-        """GET /api/v1/sessions/{id}/raw — passthrough of the canonical R2 object's bytes
-        (whole file; Range support exists server-side but isn't exposed by this helper)."""
-        resp = self._client.get(f"/api/v1/sessions/{quote(session_id, safe='')}/raw")
-        try:
-            return resp._fp.read()  # noqa: SLF001 — no JSON body to parse, just raw bytes
-        finally:
-            resp.close()
+        """GET /api/v1/sessions/{id}/raw. For a plain JSONL canonical (claude-code, codex):
+        the raw file bytes, passthrough from R2 (Range support exists server-side but isn't
+        exposed by this helper). For an export-archive-backed session: NOT a passthrough of
+        the archive — the hub extracts and returns only that one conversation's JSON (see
+        docs/agents-api.md). For a chatgpt-web/claude-web session: the canonical R2 object
+        already IS that one conversation's JSON, so it is a passthrough, just of a smaller
+        object than the archive case."""
+        return self._client.get(f"/api/v1/sessions/{quote(session_id, safe='')}/raw").read_bytes()
 
     def search(
         self,

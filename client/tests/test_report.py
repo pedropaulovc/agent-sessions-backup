@@ -83,6 +83,60 @@ def test_report_flags_stale_machine():
     assert "may be an undercount" in report
 
 
+def test_report_flags_fresh_machine_with_unparsed_or_failed_files():
+    # A fresh heartbeat (indexed_through caught up to end of day) does NOT mean everything
+    # uploaded today is already in `sessions` — an upload lands as files.parse_state='pending'
+    # first and only becomes a session row once the queue consumer parses it. Without this
+    # caveat a report would present a machine as fully fresh while still undercounting it.
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="amet-wsl")], indexed_through="2026-07-18T23:59:59.999Z", truncated=False)
+    status = HubStatus(
+        machines=[
+            MachineStatus(
+                machine_id="amet-wsl",
+                os="wsl",
+                last_seen_at="2026-07-18T23:59:59.999Z",  # fully fresh
+                last_upload_at="2026-07-18T23:59:59.999Z",
+                files_pending=3,
+                files_error=1,
+                files_total=50,
+                indexed_through="2026-07-18T23:59:59.999Z",  # fully fresh
+            )
+        ],
+        sessions=SessionsSummary(total=1, ready=1, error=0),
+    )
+    report = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=UsageReport(group_by="model", rows=[]), status=status
+    )
+    assert "## Staleness caveats" in report  # renders even though the machine isn't stale
+    assert "3 files uploaded but not yet parsed" in report
+    assert "1 failed parse" in report
+    assert "amet-wsl" in report
+
+
+def test_report_silent_when_no_pending_or_error_files():
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="amet-wsl")], indexed_through="2026-07-18T23:59:59.999Z", truncated=False)
+    status = HubStatus(
+        machines=[
+            MachineStatus(
+                machine_id="amet-wsl",
+                os="wsl",
+                last_seen_at="2026-07-18T23:59:59.999Z",
+                last_upload_at="2026-07-18T23:59:59.999Z",
+                files_pending=0,
+                files_error=0,
+                files_total=50,
+                indexed_through="2026-07-18T23:59:59.999Z",
+            )
+        ],
+        sessions=SessionsSummary(total=1, ready=1, error=0),
+    )
+    report = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=UsageReport(group_by="model", rows=[]), status=status
+    )
+    assert "## Staleness caveats" not in report
+    assert "not yet parsed" not in report
+
+
 def test_report_flags_truncation():
     sessions = [meta(session_id=f"s{i}") for i in range(3)]
     sessions_page = SessionsPage(sessions=sessions, indexed_through=None, truncated=True)

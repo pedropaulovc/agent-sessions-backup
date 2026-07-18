@@ -40,19 +40,44 @@ class HubResponse:
         return self.headers.get(name.lower())
 
     def json(self) -> Any:
+        return json.loads(self._read_body())
+
+    def read_bytes(self) -> bytes:
+        """Read and return the full response body as raw bytes, unparsed — for a binary/
+        passthrough response like GET /sessions/{id}/raw. Callers must not reach into
+        `._fp` directly (it used to be done that way here; this method exists precisely so
+        nothing has to) — that would bypass the same read-timeout wrapping .json() gets."""
+        return self._read_body()
+
+    def _read_body(self) -> bytes:
+        # HubClient.get()'s own try/except only covers urlopen() itself — i.e. the connect
+        # phase and the response headers. A server that sends 200 + headers and then stalls
+        # before the body bytes arrive raises TimeoutError HERE, on this .read() call, well
+        # after get() has already returned a HubResponse to the caller. Without this wrapper
+        # that TimeoutError would propagate past every HubError-only except clause (including
+        # the CLI's), producing a traceback instead of the documented `error: ...` + exit code.
         try:
-            return json.loads(self._fp.read())
+            return self._fp.read()
+        except TimeoutError as e:
+            raise HubError(None, f"timed out reading response body: {e}") from e
+        except OSError as e:
+            raise HubError(None, str(e)) from e
         finally:
             self._fp.close()
 
     def iter_lines(self) -> Iterator[str]:
         """Yield decoded, non-empty lines from a streaming (e.g. NDJSON) body. Closes the
-        underlying connection once the generator is exhausted or garbage-collected."""
+        underlying connection once the generator is exhausted or garbage-collected. A stall
+        between lines raises HubError, same as .json()/.read_bytes() — see _read_body()."""
         try:
             for raw_line in self._fp:
                 line = raw_line.decode("utf-8").rstrip("\n")
                 if line:
                     yield line
+        except TimeoutError as e:
+            raise HubError(None, f"timed out reading response body: {e}") from e
+        except OSError as e:
+            raise HubError(None, str(e)) from e
         finally:
             self._fp.close()
 

@@ -54,6 +54,16 @@ def _caveats_section(date: str, page: SessionsPage, status: HubStatus, *, machin
     for m in relevant_machines:
         if m.indexed_through is None or m.indexed_through < end_of_day:
             caveats.append(f"- `{m.machine_id}` {STALE_MACHINE_NOTE} (indexed_through={m.indexed_through or 'never'}).")
+        # A machine can have a perfectly fresh heartbeat (indexed_through caught up) and still
+        # have files sitting in files.parse_state='pending'/'error' — an upload only becomes a
+        # `sessions` row once the queue consumer parses it (hub/src/ingest/consumer.ts), so
+        # "heartbeat is fresh" does NOT imply "everything uploaded today is already counted
+        # below." Surface this independently of the staleness check above.
+        if m.files_pending > 0 or m.files_error > 0:
+            caveats.append(
+                f"- `{m.machine_id}`: {m.files_pending} files uploaded but not yet parsed / "
+                f"{m.files_error} failed parse — today's counts may be incomplete."
+            )
     if page.indexed_through and page.indexed_through < end_of_day:
         scope_note = " — this is fleet-wide across all machines, not scoped to your --machine/--harness filter" if filtered else ""
         caveats.append(
