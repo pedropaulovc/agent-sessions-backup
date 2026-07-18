@@ -74,6 +74,12 @@ CRT="$OUT_DIR/${MACHINE_ID}.client.pem"
 # collector is still presenting. ($KEY is reused when it already exists, so the working key/cert pair
 # survives an aborted re-enroll intact.)
 CRT_TMP="$CRT.new"
+# Sidecar written next to the temp PEM once a cert is minted (below): records the minted cert's id + fp so
+# that ANY path leaving $CRT_TMP behind (the ambiguous-D1 and no-wrangler paths) also leaves a revoke
+# handle. Without it, an operator who deletes an abandoned temp PEM loses the only handle to the minted CA
+# cert, which then lingers active until expiry — the orphan-leak class the retired_certs machinery exists
+# to prevent, reintroduced through the manual path.
+CRT_TMP_ID="$CRT_TMP.id"
 
 # FAIL EARLY on an unresolved prior enrollment. When a previous run hit the ambiguous D1-failure path
 # (wrangler exited non-zero AND the follow-up verify read also failed), it deliberately LEFT $CRT_TMP
@@ -82,9 +88,12 @@ CRT_TMP="$CRT.new"
 # fingerprint, revokes THIS run's freshly-minted cert (correct), but has already clobbered the registered
 # PEM — leaving the machine registered to a cert no longer on disk. So refuse to run and make the operator
 # resolve the ambiguity by comparing the registered fingerprint to this temp cert's; the two exits below
-# ($CRT_TMP either promoted or deleted) are the only ways past this guard.
+# ($CRT_TMP either promoted, or its cert revoked + both files deleted) are the only ways past this guard.
 if [ -f "$CRT_TMP" ]; then
   TMP_FP="$(openssl x509 -in "$CRT_TMP" -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}' || true)"
+  # The prior run persisted its minted cert id in $CRT_TMP.id; read it so 3b can print an exact revoke.
+  STRANDED_ID=""
+  [ -f "$CRT_TMP_ID" ] && STRANDED_ID="$(sed -n 's/^cert_id=//p' "$CRT_TMP_ID" 2>/dev/null | head -n1)"
   echo "ABORT: an unresolved enrollment cert from a previous run is still at $CRT_TMP" >&2
   echo "  A prior run left it after an ambiguous D1 write (couldn't confirm whether the row registered it)." >&2
   echo "  Resolve it BEFORE re-enrolling — overwriting it could strand this machine on a revoked cert:" >&2
@@ -93,9 +102,19 @@ if [ -f "$CRT_TMP" ]; then
   echo "         --command \"SELECT cert_fp_sha256 FROM machines WHERE machine_id='$MACHINE_ID';\"" >&2
   echo "  2) Compare it to THIS temp cert's fingerprint: ${TMP_FP:-<unparseable — treat as 'differs', go to 3b>}" >&2
   echo "  3a) MATCH -> enrollment actually succeeded; promote the temp cert and you're done (do NOT re-run):" >&2
-  echo "        mv $CRT_TMP $CRT" >&2
-  echo "  3b) DIFFERS or no row -> this temp cert is unused; delete it, then re-run this script:" >&2
-  echo "        rm -f $CRT_TMP" >&2
+  echo "        mv $CRT_TMP $CRT ; rm -f $CRT_TMP_ID" >&2
+  echo "  3b) DIFFERS or no row -> this temp cert is UNUSED but was already minted at the CA; REVOKE it (so it" >&2
+  echo "      can't linger CA-valid), then delete both files:" >&2
+  if [ -n "$STRANDED_ID" ]; then
+    echo "        curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$STRANDED_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\"" >&2
+    echo "        rm -f $CRT_TMP $CRT_TMP_ID" >&2
+  else
+    echo "        # no saved cert id ($CRT_TMP_ID missing — a strand from before this sidecar existed). List the" >&2
+    echo "        # zone's client certs and find the one whose SHA-256 fingerprint equals the fp printed in step 2:" >&2
+    echo "        curl -sS \"$API/zones/$ZONE_ID/client_certificates?per_page=1000\" -H \"Authorization: Bearer \$CF_API_TOKEN\"" >&2
+    echo "        # then revoke that id and remove the temp file:" >&2
+    echo "        curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/<id>\" -H \"Authorization: Bearer \$CF_API_TOKEN\" ; rm -f $CRT_TMP $CRT_TMP_ID" >&2
+  fi
   exit 1
 fi
 
@@ -212,25 +231,42 @@ print_install_steps() {
 # (POST /api/v1/admin/machines — hub/src/api/ops.ts adminMachines), which does the guarded swap + retirement
 # atomically in db.batch. M4's steady-state path is hub-mediated self-registration (POST /api/v1/certs/renew).
 #
-# Write is INSERT ... ON CONFLICT (machine_id) DO NOTHING, then a read-back: if the row now carries OUR
-# fingerprint the enrollment took (a fresh insert, or an idempotent same-fp re-run); if the id already
-# exists under a DIFFERENT fingerprint we abort and point at the admin re-enroll flow. The just-minted cert
-# was never installed, so we print its id and the one-liner to revoke it (safe direction — nothing refs it).
+# Write is INSERT ... ON CONFLICT (machine_id) DO UPDATE ... WHERE cert_fp_sha256 IS NULL (a guarded upsert
+# that fills a first cert onto a certless row but never displaces an existing one — see the INSERT_SQL note
+# below), then a read-back: if the row now carries OUR fingerprint the enrollment took (a fresh insert, a
+# certless-row fill, or an idempotent same-fp re-run); if the id already exists under a DIFFERENT fingerprint
+# the guard left it untouched and we abort + point at the admin re-enroll flow. The just-minted cert was
+# never installed, so we print its id and the one-liner to revoke it (safe direction — nothing refs it).
 # cf.tlsClientAuth.certFingerprintSHA256 == lowercase hex SHA-256 of the DER cert, no colons. If Cloudflare
 # returned success but a certificate openssl can't parse, this pipeline fails AFTER the mint — revoke the
 # unused cert before aborting (the shell twin of the hub's post-sign certFingerprint guard), rather than
 # leaking a live-but-unregistered cert under set -e. revoke_unused_cert is defined above and uses CERT_ID.
 if ! FP="$(openssl x509 -in "$CRT_TMP" -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}')" || [ -z "$FP" ]; then
   echo "    could not fingerprint the signed certificate — Cloudflare returned a cert openssl can't parse." >&2
-  rm -f "$CRT_TMP"
+  rm -f "$CRT_TMP" "$CRT_TMP_ID"
   revoke_unused_cert
   exit 1
 fi
 echo "==> cert fingerprint (SHA-256): $FP"
 
+# Persist the minted cert id + fp beside the temp PEM NOW, before any path that might leave $CRT_TMP behind.
+# Any later abort that leaves the temp cert also leaves this revoke handle; every cleanup path below removes
+# both files together, and a successful enrollment removes the sidecar after promoting $CRT.
+printf 'cert_id=%s\nfp=%s\n' "$CERT_ID" "$FP" > "$CRT_TMP_ID"
+
+# Fill a FIRST cert onto a row that has none, but NEVER displace an existing cert — both atomic in one
+# statement. A fresh id inserts; an existing id whose cert_fp_sha256 IS NULL (a reindex parent-insert row,
+# or an admin metadata-only upsert made before mTLS bootstrap) gets THIS cert filled in; an existing id that
+# already HAS a cert fails the WHERE and is left untouched — the read-back then sees a different fp and takes
+# the revoke-and-abort path unchanged. The IS NULL guard makes cert DISPLACEMENT impossible here by
+# construction, so fresh-only semantics hold without a DO NOTHING no-op blocking legitimate first-time
+# enrollment of certless-but-existing rows. (Rotations still go through the hub admin endpoint.)
 INSERT_SQL="INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, cert_id, key_protection, is_admin)
        VALUES ('$MACHINE_ID', '$OS_TAG', '$HOSTNAME_VAL', '$FP', '$CERT_ID', 'software', $IS_ADMIN)
-       ON CONFLICT (machine_id) DO NOTHING;"
+       ON CONFLICT (machine_id) DO UPDATE SET
+         cert_fp_sha256 = excluded.cert_fp_sha256, cert_id = excluded.cert_id,
+         os = excluded.os, hostname = excluded.hostname
+       WHERE machines.cert_fp_sha256 IS NULL;"
 
 # The D1 write needs a wrangler login with D1 access — NOT the just-in-time CF_API_TOKEN, which is zone-SSL
 # only (and wrangler reads CLOUDFLARE_API_TOKEN, not CF_API_TOKEN, anyway). On an authenticated admin box we
@@ -253,12 +289,13 @@ if npx --yes wrangler whoami >/dev/null 2>&1; then
       if [ "$VERIFY_FP" = "$FP" ]; then
         echo "    Verified: the row DID register with THIS cert — enrollment actually succeeded. NOT revoking." >&2
         mv "$CRT_TMP" "$CRT"
+        rm -f "$CRT_TMP_ID"
         echo "    enrolled: $MACHINE_ID -> $FP"
         exit 0
       fi
       echo "    Verified: the machines row does NOT carry this cert (found: ${VERIFY_FP:-<no row>}) — it was never installed." >&2
       echo "    Left any pre-existing $CRT untouched." >&2
-      rm -f "$CRT_TMP"
+      rm -f "$CRT_TMP" "$CRT_TMP_ID"
       revoke_unused_cert
       exit 1
     fi
@@ -268,7 +305,8 @@ if npx --yes wrangler whoami >/dev/null 2>&1; then
     echo "      1) Check the row: CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID npx wrangler d1 execute $DB_NAME --remote --command \"SELECT cert_fp_sha256 FROM machines WHERE machine_id='$MACHINE_ID';\"" >&2
     echo "      2) If it shows $FP, enrollment succeeded — move the cert into place:  mv $CRT_TMP $CRT" >&2
     echo "      3) If it shows a different fp or no row, this cert is unused — revoke it and discard the temp:" >&2
-    echo "         curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$CERT_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\" ; rm -f $CRT_TMP" >&2
+    echo "         curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$CERT_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\" ; rm -f $CRT_TMP $CRT_TMP_ID" >&2
+    echo "    (The cert id is also saved in $CRT_TMP_ID for the fail-early guard if you re-run before resolving.)" >&2
     exit 1
   fi
   # A parse failure here means wrangler returned 0 but unexpected output — the insert likely DID apply, so
@@ -289,11 +327,12 @@ if npx --yes wrangler whoami >/dev/null 2>&1; then
     echo "    script AFTER the admin swap, or let the collector renew (POST /api/v1/certs/renew)." >&2
     echo "    Your existing working PEM at $CRT is left untouched." >&2
     echo >&2
-    rm -f "$CRT_TMP"
+    rm -f "$CRT_TMP" "$CRT_TMP_ID"
     revoke_unused_cert
     exit 1
   fi
   mv "$CRT_TMP" "$CRT"
+  rm -f "$CRT_TMP_ID"
   echo "    enrolled: $MACHINE_ID -> $FP"
   print_install_steps
 else
@@ -309,14 +348,14 @@ else
   echo "  CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID npx wrangler d1 execute $DB_NAME --remote \\" >&2
   echo "    --command \"$INSERT_SQL SELECT cert_fp_sha256 AS fp FROM machines WHERE machine_id='$MACHINE_ID';\"" >&2
   echo >&2
-  echo "    The signed cert is saved (unverified) at $CRT_TMP; any pre-existing $CRT is left untouched until" >&2
-  echo "    you confirm below. The INSERT is ON CONFLICT DO NOTHING (it never overwrites an existing cert), so" >&2
-  echo "    the read-back fp is the source of truth:" >&2
+  echo "    The signed cert is saved (unverified) at $CRT_TMP (id in $CRT_TMP_ID); any pre-existing $CRT is left" >&2
+  echo "    untouched until you confirm below. The INSERT's guard fills a certless row but never overwrites an" >&2
+  echo "    existing cert, so the read-back fp is the source of truth:" >&2
   echo "      - if the returned fp EQUALS  $FP  -> enrollment took; move the cert into place and install:" >&2
-  echo "          mv $CRT_TMP $CRT" >&2
+  echo "          mv $CRT_TMP $CRT ; rm -f $CRT_TMP_ID" >&2
   echo "      - if it DIFFERS or is empty       -> '$MACHINE_ID' is already enrolled with another cert. THIS" >&2
   echo "        run's cert was NOT installed and must NOT be. Discard the temp + revoke, then rotate via admin:" >&2
-  echo "          rm -f $CRT_TMP ; curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$CERT_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\"" >&2
+  echo "          rm -f $CRT_TMP $CRT_TMP_ID ; curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$CERT_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\"" >&2
   echo "          POST /api/v1/admin/machines { machine_id, cert_fp_sha256, cert_id } with a FRESHLY minted cert." >&2
   echo >&2
   echo "    ONLY after the read-back shows $FP and you've moved the cert into place, install the collector:" >&2
