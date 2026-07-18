@@ -1,8 +1,8 @@
 import { SELF, env as testEnvRaw } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import worker from '../src/index';
-import { EXPORT_QUERY_BUDGET } from '../src/ingest/consumer';
-import { claudeExportZip, type ClaudeConvOpts, type ClaudeWebMessage } from './web-fixtures';
+import { EXPORT_OVERSIZED_CEILING, EXPORT_QUERY_BUDGET } from '../src/ingest/consumer';
+import { CLAUDE_WEB_ROOT, claudeExportZip, claudeWebConversation, type ClaudeConvOpts, type ClaudeWebMessage } from './web-fixtures';
 
 const testEnv = testEnvRaw as unknown as Env;
 
@@ -111,6 +111,56 @@ async function uploadConvs(tag: string, convs: ClaudeConvOpts[]): Promise<{ file
 
 async function uploadArchive(tag: string, convs: number): Promise<{ fileId: number; hash: string; r2Key: string }> {
   return uploadConvs(tag, Array.from({ length: convs }, (_u, i) => conv(tag, i)));
+}
+
+// A NON-export single claude-web session (goes through parseOne's normal write path, not the export
+// slicer) — used to prove the invocation budget bounds normal writes too, not just export slices.
+async function uploadClaudeWeb(tag: string, msgs: number): Promise<{ fileId: number; hash: string; r2Key: string }> {
+  const uuid = `bnd-web-${tag}`;
+  const messages: ClaudeWebMessage[] = [];
+  let parent = CLAUDE_WEB_ROOT;
+  for (let m = 0; m < msgs; m++) {
+    const u = `${tag}-w${m}`;
+    messages.push({ uuid: u, parent, sender: m % 2 === 0 ? 'human' : 'assistant', text: `web ${m}` });
+    parent = u;
+  }
+  const json = claudeWebConversation({ uuid, name: `Web ${tag}`, messages });
+  const bytes = new TextEncoder().encode(json);
+  const hash = await sha256Hex(bytes);
+  const machine = `bnd-web-${tag}`;
+  const relpath = `${uuid}.json`;
+  const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/files/${machine}/claude-web/${encodeURIComponent(relpath)}`, {
+    method: 'PUT',
+    headers: {
+      'x-dev-machine': machine,
+      'x-content-hash': `sha256:${hash}`,
+      'x-file-mtime': '2026-07-01T12:00:00Z',
+      'content-length': String(bytes.length),
+    },
+    body: json,
+  });
+  expect(res.status).toBe(201);
+  const row = await testEnv.DB.prepare('SELECT id, r2_key, content_hash FROM files WHERE machine_id = ?1 AND relpath = ?2')
+    .bind(machine, relpath)
+    .first<{ id: number; r2_key: string; content_hash: string }>();
+  return { fileId: row!.id, hash: row!.content_hash, r2Key: row!.r2_key };
+}
+
+// Build a batch message with ack/retry tracking into `flags[fileId]`.
+function batchMsg(f: { fileId: number; hash: string; r2Key: string }, flags: Record<number, { acked: boolean; retried: boolean }>) {
+  flags[f.fileId] = { acked: false, retried: false };
+  return {
+    id: String(f.fileId),
+    timestamp: new Date(),
+    attempts: 1,
+    body: { file_id: f.fileId, r2_key: f.r2Key, reason: 'upload' as const, content_hash: f.hash },
+    ack() {
+      flags[f.fileId]!.acked = true;
+    },
+    retry() {
+      flags[f.fileId]!.retried = true;
+    },
+  };
 }
 
 async function sessionState(id: string): Promise<string | null> {
@@ -456,5 +506,150 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(await fileState(replaced.fileId)).toBe('parsed'); // parsed ONLY after cleanup fully drained
     expect(await ownedSessions(replaced.fileId)).toBe(5); // exactly the kept conversations; zero stale rows
     expect(await stateCount(replaced.fileId, 'ready')).toBe(5);
+  });
+
+  it('defers an oversized conversation to its own invocation instead of writing it mid-slice (round 4 finding 2)', async () => {
+    // A conversation estimated above EXPORT_OVERSIZED_CEILING can't be sliced (writeSession is atomic per
+    // conversation), so when it appears after other work in a slice it must be cut to its OWN invocation —
+    // keeping its writeSession clear of the per-invocation cap. (Measured max real export conversation is
+    // 304 blocks, well under the ceiling, so this guard is defensive; here we force it with a big fixture.)
+    const convs = [conv('ovz', 0), conv('ovz', 1), heavyConv('ovz', 2, EXPORT_OVERSIZED_CEILING + 50), conv('ovz', 3)];
+    const { fileId, hash, r2Key } = await uploadConvs('ovz', convs);
+
+    sent.length = 0;
+    await deliver({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: hash });
+
+    // POSITIVE CONTROL: without the preflight cut, the oversized conversation writes in slice 1 alongside
+    // the two small ones (continuation offset 3). The guard cuts BEFORE it, so slice 1 holds only the two
+    // small conversations and the oversized one runs alone next invocation.
+    expect(await fileState(fileId)).toBe('pending');
+    const cont = sent.find((m) => m.file_id === fileId && typeof m.offset === 'number');
+    expect(cont).toBeDefined();
+    expect(cont!.offset!).toBe(2); // cut right before the oversized conversation at index 2
+    expect(await ownedSessions(fileId)).toBe(2); // only the two small conversations written this slice
+  });
+
+  it('holds a SINGLE invocation-wide budget: an export slice defers a normal transcript in the same batch (round 4 finding 4)', async () => {
+    const exp = await uploadArchive('inv1', 3);
+    const web = await uploadClaudeWeb('inv1', 4); // a NON-export single session (normal write path)
+
+    const flags: Record<number, { acked: boolean; retried: boolean }> = {};
+    sent.length = 0;
+    await worker.queue(
+      { queue: 'parse', messages: [batchMsg(exp, flags), batchMsg(web, flags)], ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>,
+      testEnv,
+    );
+
+    // POSITIVE CONTROL: the round-2/3 guard reserved only EXPORT messages, so a normal transcript after an
+    // export slice still ran (its writeSession could push the invocation past the cap). The invocation-wide
+    // budget reserves the export slice's cost and defers the normal transcript — ACK + re-enqueue, zero writes.
+    expect(await fileState(exp.fileId)).toBe('parsed');
+    expect(await ownedSessions(exp.fileId)).toBe(3);
+    expect(flags[web.fileId]).toEqual({ acked: true, retried: false }); // deferred by ack, not retry
+    expect(sent.some((m) => m.file_id === web.fileId && m.offset === undefined)).toBe(true); // re-enqueued fresh
+    expect(await fileState(web.fileId)).toBe('pending');
+    expect(await ownedSessions(web.fileId)).toBe(0);
+  });
+
+  it('processes a whole batch of cheap non-export transcripts without deferring (round 4 finding 4)', async () => {
+    const a = await uploadClaudeWeb('inv2a', 2);
+    const b = await uploadClaudeWeb('inv2b', 2);
+    const c = await uploadClaudeWeb('inv2c', 2);
+
+    const flags: Record<number, { acked: boolean; retried: boolean }> = {};
+    await worker.queue(
+      { queue: 'parse', messages: [batchMsg(a, flags), batchMsg(b, flags), batchMsg(c, flags)], ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>,
+      testEnv,
+    );
+
+    // Their combined cost stays well under the budget, so none defer — the budget bounds heavy batches
+    // without penalizing ordinary ones.
+    for (const f of [a, b, c]) {
+      expect(flags[f.fileId]).toEqual({ acked: true, retried: false });
+      expect(await fileState(f.fileId)).toBe('parsed');
+    }
+  });
+
+  // Destructive cleanup fan-out (kicks sibling export-inbox files to 'pending') — kept near the end.
+  it('a cleanup-continuation send failure leaves the file pending, not error, and retries the cleanup page (round 4 finding 1)', async () => {
+    const first = await uploadConvs('csf', Array.from({ length: 300 }, (_u, i) => conv('csf', i)));
+    await deliverChain({ file_id: first.fileId, r2_key: first.r2Key, reason: 'upload', content_hash: first.hash });
+    expect(await ownedSessions(first.fileId)).toBe(300);
+
+    // Replace with 3 conversations → ~297 stale to clean across multiple budgeted chunks.
+    const replaced = await uploadConvs('csf', Array.from({ length: 3 }, (_u, i) => conv('csf', i)));
+    const flags: Record<number, { acked: boolean; retried: boolean }> = {};
+    const msg = batchMsg(replaced, flags);
+
+    // Make the cleanup continuation's send throw. The archive is FULLY written (its 'ready' sessions are
+    // valid), so the file must NOT go 'error' with unreconciled stale rows — it's forced back to 'pending'
+    // and retried instead.
+    const realSend = testEnv.PARSE_QUEUE.send;
+    testEnv.PARSE_QUEUE.send = (async (m: ParseMessage) => {
+      if (m.cleanup_cursor !== undefined) throw new Error('queue send outage'); // only the cleanup continuation
+      return (realSend as (b: ParseMessage) => Promise<unknown>)(m);
+    }) as typeof testEnv.PARSE_QUEUE.send;
+    try {
+      await worker.queue({ queue: 'parse', messages: [msg], ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>, testEnv);
+    } finally {
+      testEnv.PARSE_QUEUE.send = realSend;
+    }
+
+    // POSITIVE CONTROL: without the sentinel, the generic catch marks the archive 'error' (it can't
+    // reconcile stale sessions of a session_id-NULL row). The sentinel keeps it 'pending' and retries.
+    expect(flags[replaced.fileId]).toEqual({ acked: false, retried: true });
+    expect(await fileState(replaced.fileId)).toBe('pending'); // NOT 'error'
+    expect(await ownedSessions(replaced.fileId)).toBeGreaterThan(3); // stale not fully cleaned yet
+
+    // With the queue restored, redelivery drains cleanup to completion — parsed, zero stale.
+    await deliverChain({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
+    expect(await fileState(replaced.fileId)).toBe('parsed');
+    expect(await ownedSessions(replaced.fileId)).toBe(3);
+  });
+
+  it('cleanup deletes are atomic hash-guarded: a hash flip between the recheck and the delete batch no-ops them (round 4 finding 3)', async () => {
+    const first = await uploadConvs('atom', Array.from({ length: 5 }, (_u, i) => conv('atom', i)));
+    await deliverChain({ file_id: first.fileId, r2_key: first.r2Key, reason: 'upload', content_hash: first.hash });
+    expect(await ownedSessions(first.fileId)).toBe(5);
+
+    // Replace with 1 conversation → 4 stale to delete.
+    const replaced = await uploadConvs('atom', [conv('atom', 0)]);
+
+    // Let the pre-write and post-write and per-page rechecks all read the CURRENT (matching) hash, then flip
+    // the stored hash right after the per-page recheck (the 3rd `SELECT content_hash` read) — i.e. a
+    // changed-hash upload landing AFTER the recheck but BEFORE the delete batch. The batch's embedded
+    // `EXISTS (content_hash = expected)` guard must make every delete no-op in that same transaction.
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    let hashReads = 0;
+    testEnv.DB.prepare = ((sql: string) => {
+      const stmt = realPrepare(sql);
+      if (sql !== 'SELECT content_hash FROM files WHERE id = ?1') return stmt;
+      const realBind = stmt.bind.bind(stmt);
+      stmt.bind = (...a: unknown[]) => {
+        const bound = realBind(...a);
+        const realFirst = bound.first.bind(bound);
+        (bound as unknown as Record<string, unknown>).first = async (...x: unknown[]) => {
+          hashReads++;
+          const res = await (realFirst as (...y: unknown[]) => Promise<unknown>)(...x);
+          if (hashReads === 3) {
+            await realPrepare('UPDATE files SET content_hash = ?2 WHERE id = ?1').bind(replaced.fileId, 'sha256:flipped-mid-cleanup').run();
+          }
+          return res;
+        };
+        return bound;
+      };
+      return stmt;
+    }) as typeof testEnv.DB.prepare;
+    try {
+      await deliver({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
+    } finally {
+      testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
+    }
+
+    // POSITIVE CONTROL: without the per-statement `EXISTS (content_hash = expected)` guard, the deletes run
+    // against the (now stale) recheck and remove the 4 dropped conversations. The atomic guard no-ops them,
+    // so all 5 sessions survive and the file is not parsed (markParsed's own hash guard also fails).
+    expect(await ownedSessions(replaced.fileId)).toBe(5); // nothing deleted
+    expect(await fileState(replaced.fileId)).not.toBe('parsed');
   });
 });
