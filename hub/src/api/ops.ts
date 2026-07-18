@@ -97,28 +97,29 @@ export async function usage(url: URL, env: Env): Promise<Response> {
   return Response.json({ group_by: groupBy, rows: rows.results });
 }
 
-/** POST /api/v1/admin/reindex — walk R2, upsert files rows, re-enqueue everything.
- *
- * Per-object subrequests are the constraint here: a Worker invocation gets ~1000 subrequests, and the
- * 34.7K-object corpus used to spend ~4 per object (machines upsert + files upsert + parsing-flip +
- * queue send), so the do/while blew the limit and 1101'd on the first page. Everything below is
- * structured so one page costs a FIXED handful of subrequests regardless of page size:
- *   - all the D1 writes for a page collapse into two env.DB.batch() calls (each batch is a single
- *     round trip to D1 — one subrequest — not one per statement);
- *   - the re-enqueues go through PARSE_QUEUE.sendBatch() in chunks bounded by both the 100-message
- *     count cap and a serialized-size budget (Queues rejects a >256KB batch).
- * At R2's max page size of 1000 that is ~14 subrequests/page × ~35 pages ≈ 490 for the whole corpus,
- * so it now completes in ONE invocation. The reindex_cursor is read on entry (not just written) so a
- * run that does outgrow one invocation — or one that crashes — resumes from its last persisted page
- * instead of restarting from zero and failing identically. */
+// A Worker invocation gets ~1000 subrequests, and every D1 query counts — including each statement in
+// a batch. Reindexing an object costs 2 D1 statements (files upsert + parsing-flip), so the whole
+// 34.7K-object corpus can NOT fit in one invocation at any batch granularity. Instead we make the
+// resumable cursor the primary mechanism: each call processes a bounded slice, persists the cursor,
+// and returns {done:false} until the corpus is exhausted; the caller (the drill script) loops until
+// {done:true}. PAGE_SIZE × MAX_PAGES_PER_INVOCATION bounds the worst case to ~2×(200+200) + machines +
+// list + sendBatch ≈ 850 D1/queue subrequests per call, comfortably under 1000.
+export const PAGE_SIZE = 200;
+export const MAX_PAGES_PER_INVOCATION = 2;
+
+/** POST /api/v1/admin/reindex — walk a BOUNDED slice of R2, upsert files rows, re-enqueue them, and
+ * report progress. Response: `{ enqueued, done, cursor }` (200). When `done` is false the caller must
+ * call again (the server resumes from the persisted cursor); when true the corpus (for this prefix) is
+ * fully re-enqueued. The reindex_cursor is read on entry so a crash or a bounded stop both resume from
+ * the last persisted page rather than restarting from zero. */
 export async function reindex(request: Request, env: Env, identity: Identity): Promise<Response> {
   if (identity.kind !== 'machine' || !identity.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
   const body = (await request.json().catch(() => ({}))) as { prefix?: string };
   const prefix = body.prefix ?? 'raw/';
 
-  // Resume: a crashed/paused run leaves reindex_cursor at the last R2 page it finished, tagged with
-  // the prefix it was walking. Re-entering with a live cursor for the SAME prefix picks up there; a
-  // fresh run, a completed run (cursor null), or a run for a DIFFERENT prefix starts from the
+  // Resume: a crashed/paused/bounded run leaves reindex_cursor at the last R2 page it finished, tagged
+  // with the prefix it was walking. Re-entering with a live cursor for the SAME prefix picks up there;
+  // a fresh run, a completed run (cursor null), or a run for a DIFFERENT prefix starts from the
   // beginning. The prefix tag matters because the cursor is R2's own opaque token, scoped to the
   // prefix that produced it — replaying a full-corpus cursor against a targeted `raw/machineX/`
   // reindex would skip the start of the requested prefix or fail outright.
@@ -126,8 +127,9 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
   let cursor = resumeCursor(saved?.value, prefix);
 
   let enqueued = 0;
-  do {
-    const page: R2Objects = await env.RAW.list({ prefix, cursor, limit: 1000, include: ['customMetadata'] });
+  let done = false;
+  for (let pagesThisCall = 0; pagesThisCall < MAX_PAGES_PER_INVOCATION; pagesThisCall++) {
+    const page: R2Objects = await env.RAW.list({ prefix, cursor, limit: PAGE_SIZE, include: ['customMetadata'] });
 
     type Item = { key: string; machineId: string; store: string; relpath: string; det: ReturnType<typeof detect>; contentHash: string; mtime: string | null; size: number };
     const items: Item[] = [];
@@ -213,10 +215,14 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
     await env.DB.prepare("INSERT INTO meta (key, value) VALUES ('reindex_cursor', ?1) ON CONFLICT (key) DO UPDATE SET value = ?1")
       .bind(JSON.stringify({ prefix, cursor: cursor ?? null }))
       .run();
-  } while (cursor);
+    if (!cursor) {
+      done = true;
+      break;
+    }
+  }
 
-  console.log(JSON.stringify({ event: 'hub.reindex', enqueued }));
-  return Response.json({ enqueued, done: true });
+  console.log(JSON.stringify({ event: 'hub.reindex', enqueued, done }));
+  return Response.json({ enqueued, done, cursor: cursor ?? null });
 }
 
 /** The persisted reindex cursor is a live R2 list token only when it belongs to the prefix being walked
@@ -233,16 +239,19 @@ export function resumeCursor(saved: string | undefined, prefix: string): string 
   return undefined;
 }
 
+const QUEUE_SIZE_ENCODER = new TextEncoder();
+
 /** Split queue messages into sendBatch chunks bounded by BOTH the 100-message count cap and a
  * serialized-size budget (Cloudflare Queues rejects a sendBatch whose total payload exceeds 256KB).
- * SIZE_CAP is conservative and each message's size is over-estimated (envelope overhead added) so the
- * real serialized array stays comfortably under the hard limit even with long R2 keys. */
+ * Size is measured in UTF-8 BYTES (not .length UTF-16 code units) so a multibyte relpath can't slip
+ * under the budget yet blow the byte cap; sizeCap is conservative and each message adds envelope
+ * overhead so the real serialized array stays comfortably under the hard limit. */
 export function queueChunks<T>(messages: { body: T }[], sizeCap = 200_000): { body: T }[][] {
   const chunks: { body: T }[][] = [];
   let chunk: { body: T }[] = [];
   let bytes = 0;
   for (const m of messages) {
-    const size = JSON.stringify(m.body).length + 32; // +32 for per-message array/envelope overhead
+    const size = QUEUE_SIZE_ENCODER.encode(JSON.stringify(m.body)).length + 32; // +32 for per-message array/envelope overhead
     if (chunk.length > 0 && (chunk.length >= 100 || bytes + size > sizeCap)) {
       chunks.push(chunk);
       chunk = [];

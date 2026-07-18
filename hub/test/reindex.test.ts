@@ -1,10 +1,16 @@
 import { env } from 'cloudflare:test';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { reindex } from '../src/api/ops';
+import { MAX_PAGES_PER_INVOCATION, reindex } from '../src/api/ops';
 import type { Identity } from '../src/auth/identity';
 
 const testEnv = env as unknown as Env;
 const admin: Identity = { kind: 'machine', machineId: 'reindexbox', isAdmin: true };
+
+/** Spy on sendBatch that records calls but never enqueues — a full 100-message chunk equals the vitest
+ * queue's maxBatchSize and would let the real local consumer auto-flush and race these assertions. */
+function stubSendBatch() {
+  return vi.spyOn(testEnv.PARSE_QUEUE, 'sendBatch').mockResolvedValue(undefined as never);
+}
 
 function reindexRequest(prefix?: string): Request {
   return new Request('https://api.sessions.vza.net/api/v1/admin/reindex', {
@@ -70,14 +76,15 @@ describe('admin reindex batches D1 writes + queue sends to fit the whole corpus 
     ];
     const listSpy = stubList(pages);
     const batchSpy = vi.spyOn(testEnv.DB, 'batch'); // calls through — real rows are written
-    const sendBatchSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'sendBatch');
+    const sendBatchSpy = stubSendBatch();
     const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
 
     const res = await reindex(reindexRequest(), testEnv, admin);
     expect(res.status).toBe(200);
     expect(await res.json()).toMatchObject({ enqueued: 150, done: true });
 
-    // Fresh run (no live cursor) starts at page 0, then follows the cursor to page 1.
+    // Fresh run (no live cursor) starts at page 0, then follows the cursor to page 1. Two pages fit in
+    // one invocation (MAX_PAGES_PER_INVOCATION is 2), so it finishes done:true.
     expect(listSpy.mock.calls.length).toBe(2);
     expect(listSpy.mock.calls[0]![0]?.cursor).toBeUndefined();
     expect(listSpy.mock.calls[1]![0]?.cursor).toBe('1');
@@ -173,7 +180,7 @@ describe('admin reindex batches D1 writes + queue sends to fit the whole corpus 
     const longSuffix = 'x'.repeat(4000);
     const pages = [Array.from({ length: 100 }, () => fakeObject(`raw/longbox/misc/${crypto.randomUUID()}-${longSuffix}.bin`))];
     stubList(pages);
-    const sendBatchSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'sendBatch');
+    const sendBatchSpy = stubSendBatch();
 
     const res = await reindex(reindexRequest(), testEnv, admin);
     expect(res.status).toBe(200);
@@ -191,5 +198,58 @@ describe('admin reindex batches D1 writes + queue sends to fit the whole corpus 
     }
     expect(sent).toBe(100);
     expect(await fileCount('longbox')).toBe(100);
+  });
+
+  it('measures the chunk budget in UTF-8 bytes, not UTF-16 code units, for multibyte keys (round 3 finding 2)', async () => {
+    // '中' is one UTF-16 code unit but three UTF-8 bytes. With a ~3K-char suffix each key is ~3K by
+    // .length but ~9KB serialized — the old .length budget packs ~64/chunk (~580KB of bytes, over the
+    // 256KB cap); the byte-accurate budget must pack far fewer so every chunk stays under the cap.
+    const mbSuffix = '中'.repeat(3000);
+    const pages = [Array.from({ length: 100 }, () => fakeObject(`raw/mbbox/misc/${crypto.randomUUID()}-${mbSuffix}.bin`))];
+    stubList(pages);
+    const sendBatchSpy = stubSendBatch();
+
+    const res = await reindex(reindexRequest(), testEnv, admin);
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({ enqueued: 100, done: true });
+
+    // Positive control: measuring .length instead of encoded bytes lets a chunk's real UTF-8 payload
+    // exceed 256KB — this byte-accurate assertion fails under that revert.
+    const encoder = new TextEncoder();
+    let sent = 0;
+    for (const call of sendBatchSpy.mock.calls) {
+      const chunk = call[0] as { body: unknown }[];
+      expect(encoder.encode(JSON.stringify(chunk)).length).toBeLessThan(256_000);
+      sent += chunk.length;
+    }
+    expect(sent).toBe(100);
+    expect(await fileCount('mbbox')).toBe(100);
+  });
+
+  it('processes a bounded number of pages per invocation and reports {done:false} for the caller to loop (round 3 finding 1)', async () => {
+    // The whole corpus can't fit one invocation (each D1 statement counts against the ~1000/call cap),
+    // so a call processes at most MAX_PAGES_PER_INVOCATION pages, persists the cursor, and returns
+    // done:false; the caller re-invokes until done:true. Here: MAX_PAGES+1 pages of 4 objects each.
+    const pageCount = MAX_PAGES_PER_INVOCATION + 1;
+    const pages = Array.from({ length: pageCount }, () => Array.from({ length: 4 }, () => sessionObject('loopbox')));
+    const listSpy = stubList(pages);
+    stubSendBatch();
+
+    const first = await reindex(reindexRequest(), testEnv, admin);
+    const firstBody = (await first.json()) as { enqueued: number; done: boolean; cursor: string | null };
+    expect(firstBody.done).toBe(false); // more pages remain — caller must loop
+    expect(firstBody.enqueued).toBe(MAX_PAGES_PER_INVOCATION * 4);
+    expect(firstBody.cursor).toBe(String(MAX_PAGES_PER_INVOCATION)); // the next page's token, persisted
+    expect(listSpy.mock.calls.length).toBe(MAX_PAGES_PER_INVOCATION); // stopped at the page bound, didn't drain
+    expect(await readCursor()).toEqual({ prefix: 'raw/', cursor: String(MAX_PAGES_PER_INVOCATION) });
+
+    // Second invocation resumes from the persisted cursor and finishes the tail.
+    listSpy.mockClear();
+    const second = await reindex(reindexRequest(), testEnv, admin);
+    const secondBody = (await second.json()) as { enqueued: number; done: boolean; cursor: string | null };
+    expect(secondBody.done).toBe(true);
+    expect(secondBody.cursor).toBeNull();
+    expect(listSpy.mock.calls[0]![0]?.cursor).toBe(String(MAX_PAGES_PER_INVOCATION)); // resumed, not restarted
+    expect(await fileCount('loopbox')).toBe(pageCount * 4); // all pages processed across the two calls
   });
 });
