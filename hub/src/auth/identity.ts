@@ -45,8 +45,16 @@ export async function machineIdentity(request: Request, env: Env): Promise<Ident
   // (fail closed on any truthy-looking value rather than admit a revoked cert).
   const revoked = tls?.certRevoked === '1' || tls?.certRevoked === 'true';
   if (tls?.certVerified === 'SUCCESS' && !revoked && tls.certFingerprintSHA256) {
+    // During a cert-rotation grace window (see migrations/0004_cert_rotation.sql) a machine
+    // has TWO valid fingerprints: the new current one and the previous one being retired.
+    // Match either — the current cert_fp_sha256, OR the previous fingerprint while its
+    // cert_revoke_at is still in the future — so an in-flight collector presenting the old
+    // cert keeps authenticating until the +7d prune revokes it. This is the single place
+    // every machine-authenticated route (uploads, heartbeat, renew itself) resolves identity.
     const row = await env.DB.prepare(
-      'SELECT machine_id, is_admin FROM machines WHERE cert_fp_sha256 = ?1',
+      `SELECT machine_id, is_admin FROM machines
+       WHERE cert_fp_sha256 = ?1
+          OR (prev_cert_fp_sha256 = ?1 AND cert_revoke_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
     )
       .bind(tls.certFingerprintSHA256)
       .first<{ machine_id: string; is_admin: number }>();

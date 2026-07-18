@@ -31,3 +31,43 @@ export async function runPrune(env: Env, nowMs: number = Date.now()): Promise<vo
   } while (cursor);
   console.log(JSON.stringify({ event: 'hub.prune.staging', scanned, deleted }));
 }
+
+import { revokeClientCert } from '../api/certs';
+
+/** Daily prune (cron `30 4`). For each machine whose cert-rotation grace window has elapsed,
+ * revoke the previous cert at the managed CA, then clear the rotation columns.
+ *
+ * The clear happens ONLY after a successful CA revoke — a transient Cloudflare failure leaves
+ * the row intact so the next run retries. This is CA-side cleanup, not a security boundary: the
+ * identity guard already stops honoring the previous fingerprint the instant cert_revoke_at
+ * passes (see auth/identity.ts), so a stuck revoke never re-admits the old cert.
+ *
+ * A row with a NULL prev_cert_id — a pre-M4 cert enrolled by enroll-cert.sh, whose CA id the
+ * hub never recorded — has nothing to revoke, so we just clear the columns. */
+export async function runDailyPrune(env: Env): Promise<void> {
+  const due = await env.DB.prepare(
+    `SELECT machine_id, prev_cert_id FROM machines
+      WHERE prev_cert_fp_sha256 IS NOT NULL
+        AND cert_revoke_at IS NOT NULL
+        AND cert_revoke_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+  ).all<{ machine_id: string; prev_cert_id: string | null }>();
+
+  for (const row of due.results) {
+    if (row.prev_cert_id) {
+      let revoked = false;
+      try {
+        revoked = await revokeClientCert(env, row.prev_cert_id);
+      } catch (e) {
+        console.log(JSON.stringify({ event: 'hub.prune.revoke_error', machine: row.machine_id, cert_id: row.prev_cert_id, error: String(e) }));
+      }
+      if (!revoked) {
+        console.log(JSON.stringify({ event: 'hub.prune.revoke_failed', machine: row.machine_id, cert_id: row.prev_cert_id }));
+        continue; // keep the row; retry next run
+      }
+    }
+    await env.DB.prepare(
+      `UPDATE machines SET prev_cert_fp_sha256 = NULL, prev_cert_id = NULL, cert_revoke_at = NULL WHERE machine_id = ?1`,
+    ).bind(row.machine_id).run();
+    console.log(JSON.stringify({ event: 'hub.prune.revoked', machine: row.machine_id, cert_id: row.prev_cert_id ?? null }));
+  }
+}

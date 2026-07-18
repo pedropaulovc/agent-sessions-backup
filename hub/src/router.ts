@@ -1,7 +1,9 @@
 import { machineIdentity } from './auth/identity';
 import { checkFiles, putFile } from './api/upload';
 import { abortMultipart, completeMultipart, createMultipart, uploadPart } from './api/multipart';
-import { heartbeat, listMachines, reindex, status, usage } from './api/ops';
+import { adminMachines, heartbeat, listMachines, reindex, status, usage } from './api/ops';
+import { bootstrap } from './api/bootstrap';
+import { renewCert } from './api/certs';
 import { search } from './api/search';
 import { getSession, getSessionRaw, listSessions } from './api/sessions';
 import { viewerRoute } from './viewer/router';
@@ -57,9 +59,14 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
     if (method === 'PUT') return putFile(request, env, identity, machineId, store, relpath);
   }
   if (path === '/api/v1/heartbeat' && method === 'POST') return heartbeat(request, env, identity);
+  // Cert renewal authenticates on the still-valid old cert (current OR prev-in-window), so it
+  // gates itself — kept out of the read-API block below like heartbeat/upload.
+  if (path === '/api/v1/certs/renew' && method === 'POST') return renewCert(request, env, identity);
 
   // Read APIs: any enrolled machine (or dev identity) may query.
   if (identity.kind !== 'machine') return Response.json({ error: 'unauthorized' }, { status: 401 });
+
+  if (path === '/api/v1/bootstrap' && method === 'GET') return bootstrap(env, identity);
 
   if (path === '/api/v1/search' && method === 'GET') return search(url, env);
   if (path === '/api/v1/sessions' && method === 'GET') return listSessions(url, env);
@@ -76,6 +83,7 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
   if (path === '/api/v1/status' && method === 'GET') return status(env);
   if (path === '/api/v1/usage' && method === 'GET') return usage(url, env);
   if (path === '/api/v1/admin/reindex' && method === 'POST') return reindex(request, env, identity);
+  if (path === '/api/v1/admin/machines' && method === 'POST') return adminMachines(request, env, identity);
 
   return Response.json({ error: 'not_found' }, { status: 404 });
 }

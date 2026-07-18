@@ -24,7 +24,10 @@
   "vars": {
     "ENVIRONMENT": "production",
     "API_HOST": "api.sessions.vza.net",
-    "VIEWER_HOST": "sessions.vza.net"
+    "VIEWER_HOST": "sessions.vza.net",
+    // vza.net zone id (public — also in infra/cf/enroll-cert.sh). Used by POST
+    // /api/v1/certs/renew together with the CF_CLIENT_CERT_TOKEN secret.
+    "CF_ZONE_ID": "6a56cdda4766c1d7b5ad0fbe8331048f"
   },
   "d1_databases": [
     {
@@ -89,7 +92,8 @@
       "vars": {
         "ENVIRONMENT": "preview",
         "API_HOST": "api.sessions.vza.net",
-        "VIEWER_HOST": "sessions.vza.net"
+        "VIEWER_HOST": "sessions.vza.net",
+        "CF_ZONE_ID": "6a56cdda4766c1d7b5ad0fbe8331048f"
       },
       "d1_databases": [
         {
@@ -117,6 +121,6 @@
       "observability": { "enabled": true, "head_sampling_rate": 1 }
     }
   }
-  // secrets: SETUP_TOKEN (passkey bootstrap), CF_API_TOKEN (cert renewal);
+  // secrets: SETUP_TOKEN (passkey bootstrap), CF_CLIENT_CERT_TOKEN (POST /api/v1/certs/renew);
   // preview env: DEV_AUTH (bearer gate) via `wrangler secret put DEV_AUTH --env preview`
 }

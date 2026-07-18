@@ -202,10 +202,51 @@ key) and may stay in `~/.config/agent-collector` for reference or re-bundling.
 - Real-TPM machines (Windows host, amet) replace the software `openssl` keygen with the
   TPM flows (S2/S3); the CSR → managed-CA → fingerprint → `machines` row steps are
   identical, only `key_protection` becomes `tpm`.
-- Cert renewal (`POST /api/v1/certs/renew`) is M4: the hub holds a `CF_API_TOKEN`
-  wrangler secret so a still-valid cert can request its own successor. That secret is
-  intentionally **not** set in M3 (it would require the same zone token; setting it is a
-  one-liner `wrangler secret put CF_API_TOKEN` when M4 lands).
+- Cert renewal (`POST /api/v1/certs/renew`) is implemented — see "Cert renewal endpoint" below.
 - Per-zone client-certificate limit and ECDSA acceptance were the S4 unknowns: ECDSA
   P-256 CSRs are accepted by the managed CA (the `enroll-cert.sh` default); the fleet is
   5 machines, far under any per-zone cap.
+
+## M4 fleet-management endpoints
+
+Three mTLS-authenticated endpoints back centrally-managed fleet ops (`hub/src/api/bootstrap.ts`,
+`certs.ts`, `ops.ts`):
+
+- **`GET /api/v1/bootstrap`** (any enrolled machine) — returns the centrally-managed collector
+  config (scan cadence, upload caps, per-store toggles), versioned by `schema_version` so an older
+  collector ignores keys it doesn't understand. Defaults live in code; override any subset by writing
+  a JSON object to the D1 `meta` row keyed `collector_config`. The collector merges this over local config.
+- **`POST /api/v1/certs/renew`** (authenticated by the still-valid current OR in-grace previous cert)
+  — body `{ "csr": "<PEM CSR>" }`. The hub has the managed CA sign it, swaps the new fingerprint in as
+  current, and keeps the previous fingerprint valid for 7 days (`machines.prev_cert_fp_sha256` +
+  `cert_revoke_at`; `machineIdentity` matches current OR prev-in-window). The daily prune cron (`30 4`)
+  revokes the previous cert at the CA once the window elapses. A second renew inside the window replaces
+  the previous cert and resets the clock — at most one generation is ever in grace. This is what removes
+  the per-box `wrangler d1 execute` from Step 3 for already-enrolled machines.
+- **`POST /api/v1/admin/machines`** (admin-flagged cert only, mirrors `admin/reindex`) — upsert a machine
+  row (register fingerprint, set `priority`/`is_admin`) and get the roster back. No delete path by design
+  (files/sessions FK-reference the row; decommission by revoking the cert).
+
+### USER ACTION — provision the renewal token (one-time)
+
+`POST /api/v1/certs/renew` needs a Cloudflare API token with **SSL and Certificates · Edit** on the
+`vza.net` zone (the wrangler OAuth login can't reach `/client_certificates` — error 10000, verified in
+M3). Mint one (dashboard → My Profile → API Tokens; the same SSL/Certificates permission the enrollment
+token uses), then set it as a hub secret:
+
+```
+cd hub && npx wrangler secret put CF_CLIENT_CERT_TOKEN
+```
+
+Until it's set the endpoint returns `503 cert_renewal_unavailable` (collectors keep their current cert
+and retry — no lockout). The zone id is a non-secret var (`CF_ZONE_ID` in `hub/wrangler.jsonc`).
+
+### Deploy note — apply the D1 migration
+
+`hub/migrations/0004_cert_rotation.sql` adds the rotation columns (`cert_id`, `prev_cert_fp_sha256`,
+`prev_cert_id`, `cert_revoke_at`). Apply it to each remote D1 at deploy time:
+
+```
+cd hub && npx wrangler d1 migrations apply sessions-index --remote          # production
+cd hub && npx wrangler d1 migrations apply sessions-index-preview --remote  # preview
+```

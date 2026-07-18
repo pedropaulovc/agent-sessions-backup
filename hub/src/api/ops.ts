@@ -36,6 +36,61 @@ export async function listMachines(env: Env): Promise<Response> {
   return Response.json({ machines: rows.results });
 }
 
+/** POST /api/v1/admin/machines — admin-flagged cert only (mirrors reindex's gate). Upserts one
+ * machine row (register a fingerprint, set priority/is_admin/…) and returns the full roster.
+ * There is deliberately NO delete path — decommissioning revokes the cert, it doesn't drop the row
+ * (which files/sessions FK-reference). */
+export async function adminMachines(request: Request, env: Env, identity: Identity): Promise<Response> {
+  if (identity.kind !== 'machine' || !identity.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+
+  const body = (await request.json().catch(() => ({}))) as {
+    machine_id?: string;
+    os?: string;
+    hostname?: string;
+    cert_fp_sha256?: string;
+    key_protection?: string;
+    is_admin?: boolean;
+    priority?: number;
+  };
+
+  if (body.machine_id) {
+    // Read-merge-write so a partial upsert preserves unspecified columns instead of resetting the
+    // NOT NULL ones (os/key_protection/is_admin/priority) to their table defaults.
+    const existing = await env.DB.prepare(
+      'SELECT os, hostname, cert_fp_sha256, key_protection, is_admin, priority FROM machines WHERE machine_id = ?1',
+    )
+      .bind(body.machine_id)
+      .first<{ os: string; hostname: string | null; cert_fp_sha256: string | null; key_protection: string; is_admin: number; priority: number }>();
+    const os = body.os ?? existing?.os ?? 'unknown';
+    const hostname = body.hostname ?? existing?.hostname ?? null;
+    const certFp = body.cert_fp_sha256 ?? existing?.cert_fp_sha256 ?? null;
+    const keyProtection = body.key_protection ?? existing?.key_protection ?? 'software';
+    const isAdmin = body.is_admin !== undefined ? (body.is_admin ? 1 : 0) : existing?.is_admin ?? 0;
+    const priority = body.priority ?? existing?.priority ?? 100;
+    try {
+      await env.DB.prepare(
+        `INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, key_protection, is_admin, priority)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (machine_id) DO UPDATE SET
+           os = ?2, hostname = ?3, cert_fp_sha256 = ?4, key_protection = ?5, is_admin = ?6, priority = ?7`,
+      )
+        .bind(body.machine_id, os, hostname, certFp, keyProtection, isAdmin, priority)
+        .run();
+    } catch (e) {
+      // cert_fp_sha256 is UNIQUE — reusing another machine's fingerprint conflicts. Surface a 409
+      // rather than a bare 500 so the admin caller sees it's a duplicate, not a hub fault.
+      return Response.json({ error: 'machine_upsert_conflict', detail: String(e) }, { status: 409 });
+    }
+    console.log(JSON.stringify({ event: 'hub.admin.machine_upsert', machine: body.machine_id, is_admin: isAdmin }));
+  }
+
+  const rows = await env.DB.prepare(
+    `SELECT machine_id, os, hostname, key_protection, is_admin, priority, collector_version, last_seen_at, last_upload_at, created_at
+     FROM machines ORDER BY machine_id`,
+  ).all();
+  return Response.json({ machines: rows.results });
+}
+
 /** GET /api/v1/status — index-completeness introspection for agents. */
 export async function status(env: Env): Promise<Response> {
   const machines = await env.DB.prepare(

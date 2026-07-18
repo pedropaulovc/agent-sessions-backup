@@ -7,7 +7,12 @@ interface Env {
   API_HOST: string;
   VIEWER_HOST: string;
   SETUP_TOKEN?: string;
-  CF_API_TOKEN?: string;
+  // Cloudflare zone id (public) + a zone-scoped token with SSL and Certificates:Edit,
+  // used only by POST /api/v1/certs/renew to mint a successor client cert at the managed
+  // CA. The token is a wrangler secret (`wrangler secret put CF_CLIENT_CERT_TOKEN`); unset
+  // until the user provisions it, in which case cert renewal reports 503. See infra/cf/mtls.md.
+  CF_ZONE_ID?: string;
+  CF_CLIENT_CERT_TOKEN?: string;
   DEV_AUTH?: string;
 }
 
