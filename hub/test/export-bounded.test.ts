@@ -877,7 +877,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
 
     // Make the sibling-recovery SELECT throw (it fires only after cleanup reconciled ≥1 stale session).
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
-    const SIBLING_SQL = `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state != 'error'`;
+    const SIBLING_SQL = `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state = 'parsed'`;
     testEnv.DB.prepare = ((sql: string) => {
       if (sql === SIBLING_SQL) {
         return { bind: () => ({ all: async () => { throw new Error('D1 outage on sibling recovery SELECT'); } }) } as unknown as D1PreparedStatement;
@@ -944,6 +944,137 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(await fileState(replaced.fileId)).toBe('parsed');
     expect(await ownedSessions(replaced.fileId)).toBe(2);
     expect(await fileState(sib.fileId)).toBe('pending'); // sibling kicked for reparse, never stranded terminal
+  });
+
+  it('a multi-page cleanup kicks each sibling exactly once, not once per continuation (round 7 finding 1)', async () => {
+    budgets({ slice: 800, invocation: 800 });
+    // A sibling export in the same 'export-inbox' store that fileA's cleanup fan-out will kick.
+    const sib = await uploadConvs('r7f1-sib', [conv('r7f1sib', 0), conv('r7f1sib', 1)]);
+    await deliverChain({ file_id: sib.fileId, r2_key: sib.r2Key, reason: 'upload', content_hash: sib.hash });
+    expect(await fileState(sib.fileId)).toBe('parsed');
+
+    // fileA: big, then replaced small so its reparse cleanup deletes ~10 stale sessions over MULTIPLE pages.
+    const fileA = await uploadConvs('r7f1', Array.from({ length: 12 }, (_u, i) => conv('r7f1', i)));
+    await deliverChain({ file_id: fileA.fileId, r2_key: fileA.r2Key, reason: 'upload', content_hash: fileA.hash });
+    const replaced = await uploadConvs('r7f1', Array.from({ length: 2 }, (_u, i) => conv('r7f1', i)));
+
+    // Count the recover fan-out sends aimed at THIS sibling specifically (hermetic against the other
+    // export-inbox siblings the full-suite DB also carries — those don't touch sib.fileId).
+    const sibRecoverSends = (): number => sent.filter((m) => m.file_id === sib.fileId && m.reason === 'recover').length;
+
+    // Drive the WRITE phase to completion and stop at the first cleanup continuation: no delete or kick has
+    // run yet, so the sibling is still 'parsed' and un-kicked (kickSiblings fires only in the cleanup loop).
+    budgets({ slice: 8, invocation: 8 });
+    const { stoppedCont } = await deliverChain(
+      { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash },
+      { stopAtCleanup: true },
+    );
+    expect(stoppedCont).toBeDefined();
+    expect(await fileState(sib.fileId)).toBe('parsed'); // not kicked during the write phase
+
+    // Cleanup page 1: the first stale delete fires the fan-out ONCE, flipping the sibling 'parsed' → 'pending'.
+    sent.length = 0;
+    await deliver(stoppedCont!);
+    expect(sibRecoverSends()).toBe(1); // POSITIVE CONTROL: page 1 kicks the sibling
+    expect(await fileState(sib.fileId)).toBe('pending');
+    const contB = sent.find((m) => m.file_id === replaced.fileId && typeof m.offset === 'number');
+    expect(contB).toBeDefined(); // cleanup didn't drain in one page — there IS a second continuation
+
+    // Cleanup page 2: kickSiblings runs again (the per-invocation `kicked` flag reset), but the query now
+    // selects only parse_state='parsed' siblings, so the already-flipped 'pending' sibling is excluded and
+    // issues ZERO further flip/send subrequests. Under the old `parse_state != 'error'` query it would be
+    // re-kicked on every continuation — O(pages × siblings) duplicate recover work that could re-hit the cap.
+    sent.length = 0;
+    await deliver(contB!);
+    expect(sibRecoverSends()).toBe(0); // finding 1 fix: no re-kick on the second page
+  });
+
+  it('a revertSlice failure during rollback still raises ExportRetry, never a terminal error (round 7 finding 2)', async () => {
+    budgets({ slice: 20, invocation: 20 });
+    const { fileId, hash, r2Key } = await uploadArchive('r7f2a', 5);
+
+    // Reproduce the round-2-f1b write throw (7th batch = conversation 3's first batch; conversations 1-2 are
+    // fully written and tracked in `written`), THEN make raiseExportRetry's revertSlice ALSO throw by failing
+    // the prepare of its UPDATE. A second D1 failure DURING rollback must not escape as a non-sentinel error
+    // (which the generic catch would turn into a terminal 'error' with stranded rows) — it's swallowed with a
+    // structured log and ExportRetry is still raised.
+    const REVERT_SQL = "UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1";
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    testEnv.DB.prepare = ((sql: string) => {
+      if (sql === REVERT_SQL) throw new Error('D1 outage during revertSlice');
+      return realPrepare(sql);
+    }) as typeof testEnv.DB.prepare;
+    const restore = throwOnNthBatch(7);
+    const flags = { acked: false, retried: false };
+    const msg = {
+      id: String(fileId),
+      timestamp: new Date(),
+      attempts: 1,
+      body: { file_id: fileId, r2_key: r2Key, reason: 'upload' as const, content_hash: hash },
+      ack() {
+        flags.acked = true;
+      },
+      retry() {
+        flags.retried = true;
+      },
+    };
+    try {
+      await worker.queue({ queue: 'parse', messages: [msg], ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>, testEnv);
+    } finally {
+      restore();
+      testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
+    }
+
+    // POSITIVE CONTROL: without the best-effort try/catch around revertSlice, its throw escapes
+    // raiseExportRetry as a non-sentinel error → generic catch → markError → terminal 'error'. With it, the
+    // failure is swallowed and ExportRetry is raised: the consumer retries and the file rests 'pending'.
+    expect(flags.retried).toBe(true);
+    expect(await fileState(fileId)).toBe('pending'); // NOT 'error'
+    // revertSlice failed, so this slice's 2 written sessions stay 'ready'; the same-offset retry rewrites them.
+    expect(await readyCount(fileId)).toBe(2);
+  });
+
+  it('a forcePending failure during rollback still raises ExportRetry, leaving the file non-terminal (round 7 finding 2)', async () => {
+    budgets({ slice: 20, invocation: 20 });
+    const { fileId, hash, r2Key } = await uploadArchive('r7f2b', 5);
+
+    // Same write throw, but this time revertSlice succeeds and forcePending's UPDATE throws. A rollback that
+    // can't re-assert 'pending' must still raise ExportRetry rather than fall through to a terminal 'error':
+    // the file is already non-terminal ('pending' from upload), files/check re-enqueues it, and the sentinel
+    // retries the same idempotent message — nothing is stranded.
+    const FORCE_PENDING_SQL = "UPDATE files SET parse_state = 'pending' WHERE id = ?1 AND content_hash = ?2";
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    testEnv.DB.prepare = ((sql: string) => {
+      if (sql === FORCE_PENDING_SQL) throw new Error('D1 outage during forcePending');
+      return realPrepare(sql);
+    }) as typeof testEnv.DB.prepare;
+    const restore = throwOnNthBatch(7);
+    const flags = { acked: false, retried: false };
+    const msg = {
+      id: String(fileId),
+      timestamp: new Date(),
+      attempts: 1,
+      body: { file_id: fileId, r2_key: r2Key, reason: 'upload' as const, content_hash: hash },
+      ack() {
+        flags.acked = true;
+      },
+      retry() {
+        flags.retried = true;
+      },
+    };
+    try {
+      await worker.queue({ queue: 'parse', messages: [msg], ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>, testEnv);
+    } finally {
+      restore();
+      testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
+    }
+
+    // POSITIVE CONTROL: without the best-effort try/catch around forcePending, its throw escapes → generic
+    // catch → markError → terminal 'error'. With it, ExportRetry is raised and the file stays 'pending'.
+    expect(flags.retried).toBe(true);
+    expect(await fileState(fileId)).toBe('pending'); // non-terminal, NOT 'error'
+    // revertSlice ran fine, so this slice's writes were rolled back to 'parsing'.
+    expect(await readyCount(fileId)).toBe(0);
   });
 
   it('cleanup deletes are atomic hash-guarded: a hash flip between the recheck and the delete batch no-ops them (round 4 finding 3)', async () => {

@@ -1015,10 +1015,26 @@ async function forcePending(file: FileRow, env: Env, contentHash: string | undef
 /** Handle a transient (retryable) throw out of an export parse: revert THIS invocation's writes, force the
  * file 'pending', and raise the ExportRetry sentinel so the consumer retries the same idempotent message
  * rather than marking a session_id-NULL archive terminal 'error' with stranded 'ready' rows. Never reverts
- * earlier slices (revertSlice is per-invocation) — a same-offset retry rewrites only this slice. */
+ * earlier slices (revertSlice is per-invocation) — a same-offset retry rewrites only this slice.
+ *
+ * BOTH rollbacks are best-effort (round 7 finding 2): a second D1 failure or subrequest-cap hit inside
+ * revertSlice/forcePending must NOT escape as a non-sentinel error, or the generic consumer catch would mark
+ * this session_id-NULL archive terminal 'error' with its rows stranded — the exact outcome the sentinel
+ * exists to prevent. Neither swallowed failure strands anything: a failed revertSlice leaves this slice's
+ * rows 'ready', but the same-offset retry rewrites them idempotently; a failed forcePending leaves the file
+ * non-terminal ('parsing'), which files/check re-enqueues, and the sentinel already retries this message.
+ * Both converge on a clean reparse. So we log each failure and ALWAYS raise ExportRetry. */
 async function raiseExportRetry(file: FileRow, env: Env, written: Set<string>, contentHash: string | undefined, e: unknown): Promise<never> {
-  await revertSlice(written, env);
-  await forcePending(file, env, contentHash);
+  try {
+    await revertSlice(written, env);
+  } catch (revertErr) {
+    console.log(JSON.stringify({ event: 'parse.export.revert_failed', file_id: file.id, error: String(revertErr) }));
+  }
+  try {
+    await forcePending(file, env, contentHash);
+  } catch (pendingErr) {
+    console.log(JSON.stringify({ event: 'parse.export.force_pending_failed', file_id: file.id, error: String(pendingErr) }));
+  }
   console.log(JSON.stringify({ event: 'parse.export.transient', file_id: file.id, error: String(e) }));
   throw new ExportRetry(String(e));
 }
@@ -1029,13 +1045,20 @@ async function raiseExportRetry(file: FileRow, env: Env, written: Set<string>, c
  * invocation (see the call site): a session must never be removed before an overlapping archive has a
  * NON-terminal ('pending') message to recover it — otherwise a lost flip on the final reconciliation would
  * strand a sibling terminal with its rows gone, silently dropping them from the index (round 6 finding 4).
+ *
+ * Only siblings still parse_state='parsed' are selected — the fan-out is idempotent at the QUERY level, not
+ * via the per-invocation flag alone (round 7 finding 1). Once we flip a sibling to 'pending', a later
+ * cleanup continuation's SELECT excludes it, so a multi-page cleanup flips each sibling exactly once instead
+ * of O(pages × siblings) times. The excluded states are all correct to skip: 'pending'/'parsing' siblings
+ * already have (or will get, via files/check) an active parse message; 'error' can't recover; 'skipped'/
+ * 'superseded' are dedup/replaced copies whose live content is owned by a 'parsed' file that IS in this set.
  * Returns the subrequest cost so the cleanup budget still bounds the invocation. markPendingAndEnqueue flips
  * a sibling to 'pending' THEN sends: a SEND failure after the flip is safe (files/check re-enqueues the
  * 'pending' row), so it's swallowed; a FLIP failure leaves the sibling terminal, so raise ExportRetry — and
  * because nothing has been deleted yet, the retry re-runs the whole idempotent cleanup page cleanly. */
 async function kickSiblings(file: FileRow, env: Env): Promise<number> {
   const others = await env.DB.prepare(
-    `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state != 'error'`,
+    `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state = 'parsed'`,
   )
     .bind(file.store, file.id)
     .all<{ id: number; r2_key: string; content_hash: string }>();
