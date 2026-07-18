@@ -9,9 +9,13 @@
 --
 -- cert_id is the CA's client-certificate id for the CURRENT cert, captured on renewal so
 -- a LATER renewal can move it into prev_cert_id and revoke it. Rows enrolled by
--- enroll-cert.sh (pre-M4) have cert_id NULL — their first renewal has no id to revoke,
--- which is fine: the hub stops honoring the old fingerprint at cert_revoke_at regardless,
--- and the software cert expires at the CA on its own.
+-- enroll-cert.sh (pre-M4) have cert_id NULL — their first renewal has no id to revoke.
+-- The hub stops honoring the old fingerprint at cert_revoke_at regardless, but because a
+-- NULL id means "id unknown" (the cert may still be CA-valid until its ~1yr expiry), NOT
+-- "revoked", the prune does NOT free such a fingerprint: it clears only cert_revoke_at and
+-- keeps prev_cert_fp_sha256 (with its NULL id) as a TOMBSTONE so no other machine can claim
+-- a fingerprint whose cert might still authenticate. Only a confirmed CA revoke (known id)
+-- clears prev_cert_fp_sha256 and returns the fingerprint to the reusable pool.
 ALTER TABLE machines ADD COLUMN cert_id TEXT;
 ALTER TABLE machines ADD COLUMN prev_cert_fp_sha256 TEXT;
 ALTER TABLE machines ADD COLUMN prev_cert_id TEXT;

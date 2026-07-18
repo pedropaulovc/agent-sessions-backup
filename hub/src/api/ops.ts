@@ -91,21 +91,19 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
       return Response.json({ machines: rows.results });
     }
 
-    // Reject a fingerprint already live on ANOTHER machine — as its current cert, its in-grace
-    // previous cert, OR a previous cert that is out of grace but still carries a pending cert_id
-    // (its revoke hasn't run yet: before the next daily prune, or after a failed CF DELETE). In that
-    // last case the old row's prune will still revoke prev_cert_id at the CA, which would invalidate
-    // this fingerprint if we let it become current here. Only a prev fp with prev_cert_id already
-    // NULL (nothing left to revoke) is safe to reuse. A managed cert fingerprint is unique per
-    // machine; letting two rows share one would make machineIdentity's unordered .first()
+    // Reject a fingerprint that appears on ANOTHER machine as its current cert OR its previous cert
+    // — while prev_cert_fp_sha256 is set at all, regardless of grace or cert_id. A cert is only
+    // safe to reuse once that column is cleared, and the prune clears it exactly when the underlying
+    // CA cert is confirmed gone. A NULL prev_cert_id does NOT mean "revoked": for pre-M4 rows the hub
+    // never recorded the CA id, so the old client cert may still be CA-valid — reusing that fp would
+    // let whoever holds the old cert authenticate as the new row. A managed cert fingerprint is
+    // unique per machine; letting two rows share one would make machineIdentity's unordered .first()
     // authenticate as whichever row it returned. This subsumes the plain current-fp UNIQUE collision
     // into an explicit 409 (clearer than a constraint-violation catch).
     if (body.cert_fp_sha256) {
       const clash = await env.DB.prepare(
         `SELECT machine_id FROM machines
-          WHERE (cert_fp_sha256 = ?1
-                 OR (prev_cert_fp_sha256 = ?1
-                     AND (cert_revoke_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now') OR prev_cert_id IS NOT NULL)))
+          WHERE (cert_fp_sha256 = ?1 OR prev_cert_fp_sha256 = ?1)
             AND machine_id != ?2`,
       )
         .bind(body.cert_fp_sha256, body.machine_id)
@@ -136,8 +134,16 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     // NOT revoke the dropped cert here — the admin may be reinstating exactly that fingerprint — so
     // it just ages out at the CA's 1-year validity; log what was dropped. Unchanged fp → keep the
     // active rotation window untouched.
+    //
+    // Rollback special case: if the new current fp IS the row's in-grace previous fp, its CA id is
+    // sitting right there in prev_cert_id — carry it into cert_id (unless the body supplies one) so
+    // the reinstated cert keeps a live id. Otherwise the row would store it with cert_id NULL and the
+    // NEXT renew would move NULL into prev_cert_id, so the prune never revokes the real cert.
     const fpChanged = certFp !== (existing?.cert_fp_sha256 ?? null);
-    const certId = fpChanged ? body.cert_id ?? null : existing?.cert_id ?? null;
+    const rollingBack = fpChanged && certFp !== null && certFp === (existing?.prev_cert_fp_sha256 ?? null);
+    const certId = fpChanged
+      ? body.cert_id ?? (rollingBack ? existing?.prev_cert_id ?? null : null)
+      : existing?.cert_id ?? null;
     const prevFp = fpChanged ? null : existing?.prev_cert_fp_sha256 ?? null;
     const prevId = fpChanged ? null : existing?.prev_cert_id ?? null;
     const revokeAt = fpChanged ? null : existing?.cert_revoke_at ?? null;
@@ -163,8 +169,12 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
       // a 409 rather than a bare 500 so the admin caller sees it's a duplicate, not a hub fault.
       return Response.json({ error: 'machine_upsert_conflict', detail: String(e) }, { status: 409 });
     }
-    // A fresh insert reports changes === 1; only a conflict whose CAS WHERE failed reports 0.
-    if (existing && res.meta.changes === 0) {
+    // A genuinely fresh insert reports changes === 1; changes === 0 means the ON CONFLICT DO UPDATE
+    // ran but its CAS WHERE didn't match, so nothing was written. That covers BOTH a cert rotating
+    // under an existing row AND the first-insert race — the loser read existing as null, hit ON
+    // CONFLICT after the winner inserted, and its `cert_fp_sha256 IS NULL` CAS missed. Either way the
+    // requested cert was NOT installed, so 409 unconditionally rather than a silent 200.
+    if (res.meta.changes === 0) {
       return Response.json({ error: 'concurrent_rotation', machine_id: body.machine_id }, { status: 409 });
     }
     if (fpChanged && existing && (existing.cert_id || existing.prev_cert_fp_sha256)) {

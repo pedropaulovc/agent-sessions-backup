@@ -81,9 +81,9 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
   }
   const newFp = await certFingerprint(signed.certificate);
 
-  const cur = await env.DB.prepare('SELECT cert_fp_sha256, cert_id, cert_revoke_at FROM machines WHERE machine_id = ?1')
+  const cur = await env.DB.prepare('SELECT cert_fp_sha256, cert_id, prev_cert_id, cert_revoke_at FROM machines WHERE machine_id = ?1')
     .bind(identity.machineId)
-    .first<{ cert_fp_sha256: string | null; cert_id: string | null; cert_revoke_at: string | null }>();
+    .first<{ cert_fp_sha256: string | null; cert_id: string | null; prev_cert_id: string | null; cert_revoke_at: string | null }>();
 
   const authFp = identity.certFp ?? null;
   const onCurrent = authFp !== null && authFp === cur?.cert_fp_sha256;
@@ -145,6 +145,19 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
       await revokeClientCert(env, cur.cert_id);
     } catch (e) {
       console.log(JSON.stringify({ event: 'hub.certs.orphan_revoke_failed', machine: identity.machineId, cert_id: cur.cert_id, error: String(e) }));
+    }
+  }
+
+  // Normal rotation OVERWRITES the grace slot: if a cert was already sitting in prev_cert_id (an
+  // earlier rotation still within its window), the row no longer references it, so the prune will
+  // never see it and it would linger at the CA until its 1-year expiry — a leak that repeated renews
+  // compound into zone client-cert quota exhaustion. Best-effort revoke the displaced prev now. Only
+  // the CAS winner reaches here (changes === 1), so exactly one caller revokes it.
+  if (onCurrent && cur?.prev_cert_id) {
+    try {
+      await revokeClientCert(env, cur.prev_cert_id);
+    } catch (e) {
+      console.log(JSON.stringify({ event: 'hub.certs.displaced_revoke_failed', machine: identity.machineId, cert_id: cur.prev_cert_id, error: String(e) }));
     }
   }
 

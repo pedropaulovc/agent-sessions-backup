@@ -214,6 +214,24 @@ describe('POST /api/v1/certs/renew', () => {
     expect(await machineIdentity(reqWithCert(fpC), prodEnv)).toMatchObject({ machineId: 'renew-lost' });
   });
 
+  it('revokes the previous cert that a normal rotation displaces (no orphan left at the CA)', async () => {
+    // Machine is mid-grace: current B, prev A still valid. A renew on the CURRENT cert rotates B->C,
+    // which overwrites the grace slot with B and drops the row's only reference to A. A must be
+    // revoked now, or it lingers at the CA until its 1-year expiry.
+    await seedMachine('renew-disp', { fp: 'disp-B', certId: 'disp-cert-B', prevFp: 'disp-A', prevCertId: 'disp-cert-A', revokeAt: '2999-01-01T00:00:00.000Z' });
+    const { deletes } = stubSignAndRevoke([{ seed: 'disp-C', id: 'disp-cert-C' }]);
+    const fpC = await certFingerprint(fakeCertPem('disp-C'));
+
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('renew-disp', false, 'disp-B')); // authed on current
+    expect(res.status).toBe(200);
+    const r = await row('renew-disp');
+    expect(r?.cert_fp_sha256).toBe(fpC); // C is current
+    expect(r?.prev_cert_fp_sha256).toBe('disp-B'); // old current retired into grace
+    expect(r?.prev_cert_id).toBe('disp-cert-B');
+    expect(deletes).toContain('disp-cert-A'); // the displaced older prev was revoked
+    expect(deletes).not.toContain('disp-cert-B'); // the fresh grace cert stays valid
+  });
+
   it('repeated prev-auth retries do not extend the grace clock (no immortal old cert)', async () => {
     await seedMachine('renew-lost2', { fp: 'l2-B', certId: 'cert-l2-B', prevFp: 'l2-A', prevCertId: 'cert-l2-A', revokeAt: '2999-01-01T00:00:00.000Z' });
     stubSignAndRevoke([{ seed: 'l2-C', id: 'cert-l2-C' }, { seed: 'l2-D', id: 'cert-l2-D' }]);
@@ -348,21 +366,71 @@ describe('POST /api/v1/admin/machines', () => {
     expect(r?.cert_revoke_at).toBe('2999-01-01T00:00:00.000Z');
   });
 
-  it("409s a fingerprint that is another machine's out-of-grace prev cert still awaiting revoke (pending prev_cert_id)", async () => {
-    // Grace expired (revoke_at in the past) but the daily prune hasn't cleared prev_cert_id yet, so
-    // that CA cert is still live and its next prune will revoke it — reusing the fp would strand the
-    // new holder. The plain `cert_revoke_at > now` predicate would miss this; `prev_cert_id NOT NULL` catches it.
+  it("409s a fingerprint still held as another machine's prev cert even past its grace window", async () => {
+    // Grace expired (revoke_at in the past) but the prev cert is still recorded and not yet revoked.
+    // A prev fp is reserved while prev_cert_fp_sha256 is set at all — the clash predicate is now the
+    // simple `cert_fp_sha256 = ?1 OR prev_cert_fp_sha256 = ?1`.
     await seedMachine('am-exp', { fp: 'am-exp-cur', prevFp: 'am-exp-prev', prevCertId: 'am-exp-previd', revokeAt: '2000-01-01T00:00:00.000Z' });
     const res = await adminMachines(reqJson({ machine_id: 'am-exp-other', cert_fp_sha256: 'am-exp-prev' }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(409);
     expect(((await res.json()) as { machine_id: string }).machine_id).toBe('am-exp');
   });
 
-  it('allows reusing an out-of-grace prev fp once its revoke is done (prev_cert_id cleared → nothing left to revoke)', async () => {
-    await seedMachine('am-safe', { fp: 'am-safe-cur', prevFp: 'am-safe-prev', revokeAt: '2000-01-01T00:00:00.000Z' }); // prevCertId omitted -> NULL (revoke already done)
-    const res = await adminMachines(reqJson({ machine_id: 'am-safe-other', cert_fp_sha256: 'am-safe-prev' }), testEnv, machine('am-admin', true));
+  it('409s a legacy NULL-id prev fp — unknown CA id is NOT "revoked", so the fp stays reserved (before AND after prune)', async () => {
+    // Pre-M4 enroll cert: prev_cert_id NULL because the hub never recorded the CA id, not because the
+    // cert is gone. Reusing it would let whoever still holds that old cert authenticate as the new row.
+    // Case 1: out of grace, prune hasn't run (revoke_at in the past).
+    await seedMachine('am-legacy', { fp: 'am-legacy-cur', prevFp: 'am-legacy-prev', revokeAt: '2000-01-01T00:00:00.000Z' }); // prevCertId omitted -> NULL
+    const before = await adminMachines(reqJson({ machine_id: 'am-legacy-x', cert_fp_sha256: 'am-legacy-prev' }), testEnv, machine('am-admin', true));
+    expect(before.status).toBe(409);
+    // Case 2: after prune has tombstoned it (revoke_at cleared, prev fp + NULL id kept as reservation).
+    await seedMachine('am-tomb', { fp: 'am-tomb-cur', prevFp: 'am-tomb-prev' }); // prevCertId + revokeAt NULL == tombstone
+    const after = await adminMachines(reqJson({ machine_id: 'am-tomb-x', cert_fp_sha256: 'am-tomb-prev' }), testEnv, machine('am-admin', true));
+    expect(after.status).toBe(409);
+    expect(((await after.json()) as { machine_id: string }).machine_id).toBe('am-tomb');
+  });
+
+  it('carries the prev cert id into cert_id when rolling back to the in-grace prev fp', async () => {
+    // Rollback: admin sets current back to the in-grace prev fp. Its CA id lives in prev_cert_id — it
+    // must move into cert_id, or the row stores the reinstated cert with a NULL id and the next
+    // renew/prune can never revoke the real cert.
+    await seedMachine('am-rbid', { fp: 'rbid-B', certId: 'cert-rbid-B', prevFp: 'rbid-A', prevCertId: 'cert-rbid-A', revokeAt: '2999-01-01T00:00:00.000Z' });
+    const res = await adminMachines(reqJson({ machine_id: 'am-rbid', cert_fp_sha256: 'rbid-A' }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(200);
-    expect((await row('am-safe-other'))?.cert_fp_sha256).toBe('am-safe-prev');
+    const r = await row('am-rbid');
+    expect(r?.cert_fp_sha256).toBe('rbid-A');
+    expect(r?.cert_id).toBe('cert-rbid-A'); // carried over from prev_cert_id, not dropped to NULL
+    expect(r?.prev_cert_fp_sha256).toBeNull(); // grace window cleared
+  });
+
+  it('first-insert race: the loser 409s instead of a silent 200 with nothing installed', async () => {
+    // Two registrations race for the same NEW machine_id. The loser reads existing as null, then a
+    // competing insert lands; its `cert_fp_sha256 IS NULL` CAS misses (changes === 0). With the
+    // `existing &&` gate dropped, that zero-change result is a 409 rather than a 200 installing nothing.
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
+      const stmt = realPrepare(sql);
+      if (!sql.includes('prev_cert_fp_sha256, prev_cert_id, cert_revoke_at')) return stmt;
+      const realBind = stmt.bind.bind(stmt);
+      (stmt as unknown as { bind: (...a: unknown[]) => unknown }).bind = (...b: unknown[]) => {
+        const bound = (realBind as (...a: unknown[]) => { first: (...f: unknown[]) => Promise<unknown> })(...b);
+        const realFirst = bound.first.bind(bound);
+        bound.first = async (...f: unknown[]) => {
+          const r = await realFirst(...f); // null — the row does not exist yet
+          await realPrepare('INSERT INTO machines (machine_id, os, cert_fp_sha256, cert_id) VALUES (?1, ?2, ?3, ?4)')
+            .bind('race-new', 'linux', 'race-winner-fp', 'race-winner-id')
+            .run();
+          return r;
+        };
+        return bound;
+      };
+      return stmt;
+    });
+    const res = await adminMachines(reqJson({ machine_id: 'race-new', cert_fp_sha256: 'race-loser-fp', cert_id: 'race-loser-id' }), testEnv, machine('am-admin', true));
+    spy.mockRestore();
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('concurrent_rotation');
+    expect((await row('race-new'))?.cert_fp_sha256).toBe('race-winner-fp'); // winner intact, loser NOT installed
   });
 
   it('metadata-only edit never writes cert columns, so a renew that lands mid-edit is not clobbered', async () => {
@@ -503,12 +571,29 @@ describe('daily prune (cert revoke)', () => {
     expect(r?.cert_revoke_at).toBe('2999-01-01T00:00:00.000Z');
   });
 
-  it('clears columns without a CA call when there is no prev_cert_id (pre-M4 enrolled cert)', async () => {
+  it('tombstones a NULL-id prev (pre-M4 enrolled cert): no CA call, only revoke_at cleared, fp stays reserved', async () => {
+    // Unknown CA id ≠ revoked — the underlying cert may still be CA-valid. So we retire the grace
+    // window but keep prev_cert_fp_sha256 (with NULL id) as a tombstone so no other machine can claim it.
     await seedMachine('prune-4', { fp: 'cur4', prevFp: 'old4', prevCertId: undefined, revokeAt: '2000-01-01T00:00:00.000Z' });
     const fetchMock = vi.fn();
     vi.stubGlobal('fetch', fetchMock);
     await runDailyPrune(cfEnv);
-    expect(fetchMock).not.toHaveBeenCalled(); // nothing to revoke at the CA
-    expect((await row('prune-4'))?.prev_cert_fp_sha256).toBeNull(); // still cleared
+    expect(fetchMock).not.toHaveBeenCalled(); // no recorded id -> nothing to revoke
+    const r = await row('prune-4');
+    expect(r?.prev_cert_fp_sha256).toBe('old4'); // KEPT — tombstone reservation
+    expect(r?.prev_cert_id).toBeNull();
+    expect(r?.cert_revoke_at).toBeNull(); // grace window retired (identity already stops honoring it)
+    // The tombstoned fp remains unclaimable by another machine.
+    const clash = await adminMachines(reqJson({ machine_id: 'prune-4-other', cert_fp_sha256: 'old4' }), testEnv, machine('am-admin', true));
+    expect(clash.status).toBe(409);
+  });
+
+  it('a confirmed CA revoke frees the fingerprint for reuse by another machine', async () => {
+    await seedMachine('prune-free', { fp: 'pf-cur', prevFp: 'pf-old', prevCertId: 'pf-cert-old', revokeAt: '2000-01-01T00:00:00.000Z' });
+    stubDelete(true);
+    await runDailyPrune(cfEnv);
+    expect((await row('prune-free'))?.prev_cert_fp_sha256).toBeNull(); // freed once the CA cert is gone
+    const reuse = await adminMachines(reqJson({ machine_id: 'prune-free-other', cert_fp_sha256: 'pf-old' }), testEnv, machine('am-admin', true));
+    expect(reuse.status).toBe(200); // now claimable
   });
 });
