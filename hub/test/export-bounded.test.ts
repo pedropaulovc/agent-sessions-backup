@@ -1550,6 +1550,100 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(sent.some((m) => m.file_id === sib.fileId && m.reason === 'recover')).toBe(true);
   });
 
+  it('a corrupt re-upload whose sibling fan-out exceeds one invocation reserves EVERY sibling across continuations, stamping error only after (round 13, corrupt-export flip-early)', async () => {
+    budgets({ slice: 800, invocation: 800 });
+    // main owns 2 sessions, so failExportFile's fan-out fires (owned > 0). Then re-uploaded corrupt (same
+    // row, new hash) → failExportFile routes recovery through the round-12 flip-early/send-late machinery.
+    const main = await uploadConvs('r13-main', [conv('r13main', 0), conv('r13main', 1)]);
+    await deliverChain({ file_id: main.fileId, r2_key: main.r2Key, reason: 'upload', content_hash: main.hash });
+    expect(await ownedSessions(main.fileId)).toBe(2);
+
+    // Six PARSED sibling archives (distinct conversations). Upload them all first (export uploads no longer
+    // reserve — reservation is delivery-driven — but keep them un-cross-flipped), then parse them all.
+    const SIB_COUNT = 6;
+    const sibUploads = [];
+    for (let i = 0; i < SIB_COUNT; i++) sibUploads.push(await uploadConvs(`r13-sib${i}`, [conv(`r13sib${i}`, 0)]));
+    for (const s of sibUploads) await deliverChain({ file_id: s.fileId, r2_key: s.r2Key, reason: 'upload', content_hash: s.hash });
+    const sibs = sibUploads.map((s) => s.fileId);
+    for (const id of sibs) expect(await fileState(id)).toBe('parsed');
+
+    const reservedSibs = async (): Promise<Set<number>> => {
+      const s = new Set<number>();
+      for (const id of sibs) if ((await fileState(id)) === 'reserved') s.add(id);
+      return s;
+    };
+
+    // Corrupt re-upload → failExportFile. Tight budget + tiny reserve page so the RESERVE pass cannot flip all
+    // six siblings in one invocation; the fan-out must span continuations carried by kick_cursor.
+    const corruptHash = await reuploadRawExport('r13-main', new TextEncoder().encode('not a zip at all'));
+    budgets({ slice: 6, invocation: 6, kickPage: 2 });
+    let msg: ParseMessage = { file_id: main.fileId, r2_key: main.r2Key, reason: 'upload', content_hash: corruptHash };
+    let prev = await reservedSibs();
+    let maxNewlyReservedInOneInvocation = 0;
+    let totalNewlyReserved = 0;
+    let invocations = 0;
+    const statesBeforeFinal: string[] = [];
+    for (let i = 0; i < 200; i++) {
+      sent.length = 0;
+      await deliver(msg);
+      invocations += 1;
+      const now = await reservedSibs();
+      let newly = 0;
+      for (const id of now) if (!prev.has(id)) newly += 1;
+      maxNewlyReservedInOneInvocation = Math.max(maxNewlyReservedInOneInvocation, newly);
+      totalNewlyReserved += newly;
+      prev = now;
+      const cont = sent.find((m) => m.file_id === main.fileId && typeof m.kick_cursor === 'number');
+      if (!cont) break;
+      statesBeforeFinal.push(await fileState(main.fileId)); // state AFTER a NON-final (reserve-continuation) invocation
+      msg = cont;
+    }
+
+    // POSITIVE CONTROL (reverting the flip-early ordering — mark 'error' FIRST — makes ALL of these fail):
+    // 1. The fan-out spanned ≥2 continuations and no single invocation reserved all six (paged, budget-cut).
+    expect(invocations).toBeGreaterThan(1);
+    expect(maxNewlyReservedInOneInvocation).toBeLessThan(SIB_COUNT);
+    // 2. Every sibling was reserved EXACTLY once and ends 'reserved' — none stranded 'parsed'. Under error-first
+    //    ordering the retry finds the file already 'error' (markParsed updated=false → early return) and the
+    //    reservation never completes, stranding the un-reached siblings.
+    expect(totalNewlyReserved).toBe(SIB_COUNT);
+    for (const id of sibs) expect(await fileState(id)).toBe('reserved');
+    // 3. The corrupt file is stamped 'error' ONLY after reservation completes — never during the spanning
+    //    continuations. Error-first ordering would show 'error' in statesBeforeFinal (and strand siblings).
+    expect(statesBeforeFinal.length).toBeGreaterThan(0);
+    expect(statesBeforeFinal.every((s) => s !== 'error')).toBe(true);
+    expect(await fileState(main.fileId)).toBe('error');
+    // (The send-late recover fan-out runs only on the completing invocation and is best-effort/budget-cut —
+    // the durable 'reserved' state above is the exactly-once safety net; recover delivery is proven separately
+    // in the generous-budget test below.)
+  });
+
+  it('a corrupt re-upload reserves every parsed sibling and sends it exactly one recover via the round-12 send-late helper (round 13, corrupt-export send-late)', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    // main owns sessions → fan-out fires; four parsed siblings hold conversations it may have owned.
+    const main = await uploadConvs('r13s-main', [conv('r13smain', 0), conv('r13smain', 1)]);
+    await deliverChain({ file_id: main.fileId, r2_key: main.r2Key, reason: 'upload', content_hash: main.hash });
+    const SIB_COUNT = 4;
+    const sibUploads = [];
+    for (let i = 0; i < SIB_COUNT; i++) sibUploads.push(await uploadConvs(`r13s-sib${i}`, [conv(`r13ssib${i}`, 0)]));
+    for (const s of sibUploads) await deliverChain({ file_id: s.fileId, r2_key: s.r2Key, reason: 'upload', content_hash: s.hash });
+    const sibs = sibUploads.map((s) => s.fileId);
+    for (const id of sibs) expect(await fileState(id)).toBe('parsed');
+
+    const corruptHash = await reuploadRawExport('r13s-main', new TextEncoder().encode('not a zip at all'));
+    sent.length = 0;
+    await deliver({ file_id: main.fileId, r2_key: main.r2Key, reason: 'upload', content_hash: corruptHash });
+
+    // The corrupt file rests terminal 'error'; every parsed sibling was reserved and received EXACTLY one
+    // recover — the fan-out routes through the SAME sendRecoverToReservedSiblings the cleanup success path
+    // uses, no dedicated send loop in the corrupt path. (Count per-sibling to prove exactly-once, not just ≥1.)
+    expect(await fileState(main.fileId)).toBe('error');
+    for (const id of sibs) {
+      expect(await fileState(id)).toBe('reserved');
+      expect(sent.filter((m) => m.file_id === id && m.reason === 'recover').length).toBe(1);
+    }
+  });
+
   it('a queue outage during the late recover fan-out is bounded and exits, not a spin of failing sends (round 12 finding 3608692129)', async () => {
     budgets({ slice: 800, invocation: 800, kickPage: 500 });
     // More than EXPORT_SEND_FAILURE_LIMIT parsed siblings so the abort is observable (it stops well before

@@ -432,38 +432,72 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
 // the ~1000 subrequest cap.
 const FLIP_BATCH_CHUNK = 90;
 
-async function failExportFile(file: FileRow, env: Env, contentHash: string | undefined, reason: string): Promise<void> {
-  const { updated } = await markParsed(file.id, env, 'error', file.size, reason, contentHash);
-  // A fresher re-upload already owns this row (hash moved on) — its message handles the state.
-  if (!updated) return;
-  const owned = await env.DB.prepare('SELECT session_id FROM sessions WHERE canonical_file_id = ?1')
-    .bind(file.id)
-    .all<{ session_id: string }>();
-  // Flip every owned session to 'error' in db.batch CHUNKS, not one .run() per row. A corrupt re-upload of
-  // an archive that owned N conversations otherwise costs N subrequests here (one per row) — and this runs
-  // AFTER markParsed('error') has committed, so once it breaches the ~1000 cap it throws, the retry finds the
-  // file already 'error' (markParsed returns updated=false → early return above), and the flip/fan-out never
-  // re-run: the owned rows stay stranded pointing at an errored file, FOREVER. Batched at 90/chunk, a batch is
-  // ONE subrequest regardless of statement count, so ~950 owned rows cost ceil(950/90)=11 subrequests — safely
-  // bounded under the cap, so failExportFile always completes and the file rests terminal 'error' (round 9 finding 5).
+async function failExportFile(
+  file: FileRow,
+  env: Env,
+  contentHash: string | undefined,
+  errorLabel: string,
+  msgReason: ParseMessage['reason'],
+  kickCursor: number,
+): Promise<number> {
+  let spent = 0;
+  const owned = await env.DB.prepare('SELECT session_id FROM sessions WHERE canonical_file_id = ?1').bind(file.id).all<{ session_id: string }>();
+  spent += 1;
+
+  // FLIP-EARLY (round 12): if this corrupt file owned any conversations, RESERVE the store's 'parsed'
+  // siblings BEFORE stamping 'error' — via the SAME paged, batched, hash-pinned reserveSiblings primitive as
+  // the cleanup path (recover from ANY machine: export rows carry session_id NULL and conversation ids are
+  // globally unique per account). This replaces the old unbounded `for (sibling) markPendingAndEnqueue` loop
+  // (2 subrequests/sibling) that, running AFTER markParsed('error'), would breach the cap for a store with
+  // many siblings, throw, and — because the retry found the file already 'error' → early-returned — never
+  // complete the fan-out. Stamping 'error' only AFTER reservation completes makes that trap structurally
+  // impossible: a retry re-enters with the file NOT yet 'error' and resumes the flips at kick_cursor. Same
+  // flip-early invariant as the round-11 cleanup success path.
+  if (owned.results.length > 0) {
+    const r = await reserveSiblings(file, env, contentHash, kickCursor, spent);
+    spent += r.spent;
+    if (r.superseded) return spent; // a fresher re-upload owns the file; it runs its own parse + fan-out
+    if (!r.complete) {
+      // Over budget mid-reservation → re-enqueue a continuation (kick_cursor advanced), STILL NOT 'error'.
+      try {
+        await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason: msgReason, content_hash: contentHash, kick_cursor: r.kickCursor });
+      } catch {
+        await forcePending(file, env, contentHash);
+        console.log(JSON.stringify({ event: 'parse.export.error_reserve_send_failed', file_id: file.id, kick_cursor: r.kickCursor }));
+        throw new ExportRetry('failExportFile reserve continuation send failed');
+      }
+      console.log(JSON.stringify({ event: 'parse.export.error_reserve', file_id: file.id, kick_cursor: r.kickCursor, done: false }));
+      return spent;
+    }
+  }
+
+  // Reservation complete (or nothing to recover) → NOW stamp the file 'error' (hash-guarded).
+  const { updated } = await markParsed(file.id, env, 'error', file.size, errorLabel, contentHash);
+  spent += 1;
+  if (!updated) return spent; // a fresher re-upload already owns this row — its message handles the state
+  // Flip every owned session to 'error' in db.batch CHUNKS (round 9 finding 5): one subrequest per 90 rows,
+  // so ~950 owned rows cost ~11 subrequests rather than one .run() each.
   for (let i = 0; i < owned.results.length; i += FLIP_BATCH_CHUNK) {
     const chunk = owned.results.slice(i, i + FLIP_BATCH_CHUNK);
     await env.DB.batch(chunk.map(({ session_id }) => env.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(session_id)));
+    spent += 1;
   }
+  // SEND-LATE (round 12): fan out recover messages to exactly the 'reserved' siblings via the SAME helper —
+  // paged, failed sends charged to budget, aborting after EXPORT_SEND_FAILURE_LIMIT consecutive failures. A
+  // reserved sibling holds a conversation this errored file owned; its recover parse re-claims it. Recheck
+  // OUR hash first (round 12 finding 3608692134): a re-upload in the post-mark window means the fresh message
+  // owns the file and runs its own fan-out, so skip ours (dropped 'reserved' rows heal via files/check).
   if (owned.results.length > 0) {
-    // Recover from export files on ANY machine, not just this one. Export rows carry
-    // files.session_id = NULL (never in the normal duplicate-recovery pool), and conversation ids
-    // are globally unique per account — so a same-account export uploaded from a DIFFERENT collector
-    // can hold a conversation this errored file owned. Keeping the machine_id filter would strand
-    // those sessions errored until a manual reindex. (self-exclusion + non-error kept.)
-    const others = await env.DB.prepare(
-      `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state != 'error'`,
-    )
-      .bind(file.store, file.id)
-      .all<{ id: number; r2_key: string; content_hash: string }>();
-    for (const other of others.results) await markPendingAndEnqueue(other, 'recover', env);
+    let hashStillOurs = true;
+    if (contentHash !== undefined) {
+      const recheck = await env.DB.prepare('SELECT content_hash FROM files WHERE id = ?1').bind(file.id).first<{ content_hash: string }>();
+      spent += 1;
+      hashStillOurs = recheck?.content_hash === contentHash;
+    }
+    if (hashStillOurs) spent += await sendRecoverToReservedSiblings(file, env, spent);
   }
-  console.log(JSON.stringify({ event: 'parse.export.error', file_id: file.id, error: reason, owned_errored: owned.results.length }));
+  console.log(JSON.stringify({ event: 'parse.export.error', file_id: file.id, error: errorLabel, owned_errored: owned.results.length }));
+  return spent;
 }
 
 // An export ZIP fans out to one writeSession per conversation. Writing all of a large archive (the prod
@@ -585,8 +619,7 @@ async function runExportParse(
     // generic consumer catch: it flips sessions by files.session_id, which is NULL for an archive
     // row, so the sessions this ZIP is canonical for would keep a stale 'ready' state that
     // loadNormalized()/raw can no longer reconstruct. Handle it like an invalid archive instead.
-    await failExportFile(file, env, contentHash, `r2_object_missing:${file.r2_key}`);
-    return 4;
+    return await failExportFile(file, env, contentHash, `r2_object_missing:${file.r2_key}`, reason, kickCursor ?? 0);
   }
   const archive = parseExportArchive(new Uint8Array(await obj.arrayBuffer()));
 
@@ -606,8 +639,7 @@ async function runExportParse(
   // so /status surfaces it instead of silently reporting the replacement as parsed. (An empty-but-
   // valid array is `valid` and falls through to normal write + cleanup, clearing what it owned.)
   if (!archive.valid) {
-    await failExportFile(file, env, contentHash, archive.error ?? 'invalid export archive');
-    return 4;
+    return await failExportFile(file, env, contentHash, archive.error ?? 'invalid export archive', reason, kickCursor ?? 0);
   }
 
   // A NON-empty archive (recognized layout, conversations present) that parses to zero turns across
@@ -620,8 +652,7 @@ async function runExportParse(
   // at least one turn-bearing conversation writes normally.
   const totalTurns = archive.sessions.reduce((n, s) => n + s.turns.length, 0);
   if (archive.sessions.length > 0 && totalTurns === 0) {
-    await failExportFile(file, env, contentHash, 'export archive parsed to zero turns across all conversations (content-shape drift)');
-    return 4;
+    return await failExportFile(file, env, contentHash, 'export archive parsed to zero turns across all conversations (content-shape drift)', reason, kickCursor ?? 0);
   }
 
   // Session ids we actually WROTE this parse (turns > 0 and not owned by a HEALTHY live CDP
