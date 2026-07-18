@@ -144,6 +144,18 @@ class Config:
     client_cert_path: str | None = None
     client_key_path: str | None = None
     source: Path | None = None
+    # Base dir the webcapture staging stores (WEBCAPTURE_STORES) resolve under in
+    # store_roots() when a store isn't already in `stores`. None (default, and what every
+    # real config uses) resolves live from webcapture_dir() — i.e. $XDG_DATA_HOME or
+    # ~/.local/share — at store_roots() call time. Set explicitly to point that resolution
+    # somewhere else without touching environment variables (tests use this so a Config
+    # built with only e.g. stores={"claude": ...} can never fall through to this box's real
+    # webcapture staging dir, which may hold real export ZIPs).
+    # Placed LAST (not earlier, e.g. next to the other optional fields above) so a positional
+    # Config(...) construction elsewhere in the codebase can never silently shift `source`
+    # (or any other field) into this slot — every existing call site uses keyword args, and
+    # this ordering keeps a future positional mistake impossible rather than merely unlikely.
+    staging_base: str | None = None
 
     def __post_init__(self) -> None:
         # machine_id and each store name are single URL path segments in the files API; a '/'
@@ -164,8 +176,9 @@ class Config:
         # This is the load-layer fix for the "registered only at enroll/webcapture" hole: an
         # already-enrolled collector that upgrades and drops an export ZIP, or a webcapture host, is
         # scanned without a re-enroll. Missing dirs are simply skipped by run/scanner (root.exists()).
+        base = Path(self.staging_base).expanduser() if self.staging_base else webcapture_dir()
         for name in WEBCAPTURE_STORES:
-            stores.setdefault(name, str(webcapture_dir() / name))
+            stores.setdefault(name, str(base / name))
         roots = {name: Path(root).expanduser() for name, root in stores.items()}
         if not self._drop_windows_mounts():
             return roots

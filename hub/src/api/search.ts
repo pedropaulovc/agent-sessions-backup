@@ -1,4 +1,4 @@
-import { clampLimit, normalizeToBound } from './sessions';
+import { clampLimit, decodeCursor, encodeCursor, normalizeToBound } from './sessions';
 
 const FACET_COLUMNS = ['harness', 'machine_id', 'os', 'primary_model', 'repo_url'] as const;
 
@@ -181,24 +181,4 @@ export async function search(url: URL, env: Env): Promise<Response> {
   const result = await runSearch(url, env);
   if (result.error) return Response.json({ error: result.error }, { status: 400 });
   return Response.json({ hits: result.hits, facets: result.facets, cursor: result.cursor });
-}
-
-function encodeCursor(offset: number): string {
-  return btoa(String(offset));
-}
-function decodeCursor(cursor: string | null): number {
-  if (!cursor) return 0;
-  let decoded: string;
-  try {
-    decoded = atob(cursor);
-  } catch {
-    // Invalid base64 (e.g. a hand-edited cursor like "not-base64!") — reset to the first
-    // page instead of 500ing.
-    return 0;
-  }
-  const n = Number(decoded);
-  // A finite non-integer (e.g. a hand-edited cursor decoding to 1.5) would otherwise pass
-  // through into the SQL OFFSET, which SQLite rejects with a datatype mismatch — 500 instead
-  // of just resetting to the first page.
-  return Number.isSafeInteger(n) && n >= 0 ? n : 0;
 }
