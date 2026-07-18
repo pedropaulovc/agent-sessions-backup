@@ -215,26 +215,39 @@ class Transport:
         "--connect-timeout", str(CONNECT_TIMEOUT), "--max-time", str(MAX_TIME),
     )
 
-    def _run(self, argv: list[str]) -> tuple[int, int, str]:
+    def _run(self, argv: list[str], input_bytes: bytes | None = None) -> tuple[int, int, str]:
         self._ensure_curl_version()  # fail loudly on curl too old for --fail-with-body
+        # A binary request body (multipart part) is piped to curl's stdin (`--data-binary @-`), which
+        # requires bytes mode; the response (a small JSON status line) is decoded back to text so
+        # _split_status works the same as the text-mode path.
         try:
-            proc = subprocess.run(
-                [self.curl, *argv], capture_output=True, text=True,
-                timeout=MAX_TIME + SUBPROCESS_MARGIN,
-            )
+            if input_bytes is None:
+                proc = subprocess.run(
+                    [self.curl, *argv], capture_output=True, text=True,
+                    timeout=MAX_TIME + SUBPROCESS_MARGIN,
+                )
+                stdout = proc.stdout
+            else:
+                proc = subprocess.run(
+                    [self.curl, *argv], capture_output=True, input=input_bytes,
+                    timeout=MAX_TIME + SUBPROCESS_MARGIN,
+                )
+                stdout = proc.stdout.decode("utf-8", errors="replace")
         except subprocess.TimeoutExpired:
             # Belt above curl's own --max-time: treat as a network failure (status 0).
             return 124, 0, "curl subprocess timed out"
-        status, body = _split_status(proc.stdout)
+        status, body = _split_status(stdout)
         return proc.returncode, status, body
 
-    def _run_retry(self, argv: list[str]) -> tuple[int, str]:
-        rc, status, body = self._run(argv)
+    def _run_retry(self, argv: list[str], input_bytes: bytes | None = None) -> tuple[int, str]:
+        # Call _run with a single positional arg on the bodyless path so the many tests that
+        # monkeypatch _run(argv) keep working; only the multipart part path passes input_bytes.
+        rc, status, body = self._run(argv) if input_bytes is None else self._run(argv, input_bytes)
         for delay in BACKOFF:
             if not _retryable(rc, status):
                 break
             time.sleep(delay)
-            rc, status, body = self._run(argv)
+            rc, status, body = self._run(argv) if input_bytes is None else self._run(argv, input_bytes)
         if rc != 0 and status == 0:
             return 0, body  # network failure, never reached the hub
         return status, body
@@ -270,6 +283,27 @@ class Transport:
             return self._run_retry(argv)
         finally:
             Path(body_file).unlink(missing_ok=True)
+
+    def request(self, method: str, url: str, headers: dict[str, str] | None = None) -> tuple[int, str]:
+        """A bodyless request with the auth strategy attached — used for multipart create (POST
+        ?uploads) and abort (DELETE ?uploadId), which carry their inputs entirely in headers/query."""
+        argv = [*self._COMMON, "-X", method]
+        for k, v in (headers or {}).items():
+            argv += ["-H", f"{k}: {v}"]
+        argv += self.auth.curl_args()
+        argv.append(url)
+        return self._run_retry(argv)
+
+    def put_part(self, url: str, data: bytes, headers: dict[str, str] | None = None) -> tuple[int, str]:
+        """Upload one multipart part. The part bytes are piped to curl's stdin (`--data-binary @-`)
+        so a byte RANGE of the source file uploads without ever staging the whole file to a temp
+        copy — the caller reads exactly this part's slice with an offset/length read."""
+        argv = [*self._COMMON, "-X", "PUT", "--data-binary", "@-"]
+        for k, v in (headers or {}).items():
+            argv += ["-H", f"{k}: {v}"]
+        argv += self.auth.curl_args()
+        argv.append(url)
+        return self._run_retry(argv, input_bytes=data)
 
     def upload_batch(self, uploads: list["Upload"]) -> dict[str, int]:
         """Upload many files with parallel curl. Returns url -> http_code (0 = unknown).

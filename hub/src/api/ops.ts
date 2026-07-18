@@ -161,7 +161,10 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
         store,
         relpath,
         det: detect(store, relpath, machineId),
-        contentHash: obj.checksums?.sha256 ? hex(obj.checksums.sha256) : 'unknown',
+        // Every canonical object is written by a single put({sha256}) (simple PUT, or the multipart
+        // staging->canonical copy), so R2 carries a native checksum; 'unknown' only for a legacy
+        // pre-{sha256} object.
+        contentHash: objectSha256(obj) ?? 'unknown',
         mtime: obj.customMetadata?.mtime ?? null,
         size: obj.size,
       });
@@ -279,4 +282,15 @@ export function queueChunks<T>(messages: { body: T }[], sizeCap = 200_000): { bo
 
 export function hex(buf: ArrayBuffer): string {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * The sha256 (hex) an R2 canonical object hashes to, or undefined if it has no native checksum. EVERY
+ * object under raw/ is written by a single put({sha256}) — the simple PUT directly, the multipart path
+ * via its verified staging->canonical copy — so R2 records checksums.sha256 natively and this is a real
+ * verification of the stored bytes (not a trusted metadata string). A legacy object written before the
+ * PUT path set {sha256} simply returns undefined, which the callers treat as "can't verify → missing".
+ */
+export function objectSha256(obj: R2Object | null | undefined): string | undefined {
+  return obj?.checksums?.sha256 ? hex(obj.checksums.sha256) : undefined;
 }

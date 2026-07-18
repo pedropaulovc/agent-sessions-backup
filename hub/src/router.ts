@@ -1,5 +1,6 @@
 import { machineIdentity } from './auth/identity';
 import { checkFiles, putFile } from './api/upload';
+import { abortMultipart, completeMultipart, createMultipart, uploadPart } from './api/multipart';
 import { heartbeat, listMachines, reindex, status, usage } from './api/ops';
 import { search } from './api/search';
 import { getSession, getSessionRaw, listSessions } from './api/sessions';
@@ -34,13 +35,27 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
   const path = url.pathname;
   const method = request.method;
 
+  // /api/v1/files/check is a single path segment after files/ — it does NOT match the 3-capture
+  // file route below (which needs machine/store/relpath), so this ordering is unambiguous.
+  if (path === '/api/v1/files/check' && method === 'POST') return checkFiles(request, env, identity);
+
   const fileMatch = path.match(/^\/api\/v1\/files\/([^/]+)\/([^/]+)\/(.+)$/);
-  if (fileMatch && method === 'PUT') {
+  if (fileMatch) {
     const relpath = safeDecode(fileMatch[3]!);
     if (relpath === null) return Response.json({ error: 'bad_path' }, { status: 400 });
-    return putFile(request, env, identity, fileMatch[1]!, fileMatch[2]!, relpath);
+    const machineId = fileMatch[1]!;
+    const store = fileMatch[2]!;
+    const params = url.searchParams;
+    // Multipart upload for files over the collector's threshold (Cloudflare caps a single request
+    // body at 100MB — see multipart.ts). Same path, disambiguated by method + query:
+    //   POST ?uploads              -> open      PUT ?uploadId&partNumber -> part
+    //   POST ?uploadId             -> complete  DELETE ?uploadId         -> abort
+    if (method === 'POST' && params.has('uploads')) return createMultipart(request, env, identity, machineId, store, relpath);
+    if (method === 'PUT' && params.has('uploadId')) return uploadPart(request, env, identity, machineId, store, relpath, params);
+    if (method === 'POST' && params.has('uploadId')) return completeMultipart(request, env, identity, machineId, store, relpath, params);
+    if (method === 'DELETE' && params.has('uploadId')) return abortMultipart(env, identity, machineId, store, relpath, params);
+    if (method === 'PUT') return putFile(request, env, identity, machineId, store, relpath);
   }
-  if (path === '/api/v1/files/check' && method === 'POST') return checkFiles(request, env, identity);
   if (path === '/api/v1/heartbeat' && method === 'POST') return heartbeat(request, env, identity);
 
   // Read APIs: any enrolled machine (or dev identity) may query.

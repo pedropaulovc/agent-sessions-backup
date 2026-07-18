@@ -1,9 +1,9 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
 import { markPendingAndEnqueue } from '../queue';
-import { hex } from './ops';
+import { hex, objectSha256 } from './ops';
 
-const TERMINAL_PARSE_STATES = new Set(['parsed', 'skipped', 'superseded']);
+export const TERMINAL_PARSE_STATES = new Set(['parsed', 'skipped', 'superseded']);
 
 /** R2 customMetadata values must be strings, and the x-file-mtime header is optional — build the
  * {mtime} customMetadata object only when we actually have one to record. reindex() reads this
@@ -21,7 +21,7 @@ function r2MtimeMetadata(mtime: string | null): Record<string, string> | undefin
  * place. Returns whether a restamp was applied so BOTH resync paths can fold it into their
  * re-enqueue decision (a terminal-but-restamped row must still be requeued to finally index).
  * detect() is pure/cheap and only reached on a resync, never a steady-state upload. */
-async function restampIfStale(
+export async function restampIfStale(
   row: { id: number; parse_state: string; harness: string | null; session_id: string | null },
   store: string,
   relpath: string,
@@ -120,9 +120,10 @@ export async function putFile(
   // check below (see convergeR2WithRow) may need to re-PUT these exact bytes a second time if a
   // concurrent request's write interleaves with this one, and request.body is a single-use
   // stream — RAW.put already consumes it on the first PUT, so a second PUT needs its own copy.
-  // Uploads are small today (well under 35MB); the isolate's 128MB memory limit gives comfortable
-  // headroom — revisit (e.g. switch to a content-addressed key, avoiding the rewrite entirely) if
-  // upload sizes grow enough for this to matter.
+  // This simple path only runs for files under the collector's multipart threshold (default
+  // 90MB, kept below Cloudflare's 100MB request-body cap — see multipart.ts); the isolate's
+  // 128MB memory limit gives headroom. Larger files never reach here: the collector routes them
+  // through the streamed multipart path instead.
   const bodyBuf = await request.arrayBuffer();
   // R2 verifies the checksum server-side: a corrupt/truncated body never lands. Its returned
   // object's .size is the authoritative byte count — the x-file-size/content-length header
@@ -137,6 +138,49 @@ export async function putFile(
     return Response.json({ error: 'checksum_or_write_failure', detail: String(e) }, { status: 400 });
   }
 
+  return recordUploadedObject(env, {
+    machineId,
+    store,
+    relpath,
+    r2Key,
+    size: put.size,
+    mtime,
+    sha256,
+    existed: existing != null,
+    // Simple path only: pass the buffered body so recordUploadedObject can converge R2 against a
+    // concurrent same-path writer (see convergeR2WithRow). The multipart path passes null — it
+    // controls its own object and never races a second full-file writer for the same 100MB file.
+    convergeBody: bodyBuf,
+  });
+}
+
+/**
+ * Shared finalize for a raw object that has just landed in R2 (via the simple PUT or a completed
+ * multipart upload): upsert the files row, converge R2 against a concurrent same-path writer (simple
+ * path only), stamp last_upload, flip any owned session to 'parsing', enqueue the parse, and return
+ * the 201 stored response. Keeping this in ONE place is what makes a >=90MB multipart upload index
+ * byte-identically to a <90MB simple PUT — the only difference between the two paths is how the bytes
+ * reach R2, never what happens after.
+ */
+export async function recordUploadedObject(
+  env: Env,
+  opts: {
+    machineId: string;
+    store: string;
+    relpath: string;
+    r2Key: string;
+    size: number;
+    mtime: string | null;
+    sha256: string;
+    existed: boolean;
+    convergeBody: ArrayBuffer | null;
+    // Multipart path: there is no body to re-PUT, so converge on OBSERVED R2 state instead (see
+    // convergeMultipartRow). Two overlapping changed-hash completes for the same key can leave the
+    // D1 row describing bytes R2 no longer holds; this realigns the row to whatever object survived.
+    convergeObservedR2?: boolean;
+  },
+): Promise<Response> {
+  const { machineId, store, relpath, r2Key, size, mtime, sha256, existed, convergeBody } = opts;
   // machineId is required so machine-global files (history.jsonl, identical relpath fleet-wide)
   // get a machine-scoped session_id stamped on the row — otherwise canonical/recovery/parsing
   // queries (which look files up BY session_id) can't find them.
@@ -154,7 +198,7 @@ export async function putFile(
        uploaded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
      RETURNING id`,
   )
-    .bind(machineId, store, relpath, r2Key, put.size, mtime, sha256, det.harness, det.sessionId ?? null)
+    .bind(machineId, store, relpath, r2Key, size, mtime, sha256, det.harness, det.sessionId ?? null)
     .first<{ id: number }>();
 
   // Two overlapping changed-hash uploads for the SAME path can interleave their R2 writes and D1
@@ -167,8 +211,9 @@ export async function putFile(
   // request runs this exact same check on its own way out, so it (not us) owns convergence here.
   // Either way, a genuinely stale parse message is rejected at the source by the consumer's
   // content_hash guard, so no reparse can process the wrong bytes even in the brief window before
-  // convergence completes.
-  await convergeR2WithRow(row!.id, r2Key, sha256, bodyBuf, env);
+  // convergence completes. The multipart path passes convergeBody=null (no concurrent full-file
+  // writer to race, and it never buffers the whole object) and skips this.
+  if (convergeBody !== null) await convergeR2WithRow(row!.id, r2Key, sha256, convergeBody, env);
 
   await env.DB.prepare('UPDATE machines SET last_upload_at = strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE machine_id = ?1')
     .bind(machineId)
@@ -193,12 +238,66 @@ export async function putFile(
     // dropped, the sessions are visibly stuck 'parsing' — alertable — instead of silently stale).
     await flipOwnedSessionsToParsing(row!.id, null, sha256, env);
   }
-  await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
+  // Enqueue the parse — but for the multipart path, converge FIRST so we never send a message that
+  // describes bytes R2 no longer holds. Two racing completes for one path can leave this row's upsert
+  // winning D1 while R2 ends up holding the OTHER upload's object; convergeMultipartRow detects that,
+  // realigns the row to the surviving object, and enqueues a parse for ITS hash. Sending our own
+  // sha256 message FIRST (the old order) could let the consumer parse the other object's bytes under
+  // our hash before convergence repaired the row — or forever, if convergence threw mid-way. So:
+  //   - convergence realigned + enqueued -> DON'T also send the stale-sha message (exactly one msg);
+  //   - convergence made no change (no race / R2 already matches) -> send our hash as usual;
+  //   - convergence threw -> nothing sent at all; the queue retry / next complete repairs it (that's
+  //     the point of ordering converge ahead of the send).
+  // The simple path has no observed-R2 convergence (convergeR2WithRow above only restores bytes, never
+  // changes the row hash), so realigned is always false there and it enqueues our hash.
+  const realigned = opts.convergeObservedR2 === true && (await convergeMultipartRow(row!.id, r2Key, sha256, env));
+  if (!realigned) {
+    await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
+  }
 
   console.log(
-    JSON.stringify({ event: 'access.upload', machine: machineId, key: r2Key, bytes: put.size, status: existing ? 'updated' : 'created' }),
+    JSON.stringify({ event: 'access.upload', machine: machineId, key: r2Key, bytes: size, status: existed ? 'updated' : 'created' }),
   );
   return Response.json({ status: 'stored', file_id: row!.id }, { status: 201 });
+}
+
+/**
+ * Multipart analog of convergeR2WithRow. The simple path re-PUTs its buffered body to restore R2 when
+ * a concurrent same-path writer clobbered it; a multipart complete has no body to re-PUT, so instead
+ * it aligns D1 to whatever object actually survived in R2. Two overlapping changed-hash completes for
+ * the same key each write their object then upsert their row; the R2-last-writer and D1-last-writer
+ * can differ, leaving files.content_hash describing bytes R2 no longer holds. After our own upsert we
+ * HEAD the key: if it still carries THIS complete's hash (we are the current D1 owner) but R2 holds a
+ * DIFFERENT object (identified by its native checksums.sha256), realign the row to the R2 hash and
+ * enqueue a parse for it. Guarded on our own hash so the OTHER writer — which runs this same check —
+ * owns convergence once its upsert wins the row. Exported for tests, which drive the interleaved end
+ * state directly (row hash == ours, R2 object == the other writer's) the same way convergeR2WithRow does.
+ *
+ * Returns true when it realigned the row (and enqueued a parse for the observed R2 hash), false when
+ * there was nothing to realign. recordUploadedObject runs this BEFORE its own parse-queue send and,
+ * on a true return, SKIPS that send — so a realigned row is parsed under the R2 hash exactly once and
+ * the stale-sha message is never emitted at all (not merely rejected later by the consumer guard).
+ */
+export async function convergeMultipartRow(fileId: number, r2Key: string, sha256: string, env: Env): Promise<boolean> {
+  const row = await env.DB.prepare('SELECT content_hash FROM files WHERE id = ?1').bind(fileId).first<{ content_hash: string }>();
+  if (row?.content_hash !== sha256) return false; // another writer's upsert won; they own convergence
+  const head = await env.RAW.head(r2Key);
+  const r2Hash = objectSha256(head);
+  // No object (a concurrent delete) or R2 already matches our row: nothing to realign.
+  if (!r2Hash || r2Hash === sha256) return false;
+  // R2 holds a different upload's object. Point the row at what R2 actually holds and reparse it.
+  // Realign size too (from head.size): chooseCanonical orders duplicates by `size DESC`, so a stale
+  // size from the losing upload would corrupt canonical selection and leave metadata for the wrong object.
+  const mtime = head!.customMetadata?.mtime ?? null;
+  const updated = await env.DB.prepare(
+    "UPDATE files SET content_hash = ?2, mtime = ?3, size = ?4, parse_state = 'pending', parse_error = NULL WHERE id = ?1 AND content_hash = ?5 RETURNING id",
+  )
+    .bind(fileId, r2Hash, mtime, head!.size, sha256)
+    .first<{ id: number }>();
+  if (!updated) return false; // lost the row to the other writer in the meantime
+  await env.PARSE_QUEUE.send({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: r2Hash });
+  console.log(JSON.stringify({ event: 'access.multipart_converge', key: r2Key, from: sha256, to: r2Hash }));
+  return true;
 }
 
 /**
@@ -301,8 +400,10 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
     const heads = await Promise.all(
       [...have.values()].map(async (r): Promise<[number, boolean]> => {
         const obj = await env.RAW.head(r.r2_key);
-        const checksum = obj?.checksums.sha256 ? hex(obj.checksums.sha256) : undefined;
-        return [r.id, checksum === r.content_hash];
+        // objectSha256 reads R2's native checksum, present on every canonical object (simple PUT and
+        // the multipart staging->canonical copy both use put({sha256})) — a real verification of the
+        // stored bytes. A missing object, a legacy no-checksum object, or a mismatch all report missing.
+        return [r.id, objectSha256(obj) === r.content_hash];
       }),
     );
     const objectVerified = new Map(heads);

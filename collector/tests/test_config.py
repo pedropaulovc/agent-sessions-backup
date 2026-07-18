@@ -48,6 +48,49 @@ def test_enroll_mtls_without_paths_errors(tmp_path):
         config.enroll("http://x", dev=False, path=tmp_path / "c.toml")
 
 
+def _write_config(path, extra=""):
+    path.write_text('machine_id = "m1"\nhub_url = "http://h"\nauth = "dev"\n' + extra)
+
+
+def test_load_rejects_threshold_below_part_floor(tmp_path):
+    # A threshold below R2's 5MiB part floor is also below the part-size ceiling, so no legal part
+    # could ever be sent — reject at load with a clear message rather than fail on the wire.
+    path = tmp_path / "config.toml"
+    _write_config(path, "multipart_threshold_mb = 3\n")  # 3 MB < 5 MiB
+    with pytest.raises(ValueError, match="minimum part size"):
+        config.load(path)
+
+
+def test_load_clamps_threshold_above_edge_cap(tmp_path, capsys):
+    # A threshold above the safe sub-100MB ceiling would route cap..threshold files to the doomed
+    # simple PUT (413 at the edge); clamp down and warn.
+    path = tmp_path / "config.toml"
+    _write_config(path, "multipart_threshold_mb = 250\n")
+    cfg = config.load(path)
+    assert cfg.multipart_threshold_bytes <= config.MAX_MULTIPART_THRESHOLD_BYTES
+    assert "clamping" in capsys.readouterr().err
+
+
+def test_load_clamps_part_size_below_floor(tmp_path, capsys):
+    # A configured part size below the 5MiB floor would make the hub reject every non-final part;
+    # clamp up to the floor and warn.
+    path = tmp_path / "config.toml"
+    _write_config(path, "multipart_threshold_mb = 90\nmultipart_part_size_mb = 1\n")  # 1 MB < 5 MiB
+    cfg = config.load(path)
+    assert cfg.multipart_part_size_bytes >= config.MIN_PART_SIZE_BYTES
+    assert "clamping" in capsys.readouterr().err
+
+
+def test_load_accepts_default_multipart_config_without_warning(tmp_path, capsys):
+    # The stock 90MB/64MiB config passes through untouched and silent.
+    path = tmp_path / "config.toml"
+    _write_config(path)
+    cfg = config.load(path)
+    assert cfg.multipart_threshold_mb == config.DEFAULT_MULTIPART_THRESHOLD_MB
+    assert cfg.multipart_part_size_mb == config.DEFAULT_MULTIPART_PART_SIZE_MB
+    assert "clamp" not in capsys.readouterr().err
+
+
 def test_enroll_mtls_roundtrip(tmp_path):
     path = tmp_path / "config.toml"
     cert = tmp_path / "box.client.pem"
