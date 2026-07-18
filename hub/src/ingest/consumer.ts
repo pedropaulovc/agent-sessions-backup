@@ -19,20 +19,24 @@ interface FileRow {
 
 export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: Env): Promise<void> {
   // The ~1000-D1-queries cap is per INVOCATION, and one invocation delivers a whole batch (wrangler
-  // max_batch_size:5). An export slice issues ~500 queries, so 2+ export slices in the same batch would
-  // breach the cap — the same 1101 class this PR fixes. Cap it: process at most ONE export slice per
-  // invocation; any further export messages are retried untouched so they redeliver in a later
-  // invocation. Non-export messages are cheap and always process.
-  let exportBudget = 1;
+  // max_batch_size:5). An export slice issues up to ~QUERY_BUDGET queries, so 2+ export slices in the
+  // same batch would breach the cap — the same 1101 class this PR fixes. Cap it at ONE export slice per
+  // invocation; further export messages are retried untouched to redeliver later. RESERVE the budget the
+  // moment we SEE an export message (detected cheaply from the r2 key, no DB read) — not after a
+  // successful parse — so a slice that throws AFTER doing work (e.g. a continuation-send failure) still
+  // can't leave the budget open for a second export slice this invocation. Non-export messages are cheap.
+  let exportBudgetSpent = false;
   for (const msg of batch.messages) {
     try {
-      const outcome = await parseOne(msg.body, env, exportBudget > 0);
-      if (outcome === 'export-deferred') {
-        // No export budget left this invocation — leave the row untouched and redeliver.
-        msg.retry();
-        continue;
+      if (isExportArchiveKey(msg.body.r2_key)) {
+        if (exportBudgetSpent) {
+          // Already ran an export slice this invocation — leave this row untouched and redeliver.
+          msg.retry();
+          continue;
+        }
+        exportBudgetSpent = true; // reserve on ATTEMPT, before any work
       }
-      if (outcome === 'export-processed') exportBudget = 0;
+      await parseOne(msg.body, env);
       msg.ack();
     } catch (e) {
       console.log(JSON.stringify({ event: 'parse.error', file_id: msg.body.file_id, error: String(e) }));
@@ -111,15 +115,22 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
   }
 }
 
-type ParseOutcome = 'export-processed' | 'export-deferred' | undefined;
+/** Cheap export-archive detection straight from the queue message's r2 key (raw/{machine}/{store}/
+ * {relpath...}) — lets consumeParseBatch reserve the one-export-slice-per-invocation budget BEFORE any
+ * DB read or parse, so a slice that throws after doing work can't free the budget for a second slice. */
+function isExportArchiveKey(r2Key: string): boolean {
+  const parts = r2Key.split('/');
+  if (parts.length < 4 || parts[0] !== 'raw') return false;
+  return detect(parts[2]!, parts.slice(3).join('/')).kind === 'export-archive';
+}
 
-async function parseOne(job: ParseMessage, env: Env, allowExport: boolean): Promise<ParseOutcome> {
+async function parseOne(job: ParseMessage, env: Env): Promise<void> {
   const file = await env.DB.prepare(
     'SELECT id, machine_id, store, relpath, r2_key, size, mtime, harness, session_id, content_hash FROM files WHERE id = ?1',
   )
     .bind(job.file_id)
     .first<FileRow>();
-  if (!file) return undefined;
+  if (!file) return;
 
   // Reject a stale message at the source, before any R2 read or write: if this row's
   // content_hash has already moved on from what this message was enqueued for, a re-upload beat
@@ -142,11 +153,9 @@ async function parseOne(job: ParseMessage, env: Env, allowExport: boolean): Prom
     return;
   }
   if (det.kind === 'export-archive') {
-    // At most one export slice per invocation (see consumeParseBatch) — decline and let the caller
-    // retry this message rather than running a second ~500-query slice in the same invocation.
-    if (!allowExport) return 'export-deferred';
+    // The one-export-slice-per-invocation budget is reserved by consumeParseBatch before we get here.
     await parseExportInto(file, env, job.reason, job.content_hash, job.offset ?? 0);
-    return 'export-processed';
+    return;
   }
   if (!det.sessionId || !SINGLE_SESSION_HARNESSES.has(det.harness)) {
     await markParsed(file.id, env, 'skipped', undefined, undefined, job.content_hash);
@@ -354,14 +363,19 @@ async function failExportFile(file: FileRow, env: Env, contentHash: string | und
   console.log(JSON.stringify({ event: 'parse.export.error', file_id: file.id, error: reason, owned_errored: owned.results.length }));
 }
 
-// An export ZIP fans out to one writeSession per conversation, ~5 D1 queries each. Writing all of a
-// large archive (the prod trigger: 783 conversations) in one consumer invocation blows the ~1000
-// D1-queries-per-invocation cap — and the original code marked the file 'parsed' AFTER an unbounded
-// write loop, so a run that silently stopped short still ended 'parsed' with a partial index: a
-// silent data gap. We bound each invocation to this many conversations and re-enqueue a continuation
-// (offset advanced) until the last slice, which alone marks 'parsed' and runs cleanup. 100 × ~5 ≈ 500
-// queries/invocation, comfortably under the cap even for conversations heavier than the ~5-query mean.
-export const EXPORT_CONVERSATIONS_PER_INVOCATION = 100;
+// An export ZIP fans out to one writeSession per conversation. Writing all of a large archive (the prod
+// trigger: 783 conversations) in one consumer invocation blows the ~1000 D1-queries-per-invocation cap
+// — and the original code marked the file 'parsed' AFTER an unbounded write loop, so a run that silently
+// stopped short still ended 'parsed' with a partial index: a silent data gap. We slice each invocation
+// and re-enqueue a continuation (offset advanced) until the last slice, which alone marks 'parsed' and
+// runs cleanup. The slice is bounded by ACTUAL D1 work, not conversation count: ~5 queries/conversation
+// is only the MEAN — a chatty conversation with thousands of blocks fans out to many insert batches — so
+// we accumulate writeSession's real query count against EXPORT_QUERY_BUDGET and cut the slice when it's
+// spent. EXPORT_MAX_CONVERSATIONS_PER_SLICE caps the count too (bounds the all-skips case, where each
+// conversation still costs one lookup query). A single conversation heavier than the whole budget still
+// processes alone in its own invocation.
+export const EXPORT_QUERY_BUDGET = 500;
+export const EXPORT_MAX_CONVERSATIONS_PER_SLICE = 100;
 
 async function parseExportInto(file: FileRow, env: Env, reason: ParseMessage['reason'], contentHash?: string, offset = 0): Promise<void> {
   const obj = await env.RAW.get(file.r2_key);
@@ -413,39 +427,59 @@ async function parseExportInto(file: FileRow, env: Env, reason: ParseMessage['re
   // capture). A conversation present in the new archive but now parsing to zero turns is
   // deliberately NOT kept, so its stale rows get cleared below (same as the single-session
   // empty-parse path).
-  // Process only this invocation's bounded slice of conversations (see EXPORT_CONVERSATIONS_PER_INVOCATION).
-  const sliceEnd = Math.min(offset + EXPORT_CONVERSATIONS_PER_INVOCATION, archive.sessions.length);
-  const isFinalSlice = sliceEnd >= archive.sessions.length;
+  // Process a slice of conversations starting at `offset`, bounded by BOTH the query budget (actual D1
+  // work) and the conversation-count cap. `sliceEnd` is the ACTUAL position reached — the continuation
+  // resumes there, not at a fixed offset+N. The whole loop is wrapped so ANY throw mid-slice (an
+  // unexpectedly huge conversation hitting the cap, a transient D1 error, a bug) reverts this slice's
+  // already-written sessions before rethrowing — never leaving them 'ready' over an archive we can't finish.
+  const maxEnd = Math.min(offset + EXPORT_MAX_CONVERSATIONS_PER_SLICE, archive.sessions.length);
   const written = new Set<string>();
-  for (const session of archive.sessions.slice(offset, sliceEnd)) {
-    if (session.turns.length === 0) continue;
-    const existing = await env.DB.prepare(
-      `SELECT f.store, f.parse_state AS canon_state, s.index_state, s.canonical_file_id
-       FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
-    )
-      .bind(session.id)
-      .first<{ store: string; canon_state: string; index_state: string; canonical_file_id: number }>();
-    // Skip only a HEALTHY live capture: a chatgpt-web/claude-web canonical whose index_state is
-    // 'ready'. If that live session is instead 'error'/'parsing' (or absent), let this export write
-    // RECOVER it — export archive rows carry files.session_id = NULL, so chooseRecoveryCandidate()
-    // can never see this backfill copy, and re-skipping would strand the session empty/errored
-    // despite a usable export. A later successful web reparse (canonical = its own file) overwrites
-    // this export-written row again, so the live capture still wins once it is healthy.
-    const healthyLiveCapture =
-      existing && (existing.store === 'chatgpt-web' || existing.store === 'claude-web') && existing.index_state === 'ready';
-    if (healthyLiveCapture) continue;
-    // A reason='recover' parse fills GAPS: it must only CLAIM orphaned/broken sessions, never
-    // clobber one already healthily owned by a DIFFERENT (e.g. newer) archive. The recover fan-out
-    // re-enqueues every sibling archive without knowing WHICH conversation was lost, so an older
-    // archive's stale copy of a still-healthy conversation would otherwise overwrite it. Generalize
-    // the healthy-web-capture skip: skip any conversation whose live session is 'ready' and
-    // canonically owned by another non-error file. (An 'upload'/'reindex' parse still wins normally.)
-    const healthyOtherOwner =
-      existing && existing.index_state === 'ready' && existing.canonical_file_id !== file.id && existing.canon_state !== 'error';
-    if (reason === 'recover' && healthyOtherOwner) continue;
-    await writeSession(session, file, env);
-    written.add(session.id);
+  let spent = 0;
+  let idx = offset;
+  try {
+    for (; idx < maxEnd; idx++) {
+      const session = archive.sessions[idx]!;
+      if (session.turns.length === 0) continue; // empty conversation: consumed at zero D1 cost, cleared by cleanup
+      const existing = await env.DB.prepare(
+        `SELECT f.store, f.parse_state AS canon_state, s.index_state, s.canonical_file_id
+         FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
+      )
+        .bind(session.id)
+        .first<{ store: string; canon_state: string; index_state: string; canonical_file_id: number }>();
+      spent += 1; // the ownership lookup above
+      // Skip only a HEALTHY live capture: a chatgpt-web/claude-web canonical whose index_state is
+      // 'ready'. If that live session is instead 'error'/'parsing' (or absent), let this export write
+      // RECOVER it — export archive rows carry files.session_id = NULL, so chooseRecoveryCandidate()
+      // can never see this backfill copy, and re-skipping would strand the session empty/errored
+      // despite a usable export. A later successful web reparse (canonical = its own file) overwrites
+      // this export-written row again, so the live capture still wins once it is healthy.
+      const healthyLiveCapture =
+        existing && (existing.store === 'chatgpt-web' || existing.store === 'claude-web') && existing.index_state === 'ready';
+      if (healthyLiveCapture) continue;
+      // A reason='recover' parse fills GAPS: it must only CLAIM orphaned/broken sessions, never
+      // clobber one already healthily owned by a DIFFERENT (e.g. newer) archive. The recover fan-out
+      // re-enqueues every sibling archive without knowing WHICH conversation was lost, so an older
+      // archive's stale copy of a still-healthy conversation would otherwise overwrite it. Generalize
+      // the healthy-web-capture skip: skip any conversation whose live session is 'ready' and
+      // canonically owned by another non-error file. (An 'upload'/'reindex' parse still wins normally.)
+      const healthyOtherOwner =
+        existing && existing.index_state === 'ready' && existing.canonical_file_id !== file.id && existing.canon_state !== 'error';
+      if (reason === 'recover' && healthyOtherOwner) continue;
+      spent += await writeSession(session, file, env);
+      written.add(session.id);
+      // Cut once the query budget is spent — but only AFTER writing this conversation, so a single
+      // over-budget conversation still makes progress alone rather than looping forever.
+      if (spent >= EXPORT_QUERY_BUDGET) {
+        idx++;
+        break;
+      }
+    }
+  } catch (e) {
+    await revertSlice(written, env);
+    throw e;
   }
+  const sliceEnd = idx;
+  const isFinalSlice = sliceEnd >= archive.sessions.length;
 
   // Post-write hash recheck (mirrors the pre-write guard, but covers the window DURING this slice's
   // writes): a re-upload landing after the pre-check but before here changed this row's bytes, so the
@@ -722,8 +756,11 @@ async function revertSlice(written: Set<string>, env: Env): Promise<void> {
   for (const chunk of chunkArr(stmts, 90)) await env.DB.batch(chunk);
 }
 
-/** Replace a session's index rows atomically-enough: FTS delete → blocks delete → reinsert → FTS rebuild from blocks. */
-async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Promise<void> {
+/** Replace a session's index rows atomically-enough: FTS delete → blocks delete → reinsert → FTS
+ * rebuild from blocks. Returns the number of D1 queries it issued (one per batch/first call) so the
+ * export slicer can budget by ACTUAL D1 work — a chatty conversation with thousands of blocks fans out
+ * to many insert batches and costs far more than the ~5-query mean. */
+async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Promise<number> {
   const db = env.DB;
 
   await db.batch([
@@ -824,7 +861,8 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
     }
   }
 
-  for (const chunk of chunkArr(stmts, 90)) await db.batch(chunk);
+  const insertChunks = chunkArr(stmts, 90);
+  for (const chunk of insertChunks) await db.batch(chunk);
 
   const machine = await db
     .prepare('SELECT os FROM machines WHERE machine_id = ?1')
@@ -888,6 +926,9 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
       )
       .bind(s.id),
   ]);
+
+  // 1 (delete batch) + N insert batches + 1 (machine SELECT) + 1 (session+FTS batch).
+  return 3 + insertChunks.length;
 }
 
 function chunkArr<T>(arr: T[], n: number): T[][] {
