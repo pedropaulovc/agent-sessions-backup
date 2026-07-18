@@ -148,6 +148,44 @@ def test_store_roots_always_includes_webcapture_stores(tmp_path):
     assert str(custom.store_roots()["export-inbox"]) == "/custom/inbox"
 
 
+def test_hermetic_by_construction_never_resolves_real_data_dir(tmp_path, monkeypatch):
+    """Positive control for the isolate_xdg_data_home autouse fixture (conftest.py). Plants a
+    decoy in a stand-in for this box's real ~/.local/share/agent-collector/webcapture/ (a
+    fake $HOME, never the actual real one) and proves a plain Config — built the same minimal
+    way every test's _cfg()-style helper does, with no explicit webcapture stores or
+    staging_base — still never resolves store_roots() into it, and a Scanner walk over the
+    resolved roots never sees the decoy.
+
+    Deliberately does NOT touch XDG_DATA_HOME itself: the autouse fixture already set it for
+    this test like every other, and that's what's under test here. If isolate_xdg_data_home
+    were ever removed from conftest.py, this test would start resolving into `fake_home`
+    (data_dir() falls back to $HOME when XDG_DATA_HOME is unset) and fail — exactly the
+    regression that let 4 tests in test_run.py pick up this box's real export ZIPs.
+    """
+    fake_home = tmp_path / "fake-real-home"
+    decoy_dir = fake_home / ".local" / "share" / "agent-collector" / "webcapture" / "export-inbox"
+    decoy_dir.mkdir(parents=True)
+    (decoy_dir / "DECOY-real-export.zip").write_bytes(b"not synthetic test data")
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    cfg = config.Config(machine_id="m", hub_url="http://h", stores={"claude": str(tmp_path / "claude")})
+    roots = cfg.store_roots()
+    assert "DECOY" not in str(roots["export-inbox"])
+    assert decoy_dir not in roots["export-inbox"].parents
+    assert roots["export-inbox"] != decoy_dir
+
+    from agent_collector.scanner import Scanner
+
+    found = []
+    with Scanner(cfg.effective_excludes()) as sc:
+        for store, root in roots.items():
+            if not root.exists():
+                continue
+            for item in sc.scan_store(store, root):
+                found.append((store, item.relpath))
+    assert not any("DECOY" in relpath for _store, relpath in found)
+
+
 def test_run_scans_a_dropped_export_zip_without_explicit_registration(tmp_env):
     # Round 6 Fix 2 (end-to-end at the scan layer): a config that never registered export-inbox still
     # scans a ZIP dropped into the default inbox, because store_roots() injects it.
