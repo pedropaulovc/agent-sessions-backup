@@ -720,6 +720,48 @@ describe('R2/D1 convergence after overlapping changed-hash uploads for the same 
     const searchBody = (await search.json()) as { hits: Array<{ session_id: string }> };
     expect(searchBody.hits.some((h) => h.session_id === CONVERGE_SESSION_ID)).toBe(true);
   });
+
+  it('a stale same-hash restore does NOT clobber R2 after a changed-hash upload advanced the row + converged R2 (round 11)', async () => {
+    // The finding: a same-hash retry of the OLD bytes can reach its restore after a concurrent
+    // changed-hash upload already advanced files.content_hash and converged R2 to the NEW bytes. The
+    // same-hash branch now routes its restore through convergeR2WithRow (below is exactly the call it
+    // makes), whose content_hash guard makes the write a no-op once the row no longer carries the
+    // restore's hash — so R2 keeps the NEW bytes instead of being clobbered with the old body.
+    const SID = 'f0000000-0000-4000-8000-0000000000e1';
+    const relpath = `converge-samehash/${SID}.jsonl`;
+    const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
+    const NEW = `${ccUserLine({ uuid: 'sh-new', text: 'winner new body marker' })}\n`;
+    const OLD = `${ccUserLine({ uuid: 'sh-old', text: 'stale old body marker' })}\n`;
+
+    // Winner already landed: the row shows NEW's hash and R2 holds NEW's bytes.
+    const res = await putFile('claude-projects', relpath, NEW);
+    expect(res.status).toBe(201);
+    const fileId = ((await res.json()) as { file_id: number }).file_id;
+    expect(await (await testEnv.RAW.get(r2Key))?.text()).toBe(NEW);
+
+    // The stale same-hash restore attempt: its bytes+hash are OLD, but the row now shows NEW.
+    const oldHash = await sha256Hex(new TextEncoder().encode(OLD));
+    const wrote = await convergeR2WithRow(fileId, r2Key, oldHash, new TextEncoder().encode(OLD).buffer as ArrayBuffer, testEnv);
+    expect(wrote).toBe(false); // guard bailed — did not write the old body
+    expect(await (await testEnv.RAW.get(r2Key))?.text()).toBe(NEW); // NEW bytes preserved
+  });
+
+  it('a same-hash re-upload still restores a corrupt R2 object via the guarded convergence path (round 11)', async () => {
+    // The guard must not break the legitimate restore: when the row DOES still own the bytes and R2 is
+    // missing/corrupt, a same-hash re-upload repairs R2 (restored: true) through the same path.
+    const SID = 'f0000000-0000-4000-8000-0000000000e2';
+    const relpath = `converge-samehash/${SID}.jsonl`;
+    const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
+    const CONTENT = `${ccUserLine({ uuid: 'sh-r', text: 'restore me marker' })}\n`;
+    expect((await putFile('claude-projects', relpath, CONTENT)).status).toBe(201);
+
+    // Corrupt R2 out-of-band (row still shows the correct hash): the object's checksum no longer matches.
+    await testEnv.RAW.put(r2Key, new TextEncoder().encode('corrupt garbage bytes'));
+    const res2 = await putFile('claude-projects', relpath, CONTENT);
+    const body2 = (await res2.json()) as { status: string; restored?: boolean };
+    expect(body2.restored).toBe(true);
+    expect(await (await testEnv.RAW.get(r2Key))?.text()).toBe(CONTENT); // correct bytes back in R2
+  });
 });
 
 describe('failed reparse surfaces as session index_state=error', () => {

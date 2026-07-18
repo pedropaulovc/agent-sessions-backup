@@ -80,23 +80,26 @@ export async function putFile(
     // whether this unchanged upload still needs a re-enqueue.
     const restamped = await restampIfStale(existing, store, relpath, machineId, env);
     // A matching hash normally means nothing to do — but the raw R2 object can be lost, missing,
-    // OR CORRUPT (present at the key with the wrong bytes — e.g. a bad manual restore outside
-    // this API) independent of parse_state, even for a row already 'parsed'. Head it on every
-    // same-hash resync, not just non-terminal ones, and compare R2's own sha256 checksum against
-    // existing.content_hash: restore from the request body on absence OR mismatch/missing
-    // checksum, mirroring the same verification files/check does. This path only fires on a
-    // resync (not steady-state uploads), so the extra R2 op is cheap relative to leaving /raw and
-    // normalized session loads permanently reading wrong or missing bytes.
+    // OR CORRUPT (present at the key with the wrong bytes — e.g. a bad manual restore outside this
+    // API) independent of parse_state, even for a row already 'parsed'. Restore from the request
+    // body on absence OR checksum mismatch, mirroring files/check's verification. Route it through
+    // convergeR2WithRow (same idiom the changed-hash path uses on its way out) so the restore is
+    // HASH-GUARDED: a stale same-hash retry of OLD bytes that raced a changed-hash upload which
+    // already advanced the row + converged R2 to the new bytes bails instead of clobbering R2 with
+    // the old body. This path only fires on a resync (not steady-state uploads), so buffering the
+    // body + the extra R2 op is cheap relative to leaving /raw and session loads reading wrong bytes.
     let restored = false;
-    const head = await env.RAW.head(existing.r2_key);
-    const headChecksum = head?.checksums.sha256 ? hex(head.checksums.sha256) : undefined;
-    if (!head || headChecksum !== existing.content_hash) {
-      try {
-        await env.RAW.put(existing.r2_key, request.body, { sha256, customMetadata: r2MtimeMetadata(mtime) });
-      } catch (e) {
-        return Response.json({ error: 'checksum_or_write_failure', detail: String(e) }, { status: 400 });
-      }
-      restored = true;
+    let bodyBuf: ArrayBuffer;
+    try {
+      bodyBuf = await request.arrayBuffer();
+    } catch (e) {
+      return Response.json({ error: 'body_read_failure', detail: String(e) }, { status: 400 });
+    }
+    try {
+      restored = await convergeR2WithRow(existing.id, existing.r2_key, existing.content_hash, bodyBuf, env);
+    } catch (e) {
+      // R2 rejects a body whose bytes don't match the declared sha256 (corrupt/truncated retry).
+      return Response.json({ error: 'checksum_or_write_failure', detail: String(e) }, { status: 400 });
     }
     // A non-terminal state (a dropped/failed queue message) never finished indexing in the
     // first place; a just-restored object needs its (possibly different) bytes revalidated even
@@ -238,15 +241,21 @@ export async function flipOwnedSessionsToParsing(
     .run();
 }
 
-export async function convergeR2WithRow(fileId: number, r2Key: string, sha256: string, body: ArrayBuffer, env: Env): Promise<void> {
+// Returns whether it (re)wrote R2. The `content_hash !== sha256` guard is load-bearing for BOTH
+// callers: a changed-hash upload converging on its way out, AND a same-hash restore — a stale
+// same-hash retry of OLD bytes that raced a changed-hash upload which already advanced the row and
+// converged R2 to the new bytes must NOT write the old body back (the row no longer carries its
+// hash), or R2 would serve old content while D1 claims the new hash.
+export async function convergeR2WithRow(fileId: number, r2Key: string, sha256: string, body: ArrayBuffer, env: Env): Promise<boolean> {
   const current = await env.DB.prepare('SELECT content_hash, mtime FROM files WHERE id = ?1')
     .bind(fileId)
     .first<{ content_hash: string; mtime: string | null }>();
-  if (current?.content_hash !== sha256) return;
+  if (current?.content_hash !== sha256) return false;
   const head = await env.RAW.head(r2Key);
   const headChecksum = head?.checksums.sha256 ? hex(head.checksums.sha256) : undefined;
-  if (headChecksum === sha256) return;
+  if (headChecksum === sha256) return false;
   await env.RAW.put(r2Key, body, { sha256, customMetadata: r2MtimeMetadata(current.mtime) });
+  return true;
 }
 
 /** POST /api/v1/files/check — batch resync: which of these does the hub NOT have? */
