@@ -98,11 +98,14 @@ async function getClientCertStatus(env: Env, certId: string): Promise<CertStatus
  * derive every stored fp. Closes the garbage-in case where a wrong/foreign id would later be revoked in
  * place of the real cert.
  *
+ * Returns the fp AND the CA status (same object), so the caller can require an ACTIVE cert — a fp match on
+ * a cert already pending_revocation/revoked must not be attached.
+ *
  * result.certificate is the PEM: verified against the CF API docs + the sign-response shape (enroll-cert.sh
  * has always read result.certificate from this same object). No token exists to probe the live GET until
  * CF_CLIENT_CERT_TOKEN is minted post-merge (USER ACTIONS) — live-verify on first post-merge use. Fails
  * closed regardless: an absent/renamed field → 'unknown' → 422 (attach refused), never a lockout or leak. */
-export async function getClientCertFingerprint(env: Env, certId: string): Promise<string | 'not_found' | 'unknown'> {
+export async function getClientCertFingerprint(env: Env, certId: string): Promise<{ fp: string; status: CertStatus } | 'not_found' | 'unknown'> {
   let res: Response;
   try {
     res = await fetch(
@@ -115,10 +118,10 @@ export async function getClientCertFingerprint(env: Env, certId: string): Promis
   }
   reportCfAuthFailure(res, 'status', certId);
   if (res.status === 404) return 'not_found';
-  const data = (await res.json().catch(() => ({}))) as { success?: boolean; result?: { certificate?: string } };
-  if (!data.success || !data.result?.certificate) return 'unknown';
+  const data = (await res.json().catch(() => ({}))) as { success?: boolean; result?: { certificate?: string; status?: CertStatus } };
+  if (!data.success || !data.result?.certificate || !data.result.status) return 'unknown';
   try {
-    return await certFingerprint(data.result.certificate);
+    return { fp: await certFingerprint(data.result.certificate), status: data.result.status };
   } catch {
     return 'unknown';
   }

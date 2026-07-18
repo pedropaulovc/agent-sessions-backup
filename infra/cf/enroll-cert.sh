@@ -69,6 +69,11 @@ mkdir -p "$OUT_DIR"
 KEY="$OUT_DIR/${MACHINE_ID}.client.key"
 CSR="$OUT_DIR/${MACHINE_ID}.client.csr"
 CRT="$OUT_DIR/${MACHINE_ID}.client.pem"
+# The signed cert is written to this TEMP path and moved into $CRT only once enrollment is VERIFIED. A
+# re-run on an already-enrolled machine aborts + revokes below, and must not clobber the working PEM the
+# collector is still presenting. ($KEY is reused when it already exists, so the working key/cert pair
+# survives an aborted re-enroll intact.)
+CRT_TMP="$CRT.new"
 
 echo "==> generating software EC P-256 key + CSR (WSL2/no-TPM fallback)"
 umask 077
@@ -88,7 +93,7 @@ resp="$(curl -sS -X POST "$API/zones/$ZONE_ID/client_certificates" \
 # Capture the CA client-certificate id (CERT_ID). The hub stores it in machines.cert_id and uses it
 # as the handle to REVOKE the cert on rotation/prune — so it MUST be recorded here, or every cert
 # this script enrolls looks like a legacy unknown-id row and leaks its first rotated cert.
-CERT_ID="$(python3 - "$resp" "$CRT" <<'PY'
+CERT_ID="$(python3 - "$resp" "$CRT_TMP" <<'PY'
 import json,sys
 d=json.loads(sys.argv[1])
 if not d.get("success"):
@@ -191,8 +196,9 @@ print_install_steps() {
 # returned success but a certificate openssl can't parse, this pipeline fails AFTER the mint — revoke the
 # unused cert before aborting (the shell twin of the hub's post-sign certFingerprint guard), rather than
 # leaking a live-but-unregistered cert under set -e. revoke_unused_cert is defined above and uses CERT_ID.
-if ! FP="$(openssl x509 -in "$CRT" -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}')" || [ -z "$FP" ]; then
+if ! FP="$(openssl x509 -in "$CRT_TMP" -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}')" || [ -z "$FP" ]; then
   echo "    could not fingerprint the signed certificate — Cloudflare returned a cert openssl can't parse." >&2
+  rm -f "$CRT_TMP"
   revoke_unused_cert
   exit 1
 fi
@@ -222,19 +228,23 @@ if npx --yes wrangler whoami >/dev/null 2>&1; then
     if VERIFY_FP="$(read_row_fp)"; then
       if [ "$VERIFY_FP" = "$FP" ]; then
         echo "    Verified: the row DID register with THIS cert — enrollment actually succeeded. NOT revoking." >&2
+        mv "$CRT_TMP" "$CRT"
         echo "    enrolled: $MACHINE_ID -> $FP"
         exit 0
       fi
       echo "    Verified: the machines row does NOT carry this cert (found: ${VERIFY_FP:-<no row>}) — it was never installed." >&2
+      echo "    Left any pre-existing $CRT untouched." >&2
+      rm -f "$CRT_TMP"
       revoke_unused_cert
       exit 1
     fi
     echo "    Could NOT verify the row (the follow-up read also failed) — NOT revoking; a possibly-registered cert must not be revoked." >&2
+    echo "    The signed cert is saved (unverified) at $CRT_TMP; any pre-existing $CRT is left untouched." >&2
     echo "    Resolve manually:" >&2
     echo "      1) Check the row: CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID npx wrangler d1 execute $DB_NAME --remote --command \"SELECT cert_fp_sha256 FROM machines WHERE machine_id='$MACHINE_ID';\"" >&2
-    echo "      2) If it shows $FP, enrollment succeeded — do nothing." >&2
-    echo "      3) If it shows a different fp or no row, this cert is unused — revoke it:" >&2
-    echo "         curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$CERT_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\"" >&2
+    echo "      2) If it shows $FP, enrollment succeeded — move the cert into place:  mv $CRT_TMP $CRT" >&2
+    echo "      3) If it shows a different fp or no row, this cert is unused — revoke it and discard the temp:" >&2
+    echo "         curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$CERT_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\" ; rm -f $CRT_TMP" >&2
     exit 1
   fi
   # A parse failure here means wrangler returned 0 but unexpected output — the insert likely DID apply, so
@@ -253,10 +263,13 @@ if npx --yes wrangler whoami >/dev/null 2>&1; then
     echo >&2
     echo "    Do NOT install THIS run's cert — it is being revoked below. Mint a NEW cert first: re-run this" >&2
     echo "    script AFTER the admin swap, or let the collector renew (POST /api/v1/certs/renew)." >&2
+    echo "    Your existing working PEM at $CRT is left untouched." >&2
     echo >&2
+    rm -f "$CRT_TMP"
     revoke_unused_cert
     exit 1
   fi
+  mv "$CRT_TMP" "$CRT"
   echo "    enrolled: $MACHINE_ID -> $FP"
   print_install_steps
 else
@@ -272,14 +285,16 @@ else
   echo "  CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID npx wrangler d1 execute $DB_NAME --remote \\" >&2
   echo "    --command \"$INSERT_SQL SELECT cert_fp_sha256 AS fp FROM machines WHERE machine_id='$MACHINE_ID';\"" >&2
   echo >&2
-  echo "    The INSERT is ON CONFLICT DO NOTHING (it never overwrites an existing cert), so the read-back fp" >&2
-  echo "    is the source of truth:" >&2
-  echo "      - if the returned fp EQUALS  $FP  -> enrollment took; continue to the install steps below." >&2
+  echo "    The signed cert is saved (unverified) at $CRT_TMP; any pre-existing $CRT is left untouched until" >&2
+  echo "    you confirm below. The INSERT is ON CONFLICT DO NOTHING (it never overwrites an existing cert), so" >&2
+  echo "    the read-back fp is the source of truth:" >&2
+  echo "      - if the returned fp EQUALS  $FP  -> enrollment took; move the cert into place and install:" >&2
+  echo "          mv $CRT_TMP $CRT" >&2
   echo "      - if it DIFFERS or is empty       -> '$MACHINE_ID' is already enrolled with another cert. THIS" >&2
-  echo "        run's cert was NOT installed and must NOT be. Revoke it, then rotate via the admin endpoint:" >&2
-  echo "          curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$CERT_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\"" >&2
+  echo "        run's cert was NOT installed and must NOT be. Discard the temp + revoke, then rotate via admin:" >&2
+  echo "          rm -f $CRT_TMP ; curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$CERT_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\"" >&2
   echo "          POST /api/v1/admin/machines { machine_id, cert_fp_sha256, cert_id } with a FRESHLY minted cert." >&2
   echo >&2
-  echo "    ONLY after the read-back shows $FP, install the collector:" >&2
+  echo "    ONLY after the read-back shows $FP and you've moved the cert into place, install the collector:" >&2
   print_install_steps
 fi

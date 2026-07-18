@@ -180,18 +180,31 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
       }
     }
 
-    // Verify an admin-supplied cert_id actually belongs to the fingerprint it's being attached to. A wrong
-    // or foreign id would be stored as current, copied to prev on the next rotation, and then the prune
-    // would revoke/404 that handle and stamp the REAL fingerprint's reservation revoked while the actual
-    // cert stays CA-valid and reusable. Fetch the cert by id and compare ITS fingerprint to certFp; a
-    // mismatch, 404, or unresolvable id → 422. Only meaningful with CF creds (the admin worker always has
-    // them in prod); when unconfigured we can't reach the CA and skip — the same deploy state in which
-    // renew itself can't mint (documented residual).
+    // A cert_id is a CA revoke handle; it's meaningless without a fingerprint to bind it to. If the body
+    // supplies an id but there's no effective certFp (row has no cert and the body omits cert_fp_sha256),
+    // storing it would leave an unbound handle that a later fp-set silently drops (fpChanged resets
+    // cert_id) — the minted cert then stays live but untracked. Require a fingerprint.
+    if (body.cert_id && !certFp) {
+      return Response.json({ error: 'cert_id_requires_fingerprint', machine_id: body.machine_id }, { status: 422 });
+    }
+
+    // Verify an admin-supplied cert_id actually belongs to — and is an ACTIVE cert for — the fingerprint
+    // it's being attached to. A wrong/foreign id would be stored as current, copied to prev on the next
+    // rotation, and then the prune would revoke/404 that handle and stamp the REAL fingerprint's
+    // reservation revoked while the actual cert stays CA-valid and reusable. And a fp-matching id whose CA
+    // status is already pending_revocation/revoked would install a machine on a dying cert. Fetch the cert
+    // by id: a mismatch / 404 / unresolvable id → 422 cert_id_fingerprint_mismatch; a non-active status →
+    // 422 cert_id_not_active. Only meaningful with CF creds (the admin worker always has them in prod);
+    // when unconfigured we can't reach the CA and skip — the same deploy state in which renew can't mint.
     if (body.cert_id && certFp && env.CF_ZONE_ID && env.CF_CLIENT_CERT_TOKEN) {
-      const caFp = await getClientCertFingerprint(env, body.cert_id);
-      if (caFp !== certFp) {
-        console.log(JSON.stringify({ event: 'hub.admin.machines.cert_id_unverified', machine: body.machine_id, cert_id: body.cert_id, ca_result: caFp }));
-        return Response.json({ error: 'cert_id_fingerprint_mismatch', cert_id: body.cert_id, ca: caFp }, { status: 422 });
+      const ca = await getClientCertFingerprint(env, body.cert_id);
+      if (ca === 'not_found' || ca === 'unknown' || ca.fp !== certFp) {
+        console.log(JSON.stringify({ event: 'hub.admin.machines.cert_id_unverified', machine: body.machine_id, cert_id: body.cert_id, ca_result: typeof ca === 'string' ? ca : ca.fp }));
+        return Response.json({ error: 'cert_id_fingerprint_mismatch', cert_id: body.cert_id, ca: typeof ca === 'string' ? ca : ca.fp }, { status: 422 });
+      }
+      if (ca.status !== 'active') {
+        console.log(JSON.stringify({ event: 'hub.admin.machines.cert_id_not_active', machine: body.machine_id, cert_id: body.cert_id, status: ca.status }));
+        return Response.json({ error: 'cert_id_not_active', cert_id: body.cert_id, status: ca.status }, { status: 422 });
       }
     }
 

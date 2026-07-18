@@ -993,7 +993,7 @@ describe('POST /api/v1/admin/machines', () => {
     // one being attached. A match is accepted and stored.
     const fp = await certFingerprint(fakeCertPem('ver-match'));
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
-      if (String(input).endsWith('/ver-id')) return new Response(JSON.stringify({ success: true, result: { certificate: fakeCertPem('ver-match') } }), { status: 200 });
+      if (String(input).endsWith('/ver-id')) return new Response(JSON.stringify({ success: true, result: { certificate: fakeCertPem('ver-match'), status: 'active' } }), { status: 200 });
       return new Response(JSON.stringify({ success: true }), { status: 200 });
     }));
     const res = await adminMachines(reqJson({ machine_id: 'ver-ok', cert_fp_sha256: fp, cert_id: 'ver-id' }), cfEnv, machine('am-admin', true));
@@ -1003,7 +1003,7 @@ describe('POST /api/v1/admin/machines', () => {
 
   it('422s when the supplied cert_id resolves to a DIFFERENT fingerprint at the CA', async () => {
     const fp = await certFingerprint(fakeCertPem('ver-want'));
-    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ success: true, result: { certificate: fakeCertPem('ver-other') } }), { status: 200 })));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ success: true, result: { certificate: fakeCertPem('ver-other'), status: 'active' } }), { status: 200 })));
     const res = await adminMachines(reqJson({ machine_id: 'ver-mismatch', cert_fp_sha256: fp, cert_id: 'wrong-id' }), cfEnv, machine('am-admin', true));
     expect(res.status).toBe(422);
     expect(((await res.json()) as { error: string }).error).toBe('cert_id_fingerprint_mismatch');
@@ -1016,6 +1016,28 @@ describe('POST /api/v1/admin/machines', () => {
     const res = await adminMachines(reqJson({ machine_id: 'ver-nf', cert_fp_sha256: fp, cert_id: 'ghost-id' }), cfEnv, machine('am-admin', true));
     expect(res.status).toBe(422);
     expect(((await res.json()) as { error: string }).error).toBe('cert_id_fingerprint_mismatch');
+  });
+
+  it('422s when the cert_id\'s fingerprint matches but the CA cert is already pending_revocation', async () => {
+    // A fp-matching id whose CA status is not active would install the machine on a dying cert. Reject it
+    // with the status in the error, even though the fingerprint verified.
+    const fp = await certFingerprint(fakeCertPem('ver-dying'));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ success: true, result: { certificate: fakeCertPem('ver-dying'), status: 'pending_revocation' } }), { status: 200 })));
+    const res = await adminMachines(reqJson({ machine_id: 'ver-dying-m', cert_fp_sha256: fp, cert_id: 'dying-id' }), cfEnv, machine('am-admin', true));
+    expect(res.status).toBe(422);
+    const body = (await res.json()) as { error: string; status: string };
+    expect(body.error).toBe('cert_id_not_active');
+    expect(body.status).toBe('pending_revocation');
+    expect(await row('ver-dying-m')).toBeNull(); // not stored
+  });
+
+  it('422s a body cert_id supplied with NO fingerprint to bind it to', async () => {
+    // Row has no cert and the body omits cert_fp_sha256 → certFp is null. Storing the id would leave an
+    // unbound handle a later fp-set silently drops, stranding the minted cert live-but-untracked.
+    const res = await adminMachines(reqJson({ machine_id: 'bare-id', cert_id: 'orphan-handle' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as { error: string }).error).toBe('cert_id_requires_fingerprint');
+    expect(await row('bare-id')).toBeNull(); // never created
   });
 
   it('positive control: a body cert_id owned by NO other row attaches cleanly', async () => {
