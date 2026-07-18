@@ -13,9 +13,9 @@ const testEnv = testEnvRaw as unknown as Env;
 // no matter what the previous one set), with a small default a test overrides per case. afterAll restores
 // prod values. NOTE: the cost accounting is SUBREQUESTS (each db.batch/.first/.run is ONE), not statements —
 // see the counting-model note on writeSession; a 180-block conversation costs ~5 subrequests, not ~180.
-const PROD_BUDGETS = { slice: 800, invocation: 800, ceiling: 700, cap: 900, normalReserve: 128 };
-function budgets(o: { slice?: number; invocation?: number; ceiling?: number; cap?: number; normalReserve?: number } = {}): void {
-  __setExportBudgetsForTest({ slice: 20, invocation: 20, ceiling: 700, cap: 900, normalReserve: 8, ...o });
+const PROD_BUDGETS = { slice: 800, invocation: 800, ceiling: 700, cap: 900, normalReserve: 128, kickPage: 50 };
+function budgets(o: { slice?: number; invocation?: number; ceiling?: number; cap?: number; normalReserve?: number; kickPage?: number } = {}): void {
+  __setExportBudgetsForTest({ slice: 20, invocation: 20, ceiling: 700, cap: 900, normalReserve: 8, kickPage: 50, ...o });
 }
 afterAll(() => __setExportBudgetsForTest(PROD_BUDGETS));
 
@@ -186,6 +186,27 @@ async function sessionState(id: string): Promise<string | null> {
 async function stateCount(fileId: number, state: string): Promise<number> {
   const r = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM sessions WHERE canonical_file_id = ?1 AND index_state = ?2').bind(fileId, state).first<{ n: number }>();
   return r!.n;
+}
+
+async function canonicalOwner(sessionId: string): Promise<number | null> {
+  const r = await testEnv.DB.prepare('SELECT canonical_file_id FROM sessions WHERE session_id = ?1').bind(sessionId).first<{ canonical_file_id: number | null }>();
+  return r?.canonical_file_id ?? null;
+}
+
+// Re-PUT arbitrary bytes to an existing export row's machine+relpath — a corrupt re-upload (new hash, SAME
+// row) that parses to `valid: false` and drives failExportFile. Returns the row's stored content hash.
+async function reuploadRawExport(tag: string, bytes: Uint8Array): Promise<string> {
+  const hash = await sha256Hex(bytes);
+  const relpath = `claude-export-${tag}.zip`;
+  const machine = `bnd-${tag}`;
+  const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/files/${machine}/export-inbox/${encodeURIComponent(relpath)}`, {
+    method: 'PUT',
+    headers: { 'x-dev-machine': machine, 'x-content-hash': `sha256:${hash}`, 'x-file-mtime': '2026-07-02T12:00:00Z', 'content-length': String(bytes.length) },
+    body: bytes,
+  });
+  expect(res.status).toBe(201);
+  const row = await testEnv.DB.prepare('SELECT content_hash FROM files WHERE machine_id = ?1 AND relpath = ?2').bind(machine, relpath).first<{ content_hash: string }>();
+  return row!.content_hash;
 }
 
 // Deliver a parse message and keep delivering the continuation it enqueues (write- OR cleanup-phase)
@@ -877,7 +898,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
 
     // Make the sibling-recovery SELECT throw (it fires only after cleanup reconciled ≥1 stale session).
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
-    const SIBLING_SQL = `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state = 'parsed'`;
+    const SIBLING_SQL = `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state = 'parsed' ORDER BY id ASC LIMIT ?3`;
     testEnv.DB.prepare = ((sql: string) => {
       if (sql === SIBLING_SQL) {
         return { bind: () => ({ all: async () => { throw new Error('D1 outage on sibling recovery SELECT'); } }) } as unknown as D1PreparedStatement;
@@ -1182,6 +1203,186 @@ describe('large export ingest is bounded and never marks parsed until every conv
     // reverts this file's owned rows, letting the fresh upload's message own the reparse.
     expect(sent.some((m) => m.file_id === sib.fileId && m.reason === 'recover')).toBe(false);
     expect(await fileState(sib.fileId)).toBe('parsed'); // sibling untouched, never kicked to 'pending'
+  });
+
+  it('does not error an oversized conversation owned by another archive (round 9 finding 1)', async () => {
+    budgets({ slice: 800, invocation: 800, ceiling: 4, cap: 5 });
+    const convTag = 'r9f1x';
+    const a = await uploadConvs('r9f1-a', [conv(convTag, 0)]);
+    await deliverChain({ file_id: a.fileId, r2_key: a.r2Key, reason: 'upload', content_hash: a.hash });
+    const xId = `bnd-${convTag}-conv-0`;
+    expect(await canonicalOwner(xId)).toBe(a.fileId);
+    // Make X non-healthy-ready so B's healthy-owner skip (finding 3a) doesn't fire and B reaches the
+    // oversized branch for it (simulating A mid-reparse — still A's row).
+    await testEnv.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(xId).run();
+
+    // B carries an OVERSIZED (> cap) version of the SAME conversation; B has never written or owned it.
+    const b = await uploadConvs('r9f1-b', [heavyConv(convTag, 0, 200)]);
+    await deliver({ file_id: b.fileId, r2_key: b.r2Key, reason: 'upload', content_hash: b.hash });
+
+    // POSITIVE CONTROL: the unqualified UPDATE flipped ANY row for this session id to 'error', reporting A's
+    // good data broken. Qualified by canonical_file_id, B leaves A's row untouched and still completes.
+    expect(await canonicalOwner(xId)).toBe(a.fileId); // still owned by A
+    expect(await sessionState(xId)).toBe('parsing'); // NOT flipped to 'error'
+    expect(await fileState(b.fileId)).toBe('parsed'); // B still finishes
+  });
+
+  it('cuts before an oversized conversation that only follows skipped lookups (round 9 finding 2)', async () => {
+    budgets({ slice: 800, invocation: 800, ceiling: 4, cap: 900 });
+    // Owner archive owns S0, S1 healthy, so B SKIPS them (spending a lookup each, writing nothing).
+    const owner = await uploadConvs('r9f2-own', [conv('r9f2s', 0), conv('r9f2s', 1)]);
+    await deliverChain({ file_id: owner.fileId, r2_key: owner.r2Key, reason: 'upload', content_hash: owner.hash });
+    // B: [S0(skipped), S1(skipped), Big(oversized-ceiling)].
+    const b = await uploadConvs('r9f2-b', [conv('r9f2s', 0), conv('r9f2s', 1), heavyConv('r9f2big', 0, 100)]);
+    const bigId = 'bnd-r9f2big-conv-0';
+    sent.length = 0;
+    await deliver({ file_id: b.fileId, r2_key: b.r2Key, reason: 'upload', content_hash: b.hash });
+
+    // POSITIVE CONTROL: gating on written.size (0 here — S0/S1 were skipped) let Big write in this slice
+    // after the two lookups. spentBefore counts those lookups, so Big is CUT to its own invocation.
+    expect(await sessionState(bigId)).toBe(null); // not written this slice
+    const cont = sent.find((m) => m.file_id === b.fileId && typeof m.offset === 'number');
+    expect(cont?.offset).toBe(2); // resumes AT Big (index 2), after the two skipped convs
+    await deliverChain({ file_id: b.fileId, r2_key: b.r2Key, reason: 'upload', content_hash: b.hash });
+    expect(await sessionState(bigId)).toBe('ready'); // written alone next invocation
+  });
+
+  it('writes a LEADING oversized conversation alone rather than livelocking (round 9 finding 2 livelock)', async () => {
+    budgets({ slice: 800, invocation: 800, ceiling: 4, cap: 900 });
+    const b = await uploadConvs('r9f2lead', [heavyConv('r9f2lead', 0, 100)]);
+    const bigId = 'bnd-r9f2lead-conv-0';
+    await deliver({ file_id: b.fileId, r2_key: b.r2Key, reason: 'upload', content_hash: b.hash });
+    // spentBefore is 0 for the FIRST conversation (its own lookup excluded), so it is written ALONE instead
+    // of cutting into an infinite same-offset loop (the livelock a bare `spent > 0` gate would cause).
+    expect(await sessionState(bigId)).toBe('ready');
+    expect(await fileState(b.fileId)).toBe('parsed');
+  });
+
+  it('compensates a sibling whose recover send throws, so ExportRetry re-kicks it (round 9 finding 3b)', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    const sib = await uploadConvs('r9f3b-sib', [conv('r9f3bsib', 0), conv('r9f3bsib', 1)]);
+    await deliverChain({ file_id: sib.fileId, r2_key: sib.r2Key, reason: 'upload', content_hash: sib.hash });
+    expect(await fileState(sib.fileId)).toBe('parsed');
+
+    const fileA = await uploadConvs('r9f3b', Array.from({ length: 4 }, (_u, i) => conv('r9f3b', i)));
+    await deliverChain({ file_id: fileA.fileId, r2_key: fileA.r2Key, reason: 'upload', content_hash: fileA.hash });
+    const replaced = await uploadConvs('r9f3b', [conv('r9f3b', 0)]);
+
+    // Make the recover SEND to sib throw exactly once (its flip lands first, THEN the send throws).
+    const realSend = testEnv.PARSE_QUEUE.send;
+    let sibSends = 0;
+    let sendThrown = false;
+    testEnv.PARSE_QUEUE.send = (async (m: ParseMessage) => {
+      if (m.file_id === sib.fileId && m.reason === 'recover') {
+        sibSends += 1;
+        if (!sendThrown) {
+          sendThrown = true;
+          throw new Error('queue send outage on recover');
+        }
+      }
+      return (realSend as (b: ParseMessage) => Promise<unknown>)(m);
+    }) as typeof testEnv.PARSE_QUEUE.send;
+    try {
+      // First delivery: cleanup kicks sib → flip 'pending' → send throws → compensate to 'parsed' → ExportRetry.
+      await deliver({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
+      expect(await fileState(replaced.fileId)).toBe('pending'); // retryable
+      expect(await fileState(sib.fileId)).toBe('parsed'); // compensated — NOT left stranded 'pending'
+      // Retry: re-kick sib (2nd send, succeeds) and drain cleanup.
+      await deliverChain({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
+    } finally {
+      testEnv.PARSE_QUEUE.send = realSend;
+    }
+    // POSITIVE CONTROL: swallowing the send failure left sib 'pending' with no message and flipFailed=false,
+    // so it was never re-kicked (send count 1). Compensation + ExportRetry re-kick it (send count 2).
+    expect(sibSends).toBe(2);
+    expect(await fileState(sib.fileId)).toBe('pending'); // kicked for reparse (2nd send landed)
+  });
+
+  it('bounds the sibling recovery fan-out to one page per cleanup invocation (round 9 finding 4)', async () => {
+    budgets({ slice: 800, invocation: 800 });
+    // main owns 4 sessions, then re-uploaded small so its reparse cleanup reconciles 3 stale (fires fan-out).
+    const main = await uploadConvs('r9f4-main', Array.from({ length: 4 }, (_u, i) => conv('r9f4main', i)));
+    await deliverChain({ file_id: main.fileId, r2_key: main.r2Key, reason: 'upload', content_hash: main.hash });
+    const replaced = await uploadConvs('r9f4-main', [conv('r9f4main', 0)]); // enqueues reparse; delivered below
+
+    // Six sibling archives with DISTINCT conversations. Every export UPLOAD kicks parsed siblings back to
+    // 'pending', so upload them ALL first (none parsed yet → no cross-kicking), THEN parse them — leaving all
+    // six 'parsed' at the moment we drive replaced's cleanup (a delivery, not an upload, so it won't churn them).
+    const SIB_COUNT = 6;
+    const sibUploads = [];
+    for (let i = 0; i < SIB_COUNT; i++) sibUploads.push(await uploadConvs(`r9f4-sib${i}`, [conv(`r9f4sib${i}`, 0)]));
+    for (const s of sibUploads) await deliverChain({ file_id: s.fileId, r2_key: s.r2Key, reason: 'upload', content_hash: s.hash });
+    const sibs = sibUploads.map((s) => s.fileId);
+    for (const id of sibs) expect(await fileState(id)).toBe('parsed'); // all six parsed at kick time
+
+    const recoverToSibs = (): number => sent.filter((m) => m.reason === 'recover' && sibs.includes(m.file_id)).length;
+
+    // Tight budget so the fan-out (2 subrequests/sibling) cannot flip all six siblings in one invocation;
+    // drive every continuation, tracking the MOST siblings kicked in any single invocation and the total.
+    budgets({ slice: 8, invocation: 8, kickPage: 2 });
+    let msg: ParseMessage = { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash };
+    let maxSibKicksInOneInvocation = 0;
+    let totalSibKicks = 0;
+    for (let i = 0; i < 60; i++) {
+      sent.length = 0;
+      await deliver(msg);
+      const k = recoverToSibs();
+      maxSibKicksInOneInvocation = Math.max(maxSibKicksInOneInvocation, k);
+      totalSibKicks += k;
+      const cont = sent.find((m) => m.file_id === replaced.fileId && typeof m.offset === 'number');
+      if (!cont) break;
+      msg = cont;
+    }
+    // POSITIVE CONTROL: the unbounded fan-out kicks ALL six siblings in ONE invocation (max 6). Paged and
+    // budget-cut, no single invocation can flip all of them — the fan-out spans continuations, and every
+    // sibling is kicked exactly once (total 6) and ends 'pending'.
+    expect(maxSibKicksInOneInvocation).toBeLessThan(SIB_COUNT);
+    expect(totalSibKicks).toBe(SIB_COUNT);
+    for (const id of sibs) expect(await fileState(id)).toBe('pending');
+  });
+
+  it('a corrupt re-upload with a transient failExportFile throw still converges to terminal error (round 9 finding 5)', async () => {
+    budgets({ slice: 800, invocation: 800 });
+    // A valid archive that owns sessions, then re-uploaded corrupt (same row, new hash) → failExportFile.
+    const up = await uploadConvs('r9f5', [conv('r9f5', 0), conv('r9f5', 1)]);
+    await deliverChain({ file_id: up.fileId, r2_key: up.r2Key, reason: 'upload', content_hash: up.hash });
+    expect(await ownedSessions(up.fileId)).toBe(2);
+    const corruptHash = await reuploadRawExport('r9f5', new TextEncoder().encode('not a zip at all'));
+
+    // Make one D1 read inside failExportFile (its owned-sessions SELECT) throw ONCE — a transient outage.
+    const OWNED_SQL = 'SELECT session_id FROM sessions WHERE canonical_file_id = ?1';
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    let thrown = false;
+    testEnv.DB.prepare = ((sql: string) => {
+      const stmt = realPrepare(sql);
+      if (sql !== OWNED_SQL) return stmt;
+      const realBind = stmt.bind.bind(stmt);
+      stmt.bind = (...a: unknown[]) => {
+        const bound = realBind(...a);
+        const realAll = bound.all.bind(bound);
+        (bound as unknown as Record<string, unknown>).all = async (...x: unknown[]) => {
+          if (!thrown) {
+            thrown = true;
+            throw new Error('D1 outage inside failExportFile');
+          }
+          return (realAll as (...y: unknown[]) => unknown)(...x);
+        };
+        return bound;
+      };
+      return stmt;
+    }) as typeof testEnv.DB.prepare;
+    try {
+      // First delivery of the corrupt reparse: failExportFile throws (transient) → ExportRetry → 'pending'.
+      await deliver({ file_id: up.fileId, r2_key: up.r2Key, reason: 'upload', content_hash: corruptHash });
+      expect(await fileState(up.fileId)).toBe('pending'); // retryable, not yet terminal
+      // Retry: failExportFile runs cleanly → terminal 'error'.
+      await deliver({ file_id: up.fileId, r2_key: up.r2Key, reason: 'upload', content_hash: corruptHash });
+    } finally {
+      testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
+    }
+    // POSITIVE CONTROL: a corrupt archive whose reconciliation throws must not oscillate pending forever — a
+    // transient throw converges. The retry's failExportFile succeeds and the file rests terminal 'error'.
+    expect(await fileState(up.fileId)).toBe('error');
   });
 
   it('cleanup deletes are atomic hash-guarded: a hash flip between the recheck and the delete batch no-ops them (round 4 finding 3)', async () => {

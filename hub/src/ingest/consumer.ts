@@ -482,15 +482,21 @@ export let EXPORT_OVERSIZED_CEILING = 700;
 // (~90k blocks — effectively unreachable). The destructive skip path is gated on this, so it never
 // discards a large-but-writable conversation.
 export let EXPORT_OVERSIZED_SUBREQUEST_CAP = 900;
+// The cleanup sibling-recovery fan-out (kickSiblings) processes parsed siblings in pages of this size so a
+// store with many parsed archive siblings can't spend the whole invocation budget in one unbounded fan-out
+// (round 9 finding 4). The `= 'parsed'` select is naturally resumable — each kicked sibling flips to
+// 'pending' and drops out of the next page — so the fan-out spans cleanup continuations when it can't fit.
+export let EXPORT_KICK_PAGE = 50;
 
 /** Test-only: dial the export/invocation subrequest budgets down so slicing/cleanup/deferral can be
  * exercised with tiny fixtures instead of thousands of conversations. */
-export function __setExportBudgetsForTest(o: { slice?: number; invocation?: number; ceiling?: number; cap?: number; normalReserve?: number }): void {
+export function __setExportBudgetsForTest(o: { slice?: number; invocation?: number; ceiling?: number; cap?: number; normalReserve?: number; kickPage?: number }): void {
   if (o.slice !== undefined) EXPORT_QUERY_BUDGET = o.slice;
   if (o.invocation !== undefined) INVOCATION_SUBREQUEST_BUDGET = o.invocation;
   if (o.ceiling !== undefined) EXPORT_OVERSIZED_CEILING = o.ceiling;
   if (o.cap !== undefined) EXPORT_OVERSIZED_SUBREQUEST_CAP = o.cap;
   if (o.normalReserve !== undefined) NORMAL_RESERVE = o.normalReserve;
+  if (o.kickPage !== undefined) EXPORT_KICK_PAGE = o.kickPage;
 }
 
 /** Real per-invocation SUBREQUEST cost of writeSession WITHOUT writing (each db.batch is ONE subrequest):
@@ -600,6 +606,14 @@ async function runExportParse(
     for (; idx < maxEnd; idx++) {
       const session = archive.sessions[idx]!;
       if (session.turns.length === 0) continue; // empty conversation: consumed at zero D1 cost, cleared by cleanup
+      // D1 work already done THIS invocation, EXCLUDING this conversation's own ownership lookup below — the
+      // gate for the oversized cut (round 9 finding 2). `written.size` alone under-counts: a slice of many
+      // healthy/oversized-skipped conversations spends real subrequests on their lookups while writing
+      // nothing, so gating the cut on `written.size > 0` let a near-cap oversized conversation run after that
+      // spend and breach the cap (then repeat at the same offset). `spent > 0` would over-count (this
+      // conversation's own lookup), livelocking a leading oversized conversation. Snapshotting BEFORE the
+      // lookup gates on prior work only, so a leading oversized conversation (spentBefore 0) still runs alone.
+      const spentBefore = spent;
       const existing = await env.DB.prepare(
         `SELECT f.store, f.parse_state AS canon_state, s.index_state, s.canonical_file_id
          FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
@@ -621,7 +635,11 @@ async function runExportParse(
       // re-enqueues every sibling archive without knowing WHICH conversation was lost, so an older
       // archive's stale copy of a still-healthy conversation would otherwise overwrite it. Generalize
       // the healthy-web-capture skip: skip any conversation whose live session is 'ready' and
-      // canonically owned by another non-error file. (An 'upload'/'reindex' parse still wins normally.)
+      // canonically owned by another non-error file. An 'upload'/'reindex' parse still wins normally —
+      // last-write-wins ownership is deliberate (web-ingest round 2/7/12 tests), so this stays gated on
+      // reason==='recover'. (Round 9 finding 3b keeps a lost recover SEND from silently degrading a
+      // recover into a files/check 'upload' reparse; a stale upload displacing a newer owner is a
+      // separate, narrower concern — see the PR thread.)
       const healthyOtherOwner =
         existing && existing.index_state === 'ready' && existing.canonical_file_id !== file.id && existing.canon_state !== 'error';
       if (reason === 'recover' && healthyOtherOwner) continue;
@@ -632,21 +650,25 @@ async function runExportParse(
       const estSubreq = estimateWriteSubrequests(session);
       if (estSubreq > EXPORT_OVERSIZED_SUBREQUEST_CAP) {
         // Cannot fit under the ~1000 SUBREQUEST cap even alone (~90k blocks). Record loudly and skip
-        // (preservation-first: the raw ZIP stays in R2, nothing silently dropped); flip any existing row
-        // for it to 'error'. Measured max export conversation is 304 blocks (~7 subrequests) — never today.
-        await env.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(session.id).run();
+        // (preservation-first: the raw ZIP stays in R2, nothing silently dropped). Flip the existing row to
+        // 'error' ONLY if THIS file owns it (round 9 finding 1): an unqualified UPDATE would flip a session
+        // whose healthy canonical row belongs to ANOTHER archive — reporting good data broken while our
+        // archive still marks parsed. Qualified by canonical_file_id, a row owned by another file is left
+        // untouched (logged owned:false). Measured max export conversation is 304 blocks (~7 subrequests).
+        const flip = await env.DB
+          .prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1 AND canonical_file_id = ?2 RETURNING session_id")
+          .bind(session.id, file.id)
+          .first<{ session_id: string }>();
         spent += 1;
-        console.log(JSON.stringify({ event: 'parse.export.oversized_conversation', file_id: file.id, session: session.id, est_subrequests: estSubreq }));
+        console.log(JSON.stringify({ event: 'parse.export.oversized_conversation', file_id: file.id, session: session.id, est_subrequests: estSubreq, owned: flip !== null }));
         continue;
       }
-      if (estSubreq > EXPORT_OVERSIZED_CEILING && written.size > 0) {
-        // Big enough to deserve its own invocation and this slice already WROTE a conversation — cut BEFORE
-        // it so the continuation runs it alone next invocation, keeping its writeSession clear of the cap.
-        // Gate on written.size, NOT spent: `spent` was already bumped by THIS conversation's ownership
-        // lookup, so `spent > 0` is true even when the oversized conversation is the FIRST in the slice —
-        // which would break without advancing idx and re-enqueue the SAME offset forever (archive stuck
-        // pending). written.size is 0 until a PRIOR conversation is written, so a leading oversized
-        // conversation falls through and is written ALONE (it still fits under the cap), making progress.
+      if (estSubreq > EXPORT_OVERSIZED_CEILING && spentBefore > 0) {
+        // Big enough to deserve its own invocation and this slice already spent D1 work (a prior write OR
+        // prior lookups) — cut BEFORE it so the continuation runs it alone next invocation, keeping its
+        // writeSession clear of the cap. spentBefore excludes this conversation's own lookup, so a LEADING
+        // oversized conversation (spentBefore 0) falls through and is written ALONE (it still fits under the
+        // cap) rather than re-enqueuing the SAME offset forever — see the spentBefore snapshot above.
         break;
       }
 
@@ -782,8 +804,10 @@ async function runExportParse(
         budgetHit = true;
         break;
       }
-      cursor = session_id; // advance past every row we've decided on (kept OR reconciled)
-      if (keep.has(session_id)) continue;
+      if (keep.has(session_id)) {
+        cursor = session_id; // advance past a KEPT row (decided)
+        continue;
+      }
       // This session is stale and about to be reconciled. Kick sibling archives FIRST (once per
       // invocation), BEFORE any delete, so an overlapping archive always has a 'pending' message to
       // re-claim it — the delete can never outrun the recovery (round 6 finding 4). A flip failure raises
@@ -809,9 +833,21 @@ async function runExportParse(
             return spent;
           }
         }
-        spent += await kickSiblings(file, env);
+        // Paged, resumable, budget-bounded fan-out (round 9 finding 4). If it can't drain every parsed
+        // sibling within the remaining invocation budget, cut the cleanup continuation WITHOUT reconciling
+        // this stale session: cursor still points at the last decided row, so the next invocation re-selects
+        // the still-'parsed' siblings (each kicked one flips to 'pending' and drops out), re-kicks them
+        // idempotently, and only then reconciles. Nothing is deleted before every overlapping sibling has a
+        // recovery message, so the round-6-finding-4 ordering holds across the paged fan-out too.
+        const k = await kickSiblings(file, env, spent);
+        spent += k.spent;
+        if (!k.complete) {
+          budgetHit = true;
+          break;
+        }
         kicked = true;
       }
+      cursor = session_id; // advance past a reconciled row (decided) — only now, after the kick committed
       if (archive.skipped === 0) {
         await env.DB.batch([
           bindCleanup(
@@ -1103,31 +1139,56 @@ async function raiseExportRetry(file: FileRow, env: Env, written: Set<string>, c
  * of O(pages × siblings) times. The excluded states are all correct to skip: 'pending'/'parsing' siblings
  * already have (or will get, via files/check) an active parse message; 'error' can't recover; 'skipped'/
  * 'superseded' are dedup/replaced copies whose live content is owned by a 'parsed' file that IS in this set.
- * Returns the subrequest cost so the cleanup budget still bounds the invocation. markPendingAndEnqueue flips
- * a sibling to 'pending' THEN sends: a SEND failure after the flip is safe (files/check re-enqueues the
- * 'pending' row), so it's swallowed; a FLIP failure leaves the sibling terminal, so raise ExportRetry — and
- * because nothing has been deleted yet, the retry re-runs the whole idempotent cleanup page cleanly. */
-async function kickSiblings(file: FileRow, env: Env): Promise<number> {
-  const others = await env.DB.prepare(
-    `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state = 'parsed'`,
-  )
-    .bind(file.store, file.id)
-    .all<{ id: number; r2_key: string; content_hash: string }>();
-  let spent = 1; // the sibling SELECT
-  let flipFailed = false;
-  for (const other of others.results) {
-    try {
-      await markPendingAndEnqueue(other, 'recover', env);
-      spent += 2; // flip UPDATE + queue send
-    } catch (e) {
-      const row = await env.DB.prepare('SELECT parse_state FROM files WHERE id = ?1').bind(other.id).first<{ parse_state: string }>();
-      spent += 3; // the attempted flip/send + the state re-check
-      console.log(JSON.stringify({ event: 'parse.export.recover_kick_failed', file_id: file.id, sibling: other.id, sibling_state: row?.parse_state ?? null, error: String(e) }));
-      if (row?.parse_state !== 'pending') flipFailed = true;
+ *
+ * BOUNDED + RESUMABLE (round 9 finding 4): the fan-out pages the select at EXPORT_KICK_PAGE and stops once
+ * `spentSoFar + spent` would cross the query budget, returning complete=false so the caller cuts a cleanup
+ * continuation. Because a kicked sibling flips to 'pending' and drops out of the `= 'parsed'` select, the
+ * next invocation resumes on the remaining parsed siblings — every sibling is kicked exactly once across the
+ * continuations, and no single invocation fans out to hundreds of siblings past the cap. Returns the
+ * subrequest cost AND whether every parsed sibling has now been kicked.
+ *
+ * markPendingAndEnqueue flips a sibling to 'pending' THEN sends. On any throw we compensate + retry rather
+ * than swallow (round 9 finding 3b): a swallowed SEND failure leaves the sibling 'pending' with no queue
+ * message, and its only heal is /api/v1/files/check re-enqueuing it as reason 'upload' — which never retries
+ * the intended recover. So if the flip landed but the send threw (sibling now 'pending'), revert it to
+ * 'parsed' so the idempotent select re-includes it, then raise ExportRetry to re-kick flip+send together;
+ * a bare FLIP failure (sibling still terminal) likewise raises ExportRetry. Nothing is deleted yet, so the
+ * retry re-runs the whole idempotent cleanup page cleanly. */
+async function kickSiblings(file: FileRow, env: Env, spentSoFar: number): Promise<{ spent: number; complete: boolean }> {
+  let spent = 0;
+  for (;;) {
+    const others = await env.DB.prepare(
+      `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state = 'parsed' ORDER BY id ASC LIMIT ?3`,
+    )
+      .bind(file.store, file.id, EXPORT_KICK_PAGE)
+      .all<{ id: number; r2_key: string; content_hash: string }>();
+    spent += 1; // the sibling SELECT (one page)
+    for (const other of others.results) {
+      try {
+        await markPendingAndEnqueue(other, 'recover', env);
+        spent += 2; // flip UPDATE + queue send
+      } catch (e) {
+        const row = await env.DB.prepare('SELECT parse_state FROM files WHERE id = ?1').bind(other.id).first<{ parse_state: string }>();
+        spent += 2; // the attempted flip/send + the state re-check
+        // Flip landed but send threw → sibling is 'pending' with no message. Revert it to 'parsed' so the
+        // ExportRetry below re-kicks it (flip+send together) instead of degrading into a files/check 'upload'
+        // reparse that bypasses the recover-only healthy-owner skip. If the compensation itself throws, log
+        // loudly and fall through — the eventual files/check heal still recovers the sibling.
+        if (row?.parse_state === 'pending') {
+          try {
+            await env.DB.prepare("UPDATE files SET parse_state = 'parsed' WHERE id = ?1 AND parse_state = 'pending'").bind(other.id).run();
+            spent += 1;
+          } catch (compErr) {
+            console.log(JSON.stringify({ event: 'parse.export.recover_kick_compensate_failed', file_id: file.id, sibling: other.id, error: String(compErr) }));
+          }
+        }
+        console.log(JSON.stringify({ event: 'parse.export.recover_kick_failed', file_id: file.id, sibling: other.id, sibling_state: row?.parse_state ?? null, error: String(e) }));
+        throw new ExportRetry('recovery fan-out: a sibling kick failed');
+      }
     }
+    if (others.results.length < EXPORT_KICK_PAGE) return { spent, complete: true }; // drained every parsed sibling
+    if (spentSoFar + spent >= EXPORT_QUERY_BUDGET) return { spent, complete: false }; // budget hit mid-fan-out
   }
-  if (flipFailed) throw new ExportRetry('recovery fan-out: a sibling flip failed');
-  return spent;
 }
 
 /** Replace a session's index rows atomically-enough: FTS delete → blocks delete → reinsert → FTS
