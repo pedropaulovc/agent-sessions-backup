@@ -302,6 +302,32 @@ describe('POST /api/v1/certs/renew', () => {
     expect((await row('renew-expired'))?.cert_fp_sha256).toBe('re-B'); // unchanged
   });
 
+  it('a CAS-conflict cleanup whose queue INSERT fails still returns 409 and falls back to a direct revoke', async () => {
+    // Closed-window recovery -> changes===0 -> orphan cleanup. If the retired_certs INSERT throws
+    // (transient D1), the CAS-decided 409 must NOT become a 500, and the minted cert must still get a
+    // best-effort revoke rather than being stranded live.
+    await seedMachine('renew-cleanup', { fp: 'rc-B', certId: 'cert-rc-B', prevFp: 'rc-A', prevCertId: 'cert-rc-A', revokeAt: '2000-01-01T00:00:00.000Z' });
+    const deletes: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') {
+        deletes.push(String(input).split('/').pop()!);
+        return new Response(JSON.stringify({ success: true, result: { status: 'pending_revocation' } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ success: true, result: { id: 'cert-rc-C', certificate: fakeCertPem('rc-C'), expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    // Make ONLY the retireCert queue INSERT (VALUES form) throw; the swap batch + guarded INSERT
+    // (SELECT form) are untouched.
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
+      if (sql.includes('INSERT INTO retired_certs') && sql.includes('VALUES')) throw new Error('D1_ERROR: database is locked');
+      return realPrepare(sql);
+    });
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('renew-cleanup', false, 'rc-A'));
+    spy.mockRestore();
+    expect(res.status).toBe(409); // cleanup failure never changes the CAS-decided outcome
+    expect(deletes).toContain('cert-rc-C'); // fell back to a direct best-effort revoke of the orphan
+  });
+
   it('stops honoring the previous fp once its revoke_at has passed', async () => {
     await seedMachine('renew-3', { fp: 'fpCur', prevFp: 'fpExpired', prevCertId: 'cert-x', revokeAt: '2000-01-01T00:00:00.000Z' });
     expect(await machineIdentity(reqWithCert('fpCur'), prodEnv)).toMatchObject({ machineId: 'renew-3' });

@@ -73,14 +73,20 @@ resp="$(curl -sS -X POST "$API/zones/$ZONE_ID/client_certificates" \
   -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
   --data "$body")"
 
-python3 - "$resp" "$CRT" <<'PY'
+# Capture the CA client-certificate id (CERT_ID). The hub stores it in machines.cert_id and uses it
+# as the handle to REVOKE the cert on rotation/prune — so it MUST be recorded here, or every cert
+# this script enrolls looks like a legacy unknown-id row and leaks its first rotated cert.
+CERT_ID="$(python3 - "$resp" "$CRT" <<'PY'
 import json,sys
 d=json.loads(sys.argv[1])
 if not d.get("success"):
     print("Cloudflare API error:", d.get("errors"), file=sys.stderr); sys.exit(1)
 open(sys.argv[2],"w").write(d["result"]["certificate"])
-print("    cert id:", d["result"]["id"], "expires:", d["result"]["expires_on"])
+sys.stderr.write("    cert id: %s expires: %s\n" % (d["result"]["id"], d["result"]["expires_on"]))
+print(d["result"]["id"])
 PY
+)"
+[ -n "$CERT_ID" ] || { echo "no cert id in Cloudflare response" >&2; exit 1; }
 
 # cf.tlsClientAuth.certFingerprintSHA256 == lowercase hex SHA-256 of the DER cert, no colons.
 FP="$(openssl x509 -in "$CRT" -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}')"
@@ -88,10 +94,23 @@ echo "==> cert fingerprint (SHA-256): $FP"
 
 echo "==> registering machine '$MACHINE_ID' (is_admin=$IS_ADMIN) in $DB_NAME"
 HOSTNAME_VAL="$(hostname)"
-SQL="INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, key_protection, is_admin)
-     VALUES ('$MACHINE_ID', '$OS_TAG', '$HOSTNAME_VAL', '$FP', 'software', $IS_ADMIN)
-     ON CONFLICT (machine_id) DO UPDATE SET cert_fp_sha256=excluded.cert_fp_sha256,
-       key_protection=excluded.key_protection, is_admin=excluded.is_admin;"
+# Re-enrolling an existing machine with a NEW fp displaces its old current (and any in-grace prev).
+# Those old certs may still be CA-valid, so we must reserve them in retired_certs (the prune revokes
+# them) and reset the rotation columns — the SAME displacement invariant hub/src/api/certs.ts's
+# retireCert enforces for the admin/renew paths: never carry an old cert_id onto a new fp, never drop
+# a displaced fp untracked. wrangler runs these statements in order, so the retirement SELECTs read
+# the OLD row before the upsert overwrites it. (No-ops on a fresh insert or an idempotent same-fp re-run.)
+SQL="INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at)
+       SELECT cert_fp_sha256, cert_id, machine_id, strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM machines
+       WHERE machine_id='$MACHINE_ID' AND cert_fp_sha256 IS NOT NULL AND cert_fp_sha256!='$FP';
+     INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at)
+       SELECT prev_cert_fp_sha256, prev_cert_id, machine_id, strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM machines
+       WHERE machine_id='$MACHINE_ID' AND prev_cert_fp_sha256 IS NOT NULL AND prev_cert_fp_sha256!='$FP';
+     INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, cert_id, key_protection, is_admin)
+       VALUES ('$MACHINE_ID', '$OS_TAG', '$HOSTNAME_VAL', '$FP', '$CERT_ID', 'software', $IS_ADMIN)
+       ON CONFLICT (machine_id) DO UPDATE SET cert_fp_sha256=excluded.cert_fp_sha256,
+         cert_id=excluded.cert_id, key_protection=excluded.key_protection, is_admin=excluded.is_admin,
+         prev_cert_fp_sha256=NULL, prev_cert_id=NULL, cert_revoke_at=NULL;"
 # The D1 upsert needs a wrangler login with D1 access — NOT the just-in-time CF_API_TOKEN,
 # which is zone-SSL only (and wrangler reads CLOUDFLARE_API_TOKEN, not CF_API_TOKEN, anyway).
 # On an authenticated admin box, run it; on a fresh collector box, print the SQL to run from

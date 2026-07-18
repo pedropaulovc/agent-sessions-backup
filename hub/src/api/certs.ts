@@ -139,24 +139,23 @@ export async function pollRetired(env: Env, certId: string): Promise<'revoked' |
   return 'failed'; // 'unknown' — a GET error; retry next run without guessing
 }
 
-/** A D1 write failed AFTER the CA signed a successor — the cert is live but not recorded in any
- * machines-row slot. Best-effort revoke it; unless the CA already reports it fully 'revoked', queue
- * it so it is never an untracked live cert and the prune drives it to completion. */
-async function reclaimSignedOrphan(env: Env, fingerprint: string, certId: string, machineId: string): Promise<void> {
-  let result: RevokeResult;
+/** Make a minted-but-unusable cert safe, NEVER throwing — so a cleanup failure can't change the
+ * caller's already-decided response (a CAS-conflict 409, or a renew_write_failed 500). Shared by both
+ * renew orphan sites. Primary path: queue it (retireCert) so the prune drives it to revoked. If the
+ * queue INSERT throws (transient D1), fall back to a direct best-effort revoke so it isn't left live.
+ * If BOTH fail the cert is leaked-but-loudly-logged (alertable) — strictly better than a silent
+ * strand. */
+async function reclaimOrphan(env: Env, fingerprint: string, certId: string, machineId: string): Promise<void> {
   try {
-    result = await revokeClientCert(env, certId);
-  } catch (e) {
-    console.log(JSON.stringify({ event: 'hub.certs.orphan_revoke_failed', machine: machineId, cert_id: certId, error: String(e) }));
-    result = 'failed';
-  }
-  if (result === 'revoked') return; // fully gone at the CA — nothing left to track
-  try {
-    await env.DB.prepare('INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES (?1, ?2, ?3, ?4)')
-      .bind(fingerprint, certId, machineId, new Date().toISOString())
-      .run();
+    await retireCert(env, fingerprint, certId, machineId);
+    return;
   } catch (e) {
     console.log(JSON.stringify({ event: 'hub.certs.orphan_queue_failed', machine: machineId, cert_id: certId, error: String(e) }));
+  }
+  try {
+    await revokeClientCert(env, certId);
+  } catch (e) {
+    console.log(JSON.stringify({ event: 'hub.certs.orphan_revoke_failed', machine: machineId, cert_id: certId, error: String(e) }));
   }
 }
 
@@ -250,16 +249,16 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
     // The CA already signed the successor but the D1 write threw (outage, constraint, lock). Without
     // this the cert would be live at the CA yet recorded nowhere — a per-retry leak. Reclaim it.
     console.log(JSON.stringify({ event: 'hub.certs.renew_write_failed', machine: identity.machineId, cert_id: signed.id, error: String(e) }));
-    await reclaimSignedOrphan(env, newFp, signed.id, identity.machineId);
+    await reclaimOrphan(env, newFp, signed.id, identity.machineId);
     return Response.json({ error: 'renew_write_failed' }, { status: 500 });
   }
 
   if (changes === 0) {
     // Normal path: a competing rotation advanced current. Recovery path: the grace window closed or
-    // the row moved under us. Either way the cert we just minted is an orphan. Queue it and settle —
-    // because revocation is async, a bare best-effort DELETE that returns 'pending_revocation' (or
-    // fails) would leave a live cert untracked; the queue makes the prune drive it to 'revoked'.
-    await retireCert(env, newFp, signed.id, identity.machineId);
+    // the row moved under us. Either way the cert we just minted is an orphan. reclaimOrphan queues
+    // it (so the async revoke is driven to completion by the prune) and NEVER throws — a cleanup
+    // failure must not turn the CAS-decided 409 into a 500 that strands the cert.
+    await reclaimOrphan(env, newFp, signed.id, identity.machineId);
     return Response.json({ error: 'renew_conflict' }, { status: 409 });
   }
 
