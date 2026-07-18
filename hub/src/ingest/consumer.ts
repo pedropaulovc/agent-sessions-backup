@@ -1205,11 +1205,15 @@ async function kickSiblings(file: FileRow, env: Env, spentSoFar: number): Promis
         spent += 2; // the attempted flip/send + the state re-check
         // Flip landed but send threw → sibling is 'pending' with no message. Revert it to 'parsed' so the
         // ExportRetry below re-kicks it (flip+send together) instead of degrading into a files/check 'upload'
-        // reparse that bypasses the recover-only healthy-owner skip. If the compensation itself throws, log
-        // loudly and fall through — the eventual files/check heal still recovers the sibling.
+        // reparse that bypasses the recover-only healthy-owner skip. PIN the revert to the exact bytes we
+        // flipped (content_hash from the kick-time SELECT): if the sibling was RE-UPLOADED between our flip
+        // and here, its 'pending' row now holds FRESH bytes with a new hash — reverting THAT to 'parsed'
+        // would strand the fresh upload terminal 'parsed' (and, if its own queue send was lost, files/check
+        // treats it as complete and never reparses it). The hash guard makes the revert no-op in that race.
+        // If the compensation itself throws, log loudly and fall through — the files/check heal still recovers.
         if (row?.parse_state === 'pending') {
           try {
-            await env.DB.prepare("UPDATE files SET parse_state = 'parsed' WHERE id = ?1 AND parse_state = 'pending'").bind(other.id).run();
+            await env.DB.prepare("UPDATE files SET parse_state = 'parsed' WHERE id = ?1 AND parse_state = 'pending' AND content_hash = ?2").bind(other.id, other.content_hash).run();
             spent += 1;
           } catch (compErr) {
             console.log(JSON.stringify({ event: 'parse.export.recover_kick_compensate_failed', file_id: file.id, sibling: other.id, error: String(compErr) }));

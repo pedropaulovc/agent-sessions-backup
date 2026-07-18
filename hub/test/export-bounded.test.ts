@@ -1298,6 +1298,46 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(await fileState(sib.fileId)).toBe('pending'); // kicked for reparse (2nd send landed)
   });
 
+  it('does not revert a sibling re-uploaded between the failed recover kick and the compensation (round 10 finding 1, hash-guarded compensation)', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    const sib = await uploadConvs('r10f1-sib', [conv('r10f1sib', 0)]);
+    await deliverChain({ file_id: sib.fileId, r2_key: sib.r2Key, reason: 'upload', content_hash: sib.hash });
+    expect(await fileState(sib.fileId)).toBe('parsed');
+
+    const fileA = await uploadConvs('r10f1', Array.from({ length: 4 }, (_u, i) => conv('r10f1', i)));
+    await deliverChain({ file_id: fileA.fileId, r2_key: fileA.r2Key, reason: 'upload', content_hash: fileA.hash });
+    const replaced = await uploadConvs('r10f1', [conv('r10f1', 0)]);
+
+    // When the recover send to sib throws, the flip has already landed (sib 'pending' with the OLD hash).
+    // RACE a fresh re-upload of sib in right there (new bytes → new hash, its OWN 'upload' message enqueued
+    // via realSend) so the compensation that follows the throw sees a 'pending' row holding FRESH bytes.
+    const realSend = testEnv.PARSE_QUEUE.send;
+    let freshHash = '';
+    let raced = false;
+    testEnv.PARSE_QUEUE.send = (async (m: ParseMessage) => {
+      if (m.file_id === sib.fileId && m.reason === 'recover' && !raced) {
+        raced = true;
+        freshHash = await reuploadRawExport('r10f1-sib', claudeExportZip([conv('r10f1sib', 0), conv('r10f1sib', 1)]));
+        throw new Error('queue send outage on recover');
+      }
+      return (realSend as (b: ParseMessage) => Promise<unknown>)(m);
+    }) as typeof testEnv.PARSE_QUEUE.send;
+    try {
+      await deliver({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
+    } finally {
+      testEnv.PARSE_QUEUE.send = realSend;
+    }
+
+    // POSITIVE CONTROL: without `AND content_hash = ?` on the compensation, it reverts sib to 'parsed',
+    // burying the fresh re-upload's pending bytes as terminal 'parsed' (and if that upload's own send were
+    // lost, files/check would treat it complete and never reparse). Hash-guarded, the revert no-ops: sib
+    // stays 'pending' with the FRESH hash, so its own upload parse still runs.
+    expect(freshHash).not.toBe(sib.hash);
+    const row = await testEnv.DB.prepare('SELECT parse_state, content_hash FROM files WHERE id = ?1').bind(sib.fileId).first<{ parse_state: string; content_hash: string }>();
+    expect(row?.parse_state).toBe('pending');
+    expect(row?.content_hash).toBe(freshHash);
+  });
+
   it('bounds the sibling recovery fan-out to one page per cleanup invocation (round 9 finding 4)', async () => {
     budgets({ slice: 800, invocation: 800 });
     // main owns 4 sessions, then re-uploaded small so its reparse cleanup reconciles 3 stale (fires fan-out).

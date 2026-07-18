@@ -1,0 +1,14 @@
+-- Index the canonical_file_id lookups. The export cleanup phase pages stale sessions with
+--   SELECT session_id FROM sessions WHERE canonical_file_id = ?1 AND session_id > ?2 ORDER BY session_id ASC LIMIT ?3
+-- (consumer.ts) — its hot loop for a large replacement archive. Without an index on canonical_file_id,
+-- D1 walks/filters the whole sessions table per page, so a big cleanup can blow CPU/latency even though
+-- subrequests are budgeted. A composite (canonical_file_id, session_id) serves that cursor exactly:
+-- equality on the leading column, range + ordering on the second, so each page is bounded.
+--
+-- The same index also covers every other "all sessions owned by this file" hot path — failExportFile's
+-- owned-session flip, revertOwnedReady, flipOwnedSessionsToParsing on upload, and the reindex-prefix flip
+-- (ops.ts) — all of which filter WHERE canonical_file_id = ?. This protects the reindex drill path too.
+--
+-- Numbered 0006 deliberately: 0004/0005 are reserved by other in-flight branches (0005 = cert rotation,
+-- PR #20). A numbering gap is harmless; a collision is not.
+CREATE INDEX IF NOT EXISTS idx_sessions_canonical_file ON sessions(canonical_file_id, session_id);
