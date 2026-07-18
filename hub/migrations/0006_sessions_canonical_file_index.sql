@@ -12,3 +12,11 @@
 -- Numbered 0006 deliberately: 0004/0005 are reserved by other in-flight branches (0005 = cert rotation,
 -- PR #20). A numbering gap is harmless; a collision is not.
 CREATE INDEX IF NOT EXISTS idx_sessions_canonical_file ON sessions(canonical_file_id, session_id);
+
+-- files.parse_state gains a new value this PR: 'reserved'. The export cleanup RESERVE phase flips a sibling
+-- archive 'parsed' → 'reserved' as a durable recovery reservation BEFORE deleting any stale session; the
+-- SEND-LATE pass then keys recover messages off exactly that state. 'reserved' is NON-TERMINAL and healable —
+-- files/check and the same-hash upload path re-enqueue it like 'pending' (TERMINAL_PARSE_STATES excludes it),
+-- and /status + /machines count it under files_pending. files.parse_state has no CHECK constraint (it is
+-- documented as pending|parsed|error|skipped|superseded|reserved in 0001), so no column change is needed;
+-- this note records the new value alongside the migration that introduces its writer.

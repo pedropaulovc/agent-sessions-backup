@@ -187,7 +187,7 @@ async function computeIndexedThrough(env: Env, p: URLSearchParams): Promise<stri
              WHERE machine_id IN (
                SELECT machine_id FROM sessions WHERE harness = ?1
                UNION
-               SELECT machine_id FROM files WHERE (harness = ?1${EXPORT_ARCHIVE_HARNESSES.has(harness) ? ` OR ${unknownExportArchiveClause}` : ''}) AND parse_state IN ('pending', 'error')
+               SELECT machine_id FROM files WHERE (harness = ?1${EXPORT_ARCHIVE_HARNESSES.has(harness) ? ` OR ${unknownExportArchiveClause}` : ''}) AND parse_state IN ('pending', 'reserved', 'error')
              )`,
           )
           .bind(harness)

@@ -498,9 +498,13 @@ export let EXPORT_OVERSIZED_CEILING = 700;
 export let EXPORT_OVERSIZED_SUBREQUEST_CAP = 900;
 // The cleanup sibling-recovery fan-out processes siblings in pages of this size so a store with many archive
 // siblings can't spend the whole invocation budget in one unbounded fan-out (round 9 finding 4). Both passes
-// page by files.id: the RESERVE phase flips 'parsed' siblings to 'pending' (spanning reserve continuations
-// when it can't fit), and the SEND-LATE pass enqueues recover messages to those reserved siblings.
+// page by files.id: the RESERVE phase flips 'parsed' siblings to 'reserved' (spanning reserve continuations
+// when it can't fit), and the SEND-LATE pass enqueues recover messages to those 'reserved' siblings.
 export let EXPORT_KICK_PAGE = 50;
+// Abort the SEND-LATE recover fan-out after this many CONSECUTIVE failed queue sends — a queue outage, not a
+// transient blip. Stopping bounds the subrequest spend (each attempt, success or fail, is charged); the
+// siblings left 'reserved' heal via files/check. Not budget-dialed; a plain module const (exported for tests).
+export const EXPORT_SEND_FAILURE_LIMIT = 5;
 
 /** Test-only: dial the export/invocation subrequest budgets down so slicing/cleanup/deferral can be
  * exercised with tiny fixtures instead of thousands of conversations. */
@@ -786,19 +790,20 @@ async function runExportParse(
   // still own — this replaces the old "markParsed FIRST" ordering while keeping its protection (a stale
   // parse can't delete a conversation the current bytes still contain, because its recheck returns early).
   //
-  // Sibling recovery is FLIP-EARLY / SEND-LATE (round 11). Kicking overlapping archives has two jobs with
-  // OPPOSITE ordering needs: the RESERVATION (durable 'pending' state) must precede the first delete so a
-  // dropped conversation always has a home to be re-claimed from; the recovery MESSAGE must follow the LAST
-  // delete, because a recover parse that runs while our stale rows are still owned+present would see them as
-  // healthy other-owner rows, skip them, and complete its one recovery pass without re-claiming the sessions
-  // we then delete. The old flip+send-together kick violated this across a multi-page fan-out (page-1 recover
-  // messages sat ahead of the cleanup continuation). So: (1) SCAN for the first stale session — a clean
-  // re-parse that dropped nothing never advances past scan and never touches a sibling; (2) on the first
-  // stale, RESERVE — flip every 'parsed' sibling to 'pending' (paged by files.id, hash-pinned, NO send),
-  // completing fully before any delete; a 'pending' row is a durable reservation (files/check re-enqueues it
-  // as 'upload', now SAFE because the mtime guard gap-fills under every reason); (3) DELETE the stale
-  // sessions; (4) once cleanup drains and the file is marked 'parsed', SEND-LATE — best-effort recover
-  // messages to the reserved siblings. No send in the flip loop ⇒ no compensation/hash-recheck machinery.
+  // Sibling recovery is FLIP-EARLY / SEND-LATE (round 11), made explicit in durable state (round 12). Kicking
+  // overlapping archives has two jobs with OPPOSITE ordering needs: the RESERVATION (durable 'reserved' state)
+  // must precede the first delete so a dropped conversation always has a home to be re-claimed from; the
+  // recovery MESSAGE must follow the LAST delete, because a recover parse that runs while our stale rows are
+  // still owned+present would see them as healthy other-owner rows, skip them, and complete its one recovery
+  // pass without re-claiming the sessions we then delete. The old flip+send-together kick violated this across
+  // a multi-page fan-out (page-1 recover messages sat ahead of the cleanup continuation). So: (1) SCAN for the
+  // first stale session — a clean re-parse that dropped nothing never advances past scan and never touches a
+  // sibling; (2) on the first stale, RESERVE — flip every 'parsed' sibling to 'reserved' (paged by files.id,
+  // hash-pinned, NO send), completing fully before any delete; a 'reserved' row is a durable reservation that
+  // is its OWN marker (files/check treats it non-terminal and re-enqueues it as 'upload', SAFE because the
+  // mtime guard gap-fills under every reason); (3) DELETE the stale sessions; (4) once cleanup drains and the
+  // file is marked 'parsed', SEND-LATE — best-effort recover messages to exactly the 'reserved' siblings. No
+  // send in the flip loop ⇒ no compensation/hash-recheck machinery.
   //
   // Two regimes per stale session:
   //  - archive.skipped === 0 (every row parsed): a GENUINE deletion — delete its derived rows + session
@@ -848,8 +853,8 @@ async function runExportParse(
   // ── SCAN / DELETE loop ───────────────────────────────────────────────────────────────────────────
   // In the 'scan' phase (first cleanup entry) `reserved` is false, so the FIRST stale session triggers the
   // reservation — inline when it fits the remaining budget, else handed to a 'reserve' continuation — BEFORE
-  // any delete. This is the round-6-finding-4 ordering in durable-'pending'-reservation form: no session is
-  // deleted until every overlapping sibling is at least 'pending'. A clean re-parse (no stale) never reaches
+  // any delete. This is the round-6-finding-4 ordering in durable-'reserved'-state form: no session is
+  // deleted until every overlapping sibling is at least 'reserved'. A clean re-parse (no stale) never reaches
   // the reserve branch, so it never touches a sibling.
   const cleanupGuardSql = contentHash !== undefined ? ' AND EXISTS (SELECT 1 FROM files WHERE id = ?2 AND content_hash = ?3)' : '';
   const bindCleanup = (stmt: D1PreparedStatement, sessionId: string): D1PreparedStatement =>
@@ -879,7 +884,7 @@ async function runExportParse(
         cursor = session_id; // advance past a KEPT row (decided)
         continue;
       }
-      // First STALE session: RESERVE every overlapping sibling ('parsed' → 'pending') before deleting.
+      // First STALE session: RESERVE every overlapping sibling ('parsed' → 'reserved') before deleting.
       if (!reserved) {
         const r = await reserveSiblings(file, env, contentHash, 0, spent);
         spent += r.spent;
@@ -944,10 +949,26 @@ async function runExportParse(
   }
 
   // SEND-LATE: every delete has committed and the file is terminal 'parsed', so no recover parse can now
-  // see a still-owned stale row. Best-effort enqueue recover messages for the reserved ('pending') siblings.
-  // A per-sibling send failure just leaves it 'pending' — files/check re-enqueues it (SAFE under the
-  // every-reason mtime guard) — so we log and carry on: no compensation, no state re-check (round 11).
-  if (recovered.size > 0) spent += await sendRecoverToReservedSiblings(file, env, spent);
+  // see a still-owned stale row. Best-effort enqueue recover messages for the siblings this cleanup reserved
+  // ('reserved' state — round 12). Run UNCONDITIONALLY, not gated on THIS invocation's `recovered` set
+  // (3608692127): when stale cleanup spans continuations, the delivery that deletes the last stale session
+  // may stop on budget before seeing the empty page, so the NEXT delivery reaches here with recovered.size 0
+  // even though earlier deliveries reserved siblings — the 'reserved' SELECT (1 subrequest, empty when
+  // there's nothing) fans them out regardless.
+  //
+  // Recheck OUR hash immediately before the sends (3608692134): a re-upload in the post-markParsed window
+  // means the fresh message owns the file and will run its OWN cleanup + reserve + fan-out, so skip ours. The
+  // irreducible residual (bytes change AFTER this recheck) is self-healing: a stale recover claiming a
+  // just-deleted session holds it only until the fresh upload parse runs (the every-reason mtime rule lets
+  // the newer archive re-claim), and a dropped fresh parse is healed by files/check — never terminal staleness.
+  let hashStillOurs = true;
+  if (contentHash !== undefined) {
+    const recheck = await env.DB.prepare('SELECT content_hash FROM files WHERE id = ?1').bind(file.id).first<{ content_hash: string }>();
+    spent += 1;
+    hashStillOurs = recheck?.content_hash === contentHash;
+    if (!hashStillOurs) console.log(JSON.stringify({ event: 'parse.export.send_late_skipped', file_id: file.id, reason: 'hash_changed' }));
+  }
+  if (hashStillOurs) spent += await sendRecoverToReservedSiblings(file, env, spent);
 
   console.log(
     JSON.stringify({
@@ -988,9 +1009,10 @@ async function sendCleanupContinuation(
   }
 }
 
-/** RESERVE pass: flip every 'parsed' sibling archive to 'pending' — a DURABLE recovery reservation — paged
- * by files.id so pages advance independent of parse_state (a sibling healed back to 'parsed' behind the
- * cursor can't re-trigger a re-flip → no livelock). NO queue send here; the recover messages go out later,
+/** RESERVE pass: flip every 'parsed' sibling archive to 'reserved' — a DURABLE recovery reservation that is
+ * its own explicit marker (round 12) — paged by files.id so pages advance independent of parse_state (a
+ * sibling healed back to 'parsed' behind the cursor can't re-trigger a re-flip → no livelock). NO queue send
+ * here; the recover messages go out later, keyed off exactly the 'reserved' state,
  * after every delete commits (see sendRecoverToReservedSiblings). The flip is hash-PINNED to the bytes read
  * (round 10): a sibling re-uploaded between the SELECT and the UPDATE has a new hash and is no longer
  * 'parsed', so the guarded UPDATE no-ops and never buries fresh upload bytes as a stale reservation. Returns
@@ -1026,7 +1048,7 @@ async function reserveSiblings(
       const chunk = sibs.results.slice(i, i + FLIP_BATCH_CHUNK);
       await env.DB.batch(
         chunk.map((s) =>
-          env.DB.prepare("UPDATE files SET parse_state = 'pending' WHERE id = ?1 AND parse_state = 'parsed' AND content_hash = ?2").bind(s.id, s.content_hash),
+          env.DB.prepare("UPDATE files SET parse_state = 'reserved' WHERE id = ?1 AND parse_state = 'parsed' AND content_hash = ?2").bind(s.id, s.content_hash),
         ),
       );
       spent += 1;
@@ -1037,28 +1059,49 @@ async function reserveSiblings(
   return { spent, complete: false, kickCursor: kc, superseded: false };
 }
 
-/** SEND-LATE recovery pass: page the reserved ('pending') siblings and enqueue a recover message for each,
- * best-effort. Runs only AFTER every stale delete has committed, so ordering is guaranteed — a recover parse
- * can never see one of our stale rows still owned+present. A send failure leaves the sibling 'pending' for
- * files/check to heal, so there is nothing to compensate. Bounded by the invocation budget; any siblings not
- * reached this invocation are healed by files/check (the durable 'pending' reservation is the safety net). */
+/** SEND-LATE recovery pass: page the siblings THIS cleanup reserved (parse_state = 'reserved') and enqueue a
+ * recover message for each, best-effort. Runs only AFTER every stale delete has committed, so ordering is
+ * guaranteed — a recover parse can never see one of our stale rows still owned+present.
+ *
+ * SELECTs exactly 'reserved', never 'pending' (3608692125): an unrelated pending upload — including one whose
+ * own upload message was dropped — is NOT a recovery target, so a recover-reason parse can't hijack a fresh
+ * upload's heal path. On a successful send the row stays 'reserved' (no extra UPDATE): the consumed recover
+ * parse moves it through parsing → terminal via its own markParsed, and if the message is dropped, files/check
+ * re-enqueues 'reserved' as an 'upload' (it's non-terminal) — so leaving it 'reserved' is both cheaper (saves a
+ * subrequest per send) and heals identically whether the send landed or not. A duplicate recover from a later
+ * cleanup that re-selects a still-'reserved' row is harmless (recover is idempotent under the mtime guard).
+ *
+ * A FAILED send is charged to the budget too (3608692129) so a queue outage can't spin the pager issuing
+ * thousands of failing sends while only the SELECTs advance `spent`; after EXPORT_SEND_FAILURE_LIMIT
+ * consecutive failures we abort the fan-out (the 'reserved' rows heal via files/check). Bounded by the
+ * invocation budget; any siblings not reached this invocation stay 'reserved' and are healed by files/check
+ * (the durable reservation is the safety net). */
 async function sendRecoverToReservedSiblings(file: FileRow, env: Env, spentSoFar: number): Promise<number> {
   let spent = 0;
   let cursor = 0;
+  let consecutiveFailures = 0;
   while (spentSoFar + spent < EXPORT_QUERY_BUDGET) {
     const sibs = await env.DB.prepare(
-      "SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND id > ?3 AND parse_state = 'pending' ORDER BY id ASC LIMIT ?4",
+      "SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND id > ?3 AND parse_state = 'reserved' ORDER BY id ASC LIMIT ?4",
     )
       .bind(file.store, file.id, cursor, EXPORT_KICK_PAGE)
       .all<{ id: number; r2_key: string; content_hash: string }>();
     spent += 1;
     if (sibs.results.length === 0) break;
     for (const s of sibs.results) {
+      if (spentSoFar + spent >= EXPORT_QUERY_BUDGET) return spent; // budget hit mid-page
       try {
         await env.PARSE_QUEUE.send({ file_id: s.id, r2_key: s.r2_key, reason: 'recover', content_hash: s.content_hash });
         spent += 1;
+        consecutiveFailures = 0;
       } catch (e) {
+        spent += 1; // charge the attempted send even though it threw (3608692129)
+        consecutiveFailures += 1;
         console.log(JSON.stringify({ event: 'parse.export.recover_send_failed', file_id: file.id, sibling: s.id, error: String(e) }));
+        if (consecutiveFailures >= EXPORT_SEND_FAILURE_LIMIT) {
+          console.log(JSON.stringify({ event: 'parse.export.recover_fan_out_aborted', file_id: file.id, reason: 'queue_outage', last_sibling: s.id }));
+          return spent; // queue outage — stop; the still-'reserved' siblings heal via files/check
+        }
       }
     }
     cursor = sibs.results[sibs.results.length - 1]!.id;

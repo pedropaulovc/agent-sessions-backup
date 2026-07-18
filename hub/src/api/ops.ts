@@ -501,7 +501,7 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
 export async function status(env: Env): Promise<Response> {
   const machines = await env.DB.prepare(
     `SELECT m.machine_id, m.os, m.last_seen_at, m.last_upload_at,
-            SUM(CASE WHEN f.parse_state = 'pending' THEN 1 ELSE 0 END) AS files_pending,
+            SUM(CASE WHEN f.parse_state IN ('pending', 'reserved') THEN 1 ELSE 0 END) AS files_pending,
             SUM(CASE WHEN f.parse_state = 'error' THEN 1 ELSE 0 END) AS files_error,
             COUNT(f.id) AS files_total
      FROM machines m LEFT JOIN files f ON f.machine_id = m.machine_id

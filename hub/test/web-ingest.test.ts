@@ -45,7 +45,11 @@ const putText = (machine: string, store: string, relpath: string, text: string) 
   put(machine, store, relpath, new TextEncoder().encode(text));
 
 async function drainQueue(): Promise<void> {
-  const pending = await testEnv.DB.prepare("SELECT id, r2_key FROM files WHERE parse_state = 'pending'").all<{ id: number; r2_key: string }>();
+  // Include 'reserved' — the export cleanup RESERVE phase flips a sibling to 'reserved' (not 'pending') and
+  // the SEND-LATE pass enqueues its recover message; this harness rebuilds messages from DB state, so it must
+  // pick up 'reserved' rows too (production delivers them via the real queue). files/check heals 'reserved'
+  // identically, so replaying it with the captured reason ('recover', or 'upload' if none) matches prod.
+  const pending = await testEnv.DB.prepare("SELECT id, r2_key FROM files WHERE parse_state IN ('pending', 'reserved')").all<{ id: number; r2_key: string }>();
   const messages = pending.results.map((r) => ({
     id: String(r.id),
     timestamp: new Date(),
@@ -58,10 +62,11 @@ async function drainQueue(): Promise<void> {
   await worker.queue({ queue: 'parse', messages, ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>, testEnv);
 }
 
-/** Drain repeatedly until nothing is pending — a recover enqueue flips a sibling file back to pending. */
+/** Drain repeatedly until nothing is pending/reserved — the RESERVE phase flips a sibling to 'reserved', and
+ * its late-sent recover parse then moves it through to terminal. */
 async function drainAll(): Promise<void> {
   for (let i = 0; i < 10; i++) {
-    const n = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM files WHERE parse_state = 'pending'").first<{ n: number }>();
+    const n = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM files WHERE parse_state IN ('pending', 'reserved')").first<{ n: number }>();
     if ((n?.n ?? 0) === 0) return;
     await drainQueue();
   }

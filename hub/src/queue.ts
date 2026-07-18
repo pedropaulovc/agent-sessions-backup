@@ -1,6 +1,6 @@
 /**
  * Invariant: a row with an outstanding parse message must be in a NON-TERMINAL parse_state
- * ('pending' or 'error') — never 'parsed'/'skipped'/'superseded'. That's what lets
+ * ('pending', 'error', or 'reserved') — never 'parsed'/'skipped'/'superseded'. That's what lets
  * `/api/v1/files/check` and the same-hash upload fast path self-heal a lost or dead-lettered
  * message: both treat a terminal row as "done, nothing to do" and only ever re-enqueue
  * non-terminal ones. Sending a parse message for a row still marked terminal breaks that
