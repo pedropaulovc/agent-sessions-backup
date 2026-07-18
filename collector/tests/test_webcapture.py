@@ -6,7 +6,7 @@ import pytest
 from agent_collector import config, run as run_mod
 from agent_collector.state import State
 from agent_collector.transport import Transport
-from agent_collector.webcapture import PRODUCTS, cmd_webcapture
+from agent_collector.webcapture import PRODUCTS, _run_products, cmd_webcapture
 from agent_collector.webcapture.cdp import FakeCdpTransport
 from agent_collector.webcapture.chatgpt import capture_chatgpt
 from agent_collector.webcapture.claude import capture_claude
@@ -143,6 +143,31 @@ def test_claude_empty_first_page_is_zero_not_error(tmp_path, monkeypatch):
         res = capture_claude(transport, st, tmp_path / "claude-web", events)
     assert res.checked == 0 and res.captured == 0 and res.errors == 0
     assert events == []
+
+
+def test_webcapture_missing_store_root_is_per_product_error_not_crash(tmp_path):
+    # Round 12 Fix 5: on WSL with include_windows_mounts=false a staging root under /mnt/<drive> is
+    # dropped from cfg.store_roots(). A bare dict lookup would KeyError out of the whole command
+    # (losing buffered events, skipping the other product). The missing root must become a
+    # per-product error event, and the OTHER product must still capture.
+    store_roots = {"claude-web": tmp_path / "claude-web"}  # chatgpt-web deliberately absent
+
+    def factory(origin):
+        return _chatgpt_transport() if origin == PRODUCTS["chatgpt"][0] else _claude_transport()
+
+    with State(tmp_path / "state.db") as st:
+        results, events = _run_products(None, st, ["chatgpt", "claude"], store_roots, factory)
+
+    # chatgpt: a per-product error event + a failed result, no KeyError/crash.
+    assert any(e["code"] == "webcapture_no_store_root" and e["store"] == "chatgpt-web" for e in events)
+    chatgpt_res = next(r for r in results if r.product == "chatgpt")
+    assert chatgpt_res.logged_in is False and chatgpt_res.errors >= 1
+    # claude still captured despite chatgpt's missing root.
+    claude_res = next(r for r in results if r.product == "claude")
+    assert claude_res.captured == 1
+    assert (tmp_path / "claude-web" / "k1.json").exists()
+    # rc convention: a not-logged-in product drives a non-zero exit.
+    assert any(not r.logged_in for r in results)
 
 
 def test_claude_signed_out_emits_login_event(tmp_path):

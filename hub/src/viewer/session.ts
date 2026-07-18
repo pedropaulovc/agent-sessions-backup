@@ -5,7 +5,7 @@ import { parseChatgptWeb } from '../ingest/parsers/chatgpt-web';
 import { parseClaudeCode } from '../ingest/parsers/claude-code';
 import { parseClaudeWeb } from '../ingest/parsers/claude-web';
 import { parseCodex } from '../ingest/parsers/codex';
-import { extractConversationById } from '../ingest/parsers/export-inbox';
+import { parseConversationById } from '../ingest/parsers/export-inbox';
 import { parsePromptLog } from '../ingest/parsers/history';
 import { esc, pageFoot, pageHead, q } from './layout';
 
@@ -186,14 +186,12 @@ async function parseRange(
     const obj = await env.RAW.get(file.r2_key);
     if (!obj) return null;
     // Extract + parse ONLY this conversation, not the whole archive: parseExportArchive() would
-    // inflate and parse every conversation in the ZIP (potentially hundreds) on every page view.
-    // extractConversationById reuses the same conversations.json-only inflation as /raw and returns
-    // this conversation's JSON, re-serialized identically to how ingest parsed it (JSON.stringify of
-    // the same parsed object), so the stored per-conversation byte offsets still line up with windowTurns.
-    const convJson = extractConversationById(new Uint8Array(await obj.arrayBuffer()), sessionId);
-    if (convJson === undefined) return null;
-    const full = harness === 'chatgpt-web' ? parseChatgptWeb(convJson, sessionId) : parseClaudeWeb(convJson, sessionId);
-    return windowTurns(full, startByte, endByte);
+    // inflate and parse every conversation in the ZIP (potentially hundreds) on every page view. The
+    // shared parseConversationById reuses the same conversations.json-only inflation as /raw and
+    // parses the conversation from the identical JSON.stringify(conv) ingest used, so the stored
+    // per-conversation byte offsets still line up with windowTurns.
+    const full = parseConversationById(new Uint8Array(await obj.arrayBuffer()), sessionId);
+    return full ? windowTurns(full, startByte, endByte) : null;
   }
   if (isWebHarness(harness)) {
     const obj = await env.RAW.get(file.r2_key);

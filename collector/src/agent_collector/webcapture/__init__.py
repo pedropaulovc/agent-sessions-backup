@@ -74,7 +74,21 @@ def _run_products(cfg, st: State, products: list[str], store_roots: dict, transp
             print(f"unknown product {product!r} (expected chatgpt|claude)", file=sys.stderr)
             continue
         origin, store, capture = spec
-        staging_root = store_roots[store]
+        staging_root = store_roots.get(store)
+        if staging_root is None:
+            # cfg.store_roots() dropped this store's root — e.g. on WSL with
+            # include_windows_mounts=false a staging root under /mnt/<drive> is filtered out. A bare
+            # dict lookup would KeyError out of the WHOLE command (losing the buffered events so far
+            # and skipping the other product). Surface it as a per-product error and keep going, the
+            # same shape as the CdpError/OSError paths below.
+            print(f"[FAIL] {product} webcapture: no staging root for store {store!r} "
+                  f"(filtered from store_roots — check include_windows_mounts / staging path)", file=sys.stderr)
+            events.append({
+                "level": "error", "code": "webcapture_no_store_root",
+                "message": f"{product}: staging root for store {store!r} is not available", "count": 1, "store": store,
+            })
+            results.append(CaptureResult(product=product, logged_in=False, errors=1))
+            continue
         transport = transport_factory(origin)
         try:
             results.append(capture(transport, st, staging_root, events))

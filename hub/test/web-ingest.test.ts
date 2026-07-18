@@ -778,6 +778,98 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     const body = (await api.json()) as { session: { turns: unknown[] } };
     expect(body.session.turns.length).toBe(1);
   });
+
+  it('recovers a conversation across machines: an errored canonical on machine A is recovered from an export on machine B (round 12 Fix 1)', async () => {
+    const ex1 = chatgptExportZip([{ id: 'xm-conv', title: 'X from A', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'crossmachine content from A' }] }]);
+    const rA = await put('xm-a', 'export-inbox', 'xm-a.zip', ex1);
+    const fileAId = ((await rA.json()) as { file_id: number }).file_id;
+    await drainQueue();
+
+    // Machine B uploads a NEWER export of the SAME conversation (ids are globally unique) — B becomes canonical.
+    const ex2 = chatgptExportZip([{ id: 'xm-conv', title: 'X from B', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'crossmachine content from B' }] }]);
+    const rB = await put('xm-b', 'export-inbox', 'xm-b.zip', ex2);
+    const fileBId = ((await rB.json()) as { file_id: number }).file_id;
+    const ex2Key = 'raw/xm-b/export-inbox/xm-b.zip';
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT canonical_file_id AS c FROM sessions WHERE session_id = 'xm-conv'").first<{ c: number }>()).toMatchObject({ c: fileBId });
+
+    // B's raw object is lost, then B is reparsed: failExportFile errors xm-conv and kicks recovery.
+    // The fan-out must reach machine A's export (a DIFFERENT machine) to recover the conversation.
+    await testEnv.RAW.delete(ex2Key);
+    await deliverOne(fileBId, ex2Key);
+    await drainAll();
+
+    const after = await testEnv.DB.prepare(
+      `SELECT s.index_state, f.id AS canon FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = 'xm-conv'`,
+    ).first<{ index_state: string; canon: number }>();
+    expect(after?.index_state).toBe('ready'); // recovered, not stranded 'error'
+    expect(after?.canon).toBe(fileAId); // recovered from machine A's export
+  });
+
+  it('a skipped (id-less) row in a replacement archive does NOT delete a previously-owned session (round 12 Fix 3)', async () => {
+    const relpath = 'skiprows.zip';
+    const v1 = chatgptExportZip([
+      { id: 'sk-good', title: 'Good', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'skip good v1' }] },
+      { id: 'sk-keep', title: 'Keep', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'skip keep original' }] },
+    ]);
+    const r1 = await put('skipbox', 'export-inbox', relpath, v1);
+    const fileId = ((await r1.json()) as { file_id: number }).file_id;
+    await drainQueue();
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id IN ('sk-good','sk-keep')").first<{ n: number }>()).toMatchObject({ n: 2 });
+
+    // Replacement: sk-good updates; the second row is malformed (empty id) -> skipped, not written. The
+    // skip must be non-destructive: sk-keep (previously owned, now un-written) must survive, not be deleted.
+    const v2 = chatgptExportZip([
+      { id: 'sk-good', title: 'Good v2', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'skip good v2 updated' }] },
+      { id: '', title: 'Malformed', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'idless row' }] },
+    ]);
+    expect((await put('skipbox', 'export-inbox', relpath, v2)).status).toBe(201);
+    await drainAll();
+
+    expect(await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1').bind(fileId).first<{ parse_state: string }>()).toMatchObject({ parse_state: 'parsed' });
+    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'sk-keep'").first<{ n: number }>()).toMatchObject({ n: 1 }); // retained
+    expect(await testEnv.DB.prepare("SELECT title FROM sessions WHERE session_id = 'sk-good'").first<{ title: string }>()).toMatchObject({ title: 'Good v2' }); // updated
+  });
+
+  it('the single-session API read extracts only the target conversation from an archive, not the whole ZIP (round 12 Fix 4)', async () => {
+    const zip = chatgptExportZip(
+      [
+        { id: 'apix-target', title: 'T', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'APIXTARGET content' }] },
+        { id: 'apix-sibling', title: 'S', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'APIXSIBLING content' }] },
+      ],
+      { 'attachments/poison.bin': 'y'.repeat(40_000) },
+    );
+    await put('webbox', 'export-inbox', 'apix.zip', zip);
+    await drainQueue();
+    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions/apix-target', { headers: { 'x-dev-machine': 'webbox' } });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { meta: { session_id: string }; session: { turns: unknown[] } };
+    expect(body.meta.session_id).toBe('apix-target');
+    expect(body.session.turns.length).toBe(1);
+    const text = JSON.stringify(body.session);
+    expect(text).toContain('APIXTARGET');
+    expect(text).not.toContain('APIXSIBLING'); // only the target conversation was parsed/returned
+  });
+
+  it('the single-session API decodes the id path segment (prompt-log ids contain ":") (round 12 Fix 2)', async () => {
+    const content = historyLines([{ display: 'decode marker prompt', timestamp: 1_700_000_000_000 }]).join('\n');
+    await putText('decbox', 'claude', 'history.jsonl', content);
+    await drainQueue();
+    const id = 'promptlog:decbox:claude';
+
+    // Encoded form (what a correct client sends via encodeURIComponent) resolves to the session.
+    const enc = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${encodeURIComponent(id)}`, { headers: { 'x-dev-machine': 'decbox' } });
+    expect(enc.status).toBe(200);
+    expect(((await enc.json()) as { meta: { session_id: string } }).meta.session_id).toBe(id);
+
+    // The raw unencoded ':' form still works (':' is a valid path character).
+    const raw = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${id}`, { headers: { 'x-dev-machine': 'decbox' } });
+    expect(raw.status).toBe(200);
+
+    // A malformed %-sequence is a 400, not an uncaught 500.
+    const bad = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions/promptlog%ZZ', { headers: { 'x-dev-machine': 'decbox' } });
+    expect(bad.status).toBe(400);
+  });
 });
 
 describe('prompt-log file rows upgrade a legacy NULL session_id on re-upload (round 3 Fix 2)', () => {

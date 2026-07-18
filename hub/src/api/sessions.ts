@@ -1,6 +1,6 @@
 import { detect } from '../ingest/detect';
 import { isWebHarness, parseObject } from '../ingest/parse';
-import { extractConversationById, parseExportArchive } from '../ingest/parsers/export-inbox';
+import { extractConversationById, parseConversationById, parseExportArchive } from '../ingest/parsers/export-inbox';
 import type { ExportArchive } from '../ingest/parsers/export-inbox';
 import type { NormalizedSession } from '../ingest/normalize';
 
@@ -37,16 +37,20 @@ export async function loadNormalized(
   if (!file) return null;
   const det = detect(file.store, file.relpath);
   if (det.kind === 'export-archive') {
-    // The canonical object is a multi-conversation ZIP; re-extract just this session by id, reusing
-    // an already-parsed archive from the per-request cache when present (see the doc comment).
-    let archive = archiveCache?.get(file.r2_key);
-    if (!archive) {
-      const obj = await env.RAW.get(file.r2_key);
-      if (!obj) return null;
-      archive = parseExportArchive(new Uint8Array(await obj.arrayBuffer()));
-      archiveCache?.set(file.r2_key, archive);
+    const cached = archiveCache?.get(file.r2_key);
+    if (cached) return cached.sessions.find((s) => s.id === sessionId) ?? null;
+    const obj = await env.RAW.get(file.r2_key);
+    if (!obj) return null;
+    const bytes = new Uint8Array(await obj.arrayBuffer());
+    // Bulk NDJSON path (a cache is supplied): many sibling sessions share ONE ZIP — parse it whole
+    // once and memoize, so N sessions cost one archive parse. A single-session read (no cache) must
+    // NOT parse every conversation: extract + parse ONLY this one (same targeted path the viewer uses).
+    if (archiveCache) {
+      const archive = parseExportArchive(bytes);
+      archiveCache.set(file.r2_key, archive);
+      return archive.sessions.find((s) => s.id === sessionId) ?? null;
     }
-    return archive.sessions.find((s) => s.id === sessionId) ?? null;
+    return parseConversationById(bytes, sessionId);
   }
   const obj = await env.RAW.get(file.r2_key);
   if (!obj) return null;

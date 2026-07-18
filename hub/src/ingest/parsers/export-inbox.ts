@@ -113,6 +113,23 @@ export function extractConversationById(bytes: Uint8Array, id: string): string |
   return undefined;
 }
 
+/**
+ * Extract + parse a SINGLE conversation from an export ZIP into a NormalizedSession, WITHOUT parsing
+ * the rest of the archive. The targeted read path for single-session loads (the API's loadNormalized
+ * and the viewer's parseRange): parsing the whole archive would inflate + parse every conversation
+ * in the ZIP (potentially hundreds) on each request. Byte offsets line up with what ingest stored —
+ * both parse the identical JSON.stringify(conv) re-serialization.
+ */
+export function parseConversationById(bytes: Uint8Array, id: string): NormalizedSession | null {
+  const convJson = extractConversationById(bytes, id);
+  if (convJson === undefined) return null;
+  // Layout is inferred from the conversation's own shape, the same way parseExportArchive does.
+  // JSON.parse can't throw here — convJson came straight from JSON.stringify above.
+  const harness = detectLayout([JSON.parse(convJson)]);
+  if (harness === 'unknown') return null;
+  return harness === 'chatgpt-web' ? parseChatgptWeb(convJson, id) : parseClaudeWeb(convJson, id);
+}
+
 /** Inflate ONLY conversations.json (fflate filter runs before decompression), then decode it. */
 function extractConversationsJson(bytes: Uint8Array): string | undefined {
   let files: Record<string, Uint8Array>;

@@ -322,10 +322,15 @@ async function failExportFile(file: FileRow, env: Env, contentHash: string | und
     await env.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(session_id).run();
   }
   if (owned.results.length > 0) {
+    // Recover from export files on ANY machine, not just this one. Export rows carry
+    // files.session_id = NULL (never in the normal duplicate-recovery pool), and conversation ids
+    // are globally unique per account — so a same-account export uploaded from a DIFFERENT collector
+    // can hold a conversation this errored file owned. Keeping the machine_id filter would strand
+    // those sessions errored until a manual reindex. (self-exclusion + non-error kept.)
     const others = await env.DB.prepare(
-      `SELECT id, r2_key, content_hash FROM files WHERE machine_id = ?1 AND store = ?2 AND id != ?3 AND parse_state != 'error'`,
+      `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state != 'error'`,
     )
-      .bind(file.machine_id, file.store, file.id)
+      .bind(file.store, file.id)
       .all<{ id: number; r2_key: string; content_hash: string }>();
     for (const other of others.results) await markPendingAndEnqueue(other, 'recover', env);
   }
@@ -437,8 +442,14 @@ async function parseExportInto(file: FileRow, env: Env, reason: ParseMessage['re
   // delete+reinsert reparse semantics (derived rows + this session row; raw R2 untouched). A
   // well-formed empty array correctly clears everything this file owned; the invalid case already
   // returned above, so a corrupt re-upload never reaches here.
+  // A conversation PRESENT in the replacement archive but skipped (malformed / id field renamed
+  // away) is left out of `written`, yet it must NOT be treated as a deletion: an id-less skipped row
+  // can't be matched back to the prior session it may correspond to, so deleting un-written owned
+  // sessions while ANY row was skipped could destroy a still-present-but-malformed conversation. Run
+  // the destructive cleanup only when EVERY row parsed (archive.skipped === 0), so genuine absence is
+  // still deleted; otherwise retain the un-written sessions (preservation-first).
   const recovered = new Set<string>();
-  {
+  if (archive.skipped === 0) {
     const owned = await env.DB.prepare('SELECT session_id FROM sessions WHERE canonical_file_id = ?1')
       .bind(file.id)
       .all<{ session_id: string }>();
@@ -456,16 +467,17 @@ async function parseExportInto(file: FileRow, env: Env, reason: ParseMessage['re
     }
   }
 
-  // Overlapping archives: a session we just deleted may still live in an OLDER export file that
-  // once lost ownership to this one (archives keep no files.session_id duplicates for the normal
-  // recovery path to pick from). Re-enqueue the other export-inbox files on this machine so their
-  // reparse re-claims any conversation they still contain — a transient absence self-heals.
-  // Exports are few (one-time backfills), so this fan-out is cheap and rare.
+  // Overlapping archives: a session we just deleted may still live in ANOTHER export file that once
+  // lost ownership to this one (archives keep no files.session_id duplicates for the normal recovery
+  // path to pick from). Re-enqueue the other export-inbox files — on ANY machine, since conversation
+  // ids are globally unique per account and a same-account export can be uploaded from a different
+  // collector — so their reparse re-claims any conversation they still contain; a transient absence
+  // self-heals. Exports are few (one-time backfills), so this fan-out is cheap and rare.
   if (recovered.size > 0) {
     const others = await env.DB.prepare(
-      `SELECT id, r2_key, content_hash FROM files WHERE machine_id = ?1 AND store = ?2 AND id != ?3 AND parse_state != 'error'`,
+      `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state != 'error'`,
     )
-      .bind(file.machine_id, file.store, file.id)
+      .bind(file.store, file.id)
       .all<{ id: number; r2_key: string; content_hash: string }>();
     for (const other of others.results) await markPendingAndEnqueue(other, 'recover', env);
   }

@@ -5,6 +5,16 @@ import { search } from './api/search';
 import { getSession, getSessionRaw, listSessions } from './api/sessions';
 import { viewerRoute } from './viewer/router';
 
+/** decodeURIComponent that returns null instead of throwing on a malformed %-sequence, so a bad
+ * path/id segment becomes a 400 rather than an uncaught 500. */
+function safeDecode(segment: string): string | null {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return null;
+  }
+}
+
 export async function route(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
 
@@ -26,7 +36,9 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
 
   const fileMatch = path.match(/^\/api\/v1\/files\/([^/]+)\/([^/]+)\/(.+)$/);
   if (fileMatch && method === 'PUT') {
-    return putFile(request, env, identity, fileMatch[1]!, fileMatch[2]!, decodeURIComponent(fileMatch[3]!));
+    const relpath = safeDecode(fileMatch[3]!);
+    if (relpath === null) return Response.json({ error: 'bad_path' }, { status: 400 });
+    return putFile(request, env, identity, fileMatch[1]!, fileMatch[2]!, relpath);
   }
   if (path === '/api/v1/files/check' && method === 'POST') return checkFiles(request, env, identity);
   if (path === '/api/v1/heartbeat' && method === 'POST') return heartbeat(request, env, identity);
@@ -38,7 +50,12 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
   if (path === '/api/v1/sessions' && method === 'GET') return listSessions(url, env);
   const sessionMatch = path.match(/^\/api\/v1\/sessions\/([^/]+)(\/raw)?$/);
   if (sessionMatch && method === 'GET') {
-    return sessionMatch[2] ? getSessionRaw(sessionMatch[1]!, request, env) : getSession(sessionMatch[1]!, env);
+    // Decode the id segment: new prompt-log ids contain ':' (promptlog:machine:store), which a
+    // correct client sends as promptlog%3A… — an un-decoded lookup would 404. Guard a malformed %
+    // sequence to a 400 rather than letting decodeURIComponent throw a 500. (The viewer route already decodes.)
+    const sessionId = safeDecode(sessionMatch[1]!);
+    if (sessionId === null) return Response.json({ error: 'bad_session_id' }, { status: 400 });
+    return sessionMatch[2] ? getSessionRaw(sessionId, request, env) : getSession(sessionId, env);
   }
   if (path === '/api/v1/machines' && method === 'GET') return listMachines(env);
   if (path === '/api/v1/status' && method === 'GET') return status(env);
