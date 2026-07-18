@@ -366,7 +366,7 @@ describe('POST /api/v1/certs/renew', () => {
     // The row read now runs BEFORE signing — make it throw and assert nothing was minted.
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
     const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
-      if (sql.includes('cert_revoke_at FROM machines WHERE machine_id = ?1')) throw new Error('D1_ERROR: database is locked');
+      if (sql.includes('is_admin FROM machines WHERE machine_id = ?1')) throw new Error('D1_ERROR: database is locked');
       return realPrepare(sql);
     });
     const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('renew-read', false, 'rr-A'));
@@ -428,7 +428,7 @@ describe('POST /api/v1/certs/renew', () => {
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
     const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
       const stmt = realPrepare(sql);
-      if (!(sql.includes('cert_revoke_at FROM machines WHERE machine_id = ?1') && sql.includes('prev_cert_id'))) return stmt;
+      if (!(sql.includes('is_admin FROM machines WHERE machine_id = ?1') && sql.includes('prev_cert_id'))) return stmt;
       const realBind = stmt.bind.bind(stmt);
       (stmt as unknown as { bind: (...a: unknown[]) => unknown }).bind = (...args: unknown[]) => {
         const bound = realBind(...(args as [])) as D1PreparedStatement;
@@ -487,7 +487,7 @@ describe('POST /api/v1/certs/renew', () => {
       const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
       const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((s: string) => {
         const stmt = realPrepare(s);
-        if (!(s.includes('cert_revoke_at FROM machines WHERE machine_id = ?1') && s.includes('prev_cert_id'))) return stmt;
+        if (!(s.includes('is_admin FROM machines WHERE machine_id = ?1') && s.includes('prev_cert_id'))) return stmt;
         const realBind = stmt.bind.bind(stmt);
         (stmt as unknown as { bind: (...a: unknown[]) => unknown }).bind = (...args: unknown[]) => {
           const bound = realBind(...(args as [])) as D1PreparedStatement;
@@ -520,6 +520,45 @@ describe('POST /api/v1/certs/renew', () => {
     expect(r?.cert_fp_sha256).toBe(await certFingerprint(fakeCertPem('ok-new')));
     expect(r?.prev_cert_fp_sha256).toBe('ok-cur'); // old current -> prev
     expect(r?.prev_cert_id).toBe('ok-cid'); // its id carried into prev
+  });
+
+  it('P1: a grace-slot ADMIN cert cannot renew — 403 and no cert minted', async () => {
+    // renew's recovery branch installs the caller's CSR as CURRENT; on the next request that fresh admin
+    // cert resolves as admin again — a 7-day re-escalation for whoever holds the retired admin cert. Block
+    // it before signing anything.
+    await seedMachine('adm-grace', { fp: 'ag-cur', certId: 'ag-cid', prevFp: 'ag-prev', prevCertId: 'ag-pid', revokeAt: '2999-01-01T00:00:00.000Z', isAdmin: true });
+    let signCalls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (_i: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method !== 'DELETE') signCalls++;
+      return new Response(JSON.stringify({ success: true, result: { id: 'x', certificate: fakeCertPem('x'), expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('adm-grace', true, 'ag-prev', 'grace'));
+    expect(res.status).toBe(403);
+    expect(((await res.json()) as { error: string }).error).toBe('admin_renew_requires_current_cert');
+    expect(signCalls).toBe(0); // never reached the CA mint
+    expect((await row('adm-grace'))?.cert_fp_sha256).toBe('ag-cur'); // unchanged
+  });
+
+  it('P1 positive control: a CURRENT-slot admin cert renews normally', async () => {
+    await seedMachine('adm-cur', { fp: 'ac-cur', certId: 'ac-cid', isAdmin: true });
+    vi.stubGlobal('fetch', vi.fn(async (_i: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return new Response(JSON.stringify({ success: true, result: { status: 'pending_revocation' } }), { status: 200 });
+      return new Response(JSON.stringify({ success: true, result: { id: 'ac-new-id', certificate: fakeCertPem('ac-new'), expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('adm-cur', true, 'ac-cur', 'current'));
+    expect(res.status).toBe(200);
+    expect((await row('adm-cur'))?.cert_fp_sha256).toBe(await certFingerprint(fakeCertPem('ac-new')));
+  });
+
+  it('P1: a NON-admin grace cert still recovers (the legit lost-response path is unbroken)', async () => {
+    await seedMachine('nonadm-grace', { fp: 'ng-cur', certId: 'ng-cid', prevFp: 'ng-prev', prevCertId: 'ng-pid', revokeAt: '2999-01-01T00:00:00.000Z' }); // is_admin 0
+    vi.stubGlobal('fetch', vi.fn(async (_i: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return new Response(JSON.stringify({ success: true, result: { status: 'pending_revocation' } }), { status: 200 });
+      return new Response(JSON.stringify({ success: true, result: { id: 'ng-new-id', certificate: fakeCertPem('ng-new'), expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('nonadm-grace', false, 'ng-prev', 'grace'));
+    expect(res.status).toBe(200); // recovery on the in-grace prev
+    expect((await row('nonadm-grace'))?.cert_fp_sha256).toBe(await certFingerprint(fakeCertPem('ng-new')));
   });
 });
 
@@ -636,7 +675,7 @@ describe('POST /api/v1/admin/machines', () => {
     expect((await row('am-unq'))?.cert_fp_sha256).toBe('rb3-A'); // reinstated as current
     expect(await retired('rb3-A')).toBeNull(); // reservation removed atomically with the swap
     expect((await retired('rb3-B'))?.revoked_at).toBeNull(); // old current queued as usual
-    expect(batchLen).toBe(3); // swap + retire(old current rb3-B) + un-queue(rb3-A)
+    expect(batchLen).toBe(4); // swap + retire(old current rb3-B) + carry-id + un-queue(rb3-A)
   });
 
   it('positive control: a normal rollback with no stale reservation leaves the un-queue a no-op', async () => {
@@ -649,6 +688,27 @@ describe('POST /api/v1/admin/machines', () => {
     expect(r?.prev_cert_fp_sha256).toBeNull();
     expect(await retired('rb4-A')).toBeNull(); // nothing to un-queue; still absent
     expect((await retired('rb4-B'))?.cert_id).toBe('cert-rb4-B'); // old current queued as before
+  });
+
+  it('un-queue carries the reservation cert_id when the incoming rollback id is NULL (never silently drops it)', async () => {
+    // Finding (b): a reinstated fp whose reservation holds the ONLY copy of its cert_id. The clash
+    // pre-check passes (bk-A not yet queued); a prune then queues bk-A WITH its CA id (and had cleared
+    // the prev slot) before the swap, so the handler computes cert_id = NULL. The un-queue must carry the
+    // reservation's id into machines.cert_id in the same batch, or the reinstated cert is unrevocable.
+    await seedMachine('am-carry', { fp: 'bk-B', certId: 'cert-bk-B' }); // current bk-B, no prev
+    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+    const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementationOnce(async (stmts) => {
+      await testEnv.DB.prepare("INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('bk-A', 'cert-bk-A', 'am-carry', '2000-01-01T00:00:00.000Z')").run();
+      return realBatch(stmts);
+    });
+    const res = await adminMachines(reqJson({ machine_id: 'am-carry', cert_fp_sha256: 'bk-A' }), testEnv, machine('am-admin', true));
+    spy.mockRestore();
+    expect(res.status).toBe(200);
+    const r = await row('am-carry');
+    expect(r?.cert_fp_sha256).toBe('bk-A'); // reinstated as current
+    expect(r?.cert_id).toBe('cert-bk-A'); // carried from the reservation, NOT silently NULL
+    expect(await retired('bk-A')).toBeNull(); // reservation consumed by the un-queue
+    expect((await retired('bk-B'))?.cert_id).toBe('cert-bk-B'); // displaced old current queued
   });
 
   it('rollback 409s when the reinstated fp is CLAIMED by a mid-revoke prune (machine keeps its current cert)', async () => {
@@ -957,9 +1017,40 @@ describe('daily prune (cert revoke)', () => {
     stubCa(state);
     await runDailyPrune(cfEnv);
     expect((await retired('poll-fp'))?.revoked_at).toBeNull(); // still pending -> reserved
+    expect((await retired('poll-fp'))?.claimed_at).not.toBeNull(); // claim KEPT on pending (CA is revoking)
     state['poll-id'] = 'revoked'; // CA finishes the async revocation
+    // Age the kept claim to simulate the next daily run (>1h later) — that's when the staleness threshold
+    // lets prune re-claim a pending reservation; back-to-back runs within the hour would (correctly) skip.
+    await testEnv.DB.prepare("UPDATE retired_certs SET claimed_at = '2000-01-01T00:00:00.000Z' WHERE fingerprint = 'poll-fp'").run();
     await runDailyPrune(cfEnv);
-    expect((await retired('poll-fp'))?.revoked_at).not.toBeNull(); // next poll settles it
+    expect((await retired('poll-fp'))?.revoked_at).not.toBeNull(); // next run re-claims + settles it
+  });
+
+  it('keeps the claim on a reservation the CA is still revoking (pending_revocation)', async () => {
+    // The crux of the un-queue safety: pollRetired must NOT release the claim while the CA revoke is in
+    // flight. A released claim would let a racing rollback/un-queue reinstate a cert being revoked. The
+    // claim is released ONLY when the DELETE call itself was rejected (no CA state change) — see below.
+    await testEnv.DB.prepare(
+      "INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('pk-fp', 'pk-id', 'pk-m', '2000-01-01T00:00:00.000Z')",
+    ).run();
+    stubCa({ 'pk-id': 'active' }, { deleteTo: 'pending_revocation' });
+    await runDailyPrune(cfEnv);
+    const q = await retired('pk-fp');
+    expect(q?.revoked_at).toBeNull(); // async revoke in flight
+    expect(q?.claimed_at).not.toBeNull(); // claim KEPT (not released) -> un-queue guard stays effective
+  });
+
+  it('releases the claim only when the CA rejects the DELETE (cert still active — safe to reinstate)', async () => {
+    // The single case the claim IS released back to NULL: the DELETE was rejected with no CA state
+    // change, so the cert stays fully active and its reservation is safe for a later un-queue to reinstate.
+    await testEnv.DB.prepare(
+      "INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('rl-fp', 'rl-id', 'rl-m', '2000-01-01T00:00:00.000Z')",
+    ).run();
+    stubCa({ 'rl-id': 'active' }, { deleteTo: 'fail' });
+    await runDailyPrune(cfEnv);
+    const q = await retired('rl-fp');
+    expect(q?.revoked_at).toBeNull(); // DELETE rejected -> not revoked
+    expect(q?.claimed_at).toBeNull(); // claim RELEASED -> reservation reinstatable
   });
 
   it('leaves a not-yet-due grace window alone (no CA call)', async () => {

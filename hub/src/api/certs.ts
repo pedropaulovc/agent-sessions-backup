@@ -188,32 +188,39 @@ export async function settleRetired(env: Env, certId: string | null): Promise<Re
   try {
     result = await revokeClientCert(env, certId);
   } catch (e) {
+    // Ambiguous whether the CA began revoking — KEEP the claim (never let a rollback reinstate a
+    // maybe-revoking cert); the prune re-claims via the staleness threshold and retries.
     console.log(JSON.stringify({ event: 'hub.certs.retire_revoke_error', cert_id: certId, error: String(e) }));
-    await releaseRetired(env, certId);
     return 'failed';
   }
+  // Release the claim ONLY when the DELETE was REJECTED with no CA state change ('failed'): the cert is
+  // still fully active, so it's safe for an admin to reinstate/un-queue. On 'pending_revocation' the CA IS
+  // revoking, and on 'revoked' it's gone — KEEP the claim so the un-queue's `claimed_at IS NULL` guard and
+  // the rollback CAS block reinstating a dying/dead cert. Stamp on a full revoke (terminal).
   if (result === 'revoked') {
-    if (await stampRevoked(env, certId)) return 'revoked';
+    await stampRevoked(env, certId);
+    return 'revoked';
+  }
+  if (result === 'failed') {
     await releaseRetired(env, certId);
     return 'failed';
   }
-  await releaseRetired(env, certId); // pending_revocation (async) or failed — retry next prune
-  return result;
+  return result; // pending_revocation — claim held, prune re-polls to revoked
 }
 
 /** Poll a reserved cert and advance it toward settled. CLAIMS the row first (same primitive as
  * settleRetired); a lost claim → 'skipped' (un-queued or another revoke in flight). Stamps revoked_at
- * once the CA reports 'revoked' (or 404 — already gone). A cert still 'pending_revocation' stays
- * reserved and the claim is RELEASED so it's re-polled next run; one that never actually got revoked
- * ('active'/'pending_reactivation') gets a fresh revoke attempt under the same held claim. Used by the
- * prune drain. Never throws. */
+ * once the CA reports 'revoked' (or 404 — already gone). Releases the claim ONLY when a DELETE was
+ * REJECTED ('failed' — cert still fully active, safe to reinstate). On 'pending_revocation' (the CA is
+ * revoking) or 'unknown' (couldn't determine) it KEEPS the claim so a rollback can't reinstate a
+ * dying/uncertain cert; the prune re-claims it next run via the staleness threshold. Used by the prune
+ * drain. Never throws. */
 export async function pollRetired(env: Env, certId: string): Promise<'revoked' | 'pending' | 'failed' | 'skipped'> {
   if (!(await claimRetired(env, certId))) return 'skipped';
   const status = await getClientCertStatus(env, certId);
   if (status === 'revoked' || status === 'not_found') {
-    if (await stampRevoked(env, certId)) return 'revoked';
-    await releaseRetired(env, certId);
-    return 'failed';
+    await stampRevoked(env, certId); // terminal on success; on failure the claim is kept, prune re-polls
+    return 'revoked';
   }
   if (status === 'active' || status === 'pending_reactivation') {
     let result: RevokeResult;
@@ -221,16 +228,20 @@ export async function pollRetired(env: Env, certId: string): Promise<'revoked' |
       result = await revokeClientCert(env, certId);
     } catch (e) {
       console.log(JSON.stringify({ event: 'hub.certs.poll_revoke_error', cert_id: certId, error: String(e) }));
-      await releaseRetired(env, certId);
+      return 'failed'; // ambiguous — KEEP the claim
+    }
+    if (result === 'revoked') {
+      await stampRevoked(env, certId);
+      return 'revoked';
+    }
+    if (result === 'failed') {
+      await releaseRetired(env, certId); // DELETE rejected, cert still active — safe to reinstate
       return 'failed';
     }
-    if (result === 'revoked' && (await stampRevoked(env, certId))) return 'revoked';
-    await releaseRetired(env, certId);
-    return result === 'pending_revocation' || result === 'revoked' ? 'pending' : 'failed';
+    return 'pending'; // pending_revocation — CA is revoking, KEEP the claim
   }
-  // 'pending_revocation' (async revoke in flight) or 'unknown' (GET error) — leave reserved, release
-  // the claim, retry next run without guessing.
-  await releaseRetired(env, certId);
+  // 'pending_revocation' (async revoke in flight) or 'unknown' (GET error) — KEEP the claim; the prune
+  // re-claims and re-polls next run (staleness threshold), and the un-queue/rollback stay blocked.
   return status === 'pending_revocation' ? 'pending' : 'failed';
 }
 
@@ -280,14 +291,25 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
   // bail with a retryable 503 having minted NOTHING — no orphan possible. (Doing it after signing
   // would strand a live cert on a transient read error.) The read→sign→CAS window is slightly wider,
   // but the swap's compare-and-swap on the observed fp is exactly what guards that.
-  let cur: { cert_fp_sha256: string | null; cert_id: string | null; prev_cert_fp_sha256: string | null; prev_cert_id: string | null; cert_revoke_at: string | null } | null;
+  let cur: { cert_fp_sha256: string | null; cert_id: string | null; prev_cert_fp_sha256: string | null; prev_cert_id: string | null; cert_revoke_at: string | null; is_admin: number } | null;
   try {
-    cur = await env.DB.prepare('SELECT cert_fp_sha256, cert_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at FROM machines WHERE machine_id = ?1')
+    cur = await env.DB.prepare('SELECT cert_fp_sha256, cert_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at, is_admin FROM machines WHERE machine_id = ?1')
       .bind(identity.machineId)
       .first();
   } catch (e) {
     console.log(JSON.stringify({ event: 'hub.certs.renew_read_failed', machine: identity.machineId, error: String(e) }));
     return Response.json({ error: 'cert_renewal_unavailable' }, { status: 503 });
+  }
+
+  // An admin machine's in-grace PREVIOUS cert must NOT mint a new CURRENT cert. isAdmin is already
+  // slot-gated in machineIdentity, but renew's recovery branch would install the caller's CSR as current,
+  // and the NEXT request on that freshly minted cert resolves as admin again — a 7-day re-escalation for
+  // whoever holds the retired admin cert. The grace window exists for in-flight COLLECTOR recovery; for
+  // admin machines the asymmetry says block it (an intrusion signal — log it). Non-admin grace recovery is
+  // untouched. Read is_admin straight from the row (identity.isAdmin is already false for a grace slot).
+  if (cur?.is_admin === 1 && identity.certSlot === 'grace') {
+    console.log(JSON.stringify({ event: 'hub.certs.admin_grace_renew_blocked', machine: identity.machineId, cert_fp: identity.certFp ?? null }));
+    return Response.json({ error: 'admin_renew_requires_current_cert' }, { status: 403 });
   }
 
   let signed: SignedCert;

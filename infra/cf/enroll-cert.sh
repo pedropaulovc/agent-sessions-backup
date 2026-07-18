@@ -55,6 +55,12 @@ if [ -z "$MACHINE_ID" ]; then
   MACHINE_ID="$(agent-collector machine-id 2>/dev/null)" || true
   [ -n "$MACHINE_ID" ] || { echo "no machine_id: pass it as the first arg, or install agent-collector so 'agent-collector machine-id' works" >&2; exit 2; }
 fi
+# machine_id is interpolated into SQL string literals AND into file paths (KEY/CSR/CRT under OUT_DIR),
+# so constrain it to a safe charset up front: an odd value can't break/inject the SQL or escape OUT_DIR
+# with `../`. Collector ids are host-<platform> — letters, digits, and . _ - only.
+case "$MACHINE_ID" in
+  ""|.|..|*[!A-Za-z0-9._-]*) echo "invalid machine_id '$MACHINE_ID' (allowed: letters, digits, and . _ -)" >&2; exit 2 ;;
+esac
 # os facet mirrors the platform suffix the collector encodes into machine_id (host-<platform>).
 OS_TAG="${MACHINE_ID##*-}"
 : "${CF_API_TOKEN:?set CF_API_TOKEN to a zone-scoped token with Client Certificates:Edit}"
@@ -99,7 +105,32 @@ FP="$(openssl x509 -in "$CRT" -outform DER 2>/dev/null | openssl dgst -sha256 | 
 echo "==> cert fingerprint (SHA-256): $FP"
 
 echo "==> registering machine '$MACHINE_ID' (is_admin=$IS_ADMIN) in $DB_NAME"
+# hostname is machine-controlled and goes into a single-quoted SQL literal — SQL-escape any quote (double
+# it) so it can't break or inject the statement (machine_id is already charset-validated above).
 HOSTNAME_VAL="$(hostname)"
+HOSTNAME_VAL="${HOSTNAME_VAL//\'/\'\'}"
+
+# Best-effort revoke of the cert this run minted but NEVER installed (not in machines, not in
+# retired_certs) — used by every abort/failure path so a leaked active managed cert can't burn the zone
+# quota. curl -f only catches HTTP errors, so we parse the CF response's `success` flag (an HTTP-200
+# {"success":false} must NOT be reported as revoked) and print the manual command unless it confirms.
+# CF_API_TOKEN is already in scope. Never exits — the caller decides.
+revoke_unused_cert() {
+  echo "    The cert just minted for this run was NEVER installed — revoking it now so it can't linger CA-valid..." >&2
+  local del_resp del_ok
+  del_resp="$(curl -sS -X DELETE "$API/zones/$ZONE_ID/client_certificates/$CERT_ID" -H "Authorization: Bearer $CF_API_TOKEN" 2>/dev/null || true)"
+  del_ok="$(printf '%s' "$del_resp" | python3 -c 'import json,sys
+try:
+    print("yes" if json.load(sys.stdin).get("success") else "no")
+except Exception:
+    print("no")' 2>/dev/null || echo no)"
+  if [ "$del_ok" = "yes" ]; then
+    echo "      revoked unused cert $CERT_ID" >&2
+  else
+    echo "      WARN: automatic revoke did not confirm success — run this manually so the cert doesn't linger CA-valid:" >&2
+    echo "      curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$CERT_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\"" >&2
+  fi
+}
 
 # FRESH ENROLLMENT ONLY. This inserts a brand-new machines row and deliberately does NOT overwrite an
 # existing row's cert. Re-enrolling (rotating an already-registered machine's cert) is a DISPLACEMENT — the
@@ -124,9 +155,17 @@ INSERT_SQL="INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, cert
 # insert-then-verify; on a fresh collector box we print the insert to run from such a box.
 if npx --yes wrangler whoami >/dev/null 2>&1; then
   # Insert (a no-op if the id already exists — DO NOTHING never touches an existing row's cert), then read
-  # the row back to see whose fingerprint it carries.
-  CUR_JSON="$(CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID" npx --yes wrangler d1 execute "$DB_NAME" --remote --json \
-    --command "$INSERT_SQL SELECT cert_fp_sha256 AS fp FROM machines WHERE machine_id='$MACHINE_ID';")"
+  # the row back to see whose fingerprint it carries. A non-zero exit here means the write did NOT commit
+  # (D1 auth, a lock/outage, or a rejected statement) — the cert is minted but unregistered, so revoke it
+  # before aborting rather than leaking it under set -e.
+  if ! CUR_JSON="$(CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID" npx --yes wrangler d1 execute "$DB_NAME" --remote --json \
+      --command "$INSERT_SQL SELECT cert_fp_sha256 AS fp FROM machines WHERE machine_id='$MACHINE_ID';")"; then
+    echo "    D1 registration failed (auth, lock/outage, or a rejected statement) — machine NOT registered." >&2
+    revoke_unused_cert
+    exit 1
+  fi
+  # A parse failure here means wrangler returned 0 but unexpected output — the insert likely DID apply, so
+  # abort loudly WITHOUT revoking (revoking a possibly-registered cert would lock the machine out).
   CUR_FP="$(python3 - "$CUR_JSON" <<'PY'
 import json,sys
 try:
@@ -153,16 +192,7 @@ PY
     echo "      POST https://api.sessions.vza.net/api/v1/admin/machines  (with an admin client cert)" >&2
     echo "        { \"machine_id\": \"$MACHINE_ID\", \"cert_fp_sha256\": \"$FP\", \"cert_id\": \"$CERT_ID\" }" >&2
     echo >&2
-    # The cert just minted for this run was NEVER installed (not in D1, not in retired_certs). Revoke it
-    # now so a missed manual cleanup can't leak an active managed cert and burn the zone quota. CF_API_TOKEN
-    # is already in scope. Best-effort: on failure, print the manual command and still abort non-zero.
-    echo "    The cert just minted for this run was NEVER installed — revoking it now so it can't linger CA-valid..." >&2
-    if curl -fsS -X DELETE "$API/zones/$ZONE_ID/client_certificates/$CERT_ID" -H "Authorization: Bearer $CF_API_TOKEN" >/dev/null 2>&1; then
-      echo "      revoked unused cert $CERT_ID" >&2
-    else
-      echo "      WARN: automatic revoke failed — run this manually so the cert doesn't linger CA-valid:" >&2
-      echo "      curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$CERT_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\"" >&2
-    fi
+    revoke_unused_cert
     exit 1
   fi
   echo "    enrolled: $MACHINE_ID -> $FP"

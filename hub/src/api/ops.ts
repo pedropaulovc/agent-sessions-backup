@@ -206,6 +206,21 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
       ...displaced.map((d) => queueRetiredIfDisplaced(env, d.fp, d.id, body.machine_id!, postSwap)),
       ...(fpChanged && certFp
         ? [
+            // Carry the reservation's cert_id onto the reinstated cert BEFORE deleting it. If a prune
+            // queued certFp with its CA id but our read missed it (the prev slot was already cleared, so
+            // our incoming certId is NULL), un-queuing would otherwise discard the only copy of that id
+            // and leave the machine current on an unrevocable cert. Only when OUR cert_id IS NULL, only
+            // over the UNCLAIMED reservation (a claimed one already 409'd the CAS above), and only once
+            // the swap has landed (current is now certFp).
+            env.DB.prepare(
+              `UPDATE machines
+                  SET cert_id = (SELECT cert_id FROM retired_certs
+                                   WHERE fingerprint = ?1 AND machine_id = ?2 AND revoked_at IS NULL AND claimed_at IS NULL AND cert_id IS NOT NULL
+                                   LIMIT 1)
+                WHERE machine_id = ?2 AND cert_fp_sha256 = ?1 AND cert_id IS NULL
+                  AND EXISTS (SELECT 1 FROM retired_certs
+                                WHERE fingerprint = ?1 AND machine_id = ?2 AND revoked_at IS NULL AND claimed_at IS NULL AND cert_id IS NOT NULL)`,
+            ).bind(certFp, body.machine_id),
             env.DB.prepare(
               `DELETE FROM retired_certs
                  WHERE fingerprint = ?1 AND machine_id = ?2 AND revoked_at IS NULL AND claimed_at IS NULL
