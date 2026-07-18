@@ -109,6 +109,44 @@ def test_mtls_missing_key_file_errors(tmp_path):
         MtlsAuth(client_cert_path=str(cert), client_key_path=str(tmp_path / "absent.key")).curl_args()
 
 
+# A realistic 40-hex SHA-1 thumbprint (Windows thumbprints are exactly this shape).
+TP = "A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0"
+
+
+def test_mtls_thumbprint_emits_schannel_store_ref_and_no_key():
+    # Windows/Schannel: reference the cert in Cert:\CurrentUser\My by (normalized) thumbprint, no --key.
+    # certmgr shows the thumbprint space-separated and lowercase; it normalizes to the canonical form.
+    args = MtlsAuth(client_cert_thumbprint="a1 b2 c3 d4 e5 f6 a7 b8 c9 d0 "
+                    "e1 f2 a3 b4 c5 d6 e7 f8 a9 b0").curl_args()
+    assert args == ["--cert", f"CurrentUser\\MY\\{TP}"]
+    assert "--key" not in args
+
+
+def test_mtls_thumbprint_wins_over_pem_is_prevented_at_config_layer():
+    # curl_args itself just honors the thumbprint if set (the both-set ambiguity is rejected in
+    # Config.__post_init__, tested there); a thumbprint alone never emits --key.
+    args = MtlsAuth(client_cert_thumbprint=TP, client_cert_path="/x/c.pem").curl_args()
+    assert args[0] == "--cert" and args[1].endswith(TP) and "--key" not in args
+
+
+def test_normalize_thumbprint():
+    from agent_collector.transport import normalize_thumbprint
+    # Positive controls: colon/space separators (openssl, certmgr) and an already-clean value.
+    assert normalize_thumbprint("a1:b2:c3:d4:e5:f6:a7:b8:c9:d0:"
+                                "e1:f2:a3:b4:c5:d6:e7:f8:a9:b0") == TP
+    assert normalize_thumbprint(TP.lower()) == TP
+    # The MMC cert UI prepends an invisible U+200E left-to-right mark (MS KB2023835); strip it too.
+    assert normalize_thumbprint(chr(0x200e) + TP.lower()) == TP  # U+200E LRM
+
+
+def test_normalize_thumbprint_rejects_wrong_length():
+    from agent_collector.transport import normalize_thumbprint
+    with pytest.raises(ValueError, match="40 hex"):
+        normalize_thumbprint("ABCDEF01")  # too short
+    with pytest.raises(ValueError, match="40 hex"):
+        normalize_thumbprint(TP + "AB")  # too long (e.g. a SHA-256 fragment)
+
+
 def test_auth_config_directives_maps_options_not_headers():
     from agent_collector.transport import _auth_config_directives
 
@@ -137,6 +175,16 @@ def test_build_upload_config_mtls_emits_cert_key_not_bogus_headers(tmp_path):
     assert 'header = "--key"' not in cfg
     # Real request headers still serialize as headers (positive control for the header path).
     assert 'header = "x-content-hash: sha256:ab"' in cfg
+
+
+def test_build_upload_config_mtls_thumbprint_backslash_escaped(tmp_path):
+    # The schannel store ref has backslashes; the --config file must escape them (\\) so curl
+    # doesn't read \M / \t as escapes and mangle the path. No key directive for the store path.
+    t = Transport(MtlsAuth(client_cert_thumbprint=TP))
+    up = Upload("https://api.example/x", str(tmp_path / "body"), {"x-content-hash": "sha256:ab"})
+    cfg = t._build_upload_config([up])
+    assert f'cert = "CurrentUser\\\\MY\\\\{TP}"' in cfg
+    assert "key = " not in cfg
 
 
 def test_build_upload_config_dev_still_emits_header(tmp_path):

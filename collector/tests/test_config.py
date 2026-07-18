@@ -5,6 +5,9 @@ import pytest
 
 from agent_collector import config
 
+# A realistic 40-hex SHA-1 cert thumbprint (see test_transport.TP).
+TP = "A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0"
+
 
 @pytest.mark.parametrize(
     "platform,proc,expected",
@@ -43,9 +46,59 @@ def test_enroll_and_load_roundtrip(tmp_path):
 
 
 def test_enroll_mtls_without_paths_errors(tmp_path):
-    # Non-dev enrollment needs both cert and key; otherwise a clear error, not a broken config.
-    with pytest.raises(ValueError, match="--client-cert and --client-key"):
+    # Non-dev enrollment with no client material errors clearly (PEM paths OR a Windows thumbprint).
+    with pytest.raises(ValueError, match="mTLS enrollment needs client material"):
         config.enroll("http://x", dev=False, path=tmp_path / "c.toml")
+
+
+def test_mtls_config_rejects_both_thumbprint_and_pem():
+    # The mechanism is derived from which fields are set; both set is ambiguous.
+    with pytest.raises(ValueError, match="ambiguous"):
+        config.Config(machine_id="m1", hub_url="https://h", auth="mtls",
+                      client_cert_thumbprint="ABCD", client_cert_path="/c.pem", client_key_path="/c.key")
+
+
+def test_mtls_config_rejects_no_material():
+    with pytest.raises(ValueError, match="needs client material"):
+        config.Config(machine_id="m1", hub_url="https://h", auth="mtls")
+
+
+def test_mtls_thumbprint_config_roundtrips(tmp_path):
+    cfg = config.Config(machine_id="amet-windows", hub_url="https://h", auth="mtls",
+                        client_cert_thumbprint=TP)
+    path = tmp_path / "config.toml"
+    config.save(cfg, path)
+    loaded = config.load(path)
+    assert loaded.auth == "mtls"
+    assert loaded.client_cert_thumbprint == TP
+    assert loaded.client_cert_path is None and loaded.client_key_path is None
+
+
+def test_enroll_thumbprint_writes_windows_mtls_config(tmp_path):
+    path = tmp_path / "config.toml"
+    # Pass the thumbprint space-separated and lowercase (as certmgr shows it); enroll normalizes.
+    separated = " ".join(TP[i:i + 2] for i in range(0, len(TP), 2)).lower()
+    cfg = config.enroll("https://api.sessions.vza.net/", dev=False, path=path,
+                        machine_id="amet-windows", client_cert_thumbprint=separated)
+    assert cfg.auth == "mtls"
+    assert cfg.client_cert_thumbprint == TP  # enroll normalizes
+    assert cfg.client_cert_path is None
+    assert f'client_cert_thumbprint = "{TP}"' in path.read_text()
+
+
+def test_pfx_import_ps_omits_password_when_absent():
+    # Password-less PFX (Import-PfxCertificate docs Example 2): no -Password, no SecureString —
+    # ConvertTo-SecureString -String "" throws, so building an empty SecureString would break import.
+    ps = config._pfx_import_ps(has_password=False)
+    assert "-Password" not in ps
+    assert "ConvertTo-SecureString" not in ps
+    assert "Import-PfxCertificate" in ps and "Cert:\\CurrentUser\\My" in ps
+
+
+def test_pfx_import_ps_uses_securestring_when_present():
+    ps = config._pfx_import_ps(has_password=True)
+    assert "-Password $sec" in ps
+    assert "ConvertTo-SecureString -String $env:AC_PFX_PW" in ps
 
 
 def _write_config(path, extra=""):

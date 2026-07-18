@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
 import urllib.parse
@@ -21,7 +22,7 @@ from . import config as config_mod
 from . import __version__
 from .scanner import Scanner, ScanItem, read_exact, read_range, hash_bytes, hash_file_prefix
 from .state import State, OverlapLock, now_iso, state_path
-from .transport import Transport, DevAuth, MtlsAuth, Upload, MIN_CURL_VERSION
+from .transport import Transport, DevAuth, MtlsAuth, Upload, MIN_CURL_VERSION, normalize_thumbprint
 
 # Multipart upload outcomes (enum, not a bool pair — a large file's fate is a small state machine:
 # it either uploaded fresh bytes, matched bytes the hub already had, or failed).
@@ -78,7 +79,11 @@ def build_auth(cfg: config_mod.Config):
     if cfg.auth == "dev":
         return DevAuth(cfg.machine_id)
     if cfg.auth == "mtls":
-        return MtlsAuth(client_cert_path=cfg.client_cert_path, client_key_path=cfg.client_key_path)
+        return MtlsAuth(
+            client_cert_path=cfg.client_cert_path,
+            client_key_path=cfg.client_key_path,
+            client_cert_thumbprint=cfg.client_cert_thumbprint,
+        )
     raise ValueError(f"unknown auth mode {cfg.auth!r} (expected dev|mtls)")
 
 
@@ -654,6 +659,57 @@ def cmd_status(args) -> int:
 
 
 # ------------------------------------------------------------------------ doctor
+_CERT_EXPIRY_WARN_DAYS = 21
+
+
+def _doctor_cert_store(thumbprint: str) -> bool:
+    """Doctor check for the Windows/Schannel mTLS path: confirm the client cert is present in
+    Cert:\\CurrentUser\\My and warn if it expires within ~3 weeks. Returns False only on a hard
+    failure (cert missing / can't query) so a near-expiry warning doesn't fail the whole doctor."""
+    tp = normalize_thumbprint(thumbprint)
+    short = tp[:12] + ".."
+    if not sys.platform.startswith("win"):
+        print(f"[warn] client_cert_thumbprint set but this isn't Windows; can't verify the cert store ({short})")
+        return True
+    ps = (
+        "$c = Get-Item ('Cert:\\CurrentUser\\My\\' + $env:AC_TP) -ErrorAction SilentlyContinue; "
+        "if ($null -eq $c) { 'MISSING' } "
+        "elseif (-not $c.HasPrivateKey) { 'NOPRIVKEY' } "
+        "else { [int]($c.NotAfter - (Get-Date)).TotalDays }"
+    )
+    env = {**os.environ, "AC_TP": tp}
+    try:
+        proc = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+                              capture_output=True, text=True, env=env)
+    except OSError as e:
+        print(f"[FAIL] cert-store check couldn't run powershell: {e}")
+        return False
+    out = proc.stdout.strip().splitlines()[-1].strip() if proc.stdout.strip() else ""
+    if out in ("", "MISSING"):
+        print(f"[FAIL] mTLS cert not found in Cert:\\CurrentUser\\My ({short}); re-enroll with --import-pfx")
+        return False
+    if out == "NOPRIVKEY":
+        # Cert present but no associated private key — Schannel can't complete the handshake, so the
+        # first upload would fail with an opaque error. Happens when the .pem/.crt was imported instead
+        # of the PFX. Point at the fix rather than letting doctor pass and the upload fail cryptically.
+        print(f"[FAIL] mTLS cert {short} is in Cert:\\CurrentUser\\My but has NO private key; "
+              f"import the PFX (not the .pem/.crt) via enroll --import-pfx")
+        return False
+    try:
+        days = int(out)
+    except ValueError:
+        print(f"[warn] cert-store check returned unexpected output for {short}: {out[:80]}")
+        return True
+    if days < 0:
+        print(f"[FAIL] mTLS cert {short} EXPIRED {-days}d ago; re-enroll")
+        return False
+    if days <= _CERT_EXPIRY_WARN_DAYS:
+        print(f"[warn] mTLS cert {short} present but expires in {days}d — renew soon")
+        return True
+    print(f"[ok]   mTLS cert present in Cert:\\CurrentUser\\My ({short}), {days}d to expiry")
+    return True
+
+
 def cmd_doctor(args) -> int:
     ok = True
     cfg = None
@@ -682,6 +738,11 @@ def cmd_doctor(args) -> int:
     except Exception as e:  # noqa: BLE001
         print(f"[FAIL] curl: {e}")
         ok = False
+
+    # Windows/Schannel mTLS: the cert lives in the store, so verify it's actually there (and not
+    # about to expire) — the analog of MtlsAuth's file-existence check for the PEM path.
+    if cfg.auth == "mtls" and cfg.client_cert_thumbprint:
+        ok = _doctor_cert_store(cfg.client_cert_thumbprint) and ok
 
     try:
         status, _body = transport.get(f"{cfg.hub_url}/healthz")

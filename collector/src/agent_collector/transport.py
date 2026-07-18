@@ -34,6 +34,22 @@ def _curl_config_quote(value: str) -> str:
     return value.replace("\\", "\\\\").replace('"', '\\"')
 
 
+def normalize_thumbprint(thumbprint: str) -> str:
+    """Canonicalize a cert thumbprint for the schannel store reference. Windows tools sprinkle in
+    separators (certmgr shows "ab cd ef ..", openssl uses "AB:CD:.."), and a thumbprint copied from
+    the MMC cert UI carries an invisible U+200E left-to-right mark on the first char (MS KB2023835).
+    Keep only hex digits, then require exactly 40 (a SHA-1 thumbprint) and uppercase. Anything else —
+    a mangled paste, a truncated value, an accidental SHA-256 — raises here so enrollment fails loudly
+    rather than writing a config that silently 401s on the first upload with an unfindable store entry."""
+    cleaned = re.sub(r"[^0-9a-fA-F]", "", thumbprint)
+    if len(cleaned) != 40:
+        raise ValueError(
+            f"thumbprint must be 40 hex chars (a SHA-1 cert thumbprint); got {len(cleaned)} "
+            f"after stripping non-hex from {thumbprint!r}"
+        )
+    return cleaned.upper()
+
+
 def _auth_config_directives(auth_args: list[str], q) -> list[str]:
     """Translate an auth strategy's command-line curl args into curl --config directives.
 
@@ -100,13 +116,23 @@ class DevAuth(AuthStrategy):
 
 
 class MtlsAuth(AuthStrategy):
-    """mTLS client-cert auth. `software` keys (WSL/software fallback) present a PEM cert +
-    key file to curl (`--cert`/`--key`); the files are produced by infra/cf/enroll-cert.sh
-    and their paths live in the collector config (client_cert_path/client_key_path).
+    """mTLS client-cert auth. Two software-key mechanisms, chosen by which config field is set:
 
-    TPM-backed keys (key_protection != "software") still raise NotImplementedError: the
-    private key never leaves the TPM, so curl must reference a provider/engine key handle
-    rather than a file — that lands in M4 with the per-platform TPM backends.
+    - POSIX (Linux/WSL/macOS, OpenSSL-backed curl): a PEM cert + key file presented via
+      `--cert`/`--key` (paths in client_cert_path/client_key_path, produced by infra/cf/enroll-cert.sh).
+    - Windows (Schannel-backed curl): a client cert imported into Cert:\\CurrentUser\\My, referenced by
+      THUMBPRINT via `--cert "CurrentUser\\MY\\<thumbprint>"` and NO `--key`. Schannel rejects
+      file-based PEM/PFX client certs (SEC_E_INTERNAL_ERROR — verified against the real hub; see
+      the "Windows / Schannel mTLS" section of infra/cf/mtls.md), so the store reference is the
+      only working form on the host curl.
+
+    The thumbprint reference is ALSO the S2/TPM path: a TPM/PCP-backed key surfaces as a
+    Cert:\\CurrentUser\\My entry with a non-exportable private key, so this transport code is unchanged
+    — only enrollment differs (import a software PFX now, provision a PCP key later), both writing
+    client_cert_thumbprint. key_protection stays orthogonal ('software' today).
+
+    key_protection != "software" WITHOUT a thumbprint still raises NotImplementedError: a TPM key
+    with no store reference has no curl invocation (curl can't take a raw provider handle here).
     """
 
     def __init__(
@@ -114,18 +140,25 @@ class MtlsAuth(AuthStrategy):
         client_cert_path: str | None = None,
         client_key_path: str | None = None,
         key_protection: str = "software",
+        client_cert_thumbprint: str | None = None,
     ):
         self.client_cert_path = client_cert_path
         self.client_key_path = client_key_path
         self.key_protection = key_protection
+        self.client_cert_thumbprint = client_cert_thumbprint
 
     def curl_args(self) -> list[str]:
+        # Schannel store reference (Windows software-PFX now, TPM/PCP later): the private key lives in
+        # the Windows cert store, so curl gets a thumbprint reference and NO --key. This is the only
+        # client-cert form the host's schannel curl accepts (file-based PEM/PFX -> SEC_E_INTERNAL_ERROR).
+        if self.client_cert_thumbprint:
+            return ["--cert", f"CurrentUser\\MY\\{normalize_thumbprint(self.client_cert_thumbprint)}"]
         if self.key_protection != "software":
             raise NotImplementedError(
-                f"TPM-backed mTLS (key_protection={self.key_protection!r}) is not implemented "
-                "yet; it lands in M4. The TPM key can't be handed to curl as a file — curl must "
-                "reference the provider/engine key handle. Use key_protection=\"software\" (a "
-                "file-based cert+key from infra/cf/enroll-cert.sh) until then."
+                f"TPM-backed mTLS (key_protection={self.key_protection!r}) with no store thumbprint is "
+                "not implemented; provision the key into Cert:\\CurrentUser\\My and set "
+                "client_cert_thumbprint (S2), or use key_protection=\"software\" with a file-based "
+                "cert+key (POSIX) / an imported PFX thumbprint (Windows)."
             )
         cert, key = self.client_cert_path, self.client_key_path
         if not cert or not key:

@@ -9,10 +9,13 @@ from __future__ import annotations
 
 import os
 import socket
+import subprocess
 import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from .transport import normalize_thumbprint
 
 # Capture-ALL policy: whole tree per store, minus these. fnmatch-ish on the forward-slash
 # relpath (see scanner.path_matches). Security-critical entries (creds, keys) come first.
@@ -159,10 +162,15 @@ class Config:
     include_windows_mounts: bool = False
     stores: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_STORES))
     exclude: list[str] = field(default_factory=list)
-    # File-based mTLS material (auth="mtls", software keys): PEM cert + private key that
+    # File-based mTLS material (auth="mtls", POSIX/OpenSSL curl): PEM cert + private key that
     # curl presents via --cert/--key. Written by infra/cf/enroll-cert.sh. Absent for dev auth.
     client_cert_path: str | None = None
     client_key_path: str | None = None
+    # Windows/Schannel mTLS: SHA-1 thumbprint of the client cert imported into Cert:\CurrentUser\My.
+    # Set INSTEAD of the PEM paths above — schannel can't present a file-based cert (see
+    # transport.MtlsAuth). key_protection stays orthogonal: a software-PFX-imported key now, a
+    # TPM/PCP-backed key (same field) in S2.
+    client_cert_thumbprint: str | None = None
     # Multipart tuning (MB, float so tests can use sub-MB values). Files >= threshold upload via
     # the chunked multipart path; each part carries part_size bytes (last part the remainder).
     multipart_threshold_mb: float = DEFAULT_MULTIPART_THRESHOLD_MB
@@ -198,6 +206,22 @@ class Config:
         for name in self.stores:
             if "/" in name:
                 raise ValueError(f"store name must not contain '/': {name!r}")
+        # mTLS material is exactly one mechanism, never both/neither. The mechanism is DERIVED from
+        # which fields are set (no separate mode flag): a thumbprint => Windows/Schannel store ref;
+        # cert+key paths => POSIX/PEM. Both set is ambiguous; neither leaves auth="mtls" unusable.
+        if self.auth == "mtls":
+            has_thumb = bool(self.client_cert_thumbprint)
+            has_pem = bool(self.client_cert_path and self.client_key_path)
+            if has_thumb and (self.client_cert_path or self.client_key_path):
+                raise ValueError(
+                    "ambiguous mTLS config: set EITHER client_cert_thumbprint (Windows/Schannel) OR "
+                    "client_cert_path+client_key_path (POSIX/PEM), not both"
+                )
+            if not has_thumb and not has_pem:
+                raise ValueError(
+                    "mTLS config needs client material: client_cert_thumbprint (Windows) or BOTH "
+                    "client_cert_path and client_key_path (POSIX). Run infra/cf/enroll-cert.sh."
+                )
 
     def store_roots(self) -> dict[str, Path]:
         """Resolved roots to actually scan. Under WSL with include_windows_mounts=false,
@@ -248,6 +272,8 @@ def _dump_toml(cfg: Config) -> str:
         lines.append(f'client_cert_path = "{_toml_escape(cfg.client_cert_path)}"')
     if cfg.client_key_path:
         lines.append(f'client_key_path = "{_toml_escape(cfg.client_key_path)}"')
+    if cfg.client_cert_thumbprint:
+        lines.append(f'client_cert_thumbprint = "{_toml_escape(cfg.client_cert_thumbprint)}"')
     if cfg.exclude:
         items = ", ".join(f'"{_toml_escape(p)}"' for p in cfg.exclude)
         lines.append(f"exclude = [{items}]")
@@ -288,6 +314,7 @@ def load(path: Path | str | None = None) -> Config:
         exclude=list(data.get("exclude") or []),
         client_cert_path=data.get("client_cert_path"),
         client_key_path=data.get("client_key_path"),
+        client_cert_thumbprint=data.get("client_cert_thumbprint"),
         multipart_threshold_mb=threshold_mb,
         multipart_part_size_mb=part_size_mb,
         source=path,
@@ -342,6 +369,54 @@ def _load_if_exists(path: Path) -> Config | None:
         return None  # unreadable/legacy config -> treat as a fresh enroll
 
 
+def _pfx_import_ps(has_password: bool) -> str:
+    """The PowerShell one-liner that imports $env:AC_PFX_PATH into Cert:\\CurrentUser\\My and prints
+    the thumbprint. With a password we build a SecureString from $env:AC_PFX_PW; without one we OMIT
+    -Password entirely — `ConvertTo-SecureString -String "" -AsPlainText -Force` throws, so passing an
+    empty SecureString would break the advertised password-less PFX path (Import-PfxCertificate docs
+    Example 2 calls it with no -Password). Factored out so both branches are unit-testable off-Windows."""
+    head = "$ErrorActionPreference='Stop'; "
+    tail = "$c.Thumbprint"
+    if has_password:
+        return (
+            head
+            + "$sec = ConvertTo-SecureString -String $env:AC_PFX_PW -AsPlainText -Force; "
+            "$c = Import-PfxCertificate -FilePath $env:AC_PFX_PATH "
+            "-CertStoreLocation Cert:\\CurrentUser\\My -Password $sec; " + tail
+        )
+    return (
+        head
+        + "$c = Import-PfxCertificate -FilePath $env:AC_PFX_PATH "
+        "-CertStoreLocation Cert:\\CurrentUser\\My; " + tail
+    )
+
+
+def _import_pfx_to_store(pfx_path: str, password: str | None) -> str:
+    """Windows only: import a PFX into Cert:\\CurrentUser\\My and return its SHA-1 thumbprint. The
+    private key is imported NON-exportable (Import-PfxCertificate's default) — the software-key
+    hardening schannel gives us for free. The password rides in via the environment, never on the
+    command line, so it can't surface in a process listing or shell history."""
+    if not sys.platform.startswith("win"):
+        raise RuntimeError(
+            "--import-pfx imports into the Windows certificate store and is Windows-only; on POSIX "
+            "enroll with --client-cert/--client-key (PEM) instead."
+        )
+    # Prefer an explicit password, else an already-exported AC_PFX_PW (so the secret can stay out of
+    # argv/shell history entirely), else none for a password-less PFX.
+    pw = password if password is not None else os.environ.get("AC_PFX_PW", "")
+    ps = _pfx_import_ps(has_password=bool(pw))
+    env = {**os.environ, "AC_PFX_PATH": str(Path(pfx_path).resolve()), "AC_PFX_PW": pw}
+    proc = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
+        capture_output=True, text=True, env=env,
+    )
+    thumb = proc.stdout.strip().splitlines()[-1].strip() if proc.stdout.strip() else ""
+    if proc.returncode != 0 or not thumb:
+        raise RuntimeError(f"PFX import into Cert:\\CurrentUser\\My failed (rc={proc.returncode}): "
+                           f"{proc.stderr.strip()[:400]}")
+    return thumb
+
+
 def enroll(
     hub_url: str,
     dev: bool,
@@ -349,6 +424,9 @@ def enroll(
     machine_id: str | None = None,
     client_cert_path: str | None = None,
     client_key_path: str | None = None,
+    client_cert_thumbprint: str | None = None,
+    import_pfx: str | None = None,
+    pfx_password: str | None = None,
 ) -> Config:
     """Write a collector config. `dev=True` writes dev auth (x-dev-machine); otherwise a
     file-based mTLS config, which requires both a client cert and key path (produced by
@@ -384,22 +462,39 @@ def enroll(
     if dev:
         cfg = Config(machine_id=resolved_id, hub_url=hub_url.rstrip("/"), auth="dev", **carried)
     else:
-        if not (client_cert_path and client_key_path):
-            raise ValueError(
-                "mTLS enrollment needs both --client-cert and --client-key (run "
-                "infra/cf/enroll-cert.sh first). Use --dev for the dev-header config instead."
+        thumbprint = client_cert_thumbprint
+        if import_pfx:
+            # Windows: import the PFX into the store (non-exportable key), take its thumbprint, then
+            # delete the throwaway PFX below — the private key then lives ONLY in Cert:\CurrentUser\My.
+            thumbprint = _import_pfx_to_store(import_pfx, pfx_password)
+        if thumbprint:
+            cfg = Config(
+                machine_id=resolved_id,
+                hub_url=hub_url.rstrip("/"),
+                auth="mtls",
+                client_cert_thumbprint=normalize_thumbprint(thumbprint),
+                **carried,
             )
-        cfg = Config(
-            machine_id=resolved_id,
-            hub_url=hub_url.rstrip("/"),
-            auth="mtls",
-            # Absolute (resolve()), not just expanduser(): scheduled systemd/Task Scheduler
-            # runs start from a different cwd, so a relative path (enroll-cert.sh's `--out .`
-            # default) would make MtlsAuth fail its file-existence check before every upload.
-            client_cert_path=str(Path(client_cert_path).expanduser().resolve()),
-            client_key_path=str(Path(client_key_path).expanduser().resolve()),
-            **carried,
-        )
+            if import_pfx:
+                Path(import_pfx).unlink(missing_ok=True)
+        elif client_cert_path and client_key_path:
+            cfg = Config(
+                machine_id=resolved_id,
+                hub_url=hub_url.rstrip("/"),
+                auth="mtls",
+                # Absolute (resolve()), not just expanduser(): scheduled systemd/Task Scheduler
+                # runs start from a different cwd, so a relative path (enroll-cert.sh's `--out .`
+                # default) would make MtlsAuth fail its file-existence check before every upload.
+                client_cert_path=str(Path(client_cert_path).expanduser().resolve()),
+                client_key_path=str(Path(client_key_path).expanduser().resolve()),
+                **carried,
+            )
+        else:
+            raise ValueError(
+                "mTLS enrollment needs client material: --client-cert-thumbprint or --import-pfx "
+                "(Windows/Schannel), or --client-cert + --client-key (POSIX/PEM). Run "
+                "infra/cf/enroll-cert.sh first. Use --dev for the dev-header config instead."
+            )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_dump_toml(cfg))
     cfg.source = path

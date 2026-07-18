@@ -15,8 +15,10 @@ from .webcapture import cmd_webcapture
 
 
 def _cmd_enroll(args) -> int:
-    if not args.dev and not (args.client_cert or args.client_key):
-        print("enroll: pass --dev, or --client-cert/--client-key for mTLS", file=sys.stderr)
+    mtls_material = args.client_cert or args.client_key or args.client_cert_thumbprint or args.import_pfx
+    if not args.dev and not mtls_material:
+        print("enroll: pass --dev, or mTLS material — --client-cert/--client-key (POSIX) or "
+              "--client-cert-thumbprint/--import-pfx (Windows/Schannel)", file=sys.stderr)
         return 2
     cfg = config_mod.enroll(
         args.hub,
@@ -24,14 +26,20 @@ def _cmd_enroll(args) -> int:
         machine_id=args.machine_id,
         client_cert_path=args.client_cert,
         client_key_path=args.client_key,
+        client_cert_thumbprint=args.client_cert_thumbprint,
+        import_pfx=args.import_pfx,
+        pfx_password=args.pfx_password,
     )
     print(f"wrote {cfg.source}")
     print(f"  machine_id: {cfg.machine_id}")
     print(f"  hub_url:    {cfg.hub_url}")
     print(f"  auth:       {cfg.auth}")
     if cfg.auth == "mtls":
-        print(f"  client_cert_path: {cfg.client_cert_path}")
-        print(f"  client_key_path:  {cfg.client_key_path}")
+        if cfg.client_cert_thumbprint:
+            print(f"  client_cert_thumbprint: {cfg.client_cert_thumbprint}  (Cert:\\CurrentUser\\My)")
+        else:
+            print(f"  client_cert_path: {cfg.client_cert_path}")
+            print(f"  client_key_path:  {cfg.client_key_path}")
     return 0
 
 
@@ -68,8 +76,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_enroll = sub.add_parser("enroll", help="write config (--dev, or --client-cert/--client-key for mTLS)")
     p_enroll.add_argument("--hub", required=True, help="hub base URL, e.g. https://api.sessions.vza.net")
     p_enroll.add_argument("--dev", action="store_true", help="dev auth (x-dev-machine header)")
-    p_enroll.add_argument("--client-cert", help="mTLS: path to the PEM client cert (from enroll-cert.sh)")
-    p_enroll.add_argument("--client-key", help="mTLS: path to the client private key (from enroll-cert.sh)")
+    p_enroll.add_argument("--client-cert", help="POSIX mTLS: path to the PEM client cert (from enroll-cert.sh)")
+    p_enroll.add_argument("--client-key", help="POSIX mTLS: path to the client private key (from enroll-cert.sh)")
+    p_enroll.add_argument("--client-cert-thumbprint",
+                          help="Windows/Schannel mTLS: SHA-1 thumbprint of a cert already in Cert:\\CurrentUser\\My")
+    p_enroll.add_argument("--import-pfx",
+                          help="Windows/Schannel mTLS: import this PFX into Cert:\\CurrentUser\\My, use its "
+                               "thumbprint, then delete the PFX")
+    p_enroll.add_argument("--pfx-password",
+                          help="password for --import-pfx (or set env AC_PFX_PW to keep it out of argv)")
     p_enroll.add_argument("--machine-id", help="override machine_id (default: keep existing config's, else computed)")
     p_enroll.set_defaults(func=_cmd_enroll)
 
