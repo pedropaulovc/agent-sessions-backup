@@ -328,6 +328,47 @@ describe('POST /api/v1/certs/renew', () => {
     expect(deletes).toContain('cert-rc-C'); // fell back to a direct best-effort revoke of the orphan
   });
 
+  it('a renew whose post-revoke stamp throws still returns 200; the reservation stays for the prune', async () => {
+    // Normal rotation displaces prev st-A; settleRetired revokes it and the CA reports 'revoked', so it
+    // tries to stamp revoked_at. If that D1 UPDATE throws, the COMMITTED renewal must still return 200
+    // with the new cert — the row just stays reserved for the next prune poll to re-stamp.
+    await seedMachine('renew-stamp', { fp: 'st-B', certId: 'cert-st-B', prevFp: 'st-A', prevCertId: 'cert-st-A', revokeAt: '2999-01-01T00:00:00.000Z' });
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return new Response(JSON.stringify({ success: true, result: { status: 'revoked' } }), { status: 200 });
+      return new Response(JSON.stringify({ success: true, result: { id: 'cert-st-C', certificate: fakeCertPem('st-C'), expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
+      if (sql.includes('UPDATE retired_certs SET revoked_at')) throw new Error('D1_ERROR: database is locked');
+      return realPrepare(sql);
+    });
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('renew-stamp', false, 'st-B'));
+    spy.mockRestore();
+    expect(res.status).toBe(200); // stamp failure must NOT fail the committed renewal
+    expect((await row('renew-stamp'))?.cert_fp_sha256).toBe(await certFingerprint(fakeCertPem('st-C')));
+    expect((await retired('st-A'))?.revoked_at).toBeNull(); // still reserved -> prune re-stamps next run
+  });
+
+  it('a failed pre-sign row read returns a retryable 503 and mints NOTHING (no orphan possible)', async () => {
+    await seedMachine('renew-read', { fp: 'rr-A', certId: 'cert-rr-A' });
+    let signCalls = 0;
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method !== 'DELETE') signCalls++;
+      return new Response(JSON.stringify({ success: true, result: { id: 'x', certificate: fakeCertPem('x'), expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    // The row read now runs BEFORE signing — make it throw and assert nothing was minted.
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
+      if (sql.includes('cert_revoke_at FROM machines WHERE machine_id = ?1')) throw new Error('D1_ERROR: database is locked');
+      return realPrepare(sql);
+    });
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('renew-read', false, 'rr-A'));
+    spy.mockRestore();
+    expect(res.status).toBe(503); // retryable — collector keeps its cert and retries
+    expect(signCalls).toBe(0); // never reached the CA mint
+    expect((await row('renew-read'))?.cert_fp_sha256).toBe('rr-A'); // unchanged
+  });
+
   it('stops honoring the previous fp once its revoke_at has passed', async () => {
     await seedMachine('renew-3', { fp: 'fpCur', prevFp: 'fpExpired', prevCertId: 'cert-x', revokeAt: '2000-01-01T00:00:00.000Z' });
     expect(await machineIdentity(reqWithCert('fpCur'), prodEnv)).toMatchObject({ machineId: 'renew-3' });

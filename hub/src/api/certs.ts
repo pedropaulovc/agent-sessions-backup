@@ -78,11 +78,19 @@ async function getClientCertStatus(env: Env, certId: string): Promise<CertStatus
 }
 
 /** Stamp a queued cert as revoked (returns its fingerprint to the reusable pool; the row is kept as
- * an audit trail). */
-async function stampRevoked(env: Env, certId: string): Promise<void> {
-  await env.DB.prepare('UPDATE retired_certs SET revoked_at = ?1 WHERE cert_id = ?2 AND revoked_at IS NULL')
-    .bind(new Date().toISOString(), certId)
-    .run();
+ * an audit trail). NEVER throws: a stamp failure just leaves the row reserved (revoked_at NULL) for
+ * the next prune poll to re-stamp — so a post-revoke D1 hiccup can't propagate into a caller that has
+ * already committed its main work (e.g. a completed renewal). Returns whether the stamp landed. */
+async function stampRevoked(env: Env, certId: string): Promise<boolean> {
+  try {
+    await env.DB.prepare('UPDATE retired_certs SET revoked_at = ?1 WHERE cert_id = ?2 AND revoked_at IS NULL')
+      .bind(new Date().toISOString(), certId)
+      .run();
+    return true;
+  } catch (e) {
+    console.log(JSON.stringify({ event: 'hub.certs.stamp_failed', cert_id: certId, error: String(e) }));
+    return false;
+  }
 }
 
 /** SQL fragment + binds that INSERT a displaced cert into the retired_certs queue, but ONLY if the
@@ -117,7 +125,9 @@ export async function settleRetired(env: Env, certId: string | null): Promise<Re
     console.log(JSON.stringify({ event: 'hub.certs.retire_revoke_error', cert_id: certId, error: String(e) }));
     return 'failed';
   }
-  if (result === 'revoked') await stampRevoked(env, certId);
+  // Stamp only on a full revoke, and never let a stamp failure throw out of a settle that a committed
+  // renewal is waiting on — the row stays reserved and the prune re-stamps.
+  if (result === 'revoked') return (await stampRevoked(env, certId)) ? 'revoked' : 'failed';
   return result;
 }
 
@@ -128,8 +138,7 @@ export async function settleRetired(env: Env, certId: string | null): Promise<Re
 export async function pollRetired(env: Env, certId: string): Promise<'revoked' | 'pending' | 'failed'> {
   const status = await getClientCertStatus(env, certId);
   if (status === 'revoked' || status === 'not_found') {
-    await stampRevoked(env, certId);
-    return 'revoked';
+    return (await stampRevoked(env, certId)) ? 'revoked' : 'failed';
   }
   if (status === 'pending_revocation') return 'pending';
   if (status === 'active' || status === 'pending_reactivation') {
@@ -181,6 +190,20 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
     return Response.json({ error: 'missing_csr' }, { status: 400 });
   }
 
+  // Read the row BEFORE minting anything. The CSR doesn't depend on it, and if this D1 read fails we
+  // bail with a retryable 503 having minted NOTHING — no orphan possible. (Doing it after signing
+  // would strand a live cert on a transient read error.) The read→sign→CAS window is slightly wider,
+  // but the swap's compare-and-swap on the observed fp is exactly what guards that.
+  let cur: { cert_fp_sha256: string | null; cert_id: string | null; prev_cert_fp_sha256: string | null; prev_cert_id: string | null; cert_revoke_at: string | null } | null;
+  try {
+    cur = await env.DB.prepare('SELECT cert_fp_sha256, cert_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at FROM machines WHERE machine_id = ?1')
+      .bind(identity.machineId)
+      .first();
+  } catch (e) {
+    console.log(JSON.stringify({ event: 'hub.certs.renew_read_failed', machine: identity.machineId, error: String(e) }));
+    return Response.json({ error: 'cert_renewal_unavailable' }, { status: 503 });
+  }
+
   let signed: SignedCert;
   try {
     signed = await signClientCert(env, body.csr);
@@ -189,10 +212,6 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
     return Response.json({ error: 'cf_sign_failed' }, { status: 502 });
   }
   const newFp = await certFingerprint(signed.certificate);
-
-  const cur = await env.DB.prepare('SELECT cert_fp_sha256, cert_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at FROM machines WHERE machine_id = ?1')
-    .bind(identity.machineId)
-    .first<{ cert_fp_sha256: string | null; cert_id: string | null; prev_cert_fp_sha256: string | null; prev_cert_id: string | null; cert_revoke_at: string | null }>();
 
   const authFp = identity.certFp ?? null;
   const onCurrent = authFp !== null && authFp === cur?.cert_fp_sha256;
