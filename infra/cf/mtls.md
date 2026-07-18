@@ -144,10 +144,21 @@ This is also the future TPM/PCP path (S2): a PCP-backed key surfaces as the same
 
 Enroll flow (drive it from WSL; the CSR/signing steps are identical to POSIX above —
 `enroll-cert.sh` still mints the EC P-256 key, gets it signed, and writes the `machines`
-row). The extra Windows step is getting the signed cert+key into the store as a PFX:
+row). The extra Windows step is getting the signed cert+key into the store as a PFX.
 
-**Bundle the cert+key into a PFX** — in WSL/bash, after `enroll-cert.sh` produced
-`$MID.client.pem` / `.client.key`. Export the password so it stays out of argv:
+**Sign for the WINDOWS id** — `enroll-cert.sh` takes the machine_id as its leading
+positional arg. Running it from WSL you MUST pass `amet-windows` explicitly: with no arg
+it falls back to `agent-collector machine-id`, which in WSL resolves to `amet-wsl`, and a
+cert signed for the wrong id 401s every Windows upload as `machine_mismatch`.
+
+```bash
+MID=amet-windows
+CF_API_TOKEN=<token from "Mint the enrollment token" above> \
+  infra/cf/enroll-cert.sh "$MID" --admin --out ~/.config/agent-collector
+```
+
+**Bundle the cert+key into a PFX** — still in WSL/bash, from the `$MID.client.pem` /
+`.client.key` that just got written. Export the password so it stays out of argv:
 
 ```bash
 export AC_PFX_PW='choose-a-transfer-password'
@@ -172,6 +183,18 @@ the import and pass `--client-cert-thumbprint <thumbprint>` directly. `agent-col
 doctor` then verifies the cert is present in the store and warns if it expires within 21
 days. A password-less PFX works too — omit `AC_PFX_PW` and the import runs without
 `-Password`.
+
+**Destroy the WSL-side private key** — only AFTER `doctor` confirms the store cert, so a
+failed import never leaves you with no key. The store copy is now the sole private key (the
+Windows model); the PEM key on the WSL disk is a redundant, exportable copy that
+contradicts it. The PFX was already deleted by the import; shred the leftover key too:
+
+```bash
+shred -u "$MID.client.key"    # or: rm -P on *BSD/macOS
+```
+
+The `$MID.client.pem` **cert** is public (it's just the signed certificate, not the key)
+and may stay in `~/.config/agent-collector` for reference or re-bundling.
 
 ## Notes
 
