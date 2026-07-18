@@ -24,11 +24,14 @@ def _daily_report(args: argparse.Namespace) -> int:
             bearer_token=args.bearer_token,
             dev_machine=args.dev_machine,
         )
+        # HubClient's constructor loads the mTLS cert chain eagerly — a stale/moved cert path
+        # raises here, not on the first request, so it belongs in this same config-error try
+        # block (both map to the ValueError-> "error: ..." + exit 2 path below).
+        api = SessionsApi(HubClient(config))
     except ValueError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
-    api = SessionsApi(HubClient(config))
     try:
         sessions_page = api.list_sessions(from_=report_date, to=report_date, machine=args.machine, harness=args.harness)
         usage_report = api.usage(group_by="model", from_=report_date, to=report_date)
@@ -39,7 +42,14 @@ def _daily_report(args: argparse.Namespace) -> int:
             print(e.body, file=sys.stderr)
         return 1
 
-    report = build_daily_report(date=report_date, sessions_page=sessions_page, usage_report=usage_report, status=status)
+    report = build_daily_report(
+        date=report_date,
+        sessions_page=sessions_page,
+        usage_report=usage_report,
+        status=status,
+        machine=args.machine,
+        harness=args.harness,
+    )
     if args.out:
         Path(args.out).write_text(report)
     else:

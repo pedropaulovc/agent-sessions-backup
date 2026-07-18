@@ -1,6 +1,6 @@
 import pytest
 
-from agent_sessions_client.config import AuthMode, load_config
+from agent_sessions_client.config import AuthMode, ClientConfig, load_config
 
 
 def test_bearer_mode_from_explicit_args():
@@ -52,3 +52,21 @@ def test_bearer_wins_over_mtls_config_when_both_present(tmp_path):
     config_path.write_text('client_cert_path = "/from/config.pem"\nclient_key_path = "/from/config.key"\n')
     config = load_config(config_path=config_path, bearer_token="tok", dev_machine="m1")
     assert config.auth_mode is AuthMode.BEARER
+
+
+def test_client_config_coerces_plain_string_auth_mode():
+    # AuthMode subclasses str, so a caller (ClientConfig is exported) passing the plain string
+    # "bearer" instead of AuthMode.BEARER must behave identically — not silently skip the `is
+    # AuthMode.BEARER` checks in __post_init__ and HubClient, which would send an
+    # unauthenticated request.
+    config = ClientConfig(hub_url="https://x", auth_mode="bearer", bearer_token="tok", dev_machine="m")
+    assert config.auth_mode is AuthMode.BEARER
+    assert isinstance(config.auth_mode, AuthMode)
+
+    mtls = ClientConfig(hub_url="https://x", auth_mode="mtls", client_cert_path="/c.pem", client_key_path="/c.key")
+    assert mtls.auth_mode is AuthMode.MTLS
+
+
+def test_client_config_rejects_invalid_auth_mode_string():
+    with pytest.raises(ValueError):
+        ClientConfig(hub_url="https://x", auth_mode="nonsense")

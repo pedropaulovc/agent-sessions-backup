@@ -41,6 +41,13 @@ class ClientConfig:
     dev_machine: str | None = None
 
     def __post_init__(self) -> None:
+        # AuthMode subclasses str, so a caller passing the plain string "mtls"/"bearer" (this
+        # class is exported — that's a reasonable thing to do) would otherwise sail past every
+        # `is AuthMode.X` identity check below AND in HubClient, silently sending an
+        # unauthenticated request instead of failing fast. Coerce unconditionally — AuthMode(x)
+        # is a no-op for an already-valid member and raises ValueError for anything else, which
+        # is exactly the "fail fast" behavior we want for garbage input.
+        object.__setattr__(self, "auth_mode", AuthMode(self.auth_mode))
         if self.auth_mode is AuthMode.MTLS and (self.client_cert_path is None or self.client_key_path is None):
             raise ValueError("mtls auth requires client_cert_path and client_key_path")
         if self.auth_mode is AuthMode.BEARER and (self.bearer_token is None or self.dev_machine is None):

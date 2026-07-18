@@ -77,7 +77,18 @@ class HubClient:
         if self._config.auth_mode is not AuthMode.MTLS:
             return None
         ctx = ssl.create_default_context()
-        ctx.load_cert_chain(certfile=str(self._config.client_cert_path), keyfile=str(self._config.client_key_path))
+        try:
+            ctx.load_cert_chain(certfile=str(self._config.client_cert_path), keyfile=str(self._config.client_key_path))
+        except OSError as e:
+            # Covers both a missing file (FileNotFoundError) and a malformed one
+            # (ssl.SSLError, itself an OSError subclass) — e.g. a stale collector config
+            # pointing at a rotated/moved cert. Re-raised as ValueError so it's caught by the
+            # same config-error handling load_config()'s own ValueErrors already go through
+            # (see cli.py), instead of escaping HubClient's constructor as a raw traceback.
+            raise ValueError(
+                f"failed to load mTLS client cert/key ({self._config.client_cert_path}, "
+                f"{self._config.client_key_path}): {e}"
+            ) from e
         return ctx
 
     def _headers(self) -> dict[str, str]:
@@ -99,6 +110,13 @@ class HubClient:
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             raise HubError(e.code, e.reason, body) from e
+        except TimeoutError as e:
+            # A connect-phase timeout comes back wrapped in URLError, but a READ-phase stall
+            # (hub accepts the connection, then hangs) raises the builtin TimeoutError
+            # directly — urlopen doesn't wrap it. Without this, that escapes past every
+            # HubError-only except clause (including the CLI's), producing a traceback instead
+            # of the documented `error: ...` + nonzero exit.
+            raise HubError(None, f"timed out after {self._timeout}s") from e
         except urllib.error.URLError as e:
             raise HubError(None, str(e.reason)) from e
         headers = {k.lower(): v for k, v in fp.headers.items()}

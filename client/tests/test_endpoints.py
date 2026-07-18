@@ -29,6 +29,17 @@ def test_list_sessions_truncated_heuristic(hub):
     assert page.truncated is True
 
 
+def test_list_sessions_truncation_detected_past_server_cap(hub):
+    # The hub silently clamps limit at MAX_SESSIONS_LIMIT (1000) server-side. Asking for more
+    # than that must still detect truncation against the real 1000-row cap, not the inflated
+    # requested limit — otherwise len(sessions) == 1000 < limit == 5000 reads as "not truncated"
+    # in exactly the case this heuristic exists to catch.
+    hub.sessions = [make_session_row(f"s{i}") for i in range(MAX_SESSIONS_LIMIT)]
+    page = api_for(hub).list_sessions(limit=5000)
+    assert len(page.sessions) == MAX_SESSIONS_LIMIT
+    assert page.truncated is True
+
+
 def test_list_sessions_default_limit_matches_hub_cap(hub):
     hub.sessions = []
     api_for(hub).list_sessions()

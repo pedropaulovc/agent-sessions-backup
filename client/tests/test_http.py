@@ -1,4 +1,7 @@
 import ssl
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
@@ -80,3 +83,43 @@ def test_mtls_config_builds_ssl_context_with_configured_paths(tmp_path, monkeypa
 
     assert calls == [(str(cert), str(key))]
     monkeypatch.setattr(ssl.SSLContext, "load_cert_chain", original_load_cert_chain)
+
+
+def test_mtls_config_with_missing_cert_raises_value_error(tmp_path):
+    # A stale collector config pointing at a rotated/moved cert must fail with a config-class
+    # error the CLI already maps to `error: ...` + exit 2, not a raw FileNotFoundError/
+    # ssl.SSLError traceback out of the constructor.
+    config = ClientConfig(
+        hub_url="https://example",
+        auth_mode=AuthMode.MTLS,
+        client_cert_path=tmp_path / "nonexistent.pem",
+        client_key_path=tmp_path / "nonexistent.key",
+    )
+    with pytest.raises(ValueError, match="failed to load mTLS client cert/key"):
+        HubClient(config)
+
+
+def test_read_timeout_raises_hub_error():
+    # A connect-phase timeout is wrapped in URLError already, but a read-phase stall (the hub
+    # accepts the connection, then hangs) raises the builtin TimeoutError directly out of
+    # urlopen — must be caught and wrapped like every other transport failure.
+    class SlowHandler(BaseHTTPRequestHandler):
+        def log_message(self, *args):  # silence
+            pass
+
+        def do_GET(self):
+            time.sleep(0.5)
+            self.send_response(200)
+            self.end_headers()
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        client = HubClient(bearer_config(f"http://127.0.0.1:{port}"), timeout=0.05)
+        with pytest.raises(HubError):
+            client.get("/api/v1/status")
+    finally:
+        server.shutdown()
+        server.server_close()

@@ -44,8 +44,9 @@ class SessionsApi:
         limit: int = MAX_SESSIONS_LIMIT,
     ) -> SessionsPage:
         """GET /api/v1/sessions — meta-only rows (no R2 parse), the cheap call for aggregate
-        stats. `page.truncated` is a heuristic (len(sessions) == limit): treat it as "there
-        may be more sessions in this window than were returned."
+        stats. `page.truncated` is a heuristic (len(sessions) == effective limit, i.e. the
+        hub's actual cap of MAX_SESSIONS_LIMIT even if a caller asked for more): treat it as
+        "there may be more sessions in this window than were returned."
         """
         resp = self._client.get(
             "/api/v1/sessions",
@@ -53,10 +54,15 @@ class SessionsApi:
         )
         body = resp.json()
         sessions = [SessionMeta.from_row(r) for r in body.get("sessions", [])]
+        # The hub silently clamps limit at MAX_SESSIONS_LIMIT server-side — comparing against
+        # the raw requested `limit` instead would make truncated=False exactly when a caller
+        # asked for more than 1000 and hit the real cap, the one case this heuristic exists
+        # to catch.
+        effective_limit = min(limit, MAX_SESSIONS_LIMIT)
         return SessionsPage(
             sessions=sessions,
             indexed_through=body.get("indexed_through") or None,
-            truncated=len(sessions) >= limit,
+            truncated=len(sessions) >= effective_limit,
         )
 
     def iter_sessions_ndjson(

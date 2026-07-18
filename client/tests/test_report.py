@@ -114,3 +114,77 @@ def test_report_notable_sessions_sorted_by_size_and_duration():
     )
     largest_section = report.split("**Largest by block count:**")[1].split("**Longest by duration:**")[0]
     assert largest_section.index("`big`") < largest_section.index("`small`")
+
+
+def test_report_excludes_prompt_log_from_notable_but_keeps_it_in_counts():
+    normal = meta(session_id="normal", harness="claude-code", block_count=10, started_at="2026-07-18T00:00:00.000Z", ended_at="2026-07-18T00:10:00.000Z")
+    prompt_log = meta(
+        session_id="the-log",
+        harness="prompt-log",
+        block_count=999999,  # would dominate every ranking if not excluded
+        started_at="2026-01-01T00:00:00.000Z",
+        ended_at="2026-07-18T00:00:00.000Z",
+    )
+    sessions_page = SessionsPage(sessions=[normal, prompt_log], indexed_through=None, truncated=False)
+    status = HubStatus(machines=[], sessions=SessionsSummary(total=2, ready=2, error=0))
+    report = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=UsageReport(group_by="model", rows=[]), status=status
+    )
+    notable_section = report.split("## Notable sessions")[1].split("## Token spend")[0]
+    assert "`the-log`" not in notable_section
+    assert "`normal`" in notable_section
+    assert "prompt-log" in report  # still present in the per-harness counts table
+
+
+def test_report_usage_labeled_fleet_wide_when_filtered():
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None, truncated=False)
+    usage_report = UsageReport(
+        group_by="model",
+        rows=[
+            UsageRow(
+                bucket="claude-sonnet-5", calls=1, input_tokens=1, output_tokens=1, reasoning_tokens=0,
+                cache_read_tokens=0, cache_creation_5m_tokens=0, cache_creation_1h_tokens=0,
+            )
+        ],
+    )
+    status = HubStatus(machines=[], sessions=SessionsSummary(total=1, ready=1, error=0))
+
+    unfiltered = build_daily_report(date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status)
+    assert "fleet-wide" not in unfiltered
+
+    filtered_by_machine = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status, machine="m1"
+    )
+    assert "fleet-wide" in filtered_by_machine
+
+    filtered_by_harness = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status, harness="codex"
+    )
+    assert "fleet-wide" in filtered_by_harness
+
+
+def test_report_machine_filter_scopes_staleness_caveats_to_that_machine():
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="fresh-box")], indexed_through=None, truncated=False)
+    status = HubStatus(
+        machines=[
+            MachineStatus(
+                machine_id="fresh-box", os="linux", last_seen_at="2026-07-18T23:59:59.999Z", last_upload_at=None,
+                files_pending=0, files_error=0, files_total=1, indexed_through="2026-07-18T23:59:59.999Z",
+            ),
+            MachineStatus(
+                machine_id="stale-unrelated-box", os="linux", last_seen_at="2026-07-01T00:00:00.000Z", last_upload_at=None,
+                files_pending=0, files_error=0, files_total=1, indexed_through="2026-07-01T00:00:00.000Z",
+            ),
+        ],
+        sessions=SessionsSummary(total=1, ready=1, error=0),
+    )
+    report = build_daily_report(
+        date="2026-07-18",
+        sessions_page=sessions_page,
+        usage_report=UsageReport(group_by="model", rows=[]),
+        status=status,
+        machine="fresh-box",
+    )
+    # fresh-box is fully synced -> no caveat for it; stale-unrelated-box is out of scope for a
+    # --machine=fresh-box report and must not be mentioned at all.
+    assert "stale-unrelated-box" not in report

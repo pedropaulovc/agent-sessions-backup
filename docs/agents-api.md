@@ -88,6 +88,14 @@ reasoning_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h
 Raw token counts only — the hub has no pricing table, so there's no dollar figure anywhere
 in this response. Compute cost yourself if you need it, and caveat that it's an estimate.
 
+**No `machine`/`harness` filter.** Only `group_by`/`from`/`to` are accepted (see "Known
+contract gaps" below) — if you're building a per-machine or per-harness token report, you
+must fetch the fleet-wide rows and either accept that scope or cross-reference against
+`/api/v1/sessions` yourself. The `daily-report` CLI does the honest thing here: when
+`--machine`/`--harness` is passed, it labels the token section
+"(fleet-wide — /api/v1/usage has no machine/harness filter)" rather than presenting
+fleet-wide numbers as if they were scoped to your filter.
+
 ### `GET /api/v1/status`
 Fleet freshness / index-completeness:
 ```jsonc
@@ -121,6 +129,10 @@ the plan, until they're reconciled:
 - `X-Indexed-Through` on bulk `/api/v1/sessions` is an unfiltered fleet-wide minimum — it
   does **not** narrow to the machines matching your `machine`/`harness` query params, so it
   can read more stale than your actually-filtered data really is.
+- `GET /api/v1/usage` accepts only `group_by`/`from`/`to` — no `machine`/`harness` filter at
+  all, unlike `/api/v1/sessions` and `/api/v1/search`. A report scoped to one machine or
+  harness still gets fleet-wide token totals from this endpoint; say so rather than
+  presenting them as scoped (see the CLI's behavior above).
 - `/api/v1/sessions` has no cursor/pagination at all; the plan's endpoint list implies more
   uniform pagination across endpoints than exists.
 - `GET /api/v1/bootstrap`, `POST /api/v1/certs/renew`, and `POST /api/v1/admin/machines`

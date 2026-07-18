@@ -96,3 +96,23 @@ def test_daily_report_connection_failure_returns_error(capsys):
     )
     assert rc == 1
     assert "error:" in capsys.readouterr().err
+
+
+def test_daily_report_bad_mtls_cert_returns_error_not_traceback(tmp_path, capsys, monkeypatch):
+    # A stale collector config pointing at a moved/rotated cert must produce the documented
+    # `error: ...` + exit 2, not an unhandled FileNotFoundError/ssl.SSLError traceback.
+    monkeypatch.delenv("AGENT_SESSIONS_BEARER_TOKEN", raising=False)
+    monkeypatch.delenv("AGENT_SESSIONS_DEV_MACHINE", raising=False)
+    rc = main(
+        [
+            "daily-report",
+            "--hub-url",
+            "https://example.invalid",
+            "--client-cert",
+            str(tmp_path / "nonexistent.pem"),
+            "--client-key",
+            str(tmp_path / "nonexistent.key"),
+        ]
+    )
+    assert rc == 2
+    assert "error:" in capsys.readouterr().err
