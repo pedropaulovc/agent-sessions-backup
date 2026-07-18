@@ -96,7 +96,12 @@ async function getClientCertStatus(env: Env, certId: string): Promise<CertStatus
  * VERIFY that an admin-supplied cert_id actually resolves to the fingerprint it's being attached to —
  * comparing the CA cert's own PEM fingerprint (not a CF-provided field) keeps it byte-identical to how we
  * derive every stored fp. Closes the garbage-in case where a wrong/foreign id would later be revoked in
- * place of the real cert. */
+ * place of the real cert.
+ *
+ * result.certificate is the PEM: verified against the CF API docs + the sign-response shape (enroll-cert.sh
+ * has always read result.certificate from this same object). No token exists to probe the live GET until
+ * CF_CLIENT_CERT_TOKEN is minted post-merge (USER ACTIONS) — live-verify on first post-merge use. Fails
+ * closed regardless: an absent/renamed field → 'unknown' → 422 (attach refused), never a lockout or leak. */
 export async function getClientCertFingerprint(env: Env, certId: string): Promise<string | 'not_found' | 'unknown'> {
   let res: Response;
   try {
