@@ -151,17 +151,25 @@ const EXPORT_ARCHIVE_HARNESSES = new Set<string>(['chatgpt-web', 'claude-web']);
  * the harness-X MIN stale forever, even though nothing on that machine could ever appear in
  * `/api/v1/sessions?harness=X`.
  *
- * `harness = 'unknown'`: `detect()` (hub/src/ingest/detect.ts) stamps a `.zip` upload to
- * export-inbox as `harness: 'unknown'` — its real per-conversation harness isn't known until
- * `parseExportArchive()` (hub/src/ingest/parsers/export-inbox.ts) actually reads
- * `conversations.json`, but that parser only ever recognizes ChatGPT/Claude web exports
- * (EXPORT_ARCHIVE_HARNESSES above) — it can never produce a codex or claude-code session. So
- * a pending/error 'unknown' file only needs to count against chatgpt-web/claude-web
- * freshness, not every harness: including it for codex/claude-code would make those reports
- * look stale over data that structurally cannot exist. Within that web-harness scope this is
- * still intentionally conservative (it also drags freshness for the OTHER web harness the
- * archive turns out not to contain) — honest-under-uncertainty beats optimistic, and the
- * state is transient until the parse resolves it.
+ * `harness = 'unknown'`: `detect()` (hub/src/ingest/detect.ts) stamps `harness: 'unknown'` for
+ * a LOT more than pending export archives — any unrecognized path shape in any store
+ * (`kind: 'other'`) gets it too, and the consumer only ever skips those; they can NEVER
+ * become sessions of any harness. Only the specific `store === 'export-inbox' && base.endsWith
+ * ('.zip')` case (`kind: 'export-archive'`) is later actually parsed by
+ * `parseExportArchive()` (hub/src/ingest/parsers/export-inbox.ts), which only ever recognizes
+ * ChatGPT/Claude web exports (EXPORT_ARCHIVE_HARNESSES above) — never codex or claude-code.
+ * So the unknown clause below is doubly scoped: (a) only for a queried harness in
+ * EXPORT_ARCHIVE_HARNESSES, AND (b) only for rows shaped like the export-archive case detect()
+ * actually produces (`store = 'export-inbox' AND relpath GLOB '*.zip'` — GLOB, not LIKE,
+ * to match `.endsWith('.zip')`'s case sensitivity; SQLite's LIKE is case-insensitive by
+ * default and would over-match a `.ZIP` upload that detect() itself classifies as
+ * `kind: 'other'`, i.e. never parseable). Without both restrictions, a stuck/backlogged
+ * unrelated unknown upload (an unrecognized `claude-projects` path, a non-.zip file dropped
+ * in export-inbox, etc.) would drag chatgpt-web/claude-web freshness stale over data that
+ * cannot exist. Within the real export-archive case this is still intentionally conservative
+ * (it also drags freshness for the OTHER web harness the archive turns out not to contain) —
+ * honest-under-uncertainty beats optimistic, and the state is transient until the parse
+ * resolves it.
  *
  * No filter -> fleet-wide MIN, same as before. `machine` wins if both are given — it's the
  * more specific, unambiguous filter.
@@ -169,6 +177,7 @@ const EXPORT_ARCHIVE_HARNESSES = new Set<string>(['chatgpt-web', 'claude-web']);
 async function computeIndexedThrough(env: Env, p: URLSearchParams): Promise<string | null> {
   const machine = p.get('machine');
   const harness = p.get('harness');
+  const unknownExportArchiveClause = "(harness = 'unknown' AND store = 'export-inbox' AND relpath GLOB '*.zip')";
   const row = await (machine
     ? env.DB.prepare(`SELECT MIN(COALESCE(last_seen_at, created_at)) AS t FROM machines WHERE machine_id = ?1`).bind(machine)
     : harness
@@ -178,7 +187,7 @@ async function computeIndexedThrough(env: Env, p: URLSearchParams): Promise<stri
              WHERE machine_id IN (
                SELECT machine_id FROM sessions WHERE harness = ?1
                UNION
-               SELECT machine_id FROM files WHERE (harness = ?1${EXPORT_ARCHIVE_HARNESSES.has(harness) ? " OR harness = 'unknown'" : ''}) AND parse_state IN ('pending', 'error')
+               SELECT machine_id FROM files WHERE (harness = ?1${EXPORT_ARCHIVE_HARNESSES.has(harness) ? ` OR ${unknownExportArchiveClause}` : ''}) AND parse_state IN ('pending', 'error')
              )`,
           )
           .bind(harness)
@@ -222,13 +231,31 @@ function startedAtKey(row: SessionRow): string {
  * boundary in the total (started_at DESC, session_id ASC) order, never invalidate it. This
  * also kills OFFSET's O(n) scan-and-discard cost on a page far into a large result set.
  */
+// btoa/atob operate on Latin-1 code units — a session_id containing a non-Latin-1 character
+// (web-capture session ids come from a URL-decoded upload filename, e.g. detect.ts's
+// chatgpt-web/claude-web cases, so this isn't hypothetical) makes btoa throw, 500ing the
+// whole request the moment such a row lands on a page boundary and needs a cursor. Route
+// through UTF-8 bytes first (same char-code-loop idiom already used for bytes<->base64 in
+// hub/src/auth/webauthn.ts's b64uToBuf/bufToB64u) so any valid string round-trips.
+function utf8ToBase64(s: string): string {
+  const bytes = new TextEncoder().encode(s);
+  let binary = '';
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary);
+}
+function base64ToUtf8(b64: string): string {
+  const binary = atob(b64);
+  const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+  return new TextDecoder().decode(bytes);
+}
+
 function encodeSessionsCursor(c: SessionsCursor): string {
-  return btoa(JSON.stringify([c.startedAt, c.sessionId]));
+  return utf8ToBase64(JSON.stringify([c.startedAt, c.sessionId]));
 }
 function decodeSessionsCursor(cursor: string | null): SessionsCursor | null {
   if (!cursor) return null;
   try {
-    const decoded: unknown = JSON.parse(atob(cursor));
+    const decoded: unknown = JSON.parse(base64ToUtf8(cursor));
     if (Array.isArray(decoded) && decoded.length === 2 && typeof decoded[0] === 'string' && typeof decoded[1] === 'string') {
       return { startedAt: decoded[0], sessionId: decoded[1] };
     }

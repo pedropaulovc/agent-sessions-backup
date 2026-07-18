@@ -279,6 +279,43 @@ async function insertSyntheticSessions(machine: string, harness: string, count: 
   return ids;
 }
 
+describe('/api/v1/sessions keyset cursor round-trips a non-Latin-1 session_id (round-5 finding 2)', () => {
+  const MACHINE = 'unicodebox';
+  // Web-capture session ids come straight from a URL-decoded upload filename (detect.ts's
+  // chatgpt-web/claude-web cases) — non-ASCII is a real, not hypothetical, case. One café-style
+  // Latin-1-adjacent-but-not-actually-Latin-1 id and one CJK id, to hit both "a character btoa
+  // would throw on outright" and "one that looks deceptively close to safe."
+  const IDS = ['café-a0000000-0000-4000-8000-000000000001', '東京-a0000000-0000-4000-8000-000000000002'];
+
+  beforeAll(async () => {
+    await testEnv.DB.batch(
+      IDS.map((id, i) =>
+        testEnv.DB.prepare('INSERT INTO sessions (session_id, harness, machine_id, started_at, index_state) VALUES (?1, ?2, ?3, ?4, ?5)').bind(
+          id,
+          'chatgpt-web',
+          MACHINE,
+          `2026-07-11T00:00:0${i + 1}.000Z`,
+          'ready',
+        ),
+      ),
+    );
+  });
+
+  it('paginates across a boundary row with a non-Latin-1 session_id without 500ing, cursor round-trips', async () => {
+    const res1 = await get(`machine=${MACHINE}&limit=1`);
+    expect(res1.status).toBe(200); // NOT a 500 from btoa throwing on the boundary row
+    const body1 = (await res1.json()) as { sessions: { session_id: string }[]; cursor?: string };
+    expect(body1.sessions.map((s) => s.session_id)).toEqual([IDS[1]]); // newer started_at first
+    expect(body1.cursor).toBeDefined();
+
+    const res2 = await get(`machine=${MACHINE}&limit=1&cursor=${encodeURIComponent(body1.cursor!)}`);
+    expect(res2.status).toBe(200);
+    const body2 = (await res2.json()) as { sessions: { session_id: string }[]; cursor?: string };
+    expect(body2.sessions.map((s) => s.session_id)).toEqual([IDS[0]]);
+    expect(body2.cursor).toBeUndefined(); // last page
+  });
+});
+
 describe('/api/v1/sessions format=ndjson bounds total rows per request at NDJSON_MAX_ROWS_PER_REQUEST', () => {
   const MACHINE = 'ndjsoncapbox';
   const HARNESS = 'claude-code';
@@ -512,6 +549,41 @@ describe('X-Indexed-Through and /api/v1/usage respect the request machine/harnes
     const after = await get('harness=claude-web');
     const bodyAfter = (await after.json()) as { indexed_through: string };
     expect(bodyAfter.indexed_through).not.toBe(WEBZIP_TS);
+  });
+
+  it('harness filter -> excludes pending unknown-harness files that can never resolve to a web session (round-5 finding)', async () => {
+    // Case A: a non-.zip file dropped in export-inbox — detect() stamps it harness='unknown',
+    // kind='other' (not 'export-archive'), so parseExportArchive() never even runs on it.
+    const NONZIP_MACHINE = 'filterbox-nonzip';
+    const NONZIP_TS = '2015-01-01T00:00:00.000Z';
+    const nonzipRes = await putFile(NONZIP_MACHINE, 'export-inbox', 'notes.txt', 'not an export archive');
+    expect(nonzipRes.status).toBe(201);
+    const nonzipFile = await testEnv.DB.prepare('SELECT harness, parse_state FROM files WHERE machine_id = ?1')
+      .bind(NONZIP_MACHINE)
+      .first<{ harness: string; parse_state: string }>();
+    expect(nonzipFile?.harness).toBe('unknown');
+    expect(nonzipFile?.parse_state).toBe('pending'); // never drained — stays pending
+    await testEnv.DB.prepare('UPDATE machines SET last_seen_at = ?1 WHERE machine_id = ?2').bind(NONZIP_TS, NONZIP_MACHINE).run();
+
+    // Case B: an unrecognized path shape in an unrelated store (claude-projects) — also
+    // harness='unknown', kind='other', same as case A but not even in export-inbox.
+    const OTHERSTORE_MACHINE = 'filterbox-otherstore';
+    const OTHERSTORE_TS = '2014-01-01T00:00:00.000Z';
+    const otherRes = await putFile(OTHERSTORE_MACHINE, 'claude-projects', 'not-a-uuid.jsonl', 'irrelevant content');
+    expect(otherRes.status).toBe(201);
+    const otherFile = await testEnv.DB.prepare('SELECT harness, parse_state FROM files WHERE machine_id = ?1')
+      .bind(OTHERSTORE_MACHINE)
+      .first<{ harness: string; parse_state: string }>();
+    expect(otherFile?.harness).toBe('unknown');
+    expect(otherFile?.parse_state).toBe('pending');
+    await testEnv.DB.prepare('UPDATE machines SET last_seen_at = ?1 WHERE machine_id = ?2').bind(OTHERSTORE_TS, OTHERSTORE_MACHINE).run();
+
+    // Neither is an export-archive-shaped row, so neither drags harness=claude-web's
+    // freshness down, even though both are pending 'unknown' files.
+    const res = await get('harness=claude-web');
+    const body = (await res.json()) as { indexed_through: string };
+    expect(body.indexed_through).not.toBe(NONZIP_TS);
+    expect(body.indexed_through).not.toBe(OTHERSTORE_TS);
   });
 
   it('no filter -> fleet-wide MIN across all machines (unchanged behavior)', async () => {
