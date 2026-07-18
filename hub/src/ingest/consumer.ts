@@ -2,7 +2,7 @@ import { detect } from './detect';
 import type { NormalizedSession } from './normalize';
 import { SINGLE_SESSION_HARNESSES, parseObject } from './parse';
 import { parseExportArchive } from './parsers/export-inbox';
-import { markPendingAndEnqueue } from '../queue';
+import { markPendingAndEnqueue, reservationCutoffIso } from '../queue';
 
 interface FileRow {
   id: number;
@@ -454,6 +454,25 @@ async function failExportFile(
   // impossible: a retry re-enters with the file NOT yet 'error' and resumes the flips at kick_cursor. Same
   // flip-early invariant as the round-11 cleanup success path.
   if (owned.results.length > 0) {
+    // Serialize per store (round 14): the corrupt-path fan-out honors the same defer-on-contention as the
+    // cleanup path. Only on the INITIAL entry (kickCursor === 0) — a reserve continuation already owns the
+    // store, so it must resume, not re-defer. If another cleanup holds the store, re-enqueue this corrupt
+    // parse (no kick_cursor) with backoff and stop WITHOUT marking 'error' (nothing mutated).
+    if (kickCursor === 0) {
+      const contended = await anotherCleanupHoldsStore(file, env);
+      spent += 1;
+      if (contended) {
+        try {
+          await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason: msgReason, content_hash: contentHash });
+        } catch {
+          await forcePending(file, env, contentHash);
+          console.log(JSON.stringify({ event: 'parse.export.error_defer_send_failed', file_id: file.id }));
+          throw new ExportRetry('failExportFile contention defer send failed');
+        }
+        console.log(JSON.stringify({ event: 'parse.export.error_deferred', file_id: file.id }));
+        return spent;
+      }
+    }
     const r = await reserveSiblings(file, env, contentHash, kickCursor, spent);
     spent += r.spent;
     if (r.superseded) return spent; // a fresher re-upload owns the file; it runs its own parse + fan-out
@@ -741,12 +760,17 @@ async function runExportParse(
         console.log(JSON.stringify({ event: 'parse.export.oversized_conversation', file_id: file.id, session: session.id, est_subrequests: estSubreq, owned: flip !== null }));
         continue;
       }
-      if (estSubreq > EXPORT_OVERSIZED_CEILING && spentBefore > 0) {
-        // Big enough to deserve its own invocation and this slice already spent D1 work (a prior write OR
-        // prior lookups) — cut BEFORE it so the continuation runs it alone next invocation, keeping its
-        // writeSession clear of the cap. spentBefore excludes this conversation's own lookup, so a LEADING
-        // oversized conversation (spentBefore 0) falls through and is written ALONE (it still fits under the
-        // cap) rather than re-enqueuing the SAME offset forever — see the spentBefore snapshot above.
+      if (spentBefore > 0 && (estSubreq > EXPORT_OVERSIZED_CEILING || spent + estSubreq > EXPORT_QUERY_BUDGET)) {
+        // Cut BEFORE writing this conversation, deferring it to the next invocation, when EITHER:
+        //  - it is oversized (> CEILING) and deserves its own invocation for cap headroom; OR
+        //  - its estimated cost would push THIS slice's cumulative spend past the budget (3608782615). Two
+        //    sub-ceiling-but-heavy conversations (e.g. ~600 subrequests each, budget 800) otherwise both run
+        //    here: the first leaves spent ~601, the second is not > CEILING so it isn't cut, and its write
+        //    breaches the ~1000 cap BEFORE the post-write `spent >= budget` check — then the same-offset retry
+        //    replays the identical over-budget pair forever. Cutting on the projected cumulative spend closes
+        //    that deterministic overrun.
+        // Both are gated on spentBefore > 0 (this conversation's own lookup excluded), so a LEADING heavy/
+        // oversized conversation still runs ALONE (it fits under the CAP) rather than re-enqueuing forever.
         break;
       }
 
@@ -917,6 +941,27 @@ async function runExportParse(
       }
       // First STALE session: RESERVE every overlapping sibling ('parsed' → 'reserved') before deleting.
       if (!reserved) {
+        // Serialize per store (round 14): if another cleanup already owns the store's reserve→delete→send-late
+        // window, DEFER before touching anything and stop. Only reached once we HAVE a stale row to delete, so
+        // a clean re-parse never defers; an unchanged recover parse has an empty delete set and never reaches
+        // here either, so it drains the reserved set rather than deadlocking on it (no livelock).
+        const contended = await anotherCleanupHoldsStore(file, env);
+        spent += 1;
+        if (contended) {
+          // Re-enqueue as a PLAIN re-parse (no offset/cleanup_phase), NOT a cleanup continuation: the retry
+          // re-runs the idempotent write phase and re-enters cleanup from scratch, re-checking contention. A
+          // plain message carries no resume cursor, so it can't form a self-referential cleanup-continuation
+          // loop — the store frees within a few invocations under max_concurrency:1 (the reserving cleanup's
+          // own messages run ahead of this re-enqueue), and the retry proceeds then. Nothing was mutated here.
+          try {
+            await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: contentHash });
+          } catch {
+            await forcePending(file, env, contentHash);
+            throw new ExportRetry('cleanup contention defer re-enqueue send failed');
+          }
+          console.log(JSON.stringify({ event: 'parse.export.cleanup_deferred', file_id: file.id, cursor }));
+          return spent;
+        }
         const r = await reserveSiblings(file, env, contentHash, 0, spent);
         spent += r.spent;
         if (r.superseded) return spent;
@@ -1040,6 +1085,25 @@ async function sendCleanupContinuation(
   }
 }
 
+/** One-subrequest guard for the per-store cleanup serialization (round 14): does ANOTHER store sibling carry
+ * a FRESH reservation? If so, a different cleanup owns the store's reserve → delete → send-late window, and
+ * this cleanup (which has stale rows to delete, or a corrupt-file fan-out to run) must defer BEFORE any
+ * mutation rather than reserve concurrently — concurrent reservations would let one cleanup's store-wide
+ * send-late fire the other's rows early and cross-contaminate the 'reserved' set. Our OWN reservations are
+ * excluded by OWNER (reserved_by != ?2), not by row id: a cleanup that already reserved siblings and is now
+ * retrying past a transient failure must see its own fresh reservations as NOT contended, or it would defer on
+ * itself until they went stale (1h) instead of completing the retry. reserved_by is the reserving file's id, so
+ * reserved_by != file.id keeps exactly the OTHER cleanups' live reservations as the block. Stale reservations
+ * (a crashed cleanup) fall past the reserved_at cutoff and never wedge the store. */
+async function anotherCleanupHoldsStore(file: FileRow, env: Env): Promise<boolean> {
+  const row = await env.DB.prepare(
+    "SELECT 1 AS held FROM files WHERE store = ?1 AND reserved_by != ?2 AND parse_state = 'reserved' AND reserved_at IS NOT NULL AND reserved_at > ?3 LIMIT 1",
+  )
+    .bind(file.store, file.id, reservationCutoffIso())
+    .first<{ held: number }>();
+  return row !== null;
+}
+
 /** RESERVE pass: flip every 'parsed' sibling archive to 'reserved' — a DURABLE recovery reservation that is
  * its own explicit marker (round 12) — paged by files.id so pages advance independent of parse_state (a
  * sibling healed back to 'parsed' behind the cursor can't re-trigger a re-flip → no livelock). NO queue send
@@ -1079,7 +1143,14 @@ async function reserveSiblings(
       const chunk = sibs.results.slice(i, i + FLIP_BATCH_CHUNK);
       await env.DB.batch(
         chunk.map((s) =>
-          env.DB.prepare("UPDATE files SET parse_state = 'reserved' WHERE id = ?1 AND parse_state = 'parsed' AND content_hash = ?2").bind(s.id, s.content_hash),
+          env.DB
+            // reserved_at stamps this reservation's owner-window and reserved_by stamps its OWNER = this cleanup's
+            // file.id (round 14): fresh ⇒ a live cleanup owns it, so OTHER cleanups defer and the heal paths skip
+            // it; stale ⇒ abandoned, heals normally. Owner-tagging lets a retry of THIS cleanup exclude its own
+            // reservations (anotherCleanupHoldsStore) and lets send-late target exactly the rows WE reserved.
+            // Both written in the SAME statement as the flip so neither marker can lag the state.
+            .prepare("UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = ?3 WHERE id = ?1 AND parse_state = 'parsed' AND content_hash = ?2")
+            .bind(s.id, s.content_hash, file.id),
         ),
       );
       spent += 1;
@@ -1090,9 +1161,17 @@ async function reserveSiblings(
   return { spent, complete: false, kickCursor: kc, superseded: false };
 }
 
-/** SEND-LATE recovery pass: page the siblings THIS cleanup reserved (parse_state = 'reserved') and enqueue a
- * recover message for each, best-effort. Runs only AFTER every stale delete has committed, so ordering is
- * guaranteed — a recover parse can never see one of our stale rows still owned+present.
+/** SEND-LATE recovery pass: page the siblings THIS cleanup reserved (parse_state = 'reserved' AND
+ * reserved_by = our file.id) and enqueue a recover message for each, best-effort. Runs only AFTER every stale
+ * delete has committed, so ordering is guaranteed — a recover parse can never see one of our stale rows still
+ * owned+present.
+ *
+ * Owner-scoped by reserved_by (round 14, the STRONGER fix for the cross-cleanup send-late race 3608748301):
+ * an interleaved cleanup B whose fan-out overlaps ours can NEVER select rows WE reserved, because B's SELECT is
+ * pinned to reserved_by = B's id. The per-store serialization already keeps two delete-bearing cleanups from
+ * overlapping in the first place; owner-scoping makes the send structurally incapable of firing another
+ * cleanup's reservations early even if the windows ever did touch. (reserved_by = ?2 also implies id != file.id
+ * — a cleanup never reserves its own row — so the self-exclusion the old id != ?2 gave us is preserved.)
  *
  * SELECTs exactly 'reserved', never 'pending' (3608692125): an unrelated pending upload — including one whose
  * own upload message was dropped — is NOT a recovery target, so a recover-reason parse can't hijack a fresh
@@ -1113,7 +1192,7 @@ async function sendRecoverToReservedSiblings(file: FileRow, env: Env, spentSoFar
   let consecutiveFailures = 0;
   while (spentSoFar + spent < EXPORT_QUERY_BUDGET) {
     const sibs = await env.DB.prepare(
-      "SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND id > ?3 AND parse_state = 'reserved' ORDER BY id ASC LIMIT ?4",
+      "SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND reserved_by = ?2 AND id > ?3 AND parse_state = 'reserved' ORDER BY id ASC LIMIT ?4",
     )
       .bind(file.store, file.id, cursor, EXPORT_KICK_PAGE)
       .all<{ id: number; r2_key: string; content_hash: string }>();
@@ -1266,7 +1345,11 @@ async function markParsed(
   requireContentHash?: string,
 ): Promise<{ updated: boolean }> {
   const guarded = requireContentHash !== undefined;
-  const sql = `UPDATE files SET parse_state = ?2, parsed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), parsed_size = ?3, parse_error = ?4
+  // reserved_at = NULL, reserved_by = NULL clear any reservation as the row leaves 'reserved' (round 14): a
+  // reserved sibling's own recover/upload parse ends here, and clearing BOTH markers together stops it from
+  // blocking new cleanups (contention probe) or being claimed by a stale send-late owner. A no-op for the common
+  // case (already NULL).
+  const sql = `UPDATE files SET parse_state = ?2, parsed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), parsed_size = ?3, parse_error = ?4, reserved_at = NULL, reserved_by = NULL
      WHERE id = ?1${guarded ? ' AND content_hash = ?5' : ''}`;
   const stmt = env.DB.prepare(sql);
   const result = await (guarded
