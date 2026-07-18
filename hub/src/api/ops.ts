@@ -1,6 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
-import { queueRetiredIfDisplaced, rotationCas, settleRetired, type RotationState } from './certs';
+import { getClientCertFingerprint, queueRetiredIfDisplaced, rotationCas, settleRetired, type RotationState } from './certs';
 import { normalizeToBound } from './sessions';
 
 /** POST /api/v1/heartbeat */
@@ -163,18 +163,35 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     const fpChanged = certFp !== (existing?.cert_fp_sha256 ?? null);
     const rollingBack = fpChanged && certFp !== null && certFp === (existing?.prev_cert_fp_sha256 ?? null);
 
-    // On an fp CHANGE, this row's own current/prev certs are being DISPLACED (retired under their own ids).
-    // A body cert_id equal to one of those would then be stored on the NEW current AND used to revoke the
-    // displaced cert — the hub would revoke/stamp the handle out from under the live new cert. Reject it.
-    // The one legitimate reuse is a rollback: the new fp IS the in-grace prev fp and the id IS that prev's
-    // own id (reinstating the prev with its live handle) — carried automatically below when the body omits
-    // it, and allowed when the body supplies it explicitly. (self-owned ids are excluded from the clash
-    // check above, so this is the only guard for them.)
-    if (fpChanged && body.cert_id) {
-      const isRollbackId = rollingBack && body.cert_id === (existing?.prev_cert_id ?? null);
-      const collidesDisplaced = body.cert_id === (existing?.cert_id ?? null) || body.cert_id === (existing?.prev_cert_id ?? null);
-      if (collidesDisplaced && !isRollbackId) {
+    // A body cert_id equal to one of THIS row's OWN displaced handles must not ride onto the current
+    // fingerprint (self-owned ids are excluded from the clash check above, so this is the only guard):
+    //  - the in-grace PREV id, on ANY edit (fp changing or not): storing it on current while it still sits
+    //    on the prev slot means the next rotation/prune revokes/stamps it out from under the live current.
+    //  - on an fp CHANGE, the old CURRENT id too: it's being displaced and can't also be the new current's.
+    // The one legit reuse is a rollback: the new fp IS the in-grace prev fp and the id IS that prev's own
+    // id (reinstating the prev with its live handle). Re-supplying THIS row's unchanged current id is fine
+    // (idempotent), so it is deliberately NOT rejected.
+    if (body.cert_id) {
+      const reusesOwnPrevId = body.cert_id === (existing?.prev_cert_id ?? null);
+      const isRollbackId = rollingBack && reusesOwnPrevId;
+      const reusesDisplacedCurrentId = fpChanged && body.cert_id === (existing?.cert_id ?? null);
+      if ((reusesOwnPrevId && !isRollbackId) || reusesDisplacedCurrentId) {
         return Response.json({ error: 'cert_id_belongs_to_displaced_cert', machine_id: body.machine_id }, { status: 409 });
+      }
+    }
+
+    // Verify an admin-supplied cert_id actually belongs to the fingerprint it's being attached to. A wrong
+    // or foreign id would be stored as current, copied to prev on the next rotation, and then the prune
+    // would revoke/404 that handle and stamp the REAL fingerprint's reservation revoked while the actual
+    // cert stays CA-valid and reusable. Fetch the cert by id and compare ITS fingerprint to certFp; a
+    // mismatch, 404, or unresolvable id → 422. Only meaningful with CF creds (the admin worker always has
+    // them in prod); when unconfigured we can't reach the CA and skip — the same deploy state in which
+    // renew itself can't mint (documented residual).
+    if (body.cert_id && certFp && env.CF_ZONE_ID && env.CF_CLIENT_CERT_TOKEN) {
+      const caFp = await getClientCertFingerprint(env, body.cert_id);
+      if (caFp !== certFp) {
+        console.log(JSON.stringify({ event: 'hub.admin.machines.cert_id_unverified', machine: body.machine_id, cert_id: body.cert_id, ca_result: caFp }));
+        return Response.json({ error: 'cert_id_fingerprint_mismatch', cert_id: body.cert_id, ca: caFp }, { status: 422 });
       }
     }
 

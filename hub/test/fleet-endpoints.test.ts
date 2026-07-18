@@ -967,6 +967,57 @@ describe('POST /api/v1/admin/machines', () => {
     expect(r?.cert_id).toBe('idroll-prev-id'); // its own live handle reattached
   });
 
+  it('409s a SAME-fp edit that supplies this row\'s own prev_cert_id (guard not gated on fpChanged)', async () => {
+    // Machine still has an in-grace prev. An unchanged-fp edit supplies cert_id == prev_cert_id: it would
+    // store the prev's handle on the current fp while it still sits on the prev slot, so the next
+    // rotation/prune revokes it out from under the live current. Rejected even though the fp didn't change.
+    await seedMachine('samefp-prev', { fp: 'sfp-cur', certId: 'sfp-cur-id', prevFp: 'sfp-prev', prevCertId: 'sfp-prev-id', revokeAt: '2999-01-01T00:00:00.000Z' });
+    const res = await adminMachines(reqJson({ machine_id: 'samefp-prev', cert_fp_sha256: 'sfp-cur', cert_id: 'sfp-prev-id' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('cert_id_belongs_to_displaced_cert');
+    expect((await row('samefp-prev'))?.cert_id).toBe('sfp-cur-id'); // unchanged
+  });
+
+  it('allows a SAME-fp edit to re-supply this row\'s OWN current cert_id (idempotent)', async () => {
+    await seedMachine('samefp-cur', { fp: 'sfc-cur', certId: 'sfc-cur-id', prevFp: 'sfc-prev', prevCertId: 'sfc-prev-id', revokeAt: '2999-01-01T00:00:00.000Z' });
+    const res = await adminMachines(reqJson({ machine_id: 'samefp-cur', cert_fp_sha256: 'sfc-cur', cert_id: 'sfc-cur-id', priority: 5 }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(200);
+    const r = await row('samefp-cur');
+    expect(r?.cert_id).toBe('sfc-cur-id'); // preserved
+    expect(r?.prev_cert_fp_sha256).toBe('sfc-prev'); // same-fp edit leaves the grace window intact
+    expect(r?.priority).toBe(5);
+  });
+
+  it('verifies an admin-supplied cert_id against the CA and 200s on a matching fingerprint', async () => {
+    // With CF creds configured, the endpoint fetches the cert by id and compares ITS fingerprint to the
+    // one being attached. A match is accepted and stored.
+    const fp = await certFingerprint(fakeCertPem('ver-match'));
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/ver-id')) return new Response(JSON.stringify({ success: true, result: { certificate: fakeCertPem('ver-match') } }), { status: 200 });
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }));
+    const res = await adminMachines(reqJson({ machine_id: 'ver-ok', cert_fp_sha256: fp, cert_id: 'ver-id' }), cfEnv, machine('am-admin', true));
+    expect(res.status).toBe(200);
+    expect((await row('ver-ok'))?.cert_id).toBe('ver-id');
+  });
+
+  it('422s when the supplied cert_id resolves to a DIFFERENT fingerprint at the CA', async () => {
+    const fp = await certFingerprint(fakeCertPem('ver-want'));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ success: true, result: { certificate: fakeCertPem('ver-other') } }), { status: 200 })));
+    const res = await adminMachines(reqJson({ machine_id: 'ver-mismatch', cert_fp_sha256: fp, cert_id: 'wrong-id' }), cfEnv, machine('am-admin', true));
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as { error: string }).error).toBe('cert_id_fingerprint_mismatch');
+    expect(await row('ver-mismatch')).toBeNull(); // rejected before any write
+  });
+
+  it('422s when the supplied cert_id is not resolvable at the CA (404)', async () => {
+    const fp = await certFingerprint(fakeCertPem('ver-404'));
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ success: false }), { status: 404 })));
+    const res = await adminMachines(reqJson({ machine_id: 'ver-nf', cert_fp_sha256: fp, cert_id: 'ghost-id' }), cfEnv, machine('am-admin', true));
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as { error: string }).error).toBe('cert_id_fingerprint_mismatch');
+  });
+
   it('positive control: a body cert_id owned by NO other row attaches cleanly', async () => {
     const res = await adminMachines(reqJson({ machine_id: 'idfree-b', cert_fp_sha256: 'idfree-fp', cert_id: 'fresh-unique-cid' }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(200);

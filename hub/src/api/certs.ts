@@ -91,6 +91,34 @@ async function getClientCertStatus(env: Env, certId: string): Promise<CertStatus
   return data.result.status;
 }
 
+/** Fetch a client cert by id and return the SHA-256 fingerprint of its PEM (the value mTLS reports and we
+ * store), or 'not_found' (404) / 'unknown' (error, non-success, missing PEM, or unparseable). Used to
+ * VERIFY that an admin-supplied cert_id actually resolves to the fingerprint it's being attached to —
+ * comparing the CA cert's own PEM fingerprint (not a CF-provided field) keeps it byte-identical to how we
+ * derive every stored fp. Closes the garbage-in case where a wrong/foreign id would later be revoked in
+ * place of the real cert. */
+export async function getClientCertFingerprint(env: Env, certId: string): Promise<string | 'not_found' | 'unknown'> {
+  let res: Response;
+  try {
+    res = await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/client_certificates/${certId}`,
+      { headers: { Authorization: `Bearer ${env.CF_CLIENT_CERT_TOKEN}` } },
+    );
+  } catch (e) {
+    console.log(JSON.stringify({ event: 'hub.certs.verify_error', cert_id: certId, error: String(e) }));
+    return 'unknown';
+  }
+  reportCfAuthFailure(res, 'status', certId);
+  if (res.status === 404) return 'not_found';
+  const data = (await res.json().catch(() => ({}))) as { success?: boolean; result?: { certificate?: string } };
+  if (!data.success || !data.result?.certificate) return 'unknown';
+  try {
+    return await certFingerprint(data.result.certificate);
+  } catch {
+    return 'unknown';
+  }
+}
+
 /** Stamp a queued cert as revoked (returns its fingerprint to the reusable pool; the row is kept as
  * an audit trail). NEVER throws: a stamp failure just leaves the row reserved (revoked_at NULL) for
  * the next prune poll to re-stamp — so a post-revoke D1 hiccup can't propagate into a caller that has

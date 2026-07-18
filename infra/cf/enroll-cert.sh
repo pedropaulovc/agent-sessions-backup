@@ -100,10 +100,6 @@ PY
 )"
 [ -n "$CERT_ID" ] || { echo "no cert id in Cloudflare response" >&2; exit 1; }
 
-# cf.tlsClientAuth.certFingerprintSHA256 == lowercase hex SHA-256 of the DER cert, no colons.
-FP="$(openssl x509 -in "$CRT" -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}')"
-echo "==> cert fingerprint (SHA-256): $FP"
-
 echo "==> registering machine '$MACHINE_ID' (is_admin=$IS_ADMIN) in $DB_NAME"
 # hostname is machine-controlled and goes into a single-quoted SQL literal — SQL-escape any quote (double
 # it) so it can't break or inject the statement (machine_id is already charset-validated above).
@@ -191,6 +187,17 @@ print_install_steps() {
 # fingerprint the enrollment took (a fresh insert, or an idempotent same-fp re-run); if the id already
 # exists under a DIFFERENT fingerprint we abort and point at the admin re-enroll flow. The just-minted cert
 # was never installed, so we print its id and the one-liner to revoke it (safe direction — nothing refs it).
+# cf.tlsClientAuth.certFingerprintSHA256 == lowercase hex SHA-256 of the DER cert, no colons. If Cloudflare
+# returned success but a certificate openssl can't parse, this pipeline fails AFTER the mint — revoke the
+# unused cert before aborting (the shell twin of the hub's post-sign certFingerprint guard), rather than
+# leaking a live-but-unregistered cert under set -e. revoke_unused_cert is defined above and uses CERT_ID.
+if ! FP="$(openssl x509 -in "$CRT" -outform DER 2>/dev/null | openssl dgst -sha256 | awk '{print $NF}')" || [ -z "$FP" ]; then
+  echo "    could not fingerprint the signed certificate — Cloudflare returned a cert openssl can't parse." >&2
+  revoke_unused_cert
+  exit 1
+fi
+echo "==> cert fingerprint (SHA-256): $FP"
+
 INSERT_SQL="INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, cert_id, key_protection, is_admin)
        VALUES ('$MACHINE_ID', '$OS_TAG', '$HOSTNAME_VAL', '$FP', '$CERT_ID', 'software', $IS_ADMIN)
        ON CONFLICT (machine_id) DO NOTHING;"
