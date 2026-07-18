@@ -18,9 +18,21 @@ interface FileRow {
 }
 
 export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: Env): Promise<void> {
+  // The ~1000-D1-queries cap is per INVOCATION, and one invocation delivers a whole batch (wrangler
+  // max_batch_size:5). An export slice issues ~500 queries, so 2+ export slices in the same batch would
+  // breach the cap — the same 1101 class this PR fixes. Cap it: process at most ONE export slice per
+  // invocation; any further export messages are retried untouched so they redeliver in a later
+  // invocation. Non-export messages are cheap and always process.
+  let exportBudget = 1;
   for (const msg of batch.messages) {
     try {
-      await parseOne(msg.body, env);
+      const outcome = await parseOne(msg.body, env, exportBudget > 0);
+      if (outcome === 'export-deferred') {
+        // No export budget left this invocation — leave the row untouched and redeliver.
+        msg.retry();
+        continue;
+      }
+      if (outcome === 'export-processed') exportBudget = 0;
       msg.ack();
     } catch (e) {
       console.log(JSON.stringify({ event: 'parse.error', file_id: msg.body.file_id, error: String(e) }));
@@ -99,13 +111,15 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
   }
 }
 
-async function parseOne(job: ParseMessage, env: Env): Promise<void> {
+type ParseOutcome = 'export-processed' | 'export-deferred' | undefined;
+
+async function parseOne(job: ParseMessage, env: Env, allowExport: boolean): Promise<ParseOutcome> {
   const file = await env.DB.prepare(
     'SELECT id, machine_id, store, relpath, r2_key, size, mtime, harness, session_id, content_hash FROM files WHERE id = ?1',
   )
     .bind(job.file_id)
     .first<FileRow>();
-  if (!file) return;
+  if (!file) return undefined;
 
   // Reject a stale message at the source, before any R2 read or write: if this row's
   // content_hash has already moved on from what this message was enqueued for, a re-upload beat
@@ -128,8 +142,11 @@ async function parseOne(job: ParseMessage, env: Env): Promise<void> {
     return;
   }
   if (det.kind === 'export-archive') {
+    // At most one export slice per invocation (see consumeParseBatch) — decline and let the caller
+    // retry this message rather than running a second ~500-query slice in the same invocation.
+    if (!allowExport) return 'export-deferred';
     await parseExportInto(file, env, job.reason, job.content_hash, job.offset ?? 0);
-    return;
+    return 'export-processed';
   }
   if (!det.sessionId || !SINGLE_SESSION_HARNESSES.has(det.harness)) {
     await markParsed(file.id, env, 'skipped', undefined, undefined, job.content_hash);
@@ -430,13 +447,36 @@ async function parseExportInto(file: FileRow, env: Env, reason: ParseMessage['re
     written.add(session.id);
   }
 
+  // Post-write hash recheck (mirrors the pre-write guard, but covers the window DURING this slice's
+  // writes): a re-upload landing after the pre-check but before here changed this row's bytes, so the
+  // sessions we just wrote came from the OLD ZIP. Revert them to 'parsing' (don't leave them
+  // 'ready'/canonical over stale bytes), enqueue NO continuation and do NOT markParsed — the fresh
+  // message owns the current bytes and does its own full write + cleanup. Runs on every slice.
+  if (contentHash !== undefined) {
+    const recheck = await env.DB.prepare('SELECT content_hash FROM files WHERE id = ?1').bind(file.id).first<{ content_hash: string }>();
+    if (recheck?.content_hash !== contentHash) {
+      await revertSlice(written, env);
+      console.log(JSON.stringify({ event: 'parse.export.superseded', file_id: file.id, offset, written: written.size }));
+      return;
+    }
+  }
+
   // Not the last slice: re-enqueue the continuation (offset advanced) and STOP — deliberately WITHOUT
   // markParsed and WITHOUT cleanup. The file stays 'pending' until the final slice writes the last
   // conversation, so a crash, a dropped continuation, or an over-cap invocation can never leave the
   // file 'parsed' over a partially-written archive (the silent-data-gap guard). Under queue
   // max_concurrency:1 the continuation runs after this message acks, serially.
   if (!isFinalSlice) {
-    await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: contentHash, offset: sliceEnd });
+    try {
+      await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: contentHash, offset: sliceEnd });
+    } catch (e) {
+      // The continuation couldn't be enqueued — this slice's sessions must NOT stay 'ready' over an
+      // archive we won't finish. Revert them to 'parsing' FIRST, then rethrow so the generic consumer
+      // catch marks the file 'error' and retries. The file must never end terminal with partial
+      // 'ready' rows from it.
+      await revertSlice(written, env);
+      throw e;
+    }
     console.log(
       JSON.stringify({ event: 'parse.export.slice', file_id: file.id, offset, slice_end: sliceEnd, total: archive.sessions.length, written: written.size }),
     );
@@ -454,9 +494,7 @@ async function parseExportInto(file: FileRow, env: Env, reason: ParseMessage['re
     // 'parsing' (don't advertise stale content as ready) and skip cleanup entirely — the fresh
     // parse does its own write + cleanup against the current bytes. upload.ts can't do this flip
     // for an archive, whose files row has no session_id. Safe under queue max_concurrency:1.
-    for (const id of written) {
-      await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(id).run();
-    }
+    await revertSlice(written, env);
     return;
   }
 
@@ -672,6 +710,16 @@ async function markParsed(
     : stmt.bind(fileId, state, parsedSize ?? null, parseError ?? null)
   ).run();
   return { updated: !guarded || (result.meta?.changes ?? 0) > 0 };
+}
+
+/** Flip a set of just-written export sessions back to index_state='parsing' — used whenever a slice
+ * must abandon its writes: a re-upload changed the file's bytes mid-slice, the continuation couldn't
+ * be enqueued, or the final markParsed lost the row to a fresher upload. Batched (chunks of 90) so the
+ * revert stays within the slice's D1-query budget headroom rather than one round trip per session. */
+async function revertSlice(written: Set<string>, env: Env): Promise<void> {
+  if (written.size === 0) return;
+  const stmts = [...written].map((id) => env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(id));
+  for (const chunk of chunkArr(stmts, 90)) await env.DB.batch(chunk);
 }
 
 /** Replace a session's index rows atomically-enough: FTS delete → blocks delete → reinsert → FTS rebuild from blocks. */

@@ -134,4 +134,105 @@ describe('large export ingest is bounded and never marks parsed until every conv
     // gated on all slices, not the attempt.
     expect(sent.some((m) => m.file_id === fileId && m.offset === CHUNK)).toBe(true);
   });
+
+  it('processes at most ONE export slice per invocation; a second export message is retried untouched (round 1 finding 1)', async () => {
+    // Two export files delivered in ONE batch (max_batch_size:5 in prod). Each slice is ~500 D1
+    // queries; running both in one invocation would breach the ~1000/invocation cap. Only the first
+    // must run; the second must be retried without any writes.
+    const f1 = await uploadArchive('one', 3);
+    const f2 = await uploadArchive('two', 3);
+
+    const flags: Record<number, { acked: boolean; retried: boolean }> = {
+      [f1.fileId]: { acked: false, retried: false },
+      [f2.fileId]: { acked: false, retried: false },
+    };
+    const mk = (f: { fileId: number; hash: string; r2Key: string }) => ({
+      id: String(f.fileId),
+      timestamp: new Date(),
+      attempts: 1,
+      body: { file_id: f.fileId, r2_key: f.r2Key, reason: 'upload' as const, content_hash: f.hash },
+      ack() {
+        flags[f.fileId]!.acked = true;
+      },
+      retry() {
+        flags[f.fileId]!.retried = true;
+      },
+    });
+    await worker.queue(
+      { queue: 'parse', messages: [mk(f1), mk(f2)], ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>,
+      testEnv,
+    );
+
+    // First export message ran to completion; second was deferred (retried) with zero writes.
+    expect(flags[f1.fileId]).toEqual({ acked: true, retried: false });
+    expect(flags[f2.fileId]).toEqual({ acked: false, retried: true });
+    expect(await fileState(f1.fileId)).toBe('parsed');
+    expect(await ownedSessions(f1.fileId)).toBe(3);
+    expect(await fileState(f2.fileId)).toBe('pending'); // untouched — redelivers next invocation
+    expect(await ownedSessions(f2.fileId)).toBe(0);
+  });
+
+  it('reverts a slice whose file bytes change mid-write; no continuation, not parsed (round 1 finding 2)', async () => {
+    const total = CHUNK + 5; // multi-slice so a continuation would normally follow slice 1
+    const { fileId, hash, r2Key } = await uploadArchive('hr', total);
+
+    // Make the POST-write content_hash recheck observe a mismatch while the PRE-write check still
+    // matched — i.e. a re-upload landed DURING the slice. The two rechecks are the only two uses of
+    // this exact SQL; return the real (matching) hash on the 1st, a changed hash on the 2nd.
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    let recheckCalls = 0;
+    testEnv.DB.prepare = ((sql: string) => {
+      const stmt = realPrepare(sql);
+      if (sql !== 'SELECT content_hash FROM files WHERE id = ?1') return stmt;
+      const realBind = stmt.bind.bind(stmt);
+      stmt.bind = (...a: unknown[]) => {
+        const bound = realBind(...a);
+        const realFirst = bound.first.bind(bound);
+        (bound as unknown as Record<string, unknown>).first = async (...x: unknown[]) => {
+          recheckCalls++;
+          if (recheckCalls >= 2) return { content_hash: 'sha256:changed-mid-slice' };
+          return (realFirst as (...y: unknown[]) => unknown)(...x);
+        };
+        return bound;
+      };
+      return stmt;
+    }) as typeof testEnv.DB.prepare;
+
+    sent.length = 0;
+    try {
+      await deliver({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: hash });
+    } finally {
+      testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
+    }
+
+    // Slice 1's sessions were reverted to 'parsing' (not left 'ready' over stale bytes); the file is
+    // NOT parsed and NO continuation was enqueued — the fresh parse will own the whole archive.
+    expect(await fileState(fileId)).toBe('pending');
+    const ready = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE canonical_file_id = ?1 AND index_state = 'ready'").bind(fileId).first<{ n: number }>();
+    expect(ready!.n).toBe(0);
+    const parsing = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE canonical_file_id = ?1 AND index_state = 'parsing'").bind(fileId).first<{ n: number }>();
+    expect(parsing!.n).toBe(CHUNK); // the whole slice reverted
+    expect(sent.some((m) => m.file_id === fileId && typeof m.offset === 'number')).toBe(false); // no continuation
+  });
+
+  it('a continuation-enqueue failure reverts the slice and never leaves partial ready rows (round 1 finding 3)', async () => {
+    const total = CHUNK + 5;
+    const { fileId, hash, r2Key } = await uploadArchive('cf', total);
+
+    // Make the continuation send throw. parseExportInto must revert this slice's writes and rethrow,
+    // so the generic consumer catch marks the file 'error' — never terminal with partial 'ready' rows.
+    const realSend = testEnv.PARSE_QUEUE.send;
+    testEnv.PARSE_QUEUE.send = (async () => {
+      throw new Error('queue send failed');
+    }) as typeof testEnv.PARSE_QUEUE.send;
+    try {
+      await deliver({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: hash });
+    } finally {
+      testEnv.PARSE_QUEUE.send = realSend;
+    }
+
+    expect(await fileState(fileId)).toBe('error'); // generic catch marked it; NOT 'parsed'
+    const ready = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE canonical_file_id = ?1 AND index_state = 'ready'").bind(fileId).first<{ n: number }>();
+    expect(ready!.n).toBe(0); // no partial 'ready' rows survived the failed slice
+  });
 });
