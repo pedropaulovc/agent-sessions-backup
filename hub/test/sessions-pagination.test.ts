@@ -179,6 +179,65 @@ describe('/api/v1/sessions cursor pagination', () => {
   });
 });
 
+describe('/api/v1/sessions keyset paging traverses NULL started_at rows (round-2 finding 1)', () => {
+  const MACHINE = 'nullstartbox';
+  // 3 dated sessions (DESC order: d3, d2, d1) followed by 3 undated ones, tiebroken by
+  // session_id ASC among themselves (COALESCE(started_at,'') ties them all at ''). Full
+  // expected order: d3, d2, d1, null-a, null-b, null-c.
+  const DATED = [
+    { id: 'd0000001-0000-4000-8000-000000000000', ts: '2026-07-10T00:00:01.000Z' },
+    { id: 'd0000002-0000-4000-8000-000000000000', ts: '2026-07-10T00:00:02.000Z' },
+    { id: 'd0000003-0000-4000-8000-000000000000', ts: '2026-07-10T00:00:03.000Z' },
+  ];
+  const UNDATED_IDS = ['null-a', 'null-b', 'null-c'];
+  const EXPECTED_ORDER = ['d0000003-0000-4000-8000-000000000000', 'd0000002-0000-4000-8000-000000000000', 'd0000001-0000-4000-8000-000000000000', ...UNDATED_IDS];
+
+  beforeAll(async () => {
+    const stmts = [
+      ...DATED.map(({ id, ts }) =>
+        testEnv.DB.prepare('INSERT INTO sessions (session_id, harness, machine_id, started_at, index_state) VALUES (?1, ?2, ?3, ?4, ?5)').bind(
+          id,
+          'claude-code',
+          MACHINE,
+          ts,
+          'ready',
+        ),
+      ),
+      ...UNDATED_IDS.map((id) =>
+        testEnv.DB.prepare('INSERT INTO sessions (session_id, harness, machine_id, started_at, index_state) VALUES (?1, ?2, ?3, NULL, ?4)').bind(
+          id,
+          'claude-code',
+          MACHINE,
+          'ready',
+        ),
+      ),
+    ];
+    await testEnv.DB.batch(stmts);
+  });
+
+  it('walks all pages across a NULL-started_at boundary row, no drops, cursor round-trips through the undated region', async () => {
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    let guard = 0;
+    do {
+      // limit=4 makes page 1 end exactly ON a NULL row (d3, d2, d1, null-a) — the boundary
+      // row itself is undated, which is the specific case that used to fail to decode.
+      const qs = new URLSearchParams({ machine: MACHINE, limit: '4' });
+      if (cursor) qs.set('cursor', cursor);
+      const res = await get(qs.toString());
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as { sessions: { session_id: string }[]; cursor?: string };
+      expect(body.sessions.length).toBeGreaterThan(0); // no silently-empty page while a cursor was still active
+      seen.push(...body.sessions.map((s) => s.session_id));
+      cursor = body.cursor;
+      guard++;
+    } while (cursor && guard < 10);
+
+    expect(seen).toEqual(EXPECTED_ORDER); // exact order, undated rows last and internally tiebroken
+    expect(new Set(seen).size).toBe(6); // no dupes
+  });
+});
+
 /** Direct-DB fixture helper for the NDJSON cap tests below: 300+ real uploads through
  * putFile+drainQueue would be prohibitively slow for a single test, and none of the columns
  * these tests assert on (session_id, machine_id, harness, started_at) need a real parsed
@@ -374,6 +433,36 @@ describe('X-Indexed-Through and /api/v1/usage respect the request machine/harnes
     // Without the files-table UNION, this machine (zero sessions rows) would be invisible to
     // the harness-scoped query and the MIN would stay at STALE_TS from MACHINE_A.
     expect(bodyCc.indexed_through).toBe(PENDING_TS);
+  });
+
+  it('harness filter -> excludes a machine whose only harness-X file is superseded (round-2 finding 2)', async () => {
+    const SUPERSEDED_MACHINE = 'filterbox-superseded';
+    const SUPERSEDED_TS = '2015-01-01T00:00:00.000Z'; // far older than everything else in this block
+    const res = await putFile(
+      SUPERSEDED_MACHINE,
+      'claude-projects',
+      `superseded/${'b0000000-0000-4000-8000-000000000098'}.jsonl`,
+      soloSession('b0000000-0000-4000-8000-000000000098', '2026-07-14T00:00:00.000Z'),
+    );
+    expect(res.status).toBe(201);
+    // Simulates the real outcome of canonical-dedupe demoting a lower-priority duplicate: a
+    // terminal 'superseded' file that can NEVER produce a sessions row on this machine.
+    await testEnv.DB.prepare("UPDATE files SET parse_state = 'superseded' WHERE machine_id = ?1").bind(SUPERSEDED_MACHINE).run();
+    const sessionCount = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM sessions WHERE machine_id = ?1')
+      .bind(SUPERSEDED_MACHINE)
+      .first<{ n: number }>();
+    expect(sessionCount?.n).toBe(0);
+    await testEnv.DB.prepare('UPDATE machines SET last_seen_at = ?1 WHERE machine_id = ?2').bind(SUPERSEDED_TS, SUPERSEDED_MACHINE).run();
+
+    const resCc = await get('harness=claude-code');
+    const bodyCc = (await resCc.json()) as { indexed_through: string };
+    // The prior test in this block ('...only a PENDING file...') already set the
+    // claude-code-harness MIN to PENDING_TS='2019-01-01...' via a still-pending file, which
+    // remains the correct minimum here. If the files arm didn't filter by parse_state, this
+    // ancient, terminal-state machine would drag it down further to SUPERSEDED_TS even
+    // though nothing on it can ever surface under harness=claude-code.
+    expect(bodyCc.indexed_through).not.toBe(SUPERSEDED_TS);
+    expect(bodyCc.indexed_through).toBe('2019-01-01T00:00:00.000Z');
   });
 
   it('no filter -> fleet-wide MIN across all machines (unchanged behavior)', async () => {

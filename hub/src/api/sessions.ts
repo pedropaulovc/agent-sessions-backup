@@ -131,12 +131,18 @@ export async function getSessionRaw(sessionId: string, request: Request, env: En
  * fleet), so a caller filtering to one machine or harness gets a freshness signal that
  * actually describes the data they asked for: machine filter -> that machine's own
  * last_seen_at; harness filter -> MIN over machines that have EVER produced a session of
- * that harness, OR that have a `files` row detected as that harness even before it's
- * parsed into a `sessions` row (upload.ts/detect.ts stamp `files.harness` at upload time,
- * ahead of the queue consumer) — otherwise a machine with pending/error files of the
- * filtered harness would be invisible to this query and make the signal look fresher than
- * the data it's still missing; no filter -> fleet-wide MIN, same as before. `machine` wins
- * if both are given — it's the more specific, unambiguous filter.
+ * that harness, OR that have an UNRESOLVED (`pending`/`error`) `files` row detected as that
+ * harness even before it's parsed into a `sessions` row (upload.ts/detect.ts stamp
+ * `files.harness` at upload time, ahead of the queue consumer) — otherwise a machine with a
+ * pending/error file of the filtered harness would be invisible to this query and make the
+ * signal look fresher than the data it's still missing. `parsed` files are excluded because
+ * their sessions are already covered by the `sessions` arm above; `superseded`/`skipped`
+ * files are excluded because they're terminal and can NEVER produce a sessions row — an
+ * unfiltered files arm let a machine whose only harness-X file was a lower-priority
+ * `superseded` duplicate drag the harness-X MIN stale forever, even though nothing on that
+ * machine could ever appear in `/api/v1/sessions?harness=X`. No filter -> fleet-wide MIN,
+ * same as before. `machine` wins if both are given — it's the more specific, unambiguous
+ * filter.
  */
 async function computeIndexedThrough(env: Env, p: URLSearchParams): Promise<string | null> {
   const machine = p.get('machine');
@@ -150,7 +156,7 @@ async function computeIndexedThrough(env: Env, p: URLSearchParams): Promise<stri
              WHERE machine_id IN (
                SELECT machine_id FROM sessions WHERE harness = ?1
                UNION
-               SELECT machine_id FROM files WHERE harness = ?1
+               SELECT machine_id FROM files WHERE harness = ?1 AND parse_state IN ('pending', 'error')
              )`,
           )
           .bind(harness)
@@ -159,10 +165,23 @@ async function computeIndexedThrough(env: Env, p: URLSearchParams): Promise<stri
   return row?.t ?? null;
 }
 
-/** A page of `sessions`, keyed by (started_at, session_id) — see SessionsCursor. */
+/** A page of `sessions`, keyed by (started_at, session_id) — see SessionsCursor.
+ * `startedAt` here is always the COALESCE(started_at, '')-normalized value (see
+ * startedAtKey below), never a raw possibly-NULL column value. */
 interface SessionsCursor {
   startedAt: string;
   sessionId: string;
+}
+
+/** `sessions.started_at` is nullable (ingest writes `s.startedAt ?? null` — an undated
+ * session is a real, if rare, case). Both the ORDER BY and the keyset predicate below
+ * coalesce it to `''`, which — under DESC — sorts after every real ISO timestamp, so
+ * undated sessions land last rather than vanishing from a NULL three-valued-logic
+ * comparison (`started_at < ?` and `started_at = ?` both evaluate UNKNOWN for a NULL row,
+ * silently dropping it from every page). Cursors must be built from this same coalesced
+ * value so they round-trip through the undated region instead of decoding as invalid. */
+function startedAtKey(row: SessionRow): string {
+  return (row.started_at as string | null) ?? '';
 }
 
 /**
@@ -199,13 +218,15 @@ function decodeSessionsCursor(cursor: string | null): SessionsCursor | null {
   return null;
 }
 
-/** Matches `ORDER BY started_at DESC, session_id ASC` (see listSessions): strictly-newer
- * started_at, OR equal started_at with a strictly-greater session_id (the ASC tiebreak
- * direction). Appends its binds to `binds` and returns the SQL fragment to AND into WHERE. */
+/** Matches `ORDER BY COALESCE(started_at, '') DESC, session_id ASC` (see listSessions):
+ * strictly-newer started_at, OR equal started_at with a strictly-greater session_id (the ASC
+ * tiebreak direction). Both sides use the same COALESCE as the ORDER BY — see startedAtKey's
+ * comment for why a raw nullable started_at comparison silently drops undated rows. Appends
+ * its binds to `binds` and returns the SQL fragment to AND into WHERE. */
 function keysetFilter(cursor: SessionsCursor, binds: unknown[]): string {
   binds.push(cursor.startedAt, cursor.startedAt, cursor.sessionId);
   const n = binds.length;
-  return `(started_at < ?${n - 2} OR (started_at = ?${n - 1} AND session_id > ?${n}))`;
+  return `(COALESCE(started_at, '') < ?${n - 2} OR (COALESCE(started_at, '') = ?${n - 1} AND session_id > ?${n}))`;
 }
 
 // Each ndjson row costs ~2-3 subrequests in loadNormalized (a D1 lookup, an R2 read, and
@@ -239,10 +260,16 @@ export async function listSessions(url: URL, env: Env): Promise<Response> {
   if (p.get('repo')) add((n) => `repo_url = ?${n}`, p.get('repo'));
   const limit = clampLimit(p.get('limit'), 200, 1000);
   // started_at alone isn't a stable sort key — real data can share a timestamp (bulk
-  // backfill, synthetic/imported sessions). session_id as a tiebreak makes the ordering
-  // total, which both makes paging deterministic AND is what the keyset cursor above keys
-  // off of — a non-total order would make "rows after this boundary" ambiguous.
-  const orderBy = 'ORDER BY started_at DESC, session_id ASC';
+  // backfill, synthetic/imported sessions), or be NULL entirely (see startedAtKey's comment
+  // above). session_id as a tiebreak makes the ordering total, which both makes paging
+  // deterministic AND is what the keyset cursor above keys off of — a non-total order would
+  // make "rows after this boundary" ambiguous. COALESCE(started_at, '') sorts NULL rows last
+  // under DESC (empty string is lexicographically before every real ISO timestamp) instead
+  // of silently dropping them from keyset comparisons. NOTE: this expression bypasses the
+  // `sessions_started`/`sessions_facets` indexes on the raw `started_at` column — fine at
+  // current table sizes (~3k sessions, full scan is cheap); revisit with an expression index
+  // if this table grows large enough for that to matter.
+  const orderBy = "ORDER BY COALESCE(started_at, '') DESC, session_id ASC";
 
   const indexedThrough = await computeIndexedThrough(env, p);
 
@@ -265,7 +292,7 @@ export async function listSessions(url: URL, env: Env): Promise<Response> {
     const page = hasMore ? rows.results.slice(0, limit) : rows.results;
     const last = page.at(-1);
     const nextCursor =
-      hasMore && last ? encodeSessionsCursor({ startedAt: last.started_at as string, sessionId: last.session_id }) : undefined;
+      hasMore && last ? encodeSessionsCursor({ startedAt: startedAtKey(last), sessionId: last.session_id }) : undefined;
     return Response.json(
       { sessions: page, indexed_through: indexedThrough, cursor: nextCursor },
       { headers: { 'x-indexed-through': indexedThrough ?? '' } },
@@ -294,7 +321,7 @@ export async function listSessions(url: URL, env: Env): Promise<Response> {
         const last = rows.results.at(-1);
         if (last) {
           lastRow = last;
-          cursor = { startedAt: last.started_at as string, sessionId: last.session_id };
+          cursor = { startedAt: startedAtKey(last), sessionId: last.session_id };
         }
         if (rows.results.length < fetchLimit) break; // short page -> exhausted, not just capped
         if (emitted >= NDJSON_MAX_ROWS_PER_REQUEST) {
@@ -303,7 +330,7 @@ export async function listSessions(url: URL, env: Env): Promise<Response> {
         }
       }
       if (cappedOut && lastRow) {
-        const trailer = { cursor: encodeSessionsCursor({ startedAt: lastRow.started_at as string, sessionId: lastRow.session_id }) };
+        const trailer = { cursor: encodeSessionsCursor({ startedAt: startedAtKey(lastRow), sessionId: lastRow.session_id }) };
         controller.enqueue(encoder.encode(`${JSON.stringify(trailer)}\n`));
       }
       console.log(JSON.stringify({ event: 'access.bulk', count: emitted, truncated: cappedOut }));
