@@ -1,6 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
-import { isFreshReservation, markPendingAndEnqueue } from '../queue';
+import { markPendingAndEnqueue } from '../queue';
 import { hex, objectSha256 } from './ops';
 
 export const TERMINAL_PARSE_STATES = new Set(['parsed', 'skipped', 'superseded']);
@@ -71,10 +71,10 @@ export async function putFile(
   if (!request.body) return Response.json({ error: 'missing_body' }, { status: 400 });
 
   const existing = await env.DB.prepare(
-    'SELECT id, content_hash, parse_state, reserved_at, r2_key, harness, session_id FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
+    'SELECT id, content_hash, parse_state, r2_key, harness, session_id FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
   )
     .bind(machineId, store, relpath)
-    .first<{ id: number; content_hash: string; parse_state: string; reserved_at: string | null; r2_key: string; harness: string | null; session_id: string | null }>();
+    .first<{ id: number; content_hash: string; parse_state: string; r2_key: string; harness: string | null; session_id: string | null }>();
   if (existing && existing.content_hash === sha256) {
     // Restamp a legacy row whose stored identity drifted (see restampIfStale) before deciding
     // whether this unchanged upload still needs a re-enqueue.
@@ -108,14 +108,13 @@ export async function putFile(
     // (e.g. 'parsed'/'skipped') would stay terminal while its parse message is in flight, and if
     // PARSE_QUEUE.send fails (or the message is later dropped), a client retry would see
     // 'unchanged' with the now-correct checksum and never requeue, same for files/check.
-    // A FRESH 'reserved' row is left to its reserving cleanup (round 14): re-enqueuing it as 'upload' here
-    // could run an upload parse mid-window that sees the cleanup's not-yet-deleted stale rows, marks itself
-    // parsed, and escapes the reserved set — so its sessions are never recovered after the deletes. The
-    // reserving cleanup's send-late recover message is the intended trigger. A STALE reservation (crashed
-    // cleanup) is not fresh, so it still heals here exactly as a 'pending' row would.
-    if ((restamped || restored || !TERMINAL_PARSE_STATES.has(existing.parse_state)) && !isFreshReservation(existing)) {
-      await markPendingAndEnqueue(existing, 'upload', env);
-      return Response.json({ status: 'unchanged', file_id: existing.id, requeued: true, restored, restamped });
+    // markPendingAndEnqueue applies the centralized fresh-reservation gate (round 15): a FRESH 'reserved' row
+    // (a live cleanup's) is left to its owner's recover send and NOT requeued as 'upload' here, so it can't
+    // escape the reserved set; a STALE reservation heals like any 'pending' row. `requeued` reflects whether
+    // the gate let the requeue fire.
+    if (restamped || restored || !TERMINAL_PARSE_STATES.has(existing.parse_state)) {
+      const requeued = await markPendingAndEnqueue(existing, 'upload', env);
+      return Response.json({ status: 'unchanged', file_id: existing.id, requeued, restored, restamped });
     }
     return Response.json({ status: 'unchanged', file_id: existing.id });
   }
@@ -382,7 +381,7 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
     const binds: unknown[] = [identity.machineId];
     for (const it of chunk) binds.push(it.store, it.relpath, it.sha256.replace(/^sha256:/, '').toLowerCase());
     const rows = await env.DB.prepare(
-      `SELECT id, store, relpath, r2_key, parse_state, reserved_at, content_hash, harness, session_id FROM files WHERE machine_id = ?1 AND (${conditions.join(' OR ')})`,
+      `SELECT id, store, relpath, r2_key, parse_state, content_hash, harness, session_id FROM files WHERE machine_id = ?1 AND (${conditions.join(' OR ')})`,
     )
       .bind(...binds)
       .all<{
@@ -391,7 +390,6 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
         relpath: string;
         r2_key: string;
         parse_state: string;
-        reserved_at: string | null;
         content_hash: string;
         harness: string | null;
         session_id: string | null;
@@ -433,10 +431,9 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
       //  - a TERMINAL legacy row whose identity we just restamped (same as the PUT same-hash branch)
       //    — otherwise a 'skipped' history.jsonl row with NULL harness/session_id stays unindexed.
       const restamped = await restampIfStale(row, row.store, row.relpath, identity.machineId, env);
-      // Leave a FRESH 'reserved' row to its reserving cleanup (round 14) — same reasoning as the same-hash
-      // PUT branch: healing it mid-window lets an upload parse escape the reserved set. Stale reservations
-      // (abandoned) still heal. objectVerified already kept a fresh reservation out of `missing` above.
-      if ((restamped || !TERMINAL_PARSE_STATES.has(row.parse_state)) && !isFreshReservation(row)) {
+      // markPendingAndEnqueue applies the centralized fresh-reservation gate (round 15): a fresh 'reserved'
+      // row is left to its owner's recover; a stale one heals. Same reasoning as the same-hash PUT branch.
+      if (restamped || !TERMINAL_PARSE_STATES.has(row.parse_state)) {
         await markPendingAndEnqueue(row, 'upload', env);
       }
     }

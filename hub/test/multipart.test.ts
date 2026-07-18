@@ -17,6 +17,16 @@ function fileUrl(machine: string, store: string, relpath: string): string {
   return `https://api.sessions.vza.net/api/v1/files/${machine}/${store}/${encodeURIComponent(relpath)}`;
 }
 
+async function stateOf(id: number): Promise<string | null> {
+  const row = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1').bind(id).first<{ parse_state: string }>();
+  return row?.parse_state ?? null;
+}
+
+async function reservedByOf(id: number): Promise<number | null> {
+  const row = await testEnv.DB.prepare('SELECT reserved_by FROM files WHERE id = ?1').bind(id).first<{ reserved_by: number | null }>();
+  return row?.reserved_by ?? null;
+}
+
 async function createMp(machine: string, store: string, relpath: string, size: number, hash: string): Promise<Response> {
   return SELF.fetch(`${fileUrl(machine, store, relpath)}?uploads`, {
     method: 'POST',
@@ -249,6 +259,41 @@ describe('multipart upload', () => {
     const again = await createMp('unchanged-box', 'claude', relpath, bytes.length, hash);
     expect(again.status).toBe(200);
     expect((await again.json<any>()).status).toBe('unchanged');
+  });
+
+  it('the same-hash shortcut leaves a FRESH reservation alone but re-enqueues a STALE one (round 15, 3608955878)', async () => {
+    const bytes = new TextEncoder().encode(bigSession('aaaaaaaa-bbbb-4ccc-8ddd-000000000000', 'gadolinium', 6 * MIB));
+    const relpath = 'demo/mp-gate.jsonl';
+    const first = await multipartStore('mpgate-box', 'claude', relpath, bytes, 5 * MIB);
+    expect(first.complete!.status).toBe(201);
+    const hash = await sha256Hex(bytes);
+    const row = await testEnv.DB.prepare("SELECT id FROM files WHERE machine_id = 'mpgate-box' AND relpath = ?1").bind(relpath).first<{ id: number }>();
+    const id = row!.id;
+
+    // Mark it a FRESH reservation, as if a live export cleanup owns it.
+    await testEnv.DB
+      .prepare("UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = 999999 WHERE id = ?1")
+      .bind(id)
+      .run();
+
+    // Same-hash create → the unchanged shortcut calls markPendingAndEnqueue, which the centralized gate (round
+    // 15) no-ops for a fresh reservation. POSITIVE CONTROL: without the gate this large-file resync path flips it
+    // to 'pending' + clears reserved_by, stealing the sibling out from under the cleanup before its deletes drain.
+    const fresh = await createMp('mpgate-box', 'claude', relpath, bytes.length, hash);
+    expect(fresh.status).toBe(200);
+    const freshBody = await fresh.json<any>();
+    expect(freshBody.status).toBe('unchanged');
+    expect(freshBody.requeued).toBe(false); // gated — not requeued
+    expect(await stateOf(id)).toBe('reserved');
+    expect(await reservedByOf(id)).toBe(999999);
+
+    // Age it past the staleness threshold → the shortcut heals it like any non-terminal row.
+    await testEnv.DB.prepare("UPDATE files SET reserved_at = '2020-01-01T00:00:00.000Z' WHERE id = ?1").bind(id).run();
+    const stale = await createMp('mpgate-box', 'claude', relpath, bytes.length, hash);
+    const staleBody = await stale.json<any>();
+    expect(staleBody.requeued).toBe(true);
+    expect(await stateOf(id)).toBe('pending');
+    expect(await reservedByOf(id)).toBeNull();
   });
 
   it('abort makes a later complete for that upload fail; an unknown abort is idempotent', async () => {

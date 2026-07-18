@@ -12,13 +12,28 @@ export async function markPendingAndEnqueue(
   file: { id: number; r2_key: string; content_hash: string },
   reason: ParseMessage['reason'],
   env: Env,
-): Promise<void> {
-  // Clear reserved_at/reserved_by too: the only 'reserved' rows that reach here are STALE ones the heal paths
-  // chose to reclaim (a fresh reservation is left to its owner). Dropping the markers as the row leaves
-  // 'reserved' stops the abandoned owner id from lingering and being matched by a late send-late. No-op for the
-  // common non-reserved row (both already NULL).
-  await env.DB.prepare("UPDATE files SET parse_state = 'pending', reserved_at = NULL, reserved_by = NULL WHERE id = ?1").bind(file.id).run();
+  opts: { force?: boolean } = {},
+): Promise<boolean> {
+  // CENTRALIZED reservation gate (round 15, 3608955878). Every requeue path for an existing row funnels
+  // through here, so the fresh-reservation skip lives HERE by construction instead of being re-derived in each
+  // caller (files/check, same-hash PUT, multipart same-hash shortcut, admin reindex). A row that is a FRESH
+  // reservation belongs to a live export cleanup that will recover it after its deletes drain — so leave it
+  // alone: the requeue would clear reserved_by and let the sibling escape the send-late set. The guard is one
+  // atomic UPDATE ... WHERE NOT (fresh reservation) RETURNING id — no extra read — and clears the ownership
+  // markers as the row leaves 'reserved' (a STALE reservation, a crashed owner, heals normally). RETURNING
+  // tells us whether the requeue fired; skip the enqueue (and log) when it was gated.
+  //
+  // `force` breaks even a fresh reservation — for callers that are the recovery MECHANISM, not a redundant
+  // heal (the web-session recover chain: it deliberately re-parses a chosen candidate).
+  const guard = opts.force ? '' : " AND NOT (parse_state = 'reserved' AND reserved_at IS NOT NULL AND reserved_at > ?2)";
+  const stmt = env.DB.prepare(`UPDATE files SET parse_state = 'pending', reserved_at = NULL, reserved_by = NULL WHERE id = ?1${guard} RETURNING id`);
+  const updated = await (opts.force ? stmt.bind(file.id) : stmt.bind(file.id, reservationCutoffIso())).first<{ id: number }>();
+  if (!updated) {
+    console.log(JSON.stringify({ event: 'requeue.skipped_fresh_reservation', file_id: file.id, reason }));
+    return false;
+  }
   await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: file.content_hash });
+  return true;
 }
 
 // A 'reserved' sibling belongs to exactly one in-flight export cleanup (the one that flipped it 'parsed' →

@@ -1,5 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
+import { reservationCutoffIso } from '../queue';
 import { getClientCertFingerprint, queueRetiredIfDisplaced, rotationCas, settleRetired, type RotationState } from './certs';
 import { normalizeToBound } from './sessions';
 
@@ -639,18 +640,27 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
       const machineStmts = machineIds.map((m) =>
         env.DB.prepare(`INSERT INTO machines (machine_id, os) VALUES (?1, 'unknown') ON CONFLICT (machine_id) DO NOTHING`).bind(m),
       );
+      // The DO UPDATE SKIPS a FRESH reservation (round 15, 3608955878): admin reindex used to flip every
+      // conflicting row to 'pending' unconditionally, clearing reserved_by out from under a live export
+      // cleanup so its recover send-late lost the sibling. The WHERE guard leaves a fresh reservation
+      // untouched (its owner re-parses it; a later reindex picks it up once the reservation clears); a stale
+      // reservation still flips and has its markers cleared. A skipped row emits no RETURNING id, so ids[k] is
+      // null for it and it is dropped from the session flips and the re-enqueue below.
+      const reservCutoff = reservationCutoffIso();
       const fileStmts = items.map((i) =>
         env.DB.prepare(
           `INSERT INTO files (machine_id, store, relpath, r2_key, size, mtime, content_hash, harness, session_id, parse_state)
            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')
            ON CONFLICT (machine_id, store, relpath) DO UPDATE SET
              parse_state = 'pending', size = excluded.size, mtime = COALESCE(excluded.mtime, files.mtime),
-             harness = excluded.harness, session_id = excluded.session_id, content_hash = excluded.content_hash
+             harness = excluded.harness, session_id = excluded.session_id, content_hash = excluded.content_hash,
+             reserved_at = NULL, reserved_by = NULL
+           WHERE NOT (files.parse_state = 'reserved' AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10)
            RETURNING id`,
-        ).bind(i.machineId, i.store, i.relpath, i.key, i.size, i.mtime, i.contentHash, i.det.harness, i.det.sessionId ?? null),
+        ).bind(i.machineId, i.store, i.relpath, i.key, i.size, i.mtime, i.contentHash, i.det.harness, i.det.sessionId ?? null, reservCutoff),
       );
       const results = await env.DB.batch<{ id: number }>([...machineStmts, ...fileStmts]);
-      const ids = results.slice(machineStmts.length).map((r) => r.results[0]!.id);
+      const ids = results.slice(machineStmts.length).map((r) => r.results[0]?.id ?? null);
 
       // Mirror upload.ts's canonical-reupload fix in a second batch, now that we hold each row id: the
       // upserts above flipped every file back to 'pending', so any session those files are CURRENTLY
@@ -661,6 +671,7 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
       const flipStmts = [];
       for (let k = 0; k < items.length; k++) {
         const { det } = items[k]!;
+        if (ids[k] === null) continue; // fresh reservation left intact — its cleanup owner re-parses it
         if (det.sessionId) {
           flipStmts.push(
             env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1 AND canonical_file_id = ?2").bind(det.sessionId, ids[k]!),
@@ -675,13 +686,15 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
       // count cap AND a serialized-size budget: Cloudflare Queues rejects a sendBatch whose total payload
       // exceeds 256KB, and 100 messages with long R2 keys can blow past that — which would throw here and
       // wedge this page forever. queueChunks keeps each chunk under ~200KB, leaving envelope margin.
-      const messages = items.map((i, k) => ({
-        body: { file_id: ids[k]!, r2_key: i.key, reason: 'reindex' as const, content_hash: i.contentHash },
-      }));
+      // Skip null ids (fresh reservations left intact): no reindex parse for them — their cleanup owner's
+      // recover re-parses them, and re-enqueuing would race that.
+      const messages = items.flatMap((i, k) =>
+        ids[k] === null ? [] : [{ body: { file_id: ids[k]!, r2_key: i.key, reason: 'reindex' as const, content_hash: i.contentHash } }],
+      );
       for (const chunk of queueChunks(messages)) {
         await env.PARSE_QUEUE.sendBatch(chunk);
       }
-      enqueued += items.length;
+      enqueued += messages.length;
     }
 
     cursor = page.truncated ? page.cursor : undefined;

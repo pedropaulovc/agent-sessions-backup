@@ -48,10 +48,20 @@ interface ParseMessage {
    *    the stale sessions and, once drained, best-effort send the recover messages.
    * Splitting flip-early / send-late is what keeps a recover message from ever existing before all the
    * deletes commit (round 11) — see the cleanup phase in consumer.ts. */
-  cleanup_phase?: 'scan' | 'reserve' | 'delete';
+  cleanup_phase?: 'scan' | 'reserve' | 'delete' | 'send-late';
   /** Reservation-phase cursor: the last files.id already flipped to 'pending' by the sibling fan-out.
    * The next reserve continuation resumes at `id > kick_cursor`, so pages advance by id independent of
    * parse_state — a sibling that churns back to 'parsed' behind the cursor can't re-trigger a re-flip
    * (kills the livelock). Present only on 'reserve' continuations. */
   kick_cursor?: number;
+  /** True once this cleanup has flipped ≥1 sibling to 'reserved'. Carried on every reserve/delete
+   *  continuation so a resumed invocation knows a prior one reserved: on entry it refreshes its reservations'
+   *  reserved_at (progress = freshness, so a slow-but-live window is never healed as abandoned), and if it
+   *  OWNED reservations yet the refresh finds none, a heal reclaimed them mid-flight → revert + retry rather
+   *  than delete (round 15). Absent/false on the scan entry and on a lone archive with no siblings to reserve. */
+  had_reservations?: boolean;
+  /** Send-late resume cursor: the last sibling files.id already handled by the recover fan-out. Present only
+   *  on 'send-late' continuations (round 15, 3608955881) — the owner is already 'parsed'; the continuation
+   *  resumes sendRecoverToReservedSiblings at `id > send_cursor` without re-reading R2 or re-running cleanup. */
+  send_cursor?: number;
 }

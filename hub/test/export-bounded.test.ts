@@ -2,6 +2,7 @@ import { SELF, env as testEnvRaw } from 'cloudflare:test';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import worker from '../src/index';
 import { __setExportBudgetsForTest, EXPORT_SEND_FAILURE_LIMIT } from '../src/ingest/consumer';
+import { isFreshReservation } from '../src/queue';
 import { CLAUDE_WEB_ROOT, claudeExportZip, claudeWebConversation, type ClaudeConvOpts, type ClaudeWebMessage } from './web-fixtures';
 
 const testEnv = testEnvRaw as unknown as Env;
@@ -121,6 +122,18 @@ async function fileState(id: number): Promise<string> {
 async function ownedSessions(fileId: number): Promise<number> {
   const r = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM sessions WHERE canonical_file_id = ?1').bind(fileId).first<{ n: number }>();
   return r!.n;
+}
+
+async function reservedByOf(id: number): Promise<number | null> {
+  const r = await testEnv.DB.prepare('SELECT reserved_by FROM files WHERE id = ?1').bind(id).first<{ reserved_by: number | null }>();
+  return r!.reserved_by;
+}
+
+// True when the row is a reservation the heal paths would treat as ABANDONED (parse_state 'reserved' but
+// reserved_at past the staleness threshold) — the state the on-entry refresh clears.
+async function reservationHealEligible(id: number): Promise<boolean> {
+  const r = await testEnv.DB.prepare('SELECT parse_state, reserved_at FROM files WHERE id = ?1').bind(id).first<{ parse_state: string; reserved_at: string | null }>();
+  return r!.parse_state === 'reserved' && !isFreshReservation(r!);
 }
 
 async function uploadConvs(tag: string, convs: ClaudeConvOpts[], mtime = '2026-07-01T12:00:00Z'): Promise<{ fileId: number; hash: string; r2Key: string }> {
@@ -951,7 +964,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
 
     // Make the RESERVE-phase sibling SELECT throw (it fires only after the scan hits the first stale session).
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
-    const RESERVE_SQL = "SELECT id, content_hash FROM files WHERE store = ?1 AND id != ?2 AND id > ?3 AND parse_state = 'parsed' ORDER BY id ASC LIMIT ?4";
+    const RESERVE_SQL = "SELECT id, content_hash FROM files WHERE store = ?1 AND id != ?2 AND id > ?3 AND parse_state IN ('parsed','pending') ORDER BY id ASC LIMIT ?4";
     testEnv.DB.prepare = ((sql: string) => {
       if (sql === RESERVE_SQL) {
         return { bind: () => ({ all: async () => { throw new Error('D1 outage on reservation SELECT'); } }) } as unknown as D1PreparedStatement;
@@ -986,7 +999,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
     // Make the db.batch that reserves SIB (the hash-pinned reserve flip, bound to sib.fileId) throw ONCE.
     // Tag sib's flip statement in a WeakSet and trip the batch only when it carries that statement — keeps the
     // test hermetic against the other export-inbox siblings the same reservation also flips in a full-suite run.
-    const FLIP_SQL = "UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = ?3 WHERE id = ?1 AND parse_state = 'parsed' AND content_hash = ?2";
+    const FLIP_SQL = "UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = ?3 WHERE id = ?1 AND parse_state IN ('parsed','pending') AND content_hash = ?2";
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
     const realBatch = testEnv.DB.batch.bind(testEnv.DB);
     const sibFlip = new WeakSet<object>();
@@ -1387,7 +1400,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
 
     // Hook the reserve SELECT to hand back sib's STALE hashV1 (simulating a SELECT that read sib before its
     // re-upload) while the live DB has sib parsed at hashV2. The hash-pinned flip must then no-op on sib.
-    const RESERVE_SQL = "SELECT id, content_hash FROM files WHERE store = ?1 AND id != ?2 AND id > ?3 AND parse_state = 'parsed' ORDER BY id ASC LIMIT ?4";
+    const RESERVE_SQL = "SELECT id, content_hash FROM files WHERE store = ?1 AND id != ?2 AND id > ?3 AND parse_state IN ('parsed','pending') ORDER BY id ASC LIMIT ?4";
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
     testEnv.DB.prepare = ((sql: string) => {
       const stmt = realPrepare(sql);
@@ -1571,13 +1584,17 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(flipBatchCalls).toBe(Math.ceil(N / 90));
   });
 
-  it('send-late targets only reserved siblings, never an unrelated pending upload (round 12 finding 3608692125)', async () => {
+  it('send-late fans out to exactly the reserved set — including a pending sibling the reserve pass now reserves (round 12 finding 3608692125, updated by round 15 3608955874)', async () => {
     budgets({ slice: 800, invocation: 800, kickPage: 500 });
     // A PARSED sibling our cleanup will reserve.
     const parsedSib = await uploadConvs('r12t-res', [conv('r12tres', 0)]);
     await deliverChain({ file_id: parsedSib.fileId, r2_key: parsedSib.r2Key, reason: 'upload', content_hash: parsedSib.hash });
     expect(await fileState(parsedSib.fileId)).toBe('parsed');
-    // An UNRELATED sibling left 'pending' (a fresh upload whose parse hasn't run) — NOT reserved by us.
+    // A sibling left 'pending' (a fresh upload whose parse hasn't run). ROUND 15 (3608955874) changes round 12's
+    // behavior: the reserve pass now flips 'pending' siblings to 'reserved' too, because a pending sibling could
+    // otherwise complete its own upload parse mid-window, land 'parsed' behind the reserve cursor, and escape the
+    // reserved set while the delete removes its shared session. The send-late SELECT still targets ONLY
+    // 'reserved' (round 12's invariant is intact) — but the pending sibling is 'reserved' by the time it runs.
     const pendingSib = await uploadConvs('r12t-pend', [conv('r12tpend', 0)]);
     expect(await fileState(pendingSib.fileId)).toBe('pending');
 
@@ -1587,12 +1604,12 @@ describe('large export ingest is bounded and never marks parsed until every conv
 
     await deliverChain({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
 
-    // POSITIVE CONTROL: the old pass SELECTed every 'pending' store row, so it would send a recover to the
-    // unrelated fresh upload — hijacking its heal path (a dropped upload message would then never re-run).
-    // Now it SELECTs only 'reserved': the pending upload gets NO recover; the reserved sibling does.
-    expect(sent.some((m) => m.file_id === pendingSib.fileId && m.reason === 'recover')).toBe(false);
+    // Both siblings were reserved (parsed→reserved and pending→reserved) and each gets exactly one recover; the
+    // pending sibling's own queued upload message is neutralized by the consume-time guard (see the dedicated
+    // pending-sibling race test below). send-late never selected a raw 'pending' row — it was reserved first.
+    expect(sent.some((m) => m.file_id === pendingSib.fileId && m.reason === 'recover')).toBe(true);
     expect(sent.some((m) => m.file_id === parsedSib.fileId && m.reason === 'recover')).toBe(true);
-    expect(await fileState(pendingSib.fileId)).toBe('pending'); // untouched, still awaiting its own upload parse
+    expect(await fileState(pendingSib.fileId)).toBe('reserved'); // reserved by our cleanup, awaiting its recover
   });
 
   it('runs the late recover fan-out even when the completing invocation reconciled nothing locally (round 12 finding 3608692127)', async () => {
@@ -2066,5 +2083,150 @@ describe('per-store cleanup serialization (round 14): a cleanup defers while ano
     expect(sFinal!.parse_state).toBe('parsed');
     expect(sFinal!.reserved_by).toBeNull();
     expect(sFinal!.reserved_at).toBeNull();
+  });
+});
+
+describe('reservation lifecycle edges (round 15)', () => {
+  it('reserves a PENDING sibling (not skipping past it) and its racing upload message no-ops; the recover drains it (3608955874)', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    // A sibling still 'pending' — a fresh upload whose parse message hasn't run. Keep its upload message to race later.
+    const pend = await uploadConvs('r15p-sib', [conv('r15psib', 0)]);
+    expect(await fileState(pend.fileId)).toBe('pending');
+    const pendUpload = { file_id: pend.fileId, r2_key: pend.r2Key, reason: 'upload' as const, content_hash: pend.hash };
+
+    // fileA: big then replaced small so its cleanup reserves the pending sibling and has stale to delete.
+    const fileA = await uploadConvs('r15p', Array.from({ length: 4 }, (_u, i) => conv('r15p', i)));
+    await deliverChain({ file_id: fileA.fileId, r2_key: fileA.r2Key, reason: 'upload', content_hash: fileA.hash });
+    const replaced = await uploadConvs('r15p', [conv('r15p', 0)]);
+    sent.length = 0;
+    await deliverChain({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
+
+    // POSITIVE CONTROL: the reserve pass now selects 'pending' too, so the pager did NOT advance past the pending
+    // sibling — it flipped it to 'reserved' (reserved_by = our cleanup) and send-late recovered it. Under the old
+    // 'parsed'-only pager it would stay 'pending', its upload could land 'parsed' behind the cursor, and escape.
+    expect(await fileState(pend.fileId)).toBe('reserved');
+    expect(await reservedByOf(pend.fileId)).toBe(replaced.fileId);
+    expect(sent.some((m) => m.file_id === pend.fileId && m.reason === 'recover')).toBe(true);
+
+    // The sibling's ORIGINAL upload message now races in. POSITIVE CONTROL for the consume-time guard: without
+    // it, this 'upload' parse would re-parse the reserved sibling and mark it 'parsed' behind the reserve cursor,
+    // escaping the reserved set while the delete removes its shared session. The guard no-ops it — still 'reserved'.
+    await deliver(pendUpload);
+    expect(await fileState(pend.fileId)).toBe('reserved');
+
+    // The cleanup's recover (reason: 'recover' bypasses the guard) drains it to terminal.
+    await deliver({ file_id: pend.fileId, r2_key: pend.r2Key, reason: 'recover', content_hash: pend.hash });
+    expect(await fileState(pend.fileId)).toBe('parsed');
+  });
+
+  it('a cleanup window outliving the staleness threshold keeps ownership: each continuation refreshes its reservations (3608955877)', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    const sib = await uploadConvs('r15w-sib', [conv('r15wsib', 0)]);
+    await deliverChain({ file_id: sib.fileId, r2_key: sib.r2Key, reason: 'upload', content_hash: sib.hash });
+    const fileA = await uploadConvs('r15w', Array.from({ length: 4 }, (_u, i) => conv('r15w', i)));
+    await deliverChain({ file_id: fileA.fileId, r2_key: fileA.r2Key, reason: 'upload', content_hash: fileA.hash });
+    const replaced = await uploadConvs('r15w', [conv('r15w', 0)]);
+
+    // Drive to a delete-phase continuation: sib reserved by replaced (fresh), stale deletes still pending.
+    budgets({ slice: 8, invocation: 8 });
+    const { stoppedCont } = await deliverChain(
+      { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash },
+      { stopAtCleanup: true },
+    );
+    expect(stoppedCont).toBeDefined();
+    expect(await reservedByOf(sib.fileId)).toBe(replaced.fileId);
+
+    // Simulate a long stall (queue backlog/backoff): age the reservation past STALE_RESERVATION_MS. POSITIVE
+    // CONTROL: it is now HEAL-ELIGIBLE — a files/check would treat it as abandoned and strip reserved_by, and
+    // WITHOUT the on-entry refresh the delayed delete would then strand the sibling (send-late finds nothing).
+    await testEnv.DB.prepare("UPDATE files SET reserved_at = '2020-01-01T00:00:00.000Z' WHERE id = ?1").bind(sib.fileId).run();
+    expect(await reservationHealEligible(sib.fileId)).toBe(true);
+
+    // Deliver the continuation: its on-entry refresh re-stamps reserved_at, so the reservation is fresh again (a
+    // heal now skips it), the cleanup completes, and send-late recovers the sibling — ownership survived the window.
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    sent.length = 0;
+    await deliverChain(stoppedCont!);
+    expect(await fileState(replaced.fileId)).toBe('parsed');
+    expect(await reservationHealEligible(sib.fileId)).toBe(false); // refreshed → no longer abandoned
+    expect(sent.some((m) => m.file_id === sib.fileId && m.reason === 'recover')).toBe(true);
+  });
+
+  it('a delete continuation whose reservations were healed away mid-flight reverts and retries instead of deleting (3608955877 validation)', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    const sib = await uploadConvs('r15h-sib', [conv('r15hsib', 0)]);
+    await deliverChain({ file_id: sib.fileId, r2_key: sib.r2Key, reason: 'upload', content_hash: sib.hash });
+    const fileA = await uploadConvs('r15h', Array.from({ length: 4 }, (_u, i) => conv('r15h', i)));
+    await deliverChain({ file_id: fileA.fileId, r2_key: fileA.r2Key, reason: 'upload', content_hash: fileA.hash });
+    const replaced = await uploadConvs('r15h', [conv('r15h', 0)]);
+
+    budgets({ slice: 8, invocation: 8 });
+    const { stoppedCont } = await deliverChain(
+      { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash },
+      { stopAtCleanup: true },
+    );
+    expect(stoppedCont).toBeDefined();
+    const staleBefore = await ownedSessions(replaced.fileId);
+
+    // A heal steals EVERY reservation this cleanup owns between continuations (what happens WITHOUT the refresh):
+    // the reserved siblings go back to 'pending', reserved_by cleared. Deliver the delete continuation: its refresh
+    // finds 0 owned while the message says it had reservations → it must NOT delete (that would strand the healed
+    // siblings); it reverts and raises a retry (file stays 'pending', nothing deleted). (In the shared store our
+    // cleanup also reserved sibling pollution, so heal by OWNER to drive owned→0, the case the validation guards.)
+    await testEnv.DB.prepare("UPDATE files SET parse_state = 'pending', reserved_at = NULL, reserved_by = NULL WHERE reserved_by = ?1 AND parse_state = 'reserved'").bind(replaced.fileId).run();
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    await deliver(stoppedCont!);
+    expect(await fileState(replaced.fileId)).toBe('pending'); // retryable, not parsed
+    expect(await ownedSessions(replaced.fileId)).toBe(staleBefore); // nothing deleted — safe path taken
+  });
+
+  it('send-late that hits the invocation budget enqueues a continuation that drains the remaining reserved siblings (3608955881)', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    const COUNT = 8;
+    const sibs = [];
+    for (let i = 0; i < COUNT; i++) sibs.push(await uploadConvs(`r15c-sib${i}`, [conv(`r15csib${i}`, 0)]));
+    for (const s of sibs) await deliverChain({ file_id: s.fileId, r2_key: s.r2Key, reason: 'upload', content_hash: s.hash });
+    const sibIds = new Set(sibs.map((s) => s.fileId));
+    const fileA = await uploadConvs('r15c', Array.from({ length: 4 }, (_u, i) => conv('r15c', i)));
+    await deliverChain({ file_id: fileA.fileId, r2_key: fileA.r2Key, reason: 'upload', content_hash: fileA.hash });
+    const replaced = await uploadConvs('r15c', [conv('r15c', 0)]);
+
+    // A tight budget so the reserve/delete span continuations and, in the invocation that reaches markParsed, the
+    // send-late fan-out cuts partway. Drive by hand (deliverChain would silently follow the send-late continuation
+    // too) and STOP at the first 'send-late' continuation, accumulating every recover our COUNT siblings receive.
+    budgets({ slice: 12, invocation: 12, kickPage: 500 });
+    const recovered = new Set<number>();
+    let sendLateCont: ParseMessage | undefined;
+    let msg: ParseMessage = { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash };
+    for (let guard = 0; guard < 200; guard++) {
+      sent.length = 0;
+      await deliver(msg);
+      for (const m of sent) if (m.reason === 'recover' && sibIds.has(m.file_id)) recovered.add(m.file_id);
+      const slc = sent.find((m) => m.file_id === replaced.fileId && m.cleanup_phase === 'send-late');
+      if (slc) { sendLateCont = slc; break; }
+      const cont = sent.find((m) => m.file_id === replaced.fileId && typeof m.offset === 'number');
+      if (!cont) break;
+      msg = cont;
+    }
+
+    // Cleanup completed (owner terminal 'parsed') and the fan-out cut on budget, enqueuing a 'send-late'
+    // continuation instead of stranding the rest for the 1h heal. Not all COUNT siblings were reached yet.
+    expect(await fileState(replaced.fileId)).toBe('parsed');
+    expect(sendLateCont).toBeDefined();
+    expect(recovered.size).toBeLessThan(COUNT);
+
+    // POSITIVE CONTROL: without the continuation the remaining fresh reservations would wait up to an hour for a
+    // collector files/check. Delivering it (generous budget) resumes the fan-out from the cursor and drains the rest.
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    let cmsg: ParseMessage = sendLateCont!;
+    for (let guard = 0; guard < 50; guard++) {
+      sent.length = 0;
+      await deliver(cmsg);
+      for (const m of sent) if (m.reason === 'recover' && sibIds.has(m.file_id)) recovered.add(m.file_id);
+      const next = sent.find((m) => m.file_id === replaced.fileId && m.cleanup_phase === 'send-late');
+      if (!next) break;
+      cmsg = next;
+    }
+    expect(recovered.size).toBe(COUNT); // every reserved sibling ultimately recovered across the two runs — none stranded
   });
 });

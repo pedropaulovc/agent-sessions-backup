@@ -1160,7 +1160,7 @@ describe('a fresh reservation is left to its cleanup owner; the heal paths do no
       const putRes = await putFile('res14', 'claude-projects', RELPATH, CONTENT);
       const putBody = (await putRes.json()) as { status: string; requeued?: boolean };
       expect(putBody.status).toBe('unchanged');
-      expect(putBody.requeued).toBeUndefined(); // same-hash PUT left the fresh reservation alone
+      expect(putBody.requeued).toBe(false); // centralized gate reported the fresh reservation as NOT requeued
       expect(spy).not.toHaveBeenCalled();
       expect(await stateOf(fileId)).toBe('reserved');
     } finally {
