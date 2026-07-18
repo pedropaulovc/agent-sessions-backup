@@ -51,6 +51,16 @@ def _caveats_section(date: str, page: SessionsPage, status: HubStatus, *, machin
     # filter can't narrow which machines are in scope — any machine could run that harness.
     # Only --machine unambiguously narrows this to one machine.
     relevant_machines = [m for m in status.machines if machine is None or m.machine_id == machine]
+    # A preview/local run's `x-dev-machine` identity auto-registers a `machines` row on its
+    # very first authenticated read (hub/src/auth/identity.ts::devHeaderIdentity) — with no
+    # heartbeat ever sent and no files ever uploaded, since it's a reporting client, not a
+    # collector. Left unfiltered, that row's indexed_through=null trips the staleness check
+    # below for every preview report, on an identity that was never supposed to be a data
+    # source in the first place. "Never seen AND zero files" is the closest signal /status
+    # exposes for "not actually a collector" — a real collector that's simply never uploaded
+    # yet would still show 0 files, but would also have a real last_seen_at from its
+    # heartbeats, so this predicate doesn't false-positive on a genuinely new machine.
+    relevant_machines = [m for m in relevant_machines if not (m.last_seen_at is None and m.files_total == 0)]
     for m in relevant_machines:
         if m.indexed_through is None or m.indexed_through < end_of_day:
             caveats.append(f"- `{m.machine_id}` {STALE_MACHINE_NOTE} (indexed_through={m.indexed_through or 'never'}).")

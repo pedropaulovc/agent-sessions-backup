@@ -147,6 +147,45 @@ def test_report_flags_truncation():
     assert "no pagination cursor" in report
 
 
+def test_report_skips_never_seen_zero_file_machine_but_flags_real_stale_one():
+    # A preview/local run's x-dev-machine identity auto-registers a `machines` row on its
+    # first authenticated read with no heartbeat and no files (it's a reporting client, not a
+    # collector) — indexed_through=null there must not trip the staleness caveat. A real
+    # machine that's genuinely stale (has files, just an old heartbeat) must still be flagged.
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="amet-wsl")], indexed_through=None, truncated=False)
+    status = HubStatus(
+        machines=[
+            MachineStatus(
+                machine_id="dev-reporter",
+                os=None,
+                last_seen_at=None,
+                last_upload_at=None,
+                files_pending=0,
+                files_error=0,
+                files_total=0,
+                indexed_through=None,
+            ),
+            MachineStatus(
+                machine_id="amet-wsl",
+                os="wsl",
+                last_seen_at="2026-07-01T00:00:00.000Z",
+                last_upload_at="2026-07-01T00:00:00.000Z",
+                files_pending=0,
+                files_error=0,
+                files_total=5,
+                indexed_through="2026-07-01T00:00:00.000Z",  # well before end of day
+            ),
+        ],
+        sessions=SessionsSummary(total=1, ready=1, error=0),
+    )
+    report = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=UsageReport(group_by="model", rows=[]), status=status
+    )
+    assert "dev-reporter" not in report
+    assert "amet-wsl" in report
+    assert "may be an undercount" in report
+
+
 def test_report_empty_sessions():
     sessions_page = SessionsPage(sessions=[], indexed_through=None, truncated=False)
     status = HubStatus(machines=[], sessions=SessionsSummary(total=0, ready=0, error=0))
