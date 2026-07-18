@@ -56,6 +56,31 @@ function countRecords(req: Uint8Array): number {
   return n;
 }
 
+// Extract every log record's body string from an encoded ExportLogsServiceRequest.
+// Path: req → field1 ResourceLogs → field2 ScopeLogs → field2 LogRecord → field5
+// body (AnyValue) → field1 string_value. Decodes with fatal:true so a body cut
+// mid-UTF-8-sequence (the bug) would throw instead of silently passing.
+function logBodies(req: Uint8Array): string[] {
+  const out: string[] = [];
+  const decode = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false });
+  for (const rl of lenFields(req)) {
+    if (rl.field !== 1) continue;
+    for (const sl of lenFields(rl.val)) {
+      if (sl.field !== 2) continue;
+      for (const rec of lenFields(sl.val)) {
+        if (rec.field !== 2) continue;
+        for (const f of lenFields(rec.val)) {
+          if (f.field !== 5) continue; // LogRecord.body
+          for (const v of lenFields(f.val)) {
+            if (v.field === 1) out.push(decode.decode(v.val)); // AnyValue.string_value
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
 function bodyString(bytes: number): string {
   // A JSON-ish body so it looks like a real access-log line.
   return `{"event":"http.access","path":"/x","note":"${'a'.repeat(Math.max(0, bytes - 40))}"}`;
@@ -117,6 +142,34 @@ describe('otlp chunking', () => {
     expect(chunks[0]!.byteLength).toBeLessThanOrEqual(AZURE_LIMIT);
     expect(chunks[0]!.byteLength).toBeLessThan(2_000_000);
     expect(countRecords(chunks[0]!)).toBe(1);
+  });
+
+  it('truncates a multi-byte (emoji/CJK) oversized body by BYTE budget, keeping the record and valid UTF-8', () => {
+    // 🦀 is 2 UTF-16 code units but 4 UTF-8 bytes. A ~2 MB emoji body sliced by
+    // code-UNIT count (the bug) still encodes to ~2× the cap → falls through to the
+    // drop path. Byte-budgeted truncation keeps the record and stays under the cap.
+    const emojiBody = '🦀'.repeat(500_000); // ~2 MB encoded, ~1 M UTF-16 units
+    const batch = {
+      resourceLogs: [
+        {
+          resource: { attributes: [{ key: 'service.name', value: { stringValue: 'sessions-hub' } }] },
+          scopeLogs: [{ scope: { name: 'access' }, logRecords: [{ timeUnixNano: '1782964800000000000', body: { stringValue: emojiBody } }] }],
+        },
+      ],
+    };
+    const { chunks, dropped } = encodeLogsChunks(batch, CAP);
+    expect(dropped).toBe(0); // survived — NOT dropped
+    expect(chunks.length).toBe(1);
+    expect(chunks[0]!.byteLength).toBeLessThanOrEqual(AZURE_LIMIT);
+    expect(chunks[0]!.byteLength).toBeLessThan(2_000_000); // actually truncated
+    expect(countRecords(chunks[0]!)).toBe(1);
+    // The body must decode as valid UTF-8 (fatal decoder throws on a split sequence),
+    // end on the truncation marker, and contain no replacement char.
+    const bodies = logBodies(chunks[0]!);
+    expect(bodies.length).toBe(1);
+    expect(bodies[0]).toContain('🦀'); // real emoji preserved, not mangled
+    expect(bodies[0]!.endsWith('…[gateway-truncated]')).toBe(true);
+    expect(bodies[0]).not.toContain('�'); // no mid-sequence corruption
   });
 
   it('chunks spans the same way and drops a single span too big to fit', () => {

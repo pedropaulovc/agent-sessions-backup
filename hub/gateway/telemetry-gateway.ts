@@ -202,7 +202,9 @@ async function forwardOtlp(
 
       const body = await upstream.text();
       const poison = upstream.status === 413;
-      const transient = upstream.status === 429 || upstream.status >= 500;
+      // 408 (request timeout) says nothing about payload validity — retry it like
+      // 429/5xx/network. Only a hard 413 is treated as poison.
+      const transient = upstream.status === 408 || upstream.status === 429 || upstream.status >= 500;
       if (transient) retryable = true;
       // Non-transient, non-413 responses (400/401/403…) can't be fixed by retrying
       // the same bytes, so we drop them rather than wedge the pipeline — logged for

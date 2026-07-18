@@ -440,16 +440,31 @@ function chunkSignal(resourceItems: Json[], spec: SignalSpec, maxBytes: number):
   return { chunks, dropped };
 }
 
+// Truncate a string to at most `maxBytes` of UTF-8, ending on a code-point
+// boundary. The DCR cap is a byte budget but String.slice cuts UTF-16 code units,
+// so a mostly-non-ASCII body (CJK, emoji — 3-4 bytes each) sliced by code-unit
+// count can still encode far past the cap and fall through to the drop path. We
+// encode, cut the byte array, then back off any trailing UTF-8 continuation byte
+// (0b10xxxxxx) so the result decodes cleanly with no replacement char.
+function truncateUtf8(str: string, maxBytes: number): string {
+  const enc = new TextEncoder().encode(str);
+  if (enc.length <= maxBytes) return str;
+  let end = maxBytes;
+  while (end > 0 && (enc[end]! & 0xc0) === 0x80) end--;
+  return new TextDecoder().decode(enc.subarray(0, end));
+}
+
 // Logs: truncate the body string (the usual giant field) so the record fits.
 function degradeLogRecord(lr: Json, budget: number): Json | null {
   const body = lr.body as Json | undefined;
   if (!body || typeof body !== "object" || body.stringValue === undefined) return null;
   const marker = "…[gateway-truncated]";
   const original = String(body.stringValue);
-  const keep = Math.max(0, budget - marker.length - 256); // leave room for other fields
+  const markerBytes = new TextEncoder().encode(marker).length;
+  const keep = Math.max(0, budget - markerBytes - 256); // budget/marker in BYTES; leave room for other fields
   return {
     ...lr,
-    body: { stringValue: original.slice(0, keep) + marker },
+    body: { stringValue: truncateUtf8(original, keep) + marker },
     attributes: [
       ...((lr.attributes as Json[]) ?? []),
       { key: "gateway.truncated", value: { boolValue: true } },

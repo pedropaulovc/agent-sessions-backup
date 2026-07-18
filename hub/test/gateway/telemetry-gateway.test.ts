@@ -319,4 +319,47 @@ describe('telemetry-gateway fetch handler', () => {
     expect(res.status).toBe(503);
     expect(dcrPosts).toBeGreaterThan(1); // did NOT bail after the 429 — posted the rest
   });
+
+  it('treats a chunk 408 (request timeout) as transient → posts the rest and returns 503', async () => {
+    const pem = await pemFromGeneratedKeyPair();
+    const env = makeEnv(pem);
+
+    let dcrPosts = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('login.microsoftonline.com')) {
+        return new Response(JSON.stringify({ access_token: 'fake-entra-token', expires_in: 3600 }), { status: 200 });
+      }
+      dcrPosts++;
+      // A timeout says nothing about payload validity — must stay retryable.
+      return dcrPosts === 1 ? new Response('timeout', { status: 408 }) : new Response(null, { status: 204 });
+    });
+
+    const bigBody = `{"event":"http.access","blob":"${'a'.repeat(300_000)}"}`;
+    const otlpJson = {
+      resourceLogs: [
+        {
+          resource: { attributes: [{ key: 'service.name', value: { stringValue: 'sessions-hub' } }] },
+          scopeLogs: [
+            {
+              logRecords: Array.from({ length: 6 }, (_, i) => ({
+                timeUnixNano: String(1782964800000000000n + BigInt(i)),
+                body: { stringValue: bigBody },
+              })),
+            },
+          ],
+        },
+      ],
+    };
+
+    const req = new Request('https://gateway.example/v1/logs', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.INGEST_BEARER}` },
+      body: JSON.stringify(otlpJson),
+    });
+
+    const res = await gateway.fetch(req, env as never, ctx);
+    expect(res.status).toBe(503);
+    expect(dcrPosts).toBeGreaterThan(1); // did NOT bail after the 408
+  });
 });
