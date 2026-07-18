@@ -42,11 +42,9 @@ def build_daily_report(
 def _caveats_section(date: str, page: SessionsPage, status: HubStatus, *, machine: str | None, filtered: bool) -> list[str]:
     end_of_day = f"{date}T23:59:59.999Z"
     caveats: list[str] = []
-    if page.truncated:
-        caveats.append(
-            f"- The session list hit the hub's {len(page.sessions)}-row cap for this window "
-            "(`/api/v1/sessions` has no pagination cursor) — counts below may be an undercount."
-        )
+    # No "truncated" caveat here: SessionsApi.list_sessions() follows the hub's keyset cursor
+    # transparently across as many requests as needed (see docs/agents-api.md), so
+    # sessions_page always holds the complete matching set already.
     # /api/v1/status has no harness dimension (only /api/v1/sessions does), so a --harness-only
     # filter can't narrow which machines are in scope — any machine could run that harness.
     # Only --machine unambiguously narrows this to one machine.
