@@ -1,0 +1,19 @@
+[project]
+name = "agent-sessions-client"
+version = "0.1.0"
+description = "AI-agent-facing client for the sessions hub API: typed HTTP helpers + daily-report CLI"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+agent-sessions = "agent_sessions_client.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agent_sessions_client"]
