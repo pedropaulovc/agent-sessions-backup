@@ -82,6 +82,40 @@ def test_daily_report_missing_auth_returns_error(tmp_path, capsys, monkeypatch):
     assert "error:" in capsys.readouterr().err
 
 
+def test_daily_report_unpadded_date_rejected_before_any_api_call(hub, capsys):
+    # '2026-7-8' is a plausible typo/unpadded date. date.fromisoformat's leniency toward this
+    # shape is Python-version-dependent, and the hub only inclusive-expands a strict
+    # YYYY-MM-DD `to` bound — forwarding it silently mis-scopes (or empties) the report
+    # instead of failing loudly.
+    rc = main(
+        [
+            "daily-report",
+            "--date",
+            "2026-7-8",
+            "--hub-url",
+            hub.url,
+            "--bearer-token",
+            "tok",
+            "--dev-machine",
+            "m",
+        ]
+    )
+    assert rc == 2
+    assert "error: invalid --date '2026-7-8', expected YYYY-MM-DD" in capsys.readouterr().err
+    assert hub.requests == []  # rejected before issuing any API call
+
+
+def test_daily_report_invalid_calendar_date_rejected(hub, capsys):
+    # Strict YYYY-MM-DD shape but not a real date — a regex-only check wouldn't catch this;
+    # strptime is still needed alongside it for actual calendar validity.
+    rc = main(
+        ["daily-report", "--date", "2026-02-30", "--hub-url", hub.url, "--bearer-token", "tok", "--dev-machine", "m"]
+    )
+    assert rc == 2
+    assert "error: invalid --date '2026-02-30', expected YYYY-MM-DD" in capsys.readouterr().err
+    assert hub.requests == []
+
+
 def test_daily_report_connection_failure_returns_error(capsys):
     rc = main(
         [

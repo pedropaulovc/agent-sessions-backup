@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from datetime import date as date_cls
+from datetime import datetime as datetime_cls
 from pathlib import Path
 
 from .config import load_config
@@ -12,8 +14,29 @@ from .endpoints import SessionsApi
 from .http import HubClient, HubError
 from .report import build_daily_report
 
+# Strict YYYY-MM-DD: exactly 4-2-2 digits. Needed ALONGSIDE strptime, not instead of it —
+# datetime.strptime("%Y-%m-%d") is NOT strict about zero-padding despite the format string
+# implying it (verified: strptime("2026-7-8", "%Y-%m-%d") parses fine, same as "2026-07-08"),
+# so strptime alone doesn't reject the unpadded shape this check exists for. The regex catches
+# the shape; strptime (below) still catches shape-valid-but-not-a-real-date input like
+# "2026-02-30" or "2026-13-01" that the regex can't.
+_STRICT_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 
 def _daily_report(args: argparse.Namespace) -> int:
+    if args.date is not None:
+        try:
+            valid = bool(_STRICT_DATE_RE.match(args.date))
+            if valid:
+                datetime_cls.strptime(args.date, "%Y-%m-%d")
+        except ValueError:
+            valid = False
+        if not valid:
+            # The hub only inclusive-expands a strict YYYY-MM-DD date-only `to` bound (see
+            # normalizeToBound in hub/src/api/sessions.ts) — a malformed date must be rejected
+            # here, not silently forwarded to mis-scope (or empty) the query.
+            print(f"error: invalid --date '{args.date}', expected YYYY-MM-DD", file=sys.stderr)
+            return 2
     report_date = args.date or date_cls.today().isoformat()
     try:
         config = load_config(

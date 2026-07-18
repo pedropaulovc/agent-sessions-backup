@@ -36,10 +36,14 @@ machine API. Full endpoint contract, auth modes, and known gaps: `docs/agents-ap
 3. **Always surface staleness**, don't silently present partial data as complete:
    - If any machine's `indexed_through` (from `/api/v1/status`) is before the end of the
      report date, say so and name the machine.
+   - If an in-scope machine's `/api/v1/status` entry shows `files_pending` or `files_error`
+     greater than 0, say the session counts may be incomplete and name the machine —
+     uploaded files don't appear in `/api/v1/sessions` until the ingest consumer parses them,
+     so a machine can look fresh by `indexed_through` while still hiding unparsed data.
    - If the session list came back at exactly the request `limit` (there is no pagination on
      `/api/v1/sessions` — see the gap noted in `docs/agents-api.md`), say the count may be
      truncated rather than reporting it as final.
-   - The built-in CLI report already does both of these under a "Staleness caveats" heading;
+   - The built-in CLI report already does all of these under a "Staleness caveats" heading;
      if you're calling the API by hand, replicate the same checks.
 
 4. **Treat `harness=prompt-log` sessions separately** from interactive ones — they're a
