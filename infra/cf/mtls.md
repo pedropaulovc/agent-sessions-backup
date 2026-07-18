@@ -125,6 +125,44 @@ transport then presents the cert via `curl --cert/--key`; TPM-backed keys remain
 that config in place `agent-collector run` / `backfill` upload over mTLS — the round-trip
 and the 6 GB backfill are unblocked.
 
+## Windows / Schannel mTLS
+
+The Windows collector runs against the host's `curl.exe`, which is **Schannel-backed, not
+OpenSSL**. Schannel refuses file-based client certs — the `--cert file.pem --key file.key`
+and `--cert file.p12` forms both fail. Verified against the real hub on amet:
+
+| curl client-cert form | result |
+| --- | --- |
+| `--cert cert.pem --key key.pem` | fails — Schannel won't load a file-based key |
+| `--cert client.p12 --type P12` | `SEC_E_INTERNAL_ERROR` (0x80090304, "Local Security Authority cannot be contacted") |
+| `--cert "CurrentUser\MY\<thumbprint>"` (no `--key`) | **200** — the only form that works |
+
+So on Windows the cert must live in the `Cert:\CurrentUser\My` store and be referenced by
+**thumbprint**; the collector emits `--cert "CurrentUser\MY\<thumbprint>"` with no `--key`.
+This is also the future TPM/PCP path (S2): a PCP-backed key surfaces as the same
+`CurrentUser\My` entry with a non-exportable private key, so only enrollment differs.
+
+Enroll flow (drive it from WSL; the CSR/signing steps are identical to POSIX above —
+`enroll-cert.sh` still mints the EC P-256 key, gets it signed, and writes the `machines`
+row). The extra Windows step is getting the signed cert+key into the store as a PFX:
+
+```
+# in WSL, after enroll-cert.sh produced $MID.client.pem / .client.key:
+openssl pkcs12 -export -inkey $MID.client.key -in $MID.client.pem \
+  -out $MID.client.pfx -passout env:AC_PFX_PW
+
+# hand the PFX to the Windows collector; it imports to Cert:\CurrentUser\My
+# (private key NON-exportable — the default), records the thumbprint, deletes the PFX:
+AC_PFX_PW=... agent-collector enroll --hub https://api.sessions.vza.net \
+  --machine-id amet-windows --import-pfx C:\path\to\amet-windows.client.pfx
+```
+
+`--import-pfx` writes an mTLS config with `client_cert_thumbprint` set (and no cert/key
+paths — the config layer rejects setting both). If the cert is already in the store, skip
+the import and pass `--client-cert-thumbprint <thumbprint>` directly. `agent-collector
+doctor` then verifies the cert is present in the store and warns if it expires within 21
+days. Keep the PFX password out of argv by exporting `AC_PFX_PW`.
+
 ## Notes
 
 - Real-TPM machines (Windows host, amet) replace the software `openssl` keygen with the

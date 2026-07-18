@@ -43,9 +43,42 @@ def test_enroll_and_load_roundtrip(tmp_path):
 
 
 def test_enroll_mtls_without_paths_errors(tmp_path):
-    # Non-dev enrollment needs both cert and key; otherwise a clear error, not a broken config.
-    with pytest.raises(ValueError, match="--client-cert and --client-key"):
+    # Non-dev enrollment with no client material errors clearly (PEM paths OR a Windows thumbprint).
+    with pytest.raises(ValueError, match="mTLS enrollment needs client material"):
         config.enroll("http://x", dev=False, path=tmp_path / "c.toml")
+
+
+def test_mtls_config_rejects_both_thumbprint_and_pem():
+    # The mechanism is derived from which fields are set; both set is ambiguous.
+    with pytest.raises(ValueError, match="ambiguous"):
+        config.Config(machine_id="m1", hub_url="https://h", auth="mtls",
+                      client_cert_thumbprint="ABCD", client_cert_path="/c.pem", client_key_path="/c.key")
+
+
+def test_mtls_config_rejects_no_material():
+    with pytest.raises(ValueError, match="needs client material"):
+        config.Config(machine_id="m1", hub_url="https://h", auth="mtls")
+
+
+def test_mtls_thumbprint_config_roundtrips(tmp_path):
+    cfg = config.Config(machine_id="amet-windows", hub_url="https://h", auth="mtls",
+                        client_cert_thumbprint="ABCDEF12")
+    path = tmp_path / "config.toml"
+    config.save(cfg, path)
+    loaded = config.load(path)
+    assert loaded.auth == "mtls"
+    assert loaded.client_cert_thumbprint == "ABCDEF12"
+    assert loaded.client_cert_path is None and loaded.client_key_path is None
+
+
+def test_enroll_thumbprint_writes_windows_mtls_config(tmp_path):
+    path = tmp_path / "config.toml"
+    cfg = config.enroll("https://api.sessions.vza.net/", dev=False, path=path,
+                        machine_id="amet-windows", client_cert_thumbprint="ab:cd ef 12")
+    assert cfg.auth == "mtls"
+    assert cfg.client_cert_thumbprint == "ABCDEF12"  # enroll normalizes
+    assert cfg.client_cert_path is None
+    assert 'client_cert_thumbprint = "ABCDEF12"' in path.read_text()
 
 
 def _write_config(path, extra=""):
