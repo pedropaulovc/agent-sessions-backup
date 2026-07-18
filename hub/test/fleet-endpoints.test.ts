@@ -1234,6 +1234,31 @@ describe('POST /api/v1/admin/machines', () => {
     expect((await retired(hexfp('rbp-B')))?.cert_id).toBe('rbp-B-id'); // displaced old current queued
   });
 
+  it('a DELETE-404 settle STAMPS revoked (not released), so a later rollback cannot reinstate the dead cert', async () => {
+    // A CA DELETE 404 means the cert is already GONE — terminal, same as the poll path's 404→not_found. It
+    // must STAMP revoked_at, not release the claim: a released same-machine reservation would let the
+    // reinstatement path reinstall a fingerprint whose CA cert no longer exists. (Revert the 404→'revoked'
+    // mapping in revokeClientCert and this test fails: settle returns 'failed', releases, and the rollback
+    // reinstates the dead fp.)
+    await seedMachine('del404', { fp: hexfp('d404-B'), certId: 'd404-B-id' }); // current; prev already pruned
+    await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('${hexfp('d404-A')}', 'd404-A-id', 'del404', '2000-01-01T00:00:00.000Z')`).run();
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return new Response(JSON.stringify({ success: false, errors: [{ code: 1002 }] }), { status: 404 });
+      throw new Error('unexpected non-DELETE fetch');
+    }));
+    const result = await settleRetired(testEnv, 'd404-A-id');
+    expect(result).toBe('revoked'); // 404 → settled, NOT 'failed'
+    expect((await retired(hexfp('d404-A')))?.revoked_at).not.toBeNull(); // stamped revoked, reservation settled
+
+    // A subsequent same-machine rollback to that dead fp must NOT reinstate it: the reservation is revoked,
+    // so reinstatingReserved is false and the new-fp guard requires a cert_id.
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ success: true }), { status: 200 })));
+    const res = await adminMachines(reqJson({ machine_id: 'del404', cert_fp_sha256: hexfp('d404-A') }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as { error: string }).error).toBe('cert_id_required_for_new_fp');
+    expect((await row('del404'))?.cert_fp_sha256).toBe(hexfp('d404-B')); // unchanged — dead cert NOT reinstated
+  });
+
   it('a CLAIMED same-machine reservation still 409s (prune mid-revoke; reinstating would race the DELETE)', async () => {
     await seedMachine('rbclaim', { fp: hexfp('rbc-B'), certId: 'rbc-B-id', prevFp: hexfp('rbc-A'), prevCertId: 'rbc-A-id', revokeAt: '2999-01-01T00:00:00.000Z' });
     await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, claimed_at) VALUES ('${hexfp('rbc-A')}', 'rbc-A-id', 'rbclaim', '2000-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z')`).run();

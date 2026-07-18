@@ -77,16 +77,24 @@ async function signClientCert(env: Env, csr: string, machineId: string): Promise
 type CertStatus = 'active' | 'pending_reactivation' | 'pending_revocation' | 'revoked';
 type RevokeResult = 'revoked' | 'pending_revocation' | 'failed';
 
-/** Revoke (DELETE) a client cert at the managed CA. Returns the resulting status: 'revoked' if the
- * CA already reports it fully revoked (rare — revocation is async), 'pending_revocation' if the
- * revoke was accepted and is in flight, or 'failed' if the API rejected it. Throws propagate to the
- * caller (all callers wrap in try/catch). */
+/** Revoke (DELETE) a client cert at the managed CA. Returns the resulting status: 'revoked' if the CA
+ * already reports it fully revoked (rare — revocation is async) OR the cert is already GONE (HTTP 404);
+ * 'pending_revocation' if the revoke was accepted and is in flight; or 'failed' if the API rejected it while
+ * the cert is still active. Throws propagate to the caller (all callers wrap in try/catch). */
 export async function revokeClientCert(env: Env, certId: string): Promise<RevokeResult> {
   const res = await fetch(
     `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/client_certificates/${certId}`,
     { method: 'DELETE', headers: { Authorization: `Bearer ${env.CF_CLIENT_CERT_TOKEN}` } },
   );
   reportCfAuthFailure(res, 'revoke', certId);
+  // A 404 means the cert is already GONE at the CA — SETTLED, identical to the poll path's terminal rule
+  // (getClientCertStatus maps res.status === 404 → 'not_found', and pollRetired stampRevoked's it). DELETE
+  // and poll MUST share 404 semantics because release-vs-settle feeds the reinstatement guard: settleRetired
+  // maps 'revoked' → stampRevoked but 'failed' → RELEASE the claim, and a released same-machine reservation
+  // can then be reinstated by adminMachines (the round-23 reinstatement path) onto a fingerprint whose CA
+  // cert no longer exists — locking the machine onto an unauthenticatable current cert. So 404 → 'revoked',
+  // never 'failed'. (The poll path matches only the HTTP 404, not a body error code — mirror it exactly.)
+  if (res.status === 404) return 'revoked';
   const data = (await res.json().catch(() => ({}))) as { success?: boolean; result?: { status?: string } };
   if (!data.success) return 'failed';
   return data.result?.status === 'revoked' ? 'revoked' : 'pending_revocation';
