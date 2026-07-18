@@ -146,22 +146,32 @@ Enroll flow (drive it from WSL; the CSR/signing steps are identical to POSIX abo
 `enroll-cert.sh` still mints the EC P-256 key, gets it signed, and writes the `machines`
 row). The extra Windows step is getting the signed cert+key into the store as a PFX:
 
-```
-# in WSL, after enroll-cert.sh produced $MID.client.pem / .client.key:
-openssl pkcs12 -export -inkey $MID.client.key -in $MID.client.pem \
-  -out $MID.client.pfx -passout env:AC_PFX_PW
+**Bundle the cert+key into a PFX** — in WSL/bash, after `enroll-cert.sh` produced
+`$MID.client.pem` / `.client.key`. Export the password so it stays out of argv:
 
-# hand the PFX to the Windows collector; it imports to Cert:\CurrentUser\My
-# (private key NON-exportable — the default), records the thumbprint, deletes the PFX:
-AC_PFX_PW=... agent-collector enroll --hub https://api.sessions.vza.net \
-  --machine-id amet-windows --import-pfx C:\path\to\amet-windows.client.pfx
+```bash
+export AC_PFX_PW='choose-a-transfer-password'
+openssl pkcs12 -export -inkey "$MID.client.key" -in "$MID.client.pem" \
+  -out "$MID.client.pfx" -passout env:AC_PFX_PW
+```
+
+**Import it on Windows** — in PowerShell on the host (note `$env:` assignment and the
+quoted `C:\` path; the same password you set above). The collector imports to
+`Cert:\CurrentUser\My` with the private key NON-exportable (the default), records the
+thumbprint, and deletes the PFX:
+
+```powershell
+$env:AC_PFX_PW = 'choose-a-transfer-password'
+agent-collector enroll --hub https://api.sessions.vza.net `
+  --machine-id amet-windows --import-pfx 'C:\path\to\amet-windows.client.pfx'
 ```
 
 `--import-pfx` writes an mTLS config with `client_cert_thumbprint` set (and no cert/key
 paths — the config layer rejects setting both). If the cert is already in the store, skip
 the import and pass `--client-cert-thumbprint <thumbprint>` directly. `agent-collector
 doctor` then verifies the cert is present in the store and warns if it expires within 21
-days. Keep the PFX password out of argv by exporting `AC_PFX_PW`.
+days. A password-less PFX works too — omit `AC_PFX_PW` and the import runs without
+`-Password`.
 
 ## Notes
 

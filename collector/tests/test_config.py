@@ -5,6 +5,9 @@ import pytest
 
 from agent_collector import config
 
+# A realistic 40-hex SHA-1 cert thumbprint (see test_transport.TP).
+TP = "A1B2C3D4E5F6A7B8C9D0E1F2A3B4C5D6E7F8A9B0"
+
 
 @pytest.mark.parametrize(
     "platform,proc,expected",
@@ -62,23 +65,40 @@ def test_mtls_config_rejects_no_material():
 
 def test_mtls_thumbprint_config_roundtrips(tmp_path):
     cfg = config.Config(machine_id="amet-windows", hub_url="https://h", auth="mtls",
-                        client_cert_thumbprint="ABCDEF12")
+                        client_cert_thumbprint=TP)
     path = tmp_path / "config.toml"
     config.save(cfg, path)
     loaded = config.load(path)
     assert loaded.auth == "mtls"
-    assert loaded.client_cert_thumbprint == "ABCDEF12"
+    assert loaded.client_cert_thumbprint == TP
     assert loaded.client_cert_path is None and loaded.client_key_path is None
 
 
 def test_enroll_thumbprint_writes_windows_mtls_config(tmp_path):
     path = tmp_path / "config.toml"
+    # Pass the thumbprint space-separated and lowercase (as certmgr shows it); enroll normalizes.
+    separated = " ".join(TP[i:i + 2] for i in range(0, len(TP), 2)).lower()
     cfg = config.enroll("https://api.sessions.vza.net/", dev=False, path=path,
-                        machine_id="amet-windows", client_cert_thumbprint="ab:cd ef 12")
+                        machine_id="amet-windows", client_cert_thumbprint=separated)
     assert cfg.auth == "mtls"
-    assert cfg.client_cert_thumbprint == "ABCDEF12"  # enroll normalizes
+    assert cfg.client_cert_thumbprint == TP  # enroll normalizes
     assert cfg.client_cert_path is None
-    assert 'client_cert_thumbprint = "ABCDEF12"' in path.read_text()
+    assert f'client_cert_thumbprint = "{TP}"' in path.read_text()
+
+
+def test_pfx_import_ps_omits_password_when_absent():
+    # Password-less PFX (Import-PfxCertificate docs Example 2): no -Password, no SecureString —
+    # ConvertTo-SecureString -String "" throws, so building an empty SecureString would break import.
+    ps = config._pfx_import_ps(has_password=False)
+    assert "-Password" not in ps
+    assert "ConvertTo-SecureString" not in ps
+    assert "Import-PfxCertificate" in ps and "Cert:\\CurrentUser\\My" in ps
+
+
+def test_pfx_import_ps_uses_securestring_when_present():
+    ps = config._pfx_import_ps(has_password=True)
+    assert "-Password $sec" in ps
+    assert "ConvertTo-SecureString -String $env:AC_PFX_PW" in ps
 
 
 def _write_config(path, extra=""):

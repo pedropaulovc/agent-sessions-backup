@@ -36,10 +36,18 @@ def _curl_config_quote(value: str) -> str:
 
 def normalize_thumbprint(thumbprint: str) -> str:
     """Canonicalize a cert thumbprint for the schannel store reference. Windows tools sprinkle in
-    separators (certmgr shows "ab cd ef ..", openssl uses "AB:CD:.."); strip whitespace/colons and
-    uppercase. A Windows thumbprint is the 40-hex SHA-1 of the cert; curl matches it case-insensitively,
-    but a clean canonical form keeps configs, logs, and the `--config` serialization consistent."""
-    return re.sub(r"[\s:]", "", thumbprint).upper()
+    separators (certmgr shows "ab cd ef ..", openssl uses "AB:CD:.."), and a thumbprint copied from
+    the MMC cert UI carries an invisible U+200E left-to-right mark on the first char (MS KB2023835).
+    Keep only hex digits, then require exactly 40 (a SHA-1 thumbprint) and uppercase. Anything else —
+    a mangled paste, a truncated value, an accidental SHA-256 — raises here so enrollment fails loudly
+    rather than writing a config that silently 401s on the first upload with an unfindable store entry."""
+    cleaned = re.sub(r"[^0-9a-fA-F]", "", thumbprint)
+    if len(cleaned) != 40:
+        raise ValueError(
+            f"thumbprint must be 40 hex chars (a SHA-1 cert thumbprint); got {len(cleaned)} "
+            f"after stripping non-hex from {thumbprint!r}"
+        )
+    return cleaned.upper()
 
 
 def _auth_config_directives(auth_args: list[str], q) -> list[str]:

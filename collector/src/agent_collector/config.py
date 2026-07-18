@@ -369,6 +369,28 @@ def _load_if_exists(path: Path) -> Config | None:
         return None  # unreadable/legacy config -> treat as a fresh enroll
 
 
+def _pfx_import_ps(has_password: bool) -> str:
+    """The PowerShell one-liner that imports $env:AC_PFX_PATH into Cert:\\CurrentUser\\My and prints
+    the thumbprint. With a password we build a SecureString from $env:AC_PFX_PW; without one we OMIT
+    -Password entirely — `ConvertTo-SecureString -String "" -AsPlainText -Force` throws, so passing an
+    empty SecureString would break the advertised password-less PFX path (Import-PfxCertificate docs
+    Example 2 calls it with no -Password). Factored out so both branches are unit-testable off-Windows."""
+    head = "$ErrorActionPreference='Stop'; "
+    tail = "$c.Thumbprint"
+    if has_password:
+        return (
+            head
+            + "$sec = ConvertTo-SecureString -String $env:AC_PFX_PW -AsPlainText -Force; "
+            "$c = Import-PfxCertificate -FilePath $env:AC_PFX_PATH "
+            "-CertStoreLocation Cert:\\CurrentUser\\My -Password $sec; " + tail
+        )
+    return (
+        head
+        + "$c = Import-PfxCertificate -FilePath $env:AC_PFX_PATH "
+        "-CertStoreLocation Cert:\\CurrentUser\\My; " + tail
+    )
+
+
 def _import_pfx_to_store(pfx_path: str, password: str | None) -> str:
     """Windows only: import a PFX into Cert:\\CurrentUser\\My and return its SHA-1 thumbprint. The
     private key is imported NON-exportable (Import-PfxCertificate's default) — the software-key
@@ -379,15 +401,10 @@ def _import_pfx_to_store(pfx_path: str, password: str | None) -> str:
             "--import-pfx imports into the Windows certificate store and is Windows-only; on POSIX "
             "enroll with --client-cert/--client-key (PEM) instead."
         )
-    ps = (
-        "$ErrorActionPreference='Stop'; "
-        "$sec = ConvertTo-SecureString -String $env:AC_PFX_PW -AsPlainText -Force; "
-        "$c = Import-PfxCertificate -FilePath $env:AC_PFX_PATH "
-        "-CertStoreLocation Cert:\\CurrentUser\\My -Password $sec; $c.Thumbprint"
-    )
     # Prefer an explicit password, else an already-exported AC_PFX_PW (so the secret can stay out of
-    # argv/shell history entirely), else empty for a password-less PFX.
+    # argv/shell history entirely), else none for a password-less PFX.
     pw = password if password is not None else os.environ.get("AC_PFX_PW", "")
+    ps = _pfx_import_ps(has_password=bool(pw))
     env = {**os.environ, "AC_PFX_PATH": str(Path(pfx_path).resolve()), "AC_PFX_PW": pw}
     proc = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
