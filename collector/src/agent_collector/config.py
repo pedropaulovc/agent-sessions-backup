@@ -143,6 +143,7 @@ class Config:
     # curl presents via --cert/--key. Written by infra/cf/enroll-cert.sh. Absent for dev auth.
     client_cert_path: str | None = None
     client_key_path: str | None = None
+    source: Path | None = None
     # Base dir the webcapture staging stores (WEBCAPTURE_STORES) resolve under in
     # store_roots() when a store isn't already in `stores`. None (default, and what every
     # real config uses) resolves live from webcapture_dir() — i.e. $XDG_DATA_HOME or
@@ -150,8 +151,11 @@ class Config:
     # somewhere else without touching environment variables (tests use this so a Config
     # built with only e.g. stores={"claude": ...} can never fall through to this box's real
     # webcapture staging dir, which may hold real export ZIPs).
+    # Placed LAST (not earlier, e.g. next to the other optional fields above) so a positional
+    # Config(...) construction elsewhere in the codebase can never silently shift `source`
+    # (or any other field) into this slot — every existing call site uses keyword args, and
+    # this ordering keeps a future positional mistake impossible rather than merely unlikely.
     staging_base: str | None = None
-    source: Path | None = None
 
     def __post_init__(self) -> None:
         # machine_id and each store name are single URL path segments in the files API; a '/'
