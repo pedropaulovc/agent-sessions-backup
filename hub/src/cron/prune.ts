@@ -1,4 +1,4 @@
-import { settleRetired } from '../api/certs';
+import { pollRetired } from '../api/certs';
 
 // Daily prune (runs on the `30 4 * * *` cron — see wrangler.jsonc triggers).
 //
@@ -41,12 +41,14 @@ export async function runPrune(env: Env, nowMs: number = Date.now()): Promise<vo
  * ONLY the grace window). The move + clear co-commit in one db.batch, guarded on the exact window we
  * selected, so a renew that repopulated a FRESH window between the SELECT and here is left intact.
  *
- * Phase 2 — drain the queue: every still-reserved entry (revoked_at IS NULL) with a known cert_id is
- * revoked at the CA and stamped revoked_at (the row is kept as an audit trail); its fingerprint then
- * returns to the reusable pool. An unknown-id entry (pre-M4/enroll cert, CA id never recorded) can't
- * be revoked here — it stays reserved and is logged for manual cleanup. This is CA-side cleanup, not
- * a security boundary: machineIdentity already stops honoring a fingerprint the instant it leaves the
- * current/in-grace-prev slots, so a reserved-but-unrevoked cert never authenticates. */
+ * Phase 2 — drain the queue: poll every still-reserved entry (revoked_at IS NULL) with a known
+ * cert_id. Cloudflare's revoke is ASYNCHRONOUS (DELETE → 'pending_revocation' → 'revoked'), so we
+ * stamp revoked_at — freeing the fingerprint for reuse — ONLY once the CA reports the cert actually
+ * 'revoked' (or 404). A cert still pending stays reserved and is re-polled next run; one that never
+ * got revoked gets a fresh revoke attempt. An unknown-id entry (pre-M4/enroll cert, CA id never
+ * recorded) can't be revoked here — it stays reserved and is logged for manual cleanup. This is
+ * CA-side cleanup, not a security boundary: machineIdentity already stops honoring a fingerprint the
+ * instant it leaves the current/in-grace-prev slots, so a reserved-but-unrevoked cert never authns. */
 export async function runDailyPrune(env: Env): Promise<void> {
   const due = await env.DB.prepare(
     `SELECT machine_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at FROM machines
@@ -86,7 +88,8 @@ export async function runDailyPrune(env: Env): Promise<void> {
       console.log(JSON.stringify({ event: 'hub.prune.unknown_id_reservation', machine: r.machine_id, fingerprint: r.fingerprint }));
       continue;
     }
-    const revoked = await settleRetired(env, r.cert_id);
-    if (!revoked) console.log(JSON.stringify({ event: 'hub.prune.revoke_failed', machine: r.machine_id, cert_id: r.cert_id }));
+    const outcome = await pollRetired(env, r.cert_id);
+    if (outcome === 'pending') console.log(JSON.stringify({ event: 'hub.prune.revoke_pending', machine: r.machine_id, cert_id: r.cert_id }));
+    else if (outcome === 'failed') console.log(JSON.stringify({ event: 'hub.prune.revoke_failed', machine: r.machine_id, cert_id: r.cert_id }));
   }
 }

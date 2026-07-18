@@ -1,6 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
-import { retireCert } from './certs';
+import { queueRetiredIfDisplaced, settleRetired } from './certs';
 import { normalizeToBound } from './sessions';
 
 /** POST /api/v1/heartbeat */
@@ -149,45 +149,54 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     const prevId = fpChanged ? null : existing?.prev_cert_id ?? null;
     const revokeAt = fpChanged ? null : existing?.cert_revoke_at ?? null;
 
+    // On a fingerprint change, the swap displaces the old current out of its slot — and, unless we're
+    // reinstating it as current (rollback), the old prev too. Each displaced cert must be reserved in
+    // retired_certs so a still-CA-valid fingerprint can't be reclaimed by another machine. Reserve
+    // the OLD CURRENT whenever it exists, UNCONDITIONALLY on its cert_id: a NULL id is a pre-M4 cert
+    // whose CA cert may still be valid, NOT a revoked one — dropping it untracked is the exact bug.
+    const displaced: Array<{ fp: string; id: string | null }> = [];
+    if (fpChanged && existing?.cert_fp_sha256) displaced.push({ fp: existing.cert_fp_sha256, id: existing.cert_id });
+    if (fpChanged && existing?.prev_cert_fp_sha256 && existing.prev_cert_fp_sha256 !== certFp) {
+      displaced.push({ fp: existing.prev_cert_fp_sha256, id: existing.prev_cert_id });
+    }
+
     // CAS on the current fingerprint we just observed. If a renew rotated the cert between our read
     // and this write, the DO UPDATE WHERE no longer matches (changes === 0) and we 409 rather than
     // clobber the renewed chain. IS (not =) so a NULL observed fp matches a still-NULL current one.
+    // The retirement INSERTs run in the SAME db.batch as the swap, each guarded on the swap having
+    // landed (current is now certFp) — so a lost/interrupted retire can't strand a displaced cert,
+    // and a CAS miss queues nothing.
     const observedFp = existing?.cert_fp_sha256 ?? null;
-    let res;
+    const swap = env.DB.prepare(
+      `INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, key_protection, is_admin, priority, cert_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+       ON CONFLICT (machine_id) DO UPDATE SET
+         os = ?2, hostname = ?3, cert_fp_sha256 = ?4, key_protection = ?5, is_admin = ?6, priority = ?7,
+         cert_id = ?8, prev_cert_fp_sha256 = ?9, prev_cert_id = ?10, cert_revoke_at = ?11
+       WHERE machines.cert_fp_sha256 IS ?12`,
+    ).bind(body.machine_id, os, hostname, certFp, keyProtection, isAdmin, priority, certId, prevFp, prevId, revokeAt, observedFp);
+    const stmts = [swap, ...displaced.map((d) => queueRetiredIfDisplaced(env, d.fp, d.id, body.machine_id!, certFp!))];
+
+    let results;
     try {
-      res = await env.DB.prepare(
-        `INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, key_protection, is_admin, priority, cert_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-         ON CONFLICT (machine_id) DO UPDATE SET
-           os = ?2, hostname = ?3, cert_fp_sha256 = ?4, key_protection = ?5, is_admin = ?6, priority = ?7,
-           cert_id = ?8, prev_cert_fp_sha256 = ?9, prev_cert_id = ?10, cert_revoke_at = ?11
-         WHERE machines.cert_fp_sha256 IS ?12`,
-      )
-        .bind(body.machine_id, os, hostname, certFp, keyProtection, isAdmin, priority, certId, prevFp, prevId, revokeAt, observedFp)
-        .run();
+      results = await env.DB.batch(stmts);
     } catch (e) {
       // cert_fp_sha256 is UNIQUE — a concurrent write could still race the pre-check above. Surface
       // a 409 rather than a bare 500 so the admin caller sees it's a duplicate, not a hub fault.
       return Response.json({ error: 'machine_upsert_conflict', detail: String(e) }, { status: 409 });
     }
     // A genuinely fresh insert reports changes === 1; changes === 0 means the ON CONFLICT DO UPDATE
-    // ran but its CAS WHERE didn't match, so nothing was written. That covers BOTH a cert rotating
-    // under an existing row AND the first-insert race — the loser read existing as null, hit ON
-    // CONFLICT after the winner inserted, and its `cert_fp_sha256 IS NULL` CAS missed. Either way the
-    // requested cert was NOT installed, so 409 unconditionally rather than a silent 200.
-    if (res.meta.changes === 0) {
+    // ran but its CAS WHERE didn't match, so nothing was written (a cert rotated under an existing
+    // row, or the first-insert race loser hit ON CONFLICT after the winner inserted). Either way the
+    // requested cert was NOT installed — 409, and the guarded retire INSERTs queued nothing.
+    if ((results[0]!.meta.changes ?? 0) === 0) {
       return Response.json({ error: 'concurrent_rotation', machine_id: body.machine_id }, { status: 409 });
     }
-    if (fpChanged && existing && (existing.cert_id || existing.prev_cert_fp_sha256)) {
-      console.log(JSON.stringify({ event: 'hub.admin.machines.rotation_reset', machine: body.machine_id, dropped_cert_id: existing.cert_id, dropped_prev_cert_id: existing.prev_cert_id }));
-      // The swap cleared the old current + prev out of the row's slots. Move each displaced cert into
-      // the retired_certs queue (reserved + best-effort revoked) so a still-CA-valid fingerprint is
-      // never dropped and reclaimable by another machine. The old current is always displaced (fp
-      // changed). The old prev is displaced UNLESS we just reinstated it as current (rollback).
-      if (existing.cert_fp_sha256) await retireCert(env, existing.cert_fp_sha256, existing.cert_id, body.machine_id);
-      if (existing.prev_cert_fp_sha256 && existing.prev_cert_fp_sha256 !== certFp) {
-        await retireCert(env, existing.prev_cert_fp_sha256, existing.prev_cert_id, body.machine_id);
-      }
+    if (displaced.length > 0) {
+      console.log(JSON.stringify({ event: 'hub.admin.machines.rotation_reset', machine: body.machine_id, displaced: displaced.map((d) => d.id) }));
+      // The reservations are committed; now best-effort INITIATE revocation (async — the prune polls
+      // each to 'revoked'). A failure here just leaves it reserved for the prune to retry.
+      for (const d of displaced) await settleRetired(env, d.id);
     }
     console.log(JSON.stringify({ event: 'hub.admin.machine_upsert', machine: body.machine_id, is_admin: isAdmin }));
   }

@@ -271,7 +271,9 @@ describe('POST /api/v1/certs/renew', () => {
     const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('renew-dberr', false, 'dberr-A'));
     spy.mockRestore();
     expect(res.status).toBe(500);
-    expect(deletes).toContain('cert-dberr-B'); // signed cert revoked, not left untracked at the CA
+    expect(deletes).toContain('cert-dberr-B'); // signed cert revoke initiated, not left untracked
+    // Async revoke returns pending -> the cert is queued so the prune drives it to revoked.
+    expect((await retired(await certFingerprint(fakeCertPem('dberr-B'))))?.cert_id).toBe('cert-dberr-B');
     expect((await row('renew-dberr'))?.cert_fp_sha256).toBe('dberr-A'); // row unchanged
   });
 
@@ -287,13 +289,16 @@ describe('POST /api/v1/certs/renew', () => {
     expect(r?.cert_fp_sha256).toBe(await certFingerprint(fakeCertPem('l2-D'))); // latest successor
   });
 
-  it('409s a recovery whose grace window has already closed, revoking the just-signed orphan', async () => {
+  it('409s a recovery whose grace window has already closed, queuing + revoking the just-signed orphan', async () => {
     await seedMachine('renew-expired', { fp: 're-B', certId: 'cert-re-B', prevFp: 're-A', prevCertId: 'cert-re-A', revokeAt: '2000-01-01T00:00:00.000Z' });
     const { deletes } = stubSignAndRevoke([{ seed: 're-C', id: 'cert-re-C' }]);
+    const fpReC = await certFingerprint(fakeCertPem('re-C'));
     // Construct the identity directly on the expired prev fp (machineIdentity would deny it).
     const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('renew-expired', false, 're-A'));
     expect(res.status).toBe(409);
-    expect(deletes).toContain('cert-re-C'); // orphan revoked
+    expect(deletes).toContain('cert-re-C'); // orphan revoke initiated
+    // The minted orphan is QUEUED (async revoke -> stub returns pending), never left untracked.
+    expect((await retired(fpReC))?.cert_id).toBe('cert-re-C');
     expect((await row('renew-expired'))?.cert_fp_sha256).toBe('re-B'); // unchanged
   });
 
@@ -448,16 +453,32 @@ describe('POST /api/v1/admin/machines', () => {
 
   it('an admin cert swap reserves BOTH the displaced current and prev in the queue', async () => {
     // fp swap to a brand-new cert: old current AND old prev leave the row's slots. Both must be
-    // reserved+revoked in the queue, or another machine could claim a still-CA-valid fingerprint.
+    // reserved in the queue, or another machine could claim a still-CA-valid fingerprint. (The revoke
+    // is async — the stub returns pending_revocation — so revoked_at stays NULL until a prune poll.)
     await seedMachine('am-swap', { fp: 'swap-cur', certId: 'cert-swap-cur', prevFp: 'swap-prev', prevCertId: 'cert-swap-prev', revokeAt: '2999-01-01T00:00:00.000Z' });
     const res = await adminMachines(reqJson({ machine_id: 'am-swap', cert_fp_sha256: 'swap-new', cert_id: 'cert-swap-new' }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(200);
     const r = await row('am-swap');
     expect(r?.cert_fp_sha256).toBe('swap-new');
     expect(r?.prev_cert_fp_sha256).toBeNull(); // grace window cleared
-    // Both displaced certs are queued and (fetch stub says revoke succeeded) stamped revoked.
-    expect((await retired('swap-cur'))?.revoked_at).not.toBeNull();
-    expect((await retired('swap-prev'))?.revoked_at).not.toBeNull();
+    expect((await retired('swap-cur'))?.cert_id).toBe('cert-swap-cur'); // reserved
+    expect((await retired('swap-prev'))?.cert_id).toBe('cert-swap-prev'); // reserved
+  });
+
+  it('reserves a NULL-id (pre-M4) current cert on an admin swap — unknown id is not treated as revoked', async () => {
+    // Helper-enrolled row: cert_fp set, cert_id NULL, no prev. Swapping its fp must still queue the
+    // old current, or a possibly-still-CA-valid legacy cert is dropped untracked and reclaimable.
+    await seedMachine('am-nullid', { fp: 'nullid-old' }); // certId + prev omitted -> NULL
+    const res = await adminMachines(reqJson({ machine_id: 'am-nullid', cert_fp_sha256: 'nullid-new', cert_id: 'cert-nullid-new' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(200);
+    expect((await row('am-nullid'))?.cert_fp_sha256).toBe('nullid-new');
+    const q = await retired('nullid-old');
+    expect(q).not.toBeNull(); // queued despite the NULL id
+    expect(q?.cert_id).toBeNull();
+    expect(q?.revoked_at).toBeNull(); // unknown id -> reserved forever (until manual cleanup)
+    // and it stays unclaimable by another machine
+    const clash = await adminMachines(reqJson({ machine_id: 'am-nullid-other', cert_fp_sha256: 'nullid-old' }), testEnv, machine('am-admin', true));
+    expect(clash.status).toBe(409);
   });
 
   it('rolling back to the in-grace prev fp carries its cert id and queues only the displaced old current', async () => {
@@ -578,6 +599,8 @@ describe('POST /api/v1/admin/machines', () => {
     expect(res.status).toBe(409);
     expect(((await res.json()) as { error: string }).error).toBe('concurrent_rotation');
     expect((await row('cas-race'))?.cert_fp_sha256).toBe('cas-B'); // renewed cert survived
+    // CAS miss => the guarded retirement INSERTs in the same batch queued nothing.
+    expect(await retired('cas-A')).toBeNull();
   });
 });
 
@@ -590,53 +613,79 @@ describe('daily prune (cert revoke)', () => {
     await testEnv.DB.prepare('DELETE FROM retired_certs').run();
   });
 
-  function stubDelete(success: boolean) {
-    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      expect(init?.method).toBe('DELETE');
-      expect(String(input)).toContain('/client_certificates/');
-      return new Response(JSON.stringify({ success }), { status: 200 });
-    });
-    vi.stubGlobal('fetch', fetchMock);
-    return fetchMock;
+  // Models the CF managed-CA cert lifecycle: GET returns the cert's current status (404 if absent);
+  // DELETE moves it to `deleteTo` (default the realistic async 'pending_revocation'). Records calls.
+  function stubCa(state: Record<string, string | undefined>, opts: { deleteTo?: 'revoked' | 'pending_revocation' | 'fail' } = {}) {
+    const calls: Array<{ method: string; id: string }> = [];
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const id = String(input).split('/').pop()!;
+        const method = init?.method ?? 'GET';
+        calls.push({ method, id });
+        if (method === 'DELETE') {
+          if (opts.deleteTo === 'fail') return new Response(JSON.stringify({ success: false }), { status: 200 });
+          const s = opts.deleteTo ?? 'pending_revocation';
+          state[id] = s;
+          return new Response(JSON.stringify({ success: true, result: { status: s } }), { status: 200 });
+        }
+        const st = state[id];
+        if (!st) return new Response(JSON.stringify({ success: false }), { status: 404 });
+        return new Response(JSON.stringify({ success: true, result: { status: st } }), { status: 200 });
+      }),
+    );
+    return { calls };
   }
 
-  it('moves a due grace window into the queue, revokes it at the CA, and stamps revoked_at', async () => {
+  it('moves a due grace window into the queue and settles it when the CA reports revoked', async () => {
     await seedMachine('prune-1', { fp: 'cur1', prevFp: 'old1', prevCertId: 'cert-old-1', revokeAt: '2000-01-01T00:00:00.000Z' });
-    const fetchMock = stubDelete(true);
+    const { calls } = stubCa({ 'cert-old-1': 'active' }, { deleteTo: 'revoked' });
     await runDailyPrune(cfEnv);
-    expect(fetchMock).toHaveBeenCalledTimes(1);
-    expect(String(fetchMock.mock.calls[0]![0])).toContain('/client_certificates/cert-old-1');
+    expect(calls.some((c) => c.method === 'DELETE' && c.id === 'cert-old-1')).toBe(true); // revoke issued
     const r = await row('prune-1');
     expect(r?.prev_cert_fp_sha256).toBeNull(); // grace slot cleared — reservation lives in the queue
     expect(r?.prev_cert_id).toBeNull();
     expect(r?.cert_revoke_at).toBeNull();
     expect(r?.cert_fp_sha256).toBe('cur1'); // current cert untouched
-    expect((await retired('old1'))?.revoked_at).not.toBeNull(); // revoked + stamped
+    expect((await retired('old1'))?.revoked_at).not.toBeNull(); // CA reported revoked -> settled first pass
   });
 
-  it('a failed revoke keeps the entry reserved in the queue (retries next run), grace slot still cleared', async () => {
+  it('keeps a pending-revocation entry reserved until the CA confirms revoked (async revocation)', async () => {
     await seedMachine('prune-2', { fp: 'cur2', prevFp: 'old2', prevCertId: 'cert-old-2', revokeAt: '2000-01-01T00:00:00.000Z' });
-    stubDelete(false);
+    stubCa({ 'cert-old-2': 'active' }, { deleteTo: 'pending_revocation' });
     await runDailyPrune(cfEnv);
     const r = await row('prune-2');
     expect(r?.prev_cert_fp_sha256).toBeNull(); // moved out of the grace slot into the queue
     const q = await retired('old2');
     expect(q?.cert_id).toBe('cert-old-2');
-    expect(q?.revoked_at).toBeNull(); // revoke failed -> still reserved, drained next run
+    expect(q?.revoked_at).toBeNull(); // pending_revocation -> still reserved, NOT freed yet
+  });
+
+  it('re-polls a pending reservation and settles it once the CA reports revoked', async () => {
+    // A cert retired + DELETE'd on a prior run sits pending_revocation at the CA.
+    await testEnv.DB.prepare(
+      "INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('poll-fp', 'poll-id', 'poll-m', '2000-01-01T00:00:00.000Z')",
+    ).run();
+    const state: Record<string, string | undefined> = { 'poll-id': 'pending_revocation' };
+    stubCa(state);
+    await runDailyPrune(cfEnv);
+    expect((await retired('poll-fp'))?.revoked_at).toBeNull(); // still pending -> reserved
+    state['poll-id'] = 'revoked'; // CA finishes the async revocation
+    await runDailyPrune(cfEnv);
+    expect((await retired('poll-fp'))?.revoked_at).not.toBeNull(); // next poll settles it
   });
 
   it('leaves a not-yet-due grace window alone (no CA call)', async () => {
     await seedMachine('prune-3', { fp: 'cur3', prevFp: 'old3', prevCertId: 'cert-old-3', revokeAt: '2999-01-01T00:00:00.000Z' });
-    const fetchMock = vi.fn();
-    vi.stubGlobal('fetch', fetchMock);
+    const { calls } = stubCa({});
     await runDailyPrune(cfEnv);
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(calls.length).toBe(0);
     expect((await row('prune-3'))?.prev_cert_fp_sha256).toBe('old3');
   });
 
   it('a renew repopulating a fresh window between select and batch survives (guarded move no-ops)', async () => {
     await seedMachine('prune-race', { fp: 'pr-cur', prevFp: 'pr-old', prevCertId: 'pr-cert-old', revokeAt: '2000-01-01T00:00:00.000Z' });
-    stubDelete(true);
+    stubCa({});
     // Wrap the "due" SELECT so that right after it returns the OLD window, a concurrent renew lands a
     // FRESH one. The batch's move+clear is keyed on the OLD prev fp + revoke_at, so it no-ops and the
     // fresh window survives — nothing is retired for the stale window.
@@ -664,10 +713,9 @@ describe('daily prune (cert revoke)', () => {
 
   it('moves a NULL-id (pre-M4) prev into the queue as an unknown-id reservation, keeping the fp reserved', async () => {
     await seedMachine('prune-4', { fp: 'cur4', prevFp: 'old4', prevCertId: undefined, revokeAt: '2000-01-01T00:00:00.000Z' });
-    const fetchMock = vi.fn();
-    vi.stubGlobal('fetch', fetchMock);
+    const { calls } = stubCa({});
     await runDailyPrune(cfEnv);
-    expect(fetchMock).not.toHaveBeenCalled(); // unknown id -> nothing to revoke at the CA
+    expect(calls.length).toBe(0); // unknown id -> no CA call at all (can't GET or DELETE it)
     const r = await row('prune-4');
     expect(r?.prev_cert_fp_sha256).toBeNull(); // moved out of the grace slot
     const q = await retired('old4');
@@ -680,7 +728,7 @@ describe('daily prune (cert revoke)', () => {
 
   it('a confirmed CA revoke frees the fingerprint for reuse by another machine', async () => {
     await seedMachine('prune-free', { fp: 'pf-cur', prevFp: 'pf-old', prevCertId: 'pf-cert-old', revokeAt: '2000-01-01T00:00:00.000Z' });
-    stubDelete(true);
+    stubCa({ 'pf-cert-old': 'active' }, { deleteTo: 'revoked' });
     await runDailyPrune(cfEnv);
     expect((await row('prune-free'))?.prev_cert_fp_sha256).toBeNull(); // grace slot cleared
     expect((await retired('pf-old'))?.revoked_at).not.toBeNull(); // revoked + stamped in the queue

@@ -38,16 +38,51 @@ async function signClientCert(env: Env, csr: string): Promise<SignedCert> {
   return data.result;
 }
 
-/** Revoke a previously-issued client cert at the managed CA (DELETE = revoke). Returns whether
- * Cloudflare reported success — the prune cron only clears the rotation columns on `true`, so a
- * transient failure retries next run. */
-export async function revokeClientCert(env: Env, certId: string): Promise<boolean> {
+// Cloudflare's managed-CA client cert lifecycle. A DELETE (revoke) is ASYNCHRONOUS: it moves the
+// cert to 'pending_revocation' and only later to 'revoked'. During that window the old cert can
+// still pass mTLS, so a fingerprint is safe to reuse ONLY once the cert reports 'revoked' (or 404).
+type CertStatus = 'active' | 'pending_reactivation' | 'pending_revocation' | 'revoked';
+type RevokeResult = 'revoked' | 'pending_revocation' | 'failed';
+
+/** Revoke (DELETE) a client cert at the managed CA. Returns the resulting status: 'revoked' if the
+ * CA already reports it fully revoked (rare — revocation is async), 'pending_revocation' if the
+ * revoke was accepted and is in flight, or 'failed' if the API rejected it. Throws propagate to the
+ * caller (all callers wrap in try/catch). */
+export async function revokeClientCert(env: Env, certId: string): Promise<RevokeResult> {
   const res = await fetch(
     `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/client_certificates/${certId}`,
     { method: 'DELETE', headers: { Authorization: `Bearer ${env.CF_CLIENT_CERT_TOKEN}` } },
   );
-  const data = (await res.json().catch(() => ({}))) as { success?: boolean };
-  return data.success === true;
+  const data = (await res.json().catch(() => ({}))) as { success?: boolean; result?: { status?: string } };
+  if (!data.success) return 'failed';
+  return data.result?.status === 'revoked' ? 'revoked' : 'pending_revocation';
+}
+
+/** GET a client cert's current CA status. 404 → 'not_found' (already gone); any error or unparseable
+ * body → 'unknown' (retry next run rather than assume a state). */
+async function getClientCertStatus(env: Env, certId: string): Promise<CertStatus | 'not_found' | 'unknown'> {
+  let res: Response;
+  try {
+    res = await fetch(
+      `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/client_certificates/${certId}`,
+      { headers: { Authorization: `Bearer ${env.CF_CLIENT_CERT_TOKEN}` } },
+    );
+  } catch (e) {
+    console.log(JSON.stringify({ event: 'hub.certs.status_error', cert_id: certId, error: String(e) }));
+    return 'unknown';
+  }
+  if (res.status === 404) return 'not_found';
+  const data = (await res.json().catch(() => ({}))) as { success?: boolean; result?: { status?: CertStatus } };
+  if (!data.success || !data.result?.status) return 'unknown';
+  return data.result.status;
+}
+
+/** Stamp a queued cert as revoked (returns its fingerprint to the reusable pool; the row is kept as
+ * an audit trail). */
+async function stampRevoked(env: Env, certId: string): Promise<void> {
+  await env.DB.prepare('UPDATE retired_certs SET revoked_at = ?1 WHERE cert_id = ?2 AND revoked_at IS NULL')
+    .bind(new Date().toISOString(), certId)
+    .run();
 }
 
 /** SQL fragment + binds that INSERT a displaced cert into the retired_certs queue, but ONLY if the
@@ -70,35 +105,52 @@ export async function retireCert(env: Env, fingerprint: string, certId: string |
   await settleRetired(env, certId);
 }
 
-/** Best-effort revoke a queued cert at the CA and stamp revoked_at on success; on failure or an
- * unknown (NULL) id the row stays reserved (revoked_at NULL) for the prune to retry. Returns whether
- * it is now revoked. */
-export async function settleRetired(env: Env, certId: string | null): Promise<boolean> {
-  if (!certId) return false; // unknown id — nothing to revoke; stays reserved
-  let revoked = false;
+/** Best-effort INITIATE revocation of a queued cert. Because revocation is async, a successful
+ * DELETE usually returns 'pending_revocation' — we stamp revoked_at ONLY on a full 'revoked', so the
+ * row otherwise stays reserved until a later prune poll confirms it. Returns the revoke result. */
+export async function settleRetired(env: Env, certId: string | null): Promise<RevokeResult> {
+  if (!certId) return 'failed'; // unknown id — nothing to revoke; stays reserved
+  let result: RevokeResult;
   try {
-    revoked = await revokeClientCert(env, certId);
+    result = await revokeClientCert(env, certId);
   } catch (e) {
     console.log(JSON.stringify({ event: 'hub.certs.retire_revoke_error', cert_id: certId, error: String(e) }));
+    return 'failed';
   }
-  if (!revoked) return false;
-  await env.DB.prepare('UPDATE retired_certs SET revoked_at = ?1 WHERE cert_id = ?2 AND revoked_at IS NULL')
-    .bind(new Date().toISOString(), certId)
-    .run();
-  return true;
+  if (result === 'revoked') await stampRevoked(env, certId);
+  return result;
+}
+
+/** Poll a reserved cert and advance it toward settled. Stamps revoked_at once the CA reports the
+ * cert 'revoked' (or 404 — already gone). A cert still 'pending_revocation' stays reserved (re-polled
+ * next run). One that never actually got revoked ('active'/'pending_reactivation') gets a fresh
+ * revoke attempt. Used by the prune drain. */
+export async function pollRetired(env: Env, certId: string): Promise<'revoked' | 'pending' | 'failed'> {
+  const status = await getClientCertStatus(env, certId);
+  if (status === 'revoked' || status === 'not_found') {
+    await stampRevoked(env, certId);
+    return 'revoked';
+  }
+  if (status === 'pending_revocation') return 'pending';
+  if (status === 'active' || status === 'pending_reactivation') {
+    const r = await settleRetired(env, certId);
+    return r === 'revoked' ? 'revoked' : r === 'pending_revocation' ? 'pending' : 'failed';
+  }
+  return 'failed'; // 'unknown' — a GET error; retry next run without guessing
 }
 
 /** A D1 write failed AFTER the CA signed a successor — the cert is live but not recorded in any
- * machines-row slot. Best-effort revoke it; if that also fails, queue it so it is never an untracked
- * live cert (worst case: at least its id is logged for manual cleanup). */
+ * machines-row slot. Best-effort revoke it; unless the CA already reports it fully 'revoked', queue
+ * it so it is never an untracked live cert and the prune drives it to completion. */
 async function reclaimSignedOrphan(env: Env, fingerprint: string, certId: string, machineId: string): Promise<void> {
-  let revoked = false;
+  let result: RevokeResult;
   try {
-    revoked = await revokeClientCert(env, certId);
+    result = await revokeClientCert(env, certId);
   } catch (e) {
     console.log(JSON.stringify({ event: 'hub.certs.orphan_revoke_failed', machine: machineId, cert_id: certId, error: String(e) }));
+    result = 'failed';
   }
-  if (revoked) return;
+  if (result === 'revoked') return; // fully gone at the CA — nothing left to track
   try {
     await env.DB.prepare('INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES (?1, ?2, ?3, ?4)')
       .bind(fingerprint, certId, machineId, new Date().toISOString())
@@ -204,14 +256,10 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
 
   if (changes === 0) {
     // Normal path: a competing rotation advanced current. Recovery path: the grace window closed or
-    // the row moved under us. Either way the cert we just minted is an orphan — best-effort revoke
-    // it so it doesn't linger at the CA (else it ages out at 1-year validity). Never let a revoke
-    // failure mask the 409.
-    try {
-      await revokeClientCert(env, signed.id);
-    } catch (e) {
-      console.log(JSON.stringify({ event: 'hub.certs.orphan_revoke_failed', machine: identity.machineId, cert_id: signed.id, error: String(e) }));
-    }
+    // the row moved under us. Either way the cert we just minted is an orphan. Queue it and settle —
+    // because revocation is async, a bare best-effort DELETE that returns 'pending_revocation' (or
+    // fails) would leave a live cert untracked; the queue makes the prune drive it to 'revoked'.
+    await retireCert(env, newFp, signed.id, identity.machineId);
     return Response.json({ error: 'renew_conflict' }, { status: 409 });
   }
 
