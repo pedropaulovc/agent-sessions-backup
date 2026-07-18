@@ -367,8 +367,21 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
     ? { fp: cur?.prev_cert_fp_sha256 ?? null, id: cur?.prev_cert_id ?? null }
     : { fp: cur?.cert_fp_sha256 ?? null, id: cur?.cert_id ?? null };
 
+  // RECOVERY (installing a successor over the orphaned old current, authed on the in-grace prev) is only
+  // legitimate when BOTH still hold at pre-sign-read time: the caller resolved on the GRACE slot, AND its
+  // authenticating fp is STILL this row's prev. Two races otherwise slip a stale cert in as current:
+  //  - renew-vs-renew: the loser authed on the CURRENT cert (certSlot 'current'); the winner committed
+  //    before our read, so onCurrent is now false — but that's a 409, NOT a lost-response recovery. The
+  //    certSlot gate keeps it out; on retry it resolves as grace and recovers legitimately IFF the response
+  //    was truly lost.
+  //  - recovery-vs-renewal: a concurrent current-cert renewal rotated our fp OUT of the prev slot between
+  //    machineIdentity and this read; requiring cur.prev_cert_fp_sha256 === our authenticating fp rejects
+  //    the now-stale caller instead of installing it over the legit new current.
+  // Both conditions are then pinned for the write by the full rotationCas below.
+  const isRecovery = !onCurrent && identity.certSlot === 'grace' && (cur?.prev_cert_fp_sha256 ?? null) === authFp;
+
   let changes = 0;
-  let effectiveRevokeAt: string | null;
+  let effectiveRevokeAt: string | null = null;
   try {
     if (onCurrent) {
       // NORMAL rotation: authenticated on the CURRENT cert. Retire it into a fresh grace window.
@@ -395,7 +408,7 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
       if (displaced.fp) stmts.push(queueRetiredIfDisplaced(env, displaced.fp, displaced.id, identity.machineId, postSwap));
       const results = await env.DB.batch(stmts);
       changes = results[0]!.meta.changes ?? 0;
-    } else {
+    } else if (isRecovery) {
       // RECOVERY: authenticated on the IN-GRACE PREVIOUS cert. The successor from an earlier renewal
       // was never installed (lost response), so the machine is stuck holding the old cert and would
       // otherwise die at cert_revoke_at with no path forward. Replace the orphaned successor (the
@@ -419,6 +432,12 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
       if (displaced.fp) stmts.push(queueRetiredIfDisplaced(env, displaced.fp, displaced.id, identity.machineId, postSwap));
       const results = await env.DB.batch(stmts);
       changes = results[0]!.meta.changes ?? 0;
+    } else {
+      // Neither a current-cert rotation nor a legitimate grace recovery: the row moved under our pre-sign
+      // read (a renew-vs-renew loser whose fp already rotated into prev, or a grace caller whose fp was
+      // displaced out of prev by a concurrent renewal). Do NOT install a successor over it — leave
+      // changes = 0 so the minted cert is reclaimed and we 409; the retry re-reads reality.
+      changes = 0;
     }
   } catch (e) {
     // The CA already signed the successor but the D1 write threw (outage, constraint, lock). Without
@@ -441,7 +460,7 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
   // it immediately and stamp revoked_at. On failure it stays reserved for the daily prune to retry.
   if (displaced.fp) await settleRetired(env, displaced.id);
 
-  console.log(JSON.stringify({ event: 'hub.certs.renewed', machine: identity.machineId, recovery: !onCurrent, revoke_at: effectiveRevokeAt }));
+  console.log(JSON.stringify({ event: 'hub.certs.renewed', machine: identity.machineId, recovery: isRecovery, revoke_at: effectiveRevokeAt }));
   return Response.json({
     ok: true,
     certificate: signed.certificate,

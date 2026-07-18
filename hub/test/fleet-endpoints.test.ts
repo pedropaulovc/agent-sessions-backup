@@ -576,6 +576,50 @@ describe('POST /api/v1/certs/renew', () => {
     expect((await row('nonadm-grace'))?.cert_fp_sha256).toBe(await certFingerprint(fakeCertPem('ng-new')));
   });
 
+  it('renew-vs-renew loser (current slot, fp already rotated to prev) 409s instead of recovering', async () => {
+    // The loser authed on the CURRENT cert (certSlot 'current'); the winner committed before the loser's
+    // pre-sign read, so the loser's fp is now the row's PREV with an open grace window. Without the certSlot
+    // gate the loser would take the recovery branch, install a 2nd successor, and queue the winner's fresh
+    // cert — locking out the collector that installed the winner. The gate makes it a 409.
+    await seedMachine('rvr-loser', { fp: 'winner-fp', certId: 'winner-id', prevFp: 'loser-fp', prevCertId: 'loser-id', revokeAt: '2999-01-01T00:00:00.000Z' });
+    vi.stubGlobal('fetch', vi.fn(async (_i: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return new Response(JSON.stringify({ success: true, result: { status: 'pending_revocation' } }), { status: 200 });
+      return new Response(JSON.stringify({ success: true, result: { id: 'rvr-new-id', certificate: fakeCertPem('rvr-new'), expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('rvr-loser', false, 'loser-fp', 'current'));
+    expect(res.status).toBe(409);
+    expect((await row('rvr-loser'))?.cert_fp_sha256).toBe('winner-fp'); // winner's cert intact, NOT replaced
+    expect(await retired('winner-fp')).toBeNull(); // winner's cert was NOT queued for revoke
+    expect(await retired(await certFingerprint(fakeCertPem('rvr-new')))).not.toBeNull(); // loser's successor reclaimed
+  });
+
+  it('recovery-vs-renewal: a grace caller displaced out of the prev slot 409s (stale cert not installed)', async () => {
+    // The grace caller's fp was rotated OUT of prev by a concurrent current renewal before the pre-sign
+    // read. Requiring cur.prev_cert_fp_sha256 === identity.certFp rejects the now-stale caller instead of
+    // installing its successor over the legit new current.
+    await seedMachine('rvn', { fp: 'legit-new-cur', certId: 'legit-new-id', prevFp: 'other-prev', prevCertId: 'other-prev-id', revokeAt: '2999-01-01T00:00:00.000Z' });
+    vi.stubGlobal('fetch', vi.fn(async (_i: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return new Response(JSON.stringify({ success: true, result: { status: 'pending_revocation' } }), { status: 200 });
+      return new Response(JSON.stringify({ success: true, result: { id: 'rvn-new-id', certificate: fakeCertPem('rvn-new'), expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('rvn', false, 'stale-fp', 'grace'));
+    expect(res.status).toBe(409);
+    expect((await row('rvn'))?.cert_fp_sha256).toBe('legit-new-cur'); // legit current untouched
+  });
+
+  it('positive control: a legit grace recovery (fp still the row prev) installs the successor', async () => {
+    await seedMachine('rec-ok', { fp: 'orphan-succ', certId: 'orphan-succ-id', prevFp: 'rec-prev', prevCertId: 'rec-prev-id', revokeAt: '2999-01-01T00:00:00.000Z' });
+    vi.stubGlobal('fetch', vi.fn(async (_i: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return new Response(JSON.stringify({ success: true, result: { status: 'pending_revocation' } }), { status: 200 });
+      return new Response(JSON.stringify({ success: true, result: { id: 'rec-new-id', certificate: fakeCertPem('rec-new'), expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('rec-ok', false, 'rec-prev', 'grace'));
+    expect(res.status).toBe(200);
+    const r = await row('rec-ok');
+    expect(r?.cert_fp_sha256).toBe(await certFingerprint(fakeCertPem('rec-new'))); // successor installed
+    expect(r?.prev_cert_fp_sha256).toBe('rec-prev'); // recovery leaves the grace prev untouched
+  });
+
   type LogEvent = { event?: string; result?: string; cert_id?: string };
   const renewLogEvents = (logs: ReturnType<typeof vi.spyOn>): LogEvent[] =>
     logs.mock.calls.map((c: unknown[]) => { try { return JSON.parse(c[0] as string) as LogEvent; } catch { return {} as LogEvent; } });
@@ -881,11 +925,46 @@ describe('POST /api/v1/admin/machines', () => {
     expect(((await res.json()) as { error: string }).error).toBe('cert_id_in_use');
   });
 
-  it('allows a body cert_id whose only retired_certs row is already REVOKED', async () => {
+  it('409s a body cert_id present in retired_certs even when already REVOKED (dead handle)', async () => {
+    // A confirmed-revoked id is a DEAD CA handle. Attaching it to a fresh fp would let a later prune poll
+    // that id, stamp the fresh reservation revoked, and free a still-live fingerprint. The id clash check
+    // is not filtered on revoked_at: an id in retired_certs AT ALL is unusable.
     await testEnv.DB.prepare("INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, revoked_at) VALUES ('idr-fp', 'revoked-cid', 'idr-owner', '2000-01-01T00:00:00.000Z', '2000-01-02T00:00:00.000Z')").run();
     const res = await adminMachines(reqJson({ machine_id: 'idr-b', cert_fp_sha256: 'idrb-fp', cert_id: 'revoked-cid' }), testEnv, machine('am-admin', true));
-    expect(res.status).toBe(200); // a confirmed-revoked id is dead — reattaching it revokes nothing live
-    expect((await row('idr-b'))?.cert_id).toBe('revoked-cid');
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('cert_id_in_use');
+    expect(await row('idr-b')).toBeNull(); // never created
+  });
+
+  it('409s a fp-change that reuses THIS row\'s own current cert_id (displaced-cert handle)', async () => {
+    // fp changes to a brand-new cert but the body reuses the OLD current's id — the swap would retire the
+    // displaced old current under that same id while also storing it on the new current: a dead/wrong
+    // handle on a live cert. cert_id_belongs_to_displaced_cert, distinct from cert_id_in_use.
+    await seedMachine('iddis-cur', { fp: 'idc-old', certId: 'idc-old-id' });
+    const res = await adminMachines(reqJson({ machine_id: 'iddis-cur', cert_fp_sha256: 'idc-new', cert_id: 'idc-old-id' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('cert_id_belongs_to_displaced_cert');
+    expect((await row('iddis-cur'))?.cert_fp_sha256).toBe('idc-old'); // unchanged
+  });
+
+  it('409s a NON-rollback fp-change that reuses THIS row\'s own prev cert_id', async () => {
+    // New fp is NOT the in-grace prev (so it's not a rollback), but the body reuses the prev's id — the
+    // displaced prev would be retired under an id now also on the new current. Reject.
+    await seedMachine('iddis-prev', { fp: 'idp-cur', certId: 'idp-cur-id', prevFp: 'idp-prev', prevCertId: 'idp-prev-id', revokeAt: '2999-01-01T00:00:00.000Z' });
+    const res = await adminMachines(reqJson({ machine_id: 'iddis-prev', cert_fp_sha256: 'idp-brandnew', cert_id: 'idp-prev-id' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('cert_id_belongs_to_displaced_cert');
+  });
+
+  it('positive control: a rollback to the in-grace prev fp MAY reuse that prev\'s own id', async () => {
+    // The one legit reuse: new fp IS the in-grace prev fp AND the body id IS that prev's id — reinstating
+    // the prev with its live handle. Accepted.
+    await seedMachine('idroll', { fp: 'idroll-cur', certId: 'idroll-cur-id', prevFp: 'idroll-prev', prevCertId: 'idroll-prev-id', revokeAt: '2999-01-01T00:00:00.000Z' });
+    const res = await adminMachines(reqJson({ machine_id: 'idroll', cert_fp_sha256: 'idroll-prev', cert_id: 'idroll-prev-id' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(200);
+    const r = await row('idroll');
+    expect(r?.cert_fp_sha256).toBe('idroll-prev'); // rolled back
+    expect(r?.cert_id).toBe('idroll-prev-id'); // its own live handle reattached
   });
 
   it('positive control: a body cert_id owned by NO other row attaches cleanly', async () => {

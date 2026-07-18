@@ -114,15 +114,17 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
 
     // A body-supplied cert_id is a CA handle used to REVOKE — attaching machine A's id to machine B would
     // make B's next rotation revoke A's live cert (an A-side lockout). Reject if this id is already owned:
-    // any OTHER machine's current/prev cert_id, OR an un-revoked retired_certs row (that id is mid-
-    // revocation — attaching it anywhere is wrong). Only body-supplied ids are checked; ids carried from
-    // THIS row's own existing/prev columns below are already ours. Cheap indexed-ish SELECTs in the read
-    // phase, before any write.
+    // any OTHER machine's current/prev cert_id, OR a retired_certs row AT ALL. The retired_certs check is
+    // NOT filtered on revoked_at: a still-reserved id is mid-revocation, and a CONFIRMED-revoked id is a
+    // DEAD handle — attaching either to a fresh fingerprint lets a later prune poll that id, stamp the
+    // fresh reservation revoked, and free a still-live fingerprint. Only body-supplied ids are checked;
+    // ids carried from THIS row's own existing/prev columns below are already ours. Cheap SELECTs, before
+    // any write.
     if (body.cert_id) {
       const idClash = await env.DB.prepare(
         `SELECT machine_id FROM machines WHERE (cert_id = ?1 OR prev_cert_id = ?1) AND machine_id != ?2
          UNION
-         SELECT machine_id FROM retired_certs WHERE cert_id = ?1 AND revoked_at IS NULL
+         SELECT machine_id FROM retired_certs WHERE cert_id = ?1
          LIMIT 1`,
       )
         .bind(body.cert_id, body.machine_id)
@@ -160,6 +162,22 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     // missing CA id on a helper-enrolled row) instead of always keeping the stale existing value.
     const fpChanged = certFp !== (existing?.cert_fp_sha256 ?? null);
     const rollingBack = fpChanged && certFp !== null && certFp === (existing?.prev_cert_fp_sha256 ?? null);
+
+    // On an fp CHANGE, this row's own current/prev certs are being DISPLACED (retired under their own ids).
+    // A body cert_id equal to one of those would then be stored on the NEW current AND used to revoke the
+    // displaced cert — the hub would revoke/stamp the handle out from under the live new cert. Reject it.
+    // The one legitimate reuse is a rollback: the new fp IS the in-grace prev fp and the id IS that prev's
+    // own id (reinstating the prev with its live handle) — carried automatically below when the body omits
+    // it, and allowed when the body supplies it explicitly. (self-owned ids are excluded from the clash
+    // check above, so this is the only guard for them.)
+    if (fpChanged && body.cert_id) {
+      const isRollbackId = rollingBack && body.cert_id === (existing?.prev_cert_id ?? null);
+      const collidesDisplaced = body.cert_id === (existing?.cert_id ?? null) || body.cert_id === (existing?.prev_cert_id ?? null);
+      if (collidesDisplaced && !isRollbackId) {
+        return Response.json({ error: 'cert_id_belongs_to_displaced_cert', machine_id: body.machine_id }, { status: 409 });
+      }
+    }
+
     const certId = fpChanged
       ? body.cert_id ?? (rollingBack ? existing?.prev_cert_id ?? null : null)
       : body.cert_id ?? existing?.cert_id ?? null;

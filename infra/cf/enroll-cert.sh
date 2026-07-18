@@ -161,6 +161,22 @@ read_row_fp() {
   parse_fp "$json"
 }
 
+# The post-enrollment install guidance. Printed ONLY once the machines row is CONFIRMED to carry THIS
+# run's fingerprint — in the authenticated path after the read-back verifies, and in the no-wrangler path
+# gated behind an explicit "verify the returned fp first" instruction. Never printed on an unverified
+# insert, so an operator can't install a cert that will 401 while the minted one leaks.
+print_install_steps() {
+  echo
+  echo "Done. Test the mTLS path with:"
+  echo "  curl --cert $CRT --key $KEY https://api.sessions.vza.net/api/v1/machines"
+  echo
+  echo "Then point the collector at the mTLS API (writes auth=mtls + these paths):"
+  echo "  agent-collector enroll --hub https://api.sessions.vza.net \\"
+  echo "    --machine-id \"$MACHINE_ID\" --client-cert $CRT --client-key $KEY"
+  echo
+  echo "Key stays on this box only ($KEY); the signed cert is not secret."
+}
+
 # FRESH ENROLLMENT ONLY. This inserts a brand-new machines row and deliberately does NOT overwrite an
 # existing row's cert. Re-enrolling (rotating an already-registered machine's cert) is a DISPLACEMENT — the
 # old cert must be reserved in retired_certs and revoked while the new one goes current — and that has to be
@@ -235,23 +251,28 @@ if npx --yes wrangler whoami >/dev/null 2>&1; then
     exit 1
   fi
   echo "    enrolled: $MACHINE_ID -> $FP"
+  print_install_steps
 else
+  # No wrangler here (fresh collector box). We CANNOT verify the insert from this box, and a bare
+  # INSERT ... DO NOTHING is a silent no-op if the machine_id is already enrolled under a different cert
+  # — the operator would then install a cert that 401s while this run's minted cert leaks. So print the
+  # SAME insert+read-back compound the authenticated path uses, make the operator CHECK the returned fp,
+  # and gate the install steps behind that check rather than printing them unconditionally.
   echo "    wrangler is not authenticated here, and the zone-SSL CF_API_TOKEN can't reach D1." >&2
-  echo "    Register the cert from an admin box where 'npx wrangler whoami' works, by running:" >&2
+  echo "    Register + verify from an admin box where 'npx wrangler whoami' works. Run this compound" >&2
+  echo "    (INSERT then read-back) and CHECK the returned fp BEFORE continuing:" >&2
   echo >&2
-  echo "  CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID npx wrangler d1 execute $DB_NAME --remote --command \"$INSERT_SQL\"" >&2
+  echo "  CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID npx wrangler d1 execute $DB_NAME --remote \\" >&2
+  echo "    --command \"$INSERT_SQL SELECT cert_fp_sha256 AS fp FROM machines WHERE machine_id='$MACHINE_ID';\"" >&2
   echo >&2
-  echo "    This is a FRESH-enroll insert — a no-op if the id already exists (it never overwrites a cert). If" >&2
-  echo "    '$MACHINE_ID' is already enrolled, ROTATE via the hub admin endpoint instead: POST" >&2
-  echo "    /api/v1/admin/machines { machine_id, cert_fp_sha256, cert_id }, which retires the old cert atomically." >&2
+  echo "    The INSERT is ON CONFLICT DO NOTHING (it never overwrites an existing cert), so the read-back fp" >&2
+  echo "    is the source of truth:" >&2
+  echo "      - if the returned fp EQUALS  $FP  -> enrollment took; continue to the install steps below." >&2
+  echo "      - if it DIFFERS or is empty       -> '$MACHINE_ID' is already enrolled with another cert. THIS" >&2
+  echo "        run's cert was NOT installed and must NOT be. Revoke it, then rotate via the admin endpoint:" >&2
+  echo "          curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$CERT_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\"" >&2
+  echo "          POST /api/v1/admin/machines { machine_id, cert_fp_sha256, cert_id } with a FRESHLY minted cert." >&2
+  echo >&2
+  echo "    ONLY after the read-back shows $FP, install the collector:" >&2
+  print_install_steps
 fi
-
-echo
-echo "Done. Test the mTLS path with:"
-echo "  curl --cert $CRT --key $KEY https://api.sessions.vza.net/api/v1/machines"
-echo
-echo "Then point the collector at the mTLS API (writes auth=mtls + these paths):"
-echo "  agent-collector enroll --hub https://api.sessions.vza.net \\"
-echo "    --machine-id \"$MACHINE_ID\" --client-cert $CRT --client-key $KEY"
-echo
-echo "Key stays on this box only ($KEY); the signed cert is not secret."
