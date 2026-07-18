@@ -17,12 +17,16 @@ interface FileRow {
   content_hash: string;
 }
 
-/** Thrown by an export cleanup phase that couldn't enqueue its next continuation: the archive is fully
- * written (its 'ready' sessions are valid) but stale-session cleanup isn't finished, so the file must NOT
- * be marked 'error' (archive rows have session_id NULL — the generic catch can't reconcile their stale
- * sessions). The cleanup path already forced the file back to 'pending'; the consumer catch recognizes
- * this sentinel and just retries so redelivery re-runs the same idempotent cleanup page. */
-class ExportCleanupPending extends Error {}
+/** Thrown by an export parse to signal a RETRYABLE (transient) failure: any throw out of an export parse
+ * is a D1/queue outage, never a content error (bad ZIP / shape drift take the failExportFile+return path,
+ * never throw). The file must NOT be marked 'error' — archive rows have session_id NULL, so the generic
+ * catch can't reconcile their sessions, and an 'error' export with stale 'ready' rows is terminal (files/
+ * check only re-enqueues NON-terminal rows). Every site that raises this first forces the file back to
+ * 'pending' (hash-guarded); the consumer catch recognizes the sentinel and just retries the same message,
+ * so redelivery re-runs the idempotent write/cleanup page. Two flavors, both retryable: the parseExportInto
+ * wrapper raises it for any transient throw (after reverting THIS invocation's writes), and the cleanup
+ * continuation-send path raises it directly (writes are complete + valid, so it does not revert). */
+class ExportRetry extends Error {}
 
 export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: Env): Promise<void> {
   // The ~1000-per-invocation D1 cap is shared across the WHOLE batch (wrangler max_batch_size:5), so we
@@ -45,6 +49,16 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
     }
     const isExport = isExportArchiveKey(msg.body.r2_key);
     if (isExport) {
+      // Reserve the export's worst-case budget on ATTEMPT. If that reservation would overflow the
+      // invocation AND at least one message already did work this invocation (invocationSpent > 0), DEFER
+      // the current export too — running its slice after prior D1 work could breach the ~1000-subrequest
+      // cap. The invocationSpent > 0 guard is mandatory: an export whose reservation alone crosses the cap
+      // must still run when it's the first to act this invocation, or it would defer forever (livelock).
+      if (invocationSpent > 0 && invocationSpent + EXPORT_QUERY_BUDGET >= INVOCATION_SUBREQUEST_BUDGET) {
+        await deferMessage(msg, env);
+        deferRest = true;
+        continue;
+      }
       invocationSpent += EXPORT_QUERY_BUDGET; // reserve worst-case on ATTEMPT, before any work
       if (invocationSpent >= INVOCATION_SUBREQUEST_BUDGET) deferRest = true;
     }
@@ -56,10 +70,17 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
         if (invocationSpent >= INVOCATION_SUBREQUEST_BUDGET) deferRest = true;
       }
     } catch (e) {
-      if (e instanceof ExportCleanupPending) {
-        // The cleanup path already forced the file back to 'pending'; do NOT markError. Retry re-runs the
-        // same idempotent cleanup page. (Even if retries exhaust to the DLQ, the file rests 'pending' —
-        // visible to the pipeline-stuck alert, never silently errored with unreconciled stale sessions.)
+      // This message threw after an unknown amount of D1 work (a chatty transcript can throw well past
+      // writeSession's batches; parseOne returns no count on the throw path). Charge the invocation
+      // conservatively by DEFERRING the rest of the batch BEFORE any branch/continue below — a failed heavy
+      // or stale write must not be followed by more D1 work that re-hits the cap (Codex round 5 finding 3 /
+      // round 6 finding 3: the guarded-stale `continue` used to exit before the defer flag was set).
+      deferRest = true;
+      if (e instanceof ExportRetry) {
+        // A retryable (transient) export failure. The raising site already forced the file back to
+        // 'pending'; do NOT markError. Retry re-runs the same idempotent write/cleanup page. (Even if
+        // retries exhaust to the DLQ, the file rests 'pending' — visible to the pipeline-stuck alert, never
+        // silently errored with unreconciled stale sessions.)
         msg.retry();
         continue;
       }
@@ -138,8 +159,6 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
       // past writeSession's delete/insert batches), and parseOne returns no subrequest count on the throw
       // path — so we can't charge the invocation budget precisely. Conservatively DEFER the rest of the
       // batch: a failed heavy write must not be followed by more D1 work that re-hits the ~1000-subrequest
-      // cap this budget guards (Codex round 5 finding 3). Deferral re-enqueues fresh copies, losing nothing.
-      deferRest = true;
       msg.retry();
     }
   }
@@ -456,6 +475,13 @@ function estimateWriteSubrequests(s: NormalizedSession): number {
   return 3 + Math.ceil(rows / 90);
 }
 
+/** Export-aware retryable wrapper around the whole parse. ANY throw out of runExportParse is a transient
+ * D1/queue outage — content errors (bad ZIP / shape drift) take the failExportFile+return path and never
+ * throw. Letting such a throw reach the generic consumer catch would mark a session_id-NULL archive
+ * terminal 'error' with its 'ready' rows stranded and un-re-enqueueable. So on any non-sentinel throw we
+ * revert THIS invocation's writes, force the file 'pending', and raise ExportRetry (round 6 findings 5/6:
+ * post-write-recheck and cleanup-phase D1 throws; also covers the R2 read and pre-write recheck). `written`
+ * lives here so the wrapper can revert exactly the slice this invocation wrote. */
 async function parseExportInto(
   file: FileRow,
   env: Env,
@@ -463,6 +489,24 @@ async function parseExportInto(
   contentHash?: string,
   offset = 0,
   cleanupCursor?: string,
+): Promise<number> {
+  const written = new Set<string>();
+  try {
+    return await runExportParse(file, env, reason, contentHash, offset, cleanupCursor, written);
+  } catch (e) {
+    if (e instanceof ExportRetry) throw e; // raising site already reverted + forced 'pending'; pass through
+    return await raiseExportRetry(file, env, written, contentHash, e);
+  }
+}
+
+async function runExportParse(
+  file: FileRow,
+  env: Env,
+  reason: ParseMessage['reason'],
+  contentHash: string | undefined,
+  offset: number,
+  cleanupCursor: string | undefined,
+  written: Set<string>,
 ): Promise<number> {
   const obj = await env.RAW.get(file.r2_key);
   if (!obj) {
@@ -515,11 +559,10 @@ async function parseExportInto(
   // empty-parse path).
   // Process a slice of conversations starting at `offset`, bounded by BOTH the query budget (actual D1
   // work) and the conversation-count cap. `sliceEnd` is the ACTUAL position reached — the continuation
-  // resumes there, not at a fixed offset+N. The whole loop is wrapped so ANY throw mid-slice (an
-  // unexpectedly huge conversation hitting the cap, a transient D1 error, a bug) reverts this slice's
-  // already-written sessions before rethrowing — never leaving them 'ready' over an archive we can't finish.
+  // resumes there, not at a fixed offset+N. Any throw mid-slice (a transient D1 error) raises ExportRetry:
+  // revert THIS invocation's writes and retry the same message at the same offset — never leaving a
+  // half-written conversation 'ready', never reverting earlier slices a same-offset retry won't rewrite.
   const maxEnd = Math.min(offset + EXPORT_MAX_CONVERSATIONS_PER_SLICE, archive.sessions.length);
-  const written = new Set<string>();
   let spent = 0;
   let idx = offset;
   try {
@@ -576,12 +619,11 @@ async function parseExportInto(
         break;
       }
 
-      // Track the conversations this slice commits to writing: `written.size` gates the oversized cut above
-      // (a leading oversized conversation must still be written) and is reported in the slice/superseded
-      // logs. The skip-paths above (empty / healthy live capture / healthy other owner) return before this
-      // line, so they never enter `written`. A mid-write throw is reverted by revertOwnedReady (a whole-file
-      // 'ready' → 'parsing' sweep), which flips this conversation's prior 'ready' row too without needing
-      // `written`, so the ordering here no longer matters for correctness.
+      // Track the conversations this slice commits to writing BEFORE the write: `written.size` gates the
+      // oversized cut above (a leading oversized conversation must still be written) and is reported in the
+      // slice/superseded logs, and it's the exact set revertSlice reverts if a write throws — including the
+      // in-flight conversation whose blocks are half-rewritten. The skip-paths above (empty / healthy live
+      // capture / healthy other owner) return before this line, so they never enter `written`.
       written.add(session.id);
       spent += await writeSession(session, file, env);
       // Cut once the query budget is spent — but only AFTER writing this conversation, so a single
@@ -592,10 +634,10 @@ async function parseExportInto(
       }
     }
   } catch (e) {
-    // Any throw mid-slice abandons the whole archive to 'error' — revert THIS slice AND earlier slices'
-    // published rows so no partial export is left searchable (Codex round 5 finding 2).
-    await revertOwnedReady(file, env);
-    throw e;
+    // A transient D1 throw mid-slice. Revert THIS invocation's writes (the in-flight conversation + this
+    // slice) and retry the same message at the same offset — NOT a whole-file revert, which would strand
+    // earlier slices a same-offset retry never rewrites (round 6 finding 2), and NOT a terminal 'error'.
+    await raiseExportRetry(file, env, written, contentHash, e);
   }
   const sliceEnd = idx;
   const writesComplete = sliceEnd >= archive.sessions.length;
@@ -622,17 +664,12 @@ async function parseExportInto(
   // a partially-written archive (the silent-data-gap guard). Under queue max_concurrency:1 the
   // continuation runs after this message acks, serially.
   if (!writesComplete) {
-    try {
-      await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: contentHash, offset: sliceEnd });
-    } catch (e) {
-      // The continuation couldn't be enqueued — this archive's sessions must NOT stay 'ready' over an
-      // archive we won't finish. Revert this slice AND every earlier slice's published rows (the write
-      // phase may span invocations) FIRST, then rethrow so the generic consumer catch marks the file
-      // 'error' and retries. The file must never end terminal with partial 'ready' rows (Codex round 5
-      // finding 2).
-      await revertOwnedReady(file, env);
-      throw e;
-    }
+    // If the continuation can't be enqueued, let the send throw propagate to the wrapper: it reverts THIS
+    // slice's writes (not earlier slices — they're valid for the current bytes, and the same-offset retry
+    // rewrites this slice and re-sends), forces 'pending', and raises ExportRetry so the message retries.
+    // Reverting earlier slices here would strand them, since the retry resumes at THIS offset (round 6
+    // finding 2).
+    await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: contentHash, offset: sliceEnd });
     console.log(
       JSON.stringify({ event: 'parse.export.slice', file_id: file.id, offset, slice_end: sliceEnd, total: archive.sessions.length, written: written.size }),
     );
@@ -749,18 +786,31 @@ async function parseExportInto(
   // absence self-heals. Exports are few (one-time backfills), so this fan-out is cheap and rare. Kicked
   // per cleanup invocation that reconciled something (idempotent: markPendingAndEnqueue re-flips+re-sends).
   if (recovered.size > 0) {
-    // Best-effort: a transient queue/D1 outage while kicking SIBLINGS must NOT error THIS file — its own
-    // archive is fully written and its cleanup is progressing. markPendingAndEnqueue flips each sibling to
-    // 'pending' before sending, so files/check re-enqueues any that didn't get a message; log and carry on.
-    try {
-      const others = await env.DB.prepare(
-        `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state != 'error'`,
-      )
-        .bind(file.store, file.id)
-        .all<{ id: number; r2_key: string; content_hash: string }>();
-      for (const other of others.results) await markPendingAndEnqueue(other, 'recover', env);
-    } catch (e) {
-      console.log(JSON.stringify({ event: 'parse.export.recover_kick_failed', file_id: file.id, error: String(e) }));
+    // The sibling SELECT is NOT swallowed: if it throws, let it reach the retryable wrapper (this file goes
+    // 'pending', the cleanup page retries) — swallowing it would let THIS file reach 'parsed' with the
+    // recovered session gone and no sibling kicked (round 6 finding 4).
+    const others = await env.DB.prepare(
+      `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state != 'error'`,
+    )
+      .bind(file.store, file.id)
+      .all<{ id: number; r2_key: string; content_hash: string }>();
+    // markPendingAndEnqueue flips a sibling to 'pending' THEN sends. Keep going through all siblings so one
+    // failure doesn't skip the rest, but distinguish the two failure modes on catch: a SEND failure leaves
+    // the sibling safely 'pending' (files/check re-enqueues it — swallow), while a FLIP failure leaves it
+    // terminal with nothing to re-enqueue it — so retry the whole idempotent cleanup page.
+    let flipFailed = false;
+    for (const other of others.results) {
+      try {
+        await markPendingAndEnqueue(other, 'recover', env);
+      } catch (e) {
+        const row = await env.DB.prepare('SELECT parse_state FROM files WHERE id = ?1').bind(other.id).first<{ parse_state: string }>();
+        console.log(JSON.stringify({ event: 'parse.export.recover_kick_failed', file_id: file.id, sibling: other.id, sibling_state: row?.parse_state ?? null, error: String(e) }));
+        if (row?.parse_state !== 'pending') flipFailed = true;
+      }
+    }
+    if (flipFailed) {
+      await forcePending(file, env, contentHash);
+      throw new ExportRetry('recovery fan-out: a sibling flip failed');
     }
   }
 
@@ -778,21 +828,15 @@ async function parseExportInto(
         cleanup_cursor: cursor,
       });
     } catch {
-      // The cleanup continuation couldn't be enqueued. Unlike a WRITE-continuation failure, the archive is
-      // FULLY written — its 'ready' sessions are valid — so we must NOT revert them or let the generic catch
-      // mark the file 'error' (archive rows have session_id NULL: that catch can't reconcile the remaining
-      // stale sessions, and an 'error' file with stale ready/canonical rows is exactly the terminal state to
-      // avoid). Force the file back to 'pending' — hash-guarded so we don't clobber a fresher re-upload — so
-      // even if redelivery retries exhaust to the DLQ it rests 'pending' (visible to the pipeline-stuck
-      // alert), then throw the sentinel so the consumer skips markError and just retries this idempotent
-      // cleanup page.
-      await env.DB.prepare(
-        `UPDATE files SET parse_state = 'pending' WHERE id = ?1${contentHash !== undefined ? ' AND content_hash = ?2' : ''}`,
-      )
-        .bind(...(contentHash !== undefined ? [file.id, contentHash] : [file.id]))
-        .run();
+      // The cleanup continuation couldn't be enqueued. The archive is FULLY written — its 'ready' sessions
+      // are valid — so, unlike a WRITE throw, we do NOT revert them: force the file back to 'pending'
+      // (hash-guarded, so a fresher re-upload isn't clobbered) and raise the retry sentinel directly, so the
+      // consumer skips markError and just retries this idempotent cleanup page (the same-cursor retry
+      // resumes the scan). Even if retries exhaust to the DLQ it rests 'pending' (visible to the
+      // pipeline-stuck alert), never terminal 'error' with unreconciled stale sessions.
+      await forcePending(file, env, contentHash);
       console.log(JSON.stringify({ event: 'parse.export.cleanup_send_failed', file_id: file.id, cursor }));
-      throw new ExportCleanupPending(`cleanup continuation send failed at cursor ${cursor}`);
+      throw new ExportRetry(`cleanup continuation send failed at cursor ${cursor}`);
     }
     console.log(
       JSON.stringify({ event: 'parse.export.cleanup', file_id: file.id, cursor, recovered_kicked: recovered.size, done: false }),
@@ -960,16 +1004,46 @@ async function markParsed(
 }
 
 /** Revert every 'ready' session this file is canonical for back to index_state='parsing', in ONE
- * subrequest. Used on every export-abandonment path — a re-upload changed the bytes mid-slice, the
- * continuation couldn't be enqueued, the final markParsed lost the row to a fresher upload, or a
- * hash-mismatch supersede. The export write phase spans invocations, so a per-id revert of only THIS
- * invocation's `written` set would strand EARLIER slices' 'ready'/canonical rows searchable under a file
- * that's erroring or being superseded — a partial export advertised as complete (the silent-under-
- * production class this guards). The whole-file predicate reverts every slice this file ever wrote with no
- * id bookkeeping; a new in-flight conversation that threw before its session upsert has no 'ready' row to
- * catch, so nothing is lost. */
+ * subrequest. Used only on the SUPERSEDE paths — a re-upload changed the bytes (post-write recheck,
+ * cleanup-page recheck) or markParsed lost the row to a fresher upload. There, a DIFFERENT message (the
+ * fresh upload, offset 0) owns the current bytes and rewrites every conversation, so reverting the whole
+ * file (all slices, across invocations) is correct: the old-byte rows are stale and must not stay
+ * searchable in the gap. NOT used on transient-throw paths — those retry the SAME message at the SAME
+ * offset, which never rewrites earlier slices, so reverting them would strand valid rows (see revertSlice
+ * / raiseExportRetry, round 6 finding 2). */
 async function revertOwnedReady(file: FileRow, env: Env): Promise<void> {
   await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE canonical_file_id = ?1 AND index_state = 'ready'").bind(file.id).run();
+}
+
+/** Revert ONLY the sessions THIS invocation wrote (its `written` set) back to 'parsing', batched (chunks
+ * of 90) to stay within the subrequest budget. Used on transient-throw paths, where the SAME message
+ * retries at the SAME offset and rewrites exactly this invocation's slice — so earlier slices (valid for
+ * the current bytes, not in `written`, not rewritten by the retry) must be left 'ready'. */
+async function revertSlice(written: Set<string>, env: Env): Promise<void> {
+  if (written.size === 0) return;
+  const stmts = [...written].map((id) => env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(id));
+  for (const chunk of chunkArr(stmts, 90)) await env.DB.batch(chunk);
+}
+
+/** Force this file back to parse_state='pending' (hash-guarded when the message carries a hash, so a
+ * concurrent fresh upload that already moved the row on is not clobbered). The invariant every retryable
+ * export failure restores: a row with an outstanding parse message must be NON-TERMINAL, so files/check
+ * and the same-hash upload fast path can re-enqueue it. */
+async function forcePending(file: FileRow, env: Env, contentHash: string | undefined): Promise<void> {
+  await env.DB.prepare(`UPDATE files SET parse_state = 'pending' WHERE id = ?1${contentHash !== undefined ? ' AND content_hash = ?2' : ''}`)
+    .bind(...(contentHash !== undefined ? [file.id, contentHash] : [file.id]))
+    .run();
+}
+
+/** Handle a transient (retryable) throw out of an export parse: revert THIS invocation's writes, force the
+ * file 'pending', and raise the ExportRetry sentinel so the consumer retries the same idempotent message
+ * rather than marking a session_id-NULL archive terminal 'error' with stranded 'ready' rows. Never reverts
+ * earlier slices (revertSlice is per-invocation) — a same-offset retry rewrites only this slice. */
+async function raiseExportRetry(file: FileRow, env: Env, written: Set<string>, contentHash: string | undefined, e: unknown): Promise<never> {
+  await revertSlice(written, env);
+  await forcePending(file, env, contentHash);
+  console.log(JSON.stringify({ event: 'parse.export.transient', file_id: file.id, error: String(e) }));
+  throw new ExportRetry(String(e));
 }
 
 /** Replace a session's index rows atomically-enough: FTS delete → blocks delete → reinsert → FTS

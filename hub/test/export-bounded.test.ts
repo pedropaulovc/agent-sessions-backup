@@ -347,13 +347,14 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(sent.some((m) => m.file_id === fileId && typeof m.offset === 'number')).toBe(false); // no continuation
   });
 
-  it('a continuation-enqueue failure reverts the slice and never leaves partial ready rows (round 1 finding 3)', async () => {
+  it('a continuation-enqueue failure is retryable: the slice reverts and the file goes pending, not error (round 1 finding 3 / round 6)', async () => {
     budgets({ slice: 20, invocation: 20 });
     const total = 12;
     const { fileId, hash, r2Key } = await uploadArchive('cf', total);
 
-    // Make the continuation send throw. parseExportInto must revert this slice's writes and rethrow,
-    // so the generic consumer catch marks the file 'error' — never terminal with partial 'ready' rows.
+    // Make the continuation send throw. A queue-send outage is TRANSIENT: parseExportInto must revert THIS
+    // slice's writes and force the file back to 'pending' (retryable) — never terminal 'error' with partial
+    // 'ready' rows (a session_id-NULL archive the generic catch can't reconcile).
     const realSend = testEnv.PARSE_QUEUE.send;
     testEnv.PARSE_QUEUE.send = (async () => {
       throw new Error('queue send failed');
@@ -364,43 +365,56 @@ describe('large export ingest is bounded and never marks parsed until every conv
       testEnv.PARSE_QUEUE.send = realSend;
     }
 
-    expect(await fileState(fileId)).toBe('error'); // generic catch marked it; NOT 'parsed'
-    expect(await readyCount(fileId)).toBe(0); // no partial 'ready' rows survived the failed slice
+    // POSITIVE CONTROL: before round 6 this marked the file terminal 'error'; now a transient send failure
+    // is retryable — the file rests 'pending' (re-enqueueable by files/check), with this offset-0 slice's
+    // writes reverted so no partial 'ready' rows survive.
+    expect(await fileState(fileId)).toBe('pending'); // retryable, NOT terminal 'error'
+    expect(await readyCount(fileId)).toBe(0); // this slice's writes reverted
   });
 
-  it('a LATER slice failure reverts EARLIER slices ready rows too, never leaving a partial export searchable (round 5 finding 2)', async () => {
-    // The write phase spans invocations. Deliver slice 1 normally (a prefix becomes 'ready'), then make
-    // slice 2's continuation-send fail. The generic catch marks the file 'error'; the abandon path must
-    // revert BOTH slice 2's writes AND slice 1's earlier 'ready' rows — otherwise a partial export stays
-    // searchable under an errored file (the silent-under-production class this whole PR fights).
+  it('a retryable later-slice send failure PRESERVES earlier slices and retries at the same offset (round 6 finding 2)', async () => {
+    // The write phase spans invocations. Deliver slice 1 (a prefix becomes 'ready'), then fail slice 2's
+    // continuation send. The failure is RETRYABLE and the message retries at slice 2's OWN offset — which
+    // never rewrites slice 1 — so reverting slice 1 would strand it 'parsing' forever. The correct behavior:
+    // revert only slice 2's writes, keep slice 1 'ready', force the file 'pending', and let a same-offset
+    // retry complete with every row 'ready'.
     budgets({ slice: 20, invocation: 20 });
     const total = 12;
-    const { fileId, hash, r2Key } = await uploadArchive('r5rev', total);
+    const { fileId, hash, r2Key } = await uploadArchive('r6rev', total);
 
     // Slice 1 (offset 0): writes a prefix and enqueues a continuation; the file stays pending.
     sent.length = 0;
     await deliver({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: hash });
-    const cont = sent.find((m) => m.file_id === fileId && typeof m.offset === 'number' && m.offset > 0);
+    const cont = sent.find((m) => m.file_id === fileId && typeof m.offset === 'number' && m.offset! > 0);
     expect(cont).toBeDefined();
     const firstSliceReady = await readyCount(fileId);
     expect(firstSliceReady).toBeGreaterThan(0); // slice 1 published some 'ready' rows
 
-    // Slice 2 (offset > 0): its OWN continuation-send throws → abandon → generic catch marks 'error'.
+    // Slice 2 (offset > 0): fail ITS continuation send (offset beyond slice 2). Toggle off after.
     const realSend = testEnv.PARSE_QUEUE.send;
-    testEnv.PARSE_QUEUE.send = (async () => {
-      throw new Error('queue send failed on later slice');
+    let failSend = true;
+    testEnv.PARSE_QUEUE.send = (async (m: ParseMessage) => {
+      if (failSend && typeof m.offset === 'number' && m.offset! > cont!.offset!) throw new Error('queue send failed on slice 2');
+      return (realSend as (b: ParseMessage) => Promise<unknown>)(m);
     }) as typeof testEnv.PARSE_QUEUE.send;
     try {
       await deliver(cont!);
+
+      // POSITIVE CONTROL: a whole-file revert here would flip slice 1's rows to 'parsing', and the
+      // same-offset retry (which rewrites only slice 2) would never restore them. Reverting slice 2 ONLY
+      // keeps slice 1 'ready' and the file 'pending' (retryable), not terminal 'error'.
+      expect(await fileState(fileId)).toBe('pending');
+      expect(await readyCount(fileId)).toBe(firstSliceReady); // slice 1 preserved; only slice 2 reverted
+
+      // Retry at the SAME offset with the queue restored → drains to completion with every row 'ready'.
+      failSend = false;
+      await deliverChain(cont!);
+      expect(await fileState(fileId)).toBe('parsed');
+      expect(await ownedSessions(fileId)).toBe(total);
+      expect(await readyCount(fileId)).toBe(total);
     } finally {
       testEnv.PARSE_QUEUE.send = realSend;
     }
-
-    // POSITIVE CONTROL: with the abandon path reverting only THIS invocation's `written`, slice 1's
-    // `firstSliceReady` rows survive as 'ready' under the errored file. The owned-ready sweep reverts them
-    // too → zero 'ready' rows for an incomplete, errored export.
-    expect(await fileState(fileId)).toBe('error');
-    expect(await readyCount(fileId)).toBe(0); // BOTH slices reverted, not just the failing one
   });
 
   it('budgets the slice by D1 SUBREQUESTS (batch calls), not statements: many-block conversations still fit one slice (round 3 finding 1, subrequest revert)', async () => {
@@ -424,14 +438,15 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(sent.some((m) => m.file_id === fileId && typeof m.offset === 'number')).toBe(false);
   });
 
-  it('reverts every session already written when writeSession throws mid-slice; the file is never parsed (round 2 finding 1b)', async () => {
+  it('reverts every session already written when writeSession throws mid-slice; the file goes pending, not error (round 2 finding 1b / round 6)', async () => {
     budgets({ slice: 20, invocation: 20 });
     const { fileId, hash, r2Key } = await uploadArchive('wf', 5);
 
     // Each small conversation issues 3 DB.batch calls in writeSession (block delete, block insert,
     // session+FTS). Throw on the 7th batch → conversation 3's first batch → conversations 1-2 are fully
-    // written and tracked in `written`, conversation 3 fails before any of its rows land. The slice's
-    // try/catch must revert 1-2 and rethrow.
+    // written and tracked in `written`, conversation 3 fails before any of its rows land. A mid-write D1
+    // throw is TRANSIENT: raiseExportRetry reverts this invocation's writes (1-2 and the half-written 3) and
+    // forces the file 'pending' for a same-offset retry.
     const restore = throwOnNthBatch(7);
     sent.length = 0;
     try {
@@ -440,11 +455,51 @@ describe('large export ingest is bounded and never marks parsed until every conv
       restore();
     }
 
-    // POSITIVE CONTROL for the revert-on-write-failure path: without the try/catch revert, conversations
-    // 1-2 survive as 'ready' rows canonical to a file the generic catch can only mark 'error'.
-    expect(await fileState(fileId)).toBe('error'); // generic consumer catch; NOT parsed
-    expect(await readyCount(fileId)).toBe(0); // no partial 'ready' rows survived the failed slice
+    // POSITIVE CONTROL: before round 6 this marked the file terminal 'error'; a transient write failure is
+    // now retryable — the file rests 'pending' (re-enqueueable) with this offset-0 slice reverted (no
+    // partial 'ready' rows) and NO continuation enqueued (the same message retries at offset 0).
+    expect(await fileState(fileId)).toBe('pending'); // retryable, NOT terminal 'error'
+    expect(await readyCount(fileId)).toBe(0); // this invocation's writes reverted
     expect(sent.some((m) => m.file_id === fileId && typeof m.offset === 'number')).toBe(false); // no continuation
+  });
+
+  it('a post-write hash-recheck D1 throw is retryable, not a terminal error with a stranded prefix (round 6 finding 5)', async () => {
+    budgets({ slice: 20, invocation: 20 });
+    const total = 3; // one slice → writes complete → the post-write recheck runs
+    const { fileId, hash, r2Key } = await uploadConvs('r6f5', Array.from({ length: total }, (_u, i) => conv('r6f5', i)));
+
+    // Make the POST-write hash recheck throw. It's the 2nd `SELECT content_hash` read (pre-write is 1st,
+    // cleanup rechecks come later) and lives OUTSIDE the write-loop try — the site finding 5 flagged.
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    let reads = 0;
+    testEnv.DB.prepare = ((sql: string) => {
+      const stmt = realPrepare(sql);
+      if (sql !== 'SELECT content_hash FROM files WHERE id = ?1') return stmt;
+      const realBind = stmt.bind.bind(stmt);
+      stmt.bind = (...a: unknown[]) => {
+        const bound = realBind(...a);
+        const realFirst = bound.first.bind(bound);
+        (bound as unknown as Record<string, unknown>).first = async (...x: unknown[]) => {
+          reads++;
+          if (reads === 2) throw new Error('D1 outage on post-write recheck');
+          return (realFirst as (...y: unknown[]) => unknown)(...x);
+        };
+        return bound;
+      };
+      return stmt;
+    }) as typeof testEnv.DB.prepare;
+    try {
+      await deliver({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: hash });
+    } finally {
+      testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
+    }
+
+    // POSITIVE CONTROL: the post-write recheck runs outside the write-loop try, so before round 6's whole-
+    // body wrapper a throw here reached the generic catch and marked the session_id-NULL archive terminal
+    // 'error' with its just-written 'ready' prefix stranded. The wrapper makes it retryable: file 'pending',
+    // this offset-0 slice reverted.
+    expect(await fileState(fileId)).toBe('pending');
+    expect(await readyCount(fileId)).toBe(0);
   });
 
   it('a mid-conversation throw reverts its prior ready row to parsing, never leaving it ready over a half-rewritten index (round 3 finding 4)', async () => {
@@ -466,10 +521,10 @@ describe('large export ingest is bounded and never marks parsed until every conv
       restore();
     }
 
-    // POSITIVE CONTROL for the abandonment revert: the throw's revertOwnedReady sweep (whole-file 'ready' →
-    // 'parsing') must catch this conversation's prior 'ready' row; disable the sweep and it keeps its stale
-    // 'ready' row over the half-rewritten (blocks-deleted) index while the file goes 'error'.
-    expect(await fileState(fileId)).toBe('error');
+    // POSITIVE CONTROL for the retryable revert: raiseExportRetry reverts this invocation's `written` (which
+    // includes this conversation, added before the write) to 'parsing' and forces the file 'pending' for a
+    // same-offset retry — never leaving the half-rewritten (blocks-deleted) session 'ready', never terminal.
+    expect(await fileState(fileId)).toBe('pending');
     expect(await sessionState(convId)).toBe('parsing');
   });
 
@@ -512,8 +567,8 @@ describe('large export ingest is bounded and never marks parsed until every conv
     // POSITIVE CONTROL for reserve-first vs. a success-only decrement: f1 threw, so a success-only
     // decrement would leave the budget available and f2 would run a full slice (3 sessions written).
     // Reserving on attempt keeps f2 untouched (deferred: ACKed + a fresh copy re-enqueued).
-    expect(flags[f1.fileId]!.retried).toBe(true); // f1 threw → consumer catch retries it
-    expect(await fileState(f1.fileId)).toBe('error');
+    expect(flags[f1.fileId]!.retried).toBe(true); // f1's transient throw → ExportRetry → consumer retries it
+    expect(await fileState(f1.fileId)).toBe('pending'); // retryable, NOT terminal 'error'
     expect(await readyCount(f1.fileId)).toBe(0); // f1's partial writes reverted
 
     expect(flags[f2.fileId]).toEqual({ acked: true, retried: false }); // deferred by ACK + re-enqueue
@@ -699,6 +754,33 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(await ownedSessions(w2.fileId)).toBe(0); // NO write ran for w2
   });
 
+  it('defers the CURRENT export when its reservation would overflow the invocation after prior work (round 6 finding 1)', async () => {
+    // A cheap normal transcript earlier in the batch uses part of the budget WITHOUT crossing it, then the
+    // export's worst-case reservation WOULD cross the cap. The export must be deferred — not run its slice
+    // after the prior D1 work — while the normal transcript still runs. invocation=25, reserve(slice)=20:
+    // the web spend (~15) doesn't self-trip deferRest, but 15 + 20 ≥ 25 overflows the reservation.
+    budgets({ slice: 20, invocation: 25 });
+    const web = await uploadClaudeWeb('r6f1', 2); // cheap normal transcript, runs first
+    const exp = await uploadArchive('r6f1', 3); // its reservation overflows the invocation → deferred
+
+    const flags: Record<number, { acked: boolean; retried: boolean }> = {};
+    sent.length = 0;
+    await worker.queue(
+      { queue: 'parse', messages: [batchMsg(web, flags), batchMsg(exp, flags)], ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>,
+      testEnv,
+    );
+
+    // POSITIVE CONTROL: before round 6 the reservation only set deferRest for LATER messages, so this export
+    // still ran a slice after the normal transcript's D1 work (breaching the cap). Now the CURRENT export is
+    // deferred (ACK + re-enqueue), zero writes, while the normal transcript ran. (The invocationSpent > 0
+    // guard keeps a SOLE/first export always running — other tests deliver exports first and they run.)
+    expect(await fileState(web.fileId)).toBe('parsed');
+    expect(flags[exp.fileId]).toEqual({ acked: true, retried: false });
+    expect(sent.some((m) => m.file_id === exp.fileId && m.offset === undefined)).toBe(true); // re-enqueued fresh
+    expect(await fileState(exp.fileId)).toBe('pending');
+    expect(await ownedSessions(exp.fileId)).toBe(0);
+  });
+
   // Destructive cleanup fan-out (kicks sibling export-inbox files to 'pending') — kept near the end.
   it('a cleanup-continuation send failure leaves the file pending, not error, and retries the cleanup page (round 4 finding 1)', async () => {
     budgets({ slice: 800, invocation: 800 });
@@ -736,6 +818,81 @@ describe('large export ingest is bounded and never marks parsed until every conv
     await deliverChain({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
     expect(await fileState(replaced.fileId)).toBe('parsed');
     expect(await ownedSessions(replaced.fileId)).toBe(3);
+  });
+
+  it('a cleanup-phase D1 throw is retryable and preserves the valid written sessions (round 6 finding 6)', async () => {
+    // Parse a big archive (one fast slice), then replace with a smaller one so cleanup must delete stale
+    // rows. Drive the reparse to a PURE cleanup invocation, then make its first DELETE batch throw. A
+    // cleanup-phase D1 outage must be retryable (file 'pending', not terminal 'error') and — because a pure
+    // cleanup pass wrote nothing — revert nothing, leaving every valid owned session 'ready'.
+    budgets({ slice: 800, invocation: 800 });
+    const first = await uploadConvs('r6f6', Array.from({ length: 10 }, (_u, i) => conv('r6f6', i)));
+    await deliverChain({ file_id: first.fileId, r2_key: first.r2Key, reason: 'upload', content_hash: first.hash });
+    expect(await ownedSessions(first.fileId)).toBe(10);
+
+    const replaced = await uploadConvs('r6f6', Array.from({ length: 2 }, (_u, i) => conv('r6f6', i)));
+    budgets({ slice: 8, invocation: 8 });
+
+    // First reparse invocation writes the 2 kept convs then defers cleanup to a continuation (budget spent).
+    // The re-upload flipped the file's prior sessions out of 'ready', so only the 2 just-rewritten convs are
+    // 'ready' now; the 8 dropped ones are stale rows cleanup will delete.
+    sent.length = 0;
+    await deliver({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
+    const cleanupCont = sent.find((m) => m.file_id === replaced.fileId && m.cleanup_cursor !== undefined);
+    expect(cleanupCont).toBeDefined();
+    const readyBefore = await readyCount(replaced.fileId); // the 2 rewritten convs
+    expect(readyBefore).toBe(2);
+
+    // Deliver the pure-cleanup continuation with its first DELETE batch throwing (page query is .all, the
+    // per-page recheck is .first, so batch #1 of this invocation is the first stale delete).
+    const restore = throwOnNthBatch(1);
+    try {
+      await deliver(cleanupCont!);
+    } finally {
+      restore();
+    }
+
+    // POSITIVE CONTROL: a cleanup-phase throw used to fall through to the generic catch → terminal 'error'
+    // with stale rows stuck. Now it's retryable: file 'pending', and because this pure cleanup invocation
+    // wrote nothing, revertSlice is a no-op — the 2 valid written sessions stay 'ready', nothing committed.
+    expect(await fileState(replaced.fileId)).toBe('pending');
+    expect(await readyCount(replaced.fileId)).toBe(readyBefore); // the 2 written sessions preserved (no revert)
+
+    // Retry drains cleanup → parsed, exactly the 2 kept.
+    await deliverChain(cleanupCont!);
+    expect(await fileState(replaced.fileId)).toBe('parsed');
+    expect(await ownedSessions(replaced.fileId)).toBe(2);
+  });
+
+  it('a recovery fan-out SELECT failure is retryable, not swallowed into a false parsed (round 6 finding 4)', async () => {
+    // The sibling-recovery fan-out runs only when cleanup actually reconciled a stale session. A D1 outage
+    // in its initial SELECT must NOT be swallowed (which would let THIS file reach 'parsed' with the
+    // recovered session gone and no sibling kicked) — it propagates to the retryable wrapper → 'pending'.
+    budgets({ slice: 800, invocation: 800 });
+    const first = await uploadConvs('r6f4', Array.from({ length: 6 }, (_u, i) => conv('r6f4', i)));
+    await deliverChain({ file_id: first.fileId, r2_key: first.r2Key, reason: 'upload', content_hash: first.hash });
+    expect(await ownedSessions(first.fileId)).toBe(6);
+    const replaced = await uploadConvs('r6f4', Array.from({ length: 2 }, (_u, i) => conv('r6f4', i)));
+    budgets({ slice: 20, invocation: 20 });
+
+    // Make the sibling-recovery SELECT throw (it fires only after cleanup reconciled ≥1 stale session).
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    const SIBLING_SQL = `SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND id != ?2 AND parse_state != 'error'`;
+    testEnv.DB.prepare = ((sql: string) => {
+      if (sql === SIBLING_SQL) {
+        return { bind: () => ({ all: async () => { throw new Error('D1 outage on sibling recovery SELECT'); } }) } as unknown as D1PreparedStatement;
+      }
+      return realPrepare(sql);
+    }) as typeof testEnv.DB.prepare;
+    try {
+      await deliver({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
+    } finally {
+      testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
+    }
+
+    // POSITIVE CONTROL: before round 6 the SELECT throw was swallowed and the file still reached 'parsed'.
+    // Now it propagates to the wrapper → the file rests 'pending' (re-enqueueable), never falsely parsed.
+    expect(await fileState(replaced.fileId)).toBe('pending');
   });
 
   it('cleanup deletes are atomic hash-guarded: a hash flip between the recheck and the delete batch no-ops them (round 4 finding 3)', async () => {
