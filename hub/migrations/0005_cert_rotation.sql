@@ -20,3 +20,31 @@ ALTER TABLE machines ADD COLUMN cert_id TEXT;
 ALTER TABLE machines ADD COLUMN prev_cert_fp_sha256 TEXT;
 ALTER TABLE machines ADD COLUMN prev_cert_id TEXT;
 ALTER TABLE machines ADD COLUMN cert_revoke_at TEXT;
+
+-- Durable reservation/revocation queue. The machines-row current+prev slots can hold at most two
+-- fingerprints, so ANY path that displaces a third (a renew overwriting an in-grace prev, a recovery
+-- replacing the orphaned successor, an admin cert swap clearing current/prev, the post-signing
+-- D1-failure cleanup, and the daily grace-expiry prune) records the displaced cert HERE instead of
+-- dropping it. That keeps a still-CA-valid fingerprint reserved so no other machine can claim it and
+-- have the old cert impersonate them.
+--
+--   revoked_at NULL  = still reserved: the cert may still be valid at the CA; the fingerprint is
+--                      unclaimable (adminMachines' clash check consults this table) and the daily
+--                      prune keeps trying to revoke it.
+--   revoked_at set   = confirmed revoked at the CA; the row is kept as an audit trail and the
+--                      fingerprint returns to the reusable pool.
+--   cert_id NULL     = the CA id was never recorded (pre-M4/enroll rows) — it can't be revoked here,
+--                      so the row stays reserved (logged for manual cleanup) until the cert expires.
+--
+-- retired certs NEVER authenticate — machineIdentity still matches only the current or in-grace prev
+-- fingerprint. This table is reservation + revoke bookkeeping only.
+CREATE TABLE retired_certs (
+  fingerprint TEXT NOT NULL,
+  cert_id     TEXT,
+  machine_id  TEXT NOT NULL,
+  retired_at  TEXT NOT NULL,
+  revoked_at  TEXT
+) STRICT;
+
+-- The hot lookup is "is this fingerprint still reserved?" — a partial index over the pending rows.
+CREATE INDEX retired_certs_reserved ON retired_certs (fingerprint) WHERE revoked_at IS NULL;

@@ -1,3 +1,5 @@
+import { settleRetired } from '../api/certs';
+
 // Daily prune (runs on the `30 4 * * *` cron — see wrangler.jsonc triggers).
 //
 // Multipart uploads assemble onto a staging key (mpu-staging/...) and complete copies staging ->
@@ -32,22 +34,19 @@ export async function runPrune(env: Env, nowMs: number = Date.now()): Promise<vo
   console.log(JSON.stringify({ event: 'hub.prune.staging', scanned, deleted }));
 }
 
-import { revokeClientCert } from '../api/certs';
-
-/** Daily prune (cron `30 4`). For each machine whose cert-rotation grace window has elapsed,
- * revoke the previous cert at the managed CA, then clear the rotation columns.
+/** Daily prune (cron `30 4`), two phases over the cert-rotation state.
  *
- * The clear happens ONLY after a successful CA revoke — a transient Cloudflare failure leaves
- * the row intact so the next run retries. This is CA-side cleanup, not a security boundary: the
- * identity guard already stops honoring the previous fingerprint the instant cert_revoke_at
- * passes (see auth/identity.ts), so a stuck revoke never re-admits the old cert.
+ * Phase 1 — retire expired grace windows: for each machine whose prev-cert grace window has elapsed,
+ * move the prev entry into the durable retired_certs queue and clear the prev columns (which now mean
+ * ONLY the grace window). The move + clear co-commit in one db.batch, guarded on the exact window we
+ * selected, so a renew that repopulated a FRESH window between the SELECT and here is left intact.
  *
- * A row with a NULL prev_cert_id — a pre-M4 cert enrolled by enroll-cert.sh, whose CA id the hub
- * never recorded — cannot be revoked here and its underlying cert may still be CA-valid until its
- * natural expiry. So we do NOT free the fingerprint: we clear only cert_revoke_at and keep
- * prev_cert_fp_sha256 (with its NULL id) as a TOMBSTONE, so adminMachines' clash check keeps the fp
- * unclaimable while some holder might still authenticate with the old cert. Logged for manual
- * cleanup. Only a confirmed CA revoke (known id) frees the fingerprint for reuse. */
+ * Phase 2 — drain the queue: every still-reserved entry (revoked_at IS NULL) with a known cert_id is
+ * revoked at the CA and stamped revoked_at (the row is kept as an audit trail); its fingerprint then
+ * returns to the reusable pool. An unknown-id entry (pre-M4/enroll cert, CA id never recorded) can't
+ * be revoked here — it stays reserved and is logged for manual cleanup. This is CA-side cleanup, not
+ * a security boundary: machineIdentity already stops honoring a fingerprint the instant it leaves the
+ * current/in-grace-prev slots, so a reserved-but-unrevoked cert never authenticates. */
 export async function runDailyPrune(env: Env): Promise<void> {
   const due = await env.DB.prepare(
     `SELECT machine_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at FROM machines
@@ -57,40 +56,37 @@ export async function runDailyPrune(env: Env): Promise<void> {
   ).all<{ machine_id: string; prev_cert_fp_sha256: string; prev_cert_id: string | null; cert_revoke_at: string }>();
 
   for (const row of due.results) {
-    // Each UPDATE below is conditional on the EXACT grace window we selected. A renew that landed
-    // between the SELECT and here repopulated prev_cert_fp_sha256/cert_revoke_at with a FRESH window,
-    // so cert_revoke_at = ?3 no longer matches and the UPDATE no-ops rather than wiping new state.
-    if (!row.prev_cert_id) {
-      // Unknown CA id → cannot revoke, cannot prove it's gone. Retire the grace window (identity
-      // already stops honoring it) but keep the fp reserved as a tombstone so no other machine can
-      // claim a fingerprint whose cert might still be live.
-      await env.DB.prepare(
-        `UPDATE machines SET cert_revoke_at = NULL
-          WHERE machine_id = ?1 AND prev_cert_fp_sha256 = ?2 AND cert_revoke_at = ?3 AND prev_cert_id IS NULL`,
-      )
-        .bind(row.machine_id, row.prev_cert_fp_sha256, row.cert_revoke_at)
-        .run();
-      console.log(JSON.stringify({ event: 'hub.prune.tombstoned', machine: row.machine_id, prev_cert_fp_sha256: row.prev_cert_fp_sha256 }));
+    const now = new Date().toISOString();
+    // INSERT the reservation first (guarded on the window still being present), THEN clear it — both
+    // conditional on the EXACT prev fp + revoke_at we selected, so a fresh window from a concurrent
+    // renew (new revoke_at) matches neither statement and survives untouched.
+    const results = await env.DB.batch([
+      env.DB.prepare(
+        `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at)
+         SELECT ?2, ?3, ?1, ?5
+          WHERE EXISTS (SELECT 1 FROM machines WHERE machine_id = ?1 AND prev_cert_fp_sha256 = ?2 AND cert_revoke_at = ?4)`,
+      ).bind(row.machine_id, row.prev_cert_fp_sha256, row.prev_cert_id, row.cert_revoke_at, now),
+      env.DB.prepare(
+        `UPDATE machines SET prev_cert_fp_sha256 = NULL, prev_cert_id = NULL, cert_revoke_at = NULL
+          WHERE machine_id = ?1 AND prev_cert_fp_sha256 = ?2 AND cert_revoke_at = ?3`,
+      ).bind(row.machine_id, row.prev_cert_fp_sha256, row.cert_revoke_at),
+    ]);
+    if ((results[1]!.meta.changes ?? 0) === 0) continue; // fresh window landed; leave it for next run
+    console.log(JSON.stringify({ event: 'hub.prune.retired', machine: row.machine_id, fingerprint: row.prev_cert_fp_sha256, cert_id: row.prev_cert_id ?? null }));
+  }
+
+  const reserved = await env.DB.prepare(
+    `SELECT fingerprint, cert_id, machine_id FROM retired_certs WHERE revoked_at IS NULL`,
+  ).all<{ fingerprint: string; cert_id: string | null; machine_id: string }>();
+
+  for (const r of reserved.results) {
+    if (!r.cert_id) {
+      // Unknown CA id — can't revoke, and NULL id ≠ revoked, so keep it reserved. Logged each run so
+      // the fingerprint can be manually released once the underlying cert is confirmed gone.
+      console.log(JSON.stringify({ event: 'hub.prune.unknown_id_reservation', machine: r.machine_id, fingerprint: r.fingerprint }));
       continue;
     }
-
-    let revoked = false;
-    try {
-      revoked = await revokeClientCert(env, row.prev_cert_id);
-    } catch (e) {
-      console.log(JSON.stringify({ event: 'hub.prune.revoke_error', machine: row.machine_id, cert_id: row.prev_cert_id, error: String(e) }));
-    }
-    if (!revoked) {
-      console.log(JSON.stringify({ event: 'hub.prune.revoke_failed', machine: row.machine_id, cert_id: row.prev_cert_id }));
-      continue; // keep the row; retry next run
-    }
-    // Revoke confirmed → the CA cert is gone, so the fingerprint is genuinely free. Clear all three.
-    await env.DB.prepare(
-      `UPDATE machines SET prev_cert_fp_sha256 = NULL, prev_cert_id = NULL, cert_revoke_at = NULL
-        WHERE machine_id = ?1 AND prev_cert_fp_sha256 = ?2 AND cert_revoke_at = ?3`,
-    )
-      .bind(row.machine_id, row.prev_cert_fp_sha256, row.cert_revoke_at)
-      .run();
-    console.log(JSON.stringify({ event: 'hub.prune.revoked', machine: row.machine_id, cert_id: row.prev_cert_id }));
+    const revoked = await settleRetired(env, r.cert_id);
+    if (!revoked) console.log(JSON.stringify({ event: 'hub.prune.revoke_failed', machine: r.machine_id, cert_id: r.cert_id }));
   }
 }

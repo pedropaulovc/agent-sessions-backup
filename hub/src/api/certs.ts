@@ -50,6 +50,64 @@ export async function revokeClientCert(env: Env, certId: string): Promise<boolea
   return data.success === true;
 }
 
+/** SQL fragment + binds that INSERT a displaced cert into the retired_certs queue, but ONLY if the
+ * preceding displacement in the SAME db.batch landed (the machine's current fp is now `newFp`). This
+ * co-commits the reservation with the displacement so the fingerprint is never momentarily in
+ * neither a machines-row slot nor the queue. Params: (fingerprint, cert_id, machine_id, newFp). */
+export function queueRetiredIfDisplaced(env: Env, fingerprint: string, certId: string | null, machineId: string, newFp: string) {
+  return env.DB.prepare(
+    `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at)
+     SELECT ?1, ?2, ?3, ?5 WHERE EXISTS (SELECT 1 FROM machines WHERE machine_id = ?3 AND cert_fp_sha256 = ?4)`,
+  ).bind(fingerprint, certId, machineId, newFp, new Date().toISOString());
+}
+
+/** Insert a displaced cert into the retired_certs queue, then settle it. Standalone (not batched) —
+ * used by admin swaps, where the displacement already committed. */
+export async function retireCert(env: Env, fingerprint: string, certId: string | null, machineId: string): Promise<void> {
+  await env.DB.prepare('INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES (?1, ?2, ?3, ?4)')
+    .bind(fingerprint, certId, machineId, new Date().toISOString())
+    .run();
+  await settleRetired(env, certId);
+}
+
+/** Best-effort revoke a queued cert at the CA and stamp revoked_at on success; on failure or an
+ * unknown (NULL) id the row stays reserved (revoked_at NULL) for the prune to retry. Returns whether
+ * it is now revoked. */
+export async function settleRetired(env: Env, certId: string | null): Promise<boolean> {
+  if (!certId) return false; // unknown id — nothing to revoke; stays reserved
+  let revoked = false;
+  try {
+    revoked = await revokeClientCert(env, certId);
+  } catch (e) {
+    console.log(JSON.stringify({ event: 'hub.certs.retire_revoke_error', cert_id: certId, error: String(e) }));
+  }
+  if (!revoked) return false;
+  await env.DB.prepare('UPDATE retired_certs SET revoked_at = ?1 WHERE cert_id = ?2 AND revoked_at IS NULL')
+    .bind(new Date().toISOString(), certId)
+    .run();
+  return true;
+}
+
+/** A D1 write failed AFTER the CA signed a successor — the cert is live but not recorded in any
+ * machines-row slot. Best-effort revoke it; if that also fails, queue it so it is never an untracked
+ * live cert (worst case: at least its id is logged for manual cleanup). */
+async function reclaimSignedOrphan(env: Env, fingerprint: string, certId: string, machineId: string): Promise<void> {
+  let revoked = false;
+  try {
+    revoked = await revokeClientCert(env, certId);
+  } catch (e) {
+    console.log(JSON.stringify({ event: 'hub.certs.orphan_revoke_failed', machine: machineId, cert_id: certId, error: String(e) }));
+  }
+  if (revoked) return;
+  try {
+    await env.DB.prepare('INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES (?1, ?2, ?3, ?4)')
+      .bind(fingerprint, certId, machineId, new Date().toISOString())
+      .run();
+  } catch (e) {
+    console.log(JSON.stringify({ event: 'hub.certs.orphan_queue_failed', machine: machineId, cert_id: certId, error: String(e) }));
+  }
+}
+
 /** POST /api/v1/certs/renew — a still-valid machine cert requests its own successor. The body
  * carries a fresh CSR; the hub has the managed CA sign it, swaps the new fingerprint in as
  * current, and keeps the OLD fingerprint valid for CERT_GRACE_DAYS (the prune revokes it then).
@@ -81,48 +139,67 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
   }
   const newFp = await certFingerprint(signed.certificate);
 
-  const cur = await env.DB.prepare('SELECT cert_fp_sha256, cert_id, prev_cert_id, cert_revoke_at FROM machines WHERE machine_id = ?1')
+  const cur = await env.DB.prepare('SELECT cert_fp_sha256, cert_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at FROM machines WHERE machine_id = ?1')
     .bind(identity.machineId)
-    .first<{ cert_fp_sha256: string | null; cert_id: string | null; prev_cert_id: string | null; cert_revoke_at: string | null }>();
+    .first<{ cert_fp_sha256: string | null; cert_id: string | null; prev_cert_fp_sha256: string | null; prev_cert_id: string | null; cert_revoke_at: string | null }>();
 
   const authFp = identity.certFp ?? null;
   const onCurrent = authFp !== null && authFp === cur?.cert_fp_sha256;
 
+  // The cert this rotation displaces out of a machines-row slot (queued for revoke so it can never
+  // become an untracked-but-CA-valid fingerprint): the old in-grace prev on a normal rotation, or
+  // the orphaned successor (old current) on a recovery.
+  const displaced = onCurrent
+    ? { fp: cur?.prev_cert_fp_sha256 ?? null, id: cur?.prev_cert_id ?? null }
+    : { fp: cur?.cert_fp_sha256 ?? null, id: cur?.cert_id ?? null };
+
   let changes = 0;
   let effectiveRevokeAt: string | null;
-  if (onCurrent) {
-    // NORMAL rotation: authenticated on the CURRENT cert. Retire it into a fresh grace window.
-    // ISO8601 millis+'Z' matches strftime('%Y-%m-%dT%H:%M:%fZ') so the identity guard compares
-    // chronologically. Compare-and-swap on the authenticating fp: two renews racing off the same
-    // current cert serialize — the first flips current, the second's WHERE no longer matches
-    // (changes === 0) and it 409s, rather than last-writer-wins stranding the winner's cert.
-    effectiveRevokeAt = new Date(Date.now() + CERT_GRACE_DAYS * 86_400_000).toISOString();
-    const res = await env.DB.prepare(
-      `UPDATE machines
-         SET prev_cert_fp_sha256 = ?2, prev_cert_id = ?3, cert_revoke_at = ?4,
-             cert_fp_sha256 = ?5, cert_id = ?6
-       WHERE machine_id = ?1 AND cert_fp_sha256 = ?7`,
-    )
-      .bind(identity.machineId, cur!.cert_fp_sha256, cur!.cert_id, effectiveRevokeAt, newFp, signed.id, authFp)
-      .run();
-    changes = res.meta.changes ?? 0;
-  } else {
-    // RECOVERY: authenticated on the IN-GRACE PREVIOUS cert. The successor from an earlier renewal
-    // was never installed (lost response), so the machine is stuck holding the old cert and would
-    // otherwise die at cert_revoke_at with no path forward. Replace the orphaned successor (the
-    // current slot) with this new cert WITHOUT touching the prev slot or its cert_revoke_at — grace
-    // must NOT extend, or repeated prev-auth renews would keep an old cert alive forever. Guarded on
-    // the observed current fp too so concurrent recoveries serialize. Keep the ORIGINAL revoke_at.
-    effectiveRevokeAt = cur?.cert_revoke_at ?? null;
-    const res = await env.DB.prepare(
-      `UPDATE machines
-         SET cert_fp_sha256 = ?2, cert_id = ?3
-       WHERE machine_id = ?1 AND prev_cert_fp_sha256 = ?4 AND cert_fp_sha256 = ?5
-         AND cert_revoke_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
-    )
-      .bind(identity.machineId, newFp, signed.id, authFp, cur?.cert_fp_sha256 ?? null)
-      .run();
-    changes = res.meta.changes ?? 0;
+  try {
+    if (onCurrent) {
+      // NORMAL rotation: authenticated on the CURRENT cert. Retire it into a fresh grace window.
+      // ISO8601 millis+'Z' matches strftime('%Y-%m-%dT%H:%M:%fZ') so the identity guard compares
+      // chronologically. Compare-and-swap on the authenticating fp: two renews racing off the same
+      // current cert serialize — the first flips current, the second's WHERE no longer matches
+      // (changes === 0) and it 409s, rather than last-writer-wins stranding the winner's cert. The
+      // guarded queue INSERT co-commits with the swap so a displaced in-grace prev is never dropped.
+      effectiveRevokeAt = new Date(Date.now() + CERT_GRACE_DAYS * 86_400_000).toISOString();
+      const swap = env.DB.prepare(
+        `UPDATE machines
+           SET prev_cert_fp_sha256 = ?2, prev_cert_id = ?3, cert_revoke_at = ?4,
+               cert_fp_sha256 = ?5, cert_id = ?6
+         WHERE machine_id = ?1 AND cert_fp_sha256 = ?7`,
+      ).bind(identity.machineId, cur!.cert_fp_sha256, cur!.cert_id, effectiveRevokeAt, newFp, signed.id, authFp);
+      const stmts = [swap];
+      if (displaced.fp) stmts.push(queueRetiredIfDisplaced(env, displaced.fp, displaced.id, identity.machineId, newFp));
+      const results = await env.DB.batch(stmts);
+      changes = results[0]!.meta.changes ?? 0;
+    } else {
+      // RECOVERY: authenticated on the IN-GRACE PREVIOUS cert. The successor from an earlier renewal
+      // was never installed (lost response), so the machine is stuck holding the old cert and would
+      // otherwise die at cert_revoke_at with no path forward. Replace the orphaned successor (the
+      // current slot) with this new cert WITHOUT touching the prev slot or its cert_revoke_at — grace
+      // must NOT extend, or repeated prev-auth renews would keep an old cert alive forever. Guarded on
+      // the observed current fp too so concurrent recoveries serialize. Keep the ORIGINAL revoke_at.
+      // The displaced orphaned successor is queued (co-committed) rather than silently dropped.
+      effectiveRevokeAt = cur?.cert_revoke_at ?? null;
+      const swap = env.DB.prepare(
+        `UPDATE machines
+           SET cert_fp_sha256 = ?2, cert_id = ?3
+         WHERE machine_id = ?1 AND prev_cert_fp_sha256 = ?4 AND cert_fp_sha256 = ?5
+           AND cert_revoke_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
+      ).bind(identity.machineId, newFp, signed.id, authFp, cur?.cert_fp_sha256 ?? null);
+      const stmts = [swap];
+      if (displaced.fp) stmts.push(queueRetiredIfDisplaced(env, displaced.fp, displaced.id, identity.machineId, newFp));
+      const results = await env.DB.batch(stmts);
+      changes = results[0]!.meta.changes ?? 0;
+    }
+  } catch (e) {
+    // The CA already signed the successor but the D1 write threw (outage, constraint, lock). Without
+    // this the cert would be live at the CA yet recorded nowhere — a per-retry leak. Reclaim it.
+    console.log(JSON.stringify({ event: 'hub.certs.renew_write_failed', machine: identity.machineId, cert_id: signed.id, error: String(e) }));
+    await reclaimSignedOrphan(env, newFp, signed.id, identity.machineId);
+    return Response.json({ error: 'renew_write_failed' }, { status: 500 });
   }
 
   if (changes === 0) {
@@ -138,28 +215,9 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
     return Response.json({ error: 'renew_conflict' }, { status: 409 });
   }
 
-  // Recovery displaced the orphaned successor (the old current) — best-effort revoke it too. On the
-  // normal path the old current moved into the grace window and must stay valid, so we never touch it.
-  if (!onCurrent && cur?.cert_id) {
-    try {
-      await revokeClientCert(env, cur.cert_id);
-    } catch (e) {
-      console.log(JSON.stringify({ event: 'hub.certs.orphan_revoke_failed', machine: identity.machineId, cert_id: cur.cert_id, error: String(e) }));
-    }
-  }
-
-  // Normal rotation OVERWRITES the grace slot: if a cert was already sitting in prev_cert_id (an
-  // earlier rotation still within its window), the row no longer references it, so the prune will
-  // never see it and it would linger at the CA until its 1-year expiry — a leak that repeated renews
-  // compound into zone client-cert quota exhaustion. Best-effort revoke the displaced prev now. Only
-  // the CAS winner reaches here (changes === 1), so exactly one caller revokes it.
-  if (onCurrent && cur?.prev_cert_id) {
-    try {
-      await revokeClientCert(env, cur.prev_cert_id);
-    } catch (e) {
-      console.log(JSON.stringify({ event: 'hub.certs.displaced_revoke_failed', machine: identity.machineId, cert_id: cur.prev_cert_id, error: String(e) }));
-    }
-  }
+  // The swap won and (if there was a displaced cert) it's now reserved in the queue — try to revoke
+  // it immediately and stamp revoked_at. On failure it stays reserved for the daily prune to retry.
+  if (displaced.fp) await settleRetired(env, displaced.id);
 
   console.log(JSON.stringify({ event: 'hub.certs.renewed', machine: identity.machineId, recovery: !onCurrent, revoke_at: effectiveRevokeAt }));
   return Response.json({

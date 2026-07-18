@@ -1,5 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
+import { retireCert } from './certs';
 import { normalizeToBound } from './sessions';
 
 /** POST /api/v1/heartbeat */
@@ -91,20 +92,20 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
       return Response.json({ machines: rows.results });
     }
 
-    // Reject a fingerprint that appears on ANOTHER machine as its current cert OR its previous cert
-    // — while prev_cert_fp_sha256 is set at all, regardless of grace or cert_id. A cert is only
-    // safe to reuse once that column is cleared, and the prune clears it exactly when the underlying
-    // CA cert is confirmed gone. A NULL prev_cert_id does NOT mean "revoked": for pre-M4 rows the hub
-    // never recorded the CA id, so the old client cert may still be CA-valid — reusing that fp would
-    // let whoever holds the old cert authenticate as the new row. A managed cert fingerprint is
-    // unique per machine; letting two rows share one would make machineIdentity's unordered .first()
-    // authenticate as whichever row it returned. This subsumes the plain current-fp UNIQUE collision
-    // into an explicit 409 (clearer than a constraint-violation catch).
+    // Reject a fingerprint still in use anywhere: another machine's current cert, another machine's
+    // in-grace prev cert, OR a still-reserved entry in the retired_certs queue (a displaced cert
+    // whose CA revoke hasn't been confirmed — it may still be valid at the CA, so reusing the fp
+    // would let whoever holds the old cert authenticate as the new row). The queue is the single
+    // source of truth for "reserved but not on a machines row"; prev columns now mean ONLY the grace
+    // window. A managed cert fingerprint is unique per machine; letting two rows share one would make
+    // machineIdentity's unordered .first() authenticate as whichever row it returned. This subsumes
+    // the plain current-fp UNIQUE collision into an explicit 409 (clearer than a constraint catch).
     if (body.cert_fp_sha256) {
       const clash = await env.DB.prepare(
-        `SELECT machine_id FROM machines
-          WHERE (cert_fp_sha256 = ?1 OR prev_cert_fp_sha256 = ?1)
-            AND machine_id != ?2`,
+        `SELECT machine_id FROM machines WHERE (cert_fp_sha256 = ?1 OR prev_cert_fp_sha256 = ?1) AND machine_id != ?2
+         UNION
+         SELECT machine_id FROM retired_certs WHERE fingerprint = ?1 AND revoked_at IS NULL
+         LIMIT 1`,
       )
         .bind(body.cert_fp_sha256, body.machine_id)
         .first<{ machine_id: string }>();
@@ -127,23 +128,23 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     const isAdmin = body.is_admin !== undefined ? (body.is_admin ? 1 : 0) : existing?.is_admin ?? 0;
     const priority = body.priority ?? existing?.priority ?? 100;
 
-    // When the admin swaps in a DIFFERENT current fingerprint, the row's rotation metadata
-    // (cert_id + the prev/grace triple) belongs to the OLD cert and is now stale — a later prune
-    // could revoke a cert that's current again (rollback case) and a later renew would CAS against a
-    // dead cert_id. Reset it: adopt the body's cert_id (or NULL) and clear the grace window. We do
-    // NOT revoke the dropped cert here — the admin may be reinstating exactly that fingerprint — so
-    // it just ages out at the CA's 1-year validity; log what was dropped. Unchanged fp → keep the
-    // active rotation window untouched.
+    // When the admin swaps in a DIFFERENT current fingerprint, the row's rotation metadata (cert_id +
+    // the prev/grace triple) belongs to the OLD cert and is now stale — a later renew would CAS
+    // against a dead cert_id. Reset it and clear the grace window; the displaced old current/prev
+    // certs are moved into the retired_certs queue after the write (below) so they stay reserved and
+    // get revoked. Unchanged fp → keep the active rotation window untouched.
     //
     // Rollback special case: if the new current fp IS the row's in-grace previous fp, its CA id is
     // sitting right there in prev_cert_id — carry it into cert_id (unless the body supplies one) so
-    // the reinstated cert keeps a live id. Otherwise the row would store it with cert_id NULL and the
-    // NEXT renew would move NULL into prev_cert_id, so the prune never revokes the real cert.
+    // the reinstated cert keeps a live id.
+    //
+    // cert_id when fp is UNCHANGED: honor a body-supplied cert_id (an admin attaching/correcting a
+    // missing CA id on a helper-enrolled row) instead of always keeping the stale existing value.
     const fpChanged = certFp !== (existing?.cert_fp_sha256 ?? null);
     const rollingBack = fpChanged && certFp !== null && certFp === (existing?.prev_cert_fp_sha256 ?? null);
     const certId = fpChanged
       ? body.cert_id ?? (rollingBack ? existing?.prev_cert_id ?? null : null)
-      : existing?.cert_id ?? null;
+      : body.cert_id ?? existing?.cert_id ?? null;
     const prevFp = fpChanged ? null : existing?.prev_cert_fp_sha256 ?? null;
     const prevId = fpChanged ? null : existing?.prev_cert_id ?? null;
     const revokeAt = fpChanged ? null : existing?.cert_revoke_at ?? null;
@@ -179,6 +180,14 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     }
     if (fpChanged && existing && (existing.cert_id || existing.prev_cert_fp_sha256)) {
       console.log(JSON.stringify({ event: 'hub.admin.machines.rotation_reset', machine: body.machine_id, dropped_cert_id: existing.cert_id, dropped_prev_cert_id: existing.prev_cert_id }));
+      // The swap cleared the old current + prev out of the row's slots. Move each displaced cert into
+      // the retired_certs queue (reserved + best-effort revoked) so a still-CA-valid fingerprint is
+      // never dropped and reclaimable by another machine. The old current is always displaced (fp
+      // changed). The old prev is displaced UNLESS we just reinstated it as current (rollback).
+      if (existing.cert_fp_sha256) await retireCert(env, existing.cert_fp_sha256, existing.cert_id, body.machine_id);
+      if (existing.prev_cert_fp_sha256 && existing.prev_cert_fp_sha256 !== certFp) {
+        await retireCert(env, existing.prev_cert_fp_sha256, existing.prev_cert_id, body.machine_id);
+      }
     }
     console.log(JSON.stringify({ event: 'hub.admin.machine_upsert', machine: body.machine_id, is_admin: isAdmin }));
   }
