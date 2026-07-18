@@ -75,6 +75,7 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     hostname?: string;
     cert_fp_sha256?: string;
     cert_id?: string;
+    cert_id_unknown?: boolean;
     key_protection?: string;
     is_admin?: boolean;
     priority?: number;
@@ -88,6 +89,13 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
   // Require an actual boolean; reject anything else before it can reach the integer conversion.
   if (body.is_admin !== undefined && typeof body.is_admin !== 'boolean') {
     return Response.json({ error: 'invalid_is_admin' }, { status: 422 });
+  }
+
+  // cert_id_unknown is the legacy-import escape hatch (below) that lets a new-fp install deliberately store
+  // a NULL CA handle. A truthy non-boolean ("false") would silently enable it — same string-flag footgun as
+  // is_admin — so require an actual boolean.
+  if (body.cert_id_unknown !== undefined && typeof body.cert_id_unknown !== 'boolean') {
+    return Response.json({ error: 'invalid_cert_id_unknown' }, { status: 422 });
   }
 
   if (body.machine_id) {
@@ -253,6 +261,23 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
         console.log(JSON.stringify({ event: 'hub.admin.machines.cert_id_not_active', machine: body.machine_id, cert_id: body.cert_id, status: ca.status }));
         return Response.json({ error: 'cert_id_not_active', cert_id: body.cert_id, status: ca.status }, { status: 422 });
       }
+    }
+
+    // A brand-new current fingerprint (fpChanged, and NOT a rollback to the in-grace prev) MUST come with a
+    // cert_id: the CA handle is how the displaced old current gets revoked on the next rotation/prune. If we
+    // stored NULL here, the old current rides into prev_cert_id/retired_certs with a null id, the prune skips
+    // null ids, and the displaced managed cert stays CA-valid until expiry (orphan leak) while its fingerprint
+    // sticks in manual cleanup. Require the id — UNLESS the caller EXPLICITLY opts into a legacy/unknown-id
+    // import via cert_id_unknown:true. That escape hatch exists ONLY for the real M3-era rows with no recorded
+    // id (amet-wsl, amet-windows) and the post-merge backfill's intermediate states: it deliberately stores
+    // NULL, logs a distinct greppable event, and leaves the displaced-cert cleanup MANUAL. (A body-supplied
+    // cert_id took the verified attach path above; rollback carries the prev's own trusted id below.)
+    const installingNewFpWithoutId = fpChanged && !rollingBack && certFp !== null && body.cert_id === undefined;
+    if (installingNewFpWithoutId && !body.cert_id_unknown) {
+      return Response.json({ error: 'cert_id_required_for_new_fp', machine_id: body.machine_id }, { status: 422 });
+    }
+    if (installingNewFpWithoutId && body.cert_id_unknown) {
+      console.log(JSON.stringify({ event: 'hub.admin.machines.cert_id_unknown_install', machine: body.machine_id, cert_fp_sha256: certFp }));
     }
 
     const certId = fpChanged

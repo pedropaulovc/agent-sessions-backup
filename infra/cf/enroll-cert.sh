@@ -195,6 +195,24 @@ print(fp)
 PY
 }
 
+# Parse a wrangler `d1 execute --json` payload and print the machines row's is_admin (empty if absent).
+# Scans every statement's results for the `is_admin` field. Prints ONLY the value on stdout.
+parse_admin() {  # $1 = wrangler --json output
+  python3 - "$1" <<'PY'
+import json,sys
+try:
+    d=json.loads(sys.argv[1])
+except Exception:
+    sys.exit(1)
+val=""
+for stmt in (d if isinstance(d, list) else []):
+    for r in (stmt.get("results") or []):
+        if r.get("is_admin") is not None:
+            val=str(r["is_admin"])
+print(val)
+PY
+}
+
 # Fresh, SELECT-only read of the machines row's fingerprint — used to VERIFY reality after an ambiguous
 # write. Prints the fp on stdout (empty if no row); returns non-zero if the read OR the parse fails, so
 # the caller can distinguish "provably not ours" from "couldn't tell".
@@ -261,11 +279,19 @@ printf 'cert_id=%s\nfp=%s\n' "$CERT_ID" "$FP" > "$CRT_TMP_ID"
 # the revoke-and-abort path unchanged. The IS NULL guard makes cert DISPLACEMENT impossible here by
 # construction, so fresh-only semantics hold without a DO NOTHING no-op blocking legitimate first-time
 # enrollment of certless-but-existing rows. (Rotations still go through the hub admin endpoint.)
+#
+# is_admin and key_protection are carried through excluded.* too: enrollment is operator-run WITH the CF
+# token, so the script's DECLARED role/key-protection wins over a certless metadata-row's defaults —
+# otherwise `enroll-cert.sh --admin` over a reindex parent-insert row reports success while the row keeps
+# is_admin=0 and the new cert can't reach admin endpoints. The inverse is deliberate: enrolling WITHOUT
+# --admin over a certless is_admin=1 row DEMOTES it — that's the operator's declaration, and the read-back
+# below makes the resulting is_admin visible.
 INSERT_SQL="INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, cert_id, key_protection, is_admin)
        VALUES ('$MACHINE_ID', '$OS_TAG', '$HOSTNAME_VAL', '$FP', '$CERT_ID', 'software', $IS_ADMIN)
        ON CONFLICT (machine_id) DO UPDATE SET
          cert_fp_sha256 = excluded.cert_fp_sha256, cert_id = excluded.cert_id,
-         os = excluded.os, hostname = excluded.hostname
+         os = excluded.os, hostname = excluded.hostname,
+         key_protection = excluded.key_protection, is_admin = excluded.is_admin
        WHERE machines.cert_fp_sha256 IS NULL;"
 
 # The D1 write needs a wrangler login with D1 access — NOT the just-in-time CF_API_TOKEN, which is zone-SSL
@@ -277,7 +303,7 @@ if npx --yes wrangler whoami >/dev/null 2>&1; then
   # (D1 auth, a lock/outage, or a rejected statement) — the cert is minted but unregistered, so revoke it
   # before aborting rather than leaking it under set -e.
   if ! CUR_JSON="$(CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID" npx --yes wrangler d1 execute "$DB_NAME" --remote --json \
-      --command "$INSERT_SQL SELECT cert_fp_sha256 AS fp FROM machines WHERE machine_id='$MACHINE_ID';")"; then
+      --command "$INSERT_SQL SELECT cert_fp_sha256 AS fp, is_admin FROM machines WHERE machine_id='$MACHINE_ID';")"; then
     # The combined INSERT;SELECT exited non-zero, but --command runs multiple ';' statements WITHOUT a
     # transaction: the INSERT may have COMMITTED before the SELECT/output failed. Revoking blindly could
     # kill a cert the row now points at — a fresh-enrollment lockout. So VERIFY with a separate fresh read
@@ -331,9 +357,24 @@ if npx --yes wrangler whoami >/dev/null 2>&1; then
     revoke_unused_cert
     exit 1
   fi
+  # Belt for the WHERE-guard suspenders: the fp matched, so enrollment took — and BOTH write paths (the
+  # fresh-insert VALUES and the certless-fill DO UPDATE) set is_admin, so a mismatch here should be
+  # impossible. If it ever fires (a concurrent write, or a future SQL edit that drops is_admin from the SET),
+  # the cert is registered and VALID — promote it so a working cert isn't stranded — but exit non-zero with a
+  # loud pointer to correct the flag via the admin endpoint.
+  CUR_ADMIN="$(parse_admin "$CUR_JSON" 2>/dev/null || true)"
   mv "$CRT_TMP" "$CRT"
   rm -f "$CRT_TMP_ID"
-  echo "    enrolled: $MACHINE_ID -> $FP"
+  if [ -n "$CUR_ADMIN" ] && [ "$CUR_ADMIN" != "$IS_ADMIN" ]; then
+    if [ "$IS_ADMIN" = 1 ]; then REQ_ADMIN_BOOL=true; else REQ_ADMIN_BOOL=false; fi
+    echo >&2
+    echo "    WARN: is_admin mismatch — requested is_admin=$IS_ADMIN but the row shows is_admin=$CUR_ADMIN." >&2
+    echo "    The cert is enrolled and VALID (installed at $CRT); only the admin flag is wrong. Fix it via the" >&2
+    echo "    admin endpoint, then you're done:" >&2
+    echo "      POST /api/v1/admin/machines { \"machine_id\": \"$MACHINE_ID\", \"is_admin\": $REQ_ADMIN_BOOL }" >&2
+    exit 1
+  fi
+  echo "    enrolled: $MACHINE_ID -> $FP (is_admin=$IS_ADMIN)"
   print_install_steps
 else
   # No wrangler here (fresh collector box). We CANNOT verify the insert from this box, and a bare
@@ -346,7 +387,7 @@ else
   echo "    (INSERT then read-back) and CHECK the returned fp BEFORE continuing:" >&2
   echo >&2
   echo "  CLOUDFLARE_ACCOUNT_ID=$ACCOUNT_ID npx wrangler d1 execute $DB_NAME --remote \\" >&2
-  echo "    --command \"$INSERT_SQL SELECT cert_fp_sha256 AS fp FROM machines WHERE machine_id='$MACHINE_ID';\"" >&2
+  echo "    --command \"$INSERT_SQL SELECT cert_fp_sha256 AS fp, is_admin FROM machines WHERE machine_id='$MACHINE_ID';\"" >&2
   echo >&2
   echo "    The signed cert is saved (unverified) at $CRT_TMP (id in $CRT_TMP_ID); any pre-existing $CRT is left" >&2
   echo "    untouched until you confirm below. The INSERT's guard fills a certless row but never overwrites an" >&2

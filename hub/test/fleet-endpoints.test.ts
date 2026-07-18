@@ -212,6 +212,25 @@ describe('POST /api/v1/certs/renew', () => {
     expect(await machineIdentity(reqWithCert(fpC), prodEnv)).toMatchObject({ machineId: 'renew-2' });
   });
 
+  it('502s when the CA signs but returns a result with no id, minting no orphan to mis-revoke', async () => {
+    // signClientCert must reject a success:true whose result is missing id: otherwise renewCert would carry
+    // signed.id === undefined into the D1 write, and the orphan cleanup would DELETE /client_certificates/
+    // undefined while the real cert stays active. It must throw BEFORE any write — so no DELETE is issued.
+    await seedMachine('renew-noid', { fp: 'rni-fpA', certId: 'rni-cert-A' });
+    const seen: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen.push(`${init?.method ?? 'GET'} ${String(input)}`);
+      // success:true but the result has NO id (certificate + expires_on present)
+      return new Response(JSON.stringify({ success: true, result: { certificate: fakeCertPem('rni-B'), expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    const res = await renewCert(reqJson({ csr: 'csr-body' }), cfEnv, machine('renew-noid', false, 'rni-fpA'));
+    expect(res.status).toBe(502);
+    expect(((await res.json()) as { error: string }).error).toBe('cf_sign_failed');
+    expect((await row('renew-noid'))?.cert_fp_sha256).toBe('rni-fpA'); // unchanged — no swap happened
+    expect(seen.some((s) => s.includes('/undefined'))).toBe(false); // never tried to revoke undefined
+    expect(seen.some((s) => s.startsWith('DELETE'))).toBe(false); // no revoke attempted at all
+  });
+
   // Sign-sequence stub: returns the given fake certs on successive sign POSTs and records DELETEs.
   function stubSignAndRevoke(seeds: Array<{ seed: string; id: string }>) {
     let i = 0;
@@ -689,7 +708,7 @@ describe('POST /api/v1/admin/machines', () => {
 
   it('upserts a machine and returns the roster for an admin cert', async () => {
     const res = await adminMachines(
-      reqJson({ machine_id: 'am-new', os: 'linux', cert_fp_sha256: hexfp('fp-am-new'), is_admin: true, priority: 50 }),
+      reqJson({ machine_id: 'am-new', os: 'linux', cert_fp_sha256: hexfp('fp-am-new'), is_admin: true, priority: 50, cert_id_unknown: true }),
       testEnv,
       machine('am-admin', true),
     );
@@ -728,7 +747,7 @@ describe('POST /api/v1/admin/machines', () => {
   });
 
   it('409s a duplicate CURRENT fingerprint (explicit pre-check, not a UNIQUE-violation catch)', async () => {
-    await adminMachines(reqJson({ machine_id: 'am-a', cert_fp_sha256: hexfp('fp-dup') }), testEnv, machine('am-admin', true));
+    await adminMachines(reqJson({ machine_id: 'am-a', cert_fp_sha256: hexfp('fp-dup'), cert_id_unknown: true }), testEnv, machine('am-admin', true));
     const res = await adminMachines(reqJson({ machine_id: 'am-b', cert_fp_sha256: hexfp('fp-dup') }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(409);
     expect(((await res.json()) as { error: string }).error).toBe('fingerprint_in_use');
@@ -743,7 +762,7 @@ describe('POST /api/v1/admin/machines', () => {
 
   it('resets rotation metadata when the current fingerprint changes (prune then finds nothing to revoke)', async () => {
     await seedMachine('am-rot', { fp: 'am-rot-cur', certId: 'am-rot-certid', prevFp: 'am-rot-prev', prevCertId: 'am-rot-previd', revokeAt: '2000-01-01T00:00:00.000Z' });
-    await adminMachines(reqJson({ machine_id: 'am-rot', cert_fp_sha256: hexfp('am-rot-new') }), testEnv, machine('am-admin', true));
+    await adminMachines(reqJson({ machine_id: 'am-rot', cert_fp_sha256: hexfp('am-rot-new'), cert_id_unknown: true }), testEnv, machine('am-admin', true));
     const r = await row('am-rot');
     expect(r?.cert_fp_sha256).toBe(hexfp('am-rot-new'));
     expect(r?.cert_id).toBeNull(); // no body cert_id given -> reset to NULL
@@ -830,7 +849,7 @@ describe('POST /api/v1/admin/machines', () => {
       await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('${hexfp('bk-A')}', 'cert-bk-A', 'am-carry', '2000-01-01T00:00:00.000Z')`).run();
       return realBatch(stmts);
     });
-    const res = await adminMachines(reqJson({ machine_id: 'am-carry', cert_fp_sha256: hexfp('bk-A') }), testEnv, machine('am-admin', true));
+    const res = await adminMachines(reqJson({ machine_id: 'am-carry', cert_fp_sha256: hexfp('bk-A'), cert_id_unknown: true }), testEnv, machine('am-admin', true));
     spy.mockRestore();
     expect(res.status).toBe(200);
     const r = await row('am-carry');
@@ -875,7 +894,7 @@ describe('POST /api/v1/admin/machines', () => {
       ).run();
       return realBatch(stmts);
     });
-    const res = await adminMachines(reqJson({ machine_id: 'am-lose', cert_fp_sha256: hexfp('cw-C') }), testEnv, machine('am-admin', true));
+    const res = await adminMachines(reqJson({ machine_id: 'am-lose', cert_fp_sha256: hexfp('cw-C'), cert_id_unknown: true }), testEnv, machine('am-admin', true));
     spy.mockRestore();
     expect(res.status).toBe(409); // lost the full-state CAS
     expect(await retired('cw-A')).toBeNull(); // NOT queued by the loser
@@ -922,7 +941,7 @@ describe('POST /api/v1/admin/machines', () => {
     await testEnv.DB.prepare(
       `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, revoked_at) VALUES ('${hexfp('q-done-fp')}', 'q-done-id', 'q-owner', '2000-01-01T00:00:00.000Z', '2000-01-02T00:00:00.000Z')`,
     ).run();
-    const res = await adminMachines(reqJson({ machine_id: 'q-done-claimant', cert_fp_sha256: hexfp('q-done-fp') }), testEnv, machine('am-admin', true));
+    const res = await adminMachines(reqJson({ machine_id: 'q-done-claimant', cert_fp_sha256: hexfp('q-done-fp'), cert_id_unknown: true }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(200);
     expect((await row('q-done-claimant'))?.cert_fp_sha256).toBe(hexfp('q-done-fp'));
   });
@@ -1113,9 +1132,43 @@ describe('POST /api/v1/admin/machines', () => {
     // mTLS fingerprints arrive lowercase; accept an uppercase-typed valid fp but store it lowercase so it
     // matches request.cf.tlsClientAuth.certFingerprintSHA256.
     const upper = hexfp('upper-fp').toUpperCase();
-    const res = await adminMachines(reqJson({ machine_id: 'upper-fp-m', cert_fp_sha256: upper }), testEnv, machine('am-admin', true));
+    const res = await adminMachines(reqJson({ machine_id: 'upper-fp-m', cert_fp_sha256: upper, cert_id_unknown: true }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(200);
     expect((await row('upper-fp-m'))?.cert_fp_sha256).toBe(hexfp('upper-fp')); // stored lowercase
+  });
+
+  it('422s a NEW admin fingerprint installed without a cert_id (no NULL-handle orphan)', async () => {
+    // Swapping to a brand-new fp with no cert_id would store a NULL CA handle; the displaced old current then
+    // rides to prev/retired with a null id the prune skips, stranding a CA-valid cert. Require the id.
+    await seedMachine('newfp-noid', { fp: hexfp('nfn-cur'), certId: 'nfn-cur-id' });
+    const res = await adminMachines(reqJson({ machine_id: 'newfp-noid', cert_fp_sha256: hexfp('nfn-new') }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as { error: string }).error).toBe('cert_id_required_for_new_fp');
+    expect((await row('newfp-noid'))?.cert_fp_sha256).toBe(hexfp('nfn-cur')); // unchanged
+  });
+
+  it('cert_id_unknown:true installs a NEW fp with a NULL handle and logs a distinct event (legacy import)', async () => {
+    // The explicit legacy/unknown-id escape hatch: deliberately store NULL for a real M3-era cert with no
+    // recorded id, log a greppable event, and leave the displaced cert's cleanup manual.
+    await seedMachine('newfp-unknown', { fp: hexfp('nfu-cur'), certId: 'nfu-cur-id' });
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => { logs.push(String(args[0])); });
+    const res = await adminMachines(reqJson({ machine_id: 'newfp-unknown', cert_fp_sha256: hexfp('nfu-new'), cert_id_unknown: true }), testEnv, machine('am-admin', true));
+    spy.mockRestore();
+    expect(res.status).toBe(200);
+    const r = await row('newfp-unknown');
+    expect(r?.cert_fp_sha256).toBe(hexfp('nfu-new'));
+    expect(r?.cert_id).toBeNull(); // deliberately NULL for a legacy import
+    const events = logs.map((l) => JSON.parse(l) as { event: string });
+    expect(events.some((e) => e.event === 'hub.admin.machines.cert_id_unknown_install')).toBe(true);
+    expect((await retired(hexfp('nfu-cur')))?.cert_id).toBe('nfu-cur-id'); // displaced old current still reserved
+  });
+
+  it('422s a non-boolean cert_id_unknown (string-flag footgun, same class as is_admin)', async () => {
+    const res = await adminMachines(reqJson({ machine_id: 'ciu-str', cert_fp_sha256: hexfp('ciu-new'), cert_id_unknown: 'false' }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as { error: string }).error).toBe('invalid_cert_id_unknown');
+    expect(await row('ciu-str')).toBeNull();
   });
 
   it('422s a body cert_id supplied with NO fingerprint to bind it to', async () => {
@@ -1147,7 +1200,7 @@ describe('POST /api/v1/admin/machines', () => {
     // reserved in the queue, or another machine could claim a still-CA-valid fingerprint. (The revoke
     // is async — the stub returns pending_revocation — so revoked_at stays NULL until a prune poll.)
     await seedMachine('am-swap', { fp: 'swap-cur', certId: 'cert-swap-cur', prevFp: 'swap-prev', prevCertId: 'cert-swap-prev', revokeAt: '2999-01-01T00:00:00.000Z' });
-    const res = await adminMachines(reqJson({ machine_id: 'am-swap', cert_fp_sha256: hexfp('swap-new') }), testEnv, machine('am-admin', true));
+    const res = await adminMachines(reqJson({ machine_id: 'am-swap', cert_fp_sha256: hexfp('swap-new'), cert_id_unknown: true }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(200);
     const r = await row('am-swap');
     expect(r?.cert_fp_sha256).toBe(hexfp('swap-new'));
@@ -1160,7 +1213,7 @@ describe('POST /api/v1/admin/machines', () => {
     // Helper-enrolled row: cert_fp set, cert_id NULL, no prev. Swapping its fp must still queue the
     // old current, or a possibly-still-CA-valid legacy cert is dropped untracked and reclaimable.
     await seedMachine('am-nullid', { fp: hexfp('nullid-old') }); // certId + prev omitted -> NULL
-    const res = await adminMachines(reqJson({ machine_id: 'am-nullid', cert_fp_sha256: hexfp('nullid-new') }), testEnv, machine('am-admin', true));
+    const res = await adminMachines(reqJson({ machine_id: 'am-nullid', cert_fp_sha256: hexfp('nullid-new'), cert_id_unknown: true }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(200);
     expect((await row('am-nullid'))?.cert_fp_sha256).toBe(hexfp('nullid-new'));
     const q = await retired(hexfp('nullid-old'));
@@ -1222,7 +1275,7 @@ describe('POST /api/v1/admin/machines', () => {
       };
       return stmt;
     });
-    const res = await adminMachines(reqJson({ machine_id: 'race-new', cert_fp_sha256: hexfp('race-loser-fp') }), testEnv, machine('am-admin', true));
+    const res = await adminMachines(reqJson({ machine_id: 'race-new', cert_fp_sha256: hexfp('race-loser-fp'), cert_id_unknown: true }), testEnv, machine('am-admin', true));
     spy.mockRestore();
     expect(res.status).toBe(409);
     expect(((await res.json()) as { error: string }).error).toBe('concurrent_rotation');
@@ -1287,7 +1340,7 @@ describe('POST /api/v1/admin/machines', () => {
       };
       return stmt;
     });
-    const res = await adminMachines(reqJson({ machine_id: 'cas-race', cert_fp_sha256: hexfp('cas-C') }), testEnv, machine('am-admin', true));
+    const res = await adminMachines(reqJson({ machine_id: 'cas-race', cert_fp_sha256: hexfp('cas-C'), cert_id_unknown: true }), testEnv, machine('am-admin', true));
     spy.mockRestore();
     expect(res.status).toBe(409);
     expect(((await res.json()) as { error: string }).error).toBe('concurrent_rotation');
@@ -1490,7 +1543,7 @@ describe('daily prune (cert revoke)', () => {
     await runDailyPrune(cfEnv);
     expect((await row('prune-free'))?.prev_cert_fp_sha256).toBeNull(); // grace slot cleared
     expect((await retired(hexfp('pf-old')))?.revoked_at).not.toBeNull(); // revoked + stamped in the queue
-    const reuse = await adminMachines(reqJson({ machine_id: 'prune-free-other', cert_fp_sha256: hexfp('pf-old') }), testEnv, machine('am-admin', true));
+    const reuse = await adminMachines(reqJson({ machine_id: 'prune-free-other', cert_fp_sha256: hexfp('pf-old'), cert_id_unknown: true }), testEnv, machine('am-admin', true));
     expect(reuse.status).toBe(200); // now claimable
   });
 

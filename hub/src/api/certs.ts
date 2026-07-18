@@ -44,10 +44,23 @@ async function signClientCert(env: Env, csr: string): Promise<SignedCert> {
   });
   reportCfAuthFailure(res, 'sign', null);
   const data = (await res.json()) as { success?: boolean; result?: SignedCert; errors?: unknown };
-  if (!data.success || !data.result) {
-    throw new Error(`cf client_certificates sign failed: ${JSON.stringify(data.errors)}`);
+  const r = data.result;
+  // Validate the RESULT SHAPE, not just success. A success:true with a malformed result (missing id, or a
+  // PEM-less certificate) must NOT flow on: renewCert would carry signed.id === undefined into the D1 write,
+  // and the orphan cleanup would then try to revoke /client_certificates/undefined while the actually-minted
+  // cert stays CA-valid — an unactionable orphan. Require id + certificate + expires_on to be present,
+  // non-empty strings. Same fail-closed-on-absent-field pattern as getClientCertFingerprint (round 17).
+  // Throw with the raw errors JSON (never the token) so a real CF error is still legible.
+  if (
+    !data.success ||
+    r === undefined ||
+    typeof r.id !== 'string' || r.id === '' ||
+    typeof r.certificate !== 'string' || r.certificate === '' ||
+    typeof r.expires_on !== 'string' || r.expires_on === ''
+  ) {
+    throw new Error(`cf client_certificates sign failed or returned a malformed result: ${JSON.stringify(data.errors ?? null)}`);
   }
-  return data.result;
+  return r;
 }
 
 // Cloudflare's managed-CA client cert lifecycle. A DELETE (revoke) is ASYNCHRONOUS: it moves the
