@@ -143,11 +143,20 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     // window. A managed cert fingerprint is unique per machine; letting two rows share one would make
     // machineIdentity's unordered .first() authenticate as whichever row it returned. This subsumes
     // the plain current-fp UNIQUE collision into an explicit 409 (clearer than a constraint catch).
+    //
+    // ONE exception in the retired_certs arm: THIS machine's OWN UNCLAIMED reservation (claimed_at IS NULL)
+    // is excluded, so it falls through to the guarded same-machine unqueue/CAS logic below. That is the
+    // rollback-recovery path: when a CA DELETE was rejected, pollRetired/settleRetired RELEASE claimed_at
+    // (the cert is still active and safe to reinstate), and the admin rollback to that same fingerprint IS
+    // the recovery — 409ing it here would strand the machine on a successor it may never have installed.
+    // The unqueue below claims + removes the reservation atomically in the swap batch. A same-machine
+    // CLAIMED reservation still 409s: claimed_at set means a prune's async CA DELETE is mid-flight, so
+    // reinstating it would race that DELETE. Cross-machine reservations (claimed or not) still 409.
     if (body.cert_fp_sha256) {
       const clash = await env.DB.prepare(
         `SELECT machine_id FROM machines WHERE (cert_fp_sha256 = ?1 OR prev_cert_fp_sha256 = ?1) AND machine_id != ?2
          UNION
-         SELECT machine_id FROM retired_certs WHERE fingerprint = ?1 AND revoked_at IS NULL
+         SELECT machine_id FROM retired_certs WHERE fingerprint = ?1 AND revoked_at IS NULL AND (machine_id != ?2 OR claimed_at IS NOT NULL)
          LIMIT 1`,
       )
         .bind(body.cert_fp_sha256, body.machine_id)

@@ -36,7 +36,7 @@ function reportCfAuthFailure(res: Response, op: 'sign' | 'revoke' | 'status', ce
   return true;
 }
 
-async function signClientCert(env: Env, csr: string): Promise<SignedCert> {
+async function signClientCert(env: Env, csr: string, machineId: string): Promise<SignedCert> {
   const res = await fetch(`https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/client_certificates`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${env.CF_CLIENT_CERT_TOKEN}`, 'Content-Type': 'application/json' },
@@ -58,6 +58,14 @@ async function signClientCert(env: Env, csr: string): Promise<SignedCert> {
     typeof r.certificate !== 'string' || r.certificate === '' ||
     typeof r.expires_on !== 'string' || r.expires_on === ''
   ) {
+    // If CF nonetheless MINTED a cert (a non-empty id present) but the rest of the result is malformed, that
+    // cert is live yet absent from machines AND retired_certs — and we throw BEFORE renewCert receives
+    // `signed`, so its fingerprint/reclaim cleanup never sees the id. Best-effort DIRECT revoke it here
+    // first; revokeOrphanCert emits the alertable hub.certs.orphan_revoke_failed if the revoke can't be
+    // confirmed, so a leaked live cert is at least loud. Then throw identically (renewCert still 502s).
+    if (r && typeof r.id === 'string' && r.id !== '') {
+      await revokeOrphanCert(env, r.id, machineId);
+    }
     throw new Error(`cf client_certificates sign failed or returned a malformed result: ${JSON.stringify(data.errors ?? null)}`);
   }
   return r;
@@ -388,7 +396,7 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
 
   let signed: SignedCert;
   try {
-    signed = await signClientCert(env, body.csr);
+    signed = await signClientCert(env, body.csr, identity.machineId);
   } catch (e) {
     console.log(JSON.stringify({ event: 'hub.certs.sign_failed', machine: identity.machineId, error: String(e) }));
     return Response.json({ error: 'cf_sign_failed' }, { status: 502 });

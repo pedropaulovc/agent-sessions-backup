@@ -231,6 +231,39 @@ describe('POST /api/v1/certs/renew', () => {
     expect(seen.some((s) => s.startsWith('DELETE'))).toBe(false); // no revoke attempted at all
   });
 
+  it('best-effort revokes a malformed-but-MINTED sign result (id present, no certificate) before 502', async () => {
+    // CF minted a cert (id present) but the result is malformed (no certificate). signClientCert must DELETE
+    // that id before throwing — otherwise the cert is stranded active, absent from machines AND retired_certs.
+    await seedMachine('renew-mal', { fp: 'rm-fpA', certId: 'rm-cert-A' });
+    const deletes: string[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') {
+        deletes.push(String(input));
+        return new Response(JSON.stringify({ success: true, result: { status: 'pending_revocation' } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ success: true, result: { id: 'minted-mal-id', expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    const res = await renewCert(reqJson({ csr: 'csr-body' }), cfEnv, machine('renew-mal', false, 'rm-fpA'));
+    expect(res.status).toBe(502);
+    expect(deletes.filter((u) => u.endsWith('/minted-mal-id'))).toHaveLength(1); // revoked exactly once
+    expect((await row('renew-mal'))?.cert_fp_sha256).toBe('rm-fpA'); // no swap
+  });
+
+  it('logs the orphan event when the malformed-mint best-effort revoke itself fails', async () => {
+    await seedMachine('renew-mal2', { fp: 'rm2-fpA', certId: 'rm2-cert-A' });
+    const logs: string[] = [];
+    const spy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => { logs.push(String(a[0])); });
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return new Response(JSON.stringify({ success: false }), { status: 200 }); // revoke rejected
+      return new Response(JSON.stringify({ success: true, result: { id: 'minted-mal2-id', expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    const res = await renewCert(reqJson({ csr: 'csr-body' }), cfEnv, machine('renew-mal2', false, 'rm2-fpA'));
+    spy.mockRestore();
+    expect(res.status).toBe(502);
+    const ev = logs.map((l) => JSON.parse(l) as { event: string; cert_id?: string });
+    expect(ev.some((e) => e.event === 'hub.certs.orphan_revoke_failed' && e.cert_id === 'minted-mal2-id')).toBe(true);
+  });
+
   // Sign-sequence stub: returns the given fake certs on successive sign POSTs and records DELETEs.
   function stubSignAndRevoke(seeds: Array<{ seed: string; id: string }>) {
     let i = 0;
@@ -1169,6 +1202,36 @@ describe('POST /api/v1/admin/machines', () => {
     expect(res.status).toBe(422);
     expect(((await res.json()) as { error: string }).error).toBe('invalid_cert_id_unknown');
     expect(await row('ciu-str')).toBeNull();
+  });
+
+  it('a RELEASED (unclaimed) same-machine reservation lets a rollback recover via unqueue', async () => {
+    // Recovery path: a CA DELETE was rejected, so pollRetired released claimed_at (revoked_at still NULL).
+    // The admin rollback to that same fingerprint must NOT 409 on the generic clash — its own unclaimed
+    // reservation is excluded, so it falls through to the same-machine unqueue/CAS which claims + removes it.
+    await seedMachine('rbrec', { fp: hexfp('rbrec-B'), certId: 'rbrec-B-id', prevFp: hexfp('rbrec-A'), prevCertId: 'rbrec-A-id', revokeAt: '2999-01-01T00:00:00.000Z' });
+    await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('${hexfp('rbrec-A')}', 'rbrec-A-id', 'rbrec', '2000-01-01T00:00:00.000Z')`).run(); // unclaimed
+    const res = await adminMachines(reqJson({ machine_id: 'rbrec', cert_fp_sha256: hexfp('rbrec-A') }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(200);
+    const r = await row('rbrec');
+    expect(r?.cert_fp_sha256).toBe(hexfp('rbrec-A')); // reinstated
+    expect(r?.cert_id).toBe('rbrec-A-id'); // carried from the reservation/prev
+    expect(await retired(hexfp('rbrec-A'))).toBeNull(); // reservation unqueued atomically with the swap
+  });
+
+  it('a CLAIMED same-machine reservation still 409s (prune mid-revoke; reinstating would race the DELETE)', async () => {
+    await seedMachine('rbclaim', { fp: hexfp('rbc-B'), certId: 'rbc-B-id', prevFp: hexfp('rbc-A'), prevCertId: 'rbc-A-id', revokeAt: '2999-01-01T00:00:00.000Z' });
+    await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, claimed_at) VALUES ('${hexfp('rbc-A')}', 'rbc-A-id', 'rbclaim', '2000-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z')`).run();
+    const res = await adminMachines(reqJson({ machine_id: 'rbclaim', cert_fp_sha256: hexfp('rbc-A') }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('fingerprint_in_use');
+    expect((await row('rbclaim'))?.cert_fp_sha256).toBe(hexfp('rbc-B')); // unchanged
+  });
+
+  it('a cross-machine unclaimed reservation still 409s (only the SAME machine is excluded)', async () => {
+    await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('${hexfp('xmach-fp')}', 'xmach-id', 'other-machine', '2000-01-01T00:00:00.000Z')`).run();
+    const res = await adminMachines(reqJson({ machine_id: 'xmach-claimant', cert_fp_sha256: hexfp('xmach-fp') }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(409); // generic clash still fires (before the new-fp cert_id guard)
+    expect(((await res.json()) as { error: string }).error).toBe('fingerprint_in_use');
   });
 
   it('422s a body cert_id supplied with NO fingerprint to bind it to', async () => {

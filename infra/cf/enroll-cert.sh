@@ -133,20 +133,88 @@ resp="$(curl -sS -X POST "$API/zones/$ZONE_ID/client_certificates" \
   -H "Authorization: Bearer $CF_API_TOKEN" -H "Content-Type: application/json" \
   --data "$body")"
 
-# Capture the CA client-certificate id (CERT_ID). The hub stores it in machines.cert_id and uses it
-# as the handle to REVOKE the cert on rotation/prune — so it MUST be recorded here, or every cert
-# this script enrolls looks like a legacy unknown-id row and leaks its first rotated cert.
-CERT_ID="$(python3 - "$resp" "$CRT_TMP" <<'PY'
-import json,sys
+# Best-effort revoke of the cert this run minted but NEVER installed (not in machines, not in retired_certs)
+# — used by every abort/failure path so a leaked active managed cert can't burn the zone quota. Prefers the
+# captured $CERT_ID, but FALLS BACK to the sidecar handle ($CRT_TMP.id) when CERT_ID is empty: the capture
+# below writes the id to the sidecar BEFORE validating the rest of the response, so even a malformed-but-
+# minted sign (which fails the capture and leaves CERT_ID empty) still has a revocable handle on disk. curl
+# -f only catches HTTP errors, so we parse the CF response's `success` flag (an HTTP-200 {"success":false}
+# must NOT be reported as revoked). CF_API_TOKEN is already in scope. Never exits — the caller decides.
+revoke_unused_cert() {
+  local cid="$CERT_ID"
+  if [ -z "$cid" ] && [ -f "$CRT_TMP_ID" ]; then
+    cid="$(sed -n 's/^cert_id=//p' "$CRT_TMP_ID" 2>/dev/null | head -n1)"
+  fi
+  if [ -z "$cid" ]; then
+    echo "    (no cert id captured or on the sidecar — nothing was minted to revoke)" >&2
+    return
+  fi
+  echo "    The cert just minted for this run was NEVER installed — revoking it now so it can't linger CA-valid..." >&2
+  local del_resp del_ok
+  del_resp="$(curl -sS -X DELETE "$API/zones/$ZONE_ID/client_certificates/$cid" -H "Authorization: Bearer $CF_API_TOKEN" 2>/dev/null || true)"
+  del_ok="$(printf '%s' "$del_resp" | python3 -c 'import json,sys
+try:
+    print("yes" if json.load(sys.stdin).get("success") else "no")
+except Exception:
+    print("no")' 2>/dev/null || echo no)"
+  if [ "$del_ok" = "yes" ]; then
+    echo "      revoked unused cert $cid" >&2
+  else
+    echo "      WARN: automatic revoke did not confirm success — run this manually so the cert doesn't linger CA-valid:" >&2
+    echo "      curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$cid\" -H \"Authorization: Bearer \$CF_API_TOKEN\"" >&2
+  fi
+}
+
+# Capture the CA client-certificate id (CERT_ID) — the hub stores it in machines.cert_id and uses it as the
+# REVOKE handle on rotation/prune, so it MUST be recorded or every cert this script enrolls looks like a
+# legacy unknown-id row and leaks its first rotated cert. INVARIANT: from the moment CF mints a cert (a
+# non-empty result.id), the id is on the sidecar ($CRT_TMP.id) BEFORE anything else can fail — the python
+# block writes the sidecar FIRST, THEN validates certificate/expires_on, THEN writes the PEM. We run it as
+# an `if !` condition, NOT a bare CERT_ID=$(...): under set -e a failing command-substitution assignment
+# exits the script at that line (verified), which would skip the revoke below. On failure, revoke_unused_cert
+# falls back to the sidecar id and DELETEs the stranded cert.
+CERT_ID=""
+if ! CERT_ID="$(python3 - "$resp" "$CRT_TMP" "$CRT_TMP_ID" <<'PY'
+import json,sys,hashlib,base64,re
 d=json.loads(sys.argv[1])
 if not d.get("success"):
-    print("Cloudflare API error:", d.get("errors"), file=sys.stderr); sys.exit(1)
-open(sys.argv[2],"w").write(d["result"]["certificate"])
-sys.stderr.write("    cert id: %s expires: %s\n" % (d["result"]["id"], d["result"]["expires_on"]))
-print(d["result"]["id"])
+    sys.stderr.write("    Cloudflare API error: %s\n" % json.dumps(d.get("errors")))
+    sys.exit(1)
+res=d.get("result") or {}
+cid=res.get("id")
+if not isinstance(cid,str) or not cid:
+    sys.stderr.write("    Cloudflare sign response has no cert id — nothing was minted.\n")
+    sys.exit(1)
+# MINTED: write the revoke handle to the sidecar NOW, before validating the rest. fp is a convenience
+# (SHA-256 of the DER, identical to the openssl fingerprint below) computed only if the PEM is parseable.
+pem=res.get("certificate")
+fp=""
+if isinstance(pem,str):
+    m=re.search(r"-----BEGIN CERTIFICATE-----(.+?)-----END CERTIFICATE-----",pem,re.S)
+    if m:
+        try: fp=hashlib.sha256(base64.b64decode("".join(m.group(1).split()))).hexdigest()
+        except Exception: fp=""
+open(sys.argv[3],"w").write("cert_id=%s\nfp=%s\n" % (cid,fp))
+# Now validate the remaining required fields (clean messages, no tracebacks). A nonzero exit here leaves the
+# sidecar in place so the caller's revoke_unused_cert can DELETE the minted-but-unusable cert.
+if not isinstance(pem,str) or not pem:
+    sys.stderr.write("    Cloudflare sign response has no certificate PEM (cert id %s minted; sidecar written for revoke).\n" % cid)
+    sys.exit(2)
+exp=res.get("expires_on")
+if not isinstance(exp,str) or not exp:
+    sys.stderr.write("    Cloudflare sign response has no expires_on (cert id %s minted; sidecar written for revoke).\n" % cid)
+    sys.exit(2)
+open(sys.argv[2],"w").write(pem)
+sys.stderr.write("    cert id: %s expires: %s\n" % (cid,exp))
+print(cid)
 PY
-)"
-[ -n "$CERT_ID" ] || { echo "no cert id in Cloudflare response" >&2; exit 1; }
+)"; then
+  echo "    The Cloudflare sign response was unusable (see message above) — cleaning up any minted cert." >&2
+  revoke_unused_cert
+  rm -f "$CRT_TMP" "$CRT_TMP_ID"
+  exit 1
+fi
+[ -n "$CERT_ID" ] || { echo "    no cert id in Cloudflare response" >&2; revoke_unused_cert; rm -f "$CRT_TMP" "$CRT_TMP_ID"; exit 1; }
 
 echo "==> registering machine '$MACHINE_ID' (is_admin=$IS_ADMIN) in $DB_NAME"
 # hostname is machine-controlled and goes into a single-quoted SQL literal — SQL-escape any quote (double
@@ -154,27 +222,8 @@ echo "==> registering machine '$MACHINE_ID' (is_admin=$IS_ADMIN) in $DB_NAME"
 HOSTNAME_VAL="$(hostname)"
 HOSTNAME_VAL="${HOSTNAME_VAL//\'/\'\'}"
 
-# Best-effort revoke of the cert this run minted but NEVER installed (not in machines, not in
-# retired_certs) — used by every abort/failure path so a leaked active managed cert can't burn the zone
-# quota. curl -f only catches HTTP errors, so we parse the CF response's `success` flag (an HTTP-200
-# {"success":false} must NOT be reported as revoked) and print the manual command unless it confirms.
-# CF_API_TOKEN is already in scope. Never exits — the caller decides.
-revoke_unused_cert() {
-  echo "    The cert just minted for this run was NEVER installed — revoking it now so it can't linger CA-valid..." >&2
-  local del_resp del_ok
-  del_resp="$(curl -sS -X DELETE "$API/zones/$ZONE_ID/client_certificates/$CERT_ID" -H "Authorization: Bearer $CF_API_TOKEN" 2>/dev/null || true)"
-  del_ok="$(printf '%s' "$del_resp" | python3 -c 'import json,sys
-try:
-    print("yes" if json.load(sys.stdin).get("success") else "no")
-except Exception:
-    print("no")' 2>/dev/null || echo no)"
-  if [ "$del_ok" = "yes" ]; then
-    echo "      revoked unused cert $CERT_ID" >&2
-  else
-    echo "      WARN: automatic revoke did not confirm success — run this manually so the cert doesn't linger CA-valid:" >&2
-    echo "      curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$CERT_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\"" >&2
-  fi
-}
+# (revoke_unused_cert is defined ABOVE, before the sign-result capture, so the capture's failure path can
+# call it — and it falls back to the sidecar handle when CERT_ID wasn't captured.)
 
 # Parse a wrangler `d1 execute --json` payload and print the machines row's fingerprint (empty if no
 # row). Scans every statement's results for the `fp` field so it's robust to statement ordering.
@@ -267,9 +316,11 @@ if ! FP="$(openssl x509 -in "$CRT_TMP" -outform DER 2>/dev/null | openssl dgst -
 fi
 echo "==> cert fingerprint (SHA-256): $FP"
 
-# Persist the minted cert id + fp beside the temp PEM NOW, before any path that might leave $CRT_TMP behind.
-# Any later abort that leaves the temp cert also leaves this revoke handle; every cleanup path below removes
-# both files together, and a successful enrollment removes the sidecar after promoting $CRT.
+# Refresh the sidecar with the canonical openssl fingerprint. The capture's python block already wrote it at
+# mint time (cert_id + a python-computed fp) so the handle survives any failure; this rewrites it with the
+# openssl-computed $FP for exactness. Any later abort that leaves the temp cert also leaves this revoke
+# handle; every cleanup path below removes both files together, and a successful enrollment removes the
+# sidecar after promoting $CRT.
 printf 'cert_id=%s\nfp=%s\n' "$CERT_ID" "$FP" > "$CRT_TMP_ID"
 
 # Fill a FIRST cert onto a row that has none, but NEVER displace an existing cert — both atomic in one
