@@ -67,7 +67,12 @@ export async function machineIdentity(request: Request, env: Env): Promise<Ident
       .bind(tls.certFingerprintSHA256)
       .first<{ machine_id: string; is_admin: number; cert_slot: 'current' | 'grace' }>();
     if (!row) return { kind: 'anonymous' };
-    return { kind: 'machine', machineId: row.machine_id, isAdmin: row.is_admin === 1, certFp: tls.certFingerprintSHA256, certSlot: row.cert_slot };
+    // isAdmin is gated on the CURRENT slot: a rotated-out admin cert loses admin power during its 7-day
+    // grace window at the chokepoint, so putFile/ownsPath/multipart (which key on identity.isAdmin for
+    // the cross-machine write bypass) inherit the restriction with no changes. An admin's own collector
+    // still uploads to its own path via machineId match. The router's certSlot check is belt-and-braces.
+    const isAdmin = row.is_admin === 1 && row.cert_slot === 'current';
+    return { kind: 'machine', machineId: row.machine_id, isAdmin, certFp: tls.certFingerprintSHA256, certSlot: row.cert_slot };
   }
 
   if (env.ENVIRONMENT === 'development') return devHeaderIdentity(request, env);

@@ -2,7 +2,7 @@ import { env } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { machineIdentity, type Identity } from '../src/auth/identity';
 import { bootstrap, COLLECTOR_CONFIG_SCHEMA_VERSION, DEFAULT_COLLECTOR_CONFIG } from '../src/api/bootstrap';
-import { renewCert, certFingerprint } from '../src/api/certs';
+import { renewCert, certFingerprint, settleRetired } from '../src/api/certs';
 import { adminMachines } from '../src/api/ops';
 import { runDailyPrune } from '../src/cron/prune';
 import { route } from '../src/router';
@@ -463,6 +463,64 @@ describe('POST /api/v1/certs/renew', () => {
     expect(r2?.prev_cert_fp_sha256).toBe('ia-A');
     expect(r2?.prev_cert_id).toBe('cert-ia-A'); // known id carried into prev, not a stale NULL
   });
+
+  // CLASS B: the renew CAS pins the FULL observed rotation state (rotationCas). A concurrent change to
+  // ANY of the five rotation columns between the pre-sign read and the swap must 409 (no partial pin).
+  const rotationFieldFlips: Array<{ field: string; sql: string }> = [
+    { field: 'cert_fp_sha256', sql: "UPDATE machines SET cert_fp_sha256 = 'cas-flip' WHERE machine_id = 'cas-box'" },
+    { field: 'cert_id', sql: "UPDATE machines SET cert_id = 'cas-flip' WHERE machine_id = 'cas-box'" },
+    { field: 'prev_cert_fp_sha256', sql: "UPDATE machines SET prev_cert_fp_sha256 = 'cas-flip' WHERE machine_id = 'cas-box'" },
+    { field: 'prev_cert_id', sql: "UPDATE machines SET prev_cert_id = 'cas-flip' WHERE machine_id = 'cas-box'" },
+    { field: 'cert_revoke_at', sql: "UPDATE machines SET cert_revoke_at = '2998-01-01T00:00:00.000Z' WHERE machine_id = 'cas-box'" },
+  ];
+  for (const { field, sql } of rotationFieldFlips) {
+    it(`renew 409s when ${field} changes between the read and the swap (full-state CAS)`, async () => {
+      await seedMachine('cas-box', { fp: 'cas-cur', certId: 'cas-cid', prevFp: 'cas-prev', prevCertId: 'cas-pid', revokeAt: '2999-01-01T00:00:00.000Z' });
+      const deletes: string[] = [];
+      vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (init?.method === 'DELETE') {
+          deletes.push(String(input).split('/').pop()!);
+          return new Response(JSON.stringify({ success: true, result: { status: 'pending_revocation' } }), { status: 200 });
+        }
+        return new Response(JSON.stringify({ success: true, result: { id: 'cas-new-id', certificate: fakeCertPem('cas-new'), expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+      }));
+      const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+      const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((s: string) => {
+        const stmt = realPrepare(s);
+        if (!(s.includes('cert_revoke_at FROM machines WHERE machine_id = ?1') && s.includes('prev_cert_id'))) return stmt;
+        const realBind = stmt.bind.bind(stmt);
+        (stmt as unknown as { bind: (...a: unknown[]) => unknown }).bind = (...args: unknown[]) => {
+          const bound = realBind(...(args as [])) as D1PreparedStatement;
+          const realFirst = bound.first.bind(bound) as (...a: unknown[]) => Promise<unknown>;
+          (bound as unknown as { first: (...a: unknown[]) => Promise<unknown> }).first = async (...fa: unknown[]) => {
+            const r = await realFirst(...fa);
+            await realPrepare(sql).run(); // flip exactly one rotation field after the read
+            return r;
+          };
+          return bound;
+        };
+        return stmt;
+      });
+      const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('cas-box', false, 'cas-cur'));
+      spy.mockRestore();
+      expect(res.status).toBe(409); // any rotation-field change -> CAS miss -> conflict
+      expect(deletes).toContain('cas-new-id'); // the minted successor is reclaimed, not stranded
+    });
+  }
+
+  it('positive control: renew succeeds when the full rotation state is unchanged', async () => {
+    await seedMachine('cas-ok', { fp: 'ok-cur', certId: 'ok-cid', prevFp: 'ok-prev', prevCertId: 'ok-pid', revokeAt: '2999-01-01T00:00:00.000Z' });
+    vi.stubGlobal('fetch', vi.fn(async (_i: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') return new Response(JSON.stringify({ success: true, result: { status: 'pending_revocation' } }), { status: 200 });
+      return new Response(JSON.stringify({ success: true, result: { id: 'ok-new-id', certificate: fakeCertPem('ok-new'), expires_on: '2027-01-01T00:00:00Z' } }), { status: 200 });
+    }));
+    const res = await renewCert(reqJson({ csr: 'c' }), cfEnv, machine('cas-ok', false, 'ok-cur'));
+    expect(res.status).toBe(200);
+    const r = await row('cas-ok');
+    expect(r?.cert_fp_sha256).toBe(await certFingerprint(fakeCertPem('ok-new')));
+    expect(r?.prev_cert_fp_sha256).toBe('ok-cur'); // old current -> prev
+    expect(r?.prev_cert_id).toBe('ok-cid'); // its id carried into prev
+  });
 });
 
 describe('POST /api/v1/admin/machines', () => {
@@ -612,6 +670,30 @@ describe('POST /api/v1/admin/machines', () => {
     expect(((await res.json()) as { error: string }).error).toBe('concurrent_rotation');
     expect((await row('am-claimed'))?.cert_fp_sha256).toBe('cl-B'); // NOT reinstated onto the cert being revoked
     expect((await retired('cl-A'))?.claimed_at).not.toBeNull(); // reservation still claimed; the drain proceeds
+  });
+
+  it('a CAS-losing admin swap queues nothing, even when the winner installed the same requested fp', async () => {
+    // The dangerous case the post-swap guard closes: a winner installs the SAME fp cw-C we requested (so a
+    // current==newFp-only guard would match), but in a DIFFERENT full state (its own cert_id). Our retire
+    // INSERTs are guarded on OUR exact post-swap state, so they queue nothing — we never reserve the old
+    // current/prev the winner may still be using. And our CAS (full state) misses, so we 409.
+    await seedMachine('am-lose', { fp: 'cw-A', certId: 'cw-A-id', prevFp: 'cw-B', prevCertId: 'cw-B-id', revokeAt: '2999-01-01T00:00:00.000Z' });
+    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+    const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementationOnce(async (stmts) => {
+      // Winner lands cw-C as current with ITS OWN cert_id, between our read and our swap.
+      await testEnv.DB.prepare(
+        "UPDATE machines SET cert_fp_sha256='cw-C', cert_id='winner-id', prev_cert_fp_sha256=NULL, prev_cert_id=NULL, cert_revoke_at=NULL WHERE machine_id='am-lose'",
+      ).run();
+      return realBatch(stmts);
+    });
+    const res = await adminMachines(reqJson({ machine_id: 'am-lose', cert_fp_sha256: 'cw-C', cert_id: 'cw-C-id' }), testEnv, machine('am-admin', true));
+    spy.mockRestore();
+    expect(res.status).toBe(409); // lost the full-state CAS
+    expect(await retired('cw-A')).toBeNull(); // NOT queued by the loser
+    expect(await retired('cw-B')).toBeNull(); // NOT queued by the loser
+    const r = await row('am-lose');
+    expect(r?.cert_fp_sha256).toBe('cw-C');
+    expect(r?.cert_id).toBe('winner-id'); // winner's state intact
   });
 
   it('same-fp upsert preserves an active rotation window', async () => {
@@ -1020,5 +1102,68 @@ describe('admin routes require the current cert slot', () => {
   it('still accepts an in-grace previous cert on non-admin routes (heartbeat)', async () => {
     const res = await route(apiReq('/api/v1/heartbeat', 'rt-prev', { collector_version: 'x' }), prodEnv, ctx);
     expect(res.status).toBe(200); // grace certs keep working for upload/heartbeat/renew recovery
+  });
+});
+
+describe('grace-slot certs lose cross-machine admin power (CLASS C)', () => {
+  const ctx = {} as ExecutionContext;
+  function fileReq(path: string, method: string, fp: string, body?: string): Request {
+    return new Request(`https://api.sessions.vza.net${path}`, {
+      method,
+      cf: { tlsClientAuth: { certVerified: 'SUCCESS', certFingerprintSHA256: fp } },
+      ...(body !== undefined ? { body } : {}),
+    } as unknown as RequestInit);
+  }
+
+  it('an in-grace admin cert cannot write another machine path (putFile + multipart), but the current cert can', async () => {
+    // gc-admin is an admin machine mid-rotation: current gc-cur, in-grace prev gc-prev. isAdmin is now
+    // gated on the CURRENT slot at machineIdentity, so putFile/ownsPath (which key on identity.isAdmin
+    // for the cross-machine bypass) inherit the fix with no changes.
+    await seedMachine('gc-admin', { fp: 'gc-cur', certId: 'gc-cid', prevFp: 'gc-prev', prevCertId: 'gc-pid', revokeAt: '2999-01-01T00:00:00.000Z', isAdmin: true });
+    // In-grace prev cert -> admin dropped -> cross-machine putFile is a 403 machine_mismatch.
+    const gracePut = await route(fileReq('/api/v1/files/other-box/claude/x.jsonl', 'PUT', 'gc-prev', 'hello'), prodEnv, ctx);
+    expect(gracePut.status).toBe(403);
+    // Same for a multipart create (ownsPath).
+    const graceMpu = await route(fileReq('/api/v1/files/other-box/claude/x.jsonl?uploads', 'POST', 'gc-prev', JSON.stringify({ size: 5, sha256: 'a'.repeat(64) })), prodEnv, ctx);
+    expect(graceMpu.status).toBe(403);
+    // The CURRENT admin cert keeps the cross-machine bypass -> NOT a machine_mismatch 403.
+    const currentPut = await route(fileReq('/api/v1/files/other-box/claude/x.jsonl', 'PUT', 'gc-cur', 'hello'), prodEnv, ctx);
+    expect(currentPut.status).not.toBe(403);
+  });
+});
+
+describe('settleRetired claim invariant (CLASS A)', () => {
+  it('claims the row before its CA revoke, so a concurrent un-queue no-ops (no mid-revoke lockout)', async () => {
+    await testEnv.DB.prepare(
+      "INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('sr-fp', 'sr-id', 'sr-m', '2000-01-01T00:00:00.000Z')",
+    ).run();
+    let claimedAtRevokeTime: string | null = null;
+    let unqueuedRows = -1;
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') {
+        // At the moment of the CA revoke, the row must already be claimed...
+        claimedAtRevokeTime = (await retired('sr-fp'))?.claimed_at ?? null;
+        // ...so a concurrent admin un-queue (guarded on claimed_at IS NULL) deletes nothing.
+        const res = await testEnv.DB.prepare(
+          "DELETE FROM retired_certs WHERE fingerprint='sr-fp' AND machine_id='sr-m' AND revoked_at IS NULL AND claimed_at IS NULL",
+        ).run();
+        unqueuedRows = res.meta.changes ?? 0;
+        return new Response(JSON.stringify({ success: true, result: { status: 'pending_revocation' } }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ success: true }), { status: 200 });
+    }));
+    const outcome = await settleRetired(cfEnv, 'sr-id');
+    expect(claimedAtRevokeTime).not.toBeNull(); // claimed BEFORE the CA DELETE ran
+    expect(unqueuedRows).toBe(0); // the racing un-queue found nothing to delete (row is claimed)
+    expect(outcome).toBe('pending_revocation');
+    expect(await retired('sr-fp')).not.toBeNull(); // reservation survived, not yanked mid-revoke
+  });
+
+  it('positive control: skips (no CA call) when the row was already un-queued', async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ success: true }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    const outcome = await settleRetired(cfEnv, 'no-such-reservation-id');
+    expect(outcome).toBe('skipped');
+    expect(fetchMock).not.toHaveBeenCalled(); // never touched the CA
   });
 });

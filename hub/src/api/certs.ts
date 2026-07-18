@@ -93,15 +93,44 @@ async function stampRevoked(env: Env, certId: string): Promise<boolean> {
   }
 }
 
+/** The full rotation state of a machines row: every column a cert rotation can change. All five must be
+ * pinned by any compare-and-swap on the row, and any INSERT co-committed with a swap, so a concurrent
+ * write to ANY of them is detected. */
+export interface RotationState {
+  cert_fp: string | null;
+  cert_id: string | null;
+  prev_fp: string | null;
+  prev_id: string | null;
+  revoke_at: string | null;
+}
+
+/** The full-observed-state CAS clause + binds, starting at placeholder index `start`. Pins ALL five
+ * rotation columns (IS, so NULL matches NULL) — cert_fp, cert_id, prev_fp, prev_id, revoke_at — so a
+ * concurrent change to any of them makes the swap miss (changes === 0 → the caller 409s and re-reads).
+ * The single home for "what a rotation CAS must check", used by renew (normal + recovery), the admin
+ * swap, and the co-committed retire INSERT — so no path can pin a partial subset of the state. */
+export function rotationCas(state: RotationState, start: number): { clause: string; binds: (string | null)[] } {
+  return {
+    clause:
+      `machines.cert_fp_sha256 IS ?${start} AND machines.cert_id IS ?${start + 1} ` +
+      `AND machines.prev_cert_fp_sha256 IS ?${start + 2} AND machines.prev_cert_id IS ?${start + 3} ` +
+      `AND machines.cert_revoke_at IS ?${start + 4}`,
+    binds: [state.cert_fp, state.cert_id, state.prev_fp, state.prev_id, state.revoke_at],
+  };
+}
+
 /** SQL fragment + binds that INSERT a displaced cert into the retired_certs queue, but ONLY if the
- * preceding displacement in the SAME db.batch landed (the machine's current fp is now `newFp`). This
- * co-commits the reservation with the displacement so the fingerprint is never momentarily in
- * neither a machines-row slot nor the queue. Params: (fingerprint, cert_id, machine_id, newFp). */
-export function queueRetiredIfDisplaced(env: Env, fingerprint: string, certId: string | null, machineId: string, newFp: string) {
+ * machine row is in the EXACT post-swap state `postSwap` that OUR displacement produced — checked in
+ * the SAME db.batch, after the swap, so the INSERT sees the swap's effect. A lost CAS leaves the row in
+ * the WINNER's state, so our full-state guard misses and we queue nothing (never queuing the stale
+ * current/prev we read while another rotation kept one of them live). Co-commits the reservation with
+ * the displacement so the fingerprint is never momentarily in neither a machines slot nor the queue. */
+export function queueRetiredIfDisplaced(env: Env, fingerprint: string, certId: string | null, machineId: string, postSwap: RotationState) {
+  const cas = rotationCas(postSwap, 5);
   return env.DB.prepare(
     `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at)
-     SELECT ?1, ?2, ?3, ?5 WHERE EXISTS (SELECT 1 FROM machines WHERE machine_id = ?3 AND cert_fp_sha256 = ?4)`,
-  ).bind(fingerprint, certId, machineId, newFp, new Date().toISOString());
+     SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM machines WHERE machine_id = ?3 AND ${cas.clause})`,
+  ).bind(fingerprint, certId, machineId, new Date().toISOString(), ...cas.binds);
 }
 
 /** Insert a displaced cert into the retired_certs queue, then settle it. Standalone (not batched) —
@@ -113,39 +142,96 @@ export async function retireCert(env: Env, fingerprint: string, certId: string |
   await settleRetired(env, certId);
 }
 
-/** Best-effort INITIATE revocation of a queued cert. Because revocation is async, a successful
- * DELETE usually returns 'pending_revocation' — we stamp revoked_at ONLY on a full 'revoked', so the
- * row otherwise stays reserved until a later prune poll confirms it. Returns the revoke result. */
-export async function settleRetired(env: Env, certId: string | null): Promise<RevokeResult> {
+/** THE single claim primitive. Every path that revokes a QUEUED cert (settleRetired's DELETE,
+ * pollRetired's GET+DELETE) claims the row FIRST, so a concurrent admin un-queue — which requires
+ * claimed_at IS NULL — can never delete + reinstate a fingerprint we're mid-revoke of. Returns false
+ * (do NOT touch the CA) if the row is already claimed by another revoke in flight, already revoked, or
+ * un-queued. A claim older than an hour (longer than any run — a crashed prune) is stale and
+ * re-claimable so a failed revoke is retried, not wedged. Never throws. */
+async function claimRetired(env: Env, certId: string): Promise<boolean> {
+  try {
+    const staleBefore = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const r = await env.DB.prepare(
+      `UPDATE retired_certs SET claimed_at = ?2
+         WHERE cert_id = ?1 AND revoked_at IS NULL AND (claimed_at IS NULL OR claimed_at <= ?3)`,
+    )
+      .bind(certId, new Date().toISOString(), staleBefore)
+      .run();
+    return (r.meta.changes ?? 0) > 0;
+  } catch (e) {
+    console.log(JSON.stringify({ event: 'hub.certs.claim_failed', cert_id: certId, error: String(e) }));
+    return false;
+  }
+}
+
+/** Release a claim (used when the revoke didn't fully complete) so the next prune re-attempts —
+ * a held claim would otherwise skip the row forever. Never touches a revoked row. Never throws. */
+async function releaseRetired(env: Env, certId: string): Promise<void> {
+  try {
+    await env.DB.prepare('UPDATE retired_certs SET claimed_at = NULL WHERE cert_id = ?1 AND revoked_at IS NULL')
+      .bind(certId)
+      .run();
+  } catch (e) {
+    console.log(JSON.stringify({ event: 'hub.certs.release_failed', cert_id: certId, error: String(e) }));
+  }
+}
+
+/** Best-effort INITIATE revocation of a queued cert. CLAIMS the row before the CA DELETE (so an admin
+ * un-queue can't reinstate it mid-revoke); a lost claim ('skipped') means another flow owns it — leave
+ * it be. Revocation is async, so a successful DELETE usually returns 'pending_revocation': we stamp
+ * revoked_at ONLY on a full 'revoked' and otherwise RELEASE the claim so the prune retries. NEVER
+ * throws — a committed renewal/admin swap waits on this and must not 5xx on a cleanup hiccup. */
+export async function settleRetired(env: Env, certId: string | null): Promise<RevokeResult | 'skipped'> {
   if (!certId) return 'failed'; // unknown id — nothing to revoke; stays reserved
+  if (!(await claimRetired(env, certId))) return 'skipped'; // already revoking / un-queued — don't touch the CA
   let result: RevokeResult;
   try {
     result = await revokeClientCert(env, certId);
   } catch (e) {
     console.log(JSON.stringify({ event: 'hub.certs.retire_revoke_error', cert_id: certId, error: String(e) }));
+    await releaseRetired(env, certId);
     return 'failed';
   }
-  // Stamp only on a full revoke, and never let a stamp failure throw out of a settle that a committed
-  // renewal is waiting on — the row stays reserved and the prune re-stamps.
-  if (result === 'revoked') return (await stampRevoked(env, certId)) ? 'revoked' : 'failed';
+  if (result === 'revoked') {
+    if (await stampRevoked(env, certId)) return 'revoked';
+    await releaseRetired(env, certId);
+    return 'failed';
+  }
+  await releaseRetired(env, certId); // pending_revocation (async) or failed — retry next prune
   return result;
 }
 
-/** Poll a reserved cert and advance it toward settled. Stamps revoked_at once the CA reports the
- * cert 'revoked' (or 404 — already gone). A cert still 'pending_revocation' stays reserved (re-polled
- * next run). One that never actually got revoked ('active'/'pending_reactivation') gets a fresh
- * revoke attempt. Used by the prune drain. */
-export async function pollRetired(env: Env, certId: string): Promise<'revoked' | 'pending' | 'failed'> {
+/** Poll a reserved cert and advance it toward settled. CLAIMS the row first (same primitive as
+ * settleRetired); a lost claim → 'skipped' (un-queued or another revoke in flight). Stamps revoked_at
+ * once the CA reports 'revoked' (or 404 — already gone). A cert still 'pending_revocation' stays
+ * reserved and the claim is RELEASED so it's re-polled next run; one that never actually got revoked
+ * ('active'/'pending_reactivation') gets a fresh revoke attempt under the same held claim. Used by the
+ * prune drain. Never throws. */
+export async function pollRetired(env: Env, certId: string): Promise<'revoked' | 'pending' | 'failed' | 'skipped'> {
+  if (!(await claimRetired(env, certId))) return 'skipped';
   const status = await getClientCertStatus(env, certId);
   if (status === 'revoked' || status === 'not_found') {
-    return (await stampRevoked(env, certId)) ? 'revoked' : 'failed';
+    if (await stampRevoked(env, certId)) return 'revoked';
+    await releaseRetired(env, certId);
+    return 'failed';
   }
-  if (status === 'pending_revocation') return 'pending';
   if (status === 'active' || status === 'pending_reactivation') {
-    const r = await settleRetired(env, certId);
-    return r === 'revoked' ? 'revoked' : r === 'pending_revocation' ? 'pending' : 'failed';
+    let result: RevokeResult;
+    try {
+      result = await revokeClientCert(env, certId);
+    } catch (e) {
+      console.log(JSON.stringify({ event: 'hub.certs.poll_revoke_error', cert_id: certId, error: String(e) }));
+      await releaseRetired(env, certId);
+      return 'failed';
+    }
+    if (result === 'revoked' && (await stampRevoked(env, certId))) return 'revoked';
+    await releaseRetired(env, certId);
+    return result === 'pending_revocation' || result === 'revoked' ? 'pending' : 'failed';
   }
-  return 'failed'; // 'unknown' — a GET error; retry next run without guessing
+  // 'pending_revocation' (async revoke in flight) or 'unknown' (GET error) — leave reserved, release
+  // the claim, retry next run without guessing.
+  await releaseRetired(env, certId);
+  return status === 'pending_revocation' ? 'pending' : 'failed';
 }
 
 /** Make a minted-but-unusable cert safe, NEVER throwing — so a cleanup failure can't change the
@@ -233,20 +319,22 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
       // current cert serialize — the first flips current, the second's WHERE no longer matches
       // (changes === 0) and it 409s, rather than last-writer-wins stranding the winner's cert. The
       // guarded queue INSERT co-commits with the swap so a displaced in-grace prev is never dropped.
-      // The CAS also pins the observed cert_id (IS, so NULL matches NULL): if an admin attaches a CA id
-      // to this fingerprint between our read and here, the stale observed id no longer matches and we
-      // 409 rather than move a stale NULL into prev_cert_id (which would make the old cert an
-      // unrevocable unknown-id reservation at prune despite the id now being known). The retry re-reads
-      // the fresh id and carries it into prev correctly.
+      // The CAS pins the FULL observed rotation state via rotationCas (not just the fp): a concurrent
+      // change to ANY field — e.g. an admin attaching a CA id to this fingerprint — makes it miss and
+      // 409 rather than move a stale value (a NULL cert_id) into the prev slot. The retry re-reads.
       effectiveRevokeAt = new Date(Date.now() + CERT_GRACE_DAYS * 86_400_000).toISOString();
+      const observed: RotationState = { cert_fp: cur!.cert_fp_sha256, cert_id: cur!.cert_id, prev_fp: cur!.prev_cert_fp_sha256, prev_id: cur!.prev_cert_id, revoke_at: cur!.cert_revoke_at };
+      const cas = rotationCas(observed, 7);
       const swap = env.DB.prepare(
         `UPDATE machines
            SET prev_cert_fp_sha256 = ?2, prev_cert_id = ?3, cert_revoke_at = ?4,
                cert_fp_sha256 = ?5, cert_id = ?6
-         WHERE machine_id = ?1 AND cert_fp_sha256 = ?7 AND cert_id IS ?8`,
-      ).bind(identity.machineId, cur!.cert_fp_sha256, cur!.cert_id, effectiveRevokeAt, newFp, signed.id, authFp, cur!.cert_id);
+         WHERE machine_id = ?1 AND ${cas.clause}`,
+      ).bind(identity.machineId, cur!.cert_fp_sha256, cur!.cert_id, effectiveRevokeAt, newFp, signed.id, ...cas.binds);
+      // The state OUR swap produces — the retire INSERT co-commits only if the row is exactly this.
+      const postSwap: RotationState = { cert_fp: newFp, cert_id: signed.id, prev_fp: cur!.cert_fp_sha256, prev_id: cur!.cert_id, revoke_at: effectiveRevokeAt };
       const stmts = [swap];
-      if (displaced.fp) stmts.push(queueRetiredIfDisplaced(env, displaced.fp, displaced.id, identity.machineId, newFp));
+      if (displaced.fp) stmts.push(queueRetiredIfDisplaced(env, displaced.fp, displaced.id, identity.machineId, postSwap));
       const results = await env.DB.batch(stmts);
       changes = results[0]!.meta.changes ?? 0;
     } else {
@@ -254,18 +342,23 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
       // was never installed (lost response), so the machine is stuck holding the old cert and would
       // otherwise die at cert_revoke_at with no path forward. Replace the orphaned successor (the
       // current slot) with this new cert WITHOUT touching the prev slot or its cert_revoke_at — grace
-      // must NOT extend, or repeated prev-auth renews would keep an old cert alive forever. Guarded on
-      // the observed current fp too so concurrent recoveries serialize. Keep the ORIGINAL revoke_at.
-      // The displaced orphaned successor is queued (co-committed) rather than silently dropped.
+      // must NOT extend, or repeated prev-auth renews would keep an old cert alive forever. Keep the
+      // ORIGINAL revoke_at. Guarded on the FULL observed state via rotationCas (so a concurrent id
+      // attach to the orphaned successor can't be lost) PLUS the grace window still being open, so
+      // concurrent recoveries serialize. The displaced orphaned successor is queued (co-committed).
       effectiveRevokeAt = cur?.cert_revoke_at ?? null;
+      const observed: RotationState = { cert_fp: cur?.cert_fp_sha256 ?? null, cert_id: cur?.cert_id ?? null, prev_fp: cur?.prev_cert_fp_sha256 ?? null, prev_id: cur?.prev_cert_id ?? null, revoke_at: cur?.cert_revoke_at ?? null };
+      const cas = rotationCas(observed, 4);
       const swap = env.DB.prepare(
         `UPDATE machines
            SET cert_fp_sha256 = ?2, cert_id = ?3
-         WHERE machine_id = ?1 AND prev_cert_fp_sha256 = ?4 AND cert_fp_sha256 = ?5
+         WHERE machine_id = ?1 AND ${cas.clause}
            AND cert_revoke_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
-      ).bind(identity.machineId, newFp, signed.id, authFp, cur?.cert_fp_sha256 ?? null);
+      ).bind(identity.machineId, newFp, signed.id, ...cas.binds);
+      // Recovery replaces only the current slot; prev/revoke_at are unchanged from what we observed.
+      const postSwap: RotationState = { cert_fp: newFp, cert_id: signed.id, prev_fp: cur?.prev_cert_fp_sha256 ?? null, prev_id: cur?.prev_cert_id ?? null, revoke_at: cur?.cert_revoke_at ?? null };
       const stmts = [swap];
-      if (displaced.fp) stmts.push(queueRetiredIfDisplaced(env, displaced.fp, displaced.id, identity.machineId, newFp));
+      if (displaced.fp) stmts.push(queueRetiredIfDisplaced(env, displaced.fp, displaced.id, identity.machineId, postSwap));
       const results = await env.DB.batch(stmts);
       changes = results[0]!.meta.changes ?? 0;
     }

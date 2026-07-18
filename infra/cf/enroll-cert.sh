@@ -153,8 +153,16 @@ PY
     echo "      POST https://api.sessions.vza.net/api/v1/admin/machines  (with an admin client cert)" >&2
     echo "        { \"machine_id\": \"$MACHINE_ID\", \"cert_fp_sha256\": \"$FP\", \"cert_id\": \"$CERT_ID\" }" >&2
     echo >&2
-    echo "    The cert just minted for this run was NEVER installed — revoke it so it can't linger CA-valid:" >&2
-    echo "      curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$CERT_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\"" >&2
+    # The cert just minted for this run was NEVER installed (not in D1, not in retired_certs). Revoke it
+    # now so a missed manual cleanup can't leak an active managed cert and burn the zone quota. CF_API_TOKEN
+    # is already in scope. Best-effort: on failure, print the manual command and still abort non-zero.
+    echo "    The cert just minted for this run was NEVER installed — revoking it now so it can't linger CA-valid..." >&2
+    if curl -fsS -X DELETE "$API/zones/$ZONE_ID/client_certificates/$CERT_ID" -H "Authorization: Bearer $CF_API_TOKEN" >/dev/null 2>&1; then
+      echo "      revoked unused cert $CERT_ID" >&2
+    else
+      echo "      WARN: automatic revoke failed — run this manually so the cert doesn't linger CA-valid:" >&2
+      echo "      curl -X DELETE \"$API/zones/$ZONE_ID/client_certificates/$CERT_ID\" -H \"Authorization: Bearer \$CF_API_TOKEN\"" >&2
+    fi
     exit 1
   fi
   echo "    enrolled: $MACHINE_ID -> $FP"

@@ -1,6 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
-import { queueRetiredIfDisplaced, settleRetired } from './certs';
+import { queueRetiredIfDisplaced, rotationCas, settleRetired, type RotationState } from './certs';
 import { normalizeToBound } from './sessions';
 
 /** POST /api/v1/heartbeat */
@@ -160,32 +160,39 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
       displaced.push({ fp: existing.prev_cert_fp_sha256, id: existing.prev_cert_id });
     }
 
-    // CAS on the FULL rotation state we observed — current fp, prev fp, AND the revoke window — not just
-    // the current fp. The extra columns matter for rollback: if runDailyPrune drains this row's in-grace
-    // prev into retired_certs and clears prev_cert_fp_sha256/cert_revoke_at between our read and this
-    // write, a current-fp-only CAS would still reinstate that just-queued cert as current, and the same
-    // prune's drain would then revoke the now-current cert — a lockout. Checking prev + revoke_at makes
-    // that swap 409 so the admin re-reads reality. IS (not =) so NULL observed values match still-NULL
-    // columns. The retirement INSERTs run in the SAME db.batch, each guarded on the swap having landed
-    // (current is now certFp) — so a lost/interrupted retire can't strand a displaced cert, and a CAS
-    // miss queues nothing.
+    // CAS on the FULL observed rotation state via rotationCas — cert_fp, cert_id, prev_fp, prev_id, AND
+    // the revoke window (IS, so NULL matches NULL). A concurrent change to ANY of them (a prune draining
+    // this row's in-grace prev, another admin attaching a cert_id, a renew rotating current) makes the
+    // swap miss → 409, and the admin re-reads reality — instead of clobbering with the stale row we read
+    // or queuing a displaced cert under a stale/NULL id the other writer just corrected. The retirement
+    // INSERTs run in the SAME db.batch, each guarded on the row being in exactly OUR post-swap state, so
+    // a lost/interrupted retire can't strand a displaced cert and a CAS miss queues nothing.
     //
-    // The CAS also 409s if the reinstated fp sits CLAIMED in retired_certs (revoked_at NULL,
-    // claimed_at NOT NULL): the prune stamps claimed_at right before its async CA revoke, so a claimed
-    // reservation means a drain is mid-revoke of that cert — reinstating it as current would race the
-    // DELETE and lock the machine out. 409 instead; the admin re-reads reality after the drain settles.
-    const observedFp = existing?.cert_fp_sha256 ?? null;
-    const observedPrevFp = existing?.prev_cert_fp_sha256 ?? null;
-    const observedRevokeAt = existing?.cert_revoke_at ?? null;
+    // The CAS also 409s if the reinstated fp sits CLAIMED in retired_certs (revoked_at NULL, claimed_at
+    // NOT NULL): every revoke path stamps claimed_at before its async CA DELETE (see certs.ts
+    // claimRetired), so a claimed reservation means a revoke is mid-flight — reinstating it as current
+    // would race the DELETE and lock the machine out. 409 instead; the admin re-reads after it settles.
+    const observed: RotationState = {
+      cert_fp: existing?.cert_fp_sha256 ?? null,
+      cert_id: existing?.cert_id ?? null,
+      prev_fp: existing?.prev_cert_fp_sha256 ?? null,
+      prev_id: existing?.prev_cert_id ?? null,
+      revoke_at: existing?.cert_revoke_at ?? null,
+    };
+    const cas = rotationCas(observed, 12);
     const swap = env.DB.prepare(
       `INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, key_protection, is_admin, priority, cert_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at)
        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
        ON CONFLICT (machine_id) DO UPDATE SET
          os = ?2, hostname = ?3, cert_fp_sha256 = ?4, key_protection = ?5, is_admin = ?6, priority = ?7,
          cert_id = ?8, prev_cert_fp_sha256 = ?9, prev_cert_id = ?10, cert_revoke_at = ?11
-       WHERE machines.cert_fp_sha256 IS ?12 AND machines.prev_cert_fp_sha256 IS ?13 AND machines.cert_revoke_at IS ?14
+       WHERE ${cas.clause}
          AND NOT EXISTS (SELECT 1 FROM retired_certs WHERE fingerprint = ?4 AND machine_id = ?1 AND revoked_at IS NULL AND claimed_at IS NOT NULL)`,
-    ).bind(body.machine_id, os, hostname, certFp, keyProtection, isAdmin, priority, certId, prevFp, prevId, revokeAt, observedFp, observedPrevFp, observedRevokeAt);
+    ).bind(body.machine_id, os, hostname, certFp, keyProtection, isAdmin, priority, certId, prevFp, prevId, revokeAt, ...cas.binds);
+
+    // The state OUR swap produces — each retire INSERT co-commits only if the row is EXACTLY this after
+    // the swap, so a request that lost the CAS (row now in the winner's state) queues nothing.
+    const postSwap: RotationState = { cert_fp: certFp, cert_id: certId, prev_fp: prevFp, prev_id: prevId, revoke_at: revokeAt };
 
     // Belt-and-braces for a reservation that predates our read: if the clash pre-check passed but a prune
     // then queued certFp (this row's expiring prev) into retired_certs before we read `existing`, the swap
@@ -196,7 +203,7 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     // prune (that case already 409'd at the CAS above). A no-op when there is no such reservation.
     const stmts = [
       swap,
-      ...displaced.map((d) => queueRetiredIfDisplaced(env, d.fp, d.id, body.machine_id!, certFp!)),
+      ...displaced.map((d) => queueRetiredIfDisplaced(env, d.fp, d.id, body.machine_id!, postSwap)),
       ...(fpChanged && certFp
         ? [
             env.DB.prepare(
