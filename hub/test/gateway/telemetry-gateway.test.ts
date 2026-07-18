@@ -335,6 +335,10 @@ describe('telemetry-gateway fetch handler', () => {
       if (url.includes('login.microsoftonline.com')) {
         return new Response(JSON.stringify({ access_token: 'fake-entra-token', expires_in: 3600 }), { status: 200 });
       }
+      // Defer to a macrotask so the parallel fan-out can't complete synchronously —
+      // this keeps "nothing forwarded before the ack" a real assertion now that the
+      // token is minted up front (the DCR posts still run only via waitUntil).
+      await new Promise((r) => setTimeout(r, 0));
       dcrPosts++;
       bodyBytes.push((init?.body as Uint8Array).byteLength);
       return new Response(null, { status: 204 });
@@ -373,6 +377,55 @@ describe('telemetry-gateway fetch handler', () => {
     await Promise.all(deferred);
     expect(dcrPosts).toBeGreaterThan(3); // more than the sync threshold → many chunks
     for (const b of bodyBytes) expect(b).toBeLessThanOrEqual(1_000_000);
+  });
+
+  it('returns 503 for a LARGE batch when the token exchange fails — nothing dispatched, nothing deferred', async () => {
+    const pem = await pemFromGeneratedKeyPair();
+    const env = makeEnv(pem);
+
+    const deferred: Promise<unknown>[] = [];
+    const bigCtx = { waitUntil: (p: Promise<unknown>) => deferred.push(p) } as unknown as ExecutionContext;
+
+    let dcrPosts = 0;
+    fetchMock.mockImplementation(async (input: RequestInfo | URL) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('login.microsoftonline.com')) {
+        // Entra momentarily unavailable — token minted BEFORE the ack, so this must
+        // 503 the whole batch (retryable) rather than ack + drop it inside waitUntil.
+        return new Response(JSON.stringify({ error: 'temporarily_unavailable' }), { status: 503 });
+      }
+      dcrPosts++;
+      return new Response(null, { status: 204 });
+    });
+
+    // 20 × ~300 KB → over the async threshold, but token minting fails first.
+    const bigBody = `{"event":"http.access","blob":"${'a'.repeat(300_000)}"}`;
+    const otlpJson = {
+      resourceLogs: [
+        {
+          resource: { attributes: [{ key: 'service.name', value: { stringValue: 'sessions-hub' } }] },
+          scopeLogs: [
+            {
+              logRecords: Array.from({ length: 20 }, (_, i) => ({
+                timeUnixNano: String(1782964800000000000n + BigInt(i)),
+                body: { stringValue: bigBody },
+              })),
+            },
+          ],
+        },
+      ],
+    };
+
+    const req = new Request('https://gateway.example/v1/logs', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${env.INGEST_BEARER}` },
+      body: JSON.stringify(otlpJson),
+    });
+
+    const res = await gateway.fetch(req, env as never, bigCtx);
+    expect(res.status).toBe(503); // retryable — CF redelivers the whole batch
+    expect(dcrPosts).toBe(0); // nothing forwarded
+    expect(deferred.length).toBe(0); // nothing deferred to waitUntil
   });
 
   it('classifies per chunk under the parallel pool: a 413 among several is dropped, batch still 204', async () => {

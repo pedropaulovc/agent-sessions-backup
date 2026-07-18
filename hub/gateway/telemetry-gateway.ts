@@ -247,39 +247,13 @@ async function forwardOtlp(
     return new Response(null, { status: 204 });
   }
 
-  // LARGE batch (backlog flush): ack CF immediately and finish the chunked forward
-  // in waitUntil, so CF can't context-cancel it mid-flight. This shifts the trade
-  // for large batches only: having already ack'd, a transient DCR failure can no
-  // longer surface as 503 → it's logged-and-lost. That's acceptable because the
-  // alternative is the whole pipeline wedging on CF's client timeout, and a backlog
-  // flush is exactly where duplicates-vs-loss already tilts toward "don't re-send
-  // the whole giant batch". A failed token exchange here can't 503 either, so it's
-  // logged loudly (tag gateway-token-error, async:true) for the collector-error alert.
-  if (chunks.length > SYNC_CHUNK_THRESHOLD) {
-    ctx.waitUntil(
-      (async () => {
-        let token: string;
-        try {
-          token = await getEntraToken(env);
-        } catch (e) {
-          logGatewayEvent({ tag: "gateway-token-error", endpoint, async: true, error: String(e) });
-          return;
-        }
-        await postChunks(chunks, endpoint, token, true);
-      })(),
-    );
-    return new Response(null, { status: 204 });
-  }
-
-  // SMALL steady-state batch: fully synchronous, exact prior contract —
-  //   - token exchange fails → 503, NOTHING dispatched, CF retries the batch;
-  //   - all chunks 2xx       → 204;
-  //   - a chunk 413s (cap anomaly / truncation edge) → poison: log + drop, stay ack'd;
-  //   - a chunk gets a TRANSIENT failure (408/429/5xx/network) → 503 so CF redelivers.
-  // Duplicates-over-loss is deliberate: a 503 redelivers the whole batch, re-posting
-  // landed chunks, but duplicate rows are harmless to the alert queries (absence /
-  // arg_max / gap semantics tolerate repeats) while a LOST beacon is the exact
-  // false-alarm mode the dead-man alerts guard against.
+  // Mint/refresh the Entra token SYNCHRONOUSLY for BOTH paths, before any 204. It's
+  // ~200 ms worst case and usually a cache hit — well inside the pre-ack budget
+  // (~0.9 s of parse/encode on a 6 MB batch), so it doesn't threaten the context-
+  // cancel margin. Doing it up front means a transient Entra failure returns 503
+  // with NOTHING dispatched (CF retries the whole batch, same as the small-batch
+  // contract) instead of silently dropping a large batch inside waitUntil after
+  // we've already ack'd — where the only signal would be a tail-only console line.
   let token: string;
   try {
     token = await getEntraToken(env);
@@ -288,6 +262,25 @@ async function forwardOtlp(
     return new Response("token exchange failed", { status: 503 });
   }
 
+  // LARGE batch (backlog flush): ack CF immediately and finish the chunked forward
+  // in waitUntil, so CF can't context-cancel it mid-flight. The token is already in
+  // hand, so the ONLY class that can't surface as 503 here is a TRANSIENT DCR chunk
+  // failure — logged-and-lost (disposition "lost-after-ack"). Acceptable: the
+  // alternative is wedging on CF's client timeout, and a backlog flush is exactly
+  // where duplicates-vs-loss tilts toward "don't re-send the whole giant batch".
+  if (chunks.length > SYNC_CHUNK_THRESHOLD) {
+    ctx.waitUntil(postChunks(chunks, endpoint, token, true));
+    return new Response(null, { status: 204 });
+  }
+
+  // SMALL steady-state batch: fully synchronous, exact prior contract —
+  //   - all chunks 2xx → 204;
+  //   - a chunk 413s (cap anomaly / truncation edge) → poison: log + drop, stay ack'd;
+  //   - a chunk gets a TRANSIENT failure (408/429/5xx/network) → 503 so CF redelivers.
+  // Duplicates-over-loss is deliberate: a 503 redelivers the whole batch, re-posting
+  // landed chunks, but duplicate rows are harmless to the alert queries (absence /
+  // arg_max / gap semantics tolerate repeats) while a LOST beacon is the exact
+  // false-alarm mode the dead-man alerts guard against.
   const retryable = await postChunks(chunks, endpoint, token, false);
   if (retryable) {
     return new Response("upstream transient failure — retry", { status: 503 });
