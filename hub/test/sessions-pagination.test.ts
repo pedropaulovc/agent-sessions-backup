@@ -5,6 +5,7 @@ import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import worker from '../src/index';
 import { ccLine, codexLines, CODEX_SESSION_ID } from './fixtures';
+import { chatgptExportZip } from './web-fixtures';
 
 const testEnv = env as unknown as Env;
 
@@ -13,8 +14,7 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
-async function putFile(machine: string, store: string, relpath: string, content: string): Promise<Response> {
-  const body = new TextEncoder().encode(content);
+async function putBytes(machine: string, store: string, relpath: string, body: Uint8Array): Promise<Response> {
   return SELF.fetch(`https://api.sessions.vza.net/api/v1/files/${machine}/${store}/${encodeURIComponent(relpath)}`, {
     method: 'PUT',
     headers: {
@@ -25,6 +25,10 @@ async function putFile(machine: string, store: string, relpath: string, content:
     },
     body,
   });
+}
+
+async function putFile(machine: string, store: string, relpath: string, content: string): Promise<Response> {
+  return putBytes(machine, store, relpath, new TextEncoder().encode(content));
 }
 
 async function drainQueue(): Promise<void> {
@@ -463,6 +467,44 @@ describe('X-Indexed-Through and /api/v1/usage respect the request machine/harnes
     // though nothing on it can ever surface under harness=claude-code.
     expect(bodyCc.indexed_through).not.toBe(SUPERSEDED_TS);
     expect(bodyCc.indexed_through).toBe('2019-01-01T00:00:00.000Z');
+  });
+
+  it('harness filter -> includes a machine whose only file is a pending unknown-harness export ZIP, until it parses (round-3 finding)', async () => {
+    const WEBZIP_MACHINE = 'filterbox-webzip';
+    const WEBZIP_TS = '2016-01-01T00:00:00.000Z'; // older than everything else in this block
+    const zip = chatgptExportZip([
+      { id: 'conv-unknown-1', title: 'pending export', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'hello' }] },
+    ]);
+    const res = await putBytes(WEBZIP_MACHINE, 'export-inbox', 'pending.zip', zip);
+    expect(res.status).toBe(201);
+    const fileRow = await testEnv.DB.prepare('SELECT harness, parse_state FROM files WHERE machine_id = ?1')
+      .bind(WEBZIP_MACHINE)
+      .first<{ harness: string; parse_state: string }>();
+    // detect() (hub/src/ingest/detect.ts) stamps a .zip upload 'unknown' — its real
+    // per-conversation harness isn't known until parseExportArchive() reads the archive.
+    expect(fileRow?.harness).toBe('unknown');
+    expect(fileRow?.parse_state).toBe('pending');
+    await testEnv.DB.prepare('UPDATE machines SET last_seen_at = ?1 WHERE machine_id = ?2').bind(WEBZIP_TS, WEBZIP_MACHINE).run();
+
+    // Included for harness=claude-web even though this ZIP will turn out to be chatgpt-web
+    // content — a pending 'unknown' file could contain sessions of ANY harness, so it must
+    // count against every harness-scoped freshness read until parsed (conservative by design).
+    const before = await get('harness=claude-web');
+    const bodyBefore = (await before.json()) as { indexed_through: string };
+    expect(bodyBefore.indexed_through).toBe(WEBZIP_TS);
+
+    await drainQueue();
+    const parsedFileRow = await testEnv.DB.prepare('SELECT harness, parse_state FROM files WHERE machine_id = ?1')
+      .bind(WEBZIP_MACHINE)
+      .first<{ harness: string; parse_state: string }>();
+    expect(parsedFileRow?.parse_state).toBe('parsed');
+
+    // Once parsed, the file is no longer 'pending'/'error' (excluded from the files arm) and
+    // its actual content is chatgpt-web, not claude-web — the machine correctly drops out of
+    // claude-web freshness, covered by the existing sessions/files arms.
+    const after = await get('harness=claude-web');
+    const bodyAfter = (await after.json()) as { indexed_through: string };
+    expect(bodyAfter.indexed_through).not.toBe(WEBZIP_TS);
   });
 
   it('no filter -> fleet-wide MIN across all machines (unchanged behavior)', async () => {

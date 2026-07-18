@@ -132,17 +132,30 @@ export async function getSessionRaw(sessionId: string, request: Request, env: En
  * actually describes the data they asked for: machine filter -> that machine's own
  * last_seen_at; harness filter -> MIN over machines that have EVER produced a session of
  * that harness, OR that have an UNRESOLVED (`pending`/`error`) `files` row detected as that
- * harness even before it's parsed into a `sessions` row (upload.ts/detect.ts stamp
- * `files.harness` at upload time, ahead of the queue consumer) — otherwise a machine with a
- * pending/error file of the filtered harness would be invisible to this query and make the
- * signal look fresher than the data it's still missing. `parsed` files are excluded because
- * their sessions are already covered by the `sessions` arm above; `superseded`/`skipped`
- * files are excluded because they're terminal and can NEVER produce a sessions row — an
- * unfiltered files arm let a machine whose only harness-X file was a lower-priority
- * `superseded` duplicate drag the harness-X MIN stale forever, even though nothing on that
- * machine could ever appear in `/api/v1/sessions?harness=X`. No filter -> fleet-wide MIN,
- * same as before. `machine` wins if both are given — it's the more specific, unambiguous
- * filter.
+ * harness (or as `'unknown'` — see below) even before it's parsed into a `sessions` row
+ * (upload.ts/detect.ts stamp `files.harness` at upload time, ahead of the queue consumer) —
+ * otherwise a machine with a pending/error file of the filtered harness would be invisible
+ * to this query and make the signal look fresher than the data it's still missing. `parsed`
+ * files are excluded because their sessions are already covered by the `sessions` arm above;
+ * `superseded`/`skipped` files are excluded because they're terminal and can NEVER produce a
+ * sessions row — an unfiltered files arm let a machine whose only harness-X file was a
+ * lower-priority `superseded` duplicate drag the harness-X MIN stale forever, even though
+ * nothing on that machine could ever appear in `/api/v1/sessions?harness=X`.
+ *
+ * `harness = 'unknown'`: `detect()` (hub/src/ingest/detect.ts) stamps a `.zip` upload to
+ * export-inbox as `harness: 'unknown'` — its real per-conversation harness(es) (chatgpt-web,
+ * claude-web, or a mix) aren't known until `parseExportArchive()` actually reads
+ * `conversations.json`. A pending/error 'unknown' file could turn out to contain sessions of
+ * ANY harness, so its machine's staleness must count against EVERY harness-scoped freshness
+ * read until the parse resolves it — the alternative (excluding it) would let an entire
+ * unparsed archive hide behind an optimistic freshness signal for the harness it actually
+ * contains. This is intentionally conservative: it also drags freshness for harnesses the
+ * archive turns out NOT to contain, but honest-under-uncertainty beats optimistic here, and
+ * the state is transient — once parsed, the file's `harness` (or its constituent sessions)
+ * resolves to a real value and this arm stops matching it.
+ *
+ * No filter -> fleet-wide MIN, same as before. `machine` wins if both are given — it's the
+ * more specific, unambiguous filter.
  */
 async function computeIndexedThrough(env: Env, p: URLSearchParams): Promise<string | null> {
   const machine = p.get('machine');
@@ -156,7 +169,7 @@ async function computeIndexedThrough(env: Env, p: URLSearchParams): Promise<stri
              WHERE machine_id IN (
                SELECT machine_id FROM sessions WHERE harness = ?1
                UNION
-               SELECT machine_id FROM files WHERE harness = ?1 AND parse_state IN ('pending', 'error')
+               SELECT machine_id FROM files WHERE (harness = ?1 OR harness = 'unknown') AND parse_state IN ('pending', 'error')
              )`,
           )
           .bind(harness)
