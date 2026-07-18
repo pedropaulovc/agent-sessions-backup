@@ -1,6 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { markPendingAndEnqueue } from '../queue';
-import { hex } from './ops';
+import { hex, objectSha256 } from './ops';
 import { TERMINAL_PARSE_STATES, recordUploadedObject, restampIfStale } from './upload';
 
 // R2 multipart part rules (developers.cloudflare.com/r2/objects/multipart-objects): every part
@@ -11,8 +11,12 @@ import { TERMINAL_PARSE_STATES, recordUploadedObject, restampIfStale } from './u
 export const MIN_PART_SIZE = 5 * 1024 * 1024; // 5 MiB
 export const MAX_PART_NUMBER = 10000;
 
-function r2MtimeMetadata(mtime: string | null): Record<string, string> | undefined {
-  return mtime !== null ? { mtime } : undefined;
+/** customMetadata for a multipart object: the source mtime AND the whole-object sha256. R2 records
+ * checksums.sha256 only for a single put({sha256}); a multipart object has none, so we persist the
+ * hash here for files/check, reindex, and convergence to read back (objectSha256). It is trustworthy
+ * because completeMultipart verifies the assembled object against it before the object is kept. */
+function r2Metadata(mtime: string | null, sha256: string): Record<string, string> {
+  return mtime !== null ? { mtime, sha256 } : { sha256 };
 }
 
 /** Parse+validate the whole-object headers (identical contract to the simple PUT): the sha256 the
@@ -59,27 +63,35 @@ export async function createMultipart(
   if ('error' in parsed) return Response.json({ error: parsed.error }, { status: 400 });
   const { sha256, mtime } = parsed;
 
+  const key = r2Key(machineId, store, relpath);
   const existing = await env.DB.prepare(
     'SELECT id, content_hash, parse_state, r2_key, harness, session_id FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
   )
     .bind(machineId, store, relpath)
     .first<{ id: number; content_hash: string; parse_state: string; r2_key: string; harness: string | null; session_id: string | null }>();
   if (existing && existing.content_hash === sha256) {
-    // Hub already has these exact bytes. Unlike the simple PUT's same-hash branch we have no body to
-    // repair R2 from (the collector hasn't sent anything yet) — but we still restamp a legacy row and
-    // re-enqueue a non-terminal/restamped one so a 'skipped' or dropped-message row finally indexes.
-    const restamped = await restampIfStale(existing, store, relpath, machineId, env);
-    if (restamped || !TERMINAL_PARSE_STATES.has(existing.parse_state)) {
-      await markPendingAndEnqueue(existing, 'upload', env);
-      return Response.json({ status: 'unchanged', file_id: existing.id, requeued: true, restamped });
+    // Hub's D1 says it has these bytes — but the raw R2 object can be MISSING or CORRUPT independent
+    // of the row (a bad restore, a lost object). The simple PUT repairs from the request body; we have
+    // no body yet, so verify R2 first: only short-circuit when the object is actually present AND its
+    // verified hash matches. Otherwise fall through to open a fresh upload so the collector re-sends
+    // the parts and repairs R2 (this is what makes files/check's large-file repair path work).
+    const head = await env.RAW.head(key);
+    if (head && objectSha256(head) === sha256) {
+      // R2 has the right bytes. Still restamp a legacy row and re-enqueue a non-terminal/restamped one
+      // so a 'skipped' or dropped-message row finally indexes.
+      const restamped = await restampIfStale(existing, store, relpath, machineId, env);
+      if (restamped || !TERMINAL_PARSE_STATES.has(existing.parse_state)) {
+        await markPendingAndEnqueue(existing, 'upload', env);
+        return Response.json({ status: 'unchanged', file_id: existing.id, requeued: true, restamped });
+      }
+      return Response.json({ status: 'unchanged', file_id: existing.id });
     }
-    return Response.json({ status: 'unchanged', file_id: existing.id });
+    // else: R2 missing/corrupt — fall through to open a fresh multipart so the collector repairs it.
   }
 
-  const key = r2Key(machineId, store, relpath);
   let mpu: R2MultipartUpload;
   try {
-    mpu = await env.RAW.createMultipartUpload(key, { customMetadata: r2MtimeMetadata(mtime) });
+    mpu = await env.RAW.createMultipartUpload(key, { customMetadata: r2Metadata(mtime, sha256) });
   } catch (e) {
     return Response.json({ error: 'create_multipart_failed', detail: String(e) }, { status: 400 });
   }
@@ -208,6 +220,8 @@ export async function completeMultipart(
     sha256,
     existed: existing != null,
     convergeBody: null,
+    // No body to re-PUT — converge D1 onto whatever object survived in R2 (see convergeMultipartRow).
+    convergeObservedR2: true,
   });
 }
 

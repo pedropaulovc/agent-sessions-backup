@@ -1,6 +1,7 @@
 import { env, SELF } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import worker from '../src/index';
+import { convergeMultipartRow } from '../src/api/upload';
 import { ccAssistantLine, ccUserLine } from './fixtures';
 
 const testEnv = env as unknown as Env;
@@ -277,5 +278,84 @@ describe('multipart upload', () => {
     });
     expect(res.status).toBe(400);
     expect((await res.json<any>()).error).toBe('missing_or_bad_x_content_hash');
+  });
+});
+
+describe('multipart review fixes', () => {
+  async function checkFiles(machine: string, items: Array<{ store: string; relpath: string; sha256: string }>): Promise<{ missing: Array<{ store: string; relpath: string }> }> {
+    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+      method: 'POST',
+      headers: { 'x-dev-machine': machine, 'content-type': 'application/json' },
+      body: JSON.stringify({ files: items }),
+    });
+    return res.json();
+  }
+
+  it('files/check does NOT report a completed multipart object as missing (customMetadata.sha256 fallback)', async () => {
+    const bytes = new Uint8Array(6 * MIB).fill(5);
+    const hash = await sha256Hex(bytes);
+    const relpath = 'fc/mp.bin';
+    expect((await multipartStore('fc-box', 'claude', relpath, bytes, 5 * MIB)).complete!.status).toBe(201);
+
+    // Positive control: a completed multipart object has NO native checksums.sha256...
+    const obj = await testEnv.RAW.head(`raw/fc-box/claude/${relpath}`);
+    expect(obj!.checksums.sha256).toBeUndefined();
+    expect(obj!.customMetadata?.sha256).toBe(hash); // ...but the verified hash is in customMetadata
+
+    const present = await checkFiles('fc-box', [{ store: 'claude', relpath, sha256: hash }]);
+    expect(present.missing).toEqual([]); // not re-uploaded on every backfill
+
+    // And a genuinely-absent object IS reported missing (proves the check verifies R2, not just D1).
+    await testEnv.RAW.delete(`raw/fc-box/claude/${relpath}`);
+    const gone = await checkFiles('fc-box', [{ store: 'claude', relpath, sha256: hash }]);
+    expect(gone.missing).toEqual([{ store: 'claude', relpath }]);
+  });
+
+  it('create re-opens a fresh upload (not unchanged) when the same-hash R2 object is missing/corrupt', async () => {
+    const bytes = new Uint8Array(6 * MIB).fill(6);
+    const hash = await sha256Hex(bytes);
+    const relpath = 'reopen/mp.bin';
+    expect((await multipartStore('reopen-box', 'claude', relpath, bytes, 5 * MIB)).complete!.status).toBe(201);
+
+    // Same-hash create while the object is present -> unchanged short-circuit.
+    const unchanged = await createMp('reopen-box', 'claude', relpath, bytes.length, hash);
+    expect(unchanged.status).toBe(200);
+
+    // Now the raw object is lost. A same-hash create must NOT short-circuit — it must reopen so the
+    // collector can re-send the parts and repair R2 (large-file analog of the simple PUT body repair).
+    await testEnv.RAW.delete(`raw/reopen-box/claude/${relpath}`);
+    const reopened = await createMp('reopen-box', 'claude', relpath, bytes.length, hash);
+    expect(reopened.status).toBe(201);
+    expect((await reopened.json<any>()).status).toBe('created');
+  });
+
+  it('convergeMultipartRow realigns a D1 row to the object R2 actually holds and re-enqueues', async () => {
+    // Simulate the interleaved end state of two changed-hash completes: the D1 row carries hash HA,
+    // but R2's object at the key is the OTHER writer's (its verified hash HB in customMetadata).
+    const key = 'raw/converge-box/claude/c.bin';
+    const HA = 'a'.repeat(64);
+    const HB = 'b'.repeat(64);
+    await testEnv.DB.prepare("INSERT INTO machines (machine_id, os) VALUES ('converge-box','linux') ON CONFLICT (machine_id) DO NOTHING").run();
+    const row = await testEnv.DB.prepare(
+      `INSERT INTO files (machine_id, store, relpath, r2_key, size, mtime, content_hash, parse_state)
+       VALUES ('converge-box','claude','c.bin',?1, 10, '2026-07-01T00:00:00Z', ?2, 'parsed') RETURNING id`,
+    )
+      .bind(key, HA)
+      .first<{ id: number }>();
+    // R2 holds the OTHER upload's object, identified by customMetadata.sha256 = HB.
+    await testEnv.RAW.put(key, new Uint8Array(16).fill(9), { customMetadata: { sha256: HB, mtime: '2026-07-02T00:00:00Z' } });
+
+    const converged = await convergeMultipartRow(row!.id, key, HA, testEnv);
+    expect(converged).toBe(true);
+    const after = await testEnv.DB.prepare('SELECT content_hash, parse_state, mtime FROM files WHERE id = ?1')
+      .bind(row!.id)
+      .first<{ content_hash: string; parse_state: string; mtime: string }>();
+    expect(after!.content_hash).toBe(HB); // row now describes what R2 actually holds
+    expect(after!.parse_state).toBe('pending'); // re-enqueued for a reparse
+    expect(after!.mtime).toBe('2026-07-02T00:00:00Z');
+
+    // Positive control: when R2 already matches the row, convergence is a no-op.
+    const noop = await convergeMultipartRow(row!.id, key, HB, testEnv);
+    expect(noop).toBe(false);
   });
 });

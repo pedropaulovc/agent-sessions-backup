@@ -150,7 +150,10 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
         store,
         relpath,
         det: detect(store, relpath, machineId),
-        contentHash: obj.checksums?.sha256 ? hex(obj.checksums.sha256) : 'unknown',
+        // Multipart-written objects carry NO checksums.sha256 (R2 only records it for a single
+        // put({sha256})); the completed-multipart path stashes the verified hash in customMetadata
+        // instead. Prefer the native checksum, fall back to that metadata, then 'unknown'.
+        contentHash: objectSha256(obj) ?? 'unknown',
         mtime: obj.customMetadata?.mtime ?? null,
         size: obj.size,
       });
@@ -268,4 +271,18 @@ export function queueChunks<T>(messages: { body: T }[], sizeCap = 200_000): { bo
 
 export function hex(buf: ArrayBuffer): string {
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * The sha256 (hex) an R2 object hashes to, or undefined if unknowable. A single put({sha256}) makes
+ * R2 record it natively as checksums.sha256; a multipart-completed object has NO native checksum, so
+ * the complete path stashes the DigestStream-verified hash in customMetadata.sha256. Prefer the
+ * native checksum, fall back to that metadata. The metadata is trustworthy because a surviving
+ * completed-multipart object had its whole-object hash verified against it (mismatch → deleted)
+ * before it became visible — see completeMultipart.
+ */
+export function objectSha256(obj: R2Object | null | undefined): string | undefined {
+  if (!obj) return undefined;
+  if (obj.checksums?.sha256) return hex(obj.checksums.sha256);
+  return obj.customMetadata?.sha256?.toLowerCase();
 }

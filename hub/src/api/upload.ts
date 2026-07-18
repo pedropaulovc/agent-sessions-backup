@@ -1,7 +1,7 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
 import { markPendingAndEnqueue } from '../queue';
-import { hex } from './ops';
+import { hex, objectSha256 } from './ops';
 
 export const TERMINAL_PARSE_STATES = new Set(['parsed', 'skipped', 'superseded']);
 
@@ -174,6 +174,10 @@ export async function recordUploadedObject(
     sha256: string;
     existed: boolean;
     convergeBody: ArrayBuffer | null;
+    // Multipart path: there is no body to re-PUT, so converge on OBSERVED R2 state instead (see
+    // convergeMultipartRow). Two overlapping changed-hash completes for the same key can leave the
+    // D1 row describing bytes R2 no longer holds; this realigns the row to whatever object survived.
+    convergeObservedR2?: boolean;
   },
 ): Promise<Response> {
   const { machineId, store, relpath, r2Key, size, mtime, sha256, existed, convergeBody } = opts;
@@ -236,10 +240,45 @@ export async function recordUploadedObject(
   }
   await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
 
+  if (opts.convergeObservedR2) await convergeMultipartRow(row!.id, r2Key, sha256, env);
+
   console.log(
     JSON.stringify({ event: 'access.upload', machine: machineId, key: r2Key, bytes: size, status: existed ? 'updated' : 'created' }),
   );
   return Response.json({ status: 'stored', file_id: row!.id }, { status: 201 });
+}
+
+/**
+ * Multipart analog of convergeR2WithRow. The simple path re-PUTs its buffered body to restore R2 when
+ * a concurrent same-path writer clobbered it; a multipart complete has no body to re-PUT, so instead
+ * it aligns D1 to whatever object actually survived in R2. Two overlapping changed-hash completes for
+ * the same key each write their object then upsert their row; the R2-last-writer and D1-last-writer
+ * can differ, leaving files.content_hash describing bytes R2 no longer holds. After our own upsert we
+ * HEAD the key: if it still carries THIS complete's hash (we are the current D1 owner) but R2 holds a
+ * DIFFERENT object (identified by its verified customMetadata.sha256), realign the row to the R2 hash
+ * and re-enqueue a parse for it. Guarded on our own hash so the OTHER writer — which runs this same
+ * check — owns convergence once its upsert wins the row; the consumer's content_hash guard makes the
+ * (possibly duplicate) re-enqueue idempotent. Exported for tests, which drive the interleaved end
+ * state directly (row hash == ours, R2 object == the other writer's) the same way convergeR2WithRow does.
+ */
+export async function convergeMultipartRow(fileId: number, r2Key: string, sha256: string, env: Env): Promise<boolean> {
+  const row = await env.DB.prepare('SELECT content_hash FROM files WHERE id = ?1').bind(fileId).first<{ content_hash: string }>();
+  if (row?.content_hash !== sha256) return false; // another writer's upsert won; they own convergence
+  const head = await env.RAW.head(r2Key);
+  const r2Hash = objectSha256(head);
+  // No object (a concurrent delete) or R2 already matches our row: nothing to realign.
+  if (!r2Hash || r2Hash === sha256) return false;
+  // R2 holds a different upload's object. Point the row at what R2 actually holds and reparse it.
+  const mtime = head!.customMetadata?.mtime ?? null;
+  const updated = await env.DB.prepare(
+    "UPDATE files SET content_hash = ?2, mtime = ?3, parse_state = 'pending', parse_error = NULL WHERE id = ?1 AND content_hash = ?4 RETURNING id",
+  )
+    .bind(fileId, r2Hash, mtime, sha256)
+    .first<{ id: number }>();
+  if (!updated) return false; // lost the row to the other writer in the meantime
+  await env.PARSE_QUEUE.send({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: r2Hash });
+  console.log(JSON.stringify({ event: 'access.multipart_converge', key: r2Key, from: sha256, to: r2Hash }));
+  return true;
 }
 
 /**
@@ -342,8 +381,10 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
     const heads = await Promise.all(
       [...have.values()].map(async (r): Promise<[number, boolean]> => {
         const obj = await env.RAW.head(r.r2_key);
-        const checksum = obj?.checksums.sha256 ? hex(obj.checksums.sha256) : undefined;
-        return [r.id, checksum === r.content_hash];
+        // objectSha256 falls back to customMetadata.sha256 for multipart-written objects, which have
+        // no native checksums.sha256 — without it, every completed-multipart file would report
+        // 'missing' here forever and the collector would re-upload it on every backfill/resync.
+        return [r.id, objectSha256(obj) === r.content_hash];
       }),
     );
     const objectVerified = new Map(heads);

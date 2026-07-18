@@ -7,12 +7,13 @@ enforce R2's real 5MiB floor (that rule is enforced + tested on the hub side).
 """
 
 import hashlib
+import types
 
 import pytest
 
 from agent_collector import config, run as run_mod
 from agent_collector.state import State
-from agent_collector.transport import Transport
+from agent_collector.transport import DevAuth, Transport
 
 pytestmark = pytest.mark.skipif(
     not Transport.curl_available(), reason="system curl not available"
@@ -177,6 +178,70 @@ def test_backfill_routes_large_file_through_multipart(tmp_env, hub):
     assert hub.files[("m1", "claude", "small.jsonl")]["body"] == small  # batch/simple path
     expected_parts = -(-len(big) // PART_BYTES)
     assert hub.part_attempts == expected_parts
+
+
+def test_multipart_part_read_failure_aborts_and_run_continues(tmp_env, hub, monkeypatch):
+    """A source file truncated/removed mid-upload must abort the upload, surface upload_failed, and
+    NOT kill the run — subsequent files still upload."""
+    root = tmp_env / "claude"
+    root.mkdir()
+    _write(root, "a-fail.jsonl", b"F" * 5000)
+    _write(root, "b-ok.jsonl", b"O" * 5000)
+    cfg = _cfg(hub, root)
+
+    real = run_mod.read_range
+
+    def flaky(path, offset, length):
+        if path.name == "a-fail.jsonl" and offset > 0:  # part 1 (offset 0) reads; later parts fail
+            raise OSError("source vanished mid-upload")
+        return real(path, offset, length)
+
+    monkeypatch.setattr(run_mod, "read_range", flaky)
+    with State(tmp_env / "state.db") as st:
+        run_mod._do_run(cfg, st)
+        a = st.get_file("claude", "a-fail.jsonl")
+        b = st.get_file("claude", "b-ok.jsonl")
+
+    assert a.status == "error"  # failed file marked, not crashed
+    assert len(hub.aborts) == 3  # aborted the dangling upload on each of the 3 attempts
+    assert ("m1", "claude", "b-ok.jsonl") in hub.files  # the run continued to the next file
+    assert b.status == "ok"
+    events = hub.heartbeats[-1]["events"]
+    assert any(e["code"] == "upload_failed" and e.get("store") == "claude" for e in events)
+
+
+def test_effective_part_size_escalates_then_refuses():
+    """Part size grows to keep the part count <= 10000, but never above the threshold; a file so large
+    that even threshold-sized parts exceed 10000 parts is refused (synthetic sizes, no fixtures)."""
+    ceiling = int(90 * 1024 * 1024)   # threshold bytes
+    configured = int(64 * 1024 * 1024)
+    MAX = run_mod.MULTIPART_MAX_PARTS  # 10000
+
+    # Small file: keeps the configured part size.
+    ps, refusal = run_mod._effective_part_size(1_000_000, configured, ceiling)
+    assert refusal is None and ps == configured
+
+    # Large file needing bigger-than-configured parts (but under the ceiling): escalates to ceil(size/MAX).
+    size = 80_000_000 * MAX  # needs 80,000,000-byte parts, between configured and ceiling
+    ps, refusal = run_mod._effective_part_size(size, configured, ceiling)
+    assert refusal is None and ps == 80_000_000
+
+    # Too large: even ceiling-sized parts would exceed MAX parts -> refuse, no bytes sent.
+    ps, refusal = run_mod._effective_part_size((ceiling + 1) * MAX, configured, ceiling)
+    assert ps is None and refusal is not None
+
+
+def test_multipart_refuses_unshippable_file_without_sending(tmp_env, hub):
+    """_upload_multipart refuses an over-large file up front — no create, no parts."""
+    cfg = config.Config(machine_id="m1", hub_url=hub.url, auth="dev", stores={"claude": str(tmp_env)})
+    item = types.SimpleNamespace(
+        store="claude", relpath="huge.bin", source_path=tmp_env / "huge.bin",
+        size=(cfg.multipart_threshold_bytes + 1) * run_mod.MULTIPART_MAX_PARTS, mtime_ns=1_000_000_000_000,
+    )
+    result, detail = run_mod._upload_multipart(cfg, Transport(DevAuth("m1")), item, "deadbeef")
+    assert result == run_mod.MULTIPART_FAILED
+    assert detail is not None
+    assert hub.part_attempts == 0 and not hub.multipart  # nothing was opened or sent
 
 
 def test_multipart_unchanged_shortcircuit_skips_reupload(tmp_env, hub):

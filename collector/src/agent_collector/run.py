@@ -33,6 +33,23 @@ MULTIPART_FAILED = "failed"
 # create->parts->complete this many times before giving up and surfacing a heartbeat error.
 MULTIPART_MAX_ATTEMPTS = 3
 
+# R2 caps a multipart upload at 10000 parts. For a very large file the configured part size would
+# blow past that, so we escalate the part size to ceil(size/10000); if even that exceeds the
+# threshold (the safe ceiling under Cloudflare's 100MB edge cap) the file is unshippable and we
+# refuse up front rather than upload thousands of parts only to fail on part 10001.
+MULTIPART_MAX_PARTS = 10000
+
+
+def _effective_part_size(size: int, configured: int, ceiling: int) -> tuple[int | None, str | None]:
+    """(part_size, None) or (None, refusal_reason). Grows the part size just enough to keep the part
+    count <= MULTIPART_MAX_PARTS, but never above `ceiling` (the multipart threshold, itself below the
+    100MB edge cap)."""
+    needed = -(-size // MULTIPART_MAX_PARTS)  # ceil(size / 10000)
+    if needed > ceiling:
+        return None, (f"file of {size} bytes needs >= {needed}-byte parts to stay under "
+                      f"{MULTIPART_MAX_PARTS} parts, exceeding the {ceiling}-byte part ceiling")
+    return min(max(configured, needed), ceiling), None
+
 
 # Warn-level scanner event codes that still mean a file was NOT captured this run (the DB was
 # locked or its snapshot failed, so we skipped it). They gate backfill's exit code so an
@@ -267,7 +284,12 @@ def _multipart_send_parts(transport: Transport, base_url: str, item: ScanItem, u
     for i in range(num_parts):
         offset = i * part_size
         length = min(part_size, size - offset)
-        data = read_range(item.source_path, offset, length)
+        try:
+            data = read_range(item.source_path, offset, length)
+        except OSError as e:
+            # Source truncated/removed/unreadable mid-upload: fail this file cleanly so the caller
+            # aborts the upload and emits upload_failed, and the run continues to the next file.
+            return None, f"read failed on part {i + 1}: {e}"
         if len(data) != length:
             return None, f"short read on part {i + 1}: got {len(data)} want {length}"
         part_no = i + 1
@@ -302,7 +324,10 @@ def _upload_multipart(cfg, transport: Transport, item: ScanItem, sha: str) -> tu
     opened an upload but didn't complete is aborted before retrying (and on final give-up) so no
     dangling multipart is left. Returns (MULTIPART_*, detail)."""
     base_url = file_url(cfg.hub_url, cfg.machine_id, item.store, item.relpath)
-    part_size = cfg.multipart_part_size_bytes
+    part_size, refusal = _effective_part_size(
+        item.size, cfg.multipart_part_size_bytes, cfg.multipart_threshold_bytes)
+    if part_size is None:
+        return MULTIPART_FAILED, refusal  # too large to ship in <= 10000 parts; no bytes sent
     mtime = mtime_iso(item.mtime_ns)
     last_error: str | None = None
     for _attempt in range(MULTIPART_MAX_ATTEMPTS):
