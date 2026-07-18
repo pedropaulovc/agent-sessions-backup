@@ -338,9 +338,9 @@ describe('multipart review fixes', () => {
     // The previous canonical object (v1) is byte-identical and intact — the backup was NOT destroyed.
     const canonical = await testEnv.RAW.get(`raw/preserve-box/claude/${relpath}`);
     expect(await sha256Hex(new Uint8Array(await canonical!.arrayBuffer()))).toBe(v1Hash);
-    // And no staging object was left behind.
-    const staging = await testEnv.RAW.head(`mpu-staging/preserve-box/claude/${relpath}`);
-    expect(staging).toBeNull();
+    // And no staging object was left behind (keys are upload-unique, so list the prefix).
+    const staging = await testEnv.RAW.list({ prefix: 'mpu-staging/preserve-box/' });
+    expect(staging.objects).toHaveLength(0);
   });
 
   it('canonical is not overwritten until verification passes: an in-flight upload leaves the old object', async () => {
@@ -358,6 +358,52 @@ describe('multipart review fixes', () => {
     const mid = await testEnv.RAW.get(`raw/vis-box/claude/${relpath}`);
     expect(await sha256Hex(new Uint8Array(await mid!.arrayBuffer()))).toBe(v1Hash); // still the old bytes
     await abortMp('vis-box', 'claude', relpath, upload_id);
+  });
+
+  it('CONCURRENCY: two overlapping uploads for the same path both complete with independent staging', async () => {
+    const relpath = 'race/same.bin';
+    const a = new Uint8Array(6 * MIB).fill(0xa1);
+    const b = new Uint8Array(6 * MIB).fill(0xb2);
+    const aHash = await sha256Hex(a);
+    const bHash = await sha256Hex(b);
+
+    // Two independent multipart uploads for the SAME machine/store/relpath.
+    const tokA = (await (await createMp('race-box', 'claude', relpath, a.length, aHash)).json<any>()).upload_id as string;
+    const tokB = (await (await createMp('race-box', 'claude', relpath, b.length, bHash)).json<any>()).upload_id as string;
+    // Upload-unique staging: the two tokens carry different nonces, so their staging keys differ.
+    expect(tokA.split('.')[0]).not.toBe(tokB.split('.')[0]);
+
+    const partsFor = async (tok: string, bytes: Uint8Array) => {
+      const p1 = await putPart('race-box', 'claude', relpath, tok, 1, bytes.subarray(0, 5 * MIB), 5 * MIB, false);
+      const p2 = await putPart('race-box', 'claude', relpath, tok, 2, bytes.subarray(5 * MIB), 5 * MIB, true);
+      return [await p1.json<any>(), await p2.json<any>()].map((j) => ({ part_number: j.part_number, etag: j.etag }));
+    };
+    const partsA = await partsFor(tokA, a);
+    const partsB = await partsFor(tokB, b);
+
+    // Complete both CONCURRENTLY. With a shared staging key, one request's read/copy/delete could
+    // clobber the other's completed staging object (500/422); upload-unique keys keep them independent.
+    const [rA, rB] = await Promise.all([
+      completeMp('race-box', 'claude', relpath, tokA, partsA, aHash, a.length),
+      completeMp('race-box', 'claude', relpath, tokB, partsB, bHash, b.length),
+    ]);
+    expect(rA.status, 'complete A').toBe(201);
+    expect(rB.status, 'complete B').toBe(201);
+
+    // Canonical holds one of the two verified objects (last writer wins), byte-exact — not a mix.
+    const canonical = await testEnv.RAW.get(`raw/race-box/claude/${relpath}`);
+    const canonHash = await sha256Hex(new Uint8Array(await canonical!.arrayBuffer()));
+    expect([aHash, bHash]).toContain(canonHash);
+    // The D1 row settled on one of the two valid uploads, not a corrupt/half state.
+    const row = await testEnv.DB.prepare(
+      'SELECT content_hash FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
+    )
+      .bind('race-box', 'claude', relpath)
+      .first<{ content_hash: string }>();
+    expect([aHash, bHash]).toContain(row!.content_hash);
+    // Neither upload left a staging object behind.
+    const staging = await testEnv.RAW.list({ prefix: 'mpu-staging/race-box/' });
+    expect(staging.objects).toHaveLength(0);
   });
 
   it('rejects a create for a file larger than R2 single-put finalize limit (5 GiB)', async () => {

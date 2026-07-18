@@ -23,13 +23,36 @@ function r2MtimeMetadata(mtime: string | null): Record<string, string> | undefin
  * Multipart uploads assemble onto a STAGING key, never straight onto the canonical raw key, so an
  * unverified/corrupt assembly can never overwrite the previous good backup. The staging namespace is
  * a sibling of raw/ (NOT under it) so prefix-scoped reindex — which walks raw/ — never mistakes a
- * staging object for real data. Path-based (not upload-unique) is safe: a machine's collector runs
- * are serialized by its overlap lock and the path is machine-scoped, so two completes for the same
- * key can't race; and even if they did, the canonical put({sha256}) verifies against the declared
- * hash, so a stale staging object can only cause a retry, never corruption.
+ * staging object for real data.
+ *
+ * The key is UPLOAD-UNIQUE: it carries a per-upload nonce so two overlapping uploads for the same
+ * machine/store/relpath assemble onto DISTINCT staging objects and their complete/abort cleanup
+ * (each deletes its own staging object) can never touch the other upload's bytes. We don't rely on
+ * the collector's overlap lock for this — the hub must be correct under concurrent callers on its
+ * own, same as every other convergence guard here. The nonce is generated at create time (the R2
+ * uploadId doesn't exist until createMultipartUpload returns, so it can't be part of the key it
+ * creates); create round-trips it to the collector inside the opaque upload token (see uploadToken).
+ * The prune sweep still lists the mpu-staging/ prefix, so the nonce suffix doesn't affect it.
  */
-function stagingKey(machineId: string, store: string, relpath: string): string {
-  return `mpu-staging/${machineId}/${store}/${relpath}`;
+function stagingKey(machineId: string, store: string, relpath: string, nonce: string): string {
+  return `mpu-staging/${machineId}/${store}/${relpath}.${nonce}`;
+}
+
+/**
+ * The collector treats the multipart "upload id" as an opaque token it echoes back on
+ * part/complete/abort. We pack two things into it: the staging-key NONCE and R2's own uploadId,
+ * as `<nonce>.<r2UploadId>`. The nonce is a UUID (no '.'), so splitting on the FIRST '.' recovers it
+ * regardless of what R2's uploadId contains. The collector URL-encodes the whole token, so any
+ * characters in R2's uploadId are transport-safe.
+ */
+function uploadToken(nonce: string, r2UploadId: string): string {
+  return `${nonce}.${r2UploadId}`;
+}
+
+function parseUploadToken(token: string): { nonce: string; r2UploadId: string } | null {
+  const dot = token.indexOf('.');
+  if (dot <= 0 || dot === token.length - 1) return null;
+  return { nonce: token.slice(0, dot), r2UploadId: token.slice(dot + 1) };
 }
 
 /** Parse+validate the whole-object headers (identical contract to the simple PUT): the sha256 the
@@ -106,15 +129,20 @@ export async function createMultipart(
     // else: R2 missing/corrupt — fall through to open a fresh multipart so the collector repairs it.
   }
 
-  // Assemble onto the STAGING key (no metadata — staging is throwaway; the canonical put sets it).
+  // Assemble onto an upload-unique STAGING key (no metadata — staging is throwaway; the canonical put
+  // sets it). The nonce makes concurrent uploads for this same path use distinct staging objects.
+  const nonce = crypto.randomUUID();
   let mpu: R2MultipartUpload;
   try {
-    mpu = await env.RAW.createMultipartUpload(stagingKey(machineId, store, relpath));
+    mpu = await env.RAW.createMultipartUpload(stagingKey(machineId, store, relpath, nonce));
   } catch (e) {
     return Response.json({ error: 'create_multipart_failed', detail: String(e) }, { status: 400 });
   }
   console.log(JSON.stringify({ event: 'access.multipart_create', machine: machineId, key, size }));
-  return Response.json({ status: 'created', upload_id: mpu.uploadId, key, min_part_size: MIN_PART_SIZE }, { status: 201 });
+  return Response.json(
+    { status: 'created', upload_id: uploadToken(nonce, mpu.uploadId), key, min_part_size: MIN_PART_SIZE },
+    { status: 201 },
+  );
 }
 
 /**
@@ -135,7 +163,8 @@ export async function uploadPart(
   if (identity.kind !== 'machine') return Response.json({ error: 'unauthorized' }, { status: 401 });
   if (!ownsPath(identity, machineId)) return Response.json({ error: 'machine_mismatch' }, { status: 403 });
 
-  const uploadId = params.get('uploadId')!;
+  const token = parseUploadToken(params.get('uploadId') ?? '');
+  if (!token) return Response.json({ error: 'bad_upload_id' }, { status: 400 });
   const partNumber = Number(params.get('partNumber'));
   if (!Number.isInteger(partNumber) || partNumber < 1 || partNumber > MAX_PART_NUMBER) {
     return Response.json({ error: 'bad_part_number' }, { status: 400 });
@@ -160,7 +189,8 @@ export async function uploadPart(
 
   let uploaded: R2UploadedPart;
   try {
-    uploaded = await env.RAW.resumeMultipartUpload(stagingKey(machineId, store, relpath), uploadId).uploadPart(partNumber, body);
+    const stagKey = stagingKey(machineId, store, relpath, token.nonce);
+    uploaded = await env.RAW.resumeMultipartUpload(stagKey, token.r2UploadId).uploadPart(partNumber, body);
   } catch (e) {
     // A bad/expired uploadId or an R2 error — the collector aborts and retries from create.
     return Response.json({ error: 'upload_part_failed', detail: String(e) }, { status: 400 });
@@ -193,7 +223,8 @@ export async function completeMultipart(
   if (identity.kind !== 'machine') return Response.json({ error: 'unauthorized' }, { status: 401 });
   if (!ownsPath(identity, machineId)) return Response.json({ error: 'machine_mismatch' }, { status: 403 });
 
-  const uploadId = params.get('uploadId')!;
+  const token = parseUploadToken(params.get('uploadId') ?? '');
+  if (!token) return Response.json({ error: 'bad_upload_id' }, { status: 400 });
   const parsed = parseObjectHeaders(request);
   if ('error' in parsed) return Response.json({ error: parsed.error }, { status: 400 });
   const { sha256, mtime } = parsed;
@@ -204,13 +235,13 @@ export async function completeMultipart(
   const r2Parts = parts.map((p) => ({ partNumber: p.part_number, etag: p.etag }));
 
   const canonicalKey = r2Key(machineId, store, relpath);
-  const stagKey = stagingKey(machineId, store, relpath);
+  const stagKey = stagingKey(machineId, store, relpath, token.nonce);
   const existing = await env.DB.prepare('SELECT id FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3')
     .bind(machineId, store, relpath)
     .first<{ id: number }>();
 
   try {
-    await env.RAW.resumeMultipartUpload(stagKey, uploadId).complete(r2Parts);
+    await env.RAW.resumeMultipartUpload(stagKey, token.r2UploadId).complete(r2Parts);
   } catch (e) {
     // Bad etags / part-size rule / unknown-or-expired uploadId / R2 error. Nothing landed on canonical.
     // The collector aborts + retries; R2 auto-aborts a leftover incomplete upload after 7 days.
@@ -271,15 +302,17 @@ export async function abortMultipart(
   if (identity.kind !== 'machine') return Response.json({ error: 'unauthorized' }, { status: 401 });
   if (!ownsPath(identity, machineId)) return Response.json({ error: 'machine_mismatch' }, { status: 403 });
 
-  const uploadId = params.get('uploadId')!;
-  const stagKey = stagingKey(machineId, store, relpath);
+  // A malformed token can't identify a staging object; there's nothing to abort. Idempotent 'gone'.
+  const token = parseUploadToken(params.get('uploadId') ?? '');
+  if (!token) return Response.json({ status: 'gone' });
+  const stagKey = stagingKey(machineId, store, relpath, token.nonce);
   let aborted = true;
   try {
-    await env.RAW.resumeMultipartUpload(stagKey, uploadId).abort();
+    await env.RAW.resumeMultipartUpload(stagKey, token.r2UploadId).abort();
   } catch (e) {
     // Already completed/aborted/expired at R2 — nothing left to abort.
     aborted = false;
-    console.log(JSON.stringify({ event: 'access.multipart_abort_warn', machine: machineId, upload_id: uploadId, error: String(e) }));
+    console.log(JSON.stringify({ event: 'access.multipart_abort_warn', machine: machineId, error: String(e) }));
   }
   await env.RAW.delete(stagKey).catch(() => {}); // drop a staging object a completed-but-uncopied upload left
   return Response.json({ status: aborted ? 'aborted' : 'gone' });
