@@ -29,6 +29,13 @@ interface ParseMessage {
    * write. An export ZIP fans out to hundreds of per-conversation writes (~5 D1 queries each), which
    * would blow the ~1000-queries/invocation cap in one shot — so parseExportInto processes a bounded
    * slice, then re-enqueues itself with offset advanced until the whole archive is written. Absent =
-   * start at 0. Only meaningful for export-archive files. */
+   * start at 0. `offset === archive.sessions.length` marks the CLEANUP phase (all conversations
+   * written; now reconciling stale sessions). Only meaningful for export-archive files. */
   offset?: number;
+  /** Export-archive CLEANUP-phase cursor: the last session_id already reconciled (deleted/flipped or
+   * kept) by the budgeted stale-session cleanup. Present only on cleanup-phase continuations (paired
+   * with offset === archive.sessions.length); the next invocation resumes deleting stale sessions at
+   * `session_id > cleanup_cursor`. Absent on the first cleanup pass (starts at ''). markParsed runs
+   * only once cleanup drains — so 'parsed' means every conversation written AND stale cleanup done. */
+  cleanup_cursor?: string;
 }

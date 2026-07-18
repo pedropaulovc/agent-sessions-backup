@@ -471,7 +471,7 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     expect(text).not.toContain('rawmarker-beta'); // sibling conversation B must not leak
   });
 
-  it('a re-upload landing after the write loop does not let a stale parse delete a dropped conversation — markParsed runs before cleanup (round 4 Fix 1)', async () => {
+  it('a re-upload landing after the write loop does not let a stale parse delete a dropped conversation — a per-page content_hash recheck guards cleanup (round 4 Fix 1 / round 3 finding 3)', async () => {
     const relpath = 'chatgpt-export-reorder.zip';
     const r2Key = 'raw/webbox/export-inbox/chatgpt-export-reorder.zip';
     // The archive owns A and B.
@@ -493,11 +493,12 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     const withOnlyAHash = await sha256Hex(withOnlyA);
 
     // Deliver a message carrying withOnlyA's hash — it passes the early recheck and writes A off the
-    // current R2 bytes ([A]). Then simulate ANOTHER re-upload landing mid-parse (after the write
-    // loop) by mutating the row's content_hash the first time the parse reaches its post-write-loop
-    // step. With the fix that step is the guarded markParsed, which now fails and skips cleanup, so
-    // B survives for the fresh parse; pre-fix, cleanup ran first and deleted B before markParsed
-    // noticed — leaving no row if that fresh parse were delayed/dropped.
+    // current R2 bytes ([A]). Then simulate ANOTHER re-upload landing mid-parse (after the write loop)
+    // by mutating the row's content_hash the first time the parse reaches its post-write-loop step. The
+    // budgeted cleanup phase now runs BEFORE markParsed (round 3 finding 3), but each cleanup page
+    // re-reads content_hash right after fetching it: that recheck observes the mutated hash and aborts
+    // cleanup, so B survives for the fresh parse. Pre-fix (unbounded cleanup with no per-page guard) B
+    // would be deleted before markParsed noticed — leaving no row if that fresh parse were delayed/dropped.
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
     let mutated = false;
     const mutateOnce = async () => {
