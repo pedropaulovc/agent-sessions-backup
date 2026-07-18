@@ -19,25 +19,43 @@ def test_list_sessions_parses_rows_and_decodes_models(hub):
     assert s.models == ["claude-sonnet-5"]
     assert s.duration_seconds() == 600.0
     assert page.indexed_through == "2026-07-18T00:00:00.000Z"
-    assert page.truncated is False
 
 
-def test_list_sessions_truncated_heuristic(hub):
-    hub.sessions = [make_session_row(f"s{i}") for i in range(5)]
+def test_list_sessions_follows_cursor_across_pages(hub):
+    # Ask for a page size (5) smaller than the total (12) so the fake hub's keyset pagination
+    # must hand back a `cursor`, and list_sessions() must keep re-requesting with it rather
+    # than returning just the first page. All rows share the same started_at, so the fake
+    # hub's tiebreak sorts them by session_id ascending (s00, s01, ...) — same as the real
+    # hub's `ORDER BY started_at DESC, session_id ASC`.
+    hub.sessions = [make_session_row(f"s{i:02d}") for i in range(12)]
     page = api_for(hub).list_sessions(limit=5)
-    assert len(page.sessions) == 5
-    assert page.truncated is True
+    assert len(page.sessions) == 12
+    assert [s.session_id for s in page.sessions] == [f"s{i:02d}" for i in range(12)]
+    # 12 rows at 5/page: 5 + 5 + 2 = 3 requests, the first two's last row seeding the next
+    # request's cursor.
+    session_requests = [r for r in hub.requests if r["path"] == "/api/v1/sessions"]
+    assert len(session_requests) == 3
+    assert "cursor" not in session_requests[0]["params"]
+    assert session_requests[1]["params"]["cursor"] == ["s04"]
+    assert session_requests[2]["params"]["cursor"] == ["s09"]
 
 
-def test_list_sessions_truncation_detected_past_server_cap(hub):
-    # The hub silently clamps limit at MAX_SESSIONS_LIMIT (1000) server-side. Asking for more
-    # than that must still detect truncation against the real 1000-row cap, not the inflated
-    # requested limit — otherwise len(sessions) == 1000 < limit == 5000 reads as "not truncated"
-    # in exactly the case this heuristic exists to catch.
-    hub.sessions = [make_session_row(f"s{i}") for i in range(MAX_SESSIONS_LIMIT)]
+def test_list_sessions_stops_when_response_has_no_cursor(hub):
+    hub.sessions = [make_session_row(f"s{i}") for i in range(5)]
+    api_for(hub).list_sessions(limit=5)
+    # Exactly 5 rows at limit=5 with nothing left over -> one request, no cursor follow-up.
+    session_requests = [r for r in hub.requests if r["path"] == "/api/v1/sessions"]
+    assert len(session_requests) == 1
+
+
+def test_list_sessions_past_server_cap_still_returns_everything(hub):
+    # The hub silently clamps limit at MAX_SESSIONS_LIMIT (1000) server-side, so a caller
+    # asking for more than that still only gets MAX_SESSIONS_LIMIT rows per request — but
+    # cursor-following means the total returned is still complete, not capped.
+    total = MAX_SESSIONS_LIMIT + 50
+    hub.sessions = [make_session_row(f"s{i:04d}") for i in range(total)]
     page = api_for(hub).list_sessions(limit=5000)
-    assert len(page.sessions) == MAX_SESSIONS_LIMIT
-    assert page.truncated is True
+    assert len(page.sessions) == total
 
 
 def test_list_sessions_default_limit_matches_hub_cap(hub):
@@ -64,6 +82,36 @@ def test_iter_sessions_ndjson_streams_and_captures_header(hub):
     assert [r.meta.session_id for r in records] == ["s1", "s2"]
     assert records[0].session == {"turns": []}
     assert api.last_indexed_through == "2026-07-18T05:00:00.000Z"
+
+
+def test_iter_sessions_ndjson_follows_trailer_cursor_across_requests(hub):
+    # The fake hub's default per-request ndjson cap is 10 (see FakeHub.__init__) — 25 rows
+    # forces the hub to emit a trailer {"cursor": ...} line twice before naturally exhausting,
+    # and iter_sessions_ndjson() must detect each one and transparently keep streaming.
+    hub.sessions = [make_session_row(f"s{i:02d}") for i in range(25)]
+    hub.normalized = {f"s{i:02d}": {"turns": [i]} for i in range(25)}
+    api = api_for(hub)
+    records = list(api.iter_sessions_ndjson())
+    assert [r.meta.session_id for r in records] == [f"s{i:02d}" for i in range(25)]
+    assert [r.session for r in records] == [{"turns": [i]} for i in range(25)]
+    # 25 rows at 10/request: 10 + 10 + 5 = 3 requests, the first two ending in a trailer.
+    session_requests = [r for r in hub.requests if r["path"] == "/api/v1/sessions"]
+    assert len(session_requests) == 3
+    assert "cursor" not in session_requests[0]["params"]
+    assert session_requests[1]["params"]["cursor"] == ["s09"]
+    assert session_requests[2]["params"]["cursor"] == ["s19"]
+
+
+def test_iter_sessions_ndjson_no_trailer_when_exactly_at_cap(hub):
+    # Exactly `ndjson_max_rows_per_request` rows and nothing left over must NOT emit a
+    # trailer (the hub's "short page -> exhausted" check) — otherwise the client would issue
+    # one pointless extra request that comes back empty.
+    hub.sessions = [make_session_row(f"s{i:02d}") for i in range(10)]
+    api = api_for(hub)
+    records = list(api.iter_sessions_ndjson())
+    assert len(records) == 10
+    session_requests = [r for r in hub.requests if r["path"] == "/api/v1/sessions"]
+    assert len(session_requests) == 1
 
 
 def test_get_session(hub):

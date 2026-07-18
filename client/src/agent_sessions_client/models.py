@@ -98,9 +98,13 @@ class SessionMeta:
 
 @dataclass(frozen=True)
 class SessionsPage:
+    """The COMPLETE set of sessions matching a list_sessions() call, not one hub page —
+    SessionsApi.list_sessions() follows the hub's keyset cursor across as many requests as
+    needed before returning, so callers never see a partial result (see docs/agents-api.md's
+    pagination section)."""
+
     sessions: list[SessionMeta]
     indexed_through: str | None
-    truncated: bool  # len(sessions) hit the requested limit — see docs/agents-api.md pagination note
 
 
 @dataclass(frozen=True)

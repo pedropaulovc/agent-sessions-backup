@@ -25,10 +25,14 @@ machine API. Full endpoint contract, auth modes, and known gaps: `docs/agents-ap
    built-in report makes:
    - `GET /api/v1/sessions?from=<date>&to=<date>&limit=1000` — session-level meta (counts,
      cwd, model, block/turn counts, duration). Meta-only, no R2 read, fast. Don't omit
-     `limit`: the hub defaults to 200 rows, well under the 1000 hard cap the shipped CLI
-     requests — an omitted `limit` on a busy day undercounts long before hitting the real
-     cap. Even at 1000, a result landing exactly on the limit may still be truncated (no
-     pagination on this endpoint yet) — see step 3.
+     `limit`: the hub defaults to 200 rows per page, well under the 1000 hard per-request cap
+     the shipped CLI requests — a smaller `limit` just means more page round-trips, not
+     missing data, but there's no reason not to ask for the max page size up front. This
+     endpoint paginates with a keyset `cursor`: if the response has a `cursor` field, more
+     rows matched than fit in this page — re-request with `&cursor=...` (same filters) and
+     keep going until a response has no `cursor`. The built-in client (`SessionsApi.
+     list_sessions()`) does this automatically; if you're hand-rolling the call, you must
+     loop yourself or you'll silently undercount on a busy day.
    - `GET /api/v1/usage?group_by=model&from=<date>&to=<date>` — token spend by model.
    - `GET /api/v1/status` — per-machine `indexed_through`, to check freshness before trusting
      the counts above.
@@ -40,10 +44,7 @@ machine API. Full endpoint contract, auth modes, and known gaps: `docs/agents-ap
      greater than 0, say the session counts may be incomplete and name the machine —
      uploaded files don't appear in `/api/v1/sessions` until the ingest consumer parses them,
      so a machine can look fresh by `indexed_through` while still hiding unparsed data.
-   - If the session list came back at exactly the request `limit` (there is no pagination on
-     `/api/v1/sessions` — see the gap noted in `docs/agents-api.md`), say the count may be
-     truncated rather than reporting it as final.
-   - The built-in CLI report already does all of these under a "Staleness caveats" heading;
+   - The built-in CLI report already does these under a "Staleness caveats" heading;
      if you're calling the API by hand, replicate the same checks.
 
 4. **Treat `harness=prompt-log` sessions separately** from interactive ones — they're a

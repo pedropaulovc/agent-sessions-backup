@@ -19,7 +19,6 @@ def test_report_basic_shape():
     sessions_page = SessionsPage(
         sessions=[meta(session_id="s1", harness="claude-code", machine_id="amet-wsl")],
         indexed_through="2026-07-18T23:59:59.999Z",
-        truncated=False,
     )
     usage_report = UsageReport(
         group_by="model",
@@ -59,7 +58,7 @@ def test_report_basic_shape():
 
 
 def test_report_flags_stale_machine():
-    sessions_page = SessionsPage(sessions=[meta(session_id="s1")], indexed_through="2026-07-18T09:00:00.000Z", truncated=False)
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1")], indexed_through="2026-07-18T09:00:00.000Z")
     status = HubStatus(
         machines=[
             MachineStatus(
@@ -88,7 +87,7 @@ def test_report_flags_fresh_machine_with_unparsed_or_failed_files():
     # uploaded today is already in `sessions` — an upload lands as files.parse_state='pending'
     # first and only becomes a session row once the queue consumer parses it. Without this
     # caveat a report would present a machine as fully fresh while still undercounting it.
-    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="amet-wsl")], indexed_through="2026-07-18T23:59:59.999Z", truncated=False)
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="amet-wsl")], indexed_through="2026-07-18T23:59:59.999Z")
     status = HubStatus(
         machines=[
             MachineStatus(
@@ -114,7 +113,7 @@ def test_report_flags_fresh_machine_with_unparsed_or_failed_files():
 
 
 def test_report_silent_when_no_pending_or_error_files():
-    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="amet-wsl")], indexed_through="2026-07-18T23:59:59.999Z", truncated=False)
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="amet-wsl")], indexed_through="2026-07-18T23:59:59.999Z")
     status = HubStatus(
         machines=[
             MachineStatus(
@@ -137,22 +136,12 @@ def test_report_silent_when_no_pending_or_error_files():
     assert "not yet parsed" not in report
 
 
-def test_report_flags_truncation():
-    sessions = [meta(session_id=f"s{i}") for i in range(3)]
-    sessions_page = SessionsPage(sessions=sessions, indexed_through=None, truncated=True)
-    status = HubStatus(machines=[], sessions=SessionsSummary(total=3, ready=3, error=0))
-    report = build_daily_report(
-        date="2026-07-18", sessions_page=sessions_page, usage_report=UsageReport(group_by="model", rows=[]), status=status
-    )
-    assert "no pagination cursor" in report
-
-
 def test_report_skips_never_seen_zero_file_machine_but_flags_real_stale_one():
     # A preview/local run's x-dev-machine identity auto-registers a `machines` row on its
     # first authenticated read with no heartbeat and no files (it's a reporting client, not a
     # collector) — indexed_through=null there must not trip the staleness caveat. A real
     # machine that's genuinely stale (has files, just an old heartbeat) must still be flagged.
-    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="amet-wsl")], indexed_through=None, truncated=False)
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="amet-wsl")], indexed_through=None)
     status = HubStatus(
         machines=[
             MachineStatus(
@@ -187,7 +176,7 @@ def test_report_skips_never_seen_zero_file_machine_but_flags_real_stale_one():
 
 
 def test_report_empty_sessions():
-    sessions_page = SessionsPage(sessions=[], indexed_through=None, truncated=False)
+    sessions_page = SessionsPage(sessions=[], indexed_through=None)
     status = HubStatus(machines=[], sessions=SessionsSummary(total=0, ready=0, error=0))
     report = build_daily_report(
         date="2026-07-18", sessions_page=sessions_page, usage_report=UsageReport(group_by="model", rows=[]), status=status
@@ -200,7 +189,7 @@ def test_report_empty_sessions():
 def test_report_notable_sessions_sorted_by_size_and_duration():
     small = meta(session_id="small", block_count=1, started_at="2026-07-18T00:00:00.000Z", ended_at="2026-07-18T00:01:00.000Z")
     big = meta(session_id="big", block_count=500, started_at="2026-07-18T00:00:00.000Z", ended_at="2026-07-18T02:00:00.000Z")
-    sessions_page = SessionsPage(sessions=[small, big], indexed_through=None, truncated=False)
+    sessions_page = SessionsPage(sessions=[small, big], indexed_through=None)
     status = HubStatus(machines=[], sessions=SessionsSummary(total=2, ready=2, error=0))
     report = build_daily_report(
         date="2026-07-18", sessions_page=sessions_page, usage_report=UsageReport(group_by="model", rows=[]), status=status
@@ -218,7 +207,7 @@ def test_report_excludes_prompt_log_from_notable_but_keeps_it_in_counts():
         started_at="2026-01-01T00:00:00.000Z",
         ended_at="2026-07-18T00:00:00.000Z",
     )
-    sessions_page = SessionsPage(sessions=[normal, prompt_log], indexed_through=None, truncated=False)
+    sessions_page = SessionsPage(sessions=[normal, prompt_log], indexed_through=None)
     status = HubStatus(machines=[], sessions=SessionsSummary(total=2, ready=2, error=0))
     report = build_daily_report(
         date="2026-07-18", sessions_page=sessions_page, usage_report=UsageReport(group_by="model", rows=[]), status=status
@@ -230,7 +219,7 @@ def test_report_excludes_prompt_log_from_notable_but_keeps_it_in_counts():
 
 
 def test_report_usage_labeled_fleet_wide_when_filtered():
-    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None, truncated=False)
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
     usage_report = UsageReport(
         group_by="model",
         rows=[
@@ -257,7 +246,7 @@ def test_report_usage_labeled_fleet_wide_when_filtered():
 
 
 def test_report_machine_filter_scopes_staleness_caveats_to_that_machine():
-    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="fresh-box")], indexed_through=None, truncated=False)
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="fresh-box")], indexed_through=None)
     status = HubStatus(
         machines=[
             MachineStatus(

@@ -20,9 +20,12 @@ from .models import (
     UsageRow,
 )
 
-# The hub clamps `limit` at 1000 (see clampLimit() in hub/src/api/sessions.ts) and this
-# endpoint has NO cursor/offset — unlike /api/v1/search. 1000 is the most a single call can
-# ever return; see docs/agents-api.md for what to do about a day with more sessions than that.
+# The hub clamps `limit` at 1000 (see clampLimit() in hub/src/api/sessions.ts) — that's the
+# per-REQUEST page size, not a total cap. list_sessions() and iter_sessions_ndjson() below
+# both follow the hub's cursor transparently across as many requests as needed, so a caller
+# always gets the complete matching set regardless of how many rows that is; this constant is
+# just the default page size used for each individual request. See docs/agents-api.md's
+# pagination section.
 MAX_SESSIONS_LIMIT = 1000
 
 
@@ -44,26 +47,37 @@ class SessionsApi:
         limit: int = MAX_SESSIONS_LIMIT,
     ) -> SessionsPage:
         """GET /api/v1/sessions — meta-only rows (no R2 parse), the cheap call for aggregate
-        stats. `page.truncated` is a heuristic (len(sessions) == effective limit, i.e. the
-        hub's actual cap of MAX_SESSIONS_LIMIT even if a caller asked for more): treat it as
-        "there may be more sessions in this window than were returned."
+        stats. Follows the hub's keyset `cursor` transparently: the JSON response includes a
+        `cursor` field only when more rows matched than fit in one page, and this method
+        keeps re-requesting with `?cursor=...` until a response has none, so the returned
+        `SessionsPage` always holds the COMPLETE set of matching sessions — callers never see
+        a partial page or need to know the hub's internal per-request page size (`limit`).
+        `indexed_through` on the returned page is from the last page fetched (the freshest
+        read of the two, though in practice it rarely changes mid-pagination).
         """
-        resp = self._client.get(
-            "/api/v1/sessions",
-            {"from": from_, "to": to, "harness": harness, "machine": machine, "repo": repo, "limit": limit},
-        )
-        body = resp.json()
-        sessions = [SessionMeta.from_row(r) for r in body.get("sessions", [])]
-        # The hub silently clamps limit at MAX_SESSIONS_LIMIT server-side — comparing against
-        # the raw requested `limit` instead would make truncated=False exactly when a caller
-        # asked for more than 1000 and hit the real cap, the one case this heuristic exists
-        # to catch.
-        effective_limit = min(limit, MAX_SESSIONS_LIMIT)
-        return SessionsPage(
-            sessions=sessions,
-            indexed_through=body.get("indexed_through") or None,
-            truncated=len(sessions) >= effective_limit,
-        )
+        sessions: list[SessionMeta] = []
+        indexed_through: str | None = None
+        cursor: str | None = None
+        while True:
+            resp = self._client.get(
+                "/api/v1/sessions",
+                {
+                    "from": from_,
+                    "to": to,
+                    "harness": harness,
+                    "machine": machine,
+                    "repo": repo,
+                    "limit": limit,
+                    "cursor": cursor,
+                },
+            )
+            body = resp.json()
+            sessions.extend(SessionMeta.from_row(r) for r in body.get("sessions", []))
+            indexed_through = body.get("indexed_through") or None
+            cursor = body.get("cursor") or None
+            if not cursor:
+                break
+        return SessionsPage(sessions=sessions, indexed_through=indexed_through)
 
     def iter_sessions_ndjson(
         self,
@@ -78,26 +92,46 @@ class SessionsApi:
         """GET /api/v1/sessions?format=ndjson — streams one fully parsed NormalizedSession per
         line. The hub stream-parses each session's canonical R2 object on demand, so this is
         far more expensive per-session than list_sessions() — only use it when the caller
-        needs turn content, not just aggregate counts. Sets self.last_indexed_through from the
-        response header once headers arrive (before the body streams), so callers may read it
-        as soon as the first item comes back rather than waiting for exhaustion.
+        needs turn content, not just aggregate counts.
+
+        Each request is capped at NDJSON_MAX_ROWS_PER_REQUEST (300, hub-side) rows regardless
+        of `limit`; if more rows match, the hub's stream ends with one control line
+        `{"cursor": "..."}` (no `meta` key, unlike every real row) instead of the caller's
+        query silently truncating. This method detects that trailer and transparently issues
+        another request with `?cursor=...` to keep streaming — callers get the full matching
+        set without knowing the cap exists. Sets self.last_indexed_through from each request's
+        response header as it starts, so callers may read it as soon as the first item of the
+        CURRENT page comes back; once the generator is fully exhausted, it reflects the last
+        page fetched.
         """
-        resp = self._client.get(
-            "/api/v1/sessions",
-            {
-                "from": from_,
-                "to": to,
-                "harness": harness,
-                "machine": machine,
-                "repo": repo,
-                "limit": limit,
-                "format": "ndjson",
-            },
-        )
-        self.last_indexed_through = resp.header("x-indexed-through") or None
-        for line in resp.iter_lines():
-            row = json.loads(line)
-            yield SessionRecord(meta=SessionMeta.from_row(row["meta"]), session=row.get("session"))
+        cursor: str | None = None
+        while True:
+            resp = self._client.get(
+                "/api/v1/sessions",
+                {
+                    "from": from_,
+                    "to": to,
+                    "harness": harness,
+                    "machine": machine,
+                    "repo": repo,
+                    "limit": limit,
+                    "format": "ndjson",
+                    "cursor": cursor,
+                },
+            )
+            self.last_indexed_through = resp.header("x-indexed-through") or None
+            cursor = None
+            for line in resp.iter_lines():
+                row = json.loads(line)
+                if "meta" not in row:
+                    # Trailer control line, always the last line of a capped-out response
+                    # (see hub/src/api/sessions.ts) — not a session row. Stop reading this
+                    # response's lines and re-request with this cursor to continue.
+                    cursor = row.get("cursor")
+                    break
+                yield SessionRecord(meta=SessionMeta.from_row(row["meta"]), session=row.get("session"))
+            if not cursor:
+                break
 
     def get_session(self, session_id: str) -> tuple[SessionMeta, dict | None]:
         """GET /api/v1/sessions/{id} — one fully parsed NormalizedSession."""
