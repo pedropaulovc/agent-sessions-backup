@@ -1218,6 +1218,22 @@ describe('POST /api/v1/admin/machines', () => {
     expect(await retired(hexfp('rbrec-A'))).toBeNull(); // reservation unqueued atomically with the swap
   });
 
+  it('recovers a PRUNED-prev cert via plain {machine_id, fp}: reservation id carried, no hatch needed', async () => {
+    // The round-21/round-22 interaction: once the prev slot is pruned away, prev_cert_fp is NULL so
+    // rollingBack is false — the recovery body {machine_id, fp} would trip cert_id_required_for_new_fp, and
+    // supplying the reservation's id would trip the cert_id clash. reinstatingReserved exempts it, and the
+    // unqueue carries the reservation's OWN trusted id. No cert_id, no cert_id_unknown.
+    await seedMachine('rbprune', { fp: hexfp('rbp-B'), certId: 'rbp-B-id' }); // current only; prev already pruned
+    await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('${hexfp('rbp-A')}', 'rbp-A-id', 'rbprune', '2000-01-01T00:00:00.000Z')`).run(); // released reservation
+    const res = await adminMachines(reqJson({ machine_id: 'rbprune', cert_fp_sha256: hexfp('rbp-A') }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(200); // NOT 422 cert_id_required_for_new_fp
+    const r = await row('rbprune');
+    expect(r?.cert_fp_sha256).toBe(hexfp('rbp-A')); // reinstated
+    expect(r?.cert_id).toBe('rbp-A-id'); // carried from the reservation, NOT null and NOT the hatch's NULL
+    expect(await retired(hexfp('rbp-A'))).toBeNull(); // reservation unqueued atomically
+    expect((await retired(hexfp('rbp-B')))?.cert_id).toBe('rbp-B-id'); // displaced old current queued
+  });
+
   it('a CLAIMED same-machine reservation still 409s (prune mid-revoke; reinstating would race the DELETE)', async () => {
     await seedMachine('rbclaim', { fp: hexfp('rbc-B'), certId: 'rbc-B-id', prevFp: hexfp('rbc-A'), prevCertId: 'rbc-A-id', revokeAt: '2999-01-01T00:00:00.000Z' });
     await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, claimed_at) VALUES ('${hexfp('rbc-A')}', 'rbc-A-id', 'rbclaim', '2000-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z')`).run();

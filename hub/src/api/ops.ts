@@ -145,23 +145,35 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     // the plain current-fp UNIQUE collision into an explicit 409 (clearer than a constraint catch).
     //
     // ONE exception in the retired_certs arm: THIS machine's OWN UNCLAIMED reservation (claimed_at IS NULL)
-    // is excluded, so it falls through to the guarded same-machine unqueue/CAS logic below. That is the
-    // rollback-recovery path: when a CA DELETE was rejected, pollRetired/settleRetired RELEASE claimed_at
-    // (the cert is still active and safe to reinstate), and the admin rollback to that same fingerprint IS
-    // the recovery — 409ing it here would strand the machine on a successor it may never have installed.
-    // The unqueue below claims + removes the reservation atomically in the swap batch. A same-machine
-    // CLAIMED reservation still 409s: claimed_at set means a prune's async CA DELETE is mid-flight, so
-    // reinstating it would race that DELETE. Cross-machine reservations (claimed or not) still 409.
+    // is NOT a clash — it's a REINSTATEMENT candidate, handled by the guarded same-machine unqueue/CAS below.
+    // That is the rollback-recovery path: when a CA DELETE was rejected, pollRetired/settleRetired RELEASE
+    // claimed_at (the cert is still active and safe to reinstate), and the admin request to that same
+    // fingerprint IS the recovery — 409ing it here would strand the machine on a successor it may never have
+    // installed. A same-machine CLAIMED reservation still 409s: claimed_at set means a prune's async CA
+    // DELETE is mid-flight, so reinstating it would race that DELETE. Cross-machine reservations (claimed or
+    // not) still 409. We ALSO record `reinstatingReserved` from this SAME probe (one query, decided in JS):
+    // once the prev slot has been pruned away, `rollingBack` is false, so the reinstatement would otherwise
+    // trip the round-21 "new fp needs a cert_id" guard below — but the unqueue path carries the reservation's
+    // OWN trusted id, so it must be exempted.
+    let reinstatingReserved = false;
     if (body.cert_fp_sha256) {
-      const clash = await env.DB.prepare(
-        `SELECT machine_id FROM machines WHERE (cert_fp_sha256 = ?1 OR prev_cert_fp_sha256 = ?1) AND machine_id != ?2
-         UNION
-         SELECT machine_id FROM retired_certs WHERE fingerprint = ?1 AND revoked_at IS NULL AND (machine_id != ?2 OR claimed_at IS NOT NULL)
-         LIMIT 1`,
+      const clashRows = await env.DB.prepare(
+        `SELECT machine_id, NULL AS claimed_at FROM machines WHERE (cert_fp_sha256 = ?1 OR prev_cert_fp_sha256 = ?1) AND machine_id != ?2
+         UNION ALL
+         SELECT machine_id, claimed_at FROM retired_certs WHERE fingerprint = ?1 AND revoked_at IS NULL`,
       )
         .bind(body.cert_fp_sha256, body.machine_id)
-        .first<{ machine_id: string }>();
-      if (clash) return Response.json({ error: 'fingerprint_in_use', machine_id: clash.machine_id }, { status: 409 });
+        .all<{ machine_id: string; claimed_at: string | null }>();
+      for (const c of clashRows.results) {
+        // Same-machine UNCLAIMED reservation → reinstatement candidate, not a clash. Anything else blocks:
+        // any machines row (always another machine — the WHERE excludes this one), a cross-machine
+        // reservation, or a same-machine CLAIMED reservation (prune's async DELETE mid-flight).
+        if (c.machine_id === body.machine_id && c.claimed_at === null) {
+          reinstatingReserved = true;
+          continue;
+        }
+        return Response.json({ error: 'fingerprint_in_use', machine_id: c.machine_id }, { status: 409 });
+      }
     }
 
     // A body-supplied cert_id is a CA handle used to REVOKE — attaching machine A's id to machine B would
@@ -272,16 +284,22 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
       }
     }
 
-    // A brand-new current fingerprint (fpChanged, and NOT a rollback to the in-grace prev) MUST come with a
-    // cert_id: the CA handle is how the displaced old current gets revoked on the next rotation/prune. If we
-    // stored NULL here, the old current rides into prev_cert_id/retired_certs with a null id, the prune skips
-    // null ids, and the displaced managed cert stays CA-valid until expiry (orphan leak) while its fingerprint
-    // sticks in manual cleanup. Require the id — UNLESS the caller EXPLICITLY opts into a legacy/unknown-id
-    // import via cert_id_unknown:true. That escape hatch exists ONLY for the real M3-era rows with no recorded
-    // id (amet-wsl, amet-windows) and the post-merge backfill's intermediate states: it deliberately stores
-    // NULL, logs a distinct greppable event, and leaves the displaced-cert cleanup MANUAL. (A body-supplied
-    // cert_id took the verified attach path above; rollback carries the prev's own trusted id below.)
-    const installingNewFpWithoutId = fpChanged && !rollingBack && certFp !== null && body.cert_id === undefined;
+    // A brand-new current fingerprint (fpChanged) MUST resolve a cert_id from one of THREE trusted sources —
+    // otherwise the CA handle is NULL, the old current rides into prev_cert_id/retired_certs with a null id
+    // the prune skips, and the displaced managed cert stays CA-valid until expiry (orphan leak) while its
+    // fingerprint sticks in manual cleanup. The three sources, all exempt from the guard below:
+    //   1. body-supplied cert_id — CA-verified in the attach block above;
+    //   2. rollback to the in-grace prev — carries prev_cert_id (trusted D1 state), rollingBack === true;
+    //   3. reinstating a same-machine RESERVATION — the unqueue path carries the reservation's own id
+    //      (trusted D1 state), reinstatingReserved === true. This is source 2 AFTER the prev slot was pruned
+    //      into retired_certs (so rollingBack is false but the reserved id is still recoverable).
+    // Only a genuinely-new fp with NONE of those 422s (cert_id_required_for_new_fp) — UNLESS the
+    // caller EXPLICITLY opts into a legacy/unknown-id import via cert_id_unknown:true. That escape hatch is
+    // ONLY for the real M3-era rows with no recorded id (amet-wsl, amet-windows) and the post-merge backfill:
+    // it deliberately stores NULL, logs a distinct greppable event, and leaves the displaced-cert cleanup
+    // MANUAL. It is NOT the reinstatement path (which recovers a real id), so reinstatement never needs it.
+    const installingNewFpWithoutId =
+      fpChanged && !rollingBack && !reinstatingReserved && certFp !== null && body.cert_id === undefined;
     if (installingNewFpWithoutId && !body.cert_id_unknown) {
       return Response.json({ error: 'cert_id_required_for_new_fp', machine_id: body.machine_id }, { status: 422 });
     }
