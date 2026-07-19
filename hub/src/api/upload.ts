@@ -555,8 +555,8 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
       //    — otherwise a 'skipped' history.jsonl row with NULL harness/session_id stays unindexed.
       const restamped = await restampIfStale(row, row.store, row.relpath, identity.machineId, env);
       if (detect(row.store, row.relpath, identity.machineId).kind === 'other') {
-        await markKnownOtherSkipped(row.id, row.content_hash, env);
-        continue;
+        const skipped = await markKnownOtherSkipped(row.id, row.content_hash, env);
+        if (skipped) continue;
       }
       // markPendingAndEnqueue applies the centralized fresh-reservation gate (round 15): a fresh 'reserved'
       // row is left to its owner's recover; a stale one heals. Same reasoning as the same-hash PUT branch.

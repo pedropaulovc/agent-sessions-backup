@@ -130,8 +130,10 @@ export async function createMultipart(
       // so a 'skipped' or dropped-message row finally indexes.
       const restamped = await restampIfStale(existing, store, relpath, machineId, env);
       if (detect(store, relpath, machineId).kind === 'other') {
-        await markKnownOtherSkipped(existing.id, sha256, env);
-        return Response.json({ status: 'unchanged', file_id: existing.id, restamped, skipped: true });
+        const skipped = await markKnownOtherSkipped(existing.id, sha256, env);
+        if (skipped) {
+          return Response.json({ status: 'unchanged', file_id: existing.id, restamped, skipped: true });
+        }
       }
       if (restamped || !TERMINAL_PARSE_STATES.has(existing.parse_state)) {
         // markPendingAndEnqueue applies the centralized fresh-reservation gate (round 15, 3608955878): a fresh

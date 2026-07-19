@@ -141,6 +141,45 @@ describe("known 'other' files bypass the parse queue", () => {
       reservation_owner: owner!.id,
       reservation_generation: 41,
     });
+
+    sendSpy.mockClear();
+    const multipartRetried = await SELF.fetch(`${fileUrl(machine, relpath)}?uploads`, {
+      method: 'POST',
+      headers: {
+        'x-dev-machine': machine,
+        'x-content-hash': `sha256:${changedHash}`,
+        'x-file-size': String(changed.length),
+      },
+    });
+    expect(multipartRetried.status).toBe(200);
+    expect(await multipartRetried.json()).toMatchObject({ status: 'unchanged', requeued: true });
+    expect(sendSpy).toHaveBeenCalledOnce();
+    expect(sendSpy).toHaveBeenCalledWith({
+      file_id: fileId,
+      r2_key: `raw/${machine}/${STORE}/${relpath}`,
+      reason: 'upload',
+      content_hash: changedHash,
+      reservation_owner: owner!.id,
+      reservation_generation: 41,
+    });
+
+    sendSpy.mockClear();
+    const checked = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+      method: 'POST',
+      headers: { 'x-dev-machine': machine, 'content-type': 'application/json' },
+      body: JSON.stringify({ files: [{ store: STORE, relpath, sha256: `sha256:${changedHash}` }] }),
+    });
+    expect(checked.status).toBe(200);
+    expect(await checked.json()).toEqual({ missing: [] });
+    expect(sendSpy).toHaveBeenCalledOnce();
+    expect(sendSpy).toHaveBeenCalledWith({
+      file_id: fileId,
+      r2_key: `raw/${machine}/${STORE}/${relpath}`,
+      reason: 'upload',
+      content_hash: changedHash,
+      reservation_owner: owner!.id,
+      reservation_generation: 41,
+    });
   });
 
   it('files/check heals a legacy non-terminal/stale-identity row directly to skipped without enqueueing', async () => {
