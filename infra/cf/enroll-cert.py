@@ -185,7 +185,7 @@ def ensure_collector() -> str:
     print(f"==> {action} agent-collector from {collector}")
     command = [uv, "tool", "install"]
     if executable:
-        command.append("--force")
+        command.extend(("--force", "--reinstall"))
     subprocess.run([*command, str(collector)], check=True, env=child_env())
     candidates = [shutil.which("agent-collector")]
     uv_candidate = Path.home() / ".local" / "bin" / (
