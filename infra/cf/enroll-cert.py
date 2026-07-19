@@ -392,14 +392,16 @@ def load_recovery(token: str, machine_id: str, out: Path) -> Material | None:
 def load_staged_recovery(machine_id: str, out: Path) -> Material | None:
     """Validate staged key/cert/sidecar material without management-plane access."""
     temp = out / f"{machine_id}.client.pem.new"
+    promoted = out / f"{machine_id}.client.pem"
     sidecar = out / f"{machine_id}.client.pem.new.id"
     key_path = out / f"{machine_id}.client.key"
     if not temp.exists() and not sidecar.exists():
         return None
-    if not (temp.is_file() and sidecar.is_file() and key_path.is_file()):
+    cert_path = temp if temp.is_file() else promoted
+    if not (cert_path.is_file() and sidecar.is_file() and key_path.is_file()):
         raise EnrollmentError("incomplete staged enrollment artifacts; preserve them and inspect the output directory")
     private_key = load_private_key(key_path)
-    cert = validate_certificate(temp.read_bytes(), private_key, machine_id)
+    cert = validate_certificate(cert_path.read_bytes(), private_key, machine_id)
     cert_id, saved_fp = parse_sidecar(sidecar)
     fingerprint = cert_fingerprint(cert)
     if not saved_fp:
@@ -630,13 +632,13 @@ def revoke_unused(token: str, machine_id: str, out: Path, material: Material) ->
     print(f"[ok] revoked unused certificate {material.cert_id}")
 
 
-def promote(machine_id: str, out: Path) -> Path:
+def promote(machine_id: str, out: Path, *, preserve_sidecar: bool = False) -> Path:
     temp = out / f"{machine_id}.client.pem.new"
     cert = out / f"{machine_id}.client.pem"
     sidecar = out / f"{machine_id}.client.pem.new.id"
     if temp.is_file():
         os.replace(temp, cert)
-    if sidecar.exists():
+    if sidecar.exists() and not preserve_sidecar:
         sidecar.unlink()
     return cert
 
@@ -648,6 +650,7 @@ def configure_collector(
     cert_path: Path,
     material: Material,
     schedule: bool,
+    proof_sidecar: Path | None = None,
 ) -> None:
     key_path = out / f"{machine_id}.client.key"
     if os.name == "nt":
@@ -678,6 +681,8 @@ def configure_collector(
         )
     subprocess.run([collector, "doctor", "--require-current-cert"], check=True, env=child_env())
     subprocess.run([collector, "run", "--once"], check=True, env=child_env())
+    if proof_sidecar:
+        proof_sidecar.unlink()
     if os.name == "nt":
         key_path.unlink()
         print(f"[ok] removed exportable Windows private key {key_path}")
@@ -709,13 +714,15 @@ def install_staged_collector(collector: str, machine_id: str, out: Path, schedul
 
     if material:
         print(f"==> found staged certificate ({material.fingerprint})")
-        cert_path = promote(machine_id, out)
+        sidecar = out / f"{machine_id}.client.pem.new.id"
+        cert_path = promote(machine_id, out, preserve_sidecar=True)
     else:
         material = load_local_promoted(machine_id, out)
         if not material:
             raise EnrollmentError("no complete staged or promoted certificate material was found")
         print(f"==> resuming promoted certificate ({material.fingerprint})")
-    configure_collector(collector, machine_id, out, cert_path, material, schedule)
+        sidecar = None
+    configure_collector(collector, machine_id, out, cert_path, material, schedule, sidecar)
 
 
 def is_imported_windows_enrollment(

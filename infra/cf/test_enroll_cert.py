@@ -290,6 +290,26 @@ class RecoveryTests(unittest.TestCase):
             with self.assertRaisesRegex(enroll.EnrollmentError, "no certificate fingerprint"):
                 enroll.load_staged_recovery("test-windows", out)
 
+    def test_loads_promoted_stage_after_interrupted_proof(self):
+        item = material()
+        with tempfile.TemporaryDirectory() as raw:
+            out = Path(raw)
+            (out / "test-windows.client.key").write_bytes(
+                item.private_key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.TraditionalOpenSSL,
+                    serialization.NoEncryption(),
+                )
+            )
+            (out / "test-windows.client.pem").write_bytes(
+                item.certificate.public_bytes(serialization.Encoding.PEM)
+            )
+            (out / "test-windows.client.pem.new.id").write_text(
+                f"cert_id={item.cert_id}\nfp={item.fingerprint}\n"
+            )
+            recovered = enroll.load_staged_recovery("test-windows", out)
+            self.assertEqual(recovered.fingerprint, item.fingerprint)
+
     def test_loads_complete_stranded_material(self):
         item = material()
         with tempfile.TemporaryDirectory() as raw:
@@ -699,6 +719,51 @@ class CollectorFlowTests(unittest.TestCase):
                     )
             self.assertEqual(commands, ["enroll", "doctor"])
             self.assertTrue(key.exists())
+
+    def test_staged_sidecar_survives_failed_proof_and_precedes_key_cleanup(self):
+        with tempfile.TemporaryDirectory() as raw:
+            out, cert, key, _ = self._paths(raw)
+            sidecar = out / "test-windows.client.pem.new.id"
+            sidecar.write_text(f"cert_id={self.item.cert_id}\nfp={self.item.fingerprint}\n")
+            calls = []
+
+            def fail_doctor(argv, **_kwargs):
+                calls.append(argv[1])
+                if argv[1] == "enroll":
+                    (out / "test-windows.client.pfx").unlink()
+                if argv[1] == "doctor":
+                    raise subprocess.CalledProcessError(1, argv)
+                return types.SimpleNamespace(returncode=0)
+
+            with (
+                mock.patch.object(enroll.os, "name", "nt"),
+                mock.patch.object(enroll.subprocess, "run", side_effect=fail_doctor),
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    enroll.configure_collector(
+                        "collector.exe", "test-windows", out, cert, self.item, True, sidecar
+                    )
+            self.assertEqual(calls, ["enroll", "doctor"])
+            self.assertTrue(sidecar.exists())
+            self.assertTrue(key.exists())
+
+            sidecar_order = []
+
+            def succeed(argv, **_kwargs):
+                sidecar_order.append((argv[1], sidecar.exists(), key.exists()))
+                if argv[1] == "enroll":
+                    (out / "test-windows.client.pfx").unlink()
+                return types.SimpleNamespace(returncode=0)
+
+            with (
+                mock.patch.object(enroll.os, "name", "nt"),
+                mock.patch.object(enroll.subprocess, "run", side_effect=succeed),
+            ):
+                enroll.configure_collector(
+                    "collector.exe", "test-windows", out, cert, self.item, True, sidecar
+                )
+            self.assertEqual([entry[0] for entry in sidecar_order], ["enroll", "doctor", "run", "install"])
+            self.assertEqual(sidecar_order[-1][1:], (False, False))
 
     def test_live_upload_failure_keeps_key_and_does_not_schedule(self):
         with tempfile.TemporaryDirectory() as raw:
