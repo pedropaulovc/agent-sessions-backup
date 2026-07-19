@@ -2257,6 +2257,58 @@ describe('reservation intent and retry safety (round 16)', () => {
     ],
   });
 
+  it('a changed-byte upload keeps its cleanup reservation and the current row does not contend with itself (3609611899, 3609611900)', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    const kept = 'r16-changed-reserved-kept';
+    const dropped = 'r16-changed-reserved-dropped';
+    const sibling = await uploadConvs(
+      'r16-changed-reserved-sibling',
+      [namedConv(kept, 'old kept'), namedConv(dropped, 'old dropped')],
+      '2026-07-01T12:00:00Z',
+    );
+    await deliverChain({ file_id: sibling.fileId, r2_key: sibling.r2Key, reason: 'upload', content_hash: sibling.hash });
+    const owner = await uploadConvs('r16-changed-reserved-owner', [namedConv('r16-cro-owner', 'owner')]);
+    await deliverChain({ file_id: owner.fileId, r2_key: owner.r2Key, reason: 'upload', content_hash: owner.hash });
+
+    await testEnv.DB.prepare(
+      "UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = ?2, reserved_reason = 'recover', reservation_generation = reservation_generation + 1 WHERE id = ?1",
+    )
+      .bind(sibling.fileId, owner.fileId)
+      .run();
+
+    sent.length = 0;
+    const changed = await uploadConvs(
+      'r16-changed-reserved-sibling',
+      [namedConv(kept, 'changed kept')],
+      '2026-07-03T12:00:00Z',
+    );
+    const reservation = await testEnv.DB.prepare(
+      'SELECT parse_state, reserved_by, reserved_reason, reservation_generation FROM files WHERE id = ?1',
+    )
+      .bind(sibling.fileId)
+      .first<{ parse_state: string; reserved_by: number | null; reserved_reason: string | null; reservation_generation: number }>();
+    expect(reservation).toMatchObject({ parse_state: 'reserved', reserved_by: owner.fileId, reserved_reason: 'upload' });
+    expect(sent.some((m) => m.file_id === sibling.fileId)).toBe(false); // no parse before owner cleanup drains
+
+    await deliverChain({
+      file_id: sibling.fileId,
+      r2_key: changed.r2Key,
+      reason: 'upload',
+      content_hash: changed.hash,
+      reservation_owner: owner.fileId,
+      reservation_generation: reservation!.reservation_generation,
+    });
+
+    expect(await fileState(sibling.fileId)).toBe('parsed');
+    expect(await sessionState(dropped)).toBeNull();
+    const current = await testEnv.DB.prepare('SELECT title, canonical_file_id FROM sessions WHERE session_id = ?1')
+      .bind(kept)
+      .first<{ title: string; canonical_file_id: number }>();
+    expect(current).toMatchObject({ title: 'changed kept', canonical_file_id: sibling.fileId });
+    // Positive controls: clearing the reservation at upload time would have emitted an early untagged parse;
+    // retaining it but probing only reserved_by != current id would defer on this very row and strand dropped.
+  });
+
   it('a reserved pending upload keeps upload semantics and can replace healthy rows from an older archive (3609060878)', async () => {
     budgets({ slice: 800, invocation: 800, kickPage: 500 });
     const shared = 'r16-pending-shared';
@@ -2430,6 +2482,10 @@ describe('reservation intent and retry safety (round 16)', () => {
     // POSITIVE CONTROL: comparing only against zero would accept the one surviving reservation, advance
     // past the healed sibling, and eventually mark the corrupt owner error with an incomplete recovery set.
     expect(await fileState(owner.fileId)).toBe('pending');
+    const survivors = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM files WHERE reserved_by = ?1')
+      .bind(owner.fileId)
+      .first<{ n: number }>();
+    expect(survivors?.n).toBe(0); // restart begins with no inherited, under-counted ownership
   });
 
   it('a successful cleanup continuation also restarts when only part of its reserved prefix was healed', async () => {
@@ -2452,11 +2508,19 @@ describe('reservation intent and retry safety (round 16)', () => {
     expect(stoppedCont?.reservation_count).toBe(2);
 
     const reservations = await testEnv.DB.prepare(
-      "SELECT id FROM files WHERE reserved_by = ?1 AND parse_state = 'reserved' ORDER BY id",
+      "SELECT id, r2_key, content_hash, reservation_generation FROM files WHERE reserved_by = ?1 AND parse_state = 'reserved' ORDER BY id",
     )
       .bind(owner.fileId)
-      .all<{ id: number }>();
+      .all<{ id: number; r2_key: string; content_hash: string; reservation_generation: number }>();
     expect(reservations.results).toHaveLength(2);
+    const oldSurvivorDelivery: ParseMessage = {
+      file_id: reservations.results[1]!.id,
+      r2_key: reservations.results[1]!.r2_key,
+      reason: 'recover',
+      content_hash: reservations.results[1]!.content_hash,
+      reservation_owner: owner.fileId,
+      reservation_generation: reservations.results[1]!.reservation_generation,
+    };
     await testEnv.DB.prepare(
       "UPDATE files SET parse_state = 'pending', reserved_at = NULL, reserved_by = NULL, reserved_reason = NULL WHERE id = ?1",
     )
@@ -2470,6 +2534,55 @@ describe('reservation intent and retry safety (round 16)', () => {
     expect(restart?.cleanup_phase).toBeUndefined();
     expect(restart?.reservation_count).toBeUndefined();
     expect(await fileState(owner.fileId)).toBe('pending');
+
+    const afterRelease = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM files WHERE reserved_by = ?1')
+      .bind(owner.fileId)
+      .first<{ n: number }>();
+    expect(afterRelease?.n).toBe(0);
+
+    // A delivery selected for the released generation is no longer authorized, even though the restored
+    // recover row is now parsed (and therefore not fresh). It must stop before the R2 read.
+    const realGet = testEnv.RAW.get.bind(testEnv.RAW);
+    let staleReads = 0;
+    (testEnv.RAW as unknown as { get: typeof testEnv.RAW.get }).get = (async (...args: Parameters<typeof testEnv.RAW.get>) => {
+      staleReads += 1;
+      return realGet(...args);
+    }) as typeof testEnv.RAW.get;
+    try {
+      await deliver(oldSurvivorDelivery);
+    } finally {
+      (testEnv.RAW as unknown as { get: typeof testEnv.RAW.get }).get = realGet;
+    }
+    expect(staleReads).toBe(0);
+
+    // Drive the plain restart until it owns a fresh prefix, then lose one reservation AGAIN. The carried
+    // count must describe only this new attempt, detect the second partial loss, and release its survivors
+    // before any stale-session delete can run (3609611903).
+    const restarted = await deliverChain(restart!, { stopAtCleanup: true });
+    expect(restarted.stoppedCont?.cleanup_phase).toBe('reserve');
+    expect(restarted.stoppedCont?.reservation_count).toBe(2);
+    const secondAttempt = await testEnv.DB.prepare(
+      "SELECT id FROM files WHERE reserved_by = ?1 AND parse_state = 'reserved' ORDER BY id",
+    )
+      .bind(owner.fileId)
+      .all<{ id: number }>();
+    expect(secondAttempt.results).toHaveLength(2);
+    await testEnv.DB.prepare(
+      "UPDATE files SET parse_state = 'pending', reserved_at = NULL, reserved_by = NULL, reserved_reason = NULL WHERE id = ?1",
+    )
+      .bind(secondAttempt.results[0]!.id)
+      .run();
+
+    sent.length = 0;
+    await deliver(restarted.stoppedCont!);
+    const secondRestart = sent.find((m) => m.file_id === owner.fileId);
+    expect(secondRestart?.cleanup_phase).toBeUndefined();
+    const afterSecondRelease = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM files WHERE reserved_by = ?1')
+      .bind(owner.fileId)
+      .first<{ n: number }>();
+    expect(afterSecondRelease?.n).toBe(0);
+    expect(await sessionState('bnd-r16clpo-conv-1')).toBe('parsing');
+    expect(await canonicalOwner('bnd-r16clpo-conv-1')).toBe(owner.fileId); // no delete crossed either loss boundary
   });
 
   it('an old owner-tagged delivery cannot consume a newer same-timestamp reservation by the same owner id', async () => {

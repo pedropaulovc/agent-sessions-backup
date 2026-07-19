@@ -351,11 +351,15 @@ describe('multipart reservation repair regression', () => {
     expect(await reservedByOf(row!.id)).toBe(424242);
     expect(await testEnv.RAW.head(row!.r2_key)).not.toBeNull();
 
-    // A changed-hash upload still supersedes the reservation; the preservation branch is same-hash only.
+    // Changed bytes preserve the cleanup window too, but upgrade the deferred intent to a full upload.
     const changed = new TextEncoder().encode(bigSession('eeeeeeee-ffff-4000-8000-000000000000', 'changed-bytes', 6 * MIB));
     expect((await multipartStore(machine, 'claude', relpath, changed, 5 * MIB)).complete?.status).toBe(201);
-    expect(await stateOf(row!.id)).toBe('pending');
-    expect(await reservedByOf(row!.id)).toBeNull();
+    expect(await stateOf(row!.id)).toBe('reserved');
+    expect(await reservedByOf(row!.id)).toBe(424242);
+    const changedRow = await testEnv.DB.prepare('SELECT reserved_reason FROM files WHERE id = ?1')
+      .bind(row!.id)
+      .first<{ reserved_reason: string | null }>();
+    expect(changedRow?.reserved_reason).toBe('upload');
   });
 });
 
@@ -529,7 +533,7 @@ describe('multipart review fixes', () => {
     expect((await reopened.json<any>()).status).toBe('created');
   });
 
-  it('convergeMultipartRow realigns a reserved row and flips its owned sessions to parsing before re-enqueue', async () => {
+  it('convergeMultipartRow realigns changed bytes without releasing a live cleanup reservation', async () => {
     // Simulate the interleaved end state of two changed-hash completes: the D1 row carries hash HA and
     // a stale size, but R2's object at the key is the OTHER writer's (native checksum HB, different size).
     const key = 'raw/converge-box/claude/c.bin';
@@ -544,7 +548,7 @@ describe('multipart review fixes', () => {
       .bind(key, HA)
       .first<{ id: number }>();
     await testEnv.DB.prepare(
-      "UPDATE files SET parse_state = 'reserved', reserved_at = '2026-07-18T00:00:00.000Z', reserved_by = ?1, reserved_reason = 'recover' WHERE id = ?1",
+      "UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = ?1, reserved_reason = 'recover' WHERE id = ?1",
     )
       .bind(row!.id)
       .run();
@@ -562,12 +566,12 @@ describe('multipart review fixes', () => {
       .bind(row!.id)
       .first<{ content_hash: string; parse_state: string; mtime: string; size: number; reserved_at: string | null; reserved_by: number | null; reserved_reason: string | null }>();
     expect(after!.content_hash).toBe(HB); // row now describes what R2 actually holds
-    expect(after!.parse_state).toBe('pending'); // re-enqueued for a reparse
+    expect(after!.parse_state).toBe('reserved'); // owner-tagged send-late retains cleanup ordering
     expect(after!.mtime).toBe('2026-07-02T00:00:00Z');
     expect(after!.size).toBe(otherBytes.length); // size realigned (chooseCanonical orders by size DESC)
-    expect(after!.reserved_at).toBeNull();
-    expect(after!.reserved_by).toBeNull();
-    expect(after!.reserved_reason).toBeNull();
+    expect(after!.reserved_at).not.toBeNull();
+    expect(after!.reserved_by).toBe(row!.id);
+    expect(after!.reserved_reason).toBe('upload');
     const session = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
       .bind('converge-owned-session')
       .first<{ index_state: string }>();

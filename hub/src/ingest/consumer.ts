@@ -221,13 +221,21 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
   // 'reindex' message — one that raced the reserve flip (which now also flips 'pending' siblings) — would
   // otherwise re-parse the sibling as an ordinary upload, mark it 'parsed' behind the reserve cursor, and let
   // it escape the send-late set while the owner's delete removes the shared session. No-op such a message; the
-  // reservation owner's replacement re-parses the row later. A changed-bytes re-upload never reaches here reserved
-  // (its PUT clears the marker inline), and a stale reservation isn't fresh, so both still parse normally.
+  // reservation owner's replacement re-parses the row later. A changed-bytes re-upload stays reserved but
+  // upgrades its stored intent/hash to upload, so it also waits for the ordering-safe owner delivery.
   const ownsReservation =
     job.reservation_owner !== undefined &&
     job.reservation_owner === file.reserved_by &&
     job.reservation_generation !== undefined &&
     job.reservation_generation === file.reservation_generation;
+  const reservationTagged = job.reservation_owner !== undefined || job.reservation_generation !== undefined;
+  // An owner-tagged message is a capability for one exact reservation generation. Once that reservation
+  // has been refreshed, healed, or explicitly released for a restart, never let the old capability fall
+  // through merely because the row is no longer fresh (3609611903).
+  if (reservationTagged && !ownsReservation) {
+    console.log(JSON.stringify({ event: 'parse.skipped_stale_reservation_delivery', file_id: file.id, reason: job.reason }));
+    return 1;
+  }
   if (!ownsReservation && isFreshReservation(file)) {
     console.log(JSON.stringify({ event: 'parse.skipped_fresh_reservation', file_id: file.id, reason: job.reason }));
     return 1;
@@ -515,9 +523,13 @@ async function failExportFile(
       const refreshed = await refreshOwnedReservations(file, env);
       spent += 1;
       if (refreshed < expectedReservations) {
-        // Some or all of the prefix was reclaimed before this continuation resumed. Restart from page zero
-        // rather than skip permanently past siblings that are no longer reserved. A plain message also
-        // rechecks contention.
+        // Some or all of the prefix was reclaimed before this continuation resumed. Release EVERY survivor
+        // before restarting at page zero; otherwise the new attempt starts with reservation_count=0 while
+        // silently inheriting an old prefix, and a second partial loss can satisfy the under-counted guard.
+        // Released rows return to the state implied by their durable intent, and the
+        // generation bump invalidates any owner-tagged delivery selected before the restart (3609611903).
+        await releaseOwnedReservations(file, env);
+        spent += 1;
         try {
           await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason: msgReason, content_hash: contentHash });
         } catch {
@@ -977,6 +989,8 @@ async function runExportParse(
     const refreshed = await refreshOwnedReservations(file, env);
     spent += 1;
     if (refreshed < expectedReservations) {
+      await releaseOwnedReservations(file, env);
+      spent += 1;
       await revertOwnedReady(file, env);
       try {
         await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: contentHash });
@@ -1243,19 +1257,32 @@ async function sendCleanupContinuation(
  * a FRESH reservation? If so, a different cleanup owns the store's reserve → delete → send-late window, and
  * this cleanup (which has stale rows to delete, or a corrupt-file fan-out to run) must defer BEFORE any
  * mutation rather than reserve concurrently — concurrent reservations would let one cleanup's store-wide
- * send-late fire the other's rows early and cross-contaminate the 'reserved' set. Our OWN reservations are
- * excluded by OWNER (reserved_by != ?2), not by row id: a cleanup that already reserved siblings and is now
- * retrying past a transient failure must see its own fresh reservations as NOT contended, or it would defer on
- * itself until they went stale (1h) instead of completing the retry. reserved_by is the reserving file's id, so
- * reserved_by != file.id keeps exactly the OTHER cleanups' live reservations as the block. Stale reservations
- * (a crashed cleanup) fall past the reserved_at cutoff and never wedge the store. */
+ * send-late fire the other's rows early and cross-contaminate the 'reserved' set. Exclude both reservations
+ * OWNED by this cleanup and the current row itself: an owner-tagged sibling delivery still carries the previous
+ * cleanup's reserved_by until it finishes, and must not mistake itself for contention (3609611900). Stale
+ * reservations (a crashed cleanup) fall past the reserved_at cutoff and never wedge the store. */
 async function anotherCleanupHoldsStore(file: FileRow, env: Env): Promise<boolean> {
   const row = await env.DB.prepare(
-    "SELECT 1 AS held FROM files WHERE store = ?1 AND reserved_by != ?2 AND parse_state = 'reserved' AND reserved_at IS NOT NULL AND reserved_at > ?3 LIMIT 1",
+    "SELECT 1 AS held FROM files WHERE store = ?1 AND id != ?2 AND reserved_by != ?2 AND parse_state = 'reserved' AND reserved_at IS NOT NULL AND reserved_at > ?3 LIMIT 1",
   )
     .bind(file.store, file.id, reservationCutoffIso())
     .first<{ held: number }>();
   return row !== null;
+}
+
+/** Drop every surviving reservation from a cleanup whose expected prefix was partially healed. Restarting
+ * with a plain message then begins from an actually empty ownership set, so its reservation_count is exact.
+ * Upload reservations become pending and recover reservations become parsed, so reserveSiblings reconstructs
+ * the same intent on the next pass; either state is independently healable if the restart message is lost.
+ * Incrementing the generation makes already-selected owner-tagged deliveries unusable after the release. One
+ * set-based UPDATE keeps this bounded regardless of sibling count. */
+async function releaseOwnedReservations(file: FileRow, env: Env): Promise<number> {
+  const res = await env.DB.prepare(
+    "UPDATE files SET parse_state = CASE reserved_reason WHEN 'upload' THEN 'pending' ELSE 'parsed' END, reserved_at = NULL, reserved_by = NULL, reserved_reason = NULL, reservation_generation = reservation_generation + 1 WHERE store = ?1 AND reserved_by = ?2 AND parse_state = 'reserved'",
+  )
+    .bind(file.store, file.id)
+    .run();
+  return res.meta?.changes ?? 0;
 }
 
 /** RESERVE pass: flip every 'parsed' sibling archive to 'reserved' — a DURABLE recovery reservation that is
