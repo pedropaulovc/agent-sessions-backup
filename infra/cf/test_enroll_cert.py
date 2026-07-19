@@ -493,6 +493,8 @@ class CollectorFlowTests(unittest.TestCase):
                 return types.SimpleNamespace(stdout="--import-pfx --client-cert", returncode=0)
             if argv[1:] == ["doctor", "--help"]:
                 return types.SimpleNamespace(stdout="--require-current-cert", returncode=0)
+            if argv[1:] == ["run", "--help"]:
+                return types.SimpleNamespace(stdout="--heartbeat-only", returncode=0)
             return types.SimpleNamespace(stdout="", returncode=0)
 
         with (
@@ -504,7 +506,13 @@ class CollectorFlowTests(unittest.TestCase):
 
         self.assertEqual(
             [call[0][1:3] for call in calls],
-            [["tool", "install"], ["enroll", "--help"], ["doctor", "--help"], ["machine-id"]],
+            [
+                ["tool", "install"],
+                ["enroll", "--help"],
+                ["doctor", "--help"],
+                ["run", "--help"],
+                ["machine-id"],
+            ],
         )
         for argv, kwargs in calls:
             self.assertNotIn("cf-secret", " ".join(argv))
@@ -517,12 +525,18 @@ class CollectorFlowTests(unittest.TestCase):
 
         def run(argv, **kwargs):
             calls.append((list(argv), kwargs))
-            if argv[0] == "/old/agent-collector":
-                return types.SimpleNamespace(stdout="old help", returncode=0)
+            if argv[0] == "/old/agent-collector" and argv[1] == "enroll":
+                return types.SimpleNamespace(stdout="--import-pfx --client-cert", returncode=0)
+            if argv[0] == "/old/agent-collector" and argv[1] == "doctor":
+                return types.SimpleNamespace(stdout="--require-current-cert", returncode=0)
+            if argv[0] == "/old/agent-collector" and argv[1] == "run":
+                return types.SimpleNamespace(stdout="--once", returncode=0)
             if argv[0] == "/new/agent-collector" and argv[1] == "enroll":
                 return types.SimpleNamespace(stdout="--import-pfx --client-cert", returncode=0)
             if argv[0] == "/new/agent-collector" and argv[1] == "doctor":
                 return types.SimpleNamespace(stdout="--require-current-cert", returncode=0)
+            if argv[0] == "/new/agent-collector" and argv[1] == "run":
+                return types.SimpleNamespace(stdout="--heartbeat-only", returncode=0)
             return types.SimpleNamespace(stdout="", returncode=0)
 
         lookups = iter(["/old/agent-collector", "/tools/uv", "/new/agent-collector"])
@@ -532,7 +546,7 @@ class CollectorFlowTests(unittest.TestCase):
         ):
             self.assertEqual(enroll.ensure_collector(), "/new/agent-collector")
 
-        install = calls[1][0]
+        install = next(argv for argv, _kwargs in calls if argv[:3] == ["/tools/uv", "tool", "install"])
         self.assertEqual(
             install[0:5],
             ["/tools/uv", "tool", "install", "--force", "--reinstall"],
@@ -802,14 +816,15 @@ class CollectorFlowTests(unittest.TestCase):
             commands = []
 
             def run(argv, **_kwargs):
-                commands.append(argv[1])
+                commands.append(list(argv[1:]))
                 return types.SimpleNamespace(returncode=0)
 
             with mock.patch.object(enroll.subprocess, "run", side_effect=run):
                 enroll.configure_collector(
                     "agent-collector", "test-windows", out, cert, self.item, False
                 )
-            self.assertEqual(commands, ["enroll", "doctor", "run"])
+            self.assertEqual([command[0] for command in commands], ["enroll", "doctor", "run"])
+            self.assertEqual(commands[-1], ["run", "--once"])
 
 
 if __name__ == "__main__":
