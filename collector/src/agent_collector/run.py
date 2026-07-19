@@ -177,12 +177,16 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
         scanner.close()
 
     st.finish_run(run_id, scanned, changed, uploaded, total_bytes, errors)
-    _heartbeat(cfg, st, transport, stats, events)
+    heartbeat_ok = _heartbeat(cfg, st, transport, stats, events)
     print(json.dumps({
         "mode": "run", "files_scanned": scanned, "files_changed": changed,
         "files_uploaded": uploaded, "bytes_uploaded": total_bytes, "errors": errors,
     }))
-    return 0
+    # Per-file failures remain evented and retried on later scheduled passes, but a failed
+    # heartbeat means this machine has not proved an authenticated write to the hub at all.
+    # Surface that as a command failure so enrollment never removes its exportable key or
+    # installs the scheduler on the strength of an unchecked 401/5xx.
+    return 0 if heartbeat_ok else 1
 
 
 def _process_item(cfg, st: State, transport: Transport, scanner: Scanner, item: ScanItem) -> ItemResult:
@@ -745,10 +749,13 @@ def cmd_doctor(args) -> int:
         ok = _doctor_cert_store(cfg.client_cert_thumbprint) and ok
 
     try:
-        status, _body = transport.get(f"{cfg.hub_url}/healthz")
+        # Unlike /healthz, this route requires a resolved machine identity. A 200 therefore proves
+        # the configured PEM or Schannel certificate completed mTLS and mapped to the expected
+        # machines row before enrollment removes its exportable key or installs a scheduler.
+        status, _body = transport.get(f"{cfg.hub_url}/api/v1/status")
         mark = "ok" if status == 200 else "FAIL"
         ok = ok and status == 200
-        print(f"[{mark}] hub reachable: GET {cfg.hub_url}/healthz -> {status}")
+        print(f"[{mark}] authenticated hub API: GET {cfg.hub_url}/api/v1/status -> {status}")
     except NotImplementedError as e:
         print(f"[warn] hub check skipped: {e}")
     except Exception as e:  # noqa: BLE001

@@ -87,6 +87,15 @@ def test_heartbeat_buffers_on_failure_then_drains(tmp_path, hub, monkeypatch):
     assert any(e["code"] == "upload_failed" for e in drained)
 
 
+def test_run_returns_nonzero_when_authenticated_heartbeat_fails(tmp_path, hub, monkeypatch):
+    root = tmp_path / "claude"
+    root.mkdir()
+    cfg = _cfg(hub, root)
+    monkeypatch.setattr(run_mod, "_heartbeat", lambda *_args, **_kwargs: False)
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_run(cfg, st) == 1
+
+
 def test_backfill_uses_check_and_uploads_only_missing(tmp_path, hub):
     root = tmp_path / "claude"
     root.mkdir()
@@ -522,6 +531,23 @@ def test_doctor_reports_old_curl_as_fail(tmp_path, hub, tmp_env, monkeypatch, ca
     rc = run_mod.cmd_doctor(types.SimpleNamespace(config=str(path)))
     out = capsys.readouterr().out
     assert "[FAIL] curl" in out and "7.76.0" in out
+    assert rc == 1
+
+
+def test_doctor_requires_authenticated_hub_route(tmp_path, hub, tmp_env, monkeypatch, capsys):
+    path = config.config_path()
+    config.enroll(hub.url, dev=True, path=path, machine_id="m1")
+    requested = []
+
+    def unauthorized(_transport, url):
+        requested.append(url)
+        return 401, '{"error":"unauthorized"}'
+
+    monkeypatch.setattr(Transport, "get", unauthorized)
+    rc = run_mod.cmd_doctor(types.SimpleNamespace(config=str(path)))
+    out = capsys.readouterr().out
+    assert requested == [f"{hub.url}/api/v1/status"]
+    assert "[FAIL] authenticated hub API" in out and "-> 401" in out
     assert rc == 1
 
 

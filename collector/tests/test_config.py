@@ -164,7 +164,7 @@ def test_enroll_mtls_roundtrip(tmp_path):
 
 
 def test_enroll_mtls_preserves_existing_machine_id(tmp_path):
-    # Re-enrolling for mTLS must keep the id enroll-cert.sh already signed the cert for,
+    # Re-enrolling for mTLS must keep the id enroll-cert.py already signed the cert for,
     # not reset it to default_machine_id() (that would diverge -> machine_mismatch).
     path = tmp_path / "config.toml"
     cert = tmp_path / "c.pem"
@@ -216,7 +216,7 @@ def test_enroll_explicit_machine_id_wins_over_existing(tmp_path):
 
 
 def test_enroll_mtls_resolves_relative_cert_paths(tmp_path, monkeypatch):
-    # enroll-cert.sh defaults to --out . (relative); scheduled jobs run from another cwd,
+    # enroll-cert.py records absolute material paths; scheduled jobs run from another cwd,
     # so the stored config must hold absolute paths.
     monkeypatch.chdir(tmp_path)
     (tmp_path / "c.pem").write_text("c")

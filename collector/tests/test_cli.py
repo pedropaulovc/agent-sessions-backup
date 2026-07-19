@@ -21,7 +21,7 @@ def test_cli_rejects_unknown_command():
 
 
 def test_machine_id_prints_default_without_config(tmp_path):
-    # No config under XDG_CONFIG_HOME -> the computed default (what enroll-cert.sh must sign).
+    # No config under XDG_CONFIG_HOME -> the computed default (what enroll-cert.py must sign).
     env = {**os.environ, "XDG_CONFIG_HOME": str(tmp_path)}
     proc = _run(["machine-id"], env=env)
     assert proc.returncode == 0

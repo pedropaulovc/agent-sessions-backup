@@ -45,7 +45,7 @@ def _cmd_enroll(args) -> int:
 
 def _cmd_machine_id(_args) -> int:
     # The id the collector actually stamps on upload URLs: the config's machine_id if enrolled,
-    # else the computed default. Enrollment (enroll-cert.sh) must sign a cert for THIS id or
+    # else the computed default. Enrollment (enroll-cert.py) must sign a cert for THIS id or
     # uploads fail machine_mismatch (e.g. default is host-wsl on WSL, not host-linux).
     try:
         print(config_mod.load().machine_id)
@@ -76,8 +76,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_enroll = sub.add_parser("enroll", help="write config (--dev, or --client-cert/--client-key for mTLS)")
     p_enroll.add_argument("--hub", required=True, help="hub base URL, e.g. https://api.sessions.vza.net")
     p_enroll.add_argument("--dev", action="store_true", help="dev auth (x-dev-machine header)")
-    p_enroll.add_argument("--client-cert", help="POSIX mTLS: path to the PEM client cert (from enroll-cert.sh)")
-    p_enroll.add_argument("--client-key", help="POSIX mTLS: path to the client private key (from enroll-cert.sh)")
+    p_enroll.add_argument("--client-cert", help="POSIX mTLS: path to the PEM client cert (from enroll-cert.py)")
+    p_enroll.add_argument("--client-key", help="POSIX mTLS: path to the client private key (from enroll-cert.py)")
     p_enroll.add_argument("--client-cert-thumbprint",
                           help="Windows/Schannel mTLS: SHA-1 thumbprint of a cert already in Cert:\\CurrentUser\\My")
     p_enroll.add_argument("--import-pfx",

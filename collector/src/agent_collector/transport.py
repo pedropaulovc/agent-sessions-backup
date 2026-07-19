@@ -119,7 +119,7 @@ class MtlsAuth(AuthStrategy):
     """mTLS client-cert auth. Two software-key mechanisms, chosen by which config field is set:
 
     - POSIX (Linux/WSL/macOS, OpenSSL-backed curl): a PEM cert + key file presented via
-      `--cert`/`--key` (paths in client_cert_path/client_key_path, produced by infra/cf/enroll-cert.sh).
+      `--cert`/`--key` (paths in client_cert_path/client_key_path, produced by infra/cf/enroll-cert.py).
     - Windows (Schannel-backed curl): a client cert imported into Cert:\\CurrentUser\\My, referenced by
       THUMBPRINT via `--cert "CurrentUser\\MY\\<thumbprint>"` and NO `--key`. Schannel rejects
       file-based PEM/PFX client certs (SEC_E_INTERNAL_ERROR — verified against the real hub; see
@@ -165,13 +165,13 @@ class MtlsAuth(AuthStrategy):
             missing = "client_key_path" if cert else ("client_cert_path" if key else "client_cert_path and client_key_path")
             raise ValueError(
                 f"mTLS auth requires both client_cert_path and client_key_path in the config; "
-                f"missing {missing}. Run infra/cf/enroll-cert.sh, then set both paths (see mtls.md)."
+                f"missing {missing}. Run infra/cf/enroll-cert.py, then set both paths (see mtls.md)."
             )
         for label, path in (("client_cert_path", cert), ("client_key_path", key)):
             if not os.path.exists(path):
                 raise FileNotFoundError(
                     f"mTLS {label} points at {path!r}, which does not exist. Re-run "
-                    "infra/cf/enroll-cert.sh to (re)generate the cert/key, or fix the config path."
+                    "infra/cf/enroll-cert.py to (re)generate the cert/key, or fix the config path."
                 )
         return ["--cert", cert, "--key", key]
 

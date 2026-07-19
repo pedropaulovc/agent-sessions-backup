@@ -67,7 +67,7 @@ function validateCertFields(body: { cert_id?: string; cert_fp_sha256?: string })
   return null;
 }
 
-// Keep this contract in lockstep with infra/cf/enroll-cert.sh. Machine ids become a single URL path
+// Keep this contract in lockstep with infra/cf/enroll-cert.py. Machine ids become a single URL path
 // segment on every file route, so accepting characters the collector percent-encodes (notably '/' or a
 // space) creates a row whose cert can heartbeat but whose uploads always fail machine_mismatch. The
 // helper also uses the id in SQL literals and filenames, hence the deliberately small shared charset.
