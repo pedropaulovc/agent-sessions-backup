@@ -660,14 +660,26 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
       const fileStmts = items.map((i) =>
         env.DB.prepare(
           `INSERT INTO files (machine_id, store, relpath, r2_key, size, mtime, content_hash, harness, session_id, parse_state)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
            ON CONFLICT (machine_id, store, relpath) DO UPDATE SET
-             parse_state = 'pending', size = excluded.size, mtime = COALESCE(excluded.mtime, files.mtime),
+             parse_state = excluded.parse_state, size = excluded.size, mtime = COALESCE(excluded.mtime, files.mtime),
              harness = excluded.harness, session_id = excluded.session_id, content_hash = excluded.content_hash,
              reserved_at = NULL, reserved_by = NULL, reserved_reason = NULL
-           WHERE NOT (files.parse_state = 'reserved' AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10)
+           WHERE NOT (files.parse_state = 'reserved' AND files.reserved_at IS NOT NULL AND files.reserved_at > ?11)
            RETURNING id`,
-        ).bind(i.machineId, i.store, i.relpath, i.key, i.size, i.mtime, i.contentHash, i.det.harness, i.det.sessionId ?? null, reservCutoff),
+        ).bind(
+          i.machineId,
+          i.store,
+          i.relpath,
+          i.key,
+          i.size,
+          i.mtime,
+          i.contentHash,
+          i.det.harness,
+          i.det.sessionId ?? null,
+          i.det.kind === 'other' ? 'skipped' : 'pending',
+          reservCutoff,
+        ),
       );
       const results = await env.DB.batch<{ id: number }>([...machineStmts, ...fileStmts]);
       const ids = results.slice(machineStmts.length).map((r) => r.results[0]?.id ?? null);
@@ -681,7 +693,7 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
       const flipStmts = [];
       for (let k = 0; k < items.length; k++) {
         const { det } = items[k]!;
-        if (ids[k] === null) continue; // fresh reservation left intact — its cleanup owner re-parses it
+        if (ids[k] === null || det.kind === 'other') continue; // reserved rows stay owned; known-other rows need no parse
         if (det.sessionId) {
           flipStmts.push(
             env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1 AND canonical_file_id = ?2").bind(det.sessionId, ids[k]!),
@@ -699,7 +711,9 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
       // Skip null ids (fresh reservations left intact): no reindex parse for them — their cleanup owner's
       // recover re-parses them, and re-enqueuing would race that.
       const messages = items.flatMap((i, k) =>
-        ids[k] === null ? [] : [{ body: { file_id: ids[k]!, r2_key: i.key, reason: 'reindex' as const, content_hash: i.contentHash } }],
+        ids[k] === null || i.det.kind === 'other'
+          ? []
+          : [{ body: { file_id: ids[k]!, r2_key: i.key, reason: 'reindex' as const, content_hash: i.contentHash } }],
       );
       for (const chunk of queueChunks(messages)) {
         await env.PARSE_QUEUE.sendBatch(chunk);
