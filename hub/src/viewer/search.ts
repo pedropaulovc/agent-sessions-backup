@@ -1,6 +1,9 @@
 import { runSearch, type SearchHit } from '../api/search';
+import { clampLimit, decodeCursor, encodeCursor, normalizeToBound } from '../api/sessions';
 import { esc, page, q } from './layout';
 import { TURNS_PER_PAGE } from './session';
+
+const DEFAULT_PAGE_SIZE = 20;
 
 const FILTERS = [
   { param: 'harness', col: 'harness', label: 'Harness' },
@@ -8,6 +11,13 @@ const FILTERS = [
   { param: 'os', col: 'os', label: 'OS' },
   { param: 'model', col: 'primary_model', label: 'Model' },
 ] as const;
+
+const SESSION_FILTERS = [
+  ...FILTERS,
+  { param: 'repo', col: 'repo_url', label: 'Repo' },
+  { param: 'cwd', col: 'cwd', label: 'Working directory' },
+] as const;
+const DATE_FILTERS = ['from', 'to'] as const;
 
 // Facet column name (as returned by runSearch) → query param the viewer filters on.
 const FACET_PARAM: Record<string, string> = {
@@ -35,47 +45,75 @@ interface RecentRow {
   cwd: string | null;
 }
 
-/** GET / — search box, filters, results (or recent sessions when the query is empty) and a faceted sidebar. */
+interface RecentResult {
+  rows: RecentRow[];
+  previousCursor?: string;
+  nextCursor?: string;
+  page: number;
+  limit: number;
+}
+
+interface RecentCursor {
+  direction: 'after' | 'before';
+  startedAt: string;
+  sessionId: string;
+  page: number;
+}
+
+/** GET / — paginated recent sessions or full-text results, with filters and facets in a left sidebar. */
 export async function searchPage(url: URL, env: Env): Promise<Response> {
   const p = url.searchParams;
   const query = p.get('q')?.trim() ?? '';
-  // Active filters drive both the <select> pre-selection (FILTERS) and the facet active/toggle-off state
-  // (every facet param, e.g. repo, which has no matching select). Union both so a selected repo facet
-  // renders active and its link clears the param instead of re-applying it.
-  const active: Record<string, string> = {};
-  const activeParams = new Set<string>([...FILTERS.map((f) => f.param), ...Object.values(FACET_PARAM)]);
-  for (const param of activeParams) if (p.get(param)) active[param] = p.get(param)!;
-
+  const active = activeFilters(p);
   const options = await filterOptions(env);
-  const form = renderForm(query, active, options);
+  const searchForm = renderSearchForm(query, active);
 
   if (!query) {
-    const recent = await env.DB.prepare(
-      `SELECT session_id, harness, machine_id, primary_model, title, started_at, cwd
-       FROM sessions ORDER BY started_at DESC LIMIT 50`,
-    ).all<RecentRow>();
-    const list = recent.results.length
-      ? recent.results.map(renderRecent).join('')
-      : `<p class="muted">No sessions indexed yet.</p>`;
-    return page({
-      title: 'Search — sessions',
-      nav: 'search',
-      body: `${form}<h3 class="muted small">Recent sessions</h3>${list}`,
-    });
+    const [recent, facets] = await Promise.all([recentSessions(p, env), sessionFacets(p, env)]);
+    const list = recent.rows.length
+      ? recent.rows.map(renderRecent).join('')
+      : `<p class="muted">No sessions match these filters.</p>`;
+    const firstResult = (recent.page - 1) * recent.limit + 1;
+    const summary = recent.rows.length
+      ? `<p class="muted small">Showing ${firstResult}–${firstResult + recent.rows.length - 1} recent sessions</p>`
+      : '';
+    const body = searchForm + renderSearchLayout(
+      renderSidebar(url, query, active, options, facets),
+      `<h3 class="muted small">Recent sessions</h3>${summary}${list}` +
+        recentPager(url, recent.previousCursor, recent.nextCursor, recent.page),
+    );
+    return page({ title: 'Search — sessions', nav: 'search', body });
   }
 
   const result = await runSearch(url, env, { facets: true });
+  const offset = decodeCursor(p.get('cursor'));
+  const limit = clampLimit(p.get('limit'), DEFAULT_PAGE_SIZE, 100);
   const hits = result.hits.map(renderHit).join('');
-  const body = `${form}<div class="row">` +
-    `<div class="content">` +
-    (result.hits.length
-      ? `<p class="muted small">${result.hits.length} result${result.hits.length === 1 ? '' : 's'}${result.cursor ? '+' : ''} for “${esc(query)}”</p>${hits}` +
-        pager(url, result.cursor)
-      : `<p class="muted">No matches for “${esc(query)}”.</p>`) +
-    `</div>` +
-    `<aside class="sidebar facets">${renderFacets(url, result.facets, active)}</aside>` +
-    `</div>`;
+  const summary = result.hits.length
+    ? `<p class="muted small">Showing ${offset + 1}–${offset + result.hits.length} for “${esc(query)}”</p>`
+    : '';
+  const list = result.hits.length
+    ? hits
+    : `<p class="muted">No matches for “${esc(query)}”.</p>`;
+  const body = searchForm + renderSearchLayout(
+    renderSidebar(url, query, active, options, result.facets),
+    `${summary}${list}${searchPager(url, result.cursor, offset, limit)}`,
+  );
   return page({ title: `${query} — sessions`, nav: 'search', body });
+}
+
+function activeFilters(p: URLSearchParams): Record<string, string> {
+  const active: Record<string, string> = {};
+  const params = new Set<string>([
+    ...SESSION_FILTERS.map((f) => f.param),
+    ...DATE_FILTERS,
+    ...Object.values(FACET_PARAM),
+  ]);
+  for (const param of params) {
+    const value = p.get(param);
+    if (value) active[param] = value;
+  }
+  return active;
 }
 
 async function filterOptions(env: Env): Promise<Record<string, string[]>> {
@@ -89,21 +127,184 @@ async function filterOptions(env: Env): Promise<Record<string, string[]>> {
   return out;
 }
 
-function renderForm(query: string, active: Record<string, string>, options: Record<string, string[]>): string {
+function renderSearchForm(query: string, active: Record<string, string>): string {
+  const hidden = Object.entries(active)
+    .map(([name, value]) => `<input type="hidden" name="${esc(name)}" value="${esc(value)}">`)
+    .join('');
+  return `<form class="search" method="get" action="/">` +
+    `<input type="search" name="q" value="${esc(query)}" placeholder="Full-text search across sessions…" autofocus>` +
+    hidden +
+    `<button type="submit">Search</button></form>`;
+}
+
+function renderSearchLayout(sidebar: string, content: string): string {
+  return `<div class="row search-layout">` +
+    `<aside class="sidebar facets">${sidebar}</aside>` +
+    `<section class="content search-results">${content}</section>` +
+    `</div>`;
+}
+
+function renderSidebar(
+  url: URL,
+  query: string,
+  active: Record<string, string>,
+  options: Record<string, string[]>,
+  facets: Record<string, Record<string, number>> | undefined,
+): string {
+  const preserved = Object.entries(active)
+    .filter(([name]) => !FILTERS.some((f) => f.param === name))
+    .map(([name, value]) => `<input type="hidden" name="${esc(name)}" value="${esc(value)}">`)
+    .join('');
   const selects = FILTERS.map((f) => {
-    const opts = [`<option value="">${f.label}: all</option>`]
+    const opts = [`<option value="">All</option>`]
       .concat(
         (options[f.param] ?? []).map(
-          (v) => `<option value="${esc(v)}"${active[f.param] === v ? ' selected' : ''}>${esc(v)}</option>`,
+          (value) => `<option value="${esc(value)}"${active[f.param] === value ? ' selected' : ''}>${esc(value)}</option>`,
         ),
       )
       .join('');
-    return `<select name="${f.param}">${opts}</select>`;
+    return `<label><span>${f.label}</span>` +
+      `<select name="${f.param}" aria-label="Filter by ${f.label}" onchange="this.form.requestSubmit()">${opts}</select>` +
+      `</label>`;
   }).join('');
-  return `<form class="search" method="get" action="/">` +
-    `<input type="search" name="q" value="${esc(query)}" placeholder="Full-text search across sessions…" autofocus>` +
-    selects +
-    `<button type="submit">Search</button></form>`;
+  const clear = new URL(url);
+  clear.search = '';
+  if (query) clear.searchParams.set('q', query);
+  const controls = `<form class="facet-controls" method="get" action="/">` +
+    `<input type="hidden" name="q" value="${esc(query)}">${preserved}` +
+    `<div class="facet-selects">${selects}</div>` +
+    `<noscript><button type="submit">Apply filters</button></noscript>` +
+    (Object.keys(active).length ? `<a class="clear-filters small" href="${esc(clear.pathname + clear.search)}">Clear filters</a>` : '') +
+    `</form>`;
+  return controls + renderFacets(url, facets, active);
+}
+
+async function recentSessions(p: URLSearchParams, env: Env): Promise<RecentResult> {
+  const limit = clampLimit(p.get('limit'), DEFAULT_PAGE_SIZE, 100);
+  const cursor = decodeRecentCursor(p.get('cursor'));
+  const page = cursor?.page ?? 1;
+  const { where: baseWhere, binds } = sessionWhere(p);
+  const boundary = cursor ? recentBoundary(cursor.direction, cursor.startedAt, cursor.sessionId, binds) : '';
+  const where = boundary ? `${baseWhere || 'WHERE'}${baseWhere ? ' AND' : ''} ${boundary}` : baseWhere;
+  const reverse = cursor?.direction === 'before';
+  const direction = reverse ? 'ASC' : 'DESC';
+  const result = await env.DB.prepare(
+    `SELECT session_id, harness, machine_id, primary_model, title, started_at, cwd
+     FROM sessions ${where}
+     ORDER BY COALESCE(started_at, '') ${direction}, session_id ${direction} LIMIT ${limit + 1}`,
+  ).bind(...binds).all<RecentRow>();
+  const rows = result.results.slice(0, limit);
+  if (reverse) rows.reverse();
+
+  const first = rows.at(0);
+  const last = rows.at(-1);
+  const hasPrevious = reverse
+    ? result.results.length > limit
+    : !!cursor && !!first && await hasRecentRow(p, env, 'before', first);
+  const hasNext = reverse
+    ? !!last && await hasRecentRow(p, env, 'after', last)
+    : result.results.length > limit;
+  return {
+    rows,
+    previousCursor: hasPrevious && first
+      ? encodeRecentCursor({ direction: 'before', startedAt: startedAtKey(first), sessionId: first.session_id, page: Math.max(1, page - 1) })
+      : undefined,
+    nextCursor: hasNext && last
+      ? encodeRecentCursor({ direction: 'after', startedAt: startedAtKey(last), sessionId: last.session_id, page: page + 1 })
+      : undefined,
+    page,
+    limit,
+  };
+}
+
+/** Recent sessions are actively ingested, so its cursor names a row boundary rather than
+ * an OFFSET into a moving list. The direction supports both Previous and Next without
+ * scanning/discarding every preceding row. */
+function recentBoundary(
+  direction: RecentCursor['direction'],
+  startedAt: string,
+  sessionId: string,
+  binds: string[],
+): string {
+  const op = direction === 'after' ? '<' : '>';
+  binds.push(startedAt, startedAt, sessionId);
+  const n = binds.length;
+  return `(COALESCE(started_at, '') ${op} ?${n - 2} OR ` +
+    `(COALESCE(started_at, '') = ?${n - 1} AND session_id ${op} ?${n}))`;
+}
+
+async function hasRecentRow(
+  p: URLSearchParams,
+  env: Env,
+  direction: RecentCursor['direction'],
+  row: RecentRow,
+): Promise<boolean> {
+  const { where: baseWhere, binds } = sessionWhere(p);
+  const boundary = recentBoundary(direction, startedAtKey(row), row.session_id, binds);
+  const where = `${baseWhere || 'WHERE'}${baseWhere ? ' AND' : ''} ${boundary}`;
+  return !!await env.DB.prepare(`SELECT 1 AS found FROM sessions ${where} LIMIT 1`).bind(...binds).first();
+}
+
+function startedAtKey(row: RecentRow): string {
+  return row.started_at ?? '';
+}
+
+function encodeRecentCursor(cursor: RecentCursor): string {
+  const json = JSON.stringify(['recent-v1', cursor.direction, cursor.startedAt, cursor.sessionId, cursor.page]);
+  const bytes = new TextEncoder().encode(json);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function decodeRecentCursor(value: string | null): RecentCursor | null {
+  if (!value) return null;
+  try {
+    const binary = atob(value);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    const decoded: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    if (!Array.isArray(decoded) || decoded.length !== 5 || decoded[0] !== 'recent-v1') return null;
+    const [, direction, startedAt, sessionId, page] = decoded;
+    if (direction !== 'after' && direction !== 'before') return null;
+    if (typeof startedAt !== 'string' || typeof sessionId !== 'string') return null;
+    if (!Number.isSafeInteger(page) || (page as number) < 1) return null;
+    return { direction, startedAt, sessionId, page: page as number };
+  } catch {
+    // A stale search/offset cursor, invalid base64, or hand-edited payload starts at page 1.
+    return null;
+  }
+}
+
+async function sessionFacets(p: URLSearchParams, env: Env): Promise<Record<string, Record<string, number>>> {
+  const { where, binds } = sessionWhere(p);
+  const facets: Record<string, Record<string, number>> = {};
+  for (const col of Object.keys(FACET_PARAM)) {
+    const prefix = where ? `${where} AND` : 'WHERE';
+    const rows = await env.DB.prepare(
+      `SELECT ${col} AS v, COUNT(*) AS n FROM sessions ${prefix} ${col} IS NOT NULL
+       GROUP BY ${col} ORDER BY n DESC LIMIT 20`,
+    ).bind(...binds).all<{ v: string; n: number }>();
+    facets[col] = Object.fromEntries(rows.results.map((r) => [r.v, r.n]));
+  }
+  return facets;
+}
+
+function sessionWhere(p: URLSearchParams): { where: string; binds: string[] } {
+  const clauses: string[] = [];
+  const binds: string[] = [];
+  const add = (clause: string, value: string) => {
+    binds.push(value);
+    clauses.push(clause.replace('?', `?${binds.length}`));
+  };
+  for (const f of SESSION_FILTERS) {
+    const value = p.get(f.param);
+    if (value) add(`${f.col} = ?`, value);
+  }
+  const from = p.get('from');
+  if (from) add('started_at >= ?', from);
+  const to = p.get('to');
+  if (to) add('started_at <= ?', normalizeToBound(to));
+  return { where: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '', binds };
 }
 
 function renderHit(h: SearchHit): string {
@@ -173,9 +374,44 @@ function renderFacets(url: URL, facets: Record<string, Record<string, number>> |
   return groups || '<p class="muted small">No facets.</p>';
 }
 
-function pager(url: URL, cursor?: string): string {
-  if (!cursor) return '';
+function searchPager(url: URL, cursor: string | undefined, offset: number, limit: number): string {
+  if (!cursor && offset === 0) return '';
+  const previous = new URL(url);
+  const previousOffset = Math.max(0, offset - limit);
+  if (previousOffset) previous.searchParams.set('cursor', encodeCursor(previousOffset));
+  else previous.searchParams.delete('cursor');
+  const previousLink = offset > 0
+    ? `<a rel="prev" href="${esc(previous.pathname + previous.search)}">← Previous</a>`
+    : `<span class="muted">← Previous</span>`;
+
   const next = new URL(url);
-  next.searchParams.set('cursor', cursor);
-  return `<div class="pager"><a href="${esc(next.pathname + next.search)}">Next page →</a></div>`;
+  if (cursor) next.searchParams.set('cursor', cursor);
+  const nextLink = cursor
+    ? `<a rel="next" href="${esc(next.pathname + next.search)}">Next →</a>`
+    : `<span class="muted">Next →</span>`;
+  const currentPage = Math.floor(offset / limit) + 1;
+  return `<nav class="pager" aria-label="Search result pages">${previousLink}` +
+    `<span class="small">Page ${currentPage}</span>${nextLink}</nav>`;
+}
+
+function recentPager(
+  url: URL,
+  previousCursor: string | undefined,
+  nextCursor: string | undefined,
+  currentPage: number,
+): string {
+  if (!previousCursor && !nextCursor) return '';
+  const previous = new URL(url);
+  if (previousCursor) previous.searchParams.set('cursor', previousCursor);
+  const previousLink = previousCursor
+    ? `<a rel="prev" href="${esc(previous.pathname + previous.search)}">← Previous</a>`
+    : `<span class="muted">← Previous</span>`;
+
+  const next = new URL(url);
+  if (nextCursor) next.searchParams.set('cursor', nextCursor);
+  const nextLink = nextCursor
+    ? `<a rel="next" href="${esc(next.pathname + next.search)}">Next →</a>`
+    : `<span class="muted">Next →</span>`;
+  return `<nav class="pager" aria-label="Recent session pages">${previousLink}` +
+    `<span class="small">Page ${currentPage}</span>${nextLink}</nav>`;
 }
