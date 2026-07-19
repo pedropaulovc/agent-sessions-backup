@@ -130,9 +130,26 @@ def cmd_run(args) -> int:
         return 0
     try:
         with State(machine_id=cfg.machine_id, hub_url=cfg.hub_url) as st:
+            if getattr(args, "heartbeat_only", False):
+                return _do_heartbeat_only(cfg, st)
             return _do_run(cfg, st)
     finally:
         lock.release()
+
+
+def _do_heartbeat_only(cfg: config_mod.Config, st: State) -> int:
+    """Prove an authenticated hub write without turning enrollment into a full corpus backfill."""
+    transport = Transport(build_auth(cfg))
+    run_id = st.start_run("heartbeat")
+    stats = {
+        name: {"files_seen": 0, "files_uploaded": 0, "bytes_uploaded": 0}
+        for name in cfg.stores
+    }
+    events = _windows_mount_events(cfg)
+    st.finish_run(run_id, 0, 0, 0, 0, 0)
+    heartbeat_ok = _heartbeat(cfg, st, transport, stats, events)
+    print(json.dumps({"mode": "heartbeat", "errors": 0 if heartbeat_ok else 1}))
+    return 0 if heartbeat_ok else 1
 
 
 def _do_run(cfg: config_mod.Config, st: State) -> int:

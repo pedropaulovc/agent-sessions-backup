@@ -216,7 +216,16 @@ def collector_supports_enrollment(executable: str) -> bool:
         check=False,
         env=child_env(),
     )
-    return doctor_help.returncode == 0 and "--require-current-cert" in doctor_help.stdout.split()
+    if doctor_help.returncode != 0 or "--require-current-cert" not in doctor_help.stdout.split():
+        return False
+    run_help = subprocess.run(
+        [executable, "run", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=child_env(),
+    )
+    return run_help.returncode == 0 and "--heartbeat-only" in run_help.stdout.split()
 
 
 def machine_id_for(collector: str, explicit: str | None) -> str:
@@ -689,7 +698,8 @@ def configure_collector(
             env=child_env(),
         )
     subprocess.run([collector, "doctor", "--require-current-cert"], check=True, env=child_env())
-    subprocess.run([collector, "run", "--once"], check=True, env=child_env())
+    run_mode = "--heartbeat-only" if schedule else "--once"
+    subprocess.run([collector, "run", run_mode], check=True, env=child_env())
     if proof_sidecar:
         proof_sidecar.unlink()
     if os.name == "nt":
@@ -705,7 +715,8 @@ def configure_collector(
 def resume_configured_collector(collector: str, schedule: bool) -> None:
     """Resume after Windows already imported the key and removed its exportable copy."""
     subprocess.run([collector, "doctor", "--require-current-cert"], check=True, env=child_env())
-    subprocess.run([collector, "run", "--once"], check=True, env=child_env())
+    run_mode = "--heartbeat-only" if schedule else "--once"
+    subprocess.run([collector, "run", run_mode], check=True, env=child_env())
     if schedule:
         subprocess.run([collector, "install", "--interval", "15"], check=True, env=child_env())
 
