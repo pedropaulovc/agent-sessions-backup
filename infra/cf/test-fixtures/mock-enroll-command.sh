@@ -23,6 +23,9 @@ case "${0##*/}" in
       printf ' %s' "$arg" >> "$ENROLL_TEST_LOG"
     done
     printf '\n' >> "$ENROLL_TEST_LOG"
+    if [ "${3-}" = 'd1' ] && [ "${4-}" = 'execute' ]; then
+      printf '%s\n' '[{"results":[{"fp":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","is_admin":0}]}]'
+    fi
     ;;
   openssl)
     case "${1-}" in
@@ -41,6 +44,10 @@ case "${0##*/}" in
         printf '%s' 'mock-der'
         ;;
       dgst)
+        # The real command consumes the DER stream. If this mock exits without reading, the
+        # upstream mock can lose the pipe race and die on SIGPIPE under `set -o pipefail`.
+        # That made the hermetic test runner-dependent even though the product code was fine.
+        cat >/dev/null
         printf '%s\n' 'SHA2-256(stdin)= 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
         ;;
       *)

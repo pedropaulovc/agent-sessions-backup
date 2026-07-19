@@ -28,7 +28,7 @@ if [ "${calls[0]}" != 'npx: --yes wrangler whoami' ]; then
   exit 1
 fi
 case "${calls[1]}" in
-  'npx: --yes wrangler d1 execute sessions-index --remote --command '*) ;;
+  'npx: --yes wrangler d1 execute sessions-index --remote --json --command '*) ;;
   *)
     echo "unexpected Wrangler D1 call: ${calls[1]}" >&2
     exit 1
