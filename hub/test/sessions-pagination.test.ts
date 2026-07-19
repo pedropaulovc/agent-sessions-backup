@@ -558,7 +558,7 @@ describe('X-Indexed-Through and /api/v1/usage respect the request machine/harnes
     expect(bodyAfter.indexed_through).not.toBe(WEBZIP_TS);
   });
 
-  it('harness filter -> excludes pending unknown-harness files that can never resolve to a web session (round-5 finding)', async () => {
+  it('harness filter -> excludes unknown-harness files that can never resolve to a web session (round-5 finding)', async () => {
     // Case A: a non-.zip file dropped in export-inbox — detect() stamps it harness='unknown',
     // kind='other' (not 'export-archive'), so parseExportArchive() never even runs on it.
     const NONZIP_MACHINE = 'filterbox-nonzip';
@@ -569,7 +569,7 @@ describe('X-Indexed-Through and /api/v1/usage respect the request machine/harnes
       .bind(NONZIP_MACHINE)
       .first<{ harness: string; parse_state: string }>();
     expect(nonzipFile?.harness).toBe('unknown');
-    expect(nonzipFile?.parse_state).toBe('pending'); // never drained — stays pending
+    expect(nonzipFile?.parse_state).toBe('skipped'); // known non-session shape bypasses the parse queue
     await testEnv.DB.prepare('UPDATE machines SET last_seen_at = ?1 WHERE machine_id = ?2').bind(NONZIP_TS, NONZIP_MACHINE).run();
 
     // Case B: an unrecognized path shape in an unrelated store (claude-projects) — also
@@ -582,11 +582,11 @@ describe('X-Indexed-Through and /api/v1/usage respect the request machine/harnes
       .bind(OTHERSTORE_MACHINE)
       .first<{ harness: string; parse_state: string }>();
     expect(otherFile?.harness).toBe('unknown');
-    expect(otherFile?.parse_state).toBe('pending');
+    expect(otherFile?.parse_state).toBe('skipped');
     await testEnv.DB.prepare('UPDATE machines SET last_seen_at = ?1 WHERE machine_id = ?2').bind(OTHERSTORE_TS, OTHERSTORE_MACHINE).run();
 
     // Neither is an export-archive-shaped row, so neither drags harness=claude-web's
-    // freshness down, even though both are pending 'unknown' files.
+    // freshness down. Both are terminal 'unknown' files and cannot resolve to a web session.
     const res = await get('harness=claude-web');
     const body = (await res.json()) as { indexed_through: string };
     expect(body.indexed_through).not.toBe(NONZIP_TS);
