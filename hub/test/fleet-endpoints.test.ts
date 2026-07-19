@@ -94,7 +94,8 @@ describe('GET /api/v1/bootstrap', () => {
     expect(cfg.schema_version).toBe(COLLECTOR_CONFIG_SCHEMA_VERSION);
     expect(cfg.scan_interval_seconds).toBe(DEFAULT_COLLECTOR_CONFIG.scan_interval_seconds);
     expect(cfg.max_upload_bytes).toBe(DEFAULT_COLLECTOR_CONFIG.max_upload_bytes);
-    expect((cfg.stores as Record<string, boolean>)['claude']).toBe(true); // collector's local Claude Code store key
+    expect((cfg.store_toggles as Record<string, boolean>)['claude']).toBe(true); // collector's local Claude Code store key
+    expect(cfg.stores).toBeUndefined(); // never overwrite collector Config.stores filesystem roots
   });
 
   it('401s a non-machine identity', async () => {
@@ -104,7 +105,7 @@ describe('GET /api/v1/bootstrap', () => {
 
   it('shallow-merges a meta override but keeps schema_version fixed', async () => {
     await testEnv.DB.prepare("INSERT INTO meta (key, value) VALUES ('collector_config', ?1) ON CONFLICT (key) DO UPDATE SET value = ?1")
-      .bind(JSON.stringify({ scan_interval_seconds: 60, redact_env: false, schema_version: 999 }))
+      .bind(JSON.stringify({ scan_interval_seconds: 60, redact_env: false, schema_version: 999, stores: { claude: false } }))
       .run();
     try {
       const cfg = (await (await bootstrap(testEnv, machine('boot-2'))).json()) as Record<string, unknown>;
@@ -112,6 +113,7 @@ describe('GET /api/v1/bootstrap', () => {
       expect(cfg.redact_env).toBe(false);
       expect(cfg.schema_version).toBe(COLLECTOR_CONFIG_SCHEMA_VERSION); // override can't forge the version
       expect(cfg.heartbeat_interval_seconds).toBe(DEFAULT_COLLECTOR_CONFIG.heartbeat_interval_seconds); // untouched default
+      expect(cfg.stores).toBeUndefined(); // reserved local root-map key is never served, even from meta
     } finally {
       await testEnv.DB.prepare("DELETE FROM meta WHERE key = 'collector_config'").run();
     }
@@ -138,11 +140,11 @@ describe('GET /api/v1/bootstrap', () => {
     // Source of truth: collector/src/agent_collector/config.py — DEFAULT_STORES {'claude','codex'} +
     // WEBCAPTURE_STORES ('chatgpt-web','claude-web','export-inbox').
     const COLLECTOR_STORES = new Set(['claude', 'codex', 'chatgpt-web', 'claude-web', 'export-inbox']);
-    for (const key of Object.keys(DEFAULT_COLLECTOR_CONFIG.stores)) {
+    for (const key of Object.keys(DEFAULT_COLLECTOR_CONFIG.store_toggles)) {
       expect(COLLECTOR_STORES.has(key)).toBe(true);
     }
-    expect(Object.keys(DEFAULT_COLLECTOR_CONFIG.stores)).toContain('claude'); // the real local Claude Code store
-    expect(Object.keys(DEFAULT_COLLECTOR_CONFIG.stores)).not.toContain('claude-code'); // harness name, not a store
+    expect(Object.keys(DEFAULT_COLLECTOR_CONFIG.store_toggles)).toContain('claude'); // the real local Claude Code store
+    expect(Object.keys(DEFAULT_COLLECTOR_CONFIG.store_toggles)).not.toContain('claude-code'); // harness name, not a store
   });
 });
 
@@ -772,6 +774,23 @@ describe('POST /api/v1/admin/machines', () => {
     expect(await row('ia-str')).toBeNull(); // never created
   });
 
+  it.each(['machine with space', 'machine/with/slash', '.', '..', '', 42])(
+    '422s machine_id %j before an unroutable machine row can be created',
+    async (machineId) => {
+      const res = await adminMachines(reqJson({ machine_id: machineId, priority: 7 }), testEnv, machine('am-admin', true));
+      expect(res.status).toBe(422);
+      expect(((await res.json()) as { error: string }).error).toBe('invalid_machine_id');
+      if (typeof machineId === 'string') expect(await row(machineId)).toBeNull();
+    },
+  );
+
+  it('accepts the enrollment helper charset for machine ids (positive control)', async () => {
+    const id = 'host.example_wsl-2';
+    const res = await adminMachines(reqJson({ machine_id: id, priority: 7 }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(200);
+    expect((await row(id))?.priority).toBe(7);
+  });
+
   it('is_admin: false CLEARS the admin flag (positive control: true sets it)', async () => {
     await adminMachines(reqJson({ machine_id: 'ia-clear', is_admin: true, priority: 4 }), testEnv, machine('am-admin', true));
     expect((await row('ia-clear'))?.is_admin).toBe(1); // set by boolean true
@@ -1232,6 +1251,35 @@ describe('POST /api/v1/admin/machines', () => {
     expect(r?.cert_id).toBe('rbp-A-id'); // carried from the reservation, NOT null and NOT the hatch's NULL
     expect(await retired(hexfp('rbp-A'))).toBeNull(); // reservation unqueued atomically
     expect((await retired(hexfp('rbp-B')))?.cert_id).toBe('rbp-B-id'); // displaced old current queued
+  });
+
+  it('requires the explicit legacy hatch before reinstating a NULL-id reservation', async () => {
+    // A NULL-id reservation is not a trusted CA-handle source. Treating it as reinstatingReserved would
+    // bypass cert_id_required_for_new_fp even though the carry UPDATE has no id to carry.
+    await seedMachine('rb-null', { fp: hexfp('rbn-B'), certId: 'rbn-B-id' });
+    await testEnv.DB.prepare(
+      `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('${hexfp('rbn-A')}', NULL, 'rb-null', '2000-01-01T00:00:00.000Z')`,
+    ).run();
+
+    const rejected = await adminMachines(
+      reqJson({ machine_id: 'rb-null', cert_fp_sha256: hexfp('rbn-A') }),
+      testEnv,
+      machine('am-admin', true),
+    );
+    expect(rejected.status).toBe(422);
+    expect(((await rejected.json()) as { error: string }).error).toBe('cert_id_required_for_new_fp');
+    expect((await row('rb-null'))?.cert_fp_sha256).toBe(hexfp('rbn-B'));
+    expect(await retired(hexfp('rbn-A'))).not.toBeNull();
+
+    const accepted = await adminMachines(
+      reqJson({ machine_id: 'rb-null', cert_fp_sha256: hexfp('rbn-A'), cert_id_unknown: true }),
+      testEnv,
+      machine('am-admin', true),
+    );
+    expect(accepted.status).toBe(200); // positive control: explicit legacy import remains available
+    expect((await row('rb-null'))?.cert_fp_sha256).toBe(hexfp('rbn-A'));
+    expect((await row('rb-null'))?.cert_id).toBeNull();
+    expect(await retired(hexfp('rbn-A'))).toBeNull();
   });
 
   it('a DELETE-404 settle STAMPS revoked (not released), so a later rollback cannot reinstate the dead cert', async () => {

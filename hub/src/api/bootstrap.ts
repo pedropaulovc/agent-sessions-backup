@@ -20,12 +20,14 @@ export const DEFAULT_COLLECTOR_CONFIG = {
   // under the decimal cap. Keep this number in lockstep with that collector constant — one source
   // of truth; when the collector's is exported into the shared config, reference it here.
   max_upload_bytes: 90_000_000,
-  // Per-store capture toggles. Absent store => collector uses its own default (on). These keys MUST be
-  // the collector's actual store names, or a fleet override silently no-ops. Source of truth:
+  // Per-store capture toggles. This MUST NOT be named `stores`: Config.stores is the collector's map
+  // of store name -> filesystem root, and bootstrap is merged over that local config. Absent toggle =>
+  // collector uses its own default (on). These keys MUST be the collector's actual store names, or a
+  // fleet override silently no-ops. Source of truth:
   // collector/src/agent_collector/config.py — DEFAULT_STORES ('claude', 'codex') + WEBCAPTURE_STORES
   // ('chatgpt-web', 'claude-web', 'export-inbox'). Note the local Claude Code store key is 'claude'
   // (the harness dir ~/.claude), NOT 'claude-code'. fleet-endpoints.test.ts asserts this ⊆ that set.
-  stores: {
+  store_toggles: {
     claude: true,
     codex: true,
     'chatgpt-web': true,
@@ -50,7 +52,13 @@ export async function bootstrap(env: Env, identity: Identity): Promise<Response>
       // Shallow merge: operator override wins per top-level key, but schema_version is fixed
       // by the code that defined this payload's shape — an override can't forge a version the
       // hub isn't actually serving, or collectors would mis-parse a config they can't read.
-      merged = { ...merged, ...parsed, schema_version: COLLECTOR_CONFIG_SCHEMA_VERSION };
+      // `stores` is reserved for the collector's local name -> filesystem-root map. Never echo a stale
+      // or mistaken hub override under that key: merging it over Config would replace paths with booleans
+      // (or centrally overwrite machine-specific roots) before the collector can scan. Store enablement
+      // belongs under store_toggles; roots remain local-only.
+      const safeOverride = { ...parsed };
+      delete safeOverride.stores;
+      merged = { ...merged, ...safeOverride, schema_version: COLLECTOR_CONFIG_SCHEMA_VERSION };
     } catch {
       // A malformed override must not take down bootstrap for the whole fleet — fall back to
       // defaults and self-log for `wrangler tail`.

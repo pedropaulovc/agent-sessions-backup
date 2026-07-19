@@ -66,6 +66,19 @@ function validateCertFields(body: { cert_id?: string; cert_fp_sha256?: string })
   return null;
 }
 
+// Keep this contract in lockstep with infra/cf/enroll-cert.sh. Machine ids become a single URL path
+// segment on every file route, so accepting characters the collector percent-encodes (notably '/' or a
+// space) creates a row whose cert can heartbeat but whose uploads always fail machine_mismatch. The
+// helper also uses the id in SQL literals and filenames, hence the deliberately small shared charset.
+const MACHINE_ID_RE = /^[A-Za-z0-9._-]+$/;
+
+function validateMachineId(machineId: unknown): Response | null {
+  if (typeof machineId !== 'string' || machineId === '.' || machineId === '..' || !MACHINE_ID_RE.test(machineId)) {
+    return Response.json({ error: 'invalid_machine_id' }, { status: 422 });
+  }
+  return null;
+}
+
 export async function adminMachines(request: Request, env: Env, identity: Identity): Promise<Response> {
   if (identity.kind !== 'machine' || !identity.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
 
@@ -83,6 +96,11 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
 
   const invalidCert = validateCertFields(body);
   if (invalidCert) return invalidCert;
+
+  if (body.machine_id !== undefined) {
+    const invalidMachineId = validateMachineId(body.machine_id);
+    if (invalidMachineId) return invalidMachineId;
+  }
 
   // is_admin is a PRIVILEGE flag. A form serializing it as the string "false" is truthy, so the
   // `body.is_admin ? 1 : 0` below would grant admin — a privilege escalation by serialization bug.
@@ -158,18 +176,20 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     let reinstatingReserved = false;
     if (body.cert_fp_sha256) {
       const clashRows = await env.DB.prepare(
-        `SELECT machine_id, NULL AS claimed_at FROM machines WHERE (cert_fp_sha256 = ?1 OR prev_cert_fp_sha256 = ?1) AND machine_id != ?2
+        `SELECT machine_id, NULL AS claimed_at, NULL AS cert_id FROM machines WHERE (cert_fp_sha256 = ?1 OR prev_cert_fp_sha256 = ?1) AND machine_id != ?2
          UNION ALL
-         SELECT machine_id, claimed_at FROM retired_certs WHERE fingerprint = ?1 AND revoked_at IS NULL`,
+         SELECT machine_id, claimed_at, cert_id FROM retired_certs WHERE fingerprint = ?1 AND revoked_at IS NULL`,
       )
         .bind(body.cert_fp_sha256, body.machine_id)
-        .all<{ machine_id: string; claimed_at: string | null }>();
+        .all<{ machine_id: string; claimed_at: string | null; cert_id: string | null }>();
       for (const c of clashRows.results) {
         // Same-machine UNCLAIMED reservation → reinstatement candidate, not a clash. Anything else blocks:
         // any machines row (always another machine — the WHERE excludes this one), a cross-machine
-        // reservation, or a same-machine CLAIMED reservation (prune's async DELETE mid-flight).
+        // reservation, or a same-machine CLAIMED reservation (prune's async DELETE mid-flight). Only a
+        // NON-NULL reservation id is a trusted reinstatement source: a legacy NULL-id reservation may
+        // still pass through, but the new-fingerprint guard below then requires cert_id_unknown:true.
         if (c.machine_id === body.machine_id && c.claimed_at === null) {
-          reinstatingReserved = true;
+          reinstatingReserved = c.cert_id !== null;
           continue;
         }
         return Response.json({ error: 'fingerprint_in_use', machine_id: c.machine_id }, { status: 409 });
