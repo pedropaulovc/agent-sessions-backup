@@ -3,7 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { machineIdentity, type Identity } from '../src/auth/identity';
 import { bootstrap, COLLECTOR_CONFIG_SCHEMA_VERSION, DEFAULT_COLLECTOR_CONFIG } from '../src/api/bootstrap';
 import { renewCert, certFingerprint, settleRetired, revokeClientCert, pollRetired } from '../src/api/certs';
-import { adminMachines, heartbeat } from '../src/api/ops';
+import { adminMachines, heartbeat, listMachines } from '../src/api/ops';
 import { runDailyPrune } from '../src/cron/prune';
 import { route } from '../src/router';
 
@@ -741,6 +741,16 @@ describe('POST /api/v1/admin/machines', () => {
     expect(res.status).toBe(403);
   });
 
+  it('422s an admin upsert with no machine_id while the dedicated GET keeps returning the roster', async () => {
+    const res = await adminMachines(reqJson({ priority: 7 }), testEnv, machine('am-admin', true));
+    expect(res.status).toBe(422);
+    expect(((await res.json()) as { error: string }).error).toBe('invalid_machine_id');
+
+    const roster = await listMachines(testEnv); // positive control: reads do not use the POST no-op shape
+    expect(roster.status).toBe(200);
+    expect(Array.isArray(((await roster.json()) as { machines: unknown[] }).machines)).toBe(true);
+  });
+
   it('upserts a machine and returns the roster for an admin cert', async () => {
     const res = await adminMachines(
       reqJson({ machine_id: 'am-new', os: 'linux', cert_fp_sha256: hexfp('fp-am-new'), is_admin: true, priority: 50, cert_id_unknown: true }),
@@ -930,6 +940,113 @@ describe('POST /api/v1/admin/machines', () => {
     expect(((await res.json()) as { error: string }).error).toBe('concurrent_rotation');
     expect((await row('am-claimed'))?.cert_fp_sha256).toBe('cl-B'); // NOT reinstated onto the cert being revoked
     expect((await retired(hexfp('cl-A')))?.claimed_at).not.toBeNull(); // reservation still claimed; the drain proceeds
+  });
+
+  it('reservation appearing after the clash read blocks an existing-row swap atomically', async () => {
+    // The initial clash SELECT sees no reservation. Before the UPSERT runs, another machine queues the
+    // requested fingerprint. The write-time guard must reject even an UNCLAIMED cross-machine row; only
+    // this machine's own unclaimed rollback reservation is safe to consume.
+    await seedMachine('late-res-owner', { fp: 'late-owner-current', certId: 'late-owner-id' });
+    await seedMachine('late-res-target', { fp: 'late-target-current', certId: 'late-target-id' });
+    const incoming = hexfp('late-reserved');
+    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+    const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementationOnce(async (stmts) => {
+      await testEnv.DB.prepare(
+        `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at)
+         VALUES (?1, 'late-reserved-id', 'late-res-owner', '2000-01-01T00:00:00.000Z')`,
+      ).bind(incoming).run();
+      return realBatch(stmts);
+    });
+
+    const res = await adminMachines(
+      reqJson({ machine_id: 'late-res-target', cert_fp_sha256: incoming, cert_id_unknown: true }),
+      testEnv,
+      machine('am-admin', true),
+    );
+    spy.mockRestore();
+
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('concurrent_rotation');
+    expect((await row('late-res-target'))?.cert_fp_sha256).toBe('late-target-current');
+    expect((await retired(incoming))?.machine_id).toBe('late-res-owner');
+    expect(await retired('late-target-current')).toBeNull(); // failed swap displaced nothing
+  });
+
+  it('reservation appearing after the clash read blocks the fresh INSERT arm too', async () => {
+    // ON CONFLICT's WHERE does not run for a fresh row. The INSERT source therefore carries the same
+    // reservation guard, preventing a late cross-machine reservation from being installed as current.
+    const incoming = hexfp('late-insert-reserved');
+    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+    const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementationOnce(async (stmts) => {
+      await testEnv.DB.prepare(
+        `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at)
+         VALUES (?1, 'late-insert-id', 'late-insert-owner', '2000-01-01T00:00:00.000Z')`,
+      ).bind(incoming).run();
+      return realBatch(stmts);
+    });
+
+    const res = await adminMachines(
+      reqJson({ machine_id: 'late-insert-target', cert_fp_sha256: incoming, cert_id_unknown: true }),
+      testEnv,
+      machine('am-admin', true),
+    );
+    spy.mockRestore();
+
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('concurrent_rotation');
+    expect(await row('late-insert-target')).toBeNull();
+    expect((await retired(incoming))?.machine_id).toBe('late-insert-owner');
+  });
+
+  it('does not exempt an own unclaimed reservation when the fingerprint is already current', async () => {
+    // The same-machine exception is specifically for a change that reinstates and consumes a rollback
+    // reservation. On an unchanged-fingerprint edit there is no un-queue statement, so allowing the row
+    // would leave a current cert in the revocation queue.
+    const fp = hexfp('same-current-reserved');
+    await seedMachine('same-current-reserved', { fp, certId: 'same-current-id' });
+    await testEnv.DB.prepare(
+      `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at)
+       VALUES (?1, 'same-current-id', 'same-current-reserved', '2000-01-01T00:00:00.000Z')`,
+    ).bind(fp).run();
+
+    const res = await adminMachines(
+      reqJson({ machine_id: 'same-current-reserved', cert_fp_sha256: fp, priority: 3 }),
+      testEnv,
+      machine('am-admin', true),
+    );
+
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('concurrent_rotation');
+    expect((await row('same-current-reserved'))?.priority).toBe(100);
+    expect(await retired(fp)).not.toBeNull();
+  });
+
+  it('reinstatement 409s if its trusted reservation disappears before the atomic write', async () => {
+    // The pre-check uses this reservation's non-NULL id to waive cert_id_required_for_new_fp. If a racing
+    // actor consumes it before the batch, the swap must not install the fingerprint with a NULL cert_id.
+    const fp = hexfp('vanishing-reserved');
+    await seedMachine('vanishing-target', { fp: 'vanishing-current', certId: 'vanishing-current-id' });
+    await testEnv.DB.prepare(
+      `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at)
+       VALUES (?1, 'vanishing-id', 'vanishing-target', '2000-01-01T00:00:00.000Z')`,
+    ).bind(fp).run();
+    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+    const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementationOnce(async (stmts) => {
+      await testEnv.DB.prepare('DELETE FROM retired_certs WHERE fingerprint = ?1').bind(fp).run();
+      return realBatch(stmts);
+    });
+
+    const res = await adminMachines(
+      reqJson({ machine_id: 'vanishing-target', cert_fp_sha256: fp }),
+      testEnv,
+      machine('am-admin', true),
+    );
+    spy.mockRestore();
+
+    expect(res.status).toBe(409);
+    expect(((await res.json()) as { error: string }).error).toBe('concurrent_rotation');
+    expect((await row('vanishing-target'))?.cert_fp_sha256).toBe('vanishing-current');
+    expect((await row('vanishing-target'))?.cert_id).toBe('vanishing-current-id');
   });
 
   it('a CAS-losing admin swap queues nothing, even when the winner installed the same requested fp', async () => {
@@ -1664,6 +1781,39 @@ describe('daily prune (cert revoke)', () => {
     const q = await retired('rl-fp');
     expect(q?.revoked_at).toBeNull(); // DELETE rejected -> not revoked
     expect(q?.claimed_at).toBeNull(); // claim RELEASED -> reservation reinstatable
+  });
+
+  it('keeps the claim when settle gets a non-JSON 502 after sending DELETE', async () => {
+    // Once DELETE was sent, a gateway failure cannot prove whether Cloudflare accepted the async revoke.
+    // Treating this like success:false would release the reservation for an unsafe rollback.
+    await testEnv.DB.prepare(
+      "INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('amb-settle-fp', 'amb-settle-id', 'amb-settle-m', '2000-01-01T00:00:00.000Z')",
+    ).run();
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('bad gateway', { status: 502 })));
+
+    expect(await settleRetired(cfEnv, 'amb-settle-id')).toBe('unknown');
+    const q = await retired('amb-settle-fp');
+    expect(q?.revoked_at).toBeNull();
+    expect(q?.claimed_at).not.toBeNull(); // ambiguous result remains non-reinstatable
+  });
+
+  it('keeps the claim when poll sees active then DELETE returns a parsed 500 failure', async () => {
+    // Even a success:false envelope is not proof of rejection when the HTTP response is a 5xx: the
+    // operation may have crossed the asynchronous acceptance boundary before the server failed.
+    await testEnv.DB.prepare(
+      "INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('amb-poll-fp', 'amb-poll-id', 'amb-poll-m', '2000-01-01T00:00:00.000Z')",
+    ).run();
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'DELETE') {
+        return new Response(JSON.stringify({ success: false, errors: [{ code: 1000 }] }), { status: 500 });
+      }
+      return new Response(JSON.stringify({ success: true, result: { status: 'active' } }), { status: 200 });
+    }));
+
+    expect(await pollRetired(cfEnv, 'amb-poll-id')).toBe('failed');
+    const q = await retired('amb-poll-fp');
+    expect(q?.revoked_at).toBeNull();
+    expect(q?.claimed_at).not.toBeNull(); // ambiguous result remains non-reinstatable
   });
 
   it('leaves a not-yet-due grace window alone (no CA call)', async () => {

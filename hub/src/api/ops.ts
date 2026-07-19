@@ -97,10 +97,11 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
   const invalidCert = validateCertFields(body);
   if (invalidCert) return invalidCert;
 
-  if (body.machine_id !== undefined) {
-    const invalidMachineId = validateMachineId(body.machine_id);
-    if (invalidMachineId) return invalidMachineId;
-  }
+  // This POST is only an upsert. Fleet reads have their own GET /api/v1/machines route, so an absent
+  // machine_id is a malformed write rather than a roster request. Reject it alongside the other invalid
+  // ids so a misspelled field cannot return 200 while silently applying nothing.
+  const invalidMachineId = validateMachineId(body.machine_id);
+  if (invalidMachineId) return invalidMachineId;
 
   // is_admin is a PRIVILEGE flag. A form serializing it as the string "false" is truthy, so the
   // `body.is_admin ? 1 : 0` below would grant admin — a privilege escalation by serialization bug.
@@ -356,10 +357,12 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     // INSERTs run in the SAME db.batch, each guarded on the row being in exactly OUR post-swap state, so
     // a lost/interrupted retire can't strand a displaced cert and a CAS miss queues nothing.
     //
-    // The CAS also 409s if the reinstated fp sits CLAIMED in retired_certs (revoked_at NULL, claimed_at
-    // NOT NULL): every revoke path stamps claimed_at before its async CA DELETE (see certs.ts
-    // claimRetired), so a claimed reservation means a revoke is mid-flight — reinstating it as current
-    // would race the DELETE and lock the machine out. 409 instead; the admin re-reads after it settles.
+    // The write also re-checks ALL unrevoked reservations for the incoming fingerprint. The only safe
+    // exception is this machine's own UNCLAIMED rollback reservation, which the same batch consumes below.
+    // This belongs in both the INSERT and ON CONFLICT UPDATE arms: a reservation can appear after the
+    // earlier clash SELECT, and an INSERT ... VALUES would otherwise install it without evaluating the
+    // conflict arm's WHERE at all. A same-machine claimed row or any cross-machine row makes the write
+    // miss, preserving the reservation and the working current cert.
     const observed: RotationState = {
       cert_fp: existing?.cert_fp_sha256 ?? null,
       cert_id: existing?.cert_id ?? null,
@@ -368,14 +371,28 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
       revoke_at: existing?.cert_revoke_at ?? null,
     };
     const cas = rotationCas(observed, 12);
+    const safeReservation = fpChanged
+      ? `NOT EXISTS (SELECT 1 FROM retired_certs
+                       WHERE fingerprint = ?4 AND revoked_at IS NULL
+                         AND (machine_id != ?1 OR claimed_at IS NOT NULL))`
+      : `NOT EXISTS (SELECT 1 FROM retired_certs WHERE fingerprint = ?4 AND revoked_at IS NULL)`;
+    // If the pre-check's trusted reservation id is what exempted this request from cert_id_required,
+    // require that source to still exist at write time. Otherwise a concurrent un-queue could disappear
+    // between the read and swap, leaving the newly-current fingerprint with a NULL CA handle.
+    const trustedReservation = reinstatingReserved
+      ? `AND EXISTS (SELECT 1 FROM retired_certs
+                       WHERE fingerprint = ?4 AND machine_id = ?1 AND revoked_at IS NULL
+                         AND claimed_at IS NULL AND cert_id IS NOT NULL)`
+      : '';
     const swap = env.DB.prepare(
       `INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, key_protection, is_admin, priority, cert_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+       SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+        WHERE ${safeReservation} ${trustedReservation}
        ON CONFLICT (machine_id) DO UPDATE SET
          os = ?2, hostname = ?3, cert_fp_sha256 = ?4, key_protection = ?5, is_admin = ?6, priority = ?7,
          cert_id = ?8, prev_cert_fp_sha256 = ?9, prev_cert_id = ?10, cert_revoke_at = ?11
        WHERE ${cas.clause}
-         AND NOT EXISTS (SELECT 1 FROM retired_certs WHERE fingerprint = ?4 AND machine_id = ?1 AND revoked_at IS NULL AND claimed_at IS NOT NULL)`,
+         AND ${safeReservation} ${trustedReservation}`,
     ).bind(body.machine_id, os, hostname, certFp, keyProtection, isAdmin, priority, certId, prevFp, prevId, revokeAt, ...cas.binds);
 
     // The state OUR swap produces — each retire INSERT co-commits only if the row is EXACTLY this after

@@ -75,12 +75,13 @@ async function signClientCert(env: Env, csr: string, machineId: string): Promise
 // cert to 'pending_revocation' and only later to 'revoked'. During that window the old cert can
 // still pass mTLS, so a fingerprint is safe to reuse ONLY once the cert reports 'revoked' (or 404).
 type CertStatus = 'active' | 'pending_reactivation' | 'pending_revocation' | 'revoked';
-type RevokeResult = 'revoked' | 'pending_revocation' | 'failed';
+type RevokeResult = 'revoked' | 'pending_revocation' | 'failed' | 'unknown';
 
 /** Revoke (DELETE) a client cert at the managed CA. Returns the resulting status: 'revoked' if the CA
  * already reports it fully revoked (rare — revocation is async) OR the cert is already GONE (HTTP 404);
- * 'pending_revocation' if the revoke was accepted and is in flight; or 'failed' if the API rejected it while
- * the cert is still active. Throws propagate to the caller (all callers wrap in try/catch). */
+ * 'pending_revocation' if the revoke was accepted and is in flight; 'failed' only if the API definitively
+ * rejected it while the cert is still active; or 'unknown' when the response cannot prove whether the async
+ * revoke started. Throws propagate to the caller (all callers wrap in try/catch). */
 export async function revokeClientCert(env: Env, certId: string): Promise<RevokeResult> {
   const res = await fetch(
     `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/client_certificates/${certId}`,
@@ -95,7 +96,12 @@ export async function revokeClientCert(env: Env, certId: string): Promise<Revoke
   // cert no longer exists — locking the machine onto an unauthenticatable current cert. So 404 → 'revoked',
   // never 'failed'. (The poll path matches only the HTTP 404, not a body error code — mirror it exactly.)
   if (res.status === 404) return 'revoked';
-  const data = (await res.json().catch(() => ({}))) as { success?: boolean; result?: { status?: string } };
+  const data = (await res.json().catch(() => null)) as { success?: boolean; result?: { status?: string } } | null;
+  // A 5xx or an unparseable response is ambiguous: Cloudflare may have accepted the asynchronous DELETE
+  // before the response path failed. Keep that distinct from a parsed API rejection so callers retain the
+  // retired-row claim and cannot reinstate a cert that may already be pending_revocation. A parsed
+  // success:false on a non-5xx response is the positive proof that the API rejected the operation.
+  if (res.status >= 500 || data === null) return 'unknown';
   if (!data.success) return 'failed';
   return data.result?.status === 'revoked' ? 'revoked' : 'pending_revocation';
 }
@@ -243,8 +249,9 @@ async function claimRetired(env: Env, certId: string): Promise<boolean> {
   }
 }
 
-/** Release a claim (used when the revoke didn't fully complete) so the next prune re-attempts —
- * a held claim would otherwise skip the row forever. Never touches a revoked row. Never throws. */
+/** Release a claim only after the CA definitively rejected the DELETE without changing state, making
+ * the still-active cert safe to reinstate. Ambiguous failures keep their claim until it becomes stale and
+ * the next prune reclaims/re-polls it. Never touches a revoked row. Never throws. */
 async function releaseRetired(env: Env, certId: string): Promise<void> {
   try {
     await env.DB.prepare('UPDATE retired_certs SET claimed_at = NULL WHERE cert_id = ?1 AND revoked_at IS NULL')
@@ -258,8 +265,9 @@ async function releaseRetired(env: Env, certId: string): Promise<void> {
 /** Best-effort INITIATE revocation of a queued cert. CLAIMS the row before the CA DELETE (so an admin
  * un-queue can't reinstate it mid-revoke); a lost claim ('skipped') means another flow owns it — leave
  * it be. Revocation is async, so a successful DELETE usually returns 'pending_revocation': we stamp
- * revoked_at ONLY on a full 'revoked' and otherwise RELEASE the claim so the prune retries. NEVER
- * throws — a committed renewal/admin swap waits on this and must not 5xx on a cleanup hiccup. */
+ * revoked_at ONLY on a full 'revoked', release only a proven rejection, and keep ambiguous/in-flight
+ * claims for a later stale-claim retry. NEVER throws — a committed renewal/admin swap waits on this and
+ * must not 5xx on a cleanup hiccup. */
 export async function settleRetired(env: Env, certId: string | null): Promise<RevokeResult | 'skipped'> {
   if (!certId) return 'failed'; // unknown id — nothing to revoke; stays reserved
   if (!(await claimRetired(env, certId))) return 'skipped'; // already revoking / un-queued — don't touch the CA
@@ -284,7 +292,7 @@ export async function settleRetired(env: Env, certId: string | null): Promise<Re
     await releaseRetired(env, certId);
     return 'failed';
   }
-  return result; // pending_revocation — claim held, prune re-polls to revoked
+  return result; // pending_revocation / unknown — claim held, prune re-polls to revoked
 }
 
 /** Poll a reserved cert and advance it toward settled. CLAIMS the row first (same primitive as
@@ -317,7 +325,8 @@ export async function pollRetired(env: Env, certId: string): Promise<'revoked' |
       await releaseRetired(env, certId); // DELETE rejected, cert still active — safe to reinstate
       return 'failed';
     }
-    return 'pending'; // pending_revocation — CA is revoking, KEEP the claim
+    if (result === 'pending_revocation') return 'pending'; // CA is revoking, KEEP the claim
+    return 'failed'; // ambiguous response — KEEP the claim
   }
   // 'pending_revocation' (async revoke in flight) or 'unknown' (GET error) — KEEP the claim; the prune
   // re-claims and re-polls next run (staleness threshold), and the un-queue/rollback stay blocked.
