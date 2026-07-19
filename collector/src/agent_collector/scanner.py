@@ -52,9 +52,9 @@ _DIR_PROBE = "\x00"
 
 
 def path_matches(relpath: str, pattern: str) -> bool:
-    """Exclude match on a POSIX relpath. Superset of fnmatch so security excludes never
-    silently miss: matches the full path AND the basename, and treats a leading ``**/`` as
-    an optional prefix (so ``**/oauth*`` also catches a root-level ``oauth.json``).
+    """Exclude match on a POSIX relpath. Filename-only patterns match the basename at any
+    depth; patterns containing a slash match the full relative path. A leading ``**/`` is
+    optional, so ``**/oauth*`` also catches a root-level ``oauth.json``.
 
     Matching is CASE-INSENSITIVE (both sides lowercased, fnmatchcase to avoid Windows double
     normalization), so ``ID_RSA.PEM`` / ``AUTH.JSON`` are excluded by ``*.pem`` / ``auth.json``
@@ -62,13 +62,15 @@ def path_matches(relpath: str, pattern: str) -> bool:
     relpath = relpath.lower()
     pattern = pattern.lower()
     base = relpath.rsplit("/", 1)[-1]
-    candidates = {pattern}
     if pattern.startswith("**/"):
-        candidates.add(pattern[3:])
-    for pat in candidates:
-        if fnmatch.fnmatchcase(relpath, pat) or fnmatch.fnmatchcase(base, pat):
-            return True
-    return False
+        root_pattern = pattern[3:]
+        return (
+            fnmatch.fnmatchcase(relpath, pattern)
+            or fnmatch.fnmatchcase(relpath, root_pattern)
+            or fnmatch.fnmatchcase(base, root_pattern)
+        )
+    candidate = relpath if "/" in pattern else base
+    return fnmatch.fnmatchcase(candidate, pattern)
 
 
 def first_matching_pattern(relpath: str, patterns: list[str]) -> str | None:

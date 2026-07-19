@@ -19,10 +19,23 @@ def _tree(root):
 
 def test_path_matches_security_globs():
     # basename anchored even when nested
-    assert path_matches("projects/x/.credentials.json", ".credentials.json")
-    # **/oauth* also catches a root-level file (leading **/ optional)
+    assert path_matches("projects/x/.credentials.json", "*.credentials.json*")
+    assert path_matches("projects/x/.credentials.json.bak", "*.credentials.json*")
+    assert path_matches("..credentials.json.swp", "*.credentials.json*")
+    assert path_matches(".#.credentials.json", "*.credentials.json*")
+    assert path_matches("#.credentials.json#", "*.credentials.json*")
+    assert path_matches(".auth.json.swp", "*auth.json*")
+    assert path_matches(".#auth.json", "*auth.json*")
+    assert path_matches("#auth.json#", "*auth.json*")
+    assert not path_matches("projects/auth.json-migration/session.jsonl", "*auth.json*")
+    assert not path_matches("auth.json-tests/keep.jsonl", "*auth.json*")
+    assert path_matches("cred-profiles/gmail.json", "**/cred-profiles/**")
+    assert path_matches("nested/cred-profiles/vezza.json.bak", "**/cred-profiles/**")
+    # **/oauth* also catches root-level files and directory probes (leading **/ optional)
     assert path_matches("oauth.json", "**/oauth*")
     assert path_matches("a/b/oauth-token", "**/oauth*")
+    assert path_matches("oauth_tokens/\0", "**/oauth*")
+    assert path_matches("a/oauth_tokens/\0", "**/oauth*")
     # extensions anywhere in the tree
     assert path_matches("a/b/private.key", "*.key")
     assert path_matches("deep/dir/id_rsa.pem", "*.pem")
@@ -30,7 +43,8 @@ def test_path_matches_security_globs():
     assert path_matches("db.sqlite-wal", "*.sqlite-wal")
     assert not path_matches("db.sqlite", "*.sqlite-wal")
     # directory globs
-    assert path_matches("cache/blob/x", "cache/**")
+    assert path_matches("cache/blob/x", "**/cache/**")
+    assert path_matches("plugins/cache/pkg/file", "**/cache/**")
     assert path_matches("projects/a/b/backups/old.jsonl", "projects/**/backups/**")
 
 
@@ -43,9 +57,25 @@ def test_scan_includes_and_excludes_with_nested_subagents(tmp_path):
     (subdir / "agent-22222222-2222-2222-2222-222222222222.jsonl").write_text("{}")
     # things that must be excluded
     (root / ".credentials.json").write_text("secret")
+    (root / ".credentials.json.bak").write_text("secret backup")
+    (root / "..credentials.json.swp").write_text("editor swap")
+    (root / ".#auth.json").write_text("editor lock")
+    profiles = root / "cred-profiles"
+    profiles.mkdir()
+    (profiles / "gmail.json").write_text("oauth")
+    (profiles / "vezza.json.bak").write_text("oauth backup")
     (root / "cache").mkdir()
     (root / "cache" / "blob").write_text("x")
+    nested_cache = root / "plugins" / "cache" / "package"
+    nested_cache.mkdir(parents=True)
+    (nested_cache / "metadata.json").write_text("x")
     (root / "oauth_state.json").write_text("token")
+    oauth_tokens = root / "oauth_tokens"
+    oauth_tokens.mkdir()
+    (oauth_tokens / "token.json").write_text("token")
+    nested_oauth_tokens = root / "nested" / "oauth_tokens"
+    nested_oauth_tokens.mkdir(parents=True)
+    (nested_oauth_tokens / "token.json").write_text("token")
     (root / "id.pem").write_text("key")
     (root / "shell-snapshots").mkdir()
     (root / "shell-snapshots" / "snap.sh").write_text("x")
@@ -59,8 +89,16 @@ def test_scan_includes_and_excludes_with_nested_subagents(tmp_path):
     assert "projects/slug/11111111-1111-1111-1111-111111111111.jsonl" in found
     assert "projects/slug/subagents/agent-22222222-2222-2222-2222-222222222222.jsonl" in found
     assert ".credentials.json" not in found
+    assert ".credentials.json.bak" not in found
+    assert "..credentials.json.swp" not in found
+    assert ".#auth.json" not in found
+    assert "cred-profiles/gmail.json" not in found
+    assert "cred-profiles/vezza.json.bak" not in found
     assert "cache/blob" not in found
+    assert "plugins/cache/package/metadata.json" not in found
     assert "oauth_state.json" not in found
+    assert "oauth_tokens/token.json" not in found
+    assert "nested/oauth_tokens/token.json" not in found
     assert "id.pem" not in found
     assert "shell-snapshots/snap.sh" not in found
 
@@ -171,6 +209,10 @@ def test_uppercase_credential_files_excluded(tmp_path):
     root = tmp_path / ".claude"
     root.mkdir()
     (root / "AUTH.JSON").write_text("secret")
+    (root / "AUTH.JSON.BAK").write_text("secret backup")
+    profiles = root / "CRED-PROFILES"
+    profiles.mkdir()
+    (profiles / "Work.JSON").write_text("oauth")
     (root / "ID_RSA.PEM").write_text("key")
     (root / "OAuth-Token.txt").write_text("token")
     (root / "keep.jsonl").write_text("{}")
