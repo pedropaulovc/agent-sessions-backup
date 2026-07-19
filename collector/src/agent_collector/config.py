@@ -22,8 +22,8 @@ from .transport import normalize_thumbprint
 DEFAULT_EXCLUDES: list[str] = [
     # Credential stores are frequently rewritten through backup/temp siblings. Match the
     # whole filename family, not only the live filename, and prune Claude's profile store.
-    ".credentials.json*",
-    "auth.json*",
+    "*.credentials.json*",
+    "*auth.json*",
     "**/cred-profiles/**",
     "**/oauth*",
     "*.key",

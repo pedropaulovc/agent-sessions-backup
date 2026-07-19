@@ -19,8 +19,14 @@ def _tree(root):
 
 def test_path_matches_security_globs():
     # basename anchored even when nested
-    assert path_matches("projects/x/.credentials.json", ".credentials.json*")
-    assert path_matches("projects/x/.credentials.json.bak", ".credentials.json*")
+    assert path_matches("projects/x/.credentials.json", "*.credentials.json*")
+    assert path_matches("projects/x/.credentials.json.bak", "*.credentials.json*")
+    assert path_matches("..credentials.json.swp", "*.credentials.json*")
+    assert path_matches(".#.credentials.json", "*.credentials.json*")
+    assert path_matches("#.credentials.json#", "*.credentials.json*")
+    assert path_matches(".auth.json.swp", "*auth.json*")
+    assert path_matches(".#auth.json", "*auth.json*")
+    assert path_matches("#auth.json#", "*auth.json*")
     assert path_matches("cred-profiles/gmail.json", "**/cred-profiles/**")
     assert path_matches("nested/cred-profiles/vezza.json.bak", "**/cred-profiles/**")
     # **/oauth* also catches a root-level file (leading **/ optional)
@@ -48,6 +54,8 @@ def test_scan_includes_and_excludes_with_nested_subagents(tmp_path):
     # things that must be excluded
     (root / ".credentials.json").write_text("secret")
     (root / ".credentials.json.bak").write_text("secret backup")
+    (root / "..credentials.json.swp").write_text("editor swap")
+    (root / ".#auth.json").write_text("editor lock")
     profiles = root / "cred-profiles"
     profiles.mkdir()
     (profiles / "gmail.json").write_text("oauth")
@@ -72,6 +80,8 @@ def test_scan_includes_and_excludes_with_nested_subagents(tmp_path):
     assert "projects/slug/subagents/agent-22222222-2222-2222-2222-222222222222.jsonl" in found
     assert ".credentials.json" not in found
     assert ".credentials.json.bak" not in found
+    assert "..credentials.json.swp" not in found
+    assert ".#auth.json" not in found
     assert "cred-profiles/gmail.json" not in found
     assert "cred-profiles/vezza.json.bak" not in found
     assert "cache/blob" not in found
