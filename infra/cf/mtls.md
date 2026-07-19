@@ -259,7 +259,9 @@ pages on it — so a dead token becomes an email, not a slow-burning outage. Rot
 ### Deploy note — apply the D1 migration
 
 `hub/migrations/0005_cert_rotation.sql` adds the rotation columns (`cert_id`, `prev_cert_fp_sha256`,
-`prev_cert_id`, `cert_revoke_at`). Apply it to each remote D1 at deploy time:
+`prev_cert_id`, `cert_revoke_at`), and `0009_retired_certs_reservation_source.sql` records whether a
+retired row came from a prior machine slot or is cleanup for a never-delivered minted orphan. Apply
+all pending migrations to each remote D1 before deploying the Worker that reads the new column:
 
 ```
 cd hub && npx wrangler d1 migrations apply sessions-index --remote          # production

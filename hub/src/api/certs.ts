@@ -210,18 +210,29 @@ export function rotationCas(state: RotationState, start: number): { clause: stri
  * the WINNER's state, so our full-state guard misses and we queue nothing (never queuing the stale
  * current/prev we read while another rotation kept one of them live). Co-commits the reservation with
  * the displacement so the fingerprint is never momentarily in neither a machines slot nor the queue. */
-export function queueRetiredIfDisplaced(env: Env, fingerprint: string, certId: string | null, machineId: string, postSwap: RotationState) {
-  const cas = rotationCas(postSwap, 5);
+export type RetiredCertSource = 'prior_slot' | 'orphan_cleanup';
+
+export function queueRetiredIfDisplaced(
+  env: Env,
+  fingerprint: string,
+  certId: string | null,
+  machineId: string,
+  postSwap: RotationState,
+  source: RetiredCertSource,
+) {
+  const cas = rotationCas(postSwap, 6);
   return env.DB.prepare(
-    `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at)
-     SELECT ?1, ?2, ?3, ?4 WHERE EXISTS (SELECT 1 FROM machines WHERE machine_id = ?3 AND ${cas.clause})`,
-  ).bind(fingerprint, certId, machineId, new Date().toISOString(), ...cas.binds);
+    `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, reservation_source)
+     SELECT ?1, ?2, ?3, ?4, ?5 WHERE EXISTS (SELECT 1 FROM machines WHERE machine_id = ?3 AND ${cas.clause})`,
+  ).bind(fingerprint, certId, machineId, new Date().toISOString(), source, ...cas.binds);
 }
 
-/** Insert a displaced cert into the retired_certs queue, then settle it. Standalone (not batched) —
- * used by admin swaps, where the displacement already committed. */
-export async function retireCert(env: Env, fingerprint: string, certId: string | null, machineId: string): Promise<void> {
-  await env.DB.prepare('INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES (?1, ?2, ?3, ?4)')
+/** Queue a just-minted certificate whose PEM was never returned, then try to settle it immediately. */
+async function queueOrphanCert(env: Env, fingerprint: string, certId: string | null, machineId: string): Promise<void> {
+  await env.DB.prepare(
+    `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, reservation_source)
+     VALUES (?1, ?2, ?3, ?4, 'orphan_cleanup')`,
+  )
     .bind(fingerprint, certId, machineId, new Date().toISOString())
     .run();
   await settleRetired(env, certId);
@@ -335,7 +346,7 @@ export async function pollRetired(env: Env, certId: string): Promise<'revoked' |
 
 /** Make a minted-but-unusable cert safe, NEVER throwing — so a cleanup failure can't change the
  * caller's already-decided response (a CAS-conflict 409, or a renew_write_failed 500). Shared by both
- * renew orphan sites. Primary path: queue it (retireCert) so the prune drives it to revoked. If the
+ * renew orphan sites. Primary path: queue it (queueOrphanCert) so the prune drives it to revoked. If the
  * queue INSERT throws (transient D1), fall back to a direct best-effort revoke so it isn't left live.
  * If BOTH fail the cert is leaked-but-loudly-logged (alertable) — strictly better than a silent
  * strand. */
@@ -356,7 +367,7 @@ async function revokeOrphanCert(env: Env, certId: string, machineId: string): Pr
 
 async function reclaimOrphan(env: Env, fingerprint: string, certId: string, machineId: string): Promise<void> {
   try {
-    await retireCert(env, fingerprint, certId, machineId);
+    await queueOrphanCert(env, fingerprint, certId, machineId);
     return;
   } catch (e) {
     console.log(JSON.stringify({ event: 'hub.certs.orphan_queue_failed', machine: machineId, cert_id: certId, error: String(e) }));
@@ -479,7 +490,9 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
       // The state OUR swap produces — the retire INSERT co-commits only if the row is exactly this.
       const postSwap: RotationState = { cert_fp: newFp, cert_id: signed.id, prev_fp: cur!.cert_fp_sha256, prev_id: cur!.cert_id, revoke_at: effectiveRevokeAt };
       const stmts = [swap];
-      if (displaced.fp) stmts.push(queueRetiredIfDisplaced(env, displaced.fp, displaced.id, identity.machineId, postSwap));
+      if (displaced.fp) {
+        stmts.push(queueRetiredIfDisplaced(env, displaced.fp, displaced.id, identity.machineId, postSwap, 'prior_slot'));
+      }
       const results = await env.DB.batch(stmts);
       changes = results[0]!.meta.changes ?? 0;
     } else if (isRecovery) {
@@ -490,7 +503,10 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
       // must NOT extend, or repeated prev-auth renews would keep an old cert alive forever. Keep the
       // ORIGINAL revoke_at. Guarded on the FULL observed state via rotationCas (so a concurrent id
       // attach to the orphaned successor can't be lost) PLUS the grace window still being open, so
-      // concurrent recoveries serialize. The displaced orphaned successor is queued (co-committed).
+      // concurrent recoveries serialize. is_admin = 0 is checked again in this write: a promotion that
+      // commits after the pre-sign read must make the recovery miss, or the grace holder would receive a
+      // fresh current certificate that immediately inherits admin power. The displaced orphaned successor
+      // is queued (co-committed) as orphan cleanup because its PEM was never returned to the collector.
       effectiveRevokeAt = cur?.cert_revoke_at ?? null;
       const observed: RotationState = { cert_fp: cur?.cert_fp_sha256 ?? null, cert_id: cur?.cert_id ?? null, prev_fp: cur?.prev_cert_fp_sha256 ?? null, prev_id: cur?.prev_cert_id ?? null, revoke_at: cur?.cert_revoke_at ?? null };
       const cas = rotationCas(observed, 4);
@@ -498,12 +514,15 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
         `UPDATE machines
            SET cert_fp_sha256 = ?2, cert_id = ?3
          WHERE machine_id = ?1 AND ${cas.clause}
+           AND is_admin = 0
            AND cert_revoke_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')`,
       ).bind(identity.machineId, newFp, signed.id, ...cas.binds);
       // Recovery replaces only the current slot; prev/revoke_at are unchanged from what we observed.
       const postSwap: RotationState = { cert_fp: newFp, cert_id: signed.id, prev_fp: cur?.prev_cert_fp_sha256 ?? null, prev_id: cur?.prev_cert_id ?? null, revoke_at: cur?.cert_revoke_at ?? null };
       const stmts = [swap];
-      if (displaced.fp) stmts.push(queueRetiredIfDisplaced(env, displaced.fp, displaced.id, identity.machineId, postSwap));
+      if (displaced.fp) {
+        stmts.push(queueRetiredIfDisplaced(env, displaced.fp, displaced.id, identity.machineId, postSwap, 'orphan_cleanup'));
+      }
       const results = await env.DB.batch(stmts);
       changes = results[0]!.meta.changes ?? 0;
     } else {

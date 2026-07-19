@@ -64,8 +64,8 @@ export async function runDailyPrune(env: Env): Promise<void> {
     // renew (new revoke_at) matches neither statement and survives untouched.
     const results = await env.DB.batch([
       env.DB.prepare(
-        `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at)
-         SELECT ?2, ?3, ?1, ?5
+        `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, reservation_source)
+         SELECT ?2, ?3, ?1, ?5, 'prior_slot'
           WHERE EXISTS (SELECT 1 FROM machines WHERE machine_id = ?1 AND prev_cert_fp_sha256 = ?2 AND cert_revoke_at = ?4)`,
       ).bind(row.machine_id, row.prev_cert_fp_sha256, row.prev_cert_id, row.cert_revoke_at, now),
       env.DB.prepare(

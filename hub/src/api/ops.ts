@@ -124,10 +124,25 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     // fingerprint back and lock the machine out of its freshly-installed cert. A request that DOES
     // carry cert fields owns the cert columns and CASes on the fingerprint it observed.
     const touchesCert = body.cert_fp_sha256 !== undefined || body.cert_id !== undefined;
+    const metadataUpdates = [
+      body.os !== undefined ? 'os = ?2' : null,
+      body.hostname !== undefined ? 'hostname = ?3' : null,
+      body.key_protection !== undefined ? 'key_protection = ?5' : null,
+      body.is_admin !== undefined ? 'is_admin = ?6' : null,
+      body.priority !== undefined ? 'priority = ?7' : null,
+    ].filter((assignment): assignment is string => assignment !== null);
+    const metadataOnlyUpdates = [
+      body.os !== undefined ? 'os = ?2' : null,
+      body.hostname !== undefined ? 'hostname = ?3' : null,
+      body.key_protection !== undefined ? 'key_protection = ?4' : null,
+      body.is_admin !== undefined ? 'is_admin = ?5' : null,
+      body.priority !== undefined ? 'priority = ?6' : null,
+    ].filter((assignment): assignment is string => assignment !== null);
 
     if (!touchesCert) {
-      // Metadata-only upsert: read-merge-write the NOT NULL non-cert columns, leaving every cert/
-      // rotation column exactly as it stands in the row (untouched on conflict, defaulted on insert).
+      // Metadata-only upsert: merged values seed a new row, but an existing row updates only fields the
+      // request explicitly supplied. That prevents two partial metadata edits from restoring each other's
+      // stale snapshots. Cert/rotation columns remain untouched on conflict and defaulted on insert.
       const existing = await env.DB.prepare(
         `SELECT os, hostname, key_protection, is_admin, priority FROM machines WHERE machine_id = ?1`,
       )
@@ -141,8 +156,9 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
       await env.DB.prepare(
         `INSERT INTO machines (machine_id, os, hostname, key_protection, is_admin, priority)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-         ON CONFLICT (machine_id) DO UPDATE SET
-           os = ?2, hostname = ?3, key_protection = ?4, is_admin = ?5, priority = ?6`,
+         ON CONFLICT (machine_id) DO UPDATE SET ${
+           metadataOnlyUpdates.length > 0 ? metadataOnlyUpdates.join(', ') : 'machine_id = machines.machine_id'
+         }`,
       )
         .bind(body.machine_id, os, hostname, keyProtection, isAdmin, priority)
         .run();
@@ -163,37 +179,39 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     // machineIdentity's unordered .first() authenticate as whichever row it returned. This subsumes
     // the plain current-fp UNIQUE collision into an explicit 409 (clearer than a constraint catch).
     //
-    // ONE exception in the retired_certs arm: THIS machine's OWN UNCLAIMED reservation (claimed_at IS NULL)
-    // is NOT a clash — it's a REINSTATEMENT candidate, handled by the guarded same-machine unqueue/CAS below.
+    // ONE exception in the retired_certs arm: THIS machine's OWN UNCLAIMED prior-slot reservation is NOT
+    // a clash — it's a REINSTATEMENT candidate, handled by the guarded same-machine unqueue/CAS below.
     // That is the rollback-recovery path: when a CA DELETE was rejected, pollRetired/settleRetired RELEASE
     // claimed_at (the cert is still active and safe to reinstate), and the admin request to that same
     // fingerprint IS the recovery — 409ing it here would strand the machine on a successor it may never have
     // installed. A same-machine CLAIMED reservation still 409s: claimed_at set means a prune's async CA
     // DELETE is mid-flight, so reinstating it would race that DELETE. Cross-machine reservations (claimed or
-    // not) still 409. We ALSO record `reinstatingReserved` from this SAME probe (one query, decided in JS):
+    // not) still 409. Minted-orphan cleanup rows always 409 even for the same machine: their PEM was never
+    // returned, so no collector can hold the matching key. We ALSO record `reinstatingPriorSlot` from this
+    // SAME probe (one query, decided in JS):
     // once the prev slot has been pruned away, `rollingBack` is false, so the reinstatement would otherwise
     // trip the round-21 "new fp needs a cert_id" guard below — but the unqueue path carries the reservation's
     // OWN trusted id, so it must be exempted.
-    let reinstatingReserved = false;
+    let reinstatingPriorSlot = false;
     if (body.cert_fp_sha256) {
       const clashRows = await env.DB.prepare(
-        `SELECT machine_id, NULL AS claimed_at, NULL AS cert_id FROM machines WHERE (cert_fp_sha256 = ?1 OR prev_cert_fp_sha256 = ?1) AND machine_id != ?2
+        `SELECT machine_id, NULL AS claimed_at, NULL AS cert_id, NULL AS reservation_source FROM machines WHERE (cert_fp_sha256 = ?1 OR prev_cert_fp_sha256 = ?1) AND machine_id != ?2
          UNION ALL
-         SELECT machine_id, claimed_at, cert_id FROM retired_certs WHERE fingerprint = ?1 AND revoked_at IS NULL`,
+         SELECT machine_id, claimed_at, cert_id, reservation_source FROM retired_certs WHERE fingerprint = ?1 AND revoked_at IS NULL`,
       )
         .bind(body.cert_fp_sha256, body.machine_id)
-        .all<{ machine_id: string; claimed_at: string | null; cert_id: string | null }>();
+        .all<{ machine_id: string; claimed_at: string | null; cert_id: string | null; reservation_source: string | null }>();
       for (const c of clashRows.results) {
-        // Same-machine UNCLAIMED reservation → reinstatement candidate, not a clash. Anything else blocks:
+        // Same-machine UNCLAIMED prior-slot reservation → reinstatement candidate, not a clash. Anything else blocks:
         // any machines row (always another machine — the WHERE excludes this one), a cross-machine
         // reservation, or a same-machine CLAIMED reservation (prune's async DELETE mid-flight). Only a
         // NON-NULL reservation id is a trusted reinstatement source: a legacy NULL-id reservation may
         // still pass through, but the new-fingerprint guard below then requires cert_id_unknown:true.
-        if (c.machine_id === body.machine_id && c.claimed_at === null) {
+        if (c.machine_id === body.machine_id && c.claimed_at === null && c.reservation_source === 'prior_slot') {
           // Multiple reservations for the same fingerprint are legal. Once ANY row supplies a trusted
           // CA id, a later legacy NULL-id row must not erase that fact; the carry query below likewise
           // selects any non-NULL id. Keep this accumulator monotonic and independent of SELECT row order.
-          reinstatingReserved ||= c.cert_id !== null;
+          reinstatingPriorSlot ||= c.cert_id !== null;
           continue;
         }
         return Response.json({ error: 'fingerprint_in_use', machine_id: c.machine_id }, { status: 409 });
@@ -315,7 +333,7 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     //   1. body-supplied cert_id — CA-verified in the attach block above;
     //   2. rollback to the in-grace prev — carries prev_cert_id (trusted D1 state), rollingBack === true;
     //   3. reinstating a same-machine RESERVATION — the unqueue path carries the reservation's own id
-    //      (trusted D1 state), reinstatingReserved === true. This is source 2 AFTER the prev slot was pruned
+    //      (trusted D1 state), reinstatingPriorSlot === true. This is source 2 AFTER the prev slot was pruned
     //      into retired_certs (so rollingBack is false but the reserved id is still recoverable).
     // Only a genuinely-new fp with NONE of those 422s (cert_id_required_for_new_fp) — UNLESS the
     // caller EXPLICITLY opts into a legacy/unknown-id import via cert_id_unknown:true. That escape hatch is
@@ -323,7 +341,7 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     // it deliberately stores NULL, logs a distinct greppable event, and leaves the displaced-cert cleanup
     // MANUAL. It is NOT the reinstatement path (which recovers a real id), so reinstatement never needs it.
     const installingNewFpWithoutId =
-      fpChanged && !rollingBack && !reinstatingReserved && certFp !== null && body.cert_id === undefined;
+      fpChanged && !rollingBack && !reinstatingPriorSlot && certFp !== null && body.cert_id === undefined;
     if (installingNewFpWithoutId && !body.cert_id_unknown) {
       return Response.json({ error: 'cert_id_required_for_new_fp', machine_id: body.machine_id }, { status: 422 });
     }
@@ -338,6 +356,10 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     const prevId = fpChanged ? null : existing?.prev_cert_id ?? null;
     const revokeAt = fpChanged ? null : existing?.cert_revoke_at ?? null;
 
+    // The rotation columns belong to this cert request, but metadata columns belong to whichever request
+    // explicitly supplied them. Omitting a metadata field must leave the database value untouched: a
+    // concurrent demotion/hostname edit may commit while this request is verifying a CA id, after the
+    // snapshot above was read. Writing the merged snapshot would silently restore that stale metadata.
     // On a fingerprint change, the swap displaces the old current out of its slot — and, unless we're
     // reinstating it as current (rollback), the old prev too. Each displaced cert must be reserved in
     // retired_certs so a still-CA-valid fingerprint can't be reclaimed by another machine. Reserve
@@ -374,23 +396,29 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     const safeReservation = fpChanged
       ? `NOT EXISTS (SELECT 1 FROM retired_certs
                        WHERE fingerprint = ?4 AND revoked_at IS NULL
-                         AND (machine_id != ?1 OR claimed_at IS NOT NULL))`
+                         AND (machine_id != ?1 OR claimed_at IS NOT NULL OR reservation_source != 'prior_slot'))`
       : `NOT EXISTS (SELECT 1 FROM retired_certs WHERE fingerprint = ?4 AND revoked_at IS NULL)`;
     // If the pre-check's trusted reservation id is what exempted this request from cert_id_required,
     // require that source to still exist at write time. Otherwise a concurrent un-queue could disappear
     // between the read and swap, leaving the newly-current fingerprint with a NULL CA handle.
-    const trustedReservation = reinstatingReserved
+    const trustedReservation = reinstatingPriorSlot
       ? `AND EXISTS (SELECT 1 FROM retired_certs
                        WHERE fingerprint = ?4 AND machine_id = ?1 AND revoked_at IS NULL
-                         AND claimed_at IS NULL AND cert_id IS NOT NULL)`
+                         AND claimed_at IS NULL AND cert_id IS NOT NULL AND reservation_source = 'prior_slot')`
       : '';
+    const updateAssignments = [
+      ...metadataUpdates,
+      'cert_fp_sha256 = ?4',
+      'cert_id = ?8',
+      'prev_cert_fp_sha256 = ?9',
+      'prev_cert_id = ?10',
+      'cert_revoke_at = ?11',
+    ].join(', ');
     const swap = env.DB.prepare(
       `INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, key_protection, is_admin, priority, cert_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at)
        SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
         WHERE ${safeReservation} ${trustedReservation}
-       ON CONFLICT (machine_id) DO UPDATE SET
-         os = ?2, hostname = ?3, cert_fp_sha256 = ?4, key_protection = ?5, is_admin = ?6, priority = ?7,
-         cert_id = ?8, prev_cert_fp_sha256 = ?9, prev_cert_id = ?10, cert_revoke_at = ?11
+       ON CONFLICT (machine_id) DO UPDATE SET ${updateAssignments}
        WHERE ${cas.clause}
          AND ${safeReservation} ${trustedReservation}`,
     ).bind(body.machine_id, os, hostname, certFp, keyProtection, isAdmin, priority, certId, prevFp, prevId, revokeAt, ...cas.binds);
@@ -408,7 +436,7 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
     // prune (that case already 409'd at the CAS above). A no-op when there is no such reservation.
     const stmts = [
       swap,
-      ...displaced.map((d) => queueRetiredIfDisplaced(env, d.fp, d.id, body.machine_id!, postSwap)),
+      ...displaced.map((d) => queueRetiredIfDisplaced(env, d.fp, d.id, body.machine_id!, postSwap, 'prior_slot')),
       ...(fpChanged && certFp
         ? [
             // Carry the reservation's cert_id onto the reinstated cert BEFORE deleting it. If a prune
@@ -420,15 +448,18 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
             env.DB.prepare(
               `UPDATE machines
                   SET cert_id = (SELECT cert_id FROM retired_certs
-                                   WHERE fingerprint = ?1 AND machine_id = ?2 AND revoked_at IS NULL AND claimed_at IS NULL AND cert_id IS NOT NULL
+                                   WHERE fingerprint = ?1 AND machine_id = ?2 AND revoked_at IS NULL AND claimed_at IS NULL
+                                     AND cert_id IS NOT NULL AND reservation_source = 'prior_slot'
                                    LIMIT 1)
                 WHERE machine_id = ?2 AND cert_fp_sha256 = ?1 AND cert_id IS NULL
                   AND EXISTS (SELECT 1 FROM retired_certs
-                                WHERE fingerprint = ?1 AND machine_id = ?2 AND revoked_at IS NULL AND claimed_at IS NULL AND cert_id IS NOT NULL)`,
+                                WHERE fingerprint = ?1 AND machine_id = ?2 AND revoked_at IS NULL AND claimed_at IS NULL
+                                  AND cert_id IS NOT NULL AND reservation_source = 'prior_slot')`,
             ).bind(certFp, body.machine_id),
             env.DB.prepare(
               `DELETE FROM retired_certs
                  WHERE fingerprint = ?1 AND machine_id = ?2 AND revoked_at IS NULL AND claimed_at IS NULL
+                   AND reservation_source = 'prior_slot'
                    AND EXISTS (SELECT 1 FROM machines WHERE machine_id = ?2 AND cert_fp_sha256 = ?1)`,
             ).bind(certFp, body.machine_id),
           ]

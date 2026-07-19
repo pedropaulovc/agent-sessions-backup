@@ -76,10 +76,10 @@ function row(id: string) {
 // still reserved (unclaimable); set = confirmed revoked at the CA.
 function retired(fingerprint: string) {
   return testEnv.DB.prepare(
-    'SELECT fingerprint, cert_id, machine_id, retired_at, revoked_at, claimed_at FROM retired_certs WHERE fingerprint = ?1',
+    'SELECT fingerprint, cert_id, machine_id, retired_at, revoked_at, claimed_at, reservation_source FROM retired_certs WHERE fingerprint = ?1',
   )
     .bind(fingerprint)
-    .first<{ fingerprint: string; cert_id: string | null; machine_id: string; retired_at: string; revoked_at: string | null; claimed_at: string | null }>();
+    .first<{ fingerprint: string; cert_id: string | null; machine_id: string; retired_at: string; revoked_at: string | null; claimed_at: string | null; reservation_source: 'prior_slot' | 'orphan_cleanup' }>();
 }
 
 afterEach(() => {
@@ -306,6 +306,7 @@ describe('POST /api/v1/certs/renew', () => {
     expect(r?.prev_cert_fp_sha256).toBe('lost-A'); // prev slot untouched
     expect(r?.cert_revoke_at).toBe('2999-01-01T00:00:00.000Z'); // original window kept
     expect(deletes).toContain('cert-B'); // displaced successor revoked
+    expect((await retired('lost-B'))?.reservation_source).toBe('orphan_cleanup'); // its PEM was never delivered
     expect(await machineIdentity(reqWithCert('lost-A'), prodEnv)).toMatchObject({ machineId: 'renew-lost' });
     expect(await machineIdentity(reqWithCert(fpC), prodEnv)).toMatchObject({ machineId: 'renew-lost' });
   });
@@ -340,6 +341,7 @@ describe('POST /api/v1/certs/renew', () => {
     const q = await retired('resv-A');
     expect(q?.cert_id).toBe('cert-resv-A');
     expect(q?.revoked_at).toBeNull(); // revoke failed -> reserved, drained by a later prune
+    expect(q?.reservation_source).toBe('prior_slot'); // collector may still hold this delivered cert
   });
 
   it('reclaims the signed cert when the D1 swap throws after signing (never an untracked live cert)', async () => {
@@ -360,6 +362,7 @@ describe('POST /api/v1/certs/renew', () => {
     expect(deletes).toContain('cert-dberr-B'); // signed cert revoke initiated, not left untracked
     // Async revoke returns pending -> the cert is queued so the prune drives it to revoked.
     expect((await retired(await certFingerprint(fakeCertPem('dberr-B'))))?.cert_id).toBe('cert-dberr-B');
+    expect((await retired(await certFingerprint(fakeCertPem('dberr-B'))))?.reservation_source).toBe('orphan_cleanup');
     expect((await row('renew-dberr'))?.cert_fp_sha256).toBe('dberr-A'); // row unchanged
   });
 
@@ -640,6 +643,55 @@ describe('POST /api/v1/certs/renew', () => {
     expect((await row('nonadm-grace'))?.cert_fp_sha256).toBe(await certFingerprint(fakeCertPem('ng-new')));
   });
 
+  it('a grace recovery racing an admin promotion 409s and its released minted orphan cannot be reinstated', async () => {
+    await seedMachine('promote-race', {
+      fp: 'promote-current',
+      certId: 'promote-current-id',
+      prevFp: 'promote-grace',
+      prevCertId: 'promote-grace-id',
+      revokeAt: '2999-01-01T00:00:00.000Z',
+    });
+    const mintedPem = fakeCertPem('promote-minted');
+    const mintedFp = await certFingerprint(mintedPem);
+    vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'POST') {
+        // Promotion lands after renew's pre-sign read (which saw is_admin=0) but before its recovery CAS.
+        await testEnv.DB.prepare("UPDATE machines SET is_admin = 1 WHERE machine_id = 'promote-race'").run();
+        return new Response(
+          JSON.stringify({ success: true, result: { id: 'promote-minted-id', certificate: mintedPem, expires_on: '2027-01-01T00:00:00Z' } }),
+          { status: 200 },
+        );
+      }
+      if (init?.method === 'DELETE') {
+        // Definitive rejection releases the claim, creating the exact tempting rollback state.
+        return new Response(JSON.stringify({ success: false }), { status: 200 });
+      }
+      throw new Error(`unexpected CA call ${init?.method}`);
+    }));
+
+    const renew = await renewCert(
+      reqJson({ csr: 'c' }),
+      cfEnv,
+      machine('promote-race', false, 'promote-grace', 'grace'),
+    );
+    expect(renew.status).toBe(409); // write-time is_admin=0 guard observed the promotion
+    expect(await row('promote-race')).toMatchObject({ cert_fp_sha256: 'promote-current', is_admin: 1 });
+    expect(await retired(mintedFp)).toMatchObject({
+      cert_id: 'promote-minted-id',
+      claimed_at: null,
+      reservation_source: 'orphan_cleanup',
+    });
+
+    const rollback = await adminMachines(
+      reqJson({ machine_id: 'promote-race', cert_fp_sha256: mintedFp }),
+      testEnv,
+      machine('am-admin', true),
+    );
+    expect(rollback.status).toBe(409);
+    expect(((await rollback.json()) as { error: string }).error).toBe('fingerprint_in_use');
+    expect((await row('promote-race'))?.cert_fp_sha256).toBe('promote-current');
+  });
+
   it('renew-vs-renew loser (current slot, fp already rotated to prev) 409s instead of recovering', async () => {
     // The loser authed on the CURRENT cert (certSlot 'current'); the winner committed before the loser's
     // pre-sign read, so the loser's fp is now the row's PREV with an open grace window. Without the certSlot
@@ -853,7 +905,7 @@ describe('POST /api/v1/admin/machines', () => {
     const realBatch = testEnv.DB.batch.bind(testEnv.DB);
     const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementationOnce(async (stmts) => {
       // The "prune" fires after the row read but before this swap commits.
-      await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('${hexfp('rb2-A')}', 'cert-rb2-A', 'am-race', '2000-01-01T00:00:00.000Z')`).run();
+      await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, reservation_source) VALUES ('${hexfp('rb2-A')}', 'cert-rb2-A', 'am-race', '2000-01-01T00:00:00.000Z', 'prior_slot')`).run();
       await testEnv.DB.prepare("UPDATE machines SET prev_cert_fp_sha256 = NULL, prev_cert_id = NULL, cert_revoke_at = NULL WHERE machine_id = 'am-race'").run();
       return realBatch(stmts);
     });
@@ -876,7 +928,7 @@ describe('POST /api/v1/admin/machines', () => {
     let batchLen = 0;
     const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementationOnce(async (stmts) => {
       batchLen = stmts.length;
-      await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('${hexfp('rb3-A')}', 'cert-rb3-A', 'am-unq', '2000-01-01T00:00:00.000Z')`).run();
+      await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, reservation_source) VALUES ('${hexfp('rb3-A')}', 'cert-rb3-A', 'am-unq', '2000-01-01T00:00:00.000Z', 'prior_slot')`).run();
       return realBatch(stmts);
     });
     const res = await adminMachines(reqJson({ machine_id: 'am-unq', cert_fp_sha256: hexfp('rb3-A') }), testEnv, machine('am-admin', true));
@@ -908,7 +960,7 @@ describe('POST /api/v1/admin/machines', () => {
     await seedMachine('am-carry', { fp: 'bk-B', certId: 'cert-bk-B' }); // current bk-B, no prev
     const realBatch = testEnv.DB.batch.bind(testEnv.DB);
     const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementationOnce(async (stmts) => {
-      await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('${hexfp('bk-A')}', 'cert-bk-A', 'am-carry', '2000-01-01T00:00:00.000Z')`).run();
+      await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, reservation_source) VALUES ('${hexfp('bk-A')}', 'cert-bk-A', 'am-carry', '2000-01-01T00:00:00.000Z', 'prior_slot')`).run();
       return realBatch(stmts);
     });
     const res = await adminMachines(reqJson({ machine_id: 'am-carry', cert_fp_sha256: hexfp('bk-A'), cert_id_unknown: true }), testEnv, machine('am-admin', true));
@@ -930,7 +982,7 @@ describe('POST /api/v1/admin/machines', () => {
     const realBatch = testEnv.DB.batch.bind(testEnv.DB);
     const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementationOnce(async (stmts) => {
       await testEnv.DB.prepare(
-        `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, claimed_at) VALUES ('${hexfp('cl-A')}', 'cert-cl-A', 'am-claimed', '2000-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z')`,
+        `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, claimed_at, reservation_source) VALUES ('${hexfp('cl-A')}', 'cert-cl-A', 'am-claimed', '2000-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z', 'prior_slot')`,
       ).run();
       return realBatch(stmts);
     });
@@ -1005,8 +1057,8 @@ describe('POST /api/v1/admin/machines', () => {
     const fp = hexfp('same-current-reserved');
     await seedMachine('same-current-reserved', { fp, certId: 'same-current-id' });
     await testEnv.DB.prepare(
-      `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at)
-       VALUES (?1, 'same-current-id', 'same-current-reserved', '2000-01-01T00:00:00.000Z')`,
+      `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, reservation_source)
+       VALUES (?1, 'same-current-id', 'same-current-reserved', '2000-01-01T00:00:00.000Z', 'prior_slot')`,
     ).bind(fp).run();
 
     const res = await adminMachines(
@@ -1027,8 +1079,8 @@ describe('POST /api/v1/admin/machines', () => {
     const fp = hexfp('vanishing-reserved');
     await seedMachine('vanishing-target', { fp: 'vanishing-current', certId: 'vanishing-current-id' });
     await testEnv.DB.prepare(
-      `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at)
-       VALUES (?1, 'vanishing-id', 'vanishing-target', '2000-01-01T00:00:00.000Z')`,
+      `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, reservation_source)
+       VALUES (?1, 'vanishing-id', 'vanishing-target', '2000-01-01T00:00:00.000Z', 'prior_slot')`,
     ).bind(fp).run();
     const realBatch = testEnv.DB.batch.bind(testEnv.DB);
     const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementationOnce(async (stmts) => {
@@ -1345,7 +1397,7 @@ describe('POST /api/v1/admin/machines', () => {
     // The admin rollback to that same fingerprint must NOT 409 on the generic clash — its own unclaimed
     // reservation is excluded, so it falls through to the same-machine unqueue/CAS which claims + removes it.
     await seedMachine('rbrec', { fp: hexfp('rbrec-B'), certId: 'rbrec-B-id', prevFp: hexfp('rbrec-A'), prevCertId: 'rbrec-A-id', revokeAt: '2999-01-01T00:00:00.000Z' });
-    await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('${hexfp('rbrec-A')}', 'rbrec-A-id', 'rbrec', '2000-01-01T00:00:00.000Z')`).run(); // unclaimed
+    await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, reservation_source) VALUES ('${hexfp('rbrec-A')}', 'rbrec-A-id', 'rbrec', '2000-01-01T00:00:00.000Z', 'prior_slot')`).run(); // unclaimed
     const res = await adminMachines(reqJson({ machine_id: 'rbrec', cert_fp_sha256: hexfp('rbrec-A') }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(200);
     const r = await row('rbrec');
@@ -1357,10 +1409,10 @@ describe('POST /api/v1/admin/machines', () => {
   it('recovers a PRUNED-prev cert via plain {machine_id, fp}: reservation id carried, no hatch needed', async () => {
     // The round-21/round-22 interaction: once the prev slot is pruned away, prev_cert_fp is NULL so
     // rollingBack is false — the recovery body {machine_id, fp} would trip cert_id_required_for_new_fp, and
-    // supplying the reservation's id would trip the cert_id clash. reinstatingReserved exempts it, and the
+    // supplying the reservation's id would trip the cert_id clash. reinstatingPriorSlot exempts it, and the
     // unqueue carries the reservation's OWN trusted id. No cert_id, no cert_id_unknown.
     await seedMachine('rbprune', { fp: hexfp('rbp-B'), certId: 'rbp-B-id' }); // current only; prev already pruned
-    await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('${hexfp('rbp-A')}', 'rbp-A-id', 'rbprune', '2000-01-01T00:00:00.000Z')`).run(); // released reservation
+    await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, reservation_source) VALUES ('${hexfp('rbp-A')}', 'rbp-A-id', 'rbprune', '2000-01-01T00:00:00.000Z', 'prior_slot')`).run(); // released reservation
     const res = await adminMachines(reqJson({ machine_id: 'rbprune', cert_fp_sha256: hexfp('rbp-A') }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(200); // NOT 422 cert_id_required_for_new_fp
     const r = await row('rbprune');
@@ -1381,7 +1433,7 @@ describe('POST /api/v1/admin/machines', () => {
     await seedMachine(machineId, { fp: hexfp(`rbmix-B-${suffix}`), certId: `rbmix-B-id-${suffix}` });
     for (const certId of ids) {
       await testEnv.DB.prepare(
-        `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES (?1, ?2, ?3, '2000-01-01T00:00:00.000Z')`,
+        `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, reservation_source) VALUES (?1, ?2, ?3, '2000-01-01T00:00:00.000Z', 'prior_slot')`,
       )
         .bind(oldFp, certId, machineId)
         .run();
@@ -1399,11 +1451,11 @@ describe('POST /api/v1/admin/machines', () => {
   });
 
   it('requires the explicit legacy hatch before reinstating a NULL-id reservation', async () => {
-    // A NULL-id reservation is not a trusted CA-handle source. Treating it as reinstatingReserved would
+    // A NULL-id reservation is not a trusted CA-handle source. Treating it as reinstatingPriorSlot would
     // bypass cert_id_required_for_new_fp even though the carry UPDATE has no id to carry.
     await seedMachine('rb-null', { fp: hexfp('rbn-B'), certId: 'rbn-B-id' });
     await testEnv.DB.prepare(
-      `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('${hexfp('rbn-A')}', NULL, 'rb-null', '2000-01-01T00:00:00.000Z')`,
+      `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, reservation_source) VALUES ('${hexfp('rbn-A')}', NULL, 'rb-null', '2000-01-01T00:00:00.000Z', 'prior_slot')`,
     ).run();
 
     const rejected = await adminMachines(
@@ -1434,7 +1486,7 @@ describe('POST /api/v1/admin/machines', () => {
     // mapping in revokeClientCert and this test fails: settle returns 'failed', releases, and the rollback
     // reinstates the dead fp.)
     await seedMachine('del404', { fp: hexfp('d404-B'), certId: 'd404-B-id' }); // current; prev already pruned
-    await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('${hexfp('d404-A')}', 'd404-A-id', 'del404', '2000-01-01T00:00:00.000Z')`).run();
+    await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, reservation_source) VALUES ('${hexfp('d404-A')}', 'd404-A-id', 'del404', '2000-01-01T00:00:00.000Z', 'prior_slot')`).run();
     vi.stubGlobal('fetch', vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
       if (init?.method === 'DELETE') return new Response(JSON.stringify({ success: false, errors: [{ code: 1002 }] }), { status: 404 });
       throw new Error('unexpected non-DELETE fetch');
@@ -1444,7 +1496,7 @@ describe('POST /api/v1/admin/machines', () => {
     expect((await retired(hexfp('d404-A')))?.revoked_at).not.toBeNull(); // stamped revoked, reservation settled
 
     // A subsequent same-machine rollback to that dead fp must NOT reinstate it: the reservation is revoked,
-    // so reinstatingReserved is false and the new-fp guard requires a cert_id.
+    // so reinstatingPriorSlot is false and the new-fp guard requires a cert_id.
     vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ success: true }), { status: 200 })));
     const res = await adminMachines(reqJson({ machine_id: 'del404', cert_fp_sha256: hexfp('d404-A') }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(422);
@@ -1454,7 +1506,7 @@ describe('POST /api/v1/admin/machines', () => {
 
   it('a CLAIMED same-machine reservation still 409s (prune mid-revoke; reinstating would race the DELETE)', async () => {
     await seedMachine('rbclaim', { fp: hexfp('rbc-B'), certId: 'rbc-B-id', prevFp: hexfp('rbc-A'), prevCertId: 'rbc-A-id', revokeAt: '2999-01-01T00:00:00.000Z' });
-    await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, claimed_at) VALUES ('${hexfp('rbc-A')}', 'rbc-A-id', 'rbclaim', '2000-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z')`).run();
+    await testEnv.DB.prepare(`INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at, claimed_at, reservation_source) VALUES ('${hexfp('rbc-A')}', 'rbc-A-id', 'rbclaim', '2000-01-01T00:00:00.000Z', '2000-01-01T00:00:00.000Z', 'prior_slot')`).run();
     const res = await adminMachines(reqJson({ machine_id: 'rbclaim', cert_fp_sha256: hexfp('rbc-A') }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(409);
     expect(((await res.json()) as { error: string }).error).toBe('fingerprint_in_use');
@@ -1611,6 +1663,37 @@ describe('POST /api/v1/admin/machines', () => {
     expect(r?.cert_fp_sha256).toBe('meta-B'); // renewed cert survived, NOT rolled back to meta-A
     expect(r?.cert_id).toBe('cid-B');
     expect(r?.prev_cert_fp_sha256).toBe('meta-A'); // renew's grace prev survived
+  });
+
+  it('a cert-id attach racing a demotion preserves the demotion while applying explicit metadata', async () => {
+    const pem = fakeCertPem('metadata-attach');
+    const fp = await certFingerprint(pem);
+    await seedMachine('cert-meta-race', { fp, isAdmin: true }); // helper-enrolled: id not attached yet
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      // The request already snapshotted is_admin=1/os=linux. Demotion and an OS correction land while
+      // it waits on CA verification; neither omitted field may be restored by the later cert write.
+      await testEnv.DB.prepare(
+        "UPDATE machines SET is_admin = 0, os = 'windows' WHERE machine_id = 'cert-meta-race'",
+      ).run();
+      return new Response(
+        JSON.stringify({ success: true, result: { certificate: pem, status: 'active' } }),
+        { status: 200 },
+      );
+    }));
+
+    const res = await adminMachines(
+      reqJson({ machine_id: 'cert-meta-race', cert_id: 'metadata-attach-id', priority: 3 }),
+      cfEnv,
+      machine('am-admin', true),
+    );
+    expect(res.status).toBe(200);
+    expect(await row('cert-meta-race')).toMatchObject({
+      cert_fp_sha256: fp,
+      cert_id: 'metadata-attach-id',
+      is_admin: 0,
+      os: 'windows',
+      priority: 3,
+    });
   });
 
   it('cert-field edit racing a renew 409s (CAS on the observed fp) instead of clobbering the renewed chain', async () => {
@@ -1987,6 +2070,13 @@ describe('grace-slot certs lose cross-machine admin power (CLASS C)', () => {
 });
 
 describe('settleRetired claim invariant (CLASS A)', () => {
+  it('defaults rows written by a pre-0009 Worker to conservative orphan-cleanup provenance', async () => {
+    await testEnv.DB.prepare(
+      "INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('legacy-writer-fp', 'legacy-writer-id', 'legacy-writer-m', '2000-01-01T00:00:00.000Z')",
+    ).run();
+    expect((await retired('legacy-writer-fp'))?.reservation_source).toBe('orphan_cleanup');
+  });
+
   it('claims the row before its CA revoke, so a concurrent un-queue no-ops (no mid-revoke lockout)', async () => {
     await testEnv.DB.prepare(
       "INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES ('sr-fp', 'sr-id', 'sr-m', '2000-01-01T00:00:00.000Z')",
