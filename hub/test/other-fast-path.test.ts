@@ -76,6 +76,59 @@ describe("known 'other' files bypass the parse queue", () => {
     expect(sendSpy).not.toHaveBeenCalled();
   });
 
+  it('refreshes the owner-tagged delivery when changed other bytes land under a fresh export reservation', async () => {
+    const machine = 'other-reserved-box';
+    const relpath = 'archives/reserved.7z';
+    const original = new TextEncoder().encode('reserved archive bytes v1');
+    const changed = new TextEncoder().encode('reserved archive bytes v2');
+    const changedHash = await sha256Hex(changed);
+    const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
+
+    const first = await put(machine, relpath, original);
+    const fileId = (await first.json<{ file_id: number }>()).file_id;
+    const owner = await testEnv.DB.prepare(
+      `INSERT INTO files (machine_id, store, relpath, r2_key, size, content_hash, harness, parse_state)
+       VALUES (?1, 'export-inbox', 'claude-export-reservation-owner.zip', ?2, 1, ?3, 'claude-web', 'pending')
+       RETURNING id`,
+    )
+      .bind(machine, `raw/${machine}/export-inbox/claude-export-reservation-owner.zip`, 'a'.repeat(64))
+      .first<{ id: number }>();
+    await testEnv.DB.prepare(
+      `UPDATE files SET parse_state = 'reserved',
+         reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = ?2,
+         reserved_reason = 'recover', reservation_generation = 41
+       WHERE id = ?1`,
+    )
+      .bind(fileId, owner!.id)
+      .run();
+    sendSpy.mockClear();
+
+    const updated = await put(machine, relpath, changed);
+    expect(updated.status).toBe(201);
+    expect(sendSpy).toHaveBeenCalledOnce();
+    expect(sendSpy).toHaveBeenCalledWith({
+      file_id: fileId,
+      r2_key: `raw/${machine}/${STORE}/${relpath}`,
+      reason: 'upload',
+      content_hash: changedHash,
+      reservation_owner: owner!.id,
+      reservation_generation: 41,
+    });
+    expect(
+      await testEnv.DB.prepare(
+        'SELECT parse_state, content_hash, reserved_by, reserved_reason, reservation_generation FROM files WHERE id = ?1',
+      )
+        .bind(fileId)
+        .first(),
+    ).toEqual({
+      parse_state: 'reserved',
+      content_hash: changedHash,
+      reserved_by: owner!.id,
+      reserved_reason: 'upload',
+      reservation_generation: 41,
+    });
+  });
+
   it('files/check heals a legacy non-terminal/stale-identity row directly to skipped without enqueueing', async () => {
     const machine = 'other-check-box';
     const relpath = 'archives/check.7z';

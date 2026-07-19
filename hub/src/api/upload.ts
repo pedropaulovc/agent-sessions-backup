@@ -309,12 +309,6 @@ export async function recordUploadedObject(
   // changes the row hash), so realigned is always false there and it enqueues our hash.
   const knownOther = det.kind === 'other';
   const realigned = opts.convergeObservedR2 === true && (await convergeMultipartRow(row!.id, r2Key, sha256, env, knownOther));
-  if (knownOther) {
-    console.log(
-      JSON.stringify({ event: 'access.upload', machine: machineId, key: r2Key, bytes: size, status: existed ? 'updated' : 'created' }),
-    );
-    return Response.json({ status: 'stored', file_id: row!.id }, { status: 201 });
-  }
   if (!realigned && preservedReservation && reservedUpload && row!.reserved_by !== null) {
     // The cleanup may already have selected an owner-tagged delivery for the old hash. Refresh it with the
     // current hash; parseOne waits for the owner to become terminal, so this is safe both before and after
@@ -327,7 +321,14 @@ export async function recordUploadedObject(
       reservation_owner: row!.reserved_by,
       reservation_generation: row!.reservation_generation,
     });
-  } else if (!realigned && !preservedReservation) {
+  }
+  if (knownOther) {
+    console.log(
+      JSON.stringify({ event: 'access.upload', machine: machineId, key: r2Key, bytes: size, status: existed ? 'updated' : 'created' }),
+    );
+    return Response.json({ status: 'stored', file_id: row!.id }, { status: 201 });
+  }
+  if (!realigned && !preservedReservation) {
     await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
   }
 
