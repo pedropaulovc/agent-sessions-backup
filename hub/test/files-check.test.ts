@@ -18,8 +18,8 @@ describe('POST /api/v1/files/check D1 variable cap', () => {
       .run();
 
     // Forty distinct, fully matching rows are enough to cross the 33-item boundary while keeping the
-    // fixture cheap. Cycling them to 500 entries exercises the endpoint's public request maximum; every
-    // requested triple still has a matching D1 row and checksum-verified R2 object.
+    // fixture cheap. Cycling them to 500 entries exercises the collector's production backfill batch;
+    // every requested triple still has a matching D1 row and checksum-verified R2 object.
     const fixtures = await Promise.all(
       Array.from({ length: 40 }, async (_, index) => {
         const store = 'cap-store';
