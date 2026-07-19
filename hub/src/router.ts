@@ -92,7 +92,7 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
     return sessionMatch[2] ? getSessionRaw(sessionId, request, env) : getSession(sessionId, env);
   }
   if (path === '/api/v1/machines' && method === 'GET') return listMachines(env);
-  if (path === '/api/v1/status' && method === 'GET') return status(env);
+  if (path === '/api/v1/status' && method === 'GET') return status(env, identity);
   if (path === '/api/v1/usage' && method === 'GET') return usage(url, env);
   // Admin routes require the CURRENT cert slot, not an in-grace previous one: a rotated-out admin cert
   // must not run fleet-wide writes/reindex during its 7-day grace window (identity.ts certSlot).

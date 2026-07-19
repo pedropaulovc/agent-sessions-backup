@@ -547,7 +547,39 @@ def test_doctor_requires_authenticated_hub_route(tmp_path, hub, tmp_env, monkeyp
     rc = run_mod.cmd_doctor(types.SimpleNamespace(config=str(path)))
     out = capsys.readouterr().out
     assert requested == [f"{hub.url}/api/v1/status"]
-    assert "[FAIL] authenticated hub API" in out and "-> 401" in out
+    assert "[FAIL] authenticated hub identity" in out and "-> 401" in out
+    assert rc == 1
+
+
+def test_doctor_rejects_certificate_mapped_to_another_machine(tmp_path, hub, tmp_env, monkeypatch, capsys):
+    path = config.config_path()
+    config.enroll(hub.url, dev=True, path=path, machine_id="m1")
+
+    def wrong_identity(_transport, _url):
+        return 200, json.dumps({
+            "identity": {"machine_id": "other-machine", "cert_slot": "current"},
+        })
+
+    monkeypatch.setattr(Transport, "get", wrong_identity)
+    rc = run_mod.cmd_doctor(types.SimpleNamespace(config=str(path)))
+    out = capsys.readouterr().out
+    assert "machine='other-machine'" in out
+    assert rc == 1
+
+
+def test_doctor_can_require_current_certificate_slot(tmp_path, hub, tmp_env, monkeypatch, capsys):
+    path = config.config_path()
+    config.enroll(hub.url, dev=True, path=path, machine_id="m1")
+
+    def grace_identity(_transport, _url):
+        return 200, json.dumps({
+            "identity": {"machine_id": "m1", "cert_slot": "grace"},
+        })
+
+    monkeypatch.setattr(Transport, "get", grace_identity)
+    rc = run_mod.cmd_doctor(types.SimpleNamespace(config=str(path), require_current_cert=True))
+    out = capsys.readouterr().out
+    assert "cert_slot='grace'" in out
     assert rc == 1
 
 

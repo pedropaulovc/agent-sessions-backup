@@ -10,6 +10,11 @@ The short-lived CLOUDFLARE_API_TOKEN must have these two permissions:
   - Account / D1 / Edit on Pedro's Cloudflare account
 
 No token is passed to a child process or written to disk.
+
+After an administrator has atomically registered an already-minted staged
+certificate, use --install-staged. That recovery mode performs no Cloudflare or
+D1 management calls and therefore does not require a Cloudflare API token. The
+collector's doctor and first upload prove that the hub registration matches.
 """
 
 from __future__ import annotations
@@ -384,6 +389,40 @@ def load_recovery(token: str, machine_id: str, out: Path) -> Material | None:
     return Material(private_key, cert, cert_id, fingerprint)
 
 
+def load_staged_recovery(machine_id: str, out: Path) -> Material | None:
+    """Validate staged key/cert/sidecar material without management-plane access."""
+    temp = out / f"{machine_id}.client.pem.new"
+    promoted = out / f"{machine_id}.client.pem"
+    sidecar = out / f"{machine_id}.client.pem.new.id"
+    key_path = out / f"{machine_id}.client.key"
+    if not temp.exists() and not sidecar.exists():
+        return None
+    cert_path = temp if temp.is_file() else promoted
+    if not (cert_path.is_file() and sidecar.is_file() and key_path.is_file()):
+        raise EnrollmentError("incomplete staged enrollment artifacts; preserve them and inspect the output directory")
+    private_key = load_private_key(key_path)
+    cert = validate_certificate(cert_path.read_bytes(), private_key, machine_id)
+    cert_id, saved_fp = parse_sidecar(sidecar)
+    fingerprint = cert_fingerprint(cert)
+    if not saved_fp:
+        raise EnrollmentError("staged recovery sidecar has no certificate fingerprint")
+    if saved_fp.lower() != fingerprint:
+        raise EnrollmentError("staged recovery sidecar fingerprint does not match the certificate")
+    return Material(private_key, cert, cert_id, fingerprint)
+
+
+def load_local_promoted(machine_id: str, out: Path) -> Material | None:
+    cert_path = out / f"{machine_id}.client.pem"
+    key_path = out / f"{machine_id}.client.key"
+    if not cert_path.exists() and not key_path.exists():
+        return None
+    if not (cert_path.is_file() and key_path.is_file()):
+        return None
+    private_key = load_private_key(key_path)
+    cert = validate_certificate(cert_path.read_bytes(), private_key, machine_id)
+    return Material(private_key, cert, "", cert_fingerprint(cert))
+
+
 def load_promoted(machine_id: str, out: Path, row: MachineRow) -> Material | None:
     cert_path = out / f"{machine_id}.client.pem"
     key_path = out / f"{machine_id}.client.key"
@@ -593,13 +632,13 @@ def revoke_unused(token: str, machine_id: str, out: Path, material: Material) ->
     print(f"[ok] revoked unused certificate {material.cert_id}")
 
 
-def promote(machine_id: str, out: Path) -> Path:
+def promote(machine_id: str, out: Path, *, preserve_sidecar: bool = False) -> Path:
     temp = out / f"{machine_id}.client.pem.new"
     cert = out / f"{machine_id}.client.pem"
     sidecar = out / f"{machine_id}.client.pem.new.id"
     if temp.is_file():
         os.replace(temp, cert)
-    if sidecar.exists():
+    if sidecar.exists() and not preserve_sidecar:
         sidecar.unlink()
     return cert
 
@@ -611,6 +650,7 @@ def configure_collector(
     cert_path: Path,
     material: Material,
     schedule: bool,
+    proof_sidecar: Path | None = None,
 ) -> None:
     key_path = out / f"{machine_id}.client.key"
     if os.name == "nt":
@@ -639,8 +679,10 @@ def configure_collector(
             check=True,
             env=child_env(),
         )
-    subprocess.run([collector, "doctor"], check=True, env=child_env())
+    subprocess.run([collector, "doctor", "--require-current-cert"], check=True, env=child_env())
     subprocess.run([collector, "run", "--once"], check=True, env=child_env())
+    if proof_sidecar:
+        proof_sidecar.unlink()
     if os.name == "nt":
         key_path.unlink()
         print(f"[ok] removed exportable Windows private key {key_path}")
@@ -653,10 +695,34 @@ def configure_collector(
 
 def resume_configured_collector(collector: str, schedule: bool) -> None:
     """Resume after Windows already imported the key and removed its exportable copy."""
-    subprocess.run([collector, "doctor"], check=True, env=child_env())
+    subprocess.run([collector, "doctor", "--require-current-cert"], check=True, env=child_env())
     subprocess.run([collector, "run", "--once"], check=True, env=child_env())
     if schedule:
         subprocess.run([collector, "install", "--interval", "15"], check=True, env=child_env())
+
+
+def install_staged_collector(collector: str, machine_id: str, out: Path, schedule: bool) -> None:
+    """Finish a hub-registered staged rotation without a management-plane credential."""
+    cert_path = out / f"{machine_id}.client.pem"
+    key_path = out / f"{machine_id}.client.key"
+    material = load_staged_recovery(machine_id, out)
+    if os.name == "nt" and cert_path.is_file() and not key_path.exists():
+        parse_certificate_identity(cert_path.read_bytes(), machine_id)
+        print("==> resuming an already imported Windows certificate")
+        resume_configured_collector(collector, schedule)
+        return
+
+    if material:
+        print(f"==> found staged certificate ({material.fingerprint})")
+        sidecar = out / f"{machine_id}.client.pem.new.id"
+        cert_path = promote(machine_id, out, preserve_sidecar=True)
+    else:
+        material = load_local_promoted(machine_id, out)
+        if not material:
+            raise EnrollmentError("no complete staged or promoted certificate material was found")
+        print(f"==> resuming promoted certificate ({material.fingerprint})")
+        sidecar = None
+    configure_collector(collector, machine_id, out, cert_path, material, schedule, sidecar)
 
 
 def is_imported_windows_enrollment(
@@ -684,13 +750,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", help="certificate working directory (default ~/.config/agent-collector)")
     parser.add_argument("--admin", action="store_true", help="enroll this machine as a hub admin")
     parser.add_argument("--no-schedule", action="store_true", help="do not install the 15-minute scheduler")
+    parser.add_argument(
+        "--install-staged",
+        action="store_true",
+        help="install a certificate already registered by a hub admin; requires no Cloudflare API token",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     token = os.environ.get("CLOUDFLARE_API_TOKEN")
-    if not token:
+    if not args.install_staged and not token:
         print(
             "CLOUDFLARE_API_TOKEN must contain a short-lived token with certificate and D1 Edit permissions",
             file=sys.stderr,
@@ -701,6 +772,11 @@ def main(argv: list[str] | None = None) -> int:
         machine_id = machine_id_for(collector, args.machine_id)
         out = output_dir_for(machine_id, args.out)
         print(f"==> enrolling {machine_id} from {out}")
+        if args.install_staged:
+            install_staged_collector(collector, machine_id, out, not args.no_schedule)
+            print(f"[ok] {machine_id} installed, uploaded once, and {'left unscheduled' if args.no_schedule else 'scheduled every 15 minutes'}")
+            return 0
+        assert token is not None
         preflight(token)
         is_admin = int(args.admin)
         material = load_recovery(token, machine_id, out)

@@ -115,6 +115,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_doctor = sub.add_parser("doctor", help="preflight checks")
     p_doctor.add_argument("--config", default=None)
+    p_doctor.add_argument(
+        "--require-current-cert",
+        action="store_true",
+        help="fail unless the hub maps this certificate to the configured machine's current slot",
+    )
     p_doctor.set_defaults(func=run_mod.cmd_doctor)
 
     p_web = sub.add_parser("webcapture", help="CDP-capture ChatGPT/Claude conversations into staging")

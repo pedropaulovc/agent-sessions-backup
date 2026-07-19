@@ -93,6 +93,11 @@ def _make_handler(hub: FakeHub):
                 return self._json(200, {"ok": True, "environment": "test"})
             if self.path == "/api/v1/status":
                 return self._json(200, {
+                    "identity": {
+                        "machine_id": self.headers.get("x-dev-machine"),
+                        "cert_fingerprint": None,
+                        "cert_slot": "current",
+                    },
                     "machines": [], "files": len(hub.files),
                     "keys": [list(k) for k in hub.files],
                 })

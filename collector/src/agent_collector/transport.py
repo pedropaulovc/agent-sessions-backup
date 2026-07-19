@@ -286,8 +286,8 @@ class Transport:
         return status, body
 
     def get(self, url: str) -> tuple[int, str]:
-        # Attach the auth strategy's curl args like put()/post_json() do. The only GET is
-        # doctor's /healthz probe against the API host, where the WAF rule blocks every
+        # Attach the auth strategy's curl args like put()/post_json() do. Doctor's authenticated
+        # identity probe hits the API host, where the WAF rule blocks every
         # uncertified request — a certless probe would report a correctly-enrolled production
         # collector as "hub unreachable". The client cert is not a secret to withhold from a
         # health check, and sending it makes doctor validate the real production auth path.

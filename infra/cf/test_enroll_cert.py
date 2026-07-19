@@ -244,6 +244,72 @@ class RegistrationTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_loads_staged_material_without_cloudflare_or_d1_access(self):
+        item = material()
+        with tempfile.TemporaryDirectory() as raw:
+            out = Path(raw)
+            (out / "test-windows.client.key").write_bytes(
+                item.private_key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.TraditionalOpenSSL,
+                    serialization.NoEncryption(),
+                )
+            )
+            (out / "test-windows.client.pem.new").write_bytes(
+                item.certificate.public_bytes(serialization.Encoding.PEM)
+            )
+            (out / "test-windows.client.pem.new.id").write_text(
+                f"cert_id={item.cert_id}\nfp={item.fingerprint}\n"
+            )
+            with (
+                mock.patch.object(enroll, "api_json") as api,
+                mock.patch.object(enroll, "d1_query") as d1,
+            ):
+                recovered = enroll.load_staged_recovery("test-windows", out)
+
+            api.assert_not_called()
+            d1.assert_not_called()
+            self.assertEqual(recovered.cert_id, item.cert_id)
+            self.assertEqual(recovered.fingerprint, item.fingerprint)
+
+    def test_staged_material_requires_sidecar_fingerprint(self):
+        item = material()
+        with tempfile.TemporaryDirectory() as raw:
+            out = Path(raw)
+            (out / "test-windows.client.key").write_bytes(
+                item.private_key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.TraditionalOpenSSL,
+                    serialization.NoEncryption(),
+                )
+            )
+            (out / "test-windows.client.pem.new").write_bytes(
+                item.certificate.public_bytes(serialization.Encoding.PEM)
+            )
+            (out / "test-windows.client.pem.new.id").write_text(f"cert_id={item.cert_id}\nfp=\n")
+            with self.assertRaisesRegex(enroll.EnrollmentError, "no certificate fingerprint"):
+                enroll.load_staged_recovery("test-windows", out)
+
+    def test_loads_promoted_stage_after_interrupted_proof(self):
+        item = material()
+        with tempfile.TemporaryDirectory() as raw:
+            out = Path(raw)
+            (out / "test-windows.client.key").write_bytes(
+                item.private_key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.TraditionalOpenSSL,
+                    serialization.NoEncryption(),
+                )
+            )
+            (out / "test-windows.client.pem").write_bytes(
+                item.certificate.public_bytes(serialization.Encoding.PEM)
+            )
+            (out / "test-windows.client.pem.new.id").write_text(
+                f"cert_id={item.cert_id}\nfp={item.fingerprint}\n"
+            )
+            recovered = enroll.load_staged_recovery("test-windows", out)
+            self.assertEqual(recovered.fingerprint, item.fingerprint)
+
     def test_loads_complete_stranded_material(self):
         item = material()
         with tempfile.TemporaryDirectory() as raw:
@@ -599,6 +665,37 @@ class CollectorFlowTests(unittest.TestCase):
             preflight.assert_called_once_with("token")
             resume.assert_called_once_with("collector.exe", False)
 
+    def test_main_installs_staged_material_without_management_token(self):
+        with tempfile.TemporaryDirectory() as raw:
+            out = Path(raw)
+            with (
+                mock.patch.dict(enroll.os.environ, {}, clear=True),
+                mock.patch.object(enroll, "ensure_collector", return_value="collector.exe"),
+                mock.patch.object(enroll, "machine_id_for", return_value="test-windows"),
+                mock.patch.object(enroll, "output_dir_for", return_value=out),
+                mock.patch.object(enroll, "install_staged_collector") as install,
+                mock.patch.object(enroll, "preflight") as preflight,
+            ):
+                self.assertEqual(enroll.main(["--install-staged", "--no-schedule"]), 0)
+
+            install.assert_called_once_with("collector.exe", "test-windows", out, False)
+            preflight.assert_not_called()
+
+    def test_install_staged_rejects_incomplete_new_stage_before_imported_resume(self):
+        with tempfile.TemporaryDirectory() as raw:
+            out = Path(raw)
+            (out / "test-windows.client.pem").write_bytes(
+                self.item.certificate.public_bytes(serialization.Encoding.PEM)
+            )
+            (out / "test-windows.client.pem.new").write_text("stranded stage")
+            with (
+                mock.patch.object(enroll.os, "name", "nt"),
+                mock.patch.object(enroll, "resume_configured_collector") as resume,
+            ):
+                with self.assertRaisesRegex(enroll.EnrollmentError, "incomplete staged"):
+                    enroll.install_staged_collector("collector.exe", "test-windows", out, True)
+            resume.assert_not_called()
+
     def test_doctor_failure_keeps_key_and_does_not_run_or_schedule(self):
         with tempfile.TemporaryDirectory() as raw:
             out, cert, key, _ = self._paths(raw)
@@ -622,6 +719,51 @@ class CollectorFlowTests(unittest.TestCase):
                     )
             self.assertEqual(commands, ["enroll", "doctor"])
             self.assertTrue(key.exists())
+
+    def test_staged_sidecar_survives_failed_proof_and_precedes_key_cleanup(self):
+        with tempfile.TemporaryDirectory() as raw:
+            out, cert, key, _ = self._paths(raw)
+            sidecar = out / "test-windows.client.pem.new.id"
+            sidecar.write_text(f"cert_id={self.item.cert_id}\nfp={self.item.fingerprint}\n")
+            calls = []
+
+            def fail_doctor(argv, **_kwargs):
+                calls.append(argv[1])
+                if argv[1] == "enroll":
+                    (out / "test-windows.client.pfx").unlink()
+                if argv[1] == "doctor":
+                    raise subprocess.CalledProcessError(1, argv)
+                return types.SimpleNamespace(returncode=0)
+
+            with (
+                mock.patch.object(enroll.os, "name", "nt"),
+                mock.patch.object(enroll.subprocess, "run", side_effect=fail_doctor),
+            ):
+                with self.assertRaises(subprocess.CalledProcessError):
+                    enroll.configure_collector(
+                        "collector.exe", "test-windows", out, cert, self.item, True, sidecar
+                    )
+            self.assertEqual(calls, ["enroll", "doctor"])
+            self.assertTrue(sidecar.exists())
+            self.assertTrue(key.exists())
+
+            sidecar_order = []
+
+            def succeed(argv, **_kwargs):
+                sidecar_order.append((argv[1], sidecar.exists(), key.exists()))
+                if argv[1] == "enroll":
+                    (out / "test-windows.client.pfx").unlink()
+                return types.SimpleNamespace(returncode=0)
+
+            with (
+                mock.patch.object(enroll.os, "name", "nt"),
+                mock.patch.object(enroll.subprocess, "run", side_effect=succeed),
+            ):
+                enroll.configure_collector(
+                    "collector.exe", "test-windows", out, cert, self.item, True, sidecar
+                )
+            self.assertEqual([entry[0] for entry in sidecar_order], ["enroll", "doctor", "run", "install"])
+            self.assertEqual(sidecar_order[-1][1:], (False, False))
 
     def test_live_upload_failure_keeps_key_and_does_not_schedule(self):
         with tempfile.TemporaryDirectory() as raw:
