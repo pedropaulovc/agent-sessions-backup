@@ -8,7 +8,28 @@ import { runDailyPrune } from '../src/cron/prune';
 import { route } from '../src/router';
 
 const testEnv = env as unknown as Env;
-const cfEnv = { ...testEnv, CF_ZONE_ID: 'zone-1', CF_CLIENT_CERT_TOKEN: 'cf-token' } as Env;
+const fakeBroker = {
+  idFromName: () => ({ toString: () => 'managed-ca' }),
+  get: () => ({
+    fetch: async (_input: RequestInfo | URL, init?: RequestInit) => {
+      const operation = JSON.parse(String(init?.body ?? '{}')) as { kind?: string; csr?: string; validity_days?: number; cert_id?: string };
+      const base = 'https://api.cloudflare.com/client/v4/zones/zone-1/client_certificates';
+      if (operation.kind === 'sign') {
+        return fetch(base, { method: 'POST', body: JSON.stringify({ csr: operation.csr, validity_days: operation.validity_days }) });
+      }
+      if (operation.kind === 'revoke') return fetch(`${base}/${operation.cert_id}`, { method: 'DELETE' });
+      return fetch(`${base}/${operation.cert_id}`);
+    },
+  }),
+} as unknown as DurableObjectNamespace;
+const cfEnv = {
+  ...testEnv,
+  CF_ZONE_ID: 'zone-1',
+  CF_OAUTH_CLIENT_ID: 'oauth-client',
+  CF_OAUTH_REDIRECT_URI: 'https://sessions.example/oauth/callback',
+  CF_OAUTH_SCOPES: 'ssl-and-certificates.write offline_access',
+  CF_OAUTH_BROKER: fakeBroker,
+} as Env;
 const prodEnv = { ...testEnv, ENVIRONMENT: 'production' } as Env;
 
 const machine = (machineId: string, isAdmin = false, certFp?: string, certSlot: 'current' | 'grace' = 'current'): Identity => ({
@@ -1300,7 +1321,7 @@ describe('POST /api/v1/admin/machines', () => {
   it('503s a GENUINELY-NEW cert_id attach when CF creds are unconfigured (fail closed, not stored)', async () => {
     // The pre-secret deploy window: an admin poke could slip an arbitrary/dead handle in unverified. We
     // can't reach the CA to verify, so we fail closed with 503 (the request may be valid — we just can't
-    // confirm it yet) rather than accept it. testEnv has no CF_ZONE_ID/CF_CLIENT_CERT_TOKEN.
+    // confirm it yet) rather than accept it. testEnv has no configured Cloudflare OAuth broker.
     await seedMachine('nc-attach', { fp: hexfp('nc-fp') }); // certId omitted -> NULL
     const res = await adminMachines(reqJson({ machine_id: 'nc-attach', cert_fp_sha256: hexfp('nc-fp'), cert_id: 'nc-new-id' }), testEnv, machine('am-admin', true));
     expect(res.status).toBe(503);
@@ -1491,7 +1512,7 @@ describe('POST /api/v1/admin/machines', () => {
       if (init?.method === 'DELETE') return new Response(JSON.stringify({ success: false, errors: [{ code: 1002 }] }), { status: 404 });
       throw new Error('unexpected non-DELETE fetch');
     }));
-    const result = await settleRetired(testEnv, 'd404-A-id');
+    const result = await settleRetired(cfEnv, 'd404-A-id');
     expect(result).toBe('revoked'); // 404 → settled, NOT 'failed'
     expect((await retired(hexfp('d404-A')))?.revoked_at).not.toBeNull(); // stamped revoked, reservation settled
 
@@ -2113,9 +2134,8 @@ describe('settleRetired claim invariant (CLASS A)', () => {
 });
 
 describe('CF API auth failures are distinctly alertable', () => {
-  // A 401/403 from the CF API means CF_CLIENT_CERT_TOKEN is expired/revoked/under-scoped — EVERY
-  // sign/revoke/poll fails until it's rotated. The hub emits hub.certs.cf_auth_failed (separate from the
-  // generic sign_failed / *_error logs) so infra/azure/alerts/cf-auth-failed.kql can page on a dead token.
+  // A 401/403 that remains after the broker's refresh means the OAuth grant was revoked or is
+  // under-scoped. The hub emits hub.certs.cf_auth_failed so the operator reauthorizes it.
   const authFail = (status: number) =>
     vi.fn(async () => new Response(JSON.stringify({ success: false, errors: [{ code: 10000, message: 'Authentication error' }] }), { status }));
 

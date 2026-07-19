@@ -8,7 +8,12 @@ export default defineConfig(async () => {
       cloudflareTest({
         wrangler: { configPath: './wrangler.jsonc' },
         miniflare: {
-          bindings: { ENVIRONMENT: 'development', SETUP_TOKEN: 'test-setup-token', TEST_MIGRATIONS: migrations },
+          bindings: {
+            ENVIRONMENT: 'development',
+            SETUP_TOKEN: 'test-setup-token',
+            TEST_MIGRATIONS: migrations,
+            CF_OAUTH_CLIENT_ID: 'test-oauth-client',
+          },
           // The local queue simulator auto-delivers PARSE_QUEUE messages on its own real-time
           // timer (wrangler.jsonc sets no max_batch_timeout, so it falls back to a short local
           // default — observed firing well under 1.5s), independent of and in addition to this

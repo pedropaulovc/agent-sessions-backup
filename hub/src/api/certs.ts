@@ -1,4 +1,5 @@
 import type { Identity } from '../auth/identity';
+import { cloudflareClientCertificateRequest, CloudflareOAuthUnavailable } from '../auth/cloudflare-oauth';
 import { hex } from './ops';
 
 // Grace window a rotated-out cert stays valid after its successor is minted, before the
@@ -25,11 +26,9 @@ interface SignedCert {
   expires_on: string;
 }
 
-// A 401/403 from the CF API is operationally distinct from a transient error or a per-cert rejection:
-// it means CF_CLIENT_CERT_TOKEN is expired, revoked, or under-scoped, so EVERY sign/revoke/poll will
-// keep failing until the token is rotated. Emit a dedicated event (separate from the generic
-// sign_failed / *_error logs) so an alert can page on a dead token instead of it hiding as a stream of
-// per-call failures that look like ordinary CF flakiness. Returns whether it was an auth failure.
+// The OAuth broker refreshes once before it lets a 401/403 escape. A remaining auth failure therefore
+// means the grant lacks the required scope or has been revoked; emit the existing alert event so the
+// operator is told to reauthorize the Cloudflare connection.
 function reportCfAuthFailure(res: Response, op: 'sign' | 'revoke' | 'status', certId: string | null): boolean {
   if (res.status !== 401 && res.status !== 403) return false;
   console.log(JSON.stringify({ event: 'hub.certs.cf_auth_failed', op, cert_id: certId, http_status: res.status }));
@@ -37,11 +36,7 @@ function reportCfAuthFailure(res: Response, op: 'sign' | 'revoke' | 'status', ce
 }
 
 async function signClientCert(env: Env, csr: string, machineId: string): Promise<SignedCert> {
-  const res = await fetch(`https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/client_certificates`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${env.CF_CLIENT_CERT_TOKEN}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ csr, validity_days: 365 }),
-  });
+  const res = await cloudflareClientCertificateRequest(env, { kind: 'sign', csr, validity_days: 365 });
   reportCfAuthFailure(res, 'sign', null);
   const data = (await res.json()) as { success?: boolean; result?: SignedCert; errors?: unknown };
   const r = data.result;
@@ -83,10 +78,7 @@ type RevokeResult = 'revoked' | 'pending_revocation' | 'failed' | 'unknown';
  * rejected it while the cert is still active; or 'unknown' when the response cannot prove whether the async
  * revoke started. Throws propagate to the caller (all callers wrap in try/catch). */
 export async function revokeClientCert(env: Env, certId: string): Promise<RevokeResult> {
-  const res = await fetch(
-    `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/client_certificates/${certId}`,
-    { method: 'DELETE', headers: { Authorization: `Bearer ${env.CF_CLIENT_CERT_TOKEN}` } },
-  );
+  const res = await cloudflareClientCertificateRequest(env, { kind: 'revoke', cert_id: certId });
   reportCfAuthFailure(res, 'revoke', certId);
   // A 404 means the cert is already GONE at the CA — SETTLED, identical to the poll path's terminal rule
   // (getClientCertStatus maps res.status === 404 → 'not_found', and pollRetired stampRevoked's it). DELETE
@@ -111,10 +103,7 @@ export async function revokeClientCert(env: Env, certId: string): Promise<Revoke
 async function getClientCertStatus(env: Env, certId: string): Promise<CertStatus | 'not_found' | 'unknown'> {
   let res: Response;
   try {
-    res = await fetch(
-      `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/client_certificates/${certId}`,
-      { headers: { Authorization: `Bearer ${env.CF_CLIENT_CERT_TOKEN}` } },
-    );
+    res = await cloudflareClientCertificateRequest(env, { kind: 'get', cert_id: certId });
   } catch (e) {
     console.log(JSON.stringify({ event: 'hub.certs.status_error', cert_id: certId, error: String(e) }));
     return 'unknown';
@@ -137,18 +126,15 @@ async function getClientCertStatus(env: Env, certId: string): Promise<CertStatus
  * a cert already pending_revocation/revoked must not be attached.
  *
  * result.certificate is the PEM: verified against the CF API docs + the sign-response shape (enroll-cert.py
- * has always read result.certificate from this same object). No token exists to probe the live GET until
- * CF_CLIENT_CERT_TOKEN is minted post-merge (USER ACTIONS) — live-verify on first post-merge use. Fails
- * closed regardless: an absent/renamed field → 'unknown' → 422 (attach refused), never a lockout or leak. */
-export async function getClientCertFingerprint(env: Env, certId: string): Promise<{ fp: string; status: CertStatus } | 'not_found' | 'unknown'> {
+ * reads the same field). The first OAuth authorization is proven with a live GET before any swap. An
+ * unavailable grant remains distinct from an invalid certificate so the admin route returns retryable 503. */
+export async function getClientCertFingerprint(env: Env, certId: string): Promise<{ fp: string; status: CertStatus } | 'not_found' | 'unknown' | 'unavailable'> {
   let res: Response;
   try {
-    res = await fetch(
-      `https://api.cloudflare.com/client/v4/zones/${env.CF_ZONE_ID}/client_certificates/${certId}`,
-      { headers: { Authorization: `Bearer ${env.CF_CLIENT_CERT_TOKEN}` } },
-    );
+    res = await cloudflareClientCertificateRequest(env, { kind: 'get', cert_id: certId });
   } catch (e) {
     console.log(JSON.stringify({ event: 'hub.certs.verify_error', cert_id: certId, error: String(e) }));
+    if (e instanceof CloudflareOAuthUnavailable) return 'unavailable';
     return 'unknown';
   }
   reportCfAuthFailure(res, 'status', certId);
@@ -160,6 +146,16 @@ export async function getClientCertFingerprint(env: Env, certId: string): Promis
   } catch {
     return 'unknown';
   }
+}
+
+/** Read-only admin positive control for a newly authorized Cloudflare OAuth grant. */
+export async function probeClientCert(env: Env, certId: string): Promise<Response> {
+  if (!certId) return Response.json({ error: 'missing_cert_id' }, { status: 400 });
+  const result = await getClientCertFingerprint(env, certId);
+  if (result === 'unavailable') return Response.json({ error: 'cloudflare_oauth_unavailable' }, { status: 503 });
+  if (result === 'not_found') return Response.json({ error: 'certificate_not_found', cert_id: certId }, { status: 404 });
+  if (result === 'unknown') return Response.json({ error: 'certificate_lookup_failed', cert_id: certId }, { status: 502 });
+  return Response.json({ ok: true, cert_id: certId, fingerprint: result.fp, status: result.status });
 }
 
 /** Stamp a queued cert as revoked (returns its fingerprint to the reusable pool; the row is kept as
@@ -385,8 +381,8 @@ async function reclaimOrphan(env: Env, fingerprint: string, certId: string, mach
  * prev, resetting the +7d clock: at most one generation is ever in grace, never a chain of three. */
 export async function renewCert(request: Request, env: Env, identity: Identity): Promise<Response> {
   if (identity.kind !== 'machine') return Response.json({ error: 'unauthorized' }, { status: 401 });
-  if (!env.CF_ZONE_ID || !env.CF_CLIENT_CERT_TOKEN) {
-    // The renewal secret isn't provisioned yet — genuinely can't mint a cert. 503 so the
+  if (!env.CF_ZONE_ID || !env.CF_OAUTH_BROKER || !env.CF_OAUTH_CLIENT_ID || !env.CF_OAUTH_REDIRECT_URI) {
+    // The OAuth connection isn't configured yet — genuinely can't mint a cert. 503 so the
     // collector keeps its current cert and retries later instead of treating this as fatal.
     console.log(JSON.stringify({ event: 'hub.certs.renew_unconfigured', machine: identity.machineId }));
     return Response.json({ error: 'cert_renewal_unavailable' }, { status: 503 });
@@ -426,6 +422,10 @@ export async function renewCert(request: Request, env: Env, identity: Identity):
   try {
     signed = await signClientCert(env, body.csr, identity.machineId);
   } catch (e) {
+    if (e instanceof CloudflareOAuthUnavailable) {
+      console.log(JSON.stringify({ event: 'hub.certs.renew_unavailable', machine: identity.machineId, reason: e.reason }));
+      return Response.json({ error: 'cert_renewal_unavailable', reason: e.reason }, { status: 503 });
+    }
     console.log(JSON.stringify({ event: 'hub.certs.sign_failed', machine: identity.machineId, error: String(e) }));
     return Response.json({ error: 'cf_sign_failed' }, { status: 502 });
   }

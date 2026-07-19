@@ -3,6 +3,8 @@ import { runWatchdog } from './cron/watchdog';
 import { consumeParseBatch } from './ingest/consumer';
 import { route } from './router';
 
+export { CloudflareOAuthBroker } from './auth/cloudflare-oauth';
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     return route(request, env, ctx);

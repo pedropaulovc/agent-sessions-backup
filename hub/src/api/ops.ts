@@ -309,7 +309,7 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
       // (not 422): the request may be perfectly valid — the deploy state just can't verify it yet. In this
       // same window renew can't mint either, so no legitimate cert_id attach arises from the fleet; only a
       // raw admin poke can, and that's precisely what must fail closed.
-      if (!env.CF_ZONE_ID || !env.CF_CLIENT_CERT_TOKEN) {
+      if (!env.CF_ZONE_ID || !env.CF_OAUTH_BROKER || !env.CF_OAUTH_CLIENT_ID || !env.CF_OAUTH_REDIRECT_URI) {
         console.log(JSON.stringify({ event: 'hub.admin.machines.cert_id_unverifiable', machine: body.machine_id, cert_id: body.cert_id }));
         return Response.json({ error: 'cert_id_verification_unavailable', cert_id: body.cert_id }, { status: 503 });
       }
@@ -317,6 +317,10 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
       // fp-match whose CA status is already pending_revocation/revoked → 422 cert_id_not_active (installing
       // a machine on a dying cert).
       const ca = await getClientCertFingerprint(env, body.cert_id);
+      if (ca === 'unavailable') {
+        console.log(JSON.stringify({ event: 'hub.admin.machines.cert_id_unverifiable', machine: body.machine_id, cert_id: body.cert_id }));
+        return Response.json({ error: 'cert_id_verification_unavailable', cert_id: body.cert_id }, { status: 503 });
+      }
       if (ca === 'not_found' || ca === 'unknown' || ca.fp !== certFp) {
         console.log(JSON.stringify({ event: 'hub.admin.machines.cert_id_unverified', machine: body.machine_id, cert_id: body.cert_id, ca_result: typeof ca === 'string' ? ca : ca.fp }));
         return Response.json({ error: 'cert_id_fingerprint_mismatch', cert_id: body.cert_id, ca: typeof ca === 'string' ? ca : ca.fp }, { status: 422 });

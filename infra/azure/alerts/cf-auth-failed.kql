@@ -1,28 +1,22 @@
 // Fires when sessions-hub logs a hub.certs.cf_auth_failed event within the last
 // hour — i.e. the Cloudflare API returned 401/403 to a cert sign, revoke, or
-// status(poll) call. That is NOT ordinary CF flakiness: it means the
-// CF_CLIENT_CERT_TOKEN the hub uses to mint/revoke mTLS client certs is expired,
-// revoked, or under-scoped, so EVERY rotation operation will keep failing until
-// the token is rotated. Left unnoticed this is silent: renewals 502, the daily
+// status(poll) call. That is NOT ordinary CF flakiness: the Cloudflare OAuth
+// grant is revoked, under-scoped, or requires fresh authorization, so EVERY
+// rotation operation will keep failing until the account owner reconnects it.
+// Left unnoticed this is silent: renewals 503, the daily
 // prune can't revoke displaced certs, and stale certs stay valid at the CA. This
-// alert turns a dead token into an email instead of a slow-burning outage.
+// alert turns a dead grant into an email instead of a slow-burning outage.
 //
 // Configure the scheduled-query rule to fire on count >= 1 over the window (a
-// single occurrence is already actionable — one dead token fails everything).
-// Remediation: mint a replacement API token (see below) and update the
-// CF_CLIENT_CERT_TOKEN secret (`wrangler secret put CF_CLIENT_CERT_TOKEN`).
-//
-// The token this alert guards should be minted:
-//   - expiry ~1 year out (expires_on), and its rotation tracked BEFORE it lapses
-//     — an expired token is exactly what trips this alert;
-//   - zone-scoped to the sessions zone (not account-wide);
-//   - with the single permission SSL and Certificates:Edit (mint + revoke client
-//     certs), nothing broader.
+// single occurrence is already actionable — one dead grant fails everything).
+// Remediation: use the current-admin mTLS endpoint to begin Cloudflare OAuth
+// authorization again, then complete the browser consent. Do not add an API
+// token secret to the Worker.
 //
 // hub.certs.cf_auth_failed is emitted by reportCfAuthFailure() in
 // hub/src/api/certs.ts, wired into all three CF API call sites (sign / revoke /
-// status), carrying { op, cert_id, http_status }. It is deliberately separate
-// from the generic hub.certs.sign_failed / *_error logs so a token problem is
+// status), carrying a reason and, for provider rejections, the operation/status.
+// It is deliberately separate from generic sign_failed / *_error logs so an auth problem is
 // distinguishable from a per-cert rejection or a transient network error.
 //
 // See missed-heartbeat.kql for the OTelLogs/Body-as-JSON assumption this query
