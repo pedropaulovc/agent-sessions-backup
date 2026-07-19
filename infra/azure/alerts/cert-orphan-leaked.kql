@@ -1,0 +1,34 @@
+// Fires when sessions-hub logs hub.certs.orphan_revoke_failed within the last hour — a client cert the
+// CA minted that the hub could neither record (queue into retired_certs) NOR revoke. It is the terminal
+// "leaked live cert" signal: the renew orphan-reclaim path (a CAS conflict or post-sign D1 write
+// failure), or the post-sign fingerprint failure (a malformed cert with an id but no fingerprint to
+// queue under), tried a direct CA revoke and it did NOT confirm — either the DELETE threw, or it
+// returned HTTP-200 {success:false} (surfaced as revokeClientCert -> 'failed'). Left alone the cert
+// stays valid at the CA, untracked in both `machines` and `retired_certs`, burning zone quota and — if
+// its fingerprint were ever reused — a potential impersonation handle. Each event should be
+// investigated: revoke the cert by its id manually.
+//
+// Configure the scheduled-query rule to fire on count >= 1 over the window (each leaked cert is
+// individually actionable). Distinct from hub.certs.cf_auth_failed (which means the TOKEN is dead —
+// every operation fails); an orphan leak can happen with a perfectly healthy token (transient D1, a
+// CAS race, a malformed CF payload), so it gets its own alert.
+//
+// The event { machine, cert_id, result?/error? } is emitted by revokeOrphanCert() in
+// hub/src/api/certs.ts. hub.certs.orphan_queue_failed (the queue INSERT failing) is NOT alerted on its
+// own — it is followed by the direct revoke, and only if THAT also fails does orphan_revoke_failed fire.
+//
+// See missed-heartbeat.kql for the OTelLogs/Body-as-JSON assumption this query shares. ASSUMPTION TO
+// VERIFY AT M4 DEPLOY: confirm the table/column names once real data flows.
+
+// `otel` wraps OTelLogs in `union isfuzzy=true` so a missing table (before the first OTLP log lands)
+// degrades to empty instead of erroring the whole rule — see missed-heartbeat.kql's "Missing-table
+// guard" note for the full rationale.
+let otel = union isfuzzy=true
+    (datatable(TimeGenerated:datetime, Body:string)[]),
+    (OTelLogs | project TimeGenerated, Body);
+otel
+| where TimeGenerated > ago(1h)
+| extend body = todynamic(Body)
+| where body.event == "hub.certs.orphan_revoke_failed"
+| extend machine = tostring(body.machine), cert_id = tostring(body.cert_id), result = tostring(body.result), error = tostring(body.error)
+| project TimeGenerated, machine, cert_id, result, error

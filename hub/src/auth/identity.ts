@@ -1,5 +1,11 @@
 export type Identity =
-  | { kind: 'machine'; machineId: string; isAdmin: boolean }
+  // certFp is the client-cert fingerprint that authenticated this request (current OR an
+  // in-grace previous fp). certs/renew compare-and-swaps on it so a concurrent renew can't
+  // strand a cert; absent for dev/preview header identities, which never rotate certs.
+  // certSlot says WHICH fingerprint matched: 'current' or an in-grace 'grace' (previous) cert.
+  // Admin routes require 'current' — a rotated-out admin cert must not run fleet writes during its
+  // 7-day grace window. Uploads/heartbeat/renew accept either. Dev/preview identities are 'current'.
+  | { kind: 'machine'; machineId: string; isAdmin: boolean; certFp?: string; certSlot: 'current' | 'grace' }
   | { kind: 'human' }
   | { kind: 'anonymous' };
 
@@ -45,13 +51,28 @@ export async function machineIdentity(request: Request, env: Env): Promise<Ident
   // (fail closed on any truthy-looking value rather than admit a revoked cert).
   const revoked = tls?.certRevoked === '1' || tls?.certRevoked === 'true';
   if (tls?.certVerified === 'SUCCESS' && !revoked && tls.certFingerprintSHA256) {
+    // During a cert-rotation grace window (see migrations/0005_cert_rotation.sql) a machine
+    // has TWO valid fingerprints: the new current one and the previous one being retired.
+    // Match either — the current cert_fp_sha256, OR the previous fingerprint while its
+    // cert_revoke_at is still in the future — so an in-flight collector presenting the old
+    // cert keeps authenticating until the +7d prune revokes it. This is the single place
+    // every machine-authenticated route (uploads, heartbeat, renew itself) resolves identity.
     const row = await env.DB.prepare(
-      'SELECT machine_id, is_admin FROM machines WHERE cert_fp_sha256 = ?1',
+      `SELECT machine_id, is_admin,
+              CASE WHEN cert_fp_sha256 = ?1 THEN 'current' ELSE 'grace' END AS cert_slot
+         FROM machines
+        WHERE cert_fp_sha256 = ?1
+           OR (prev_cert_fp_sha256 = ?1 AND cert_revoke_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
     )
       .bind(tls.certFingerprintSHA256)
-      .first<{ machine_id: string; is_admin: number }>();
+      .first<{ machine_id: string; is_admin: number; cert_slot: 'current' | 'grace' }>();
     if (!row) return { kind: 'anonymous' };
-    return { kind: 'machine', machineId: row.machine_id, isAdmin: row.is_admin === 1 };
+    // isAdmin is gated on the CURRENT slot: a rotated-out admin cert loses admin power during its 7-day
+    // grace window at the chokepoint, so putFile/ownsPath/multipart (which key on identity.isAdmin for
+    // the cross-machine write bypass) inherit the restriction with no changes. An admin's own collector
+    // still uploads to its own path via machineId match. The router's certSlot check is belt-and-braces.
+    const isAdmin = row.is_admin === 1 && row.cert_slot === 'current';
+    return { kind: 'machine', machineId: row.machine_id, isAdmin, certFp: tls.certFingerprintSHA256, certSlot: row.cert_slot };
   }
 
   if (env.ENVIRONMENT === 'development') return devHeaderIdentity(request, env);
@@ -71,5 +92,5 @@ async function devHeaderIdentity(request: Request, env: Env): Promise<Identity> 
   )
     .bind(dev, request.headers.get('x-dev-os') ?? 'linux')
     .run();
-  return { kind: 'machine', machineId: dev, isAdmin: true };
+  return { kind: 'machine', machineId: dev, isAdmin: true, certSlot: 'current' };
 }

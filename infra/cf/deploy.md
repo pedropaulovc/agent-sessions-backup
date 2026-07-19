@@ -33,7 +33,8 @@ GitHub Actions stays the PR gate (typecheck + vitest + pytest); Workers Builds o
 
 ## One-time secrets
 
-- Production: `SETUP_TOKEN` (set), `CF_API_TOKEN` (M4, cert renewal — unset).
+- Production: `SETUP_TOKEN` (set), `CF_CLIENT_CERT_TOKEN` (cert renewal, `POST /api/v1/certs/renew`
+  — unset until the user provisions it; see infra/cf/mtls.md "Cert renewal endpoint").
 - Preview: `DEV_AUTH` — the bearer that gates the public preview URL. Until it is set, the
   preview fails closed (denies), which is safe. Set with:
   `cd hub && npx wrangler secret put DEV_AUTH --env preview`
