@@ -533,7 +533,10 @@ class CollectorFlowTests(unittest.TestCase):
             self.assertEqual(enroll.ensure_collector(), "/new/agent-collector")
 
         install = calls[1][0]
-        self.assertEqual(install[0:4], ["/tools/uv", "tool", "install", "--force"])
+        self.assertEqual(
+            install[0:5],
+            ["/tools/uv", "tool", "install", "--force", "--reinstall"],
+        )
 
     def test_windows_order_password_isolation_and_cleanup(self):
         with tempfile.TemporaryDirectory() as raw:
