@@ -5,6 +5,22 @@ import { hex, objectSha256 } from './ops';
 
 export const TERMINAL_PARSE_STATES = new Set(['parsed', 'skipped', 'superseded']);
 
+/** Finish a known non-parseable file without spending a queue delivery on it. A fresh export
+ * cleanup reservation remains owner-controlled; every other row becomes terminal immediately and
+ * sheds stale reservation/error metadata. */
+export async function markKnownOtherSkipped(fileId: number, contentHash: string, env: Env): Promise<boolean> {
+  const skipped = await env.DB.prepare(
+    `UPDATE files SET parse_state = 'skipped', parse_error = NULL,
+       reserved_at = NULL, reserved_by = NULL, reserved_reason = NULL
+     WHERE id = ?1 AND content_hash = ?2
+       AND NOT (parse_state = 'reserved' AND reserved_at IS NOT NULL AND reserved_at > ?3)
+     RETURNING id`,
+  )
+    .bind(fileId, contentHash, reservationCutoffIso())
+    .first<{ id: number }>();
+  return skipped !== null;
+}
+
 /** R2 customMetadata values must be strings, and the x-file-mtime header is optional — build the
  * {mtime} customMetadata object only when we actually have one to record. reindex() reads this
  * back (see ops.ts) to restore files.mtime for R2 objects whose D1 row was lost/wiped; a legacy
@@ -76,6 +92,7 @@ export async function putFile(
     .bind(machineId, store, relpath)
     .first<{ id: number; content_hash: string; parse_state: string; r2_key: string; harness: string | null; session_id: string | null }>();
   if (existing && existing.content_hash === sha256) {
+    const det = detect(store, relpath, machineId);
     // Restamp a legacy row whose stored identity drifted (see restampIfStale) before deciding
     // whether this unchanged upload still needs a re-enqueue.
     const restamped = await restampIfStale(existing, store, relpath, machineId, env);
@@ -112,6 +129,12 @@ export async function putFile(
     // (a live cleanup's) is left to its owner's recover send and NOT requeued as 'upload' here, so it can't
     // escape the reserved set; a STALE reservation heals like any 'pending' row. `requeued` reflects whether
     // the gate let the requeue fire.
+    if (det.kind === 'other') {
+      const skipped = await markKnownOtherSkipped(existing.id, sha256, env);
+      if (skipped) {
+        return Response.json({ status: 'unchanged', file_id: existing.id, restored, restamped, skipped: true });
+      }
+    }
     if (restamped || restored || !TERMINAL_PARSE_STATES.has(existing.parse_state)) {
       const requeued = await markPendingAndEnqueue(existing, 'upload', env);
       return Response.json({ status: 'unchanged', file_id: existing.id, requeued, restored, restamped });
@@ -189,9 +212,10 @@ export async function recordUploadedObject(
   // get a machine-scoped session_id stamped on the row — otherwise canonical/recovery/parsing
   // queries (which look files up BY session_id) can't find them.
   const det = detect(store, relpath, machineId);
+  const targetParseState = det.kind === 'other' ? 'skipped' : 'pending';
   const row = await env.DB.prepare(
     `INSERT INTO files (machine_id, store, relpath, r2_key, size, mtime, content_hash, harness, session_id, parse_state)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
      ON CONFLICT (machine_id, store, relpath) DO UPDATE SET
        size = excluded.size, mtime = excluded.mtime, content_hash = excluded.content_hash,
        -- Refresh harness/session_id too: a row created before machine-scoped prompt-log ids
@@ -204,28 +228,28 @@ export async function recordUploadedObject(
        -- Same-hash repairs retain their original upload/recover intent (3609060881, 3609611899).
        parse_state = CASE
          WHEN files.parse_state = 'reserved'
-           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10 THEN 'reserved'
-         ELSE 'pending' END,
+           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?11 THEN 'reserved'
+         ELSE excluded.parse_state END,
        parse_error = CASE
          WHEN files.content_hash = excluded.content_hash AND files.parse_state = 'reserved'
-           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10 THEN files.parse_error
+           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?11 THEN files.parse_error
          ELSE NULL END,
        reserved_at = CASE
          WHEN files.parse_state = 'reserved'
-           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10 THEN files.reserved_at
+           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?11 THEN files.reserved_at
          ELSE NULL END,
        reserved_by = CASE
          WHEN files.parse_state = 'reserved'
-           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10 THEN files.reserved_by
+           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?11 THEN files.reserved_by
          ELSE NULL END,
        reserved_reason = CASE
-         WHEN files.parse_state = 'reserved' AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10
+         WHEN files.parse_state = 'reserved' AND files.reserved_at IS NOT NULL AND files.reserved_at > ?11
            THEN CASE WHEN files.content_hash = excluded.content_hash THEN files.reserved_reason ELSE 'upload' END
          ELSE NULL END,
        uploaded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
      RETURNING id, parse_state, reserved_reason, reserved_by, reservation_generation`,
   )
-    .bind(machineId, store, relpath, r2Key, size, mtime, sha256, det.harness, det.sessionId ?? null, reservationCutoffIso())
+    .bind(machineId, store, relpath, r2Key, size, mtime, sha256, det.harness, det.sessionId ?? null, targetParseState, reservationCutoffIso())
     .first<{
       id: number;
       parse_state: string;
@@ -285,7 +309,8 @@ export async function recordUploadedObject(
   //     the point of ordering converge ahead of the send).
   // The simple path has no observed-R2 convergence (convergeR2WithRow above only restores bytes, never
   // changes the row hash), so realigned is always false there and it enqueues our hash.
-  const realigned = opts.convergeObservedR2 === true && (await convergeMultipartRow(row!.id, r2Key, sha256, env));
+  const knownOther = det.kind === 'other';
+  const realigned = opts.convergeObservedR2 === true && (await convergeMultipartRow(row!.id, r2Key, sha256, env, knownOther));
   if (!realigned && preservedReservation && reservedUpload && row!.reserved_by !== null) {
     // The cleanup may already have selected an owner-tagged delivery for the old hash. Refresh it with the
     // current hash; parseOne waits for the owner to become terminal, so this is safe both before and after
@@ -298,7 +323,14 @@ export async function recordUploadedObject(
       reservation_owner: row!.reserved_by,
       reservation_generation: row!.reservation_generation,
     });
-  } else if (!realigned && !preservedReservation) {
+  }
+  if (knownOther) {
+    console.log(
+      JSON.stringify({ event: 'access.upload', machine: machineId, key: r2Key, bytes: size, status: existed ? 'updated' : 'created' }),
+    );
+    return Response.json({ status: 'stored', file_id: row!.id }, { status: 201 });
+  }
+  if (!realigned && !preservedReservation) {
     await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
   }
 
@@ -325,7 +357,13 @@ export async function recordUploadedObject(
  * on a true return, SKIPS that send — so a realigned row is parsed under the R2 hash exactly once and
  * the stale-sha message is never emitted at all (not merely rejected later by the consumer guard).
  */
-export async function convergeMultipartRow(fileId: number, r2Key: string, sha256: string, env: Env): Promise<boolean> {
+export async function convergeMultipartRow(
+  fileId: number,
+  r2Key: string,
+  sha256: string,
+  env: Env,
+  knownOther = false,
+): Promise<boolean> {
   const row = await env.DB.prepare('SELECT content_hash FROM files WHERE id = ?1').bind(fileId).first<{ content_hash: string }>();
   if (row?.content_hash !== sha256) return false; // another writer's upsert won; they own convergence
   const head = await env.RAW.head(r2Key);
@@ -340,6 +378,7 @@ export async function convergeMultipartRow(fileId: number, r2Key: string, sha256
     `UPDATE files SET content_hash = ?2, mtime = ?3, size = ?4,
        parse_state = CASE
          WHEN parse_state = 'reserved' AND reserved_at IS NOT NULL AND reserved_at > ?6 THEN 'reserved'
+         WHEN ?7 = 1 THEN 'skipped'
          ELSE 'pending' END,
        parse_error = NULL,
        reserved_at = CASE
@@ -353,9 +392,23 @@ export async function convergeMultipartRow(fileId: number, r2Key: string, sha256
          ELSE NULL END
      WHERE id = ?1 AND content_hash = ?5 RETURNING id, parse_state, reserved_by, reservation_generation`,
   )
-    .bind(fileId, r2Hash, mtime, head!.size, sha256, reservationCutoffIso())
+    .bind(fileId, r2Hash, mtime, head!.size, sha256, reservationCutoffIso(), knownOther ? 1 : 0)
     .first<{ id: number; parse_state: string; reserved_by: number | null; reservation_generation: number }>();
   if (!updated) return false; // lost the row to the other writer in the meantime
+  if (knownOther) {
+    if (updated.parse_state === 'reserved' && updated.reserved_by !== null) {
+      await env.PARSE_QUEUE.send({
+        file_id: fileId,
+        r2_key: r2Key,
+        reason: 'upload',
+        content_hash: r2Hash,
+        reservation_owner: updated.reserved_by,
+        reservation_generation: updated.reservation_generation,
+      });
+    }
+    console.log(JSON.stringify({ event: 'access.multipart_converge', key: r2Key, from: sha256, to: r2Hash }));
+    return true;
+  }
   // If convergence discovers that R2 actually contains different bytes, this is a real changed-hash upload.
   // Flip every session the archive owns so ready rows never describe the pre-realignment object. A live
   // reservation remains owner-controlled and defers the enqueue; otherwise enqueue immediately.
@@ -501,6 +554,10 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
       //  - a TERMINAL legacy row whose identity we just restamped (same as the PUT same-hash branch)
       //    — otherwise a 'skipped' history.jsonl row with NULL harness/session_id stays unindexed.
       const restamped = await restampIfStale(row, row.store, row.relpath, identity.machineId, env);
+      if (detect(row.store, row.relpath, identity.machineId).kind === 'other') {
+        const skipped = await markKnownOtherSkipped(row.id, row.content_hash, env);
+        if (skipped) continue;
+      }
       // markPendingAndEnqueue applies the centralized fresh-reservation gate (round 15): a fresh 'reserved'
       // row is left to its owner's recover; a stale one heals. Same reasoning as the same-hash PUT branch.
       if (restamped || !TERMINAL_PARSE_STATES.has(row.parse_state)) {

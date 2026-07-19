@@ -1,7 +1,8 @@
 import type { Identity } from '../auth/identity';
+import { detect } from '../ingest/detect';
 import { markPendingAndEnqueue } from '../queue';
 import { hex, objectSha256 } from './ops';
-import { TERMINAL_PARSE_STATES, recordUploadedObject, restampIfStale } from './upload';
+import { markKnownOtherSkipped, TERMINAL_PARSE_STATES, recordUploadedObject, restampIfStale } from './upload';
 
 // R2 multipart part rules (developers.cloudflare.com/r2/objects/multipart-objects): every part
 // except the last must be >= 5 MiB AND all be the same size; <= 10000 parts. The collector uploads
@@ -128,6 +129,12 @@ export async function createMultipart(
       // R2 has the right bytes. Still restamp a legacy row and re-enqueue a non-terminal/restamped one
       // so a 'skipped' or dropped-message row finally indexes.
       const restamped = await restampIfStale(existing, store, relpath, machineId, env);
+      if (detect(store, relpath, machineId).kind === 'other') {
+        const skipped = await markKnownOtherSkipped(existing.id, sha256, env);
+        if (skipped) {
+          return Response.json({ status: 'unchanged', file_id: existing.id, restamped, skipped: true });
+        }
+      }
       if (restamped || !TERMINAL_PARSE_STATES.has(existing.parse_state)) {
         // markPendingAndEnqueue applies the centralized fresh-reservation gate (round 15, 3608955878): a fresh
         // 'reserved' row is left to its cleanup owner's recover and NOT healed as 'upload' here, so this

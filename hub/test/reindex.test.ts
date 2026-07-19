@@ -173,7 +173,7 @@ describe('admin reindex batches D1 writes + queue sends to fit the whole corpus 
     // 100 objects whose keys are ~4KB each: by count alone they'd pack into one 100-message sendBatch
     // of ~400KB, over the Queues 256KB cap. The size budget must split them into multiple sub-cap chunks.
     const longSuffix = 'x'.repeat(4000);
-    const pages = [Array.from({ length: 100 }, () => fakeObject(`raw/longbox/misc/${crypto.randomUUID()}-${longSuffix}.bin`))];
+    const pages = [Array.from({ length: 100 }, () => fakeObject(`raw/longbox/claude/${longSuffix}/${crypto.randomUUID()}.jsonl`))];
     stubList(pages);
     const sendBatchSpy = stubSendBatch();
 
@@ -200,7 +200,7 @@ describe('admin reindex batches D1 writes + queue sends to fit the whole corpus 
     // .length but ~9KB serialized — the old .length budget packs ~64/chunk (~580KB of bytes, over the
     // 256KB cap); the byte-accurate budget must pack far fewer so every chunk stays under the cap.
     const mbSuffix = '中'.repeat(3000);
-    const pages = [Array.from({ length: 100 }, () => fakeObject(`raw/mbbox/misc/${crypto.randomUUID()}-${mbSuffix}.bin`))];
+    const pages = [Array.from({ length: 100 }, () => fakeObject(`raw/mbbox/claude/${mbSuffix}/${crypto.randomUUID()}.jsonl`))];
     stubList(pages);
     const sendBatchSpy = stubSendBatch();
 

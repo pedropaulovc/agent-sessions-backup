@@ -263,7 +263,7 @@ describe('multipart upload', () => {
 
   it('the same-hash shortcut leaves a FRESH reservation alone but re-enqueues a STALE one (round 15, 3608955878)', async () => {
     const bytes = new TextEncoder().encode(bigSession('aaaaaaaa-bbbb-4ccc-8ddd-000000000000', 'gadolinium', 6 * MIB));
-    const relpath = 'demo/mp-gate.jsonl';
+    const relpath = 'demo/aaaaaaaa-bbbb-4ccc-8ddd-000000000000.jsonl';
     const first = await multipartStore('mpgate-box', 'claude', relpath, bytes, 5 * MIB);
     expect(first.complete!.status).toBe(201);
     const hash = await sha256Hex(bytes);
@@ -613,7 +613,7 @@ describe('multipart review fixes', () => {
   it('ORDERING non-race: converge sees a matching R2 object, exactly one parse message with our sha', async () => {
     const bytes = new Uint8Array(32).fill(3);
     const sha = await sha256Hex(bytes);
-    const relpath = 'order/match.bin';
+    const relpath = 'order/11111111-1111-4111-8111-111111111111.jsonl';
     // R2 already holds OUR object (native checksum == sha): convergence must be a no-op.
     await ensureMachine('order-box');
     await testEnv.RAW.put(`raw/order-box/claude/${relpath}`, bytes, { sha256: sha });
@@ -630,7 +630,7 @@ describe('multipart review fixes', () => {
     const bytesB = new Uint8Array(48).fill(7);
     const shaB = await sha256Hex(bytesB);
     const shaA = 'a'.repeat(64); // this upload's declared hash — but R2 holds B (the other racer's object)
-    const relpath = 'order/race.bin';
+    const relpath = 'order/22222222-2222-4222-8222-222222222222.jsonl';
     await ensureMachine('race2-box');
     await testEnv.RAW.put(`raw/race2-box/claude/${relpath}`, bytesB, { sha256: shaB });
 
@@ -650,7 +650,7 @@ describe('multipart review fixes', () => {
   });
 
   it('ORDERING converge-throws: no parse message is enqueued (queue retry / next complete repairs)', async () => {
-    const relpath = 'order/throws.bin';
+    const relpath = 'order/33333333-3333-4333-8333-333333333333.jsonl';
     const shaA = 'c'.repeat(64);
     await ensureMachine('throw-box');
     await testEnv.RAW.put(`raw/throw-box/claude/${relpath}`, new Uint8Array(16).fill(5)); // head() is stubbed to throw before any checksum read
