@@ -1253,6 +1253,34 @@ describe('POST /api/v1/admin/machines', () => {
     expect((await retired(hexfp('rbp-B')))?.cert_id).toBe('rbp-B-id'); // displaced old current queued
   });
 
+  it.each([
+    { suffix: 'null-first', ids: [null, 'rbmix-A-id'] },
+    { suffix: 'id-first', ids: ['rbmix-A-id', null] },
+  ])('mixed NULL/non-NULL duplicate reservations reinstate regardless of row order ($suffix)', async ({ suffix, ids }) => {
+    // retired_certs deliberately has no uniqueness constraint on fingerprint. The clash probe can return
+    // both rows in either order; seeing the NULL row last must not overwrite the earlier trusted-id result.
+    const machineId = `rbmix-${suffix}`;
+    const oldFp = hexfp(`rbmix-A-${suffix}`);
+    await seedMachine(machineId, { fp: hexfp(`rbmix-B-${suffix}`), certId: `rbmix-B-id-${suffix}` });
+    for (const certId of ids) {
+      await testEnv.DB.prepare(
+        `INSERT INTO retired_certs (fingerprint, cert_id, machine_id, retired_at) VALUES (?1, ?2, ?3, '2000-01-01T00:00:00.000Z')`,
+      )
+        .bind(oldFp, certId, machineId)
+        .run();
+    }
+
+    const res = await adminMachines(
+      reqJson({ machine_id: machineId, cert_fp_sha256: oldFp }),
+      testEnv,
+      machine('am-admin', true),
+    );
+    expect(res.status).toBe(200); // no legacy hatch: at least one reservation has a trusted CA id
+    expect((await row(machineId))?.cert_fp_sha256).toBe(oldFp);
+    expect((await row(machineId))?.cert_id).toBe('rbmix-A-id'); // non-NULL duplicate carried
+    expect(await retired(oldFp)).toBeNull(); // both duplicate reservations consumed
+  });
+
   it('requires the explicit legacy hatch before reinstating a NULL-id reservation', async () => {
     // A NULL-id reservation is not a trusted CA-handle source. Treating it as reinstatingReserved would
     // bypass cert_id_required_for_new_fp even though the carry UPDATE has no id to carry.

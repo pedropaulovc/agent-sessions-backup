@@ -189,7 +189,10 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
         // NON-NULL reservation id is a trusted reinstatement source: a legacy NULL-id reservation may
         // still pass through, but the new-fingerprint guard below then requires cert_id_unknown:true.
         if (c.machine_id === body.machine_id && c.claimed_at === null) {
-          reinstatingReserved = c.cert_id !== null;
+          // Multiple reservations for the same fingerprint are legal. Once ANY row supplies a trusted
+          // CA id, a later legacy NULL-id row must not erase that fact; the carry query below likewise
+          // selects any non-NULL id. Keep this accumulator monotonic and independent of SELECT row order.
+          reinstatingReserved ||= c.cert_id !== null;
           continue;
         }
         return Response.json({ error: 'fingerprint_in_use', machine_id: c.machine_id }, { status: 409 });
