@@ -200,14 +200,23 @@ def ensure_collector() -> str:
 
 
 def collector_supports_enrollment(executable: str) -> bool:
-    proc = subprocess.run(
+    enroll_help = subprocess.run(
         [executable, "enroll", "--help"],
         capture_output=True,
         text=True,
         check=False,
         env=child_env(),
     )
-    return proc.returncode == 0 and "--import-pfx" in proc.stdout and "--client-cert" in proc.stdout
+    if enroll_help.returncode != 0 or not {"--import-pfx", "--client-cert"}.issubset(enroll_help.stdout.split()):
+        return False
+    doctor_help = subprocess.run(
+        [executable, "doctor", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=child_env(),
+    )
+    return doctor_help.returncode == 0 and "--require-current-cert" in doctor_help.stdout.split()
 
 
 def machine_id_for(collector: str, explicit: str | None) -> str:
