@@ -147,6 +147,7 @@ export async function cloudflareClientCertificateRequest(env: Env, operation: Cl
 /** Singleton OAuth and managed-CA broker. OAuth bearer credentials never leave this object. */
 export class CloudflareOAuthBroker extends DurableObject<Env> {
   private refreshInFlight: Promise<string> | null = null;
+  private grantMutationTail: Promise<void> = Promise.resolve();
 
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
@@ -198,24 +199,26 @@ export class CloudflareOAuthBroker extends DurableObject<Env> {
     if (typeof body.state !== 'string' || body.state !== pending.state) return internalError('invalid_state', 400);
     if (typeof body.code !== 'string' || !body.code) return internalError('missing_code', 400);
 
-    const res = await fetch(TOKEN_ENDPOINT, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: tokenForm({
-        grant_type: 'authorization_code',
-        client_id: config.clientId,
-        redirect_uri: config.redirectUri,
-        code: body.code,
-        code_verifier: pending.verifier,
-      }),
+    return this.withGrantMutation(async () => {
+      const res = await fetch(TOKEN_ENDPOINT, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: tokenForm({
+          grant_type: 'authorization_code',
+          client_id: config.clientId,
+          redirect_uri: config.redirectUri,
+          code: body.code as string,
+          code_verifier: pending.verifier,
+        }),
+      });
+      const token = (await res.json().catch(() => ({}))) as TokenResponse;
+      if (!res.ok) return internalError('code_exchange_failed', 502);
+      const grant = this.validateGrant(token, null, config.scopes);
+      if (!grant) return internalError('invalid_token_response', 502);
+      await this.ctx.storage.put('grant', grant);
+      console.log(JSON.stringify({ event: 'hub.certs.oauth_authorized', scopes: grant.scopes }));
+      return Response.json({ ok: true });
     });
-    const token = (await res.json().catch(() => ({}))) as TokenResponse;
-    if (!res.ok) return internalError('code_exchange_failed', 502);
-    const grant = this.validateGrant(token, null);
-    if (!grant) return internalError('invalid_token_response', 502);
-    await this.ctx.storage.put('grant', grant);
-    console.log(JSON.stringify({ event: 'hub.certs.oauth_authorized', scopes: grant.scopes }));
-    return Response.json({ ok: true });
   }
 
   private async status(): Promise<Response> {
@@ -227,17 +230,19 @@ export class CloudflareOAuthBroker extends DurableObject<Env> {
   private async disconnect(): Promise<Response> {
     const config = this.configuration();
     if (!config) return internalError('not_configured');
-    const grant = await this.ctx.storage.get<OAuthGrant>('grant');
-    if (!grant) return Response.json({ ok: true, authorization: 'missing' });
-    const res = await fetch(REVOKE_ENDPOINT, {
-      method: 'POST',
-      headers: { 'content-type': 'application/x-www-form-urlencoded' },
-      body: tokenForm({ client_id: config.clientId, token: grant.refreshToken, token_type_hint: 'refresh_token' }),
+    return this.withGrantMutation(async () => {
+      const grant = await this.ctx.storage.get<OAuthGrant>('grant');
+      if (!grant) return Response.json({ ok: true, authorization: 'missing' });
+      const res = await fetch(REVOKE_ENDPOINT, {
+        method: 'POST',
+        headers: { 'content-type': 'application/x-www-form-urlencoded' },
+        body: tokenForm({ client_id: config.clientId, token: grant.refreshToken, token_type_hint: 'refresh_token' }),
+      });
+      if (!res.ok) return internalError('grant_revoke_failed', 502);
+      await this.ctx.storage.delete('grant');
+      console.log(JSON.stringify({ event: 'hub.certs.oauth_disconnected' }));
+      return Response.json({ ok: true, authorization: 'missing' });
     });
-    if (!res.ok) return internalError('grant_revoke_failed', 502);
-    await this.ctx.storage.delete('grant');
-    console.log(JSON.stringify({ event: 'hub.certs.oauth_disconnected' }));
-    return Response.json({ ok: true, authorization: 'missing' });
   }
 
   private async clientCertificate(request: Request): Promise<Response> {
@@ -304,10 +309,30 @@ export class CloudflareOAuthBroker extends DurableObject<Env> {
     if (grant.state === 'reauthorization_required') throw new CloudflareOAuthUnavailable('reauthorization_required');
     if (mode === 'cached' && grant.accessToken && grant.accessExpiresAt - EXPIRY_SKEW_MS > Date.now()) return grant.accessToken;
     if (this.refreshInFlight) return this.refreshInFlight;
-    this.refreshInFlight = this.refresh(grant).finally(() => {
+    this.refreshInFlight = this.withGrantMutation(async () => {
+      const latest = await this.ctx.storage.get<OAuthGrant>('grant');
+      if (!latest) throw new CloudflareOAuthUnavailable('not_authorized');
+      if (latest.state === 'reauthorization_required') throw new CloudflareOAuthUnavailable('reauthorization_required');
+      if (mode === 'cached' && latest.accessToken && latest.accessExpiresAt - EXPIRY_SKEW_MS > Date.now()) return latest.accessToken;
+      return this.refresh(latest);
+    }).finally(() => {
       this.refreshInFlight = null;
     });
     return this.refreshInFlight;
+  }
+
+  private async withGrantMutation<T>(operation: () => Promise<T>): Promise<T> {
+    const predecessor = this.grantMutationTail;
+    let release!: () => void;
+    this.grantMutationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await predecessor;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 
   private async refresh(current: OAuthGrant): Promise<string> {
@@ -327,18 +352,21 @@ export class CloudflareOAuthBroker extends DurableObject<Env> {
       }
       throw new CloudflareOAuthUnavailable('refresh_failed');
     }
-    const next = this.validateGrant(token, current.refreshToken);
+    const next = this.validateGrant(token, current.refreshToken, current.scopes);
     if (!next) throw new CloudflareOAuthUnavailable('invalid_refresh_response');
     await this.ctx.storage.put('grant', next);
     return next.accessToken;
   }
 
-  private validateGrant(token: TokenResponse, existingRefreshToken: string | null): OAuthGrant | null {
+  private validateGrant(token: TokenResponse, existingRefreshToken: string | null, requestedScopes: string[]): OAuthGrant | null {
     if (typeof token.access_token !== 'string' || !token.access_token) return null;
     const refreshToken = typeof token.refresh_token === 'string' && token.refresh_token ? token.refresh_token : existingRefreshToken;
     if (!refreshToken) return null;
     if (typeof token.expires_in !== 'number' || !Number.isFinite(token.expires_in) || token.expires_in <= 0) return null;
-    const scopes = parseGrantedScopes(token.scope);
+    // RFC 6749 lets the token response omit `scope` when it exactly matches the request. If the
+    // provider returns a scope value, treat it as authoritative and fail closed on a downgrade.
+    const returnedScopes = parseGrantedScopes(token.scope);
+    const scopes = returnedScopes.length > 0 ? returnedScopes : requestedScopes;
     if (!scopes.includes(REQUIRED_SCOPE)) return null;
     return {
       state: 'authorized',

@@ -97,6 +97,16 @@ describe('Cloudflare OAuth broker', () => {
     expect(await (await cloudflareOAuthStatus(testEnv)).json()).toEqual({ authorization: 'missing' });
   });
 
+  it('accepts an omitted scope field as the unchanged requested grant per RFC 6749', async () => {
+    const url = await authorizationUrl();
+    vi.stubGlobal('fetch', vi.fn(async () => tokenResponse({ scope: undefined })));
+    const callback = new URL('https://sessions.vza.net/oauth/cloudflare/callback');
+    callback.searchParams.set('code', 'authorization-code');
+    callback.searchParams.set('state', url.searchParams.get('state')!);
+    expect((await completeCloudflareOAuth(callback, testEnv)).status).toBe(200);
+    expect(await (await cloudflareOAuthStatus(testEnv)).json()).toMatchObject({ authorization: 'authorized' });
+  });
+
   it('proxies only the configured zone and never returns its bearer credential', async () => {
     await authorize();
     const certId = '2544a51d-fc9e-47f0-966e-2a789155ade0';
