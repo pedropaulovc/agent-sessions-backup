@@ -62,14 +62,15 @@ def path_matches(relpath: str, pattern: str) -> bool:
     relpath = relpath.lower()
     pattern = pattern.lower()
     base = relpath.rsplit("/", 1)[-1]
-    candidates = {pattern}
     if pattern.startswith("**/"):
-        candidates.add(pattern[3:])
-    for pat in candidates:
-        candidate = relpath if "/" in pat else base
-        if fnmatch.fnmatchcase(candidate, pat):
-            return True
-    return False
+        root_pattern = pattern[3:]
+        return (
+            fnmatch.fnmatchcase(relpath, pattern)
+            or fnmatch.fnmatchcase(relpath, root_pattern)
+            or fnmatch.fnmatchcase(base, root_pattern)
+        )
+    candidate = relpath if "/" in pattern else base
+    return fnmatch.fnmatchcase(candidate, pattern)
 
 
 def first_matching_pattern(relpath: str, patterns: list[str]) -> str | None:

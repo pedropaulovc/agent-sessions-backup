@@ -31,9 +31,11 @@ def test_path_matches_security_globs():
     assert not path_matches("auth.json-tests/keep.jsonl", "*auth.json*")
     assert path_matches("cred-profiles/gmail.json", "**/cred-profiles/**")
     assert path_matches("nested/cred-profiles/vezza.json.bak", "**/cred-profiles/**")
-    # **/oauth* also catches a root-level file (leading **/ optional)
+    # **/oauth* also catches root-level files and directory probes (leading **/ optional)
     assert path_matches("oauth.json", "**/oauth*")
     assert path_matches("a/b/oauth-token", "**/oauth*")
+    assert path_matches("oauth_tokens/\0", "**/oauth*")
+    assert path_matches("a/oauth_tokens/\0", "**/oauth*")
     # extensions anywhere in the tree
     assert path_matches("a/b/private.key", "*.key")
     assert path_matches("deep/dir/id_rsa.pem", "*.pem")
@@ -68,6 +70,12 @@ def test_scan_includes_and_excludes_with_nested_subagents(tmp_path):
     nested_cache.mkdir(parents=True)
     (nested_cache / "metadata.json").write_text("x")
     (root / "oauth_state.json").write_text("token")
+    oauth_tokens = root / "oauth_tokens"
+    oauth_tokens.mkdir()
+    (oauth_tokens / "token.json").write_text("token")
+    nested_oauth_tokens = root / "nested" / "oauth_tokens"
+    nested_oauth_tokens.mkdir(parents=True)
+    (nested_oauth_tokens / "token.json").write_text("token")
     (root / "id.pem").write_text("key")
     (root / "shell-snapshots").mkdir()
     (root / "shell-snapshots" / "snap.sh").write_text("x")
@@ -89,6 +97,8 @@ def test_scan_includes_and_excludes_with_nested_subagents(tmp_path):
     assert "cache/blob" not in found
     assert "plugins/cache/package/metadata.json" not in found
     assert "oauth_state.json" not in found
+    assert "oauth_tokens/token.json" not in found
+    assert "nested/oauth_tokens/token.json" not in found
     assert "id.pem" not in found
     assert "shell-snapshots/snap.sh" not in found
 
