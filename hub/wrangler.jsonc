@@ -25,9 +25,12 @@
     "ENVIRONMENT": "production",
     "API_HOST": "api.sessions.vza.net",
     "VIEWER_HOST": "sessions.vza.net",
-    // vza.net zone id (public — also in infra/cf/enroll-cert.py). Used by POST
-    // /api/v1/certs/renew together with the CF_CLIENT_CERT_TOKEN secret.
-    "CF_ZONE_ID": "6a56cdda4766c1d7b5ad0fbe8331048f"
+    // vza.net zone id (public — also in infra/cf/enroll-cert.py). Certificate
+    // operations use a private Cloudflare OAuth client; no API token is stored.
+    "CF_ZONE_ID": "6a56cdda4766c1d7b5ad0fbe8331048f",
+    "CF_OAUTH_CLIENT_ID": "0455069be2aea97dd2812497f3ba0dfe",
+    "CF_OAUTH_REDIRECT_URI": "https://sessions.vza.net/oauth/cloudflare/callback",
+    "CF_OAUTH_SCOPES": "ssl-and-certificates.write offline_access"
   },
   "d1_databases": [
     {
@@ -39,6 +42,12 @@
   ],
   "r2_buckets": [{ "binding": "RAW", "bucket_name": "agent-sessions-raw" }],
   "kv_namespaces": [{ "binding": "KV", "id": "61505c2df55242daa2f572c188819961" }],
+  "durable_objects": {
+    "bindings": [{ "name": "CF_OAUTH_BROKER", "class_name": "CloudflareOAuthBroker" }]
+  },
+  "exports": {
+    "CloudflareOAuthBroker": { "type": "durable-object", "storage": "sqlite" }
+  },
   "queues": {
     "producers": [{ "binding": "PARSE_QUEUE", "queue": "parse" }],
     "consumers": [
@@ -92,8 +101,7 @@
       "vars": {
         "ENVIRONMENT": "preview",
         "API_HOST": "api.sessions.vza.net",
-        "VIEWER_HOST": "sessions.vza.net",
-        "CF_ZONE_ID": "6a56cdda4766c1d7b5ad0fbe8331048f"
+        "VIEWER_HOST": "sessions.vza.net"
       },
       "d1_databases": [
         {
@@ -105,6 +113,9 @@
       ],
       "r2_buckets": [{ "binding": "RAW", "bucket_name": "agent-sessions-raw-preview" }],
       "kv_namespaces": [{ "binding": "KV", "id": "eda3b8a8ba1e416fa65e98d0c266a4bb" }],
+      // Intentionally no OAuth broker in preview: unreviewed PR code cannot reach the
+      // production account's managed certificate authority.
+      "durable_objects": { "bindings": [] },
       "queues": {
         "producers": [{ "binding": "PARSE_QUEUE", "queue": "parse-preview" }],
         "consumers": [
@@ -121,6 +132,7 @@
       "observability": { "enabled": true, "head_sampling_rate": 1 }
     }
   }
-  // secrets: SETUP_TOKEN (passkey bootstrap), CF_CLIENT_CERT_TOKEN (POST /api/v1/certs/renew);
+  // secrets: SETUP_TOKEN (passkey bootstrap). Cloudflare certificate lifecycle uses
+  // Authorization Code + PKCE; the OAuth grant lives only in CF_OAUTH_BROKER storage.
   // preview env: DEV_AUTH (bearer gate) via `wrangler secret put DEV_AUTH --env preview`
 }

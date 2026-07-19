@@ -1,9 +1,15 @@
 import { machineIdentity } from './auth/identity';
+import {
+  cloudflareOAuthStatus,
+  completeCloudflareOAuth,
+  disconnectCloudflareOAuth,
+  startCloudflareOAuth,
+} from './auth/cloudflare-oauth';
 import { checkFiles, putFile } from './api/upload';
 import { abortMultipart, completeMultipart, createMultipart, uploadPart } from './api/multipart';
 import { adminMachines, heartbeat, listMachines, reindex, status, usage } from './api/ops';
 import { bootstrap } from './api/bootstrap';
-import { renewCert } from './api/certs';
+import { probeClientCert, renewCert } from './api/certs';
 import { search } from './api/search';
 import { getSession, getSessionRaw, listSessions } from './api/sessions';
 import { viewerRoute } from './viewer/router';
@@ -23,6 +29,12 @@ export async function route(request: Request, env: Env, _ctx: ExecutionContext):
 
   if (url.pathname === '/healthz') {
     return Response.json({ ok: true, environment: env.ENVIRONMENT });
+  }
+
+  // Cloudflare's browser redirect cannot use the mTLS-only API hostname. The random, five-minute,
+  // one-use OAuth state is created only by a current admin identity and validated inside the broker.
+  if (url.hostname === env.VIEWER_HOST && url.pathname === '/oauth/cloudflare/callback' && request.method === 'GET') {
+    return completeCloudflareOAuth(url, env);
   }
 
   if (url.hostname === env.API_HOST || url.pathname.startsWith('/api/')) {
@@ -91,6 +103,14 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
   if (path === '/api/v1/admin/machines' && method === 'POST') {
     if (identity.certSlot !== 'current') return Response.json({ error: 'admin_requires_current_cert' }, { status: 403 });
     return adminMachines(request, env, identity);
+  }
+  if (path.startsWith('/api/v1/admin/cloudflare-oauth')) {
+    if (!identity.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+    if (identity.certSlot !== 'current') return Response.json({ error: 'admin_requires_current_cert' }, { status: 403 });
+    if (path === '/api/v1/admin/cloudflare-oauth/start' && method === 'POST') return startCloudflareOAuth(env);
+    if (path === '/api/v1/admin/cloudflare-oauth/status' && method === 'GET') return cloudflareOAuthStatus(env);
+    if (path === '/api/v1/admin/cloudflare-oauth/probe' && method === 'GET') return probeClientCert(env, url.searchParams.get('cert_id') ?? '');
+    if (path === '/api/v1/admin/cloudflare-oauth/disconnect' && method === 'POST') return disconnectCloudflareOAuth(env);
   }
 
   return Response.json({ error: 'not_found' }, { status: 404 });

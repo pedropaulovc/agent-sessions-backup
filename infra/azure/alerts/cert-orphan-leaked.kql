@@ -10,7 +10,7 @@
 //
 // Configure the scheduled-query rule to fire on count >= 1 over the window (each leaked cert is
 // individually actionable). Distinct from hub.certs.cf_auth_failed (which means the TOKEN is dead —
-// every operation fails); an orphan leak can happen with a perfectly healthy token (transient D1, a
+// every operation fails); an orphan leak can happen with a perfectly healthy OAuth grant (transient D1, a
 // CAS race, a malformed CF payload), so it gets its own alert.
 //
 // The event { machine, cert_id, result?/error? } is emitted by revokeOrphanCert() in

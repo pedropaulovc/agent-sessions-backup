@@ -12,11 +12,12 @@ depth). This file is the runbook for standing that up on the `vza.net` zone.
   client cert, `GET /api/v1/search`, `PUT /api/v1/files/...`, and even a forged
   `x-dev-machine` header all return `401` in production (verified). `ENVIRONMENT=production`
   disables the dev-header and `DEV_AUTH` bypasses entirely (`src/auth/identity.ts`).
-- **The wrangler OAuth login cannot configure mTLS.** Its token is accepted for
-  Workers/D1/R2/KV/Queues and read-only zone metadata, but the zone SSL surface
-  (`/client_certificates`, `/ssl/certificate_packs`, `/dns_records`) rejects it with
-  auth error `10000`. So the three steps below need a **zone-scoped API token** (or the
-  dashboard). This matches the plan's design: enrollment pastes a just-in-time token.
+- **The Wrangler OAuth client cannot configure mTLS.** Its legacy `ssl_certs:write`
+  grant is accepted for Wrangler's certificate surface but the zone-managed
+  `/client_certificates` endpoint rejects it with auth error `10000`. The hub therefore
+  uses its own private Cloudflare OAuth client with the current
+  `ssl-and-certificates.write` permission. Fresh enrollment still pastes a short-lived,
+  target-local API token; no API token is stored in the hub.
 - **DNS/routing did not need a zone token.** Both hostnames are Workers **Custom
   Domains** (`custom_domain: true` in `wrangler.jsonc`), which Cloudflare provisions
   (proxied record + edge cert) through the Workers API. `api.sessions.vza.net` needed a
@@ -167,34 +168,51 @@ Three mTLS-authenticated endpoints back centrally-managed fleet ops (`hub/src/ap
   row (register fingerprint, set `priority`/`is_admin`) and get the roster back. No delete path by design
   (files/sessions FK-reference the row; decommission by revoking the cert).
 
-### USER ACTION — provision the renewal token (one-time)
+### Cloudflare OAuth connection (one-time)
 
-`POST /api/v1/certs/renew` needs a Cloudflare API token with **SSL and Certificates · Edit** on the
-`vza.net` zone (the wrangler OAuth login can't reach `/client_certificates` — error 10000, verified in
-M3). Mint one (dashboard → My Profile → API Tokens; the same SSL/Certificates permission the enrollment
-token uses), then set it as a hub secret:
+The hub stores no Cloudflare API token and has no OAuth client secret. Create a **private** OAuth client
+in Cloudflare Dashboard → Manage Account → OAuth clients with:
+
+This is separate from the existing Worker → Azure workload-identity federation: Azure accepts the
+hub's OIDC assertion, while Cloudflare's management API does not offer that token-exchange flow for
+third-party workloads. Cloudflare's supported no-API-token mechanism is its user-authorized OAuth flow.
+
+| Field | Value |
+|---|---|
+| Grant types | `authorization_code`, `refresh_token` |
+| Response type | `code` |
+| Token authentication | `none` |
+| Redirect URL | `https://sessions.vza.net/oauth/cloudflare/callback` |
+| Permission | `ssl-and-certificates.write` |
+
+Put the public client ID in `CF_OAUTH_CLIENT_ID` under the production `vars` in `hub/wrangler.jsonc`
+and deploy. The callback uses the viewer hostname because the API hostname's WAF requires a client
+certificate; PKCE S256 removes the need for a client secret.
+
+From a current admin identity, start authorization:
 
 ```
-cd hub && npx wrangler secret put CF_CLIENT_CERT_TOKEN
+POST https://api.sessions.vza.net/api/v1/admin/cloudflare-oauth/start
 ```
 
-Until it's set the endpoint returns `503 cert_renewal_unavailable` (collectors keep their current cert
-and retry — no lockout). The zone id is a non-secret var (`CF_ZONE_ID` in `hub/wrangler.jsonc`).
+Open the returned `authorization_url`, select the `18ef3246…` account, and approve. The five-minute
+state is random and one-use. The refresh credential remains inside the singleton SQLite Durable Object,
+which serializes refresh rotation and exposes only sign/get/revoke calls for the hardcoded `vza.net`
+zone; the main Worker cannot retrieve the bearer credential.
 
-Mint it narrowly and track its expiry:
+Before any certificate mutation, prove the grant against the exact managed-CA endpoint:
 
-- **Scope:** zone `vza.net` only (never account-wide).
-- **Permission:** the single **SSL and Certificates · Edit** — nothing broader.
-- **Expiry:** set `expires_on` ~1 year out and rotate it **before** it lapses. The CF API has no
-  inbound OIDC/workload-identity federation for API tokens (open feature request since 2023,
-  community thread 492897), so this bearer token — not a federated credential — is what mints and
-  revokes every mTLS client cert; an expired or revoked token silently breaks renewals and the daily
-  revoke prune.
+```
+GET https://api.sessions.vza.net/api/v1/admin/cloudflare-oauth/probe?cert_id=<known-active-cert-id>
+```
 
-That failure mode is now alertable: the hub emits a distinct `hub.certs.cf_auth_failed` event on any
-401/403 from the CF API (sign / revoke / status paths), and `infra/azure/alerts/cf-auth-failed.kql`
-pages on it — so a dead token becomes an email, not a slow-burning outage. Rotating the secret
-(`wrangler secret put CF_CLIENT_CERT_TOKEN`) clears it.
+The response must be `200` and its fingerprint/status must match the known certificate. If Cloudflare
+returns error `10000`/403, stop: the managed-CA endpoint is not accepting the new OAuth grant despite
+advertising the permission, and hub-side zero-API-token automation is unavailable.
+
+Until the connection is authorized, renewal returns `503 cert_renewal_unavailable`; collectors retain
+their current certificate and retry. A revoked/under-scoped grant emits `hub.certs.cf_auth_failed`, and
+`infra/azure/alerts/cf-auth-failed.kql` pages with reauthorization as the remediation.
 
 ### Deploy note — apply the D1 migration
 

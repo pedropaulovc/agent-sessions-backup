@@ -7,12 +7,14 @@ interface Env {
   API_HOST: string;
   VIEWER_HOST: string;
   SETUP_TOKEN?: string;
-  // Cloudflare zone id (public) + a zone-scoped token with SSL and Certificates:Edit,
-  // used only by POST /api/v1/certs/renew to mint a successor client cert at the managed
-  // CA. The token is a wrangler secret (`wrangler secret put CF_CLIENT_CERT_TOKEN`); unset
-  // until the user provisions it, in which case cert renewal reports 503. See infra/cf/mtls.md.
+  // Cloudflare's managed client-certificate lifecycle is authorized through a private
+  // OAuth client. The singleton Durable Object owns the grant and never returns bearer
+  // credentials to the main Worker; callers can invoke only its fixed certificate API.
   CF_ZONE_ID?: string;
-  CF_CLIENT_CERT_TOKEN?: string;
+  CF_OAUTH_CLIENT_ID?: string;
+  CF_OAUTH_REDIRECT_URI?: string;
+  CF_OAUTH_SCOPES?: string;
+  CF_OAUTH_BROKER?: DurableObjectNamespace;
   DEV_AUTH?: string;
 }
 

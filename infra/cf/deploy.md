@@ -7,7 +7,7 @@ target different resources — production must never be touched by a PR preview.
 
 | Env | Worker name | Bindings | Auth | Serves on |
 |---|---|---|---|---|
-| production (top-level config) | `sessions-hub` | `sessions-index`, `agent-sessions-raw`, `sessions-hub-kv`, `parse`/`parse-dlq` | mTLS (api) + passkeys (viewer), fail-closed | api.sessions.vza.net, sessions.vza.net (custom domains) |
+| production (top-level config) | `sessions-hub` | `sessions-index`, `agent-sessions-raw`, `sessions-hub-kv`, `CF_OAUTH_BROKER`, `parse`/`parse-dlq` | mTLS (api) + passkeys (viewer), fail-closed | api.sessions.vza.net, sessions.vza.net (custom domains) |
 | preview (`env.preview`) | `sessions-hub-preview` | `*-preview` D1/R2/KV/queues | `DEV_AUTH` bearer (ENVIRONMENT=preview) | its `*.workers.dev` version URL |
 
 `env.preview` redeclares every binding (wrangler does not inherit bindings into named
@@ -31,10 +31,11 @@ the top-level (production) bindings. `--env preview` is what pins a PR build to 
 
 GitHub Actions stays the PR gate (typecheck + vitest + pytest); Workers Builds owns deploys.
 
-## One-time secrets
+## One-time credentials
 
-- Production: `SETUP_TOKEN` (set), `CF_CLIENT_CERT_TOKEN` (cert renewal, `POST /api/v1/certs/renew`
-  — unset until the user provisions it; see infra/cf/mtls.md "Cert renewal endpoint").
+- Production secret: `SETUP_TOKEN` (set). Certificate renewal stores no API token or OAuth client
+  secret. A private Cloudflare OAuth client uses Authorization Code + PKCE, and its grant stays inside
+  the SQLite `CF_OAUTH_BROKER` Durable Object. See infra/cf/mtls.md "Cloudflare OAuth connection".
 - Preview: `DEV_AUTH` — the bearer that gates the public preview URL. Until it is set, the
   preview fails closed (denies), which is safe. Set with:
   `cd hub && npx wrangler secret put DEV_AUTH --env preview`
