@@ -26,10 +26,12 @@ export async function markPendingAndEnqueue(
   // `force` breaks even a fresh reservation — for callers that are the recovery MECHANISM, not a redundant
   // heal (the web-session recover chain: it deliberately re-parses a chosen candidate).
   const guard = opts.force ? '' : " AND NOT (parse_state = 'reserved' AND reserved_at IS NOT NULL AND reserved_at > ?2)";
-  // Keep a stale reservation's intent just long enough to read it inside this atomic batch, then clear the
-  // tuple before sending. A recover reservation must heal as recover, not be promoted to the caller's usual
-  // upload reason (3609651686). Incrementing the generation invalidates any abandoned owner-tagged delivery.
-  const carryReason = opts.force ? 'NULL' : "CASE WHEN parse_state = 'reserved' THEN reserved_reason ELSE NULL END";
+  // Keep a stale reservation's intent until its replacement message is safely enqueued. A recover reservation
+  // must heal as recover, not be promoted to the caller's usual upload reason (3609651686), and a transient send
+  // failure must leave that intent available to the next heal attempt (3609702705). `pending` is included because
+  // that is the durable state left by a failed send. Incrementing the generation invalidates any abandoned
+  // owner-tagged delivery.
+  const carryReason = opts.force ? 'NULL' : "CASE WHEN parse_state IN ('reserved', 'pending') THEN reserved_reason ELSE NULL END";
   const transition = env.DB.prepare(
     `UPDATE files SET parse_state = 'pending', reserved_at = NULL, reserved_by = NULL,
        reserved_reason = ${carryReason},
@@ -42,7 +44,6 @@ export async function markPendingAndEnqueue(
     env.DB.prepare(
       'SELECT parse_state, reserved_at, reserved_by, reserved_reason, reservation_generation FROM files WHERE id = ?1',
     ).bind(file.id),
-    env.DB.prepare("UPDATE files SET reserved_reason = NULL WHERE id = ?1 AND parse_state = 'pending'").bind(file.id),
   ]);
   const intentRow = intent?.results?.[0] as {
     parse_state: string;
@@ -77,6 +78,14 @@ export async function markPendingAndEnqueue(
   const storedReason = intentRow?.reserved_reason;
   const effectiveReason: ParseMessage['reason'] = storedReason === 'recover' || storedReason === 'upload' ? storedReason : reason;
   await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason: effectiveReason, content_hash: file.content_hash });
+  if (storedReason === 'recover' || storedReason === 'upload') {
+    // Clear only the intent this send consumed. If a concurrent upload or cleanup changed the row/hash/state,
+    // its newer intent wins; if this cleanup statement fails, retaining the hint is safe and makes a later heal
+    // enqueue the same idempotent parse again instead of silently changing its semantics.
+    await env.DB.prepare(
+      "UPDATE files SET reserved_reason = NULL WHERE id = ?1 AND parse_state = 'pending' AND content_hash = ?2 AND reserved_reason = ?3",
+    ).bind(file.id, file.content_hash, storedReason).run();
+  }
   return true;
 }
 

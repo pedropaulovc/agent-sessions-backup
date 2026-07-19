@@ -2328,6 +2328,138 @@ describe('reservation intent and retry safety (round 16)', () => {
     // defers on this very row and strands dropped.
   });
 
+  it('a stale recover heal retains its intent across a queue-send failure (3609702705)', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    const owner = await uploadConvs('r16-heal-intent-owner', [namedConv('r16-heal-intent-owner-conv', 'owner')]);
+    await deliverChain({ file_id: owner.fileId, r2_key: owner.r2Key, reason: 'upload', content_hash: owner.hash });
+    const sibling = await uploadConvs('r16-heal-intent-sibling', [namedConv('r16-heal-intent-sibling-conv', 'sibling')]);
+    await deliverChain({ file_id: sibling.fileId, r2_key: sibling.r2Key, reason: 'upload', content_hash: sibling.hash });
+    await testEnv.DB.prepare(
+      "UPDATE files SET parse_state = 'reserved', reserved_at = '2020-01-01T00:00:00.000Z', reserved_by = ?2, reserved_reason = 'recover', reservation_generation = reservation_generation + 1 WHERE id = ?1",
+    ).bind(sibling.fileId, owner.fileId).run();
+
+    const captureSend = testEnv.PARSE_QUEUE.send;
+    let sendAttempts = 0;
+    testEnv.PARSE_QUEUE.send = ((...args: Parameters<typeof captureSend>) => {
+      sendAttempts += 1;
+      if (sendAttempts === 1) return Promise.reject(new Error('transient heal enqueue failure'));
+      return captureSend(...args);
+    }) as typeof testEnv.PARSE_QUEUE.send;
+    sent.length = 0;
+    try {
+      const healTarget = { id: sibling.fileId, r2_key: sibling.r2Key, content_hash: sibling.hash };
+      await expect(markPendingAndEnqueue(healTarget, 'upload', testEnv)).rejects.toThrow('transient heal enqueue failure');
+      const afterFailure = await testEnv.DB.prepare(
+        'SELECT parse_state, reserved_by, reserved_reason FROM files WHERE id = ?1',
+      )
+        .bind(sibling.fileId)
+        .first<{ parse_state: string; reserved_by: number | null; reserved_reason: string | null }>();
+      expect(afterFailure).toEqual({ parse_state: 'pending', reserved_by: null, reserved_reason: 'recover' });
+
+      await expect(markPendingAndEnqueue(healTarget, 'upload', testEnv)).resolves.toBe(true);
+    } finally {
+      testEnv.PARSE_QUEUE.send = captureSend;
+    }
+
+    // POSITIVE CONTROL: even though the retrying caller normally requests `upload`, the successfully queued
+    // replacement retains `recover`; only after that send succeeds is the durable intent cleared.
+    expect(sent).toContainEqual(expect.objectContaining({ file_id: sibling.fileId, reason: 'recover' }));
+    const afterSuccess = await testEnv.DB.prepare('SELECT parse_state, reserved_reason FROM files WHERE id = ?1')
+      .bind(sibling.fileId)
+      .first<{ parse_state: string; reserved_reason: string | null }>();
+    expect(afterSuccess).toEqual({ parse_state: 'pending', reserved_reason: null });
+  });
+
+  it('a reserved-delivery deferral send failure retries without turning the sibling into an error (3609702706)', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    const owner = await uploadConvs('r16-defer-failure-owner', [namedConv('r16-defer-failure-owner-conv', 'owner')]);
+    await deliverChain({ file_id: owner.fileId, r2_key: owner.r2Key, reason: 'upload', content_hash: owner.hash });
+    const sibling = await uploadConvs('r16-defer-failure-sibling', [namedConv('r16-defer-failure-sibling-conv', 'sibling')]);
+    await deliverChain({ file_id: sibling.fileId, r2_key: sibling.r2Key, reason: 'upload', content_hash: sibling.hash });
+    await testEnv.DB.prepare("UPDATE files SET parse_state = 'pending' WHERE id = ?1").bind(owner.fileId).run();
+    await testEnv.DB.prepare(
+      "UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = ?2, reserved_reason = 'recover', reservation_generation = reservation_generation + 1 WHERE id = ?1",
+    ).bind(sibling.fileId, owner.fileId).run();
+    const generation = await testEnv.DB.prepare('SELECT reservation_generation FROM files WHERE id = ?1')
+      .bind(sibling.fileId)
+      .first<{ reservation_generation: number }>();
+    const delivery: ParseMessage = {
+      file_id: sibling.fileId,
+      r2_key: sibling.r2Key,
+      reason: 'recover',
+      content_hash: sibling.hash,
+      reservation_owner: owner.fileId,
+      reservation_generation: generation!.reservation_generation,
+    };
+
+    const captureSend = testEnv.PARSE_QUEUE.send;
+    testEnv.PARSE_QUEUE.send = (async () => {
+      throw new Error('transient reservation deferral enqueue failure');
+    }) as typeof testEnv.PARSE_QUEUE.send;
+    let acked = false;
+    let retried = false;
+    try {
+      await worker.queue(
+        {
+          queue: 'parse',
+          messages: [{
+            id: String(sibling.fileId),
+            timestamp: new Date(),
+            attempts: 1,
+            body: delivery,
+            ack() { acked = true; },
+            retry() { retried = true; },
+          }],
+          ackAll() {},
+          retryAll() {},
+        } as unknown as MessageBatch<ParseMessage>,
+        testEnv,
+      );
+    } finally {
+      testEnv.PARSE_QUEUE.send = captureSend;
+    }
+
+    expect(acked).toBe(false);
+    expect(retried).toBe(true);
+    const afterFailure = await testEnv.DB.prepare(
+      'SELECT parse_state, reserved_by, reserved_reason, reservation_generation FROM files WHERE id = ?1',
+    )
+      .bind(sibling.fileId)
+      .first<{ parse_state: string; reserved_by: number | null; reserved_reason: string | null; reservation_generation: number }>();
+    expect(afterFailure).toEqual({
+      parse_state: 'reserved',
+      reserved_by: owner.fileId,
+      reserved_reason: 'recover',
+      reservation_generation: generation!.reservation_generation,
+    });
+
+    // POSITIVE CONTROL: once the queue is healthy, the same delivery is placed behind the owner and the
+    // original is acknowledged, while the reservation itself remains intact for that deferred capability.
+    sent.length = 0;
+    let controlAcked = false;
+    let controlRetried = false;
+    await worker.queue(
+      {
+        queue: 'parse',
+        messages: [{
+          id: String(sibling.fileId),
+          timestamp: new Date(),
+          attempts: 2,
+          body: delivery,
+          ack() { controlAcked = true; },
+          retry() { controlRetried = true; },
+        }],
+        ackAll() {},
+        retryAll() {},
+      } as unknown as MessageBatch<ParseMessage>,
+      testEnv,
+    );
+    expect(controlAcked).toBe(true);
+    expect(controlRetried).toBe(false);
+    expect(sent).toContainEqual(delivery);
+    expect(await fileState(sibling.fileId)).toBe('reserved');
+  });
+
   it('an owner-tagged transient retry stays reserved and keeps its capability across continuations (3609651689)', async () => {
     budgets({ slice: 8, invocation: 8, kickPage: 500 });
     const owner = await uploadConvs('r16-tagged-retry-owner', [namedConv('r16-tagged-owner', 'owner')]);

@@ -28,7 +28,9 @@ interface FileRow {
  * check only re-enqueues NON-terminal rows). Every site that raises this first forces the file back to
  * 'pending' (hash-guarded); the consumer catch recognizes the sentinel and just retries the same message.
  * A send-late continuation is the exception: its owner is already correctly 'parsed', so a transient fan-out
- * read raises this sentinel without changing owner state and retries only that continuation. */
+ * read raises this sentinel without changing owner state and retries only that continuation. An owner-tagged
+ * reservation delivery that cannot re-enqueue behind its still-running owner is the other exception: it stays
+ * reserved and retries the exact capability instead of falling into the generic file-error path. */
 class ExportRetry extends Error {}
 
 export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: Env): Promise<void> {
@@ -94,10 +96,10 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
       // round 6 finding 3: the guarded-stale `continue` used to exit before the defer flag was set).
       deferRest = true;
       if (e instanceof ExportRetry) {
-        // A retryable (transient) export failure. The raising site already forced the file back to
-        // 'pending'; do NOT markError. Retry re-runs the same idempotent write/cleanup page. (Even if
-        // retries exhaust to the DLQ, the file rests 'pending' — visible to the pipeline-stuck alert, never
-        // silently errored with unreconciled stale sessions.)
+        // A retryable transient failure. Export raising sites already forced the file back to 'pending';
+        // an owner-tagged reservation deferral deliberately leaves it 'reserved'. Do NOT markError in either
+        // case: retry the exact message/capability. Even if retries exhaust to the DLQ, the non-terminal row
+        // remains visible to pipeline-stuck alerts and the files/check healing path.
         msg.retry();
         continue;
       }
@@ -267,7 +269,12 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
       .bind(reservationDelivery.owner)
       .first<{ parse_state: string }>();
     if (owner !== null && owner.parse_state !== 'parsed' && owner.parse_state !== 'error') {
-      await env.PARSE_QUEUE.send(job);
+      try {
+        await env.PARSE_QUEUE.send(job);
+      } catch (e) {
+        console.log(JSON.stringify({ event: 'parse.reservation_owner_defer_retry', file_id: file.id, owner: reservationDelivery.owner, error: String(e) }));
+        throw new ExportRetry('reservation-owner deferral send transient failure');
+      }
       console.log(JSON.stringify({ event: 'parse.deferred_reservation_owner', file_id: file.id, owner: reservationDelivery.owner }));
       return 3;
     }
