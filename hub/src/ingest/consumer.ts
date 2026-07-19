@@ -224,6 +224,7 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
   // reservation owner's replacement re-parses the row later. A changed-bytes re-upload stays reserved but
   // upgrades its stored intent/hash to upload, so it also waits for the ordering-safe owner delivery.
   const ownsReservation =
+    file.parse_state === 'reserved' &&
     job.reservation_owner !== undefined &&
     job.reservation_owner === file.reserved_by &&
     job.reservation_generation !== undefined &&
@@ -240,6 +241,9 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
     console.log(JSON.stringify({ event: 'parse.skipped_fresh_reservation', file_id: file.id, reason: job.reason }));
     return 1;
   }
+  const reservationDelivery: ReservationDelivery = ownsReservation
+    ? { owner: job.reservation_owner!, generation: job.reservation_generation! }
+    : null;
 
   // Reject a stale message at the source, before any R2 read or write: if this row's
   // content_hash has already moved on from what this message was enqueued for, a re-upload beat
@@ -253,6 +257,21 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
   // already passed). Messages enqueued before content_hash existed carry it as undefined and
   // skip this check entirely, same as every other hash guard in this file.
   if (job.content_hash !== undefined && file.content_hash !== job.content_hash) return 2;
+
+  // A changed upload refreshes its owner-tagged message immediately, including while the owner's cleanup is
+  // still deleting. Keep that message behind the ordering barrier: only a parsed (successful cleanup) or error
+  // (corrupt cleanup) owner has completed its reserve/delete window. Re-enqueueing retains the exact capability
+  // and places it behind the owner's already-queued continuation (3609651684).
+  if (reservationDelivery !== null) {
+    const owner = await env.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(reservationDelivery.owner)
+      .first<{ parse_state: string }>();
+    if (owner !== null && owner.parse_state !== 'parsed' && owner.parse_state !== 'error') {
+      await env.PARSE_QUEUE.send(job);
+      console.log(JSON.stringify({ event: 'parse.deferred_reservation_owner', file_id: file.id, owner: reservationDelivery.owner }));
+      return 3;
+    }
+  }
 
   const det = detect(file.store, file.relpath, file.machine_id);
 
@@ -283,7 +302,18 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
     // above, before any R2 read), so continuations are pinned to the bytes this parse actually read. NOT a
     // fresh read at send time, which would pin to post-re-upload bytes and defeat the guard. Only the first
     // legacy slice is unguarded; every continuation it enqueues carries this hash.
-    return 2 + (await parseExportInto(file, env, job.reason, job.content_hash ?? file.content_hash, job.offset ?? 0, job.cleanup_cursor, job.cleanup_phase, job.kick_cursor, job.reservation_count ?? 0));
+    return 2 + (await parseExportInto(
+      file,
+      env,
+      job.reason,
+      job.content_hash ?? file.content_hash,
+      job.offset ?? 0,
+      job.cleanup_cursor,
+      job.cleanup_phase,
+      job.kick_cursor,
+      job.reservation_count ?? 0,
+      reservationDelivery,
+    ));
   }
   if (!det.sessionId || !SINGLE_SESSION_HARNESSES.has(det.harness)) {
     await markParsed(file.id, env, 'skipped', undefined, undefined, job.content_hash);
@@ -481,6 +511,7 @@ async function failExportFile(
   msgReason: ParseMessage['reason'],
   kickCursor: number,
   reservationCount: number,
+  reservationDelivery: ReservationDelivery,
 ): Promise<number> {
   let spent = 0;
   const owned = await env.DB.prepare('SELECT session_id FROM sessions WHERE canonical_file_id = ?1').bind(file.id).all<{ session_id: string }>();
@@ -505,9 +536,9 @@ async function failExportFile(
       spent += 1;
       if (contended) {
         try {
-          await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason: msgReason, content_hash: contentHash });
+          await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason: msgReason, content_hash: contentHash, ...reservationFields(reservationDelivery) });
         } catch {
-          await forcePending(file, env, contentHash);
+          await forcePending(file, env, contentHash, reservationDelivery);
           console.log(JSON.stringify({ event: 'parse.export.error_defer_send_failed', file_id: file.id }));
           throw new ExportRetry('failExportFile contention defer send failed');
         }
@@ -531,9 +562,9 @@ async function failExportFile(
         await releaseOwnedReservations(file, env);
         spent += 1;
         try {
-          await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason: msgReason, content_hash: contentHash });
+          await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason: msgReason, content_hash: contentHash, ...reservationFields(reservationDelivery) });
         } catch {
-          await forcePending(file, env, contentHash);
+          await forcePending(file, env, contentHash, reservationDelivery);
           throw new ExportRetry('failExportFile lost-reservation restart send failed');
         }
         console.log(
@@ -563,9 +594,10 @@ async function failExportFile(
           content_hash: contentHash,
           kick_cursor: r.kickCursor,
           reservation_count: expectedReservations,
+          ...reservationFields(reservationDelivery),
         });
       } catch {
-        await forcePending(file, env, contentHash);
+        await forcePending(file, env, contentHash, reservationDelivery);
         console.log(JSON.stringify({ event: 'parse.export.error_reserve_send_failed', file_id: file.id, kick_cursor: r.kickCursor }));
         throw new ExportRetry('failExportFile reserve continuation send failed');
       }
@@ -643,6 +675,13 @@ export let EXPORT_KICK_PAGE = 50;
 // siblings left 'reserved' heal via files/check. Not budget-dialed; a plain module const (exported for tests).
 export const EXPORT_SEND_FAILURE_LIMIT = 5;
 
+type ReservationDelivery = { owner: number; generation: number } | null;
+
+function reservationFields(delivery: ReservationDelivery): Pick<ParseMessage, 'reservation_owner' | 'reservation_generation'> {
+  if (delivery === null) return {};
+  return { reservation_owner: delivery.owner, reservation_generation: delivery.generation };
+}
+
 /** Test-only: dial the export/invocation subrequest budgets down so slicing/cleanup/deferral can be
  * exercised with tiny fixtures instead of thousands of conversations. */
 export function __setExportBudgetsForTest(o: { slice?: number; invocation?: number; ceiling?: number; cap?: number; normalReserve?: number; kickPage?: number }): void {
@@ -696,13 +735,14 @@ async function parseExportInto(
   cleanupPhase?: ParseMessage['cleanup_phase'],
   kickCursor?: number,
   reservationCount = 0,
+  reservationDelivery: ReservationDelivery = null,
 ): Promise<number> {
   const written = new Set<string>();
   try {
-    return await runExportParse(file, env, reason, contentHash, offset, cleanupCursor, cleanupPhase, kickCursor, reservationCount, written);
+    return await runExportParse(file, env, reason, contentHash, offset, cleanupCursor, cleanupPhase, kickCursor, reservationCount, written, reservationDelivery);
   } catch (e) {
-    if (e instanceof ExportRetry) throw e; // raising site already reverted + forced 'pending'; pass through
-    return await raiseExportRetry(file, env, written, contentHash, e);
+    if (e instanceof ExportRetry) throw e; // raising site already reverted + restored retryable state; pass through
+    return await raiseExportRetry(file, env, written, contentHash, e, reservationDelivery);
   }
 }
 
@@ -717,6 +757,7 @@ async function runExportParse(
   kickCursor: number | undefined,
   reservationCount: number,
   written: Set<string>,
+  reservationDelivery: ReservationDelivery,
 ): Promise<number> {
   const obj = await env.RAW.get(file.r2_key);
   if (!obj) {
@@ -724,7 +765,7 @@ async function runExportParse(
     // generic consumer catch: it flips sessions by files.session_id, which is NULL for an archive
     // row, so the sessions this ZIP is canonical for would keep a stale 'ready' state that
     // loadNormalized()/raw can no longer reconstruct. Handle it like an invalid archive instead.
-    return await failExportFile(file, env, contentHash, `r2_object_missing:${file.r2_key}`, reason, kickCursor ?? 0, reservationCount);
+    return await failExportFile(file, env, contentHash, `r2_object_missing:${file.r2_key}`, reason, kickCursor ?? 0, reservationCount, reservationDelivery);
   }
   const archive = parseExportArchive(new Uint8Array(await obj.arrayBuffer()));
 
@@ -744,7 +785,7 @@ async function runExportParse(
   // so /status surfaces it instead of silently reporting the replacement as parsed. (An empty-but-
   // valid array is `valid` and falls through to normal write + cleanup, clearing what it owned.)
   if (!archive.valid) {
-    return await failExportFile(file, env, contentHash, archive.error ?? 'invalid export archive', reason, kickCursor ?? 0, reservationCount);
+    return await failExportFile(file, env, contentHash, archive.error ?? 'invalid export archive', reason, kickCursor ?? 0, reservationCount, reservationDelivery);
   }
 
   // A NON-empty archive (recognized layout, conversations present) that parses to zero turns across
@@ -757,7 +798,7 @@ async function runExportParse(
   // at least one turn-bearing conversation writes normally.
   const totalTurns = archive.sessions.reduce((n, s) => n + s.turns.length, 0);
   if (archive.sessions.length > 0 && totalTurns === 0) {
-    return await failExportFile(file, env, contentHash, 'export archive parsed to zero turns across all conversations (content-shape drift)', reason, kickCursor ?? 0, reservationCount);
+    return await failExportFile(file, env, contentHash, 'export archive parsed to zero turns across all conversations (content-shape drift)', reason, kickCursor ?? 0, reservationCount, reservationDelivery);
   }
 
   // Session ids we actually WROTE this parse (turns > 0 and not owned by a HEALTHY live CDP
@@ -879,7 +920,7 @@ async function runExportParse(
     // A transient D1 throw mid-slice. Revert THIS invocation's writes (the in-flight conversation + this
     // slice) and retry the same message at the same offset — NOT a whole-file revert, which would strand
     // earlier slices a same-offset retry never rewrites (round 6 finding 2), and NOT a terminal 'error'.
-    await raiseExportRetry(file, env, written, contentHash, e);
+    await raiseExportRetry(file, env, written, contentHash, e, reservationDelivery);
   }
   const sliceEnd = idx;
   const writesComplete = sliceEnd >= archive.sessions.length;
@@ -911,7 +952,14 @@ async function runExportParse(
     // rewrites this slice and re-sends), forces 'pending', and raises ExportRetry so the message retries.
     // Reverting earlier slices here would strand them, since the retry resumes at THIS offset (round 6
     // finding 2).
-    await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: contentHash, offset: sliceEnd });
+    await env.PARSE_QUEUE.send({
+      file_id: file.id,
+      r2_key: file.r2_key,
+      reason,
+      content_hash: contentHash,
+      offset: sliceEnd,
+      ...reservationFields(reservationDelivery),
+    });
     console.log(
       JSON.stringify({ event: 'parse.export.slice', file_id: file.id, offset, slice_end: sliceEnd, total: archive.sessions.length, written: written.size }),
     );
@@ -993,9 +1041,9 @@ async function runExportParse(
       spent += 1;
       await revertOwnedReady(file, env);
       try {
-        await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: contentHash });
+        await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: contentHash, ...reservationFields(reservationDelivery) });
       } catch {
-        await forcePending(file, env, contentHash);
+        await forcePending(file, env, contentHash, reservationDelivery);
         throw new ExportRetry('cleanup lost-reservation restart send failed');
       }
       console.log(
@@ -1032,6 +1080,7 @@ async function runExportParse(
         r.kickCursor,
         expectedReservations,
         'reserve',
+        reservationDelivery,
       );
       console.log(JSON.stringify({ event: 'parse.export.reserve', file_id: file.id, kick_cursor: r.kickCursor, done: false }));
       return spent;
@@ -1088,9 +1137,9 @@ async function runExportParse(
           // loop — the store frees within a few invocations under max_concurrency:1 (the reserving cleanup's
           // own messages run ahead of this re-enqueue), and the retry proceeds then. Nothing was mutated here.
           try {
-            await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: contentHash });
+            await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: contentHash, ...reservationFields(reservationDelivery) });
           } catch {
-            await forcePending(file, env, contentHash);
+            await forcePending(file, env, contentHash, reservationDelivery);
             throw new ExportRetry('cleanup contention defer re-enqueue send failed');
           }
           console.log(JSON.stringify({ event: 'parse.export.cleanup_deferred', file_id: file.id, cursor }));
@@ -1114,6 +1163,7 @@ async function runExportParse(
             r.kickCursor,
             expectedReservations,
             'reserve',
+            reservationDelivery,
           );
           console.log(JSON.stringify({ event: 'parse.export.reserve', file_id: file.id, kick_cursor: r.kickCursor, cursor, done: false }));
           return spent;
@@ -1166,6 +1216,7 @@ async function runExportParse(
       undefined,
       expectedReservations,
       reserved ? 'delete' : 'scan',
+      reservationDelivery,
     );
     console.log(JSON.stringify({ event: 'parse.export.cleanup', file_id: file.id, cursor, phase: reserved ? 'delete' : 'scan', recovered: recovered.size, done: false }));
     return spent;
@@ -1233,6 +1284,7 @@ async function sendCleanupContinuation(
   kickCursor: number | undefined,
   reservationCount: number,
   label: string,
+  reservationDelivery: ReservationDelivery,
 ): Promise<void> {
   try {
     await env.PARSE_QUEUE.send({
@@ -1245,9 +1297,10 @@ async function sendCleanupContinuation(
       cleanup_cursor: cleanupCursor,
       kick_cursor: kickCursor,
       reservation_count: reservationCount,
+      ...reservationFields(reservationDelivery),
     });
   } catch {
-    await forcePending(file, env, contentHash);
+    await forcePending(file, env, contentHash, reservationDelivery);
     console.log(JSON.stringify({ event: 'parse.export.cleanup_send_failed', file_id: file.id, phase: label, cursor: cleanupCursor }));
     throw new ExportRetry(`cleanup ${label} continuation send failed`);
   }
@@ -1622,18 +1675,36 @@ async function revertSlice(written: Set<string>, env: Env): Promise<void> {
   for (const chunk of chunkArr(stmts, 90)) await env.DB.batch(chunk);
 }
 
-/** Force this file back to parse_state='pending' (hash-guarded when the message carries a hash, so a
- * concurrent fresh upload that already moved the row on is not clobbered). The invariant every retryable
- * export failure restores: a row with an outstanding parse message must be NON-TERMINAL, so files/check
- * and the same-hash upload fast path can re-enqueue it. */
-async function forcePending(file: FileRow, env: Env, contentHash: string | undefined): Promise<void> {
+/** Restore the retryable state (hash-guarded when the message carries a hash, so a concurrent fresh upload
+ * that already moved the row on is not clobbered). Ordinary parses return to pending. An exact owner-tagged
+ * delivery remains reserved with its ownership tuple intact; changing it to pending would expose it to a
+ * competing cleanup/files-check before the retry fills the sessions its owner deleted (3609651689). */
+async function forcePending(
+  file: FileRow,
+  env: Env,
+  contentHash: string | undefined,
+  reservationDelivery: ReservationDelivery = null,
+): Promise<void> {
+  if (reservationDelivery !== null) {
+    const hashGuard = contentHash !== undefined ? ' AND content_hash = ?2' : '';
+    const ownerPosition = contentHash !== undefined ? 3 : 2;
+    await env.DB.prepare(
+      `UPDATE files SET parse_state = 'reserved' WHERE id = ?1${hashGuard} AND parse_state = 'reserved'
+       AND reserved_by = ?${ownerPosition} AND reservation_generation = ?${ownerPosition + 1}`,
+    )
+      .bind(...(contentHash !== undefined
+        ? [file.id, contentHash, reservationDelivery.owner, reservationDelivery.generation]
+        : [file.id, reservationDelivery.owner, reservationDelivery.generation]))
+      .run();
+    return;
+  }
   await env.DB.prepare(`UPDATE files SET parse_state = 'pending' WHERE id = ?1${contentHash !== undefined ? ' AND content_hash = ?2' : ''}`)
     .bind(...(contentHash !== undefined ? [file.id, contentHash] : [file.id]))
     .run();
 }
 
-/** Handle a transient (retryable) throw out of an export parse: revert THIS invocation's writes, force the
- * file 'pending', and raise the ExportRetry sentinel so the consumer retries the same idempotent message
+/** Handle a transient (retryable) throw out of an export parse: revert THIS invocation's writes, restore the
+ * file's retryable pending/reserved state, and raise the ExportRetry sentinel so the consumer retries the same idempotent message
  * rather than marking a session_id-NULL archive terminal 'error' with stranded 'ready' rows. Never reverts
  * earlier slices (revertSlice is per-invocation) — a same-offset retry rewrites only this slice.
  *
@@ -1644,14 +1715,21 @@ async function forcePending(file: FileRow, env: Env, contentHash: string | undef
  * rows 'ready', but the same-offset retry rewrites them idempotently; a failed forcePending leaves the file
  * non-terminal ('parsing'), which files/check re-enqueues, and the sentinel already retries this message.
  * Both converge on a clean reparse. So we log each failure and ALWAYS raise ExportRetry. */
-async function raiseExportRetry(file: FileRow, env: Env, written: Set<string>, contentHash: string | undefined, e: unknown): Promise<never> {
+async function raiseExportRetry(
+  file: FileRow,
+  env: Env,
+  written: Set<string>,
+  contentHash: string | undefined,
+  e: unknown,
+  reservationDelivery: ReservationDelivery,
+): Promise<never> {
   try {
     await revertSlice(written, env);
   } catch (revertErr) {
     console.log(JSON.stringify({ event: 'parse.export.revert_failed', file_id: file.id, error: String(revertErr) }));
   }
   try {
-    await forcePending(file, env, contentHash);
+    await forcePending(file, env, contentHash, reservationDelivery);
   } catch (pendingErr) {
     console.log(JSON.stringify({ event: 'parse.export.force_pending_failed', file_id: file.id, error: String(pendingErr) }));
   }

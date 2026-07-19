@@ -1145,7 +1145,9 @@ describe('a fresh reservation is left to its cleanup owner; the heal paths do no
     const hash = parsed!.content_hash;
 
     // Flip to a FRESH reservation, exactly as the export RESERVE phase does (state + reserved_at together).
-    await testEnv.DB.prepare("UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id = ?1").bind(fileId).run();
+    await testEnv.DB.prepare(
+      "UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = 424242, reserved_reason = 'recover' WHERE id = ?1",
+    ).bind(fileId).run();
 
     // A fresh reservation belongs to its reserving cleanup; neither heal path may re-enqueue it (an 'upload'
     // parse mid-window would escape the reserved set and lose the sessions that cleanup is about to delete).
@@ -1174,8 +1176,12 @@ describe('a fresh reservation is left to its cleanup owner; the heal paths do no
     try {
       const checkRes2 = await checkFilesResync(hash);
       expect(checkRes2.status).toBe(200);
-      expect(spy2).toHaveBeenCalledWith(expect.objectContaining({ file_id: fileId, r2_key: r2Key }));
+      expect(spy2).toHaveBeenCalledWith(expect.objectContaining({ file_id: fileId, r2_key: r2Key, reason: 'recover' }));
       expect(await stateOf(fileId)).toBe('pending'); // stale reservation healed like any non-terminal row
+      const healed = await testEnv.DB.prepare('SELECT reserved_by, reserved_reason FROM files WHERE id = ?1')
+        .bind(fileId)
+        .first<{ reserved_by: number | null; reserved_reason: string | null }>();
+      expect(healed).toEqual({ reserved_by: null, reserved_reason: null });
     } finally {
       spy2.mockRestore();
     }

@@ -223,10 +223,16 @@ export async function recordUploadedObject(
            THEN CASE WHEN files.content_hash = excluded.content_hash THEN files.reserved_reason ELSE 'upload' END
          ELSE NULL END,
        uploaded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-     RETURNING id, parse_state, reserved_reason`,
+     RETURNING id, parse_state, reserved_reason, reserved_by, reservation_generation`,
   )
     .bind(machineId, store, relpath, r2Key, size, mtime, sha256, det.harness, det.sessionId ?? null, reservationCutoffIso())
-    .first<{ id: number; parse_state: string; reserved_reason: string | null }>();
+    .first<{
+      id: number;
+      parse_state: string;
+      reserved_reason: string | null;
+      reserved_by: number | null;
+      reservation_generation: number;
+    }>();
   const preservedReservation = row!.parse_state === 'reserved';
   const reservedUpload = preservedReservation && row!.reserved_reason === 'upload';
 
@@ -280,7 +286,19 @@ export async function recordUploadedObject(
   // The simple path has no observed-R2 convergence (convergeR2WithRow above only restores bytes, never
   // changes the row hash), so realigned is always false there and it enqueues our hash.
   const realigned = opts.convergeObservedR2 === true && (await convergeMultipartRow(row!.id, r2Key, sha256, env));
-  if (!realigned && !preservedReservation) {
+  if (!realigned && preservedReservation && reservedUpload && row!.reserved_by !== null) {
+    // The cleanup may already have selected an owner-tagged delivery for the old hash. Refresh it with the
+    // current hash; parseOne waits for the owner to become terminal, so this is safe both before and after
+    // its delete window drains (3609651684).
+    await env.PARSE_QUEUE.send({
+      file_id: row!.id,
+      r2_key: r2Key,
+      reason: 'upload',
+      content_hash: sha256,
+      reservation_owner: row!.reserved_by,
+      reservation_generation: row!.reservation_generation,
+    });
+  } else if (!realigned && !preservedReservation) {
     await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
   }
 
@@ -333,16 +351,25 @@ export async function convergeMultipartRow(fileId: number, r2Key: string, sha256
        reserved_reason = CASE
          WHEN parse_state = 'reserved' AND reserved_at IS NOT NULL AND reserved_at > ?6 THEN 'upload'
          ELSE NULL END
-     WHERE id = ?1 AND content_hash = ?5 RETURNING id, parse_state`,
+     WHERE id = ?1 AND content_hash = ?5 RETURNING id, parse_state, reserved_by, reservation_generation`,
   )
     .bind(fileId, r2Hash, mtime, head!.size, sha256, reservationCutoffIso())
-    .first<{ id: number; parse_state: string }>();
+    .first<{ id: number; parse_state: string; reserved_by: number | null; reservation_generation: number }>();
   if (!updated) return false; // lost the row to the other writer in the meantime
   // If convergence discovers that R2 actually contains different bytes, this is a real changed-hash upload.
   // Flip every session the archive owns so ready rows never describe the pre-realignment object. A live
   // reservation remains owner-controlled and defers the enqueue; otherwise enqueue immediately.
   await flipOwnedSessionsToParsing(fileId, null, r2Hash, env);
-  if (updated.parse_state !== 'reserved') {
+  if (updated.parse_state === 'reserved' && updated.reserved_by !== null) {
+    await env.PARSE_QUEUE.send({
+      file_id: fileId,
+      r2_key: r2Key,
+      reason: 'upload',
+      content_hash: r2Hash,
+      reservation_owner: updated.reserved_by,
+      reservation_generation: updated.reservation_generation,
+    });
+  } else {
     await env.PARSE_QUEUE.send({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: r2Hash });
   }
   console.log(JSON.stringify({ event: 'access.multipart_converge', key: r2Key, from: sha256, to: r2Hash }));

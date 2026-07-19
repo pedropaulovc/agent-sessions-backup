@@ -2,7 +2,7 @@ import { SELF, env as testEnvRaw } from 'cloudflare:test';
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import worker from '../src/index';
 import { __setExportBudgetsForTest, EXPORT_SEND_FAILURE_LIMIT } from '../src/ingest/consumer';
-import { isFreshReservation } from '../src/queue';
+import { isFreshReservation, markPendingAndEnqueue } from '../src/queue';
 import { CLAUDE_WEB_ROOT, claudeExportZip, claudeWebConversation, type ClaudeConvOpts, type ClaudeWebMessage } from './web-fixtures';
 
 const testEnv = testEnvRaw as unknown as Env;
@@ -2257,7 +2257,7 @@ describe('reservation intent and retry safety (round 16)', () => {
     ],
   });
 
-  it('a changed-byte upload keeps its cleanup reservation and the current row does not contend with itself (3609611899, 3609611900)', async () => {
+  it('a changed-byte upload refreshes its tagged delivery but waits for cleanup before parsing (3609611899, 3609611900, 3609651684)', async () => {
     budgets({ slice: 800, invocation: 800, kickPage: 500 });
     const kept = 'r16-changed-reserved-kept';
     const dropped = 'r16-changed-reserved-dropped';
@@ -2275,6 +2275,7 @@ describe('reservation intent and retry safety (round 16)', () => {
     )
       .bind(sibling.fileId, owner.fileId)
       .run();
+    await testEnv.DB.prepare("UPDATE files SET parse_state = 'pending' WHERE id = ?1").bind(owner.fileId).run();
 
     sent.length = 0;
     const changed = await uploadConvs(
@@ -2288,16 +2289,33 @@ describe('reservation intent and retry safety (round 16)', () => {
       .bind(sibling.fileId)
       .first<{ parse_state: string; reserved_by: number | null; reserved_reason: string | null; reservation_generation: number }>();
     expect(reservation).toMatchObject({ parse_state: 'reserved', reserved_by: owner.fileId, reserved_reason: 'upload' });
-    expect(sent.some((m) => m.file_id === sibling.fileId)).toBe(false); // no parse before owner cleanup drains
-
-    await deliverChain({
-      file_id: sibling.fileId,
-      r2_key: changed.r2Key,
+    const refreshed = sent.find((m) => m.file_id === sibling.fileId);
+    expect(refreshed).toMatchObject({
       reason: 'upload',
       content_hash: changed.hash,
       reservation_owner: owner.fileId,
       reservation_generation: reservation!.reservation_generation,
     });
+
+    sent.length = 0;
+    expect(await markPendingAndEnqueue(
+      { id: sibling.fileId, r2_key: changed.r2Key, content_hash: changed.hash },
+      'upload',
+      testEnv,
+    )).toBe(true);
+    const retryRefresh = sent.find((m) => m.file_id === sibling.fileId);
+    expect(retryRefresh).toEqual(refreshed); // same-hash retry repairs a failed first enqueue
+
+    sent.length = 0;
+    await deliver(retryRefresh!);
+    const deferred = sent.find((m) => m.file_id === sibling.fileId);
+    expect(deferred).toEqual(refreshed); // same current-hash capability moved behind owner continuation
+    expect(await fileState(sibling.fileId)).toBe('reserved');
+    expect(await sessionState(dropped)).toBe('parsing'); // changed bytes visible as in-progress, not deleted early
+
+    await testEnv.DB.prepare("UPDATE files SET parse_state = 'parsed' WHERE id = ?1").bind(owner.fileId).run();
+
+    await deliverChain(deferred!);
 
     expect(await fileState(sibling.fileId)).toBe('parsed');
     expect(await sessionState(dropped)).toBeNull();
@@ -2305,8 +2323,62 @@ describe('reservation intent and retry safety (round 16)', () => {
       .bind(kept)
       .first<{ title: string; canonical_file_id: number }>();
     expect(current).toMatchObject({ title: 'changed kept', canonical_file_id: sibling.fileId });
-    // Positive controls: clearing the reservation at upload time would have emitted an early untagged parse;
-    // retaining it but probing only reserved_by != current id would defer on this very row and strand dropped.
+    // Positive controls: suppressing the refresh strands the new hash behind the stale queued message;
+    // parsing the refresh immediately violates delete ordering; probing only reserved_by != current id then
+    // defers on this very row and strands dropped.
+  });
+
+  it('an owner-tagged transient retry stays reserved and keeps its capability across continuations (3609651689)', async () => {
+    budgets({ slice: 8, invocation: 8, kickPage: 500 });
+    const owner = await uploadConvs('r16-tagged-retry-owner', [namedConv('r16-tagged-owner', 'owner')]);
+    await deliverChain({ file_id: owner.fileId, r2_key: owner.r2Key, reason: 'upload', content_hash: owner.hash });
+    const sibling = await uploadConvs(
+      'r16-tagged-retry-sibling',
+      [namedConv('r16-tagged-retry-a', 'retry a'), namedConv('r16-tagged-retry-b', 'retry b')],
+    );
+    await deliverChain({ file_id: sibling.fileId, r2_key: sibling.r2Key, reason: 'upload', content_hash: sibling.hash });
+    await testEnv.DB.prepare(
+      "UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = ?2, reserved_reason = 'recover', reservation_generation = reservation_generation + 1 WHERE id = ?1",
+    ).bind(sibling.fileId, owner.fileId).run();
+    const generation = await testEnv.DB.prepare('SELECT reservation_generation FROM files WHERE id = ?1')
+      .bind(sibling.fileId)
+      .first<{ reservation_generation: number }>();
+    const delivery: ParseMessage = {
+      file_id: sibling.fileId,
+      r2_key: sibling.r2Key,
+      reason: 'recover',
+      content_hash: sibling.hash,
+      reservation_owner: owner.fileId,
+      reservation_generation: generation!.reservation_generation,
+    };
+
+    const restore = throwOnNthBatch(1);
+    try {
+      await deliver(delivery);
+    } finally {
+      restore();
+    }
+    const afterThrow = await testEnv.DB.prepare(
+      'SELECT parse_state, reserved_by, reservation_generation FROM files WHERE id = ?1',
+    )
+      .bind(sibling.fileId)
+      .first<{ parse_state: string; reserved_by: number | null; reservation_generation: number }>();
+    expect(afterThrow).toEqual({
+      parse_state: 'reserved',
+      reserved_by: owner.fileId,
+      reservation_generation: generation!.reservation_generation,
+    });
+
+    sent.length = 0;
+    await deliver(delivery);
+    const continuation = sent.find((m) => m.file_id === sibling.fileId && typeof m.offset === 'number');
+    expect(continuation).toMatchObject({
+      reservation_owner: owner.fileId,
+      reservation_generation: generation!.reservation_generation,
+    });
+    await deliverChain(continuation!);
+    expect(await fileState(sibling.fileId)).toBe('parsed');
+    expect(await reservedByOf(sibling.fileId)).toBeNull();
   });
 
   it('a reserved pending upload keeps upload semantics and can replace healthy rows from an older archive (3609060878)', async () => {

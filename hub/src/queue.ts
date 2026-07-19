@@ -26,13 +26,57 @@ export async function markPendingAndEnqueue(
   // `force` breaks even a fresh reservation — for callers that are the recovery MECHANISM, not a redundant
   // heal (the web-session recover chain: it deliberately re-parses a chosen candidate).
   const guard = opts.force ? '' : " AND NOT (parse_state = 'reserved' AND reserved_at IS NOT NULL AND reserved_at > ?2)";
-  const stmt = env.DB.prepare(`UPDATE files SET parse_state = 'pending', reserved_at = NULL, reserved_by = NULL, reserved_reason = NULL WHERE id = ?1${guard} RETURNING id`);
-  const updated = await (opts.force ? stmt.bind(file.id) : stmt.bind(file.id, reservationCutoffIso())).first<{ id: number }>();
-  if (!updated) {
+  // Keep a stale reservation's intent just long enough to read it inside this atomic batch, then clear the
+  // tuple before sending. A recover reservation must heal as recover, not be promoted to the caller's usual
+  // upload reason (3609651686). Incrementing the generation invalidates any abandoned owner-tagged delivery.
+  const carryReason = opts.force ? 'NULL' : "CASE WHEN parse_state = 'reserved' THEN reserved_reason ELSE NULL END";
+  const transition = env.DB.prepare(
+    `UPDATE files SET parse_state = 'pending', reserved_at = NULL, reserved_by = NULL,
+       reserved_reason = ${carryReason},
+       reservation_generation = CASE WHEN parse_state = 'reserved' THEN reservation_generation + 1 ELSE reservation_generation END
+     WHERE id = ?1${guard} RETURNING id`,
+  );
+  const boundTransition = opts.force ? transition.bind(file.id) : transition.bind(file.id, reservationCutoffIso());
+  const [updated, intent] = await env.DB.batch([
+    boundTransition,
+    env.DB.prepare(
+      'SELECT parse_state, reserved_at, reserved_by, reserved_reason, reservation_generation FROM files WHERE id = ?1',
+    ).bind(file.id),
+    env.DB.prepare("UPDATE files SET reserved_reason = NULL WHERE id = ?1 AND parse_state = 'pending'").bind(file.id),
+  ]);
+  const intentRow = intent?.results?.[0] as {
+    parse_state: string;
+    reserved_at: string | null;
+    reserved_by: number | null;
+    reserved_reason: string | null;
+    reservation_generation: number;
+  } | undefined;
+  if ((updated?.results?.length ?? 0) === 0) {
+    // A same-hash retry/files-check can arrive after a changed reserved upload's refreshed queue send failed.
+    // Refresh that exact owner capability without breaking the live window; parseOne defers it until the owner
+    // finishes. Recover reservations still remain untouched and wait for their owner's send-late.
+    if (
+      intentRow?.reserved_reason === 'upload' &&
+      intentRow.reserved_by !== null &&
+      isFreshReservation(intentRow)
+    ) {
+      await env.PARSE_QUEUE.send({
+        file_id: file.id,
+        r2_key: file.r2_key,
+        reason: 'upload',
+        content_hash: file.content_hash,
+        reservation_owner: intentRow.reserved_by,
+        reservation_generation: intentRow.reservation_generation,
+      });
+      console.log(JSON.stringify({ event: 'requeue.refreshed_reserved_upload', file_id: file.id }));
+      return true;
+    }
     console.log(JSON.stringify({ event: 'requeue.skipped_fresh_reservation', file_id: file.id, reason }));
     return false;
   }
-  await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: file.content_hash });
+  const storedReason = intentRow?.reserved_reason;
+  const effectiveReason: ParseMessage['reason'] = storedReason === 'recover' || storedReason === 'upload' ? storedReason : reason;
+  await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason: effectiveReason, content_hash: file.content_hash });
   return true;
 }
 
