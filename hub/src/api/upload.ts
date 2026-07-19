@@ -394,6 +394,16 @@ export async function convergeMultipartRow(
     .first<{ id: number; parse_state: string; reserved_by: number | null; reservation_generation: number }>();
   if (!updated) return false; // lost the row to the other writer in the meantime
   if (knownOther) {
+    if (updated.parse_state === 'reserved' && updated.reserved_by !== null) {
+      await env.PARSE_QUEUE.send({
+        file_id: fileId,
+        r2_key: r2Key,
+        reason: 'upload',
+        content_hash: r2Hash,
+        reservation_owner: updated.reserved_by,
+        reservation_generation: updated.reservation_generation,
+      });
+    }
     console.log(JSON.stringify({ event: 'access.multipart_converge', key: r2Key, from: sha256, to: r2Hash }));
     return true;
   }

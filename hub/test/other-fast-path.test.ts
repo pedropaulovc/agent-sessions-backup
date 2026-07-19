@@ -242,6 +242,59 @@ describe("known 'other' files bypass the parse queue", () => {
     expect(sendSpy).not.toHaveBeenCalled();
   });
 
+  it('refreshes a reserved owner delivery when known-other multipart convergence changes the hash', async () => {
+    const machine = 'other-multipart-reserved-box';
+    const relpath = 'archives/multipart-reserved.7z';
+    const original = new TextEncoder().encode('multipart reservation bytes v1');
+    const surviving = new TextEncoder().encode('multipart reservation bytes v2');
+    const originalHash = await sha256Hex(original);
+    const survivingHash = await sha256Hex(surviving);
+    const first = await put(machine, relpath, original);
+    const fileId = (await first.json<{ file_id: number }>()).file_id;
+    const r2Key = `raw/${machine}/${STORE}/${relpath}`;
+    const owner = await testEnv.DB.prepare(
+      `INSERT INTO files (machine_id, store, relpath, r2_key, size, content_hash, harness, parse_state)
+       VALUES (?1, 'export-inbox', 'claude-export-multipart-owner.zip', ?2, 1, ?3, 'claude-web', 'pending')
+       RETURNING id`,
+    )
+      .bind(machine, `raw/${machine}/export-inbox/claude-export-multipart-owner.zip`, 'b'.repeat(64))
+      .first<{ id: number }>();
+    await testEnv.DB.prepare(
+      `UPDATE files SET parse_state = 'reserved',
+         reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = ?2,
+         reserved_reason = 'recover', reservation_generation = 17
+       WHERE id = ?1`,
+    )
+      .bind(fileId, owner!.id)
+      .run();
+    await testEnv.RAW.put(r2Key, surviving, { sha256: survivingHash });
+    const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
+
+    expect(await convergeMultipartRow(fileId, r2Key, originalHash, testEnv, true)).toBe(true);
+    expect(sendSpy).toHaveBeenCalledOnce();
+    expect(sendSpy).toHaveBeenCalledWith({
+      file_id: fileId,
+      r2_key: r2Key,
+      reason: 'upload',
+      content_hash: survivingHash,
+      reservation_owner: owner!.id,
+      reservation_generation: 17,
+    });
+    expect(
+      await testEnv.DB.prepare(
+        'SELECT parse_state, content_hash, reserved_by, reserved_reason, reservation_generation FROM files WHERE id = ?1',
+      )
+        .bind(fileId)
+        .first(),
+    ).toEqual({
+      parse_state: 'reserved',
+      content_hash: survivingHash,
+      reserved_by: owner!.id,
+      reserved_reason: 'upload',
+      reservation_generation: 17,
+    });
+  });
+
   it('admin reindex recreates known-other rows as skipped and reports zero enqueued', async () => {
     const machine = 'other-reindex-box';
     const relpath = 'archives/reindex.7z';
