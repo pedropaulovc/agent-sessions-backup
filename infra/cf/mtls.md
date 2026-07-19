@@ -81,9 +81,9 @@ edge before it reaches the Worker.
 From native PowerShell, set the short-lived token and run one command:
 
 ```powershell
-$env:CF_API_TOKEN = '<token from above>'
+$env:CLOUDFLARE_API_TOKEN = '<token from above>'
 uv run infra/cf/enroll-cert.py
-Remove-Item Env:CF_API_TOKEN
+Remove-Item Env:CLOUDFLARE_API_TOKEN
 ```
 
 The Python script handles the complete local flow: it preflights both token permissions,
@@ -94,13 +94,19 @@ the complete stored tuple. It then configures the collector, runs `doctor` with 
 authenticated `/api/v1/status` probe, performs one live collector pass, and installs the
 15-minute schedule.
 
+When an older Git Bash run left material in a repository-local `.config/agent-collector`,
+the script checks a bounded set of current and legacy checkout locations for the exact
+machine id and resumes that verified material in place. If more than one location
+matches, it stops and lists them; select one explicitly with `--out <directory>` after
+inspection.
+
 Use `--admin` when this machine needs hub admin endpoints, `--machine-id <id>` only to
 override the collector-derived id, `--out <directory>` to move the working material, or
 `--no-schedule` to stop after the verified one-shot upload. On POSIX, use the same command
 with an environment assignment:
 
 ```bash
-CF_API_TOKEN='<token from above>' uv run infra/cf/enroll-cert.py
+CLOUDFLARE_API_TOKEN='<token from above>' uv run infra/cf/enroll-cert.py
 ```
 
 The token is sent only in Cloudflare HTTPS headers. It is never placed in argv, written to

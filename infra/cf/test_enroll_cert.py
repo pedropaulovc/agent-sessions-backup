@@ -512,19 +512,82 @@ class CollectorFlowTests(unittest.TestCase):
             with mock.patch.object(enroll.Path, "cwd", return_value=root):
                 self.assertEqual(enroll.output_dir_for("test-windows", None), out.resolve())
 
+    def test_legacy_windows_checkout_artifacts_are_discovered(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            home = root / "Users" / "pedro"
+            cwd = root / "src" / "agent-sessions-backup"
+            legacy = home / "src" / "agent-sessions-backup" / ".config" / "agent-collector"
+            cwd.mkdir(parents=True)
+            legacy.mkdir(parents=True)
+            (legacy / "test-windows.client.pem.new").write_text("certificate")
+            with (
+                mock.patch.object(enroll.Path, "home", return_value=home),
+                mock.patch.object(enroll.Path, "cwd", return_value=cwd),
+            ):
+                self.assertEqual(enroll.output_dir_for("test-windows", None), legacy.resolve())
+
+    def test_multiple_exact_machine_artifact_directories_are_ambiguous(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            first = root / "current" / ".config" / "agent-collector"
+            second = root / "legacy" / ".config" / "agent-collector"
+            first.mkdir(parents=True)
+            second.mkdir(parents=True)
+            (first / "test-windows.client.pem").write_text("first")
+            (second / "test-windows.client.key").write_text("second")
+            (second / "other-windows.client.pem").write_text("unrelated")
+            with mock.patch.object(enroll, "output_dir_candidates", return_value=(first, second)):
+                with self.assertRaisesRegex(enroll.EnrollmentError, "multiple candidate directories") as raised:
+                    enroll.output_dir_for("test-windows", None)
+            self.assertIn(str(first), str(raised.exception))
+            self.assertIn(str(second), str(raised.exception))
+            self.assertIn("--out <directory>", str(raised.exception))
+
+    def test_artifacts_for_another_machine_do_not_select_legacy_directory(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            home = root / "Users" / "pedro"
+            legacy = home / "src" / "agent-sessions-backup" / ".config" / "agent-collector"
+            default = home / ".config" / "agent-collector"
+            legacy.mkdir(parents=True)
+            (legacy / "other-windows.client.pem.new").write_text("unrelated")
+            with (
+                mock.patch.object(enroll.Path, "home", return_value=home),
+                mock.patch.object(enroll, "output_dir_candidates", return_value=(legacy, default)),
+            ):
+                self.assertEqual(enroll.output_dir_for("test-windows", None), default.resolve())
+
+    def test_explicit_output_directory_wins_over_discovery(self):
+        with tempfile.TemporaryDirectory() as raw:
+            explicit = Path(raw) / "chosen"
+            with mock.patch.object(enroll, "output_dir_candidates") as candidates:
+                self.assertEqual(enroll.output_dir_for("test-windows", str(explicit)), explicit.resolve())
+            candidates.assert_not_called()
+
     def test_main_resumes_imported_windows_cert_before_loading_private_key(self):
+        class TokenEnvironment(dict):
+            def get(self, key, default=None):
+                if key == "CF_API_TOKEN":
+                    raise AssertionError("main must not read the deprecated token name")
+                return super().get(key, default)
+
         with tempfile.TemporaryDirectory() as raw:
             out = Path(raw)
             cert = out / "test-windows.client.pem"
             cert.write_bytes(self.item.certificate.public_bytes(serialization.Encoding.PEM))
             row = enroll.MachineRow(self.item.fingerprint, self.item.cert_id, 0, "software")
             with (
-                mock.patch.dict(os.environ, {"CF_API_TOKEN": "token"}),
+                mock.patch.object(
+                    enroll.os,
+                    "environ",
+                    TokenEnvironment(CLOUDFLARE_API_TOKEN="token"),
+                ),
                 mock.patch.object(enroll.os, "name", "nt"),
                 mock.patch.object(enroll, "ensure_collector", return_value="collector.exe"),
                 mock.patch.object(enroll, "machine_id_for", return_value="test-windows"),
                 mock.patch.object(enroll, "output_dir_for", return_value=out),
-                mock.patch.object(enroll, "preflight"),
+                mock.patch.object(enroll, "preflight") as preflight,
                 mock.patch.object(enroll, "load_recovery", return_value=None),
                 mock.patch.object(enroll, "get_machine", return_value=row),
                 mock.patch.object(enroll, "load_promoted") as load_promoted,
@@ -533,6 +596,7 @@ class CollectorFlowTests(unittest.TestCase):
                 self.assertEqual(enroll.main(["--no-schedule"]), 0)
 
             load_promoted.assert_not_called()
+            preflight.assert_called_once_with("token")
             resume.assert_called_once_with("collector.exe", False)
 
     def test_doctor_failure_keeps_key_and_does_not_run_or_schedule(self):
