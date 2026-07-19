@@ -87,6 +87,20 @@ describe('Cloudflare OAuth broker', () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it('preserves a pending authorization when a public callback has the wrong state', async () => {
+    const authorizeUrl = await authorizationUrl();
+    const wrongState = new URL('https://sessions.vza.net/oauth/cloudflare/callback');
+    wrongState.searchParams.set('code', 'attacker-code');
+    wrongState.searchParams.set('state', 'wrong-state');
+    expect((await completeCloudflareOAuth(wrongState, testEnv)).status).toBe(400);
+
+    vi.stubGlobal('fetch', vi.fn(async () => tokenResponse()));
+    const callback = new URL('https://sessions.vza.net/oauth/cloudflare/callback');
+    callback.searchParams.set('code', 'authorization-code');
+    callback.searchParams.set('state', authorizeUrl.searchParams.get('state')!);
+    expect((await completeCloudflareOAuth(callback, testEnv)).status).toBe(200);
+  });
+
   it('rejects a token response that omits the managed-CA permission', async () => {
     const url = await authorizationUrl();
     vi.stubGlobal('fetch', vi.fn(async () => tokenResponse({ scope: 'offline_access' })));

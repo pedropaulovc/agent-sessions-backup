@@ -193,10 +193,14 @@ export class CloudflareOAuthBroker extends DurableObject<Env> {
     if (!config) return internalError('not_configured');
     const body = (await request.json().catch(() => ({}))) as { code?: unknown; state?: unknown; error?: unknown };
     const pending = await this.ctx.storage.get<PendingAuthorization>('pending_authorization');
+    if (!pending) return internalError('authorization_expired', 400);
+    if (pending.expiresAt < Date.now()) {
+      await this.ctx.storage.delete('pending_authorization');
+      return internalError('authorization_expired', 400);
+    }
+    if (typeof body.state !== 'string' || body.state !== pending.state) return internalError('invalid_state', 400);
     await this.ctx.storage.delete('pending_authorization');
     if (typeof body.error === 'string' && body.error) return internalError('authorization_denied', 400);
-    if (!pending || pending.expiresAt < Date.now()) return internalError('authorization_expired', 400);
-    if (typeof body.state !== 'string' || body.state !== pending.state) return internalError('invalid_state', 400);
     if (typeof body.code !== 'string' || !body.code) return internalError('missing_code', 400);
 
     return this.withGrantMutation(async () => {
