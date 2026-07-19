@@ -55,7 +55,7 @@ main { max-width: 1180px; margin: 0 auto; padding: 20px; }
 }
 .row { display: flex; gap: 16px; }
 .search-layout { gap: 24px; align-items: flex-start; }
-.sidebar { flex: 0 0 220px; }
+.sidebar { flex: 0 0 240px; width: 240px; min-width: 0; max-width: 240px; }
 .content { flex: 1 1 auto; min-width: 0; }
 form.search { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
 form.search input[type=search] {
@@ -83,8 +83,9 @@ form.search button { background: var(--accent); color: #fff; border-color: var(-
 .hit .meta { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
 .facets h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 14px 0 6px; }
 .facets ul { list-style: none; margin: 0 0 4px; padding: 0; }
-.facets li { display: flex; justify-content: space-between; gap: 8px; padding: 1px 0; }
-.facets li .n { color: var(--muted); }
+.facets li { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; min-width: 0; padding: 1px 0; }
+.facets li a { min-width: 0; overflow-wrap: anywhere; }
+.facets li .n { flex: 0 0 auto; color: var(--muted); }
 .facets li.active { font-weight: 700; }
 table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
@@ -124,7 +125,7 @@ img.media { max-width: 100%; height: auto; border: 1px solid var(--line); border
 @media (max-width: 760px) {
   main { padding: 14px; }
   .search-layout { flex-direction: column; gap: 10px; }
-  .sidebar { flex-basis: auto; width: 100%; }
+  .sidebar { flex-basis: auto; width: 100%; max-width: none; }
   .facets { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 14px; }
   .facet-selects { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .content { width: 100%; }

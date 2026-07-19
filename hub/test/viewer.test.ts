@@ -675,7 +675,7 @@ describe('viewer result pagination and facet layout', () => {
     return [...html.matchAll(/<a href="\/s\/(viewer-pagination-[^"]+)">/g)].map((match) => match[1]!);
   }
 
-  it('renders filters before results in a responsive left sidebar and auto-submits selects', async () => {
+  it('renders auto-submitting filters in a bounded, responsive left sidebar', async () => {
     const res = await SELF.fetch(
       `https://sessions.vza.net/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&machine=${PAGINATION_MACHINE}`,
     );
@@ -686,7 +686,14 @@ describe('viewer result pagination and facet layout', () => {
     expect(html).toContain('onchange="this.form.requestSubmit()"');
     expect(html).toContain(`<option value="${PAGINATION_HARNESS}" selected>`);
     expect(html).toContain(`<option value="${PAGINATION_MACHINE}" selected>`);
+    // flex items default to min-width:auto, which let a long repo/cwd facet expand this
+    // nominally 220px-content sidebar to 460px+ in production. The outer width includes
+    // its 20px padding + border; links wrap while their count stays intact.
+    expect(html).toContain('.sidebar { flex: 0 0 240px; width: 240px; min-width: 0; max-width: 240px; }');
+    expect(html).toContain('.facets li a { min-width: 0; overflow-wrap: anywhere; }');
+    expect(html).toContain('.facets li .n { flex: 0 0 auto;');
     expect(html).toContain('@media (max-width: 760px)');
+    expect(html).toContain('.sidebar { flex-basis: auto; width: 100%; max-width: none; }');
   });
 
   it('paginates full-text results in both directions while preserving query and filter state', async () => {
