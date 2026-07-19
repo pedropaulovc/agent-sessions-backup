@@ -357,6 +357,11 @@ export async function convergeR2WithRow(fileId: number, r2Key: string, sha256: s
   return true;
 }
 
+// Production D1 accepts numbered bind variables only through ?100. Each files/check item consumes
+// three (store, relpath, content_hash), in addition to the chunk's single machine_id bind:
+// 1 + 33 * 3 = 100 exactly. Keep the chunk bound derived from that invariant when this query changes.
+const FILE_CHECK_CHUNK_SIZE = 33;
+
 /** POST /api/v1/files/check — batch resync: which of these does the hub NOT have? */
 export async function checkFiles(request: Request, env: Env, identity: Identity): Promise<Response> {
   if (identity.kind !== 'machine') return Response.json({ error: 'unauthorized' }, { status: 401 });
@@ -365,7 +370,7 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
   if (items.length > 1000) return Response.json({ error: 'batch_too_large' }, { status: 400 });
 
   const missing: Array<{ store: string; relpath: string }> = [];
-  for (const chunk of chunks(items, 50)) {
+  for (const chunk of chunks(items, FILE_CHECK_CHUNK_SIZE)) {
     const conditions = chunk.map((_, i) => `(store = ?${i * 3 + 2} AND relpath = ?${i * 3 + 3} AND content_hash = ?${i * 3 + 4})`);
     const binds: unknown[] = [identity.machineId];
     for (const it of chunk) binds.push(it.store, it.relpath, it.sha256.replace(/^sha256:/, '').toLowerCase());
@@ -390,7 +395,7 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
     // a local rewrite), wrongly reporting the changed file as present.
     const have = new Map(rows.results.map((r) => [`${r.store}\n${r.relpath}\n${r.content_hash}`, r]));
     // A matched D1 row is not proof the raw bytes still exist OR are still correct — head every
-    // match in this chunk (bounded to ≤50, parallel) and compare R2's own sha256 checksum
+    // match in this chunk (bounded to ≤33, parallel) and compare R2's own sha256 checksum
     // (present because every PUT through this API passes {sha256}) against the row's
     // content_hash. A missing object, a missing checksum (shouldn't happen via our PUT path, but
     // conservative if it ever does), or a mismatch (e.g. the object was overwritten/replaced by
