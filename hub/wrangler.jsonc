@@ -28,6 +28,7 @@
     // vza.net zone id (public — also in infra/cf/enroll-cert.py). Certificate
     // operations use a private Cloudflare OAuth client; no API token is stored.
     "CF_ZONE_ID": "6a56cdda4766c1d7b5ad0fbe8331048f",
+    "CF_OAUTH_CLIENT_ID": "0455069be2aea97dd2812497f3ba0dfe",
     "CF_OAUTH_REDIRECT_URI": "https://sessions.vza.net/oauth/cloudflare/callback",
     "CF_OAUTH_SCOPES": "ssl-and-certificates.write offline_access"
   },
