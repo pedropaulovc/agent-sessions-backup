@@ -153,6 +153,9 @@ describe('preview auth over HTTP', () => {
         headers: { 'x-dev-machine': 'previewbox-http', authorization: 'Bearer preview-secret' },
       });
       expect(res.status).toBe(200);
+      expect(await res.json()).toMatchObject({
+        identity: { machine_id: 'previewbox-http', cert_fingerprint: null, cert_slot: 'current' },
+      });
     } finally {
       testEnv.ENVIRONMENT = original;
     }

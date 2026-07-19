@@ -749,13 +749,21 @@ def cmd_doctor(args) -> int:
         ok = _doctor_cert_store(cfg.client_cert_thumbprint) and ok
 
     try:
-        # Unlike /healthz, this route requires a resolved machine identity. A 200 therefore proves
-        # the configured PEM or Schannel certificate completed mTLS and mapped to the expected
-        # machines row before enrollment removes its exportable key or installs a scheduler.
-        status, _body = transport.get(f"{cfg.hub_url}/api/v1/status")
-        mark = "ok" if status == 200 else "FAIL"
-        ok = ok and status == 200
-        print(f"[{mark}] authenticated hub API: GET {cfg.hub_url}/api/v1/status -> {status}")
+        # /status echoes the identity resolved from the presented certificate. Checking the machine
+        # id prevents a valid cert registered to a different row from passing enrollment and then
+        # failing every machine-scoped upload with machine_mismatch.
+        status, body = transport.get(f"{cfg.hub_url}/api/v1/status")
+        identity = json.loads(body).get("identity", {}) if status == 200 else {}
+        mapped_machine = identity.get("machine_id")
+        cert_slot = identity.get("cert_slot")
+        require_current = getattr(args, "require_current_cert", False)
+        identity_ok = mapped_machine == cfg.machine_id
+        slot_ok = not require_current or cert_slot == "current"
+        route_ok = status == 200 and identity_ok and slot_ok
+        mark = "ok" if route_ok else "FAIL"
+        ok = ok and route_ok
+        print(f"[{mark}] authenticated hub identity: GET {cfg.hub_url}/api/v1/status -> {status}; "
+              f"machine={mapped_machine!r}; cert_slot={cert_slot!r}")
     except NotImplementedError as e:
         print(f"[warn] hub check skipped: {e}")
     except Exception as e:  # noqa: BLE001

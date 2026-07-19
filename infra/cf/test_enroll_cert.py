@@ -661,6 +661,21 @@ class CollectorFlowTests(unittest.TestCase):
             install.assert_called_once_with("collector.exe", "test-windows", out, False)
             preflight.assert_not_called()
 
+    def test_install_staged_rejects_incomplete_new_stage_before_imported_resume(self):
+        with tempfile.TemporaryDirectory() as raw:
+            out = Path(raw)
+            (out / "test-windows.client.pem").write_bytes(
+                self.item.certificate.public_bytes(serialization.Encoding.PEM)
+            )
+            (out / "test-windows.client.pem.new").write_text("stranded stage")
+            with (
+                mock.patch.object(enroll.os, "name", "nt"),
+                mock.patch.object(enroll, "resume_configured_collector") as resume,
+            ):
+                with self.assertRaisesRegex(enroll.EnrollmentError, "incomplete staged"):
+                    enroll.install_staged_collector("collector.exe", "test-windows", out, True)
+            resume.assert_not_called()
+
     def test_doctor_failure_keeps_key_and_does_not_run_or_schedule(self):
         with tempfile.TemporaryDirectory() as raw:
             out, cert, key, _ = self._paths(raw)

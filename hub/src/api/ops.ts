@@ -503,7 +503,8 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
 }
 
 /** GET /api/v1/status — index-completeness introspection for agents. */
-export async function status(env: Env): Promise<Response> {
+export async function status(env: Env, identity: Identity): Promise<Response> {
+  if (identity.kind !== 'machine') return Response.json({ error: 'unauthorized' }, { status: 401 });
   const machines = await env.DB.prepare(
     `SELECT m.machine_id, m.os, m.last_seen_at, m.last_upload_at,
             SUM(CASE WHEN f.parse_state IN ('pending', 'reserved') THEN 1 ELSE 0 END) AS files_pending,
@@ -519,6 +520,11 @@ export async function status(env: Env): Promise<Response> {
      FROM sessions`,
   ).first();
   return Response.json({
+    identity: {
+      machine_id: identity.machineId,
+      cert_fingerprint: identity.certFp ?? null,
+      cert_slot: identity.certSlot,
+    },
     machines: machines.results.map((m) => ({ ...m, indexed_through: m.last_seen_at })),
     sessions,
   });

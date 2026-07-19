@@ -676,7 +676,7 @@ def configure_collector(
             check=True,
             env=child_env(),
         )
-    subprocess.run([collector, "doctor"], check=True, env=child_env())
+    subprocess.run([collector, "doctor", "--require-current-cert"], check=True, env=child_env())
     subprocess.run([collector, "run", "--once"], check=True, env=child_env())
     if os.name == "nt":
         key_path.unlink()
@@ -690,7 +690,7 @@ def configure_collector(
 
 def resume_configured_collector(collector: str, schedule: bool) -> None:
     """Resume after Windows already imported the key and removed its exportable copy."""
-    subprocess.run([collector, "doctor"], check=True, env=child_env())
+    subprocess.run([collector, "doctor", "--require-current-cert"], check=True, env=child_env())
     subprocess.run([collector, "run", "--once"], check=True, env=child_env())
     if schedule:
         subprocess.run([collector, "install", "--interval", "15"], check=True, env=child_env())
@@ -700,13 +700,13 @@ def install_staged_collector(collector: str, machine_id: str, out: Path, schedul
     """Finish a hub-registered staged rotation without a management-plane credential."""
     cert_path = out / f"{machine_id}.client.pem"
     key_path = out / f"{machine_id}.client.key"
+    material = load_staged_recovery(machine_id, out)
     if os.name == "nt" and cert_path.is_file() and not key_path.exists():
         parse_certificate_identity(cert_path.read_bytes(), machine_id)
         print("==> resuming an already imported Windows certificate")
         resume_configured_collector(collector, schedule)
         return
 
-    material = load_staged_recovery(machine_id, out)
     if material:
         print(f"==> found staged certificate ({material.fingerprint})")
         cert_path = promote(machine_id, out)
