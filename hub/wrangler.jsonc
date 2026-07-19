@@ -25,7 +25,7 @@
     "ENVIRONMENT": "production",
     "API_HOST": "api.sessions.vza.net",
     "VIEWER_HOST": "sessions.vza.net",
-    // vza.net zone id (public — also in infra/cf/enroll-cert.sh). Used by POST
+    // vza.net zone id (public — also in infra/cf/enroll-cert.py). Used by POST
     // /api/v1/certs/renew together with the CF_CLIENT_CERT_TOKEN secret.
     "CF_ZONE_ID": "6a56cdda4766c1d7b5ad0fbe8331048f"
   },

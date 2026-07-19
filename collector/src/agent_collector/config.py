@@ -168,7 +168,7 @@ class Config:
     stores: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_STORES))
     exclude: list[str] = field(default_factory=list)
     # File-based mTLS material (auth="mtls", POSIX/OpenSSL curl): PEM cert + private key that
-    # curl presents via --cert/--key. Written by infra/cf/enroll-cert.sh. Absent for dev auth.
+    # curl presents via --cert/--key. Written by infra/cf/enroll-cert.py. Absent for dev auth.
     client_cert_path: str | None = None
     client_key_path: str | None = None
     # Windows/Schannel mTLS: SHA-1 thumbprint of the client cert imported into Cert:\CurrentUser\My.
@@ -225,7 +225,7 @@ class Config:
             if not has_thumb and not has_pem:
                 raise ValueError(
                     "mTLS config needs client material: client_cert_thumbprint (Windows) or BOTH "
-                    "client_cert_path and client_key_path (POSIX). Run infra/cf/enroll-cert.sh."
+                    "client_cert_path and client_key_path (POSIX). Run infra/cf/enroll-cert.py."
                 )
 
     def store_roots(self) -> dict[str, Path]:
@@ -435,7 +435,7 @@ def enroll(
 ) -> Config:
     """Write a collector config. `dev=True` writes dev auth (x-dev-machine); otherwise a
     file-based mTLS config, which requires both a client cert and key path (produced by
-    infra/cf/enroll-cert.sh). TPM-backed mTLS enrollment lands in M4.
+    infra/cf/enroll-cert.py). TPM-backed mTLS enrollment lands in M4.
 
     Re-enrolling an existing box (e.g. dev -> mTLS for production) only swaps the auth
     material, hub_url, and machine_id. Every OTHER field — stores, exclude globs,
@@ -443,7 +443,7 @@ def enroll(
     collector doesn't silently revert to defaults and stop backing up its custom roots.
 
     machine_id resolution: explicit override > existing config's id > computed default.
-    Preserving the existing id keeps mTLS consistent — enroll-cert.sh signs the cert for the
+    Preserving the existing id keeps mTLS consistent — enroll-cert.py signs the cert for the
     id `agent-collector machine-id` reports (the configured one), so resetting to the default
     would make cert identity and upload URLs diverge and every upload 401 as machine_mismatch.
     """
@@ -488,7 +488,7 @@ def enroll(
                 hub_url=hub_url.rstrip("/"),
                 auth="mtls",
                 # Absolute (resolve()), not just expanduser(): scheduled systemd/Task Scheduler
-                # runs start from a different cwd, so a relative path (enroll-cert.sh's `--out .`
+                # runs start from a different cwd, so a relative path (enroll-cert.py's `--out .`
                 # default) would make MtlsAuth fail its file-existence check before every upload.
                 client_cert_path=str(Path(client_cert_path).expanduser().resolve()),
                 client_key_path=str(Path(client_key_path).expanduser().resolve()),
@@ -498,7 +498,7 @@ def enroll(
             raise ValueError(
                 "mTLS enrollment needs client material: --client-cert-thumbprint or --import-pfx "
                 "(Windows/Schannel), or --client-cert + --client-key (POSIX/PEM). Run "
-                "infra/cf/enroll-cert.sh first. Use --dev for the dev-header config instead."
+                "infra/cf/enroll-cert.py first. Use --dev for the dev-header config instead."
             )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(_dump_toml(cfg))

@@ -136,7 +136,7 @@ async function getClientCertStatus(env: Env, certId: string): Promise<CertStatus
  * Returns the fp AND the CA status (same object), so the caller can require an ACTIVE cert — a fp match on
  * a cert already pending_revocation/revoked must not be attached.
  *
- * result.certificate is the PEM: verified against the CF API docs + the sign-response shape (enroll-cert.sh
+ * result.certificate is the PEM: verified against the CF API docs + the sign-response shape (enroll-cert.py
  * has always read result.certificate from this same object). No token exists to probe the live GET until
  * CF_CLIENT_CERT_TOKEN is minted post-merge (USER ACTIONS) — live-verify on first post-merge use. Fails
  * closed regardless: an absent/renamed field → 'unknown' → 422 (attach refused), never a lockout or leak. */

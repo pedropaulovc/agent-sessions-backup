@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
-      - run: bash ../infra/cf/test-enroll-cert-token-isolation.sh
+      - run: uv run --script ../infra/cf/test_enroll_cert.py
       - run: uv sync
       - run: uv run pytest
 

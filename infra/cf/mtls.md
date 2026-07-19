@@ -29,12 +29,13 @@ Cloudflare dashboard → My Profile → API Tokens → Create Token → Custom t
 
 | Permission | Scope |
 |---|---|
-| Zone · **SSL and Certificates** · Edit | Zone: `vza.net` — mints client certs + edge certs |
-| Zone · **API Gateway** · Edit | Zone: `vza.net` — mTLS hostname associations (a.k.a. API Shield) |
-| Zone · Zone Settings · Read | Zone: `vza.net` |
+| Zone · **SSL and Certificates** · Edit | Zone: `vza.net` — mint and revoke client certificates |
+| Account · **D1** · Edit | Account: `Pedro@vezza.com.br` — register and verify the machine row |
 
-Set TTL to ~1 hour. This single token covers all three steps below; the
-`enroll-cert.sh` helper only needs the SSL/Certificates half.
+Set TTL to about one hour. `enroll-cert.py` uses this token directly with the
+Cloudflare REST API; it does not need Wrangler login or a second credential. If you
+configure the one-time hostname association through the API instead of the dashboard,
+use a separate deployment token with **API Gateway · Edit** for that operation.
 
 ## Step 1 — enable the mTLS hostname association (one-time)
 
@@ -77,53 +78,33 @@ edge before it reaches the Worker.
 
 ## Step 3 — enroll each machine (repeatable)
 
-Run the helper with the enrollment token. With no machine_id argument it enrolls the id
-the collector actually uses — `agent-collector machine-id` (config override, else the
-computed default). This matters: on WSL the default is `<host>-wsl`, not `<host>-linux`,
-and a cert signed for the wrong id 401s every upload as `machine_mismatch`.
+From native PowerShell, set the short-lived token and run one command:
 
-```
-CF_API_TOKEN=<token from above> \
-  infra/cf/enroll-cert.sh --admin --out ~/.config/agent-collector
+```powershell
+$env:CF_API_TOKEN = '<token from above>'
+uv run infra/cf/enroll-cert.py
+Remove-Item Env:CF_API_TOKEN
 ```
 
-It resolves the machine_id, generates an EC P-256 software key + CSR, has the managed CA
-sign it, computes the SHA-256 fingerprint the way `cf.tlsClientAuth.certFingerprintSHA256`
-reports it, and upserts the `machines` row via `wrangler d1 execute --remote`. `--admin`
-sets `is_admin=1` (needed for `POST /api/v1/admin/reindex`); drop it for ordinary
-machines. Pass the id explicitly as the first arg only on a box where the collector isn't
-installed yet. The private key never leaves the box; the signed cert is not secret.
+The Python script handles the complete local flow: it preflights both token permissions,
+installs the sibling collector with `uv tool install` only when it is missing, derives the
+collector's exact machine id, generates the P-256 key and CSR, mints and validates the
+certificate, performs a guarded fresh-only D1 registration, and independently verifies
+the complete stored tuple. It then configures the collector, runs `doctor` with an
+authenticated `/api/v1/status` probe, performs one live collector pass, and installs the
+15-minute schedule.
 
-The D1 upsert needs a **wrangler login with D1 access** — the just-in-time `CF_API_TOKEN`
-is zone-SSL only. Run `enroll-cert.sh` on an authenticated admin box (this one), or, if you
-mint the cert on a fresh remote box, the script prints the exact `wrangler d1 execute`
-command to run from an admin box instead. (M4 replaces this with hub-mediated
-self-registration via `POST /api/v1/certs/renew`, so no wrangler login is needed per box.)
+Use `--admin` when this machine needs hub admin endpoints, `--machine-id <id>` only to
+override the collector-derived id, `--out <directory>` to move the working material, or
+`--no-schedule` to stop after the verified one-shot upload. On POSIX, use the same command
+with an environment assignment:
 
-Verify end-to-end (the cert/key basenames use the resolved machine_id):
-
-```
-MID=$(agent-collector machine-id)
-curl --cert ~/.config/agent-collector/$MID.client.pem \
-     --key  ~/.config/agent-collector/$MID.client.key \
-     https://api.sessions.vza.net/api/v1/machines
+```bash
+CF_API_TOKEN='<token from above>' uv run infra/cf/enroll-cert.py
 ```
 
-Once this returns JSON (not 401), point the collector at the mTLS API by writing an
-mTLS config (sets `auth = "mtls"` plus the two cert/key paths `enroll-cert.sh` just
-wrote):
-
-```
-agent-collector enroll --hub https://api.sessions.vza.net \
-  --machine-id "$MID" \
-  --client-cert ~/.config/agent-collector/$MID.client.pem \
-  --client-key  ~/.config/agent-collector/$MID.client.key
-```
-
-(or set `auth`, `client_cert_path`, and `client_key_path` in `config.toml` by hand). The
-transport then presents the cert via `curl --cert/--key`; TPM-backed keys remain M4. With
-that config in place `agent-collector run` / `backfill` upload over mTLS — the round-trip
-and the 6 GB backfill are unblocked.
+The token is sent only in Cloudflare HTTPS headers. It is never placed in argv, written to
+disk, logged, or inherited by `uv` or collector subprocesses.
 
 ## Windows / Schannel mTLS
 
@@ -142,69 +123,22 @@ So on Windows the cert must live in the `Cert:\CurrentUser\My` store and be refe
 This is also the future TPM/PCP path (S2): a PCP-backed key surfaces as the same
 `CurrentUser\My` entry with a non-exportable private key, so only enrollment differs.
 
-Enroll flow (drive it from WSL; the CSR/signing steps are identical to POSIX above —
-`enroll-cert.sh` still mints the EC P-256 key, gets it signed, and writes the `machines`
-row). The extra Windows step is getting the signed cert+key into the store as a PFX.
-
-**Sign for the WINDOWS id** — `enroll-cert.sh` takes the machine_id as its leading
-positional arg. Running it from WSL you MUST pass `amet-windows` explicitly: with no arg
-it falls back to `agent-collector machine-id`, which in WSL resolves to `amet-wsl`, and a
-cert signed for the wrong id 401s every Windows upload as `machine_mismatch`.
-
-```bash
-MID=amet-windows
-OUT=~/.config/agent-collector
-CF_API_TOKEN=<token from "Mint the enrollment token" above> \
-  infra/cf/enroll-cert.sh "$MID" --admin --out "$OUT"
-```
-
-**Bundle the cert+key into a PFX** — still in WSL/bash, from the `$OUT/$MID.client.pem` /
-`.client.key` that just got written. Export the password so it stays out of argv:
-
-```bash
-export AC_PFX_PW='choose-a-transfer-password'
-openssl pkcs12 -export -inkey "$OUT/$MID.client.key" -in "$OUT/$MID.client.pem" \
-  -out "$OUT/$MID.client.pfx" -passout env:AC_PFX_PW
-```
-
-**Import it on Windows** — in PowerShell on the host (note `$env:` assignment and the
-quoted `C:\` path; the same password you set above). The collector imports to
-`Cert:\CurrentUser\My` with the private key NON-exportable (the default), records the
-thumbprint, and deletes the PFX:
-
-```powershell
-$env:AC_PFX_PW = 'choose-a-transfer-password'
-agent-collector enroll --hub https://api.sessions.vza.net `
-  --machine-id amet-windows --import-pfx 'C:\path\to\amet-windows.client.pfx'
-```
-
-`--import-pfx` writes an mTLS config with `client_cert_thumbprint` set (and no cert/key
-paths — the config layer rejects setting both). If the cert is already in the store, skip
-the import and pass `--client-cert-thumbprint <thumbprint>` directly. `agent-collector
-doctor` then verifies the cert is present in the store and warns if it expires within 21
-days. A password-less PFX works too — omit `AC_PFX_PW` and the import runs without
-`-Password`.
-
-**Destroy the WSL-side private key** — only AFTER `doctor` confirms the store cert, so a
-failed import never leaves you with no key. The store copy is now the sole private key (the
-Windows model); the PEM key on the WSL disk is a redundant, exportable copy that
-contradicts it. The PFX was already deleted by the import; shred the leftover key too:
-
-```bash
-shred -u "$OUT/$MID.client.key"    # or: rm -P on *BSD/macOS
-```
-
-The `$OUT/$MID.client.pem` **cert** is public (it's just the signed certificate, not the
-key) and may stay in `~/.config/agent-collector` for reference or re-bundling.
+`enroll-cert.py` detects native Windows and does the extra work automatically. It creates
+a randomly password-protected PFX in memory/on the local working directory, passes the
+password to the collector only through a scrubbed child environment, imports the key as
+non-exportable into `Cert:\CurrentUser\My`, and confirms that the collector deleted the
+PFX. The exportable PEM key is kept through `doctor`'s authenticated hub check and the live
+collector pass, then deleted only after both succeed. If import, the authenticated check, or
+the pass fails, the key is retained and scheduling does not occur.
 
 ## Notes
 
-- Real-TPM machines (Windows host, amet) replace the software `openssl` keygen with the
+- Real-TPM machines (Windows host, amet) replace the software keygen with the
   TPM flows (S2/S3); the CSR → managed-CA → fingerprint → `machines` row steps are
   identical, only `key_protection` becomes `tpm`.
 - Cert renewal (`POST /api/v1/certs/renew`) is implemented — see "Cert renewal endpoint" below.
 - Per-zone client-certificate limit and ECDSA acceptance were the S4 unknowns: ECDSA
-  P-256 CSRs are accepted by the managed CA (the `enroll-cert.sh` default); the fleet is
+  P-256 CSRs are accepted by the managed CA (the `enroll-cert.py` default); the fleet is
   5 machines, far under any per-zone cap.
 
 ## M4 fleet-management endpoints
@@ -221,8 +155,8 @@ Three mTLS-authenticated endpoints back centrally-managed fleet ops (`hub/src/ap
   current, and keeps the previous fingerprint valid for 7 days (`machines.prev_cert_fp_sha256` +
   `cert_revoke_at`; `machineIdentity` matches current OR prev-in-window). The daily prune cron (`30 4`)
   revokes the previous cert at the CA once the window elapses. A second renew inside the window replaces
-  the previous cert and resets the clock — at most one generation is ever in grace. This is what removes
-  the per-box `wrangler d1 execute` from Step 3 for already-enrolled machines.
+  the previous cert and resets the clock — at most one generation is ever in grace. Renewal is therefore
+  authenticated by the current client certificate and does not reuse the fresh-enrollment D1 token.
 - **`POST /api/v1/admin/machines`** (admin-flagged cert only, mirrors `admin/reindex`) — upsert a machine
   row (register fingerprint, set `priority`/`is_admin`) and get the roster back. No delete path by design
   (files/sessions FK-reference the row; decommission by revoking the cert).
