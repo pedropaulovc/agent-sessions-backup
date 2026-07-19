@@ -558,7 +558,7 @@ class CollectorFlowTests(unittest.TestCase):
                 )
 
             self.assertEqual([call[0][1] for call in calls], ["enroll", "doctor", "run", "install"])
-            self.assertEqual(calls[2][0][1:], ["run", "--once"])
+            self.assertEqual(calls[2][0][1:], ["run", "--heartbeat-only"])
             self.assertTrue(all(key_exists for _, _, key_exists in calls[:3]))
             self.assertFalse(calls[3][2], "key must be removed before scheduler install")
             self.assertFalse(key.exists())

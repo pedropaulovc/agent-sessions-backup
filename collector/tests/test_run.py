@@ -66,6 +66,30 @@ def test_run_records_heartbeat_with_stats(tmp_path, hub):
     assert hb["stores"]["claude"]["bytes_uploaded"] == len(b"data")
 
 
+def test_heartbeat_only_writes_without_scanning(tmp_path, hub, tmp_env, monkeypatch, capsys):
+    path = config.config_path()
+    config.enroll(hub.url, dev=True, path=path, machine_id="m1")
+    monkeypatch.setattr(
+        run_mod,
+        "Scanner",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("scanner must not start")),
+    )
+
+    rc = run_mod.cmd_run(types.SimpleNamespace(config=str(path), heartbeat_only=True))
+
+    assert rc == 0
+    assert len(hub.heartbeats) == 1
+    assert all(store["files_seen"] == 0 for store in hub.heartbeats[0]["stores"].values())
+    assert json.loads(capsys.readouterr().out.splitlines()[-1]) == {"mode": "heartbeat", "errors": 0}
+
+
+def test_heartbeat_only_returns_nonzero_when_write_fails(tmp_path, hub, monkeypatch):
+    cfg = _cfg(hub, tmp_path / "claude")
+    monkeypatch.setattr(Transport, "post_json", lambda *_args, **_kwargs: (401, "unauthorized"))
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_heartbeat_only(cfg, st) == 1
+
+
 def test_heartbeat_buffers_on_failure_then_drains(tmp_path, hub, monkeypatch):
     monkeypatch.setattr("agent_collector.transport.BACKOFF", (0.01, 0.01, 0.01))
     cfg = _cfg(hub, tmp_path / "claude")

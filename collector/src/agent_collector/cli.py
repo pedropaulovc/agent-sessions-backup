@@ -100,6 +100,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_run = sub.add_parser("run", help="one incremental pass")
     p_run.add_argument("--once", action="store_true", help="single pass (default)")
+    p_run.add_argument(
+        "--heartbeat-only",
+        action="store_true",
+        help="send one authenticated heartbeat without scanning stores",
+    )
     p_run.add_argument("--config", default=None, help="config path override")
     p_run.set_defaults(func=run_mod.cmd_run)
 

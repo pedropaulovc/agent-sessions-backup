@@ -689,7 +689,7 @@ def configure_collector(
             env=child_env(),
         )
     subprocess.run([collector, "doctor", "--require-current-cert"], check=True, env=child_env())
-    subprocess.run([collector, "run", "--once"], check=True, env=child_env())
+    subprocess.run([collector, "run", "--heartbeat-only"], check=True, env=child_env())
     if proof_sidecar:
         proof_sidecar.unlink()
     if os.name == "nt":
@@ -705,7 +705,7 @@ def configure_collector(
 def resume_configured_collector(collector: str, schedule: bool) -> None:
     """Resume after Windows already imported the key and removed its exportable copy."""
     subprocess.run([collector, "doctor", "--require-current-cert"], check=True, env=child_env())
-    subprocess.run([collector, "run", "--once"], check=True, env=child_env())
+    subprocess.run([collector, "run", "--heartbeat-only"], check=True, env=child_env())
     if schedule:
         subprocess.run([collector, "install", "--interval", "15"], check=True, env=child_env())
 
