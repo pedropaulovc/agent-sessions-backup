@@ -54,18 +54,29 @@ main { max-width: 1180px; margin: 0 auto; padding: 20px; }
   padding: 0 6px; font-size: 11px; font-weight: 600;
 }
 .row { display: flex; gap: 16px; }
-.sidebar { flex: 0 0 240px; }
+.search-layout { gap: 24px; align-items: flex-start; }
+.sidebar { flex: 0 0 220px; }
 .content { flex: 1 1 auto; min-width: 0; }
 form.search { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
 form.search input[type=search] {
   flex: 1 1 320px; min-width: 220px; padding: 8px 10px; border: 1px solid var(--line);
   border-radius: 6px; background: var(--card); color: var(--fg); font: inherit;
 }
-form.search select, form.search button {
+form.search button {
   padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--card);
   color: var(--fg); font: inherit;
 }
 form.search button { background: var(--accent); color: #fff; border-color: var(--accent); cursor: pointer; }
+.facets { border-right: 1px solid var(--line); padding-right: 20px; }
+.facet-controls { margin-bottom: 16px; }
+.facet-selects { display: grid; gap: 9px; }
+.facet-controls label { display: grid; gap: 3px; color: var(--muted); font-size: 12px; font-weight: 600; }
+.facet-controls select, .facet-controls button {
+  width: 100%; min-width: 0; padding: 7px 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--card); color: var(--fg); font: inherit;
+}
+.facet-controls button { margin-top: 8px; background: var(--accent); color: #fff; border-color: var(--accent); cursor: pointer; }
+.clear-filters { display: inline-block; margin-top: 9px; }
 .hit { border-bottom: 1px solid var(--line); padding: 12px 0; }
 .hit .title { font-weight: 600; }
 .hit .snip { margin: 4px 0; color: var(--fg); white-space: pre-wrap; word-break: break-word; }
@@ -110,6 +121,17 @@ details.error > summary { color: var(--err); }
 .pager { display: flex; gap: 14px; align-items: center; margin: 18px 0; justify-content: center; }
 img.media { max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 6px; }
 .truncnote { color: var(--muted); font-size: 11px; }
+@media (max-width: 760px) {
+  main { padding: 14px; }
+  .search-layout { flex-direction: column; gap: 10px; }
+  .sidebar { flex-basis: auto; width: 100%; }
+  .facets { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 14px; }
+  .facet-selects { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .content { width: 100%; }
+}
+@media (max-width: 440px) {
+  .facet-selects { grid-template-columns: 1fr; }
+}
 `;
 
 /** Full-document shell used by non-streamed pages. */

@@ -629,3 +629,106 @@ describe('viewer', () => {
     expect(missingRes.headers.get('location')).toBe('/login');
   });
 });
+
+describe('viewer result pagination and facet layout', () => {
+  const PAGINATION_HARNESS = 'viewer-pagination-test';
+  const PAGINATION_MACHINE = 'viewer-pagination-machine';
+  const PAGINATION_MARKER = 'viewerpaginationmarker';
+
+  beforeAll(async () => {
+    const statements: D1PreparedStatement[] = [];
+    for (let i = 0; i < 25; i++) {
+      const id = `viewer-pagination-${String(i).padStart(2, '0')}`;
+      statements.push(
+        testEnv.DB.prepare(
+          `INSERT INTO sessions
+             (session_id, harness, machine_id, os, primary_model, title, started_at, index_state)
+           VALUES (?1, ?2, ?3, 'linux', 'pagination-model', ?4, ?5, 'ready')`,
+        ).bind(id, PAGINATION_HARNESS, PAGINATION_MACHINE, `Pagination item ${i}`, `2026-07-${String(i + 1).padStart(2, '0')}T12:00:00Z`),
+      );
+      statements.push(
+        testEnv.DB.prepare(
+          `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text)
+           VALUES (?1, 1, 0, 0, 'user', 'text', ?2)`,
+        ).bind(id, `${PAGINATION_MARKER} item ${i}`),
+      );
+    }
+    await testEnv.DB.batch(statements);
+    await testEnv.DB.prepare(
+      `INSERT INTO blocks_fts(rowid, text)
+       SELECT id, text FROM blocks WHERE session_id LIKE 'viewer-pagination-%'`,
+    ).run();
+  });
+
+  function pageHref(html: string, rel: 'next' | 'prev'): string {
+    const match = html.match(new RegExp(`<a rel="${rel}" href="([^"]+)"`));
+    expect(match, `${rel} link should be present`).toBeTruthy();
+    return match![1]!.replaceAll('&amp;', '&');
+  }
+
+  it('renders filters before results in a responsive left sidebar and auto-submits selects', async () => {
+    const res = await SELF.fetch(
+      `https://sessions.vza.net/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&machine=${PAGINATION_MACHINE}`,
+    );
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    expect(html.indexOf('<aside class="sidebar facets">')).toBeLessThan(html.indexOf('<section class="content search-results">'));
+    expect(html).toContain('class="facet-controls"');
+    expect(html).toContain('onchange="this.form.requestSubmit()"');
+    expect(html).toContain(`<option value="${PAGINATION_HARNESS}" selected>`);
+    expect(html).toContain(`<option value="${PAGINATION_MACHINE}" selected>`);
+    expect(html).toContain('@media (max-width: 760px)');
+  });
+
+  it('paginates full-text results in both directions while preserving query and filter state', async () => {
+    const first = await (await SELF.fetch(
+      `https://sessions.vza.net/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&machine=${PAGINATION_MACHINE}&limit=10`,
+    )).text();
+    expect(first).toContain('Showing 1–10');
+    expect(first).toContain('Page 1');
+    expect(first).not.toContain('<a rel="prev"');
+
+    const secondHref = pageHref(first, 'next');
+    expect(secondHref).toContain(`q=${PAGINATION_MARKER}`);
+    expect(secondHref).toContain(`harness=${PAGINATION_HARNESS}`);
+    expect(secondHref).toContain(`machine=${PAGINATION_MACHINE}`);
+    expect(secondHref).toContain('limit=10');
+    const second = await (await SELF.fetch(`https://sessions.vza.net${secondHref}`)).text();
+    expect(second).toContain('Showing 11–20');
+    expect(second).toContain('Page 2');
+    expect(pageHref(second, 'prev')).toBe(`/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&machine=${PAGINATION_MACHINE}&limit=10`);
+
+    const thirdHref = pageHref(second, 'next');
+    const third = await (await SELF.fetch(`https://sessions.vza.net${thirdHref}`)).text();
+    expect(third).toContain('Showing 21–25');
+    expect(third).toContain('Page 3');
+    expect(third).not.toContain('<a rel="next"');
+    expect(third).toContain('<span class="muted">Next →</span>');
+  });
+
+  it('paginates and filters the default recent-session list, including recovery from the last page', async () => {
+    const first = await (await SELF.fetch(
+      `https://sessions.vza.net/?harness=${PAGINATION_HARNESS}&limit=10`,
+    )).text();
+    expect(first).toContain('Showing 1–10 recent sessions');
+    expect(first.match(/<div class="hit">/g)).toHaveLength(10);
+
+    const second = await (await SELF.fetch(`https://sessions.vza.net${pageHref(first, 'next')}`)).text();
+    const third = await (await SELF.fetch(`https://sessions.vza.net${pageHref(second, 'next')}`)).text();
+    expect(third).toContain('Showing 21–25 recent sessions');
+    expect(third.match(/<div class="hit">/g)).toHaveLength(5);
+    expect(pageHref(third, 'prev')).toContain(`harness=${PAGINATION_HARNESS}`);
+    expect(third).not.toContain(`/s/${BIG_SESSION}`);
+  });
+
+  it('resets pagination when a facet changes but preserves the text query', async () => {
+    const first = await (await SELF.fetch(
+      `https://sessions.vza.net/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&limit=10`,
+    )).text();
+    const second = await (await SELF.fetch(`https://sessions.vza.net${pageHref(first, 'next')}`)).text();
+    const controls = second.match(/<form class="facet-controls"[\s\S]*?<\/form>/)?.[0] ?? '';
+    expect(controls).toContain(`name="q" value="${PAGINATION_MARKER}"`);
+    expect(controls).not.toContain('name="cursor"');
+    expect(controls).not.toContain('name="limit"');
+  });
+});
