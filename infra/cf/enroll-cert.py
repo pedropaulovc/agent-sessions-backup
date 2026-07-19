@@ -780,6 +780,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    run_summary = "uploaded one full pass" if args.no_schedule else "sent an authenticated heartbeat"
+    schedule_summary = "left unscheduled" if args.no_schedule else "scheduled every 15 minutes"
     token = os.environ.get("CLOUDFLARE_API_TOKEN")
     if not args.install_staged and not token:
         print(
@@ -794,7 +796,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"==> enrolling {machine_id} from {out}")
         if args.install_staged:
             install_staged_collector(collector, machine_id, out, not args.no_schedule)
-            print(f"[ok] {machine_id} installed, uploaded once, and {'left unscheduled' if args.no_schedule else 'scheduled every 15 minutes'}")
+            print(f"[ok] {machine_id} installed, {run_summary}, and {schedule_summary}")
             return 0
         assert token is not None
         preflight(token)
@@ -808,7 +810,7 @@ def main(argv: list[str] | None = None) -> int:
                 if is_imported_windows_enrollment(machine_id, out, existing, is_admin):
                     print("==> resuming an already imported Windows certificate")
                     resume_configured_collector(collector, not args.no_schedule)
-                    print(f"[ok] {machine_id} uploaded once and {'left unscheduled' if args.no_schedule else 'scheduled every 15 minutes'}")
+                    print(f"[ok] {machine_id} {run_summary} and {schedule_summary}")
                     return 0
                 material = load_promoted(machine_id, out, existing)
                 if material:
@@ -829,7 +831,7 @@ def main(argv: list[str] | None = None) -> int:
         cert_path = promote(machine_id, out)
         print(f"[ok] D1 registration verified; certificate promoted to {cert_path}")
         configure_collector(collector, machine_id, out, cert_path, material, not args.no_schedule)
-        print(f"[ok] {machine_id} enrolled, uploaded once, and {'left unscheduled' if args.no_schedule else 'scheduled every 15 minutes'}")
+        print(f"[ok] {machine_id} enrolled, {run_summary}, and {schedule_summary}")
         return 0
     except (EnrollmentError, subprocess.CalledProcessError, OSError, ValueError) as error:
         print(f"enrollment failed: {_redacted_error(error)}", file=sys.stderr)
