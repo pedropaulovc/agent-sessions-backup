@@ -35,6 +35,16 @@ ACCOUNT_ID="18ef3246e9f36d1560485ef53889c0ab" # Pedro@vezza.com.br's Account
 DB_NAME="sessions-index"
 API="https://api.cloudflare.com/client/v4"
 
+# Wrangler 4.112 consumes CF_API_TOKEN as a deprecated alias for CLOUDFLARE_API_TOKEN. This script's
+# CF_API_TOKEN is deliberately a narrow zone SSL token used only by curl to sign the CSR; if Wrangler
+# inherits it, `whoami` appears authenticated but D1 rejects registration with code 7403 instead of
+# using the operator's OAuth login. Strip both token spellings only for Wrangler subprocesses so they
+# fall back to Wrangler's authenticated OAuth session. The signing curl below still inherits
+# CF_API_TOKEN unchanged.
+wrangler_oauth() {
+  env -u CF_API_TOKEN -u CLOUDFLARE_API_TOKEN npx --yes wrangler "$@"
+}
+
 # machine_id: optional leading positional. If omitted, derive it from the collector itself
 # (`agent-collector machine-id`) so the cert is signed for the EXACT id the collector stamps
 # on upload URLs — on WSL that's <host>-wsl, not <host>-linux, and a mismatch 401s as
@@ -267,7 +277,7 @@ PY
 # the caller can distinguish "provably not ours" from "couldn't tell".
 read_row_fp() {
   local json
-  json="$(CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID" npx --yes wrangler d1 execute "$DB_NAME" --remote --json \
+  json="$(CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID" wrangler_oauth d1 execute "$DB_NAME" --remote --json \
       --command "SELECT cert_fp_sha256 AS fp FROM machines WHERE machine_id='$MACHINE_ID';" 2>/dev/null)" || return 1
   parse_fp "$json"
 }
@@ -346,14 +356,14 @@ INSERT_SQL="INSERT INTO machines (machine_id, os, hostname, cert_fp_sha256, cert
        WHERE machines.cert_fp_sha256 IS NULL;"
 
 # The D1 write needs a wrangler login with D1 access — NOT the just-in-time CF_API_TOKEN, which is zone-SSL
-# only (and wrangler reads CLOUDFLARE_API_TOKEN, not CF_API_TOKEN, anyway). On an authenticated admin box we
+# only (Wrangler consumes both token spellings). On an authenticated admin box we
 # insert-then-verify; on a fresh collector box we print the insert to run from such a box.
-if npx --yes wrangler whoami >/dev/null 2>&1; then
+if wrangler_oauth whoami >/dev/null 2>&1; then
   # Insert (a no-op if the id already exists — DO NOTHING never touches an existing row's cert), then read
   # the row back to see whose fingerprint it carries. A non-zero exit here means the write did NOT commit
   # (D1 auth, a lock/outage, or a rejected statement) — the cert is minted but unregistered, so revoke it
   # before aborting rather than leaking it under set -e.
-  if ! CUR_JSON="$(CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID" npx --yes wrangler d1 execute "$DB_NAME" --remote --json \
+  if ! CUR_JSON="$(CLOUDFLARE_ACCOUNT_ID="$ACCOUNT_ID" wrangler_oauth d1 execute "$DB_NAME" --remote --json \
       --command "$INSERT_SQL SELECT cert_fp_sha256 AS fp, is_admin FROM machines WHERE machine_id='$MACHINE_ID';")"; then
     # The combined INSERT;SELECT exited non-zero, but --command runs multiple ';' statements WITHOUT a
     # transaction: the INSERT may have COMMITTED before the SELECT/output failed. Revoking blindly could
