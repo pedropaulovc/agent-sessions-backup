@@ -26,7 +26,7 @@ export async function markPendingAndEnqueue(
   // `force` breaks even a fresh reservation — for callers that are the recovery MECHANISM, not a redundant
   // heal (the web-session recover chain: it deliberately re-parses a chosen candidate).
   const guard = opts.force ? '' : " AND NOT (parse_state = 'reserved' AND reserved_at IS NOT NULL AND reserved_at > ?2)";
-  const stmt = env.DB.prepare(`UPDATE files SET parse_state = 'pending', reserved_at = NULL, reserved_by = NULL WHERE id = ?1${guard} RETURNING id`);
+  const stmt = env.DB.prepare(`UPDATE files SET parse_state = 'pending', reserved_at = NULL, reserved_by = NULL, reserved_reason = NULL WHERE id = ?1${guard} RETURNING id`);
   const updated = await (opts.force ? stmt.bind(file.id) : stmt.bind(file.id, reservationCutoffIso())).first<{ id: number }>();
   if (!updated) {
     console.log(JSON.stringify({ event: 'requeue.skipped_fresh_reservation', file_id: file.id, reason }));

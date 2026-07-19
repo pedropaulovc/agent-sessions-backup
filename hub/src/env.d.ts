@@ -54,14 +54,19 @@ interface ParseMessage {
    * parse_state — a sibling that churns back to 'parsed' behind the cursor can't re-trigger a re-flip
    * (kills the livelock). Present only on 'reserve' continuations. */
   kick_cursor?: number;
-  /** True once this cleanup has flipped ≥1 sibling to 'reserved'. Carried on every reserve/delete
-   *  continuation so a resumed invocation knows a prior one reserved: on entry it refreshes its reservations'
-   *  reserved_at (progress = freshness, so a slow-but-live window is never healed as abandoned), and if it
-   *  OWNED reservations yet the refresh finds none, a heal reclaimed them mid-flight → revert + retry rather
-   *  than delete (round 15). Absent/false on the scan entry and on a lone archive with no siblings to reserve. */
-  had_reservations?: boolean;
+  /** Number of sibling reservations this cleanup expects to still own. Carried on every reserve/delete
+   *  continuation so a resumed invocation can detect partial as well as total reservation loss before it
+   *  deletes anything. Each entry refreshes the owned rows' reserved_at; fewer refreshed rows than expected
+   *  means a heal reclaimed part of the prefix, so the cleanup restarts from page zero. */
+  reservation_count?: number;
   /** Send-late resume cursor: the last sibling files.id already handled by the recover fan-out. Present only
    *  on 'send-late' continuations (round 15, 3608955881) — the owner is already 'parsed'; the continuation
    *  resumes sendRecoverToReservedSiblings at `id > send_cursor` without re-reading R2 or re-running cleanup. */
   send_cursor?: number;
+  /** Cleanup file whose durable reservation authorized this delivery. Pending uploads retain full upload
+   * semantics, but only this owner-tagged send-late replacement may bypass the fresh-reservation guard. */
+  reservation_owner?: number;
+  /** Durable per-row reservation generation selected by send-late. Owner ids can be reused by a later cleanup
+   * of the same archive, so both owner and generation must still match before this delivery may consume the row. */
+  reservation_generation?: number;
 }

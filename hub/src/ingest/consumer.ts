@@ -17,6 +17,8 @@ interface FileRow {
   content_hash: string;
   parse_state: string;
   reserved_at: string | null;
+  reserved_by: number | null;
+  reservation_generation: number;
 }
 
 /** Thrown by an export parse to signal a RETRYABLE (transient) failure: any throw out of an export parse
@@ -24,10 +26,9 @@ interface FileRow {
  * never throw). The file must NOT be marked 'error' — archive rows have session_id NULL, so the generic
  * catch can't reconcile their sessions, and an 'error' export with stale 'ready' rows is terminal (files/
  * check only re-enqueues NON-terminal rows). Every site that raises this first forces the file back to
- * 'pending' (hash-guarded); the consumer catch recognizes the sentinel and just retries the same message,
- * so redelivery re-runs the idempotent write/cleanup page. Two flavors, both retryable: the parseExportInto
- * wrapper raises it for any transient throw (after reverting THIS invocation's writes), and the cleanup
- * continuation-send path raises it directly (writes are complete + valid, so it does not revert). */
+ * 'pending' (hash-guarded); the consumer catch recognizes the sentinel and just retries the same message.
+ * A send-late continuation is the exception: its owner is already correctly 'parsed', so a transient fan-out
+ * read raises this sentinel without changing owner state and retries only that continuation. */
 class ExportRetry extends Error {}
 
 export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: Env): Promise<void> {
@@ -209,20 +210,25 @@ function isExportArchiveKey(r2Key: string): boolean {
 // lookups/guards are folded in as small fixed terms — precision isn't needed, the budget is a coarse gate.
 async function parseOne(job: ParseMessage, env: Env): Promise<number> {
   const file = await env.DB.prepare(
-    'SELECT id, machine_id, store, relpath, r2_key, size, mtime, harness, session_id, content_hash, parse_state, reserved_at FROM files WHERE id = ?1',
+    'SELECT id, machine_id, store, relpath, r2_key, size, mtime, harness, session_id, content_hash, parse_state, reserved_at, reserved_by, reservation_generation FROM files WHERE id = ?1',
   )
     .bind(job.file_id)
     .first<FileRow>();
   if (!file) return 1;
 
   // Consume-time reservation guard (round 15, 3608955874): a row a live export cleanup has FRESH-reserved
-  // must be re-parsed ONLY by that cleanup's recover message. A redundant queued 'upload'/'files-check'/
+  // must be re-parsed ONLY by that cleanup's owner-tagged send-late message. A redundant queued 'upload'/'files-check'/
   // 'reindex' message — one that raced the reserve flip (which now also flips 'pending' siblings) — would
   // otherwise re-parse the sibling as an ordinary upload, mark it 'parsed' behind the reserve cursor, and let
   // it escape the send-late set while the owner's delete removes the shared session. No-op such a message; the
-  // reservation's owner recover re-parses the row later. A changed-bytes re-upload never reaches here reserved
+  // reservation owner's replacement re-parses the row later. A changed-bytes re-upload never reaches here reserved
   // (its PUT clears the marker inline), and a stale reservation isn't fresh, so both still parse normally.
-  if (job.reason !== 'recover' && isFreshReservation(file)) {
+  const ownsReservation =
+    job.reservation_owner !== undefined &&
+    job.reservation_owner === file.reserved_by &&
+    job.reservation_generation !== undefined &&
+    job.reservation_generation === file.reservation_generation;
+  if (!ownsReservation && isFreshReservation(file)) {
     console.log(JSON.stringify({ event: 'parse.skipped_fresh_reservation', file_id: file.id, reason: job.reason }));
     return 1;
   }
@@ -251,7 +257,12 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
     // A 'send-late' continuation (round 15, 3608955881) resumes ONLY the recover fan-out from the carried
     // cursor — the owner is already terminal 'parsed', so there is no R2 read, no write, no cleanup to redo.
     if (job.cleanup_phase === 'send-late') {
-      return 2 + (await fanOutRecover(file, env, job.reason, job.content_hash ?? file.content_hash, 0, job.send_cursor ?? 0));
+      try {
+        return 2 + (await fanOutRecover(file, env, job.reason, job.content_hash ?? file.content_hash, 0, job.send_cursor ?? 0));
+      } catch (e) {
+        console.log(JSON.stringify({ event: 'parse.export.send_late_retry', file_id: file.id, cursor: job.send_cursor ?? 0, error: String(e) }));
+        throw new ExportRetry('send-late fan-out transient failure');
+      }
     }
     // The one-export-slice-per-invocation reservation is applied by consumeParseBatch before we get here;
     // the actual per-invocation subrequest count comes back from parseExportInto for the batch budget.
@@ -264,7 +275,7 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
     // above, before any R2 read), so continuations are pinned to the bytes this parse actually read. NOT a
     // fresh read at send time, which would pin to post-re-upload bytes and defeat the guard. Only the first
     // legacy slice is unguarded; every continuation it enqueues carries this hash.
-    return 2 + (await parseExportInto(file, env, job.reason, job.content_hash ?? file.content_hash, job.offset ?? 0, job.cleanup_cursor, job.cleanup_phase, job.kick_cursor, job.had_reservations ?? false));
+    return 2 + (await parseExportInto(file, env, job.reason, job.content_hash ?? file.content_hash, job.offset ?? 0, job.cleanup_cursor, job.cleanup_phase, job.kick_cursor, job.reservation_count ?? 0));
   }
   if (!det.sessionId || !SINGLE_SESSION_HARNESSES.has(det.harness)) {
     await markParsed(file.id, env, 'skipped', undefined, undefined, job.content_hash);
@@ -461,6 +472,7 @@ async function failExportFile(
   errorLabel: string,
   msgReason: ParseMessage['reason'],
   kickCursor: number,
+  reservationCount: number,
 ): Promise<number> {
   let spent = 0;
   const owned = await env.DB.prepare('SELECT session_id FROM sessions WHERE canonical_file_id = ?1').bind(file.id).all<{ session_id: string }>();
@@ -495,13 +507,51 @@ async function failExportFile(
         return spent;
       }
     }
+    let expectedReservations = reservationCount;
+    if (kickCursor > 0) {
+      // Corrupt-archive reservation can span the same long queue windows as successful cleanup. Refresh the
+      // pages already reserved before advancing the cursor; otherwise files/check may heal the prefix after
+      // one hour and the eventual error fan-out can no longer recover sessions from it (3609060889).
+      const refreshed = await refreshOwnedReservations(file, env);
+      spent += 1;
+      if (refreshed < expectedReservations) {
+        // Some or all of the prefix was reclaimed before this continuation resumed. Restart from page zero
+        // rather than skip permanently past siblings that are no longer reserved. A plain message also
+        // rechecks contention.
+        try {
+          await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason: msgReason, content_hash: contentHash });
+        } catch {
+          await forcePending(file, env, contentHash);
+          throw new ExportRetry('failExportFile lost-reservation restart send failed');
+        }
+        console.log(
+          JSON.stringify({
+            event: 'parse.export.error_reservations_healed_away',
+            file_id: file.id,
+            kick_cursor: kickCursor,
+            expected: expectedReservations,
+            refreshed,
+          }),
+        );
+        return spent;
+      }
+      expectedReservations = refreshed;
+    }
     const r = await reserveSiblings(file, env, contentHash, kickCursor, spent);
     spent += r.spent;
+    expectedReservations += r.reserved;
     if (r.superseded) return spent; // a fresher re-upload owns the file; it runs its own parse + fan-out
     if (!r.complete) {
       // Over budget mid-reservation → re-enqueue a continuation (kick_cursor advanced), STILL NOT 'error'.
       try {
-        await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason: msgReason, content_hash: contentHash, kick_cursor: r.kickCursor });
+        await env.PARSE_QUEUE.send({
+          file_id: file.id,
+          r2_key: file.r2_key,
+          reason: msgReason,
+          content_hash: contentHash,
+          kick_cursor: r.kickCursor,
+          reservation_count: expectedReservations,
+        });
       } catch {
         await forcePending(file, env, contentHash);
         console.log(JSON.stringify({ event: 'parse.export.error_reserve_send_failed', file_id: file.id, kick_cursor: r.kickCursor }));
@@ -633,11 +683,11 @@ async function parseExportInto(
   cleanupCursor?: string,
   cleanupPhase?: ParseMessage['cleanup_phase'],
   kickCursor?: number,
-  hadReservations = false,
+  reservationCount = 0,
 ): Promise<number> {
   const written = new Set<string>();
   try {
-    return await runExportParse(file, env, reason, contentHash, offset, cleanupCursor, cleanupPhase, kickCursor, hadReservations, written);
+    return await runExportParse(file, env, reason, contentHash, offset, cleanupCursor, cleanupPhase, kickCursor, reservationCount, written);
   } catch (e) {
     if (e instanceof ExportRetry) throw e; // raising site already reverted + forced 'pending'; pass through
     return await raiseExportRetry(file, env, written, contentHash, e);
@@ -653,7 +703,7 @@ async function runExportParse(
   cleanupCursor: string | undefined,
   cleanupPhase: ParseMessage['cleanup_phase'],
   kickCursor: number | undefined,
-  hadReservations: boolean,
+  reservationCount: number,
   written: Set<string>,
 ): Promise<number> {
   const obj = await env.RAW.get(file.r2_key);
@@ -662,7 +712,7 @@ async function runExportParse(
     // generic consumer catch: it flips sessions by files.session_id, which is NULL for an archive
     // row, so the sessions this ZIP is canonical for would keep a stale 'ready' state that
     // loadNormalized()/raw can no longer reconstruct. Handle it like an invalid archive instead.
-    return await failExportFile(file, env, contentHash, `r2_object_missing:${file.r2_key}`, reason, kickCursor ?? 0);
+    return await failExportFile(file, env, contentHash, `r2_object_missing:${file.r2_key}`, reason, kickCursor ?? 0, reservationCount);
   }
   const archive = parseExportArchive(new Uint8Array(await obj.arrayBuffer()));
 
@@ -682,7 +732,7 @@ async function runExportParse(
   // so /status surfaces it instead of silently reporting the replacement as parsed. (An empty-but-
   // valid array is `valid` and falls through to normal write + cleanup, clearing what it owned.)
   if (!archive.valid) {
-    return await failExportFile(file, env, contentHash, archive.error ?? 'invalid export archive', reason, kickCursor ?? 0);
+    return await failExportFile(file, env, contentHash, archive.error ?? 'invalid export archive', reason, kickCursor ?? 0, reservationCount);
   }
 
   // A NON-empty archive (recognized layout, conversations present) that parses to zero turns across
@@ -695,7 +745,7 @@ async function runExportParse(
   // at least one turn-bearing conversation writes normally.
   const totalTurns = archive.sessions.reduce((n, s) => n + s.turns.length, 0);
   if (archive.sessions.length > 0 && totalTurns === 0) {
-    return await failExportFile(file, env, contentHash, 'export archive parsed to zero turns across all conversations (content-shape drift)', reason, kickCursor ?? 0);
+    return await failExportFile(file, env, contentHash, 'export archive parsed to zero turns across all conversations (content-shape drift)', reason, kickCursor ?? 0, reservationCount);
   }
 
   // Session ids we actually WROTE this parse (turns > 0 and not owned by a HEALTHY live CDP
@@ -762,7 +812,8 @@ async function runExportParse(
       // reclaim. Ties and unknown (NULL/unparseable) mtimes fall through to last-write-wins: only a
       // strictly-OLDER archive displacing a strictly-newer one is the bug — a genuinely newer upload still
       // steals from older owners (web-ingest round 2/7/12 last-write-wins tests, all same-mtime, still hold).
-      const otherOwner = existing && existing.canonical_file_id !== file.id && existing.canon_state !== 'error';
+      const otherOwner =
+        existing && existing.canonical_file_id !== file.id && existing.canon_state !== 'error' && existing.index_state !== 'error';
       if (otherOwner && isOwnerNewer(existing!.owner_mtime, file.mtime)) continue;
 
       // Preflight the conversation's SUBREQUEST cost. writeSession is atomic per conversation (no
@@ -913,25 +964,38 @@ async function runExportParse(
 
   const phase: NonNullable<ParseMessage['cleanup_phase']> = cleanupPhase ?? 'scan';
   let reserved = phase === 'delete';
-  // Tracks whether THIS cleanup owns any sibling reservation — seeded from the continuation and set true the
-  // moment reserveSiblings flips ≥1 row. Propagated onto every continuation so a resumed invocation knows a
-  // prior one reserved, and used by the healed-away validation below.
-  let owned = hadReservations;
+  // Exact number of sibling reservations this cleanup expects to own. Propagating the count lets a resumed
+  // invocation detect a partially healed prefix; a boolean only detected the all-rows-lost case.
+  let expectedReservations = reservationCount;
 
   // Round 15 (3608955877): a resumed cleanup (reserve/delete continuation) REFRESHES its reservations on entry
   // so a slow-but-live window (queue backlog can stretch it past STALE_RESERVATION_MS) is never healed out from
-  // under it. If we OWNED reservations (a prior invocation reserved) but the refresh finds NONE, a heal reclaimed
-  // them mid-flight: do NOT delete (that would strand the healed siblings' shared sessions) — revert our 'ready'
-  // rows and retry, which re-reserves from a clean slate.
+  // under it. If fewer rows refresh than the continuation expects, a heal reclaimed part of the prefix
+  // mid-flight: do NOT delete (that would strand the healed siblings' shared sessions). Revert our 'ready'
+  // rows and enqueue a plain parse, which re-reserves from a clean slate instead of retrying the stale cursor.
   if (phase === 'reserve' || phase === 'delete') {
     const refreshed = await refreshOwnedReservations(file, env);
     spent += 1;
-    if (owned && refreshed === 0) {
+    if (refreshed < expectedReservations) {
       await revertOwnedReady(file, env);
-      console.log(JSON.stringify({ event: 'parse.export.reservations_healed_away', file_id: file.id, phase }));
-      await forcePending(file, env, contentHash);
-      throw new ExportRetry('cleanup reservations healed away mid-flight');
+      try {
+        await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: contentHash });
+      } catch {
+        await forcePending(file, env, contentHash);
+        throw new ExportRetry('cleanup lost-reservation restart send failed');
+      }
+      console.log(
+        JSON.stringify({
+          event: 'parse.export.reservations_healed_away',
+          file_id: file.id,
+          phase,
+          expected: expectedReservations,
+          refreshed,
+        }),
+      );
+      return spent;
     }
+    expectedReservations = refreshed;
   }
 
   // Resume a reservation that overflowed a prior invocation's budget ('reserve' continuation): finish
@@ -940,10 +1004,21 @@ async function runExportParse(
   if (phase === 'reserve') {
     const r = await reserveSiblings(file, env, contentHash, kickCursor ?? 0, spent);
     spent += r.spent;
-    if (r.reserved > 0) owned = true;
+    expectedReservations += r.reserved;
     if (r.superseded) return spent;
     if (!r.complete) {
-      await sendCleanupContinuation(file, env, reason, contentHash, archive.sessions.length, 'reserve', cleanupCursor ?? '', r.kickCursor, owned, 'reserve');
+      await sendCleanupContinuation(
+        file,
+        env,
+        reason,
+        contentHash,
+        archive.sessions.length,
+        'reserve',
+        cleanupCursor ?? '',
+        r.kickCursor,
+        expectedReservations,
+        'reserve',
+      );
       console.log(JSON.stringify({ event: 'parse.export.reserve', file_id: file.id, kick_cursor: r.kickCursor, done: false }));
       return spent;
     }
@@ -1009,12 +1084,23 @@ async function runExportParse(
         }
         const r = await reserveSiblings(file, env, contentHash, 0, spent);
         spent += r.spent;
-        if (r.reserved > 0) owned = true;
+        expectedReservations += r.reserved;
         if (r.superseded) return spent;
         if (!r.complete) {
           // Reservation overflowed the budget → hand off to a 'reserve' continuation that resumes deletes
           // HERE (cursor still at the last kept row before this stale one). NOTHING is deleted yet.
-          await sendCleanupContinuation(file, env, reason, contentHash, archive.sessions.length, 'reserve', cursor, r.kickCursor, owned, 'reserve');
+          await sendCleanupContinuation(
+            file,
+            env,
+            reason,
+            contentHash,
+            archive.sessions.length,
+            'reserve',
+            cursor,
+            r.kickCursor,
+            expectedReservations,
+            'reserve',
+          );
           console.log(JSON.stringify({ event: 'parse.export.reserve', file_id: file.id, kick_cursor: r.kickCursor, cursor, done: false }));
           return spent;
         }
@@ -1055,7 +1141,18 @@ async function runExportParse(
   // phase (still 'scan' if no stale has been found yet, else 'delete') and STOP — still WITHOUT markParsed,
   // so the file stays 'pending' until cleanup drains.
   if (!cleanupComplete) {
-    await sendCleanupContinuation(file, env, reason, contentHash, archive.sessions.length, reserved ? 'delete' : 'scan', cursor, undefined, owned, reserved ? 'delete' : 'scan');
+    await sendCleanupContinuation(
+      file,
+      env,
+      reason,
+      contentHash,
+      archive.sessions.length,
+      reserved ? 'delete' : 'scan',
+      cursor,
+      undefined,
+      expectedReservations,
+      reserved ? 'delete' : 'scan',
+    );
     console.log(JSON.stringify({ event: 'parse.export.cleanup', file_id: file.id, cursor, phase: reserved ? 'delete' : 'scan', recovered: recovered.size, done: false }));
     return spent;
   }
@@ -1120,11 +1217,21 @@ async function sendCleanupContinuation(
   cleanupPhase: NonNullable<ParseMessage['cleanup_phase']>,
   cleanupCursor: string,
   kickCursor: number | undefined,
-  hadReservations: boolean,
+  reservationCount: number,
   label: string,
 ): Promise<void> {
   try {
-    await env.PARSE_QUEUE.send({ file_id: file.id, r2_key: file.r2_key, reason, content_hash: contentHash, offset, cleanup_phase: cleanupPhase, cleanup_cursor: cleanupCursor, kick_cursor: kickCursor, had_reservations: hadReservations });
+    await env.PARSE_QUEUE.send({
+      file_id: file.id,
+      r2_key: file.r2_key,
+      reason,
+      content_hash: contentHash,
+      offset,
+      cleanup_phase: cleanupPhase,
+      cleanup_cursor: cleanupCursor,
+      kick_cursor: kickCursor,
+      reservation_count: reservationCount,
+    });
   } catch {
     await forcePending(file, env, contentHash);
     console.log(JSON.stringify({ event: 'parse.export.cleanup_send_failed', file_id: file.id, phase: label, cursor: cleanupCursor }));
@@ -1154,7 +1261,7 @@ async function anotherCleanupHoldsStore(file: FileRow, env: Env): Promise<boolea
 /** RESERVE pass: flip every 'parsed' sibling archive to 'reserved' — a DURABLE recovery reservation that is
  * its own explicit marker (round 12) — paged by files.id so pages advance independent of parse_state (a
  * sibling healed back to 'parsed' behind the cursor can't re-trigger a re-flip → no livelock). NO queue send
- * here; the recover messages go out later, keyed off exactly the 'reserved' state,
+ * here; the owner-tagged deliveries go out later, keyed off exactly the 'reserved' state,
  * after every delete commits (see sendRecoverToReservedSiblings). The flip is hash-PINNED to the bytes read
  * (round 10): a sibling re-uploaded between the SELECT and the UPDATE has a new hash and is no longer
  * 'parsed', so the guarded UPDATE no-ops and never buries fresh upload bytes as a stale reservation. Returns
@@ -1206,7 +1313,7 @@ async function reserveSiblings(
             // Both written in the SAME statement as the flip so neither marker can lag the state. Hash-PINNED and
             // state-guarded to 'parsed'/'pending' so a sibling re-uploaded (new hash) or already reserved between
             // the SELECT and here is not clobbered.
-            .prepare("UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = ?3 WHERE id = ?1 AND parse_state IN ('parsed','pending') AND content_hash = ?2")
+            .prepare("UPDATE files SET reserved_reason = CASE parse_state WHEN 'pending' THEN 'upload' ELSE 'recover' END, parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = ?3, reservation_generation = reservation_generation + 1 WHERE id = ?1 AND parse_state IN ('parsed','pending') AND content_hash = ?2")
             .bind(s.id, s.content_hash, file.id),
         ),
       );
@@ -1224,10 +1331,12 @@ async function reserveSiblings(
  * the heal paths would treat the still-live reservations as abandoned, strip reserved_by, and the delayed delete
  * would then strand the sibling (send-late only targets rows still reserved_by us). Re-stamping reserved_at on
  * every continuation makes PROGRESS the freshness signal: a live cleanup keeps its window open; a genuinely
- * crashed one stops refreshing and its rows go stale on schedule. Returns the number of rows still owned. */
+ * crashed one stops refreshing and its rows go stale on schedule. The durable generation increments in the
+ * same statement so deliveries selected before this refresh cannot consume the renewed reservation. Returns
+ * the number of rows still owned. */
 async function refreshOwnedReservations(file: FileRow, env: Env): Promise<number> {
   const res = await env.DB.prepare(
-    "UPDATE files SET reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE store = ?1 AND reserved_by = ?2 AND parse_state = 'reserved'",
+    "UPDATE files SET reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reservation_generation = reservation_generation + 1 WHERE store = ?1 AND reserved_by = ?2 AND parse_state = 'reserved'",
   )
     .bind(file.store, file.id)
     .run();
@@ -1235,8 +1344,8 @@ async function refreshOwnedReservations(file: FileRow, env: Env): Promise<number
 }
 
 /** SEND-LATE recovery pass: page the siblings THIS cleanup reserved (parse_state = 'reserved' AND
- * reserved_by = our file.id) and enqueue a recover message for each, best-effort. Runs only AFTER every stale
- * delete has committed, so ordering is guaranteed — a recover parse can never see one of our stale rows still
+ * reserved_by = our file.id) and enqueue its stored upload/recover intent, best-effort. Runs only AFTER every stale
+ * delete has committed, so ordering is guaranteed — a replacement parse can never see one of our stale rows still
  * owned+present.
  *
  * Owner-scoped by reserved_by (round 14, the STRONGER fix for the cross-cleanup send-late race 3608748301):
@@ -1246,10 +1355,11 @@ async function refreshOwnedReservations(file: FileRow, env: Env): Promise<number
  * cleanup's reservations early even if the windows ever did touch. (reserved_by = ?2 also implies id != file.id
  * — a cleanup never reserves its own row — so the self-exclusion the old id != ?2 gave us is preserved.)
  *
- * SELECTs exactly 'reserved', never 'pending' (3608692125): an unrelated pending upload — including one whose
- * own upload message was dropped — is NOT a recovery target, so a recover-reason parse can't hijack a fresh
- * upload's heal path. On a successful send the row stays 'reserved' (no extra UPDATE): the consumed recover
- * parse moves it through parsing → terminal via its own markParsed, and if the message is dropped, files/check
+ * SELECTs exactly 'reserved', never a raw 'pending' row (3608692125). A pending row explicitly reserved before
+ * deletes carries reserved_reason='upload'; an already-parsed sibling carries 'recover'. This keeps a genuinely
+ * newer pending archive's full replacement semantics instead of converting it into gap-fill mode (3609060878).
+ * On a successful send the row stays 'reserved' (no extra UPDATE): the consumed owner-tagged parse moves it
+ * through parsing → terminal via its own markParsed, and if the message is dropped, files/check
  * re-enqueues 'reserved' as an 'upload' (it's non-terminal) — so leaving it 'reserved' is both cheaper (saves a
  * subrequest per send) and heals identically whether the send landed or not. A duplicate recover from a later
  * cleanup that re-selects a still-'reserved' row is harmless (recover is idempotent under the mtime guard).
@@ -1270,16 +1380,24 @@ async function sendRecoverToReservedSiblings(
   let consecutiveFailures = 0;
   while (spentSoFar + spent < EXPORT_QUERY_BUDGET) {
     const sibs = await env.DB.prepare(
-      "SELECT id, r2_key, content_hash FROM files WHERE store = ?1 AND reserved_by = ?2 AND id > ?3 AND parse_state = 'reserved' ORDER BY id ASC LIMIT ?4",
+      "SELECT id, r2_key, content_hash, reservation_generation, COALESCE(reserved_reason, 'recover') AS reserved_reason FROM files WHERE store = ?1 AND reserved_by = ?2 AND id > ?3 AND parse_state = 'reserved' AND reserved_at IS NOT NULL ORDER BY id ASC LIMIT ?4",
     )
       .bind(file.store, file.id, cursor, EXPORT_KICK_PAGE)
-      .all<{ id: number; r2_key: string; content_hash: string }>();
+      .all<{ id: number; r2_key: string; content_hash: string; reservation_generation: number; reserved_reason: string }>();
     spent += 1;
     if (sibs.results.length === 0) return { spent, cursor, cut: 'done' }; // no more reserved siblings — fully drained
     for (const s of sibs.results) {
       if (spentSoFar + spent >= EXPORT_QUERY_BUDGET) return { spent, cursor, cut: 'budget' }; // budget hit mid-page → resume here
       try {
-        await env.PARSE_QUEUE.send({ file_id: s.id, r2_key: s.r2_key, reason: 'recover', content_hash: s.content_hash });
+        const reservedReason: ParseMessage['reason'] = s.reserved_reason === 'upload' ? 'upload' : 'recover';
+        await env.PARSE_QUEUE.send({
+          file_id: s.id,
+          r2_key: s.r2_key,
+          reason: reservedReason,
+          content_hash: s.content_hash,
+          reservation_owner: file.id,
+          reservation_generation: s.reservation_generation,
+        });
         spent += 1;
         consecutiveFailures = 0;
         cursor = s.id; // advance the resume cursor only past a row we actually handled
@@ -1441,11 +1559,11 @@ async function markParsed(
   requireContentHash?: string,
 ): Promise<{ updated: boolean }> {
   const guarded = requireContentHash !== undefined;
-  // reserved_at = NULL, reserved_by = NULL clear any reservation as the row leaves 'reserved' (round 14): a
-  // reserved sibling's own recover/upload parse ends here, and clearing BOTH markers together stops it from
+  // Clear the reservation tuple as the row leaves 'reserved': its owner-tagged recover/upload parse ends here,
+  // and clearing the owner, timestamp, and reason together stops it from
   // blocking new cleanups (contention probe) or being claimed by a stale send-late owner. A no-op for the common
   // case (already NULL).
-  const sql = `UPDATE files SET parse_state = ?2, parsed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), parsed_size = ?3, parse_error = ?4, reserved_at = NULL, reserved_by = NULL
+  const sql = `UPDATE files SET parse_state = ?2, parsed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), parsed_size = ?3, parse_error = ?4, reserved_at = NULL, reserved_by = NULL, reserved_reason = NULL
      WHERE id = ?1${guarded ? ' AND content_hash = ?5' : ''}`;
   const stmt = env.DB.prepare(sql);
   const result = await (guarded

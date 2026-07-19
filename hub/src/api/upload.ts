@@ -1,6 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
-import { markPendingAndEnqueue } from '../queue';
+import { markPendingAndEnqueue, reservationCutoffIso } from '../queue';
 import { hex, objectSha256 } from './ops';
 
 export const TERMINAL_PARSE_STATES = new Set(['parsed', 'skipped', 'superseded']);
@@ -198,14 +198,36 @@ export async function recordUploadedObject(
        -- existed (or before a detect() change) would otherwise keep a stale/NULL session_id even
        -- after re-upload, so canonical/recovery queries that join on files.session_id miss it.
        harness = excluded.harness, session_id = excluded.session_id,
-       -- reserved_at/reserved_by cleared: a full re-upload with new bytes supersedes any reservation this row
-       -- carried (the reservation was for the old bytes; this upload's own parse rewrites the sessions).
-       parse_state = 'pending', parse_error = NULL, reserved_at = NULL, reserved_by = NULL,
+       -- Changed bytes supersede an old reservation. A SAME-hash repair is different: it restores the raw
+       -- object without changing the bytes the live cleanup reserved, so preserve that fresh reservation and
+       -- let its owner drain it after deletes. This closes the multipart fall-through path that bypasses the
+       -- same-hash create shortcut's markPendingAndEnqueue guard (3609060881).
+       parse_state = CASE
+         WHEN files.content_hash = excluded.content_hash AND files.parse_state = 'reserved'
+           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10 THEN 'reserved'
+         ELSE 'pending' END,
+       parse_error = CASE
+         WHEN files.content_hash = excluded.content_hash AND files.parse_state = 'reserved'
+           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10 THEN files.parse_error
+         ELSE NULL END,
+       reserved_at = CASE
+         WHEN files.content_hash = excluded.content_hash AND files.parse_state = 'reserved'
+           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10 THEN files.reserved_at
+         ELSE NULL END,
+       reserved_by = CASE
+         WHEN files.content_hash = excluded.content_hash AND files.parse_state = 'reserved'
+           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10 THEN files.reserved_by
+         ELSE NULL END,
+       reserved_reason = CASE
+         WHEN files.content_hash = excluded.content_hash AND files.parse_state = 'reserved'
+           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10 THEN files.reserved_reason
+         ELSE NULL END,
        uploaded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-     RETURNING id`,
+     RETURNING id, parse_state`,
   )
-    .bind(machineId, store, relpath, r2Key, size, mtime, sha256, det.harness, det.sessionId ?? null)
-    .first<{ id: number }>();
+    .bind(machineId, store, relpath, r2Key, size, mtime, sha256, det.harness, det.sessionId ?? null, reservationCutoffIso())
+    .first<{ id: number; parse_state: string }>();
+  const preservedReservation = row!.parse_state === 'reserved';
 
   // Two overlapping changed-hash uploads for the SAME path can interleave their R2 writes and D1
   // upserts arbitrarily — this request's RAW.put above can land before or after a concurrent
@@ -224,7 +246,10 @@ export async function recordUploadedObject(
   await env.DB.prepare('UPDATE machines SET last_upload_at = strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE machine_id = ?1')
     .bind(machineId)
     .run();
-  if (det.sessionId) {
+  if (preservedReservation) {
+    // The repaired bytes are unchanged and the live cleanup still owns the row. Its owner-tagged send-late
+    // delivery is the only parse allowed to drain it; do not flip sessions or enqueue an early upload here.
+  } else if (det.sessionId) {
     // A changed-hash re-upload of the session's CURRENT canonical file just overwrote the raw
     // object out from under the derived rows: files.parse_state flips to 'pending' above, but
     // sessions.index_state (and the blocks/FTS it advertises) would otherwise stay 'ready' —
@@ -257,7 +282,7 @@ export async function recordUploadedObject(
   // The simple path has no observed-R2 convergence (convergeR2WithRow above only restores bytes, never
   // changes the row hash), so realigned is always false there and it enqueues our hash.
   const realigned = opts.convergeObservedR2 === true && (await convergeMultipartRow(row!.id, r2Key, sha256, env));
-  if (!realigned) {
+  if (!realigned && !preservedReservation) {
     await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
   }
 
@@ -296,11 +321,16 @@ export async function convergeMultipartRow(fileId: number, r2Key: string, sha256
   // size from the losing upload would corrupt canonical selection and leave metadata for the wrong object.
   const mtime = head!.customMetadata?.mtime ?? null;
   const updated = await env.DB.prepare(
-    "UPDATE files SET content_hash = ?2, mtime = ?3, size = ?4, parse_state = 'pending', parse_error = NULL, reserved_at = NULL, reserved_by = NULL WHERE id = ?1 AND content_hash = ?5 RETURNING id",
+    "UPDATE files SET content_hash = ?2, mtime = ?3, size = ?4, parse_state = 'pending', parse_error = NULL, reserved_at = NULL, reserved_by = NULL, reserved_reason = NULL WHERE id = ?1 AND content_hash = ?5 RETURNING id",
   )
     .bind(fileId, r2Hash, mtime, head!.size, sha256)
     .first<{ id: number }>();
   if (!updated) return false; // lost the row to the other writer in the meantime
+  // A same-hash repair deliberately preserves a live export reservation and therefore skips the upload
+  // path's earlier sessions -> parsing flip. If convergence discovers that R2 actually contains different
+  // bytes, the reservation is cleared above and this is now a real changed-hash upload. Flip every session
+  // the archive owns before enqueueing so ready rows never describe the pre-realignment object.
+  await flipOwnedSessionsToParsing(fileId, null, r2Hash, env);
   await env.PARSE_QUEUE.send({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: r2Hash });
   console.log(JSON.stringify({ event: 'access.multipart_converge', key: r2Key, from: sha256, to: r2Hash }));
   return true;

@@ -999,7 +999,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
     // Make the db.batch that reserves SIB (the hash-pinned reserve flip, bound to sib.fileId) throw ONCE.
     // Tag sib's flip statement in a WeakSet and trip the batch only when it carries that statement — keeps the
     // test hermetic against the other export-inbox siblings the same reservation also flips in a full-suite run.
-    const FLIP_SQL = "UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = ?3 WHERE id = ?1 AND parse_state IN ('parsed','pending') AND content_hash = ?2";
+    const FLIP_SQL = "UPDATE files SET reserved_reason = CASE parse_state WHEN 'pending' THEN 'upload' ELSE 'recover' END, parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = ?3, reservation_generation = reservation_generation + 1 WHERE id = ?1 AND parse_state IN ('parsed','pending') AND content_hash = ?2";
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
     const realBatch = testEnv.DB.batch.bind(testEnv.DB);
     const sibFlip = new WeakSet<object>();
@@ -1604,10 +1604,10 @@ describe('large export ingest is bounded and never marks parsed until every conv
 
     await deliverChain({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
 
-    // Both siblings were reserved (parsed→reserved and pending→reserved) and each gets exactly one recover; the
+    // Both siblings were reserved. The parsed one gets recover semantics; the pending one keeps upload semantics
     // pending sibling's own queued upload message is neutralized by the consume-time guard (see the dedicated
     // pending-sibling race test below). send-late never selected a raw 'pending' row — it was reserved first.
-    expect(sent.some((m) => m.file_id === pendingSib.fileId && m.reason === 'recover')).toBe(true);
+    expect(sent.some((m) => m.file_id === pendingSib.fileId && m.reason === 'upload')).toBe(true);
     expect(sent.some((m) => m.file_id === parsedSib.fileId && m.reason === 'recover')).toBe(true);
     expect(await fileState(pendingSib.fileId)).toBe('reserved'); // reserved by our cleanup, awaiting its recover
   });
@@ -1782,7 +1782,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
     // Right after markParsed succeeds (its own hash guard passed), change replaced's stored content_hash — a
     // re-upload landing in the post-mark window. The send-late's pre-send recheck must then see a mismatch and
     // skip the fan-out entirely. Hook the markParsed UPDATE (multi-line, .run()) and mutate the hash after it runs.
-    const MARK_SQL = `UPDATE files SET parse_state = ?2, parsed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), parsed_size = ?3, parse_error = ?4, reserved_at = NULL, reserved_by = NULL
+    const MARK_SQL = `UPDATE files SET parse_state = ?2, parsed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), parsed_size = ?3, parse_error = ?4, reserved_at = NULL, reserved_by = NULL, reserved_reason = NULL
      WHERE id = ?1 AND content_hash = ?5`;
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
     let mutated = false;
@@ -1948,7 +1948,8 @@ describe('per-store cleanup serialization (round 14): a cleanup defers while ano
     await deliverChain({ file_id: aRepl.fileId, r2_key: aRepl.r2Key, reason: 'upload', content_hash: aRepl.hash });
     expect(await fileState(aRepl.fileId)).toBe('parsed');
     expect(await fileState(c.fileId)).toBe('reserved'); // A reserved C; its recover is queued but undelivered
-    expect(sent.some((m) => m.file_id === c.fileId && m.reason === 'recover')).toBe(true);
+    const cRecover = sent.find((m) => m.file_id === c.fileId && m.reason === 'recover');
+    expect(cRecover).toBeDefined();
 
     // B: a second archive that also drops a conversation → its cleanup has a stale row to delete. Delivering
     // its reparse ONCE must DEFER at first-stale (C reserved-fresh) BEFORE deleting or reserving anything.
@@ -1970,7 +1971,7 @@ describe('per-store cleanup serialization (round 14): a cleanup defers while ano
     // then clear reserved_at on the rest (A's cleanup also reserved every OTHER parsed sibling in the shared
     // store — in production each drains via its own recover send, which deliverChain doesn't deliver here).
     const bDefer = sent.find((m) => m.file_id === bRepl.fileId && m.offset === undefined)!;
-    await deliver({ file_id: c.fileId, r2_key: c.r2Key, reason: 'recover', content_hash: c.hash });
+    await deliver(cRecover!);
     expect(await fileState(c.fileId)).toBe('parsed'); // C drained via its recover parse (reserved_at cleared)
     await testEnv.DB.prepare("UPDATE files SET reserved_at = NULL WHERE reserved_at IS NOT NULL").run();
 
@@ -2026,7 +2027,17 @@ describe('per-store cleanup serialization (round 14): a cleanup defers while ano
     expect(sent.some((m) => m.file_id === e.fileId && m.content_hash === corruptHash && m.offset === undefined && m.kick_cursor === undefined)).toBe(true);
 
     // Drain C, then redeliver E's corrupt parse → now the store is free, so E errors terminally.
-    await deliver({ file_id: c.fileId, r2_key: c.r2Key, reason: 'recover', content_hash: c.hash });
+    const cReservation = await testEnv.DB.prepare('SELECT reservation_generation FROM files WHERE id = ?1')
+      .bind(c.fileId)
+      .first<{ reservation_generation: number }>();
+    await deliver({
+      file_id: c.fileId,
+      r2_key: c.r2Key,
+      reason: 'recover',
+      content_hash: c.hash,
+      reservation_owner: OTHER_OWNER,
+      reservation_generation: cReservation!.reservation_generation,
+    });
     await deliver({ file_id: e.fileId, r2_key: e.r2Key, reason: 'upload', content_hash: corruptHash });
     expect(await fileState(e.fileId)).toBe('error');
   });
@@ -2075,10 +2086,11 @@ describe('per-store cleanup serialization (round 14): a cleanup defers while ano
     sent.length = 0;
     await deliverChain({ file_id: reup.fileId, r2_key: reup.r2Key, reason: 'upload', content_hash: reup.hash });
     expect(await fileState(reup.fileId)).toBe('parsed');
-    expect(sent.some((m) => m.file_id === s.fileId && m.reason === 'recover')).toBe(true); // send-late reclaimed S
+    const reclaimedDelivery = sent.find((m) => m.file_id === s.fileId && m.reason === 'recover');
+    expect(reclaimedDelivery).toBeDefined(); // send-late reclaimed S
 
     // Delivering that recover drains S to terminal and clears the ownership markers — no orphaned reservation.
-    await deliver({ file_id: s.fileId, r2_key: s.r2Key, reason: 'recover', content_hash: s.hash });
+    await deliver(reclaimedDelivery!);
     const sFinal = await testEnv.DB.prepare('SELECT parse_state, reserved_by, reserved_at FROM files WHERE id = ?1').bind(s.fileId).first<{ parse_state: string; reserved_by: number | null; reserved_at: string | null }>();
     expect(sFinal!.parse_state).toBe('parsed');
     expect(sFinal!.reserved_by).toBeNull();
@@ -2087,7 +2099,7 @@ describe('per-store cleanup serialization (round 14): a cleanup defers while ano
 });
 
 describe('reservation lifecycle edges (round 15)', () => {
-  it('reserves a PENDING sibling (not skipping past it) and its racing upload message no-ops; the recover drains it (3608955874)', async () => {
+  it('reserves a PENDING sibling, blocks its racing upload, then drains it with owner-tagged upload semantics (3608955874, 3609060878)', async () => {
     budgets({ slice: 800, invocation: 800, kickPage: 500 });
     // A sibling still 'pending' — a fresh upload whose parse message hasn't run. Keep its upload message to race later.
     const pend = await uploadConvs('r15p-sib', [conv('r15psib', 0)]);
@@ -2106,7 +2118,10 @@ describe('reservation lifecycle edges (round 15)', () => {
     // 'parsed'-only pager it would stay 'pending', its upload could land 'parsed' behind the cursor, and escape.
     expect(await fileState(pend.fileId)).toBe('reserved');
     expect(await reservedByOf(pend.fileId)).toBe(replaced.fileId);
-    expect(sent.some((m) => m.file_id === pend.fileId && m.reason === 'recover')).toBe(true);
+    const reservedDelivery = sent.find((m) => m.file_id === pend.fileId);
+    expect(reservedDelivery?.reason).toBe('upload');
+    expect(reservedDelivery?.reservation_owner).toBe(replaced.fileId);
+    expect(reservedDelivery?.reservation_generation).toBeTypeOf('number');
 
     // The sibling's ORIGINAL upload message now races in. POSITIVE CONTROL for the consume-time guard: without
     // it, this 'upload' parse would re-parse the reserved sibling and mark it 'parsed' behind the reserve cursor,
@@ -2114,8 +2129,9 @@ describe('reservation lifecycle edges (round 15)', () => {
     await deliver(pendUpload);
     expect(await fileState(pend.fileId)).toBe('reserved');
 
-    // The cleanup's recover (reason: 'recover' bypasses the guard) drains it to terminal.
-    await deliver({ file_id: pend.fileId, r2_key: pend.r2Key, reason: 'recover', content_hash: pend.hash });
+    // The cleanup's owner-tagged replacement preserves the pending row's original FULL upload semantics,
+    // while still bypassing the guard only after deletes drain.
+    await deliver(reservedDelivery!);
     expect(await fileState(pend.fileId)).toBe('parsed');
   });
 
@@ -2228,5 +2244,273 @@ describe('reservation lifecycle edges (round 15)', () => {
       cmsg = next;
     }
     expect(recovered.size).toBe(COUNT); // every reserved sibling ultimately recovered across the two runs — none stranded
+  });
+});
+
+describe('reservation intent and retry safety (round 16)', () => {
+  const namedConv = (uuid: string, name: string): ClaudeConvOpts => ({
+    uuid,
+    name,
+    messages: [
+      { uuid: `${uuid}-h`, parent: '00000000-0000-4000-8000-000000000000', sender: 'human', text: `${name} question` },
+      { uuid: `${uuid}-a`, parent: `${uuid}-h`, sender: 'assistant', text: `${name} answer` },
+    ],
+  });
+
+  it('a reserved pending upload keeps upload semantics and can replace healthy rows from an older archive (3609060878)', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    const shared = 'r16-pending-shared';
+    const dropped = 'r16-pending-dropped';
+
+    const owner = await uploadConvs(
+      'r16-pending-owner',
+      [namedConv(shared, 'older owner'), namedConv(dropped, 'older dropped')],
+      '2026-07-01T12:00:00Z',
+    );
+    await deliverChain({ file_id: owner.fileId, r2_key: owner.r2Key, reason: 'upload', content_hash: owner.hash });
+
+    // This genuinely newer archive is pending: its original upload message has not run yet.
+    const pending = await uploadConvs(
+      'r16-pending-newer',
+      [namedConv(shared, 'newer pending'), namedConv(dropped, 'newer recovered')],
+      '2026-07-03T12:00:00Z',
+    );
+    const replacement = await uploadConvs(
+      'r16-pending-owner',
+      [namedConv(shared, 'older replacement')],
+      '2026-07-02T12:00:00Z',
+    );
+
+    sent.length = 0;
+    await deliverChain({ file_id: replacement.fileId, r2_key: replacement.r2Key, reason: 'upload', content_hash: replacement.hash });
+    const pendingDelivery = sent.find((m) => m.file_id === pending.fileId);
+    expect(pendingDelivery?.reason).toBe('upload');
+    expect(pendingDelivery?.reservation_owner).toBe(replacement.fileId);
+    expect(pendingDelivery?.reservation_generation).toBeTypeOf('number');
+
+    await deliver(pendingDelivery!);
+    const row = await testEnv.DB.prepare('SELECT title, canonical_file_id FROM sessions WHERE session_id = ?1')
+      .bind(shared)
+      .first<{ title: string; canonical_file_id: number }>();
+    // POSITIVE CONTROL: reason='recover' would gap-fill only, skip this still-healthy shared row, and leave
+    // 'older replacement'. Persisting the pending intent lets the newer archive claim it normally.
+    expect(row?.title).toBe('newer pending');
+    expect(row?.canonical_file_id).toBe(pending.fileId);
+  });
+
+  it('a transient send-late SELECT failure retries without marking its parsed owner error (3609060884)', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    const owner = await uploadConvs('r16-send-late-owner', [conv('r16slowner', 0)]);
+    await deliverChain({ file_id: owner.fileId, r2_key: owner.r2Key, reason: 'upload', content_hash: owner.hash });
+    const sibling = await uploadConvs('r16-send-late-sibling', [conv('r16slsib', 0)]);
+    await testEnv.DB.prepare(
+      "UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = ?2, reserved_reason = 'recover' WHERE id = ?1",
+    ).bind(sibling.fileId, owner.fileId).run();
+
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    let failed = false;
+    testEnv.DB.prepare = ((sql: string) => {
+      if (!failed && sql.includes('reserved_by = ?2 AND id > ?3')) {
+        failed = true;
+        throw new Error('transient send-late D1 outage');
+      }
+      return realPrepare(sql);
+    }) as typeof testEnv.DB.prepare;
+    let retried = false;
+    try {
+      const body: ParseMessage = {
+        file_id: owner.fileId,
+        r2_key: owner.r2Key,
+        reason: 'upload',
+        content_hash: owner.hash,
+        cleanup_phase: 'send-late',
+      };
+      await worker.queue(
+        {
+          queue: 'parse',
+          messages: [{ id: String(owner.fileId), timestamp: new Date(), attempts: 1, body, ack() {}, retry() { retried = true; } }],
+          ackAll() {},
+          retryAll() {},
+        } as unknown as MessageBatch<ParseMessage>,
+        testEnv,
+      );
+    } finally {
+      testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
+    }
+
+    expect(failed).toBe(true);
+    expect(retried).toBe(true);
+    // POSITIVE CONTROL: the old generic catch changed this already-successful owner to 'error'.
+    expect(await fileState(owner.fileId)).toBe('parsed');
+  });
+
+  it('recover may reclaim from a newer parsed owner when that owner session is errored (3609060887)', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    const sessionId = 'r16-newer-error-shared';
+    const older = await uploadConvs('r16-newer-error-old', [namedConv(sessionId, 'older usable')], '2026-07-01T12:00:00Z');
+    await deliverChain({ file_id: older.fileId, r2_key: older.r2Key, reason: 'upload', content_hash: older.hash });
+    const newer = await uploadConvs('r16-newer-error-new', [namedConv(sessionId, 'newer broken')], '2026-07-03T12:00:00Z');
+    await deliverChain({ file_id: newer.fileId, r2_key: newer.r2Key, reason: 'upload', content_hash: newer.hash });
+    await testEnv.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(sessionId).run();
+
+    await deliver({ file_id: older.fileId, r2_key: older.r2Key, reason: 'recover', content_hash: older.hash });
+    const row = await testEnv.DB.prepare('SELECT title, index_state, canonical_file_id FROM sessions WHERE session_id = ?1')
+      .bind(sessionId)
+      .first<{ title: string; index_state: string; canonical_file_id: number }>();
+    // POSITIVE CONTROL: the old mtime guard skipped solely because the parsed owner file was newer.
+    expect(row?.title).toBe('older usable');
+    expect(row?.index_state).toBe('ready');
+    expect(row?.canonical_file_id).toBe(older.fileId);
+  });
+
+  it('a corrupt-export reservation continuation refreshes the prefix it already owns (3609060889)', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    const owner = await uploadConvs('r16-corrupt-refresh-owner', [conv('r16cro', 0), conv('r16cro', 1)]);
+    await deliverChain({ file_id: owner.fileId, r2_key: owner.r2Key, reason: 'upload', content_hash: owner.hash });
+    for (let i = 0; i < 3; i++) {
+      const sibling = await uploadConvs(`r16-corrupt-refresh-sib${i}`, [conv(`r16crs${i}`, 0)]);
+      await deliverChain({ file_id: sibling.fileId, r2_key: sibling.r2Key, reason: 'upload', content_hash: sibling.hash });
+    }
+
+    const corruptHash = await reuploadRawExport('r16-corrupt-refresh-owner', new TextEncoder().encode('not a zip'));
+    budgets({ slice: 5, invocation: 5, kickPage: 1 });
+    sent.length = 0;
+    await deliver({ file_id: owner.fileId, r2_key: owner.r2Key, reason: 'upload', content_hash: corruptHash });
+    const continuation = sent.find((m) => m.file_id === owner.fileId && typeof m.kick_cursor === 'number');
+    expect(continuation?.reservation_count).toBe(1);
+
+    const firstReserved = await testEnv.DB.prepare("SELECT id FROM files WHERE reserved_by = ?1 AND parse_state = 'reserved' ORDER BY id LIMIT 1")
+      .bind(owner.fileId)
+      .first<{ id: number }>();
+    expect(firstReserved).not.toBeNull();
+    await testEnv.DB.prepare("UPDATE files SET reserved_at = '2020-01-01T00:00:00.000Z' WHERE reserved_by = ?1").bind(owner.fileId).run();
+    expect(await reservationHealEligible(firstReserved!.id)).toBe(true);
+
+    sent.length = 0;
+    await deliver(continuation!);
+    // POSITIVE CONTROL: without the corrupt-path on-entry refresh, this remains stale/heal-eligible while
+    // later pages advance, so files/check can clear it before send-late ever reaches it.
+    expect(await reservationHealEligible(firstReserved!.id)).toBe(false);
+  });
+
+  it('a corrupt-export continuation restarts when only part of its reserved prefix was healed', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    const owner = await uploadConvs('r16-corrupt-partial-owner', [conv('r16cpo', 0), conv('r16cpo', 1)]);
+    await deliverChain({ file_id: owner.fileId, r2_key: owner.r2Key, reason: 'upload', content_hash: owner.hash });
+    for (let i = 0; i < 3; i++) {
+      const sibling = await uploadConvs(`r16-corrupt-partial-sib${i}`, [conv(`r16cps${i}`, 0)]);
+      await deliverChain({ file_id: sibling.fileId, r2_key: sibling.r2Key, reason: 'upload', content_hash: sibling.hash });
+    }
+
+    const corruptHash = await reuploadRawExport('r16-corrupt-partial-owner', new TextEncoder().encode('still not a zip'));
+    budgets({ slice: 5, invocation: 5, kickPage: 2 });
+    sent.length = 0;
+    await deliver({ file_id: owner.fileId, r2_key: owner.r2Key, reason: 'upload', content_hash: corruptHash });
+    const continuation = sent.find((m) => m.file_id === owner.fileId && typeof m.kick_cursor === 'number');
+    expect(continuation?.reservation_count).toBe(2);
+
+    const reservations = await testEnv.DB.prepare(
+      "SELECT id FROM files WHERE reserved_by = ?1 AND parse_state = 'reserved' ORDER BY id",
+    )
+      .bind(owner.fileId)
+      .all<{ id: number }>();
+    expect(reservations.results).toHaveLength(2);
+    await testEnv.DB.prepare(
+      "UPDATE files SET parse_state = 'pending', reserved_at = NULL, reserved_by = NULL, reserved_reason = NULL WHERE id = ?1",
+    )
+      .bind(reservations.results[0]!.id)
+      .run();
+
+    sent.length = 0;
+    await deliver(continuation!);
+    const restart = sent.find((m) => m.file_id === owner.fileId);
+    expect(restart).toMatchObject({ file_id: owner.fileId, reason: 'upload', content_hash: corruptHash });
+    expect(restart?.kick_cursor).toBeUndefined();
+    expect(restart?.reservation_count).toBeUndefined();
+    // POSITIVE CONTROL: comparing only against zero would accept the one surviving reservation, advance
+    // past the healed sibling, and eventually mark the corrupt owner error with an incomplete recovery set.
+    expect(await fileState(owner.fileId)).toBe('pending');
+  });
+
+  it('a successful cleanup continuation also restarts when only part of its reserved prefix was healed', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    for (let i = 0; i < 3; i++) {
+      const sibling = await uploadConvs(`r16-cleanup-partial-sib${i}`, [conv(`r16clps${i}`, 0)]);
+      await deliverChain({ file_id: sibling.fileId, r2_key: sibling.r2Key, reason: 'upload', content_hash: sibling.hash });
+    }
+    const owner = await uploadConvs('r16-cleanup-partial-owner', [conv('r16clpo', 0), conv('r16clpo', 1)]);
+    await deliverChain({ file_id: owner.fileId, r2_key: owner.r2Key, reason: 'upload', content_hash: owner.hash });
+    const replacement = await uploadConvs('r16-cleanup-partial-owner', [conv('r16clpo', 0)]);
+
+    budgets({ slice: 8, invocation: 8, kickPage: 2 });
+    sent.length = 0;
+    const { stoppedCont } = await deliverChain(
+      { file_id: replacement.fileId, r2_key: replacement.r2Key, reason: 'upload', content_hash: replacement.hash },
+      { stopAtCleanup: true },
+    );
+    expect(stoppedCont?.cleanup_phase).toBe('reserve');
+    expect(stoppedCont?.reservation_count).toBe(2);
+
+    const reservations = await testEnv.DB.prepare(
+      "SELECT id FROM files WHERE reserved_by = ?1 AND parse_state = 'reserved' ORDER BY id",
+    )
+      .bind(owner.fileId)
+      .all<{ id: number }>();
+    expect(reservations.results).toHaveLength(2);
+    await testEnv.DB.prepare(
+      "UPDATE files SET parse_state = 'pending', reserved_at = NULL, reserved_by = NULL, reserved_reason = NULL WHERE id = ?1",
+    )
+      .bind(reservations.results[0]!.id)
+      .run();
+
+    sent.length = 0;
+    await deliver(stoppedCont!);
+    const restart = sent.find((m) => m.file_id === owner.fileId);
+    expect(restart).toMatchObject({ file_id: owner.fileId, reason: 'upload', content_hash: replacement.hash });
+    expect(restart?.cleanup_phase).toBeUndefined();
+    expect(restart?.reservation_count).toBeUndefined();
+    expect(await fileState(owner.fileId)).toBe('pending');
+  });
+
+  it('an old owner-tagged delivery cannot consume a newer same-timestamp reservation by the same owner id', async () => {
+    budgets({ slice: 800, invocation: 800, kickPage: 500 });
+    const owner = await uploadConvs('r16-generation-owner', [conv('r16go', 0)]);
+    await deliverChain({ file_id: owner.fileId, r2_key: owner.r2Key, reason: 'upload', content_hash: owner.hash });
+    const sibling = await uploadConvs('r16-generation-sibling', [conv('r16gs', 0)]);
+    await deliverChain({ file_id: sibling.fileId, r2_key: sibling.r2Key, reason: 'upload', content_hash: sibling.hash });
+
+    const identicalTimestamp = new Date(Date.now() + 30_000).toISOString();
+    await testEnv.DB.prepare(
+      "UPDATE files SET parse_state = 'reserved', reserved_at = ?3, reserved_by = ?2, reserved_reason = 'recover', reservation_generation = reservation_generation + 1 WHERE id = ?1",
+    )
+      .bind(sibling.fileId, owner.fileId, identicalTimestamp)
+      .run();
+    const oldReservation = await testEnv.DB.prepare('SELECT reservation_generation FROM files WHERE id = ?1')
+      .bind(sibling.fileId)
+      .first<{ reservation_generation: number }>();
+    const staleDelivery: ParseMessage = {
+      file_id: sibling.fileId,
+      r2_key: sibling.r2Key,
+      reason: 'recover',
+      content_hash: sibling.hash,
+      reservation_owner: owner.fileId,
+      reservation_generation: oldReservation!.reservation_generation,
+    };
+
+    // The same stable owner id starts a later cleanup and refreshes/re-reserves this sibling in the exact same
+    // timestamp millisecond. reserved_at cannot distinguish the windows; the durable integer generation must.
+    await testEnv.DB.prepare(
+      'UPDATE files SET reserved_at = ?2, reservation_generation = reservation_generation + 1 WHERE id = ?1',
+    ).bind(sibling.fileId, identicalTimestamp).run();
+    const newReservation = await testEnv.DB.prepare('SELECT reserved_at, reservation_generation FROM files WHERE id = ?1')
+      .bind(sibling.fileId)
+      .first<{ reserved_at: string; reservation_generation: number }>();
+    expect(newReservation?.reserved_at).toBe(identicalTimestamp);
+    expect(newReservation?.reservation_generation).toBe(oldReservation!.reservation_generation + 1);
+    await deliver(staleDelivery);
+    expect(await fileState(sibling.fileId)).toBe('reserved');
+
+    await deliver({ ...staleDelivery, reservation_generation: newReservation!.reservation_generation });
+    expect(await fileState(sibling.fileId)).toBe('parsed');
   });
 });

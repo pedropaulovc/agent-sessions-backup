@@ -10,16 +10,19 @@ const CLAUDE_ROOT = '00000000-0000-4000-8000-000000000000';
 
 const testEnv = testEnvRaw as unknown as Env;
 
-// The recover fan-out enqueues sibling archives with reason:'recover', and that reason rides in the
-// queue MESSAGE, not the DB. drainQueue below rebuilds messages by polling pending files, so on its
-// own it would stamp every redelivery 'upload' and silently downgrade a recover parse into an
-// authoritative one (masking the fix that gates clobbering on reason). Capture the real reason per
-// file from PARSE_QUEUE.send — every enqueue path (upload, reindex, recover) goes through it — and
-// let drainQueue replay it.
-const enqueuedReason = new Map<number, ParseMessage['reason']>();
+// The recover fan-out's intent and reservation authorization ride in the queue MESSAGE, not the DB.
+// drainQueue below rebuilds messages by polling pending files, so capture those delivery fields per file
+// from PARSE_QUEUE.send and replay them. Omitting owner/generation would turn every genuine send-late child
+// into an untagged stale delivery that the fresh-reservation guard correctly rejects.
+type DeliveryFields = Pick<ParseMessage, 'reason' | 'reservation_owner' | 'reservation_generation'>;
+const enqueuedDelivery = new Map<number, DeliveryFields>();
 const realQueueSend = testEnv.PARSE_QUEUE.send.bind(testEnv.PARSE_QUEUE);
 testEnv.PARSE_QUEUE.send = (async (msg: ParseMessage) => {
-  enqueuedReason.set(msg.file_id, msg.reason);
+  enqueuedDelivery.set(msg.file_id, {
+    reason: msg.reason,
+    reservation_owner: msg.reservation_owner,
+    reservation_generation: msg.reservation_generation,
+  });
   return realQueueSend(msg);
 }) as typeof testEnv.PARSE_QUEUE.send;
 
@@ -48,13 +51,13 @@ async function drainQueue(): Promise<void> {
   // Include 'reserved' — the export cleanup RESERVE phase flips a sibling to 'reserved' (not 'pending') and
   // the SEND-LATE pass enqueues its recover message; this harness rebuilds messages from DB state, so it must
   // pick up 'reserved' rows too (production delivers them via the real queue). files/check heals 'reserved'
-  // identically, so replaying it with the captured reason ('recover', or 'upload' if none) matches prod.
+  // identically, so replaying it with the captured intent and reservation generation matches prod.
   const pending = await testEnv.DB.prepare("SELECT id, r2_key FROM files WHERE parse_state IN ('pending', 'reserved')").all<{ id: number; r2_key: string }>();
   const messages = pending.results.map((r) => ({
     id: String(r.id),
     timestamp: new Date(),
     attempts: 1,
-    body: { file_id: r.id, r2_key: r.r2_key, reason: enqueuedReason.get(r.id) ?? 'upload' },
+    body: { file_id: r.id, r2_key: r.r2_key, ...(enqueuedDelivery.get(r.id) ?? { reason: 'upload' as const }) },
     ack() {},
     retry() {},
   }));
@@ -98,7 +101,7 @@ async function resetExportState(): Promise<void> {
   }
   stmts.push(testEnv.DB.prepare("DELETE FROM files WHERE store = 'export-inbox'"));
   await testEnv.DB.batch(stmts);
-  enqueuedReason.clear();
+  enqueuedDelivery.clear();
 }
 
 /** Deliver one explicit message (optionally with a specific content_hash to simulate a stale delivery). */

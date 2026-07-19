@@ -654,7 +654,7 @@ export async function reindex(request: Request, env: Env, identity: Identity): P
            ON CONFLICT (machine_id, store, relpath) DO UPDATE SET
              parse_state = 'pending', size = excluded.size, mtime = COALESCE(excluded.mtime, files.mtime),
              harness = excluded.harness, session_id = excluded.session_id, content_hash = excluded.content_hash,
-             reserved_at = NULL, reserved_by = NULL
+             reserved_at = NULL, reserved_by = NULL, reserved_reason = NULL
            WHERE NOT (files.parse_state = 'reserved' AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10)
            RETURNING id`,
         ).bind(i.machineId, i.store, i.relpath, i.key, i.size, i.mtime, i.contentHash, i.det.harness, i.det.sessionId ?? null, reservCutoff),
