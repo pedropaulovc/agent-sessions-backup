@@ -491,6 +491,8 @@ class CollectorFlowTests(unittest.TestCase):
                 return types.SimpleNamespace(stdout="test-windows\n", returncode=0)
             if argv[1:] == ["enroll", "--help"]:
                 return types.SimpleNamespace(stdout="--import-pfx --client-cert", returncode=0)
+            if argv[1:] == ["doctor", "--help"]:
+                return types.SimpleNamespace(stdout="--require-current-cert", returncode=0)
             return types.SimpleNamespace(stdout="", returncode=0)
 
         with (
@@ -502,7 +504,7 @@ class CollectorFlowTests(unittest.TestCase):
 
         self.assertEqual(
             [call[0][1:3] for call in calls],
-            [["tool", "install"], ["enroll", "--help"], ["machine-id"]],
+            [["tool", "install"], ["enroll", "--help"], ["doctor", "--help"], ["machine-id"]],
         )
         for argv, kwargs in calls:
             self.assertNotIn("cf-secret", " ".join(argv))
@@ -517,8 +519,10 @@ class CollectorFlowTests(unittest.TestCase):
             calls.append((list(argv), kwargs))
             if argv[0] == "/old/agent-collector":
                 return types.SimpleNamespace(stdout="old help", returncode=0)
-            if argv[0] == "/new/agent-collector":
+            if argv[0] == "/new/agent-collector" and argv[1] == "enroll":
                 return types.SimpleNamespace(stdout="--import-pfx --client-cert", returncode=0)
+            if argv[0] == "/new/agent-collector" and argv[1] == "doctor":
+                return types.SimpleNamespace(stdout="--require-current-cert", returncode=0)
             return types.SimpleNamespace(stdout="", returncode=0)
 
         lookups = iter(["/old/agent-collector", "/tools/uv", "/new/agent-collector"])
