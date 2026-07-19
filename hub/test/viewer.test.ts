@@ -639,12 +639,17 @@ describe('viewer result pagination and facet layout', () => {
     const statements: D1PreparedStatement[] = [];
     for (let i = 0; i < 25; i++) {
       const id = `viewer-pagination-${String(i).padStart(2, '0')}`;
+      // Exercise both halves of the keyset's total order: item 14 ties item 15's
+      // timestamp exactly across the page-1 boundary, while items 0/1 are NULL and
+      // must remain traversable at the end via COALESCE(started_at, '').
+      const day = i === 14 ? 16 : i + 1;
+      const startedAt = i < 2 ? null : `2026-07-${String(day).padStart(2, '0')}T12:00:00Z`;
       statements.push(
         testEnv.DB.prepare(
           `INSERT INTO sessions
              (session_id, harness, machine_id, os, primary_model, title, started_at, index_state)
            VALUES (?1, ?2, ?3, 'linux', 'pagination-model', ?4, ?5, 'ready')`,
-        ).bind(id, PAGINATION_HARNESS, PAGINATION_MACHINE, `Pagination item ${i}`, `2026-07-${String(i + 1).padStart(2, '0')}T12:00:00Z`),
+        ).bind(id, PAGINATION_HARNESS, PAGINATION_MACHINE, `Pagination item ${i}`, startedAt),
       );
       statements.push(
         testEnv.DB.prepare(
@@ -664,6 +669,10 @@ describe('viewer result pagination and facet layout', () => {
     const match = html.match(new RegExp(`<a rel="${rel}" href="([^"]+)"`));
     expect(match, `${rel} link should be present`).toBeTruthy();
     return match![1]!.replaceAll('&amp;', '&');
+  }
+
+  function recentIds(html: string): string[] {
+    return [...html.matchAll(/<a href="\/s\/(viewer-pagination-[^"]+)">/g)].map((match) => match[1]!);
   }
 
   it('renders filters before results in a responsive left sidebar and auto-submits selects', async () => {
@@ -719,6 +728,9 @@ describe('viewer result pagination and facet layout', () => {
     expect(third.match(/<div class="hit">/g)).toHaveLength(5);
     expect(pageHref(third, 'prev')).toContain(`harness=${PAGINATION_HARNESS}`);
     expect(third).not.toContain(`/s/${BIG_SESSION}`);
+
+    const backToSecond = await (await SELF.fetch(`https://sessions.vza.net${pageHref(third, 'prev')}`)).text();
+    expect(recentIds(backToSecond)).toEqual(recentIds(second));
   });
 
   it('resets pagination when a facet changes but preserves the text query', async () => {
@@ -730,5 +742,44 @@ describe('viewer result pagination and facet layout', () => {
     expect(controls).toContain(`name="q" value="${PAGINATION_MARKER}"`);
     expect(controls).not.toContain('name="cursor"');
     expect(controls).not.toContain('name="limit"');
+  });
+
+  it('keeps the recent-session boundary stable when a newer session is ingested between pages', async () => {
+    const first = await (await SELF.fetch(
+      `https://sessions.vza.net/?harness=${PAGINATION_HARNESS}&limit=10`,
+    )).text();
+    const firstIds = recentIds(first);
+    expect(firstIds).toEqual(
+      Array.from({ length: 10 }, (_, i) => `viewer-pagination-${String(24 - i).padStart(2, '0')}`),
+    );
+    const nextHref = pageHref(first, 'next');
+
+    // Positive control: the old OFFSET 10 page shifts when a new row lands ahead of page 1.
+    const offsetPage = async () => (await testEnv.DB.prepare(
+      `SELECT session_id FROM sessions WHERE harness = ?1
+       ORDER BY COALESCE(started_at, '') DESC, session_id DESC LIMIT 10 OFFSET 10`,
+    ).bind(PAGINATION_HARNESS).all<{ session_id: string }>()).results.map((row) => row.session_id);
+    const offsetBefore = await offsetPage();
+
+    await testEnv.DB.prepare(
+      `INSERT INTO sessions
+         (session_id, harness, machine_id, os, primary_model, title, started_at, index_state)
+       VALUES ('viewer-pagination-new', ?1, ?2, 'linux', 'pagination-model', 'Newer concurrent session',
+               '2026-07-26T12:00:00Z', 'ready')`,
+    ).bind(PAGINATION_HARNESS, PAGINATION_MACHINE).run();
+
+    const offsetAfter = await offsetPage();
+    expect(offsetAfter).not.toEqual(offsetBefore);
+    expect(offsetAfter).toContain(firstIds.at(-1)!); // repeats the last row from page 1
+
+    // The viewer cursor names page 1's last (started_at, session_id), so the newly inserted
+    // row cannot move its page-2 boundary. No repeat and no skipped pre-existing row.
+    const second = await (await SELF.fetch(`https://sessions.vza.net${nextHref}`)).text();
+    const secondIds = recentIds(second);
+    expect(secondIds).toEqual(
+      Array.from({ length: 10 }, (_, i) => `viewer-pagination-${String(14 - i).padStart(2, '0')}`),
+    );
+    expect(secondIds.some((id) => firstIds.includes(id))).toBe(false);
+    expect(secondIds).not.toContain('viewer-pagination-new');
   });
 });

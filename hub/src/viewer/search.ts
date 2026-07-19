@@ -47,9 +47,17 @@ interface RecentRow {
 
 interface RecentResult {
   rows: RecentRow[];
-  cursor?: string;
-  offset: number;
+  previousCursor?: string;
+  nextCursor?: string;
+  page: number;
   limit: number;
+}
+
+interface RecentCursor {
+  direction: 'after' | 'before';
+  startedAt: string;
+  sessionId: string;
+  page: number;
 }
 
 /** GET / — paginated recent sessions or full-text results, with filters and facets in a left sidebar. */
@@ -65,12 +73,14 @@ export async function searchPage(url: URL, env: Env): Promise<Response> {
     const list = recent.rows.length
       ? recent.rows.map(renderRecent).join('')
       : `<p class="muted">No sessions match these filters.</p>`;
+    const firstResult = (recent.page - 1) * recent.limit + 1;
     const summary = recent.rows.length
-      ? `<p class="muted small">Showing ${recent.offset + 1}–${recent.offset + recent.rows.length} recent sessions</p>`
+      ? `<p class="muted small">Showing ${firstResult}–${firstResult + recent.rows.length - 1} recent sessions</p>`
       : '';
     const body = searchForm + renderSearchLayout(
       renderSidebar(url, query, active, options, facets),
-      `<h3 class="muted small">Recent sessions</h3>${summary}${list}${pager(url, recent.cursor, recent.offset, recent.limit)}`,
+      `<h3 class="muted small">Recent sessions</h3>${summary}${list}` +
+        recentPager(url, recent.previousCursor, recent.nextCursor, recent.page),
     );
     return page({ title: 'Search — sessions', nav: 'search', body });
   }
@@ -87,7 +97,7 @@ export async function searchPage(url: URL, env: Env): Promise<Response> {
     : `<p class="muted">No matches for “${esc(query)}”.</p>`;
   const body = searchForm + renderSearchLayout(
     renderSidebar(url, query, active, options, result.facets),
-    `${summary}${list}${pager(url, result.cursor, offset, limit)}`,
+    `${summary}${list}${searchPager(url, result.cursor, offset, limit)}`,
   );
   return page({ title: `${query} — sessions`, nav: 'search', body });
 }
@@ -171,18 +181,98 @@ function renderSidebar(
 
 async function recentSessions(p: URLSearchParams, env: Env): Promise<RecentResult> {
   const limit = clampLimit(p.get('limit'), DEFAULT_PAGE_SIZE, 100);
-  const offset = decodeCursor(p.get('cursor'));
-  const { where, binds } = sessionWhere(p);
+  const cursor = decodeRecentCursor(p.get('cursor'));
+  const page = cursor?.page ?? 1;
+  const { where: baseWhere, binds } = sessionWhere(p);
+  const boundary = cursor ? recentBoundary(cursor.direction, cursor.startedAt, cursor.sessionId, binds) : '';
+  const where = boundary ? `${baseWhere || 'WHERE'}${baseWhere ? ' AND' : ''} ${boundary}` : baseWhere;
+  const reverse = cursor?.direction === 'before';
+  const direction = reverse ? 'ASC' : 'DESC';
   const result = await env.DB.prepare(
     `SELECT session_id, harness, machine_id, primary_model, title, started_at, cwd
-     FROM sessions ${where} ORDER BY started_at DESC, session_id DESC LIMIT ${limit + 1} OFFSET ${offset}`,
+     FROM sessions ${where}
+     ORDER BY COALESCE(started_at, '') ${direction}, session_id ${direction} LIMIT ${limit + 1}`,
   ).bind(...binds).all<RecentRow>();
+  const rows = result.results.slice(0, limit);
+  if (reverse) rows.reverse();
+
+  const first = rows.at(0);
+  const last = rows.at(-1);
+  const hasPrevious = reverse
+    ? result.results.length > limit
+    : !!cursor && !!first && await hasRecentRow(p, env, 'before', first);
+  const hasNext = reverse
+    ? !!last && await hasRecentRow(p, env, 'after', last)
+    : result.results.length > limit;
   return {
-    rows: result.results.slice(0, limit),
-    cursor: result.results.length > limit ? encodeCursor(offset + limit) : undefined,
-    offset,
+    rows,
+    previousCursor: hasPrevious && first
+      ? encodeRecentCursor({ direction: 'before', startedAt: startedAtKey(first), sessionId: first.session_id, page: Math.max(1, page - 1) })
+      : undefined,
+    nextCursor: hasNext && last
+      ? encodeRecentCursor({ direction: 'after', startedAt: startedAtKey(last), sessionId: last.session_id, page: page + 1 })
+      : undefined,
+    page,
     limit,
   };
+}
+
+/** Recent sessions are actively ingested, so its cursor names a row boundary rather than
+ * an OFFSET into a moving list. The direction supports both Previous and Next without
+ * scanning/discarding every preceding row. */
+function recentBoundary(
+  direction: RecentCursor['direction'],
+  startedAt: string,
+  sessionId: string,
+  binds: string[],
+): string {
+  const op = direction === 'after' ? '<' : '>';
+  binds.push(startedAt, startedAt, sessionId);
+  const n = binds.length;
+  return `(COALESCE(started_at, '') ${op} ?${n - 2} OR ` +
+    `(COALESCE(started_at, '') = ?${n - 1} AND session_id ${op} ?${n}))`;
+}
+
+async function hasRecentRow(
+  p: URLSearchParams,
+  env: Env,
+  direction: RecentCursor['direction'],
+  row: RecentRow,
+): Promise<boolean> {
+  const { where: baseWhere, binds } = sessionWhere(p);
+  const boundary = recentBoundary(direction, startedAtKey(row), row.session_id, binds);
+  const where = `${baseWhere || 'WHERE'}${baseWhere ? ' AND' : ''} ${boundary}`;
+  return !!await env.DB.prepare(`SELECT 1 AS found FROM sessions ${where} LIMIT 1`).bind(...binds).first();
+}
+
+function startedAtKey(row: RecentRow): string {
+  return row.started_at ?? '';
+}
+
+function encodeRecentCursor(cursor: RecentCursor): string {
+  const json = JSON.stringify(['recent-v1', cursor.direction, cursor.startedAt, cursor.sessionId, cursor.page]);
+  const bytes = new TextEncoder().encode(json);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function decodeRecentCursor(value: string | null): RecentCursor | null {
+  if (!value) return null;
+  try {
+    const binary = atob(value);
+    const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+    const decoded: unknown = JSON.parse(new TextDecoder().decode(bytes));
+    if (!Array.isArray(decoded) || decoded.length !== 5 || decoded[0] !== 'recent-v1') return null;
+    const [, direction, startedAt, sessionId, page] = decoded;
+    if (direction !== 'after' && direction !== 'before') return null;
+    if (typeof startedAt !== 'string' || typeof sessionId !== 'string') return null;
+    if (!Number.isSafeInteger(page) || (page as number) < 1) return null;
+    return { direction, startedAt, sessionId, page: page as number };
+  } catch {
+    // A stale search/offset cursor, invalid base64, or hand-edited payload starts at page 1.
+    return null;
+  }
 }
 
 async function sessionFacets(p: URLSearchParams, env: Env): Promise<Record<string, Record<string, number>>> {
@@ -284,7 +374,7 @@ function renderFacets(url: URL, facets: Record<string, Record<string, number>> |
   return groups || '<p class="muted small">No facets.</p>';
 }
 
-function pager(url: URL, cursor: string | undefined, offset: number, limit: number): string {
+function searchPager(url: URL, cursor: string | undefined, offset: number, limit: number): string {
   if (!cursor && offset === 0) return '';
   const previous = new URL(url);
   const previousOffset = Math.max(0, offset - limit);
@@ -301,5 +391,27 @@ function pager(url: URL, cursor: string | undefined, offset: number, limit: numb
     : `<span class="muted">Next →</span>`;
   const currentPage = Math.floor(offset / limit) + 1;
   return `<nav class="pager" aria-label="Search result pages">${previousLink}` +
+    `<span class="small">Page ${currentPage}</span>${nextLink}</nav>`;
+}
+
+function recentPager(
+  url: URL,
+  previousCursor: string | undefined,
+  nextCursor: string | undefined,
+  currentPage: number,
+): string {
+  if (!previousCursor && !nextCursor) return '';
+  const previous = new URL(url);
+  if (previousCursor) previous.searchParams.set('cursor', previousCursor);
+  const previousLink = previousCursor
+    ? `<a rel="prev" href="${esc(previous.pathname + previous.search)}">← Previous</a>`
+    : `<span class="muted">← Previous</span>`;
+
+  const next = new URL(url);
+  if (nextCursor) next.searchParams.set('cursor', nextCursor);
+  const nextLink = nextCursor
+    ? `<a rel="next" href="${esc(next.pathname + next.search)}">Next →</a>`
+    : `<span class="muted">Next →</span>`;
+  return `<nav class="pager" aria-label="Recent session pages">${previousLink}` +
     `<span class="small">Page ${currentPage}</span>${nextLink}</nav>`;
 }
