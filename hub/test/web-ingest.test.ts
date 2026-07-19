@@ -10,16 +10,19 @@ const CLAUDE_ROOT = '00000000-0000-4000-8000-000000000000';
 
 const testEnv = testEnvRaw as unknown as Env;
 
-// The recover fan-out enqueues sibling archives with reason:'recover', and that reason rides in the
-// queue MESSAGE, not the DB. drainQueue below rebuilds messages by polling pending files, so on its
-// own it would stamp every redelivery 'upload' and silently downgrade a recover parse into an
-// authoritative one (masking the fix that gates clobbering on reason). Capture the real reason per
-// file from PARSE_QUEUE.send — every enqueue path (upload, reindex, recover) goes through it — and
-// let drainQueue replay it.
-const enqueuedReason = new Map<number, ParseMessage['reason']>();
+// The recover fan-out's intent and reservation authorization ride in the queue MESSAGE, not the DB.
+// drainQueue below rebuilds messages by polling pending files, so capture those delivery fields per file
+// from PARSE_QUEUE.send and replay them. Omitting owner/generation would turn every genuine send-late child
+// into an untagged stale delivery that the fresh-reservation guard correctly rejects.
+type DeliveryFields = Pick<ParseMessage, 'reason' | 'reservation_owner' | 'reservation_generation'>;
+const enqueuedDelivery = new Map<number, DeliveryFields>();
 const realQueueSend = testEnv.PARSE_QUEUE.send.bind(testEnv.PARSE_QUEUE);
 testEnv.PARSE_QUEUE.send = (async (msg: ParseMessage) => {
-  enqueuedReason.set(msg.file_id, msg.reason);
+  enqueuedDelivery.set(msg.file_id, {
+    reason: msg.reason,
+    reservation_owner: msg.reservation_owner,
+    reservation_generation: msg.reservation_generation,
+  });
   return realQueueSend(msg);
 }) as typeof testEnv.PARSE_QUEUE.send;
 
@@ -45,12 +48,16 @@ const putText = (machine: string, store: string, relpath: string, text: string) 
   put(machine, store, relpath, new TextEncoder().encode(text));
 
 async function drainQueue(): Promise<void> {
-  const pending = await testEnv.DB.prepare("SELECT id, r2_key FROM files WHERE parse_state = 'pending'").all<{ id: number; r2_key: string }>();
+  // Include 'reserved' — the export cleanup RESERVE phase flips a sibling to 'reserved' (not 'pending') and
+  // the SEND-LATE pass enqueues its recover message; this harness rebuilds messages from DB state, so it must
+  // pick up 'reserved' rows too (production delivers them via the real queue). files/check heals 'reserved'
+  // identically, so replaying it with the captured intent and reservation generation matches prod.
+  const pending = await testEnv.DB.prepare("SELECT id, r2_key FROM files WHERE parse_state IN ('pending', 'reserved')").all<{ id: number; r2_key: string }>();
   const messages = pending.results.map((r) => ({
     id: String(r.id),
     timestamp: new Date(),
     attempts: 1,
-    body: { file_id: r.id, r2_key: r.r2_key, reason: enqueuedReason.get(r.id) ?? 'upload' },
+    body: { file_id: r.id, r2_key: r.r2_key, ...(enqueuedDelivery.get(r.id) ?? { reason: 'upload' as const }) },
     ack() {},
     retry() {},
   }));
@@ -58,10 +65,11 @@ async function drainQueue(): Promise<void> {
   await worker.queue({ queue: 'parse', messages, ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>, testEnv);
 }
 
-/** Drain repeatedly until nothing is pending — a recover enqueue flips a sibling file back to pending. */
+/** Drain repeatedly until nothing is pending/reserved — the RESERVE phase flips a sibling to 'reserved', and
+ * its late-sent recover parse then moves it through to terminal. */
 async function drainAll(): Promise<void> {
   for (let i = 0; i < 10; i++) {
-    const n = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM files WHERE parse_state = 'pending'").first<{ n: number }>();
+    const n = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM files WHERE parse_state IN ('pending', 'reserved')").first<{ n: number }>();
     if ((n?.n ?? 0) === 0) return;
     await drainQueue();
   }
@@ -93,7 +101,7 @@ async function resetExportState(): Promise<void> {
   }
   stmts.push(testEnv.DB.prepare("DELETE FROM files WHERE store = 'export-inbox'"));
   await testEnv.DB.batch(stmts);
-  enqueuedReason.clear();
+  enqueuedDelivery.clear();
 }
 
 /** Deliver one explicit message (optionally with a specific content_hash to simulate a stale delivery). */
@@ -471,7 +479,7 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     expect(text).not.toContain('rawmarker-beta'); // sibling conversation B must not leak
   });
 
-  it('a re-upload landing after the write loop does not let a stale parse delete a dropped conversation — markParsed runs before cleanup (round 4 Fix 1)', async () => {
+  it('a re-upload landing after the write loop does not let a stale parse delete a dropped conversation — a per-page content_hash recheck guards cleanup (round 4 Fix 1 / round 3 finding 3)', async () => {
     const relpath = 'chatgpt-export-reorder.zip';
     const r2Key = 'raw/webbox/export-inbox/chatgpt-export-reorder.zip';
     // The archive owns A and B.
@@ -493,11 +501,12 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     const withOnlyAHash = await sha256Hex(withOnlyA);
 
     // Deliver a message carrying withOnlyA's hash — it passes the early recheck and writes A off the
-    // current R2 bytes ([A]). Then simulate ANOTHER re-upload landing mid-parse (after the write
-    // loop) by mutating the row's content_hash the first time the parse reaches its post-write-loop
-    // step. With the fix that step is the guarded markParsed, which now fails and skips cleanup, so
-    // B survives for the fresh parse; pre-fix, cleanup ran first and deleted B before markParsed
-    // noticed — leaving no row if that fresh parse were delayed/dropped.
+    // current R2 bytes ([A]). Then simulate ANOTHER re-upload landing mid-parse (after the write loop)
+    // by mutating the row's content_hash the first time the parse reaches its post-write-loop step. The
+    // budgeted cleanup phase now runs BEFORE markParsed (round 3 finding 3), but each cleanup page
+    // re-reads content_hash right after fetching it: that recheck observes the mutated hash and aborts
+    // cleanup, so B survives for the fresh parse. Pre-fix (unbounded cleanup with no per-page guard) B
+    // would be deleted before markParsed noticed — leaving no row if that fresh parse were delayed/dropped.
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
     let mutated = false;
     const mutateOnce = async () => {

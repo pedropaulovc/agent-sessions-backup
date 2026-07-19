@@ -1,0 +1,22 @@
+-- Index the canonical_file_id lookups. The export cleanup phase pages stale sessions with
+--   SELECT session_id FROM sessions WHERE canonical_file_id = ?1 AND session_id > ?2 ORDER BY session_id ASC LIMIT ?3
+-- (consumer.ts) — its hot loop for a large replacement archive. Without an index on canonical_file_id,
+-- D1 walks/filters the whole sessions table per page, so a big cleanup can blow CPU/latency even though
+-- subrequests are budgeted. A composite (canonical_file_id, session_id) serves that cursor exactly:
+-- equality on the leading column, range + ordering on the second, so each page is bounded.
+--
+-- The same index also covers every other "all sessions owned by this file" hot path — failExportFile's
+-- owned-session flip, revertOwnedReady, flipOwnedSessionsToParsing on upload, and the reindex-prefix flip
+-- (ops.ts) — all of which filter WHERE canonical_file_id = ?. This protects the reindex drill path too.
+--
+-- Numbered 0006 deliberately: 0004/0005 are reserved by other in-flight branches (0005 = cert rotation,
+-- PR #20). A numbering gap is harmless; a collision is not.
+CREATE INDEX IF NOT EXISTS idx_sessions_canonical_file ON sessions(canonical_file_id, session_id);
+
+-- files.parse_state gains a new value this PR: 'reserved'. The export cleanup RESERVE phase flips a sibling
+-- archive 'parsed' → 'reserved' as a durable recovery reservation BEFORE deleting any stale session; the
+-- SEND-LATE pass then keys recover messages off exactly that state. 'reserved' is NON-TERMINAL and healable —
+-- files/check and the same-hash upload path re-enqueue it like 'pending' (TERMINAL_PARSE_STATES excludes it),
+-- and /status + /machines count it under files_pending. files.parse_state has no CHECK constraint (it is
+-- documented as pending|parsed|error|skipped|superseded|reserved in 0001), so no column change is needed;
+-- this note records the new value alongside the migration that introduces its writer.

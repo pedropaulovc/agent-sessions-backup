@@ -25,7 +25,7 @@ CREATE TABLE files (
   content_hash TEXT NOT NULL,
   harness TEXT,
   session_id TEXT,
-  parse_state TEXT NOT NULL DEFAULT 'pending', -- pending|parsed|error|skipped|superseded
+  parse_state TEXT NOT NULL DEFAULT 'pending', -- pending|parsed|error|skipped|superseded|reserved (reserved added in 0006-era PR)
   parse_error TEXT,
   parsed_at TEXT,
   parsed_size INTEGER,

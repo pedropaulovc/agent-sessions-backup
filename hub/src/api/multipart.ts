@@ -129,8 +129,11 @@ export async function createMultipart(
       // so a 'skipped' or dropped-message row finally indexes.
       const restamped = await restampIfStale(existing, store, relpath, machineId, env);
       if (restamped || !TERMINAL_PARSE_STATES.has(existing.parse_state)) {
-        await markPendingAndEnqueue(existing, 'upload', env);
-        return Response.json({ status: 'unchanged', file_id: existing.id, requeued: true, restamped });
+        // markPendingAndEnqueue applies the centralized fresh-reservation gate (round 15, 3608955878): a fresh
+        // 'reserved' row is left to its cleanup owner's recover and NOT healed as 'upload' here, so this
+        // large-file same-hash shortcut can no longer clear a live reservation. `requeued` reflects the gate.
+        const requeued = await markPendingAndEnqueue(existing, 'upload', env);
+        return Response.json({ status: 'unchanged', file_id: existing.id, requeued, restamped });
       }
       return Response.json({ status: 'unchanged', file_id: existing.id });
     }

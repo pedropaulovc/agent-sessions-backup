@@ -273,4 +273,59 @@ describe('admin reindex batches D1 writes + queue sends to fit the whole corpus 
     expect(totalStatements).toBeLessThanOrEqual(800);
     expect(totalStatements).toBeGreaterThanOrEqual(600); // proves the machine upserts ARE included, not skipped
   });
+
+  it('leaves a FRESH reservation intact (no flip, no reindex enqueue) but heals a STALE one (round 15, 3608955878)', async () => {
+    const obj = sessionObject('gatebox');
+    const pages = [[obj]];
+    stubList(pages);
+    stubSendBatch();
+    // A prior test in this file leaves a live reindex_cursor (same 'raw/' prefix) in meta; clear it so this
+    // reindex walks our stub page from the start instead of resuming past it.
+    await seedCursor(null);
+    // First reindex creates the row as 'pending'.
+    await reindex(reindexRequest(), testEnv, admin);
+    const row = await testEnv.DB.prepare("SELECT id FROM files WHERE machine_id = 'gatebox'").first<{ id: number }>();
+    expect(row).not.toBeNull();
+    const id = row!.id;
+
+    // Mark it a FRESH reservation, as if a live export cleanup owns it (reserved_by = some other file).
+    await testEnv.DB
+      .prepare("UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = 999999 WHERE id = ?1")
+      .bind(id)
+      .run();
+
+    // Reindex again: the DO UPDATE's fresh-reservation guard must SKIP it — no flip, no reindex parse. POSITIVE
+    // CONTROL: revert the WHERE guard and the upsert flips it to 'pending' + clears reserved_by + enqueues a
+    // reindex parse, stealing the sibling out from under the cleanup's send-late.
+    stubList(pages);
+    const sendBatchFresh = stubSendBatch();
+    sendBatchFresh.mockClear(); // spyOn re-wraps the same mock — drop the first reindex's recorded call
+    const resFresh = await reindex(reindexRequest(), testEnv, admin);
+    expect(await resFresh.json()).toMatchObject({ enqueued: 0 }); // skipped → nothing re-enqueued
+    expect(await stateOf(id)).toBe('reserved'); // reservation left intact
+    expect(await reservedByOf(id)).toBe(999999); // ownership preserved
+    expect(sendBatchFresh.mock.calls.flatMap((c) => c[0] as unknown[]).length).toBe(0);
+
+    // Age it past the staleness threshold (a crashed cleanup): reindex now heals it like any row — flips to
+    // 'pending', clears the markers, enqueues a reindex parse.
+    await testEnv.DB.prepare("UPDATE files SET reserved_at = '2020-01-01T00:00:00.000Z' WHERE id = ?1").bind(id).run();
+    stubList(pages);
+    const sendBatchStale = stubSendBatch();
+    sendBatchStale.mockClear();
+    const resStale = await reindex(reindexRequest(), testEnv, admin);
+    expect(await resStale.json()).toMatchObject({ enqueued: 1 });
+    expect(await stateOf(id)).toBe('pending'); // stale reservation healed
+    expect(await reservedByOf(id)).toBeNull();
+    expect(sendBatchStale.mock.calls.flatMap((c) => c[0] as unknown[]).length).toBe(1);
+  });
 });
+
+async function stateOf(id: number): Promise<string> {
+  const r = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1').bind(id).first<{ parse_state: string }>();
+  return r!.parse_state;
+}
+
+async function reservedByOf(id: number): Promise<number | null> {
+  const r = await testEnv.DB.prepare('SELECT reserved_by FROM files WHERE id = ?1').bind(id).first<{ reserved_by: number | null }>();
+  return r!.reserved_by;
+}

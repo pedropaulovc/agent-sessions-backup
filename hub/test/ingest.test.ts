@@ -1113,3 +1113,77 @@ describe('a recovery kick leaves the candidate pending, not terminal, so a dropp
     expect(session?.index_state).toBe('ready');
   });
 });
+
+describe('a fresh reservation is left to its cleanup owner; the heal paths do not re-enqueue it until it goes stale (round 14, reservation ownership)', () => {
+  const SID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeee1414';
+  const RELPATH = `res14-path/${SID}.jsonl`;
+  const CONTENT = [
+    ccUserLine({ uuid: 'res14-u1', text: 'reservation-heal marker one' }),
+    ccAssistantLine({ uuid: 'res14-a1', parentUuid: 'res14-u1', text: 'reservation-heal answer one' }),
+  ].join('\n');
+
+  async function stateOf(id: number): Promise<string> {
+    const r = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1').bind(id).first<{ parse_state: string }>();
+    return r!.parse_state;
+  }
+  async function checkFilesResync(hash: string): Promise<Response> {
+    return SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+      method: 'POST',
+      headers: { 'x-dev-machine': 'res14', 'content-type': 'application/json' },
+      body: JSON.stringify({ files: [{ store: 'claude-projects', relpath: RELPATH, sha256: `sha256:${hash}` }] }),
+    });
+  }
+
+  it('files/check and a same-hash PUT skip a FRESH reserved row, but re-enqueue a STALE one', async () => {
+    const res = await putFile('res14', 'claude-projects', RELPATH, CONTENT);
+    expect(res.status).toBe(201);
+    const fileId = ((await res.json()) as { file_id: number }).file_id;
+    const r2Key = `raw/res14/claude-projects/${RELPATH}`;
+    await deliverOne(fileId, r2Key);
+    const parsed = await testEnv.DB.prepare('SELECT parse_state, content_hash FROM files WHERE id = ?1').bind(fileId).first<{ parse_state: string; content_hash: string }>();
+    expect(parsed?.parse_state).toBe('parsed');
+    const hash = parsed!.content_hash;
+
+    // Flip to a FRESH reservation, exactly as the export RESERVE phase does (state + reserved_at together).
+    await testEnv.DB.prepare(
+      "UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = 424242, reserved_reason = 'recover' WHERE id = ?1",
+    ).bind(fileId).run();
+
+    // A fresh reservation belongs to its reserving cleanup; neither heal path may re-enqueue it (an 'upload'
+    // parse mid-window would escape the reserved set and lose the sessions that cleanup is about to delete).
+    const spy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
+    try {
+      const checkRes = await checkFilesResync(hash);
+      expect(checkRes.status).toBe(200);
+      expect(((await checkRes.json()) as { missing: unknown[] }).missing).toHaveLength(0); // bytes present
+      expect(spy).not.toHaveBeenCalled(); // fresh reservation NOT healed
+      expect(await stateOf(fileId)).toBe('reserved');
+
+      const putRes = await putFile('res14', 'claude-projects', RELPATH, CONTENT);
+      const putBody = (await putRes.json()) as { status: string; requeued?: boolean };
+      expect(putBody.status).toBe('unchanged');
+      expect(putBody.requeued).toBe(false); // centralized gate reported the fresh reservation as NOT requeued
+      expect(spy).not.toHaveBeenCalled();
+      expect(await stateOf(fileId)).toBe('reserved');
+    } finally {
+      spy.mockRestore();
+    }
+
+    // POSITIVE CONTROL: age the reservation past the staleness threshold (a crashed cleanup). Now it is NOT a
+    // live reservation, so files/check heals it exactly like a 'pending' row — flips to 'pending' + re-enqueues.
+    await testEnv.DB.prepare("UPDATE files SET reserved_at = '2020-01-01T00:00:00.000Z' WHERE id = ?1").bind(fileId).run();
+    const spy2 = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
+    try {
+      const checkRes2 = await checkFilesResync(hash);
+      expect(checkRes2.status).toBe(200);
+      expect(spy2).toHaveBeenCalledWith(expect.objectContaining({ file_id: fileId, r2_key: r2Key, reason: 'recover' }));
+      expect(await stateOf(fileId)).toBe('pending'); // stale reservation healed like any non-terminal row
+      const healed = await testEnv.DB.prepare('SELECT reserved_by, reserved_reason FROM files WHERE id = ?1')
+        .bind(fileId)
+        .first<{ reserved_by: number | null; reserved_reason: string | null }>();
+      expect(healed).toEqual({ reserved_by: null, reserved_reason: null });
+    } finally {
+      spy2.mockRestore();
+    }
+  });
+});

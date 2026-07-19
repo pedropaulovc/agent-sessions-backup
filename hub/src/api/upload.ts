@@ -1,6 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
-import { markPendingAndEnqueue } from '../queue';
+import { markPendingAndEnqueue, reservationCutoffIso } from '../queue';
 import { hex, objectSha256 } from './ops';
 
 export const TERMINAL_PARSE_STATES = new Set(['parsed', 'skipped', 'superseded']);
@@ -108,9 +108,13 @@ export async function putFile(
     // (e.g. 'parsed'/'skipped') would stay terminal while its parse message is in flight, and if
     // PARSE_QUEUE.send fails (or the message is later dropped), a client retry would see
     // 'unchanged' with the now-correct checksum and never requeue, same for files/check.
+    // markPendingAndEnqueue applies the centralized fresh-reservation gate (round 15): a FRESH 'reserved' row
+    // (a live cleanup's) is left to its owner's recover send and NOT requeued as 'upload' here, so it can't
+    // escape the reserved set; a STALE reservation heals like any 'pending' row. `requeued` reflects whether
+    // the gate let the requeue fire.
     if (restamped || restored || !TERMINAL_PARSE_STATES.has(existing.parse_state)) {
-      await markPendingAndEnqueue(existing, 'upload', env);
-      return Response.json({ status: 'unchanged', file_id: existing.id, requeued: true, restored, restamped });
+      const requeued = await markPendingAndEnqueue(existing, 'upload', env);
+      return Response.json({ status: 'unchanged', file_id: existing.id, requeued, restored, restamped });
     }
     return Response.json({ status: 'unchanged', file_id: existing.id });
   }
@@ -194,12 +198,43 @@ export async function recordUploadedObject(
        -- existed (or before a detect() change) would otherwise keep a stale/NULL session_id even
        -- after re-upload, so canonical/recovery queries that join on files.session_id miss it.
        harness = excluded.harness, session_id = excluded.session_id,
-       parse_state = 'pending', parse_error = NULL,
+       -- A live cleanup owns the reserve -> delete -> send-late window even when the collector uploads changed
+       -- bytes meanwhile. Keep the row reserved until that cleanup drains; changed bytes upgrade the durable
+       -- intent to 'upload', so the owner-tagged delivery runs full replacement semantics after the deletes.
+       -- Same-hash repairs retain their original upload/recover intent (3609060881, 3609611899).
+       parse_state = CASE
+         WHEN files.parse_state = 'reserved'
+           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10 THEN 'reserved'
+         ELSE 'pending' END,
+       parse_error = CASE
+         WHEN files.content_hash = excluded.content_hash AND files.parse_state = 'reserved'
+           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10 THEN files.parse_error
+         ELSE NULL END,
+       reserved_at = CASE
+         WHEN files.parse_state = 'reserved'
+           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10 THEN files.reserved_at
+         ELSE NULL END,
+       reserved_by = CASE
+         WHEN files.parse_state = 'reserved'
+           AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10 THEN files.reserved_by
+         ELSE NULL END,
+       reserved_reason = CASE
+         WHEN files.parse_state = 'reserved' AND files.reserved_at IS NOT NULL AND files.reserved_at > ?10
+           THEN CASE WHEN files.content_hash = excluded.content_hash THEN files.reserved_reason ELSE 'upload' END
+         ELSE NULL END,
        uploaded_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
-     RETURNING id`,
+     RETURNING id, parse_state, reserved_reason, reserved_by, reservation_generation`,
   )
-    .bind(machineId, store, relpath, r2Key, size, mtime, sha256, det.harness, det.sessionId ?? null)
-    .first<{ id: number }>();
+    .bind(machineId, store, relpath, r2Key, size, mtime, sha256, det.harness, det.sessionId ?? null, reservationCutoffIso())
+    .first<{
+      id: number;
+      parse_state: string;
+      reserved_reason: string | null;
+      reserved_by: number | null;
+      reservation_generation: number;
+    }>();
+  const preservedReservation = row!.parse_state === 'reserved';
+  const reservedUpload = preservedReservation && row!.reserved_reason === 'upload';
 
   // Two overlapping changed-hash uploads for the SAME path can interleave their R2 writes and D1
   // upserts arbitrarily — this request's RAW.put above can land before or after a concurrent
@@ -218,7 +253,7 @@ export async function recordUploadedObject(
   await env.DB.prepare('UPDATE machines SET last_upload_at = strftime(\'%Y-%m-%dT%H:%M:%fZ\',\'now\') WHERE machine_id = ?1')
     .bind(machineId)
     .run();
-  if (det.sessionId) {
+  if ((!preservedReservation || reservedUpload) && det.sessionId) {
     // A changed-hash re-upload of the session's CURRENT canonical file just overwrote the raw
     // object out from under the derived rows: files.parse_state flips to 'pending' above, but
     // sessions.index_state (and the blocks/FTS it advertises) would otherwise stay 'ready' —
@@ -230,7 +265,7 @@ export async function recordUploadedObject(
     // yet) or a non-canonical duplicate (canonical_file_id != this file's id). Hash-guarded against
     // the concurrent-upsert-loser race — see flipOwnedSessionsToParsing.
     await flipOwnedSessionsToParsing(row!.id, det.sessionId, sha256, env);
-  } else if (det.kind === 'export-archive') {
+  } else if ((!preservedReservation || reservedUpload) && det.kind === 'export-archive') {
     // An export ZIP fans out to many per-conversation sessions and carries no det.sessionId, so the
     // single-session flip above never runs. A changed-hash re-upload already overwrote the ZIP; flip
     // every session this archive is canonical for to 'parsing' so /search and /sessions stop
@@ -251,7 +286,19 @@ export async function recordUploadedObject(
   // The simple path has no observed-R2 convergence (convergeR2WithRow above only restores bytes, never
   // changes the row hash), so realigned is always false there and it enqueues our hash.
   const realigned = opts.convergeObservedR2 === true && (await convergeMultipartRow(row!.id, r2Key, sha256, env));
-  if (!realigned) {
+  if (!realigned && preservedReservation && reservedUpload && row!.reserved_by !== null) {
+    // The cleanup may already have selected an owner-tagged delivery for the old hash. Refresh it with the
+    // current hash; parseOne waits for the owner to become terminal, so this is safe both before and after
+    // its delete window drains (3609651684).
+    await env.PARSE_QUEUE.send({
+      file_id: row!.id,
+      r2_key: r2Key,
+      reason: 'upload',
+      content_hash: sha256,
+      reservation_owner: row!.reserved_by,
+      reservation_generation: row!.reservation_generation,
+    });
+  } else if (!realigned && !preservedReservation) {
     await env.PARSE_QUEUE.send({ file_id: row!.id, r2_key: r2Key, reason: 'upload', content_hash: sha256 });
   }
 
@@ -290,12 +337,41 @@ export async function convergeMultipartRow(fileId: number, r2Key: string, sha256
   // size from the losing upload would corrupt canonical selection and leave metadata for the wrong object.
   const mtime = head!.customMetadata?.mtime ?? null;
   const updated = await env.DB.prepare(
-    "UPDATE files SET content_hash = ?2, mtime = ?3, size = ?4, parse_state = 'pending', parse_error = NULL WHERE id = ?1 AND content_hash = ?5 RETURNING id",
+    `UPDATE files SET content_hash = ?2, mtime = ?3, size = ?4,
+       parse_state = CASE
+         WHEN parse_state = 'reserved' AND reserved_at IS NOT NULL AND reserved_at > ?6 THEN 'reserved'
+         ELSE 'pending' END,
+       parse_error = NULL,
+       reserved_at = CASE
+         WHEN parse_state = 'reserved' AND reserved_at IS NOT NULL AND reserved_at > ?6 THEN reserved_at
+         ELSE NULL END,
+       reserved_by = CASE
+         WHEN parse_state = 'reserved' AND reserved_at IS NOT NULL AND reserved_at > ?6 THEN reserved_by
+         ELSE NULL END,
+       reserved_reason = CASE
+         WHEN parse_state = 'reserved' AND reserved_at IS NOT NULL AND reserved_at > ?6 THEN 'upload'
+         ELSE NULL END
+     WHERE id = ?1 AND content_hash = ?5 RETURNING id, parse_state, reserved_by, reservation_generation`,
   )
-    .bind(fileId, r2Hash, mtime, head!.size, sha256)
-    .first<{ id: number }>();
+    .bind(fileId, r2Hash, mtime, head!.size, sha256, reservationCutoffIso())
+    .first<{ id: number; parse_state: string; reserved_by: number | null; reservation_generation: number }>();
   if (!updated) return false; // lost the row to the other writer in the meantime
-  await env.PARSE_QUEUE.send({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: r2Hash });
+  // If convergence discovers that R2 actually contains different bytes, this is a real changed-hash upload.
+  // Flip every session the archive owns so ready rows never describe the pre-realignment object. A live
+  // reservation remains owner-controlled and defers the enqueue; otherwise enqueue immediately.
+  await flipOwnedSessionsToParsing(fileId, null, r2Hash, env);
+  if (updated.parse_state === 'reserved' && updated.reserved_by !== null) {
+    await env.PARSE_QUEUE.send({
+      file_id: fileId,
+      r2_key: r2Key,
+      reason: 'upload',
+      content_hash: r2Hash,
+      reservation_owner: updated.reserved_by,
+      reservation_generation: updated.reservation_generation,
+    });
+  } else {
+    await env.PARSE_QUEUE.send({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: r2Hash });
+  }
   console.log(JSON.stringify({ event: 'access.multipart_converge', key: r2Key, from: sha256, to: r2Hash }));
   return true;
 }
@@ -425,6 +501,8 @@ export async function checkFiles(request: Request, env: Env, identity: Identity)
       //  - a TERMINAL legacy row whose identity we just restamped (same as the PUT same-hash branch)
       //    — otherwise a 'skipped' history.jsonl row with NULL harness/session_id stays unindexed.
       const restamped = await restampIfStale(row, row.store, row.relpath, identity.machineId, env);
+      // markPendingAndEnqueue applies the centralized fresh-reservation gate (round 15): a fresh 'reserved'
+      // row is left to its owner's recover; a stale one heals. Same reasoning as the same-hash PUT branch.
       if (restamped || !TERMINAL_PARSE_STATES.has(row.parse_state)) {
         await markPendingAndEnqueue(row, 'upload', env);
       }

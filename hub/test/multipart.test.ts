@@ -17,6 +17,16 @@ function fileUrl(machine: string, store: string, relpath: string): string {
   return `https://api.sessions.vza.net/api/v1/files/${machine}/${store}/${encodeURIComponent(relpath)}`;
 }
 
+async function stateOf(id: number): Promise<string | null> {
+  const row = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1').bind(id).first<{ parse_state: string }>();
+  return row?.parse_state ?? null;
+}
+
+async function reservedByOf(id: number): Promise<number | null> {
+  const row = await testEnv.DB.prepare('SELECT reserved_by FROM files WHERE id = ?1').bind(id).first<{ reserved_by: number | null }>();
+  return row?.reserved_by ?? null;
+}
+
 async function createMp(machine: string, store: string, relpath: string, size: number, hash: string): Promise<Response> {
   return SELF.fetch(`${fileUrl(machine, store, relpath)}?uploads`, {
     method: 'POST',
@@ -251,6 +261,41 @@ describe('multipart upload', () => {
     expect((await again.json<any>()).status).toBe('unchanged');
   });
 
+  it('the same-hash shortcut leaves a FRESH reservation alone but re-enqueues a STALE one (round 15, 3608955878)', async () => {
+    const bytes = new TextEncoder().encode(bigSession('aaaaaaaa-bbbb-4ccc-8ddd-000000000000', 'gadolinium', 6 * MIB));
+    const relpath = 'demo/mp-gate.jsonl';
+    const first = await multipartStore('mpgate-box', 'claude', relpath, bytes, 5 * MIB);
+    expect(first.complete!.status).toBe(201);
+    const hash = await sha256Hex(bytes);
+    const row = await testEnv.DB.prepare("SELECT id FROM files WHERE machine_id = 'mpgate-box' AND relpath = ?1").bind(relpath).first<{ id: number }>();
+    const id = row!.id;
+
+    // Mark it a FRESH reservation, as if a live export cleanup owns it.
+    await testEnv.DB
+      .prepare("UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = 999999 WHERE id = ?1")
+      .bind(id)
+      .run();
+
+    // Same-hash create → the unchanged shortcut calls markPendingAndEnqueue, which the centralized gate (round
+    // 15) no-ops for a fresh reservation. POSITIVE CONTROL: without the gate this large-file resync path flips it
+    // to 'pending' + clears reserved_by, stealing the sibling out from under the cleanup before its deletes drain.
+    const fresh = await createMp('mpgate-box', 'claude', relpath, bytes.length, hash);
+    expect(fresh.status).toBe(200);
+    const freshBody = await fresh.json<any>();
+    expect(freshBody.status).toBe('unchanged');
+    expect(freshBody.requeued).toBe(false); // gated — not requeued
+    expect(await stateOf(id)).toBe('reserved');
+    expect(await reservedByOf(id)).toBe(999999);
+
+    // Age it past the staleness threshold → the shortcut heals it like any non-terminal row.
+    await testEnv.DB.prepare("UPDATE files SET reserved_at = '2020-01-01T00:00:00.000Z' WHERE id = ?1").bind(id).run();
+    const stale = await createMp('mpgate-box', 'claude', relpath, bytes.length, hash);
+    const staleBody = await stale.json<any>();
+    expect(staleBody.requeued).toBe(true);
+    expect(await stateOf(id)).toBe('pending');
+    expect(await reservedByOf(id)).toBeNull();
+  });
+
   it('abort makes a later complete for that upload fail; an unknown abort is idempotent', async () => {
     const bytes = new Uint8Array(6 * MIB).fill(1);
     const hash = await sha256Hex(bytes);
@@ -279,6 +324,42 @@ describe('multipart upload', () => {
     });
     expect(res.status).toBe(400);
     expect((await res.json<any>()).error).toBe('missing_or_bad_x_content_hash');
+  });
+});
+
+describe('multipart reservation repair regression', () => {
+  it('same-hash missing-object repair preserves a fresh cleanup reservation (3609060881)', async () => {
+    const bytes = new TextEncoder().encode(bigSession('eeeeeeee-ffff-4000-8000-000000000000', 'reservation-repair', 6 * MIB));
+    const machine = 'mp-repair-reservation';
+    const relpath = 'demo/reserved-repair.jsonl';
+    const first = await multipartStore(machine, 'claude', relpath, bytes, 5 * MIB);
+    expect(first.complete?.status).toBe(201);
+    const row = await testEnv.DB.prepare('SELECT id, r2_key FROM files WHERE machine_id = ?1 AND relpath = ?2')
+      .bind(machine, relpath)
+      .first<{ id: number; r2_key: string }>();
+
+    await testEnv.DB.prepare(
+      "UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = 424242, reserved_reason = 'recover' WHERE id = ?1",
+    ).bind(row!.id).run();
+    await testEnv.RAW.delete(row!.r2_key); // force createMultipart to fall through into a same-hash repair
+
+    const repaired = await multipartStore(machine, 'claude', relpath, bytes, 5 * MIB);
+    expect(repaired.createStatus).toBe(201);
+    expect(repaired.complete?.status).toBe(201);
+    // POSITIVE CONTROL: the old unconditional conflict update changed this to pending and cleared the owner.
+    expect(await stateOf(row!.id)).toBe('reserved');
+    expect(await reservedByOf(row!.id)).toBe(424242);
+    expect(await testEnv.RAW.head(row!.r2_key)).not.toBeNull();
+
+    // Changed bytes preserve the cleanup window too, but upgrade the deferred intent to a full upload.
+    const changed = new TextEncoder().encode(bigSession('eeeeeeee-ffff-4000-8000-000000000000', 'changed-bytes', 6 * MIB));
+    expect((await multipartStore(machine, 'claude', relpath, changed, 5 * MIB)).complete?.status).toBe(201);
+    expect(await stateOf(row!.id)).toBe('reserved');
+    expect(await reservedByOf(row!.id)).toBe(424242);
+    const changedRow = await testEnv.DB.prepare('SELECT reserved_reason FROM files WHERE id = ?1')
+      .bind(row!.id)
+      .first<{ reserved_reason: string | null }>();
+    expect(changedRow?.reserved_reason).toBe('upload');
   });
 });
 
@@ -452,7 +533,7 @@ describe('multipart review fixes', () => {
     expect((await reopened.json<any>()).status).toBe('created');
   });
 
-  it('convergeMultipartRow realigns a D1 row (hash, size, mtime) to the object R2 actually holds and re-enqueues', async () => {
+  it('convergeMultipartRow realigns changed bytes without releasing a live cleanup reservation', async () => {
     // Simulate the interleaved end state of two changed-hash completes: the D1 row carries hash HA and
     // a stale size, but R2's object at the key is the OTHER writer's (native checksum HB, different size).
     const key = 'raw/converge-box/claude/c.bin';
@@ -466,18 +547,35 @@ describe('multipart review fixes', () => {
     )
       .bind(key, HA)
       .first<{ id: number }>();
+    await testEnv.DB.prepare(
+      "UPDATE files SET parse_state = 'reserved', reserved_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), reserved_by = ?1, reserved_reason = 'recover' WHERE id = ?1",
+    )
+      .bind(row!.id)
+      .run();
+    await testEnv.DB.prepare(
+      "INSERT INTO sessions (session_id, harness, machine_id, canonical_file_id, index_state) VALUES ('converge-owned-session', 'claude-export', 'converge-box', ?1, 'ready')",
+    )
+      .bind(row!.id)
+      .run();
     // R2 holds the OTHER upload's object with a NATIVE checksum (put({sha256})), size 64, mtime differs.
     await testEnv.RAW.put(key, otherBytes, { sha256: HB, customMetadata: { mtime: '2026-07-02T00:00:00Z' } });
 
     const converged = await convergeMultipartRow(row!.id, key, HA, testEnv);
     expect(converged).toBe(true);
-    const after = await testEnv.DB.prepare('SELECT content_hash, parse_state, mtime, size FROM files WHERE id = ?1')
+    const after = await testEnv.DB.prepare('SELECT content_hash, parse_state, mtime, size, reserved_at, reserved_by, reserved_reason FROM files WHERE id = ?1')
       .bind(row!.id)
-      .first<{ content_hash: string; parse_state: string; mtime: string; size: number }>();
+      .first<{ content_hash: string; parse_state: string; mtime: string; size: number; reserved_at: string | null; reserved_by: number | null; reserved_reason: string | null }>();
     expect(after!.content_hash).toBe(HB); // row now describes what R2 actually holds
-    expect(after!.parse_state).toBe('pending'); // re-enqueued for a reparse
+    expect(after!.parse_state).toBe('reserved'); // owner-tagged send-late retains cleanup ordering
     expect(after!.mtime).toBe('2026-07-02T00:00:00Z');
     expect(after!.size).toBe(otherBytes.length); // size realigned (chooseCanonical orders by size DESC)
+    expect(after!.reserved_at).not.toBeNull();
+    expect(after!.reserved_by).toBe(row!.id);
+    expect(after!.reserved_reason).toBe('upload');
+    const session = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+      .bind('converge-owned-session')
+      .first<{ index_state: string }>();
+    expect(session?.index_state).toBe('parsing');
 
     // Positive control: when R2 already matches the row, convergence is a no-op.
     const noop = await convergeMultipartRow(row!.id, key, HB, testEnv);
