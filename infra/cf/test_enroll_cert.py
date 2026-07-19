@@ -696,11 +696,15 @@ class CollectorFlowTests(unittest.TestCase):
                 mock.patch.object(enroll, "output_dir_for", return_value=out),
                 mock.patch.object(enroll, "install_staged_collector") as install,
                 mock.patch.object(enroll, "preflight") as preflight,
+                mock.patch("builtins.print") as emit,
             ):
-                self.assertEqual(enroll.main(["--install-staged", "--no-schedule"]), 0)
+                self.assertEqual(enroll.main(["--install-staged"]), 0)
 
-            install.assert_called_once_with("collector.exe", "test-windows", out, False)
+            install.assert_called_once_with("collector.exe", "test-windows", out, True)
             preflight.assert_not_called()
+            emit.assert_any_call(
+                "[ok] test-windows installed, sent an authenticated heartbeat, and scheduled every 15 minutes"
+            )
 
     def test_install_staged_rejects_incomplete_new_stage_before_imported_resume(self):
         with tempfile.TemporaryDirectory() as raw:
