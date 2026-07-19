@@ -20,14 +20,19 @@ from .transport import normalize_thumbprint
 # Capture-ALL policy: whole tree per store, minus these. fnmatch-ish on the forward-slash
 # relpath (see scanner.path_matches). Security-critical entries (creds, keys) come first.
 DEFAULT_EXCLUDES: list[str] = [
-    ".credentials.json",
-    "auth.json",
+    # Credential stores are frequently rewritten through backup/temp siblings. Match the
+    # whole filename family, not only the live filename, and prune Claude's profile store.
+    ".credentials.json*",
+    "auth.json*",
+    "**/cred-profiles/**",
     "**/oauth*",
     "*.key",
     "*.pem",
-    "cache/**",
-    "Cache/**",
-    "tmp/**",
+    # Cache/temp directories occur below plugin trees as well as at the store root. The
+    # matcher is case-insensitive and treats the leading **/ as optional.
+    "**/cache/**",
+    "**/tmp/**",
+    "**/.tmp/**",
     "**/.DS_Store",
     ".last-cleanup",
     "statsig/**",

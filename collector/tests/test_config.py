@@ -42,7 +42,7 @@ def test_enroll_and_load_roundtrip(tmp_path):
     assert {k: loaded.stores[k] for k in config.DEFAULT_STORES} == config.DEFAULT_STORES
     assert "export-inbox" in loaded.stores
     # Security defaults always apply even though the file lists no excludes.
-    assert ".credentials.json" in loaded.effective_excludes()
+    assert ".credentials.json*" in loaded.effective_excludes()
 
 
 def test_enroll_mtls_without_paths_errors(tmp_path):
@@ -398,3 +398,17 @@ def test_effective_excludes_extends_defaults(tmp_path):
     eff = cfg.effective_excludes()
     assert "custom/**" in eff
     assert "*.pem" in eff  # default still present
+
+
+def test_security_excludes_cannot_be_removed_by_user_config(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'machine_id = "m"\nhub_url = "http://x"\nauth = "dev"\n'
+        'exclude = []\n'
+    )
+    cfg = config.load(path)
+    effective = cfg.effective_excludes()
+    assert ".credentials.json*" in effective
+    assert "auth.json*" in effective
+    assert "**/cred-profiles/**" in effective
+    assert "**/cache/**" in effective
