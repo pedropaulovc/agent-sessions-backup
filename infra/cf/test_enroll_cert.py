@@ -244,6 +244,52 @@ class RegistrationTests(unittest.TestCase):
 
 
 class RecoveryTests(unittest.TestCase):
+    def test_loads_staged_material_without_cloudflare_or_d1_access(self):
+        item = material()
+        with tempfile.TemporaryDirectory() as raw:
+            out = Path(raw)
+            (out / "test-windows.client.key").write_bytes(
+                item.private_key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.TraditionalOpenSSL,
+                    serialization.NoEncryption(),
+                )
+            )
+            (out / "test-windows.client.pem.new").write_bytes(
+                item.certificate.public_bytes(serialization.Encoding.PEM)
+            )
+            (out / "test-windows.client.pem.new.id").write_text(
+                f"cert_id={item.cert_id}\nfp={item.fingerprint}\n"
+            )
+            with (
+                mock.patch.object(enroll, "api_json") as api,
+                mock.patch.object(enroll, "d1_query") as d1,
+            ):
+                recovered = enroll.load_staged_recovery("test-windows", out)
+
+            api.assert_not_called()
+            d1.assert_not_called()
+            self.assertEqual(recovered.cert_id, item.cert_id)
+            self.assertEqual(recovered.fingerprint, item.fingerprint)
+
+    def test_staged_material_requires_sidecar_fingerprint(self):
+        item = material()
+        with tempfile.TemporaryDirectory() as raw:
+            out = Path(raw)
+            (out / "test-windows.client.key").write_bytes(
+                item.private_key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.TraditionalOpenSSL,
+                    serialization.NoEncryption(),
+                )
+            )
+            (out / "test-windows.client.pem.new").write_bytes(
+                item.certificate.public_bytes(serialization.Encoding.PEM)
+            )
+            (out / "test-windows.client.pem.new.id").write_text(f"cert_id={item.cert_id}\nfp=\n")
+            with self.assertRaisesRegex(enroll.EnrollmentError, "no certificate fingerprint"):
+                enroll.load_staged_recovery("test-windows", out)
+
     def test_loads_complete_stranded_material(self):
         item = material()
         with tempfile.TemporaryDirectory() as raw:
@@ -598,6 +644,22 @@ class CollectorFlowTests(unittest.TestCase):
             load_promoted.assert_not_called()
             preflight.assert_called_once_with("token")
             resume.assert_called_once_with("collector.exe", False)
+
+    def test_main_installs_staged_material_without_management_token(self):
+        with tempfile.TemporaryDirectory() as raw:
+            out = Path(raw)
+            with (
+                mock.patch.dict(enroll.os.environ, {}, clear=True),
+                mock.patch.object(enroll, "ensure_collector", return_value="collector.exe"),
+                mock.patch.object(enroll, "machine_id_for", return_value="test-windows"),
+                mock.patch.object(enroll, "output_dir_for", return_value=out),
+                mock.patch.object(enroll, "install_staged_collector") as install,
+                mock.patch.object(enroll, "preflight") as preflight,
+            ):
+                self.assertEqual(enroll.main(["--install-staged", "--no-schedule"]), 0)
+
+            install.assert_called_once_with("collector.exe", "test-windows", out, False)
+            preflight.assert_not_called()
 
     def test_doctor_failure_keeps_key_and_does_not_run_or_schedule(self):
         with tempfile.TemporaryDirectory() as raw:
