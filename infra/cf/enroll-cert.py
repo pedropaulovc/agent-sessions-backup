@@ -5,7 +5,7 @@
 # ///
 """Install, enroll, verify, and schedule the collector on this machine.
 
-The short-lived CF_API_TOKEN must have these two permissions:
+The short-lived CLOUDFLARE_API_TOKEN must have these two permissions:
   - Zone / SSL and Certificates / Edit on vza.net
   - Account / D1 / Edit on Pedro's Cloudflare account
 
@@ -79,7 +79,7 @@ class Material:
 
 def _redacted_error(error: BaseException) -> str:
     text = str(error)
-    for name in ("CF_API_TOKEN", "CLOUDFLARE_API_TOKEN", "AC_PFX_PW"):
+    for name in ("CLOUDFLARE_API_TOKEN", "AC_PFX_PW"):
         value = os.environ.get(name)
         if value:
             text = text.replace(value, "<redacted>")
@@ -221,19 +221,57 @@ def machine_id_for(collector: str, explicit: str | None) -> str:
     return machine_id
 
 
+def enrollment_artifact_names(machine_id: str) -> tuple[str, ...]:
+    return tuple(
+        f"{machine_id}{suffix}"
+        for suffix in (
+            ".client.pem.new",
+            ".client.pem.new.id",
+            ".client.pem",
+            ".client.key",
+            ".client.csr",
+            ".client.pfx",
+        )
+    )
+
+
+def output_dir_candidates() -> tuple[Path, ...]:
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates = (
+        Path.cwd() / ".config" / "agent-collector",
+        repo_root / ".config" / "agent-collector",
+        Path.home() / "src" / Path.cwd().name / ".config" / "agent-collector",
+        Path.home() / "src" / repo_root.name / ".config" / "agent-collector",
+        Path.home() / ".config" / "agent-collector",
+    )
+    unique: list[Path] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved not in unique:
+            unique.append(resolved)
+    return tuple(unique)
+
+
 def output_dir_for(machine_id: str, explicit: str | None) -> Path:
     if explicit:
         return Path(explicit).expanduser().resolve()
-    cwd_candidate = Path.cwd() / ".config" / "agent-collector"
-    artifact_names = (
-        f"{machine_id}.client.pem.new",
-        f"{machine_id}.client.pem.new.id",
-        f"{machine_id}.client.pem",
-        f"{machine_id}.client.key",
-    )
-    if any((cwd_candidate / name).is_file() for name in artifact_names):
-        print(f"==> resuming enrollment artifacts under {cwd_candidate}")
-        return cwd_candidate.resolve()
+    candidates = output_dir_candidates()
+    artifact_names = enrollment_artifact_names(machine_id)
+    matches = [
+        candidate
+        for candidate in candidates
+        if any((candidate / name).is_file() for name in artifact_names)
+    ]
+    if len(matches) > 1:
+        rendered = "\n  - ".join(str(match) for match in matches)
+        raise EnrollmentError(
+            f"enrollment artifacts for {machine_id!r} exist in multiple candidate directories:\n"
+            f"  - {rendered}\n"
+            "inspect them, then rerun with --out <directory> to select the verified recovery set"
+        )
+    if matches:
+        print(f"==> resuming enrollment artifacts under {matches[0]}")
+        return matches[0]
     return (Path.home() / ".config" / "agent-collector").resolve()
 
 
@@ -651,9 +689,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    token = os.environ.get("CF_API_TOKEN")
+    token = os.environ.get("CLOUDFLARE_API_TOKEN")
     if not token:
-        print("CF_API_TOKEN must contain a short-lived token with certificate and D1 Edit permissions", file=sys.stderr)
+        print(
+            "CLOUDFLARE_API_TOKEN must contain a short-lived token with certificate and D1 Edit permissions",
+            file=sys.stderr,
+        )
         return 2
     try:
         collector = ensure_collector()
