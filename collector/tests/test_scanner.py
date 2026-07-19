@@ -27,6 +27,8 @@ def test_path_matches_security_globs():
     assert path_matches(".auth.json.swp", "*auth.json*")
     assert path_matches(".#auth.json", "*auth.json*")
     assert path_matches("#auth.json#", "*auth.json*")
+    assert not path_matches("projects/auth.json-migration/session.jsonl", "*auth.json*")
+    assert not path_matches("auth.json-tests/keep.jsonl", "*auth.json*")
     assert path_matches("cred-profiles/gmail.json", "**/cred-profiles/**")
     assert path_matches("nested/cred-profiles/vezza.json.bak", "**/cred-profiles/**")
     # **/oauth* also catches a root-level file (leading **/ optional)
