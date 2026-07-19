@@ -127,6 +127,20 @@ describe("known 'other' files bypass the parse queue", () => {
       reserved_reason: 'upload',
       reservation_generation: 41,
     });
+
+    sendSpy.mockClear();
+    const retried = await put(machine, relpath, changed);
+    expect(retried.status).toBe(200);
+    expect(await retried.json()).toMatchObject({ status: 'unchanged', requeued: true, restored: false });
+    expect(sendSpy).toHaveBeenCalledOnce();
+    expect(sendSpy).toHaveBeenCalledWith({
+      file_id: fileId,
+      r2_key: `raw/${machine}/${STORE}/${relpath}`,
+      reason: 'upload',
+      content_hash: changedHash,
+      reservation_owner: owner!.id,
+      reservation_generation: 41,
+    });
   });
 
   it('files/check heals a legacy non-terminal/stale-identity row directly to skipped without enqueueing', async () => {

@@ -130,8 +130,10 @@ export async function putFile(
     // escape the reserved set; a STALE reservation heals like any 'pending' row. `requeued` reflects whether
     // the gate let the requeue fire.
     if (det.kind === 'other') {
-      await markKnownOtherSkipped(existing.id, sha256, env);
-      return Response.json({ status: 'unchanged', file_id: existing.id, restored, restamped, skipped: true });
+      const skipped = await markKnownOtherSkipped(existing.id, sha256, env);
+      if (skipped) {
+        return Response.json({ status: 'unchanged', file_id: existing.id, restored, restamped, skipped: true });
+      }
     }
     if (restamped || restored || !TERMINAL_PARSE_STATES.has(existing.parse_state)) {
       const requeued = await markPendingAndEnqueue(existing, 'upload', env);
