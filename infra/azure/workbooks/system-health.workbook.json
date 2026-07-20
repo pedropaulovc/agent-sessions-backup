@@ -45,7 +45,7 @@
       "type": 3,
       "content": {
         "version": "KqlItem/1.0",
-        "title": "Per-machine health (latest snapshot)",
+        "title": "Per-machine health (heartbeat is end-of-run; upload age shows current activity)",
         "query": "let logs = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, Body:string)[]),\n    (OTelLogs | project TimeGenerated, Body);\nlet machine_health = logs\n    | where TimeGenerated > ago(24h)\n    | extend body = todynamic(Body)\n    | where body.event == 'hub.machine.health'\n    | extend machine = tostring(body.machine)\n    | summarize arg_max(TimeGenerated, body) by machine\n    | extend HeartbeatAgeSeconds=tolong(body.heartbeat_age_seconds), UploadAgeSeconds=tolong(body.upload_age_seconds)\n    | extend Health=case(TimeGenerated < ago(35m), 'CRITICAL - Stale snapshot', HeartbeatAgeSeconds > 259200 or tolong(body.files_error) > 0, 'CRITICAL', HeartbeatAgeSeconds > 3600 or tolong(body.files_pending) > 0, 'Warning', 'Healthy')\n    | project Machine=machine, Health, OS=tostring(body.os), Collector=tostring(body.collector_version), Snapshot=TimeGenerated, LastSeen=todatetime(body.last_seen_at), LastUpload=todatetime(body.last_upload_at), HeartbeatAgeMinutes=round(toreal(HeartbeatAgeSeconds) / 60.0, 1), UploadAgeMinutes=round(toreal(UploadAgeSeconds) / 60.0, 1), FilesPending=tolong(body.files_pending), FileErrors=tolong(body.files_error), FilesComplete=tolong(body.files_complete), FilesTotal=tolong(body.files_total)\n    | extend IsSentinel=false;\nlet machine_count = toscalar(machine_health | summarize count());\nunion machine_health, (print Machine='', Health='CRITICAL - No data', OS='', Collector='', Snapshot=todatetime(''), LastSeen=todatetime(''), LastUpload=todatetime(''), HeartbeatAgeMinutes=toreal(''), UploadAgeMinutes=toreal(''), FilesPending=tolong(''), FileErrors=tolong(''), FilesComplete=tolong(''), FilesTotal=tolong(''), IsSentinel=true)\n| where machine_count == 0 or not(IsSentinel)\n| extend HealthRank=case(Health startswith 'CRITICAL', 0, Health == 'Warning', 1, 2)\n| order by HealthRank asc, FilesPending desc, HeartbeatAgeMinutes desc\n| project-away HealthRank, IsSentinel",
         "size": 0,
         "queryType": 0,
@@ -58,12 +58,15 @@
       "type": 3,
       "content": {
         "version": "KqlItem/1.0",
-        "title": "File parse queue and session backlog (24h, 15-minute snapshots)",
-        "query": "let logs = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, Body:string)[]),\n    (OTelLogs | project TimeGenerated, Body);\nlogs\n| where TimeGenerated > ago(24h)\n| extend body = todynamic(Body)\n| where body.event == 'hub.fleet.health'\n| project TimeGenerated, FilesPending=tolong(body.files_pending), FileErrors=tolong(body.files_error), SessionsParsing=tolong(body.sessions_parsing), SessionErrors=tolong(body.sessions_error)\n| order by TimeGenerated asc",
+        "title": "File parse queue and session backlog (fixed 24h window, 15-minute snapshots)",
+        "query": "let logs = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, Body:string)[]),\n    (OTelLogs | project TimeGenerated, Body);\nlet snapshots = logs\n    | where TimeGenerated > ago(24h)\n    | extend body = todynamic(Body)\n    | where body.event == 'hub.fleet.health'\n    | summarize arg_max(TimeGenerated, body) by SnapshotBin=bin(TimeGenerated, 15m)\n    | project TimeGenerated=SnapshotBin, FilesPending=tolong(body.files_pending), FileErrors=tolong(body.files_error), SessionsParsing=tolong(body.sessions_parsing), SessionErrors=tolong(body.sessions_error);\nrange TimeGenerated from bin(ago(24h), 15m) to bin(now(), 15m) step 15m\n| join kind=leftouter snapshots on TimeGenerated\n| project TimeGenerated, FilesPending, FileErrors, SessionsParsing, SessionErrors\n| order by TimeGenerated asc",
         "size": 0,
         "queryType": 0,
         "resourceType": "microsoft.operationalinsights/workspaces",
-        "visualization": "timechart"
+        "visualization": "timechart",
+        "chartSettings": {
+          "showLegend": false
+        }
       },
       "name": "backlog-trend"
     },
