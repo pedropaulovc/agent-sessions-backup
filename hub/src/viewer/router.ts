@@ -1,15 +1,10 @@
-import { previewBearerOk } from '../auth/identity';
 import { readSession } from '../auth/session';
 import { webauthnRoute } from '../auth/webauthn';
 import { blobEndpoint } from './blob';
 import { machinesPage } from './machines';
 import { searchPage } from './search';
 import { sessionPage } from './session';
-
-// __Host- prefix requires Secure + Path=/ + no Domain; the browser rejects it otherwise, which is
-// exactly the hardening we want. Short-lived so a leaked cookie expires on its own.
-const PREVIEW_COOKIE = '__Host-preview-auth';
-const PREVIEW_COOKIE_MAX_AGE = 3600;
+import { previewAccess, previewBootstrapRoute, withPreviewCookie } from './preview-auth';
 
 /**
  * Host-routed viewer. The auth surface (/login, /settings, /logout, /webauthn/*) is always
@@ -33,6 +28,9 @@ const PREVIEW_COOKIE_MAX_AGE = 3600;
  * consulted on the API.
  */
 export async function viewerRoute(request: Request, url: URL, env: Env): Promise<Response> {
+  const previewBootstrap = await previewBootstrapRoute(request, url, env);
+  if (previewBootstrap) return previewBootstrap;
+
   const authResp = await webauthnRoute(request, url, env);
   if (authResp) return authResp;
 
@@ -55,10 +53,7 @@ async function viewerAccess(request: Request, env: Env): Promise<Access> {
   if (await readSession(request, env)) return 'pass';
 
   // Preview-only DEV_AUTH fallback. Production ignores it entirely.
-  if (env.ENVIRONMENT === 'preview') {
-    if (previewBearerOk(request, env)) return 'issue-cookie';
-    if (previewCookieOk(request, env)) return 'pass';
-  }
+  if (env.ENVIRONMENT === 'preview') return previewAccess(request, env);
 
   return 'deny';
 }
@@ -77,29 +72,4 @@ function handle(url: URL, env: Env): Promise<Response> {
   return Promise.resolve(
     new Response('not found', { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8' } }),
   );
-}
-
-/** Preview-cookie credential check: a matching preview cookie. The API path never calls this. */
-function previewCookieOk(request: Request, env: Env): boolean {
-  return !!env.DEV_AUTH && readCookie(request, PREVIEW_COOKIE) === env.DEV_AUTH;
-}
-
-/** Re-emit `res` with the preview auth cookie set. Clones so streaming bodies (session page) pass through. */
-function withPreviewCookie(res: Response, env: Env): Response {
-  const cookie =
-    `${PREVIEW_COOKIE}=${env.DEV_AUTH}; HttpOnly; Secure; Path=/; SameSite=Strict; Max-Age=${PREVIEW_COOKIE_MAX_AGE}`;
-  const out = new Response(res.body, res);
-  out.headers.append('set-cookie', cookie);
-  return out;
-}
-
-function readCookie(request: Request, name: string): string | undefined {
-  const header = request.headers.get('cookie');
-  if (!header) return undefined;
-  for (const part of header.split(';')) {
-    const eq = part.indexOf('=');
-    if (eq === -1) continue;
-    if (part.slice(0, eq).trim() === name) return part.slice(eq + 1).trim();
-  }
-  return undefined;
 }
