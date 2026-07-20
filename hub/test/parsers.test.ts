@@ -254,6 +254,70 @@ describe('parseClaudeCode', () => {
     expect(s.turns.every((t) => t.onMainPath)).toBe(true); // nothing wrongly hidden
   });
 
+  it('walks main-path ancestry through a skipped uuid-bearing attachment envelope', async () => {
+    const lines = [
+      ccUserLine({ uuid: 'u1', text: 'question before attachment' }),
+      ccAssistantLine({ uuid: 'a1', parentUuid: 'u1', text: 'answer before attachment' }),
+      JSON.stringify({ type: 'attachment', uuid: 'att1', parentUuid: 'a1', payload: { kind: 'hook' } }),
+      ccUserLine({ uuid: 'u2', parentUuid: 'att1', text: 'question after attachment' }),
+      ccAssistantLine({ uuid: 'a2', parentUuid: 'u2', text: 'answer after attachment' }),
+    ];
+
+    const s = await parseClaudeCode(readJsonlLines(toStream(lines)), CC_SESSION_ID);
+
+    expect(s.turns.map((turn) => turn.id)).toEqual(['u1', 'a1', 'u2', 'a2']);
+    expect(s.turns.every((turn) => turn.onMainPath)).toBe(true);
+    expect(s.stats.skippedLineTypes.attachment).toBe(1);
+  });
+
+  it('uses compact_boundary logicalParentUuid to keep pre-compaction turns on the main path', async () => {
+    const lines = [
+      ccUserLine({ uuid: 'u1', text: 'question before compaction' }),
+      ccAssistantLine({ uuid: 'a1', parentUuid: 'u1', text: 'answer before compaction' }),
+      JSON.stringify({
+        type: 'system',
+        subtype: 'compact_boundary',
+        uuid: 'compact1',
+        parentUuid: null,
+        logicalParentUuid: 'a1',
+        content: 'Conversation compacted',
+      }),
+      ccUserLine({ uuid: 'u2', parentUuid: 'compact1', text: 'summary after compaction' }),
+      ccAssistantLine({ uuid: 'a2', parentUuid: 'u2', text: 'answer after compaction' }),
+    ];
+
+    const s = await parseClaudeCode(readJsonlLines(toStream(lines)), CC_SESSION_ID);
+
+    expect(s.turns.map((turn) => turn.id)).toEqual(['u1', 'a1', 'compact1', 'u2', 'a2']);
+    expect(s.turns.find((turn) => turn.id === 'compact1')?.parentId).toBe('a1');
+    expect(s.turns.every((turn) => turn.onMainPath)).toBe(true);
+  });
+
+  it('crosses attachment and compaction ancestry without reviving an abandoned branch', async () => {
+    const lines = [
+      ccUserLine({ uuid: 'u1', text: 'shared question' }),
+      ccAssistantLine({ uuid: 'a-abandoned', parentUuid: 'u1', text: 'abandoned answer' }),
+      ccAssistantLine({ uuid: 'a-winner', parentUuid: 'u1', text: 'winning answer' }),
+      JSON.stringify({ type: 'attachment', uuid: 'att1', parentUuid: 'a-winner' }),
+      JSON.stringify({
+        type: 'system',
+        subtype: 'compact_boundary',
+        uuid: 'compact1',
+        parentUuid: null,
+        logicalParentUuid: 'att1',
+        content: 'Conversation compacted',
+      }),
+      ccUserLine({ uuid: 'u2', parentUuid: 'compact1', text: 'compaction summary' }),
+      ccAssistantLine({ uuid: 'a2', parentUuid: 'u2', text: 'continued answer' }),
+    ];
+
+    const s = await parseClaudeCode(readJsonlLines(toStream(lines)), CC_SESSION_ID);
+    const byId = (id: string) => s.turns.find((turn) => turn.id === id)!;
+
+    expect(byId('a-abandoned').onMainPath).toBe(false);
+    expect(['u1', 'a-winner', 'compact1', 'u2', 'a2'].every((id) => byId(id).onMainPath)).toBe(true);
+  });
+
   it('keeps retained turns on the main path when an oversized line makes Claude ancestry incomplete', async () => {
     const before = ccUserLine({ uuid: 'u-before', text: 'question before skipped line' });
     const after = ccAssistantLine({
