@@ -107,6 +107,15 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
 }
 
+async function seedPreviewBootstrap(nonce: string, expiresAt = Date.now() + 60_000): Promise<string> {
+  const hash = await sha256Hex(new TextEncoder().encode(nonce));
+  const key = `preview_auth:${hash}`;
+  await testEnv.DB.prepare('INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = ?2')
+    .bind(key, String(expiresAt))
+    .run();
+  return key;
+}
+
 async function putFile(store: string, relpath: string, content: string): Promise<Response> {
   const body = new TextEncoder().encode(content);
   return SELF.fetch(`https://api.sessions.vza.net/api/v1/files/testbox-wsl/${store}/${encodeURIComponent(relpath)}`, {
@@ -654,6 +663,92 @@ describe('viewer', () => {
     expect(res.status).toBe(200);
     // A cookie request is already authenticated — no need to re-issue.
     expect(res.headers.get('set-cookie')).toBeNull();
+  });
+
+  it('preview: a bootstrap nonce atomically becomes a browser cookie and redirects to a relative path', async () => {
+    const nonce = 'valid-preview-bootstrap-nonce';
+    const key = await seedPreviewBootstrap(nonce);
+    const url = new URL('https://branch.sessions-hub.workers.dev/_preview/bootstrap');
+    url.searchParams.set('token', nonce);
+    url.searchParams.set('next', '/s/example?view=chronological&page=4#turn-700');
+    const previewEnv = { ...testEnv, ENVIRONMENT: 'preview', DEV_AUTH: 'preview-secret' } as unknown as Env;
+
+    const res = await viewerRoute(new Request(url), url, previewEnv);
+
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toBe('/s/example?view=chronological&page=4#turn-700');
+    expect(res.headers.get('set-cookie')).toContain('__Host-preview-auth=preview-secret');
+    expect(res.headers.get('set-cookie')).toContain('HttpOnly');
+    expect(res.headers.get('set-cookie')).toContain('Secure');
+    expect(res.headers.get('set-cookie')).toContain('SameSite=Strict');
+    expect(await testEnv.DB.prepare('SELECT value FROM meta WHERE key = ?1').bind(key).first()).toBeNull();
+  });
+
+  it('preview: concurrent bootstrap attempts consume the nonce exactly once', async () => {
+    const nonce = 'concurrent-preview-bootstrap-nonce';
+    await seedPreviewBootstrap(nonce);
+    const url = new URL('https://branch.sessions-hub.workers.dev/_preview/bootstrap');
+    url.searchParams.set('token', nonce);
+    const previewEnv = { ...testEnv, ENVIRONMENT: 'preview', DEV_AUTH: 'preview-secret' } as unknown as Env;
+
+    const responses = await Promise.all([
+      viewerRoute(new Request(url), url, previewEnv),
+      viewerRoute(new Request(url), url, previewEnv),
+    ]);
+
+    expect(responses.map((response) => response.status).sort()).toEqual([302, 404]);
+  });
+
+  it('preview: invalid, expired, and reused bootstrap nonces share the same rejection', async () => {
+    const expired = 'expired-preview-bootstrap-nonce';
+    await seedPreviewBootstrap(expired, Date.now() - 1);
+    const previewEnv = { ...testEnv, ENVIRONMENT: 'preview', DEV_AUTH: 'preview-secret' } as unknown as Env;
+    const request = async (token: string) => {
+      const url = new URL('https://branch.sessions-hub.workers.dev/_preview/bootstrap');
+      url.searchParams.set('token', token);
+      return viewerRoute(new Request(url), url, previewEnv);
+    };
+
+    const invalid = await request('never-seeded-preview-bootstrap-nonce');
+    const expiredResponse = await request(expired);
+    const reused = await request(expired);
+
+    for (const response of [invalid, expiredResponse, reused]) {
+      expect(response.status).toBe(404);
+      expect(await response.text()).toBe('not found');
+      expect(response.headers.get('set-cookie')).toBeNull();
+    }
+  });
+
+  it('preview: rejects an open redirect without consuming the nonce', async () => {
+    const nonce = 'open-redirect-preview-bootstrap-nonce';
+    const key = await seedPreviewBootstrap(nonce);
+    const url = new URL('https://branch.sessions-hub.workers.dev/_preview/bootstrap');
+    url.searchParams.set('token', nonce);
+    url.searchParams.set('next', '//evil.example/steal');
+    const previewEnv = { ...testEnv, ENVIRONMENT: 'preview', DEV_AUTH: 'preview-secret' } as unknown as Env;
+
+    const res = await viewerRoute(new Request(url), url, previewEnv);
+
+    expect(res.status).toBe(404);
+    expect(res.headers.get('location')).toBeNull();
+    expect(await testEnv.DB.prepare('SELECT value FROM meta WHERE key = ?1').bind(key).first()).not.toBeNull();
+    await testEnv.DB.prepare('DELETE FROM meta WHERE key = ?1').bind(key).run();
+  });
+
+  it('production: the preview bootstrap route is disabled and cannot consume a nonce', async () => {
+    const nonce = 'production-disabled-preview-bootstrap-nonce';
+    const key = await seedPreviewBootstrap(nonce);
+    const url = new URL('https://sessions.vza.net/_preview/bootstrap');
+    url.searchParams.set('token', nonce);
+    const prodEnv = { ...testEnv, ENVIRONMENT: 'production', DEV_AUTH: 'preview-secret' } as unknown as Env;
+
+    const res = await viewerRoute(new Request(url), url, prodEnv);
+
+    expect(res.status).toBe(404);
+    expect(res.headers.get('set-cookie')).toBeNull();
+    expect(await testEnv.DB.prepare('SELECT value FROM meta WHERE key = ?1').bind(key).first()).not.toBeNull();
+    await testEnv.DB.prepare('DELETE FROM meta WHERE key = ?1').bind(key).run();
   });
 
   it('production ignores DEV_AUTH entirely (a bearer still redirects to /login)', async () => {

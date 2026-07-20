@@ -5,6 +5,11 @@
   "compatibility_date": "2026-07-01",
   "compatibility_flags": ["nodejs_compat"],
   "limits": { "cpu_ms": 300000 },
+  // Keep version preview URLs enabled for both production and named environments.
+  // The preview environment has an explicit Worker name below so Workers Builds does
+  // not upload PR code into this production service (which implements a Durable Object
+  // and therefore cannot receive preview URLs).
+  "preview_urls": true,
   // Routes activated in M3. Implemented as Workers Custom Domains (not zone
   // `routes` with `zone_name`) because the deploy credential is an OAuth token
   // without a dns_records scope: custom domains are provisioned through the
@@ -84,20 +89,27 @@
   // resource set — wrangler does NOT inherit bindings into named environments, so each
   // must be restated — and pins ENVIRONMENT='preview', which turns on the DEV_AUTH
   // bearer gate (src/auth/identity.ts) so the public *.workers.dev preview URL is not
-  // unauthenticated. `--env preview` also names the worker `sessions-hub-preview`, a
-  // separate Worker from production. No routes/custom domains: previews serve from their
-  // workers.dev version URL, where zone mTLS/WAF don't apply (hence the bearer gate).
-  // DEV_AUTH is a per-env secret: `wrangler secret put DEV_AUTH --env preview`.
+  // unauthenticated. Automatic Git builds and manual `--env preview` uploads both target
+  // the separate sessions-hub-preview Worker. It has never implemented the production
+  // Durable Object, so Cloudflare can create branch/version URLs for it. No routes/custom
+  // domains: previews serve from workers.dev, where zone mTLS/WAF do not apply.
   "env": {
     "preview": {
+      // Workers Builds is connected to sessions-hub and otherwise keeps that service as
+      // the upload target even with `--env preview`. Select the DO-free preview service
+      // explicitly so Cloudflare can generate a preview URL.
+      "name": "sessions-hub-preview",
+      // Automatic PR versions must not export the production Durable Object handler:
+      // Cloudflare suppresses preview URLs for any Worker that implements one.
+      "main": "src/preview.ts",
+      // `exports` inherits from the top-level even though durable_objects.bindings does not.
+      // Override it explicitly or upload metadata still advertises CloudflareOAuthBroker
+      // and Cloudflare sets has_preview=false despite the preview-only module surface.
+      "exports": {},
       // Empty on purpose: unlike bindings, `routes` IS inherited into named environments,
       // so without this a preview deploy would REASSIGN the production custom domains
       // (api./sessions.vza.net) to sessions-hub-preview. Previews serve from workers.dev.
       "routes": [],
-      // Preview URLs are off by default (verified: every *.workers.dev probe of this worker
-      // 404s without it). PR builds upload versions with `--env preview`; this exposes each
-      // version's <hash>-sessions-hub-preview.pedro-18e.workers.dev URL, gated by DEV_AUTH.
-      "preview_urls": true,
       "vars": {
         "ENVIRONMENT": "preview",
         "API_HOST": "api.sessions.vza.net",

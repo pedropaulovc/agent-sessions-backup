@@ -34,8 +34,9 @@ export async function parseClaudeCode(
   let firstUserText: string | undefined;
   let lastMessageUuid: string | undefined;
   let mainPathAncestry: MainPathAncestry = 'complete';
-  // uuid -> parentUuid for EVERY envelope that builds a turn (kept or dropped), so the main-path walk can
-  // start from the last envelope and traverse through turns that yielded no blocks to the nearest kept ancestor.
+  // uuid -> logical parent for EVERY parsed envelope, including non-turn metadata such as attachments.
+  // Claude links ordinary messages through those envelopes, and compaction boundaries carry the old tail in
+  // logicalParentUuid while deliberately leaving parentUuid null. The main-path walk must cross both shapes.
   const envelopeParent = new Map<string, string | undefined>();
 
   for await (const line of lines) {
@@ -55,6 +56,9 @@ export async function parseClaudeCode(
       continue;
     }
     const type = typeof o.type === 'string' ? o.type : '?';
+    const envelopeId = str(o.uuid);
+    const ancestryParentId = str(o.logicalParentUuid) ?? str(o.parentUuid);
+    if (envelopeId) envelopeParent.set(envelopeId, ancestryParentId);
 
     if (type === 'ai-title') {
       aiTitle = str(o.title) ?? aiTitle;
@@ -85,15 +89,13 @@ export async function parseClaudeCode(
 
     const turn: NormalizedTurn = {
       index: session.turns.length,
-      id: str(o.uuid),
-      parentId: str(o.parentUuid) ?? undefined,
+      id: envelopeId,
+      parentId: ancestryParentId,
       onMainPath: false, // resolved after the full pass
       role,
       ts,
       blocks: [],
     };
-    if (turn.id) envelopeParent.set(turn.id, turn.parentId);
-
     if (type === 'assistant' && msg) {
       const model = str(msg.model);
       if (model) {
