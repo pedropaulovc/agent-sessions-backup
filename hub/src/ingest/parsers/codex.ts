@@ -47,6 +47,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
     // subtype). The later filter explicitly keeps t.usage turns, so flush must not drop them.
     if (current && (current.blocks.length > 0 || current.usage)) session.turns.push(current);
     current = undefined;
+    currentTurnId = undefined;
     // A representation pair (event_msg + response_item for one logical message) is always
     // adjacent within a single turn — so an unpaired occurrence left pending at a turn boundary
     // is never going to be paired and must not survive to wrongly consume an unrelated, later
@@ -116,6 +117,17 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
 
   for await (const line of lines) {
     session.stats.lines++;
+    if (line.kind === 'oversized') {
+      session.stats.skippedLineTypes['oversized-line'] =
+        (session.stats.skippedLineTypes['oversized-line'] ?? 0) + 1;
+      // The skipped envelope could have changed roles, turn IDs, or carried either half of a
+      // duplicate event_msg/response_item pair. Treat it as an unknown turn boundary so records
+      // on opposite sides cannot merge or dedupe. It may also have started a new assistant call,
+      // so usage after the gap must not overwrite the last visible pre-gap assistant turn.
+      flush();
+      lastAssistant = undefined;
+      continue;
+    }
     if (line.text.trim() === '') continue;
     let o: Record<string, unknown>;
     try {

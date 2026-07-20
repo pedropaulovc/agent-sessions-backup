@@ -17,6 +17,7 @@ const UNVER_SESSION = '99999999-7777-4777-8777-777777777777';
 const UNKNOWN_MEDIA_SESSION = '88888888-8888-4888-8888-888888888888';
 const CODEX_TAIL_SESSION = '77777777-9999-4999-8999-999999999999';
 const REPO_SESSION = '66666666-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const OFFSET_MATCH_SESSION = '55555555-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const REPO_URL = 'https://github.com/tester/facetdemo';
 
 // Hostile transcript payloads: an SVG with inline script and an HTML "document".
@@ -217,6 +218,15 @@ describe('viewer', () => {
       )).status,
     ).toBe(201);
 
+    const offsetMatchContent = [
+      ccLine(OFFSET_MATCH_SESSION, { uuid: 'om-1', parentUuid: null, role: 'user', text: 'offset first turn' }),
+      ccLine(OFFSET_MATCH_SESSION, { uuid: 'om-2', parentUuid: 'om-1', role: 'assistant', text: 'offset second turn' }),
+      ccLine(OFFSET_MATCH_SESSION, { uuid: 'om-3', parentUuid: 'om-2', role: 'user', text: 'offset third turn' }),
+    ].join('\n');
+    expect(
+      (await putFile('claude-projects', `-home-tester-src-demo/${OFFSET_MATCH_SESSION}.jsonl`, offsetMatchContent)).status,
+    ).toBe(201);
+
     await drainQueue();
   });
 
@@ -354,6 +364,56 @@ describe('viewer', () => {
     expect(p1).not.toContain('abandonedmarker');
     expect(p1).not.toContain('id="t100"');
     expect(p1).toContain('shared start prompt'); // main-path prefix still shown
+  });
+
+  it('matches turn metadata at any block offset so skipped D1 records cannot shift later turns', async () => {
+    const rows = (
+      await testEnv.DB.prepare(
+        'SELECT turn_index, byte_start FROM blocks WHERE session_id = ?1 ORDER BY turn_index',
+      )
+        .bind(OFFSET_MATCH_SESSION)
+        .all<{ turn_index: number; byte_start: number }>()
+    ).results;
+    expect(rows).toHaveLength(3);
+
+    // Simulate a previously indexed turn whose source record is now skipped by the bounded JSONL reader.
+    // Later D1 turns keep their authoritative indices, leaving this row unmatched by the fresh raw parse.
+    await testEnv.DB.prepare(
+      'UPDATE blocks SET turn_index = turn_index + 1 WHERE session_id = ?1 AND turn_index >= 1',
+    ).bind(OFFSET_MATCH_SESSION).run();
+    await testEnv.DB.prepare(
+      `INSERT INTO blocks
+         (session_id, file_id, turn_index, block_index, role, btype, byte_start, byte_len, truncated, text, on_main_path)
+       SELECT session_id, file_id, 1, 0, 'assistant', 'text', ?2, 1, 0, NULL, 0
+       FROM blocks WHERE session_id = ?1 AND turn_index = 0 LIMIT 1`,
+    ).bind(OFFSET_MATCH_SESSION, rows[0]!.byte_start + 1).run();
+
+    // The old turn 2 also had an oversized first block, followed by the smaller block that still exists in
+    // the raw parse. Its authoritative index/main-path metadata must match at that later surviving offset,
+    // not only at MIN(byte_start) for the turn.
+    await testEnv.DB.prepare(
+      'UPDATE blocks SET block_index = block_index + 1, on_main_path = 0 WHERE session_id = ?1 AND turn_index = 2',
+    ).bind(OFFSET_MATCH_SESSION).run();
+    await testEnv.DB.prepare(
+      `INSERT INTO blocks
+         (session_id, file_id, turn_index, block_index, role, btype, byte_start, byte_len, truncated, text, on_main_path)
+       SELECT session_id, file_id, 2, 0, 'assistant', 'tool_result', ?2, 1, 0, NULL, 0
+       FROM blocks WHERE session_id = ?1 AND turn_index = 0 LIMIT 1`,
+    ).bind(OFFSET_MATCH_SESSION, rows[0]!.byte_start + 2).run();
+
+    const chronological = await (
+      await SELF.fetch(`https://sessions.vza.net/s/${OFFSET_MATCH_SESSION}?view=chronological`)
+    ).text();
+    expect(chronological).not.toContain('id="t1"');
+    expect(chronological).toMatch(/<article id="t2" class="turn assistant rewound">[\s\S]*?offset second turn/);
+    expect(chronological).toMatch(/<article id="t3" class="turn user">[\s\S]*?offset third turn/);
+
+    const effective = await (
+      await SELF.fetch(`https://sessions.vza.net/s/${OFFSET_MATCH_SESSION}?view=effective`)
+    ).text();
+    expect(effective).not.toContain('offset second turn');
+    expect(effective).not.toContain('id="t2"');
+    expect(effective).toContain('offset third turn');
   });
 
   it('reindex preserves persisted on_main_path flags', async () => {

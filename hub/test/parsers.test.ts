@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { readJsonlLines } from '../src/ingest/jsonl';
+import { MAX_JSONL_LINE_BYTES, readJsonlLines, type JsonlLine } from '../src/ingest/jsonl';
 import { parseClaudeCode } from '../src/ingest/parsers/claude-code';
 import { parseCodex } from '../src/ingest/parsers/codex';
+import { parsePromptLog } from '../src/ingest/parsers/history';
 import {
   CC_SESSION_ID,
   CODEX_SESSION_ID,
@@ -19,11 +20,13 @@ describe('readJsonlLines', () => {
     const lines = ['{"a":1}', '{"b":"ü"}', '{"c":3}'];
     const encoder = new TextEncoder();
     const raw = encoder.encode(lines.join('\n') + '\n');
-    const out: Array<{ text: string; byteStart: number; byteLen: number }> = [];
+    const out: JsonlLine[] = [];
     for await (const l of readJsonlLines(toStream(lines))) out.push(l);
-    expect(out.map((l) => l.text)).toEqual(lines);
+    expect(out.map((l) => (l.kind === 'decoded' ? l.text : undefined))).toEqual(lines);
     // Re-slicing the original buffer at reported offsets must reproduce each line.
     for (const l of out) {
+      expect(l.kind).toBe('decoded');
+      if (l.kind !== 'decoded') throw new Error('expected decoded line');
       const slice = raw.subarray(l.byteStart, l.byteStart + l.byteLen);
       expect(new TextDecoder().decode(slice)).toBe(l.text + '\n');
     }
@@ -43,8 +46,123 @@ describe('readJsonlLines', () => {
     const out = [];
     for await (const l of readJsonlLines(stream)) out.push(l);
     expect(out).toHaveLength(2);
+    expect(out[1]!.kind).toBe('decoded');
+    if (out[1]!.kind !== 'decoded') throw new Error('expected decoded line');
     expect(out[1]!.text.length).toBe(big.length);
     expect(out[1]!.byteStart).toBe(8);
+  });
+
+  it('accepts exactly 2 MiB of content and skips 2 MiB + 1 with exact source spans', async () => {
+    const accepted = 'a'.repeat(MAX_JSONL_LINE_BYTES);
+    const oversized = 'b'.repeat(MAX_JSONL_LINE_BYTES + 1);
+    const tail = '{"tail":true}';
+    const body = new TextEncoder().encode(`${accepted}\n${oversized}\n${tail}`);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let offset = 0; offset < body.length; offset += 65536) {
+          controller.enqueue(body.subarray(offset, Math.min(offset + 65536, body.length)));
+        }
+        controller.close();
+      },
+    });
+
+    const out: JsonlLine[] = [];
+    for await (const line of readJsonlLines(stream)) out.push(line);
+
+    expect(out).toHaveLength(3);
+    const first = out[0]!;
+    expect(first).toMatchObject({ kind: 'decoded', byteStart: 0, byteLen: MAX_JSONL_LINE_BYTES + 1 });
+    expect(first.kind === 'decoded' ? first.text.length : -1).toBe(MAX_JSONL_LINE_BYTES);
+    expect(out[1]).toEqual({
+      kind: 'oversized',
+      byteStart: MAX_JSONL_LINE_BYTES + 1,
+      byteLen: MAX_JSONL_LINE_BYTES + 2,
+    });
+    expect(out[2]).toEqual({
+      kind: 'decoded',
+      text: tail,
+      byteStart: 2 * MAX_JSONL_LINE_BYTES + 3,
+      byteLen: tail.length,
+    });
+    expect(out.reduce((sum, line) => sum + line.byteLen, 0)).toBe(body.length);
+
+    const finalBody = new TextEncoder().encode(oversized);
+    const finalStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let offset = 0; offset < finalBody.length; offset += 65536) {
+          controller.enqueue(finalBody.subarray(offset, Math.min(offset + 65536, finalBody.length)));
+        }
+        controller.close();
+      },
+    });
+    const finalOut: JsonlLine[] = [];
+    for await (const line of readJsonlLines(finalStream)) finalOut.push(line);
+    expect(finalOut).toEqual([{ kind: 'oversized', byteStart: 0, byteLen: MAX_JSONL_LINE_BYTES + 1 }]);
+  });
+
+  it('discards a very large multi-chunk line and resumes at the next record', async () => {
+    const chunk = new Uint8Array(64 * 1024).fill(0x78);
+    const chunkCount = 512;
+    const tail = new TextEncoder().encode('\n{"after":true}\n');
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let i = 0; i < chunkCount; i++) controller.enqueue(chunk);
+        controller.enqueue(tail);
+        controller.close();
+      },
+    });
+
+    const out: JsonlLine[] = [];
+    for await (const line of readJsonlLines(stream)) out.push(line);
+
+    const oversizedBytes = chunk.length * chunkCount;
+    expect(out).toEqual([
+      { kind: 'oversized', byteStart: 0, byteLen: oversizedBytes + 1 },
+      { kind: 'decoded', text: '{"after":true}', byteStart: oversizedBytes + 1, byteLen: 15 },
+    ]);
+  });
+
+  it('accounts for oversized records as skipped, not malformed, and continues every JSONL parser', async () => {
+    const oversized: JsonlLine = {
+      kind: 'oversized',
+      byteStart: 0,
+      byteLen: MAX_JSONL_LINE_BYTES + 2,
+    };
+    const lines = async function* (text: string): AsyncGenerator<JsonlLine> {
+      yield oversized;
+      yield {
+        kind: 'decoded',
+        text,
+        byteStart: oversized.byteLen,
+        byteLen: new TextEncoder().encode(text).length + 1,
+      };
+    };
+
+    const [claude, codex, history] = await Promise.all([
+      parseClaudeCode(lines(ccUserLine({ uuid: 'u-after', text: 'after oversized' })), CC_SESSION_ID),
+      parseCodex(
+        lines(JSON.stringify({
+          timestamp: '2026-07-20T00:00:00.000Z',
+          type: 'session_meta',
+          payload: { cwd: '/after/oversized' },
+        })),
+        CODEX_SESSION_ID,
+      ),
+      parsePromptLog(
+        lines(JSON.stringify({ display: 'after oversized', timestamp: 1_700_000_000_000 })),
+        'promptlog:testbox:claude',
+      ),
+    ]);
+    for (const session of [claude, codex, history]) {
+      expect(session.stats).toMatchObject({
+        lines: 2,
+        parseErrorLines: 0,
+        skippedLineTypes: { 'oversized-line': 1 },
+      });
+    }
+    expect(claude.turns[0]!.blocks[0]!.text).toBe('after oversized');
+    expect(codex.cwd).toBe('/after/oversized');
+    expect(history.turns[0]!.blocks[0]!.text).toBe('after oversized');
   });
 });
 
@@ -134,6 +252,37 @@ describe('parseClaudeCode', () => {
     const s = await parseClaudeCode(readJsonlLines(toStream(lines)), CC_SESSION_ID);
     expect(s.turns.map((t) => t.id)).toEqual(['u1', 'a1']); // empty tail dropped
     expect(s.turns.every((t) => t.onMainPath)).toBe(true); // nothing wrongly hidden
+  });
+
+  it('keeps retained turns on the main path when an oversized line makes Claude ancestry incomplete', async () => {
+    const before = ccUserLine({ uuid: 'u-before', text: 'question before skipped line' });
+    const after = ccAssistantLine({
+      uuid: 'a-after',
+      parentUuid: 'a-skipped',
+      text: 'answer after skipped line',
+    });
+    const encodedLength = (text: string) => new TextEncoder().encode(text).length;
+    const lines = async function* (): AsyncGenerator<JsonlLine> {
+      yield { kind: 'decoded', text: before, byteStart: 0, byteLen: encodedLength(before) + 1 };
+      const oversizedStart = encodedLength(before) + 1;
+      yield {
+        kind: 'oversized',
+        byteStart: oversizedStart,
+        byteLen: MAX_JSONL_LINE_BYTES + 2,
+      };
+      yield {
+        kind: 'decoded',
+        text: after,
+        byteStart: oversizedStart + MAX_JSONL_LINE_BYTES + 2,
+        byteLen: encodedLength(after),
+      };
+    };
+
+    const s = await parseClaudeCode(lines(), CC_SESSION_ID);
+
+    expect(s.turns.map((turn) => turn.id)).toEqual(['u-before', 'a-after']);
+    expect(s.turns.every((turn) => turn.onMainPath)).toBe(true);
+    expect(s.stats.skippedLineTypes['oversized-line']).toBe(1);
   });
 
   it('caps oversized blocks and flags truncation', async () => {
@@ -400,6 +549,82 @@ describe('parseCodex', () => {
     const s = await parseCodex(readJsonlLines(toStream(lines)), CODEX_SESSION_ID);
     const texts = s.turns.flatMap((t) => t.blocks.filter((b) => b.type === 'text').map((b) => b.text));
     expect(texts).toEqual([text]);
+  });
+
+  it('treats an oversized record as an unknown turn boundary for grouping, dedupe, and usage attribution', async () => {
+    const text = 'same assistant text on both sides of the skipped record';
+    const decoded = (value: Record<string, unknown>, byteStart: number): JsonlLine => {
+      const line = JSON.stringify(value);
+      return {
+        kind: 'decoded',
+        text: line,
+        byteStart,
+        byteLen: new TextEncoder().encode(line).length + 1,
+      };
+    };
+    const records: JsonlLine[] = [
+      decoded(
+        {
+          timestamp: '2026-07-20T10:00:00.000Z',
+          type: 'turn_context',
+          payload: { turn_id: 't1', model: 'gpt-test-boundary' },
+        },
+        0,
+      ),
+      decoded(
+        {
+          timestamp: '2026-07-20T10:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text }],
+            internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+          },
+        },
+        100,
+      ),
+      decoded(
+        {
+          timestamp: '2026-07-20T10:00:02.000Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 10 } } },
+        },
+        200,
+      ),
+      { kind: 'oversized', byteStart: 300, byteLen: MAX_JSONL_LINE_BYTES + 2 },
+      // This usage event has no visible assistant message before it. It must open a post-gap
+      // usage-only turn instead of mutating the pre-gap assistant retained in session.turns.
+      decoded(
+        {
+          timestamp: '2026-07-20T10:00:04.000Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 200, output_tokens: 20 } } },
+        },
+        400,
+      ),
+      // Same role and text, opposite wire representation. The unknown boundary must prevent
+      // both turn merging and cross-gap duplicate pairing.
+      decoded(
+        {
+          timestamp: '2026-07-20T10:00:05.000Z',
+          type: 'event_msg',
+          payload: { type: 'agent_message', message: text },
+        },
+        500,
+      ),
+    ];
+    const lines = async function* (): AsyncGenerator<JsonlLine> {
+      yield* records;
+    };
+
+    const s = await parseCodex(lines(), CODEX_SESSION_ID);
+
+    expect(s.stats.skippedLineTypes['oversized-line']).toBe(1);
+    expect(s.turns).toHaveLength(2);
+    expect(s.turns.map((turn) => turn.role)).toEqual(['assistant', 'assistant']);
+    expect(s.turns.map((turn) => turn.blocks.map((block) => block.text))).toEqual([[text], [text]]);
+    expect(s.turns.map((turn) => turn.usage?.inputTokens)).toEqual([100, 200]);
   });
 
   it('a token_count with no indexable block for the current call opens a fresh usage-only turn instead of overwriting the previous call (regression: lastAssistant stayed stale across a new user turn)', async () => {
