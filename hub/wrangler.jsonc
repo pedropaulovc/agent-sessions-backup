@@ -99,6 +99,9 @@
   // keep both secrets in sync.
   "env": {
     "preview": {
+      // Automatic PR versions must not export the production Durable Object handler:
+      // Cloudflare suppresses preview URLs for any Worker that implements one.
+      "main": "src/preview.ts",
       // Empty on purpose: unlike bindings, `routes` IS inherited into named environments,
       // so without this a preview deploy would REASSIGN the production custom domains
       // (api./sessions.vza.net) to sessions-hub-preview. Previews serve from workers.dev.
