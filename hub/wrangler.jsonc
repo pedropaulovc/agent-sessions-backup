@@ -102,6 +102,10 @@
       // Automatic PR versions must not export the production Durable Object handler:
       // Cloudflare suppresses preview URLs for any Worker that implements one.
       "main": "src/preview.ts",
+      // `exports` inherits from the top-level even though durable_objects.bindings does not.
+      // Override it explicitly or upload metadata still advertises CloudflareOAuthBroker
+      // and Cloudflare sets has_preview=false despite the preview-only module surface.
+      "exports": {},
       // Empty on purpose: unlike bindings, `routes` IS inherited into named environments,
       // so without this a preview deploy would REASSIGN the production custom domains
       // (api./sessions.vza.net) to sessions-hub-preview. Previews serve from workers.dev.
