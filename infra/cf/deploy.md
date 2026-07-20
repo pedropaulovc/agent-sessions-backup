@@ -53,6 +53,13 @@ GitHub Actions stays the PR gate (typecheck + vitest + pytest); Workers Builds o
   `cd hub && npx wrangler versions secret put DEV_AUTH --env preview`. A secret update creates
   a new version; the next automatic branch build inherits it and moves the branch alias.
 
+Passkeys cannot authenticate on `*.workers.dev` because WebAuthn is intentionally pinned to
+`sessions.vza.net`. For browser review, generate a random nonce and insert
+`preview_auth:<sha256hex(nonce)>` into the preview D1 `meta` table with its expiry epoch in
+milliseconds as the value. Open `/_preview/bootstrap?token=<nonce>&next=<encoded-relative-path>`.
+The Worker atomically deletes the row, rejects expired/reused tokens, issues the HttpOnly preview
+cookie, and redirects. Never place the long-lived `DEV_AUTH` value in a URL.
+
 ## Verifying config without deploying
 
 ```
