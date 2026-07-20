@@ -162,8 +162,8 @@ export async function runWatchdog(env: Env): Promise<void> {
       );
 
       // Kept for the existing missed-heartbeat alert contract. The richer
-      // machine health event is converted into gauges by the gateway, while
-      // this log remains the alert's backwards-compatible input.
+      // machine health event feeds the Workbook's OTel log queries, while this
+      // log remains the alert's backwards-compatible input.
       console.log(
         JSON.stringify({
           event: 'hub.machine.heartbeat_age',
