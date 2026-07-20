@@ -663,6 +663,24 @@ describe('viewer result pagination and facet layout', () => {
       `INSERT INTO blocks_fts(rowid, text)
        SELECT id, text FROM blocks WHERE session_id LIKE 'viewer-pagination-%'`,
     ).run();
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, os, primary_model, title, started_at, ended_at, tokens_in, tokens_out, tokens_reasoning, index_state)
+         VALUES ('viewer-sort-short', 'viewer-sort-test', 'viewer-sort-machine', 'linux', 'sort-model', 'Short session', '2026-07-01T10:00:00Z', '2026-07-01T10:02:00Z', 10, 5, 0, 'ready')`,
+      ),
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, os, primary_model, title, started_at, ended_at, tokens_in, tokens_out, tokens_reasoning, index_state)
+         VALUES ('viewer-sort-long', 'viewer-sort-test', 'viewer-sort-machine', 'linux', 'sort-model', 'Long session', '2026-07-01T10:00:00Z', '2026-07-01T13:30:00Z', 100, 50, 25, 'ready')`,
+      ),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text) VALUES
+         ('viewer-sort-short', 1, 0, 0, 'user', 'text', 'viewersortmarker'),
+         ('viewer-sort-long', 1, 0, 0, 'user', 'text', 'viewersortmarker')`,
+      ),
+    ]);
+    await testEnv.DB.prepare(
+      `INSERT INTO blocks_fts(rowid, text) SELECT id, text FROM blocks WHERE session_id LIKE 'viewer-sort-%'`,
+    ).run();
   });
 
   function pageHref(html: string, rel: 'next' | 'prev'): string {
@@ -749,6 +767,22 @@ describe('viewer result pagination and facet layout', () => {
     expect(controls).toContain(`name="q" value="${PAGINATION_MARKER}"`);
     expect(controls).not.toContain('name="cursor"');
     expect(controls).not.toContain('name="limit"');
+  });
+
+  it('filters by session time and sorts by session time or total tokens', async () => {
+    const timeSorted = await (await SELF.fetch('https://sessions.vza.net/?q=viewersortmarker&harness=viewer-sort-test&sort=session_time')).text();
+    expect(timeSorted).toContain('<option value="session_time" selected>Session time</option>');
+    expect(timeSorted).toContain('>Session time</h3>');
+    expect(timeSorted.indexOf('Long session')).toBeLessThan(timeSorted.indexOf('Short session'));
+    expect(timeSorted).toContain('Over 2 hours');
+
+    const tokenSorted = await (await SELF.fetch('https://sessions.vza.net/?q=viewersortmarker&harness=viewer-sort-test&sort=total_tokens')).text();
+    expect(tokenSorted).toContain('<option value="total_tokens" selected>Total tokens</option>');
+    expect(tokenSorted.indexOf('Long session')).toBeLessThan(tokenSorted.indexOf('Short session'));
+
+    const shortOnly = await (await SELF.fetch('https://sessions.vza.net/?q=viewersortmarker&harness=viewer-sort-test&session_time=under-5m')).text();
+    expect(shortOnly).toContain('Short session');
+    expect(shortOnly).not.toContain('Long session');
   });
 
   it('keeps the recent-session boundary stable when a newer session is ingested between pages', async () => {
