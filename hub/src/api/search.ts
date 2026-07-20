@@ -8,7 +8,8 @@ const SESSION_TIME_FACETS = [
   ['over-2h', 'Over 2 hours', 2 * 60 * 60, null],
 ] as const;
 const SESSION_TIME_SQL = "MAX(0, (julianday(s.ended_at) - julianday(s.started_at)) * 86400)";
-const TOTAL_TOKENS_SQL = 'COALESCE(s.tokens_in, 0) + COALESCE(s.tokens_out, 0) + COALESCE(s.tokens_reasoning, 0)';
+// Reasoning output is already included in output tokens, and cached input is not new work.
+const TOTAL_TOKENS_SQL = 'COALESCE(s.tokens_in, 0) + COALESCE(s.tokens_out, 0)';
 
 function sessionTimeFilter(value: string | null, addFilter: (sql: string, value: unknown) => void): void {
   const facet = SESSION_TIME_FACETS.find(([key]) => key === value);

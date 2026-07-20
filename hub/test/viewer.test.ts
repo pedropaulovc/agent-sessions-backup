@@ -673,9 +673,14 @@ describe('viewer result pagination and facet layout', () => {
          VALUES ('viewer-sort-long', 'viewer-sort-test', 'viewer-sort-machine', 'linux', 'sort-model', 'Long session', '2026-07-01T10:00:00Z', '2026-07-01T13:30:00Z', 100, 50, 25, 'ready')`,
       ),
       testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, os, primary_model, title, started_at, ended_at, tokens_in, tokens_out, tokens_reasoning, tokens_cached, index_state)
+         VALUES ('viewer-sort-reasoning', 'viewer-sort-test', 'viewer-sort-machine', 'linux', 'sort-model', 'Reasoning-heavy session', '2026-07-01T10:00:00Z', '2026-07-01T10:30:00Z', 20, 10, 500, 10000, 'ready')`,
+      ),
+      testEnv.DB.prepare(
         `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text) VALUES
          ('viewer-sort-short', 1, 0, 0, 'user', 'text', 'viewersortmarker'),
-         ('viewer-sort-long', 1, 0, 0, 'user', 'text', 'viewersortmarker')`,
+         ('viewer-sort-long', 1, 0, 0, 'user', 'text', 'viewersortmarker'),
+         ('viewer-sort-reasoning', 1, 0, 0, 'user', 'text', 'viewersortmarker')`,
       ),
     ]);
     await testEnv.DB.prepare(
@@ -770,6 +775,9 @@ describe('viewer result pagination and facet layout', () => {
   });
 
   it('filters by session time and sorts by session time or total tokens', async () => {
+    const relevanceSorted = await (await SELF.fetch('https://sessions.vza.net/?q=viewersortmarker&harness=viewer-sort-test')).text();
+    expect(relevanceSorted).toContain('<option value="recent" selected>Relevance</option>');
+
     const timeSorted = await (await SELF.fetch('https://sessions.vza.net/?q=viewersortmarker&harness=viewer-sort-test&sort=session_time')).text();
     expect(timeSorted).toContain('<option value="session_time" selected>Session time</option>');
     expect(timeSorted).toContain('>Session time</h3>');
@@ -779,6 +787,10 @@ describe('viewer result pagination and facet layout', () => {
     const tokenSorted = await (await SELF.fetch('https://sessions.vza.net/?q=viewersortmarker&harness=viewer-sort-test&sort=total_tokens')).text();
     expect(tokenSorted).toContain('<option value="total_tokens" selected>Total tokens</option>');
     expect(tokenSorted.indexOf('Long session')).toBeLessThan(tokenSorted.indexOf('Short session'));
+    expect(tokenSorted.indexOf('Long session')).toBeLessThan(tokenSorted.indexOf('Reasoning-heavy session'));
+    expect(tokenSorted.indexOf('Reasoning-heavy session')).toBeLessThan(tokenSorted.indexOf('Short session'));
+    expect(tokenSorted).toContain('30 tokens');
+    expect(tokenSorted).not.toContain('530 tokens');
 
     const shortOnly = await (await SELF.fetch('https://sessions.vza.net/?q=viewersortmarker&harness=viewer-sort-test&session_time=under-5m')).text();
     expect(shortOnly).toContain('Short session');

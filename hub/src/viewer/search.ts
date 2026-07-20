@@ -30,7 +30,8 @@ const SESSION_TIME_FACETS: Record<string, string> = {
   'over-2h': 'Over 2 hours',
 };
 const SESSION_TIME_SQL = "MAX(0, (julianday(ended_at) - julianday(started_at)) * 86400)";
-const TOTAL_TOKENS_SQL = 'COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0) + COALESCE(tokens_reasoning, 0)';
+// Reasoning output is already included in output tokens, and cached input is not new work.
+const TOTAL_TOKENS_SQL = 'COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0)';
 
 // Facet column name (as returned by runSearch) → query param the viewer filters on.
 const FACET_PARAM: Record<string, string> = {
@@ -191,6 +192,9 @@ function renderSidebar(
   }).join('');
   const sort = active.sort ?? 'recent';
   const sortOptions = SORT_OPTIONS.map(([value, label]) =>
+    // Full-text searches use FTS relevance unless an explicit non-default sort is selected.
+    value === 'recent' && query ? [value, 'Relevance'] : [value, label],
+  ).map(([value, label]) =>
     `<option value="${value}"${sort === value ? ' selected' : ''}>${label}</option>`,
   ).join('');
   const clear = new URL(url);
