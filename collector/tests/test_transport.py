@@ -1,4 +1,5 @@
 import hashlib
+import types
 
 import pytest
 
@@ -292,6 +293,67 @@ def test_subprocess_timeout_maps_to_status_zero(monkeypatch):
     t._curl_version_ok = True  # skip the version probe; this test is about the transfer timeout
     rc, status, _body = t._run(["-sS", "http://127.0.0.1:1/x"])
     assert status == 0 and rc != 0  # no HTTP response -> treated as network failure
+
+
+def test_windows_curl_version_probe_uses_no_window(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return types.SimpleNamespace(stdout="curl 8.5.0 Windows\n", returncode=0)
+
+    monkeypatch.setattr(transport_mod.sys, "platform", "win32")
+    monkeypatch.setattr(transport_mod.subprocess, "run", fake_run)
+    assert Transport(DevAuth("m1"))._probe_curl_version() == (8, 5, 0)
+    assert calls[0][1]["creationflags"] == transport_mod._CREATE_NO_WINDOW
+
+
+@pytest.mark.parametrize("input_bytes", [None, b"multipart part"])
+def test_windows_single_transfer_curl_uses_no_window(monkeypatch, input_bytes):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        stdout = b"{}\n200" if "input" in kwargs else "{}\n200"
+        return types.SimpleNamespace(stdout=stdout, returncode=0)
+
+    monkeypatch.setattr(transport_mod.sys, "platform", "win32")
+    monkeypatch.setattr(transport_mod.subprocess, "run", fake_run)
+    transport = Transport(DevAuth("m1"))
+    transport._curl_version_ok = True
+    assert transport._run(["-sS", "https://example.test"], input_bytes)[1] == 200
+    assert calls[0][1]["creationflags"] == transport_mod._CREATE_NO_WINDOW
+
+
+def test_windows_parallel_upload_curl_uses_no_window(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return types.SimpleNamespace(stdout="https://example.test/file 200\n", returncode=0)
+
+    monkeypatch.setattr(transport_mod.sys, "platform", "win32")
+    monkeypatch.setattr(transport_mod.subprocess, "run", fake_run)
+    body = tmp_path / "body"
+    body.write_bytes(b"payload")
+    upload = Upload("https://example.test/file", str(body), {})
+    assert Transport(DevAuth("m1"))._upload_config([upload]) == {
+        "https://example.test/file": 200,
+    }
+    assert calls[0][1]["creationflags"] == transport_mod._CREATE_NO_WINDOW
+
+
+def test_non_windows_curl_omits_creation_flags(monkeypatch):
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return types.SimpleNamespace(stdout="curl 8.5.0 Linux\n", returncode=0)
+
+    monkeypatch.setattr(transport_mod.sys, "platform", "linux")
+    monkeypatch.setattr(transport_mod.subprocess, "run", fake_run)
+    assert Transport(DevAuth("m1"))._probe_curl_version() == (8, 5, 0)
+    assert "creationflags" not in calls[0][1]
 
 
 def test_curl_config_quote_roundtrips_backslashes_and_quotes():

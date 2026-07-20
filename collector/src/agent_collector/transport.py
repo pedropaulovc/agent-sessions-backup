@@ -19,6 +19,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -92,6 +93,14 @@ RETRY_STATUSES = frozenset({408, 429})
 # silently return status 0 for every request, so we probe the version and fail loudly.
 MIN_CURL_VERSION = (7, 76, 0)
 _CURL_FLAG_REQUIRING_MIN = "--fail-with-body"
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+
+def _run_curl(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """Run curl without allocating a child console from a pythonw scheduled task."""
+    if sys.platform.startswith("win"):
+        kwargs["creationflags"] = _CREATE_NO_WINDOW
+    return subprocess.run(argv, **kwargs)
 
 
 def _parse_curl_version(version_output: str) -> tuple[int, int, int] | None:
@@ -209,8 +218,8 @@ class Transport:
     def _probe_curl_version(self) -> tuple[int, int, int] | None:
         """Run `curl --version` and parse it. Seam for tests to monkeypatch."""
         try:
-            proc = subprocess.run([self.curl, "--version"], capture_output=True, text=True,
-                                  timeout=CONNECT_TIMEOUT)
+            proc = _run_curl([self.curl, "--version"], capture_output=True, text=True,
+                             timeout=CONNECT_TIMEOUT)
         except (OSError, subprocess.SubprocessError):
             return None
         first = proc.stdout.splitlines()[0] if proc.stdout else ""
@@ -255,13 +264,13 @@ class Transport:
         # _split_status works the same as the text-mode path.
         try:
             if input_bytes is None:
-                proc = subprocess.run(
+                proc = _run_curl(
                     [self.curl, *argv], capture_output=True, text=True,
                     timeout=MAX_TIME + SUBPROCESS_MARGIN,
                 )
                 stdout = proc.stdout
             else:
-                proc = subprocess.run(
+                proc = _run_curl(
                     [self.curl, *argv], capture_output=True, input=input_bytes,
                     timeout=MAX_TIME + SUBPROCESS_MARGIN,
                 )
@@ -385,7 +394,7 @@ class Transport:
         waves = -(-len(chunk) // max(self.parallel_max, 1))
         batch_timeout = waves * MAX_TIME + SUBPROCESS_MARGIN
         try:
-            proc = subprocess.run(
+            proc = _run_curl(
                 [self.curl, "-sS", "--parallel", "--parallel-max",
                  str(self.parallel_max), "--config", cfg_path],
                 capture_output=True, text=True, timeout=batch_timeout,
