@@ -39,6 +39,11 @@ export async function parseClaudeCode(
 
   for await (const line of lines) {
     session.stats.lines++;
+    if (line.kind === 'oversized') {
+      session.stats.skippedLineTypes['oversized-line'] =
+        (session.stats.skippedLineTypes['oversized-line'] ?? 0) + 1;
+      continue;
+    }
     if (line.text.trim() === '') continue;
     let o: Record<string, unknown>;
     try {

@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { readJsonlLines } from '../src/ingest/jsonl';
+import { MAX_JSONL_LINE_BYTES, readJsonlLines, type JsonlLine } from '../src/ingest/jsonl';
 import { parseClaudeCode } from '../src/ingest/parsers/claude-code';
 import { parseCodex } from '../src/ingest/parsers/codex';
+import { parsePromptLog } from '../src/ingest/parsers/history';
 import {
   CC_SESSION_ID,
   CODEX_SESSION_ID,
@@ -19,11 +20,13 @@ describe('readJsonlLines', () => {
     const lines = ['{"a":1}', '{"b":"ü"}', '{"c":3}'];
     const encoder = new TextEncoder();
     const raw = encoder.encode(lines.join('\n') + '\n');
-    const out: Array<{ text: string; byteStart: number; byteLen: number }> = [];
+    const out: JsonlLine[] = [];
     for await (const l of readJsonlLines(toStream(lines))) out.push(l);
-    expect(out.map((l) => l.text)).toEqual(lines);
+    expect(out.map((l) => (l.kind === 'decoded' ? l.text : undefined))).toEqual(lines);
     // Re-slicing the original buffer at reported offsets must reproduce each line.
     for (const l of out) {
+      expect(l.kind).toBe('decoded');
+      if (l.kind !== 'decoded') throw new Error('expected decoded line');
       const slice = raw.subarray(l.byteStart, l.byteStart + l.byteLen);
       expect(new TextDecoder().decode(slice)).toBe(l.text + '\n');
     }
@@ -43,8 +46,123 @@ describe('readJsonlLines', () => {
     const out = [];
     for await (const l of readJsonlLines(stream)) out.push(l);
     expect(out).toHaveLength(2);
+    expect(out[1]!.kind).toBe('decoded');
+    if (out[1]!.kind !== 'decoded') throw new Error('expected decoded line');
     expect(out[1]!.text.length).toBe(big.length);
     expect(out[1]!.byteStart).toBe(8);
+  });
+
+  it('accepts exactly 2 MiB of content and skips 2 MiB + 1 with exact source spans', async () => {
+    const accepted = 'a'.repeat(MAX_JSONL_LINE_BYTES);
+    const oversized = 'b'.repeat(MAX_JSONL_LINE_BYTES + 1);
+    const tail = '{"tail":true}';
+    const body = new TextEncoder().encode(`${accepted}\n${oversized}\n${tail}`);
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let offset = 0; offset < body.length; offset += 65536) {
+          controller.enqueue(body.subarray(offset, Math.min(offset + 65536, body.length)));
+        }
+        controller.close();
+      },
+    });
+
+    const out: JsonlLine[] = [];
+    for await (const line of readJsonlLines(stream)) out.push(line);
+
+    expect(out).toHaveLength(3);
+    const first = out[0]!;
+    expect(first).toMatchObject({ kind: 'decoded', byteStart: 0, byteLen: MAX_JSONL_LINE_BYTES + 1 });
+    expect(first.kind === 'decoded' ? first.text.length : -1).toBe(MAX_JSONL_LINE_BYTES);
+    expect(out[1]).toEqual({
+      kind: 'oversized',
+      byteStart: MAX_JSONL_LINE_BYTES + 1,
+      byteLen: MAX_JSONL_LINE_BYTES + 2,
+    });
+    expect(out[2]).toEqual({
+      kind: 'decoded',
+      text: tail,
+      byteStart: 2 * MAX_JSONL_LINE_BYTES + 3,
+      byteLen: tail.length,
+    });
+    expect(out.reduce((sum, line) => sum + line.byteLen, 0)).toBe(body.length);
+
+    const finalBody = new TextEncoder().encode(oversized);
+    const finalStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let offset = 0; offset < finalBody.length; offset += 65536) {
+          controller.enqueue(finalBody.subarray(offset, Math.min(offset + 65536, finalBody.length)));
+        }
+        controller.close();
+      },
+    });
+    const finalOut: JsonlLine[] = [];
+    for await (const line of readJsonlLines(finalStream)) finalOut.push(line);
+    expect(finalOut).toEqual([{ kind: 'oversized', byteStart: 0, byteLen: MAX_JSONL_LINE_BYTES + 1 }]);
+  });
+
+  it('discards a very large multi-chunk line and resumes at the next record', async () => {
+    const chunk = new Uint8Array(64 * 1024).fill(0x78);
+    const chunkCount = 512;
+    const tail = new TextEncoder().encode('\n{"after":true}\n');
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (let i = 0; i < chunkCount; i++) controller.enqueue(chunk);
+        controller.enqueue(tail);
+        controller.close();
+      },
+    });
+
+    const out: JsonlLine[] = [];
+    for await (const line of readJsonlLines(stream)) out.push(line);
+
+    const oversizedBytes = chunk.length * chunkCount;
+    expect(out).toEqual([
+      { kind: 'oversized', byteStart: 0, byteLen: oversizedBytes + 1 },
+      { kind: 'decoded', text: '{"after":true}', byteStart: oversizedBytes + 1, byteLen: 15 },
+    ]);
+  });
+
+  it('accounts for oversized records as skipped, not malformed, and continues every JSONL parser', async () => {
+    const oversized: JsonlLine = {
+      kind: 'oversized',
+      byteStart: 0,
+      byteLen: MAX_JSONL_LINE_BYTES + 2,
+    };
+    const lines = async function* (text: string): AsyncGenerator<JsonlLine> {
+      yield oversized;
+      yield {
+        kind: 'decoded',
+        text,
+        byteStart: oversized.byteLen,
+        byteLen: new TextEncoder().encode(text).length + 1,
+      };
+    };
+
+    const [claude, codex, history] = await Promise.all([
+      parseClaudeCode(lines(ccUserLine({ uuid: 'u-after', text: 'after oversized' })), CC_SESSION_ID),
+      parseCodex(
+        lines(JSON.stringify({
+          timestamp: '2026-07-20T00:00:00.000Z',
+          type: 'session_meta',
+          payload: { cwd: '/after/oversized' },
+        })),
+        CODEX_SESSION_ID,
+      ),
+      parsePromptLog(
+        lines(JSON.stringify({ display: 'after oversized', timestamp: 1_700_000_000_000 })),
+        'promptlog:testbox:claude',
+      ),
+    ]);
+    for (const session of [claude, codex, history]) {
+      expect(session.stats).toMatchObject({
+        lines: 2,
+        parseErrorLines: 0,
+        skippedLineTypes: { 'oversized-line': 1 },
+      });
+    }
+    expect(claude.turns[0]!.blocks[0]!.text).toBe('after oversized');
+    expect(codex.cwd).toBe('/after/oversized');
+    expect(history.turns[0]!.blocks[0]!.text).toBe('after oversized');
   });
 });
 

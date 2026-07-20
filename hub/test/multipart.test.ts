@@ -133,16 +133,22 @@ async function drainQueue(): Promise<void> {
   await worker.queue({ queue: 'parse', messages } as any, testEnv);
 }
 
-/** A valid Claude Code session padded past `minBytes` with one big assistant text line (the parser
- * handles >1MB lines), so the object needs multiple >=5MiB parts yet still parses to a real session. */
+/** A valid Claude Code session padded past `minBytes` with sub-2MiB records, so the object needs
+ * multiple >=5MiB parts while every individual JSONL record remains indexable. */
 function bigSession(sessionId: string, marker: string, minBytes: number): string {
-  const pad = 'y'.repeat(minBytes);
-  return (
-    [
-      ccUserLine({ uuid: 'u1', text: `${marker} question` }),
-      ccAssistantLine({ uuid: 'a1', parentUuid: 'u1', text: `${marker} answer ${pad}` }),
-    ].join('\n') + '\n'
-  );
+  const lines = [ccUserLine({ uuid: 'u1', text: `${marker} question` })];
+  let parentUuid = 'u1';
+  let remaining = minBytes;
+  let index = 1;
+  while (remaining > 0) {
+    const uuid = `a${index}`;
+    const padBytes = Math.min(remaining, MIB);
+    lines.push(ccAssistantLine({ uuid, parentUuid, text: `${marker} answer ${'y'.repeat(padBytes)}` }));
+    parentUuid = uuid;
+    remaining -= padBytes;
+    index++;
+  }
+  return `${lines.join('\n')}\n`;
 }
 
 const CC_SID = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
