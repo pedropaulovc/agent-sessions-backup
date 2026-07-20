@@ -233,6 +233,27 @@ describe('watchdog', () => {
     expect(events.some((e) => e.event === 'hub.watchdog.warn' && e.tag === 'd1-size-unavailable')).toBe(true);
   });
 
+  it('preserves orphaned session counts when the machine roster is empty', async () => {
+    const testEnv = env as unknown as Env;
+    await testEnv.DB.prepare(
+      "INSERT INTO sessions (session_id, harness, machine_id, index_state) VALUES ('orphan-error', 'codex', 'missing-machine', 'error')",
+    ).run();
+
+    const events = captureLogs();
+    await runWatchdog(testEnv);
+    await testEnv.DB.prepare("DELETE FROM sessions WHERE session_id = 'orphan-error'").run();
+
+    expect(events.some((event) => event.event === 'hub.machine.health')).toBe(false);
+    expect(events.find((event) => event.event === 'hub.fleet.health')).toMatchObject({
+      machine_count: 0,
+      files_total: 0,
+      sessions_ready: 0,
+      sessions_parsing: 0,
+      sessions_error: 1,
+      sessions_total: 1,
+    });
+  });
+
   it('computes exact file-state and session-state counts in D1', async () => {
     const testEnv = env as unknown as Env;
     await testEnv.DB.batch([

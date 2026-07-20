@@ -98,6 +98,16 @@ export async function runWatchdog(env: Env): Promise<void> {
                 COALESCE(f.files_total, 0) AS files_total
          FROM machines m
          LEFT JOIN file_counts f ON f.machine_id = m.machine_id
+       ), fleet_counts AS (
+         SELECT COUNT(*) AS machine_count,
+                COALESCE(SUM(files_pending), 0) AS files_pending,
+                COALESCE(SUM(files_error), 0) AS files_error,
+                COALESCE(SUM(files_parsed), 0) AS files_parsed,
+                COALESCE(SUM(files_skipped), 0) AS files_skipped,
+                COALESCE(SUM(files_superseded), 0) AS files_superseded,
+                COALESCE(SUM(files_complete), 0) AS files_complete,
+                COALESCE(SUM(files_total), 0) AS files_total
+         FROM machine_health
        )
        SELECT 'machine' AS row_kind, machine_id, os, collector_version,
               last_seen_at, last_upload_at, heartbeat_age_seconds, upload_age_seconds,
@@ -108,13 +118,13 @@ export async function runWatchdog(env: Env): Promise<void> {
        FROM machine_health
        UNION ALL
        SELECT 'fleet' AS row_kind, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-              COUNT(*), COALESCE(SUM(files_pending), 0),
-              COALESCE(SUM(files_error), 0), COALESCE(SUM(files_parsed), 0),
-              COALESCE(SUM(files_skipped), 0), COALESCE(SUM(files_superseded), 0),
-              COALESCE(SUM(files_complete), 0), COALESCE(SUM(files_total), 0),
+              f.machine_count, f.files_pending,
+              f.files_error, f.files_parsed,
+              f.files_skipped, f.files_superseded,
+              f.files_complete, f.files_total,
               COALESCE(s.sessions_ready, 0), COALESCE(s.sessions_parsing, 0),
               COALESCE(s.sessions_error, 0), COALESCE(s.sessions_total, 0)
-       FROM machine_health
+       FROM fleet_counts f
        CROSS JOIN session_counts s`,
     ).all<HealthRow>();
 

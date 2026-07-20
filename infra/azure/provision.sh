@@ -519,7 +519,11 @@ echo "=== Azure Workbook (system health) ==="
 # makes this PUT idempotent and lets every re-run converge edits to the existing
 # workbook rather than creating another gallery entry.
 #
-# Every KQL item is scoped through sourceId to law-agent-backup. The queries use
+# Every KQL item is scoped through sourceId and fallbackResourceIds to
+# law-agent-backup. `sourceId` associates the ARM resource, while the fallback
+# resource makes the queries resolve when the workbook is opened from the
+# Azure Monitor Workbooks gallery instead of directly from the workspace blade.
+# The queries use
 # `union isfuzzy=true` empty-datatable guards around OTelLogs, OTelSpans, and
 # AppAvailabilityResults so a table that has not received its first record yet
 # renders as empty/no-data instead of breaking the entire workbook.
@@ -541,7 +545,7 @@ jq -n \
       tags: {($hiddenLink): "Resource"},
       properties: {
         displayName: $displayName,
-        serializedData: ($workbook[0] | tojson),
+        serializedData: ($workbook[0] | .fallbackResourceIds = [$sourceId] | tojson),
         version: "Notebook/1.0",
         sourceId: $sourceId,
         category: "workbook"
