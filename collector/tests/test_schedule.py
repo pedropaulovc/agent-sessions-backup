@@ -1,5 +1,4 @@
 import re
-import sys
 import types
 
 from agent_collector import schedule
@@ -16,36 +15,35 @@ def _parse_action(script: str):
     return m.group(1), m.group(2)
 
 
-def test_console_script_execute_and_argument_split(monkeypatch):
-    monkeypatch.setattr(taskscheduler.shutil, "which", lambda _n: "C:/tools/agent-collector.exe")
+def test_task_executes_sibling_pythonw_with_module_arguments(monkeypatch):
+    monkeypatch.setattr(taskscheduler.sys, "executable", "C:/tools/venv/Scripts/python.exe")
     script = taskscheduler._install_script(15)
     execute, argument = _parse_action(script)
-    assert execute == "C:/tools/agent-collector.exe"
-    assert argument == "run --once"
+    assert execute == "C:/tools/venv/Scripts/pythonw.exe"
+    assert argument == "-m agent_collector.cli run --once"
     # arguments must NOT be folded into -Execute
-    assert "run --once" not in execute
+    assert "agent_collector.cli" not in execute
+    assert "agent-collector.exe" not in script
 
 
 def test_apostrophe_in_path_doubled_in_ps_literal(monkeypatch):
-    monkeypatch.setattr(taskscheduler.shutil, "which",
-                        lambda _n: r"C:\Users\O'Neil\agent-collector.exe")
+    monkeypatch.setattr(taskscheduler.sys, "executable", "C:/Users/O'Neil/venv/python.exe")
     script = taskscheduler._install_script(15)
-    # single-quoted PS literal: an apostrophe must be doubled ('') or the string terminates early
-    assert r"C:\Users\O''Neil\agent-collector.exe" in script
-    assert r"C:\Users\O'Neil\agent-collector.exe" not in script  # un-doubled form must be gone
+    assert "C:/Users/O''Neil/venv/pythonw.exe" in script
+    assert "C:/Users/O'Neil/venv/pythonw.exe" not in script
 
 
-def test_module_fallback_execute_is_python_only(monkeypatch):
-    monkeypatch.setattr(taskscheduler.shutil, "which", lambda _n: None)
-    script = taskscheduler._install_script(15)
-    execute, argument = _parse_action(script)
-    assert execute == sys.executable
-    assert "agent_collector.cli" not in execute      # module lives in -Argument
-    assert argument == "-m agent_collector.cli run --once"
+def test_windows_install_fails_before_registration_when_pythonw_is_missing(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(taskscheduler.config_mod, "config_dir", lambda: tmp_path)
+    monkeypatch.setattr(taskscheduler.config_mod, "detect_platform_tag", lambda: "windows")
+    monkeypatch.setattr(taskscheduler, "_pythonw_path", lambda: tmp_path / "pythonw.exe")
+    assert taskscheduler.install(15) == 1
+    assert "pythonw.exe not found" in capsys.readouterr().err
+    assert not (tmp_path / "agent-collector-task.ps1").exists()
 
 
 def test_randomdelay_on_trigger_not_settings(monkeypatch):
-    monkeypatch.setattr(taskscheduler.shutil, "which", lambda _n: "agent-collector")
+    monkeypatch.setattr(taskscheduler.sys, "executable", "C:/tools/venv/Scripts/python.exe")
     script = taskscheduler._install_script(15)
     trigger = next(l for l in script.splitlines() if "New-ScheduledTaskTrigger" in l)
     settings = next(l for l in script.splitlines() if "New-ScheduledTaskSettingsSet" in l)

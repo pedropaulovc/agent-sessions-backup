@@ -27,16 +27,18 @@ def _ps_quote(value: str) -> str:
     return value.replace("'", "''")
 
 
-def _action_parts() -> tuple[str, str]:
-    """(-Execute, -Argument): the executable path only, then its arguments separately.
+def _pythonw_path() -> Path:
+    return Path(sys.executable).with_name("pythonw.exe")
 
-    Never fold arguments into -Execute — Task Scheduler treats -Execute as a single
-    program path. Paths with spaces are safe inside the single-quoted PS literal.
+
+def _action_parts() -> tuple[str, str]:
+    """(-Execute, -Argument): the GUI Python interpreter, then module arguments.
+
+    The console-script launcher and python.exe use Windows' CUI subsystem, so Task
+    Scheduler gives them a visible console for an interactively logged-on user.
+    pythonw.exe runs the same module without allocating a console window.
     """
-    exe = shutil.which("agent-collector")
-    if exe:
-        return exe, "run --once"
-    return sys.executable, "-m agent_collector.cli run --once"
+    return str(_pythonw_path()), "-m agent_collector.cli run --once"
 
 
 def _install_script(interval: int) -> str:
@@ -81,6 +83,12 @@ def _write_and_maybe_run(script: str, verb: str) -> int:
 
 
 def install(interval: int = 15) -> int:
+    if config_mod.detect_platform_tag() == "windows" and not _pythonw_path().is_file():
+        print(
+            f"[FAIL] pythonw.exe not found next to the active interpreter: {_pythonw_path()}",
+            file=sys.stderr,
+        )
+        return 1
     return _write_and_maybe_run(_install_script(interval), "install")
 
 
