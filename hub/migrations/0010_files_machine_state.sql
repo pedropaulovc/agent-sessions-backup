@@ -5,7 +5,7 @@
 -- 1,063 ms SQL duration for a single read-only snapshot.
 --
 -- Keeping both columns in the index makes that aggregation a covering-index
--- scan. It also serves /api/v1/status and /machines, which compute the same
--- per-machine state counts.
+-- scan. It also serves /api/v1/status and the viewer's /machines page, which
+-- compute the same per-machine state counts.
 CREATE INDEX IF NOT EXISTS idx_files_machine_state
   ON files(machine_id, parse_state);
