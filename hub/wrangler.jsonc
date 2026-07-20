@@ -5,11 +5,10 @@
   "compatibility_date": "2026-07-01",
   "compatibility_flags": ["nodejs_compat"],
   "limits": { "cpu_ms": 300000 },
-  // Workers Builds publishes Git branch versions under the connected top-level
-  // sessions-hub service, even when the build selects env.preview bindings. Preview
-  // URLs are a service-level setting, so this must be top-level for branch aliases to
-  // receive *.workers.dev version URLs (version 209 proved env.preview alone leaves
-  // has_preview=false).
+  // Keep version preview URLs enabled for both production and named environments.
+  // The preview environment has an explicit Worker name below so Workers Builds does
+  // not upload PR code into this production service (which implements a Durable Object
+  // and therefore cannot receive preview URLs).
   "preview_urls": true,
   // Routes activated in M3. Implemented as Workers Custom Domains (not zone
   // `routes` with `zone_name`) because the deploy credential is an OAuth token
@@ -90,15 +89,16 @@
   // resource set — wrangler does NOT inherit bindings into named environments, so each
   // must be restated — and pins ENVIRONMENT='preview', which turns on the DEV_AUTH
   // bearer gate (src/auth/identity.ts) so the public *.workers.dev preview URL is not
-  // unauthenticated. In automatic Git builds these isolated bindings are applied to a
-  // version of the connected sessions-hub service; top-level preview_urls above enables
-  // its branch aliases. No routes/custom domains: previews serve from workers.dev, where
-  // zone mTLS/WAF don't apply (hence the bearer gate).
-  // Automatic Git-build versions inherit DEV_AUTH from the connected sessions-hub service.
-  // Manual `--env preview` uploads target sessions-hub-preview and use that worker's copy;
-  // keep both secrets in sync.
+  // unauthenticated. Automatic Git builds and manual `--env preview` uploads both target
+  // the separate sessions-hub-preview Worker. It has never implemented the production
+  // Durable Object, so Cloudflare can create branch/version URLs for it. No routes/custom
+  // domains: previews serve from workers.dev, where zone mTLS/WAF do not apply.
   "env": {
     "preview": {
+      // Workers Builds is connected to sessions-hub and otherwise keeps that service as
+      // the upload target even with `--env preview`. Select the DO-free preview service
+      // explicitly so Cloudflare can generate a preview URL.
+      "name": "sessions-hub-preview",
       // Automatic PR versions must not export the production Durable Object handler:
       // Cloudflare suppresses preview URLs for any Worker that implements one.
       "main": "src/preview.ts",

@@ -4,6 +4,7 @@ import * as previewEntrypoint from '../src/preview';
 import * as productionEntrypoint from '../src/index';
 
 interface WranglerConfig {
+  name?: string;
   exports?: Record<string, unknown>;
   env?: Record<string, WranglerConfig & { main?: string }>;
 }
@@ -22,6 +23,8 @@ describe('preview entrypoint', () => {
     const effectiveExports = preview && Object.hasOwn(preview, 'exports') ? preview.exports : wrangler.exports;
 
     expect(wrangler.exports).toHaveProperty('CloudflareOAuthBroker');
+    expect(wrangler.name).toBe('sessions-hub');
+    expect(preview?.name).toBe('sessions-hub-preview');
     expect(preview?.main).toBe('src/preview.ts');
     expect(effectiveExports).toEqual({});
   });
