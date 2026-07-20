@@ -3,7 +3,7 @@
 #
 # Provisions Azure observability resources for agent-sessions-backup (idempotent
 # — every resource is show-or-create, safe to re-run). Requires: az CLI with an
-# active login session (`az login`). The application-insights,
+# active login session (`az login`) and jq. The application-insights,
 # monitor-control-service, and scheduled-query CLI extensions are installed
 # automatically by this script if missing (see "Azure CLI Extensions" below) —
 # no manual `az extension add` needed first.
@@ -59,6 +59,8 @@ FED_CRED_NAME="cf-worker-federation"
 FED_SUBJECT="cf-worker:sessions-telemetry-gateway"
 AG_NAME="ag-pedro-email"
 WEBTEST_NAME="agent-backup-healthz"
+WORKBOOK_NAME="03c0208e-6d39-4a92-8502-b0c4a983d7e1"
+WORKBOOK_DISPLAY_NAME="Agent sessions backup - System health"
 # sessions.vza.net/healthz only resolves once the M3 zone routes in
 # hub/wrangler.jsonc are uncommented and deployed (currently commented out —
 # see that file). If you're running this script before M3, override with a
@@ -82,6 +84,11 @@ for ext in application-insights monitor-control-service scheduled-query; do
         || az extension add -n "$ext" --only-show-errors -y >/dev/null
 done
 echo "OK: application-insights, monitor-control-service, scheduled-query"
+
+if ! command -v jq >/dev/null 2>&1; then
+    echo "ERROR: jq is required to validate and package the source-controlled Azure Workbook." >&2
+    exit 1
+fi
 
 echo ""
 echo "=== Resource Group ==="
@@ -504,6 +511,48 @@ if ! az monitor metrics alert show --name "$AVAIL_ALERT_NAME" --resource-group "
 fi
 echo "OK: $AVAIL_ALERT_NAME"
 
+echo ""
+echo "=== Azure Workbook (system health) ==="
+# Workbooks are ARM resources. Keep the Notebook/1.0 payload in source control
+# instead of embedding an escaped JSON string in this shell script; jq validates
+# it and serializes it into the ARM `serializedData` property. The stable GUID
+# makes this PUT idempotent and lets every re-run converge edits to the existing
+# workbook rather than creating another gallery entry.
+#
+# Every KQL item is scoped through sourceId to law-agent-backup. The queries use
+# `union isfuzzy=true` empty-datatable guards around OTelLogs, OTelSpans, and
+# AppAvailabilityResults so a table that has not received its first record yet
+# renders as empty/no-data instead of breaking the entire workbook.
+WORKBOOK_DEFINITION="$REPO_ROOT/infra/azure/workbooks/system-health.workbook.json"
+WORKBOOK_ID="/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Insights/workbooks/$WORKBOOK_NAME"
+WORKBOOK_URL="https://management.azure.com${WORKBOOK_ID}?api-version=2023-06-01"
+WORKBOOK_BODY_FILE=$(mktemp "${TMPDIR:-/tmp}/agent-backup-workbook.XXXXXX")
+trap 'rm -f "$WORKBOOK_BODY_FILE"' EXIT
+jq -e . "$WORKBOOK_DEFINITION" >/dev/null
+jq -n \
+    --arg location "$LOCATION" \
+    --arg displayName "$WORKBOOK_DISPLAY_NAME" \
+    --arg sourceId "$LAW_ID" \
+    --arg hiddenLink "hidden-link:$LAW_ID" \
+    --slurpfile workbook "$WORKBOOK_DEFINITION" \
+    '{
+      location: $location,
+      kind: "shared",
+      tags: {($hiddenLink): "Resource"},
+      properties: {
+        displayName: $displayName,
+        serializedData: ($workbook[0] | tojson),
+        version: "Notebook/1.0",
+        sourceId: $sourceId,
+        category: "workbook"
+      }
+    }' > "$WORKBOOK_BODY_FILE"
+
+az rest --method put --url "$WORKBOOK_URL" --body "@$WORKBOOK_BODY_FILE" --only-show-errors >/dev/null
+rm -f "$WORKBOOK_BODY_FILE"
+trap - EXIT
+echo "OK: $WORKBOOK_DISPLAY_NAME ($WORKBOOK_ID)"
+
 TENANT_ID=$(az account show --query tenantId -o tsv)
 
 echo ""
@@ -511,6 +560,7 @@ echo "=== Outputs ==="
 echo "Tenant ID:              $TENANT_ID"
 echo "Managed Identity ID:    $MI_CLIENT_ID"
 echo "DCR resource ID:        $DCR_ID"
+echo "System health workbook: $WORKBOOK_ID"
 echo "OTLP logs endpoint:     $OTLP_LOGS_ENDPOINT"
 echo "OTLP traces endpoint:   $OTLP_TRACES_ENDPOINT"
 echo "OIDC issuer URL:        $ISSUER_URL"

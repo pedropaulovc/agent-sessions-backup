@@ -47,8 +47,13 @@ consistently; don't mix the two conventions in the same session.
 4. Run `./infra/azure/provision.sh <issuer-url>` (the issuer URL from step 3).
    This creates the resource group, workspace-based Application Insights, the
    DCE/DCR with native OTLP ingestion (logs + traces), the user-assigned
-   managed identity + federated credential, the action group, and the
-   KQL-based alerts. Outputs land in `infra/out/azure.env` (gitignored) —
+   managed identity + federated credential, the action group, the KQL-based
+   alerts, and the `Agent sessions backup - System health` Azure Workbook.
+   The workbook is source-controlled at
+   `infra/azure/workbooks/system-health.workbook.json` and is updated
+   idempotently on every provisioning run. It is scoped to
+   `law-agent-backup`, so it needs no connection string, API key, or other
+   Azure secret. Outputs land in `infra/out/azure.env` (gitignored) —
    **this file, not this doc, is the source of truth for the actual values**.
    Safe to re-run: every resource is show-or-create (or, for the federated
    credential specifically, show-or-create-or-update — see the script comment
@@ -166,10 +171,36 @@ consistently; don't mix the two conventions in the same session.
     (export is per-signal — a destinations array with no `enabled: true` next
     to it exports nothing; this matches the comment already in
     `hub/wrangler.jsonc`) and redeploy `sessions-hub`.
-11. Verify: trigger a request against the hub, then query `OTelLogs` /
-    `OTelTraces` (or whatever the actual table names turn out to be — see the
-    ASSUMPTION comments in `infra/azure/alerts/*.kql`) in the Log Analytics
-    workspace for the new data.
+11. Verify: trigger a request against the hub, then query `OTelLogs` and
+    `OTelSpans` in the Log Analytics workspace. Open **Azure Monitor →
+    Workbooks → Agent sessions backup - System health** for the combined
+    operational view. The live native table names were confirmed on
+    2026-07-20: structured log JSON is in `OTelLogs.Body`, spans are in
+    `OTelSpans`, and the web test results are in `AppAvailabilityResults`.
+
+## System health workbook signals
+
+The watchdog emits these fleet gauges as structured OpenTelemetry logs every
+15 minutes. Keeping the data on the existing logs path avoids a second Azure
+Monitor workspace and still provides durable, queryable time series without
+adding credentials:
+
+| Event | Scope | Fields used by the workbook |
+|---|---|---|
+| `hub.machine.health` | One per enrolled machine | OS, collector version, exact last-seen/upload timestamps and ages, pending/error/parsed/skipped/superseded/complete/total file counts |
+| `hub.fleet.health` | One aggregate | Machine count, all file-state totals, ready/parsing/error/total session counts |
+| `hub.watchdog.run` | One liveness beacon | Roster-read health and machine count |
+| `hub.d1.db_size_bytes` | One storage gauge | Current D1 bytes |
+| `parse.done`, `parse.error` | Per parse attempt | Parse throughput, failures, and malformed-line totals |
+| `access.upload`, `access.multipart_create` | Per upload operation | Upload/ingress throughput |
+
+The workbook also queries `OTelSpans` and `AppAvailabilityResults` for request
+volume, failures, latency, ingestion delay, and per-location `/healthz`
+availability. It reports p50, p95, and maximum ingestion delay, plus records
+delayed by more than five or ten minutes. Each KQL query wraps its native table
+with `union isfuzzy=true` and an empty typed datatable. A new workspace shows an
+empty or `No data` panel until the first signal lands; it does not fail just
+because Azure has not created the table yet.
 
 ## What the alerts do (and don't) cover
 

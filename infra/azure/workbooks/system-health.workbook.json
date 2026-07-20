@@ -1,0 +1,198 @@
+{
+  "version": "Notebook/1.0",
+  "items": [
+    {
+      "type": 1,
+      "content": {
+        "json": "# Agent sessions backup — system health\nLive fleet, queue, parsing, ingestion, and availability signals. Health snapshots refresh every 15 minutes; operational charts use the windows shown in each title. `No data` is intentionally visible as a degraded state, not treated as healthy."
+      },
+      "name": "overview"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "title": "At-a-glance status",
+        "query": "let logs = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, Body:string)[]),\n    (OTelLogs | project TimeGenerated, Body);\nlet latest_watchdog = toscalar(logs\n    | where TimeGenerated > ago(2h)\n    | extend body = todynamic(Body)\n    | where body.event == 'hub.watchdog.run'\n    | summarize max(TimeGenerated));\nlet latest_roster_ok = toscalar(logs\n    | where TimeGenerated > ago(2h)\n    | extend body = todynamic(Body)\n    | where body.event == 'hub.watchdog.run'\n    | summarize arg_max(TimeGenerated, body)\n    | project tobool(body.roster_ok));\nlet max_heartbeat_age = toscalar(logs\n    | where TimeGenerated > ago(2h)\n    | extend body = todynamic(Body)\n    | where body.event == 'hub.machine.health'\n    | summarize max(tolong(body.heartbeat_age_seconds)));\nlet latest_fleet = logs\n    | where TimeGenerated > ago(2h)\n    | extend body = todynamic(Body)\n    | where body.event == 'hub.fleet.health'\n    | summarize arg_max(TimeGenerated, body);\nlet pending = toscalar(latest_fleet | project tolong(body.files_pending));\nlet file_errors = toscalar(latest_fleet | project tolong(body.files_error));\nlet session_errors = toscalar(latest_fleet | project tolong(body.sessions_error));\nlet recent_parse_errors = toscalar(logs\n    | where TimeGenerated > ago(1h)\n    | extend body = todynamic(Body)\n    | where body.event == 'parse.error'\n    | summarize count());\nunion\n    (print Metric='Watchdog', Value=iff(isnull(latest_watchdog), 'No data', strcat(datetime_diff('minute', now(), latest_watchdog), ' min ago')), Status=case(isnull(latest_watchdog), 'CRITICAL', latest_watchdog < ago(35m), 'CRITICAL', 'Healthy')),\n    (print Metric='D1 roster', Value=case(isnull(latest_roster_ok), 'No data', latest_roster_ok, 'Readable', 'Unavailable'), Status=case(isnull(latest_roster_ok), 'CRITICAL', latest_roster_ok, 'Healthy', 'CRITICAL')),\n    (print Metric='Oldest heartbeat', Value=iff(isnull(max_heartbeat_age), 'No data', strcat(round(toreal(max_heartbeat_age) / 60.0, 1), ' min')), Status=case(isnull(max_heartbeat_age), 'CRITICAL', max_heartbeat_age > 259200, 'CRITICAL', max_heartbeat_age > 3600, 'Warning', 'Healthy')),\n    (print Metric='Parse queue backlog', Value=iff(isnull(pending), 'No data', tostring(pending)), Status=case(isnull(pending), 'CRITICAL', pending > 0, 'Warning', 'Healthy')),\n    (print Metric='File errors', Value=iff(isnull(file_errors), 'No data', tostring(file_errors)), Status=case(isnull(file_errors), 'CRITICAL', file_errors > 0, 'CRITICAL', 'Healthy')),\n    (print Metric='Session errors', Value=iff(isnull(session_errors), 'No data', tostring(session_errors)), Status=case(isnull(session_errors), 'CRITICAL', session_errors > 0, 'CRITICAL', 'Healthy')),\n    (print Metric='Parse errors (1h)', Value=tostring(recent_parse_errors), Status=iff(recent_parse_errors > 0, 'CRITICAL', 'Healthy'))\n| project Metric, Value, Status",
+        "size": 0,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "at-a-glance-status"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## Fleet and machine state"
+      },
+      "name": "fleet-heading"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "title": "Latest fleet snapshot",
+        "query": "let logs = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, Body:string)[]),\n    (OTelLogs | project TimeGenerated, Body);\nlogs\n| where TimeGenerated > ago(24h)\n| extend body = todynamic(Body)\n| where body.event == 'hub.fleet.health'\n| summarize arg_max(TimeGenerated, body)\n| project Snapshot=TimeGenerated,\n          Machines=tolong(body.machine_count),\n          FilesTotal=tolong(body.files_total),\n          FilesPending=tolong(body.files_pending),\n          FilesComplete=tolong(body.files_complete),\n          FilesParsed=tolong(body.files_parsed),\n          FilesSkipped=tolong(body.files_skipped),\n          FilesSuperseded=tolong(body.files_superseded),\n          FileErrors=tolong(body.files_error),\n          SessionsTotal=tolong(body.sessions_total),\n          SessionsReady=tolong(body.sessions_ready),\n          SessionsParsing=tolong(body.sessions_parsing),\n          SessionErrors=tolong(body.sessions_error)",
+        "size": 0,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "fleet-snapshot"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "title": "Per-machine health (latest snapshot)",
+        "query": "let logs = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, Body:string)[]),\n    (OTelLogs | project TimeGenerated, Body);\nlogs\n| where TimeGenerated > ago(24h)\n| extend body = todynamic(Body)\n| where body.event == 'hub.machine.health'\n| extend machine = tostring(body.machine)\n| summarize arg_max(TimeGenerated, body) by machine\n| extend HeartbeatAgeSeconds=tolong(body.heartbeat_age_seconds), UploadAgeSeconds=tolong(body.upload_age_seconds)\n| extend Health=case(HeartbeatAgeSeconds > 259200 or tolong(body.files_error) > 0, 'CRITICAL', HeartbeatAgeSeconds > 3600 or tolong(body.files_pending) > 0, 'Warning', 'Healthy')\n| project Machine=machine, Health, OS=tostring(body.os), Collector=tostring(body.collector_version), Snapshot=TimeGenerated, LastSeen=todatetime(body.last_seen_at), LastUpload=todatetime(body.last_upload_at), HeartbeatAgeMinutes=round(toreal(HeartbeatAgeSeconds) / 60.0, 1), UploadAgeMinutes=round(toreal(UploadAgeSeconds) / 60.0, 1), FilesPending=tolong(body.files_pending), FileErrors=tolong(body.files_error), FilesComplete=tolong(body.files_complete), FilesTotal=tolong(body.files_total)\n| order by Health asc, FilesPending desc, HeartbeatAgeMinutes desc",
+        "size": 0,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "per-machine-health"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "title": "File parse queue and session backlog (24h, 15-minute snapshots)",
+        "query": "let logs = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, Body:string)[]),\n    (OTelLogs | project TimeGenerated, Body);\nlogs\n| where TimeGenerated > ago(24h)\n| extend body = todynamic(Body)\n| where body.event == 'hub.fleet.health'\n| project TimeGenerated, FilesPending=tolong(body.files_pending), FileErrors=tolong(body.files_error), SessionsParsing=tolong(body.sessions_parsing), SessionErrors=tolong(body.sessions_error)\n| order by TimeGenerated asc",
+        "size": 0,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "backlog-trend"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## Queue and parse processing"
+      },
+      "name": "processing-heading"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "title": "Parse throughput and errors (24h, 15-minute bins)",
+        "query": "let logs = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, Body:string)[]),\n    (OTelLogs | project TimeGenerated, Body);\nlogs\n| where TimeGenerated > ago(24h)\n| extend body = todynamic(Body), Event=tostring(todynamic(Body).event)\n| where Event in ('parse.done', 'parse.error')\n| summarize Completed=countif(Event == 'parse.done'), Errors=countif(Event == 'parse.error'), ParseErrorLines=sumif(tolong(body.parse_error_lines), Event == 'parse.done') by bin(TimeGenerated, 15m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "parse-throughput"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "title": "Upload and multipart activity (24h, 15-minute bins)",
+        "query": "let logs = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, Body:string)[]),\n    (OTelLogs | project TimeGenerated, Body);\nlogs\n| where TimeGenerated > ago(24h)\n| extend Event=tostring(todynamic(Body).event)\n| where Event in ('access.upload', 'access.multipart_create')\n| summarize Uploads=countif(Event == 'access.upload'), MultipartCreates=countif(Event == 'access.multipart_create') by bin(TimeGenerated, 15m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "upload-throughput"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## Telemetry ingestion and availability"
+      },
+      "name": "ingestion-heading"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "title": "Azure ingestion freshness and delay (1h)",
+        "query": "let logs = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, IngestedAt:datetime)[]),\n    (OTelLogs | project TimeGenerated, IngestedAt=ingestion_time());\nlet spans = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, IngestedAt:datetime)[]),\n    (OTelSpans | project TimeGenerated, IngestedAt=ingestion_time());\nunion (logs | extend Signal='Logs'), (spans | extend Signal='Traces')\n| where TimeGenerated > ago(1h)\n| extend DelaySeconds=datetime_diff('millisecond', IngestedAt, TimeGenerated) / 1000.0\n| summarize Records=count(), LatestGenerated=max(TimeGenerated), LatestIngested=max(IngestedAt), FreshnessSeconds=datetime_diff('second', now(), max(IngestedAt)), P50DelaySeconds=round(percentile(DelaySeconds, 50), 1), P95DelaySeconds=round(percentile(DelaySeconds, 95), 1), MaxDelaySeconds=round(max(DelaySeconds), 1), Over5Minutes=countif(DelaySeconds > 300), Over10Minutes=countif(DelaySeconds > 600) by Signal",
+        "size": 0,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "ingestion-health"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "title": "Logs and traces volume (24h, 15-minute bins)",
+        "query": "let logs = union isfuzzy=true\n    (datatable(TimeGenerated:datetime)[]),\n    (OTelLogs | project TimeGenerated);\nlet spans = union isfuzzy=true\n    (datatable(TimeGenerated:datetime)[]),\n    (OTelSpans | project TimeGenerated);\nunion (logs | extend Signal='Logs'), (spans | extend Signal='Traces')\n| where TimeGenerated > ago(24h)\n| summarize Records=count() by Signal, bin(TimeGenerated, 15m)\n| order by TimeGenerated asc",
+        "size": 0,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "telemetry-volume"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "title": "Health endpoint availability (24h)",
+        "query": "let availability = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, Name:string, Location:string, Success:bool, DurationMs:real, Message:string)[]),\n    (AppAvailabilityResults | project TimeGenerated, Name, Location, Success=tobool(Success), DurationMs=toreal(DurationMs), Message);\navailability\n| where TimeGenerated > ago(24h)\n| summarize Checks=count(), Succeeded=countif(Success), Failed=countif(not(Success)), AvailabilityPercent=round(100.0 * countif(Success) / count(), 2), P95DurationMs=round(percentile(DurationMs, 95), 1), Latest=max(TimeGenerated) by Name, Location\n| order by Failed desc, Location asc",
+        "size": 0,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "availability"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "title": "D1 database size (14d)",
+        "query": "let logs = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, Body:string)[]),\n    (OTelLogs | project TimeGenerated, Body);\nlogs\n| where TimeGenerated > ago(14d)\n| extend body = todynamic(Body)\n| where body.event == 'hub.d1.db_size_bytes'\n| extend SizeGiB=round(toreal(body.bytes) / 1073741824.0, 3)\n| project TimeGenerated, SizeGiB\n| order by TimeGenerated asc",
+        "size": 0,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "timechart"
+      },
+      "name": "d1-size"
+    },
+    {
+      "type": 1,
+      "content": {
+        "json": "## Request performance and troubleshooting"
+      },
+      "name": "troubleshooting-heading"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "title": "HTTP request health by operation (1h)",
+        "query": "let spans = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, Kind:string, Name:string, EnrichedName:string, Success:bool, DurationMs:real, ResultCode:string, ItemCount:long)[]),\n    (OTelSpans | project TimeGenerated, Kind, Name, EnrichedName, Success=tobool(Success), DurationMs=toreal(DurationMs), ResultCode, ItemCount=tolong(ItemCount));\nspans\n| where TimeGenerated > ago(1h) and Kind == 'Server'\n| extend Operation=iff(isempty(EnrichedName), Name, EnrichedName), Weight=coalesce(ItemCount, 1)\n| summarize Requests=sum(Weight), Failures=sumif(Weight, not(Success)), P50DurationMs=round(percentile(DurationMs, 50), 1), P95DurationMs=round(percentile(DurationMs, 95), 1), MaxDurationMs=round(max(DurationMs), 1), Latest=max(TimeGenerated) by Operation\n| top 25 by Requests desc",
+        "size": 0,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "http-health"
+    },
+    {
+      "type": 3,
+      "content": {
+        "version": "KqlItem/1.0",
+        "title": "Recent structured errors and warnings (24h)",
+        "query": "let logs = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, Body:string, SeverityText:string)[]),\n    (OTelLogs | project TimeGenerated, Body, SeverityText);\nlogs\n| where TimeGenerated > ago(24h)\n| extend body=todynamic(Body), Event=tostring(todynamic(Body).event)\n| extend Payload=todynamic(body.payload)\n| extend Level=coalesce(tostring(Payload.level), tostring(body.level), SeverityText), Code=coalesce(tostring(Payload.code), tostring(body.code)), Message=coalesce(tostring(Payload.message), tostring(body.error), tostring(body.message))\n| where Level in~ ('error', 'fatal', 'warn', 'warning') or Event endswith '.error' or Event endswith '.warn' or Event contains 'failed'\n| project TimeGenerated, Severity=Level, Event, Machine=tostring(body.machine), Code, Tag=tostring(body.tag), Error=Message, Details=Body\n| top 100 by TimeGenerated desc",
+        "size": 0,
+        "queryType": 0,
+        "resourceType": "microsoft.operationalinsights/workspaces",
+        "visualization": "table"
+      },
+      "name": "recent-errors"
+    }
+  ],
+  "isLocked": false,
+  "fallbackResourceIds": []
+}
