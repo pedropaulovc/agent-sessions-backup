@@ -302,5 +302,22 @@ describe('watchdog', () => {
       sessions_error: 1,
       sessions_total: 3,
     });
+
+    const plan = await testEnv.DB.prepare(
+      `EXPLAIN QUERY PLAN
+       SELECT machine_id,
+              SUM(CASE WHEN parse_state IN ('pending', 'reserved') THEN 1 ELSE 0 END) AS files_pending,
+              SUM(CASE WHEN parse_state = 'error' THEN 1 ELSE 0 END) AS files_error,
+              SUM(CASE WHEN parse_state = 'parsed' THEN 1 ELSE 0 END) AS files_parsed,
+              SUM(CASE WHEN parse_state = 'skipped' THEN 1 ELSE 0 END) AS files_skipped,
+              SUM(CASE WHEN parse_state = 'superseded' THEN 1 ELSE 0 END) AS files_superseded,
+              SUM(CASE WHEN parse_state IN ('parsed', 'skipped', 'superseded') THEN 1 ELSE 0 END) AS files_complete,
+              COUNT(*) AS files_total
+       FROM files
+       GROUP BY machine_id`,
+    ).all<{ detail: string }>();
+    expect(plan.results.map((row) => row.detail).join('\n')).toContain(
+      'SCAN files USING COVERING INDEX idx_files_machine_state',
+    );
   });
 });
