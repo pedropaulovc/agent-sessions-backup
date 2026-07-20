@@ -76,6 +76,11 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   if (p.get('cwd')) addFilter('s.cwd = ?', p.get('cwd'));
   if (p.get('from')) addFilter('s.started_at >= ?', p.get('from'));
   if (p.get('to')) addFilter('s.started_at <= ?', normalizeToBound(p.get('to')!));
+  const sessionDate = p.get('session_date');
+  if (sessionDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionDate)) {
+    addFilter('s.started_at >= ?', sessionDate);
+    addFilter("s.started_at < date(?, '+1 day')", sessionDate);
+  }
   sessionTimeFilter(p.get('session_time'), addFilter);
   const where = filters.length ? `AND ${filters.join(' AND ')}` : '';
   const order = searchOrder(p.get('sort'));
@@ -198,6 +203,15 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
         .all<{ v: string; n: number }>();
       facets[col] = Object.fromEntries(fr.results.map((r) => [r.v, r.n]));
     }
+    const dateFacets = await env.DB.prepare(
+      `SELECT substr(s.started_at, 1, 10) AS v, COUNT(DISTINCT s.session_id) AS n
+       FROM blocks_fts JOIN blocks b ON b.id = blocks_fts.rowid JOIN sessions s ON s.session_id = b.session_id
+       WHERE blocks_fts MATCH ?1 ${where} AND s.started_at IS NOT NULL
+       GROUP BY v ORDER BY v DESC LIMIT 20`,
+    )
+      .bind(effectiveMatch, ...binds)
+      .all<{ v: string; n: number }>();
+    facets.session_date = Object.fromEntries(dateFacets.results.map((r) => [r.v, r.n]));
     const timeFacets: Record<string, number> = {};
     for (const [key, , min, max] of SESSION_TIME_FACETS) {
       const upper = max === null ? '' : ` AND ${SESSION_TIME_SQL} < ?${binds.length + 3}`;
@@ -211,6 +225,7 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
     facets.session_time = timeFacets;
   } else if (wantFacets) {
     for (const col of FACET_COLUMNS) facets[col] = {};
+    facets.session_date = {};
     facets.session_time = {};
   }
 

@@ -785,6 +785,26 @@ describe('viewer result pagination and facet layout', () => {
     expect(shortOnly).not.toContain('Long session');
   });
 
+  it('facets calendar session dates and filters both recent and full-text results to the selected day', async () => {
+    const recent = await (await SELF.fetch(
+      `https://sessions.vza.net/?harness=${PAGINATION_HARNESS}`,
+    )).text();
+    expect(recent).toContain('>Session date/time</h3>');
+    expect(recent).toContain(`href="/?harness=${PAGINATION_HARNESS}&amp;session_date=2026-07-25"`);
+
+    const recentDay = await (await SELF.fetch(
+      `https://sessions.vza.net/?harness=${PAGINATION_HARNESS}&session_date=2026-07-25`,
+    )).text();
+    expect(recentDay).toContain('Pagination item 24');
+    expect(recentDay).not.toContain('Pagination item 23');
+
+    const searchDay = await (await SELF.fetch(
+      `https://sessions.vza.net/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&session_date=2026-07-25`,
+    )).text();
+    expect(searchDay).toContain('Pagination item 24');
+    expect(searchDay).not.toContain('Pagination item 23');
+  });
+
   it('keeps the recent-session boundary stable when a newer session is ingested between pages', async () => {
     const first = await (await SELF.fetch(
       `https://sessions.vza.net/?harness=${PAGINATION_HARNESS}&limit=10`,

@@ -39,6 +39,7 @@ const FACET_PARAM: Record<string, string> = {
   os: 'os',
   primary_model: 'model',
   repo_url: 'repo',
+  session_date: 'session_date',
   session_time: 'session_time',
 };
 const FACET_LABEL: Record<string, string> = {
@@ -47,6 +48,7 @@ const FACET_LABEL: Record<string, string> = {
   os: 'OS',
   primary_model: 'Model',
   repo_url: 'Repo',
+  session_date: 'Session date/time',
   session_time: 'Session time',
 };
 
@@ -125,6 +127,7 @@ function activeFilters(p: URLSearchParams): Record<string, string> {
     ...SESSION_FILTERS.map((f) => f.param),
     ...DATE_FILTERS,
     'session_time',
+    'session_date',
     'sort',
     ...Object.values(FACET_PARAM),
   ]);
@@ -332,6 +335,15 @@ async function sessionFacets(p: URLSearchParams, env: Env): Promise<Record<strin
       facets[col] = await sessionTimeFacets(where, binds, env);
       continue;
     }
+    if (col === 'session_date') {
+      const prefix = where ? `${where} AND` : 'WHERE';
+      const rows = await env.DB.prepare(
+        `SELECT substr(started_at, 1, 10) AS v, COUNT(*) AS n FROM sessions ${prefix} started_at IS NOT NULL
+         GROUP BY v ORDER BY v DESC LIMIT 20`,
+      ).bind(...binds).all<{ v: string; n: number }>();
+      facets[col] = Object.fromEntries(rows.results.map((r) => [r.v, r.n]));
+      continue;
+    }
     const prefix = where ? `${where} AND` : 'WHERE';
     const rows = await env.DB.prepare(
       `SELECT ${col} AS v, COUNT(*) AS n FROM sessions ${prefix} ${col} IS NOT NULL
@@ -374,6 +386,11 @@ function sessionWhere(p: URLSearchParams): { where: string; binds: string[] } {
   if (from) add('started_at >= ?', from);
   const to = p.get('to');
   if (to) add('started_at <= ?', normalizeToBound(to));
+  const sessionDate = p.get('session_date');
+  if (sessionDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionDate)) {
+    add('started_at >= ?', sessionDate);
+    add("started_at < date(?, '+1 day')", sessionDate);
+  }
   const sessionTime = p.get('session_time');
   if (sessionTime === 'under-5m') { add(`${SESSION_TIME_SQL} >= ?`, '0'); add(`${SESSION_TIME_SQL} < ?`, String(5 * 60)); }
   if (sessionTime === '5m-30m') { add(`${SESSION_TIME_SQL} >= ?`, String(5 * 60)); add(`${SESSION_TIME_SQL} < ?`, String(30 * 60)); }
