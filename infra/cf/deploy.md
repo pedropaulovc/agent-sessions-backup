@@ -16,18 +16,30 @@ override a preview deploy would steal the production custom domains).
 
 ## Workers Builds configuration (set once, in the dashboard)
 
-The repo is not connected to Workers Builds yet. When connecting (Workers & Pages →
-the `sessions-hub` Worker → Settings → Builds → Connect repo), set:
+Connect **both** Workers to `pedropaulovc/agent-sessions-backup`. A Worker that implements
+a Durable Object cannot receive Cloudflare Preview URLs. Workers Builds also pins an upload
+to the Worker connected in the dashboard, overriding Wrangler's environment `name` and
+`--name`. The DO-free `sessions-hub-preview` service therefore needs its own Git connection.
+
+For `sessions-hub`:
 
 - **Production branch:** `main`
+- **Builds for non-production branches:** disabled (the preview Worker owns them)
 - **Build command:** `cd hub && npm ci`
-- **Deploy command (production branch):** `cd hub && npx wrangler deploy`
-- **Non-production branch deploy command:** `cd hub && npx wrangler versions upload --env preview`
+- **Deploy command:** `cd hub && npx wrangler deploy`
 
-The non-production override is the load-bearing line: Workers Builds' default for
-non-production branches is `wrangler versions upload` with **no** environment, which uses
-the top-level (production) bindings. `--env preview` is what pins a PR build to the
-`-preview` resources and the `sessions-hub-preview` Worker.
+For `sessions-hub-preview`:
+
+- **Production branch:** `main`
+- **Builds for non-production branches:** enabled
+- **Build command:** `cd hub && npm ci`
+- **Deploy command:** `cd hub && npx wrangler versions upload --env preview --name sessions-hub-preview`
+- **Non-production branch deploy command:** the same `versions upload` command
+- **Domains & Routes:** production `workers.dev` URL disabled; Preview URLs enabled
+
+The explicit environment is load-bearing: Workers Builds' default `versions upload` uses
+the top-level production bindings. `--env preview` selects the complete isolated binding
+set, while the matching explicit name makes configuration drift visible in the build log.
 
 GitHub Actions stays the PR gate (typecheck + vitest + pytest); Workers Builds owns deploys.
 
@@ -38,7 +50,8 @@ GitHub Actions stays the PR gate (typecheck + vitest + pytest); Workers Builds o
   the SQLite `CF_OAUTH_BROKER` Durable Object. See infra/cf/mtls.md "Cloudflare OAuth connection".
 - Preview: `DEV_AUTH` — the bearer that gates the public preview URL. Until it is set, the
   preview fails closed (denies), which is safe. Set with:
-  `cd hub && npx wrangler secret put DEV_AUTH --env preview`
+  `cd hub && npx wrangler versions secret put DEV_AUTH --env preview`. A secret update creates
+  a new version; the next automatic branch build inherits it and moves the branch alias.
 
 ## Verifying config without deploying
 
