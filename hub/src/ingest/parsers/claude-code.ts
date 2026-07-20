@@ -33,6 +33,7 @@ export async function parseClaudeCode(
   let customTitle: string | undefined;
   let firstUserText: string | undefined;
   let lastMessageUuid: string | undefined;
+  let mainPathAncestry: MainPathAncestry = 'complete';
   // uuid -> parentUuid for EVERY envelope that builds a turn (kept or dropped), so the main-path walk can
   // start from the last envelope and traverse through turns that yielded no blocks to the nearest kept ancestor.
   const envelopeParent = new Map<string, string | undefined>();
@@ -42,6 +43,7 @@ export async function parseClaudeCode(
     if (line.kind === 'oversized') {
       session.stats.skippedLineTypes['oversized-line'] =
         (session.stats.skippedLineTypes['oversized-line'] ?? 0) + 1;
+      mainPathAncestry = 'incomplete-oversized-line';
       continue;
     }
     if (line.text.trim() === '') continue;
@@ -121,12 +123,14 @@ export async function parseClaudeCode(
     if (turn.blocks.length > 0 || turn.usage) session.turns.push(turn);
   }
 
-  markMainPath(session.turns, lastMessageUuid, envelopeParent);
+  markMainPath(session.turns, lastMessageUuid, envelopeParent, mainPathAncestry);
   session.models = [...models];
   session.primaryModel = session.models[0];
   session.title = customTitle ?? aiTitle ?? firstUserText;
   return session;
 }
+
+type MainPathAncestry = 'complete' | 'incomplete-oversized-line';
 
 function* blocksFrom(
   content: unknown,
@@ -255,7 +259,17 @@ function markMainPath(
   turns: NormalizedTurn[],
   lastUuid: string | undefined,
   envelopeParent: Map<string, string | undefined>,
+  ancestry: MainPathAncestry,
 ): void {
+  // An oversized skipped envelope may be any missing link in the parentUuid chain. Without its uuid and
+  // parentUuid, treating retained turns outside the partial chain as abandoned can hide real conversation
+  // history. Fail open for this intentionally lossy parse; complete transcripts still get precise branch
+  // classification below.
+  if (ancestry === 'incomplete-oversized-line') {
+    for (const turn of turns) turn.onMainPath = true;
+    return;
+  }
+
   const byId = new Map<string, NormalizedTurn>();
   for (const t of turns) if (t.id) byId.set(t.id, t);
   // Walk the FULL parentUuid chain from the last envelope (via the all-envelopes map, so a uuid-bearing tail

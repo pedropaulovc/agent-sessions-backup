@@ -254,6 +254,37 @@ describe('parseClaudeCode', () => {
     expect(s.turns.every((t) => t.onMainPath)).toBe(true); // nothing wrongly hidden
   });
 
+  it('keeps retained turns on the main path when an oversized line makes Claude ancestry incomplete', async () => {
+    const before = ccUserLine({ uuid: 'u-before', text: 'question before skipped line' });
+    const after = ccAssistantLine({
+      uuid: 'a-after',
+      parentUuid: 'a-skipped',
+      text: 'answer after skipped line',
+    });
+    const encodedLength = (text: string) => new TextEncoder().encode(text).length;
+    const lines = async function* (): AsyncGenerator<JsonlLine> {
+      yield { kind: 'decoded', text: before, byteStart: 0, byteLen: encodedLength(before) + 1 };
+      const oversizedStart = encodedLength(before) + 1;
+      yield {
+        kind: 'oversized',
+        byteStart: oversizedStart,
+        byteLen: MAX_JSONL_LINE_BYTES + 2,
+      };
+      yield {
+        kind: 'decoded',
+        text: after,
+        byteStart: oversizedStart + MAX_JSONL_LINE_BYTES + 2,
+        byteLen: encodedLength(after),
+      };
+    };
+
+    const s = await parseClaudeCode(lines(), CC_SESSION_ID);
+
+    expect(s.turns.map((turn) => turn.id)).toEqual(['u-before', 'a-after']);
+    expect(s.turns.every((turn) => turn.onMainPath)).toBe(true);
+    expect(s.stats.skippedLineTypes['oversized-line']).toBe(1);
+  });
+
   it('caps oversized blocks and flags truncation', async () => {
     const huge = 'z'.repeat(40_000);
     const lines = [ccUserLine({ uuid: 'u1', text: huge })];
