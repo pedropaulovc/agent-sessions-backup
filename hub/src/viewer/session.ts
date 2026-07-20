@@ -79,13 +79,23 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
 
   // Authoritative per-CONTENT-turn metadata for this page. Match it back to parsed turns by source byte
   // offset rather than ordinal position: a skipped oversized record can leave an unmatched indexed row,
-  // which must not shift every later turn's anchor/main-path flag. The value is a queue because whole-document
-  // formats can legitimately assign several turns the same synthetic source offset.
+  // which must not shift every later turn's anchor/main-path flag. Register the turn at every persisted block
+  // offset because the first block can itself be skipped while a later block from the same turn survives.
+  // The value is a queue because whole-document formats can legitimately assign several turns the same
+  // synthetic source offset.
   const pageTurns = (
     await env.DB.prepare(
-      `SELECT turn_index, MIN(byte_start) AS byte_start, MAX(on_main_path) AS on_main_path FROM blocks
-       WHERE session_id = ?1 AND turn_index >= ?2 AND turn_index < ?3 AND btype != 'compaction'
-       GROUP BY turn_index ORDER BY turn_index`,
+      `WITH page_blocks AS (
+         SELECT turn_index, byte_start, on_main_path FROM blocks
+         WHERE session_id = ?1 AND turn_index >= ?2 AND turn_index < ?3 AND btype != 'compaction'
+       ), turn_meta AS (
+         SELECT turn_index, MAX(on_main_path) AS on_main_path FROM page_blocks GROUP BY turn_index
+       )
+       SELECT p.turn_index, p.byte_start, m.on_main_path
+       FROM page_blocks p JOIN turn_meta m ON m.turn_index = p.turn_index
+       WHERE p.byte_start IS NOT NULL
+       GROUP BY p.turn_index, p.byte_start
+       ORDER BY p.turn_index, p.byte_start`,
     )
       .bind(sessionId, lo, hi)
       .all<{ turn_index: number; byte_start: number | null; on_main_path: number }>()

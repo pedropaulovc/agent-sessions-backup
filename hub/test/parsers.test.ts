@@ -551,6 +551,82 @@ describe('parseCodex', () => {
     expect(texts).toEqual([text]);
   });
 
+  it('treats an oversized record as an unknown turn boundary for grouping, dedupe, and usage attribution', async () => {
+    const text = 'same assistant text on both sides of the skipped record';
+    const decoded = (value: Record<string, unknown>, byteStart: number): JsonlLine => {
+      const line = JSON.stringify(value);
+      return {
+        kind: 'decoded',
+        text: line,
+        byteStart,
+        byteLen: new TextEncoder().encode(line).length + 1,
+      };
+    };
+    const records: JsonlLine[] = [
+      decoded(
+        {
+          timestamp: '2026-07-20T10:00:00.000Z',
+          type: 'turn_context',
+          payload: { turn_id: 't1', model: 'gpt-test-boundary' },
+        },
+        0,
+      ),
+      decoded(
+        {
+          timestamp: '2026-07-20T10:00:01.000Z',
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'assistant',
+            content: [{ type: 'output_text', text }],
+            internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+          },
+        },
+        100,
+      ),
+      decoded(
+        {
+          timestamp: '2026-07-20T10:00:02.000Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 100, output_tokens: 10 } } },
+        },
+        200,
+      ),
+      { kind: 'oversized', byteStart: 300, byteLen: MAX_JSONL_LINE_BYTES + 2 },
+      // This usage event has no visible assistant message before it. It must open a post-gap
+      // usage-only turn instead of mutating the pre-gap assistant retained in session.turns.
+      decoded(
+        {
+          timestamp: '2026-07-20T10:00:04.000Z',
+          type: 'event_msg',
+          payload: { type: 'token_count', info: { last_token_usage: { input_tokens: 200, output_tokens: 20 } } },
+        },
+        400,
+      ),
+      // Same role and text, opposite wire representation. The unknown boundary must prevent
+      // both turn merging and cross-gap duplicate pairing.
+      decoded(
+        {
+          timestamp: '2026-07-20T10:00:05.000Z',
+          type: 'event_msg',
+          payload: { type: 'agent_message', message: text },
+        },
+        500,
+      ),
+    ];
+    const lines = async function* (): AsyncGenerator<JsonlLine> {
+      yield* records;
+    };
+
+    const s = await parseCodex(lines(), CODEX_SESSION_ID);
+
+    expect(s.stats.skippedLineTypes['oversized-line']).toBe(1);
+    expect(s.turns).toHaveLength(2);
+    expect(s.turns.map((turn) => turn.role)).toEqual(['assistant', 'assistant']);
+    expect(s.turns.map((turn) => turn.blocks.map((block) => block.text))).toEqual([[text], [text]]);
+    expect(s.turns.map((turn) => turn.usage?.inputTokens)).toEqual([100, 200]);
+  });
+
   it('a token_count with no indexable block for the current call opens a fresh usage-only turn instead of overwriting the previous call (regression: lastAssistant stayed stale across a new user turn)', async () => {
     const lines = [
       { timestamp: '2026-07-08T10:00:00.000Z', type: 'session_meta', payload: { session_id: CODEX_SESSION_ID, cwd: '/x' } },
