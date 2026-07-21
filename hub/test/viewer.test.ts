@@ -1853,6 +1853,52 @@ describe('viewer facet value discovery', () => {
     ).run();
   });
 
+  function nextHref(html: string): string | null {
+    return html.match(/<a rel="next" href="([^"]+)"/)?.[1]?.replaceAll('&amp;', '&') ?? null;
+  }
+
+  it('defaults recent, sorted, and full-text result pages to 100 rows', async () => {
+    const repo = encodeURIComponent(FACET_CAP_REPO);
+    for (const query of [
+      `repo=${repo}`,
+      `repo=${repo}&sort=total_tokens`,
+      `q=${FACET_CAP_MARKER}&repo=${repo}`,
+    ]) {
+      const first = await (await SELF.fetch(`https://sessions.vza.net/?${query}`)).text();
+      expect(first).toContain(query.startsWith('q=') ? 'Showing 1–100 for' : 'Showing 1–100 recent sessions');
+      expect(first.match(/<div class="hit">/g)).toHaveLength(100);
+
+      const next = nextHref(first);
+      expect(next).not.toBeNull();
+      const second = await (await SELF.fetch(`https://sessions.vza.net${next}`)).text();
+      expect(second).toContain(query.startsWith('q=') ? 'Showing 101–200 for' : 'Showing 101–200 recent sessions');
+      expect(second.match(/<div class="hit">/g)).toHaveLength(100);
+      expect(nextHref(second)).toBeNull();
+    }
+  });
+
+  it('uses 100 as the FTS API default while preserving lower limits and the maximum clamp', async () => {
+    const base = `https://api.sessions.vza.net/api/v1/search?q=${FACET_CAP_MARKER}` +
+      `&repo=${encodeURIComponent(FACET_CAP_REPO)}`;
+    const get = async (suffix = '') => {
+      const response = await SELF.fetch(base + suffix, { headers: { 'x-dev-machine': 'testbox-wsl' } });
+      expect(response.status).toBe(200);
+      return response.json() as Promise<{ hits: unknown[]; cursor?: string }>;
+    };
+
+    const defaultPage = await get();
+    expect(defaultPage.hits).toHaveLength(100);
+    expect(defaultPage.cursor).toBeDefined();
+
+    const lowerPage = await get('&limit=10');
+    expect(lowerPage.hits).toHaveLength(10);
+    expect(lowerPage.cursor).toBeDefined();
+
+    const clampedPage = await get('&limit=101');
+    expect(clampedPage.hits).toHaveLength(100);
+    expect(clampedPage.cursor).toBeDefined();
+  });
+
   it('keeps 200 harness, machine, OS, model, and project values reachable in recent and FTS lists', async () => {
     const expected = [
       ['Harness', 'facet-cap-harness-199'],

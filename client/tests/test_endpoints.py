@@ -171,9 +171,17 @@ def test_search(hub):
             "session": {"harness": "claude-code"},
         }
     ]
-    result = api_for(hub).search("hello", limit=10)
+    result = api_for(hub).search("hello")
     assert len(result.hits) == 1
     assert result.hits[0].snippet == "<mark>hello</mark>"
+    request = hub.requests[-1]
+    assert request["path"] == "/api/v1/search"
+    assert request["params"]["limit"] == ["100"]
+
+
+def test_search_preserves_explicit_lower_limit(hub):
+    api_for(hub).search("hello", limit=10)
+    assert hub.requests[-1]["params"]["limit"] == ["10"]
 
 
 def test_usage_group_by_model(hub):

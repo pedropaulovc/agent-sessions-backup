@@ -109,7 +109,7 @@ The response shape depends on what the session's canonical file actually is
 ### `GET /api/v1/search`
 Params: `q` (FTS5 MATCH syntax — invalid syntax is retried as a quoted literal phrase, then
 degrades to an empty result set rather than a 500), `harness`, `machine`, `os`, `model`,
-`repo`, `cwd`, `from`, `to`, `limit` (default 20, max 100), `cursor` (opaque, paginates),
+`repo`, `cwd`, `from`, `to`, `limit` (default 100, max 100), `cursor` (opaque, paginates),
 `facets=1` (adds facet counts over harness/machine_id/os/primary_model/repo_url).
 
 ### `GET /api/v1/usage?group_by=day|model|machine|repo&from&to`
