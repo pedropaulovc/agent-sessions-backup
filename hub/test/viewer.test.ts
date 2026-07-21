@@ -28,7 +28,53 @@ const OFF_MAIN_TITLE_SESSION = '30303030-cccc-4ccc-8ccc-cccccccccccc';
 const STORED_FALLBACK_TITLE_SESSION = '40404040-dddd-4ddd-8ddd-dddddddddddd';
 const SCHEDULED_TITLE_SESSION = '50505050-eeee-4eee-8eee-eeeeeeeeeeee';
 const ENCODED_SCHEDULED_TITLE_SESSION = '60606060-ffff-4fff-8fff-ffffffffffff';
+const INJECTED_WRAPPERS_TITLE_SESSION = 'injected-wrapper-title-session';
 const REPO_URL = 'https://github.com/tester/facetdemo';
+
+const WRAPPER_TITLE_CASES = [
+  {
+    id: 'wrapper-title-task-notification',
+    source: '<task-notification>\n<task-id>abc</task-id>\n<summary>Background &amp; check &#x2705;</summary>\n<status>completed</status>\n</task-notification>',
+    expectedHtml: 'Background &amp; check ✅',
+    query: 'tasknotificationtitlequerysentinel',
+  },
+  {
+    id: 'wrapper-title-teammate-summary',
+    source: '<teammate-message color="blue" summary="Review &amp; merge &#35;42" teammate_id="implementer">Body must not title</teammate-message>',
+    expectedHtml: 'Review &amp; merge #42',
+    query: 'anyteammatesummaryquerysentinel',
+  },
+  {
+    id: 'wrapper-title-teammate-assignment',
+    source: '<teammate-message color="green" notsummary="Wrong title" teammate_id="worker">\n{"type":"task_assignment","taskId":"7","subject":"Refactor \\u0026 &amp; verify","description":"Description must not title"}\n</teammate-message>',
+    expectedHtml: 'Refactor &amp; &amp;amp; verify',
+    query: 'teammateassignmenttitlequerysentinel',
+  },
+  {
+    id: 'wrapper-title-teammate-plural',
+    source: '<teammate-messages summary="Wrong title">Literal plural wrapper</teammate-messages>',
+    expectedHtml: '&lt;teammate-messages summary=&quot;Wrong title&quot;&gt;Literal plural wrapper&lt;/teammate-messages&gt;',
+    query: 'teammatepluralquerysentinel',
+  },
+  {
+    id: 'wrapper-title-command-message',
+    source: '<command-message>\n  playwright-cli &amp; inspect  \n</command-message>\n<command-name>/playwright-cli</command-name>',
+    expectedHtml: 'playwright-cli &amp; inspect',
+    query: 'commandmessagetitlequerysentinel',
+  },
+  {
+    id: 'wrapper-title-task',
+    source: '<task>\r\n  Audit &amp; repair &#35;42  \r\n</task>',
+    expectedHtml: 'Audit &amp; repair #42',
+    query: 'taskwrappertitlequerysentinel',
+  },
+  {
+    id: 'wrapper-title-malformed',
+    source: '<task-notification><summary>Missing close',
+    expectedHtml: '&lt;task-notification&gt;&lt;summary&gt;Missing close',
+    query: 'malformedwrappertitlequerysentinel',
+  },
+] as const;
 
 // Hostile transcript payloads: an SVG with inline script and an HTML "document".
 const SVG_XSS_B64 = btoa('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>');
@@ -396,6 +442,45 @@ describe('viewer', () => {
       SCHEDULED_TITLE_SESSION,
       ENCODED_SCHEDULED_TITLE_SESSION,
     ).run();
+
+    const wrapperStatements: D1PreparedStatement[] = [];
+    for (let i = 0; i < WRAPPER_TITLE_CASES.length; i++) {
+      const titleCase = WRAPPER_TITLE_CASES[i]!;
+      wrapperStatements.push(
+        testEnv.DB.prepare(
+          `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+           VALUES (?1, 'wrapper-title-test', 'testbox-wsl', 'Stored wrapper title', ?2, 'ready')`,
+        ).bind(titleCase.id, `2026-07-02T10:00:0${i}Z`),
+        testEnv.DB.prepare(
+          `INSERT INTO blocks
+             (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
+           (?1, 1, 0, 0, 'user', 'text', ?2, 1),
+           (?1, 1, 1, 0, 'assistant', 'text', ?3, 1)`,
+        ).bind(titleCase.id, titleCase.source, `${titleCase.query} response`),
+      );
+    }
+    wrapperStatements.push(
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+         VALUES (?1, 'injected-title-test', 'testbox-wsl', 'Stored injected title', '2026-07-02T11:00:00Z', 'ready')`,
+      ).bind(INJECTED_WRAPPERS_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks
+           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
+         (?1, 1, 0, 0, 'user', 'text', '<codex_internal_context>injected</codex_internal_context>', 1),
+         (?1, 1, 1, 0, 'assistant', 'text', '<system-reminder>injected</system-reminder>', 1),
+         (?1, 1, 2, 0, 'user', 'text', '<environment_context>injected</environment_context>', 1),
+         (?1, 1, 3, 0, 'assistant', 'text', '<hook_prompt>injected</hook_prompt>', 1),
+         (?1, 1, 4, 0, 'user', 'text', 'First interaction after injected wrappers', 1),
+         (?1, 1, 5, 0, 'assistant', 'text', 'injectedwrapperstitlequerysentinel response', 1)`,
+      ).bind(INJECTED_WRAPPERS_TITLE_SESSION),
+    );
+    await testEnv.DB.batch(wrapperStatements);
+    await testEnv.DB.prepare(
+      `INSERT INTO blocks_fts(rowid, text)
+       SELECT id, text FROM blocks
+       WHERE (session_id = ?1 OR session_id LIKE 'wrapper-title-%') AND text IS NOT NULL`,
+    ).bind(INJECTED_WRAPPERS_TITLE_SESSION).run();
   });
 
   it('search page returns 200 with a highlighted snippet and a link to the session', async () => {
@@ -408,7 +493,7 @@ describe('viewer', () => {
   });
 
   it('empty query lists recent sessions', async () => {
-    const res = await SELF.fetch('https://sessions.vza.net/');
+    const res = await SELF.fetch('https://sessions.vza.net/?harness=claude-code');
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('Recent sessions');
@@ -416,7 +501,7 @@ describe('viewer', () => {
   });
 
   it('titles recent sessions from the first user/agent text, excluding system instructions, hooks, and tools', async () => {
-    const html = await (await SELF.fetch('https://sessions.vza.net/')).text();
+    const html = await (await SELF.fetch('https://sessions.vza.net/?harness=claude-code')).text();
     expect(html).toContain(`<a href="/s/${TITLE_SESSION}">First real title interaction</a>`);
     expect(html).not.toContain('Generated title must not be used');
     expect(html).not.toContain('System prompt must not become the title');
@@ -465,6 +550,34 @@ describe('viewer', () => {
     const html = await (await SELF.fetch('https://sessions.vza.net/?q=encodedscheduledtitlequerysentinel')).text();
     expect(html).toContain(
       `<a href="/s/${ENCODED_SCHEDULED_TITLE_SESSION}?page=1#t1">update&amp;daily-notes</a>`,
+    );
+  });
+
+  it('normalizes nested, teammate, JSON-assignment, command, and task wrappers', async () => {
+    for (const titleCase of WRAPPER_TITLE_CASES) {
+      const html = await (await SELF.fetch(`https://sessions.vza.net/?q=${titleCase.query}`)).text();
+      expect(html).toContain(
+        `<a href="/s/${titleCase.id}?page=1#t1">${titleCase.expectedHtml}</a>`,
+      );
+    }
+
+    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=wrapper-title-test')).text();
+    for (const titleCase of WRAPPER_TITLE_CASES) {
+      expect(recent).toContain(`<a href="/s/${titleCase.id}">${titleCase.expectedHtml}</a>`);
+    }
+    expect(recent).not.toContain('Description must not title');
+    expect(recent).not.toContain('Body must not title');
+  });
+
+  it('skips newly recognized injected wrapper turns', async () => {
+    const query = await (await SELF.fetch('https://sessions.vza.net/?q=injectedwrapperstitlequerysentinel')).text();
+    expect(query).toContain(
+      `<a href="/s/${INJECTED_WRAPPERS_TITLE_SESSION}?page=1#t5">First interaction after injected wrappers</a>`,
+    );
+
+    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=injected-title-test')).text();
+    expect(recent).toContain(
+      `<a href="/s/${INJECTED_WRAPPERS_TITLE_SESSION}">First interaction after injected wrappers</a>`,
     );
   });
 

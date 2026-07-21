@@ -4,6 +4,10 @@ const INJECTED_TURN_PREFIXES = [
   '<recommended_plugins>',
   '<command-name>',
   '<local-command-stdout>',
+  '<codex_internal_context',
+  '<system-reminder',
+  '<environment_context',
+  '<hook_prompt',
 ] as const;
 
 const NON_CONVERSATION_BLOCK_PREFIXES = [
@@ -14,21 +18,28 @@ const NON_CONVERSATION_BLOCK_PREFIXES = [
 
 const IMAGE_PREFIX = '<image name=[Image #';
 const IMAGE_CLOSE = '</image>';
-
-const XML_ATTRIBUTE_TITLE_PREFIXES = [
-  '<teammate-message teammate_id="team-lead" summary="',
-  '<scheduled-task name="',
-] as const;
+const SPECIAL_TITLE_LIMIT = 2048;
 
 /** Select the first human/agent text exchange as a compact JSON candidate.
  * System/developer instructions, hook metadata, thinking, tool traffic, and known injected
  * user/assistant wrappers are ineligible. The correlated lookup uses blocks_session. */
 export function firstInteractionTitleCandidateSql(sessionAlias: string): string {
   const text = interactionTextSql('title_block.text');
-  const attributeTitles = XML_ATTRIBUTE_TITLE_PREFIXES.map((prefix) => xmlAttributeTitleSql(text, prefix));
-  const isAttributeTitle = attributeTitles.map(({ condition }) => condition).join(' OR ');
-  const attributeTitle = attributeTitles
-    .map(({ condition, value }) => `WHEN ${condition} THEN ${value}`)
+  const specialTitles = [
+    teammateSummaryTitleSql(text),
+    teammateAssignmentTitleSql(text),
+    xmlAttributeTitleSql(text, '<scheduled-task name="'),
+    nestedElementTitleSql(text, '<task-notification>', '<summary>', '</summary>'),
+    nestedElementTitleSql(text, '<command-message>', '<command-message>', '</command-message>'),
+    nestedElementTitleSql(text, '<task>', '<task>', '</task>'),
+  ];
+  const isSpecialTitle = specialTitles.map(({ condition }) => condition).join(' OR ');
+  const isEncodedSpecialTitle = specialTitles
+    .filter(({ kind }) => kind === 'encoded-special')
+    .map(({ condition }) => condition)
+    .join(' OR ');
+  const specialTitle = specialTitles
+    .map(({ condition, value }) => `WHEN ${condition} THEN substr(${value}, 1, ${SPECIAL_TITLE_LIMIT})`)
     .join('\n                      ');
   const turnIsEligible = excludesPrefixesSql(text, INJECTED_TURN_PREFIXES);
   const blockIsEligible = excludesPrefixesSql(text, NON_CONVERSATION_BLOCK_PREFIXES);
@@ -36,9 +47,13 @@ export function firstInteractionTitleCandidateSql(sessionAlias: string): string 
   const earlierBlockIsEligible = excludesPrefixesSql(earlierText, NON_CONVERSATION_BLOCK_PREFIXES);
 
   return `(SELECT json_object(
-                    'kind', CASE WHEN ${isAttributeTitle} THEN 'xml-attribute' ELSE 'text' END,
+                    'kind', CASE
+                      WHEN ${isEncodedSpecialTitle} THEN 'encoded-special'
+                      WHEN ${isSpecialTitle} THEN 'plain-special'
+                      ELSE 'text'
+                    END,
                     'text', CASE
-                      ${attributeTitle}
+                      ${specialTitle}
                       ELSE substr(trim(${text}), 1, 120)
                     END)
            FROM blocks title_block
@@ -65,17 +80,87 @@ export function firstInteractionTitleCandidateSql(sessionAlias: string): string 
            LIMIT 1)`;
 }
 
+interface SqlTitleExtractor {
+  condition: string;
+  value: string;
+  kind: 'encoded-special' | 'plain-special';
+}
+
 function xmlAttributeTitleSql(
   textSql: string,
   prefix: string,
-): { condition: string; value: string } {
+): SqlTitleExtractor {
   const rest = `substr(${textSql}, ${prefix.length + 1})`;
   const condition = `substr(${textSql}, 1, ${prefix.length}) = ${sqlString(prefix)} ` +
     `AND instr(${rest}, '"') > 0`;
   return {
     condition: `(${condition})`,
     value: `substr(${rest}, 1, instr(${rest}, '"') - 1)`,
+    kind: 'encoded-special',
   };
+}
+
+function teammateSummaryTitleSql(textSql: string): SqlTitleExtractor {
+  const teammatePrefix = '<teammate-message';
+  const summaryPrefix = 'summary="';
+  const openingTag = `substr(${textSql}, 1, instr(${textSql}, '>'))`;
+  const summaryStart = `instr(${openingTag}, ${sqlString(summaryPrefix)})`;
+  const rest = `substr(${openingTag}, ${summaryStart} + ${summaryPrefix.length})`;
+  const beforeSummary = `substr(${openingTag}, ${summaryStart} - 1, 1)`;
+  const condition = startsElementSql(textSql, teammatePrefix) +
+    ` AND instr(${textSql}, '>') > 0 AND ${summaryStart} > 0 ` +
+    `AND ${beforeSummary} IN (' ', char(9), char(10), char(13)) AND instr(${rest}, '"') > 0`;
+  return {
+    condition: `(${condition})`,
+    value: `substr(${rest}, 1, instr(${rest}, '"') - 1)`,
+    kind: 'encoded-special',
+  };
+}
+
+function teammateAssignmentTitleSql(textSql: string): SqlTitleExtractor {
+  const teammatePrefix = '<teammate-message';
+  const close = '</teammate-message>';
+  const openEnd = `instr(${textSql}, '>')`;
+  const closeStart = `instr(${textSql}, ${sqlString(close)})`;
+  const body = `trim(substr(${textSql}, ${openEnd} + 1, ${closeStart} - ${openEnd} - 1), ` +
+    `char(9) || char(10) || char(13) || ' ')`;
+  const jsonType = jsonTextSql(body, '$.type');
+  const subject = jsonTextSql(body, '$.subject');
+  const condition = startsElementSql(textSql, teammatePrefix) +
+    ` AND ${openEnd} > 0 AND ${closeStart} > ${openEnd} ` +
+    `AND ${jsonType} = 'task_assignment' AND typeof(${subject}) = 'text'`;
+  return { condition: `(${condition})`, value: subject, kind: 'plain-special' };
+}
+
+function nestedElementTitleSql(
+  textSql: string,
+  wrapperPrefix: string,
+  openTag: string,
+  closeTag: string,
+): SqlTitleExtractor {
+  const openStart = `instr(${textSql}, ${sqlString(openTag)})`;
+  const rest = `substr(${textSql}, ${openStart} + ${openTag.length})`;
+  const condition = startsWithSql(textSql, wrapperPrefix) +
+    ` AND ${openStart} > 0 AND instr(${rest}, ${sqlString(closeTag)}) > 0`;
+  return {
+    condition: `(${condition})`,
+    value: `trim(substr(${rest}, 1, instr(${rest}, ${sqlString(closeTag)}) - 1), ` +
+      `char(9) || char(10) || char(13) || ' ')`,
+    kind: 'encoded-special',
+  };
+}
+
+function jsonTextSql(jsonSql: string, path: string): string {
+  return `(CASE WHEN json_valid(${jsonSql}) THEN json_extract(${jsonSql}, ${sqlString(path)}) END)`;
+}
+
+function startsWithSql(textSql: string, prefix: string): string {
+  return `substr(${textSql}, 1, ${prefix.length}) = ${sqlString(prefix)}`;
+}
+
+function startsElementSql(textSql: string, prefix: string): string {
+  const next = `substr(${textSql}, ${prefix.length + 1}, 1)`;
+  return `(${startsWithSql(textSql, prefix)} AND ${next} IN (' ', '>', char(9), char(10), char(13)))`;
 }
 
 function interactionTextSql(textSql: string): string {
@@ -101,8 +186,9 @@ export function resolveFirstInteractionTitle(candidate: string | null): string |
   try {
     const parsed = JSON.parse(candidate) as { kind?: unknown; text?: unknown };
     if (typeof parsed.text !== 'string') return null;
-    if (parsed.kind !== 'xml-attribute') return parsed.text;
-    return decodeXmlEntities(parsed.text).trim().slice(0, 120);
+    if (parsed.kind === 'encoded-special') return decodeXmlEntities(parsed.text).trim().slice(0, 120);
+    if (parsed.kind === 'plain-special') return parsed.text.trim().slice(0, 120);
+    return parsed.text;
   } catch {
     return null;
   }
