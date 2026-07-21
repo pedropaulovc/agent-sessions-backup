@@ -222,7 +222,7 @@ const SEARCH_CONTENT = [
   ccLine(SEARCH_SESSION, { uuid: 'a1', parentUuid: 'u1', role: 'assistant', text: 'searching', toolUse: { id: 'tu1', name: 'Grep', input: { pattern: 'xenondioxide' } } }),
   ccLine(SEARCH_SESSION, { uuid: 'uOld', parentUuid: 'a1', role: 'user', text: 'abandoned branch attempt' }),
   ccLine(SEARCH_SESSION, { uuid: 'aOld', parentUuid: 'uOld', role: 'assistant', text: 'abandoned assistant reply' }),
-  ccLine(SEARCH_SESSION, { uuid: 'u2', parentUuid: 'a1', role: 'user', toolResult: { toolUseId: 'tu1', content: 'xenondioxide appears in notes.md line 12' } }),
+  ccLine(SEARCH_SESSION, { uuid: 'u2', parentUuid: 'a1', role: 'user', toolResult: { toolUseId: 'tu1', content: '{"path":"notes.md","match":"xenondioxide appears in notes.md line 12"}' } }),
   ccLine(SEARCH_SESSION, { uuid: 'a2', parentUuid: 'u2', role: 'assistant', text: 'found the reference' }),
   ccLine(SEARCH_SESSION, { uuid: 'uImg', parentUuid: 'a2', role: 'user', image: { mediaType: 'image/png', data: TINY_PNG_B64 } }),
 ].join('\n');
@@ -726,6 +726,16 @@ describe('viewer', () => {
     expect(html).toContain(`<a class="button-link" href="/s/${SEARCH_SESSION}/download">Download raw session</a>`);
     // inline image points at the blob endpoint
     expect(html).toMatch(new RegExp(`/s/${SEARCH_SESSION}/blob/\\d+`));
+  });
+
+  it('joins linked tool calls and results, with their leading JSON fields in the summary', async () => {
+    const html = await (await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`)).text();
+
+    expect(html).toContain('<details class="block tool-pair"><summary>🔧 Grep · pattern: xenondioxide → path: notes.md</summary>');
+    expect(html).toContain('<span class="muted small">call</span>');
+    expect(html).toContain('<span class="muted small">↩ result</span>');
+    expect(html).toContain('xenondioxide appears in notes.md line 12');
+    expect(html).not.toContain('class="turn tool');
   });
 
   it('downloads the complete canonical session with an attachment filename', async () => {

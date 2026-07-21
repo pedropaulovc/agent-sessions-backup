@@ -131,6 +131,7 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
         if (!parsed) {
           controller.enqueue(encoder.encode('<p class="warn">Raw transcript unavailable (R2 object missing).</p>'));
         } else {
+          const toolPairs = pairToolResults(parsed.turns);
           let rendered = 0;
           for (const turn of parsed.turns) {
             const isContent = !turn.compaction && turn.blocks.length > 0;
@@ -141,7 +142,16 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
             // Prefer the persisted main-path flag; fall back to the parser's per-page guess only when the
             // D1 lookup has no matching row (e.g. compaction markers, which have no content block rows).
             const onMainPath = indexed ? indexed.onMainPath : turn.onMainPath;
-            const html = renderTurn(turn, sessionId, view, mediaIds, indexed?.turnIndex, onMainPath, blobVersion);
+            const html = renderTurn(
+              turn,
+              sessionId,
+              view,
+              mediaIds,
+              indexed?.turnIndex,
+              onMainPath,
+              blobVersion,
+              toolPairs,
+            );
             if (html) {
               controller.enqueue(encoder.encode(html));
               rendered++;
@@ -258,6 +268,7 @@ function renderTurn(
   turnIndex: number | undefined,
   onMainPath: boolean,
   blobVersion: string,
+  toolPairs: ToolPairs,
 ): string {
   if (turn.compaction) {
     return `<div class="divider">── context compacted ──</div>`;
@@ -272,11 +283,19 @@ function renderTurn(
   const model = turn.model ? `<span class="chip">${esc(turn.model)}</span>` : '';
   const ts = turn.ts ? `<span class="muted small">${esc(turn.ts)}</span>` : '';
   const head = `<div class="turnhead"><span class="role">${esc(turn.role)}</span>${model}${ts}</div>`;
-  const body = turn.blocks.map((b, bi) => renderBlock(b, bi, sessionId, mediaIds, blobVersion)).join('');
+  const body = turn.blocks.map((b, bi) => renderBlock(b, bi, sessionId, mediaIds, blobVersion, toolPairs)).join('');
+  if (!body) return '';
   return `<article${anchor} class="${cls}">${head}<div class="body">${body}</div></article>`;
 }
 
-function renderBlock(b: NormalizedBlock, bi: number, sessionId: string, mediaIds: Map<string, number>, blobVersion: string): string {
+function renderBlock(
+  b: NormalizedBlock,
+  bi: number,
+  sessionId: string,
+  mediaIds: Map<string, number>,
+  blobVersion: string,
+  toolPairs: ToolPairs,
+): string {
   const trunc = b.truncated ? `<div class="truncnote">… truncated for indexing</div>` : '';
   switch (b.type) {
     case 'text':
@@ -286,12 +305,25 @@ function renderBlock(b: NormalizedBlock, bi: number, sessionId: string, mediaIds
       return `<details class="block"><summary>💭 thinking</summary><pre>${esc(b.text ?? '')}</pre></details>`;
     case 'tool_use': {
       const name = b.toolName ?? 'tool';
-      return `<details class="block"><summary>🔧 ${esc(name)}</summary><pre>${esc(prettyToolInput(b.text ?? '', name))}</pre></details>${trunc}`;
+      const input = prettyToolInput(b.text ?? '', name);
+      const result = toolPairs.byCall.get(b);
+      if (!result) {
+        return `<details class="block"><summary>🔧 ${esc(toolSummary(name, input))}</summary><pre>${esc(input)}</pre></details>${trunc}`;
+      }
+      const resultText = result.text ?? '';
+      const errCls = result.isError ? ' error' : '';
+      const icon = result.isError ? '⚠️' : '↩';
+      return `<details class="block tool-pair${errCls}"><summary>🔧 ${esc(toolSummary(name, input, resultText))}</summary>` +
+        `<div class="tool-part"><span class="muted small">call</span><pre>${esc(input)}</pre></div>` +
+        `<div class="tool-part"><span class="muted small">${icon} result</span><pre>${esc(resultText)}</pre>${result.truncated ? '<div class="truncnote">… truncated for indexing</div>' : ''}</div>` +
+        `</details>${trunc}`;
     }
     case 'tool_result': {
+      if (toolPairs.results.has(b)) return '';
       const errCls = b.isError ? ' error' : '';
       const icon = b.isError ? '⚠️' : '↩';
-      return `<details class="block${errCls}"><summary>${icon} tool result</summary><pre>${esc(b.text ?? '')}</pre></details>${trunc}`;
+      const text = b.text ?? '';
+      return `<details class="block${errCls}"><summary>${icon} ${esc(toolResultSummary(text))}</summary><pre>${esc(text)}</pre></details>${trunc}`;
     }
     case 'image': {
       const id = mediaIds.get(`${b.byteStart}:${bi}`);
@@ -307,6 +339,32 @@ function renderBlock(b: NormalizedBlock, bi: number, sessionId: string, mediaIds
     default:
       return '';
   }
+}
+
+/** Pair by protocol ID, not adjacency: parallel calls may resolve in a different order. */
+interface ToolPairs {
+  byCall: Map<NormalizedBlock, NormalizedBlock>;
+  results: Set<NormalizedBlock>;
+}
+
+function pairToolResults(turns: NormalizedTurn[]): ToolPairs {
+  const calls = new Map<string, NormalizedBlock>();
+  const results: Array<NormalizedBlock> = [];
+  for (const turn of turns) {
+    for (const block of turn.blocks) {
+      if (block.type === 'tool_use' && block.toolUseId) calls.set(block.toolUseId, block);
+      if (block.type === 'tool_result' && block.toolUseId) results.push(block);
+    }
+  }
+  const byCall = new Map<NormalizedBlock, NormalizedBlock>();
+  const pairedResults = new Set<NormalizedBlock>();
+  for (const result of results) {
+    const call = calls.get(result.toolUseId!);
+    if (!call) continue;
+    byCall.set(call, result);
+    pairedResults.add(result);
+  }
+  return { byCall, results: pairedResults };
 }
 
 function renderHeader(
@@ -391,6 +449,39 @@ function prettyToolInput(text: string, name: string): string {
   } catch {
     return rest || text;
   }
+}
+
+function toolSummary(name: string, input: string, result?: string): string {
+  const details = [firstJsonProperty(input), result === undefined ? undefined : firstJsonProperty(result)].filter(
+    (v): v is string => v !== undefined,
+  );
+  return details.length ? `${name} · ${details.join(' → ')}` : name;
+}
+
+function toolResultSummary(text: string): string {
+  const detail = firstJsonProperty(text);
+  return detail ? `tool result · ${detail}` : 'tool result';
+}
+
+/** The leading JSON field is normally the concise identifier (path, command, query) people need at a glance. */
+function firstJsonProperty(text: string): string | undefined {
+  try {
+    const value: unknown = JSON.parse(text);
+    if (!isRecord(value)) return undefined;
+    const first = Object.entries(value)[0];
+    if (!first) return undefined;
+    const [key, raw] = first;
+    const rendered = typeof raw === 'string' ? raw : JSON.stringify(raw);
+    const compact = (rendered ?? '').replace(/\s+/g, ' ').trim();
+    if (!compact) return key;
+    return `${key}: ${compact.slice(0, 120)}${compact.length > 120 ? '…' : ''}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 function fmtNum(n: number | null): string {
