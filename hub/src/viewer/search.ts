@@ -1,4 +1,4 @@
-import { runSearch, type SearchHit } from '../api/search';
+import { facetValueLimit, runSearch, type SearchHit } from '../api/search';
 import { clampLimit, decodeCursor, encodeCursor, normalizeToBound } from '../api/sessions';
 import { esc, page, q } from './layout';
 import { TURNS_PER_PAGE } from './session';
@@ -329,7 +329,7 @@ async function sessionFacets(p: URLSearchParams, env: Env): Promise<Record<strin
     const prefix = where ? `${where} AND` : 'WHERE';
     const rows = await env.DB.prepare(
       `SELECT ${col} AS v, COUNT(*) AS n FROM sessions ${prefix} ${col} IS NOT NULL
-       GROUP BY ${col} ORDER BY n DESC LIMIT 20`,
+       GROUP BY ${col} ORDER BY n DESC LIMIT ${facetValueLimit(col)}`,
     ).bind(...binds).all<{ v: string; n: number }>();
     facets[col] = Object.fromEntries(rows.results.map((r) => [r.v, r.n]));
   }
