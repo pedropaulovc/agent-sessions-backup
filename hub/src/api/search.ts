@@ -11,6 +11,8 @@ import {
   totalTokensSql,
 } from '../session-filters';
 
+export const DEFAULT_RESULT_PAGE_SIZE = 100;
+
 function searchOrder(sort: string | null): string {
   if (sort === 'session_time') return `ORDER BY ${sessionDurationSql('s')} DESC, rank, b.id`;
   if (sort === 'total_tokens') return `ORDER BY ${totalTokensSql('s')} DESC, rank, b.id`;
@@ -70,7 +72,7 @@ export interface SearchResult {
 /** Core FTS search over blocks with session-level filters and optional facet counts. Shared by the API and the viewer. */
 export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } = {}): Promise<SearchResult> {
   const q = url.searchParams.get('q')?.trim() ?? '';
-  const limit = clampLimit(url.searchParams.get('limit'), 20, 100);
+  const limit = clampLimit(url.searchParams.get('limit'), DEFAULT_RESULT_PAGE_SIZE, DEFAULT_RESULT_PAGE_SIZE);
   const offset = decodeCursor(url.searchParams.get('cursor'));
   const wantFacets = opts.facets ?? url.searchParams.get('facets') === '1';
 

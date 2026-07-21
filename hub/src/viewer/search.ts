@@ -1,4 +1,4 @@
-import { runSearch, type SearchHit } from '../api/search';
+import { DEFAULT_RESULT_PAGE_SIZE, runSearch, type SearchHit } from '../api/search';
 import { clampLimit, decodeCursor, encodeCursor } from '../api/sessions';
 import {
   buildSessionFilterSql,
@@ -19,8 +19,6 @@ import {
 import { esc, page, q } from './layout';
 import { TURNS_PER_PAGE } from './session';
 import { firstInteractionTitleCandidateSql, sessionDisplayTitle } from '../session-title';
-
-const DEFAULT_PAGE_SIZE = 20;
 
 const SORT_OPTIONS = [
   ['recent', 'Recent'],
@@ -80,7 +78,7 @@ export async function searchPage(url: URL, env: Env): Promise<Response> {
 
   const result = await runSearch(url, env, { facets: true });
   const offset = decodeCursor(p.get('cursor'));
-  const limit = clampLimit(p.get('limit'), DEFAULT_PAGE_SIZE, 100);
+  const limit = clampLimit(p.get('limit'), DEFAULT_RESULT_PAGE_SIZE, DEFAULT_RESULT_PAGE_SIZE);
   const hits = result.hits.map(renderHit).join('');
   const summary = result.hits.length
     ? `<p class="muted small">Showing ${offset + 1}–${offset + result.hits.length} for “${esc(query)}”</p>`
@@ -148,7 +146,7 @@ function renderSidebar(
 
 async function recentSessions(p: URLSearchParams, env: Env): Promise<RecentResult> {
   if (p.get('sort') === 'session_time' || p.get('sort') === 'total_tokens') return sortedRecentSessions(p, env);
-  const limit = clampLimit(p.get('limit'), DEFAULT_PAGE_SIZE, 100);
+  const limit = clampLimit(p.get('limit'), DEFAULT_RESULT_PAGE_SIZE, DEFAULT_RESULT_PAGE_SIZE);
   const cursor = decodeRecentCursor(p.get('cursor'));
   const page = cursor?.page ?? 1;
   const { where: baseWhere, binds } = sessionWhere(p);
@@ -190,7 +188,7 @@ async function recentSessions(p: URLSearchParams, env: Env): Promise<RecentResul
 /** Non-default sorts use the search page's offset cursor. Recent stays keyset-paginated because
  * new ingestion should never shift rows between its pages. */
 async function sortedRecentSessions(p: URLSearchParams, env: Env): Promise<RecentResult> {
-  const limit = clampLimit(p.get('limit'), DEFAULT_PAGE_SIZE, 100);
+  const limit = clampLimit(p.get('limit'), DEFAULT_RESULT_PAGE_SIZE, DEFAULT_RESULT_PAGE_SIZE);
   const offset = decodeCursor(p.get('cursor'));
   const { where, binds } = sessionWhere(p);
   const order = p.get('sort') === 'session_time' ? sessionDurationSql('sessions') : totalTokensSql('sessions');
