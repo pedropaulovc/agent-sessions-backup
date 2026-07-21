@@ -1,6 +1,8 @@
 import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import worker from '../src/index';
+import { firstInteractionTitleCandidateSql } from '../src/session-title';
+import { interactionTitlesSql, searchHitsSql } from '../src/api/search';
 import { viewerRoute } from '../src/viewer/router';
 import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures';
 import { blobVersionOf } from '../src/viewer/session';
@@ -18,7 +20,63 @@ const UNKNOWN_MEDIA_SESSION = '88888888-8888-4888-8888-888888888888';
 const CODEX_TAIL_SESSION = '77777777-9999-4999-8999-999999999999';
 const REPO_SESSION = '66666666-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const OFFSET_MATCH_SESSION = '55555555-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const TITLE_SESSION = '44444444-cccc-4ccc-8ccc-cccccccccccc';
+const TEAMMATE_TITLE_SESSION = '33333333-dddd-4ddd-8ddd-dddddddddddd';
+const PREFIXED_TURN_TITLE_SESSION = '22222222-eeee-4eee-8eee-eeeeeeeeeeee';
+const SERVER_TOOL_TITLE_SESSION = '11111111-ffff-4fff-8fff-ffffffffffff';
+const IMAGE_FORWARD_TITLE_SESSION = '10101010-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const IMAGE_WINDOWS_TITLE_SESSION = '20202020-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const OFF_MAIN_TITLE_SESSION = '30303030-cccc-4ccc-8ccc-cccccccccccc';
+const STORED_FALLBACK_TITLE_SESSION = '40404040-dddd-4ddd-8ddd-dddddddddddd';
+const SCHEDULED_TITLE_SESSION = '50505050-eeee-4eee-8eee-eeeeeeeeeeee';
+const ENCODED_SCHEDULED_TITLE_SESSION = '60606060-ffff-4fff-8fff-ffffffffffff';
+const INJECTED_WRAPPERS_TITLE_SESSION = 'injected-wrapper-title-session';
 const REPO_URL = 'https://github.com/tester/facetdemo';
+
+const WRAPPER_TITLE_CASES = [
+  {
+    id: 'wrapper-title-task-notification',
+    source: '<task-notification>\n<task-id>abc</task-id>\n<summary>Background &amp; check &#x2705;</summary>\n<status>completed</status>\n</task-notification>',
+    expectedHtml: 'Background &amp; check ✅',
+    query: 'tasknotificationtitlequerysentinel',
+  },
+  {
+    id: 'wrapper-title-teammate-summary',
+    source: '<teammate-message color="blue" summary="Review &amp; merge &#35;42" teammate_id="implementer">Body must not title</teammate-message>',
+    expectedHtml: 'Review &amp; merge #42',
+    query: 'anyteammatesummaryquerysentinel',
+  },
+  {
+    id: 'wrapper-title-teammate-assignment',
+    source: '<teammate-message color="green" notsummary="Wrong title" teammate_id="worker">\n{"type":"task_assignment","taskId":"7","subject":"Refactor \\u0026 &amp; verify","description":"Description must not title"}\n</teammate-message>',
+    expectedHtml: 'Refactor &amp; &amp;amp; verify',
+    query: 'teammateassignmenttitlequerysentinel',
+  },
+  {
+    id: 'wrapper-title-teammate-plural',
+    source: '<teammate-messages summary="Wrong title">Literal plural wrapper</teammate-messages>',
+    expectedHtml: '&lt;teammate-messages summary=&quot;Wrong title&quot;&gt;Literal plural wrapper&lt;/teammate-messages&gt;',
+    query: 'teammatepluralquerysentinel',
+  },
+  {
+    id: 'wrapper-title-command-message',
+    source: '<command-message>\n  playwright-cli &amp; inspect  \n</command-message>\n<command-name>/playwright-cli</command-name>',
+    expectedHtml: 'playwright-cli &amp; inspect',
+    query: 'commandmessagetitlequerysentinel',
+  },
+  {
+    id: 'wrapper-title-task',
+    source: '<task>\r\n  Audit &amp; repair &#35;42  \r\n</task>',
+    expectedHtml: 'Audit &amp; repair #42',
+    query: 'taskwrappertitlequerysentinel',
+  },
+  {
+    id: 'wrapper-title-malformed',
+    source: '<task-notification><summary>Missing close',
+    expectedHtml: '&lt;task-notification&gt;&lt;summary&gt;Missing close',
+    query: 'malformedwrappertitlequerysentinel',
+  },
+] as const;
 
 // Hostile transcript payloads: an SVG with inline script and an HTML "document".
 const SVG_XSS_B64 = btoa('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>');
@@ -227,6 +285,73 @@ describe('viewer', () => {
       )).status,
     ).toBe(201);
 
+    const titleContent = [
+      ccSystemLine(TITLE_SESSION, { uuid: 'title-system', text: 'System prompt must not become the title' }),
+      JSON.stringify({ type: 'attachment', uuid: 'title-hook', parentUuid: 'title-system', payload: { kind: 'hook', output: 'Hook output must not become the title' } }),
+      ccLine(TITLE_SESSION, { uuid: 'title-tool-use', parentUuid: 'title-hook', role: 'assistant', toolUse: { id: 'title-tu', name: 'Read', input: { file_path: '/tmp/title' } } }),
+      ccLine(TITLE_SESSION, { uuid: 'title-tool-result', parentUuid: 'title-tool-use', role: 'user', toolResult: { toolUseId: 'title-tu', content: 'Tool result must not become the title' } }),
+      ccLine(TITLE_SESSION, { uuid: 'title-server-tool', parentUuid: 'title-tool-result', role: 'assistant', unknownFirst: 'server_tool_use' }),
+      ccLine(TITLE_SESSION, { uuid: 'title-agents', parentUuid: 'title-server-tool', role: 'user', text: '# AGENTS.md instructions\nInjected agent instructions' }),
+      ccLine(TITLE_SESSION, { uuid: 'title-local', parentUuid: 'title-agents', role: 'assistant', text: '<local-command-caveat>Injected local command</local-command-caveat>' }),
+      ccLine(TITLE_SESSION, { uuid: 'title-plugins', parentUuid: 'title-local', role: 'user', text: '<recommended_plugins>Injected plugin list</recommended_plugins>' }),
+      ccLine(TITLE_SESSION, { uuid: 'title-command', parentUuid: 'title-plugins', role: 'assistant', text: '<command-name>Injected command</command-name>' }),
+      ccLine(TITLE_SESSION, { uuid: 'title-stdout', parentUuid: 'title-command', role: 'user', text: '<local-command-stdout>Injected stdout</local-command-stdout>' }),
+      ccLine(TITLE_SESSION, { uuid: 'title-user', parentUuid: 'title-stdout', role: 'user', text: 'First real title interaction' }),
+      ccLine(TITLE_SESSION, { uuid: 'title-assistant', parentUuid: 'title-user', role: 'assistant', text: 'titlequerysentinel response' }),
+      JSON.stringify({ type: 'ai-title', title: 'Generated title must not be used' }),
+    ].join('\n');
+    expect(
+      (await putFile('claude-projects', `-home-tester-src-demo/${TITLE_SESSION}.jsonl`, titleContent)).status,
+    ).toBe(201);
+
+    const teammateTitleContent = [
+      ccSystemLine(TEAMMATE_TITLE_SESSION, { uuid: 'teammate-system', text: 'Teammate system prelude' }),
+      ccLine(TEAMMATE_TITLE_SESSION, { uuid: 'teammate-agents', parentUuid: 'teammate-system', role: 'user', text: '# AGENTS.md instructions\nInjected before teammate' }),
+      ccLine(TEAMMATE_TITLE_SESSION, {
+        uuid: 'teammate-message',
+        parentUuid: 'teammate-agents',
+        role: 'user',
+        text: '<teammate-message teammate_id="team-lead" summary="Fix &amp; verify &quot;quoted&quot; &#x1F680;">Ignore wrapper body</teammate-message>',
+      }),
+      ccLine(TEAMMATE_TITLE_SESSION, { uuid: 'teammate-response', parentUuid: 'teammate-message', role: 'assistant', text: 'teammatetitlequerysentinel response' }),
+    ].join('\n');
+    expect(
+      (await putFile('claude-projects', `-home-tester-src-demo/${TEAMMATE_TITLE_SESSION}.jsonl`, teammateTitleContent)).status,
+    ).toBe(201);
+
+    const serverToolTitleContent = [
+      ccSystemLine(SERVER_TOOL_TITLE_SESSION, { uuid: 'server-tool-system', text: 'Server tool system prelude' }),
+      ccLine(SERVER_TOOL_TITLE_SESSION, {
+        uuid: 'server-tool-with-text',
+        parentUuid: 'server-tool-system',
+        role: 'assistant',
+        unknownFirst: 'server_tool_use',
+        text: 'Real text after server tool metadata',
+      }),
+      ccLine(SERVER_TOOL_TITLE_SESSION, { uuid: 'server-tool-query', parentUuid: 'server-tool-with-text', role: 'user', text: 'servertooltitlequerysentinel response' }),
+    ].join('\n');
+    expect(
+      (await putFile('claude-projects', `-home-tester-src-demo/${SERVER_TOOL_TITLE_SESSION}.jsonl`, serverToolTitleContent)).status,
+    ).toBe(201);
+
+    const imageForwardTitleContent = [
+      ccLine(IMAGE_FORWARD_TITLE_SESSION, {
+        uuid: 'image-forward-prompt',
+        parentUuid: null,
+        role: 'user',
+        text: [
+          '<image name=[Image #1] path="C:/src/harmonic-analyzer/cad/out/png/cone-gear-shaft_drawing.png">\n</image>',
+          '<image name=[Image #2] path="C:/src/harmonic-analyzer/cad/out/png/cone-gear-assembly.png">\n</image>',
+          '<image name=[Image #3] path="C:/src/harmonic-analyzer/cad/out/png/cone-gear-detail.png">\n</image>',
+          'Please inspect the cone gear shaft drawing',
+        ].join('\n\n'),
+      }),
+      ccLine(IMAGE_FORWARD_TITLE_SESSION, { uuid: 'image-forward-query', parentUuid: 'image-forward-prompt', role: 'assistant', text: 'forwardimagetitlequerysentinel response' }),
+    ].join('\n');
+    expect(
+      (await putFile('claude-projects', `-home-tester-src-demo/${IMAGE_FORWARD_TITLE_SESSION}.jsonl`, imageForwardTitleContent)).status,
+    ).toBe(201);
+
     const offsetMatchContent = [
       ccLine(OFFSET_MATCH_SESSION, { uuid: 'om-1', parentUuid: null, role: 'user', text: 'offset first turn' }),
       ccLine(OFFSET_MATCH_SESSION, { uuid: 'om-2', parentUuid: 'om-1', role: 'assistant', text: 'offset second turn' }),
@@ -237,6 +362,136 @@ describe('viewer', () => {
     ).toBe(201);
 
     await drainQueue();
+
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+         VALUES (?1, 'claude-code', 'testbox-wsl', 'Stored prefixed-turn title', '2026-07-01T10:00:00Z', 'ready')`,
+      ).bind(PREFIXED_TURN_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text) VALUES
+         (?1, 1, 0, 0, 'user', 'text', '# AGENTS.md instructions injected in first block'),
+         (?1, 1, 0, 1, 'user', 'text', 'Same-turn text must not become the title'),
+         (?1, 1, 1, 0, 'assistant', 'text', 'First later turn title'),
+         (?1, 1, 2, 0, 'user', 'text', 'sameturntitlesentinel query target')`,
+      ).bind(PREFIXED_TURN_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+         VALUES (?1, 'image-title-test', 'testbox-wsl', 'Stored Windows image title', '2026-07-01T10:00:00Z', 'ready')`,
+      ).bind(IMAGE_WINDOWS_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks
+           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
+         (?1, 1, 0, 0, 'user', 'text', ?2, 1),
+         (?1, 1, 0, 1, 'user', 'text', 'Windows image prompt after wrapper-only block', 1),
+         (?1, 1, 1, 0, 'assistant', 'text', 'windowsimagetitlequerysentinel response', 1)`,
+      ).bind(
+        IMAGE_WINDOWS_TITLE_SESSION,
+        [
+          '<image name=[Image #1] path="C:\\src\\harmonic-analyzer\\out\\sample-1.jpg">\r\n</image>',
+          '<image name=[Image #2] path="C:\\src\\harmonic-analyzer\\out\\sample-2.jpg">\r\n</image>',
+          '<image name=[Image #3] path="C:\\src\\harmonic-analyzer\\out\\sample-3.jpg">\r\n</image>',
+        ].join('\r\n\r\n'),
+      ),
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+         VALUES (?1, 'main-path-title-test', 'testbox-wsl', 'Stored main-path title', '2026-07-01T10:00:00Z', 'ready')`,
+      ).bind(OFF_MAIN_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks
+           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
+         (?1, 1, 0, 0, 'user', 'text', 'Abandoned earliest title', 0),
+         (?1, 1, 1, 0, 'user', 'text', 'Main path interaction title', 1),
+         (?1, 1, 2, 0, 'assistant', 'text', 'mainpathtitlequerysentinel response', 1)`,
+      ).bind(OFF_MAIN_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+         VALUES (?1, 'title-fallback-test', 'testbox-wsl', 'Stored fallback title', '2026-07-01T10:00:00Z', 'ready')`,
+      ).bind(STORED_FALLBACK_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks
+           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
+         (?1, 1, 0, 0, 'user', 'image', NULL, 1),
+         (?1, 1, 1, 0, 'assistant', 'tool_use', 'fallbacktitlequerysentinel tool metadata', 1)`,
+      ).bind(STORED_FALLBACK_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+         VALUES (?1, 'scheduled-title-test', 'testbox-wsl', 'Stored scheduled title', '2026-07-01T11:00:00Z', 'ready')`,
+      ).bind(SCHEDULED_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks
+           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
+         (?1, 1, 0, 0, 'user', 'text', ?2, 1),
+         (?1, 1, 1, 0, 'assistant', 'text', 'scheduledtitlequerysentinel response', 1)`,
+      ).bind(
+        SCHEDULED_TITLE_SESSION,
+        '<scheduled-task name="update-daily-notes" file="C:\\Users\\pedro\\.claude\\scheduled-tasks\\update-daily-notes\\SKILL.md">Scheduled body must not become the title</scheduled-task>',
+      ),
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+         VALUES (?1, 'scheduled-title-test', 'testbox-wsl', 'Stored encoded scheduled title', '2026-07-01T10:00:00Z', 'ready')`,
+      ).bind(ENCODED_SCHEDULED_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks
+           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
+         (?1, 1, 0, 0, 'user', 'text', ?2, 1),
+         (?1, 1, 1, 0, 'assistant', 'text', 'encodedscheduledtitlequerysentinel response', 1)`,
+      ).bind(
+        ENCODED_SCHEDULED_TITLE_SESSION,
+        '<scheduled-task name="update&amp;daily&#45;notes" file="C:\\Users\\pedro\\.claude\\scheduled-tasks\\update-daily-notes\\SKILL.md">Encoded scheduled body</scheduled-task>',
+      ),
+    ]);
+    await testEnv.DB.prepare(
+      `INSERT INTO blocks_fts(rowid, text)
+       SELECT id, text FROM blocks
+       WHERE session_id IN (?1, ?2, ?3, ?4, ?5, ?6) AND text IS NOT NULL`,
+    ).bind(
+      PREFIXED_TURN_TITLE_SESSION,
+      IMAGE_WINDOWS_TITLE_SESSION,
+      OFF_MAIN_TITLE_SESSION,
+      STORED_FALLBACK_TITLE_SESSION,
+      SCHEDULED_TITLE_SESSION,
+      ENCODED_SCHEDULED_TITLE_SESSION,
+    ).run();
+
+    const wrapperStatements: D1PreparedStatement[] = [];
+    for (let i = 0; i < WRAPPER_TITLE_CASES.length; i++) {
+      const titleCase = WRAPPER_TITLE_CASES[i]!;
+      wrapperStatements.push(
+        testEnv.DB.prepare(
+          `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+           VALUES (?1, 'wrapper-title-test', 'testbox-wsl', 'Stored wrapper title', ?2, 'ready')`,
+        ).bind(titleCase.id, `2026-07-02T10:00:0${i}Z`),
+        testEnv.DB.prepare(
+          `INSERT INTO blocks
+             (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
+           (?1, 1, 0, 0, 'user', 'text', ?2, 1),
+           (?1, 1, 1, 0, 'assistant', 'text', ?3, 1)`,
+        ).bind(titleCase.id, titleCase.source, `${titleCase.query} response`),
+      );
+    }
+    wrapperStatements.push(
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+         VALUES (?1, 'injected-title-test', 'testbox-wsl', 'Stored injected title', '2026-07-02T11:00:00Z', 'ready')`,
+      ).bind(INJECTED_WRAPPERS_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks
+           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
+         (?1, 1, 0, 0, 'user', 'text', '<codex_internal_context>injected</codex_internal_context>', 1),
+         (?1, 1, 1, 0, 'assistant', 'text', '<system-reminder>injected</system-reminder>', 1),
+         (?1, 1, 2, 0, 'user', 'text', '<environment_context>injected</environment_context>', 1),
+         (?1, 1, 3, 0, 'assistant', 'text', '<hook_prompt>injected</hook_prompt>', 1),
+         (?1, 1, 4, 0, 'user', 'text', 'First interaction after injected wrappers', 1),
+         (?1, 1, 5, 0, 'assistant', 'text', 'injectedwrapperstitlequerysentinel response', 1)`,
+      ).bind(INJECTED_WRAPPERS_TITLE_SESSION),
+    );
+    await testEnv.DB.batch(wrapperStatements);
+    await testEnv.DB.prepare(
+      `INSERT INTO blocks_fts(rowid, text)
+       SELECT id, text FROM blocks
+       WHERE (session_id = ?1 OR session_id LIKE 'wrapper-title-%') AND text IS NOT NULL`,
+    ).bind(INJECTED_WRAPPERS_TITLE_SESSION).run();
   });
 
   it('search page returns 200 with a highlighted snippet and a link to the session', async () => {
@@ -249,11 +504,179 @@ describe('viewer', () => {
   });
 
   it('empty query lists recent sessions', async () => {
-    const res = await SELF.fetch('https://sessions.vza.net/');
+    const res = await SELF.fetch('https://sessions.vza.net/?harness=claude-code');
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('Recent sessions');
     expect(html).toContain(`/s/${BIG_SESSION}`);
+  });
+
+  it('titles recent sessions from the first user/agent text, excluding system instructions, hooks, and tools', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?harness=claude-code')).text();
+    expect(html).toContain(`<a href="/s/${TITLE_SESSION}">First real title interaction</a>`);
+    expect(html).not.toContain('Generated title must not be used');
+    expect(html).not.toContain('System prompt must not become the title');
+    expect(html).not.toContain('Hook output must not become the title');
+    expect(html).not.toContain('Tool result must not become the title');
+    expect(html).not.toContain('Injected agent instructions');
+    expect(html).not.toContain('Injected local command');
+    expect(html).not.toContain('Injected plugin list');
+    expect(html).not.toContain('Injected command');
+    expect(html).not.toContain('Injected stdout');
+    expect(html).toContain(`<a href="/s/${TEAMMATE_TITLE_SESSION}">Fix &amp; verify &quot;quoted&quot; 🚀</a>`);
+
+    const sorted = await (await SELF.fetch('https://sessions.vza.net/?harness=claude-code&sort=total_tokens')).text();
+    expect(sorted).toContain(`<a href="/s/${TITLE_SESSION}">First real title interaction</a>`);
+  });
+
+  it('titles query results from the first user/agent text, not the matching turn or stored title', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=titlequerysentinel')).text();
+    expect(html).toContain(`<a href="/s/${TITLE_SESSION}?page=1#t10">First real title interaction</a>`);
+    expect(html).not.toContain('Generated title must not be used');
+  });
+
+  it('uses the decoded team-lead teammate summary as the title', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=teammatetitlequerysentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${TEAMMATE_TITLE_SESSION}?page=1#t3">Fix &amp; verify &quot;quoted&quot; 🚀</a>`,
+    );
+    expect(html).not.toContain('Ignore wrapper body');
+  });
+
+  it('uses the decoded scheduled-task name instead of its Windows path or body', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=scheduledtitlequerysentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${SCHEDULED_TITLE_SESSION}?page=1#t1">update-daily-notes</a>`,
+    );
+    expect(html).not.toContain('C:\\Users\\pedro');
+    expect(html).not.toContain('Scheduled body must not become the title');
+
+    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=scheduled-title-test')).text();
+    expect(recent).toContain(`<a href="/s/${SCHEDULED_TITLE_SESSION}">update-daily-notes</a>`);
+    expect(recent).not.toContain('C:\\Users\\pedro');
+    expect(recent).not.toContain('Scheduled body must not become the title');
+  });
+
+  it('decodes named and numeric entities in a scheduled-task name', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=encodedscheduledtitlequerysentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${ENCODED_SCHEDULED_TITLE_SESSION}?page=1#t1">update&amp;daily-notes</a>`,
+    );
+  });
+
+  it('normalizes nested, teammate, JSON-assignment, command, and task wrappers', async () => {
+    for (const titleCase of WRAPPER_TITLE_CASES) {
+      const html = await (await SELF.fetch(`https://sessions.vza.net/?q=${titleCase.query}`)).text();
+      expect(html).toContain(
+        `<a href="/s/${titleCase.id}?page=1#t1">${titleCase.expectedHtml}</a>`,
+      );
+    }
+
+    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=wrapper-title-test')).text();
+    for (const titleCase of WRAPPER_TITLE_CASES) {
+      expect(recent).toContain(`<a href="/s/${titleCase.id}">${titleCase.expectedHtml}</a>`);
+    }
+    expect(recent).not.toContain('Description must not title');
+    expect(recent).not.toContain('Body must not title');
+  });
+
+  it('skips newly recognized injected wrapper turns', async () => {
+    const query = await (await SELF.fetch('https://sessions.vza.net/?q=injectedwrapperstitlequerysentinel')).text();
+    expect(query).toContain(
+      `<a href="/s/${INJECTED_WRAPPERS_TITLE_SESSION}?page=1#t5">First interaction after injected wrappers</a>`,
+    );
+
+    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=injected-title-test')).text();
+    expect(recent).toContain(
+      `<a href="/s/${INJECTED_WRAPPERS_TITLE_SESSION}">First interaction after injected wrappers</a>`,
+    );
+  });
+
+  it('rejects the entire turn when its first text block has an injected prefix', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=sameturntitlesentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${PREFIXED_TURN_TITLE_SESSION}?page=1#t2">First later turn title</a>`,
+    );
+    expect(html).not.toContain('Same-turn text must not become the title');
+  });
+
+  it('skips preserved server tool metadata without suppressing real text later in the same turn', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=servertooltitlequerysentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${SERVER_TOOL_TITLE_SESSION}?page=1#t2">Real text after server tool metadata</a>`,
+    );
+    expect(html).not.toContain('{&quot;type&quot;:&quot;server_tool_use&quot;');
+  });
+
+  it('strips every consecutive leading image wrapper before a prompt', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=forwardimagetitlequerysentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${IMAGE_FORWARD_TITLE_SESSION}?page=1#t1">Please inspect the cone gear shaft drawing</a>`,
+    );
+    expect(html).not.toContain('cone-gear-shaft_drawing.png');
+  });
+
+  it('ignores multiple image-only wrappers and uses later text in the same turn', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=windowsimagetitlequerysentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${IMAGE_WINDOWS_TITLE_SESSION}?page=1#t1">Windows image prompt after wrapper-only block</a>`,
+    );
+    expect(html).not.toContain('C:\\src\\harmonic-analyzer');
+  });
+
+  it('keeps first-interaction title lookup on the session block index', async () => {
+    const plan = await testEnv.DB.prepare(
+      `EXPLAIN QUERY PLAN
+       SELECT ${firstInteractionTitleCandidateSql('sessions')}
+       FROM sessions
+       WHERE session_id = ?1`,
+    ).bind(IMAGE_FORWARD_TITLE_SESSION).all<{ detail: string }>();
+    const details = plan.results.map((row) => row.detail).join('\n');
+    expect(details).toContain('SEARCH title_block USING INDEX blocks_session (session_id=?)');
+    expect(details).not.toContain('SCAN title_block');
+  });
+
+  it('limits broad FTS matches before resolving interaction titles', async () => {
+    const searchPlan = await testEnv.DB.prepare(
+      `EXPLAIN QUERY PLAN ${searchHitsSql('', null, 20, 0)}`,
+    ).bind('filler').all<{ detail: string }>();
+    const searchDetails = searchPlan.results.map((row) => row.detail).join('\n');
+    expect(searchDetails).toContain('SCAN blocks_fts VIRTUAL TABLE');
+    expect(searchDetails).not.toContain('title_block');
+
+    const titlePlan = await testEnv.DB.prepare(
+      `EXPLAIN QUERY PLAN ${interactionTitlesSql(2)}`,
+    ).bind(SEARCH_SESSION, BIG_SESSION).all<{ detail: string }>();
+    const titleDetails = titlePlan.results.map((row) => row.detail).join('\n');
+    expect(titleDetails).toContain('SEARCH title_block USING INDEX blocks_session (session_id=?)');
+    expect(titleDetails).not.toContain('blocks_fts');
+  });
+
+  it('ignores abandoned title blocks and chooses the first main-path interaction', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=mainpathtitlequerysentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${OFF_MAIN_TITLE_SESSION}?page=1#t2">Main path interaction title</a>`,
+    );
+    expect(html).not.toContain('Abandoned earliest title');
+  });
+
+  it('falls back to the stored title when a session has only image and tool blocks', async () => {
+    const query = await (await SELF.fetch('https://sessions.vza.net/?q=fallbacktitlequerysentinel')).text();
+    expect(query).toContain(
+      `<a href="/s/${STORED_FALLBACK_TITLE_SESSION}?page=1#t1">Stored fallback title</a>`,
+    );
+
+    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=title-fallback-test')).text();
+    expect(recent).toContain(
+      `<a href="/s/${STORED_FALLBACK_TITLE_SESSION}">Stored fallback title</a>`,
+    );
+
+    const sorted = await (await SELF.fetch(
+      'https://sessions.vza.net/?harness=title-fallback-test&sort=total_tokens',
+    )).text();
+    expect(sorted).toContain(
+      `<a href="/s/${STORED_FALLBACK_TITLE_SESSION}">Stored fallback title</a>`,
+    );
   });
 
   it('marks a selected repo facet active with a toggle-off link that drops the repo param', async () => {
@@ -810,7 +1233,7 @@ describe('viewer result pagination and facet layout', () => {
         testEnv.DB.prepare(
           `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text)
            VALUES (?1, 1, 0, 0, 'user', 'text', ?2)`,
-        ).bind(id, `${PAGINATION_MARKER} item ${i}`),
+        ).bind(id, `Pagination item ${i} ${PAGINATION_MARKER}`),
       );
     }
     await testEnv.DB.batch(statements);
@@ -833,9 +1256,9 @@ describe('viewer result pagination and facet layout', () => {
       ),
       testEnv.DB.prepare(
         `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text) VALUES
-         ('viewer-sort-short', 1, 0, 0, 'user', 'text', 'viewersortmarker'),
-         ('viewer-sort-long', 1, 0, 0, 'user', 'text', 'viewersortmarker'),
-         ('viewer-sort-reasoning', 1, 0, 0, 'user', 'text', 'viewersortmarker')`,
+         ('viewer-sort-short', 1, 0, 0, 'user', 'text', 'Short session viewersortmarker'),
+         ('viewer-sort-long', 1, 0, 0, 'user', 'text', 'Long session viewersortmarker'),
+         ('viewer-sort-reasoning', 1, 0, 0, 'user', 'text', 'Reasoning-heavy session viewersortmarker')`,
       ),
     ]);
     await testEnv.DB.prepare(
