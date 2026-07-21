@@ -1,6 +1,7 @@
 import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import worker from '../src/index';
+import { firstInteractionTitleCandidateSql } from '../src/session-title';
 import { viewerRoute } from '../src/viewer/router';
 import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures';
 import { blobVersionOf } from '../src/viewer/session';
@@ -337,7 +338,12 @@ describe('viewer', () => {
         uuid: 'image-forward-prompt',
         parentUuid: null,
         role: 'user',
-        text: '<image name=[Image #1] path="C:/src/harmonic-analyzer/.claude/worktrees/batch-cone/cad/out/png/cone-gear-shaft_drawing.png">\n</image>\n\nPlease inspect the cone gear shaft drawing',
+        text: [
+          '<image name=[Image #1] path="C:/src/harmonic-analyzer/cad/out/png/cone-gear-shaft_drawing.png">\n</image>',
+          '<image name=[Image #2] path="C:/src/harmonic-analyzer/cad/out/png/cone-gear-assembly.png">\n</image>',
+          '<image name=[Image #3] path="C:/src/harmonic-analyzer/cad/out/png/cone-gear-detail.png">\n</image>',
+          'Please inspect the cone gear shaft drawing',
+        ].join('\n\n'),
       }),
       ccLine(IMAGE_FORWARD_TITLE_SESSION, { uuid: 'image-forward-query', parentUuid: 'image-forward-prompt', role: 'assistant', text: 'forwardimagetitlequerysentinel response' }),
     ].join('\n');
@@ -380,7 +386,11 @@ describe('viewer', () => {
          (?1, 1, 1, 0, 'assistant', 'text', 'windowsimagetitlequerysentinel response', 1)`,
       ).bind(
         IMAGE_WINDOWS_TITLE_SESSION,
-        '<image name=[Image #1] path="C:\\src\\harmonic-analyzer\\.claude\\worktrees\\pose-bench-sol\\comparisons\\bench\\out\\sandbox\\sample.jpg">\r\n</image>\r\n',
+        [
+          '<image name=[Image #1] path="C:\\src\\harmonic-analyzer\\out\\sample-1.jpg">\r\n</image>',
+          '<image name=[Image #2] path="C:\\src\\harmonic-analyzer\\out\\sample-2.jpg">\r\n</image>',
+          '<image name=[Image #3] path="C:\\src\\harmonic-analyzer\\out\\sample-3.jpg">\r\n</image>',
+        ].join('\r\n\r\n'),
       ),
       testEnv.DB.prepare(
         `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
@@ -597,7 +607,7 @@ describe('viewer', () => {
     expect(html).not.toContain('{&quot;type&quot;:&quot;server_tool_use&quot;');
   });
 
-  it('strips a leading image wrapper with the user-provided forward-slash path', async () => {
+  it('strips every consecutive leading image wrapper before a prompt', async () => {
     const html = await (await SELF.fetch('https://sessions.vza.net/?q=forwardimagetitlequerysentinel')).text();
     expect(html).toContain(
       `<a href="/s/${IMAGE_FORWARD_TITLE_SESSION}?page=1#t1">Please inspect the cone gear shaft drawing</a>`,
@@ -605,12 +615,24 @@ describe('viewer', () => {
     expect(html).not.toContain('cone-gear-shaft_drawing.png');
   });
 
-  it('ignores a Windows image-only block and uses later text in the same turn', async () => {
+  it('ignores multiple image-only wrappers and uses later text in the same turn', async () => {
     const html = await (await SELF.fetch('https://sessions.vza.net/?q=windowsimagetitlequerysentinel')).text();
     expect(html).toContain(
       `<a href="/s/${IMAGE_WINDOWS_TITLE_SESSION}?page=1#t1">Windows image prompt after wrapper-only block</a>`,
     );
     expect(html).not.toContain('C:\\src\\harmonic-analyzer');
+  });
+
+  it('keeps first-interaction title lookup on the session block index', async () => {
+    const plan = await testEnv.DB.prepare(
+      `EXPLAIN QUERY PLAN
+       SELECT ${firstInteractionTitleCandidateSql('sessions')}
+       FROM sessions
+       WHERE session_id = ?1`,
+    ).bind(IMAGE_FORWARD_TITLE_SESSION).all<{ detail: string }>();
+    const details = plan.results.map((row) => row.detail).join('\n');
+    expect(details).toContain('SEARCH title_block USING INDEX blocks_session (session_id=?)');
+    expect(details).not.toContain('SCAN title_block');
   });
 
   it('ignores abandoned title blocks and chooses the first main-path interaction', async () => {

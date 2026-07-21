@@ -165,10 +165,20 @@ function startsElementSql(textSql: string, prefix: string): string {
 
 function interactionTextSql(textSql: string): string {
   const text = leadingTrimSql(textSql);
-  const afterImage = `substr(${text}, instr(${text}, ${sqlString(IMAGE_CLOSE)}) + ${IMAGE_CLOSE.length})`;
-  const hasImage = `substr(${text}, 1, ${IMAGE_PREFIX.length}) = ${sqlString(IMAGE_PREFIX)} ` +
-    `AND instr(${text}, ${sqlString(IMAGE_CLOSE)}) > 0`;
-  return `(CASE WHEN ${hasImage} THEN ${leadingTrimSql(afterImage)} ELSE ${text} END)`;
+  const remainder = `substr(remaining, instr(remaining, ${sqlString(IMAGE_CLOSE)}) + ${IMAGE_CLOSE.length})`;
+  const hasImage = `substr(remaining, 1, ${IMAGE_PREFIX.length}) = ${sqlString(IMAGE_PREFIX)} ` +
+    `AND instr(remaining, ${sqlString(IMAGE_CLOSE)}) > 0`;
+  return `(WITH RECURSIVE image_prefixes(remaining, depth) AS (
+            SELECT ${text}, 0
+            UNION ALL
+            SELECT ${leadingTrimSql(remainder)}, depth + 1
+            FROM image_prefixes
+            WHERE ${hasImage}
+          )
+          SELECT remaining
+          FROM image_prefixes
+          ORDER BY depth DESC
+          LIMIT 1)`;
 }
 
 function leadingTrimSql(textSql: string): string {
