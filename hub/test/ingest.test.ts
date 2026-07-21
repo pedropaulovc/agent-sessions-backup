@@ -75,6 +75,16 @@ const SESSION_CONTENT = [
   ccAssistantLine({ uuid: 'a2', parentUuid: 'u2', text: 'Gallium melts just below body temperature.' }),
 ].join('\n');
 
+function projectSessionLine(sessionId: string, cwd: string, text: string): string {
+  const line = JSON.parse(ccUserLine({ uuid: `${sessionId}-user`, text })) as {
+    sessionId: string;
+    cwd: string;
+  };
+  line.sessionId = sessionId;
+  line.cwd = cwd;
+  return JSON.stringify(line);
+}
+
 describe('ingest pipeline end-to-end', () => {
   beforeAll(async () => {
     const res = await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${CC_SESSION_ID}.jsonl`, SESSION_CONTENT);
@@ -135,6 +145,35 @@ describe('ingest pipeline end-to-end', () => {
     });
     const body2 = (await res2.json()) as { hits: unknown[] };
     expect(body2.hits).toHaveLength(1);
+  });
+
+  it('sets project_name on insert and refreshes it on reparse and conflict update', async () => {
+    const sessionId = '70707070-7070-4707-8707-707070707070';
+    const relpath = `project-ingest/${sessionId}.jsonl`;
+    const first = projectSessionLine(sessionId, '/home/tester/src/alpha-wt-feature', 'first project payload');
+    expect((await putFile('testbox-wsl', 'claude-projects', relpath, first)).status).toBe(201);
+    await drainQueue();
+
+    const inserted = await testEnv.DB.prepare('SELECT project_name, canonical_file_id FROM sessions WHERE session_id = ?1')
+      .bind(sessionId)
+      .first<{ project_name: string | null; canonical_file_id: number }>();
+    expect(inserted?.project_name).toBe('alpha');
+
+    await testEnv.DB.prepare("UPDATE sessions SET project_name = 'stale' WHERE session_id = ?1").bind(sessionId).run();
+    const file = await testEnv.DB.prepare('SELECT id, r2_key FROM files WHERE id = ?1')
+      .bind(inserted!.canonical_file_id)
+      .first<{ id: number; r2_key: string }>();
+    await deliverOne(file!.id, file!.r2_key, undefined, 'reindex');
+    expect(
+      await testEnv.DB.prepare('SELECT project_name FROM sessions WHERE session_id = ?1').bind(sessionId).first(),
+    ).toMatchObject({ project_name: 'alpha' });
+
+    const changed = projectSessionLine(sessionId, 'C:\\src\\beta-project\\nested', 'changed project payload');
+    expect((await putFile('testbox-wsl', 'claude-projects', relpath, changed)).status).toBe(201);
+    await drainQueue();
+    expect(
+      await testEnv.DB.prepare('SELECT project_name FROM sessions WHERE session_id = ?1').bind(sessionId).first(),
+    ).toMatchObject({ project_name: 'beta-project' });
   });
 
   it('dedupes the same session uploaded from a second machine (superseded, not double-indexed)', async () => {
