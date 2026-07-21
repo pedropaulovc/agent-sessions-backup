@@ -21,13 +21,14 @@ repo_path AS (
         OR lower(repo) LIKE 'ssh://%' OR lower(repo) LIKE 'git://%' OR lower(repo) LIKE 'file://%' THEN
         CASE
           WHEN instr(substr(repo, instr(repo, '://') + 3), '/') > 0
+           AND (lower(repo) LIKE 'file://%' OR instr(substr(repo, instr(repo, '://') + 3), '/') > 1)
           THEN substr(
             substr(repo, instr(repo, '://') + 3),
             instr(substr(repo, instr(repo, '://') + 3), '/') + 1
           )
           ELSE NULL
         END
-      WHEN repo GLOB '*@*:*/*' THEN substr(repo, instr(repo, ':') + 1)
+      WHEN repo GLOB '*@*:*' AND instr(repo, ':') < length(repo) THEN substr(repo, instr(repo, ':') + 1)
       ELSE NULL
     END AS path
   FROM source
@@ -64,52 +65,69 @@ repo_name AS (
   SELECT
     session_id,
     CASE
-      WHEN part IS NULL OR part IN ('', '.', '..', '.git') THEN NULL
-      WHEN lower(part) LIKE '%.git' THEN substr(part, 1, length(part) - 4)
-      ELSE part
+      WHEN part IS NULL OR trim(part) IN ('', '.', '..', '.git') OR instr(part, char(92)) > 0 THEN NULL
+      WHEN lower(trim(part)) LIKE '%.git' THEN substr(trim(part), 1, length(trim(part)) - 4)
+      ELSE trim(part)
     END AS name
   FROM repo_parts
   WHERE rest = '' AND depth > 0
+),
+cwd_shape AS (
+  SELECT
+    session_id,
+    cwd,
+    '/' || ltrim(cwd, '/') AS rooted,
+    instr(lower(cwd), '-src-') AS encoded_src,
+    instr(lower(cwd), '--claude-worktrees-') AS encoded_worktree
+  FROM repo_clean
 ),
 cwd_candidate AS (
   SELECT
     session_id,
     CASE
-      WHEN instr(lower(cwd), 'c--src-') > 0
-       AND (instr(lower(cwd), 'c--src-') = 1 OR substr(cwd, instr(lower(cwd), 'c--src-') - 1, 1) = '/')
-       AND instr(lower(cwd), '--claude-worktrees-') > instr(lower(cwd), 'c--src-') + 7
-       AND instr(substr(lower(cwd), instr(lower(cwd), 'c--src-') + 7), 'c--src-') = 0
-       AND instr(substr(lower(cwd), instr(lower(cwd), '--claude-worktrees-') + 19), '--claude-worktrees-') = 0
+      WHEN encoded_src > 0
+       AND encoded_worktree > encoded_src + 5
+       AND instr(substr(lower(cwd), encoded_src + 5), '-src-') = 0
+       AND instr(substr(lower(cwd), encoded_worktree + 19), '--claude-worktrees-') = 0
+       AND length(cwd) >= encoded_worktree + 19
+       AND substr(cwd, encoded_worktree + 19, 1) <> '/'
       THEN substr(
         cwd,
-        instr(lower(cwd), 'c--src-') + 7,
-        instr(lower(cwd), '--claude-worktrees-') - instr(lower(cwd), 'c--src-') - 7
+        encoded_src + 5,
+        encoded_worktree - encoded_src - 5
       )
-      WHEN instr(lower('/' || ltrim(cwd, '/')), '/src/') > 0 THEN
+      WHEN encoded_src > 0 AND encoded_worktree > encoded_src THEN NULL
+      WHEN instr(cwd, '//') = 0
+       AND instr(rooted, '/./') = 0
+       AND instr(rooted, '/../') = 0
+       AND substr(rooted, -2) <> '/.'
+       AND substr(rooted, -3) <> '/..'
+       AND instr(lower(rooted), '/src/') > 0 THEN
         CASE
-          WHEN instr(substr('/' || ltrim(cwd, '/'), instr(lower('/' || ltrim(cwd, '/')), '/src/') + 5), '/') > 0
+          WHEN instr(substr(rooted, instr(lower(rooted), '/src/') + 5), '/') > 0
           THEN substr(
-            substr('/' || ltrim(cwd, '/'), instr(lower('/' || ltrim(cwd, '/')), '/src/') + 5),
+            substr(rooted, instr(lower(rooted), '/src/') + 5),
             1,
-            instr(substr('/' || ltrim(cwd, '/'), instr(lower('/' || ltrim(cwd, '/')), '/src/') + 5), '/') - 1
+            instr(substr(rooted, instr(lower(rooted), '/src/') + 5), '/') - 1
           )
-          ELSE substr('/' || ltrim(cwd, '/'), instr(lower('/' || ltrim(cwd, '/')), '/src/') + 5)
+          ELSE substr(rooted, instr(lower(rooted), '/src/') + 5)
         END
       ELSE NULL
     END AS name
-  FROM repo_clean
+  FROM cwd_shape
 ),
 cwd_name AS (
   SELECT
     session_id,
     CASE
-      WHEN name IS NULL OR trim(name) IN ('', '.', '..')
+      WHEN name IS NULL OR trim(name) IN ('', '.', '..') OR instr(trim(name), '/') > 0
         OR lower(trim(name)) IN ('src', '.claude', 'worktrees', 'claude-worktrees') THEN NULL
-      WHEN instr(lower(name), '-wt-') > 1
-        AND instr(substr(lower(name), instr(lower(name), '-wt-') + 4), '-wt-') = 0
-        AND instr(lower(name), '-wt-') + 4 <= length(name)
-      THEN substr(name, 1, instr(lower(name), '-wt-') - 1)
-      WHEN instr(lower(name), '-wt-') > 0 THEN NULL
+      WHEN lower(trim(name)) = '.worktrees' THEN NULL
+      WHEN instr(lower(trim(name)), '-wt-') > 1
+        AND instr(substr(lower(trim(name)), instr(lower(trim(name)), '-wt-') + 4), '-wt-') = 0
+        AND instr(lower(trim(name)), '-wt-') + 4 <= length(trim(name))
+      THEN substr(trim(name), 1, instr(lower(trim(name)), '-wt-') - 1)
+      WHEN instr(lower(trim(name)), '-wt-') > 0 THEN NULL
       ELSE trim(name)
     END AS name
   FROM cwd_candidate

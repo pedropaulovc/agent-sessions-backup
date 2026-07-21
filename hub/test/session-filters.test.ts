@@ -11,6 +11,20 @@ function facet(key: string) {
 }
 
 describe('session multi-value filters', () => {
+  it('registers project as a first-class repeated column facet', () => {
+    const project = facet('project_name');
+    expect(project).toMatchObject({
+      param: 'project',
+      kind: 'column',
+      column: 'project_name',
+      label: 'Project',
+    });
+
+    const filter = buildSessionFilterSql(new URLSearchParams('project=alpha&project=beta'), 'sessions');
+    expect(filter.clause).toBe('sessions.project_name IN (SELECT value FROM json_each(?1))');
+    expect(filter.binds).toEqual(['["alpha","beta"]']);
+  });
+
   it('stable-dedupes repeated values and caps each filter at 100', () => {
     const params = new URLSearchParams();
     params.append('harness', 'first');

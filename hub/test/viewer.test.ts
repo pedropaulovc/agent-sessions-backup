@@ -2,6 +2,7 @@ import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import worker from '../src/index';
 import { firstInteractionTitleCandidateSql } from '../src/session-title';
+import { deriveProjectName } from '../src/project-name';
 import { interactionTitlesSql, searchHitsSql } from '../src/api/search';
 import { buildSessionFilterSql } from '../src/session-filters';
 import { viewerRoute } from '../src/viewer/router';
@@ -1292,6 +1293,12 @@ describe('viewer result pagination and facet layout', () => {
   const MULTI_HARNESS_C = 'multi-harness-c';
   const MULTI_MACHINE_1 = 'multi-machine-1';
   const MULTI_MACHINE_2 = 'multi-machine-2';
+  const MULTI_PROJECT_ALPHA = deriveProjectName('/home/pedro/src/multi-project-alpha-wt-feature', null)!;
+  const MULTI_PROJECT_BETA = deriveProjectName('C:\\src\\multi-project-beta\\.claude\\worktrees\\fix', null)!;
+  const MULTI_PROJECT_GAMMA = deriveProjectName(
+    '/users/pedro/.claude/projects/C--src-multi-project-gamma--claude-worktrees-fix',
+    null,
+  )!;
 
   beforeAll(async () => {
     const statements: D1PreparedStatement[] = [];
@@ -1347,12 +1354,21 @@ describe('viewer result pagination and facet layout', () => {
     await testEnv.DB.batch([
       testEnv.DB.prepare(
         `INSERT INTO sessions
-           (session_id, harness, machine_id, os, primary_model, repo_url, title, started_at, ended_at, index_state) VALUES
-         ('viewer-multi-a1', ?1, ?4, 'linux', 'multi-model-a', 'https://example.test/repo-a', 'Multi A1', '2026-06-01T10:00:00Z', '2026-06-01T10:02:00Z', 'ready'),
-         ('viewer-multi-b1', ?2, ?4, 'windows', 'multi-model-b', 'https://example.test/repo-b', 'Multi B1', '2026-06-02T10:00:00Z', '2026-06-02T13:00:00Z', 'ready'),
-         ('viewer-multi-c1', ?3, ?4, 'linux', 'multi-model-c', 'https://example.test/repo-c', 'Multi C1', '2026-06-03T10:00:00Z', '2026-06-03T10:20:00Z', 'ready'),
-         ('viewer-multi-a2', ?1, ?5, 'linux', 'multi-model-a', 'https://example.test/repo-a', 'Multi A2', '2026-06-03T11:00:00Z', '2026-06-03T14:00:00Z', 'ready')`,
-      ).bind(MULTI_HARNESS_A, MULTI_HARNESS_B, MULTI_HARNESS_C, MULTI_MACHINE_1, MULTI_MACHINE_2),
+           (session_id, harness, machine_id, os, primary_model, repo_url, cwd, project_name, title, started_at, ended_at, index_state) VALUES
+         ('viewer-multi-a1', ?1, ?4, 'linux', 'multi-model-a', NULL, '/home/pedro/src/multi-project-alpha-wt-feature', ?6, 'Multi A1', '2026-06-01T10:00:00Z', '2026-06-01T10:02:00Z', 'ready'),
+         ('viewer-multi-b1', ?2, ?4, 'windows', 'multi-model-b', NULL, 'C:\\src\\multi-project-beta\\.claude\\worktrees\\fix', ?7, 'Multi B1', '2026-06-02T10:00:00Z', '2026-06-02T13:00:00Z', 'ready'),
+         ('viewer-multi-c1', ?3, ?4, 'linux', 'multi-model-c', NULL, 'C--src-multi-project-gamma--claude-worktrees-fix', ?8, 'Multi C1', '2026-06-03T10:00:00Z', '2026-06-03T10:20:00Z', 'ready'),
+         ('viewer-multi-a2', ?1, ?5, 'linux', 'multi-model-a', NULL, '/home/pedro/src/multi-project-alpha-wt-other', ?6, 'Multi A2', '2026-06-03T11:00:00Z', '2026-06-03T14:00:00Z', 'ready')`,
+      ).bind(
+        MULTI_HARNESS_A,
+        MULTI_HARNESS_B,
+        MULTI_HARNESS_C,
+        MULTI_MACHINE_1,
+        MULTI_MACHINE_2,
+        MULTI_PROJECT_ALPHA,
+        MULTI_PROJECT_BETA,
+        MULTI_PROJECT_GAMMA,
+      ),
       testEnv.DB.prepare(
         `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text) VALUES
          ('viewer-multi-a1', 1, 0, 0, 'user', 'text', 'Multi A1 ${MULTI_MARKER}'),
@@ -1396,6 +1412,7 @@ describe('viewer result pagination and facet layout', () => {
     expect(html).not.toContain('aria-label="Filter by Machine"');
     expect(html).not.toContain('aria-label="Filter by OS"');
     expect(html).not.toContain('aria-label="Filter by Model"');
+    expect(html).not.toContain('aria-label="Filter by Project"');
     expect(html).toContain('>Harness</h3>');
     expect(html).toContain('>Machine</h3>');
     expect(html).toContain(`✓ ${PAGINATION_HARNESS}</a>`);
@@ -1423,6 +1440,54 @@ describe('viewer result pagination and facet layout', () => {
     expect(search).toContain('Multi B1');
     expect(search).not.toContain('Multi C1');
     expect(search).not.toContain('Multi A2');
+  });
+
+  it('filters repeated worktree-derived projects in both recent and FTS paths', async () => {
+    const filters = `project=${MULTI_PROJECT_ALPHA}&project=${MULTI_PROJECT_BETA}&machine=${MULTI_MACHINE_1}`;
+    for (const query of ['', `q=${MULTI_MARKER}&`]) {
+      const html = await (await SELF.fetch(`https://sessions.vza.net/?${query}${filters}`)).text();
+      expect(html).toContain('Multi A1');
+      expect(html).toContain('Multi B1');
+      expect(html).not.toContain('Multi C1');
+      expect(html).not.toContain('Multi A2');
+      expect(html).toContain('>Project</h3>');
+      expect(html).toContain(`>✓ ${MULTI_PROJECT_ALPHA}</a>`);
+      expect(html).toContain(`>✓ ${MULTI_PROJECT_BETA}</a>`);
+    }
+  });
+
+  it('computes disjunctive project counts and retains a selected missing project at zero', async () => {
+    const response = await SELF.fetch(
+      `https://api.sessions.vza.net/api/v1/search?q=${MULTI_MARKER}&facets=1` +
+      `&project=${MULTI_PROJECT_ALPHA}&machine=${MULTI_MACHINE_1}`,
+      { headers: { 'x-dev-machine': 'testbox-wsl' } },
+    );
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      hits: Array<{ session_id: string }>;
+      facets: Record<string, Record<string, number>>;
+    };
+    expect(body.hits.map((hit) => hit.session_id)).toEqual(['viewer-multi-a1']);
+    expect(body.facets.project_name).toMatchObject({
+      [MULTI_PROJECT_ALPHA]: 1,
+      [MULTI_PROJECT_BETA]: 1,
+      [MULTI_PROJECT_GAMMA]: 1,
+    });
+    expect(body.facets.machine_id).toMatchObject({
+      [MULTI_MACHINE_1]: 1,
+      [MULTI_MACHINE_2]: 1,
+    });
+
+    const missing = 'multi-project-missing';
+    for (const query of ['', `q=${MULTI_MARKER}&`]) {
+      const html = await (await SELF.fetch(
+        `https://sessions.vza.net/?${query}project=${missing}&machine=${MULTI_MACHINE_1}`,
+      )).text();
+      expect(html).toContain(`>✓ ${missing}</a><span class="n">0</span>`);
+      expect(html).toContain(`>${MULTI_PROJECT_ALPHA}</a>`);
+      expect(html).toContain(`>${MULTI_PROJECT_BETA}</a>`);
+      expect(html).toContain(`>${MULTI_PROJECT_GAMMA}</a>`);
+    }
   });
 
   it('ORs repeated session date and time buckets consistently in recent and FTS paths', async () => {
@@ -1501,6 +1566,7 @@ describe('viewer result pagination and facet layout', () => {
     const html = await (await SELF.fetch(
       `https://sessions.vza.net/?q=${MULTI_MARKER}&harness=${MULTI_HARNESS_A}` +
       `&harness=${MULTI_HARNESS_B}&machine=${MULTI_MACHINE_1}&session_time=under-5m` +
+      `&project=${MULTI_PROJECT_ALPHA}&project=${MULTI_PROJECT_BETA}` +
       `&sort=total_tokens&limit=10&cursor=stale`,
     )).text();
     const searchForm = html.match(/<form class="search"[\s\S]*?<\/form>/)?.[0] ?? '';
@@ -1511,6 +1577,9 @@ describe('viewer result pagination and facet layout', () => {
       expect(form).toContain(`name="harness" value="${MULTI_HARNESS_B}"`);
       expect(form).toContain(`name="machine" value="${MULTI_MACHINE_1}"`);
       expect(form).toContain('name="session_time" value="under-5m"');
+      expect(form.match(/name="project"/g)).toHaveLength(2);
+      expect(form).toContain(`name="project" value="${MULTI_PROJECT_ALPHA}"`);
+      expect(form).toContain(`name="project" value="${MULTI_PROJECT_BETA}"`);
       expect(form).not.toContain('name="cursor"');
     }
 
@@ -1523,6 +1592,7 @@ describe('viewer result pagination and facet layout', () => {
     expect(clear).not.toContain('name="harness"');
     expect(clear).not.toContain('name="machine"');
     expect(clear).not.toContain('name="session_time"');
+    expect(clear).not.toContain('name="project"');
     expect(clear).not.toContain('name="cursor"');
   });
 
@@ -1577,6 +1647,20 @@ describe('viewer result pagination and facet layout', () => {
     expect(details).toContain('SEARCH sessions USING INDEX sessions_facets (harness=? AND machine_id=?)');
     expect(details).not.toContain('SCAN sessions');
     expect(filter.binds).toHaveLength(2);
+  });
+
+  it('keeps repeated project filters on sessions_project', async () => {
+    const filter = buildSessionFilterSql(
+      new URLSearchParams(`project=${MULTI_PROJECT_ALPHA}&project=${MULTI_PROJECT_BETA}`),
+      'sessions',
+    );
+    const plan = await testEnv.DB.prepare(
+      `EXPLAIN QUERY PLAN SELECT session_id FROM sessions WHERE ${filter.clause}`,
+    ).bind(...filter.binds).all<{ detail: string }>();
+    const details = plan.results.map((row) => row.detail).join('\n');
+    expect(details).toContain('SEARCH sessions USING INDEX sessions_project (project_name=?)');
+    expect(details).not.toContain('SCAN sessions');
+    expect(filter.binds).toEqual([JSON.stringify([MULTI_PROJECT_ALPHA, MULTI_PROJECT_BETA])]);
   });
 
   it('paginates and filters the default recent-session list, including recovery from the last page', async () => {
@@ -1704,8 +1788,8 @@ describe('viewer facet value discovery', () => {
       statements.push(
         testEnv.DB.prepare(
           `INSERT INTO sessions
-             (session_id, harness, machine_id, os, primary_model, repo_url, title, started_at, index_state)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '2026-07-20T12:00:00Z', 'ready')`,
+             (session_id, harness, machine_id, os, primary_model, repo_url, project_name, title, started_at, index_state)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, '2026-07-20T12:00:00Z', 'ready')`,
         ).bind(
           id,
           `facet-cap-harness-${suffix}`,
@@ -1713,6 +1797,7 @@ describe('viewer facet value discovery', () => {
           `facet-cap-os-${suffix}`,
           `facet-cap-model-${suffix}`,
           FACET_CAP_REPO,
+          `facet-cap-project-${suffix}`,
           `Facet cap ${suffix}`,
         ),
       );
@@ -1730,12 +1815,13 @@ describe('viewer facet value discovery', () => {
     ).run();
   });
 
-  it('keeps 200 harness, machine, OS, and model values reachable in recent and FTS lists', async () => {
+  it('keeps 200 harness, machine, OS, model, and project values reachable in recent and FTS lists', async () => {
     const expected = [
       ['Harness', 'facet-cap-harness-199'],
       ['Machine', 'facet-cap-machine-199'],
       ['OS', 'facet-cap-os-199'],
       ['Model', 'facet-cap-model-199'],
+      ['Project', 'facet-cap-project-199'],
     ] as const;
     const repo = encodeURIComponent(FACET_CAP_REPO);
     const recent = await (await SELF.fetch(`https://sessions.vza.net/?repo=${repo}`)).text();
