@@ -1349,7 +1349,7 @@ describe('viewer result pagination and facet layout', () => {
     return [...html.matchAll(/<a href="\/s\/(viewer-pagination-[^"]+)">/g)].map((match) => match[1]!);
   }
 
-  it('renders auto-submitting filters in a bounded, responsive left sidebar', async () => {
+  it('renders clickable facets and sort without redundant facet dropdowns', async () => {
     const res = await SELF.fetch(
       `https://sessions.vza.net/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&machine=${PAGINATION_MACHINE}`,
     );
@@ -1357,9 +1357,15 @@ describe('viewer result pagination and facet layout', () => {
     const html = await res.text();
     expect(html.indexOf('<aside class="sidebar facets">')).toBeLessThan(html.indexOf('<section class="content search-results">'));
     expect(html).toContain('class="facet-controls"');
-    expect(html).toContain('onchange="this.form.requestSubmit()"');
-    expect(html).toContain(`<option value="${PAGINATION_HARNESS}" selected>`);
-    expect(html).toContain(`<option value="${PAGINATION_MACHINE}" selected>`);
+    expect(html).toContain('aria-label="Sort sessions" onchange="this.form.requestSubmit()"');
+    expect(html).not.toContain('aria-label="Filter by Harness"');
+    expect(html).not.toContain('aria-label="Filter by Machine"');
+    expect(html).not.toContain('aria-label="Filter by OS"');
+    expect(html).not.toContain('aria-label="Filter by Model"');
+    expect(html).toContain('>Harness</h3>');
+    expect(html).toContain('>Machine</h3>');
+    expect(html).toContain(`✓ ${PAGINATION_HARNESS}</a>`);
+    expect(html).toContain(`✓ ${PAGINATION_MACHINE}</a>`);
     // flex items default to min-width:auto, which let a long repo/cwd facet expand this
     // nominally 220px-content sidebar to 460px+ in production. The outer width includes
     // its 20px padding + border; links wrap while their count stays intact.
@@ -1421,6 +1427,7 @@ describe('viewer result pagination and facet layout', () => {
     const second = await (await SELF.fetch(`https://sessions.vza.net${pageHref(first, 'next')}`)).text();
     const controls = second.match(/<form class="facet-controls"[\s\S]*?<\/form>/)?.[0] ?? '';
     expect(controls).toContain(`name="q" value="${PAGINATION_MARKER}"`);
+    expect(controls).toContain(`name="harness" value="${PAGINATION_HARNESS}"`);
     expect(controls).not.toContain('name="cursor"');
     expect(controls).not.toContain('name="limit"');
   });
@@ -1505,5 +1512,66 @@ describe('viewer result pagination and facet layout', () => {
     );
     expect(secondIds.some((id) => firstIds.includes(id))).toBe(false);
     expect(secondIds).not.toContain('viewer-pagination-new');
+  });
+});
+
+describe('viewer facet value discovery', () => {
+  const FACET_CAP_REPO = 'https://example.test/facet-value-cap';
+  const FACET_CAP_MARKER = 'facetvaluecapsentinel';
+
+  beforeAll(async () => {
+    const statements: D1PreparedStatement[] = [];
+    for (let i = 0; i < 200; i++) {
+      const suffix = String(i).padStart(3, '0');
+      const id = `viewer-facet-cap-${suffix}`;
+      statements.push(
+        testEnv.DB.prepare(
+          `INSERT INTO sessions
+             (session_id, harness, machine_id, os, primary_model, repo_url, title, started_at, index_state)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '2026-07-20T12:00:00Z', 'ready')`,
+        ).bind(
+          id,
+          `facet-cap-harness-${suffix}`,
+          `facet-cap-machine-${suffix}`,
+          `facet-cap-os-${suffix}`,
+          `facet-cap-model-${suffix}`,
+          FACET_CAP_REPO,
+          `Facet cap ${suffix}`,
+        ),
+      );
+      statements.push(
+        testEnv.DB.prepare(
+          `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text)
+           VALUES (?1, 1, 0, 0, 'user', 'text', ?2)`,
+        ).bind(id, `${FACET_CAP_MARKER} ${suffix}`),
+      );
+    }
+    await testEnv.DB.batch(statements);
+    await testEnv.DB.prepare(
+      `INSERT INTO blocks_fts(rowid, text)
+       SELECT id, text FROM blocks WHERE session_id LIKE 'viewer-facet-cap-%'`,
+    ).run();
+  });
+
+  it('keeps 200 harness, machine, OS, and model values reachable in recent and FTS lists', async () => {
+    const expected = [
+      ['Harness', 'facet-cap-harness-199'],
+      ['Machine', 'facet-cap-machine-199'],
+      ['OS', 'facet-cap-os-199'],
+      ['Model', 'facet-cap-model-199'],
+    ] as const;
+    const repo = encodeURIComponent(FACET_CAP_REPO);
+    const recent = await (await SELF.fetch(`https://sessions.vza.net/?repo=${repo}`)).text();
+    const search = await (await SELF.fetch(
+      `https://sessions.vza.net/?q=${FACET_CAP_MARKER}&repo=${repo}`,
+    )).text();
+
+    for (const [label, value] of expected) {
+      for (const html of [recent, search]) {
+        const items = html.match(new RegExp(`<h3>${label}</h3><ul>([\\s\\S]*?)</ul>`))?.[1] ?? '';
+        expect(items).toContain(value);
+        expect(items.match(/<li/g)).toHaveLength(200);
+      }
+    }
   });
 });

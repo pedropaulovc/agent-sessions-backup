@@ -1,4 +1,4 @@
-import { runSearch, type SearchHit } from '../api/search';
+import { facetValueLimit, runSearch, type SearchHit } from '../api/search';
 import { clampLimit, decodeCursor, encodeCursor, normalizeToBound } from '../api/sessions';
 import { esc, page, q } from './layout';
 import { TURNS_PER_PAGE } from './session';
@@ -7,10 +7,10 @@ import { firstInteractionTitleCandidateSql, sessionDisplayTitle } from '../sessi
 const DEFAULT_PAGE_SIZE = 20;
 
 const FILTERS = [
-  { param: 'harness', col: 'harness', label: 'Harness' },
-  { param: 'machine', col: 'machine_id', label: 'Machine' },
-  { param: 'os', col: 'os', label: 'OS' },
-  { param: 'model', col: 'primary_model', label: 'Model' },
+  { param: 'harness', col: 'harness' },
+  { param: 'machine', col: 'machine_id' },
+  { param: 'os', col: 'os' },
+  { param: 'model', col: 'primary_model' },
 ] as const;
 
 const SESSION_FILTERS = [
@@ -87,7 +87,6 @@ export async function searchPage(url: URL, env: Env): Promise<Response> {
   const p = url.searchParams;
   const query = p.get('q')?.trim() ?? '';
   const active = activeFilters(p);
-  const options = await filterOptions(env);
   const searchForm = renderSearchForm(query, active);
 
   if (!query) {
@@ -100,7 +99,7 @@ export async function searchPage(url: URL, env: Env): Promise<Response> {
       ? `<p class="muted small">Showing ${firstResult}–${firstResult + recent.rows.length - 1} recent sessions</p>`
       : '';
     const body = searchForm + renderSearchLayout(
-      renderSidebar(url, query, active, options, facets),
+      renderSidebar(url, query, active, facets),
       `<h3 class="muted small">Recent sessions</h3>${summary}${list}` +
         recentPager(url, recent.previousCursor, recent.nextCursor, recent.page),
     );
@@ -118,7 +117,7 @@ export async function searchPage(url: URL, env: Env): Promise<Response> {
     ? hits
     : `<p class="muted">No matches for “${esc(query)}”.</p>`;
   const body = searchForm + renderSearchLayout(
-    renderSidebar(url, query, active, options, result.facets),
+    renderSidebar(url, query, active, result.facets),
     `${summary}${list}${searchPager(url, result.cursor, offset, limit)}`,
   );
   return page({ title: `${query} — sessions`, nav: 'search', body });
@@ -139,17 +138,6 @@ function activeFilters(p: URLSearchParams): Record<string, string> {
     if (value) active[param] = value;
   }
   return active;
-}
-
-async function filterOptions(env: Env): Promise<Record<string, string[]>> {
-  const out: Record<string, string[]> = {};
-  for (const f of FILTERS) {
-    const rows = await env.DB.prepare(
-      `SELECT DISTINCT ${f.col} AS v FROM sessions WHERE ${f.col} IS NOT NULL ORDER BY ${f.col} LIMIT 200`,
-    ).all<{ v: string }>();
-    out[f.param] = rows.results.map((r) => r.v);
-  }
-  return out;
 }
 
 function renderSearchForm(query: string, active: Record<string, string>): string {
@@ -173,25 +161,12 @@ function renderSidebar(
   url: URL,
   query: string,
   active: Record<string, string>,
-  options: Record<string, string[]>,
   facets: Record<string, Record<string, number>> | undefined,
 ): string {
   const preserved = Object.entries(active)
-    .filter(([name]) => name !== 'sort' && !FILTERS.some((f) => f.param === name))
+    .filter(([name]) => name !== 'sort')
     .map(([name, value]) => `<input type="hidden" name="${esc(name)}" value="${esc(value)}">`)
     .join('');
-  const selects = FILTERS.map((f) => {
-    const opts = [`<option value="">All</option>`]
-      .concat(
-        (options[f.param] ?? []).map(
-          (value) => `<option value="${esc(value)}"${active[f.param] === value ? ' selected' : ''}>${esc(value)}</option>`,
-        ),
-      )
-      .join('');
-    return `<label><span>${f.label}</span>` +
-      `<select name="${f.param}" aria-label="Filter by ${f.label}" onchange="this.form.requestSubmit()">${opts}</select>` +
-      `</label>`;
-  }).join('');
   const sort = active.sort ?? 'recent';
   const sortOptions = SORT_OPTIONS.map(([value, label]) =>
     // Full-text searches use FTS relevance unless an explicit non-default sort is selected.
@@ -204,7 +179,6 @@ function renderSidebar(
   if (query) clear.searchParams.set('q', query);
   const controls = `<form class="facet-controls" method="get" action="/">` +
     `<input type="hidden" name="q" value="${esc(query)}">${preserved}` +
-    `<div class="facet-selects">${selects}</div>` +
     `<label><span>Sort by</span><select name="sort" aria-label="Sort sessions" onchange="this.form.requestSubmit()">${sortOptions}</select></label>` +
     `<noscript><button type="submit">Apply filters</button></noscript>` +
     (Object.keys(active).length ? `<a class="clear-filters small" href="${esc(clear.pathname + clear.search)}">Clear filters</a>` : '') +
@@ -355,7 +329,7 @@ async function sessionFacets(p: URLSearchParams, env: Env): Promise<Record<strin
     const prefix = where ? `${where} AND` : 'WHERE';
     const rows = await env.DB.prepare(
       `SELECT ${col} AS v, COUNT(*) AS n FROM sessions ${prefix} ${col} IS NOT NULL
-       GROUP BY ${col} ORDER BY n DESC LIMIT 20`,
+       GROUP BY ${col} ORDER BY n DESC LIMIT ${facetValueLimit(col)}`,
     ).bind(...binds).all<{ v: string; n: number }>();
     facets[col] = Object.fromEntries(rows.results.map((r) => [r.v, r.n]));
   }

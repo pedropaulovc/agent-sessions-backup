@@ -2,6 +2,7 @@ import { clampLimit, decodeCursor, encodeCursor, normalizeToBound } from './sess
 import { firstInteractionTitleCandidateSql, resolveFirstInteractionTitle } from '../session-title';
 
 const FACET_COLUMNS = ['harness', 'machine_id', 'os', 'primary_model', 'repo_url'] as const;
+const WIDE_FACET_COLUMNS = new Set<string>(['harness', 'machine_id', 'os', 'primary_model']);
 const SESSION_TIME_FACETS = [
   ['under-5m', 'Under 5 minutes', 0, 5 * 60],
   ['5m-30m', '5–30 minutes', 5 * 60, 30 * 60],
@@ -11,6 +12,11 @@ const SESSION_TIME_FACETS = [
 const SESSION_TIME_SQL = "MAX(0, (julianday(s.ended_at) - julianday(s.started_at)) * 86400)";
 // Reasoning output is already included in output tokens, and cached input is not new work.
 const TOTAL_TOKENS_SQL = 'COALESCE(s.tokens_in, 0) + COALESCE(s.tokens_out, 0)';
+
+/** Keep the four former dropdown facets as discoverable as their previous 200-option controls. */
+export function facetValueLimit(column: string): number {
+  return WIDE_FACET_COLUMNS.has(column) ? 200 : 20;
+}
 
 function sessionTimeFilter(value: string | null, addFilter: (sql: string, value: unknown) => void): void {
   const facet = SESSION_TIME_FACETS.find(([key]) => key === value);
@@ -226,7 +232,7 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
         `SELECT s.${col} AS v, COUNT(DISTINCT s.session_id) AS n
          FROM blocks_fts JOIN blocks b ON b.id = blocks_fts.rowid JOIN sessions s ON s.session_id = b.session_id
          WHERE blocks_fts MATCH ?1 ${where} AND s.${col} IS NOT NULL
-         GROUP BY s.${col} ORDER BY n DESC LIMIT 20`,
+         GROUP BY s.${col} ORDER BY n DESC LIMIT ${facetValueLimit(col)}`,
       )
         .bind(effectiveMatch, ...binds)
         .all<{ v: string; n: number }>();
