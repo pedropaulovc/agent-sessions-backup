@@ -566,10 +566,13 @@ describe('viewer', () => {
 
   it('normalizes nested, teammate, JSON-assignment, command, and task wrappers', async () => {
     for (const titleCase of WRAPPER_TITLE_CASES) {
-      const html = await (await SELF.fetch(`https://sessions.vza.net/?q=${titleCase.query}`)).text();
-      expect(html).toContain(
+      const searchHtml = await (await SELF.fetch(`https://sessions.vza.net/?q=${titleCase.query}`)).text();
+      expect(searchHtml).toContain(
         `<a href="/s/${titleCase.id}?page=1#t1">${titleCase.expectedHtml}</a>`,
       );
+      const detailHtml = await (await SELF.fetch(`https://sessions.vza.net/s/${titleCase.id}`)).text();
+      expect(detailHtml).toContain(`<title>${titleCase.expectedHtml}</title>`);
+      expect(detailHtml).toContain(`<h2 style="margin:0">${titleCase.expectedHtml}</h2>`);
     }
 
     const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=wrapper-title-test')).text();
@@ -677,6 +680,21 @@ describe('viewer', () => {
     expect(sorted).toContain(
       `<a href="/s/${STORED_FALLBACK_TITLE_SESSION}">Stored fallback title</a>`,
     );
+
+    const detail = await (await SELF.fetch(
+      `https://sessions.vza.net/s/${STORED_FALLBACK_TITLE_SESSION}`,
+    )).text();
+    expect(detail).toContain('<title>Stored fallback title</title>');
+    expect(detail).toContain('<h2 style="margin:0">Stored fallback title</h2>');
+  });
+
+  it('uses the session id on search and detail pages when no interaction or stored title exists', async () => {
+    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=claude-code')).text();
+    expect(recent).toContain(`<a href="/s/${BLOB_SESSION}">${BLOB_SESSION}</a>`);
+
+    const detail = await (await SELF.fetch(`https://sessions.vza.net/s/${BLOB_SESSION}`)).text();
+    expect(detail).toContain(`<title>${BLOB_SESSION}</title>`);
+    expect(detail).toContain(`<h2 style="margin:0">${BLOB_SESSION}</h2>`);
   });
 
   it('marks a selected repo facet active with a toggle-off link that drops the repo param', async () => {
@@ -698,6 +716,8 @@ describe('viewer', () => {
     const res = await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`);
     expect(res.status).toBe(200);
     const html = await res.text();
+    expect(html).toContain('<title>where is the xenondioxide note?</title>');
+    expect(html).toContain('<h2 style="margin:0">where is the xenondioxide note?</h2>');
     expect(html).toContain('turn user');
     expect(html).toContain('turn assistant');
     expect(html).toContain('found the reference');
