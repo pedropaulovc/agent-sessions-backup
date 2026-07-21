@@ -79,7 +79,8 @@ export function facetOrderSql(definition: MultiValueFilterDefinition): string {
 export function selectedValues(params: URLSearchParams, definition: MultiValueFilterDefinition): string[] {
   const values: string[] = [];
   const seen = new Set<string>();
-  for (const value of params.getAll(definition.param)) {
+  for (const rawValue of params.getAll(definition.param)) {
+    const value = rawValue.trim();
     if (!value || seen.has(value) || !validValue(definition, value)) continue;
     seen.add(value);
     values.push(value);
@@ -154,10 +155,10 @@ export function mergeFacetCounts(
   rows: Array<{ v: string; n: number }>,
   selected: readonly string[],
 ): Record<string, number> {
-  const counts: Record<string, number> = {};
+  const counts = Object.create(null) as Record<string, number>;
   for (const row of rows) counts[row.v] = Number(row.n);
   for (const value of selected) {
-    if (counts[value] === undefined) counts[value] = 0;
+    if (!Object.hasOwn(counts, value)) counts[value] = 0;
   }
   return counts;
 }

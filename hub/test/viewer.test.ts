@@ -1612,7 +1612,13 @@ describe('viewer result pagination and facet layout', () => {
     const second = await (await SELF.fetch(`https://sessions.vza.net${secondHref}`)).text();
     expect(second).toContain('Showing 11–20');
     expect(second).toContain('Page 2');
-    expect(pageHref(second, 'prev')).toBe(`/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&machine=${PAGINATION_MACHINE}&limit=10`);
+    const previous = new URL(pageHref(second, 'prev'), 'https://sessions.vza.net');
+    expect(Object.fromEntries(previous.searchParams)).toEqual({
+      q: PAGINATION_MARKER,
+      harness: PAGINATION_HARNESS,
+      machine: PAGINATION_MACHINE,
+      limit: '10',
+    });
 
     const thirdHref = pageHref(second, 'next');
     const third = await (await SELF.fetch(`https://sessions.vza.net${thirdHref}`)).text();
@@ -1633,6 +1639,38 @@ describe('viewer result pagination and facet layout', () => {
       'missing-pagination-harness',
     ]);
     expect(next.searchParams.get('limit')).toBe('10');
+  });
+
+  it('canonicalizes trimmed, deduped, capped filters in recent and FTS pager links', async () => {
+    const raw = new URLSearchParams({ limit: '10' });
+    raw.append('harness', `  ${PAGINATION_HARNESS}  `);
+    raw.append('harness', PAGINATION_HARNESS);
+    raw.append('harness', '   ');
+    for (let index = 0; index < 105; index++) raw.append('harness', `pager-extra-${index}`);
+
+    const expectCanonical = (href: string) => {
+      const values = new URL(href, 'https://sessions.vza.net').searchParams.getAll('harness');
+      expect(values).toHaveLength(100);
+      expect(values[0]).toBe(PAGINATION_HARNESS);
+      expect(values.filter((value) => value === PAGINATION_HARNESS)).toHaveLength(1);
+      expect(values.every((value) => value === value.trim() && value.length > 0)).toBe(true);
+      expect(values).not.toContain('pager-extra-104');
+    };
+
+    for (const query of [null, PAGINATION_MARKER]) {
+      const firstParams = new URLSearchParams(raw);
+      if (query) firstParams.set('q', query);
+      const first = await (await SELF.fetch(`https://sessions.vza.net/?${firstParams}`)).text();
+      const firstNext = pageHref(first, 'next');
+      expectCanonical(firstNext);
+
+      const secondParams = new URLSearchParams(raw);
+      if (query) secondParams.set('q', query);
+      secondParams.set('cursor', new URL(firstNext, 'https://sessions.vza.net').searchParams.get('cursor')!);
+      const second = await (await SELF.fetch(`https://sessions.vza.net/?${secondParams}`)).text();
+      expectCanonical(pageHref(second, 'prev'));
+      expectCanonical(pageHref(second, 'next'));
+    }
   });
 
   it('keeps bounded multi-value filters on the composite session facet index', async () => {

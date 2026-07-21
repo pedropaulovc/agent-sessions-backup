@@ -3,6 +3,7 @@ import {
   buildSessionFilterSql,
   FACET_DEFINITIONS,
   MAX_VALUES_PER_FILTER,
+  mergeFacetCounts,
   selectedValues,
 } from '../src/session-filters';
 
@@ -25,12 +26,12 @@ describe('session multi-value filters', () => {
     expect(filter.binds).toEqual(['["alpha","beta"]']);
   });
 
-  it('stable-dedupes repeated values and caps each filter at 100', () => {
+  it('trims, stable-dedupes, drops blanks, and caps each filter at 100', () => {
     const params = new URLSearchParams();
-    params.append('harness', 'first');
+    params.append('harness', '  first  ');
     params.append('harness', 'second');
     params.append('harness', 'first');
-    params.append('harness', '');
+    params.append('harness', '   ');
     for (let index = 0; index < 105; index++) params.append('harness', `extra-${index}`);
 
     const values = selectedValues(params, facet('harness'));
@@ -55,8 +56,8 @@ describe('session multi-value filters', () => {
 
   it('dedupes and validates repeated date and duration buckets', () => {
     const params = new URLSearchParams(
-      'session_date=2026-07-01&session_date=bad&session_date=2026-07-01&' +
-      'session_date=2026-07-02&session_time=under-5m&session_time=bad&session_time=over-2h',
+      'session_date=%202026-07-01%20&session_date=bad&session_date=2026-07-01&' +
+      'session_date=2026-07-02&session_time=%20under-5m%20&session_time=bad&session_time=over-2h',
     );
 
     expect(selectedValues(params, facet('session_date'))).toEqual(['2026-07-01', '2026-07-02']);
@@ -68,6 +69,20 @@ describe('session multi-value filters', () => {
     expect(filter.binds).toEqual([
       '["2026-07-01","2026-07-02"]',
       '["under-5m","over-2h"]',
+    ]);
+  });
+
+  it('retains facet names that collide with Object prototype keys', () => {
+    const counts = mergeFacetCounts(
+      [{ v: '__proto__', n: 7 }],
+      ['__proto__', 'constructor', 'toString'],
+    );
+
+    expect(Object.getPrototypeOf(counts)).toBeNull();
+    expect(Object.entries(counts)).toEqual([
+      ['__proto__', 7],
+      ['constructor', 0],
+      ['toString', 0],
     ]);
   });
 });

@@ -405,6 +405,7 @@ function renderFacets(
 function searchPager(url: URL, cursor: string | undefined, offset: number, limit: number): string {
   if (!cursor && offset === 0) return '';
   const previous = new URL(url);
+  canonicalizeMultiValueFilters(previous.searchParams);
   const previousOffset = Math.max(0, offset - limit);
   if (previousOffset) previous.searchParams.set('cursor', encodeCursor(previousOffset));
   else previous.searchParams.delete('cursor');
@@ -413,6 +414,7 @@ function searchPager(url: URL, cursor: string | undefined, offset: number, limit
     : `<span class="muted">← Previous</span>`;
 
   const next = new URL(url);
+  canonicalizeMultiValueFilters(next.searchParams);
   if (cursor) next.searchParams.set('cursor', cursor);
   const nextLink = cursor
     ? `<a rel="next" href="${esc(next.pathname + next.search)}">Next →</a>`
@@ -430,12 +432,14 @@ function recentPager(
 ): string {
   if (!previousCursor && !nextCursor) return '';
   const previous = new URL(url);
+  canonicalizeMultiValueFilters(previous.searchParams);
   if (previousCursor) previous.searchParams.set('cursor', previousCursor);
   const previousLink = previousCursor
     ? `<a rel="prev" href="${esc(previous.pathname + previous.search)}">← Previous</a>`
     : `<span class="muted">← Previous</span>`;
 
   const next = new URL(url);
+  canonicalizeMultiValueFilters(next.searchParams);
   if (nextCursor) next.searchParams.set('cursor', nextCursor);
   const nextLink = nextCursor
     ? `<a rel="next" href="${esc(next.pathname + next.search)}">Next →</a>`

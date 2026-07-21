@@ -51,6 +51,15 @@ const PROJECT_CASES: ProjectCase[] = [
     repoUrl: 'git@host:right-project.git',
     expected: 'right-project',
   },
+  {
+    name: 'SCP-like repository URL may contain at-signs in its path',
+    cwd: '/home/pedro/src/wrong-project',
+    repoUrl: 'git@host:owner/right@project.git',
+    expected: 'right@project',
+  },
+  { name: 'SCP-like repository rejects whitespace in its authority', cwd: '/home/pedro/src/fallback', repoUrl: 'bad @host:repo.git', expected: 'fallback' },
+  { name: 'SCP-like repository rejects repeated at-signs in its authority', cwd: '/home/pedro/src/fallback', repoUrl: 'git@@host:repo.git', expected: 'fallback' },
+  { name: 'case-insensitive bare dot-git falls back to cwd', cwd: '/home/pedro/src/fallback', repoUrl: 'git@host:.GIT', expected: 'fallback' },
   { name: 'percent-encoded repository basename stays stable', repoUrl: 'https://example.test/org/right%20project.git', expected: 'right%20project' },
   { name: 'repository may legitimately be named src', cwd: '/tmp', repoUrl: 'https://example.test/org/src.git', expected: 'src' },
   { name: 'repository may legitimately be named dot-claude', cwd: '/tmp', repoUrl: 'https://example.test/org/.claude.git', expected: '.claude' },
@@ -60,6 +69,11 @@ const PROJECT_CASES: ProjectCase[] = [
   { name: 'generic b suffix is retained', cwd: '/home/pedro/src/project-b', expected: 'project-b' },
   { name: 'dot segments are ambiguous', cwd: '/home/pedro/src/first/../final-project', expected: null },
   { name: 'duplicate separators are ambiguous', cwd: '/home/pedro//src/project', expected: null },
+  {
+    name: 'duplicate separators make an encoded worktree ambiguous',
+    cwd: '/prefix//C--src-project--claude-worktrees-fix',
+    expected: null,
+  },
   { name: 'no src segment', cwd: '/home/pedro/projects/unknown', expected: null },
   { name: 'src has no project child', cwd: '/home/pedro/src', expected: null },
   { name: 'dot-claude is not a cwd project', cwd: '/home/pedro/src/.claude/worktrees/name', expected: null },
@@ -103,10 +117,12 @@ describe('project_name migration', () => {
        VALUES (?1, 'codex', ?2, ?3, 'ready')`,
     ).bind(`project-parity-${String(index).padStart(2, '0')}`, testCase.cwd ?? null, testCase.repoUrl ?? null)));
 
-    const migration = testEnv.TEST_MIGRATIONS.find((candidate) => candidate.name === '0011_sessions_project_name.sql');
-    const backfill = migration?.queries.find((query) => query.includes('UPDATE sessions') && query.includes('cwd_candidate'));
-    expect(backfill).toBeTruthy();
-    await testEnv.DB.prepare(backfill!).run();
+    for (const name of ['0011_sessions_project_name.sql', '0012_sessions_project_name_parity.sql']) {
+      const migration = testEnv.TEST_MIGRATIONS.find((candidate) => candidate.name === name);
+      const backfill = migration?.queries.find((query) => query.includes('UPDATE sessions') && query.includes('cwd_candidate'));
+      expect(backfill, name).toBeTruthy();
+      await testEnv.DB.prepare(backfill!).run();
+    }
 
     const rows = await testEnv.DB.prepare(
       "SELECT session_id, project_name FROM sessions WHERE session_id LIKE 'project-parity-%' ORDER BY session_id",
