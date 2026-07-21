@@ -131,8 +131,11 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
         if (!parsed) {
           controller.enqueue(encoder.encode('<p class="warn">Raw transcript unavailable (R2 object missing).</p>'));
         } else {
-          const toolPairs = pairToolResults(parsed.turns);
-          let rendered = 0;
+          const renderableTurns: Array<{
+            turn: NormalizedTurn;
+            turnIndex: number | undefined;
+            onMainPath: boolean;
+          }> = [];
           for (const turn of parsed.turns) {
             const isContent = !turn.compaction && turn.blocks.length > 0;
             const byteStart = turn.blocks[0]?.byteStart ?? turn.byteStart;
@@ -142,12 +145,24 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
             // Prefer the persisted main-path flag; fall back to the parser's per-page guess only when the
             // D1 lookup has no matching row (e.g. compaction markers, which have no content block rows).
             const onMainPath = indexed ? indexed.onMainPath : turn.onMainPath;
+            renderableTurns.push({ turn, turnIndex: indexed?.turnIndex, onMainPath });
+          }
+
+          // Pair only blocks that this view can display. Otherwise a result on an abandoned branch could
+          // be moved into a visible call while its own turn is correctly hidden by the effective view.
+          const visibleTurns = renderableTurns
+            .filter(({ turn, onMainPath }) => !turn.compaction && (view !== 'effective' || onMainPath))
+            .map(({ turn }) => turn);
+          const toolPairs = pairToolResults(visibleTurns);
+
+          let rendered = 0;
+          for (const { turn, turnIndex, onMainPath } of renderableTurns) {
             const html = renderTurn(
               turn,
               sessionId,
               view,
               mediaIds,
-              indexed?.turnIndex,
+              turnIndex,
               onMainPath,
               blobVersion,
               toolPairs,
@@ -341,29 +356,41 @@ function renderBlock(
   }
 }
 
-/** Pair by protocol ID, not adjacency: parallel calls may resolve in a different order. */
+/** Pair by protocol ID when available; web captures without ids fall back to transcript order. */
 interface ToolPairs {
   byCall: Map<NormalizedBlock, NormalizedBlock>;
   results: Set<NormalizedBlock>;
 }
 
 function pairToolResults(turns: NormalizedTurn[]): ToolPairs {
-  const calls = new Map<string, NormalizedBlock>();
-  const results: Array<NormalizedBlock> = [];
-  for (const turn of turns) {
-    for (const block of turn.blocks) {
-      if (block.type === 'tool_use' && block.toolUseId) calls.set(block.toolUseId, block);
-      if (block.type === 'tool_result' && block.toolUseId) results.push(block);
-    }
-  }
+  const callsById = new Map<string, NormalizedBlock[]>();
+  const callsWithoutId: NormalizedBlock[] = [];
   const byCall = new Map<NormalizedBlock, NormalizedBlock>();
   const pairedResults = new Set<NormalizedBlock>();
-  for (const result of results) {
-    const call = calls.get(result.toolUseId!);
-    if (!call) continue;
-    byCall.set(call, result);
-    pairedResults.add(result);
+
+  for (const turn of turns) {
+    for (const block of turn.blocks) {
+      if (block.type === 'tool_use') {
+        if (!block.toolUseId) {
+          callsWithoutId.push(block);
+          continue;
+        }
+        const pending = callsById.get(block.toolUseId) ?? [];
+        pending.push(block);
+        callsById.set(block.toolUseId, pending);
+        continue;
+      }
+
+      if (block.type !== 'tool_result') continue;
+      const call = block.toolUseId
+        ? callsById.get(block.toolUseId)?.shift()
+        : callsWithoutId.shift();
+      if (!call) continue;
+      byCall.set(call, block);
+      pairedResults.add(block);
+    }
   }
+
   return { byCall, results: pairedResults };
 }
 

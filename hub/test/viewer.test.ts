@@ -7,6 +7,7 @@ import { interactionTitlesSql, searchHitsSql } from '../src/api/search';
 import { buildSessionFilterSql } from '../src/session-filters';
 import { viewerRoute } from '../src/viewer/router';
 import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures';
+import { chatgptWebConversation } from './web-fixtures';
 import { blobVersionOf } from '../src/viewer/session';
 
 const testEnv = env as unknown as Env;
@@ -33,6 +34,7 @@ const STORED_FALLBACK_TITLE_SESSION = '40404040-dddd-4ddd-8ddd-dddddddddddd';
 const SCHEDULED_TITLE_SESSION = '50505050-eeee-4eee-8eee-eeeeeeeeeeee';
 const ENCODED_SCHEDULED_TITLE_SESSION = '60606060-ffff-4fff-8fff-ffffffffffff';
 const INJECTED_WRAPPERS_TITLE_SESSION = 'injected-wrapper-title-session';
+const CHATGPT_TOOL_SESSION = 'chatgpt-tool-pair-session';
 const REPO_URL = 'https://github.com/tester/facetdemo';
 
 const WRAPPER_TITLE_CASES = [
@@ -362,6 +364,18 @@ describe('viewer', () => {
     expect(
       (await putFile('claude-projects', `-home-tester-src-demo/${OFFSET_MATCH_SESSION}.jsonl`, offsetMatchContent)).status,
     ).toBe(201);
+
+    const chatgptToolContent = chatgptWebConversation({
+      id: CHATGPT_TOOL_SESSION,
+      title: 'Anonymous tool pairing',
+      turns: [
+        { node: 'ct-u1', parent: 'root-node', role: 'user', text: 'Look up the session' },
+        { node: 'ct-a1', parent: 'ct-u1', role: 'assistant', tool: { recipient: 'search', code: '{"query":"session viewer","limit":1}' } },
+        { node: 'ct-r1', parent: 'ct-a1', role: 'tool', text: '{"result":"viewer found","count":1}' },
+        { node: 'ct-a2', parent: 'ct-r1', role: 'assistant', text: 'Found it.' },
+      ],
+    });
+    expect((await putFile('chatgpt-web', `${CHATGPT_TOOL_SESSION}.json`, chatgptToolContent)).status).toBe(201);
 
     await drainQueue();
 
@@ -736,6 +750,13 @@ describe('viewer', () => {
     expect(html).toContain('<span class="muted small">↩ result</span>');
     expect(html).toContain('xenondioxide appears in notes.md line 12');
     expect(html).not.toContain('class="turn tool');
+  });
+
+  it('joins tool calls and results in transcript order when the capture has no protocol ids', async () => {
+    const html = await (await SELF.fetch(`https://sessions.vza.net/s/${CHATGPT_TOOL_SESSION}`)).text();
+
+    expect(html).toContain('<details class="block tool-pair"><summary>🔧 search · query: session viewer → result: viewer found</summary>');
+    expect(html).not.toContain('<summary>↩ tool result');
   });
 
   it('downloads the complete canonical session with an attachment filename', async () => {

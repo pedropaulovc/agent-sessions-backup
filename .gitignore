@@ -13,6 +13,7 @@ collector/.coverage
 infra/out/
 .DS_Store
 .claude/worktrees/
+.playwright-cli/
 
 # local secrets — never commit
 .env.local
