@@ -19,6 +19,9 @@ const CODEX_TAIL_SESSION = '77777777-9999-4999-8999-999999999999';
 const REPO_SESSION = '66666666-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const OFFSET_MATCH_SESSION = '55555555-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const TITLE_SESSION = '44444444-cccc-4ccc-8ccc-cccccccccccc';
+const TEAMMATE_TITLE_SESSION = '33333333-dddd-4ddd-8ddd-dddddddddddd';
+const PREFIXED_TURN_TITLE_SESSION = '22222222-eeee-4eee-8eee-eeeeeeeeeeee';
+const SERVER_TOOL_TITLE_SESSION = '11111111-ffff-4fff-8fff-ffffffffffff';
 const REPO_URL = 'https://github.com/tester/facetdemo';
 
 // Hostile transcript payloads: an SVG with inline script and an HTML "document".
@@ -233,12 +236,48 @@ describe('viewer', () => {
       JSON.stringify({ type: 'attachment', uuid: 'title-hook', parentUuid: 'title-system', payload: { kind: 'hook', output: 'Hook output must not become the title' } }),
       ccLine(TITLE_SESSION, { uuid: 'title-tool-use', parentUuid: 'title-hook', role: 'assistant', toolUse: { id: 'title-tu', name: 'Read', input: { file_path: '/tmp/title' } } }),
       ccLine(TITLE_SESSION, { uuid: 'title-tool-result', parentUuid: 'title-tool-use', role: 'user', toolResult: { toolUseId: 'title-tu', content: 'Tool result must not become the title' } }),
-      ccLine(TITLE_SESSION, { uuid: 'title-user', parentUuid: 'title-tool-result', role: 'user', text: 'First real title interaction' }),
+      ccLine(TITLE_SESSION, { uuid: 'title-server-tool', parentUuid: 'title-tool-result', role: 'assistant', unknownFirst: 'server_tool_use' }),
+      ccLine(TITLE_SESSION, { uuid: 'title-agents', parentUuid: 'title-server-tool', role: 'user', text: '# AGENTS.md instructions\nInjected agent instructions' }),
+      ccLine(TITLE_SESSION, { uuid: 'title-local', parentUuid: 'title-agents', role: 'assistant', text: '<local-command-caveat>Injected local command</local-command-caveat>' }),
+      ccLine(TITLE_SESSION, { uuid: 'title-plugins', parentUuid: 'title-local', role: 'user', text: '<recommended_plugins>Injected plugin list</recommended_plugins>' }),
+      ccLine(TITLE_SESSION, { uuid: 'title-command', parentUuid: 'title-plugins', role: 'assistant', text: '<command-name>Injected command</command-name>' }),
+      ccLine(TITLE_SESSION, { uuid: 'title-stdout', parentUuid: 'title-command', role: 'user', text: '<local-command-stdout>Injected stdout</local-command-stdout>' }),
+      ccLine(TITLE_SESSION, { uuid: 'title-user', parentUuid: 'title-stdout', role: 'user', text: 'First real title interaction' }),
       ccLine(TITLE_SESSION, { uuid: 'title-assistant', parentUuid: 'title-user', role: 'assistant', text: 'titlequerysentinel response' }),
       JSON.stringify({ type: 'ai-title', title: 'Generated title must not be used' }),
     ].join('\n');
     expect(
       (await putFile('claude-projects', `-home-tester-src-demo/${TITLE_SESSION}.jsonl`, titleContent)).status,
+    ).toBe(201);
+
+    const teammateTitleContent = [
+      ccSystemLine(TEAMMATE_TITLE_SESSION, { uuid: 'teammate-system', text: 'Teammate system prelude' }),
+      ccLine(TEAMMATE_TITLE_SESSION, { uuid: 'teammate-agents', parentUuid: 'teammate-system', role: 'user', text: '# AGENTS.md instructions\nInjected before teammate' }),
+      ccLine(TEAMMATE_TITLE_SESSION, {
+        uuid: 'teammate-message',
+        parentUuid: 'teammate-agents',
+        role: 'user',
+        text: '<teammate-message teammate_id="team-lead" summary="Fix &amp; verify &quot;quoted&quot; &#x1F680;">Ignore wrapper body</teammate-message>',
+      }),
+      ccLine(TEAMMATE_TITLE_SESSION, { uuid: 'teammate-response', parentUuid: 'teammate-message', role: 'assistant', text: 'teammatetitlequerysentinel response' }),
+    ].join('\n');
+    expect(
+      (await putFile('claude-projects', `-home-tester-src-demo/${TEAMMATE_TITLE_SESSION}.jsonl`, teammateTitleContent)).status,
+    ).toBe(201);
+
+    const serverToolTitleContent = [
+      ccSystemLine(SERVER_TOOL_TITLE_SESSION, { uuid: 'server-tool-system', text: 'Server tool system prelude' }),
+      ccLine(SERVER_TOOL_TITLE_SESSION, {
+        uuid: 'server-tool-with-text',
+        parentUuid: 'server-tool-system',
+        role: 'assistant',
+        unknownFirst: 'server_tool_use',
+        text: 'Real text after server tool metadata',
+      }),
+      ccLine(SERVER_TOOL_TITLE_SESSION, { uuid: 'server-tool-query', parentUuid: 'server-tool-with-text', role: 'user', text: 'servertooltitlequerysentinel response' }),
+    ].join('\n');
+    expect(
+      (await putFile('claude-projects', `-home-tester-src-demo/${SERVER_TOOL_TITLE_SESSION}.jsonl`, serverToolTitleContent)).status,
     ).toBe(201);
 
     const offsetMatchContent = [
@@ -251,6 +290,24 @@ describe('viewer', () => {
     ).toBe(201);
 
     await drainQueue();
+
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+         VALUES (?1, 'claude-code', 'testbox-wsl', 'Stored prefixed-turn title', '2026-07-01T10:00:00Z', 'ready')`,
+      ).bind(PREFIXED_TURN_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text) VALUES
+         (?1, 1, 0, 0, 'user', 'text', '# AGENTS.md instructions injected in first block'),
+         (?1, 1, 0, 1, 'user', 'text', 'Same-turn text must not become the title'),
+         (?1, 1, 1, 0, 'assistant', 'text', 'First later turn title'),
+         (?1, 1, 2, 0, 'user', 'text', 'sameturntitlesentinel query target')`,
+      ).bind(PREFIXED_TURN_TITLE_SESSION),
+    ]);
+    await testEnv.DB.prepare(
+      `INSERT INTO blocks_fts(rowid, text)
+       SELECT id, text FROM blocks WHERE session_id = ?1`,
+    ).bind(PREFIXED_TURN_TITLE_SESSION).run();
   });
 
   it('search page returns 200 with a highlighted snippet and a link to the session', async () => {
@@ -277,12 +334,45 @@ describe('viewer', () => {
     expect(html).not.toContain('System prompt must not become the title');
     expect(html).not.toContain('Hook output must not become the title');
     expect(html).not.toContain('Tool result must not become the title');
+    expect(html).not.toContain('Injected agent instructions');
+    expect(html).not.toContain('Injected local command');
+    expect(html).not.toContain('Injected plugin list');
+    expect(html).not.toContain('Injected command');
+    expect(html).not.toContain('Injected stdout');
+    expect(html).toContain(`<a href="/s/${TEAMMATE_TITLE_SESSION}">Fix &amp; verify &quot;quoted&quot; 🚀</a>`);
+
+    const sorted = await (await SELF.fetch('https://sessions.vza.net/?harness=claude-code&sort=total_tokens')).text();
+    expect(sorted).toContain(`<a href="/s/${TITLE_SESSION}">First real title interaction</a>`);
   });
 
   it('titles query results from the first user/agent text, not the matching turn or stored title', async () => {
     const html = await (await SELF.fetch('https://sessions.vza.net/?q=titlequerysentinel')).text();
-    expect(html).toContain(`<a href="/s/${TITLE_SESSION}?page=1#t4">First real title interaction</a>`);
+    expect(html).toContain(`<a href="/s/${TITLE_SESSION}?page=1#t10">First real title interaction</a>`);
     expect(html).not.toContain('Generated title must not be used');
+  });
+
+  it('uses the decoded team-lead teammate summary as the title', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=teammatetitlequerysentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${TEAMMATE_TITLE_SESSION}?page=1#t3">Fix &amp; verify &quot;quoted&quot; 🚀</a>`,
+    );
+    expect(html).not.toContain('Ignore wrapper body');
+  });
+
+  it('rejects the entire turn when its first text block has an injected prefix', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=sameturntitlesentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${PREFIXED_TURN_TITLE_SESSION}?page=1#t2">First later turn title</a>`,
+    );
+    expect(html).not.toContain('Same-turn text must not become the title');
+  });
+
+  it('skips preserved server tool metadata without suppressing real text later in the same turn', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=servertooltitlequerysentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${SERVER_TOOL_TITLE_SESSION}?page=1#t2">Real text after server tool metadata</a>`,
+    );
+    expect(html).not.toContain('{&quot;type&quot;:&quot;server_tool_use&quot;');
   });
 
   it('marks a selected repo facet active with a toggle-off link that drops the repo param', async () => {

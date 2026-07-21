@@ -1,12 +1,92 @@
-/** Title shown for a session in search results: its first human/agent text exchange.
- * System/developer instructions, hook metadata, thinking, and tool traffic are not conversation text. */
-export function firstInteractionTitleSql(sessionAlias: string): string {
-  return `(SELECT substr(trim(title_block.text), 1, 120)
+const INJECTED_TURN_PREFIXES = [
+  '# AGENTS.md instructions',
+  '<local-command-',
+  '<recommended_plugins>',
+  '<command-name>',
+  '<local-command-stdout>',
+] as const;
+
+const NON_CONVERSATION_BLOCK_PREFIXES = [
+  // Claude Code preserves unsupported server tool metadata as a text block containing raw JSON.
+  // Match the known metadata type exactly; ordinary user prompts that happen to be JSON stay eligible.
+  '{"type":"server_tool_use"',
+] as const;
+
+const TEAMMATE_PREFIX = '<teammate-message teammate_id="team-lead" summary="';
+
+/** Select the first human/agent text exchange as a compact JSON candidate.
+ * System/developer instructions, hook metadata, thinking, tool traffic, and known injected
+ * user/assistant wrappers are ineligible. The correlated lookup uses blocks_session. */
+export function firstInteractionTitleCandidateSql(sessionAlias: string): string {
+  const text = 'ltrim(title_block.text)';
+  const teammateRest = `substr(${text}, ${TEAMMATE_PREFIX.length + 1})`;
+  const isTeammate = `substr(${text}, 1, ${TEAMMATE_PREFIX.length}) = ${sqlString(TEAMMATE_PREFIX)}`;
+  const turnIsEligible = excludesPrefixesSql(text, INJECTED_TURN_PREFIXES);
+  const blockIsEligible = excludesPrefixesSql(text, NON_CONVERSATION_BLOCK_PREFIXES);
+  const earlierText = 'ltrim(earlier_title_block.text)';
+  const earlierBlockIsEligible = excludesPrefixesSql(earlierText, NON_CONVERSATION_BLOCK_PREFIXES);
+
+  return `(SELECT json_object(
+                    'kind', CASE WHEN ${isTeammate} THEN 'teammate' ELSE 'text' END,
+                    'text', CASE
+                      WHEN ${isTeammate} AND instr(${teammateRest}, '">') > 0
+                        THEN substr(${teammateRest}, 1, instr(${teammateRest}, '">') - 1)
+                      ELSE substr(trim(title_block.text), 1, 120)
+                    END)
            FROM blocks title_block
            WHERE title_block.session_id = ${sessionAlias}.session_id
              AND title_block.role IN ('user', 'assistant')
              AND title_block.btype IN ('text', 'prompt')
              AND trim(COALESCE(title_block.text, '')) <> ''
+             AND ${blockIsEligible}
+             AND NOT EXISTS (
+               SELECT 1
+               FROM blocks earlier_title_block
+               WHERE earlier_title_block.session_id = title_block.session_id
+                 AND earlier_title_block.turn_index = title_block.turn_index
+                 AND earlier_title_block.block_index < title_block.block_index
+                 AND earlier_title_block.role IN ('user', 'assistant')
+                 AND earlier_title_block.btype IN ('text', 'prompt')
+                 AND trim(COALESCE(earlier_title_block.text, '')) <> ''
+                 AND ${earlierBlockIsEligible}
+             )
+             AND ${turnIsEligible}
            ORDER BY title_block.turn_index, title_block.block_index
            LIMIT 1)`;
+}
+
+function excludesPrefixesSql(textSql: string, prefixes: readonly string[]): string {
+  return prefixes
+    .map((prefix) => `substr(${textSql}, 1, ${prefix.length}) <> ${sqlString(prefix)}`)
+    .join('\n                 AND ');
+}
+
+export function resolveFirstInteractionTitle(candidate: string | null): string | null {
+  if (!candidate) return null;
+  try {
+    const parsed = JSON.parse(candidate) as { kind?: unknown; text?: unknown };
+    if (typeof parsed.text !== 'string') return null;
+    if (parsed.kind !== 'teammate') return parsed.text;
+    return decodeXmlEntities(parsed.text).trim().slice(0, 120);
+  } catch {
+    return null;
+  }
+}
+
+function decodeXmlEntities(value: string): string {
+  return value.replace(/&(#(?:x[\da-f]+|\d+)|amp|apos|gt|lt|quot);/gi, (encoded, entity: string) => {
+    const named: Record<string, string> = { amp: '&', apos: "'", gt: '>', lt: '<', quot: '"' };
+    const replacement = named[entity.toLowerCase()];
+    if (replacement !== undefined) return replacement;
+
+    const hex = entity[1]?.toLowerCase() === 'x';
+    const codePoint = Number.parseInt(entity.slice(hex ? 2 : 1), hex ? 16 : 10);
+    if (!Number.isSafeInteger(codePoint) || codePoint > 0x10ffff) return encoded;
+    if (codePoint >= 0xd800 && codePoint <= 0xdfff) return encoded;
+    return String.fromCodePoint(codePoint);
+  });
+}
+
+function sqlString(value: string): string {
+  return `'${value.replaceAll("'", "''")}'`;
 }
