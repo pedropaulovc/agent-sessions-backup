@@ -26,6 +26,8 @@ const IMAGE_FORWARD_TITLE_SESSION = '10101010-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const IMAGE_WINDOWS_TITLE_SESSION = '20202020-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const OFF_MAIN_TITLE_SESSION = '30303030-cccc-4ccc-8ccc-cccccccccccc';
 const STORED_FALLBACK_TITLE_SESSION = '40404040-dddd-4ddd-8ddd-dddddddddddd';
+const SCHEDULED_TITLE_SESSION = '50505050-eeee-4eee-8eee-eeeeeeeeeeee';
+const ENCODED_SCHEDULED_TITLE_SESSION = '60606060-ffff-4fff-8fff-ffffffffffff';
 const REPO_URL = 'https://github.com/tester/facetdemo';
 
 // Hostile transcript payloads: an SVG with inline script and an HTML "document".
@@ -355,16 +357,44 @@ describe('viewer', () => {
          (?1, 1, 0, 0, 'user', 'image', NULL, 1),
          (?1, 1, 1, 0, 'assistant', 'tool_use', 'fallbacktitlequerysentinel tool metadata', 1)`,
       ).bind(STORED_FALLBACK_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+         VALUES (?1, 'scheduled-title-test', 'testbox-wsl', 'Stored scheduled title', '2026-07-01T11:00:00Z', 'ready')`,
+      ).bind(SCHEDULED_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks
+           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
+         (?1, 1, 0, 0, 'user', 'text', ?2, 1),
+         (?1, 1, 1, 0, 'assistant', 'text', 'scheduledtitlequerysentinel response', 1)`,
+      ).bind(
+        SCHEDULED_TITLE_SESSION,
+        '<scheduled-task name="update-daily-notes" file="C:\\Users\\pedro\\.claude\\scheduled-tasks\\update-daily-notes\\SKILL.md">Scheduled body must not become the title</scheduled-task>',
+      ),
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+         VALUES (?1, 'scheduled-title-test', 'testbox-wsl', 'Stored encoded scheduled title', '2026-07-01T10:00:00Z', 'ready')`,
+      ).bind(ENCODED_SCHEDULED_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks
+           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
+         (?1, 1, 0, 0, 'user', 'text', ?2, 1),
+         (?1, 1, 1, 0, 'assistant', 'text', 'encodedscheduledtitlequerysentinel response', 1)`,
+      ).bind(
+        ENCODED_SCHEDULED_TITLE_SESSION,
+        '<scheduled-task name="update&amp;daily&#45;notes" file="C:\\Users\\pedro\\.claude\\scheduled-tasks\\update-daily-notes\\SKILL.md">Encoded scheduled body</scheduled-task>',
+      ),
     ]);
     await testEnv.DB.prepare(
       `INSERT INTO blocks_fts(rowid, text)
        SELECT id, text FROM blocks
-       WHERE session_id IN (?1, ?2, ?3, ?4) AND text IS NOT NULL`,
+       WHERE session_id IN (?1, ?2, ?3, ?4, ?5, ?6) AND text IS NOT NULL`,
     ).bind(
       PREFIXED_TURN_TITLE_SESSION,
       IMAGE_WINDOWS_TITLE_SESSION,
       OFF_MAIN_TITLE_SESSION,
       STORED_FALLBACK_TITLE_SESSION,
+      SCHEDULED_TITLE_SESSION,
+      ENCODED_SCHEDULED_TITLE_SESSION,
     ).run();
   });
 
@@ -415,6 +445,27 @@ describe('viewer', () => {
       `<a href="/s/${TEAMMATE_TITLE_SESSION}?page=1#t3">Fix &amp; verify &quot;quoted&quot; 🚀</a>`,
     );
     expect(html).not.toContain('Ignore wrapper body');
+  });
+
+  it('uses the decoded scheduled-task name instead of its Windows path or body', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=scheduledtitlequerysentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${SCHEDULED_TITLE_SESSION}?page=1#t1">update-daily-notes</a>`,
+    );
+    expect(html).not.toContain('C:\\Users\\pedro');
+    expect(html).not.toContain('Scheduled body must not become the title');
+
+    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=scheduled-title-test')).text();
+    expect(recent).toContain(`<a href="/s/${SCHEDULED_TITLE_SESSION}">update-daily-notes</a>`);
+    expect(recent).not.toContain('C:\\Users\\pedro');
+    expect(recent).not.toContain('Scheduled body must not become the title');
+  });
+
+  it('decodes named and numeric entities in a scheduled-task name', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=encodedscheduledtitlequerysentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${ENCODED_SCHEDULED_TITLE_SESSION}?page=1#t1">update&amp;daily-notes</a>`,
+    );
   });
 
   it('rejects the entire turn when its first text block has an injected prefix', async () => {
