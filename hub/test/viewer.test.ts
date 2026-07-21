@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import worker from '../src/index';
 import { firstInteractionTitleCandidateSql } from '../src/session-title';
 import { interactionTitlesSql, searchHitsSql } from '../src/api/search';
+import { buildSessionFilterSql } from '../src/session-filters';
 import { viewerRoute } from '../src/viewer/router';
 import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures';
 import { blobVersionOf } from '../src/viewer/session';
@@ -1285,6 +1286,12 @@ describe('viewer result pagination and facet layout', () => {
   const PAGINATION_HARNESS = 'viewer-pagination-test';
   const PAGINATION_MACHINE = 'viewer-pagination-machine';
   const PAGINATION_MARKER = 'viewerpaginationmarker';
+  const MULTI_MARKER = 'viewermultifacetmarker';
+  const MULTI_HARNESS_A = 'multi-harness-a';
+  const MULTI_HARNESS_B = 'multi-harness-b';
+  const MULTI_HARNESS_C = 'multi-harness-c';
+  const MULTI_MACHINE_1 = 'multi-machine-1';
+  const MULTI_MACHINE_2 = 'multi-machine-2';
 
   beforeAll(async () => {
     const statements: D1PreparedStatement[] = [];
@@ -1337,6 +1344,26 @@ describe('viewer result pagination and facet layout', () => {
     await testEnv.DB.prepare(
       `INSERT INTO blocks_fts(rowid, text) SELECT id, text FROM blocks WHERE session_id LIKE 'viewer-sort-%'`,
     ).run();
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        `INSERT INTO sessions
+           (session_id, harness, machine_id, os, primary_model, repo_url, title, started_at, ended_at, index_state) VALUES
+         ('viewer-multi-a1', ?1, ?4, 'linux', 'multi-model-a', 'https://example.test/repo-a', 'Multi A1', '2026-06-01T10:00:00Z', '2026-06-01T10:02:00Z', 'ready'),
+         ('viewer-multi-b1', ?2, ?4, 'windows', 'multi-model-b', 'https://example.test/repo-b', 'Multi B1', '2026-06-02T10:00:00Z', '2026-06-02T13:00:00Z', 'ready'),
+         ('viewer-multi-c1', ?3, ?4, 'linux', 'multi-model-c', 'https://example.test/repo-c', 'Multi C1', '2026-06-03T10:00:00Z', '2026-06-03T10:20:00Z', 'ready'),
+         ('viewer-multi-a2', ?1, ?5, 'linux', 'multi-model-a', 'https://example.test/repo-a', 'Multi A2', '2026-06-03T11:00:00Z', '2026-06-03T14:00:00Z', 'ready')`,
+      ).bind(MULTI_HARNESS_A, MULTI_HARNESS_B, MULTI_HARNESS_C, MULTI_MACHINE_1, MULTI_MACHINE_2),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text) VALUES
+         ('viewer-multi-a1', 1, 0, 0, 'user', 'text', 'Multi A1 ${MULTI_MARKER}'),
+         ('viewer-multi-b1', 1, 0, 0, 'user', 'text', 'Multi B1 ${MULTI_MARKER}'),
+         ('viewer-multi-c1', 1, 0, 0, 'user', 'text', 'Multi C1 ${MULTI_MARKER}'),
+         ('viewer-multi-a2', 1, 0, 0, 'user', 'text', 'Multi A2 ${MULTI_MARKER}')`,
+      ),
+    ]);
+    await testEnv.DB.prepare(
+      `INSERT INTO blocks_fts(rowid, text) SELECT id, text FROM blocks WHERE session_id LIKE 'viewer-multi-%'`,
+    ).run();
   });
 
   function pageHref(html: string, rel: 'next' | 'prev'): string {
@@ -1347,6 +1374,13 @@ describe('viewer result pagination and facet layout', () => {
 
   function recentIds(html: string): string[] {
     return [...html.matchAll(/<a href="\/s\/(viewer-pagination-[^"]+)">/g)].map((match) => match[1]!);
+  }
+
+  function facetHref(html: string, label: string, active = false): string {
+    const text = `${active ? '✓ ' : ''}${label}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const match = html.match(new RegExp(`<a href="([^"]+)">${text}<\\/a>`));
+    expect(match, `facet link ${label} should be present`).toBeTruthy();
+    return match![1]!.replaceAll('&amp;', '&');
   }
 
   it('renders clickable facets and sort without redundant facet dropdowns', async () => {
@@ -1376,6 +1410,122 @@ describe('viewer result pagination and facet layout', () => {
     expect(html).toContain('.sidebar { flex-basis: auto; width: 100%; max-width: none; }');
   });
 
+  it('ORs repeated values within a facet and ANDs different facets in recent and FTS results', async () => {
+    const filters = `harness=${MULTI_HARNESS_A}&harness=${MULTI_HARNESS_B}&machine=${MULTI_MACHINE_1}`;
+    const recent = await (await SELF.fetch(`https://sessions.vza.net/?${filters}`)).text();
+    expect(recent).toContain('Multi A1');
+    expect(recent).toContain('Multi B1');
+    expect(recent).not.toContain('Multi C1');
+    expect(recent).not.toContain('Multi A2');
+
+    const search = await (await SELF.fetch(`https://sessions.vza.net/?q=${MULTI_MARKER}&${filters}`)).text();
+    expect(search).toContain('Multi A1');
+    expect(search).toContain('Multi B1');
+    expect(search).not.toContain('Multi C1');
+    expect(search).not.toContain('Multi A2');
+  });
+
+  it('ORs repeated session date and time buckets consistently in recent and FTS paths', async () => {
+    const dateFilters = `machine=${MULTI_MACHINE_1}&session_date=2026-06-01&session_date=2026-06-02`;
+    for (const query of ['', `q=${MULTI_MARKER}&`]) {
+      const html = await (await SELF.fetch(`https://sessions.vza.net/?${query}${dateFilters}`)).text();
+      expect(html).toContain('Multi A1');
+      expect(html).toContain('Multi B1');
+      expect(html).not.toContain('Multi C1');
+      expect(html).not.toContain('Multi A2');
+    }
+
+    const timeFilters = `machine=${MULTI_MACHINE_1}&session_time=under-5m&session_time=over-2h`;
+    for (const query of ['', `q=${MULTI_MARKER}&`]) {
+      const html = await (await SELF.fetch(`https://sessions.vza.net/?${query}${timeFilters}`)).text();
+      expect(html).toContain('Multi A1');
+      expect(html).toContain('Multi B1');
+      expect(html).not.toContain('Multi C1');
+      expect(html).not.toContain('Multi A2');
+    }
+  });
+
+  it('computes disjunctive FTS facets and retains a selected missing value with count zero', async () => {
+    const url = `https://api.sessions.vza.net/api/v1/search?q=${MULTI_MARKER}&facets=1&` +
+      `harness=${MULTI_HARNESS_A}&machine=${MULTI_MACHINE_1}`;
+    const response = await SELF.fetch(url, { headers: { 'x-dev-machine': 'testbox-wsl' } });
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as {
+      hits: Array<{ session_id: string }>;
+      facets: Record<string, Record<string, number>>;
+    };
+    expect(body.hits.map((hit) => hit.session_id)).toEqual(['viewer-multi-a1']);
+    expect(body.facets.harness).toMatchObject({
+      [MULTI_HARNESS_A]: 1,
+      [MULTI_HARNESS_B]: 1,
+      [MULTI_HARNESS_C]: 1,
+    });
+    expect(body.facets.machine_id).toMatchObject({
+      [MULTI_MACHINE_1]: 1,
+      [MULTI_MACHINE_2]: 1,
+    });
+
+    const missing = 'multi-harness-missing';
+    for (const query of ['', `q=${MULTI_MARKER}&`]) {
+      const html = await (await SELF.fetch(
+        `https://sessions.vza.net/?${query}harness=${missing}&machine=${MULTI_MACHINE_1}`,
+      )).text();
+      expect(html).toContain(`>✓ ${missing}</a><span class="n">0</span>`);
+      expect(html).toContain(`>${MULTI_HARNESS_A}</a>`);
+      expect(html).toContain(`>${MULTI_HARNESS_B}</a>`);
+    }
+  });
+
+  it('appends inactive facet values, removes only the clicked active value, and resets the cursor', async () => {
+    const html = await (await SELF.fetch(
+      `https://sessions.vza.net/?q=${MULTI_MARKER}&harness=${MULTI_HARNESS_A}` +
+      `&harness=${MULTI_HARNESS_B}&machine=${MULTI_MACHINE_1}&cursor=stale`,
+    )).text();
+
+    const remove = new URL(facetHref(html, MULTI_HARNESS_A, true), 'https://sessions.vza.net');
+    expect(remove.searchParams.getAll('harness')).toEqual([MULTI_HARNESS_B]);
+    expect(remove.searchParams.getAll('machine')).toEqual([MULTI_MACHINE_1]);
+    expect(remove.searchParams.has('cursor')).toBe(false);
+
+    const append = new URL(facetHref(html, MULTI_HARNESS_C), 'https://sessions.vza.net');
+    expect(append.searchParams.getAll('harness')).toEqual([
+      MULTI_HARNESS_A,
+      MULTI_HARNESS_B,
+      MULTI_HARNESS_C,
+    ]);
+    expect(append.searchParams.getAll('machine')).toEqual([MULTI_MACHINE_1]);
+    expect(append.searchParams.has('cursor')).toBe(false);
+  });
+
+  it('preserves repeated filters in search and sort forms and clears them with a no-JS GET button', async () => {
+    const html = await (await SELF.fetch(
+      `https://sessions.vza.net/?q=${MULTI_MARKER}&harness=${MULTI_HARNESS_A}` +
+      `&harness=${MULTI_HARNESS_B}&machine=${MULTI_MACHINE_1}&session_time=under-5m` +
+      `&sort=total_tokens&limit=10&cursor=stale`,
+    )).text();
+    const searchForm = html.match(/<form class="search"[\s\S]*?<\/form>/)?.[0] ?? '';
+    const sortForm = html.match(/<form class="facet-controls"[\s\S]*?<\/form>/)?.[0] ?? '';
+    for (const form of [searchForm, sortForm]) {
+      expect(form.match(/name="harness"/g)).toHaveLength(2);
+      expect(form).toContain(`name="harness" value="${MULTI_HARNESS_A}"`);
+      expect(form).toContain(`name="harness" value="${MULTI_HARNESS_B}"`);
+      expect(form).toContain(`name="machine" value="${MULTI_MACHINE_1}"`);
+      expect(form).toContain('name="session_time" value="under-5m"');
+      expect(form).not.toContain('name="cursor"');
+    }
+
+    const clear = html.match(/<form class="clear-facets"[\s\S]*?<\/form>/)?.[0] ?? '';
+    expect(clear).toContain('method="get"');
+    expect(clear).toContain(`<input type="hidden" name="q" value="${MULTI_MARKER}">`);
+    expect(clear).toContain('<input type="hidden" name="sort" value="total_tokens">');
+    expect(clear).toContain('<input type="hidden" name="limit" value="10">');
+    expect(clear).toContain('<button type="submit">Clear facets</button>');
+    expect(clear).not.toContain('name="harness"');
+    expect(clear).not.toContain('name="machine"');
+    expect(clear).not.toContain('name="session_time"');
+    expect(clear).not.toContain('name="cursor"');
+  });
+
   it('paginates full-text results in both directions while preserving query and filter state', async () => {
     const first = await (await SELF.fetch(
       `https://sessions.vza.net/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&machine=${PAGINATION_MACHINE}&limit=10`,
@@ -1400,6 +1550,33 @@ describe('viewer result pagination and facet layout', () => {
     expect(third).toContain('Page 3');
     expect(third).not.toContain('<a rel="next"');
     expect(third).toContain('<span class="muted">Next →</span>');
+  });
+
+  it('preserves repeated facet params through pagination', async () => {
+    const first = await (await SELF.fetch(
+      `https://sessions.vza.net/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}` +
+      `&harness=missing-pagination-harness&limit=10`,
+    )).text();
+    const next = new URL(pageHref(first, 'next'), 'https://sessions.vza.net');
+    expect(next.searchParams.getAll('harness')).toEqual([
+      PAGINATION_HARNESS,
+      'missing-pagination-harness',
+    ]);
+    expect(next.searchParams.get('limit')).toBe('10');
+  });
+
+  it('keeps bounded multi-value filters on the composite session facet index', async () => {
+    const params = new URLSearchParams(
+      `harness=${MULTI_HARNESS_A}&harness=${MULTI_HARNESS_B}&machine=${MULTI_MACHINE_1}`,
+    );
+    const filter = buildSessionFilterSql(params, 'sessions');
+    const plan = await testEnv.DB.prepare(
+      `EXPLAIN QUERY PLAN SELECT session_id FROM sessions WHERE ${filter.clause}`,
+    ).bind(...filter.binds).all<{ detail: string }>();
+    const details = plan.results.map((row) => row.detail).join('\n');
+    expect(details).toContain('SEARCH sessions USING INDEX sessions_facets (harness=? AND machine_id=?)');
+    expect(details).not.toContain('SCAN sessions');
+    expect(filter.binds).toHaveLength(2);
   });
 
   it('paginates and filters the default recent-session list, including recovery from the last page', async () => {
@@ -1429,7 +1606,7 @@ describe('viewer result pagination and facet layout', () => {
     expect(controls).toContain(`name="q" value="${PAGINATION_MARKER}"`);
     expect(controls).toContain(`name="harness" value="${PAGINATION_HARNESS}"`);
     expect(controls).not.toContain('name="cursor"');
-    expect(controls).not.toContain('name="limit"');
+    expect(controls).toContain('name="limit" value="10"');
   });
 
   it('filters by session time and sorts by session time or total tokens', async () => {

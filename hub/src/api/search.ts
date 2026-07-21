@@ -1,38 +1,19 @@
-import { clampLimit, decodeCursor, encodeCursor, normalizeToBound } from './sessions';
+import { clampLimit, decodeCursor, encodeCursor } from './sessions';
 import { firstInteractionTitleCandidateSql, resolveFirstInteractionTitle } from '../session-title';
-
-const FACET_COLUMNS = ['harness', 'machine_id', 'os', 'primary_model', 'repo_url'] as const;
-const WIDE_FACET_COLUMNS = new Set<string>(['harness', 'machine_id', 'os', 'primary_model']);
-const SESSION_TIME_FACETS = [
-  ['under-5m', 'Under 5 minutes', 0, 5 * 60],
-  ['5m-30m', '5–30 minutes', 5 * 60, 30 * 60],
-  ['30m-2h', '30 minutes–2 hours', 30 * 60, 2 * 60 * 60],
-  ['over-2h', 'Over 2 hours', 2 * 60 * 60, null],
-] as const;
-const SESSION_TIME_SQL = "MAX(0, (julianday(s.ended_at) - julianday(s.started_at)) * 86400)";
-// Reasoning output is already included in output tokens, and cached input is not new work.
-const TOTAL_TOKENS_SQL = 'COALESCE(s.tokens_in, 0) + COALESCE(s.tokens_out, 0)';
-
-/** Keep the four former dropdown facets as discoverable as their previous 200-option controls. */
-export function facetValueLimit(column: string): number {
-  return WIDE_FACET_COLUMNS.has(column) ? 200 : 20;
-}
-
-function sessionTimeFilter(value: string | null, addFilter: (sql: string, value: unknown) => void): void {
-  const facet = SESSION_TIME_FACETS.find(([key]) => key === value);
-  if (!facet) return;
-  const [, , min, max] = facet;
-  if (max === null) {
-    addFilter(`${SESSION_TIME_SQL} >= ?`, min);
-    return;
-  }
-  addFilter(`${SESSION_TIME_SQL} >= ?`, min);
-  addFilter(`${SESSION_TIME_SQL} < ?`, max);
-}
+import {
+  buildSessionFilterSql,
+  FACET_DEFINITIONS,
+  facetExpressionSql,
+  facetOrderSql,
+  mergeFacetCounts,
+  selectedValues,
+  sessionDurationSql,
+  totalTokensSql,
+} from '../session-filters';
 
 function searchOrder(sort: string | null): string {
-  if (sort === 'session_time') return `ORDER BY ${SESSION_TIME_SQL} DESC, rank, b.id`;
-  if (sort === 'total_tokens') return `ORDER BY ${TOTAL_TOKENS_SQL} DESC, rank, b.id`;
+  if (sort === 'session_time') return `ORDER BY ${sessionDurationSql('s')} DESC, rank, b.id`;
+  if (sort === 'total_tokens') return `ORDER BY ${totalTokensSql('s')} DESC, rank, b.id`;
   return 'ORDER BY rank, b.id';
 }
 
@@ -43,7 +24,7 @@ export function searchHitsSql(where: string, sort: string | null, limit: number,
                  bm25(blocks_fts) AS rank,
                  s.harness, s.machine_id, s.os, s.cwd, s.repo_url, s.primary_model,
                  s.title AS stored_title, s.started_at, s.index_state,
-                 ${SESSION_TIME_SQL} AS duration_seconds, ${TOTAL_TOKENS_SQL} AS total_tokens
+                 ${sessionDurationSql('s')} AS duration_seconds, ${totalTokensSql('s')} AS total_tokens
           FROM blocks_fts
           JOIN blocks b ON b.id = blocks_fts.rowid
           JOIN sessions s ON s.session_id = b.session_id
@@ -93,28 +74,10 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   const offset = decodeCursor(url.searchParams.get('cursor'));
   const wantFacets = opts.facets ?? url.searchParams.get('facets') === '1';
 
-  const filters: string[] = [];
-  const binds: unknown[] = [];
-  const addFilter = (sql: string, value: unknown) => {
-    binds.push(value);
-    filters.push(sql.replace('?', `?${binds.length + 1}`)); // ?1 reserved for the query text
-  };
   const p = url.searchParams;
-  if (p.get('harness')) addFilter('s.harness = ?', p.get('harness'));
-  if (p.get('machine')) addFilter('s.machine_id = ?', p.get('machine'));
-  if (p.get('os')) addFilter('s.os = ?', p.get('os'));
-  if (p.get('model')) addFilter('s.primary_model = ?', p.get('model'));
-  if (p.get('repo')) addFilter('s.repo_url = ?', p.get('repo'));
-  if (p.get('cwd')) addFilter('s.cwd = ?', p.get('cwd'));
-  if (p.get('from')) addFilter('s.started_at >= ?', p.get('from'));
-  if (p.get('to')) addFilter('s.started_at <= ?', normalizeToBound(p.get('to')!));
-  const sessionDate = p.get('session_date');
-  if (sessionDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionDate)) {
-    addFilter('s.started_at >= ?', sessionDate);
-    addFilter("s.started_at < date(?, '+1 day')", sessionDate);
-  }
-  sessionTimeFilter(p.get('session_time'), addFilter);
-  const where = filters.length ? `AND ${filters.join(' AND ')}` : '';
+  const sessionFilter = buildSessionFilterSql(p, 's', 2);
+  const binds = sessionFilter.binds;
+  const where = sessionFilter.clause ? `AND ${sessionFilter.clause}` : '';
 
   if (!q) return { hits: [], error: 'missing_q' };
 
@@ -227,41 +190,29 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   // facets clause would ALSO reject. Skip it and report empty facets rather than retrying with a
   // match string already known to be broken.
   if (wantFacets && effectiveMatch !== null) {
-    for (const col of FACET_COLUMNS) {
-      const fr = await env.DB.prepare(
-        `SELECT s.${col} AS v, COUNT(DISTINCT s.session_id) AS n
+    const statements = FACET_DEFINITIONS.map((definition) => {
+      const filter = buildSessionFilterSql(p, 's', 2, definition.key);
+      const filtered = filter.clause ? ` AND ${filter.clause}` : '';
+      const expression = facetExpressionSql(definition, 's');
+      return env.DB.prepare(
+        `SELECT ${expression} AS v, COUNT(DISTINCT s.session_id) AS n
          FROM blocks_fts JOIN blocks b ON b.id = blocks_fts.rowid JOIN sessions s ON s.session_id = b.session_id
-         WHERE blocks_fts MATCH ?1 ${where} AND s.${col} IS NOT NULL
-         GROUP BY s.${col} ORDER BY n DESC LIMIT ${facetValueLimit(col)}`,
-      )
-        .bind(effectiveMatch, ...binds)
-        .all<{ v: string; n: number }>();
-      facets[col] = Object.fromEntries(fr.results.map((r) => [r.v, r.n]));
+         WHERE blocks_fts MATCH ?1${filtered} AND ${expression} IS NOT NULL
+         GROUP BY v ORDER BY ${facetOrderSql(definition)} LIMIT ${definition.valueLimit ?? 20}`,
+      ).bind(effectiveMatch, ...filter.binds);
+    });
+    const results = await env.DB.batch<{ v: string; n: number }>(statements);
+    for (let index = 0; index < FACET_DEFINITIONS.length; index++) {
+      const definition = FACET_DEFINITIONS[index]!;
+      facets[definition.key] = mergeFacetCounts(
+        results[index]!.results,
+        selectedValues(p, definition),
+      );
     }
-    const dateFacets = await env.DB.prepare(
-      `SELECT substr(s.started_at, 1, 10) AS v, COUNT(DISTINCT s.session_id) AS n
-       FROM blocks_fts JOIN blocks b ON b.id = blocks_fts.rowid JOIN sessions s ON s.session_id = b.session_id
-       WHERE blocks_fts MATCH ?1 ${where} AND s.started_at IS NOT NULL
-       GROUP BY v ORDER BY v DESC LIMIT 20`,
-    )
-      .bind(effectiveMatch, ...binds)
-      .all<{ v: string; n: number }>();
-    facets.session_date = Object.fromEntries(dateFacets.results.map((r) => [r.v, r.n]));
-    const timeFacets: Record<string, number> = {};
-    for (const [key, , min, max] of SESSION_TIME_FACETS) {
-      const upper = max === null ? '' : ` AND ${SESSION_TIME_SQL} < ?${binds.length + 3}`;
-      const fr = await env.DB.prepare(
-        `SELECT COUNT(DISTINCT s.session_id) AS n
-         FROM blocks_fts JOIN blocks b ON b.id = blocks_fts.rowid JOIN sessions s ON s.session_id = b.session_id
-         WHERE blocks_fts MATCH ?1 ${where} AND ${SESSION_TIME_SQL} >= ?${binds.length + 2}${upper}`,
-      ).bind(effectiveMatch, ...binds, min, ...(max === null ? [] : [max])).first<{ n: number }>();
-      if (fr?.n) timeFacets[key] = fr.n;
-    }
-    facets.session_time = timeFacets;
   } else if (wantFacets) {
-    for (const col of FACET_COLUMNS) facets[col] = {};
-    facets.session_date = {};
-    facets.session_time = {};
+    for (const definition of FACET_DEFINITIONS) {
+      facets[definition.key] = mergeFacetCounts([], selectedValues(p, definition));
+    }
   }
 
   return {

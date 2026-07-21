@@ -1,59 +1,32 @@
-import { facetValueLimit, runSearch, type SearchHit } from '../api/search';
-import { clampLimit, decodeCursor, encodeCursor, normalizeToBound } from '../api/sessions';
+import { runSearch, type SearchHit } from '../api/search';
+import { clampLimit, decodeCursor, encodeCursor } from '../api/sessions';
+import {
+  buildSessionFilterSql,
+  canonicalSessionFilterEntries,
+  canonicalizeMultiValueFilters,
+  FACET_DEFINITIONS,
+  facetExpressionSql,
+  facetLabelValue,
+  facetOrderSql,
+  hasSessionFilters,
+  MAX_VALUES_PER_FILTER,
+  mergeFacetCounts,
+  selectedFacetValues,
+  selectedValues,
+  sessionDurationSql,
+  totalTokensSql,
+} from '../session-filters';
 import { esc, page, q } from './layout';
 import { TURNS_PER_PAGE } from './session';
 import { firstInteractionTitleCandidateSql, sessionDisplayTitle } from '../session-title';
 
 const DEFAULT_PAGE_SIZE = 20;
 
-const FILTERS = [
-  { param: 'harness', col: 'harness' },
-  { param: 'machine', col: 'machine_id' },
-  { param: 'os', col: 'os' },
-  { param: 'model', col: 'primary_model' },
-] as const;
-
-const SESSION_FILTERS = [
-  ...FILTERS,
-  { param: 'repo', col: 'repo_url', label: 'Repo' },
-  { param: 'cwd', col: 'cwd', label: 'Working directory' },
-] as const;
-const DATE_FILTERS = ['from', 'to'] as const;
 const SORT_OPTIONS = [
   ['recent', 'Recent'],
   ['session_time', 'Session time'],
   ['total_tokens', 'Total tokens'],
 ] as const;
-const SESSION_TIME_FACETS: Record<string, string> = {
-  'under-5m': 'Under 5 minutes',
-  '5m-30m': '5–30 minutes',
-  '30m-2h': '30 minutes–2 hours',
-  'over-2h': 'Over 2 hours',
-};
-const SESSION_TIME_SQL = "MAX(0, (julianday(ended_at) - julianday(started_at)) * 86400)";
-// Reasoning output is already included in output tokens, and cached input is not new work.
-const TOTAL_TOKENS_SQL = 'COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0)';
-
-// Facet column name (as returned by runSearch) → query param the viewer filters on.
-const FACET_PARAM: Record<string, string> = {
-  harness: 'harness',
-  machine_id: 'machine',
-  os: 'os',
-  primary_model: 'model',
-  repo_url: 'repo',
-  session_date: 'session_date',
-  session_time: 'session_time',
-};
-const FACET_LABEL: Record<string, string> = {
-  harness: 'Harness',
-  machine_id: 'Machine',
-  os: 'OS',
-  primary_model: 'Model',
-  repo_url: 'Repo',
-  session_date: 'Session date/time',
-  session_time: 'Session time',
-};
-
 interface RecentRow {
   session_id: string;
   harness: string;
@@ -86,8 +59,7 @@ interface RecentCursor {
 export async function searchPage(url: URL, env: Env): Promise<Response> {
   const p = url.searchParams;
   const query = p.get('q')?.trim() ?? '';
-  const active = activeFilters(p);
-  const searchForm = renderSearchForm(query, active);
+  const searchForm = renderSearchForm(query, p);
 
   if (!query) {
     const [recent, facets] = await Promise.all([recentSessions(p, env), sessionFacets(p, env)]);
@@ -99,7 +71,7 @@ export async function searchPage(url: URL, env: Env): Promise<Response> {
       ? `<p class="muted small">Showing ${firstResult}–${firstResult + recent.rows.length - 1} recent sessions</p>`
       : '';
     const body = searchForm + renderSearchLayout(
-      renderSidebar(url, query, active, facets),
+      renderSidebar(url, query, facets),
       `<h3 class="muted small">Recent sessions</h3>${summary}${list}` +
         recentPager(url, recent.previousCursor, recent.nextCursor, recent.page),
     );
@@ -117,36 +89,20 @@ export async function searchPage(url: URL, env: Env): Promise<Response> {
     ? hits
     : `<p class="muted">No matches for “${esc(query)}”.</p>`;
   const body = searchForm + renderSearchLayout(
-    renderSidebar(url, query, active, result.facets),
+    renderSidebar(url, query, result.facets),
     `${summary}${list}${searchPager(url, result.cursor, offset, limit)}`,
   );
   return page({ title: `${query} — sessions`, nav: 'search', body });
 }
 
-function activeFilters(p: URLSearchParams): Record<string, string> {
-  const active: Record<string, string> = {};
-  const params = new Set<string>([
-    ...SESSION_FILTERS.map((f) => f.param),
-    ...DATE_FILTERS,
-    'session_time',
-    'session_date',
-    'sort',
-    ...Object.values(FACET_PARAM),
-  ]);
-  for (const param of params) {
-    const value = p.get(param);
-    if (value) active[param] = value;
-  }
-  return active;
-}
-
-function renderSearchForm(query: string, active: Record<string, string>): string {
-  const hidden = Object.entries(active)
-    .map(([name, value]) => `<input type="hidden" name="${esc(name)}" value="${esc(value)}">`)
-    .join('');
+function renderSearchForm(query: string, params: URLSearchParams): string {
+  const preserved = [
+    ...canonicalSessionFilterEntries(params),
+    ...preservedControlEntries(params, ['sort', 'limit']),
+  ];
   return `<form class="search" method="get" action="/">` +
     `<input type="search" name="q" value="${esc(query)}" placeholder="Full-text search across sessions…" autofocus>` +
-    hidden +
+    hiddenInputs(preserved) +
     `<button type="submit">Search</button></form>`;
 }
 
@@ -160,30 +116,34 @@ function renderSearchLayout(sidebar: string, content: string): string {
 function renderSidebar(
   url: URL,
   query: string,
-  active: Record<string, string>,
   facets: Record<string, Record<string, number>> | undefined,
 ): string {
-  const preserved = Object.entries(active)
-    .filter(([name]) => name !== 'sort')
-    .map(([name, value]) => `<input type="hidden" name="${esc(name)}" value="${esc(value)}">`)
-    .join('');
-  const sort = active.sort ?? 'recent';
+  const params = url.searchParams;
+  const sort = params.get('sort') ?? 'recent';
   const sortOptions = SORT_OPTIONS.map(([value, label]) =>
     // Full-text searches use FTS relevance unless an explicit non-default sort is selected.
     value === 'recent' && query ? [value, 'Relevance'] : [value, label],
   ).map(([value, label]) =>
     `<option value="${value}"${sort === value ? ' selected' : ''}>${label}</option>`,
   ).join('');
-  const clear = new URL(url);
-  clear.search = '';
-  if (query) clear.searchParams.set('q', query);
   const controls = `<form class="facet-controls" method="get" action="/">` +
-    `<input type="hidden" name="q" value="${esc(query)}">${preserved}` +
+    hiddenInputs([
+      ['q', query],
+      ...canonicalSessionFilterEntries(params),
+      ...preservedControlEntries(params, ['limit']),
+    ]) +
     `<label><span>Sort by</span><select name="sort" aria-label="Sort sessions" onchange="this.form.requestSubmit()">${sortOptions}</select></label>` +
     `<noscript><button type="submit">Apply filters</button></noscript>` +
-    (Object.keys(active).length ? `<a class="clear-filters small" href="${esc(clear.pathname + clear.search)}">Clear filters</a>` : '') +
     `</form>`;
-  return controls + renderFacets(url, facets, active);
+  const clear = hasSessionFilters(params)
+    ? `<form class="clear-facets" method="get" action="/">` +
+      hiddenInputs([
+        ['q', query],
+        ...preservedControlEntries(params, ['sort', 'limit']),
+      ]) +
+      `<button type="submit">Clear facets</button></form>`
+    : '';
+  return controls + clear + renderFacets(url, facets, selectedFacetValues(params));
 }
 
 async function recentSessions(p: URLSearchParams, env: Env): Promise<RecentResult> {
@@ -199,7 +159,7 @@ async function recentSessions(p: URLSearchParams, env: Env): Promise<RecentResul
   const result = await env.DB.prepare(
     `SELECT session_id, harness, machine_id, primary_model,
             ${firstInteractionTitleCandidateSql('sessions')} AS title_candidate, title AS stored_title, started_at, cwd,
-            ${SESSION_TIME_SQL} AS duration_seconds, ${TOTAL_TOKENS_SQL} AS total_tokens
+            ${sessionDurationSql('sessions')} AS duration_seconds, ${totalTokensSql('sessions')} AS total_tokens
      FROM sessions ${where}
      ORDER BY COALESCE(started_at, '') ${direction}, session_id ${direction} LIMIT ${limit + 1}`,
   ).bind(...binds).all<RecentRow>();
@@ -233,11 +193,11 @@ async function sortedRecentSessions(p: URLSearchParams, env: Env): Promise<Recen
   const limit = clampLimit(p.get('limit'), DEFAULT_PAGE_SIZE, 100);
   const offset = decodeCursor(p.get('cursor'));
   const { where, binds } = sessionWhere(p);
-  const order = p.get('sort') === 'session_time' ? SESSION_TIME_SQL : TOTAL_TOKENS_SQL;
+  const order = p.get('sort') === 'session_time' ? sessionDurationSql('sessions') : totalTokensSql('sessions');
   const rows = await env.DB.prepare(
     `SELECT session_id, harness, machine_id, primary_model,
             ${firstInteractionTitleCandidateSql('sessions')} AS title_candidate, title AS stored_title, started_at, cwd,
-            ${SESSION_TIME_SQL} AS duration_seconds, ${TOTAL_TOKENS_SQL} AS total_tokens
+            ${sessionDurationSql('sessions')} AS duration_seconds, ${totalTokensSql('sessions')} AS total_tokens
      FROM sessions ${where} ORDER BY ${order} DESC, session_id DESC LIMIT ${limit + 1} OFFSET ${offset}`,
   ).bind(...binds).all<RecentRow>();
   const result = rows.results.slice(0, limit);
@@ -310,75 +270,30 @@ function decodeRecentCursor(value: string | null): RecentCursor | null {
 }
 
 async function sessionFacets(p: URLSearchParams, env: Env): Promise<Record<string, Record<string, number>>> {
-  const { where, binds } = sessionWhere(p);
   const facets: Record<string, Record<string, number>> = {};
-  for (const col of Object.keys(FACET_PARAM)) {
-    if (col === 'session_time') {
-      facets[col] = await sessionTimeFacets(where, binds, env);
-      continue;
-    }
-    if (col === 'session_date') {
-      const prefix = where ? `${where} AND` : 'WHERE';
-      const rows = await env.DB.prepare(
-        `SELECT substr(started_at, 1, 10) AS v, COUNT(*) AS n FROM sessions ${prefix} started_at IS NOT NULL
-         GROUP BY v ORDER BY v DESC LIMIT 20`,
-      ).bind(...binds).all<{ v: string; n: number }>();
-      facets[col] = Object.fromEntries(rows.results.map((r) => [r.v, r.n]));
-      continue;
-    }
-    const prefix = where ? `${where} AND` : 'WHERE';
-    const rows = await env.DB.prepare(
-      `SELECT ${col} AS v, COUNT(*) AS n FROM sessions ${prefix} ${col} IS NOT NULL
-       GROUP BY ${col} ORDER BY n DESC LIMIT ${facetValueLimit(col)}`,
-    ).bind(...binds).all<{ v: string; n: number }>();
-    facets[col] = Object.fromEntries(rows.results.map((r) => [r.v, r.n]));
+  const statements = FACET_DEFINITIONS.map((definition) => {
+    const filter = buildSessionFilterSql(p, 'sessions', 1, definition.key);
+    const expression = facetExpressionSql(definition, 'sessions');
+    const where = [filter.clause, `${expression} IS NOT NULL`].filter(Boolean).join(' AND ');
+    return env.DB.prepare(
+      `SELECT ${expression} AS v, COUNT(*) AS n FROM sessions
+       WHERE ${where} GROUP BY v ORDER BY ${facetOrderSql(definition)} LIMIT ${definition.valueLimit ?? 20}`,
+    ).bind(...filter.binds);
+  });
+  const results = await env.DB.batch<{ v: string; n: number }>(statements);
+  for (let index = 0; index < FACET_DEFINITIONS.length; index++) {
+    const definition = FACET_DEFINITIONS[index]!;
+    facets[definition.key] = mergeFacetCounts(
+      results[index]!.results,
+      selectedValues(p, definition),
+    );
   }
   return facets;
 }
 
-async function sessionTimeFacets(where: string, binds: string[], env: Env): Promise<Record<string, number>> {
-  const ranges = [
-    ['under-5m', 0, 5 * 60], ['5m-30m', 5 * 60, 30 * 60],
-    ['30m-2h', 30 * 60, 2 * 60 * 60], ['over-2h', 2 * 60 * 60, null],
-  ] as const;
-  const out: Record<string, number> = {};
-  for (const [key, min, max] of ranges) {
-    const prefix = where ? `${where} AND` : 'WHERE';
-    const upper = max === null ? '' : ` AND ${SESSION_TIME_SQL} < ?${binds.length + 2}`;
-    const row = await env.DB.prepare(
-      `SELECT COUNT(*) AS n FROM sessions ${prefix} ${SESSION_TIME_SQL} >= ?${binds.length + 1}${upper}`,
-    ).bind(...binds, min, ...(max === null ? [] : [max])).first<{ n: number }>();
-    if (row?.n) out[key] = row.n;
-  }
-  return out;
-}
-
 function sessionWhere(p: URLSearchParams): { where: string; binds: string[] } {
-  const clauses: string[] = [];
-  const binds: string[] = [];
-  const add = (clause: string, value: string) => {
-    binds.push(value);
-    clauses.push(clause.replace('?', `?${binds.length}`));
-  };
-  for (const f of SESSION_FILTERS) {
-    const value = p.get(f.param);
-    if (value) add(`${f.col} = ?`, value);
-  }
-  const from = p.get('from');
-  if (from) add('started_at >= ?', from);
-  const to = p.get('to');
-  if (to) add('started_at <= ?', normalizeToBound(to));
-  const sessionDate = p.get('session_date');
-  if (sessionDate && /^\d{4}-\d{2}-\d{2}$/.test(sessionDate)) {
-    add('started_at >= ?', sessionDate);
-    add("started_at < date(?, '+1 day')", sessionDate);
-  }
-  const sessionTime = p.get('session_time');
-  if (sessionTime === 'under-5m') { add(`${SESSION_TIME_SQL} >= ?`, '0'); add(`${SESSION_TIME_SQL} < ?`, String(5 * 60)); }
-  if (sessionTime === '5m-30m') { add(`${SESSION_TIME_SQL} >= ?`, String(5 * 60)); add(`${SESSION_TIME_SQL} < ?`, String(30 * 60)); }
-  if (sessionTime === '30m-2h') { add(`${SESSION_TIME_SQL} >= ?`, String(30 * 60)); add(`${SESSION_TIME_SQL} < ?`, String(2 * 60 * 60)); }
-  if (sessionTime === 'over-2h') add(`${SESSION_TIME_SQL} >= ?`, String(2 * 60 * 60));
-  return { where: clauses.length ? `WHERE ${clauses.join(' AND ')}` : '', binds };
+  const filter = buildSessionFilterSql(p, 'sessions');
+  return { where: filter.clause ? `WHERE ${filter.clause}` : '', binds: filter.binds };
 }
 
 function renderHit(h: SearchHit): string {
@@ -433,31 +348,55 @@ function fmtTokens(n: number): string {
   return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(n);
 }
 
+function hiddenInputs(entries: Array<[string, string]>): string {
+  return entries
+    .map(([name, value]) => `<input type="hidden" name="${esc(name)}" value="${esc(value)}">`)
+    .join('');
+}
+
+function preservedControlEntries(params: URLSearchParams, names: string[]): Array<[string, string]> {
+  const entries: Array<[string, string]> = [];
+  for (const name of names) {
+    const value = params.get(name);
+    if (value) entries.push([name, value]);
+  }
+  return entries;
+}
+
 /** The FTS snippet() output contains our literal <mark>…</mark> markers around otherwise-escaped text. */
 function sanitizeSnippet(snip: string): string {
   return esc(snip).replaceAll('&lt;mark&gt;', '<mark>').replaceAll('&lt;/mark&gt;', '</mark>');
 }
 
-function renderFacets(url: URL, facets: Record<string, Record<string, number>> | undefined, active: Record<string, string>): string {
+function renderFacets(
+  url: URL,
+  facets: Record<string, Record<string, number>> | undefined,
+  selected: Record<string, string[]>,
+): string {
   if (!facets) return '';
-  const groups = Object.entries(facets)
-    .filter(([, values]) => Object.keys(values).length > 0)
-    .map(([col, values]) => {
-      const param = FACET_PARAM[col] ?? col;
+  const groups = FACET_DEFINITIONS
+    .filter((definition) => Object.keys(facets[definition.key] ?? {}).length > 0)
+    .map((definition) => {
+      const values = facets[definition.key] ?? {};
+      const selectedValuesForFacet = selected[definition.key] ?? [];
       const items = Object.entries(values)
         .map(([value, n]) => {
-          const isActive = active[param] === value;
+          const isActive = selectedValuesForFacet.includes(value);
           const target = new URL(url);
-          if (isActive) target.searchParams.delete(param);
-          else target.searchParams.set(param, value);
+          canonicalizeMultiValueFilters(target.searchParams);
+          target.searchParams.delete(definition.param);
+          const nextValues = isActive
+            ? selectedValuesForFacet.filter((selectedValue) => selectedValue !== value)
+            : [...selectedValuesForFacet, value].slice(0, MAX_VALUES_PER_FILTER);
+          for (const nextValue of nextValues) target.searchParams.append(definition.param, nextValue);
           target.searchParams.delete('cursor');
           const href = `${target.pathname}${target.search}`;
           return `<li class="${isActive ? 'active' : ''}">` +
-            `<a href="${esc(href)}">${isActive ? '✓ ' : ''}${esc(col === 'session_time' ? (SESSION_TIME_FACETS[value] ?? value) : value)}</a>` +
+            `<a href="${esc(href)}">${isActive ? '✓ ' : ''}${esc(facetLabelValue(definition, value))}</a>` +
             `<span class="n">${n}</span></li>`;
         })
         .join('');
-      return `<h3>${esc(FACET_LABEL[col] ?? col)}</h3><ul>${items}</ul>`;
+      return `<h3>${esc(definition.label ?? definition.key)}</h3><ul>${items}</ul>`;
     })
     .join('');
   return groups || '<p class="muted small">No facets.</p>';

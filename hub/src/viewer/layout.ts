@@ -80,7 +80,11 @@ form.search button { background: var(--accent); color: #fff; border-color: var(-
   background: var(--card); color: var(--fg); font: inherit;
 }
 .facet-controls button { margin-top: 8px; background: var(--accent); color: #fff; border-color: var(--accent); cursor: pointer; }
-.clear-filters { display: inline-block; margin-top: 9px; }
+.clear-facets { margin: 9px 0 16px; }
+.clear-facets button {
+  width: 100%; padding: 7px 8px; border: 1px solid var(--line); border-radius: 6px;
+  background: var(--card); color: var(--fg); font: inherit; cursor: pointer;
+}
 .hit { border-bottom: 1px solid var(--line); padding: 12px 0; }
 .hit .title { font-weight: 600; }
 .hit .snip { margin: 4px 0; color: var(--fg); white-space: pre-wrap; word-break: break-word; }
