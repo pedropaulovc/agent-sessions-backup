@@ -30,6 +30,30 @@ function searchOrder(sort: string | null): string {
   return 'ORDER BY rank, b.id';
 }
 
+/** @internal Exported so the query-plan regression exercises the exact production query. */
+export function searchHitsSql(where: string, sort: string | null, limit: number, offset: number): string {
+  return `SELECT b.session_id, b.turn_index, b.block_index, b.role, b.btype, b.tool_name, b.ts,
+                 snippet(blocks_fts, 0, '<mark>', '</mark>', '…', 16) AS snip,
+                 bm25(blocks_fts) AS rank,
+                 s.harness, s.machine_id, s.os, s.cwd, s.repo_url, s.primary_model,
+                 s.title AS stored_title, s.started_at, s.index_state,
+                 ${SESSION_TIME_SQL} AS duration_seconds, ${TOTAL_TOKENS_SQL} AS total_tokens
+          FROM blocks_fts
+          JOIN blocks b ON b.id = blocks_fts.rowid
+          JOIN sessions s ON s.session_id = b.session_id
+          WHERE blocks_fts MATCH ?1 ${where}
+          ${searchOrder(sort)} LIMIT ${limit + 1} OFFSET ${offset}`;
+}
+
+/** @internal Exported so tests can verify the bounded post-search lookup plan. */
+export function interactionTitlesSql(sessionCount: number): string {
+  const placeholders = Array.from({ length: sessionCount }, (_, index) => `?${index + 1}`).join(', ');
+  return `SELECT sessions.session_id,
+                 ${firstInteractionTitleCandidateSql('sessions')} AS title_candidate
+          FROM sessions
+          WHERE sessions.session_id IN (${placeholders})`;
+}
+
 export interface SearchHit {
   session_id: string;
   snippet: string;
@@ -85,7 +109,6 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   }
   sessionTimeFilter(p.get('session_time'), addFilter);
   const where = filters.length ? `AND ${filters.join(' AND ')}` : '';
-  const order = searchOrder(p.get('sort'));
 
   if (!q) return { hits: [], error: 'missing_q' };
 
@@ -130,18 +153,7 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   const run = async (match: string) => {
     try {
       return await env.DB.prepare(
-        `SELECT b.session_id, b.turn_index, b.block_index, b.role, b.btype, b.tool_name, b.ts,
-                snippet(blocks_fts, 0, '<mark>', '</mark>', '…', 16) AS snip,
-                bm25(blocks_fts) AS rank,
-                s.harness, s.machine_id, s.os, s.cwd, s.repo_url, s.primary_model,
-                ${firstInteractionTitleCandidateSql('s')} AS title_candidate, s.title AS stored_title,
-                s.started_at, s.index_state,
-                ${SESSION_TIME_SQL} AS duration_seconds, ${TOTAL_TOKENS_SQL} AS total_tokens
-         FROM blocks_fts
-         JOIN blocks b ON b.id = blocks_fts.rowid
-         JOIN sessions s ON s.session_id = b.session_id
-         WHERE blocks_fts MATCH ?1 ${where}
-         ${order} LIMIT ${limit + 1} OFFSET ${offset}`,
+        searchHitsSql(where, p.get('sort'), limit, offset),
       )
         .bind(match, ...binds)
         .all();
@@ -165,7 +177,19 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   }
   const results = rows?.results ?? [];
 
-  const hits: SearchHit[] = results.slice(0, limit).map((r) => ({
+  // Ranking and pagination must finish before the correlated title selector runs. Resolving the
+  // unique sessions in a separate statement makes that boundary explicit and bounds the expensive
+  // blocks lookup to the hits we will actually render (the extra row only determines the cursor).
+  const returnedResults = results.slice(0, limit);
+  const sessionIds = [...new Set(returnedResults.map((row) => row.session_id as string))];
+  const titleCandidates = sessionIds.length === 0
+    ? []
+    : (await env.DB.prepare(interactionTitlesSql(sessionIds.length))
+      .bind(...sessionIds)
+      .all<{ session_id: string; title_candidate: string | null }>()).results;
+  const titleBySession = new Map(titleCandidates.map((row) => [row.session_id, row.title_candidate]));
+
+  const hits: SearchHit[] = returnedResults.map((r) => ({
     session_id: r.session_id as string,
     snippet: r.snip as string,
     block: {
@@ -183,7 +207,7 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
       cwd: (r.cwd as string | null) ?? null,
       repo_url: (r.repo_url as string | null) ?? null,
       primary_model: (r.primary_model as string | null) ?? null,
-      title: resolveFirstInteractionTitle((r.title_candidate as string | null) ?? null) ??
+      title: resolveFirstInteractionTitle(titleBySession.get(r.session_id as string) ?? null) ??
         ((r.stored_title as string | null) ?? null),
       started_at: (r.started_at as string | null) ?? null,
       duration_seconds: r.duration_seconds === null ? null : Number(r.duration_seconds),

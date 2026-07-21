@@ -2,6 +2,7 @@ import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import worker from '../src/index';
 import { firstInteractionTitleCandidateSql } from '../src/session-title';
+import { interactionTitlesSql, searchHitsSql } from '../src/api/search';
 import { viewerRoute } from '../src/viewer/router';
 import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures';
 import { blobVersionOf } from '../src/viewer/session';
@@ -633,6 +634,22 @@ describe('viewer', () => {
     const details = plan.results.map((row) => row.detail).join('\n');
     expect(details).toContain('SEARCH title_block USING INDEX blocks_session (session_id=?)');
     expect(details).not.toContain('SCAN title_block');
+  });
+
+  it('limits broad FTS matches before resolving interaction titles', async () => {
+    const searchPlan = await testEnv.DB.prepare(
+      `EXPLAIN QUERY PLAN ${searchHitsSql('', null, 20, 0)}`,
+    ).bind('filler').all<{ detail: string }>();
+    const searchDetails = searchPlan.results.map((row) => row.detail).join('\n');
+    expect(searchDetails).toContain('SCAN blocks_fts VIRTUAL TABLE');
+    expect(searchDetails).not.toContain('title_block');
+
+    const titlePlan = await testEnv.DB.prepare(
+      `EXPLAIN QUERY PLAN ${interactionTitlesSql(2)}`,
+    ).bind(SEARCH_SESSION, BIG_SESSION).all<{ detail: string }>();
+    const titleDetails = titlePlan.results.map((row) => row.detail).join('\n');
+    expect(titleDetails).toContain('SEARCH title_block USING INDEX blocks_session (session_id=?)');
+    expect(titleDetails).not.toContain('blocks_fts');
   });
 
   it('ignores abandoned title blocks and chooses the first main-path interaction', async () => {
