@@ -1349,7 +1349,7 @@ describe('viewer result pagination and facet layout', () => {
     return [...html.matchAll(/<a href="\/s\/(viewer-pagination-[^"]+)">/g)].map((match) => match[1]!);
   }
 
-  it('renders auto-submitting filters in a bounded, responsive left sidebar', async () => {
+  it('renders clickable facets and sort without redundant facet dropdowns', async () => {
     const res = await SELF.fetch(
       `https://sessions.vza.net/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&machine=${PAGINATION_MACHINE}`,
     );
@@ -1357,9 +1357,15 @@ describe('viewer result pagination and facet layout', () => {
     const html = await res.text();
     expect(html.indexOf('<aside class="sidebar facets">')).toBeLessThan(html.indexOf('<section class="content search-results">'));
     expect(html).toContain('class="facet-controls"');
-    expect(html).toContain('onchange="this.form.requestSubmit()"');
-    expect(html).toContain(`<option value="${PAGINATION_HARNESS}" selected>`);
-    expect(html).toContain(`<option value="${PAGINATION_MACHINE}" selected>`);
+    expect(html).toContain('aria-label="Sort sessions" onchange="this.form.requestSubmit()"');
+    expect(html).not.toContain('aria-label="Filter by Harness"');
+    expect(html).not.toContain('aria-label="Filter by Machine"');
+    expect(html).not.toContain('aria-label="Filter by OS"');
+    expect(html).not.toContain('aria-label="Filter by Model"');
+    expect(html).toContain('>Harness</h3>');
+    expect(html).toContain('>Machine</h3>');
+    expect(html).toContain(`✓ ${PAGINATION_HARNESS}</a>`);
+    expect(html).toContain(`✓ ${PAGINATION_MACHINE}</a>`);
     // flex items default to min-width:auto, which let a long repo/cwd facet expand this
     // nominally 220px-content sidebar to 460px+ in production. The outer width includes
     // its 20px padding + border; links wrap while their count stays intact.
@@ -1421,6 +1427,7 @@ describe('viewer result pagination and facet layout', () => {
     const second = await (await SELF.fetch(`https://sessions.vza.net${pageHref(first, 'next')}`)).text();
     const controls = second.match(/<form class="facet-controls"[\s\S]*?<\/form>/)?.[0] ?? '';
     expect(controls).toContain(`name="q" value="${PAGINATION_MARKER}"`);
+    expect(controls).toContain(`name="harness" value="${PAGINATION_HARNESS}"`);
     expect(controls).not.toContain('name="cursor"');
     expect(controls).not.toContain('name="limit"');
   });

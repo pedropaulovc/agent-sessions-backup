@@ -74,7 +74,6 @@ form.search button {
 form.search button { background: var(--accent); color: #fff; border-color: var(--accent); cursor: pointer; }
 .facets { border-right: 1px solid var(--line); padding-right: 20px; }
 .facet-controls { margin-bottom: 16px; }
-.facet-selects { display: grid; gap: 9px; }
 .facet-controls label { display: grid; gap: 3px; color: var(--muted); font-size: 12px; font-weight: 600; }
 .facet-controls select, .facet-controls button {
   width: 100%; min-width: 0; padding: 7px 8px; border: 1px solid var(--line); border-radius: 6px;
@@ -132,11 +131,7 @@ img.media { max-width: 100%; height: auto; border: 1px solid var(--line); border
   .search-layout { flex-direction: column; gap: 10px; }
   .sidebar { flex-basis: auto; width: 100%; max-width: none; }
   .facets { border-right: 0; border-bottom: 1px solid var(--line); padding: 0 0 14px; }
-  .facet-selects { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .content { width: 100%; }
-}
-@media (max-width: 440px) {
-  .facet-selects { grid-template-columns: 1fr; }
 }
 `;
 
