@@ -22,6 +22,10 @@ const TITLE_SESSION = '44444444-cccc-4ccc-8ccc-cccccccccccc';
 const TEAMMATE_TITLE_SESSION = '33333333-dddd-4ddd-8ddd-dddddddddddd';
 const PREFIXED_TURN_TITLE_SESSION = '22222222-eeee-4eee-8eee-eeeeeeeeeeee';
 const SERVER_TOOL_TITLE_SESSION = '11111111-ffff-4fff-8fff-ffffffffffff';
+const IMAGE_FORWARD_TITLE_SESSION = '10101010-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const IMAGE_WINDOWS_TITLE_SESSION = '20202020-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const OFF_MAIN_TITLE_SESSION = '30303030-cccc-4ccc-8ccc-cccccccccccc';
+const STORED_FALLBACK_TITLE_SESSION = '40404040-dddd-4ddd-8ddd-dddddddddddd';
 const REPO_URL = 'https://github.com/tester/facetdemo';
 
 // Hostile transcript payloads: an SVG with inline script and an HTML "document".
@@ -280,6 +284,19 @@ describe('viewer', () => {
       (await putFile('claude-projects', `-home-tester-src-demo/${SERVER_TOOL_TITLE_SESSION}.jsonl`, serverToolTitleContent)).status,
     ).toBe(201);
 
+    const imageForwardTitleContent = [
+      ccLine(IMAGE_FORWARD_TITLE_SESSION, {
+        uuid: 'image-forward-prompt',
+        parentUuid: null,
+        role: 'user',
+        text: '<image name=[Image #1] path="C:/src/harmonic-analyzer/.claude/worktrees/batch-cone/cad/out/png/cone-gear-shaft_drawing.png">\n</image>\n\nPlease inspect the cone gear shaft drawing',
+      }),
+      ccLine(IMAGE_FORWARD_TITLE_SESSION, { uuid: 'image-forward-query', parentUuid: 'image-forward-prompt', role: 'assistant', text: 'forwardimagetitlequerysentinel response' }),
+    ].join('\n');
+    expect(
+      (await putFile('claude-projects', `-home-tester-src-demo/${IMAGE_FORWARD_TITLE_SESSION}.jsonl`, imageForwardTitleContent)).status,
+    ).toBe(201);
+
     const offsetMatchContent = [
       ccLine(OFFSET_MATCH_SESSION, { uuid: 'om-1', parentUuid: null, role: 'user', text: 'offset first turn' }),
       ccLine(OFFSET_MATCH_SESSION, { uuid: 'om-2', parentUuid: 'om-1', role: 'assistant', text: 'offset second turn' }),
@@ -303,11 +320,52 @@ describe('viewer', () => {
          (?1, 1, 1, 0, 'assistant', 'text', 'First later turn title'),
          (?1, 1, 2, 0, 'user', 'text', 'sameturntitlesentinel query target')`,
       ).bind(PREFIXED_TURN_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+         VALUES (?1, 'image-title-test', 'testbox-wsl', 'Stored Windows image title', '2026-07-01T10:00:00Z', 'ready')`,
+      ).bind(IMAGE_WINDOWS_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks
+           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
+         (?1, 1, 0, 0, 'user', 'text', ?2, 1),
+         (?1, 1, 0, 1, 'user', 'text', 'Windows image prompt after wrapper-only block', 1),
+         (?1, 1, 1, 0, 'assistant', 'text', 'windowsimagetitlequerysentinel response', 1)`,
+      ).bind(
+        IMAGE_WINDOWS_TITLE_SESSION,
+        '<image name=[Image #1] path="C:\\src\\harmonic-analyzer\\.claude\\worktrees\\pose-bench-sol\\comparisons\\bench\\out\\sandbox\\sample.jpg">\r\n</image>\r\n',
+      ),
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+         VALUES (?1, 'main-path-title-test', 'testbox-wsl', 'Stored main-path title', '2026-07-01T10:00:00Z', 'ready')`,
+      ).bind(OFF_MAIN_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks
+           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
+         (?1, 1, 0, 0, 'user', 'text', 'Abandoned earliest title', 0),
+         (?1, 1, 1, 0, 'user', 'text', 'Main path interaction title', 1),
+         (?1, 1, 2, 0, 'assistant', 'text', 'mainpathtitlequerysentinel response', 1)`,
+      ).bind(OFF_MAIN_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
+         VALUES (?1, 'title-fallback-test', 'testbox-wsl', 'Stored fallback title', '2026-07-01T10:00:00Z', 'ready')`,
+      ).bind(STORED_FALLBACK_TITLE_SESSION),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks
+           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
+         (?1, 1, 0, 0, 'user', 'image', NULL, 1),
+         (?1, 1, 1, 0, 'assistant', 'tool_use', 'fallbacktitlequerysentinel tool metadata', 1)`,
+      ).bind(STORED_FALLBACK_TITLE_SESSION),
     ]);
     await testEnv.DB.prepare(
       `INSERT INTO blocks_fts(rowid, text)
-       SELECT id, text FROM blocks WHERE session_id = ?1`,
-    ).bind(PREFIXED_TURN_TITLE_SESSION).run();
+       SELECT id, text FROM blocks
+       WHERE session_id IN (?1, ?2, ?3, ?4) AND text IS NOT NULL`,
+    ).bind(
+      PREFIXED_TURN_TITLE_SESSION,
+      IMAGE_WINDOWS_TITLE_SESSION,
+      OFF_MAIN_TITLE_SESSION,
+      STORED_FALLBACK_TITLE_SESSION,
+    ).run();
   });
 
   it('search page returns 200 with a highlighted snippet and a link to the session', async () => {
@@ -373,6 +431,49 @@ describe('viewer', () => {
       `<a href="/s/${SERVER_TOOL_TITLE_SESSION}?page=1#t2">Real text after server tool metadata</a>`,
     );
     expect(html).not.toContain('{&quot;type&quot;:&quot;server_tool_use&quot;');
+  });
+
+  it('strips a leading image wrapper with the user-provided forward-slash path', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=forwardimagetitlequerysentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${IMAGE_FORWARD_TITLE_SESSION}?page=1#t1">Please inspect the cone gear shaft drawing</a>`,
+    );
+    expect(html).not.toContain('cone-gear-shaft_drawing.png');
+  });
+
+  it('ignores a Windows image-only block and uses later text in the same turn', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=windowsimagetitlequerysentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${IMAGE_WINDOWS_TITLE_SESSION}?page=1#t1">Windows image prompt after wrapper-only block</a>`,
+    );
+    expect(html).not.toContain('C:\\src\\harmonic-analyzer');
+  });
+
+  it('ignores abandoned title blocks and chooses the first main-path interaction', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=mainpathtitlequerysentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${OFF_MAIN_TITLE_SESSION}?page=1#t2">Main path interaction title</a>`,
+    );
+    expect(html).not.toContain('Abandoned earliest title');
+  });
+
+  it('falls back to the stored title when a session has only image and tool blocks', async () => {
+    const query = await (await SELF.fetch('https://sessions.vza.net/?q=fallbacktitlequerysentinel')).text();
+    expect(query).toContain(
+      `<a href="/s/${STORED_FALLBACK_TITLE_SESSION}?page=1#t1">Stored fallback title</a>`,
+    );
+
+    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=title-fallback-test')).text();
+    expect(recent).toContain(
+      `<a href="/s/${STORED_FALLBACK_TITLE_SESSION}">Stored fallback title</a>`,
+    );
+
+    const sorted = await (await SELF.fetch(
+      'https://sessions.vza.net/?harness=title-fallback-test&sort=total_tokens',
+    )).text();
+    expect(sorted).toContain(
+      `<a href="/s/${STORED_FALLBACK_TITLE_SESSION}">Stored fallback title</a>`,
+    );
   });
 
   it('marks a selected repo facet active with a toggle-off link that drops the repo param', async () => {

@@ -134,7 +134,8 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
                 snippet(blocks_fts, 0, '<mark>', '</mark>', '…', 16) AS snip,
                 bm25(blocks_fts) AS rank,
                 s.harness, s.machine_id, s.os, s.cwd, s.repo_url, s.primary_model,
-                ${firstInteractionTitleCandidateSql('s')} AS title_candidate, s.started_at, s.index_state,
+                ${firstInteractionTitleCandidateSql('s')} AS title_candidate, s.title AS stored_title,
+                s.started_at, s.index_state,
                 ${SESSION_TIME_SQL} AS duration_seconds, ${TOTAL_TOKENS_SQL} AS total_tokens
          FROM blocks_fts
          JOIN blocks b ON b.id = blocks_fts.rowid
@@ -182,7 +183,8 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
       cwd: (r.cwd as string | null) ?? null,
       repo_url: (r.repo_url as string | null) ?? null,
       primary_model: (r.primary_model as string | null) ?? null,
-      title: resolveFirstInteractionTitle((r.title_candidate as string | null) ?? null),
+      title: resolveFirstInteractionTitle((r.title_candidate as string | null) ?? null) ??
+        ((r.stored_title as string | null) ?? null),
       started_at: (r.started_at as string | null) ?? null,
       duration_seconds: r.duration_seconds === null ? null : Number(r.duration_seconds),
       total_tokens: Number(r.total_tokens),

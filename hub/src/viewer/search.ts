@@ -60,6 +60,7 @@ interface RecentRow {
   machine_id: string | null;
   primary_model: string | null;
   title_candidate: string | null;
+  stored_title: string | null;
   started_at: string | null;
   cwd: string | null;
   duration_seconds: number | null;
@@ -223,7 +224,7 @@ async function recentSessions(p: URLSearchParams, env: Env): Promise<RecentResul
   const direction = reverse ? 'ASC' : 'DESC';
   const result = await env.DB.prepare(
     `SELECT session_id, harness, machine_id, primary_model,
-            ${firstInteractionTitleCandidateSql('sessions')} AS title_candidate, started_at, cwd,
+            ${firstInteractionTitleCandidateSql('sessions')} AS title_candidate, title AS stored_title, started_at, cwd,
             ${SESSION_TIME_SQL} AS duration_seconds, ${TOTAL_TOKENS_SQL} AS total_tokens
      FROM sessions ${where}
      ORDER BY COALESCE(started_at, '') ${direction}, session_id ${direction} LIMIT ${limit + 1}`,
@@ -261,7 +262,7 @@ async function sortedRecentSessions(p: URLSearchParams, env: Env): Promise<Recen
   const order = p.get('sort') === 'session_time' ? SESSION_TIME_SQL : TOTAL_TOKENS_SQL;
   const rows = await env.DB.prepare(
     `SELECT session_id, harness, machine_id, primary_model,
-            ${firstInteractionTitleCandidateSql('sessions')} AS title_candidate, started_at, cwd,
+            ${firstInteractionTitleCandidateSql('sessions')} AS title_candidate, title AS stored_title, started_at, cwd,
             ${SESSION_TIME_SQL} AS duration_seconds, ${TOTAL_TOKENS_SQL} AS total_tokens
      FROM sessions ${where} ORDER BY ${order} DESC, session_id DESC LIMIT ${limit + 1} OFFSET ${offset}`,
   ).bind(...binds).all<RecentRow>();
@@ -431,7 +432,7 @@ function renderHit(h: SearchHit): string {
 }
 
 function renderRecent(r: RecentRow): string {
-  const title = resolveFirstInteractionTitle(r.title_candidate) || r.session_id;
+  const title = resolveFirstInteractionTitle(r.title_candidate) || r.stored_title || r.session_id;
   const meta = [
     `<span class="badge">${esc(r.harness)}</span>`,
     r.machine_id ? `<span class="chip">${esc(r.machine_id)}</span>` : '',

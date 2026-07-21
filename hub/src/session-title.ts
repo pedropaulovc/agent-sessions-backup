@@ -13,17 +13,19 @@ const NON_CONVERSATION_BLOCK_PREFIXES = [
 ] as const;
 
 const TEAMMATE_PREFIX = '<teammate-message teammate_id="team-lead" summary="';
+const IMAGE_PREFIX = '<image name=[Image #';
+const IMAGE_CLOSE = '</image>';
 
 /** Select the first human/agent text exchange as a compact JSON candidate.
  * System/developer instructions, hook metadata, thinking, tool traffic, and known injected
  * user/assistant wrappers are ineligible. The correlated lookup uses blocks_session. */
 export function firstInteractionTitleCandidateSql(sessionAlias: string): string {
-  const text = 'ltrim(title_block.text)';
+  const text = interactionTextSql('title_block.text');
   const teammateRest = `substr(${text}, ${TEAMMATE_PREFIX.length + 1})`;
   const isTeammate = `substr(${text}, 1, ${TEAMMATE_PREFIX.length}) = ${sqlString(TEAMMATE_PREFIX)}`;
   const turnIsEligible = excludesPrefixesSql(text, INJECTED_TURN_PREFIXES);
   const blockIsEligible = excludesPrefixesSql(text, NON_CONVERSATION_BLOCK_PREFIXES);
-  const earlierText = 'ltrim(earlier_title_block.text)';
+  const earlierText = interactionTextSql('earlier_title_block.text');
   const earlierBlockIsEligible = excludesPrefixesSql(earlierText, NON_CONVERSATION_BLOCK_PREFIXES);
 
   return `(SELECT json_object(
@@ -31,13 +33,14 @@ export function firstInteractionTitleCandidateSql(sessionAlias: string): string 
                     'text', CASE
                       WHEN ${isTeammate} AND instr(${teammateRest}, '">') > 0
                         THEN substr(${teammateRest}, 1, instr(${teammateRest}, '">') - 1)
-                      ELSE substr(trim(title_block.text), 1, 120)
+                      ELSE substr(trim(${text}), 1, 120)
                     END)
            FROM blocks title_block
            WHERE title_block.session_id = ${sessionAlias}.session_id
              AND title_block.role IN ('user', 'assistant')
              AND title_block.btype IN ('text', 'prompt')
-             AND trim(COALESCE(title_block.text, '')) <> ''
+             AND title_block.on_main_path = 1
+             AND COALESCE(${text}, '') <> ''
              AND ${blockIsEligible}
              AND NOT EXISTS (
                SELECT 1
@@ -47,12 +50,25 @@ export function firstInteractionTitleCandidateSql(sessionAlias: string): string 
                  AND earlier_title_block.block_index < title_block.block_index
                  AND earlier_title_block.role IN ('user', 'assistant')
                  AND earlier_title_block.btype IN ('text', 'prompt')
-                 AND trim(COALESCE(earlier_title_block.text, '')) <> ''
+                 AND earlier_title_block.on_main_path = 1
+                 AND COALESCE(${earlierText}, '') <> ''
                  AND ${earlierBlockIsEligible}
              )
              AND ${turnIsEligible}
            ORDER BY title_block.turn_index, title_block.block_index
            LIMIT 1)`;
+}
+
+function interactionTextSql(textSql: string): string {
+  const text = leadingTrimSql(textSql);
+  const afterImage = `substr(${text}, instr(${text}, ${sqlString(IMAGE_CLOSE)}) + ${IMAGE_CLOSE.length})`;
+  const hasImage = `substr(${text}, 1, ${IMAGE_PREFIX.length}) = ${sqlString(IMAGE_PREFIX)} ` +
+    `AND instr(${text}, ${sqlString(IMAGE_CLOSE)}) > 0`;
+  return `(CASE WHEN ${hasImage} THEN ${leadingTrimSql(afterImage)} ELSE ${text} END)`;
+}
+
+function leadingTrimSql(textSql: string): string {
+  return `ltrim(${textSql}, char(9) || char(10) || char(13) || ' ')`;
 }
 
 function excludesPrefixesSql(textSql: string, prefixes: readonly string[]): string {
