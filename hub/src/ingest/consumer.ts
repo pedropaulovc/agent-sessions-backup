@@ -3,6 +3,7 @@ import type { NormalizedSession } from './normalize';
 import { SINGLE_SESSION_HARNESSES, parseObject } from './parse';
 import { parseExportArchive } from './parsers/export-inbox';
 import { isFreshReservation, markPendingAndEnqueue, reservationCutoffIso } from '../queue';
+import { deriveProjectName } from '../project-name';
 
 interface FileRow {
   id: number;
@@ -1869,14 +1870,15 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
   await db.batch([
     db
       .prepare(
-        `INSERT INTO sessions (session_id, harness, machine_id, os, canonical_file_id, cwd, repo_url, git_branch, models,
+        `INSERT INTO sessions (session_id, harness, machine_id, os, canonical_file_id, cwd, repo_url, project_name, git_branch, models,
                                primary_model, title, started_at, ended_at, parent_session_id, parent_tool_use_id, is_sidechain,
                                turn_count, block_count, tokens_in, tokens_out, tokens_reasoning, tokens_cached, index_state, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, 'ready',
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, 'ready',
                  strftime('%Y-%m-%dT%H:%M:%fZ','now'))
          ON CONFLICT (session_id) DO UPDATE SET
            harness = excluded.harness, machine_id = excluded.machine_id, os = excluded.os,
            canonical_file_id = excluded.canonical_file_id, cwd = excluded.cwd, repo_url = excluded.repo_url,
+           project_name = excluded.project_name,
            git_branch = excluded.git_branch, models = excluded.models, primary_model = excluded.primary_model,
            title = COALESCE(excluded.title, sessions.title), started_at = excluded.started_at, ended_at = excluded.ended_at,
            parent_session_id = COALESCE(excluded.parent_session_id, sessions.parent_session_id),
@@ -1900,6 +1902,7 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
         file.id,
         s.cwd ?? null,
         s.repoUrl ?? null,
+        deriveProjectName(s.cwd, s.repoUrl),
         s.gitBranch ?? null,
         JSON.stringify(s.models),
         s.primaryModel ?? null,
