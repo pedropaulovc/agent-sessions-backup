@@ -1,4 +1,5 @@
 import { clampLimit, decodeCursor, encodeCursor, normalizeToBound } from './sessions';
+import { firstInteractionTitleSql } from '../session-title';
 
 const FACET_COLUMNS = ['harness', 'machine_id', 'os', 'primary_model', 'repo_url'] as const;
 const SESSION_TIME_FACETS = [
@@ -132,7 +133,8 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
         `SELECT b.session_id, b.turn_index, b.block_index, b.role, b.btype, b.tool_name, b.ts,
                 snippet(blocks_fts, 0, '<mark>', '</mark>', '…', 16) AS snip,
                 bm25(blocks_fts) AS rank,
-                s.harness, s.machine_id, s.os, s.cwd, s.repo_url, s.primary_model, s.title, s.started_at, s.index_state,
+                s.harness, s.machine_id, s.os, s.cwd, s.repo_url, s.primary_model,
+                ${firstInteractionTitleSql('s')} AS title, s.started_at, s.index_state,
                 ${SESSION_TIME_SQL} AS duration_seconds, ${TOTAL_TOKENS_SQL} AS total_tokens
          FROM blocks_fts
          JOIN blocks b ON b.id = blocks_fts.rowid

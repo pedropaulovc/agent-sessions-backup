@@ -18,6 +18,7 @@ const UNKNOWN_MEDIA_SESSION = '88888888-8888-4888-8888-888888888888';
 const CODEX_TAIL_SESSION = '77777777-9999-4999-8999-999999999999';
 const REPO_SESSION = '66666666-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const OFFSET_MATCH_SESSION = '55555555-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const TITLE_SESSION = '44444444-cccc-4ccc-8ccc-cccccccccccc';
 const REPO_URL = 'https://github.com/tester/facetdemo';
 
 // Hostile transcript payloads: an SVG with inline script and an HTML "document".
@@ -227,6 +228,19 @@ describe('viewer', () => {
       )).status,
     ).toBe(201);
 
+    const titleContent = [
+      ccSystemLine(TITLE_SESSION, { uuid: 'title-system', text: 'System prompt must not become the title' }),
+      JSON.stringify({ type: 'attachment', uuid: 'title-hook', parentUuid: 'title-system', payload: { kind: 'hook', output: 'Hook output must not become the title' } }),
+      ccLine(TITLE_SESSION, { uuid: 'title-tool-use', parentUuid: 'title-hook', role: 'assistant', toolUse: { id: 'title-tu', name: 'Read', input: { file_path: '/tmp/title' } } }),
+      ccLine(TITLE_SESSION, { uuid: 'title-tool-result', parentUuid: 'title-tool-use', role: 'user', toolResult: { toolUseId: 'title-tu', content: 'Tool result must not become the title' } }),
+      ccLine(TITLE_SESSION, { uuid: 'title-user', parentUuid: 'title-tool-result', role: 'user', text: 'First real title interaction' }),
+      ccLine(TITLE_SESSION, { uuid: 'title-assistant', parentUuid: 'title-user', role: 'assistant', text: 'titlequerysentinel response' }),
+      JSON.stringify({ type: 'ai-title', title: 'Generated title must not be used' }),
+    ].join('\n');
+    expect(
+      (await putFile('claude-projects', `-home-tester-src-demo/${TITLE_SESSION}.jsonl`, titleContent)).status,
+    ).toBe(201);
+
     const offsetMatchContent = [
       ccLine(OFFSET_MATCH_SESSION, { uuid: 'om-1', parentUuid: null, role: 'user', text: 'offset first turn' }),
       ccLine(OFFSET_MATCH_SESSION, { uuid: 'om-2', parentUuid: 'om-1', role: 'assistant', text: 'offset second turn' }),
@@ -254,6 +268,21 @@ describe('viewer', () => {
     const html = await res.text();
     expect(html).toContain('Recent sessions');
     expect(html).toContain(`/s/${BIG_SESSION}`);
+  });
+
+  it('titles recent sessions from the first user/agent text, excluding system instructions, hooks, and tools', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/')).text();
+    expect(html).toContain(`<a href="/s/${TITLE_SESSION}">First real title interaction</a>`);
+    expect(html).not.toContain('Generated title must not be used');
+    expect(html).not.toContain('System prompt must not become the title');
+    expect(html).not.toContain('Hook output must not become the title');
+    expect(html).not.toContain('Tool result must not become the title');
+  });
+
+  it('titles query results from the first user/agent text, not the matching turn or stored title', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=titlequerysentinel')).text();
+    expect(html).toContain(`<a href="/s/${TITLE_SESSION}?page=1#t4">First real title interaction</a>`);
+    expect(html).not.toContain('Generated title must not be used');
   });
 
   it('marks a selected repo facet active with a toggle-off link that drops the repo param', async () => {
@@ -810,7 +839,7 @@ describe('viewer result pagination and facet layout', () => {
         testEnv.DB.prepare(
           `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text)
            VALUES (?1, 1, 0, 0, 'user', 'text', ?2)`,
-        ).bind(id, `${PAGINATION_MARKER} item ${i}`),
+        ).bind(id, `Pagination item ${i} ${PAGINATION_MARKER}`),
       );
     }
     await testEnv.DB.batch(statements);
@@ -833,9 +862,9 @@ describe('viewer result pagination and facet layout', () => {
       ),
       testEnv.DB.prepare(
         `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text) VALUES
-         ('viewer-sort-short', 1, 0, 0, 'user', 'text', 'viewersortmarker'),
-         ('viewer-sort-long', 1, 0, 0, 'user', 'text', 'viewersortmarker'),
-         ('viewer-sort-reasoning', 1, 0, 0, 'user', 'text', 'viewersortmarker')`,
+         ('viewer-sort-short', 1, 0, 0, 'user', 'text', 'Short session viewersortmarker'),
+         ('viewer-sort-long', 1, 0, 0, 'user', 'text', 'Long session viewersortmarker'),
+         ('viewer-sort-reasoning', 1, 0, 0, 'user', 'text', 'Reasoning-heavy session viewersortmarker')`,
       ),
     ]);
     await testEnv.DB.prepare(
