@@ -349,12 +349,13 @@ function renderHeader(
     view === 'chronological'
       ? `<a href="${esc(withView(url, 'effective'))}">effective view</a>`
       : `<a href="${esc(withView(url, 'chronological'))}">chronological view</a>`;
+  const download = `<a class="button-link" href="/s/${q(meta.session_id)}/download">Download raw session</a>`;
 
   return (
     banners.join('') +
     `<div class="sesshead"><h2 style="margin:0">${esc(displayTitle)}</h2>` +
     `<div class="kv">${kv.join('')}</div>` +
-    `<div class="kv">${tokens} · ${viewToggle}</div></div>`
+    `<div class="kv">${tokens} · ${viewToggle} · ${download}</div></div>`
   );
 }
 

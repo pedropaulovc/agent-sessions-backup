@@ -1,5 +1,6 @@
 import { readSession } from '../auth/session';
 import { webauthnRoute } from '../auth/webauthn';
+import { downloadSessionRaw } from '../api/sessions';
 import { blobEndpoint } from './blob';
 import { machinesPage } from './machines';
 import { searchPage } from './search';
@@ -62,6 +63,9 @@ function handle(url: URL, env: Env): Promise<Response> {
   const path = url.pathname;
   if (path === '/' || path === '') return searchPage(url, env);
   if (path === '/machines') return machinesPage(env);
+
+  const download = path.match(/^\/s\/([^/]+)\/download$/);
+  if (download) return downloadSessionRaw(decodeURIComponent(download[1]!), env);
 
   const blob = path.match(/^\/s\/([^/]+)\/blob\/([^/]+)$/);
   if (blob) return blobEndpoint(decodeURIComponent(blob[1]!), decodeURIComponent(blob[2]!), url, env);

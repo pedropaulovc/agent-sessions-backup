@@ -36,6 +36,11 @@ body {
 }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
+.button-link {
+  display: inline-block; padding: 2px 8px; border: 1px solid var(--accent); border-radius: 5px;
+  background: var(--accent); color: #fff; font-size: 12px; font-weight: 600;
+}
+.button-link:hover { text-decoration: none; }
 mark { background: var(--mark); color: inherit; padding: 0 1px; border-radius: 2px; }
 header.nav {
   display: flex; gap: 18px; align-items: baseline; padding: 12px 20px;
