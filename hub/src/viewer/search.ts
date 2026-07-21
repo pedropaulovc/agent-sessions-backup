@@ -2,7 +2,7 @@ import { runSearch, type SearchHit } from '../api/search';
 import { clampLimit, decodeCursor, encodeCursor, normalizeToBound } from '../api/sessions';
 import { esc, page, q } from './layout';
 import { TURNS_PER_PAGE } from './session';
-import { firstInteractionTitleCandidateSql, resolveFirstInteractionTitle } from '../session-title';
+import { firstInteractionTitleCandidateSql, sessionDisplayTitle } from '../session-title';
 
 const DEFAULT_PAGE_SIZE = 20;
 
@@ -409,7 +409,7 @@ function sessionWhere(p: URLSearchParams): { where: string; binds: string[] } {
 
 function renderHit(h: SearchHit): string {
   const s = h.session;
-  const title = s.title || h.session_id;
+  const title = sessionDisplayTitle(null, s.title, h.session_id);
   const meta = [
     `<span class="badge">${esc(s.harness)}</span>`,
     s.machine_id ? `<span class="chip">${esc(s.machine_id)}</span>` : '',
@@ -432,7 +432,7 @@ function renderHit(h: SearchHit): string {
 }
 
 function renderRecent(r: RecentRow): string {
-  const title = resolveFirstInteractionTitle(r.title_candidate) || r.stored_title || r.session_id;
+  const title = sessionDisplayTitle(r.title_candidate, r.stored_title, r.session_id);
   const meta = [
     `<span class="badge">${esc(r.harness)}</span>`,
     r.machine_id ? `<span class="chip">${esc(r.machine_id)}</span>` : '',

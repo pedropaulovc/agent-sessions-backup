@@ -204,6 +204,14 @@ export function resolveFirstInteractionTitle(candidate: string | null): string |
   }
 }
 
+export function sessionDisplayTitle(
+  candidate: string | null,
+  storedTitle: string | null,
+  sessionId: string,
+): string {
+  return resolveFirstInteractionTitle(candidate) || storedTitle || sessionId;
+}
+
 function decodeXmlEntities(value: string): string {
   return value.replace(/&(#(?:x[\da-f]+|\d+)|amp|apos|gt|lt|quot);/gi, (encoded, entity: string) => {
     const named: Record<string, string> = { amp: '&', apos: "'", gt: '>', lt: '<', quot: '"' };
