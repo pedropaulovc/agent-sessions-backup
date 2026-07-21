@@ -121,6 +121,8 @@ details.block { margin: 6px 0; border: 1px solid var(--line); border-radius: 6px
 details.block > summary { cursor: pointer; padding: 5px 10px; user-select: none; }
 details.block[open] > summary { border-bottom: 1px solid var(--line); }
 details.block pre { margin: 0; padding: 10px; overflow-x: auto; white-space: pre-wrap; word-break: break-word; }
+details.tool-pair .tool-part + .tool-part { border-top: 1px solid var(--line); }
+details.tool-pair .tool-part > .small { display: block; padding: 5px 10px 0; }
 details.error { border-color: var(--err); }
 details.error > summary { color: var(--err); }
 .divider {
