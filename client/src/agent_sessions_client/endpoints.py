@@ -192,7 +192,7 @@ class SessionsApi:
         cwd: str | None = None,
         from_: str | None = None,
         to: str | None = None,
-        limit: int = 20,
+        limit: int = 100,
         cursor: str | None = None,
         facets: bool = False,
     ) -> SearchResult:
