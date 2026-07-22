@@ -1,15 +1,39 @@
 import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import worker from '../src/index';
-import { firstInteractionTitleCandidateSql } from '../src/session-title';
+import { computeFirstInteractionTitle } from '../src/session-title';
 import { deriveProjectName } from '../src/project-name';
-import { interactionTitlesSql, searchHitsSql } from '../src/api/search';
+import { searchHitsSql } from '../src/api/search';
 import { buildSessionFilterSql } from '../src/session-filters';
 import { viewerRoute } from '../src/viewer/router';
 import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures';
 import { blobVersionOf } from '../src/viewer/session';
 
 const testEnv = env as unknown as Env;
+
+/** Populate sessions.first_interaction_title for fixtures inserted directly into `blocks` (bypassing
+ * the ingest writer that computes it). Mirrors the production backfill path (reparse → writer).
+ * Sessions ingested through drainQueue already have it; recomputing is idempotent. */
+async function backfillFirstInteractionTitles(db: D1Database): Promise<void> {
+  const sessions = (await db.prepare('SELECT session_id FROM sessions').all<{ session_id: string }>()).results;
+  for (const { session_id } of sessions) {
+    const blocks = (await db
+      .prepare('SELECT turn_index, block_index, role, btype, text, on_main_path FROM blocks WHERE session_id = ?1 ORDER BY turn_index, block_index')
+      .bind(session_id)
+      .all<{ turn_index: number; block_index: number; role: string; btype: string; text: string | null; on_main_path: number }>()).results;
+    const title = computeFirstInteractionTitle(
+      blocks.map((b) => ({
+        turnIndex: b.turn_index,
+        blockIndex: b.block_index,
+        role: b.role,
+        btype: b.btype,
+        text: b.text,
+        onMainPath: b.on_main_path === 1,
+      })),
+    );
+    await db.prepare('UPDATE sessions SET first_interaction_title = ?2 WHERE session_id = ?1').bind(session_id, title).run();
+  }
+}
 
 const SEARCH_SESSION = 'aaaaaaaa-1111-4111-8111-111111111111';
 const BIG_SESSION = 'bbbbbbbb-2222-4222-8222-222222222222';
@@ -511,6 +535,8 @@ describe('viewer', () => {
        SELECT id, text FROM blocks
        WHERE (session_id = ?1 OR session_id LIKE 'wrapper-title-%') AND text IS NOT NULL`,
     ).bind(INJECTED_WRAPPERS_TITLE_SESSION).run();
+
+    await backfillFirstInteractionTitles(testEnv.DB);
   });
 
   it('search page returns 200 with a highlighted snippet and a link to the session', async () => {
@@ -654,32 +680,16 @@ describe('viewer', () => {
     expect(html).not.toContain('C:\\src\\harmonic-analyzer');
   });
 
-  it('keeps first-interaction title lookup on the session block index', async () => {
-    const plan = await testEnv.DB.prepare(
-      `EXPLAIN QUERY PLAN
-       SELECT ${firstInteractionTitleCandidateSql('sessions')}
-       FROM sessions
-       WHERE session_id = ?1`,
-    ).bind(IMAGE_FORWARD_TITLE_SESSION).all<{ detail: string }>();
-    const details = plan.results.map((row) => row.detail).join('\n');
-    expect(details).toContain('SEARCH title_block USING INDEX blocks_session (session_id=?)');
-    expect(details).not.toContain('SCAN title_block');
-  });
-
-  it('limits broad FTS matches before resolving interaction titles', async () => {
+  it('drives full-text search off the blocks_fts index and reads the title as a stored column', async () => {
     const searchPlan = await testEnv.DB.prepare(
       `EXPLAIN QUERY PLAN ${searchHitsSql('', null, 20, 0)}`,
     ).bind('filler').all<{ detail: string }>();
     const searchDetails = searchPlan.results.map((row) => row.detail).join('\n');
     expect(searchDetails).toContain('SCAN blocks_fts VIRTUAL TABLE');
+    // The first-interaction title is now a stored sessions column, not a correlated per-row
+    // recursive subquery, so the search plan never materializes a blocks title lookup.
     expect(searchDetails).not.toContain('title_block');
-
-    const titlePlan = await testEnv.DB.prepare(
-      `EXPLAIN QUERY PLAN ${interactionTitlesSql(2)}`,
-    ).bind(SEARCH_SESSION, BIG_SESSION).all<{ detail: string }>();
-    const titleDetails = titlePlan.results.map((row) => row.detail).join('\n');
-    expect(titleDetails).toContain('SEARCH title_block USING INDEX blocks_session (session_id=?)');
-    expect(titleDetails).not.toContain('blocks_fts');
+    expect(searchHitsSql('', null, 20, 0)).toContain('s.first_interaction_title');
   });
 
   it('ignores abandoned title blocks and chooses the first main-path interaction', async () => {

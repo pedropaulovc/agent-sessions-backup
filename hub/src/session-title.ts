@@ -1,3 +1,15 @@
+/** First human/agent interaction title, derived from a session's blocks.
+ *
+ * This runs once at index time (the ingest writer stores the result in
+ * sessions.first_interaction_title) instead of at query time. It used to be a giant generated
+ * SQL expression inlined into every listing query, which pushed the statement past D1's length
+ * limit; computing it in TypeScript removes that ceiling and keeps the read path a plain column
+ * read. Existing rows are backfilled by re-parsing from R2 (POST /api/v1/admin/reindex), the same
+ * convention on_main_path uses (see migrations/0002). */
+
+// A turn is ineligible to title a session when its first eligible text block starts with one of
+// these harness-injected wrappers (system/developer instructions, hook metadata, slash-command
+// scaffolding). The turn is skipped entirely and a later turn is used.
 const INJECTED_TURN_PREFIXES = [
   '# AGENTS.md instructions',
   '<local-command-',
@@ -10,216 +22,173 @@ const INJECTED_TURN_PREFIXES = [
   '<hook_prompt',
 ] as const;
 
+// Claude Code preserves unsupported server tool metadata as a text block containing raw JSON.
+// Such a block never represents a turn (a later real block in the same turn still can); ordinary
+// user prompts that merely happen to be JSON stay eligible because the match is prefix-exact.
 const NON_CONVERSATION_BLOCK_PREFIXES = [
-  // Claude Code preserves unsupported server tool metadata as a text block containing raw JSON.
-  // Match the known metadata type exactly; ordinary user prompts that happen to be JSON stay eligible.
   '{"type":"server_tool_use"',
 ] as const;
-
-const IMAGE_PREFIX = '<image name=[Image #';
-const IMAGE_CLOSE = '</image>';
 
 // Leading wrappers the harness injects ahead of the real prompt: an <image ...>...</image>
 // attachment block, or the <fork-boilerplate>...</fork-boilerplate> context a forked session
 // carries in. Each is stripped in place so the human prompt that follows becomes the title.
 const LEADING_WRAPPERS = [
-  { open: IMAGE_PREFIX, close: IMAGE_CLOSE },
+  { open: '<image name=[Image #', close: '</image>' },
   { open: '<fork-boilerplate>', close: '</fork-boilerplate>' },
 ] as const;
 
-const SPECIAL_TITLE_LIMIT = 2048;
+const TITLE_LIMIT = 120;
+const LEADING_WHITESPACE = /^[\t\n\r ]+/;
+const SURROUNDING_WHITESPACE = /^[\t\n\r ]+|[\t\n\r ]+$/g;
 
-/** Select the first human/agent text exchange as a compact JSON candidate.
- * System/developer instructions, hook metadata, thinking, tool traffic, and known injected
- * user/assistant wrappers are ineligible. The correlated lookup uses blocks_session. */
-export function firstInteractionTitleCandidateSql(sessionAlias: string): string {
-  const text = interactionTextSql('title_block.text');
-  const specialTitles = [
-    teammateSummaryTitleSql(text),
-    teammateAssignmentTitleSql(text),
-    xmlAttributeTitleSql(text, '<scheduled-task name="'),
-    nestedElementTitleSql(text, '<task-notification>', '<summary>', '</summary>'),
-    nestedElementTitleSql(text, '<command-message>', '<command-message>', '</command-message>'),
-    nestedElementTitleSql(text, '<task>', '<task>', '</task>'),
-  ];
-  // Emit each special-title condition exactly once: a single CASE picks the matching branch and
-  // builds that branch's full {kind, text} JSON. (Splitting kind and text into separate CASEs
-  // repeated every condition — and every condition carries many interaction-text references —
-  // which bloats the inlined query past D1's statement length limit.)
-  const titleJson = specialTitles
-    .map(({ condition, value, kind }) =>
-      `WHEN ${condition} THEN json_object('kind', '${kind}', 'text', substr(${value}, 1, ${SPECIAL_TITLE_LIMIT}))`)
-    .join('\n                      ');
-  const turnIsEligible = excludesPrefixesSql(text, INJECTED_TURN_PREFIXES);
-  const blockIsEligible = excludesPrefixesSql(text, NON_CONVERSATION_BLOCK_PREFIXES);
-  const earlierText = interactionTextSql('earlier_title_block.text');
-  const earlierBlockIsEligible = excludesPrefixesSql(earlierText, NON_CONVERSATION_BLOCK_PREFIXES);
-
-  return `(SELECT CASE
-                      ${titleJson}
-                      ELSE json_object('kind', 'text', 'text', substr(trim(${text}), 1, 120))
-                    END
-           FROM blocks title_block
-           WHERE title_block.session_id = ${sessionAlias}.session_id
-             AND title_block.role IN ('user', 'assistant')
-             AND title_block.btype IN ('text', 'prompt')
-             AND title_block.on_main_path = 1
-             AND COALESCE(${text}, '') <> ''
-             AND ${blockIsEligible}
-             AND NOT EXISTS (
-               SELECT 1
-               FROM blocks earlier_title_block
-               WHERE earlier_title_block.session_id = title_block.session_id
-                 AND earlier_title_block.turn_index = title_block.turn_index
-                 AND earlier_title_block.block_index < title_block.block_index
-                 AND earlier_title_block.role IN ('user', 'assistant')
-                 AND earlier_title_block.btype IN ('text', 'prompt')
-                 AND earlier_title_block.on_main_path = 1
-                 AND COALESCE(${earlierText}, '') <> ''
-                 AND ${earlierBlockIsEligible}
-             )
-             AND ${turnIsEligible}
-           ORDER BY title_block.turn_index, title_block.block_index
-           LIMIT 1)`;
+/** Minimal block shape the title derivation needs — satisfied by both normalized ingest turns and
+ * rows read back from the blocks table during a backfill. */
+export interface TitleBlock {
+  turnIndex: number;
+  blockIndex: number;
+  role: string;
+  btype: string;
+  text: string | null;
+  onMainPath: boolean;
 }
 
-interface SqlTitleExtractor {
-  condition: string;
-  value: string;
-  kind: 'encoded-special' | 'plain-special';
-}
+/** Pick the first human/agent text exchange as the session title, or null when none qualifies.
+ * A turn is represented by its first non-empty, non-server-tool text block; that representative is
+ * skipped (dropping the whole turn) when it starts with an injected wrapper. Special harness
+ * wrappers (teammate, scheduled-task, task/command messages) resolve to their embedded subject. */
+export function computeFirstInteractionTitle(blocks: TitleBlock[]): string | null {
+  const eligible = blocks
+    .filter((b) =>
+      (b.role === 'user' || b.role === 'assistant') &&
+      (b.btype === 'text' || b.btype === 'prompt') &&
+      b.onMainPath && b.text !== null)
+    .sort((a, b) => a.turnIndex - b.turnIndex || a.blockIndex - b.blockIndex);
 
-function xmlAttributeTitleSql(
-  textSql: string,
-  prefix: string,
-): SqlTitleExtractor {
-  const rest = `substr(${textSql}, ${prefix.length + 1})`;
-  const condition = `substr(${textSql}, 1, ${prefix.length}) = ${sqlString(prefix)} ` +
-    `AND instr(${rest}, '"') > 0`;
-  return {
-    condition: `(${condition})`,
-    value: `substr(${rest}, 1, instr(${rest}, '"') - 1)`,
-    kind: 'encoded-special',
-  };
-}
+  let currentTurn: number | null = null;
+  let representativeTaken = false;
+  for (const block of eligible) {
+    if (block.turnIndex !== currentTurn) {
+      currentTurn = block.turnIndex;
+      representativeTaken = false;
+    }
+    if (representativeTaken) continue;
 
-function teammateSummaryTitleSql(textSql: string): SqlTitleExtractor {
-  const teammatePrefix = '<teammate-message';
-  const summaryPrefix = 'summary="';
-  const openingTag = `substr(${textSql}, 1, instr(${textSql}, '>'))`;
-  const summaryStart = `instr(${openingTag}, ${sqlString(summaryPrefix)})`;
-  const rest = `substr(${openingTag}, ${summaryStart} + ${summaryPrefix.length})`;
-  const beforeSummary = `substr(${openingTag}, ${summaryStart} - 1, 1)`;
-  const condition = startsElementSql(textSql, teammatePrefix) +
-    ` AND instr(${textSql}, '>') > 0 AND ${summaryStart} > 0 ` +
-    `AND ${beforeSummary} IN (' ', char(9), char(10), char(13)) AND instr(${rest}, '"') > 0`;
-  return {
-    condition: `(${condition})`,
-    value: `substr(${rest}, 1, instr(${rest}, '"') - 1)`,
-    kind: 'encoded-special',
-  };
-}
+    const stripped = stripLeadingWrappers(block.text!);
+    // Empty-after-strip and server-tool metadata blocks don't represent the turn — keep scanning
+    // this turn for its first real text block.
+    if (stripped === '' || startsWithAny(stripped, NON_CONVERSATION_BLOCK_PREFIXES)) continue;
 
-function teammateAssignmentTitleSql(textSql: string): SqlTitleExtractor {
-  const teammatePrefix = '<teammate-message';
-  const close = '</teammate-message>';
-  const openEnd = `instr(${textSql}, '>')`;
-  const closeStart = `instr(${textSql}, ${sqlString(close)})`;
-  const body = `trim(substr(${textSql}, ${openEnd} + 1, ${closeStart} - ${openEnd} - 1), ` +
-    `${WHITESPACE_CHARS})`;
-  const jsonType = jsonTextSql(body, '$.type');
-  const subject = jsonTextSql(body, '$.subject');
-  const condition = startsElementSql(textSql, teammatePrefix) +
-    ` AND ${openEnd} > 0 AND ${closeStart} > ${openEnd} ` +
-    `AND ${jsonType} = 'task_assignment' AND typeof(${subject}) = 'text'`;
-  return { condition: `(${condition})`, value: subject, kind: 'plain-special' };
-}
-
-function nestedElementTitleSql(
-  textSql: string,
-  wrapperPrefix: string,
-  openTag: string,
-  closeTag: string,
-): SqlTitleExtractor {
-  const openStart = `instr(${textSql}, ${sqlString(openTag)})`;
-  const rest = `substr(${textSql}, ${openStart} + ${openTag.length})`;
-  const condition = startsWithSql(textSql, wrapperPrefix) +
-    ` AND ${openStart} > 0 AND instr(${rest}, ${sqlString(closeTag)}) > 0`;
-  return {
-    condition: `(${condition})`,
-    value: `trim(substr(${rest}, 1, instr(${rest}, ${sqlString(closeTag)}) - 1), ` +
-      `${WHITESPACE_CHARS})`,
-    kind: 'encoded-special',
-  };
-}
-
-function jsonTextSql(jsonSql: string, path: string): string {
-  return `(CASE WHEN json_valid(${jsonSql}) THEN json_extract(${jsonSql}, ${sqlString(path)}) END)`;
-}
-
-function startsWithSql(textSql: string, prefix: string): string {
-  return `substr(${textSql}, 1, ${prefix.length}) = ${sqlString(prefix)}`;
-}
-
-function startsElementSql(textSql: string, prefix: string): string {
-  const next = `substr(${textSql}, ${prefix.length + 1}, 1)`;
-  return `(${startsWithSql(textSql, prefix)} AND ${next} IN (' ', '>', char(9), char(10), char(13)))`;
-}
-
-// Repeatedly strip any leading injected wrapper (see LEADING_WRAPPERS) so the human prompt that
-// follows becomes the title. This expression is inlined at every interaction-text reference in the
-// title query — dozens of times over — so it is kept terse (short aliases, no padding) to stay well
-// under D1's SQL statement length limit. `r` is the remaining text; `d` counts strips applied.
-function interactionTextSql(textSql: string): string {
-  const steps = LEADING_WRAPPERS.map(({ open, close }) => {
-    const closeAt = `instr(r,${sqlString(close)})`;
-    return {
-      condition: `substr(r,1,${open.length})=${sqlString(open)} AND ${closeAt}>0`,
-      remainder: `substr(r,${closeAt}+${close.length})`,
-    };
-  });
-  const hasWrapper = steps.map(({ condition }) => `(${condition})`).join(' OR ');
-  const nextRemainder = `CASE ${steps
-    .map(({ condition, remainder }) => `WHEN ${condition} THEN ${remainder}`)
-    .join(' ')} ELSE r END`;
-  return `(WITH RECURSIVE w(r,d) AS (SELECT ${leadingTrimSql(textSql)},0 ` +
-    `UNION ALL SELECT ${leadingTrimSql(nextRemainder)},d+1 FROM w WHERE ${hasWrapper}) ` +
-    `SELECT r FROM w ORDER BY d DESC LIMIT 1)`;
-}
-
-// char(9,10,13,32) builds the "\t\n\r " trim set in one call — far shorter than concatenating
-// four char() calls, which matters because this is inlined hundreds of times in the title query.
-const WHITESPACE_CHARS = 'char(9,10,13,32)';
-
-function leadingTrimSql(textSql: string): string {
-  return `ltrim(${textSql}, ${WHITESPACE_CHARS})`;
-}
-
-function excludesPrefixesSql(textSql: string, prefixes: readonly string[]): string {
-  return prefixes
-    .map((prefix) => `substr(${textSql}, 1, ${prefix.length}) <> ${sqlString(prefix)}`)
-    .join('\n                 AND ');
-}
-
-export function resolveFirstInteractionTitle(candidate: string | null): string | null {
-  if (!candidate) return null;
-  try {
-    const parsed = JSON.parse(candidate) as { kind?: unknown; text?: unknown };
-    if (typeof parsed.text !== 'string') return null;
-    if (parsed.kind === 'encoded-special') return decodeXmlEntities(parsed.text).trim().slice(0, 120);
-    if (parsed.kind === 'plain-special') return parsed.text.trim().slice(0, 120);
-    return parsed.text;
-  } catch {
-    return null;
+    representativeTaken = true;
+    // This block represents the turn. An injected wrapper here drops the whole turn.
+    if (startsWithAny(stripped, INJECTED_TURN_PREFIXES)) continue;
+    return deriveTitle(stripped);
   }
+  return null;
 }
 
+/** Resolve the display title: the derived first-interaction title, else the harness-stored title,
+ * else the session id. */
 export function sessionDisplayTitle(
-  candidate: string | null,
+  firstInteractionTitle: string | null,
   storedTitle: string | null,
   sessionId: string,
 ): string {
-  return resolveFirstInteractionTitle(candidate) || storedTitle || sessionId;
+  return firstInteractionTitle || storedTitle || sessionId;
+}
+
+function deriveTitle(text: string): string {
+  return (
+    teammateSummaryTitle(text) ??
+    teammateAssignmentTitle(text) ??
+    attributeTitle(text, '<scheduled-task name="') ??
+    nestedElementTitle(text, '<task-notification>', '<summary>', '</summary>') ??
+    nestedElementTitle(text, '<command-message>', '<command-message>', '</command-message>') ??
+    nestedElementTitle(text, '<task>', '<task>', '</task>') ??
+    text.trim().slice(0, TITLE_LIMIT)
+  );
+}
+
+/** Strip every leading injected wrapper (image, fork-boilerplate), re-trimming between strips so
+ * interleaved wrappers and the whitespace separating them all come off. */
+function stripLeadingWrappers(text: string): string {
+  let remaining = text.replace(LEADING_WHITESPACE, '');
+  for (;;) {
+    const wrapper = LEADING_WRAPPERS.find(({ open, close }) =>
+      remaining.startsWith(open) && remaining.includes(close));
+    if (!wrapper) return remaining;
+    const end = remaining.indexOf(wrapper.close) + wrapper.close.length;
+    remaining = remaining.slice(end).replace(LEADING_WHITESPACE, '');
+  }
+}
+
+/** <scheduled-task name="..."> — the quoted attribute value right after the prefix. */
+function attributeTitle(text: string, prefix: string): string | null {
+  if (!text.startsWith(prefix)) return null;
+  const rest = text.slice(prefix.length);
+  const end = rest.indexOf('"');
+  if (end < 0) return null;
+  return decodedTitle(rest.slice(0, end));
+}
+
+/** <wrapper ...><open>subject<close> — the subject between the first open/close pair. */
+function nestedElementTitle(text: string, wrapperPrefix: string, openTag: string, closeTag: string): string | null {
+  if (!text.startsWith(wrapperPrefix)) return null;
+  const openStart = text.indexOf(openTag);
+  if (openStart < 0) return null;
+  const rest = text.slice(openStart + openTag.length);
+  const end = rest.indexOf(closeTag);
+  if (end < 0) return null;
+  return decodedTitle(rest.slice(0, end).replace(SURROUNDING_WHITESPACE, ''));
+}
+
+/** <teammate-message ... summary="..."> — the summary attribute inside the opening tag. */
+function teammateSummaryTitle(text: string): string | null {
+  if (!startsElement(text, '<teammate-message')) return null;
+  const tagEnd = text.indexOf('>');
+  if (tagEnd < 0) return null;
+  const openingTag = text.slice(0, tagEnd + 1);
+  const marker = 'summary="';
+  const start = openingTag.indexOf(marker);
+  if (start < 1 || !' \t\n\r'.includes(openingTag[start - 1]!)) return null;
+  const rest = openingTag.slice(start + marker.length);
+  const end = rest.indexOf('"');
+  if (end < 0) return null;
+  return decodedTitle(rest.slice(0, end));
+}
+
+/** <teammate-message>{JSON task_assignment}</teammate-message> — the assignment's subject field. */
+function teammateAssignmentTitle(text: string): string | null {
+  if (!startsElement(text, '<teammate-message')) return null;
+  const tagEnd = text.indexOf('>');
+  const closeStart = text.indexOf('</teammate-message>');
+  if (tagEnd < 0 || closeStart <= tagEnd) return null;
+  const body = text.slice(tagEnd + 1, closeStart).replace(SURROUNDING_WHITESPACE, '');
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== 'object') return null;
+  const record = parsed as { type?: unknown; subject?: unknown };
+  if (record.type !== 'task_assignment' || typeof record.subject !== 'string') return null;
+  return record.subject.replace(SURROUNDING_WHITESPACE, '').slice(0, TITLE_LIMIT);
+}
+
+/** True when `text` opens an element with `prefix` (the tag name is followed by a boundary char,
+ * so `<task>` does not match `<taskboard>`). */
+function startsElement(text: string, prefix: string): boolean {
+  if (!text.startsWith(prefix)) return false;
+  const next = text[prefix.length];
+  return next === undefined || ' >\t\n\r'.includes(next);
+}
+
+function startsWithAny(text: string, prefixes: readonly string[]): boolean {
+  return prefixes.some((prefix) => text.startsWith(prefix));
+}
+
+function decodedTitle(raw: string): string {
+  return decodeXmlEntities(raw).replace(SURROUNDING_WHITESPACE, '').slice(0, TITLE_LIMIT);
 }
 
 function decodeXmlEntities(value: string): string {
@@ -234,8 +203,4 @@ function decodeXmlEntities(value: string): string {
     if (codePoint >= 0xd800 && codePoint <= 0xdfff) return encoded;
     return String.fromCodePoint(codePoint);
   });
-}
-
-function sqlString(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
 }

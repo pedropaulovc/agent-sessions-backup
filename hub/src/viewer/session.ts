@@ -7,7 +7,7 @@ import { parseClaudeWeb } from '../ingest/parsers/claude-web';
 import { parseCodex } from '../ingest/parsers/codex';
 import { parseConversationById } from '../ingest/parsers/export-inbox';
 import { parsePromptLog } from '../ingest/parsers/history';
-import { firstInteractionTitleCandidateSql, sessionDisplayTitle } from '../session-title';
+import { sessionDisplayTitle } from '../session-title';
 import { esc, pageFoot, pageHead, q } from './layout';
 
 /** Turns per page. Pages are turn_index buckets [(p-1)*SIZE, p*SIZE), so a block's page is floor(turn_index/SIZE)+1. */
@@ -22,7 +22,7 @@ interface SessionMeta {
   repo_url: string | null;
   git_branch: string | null;
   primary_model: string | null;
-  title_candidate: string | null;
+  first_interaction_title: string | null;
   title: string | null;
   started_at: string | null;
   ended_at: string | null;
@@ -42,14 +42,14 @@ type View = 'chronological' | 'effective';
 export async function sessionPage(sessionId: string, url: URL, env: Env): Promise<Response> {
   const meta = await env.DB.prepare(
     `SELECT session_id, harness, machine_id, os, cwd, repo_url, git_branch, primary_model,
-            ${firstInteractionTitleCandidateSql('sessions')} AS title_candidate, title, started_at, ended_at,
+            first_interaction_title, title, started_at, ended_at,
             parent_session_id, is_sidechain, turn_count, tokens_in, tokens_out, tokens_reasoning, tokens_cached, index_state
      FROM sessions WHERE session_id = ?1`,
   )
     .bind(sessionId)
     .first<SessionMeta>();
   if (!meta) return notFound();
-  const displayTitle = sessionDisplayTitle(meta.title_candidate, meta.title, meta.session_id);
+  const displayTitle = sessionDisplayTitle(meta.first_interaction_title, meta.title, meta.session_id);
 
   const file = await env.DB.prepare(
     `SELECT f.store, f.relpath, f.r2_key, f.content_hash FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,

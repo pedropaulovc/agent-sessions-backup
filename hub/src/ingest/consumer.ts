@@ -4,6 +4,7 @@ import { SINGLE_SESSION_HARNESSES, parseObject } from './parse';
 import { parseExportArchive } from './parsers/export-inbox';
 import { isFreshReservation, markPendingAndEnqueue, reservationCutoffIso } from '../queue';
 import { deriveProjectName } from '../project-name';
+import { computeFirstInteractionTitle, type TitleBlock } from '../session-title';
 
 interface FileRow {
   id: number;
@@ -1867,19 +1868,39 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
     .bind(file.machine_id)
     .first<{ os: string }>();
 
+  // Derive the first-interaction title from the same blocks just written (block_index == bi, the
+  // per-turn insert order above), so the listing queries read a stored column instead of an
+  // inlined per-query SQL derivation.
+  const titleBlocks: TitleBlock[] = [];
+  for (const turn of s.turns) {
+    for (let bi = 0; bi < turn.blocks.length; bi++) {
+      titleBlocks.push({
+        turnIndex: turn.index,
+        blockIndex: bi,
+        role: turn.role,
+        btype: turn.blocks[bi]!.type,
+        text: turn.blocks[bi]!.text ?? null,
+        onMainPath: turn.onMainPath,
+      });
+    }
+  }
+  const firstInteractionTitle = computeFirstInteractionTitle(titleBlocks);
+
   await db.batch([
     db
       .prepare(
         `INSERT INTO sessions (session_id, harness, machine_id, os, canonical_file_id, cwd, repo_url, project_name, git_branch, models,
                                primary_model, title, started_at, ended_at, parent_session_id, parent_tool_use_id, is_sidechain,
-                               turn_count, block_count, tokens_in, tokens_out, tokens_reasoning, tokens_cached, index_state, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, 'ready',
+                               turn_count, block_count, tokens_in, tokens_out, tokens_reasoning, tokens_cached,
+                               first_interaction_title, index_state, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 'ready',
                  strftime('%Y-%m-%dT%H:%M:%fZ','now'))
          ON CONFLICT (session_id) DO UPDATE SET
            harness = excluded.harness, machine_id = excluded.machine_id, os = excluded.os,
            canonical_file_id = excluded.canonical_file_id, cwd = excluded.cwd, repo_url = excluded.repo_url,
            project_name = excluded.project_name,
            git_branch = excluded.git_branch, models = excluded.models, primary_model = excluded.primary_model,
+           first_interaction_title = excluded.first_interaction_title,
            title = COALESCE(excluded.title, sessions.title), started_at = excluded.started_at, ended_at = excluded.ended_at,
            parent_session_id = COALESCE(excluded.parent_session_id, sessions.parent_session_id),
            -- excluded wins when non-null: a transcript reparse reads the CURRENT sibling meta live
@@ -1918,6 +1939,7 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
         totals.out,
         totals.reasoning,
         totals.cached,
+        firstInteractionTitle,
       ),
     db
       .prepare(
