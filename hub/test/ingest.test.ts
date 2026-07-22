@@ -701,11 +701,12 @@ describe('a canonical file reparsed to zero turns clears the stale index and rec
     const r2KeyA = `raw/recover-a/claude-projects/recover-a-path/${SESSION_ID}.jsonl`;
     await deliverOne(fileIdA, r2KeyA);
 
-    const sessionAfterA = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+    const sessionAfterA = await testEnv.DB.prepare('SELECT canonical_file_id, index_state, first_interaction_title FROM sessions WHERE session_id = ?1')
       .bind(SESSION_ID)
-      .first<{ canonical_file_id: number; index_state: string }>();
+      .first<{ canonical_file_id: number; index_state: string; first_interaction_title: string | null }>();
     expect(sessionAfterA?.canonical_file_id).toBe(fileIdA);
     expect(sessionAfterA?.index_state).toBe('ready');
+    expect(sessionAfterA?.first_interaction_title).toBe('unique-marker-alpha searchable content');
 
     // Confirm the original content is actually searchable before we blow it away.
     const searchBefore = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-alpha', {
@@ -738,11 +739,13 @@ describe('a canonical file reparsed to zero turns clears the stale index and rec
       .first<{ parse_state: string }>();
     expect(rowA?.parse_state).toBe('error');
 
-    const sessionAfterGarbage = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+    const sessionAfterGarbage = await testEnv.DB.prepare('SELECT canonical_file_id, index_state, first_interaction_title FROM sessions WHERE session_id = ?1')
       .bind(SESSION_ID)
-      .first<{ canonical_file_id: number; index_state: string }>();
+      .first<{ canonical_file_id: number; index_state: string; first_interaction_title: string | null }>();
     expect(sessionAfterGarbage?.index_state).toBe('error');
     expect(sessionAfterGarbage?.canonical_file_id).toBe(fileIdA); // kept so raw access still resolves
+    // The derived title is cleared with the blocks it came from — no stale title survives the wipe.
+    expect(sessionAfterGarbage?.first_interaction_title).toBe(null);
 
     const blocksLeft = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
       .bind(SESSION_ID)

@@ -18,7 +18,7 @@ import {
 } from '../session-filters';
 import { esc, page, q } from './layout';
 import { TURNS_PER_PAGE } from './session';
-import { firstInteractionTitleCandidateSql, sessionDisplayTitle } from '../session-title';
+import { sessionDisplayTitle } from '../session-title';
 
 const SORT_OPTIONS = [
   ['recent', 'Recent'],
@@ -30,7 +30,7 @@ interface RecentRow {
   harness: string;
   machine_id: string | null;
   primary_model: string | null;
-  title_candidate: string | null;
+  first_interaction_title: string | null;
   stored_title: string | null;
   started_at: string | null;
   cwd: string | null;
@@ -156,7 +156,7 @@ async function recentSessions(p: URLSearchParams, env: Env): Promise<RecentResul
   const direction = reverse ? 'ASC' : 'DESC';
   const result = await env.DB.prepare(
     `SELECT session_id, harness, machine_id, primary_model,
-            ${firstInteractionTitleCandidateSql('sessions')} AS title_candidate, title AS stored_title, started_at, cwd,
+            first_interaction_title, title AS stored_title, started_at, cwd,
             ${sessionDurationSql('sessions')} AS duration_seconds, ${totalTokensSql('sessions')} AS total_tokens
      FROM sessions ${where}
      ORDER BY COALESCE(started_at, '') ${direction}, session_id ${direction} LIMIT ${limit + 1}`,
@@ -194,7 +194,7 @@ async function sortedRecentSessions(p: URLSearchParams, env: Env): Promise<Recen
   const order = p.get('sort') === 'session_time' ? sessionDurationSql('sessions') : totalTokensSql('sessions');
   const rows = await env.DB.prepare(
     `SELECT session_id, harness, machine_id, primary_model,
-            ${firstInteractionTitleCandidateSql('sessions')} AS title_candidate, title AS stored_title, started_at, cwd,
+            first_interaction_title, title AS stored_title, started_at, cwd,
             ${sessionDurationSql('sessions')} AS duration_seconds, ${totalTokensSql('sessions')} AS total_tokens
      FROM sessions ${where} ORDER BY ${order} DESC, session_id DESC LIMIT ${limit + 1} OFFSET ${offset}`,
   ).bind(...binds).all<RecentRow>();
@@ -319,7 +319,7 @@ function renderHit(h: SearchHit): string {
 }
 
 function renderRecent(r: RecentRow): string {
-  const title = sessionDisplayTitle(r.title_candidate, r.stored_title, r.session_id);
+  const title = sessionDisplayTitle(r.first_interaction_title, r.stored_title, r.session_id);
   const meta = [
     `<span class="badge">${esc(r.harness)}</span>`,
     r.machine_id ? `<span class="chip">${esc(r.machine_id)}</span>` : '',

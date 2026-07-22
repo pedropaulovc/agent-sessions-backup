@@ -1,0 +1,12 @@
+-- Persist the derived first-interaction title at index time (computeFirstInteractionTitle in
+-- session-title.ts) instead of recomputing it from a giant inlined SQL expression on every
+-- listing query. The old query-time form inlined a recursive per-block strip at hundreds of
+-- references and rode D1's SQL statement length limit; a stored column removes that ceiling and
+-- turns the read path into a plain column read.
+--
+-- There is no SQL backfill: the value is derived from block text/ordering that the writer already
+-- holds, not from anything reconstructable in pure SQL. Existing rows stay NULL (the read path
+-- falls back to the stored harness title, then the session id) until a reparse recomputes them —
+-- POST /api/v1/admin/reindex re-parses every canonical R2 object through the writer, the same
+-- backfill path on_main_path relies on (see migrations/0002_blocks_on_main_path.sql).
+ALTER TABLE sessions ADD COLUMN first_interaction_title TEXT;
