@@ -381,7 +381,10 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
           ).bind(det.sessionId),
           env.DB.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(det.sessionId),
           env.DB.prepare('DELETE FROM usage WHERE session_id = ?1').bind(det.sessionId),
-          env.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(det.sessionId),
+          // Clear the derived title alongside the blocks it was computed from — otherwise listings,
+          // search metadata, and the detail header keep showing the stale title of the now-deleted
+          // index (the old query-time derivation returned null once the blocks were gone).
+          env.DB.prepare("UPDATE sessions SET index_state = 'error', first_interaction_title = NULL WHERE session_id = ?1").bind(det.sessionId),
         ]);
       }
       // A recovery-kicked duplicate (reason: 'recover') parsing to zero turns instead of throwing
