@@ -18,6 +18,15 @@ const NON_CONVERSATION_BLOCK_PREFIXES = [
 
 const IMAGE_PREFIX = '<image name=[Image #';
 const IMAGE_CLOSE = '</image>';
+
+// Leading wrappers the harness injects ahead of the real prompt: an <image ...>...</image>
+// attachment block, or the <fork-boilerplate>...</fork-boilerplate> context a forked session
+// carries in. Each is stripped in place so the human prompt that follows becomes the title.
+const LEADING_WRAPPERS = [
+  { open: IMAGE_PREFIX, close: IMAGE_CLOSE },
+  { open: '<fork-boilerplate>', close: '</fork-boilerplate>' },
+] as const;
+
 const SPECIAL_TITLE_LIMIT = 2048;
 
 /** Select the first human/agent text exchange as a compact JSON candidate.
@@ -33,29 +42,23 @@ export function firstInteractionTitleCandidateSql(sessionAlias: string): string 
     nestedElementTitleSql(text, '<command-message>', '<command-message>', '</command-message>'),
     nestedElementTitleSql(text, '<task>', '<task>', '</task>'),
   ];
-  const isSpecialTitle = specialTitles.map(({ condition }) => condition).join(' OR ');
-  const isEncodedSpecialTitle = specialTitles
-    .filter(({ kind }) => kind === 'encoded-special')
-    .map(({ condition }) => condition)
-    .join(' OR ');
-  const specialTitle = specialTitles
-    .map(({ condition, value }) => `WHEN ${condition} THEN substr(${value}, 1, ${SPECIAL_TITLE_LIMIT})`)
+  // Emit each special-title condition exactly once: a single CASE picks the matching branch and
+  // builds that branch's full {kind, text} JSON. (Splitting kind and text into separate CASEs
+  // repeated every condition — and every condition carries many interaction-text references —
+  // which bloats the inlined query past D1's statement length limit.)
+  const titleJson = specialTitles
+    .map(({ condition, value, kind }) =>
+      `WHEN ${condition} THEN json_object('kind', '${kind}', 'text', substr(${value}, 1, ${SPECIAL_TITLE_LIMIT}))`)
     .join('\n                      ');
   const turnIsEligible = excludesPrefixesSql(text, INJECTED_TURN_PREFIXES);
   const blockIsEligible = excludesPrefixesSql(text, NON_CONVERSATION_BLOCK_PREFIXES);
   const earlierText = interactionTextSql('earlier_title_block.text');
   const earlierBlockIsEligible = excludesPrefixesSql(earlierText, NON_CONVERSATION_BLOCK_PREFIXES);
 
-  return `(SELECT json_object(
-                    'kind', CASE
-                      WHEN ${isEncodedSpecialTitle} THEN 'encoded-special'
-                      WHEN ${isSpecialTitle} THEN 'plain-special'
-                      ELSE 'text'
-                    END,
-                    'text', CASE
-                      ${specialTitle}
-                      ELSE substr(trim(${text}), 1, 120)
-                    END)
+  return `(SELECT CASE
+                      ${titleJson}
+                      ELSE json_object('kind', 'text', 'text', substr(trim(${text}), 1, 120))
+                    END
            FROM blocks title_block
            WHERE title_block.session_id = ${sessionAlias}.session_id
              AND title_block.role IN ('user', 'assistant')
@@ -123,7 +126,7 @@ function teammateAssignmentTitleSql(textSql: string): SqlTitleExtractor {
   const openEnd = `instr(${textSql}, '>')`;
   const closeStart = `instr(${textSql}, ${sqlString(close)})`;
   const body = `trim(substr(${textSql}, ${openEnd} + 1, ${closeStart} - ${openEnd} - 1), ` +
-    `char(9) || char(10) || char(13) || ' ')`;
+    `${WHITESPACE_CHARS})`;
   const jsonType = jsonTextSql(body, '$.type');
   const subject = jsonTextSql(body, '$.subject');
   const condition = startsElementSql(textSql, teammatePrefix) +
@@ -145,7 +148,7 @@ function nestedElementTitleSql(
   return {
     condition: `(${condition})`,
     value: `trim(substr(${rest}, 1, instr(${rest}, ${sqlString(closeTag)}) - 1), ` +
-      `char(9) || char(10) || char(13) || ' ')`,
+      `${WHITESPACE_CHARS})`,
     kind: 'encoded-special',
   };
 }
@@ -163,26 +166,33 @@ function startsElementSql(textSql: string, prefix: string): string {
   return `(${startsWithSql(textSql, prefix)} AND ${next} IN (' ', '>', char(9), char(10), char(13)))`;
 }
 
+// Repeatedly strip any leading injected wrapper (see LEADING_WRAPPERS) so the human prompt that
+// follows becomes the title. This expression is inlined at every interaction-text reference in the
+// title query — dozens of times over — so it is kept terse (short aliases, no padding) to stay well
+// under D1's SQL statement length limit. `r` is the remaining text; `d` counts strips applied.
 function interactionTextSql(textSql: string): string {
-  const text = leadingTrimSql(textSql);
-  const remainder = `substr(remaining, instr(remaining, ${sqlString(IMAGE_CLOSE)}) + ${IMAGE_CLOSE.length})`;
-  const hasImage = `substr(remaining, 1, ${IMAGE_PREFIX.length}) = ${sqlString(IMAGE_PREFIX)} ` +
-    `AND instr(remaining, ${sqlString(IMAGE_CLOSE)}) > 0`;
-  return `(WITH RECURSIVE image_prefixes(remaining, depth) AS (
-            SELECT ${text}, 0
-            UNION ALL
-            SELECT ${leadingTrimSql(remainder)}, depth + 1
-            FROM image_prefixes
-            WHERE ${hasImage}
-          )
-          SELECT remaining
-          FROM image_prefixes
-          ORDER BY depth DESC
-          LIMIT 1)`;
+  const steps = LEADING_WRAPPERS.map(({ open, close }) => {
+    const closeAt = `instr(r,${sqlString(close)})`;
+    return {
+      condition: `substr(r,1,${open.length})=${sqlString(open)} AND ${closeAt}>0`,
+      remainder: `substr(r,${closeAt}+${close.length})`,
+    };
+  });
+  const hasWrapper = steps.map(({ condition }) => `(${condition})`).join(' OR ');
+  const nextRemainder = `CASE ${steps
+    .map(({ condition, remainder }) => `WHEN ${condition} THEN ${remainder}`)
+    .join(' ')} ELSE r END`;
+  return `(WITH RECURSIVE w(r,d) AS (SELECT ${leadingTrimSql(textSql)},0 ` +
+    `UNION ALL SELECT ${leadingTrimSql(nextRemainder)},d+1 FROM w WHERE ${hasWrapper}) ` +
+    `SELECT r FROM w ORDER BY d DESC LIMIT 1)`;
 }
 
+// char(9,10,13,32) builds the "\t\n\r " trim set in one call — far shorter than concatenating
+// four char() calls, which matters because this is inlined hundreds of times in the title query.
+const WHITESPACE_CHARS = 'char(9,10,13,32)';
+
 function leadingTrimSql(textSql: string): string {
-  return `ltrim(${textSql}, char(9) || char(10) || char(13) || ' ')`;
+  return `ltrim(${textSql}, ${WHITESPACE_CHARS})`;
 }
 
 function excludesPrefixesSql(textSql: string, prefixes: readonly string[]): string {

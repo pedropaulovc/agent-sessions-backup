@@ -28,6 +28,7 @@ const PREFIXED_TURN_TITLE_SESSION = '22222222-eeee-4eee-8eee-eeeeeeeeeeee';
 const SERVER_TOOL_TITLE_SESSION = '11111111-ffff-4fff-8fff-ffffffffffff';
 const IMAGE_FORWARD_TITLE_SESSION = '10101010-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const IMAGE_WINDOWS_TITLE_SESSION = '20202020-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
+const FORK_BOILERPLATE_TITLE_SESSION = '12121212-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const OFF_MAIN_TITLE_SESSION = '30303030-cccc-4ccc-8ccc-cccccccccccc';
 const STORED_FALLBACK_TITLE_SESSION = '40404040-dddd-4ddd-8ddd-dddddddddddd';
 const SCHEDULED_TITLE_SESSION = '50505050-eeee-4eee-8eee-eeeeeeeeeeee';
@@ -354,6 +355,22 @@ describe('viewer', () => {
       (await putFile('claude-projects', `-home-tester-src-demo/${IMAGE_FORWARD_TITLE_SESSION}.jsonl`, imageForwardTitleContent)).status,
     ).toBe(201);
 
+    const forkBoilerplateTitleContent = [
+      ccLine(FORK_BOILERPLATE_TITLE_SESSION, {
+        uuid: 'fork-boilerplate-prompt',
+        parentUuid: null,
+        role: 'user',
+        text: [
+          '<fork-boilerplate>\nYou are a fork of the parent session. Inherit its full context.\n</fork-boilerplate>',
+          'Investigate the flaky cone gear test',
+        ].join('\n\n'),
+      }),
+      ccLine(FORK_BOILERPLATE_TITLE_SESSION, { uuid: 'fork-boilerplate-query', parentUuid: 'fork-boilerplate-prompt', role: 'assistant', text: 'forkboilerplatetitlequerysentinel response' }),
+    ].join('\n');
+    expect(
+      (await putFile('claude-projects', `-home-tester-src-demo/${FORK_BOILERPLATE_TITLE_SESSION}.jsonl`, forkBoilerplateTitleContent)).status,
+    ).toBe(201);
+
     const offsetMatchContent = [
       ccLine(OFFSET_MATCH_SESSION, { uuid: 'om-1', parentUuid: null, role: 'user', text: 'offset first turn' }),
       ccLine(OFFSET_MATCH_SESSION, { uuid: 'om-2', parentUuid: 'om-1', role: 'assistant', text: 'offset second turn' }),
@@ -619,6 +636,14 @@ describe('viewer', () => {
       `<a href="/s/${IMAGE_FORWARD_TITLE_SESSION}?page=1#t1">Please inspect the cone gear shaft drawing</a>`,
     );
     expect(html).not.toContain('cone-gear-shaft_drawing.png');
+  });
+
+  it('strips a leading fork-boilerplate wrapper and titles from the prompt after it', async () => {
+    const html = await (await SELF.fetch('https://sessions.vza.net/?q=forkboilerplatetitlequerysentinel')).text();
+    expect(html).toContain(
+      `<a href="/s/${FORK_BOILERPLATE_TITLE_SESSION}?page=1#t1">Investigate the flaky cone gear test</a>`,
+    );
+    expect(html).not.toContain('fork of the parent session');
   });
 
   it('ignores multiple image-only wrappers and uses later text in the same turn', async () => {
