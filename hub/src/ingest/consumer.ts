@@ -53,6 +53,11 @@ const TRANSIENT_D1_ERROR_SUBSTRINGS = [
 ];
 function isTransientD1Error(e: unknown): boolean {
   const s = String(e);
+  // Qualify by the D1_ERROR origin BEFORE the phrase match: these phrases are only transient when D1
+  // itself raised them. Without the prefix guard a non-D1 throw whose text happens to contain a phrase —
+  // e.g. r2_object_missing:${r2_key} for a key that embeds one — would be misclassified as transient and
+  // retried instead of taking the terminal parse.error path that errors the file + kicks recovery.
+  if (!s.includes('D1_ERROR')) return false;
   return TRANSIENT_D1_ERROR_SUBSTRINGS.some((sub) => s.includes(sub));
 }
 

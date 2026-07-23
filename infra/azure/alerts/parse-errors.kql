@@ -1,4 +1,4 @@
-// Fires when the parse queue consumer logs 2+ parse.error events within the last
+// Fires when the parse queue consumer errors 2+ DISTINCT files within the last
 // 15 minutes (malformed raw session file, unexpected harness format, etc — see
 // hub/migrations/0001_init.sql's `parse_error` column, which M1's queue
 // consumer is expected to also mirror into a structured console.log).
@@ -11,13 +11,17 @@
 //      isTransientD1Error / TRANSIENT_D1_ERROR_SUBSTRINGS) — but this filter is
 //      belt-and-braces: it keeps the alert quiet during the deploy window before
 //      that code ships, and for any transient string not yet in the allowlist.
-//   2. Threshold is 2+ in the window, not 1. A genuine incident (yesterday's
-//      migration-0013 schema break was 16 errors across 4 files in an hour)
-//      produces a sustained burst; a single one-off malformed file surfaces in
-//      the fleet-health files_error count / system-health workbook instead of
-//      paging. Keep both filters in the query, not provision.sh: the shared
-//      `count 'Placeholder_1' > 0` condition there is generic across all alerts,
-//      so the summarize+threshold lives here and trips that > 0 on 2+ rows.
+//   2. Threshold is 2+ DISTINCT files, not 2+ log rows. The consumer retries a
+//      terminal failure up to the queue's max_retries (3) before DLQ, re-logging
+//      parse.error on every delivery — so ONE persistent bad file emits several
+//      rows. Counting rows would let a single one-off file trip a `> 1` guard;
+//      dcount(file_id) makes the signal "multiple files failed", which a genuine
+//      incident is (yesterday's migration-0013 schema break errored 4 files) and
+//      a lone malformed file is not — that one surfaces in the fleet-health
+//      files_error count / system-health workbook instead of paging. Keep both
+//      filters in the query, not provision.sh: the shared `count 'Placeholder_1'
+//      > 0` condition there is generic across all alerts, so the summarize +
+//      threshold lives here and trips that > 0 on the single surviving row.
 //
 // See missed-heartbeat.kql for the OTelLogs/Body-as-JSON assumption this query
 // shares. ASSUMPTION TO VERIFY AT M4 DEPLOY: confirm the table/column names
@@ -37,16 +41,19 @@ otel
 | where TimeGenerated > ago(15m)
 | extend body = todynamic(Body)
 | where body.event == "parse.error"
-| extend err = tostring(body.error)
+| extend err = tostring(body.error), fid = tostring(body.file_id)
 // Drop known-transient D1 blips — the consumer retries these; see header note 1.
-| where err !has "Network connection lost"
-    and err !has "storage caused object to be reset"
-    and err !has "reset because its code was updated"
-    and err !has "Cannot resolve Durable Object"
-// A bare summarize (no `by`) yields exactly one row — n counts the surviving
-// errors, make_set surfaces a sample for the notification. `where n > 1` then
-// emits that row only on 2+ errors, so provision.sh's `count > 0` condition
-// fires exactly on a sustained burst, never on a single one-off. See header 2.
-| summarize n = count(), errors = make_set(err, 10)
-| where n > 1
-| project n, errors
+// `contains` (substring), NOT `has`: `has` is term-based and won't reliably match
+// these multi-word phrases, so a transient row could survive and page.
+| where err !contains "Network connection lost"
+    and err !contains "storage caused object to be reset"
+    and err !contains "reset because its code was updated"
+    and err !contains "Cannot resolve Durable Object"
+// A bare summarize (no `by`) yields exactly one row — files counts DISTINCT
+// affected file_ids (not rows: a retried terminal failure logs several), errors
+// samples the messages for the notification. `where files > 1` emits that row
+// only when 2+ files failed, so provision.sh's `count > 0` condition fires on a
+// real multi-file incident, never on one retried one-off. See header note 2.
+| summarize files = dcount(fid), errors = make_set(err, 10)
+| where files > 1
+| project files, errors

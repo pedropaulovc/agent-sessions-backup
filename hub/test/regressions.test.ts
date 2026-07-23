@@ -1865,4 +1865,51 @@ describe("consumeParseBatch retries a TRANSIENT D1 error instead of stamping a t
     expect(fileRow?.parse_state).toBe('pending');
     expect(fileRow?.parse_error).toBeNull();
   });
+
+  it('a NON-D1 error whose text merely contains a transient phrase is NOT misclassified — it still errors the file and logs parse.error (guards the D1_ERROR-origin qualifier)', async () => {
+    const SESSION_ID = 'e0000000-0000-4000-8000-00000000000a';
+    const relpath = `transient-retry-demo/${SESSION_ID}.jsonl`;
+    const content = `${ccUserLine({ uuid: 'tr-u2', text: 'unique-marker-transient-qualifier content' })}\n`;
+    const res = await putFile('claude-projects', relpath, content);
+    expect(res.status).toBe(201);
+    const fileId = ((await res.json()) as { file_id: number }).file_id;
+    const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
+
+    // A throw that carries a transient PHRASE but no D1_ERROR origin (e.g. an r2_object_missing whose
+    // key embedded the phrase). isTransientD1Error must return false → terminal path, not a retry.
+    const originalGet = testEnv.RAW.get.bind(testEnv.RAW);
+    const spy = vi.spyOn(testEnv.RAW, 'get').mockImplementation(async (key: string, ...rest: unknown[]): Promise<R2ObjectBody | null> => {
+      if (key === r2Key) throw new Error('r2_object_missing:raw/regbox/claude-projects/Network connection lost/x.jsonl');
+      return (originalGet as (key: string, ...rest: unknown[]) => Promise<R2ObjectBody | null>)(key, ...rest);
+    });
+    const logs: string[] = [];
+    const logSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      logs.push(args.map(String).join(' '));
+    });
+
+    try {
+      await deliverOne(fileId, r2Key);
+    } finally {
+      spy.mockRestore();
+      logSpy.mockRestore();
+    }
+
+    const events = logs
+      .map((l) => {
+        try {
+          return JSON.parse(l) as { event?: string };
+        } catch {
+          return null;
+        }
+      })
+      .filter((e): e is { event?: string } => e !== null);
+    expect(events.some((e) => e.event === 'parse.error')).toBe(true);
+    expect(events.some((e) => e.event === 'parse.retry')).toBe(false);
+
+    const fileRow = await testEnv.DB.prepare('SELECT parse_state, parse_error FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string; parse_error: string | null }>();
+    expect(fileRow?.parse_state).toBe('error');
+    expect(fileRow?.parse_error).toContain('r2_object_missing');
+  });
 });
