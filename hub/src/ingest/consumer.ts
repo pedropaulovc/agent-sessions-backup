@@ -35,6 +35,34 @@ interface FileRow {
  * reserved and retries the exact capability instead of falling into the generic file-error path. */
 class ExportRetry extends Error {}
 
+/** Cloudflare D1 raises these on TRANSIENT infrastructure blips — a colo/Durable Object reset, a dropped
+ * connection to the backing storage — where the write never landed and re-running the identical parse
+ * succeeds. The standard (non-export) parse path treats them as RETRYABLE instead of flipping the file to a
+ * terminal 'error' it can only leave via a re-upload/reindex: parseOne is idempotent under the queue's
+ * max_concurrency:1 (writeSession is a full delete+reinsert per session_id; markParsed is hash-guarded), so
+ * msg.retry() re-parses the exact message cleanly, and a file that never reaches markParsed simply stays
+ * 'pending' for files/check to re-enqueue. The export path already gets this for free — every throw out of
+ * runExportParse becomes an ExportRetry. Match by message substring because D1 surfaces no structured error
+ * code; keep the list to KNOWN-transient strings ONLY, so genuine terminal failures (schema drift like
+ * `no column named …`, malformed content) still fall through to the parse.error log + 'error' flip and page. */
+const TRANSIENT_D1_ERROR_SUBSTRINGS = [
+  'Network connection lost',
+  'storage caused object to be reset',
+  'reset because its code was updated',
+  'Cannot resolve Durable Object',
+];
+function isTransientD1Error(e: unknown): boolean {
+  // Qualify by the D1_ERROR origin BEFORE the phrase match: these phrases are only transient when D1
+  // itself raised them. The origin check is a PREFIX on the error MESSAGE (D1 throws Errors whose message
+  // is `D1_ERROR: <detail>`), not "contains D1_ERROR anywhere" — otherwise a non-D1 throw whose
+  // user-controlled text merely embeds the token (e.g. r2_object_missing on a key with a dir named
+  // `D1_ERROR/Network connection lost`) would be misclassified as transient and retried instead of taking
+  // the terminal parse.error path that errors the file + kicks recovery. A non-Error throw fails the guard
+  // too — the safe direction (treat as terminal / page), never silently retry.
+  if (!(e instanceof Error) || !e.message.startsWith('D1_ERROR')) return false;
+  return TRANSIENT_D1_ERROR_SUBSTRINGS.some((sub) => e.message.includes(sub));
+}
+
 export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: Env): Promise<void> {
   // The ~1000-per-invocation D1 cap is shared across the WHOLE batch (wrangler max_batch_size:5), so we
   // run a single INVOCATION-LEVEL budget across every message — export AND normal transcript — not just a
@@ -102,6 +130,17 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
         // an owner-tagged reservation deferral deliberately leaves it 'reserved'. Do NOT markError in either
         // case: retry the exact message/capability. Even if retries exhaust to the DLQ, the non-terminal row
         // remains visible to pipeline-stuck alerts and the files/check healing path.
+        msg.retry();
+        continue;
+      }
+      if (isTransientD1Error(e)) {
+        // A transient D1 blip (lost connection / colo reset), NOT a content error. parseOne is idempotent
+        // under max_concurrency:1, so retry the exact message rather than stamping a terminal 'error' the
+        // file can only escape via a re-upload/reindex. Emit parse.retry (NOT parse.error) so the
+        // parse-errors alert stays quiet on blips; the file is left un-flipped (stays 'pending' if it never
+        // reached markParsed → files/check re-enqueues) and, if retries exhaust, the message is preserved on
+        // the DLQ. Mirrors the export path's ExportRetry handling above.
+        console.log(JSON.stringify({ event: 'parse.retry', file_id: msg.body.file_id, error: String(e) }));
         msg.retry();
         continue;
       }

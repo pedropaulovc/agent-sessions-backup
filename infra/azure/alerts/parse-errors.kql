@@ -1,7 +1,27 @@
-// Fires when the parse queue consumer logs a parse.error event within the last
+// Fires when the parse queue consumer errors 2+ DISTINCT files within the last
 // 15 minutes (malformed raw session file, unexpected harness format, etc — see
 // hub/migrations/0001_init.sql's `parse_error` column, which M1's queue
 // consumer is expected to also mirror into a structured console.log).
+//
+// Two noise guards, added 2026-07-23 after a lone transient D1 blip
+// (`D1_ERROR: Network connection lost.`) paged at 01:40 UTC for a file that had
+// already self-healed on the collector's next re-upload:
+//   1. Transient D1 errors are EXCLUDED here. The consumer now retries these
+//      instead of stamping a terminal parse.error (see consumer.ts
+//      isTransientD1Error / TRANSIENT_D1_ERROR_SUBSTRINGS) — but this filter is
+//      belt-and-braces: it keeps the alert quiet during the deploy window before
+//      that code ships, and for any transient string not yet in the allowlist.
+//   2. Threshold is 2+ DISTINCT files, not 2+ log rows. The consumer retries a
+//      terminal failure up to the queue's max_retries (3) before DLQ, re-logging
+//      parse.error on every delivery — so ONE persistent bad file emits several
+//      rows. Counting rows would let a single one-off file trip a `> 1` guard;
+//      dcount(file_id) makes the signal "multiple files failed", which a genuine
+//      incident is (yesterday's migration-0013 schema break errored 4 files) and
+//      a lone malformed file is not — that one surfaces in the fleet-health
+//      files_error count / system-health workbook instead of paging. Keep both
+//      filters in the query, not provision.sh: the shared `count 'Placeholder_1'
+//      > 0` condition there is generic across all alerts, so the summarize +
+//      threshold lives here and trips that > 0 on the single surviving row.
 //
 // See missed-heartbeat.kql for the OTelLogs/Body-as-JSON assumption this query
 // shares. ASSUMPTION TO VERIFY AT M4 DEPLOY: confirm the table/column names
@@ -21,4 +41,25 @@ otel
 | where TimeGenerated > ago(15m)
 | extend body = todynamic(Body)
 | where body.event == "parse.error"
-| project TimeGenerated, body
+| extend err = tostring(body.error), fid = tostring(body.file_id)
+// Suppress a row ONLY when it is BOTH from D1 (contains "D1_ERROR") AND carries a
+// known-transient phrase — mirroring the consumer's isTransientD1Error. Requiring
+// the D1_ERROR origin means a terminal error whose user-controlled path merely
+// embeds a phrase (e.g. r2_object_missing under a dir named "Network connection
+// lost") still counts toward dcount(fid) and can page. `contains` (substring),
+// NOT `has`: `has` is term-based and won't reliably match these multi-word
+// phrases or the underscored D1_ERROR token. See header note 1.
+| extend transientD1 = err contains "D1_ERROR" and (
+       err contains "Network connection lost"
+    or err contains "storage caused object to be reset"
+    or err contains "reset because its code was updated"
+    or err contains "Cannot resolve Durable Object")
+| where not(transientD1)
+// A bare summarize (no `by`) yields exactly one row — files counts DISTINCT
+// affected file_ids (not rows: a retried terminal failure logs several), errors
+// samples the messages for the notification. `where files > 1` emits that row
+// only when 2+ files failed, so provision.sh's `count > 0` condition fires on a
+// real multi-file incident, never on one retried one-off. See header note 2.
+| summarize files = dcount(fid), errors = make_set(err, 10)
+| where files > 1
+| project files, errors

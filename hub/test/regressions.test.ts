@@ -1789,3 +1789,129 @@ describe("consumeParseBatch's catch path is guarded by content_hash (regression:
     expect(bodyV2After.hits.some((h) => h.session_id === SESSION_ID)).toBe(true);
   });
 });
+
+describe("consumeParseBatch retries a TRANSIENT D1 error instead of stamping a terminal parse.error (regression: a lone `D1_ERROR: Network connection lost.` blip flipped a healthy file to parse_state='error' — which only auto-heals on a re-upload/reindex — and paged the parse-errors alert at 01:40 UTC, even though re-running the identical idempotent parse succeeds)", () => {
+  it('a transient D1 throw mid-parse leaves the file un-flipped (still pending), calls msg.retry() not ack(), and logs parse.retry not parse.error', async () => {
+    const SESSION_ID = 'e0000000-0000-4000-8000-000000000009';
+    const relpath = `transient-retry-demo/${SESSION_ID}.jsonl`;
+    const content = `${ccUserLine({ uuid: 'tr-u1', text: 'unique-marker-transient-retry content' })}\n`;
+    const res = await putFile('claude-projects', relpath, content);
+    expect(res.status).toBe(201);
+    const fileId = ((await res.json()) as { file_id: number }).file_id;
+    const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
+
+    // Force parseOne's R2 read to throw the EXACT string Cloudflare D1 raises on a dropped backend
+    // connection. isTransientD1Error classifies by message substring (D1 exposes no error code), so
+    // the throw's origin doesn't matter — the point is the consumer catch must recognize it as
+    // transient and retry, not flip the file to a terminal 'error'. (Genuine terminal errors like
+    // r2_object_missing still hit the parse.error + 'error' path — the missing-object tests above
+    // guard that this classification isn't too greedy.)
+    const originalGet = testEnv.RAW.get.bind(testEnv.RAW);
+    const spy = vi.spyOn(testEnv.RAW, 'get').mockImplementation(async (key: string, ...rest: unknown[]): Promise<R2ObjectBody | null> => {
+      if (key === r2Key) throw new Error('D1_ERROR: Network connection lost.');
+      return (originalGet as (key: string, ...rest: unknown[]) => Promise<R2ObjectBody | null>)(key, ...rest);
+    });
+    const logs: string[] = [];
+    const logSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      logs.push(args.map(String).join(' '));
+    });
+
+    let retried = 0;
+    let acked = 0;
+    const message = {
+      id: String(fileId),
+      timestamp: new Date(),
+      attempts: 1,
+      body: { file_id: fileId, r2_key: r2Key, reason: 'upload' as const },
+      ack() {
+        acked++;
+      },
+      retry() {
+        retried++;
+      },
+    };
+    try {
+      await worker.queue(
+        { queue: 'parse', messages: [message], ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>,
+        testEnv,
+      );
+    } finally {
+      spy.mockRestore();
+      logSpy.mockRestore();
+    }
+
+    // Retried (redelivers the exact message), never acked (ack would drop the message on the floor).
+    expect(retried).toBe(1);
+    expect(acked).toBe(0);
+
+    // Logged parse.retry, NOT parse.error — so the parse-errors alert stays quiet on the blip.
+    const events = logs
+      .map((l) => {
+        try {
+          return JSON.parse(l) as { event?: string; file_id?: number };
+        } catch {
+          return null;
+        }
+      })
+      .filter((e): e is { event?: string; file_id?: number } => e !== null);
+    expect(events.some((e) => e.event === 'parse.retry' && e.file_id === fileId)).toBe(true);
+    expect(events.some((e) => e.event === 'parse.error')).toBe(false);
+
+    // File is left exactly as it was — 'pending', no parse_error — so a redelivery (or files/check)
+    // re-parses it cleanly rather than it being stranded in a terminal 'error' state.
+    const fileRow = await testEnv.DB.prepare('SELECT parse_state, parse_error FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string; parse_error: string | null }>();
+    expect(fileRow?.parse_state).toBe('pending');
+    expect(fileRow?.parse_error).toBeNull();
+  });
+
+  it('a NON-D1 error whose user-controlled text embeds BOTH "D1_ERROR" and a transient phrase is NOT misclassified — the D1_ERROR-origin check is a message prefix, not a substring, so it still errors the file and logs parse.error', async () => {
+    const SESSION_ID = 'e0000000-0000-4000-8000-00000000000a';
+    const relpath = `transient-retry-demo/${SESSION_ID}.jsonl`;
+    const content = `${ccUserLine({ uuid: 'tr-u2', text: 'unique-marker-transient-qualifier content' })}\n`;
+    const res = await putFile('claude-projects', relpath, content);
+    expect(res.status).toBe(201);
+    const fileId = ((await res.json()) as { file_id: number }).file_id;
+    const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
+
+    // Pathological terminal throw: an r2_object_missing whose key embeds BOTH the D1_ERROR token AND a
+    // transient phrase in directory names. A naive `String(e).includes('D1_ERROR') && includes(phrase)`
+    // guard would wrongly classify this as transient; the message-PREFIX check (message starts with
+    // 'D1_ERROR') correctly rejects it → terminal parse.error path, not a retry.
+    const originalGet = testEnv.RAW.get.bind(testEnv.RAW);
+    const spy = vi.spyOn(testEnv.RAW, 'get').mockImplementation(async (key: string, ...rest: unknown[]): Promise<R2ObjectBody | null> => {
+      if (key === r2Key) throw new Error('r2_object_missing:raw/regbox/claude-projects/D1_ERROR/Network connection lost/x.jsonl');
+      return (originalGet as (key: string, ...rest: unknown[]) => Promise<R2ObjectBody | null>)(key, ...rest);
+    });
+    const logs: string[] = [];
+    const logSpy = vi.spyOn(console, 'log').mockImplementation((...args: unknown[]) => {
+      logs.push(args.map(String).join(' '));
+    });
+
+    try {
+      await deliverOne(fileId, r2Key);
+    } finally {
+      spy.mockRestore();
+      logSpy.mockRestore();
+    }
+
+    const events = logs
+      .map((l) => {
+        try {
+          return JSON.parse(l) as { event?: string };
+        } catch {
+          return null;
+        }
+      })
+      .filter((e): e is { event?: string } => e !== null);
+    expect(events.some((e) => e.event === 'parse.error')).toBe(true);
+    expect(events.some((e) => e.event === 'parse.retry')).toBe(false);
+
+    const fileRow = await testEnv.DB.prepare('SELECT parse_state, parse_error FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string; parse_error: string | null }>();
+    expect(fileRow?.parse_state).toBe('error');
+    expect(fileRow?.parse_error).toContain('r2_object_missing');
+  });
+});
