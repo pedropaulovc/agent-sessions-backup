@@ -1866,7 +1866,7 @@ describe("consumeParseBatch retries a TRANSIENT D1 error instead of stamping a t
     expect(fileRow?.parse_error).toBeNull();
   });
 
-  it('a NON-D1 error whose text merely contains a transient phrase is NOT misclassified — it still errors the file and logs parse.error (guards the D1_ERROR-origin qualifier)', async () => {
+  it('a NON-D1 error whose user-controlled text embeds BOTH "D1_ERROR" and a transient phrase is NOT misclassified — the D1_ERROR-origin check is a message prefix, not a substring, so it still errors the file and logs parse.error', async () => {
     const SESSION_ID = 'e0000000-0000-4000-8000-00000000000a';
     const relpath = `transient-retry-demo/${SESSION_ID}.jsonl`;
     const content = `${ccUserLine({ uuid: 'tr-u2', text: 'unique-marker-transient-qualifier content' })}\n`;
@@ -1875,11 +1875,13 @@ describe("consumeParseBatch retries a TRANSIENT D1 error instead of stamping a t
     const fileId = ((await res.json()) as { file_id: number }).file_id;
     const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
 
-    // A throw that carries a transient PHRASE but no D1_ERROR origin (e.g. an r2_object_missing whose
-    // key embedded the phrase). isTransientD1Error must return false → terminal path, not a retry.
+    // Pathological terminal throw: an r2_object_missing whose key embeds BOTH the D1_ERROR token AND a
+    // transient phrase in directory names. A naive `String(e).includes('D1_ERROR') && includes(phrase)`
+    // guard would wrongly classify this as transient; the message-PREFIX check (message starts with
+    // 'D1_ERROR') correctly rejects it → terminal parse.error path, not a retry.
     const originalGet = testEnv.RAW.get.bind(testEnv.RAW);
     const spy = vi.spyOn(testEnv.RAW, 'get').mockImplementation(async (key: string, ...rest: unknown[]): Promise<R2ObjectBody | null> => {
-      if (key === r2Key) throw new Error('r2_object_missing:raw/regbox/claude-projects/Network connection lost/x.jsonl');
+      if (key === r2Key) throw new Error('r2_object_missing:raw/regbox/claude-projects/D1_ERROR/Network connection lost/x.jsonl');
       return (originalGet as (key: string, ...rest: unknown[]) => Promise<R2ObjectBody | null>)(key, ...rest);
     });
     const logs: string[] = [];

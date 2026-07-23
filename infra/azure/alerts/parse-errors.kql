@@ -42,13 +42,19 @@ otel
 | extend body = todynamic(Body)
 | where body.event == "parse.error"
 | extend err = tostring(body.error), fid = tostring(body.file_id)
-// Drop known-transient D1 blips — the consumer retries these; see header note 1.
-// `contains` (substring), NOT `has`: `has` is term-based and won't reliably match
-// these multi-word phrases, so a transient row could survive and page.
-| where err !contains "Network connection lost"
-    and err !contains "storage caused object to be reset"
-    and err !contains "reset because its code was updated"
-    and err !contains "Cannot resolve Durable Object"
+// Suppress a row ONLY when it is BOTH from D1 (contains "D1_ERROR") AND carries a
+// known-transient phrase — mirroring the consumer's isTransientD1Error. Requiring
+// the D1_ERROR origin means a terminal error whose user-controlled path merely
+// embeds a phrase (e.g. r2_object_missing under a dir named "Network connection
+// lost") still counts toward dcount(fid) and can page. `contains` (substring),
+// NOT `has`: `has` is term-based and won't reliably match these multi-word
+// phrases or the underscored D1_ERROR token. See header note 1.
+| extend transientD1 = err contains "D1_ERROR" and (
+       err contains "Network connection lost"
+    or err contains "storage caused object to be reset"
+    or err contains "reset because its code was updated"
+    or err contains "Cannot resolve Durable Object")
+| where not(transientD1)
 // A bare summarize (no `by`) yields exactly one row — files counts DISTINCT
 // affected file_ids (not rows: a retried terminal failure logs several), errors
 // samples the messages for the notification. `where files > 1` emits that row
