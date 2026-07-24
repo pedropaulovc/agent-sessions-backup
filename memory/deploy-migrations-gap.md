@@ -1,15 +1,27 @@
 ---
 name: deploy-migrations-gap
-description: hub code auto-deploys via Cloudflare Workers Builds but D1 migrations do NOT — apply them to prod manually or a migration-bearing merge breaks prod
+description: CI (not Workers Builds) now deploys the hub Worker — migrate then wrangler deploy, in that order, on merge to main (PR #52, 2026-07-24)
 metadata:
   type: project
 ---
 
-**Merging a migration-bearing PR to main breaks production until the migration is applied by hand.**
+**RESOLVED 2026-07-24 by PR #52.** CI is now the sole prod deployer: `.github/workflows/ci.yml`'s
+`deploy` job (push to main, gated on the `hub` tests) runs `wrangler d1 migrations apply sessions-index
+--remote` **then** `wrangler deploy`, in that order, in one job — so code never runs against an
+un-migrated schema. Cloudflare Workers Builds auto-deploy for the **production** `sessions-hub` Worker
+was turned OFF (git repo disconnected in the dashboard) so nothing races the workflow. The separate
+`sessions-hub-preview` Worker keeps its own Workers Builds connection for PR preview URLs (harmless,
+never touches prod). Auth is repo secret **`CLOUDFLARE_API_TOKEN`** (a user API token
+`sessions-hub CI deploy + D1 migrate`, expires **2026-10-24** — recreate before then): account
+`18ef3246…` scoped D1 / Workers Scripts / Queues / Workers R2 / Workers KV = Edit, Account Settings =
+Read; zone vza.net = Workers Routes:Edit. `account_id` comes from wrangler.jsonc (so no
+CLOUDFLARE_ACCOUNT_ID needed with this token).
 
-Cloudflare Workers Builds auto-deploys the hub Worker on push to `main`, but that deploy does NOT
-run D1 migrations, and `ci.yml` only runs tests (no migrate step). So new code that references a
-new column/table hits the OLD prod schema → every affected request throws
+--- Historical context (the incident this fixed) ---
+
+**Before the fix:** Workers Builds auto-deployed the hub Worker on push to `main`, but that deploy did
+NOT run D1 migrations, and `ci.yml` only ran tests (no migrate step). So new code that referenced a
+new column/table hit the OLD prod schema → every affected request threw
 (`D1_ERROR: table X has no column named Y: SQLITE_ERROR`). This fired the `agent-backup-parse-errors`
 alert on 2026-07-22 when PR #51's migration 0013 (sessions.first_interaction_title) shipped without
 being applied — the ingest writer's INSERT failed on every file.
@@ -33,5 +45,12 @@ re-enqueues `parse_state='error'` rows. They recover on a collector re-upload or
 (`POST /api/v1/admin/reindex`, which needs machine mTLS admin identity — not callable with a plain
 token). Reindex is also the backfill path for derived columns (see [[session-title-sql-size-limit]]).
 
-**Durable fix (not yet done):** add a `wrangler d1 migrations apply --remote` step to the deploy
-pipeline (CF API token secret), gated before the Workers Builds deploy, so migrations lead code.
+**Manual apply (still valid for out-of-band fixes):**
+```
+cd hub
+CLOUDFLARE_ACCOUNT_ID=18ef3246e9f36d1560485ef53889c0ab \
+  npx wrangler d1 migrations apply sessions-index --remote
+```
+`wrangler d1 migrations list sessions-index --remote` shows unapplied ones; `npm run migrate:remote`
+is the same command. Two CF accounts are configured, so CLOUDFLARE_ACCOUNT_ID must be set when using
+an OAuth login (the CI API token pins the account itself).
