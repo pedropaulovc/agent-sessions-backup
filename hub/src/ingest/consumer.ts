@@ -1804,7 +1804,7 @@ async function raiseExportRetry(
 async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Promise<number> {
   const db = env.DB;
 
-  await db.batch([
+  const clearRes = await db.batch([
     db
       .prepare(
         `INSERT INTO blocks_fts (blocks_fts, rowid, text)
@@ -1814,6 +1814,9 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
     db.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(s.id),
     db.prepare('DELETE FROM usage WHERE session_id = ?1').bind(s.id),
   ]);
+  // `changes` on the DELETE is the pre-existing row count — free (no extra SELECT) and the only
+  // way to tell an initial write from a rewrite of an already-indexed session.
+  const priorBlocks = clearRes[1]?.meta?.changes ?? 0;
 
   const insertBlock = db.prepare(
     `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, byte_start, byte_len, truncated, text, on_main_path)
@@ -1903,7 +1906,8 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
   }
 
   const insertChunks = chunkArr(stmts, 90);
-  for (const chunk of insertChunks) await db.batch(chunk);
+  let insertRows = 0;
+  for (const chunk of insertChunks) insertRows += sumRowsWritten(await db.batch(chunk));
 
   const machine = await db
     .prepare('SELECT os FROM machines WHERE machine_id = ?1')
@@ -1928,7 +1932,7 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
   }
   const firstInteractionTitle = computeFirstInteractionTitle(titleBlocks);
 
-  await db.batch([
+  const finalizeRes = await db.batch([
     db
       .prepare(
         `INSERT INTO sessions (session_id, harness, machine_id, os, canonical_file_id, cwd, repo_url, project_name, git_branch, models,
@@ -1991,10 +1995,44 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
       .bind(s.id),
   ]);
 
+  // Billed write cost of this one session write, split by phase. D1 meters ROWS WRITTEN, and every
+  // row here is written at least three times over (base table + the blocks_fts shadow tables), so a
+  // rewrite of an unchanged session is far from free: `rewritten_blocks` is the redundant part —
+  // blocks that existed before this write and were deleted and re-inserted verbatim. It is the
+  // headroom an incremental (append-only) writer would reclaim, and the reason this event exists:
+  // rows_written is otherwise only observable as an account-wide daily total in the GraphQL
+  // analytics API, which cannot attribute cost to a session, a harness, or a re-parse.
+  console.log(
+    JSON.stringify({
+      event: 'hub.d1.write_cost',
+      session: s.id,
+      file_id: file.id,
+      harness: s.harness,
+      write_kind: priorBlocks > 0 ? 'rewrite' : 'initial',
+      blocks: blockCount,
+      prior_blocks: priorBlocks,
+      rewritten_blocks: Math.min(priorBlocks, blockCount),
+      rows_written: sumRowsWritten(clearRes) + insertRows + sumRowsWritten(finalizeRes),
+      rows_written_clear: sumRowsWritten(clearRes),
+      rows_written_insert: insertRows,
+      rows_written_finalize: sumRowsWritten(finalizeRes),
+      batches: 2 + insertChunks.length,
+    }),
+  );
+
   // SUBREQUESTS (see the counting-model note above): delete batch (1) + one batch per 90-block insert
   // chunk (insertChunks.length) + machine SELECT (1) + session/FTS batch (1). A db.batch of N statements
   // is ONE subrequest, so a chatty conversation's cost grows with its BATCH count, not its statement count.
   return 3 + insertChunks.length;
+}
+
+/** Billed rows written by one `db.batch()`, summed across its statements. `meta.rows_written` counts
+ * every physical row the statement touched — including the blocks_fts shadow tables, which is the
+ * point: FTS maintenance is the majority of this database's write bill and is invisible in the
+ * statement text. Absent on D1 backends that do not populate it (older miniflare), hence `?? 0`;
+ * a zero here means "not reported", not "free". */
+function sumRowsWritten(results: D1Result[]): number {
+  return results.reduce((total, r) => total + (r.meta?.rows_written ?? 0), 0);
 }
 
 function chunkArr<T>(arr: T[], n: number): T[][] {

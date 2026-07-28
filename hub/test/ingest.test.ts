@@ -1229,3 +1229,83 @@ describe('a fresh reservation is left to its cleanup owner; the heal paths do no
     }
   });
 });
+
+// The collector re-uploads a session file every scan while the session is still being appended to
+// (15-minute cadence, see collector/src/agent_collector), and each re-upload re-parses and REWRITES
+// the whole session — every prior block deleted and re-inserted verbatim, in blocks and in the FTS
+// shadow tables. D1 bills rows written, so that redundant rewrite is the dominant write cost of an
+// active session. Nothing on the D1 side attributes it: the GraphQL analytics API reports only an
+// account-wide daily rowsWritten total. writeSession therefore emits hub.d1.write_cost per session
+// write; this test pins the fields the cost analysis depends on — that a grow-then-reparse is
+// labelled 'rewrite' and reports the prior blocks it needlessly rewrote.
+describe('hub.d1.write_cost telemetry', () => {
+  const GROW_SESSION = '99999999-8888-4777-8666-555555555555';
+  const relpath = `-home-tester-src-demo/${GROW_SESSION}.jsonl`;
+
+  function sessionOfLength(turns: number): string {
+    const lines: string[] = [];
+    for (let i = 0; i < turns; i++) {
+      lines.push(projectSessionLine(GROW_SESSION, '/home/tester/src/demo', `question ${i}`));
+      lines.push(ccAssistantLine({ uuid: `grow-a${i}`, parentUuid: `${GROW_SESSION}-user`, text: `answer ${i}` }));
+    }
+    return lines.join('\n');
+  }
+
+  function captureLogs() {
+    const events: Array<Record<string, unknown>> = [];
+    vi.spyOn(console, 'log').mockImplementation((line: string) => {
+      try {
+        events.push(JSON.parse(line));
+      } catch {
+        /* non-JSON log line, ignore */
+      }
+    });
+    return events;
+  }
+
+  function writeCosts(events: Array<Record<string, unknown>>) {
+    return events.filter((e) => e.event === 'hub.d1.write_cost' && e.session === GROW_SESSION);
+  }
+
+  it('labels the first write initial and the append-driven re-parse a rewrite that re-writes every prior block', async () => {
+    const first = captureLogs();
+    expect((await putFile('testbox-wsl', 'claude-projects', relpath, sessionOfLength(3))).status).toBe(201);
+    await drainQueue();
+    const initial = writeCosts(first)[0];
+    vi.restoreAllMocks();
+
+    expect(initial).toBeTruthy();
+    expect(initial!.write_kind).toBe('initial');
+    expect(initial!.prior_blocks).toBe(0);
+    expect(initial!.rewritten_blocks).toBe(0);
+    const initialBlocks = initial!.blocks as number;
+    expect(initialBlocks).toBeGreaterThan(0);
+
+    // The session grows by 2 turns; the file is re-uploaded whole, exactly as the collector does.
+    const second = captureLogs();
+    expect((await putFile('testbox-wsl', 'claude-projects', relpath, sessionOfLength(5))).status).toBe(201);
+    await drainQueue();
+    const rewrite = writeCosts(second)[0];
+    vi.restoreAllMocks();
+
+    expect(rewrite).toBeTruthy();
+    expect(rewrite!.write_kind).toBe('rewrite');
+    expect(rewrite!.prior_blocks).toBe(initialBlocks);
+    expect(rewrite!.blocks as number).toBeGreaterThan(initialBlocks);
+    // The redundant part: every block the first write already stored is deleted and written again.
+    expect(rewrite!.rewritten_blocks).toBe(initialBlocks);
+
+    // The billed number itself, and its split. Asserted non-zero because `meta.rows_written` is read
+    // defensively (`?? 0`) — without this the event would still be emitted, silently reporting a
+    // free write, and the whole cost analysis downstream would read zero.
+    for (const cost of [initial!, rewrite!]) {
+      expect(cost.rows_written as number).toBeGreaterThan(0);
+      expect(cost.rows_written).toBe(
+        (cost.rows_written_clear as number) + (cost.rows_written_insert as number) + (cost.rows_written_finalize as number),
+      );
+    }
+    // Clearing an already-indexed session costs rows (FTS delete + row deletes); the initial write
+    // has nothing to clear. This is the cost an append-only writer would avoid paying every 15 min.
+    expect(rewrite!.rows_written_clear as number).toBeGreaterThan(initial!.rows_written_clear as number);
+  });
+});
