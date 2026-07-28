@@ -1804,7 +1804,7 @@ async function raiseExportRetry(
 async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Promise<number> {
   const db = env.DB;
 
-  await db.batch([
+  const clearRes = await db.batch([
     db
       .prepare(
         `INSERT INTO blocks_fts (blocks_fts, rowid, text)
@@ -1814,6 +1814,12 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
     db.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(s.id),
     db.prepare('DELETE FROM usage WHERE session_id = ?1').bind(s.id),
   ]);
+  // `changes` on the DELETEs is the pre-existing row count — free (no extra SELECT) and the only
+  // way to tell an initial write from a rewrite of an already-indexed session. Both deletes count:
+  // a transcript of usage-only turns (codex retains those) has usage rows and NO blocks, so keying
+  // off blocks alone would label every one of its re-parses 'initial' while it pays rewrite cost.
+  const priorBlocks = clearRes[1]?.meta?.changes ?? 0;
+  const priorUsage = clearRes[2]?.meta?.changes ?? 0;
 
   const insertBlock = db.prepare(
     `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, byte_start, byte_len, truncated, text, on_main_path)
@@ -1902,99 +1908,165 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
     }
   }
 
+  // Billed write cost of this one session write, split by phase. D1 meters ROWS WRITTEN, and every
+  // row here is written several times over (base table + the blocks_fts shadow tables), so a rewrite
+  // of an already-indexed session is far from free. `prior_blocks`/`prior_usage` are the rows this
+  // write DELETED — deliberately not described as redundant: on an edited or replaced transcript
+  // those rows genuinely had to go, and distinguishing the two needs a block-identity comparison
+  // this event does not do. The event exists because rows_written is otherwise observable only as an
+  // account-wide daily total in the GraphQL analytics API, which cannot attribute cost to a session,
+  // a harness, or a re-parse.
+  //
+  // Emitted on the failure path too (`outcome: 'failed'`, then the error propagates): the clear batch
+  // and any completed insert chunks have ALREADY been billed by the time a later chunk throws, and the
+  // queue retries the whole write — so dropping the event exactly when writes are being repeated
+  // would blind the attribution precisely where spend is worst.
+  let insertRows = 0;
+  let finalizeRows = 0;
+  // Counted as batches are ATTEMPTED, not planned: on the failure path the event must describe the work
+  // that actually ran, and a large session throwing on its first chunk would otherwise report dozens of
+  // batches it never reached. The clear batch above is the one already spent when we get here.
+  let batchesRun = 1;
   const insertChunks = chunkArr(stmts, 90);
-  for (const chunk of insertChunks) await db.batch(chunk);
+  const emitWriteCost = (outcome: 'ok' | 'failed') =>
+    console.log(
+      JSON.stringify({
+        event: 'hub.d1.write_cost',
+        session: s.id,
+        file_id: file.id,
+        harness: s.harness,
+        outcome,
+        write_kind: priorBlocks > 0 || priorUsage > 0 ? 'rewrite' : 'initial',
+        blocks: blockCount,
+        prior_blocks: priorBlocks,
+        prior_usage: priorUsage,
+        rows_written: sumRowsWritten(clearRes) + insertRows + finalizeRows,
+        rows_written_clear: sumRowsWritten(clearRes),
+        rows_written_insert: insertRows,
+        rows_written_finalize: finalizeRows,
+        batches: batchesRun,
+      }),
+    );
 
-  const machine = await db
-    .prepare('SELECT os FROM machines WHERE machine_id = ?1')
-    .bind(file.machine_id)
-    .first<{ os: string }>();
-
-  // Derive the first-interaction title from the same blocks just written (block_index == bi, the
-  // per-turn insert order above), so the listing queries read a stored column instead of an
-  // inlined per-query SQL derivation.
-  const titleBlocks: TitleBlock[] = [];
-  for (const turn of s.turns) {
-    for (let bi = 0; bi < turn.blocks.length; bi++) {
-      titleBlocks.push({
-        turnIndex: turn.index,
-        blockIndex: bi,
-        role: turn.role,
-        btype: turn.blocks[bi]!.type,
-        text: turn.blocks[bi]!.text ?? null,
-        onMainPath: turn.onMainPath,
-      });
-    }
+  try {
+    return await runWrite();
+  } catch (e) {
+    emitWriteCost('failed');
+    throw e;
   }
-  const firstInteractionTitle = computeFirstInteractionTitle(titleBlocks);
 
-  await db.batch([
-    db
-      .prepare(
-        `INSERT INTO sessions (session_id, harness, machine_id, os, canonical_file_id, cwd, repo_url, project_name, git_branch, models,
-                               primary_model, title, started_at, ended_at, parent_session_id, parent_tool_use_id, is_sidechain,
-                               turn_count, block_count, tokens_in, tokens_out, tokens_reasoning, tokens_cached,
-                               first_interaction_title, index_state, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 'ready',
-                 strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-         ON CONFLICT (session_id) DO UPDATE SET
-           harness = excluded.harness, machine_id = excluded.machine_id, os = excluded.os,
-           canonical_file_id = excluded.canonical_file_id, cwd = excluded.cwd, repo_url = excluded.repo_url,
-           project_name = excluded.project_name,
-           git_branch = excluded.git_branch, models = excluded.models, primary_model = excluded.primary_model,
-           first_interaction_title = excluded.first_interaction_title,
-           title = COALESCE(excluded.title, sessions.title), started_at = excluded.started_at, ended_at = excluded.ended_at,
-           parent_session_id = COALESCE(excluded.parent_session_id, sessions.parent_session_id),
-           -- excluded wins when non-null: a transcript reparse reads the CURRENT sibling meta live
-           -- (readSiblingMeta above), so a corrected .meta.json shows up here as a fresh, non-null
-           -- excluded.parent_tool_use_id and must overwrite the stale stored value. Only fall back
-           -- to the stored value when THIS write has no metadata of its own to offer (excluded is
-           -- NULL) — e.g. a transcript reparse whose sibling meta hasn't landed (or was deleted),
-           -- where linkSubagentMeta's own targeted UPDATE remains the source of truth instead.
-           parent_tool_use_id = COALESCE(excluded.parent_tool_use_id, sessions.parent_tool_use_id),
-           is_sidechain = excluded.is_sidechain, turn_count = excluded.turn_count, block_count = excluded.block_count,
-           tokens_in = excluded.tokens_in, tokens_out = excluded.tokens_out,
-           tokens_reasoning = excluded.tokens_reasoning, tokens_cached = excluded.tokens_cached,
-           index_state = 'ready', updated_at = excluded.updated_at`,
-      )
-      .bind(
-        s.id,
-        s.harness,
-        file.machine_id,
-        machine?.os ?? null,
-        file.id,
-        s.cwd ?? null,
-        s.repoUrl ?? null,
-        deriveProjectName(s.cwd, s.repoUrl),
-        s.gitBranch ?? null,
-        JSON.stringify(s.models),
-        s.primaryModel ?? null,
-        s.title ?? null,
-        s.startedAt ?? null,
-        s.endedAt ?? null,
-        s.parentSessionId ?? null,
-        s.parentToolUseId ?? null,
-        s.isSidechain ? 1 : 0,
-        s.turns.length,
-        blockCount,
-        totals.in,
-        totals.out,
-        totals.reasoning,
-        totals.cached,
-        firstInteractionTitle,
-      ),
-    db
-      .prepare(
-        `INSERT INTO blocks_fts (rowid, text)
-         SELECT id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL`,
-      )
-      .bind(s.id),
-  ]);
+  /** The billed half of the write, in one scope so the catch above can report what it already paid
+   * for. Declared (not inlined) purely to keep that try block one statement deep. */
+  async function runWrite(): Promise<number> {
+    for (const chunk of insertChunks) {
+      batchesRun++;
+      insertRows += sumRowsWritten(await db.batch(chunk));
+    }
 
-  // SUBREQUESTS (see the counting-model note above): delete batch (1) + one batch per 90-block insert
-  // chunk (insertChunks.length) + machine SELECT (1) + session/FTS batch (1). A db.batch of N statements
-  // is ONE subrequest, so a chatty conversation's cost grows with its BATCH count, not its statement count.
-  return 3 + insertChunks.length;
+    const machine = await db
+      .prepare('SELECT os FROM machines WHERE machine_id = ?1')
+      .bind(file.machine_id)
+      .first<{ os: string }>();
+
+    // Derive the first-interaction title from the same blocks just written (block_index == bi, the
+    // per-turn insert order above), so the listing queries read a stored column instead of an
+    // inlined per-query SQL derivation.
+    const titleBlocks: TitleBlock[] = [];
+    for (const turn of s.turns) {
+      for (let bi = 0; bi < turn.blocks.length; bi++) {
+        titleBlocks.push({
+          turnIndex: turn.index,
+          blockIndex: bi,
+          role: turn.role,
+          btype: turn.blocks[bi]!.type,
+          text: turn.blocks[bi]!.text ?? null,
+          onMainPath: turn.onMainPath,
+        });
+      }
+    }
+    const firstInteractionTitle = computeFirstInteractionTitle(titleBlocks);
+
+    batchesRun++;
+    const finalizeRes = await db.batch([
+      db
+        .prepare(
+          `INSERT INTO sessions (session_id, harness, machine_id, os, canonical_file_id, cwd, repo_url, project_name, git_branch, models,
+                                 primary_model, title, started_at, ended_at, parent_session_id, parent_tool_use_id, is_sidechain,
+                                 turn_count, block_count, tokens_in, tokens_out, tokens_reasoning, tokens_cached,
+                                 first_interaction_title, index_state, updated_at)
+           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 'ready',
+                   strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+           ON CONFLICT (session_id) DO UPDATE SET
+             harness = excluded.harness, machine_id = excluded.machine_id, os = excluded.os,
+             canonical_file_id = excluded.canonical_file_id, cwd = excluded.cwd, repo_url = excluded.repo_url,
+             project_name = excluded.project_name,
+             git_branch = excluded.git_branch, models = excluded.models, primary_model = excluded.primary_model,
+             first_interaction_title = excluded.first_interaction_title,
+             title = COALESCE(excluded.title, sessions.title), started_at = excluded.started_at, ended_at = excluded.ended_at,
+             parent_session_id = COALESCE(excluded.parent_session_id, sessions.parent_session_id),
+             -- excluded wins when non-null: a transcript reparse reads the CURRENT sibling meta live
+             -- (readSiblingMeta above), so a corrected .meta.json shows up here as a fresh, non-null
+             -- excluded.parent_tool_use_id and must overwrite the stale stored value. Only fall back
+             -- to the stored value when THIS write has no metadata of its own to offer (excluded is
+             -- NULL) — e.g. a transcript reparse whose sibling meta hasn't landed (or was deleted),
+             -- where linkSubagentMeta's own targeted UPDATE remains the source of truth instead.
+             parent_tool_use_id = COALESCE(excluded.parent_tool_use_id, sessions.parent_tool_use_id),
+             is_sidechain = excluded.is_sidechain, turn_count = excluded.turn_count, block_count = excluded.block_count,
+             tokens_in = excluded.tokens_in, tokens_out = excluded.tokens_out,
+             tokens_reasoning = excluded.tokens_reasoning, tokens_cached = excluded.tokens_cached,
+             index_state = 'ready', updated_at = excluded.updated_at`,
+        )
+        .bind(
+          s.id,
+          s.harness,
+          file.machine_id,
+          machine?.os ?? null,
+          file.id,
+          s.cwd ?? null,
+          s.repoUrl ?? null,
+          deriveProjectName(s.cwd, s.repoUrl),
+          s.gitBranch ?? null,
+          JSON.stringify(s.models),
+          s.primaryModel ?? null,
+          s.title ?? null,
+          s.startedAt ?? null,
+          s.endedAt ?? null,
+          s.parentSessionId ?? null,
+          s.parentToolUseId ?? null,
+          s.isSidechain ? 1 : 0,
+          s.turns.length,
+          blockCount,
+          totals.in,
+          totals.out,
+          totals.reasoning,
+          totals.cached,
+          firstInteractionTitle,
+        ),
+      db
+        .prepare(
+          `INSERT INTO blocks_fts (rowid, text)
+           SELECT id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL`,
+        )
+        .bind(s.id),
+    ]);
+
+    finalizeRows = sumRowsWritten(finalizeRes);
+    emitWriteCost('ok');
+
+    // SUBREQUESTS (see the counting-model note above): delete batch (1) + one batch per 90-block insert
+    // chunk (insertChunks.length) + machine SELECT (1) + session/FTS batch (1). A db.batch of N statements
+    // is ONE subrequest, so a chatty conversation's cost grows with its BATCH count, not its statement count.
+    return 3 + insertChunks.length;
+  }
+}
+
+/** Billed rows written by one `db.batch()`, summed across its statements. `meta.rows_written` counts
+ * every physical row the statement touched — including the blocks_fts shadow tables, which is the
+ * point: FTS maintenance is the majority of this database's write bill and is invisible in the
+ * statement text. Absent on D1 backends that do not populate it (older miniflare), hence `?? 0`;
+ * a zero here means "not reported", not "free". */
+function sumRowsWritten(results: D1Result[]): number {
+  return results.reduce((total, r) => total + (r.meta?.rows_written ?? 0), 0);
 }
 
 function chunkArr<T>(arr: T[], n: number): T[][] {
