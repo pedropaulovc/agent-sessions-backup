@@ -12,7 +12,15 @@ changes to Azure. The Scheduled Query Alert keeps evaluating whatever KQL was la
 someone re-runs provisioning or updates it directly. So a merged alert fix is a no-op in prod until
 you apply it.
 
-**A NEW .kql file is worse than an edited one: it does not exist in Azure at all.** Adding
+**This gap recurs and has bitten twice.** Confirmed 2026-07-28: `collector-errors` had been
+evaluating a query stale since 2026-07-18 (commit 88f187b, which nested collector-supplied fields
+under `body.payload.*` so a collector couldn't forge `event`/`machine`, and updated the .kql to
+match). The live alert kept reading `body.{level,code,message}` — fields that no longer existed — so
+for ten days it **could not have fired on any collector error**, while the repo read as if it were
+watching. A stale alert is worse than a missing one: it looks healthy. Re-run provisioning after
+ANY .kql change, and treat a long gap since the last run as "assume every alert is stale."
+
+**A NEW .kql file is worse than an unapplied edit in one respect: it does not exist in Azure at all.** Adding
 `alerts/foo.kql` and merging creates nothing — the repo then *reads* as if the monitor exists while
 nothing is watching. Confirmed 2026-07-28: `cert-orphan-leaked` and `cf-auth-failed` had .kql files
 but no Azure alert, so nobody had run provisioning since they were added. Reconcile with:
