@@ -1,0 +1,14 @@
+-- Content fingerprint of a block row, so an incremental write can tell "already stored, unchanged"
+-- from "same position, different content" without re-reading every stored block's text.
+--
+-- writeSession retains the unchanged leading run of an already-indexed session instead of deleting
+-- and re-inserting the whole thing. Position and byte offsets alone cannot decide what is unchanged:
+-- a re-uploaded transcript can carry different bytes at identical offsets (an edited or replaced
+-- file, a re-captured web conversation), and retaining on position alone would serve that stale text
+-- forever. This hash covers every column the comparison does not check directly — role, btype,
+-- tool_name, ts, truncated, on_main_path, text — so any change to what the parser stores, including
+-- a change to the parser itself, shows up as a mismatch and rewrites from that block on.
+--
+-- Existing rows default to 0, which the hash never produces, so the first parse after this migration
+-- retains nothing and rewrites the session in full — the same work it does today.
+ALTER TABLE blocks ADD COLUMN row_hash INTEGER NOT NULL DEFAULT 0;

@@ -1242,13 +1242,28 @@ describe('hub.d1.write_cost telemetry', () => {
   const GROW_SESSION = '99999999-8888-4777-8666-555555555555';
   const relpath = `-home-tester-src-demo/${GROW_SESSION}.jsonl`;
 
-  function sessionOfLength(turns: number): string {
+  /** A properly parent-chained transcript: each turn's uuid links to the previous one, the way a real
+   * session file grows. Reusing one uuid across turns makes the parser re-parent the tail whenever a
+   * line is appended, which is a genuine divergence — and would test the fixture, not the writer. */
+  function chained(sessionId: string, turns: number): string {
     const lines: string[] = [];
     for (let i = 0; i < turns; i++) {
-      lines.push(projectSessionLine(GROW_SESSION, '/home/tester/src/demo', `question ${i}`));
-      lines.push(ccAssistantLine({ uuid: `grow-a${i}`, parentUuid: `${GROW_SESSION}-user`, text: `answer ${i}` }));
+      const user = JSON.parse(
+        ccUserLine({ uuid: `${sessionId}-u${i}`, parentUuid: i === 0 ? null : `${sessionId}-a${i - 1}`, text: `question ${i}` }),
+      ) as { sessionId: string };
+      user.sessionId = sessionId;
+      lines.push(JSON.stringify(user));
+      const assistant = JSON.parse(
+        ccAssistantLine({ uuid: `${sessionId}-a${i}`, parentUuid: `${sessionId}-u${i}`, text: `answer ${i}` }),
+      ) as { sessionId: string };
+      assistant.sessionId = sessionId;
+      lines.push(JSON.stringify(assistant));
     }
     return lines.join('\n');
+  }
+
+  function sessionOfLength(turns: number): string {
+    return chained(GROW_SESSION, turns);
   }
 
   function captureLogs() {
@@ -1267,7 +1282,7 @@ describe('hub.d1.write_cost telemetry', () => {
     return events.filter((e) => e.event === 'hub.d1.write_cost' && e.session === GROW_SESSION);
   }
 
-  it('labels the first write initial and the append-driven re-parse a rewrite that re-writes every prior block', async () => {
+  it('retains the stored prefix when the file only grew, rewriting just the boundary block', async () => {
     const first = captureLogs();
     expect((await putFile('testbox-wsl', 'claude-projects', relpath, sessionOfLength(3))).status).toBe(201);
     await drainQueue();
@@ -1277,39 +1292,91 @@ describe('hub.d1.write_cost telemetry', () => {
     expect(initial).toBeTruthy();
     expect(initial!.write_kind).toBe('initial');
     expect(initial!.outcome).toBe('ok');
+    expect(initial!.retained_blocks).toBe(0);
     expect(initial!.prior_blocks).toBe(0);
     expect(initial!.prior_usage).toBe(0);
     const initialBlocks = initial!.blocks as number;
     expect(initialBlocks).toBeGreaterThan(0);
 
-    // The session grows by 2 turns; the file is re-uploaded whole, exactly as the collector does.
+    // The session grows by 2 turns and the whole file is re-uploaded, exactly as the collector does.
     const second = captureLogs();
     expect((await putFile('testbox-wsl', 'claude-projects', relpath, sessionOfLength(5))).status).toBe(201);
     await drainQueue();
-    const rewrite = writeCosts(second)[0];
+    const append = writeCosts(second)[0];
     vi.restoreAllMocks();
 
-    expect(rewrite).toBeTruthy();
-    expect(rewrite!.write_kind).toBe('rewrite');
-    expect(rewrite!.outcome).toBe('ok');
-    // Every block the first write stored was deleted and written again to add two turns. The event
-    // reports that count as what was DELETED, not as redundant work: on an edited transcript those
-    // rows genuinely had to go, and this event does not compare block identity to tell the difference.
-    expect(rewrite!.prior_blocks).toBe(initialBlocks);
-    expect(rewrite!.blocks as number).toBeGreaterThan(initialBlocks);
+    expect(append).toBeTruthy();
+    expect(append!.outcome).toBe('ok');
+    // 'partial', not 'append': a JSONL file's last line carries no trailing newline, so appending to
+    // the file grows that final block's byte_len by one. Exactly one stored block therefore diverges
+    // and is rewritten — every earlier one is retained.
+    expect(append!.write_kind).toBe('partial');
+    expect(append!.retained_blocks).toBe(initialBlocks - 1);
+    expect(append!.prior_blocks).toBe(1);
+    expect(append!.appended_blocks).toBe((append!.blocks as number) - initialBlocks + 1);
 
-    // The billed number itself, and its split. Asserted non-zero because `meta.rows_written` is read
-    // defensively (`?? 0`) — without this the event would still be emitted, silently reporting a
-    // free write, and the whole cost analysis downstream would read zero.
-    for (const cost of [initial!, rewrite!]) {
-      expect(cost.rows_written as number).toBeGreaterThan(0);
-      expect(cost.rows_written).toBe(
-        (cost.rows_written_clear as number) + (cost.rows_written_insert as number) + (cost.rows_written_finalize as number),
-      );
+    // The point of the exercise: adding two turns to a 3-turn session costs a fraction of rewriting it.
+    expect(append!.rows_written as number).toBeLessThan(initial!.rows_written as number);
+
+    // And the index is correct, not merely cheap: every block present exactly once, old and new alike.
+    const rows = await testEnv.DB.prepare(
+      'SELECT COUNT(*) AS n, COUNT(DISTINCT turn_index || ":" || block_index) AS distinct_positions FROM blocks WHERE session_id = ?1',
+    )
+      .bind(GROW_SESSION)
+      .first<{ n: number; distinct_positions: number }>();
+    expect(rows!.n).toBe(append!.blocks);
+    expect(rows!.distinct_positions).toBe(append!.blocks);
+    for (const needle of ['question 0', 'question 4']) {
+      const hit = await testEnv.DB.prepare(
+        'SELECT COUNT(*) AS n FROM blocks_fts JOIN blocks ON blocks.id = blocks_fts.rowid WHERE blocks_fts MATCH ?1 AND blocks.session_id = ?2',
+      )
+        .bind(`"${needle}"`, GROW_SESSION)
+        .first<{ n: number }>();
+      expect(hit!.n).toBeGreaterThan(0);
     }
-    // Clearing an already-indexed session costs rows (FTS delete + row deletes); the initial write
-    // has nothing to clear. This is the cost an append-only writer would avoid paying every 15 min.
-    expect(rewrite!.rows_written_clear as number).toBeGreaterThan(initial!.rows_written_clear as number);
+  });
+
+  it('rewrites from the first changed block when earlier content was edited in place', async () => {
+    // A re-upload is not always an append: a transcript can be edited or replaced. Identical byte
+    // offsets must NOT be enough to retain a block — the row hash is what catches this.
+    const EDITED = '88888888-7777-4666-8555-444444444444';
+    const editedPath = `-home-tester-src-demo/${EDITED}.jsonl`;
+    const original = [
+      projectSessionLine(EDITED, '/home/tester/src/demo', 'aaaa'),
+      projectSessionLine(EDITED, '/home/tester/src/demo', 'bbbb'),
+    ].join('\n');
+    // Same length, same offsets, different content in the FIRST turn.
+    const edited = [
+      projectSessionLine(EDITED, '/home/tester/src/demo', 'zzzz'),
+      projectSessionLine(EDITED, '/home/tester/src/demo', 'bbbb'),
+    ].join('\n');
+    expect(original.length).toBe(edited.length);
+
+    expect((await putFile('testbox-wsl', 'claude-projects', editedPath, original)).status).toBe(201);
+    await drainQueue();
+
+    const events = captureLogs();
+    expect((await putFile('testbox-wsl', 'claude-projects', editedPath, edited)).status).toBe(201);
+    await drainQueue();
+    const cost = events.filter((e) => e.event === 'hub.d1.write_cost' && e.session === EDITED)[0];
+    vi.restoreAllMocks();
+
+    expect(cost).toBeTruthy();
+    expect(cost!.write_kind).toBe('rewrite');
+    expect(cost!.retained_blocks).toBe(0);
+    expect(cost!.prior_blocks as number).toBeGreaterThan(0);
+
+    // The stale text is gone from both the table and the search index.
+    const stale = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1 AND text LIKE ?2')
+      .bind(EDITED, '%aaaa%')
+      .first<{ n: number }>();
+    expect(stale!.n).toBe(0);
+    const staleFts = await testEnv.DB.prepare(
+      'SELECT COUNT(*) AS n FROM blocks_fts JOIN blocks ON blocks.id = blocks_fts.rowid WHERE blocks_fts MATCH ?1 AND blocks.session_id = ?2',
+    )
+      .bind('aaaa', EDITED)
+      .first<{ n: number }>();
+    expect(staleFts!.n).toBe(0);
   });
 
   it('labels a session that had only usage rows a rewrite, not an initial write', async () => {
@@ -1359,8 +1426,9 @@ describe('hub.d1.write_cost telemetry', () => {
     expect(cost!.outcome).toBe('failed');
     // The clear batch landed before the throw, so its cost is reported; the finalize never ran.
     expect(cost!.rows_written_finalize).toBe(0);
-    // Batches ATTEMPTED, not planned: the clear batch plus the one insert chunk that threw.
-    expect(cost!.batches).toBe(2);
+    // Round trips ATTEMPTED, not planned: the prefix probe, the clear batch, and the one insert chunk
+    // that threw — not the chunks after it.
+    expect(cost!.batches).toBe(3);
     expect(cost!.rows_written as number).toBe(cost!.rows_written_clear as number);
   });
 });

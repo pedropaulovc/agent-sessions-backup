@@ -746,7 +746,8 @@ export function __setExportBudgetsForTest(o: { slice?: number; invocation?: numb
 
 /** Real per-invocation SUBREQUEST cost of writeSession WITHOUT writing (each db.batch is ONE subrequest):
  * delete batch (1) + ceil(rows/90) insert batches + machine SELECT (1) + session/FTS batch (1), where
- * rows = one per block / compaction marker / usage row. Lets the export slicer preflight a conversation. */
+ * rows = one per block / compaction marker / usage row. Lets the export slicer preflight a conversation.
+ * No prefix probe: the export call site passes retention 'off' precisely so this estimate stays exact. */
 function estimateWriteSubrequests(s: NormalizedSession): number {
   let rows = 0;
   for (const turn of s.turns) {
@@ -959,7 +960,10 @@ async function runExportParse(
       // in-flight conversation whose blocks are half-rewritten. The skip-paths above (empty / healthy live
       // capture / healthy other owner) return before this line, so they never enter `written`.
       written.add(session.id);
-      spent += await writeSession(session, file, env);
+      // 'off': an export writes each conversation once, so a prefix probe would buy nothing here — and
+      // it would add a subrequest per conversation that estimateWriteSubrequests (and the slice arithmetic
+      // built on it) would have to carry for every archive.
+      spent += await writeSession(session, file, env, 'off');
       // Cut once the query budget is spent — but only AFTER writing this conversation, so a single
       // over-budget conversation still makes progress alone rather than looping forever.
       if (spent >= EXPORT_QUERY_BUDGET) {
@@ -1801,29 +1805,42 @@ async function raiseExportRetry(
  * 1101 was fixed by BATCHING unbatched per-object writes (fewer subrequests). So cost = delete batch (1)
  * + one batch per 90-block insert chunk + machine SELECT (1) + session/FTS batch (1). See
  * memory/d1-invocation-limits.md. */
-async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Promise<number> {
+async function writeSession(
+  s: NormalizedSession,
+  file: FileRow,
+  env: Env,
+  retention: 'prefix' | 'off' = 'prefix',
+): Promise<number> {
   const db = env.DB;
 
+  const pending = buildBlockRows(s);
+  const probes = retention === 'off' || pending.length === 0 ? 0 : 1;
+  const retained = probes === 0 ? NOTHING_RETAINED : await retainablePrefix(s, file, pending, db);
+
+  // Everything from the first divergent block onward is rewritten; everything before it is left in
+  // place. `retained.count === 0` reproduces the original unconditional full rewrite exactly (`id > 0`
+  // matches every row of the session, `turn_index >= 0` every usage row), so the fallback is not a
+  // second code path to keep correct — it is this one with an empty prefix.
   const clearRes = await db.batch([
     db
       .prepare(
         `INSERT INTO blocks_fts (blocks_fts, rowid, text)
-         SELECT 'delete', id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL`,
+         SELECT 'delete', id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL AND id > ?2`,
       )
-      .bind(s.id),
-    db.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(s.id),
-    db.prepare('DELETE FROM usage WHERE session_id = ?1').bind(s.id),
+      .bind(s.id, retained.lastId),
+    db.prepare('DELETE FROM blocks WHERE session_id = ?1 AND id > ?2').bind(s.id, retained.lastId),
+    db.prepare('DELETE FROM usage WHERE session_id = ?1 AND turn_index >= ?2').bind(s.id, retained.fromTurn),
   ]);
-  // `changes` on the DELETEs is the pre-existing row count — free (no extra SELECT) and the only
-  // way to tell an initial write from a rewrite of an already-indexed session. Both deletes count:
-  // a transcript of usage-only turns (codex retains those) has usage rows and NO blocks, so keying
-  // off blocks alone would label every one of its re-parses 'initial' while it pays rewrite cost.
+  // `changes` on the DELETEs is what this write actually removed — with a retained prefix that is the
+  // divergent tail, not the whole session. Both deletes count when deciding whether the session
+  // already existed: a transcript of usage-only turns (codex retains those) has usage rows and NO
+  // blocks, so keying off blocks alone would label every one of its re-parses 'initial'.
   const priorBlocks = clearRes[1]?.meta?.changes ?? 0;
   const priorUsage = clearRes[2]?.meta?.changes ?? 0;
 
   const insertBlock = db.prepare(
-    `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, byte_start, byte_len, truncated, text, on_main_path)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`,
+    `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, byte_start, byte_len, truncated, text, on_main_path, row_hash)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)`,
   );
   const insertUsage = db.prepare(
     `INSERT INTO usage (session_id, turn_index, ts, model, service_tier, input_tokens, output_tokens, reasoning_tokens,
@@ -1834,78 +1851,61 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
        reasoning_tokens = excluded.reasoning_tokens, cache_read_tokens = excluded.cache_read_tokens`,
   );
 
-  const stmts: D1PreparedStatement[] = [];
-  let blockCount = 0;
+  // Only the divergent tail is written. Token totals still come from EVERY turn — they land on the
+  // session row, which is rewritten whole regardless of how many blocks were retained.
   const totals = { in: 0, out: 0, reasoning: 0, cached: 0 };
   for (const turn of s.turns) {
-    for (let bi = 0; bi < turn.blocks.length; bi++) {
-      const b = turn.blocks[bi]!;
-      blockCount++;
-      stmts.push(
-        insertBlock.bind(
-          s.id,
-          file.id,
-          turn.index,
-          bi,
-          turn.role,
-          b.type,
-          b.toolName ?? null,
-          turn.ts ?? null,
-          b.byteStart,
-          b.byteLen,
-          b.truncated ? 1 : 0,
-          b.text ?? null,
-          turn.onMainPath ? 1 : 0,
-        ),
-      );
-    }
-    // Blockless compaction markers (codex) still get one text-less 'compaction' row so pagination and byte
-    // windows account for the turn — otherwise a divider at a page boundary or after the last content block
-    // is silently dropped. text stays NULL, so it never enters FTS; the viewer renders the divider from the
-    // parsed turn, not this row.
-    if (turn.blocks.length === 0 && turn.compaction && turn.byteStart !== undefined && turn.byteLen !== undefined) {
-      stmts.push(
-        insertBlock.bind(
-          s.id,
-          file.id,
-          turn.index,
-          0,
-          turn.role,
-          'compaction',
-          null,
-          turn.ts ?? null,
-          turn.byteStart,
-          turn.byteLen,
-          0,
-          null,
-          turn.onMainPath ? 1 : 0,
-        ),
-      );
-    }
     const u = turn.usage;
-    if (u) {
-      totals.in += u.inputTokens ?? 0;
-      totals.out += u.outputTokens ?? 0;
-      totals.reasoning += u.reasoningTokens ?? 0;
-      totals.cached += u.cacheReadTokens ?? 0;
-      stmts.push(
-        insertUsage.bind(
-          s.id,
-          turn.index,
-          turn.ts ?? null,
-          u.model ?? null,
-          u.serviceTier ?? null,
-          u.inputTokens ?? null,
-          u.outputTokens ?? null,
-          u.reasoningTokens ?? null,
-          u.cacheCreation5mTokens ?? null,
-          u.cacheCreation1hTokens ?? null,
-          u.cacheReadTokens ?? null,
-          u.inferenceGeo ?? null,
-          u.requestId ?? null,
-        ),
-      );
-    }
+    if (!u) continue;
+    totals.in += u.inputTokens ?? 0;
+    totals.out += u.outputTokens ?? 0;
+    totals.reasoning += u.reasoningTokens ?? 0;
+    totals.cached += u.cacheReadTokens ?? 0;
+  }
+
+  const blockCount = pending.length;
+  const stmts: D1PreparedStatement[] = pending.slice(retained.count).map((b) =>
+    insertBlock.bind(
+      s.id,
+      file.id,
+      b.turnIndex,
+      b.blockIndex,
+      b.role,
+      b.btype,
+      b.toolName,
+      b.ts,
+      b.byteStart,
+      b.byteLen,
+      b.truncated,
+      b.text,
+      b.onMainPath,
+      b.rowHash,
+    ),
+  );
+  // Usage is keyed by (session_id, turn_index) and was cleared from `retained.fromTurn` on, so re-insert
+  // from that turn. The boundary turn is included rather than skipped: its blocks can be unchanged while
+  // its usage arrives later in the file (a retry writing a second assistant record for the same turn),
+  // and one extra upsert is cheaper than reasoning about which halves of a turn can still move.
+  for (const turn of s.turns) {
+    const u = turn.usage;
+    if (!u || turn.index < retained.fromTurn) continue;
+    stmts.push(
+      insertUsage.bind(
+        s.id,
+        turn.index,
+        turn.ts ?? null,
+        u.model ?? null,
+        u.serviceTier ?? null,
+        u.inputTokens ?? null,
+        u.outputTokens ?? null,
+        u.reasoningTokens ?? null,
+        u.cacheCreation5mTokens ?? null,
+        u.cacheCreation1hTokens ?? null,
+        u.cacheReadTokens ?? null,
+        u.inferenceGeo ?? null,
+        u.requestId ?? null,
+      ),
+    );
   }
 
   // Billed write cost of this one session write, split by phase. D1 meters ROWS WRITTEN, and every
@@ -1923,10 +1923,11 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
   // would blind the attribution precisely where spend is worst.
   let insertRows = 0;
   let finalizeRows = 0;
-  // Counted as batches are ATTEMPTED, not planned: on the failure path the event must describe the work
-  // that actually ran, and a large session throwing on its first chunk would otherwise report dozens of
-  // batches it never reached. The clear batch above is the one already spent when we get here.
-  let batchesRun = 1;
+  // Counted as D1 round trips are ATTEMPTED, not planned: on the failure path the event must describe
+  // the work that actually ran, and a large session throwing on its first chunk would otherwise report
+  // dozens of batches it never reached. The prefix probe (when it ran) and the clear batch are the ones
+  // already spent by the time we get here.
+  let batchesRun = 1 + probes;
   const insertChunks = chunkArr(stmts, 90);
   const emitWriteCost = (outcome: 'ok' | 'failed') =>
     console.log(
@@ -1936,8 +1937,10 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
         file_id: file.id,
         harness: s.harness,
         outcome,
-        write_kind: priorBlocks > 0 || priorUsage > 0 ? 'rewrite' : 'initial',
+        write_kind: classifyWrite(retained.count, priorBlocks, priorUsage),
         blocks: blockCount,
+        retained_blocks: retained.count,
+        appended_blocks: blockCount - retained.count,
         prior_blocks: priorBlocks,
         prior_usage: priorUsage,
         rows_written: sumRowsWritten(clearRes) + insertRows + finalizeRows,
@@ -2045,19 +2048,221 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
       db
         .prepare(
           `INSERT INTO blocks_fts (rowid, text)
-           SELECT id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL`,
+           SELECT id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL AND id > ?2`,
         )
-        .bind(s.id),
+        .bind(s.id, retained.lastId),
     ]);
 
     finalizeRows = sumRowsWritten(finalizeRes);
     emitWriteCost('ok');
 
-    // SUBREQUESTS (see the counting-model note above): delete batch (1) + one batch per 90-block insert
-    // chunk (insertChunks.length) + machine SELECT (1) + session/FTS batch (1). A db.batch of N statements
-    // is ONE subrequest, so a chatty conversation's cost grows with its BATCH count, not its statement count.
-    return 3 + insertChunks.length;
+    // SUBREQUESTS (see the counting-model note above): prefix probe (1, only when retention is on) +
+    // delete batch (1) + one batch per 90-block insert chunk (insertChunks.length) + machine SELECT (1) +
+    // session/FTS batch (1). A db.batch of N statements is ONE subrequest, so a chatty conversation's cost
+    // grows with its BATCH count, not its statement count.
+    return 3 + probes + insertChunks.length;
   }
+}
+
+/** What this write did to an existing session, as one state rather than a pile of flags:
+ * `initial` nothing was there, `append` the stored rows all survived and only new ones were added,
+ * `partial` a divergent tail was rewritten behind a retained prefix, `rewrite` nothing was retained. */
+function classifyWrite(retainedCount: number, deletedBlocks: number, deletedUsage: number): string {
+  if (retainedCount === 0 && deletedBlocks === 0 && deletedUsage === 0) return 'initial';
+  if (retainedCount === 0) return 'rewrite';
+  if (deletedBlocks === 0) return 'append';
+  return 'partial';
+}
+
+/** One row destined for `blocks`, flattened out of the turn/block nesting so it can be compared
+ * position-by-position against what is already stored. */
+interface PendingBlock {
+  turnIndex: number;
+  blockIndex: number;
+  role: string | null;
+  btype: string;
+  toolName: string | null;
+  ts: string | null;
+  byteStart: number | null;
+  byteLen: number | null;
+  truncated: number;
+  text: string | null;
+  onMainPath: number;
+  /** Fingerprint of every field above that `sameBlock` does not compare directly. */
+  rowHash: number;
+}
+
+/** Fill in the fingerprint of a row's non-positional content. Text is hashed with its length so a
+ * value cannot be confused with a differently-split neighbour. */
+function withHash(row: Omit<PendingBlock, 'rowHash'>): PendingBlock {
+  return {
+    ...row,
+    rowHash: hashBlockRow([
+      row.role,
+      row.btype,
+      row.toolName,
+      row.ts,
+      row.truncated,
+      row.onMainPath,
+      row.text === null ? null : row.text.length,
+      row.text,
+    ]),
+  };
+}
+
+/** The `blocks` rows a parsed session implies, in insert order. */
+function buildBlockRows(s: NormalizedSession): PendingBlock[] {
+  const rows: PendingBlock[] = [];
+  for (const turn of s.turns) {
+    for (let bi = 0; bi < turn.blocks.length; bi++) {
+      const b = turn.blocks[bi]!;
+      rows.push(
+        withHash({
+          turnIndex: turn.index,
+          blockIndex: bi,
+          role: turn.role,
+          btype: b.type,
+          toolName: b.toolName ?? null,
+          ts: turn.ts ?? null,
+          byteStart: b.byteStart,
+          byteLen: b.byteLen,
+          truncated: b.truncated ? 1 : 0,
+          text: b.text ?? null,
+          onMainPath: turn.onMainPath ? 1 : 0,
+        }),
+      );
+    }
+    // Blockless compaction markers (codex) still get one text-less 'compaction' row so pagination and byte
+    // windows account for the turn — otherwise a divider at a page boundary or after the last content block
+    // is silently dropped. text stays NULL, so it never enters FTS; the viewer renders the divider from the
+    // parsed turn, not this row.
+    if (turn.blocks.length === 0 && turn.compaction && turn.byteStart !== undefined && turn.byteLen !== undefined) {
+      rows.push(
+        withHash({
+          turnIndex: turn.index,
+          blockIndex: 0,
+          role: turn.role,
+          btype: 'compaction',
+          toolName: null,
+          ts: turn.ts ?? null,
+          byteStart: turn.byteStart,
+          byteLen: turn.byteLen,
+          truncated: 0,
+          text: null,
+          onMainPath: turn.onMainPath ? 1 : 0,
+        }),
+      );
+    }
+  }
+  return rows;
+}
+
+/** Stored blocks are read whole to find the prefix, so cap what a single probe will pull into memory.
+ * The largest session observed in prod is ~7.5k blocks; past this the write falls back to a full
+ * rewrite rather than materialising an unbounded result set. */
+const PREFIX_PROBE_MAX_BLOCKS = 20_000;
+
+interface RetainedPrefix {
+  /** How many leading rows of `pending` are already stored, unchanged. */
+  count: number;
+  /** Highest `blocks.id` among them: the write deletes `id > lastId` and FTS-inserts `id > lastId`. */
+  lastId: number;
+  /** First turn whose usage rows are re-inserted. */
+  fromTurn: number;
+}
+
+const NOTHING_RETAINED: RetainedPrefix = { count: 0, lastId: 0, fromTurn: 0 };
+
+/** How much of an already-indexed session this write can leave alone.
+ *
+ * The collector re-uploads a live session file on every scan, so most writes differ from what is
+ * stored only by a handful of appended turns — but the writer used to delete and re-insert every
+ * block (and every FTS shadow row) to add them, which is the single largest source of billed rows
+ * written. This finds the longest leading run of `pending` that matches what is stored, so the
+ * caller can rewrite only the tail.
+ *
+ * Every mismatch — a different canonical file, a parser bump, a retroactively re-parented turn, an
+ * edited transcript, out-of-order rowids — returns a shorter prefix (0 in the limit), and a shorter
+ * prefix is always SAFE: it just rewrites more, ending at the original full-rewrite behaviour. */
+async function retainablePrefix(
+  s: NormalizedSession,
+  file: FileRow,
+  pending: PendingBlock[],
+  db: D1Database,
+): Promise<RetainedPrefix> {
+  if (pending.length === 0) return NOTHING_RETAINED;
+
+  const storedRes = await db
+    .prepare(
+      `SELECT id, file_id, turn_index, block_index, byte_start, byte_len, row_hash
+       FROM blocks WHERE session_id = ?1 ORDER BY turn_index, block_index LIMIT ?2`,
+    )
+    .bind(s.id, PREFIX_PROBE_MAX_BLOCKS + 1)
+    .all<StoredBlock>();
+
+  const stored = storedRes.results ?? [];
+  if (stored.length === 0 || stored.length > PREFIX_PROBE_MAX_BLOCKS) return NOTHING_RETAINED;
+
+  let count = 0;
+  let lastId = 0;
+  while (count < stored.length && count < pending.length) {
+    const a = stored[count]!;
+    const b = pending[count]!;
+    if (!sameBlock(a, b, file.id)) break;
+    // The tail is deleted by `id > lastId`, which only removes everything after the prefix if ids
+    // ascend in this order. They do when a session was written in one pass, but a session assembled
+    // by an older/partial write need not be that tidy — so verify rather than assume.
+    if (a.id <= lastId) return NOTHING_RETAINED;
+    lastId = a.id;
+    count++;
+  }
+
+  if (count === 0) return NOTHING_RETAINED;
+  // Re-insert usage from the boundary turn on (see the call site for why it is inclusive).
+  const boundary = pending[Math.min(count, pending.length - 1)]!;
+  return { count, lastId, fromTurn: boundary.turnIndex };
+}
+
+interface StoredBlock {
+  id: number;
+  file_id: number;
+  turn_index: number;
+  block_index: number;
+  byte_start: number | null;
+  byte_len: number | null;
+  row_hash: number;
+}
+
+/** Whether a stored row and a freshly parsed one are the same block, of the same file, holding the
+ * same content. Position and offsets are compared directly; everything else the row carries — role,
+ * type, tool name, timestamp, truncation, main-path flag, and the indexed text itself — is folded
+ * into `row_hash`, so a transcript that changed underneath identical offsets does NOT match. */
+function sameBlock(a: StoredBlock, b: PendingBlock, fileId: number): boolean {
+  return (
+    a.file_id === fileId &&
+    a.turn_index === b.turnIndex &&
+    a.block_index === b.blockIndex &&
+    a.byte_start === b.byteStart &&
+    a.byte_len === b.byteLen &&
+    a.row_hash === b.rowHash
+  );
+}
+
+/** 53-bit content fingerprint of a block row: two independently seeded FNV-1a passes over the same
+ * string, packed into one integer SQLite stores exactly. Not cryptographic — it defends against
+ * accidental collision between two versions of the same block, not against a crafted one — and never
+ * returns 0, which is the migration's default for rows written before hashing existed. */
+function hashBlockRow(parts: Array<string | number | null>): number {
+  const s = parts.map((p) => (p === null ? '\u0000' : String(p))).join('\u0001');
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ c, 0x85ebca6b) >>> 0;
+  }
+  const packed = h1 * 0x200000 + (h2 >>> 11);
+  return packed === 0 ? 1 : packed;
 }
 
 /** Billed rows written by one `db.batch()`, summed across its statements. `meta.rows_written` counts
