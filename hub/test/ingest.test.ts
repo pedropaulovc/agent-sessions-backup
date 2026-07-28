@@ -1399,42 +1399,72 @@ describe('hub.d1.write_cost telemetry', () => {
     expect(cost!.write_kind).toBe('rewrite');
   });
 
-  it('retains nothing when the stored blocks do not match the last completed write', async () => {
-    // A write commits its insert chunks one batch at a time and only adds them to blocks_fts in the
-    // FINAL batch — the same batch that stores block_count. A write that dies in between leaves blocks
-    // with no FTS rows, and those blocks match the next parse perfectly, so retaining them would skip
-    // them in the FTS rebuild (`id > lastId`) and leave them unsearchable in a session marked ready.
-    // Retention therefore requires the stored block count to equal the recorded one.
+  it('recovers from a write torn between committing blocks and indexing them', async () => {
+    // A transient failure between a committed insert chunk and the trailing FTS insert used to leave
+    // blocks the index never saw. Retaining a prefix is what makes that dangerous: those blocks match
+    // the next parse exactly, so it would retain them and never index them, leaving content silently
+    // unsearchable in a session marked ready. (The unconditional rewrite this replaced healed the state
+    // on every retry, so the hazard arrives with retention.) Each chunk now indexes its own rows in its
+    // own batch, so a torn write leaves a shorter but consistent session the next parse completes.
     //
-    // The torn state is simulated by moving block_count rather than by tearing a real write: a real
-    // torn write leaves blocks that FTS never indexed, and deleting those throws SQLITE_CORRUPT_VTAB
-    // on the next parse — a pre-existing failure (reproduced on main, independent of this change)
-    // that is fixed separately. This test pins the guard, which is what this change owns.
+    // NOTE for anyone reading a failure here: miniflare and real D1 diverge on the FTS 'delete' command
+    // for a rowid the index never received. Real D1 no-ops (verified against sessions-index-preview:
+    // the delete succeeds, integrity-check passes, the row simply stays unindexed); miniflare throws
+    // SQLITE_CORRUPT_VTAB. Neither behaviour is what this test pins — it pins that the state does not
+    // arise in the first place.
     const TORN = '55555555-4444-4333-8222-111111111111';
     const tornPath = `-home-tester-src-demo/${TORN}.jsonl`;
-    expect((await putFile('testbox-wsl', 'claude-projects', tornPath, chained(TORN, 3))).status).toBe(201);
-    await drainQueue();
+    const content = chained(TORN, 60); // > 90 statements, so the write spans several insert chunks
 
-    // POSITIVE CONTROL: unmolested, this same re-parse retains its prefix (see the growth test above).
-    await testEnv.DB.prepare('UPDATE sessions SET block_count = block_count + 5 WHERE session_id = ?1').bind(TORN).run();
+    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+    let insertChunks = 0;
+    const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementation((stmts: D1PreparedStatement[]) => {
+      const sql = (stmts[0] as unknown as { statement?: string }).statement ?? '';
+      if (sql.startsWith('INSERT INTO blocks ')) {
+        insertChunks++;
+        if (insertChunks === 2) throw new Error('D1_ERROR: simulated torn write');
+      }
+      return realBatch(stmts);
+    });
+    try {
+      expect((await putFile('testbox-wsl', 'claude-projects', tornPath, content)).status).toBe(201);
+      await drainQueue();
+    } finally {
+      spy.mockRestore();
+    }
+    // POSITIVE CONTROL: the torn write really did commit a chunk before dying...
+    const partial = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
+      .bind(TORN)
+      .first<{ n: number }>();
+    expect(partial!.n).toBeGreaterThan(0);
+    expect(partial!.n).toBeLessThan(120);
+    // ...and what it did commit is INDEXED, which is the invariant that makes recovery possible.
+    const partialSearchable = await testEnv.DB.prepare(
+      'SELECT COUNT(*) AS n FROM blocks_fts JOIN blocks ON blocks.id = blocks_fts.rowid WHERE blocks_fts MATCH ?1 AND blocks.session_id = ?2',
+    )
+      .bind('question', TORN)
+      .first<{ n: number }>();
+    expect(partialSearchable!.n).toBeGreaterThan(0);
 
-    const events = captureLogs();
-    expect((await putFile('testbox-wsl', 'claude-projects', tornPath, chained(TORN, 4))).status).toBe(201);
+    // Retry the parse, exactly as the queue would.
+    const retryLogs = captureLogs();
+    await testEnv.DB.prepare("UPDATE files SET parse_state = 'pending' WHERE session_id = ?1").bind(TORN).run();
     await drainQueue();
-    const cost = events.filter((e) => e.event === 'hub.d1.write_cost' && e.session === TORN)[0];
+    const errors = retryLogs.filter((e) => String(e.event).includes('error'));
     vi.restoreAllMocks();
 
-    expect(cost).toBeTruthy();
-    expect(cost!.retained_blocks).toBe(0);
-    expect(cost!.write_kind).toBe('rewrite');
-
-    // And the rewrite left a complete, searchable index.
+    // No SQLITE_CORRUPT_VTAB, and the session is complete and fully searchable.
+    expect(errors).toEqual([]);
+    const rows = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
+      .bind(TORN)
+      .first<{ n: number }>();
     const searchable = await testEnv.DB.prepare(
       'SELECT COUNT(*) AS n FROM blocks_fts JOIN blocks ON blocks.id = blocks_fts.rowid WHERE blocks_fts MATCH ?1 AND blocks.session_id = ?2',
     )
       .bind('question', TORN)
       .first<{ n: number }>();
-    expect(searchable!.n).toBe(4);
+    expect(rows!.n).toBe(120);
+    expect(searchable!.n).toBe(60); // one 'question N' block per turn, every one indexed
   });
 
   it('refreshes usage on a retained turn when a late token_count attaches to it (codex)', async () => {

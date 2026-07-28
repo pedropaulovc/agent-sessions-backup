@@ -1830,14 +1830,15 @@ async function writeSession(
       )
       .bind(s.id, retained.lastId),
     db.prepare('DELETE FROM blocks WHERE session_id = ?1 AND id > ?2').bind(s.id, retained.lastId),
-    usageDelete(db, s.id, retained, pendingUsage),
+    ...usageDeletes(db, s.id, retained, pendingUsage),
   ]);
   // `changes` on the DELETEs is what this write actually removed — with a retained prefix that is the
   // divergent tail, not the whole session. Both deletes count when deciding whether the session
   // already existed: a transcript of usage-only turns (codex retains those) has usage rows and NO
   // blocks, so keying off blocks alone would label every one of its re-parses 'initial'.
   const priorBlocks = clearRes[1]?.meta?.changes ?? 0;
-  const priorUsage = clearRes[2]?.meta?.changes ?? 0;
+  // The usage deletes are a variable-length tail of the batch (chunked under the parameter cap).
+  const priorUsage = clearRes.slice(2).reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
 
   const insertBlock = db.prepare(
     `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, byte_start, byte_len, truncated, text, on_main_path, row_hash)
@@ -1870,7 +1871,8 @@ async function writeSession(
   }
 
   const blockCount = pending.length;
-  const stmts: D1PreparedStatement[] = pending.slice(retained.count).map((b) =>
+  const newBlocks = pending.slice(retained.count);
+  const blockStmts: D1PreparedStatement[] = newBlocks.map((b) =>
     insertBlock.bind(
       s.id,
       file.id,
@@ -1892,10 +1894,11 @@ async function writeSession(
   // `token_count` to the PRECEDING assistant turn, so a re-upload can change an earlier turn's tokens
   // while every block stays byte-identical. Deriving the usage boundary from the retained blocks would
   // silently keep that stale row. When the probe did not run (export), every row is rewritten as before.
+  const usageStmts: D1PreparedStatement[] = [];
   for (const u of pendingUsage) {
     const stored = retained.usage?.get(u.turnIndex);
     if (stored && sameUsage(stored, u)) continue;
-    stmts.push(
+    usageStmts.push(
       insertUsage.bind(
         s.id,
         u.turnIndex,
@@ -1927,6 +1930,40 @@ async function writeSession(
   // and any completed insert chunks have ALREADY been billed by the time a later chunk throws, and the
   // queue retries the whole write — so dropping the event exactly when writes are being repeated
   // would blind the attribution precisely where spend is worst.
+  // Each chunk of block inserts carries the FTS insert for EXACTLY those rows, in the same batch.
+  // db.batch is a transaction (verified: a failing statement rolls the whole batch back), so this makes
+  // "committed implies indexed" an invariant of every batch.
+  //
+  // Retaining a prefix is what makes that invariant necessary. A write that dies between a committed
+  // chunk and a single trailing FTS insert leaves blocks the index never saw; those blocks match the
+  // next parse exactly, so it would RETAIN them, and nothing would ever index them — silently
+  // unsearchable content in a session marked ready. The unconditional rewrite this replaced healed that
+  // on every retry, so the hazard arrives with retention rather than predating it.
+  //
+  // Detecting the state afterwards is not an option: `EXISTS (SELECT 1 FROM blocks_fts WHERE rowid = ?)`
+  // returns 1 for a never-indexed row (verified against real D1), because a rowid lookup on an
+  // external-content table is answered from the content table, not the index.
+  //
+  // Chunks are contiguous in (turn_index, block_index), and the clear batch already removed anything that
+  // previously occupied those positions, so the range predicate matches precisely this chunk's rows.
+  const insertChunks: D1PreparedStatement[][] = chunkArr(blockStmts, 90).map((chunk, i) => {
+    const first = newBlocks[i * 90]!;
+    const last = newBlocks[Math.min(i * 90 + chunk.length, newBlocks.length) - 1]!;
+    return [
+      ...chunk,
+      db
+        .prepare(
+          `INSERT INTO blocks_fts (rowid, text)
+           SELECT id, text FROM blocks
+           WHERE session_id = ?1 AND text IS NOT NULL
+             AND (turn_index > ?2 OR (turn_index = ?2 AND block_index >= ?3))
+             AND (turn_index < ?4 OR (turn_index = ?4 AND block_index <= ?5))`,
+        )
+        .bind(s.id, first.turnIndex, first.blockIndex, last.turnIndex, last.blockIndex),
+    ];
+  });
+  insertChunks.push(...chunkArr(usageStmts, 90));
+
   let insertRows = 0;
   let finalizeRows = 0;
   // Counted as D1 round trips are ATTEMPTED, not planned: on the failure path the event must describe
@@ -1934,7 +1971,6 @@ async function writeSession(
   // dozens of batches it never reached. The prefix probe (when it ran) and the clear batch are the ones
   // already spent by the time we get here.
   let batchesRun = 1 + probes;
-  const insertChunks = chunkArr(stmts, 90);
   const emitWriteCost = (outcome: 'ok' | 'failed') =>
     console.log(
       JSON.stringify({
@@ -2051,12 +2087,6 @@ async function writeSession(
           totals.cached,
           firstInteractionTitle,
         ),
-      db
-        .prepare(
-          `INSERT INTO blocks_fts (rowid, text)
-           SELECT id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL AND id > ?2`,
-        )
-        .bind(s.id, retained.lastId),
     ]);
 
     finalizeRows = sumRowsWritten(finalizeRes);
@@ -2197,14 +2227,13 @@ async function retainablePrefix(
   pending: PendingBlock[],
   db: D1Database,
 ): Promise<RetainedPrefix> {
-  const [blocksRes, sessionRes, usageRes] = await db.batch([
+  const [blocksRes, usageRes] = await db.batch([
     db
       .prepare(
         `SELECT id, file_id, turn_index, block_index, byte_start, byte_len, row_hash
          FROM blocks WHERE session_id = ?1 ORDER BY turn_index, block_index LIMIT ?2`,
       )
       .bind(s.id, PREFIX_PROBE_MAX_BLOCKS + 1),
-    db.prepare('SELECT block_count FROM sessions WHERE session_id = ?1').bind(s.id),
     db
       .prepare(
         `SELECT turn_index, ts, model, service_tier, input_tokens, output_tokens, reasoning_tokens,
@@ -2221,16 +2250,11 @@ async function retainablePrefix(
   const stored = (blocksRes?.results ?? []) as StoredBlock[];
   if (stored.length === 0 || stored.length > PREFIX_PROBE_MAX_BLOCKS) return { ...NOTHING_RETAINED, usage };
 
-  // Retain nothing unless the stored blocks are exactly what the last COMPLETED write left behind.
-  // A write commits its insert chunks one batch at a time and only indexes them in the final batch —
-  // the same batch that stores block_count — so a write that died in between leaves blocks with no FTS
-  // rows. Those blocks match `pending` perfectly, so they would be retained and then skipped by the
-  // FTS rebuild (`id > lastId`), leaving them permanently unsearchable in a session marked ready.
-  // Comparing against the recorded block_count spots that torn state and rewrites the session whole,
-  // which is exactly how the unconditional rewrite used to heal it.
-  const storedCount = (sessionRes?.results?.[0] as { block_count?: number | null } | undefined)?.block_count;
-  if (storedCount !== stored.length) return { ...NOTHING_RETAINED, usage };
-
+  // No write-completeness check is needed here, and none would be sound: a torn write can leave the
+  // same number of blocks it started with (all replacement chunks commit, the final batch fails), so
+  // counting rows cannot prove a write finished. Instead every batch indexes what it inserts, so any
+  // committed block is an indexed block, and a half-finished write leaves a SHORTER but perfectly
+  // consistent session — whose blocks match this parse's prefix and whose missing tail is appended here.
   let count = 0;
   let lastId = 0;
   while (count < stored.length && count < pending.length) {
@@ -2251,15 +2275,21 @@ async function retainablePrefix(
 
 /** The usage rows this write must REMOVE. With a probe, that is only the turns that no longer exist
  * (a shrunken transcript) — unchanged rows are left alone and changed ones are replaced by the upsert.
- * Without one, it is every row of the session, which is what the writer always did. */
-function usageDelete(db: D1Database, sessionId: string, retained: RetainedPrefix, pending: PendingUsage[]): D1PreparedStatement {
-  if (retained.usage === null) return db.prepare('DELETE FROM usage WHERE session_id = ?1').bind(sessionId);
+ * Without one, it is every row of the session, which is what the writer always did.
+ *
+ * Returns a LIST because D1 binds at most 100 parameters per statement: a transcript that lost 100+
+ * usage-bearing turns would otherwise blow the limit and fail the whole clear batch, turning an edited
+ * transcript into a parse error instead of a reindex. */
+function usageDeletes(db: D1Database, sessionId: string, retained: RetainedPrefix, pending: PendingUsage[]): D1PreparedStatement[] {
+  if (retained.usage === null) return [db.prepare('DELETE FROM usage WHERE session_id = ?1').bind(sessionId)];
   const live = new Set(pending.map((u) => u.turnIndex));
   const gone = [...retained.usage.keys()].filter((t) => !live.has(t));
-  if (gone.length === 0) return db.prepare('DELETE FROM usage WHERE session_id = ?1 AND 0').bind(sessionId);
-  return db
-    .prepare(`DELETE FROM usage WHERE session_id = ?1 AND turn_index IN (${gone.map(() => '?').join(', ')})`)
-    .bind(sessionId, ...gone);
+  // 90 turn indexes + the session id stays under the 100-parameter cap, matching the insert chunk size.
+  return chunkArr(gone, 90).map((batch) =>
+    db
+      .prepare(`DELETE FROM usage WHERE session_id = ?1 AND turn_index IN (${batch.map(() => '?').join(', ')})`)
+      .bind(sessionId, ...batch),
+  );
 }
 
 /** A usage row as stored, for diffing against the parsed turns. */
