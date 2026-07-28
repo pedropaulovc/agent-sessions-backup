@@ -1276,8 +1276,9 @@ describe('hub.d1.write_cost telemetry', () => {
 
     expect(initial).toBeTruthy();
     expect(initial!.write_kind).toBe('initial');
+    expect(initial!.outcome).toBe('ok');
     expect(initial!.prior_blocks).toBe(0);
-    expect(initial!.rewritten_blocks).toBe(0);
+    expect(initial!.prior_usage).toBe(0);
     const initialBlocks = initial!.blocks as number;
     expect(initialBlocks).toBeGreaterThan(0);
 
@@ -1290,10 +1291,12 @@ describe('hub.d1.write_cost telemetry', () => {
 
     expect(rewrite).toBeTruthy();
     expect(rewrite!.write_kind).toBe('rewrite');
+    expect(rewrite!.outcome).toBe('ok');
+    // Every block the first write stored was deleted and written again to add two turns. The event
+    // reports that count as what was DELETED, not as redundant work: on an edited transcript those
+    // rows genuinely had to go, and this event does not compare block identity to tell the difference.
     expect(rewrite!.prior_blocks).toBe(initialBlocks);
     expect(rewrite!.blocks as number).toBeGreaterThan(initialBlocks);
-    // The redundant part: every block the first write already stored is deleted and written again.
-    expect(rewrite!.rewritten_blocks).toBe(initialBlocks);
 
     // The billed number itself, and its split. Asserted non-zero because `meta.rows_written` is read
     // defensively (`?? 0`) — without this the event would still be emitted, silently reporting a
@@ -1307,5 +1310,55 @@ describe('hub.d1.write_cost telemetry', () => {
     // Clearing an already-indexed session costs rows (FTS delete + row deletes); the initial write
     // has nothing to clear. This is the cost an append-only writer would avoid paying every 15 min.
     expect(rewrite!.rows_written_clear as number).toBeGreaterThan(initial!.rows_written_clear as number);
+  });
+
+  it('labels a session that had only usage rows a rewrite, not an initial write', async () => {
+    // A codex transcript of usage-only turns indexes usage rows and NO blocks. Keying write_kind off
+    // the block count alone would call every one of its re-parses 'initial' while it pays the full
+    // delete-and-reinsert cost of its usage rows, which rows_written already includes.
+    const USAGE_ONLY = '77777777-6666-4555-8444-333333333333';
+    await testEnv.DB.prepare('INSERT INTO usage (session_id, turn_index, input_tokens) VALUES (?1, 0, 5)').bind(USAGE_ONLY).run();
+
+    const events = captureLogs();
+    const line = projectSessionLine(USAGE_ONLY, '/home/tester/src/demo', 'first real content');
+    expect((await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${USAGE_ONLY}.jsonl`, line)).status).toBe(201);
+    await drainQueue();
+    const cost = events.filter((e) => e.event === 'hub.d1.write_cost' && e.session === USAGE_ONLY)[0];
+    vi.restoreAllMocks();
+
+    expect(cost).toBeTruthy();
+    expect(cost!.prior_blocks).toBe(0);
+    expect(cost!.prior_usage).toBe(1);
+    expect(cost!.write_kind).toBe('rewrite');
+  });
+
+  it('still reports the rows it already paid for when a later batch throws', async () => {
+    // The clear batch and any completed insert chunks are billed before a later chunk fails, and the
+    // queue retries the whole write — so the failure path is exactly where attribution matters most.
+    const FAILING = '66666666-5555-4444-8333-222222222222';
+    const events = captureLogs();
+    // Fail the block-insert chunk specifically: the clear batch has landed (and been billed) by then,
+    // which is the exact shape of a partially-paid-for write.
+    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+    const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementation((stmts: D1PreparedStatement[]) => {
+      const sql = (stmts[0] as unknown as { statement?: string }).statement ?? '';
+      if (sql.startsWith('INSERT INTO blocks ')) throw new Error('D1_ERROR: simulated mid-write failure');
+      return realBatch(stmts);
+    });
+    try {
+      const line = projectSessionLine(FAILING, '/home/tester/src/demo', 'content that fails mid-write');
+      expect((await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${FAILING}.jsonl`, line)).status).toBe(201);
+      await drainQueue();
+    } finally {
+      spy.mockRestore();
+    }
+    const cost = events.filter((e) => e.event === 'hub.d1.write_cost' && e.session === FAILING)[0];
+    vi.restoreAllMocks();
+
+    expect(cost).toBeTruthy();
+    expect(cost!.outcome).toBe('failed');
+    // The clear batch landed before the throw, so its cost is reported; the finalize never ran.
+    expect(cost!.rows_written_finalize).toBe(0);
+    expect(cost!.rows_written as number).toBe(cost!.rows_written_clear as number);
   });
 });
