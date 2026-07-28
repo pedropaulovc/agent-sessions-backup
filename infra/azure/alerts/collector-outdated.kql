@@ -1,0 +1,55 @@
+// Fires when any machine is running a collector build the hub does not expect —
+// an older version, a newer one, or none reported at all.
+//
+// Source: the hub watchdog cron (*/15) emits one log per machine in the D1
+// `machines` roster (hub/src/cron/watchdog.ts):
+//   { event: "hub.machine.health", machine: <id>, collector_version: <v|null>,
+//     expected_collector_version: <v>, collector_state: "current"|"outdated", ... }
+// Workers observability ships it to Log Analytics OTelLogs (Body = that JSON) —
+// same path/column as missed-heartbeat.kql.
+//
+// The comparison is done in the HUB, not here. A version literal in this file
+// would have to be hand-edited AND the alert re-applied (infra/azure/provision.sh
+// does not run on merge — see memory/alert-kql-manual-apply.md) on every collector
+// bump, so it would drift silently and this alert would grade the fleet against a
+// version nobody is shipping. `collector_state` is computed against
+// EXPECTED_COLLECTOR_VERSION, which a unit test pins to collector/pyproject.toml.
+//
+// A null/absent collector_version is reported as 'outdated' by the hub on purpose:
+// a machine that never told us its version is not a machine known to be current.
+//
+// Takes the LATEST report per machine (arg_max) so a machine that has since been
+// updated stops firing on the next watchdog pass rather than on window expiry. A
+// 1h window comfortably contains several */15 emissions.
+//
+// This alert is deliberately NOT a dead-man's switch: a machine that stops
+// heartbeating entirely is missed-heartbeat.kql's job, and a silent pipeline is
+// covered by its __pipeline_silent__ row. Duplicating that here would double-page
+// on one incident — and it WOULD have, because the watchdog iterates the roster and
+// keeps emitting health rows for a machine that is long dead. So an outdated machine
+// is dropped here once it passes the same 72h tolerance missed-heartbeat thresholds
+// on, handing the incident over rather than paging alongside it.
+//
+// A NULL age is deliberately NOT dropped: missed-heartbeat thresholds on
+// `age_seconds > 72h`, which null never satisfies, so a machine that has never
+// checked in at all would otherwise be covered by neither alert.
+
+// `otel` wraps OTelLogs in `union isfuzzy=true` so a missing table (before the
+// first OTLP log lands) degrades to empty instead of erroring the whole rule —
+// see missed-heartbeat.kql's "Missing-table guard" note for the full rationale.
+let otel = union isfuzzy=true
+    (datatable(TimeGenerated:datetime, Body:string)[]),
+    (OTelLogs | project TimeGenerated, Body);
+otel
+| where TimeGenerated > ago(1h)
+| extend body = todynamic(Body)
+| where body.event == "hub.machine.health"
+| extend machine = tostring(body.machine),
+         collector_version = tostring(body.collector_version),
+         expected_collector_version = tostring(body.expected_collector_version),
+         collector_state = tostring(body.collector_state),
+         heartbeat_age_seconds = tolong(body.heartbeat_age_seconds)
+| summarize arg_max(TimeGenerated, collector_version, expected_collector_version, collector_state, heartbeat_age_seconds) by machine
+| where collector_state == "outdated"
+| where isnull(heartbeat_age_seconds) or heartbeat_age_seconds <= 72 * 3600
+| project TimeGenerated, machine, collector_version, expected_collector_version, heartbeat_age_seconds

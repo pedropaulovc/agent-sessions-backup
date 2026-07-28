@@ -24,6 +24,8 @@
 // These console.log lines ride Cloudflare Workers observability → the
 // sessions-telemetry-gateway → Azure Monitor OTelLogs (see infra/cf/telemetry.md).
 
+import { EXPECTED_COLLECTOR_VERSION } from '../collector-version';
+
 interface HealthRow {
   row_kind: 'machine' | 'fleet';
   machine_id: string | null;
@@ -157,6 +159,12 @@ export async function runWatchdog(env: Env): Promise<void> {
           machine: m.machine_id,
           os: m.os,
           collector_version: m.collector_version,
+          // Emitted alongside the reported version, and compared HERE rather than in the alert's KQL:
+          // a version literal in KQL would have to be edited (and the alert re-applied by hand) on
+          // every collector bump, so it would drift silently. `null` is 'outdated' too — a collector
+          // that never reported a version is not a collector known to be current.
+          expected_collector_version: EXPECTED_COLLECTOR_VERSION,
+          collector_state: m.collector_version === EXPECTED_COLLECTOR_VERSION ? 'current' : 'outdated',
           last_seen_at: m.last_seen_at,
           last_upload_at: m.last_upload_at,
           heartbeat_age_seconds: m.heartbeat_age_seconds,

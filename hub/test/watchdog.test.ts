@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { env } from 'cloudflare:test';
 import { runWatchdog } from '../src/cron/watchdog';
+import { EXPECTED_COLLECTOR_VERSION } from '../src/collector-version';
 
 // runWatchdog only touches env.DB, so a hand-rolled stub exercises every branch
 // without the workers D1. `prepare` dispatches on the SQL: the machines roster
@@ -210,6 +211,29 @@ describe('watchdog', () => {
     expect(events.some((e) => e.event === 'hub.machine.health')).toBe(false);
     expect(events.some((e) => e.event === 'hub.fleet.health')).toBe(false);
     expect(events.some((e) => e.event === 'hub.watchdog.warn' && e.tag === 'machines-roster-unavailable')).toBe(true);
+  });
+
+  it('reports each machine against the expected collector version', async () => {
+    // The comparison lives here rather than in the alert's KQL: a version literal in KQL would need a
+    // hand-edit plus a manual re-apply on every collector bump, and would drift silently instead.
+    const events = captureLogs();
+    await runWatchdog(
+      makeEnv({
+        machines: [
+          { machine_id: 'current-box', collector_version: EXPECTED_COLLECTOR_VERSION, heartbeat_age_seconds: 60 },
+          { machine_id: 'stale-box', collector_version: '0.0.1', heartbeat_age_seconds: 60 },
+          { machine_id: 'silent-box', collector_version: null, heartbeat_age_seconds: 60 },
+        ],
+      }),
+    );
+    const health = events.filter((e) => e.event === 'hub.machine.health');
+    const stateOf = (machine: string) => health.find((e) => e.machine === machine)?.collector_state;
+
+    expect(stateOf('current-box')).toBe('current');
+    expect(stateOf('stale-box')).toBe('outdated');
+    // A collector that never reported a version is not a collector known to be current.
+    expect(stateOf('silent-box')).toBe('outdated');
+    expect(health.every((e) => e.expected_collector_version === EXPECTED_COLLECTOR_VERSION)).toBe(true);
   });
 
   it('emits a bytes:-1 sentinel + warn when the size probe throws (e.g. SQLITE_AUTH)', async () => {

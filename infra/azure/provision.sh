@@ -351,6 +351,7 @@ alert_window_for() {
         d1-size) echo "1h" ;;
         cf-auth-failed) echo "1h" ;;
         cert-orphan-leaked) echo "1h" ;;
+        collector-outdated) echo "1h" ;;
         parse-errors) echo "15m" ;;
         *) echo "15m" ;;
     esac
