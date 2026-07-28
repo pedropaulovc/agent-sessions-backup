@@ -1,6 +1,6 @@
 ---
 name: alert-kql-manual-apply
-description: Azure alert KQL in infra/azure/alerts/*.kql does NOT auto-deploy on merge — apply it by hand (provision.sh or a surgical az update) or prod keeps evaluating the stale query
+description: Azure alert KQL in infra/azure/alerts/*.kql does NOT auto-deploy on merge — apply by hand (provision.sh, or az create for a NEW alert / az update for an edited one), else prod evaluates a stale query or no query at all
 metadata:
   type: project
 ---
@@ -11,6 +11,15 @@ Same class of gap as [[deploy-migrations-gap]]: nothing in CI or Workers Builds 
 changes to Azure. The Scheduled Query Alert keeps evaluating whatever KQL was last applied until
 someone re-runs provisioning or updates it directly. So a merged alert fix is a no-op in prod until
 you apply it.
+
+**A NEW .kql file is worse than an edited one: it does not exist in Azure at all.** Adding
+`alerts/foo.kql` and merging creates nothing — the repo then *reads* as if the monitor exists while
+nothing is watching. Confirmed 2026-07-28: `cert-orphan-leaked` and `cf-auth-failed` had .kql files
+but no Azure alert, so nobody had run provisioning since they were added. Reconcile with:
+```
+diff <(az monitor scheduled-query list -g rg-agent-backup --query "[].name" -o tsv | sort) \
+     <(ls infra/azure/alerts/*.kql | xargs -n1 basename | sed 's/.kql//;s/^/agent-backup-/' | sort)
+```
 
 **Apply the whole set** (idempotent; updates every alert on drift — also touches federated creds,
 role assignments, action groups):
@@ -27,6 +36,20 @@ az monitor scheduled-query update \
   --condition-query Placeholder_1="$(cat infra/azure/alerts/<base>.kql)" \
   --skip-query-validation true
 ```
+**Creating a NEW alert** needs `create`, not `update` (update fails on a nonexistent alert), and
+unlike update it needs the scope/location/severity/action-group too — values used 2026-07-28:
+```
+az monitor scheduled-query create --name agent-backup-<base> --resource-group rg-agent-backup \
+  --scopes "$(az monitor log-analytics workspace show -g rg-agent-backup -n law-agent-backup --query id -o tsv)" \
+  --location westus2 --condition "count 'Placeholder_1' > 0" \
+  --condition-query Placeholder_1="$(cat infra/azure/alerts/<base>.kql)" \
+  --evaluation-frequency 1h --window-size 1h --severity 2 \
+  --action-groups "$(az monitor action-group list -g rg-agent-backup --query '[0].id' -o tsv)" \
+  --skip-query-validation true
+```
+Add the alert's window to `alert_window_for()` in provision.sh too, or the next full provision run
+silently regrades it to the 15m default.
+
 `<base>` = the .kql basename (e.g. `parse-errors` → alert `agent-backup-parse-errors`). The shared
 `count 'Placeholder_1' > 0` condition is generic across all alerts, so any summarize/threshold logic
 must live INSIDE the .kql (emit a row only when it should fire). `--skip-query-validation` because the
