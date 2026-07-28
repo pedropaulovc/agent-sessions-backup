@@ -1923,6 +1923,10 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
   // would blind the attribution precisely where spend is worst.
   let insertRows = 0;
   let finalizeRows = 0;
+  // Counted as batches are ATTEMPTED, not planned: on the failure path the event must describe the work
+  // that actually ran, and a large session throwing on its first chunk would otherwise report dozens of
+  // batches it never reached. The clear batch above is the one already spent when we get here.
+  let batchesRun = 1;
   const insertChunks = chunkArr(stmts, 90);
   const emitWriteCost = (outcome: 'ok' | 'failed') =>
     console.log(
@@ -1940,7 +1944,7 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
         rows_written_clear: sumRowsWritten(clearRes),
         rows_written_insert: insertRows,
         rows_written_finalize: finalizeRows,
-        batches: 2 + insertChunks.length,
+        batches: batchesRun,
       }),
     );
 
@@ -1954,7 +1958,10 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
   /** The billed half of the write, in one scope so the catch above can report what it already paid
    * for. Declared (not inlined) purely to keep that try block one statement deep. */
   async function runWrite(): Promise<number> {
-    for (const chunk of insertChunks) insertRows += sumRowsWritten(await db.batch(chunk));
+    for (const chunk of insertChunks) {
+      batchesRun++;
+      insertRows += sumRowsWritten(await db.batch(chunk));
+    }
 
     const machine = await db
       .prepare('SELECT os FROM machines WHERE machine_id = ?1')
@@ -1979,6 +1986,7 @@ async function writeSession(s: NormalizedSession, file: FileRow, env: Env): Prom
     }
     const firstInteractionTitle = computeFirstInteractionTitle(titleBlocks);
 
+    batchesRun++;
     const finalizeRes = await db.batch([
       db
         .prepare(

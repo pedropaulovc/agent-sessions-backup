@@ -1359,6 +1359,8 @@ describe('hub.d1.write_cost telemetry', () => {
     expect(cost!.outcome).toBe('failed');
     // The clear batch landed before the throw, so its cost is reported; the finalize never ran.
     expect(cost!.rows_written_finalize).toBe(0);
+    // Batches ATTEMPTED, not planned: the clear batch plus the one insert chunk that threw.
+    expect(cost!.batches).toBe(2);
     expect(cost!.rows_written as number).toBe(cost!.rows_written_clear as number);
   });
 });
