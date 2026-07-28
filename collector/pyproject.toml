@@ -1,6 +1,9 @@
 [project]
 name = "agent-collector"
-version = "0.1.0"
+# Derived from agent_collector.__version__ — the SAME string the heartbeat reports (run.py sends
+# `collector_version: __version__`). Two hand-maintained version strings would let a release bump one
+# and not the other, so the fleet would report a version the hub never expects and page as outdated.
+dynamic = ["version"]
 description = "Per-machine collector: incremental session-file uploads, heartbeats, web capture"
 requires-python = ">=3.12"
 dependencies = []
@@ -14,6 +17,9 @@ agent-collector = "agent_collector.cli:main"
 
 [dependency-groups]
 dev = ["pytest>=8"]
+
+[tool.hatch.version]
+path = "src/agent_collector/__init__.py"
 
 [build-system]
 requires = ["hatchling"]

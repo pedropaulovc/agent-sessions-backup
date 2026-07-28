@@ -25,7 +25,14 @@
 // This alert is deliberately NOT a dead-man's switch: a machine that stops
 // heartbeating entirely is missed-heartbeat.kql's job, and a silent pipeline is
 // covered by its __pipeline_silent__ row. Duplicating that here would double-page
-// on one incident.
+// on one incident — and it WOULD have, because the watchdog iterates the roster and
+// keeps emitting health rows for a machine that is long dead. So an outdated machine
+// is dropped here once it passes the same 72h tolerance missed-heartbeat thresholds
+// on, handing the incident over rather than paging alongside it.
+//
+// A NULL age is deliberately NOT dropped: missed-heartbeat thresholds on
+// `age_seconds > 72h`, which null never satisfies, so a machine that has never
+// checked in at all would otherwise be covered by neither alert.
 
 // `otel` wraps OTelLogs in `union isfuzzy=true` so a missing table (before the
 // first OTLP log lands) degrades to empty instead of erroring the whole rule —
@@ -40,7 +47,9 @@ otel
 | extend machine = tostring(body.machine),
          collector_version = tostring(body.collector_version),
          expected_collector_version = tostring(body.expected_collector_version),
-         collector_state = tostring(body.collector_state)
-| summarize arg_max(TimeGenerated, collector_version, expected_collector_version, collector_state) by machine
+         collector_state = tostring(body.collector_state),
+         heartbeat_age_seconds = tolong(body.heartbeat_age_seconds)
+| summarize arg_max(TimeGenerated, collector_version, expected_collector_version, collector_state, heartbeat_age_seconds) by machine
 | where collector_state == "outdated"
-| project TimeGenerated, machine, collector_version, expected_collector_version
+| where isnull(heartbeat_age_seconds) or heartbeat_age_seconds <= 72 * 3600
+| project TimeGenerated, machine, collector_version, expected_collector_version, heartbeat_age_seconds
