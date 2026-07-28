@@ -1814,6 +1814,7 @@ async function writeSession(
   const db = env.DB;
 
   const pending = buildBlockRows(s);
+  const pendingUsage = buildUsageRows(s);
   const probes = retention === 'off' || pending.length === 0 ? 0 : 1;
   const retained = probes === 0 ? NOTHING_RETAINED : await retainablePrefix(s, file, pending, db);
 
@@ -1829,7 +1830,7 @@ async function writeSession(
       )
       .bind(s.id, retained.lastId),
     db.prepare('DELETE FROM blocks WHERE session_id = ?1 AND id > ?2').bind(s.id, retained.lastId),
-    db.prepare('DELETE FROM usage WHERE session_id = ?1 AND turn_index >= ?2').bind(s.id, retained.fromTurn),
+    usageDelete(db, s.id, retained, pendingUsage),
   ]);
   // `changes` on the DELETEs is what this write actually removed — with a retained prefix that is the
   // divergent tail, not the whole session. Both deletes count when deciding whether the session
@@ -1847,8 +1848,13 @@ async function writeSession(
                         cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, inference_geo, request_id)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
      ON CONFLICT (session_id, turn_index) DO UPDATE SET
+       ts = excluded.ts, model = excluded.model, service_tier = excluded.service_tier,
        input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens,
-       reasoning_tokens = excluded.reasoning_tokens, cache_read_tokens = excluded.cache_read_tokens`,
+       reasoning_tokens = excluded.reasoning_tokens,
+       cache_creation_5m_tokens = excluded.cache_creation_5m_tokens,
+       cache_creation_1h_tokens = excluded.cache_creation_1h_tokens,
+       cache_read_tokens = excluded.cache_read_tokens, inference_geo = excluded.inference_geo,
+       request_id = excluded.request_id`,
   );
 
   // Only the divergent tail is written. Token totals still come from EVERY turn — they land on the
@@ -1882,28 +1888,28 @@ async function writeSession(
       b.rowHash,
     ),
   );
-  // Usage is keyed by (session_id, turn_index) and was cleared from `retained.fromTurn` on, so re-insert
-  // from that turn. The boundary turn is included rather than skipped: its blocks can be unchanged while
-  // its usage arrives later in the file (a retry writing a second assistant record for the same turn),
-  // and one extra upsert is cheaper than reasoning about which halves of a turn can still move.
-  for (const turn of s.turns) {
-    const u = turn.usage;
-    if (!u || turn.index < retained.fromTurn) continue;
+  // Usage is diffed per turn, independently of the block prefix: the codex parser attaches a late
+  // `token_count` to the PRECEDING assistant turn, so a re-upload can change an earlier turn's tokens
+  // while every block stays byte-identical. Deriving the usage boundary from the retained blocks would
+  // silently keep that stale row. When the probe did not run (export), every row is rewritten as before.
+  for (const u of pendingUsage) {
+    const stored = retained.usage?.get(u.turnIndex);
+    if (stored && sameUsage(stored, u)) continue;
     stmts.push(
       insertUsage.bind(
         s.id,
-        turn.index,
-        turn.ts ?? null,
-        u.model ?? null,
-        u.serviceTier ?? null,
-        u.inputTokens ?? null,
-        u.outputTokens ?? null,
-        u.reasoningTokens ?? null,
-        u.cacheCreation5mTokens ?? null,
-        u.cacheCreation1hTokens ?? null,
-        u.cacheReadTokens ?? null,
-        u.inferenceGeo ?? null,
-        u.requestId ?? null,
+        u.turnIndex,
+        u.ts,
+        u.model,
+        u.serviceTier,
+        u.inputTokens,
+        u.outputTokens,
+        u.reasoningTokens,
+        u.cacheCreation5mTokens,
+        u.cacheCreation1hTokens,
+        u.cacheReadTokens,
+        u.inferenceGeo,
+        u.requestId,
       ),
     );
   }
@@ -2167,11 +2173,12 @@ interface RetainedPrefix {
   count: number;
   /** Highest `blocks.id` among them: the write deletes `id > lastId` and FTS-inserts `id > lastId`. */
   lastId: number;
-  /** First turn whose usage rows are re-inserted. */
-  fromTurn: number;
+  /** Stored usage by turn index, for the independent usage diff. `null` when the probe never ran, in
+   * which case the caller clears and rewrites every usage row as it always did. */
+  usage: Map<number, StoredUsage> | null;
 }
 
-const NOTHING_RETAINED: RetainedPrefix = { count: 0, lastId: 0, fromTurn: 0 };
+const NOTHING_RETAINED: RetainedPrefix = { count: 0, lastId: 0, usage: null };
 
 /** How much of an already-indexed session this write can leave alone.
  *
@@ -2190,18 +2197,39 @@ async function retainablePrefix(
   pending: PendingBlock[],
   db: D1Database,
 ): Promise<RetainedPrefix> {
-  if (pending.length === 0) return NOTHING_RETAINED;
+  const [blocksRes, sessionRes, usageRes] = await db.batch([
+    db
+      .prepare(
+        `SELECT id, file_id, turn_index, block_index, byte_start, byte_len, row_hash
+         FROM blocks WHERE session_id = ?1 ORDER BY turn_index, block_index LIMIT ?2`,
+      )
+      .bind(s.id, PREFIX_PROBE_MAX_BLOCKS + 1),
+    db.prepare('SELECT block_count FROM sessions WHERE session_id = ?1').bind(s.id),
+    db
+      .prepare(
+        `SELECT turn_index, ts, model, service_tier, input_tokens, output_tokens, reasoning_tokens,
+                cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, inference_geo, request_id
+         FROM usage WHERE session_id = ?1`,
+      )
+      .bind(s.id),
+  ]);
 
-  const storedRes = await db
-    .prepare(
-      `SELECT id, file_id, turn_index, block_index, byte_start, byte_len, row_hash
-       FROM blocks WHERE session_id = ?1 ORDER BY turn_index, block_index LIMIT ?2`,
-    )
-    .bind(s.id, PREFIX_PROBE_MAX_BLOCKS + 1)
-    .all<StoredBlock>();
+  // Usage is diffed independently of the blocks, and stays valid even when no block is retained.
+  const usage = new Map<number, StoredUsage>();
+  for (const row of (usageRes?.results ?? []) as StoredUsage[]) usage.set(row.turn_index, row);
 
-  const stored = storedRes.results ?? [];
-  if (stored.length === 0 || stored.length > PREFIX_PROBE_MAX_BLOCKS) return NOTHING_RETAINED;
+  const stored = (blocksRes?.results ?? []) as StoredBlock[];
+  if (stored.length === 0 || stored.length > PREFIX_PROBE_MAX_BLOCKS) return { ...NOTHING_RETAINED, usage };
+
+  // Retain nothing unless the stored blocks are exactly what the last COMPLETED write left behind.
+  // A write commits its insert chunks one batch at a time and only indexes them in the final batch —
+  // the same batch that stores block_count — so a write that died in between leaves blocks with no FTS
+  // rows. Those blocks match `pending` perfectly, so they would be retained and then skipped by the
+  // FTS rebuild (`id > lastId`), leaving them permanently unsearchable in a session marked ready.
+  // Comparing against the recorded block_count spots that torn state and rewrites the session whole,
+  // which is exactly how the unconditional rewrite used to heal it.
+  const storedCount = (sessionRes?.results?.[0] as { block_count?: number | null } | undefined)?.block_count;
+  if (storedCount !== stored.length) return { ...NOTHING_RETAINED, usage };
 
   let count = 0;
   let lastId = 0;
@@ -2212,15 +2240,103 @@ async function retainablePrefix(
     // The tail is deleted by `id > lastId`, which only removes everything after the prefix if ids
     // ascend in this order. They do when a session was written in one pass, but a session assembled
     // by an older/partial write need not be that tidy — so verify rather than assume.
-    if (a.id <= lastId) return NOTHING_RETAINED;
+    if (a.id <= lastId) return { ...NOTHING_RETAINED, usage };
     lastId = a.id;
     count++;
   }
 
-  if (count === 0) return NOTHING_RETAINED;
-  // Re-insert usage from the boundary turn on (see the call site for why it is inclusive).
-  const boundary = pending[Math.min(count, pending.length - 1)]!;
-  return { count, lastId, fromTurn: boundary.turnIndex };
+  if (count === 0) return { ...NOTHING_RETAINED, usage };
+  return { count, lastId, usage };
+}
+
+/** The usage rows this write must REMOVE. With a probe, that is only the turns that no longer exist
+ * (a shrunken transcript) — unchanged rows are left alone and changed ones are replaced by the upsert.
+ * Without one, it is every row of the session, which is what the writer always did. */
+function usageDelete(db: D1Database, sessionId: string, retained: RetainedPrefix, pending: PendingUsage[]): D1PreparedStatement {
+  if (retained.usage === null) return db.prepare('DELETE FROM usage WHERE session_id = ?1').bind(sessionId);
+  const live = new Set(pending.map((u) => u.turnIndex));
+  const gone = [...retained.usage.keys()].filter((t) => !live.has(t));
+  if (gone.length === 0) return db.prepare('DELETE FROM usage WHERE session_id = ?1 AND 0').bind(sessionId);
+  return db
+    .prepare(`DELETE FROM usage WHERE session_id = ?1 AND turn_index IN (${gone.map(() => '?').join(', ')})`)
+    .bind(sessionId, ...gone);
+}
+
+/** A usage row as stored, for diffing against the parsed turns. */
+interface StoredUsage {
+  turn_index: number;
+  ts: string | null;
+  model: string | null;
+  service_tier: string | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  reasoning_tokens: number | null;
+  cache_creation_5m_tokens: number | null;
+  cache_creation_1h_tokens: number | null;
+  cache_read_tokens: number | null;
+  inference_geo: string | null;
+  request_id: string | null;
+}
+
+/** Whether a stored usage row already says exactly what this parse says.
+ *
+ * Usage is compared per turn rather than inferred from the retained block prefix, because usage can
+ * change on a turn whose blocks did not: the codex parser attaches a `token_count` event to the
+ * PRECEDING assistant turn (see parsers/codex.ts), so appending one to a file updates an earlier
+ * turn's tokens while every block stays byte-identical. */
+function sameUsage(a: StoredUsage, b: PendingUsage): boolean {
+  return (
+    a.ts === b.ts &&
+    a.model === b.model &&
+    a.service_tier === b.serviceTier &&
+    a.input_tokens === b.inputTokens &&
+    a.output_tokens === b.outputTokens &&
+    a.reasoning_tokens === b.reasoningTokens &&
+    a.cache_creation_5m_tokens === b.cacheCreation5mTokens &&
+    a.cache_creation_1h_tokens === b.cacheCreation1hTokens &&
+    a.cache_read_tokens === b.cacheReadTokens &&
+    a.inference_geo === b.inferenceGeo &&
+    a.request_id === b.requestId
+  );
+}
+
+interface PendingUsage {
+  turnIndex: number;
+  ts: string | null;
+  model: string | null;
+  serviceTier: string | null;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  reasoningTokens: number | null;
+  cacheCreation5mTokens: number | null;
+  cacheCreation1hTokens: number | null;
+  cacheReadTokens: number | null;
+  inferenceGeo: string | null;
+  requestId: string | null;
+}
+
+/** The `usage` rows a parsed session implies, one per turn that reported any. */
+function buildUsageRows(s: NormalizedSession): PendingUsage[] {
+  const rows: PendingUsage[] = [];
+  for (const turn of s.turns) {
+    const u = turn.usage;
+    if (!u) continue;
+    rows.push({
+      turnIndex: turn.index,
+      ts: turn.ts ?? null,
+      model: u.model ?? null,
+      serviceTier: u.serviceTier ?? null,
+      inputTokens: u.inputTokens ?? null,
+      outputTokens: u.outputTokens ?? null,
+      reasoningTokens: u.reasoningTokens ?? null,
+      cacheCreation5mTokens: u.cacheCreation5mTokens ?? null,
+      cacheCreation1hTokens: u.cacheCreation1hTokens ?? null,
+      cacheReadTokens: u.cacheReadTokens ?? null,
+      inferenceGeo: u.inferenceGeo ?? null,
+      requestId: u.requestId ?? null,
+    });
+  }
+  return rows;
 }
 
 interface StoredBlock {

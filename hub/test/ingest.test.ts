@@ -1399,6 +1399,89 @@ describe('hub.d1.write_cost telemetry', () => {
     expect(cost!.write_kind).toBe('rewrite');
   });
 
+  it('retains nothing when the stored blocks do not match the last completed write', async () => {
+    // A write commits its insert chunks one batch at a time and only adds them to blocks_fts in the
+    // FINAL batch — the same batch that stores block_count. A write that dies in between leaves blocks
+    // with no FTS rows, and those blocks match the next parse perfectly, so retaining them would skip
+    // them in the FTS rebuild (`id > lastId`) and leave them unsearchable in a session marked ready.
+    // Retention therefore requires the stored block count to equal the recorded one.
+    //
+    // The torn state is simulated by moving block_count rather than by tearing a real write: a real
+    // torn write leaves blocks that FTS never indexed, and deleting those throws SQLITE_CORRUPT_VTAB
+    // on the next parse — a pre-existing failure (reproduced on main, independent of this change)
+    // that is fixed separately. This test pins the guard, which is what this change owns.
+    const TORN = '55555555-4444-4333-8222-111111111111';
+    const tornPath = `-home-tester-src-demo/${TORN}.jsonl`;
+    expect((await putFile('testbox-wsl', 'claude-projects', tornPath, chained(TORN, 3))).status).toBe(201);
+    await drainQueue();
+
+    // POSITIVE CONTROL: unmolested, this same re-parse retains its prefix (see the growth test above).
+    await testEnv.DB.prepare('UPDATE sessions SET block_count = block_count + 5 WHERE session_id = ?1').bind(TORN).run();
+
+    const events = captureLogs();
+    expect((await putFile('testbox-wsl', 'claude-projects', tornPath, chained(TORN, 4))).status).toBe(201);
+    await drainQueue();
+    const cost = events.filter((e) => e.event === 'hub.d1.write_cost' && e.session === TORN)[0];
+    vi.restoreAllMocks();
+
+    expect(cost).toBeTruthy();
+    expect(cost!.retained_blocks).toBe(0);
+    expect(cost!.write_kind).toBe('rewrite');
+
+    // And the rewrite left a complete, searchable index.
+    const searchable = await testEnv.DB.prepare(
+      'SELECT COUNT(*) AS n FROM blocks_fts JOIN blocks ON blocks.id = blocks_fts.rowid WHERE blocks_fts MATCH ?1 AND blocks.session_id = ?2',
+    )
+      .bind('question', TORN)
+      .first<{ n: number }>();
+    expect(searchable!.n).toBe(4);
+  });
+
+  it('refreshes usage on a retained turn when a late token_count attaches to it (codex)', async () => {
+    // The codex parser folds a token_count arriving AFTER a tool-result turn into the preceding
+    // assistant turn. Appending one therefore changes an earlier turn's usage while every block stays
+    // byte-identical — so a usage boundary derived from the retained block prefix would keep the stale
+    // row. Usage is diffed per turn for exactly this case.
+    const SID = '3d1a3d1a-0000-4000-8000-abcdefabcdef';
+    const relpath = `2026/07/02/rollout-2026-07-02T09-00-00-${SID}.jsonl`;
+    const at = (n: number) => `2026-07-02T09:00:0${n}.000Z`;
+    const meta = { timestamp: at(0), type: 'session_meta', payload: { session_id: SID, cwd: '/home/tester/src/demo', originator: 'codex-tui', cli_version: '0.150.0' } };
+    const turnCtx = { timestamp: at(1), type: 'turn_context', payload: { turn_id: 't1', cwd: '/home/tester/src/demo', model: 'gpt-test-2' } };
+    const userMsg = { timestamp: at(2), type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: 'fix the widget' }] } };
+    const call = { timestamp: at(3), type: 'response_item', payload: { type: 'function_call', name: 'shell', call_id: 'call_1', arguments: '{"command":"pytest"}', internal_chat_message_metadata_passthrough: { turn_id: 't2' } } };
+    const assistantMsg = { timestamp: at(4), type: 'response_item', payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'done' }], internal_chat_message_metadata_passthrough: { turn_id: 't2' } } };
+    const output = { timestamp: at(5), type: 'response_item', payload: { type: 'function_call_output', call_id: 'call_1', output: '1 passed', internal_chat_message_metadata_passthrough: { turn_id: 't2' } } };
+    const tokenCount = {
+      timestamp: at(6),
+      type: 'event_msg',
+      payload: {
+        type: 'token_count',
+        info: {
+          total_token_usage: { input_tokens: 900, cached_input_tokens: 500, output_tokens: 80, reasoning_output_tokens: 20, total_tokens: 980 },
+          last_token_usage: { input_tokens: 900, cached_input_tokens: 500, output_tokens: 80, reasoning_output_tokens: 20, total_tokens: 980 },
+        },
+      },
+    };
+    const base = [meta, turnCtx, userMsg, call, assistantMsg, output].map((o) => JSON.stringify(o));
+
+    expect((await putFile('testbox-wsl', 'codex-sessions', relpath, base.join('\n'))).status).toBe(201);
+    await drainQueue();
+    const before = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM usage WHERE session_id = ?1').bind(SID).first<{ n: number }>();
+    expect(before!.n).toBe(0);
+
+    // Append ONLY the token_count event. Every block keeps its bytes; an earlier turn gains usage.
+    expect((await putFile('testbox-wsl', 'codex-sessions', relpath, [...base, JSON.stringify(tokenCount)].join('\n'))).status).toBe(201);
+    await drainQueue();
+
+    const after = await testEnv.DB.prepare('SELECT turn_index, input_tokens, output_tokens, cache_read_tokens FROM usage WHERE session_id = ?1')
+      .bind(SID)
+      .all<{ turn_index: number; input_tokens: number; output_tokens: number; cache_read_tokens: number }>();
+    expect(after.results.length).toBe(1);
+    expect(after.results[0]!.input_tokens).toBe(900);
+    expect(after.results[0]!.output_tokens).toBe(80);
+    expect(after.results[0]!.cache_read_tokens).toBe(500);
+  });
+
   it('still reports the rows it already paid for when a later batch throws', async () => {
     // The clear batch and any completed insert chunks are billed before a later chunk fails, and the
     // queue retries the whole write — so the failure path is exactly where attribution matters most.
