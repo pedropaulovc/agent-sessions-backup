@@ -22,9 +22,8 @@ export function turnFallbackKeyOf(turn: NormalizedTurn): string {
   };
 
   mix(turn.role);
-  mix(turn.ts);
-  // Parser context such as model and parent lineage may sit outside a viewer byte range. Only hash
-  // fields intrinsic to the rendered source records so full-ingest and ranged keys stay identical.
+  // Parser context such as model, parent lineage, and pre-block timestamps may sit outside a viewer
+  // byte range. Only hash fields intrinsic to rendered records so full-ingest and ranged keys agree.
   mix(turn.blocks[0]?.byteStart ?? turn.byteStart);
   for (const block of turn.blocks) {
     mix(block.type);

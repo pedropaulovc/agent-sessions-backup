@@ -2050,14 +2050,20 @@ async function writeSession(
          JOIN json_each(?2) mapping ON mapping.key = st.turn_key
          WHERE st.session_id = ?1 AND st.turn_key != mapping.value`,
       ).bind(s.id, encodedKeys),
-      db.prepare(
-        `DELETE FROM starred_turns
-         WHERE session_id = ?1
-           AND NOT EXISTS (
-             SELECT 1 FROM json_each(?2) live WHERE live.value = starred_turns.turn_key
-           )`,
-      ).bind(s.id, encodedKeys),
     ];
+    const sourceComplete =
+      s.stats.parseErrorLines === 0 && (s.stats.skippedLineTypes['oversized-line'] ?? 0) === 0;
+    if (sourceComplete) {
+      starReconciliation.push(
+        db.prepare(
+          `DELETE FROM starred_turns
+           WHERE session_id = ?1
+             AND NOT EXISTS (
+               SELECT 1 FROM json_each(?2) live WHERE live.value = starred_turns.turn_key
+             )`,
+        ).bind(s.id, encodedKeys),
+      );
+    }
 
     batchesRun++;
     const finalizeRes = await db.batch([

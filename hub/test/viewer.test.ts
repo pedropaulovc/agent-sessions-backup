@@ -987,6 +987,21 @@ describe('viewer', () => {
     );
     expect(starredAgain.status).toBe(303);
 
+    const degradedContent = [
+      ccLine(STAR_STABLE_SESSION, { uuid: 'stable-new-root', parentUuid: null, role: 'user', text: 'new earlier turn' }),
+      ccLine(STAR_STABLE_SESSION, { uuid: 'stable-root', parentUuid: 'stable-new-root', role: 'user', text: 'stable root turn' }),
+      '{"malformed":',
+    ].join('\n');
+    expect((await putFile('claude-projects', STAR_STABLE_RELPATH, degradedContent)).status).toBe(201);
+    await drainQueue();
+
+    const preservedThroughDegradation = await testEnv.DB.prepare(
+      'SELECT COUNT(*) AS n FROM starred_turns WHERE session_id = ?1',
+    )
+      .bind(STAR_STABLE_SESSION)
+      .first<{ n: number }>();
+    expect(preservedThroughDegradation?.n).toBe(1);
+
     const prunedContent = [
       ccLine(STAR_STABLE_SESSION, { uuid: 'stable-new-root', parentUuid: null, role: 'user', text: 'new earlier turn' }),
       ccLine(STAR_STABLE_SESSION, { uuid: 'stable-root', parentUuid: 'stable-new-root', role: 'user', text: 'stable root turn' }),
@@ -1338,7 +1353,13 @@ describe('viewer', () => {
       ts: '2026-07-30T12:00:00Z',
       blocks: [{ type: 'text' as const, text: 'live event message', byteStart: 100, byteLen: 20 }],
     };
-    const completed = { ...partial, id: 'assistant:t1:id:msg_1', model: 'gpt-5', parentId: 'context-only-parent' };
+    const completed = {
+      ...partial,
+      id: 'assistant:t1:id:msg_1',
+      ts: '2026-07-30T11:59:59Z',
+      model: 'gpt-5',
+      parentId: 'context-only-parent',
+    };
 
     expect(turnFallbackKeyOf(completed)).toBe(turnKeyOf(partial));
     expect(turnKeyOf(completed)).not.toBe(turnKeyOf(partial));
