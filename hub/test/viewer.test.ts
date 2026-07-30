@@ -7,7 +7,8 @@ import { searchHitsSql } from '../src/api/search';
 import { buildSessionFilterSql } from '../src/session-filters';
 import { viewerRoute } from '../src/viewer/router';
 import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures';
-import { blobVersionOf, turnKeyOf } from '../src/viewer/session';
+import { blobVersionOf } from '../src/viewer/session';
+import { turnFallbackKeyOf, turnKeyOf } from '../src/turn-key';
 
 const testEnv = env as unknown as Env;
 
@@ -923,6 +924,12 @@ describe('viewer', () => {
     expect(preserved?.turn_key).toBe('id:stable-target');
 
     await deliverOne(starStableFileId, starStableR2Key);
+    const recoveredFile = await testEnv.DB.prepare(
+      'SELECT parse_state, parse_error FROM files WHERE id = ?1',
+    )
+      .bind(starStableFileId)
+      .first<{ parse_state: string; parse_error: string | null }>();
+    expect(recoveredFile).toEqual({ parse_state: 'parsed', parse_error: null });
     const recovered = await (await SELF.fetch(`https://sessions.vza.net/s/${STAR_STABLE_SESSION}`)).text();
     expect(recovered).toMatch(/<article id="t2" class="turn assistant starred">[\s\S]*?stable starred target/);
 
@@ -962,6 +969,39 @@ describe('viewer', () => {
 
     const empty = await (await SELF.fetch('https://sessions.vza.net/?has_star=1')).text();
     expect(empty).not.toContain(`/s/${STAR_STABLE_SESSION}`);
+
+    const starredAgain = await SELF.fetch(
+      `https://sessions.vza.net/s/${STAR_STABLE_SESSION}/turns/2/star`,
+      {
+        method: 'POST',
+        headers: {
+          origin: 'https://sessions.vza.net',
+          'content-type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({
+          turn_key: 'id:stable-target',
+          transcript_revision: recoveredRevision,
+        }),
+        redirect: 'manual',
+      },
+    );
+    expect(starredAgain.status).toBe(303);
+
+    const prunedContent = [
+      ccLine(STAR_STABLE_SESSION, { uuid: 'stable-new-root', parentUuid: null, role: 'user', text: 'new earlier turn' }),
+      ccLine(STAR_STABLE_SESSION, { uuid: 'stable-root', parentUuid: 'stable-new-root', role: 'user', text: 'stable root turn' }),
+    ].join('\n');
+    expect((await putFile('claude-projects', STAR_STABLE_RELPATH, prunedContent)).status).toBe(201);
+    await drainQueue();
+
+    const reconciled = await testEnv.DB.prepare(
+      'SELECT COUNT(*) AS n FROM starred_turns WHERE session_id = ?1',
+    )
+      .bind(STAR_STABLE_SESSION)
+      .first<{ n: number }>();
+    expect(reconciled?.n).toBe(0);
+    const prunedFacet = await (await SELF.fetch('https://sessions.vza.net/?has_star=1')).text();
+    expect(prunedFacet).not.toContain(`/s/${STAR_STABLE_SESSION}`);
   });
 
   it('joins linked tool calls and results, with their leading JSON fields in the summary', async () => {
@@ -1288,6 +1328,20 @@ describe('viewer', () => {
     };
 
     expect(turnKeyOf(repeated)).not.toBe(turnKeyOf(first));
+  });
+
+  it('retains the id-less fallback as an alias when a live source ID arrives', () => {
+    const partial = {
+      index: 3,
+      onMainPath: true,
+      role: 'assistant' as const,
+      ts: '2026-07-30T12:00:00Z',
+      blocks: [{ type: 'text' as const, text: 'live event message', byteStart: 100, byteLen: 20 }],
+    };
+    const completed = { ...partial, id: 'assistant:t1:id:msg_1' };
+
+    expect(turnFallbackKeyOf(completed)).toBe(turnKeyOf(partial));
+    expect(turnKeyOf(completed)).not.toBe(turnKeyOf(partial));
   });
 
   it('serves a checksum-less blob revalidatable (no immutable, no redirect loop)', async () => {

@@ -5,6 +5,7 @@ import { parseExportArchive } from './parsers/export-inbox';
 import { isFreshReservation, markPendingAndEnqueue, reservationCutoffIso } from '../queue';
 import { deriveProjectName } from '../project-name';
 import { computeFirstInteractionTitle, type TitleBlock } from '../session-title';
+import { turnFallbackKeyOf, turnKeyOf } from '../turn-key';
 
 interface FileRow {
   id: number;
@@ -2008,10 +2009,12 @@ async function writeSession(
       insertRows += sumRowsWritten(await db.batch(chunk));
     }
 
-    const machine = await db
-      .prepare('SELECT os FROM machines WHERE machine_id = ?1')
-      .bind(file.machine_id)
-      .first<{ os: string }>();
+    const machineOs = (
+      await db
+        .prepare('SELECT os FROM machines WHERE machine_id = ?1')
+        .bind(file.machine_id)
+        .first<{ os: string }>()
+    )?.os;
 
     // Derive the first-interaction title from the same blocks just written (block_index == bi, the
     // per-turn insert order above), so the listing queries read a stored column instead of an
@@ -2030,6 +2033,31 @@ async function writeSession(
       }
     }
     const firstInteractionTitle = computeFirstInteractionTitle(titleBlocks);
+
+    const keys = new Map<string, string>();
+    for (const turn of s.turns) {
+      if (turn.compaction || turn.blocks.length === 0) continue;
+      const primary = turnKeyOf(turn);
+      keys.set(primary, primary);
+      keys.set(turnFallbackKeyOf(turn), primary);
+    }
+    const encodedKeys = JSON.stringify(Object.fromEntries(keys));
+    const starReconciliation = [
+      db.prepare(
+        `INSERT OR IGNORE INTO starred_turns (session_id, turn_key, starred_at)
+         SELECT st.session_id, mapping.value, st.starred_at
+         FROM starred_turns st
+         JOIN json_each(?2) mapping ON mapping.key = st.turn_key
+         WHERE st.session_id = ?1 AND st.turn_key != mapping.value`,
+      ).bind(s.id, encodedKeys),
+      db.prepare(
+        `DELETE FROM starred_turns
+         WHERE session_id = ?1
+           AND NOT EXISTS (
+             SELECT 1 FROM json_each(?2) live WHERE live.value = starred_turns.turn_key
+           )`,
+      ).bind(s.id, encodedKeys),
+    ];
 
     batchesRun++;
     const finalizeRes = await db.batch([
@@ -2065,7 +2093,7 @@ async function writeSession(
           s.id,
           s.harness,
           file.machine_id,
-          machine?.os ?? null,
+          machineOs ?? null,
           file.id,
           s.cwd ?? null,
           s.repoUrl ?? null,
@@ -2087,9 +2115,10 @@ async function writeSession(
           totals.cached,
           firstInteractionTitle,
         ),
+      ...starReconciliation,
     ]);
 
-    finalizeRows = sumRowsWritten(finalizeRes);
+    finalizeRows = finalizeRes[0]?.meta.changes ?? 0;
     emitWriteCost('ok');
 
     // SUBREQUESTS (see the counting-model note above): prefix probe (1, only when retention is on) +

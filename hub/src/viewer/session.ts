@@ -8,6 +8,7 @@ import { parseCodex } from '../ingest/parsers/codex';
 import { parseConversationById } from '../ingest/parsers/export-inbox';
 import { parsePromptLog } from '../ingest/parsers/history';
 import { sessionDisplayTitle } from '../session-title';
+import { turnKeyOf } from '../turn-key';
 import { esc, pageFoot, pageHead, q } from './layout';
 
 /** Turns per page. Pages are turn_index buckets [(p-1)*SIZE, p*SIZE), so a block's page is floor(turn_index/SIZE)+1. */
@@ -510,41 +511,6 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function fmtNum(n: number | null): string {
   return (n ?? 0).toLocaleString('en-US');
-}
-/** Stable source ID when available; otherwise a content-and-source-position fingerprint. */
-export function turnKeyOf(turn: NormalizedTurn): string {
-  if (turn.id) return `id:${turn.id}`;
-
-  let h1 = 0x811c9dc5;
-  let h2 = 0x01000193;
-  const mix = (value: string | number | boolean | null | undefined) => {
-    const text = value === null || value === undefined ? '\u0000' : String(value);
-    for (let i = 0; i < text.length; i++) {
-      const code = text.charCodeAt(i);
-      h1 = Math.imul(h1 ^ code, 0x01000193) >>> 0;
-      h2 = Math.imul(h2 ^ code, 0x85ebca6b) >>> 0;
-    }
-    h1 = Math.imul(h1 ^ 0x1f, 0x01000193) >>> 0;
-    h2 = Math.imul(h2 ^ 0x1f, 0x85ebca6b) >>> 0;
-  };
-
-  mix(turn.role);
-  mix(turn.parentId);
-  mix(turn.ts);
-  mix(turn.model);
-  // Without a source ID, absolute position is the only discriminator for otherwise identical
-  // records. Ranged parsing preserves absolute offsets, so the key stays page-independent.
-  mix(turn.blocks[0]?.byteStart ?? turn.byteStart);
-  for (const block of turn.blocks) {
-    mix(block.type);
-    mix(block.toolUseId);
-    mix(block.toolName);
-    mix(block.isError);
-    mix(block.mediaType);
-    mix(block.truncated);
-    mix(block.text);
-  }
-  return `content:${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}`;
 }
 
 
