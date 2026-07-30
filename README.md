@@ -17,6 +17,7 @@ Backup, index, search, and render AI agent/chat sessions from every machine and 
 | `collector/` | Per-machine Python collector (`agent-collector` CLI) |
 | `infra/` | Azure provisioning (az CLI), Cloudflare mTLS/cert setup, install one-liners |
 | `scripts/` | Local corpus seeding + verification tooling |
+| `docs/` | Agent API guide and [security threat model](docs/threat-model.md) |
 | `memory/` | Project memory for AI agents working on this repo |
 
 ## Principles
