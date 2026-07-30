@@ -1,4 +1,4 @@
-# Deploying the hub (Workers Builds)
+# Deploying the hub
 
 The hub deploys from `main` on the `18ef3246…` account. Production, branch previews, and
 their stable front door target separate Workers — production must never be touched by a PR
@@ -16,19 +16,63 @@ preview.
 environments) and sets `"routes": []` (it *does* inherit `routes`, so without the empty
 override a preview deploy would steal the production custom domains).
 
-## Workers Builds configuration (set once, in the dashboard)
+## Deployment ownership
 
-Connect **both** Workers to `pedropaulovc/agent-sessions-backup`. A Worker that implements
-a Durable Object cannot receive Cloudflare Preview URLs. Workers Builds also pins an upload
-to the Worker connected in the dashboard, overriding Wrangler's environment `name` and
-`--name`. The DO-free `sessions-hub-preview` service therefore needs its own Git connection.
+### Production: GitHub Actions
 
-For `sessions-hub`:
+`.github/workflows/ci.yml` is the sole production deployer. Cloudflare Workers
+Builds production auto-deploy is disabled. After the hub typecheck and tests pass,
+one concurrency-locked job applies D1 migrations and then deploys `sessions-hub`;
+keeping both commands in one job prevents two main pushes from interleaving a
+newer migration with an older Worker deploy.
+The Worker deploy passes `--env ""` explicitly so Wrangler selects the top-level
+production bindings instead of relying on its multiple-environment default.
 
-- **Production branch:** `main`
-- **Builds for non-production branches:** disabled (the preview Worker owns them)
-- **Build command:** `cd hub && npm ci`
-- **Deploy command:** `cd hub && npx wrangler deploy`
+Cloudflare does not currently exchange GitHub Actions OIDC assertions for Wrangler
+credentials. Its [GitHub Actions documentation](https://developers.cloudflare.com/workers/ci-cd/external-cicd/github-actions/)
+requires an API token for non-interactive CI. Use two expiring
+[account-owned API tokens](https://developers.cloudflare.com/fundamentals/api/get-started/account-owned-tokens/)
+instead of a user token or global API key. Account-owned tokens are service
+principals and support D1, Workers, and Queues.
+
+Create both tokens under **Manage Account → Account API Tokens**, include only the
+`18ef3246…` production account, and set an explicit expiration. This repository's
+default is 90 days with a rotation reminder at least 14 days before expiry.
+
+| GitHub environment secret | Cloudflare account permissions | Used by |
+|---|---|---|
+| `CLOUDFLARE_D1_TOKEN` | D1 · Edit | `wrangler d1 migrations apply sessions-index --remote` |
+| `CLOUDFLARE_WORKERS_TOKEN` | Workers Scripts · Edit; Queues · Edit | `wrangler deploy --env ""` |
+
+Do not grant Account Settings, Workers KV Storage, Workers R2 Storage, or zone
+Workers Routes permissions. The account ID is pinned in `hub/wrangler.jsonc`;
+the deploy references existing KV/R2 bindings and uses account-level Worker
+custom domains rather than zone route patterns.
+
+In GitHub, create a `production` environment restricted to the `main` branch,
+add the two secrets above, and enable a required reviewer when a second trusted
+reviewer is available. The workflow grants only `contents: read`; it does not
+request `id-token: write` because Cloudflare has no supported GitHub OIDC
+exchange.
+
+Cut over without losing deployment access:
+
+1. Create the two account tokens and the GitHub `production` environment secrets.
+2. Merge the workflow change only after both environment secrets exist.
+3. Observe one successful main deployment: D1 migration first, Worker deploy second.
+4. Delete the old repository secret `CLOUDFLARE_API_TOKEN` and revoke its Cloudflare token.
+
+For routine rotation, create successors with the same scopes, replace both
+environment secrets, verify one normal deployment, then delete the old tokens.
+Do not use Cloudflare's Roll operation for planned rotation: it invalidates the
+old value immediately and removes the safe overlap window.
+
+### Preview: Workers Builds
+
+The DO-free `sessions-hub-preview` service owns automatic branch previews. A
+Worker that implements a Durable Object cannot receive Cloudflare Preview URLs,
+and Workers Builds pins an upload to the Worker connected in the dashboard,
+overriding Wrangler's environment `name` and `--name`.
 
 For `sessions-hub-preview`:
 
@@ -39,11 +83,10 @@ For `sessions-hub-preview`:
 - **Non-production branch deploy command:** the same `versions upload` command
 - **Domains & Routes:** production `workers.dev` URL disabled; Preview URLs enabled
 
-The explicit environment is load-bearing: Workers Builds' default `versions upload` uses
-the top-level production bindings. `--env preview` selects the complete isolated binding
-set, while the matching explicit name makes configuration drift visible in the build log.
-
-GitHub Actions stays the PR gate (typecheck + vitest + pytest); Workers Builds owns deploys.
+The explicit environment is load-bearing: Workers Builds' default `versions upload`
+uses the top-level production bindings. `--env preview` selects the complete isolated
+binding set, while the matching explicit name makes configuration drift visible in
+the build log. GitHub Actions remains the PR gate for typecheck, Vitest, and pytest.
 
 ## Stable branch preview front door
 
