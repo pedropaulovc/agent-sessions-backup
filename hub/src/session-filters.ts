@@ -15,7 +15,7 @@ type FacetOrder = 'count' | 'value-desc' | 'bucket';
 export interface MultiValueFilterDefinition {
   key: string;
   param: string;
-  kind: 'column' | 'session-date' | 'session-time';
+  kind: 'column' | 'session-date' | 'session-time' | 'has-star';
   column?: SessionColumn;
   label?: string;
   facetOrder?: FacetOrder;
@@ -32,6 +32,7 @@ export const FACET_DEFINITIONS: readonly MultiValueFilterDefinition[] = [
   { key: 'project_name', param: 'project', kind: 'column', column: 'project_name', label: 'Project', facetOrder: 'count', valueLimit: 200 },
   { key: 'session_date', param: 'session_date', kind: 'session-date', label: 'Session date/time', facetOrder: 'value-desc' },
   { key: 'session_time', param: 'session_time', kind: 'session-time', label: 'Session time', facetOrder: 'bucket' },
+  { key: 'has_star', param: 'has_star', kind: 'has-star', label: 'Has star', facetOrder: 'count' },
 ] as const;
 
 const NON_FACET_MULTI_FILTERS: readonly MultiValueFilterDefinition[] = [
@@ -58,6 +59,9 @@ export function totalTokensSql(alias: string): string {
 export function facetExpressionSql(definition: MultiValueFilterDefinition, alias: string): string {
   if (definition.kind === 'column') return `${alias}.${definition.column}`;
   if (definition.kind === 'session-date') return `substr(${alias}.started_at, 1, 10)`;
+  if (definition.kind === 'has-star') {
+    return `(CASE WHEN EXISTS (SELECT 1 FROM starred_turns st WHERE st.session_id = ${alias}.session_id) THEN '1' END)`;
+  }
 
   const duration = sessionDurationSql(alias);
   const cases = SESSION_TIME_BUCKETS.map((bucket) => {
@@ -164,12 +168,16 @@ export function mergeFacetCounts(
 }
 
 export function facetLabelValue(definition: MultiValueFilterDefinition, value: string): string {
-  if (definition.kind !== 'session-time') return value;
-  return SESSION_TIME_BUCKETS.find((bucket) => bucket.value === value)?.label ?? value;
+  if (definition.kind === 'session-time') {
+    return SESSION_TIME_BUCKETS.find((bucket) => bucket.value === value)?.label ?? value;
+  }
+  if (definition.kind === 'has-star') return value === '1' ? 'Yes' : value;
+  return value;
 }
 
 function validValue(definition: MultiValueFilterDefinition, value: string): boolean {
   if (definition.kind === 'session-date') return /^\d{4}-\d{2}-\d{2}$/.test(value);
   if (definition.kind === 'session-time') return SESSION_TIME_VALUES.has(value);
+  if (definition.kind === 'has-star') return value === '1';
   return true;
 }

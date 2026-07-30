@@ -166,6 +166,24 @@ describe('readJsonlLines', () => {
   });
 });
 
+describe('parsePromptLog', () => {
+  it('gives repeated timestamp-less prompts distinct append-stable identities', async () => {
+    const records = [
+      JSON.stringify({ display: 'continue' }),
+      JSON.stringify({ display: 'continue' }),
+    ];
+    const session = await parsePromptLog(
+      readJsonlLines(toStream(records)),
+      'promptlog:testbox:claude',
+    );
+
+    expect(session.turns.map((turn) => turn.id)).toEqual([
+      'prompt-offset:0',
+      `prompt-offset:${records[0]!.length + 1}`,
+    ]);
+  });
+});
+
 describe('parseClaudeCode', () => {
   it('parses turns, skips noise, extracts usage/title, survives malformed lines', async () => {
     const lines = [
@@ -402,6 +420,15 @@ describe('parseCodex', () => {
     const roles = s.turns.map((t) => t.role);
     // user → assistant (thinking+tool_use) → tool (result) → assistant (text) → compaction marker
     expect(roles).toEqual(['user', 'assistant', 'tool', 'assistant', 'system']);
+    expect(s.turns[0]!.id).toMatch(
+      /^user:t1:at:2026-07-02T09:00:02\.000Z:payload:\d+:[0-9a-f]+:offset:\d+$/,
+    );
+    expect(s.turns[1]!.id).toBe('assistant:t2:id:rs_1');
+    expect(s.turns[2]!.id).toBe('tool:t2:call:call_1');
+    expect(s.turns[3]!.id).toMatch(
+      /^assistant:t2:at:2026-07-02T09:00:06\.000Z:payload:\d+:[0-9a-f]+:offset:\d+$/,
+    );
+    expect(s.turns[4]!.id).toBeUndefined();
 
     const assistant = s.turns[1]!;
     expect(assistant.blocks.map((b) => b.type)).toEqual(['thinking', 'tool_use']);
@@ -431,6 +458,95 @@ describe('parseCodex', () => {
     expect(assistantTexts).toHaveLength(1);
 
     expect(s.turns[4]!.compaction?.kind).toBe('codex-window');
+  });
+
+  it('keeps Codex source identities stable when parsing a later byte-range page', async () => {
+    const records = [
+      {
+        timestamp: '2026-07-10T10:00:00.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'same assistant text' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      {
+        timestamp: '2026-07-10T10:00:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call-page',
+          output: 'tool result at the boundary',
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      {
+        timestamp: '2026-07-10T10:00:00.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'same assistant text' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+    ].map((record) => JSON.stringify(record));
+    const full = await parseCodex(readJsonlLines(toStream(records)), CODEX_SESSION_ID);
+    const rangeOffset = records[0]!.length + records[1]!.length + 2;
+    const ranged = await parseCodex(
+      readJsonlLines(toStream(records.slice(2)), rangeOffset),
+      CODEX_SESSION_ID,
+    );
+
+    expect(full.turns[2]!.id).toBe(ranged.turns[0]!.id);
+    expect(full.turns[2]!.id).not.toBe(full.turns[0]!.id);
+  });
+
+  it('groups source turns identically when token_count opens a blockless page-boundary turn', async () => {
+    const records = [
+      {
+        timestamp: '2026-07-10T11:00:00.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: { last_token_usage: { input_tokens: 10, output_tokens: 2 } },
+        },
+      },
+      {
+        timestamp: '2026-07-10T11:00:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'first source turn' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'page-t1' },
+        },
+      },
+      {
+        timestamp: '2026-07-10T11:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'second source turn' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'page-t2' },
+        },
+      },
+    ].map((record) => JSON.stringify(record));
+    const full = await parseCodex(readJsonlLines(toStream(records)), CODEX_SESSION_ID);
+    const rangeOffset = records[0]!.length + 1;
+    const ranged = await parseCodex(
+      readJsonlLines(toStream(records.slice(1)), rangeOffset),
+      CODEX_SESSION_ID,
+    );
+
+    expect(full.turns).toHaveLength(2);
+    expect(full.turns.map((turn) => turn.id)).toEqual(ranged.turns.map((turn) => turn.id));
+    expect(full.turns.map((turn) => turn.blocks[0]?.text)).toEqual(
+      ranged.turns.map((turn) => turn.blocks[0]?.text),
+    );
   });
 
   it('keeps a usage-only turn when token_count is the only billable event before EOF (regression: flush dropped 0-block turns even with usage set)', async () => {

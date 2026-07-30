@@ -8,6 +8,7 @@ import { parseCodex } from '../ingest/parsers/codex';
 import { parseConversationById } from '../ingest/parsers/export-inbox';
 import { parsePromptLog } from '../ingest/parsers/history';
 import { sessionDisplayTitle } from '../session-title';
+import { turnKeyOf } from '../turn-key';
 import { esc, pageFoot, pageHead, q } from './layout';
 
 /** Turns per page. Pages are turn_index buckets [(p-1)*SIZE, p*SIZE), so a block's page is floor(turn_index/SIZE)+1. */
@@ -34,6 +35,7 @@ interface SessionMeta {
   tokens_reasoning: number | null;
   tokens_cached: number | null;
   index_state: string;
+  updated_at: string | null;
 }
 
 type View = 'chronological' | 'effective';
@@ -42,7 +44,7 @@ type View = 'chronological' | 'effective';
 export async function sessionPage(sessionId: string, url: URL, env: Env): Promise<Response> {
   const meta = await env.DB.prepare(
     `SELECT session_id, harness, machine_id, os, cwd, repo_url, git_branch, primary_model,
-            first_interaction_title, title, started_at, ended_at,
+            first_interaction_title, title, started_at, ended_at, updated_at,
             parent_session_id, is_sidechain, turn_count, tokens_in, tokens_out, tokens_reasoning, tokens_cached, index_state
      FROM sessions WHERE session_id = ?1`,
   )
@@ -59,6 +61,7 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
   // Cache-busting token for blob URLs: block ids (rowids) are reused across reindexes, so the
   // 1-year immutable cache is keyed on the canonical file's content hash prefix.
   const blobVersion = blobVersionOf(file?.content_hash);
+  const transcriptRevision = `${file?.content_hash ?? ''}:${meta.updated_at ?? ''}`;
 
   const view: View = url.searchParams.get('view') === 'effective' ? 'effective' : 'chronological';
   const maxTurn = (
@@ -76,6 +79,13 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
   )
     .bind(sessionId)
     .all<{ session_id: string; title: string | null }>();
+  const starredKeys = new Set(
+    (
+      await env.DB.prepare('SELECT turn_key FROM starred_turns WHERE session_id = ?1')
+        .bind(sessionId)
+        .all<{ turn_key: string }>()
+    ).results.map((row) => row.turn_key),
+  );
 
   // Page = turn_index bucket. Byte window co-monotonic with turn_index (file order), so it covers exactly [lo, hi).
   const startByte = await firstByteFrom(env, sessionId, lo);
@@ -96,7 +106,8 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
          SELECT turn_index, MAX(on_main_path) AS on_main_path FROM page_blocks GROUP BY turn_index
        )
        SELECT p.turn_index, p.byte_start, m.on_main_path
-       FROM page_blocks p JOIN turn_meta m ON m.turn_index = p.turn_index
+       FROM page_blocks p
+       JOIN turn_meta m ON m.turn_index = p.turn_index
        WHERE p.byte_start IS NOT NULL
        GROUP BY p.turn_index, p.byte_start
        ORDER BY p.turn_index, p.byte_start`,
@@ -142,6 +153,7 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
             // Prefer the persisted main-path flag; fall back to the parser's per-page guess only when the
             // D1 lookup has no matching row (e.g. compaction markers, which have no content block rows).
             const onMainPath = indexed ? indexed.onMainPath : turn.onMainPath;
+            const key = turnKeyOf(turn);
             const html = renderTurn(
               turn,
               sessionId,
@@ -149,6 +161,9 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
               mediaIds,
               indexed?.turnIndex,
               onMainPath,
+              key,
+              starredKeys.has(key),
+              transcriptRevision,
               blobVersion,
               toolPairs,
             );
@@ -267,6 +282,9 @@ function renderTurn(
   mediaIds: Map<string, number>,
   turnIndex: number | undefined,
   onMainPath: boolean,
+  turnKey: string,
+  starred: boolean,
+  transcriptRevision: string,
   blobVersion: string,
   toolPairs: ToolPairs,
 ): string {
@@ -277,12 +295,19 @@ function renderTurn(
   if (turn.blocks.length === 0) return '';
 
   const rewound = view === 'chronological' && !onMainPath;
-  const cls = `turn ${esc(turn.role)}${rewound ? ' rewound' : ''}`;
+  const cls = `turn ${esc(turn.role)}${rewound ? ' rewound' : ''}${starred ? ' starred' : ''}`;
   // Stable anchor id (present in every view) so search-hit deep links can scroll to the matching turn.
   const anchor = turnIndex === undefined ? '' : ` id="t${turnIndex}"`;
   const model = turn.model ? `<span class="chip">${esc(turn.model)}</span>` : '';
   const ts = turn.ts ? `<span class="muted small">${esc(turn.ts)}</span>` : '';
-  const head = `<div class="turnhead"><span class="role">${esc(turn.role)}</span>${model}${ts}</div>`;
+  const star = turnIndex === undefined
+    ? ''
+    : `<form class="turn-star" method="post" action="/s/${q(sessionId)}/turns/${turnIndex}/${starred ? 'unstar' : 'star'}?view=${view}">` +
+      `<input type="hidden" name="turn_key" value="${esc(turnKey)}">` +
+      `<input type="hidden" name="transcript_revision" value="${esc(transcriptRevision)}">` +
+      `<button type="submit" aria-label="${starred ? 'Unstar' : 'Star'} turn" aria-pressed="${starred}" title="${starred ? 'Unstar' : 'Star'} turn">` +
+      `${starred ? '&#9733;' : '&#9734;'}</button></form>`;
+  const head = `<div class="turnhead"><span class="role">${esc(turn.role)}</span>${model}${ts}${star}</div>`;
   const body = turn.blocks.map((b, bi) => renderBlock(b, bi, sessionId, mediaIds, blobVersion, toolPairs)).join('');
   if (!body) return '';
   return `<article${anchor} class="${cls}">${head}<div class="body">${body}</div></article>`;
@@ -487,6 +512,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function fmtNum(n: number | null): string {
   return (n ?? 0).toLocaleString('en-US');
 }
+
 
 /**
  * Cache-busting version token for blob URLs: first 12 hex of the canonical file's content hash.

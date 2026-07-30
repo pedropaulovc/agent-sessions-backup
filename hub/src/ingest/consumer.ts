@@ -5,6 +5,7 @@ import { parseExportArchive } from './parsers/export-inbox';
 import { isFreshReservation, markPendingAndEnqueue, reservationCutoffIso } from '../queue';
 import { deriveProjectName } from '../project-name';
 import { computeFirstInteractionTitle, type TitleBlock } from '../session-title';
+import { turnFallbackKeyOf, turnKeyOf } from '../turn-key';
 
 interface FileRow {
   id: number;
@@ -414,7 +415,7 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
         // actually-parseable content — now stale, since the current bytes produced nothing.
         // Clear the derived rows (keep the sessions row itself so facets/raw access still
         // resolve) and mark the session errored.
-        await env.DB.batch([
+        const clearStatements = [
           env.DB.prepare(
             `INSERT INTO blocks_fts (blocks_fts, rowid, text) SELECT 'delete', id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL`,
           ).bind(det.sessionId),
@@ -424,7 +425,19 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
           // search metadata, and the detail header keep showing the stale title of the now-deleted
           // index (the old query-time derivation returned null once the blocks were gone).
           env.DB.prepare("UPDATE sessions SET index_state = 'error', first_interaction_title = NULL WHERE session_id = ?1").bind(det.sessionId),
-        ]);
+        ];
+        const sourceComplete =
+          parsed.stats.parseErrorLines === 0 && (parsed.stats.skippedLineTypes['oversized-line'] ?? 0) === 0;
+        if (sourceComplete) {
+          clearStatements.push(
+            env.DB.prepare(
+              `DELETE FROM starred_turns
+               WHERE session_id = ?1
+                 AND EXISTS (SELECT 1 FROM files source WHERE source.id = ?2 AND source.content_hash = ?3)`,
+            ).bind(det.sessionId, file.id, file.content_hash),
+          );
+        }
+        await env.DB.batch(clearStatements);
       }
       // A recovery-kicked duplicate (reason: 'recover') parsing to zero turns instead of throwing
       // doesn't match the canonical check above: canonical_file_id still points at the session's
@@ -2008,10 +2021,12 @@ async function writeSession(
       insertRows += sumRowsWritten(await db.batch(chunk));
     }
 
-    const machine = await db
-      .prepare('SELECT os FROM machines WHERE machine_id = ?1')
-      .bind(file.machine_id)
-      .first<{ os: string }>();
+    const machineOs = (
+      await db
+        .prepare('SELECT os FROM machines WHERE machine_id = ?1')
+        .bind(file.machine_id)
+        .first<{ os: string }>()
+    )?.os;
 
     // Derive the first-interaction title from the same blocks just written (block_index == bi, the
     // per-turn insert order above), so the listing queries read a stored column instead of an
@@ -2030,6 +2045,40 @@ async function writeSession(
       }
     }
     const firstInteractionTitle = computeFirstInteractionTitle(titleBlocks);
+
+    const keys = new Map<string, string>();
+    for (const turn of s.turns) {
+      if (turn.compaction || turn.blocks.length === 0) continue;
+      const primary = turnKeyOf(turn);
+      keys.set(primary, primary);
+      keys.set(turnFallbackKeyOf(turn), primary);
+    }
+    const encodedKeys = JSON.stringify(Object.fromEntries(keys));
+    const starReconciliation = [
+      db.prepare(
+        `INSERT OR IGNORE INTO starred_turns (session_id, turn_key, starred_at)
+         SELECT st.session_id, mapping.value, st.starred_at
+         FROM starred_turns st
+         JOIN json_each(?2) mapping ON mapping.key = st.turn_key
+         WHERE st.session_id = ?1
+           AND st.turn_key != mapping.value
+           AND EXISTS (SELECT 1 FROM files source WHERE source.id = ?3 AND source.content_hash = ?4)`,
+      ).bind(s.id, encodedKeys, file.id, file.content_hash),
+    ];
+    const sourceComplete =
+      s.stats.parseErrorLines === 0 && (s.stats.skippedLineTypes['oversized-line'] ?? 0) === 0;
+    if (sourceComplete) {
+      starReconciliation.push(
+        db.prepare(
+          `DELETE FROM starred_turns
+           WHERE session_id = ?1
+             AND EXISTS (SELECT 1 FROM files source WHERE source.id = ?3 AND source.content_hash = ?4)
+             AND NOT EXISTS (
+               SELECT 1 FROM json_each(?2) live WHERE live.value = starred_turns.turn_key
+             )`,
+        ).bind(s.id, encodedKeys, file.id, file.content_hash),
+      );
+    }
 
     batchesRun++;
     const finalizeRes = await db.batch([
@@ -2065,7 +2114,7 @@ async function writeSession(
           s.id,
           s.harness,
           file.machine_id,
-          machine?.os ?? null,
+          machineOs ?? null,
           file.id,
           s.cwd ?? null,
           s.repoUrl ?? null,
@@ -2087,6 +2136,7 @@ async function writeSession(
           totals.cached,
           firstInteractionTitle,
         ),
+      ...starReconciliation,
     ]);
 
     finalizeRows = sumRowsWritten(finalizeRes);

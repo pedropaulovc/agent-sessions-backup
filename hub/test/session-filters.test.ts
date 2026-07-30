@@ -72,6 +72,26 @@ describe('session multi-value filters', () => {
     ]);
   });
 
+  it('filters sessions by the presence of a star', () => {
+    const definition = facet('has_star');
+    expect(definition).toMatchObject({
+      param: 'has_star',
+      kind: 'has-star',
+      label: 'Has star',
+    });
+
+    const params = new URLSearchParams('has_star=1&has_star=0&has_star=yes&has_star=1');
+    expect(selectedValues(params, definition)).toEqual(['1']);
+
+    const filter = buildSessionFilterSql(params, 's', 3);
+    expect(filter.clause).toBe(
+      `(CASE WHEN EXISTS (SELECT 1 FROM starred_turns st WHERE st.session_id = s.session_id) THEN '1' END) ` +
+      `IN (SELECT value FROM json_each(?3))`,
+    );
+    expect(filter.binds).toEqual(['["1"]']);
+    expect(buildSessionFilterSql(params, 's', 1, 'has_star')).toEqual({ clause: '', binds: [] });
+  });
+
   it('retains facet names that collide with Object prototype keys', () => {
     const counts = mergeFacetCounts(
       [{ v: '__proto__', n: 7 }],

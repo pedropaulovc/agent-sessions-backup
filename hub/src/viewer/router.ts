@@ -1,10 +1,10 @@
-import { readSession } from '../auth/session';
+import { originOk, readSession } from '../auth/session';
 import { webauthnRoute } from '../auth/webauthn';
 import { downloadSessionRaw } from '../api/sessions';
 import { blobEndpoint } from './blob';
 import { machinesPage } from './machines';
 import { searchPage } from './search';
-import { sessionPage } from './session';
+import { sessionPage, TURNS_PER_PAGE } from './session';
 import { previewAccess, previewBootstrapRoute, withPreviewCookie } from './preview-auth';
 
 /**
@@ -38,9 +38,14 @@ export async function viewerRoute(request: Request, url: URL, env: Env): Promise
   const access = await viewerAccess(request, env);
   if (access === 'deny') return new Response(null, { status: 302, headers: { location: '/login' } });
 
-  if (request.method !== 'GET') return new Response('method not allowed', { status: 405 });
-
-  const res = await handle(url, env);
+  let res: Response;
+  if (request.method === 'GET') {
+    res = await handle(url, env);
+  } else if (request.method === 'POST') {
+    res = await handlePost(request, url, env);
+  } else {
+    res = new Response('method not allowed', { status: 405 });
+  }
   return access === 'issue-cookie' ? withPreviewCookie(res, env) : res;
 }
 
@@ -76,4 +81,111 @@ function handle(url: URL, env: Env): Promise<Response> {
   return Promise.resolve(
     new Response('not found', { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8' } }),
   );
+}
+
+async function handlePost(request: Request, url: URL, env: Env): Promise<Response> {
+  const turnStar = url.pathname.match(/^\/s\/([^/]+)\/turns\/(\d+)\/(star|unstar)$/);
+  if (!turnStar) return new Response('not found', { status: 404 });
+  if (!originOk(request)) return new Response('forbidden', { status: 403 });
+
+  const sessionId = decodeURIComponent(turnStar[1]!);
+  const turnIndex = Number(turnStar[2]);
+  const turn = await env.DB.prepare(
+    `SELECT f.content_hash, s.updated_at, s.index_state,
+            EXISTS (
+              SELECT 1 FROM blocks b
+              WHERE b.session_id = s.session_id
+                AND b.file_id = s.canonical_file_id
+                AND b.turn_index = ?2
+                AND b.btype != 'compaction'
+            ) AS turn_present
+     FROM sessions s
+     JOIN files f ON f.id = s.canonical_file_id
+     WHERE s.session_id = ?1`,
+  )
+    .bind(sessionId, turnIndex)
+    .first<{
+      content_hash: string;
+      updated_at: string | null;
+      index_state: string;
+      turn_present: number;
+    }>();
+  if (!turn) return new Response('turn not found', { status: 404 });
+
+  const form = await request.formData().catch(() => null);
+  const turnKey = form?.get('turn_key');
+  const transcriptRevision = form?.get('transcript_revision');
+  if (typeof turnKey !== 'string' || turnKey.length === 0 || turnKey.length > 1024) {
+    return new Response('bad turn key', { status: 400 });
+  }
+  const currentRevision = `${turn.content_hash}:${turn.updated_at ?? ''}`;
+  if (
+    turn.index_state !== 'ready' ||
+    typeof transcriptRevision !== 'string' ||
+    transcriptRevision !== currentRevision
+  ) {
+    return new Response('stale transcript', { status: 409 });
+  }
+  if (turn.turn_present !== 1) return new Response('turn not found', { status: 404 });
+
+  let applied: { applied: number } | null;
+  if (turnStar[3] === 'star') {
+    applied = await env.DB.prepare(
+      `INSERT INTO starred_turns (session_id, turn_key)
+       SELECT ?1, ?2
+       WHERE EXISTS (
+         SELECT 1
+         FROM sessions s
+         JOIN files f ON f.id = s.canonical_file_id
+         JOIN blocks b ON b.session_id = s.session_id AND b.file_id = s.canonical_file_id
+         WHERE s.session_id = ?1
+           AND s.index_state = 'ready'
+           AND b.turn_index = ?3
+           AND b.btype != 'compaction'
+           AND f.content_hash || ':' || COALESCE(s.updated_at, '') = ?4
+       )
+       ON CONFLICT (session_id, turn_key) DO UPDATE SET turn_key = excluded.turn_key
+       RETURNING 1 AS applied`,
+    )
+      .bind(sessionId, turnKey, turnIndex, transcriptRevision)
+      .first<{ applied: number }>();
+  } else {
+    const [guard] = await env.DB.batch<{ applied: number }>([
+      env.DB.prepare(
+        `SELECT 1 AS applied
+         FROM sessions s
+         JOIN files f ON f.id = s.canonical_file_id
+         JOIN blocks b ON b.session_id = s.session_id AND b.file_id = s.canonical_file_id
+         WHERE s.session_id = ?1
+           AND s.index_state = 'ready'
+           AND b.turn_index = ?3
+           AND b.btype != 'compaction'
+           AND f.content_hash || ':' || COALESCE(s.updated_at, '') = ?4
+         LIMIT 1`,
+      ).bind(sessionId, turnKey, turnIndex, transcriptRevision),
+      env.DB.prepare(
+        `DELETE FROM starred_turns
+         WHERE session_id = ?1
+           AND turn_key = ?2
+           AND EXISTS (
+             SELECT 1
+             FROM sessions s
+             JOIN files f ON f.id = s.canonical_file_id
+             JOIN blocks b ON b.session_id = s.session_id AND b.file_id = s.canonical_file_id
+             WHERE s.session_id = ?1
+               AND s.index_state = 'ready'
+               AND b.turn_index = ?3
+               AND b.btype != 'compaction'
+               AND f.content_hash || ':' || COALESCE(s.updated_at, '') = ?4
+           )`,
+      ).bind(sessionId, turnKey, turnIndex, transcriptRevision),
+    ]);
+    applied = guard?.results[0] ?? null;
+  }
+  if (!applied) return new Response('stale transcript', { status: 409 });
+
+  const page = Math.floor(turnIndex / TURNS_PER_PAGE) + 1;
+  const view = url.searchParams.get('view') === 'effective' ? 'effective' : 'chronological';
+  const location = `/s/${encodeURIComponent(sessionId)}?page=${page}&view=${view}#t${turnIndex}`;
+  return new Response(null, { status: 303, headers: { location } });
 }
