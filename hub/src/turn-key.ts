@@ -22,11 +22,9 @@ export function turnFallbackKeyOf(turn: NormalizedTurn): string {
   };
 
   mix(turn.role);
-  mix(turn.parentId);
   mix(turn.ts);
-  mix(turn.model);
-  // Without a source ID, absolute position is the only discriminator for otherwise identical
-  // records. Ranged parsing preserves absolute offsets, so the key stays page-independent.
+  // Parser context such as model and parent lineage may sit outside a viewer byte range. Only hash
+  // fields intrinsic to the rendered source records so full-ingest and ranged keys stay identical.
   mix(turn.blocks[0]?.byteStart ?? turn.byteStart);
   for (const block of turn.blocks) {
     mix(block.type);

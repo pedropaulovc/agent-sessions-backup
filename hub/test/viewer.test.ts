@@ -1330,7 +1330,7 @@ describe('viewer', () => {
     expect(turnKeyOf(repeated)).not.toBe(turnKeyOf(first));
   });
 
-  it('retains the id-less fallback as an alias when a live source ID arrives', () => {
+  it('ignores parser context when retaining the id-less fallback for a live source ID', () => {
     const partial = {
       index: 3,
       onMainPath: true,
@@ -1338,7 +1338,7 @@ describe('viewer', () => {
       ts: '2026-07-30T12:00:00Z',
       blocks: [{ type: 'text' as const, text: 'live event message', byteStart: 100, byteLen: 20 }],
     };
-    const completed = { ...partial, id: 'assistant:t1:id:msg_1' };
+    const completed = { ...partial, id: 'assistant:t1:id:msg_1', model: 'gpt-5', parentId: 'context-only-parent' };
 
     expect(turnFallbackKeyOf(completed)).toBe(turnKeyOf(partial));
     expect(turnKeyOf(completed)).not.toBe(turnKeyOf(partial));
