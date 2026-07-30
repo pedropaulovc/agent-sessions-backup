@@ -2118,7 +2118,7 @@ async function writeSession(
       ...starReconciliation,
     ]);
 
-    finalizeRows = finalizeRes[0]?.meta.changes ?? 0;
+    finalizeRows = sumRowsWritten(finalizeRes);
     emitWriteCost('ok');
 
     // SUBREQUESTS (see the counting-model note above): prefix probe (1, only when retention is on) +
