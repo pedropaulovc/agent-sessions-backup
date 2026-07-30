@@ -22,9 +22,11 @@ override a preview deploy would steal the production custom domains).
 
 `.github/workflows/ci.yml` is the sole production deployer. Cloudflare Workers
 Builds production auto-deploy is disabled. After the hub typecheck and tests pass,
-one concurrency-locked job applies D1 migrations and then deploys `sessions-hub`;
-keeping both commands in one job prevents two main pushes from interleaving a
-newer migration with an older Worker deploy.
+one concurrency-locked job applies D1 migrations and then deploys `sessions-hub`.
+GitHub does not guarantee the order of jobs waiting on a concurrency group, so the
+job fetches `main` after acquiring the lock and skips every step after checkout when
+its commit is stale. Together, the lock and freshness guard prevent interleaved
+migrations and an older run rolling production back after a newer deployment.
 The Worker deploy passes `--env ""` explicitly so Wrangler selects the top-level
 production bindings instead of relying on its multiple-environment default.
 
