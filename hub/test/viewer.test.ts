@@ -809,6 +809,22 @@ describe('viewer', () => {
       redirect: 'manual',
     });
     expect(rejected.status).toBe(403);
+    await testEnv.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1")
+      .bind(SEARCH_SESSION)
+      .run();
+    const indexing = await SELF.fetch(`${endpoint}/star`, {
+      method: 'POST',
+      headers: {
+        origin: 'https://sessions.vza.net',
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ turn_key: 'id:u1', transcript_revision: revision }),
+      redirect: 'manual',
+    });
+    await testEnv.DB.prepare("UPDATE sessions SET index_state = 'ready' WHERE session_id = ?1")
+      .bind(SEARCH_SESSION)
+      .run();
+    expect(indexing.status).toBe(409);
 
     const starred = await SELF.fetch(`${endpoint}/star?view=chronological`, {
       method: 'POST',
@@ -1223,7 +1239,7 @@ describe('viewer', () => {
     expect(blobVersionOf('g'.repeat(64))).toBe(''); // non-hex
   });
 
-  it('fingerprints id-less turns independently of index and byte offsets', () => {
+  it('fingerprints timestamped id-less turns independently of index and byte offsets', () => {
     const original = {
       index: 3,
       onMainPath: true,
@@ -1244,6 +1260,22 @@ describe('viewer', () => {
 
     expect(turnKeyOf(moved)).toBe(turnKeyOf(original));
     expect(turnKeyOf(changed)).not.toBe(turnKeyOf(original));
+  });
+
+  it('uses source offsets to disambiguate identical timestamp-less id-less turns', () => {
+    const first = {
+      index: 3,
+      onMainPath: true,
+      role: 'user' as const,
+      blocks: [{ type: 'text' as const, text: 'continue', byteStart: 100, byteLen: 10 }],
+    };
+    const repeated = {
+      ...first,
+      index: 9,
+      blocks: [{ ...first.blocks[0]!, byteStart: 900 }],
+    };
+
+    expect(turnKeyOf(repeated)).not.toBe(turnKeyOf(first));
   });
 
   it('serves a checksum-less blob revalidatable (no immutable, no redirect loop)', async () => {

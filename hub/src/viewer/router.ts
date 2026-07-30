@@ -91,15 +91,25 @@ async function handlePost(request: Request, url: URL, env: Env): Promise<Respons
   const sessionId = decodeURIComponent(turnStar[1]!);
   const turnIndex = Number(turnStar[2]);
   const turn = await env.DB.prepare(
-    `SELECT f.content_hash, s.updated_at
-     FROM blocks b
-     JOIN sessions s ON s.session_id = b.session_id
+    `SELECT f.content_hash, s.updated_at, s.index_state,
+            EXISTS (
+              SELECT 1 FROM blocks b
+              WHERE b.session_id = s.session_id
+                AND b.file_id = s.canonical_file_id
+                AND b.turn_index = ?2
+                AND b.btype != 'compaction'
+            ) AS turn_present
+     FROM sessions s
      JOIN files f ON f.id = s.canonical_file_id
-     WHERE b.session_id = ?1 AND b.turn_index = ?2 AND b.btype != 'compaction'
-     LIMIT 1`,
+     WHERE s.session_id = ?1`,
   )
     .bind(sessionId, turnIndex)
-    .first<{ content_hash: string; updated_at: string | null }>();
+    .first<{
+      content_hash: string;
+      updated_at: string | null;
+      index_state: string;
+      turn_present: number;
+    }>();
   if (!turn) return new Response('turn not found', { status: 404 });
 
   const form = await request.formData().catch(() => null);
@@ -109,9 +119,14 @@ async function handlePost(request: Request, url: URL, env: Env): Promise<Respons
     return new Response('bad turn key', { status: 400 });
   }
   const currentRevision = `${turn.content_hash}:${turn.updated_at ?? ''}`;
-  if (typeof transcriptRevision !== 'string' || transcriptRevision !== currentRevision) {
+  if (
+    turn.index_state !== 'ready' ||
+    typeof transcriptRevision !== 'string' ||
+    transcriptRevision !== currentRevision
+  ) {
     return new Response('stale transcript', { status: 409 });
   }
+  if (turn.turn_present !== 1) return new Response('turn not found', { status: 404 });
 
   if (turnStar[3] === 'star') {
     await env.DB.prepare(

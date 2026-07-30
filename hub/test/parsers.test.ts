@@ -421,10 +421,10 @@ describe('parseCodex', () => {
     // user → assistant (thinking+tool_use) → tool (result) → assistant (text) → compaction marker
     expect(roles).toEqual(['user', 'assistant', 'tool', 'assistant', 'system']);
     expect(s.turns.map((turn) => turn.id)).toEqual([
-      'user:t1:1',
-      'assistant:t2:1',
-      'tool:t2:1',
-      'assistant:t2:2',
+      'user:t1:at:2026-07-02T09:00:02.000Z',
+      'assistant:t2:id:rs_1',
+      'tool:t2:call:call_1',
+      'assistant:t2:at:2026-07-02T09:00:06.000Z',
       undefined,
     ]);
 
@@ -456,6 +456,50 @@ describe('parseCodex', () => {
     expect(assistantTexts).toHaveLength(1);
 
     expect(s.turns[4]!.compaction?.kind).toBe('codex-window');
+  });
+
+  it('keeps Codex source identities stable when parsing a later byte-range page', async () => {
+    const records = [
+      {
+        timestamp: '2026-07-10T10:00:00.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'before the page boundary' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      {
+        timestamp: '2026-07-10T10:00:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'function_call_output',
+          call_id: 'call-page',
+          output: 'tool result at the boundary',
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+      {
+        timestamp: '2026-07-10T10:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'after the page boundary' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 't1' },
+        },
+      },
+    ].map((record) => JSON.stringify(record));
+    const full = await parseCodex(readJsonlLines(toStream(records)), CODEX_SESSION_ID);
+    const rangeOffset = records[0]!.length + records[1]!.length + 2;
+    const ranged = await parseCodex(
+      readJsonlLines(toStream(records.slice(2)), rangeOffset),
+      CODEX_SESSION_ID,
+    );
+
+    expect(full.turns[2]!.id).toBe(ranged.turns[0]!.id);
+    expect(full.turns[2]!.id).not.toBe(full.turns[0]!.id);
   });
 
   it('keeps a usage-only turn when token_count is the only billable event before EOF (regression: flush dropped 0-block turns even with usage set)', async () => {

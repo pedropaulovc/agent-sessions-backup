@@ -32,7 +32,6 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
   let current: NormalizedTurn | undefined;
   let currentTurnId: string | undefined;
   let lastAssistant: NormalizedTurn | undefined;
-  const sourceTurnOccurrences = new Map<string, number>();
   let firstUserText: string | undefined;
   // Codex represents one logical message TWICE on the wire: once as event_msg/user_message|
   // agent_message, once as response_item/message. These two maps pair up that duplicate
@@ -56,24 +55,28 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
     pendingFromResponseItem.clear();
     pendingFromEventMsg.clear();
   };
-  const sourceTurnIdentity = (role: Role, turnId: string): string => {
-    const base = `${role}:${turnId}`;
-    const occurrence = (sourceTurnOccurrences.get(base) ?? 0) + 1;
-    sourceTurnOccurrences.set(base, occurrence);
-    return `${base}:${occurrence}`;
-  };
-  const openTurn = (role: Role, ts: string | undefined, turnId: string | undefined) => {
+  const sourceTurnIdentity = (
+    role: Role,
+    turnId: string,
+    sourceItem: string,
+  ): string => `${role}:${turnId}:${sourceItem}`;
+  const openTurn = (
+    role: Role,
+    ts: string | undefined,
+    turnId: string | undefined,
+    sourceItem?: string,
+  ) => {
     if (current && (current.role !== role || (turnId && currentTurnId && turnId !== currentTurnId))) flush();
-    if (current && turnId && !currentTurnId && !current.id) {
+    if (current && turnId && sourceItem && !currentTurnId && !current.id) {
       // An event_msg may open the turn before its response_item twin supplies the source ID.
       // Attach the identity without changing the grouping boundary: leaving currentTurnId
       // unset preserves pairing when the next response item starts a new source turn.
-      current.id = sourceTurnIdentity(role, turnId);
+      current.id = sourceTurnIdentity(role, turnId, sourceItem);
     }
     if (!current) {
       current = {
         index: session.turns.length,
-        id: turnId ? sourceTurnIdentity(role, turnId) : undefined,
+        id: turnId && sourceItem ? sourceTurnIdentity(role, turnId, sourceItem) : undefined,
         onMainPath: true,
         role,
         ts,
@@ -215,6 +218,15 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       ? p.internal_chat_message_metadata_passthrough
       : undefined;
     const turnId = str(meta?.turn_id);
+    const itemId = str(p.id);
+    const callId = str(p.call_id);
+    const sourceItem = itemId
+      ? `id:${itemId}`
+      : callId
+        ? `call:${callId}`
+        : ts
+          ? `at:${ts}`
+          : `payload:${messageKey(safeJson(p))}:offset:${at.byteStart}`;
     switch (p.type) {
       case 'message': {
         const role = (str(p.role) as Role) ?? 'assistant';
@@ -225,7 +237,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         // that first means a message that itself opens a new turn gets to register its own
         // pending count in the FRESH map, instead of registering then immediately having its own
         // turn-opening flush wipe it out.
-        const turn = openTurn(role === 'developer' ? 'developer' : role, ts, turnId);
+        const turn = openTurn(role === 'developer' ? 'developer' : role, ts, turnId, sourceItem);
         if (!shouldIndexMessage('response_item', role, text)) break;
         const c = cap(text, CAPS.text);
         turn.blocks.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });
@@ -236,7 +248,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         // Often only encrypted_content is present — index summary text when it exists.
         const text = contentText(p.summary) || contentText(p.content);
         if (!text) break;
-        const turn = openTurn('assistant', ts, turnId);
+        const turn = openTurn('assistant', ts, turnId, sourceItem);
         const c = cap(text, CAPS.thinking);
         turn.blocks.push({ type: 'thinking', text: c.text, truncated: c.truncated, ...at });
         break;
@@ -245,7 +257,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       case 'custom_tool_call': {
         const name = str(p.name) ?? 'tool';
         const args = str(p.arguments) ?? str(p.input) ?? '';
-        const turn = openTurn('assistant', ts, turnId);
+        const turn = openTurn('assistant', ts, turnId, sourceItem);
         const c = cap(`${name} ${args}`, CAPS.tool_use);
         turn.blocks.push({
           type: 'tool_use',
@@ -261,7 +273,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       case 'custom_tool_call_output': {
         const out = p.output;
         const text = typeof out === 'string' ? out : contentText(out) || safeJson(out);
-        const turn = openTurn('tool', ts, turnId);
+        const turn = openTurn('tool', ts, turnId, sourceItem);
         const c = cap(text, CAPS.tool_result);
         turn.blocks.push({
           type: 'tool_result',
