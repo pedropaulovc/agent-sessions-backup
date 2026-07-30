@@ -2048,8 +2048,10 @@ async function writeSession(
          SELECT st.session_id, mapping.value, st.starred_at
          FROM starred_turns st
          JOIN json_each(?2) mapping ON mapping.key = st.turn_key
-         WHERE st.session_id = ?1 AND st.turn_key != mapping.value`,
-      ).bind(s.id, encodedKeys),
+         WHERE st.session_id = ?1
+           AND st.turn_key != mapping.value
+           AND EXISTS (SELECT 1 FROM files source WHERE source.id = ?3 AND source.content_hash = ?4)`,
+      ).bind(s.id, encodedKeys, file.id, file.content_hash),
     ];
     const sourceComplete =
       s.stats.parseErrorLines === 0 && (s.stats.skippedLineTypes['oversized-line'] ?? 0) === 0;
@@ -2058,10 +2060,11 @@ async function writeSession(
         db.prepare(
           `DELETE FROM starred_turns
            WHERE session_id = ?1
+             AND EXISTS (SELECT 1 FROM files source WHERE source.id = ?3 AND source.content_hash = ?4)
              AND NOT EXISTS (
                SELECT 1 FROM json_each(?2) live WHERE live.value = starred_turns.turn_key
              )`,
-        ).bind(s.id, encodedKeys),
+        ).bind(s.id, encodedKeys, file.id, file.content_hash),
       );
     }
 
