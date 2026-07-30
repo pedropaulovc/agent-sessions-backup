@@ -34,6 +34,7 @@ interface SessionMeta {
   tokens_reasoning: number | null;
   tokens_cached: number | null;
   index_state: string;
+  updated_at: string | null;
 }
 
 type View = 'chronological' | 'effective';
@@ -42,7 +43,7 @@ type View = 'chronological' | 'effective';
 export async function sessionPage(sessionId: string, url: URL, env: Env): Promise<Response> {
   const meta = await env.DB.prepare(
     `SELECT session_id, harness, machine_id, os, cwd, repo_url, git_branch, primary_model,
-            first_interaction_title, title, started_at, ended_at,
+            first_interaction_title, title, started_at, ended_at, updated_at,
             parent_session_id, is_sidechain, turn_count, tokens_in, tokens_out, tokens_reasoning, tokens_cached, index_state
      FROM sessions WHERE session_id = ?1`,
   )
@@ -59,6 +60,7 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
   // Cache-busting token for blob URLs: block ids (rowids) are reused across reindexes, so the
   // 1-year immutable cache is keyed on the canonical file's content hash prefix.
   const blobVersion = blobVersionOf(file?.content_hash);
+  const transcriptRevision = `${file?.content_hash ?? ''}:${meta.updated_at ?? ''}`;
 
   const view: View = url.searchParams.get('view') === 'effective' ? 'effective' : 'chronological';
   const maxTurn = (
@@ -160,6 +162,7 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
               onMainPath,
               key,
               starredKeys.has(key),
+              transcriptRevision,
               blobVersion,
               toolPairs,
             );
@@ -280,6 +283,7 @@ function renderTurn(
   onMainPath: boolean,
   turnKey: string,
   starred: boolean,
+  transcriptRevision: string,
   blobVersion: string,
   toolPairs: ToolPairs,
 ): string {
@@ -299,6 +303,7 @@ function renderTurn(
     ? ''
     : `<form class="turn-star" method="post" action="/s/${q(sessionId)}/turns/${turnIndex}/${starred ? 'unstar' : 'star'}?view=${view}">` +
       `<input type="hidden" name="turn_key" value="${esc(turnKey)}">` +
+      `<input type="hidden" name="transcript_revision" value="${esc(transcriptRevision)}">` +
       `<button type="submit" aria-label="${starred ? 'Unstar' : 'Star'} turn" aria-pressed="${starred}" title="${starred ? 'Unstar' : 'Star'} turn">` +
       `${starred ? '&#9733;' : '&#9734;'}</button></form>`;
   const head = `<div class="turnhead"><span class="role">${esc(turn.role)}</span>${model}${ts}${star}</div>`;

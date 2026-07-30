@@ -240,6 +240,18 @@ async function deliverOne(fileId: number, r2Key: string): Promise<void> {
   await worker.queue({ queue: 'parse', messages: [message], ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>, testEnv);
 }
 
+async function transcriptRevision(sessionId: string): Promise<string> {
+  const row = await testEnv.DB.prepare(
+    `SELECT f.content_hash, s.updated_at
+     FROM sessions s JOIN files f ON f.id = s.canonical_file_id
+     WHERE s.session_id = ?1`,
+  )
+    .bind(sessionId)
+    .first<{ content_hash: string; updated_at: string | null }>();
+  if (!row) throw new Error(`missing transcript revision for ${sessionId}`);
+  return `${row.content_hash}:${row.updated_at ?? ''}`;
+}
+
 let rewindFileId = 0;
 let rewindR2Key = '';
 let starStableFileId = 0;
@@ -787,6 +799,8 @@ describe('viewer', () => {
     const initial = await (await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`)).text();
     expect(initial).toContain(`action="/s/${SEARCH_SESSION}/turns/0/star?view=chronological"`);
     expect(initial).toContain('<input type="hidden" name="turn_key" value="id:u1">');
+    expect(initial).toContain('<input type="hidden" name="transcript_revision"');
+    const revision = await transcriptRevision(SEARCH_SESSION);
     expect(initial).toContain('aria-label="Star turn" aria-pressed="false"');
 
     const rejected = await SELF.fetch(`${endpoint}/star`, {
@@ -802,7 +816,7 @@ describe('viewer', () => {
         origin: 'https://sessions.vza.net',
         'content-type': 'application/x-www-form-urlencoded',
       },
-      body: 'turn_key=id%3Au1',
+      body: new URLSearchParams({ turn_key: 'id:u1', transcript_revision: revision }),
       redirect: 'manual',
     });
     expect(starred.status).toBe(303);
@@ -819,7 +833,7 @@ describe('viewer', () => {
         origin: 'https://sessions.vza.net',
         'content-type': 'application/x-www-form-urlencoded',
       },
-      body: 'turn_key=id%3Au1',
+      body: new URLSearchParams({ turn_key: 'id:u1', transcript_revision: revision }),
       redirect: 'manual',
     });
     expect(unstarred.status).toBe(303);
@@ -832,13 +846,14 @@ describe('viewer', () => {
 
   it('keeps a star attached across turn insertion and session replacement', async () => {
     const endpoint = `https://sessions.vza.net/s/${STAR_STABLE_SESSION}/turns/1/star`;
+    const revision = await transcriptRevision(STAR_STABLE_SESSION);
     const starred = await SELF.fetch(endpoint, {
       method: 'POST',
       headers: {
         origin: 'https://sessions.vza.net',
         'content-type': 'application/x-www-form-urlencoded',
       },
-      body: 'turn_key=id%3Astable-target',
+      body: new URLSearchParams({ turn_key: 'id:stable-target', transcript_revision: revision }),
       redirect: 'manual',
     });
     expect(starred.status).toBe(303);
@@ -857,6 +872,20 @@ describe('viewer', () => {
     const reordered = await (await SELF.fetch(`https://sessions.vza.net/s/${STAR_STABLE_SESSION}`)).text();
     expect(reordered).toMatch(/<article id="t2" class="turn assistant starred">[\s\S]*?stable starred target/);
     expect(reordered).not.toMatch(/<article id="t1" class="turn user starred">/);
+
+    const stale = await SELF.fetch(
+      `https://sessions.vza.net/s/${STAR_STABLE_SESSION}/turns/2/unstar`,
+      {
+        method: 'POST',
+        headers: {
+          origin: 'https://sessions.vza.net',
+          'content-type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({ turn_key: 'id:stable-target', transcript_revision: revision }),
+        redirect: 'manual',
+      },
+    );
+    expect(stale.status).toBe(409);
 
     await testEnv.DB.prepare('DELETE FROM sessions WHERE session_id = ?1').bind(STAR_STABLE_SESSION).run();
     const preserved = await testEnv.DB.prepare(
@@ -886,6 +915,7 @@ describe('viewer', () => {
     ).text();
     expect(searched).toContain(`/s/${STAR_STABLE_SESSION}`);
 
+    const recoveredRevision = await transcriptRevision(STAR_STABLE_SESSION);
     const unstarred = await SELF.fetch(
       `https://sessions.vza.net/s/${STAR_STABLE_SESSION}/turns/2/unstar`,
       {
@@ -894,7 +924,10 @@ describe('viewer', () => {
           origin: 'https://sessions.vza.net',
           'content-type': 'application/x-www-form-urlencoded',
         },
-        body: 'turn_key=id%3Astable-target',
+        body: new URLSearchParams({
+          turn_key: 'id:stable-target',
+          transcript_revision: recoveredRevision,
+        }),
         redirect: 'manual',
       },
     );

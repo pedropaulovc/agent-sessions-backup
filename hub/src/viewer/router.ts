@@ -91,18 +91,26 @@ async function handlePost(request: Request, url: URL, env: Env): Promise<Respons
   const sessionId = decodeURIComponent(turnStar[1]!);
   const turnIndex = Number(turnStar[2]);
   const turn = await env.DB.prepare(
-    `SELECT 1 AS present FROM blocks
-     WHERE session_id = ?1 AND turn_index = ?2 AND btype != 'compaction'
+    `SELECT f.content_hash, s.updated_at
+     FROM blocks b
+     JOIN sessions s ON s.session_id = b.session_id
+     JOIN files f ON f.id = s.canonical_file_id
+     WHERE b.session_id = ?1 AND b.turn_index = ?2 AND b.btype != 'compaction'
      LIMIT 1`,
   )
     .bind(sessionId, turnIndex)
-    .first<{ present: number }>();
+    .first<{ content_hash: string; updated_at: string | null }>();
   if (!turn) return new Response('turn not found', { status: 404 });
 
   const form = await request.formData().catch(() => null);
   const turnKey = form?.get('turn_key');
+  const transcriptRevision = form?.get('transcript_revision');
   if (typeof turnKey !== 'string' || turnKey.length === 0 || turnKey.length > 1024) {
     return new Response('bad turn key', { status: 400 });
+  }
+  const currentRevision = `${turn.content_hash}:${turn.updated_at ?? ''}`;
+  if (typeof transcriptRevision !== 'string' || transcriptRevision !== currentRevision) {
+    return new Response('stale transcript', { status: 409 });
   }
 
   if (turnStar[3] === 'star') {

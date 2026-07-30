@@ -32,6 +32,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
   let current: NormalizedTurn | undefined;
   let currentTurnId: string | undefined;
   let lastAssistant: NormalizedTurn | undefined;
+  const sourceTurnOccurrences = new Map<string, number>();
   let firstUserText: string | undefined;
   // Codex represents one logical message TWICE on the wire: once as event_msg/user_message|
   // agent_message, once as response_item/message. These two maps pair up that duplicate
@@ -55,10 +56,29 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
     pendingFromResponseItem.clear();
     pendingFromEventMsg.clear();
   };
+  const sourceTurnIdentity = (role: Role, turnId: string): string => {
+    const base = `${role}:${turnId}`;
+    const occurrence = (sourceTurnOccurrences.get(base) ?? 0) + 1;
+    sourceTurnOccurrences.set(base, occurrence);
+    return `${base}:${occurrence}`;
+  };
   const openTurn = (role: Role, ts: string | undefined, turnId: string | undefined) => {
     if (current && (current.role !== role || (turnId && currentTurnId && turnId !== currentTurnId))) flush();
+    if (current && turnId && !currentTurnId && !current.id) {
+      // An event_msg may open the turn before its response_item twin supplies the source ID.
+      // Attach the identity without changing the grouping boundary: leaving currentTurnId
+      // unset preserves pairing when the next response item starts a new source turn.
+      current.id = sourceTurnIdentity(role, turnId);
+    }
     if (!current) {
-      current = { index: session.turns.length, onMainPath: true, role, ts, blocks: [] };
+      current = {
+        index: session.turns.length,
+        id: turnId ? sourceTurnIdentity(role, turnId) : undefined,
+        onMainPath: true,
+        role,
+        ts,
+        blocks: [],
+      };
       currentTurnId = turnId;
       // A new user/developer/system turn means whatever assistant call preceded it is done; a
       // token_count that arrives after this (for a reply with no indexable block, e.g.

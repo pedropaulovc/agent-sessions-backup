@@ -61,6 +61,9 @@ export async function parsePromptLog(
     const c = cap(text, CAPS.prompt);
     const turn: NormalizedTurn = {
       index: session.turns.length,
+      // history.jsonl is append-only, so the source byte offset is a stable identity and
+      // disambiguates repeated id-less prompts even when timestamps are absent.
+      id: `prompt-offset:${line.byteStart}`,
       onMainPath: true,
       role: 'user',
       ts,

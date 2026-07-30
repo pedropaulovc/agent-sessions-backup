@@ -166,6 +166,24 @@ describe('readJsonlLines', () => {
   });
 });
 
+describe('parsePromptLog', () => {
+  it('gives repeated timestamp-less prompts distinct append-stable identities', async () => {
+    const records = [
+      JSON.stringify({ display: 'continue' }),
+      JSON.stringify({ display: 'continue' }),
+    ];
+    const session = await parsePromptLog(
+      readJsonlLines(toStream(records)),
+      'promptlog:testbox:claude',
+    );
+
+    expect(session.turns.map((turn) => turn.id)).toEqual([
+      'prompt-offset:0',
+      `prompt-offset:${records[0]!.length + 1}`,
+    ]);
+  });
+});
+
 describe('parseClaudeCode', () => {
   it('parses turns, skips noise, extracts usage/title, survives malformed lines', async () => {
     const lines = [
@@ -402,6 +420,13 @@ describe('parseCodex', () => {
     const roles = s.turns.map((t) => t.role);
     // user → assistant (thinking+tool_use) → tool (result) → assistant (text) → compaction marker
     expect(roles).toEqual(['user', 'assistant', 'tool', 'assistant', 'system']);
+    expect(s.turns.map((turn) => turn.id)).toEqual([
+      'user:t1:1',
+      'assistant:t2:1',
+      'tool:t2:1',
+      'assistant:t2:2',
+      undefined,
+    ]);
 
     const assistant = s.turns[1]!;
     expect(assistant.blocks.map((b) => b.type)).toEqual(['thinking', 'tool_use']);
