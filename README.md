@@ -24,7 +24,7 @@ Backup, index, search, and render AI agent/chat sessions from every machine and 
 Run this in PowerShell to update an enrolled collector to the current `main` branch, replace its scheduled task, and send an immediate heartbeat. It waits for an in-progress scheduled run before replacing the tool, so it never updates the executable under that process.
 
 ```powershell
-$collector = Join-Path $env:USERPROFILE '.local\bin\agent-collector.exe'; while ((Get-ScheduledTask -TaskName agent-collector -ErrorAction SilentlyContinue).State -eq 'Running') { Start-Sleep -Seconds 2 }; uv tool install --force --reinstall --no-cache 'git+https://github.com/pedropaulovc/agent-sessions-backup.git@main#subdirectory=collector'; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & $collector install --interval 15; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; & $collector run --heartbeat-only; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+iwr https://raw.githubusercontent.com/pedropaulovc/agent-sessions-backup/main/scripts/setup-windows-collector.ps1 | iex
 ```
 
 ## Principles
