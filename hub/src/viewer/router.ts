@@ -99,16 +99,22 @@ async function handlePost(request: Request, url: URL, env: Env): Promise<Respons
     .first<{ present: number }>();
   if (!turn) return new Response('turn not found', { status: 404 });
 
+  const form = await request.formData().catch(() => null);
+  const turnKey = form?.get('turn_key');
+  if (typeof turnKey !== 'string' || turnKey.length === 0 || turnKey.length > 1024) {
+    return new Response('bad turn key', { status: 400 });
+  }
+
   if (turnStar[3] === 'star') {
     await env.DB.prepare(
-      `INSERT INTO starred_turns (session_id, turn_index) VALUES (?1, ?2)
-       ON CONFLICT (session_id, turn_index) DO NOTHING`,
+      `INSERT INTO starred_turns (session_id, turn_key) VALUES (?1, ?2)
+       ON CONFLICT (session_id, turn_key) DO NOTHING`,
     )
-      .bind(sessionId, turnIndex)
+      .bind(sessionId, turnKey)
       .run();
   } else {
-    await env.DB.prepare('DELETE FROM starred_turns WHERE session_id = ?1 AND turn_index = ?2')
-      .bind(sessionId, turnIndex)
+    await env.DB.prepare('DELETE FROM starred_turns WHERE session_id = ?1 AND turn_key = ?2')
+      .bind(sessionId, turnKey)
       .run();
   }
 

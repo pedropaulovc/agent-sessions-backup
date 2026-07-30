@@ -76,6 +76,13 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
   )
     .bind(sessionId)
     .all<{ session_id: string; title: string | null }>();
+  const starredKeys = new Set(
+    (
+      await env.DB.prepare('SELECT turn_key FROM starred_turns WHERE session_id = ?1')
+        .bind(sessionId)
+        .all<{ turn_key: string }>()
+    ).results.map((row) => row.turn_key),
+  );
 
   // Page = turn_index bucket. Byte window co-monotonic with turn_index (file order), so it covers exactly [lo, hi).
   const startByte = await firstByteFrom(env, sessionId, lo);
@@ -95,22 +102,21 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
        ), turn_meta AS (
          SELECT turn_index, MAX(on_main_path) AS on_main_path FROM page_blocks GROUP BY turn_index
        )
-       SELECT p.turn_index, p.byte_start, m.on_main_path, st.turn_index IS NOT NULL AS starred
+       SELECT p.turn_index, p.byte_start, m.on_main_path
        FROM page_blocks p
        JOIN turn_meta m ON m.turn_index = p.turn_index
-       LEFT JOIN starred_turns st ON st.session_id = ?1 AND st.turn_index = p.turn_index
        WHERE p.byte_start IS NOT NULL
-       GROUP BY p.turn_index, p.byte_start, st.turn_index
+       GROUP BY p.turn_index, p.byte_start
        ORDER BY p.turn_index, p.byte_start`,
     )
       .bind(sessionId, lo, hi)
-      .all<{ turn_index: number; byte_start: number | null; on_main_path: number; starred: number }>()
+      .all<{ turn_index: number; byte_start: number | null; on_main_path: number }>()
   ).results;
-  const pageTurnsByByteStart = new Map<number, Array<{ turnIndex: number; onMainPath: boolean; starred: boolean }>>();
+  const pageTurnsByByteStart = new Map<number, Array<{ turnIndex: number; onMainPath: boolean }>>();
   for (const row of pageTurns) {
     if (row.byte_start === null) continue;
     const queue = pageTurnsByByteStart.get(row.byte_start) ?? [];
-    queue.push({ turnIndex: row.turn_index, onMainPath: row.on_main_path === 1, starred: row.starred === 1 });
+    queue.push({ turnIndex: row.turn_index, onMainPath: row.on_main_path === 1 });
     pageTurnsByByteStart.set(row.byte_start, queue);
   }
 
@@ -144,6 +150,7 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
             // Prefer the persisted main-path flag; fall back to the parser's per-page guess only when the
             // D1 lookup has no matching row (e.g. compaction markers, which have no content block rows).
             const onMainPath = indexed ? indexed.onMainPath : turn.onMainPath;
+            const key = turnKeyOf(turn);
             const html = renderTurn(
               turn,
               sessionId,
@@ -151,7 +158,8 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
               mediaIds,
               indexed?.turnIndex,
               onMainPath,
-              indexed?.starred ?? false,
+              key,
+              starredKeys.has(key),
               blobVersion,
               toolPairs,
             );
@@ -270,6 +278,7 @@ function renderTurn(
   mediaIds: Map<string, number>,
   turnIndex: number | undefined,
   onMainPath: boolean,
+  turnKey: string,
   starred: boolean,
   blobVersion: string,
   toolPairs: ToolPairs,
@@ -289,6 +298,7 @@ function renderTurn(
   const star = turnIndex === undefined
     ? ''
     : `<form class="turn-star" method="post" action="/s/${q(sessionId)}/turns/${turnIndex}/${starred ? 'unstar' : 'star'}?view=${view}">` +
+      `<input type="hidden" name="turn_key" value="${esc(turnKey)}">` +
       `<button type="submit" aria-label="${starred ? 'Unstar' : 'Star'} turn" aria-pressed="${starred}" title="${starred ? 'Unstar' : 'Star'} turn">` +
       `${starred ? '&#9733;' : '&#9734;'}</button></form>`;
   const head = `<div class="turnhead"><span class="role">${esc(turn.role)}</span>${model}${ts}${star}</div>`;
@@ -496,6 +506,39 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function fmtNum(n: number | null): string {
   return (n ?? 0).toLocaleString('en-US');
 }
+/** Stable source ID when available; otherwise a content fingerprint that ignores ordinal position and byte offsets. */
+export function turnKeyOf(turn: NormalizedTurn): string {
+  if (turn.id) return `id:${turn.id}`;
+
+  let h1 = 0x811c9dc5;
+  let h2 = 0x01000193;
+  const mix = (value: string | number | boolean | null | undefined) => {
+    const text = value === null || value === undefined ? '\u0000' : String(value);
+    for (let i = 0; i < text.length; i++) {
+      const code = text.charCodeAt(i);
+      h1 = Math.imul(h1 ^ code, 0x01000193) >>> 0;
+      h2 = Math.imul(h2 ^ code, 0x85ebca6b) >>> 0;
+    }
+    h1 = Math.imul(h1 ^ 0x1f, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ 0x1f, 0x85ebca6b) >>> 0;
+  };
+
+  mix(turn.role);
+  mix(turn.parentId);
+  mix(turn.ts);
+  mix(turn.model);
+  for (const block of turn.blocks) {
+    mix(block.type);
+    mix(block.toolUseId);
+    mix(block.toolName);
+    mix(block.isError);
+    mix(block.mediaType);
+    mix(block.truncated);
+    mix(block.text);
+  }
+  return `content:${h1.toString(16).padStart(8, '0')}${h2.toString(16).padStart(8, '0')}`;
+}
+
 
 /**
  * Cache-busting version token for blob URLs: first 12 hex of the canonical file's content hash.

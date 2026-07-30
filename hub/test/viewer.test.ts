@@ -7,7 +7,7 @@ import { searchHitsSql } from '../src/api/search';
 import { buildSessionFilterSql } from '../src/session-filters';
 import { viewerRoute } from '../src/viewer/router';
 import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures';
-import { blobVersionOf } from '../src/viewer/session';
+import { blobVersionOf, turnKeyOf } from '../src/viewer/session';
 
 const testEnv = env as unknown as Env;
 
@@ -58,6 +58,8 @@ const STORED_FALLBACK_TITLE_SESSION = '40404040-dddd-4ddd-8ddd-dddddddddddd';
 const SCHEDULED_TITLE_SESSION = '50505050-eeee-4eee-8eee-eeeeeeeeeeee';
 const ENCODED_SCHEDULED_TITLE_SESSION = '60606060-ffff-4fff-8fff-ffffffffffff';
 const INJECTED_WRAPPERS_TITLE_SESSION = 'injected-wrapper-title-session';
+const STAR_STABLE_SESSION = '70707070-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const STAR_STABLE_RELPATH = `-home-tester-src-demo/${STAR_STABLE_SESSION}.jsonl`;
 const REPO_URL = 'https://github.com/tester/facetdemo';
 
 const WRAPPER_TITLE_CASES = [
@@ -240,6 +242,8 @@ async function deliverOne(fileId: number, r2Key: string): Promise<void> {
 
 let rewindFileId = 0;
 let rewindR2Key = '';
+let starStableFileId = 0;
+let starStableR2Key = '';
 
 // A session with searchable tool output, an inline image, and an abandoned (rewound) branch.
 const SEARCH_CONTENT = [
@@ -403,6 +407,21 @@ describe('viewer', () => {
     expect(
       (await putFile('claude-projects', `-home-tester-src-demo/${OFFSET_MATCH_SESSION}.jsonl`, offsetMatchContent)).status,
     ).toBe(201);
+
+    const starStableContent = [
+      ccLine(STAR_STABLE_SESSION, { uuid: 'stable-root', parentUuid: null, role: 'user', text: 'stable root turn' }),
+      ccLine(STAR_STABLE_SESSION, { uuid: 'stable-target', parentUuid: 'stable-root', role: 'assistant', text: 'stable starred target' }),
+    ].join('\n');
+    const starStableRes = await putFile('claude-projects', STAR_STABLE_RELPATH, starStableContent);
+    expect(starStableRes.status).toBe(201);
+    const starStableFile = await testEnv.DB.prepare(
+      'SELECT id, r2_key FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
+    )
+      .bind('testbox-wsl', 'claude-projects', STAR_STABLE_RELPATH)
+      .first<{ id: number; r2_key: string }>();
+    expect(starStableFile).toBeTruthy();
+    starStableFileId = starStableFile!.id;
+    starStableR2Key = starStableFile!.r2_key;
 
     await drainQueue();
 
@@ -767,6 +786,7 @@ describe('viewer', () => {
     const endpoint = `https://sessions.vza.net/s/${SEARCH_SESSION}/turns/0`;
     const initial = await (await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`)).text();
     expect(initial).toContain(`action="/s/${SEARCH_SESSION}/turns/0/star?view=chronological"`);
+    expect(initial).toContain('<input type="hidden" name="turn_key" value="id:u1">');
     expect(initial).toContain('aria-label="Star turn" aria-pressed="false"');
 
     const rejected = await SELF.fetch(`${endpoint}/star`, {
@@ -778,7 +798,11 @@ describe('viewer', () => {
 
     const starred = await SELF.fetch(`${endpoint}/star?view=chronological`, {
       method: 'POST',
-      headers: { origin: 'https://sessions.vza.net' },
+      headers: {
+        origin: 'https://sessions.vza.net',
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: 'turn_key=id%3Au1',
       redirect: 'manual',
     });
     expect(starred.status).toBe(303);
@@ -791,7 +815,11 @@ describe('viewer', () => {
 
     const unstarred = await SELF.fetch(`${endpoint}/unstar?view=effective`, {
       method: 'POST',
-      headers: { origin: 'https://sessions.vza.net' },
+      headers: {
+        origin: 'https://sessions.vza.net',
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: 'turn_key=id%3Au1',
       redirect: 'manual',
     });
     expect(unstarred.status).toBe(303);
@@ -800,6 +828,80 @@ describe('viewer', () => {
     const unstarredHtml = await (await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`)).text();
     expect(unstarredHtml).toContain('<article id="t0" class="turn user">');
     expect(unstarredHtml).not.toContain('<article id="t0" class="turn user starred">');
+  });
+
+  it('keeps a star attached across turn insertion and session replacement', async () => {
+    const endpoint = `https://sessions.vza.net/s/${STAR_STABLE_SESSION}/turns/1/star`;
+    const starred = await SELF.fetch(endpoint, {
+      method: 'POST',
+      headers: {
+        origin: 'https://sessions.vza.net',
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: 'turn_key=id%3Astable-target',
+      redirect: 'manual',
+    });
+    expect(starred.status).toBe(303);
+
+    const before = await (await SELF.fetch(`https://sessions.vza.net/s/${STAR_STABLE_SESSION}`)).text();
+    expect(before).toMatch(/<article id="t1" class="turn assistant starred">[\s\S]*?stable starred target/);
+
+    const updatedContent = [
+      ccLine(STAR_STABLE_SESSION, { uuid: 'stable-new-root', parentUuid: null, role: 'user', text: 'new earlier turn' }),
+      ccLine(STAR_STABLE_SESSION, { uuid: 'stable-root', parentUuid: 'stable-new-root', role: 'user', text: 'stable root turn' }),
+      ccLine(STAR_STABLE_SESSION, { uuid: 'stable-target', parentUuid: 'stable-root', role: 'assistant', text: 'stable starred target' }),
+    ].join('\n');
+    expect((await putFile('claude-projects', STAR_STABLE_RELPATH, updatedContent)).status).toBe(201);
+    await drainQueue();
+
+    const reordered = await (await SELF.fetch(`https://sessions.vza.net/s/${STAR_STABLE_SESSION}`)).text();
+    expect(reordered).toMatch(/<article id="t2" class="turn assistant starred">[\s\S]*?stable starred target/);
+    expect(reordered).not.toMatch(/<article id="t1" class="turn user starred">/);
+
+    await testEnv.DB.prepare('DELETE FROM sessions WHERE session_id = ?1').bind(STAR_STABLE_SESSION).run();
+    const preserved = await testEnv.DB.prepare(
+      'SELECT turn_key FROM starred_turns WHERE session_id = ?1',
+    )
+      .bind(STAR_STABLE_SESSION)
+      .first<{ turn_key: string }>();
+    expect(preserved?.turn_key).toBe('id:stable-target');
+
+    await deliverOne(starStableFileId, starStableR2Key);
+    const recovered = await (await SELF.fetch(`https://sessions.vza.net/s/${STAR_STABLE_SESSION}`)).text();
+    expect(recovered).toMatch(/<article id="t2" class="turn assistant starred">[\s\S]*?stable starred target/);
+
+    const recent = await (await SELF.fetch('https://sessions.vza.net/?has_star=1')).text();
+    expect(recent).toContain('<h3>Has star</h3>');
+    expect(recent).toContain('✓ Yes');
+    expect(recent).toContain(`/s/${STAR_STABLE_SESSION}`);
+    expect(recent).not.toContain(`/s/${SEARCH_SESSION}`);
+
+    const sorted = await (
+      await SELF.fetch('https://sessions.vza.net/?sort=total_tokens&has_star=1')
+    ).text();
+    expect(sorted).toContain(`/s/${STAR_STABLE_SESSION}`);
+
+    const searched = await (
+      await SELF.fetch('https://sessions.vza.net/?q=stable+starred+target&has_star=1')
+    ).text();
+    expect(searched).toContain(`/s/${STAR_STABLE_SESSION}`);
+
+    const unstarred = await SELF.fetch(
+      `https://sessions.vza.net/s/${STAR_STABLE_SESSION}/turns/2/unstar`,
+      {
+        method: 'POST',
+        headers: {
+          origin: 'https://sessions.vza.net',
+          'content-type': 'application/x-www-form-urlencoded',
+        },
+        body: 'turn_key=id%3Astable-target',
+        redirect: 'manual',
+      },
+    );
+    expect(unstarred.status).toBe(303);
+
+    const empty = await (await SELF.fetch('https://sessions.vza.net/?has_star=1')).text();
+    expect(empty).not.toContain(`/s/${STAR_STABLE_SESSION}`);
   });
 
   it('joins linked tool calls and results, with their leading JSON fields in the summary', async () => {
@@ -1086,6 +1188,29 @@ describe('viewer', () => {
     expect(blobVersionOf(null)).toBe('');
     expect(blobVersionOf('xyz')).toBe('');
     expect(blobVersionOf('g'.repeat(64))).toBe(''); // non-hex
+  });
+
+  it('fingerprints id-less turns independently of index and byte offsets', () => {
+    const original = {
+      index: 3,
+      onMainPath: true,
+      role: 'assistant' as const,
+      ts: '2026-07-30T12:00:00Z',
+      model: 'test-model',
+      blocks: [{ type: 'text' as const, text: 'stable fallback content', byteStart: 100, byteLen: 24 }],
+    };
+    const moved = {
+      ...original,
+      index: 14,
+      blocks: [{ ...original.blocks[0]!, byteStart: 900, byteLen: 30 }],
+    };
+    const changed = {
+      ...moved,
+      blocks: [{ ...moved.blocks[0]!, text: 'different content' }],
+    };
+
+    expect(turnKeyOf(moved)).toBe(turnKeyOf(original));
+    expect(turnKeyOf(changed)).not.toBe(turnKeyOf(original));
   });
 
   it('serves a checksum-less blob revalidatable (no immutable, no redirect loop)', async () => {
