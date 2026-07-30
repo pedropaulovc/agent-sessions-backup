@@ -415,7 +415,7 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
         // actually-parseable content — now stale, since the current bytes produced nothing.
         // Clear the derived rows (keep the sessions row itself so facets/raw access still
         // resolve) and mark the session errored.
-        await env.DB.batch([
+        const clearStatements = [
           env.DB.prepare(
             `INSERT INTO blocks_fts (blocks_fts, rowid, text) SELECT 'delete', id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL`,
           ).bind(det.sessionId),
@@ -425,7 +425,19 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
           // search metadata, and the detail header keep showing the stale title of the now-deleted
           // index (the old query-time derivation returned null once the blocks were gone).
           env.DB.prepare("UPDATE sessions SET index_state = 'error', first_interaction_title = NULL WHERE session_id = ?1").bind(det.sessionId),
-        ]);
+        ];
+        const sourceComplete =
+          parsed.stats.parseErrorLines === 0 && (parsed.stats.skippedLineTypes['oversized-line'] ?? 0) === 0;
+        if (sourceComplete) {
+          clearStatements.push(
+            env.DB.prepare(
+              `DELETE FROM starred_turns
+               WHERE session_id = ?1
+                 AND EXISTS (SELECT 1 FROM files source WHERE source.id = ?2 AND source.content_hash = ?3)`,
+            ).bind(det.sessionId, file.id, file.content_hash),
+          );
+        }
+        await env.DB.batch(clearStatements);
       }
       // A recovery-kicked duplicate (reason: 'recover') parsing to zero turns instead of throwing
       // doesn't match the canonical check above: canonical_file_id still points at the session's

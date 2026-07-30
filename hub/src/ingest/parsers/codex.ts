@@ -68,10 +68,13 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
   ) => {
     if (current && (current.role !== role || (turnId && currentTurnId && turnId !== currentTurnId))) flush();
     if (current && turnId && sourceItem && !currentTurnId && !current.id) {
-      // An event_msg may open the turn before its response_item twin supplies the source ID.
-      // Attach the identity without changing the grouping boundary: leaving currentTurnId
-      // unset preserves pairing when the next response item starts a new source turn.
+      // A token_count may open a blockless turn before its response_item supplies the source ID.
+      // Adopt that ID as the boundary so full and ranged parses split the following source turn
+      // identically. A preceding event_msg already contributed a block; leave its boundary unset
+      // until its representation twin is consumed, so the twin can still dedupe within this turn.
+      const blockless = current.blocks.length === 0;
       current.id = sourceTurnIdentity(role, turnId, sourceItem);
+      if (blockless) currentTurnId = turnId;
     }
     if (!current) {
       current = {

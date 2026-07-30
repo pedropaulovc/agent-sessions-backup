@@ -504,6 +504,51 @@ describe('parseCodex', () => {
     expect(full.turns[2]!.id).not.toBe(full.turns[0]!.id);
   });
 
+  it('groups source turns identically when token_count opens a blockless page-boundary turn', async () => {
+    const records = [
+      {
+        timestamp: '2026-07-10T11:00:00.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: { last_token_usage: { input_tokens: 10, output_tokens: 2 } },
+        },
+      },
+      {
+        timestamp: '2026-07-10T11:00:01.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'first source turn' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'page-t1' },
+        },
+      },
+      {
+        timestamp: '2026-07-10T11:00:02.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'assistant',
+          content: [{ type: 'output_text', text: 'second source turn' }],
+          internal_chat_message_metadata_passthrough: { turn_id: 'page-t2' },
+        },
+      },
+    ].map((record) => JSON.stringify(record));
+    const full = await parseCodex(readJsonlLines(toStream(records)), CODEX_SESSION_ID);
+    const rangeOffset = records[0]!.length + 1;
+    const ranged = await parseCodex(
+      readJsonlLines(toStream(records.slice(1)), rangeOffset),
+      CODEX_SESSION_ID,
+    );
+
+    expect(full.turns).toHaveLength(2);
+    expect(full.turns.map((turn) => turn.id)).toEqual(ranged.turns.map((turn) => turn.id));
+    expect(full.turns.map((turn) => turn.blocks[0]?.text)).toEqual(
+      ranged.turns.map((turn) => turn.blocks[0]?.text),
+    );
+  });
+
   it('keeps a usage-only turn when token_count is the only billable event before EOF (regression: flush dropped 0-block turns even with usage set)', async () => {
     const lines = [
       { timestamp: '2026-07-03T10:00:00.000Z', type: 'session_meta', payload: { session_id: CODEX_SESSION_ID, cwd: '/x' } },

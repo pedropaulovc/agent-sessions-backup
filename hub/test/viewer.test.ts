@@ -1017,6 +1017,33 @@ describe('viewer', () => {
     expect(reconciled?.n).toBe(0);
     const prunedFacet = await (await SELF.fetch('https://sessions.vza.net/?has_star=1')).text();
     expect(prunedFacet).not.toContain(`/s/${STAR_STABLE_SESSION}`);
+
+    const cleanRevision = await transcriptRevision(STAR_STABLE_SESSION);
+    const remainingStar = await SELF.fetch(
+      `https://sessions.vza.net/s/${STAR_STABLE_SESSION}/turns/1/star`,
+      {
+        method: 'POST',
+        headers: {
+          origin: 'https://sessions.vza.net',
+          'content-type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({
+          turn_key: 'id:stable-root',
+          transcript_revision: cleanRevision,
+        }),
+        redirect: 'manual',
+      },
+    );
+    expect(remainingStar.status).toBe(303);
+    expect((await putFile('claude-projects', STAR_STABLE_RELPATH, '')).status).toBe(201);
+    await drainQueue();
+
+    const emptyReplacementStars = await testEnv.DB.prepare(
+      'SELECT COUNT(*) AS n FROM starred_turns WHERE session_id = ?1',
+    )
+      .bind(STAR_STABLE_SESSION)
+      .first<{ n: number }>();
+    expect(emptyReplacementStars?.n).toBe(0);
   });
 
   it('joins linked tool calls and results, with their leading JSON fields in the summary', async () => {
