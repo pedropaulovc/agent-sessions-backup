@@ -19,6 +19,14 @@ Backup, index, search, and render AI agent/chat sessions from every machine and 
 | `scripts/` | Local corpus seeding + verification tooling |
 | `memory/` | Project memory for AI agents working on this repo |
 
+## Update a Windows collector
+
+Run this in PowerShell to update an enrolled collector to the current `main` branch, replace its scheduled task, and send an immediate heartbeat. It waits for an in-progress scheduled run before replacing the tool, so it never updates the executable under that process.
+
+```powershell
+iwr https://raw.githubusercontent.com/pedropaulovc/agent-sessions-backup/main/scripts/setup-windows-collector.ps1 | iex
+```
+
 ## Principles
 
 - **R2 is truth.** The D1 index is derived and fully rebuildable from raw files alone.
