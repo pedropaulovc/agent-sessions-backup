@@ -1,10 +1,10 @@
-import { readSession } from '../auth/session';
+import { originOk, readSession } from '../auth/session';
 import { webauthnRoute } from '../auth/webauthn';
 import { downloadSessionRaw } from '../api/sessions';
 import { blobEndpoint } from './blob';
 import { machinesPage } from './machines';
 import { searchPage } from './search';
-import { sessionPage } from './session';
+import { sessionPage, TURNS_PER_PAGE } from './session';
 import { previewAccess, previewBootstrapRoute, withPreviewCookie } from './preview-auth';
 
 /**
@@ -38,9 +38,14 @@ export async function viewerRoute(request: Request, url: URL, env: Env): Promise
   const access = await viewerAccess(request, env);
   if (access === 'deny') return new Response(null, { status: 302, headers: { location: '/login' } });
 
-  if (request.method !== 'GET') return new Response('method not allowed', { status: 405 });
-
-  const res = await handle(url, env);
+  let res: Response;
+  if (request.method === 'GET') {
+    res = await handle(url, env);
+  } else if (request.method === 'POST') {
+    res = await handlePost(request, url, env);
+  } else {
+    res = new Response('method not allowed', { status: 405 });
+  }
   return access === 'issue-cookie' ? withPreviewCookie(res, env) : res;
 }
 
@@ -76,4 +81,39 @@ function handle(url: URL, env: Env): Promise<Response> {
   return Promise.resolve(
     new Response('not found', { status: 404, headers: { 'content-type': 'text/plain; charset=utf-8' } }),
   );
+}
+
+async function handlePost(request: Request, url: URL, env: Env): Promise<Response> {
+  const turnStar = url.pathname.match(/^\/s\/([^/]+)\/turns\/(\d+)\/(star|unstar)$/);
+  if (!turnStar) return new Response('not found', { status: 404 });
+  if (!originOk(request)) return new Response('forbidden', { status: 403 });
+
+  const sessionId = decodeURIComponent(turnStar[1]!);
+  const turnIndex = Number(turnStar[2]);
+  const turn = await env.DB.prepare(
+    `SELECT 1 AS present FROM blocks
+     WHERE session_id = ?1 AND turn_index = ?2 AND btype != 'compaction'
+     LIMIT 1`,
+  )
+    .bind(sessionId, turnIndex)
+    .first<{ present: number }>();
+  if (!turn) return new Response('turn not found', { status: 404 });
+
+  if (turnStar[3] === 'star') {
+    await env.DB.prepare(
+      `INSERT INTO starred_turns (session_id, turn_index) VALUES (?1, ?2)
+       ON CONFLICT (session_id, turn_index) DO NOTHING`,
+    )
+      .bind(sessionId, turnIndex)
+      .run();
+  } else {
+    await env.DB.prepare('DELETE FROM starred_turns WHERE session_id = ?1 AND turn_index = ?2')
+      .bind(sessionId, turnIndex)
+      .run();
+  }
+
+  const page = Math.floor(turnIndex / TURNS_PER_PAGE) + 1;
+  const view = url.searchParams.get('view') === 'effective' ? 'effective' : 'chronological';
+  const location = `/s/${encodeURIComponent(sessionId)}?page=${page}&view=${view}#t${turnIndex}`;
+  return new Response(null, { status: 303, headers: { location } });
 }

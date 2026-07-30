@@ -19,13 +19,13 @@ export function q(v: unknown): string {
 const STYLE = `
 :root {
   --bg: #fbfbfa; --fg: #1d1d1f; --muted: #6b6b70; --line: #e2e2df; --card: #ffffff;
-  --accent: #3454d1; --accent-bg: #eaeefb; --mark: #ffe58a; --err: #b42318; --err-bg: #fef3f2;
+  --accent: #3454d1; --accent-bg: #eaeefb; --mark: #ffe58a; --star: #9a6700; --err: #b42318; --err-bg: #fef3f2;
   --user: #eef3ff; --assistant: #ffffff; --system: #f4f2ee; --tool: #f6f7f9; --chip: #eceef2;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #16171a; --fg: #e6e6e8; --muted: #9a9aa2; --line: #2c2e33; --card: #1d1f23;
-    --accent: #7f9cff; --accent-bg: #23293d; --mark: #6b5d1e; --err: #ff8b7a; --err-bg: #3a1f1c;
+    --accent: #7f9cff; --accent-bg: #23293d; --mark: #6b5d1e; --star: #f2cc60; --err: #ff8b7a; --err-bg: #3a1f1c;
     --user: #1c2333; --assistant: #1d1f23; --system: #24231f; --tool: #202227; --chip: #2a2d33;
   }
 }
@@ -107,6 +107,14 @@ tr.stale td { background: var(--err-bg); }
 .turn > .turnhead {
   display: flex; gap: 10px; align-items: baseline; padding: 6px 12px; border-bottom: 1px solid var(--line);
 }
+.turn.starred { border-color: var(--star); }
+.turn-star { margin: -3px -6px -3px auto; }
+.turn-star button {
+  width: 30px; height: 30px; padding: 0; border: 0; border-radius: 5px; background: transparent;
+  color: var(--muted); cursor: pointer; font: 20px/30px Georgia, serif;
+}
+.turn-star button:hover, .turn-star button:focus-visible { background: var(--accent-bg); color: var(--star); }
+.turn.starred .turn-star button { color: var(--star); }
 .turn .role { font-weight: 700; text-transform: capitalize; }
 .turn .body { padding: 10px 12px; }
 .turn.user { background: var(--user); }

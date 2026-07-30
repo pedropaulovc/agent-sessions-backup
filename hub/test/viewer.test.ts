@@ -763,6 +763,45 @@ describe('viewer', () => {
     expect(html).toMatch(new RegExp(`/s/${SEARCH_SESSION}/blob/\\d+`));
   });
 
+  it('stars and unstars a turn with a same-origin POST', async () => {
+    const endpoint = `https://sessions.vza.net/s/${SEARCH_SESSION}/turns/0`;
+    const initial = await (await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`)).text();
+    expect(initial).toContain(`action="/s/${SEARCH_SESSION}/turns/0/star?view=chronological"`);
+    expect(initial).toContain('aria-label="Star turn" aria-pressed="false"');
+
+    const rejected = await SELF.fetch(`${endpoint}/star`, {
+      method: 'POST',
+      headers: { origin: 'https://attacker.example' },
+      redirect: 'manual',
+    });
+    expect(rejected.status).toBe(403);
+
+    const starred = await SELF.fetch(`${endpoint}/star?view=chronological`, {
+      method: 'POST',
+      headers: { origin: 'https://sessions.vza.net' },
+      redirect: 'manual',
+    });
+    expect(starred.status).toBe(303);
+    expect(starred.headers.get('location')).toBe(`/s/${SEARCH_SESSION}?page=1&view=chronological#t0`);
+
+    const starredHtml = await (await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`)).text();
+    expect(starredHtml).toContain('<article id="t0" class="turn user starred">');
+    expect(starredHtml).toContain(`action="/s/${SEARCH_SESSION}/turns/0/unstar?view=chronological"`);
+    expect(starredHtml).toContain('aria-label="Unstar turn" aria-pressed="true"');
+
+    const unstarred = await SELF.fetch(`${endpoint}/unstar?view=effective`, {
+      method: 'POST',
+      headers: { origin: 'https://sessions.vza.net' },
+      redirect: 'manual',
+    });
+    expect(unstarred.status).toBe(303);
+    expect(unstarred.headers.get('location')).toBe(`/s/${SEARCH_SESSION}?page=1&view=effective#t0`);
+
+    const unstarredHtml = await (await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`)).text();
+    expect(unstarredHtml).toContain('<article id="t0" class="turn user">');
+    expect(unstarredHtml).not.toContain('<article id="t0" class="turn user starred">');
+  });
+
   it('joins linked tool calls and results, with their leading JSON fields in the summary', async () => {
     const html = await (await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`)).text();
 

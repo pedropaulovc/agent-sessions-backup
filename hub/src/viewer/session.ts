@@ -95,20 +95,22 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
        ), turn_meta AS (
          SELECT turn_index, MAX(on_main_path) AS on_main_path FROM page_blocks GROUP BY turn_index
        )
-       SELECT p.turn_index, p.byte_start, m.on_main_path
-       FROM page_blocks p JOIN turn_meta m ON m.turn_index = p.turn_index
+       SELECT p.turn_index, p.byte_start, m.on_main_path, st.turn_index IS NOT NULL AS starred
+       FROM page_blocks p
+       JOIN turn_meta m ON m.turn_index = p.turn_index
+       LEFT JOIN starred_turns st ON st.session_id = ?1 AND st.turn_index = p.turn_index
        WHERE p.byte_start IS NOT NULL
-       GROUP BY p.turn_index, p.byte_start
+       GROUP BY p.turn_index, p.byte_start, st.turn_index
        ORDER BY p.turn_index, p.byte_start`,
     )
       .bind(sessionId, lo, hi)
-      .all<{ turn_index: number; byte_start: number | null; on_main_path: number }>()
+      .all<{ turn_index: number; byte_start: number | null; on_main_path: number; starred: number }>()
   ).results;
-  const pageTurnsByByteStart = new Map<number, Array<{ turnIndex: number; onMainPath: boolean }>>();
+  const pageTurnsByByteStart = new Map<number, Array<{ turnIndex: number; onMainPath: boolean; starred: boolean }>>();
   for (const row of pageTurns) {
     if (row.byte_start === null) continue;
     const queue = pageTurnsByByteStart.get(row.byte_start) ?? [];
-    queue.push({ turnIndex: row.turn_index, onMainPath: row.on_main_path === 1 });
+    queue.push({ turnIndex: row.turn_index, onMainPath: row.on_main_path === 1, starred: row.starred === 1 });
     pageTurnsByByteStart.set(row.byte_start, queue);
   }
 
@@ -149,6 +151,7 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
               mediaIds,
               indexed?.turnIndex,
               onMainPath,
+              indexed?.starred ?? false,
               blobVersion,
               toolPairs,
             );
@@ -267,6 +270,7 @@ function renderTurn(
   mediaIds: Map<string, number>,
   turnIndex: number | undefined,
   onMainPath: boolean,
+  starred: boolean,
   blobVersion: string,
   toolPairs: ToolPairs,
 ): string {
@@ -277,12 +281,17 @@ function renderTurn(
   if (turn.blocks.length === 0) return '';
 
   const rewound = view === 'chronological' && !onMainPath;
-  const cls = `turn ${esc(turn.role)}${rewound ? ' rewound' : ''}`;
+  const cls = `turn ${esc(turn.role)}${rewound ? ' rewound' : ''}${starred ? ' starred' : ''}`;
   // Stable anchor id (present in every view) so search-hit deep links can scroll to the matching turn.
   const anchor = turnIndex === undefined ? '' : ` id="t${turnIndex}"`;
   const model = turn.model ? `<span class="chip">${esc(turn.model)}</span>` : '';
   const ts = turn.ts ? `<span class="muted small">${esc(turn.ts)}</span>` : '';
-  const head = `<div class="turnhead"><span class="role">${esc(turn.role)}</span>${model}${ts}</div>`;
+  const star = turnIndex === undefined
+    ? ''
+    : `<form class="turn-star" method="post" action="/s/${q(sessionId)}/turns/${turnIndex}/${starred ? 'unstar' : 'star'}?view=${view}">` +
+      `<button type="submit" aria-label="${starred ? 'Unstar' : 'Star'} turn" aria-pressed="${starred}" title="${starred ? 'Unstar' : 'Star'} turn">` +
+      `${starred ? '&#9733;' : '&#9734;'}</button></form>`;
+  const head = `<div class="turnhead"><span class="role">${esc(turn.role)}</span>${model}${ts}${star}</div>`;
   const body = turn.blocks.map((b, bi) => renderBlock(b, bi, sessionId, mediaIds, blobVersion, toolPairs)).join('');
   if (!body) return '';
   return `<article${anchor} class="${cls}">${head}<div class="body">${body}</div></article>`;
