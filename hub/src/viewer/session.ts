@@ -511,7 +511,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function fmtNum(n: number | null): string {
   return (n ?? 0).toLocaleString('en-US');
 }
-/** Stable source ID when available; otherwise a content fingerprint with a source-offset tie-breaker for timestamp-less turns. */
+/** Stable source ID when available; otherwise a content-and-source-position fingerprint. */
 export function turnKeyOf(turn: NormalizedTurn): string {
   if (turn.id) return `id:${turn.id}`;
 
@@ -532,9 +532,9 @@ export function turnKeyOf(turn: NormalizedTurn): string {
   mix(turn.parentId);
   mix(turn.ts);
   mix(turn.model);
-  // An id-less, timestamp-less source provides no insertion-stable semantic identity. Its absolute
-  // source offset is still page-independent and prevents identical turns from sharing one star.
-  if (!turn.ts) mix(turn.blocks[0]?.byteStart ?? turn.byteStart);
+  // Without a source ID, absolute position is the only discriminator for otherwise identical
+  // records. Ranged parsing preserves absolute offsets, so the key stays page-independent.
+  mix(turn.blocks[0]?.byteStart ?? turn.byteStart);
   for (const block of turn.blocks) {
     mix(block.type);
     mix(block.toolUseId);

@@ -855,6 +855,17 @@ describe('viewer', () => {
     expect(unstarred.status).toBe(303);
     expect(unstarred.headers.get('location')).toBe(`/s/${SEARCH_SESSION}?page=1&view=effective#t0`);
 
+    const repeatedUnstar = await SELF.fetch(`${endpoint}/unstar?view=effective`, {
+      method: 'POST',
+      headers: {
+        origin: 'https://sessions.vza.net',
+        'content-type': 'application/x-www-form-urlencoded',
+      },
+      body: new URLSearchParams({ turn_key: 'id:u1', transcript_revision: revision }),
+      redirect: 'manual',
+    });
+    expect(repeatedUnstar.status).toBe(303);
+
     const unstarredHtml = await (await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`)).text();
     expect(unstarredHtml).toContain('<article id="t0" class="turn user">');
     expect(unstarredHtml).not.toContain('<article id="t0" class="turn user starred">');
@@ -1239,7 +1250,7 @@ describe('viewer', () => {
     expect(blobVersionOf('g'.repeat(64))).toBe(''); // non-hex
   });
 
-  it('fingerprints timestamped id-less turns independently of index and byte offsets', () => {
+  it('fingerprints id-less turns by content and absolute source position', () => {
     const original = {
       index: 3,
       onMainPath: true,
@@ -1258,15 +1269,16 @@ describe('viewer', () => {
       blocks: [{ ...moved.blocks[0]!, text: 'different content' }],
     };
 
-    expect(turnKeyOf(moved)).toBe(turnKeyOf(original));
-    expect(turnKeyOf(changed)).not.toBe(turnKeyOf(original));
+    expect(turnKeyOf(moved)).not.toBe(turnKeyOf(original));
+    expect(turnKeyOf(changed)).not.toBe(turnKeyOf(moved));
   });
 
-  it('uses source offsets to disambiguate identical timestamp-less id-less turns', () => {
+  it('uses source offsets to disambiguate identical id-less turns with the same timestamp', () => {
     const first = {
       index: 3,
       onMainPath: true,
       role: 'user' as const,
+      ts: '2026-07-30T12:00:00Z',
       blocks: [{ type: 'text' as const, text: 'continue', byteStart: 100, byteLen: 10 }],
     };
     const repeated = {

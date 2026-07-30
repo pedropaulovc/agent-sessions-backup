@@ -128,18 +128,61 @@ async function handlePost(request: Request, url: URL, env: Env): Promise<Respons
   }
   if (turn.turn_present !== 1) return new Response('turn not found', { status: 404 });
 
+  let applied: { applied: number } | null;
   if (turnStar[3] === 'star') {
-    await env.DB.prepare(
-      `INSERT INTO starred_turns (session_id, turn_key) VALUES (?1, ?2)
-       ON CONFLICT (session_id, turn_key) DO NOTHING`,
+    applied = await env.DB.prepare(
+      `INSERT INTO starred_turns (session_id, turn_key)
+       SELECT ?1, ?2
+       WHERE EXISTS (
+         SELECT 1
+         FROM sessions s
+         JOIN files f ON f.id = s.canonical_file_id
+         JOIN blocks b ON b.session_id = s.session_id AND b.file_id = s.canonical_file_id
+         WHERE s.session_id = ?1
+           AND s.index_state = 'ready'
+           AND b.turn_index = ?3
+           AND b.btype != 'compaction'
+           AND f.content_hash || ':' || COALESCE(s.updated_at, '') = ?4
+       )
+       ON CONFLICT (session_id, turn_key) DO UPDATE SET turn_key = excluded.turn_key
+       RETURNING 1 AS applied`,
     )
-      .bind(sessionId, turnKey)
-      .run();
+      .bind(sessionId, turnKey, turnIndex, transcriptRevision)
+      .first<{ applied: number }>();
   } else {
-    await env.DB.prepare('DELETE FROM starred_turns WHERE session_id = ?1 AND turn_key = ?2')
-      .bind(sessionId, turnKey)
-      .run();
+    const [guard] = await env.DB.batch<{ applied: number }>([
+      env.DB.prepare(
+        `SELECT 1 AS applied
+         FROM sessions s
+         JOIN files f ON f.id = s.canonical_file_id
+         JOIN blocks b ON b.session_id = s.session_id AND b.file_id = s.canonical_file_id
+         WHERE s.session_id = ?1
+           AND s.index_state = 'ready'
+           AND b.turn_index = ?3
+           AND b.btype != 'compaction'
+           AND f.content_hash || ':' || COALESCE(s.updated_at, '') = ?4
+         LIMIT 1`,
+      ).bind(sessionId, turnKey, turnIndex, transcriptRevision),
+      env.DB.prepare(
+        `DELETE FROM starred_turns
+         WHERE session_id = ?1
+           AND turn_key = ?2
+           AND EXISTS (
+             SELECT 1
+             FROM sessions s
+             JOIN files f ON f.id = s.canonical_file_id
+             JOIN blocks b ON b.session_id = s.session_id AND b.file_id = s.canonical_file_id
+             WHERE s.session_id = ?1
+               AND s.index_state = 'ready'
+               AND b.turn_index = ?3
+               AND b.btype != 'compaction'
+               AND f.content_hash || ':' || COALESCE(s.updated_at, '') = ?4
+           )`,
+      ).bind(sessionId, turnKey, turnIndex, transcriptRevision),
+    ]);
+    applied = guard?.results[0] ?? null;
   }
+  if (!applied) return new Response('stale transcript', { status: 409 });
 
   const page = Math.floor(turnIndex / TURNS_PER_PAGE) + 1;
   const view = url.searchParams.get('view') === 'effective' ? 'effective' : 'chronological';

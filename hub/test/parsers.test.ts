@@ -420,13 +420,15 @@ describe('parseCodex', () => {
     const roles = s.turns.map((t) => t.role);
     // user → assistant (thinking+tool_use) → tool (result) → assistant (text) → compaction marker
     expect(roles).toEqual(['user', 'assistant', 'tool', 'assistant', 'system']);
-    expect(s.turns.map((turn) => turn.id)).toEqual([
-      'user:t1:at:2026-07-02T09:00:02.000Z',
-      'assistant:t2:id:rs_1',
-      'tool:t2:call:call_1',
-      'assistant:t2:at:2026-07-02T09:00:06.000Z',
-      undefined,
-    ]);
+    expect(s.turns[0]!.id).toMatch(
+      /^user:t1:at:2026-07-02T09:00:02\.000Z:payload:\d+:[0-9a-f]+:offset:\d+$/,
+    );
+    expect(s.turns[1]!.id).toBe('assistant:t2:id:rs_1');
+    expect(s.turns[2]!.id).toBe('tool:t2:call:call_1');
+    expect(s.turns[3]!.id).toMatch(
+      /^assistant:t2:at:2026-07-02T09:00:06\.000Z:payload:\d+:[0-9a-f]+:offset:\d+$/,
+    );
+    expect(s.turns[4]!.id).toBeUndefined();
 
     const assistant = s.turns[1]!;
     expect(assistant.blocks.map((b) => b.type)).toEqual(['thinking', 'tool_use']);
@@ -466,7 +468,7 @@ describe('parseCodex', () => {
         payload: {
           type: 'message',
           role: 'assistant',
-          content: [{ type: 'output_text', text: 'before the page boundary' }],
+          content: [{ type: 'output_text', text: 'same assistant text' }],
           internal_chat_message_metadata_passthrough: { turn_id: 't1' },
         },
       },
@@ -481,12 +483,12 @@ describe('parseCodex', () => {
         },
       },
       {
-        timestamp: '2026-07-10T10:00:02.000Z',
+        timestamp: '2026-07-10T10:00:00.000Z',
         type: 'response_item',
         payload: {
           type: 'message',
           role: 'assistant',
-          content: [{ type: 'output_text', text: 'after the page boundary' }],
+          content: [{ type: 'output_text', text: 'same assistant text' }],
           internal_chat_message_metadata_passthrough: { turn_id: 't1' },
         },
       },

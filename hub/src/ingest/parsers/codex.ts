@@ -224,9 +224,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       ? `id:${itemId}`
       : callId
         ? `call:${callId}`
-        : ts
-          ? `at:${ts}`
-          : `payload:${messageKey(safeJson(p))}:offset:${at.byteStart}`;
+        : `at:${ts ?? 'unknown'}:payload:${messageKey(safeJson(p))}:offset:${at.byteStart}`;
     switch (p.type) {
       case 'message': {
         const role = (str(p.role) as Role) ?? 'assistant';
