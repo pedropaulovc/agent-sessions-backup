@@ -72,8 +72,6 @@ export async function getSession(sessionId: string, env: Env): Promise<Response>
   return Response.json({ meta: row, session: normalized });
 }
 
-type RawDelivery = 'inline' | 'download';
-
 interface RawFile {
   store: string;
   relpath: string;
@@ -81,18 +79,12 @@ interface RawFile {
 }
 
 export async function getSessionRaw(sessionId: string, request: Request, env: Env): Promise<Response> {
-  return serveSessionRaw(sessionId, request.headers.get('range'), 'inline', env);
-}
-
-/** Serve a browser download of the complete canonical source for one session. */
-export async function downloadSessionRaw(sessionId: string, env: Env): Promise<Response> {
-  return serveSessionRaw(sessionId, null, 'download', env);
+  return serveSessionRaw(sessionId, request.headers.get('range'), env);
 }
 
 async function serveSessionRaw(
   sessionId: string,
   rangeHeader: string | null,
-  delivery: RawDelivery,
   env: Env,
 ): Promise<Response> {
   const file = await env.DB.prepare(
@@ -113,10 +105,10 @@ async function serveSessionRaw(
     if (!obj) return Response.json({ error: 'r2_object_missing' }, { status: 404 });
     const conv = extractConversationById(new Uint8Array(await obj.arrayBuffer()), sessionId);
     if (conv === undefined) return Response.json({ error: 'not_found' }, { status: 404 });
-    console.log(JSON.stringify({ event: 'access.raw', session: sessionId, range: null, delivery }));
+    console.log(JSON.stringify({ event: 'access.raw', session: sessionId, range: null }));
     return new Response(conv, {
       status: 200,
-      headers: rawHeaders('application/json; charset=utf-8', delivery, `${sessionId}.json`, new TextEncoder().encode(conv).byteLength),
+      headers: rawHeaders('application/json; charset=utf-8'),
     });
   }
 
@@ -127,26 +119,21 @@ async function serveSessionRaw(
   if (isWebHarness(det.harness)) {
     const obj = await env.RAW.get(file.r2_key);
     if (!obj) return Response.json({ error: 'r2_object_missing' }, { status: 404 });
-    console.log(JSON.stringify({ event: 'access.raw', session: sessionId, range: null, delivery }));
+    console.log(JSON.stringify({ event: 'access.raw', session: sessionId, range: null }));
     return new Response(obj.body, {
       status: 200,
-      headers: rawHeaders('application/json; charset=utf-8', delivery, sourceBasename(file.relpath, `${sessionId}.json`), obj.size),
+      headers: rawHeaders('application/json; charset=utf-8'),
     });
   }
 
   // A present-but-unparseable Range header (e.g. the suffix form `bytes=-500`, which
   // parseRange doesn't support) must fall back to a full 200 — never claim 206 while
   // actually serving the whole body.
-  const parsedRange = delivery === 'inline' && rangeHeader ? parseRange(rangeHeader) : undefined;
+  const parsedRange = rangeHeader ? parseRange(rangeHeader) : undefined;
   const obj = parsedRange ? await env.RAW.get(file.r2_key, { range: parsedRange }) : await env.RAW.get(file.r2_key);
   if (!obj) return Response.json({ error: 'r2_object_missing' }, { status: 404 });
-  console.log(JSON.stringify({ event: 'access.raw', session: sessionId, range: parsedRange ? rangeHeader : null, delivery }));
-  const headers = rawHeaders(
-    'application/x-ndjson; charset=utf-8',
-    delivery,
-    sourceBasename(file.relpath, `${sessionId}.jsonl`),
-    parsedRange ? undefined : obj.size,
-  );
+  console.log(JSON.stringify({ event: 'access.raw', session: sessionId, range: parsedRange ? rangeHeader : null }));
+  const headers = rawHeaders('application/x-ndjson; charset=utf-8');
   const servedRange = obj.range;
   if (parsedRange && servedRange && 'offset' in servedRange && servedRange.offset !== undefined && servedRange.length !== undefined) {
     const start = servedRange.offset;
@@ -158,34 +145,8 @@ async function serveSessionRaw(
   });
 }
 
-function rawHeaders(
-  contentType: string,
-  delivery: RawDelivery,
-  filename: string,
-  contentLength: number | undefined,
-): Headers {
-  const headers = new Headers({ 'content-type': contentType });
-  if (delivery === 'inline') return headers;
-
-  headers.set('content-disposition', attachmentDisposition(filename));
-  headers.set('cache-control', 'private, no-store');
-  headers.set('x-content-type-options', 'nosniff');
-  if (contentLength !== undefined) headers.set('content-length', String(contentLength));
-  return headers;
-}
-
-function sourceBasename(relpath: string, fallback: string): string {
-  const basename = relpath.split(/[\\/]/).at(-1);
-  return basename || fallback;
-}
-
-function attachmentDisposition(filename: string): string {
-  const fallback = filename
-    .normalize('NFKD')
-    .replace(/[^\x20-\x7e]/g, '_')
-    .replace(/["\\;\r\n]/g, '_');
-  const encoded = encodeURIComponent(filename).replace(/['()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
-  return `attachment; filename="${fallback || 'session'}"; filename*=UTF-8''${encoded}`;
+function rawHeaders(contentType: string): Headers {
+  return new Headers({ 'content-type': contentType });
 }
 
 // The only harnesses a pending/error `files.harness = 'unknown'` export-inbox row (see

@@ -30,6 +30,7 @@
     "ENVIRONMENT": "production",
     "API_HOST": "api.sessions.vza.net",
     "VIEWER_HOST": "sessions.vza.net",
+    "R2_DASHBOARD_BASE_URL": "https://dash.cloudflare.com/18ef3246e9f36d1560485ef53889c0ab/r2/default/buckets/agent-sessions-raw",
     // vza.net zone id (public — also in infra/cf/enroll-cert.py). Certificate
     // operations use a private Cloudflare OAuth client; no API token is stored.
     "CF_ZONE_ID": "6a56cdda4766c1d7b5ad0fbe8331048f",
@@ -113,7 +114,8 @@
       "vars": {
         "ENVIRONMENT": "preview",
         "API_HOST": "api.sessions.vza.net",
-        "VIEWER_HOST": "sessions.vza.net"
+        "VIEWER_HOST": "sessions.vza.net",
+        "R2_DASHBOARD_BASE_URL": "https://dash.cloudflare.com/18ef3246e9f36d1560485ef53889c0ab/r2/default/buckets/agent-sessions-raw-preview"
       },
       "d1_databases": [
         {

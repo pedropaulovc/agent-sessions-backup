@@ -790,7 +790,12 @@ describe('viewer', () => {
     expect(html).toContain('turn user');
     expect(html).toContain('turn assistant');
     expect(html).toContain('found the reference');
-    expect(html).toContain(`<a class="button-link" href="/s/${SEARCH_SESSION}/download">Download raw session</a>`);
+    expect(html).toContain('Session files in R2');
+    expect(html).toContain('target="_blank" rel="noopener noreferrer"');
+    expect(html).toContain(
+      `https://dash.cloudflare.com/18ef3246e9f36d1560485ef53889c0ab/r2/default/buckets/agent-sessions-raw/objects/${encodeURIComponent(encodeURIComponent('raw/testbox-wsl/claude-projects/-home-tester-src-demo/' + SEARCH_SESSION + '.jsonl'))}/details?prefix=raw%2Ftestbox-wsl%2Fclaude-projects%2F`,
+    );
+    expect(html).not.toContain('Download raw session');
     // inline image points at the blob endpoint
     expect(html).toMatch(new RegExp(`/s/${SEARCH_SESSION}/blob/\\d+`));
   });
@@ -1054,51 +1059,6 @@ describe('viewer', () => {
     expect(html).toContain('<span class="muted small">↩ result</span>');
     expect(html).toContain('xenondioxide appears in notes.md line 12');
     expect(html).not.toContain('class="turn tool');
-  });
-
-  it('downloads the complete canonical session with an attachment filename', async () => {
-    const res = await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}/download`, {
-      headers: { range: 'bytes=0-9' },
-    });
-
-    expect(res.status).toBe(200);
-    expect(res.headers.get('content-type')).toBe('application/x-ndjson; charset=utf-8');
-    expect(res.headers.get('content-range')).toBeNull();
-    expect(res.headers.get('content-disposition')).toContain(`filename="${SEARCH_SESSION}.jsonl"`);
-    expect(res.headers.get('content-disposition')).toContain(`filename*=UTF-8''${SEARCH_SESSION}.jsonl`);
-    expect(res.headers.get('cache-control')).toBe('private, no-store');
-    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
-    expect(await res.text()).toBe(SEARCH_CONTENT);
-  });
-
-  it('uses only canonical_file_id and never falls back to another source file', async () => {
-    const missingSession = 'download-missing-canonical';
-    const canonicalRelpath = `download-tests/${missingSession}.jsonl`;
-    const canonicalKey = `raw/testbox-wsl/claude-projects/${canonicalRelpath}`;
-    const fallbackRelpath = `download-tests/${missingSession}-fallback.jsonl`;
-    const fallbackKey = `raw/testbox-wsl/claude-projects/${fallbackRelpath}`;
-    const fallbackContent = 'private sibling data must not be served';
-
-    await testEnv.DB.prepare(
-      `INSERT INTO files (machine_id, store, relpath, r2_key, size, content_hash, harness, session_id, parse_state)
-       VALUES ('testbox-wsl', 'claude-projects', ?1, ?2, 123, 'sha256:missing-canonical', 'claude-code', ?3, 'parsed')`,
-    ).bind(canonicalRelpath, canonicalKey, missingSession).run();
-    const canonical = await testEnv.DB.prepare('SELECT id FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3')
-      .bind('testbox-wsl', 'claude-projects', canonicalRelpath)
-      .first<{ id: number }>();
-    await testEnv.DB.prepare(
-      `INSERT INTO sessions (session_id, harness, machine_id, canonical_file_id, index_state)
-       VALUES (?1, 'claude-code', 'testbox-wsl', ?2, 'ready')`,
-    ).bind(missingSession, canonical!.id).run();
-    await testEnv.DB.prepare(
-      `INSERT INTO files (machine_id, store, relpath, r2_key, size, content_hash, harness, session_id, parse_state)
-       VALUES ('testbox-wsl', 'claude-projects', ?1, ?2, ?3, 'sha256:noncanonical', 'claude-code', ?4, 'parsed')`,
-    ).bind(fallbackRelpath, fallbackKey, fallbackContent.length, missingSession).run();
-    await testEnv.RAW.put(fallbackKey, fallbackContent);
-
-    const res = await SELF.fetch(`https://sessions.vza.net/s/${missingSession}/download`);
-    expect(res.status).toBe(404);
-    await expect(res.json()).resolves.toEqual({ error: 'r2_object_missing' });
   });
 
   it('dims off-main-path (rewound) turns in the chronological view', async () => {
@@ -1508,11 +1468,9 @@ describe('viewer', () => {
     expect(res.headers.get('location')).toBe('/login');
   });
 
-  it('protects raw downloads with the same production viewer authentication', async () => {
-    const url = new URL(`https://sessions.vza.net/s/${SEARCH_SESSION}/download`);
-    const res = await viewerRoute(new Request(url.toString()), url, { ENVIRONMENT: 'production' } as Env);
-    expect(res.status).toBe(302);
-    expect(res.headers.get('location')).toBe('/login');
+  it('does not expose the obsolete viewer raw-download route', async () => {
+    const res = await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}/download`);
+    expect(res.status).toBe(404);
   });
 
   it('redirects to /login in preview when unauthenticated (publicly reachable previews)', async () => {
