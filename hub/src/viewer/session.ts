@@ -37,6 +37,12 @@ interface SessionMeta {
   index_state: string;
   updated_at: string | null;
 }
+interface SessionFile {
+  store: string;
+  relpath: string;
+  r2_key: string;
+  content_hash: string;
+}
 
 type View = 'chronological' | 'effective';
 
@@ -57,7 +63,7 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
     `SELECT f.store, f.relpath, f.r2_key, f.content_hash FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
   )
     .bind(sessionId)
-    .first<{ store: string; relpath: string; r2_key: string; content_hash: string }>();
+    .first<SessionFile>();
   // Cache-busting token for blob URLs: block ids (rowids) are reused across reindexes, so the
   // 1-year immutable cache is keyed on the canonical file's content hash prefix.
   const blobVersion = blobVersionOf(file?.content_hash);
@@ -128,7 +134,7 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
 
   const head =
     pageHead(displayTitle, undefined) +
-    renderHeader(meta, displayTitle, children.results, view, url) +
+    renderHeader(meta, displayTitle, children.results, view, url, file, env) +
     (view === 'effective'
       ? `<p class="muted small">Effective view — replaced/abandoned turns hidden. <a href="${esc(withView(url, 'chronological'))}">Show all</a></p>`
       : '');
@@ -392,12 +398,21 @@ function pairToolResults(turns: NormalizedTurn[]): ToolPairs {
   return { byCall, results: pairedResults };
 }
 
+function r2ObjectUrl(r2Key: string, baseUrl: string): string {
+  const prefix = r2Key.slice(0, r2Key.lastIndexOf('/') + 1);
+  const object = encodeURIComponent(encodeURIComponent(r2Key));
+  const query = new URLSearchParams({ prefix });
+  return `${baseUrl.replace(/\/+$/, '')}/objects/${object}/details?${query}`;
+}
+
 function renderHeader(
   meta: SessionMeta,
   displayTitle: string,
   children: Array<{ session_id: string; title: string | null }>,
   view: View,
   url: URL,
+  file: SessionFile | null,
+  env: Env,
 ): string {
   const banners: string[] = [];
   if (meta.parent_session_id) {
@@ -432,13 +447,15 @@ function renderHeader(
     view === 'chronological'
       ? `<a href="${esc(withView(url, 'effective'))}">effective view</a>`
       : `<a href="${esc(withView(url, 'chronological'))}">chronological view</a>`;
-  const download = `<a class="button-link" href="/s/${q(meta.session_id)}/download">Download raw session</a>`;
+  const filesLink = file
+    ? `<a href="${esc(r2ObjectUrl(file.r2_key, env.R2_DASHBOARD_BASE_URL))}" target="_blank" rel="noopener noreferrer">Session files in R2</a>`
+    : '';
 
   return (
     banners.join('') +
     `<div class="sesshead"><h2 style="margin:0">${esc(displayTitle)}</h2>` +
     `<div class="kv">${kv.join('')}</div>` +
-    `<div class="kv">${tokens} · ${viewToggle} · ${download}</div></div>`
+    `<div class="kv">${tokens} · ${viewToggle}${filesLink ? ` · ${filesLink}` : ''}</div></div>`
   );
 }
 

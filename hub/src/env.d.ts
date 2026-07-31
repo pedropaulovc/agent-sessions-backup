@@ -6,6 +6,7 @@ interface Env {
   ENVIRONMENT: 'development' | 'preview' | 'production';
   API_HOST: string;
   VIEWER_HOST: string;
+  R2_DASHBOARD_BASE_URL: string;
   SETUP_TOKEN?: string;
   // Cloudflare's managed client-certificate lifecycle is authorized through a private
   // OAuth client. The singleton Durable Object owns the grant and never returns bearer
