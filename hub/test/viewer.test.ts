@@ -792,12 +792,23 @@ describe('viewer', () => {
     expect(html).toContain('found the reference');
     expect(html).toContain('Session files in R2');
     expect(html).toContain('target="_blank" rel="noopener noreferrer"');
+    const r2Prefix = `raw/testbox-wsl/claude-projects/-home-tester-src-demo/${SEARCH_SESSION}`;
     expect(html).toContain(
-      `https://dash.cloudflare.com/18ef3246e9f36d1560485ef53889c0ab/r2/default/buckets/agent-sessions-raw/objects/${encodeURIComponent(encodeURIComponent('raw/testbox-wsl/claude-projects/-home-tester-src-demo/' + SEARCH_SESSION + '.jsonl'))}/details?prefix=raw%2Ftestbox-wsl%2Fclaude-projects%2F`,
+      `https://dash.cloudflare.com/18ef3246e9f36d1560485ef53889c0ab/r2/default/buckets/agent-sessions-raw?prefix=${encodeURIComponent(r2Prefix)}`,
     );
+    expect(html).not.toContain('/objects/');
     expect(html).not.toContain('Download raw session');
     // inline image points at the blob endpoint
     expect(html).toMatch(new RegExp(`/s/${SEARCH_SESSION}/blob/\\d+`));
+  });
+
+  it('keeps single-file sessions on the R2 object details page', async () => {
+    const html = await (await SELF.fetch(`https://sessions.vza.net/s/${CODEX_TAIL_SESSION}`)).text();
+    const r2Key = `raw/testbox-wsl/codex-sessions/2026/07/02/rollout-2026-07-02T09-00-00-${CODEX_TAIL_SESSION}.jsonl`;
+    const prefix = 'raw/testbox-wsl/codex-sessions/2026/07/02/';
+    expect(html).toContain(
+      `https://dash.cloudflare.com/18ef3246e9f36d1560485ef53889c0ab/r2/default/buckets/agent-sessions-raw/objects/${encodeURIComponent(encodeURIComponent(r2Key))}/details?prefix=${encodeURIComponent(prefix)}`,
+    );
   });
 
   it('stars and unstars a turn with a same-origin POST', async () => {

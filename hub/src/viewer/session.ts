@@ -398,11 +398,28 @@ function pairToolResults(turns: NormalizedTurn[]): ToolPairs {
   return { byCall, results: pairedResults };
 }
 
+function r2DashboardBase(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, '');
+}
+
 function r2ObjectUrl(r2Key: string, baseUrl: string): string {
   const prefix = r2Key.slice(0, r2Key.lastIndexOf('/') + 1);
   const object = encodeURIComponent(encodeURIComponent(r2Key));
   const query = new URLSearchParams({ prefix });
-  return `${baseUrl.replace(/\/+$/, '')}/objects/${object}/details?${query}`;
+  return `${r2DashboardBase(baseUrl)}/objects/${object}/details?${query}`;
+}
+
+function r2SearchUrl(prefix: string, baseUrl: string): string {
+  const query = new URLSearchParams({ prefix });
+  return `${r2DashboardBase(baseUrl)}?${query}`;
+}
+
+function r2SessionUrl(harness: string, r2Key: string, baseUrl: string): string {
+  if (harness !== 'claude-code') return r2ObjectUrl(r2Key, baseUrl);
+  const slash = r2Key.lastIndexOf('/');
+  const dot = r2Key.lastIndexOf('.');
+  const prefix = dot > slash ? r2Key.slice(0, dot) : r2Key;
+  return r2SearchUrl(prefix, baseUrl);
 }
 
 function renderHeader(
@@ -448,7 +465,7 @@ function renderHeader(
       ? `<a href="${esc(withView(url, 'effective'))}">effective view</a>`
       : `<a href="${esc(withView(url, 'chronological'))}">chronological view</a>`;
   const filesLink = file
-    ? `<a href="${esc(r2ObjectUrl(file.r2_key, env.R2_DASHBOARD_BASE_URL))}" target="_blank" rel="noopener noreferrer">Session files in R2</a>`
+    ? `<a href="${esc(r2SessionUrl(meta.harness, file.r2_key, env.R2_DASHBOARD_BASE_URL))}" target="_blank" rel="noopener noreferrer">Session files in R2</a>`
     : '';
 
   return (
