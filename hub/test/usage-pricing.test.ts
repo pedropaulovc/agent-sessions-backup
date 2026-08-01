@@ -514,4 +514,67 @@ describe('priceEpochExpr', () => {
     const row = (await fetchUsage('group_by=machine&machine=differbox')).rows[0]!;
     expect(Number(row.unpriced_calls)).toBeGreaterThan(0);
   });
+
+  // Both directions of the same bug: which rates matter depends on the tier the REQUEST selects,
+  // and a fixed column list cannot know that. A hand-maintained list was wrong twice here.
+  const seedTiered = async (
+    model: string,
+    machine: string,
+    rows: readonly (readonly [string, number, number | null])[],
+  ) => {
+    for (const [from, std, batchRate] of rows) {
+      await testEnv.DB.prepare(
+        `INSERT INTO model_prices
+           (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
+            cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
+            cache_accounting, source, fetched_at)
+         VALUES (?1, ?2, ?1, 'openai', ?3, ?3, 0, 0, 0, ?4, ?4, 'subset', 'test', '2026-07-31T00:00:00Z')`,
+      )
+        .bind(model, from, std, batchRate)
+        .run();
+    }
+    await seedSession(`${model}-sess`, machine, 'claude-code');
+    await testEnv.DB.prepare(
+      `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens,
+                          cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens)
+       VALUES (?1, 920, NULL, ?2, 1000000, 0, 0, 0, 0)`,
+    )
+      .bind(`${model}-sess`, model)
+      .run();
+  };
+
+  it('prices a timestamp-less STANDARD request when only the batch rate moved', async () => {
+    // The standard request never reads input_cost_batch, so a historical change to it alone
+    // cannot alter these dollars — but a column list that always included both tiers said it did.
+    await seedTiered('std-req-model', 'stdreqbox', [
+      ['2026-01-01', 7, 3],
+      ['2026-05-01', 7, 99],
+    ]);
+    const row = (await fetchUsage('group_by=machine&machine=stdreqbox')).rows[0]!;
+    expect(Number(row.unpriced_calls), 'a batch-only rate change unpriced a standard request').toBe(0);
+    expect(Number(row.cost_usd)).toBeCloseTo(7, 6);
+  });
+
+  it('prices a timestamp-less BATCH request when only the standard rate moved', async () => {
+    // The mirror image: with a published batch tier the standard rate is never selected.
+    await seedTiered('batch-req-model', 'batchreqbox', [
+      ['2026-01-01', 40, 5],
+      ['2026-05-01', 900, 5],
+    ]);
+    const row = (await fetchUsage('group_by=machine&machine=batchreqbox&batch=1')).rows[0]!;
+    expect(Number(row.unpriced_calls), 'a standard-only rate change unpriced a batch request').toBe(0);
+    expect(Number(row.cost_usd)).toBeCloseTo(5, 6);
+  });
+
+  it('refuses a timestamp-less BATCH request when the batch tier appears mid-history', async () => {
+    // `batch=1` falls back to the standard rate when no batch tier is published, so a NULL ->
+    // published transition really does change the dollars AND the rate set. Comparing outcomes
+    // catches it; comparing only `input_cost_batch` against a request flag would not have.
+    await seedTiered('batch-gap-model', 'batchgapbox', [
+      ['2026-01-01', 5, null],
+      ['2026-05-01', 5, 5],
+    ]);
+    const row = (await fetchUsage('group_by=machine&machine=batchgapbox&batch=1')).rows[0]!;
+    expect(Number(row.unpriced_calls), 'a standard->batch rate-set flip was treated as equivalent').toBeGreaterThan(0);
+  });
 });

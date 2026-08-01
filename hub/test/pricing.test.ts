@@ -307,6 +307,17 @@ describe('model id resolution', () => {
     expect(c).toContain('claude-haiku-4-5');
     expect(c).toContain('anthropic/claude-haiku-4-5');
   });
+
+  it('tries EVERY exact form, prefixed included, before any undated one', () => {
+    // An undated match is a DIFFERENT model's rate. With `anthropic/claude-x-20260101` published
+    // and a bare `claude-x` family entry present but no bare dated key, ordering the undated
+    // candidate first prices the call at the family rate and reports it as confidently priced.
+    const c = priceKeyCandidates('claude-x-20260101');
+    const lastExact = Math.max(...c.map((k, i) => (k.endsWith('-20260101') ? i : -1)));
+    const firstUndated = c.findIndex((k) => !k.endsWith('-20260101'));
+    expect(c).toContain('anthropic/claude-x-20260101');
+    expect(firstUndated, 'an undated candidate is tried before an exact prefixed one').toBeGreaterThan(lastExact);
+  });
 });
 
 describe('historical pricing', () => {

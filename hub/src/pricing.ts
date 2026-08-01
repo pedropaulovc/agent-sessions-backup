@@ -56,7 +56,8 @@ const MILLION = 1_000_000;
 
 /** Candidate upstream keys for a model id, most specific first. Real ids include
  * date-suffixed variants (`claude-haiku-4-5-20251001`) that upstream may or may not carry
- * separately; try exact first, then the undated family, then provider-prefixed forms. */
+ * separately; try every EXACT form (bare and provider-prefixed) before any undated fallback --
+ * an undated match is a different model's rate, so it must lose to any exact one. */
 export { priceKeyCandidates } from './upstream-catalog.mjs';
 
 /** How a `usage.model` value should be treated for pricing. Three states, not a boolean,

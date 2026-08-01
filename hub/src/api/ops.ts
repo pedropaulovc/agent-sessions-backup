@@ -683,7 +683,8 @@ export async function usage(url: URL, env: Env): Promise<Response> {
     // cache-write shape, and therefore one rate and one accounting convention. `epoch` — not
     // `bucket` — is the date to price at; see the comment on the query above.
     const modelClass = classifyModel(r.model);
-    const price = modelClass === 'billable' ? priceForGroup(prices.get(r.model as string) ?? [], String(r.epoch), r) : null;
+    const price =
+      modelClass === 'billable' ? priceForGroup(prices.get(r.model as string) ?? [], String(r.epoch), r, batch) : null;
     const cost = costOfUsage(r, price, { batch });
     agg.billable_input_tokens += cost.billableInputTokens;
     agg.cost_usd += cost.usd;
@@ -738,40 +739,6 @@ function costBasis(batch: boolean, rateSetsUsed: Set<'standard' | 'batch' | 'mix
   return anyBatch ? 'litellm_list_price_batch_partial' : 'litellm_list_price';
 }
 
-/** Fields that actually change what a row COSTS. Two snapshots agreeing on all of these are
- * interchangeable for pricing, whatever else differs between them (`effective_from`,
- * `litellm_key`, `fetched_at`, `provider`). */
-const COST_RELEVANT_COLS = [
-  'input_cost',
-  'output_cost',
-  'cache_read_cost',
-  'cache_write_5m_cost',
-  'cache_write_1h_cost',
-  'input_cost_batch',
-  'output_cost_batch',
-  'cache_accounting',
-] as const;
-
-/** Which columns a group's cost actually depends on, given the token classes it HAS.
- *
- * Comparing all of them was still too strict: an input-only group became unpriced merely because
- * `output_cost` moved, or because `cache_accounting` flipped on a group with no cache reads —
- * neither of which can change that group's dollars. */
-function relevantCols(row: UsageTokens): readonly (typeof COST_RELEVANT_COLS)[number][] {
-  const cols: (typeof COST_RELEVANT_COLS)[number][] = [];
-  const n = (v: number | null | undefined) => Math.max(0, v ?? 0);
-  if (n(row.input_tokens) > 0) cols.push('input_cost', 'input_cost_batch');
-  if (n(row.output_tokens) > 0) cols.push('output_cost', 'output_cost_batch');
-  if (n(row.cache_read_tokens) > 0) cols.push('cache_read_cost', 'cache_accounting', 'input_cost');
-  if (n(row.cache_creation_5m_tokens) > 0) cols.push('cache_write_5m_cost');
-  if (n(row.cache_creation_1h_tokens) > 0) cols.push('cache_write_1h_cost');
-  return cols;
-}
-
-function costEquivalent(a: ModelPrice, b: ModelPrice, cols: readonly (typeof COST_RELEVANT_COLS)[number][]): boolean {
-  return cols.every((c) => (a[c] ?? null) === (b[c] ?? null));
-}
-
 /** The rate for a group, given the epoch it was bucketed into.
  *
  * A group with no timestamp can still be priced when every snapshot the model has would produce
@@ -780,16 +747,30 @@ function costEquivalent(a: ModelPrice, b: ModelPrice, cols: readonly (typeof COS
  * becoming `openai`, say), and that alone made every timestamp-less call for the model unpriced
  * even though all its snapshots compute identical dollars.
  *
- * When they genuinely differ, any choice is a guess, so it stays unpriced rather than being
+ * The comparison runs `costOfUsage` itself rather than diffing a hand-maintained list of
+ * "cost-relevant columns". Two attempts at that list were both wrong in the same direction —
+ * comparing rates the request does not select. The batch tier is the clearest case: `batch=1`
+ * takes `*_cost_batch` and FALLS BACK to standard when a model publishes none, so which columns
+ * matter depends on the request flag AND on whether the batch rate is null, and a standard-priced
+ * request was going unpriced because only `input_cost_batch` had moved historically. Asking the
+ * pricing function what each snapshot actually costs cannot drift from what it actually charges.
+ *
+ * When snapshots genuinely differ, any choice is a guess, so it stays unpriced rather than being
  * charged at some arbitrary rate and reported as a real figure. */
-function priceForGroup(history: ModelPrice[], epoch: string, row: UsageTokens): ModelPrice | null {
+function priceForGroup(history: ModelPrice[], epoch: string, row: UsageTokens, batch: boolean): ModelPrice | null {
   if (epoch !== EPOCH_UNKNOWN_TIME) return priceAt(history, epoch);
   if (!history.length) return null;
   const first = history[0]!;
-  const cols = relevantCols(row);
-  // No billable tokens at all: nothing to disagree about, so any snapshot serves.
-  if (!cols.length) return first;
-  return history.every((p) => costEquivalent(first, p, cols)) ? first : null;
+  if (history.length === 1) return first;
+  // `rateSet` is compared alongside the dollars: two snapshots can cost the same while one paid a
+  // batch rate and the other fell back to standard, and that difference is what `cost_basis`
+  // reports to the caller.
+  const outcome = (p: ModelPrice) => {
+    const c = costOfUsage(row, p, { batch });
+    return `${c.usd}|${c.unpriced}|${c.rateSet}`;
+  };
+  const baseline = outcome(first);
+  return history.every((p) => outcome(p) === baseline) ? first : null;
 }
 
 /** Stands in for a NULL `usage.model` in `unpriced_models`. Deliberately bracketed so it cannot

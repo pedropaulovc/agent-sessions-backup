@@ -146,7 +146,7 @@ def _usage_section(usage: UsageReport) -> list[str]:
     for row in sorted(usage.rows, key=lambda r: r.total_tokens, reverse=True):
         model = row.bucket or "(unknown)"
         # An unpriced row's 0.00 would read as "this was free" rather than "we have no rate".
-        cost = "—" if row.unpriced_calls and not row.cost_usd else f"${row.cost_usd:,.2f}"
+        cost = "—" if row.unpriced_calls and not row.cost_usd else _fmt_cost(row.cost_usd)
         lines.append(
             f"| {model} | {row.calls} | {row.input_tokens:,} | {row.output_tokens:,} | {row.reasoning_tokens:,} "
             f"| {row.cache_read_tokens:,} | {row.cache_creation_5m_tokens:,}/{row.cache_creation_1h_tokens:,} |"
@@ -159,6 +159,23 @@ def _usage_section(usage: UsageReport) -> list[str]:
 
 
 _NO_PRICING_NOTE = "_Token counts only — this hub did not return pricing, so no dollar figure is available._"
+
+
+def _fmt_cost(usd: float) -> str:
+    """Never print a nonzero cost as `$0.00`.
+
+    Two decimals is the right resolution for a day's spend and the wrong one for a single
+    low-volume model bucket: `cost_usd=0.004` rendered as `$0.00`, and since the report carries no
+    more precise figure anywhere, real usage was presented as free. A true zero still prints
+    `$0.00` -- the marker has to mean "too small to show at this precision", not "cheap".
+    """
+    if usd == 0:
+        return "$0.00"
+    # Keyed off the rendered string, not a 0.005 threshold: the threshold has to agree with
+    # whatever rounding the format applies, and it does not have to -- 0.005 itself formats as
+    # "$0.00" under round-half-even.
+    formatted = f"${usd:,.2f}"
+    return "<$0.01" if formatted in ("$0.00", "$-0.00") else formatted
 
 
 # The number is a list-price equivalent, NOT a bill: these tokens were very likely burned under
@@ -188,5 +205,10 @@ def _cost_note(usage: UsageReport) -> list[str]:
     return [
         note,
         "",
-        f"_Totals are a floor: {usage.unpriced_calls:,} calls have no published rate ({models})._",
+        # NOT "no published rate". `unpriced_calls` is one counter for several distinct failure
+        # modes: a missing catalog rate, yes, but also a timestamp too ambiguous to pick a
+        # snapshot, an unknown cache-accounting convention, and a rate missing for just one token
+        # class the call used. Naming the catalog specifically sends readers hunting for a
+        # coverage gap that may not exist.
+        f"_Totals are a floor: {usage.unpriced_calls:,} calls could not be priced ({models})._",
     ]

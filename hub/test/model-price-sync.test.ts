@@ -1,6 +1,7 @@
 import { env } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runModelPriceSync } from '../src/cron/model-prices';
+import { perM } from '../src/upstream-catalog.mjs';
 
 /** The unattended refresh path. Without these, "prices stay current" rests on a cron trigger
  * nobody ever exercised — and a silently stale price table produces confident, wrong dollars.
@@ -42,7 +43,9 @@ function mockUpstream(payload: Record<string, unknown> | { fail: number }): void
   return mockUpstreamRaw(payload);
 }
 
-function mockUpstreamRaw(payload: Record<string, unknown> | { fail: number }): void {
+// `unknown`, not Record: the point of several tests here is a payload that is NOT a catalog --
+// an array, an error envelope -- and a narrower parameter type would reject exactly those.
+function mockUpstreamRaw(payload: unknown): void {
   vi.stubGlobal(
     'fetch',
     vi.fn(async () => {
@@ -231,6 +234,30 @@ describe('model price autorefresh', () => {
       expect(sync.ok).toBe(0);
       expect(sync.error).toContain('does not look like a price catalog');
     })();
+  });
+
+  it('refuses an ARRAY of priced entries, which passes every count-based check', async () => {
+    // The nastiest near-miss: `typeof [] === 'object'`, Object.keys gives 100+, and every element
+    // carries cost fields, so the guard's entry count and its priced count both pass. But the
+    // catalog is keyed BY MODEL NAME, so every lookup misses -- ok=1 with all models unresolved.
+    mockUpstreamRaw(Array.from({ length: 150 }, () => entry()));
+    await expect(runModelPriceSync(testEnv)).rejects.toThrow('does not look like a price catalog');
+    expect(await pricesFor('claude-opus-5'), 'an array payload wrote prices').toHaveLength(0);
+  });
+
+  it('drops a rate that overflows to Infinity when scaled to per-million', async () => {
+    // Finite going in, Infinity coming out (MAX_VALUE * 1e6). The assertion is on perM itself,
+    // not on the stored row, because the end-to-end version of this test is VACUOUS: D1 coerces a
+    // bound non-finite REAL to NULL and does not fail the batch, so the cron reaches the same
+    // stored value with or without the guard (verified by reverting it -- input_cost was NULL
+    // either way, and the well-formed neighbour was still priced).
+    //
+    // The path that actually breaks is the manual backfill: scripts/sync-model-prices.mjs
+    // interpolates rates into a SQL FILE and its sqlNum THROWS on a non-finite value, aborting
+    // the whole run and leaving every model's snapshot stale. sqlNum's contract is that perM
+    // never hands it one, so that is what this asserts.
+    expect(perM(Number.MAX_VALUE), 'a rate that overflows when scaled reached sqlNum').toBe(null);
+    expect(perM(Number.MAX_VALUE / 2e6), 'a large but representable rate was dropped').toBeGreaterThan(0);
   });
 
   it('rejects a negative rate instead of storing a cost that cancels real spend', async () => {

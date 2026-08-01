@@ -23,9 +23,17 @@ export const MIN_CATALOG_ENTRIES = 100;
  *
  * Rejects negatives as well as non-finite values: a negative rate stores fine and prices a row as
  * fully PRICED, producing negative cost_usd that cancels legitimate spend in an aggregate — an
- * undercount with nothing in unpriced_calls to flag it. Zero is legitimate (free models). */
-export const perM = (v) =>
-  typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Number((v * PER_MILLION).toPrecision(12)) : null;
+ * undercount with nothing in unpriced_calls to flag it. Zero is legitimate (free models).
+ *
+ * The SCALED value is what gets validated, not the input: a rate above MAX_VALUE / 1e6 is finite
+ * going in and Infinity coming out. The manual script then throws in sqlNum and the cron binds a
+ * non-finite value, so one malformed upstream field aborts the whole refresh and leaves every
+ * model's snapshot stale -- a single bad rate must cost that one rate, not the run. */
+export const perM = (v) => {
+  if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) return null;
+  const scaled = Number((v * PER_MILLION).toPrecision(12));
+  return Number.isFinite(scaled) ? scaled : null;
+};
 
 /** An integer for a STRICT INTEGER column, or null. Truncates a finite float — a fractional
  * context length is a real limit expressed sloppily — and drops anything that is not a number.
@@ -47,7 +55,12 @@ export const intOrNull = (v) => {
  * written, and the run records success. Prices then silently stop tracking upstream while the sync
  * reports healthy, which is worse than a visible failure. */
 export function assertLooksLikeCatalog(payload) {
-  const entryCount = payload && typeof payload === 'object' ? Object.keys(payload).length : 0;
+  // Arrays are rejected explicitly. `typeof [] === 'object'`, Object.keys gives the length, and a
+  // 100-element array of priced objects passes every check below -- but the catalog is keyed BY
+  // MODEL NAME, so every lookup misses, the sync records ok=1 with all models unresolved, and
+  // prices quietly stop tracking upstream. That is the exact failure this guard exists to catch.
+  const isRecord = !!payload && typeof payload === 'object' && !Array.isArray(payload);
+  const entryCount = isRecord ? Object.keys(payload).length : 0;
   const priced =
     entryCount === 0
       ? 0
@@ -93,14 +106,17 @@ export function lookupEntry(catalog, key) {
   return Object.prototype.hasOwnProperty.call(catalog, key) ? catalog[key] : undefined;
 }
 
+const PROVIDER_PREFIXES = ['anthropic', 'openai', 'deepseek'];
+
 export function priceKeyCandidates(model) {
-  const out = [model];
   const undated = undatedModel(model);
-  if (undated !== model) out.push(undated);
-  for (const p of ['anthropic', 'openai', 'deepseek']) {
-    out.push(`${p}/${model}`);
-    if (undated !== model) out.push(`${p}/${undated}`);
-  }
+  // EVERY exact form -- including the provider-prefixed ones -- is tried before ANY undated
+  // fallback. The undated key is a different model's rate: strip the release stamp first and
+  // `anthropic/claude-x-20260101` loses to a bare `claude-x` family entry, so the call is
+  // confidently priced at the family rate instead of the release it actually ran on. An exact
+  // match under a prefix is still exact; an undated match never is.
+  const out = [model, ...PROVIDER_PREFIXES.map((p) => `${p}/${model}`)];
+  if (undated !== model) out.push(undated, ...PROVIDER_PREFIXES.map((p) => `${p}/${undated}`));
   return out;
 }
 

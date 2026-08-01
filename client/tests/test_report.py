@@ -318,6 +318,55 @@ def test_report_labels_partial_batch_pricing_honestly():
     assert "standard rates for the rest" in report
 
 
+def test_report_does_not_print_a_nonzero_cost_as_zero():
+    # $0.004 formatted to two decimals is "$0.00", and the report carries no more precise figure
+    # anywhere -- so ordinary low-volume usage was presented as free.
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
+    usage_report = UsageReport(
+        group_by="model", rows=[_usage_report_one_row(cost_usd=0.004).rows[0]], cost_basis="litellm_list_price"
+    )
+    status = HubStatus(machines=[], sessions=SessionsSummary(total=1, ready=1, error=0))
+    report = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status
+    )
+    assert "<$0.01" in report
+    assert "$0.00" not in report
+
+
+def test_report_still_prints_a_true_zero_as_zero():
+    # The marker means "too small to show at this precision", not "cheap" -- a genuinely free
+    # model must not be dressed up as costing something.
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
+    usage_report = UsageReport(
+        group_by="model", rows=[_usage_report_one_row(cost_usd=0.0).rows[0]], cost_basis="litellm_list_price"
+    )
+    status = HubStatus(machines=[], sessions=SessionsSummary(total=1, ready=1, error=0))
+    report = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status
+    )
+    assert "$0.00" in report
+    assert "<$0.01" not in report
+
+
+def test_report_does_not_blame_the_catalog_for_every_unpriced_call():
+    # `unpriced_calls` is one counter for several failure modes -- an ambiguous timestamp, an
+    # unknown cache-accounting convention, a rate missing for one token class. Saying "no
+    # published rate" sends readers hunting for a catalog gap that may not exist.
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
+    usage_report = UsageReport(
+        group_by="model",
+        rows=[_usage_report_one_row(unpriced_calls=3).rows[0]],
+        cost_basis="litellm_list_price",
+        unpriced_models=["ambiguous-model"],
+    )
+    status = HubStatus(machines=[], sessions=SessionsSummary(total=1, ready=1, error=0))
+    report = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status
+    )
+    assert "could not be priced" in report
+    assert "no published rate" not in report
+
+
 def test_report_marks_unpriced_rows_rather_than_showing_them_as_free():
     sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
     usage_report = UsageReport(
