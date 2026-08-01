@@ -72,104 +72,93 @@ interface MigrationInput {
   sql: string;
 }
 
-/** Strip `--` line comments, skipping any that are inside a quoted literal.
+/** SQLite's quoting forms. A semicolon or a `--` inside ANY of these is data, not syntax:
+ * `CREATE TABLE "audit;log" (id INT);` is valid SQL that wrangler applies fine, and a scanner that
+ * tracks only `'…'` splits it into two invalid fragments. `''` and `""` are escaped quotes rather
+ * than a close followed by an open; `[…]` has no escape form in SQLite. */
+const QUOTE_CLOSERS: Record<string, string> = { "'": "'", '"': '"', '`': '`', '[': ']' };
+
+/** Walk `sql`, calling `emit` for each character that is real syntax, with `quoted` telling it
+ * whether the character sits inside a quoted literal or identifier. Comments are dropped.
  *
- * The quote-awareness is not hypothetical tidiness: migrations 0011 and 0012 both contain
- * `instr(lower(cwd), '--claude-worktrees-')`. A naive /--.*$/ strip truncates that line at the
- * literal's own leading dashes, producing `instr(lower(cwd), ` — an unbalanced quote and a torn
- * statement, applied to a real database.
- */
-function stripComments(sql: string): string {
-  let out = '';
-  let inLiteral = false;
+ * One scanner so the splitter and the guard can never disagree about where a statement ends —
+ * they previously shared a naive `--` strip, which meant the guard could not detect the very
+ * corruption the splitter was producing. */
+function scanSql(sql: string, emit: (ch: string, quoted: boolean) => void): { unterminated: boolean } {
+  let open: string | null = null;
   for (let i = 0; i < sql.length; i++) {
     const c = sql[i]!;
-    if (inLiteral) {
-      out += c;
-      // '' is SQL's escaped quote, not a close immediately followed by an open.
-      if (c === "'" && sql[i + 1] === "'") {
-        out += "'";
+    if (open) {
+      emit(c, true);
+      const closer = QUOTE_CLOSERS[open]!;
+      // A doubled closer is an escaped one -- but only for the quote forms that HAVE an escape.
+      if (c === closer && closer !== ']' && sql[i + 1] === closer) {
+        emit(closer, true);
         i++;
         continue;
       }
-      if (c === "'") inLiteral = false;
+      if (c === closer) open = null;
       continue;
     }
-    if (c === "'") {
-      inLiteral = true;
-      out += c;
+    if (QUOTE_CLOSERS[c]) {
+      open = c;
+      emit(c, true);
       continue;
     }
     if (c === '-' && sql[i + 1] === '-') {
       while (i < sql.length && sql[i] !== '\n') i++;
-      out += '\n';
+      emit('\n', false);
       continue;
     }
-    // Block comments too: `/* rationale; details */` is valid SQLite that wrangler applies fine,
-    // and leaving it intact would make its semicolon a statement boundary and emit two invalid
-    // fragments. Unterminated is left alone so assertSplittable's quote/parity checks see the
-    // original text rather than a silently truncated version.
+    // `/* rationale; details */` is valid SQLite that wrangler applies; leaving it intact would
+    // make its semicolon a statement boundary. Unterminated is left as text so assertSplittable
+    // sees the original rather than a silently truncated version.
     if (c === '/' && sql[i + 1] === '*') {
       const close = sql.indexOf('*/', i + 2);
       if (close === -1) {
-        out += c;
+        emit(c, false);
         continue;
       }
       i = close + 1;
-      out += ' ';
+      emit(' ', false);
       continue;
     }
-    out += c;
+    emit(c, false);
   }
-  return out;
+  // A quote still open at EOF means the scanner's idea of where statements end is not the
+  // database's, so nothing derived from this scan can be trusted.
+  return { unterminated: open !== null };
 }
 
-/** Split a migration file into statements on `;`, ignoring semicolons inside quoted literals and
- * comments. `assertSplittable` still refuses trigger bodies, whose inner semicolons are real
- * statement terminators that must NOT split — being torn in half is the worst outcome a migration
- * has, so that case fails loudly rather than cleverly.
+/** Split a migration file into statements on `;`, ignoring semicolons inside quoted literals,
+ * quoted identifiers and comments. `assertSplittable` still refuses trigger bodies, whose inner
+ * semicolons are real statement terminators that must NOT split — being torn in half is the worst
+ * outcome a migration has, so that case fails loudly rather than cleverly.
  */
 export function splitStatements(sql: string): string[] {
-  const stripped = stripComments(sql);
   const out: string[] = [];
   let cur = '';
-  let inLiteral = false;
-  for (let i = 0; i < stripped.length; i++) {
-    const c = stripped[i]!;
-    if (inLiteral) {
-      cur += c;
-      if (c === "'" && stripped[i + 1] === "'") {
-        cur += "'";
-        i++;
-        continue;
-      }
-      if (c === "'") inLiteral = false;
-      continue;
-    }
-    if (c === "'") {
-      inLiteral = true;
-      cur += c;
-      continue;
-    }
-    if (c === ';') {
+  scanSql(sql, (ch, quoted) => {
+    if (ch === ';' && !quoted) {
       out.push(cur);
       cur = '';
-      continue;
+      return;
     }
-    cur += c;
-  }
+    cur += ch;
+  });
   out.push(cur);
   return out.map((x) => x.trim()).filter((x) => x.length > 0);
 }
 
 export function assertSplittable(name: string, sql: string): string | null {
-  const stripped = stripComments(sql);
+  let stripped = '';
+  const { unterminated } = scanSql(sql, (ch) => {
+    stripped += ch;
+  });
+  if (unterminated) return `${name}: unterminated quote or identifier — refusing to guess where statements end`;
   if (/\bBEGIN\b/i.test(stripped) || /\bCREATE\s+TRIGGER\b/i.test(stripped)) {
     return `${name}: contains a trigger or BEGIN block, which this endpoint's statement splitter cannot handle safely`;
   }
-  // An unterminated literal means the scanner's idea of where statements end is not the database's.
-  const quotes = (stripped.match(/'/g) ?? []).length;
-  if (quotes % 2 !== 0) return `${name}: unbalanced quote — refusing to guess where statements end`;
   return null;
 }
 
@@ -177,20 +166,6 @@ export async function migratePreview(request: Request, env: Env): Promise<Respon
   // Preview only, and 404 rather than 403: on production this route does not exist. The check is
   // first so an unauthenticated prod request cannot even learn the endpoint is there.
   if (env.ENVIRONMENT !== 'preview') return Response.json({ error: 'not_found' }, { status: 404 });
-
-  // Before authentication even: this says nothing about the caller, only about which database
-  // this Worker was built to talk to, and a legitimate caller needs to see it as loudly as a
-  // hostile one does.
-  if (!(await assertPreviewDatabase(env))) {
-    console.log(JSON.stringify({ event: 'hub.migrate.rejected', reason: 'not_preview_database' }));
-    return Response.json(
-      {
-        error: 'not_preview_database',
-        detail: `the bound DB has no ${PREVIEW_MARKER_TABLE} row for '${PREVIEW_MARKER_VALUE}' — refusing to migrate a database that cannot prove it is the preview one`,
-      },
-      { status: 409 },
-    );
-  }
 
   const repo = env.MIGRATE_OIDC_REPOSITORY;
   if (!repo) return Response.json({ error: 'migrate_not_configured' }, { status: 503 });
@@ -205,6 +180,12 @@ export async function migratePreview(request: Request, env: Env): Promise<Respon
   });
   if (!verified.ok) {
     console.log(JSON.stringify({ event: 'hub.migrate.rejected', reason: verified.reason }));
+    // A transient JWKS failure says nothing about the token. Surfacing it as a flat 401 made CI --
+    // which now treats every handler error as fatal -- fail a perfectly valid run red instead of
+    // using its retry window. 503 + retryable is the signal it keys off.
+    if (verified.retryable) {
+      return Response.json({ error: 'oidc_unavailable', reason: verified.reason, retryable: true }, { status: 503 });
+    }
     return Response.json({ error: 'oidc_rejected', reason: verified.reason }, { status: 401 });
   }
 
@@ -212,6 +193,22 @@ export async function migratePreview(request: Request, env: Env): Promise<Respon
   const migrations = body?.migrations;
   if (!Array.isArray(migrations) || migrations.some((m) => typeof m?.name !== 'string' || typeof m?.sql !== 'string')) {
     return Response.json({ error: 'bad_body' }, { status: 400 });
+  }
+
+  // Only now touch D1. This route has no mTLS and its workers.dev preview alias is publicly
+  // reachable, so doing the marker query first let any unauthenticated POST force a query against
+  // the shared preview database -- a trivial flood could burn its quota and degrade every branch
+  // preview. Authentication first, marker check immediately before any write: the check still runs
+  // on every path that writes, which is all it was ever protecting.
+  if (!(await assertPreviewDatabase(env))) {
+    console.log(JSON.stringify({ event: 'hub.migrate.rejected', reason: 'not_preview_database' }));
+    return Response.json(
+      {
+        error: 'not_preview_database',
+        detail: `the bound DB has no ${PREVIEW_MARKER_TABLE} row for '${PREVIEW_MARKER_VALUE}' — refusing to migrate a database that cannot prove it is the preview one`,
+      },
+      { status: 409 },
+    );
   }
 
   // Validate the whole set BEFORE applying any of it — a batch that fails halfway leaves the
@@ -243,17 +240,36 @@ export async function migratePreview(request: Request, env: Env): Promise<Respon
     // lands whole or not at all. The bookkeeping insert rides in the SAME batch — recording it
     // separately would let a crash between the two leave a migration applied but unrecorded, and
     // the next run would replay it.
+    //
+    // The insert goes FIRST, and `name` is UNIQUE, which makes it an atomic claim. Every branch
+    // shares one preview database and the workflow has no concurrency group, so two overlapping
+    // runs can both read the `already` snapshot above before either writes; without the claim the
+    // loser replays the DDL and returns migration_failed, turning a successful migration into a
+    // red check. Claiming inside the transaction means the loser's whole batch rolls back having
+    // applied nothing.
     // A D1 rejection here (an ALTER against a missing table, say) is DETERMINISTIC — it will fail
     // identically on every retry. Letting it escape produces Cloudflare's platform-generated 500,
     // which carries no JSON body, and CI classifies bodiless responses as "the preview is not up
     // yet" and retries then passes. Returning the error envelope is what makes CI fail loudly.
     try {
       await env.DB.batch([
-        ...statements.map((s) => env.DB.prepare(s)),
         env.DB.prepare('INSERT INTO d1_migrations (name) VALUES (?1)').bind(m.name),
+        ...statements.map((s) => env.DB.prepare(s)),
       ]);
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
+      // Distinguish "a concurrent run won the claim" from a genuine SQL error by re-reading the
+      // bookkeeping table. If the migration is recorded now, someone else applied it while we were
+      // working and the correct answer is `skipped`, not a red check.
+      const claimed = await env.DB.prepare('SELECT name FROM d1_migrations WHERE name = ?1')
+        .bind(m.name)
+        .first()
+        .catch(() => null);
+      if (claimed) {
+        console.log(JSON.stringify({ event: 'hub.migrate.raced', migration: m.name }));
+        skipped.push(m.name);
+        continue;
+      }
       console.log(JSON.stringify({ event: 'hub.migrate.failed', migration: m.name, detail, applied }));
       return Response.json({ error: 'migration_failed', migration: m.name, detail, applied }, { status: 500 });
     }

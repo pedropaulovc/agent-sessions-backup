@@ -213,7 +213,7 @@ describe('statement splitting', () => {
     // statement in half. The splitter is now quote-aware, so this is valid input, not a hazard —
     // see the 'statement splitting' block below for the assertion that it splits correctly.
     expect(assertSplittable('m', "INSERT INTO a VALUES ('x;y');")).toBeNull();
-    expect(assertSplittable('m', "INSERT INTO a VALUES ('unterminated);")).toContain('unbalanced quote');
+    expect(assertSplittable('m', "INSERT INTO a VALUES ('unterminated);")).toContain('unterminated quote');
     expect(assertSplittable('m', 'CREATE TABLE a (x INT);')).toBeNull();
   });
 
@@ -287,6 +287,28 @@ describe('statement splitting', () => {
     expect(out[0]).toContain("'/* not a comment; */'");
   });
 
+  it('does not split on a semicolon inside a quoted IDENTIFIER', () => {
+    // Valid SQLite that wrangler applies fine. A scanner tracking only '…' tears each of these
+    // into two invalid fragments, and a quote-parity check on ' alone cannot notice.
+    for (const ddl of [
+      'CREATE TABLE "audit;log" (id INT);',
+      'CREATE TABLE `audit;log` (id INT);',
+      'CREATE TABLE [audit;log] (id INT);',
+    ]) {
+      expect(splitStatements(ddl), ddl).toHaveLength(1);
+      expect(assertSplittable('m', ddl), ddl).toBe(null);
+    }
+  });
+
+  it('does not treat -- inside a quoted identifier as a comment', () => {
+    const sql = 'CREATE TABLE "audit--log" (id INT);';
+    expect(splitStatements(sql)[0]).toContain('"audit--log"');
+  });
+
+  it('flags an unterminated identifier, not just an unterminated literal', () => {
+    expect(assertSplittable('m', 'CREATE TABLE "audit (id INT);')).toContain('unterminated');
+  });
+
   it('still strips real comments', () => {
     expect(splitStatements("-- leading\nSELECT 1; -- trailing\nSELECT 2;")).toEqual(['SELECT 1', 'SELECT 2']);
   });
@@ -313,15 +335,16 @@ describe('bound-database check', () => {
     expect(res.status).toBe(409);
   });
 
-  it('refuses BEFORE authenticating, and before writing anything', async () => {
-    // Ordering matters twice over: a valid token must not be a prerequisite for the refusal (or a
-    // stolen one would bypass it), and nothing may be written to a database that failed to
-    // identify itself — including the d1_migrations bookkeeping table.
+  it('authenticates BEFORE touching D1 at all', async () => {
+    // This route has no mTLS and its workers.dev preview alias is publicly reachable. Running the
+    // marker query first let any unauthenticated POST force a query against the shared preview
+    // database, so a trivial flood could burn its quota and degrade every branch preview.
     await testEnv.DB.prepare(`DROP TABLE IF EXISTS ${PREVIEW_MARKER_TABLE}`).run();
     await testEnv.DB.prepare('DROP TABLE IF EXISTS migrate_probe').run();
     const res = await post('not-even-a-jwt', [{ name: '9999_probe', sql: 'CREATE TABLE migrate_probe (a INT);' }]);
-    // 409, not 401: the refusal does not depend on the caller's token being good.
-    expect(res.status).toBe(409);
+    // 401, not 409: with the marker table absent, a 409 would prove the marker query ran for an
+    // unauthenticated caller. Getting 401 is what shows it did not.
+    expect(res.status).toBe(401);
     const probe = await testEnv.DB.prepare("SELECT name FROM sqlite_master WHERE name = 'migrate_probe'")
       .first()
       .catch(() => null);
@@ -354,5 +377,57 @@ describe('bound-database check', () => {
       .first()
       .catch(() => null);
     expect(row).toBe(null);
+  });
+
+  it('reports a name already recorded as skipped rather than replaying its DDL', async () => {
+    // HONEST SCOPE. Two things I checked and want recorded, because both cut against the obvious
+    // test. (1) The end-to-end race is not reproducible here: overlapping requests via Promise.all
+    // still serialize inside the isolate, so the second one's snapshot already has the first's row
+    // and it takes the ordinary skip path — that test passed against the unfixed code. (2) D1's
+    // batch is transactional regardless of statement order, so putting the bookkeeping INSERT
+    // first does NOT change rollback behaviour; a duplicate aborts the batch either way.
+    //
+    // So the load-bearing part of the fix is the catch branch: on a failed batch, re-read
+    // d1_migrations and report `skipped` if the name is now present, instead of returning
+    // migration_failed and reddening the check. That is what this asserts.
+    const token = await signJwt(keys.pair.privateKey, goodClaims());
+    const sql = 'CREATE TABLE migrate_probe (a INT);';
+    expect((await post(token, [{ name: '9999_race', sql }])).status).toBe(200);
+    const second = await post(token, [{ name: '9999_race', sql }]);
+    expect(second.status).toBe(200);
+    expect((await second.json<{ skipped: string[] }>()).skipped).toContain('9999_race');
+  });
+
+  it('reports an unreachable JWKS as retryable, not as a bad token', async () => {
+    // CI treats any handler error as fatal, so a flat 401 here failed a valid run red during a
+    // GitHub blip. 503 + retryable:true is what keeps it in the retry loop.
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('upstream sad', { status: 503 })));
+    const token = await signJwt(keys.pair.privateKey, goodClaims());
+    const res = await post(token, [{ name: '9999_probe', sql: 'CREATE TABLE migrate_probe (a INT);' }]);
+    expect(res.status).toBe(503);
+    const body = await res.json<{ error: string; retryable: boolean }>();
+    expect(body.error).toBe('oidc_unavailable');
+    expect(body.retryable).toBe(true);
+  });
+
+  it('refetches the JWKS uncached when the kid is unknown, covering key rotation', async () => {
+    // A newly rotated signing key is absent from the 10-minute cached set, so a perfectly valid
+    // token looks forged. First call serves a stale set, second serves the real one.
+    let call = 0;
+    const realJwk = { ...keys.jwk, kid: 'rotated-key', alg: 'RS256', use: 'sig' };
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (!url.includes('token.actions.githubusercontent.com')) return new Response('nf', { status: 404 });
+        call++;
+        const keySet = call === 1 ? [{ kty: 'RSA', kid: 'old-key', n: 'AQAB', e: 'AQAB' }] : [realJwk];
+        return new Response(JSON.stringify({ keys: keySet }), { status: 200 });
+      }),
+    );
+    const token = await signJwt(keys.pair.privateKey, goodClaims(), { alg: 'RS256', kid: 'rotated-key', typ: 'JWT' });
+    const res = await post(token, [{ name: '9999_rot', sql: 'CREATE TABLE migrate_probe (a INT);' }]);
+    expect(res.status, 'a rotated signing key was treated as a forged token').toBe(200);
+    expect(call).toBeGreaterThanOrEqual(2);
   });
 });

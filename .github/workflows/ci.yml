@@ -141,7 +141,11 @@ jobs:
           TARGET: ${{ steps.target.outputs.url }}
         run: |
           set -uo pipefail
-          oidc=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          # Bounded: without a transfer deadline a server that accepts the connection and then
+          # stops responding parks this step until the job's own timeout, so the retry loop below
+          # never gets to run at all.
+          oidc=$(curl -sS --connect-timeout 10 --max-time 30 \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sessions-hub-preview-migrate" | jq -r .value)
           if [ -z "$oidc" ] || [ "$oidc" = "null" ]; then
             echo "::error::could not mint a GitHub OIDC token (is id-token: write set?)"
@@ -164,7 +168,8 @@ jobs:
           # the failure this job exists to prevent. Retry only what is plausibly transient.
           code=000
           for attempt in 1 2 3 4 5; do
-            code=$(curl -sS -o /tmp/migrate-out.json -w '%{http_code}' \
+            code=$(curl -sS --connect-timeout 10 --max-time 120 \
+              -o /tmp/migrate-out.json -w '%{http_code}' \
               -X POST "$TARGET/api/v1/admin/migrate" \
               -H "Authorization: Bearer $oidc" -H 'content-type: application/json' \
               --data-binary @/tmp/migrations.json) || code=000
@@ -178,7 +183,10 @@ jobs:
             # repository allowlist is unset; both are permanent misconfigurations, while a 404 or
             # 503 from Cloudflare's edge means the preview simply is not up yet. Every response
             # from our handler carries a JSON `error` key, and the edge's never does.
-            if [ -n "$body" ] && printf '%s' "$body" | jq -e 'has("error")' >/dev/null 2>&1; then
+            # `retryable` marks a handler error that says nothing about this request — GitHub's
+            # JWKS endpoint being unreachable — so it must NOT be fatal even though the handler
+            # answered. Everything else the handler returns is permanent.
+            if [ -n "$body" ] && printf '%s' "$body" | jq -e 'has("error") and (.retryable // false | not)' >/dev/null 2>&1; then
               echo "::error::preview migration rejected at $TARGET with HTTP $code: $body"
               exit 1
             fi

@@ -34,7 +34,9 @@ export interface GitHubOidcClaims {
 
 export type OidcResult =
   | { ok: true; claims: GitHubOidcClaims }
-  | { ok: false; reason: string };
+  // `retryable` marks a failure that says nothing about the token -- GitHub's JWKS endpoint being
+  // unreachable -- so a caller can retry instead of failing a valid run.
+  | { ok: false; reason: string; retryable?: boolean };
 
 interface Jwk {
   kid: string;
@@ -63,8 +65,14 @@ function decodeJson<T>(segment: string): T | null {
 
 /** GitHub rotates signing keys, so the key set is fetched rather than pinned. `cacheTtl` keeps
  * this off the hot path without holding a stale set past a rotation. */
-async function fetchJwks(): Promise<Jwk[] | null> {
-  const res = await fetch(GITHUB_JWKS_URL, { cf: { cacheTtl: 600, cacheEverything: true } });
+async function fetchJwks(bypassCache = false): Promise<Jwk[] | null> {
+  // `cacheEverything` with a 600s TTL keeps the common path off the network. bypassCache forces a
+  // fresh fetch for the one case the cache gets wrong: GitHub rotating in a new signing key inside
+  // the TTL, so a perfectly valid token names a kid the cached set predates.
+  const res = await fetch(GITHUB_JWKS_URL, {
+    cf: bypassCache ? { cacheTtl: 0 } : { cacheTtl: 600, cacheEverything: true },
+    ...(bypassCache ? { headers: { 'cache-control': 'no-cache' } } : {}),
+  });
   if (!res.ok) return null;
   const body = (await res.json()) as { keys?: Jwk[] };
   return body.keys ?? null;
@@ -97,9 +105,19 @@ export async function verifyGitHubOidc(
   if (!claims) return { ok: false, reason: 'malformed_claims' };
   if (claims.iss !== GITHUB_ISSUER) return { ok: false, reason: 'bad_issuer' };
 
-  const jwks = await fetchJwks();
-  if (!jwks) return { ok: false, reason: 'jwks_unavailable' };
-  const jwk = jwks.find((k) => k.kid === header.kid);
+  let jwks = await fetchJwks();
+  let jwk = jwks?.find((k) => k.kid === header.kid);
+  // An unknown kid is far more likely to be a key rotation the cache has not caught up with than a
+  // forged token, and a forged one fails signature verification below anyway -- so pay for one
+  // uncached fetch before rejecting. Without this, a valid run fails during every rotation window,
+  // and since CI now treats any handler error as fatal, it fails RED rather than retrying.
+  if (!jwk) {
+    jwks = await fetchJwks(true);
+    jwk = jwks?.find((k) => k.kid === header.kid);
+  }
+  // Distinguish "GitHub is unreachable" from "this token is bad": the first is transient and the
+  // caller should retry, the second never becomes valid. `retryable` is what CI keys off.
+  if (!jwks) return { ok: false, reason: 'jwks_unavailable', retryable: true };
   if (!jwk) return { ok: false, reason: 'unknown_kid' };
 
   const key = await crypto.subtle.importKey(
