@@ -10,6 +10,15 @@ const UPSTREAM =
 const PER_MILLION = 1_000_000;
 // Round after scaling: 2e-8 * 1e6 lands on 0.019999999999999998 in binary float, which is
 // numerically irrelevant but makes the stored table look untrustworthy.
+// max_input_tokens/max_output_tokens land in STRICT INTEGER columns. Upstream is a community
+// JSON blob typed `unknown`, and a `as number` assertion is a compile-time fiction: a string or a
+// float there makes D1 reject the INSERT, and because every model's snapshot goes out in ONE
+// batch(), a single bad entry aborts the whole sync and leaves every price stale. Coerce the same
+// way scripts/sync-model-prices.mjs does -- drop anything that isn't a finite number, truncate the
+// rest -- so one malformed upstream row costs that row only.
+const intOrNull = (v: unknown): number | null =>
+  typeof v === 'number' && Number.isFinite(v) ? Math.trunc(v) : null;
+
 const perM = (v: unknown): number | null =>
   typeof v === 'number' && Number.isFinite(v) ? Number((v * PER_MILLION).toPrecision(12)) : null;
 
@@ -123,8 +132,8 @@ export async function runModelPriceSync(env: Env): Promise<void> {
           next.cache_write_1h_cost,
           next.input_cost_batch,
           next.output_cost_batch,
-          (e['max_input_tokens'] as number) ?? null,
-          (e['max_output_tokens'] as number) ?? null,
+          intOrNull(e['max_input_tokens']),
+          intOrNull(e['max_output_tokens']),
           cacheAccounting,
           now,
         ),

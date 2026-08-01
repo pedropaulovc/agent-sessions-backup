@@ -44,7 +44,7 @@ export interface Cost {
    * with no published batch tier falls back to its standard rates, and the caller has to know
    * that happened or it will label standard-priced dollars as batch-priced. `none` means
    * nothing was priced. */
-  rateSet: 'standard' | 'batch' | 'none';
+  rateSet: 'standard' | 'batch' | 'mixed' | 'none';
 }
 
 const MILLION = 1_000_000;
@@ -126,9 +126,15 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   const unpriced: Cost = { usd: 0, unpriced: true, billableInputTokens: 0, rateSet: 'none' };
   if (!price) return unpriced;
 
-  const batch = opts?.batch === true && price.input_cost_batch != null && price.output_cost_batch != null;
-  const inRate = batch ? price.input_cost_batch : price.input_cost;
-  const outRate = batch ? price.output_cost_batch : price.output_cost;
+  // Batch rates are chosen PER CLASS, matching how rates are required per class below. An
+  // all-or-nothing check would fall back to standard pricing for an input-only row whose input
+  // batch rate is published just because the output batch rate is not — overstating a batch
+  // estimate the caller explicitly asked for and could have had.
+  const wantBatch = opts?.batch === true;
+  const useBatchIn = wantBatch && price.input_cost_batch != null;
+  const useBatchOut = wantBatch && price.output_cost_batch != null;
+  const inRate = useBatchIn ? price.input_cost_batch : price.input_cost;
+  const outRate = useBatchOut ? price.output_cost_batch : price.output_cost;
 
   // A missing cache READ rate falls back to the input rate: a cache read is never dearer than
   // fresh input, so that direction can only over-report, never quietly under-report.
@@ -156,7 +162,16 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
       cw1h * (price.cache_write_1h_cost ?? 0)) /
     MILLION;
 
-  return { usd, unpriced: false, billableInputTokens: billableInput, rateSet: batch ? 'batch' : 'standard' };
+  // Report what was actually applied to the classes this row HAS. A row with no output tokens
+  // is fully batch-priced on its input batch rate alone; one that pays a batch input rate and a
+  // standard output rate is genuinely `mixed`, and calling it either pure label would misstate
+  // the dollars in exactly the direction the caller is trying to detect.
+  const batchClasses = (billableInput > 0 && useBatchIn ? 1 : 0) + (output > 0 && useBatchOut ? 1 : 0);
+  const standardClasses = (billableInput > 0 && !useBatchIn ? 1 : 0) + (output > 0 && !useBatchOut ? 1 : 0);
+  const rateSet: Cost['rateSet'] =
+    batchClasses > 0 && standardClasses > 0 ? 'mixed' : batchClasses > 0 ? 'batch' : 'standard';
+
+  return { usd, unpriced: false, billableInputTokens: billableInput, rateSet };
 }
 
 /** Pick the rate in effect at `ts` from a model's price history (rows newest-first). */

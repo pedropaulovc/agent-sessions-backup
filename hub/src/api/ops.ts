@@ -648,7 +648,7 @@ export async function usage(url: URL, env: Env): Promise<Response> {
   const batch = url.searchParams.get('batch') === '1';
   const byBucket = new Map<string | null, UsageOutRow>();
   const unpricedModels = new Set<string>();
-  const rateSetsUsed = new Set<'standard' | 'batch'>();
+  const rateSetsUsed = new Set<'standard' | 'batch' | 'mixed'>();
 
   for (const r of rows.results ?? []) {
     // Key by the bucket VALUE, not String(bucket): a NULL bucket and a bucket whose literal text
@@ -722,10 +722,14 @@ export async function usage(url: URL, env: Env): Promise<Response> {
  * when it has no published batch tier (Anthropic publishes none at all), so a response that
  * flatly claimed `..._batch` could be reporting standard-priced dollars — or a mix of both,
  * which is the case any time a batch query spans providers. */
-function costBasis(batch: boolean, rateSetsUsed: Set<'standard' | 'batch'>): string {
+function costBasis(batch: boolean, rateSetsUsed: Set<'standard' | 'batch' | 'mixed'>): string {
   if (!batch) return 'litellm_list_price';
-  if (!rateSetsUsed.has('standard')) return 'litellm_list_price_batch';
-  return rateSetsUsed.has('batch') ? 'litellm_list_price_batch_partial' : 'litellm_list_price';
+  // `mixed` is a single row that paid a batch rate on one class and a standard rate on another,
+  // so it makes the whole response partial on its own.
+  const anyBatch = rateSetsUsed.has('batch') || rateSetsUsed.has('mixed');
+  const anyStandard = rateSetsUsed.has('standard') || rateSetsUsed.has('mixed');
+  if (!anyStandard) return anyBatch ? 'litellm_list_price_batch' : 'litellm_list_price';
+  return anyBatch ? 'litellm_list_price_batch_partial' : 'litellm_list_price';
 }
 
 /** The rate for a group, given the epoch it was bucketed into.

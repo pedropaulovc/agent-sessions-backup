@@ -161,4 +161,32 @@ describe('model price autorefresh', () => {
     ).results;
     expect(JSON.parse(audit[0]!.unresolved ?? '[]')).not.toContain('<synthetic>');
   });
+
+  it('coerces non-integer max_*_tokens rather than failing the whole batch', async () => {
+    // These land in STRICT INTEGER columns, and every model's snapshot goes out in ONE batch(),
+    // so a single malformed upstream entry used to abort the sync and leave EVERY price stale.
+    // The float and the numeric string here are exactly the shapes a community JSON blob produces.
+    await testEnv.DB.prepare(
+      `INSERT INTO usage (session_id, turn_index, ts, model) VALUES ('sync-sess', 2, '2026-07-01T00:00:00Z', 'claude-sonnet-5')`,
+    ).run();
+    mockUpstream({
+      'claude-opus-5': entry({ max_input_tokens: 200000.5, max_output_tokens: '32768' }),
+      'claude-sonnet-5': entry({ max_input_tokens: 200000 }),
+    });
+    await runModelPriceSync(testEnv);
+
+    const limits = (
+      await testEnv.DB.prepare(
+        `SELECT model, max_input_tokens, max_output_tokens FROM model_prices ORDER BY model`,
+      ).all<Record<string, unknown>>()
+    ).results;
+    expect(limits.find((r) => r.model === 'claude-opus-5')).toMatchObject({
+      // A finite float is a real limit expressed sloppily -- truncate it rather than discarding
+      // the value. Only a non-number (the string) has nothing recoverable in it.
+      max_input_tokens: 200000,
+      max_output_tokens: null,
+    });
+    // The actual point: the well-formed model still got written despite the bad neighbour.
+    expect(limits.find((r) => r.model === 'claude-sonnet-5')!.max_input_tokens).toBe(200000);
+  });
 });

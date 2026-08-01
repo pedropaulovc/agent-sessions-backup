@@ -91,6 +91,25 @@ describe('batch tier', () => {
     expect(batch.usd).toBeCloseTo(0.1 + 0.6, 10);
   });
 
+  it('applies a published batch rate per class, not all-or-nothing', () => {
+    // A provider that publishes an input batch rate but no output one is common enough (the
+    // fields are independent upstream). The old check required BOTH before using EITHER, so an
+    // input-only row silently paid full list price despite a published batch rate for exactly
+    // the tokens it had.
+    const halfBatch: ModelPrice = { ...LUNA, output_cost_batch: null };
+    const inputOnly = { model: 'gpt-5.6-luna', input_tokens: 1_000_000, output_tokens: 0 };
+    expect(costOfUsage(inputOnly, halfBatch, { batch: true }).usd).toBeCloseTo(0.1, 10);
+    expect(costOfUsage(inputOnly, halfBatch, { batch: true }).rateSet).toBe('batch');
+
+    // With BOTH classes present and only one batch rate published, the row is genuinely priced
+    // off two different rate sets -- report that instead of picking a label that misstates half
+    // the dollars in either direction.
+    const both = { model: 'gpt-5.6-luna', input_tokens: 1_000_000, output_tokens: 1_000_000 };
+    const c = costOfUsage(both, halfBatch, { batch: true });
+    expect(c.usd).toBeCloseTo(0.1 + 1.2, 10);
+    expect(c.rateSet).toBe('mixed');
+  });
+
   it('falls back to standard rates when the provider has no batch tier', () => {
     // Anthropic publishes no batch fields in LiteLLM, so asking for batch must not silently
     // discount -- it should return the standard price rather than a number we invented.
