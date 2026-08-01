@@ -77,11 +77,24 @@ so a PR can repoint `env.preview.d1_databases[].database_id` at the production d
 committed in that same file) and its preview Worker would then be bound to production. Nothing in
 the deployment path stops that.
 
-What closes it is that the endpoint **asks the database it is actually bound to whether it is the
-preview one**, before authenticating the caller and before writing anything. The preview database
-carries a `preview_environment_marker` row; production does not, and a PR has no credential to add
-one. A repointed binding therefore gets `409 not_preview_database` instead of a migration. It fails
-**closed**: a missing table, a missing row, a wrong value, or any error at all means no writes.
+The endpoint therefore **asks the database it is actually bound to whether it is the preview one**,
+before authenticating the caller and before writing anything. The preview database carries a
+`preview_environment_marker` row; production does not. A repointed binding gets
+`409 not_preview_database` instead of a migration, and it fails **closed** — a missing table, a
+missing row, a wrong value, or any error at all means no writes.
+
+**This stops an accident, not an attacker.** The check is itself PR-controlled code, so a hostile
+PR can delete it, and no check inside this Worker can do better, because Workers Builds builds the
+Worker from the PR. What it reliably prevents is a mistyped or copy-pasted database id, a bad
+merge, or a stale config pointing the preview at production — the realistic failure.
+
+The malicious-author case is bounded by the repository rather than by this code. The job runs only
+for same-repo PRs, so it needs push access; `main` is unprotected, so that access already permits a
+direct push to `main`, which runs CI's `deploy` job with the full-account `CLOUDFLARE_API_TOKEN`.
+This endpoint grants strictly less than such an attacker already holds — which is a statement about
+the repository's posture, not a property of the endpoint. If that posture changes (branch
+protection on `main`, or additional collaborators), the honest fix is to host preview D1 in a
+**separate Cloudflare account**, where nothing reachable from a build can name production at all.
 
 Seeding that marker is a one-time manual step, done with the production credential — deliberately
 *not* by a migration or by the endpoint, since anything a PR can cause to run could otherwise mint

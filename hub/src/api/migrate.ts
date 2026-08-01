@@ -11,10 +11,24 @@ import { verifyGitHubOidc } from '../auth/github-oidc';
  * env.preview at the production database id (it is committed in that same file) and this endpoint
  * would then apply PR-authored SQL to production. The binding alone is therefore NOT the control.
  *
- * What closes it is `assertPreviewDatabase` below: the endpoint asks the database it is actually
- * bound to whether it is the preview one, and refuses before any write if the answer isn't yes.
- * Production has no such marker and a PR has no credential to add one, so a repointed binding
- * gets a 409 rather than a migration. CI authenticates with a short-lived GitHub OIDC assertion.
+ * `assertPreviewDatabase` below narrows that: the endpoint asks the database it is actually bound
+ * to whether it is the preview one, and refuses before any write if the answer isn't yes.
+ *
+ * Be precise about what that does and does not buy. This check is itself PR-controlled code, so a
+ * hostile PR can simply delete it — it is NOT a defence against a malicious author, and nothing
+ * inside this Worker can be, because Workers Builds builds the Worker from the PR. What it does
+ * defend against is ACCIDENT: a mistyped or copy-pasted database id, a bad merge, a stale config
+ * repointing the preview at production. That is the realistic failure here and it is worth
+ * closing, but it is a different claim.
+ *
+ * The malicious-author case is bounded by the repository, not by this code: the job only runs for
+ * same-repo PRs, so it requires push access, and this repo's `main` is unprotected — that access
+ * already permits a direct push to `main`, which runs CI's `deploy` job with the full-account
+ * CLOUDFLARE_API_TOKEN. This endpoint therefore grants strictly less than the attacker already
+ * has. Closing it properly (rather than relying on that) means hosting preview D1 in a separate
+ * Cloudflare account, where no credential or binding reachable from a build can name production.
+ *
+ * CI authenticates with a short-lived GitHub OIDC assertion.
  *
  * The caller supplies the migration SQL because `wrangler d1 migrations apply` is a wrangler-side
  * operation. That is deliberate rather than reluctant: the preview Worker is itself built from PR
@@ -89,6 +103,20 @@ function stripComments(sql: string): string {
     if (c === '-' && sql[i + 1] === '-') {
       while (i < sql.length && sql[i] !== '\n') i++;
       out += '\n';
+      continue;
+    }
+    // Block comments too: `/* rationale; details */` is valid SQLite that wrangler applies fine,
+    // and leaving it intact would make its semicolon a statement boundary and emit two invalid
+    // fragments. Unterminated is left alone so assertSplittable's quote/parity checks see the
+    // original text rather than a silently truncated version.
+    if (c === '/' && sql[i + 1] === '*') {
+      const close = sql.indexOf('*/', i + 2);
+      if (close === -1) {
+        out += c;
+        continue;
+      }
+      i = close + 1;
+      out += ' ';
       continue;
     }
     out += c;
@@ -215,10 +243,20 @@ export async function migratePreview(request: Request, env: Env): Promise<Respon
     // lands whole or not at all. The bookkeeping insert rides in the SAME batch — recording it
     // separately would let a crash between the two leave a migration applied but unrecorded, and
     // the next run would replay it.
-    await env.DB.batch([
-      ...statements.map((s) => env.DB.prepare(s)),
-      env.DB.prepare('INSERT INTO d1_migrations (name) VALUES (?1)').bind(m.name),
-    ]);
+    // A D1 rejection here (an ALTER against a missing table, say) is DETERMINISTIC — it will fail
+    // identically on every retry. Letting it escape produces Cloudflare's platform-generated 500,
+    // which carries no JSON body, and CI classifies bodiless responses as "the preview is not up
+    // yet" and retries then passes. Returning the error envelope is what makes CI fail loudly.
+    try {
+      await env.DB.batch([
+        ...statements.map((s) => env.DB.prepare(s)),
+        env.DB.prepare('INSERT INTO d1_migrations (name) VALUES (?1)').bind(m.name),
+      ]);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      console.log(JSON.stringify({ event: 'hub.migrate.failed', migration: m.name, detail, applied }));
+      return Response.json({ error: 'migration_failed', migration: m.name, detail, applied }, { status: 500 });
+    }
     applied.push(m.name);
   }
 

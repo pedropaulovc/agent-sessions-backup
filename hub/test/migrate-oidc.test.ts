@@ -272,6 +272,21 @@ describe('statement splitting', () => {
     expect(out[0]).toContain("'it''s; fine'");
   });
 
+  it('strips block comments, including their semicolons', () => {
+    // Valid SQLite that wrangler applies fine. Leaving the comment intact makes its semicolon a
+    // statement boundary and emits two invalid fragments.
+    const out = splitStatements('CREATE TABLE a(x); /* rationale; details */ CREATE INDEX i ON a(x);');
+    expect(out).toHaveLength(2);
+    expect(out[1]).toBe('CREATE INDEX i ON a(x)');
+    expect(out.join(' ')).not.toContain('rationale');
+  });
+
+  it('does not treat /* inside a literal as a block comment', () => {
+    const out = splitStatements("INSERT INTO t (a) VALUES ('/* not a comment; */'); SELECT 1;");
+    expect(out).toHaveLength(2);
+    expect(out[0]).toContain("'/* not a comment; */'");
+  });
+
   it('still strips real comments', () => {
     expect(splitStatements("-- leading\nSELECT 1; -- trailing\nSELECT 2;")).toEqual(['SELECT 1', 'SELECT 2']);
   });
@@ -311,5 +326,33 @@ describe('bound-database check', () => {
       .first()
       .catch(() => null);
     expect(probe).toBe(null);
+  });
+
+  it('returns a JSON error envelope when D1 rejects the SQL, not a bare 500', () => {
+    // CI classifies a response with no JSON `error` key as "preview not deployed yet" and retries
+    // then passes. An uncaught batch rejection becomes Cloudflare's bodiless platform 500, so a
+    // deterministic SQL failure would exit the job green with the schema stale.
+    return (async () => {
+      const token = await signJwt(keys.pair.privateKey, goodClaims());
+      const res = await post(token, [
+        { name: '9999_broken', sql: 'ALTER TABLE table_that_does_not_exist ADD COLUMN x INT;' },
+      ]);
+      expect(res.status).toBe(500);
+      const body = await res.json<{ error: string; migration: string }>();
+      expect(body.error).toBe('migration_failed');
+      expect(body.migration).toBe('9999_broken');
+      // The workflow's classifier keys off exactly this.
+      expect(Object.keys(body)).toContain('error');
+    })();
+  });
+
+  it('does not record a migration that failed to apply', async () => {
+    const token = await signJwt(keys.pair.privateKey, goodClaims());
+    await post(token, [{ name: '9999_broken', sql: 'ALTER TABLE table_that_does_not_exist ADD COLUMN x INT;' }]);
+    const row = await testEnv.DB.prepare('SELECT name FROM d1_migrations WHERE name = ?1')
+      .bind('9999_broken')
+      .first()
+      .catch(() => null);
+    expect(row).toBe(null);
   });
 });

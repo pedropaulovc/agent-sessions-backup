@@ -125,6 +125,16 @@ jobs:
           BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
           alias=$(printf '%s' "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | cut -c1-42)
+          # A DNS label may not start or end with '-', but a branch may start or end with
+          # punctuation (`_repair`, `@repair`, `fix.`) and the substitution above turns that into a
+          # leading or trailing hyphen. The resulting hostname cannot resolve, which — since the
+          # endpoint never answers — looks exactly like "the preview is not deployed yet" and
+          # exits green having applied nothing. Strip them.
+          alias=$(printf '%s' "$alias" | sed 's/^-*//; s/-*$//')
+          if [ -z "$alias" ]; then
+            echo "::error::branch '$BRANCH' normalises to an empty preview alias — cannot derive a target URL."
+            exit 1
+          fi
           echo "url=https://${alias}-sessions-hub-preview.pedro-18e.workers.dev" >> "$GITHUB_OUTPUT"
       - name: Apply preview migrations
         env:
