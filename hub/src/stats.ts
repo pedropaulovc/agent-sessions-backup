@@ -384,10 +384,12 @@ export interface DepthRow {
   label: string;
   /** Mean dollars per call in this depth band. Mean, not median, because the per-call rows are
    * already summed into (session, model, epoch, band, shape) groups by the time pricing runs —
-   * there is no per-call distribution left to take a median of. (Not for lack of the function:
-   * upstream SQLite ships median()/percentile() via ext/misc/percentile.c, but D1's build does
-   * not expose them — `SELECT median(x)` there fails with `no such function: median`.)
-   * Labelled as a mean in the UI. */
+   * there is no per-call distribution left to take a median of. Labelled as a mean in the UI.
+   *
+   * Not a limit of the database: D1 does not expose median()/percentile() (`SELECT median(x)` →
+   * `no such function`), but it does have window functions, and `usage` is one row per turn — so
+   * an exact median is a `row_number()` away once a per-turn USD column exists. That column is
+   * blocked on pricing moving off the read path, which is #70. */
   usdPerCall: number;
   calls: number;
   sessions: number;
