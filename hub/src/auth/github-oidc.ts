@@ -1,0 +1,132 @@
+/** Verification of GitHub Actions OIDC tokens.
+ *
+ * Why this exists: Cloudflare has no workload-identity federation for its own API (an open
+ * request — cloudflare/workers-sdk#11434, no official response as of 2026-06), and D1 API-token
+ * permissions are ACCOUNT-scoped, with no per-database resource the way R2 has per-bucket ones.
+ * So there is no Cloudflare credential that can be handed to CI and be incapable of touching the
+ * production database.
+ *
+ * The isolation primitive D1 does have is the Worker BINDING: "each Worker can only access the
+ * bindings explicitly attached to it". The preview Worker's `DB` is `sessions-index-preview` and
+ * it has no production binding at all. Authenticating CI to THAT Worker with a short-lived OIDC
+ * assertion therefore gives CI a capability that is physically incapable of reaching production —
+ * which no API token can offer — and leaves no long-lived secret in CI to leak in the first place.
+ */
+
+const GITHUB_ISSUER = 'https://token.actions.githubusercontent.com';
+const GITHUB_JWKS_URL = `${GITHUB_ISSUER}/.well-known/jwks`;
+
+/** The claims this hub cares about. GitHub sets many more. */
+export interface GitHubOidcClaims {
+  iss: string;
+  aud: string | string[];
+  sub: string;
+  exp: number;
+  nbf?: number;
+  iat?: number;
+  repository?: string;
+  repository_owner?: string;
+  ref?: string;
+  environment?: string;
+  workflow?: string;
+  event_name?: string;
+}
+
+export type OidcResult =
+  | { ok: true; claims: GitHubOidcClaims }
+  | { ok: false; reason: string };
+
+interface Jwk {
+  kid: string;
+  kty: string;
+  alg?: string;
+  use?: string;
+  n: string;
+  e: string;
+}
+
+function b64urlToBytes(s: string): Uint8Array {
+  const pad = s.length % 4 === 0 ? '' : '='.repeat(4 - (s.length % 4));
+  const bin = atob(s.replace(/-/g, '+').replace(/_/g, '/') + pad);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function decodeJson<T>(segment: string): T | null {
+  try {
+    return JSON.parse(new TextDecoder().decode(b64urlToBytes(segment))) as T;
+  } catch {
+    return null;
+  }
+}
+
+/** GitHub rotates signing keys, so the key set is fetched rather than pinned. `cacheTtl` keeps
+ * this off the hot path without holding a stale set past a rotation. */
+async function fetchJwks(): Promise<Jwk[] | null> {
+  const res = await fetch(GITHUB_JWKS_URL, { cf: { cacheTtl: 600, cacheEverything: true } });
+  if (!res.ok) return null;
+  const body = (await res.json()) as { keys?: Jwk[] };
+  return body.keys ?? null;
+}
+
+/**
+ * Verify a GitHub Actions OIDC token.
+ *
+ * `expectedAudience` and `expectedRepository` are both required and both checked. Audience alone
+ * is not enough — any repository can mint a token with an arbitrary `aud` — and repository alone
+ * is not enough either, since a token minted for some other service in the same repo would
+ * otherwise be replayable here.
+ */
+export async function verifyGitHubOidc(
+  token: string,
+  opts: { expectedAudience: string; expectedRepository: string; now?: number },
+): Promise<OidcResult> {
+  const parts = token.split('.');
+  if (parts.length !== 3) return { ok: false, reason: 'malformed_token' };
+  const [headerB64, payloadB64, signatureB64] = parts as [string, string, string];
+
+  const header = decodeJson<{ alg?: string; kid?: string }>(headerB64);
+  if (!header) return { ok: false, reason: 'malformed_header' };
+  // Pin the algorithm. Accepting whatever `alg` the token names is the classic JWT bypass —
+  // `none` skips verification, and an HMAC alg would let the public key be used as a shared secret.
+  if (header.alg !== 'RS256') return { ok: false, reason: 'unexpected_alg' };
+  if (!header.kid) return { ok: false, reason: 'missing_kid' };
+
+  const claims = decodeJson<GitHubOidcClaims>(payloadB64);
+  if (!claims) return { ok: false, reason: 'malformed_claims' };
+  if (claims.iss !== GITHUB_ISSUER) return { ok: false, reason: 'bad_issuer' };
+
+  const jwks = await fetchJwks();
+  if (!jwks) return { ok: false, reason: 'jwks_unavailable' };
+  const jwk = jwks.find((k) => k.kid === header.kid);
+  if (!jwk) return { ok: false, reason: 'unknown_kid' };
+
+  const key = await crypto.subtle.importKey(
+    'jwk',
+    { kty: jwk.kty, n: jwk.n, e: jwk.e, alg: 'RS256', ext: true },
+    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
+    false,
+    ['verify'],
+  );
+  const signed = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+  const valid = await crypto.subtle.verify(
+    'RSASSA-PKCS1-v1_5',
+    key,
+    b64urlToBytes(signatureB64) as BufferSource,
+    signed as BufferSource,
+  );
+  if (!valid) return { ok: false, reason: 'bad_signature' };
+
+  // Claim checks come AFTER signature verification: an unverified payload is attacker-controlled
+  // text, so validating it first would be checking a string the attacker chose.
+  const now = opts.now ?? Math.floor(Date.now() / 1000);
+  if (typeof claims.exp !== 'number' || now >= claims.exp) return { ok: false, reason: 'expired' };
+  if (typeof claims.nbf === 'number' && now < claims.nbf) return { ok: false, reason: 'not_yet_valid' };
+
+  const auds = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+  if (!auds.includes(opts.expectedAudience)) return { ok: false, reason: 'bad_audience' };
+  if (claims.repository !== opts.expectedRepository) return { ok: false, reason: 'bad_repository' };
+
+  return { ok: true, claims };
+}
