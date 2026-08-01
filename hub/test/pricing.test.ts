@@ -245,6 +245,15 @@ describe('rate set reporting', () => {
     expect(costOfUsage({ model: 'claude-opus-5', input_tokens: 1 }, OPUS, { batch: true }).rateSet).toBe('standard');
   });
 
+  it('falls a missing cache-read rate back to the STANDARD input rate, not the batch one', () => {
+    // Otherwise a cache read is charged at the batch discount while rateSet reports it as
+    // standard — the two halves of the same rule disagreeing.
+    const noCacheRate: ModelPrice = { ...LUNA, cache_read_cost: null };
+    const u = { model: 'gpt-5.6-luna', cache_read_tokens: 1_000_000 };
+    // Standard input is 0.2/M; batch input is 0.1/M. Must be the former.
+    expect(costOfUsage(u, noCacheRate, { batch: true }).usd).toBeCloseTo(0.2, 10);
+  });
+
   it('counts cache classes as standard — LiteLLM publishes no batch cache rates', () => {
     // A cached call under batch=1 pays batch rates on input/output and STANDARD rates on cache
     // read and cache write, because no batch cache columns exist upstream to pay instead. Calling

@@ -24,3 +24,4 @@ infra/out/
 # project is real session data (prompts, machine names, local paths, session UUIDs) served
 # from the authenticated viewer. Never commit them.
 .playwright-cli/
+actionlint

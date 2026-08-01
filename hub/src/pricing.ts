@@ -138,7 +138,11 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
 
   // A missing cache READ rate falls back to the input rate: a cache read is never dearer than
   // fresh input, so that direction can only over-report, never quietly under-report.
-  const readRate = price.cache_read_cost ?? inRate;
+  // Falls back to the STANDARD input rate, never the batch-selected one. LiteLLM publishes no
+  // batch cache columns, so a cache read is standard-priced by construction — and the rateSet
+  // calculation below already counts cache classes as standard. Falling back to `inRate` would
+  // charge a batch-discounted rate for cache reads while simultaneously labelling them standard.
+  const readRate = price.cache_read_cost ?? price.input_cost;
 
   // A rate is required only for a token class that is actually PRESENT. Upstream routinely
   // publishes partial entries, and discarding a known input cost because `output_cost` happens

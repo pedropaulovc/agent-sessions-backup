@@ -18,6 +18,10 @@ import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
+// Coercion + validation shared verbatim with hub/src/cron/model-prices.ts. These two drifted
+// three times in one review; the rules now live in one file.
+import { assertLooksLikeCatalog, intOrNull, perM } from '../hub/src/upstream-catalog.mjs';
 
 const UPSTREAM =
   'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json';
@@ -31,11 +35,6 @@ const PER_MILLION = 1_000_000;
 /** Upstream stores dollars per token; the table stores dollars per million tokens. */
 // Round after scaling: 2e-8 * 1e6 lands on 0.019999999999999998 in binary float, which is
 // numerically irrelevant but makes the stored table look untrustworthy.
-// Mirrors hub/src/cron/model-prices.ts. Negative is rejected as well as non-finite: a negative
-// rate stores fine and prices a row as fully PRICED, producing negative cost_usd that cancels
-// legitimate spend in an aggregate. Zero is legitimate (free models).
-const perM = (v) =>
-  typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Number((v * PER_MILLION).toPrecision(12)) : null;
 
 const sqlStr = (v) => (v == null ? 'NULL' : `'${String(v).replaceAll("'", "''")}'`);
 
@@ -55,7 +54,6 @@ const sqlNum = (v) => {
 };
 
 /** Upstream token limits are unvalidated JSON; coerce to a finite integer or drop them. */
-const intOrNull = (v) => (typeof v === 'number' && Number.isFinite(v) ? Math.trunc(v) : null);
 
 function run(args) {
   return execFileSync('npx', ['wrangler', 'd1', 'execute', DB, REMOTE ? '--remote' : '--local', ...args], {
@@ -154,7 +152,10 @@ async function main() {
   const res = await fetch(UPSTREAM);
   if (!res.ok) throw new Error(`upstream fetch failed: ${res.status} ${res.statusText}`);
   const upstream = await res.json();
-  const entryCount = Object.keys(upstream).length;
+  // Same guard as the cron, from the same module: a 200 carrying `{}` or an error envelope would
+  // otherwise resolve no models, write no rows, and exit 0 — a backfill that reports success
+  // having done nothing, while prices stay stale.
+  const entryCount = assertLooksLikeCatalog(upstream);
   process.stderr.write(`upstream entries: ${entryCount}\n`);
 
   let models;
@@ -225,7 +226,11 @@ async function main() {
   process.stderr.write(`wrote ${inserts.length} price row(s)\n`);
 }
 
-main().catch((e) => {
-  process.stderr.write(`sync-model-prices failed: ${e.message}\n`);
-  process.exit(1);
-});
+// Only when run directly. This script writes to a real database, and an `import()` of it -- to
+// check that its module graph resolves, say -- otherwise executes the whole sync as a side effect.
+if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
+  main().catch((e) => {
+    process.stderr.write(`sync-model-prices failed: ${e.message}\n`);
+    process.exit(1);
+  });
+}
