@@ -788,8 +788,18 @@ export function priceEpochExpr(prices: Map<string, ModelPrice[]>): string {
   // wherever its first character lands. Neither is detectable downstream — the row looks
   // confidently priced. Routing both to the unknown epoch means they price only when the model
   // has a single unambiguous snapshot, and are reported as unpriced otherwise.
-  const canonical = `u.ts GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z'`;
-  const unknownArm = `WHEN u.ts IS NULL OR NOT (${canonical}) THEN '${EPOCH_UNKNOWN_TIME}'`;
+  // Canonical UTC AND a real calendar date. The GLOB alone only checks digit POSITIONS, so
+  // `2026-99-99T00:00:00Z` passed it and then sorted after every boundary, confidently selecting
+  // the newest snapshot. `date()` rejects that (NULL), but on its own it is not enough either:
+  // it silently ROLLS `2026-02-31` forward to `2026-03-03` and calls it valid. Comparing the
+  // round-trip against the literal prefix catches the rollover.
+  //
+  // `IS NOT 1`, not `NOT (...)`: date() returns NULL for an unparseable value, and `NOT (NULL)`
+  // is NULL, so a plain negation would fail to fire this arm and let the row fall through to the
+  // date arms — the exact NULL-semantics trap that already produced one bug in this query.
+  const canonical =
+    `u.ts GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z' AND date(u.ts) = substr(u.ts, 1, 10)`;
+  const unknownArm = `WHEN u.ts IS NULL OR (${canonical}) IS NOT 1 THEN '${EPOCH_UNKNOWN_TIME}'`;
   if (!boundaries.length) return `CASE ${unknownArm} ELSE '${EPOCH_BEFORE_ANY_PRICE}' END`;
   const arms = boundaries.map((e) => `WHEN u.ts >= '${e}' THEN '${e}'`).join(' ');
   return `CASE ${unknownArm} ${arms} ELSE '${EPOCH_BEFORE_ANY_PRICE}' END`;

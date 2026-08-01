@@ -52,16 +52,7 @@ const MILLION = 1_000_000;
 /** Candidate upstream keys for a model id, most specific first. Real ids include
  * date-suffixed variants (`claude-haiku-4-5-20251001`) that upstream may or may not carry
  * separately; try exact first, then the undated family, then provider-prefixed forms. */
-export function priceKeyCandidates(model: string): string[] {
-  const out = [model];
-  const undated = model.replace(/-\d{8}$/, '');
-  if (undated !== model) out.push(undated);
-  for (const p of ['anthropic', 'openai', 'deepseek']) {
-    out.push(`${p}/${model}`);
-    if (undated !== model) out.push(`${p}/${undated}`);
-  }
-  return out;
-}
+export { priceKeyCandidates } from './upstream-catalog.mjs';
 
 /** How a `usage.model` value should be treated for pricing. Three states, not a boolean,
  * because "we know this is not an API call" and "we do not know what this was" have opposite
@@ -124,6 +115,13 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   // while a `<synthetic>` row never reached an API at all. Reporting a number there would let a
   // caller sum billable input across rows whose dollars are missing.
   const unpriced: Cost = { usd: 0, unpriced: true, billableInputTokens: 0, rateSet: 'none' };
+  // A row with no matching price but ZERO tokens in every billable class contributes no unknown
+  // cost, so it is not "unpriced" in the sense the caller cares about. Counting it inflated
+  // unpriced_calls, put its model in unpriced_models, and told clients the total was a floor —
+  // all on the strength of a call that could not have cost anything whatever the rate turned out
+  // to be. Costed at 0 and priced, so the coverage signal keeps meaning "dollars are missing".
+  const anyBillableTokens = billableInput > 0 || output > 0 || cacheRead > 0 || cw5 > 0 || cw1h > 0;
+  if (!anyBillableTokens) return { usd: 0, unpriced: false, billableInputTokens: 0, rateSet: 'none' };
   if (!price) return unpriced;
 
   // Batch rates are chosen PER CLASS, matching how rates are required per class below. An

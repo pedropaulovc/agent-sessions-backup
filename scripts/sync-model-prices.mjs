@@ -21,7 +21,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 // Coercion + validation shared verbatim with hub/src/cron/model-prices.ts. These two drifted
 // three times in one review; the rules now live in one file.
-import { assertLooksLikeCatalog, intOrNull, perM } from '../hub/src/upstream-catalog.mjs';
+import { assertLooksLikeCatalog, intOrNull, perM, priceKeyCandidates } from '../hub/src/upstream-catalog.mjs';
 
 const UPSTREAM =
   'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json';
@@ -85,19 +85,6 @@ function d1(sql) {
   const start = lines.findIndex((l) => l.trimEnd() === '[');
   if (start < 0) throw new Error(`no JSON array in wrangler output:\n${clean}`);
   return JSON.parse(lines.slice(start).join('\n'));
-}
-
-/** Candidate upstream keys, most specific first. Mirrors priceKeyCandidates() in
- * hub/src/pricing.ts -- keep the two in step. */
-function candidates(model) {
-  const out = [model];
-  const undated = model.replace(/-\d{8}$/, '');
-  if (undated !== model) out.push(undated);
-  for (const p of ['anthropic', 'openai', 'deepseek']) {
-    out.push(`${p}/${model}`);
-    if (undated !== model) out.push(`${p}/${undated}`);
-  }
-  return out;
 }
 
 const isBillable = (m) => !!m && !m.startsWith('<');
@@ -177,7 +164,7 @@ async function main() {
   const inserts = [];
   const unresolved = [];
   for (const model of models) {
-    const key = candidates(model).find((c) => upstream[c]);
+    const key = priceKeyCandidates(model).find((c) => upstream[c]);
     if (!key) {
       unresolved.push(model);
       continue;

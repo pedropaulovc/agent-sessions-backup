@@ -236,4 +236,26 @@ describe('model price autorefresh', () => {
     // rather than fully priced and quietly negative.
     expect(rows[0]!.input_cost).toBe(null);
   });
+
+  it('does not treat any eight trailing digits as a release date', async () => {
+    // `gpt-5-99999999` is not a dated `gpt-5`. Stripping the suffix made it resolve to the real
+    // gpt-5 catalog entry and receive a confident price, instead of surfacing in unpriced_models.
+    await testEnv.DB.prepare(
+      `INSERT INTO usage (session_id, turn_index, ts, model) VALUES ('sync-sess', 3, '2026-07-01T00:00:00Z', 'gpt-5-99999999')`,
+    ).run();
+    await testEnv.DB.prepare(
+      `INSERT INTO usage (session_id, turn_index, ts, model) VALUES ('sync-sess', 4, '2026-07-01T00:00:00Z', 'gpt-5-20260214')`,
+    ).run();
+    mockUpstream({ 'claude-opus-5': entry(), 'gpt-5': entry({ litellm_provider: 'openai' }) });
+    await runModelPriceSync(testEnv);
+
+    const sync = (
+      await testEnv.DB.prepare('SELECT unresolved FROM model_prices_sync ORDER BY id DESC LIMIT 1').all<{
+        unresolved: string | null;
+      }>()
+    ).results[0]!;
+    expect(sync.unresolved ?? '', 'an impossible date suffix resolved to the undated model').toContain('gpt-5-99999999');
+    // A REAL dated suffix must still resolve, or the fix has over-reached.
+    expect(sync.unresolved ?? '').not.toContain('gpt-5-20260214');
+  });
 });

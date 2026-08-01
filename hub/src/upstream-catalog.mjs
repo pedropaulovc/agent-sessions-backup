@@ -52,3 +52,36 @@ export function assertLooksLikeCatalog(payload) {
   }
   return entryCount;
 }
+
+/** Strip a trailing `-YYYYMMDD` release stamp, but ONLY when it is a real calendar date.
+ *
+ * A bare `\d{8}` match treats any eight trailing digits as a date, so an unmatched or custom model
+ * like `gpt-5-99999999` falls back to the real `gpt-5` catalog entry and receives a confident
+ * price instead of appearing in unpriced_models. Parsers accept arbitrary non-empty model strings,
+ * so this has to validate rather than assume. Rolling dates (`-20260231`) are rejected too:
+ * Date.UTC would silently normalise Feb 31 to Mar 3 and call it valid.
+ */
+export function undatedModel(model) {
+  const m = /-(\d{4})(\d{2})(\d{2})$/.exec(model);
+  if (!m) return model;
+  const [, y, mo, d] = m;
+  const year = Number(y);
+  const month = Number(mo);
+  const day = Number(d);
+  const dt = new Date(Date.UTC(year, month - 1, day));
+  if (dt.getUTCFullYear() !== year || dt.getUTCMonth() !== month - 1 || dt.getUTCDate() !== day) return model;
+  return model.slice(0, m.index);
+}
+
+/** Upstream keys to try for a model id, best match first. Shared by pricing.ts, the cron and the
+ * manual script -- three copies of this drifted apart once already. */
+export function priceKeyCandidates(model) {
+  const out = [model];
+  const undated = undatedModel(model);
+  if (undated !== model) out.push(undated);
+  for (const p of ['anthropic', 'openai', 'deepseek']) {
+    out.push(`${p}/${model}`);
+    if (undated !== model) out.push(`${p}/${undated}`);
+  }
+  return out;
+}

@@ -254,6 +254,18 @@ describe('rate set reporting', () => {
     expect(costOfUsage(u, noCacheRate, { batch: true }).usd).toBeCloseTo(0.2, 10);
   });
 
+  it('does not report a zero-token call as unpriced even with no matching price', () => {
+    // Such a call contributes no unknown cost whatever the rate turns out to be. Counting it
+    // inflated unpriced_calls, added its model to unpriced_models, and told clients the total was
+    // a floor — degrading the coverage signal that is supposed to mean "dollars are missing".
+    const c = costOfUsage({ model: 'brand-new-model', input_tokens: 0, output_tokens: 0 }, null);
+    expect(c.unpriced).toBe(false);
+    expect(c.usd).toBe(0);
+    expect(c.rateSet).toBe('none');
+    // A row with tokens and no price is still unpriced — the signal has to keep working.
+    expect(costOfUsage({ model: 'brand-new-model', input_tokens: 1 }, null).unpriced).toBe(true);
+  });
+
   it('claims no rate set at all when every billable class is zero', () => {
     // Such a row produced no dollars from any rate set. Reporting 'standard' put it into
     // rateSetsUsed and flipped a fully batch-priced response's cost_basis to _partial on the

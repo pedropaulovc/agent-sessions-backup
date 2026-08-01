@@ -11,7 +11,8 @@ const testEnv = env as unknown as Env;
 
 /** The canonical-UTC shape the epoch expression requires; kept here so the SQL-string assertions
  * below read as one thing rather than a wall of bracket classes. */
-const GLOB = "u.ts GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z'";
+const GLOB =
+  "u.ts GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z' AND date(u.ts) = substr(u.ts, 1, 10)";
 const MACHINE = 'pricebox';
 
 /** Two snapshots of one model, at a 10x rate cut. Any test below that mixes usage from both
@@ -355,7 +356,7 @@ describe('priceEpochExpr', () => {
     // offset-bearing `2026-06-30T23:30:00-05:00` (04:30 July 1 UTC) would sort into the wrong
     // epoch and be priced confidently wrong.
     expect(expr).toBe(
-      `CASE WHEN u.ts IS NULL OR NOT (${GLOB}) THEN 'unknown'` +
+      `CASE WHEN u.ts IS NULL OR (${GLOB}) IS NOT 1 THEN 'unknown'` +
         " WHEN u.ts >= '2026-07-01' THEN '2026-07-01'" +
         " WHEN u.ts >= '2026-04-01' THEN '2026-04-01'" +
         " WHEN u.ts >= '2026-01-01' THEN '2026-01-01'" +
@@ -367,7 +368,7 @@ describe('priceEpochExpr', () => {
     // The ELSE must NOT be an empty/falsy string: priceAt() reads a falsy ts as "no opinion"
     // and returns the NEWEST rate, which is the very bug this expression exists to prevent.
     expect(priceEpochExpr(new Map())).toBe(
-      `CASE WHEN u.ts IS NULL OR NOT (${GLOB}) THEN 'unknown' ELSE '0000-00-00' END`,
+      `CASE WHEN u.ts IS NULL OR (${GLOB}) IS NOT 1 THEN 'unknown' ELSE '0000-00-00' END`,
     );
   });
 
@@ -387,6 +388,24 @@ describe('priceEpochExpr', () => {
     const row = (await fetchUsage('group_by=machine&machine=tzbox')).rows[0]!;
     // The old rate would have charged 100/M for a call that belongs at 10/M.
     expect(Number(row.cost_usd), 'an offset timestamp was priced at the wrong epoch').not.toBeCloseTo(100, 6);
+    expect(Number(row.unpriced_calls)).toBeGreaterThan(0);
+  });
+
+  it('treats a digit-shaped but impossible date as an unknown epoch', async () => {
+    // `2026-99-99T00:00:00Z` passes a positions-only GLOB and then sorts AFTER every boundary,
+    // so it confidently selected the newest snapshot for a positive-token row.
+    await seedSession('bad-date-sess', 'baddatebox', 'claude-code');
+    await seedUsage('bad-date-sess', '2026-99-99T00:00:00Z', 'claude-opus-5', { input: 1_000_000 });
+    const row = (await fetchUsage('group_by=machine&machine=baddatebox')).rows[0]!;
+    expect(Number(row.unpriced_calls), 'an impossible date was priced at the newest snapshot').toBeGreaterThan(0);
+  });
+
+  it('treats a rolling date (Feb 31) as an unknown epoch', async () => {
+    // date() alone is not enough here: SQLite rolls 2026-02-31 forward to 2026-03-03 and reports
+    // it valid. Only the round-trip against the literal prefix catches it.
+    await seedSession('roll-sess', 'rollbox', 'claude-code');
+    await seedUsage('roll-sess', '2026-02-31T00:00:00Z', 'claude-opus-5', { input: 1_000_000 });
+    const row = (await fetchUsage('group_by=machine&machine=rollbox')).rows[0]!;
     expect(Number(row.unpriced_calls)).toBeGreaterThan(0);
   });
 

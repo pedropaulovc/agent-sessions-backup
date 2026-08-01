@@ -5,7 +5,7 @@
  * and `--all`; this is the unattended path and the two share the same resolution rules --
  * literally, via ../upstream-catalog.mjs, after they drifted three separate times in one review. */
 
-import { assertLooksLikeCatalog, intOrNull, perM } from '../upstream-catalog.mjs';
+import { assertLooksLikeCatalog, intOrNull, perM, priceKeyCandidates } from '../upstream-catalog.mjs';
 
 const UPSTREAM =
   'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json';
@@ -31,17 +31,6 @@ const ACCOUNTING_COLS = ['provider', 'cache_accounting'] as const;
 type Rates = Record<(typeof RATE_COLS)[number], number | null>;
 type Accounting = Record<(typeof ACCOUNTING_COLS)[number], string | null>;
 
-/** Mirrors priceKeyCandidates() in ../pricing.ts and candidates() in the CLI script. */
-function candidates(model: string): string[] {
-  const out = [model];
-  const undated = model.replace(/-\d{8}$/, '');
-  if (undated !== model) out.push(undated);
-  for (const p of ['anthropic', 'openai', 'deepseek']) {
-    out.push(`${p}/${model}`);
-    if (undated !== model) out.push(`${p}/${undated}`);
-  }
-  return out;
-}
 
 export async function runModelPriceSync(env: Env): Promise<void> {
   const today = new Date().toISOString().slice(0, 10);
@@ -72,7 +61,7 @@ export async function runModelPriceSync(env: Env): Promise<void> {
     const stmts: D1PreparedStatement[] = [];
     const unresolved: string[] = [];
     for (const model of models) {
-      const key = candidates(model).find((c) => upstream[c]);
+      const key = priceKeyCandidates(model).find((c) => upstream[c]);
       if (!key) {
         unresolved.push(model);
         continue;
