@@ -385,6 +385,18 @@ describe('per-class breakdown', () => {
     expect(c.byClass.input).toBe(0);
   });
 
+  it('gives every unpriced result its OWN zero breakdown', () => {
+    // Callers aggregate by adding into `byClass`. A shared module-level zero would mean the first
+    // caller to accumulate into one corrupts the zero handed to every later call -- surfacing as
+    // unrelated rows quietly inheriting someone else's dollars.
+    const a = costOfUsage({ model: 'nope', input_tokens: 1_000_000 }, null);
+    const b = costOfUsage({ model: 'nope', input_tokens: 1_000_000 }, null);
+    expect(a.byClass).not.toBe(b.byClass);
+    a.byClass.input += 999;
+    expect(b.byClass.input, 'the zero breakdown is shared between calls').toBe(0);
+    expect(costOfUsage({ model: 'nope' }, null).byClass.input).toBe(0);
+  });
+
   it('reports every class as zero on an unpriced row', () => {
     const c = costOfUsage({ model: 'nope', input_tokens: 1_000_000 }, null);
     expect(c.unpriced).toBe(true);

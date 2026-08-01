@@ -499,6 +499,7 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
   // totals if the two ever drifted apart on filters.
   const sessionsPerModel = distinctSessions(rows, (r) => r.model ?? null);
   const sessionsPerBand = distinctSessions(rows, (r) => r.band ?? null);
+  const sessionsPerAttr = distinctSessions(rows, (r) => attributionKey(r, q.by));
 
   const cacheUsd = total.byClass.cacheRead + total.byClass.cacheWrite5m + total.byClass.cacheWrite1h;
 
@@ -532,7 +533,12 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
     }),
     gaps,
     attribution: [...byAttr.values()]
-      .map((g) => ({ key: g.key ?? '(none)', usd: g.usd, calls: g.calls, sessions: 0 }))
+      .map((g) => ({
+        key: g.key ?? '(none)',
+        usd: g.usd,
+        calls: g.calls,
+        sessions: sessionsPerAttr.get(g.key ?? null) ?? 0,
+      }))
       .sort((a, b) => b.usd - a.usd || b.calls - a.calls)
       .slice(0, ATTRIBUTION_LIMIT),
     rhythm,

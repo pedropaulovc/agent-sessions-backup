@@ -76,7 +76,13 @@ export interface CostByClass {
   cacheWrite1h: number;
 }
 
-const NO_CLASS_COST: CostByClass = { input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0 };
+/** A FRESH zero breakdown per call, never a shared instance.
+ *
+ * `Cost.byClass` is a plain mutable object and callers aggregate by adding into one (see the fold
+ * in stats.ts). Handing every unpriced result a reference to the same module-level object means
+ * the first caller to accumulate into one corrupts the zero for every later call -- a bug that
+ * would surface as unrelated rows quietly inheriting someone else's dollars. */
+const noClassCost = (): CostByClass => ({ input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0 });
 
 const MILLION = 1_000_000;
 
@@ -165,7 +171,7 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
     billableInputTokens: 0,
     rateSet: 'none',
     rateSignature: 'unpriced',
-    byClass: NO_CLASS_COST,
+    byClass: noClassCost(),
   };
   // A row with no matching price but ZERO tokens in every billable class contributes no unknown
   // cost, so it is not "unpriced" in the sense the caller cares about. Counting it inflated
@@ -185,7 +191,7 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
       billableInputTokens: 0,
       rateSet: 'none',
       rateSignature: 'zero',
-      byClass: NO_CLASS_COST,
+      byClass: noClassCost(),
     };
   if (!price) return unpriced;
 

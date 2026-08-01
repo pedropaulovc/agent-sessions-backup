@@ -255,7 +255,8 @@ function attributionPanel(s: Stats, url: URL, query: StatsQuery): string {
       (r) =>
         `<tr><th scope="row" class="wrap">${esc(r.key)}</th>` +
         `<td class="barcell">${bar(max > 0 ? (r.usd / max) * 100 : 0, 'a')}</td>` +
-        `<td class="num">${fmtUsd(r.usd)}</td><td class="num muted">${fmtInt(r.calls)} turns</td></tr>`,
+        `<td class="num">${fmtUsd(r.usd)}</td><td class="num muted">${fmtInt(r.calls)} turns</td>` +
+        `<td class="num muted">${fmtInt(r.sessions)} sess</td></tr>`,
     )
     .join('');
   return panel(
