@@ -1,6 +1,6 @@
 import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
-import { priceEpochExpr } from '../src/api/ops';
+import { priceEpochExpr } from '../src/usage-agg';
 import type { ModelPrice } from '../src/pricing';
 
 /** Integration tests for /api/v1/usage's pricing aggregate — the part that has to survive

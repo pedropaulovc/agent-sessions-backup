@@ -3,6 +3,7 @@ import { webauthnRoute } from '../auth/webauthn';
 import { blobEndpoint } from './blob';
 import { machinesPage } from './machines';
 import { searchPage } from './search';
+import { statsPage } from './stats';
 import { sessionPage, TURNS_PER_PAGE } from './session';
 import { previewAccess, previewBootstrapRoute, withPreviewCookie } from './preview-auth';
 
@@ -67,6 +68,7 @@ function handle(url: URL, env: Env): Promise<Response> {
   const path = url.pathname;
   if (path === '/' || path === '') return searchPage(url, env);
   if (path === '/machines') return machinesPage(env);
+  if (path === '/stats') return statsPage(url, env);
 
   const blob = path.match(/^\/s\/([^/]+)\/blob\/([^/]+)$/);
   if (blob) return blobEndpoint(decodeURIComponent(blob[1]!), decodeURIComponent(blob[2]!), url, env);
