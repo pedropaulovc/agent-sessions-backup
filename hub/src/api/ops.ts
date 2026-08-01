@@ -609,12 +609,16 @@ export async function usage(url: URL, env: Env): Promise<Response> {
               (COALESCE(u.cache_creation_5m_tokens,0) > 0) AS has_w5,
               (COALESCE(u.cache_creation_1h_tokens,0) > 0) AS has_w1h,
               COUNT(*) AS calls,
-              SUM(COALESCE(u.input_tokens,0)) AS input_tokens,
-              SUM(COALESCE(u.output_tokens,0)) AS output_tokens,
-              SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens,
-              SUM(COALESCE(u.cache_read_tokens,0)) AS cache_read_tokens,
-              SUM(COALESCE(u.cache_creation_5m_tokens,0)) AS cache_creation_5m_tokens,
-              SUM(COALESCE(u.cache_creation_1h_tokens,0)) AS cache_creation_1h_tokens,
+              -- MAX(0, ...) on every class: the usage table has no nonnegative constraint and both
+              -- parsers accept whatever a transcript reports, so a negative counter would
+              -- otherwise produce a negative cost_usd reported as fully priced -- and, summed,
+              -- would cancel real cost from valid calls sharing the bucket.
+              SUM(MAX(0, COALESCE(u.input_tokens,0))) AS input_tokens,
+              SUM(MAX(0, COALESCE(u.output_tokens,0))) AS output_tokens,
+              SUM(MAX(0, COALESCE(u.reasoning_tokens,0))) AS reasoning_tokens,
+              SUM(MAX(0, COALESCE(u.cache_read_tokens,0))) AS cache_read_tokens,
+              SUM(MAX(0, COALESCE(u.cache_creation_5m_tokens,0))) AS cache_creation_5m_tokens,
+              SUM(MAX(0, COALESCE(u.cache_creation_1h_tokens,0))) AS cache_creation_1h_tokens,
               -- Subset-accounting models bill only input beyond the cached prefix, and the
               -- clamp at 0 is nonlinear, so it has to happen per row: one truncated call with
               -- cache_read > input would otherwise cancel fresh input from valid calls in the

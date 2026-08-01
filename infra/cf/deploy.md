@@ -54,10 +54,16 @@ selected environment's bindings. Without that job a branch preview runs new code
 old preview schema — PR #65 shipped migration 0016 and every `/api/v1/usage` request on its
 preview returned `no such table: model_prices` until the migration was applied by hand.
 
-That job needs its own repo secret, **`CLOUDFLARE_PREVIEW_API_TOKEN`** (D1:Edit + Account
-Settings:Read). It must NOT be `CLOUDFLARE_API_TOKEN`, and the job has no fallback to it: the
-`deploy` token can edit production D1, Workers, queues, R2, KV and zone routes, and
-`migrate-preview` runs PR-authored code.
+That job needs **`CLOUDFLARE_PREVIEW_API_TOKEN`** (D1:Edit + Account Settings:Read). It must NOT
+be `CLOUDFLARE_API_TOKEN`, and the job has no fallback to it: the `deploy` token can edit
+production D1, Workers, queues, R2, KV and zone routes, and `migrate-preview` runs PR-authored
+code.
+
+**Create it as a secret ON THE `preview` ENVIRONMENT, never as a repository secret.** A repository
+secret is readable by *any* job in the workflow, so a PR could simply add a job that omits
+`environment: preview` and reference it directly — collecting the credential with no approval and
+defeating the entire control below. Environment secrets are only exposed to jobs that declare that
+environment, which is what makes the protection rule binding.
 
 **Add a required-reviewer rule to the `preview` environment BEFORE setting that secret.** Scoping
 the token is not sufficient on its own, for two compounding reasons. Cloudflare's D1 permissions

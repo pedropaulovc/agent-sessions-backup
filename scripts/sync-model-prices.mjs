@@ -35,7 +35,24 @@ const perM = (v) =>
   typeof v === 'number' && Number.isFinite(v) ? Number((v * PER_MILLION).toPrecision(12)) : null;
 
 const sqlStr = (v) => (v == null ? 'NULL' : `'${String(v).replaceAll("'", "''")}'`);
-const sqlNum = (v) => (v == null ? 'NULL' : String(v));
+
+// Unlike the cron (hub/src/cron/model-prices.ts), which binds parameters, this script builds a
+// SQL FILE and hands it to `wrangler d1 execute --remote` against the PRODUCTION database. A
+// numeric literal is therefore interpolated unquoted, so anything that is not provably a finite
+// number must never reach the statement: the values come from a third-party payload (LiteLLM's
+// JSON), where a string like "1); DROP TABLE usage; --" would otherwise be spliced in verbatim.
+// Throwing beats coercing to NULL — a malformed upstream field is a reason to stop and look, not
+// to write a silently wrong price row.
+const sqlNum = (v) => {
+  if (v == null) return 'NULL';
+  if (typeof v !== 'number' || !Number.isFinite(v)) {
+    throw new Error(`refusing to inline non-numeric value into SQL: ${JSON.stringify(v)}`);
+  }
+  return String(v);
+};
+
+/** Upstream token limits are unvalidated JSON; coerce to a finite integer or drop them. */
+const intOrNull = (v) => (typeof v === 'number' && Number.isFinite(v) ? Math.trunc(v) : null);
 
 function run(args) {
   return execFileSync('npx', ['wrangler', 'd1', 'execute', DB, REMOTE ? '--remote' : '--local', ...args], {
@@ -107,8 +124,8 @@ function extract(entry, key, model, today) {
     cache_write_1h_cost: perM(entry.cache_creation_input_token_cost_above_1hr),
     input_cost_batch: perM(entry.input_cost_per_token_batches),
     output_cost_batch: perM(entry.output_cost_per_token_batches),
-    max_input_tokens: entry.max_input_tokens ?? null,
-    max_output_tokens: entry.max_output_tokens ?? null,
+    max_input_tokens: intOrNull(entry.max_input_tokens),
+    max_output_tokens: intOrNull(entry.max_output_tokens),
     cache_accounting: cacheAccounting(provider),
   };
 }

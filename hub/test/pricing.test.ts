@@ -188,6 +188,34 @@ describe('missing prices', () => {
   });
 });
 
+describe('corrupt token counters', () => {
+  it('never produces a negative cost from a negative counter', () => {
+    // `usage` has no nonnegative constraint and both parsers store whatever a transcript
+    // reports. Unclamped, this row bills -1M * 5 = -$5 and reports itself as fully priced —
+    // a credit invented from corrupt input, which then cancels real cost when summed.
+    const c = costOfUsage({ model: 'claude-opus-5', input_tokens: -1_000_000, output_tokens: 40 }, OPUS);
+    expect(c.usd).toBeGreaterThanOrEqual(0);
+    expect(c.usd).toBeCloseTo((40 * 25) / 1e6, 10);
+    expect(c.billableInputTokens).toBe(0);
+  });
+
+  it('clamps every token class, not just input', () => {
+    const c = costOfUsage(
+      {
+        model: 'claude-opus-5',
+        input_tokens: -5,
+        output_tokens: -5,
+        cache_read_tokens: -5,
+        cache_creation_5m_tokens: -5,
+        cache_creation_1h_tokens: -5,
+      },
+      OPUS,
+    );
+    expect(c.usd).toBe(0);
+    expect(c.unpriced).toBe(false);
+  });
+});
+
 describe('rate set reporting', () => {
   it('reports which rate set actually priced the row', () => {
     const u = { model: 'gpt-5.6-luna', input_tokens: 1_000_000, output_tokens: 0 };

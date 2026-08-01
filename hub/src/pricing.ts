@@ -96,11 +96,16 @@ export function isBillableModel(model: string | null | undefined): model is stri
  * portion at the full input rate. Same two columns, opposite arithmetic.
  */
 export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { batch?: boolean }): Cost {
-  const input = u.input_tokens ?? 0;
-  const output = u.output_tokens ?? 0;
-  const cacheRead = u.cache_read_tokens ?? 0;
-  const cw5 = u.cache_creation_5m_tokens ?? 0;
-  const cw1h = u.cache_creation_1h_tokens ?? 0;
+  // Clamp at 0. `usage` has no nonnegative constraint and both parsers store whatever counter a
+  // transcript reports, so a negative value would otherwise flow straight into the arithmetic and
+  // produce a NEGATIVE cost_usd on a row reported as fully priced. A token count below zero is
+  // not a discount; it is corrupt input.
+  const nonNegative = (v: number | null | undefined): number => Math.max(0, v ?? 0);
+  const input = nonNegative(u.input_tokens);
+  const output = nonNegative(u.output_tokens);
+  const cacheRead = nonNegative(u.cache_read_tokens);
+  const cw5 = nonNegative(u.cache_creation_5m_tokens);
+  const cw1h = nonNegative(u.cache_creation_1h_tokens);
 
   // Under `subset`, the cached tokens are already inside input_tokens; only the remainder is
   // fresh. Clamp at 0 -- a truncated or out-of-order transcript can report cacheRead > input.
@@ -110,7 +115,7 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   // its neighbours. `fresh_input_tokens` carries that per-row sum when the caller has one.
   const billableInput =
     price?.cache_accounting === 'subset'
-      ? (u.fresh_input_tokens ?? Math.max(0, input - cacheRead))
+      ? nonNegative(u.fresh_input_tokens ?? input - cacheRead)
       : input;
 
   // `billableInputTokens` is 0 on every unpriced path, never the raw input count. The field's
