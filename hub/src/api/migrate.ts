@@ -151,12 +151,17 @@ export function splitStatements(sql: string): string[] {
 }
 
 export function assertSplittable(name: string, sql: string): string | null {
-  let stripped = '';
-  const { unterminated } = scanSql(sql, (ch) => {
-    stripped += ch;
+  // Built from UNQUOTED characters only. `INSERT INTO messages VALUES ('BEGIN')` is valid SQL that
+  // wrangler applies fine, and matching this guard against text that still contained quoted
+  // content rejected it permanently -- a 422 that never resolves, blocking every other pending
+  // migration in the same request. Quoted runs collapse to a space so neighbouring tokens cannot
+  // fuse into a false match (`a'x'BEGIN` must not read as one word).
+  let unquoted = '';
+  const { unterminated } = scanSql(sql, (ch, quoted) => {
+    unquoted += quoted ? ' ' : ch;
   });
   if (unterminated) return `${name}: unterminated quote or identifier — refusing to guess where statements end`;
-  if (/\bBEGIN\b/i.test(stripped) || /\bCREATE\s+TRIGGER\b/i.test(stripped)) {
+  if (/\bBEGIN\b/i.test(unquoted) || /\bCREATE\s+TRIGGER\b/i.test(unquoted)) {
     return `${name}: contains a trigger or BEGIN block, which this endpoint's statement splitter cannot handle safely`;
   }
   return null;

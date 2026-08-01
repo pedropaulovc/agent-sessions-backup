@@ -305,6 +305,23 @@ describe('statement splitting', () => {
     expect(splitStatements(sql)[0]).toContain('"audit--log"');
   });
 
+  it('does not trip the trigger guard on BEGIN inside quoted text', () => {
+    // Valid SQL that wrangler applies. Rejecting it is a permanent 422 that blocks every other
+    // pending migration in the same request, so a false positive here is worse than a false
+    // negative elsewhere.
+    expect(assertSplittable('m', "INSERT INTO messages VALUES ('BEGIN');")).toBe(null);
+    expect(assertSplittable('m', 'CREATE TABLE "BEGIN" (x INT);')).toBe(null);
+    expect(assertSplittable('m', "INSERT INTO t VALUES ('CREATE TRIGGER x');")).toBe(null);
+    // Still caught where it is real syntax.
+    expect(assertSplittable('m', 'CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;')).toContain('trigger');
+  });
+
+  it('does not fuse tokens across a stripped quoted run', () => {
+    // Quoted runs collapse to a space, not to nothing — otherwise `a'x'BEGIN` would read as one
+    // word and could mask a real BEGIN, or invent one.
+    expect(assertSplittable('m', "SELECT 'a' BEGIN;")).toContain('trigger');
+  });
+
   it('flags an unterminated identifier, not just an unterminated literal', () => {
     expect(assertSplittable('m', 'CREATE TABLE "audit (id INT);')).toContain('unterminated');
   });
