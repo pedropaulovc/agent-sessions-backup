@@ -1,4 +1,5 @@
 import { env, SELF } from 'cloudflare:test';
+import { resetJwksThrottleForTests } from '../src/auth/github-oidc';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   assertSplittable,
@@ -96,6 +97,9 @@ beforeEach(async () => {
   stubJwks(keys.jwk);
   testEnv.ENVIRONMENT = 'preview';
   testEnv.MIGRATE_OIDC_REPOSITORY = REPO;
+  // The JWKS refresh throttle is process-wide by design, so it leaks between tests in this
+  // isolate. Reset it per test rather than letting execution order decide which ones can refresh.
+  resetJwksThrottleForTests();
   await seedPreviewMarker();
   await testEnv.DB.prepare('DROP TABLE IF EXISTS migrate_probe').run();
   await testEnv.DB.prepare('DELETE FROM d1_migrations WHERE name LIKE ?1').bind('9999_%').run().catch(() => {});
@@ -456,5 +460,55 @@ describe('bound-database check', () => {
     const res = await post(token, [{ name: '9999_rot', sql: 'CREATE TABLE migrate_probe (a INT);' }]);
     expect(res.status, 'a rotated signing key was treated as a forged token').toBe(200);
     expect(call).toBeGreaterThanOrEqual(2);
+  });
+
+  it('converts a THROWN JWKS failure into a retryable response, not a platform 500', async () => {
+    // Only non-2xx was being converted to null; a network-layer rejection or malformed JSON still
+    // threw. That becomes Cloudflare's bodiless platform 500, which CI reads as "endpoint not up
+    // yet" — so it retries, then exits GREEN with the preview left on an old schema.
+    vi.stubGlobal('fetch', vi.fn(async () => {
+      throw new TypeError('network down');
+    }));
+    const token = await signJwt(keys.pair.privateKey, goodClaims());
+    const res = await post(token, [{ name: '9999_probe', sql: 'CREATE TABLE migrate_probe (a INT);' }]);
+    expect(res.status).toBe(503);
+    expect((await res.json<{ retryable: boolean }>()).retryable).toBe(true);
+  });
+
+  it('converts malformed JWKS JSON into a retryable response', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => new Response('<html>not json</html>', { status: 200 })));
+    const token = await signJwt(keys.pair.privateKey, goodClaims());
+    const res = await post(token, [{ name: '9999_probe', sql: 'CREATE TABLE migrate_probe (a INT);' }]);
+    expect(res.status).toBe(503);
+  });
+
+  it('throttles cache-bypassing JWKS refreshes across requests', async () => {
+    // The refetch is reachable BEFORE signature verification (the kid comes from an unverified
+    // header) on a publicly reachable route, so unthrottled it is one outbound GitHub request per
+    // forged token — an unauthenticated amplifier that can rate-limit the JWKS access real
+    // migration runs need.
+    let fetches = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (!url.includes('token.actions.githubusercontent.com')) return new Response('nf', { status: 404 });
+        fetches++;
+        return new Response(JSON.stringify({ keys: [{ kty: 'RSA', kid: 'only-key', n: 'AQAB', e: 'AQAB' }] }), {
+          status: 200,
+        });
+      }),
+    );
+    for (let i = 0; i < 5; i++) {
+      const token = await signJwt(keys.pair.privateKey, goodClaims(), {
+        alg: 'RS256',
+        kid: `forged-kid-${i}`,
+        typ: 'JWT',
+      });
+      const res = await post(token, [{ name: '9999_probe', sql: 'SELECT 1;' }]);
+      expect(res.status).toBe(401);
+    }
+    // 5 unknown kids: each does one CACHED lookup, but at most one may bypass the cache.
+    expect(fetches, 'every forged kid forced an uncached GitHub fetch').toBeLessThanOrEqual(6);
   });
 });

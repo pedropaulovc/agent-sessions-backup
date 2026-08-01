@@ -141,16 +141,19 @@ jobs:
           TARGET: ${{ steps.target.outputs.url }}
         run: |
           set -uo pipefail
-          # Bounded: without a transfer deadline a server that accepts the connection and then
-          # stops responding parks this step until the job's own timeout, so the retry loop below
-          # never gets to run at all.
-          oidc=$(curl -sS --connect-timeout 10 --max-time 30 \
-            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sessions-hub-preview-migrate" | jq -r .value)
-          if [ -z "$oidc" ] || [ "$oidc" = "null" ]; then
-            echo "::error::could not mint a GitHub OIDC token (is id-token: write set?)"
-            exit 1
-          fi
+          # Minted inside the retry loop, not once up front. These assertions are short-lived
+          # (minutes), while the loop can span far longer — five 120s transfers plus sleeps. A
+          # token minted before a slow first attempt can be EXPIRED by the time a later attempt
+          # finally reaches the handler, which then returns the permanent `oidc_rejected` envelope
+          # and fails the job for a deployment race the retries were meant to absorb.
+          #
+          # Bounded transfers: without a deadline a server that accepts the connection and then
+          # goes quiet parks this step until the job timeout, so the loop never runs at all.
+          mint_oidc() {
+            curl -sS --connect-timeout 10 --max-time 30 \
+              -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sessions-hub-preview-migrate" | jq -r .value
+          }
           python3 -c "
           import json, pathlib
           files = sorted(pathlib.Path('hub/migrations').glob('*.sql'))
@@ -168,6 +171,11 @@ jobs:
           # the failure this job exists to prevent. Retry only what is plausibly transient.
           code=000
           for attempt in 1 2 3 4 5; do
+            oidc=$(mint_oidc)
+            if [ -z "$oidc" ] || [ "$oidc" = "null" ]; then
+              echo "::error::could not mint a GitHub OIDC token (is id-token: write set?)"
+              exit 1
+            fi
             code=$(curl -sS --connect-timeout 10 --max-time 120 \
               -o /tmp/migrate-out.json -w '%{http_code}' \
               -X POST "$TARGET/api/v1/admin/migrate" \
@@ -231,6 +239,19 @@ jobs:
           cache-dependency-path: hub/package-lock.json
       - run: npm ci
       - run: npx wrangler d1 migrations apply sessions-index --remote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # The preview D1 too, and from HERE rather than from migrate-preview. That job only runs for
+      # same-repo pull requests, but `sessions-hub-preview` has `main` as its production branch —
+      # so a direct push to main (which is unprotected) or a merged FORK PR deploys new preview
+      # code with no migration behind it, leaving the shared preview database on the old schema
+      # until some unrelated PR happens to migrate it. The production `deploy` step below only
+      # covers `sessions-index`.
+      #
+      # This runs on the trusted path with the credential that already exists, so it needs no OIDC
+      # and adds no PR-reachable surface — closing the gap without widening migrate-preview's
+      # trigger to pushes, where there is no pull_request head ref to derive a preview URL from.
+      - run: npx wrangler d1 migrations apply DB --env preview --remote
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       - run: npx wrangler deploy

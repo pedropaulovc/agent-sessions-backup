@@ -65,17 +65,55 @@ function decodeJson<T>(segment: string): T | null {
 
 /** GitHub rotates signing keys, so the key set is fetched rather than pinned. `cacheTtl` keeps
  * this off the hot path without holding a stale set past a rotation. */
+/** Minimum gap between cache-bypassing JWKS fetches, per isolate.
+ *
+ * The uncached refetch exists for key rotation, but it is reachable BEFORE signature verification
+ * (the kid is read from an unverified header), and this route is publicly reachable. Without a
+ * throttle an unauthenticated flood of syntactically valid JWTs each carrying a fresh random kid
+ * forces one outbound GitHub request apiece — burning Worker resources and risking rate-limiting
+ * the JWKS access that legitimate migration runs depend on. One refresh a minute is far more than
+ * rotation needs and far less than a flood wants.
+ */
+const UNCACHED_JWKS_MIN_INTERVAL_MS = 60_000;
+let lastUncachedJwksFetch = 0;
+
 async function fetchJwks(bypassCache = false): Promise<Jwk[] | null> {
   // `cacheEverything` with a 600s TTL keeps the common path off the network. bypassCache forces a
   // fresh fetch for the one case the cache gets wrong: GitHub rotating in a new signing key inside
   // the TTL, so a perfectly valid token names a kid the cached set predates.
-  const res = await fetch(GITHUB_JWKS_URL, {
-    cf: bypassCache ? { cacheTtl: 0 } : { cacheTtl: 600, cacheEverything: true },
-    ...(bypassCache ? { headers: { 'cache-control': 'no-cache' } } : {}),
-  });
-  if (!res.ok) return null;
-  const body = (await res.json()) as { keys?: Jwk[] };
-  return body.keys ?? null;
+  try {
+    const res = await fetch(GITHUB_JWKS_URL, {
+      cf: bypassCache ? { cacheTtl: 0 } : { cacheTtl: 600, cacheEverything: true },
+      ...(bypassCache ? { headers: { 'cache-control': 'no-cache' } } : {}),
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { keys?: Jwk[] };
+    return body.keys ?? null;
+  } catch {
+    // A network-layer rejection or malformed JSON is exactly as transient as a 5xx, and must
+    // reach the caller as `null` rather than propagating. An uncaught throw here becomes
+    // Cloudflare's bodiless platform 500, which CI reads as "the endpoint is not up yet" — so it
+    // retries, then exits GREEN with the preview left on an old schema.
+    return null;
+  }
+}
+
+/** Reset the refresh throttle. TEST ONLY — nothing in the request path calls this; the throttle
+ * is deliberately process-wide so a flood cannot be escaped by varying the request. */
+export function resetJwksThrottleForTests(): void {
+  lastUncachedJwksFetch = 0;
+}
+
+/** True if a cache-bypassing refresh is allowed right now, consuming the allowance if so.
+ *
+ * Note the accepted cost: a flood can delay a LEGITIMATE rotation refresh by up to the interval.
+ * That is survivable here because the only caller (CI) retries with backoff over a longer window
+ * than the throttle, so a run that arrives mid-rotation recovers on a later attempt instead of
+ * failing — whereas an unthrottled amplifier has no such ceiling. */
+function allowUncachedJwksFetch(now: number): boolean {
+  if (now - lastUncachedJwksFetch < UNCACHED_JWKS_MIN_INTERVAL_MS) return false;
+  lastUncachedJwksFetch = now;
+  return true;
 }
 
 /**
@@ -111,7 +149,7 @@ export async function verifyGitHubOidc(
   // forged token, and a forged one fails signature verification below anyway -- so pay for one
   // uncached fetch before rejecting. Without this, a valid run fails during every rotation window,
   // and since CI now treats any handler error as fatal, it fails RED rather than retrying.
-  if (!jwk) {
+  if (!jwk && allowUncachedJwksFetch(Date.now())) {
     jwks = await fetchJwks(true);
     jwk = jwks?.find((k) => k.kid === header.kid);
   }
