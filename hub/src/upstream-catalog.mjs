@@ -92,3 +92,28 @@ export function priceKeyCandidates(model) {
   }
   return out;
 }
+
+/** Providers whose cache-read convention is actually KNOWN. Anything absent yields 'unknown'.
+ *
+ * Guessing here is a silent ~2x error on every cached turn — disjoint bills cache reads on top of
+ * input, subset bills them inside it — and the row still reports as priced, so nothing downstream
+ * can notice. See migration 0017. `litellm_provider` is community JSON typed `unknown`, so it is
+ * validated as a string rather than cast: a number or object there would otherwise be bound
+ * straight into a STRICT TEXT column and fail the whole batch.
+ */
+const CACHE_ACCOUNTING_BY_PROVIDER = {
+  anthropic: 'disjoint',
+  openai: 'subset',
+  azure: 'subset',
+  deepseek: 'subset',
+};
+
+/** The provider string, or null if upstream gave something that is not a usable string. */
+export function providerOf(entry) {
+  const v = entry?.['litellm_provider'];
+  return typeof v === 'string' && v.length > 0 ? v : null;
+}
+
+export function cacheAccountingFor(provider) {
+  return CACHE_ACCOUNTING_BY_PROVIDER[provider ?? ''] ?? 'unknown';
+}

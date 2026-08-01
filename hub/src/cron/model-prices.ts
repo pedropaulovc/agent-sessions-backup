@@ -5,7 +5,14 @@
  * and `--all`; this is the unattended path and the two share the same resolution rules --
  * literally, via ../upstream-catalog.mjs, after they drifted three separate times in one review. */
 
-import { assertLooksLikeCatalog, intOrNull, perM, priceKeyCandidates } from '../upstream-catalog.mjs';
+import {
+  assertLooksLikeCatalog,
+  cacheAccountingFor,
+  intOrNull,
+  perM,
+  priceKeyCandidates,
+  providerOf,
+} from '../upstream-catalog.mjs';
 
 const UPSTREAM =
   'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json';
@@ -28,18 +35,18 @@ const RATE_COLS = [
  * every cached call until some unrelated rate happens to change. */
 const ACCOUNTING_COLS = ['provider', 'cache_accounting'] as const;
 
-/** Only providers whose cache-read convention is actually known. Anything absent from this map
- * stores NULL rather than guessing -- see the call site. */
-/** Statements per D1 batch. Each one costs a subrequest against the invocation's ~1000 budget,
- * which the daily handler shares with the prune jobs it runs alongside this. */
+/** Statements per D1 batch. Each costs a subrequest against the invocation's ~1000 budget. */
 const MAX_STATEMENTS_PER_BATCH = 100;
 
-const CACHE_ACCOUNTING_BY_PROVIDER: Record<string, 'disjoint' | 'subset'> = {
-  anthropic: 'disjoint',
-  openai: 'subset',
-  azure: 'subset',
-  deepseek: 'subset',
-};
+/** Price rows written per INVOCATION. Chunking the batch calls does not reset the budget --
+ * every chunk still spends from the same invocation's ~1000 subrequests, shared with the prune
+ * jobs the daily handler runs alongside this. So the real bound is total work, not batch size.
+ *
+ * Models are processed stalest-first, so a run that hits this ceiling still makes progress on the
+ * rows most in need of it, and the daily cadence catches the remainder. The audit row records how
+ * many were deferred, so "the sync is not keeping up" is visible in the data rather than inferred.
+ */
+const MAX_PRICE_WRITES_PER_RUN = 400;
 
 type Rates = Record<(typeof RATE_COLS)[number], number | null>;
 type Accounting = Record<(typeof ACCOUNTING_COLS)[number], string | null>;
@@ -55,7 +62,18 @@ export async function runModelPriceSync(env: Env): Promise<void> {
     const entryCount = assertLooksLikeCatalog(upstream);
 
     const models = (
-      await env.DB.prepare(`SELECT DISTINCT model FROM usage WHERE model IS NOT NULL`).all<{
+      await env.DB.prepare(
+        // Stalest first, so a run that hits MAX_PRICE_WRITES_PER_RUN spends its budget on the
+        // models most in need of it and never starves one: a model with no price row at all sorts
+        // ahead of every priced one (NULL sorts first under ASC), and among priced models the
+        // oldest fetch wins. Each run therefore advances the frontier.
+        `SELECT u.model AS model, MAX(p.fetched_at) AS newest
+           FROM usage u
+           LEFT JOIN model_prices p ON p.model = u.model
+          WHERE u.model IS NOT NULL
+          GROUP BY u.model
+          ORDER BY newest ASC, u.model ASC`,
+      ).all<{
         model: string;
       }>()
     ).results.map((r) => r.model)
@@ -73,14 +91,19 @@ export async function runModelPriceSync(env: Env): Promise<void> {
 
     const stmts: D1PreparedStatement[] = [];
     const unresolved: string[] = [];
+    let deferred = 0;
     for (const model of models) {
+      if (stmts.length >= MAX_PRICE_WRITES_PER_RUN) {
+        deferred++;
+        continue;
+      }
       const key = priceKeyCandidates(model).find((c) => upstream[c]);
       if (!key) {
         unresolved.push(model);
         continue;
       }
       const e = upstream[key]!;
-      const provider = (e['litellm_provider'] as string) ?? null;
+      const provider = providerOf(e);
       const next: Rates = {
         input_cost: perM(e['input_cost_per_token']),
         output_cost: perM(e['output_cost_per_token']),
@@ -105,7 +128,7 @@ export async function runModelPriceSync(env: Env): Promise<void> {
       // reads. NOT null: the column is NOT NULL, and INSERT OR REPLACE silently substitutes the
       // column DEFAULT for a NULL rather than failing, so a nullable-looking write would have
       // stored 'disjoint' while the code believed otherwise (see migration 0017).
-      const cacheAccounting = CACHE_ACCOUNTING_BY_PROVIDER[provider ?? ''] ?? 'unknown';
+      const cacheAccounting = cacheAccountingFor(provider);
       const prev = latest.get(model);
       const ratesUnchanged = prev && RATE_COLS.every((c) => (prev[c] ?? null) === (next[c] ?? null));
       const accountingUnchanged =
@@ -144,7 +167,14 @@ export async function runModelPriceSync(env: Env): Promise<void> {
       env.DB.prepare(
         `INSERT INTO model_prices_sync (upstream_entries, models_seen, rows_inserted, unresolved, ok)
          VALUES (?1,?2,?3,?4,1)`,
-      ).bind(entryCount, models.length, priceInserts, JSON.stringify(unresolved)),
+      ).bind(
+        entryCount,
+        models.length,
+        priceInserts,
+        // Deferred models ride in the same audit field as unresolved ones so a run that hit the
+        // per-invocation ceiling is visible rather than looking like a clean, complete sync.
+        JSON.stringify(deferred ? [...unresolved, `__deferred__:${deferred}`] : unresolved),
+      ),
     );
 
     // Chunked, because every statement in a D1 batch spends one of the invocation's ~1000

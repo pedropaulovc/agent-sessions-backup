@@ -249,7 +249,10 @@ describe('rate set reporting', () => {
     // Otherwise a cache read is charged at the batch discount while rateSet reports it as
     // standard — the two halves of the same rule disagreeing.
     const noCacheRate: ModelPrice = { ...LUNA, cache_read_cost: null };
-    const u = { model: 'gpt-5.6-luna', cache_read_tokens: 1_000_000 };
+    // LUNA is a `subset` model, so the cache-read charge is clamped to input — give it input, or
+    // the row is contradictory (cached tokens with no input to be a subset of) and prices at 0,
+    // testing the clamp instead of the rate fallback this is about.
+    const u = { model: 'gpt-5.6-luna', input_tokens: 1_000_000, cache_read_tokens: 1_000_000 };
     // Standard input is 0.2/M; batch input is 0.1/M. Must be the former.
     expect(costOfUsage(u, noCacheRate, { batch: true }).usd).toBeCloseTo(0.2, 10);
   });
@@ -340,6 +343,35 @@ describe('unknown cache accounting', () => {
     const c = costOfUsage({ model: 'gpt-5.6-luna', input_tokens: 1_000_000, output_tokens: 1_000_000 }, UNKNOWN);
     expect(c.unpriced).toBe(false);
     expect(c.usd).toBeCloseTo(0.2 + 1.2, 10);
+  });
+});
+
+describe('subset cache-read clamp', () => {
+  it('never bills more cached tokens than the row reports as input', () => {
+    // Under subset accounting cached tokens are BY DEFINITION part of input_tokens. The
+    // fresh-input clamp only protected the subtraction: input=500 / cache_read=9000 correctly
+    // yields 0 fresh input, but the cache term still billed all 9000 — 18x the tokens the row
+    // says it used.
+    const c = costOfUsage({ model: 'gpt-5.6-luna', input_tokens: 500, cache_read_tokens: 9000 }, LUNA);
+    // 500 cached tokens at 0.02/M, and no fresh input.
+    expect(c.usd).toBeCloseTo((500 * 0.02) / 1_000_000, 12);
+    expect(c.billableInputTokens).toBe(0);
+  });
+
+  it('leaves disjoint models alone', () => {
+    // Anthropic reports cache reads SEPARATELY from input, so exceeding input is normal there and
+    // clamping would under-report real spend.
+    const c = costOfUsage({ model: 'claude-opus-5', input_tokens: 500, cache_read_tokens: 9000 }, OPUS);
+    expect(c.usd).toBeCloseTo((500 * 5 + 9000 * 0.5) / 1_000_000, 12);
+  });
+
+  it('uses the per-row sum when the caller pre-aggregated', () => {
+    // MIN is nonlinear, so a group's totals cannot reproduce it — the SQL carries the per-row sum.
+    const c = costOfUsage(
+      { model: 'gpt-5.6-luna', input_tokens: 1000, cache_read_tokens: 18000, billable_cache_read_tokens: 1000 },
+      LUNA,
+    );
+    expect(c.usd).toBeCloseTo((1000 * 0.02) / 1_000_000, 12);
   });
 });
 });

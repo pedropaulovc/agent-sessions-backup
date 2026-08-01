@@ -457,6 +457,36 @@ describe('priceEpochExpr', () => {
     expect(Number(row.cost_usd)).toBeCloseTo(7, 6);
   });
 
+  it('prices a timestamp-less input-only row when only an UNUSED rate moved', async () => {
+    // Comparing every cost column was still too strict: an input-only group has no output tokens,
+    // so an output_cost change cannot alter its dollars — yet it was reported unpriced.
+    for (const [from, outCost] of [
+      ['2026-01-01', 200],
+      ['2026-05-01', 900],
+    ] as const) {
+      await testEnv.DB.prepare(
+        `INSERT INTO model_prices
+           (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
+            cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
+            cache_accounting, source, fetched_at)
+         VALUES ('unused-rate-model', ?1, 'unused-rate-model', 'openai', 7, ?2, 0, 0, 0, NULL, NULL,
+                 'subset', 'test', '2026-07-31T00:00:00Z')`,
+      )
+        .bind(from, outCost)
+        .run();
+    }
+    await seedSession('unused-sess', 'unusedbox', 'claude-code');
+    await testEnv.DB.prepare(
+      `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens,
+                          cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens)
+       VALUES ('unused-sess', 910, NULL, 'unused-rate-model', 1000000, 0, 0, 0, 0)`,
+    ).run();
+
+    const row = (await fetchUsage('group_by=machine&machine=unusedbox')).rows[0]!;
+    expect(Number(row.unpriced_calls), 'an unused output_cost change left an input-only row unpriced').toBe(0);
+    expect(Number(row.cost_usd)).toBeCloseTo(7, 6);
+  });
+
   it('still refuses a timestamp-less row when snapshots genuinely differ', async () => {
     // The other direction: the fix must not start guessing when the rates really do disagree.
     for (const [from, cost] of [

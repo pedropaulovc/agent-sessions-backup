@@ -17,6 +17,9 @@ export interface UsageTokens {
    * subset-accounting clamp already applied per row. Absent for a single row, where deriving
    * it from `input_tokens`/`cache_read_tokens` is exact. See `billableInput` below. */
   fresh_input_tokens?: number | null;
+  /** Per-row SUM(MIN(cache_read, input)) for a pre-aggregated group — the min is nonlinear, so it
+   * cannot be recomputed from the group's totals. */
+  billable_cache_read_tokens?: number | null;
 }
 
 export interface ModelPrice {
@@ -111,6 +114,19 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
       ? nonNegative(u.fresh_input_tokens ?? input - cacheRead)
       : input;
 
+  // Under `subset`, cached tokens are BY DEFINITION part of input_tokens, so the cache-read charge
+  // cannot exceed input either. The fresh-input clamp above only protects the subtraction: with
+  // input=500 and cache_read=9000 it correctly yields 0 fresh input, but the cache term still
+  // billed all 9000 — charging 18x the tokens the row says it used. Clamp both sides.
+  //
+  // Like the fresh-input clamp this is NONLINEAR, so on a pre-aggregated group it has to have been
+  // applied per row; `billable_cache_read_tokens` carries that per-row sum when the caller has
+  // one. The raw counter stays untouched for reporting.
+  const billableCacheRead =
+    price?.cache_accounting === 'subset'
+      ? nonNegative(u.billable_cache_read_tokens ?? Math.min(cacheRead, input))
+      : cacheRead;
+
   // `billableInputTokens` is 0 on every unpriced path, never the raw input count. The field's
   // contract is "input actually billed at the input rate", and for an unmatched model we do not
   // know the accounting convention (a subset model's cached prefix would be wrongly included),
@@ -168,7 +184,7 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   const usd =
     (billableInput * (inRate ?? 0) +
       output * (outRate ?? 0) +
-      cacheRead * (readRate ?? 0) +
+      billableCacheRead * (readRate ?? 0) +
       cw5 * (price.cache_write_5m_cost ?? 0) +
       cw1h * (price.cache_write_1h_cost ?? 0)) /
     MILLION;

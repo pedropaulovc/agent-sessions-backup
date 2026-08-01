@@ -21,7 +21,14 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 // Coercion + validation shared verbatim with hub/src/cron/model-prices.ts. These two drifted
 // three times in one review; the rules now live in one file.
-import { assertLooksLikeCatalog, intOrNull, perM, priceKeyCandidates } from '../hub/src/upstream-catalog.mjs';
+import {
+  assertLooksLikeCatalog,
+  cacheAccountingFor,
+  intOrNull,
+  perM,
+  priceKeyCandidates,
+  providerOf,
+} from '../hub/src/upstream-catalog.mjs';
 
 const UPSTREAM =
   'https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json';
@@ -91,12 +98,9 @@ const isBillable = (m) => !!m && !m.startsWith('<');
 
 /** Anthropic reports cache reads disjoint from input_tokens; OpenAI-family reports them as a
  * subset. Getting this backwards double-bills (or under-bills) every cached turn. */
-function cacheAccounting(provider) {
-  return provider === 'anthropic' ? 'disjoint' : 'subset';
-}
 
 function extract(entry, key, model, today) {
-  const provider = entry.litellm_provider ?? null;
+  const provider = providerOf(entry);
   return {
     model,
     effective_from: today,
@@ -114,7 +118,7 @@ function extract(entry, key, model, today) {
     output_cost_batch: perM(entry.output_cost_per_token_batches),
     max_input_tokens: intOrNull(entry.max_input_tokens),
     max_output_tokens: intOrNull(entry.max_output_tokens),
-    cache_accounting: cacheAccounting(provider),
+    cache_accounting: cacheAccountingFor(provider),
   };
 }
 

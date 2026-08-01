@@ -629,7 +629,13 @@ export async function usage(url: URL, env: Env): Promise<Response> {
               -- cache_read would otherwise ADD to fresh input: (5) - (-100) = 105 billable tokens
               -- on a row whose own reported columns say input=5, cache_read=0.
               SUM(MAX(0, MAX(0, COALESCE(u.input_tokens,0)) - MAX(0, COALESCE(u.cache_read_tokens,0))))
-                AS fresh_input_tokens
+                AS fresh_input_tokens,
+              -- The other half of the same clamp, and nonlinear for the same reason. Under subset
+              -- accounting cached tokens are part of input, so the cache-read CHARGE cannot exceed
+              -- input either: input=500 with cache_read=9000 is 0 fresh input AND at most 500
+              -- billable cached tokens, not 9000.
+              SUM(MIN(MAX(0, COALESCE(u.cache_read_tokens,0)), MAX(0, COALESCE(u.input_tokens,0))))
+                AS billable_cache_read_tokens
        FROM usage u JOIN sessions s ON s.session_id = u.session_id
        ${where}
        GROUP BY bucket, u.model, epoch, has_input, has_fresh_input, has_output, has_cache_read, has_w5, has_w1h
@@ -677,7 +683,7 @@ export async function usage(url: URL, env: Env): Promise<Response> {
     // cache-write shape, and therefore one rate and one accounting convention. `epoch` — not
     // `bucket` — is the date to price at; see the comment on the query above.
     const modelClass = classifyModel(r.model);
-    const price = modelClass === 'billable' ? priceForGroup(prices.get(r.model as string) ?? [], String(r.epoch)) : null;
+    const price = modelClass === 'billable' ? priceForGroup(prices.get(r.model as string) ?? [], String(r.epoch), r) : null;
     const cost = costOfUsage(r, price, { batch });
     agg.billable_input_tokens += cost.billableInputTokens;
     agg.cost_usd += cost.usd;
@@ -746,8 +752,24 @@ const COST_RELEVANT_COLS = [
   'cache_accounting',
 ] as const;
 
-function costEquivalent(a: ModelPrice, b: ModelPrice): boolean {
-  return COST_RELEVANT_COLS.every((c) => (a[c] ?? null) === (b[c] ?? null));
+/** Which columns a group's cost actually depends on, given the token classes it HAS.
+ *
+ * Comparing all of them was still too strict: an input-only group became unpriced merely because
+ * `output_cost` moved, or because `cache_accounting` flipped on a group with no cache reads —
+ * neither of which can change that group's dollars. */
+function relevantCols(row: UsageTokens): readonly (typeof COST_RELEVANT_COLS)[number][] {
+  const cols: (typeof COST_RELEVANT_COLS)[number][] = [];
+  const n = (v: number | null | undefined) => Math.max(0, v ?? 0);
+  if (n(row.input_tokens) > 0) cols.push('input_cost', 'input_cost_batch');
+  if (n(row.output_tokens) > 0) cols.push('output_cost', 'output_cost_batch');
+  if (n(row.cache_read_tokens) > 0) cols.push('cache_read_cost', 'cache_accounting', 'input_cost');
+  if (n(row.cache_creation_5m_tokens) > 0) cols.push('cache_write_5m_cost');
+  if (n(row.cache_creation_1h_tokens) > 0) cols.push('cache_write_1h_cost');
+  return cols;
+}
+
+function costEquivalent(a: ModelPrice, b: ModelPrice, cols: readonly (typeof COST_RELEVANT_COLS)[number][]): boolean {
+  return cols.every((c) => (a[c] ?? null) === (b[c] ?? null));
 }
 
 /** The rate for a group, given the epoch it was bucketed into.
@@ -760,11 +782,14 @@ function costEquivalent(a: ModelPrice, b: ModelPrice): boolean {
  *
  * When they genuinely differ, any choice is a guess, so it stays unpriced rather than being
  * charged at some arbitrary rate and reported as a real figure. */
-function priceForGroup(history: ModelPrice[], epoch: string): ModelPrice | null {
+function priceForGroup(history: ModelPrice[], epoch: string, row: UsageTokens): ModelPrice | null {
   if (epoch !== EPOCH_UNKNOWN_TIME) return priceAt(history, epoch);
   if (!history.length) return null;
   const first = history[0]!;
-  return history.every((p) => costEquivalent(first, p)) ? first : null;
+  const cols = relevantCols(row);
+  // No billable tokens at all: nothing to disagree about, so any snapshot serves.
+  if (!cols.length) return first;
+  return history.every((p) => costEquivalent(first, p, cols)) ? first : null;
 }
 
 /** Stands in for a NULL `usage.model` in `unpriced_models`. Deliberately bracketed so it cannot
