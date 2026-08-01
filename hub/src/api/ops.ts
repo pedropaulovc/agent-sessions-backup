@@ -588,11 +588,18 @@ export async function usage(url: URL, env: Env): Promise<Response> {
        SELECT ${expr} AS bucket,
               u.model AS model,
               ${epochExpr} AS epoch,
-              -- Split groups by cache-write PRESENCE, because an absent write rate makes a row
-              -- unpriced (see costOfUsage): without this, one cache-writing call in a group
-              -- would drag every ordinary call beside it to $0/unpriced even though those are
-              -- perfectly priceable. In practice a model either writes cache or never does, so
-              -- this rarely multiplies the group count at all.
+              -- Split groups by which token classes are PRESENT. Every one of these can
+              -- independently require a nullable rate, and costOfUsage marks a row unpriced when
+              -- a rate it needs is missing — so mixing shapes lets one unpriceable call drag
+              -- perfectly priceable neighbours to $0/unpriced. Concretely, with a partial
+              -- upstream entry that has an input rate but no output rate, an input-only call
+              -- grouped with an output-bearing one loses its own valid cost.
+              --
+              -- These are booleans, so the fan-out is bounded and in practice tiny: a model's
+              -- calls nearly all share one shape (input+output, or input+output+cache).
+              (COALESCE(u.input_tokens,0) > 0) AS has_input,
+              (COALESCE(u.output_tokens,0) > 0) AS has_output,
+              (COALESCE(u.cache_read_tokens,0) > 0) AS has_cache_read,
               (COALESCE(u.cache_creation_5m_tokens,0) > 0) AS has_w5,
               (COALESCE(u.cache_creation_1h_tokens,0) > 0) AS has_w1h,
               COUNT(*) AS calls,
@@ -609,7 +616,8 @@ export async function usage(url: URL, env: Env): Promise<Response> {
               SUM(MAX(0, COALESCE(u.input_tokens,0) - COALESCE(u.cache_read_tokens,0)))
                 AS fresh_input_tokens
        FROM usage u JOIN sessions s ON s.session_id = u.session_id
-       ${where} GROUP BY bucket, u.model, epoch, has_w5, has_w1h
+       ${where}
+       GROUP BY bucket, u.model, epoch, has_input, has_output, has_cache_read, has_w5, has_w1h
      )
      SELECT a.* FROM agg a
      JOIN (SELECT bucket FROM agg GROUP BY bucket ORDER BY bucket DESC LIMIT ?${binds.length + 1}) top
@@ -623,12 +631,17 @@ export async function usage(url: URL, env: Env): Promise<Response> {
     .all<UsageAggRow>();
 
   const batch = url.searchParams.get('batch') === '1';
-  const byBucket = new Map<string, UsageOutRow>();
+  const byBucket = new Map<string | null, UsageOutRow>();
   const unpricedModels = new Set<string>();
   const rateSetsUsed = new Set<'standard' | 'batch'>();
 
   for (const r of rows.results ?? []) {
-    const key = String(r.bucket);
+    // Key by the bucket VALUE, not String(bucket): a NULL bucket and a bucket whose literal text
+    // is "null" (a repo_url or model that really is the string "null") both stringify to "null"
+    // and would merge into one row, silently combining two different populations' calls, tokens
+    // and cost — and losing one of the two buckets from the response. A Map handles a null key
+    // natively, so no sentinel is needed.
+    const key = (r.bucket ?? null) as string | null;
     const agg = byBucket.get(key) ?? {
       bucket: r.bucket,
       calls: 0,
@@ -669,7 +682,13 @@ export async function usage(url: URL, env: Env): Promise<Response> {
   // No slice here: the query already returns whole buckets and at most MAX_BUCKETS of them,
   // so trimming again could only cut a bucket that was counted in full.
   const out = [...byBucket.values()]
-    .sort((a, b) => String(b.bucket).localeCompare(String(a.bucket)))
+    // Mirror the query's `ORDER BY bucket DESC`, where SQLite sorts NULL last. Comparing
+    // String(null) here would instead file it among the "n"s.
+    .sort((a, b) => {
+      if (a.bucket === null) return 1;
+      if (b.bucket === null) return -1;
+      return String(b.bucket).localeCompare(String(a.bucket));
+    })
     .map((r) => ({ ...r, cost_usd: Math.round(r.cost_usd * 1e6) / 1e6 }));
 
   return Response.json({

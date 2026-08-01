@@ -59,10 +59,25 @@ jobs:
   #
   # The preview D1 is shared by all branches, so an unmerged branch's migration lands here early. That
   # is already true of every other preview resource and is the accepted cost of one shared preview env.
+  # SECURITY: this job runs PR-CONTROLLED code and therefore must never see a secret that can
+  # touch production. It uses CLOUDFLARE_PREVIEW_API_TOKEN — a separate, D1-only credential — and
+  # deliberately does NOT fall back to CLOUDFLARE_API_TOKEN (the `deploy` job's token, which can
+  # edit production D1, Workers, queues, R2, KV and zone routes). If the preview token is not
+  # configured the job skips with a notice: an unmigrated preview is a broken preview, while a
+  # leaked production token is a compromised account.
+  #
+  # Be clear about what the hardening below does and does not buy. For a same-repo PR, GitHub runs
+  # the PR's OWN copy of this workflow file, so a PR author can simply rewrite this job to print
+  # whatever secret it is given. No in-workflow measure changes that. The only real controls are
+  # (a) least privilege, so what a PR can reach is a preview-only credential, and (b) putting this
+  # job behind a GitHub Environment with required reviewers if the repo ever takes outside PRs.
+  # `--ignore-scripts` and the database-id assertion are defence in depth against a compromised
+  # DEPENDENCY rather than against a malicious author.
   migrate-preview:
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     needs: hub
     runs-on: ubuntu-latest
+    environment: preview
     defaults:
       run:
         working-directory: hub
@@ -73,13 +88,43 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: hub/package-lock.json
-      - run: npm ci
+      - id: token
+        if: ${{ secrets.CLOUDFLARE_PREVIEW_API_TOKEN != '' }}
+        run: echo "present=1" >> "$GITHUB_OUTPUT"
+      - if: steps.token.outputs.present != '1'
+        run: |
+          echo "::notice::CLOUDFLARE_PREVIEW_API_TOKEN is not configured — skipping preview migrations."
+          echo "::notice::Create a D1-only Cloudflare API token (D1:Edit, Account Settings:Read) and add it"
+          echo "::notice::as that secret. This job will NOT use the production deploy token."
+      # No lifecycle scripts: this job holds a credential, and `npm ci` otherwise executes
+      # postinstall hooks from PR-controlled package.json and its dependency tree before the
+      # token is ever used. wrangler's CLI works fine without them (no local workerd needed for
+      # a --remote migration).
+      - if: steps.token.outputs.present == '1'
+        run: npm ci --ignore-scripts
+      # wrangler resolves the migration target from wrangler.jsonc, which is PR-controlled — a PR
+      # could repoint env.preview at the PRODUCTION database id and have this job migrate prod.
+      # Pin the expected preview database id here, in the workflow, and refuse to run on a mismatch.
+      - if: steps.token.outputs.present == '1'
+        run: |
+          expected=8f2cd488-0060-4f32-8025-f5b461c9fe0a
+          actual=$(node -e '
+            const fs=require("fs");
+            const raw=fs.readFileSync("wrangler.jsonc","utf8").replace(/^\s*\/\/.*$/gm,"");
+            const db=JSON.parse(raw).env.preview.d1_databases.find(d=>d.binding==="DB");
+            process.stdout.write(db.database_id);
+          ')
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::env.preview DB id is $actual, expected the preview database $expected — refusing to migrate."
+            exit 1
+          fi
       # `DB --env preview`, not the database name: `sessions-index-preview` is declared only under
       # env.preview, and wrangler resolves migration targets against the selected environment's
       # bindings, so the bare name errors with "Couldn't find a D1 DB with the name or binding".
-      - run: npx wrangler d1 migrations apply DB --env preview --remote
+      - if: steps.token.outputs.present == '1'
+        run: npx wrangler d1 migrations apply DB --env preview --remote
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PREVIEW_API_TOKEN }}
 
   # Migrate D1 then deploy the hub Worker, in that order, on merge to main. This is the SOLE deployer:
   # Cloudflare Workers Builds auto-deploy is turned OFF so nothing races us. Applying migrations before

@@ -194,6 +194,65 @@ describe('rows the aggregate must not silently drop', () => {
   });
 });
 
+describe('a NULL bucket is not the string "null"', () => {
+  beforeAll(async () => {
+    // Two sessions on one machine: one with no repo_url at all, one whose repo_url is the
+    // literal text "null". Both stringify to "null" — merging them would combine two unrelated
+    // populations and drop one bucket from the response entirely.
+    await testEnv.DB.prepare(
+      `INSERT INTO sessions (session_id, harness, machine_id, repo_url, started_at, index_state)
+       VALUES ('sess-litnull', 'codex', 'collidebox', 'null', '2026-04-01T00:00:00Z', 'ready')`,
+    ).run();
+    await testEnv.DB.prepare(
+      `INSERT INTO sessions (session_id, harness, machine_id, repo_url, started_at, index_state)
+       VALUES ('sess-sqlnull', 'codex', 'collidebox', NULL, '2026-04-01T00:00:00Z', 'ready')`,
+    ).run();
+    await seedUsage('sess-litnull', '2026-04-01T10:00:00Z', 'claude-opus-5', { input: 1_111 });
+    await seedUsage('sess-sqlnull', '2026-04-01T10:00:00Z', 'claude-opus-5', { input: 2_222 });
+  });
+
+  it('keeps them as two separate buckets', async () => {
+    const body = await fetchUsage('group_by=repo&machine=collidebox');
+    const literal = body.rows.find((r) => r.bucket === 'null');
+    const sqlNull = body.rows.find((r) => r.bucket === null);
+    expect(literal, 'the literal "null" repo bucket is missing').toBeTruthy();
+    expect(sqlNull, 'the SQL NULL repo bucket is missing').toBeTruthy();
+    expect(literal!.input_tokens).toBe(1_111);
+    expect(sqlNull!.input_tokens).toBe(2_222);
+  });
+});
+
+describe('token-class shapes are priced independently', () => {
+  beforeAll(async () => {
+    // A model whose upstream entry publishes an input rate but NO output rate.
+    await testEnv.DB.prepare(
+      `INSERT INTO model_prices
+         (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
+          cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
+          cache_accounting, source, fetched_at)
+       VALUES ('partial-model', '2026-01-01', 'partial-model', 'openai', 10, NULL, 0, 0, 0,
+               NULL, NULL, 'disjoint', 'test', '2026-01-01T00:00:00Z')`,
+    ).run();
+    await testEnv.DB.prepare(
+      `INSERT INTO sessions (session_id, harness, machine_id, repo_url, started_at, index_state)
+       VALUES ('sess-partial', 'codex', 'partialbox', 'https://github.com/a/b', '2026-05-01T00:00:00Z', 'ready')`,
+    ).run();
+    // One input-only call (priceable at the known input rate) and one with output (not).
+    await seedUsage('sess-partial', '2026-05-01T10:00:00Z', 'partial-model', { input: 1_000_000 });
+    await seedUsage('sess-partial', '2026-05-01T11:00:00Z', 'partial-model', { input: 500, output: 90 });
+  });
+
+  it('still prices the input-only call when the output rate is unpublished', async () => {
+    // Grouping the two shapes together put output tokens in the aggregate, so costOfUsage saw a
+    // missing output rate and threw away the input-only call's perfectly valid $10 too.
+    const body = await fetchUsage('group_by=model&machine=partialbox');
+    const row = body.rows.find((r) => r.bucket === 'partial-model');
+    expect(row!.cost_usd).toBeCloseTo(10, 6);
+    // The output-bearing call remains unpriced — it genuinely can't be costed.
+    expect(row!.unpriced_calls).toBe(1);
+  });
+});
+
 describe('cost_basis honesty', () => {
   it('does not claim batch pricing for a model with no batch tier', async () => {
     // The seeded claude-opus-5 rows have NULL batch rates, so batch=1 falls back to standard.

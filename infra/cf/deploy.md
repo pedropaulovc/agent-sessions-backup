@@ -54,6 +54,21 @@ selected environment's bindings. Without that job a branch preview runs new code
 old preview schema — PR #65 shipped migration 0016 and every `/api/v1/usage` request on its
 preview returned `no such table: model_prices` until the migration was applied by hand.
 
+That job needs its own repo secret, **`CLOUDFLARE_PREVIEW_API_TOKEN`**, scoped to **D1:Edit +
+Account Settings:Read and nothing else**. It must NOT be `CLOUDFLARE_API_TOKEN`, and the job
+deliberately has no fallback to it: `migrate-preview` runs on pull requests, so it executes
+PR-authored code, and for a same-repo PR GitHub runs the PR's own copy of the workflow — a PR
+can therefore print any secret the job is handed. The `deploy` token can edit production D1,
+Workers, queues, R2, KV and zone routes, so handing it to that job would put production one
+malicious (or compromised-dependency) PR away. Until the preview secret exists the job skips
+with a notice and previews stay unmigrated; that is the intended failure direction. The job
+also runs `npm ci --ignore-scripts` and asserts `env.preview`'s `database_id` matches the
+preview DB before migrating, which guards against a compromised dependency or a PR quietly
+repointing `wrangler.jsonc` at production — neither substitutes for the scoped token.
+
+It runs under the `preview` GitHub Environment, which is where to attach required reviewers if
+this repo ever accepts pull requests from people who should not hold that credential.
+
 ## Stable branch preview front door
 
 Cloudflare's automatic branch aliases remain the deployment targets produced by Workers
