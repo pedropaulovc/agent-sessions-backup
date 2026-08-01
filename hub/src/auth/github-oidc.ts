@@ -145,17 +145,27 @@ export async function verifyGitHubOidc(
 
   let jwks = await fetchJwks();
   let jwk = jwks?.find((k) => k.kid === header.kid);
+  let refreshThrottled = false;
   // An unknown kid is far more likely to be a key rotation the cache has not caught up with than a
   // forged token, and a forged one fails signature verification below anyway -- so pay for one
   // uncached fetch before rejecting. Without this, a valid run fails during every rotation window,
   // and since CI now treats any handler error as fatal, it fails RED rather than retrying.
-  if (!jwk && allowUncachedJwksFetch(Date.now())) {
-    jwks = await fetchJwks(true);
-    jwk = jwks?.find((k) => k.kid === header.kid);
+  if (!jwk) {
+    if (allowUncachedJwksFetch(Date.now())) {
+      jwks = await fetchJwks(true);
+      jwk = jwks?.find((k) => k.kid === header.kid);
+    } else {
+      refreshThrottled = true;
+    }
   }
   // Distinguish "GitHub is unreachable" from "this token is bad": the first is transient and the
   // caller should retry, the second never becomes valid. `retryable` is what CI keys off.
   if (!jwks) return { ok: false, reason: 'jwks_unavailable', retryable: true };
+  // An unknown kid whose refresh was THROTTLED is not evidence the key does not exist -- the
+  // lookup that would have found it never ran. A forged request consuming the allowance just
+  // before GitHub rotates would otherwise make a valid CI token fail permanently on its first
+  // 401, when the same token succeeds once the interval elapses.
+  if (!jwk && refreshThrottled) return { ok: false, reason: 'jwks_refresh_throttled', retryable: true };
   if (!jwk) return { ok: false, reason: 'unknown_kid' };
 
   const key = await crypto.subtle.importKey(

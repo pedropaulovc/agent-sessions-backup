@@ -41,6 +41,20 @@ import { verifyGitHubOidc } from '../auth/github-oidc';
  * from being replayed here. */
 export const MIGRATE_OIDC_AUDIENCE = 'sessions-hub-preview-migrate';
 
+/** Stamped on every response so CI can tell THIS handler's verdict from a stale branch version's.
+ *
+ * Workers Builds deploys independently of CI, so on an existing branch alias a request can reach
+ * the previously deployed Worker. Without this, a migration that depends on a contemporaneous
+ * handler change gets `unsupported_migration` from the OLD version and CI treats it as permanent —
+ * failing a run that the in-flight deploy would have fixed. Bump when a response's meaning changes.
+ */
+export const MIGRATE_HANDLER_VERSION = 1;
+
+/** Every response from this route, so the `handler` stamp cannot be forgotten on a new branch. */
+function migrateJson(body: Record<string, unknown>, status: number): Response {
+  return Response.json({ ...body, handler: MIGRATE_HANDLER_VERSION }, { status });
+}
+
 /** A row only the real preview database carries. Seeded out of band, once, by whoever holds the
  * production credential (see infra/cf/deploy.md) — deliberately NOT created by this endpoint or by
  * a migration, because anything a PR can cause to run could then mint the marker on the database
@@ -169,7 +183,13 @@ export function assertSplittable(name: string, sql: string): string | null {
   if (unterminated) {
     return `${name}: unterminated quote, identifier or block comment — refusing to guess where statements end`;
   }
-  if (/\bBEGIN\b/i.test(unquoted) || /\bCREATE\s+TRIGGER\b/i.test(unquoted)) {
+  // `BEGIN` only in STATEMENT-KEYWORD position. `CREATE TABLE ranges(begin TEXT)` is valid
+  // SQLite that wrangler applies fine, and rejecting the token wherever it appears turned an
+  // ordinary column name into a permanent 422 that blocks every migration in the same request.
+  // What actually defeats the splitter is a transaction or trigger BODY, and both announce
+  // themselves at the start of a statement (or as CREATE TRIGGER, whose body follows).
+  const startsATransaction = splitStatements(sql).some((stmt) => /^BEGIN\b/i.test(stmt.trim()));
+  if (startsATransaction || /\bCREATE\s+TRIGGER\b/i.test(unquoted)) {
     return `${name}: contains a trigger or BEGIN block, which this endpoint's statement splitter cannot handle safely`;
   }
   return null;
@@ -178,14 +198,14 @@ export function assertSplittable(name: string, sql: string): string | null {
 export async function migratePreview(request: Request, env: Env): Promise<Response> {
   // Preview only, and 404 rather than 403: on production this route does not exist. The check is
   // first so an unauthenticated prod request cannot even learn the endpoint is there.
-  if (env.ENVIRONMENT !== 'preview') return Response.json({ error: 'not_found' }, { status: 404 });
+  if (env.ENVIRONMENT !== 'preview') return migrateJson({ error: 'not_found' }, 404);
 
   const repo = env.MIGRATE_OIDC_REPOSITORY;
-  if (!repo) return Response.json({ error: 'migrate_not_configured' }, { status: 503 });
+  if (!repo) return migrateJson({ error: 'migrate_not_configured' }, 503);
 
   const auth = request.headers.get('authorization') ?? '';
   const token = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : '';
-  if (!token) return Response.json({ error: 'missing_oidc_token' }, { status: 401 });
+  if (!token) return migrateJson({ error: 'missing_oidc_token' }, 401);
 
   const verified = await verifyGitHubOidc(token, {
     expectedAudience: MIGRATE_OIDC_AUDIENCE,
@@ -197,15 +217,15 @@ export async function migratePreview(request: Request, env: Env): Promise<Respon
     // which now treats every handler error as fatal -- fail a perfectly valid run red instead of
     // using its retry window. 503 + retryable is the signal it keys off.
     if (verified.retryable) {
-      return Response.json({ error: 'oidc_unavailable', reason: verified.reason, retryable: true }, { status: 503 });
+      return migrateJson({ error: 'oidc_unavailable', reason: verified.reason, retryable: true }, 503);
     }
-    return Response.json({ error: 'oidc_rejected', reason: verified.reason }, { status: 401 });
+    return migrateJson({ error: 'oidc_rejected', reason: verified.reason }, 401);
   }
 
   const body = (await request.json().catch(() => null)) as { migrations?: MigrationInput[] } | null;
   const migrations = body?.migrations;
   if (!Array.isArray(migrations) || migrations.some((m) => typeof m?.name !== 'string' || typeof m?.sql !== 'string')) {
-    return Response.json({ error: 'bad_body' }, { status: 400 });
+    return migrateJson({ error: 'bad_body' }, 400);
   }
 
   // Only now touch D1. This route has no mTLS and its workers.dev preview alias is publicly
@@ -215,12 +235,12 @@ export async function migratePreview(request: Request, env: Env): Promise<Respon
   // on every path that writes, which is all it was ever protecting.
   if (!(await assertPreviewDatabase(env))) {
     console.log(JSON.stringify({ event: 'hub.migrate.rejected', reason: 'not_preview_database' }));
-    return Response.json(
+    return migrateJson(
       {
         error: 'not_preview_database',
         detail: `the bound DB has no ${PREVIEW_MARKER_TABLE} row for '${PREVIEW_MARKER_VALUE}' — refusing to migrate a database that cannot prove it is the preview one`,
       },
-      { status: 409 },
+      409,
     );
   }
 
@@ -228,7 +248,7 @@ export async function migratePreview(request: Request, env: Env): Promise<Respon
   // database in a state no migration file describes.
   for (const m of migrations) {
     const problem = assertSplittable(m.name, m.sql);
-    if (problem) return Response.json({ error: 'unsupported_migration', detail: problem }, { status: 422 });
+    if (problem) return migrateJson({ error: 'unsupported_migration', detail: problem }, 422);
   }
 
   await env.DB.prepare(MIGRATIONS_TABLE).run();
@@ -284,7 +304,7 @@ export async function migratePreview(request: Request, env: Env): Promise<Respon
         continue;
       }
       console.log(JSON.stringify({ event: 'hub.migrate.failed', migration: m.name, detail, applied }));
-      return Response.json({ error: 'migration_failed', migration: m.name, detail, applied }, { status: 500 });
+      return migrateJson({ error: 'migration_failed', migration: m.name, detail, applied }, 500);
     }
     applied.push(m.name);
   }
@@ -299,5 +319,5 @@ export async function migratePreview(request: Request, env: Env): Promise<Respon
       skipped,
     }),
   );
-  return Response.json({ applied, skipped });
+  return migrateJson({ applied, skipped }, 200);
 }

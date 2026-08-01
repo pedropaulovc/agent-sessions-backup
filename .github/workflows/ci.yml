@@ -154,6 +154,15 @@ jobs:
               -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
               "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sessions-hub-preview-migrate" | jq -r .value
           }
+          # The handler version this checkout expects. A response carrying anything else came from
+          # a Worker version that predates this PR, so its verdict is about different code.
+          EXPECTED_HANDLER=$(node -e '
+            const src = require("fs").readFileSync("src/api/migrate.ts", "utf8");
+            const m = /MIGRATE_HANDLER_VERSION\s*=\s*(\d+)/.exec(src);
+            if (!m) { console.error("MIGRATE_HANDLER_VERSION not found"); process.exit(1); }
+            process.stdout.write(m[1]);
+          ')
+          echo "expecting migrate handler v$EXPECTED_HANDLER"
           python3 -c "
           import json, pathlib
           files = sorted(pathlib.Path('hub/migrations').glob('*.sql'))
@@ -173,8 +182,13 @@ jobs:
           for attempt in 1 2 3 4 5; do
             oidc=$(mint_oidc)
             if [ -z "$oidc" ] || [ "$oidc" = "null" ]; then
-              echo "::error::could not mint a GitHub OIDC token (is id-token: write set?)"
-              exit 1
+              # Transient too: a connection error, timeout, 5xx or non-JSON from GitHub's token
+              # service yields an empty value, and exiting here turned a brief outage into a red
+              # check even though the next attempt would have succeeded. Advance the loop instead;
+              # if every attempt fails to mint, the loop falls through to the notice below.
+              echo "attempt $attempt: could not mint an OIDC token (transient, or id-token: write unset)"
+              sleep 15
+              continue
             fi
             code=$(curl -sS --connect-timeout 10 --max-time 120 \
               -o /tmp/migrate-out.json -w '%{http_code}' \
@@ -204,10 +218,21 @@ jobs:
             #
             # This does mean a genuinely broken OIDC setup retries five times before failing, which
             # is the right trade: it still fails, just later.
-            if [ -n "$body" ] && printf '%s' "$body" \
-              | jq -e 'has("error") and (.retryable // false | not) and (.error != "unauthorized")' >/dev/null 2>&1; then
+            # Only fatal when the CURRENT handler answered. Every response from this endpoint
+            # carries `handler` (MIGRATE_HANDLER_VERSION in hub/src/api/migrate.ts); a stale branch
+            # version answers with an older value or none at all. Without that check a migration
+            # that depends on a contemporaneous handler change gets `unsupported_migration` or
+            # `migration_failed` from the OLD version and fails immediately, when the deploy it is
+            # racing would have fixed it — the same class as the `unauthorized` case below, which
+            # is the parent router answering because the route does not exist yet.
+            handler=$(printf '%s' "$body" | jq -r '.handler // empty' 2>/dev/null || true)
+            if [ -n "$body" ] && [ "$handler" = "$EXPECTED_HANDLER" ] && printf '%s' "$body" \
+              | jq -e 'has("error") and (.retryable // false | not)' >/dev/null 2>&1; then
               echo "::error::preview migration rejected at $TARGET with HTTP $code: $body"
               exit 1
+            fi
+            if [ -n "$body" ] && [ -n "$handler" ] && [ "$handler" != "$EXPECTED_HANDLER" ]; then
+              echo "attempt $attempt: stale handler v$handler (expected v$EXPECTED_HANDLER) — deploy still in flight"
             fi
             echo "attempt $attempt: HTTP $code (no handler response — treating as transient) $body"
             sleep 15
@@ -241,19 +266,23 @@ jobs:
       - run: npx wrangler d1 migrations apply sessions-index --remote
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      # The preview D1 too, and from HERE rather than from migrate-preview. That job only runs for
+      - run: npx wrangler deploy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # The preview D1, and from HERE rather than from migrate-preview. That job only runs for
       # same-repo pull requests, but `sessions-hub-preview` has `main` as its production branch —
       # so a direct push to main (which is unprotected) or a merged FORK PR deploys new preview
       # code with no migration behind it, leaving the shared preview database on the old schema
-      # until some unrelated PR happens to migrate it. The production `deploy` step below only
-      # covers `sessions-index`.
+      # until some unrelated PR happens to migrate it. The `deploy` step above covers only
+      # `sessions-index`.
       #
-      # This runs on the trusted path with the credential that already exists, so it needs no OIDC
-      # and adds no PR-reachable surface — closing the gap without widening migrate-preview's
-      # trigger to pushes, where there is no pull_request head ref to derive a preview URL from.
+      # LAST, deliberately, and this ordering is the whole point. The shared preview database
+      # carries schema from unmerged branches, so a preview migration can conflict with a main
+      # migration through no fault of this release. Running it before `wrangler deploy` would let
+      # preview-only contamination abort the job with production already migrated but still
+      # running the OLD Worker — new schema, old code, which is the exact failure this job exists
+      # to prevent. Placed after the deploy, production is always left consistent and a failure
+      # here means only "preview needs attention", while still being visible as a red check.
       - run: npx wrangler d1 migrations apply DB --env preview --remote
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      - run: npx wrangler deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

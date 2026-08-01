@@ -2,6 +2,7 @@ import { env, SELF } from 'cloudflare:test';
 import { resetJwksThrottleForTests } from '../src/auth/github-oidc';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  MIGRATE_HANDLER_VERSION,
   assertSplittable,
   splitStatements,
   MIGRATE_OIDC_AUDIENCE,
@@ -321,9 +322,22 @@ describe('statement splitting', () => {
   });
 
   it('does not fuse tokens across a stripped quoted run', () => {
-    // Quoted runs collapse to a space, not to nothing — otherwise `a'x'BEGIN` would read as one
-    // word and could mask a real BEGIN, or invent one.
-    expect(assertSplittable('m', "SELECT 'a' BEGIN;")).toContain('trigger');
+    // Quoted runs collapse to a space, not to nothing. Collapsing to nothing would INVENT
+    // keywords: `CREATE TRIG'x'GER` would read as `CREATE TRIGGER` and reject a valid migration.
+    expect(assertSplittable('m', "CREATE TABLE t (a TEXT DEFAULT 'TRIG' , b TEXT);")).toBe(null);
+    expect(assertSplittable('m', "SELECT 'a' AS begin_col;")).toBe(null);
+    // A real trigger is still caught.
+    expect(assertSplittable('m', 'CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;')).toContain('trigger');
+  });
+
+  it('accepts BEGIN as an ordinary identifier', () => {
+    // `CREATE TABLE ranges(begin TEXT)` is valid SQLite that wrangler applies. Rejecting the token
+    // wherever it appeared turned an ordinary column name into a permanent 422 that blocks every
+    // other migration in the same request.
+    expect(assertSplittable('m', 'CREATE TABLE ranges (begin TEXT, end TEXT);')).toBe(null);
+    expect(assertSplittable('m', 'SELECT begin FROM ranges;')).toBe(null);
+    // But a real transaction block is still refused — its inner semicolons are real terminators.
+    expect(assertSplittable('m', 'BEGIN; CREATE TABLE a(x INT); COMMIT;')).toContain('trigger');
   });
 
   it('rejects an unterminated block comment instead of scanning its body as SQL', () => {
@@ -506,9 +520,55 @@ describe('bound-database check', () => {
         typ: 'JWT',
       });
       const res = await post(token, [{ name: '9999_probe', sql: 'SELECT 1;' }]);
-      expect(res.status).toBe(401);
+      // First forged kid consumes the allowance and gets a genuine unknown_kid 401; the rest are
+      // THROTTLED, which is reported retryable (503) because the lookup that would have found the
+      // key never ran — see the throttled-kid test below.
+      expect([401, 503]).toContain(res.status);
     }
     // 5 unknown kids: each does one CACHED lookup, but at most one may bypass the cache.
     expect(fetches, 'every forged kid forced an uncached GitHub fetch').toBeLessThanOrEqual(6);
+  });
+
+  it('reports a THROTTLED unknown kid as retryable, not as a bad token', async () => {
+    // A forged request consuming the one-minute allowance just before GitHub rotates would
+    // otherwise make a valid CI token fail permanently on its first 401 — the refresh that would
+    // have found the key never ran, so "unknown kid" is not evidence the key does not exist.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        if (!url.includes('token.actions.githubusercontent.com')) return new Response('nf', { status: 404 });
+        return new Response(JSON.stringify({ keys: [{ kty: 'RSA', kid: 'stale-key', n: 'AQAB', e: 'AQAB' }] }), {
+          status: 200,
+        });
+      }),
+    );
+    const mk = (kid: string) => signJwt(keys.pair.privateKey, goodClaims(), { alg: 'RS256', kid, typ: 'JWT' });
+    // Burn the allowance.
+    const first = await post(await mk('attacker-kid'), [{ name: '9999_a', sql: 'SELECT 1;' }]);
+    expect(first.status, 'the first request should have consumed the refresh allowance').toBe(401);
+    // Now the legitimate rotated key arrives and cannot trigger a refresh.
+    const second = await post(await mk('rotated-key'), [{ name: '9999_b', sql: 'SELECT 1;' }]);
+    expect(second.status).toBe(503);
+    const body = await second.json<{ reason: string; retryable: boolean }>();
+    expect(body.reason).toBe('jwks_refresh_throttled');
+    expect(body.retryable).toBe(true);
+  });
+
+  it('stamps the handler version on every response, success and failure', async () => {
+    // CI uses this to tell THIS handler's verdict from a stale branch version's. A response
+    // missing it would be classified as stale forever and the job would never fail on a real
+    // rejection — so the stamp has to be on every path, not just the happy one.
+    const token = await signJwt(keys.pair.privateKey, goodClaims());
+    const ok = await post(token, [{ name: '9999_stamp', sql: 'CREATE TABLE migrate_probe (a INT);' }]);
+    expect((await ok.json<{ handler: number }>()).handler).toBe(MIGRATE_HANDLER_VERSION);
+
+    const rejected = await post('not-a-jwt', [{ name: '9999_x', sql: 'SELECT 1;' }]);
+    expect(rejected.status).toBe(401);
+    expect((await rejected.json<{ handler: number }>()).handler).toBe(MIGRATE_HANDLER_VERSION);
+
+    const unsupported = await post(token, [{ name: '9999_y', sql: 'CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;' }]);
+    expect(unsupported.status).toBe(422);
+    expect((await unsupported.json<{ handler: number }>()).handler).toBe(MIGRATE_HANDLER_VERSION);
   });
 });
