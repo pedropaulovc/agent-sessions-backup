@@ -358,6 +358,27 @@ describe('unknown cache accounting', () => {
   });
 });
 
+describe('rates that overflow when costed', () => {
+  it('reports a row whose cost overflows to Infinity as unpriced, not as priced-with-null', () => {
+    // A finite rate that survives ingest can still overflow once it meets a token count:
+    // perM(1e300) is 1e306, which SQLite stores, and 1000 tokens of it is Infinity. JSON.stringify
+    // turns that into `cost_usd: null` while the row stays PRICED and out of unpriced_calls -- a
+    // missing dollar figure claiming full coverage, which is exactly what unpriced_calls exists
+    // to rule out.
+    const huge: ModelPrice = { ...LUNA, input_cost: 1e306 };
+    const c = costOfUsage({ model: 'gpt-5.6-luna', input_tokens: 1000 }, huge);
+    expect(c.unpriced, 'an overflowed cost was reported as priced').toBe(true);
+    expect(JSON.parse(JSON.stringify({ usd: c.usd })).usd, 'the reported cost serialised to null').toBe(0);
+  });
+
+  it('leaves a large but representable cost alone', () => {
+    const big: ModelPrice = { ...LUNA, input_cost: 1e6 };
+    const c = costOfUsage({ model: 'gpt-5.6-luna', input_tokens: 1000 }, big);
+    expect(c.unpriced).toBe(false);
+    expect(c.usd).toBeCloseTo(1000, 6);
+  });
+});
+
 describe('subset cache-read clamp', () => {
   it('never bills more cached tokens than the row reports as input', () => {
     // Under subset accounting cached tokens are BY DEFINITION part of input_tokens. The

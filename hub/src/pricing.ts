@@ -234,6 +234,14 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
           ? 'standard'
           : 'none';
 
+  // A finite rate can still overflow once it meets a token count: perM(1e300) is 1e306, which
+  // SQLite stores happily, and 1000 tokens of it is Infinity. `Response.json` serialises that as
+  // `cost_usd: null` while the row stays marked PRICED and absent from unpriced_calls -- a
+  // missing dollar figure that claims full coverage, which is the one thing unpriced_calls exists
+  // to rule out. Bounding the rate at ingest cannot close this on its own (the threshold depends
+  // on the token count), so the computed cost is checked where it is actually produced.
+  if (!Number.isFinite(usd)) return unpriced;
+
   // Only the classes this row HAS, so an unused rate moving cannot make two snapshots differ.
   // `cache_accounting` is included only when there ARE raw cache reads: it decides whether they
   // are billed on top of input or subtracted from it, which changes the token counts and therefore
