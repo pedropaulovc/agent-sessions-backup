@@ -106,6 +106,17 @@ jobs:
     # `needs: hub` only orders jobs WITHIN one run, and the preview D1 is shared by every branch —
     # so two PRs opened around the same time can apply migrations to the same database
     # concurrently. A repo-wide group (not per-PR) makes them queue instead of race.
+    #
+    # KNOWN LIMIT, deliberately accepted: GitHub keeps at most ONE pending run per group. A third
+    # overlapping run displaces the second, and the displaced one is CANCELLED, not queued behind
+    # it. So with three PRs landing at once, one PR's migrations may not reach the preview
+    # database on that push. That is tolerable here and a real queue is not worth building for it:
+    # the outcome is a visibly cancelled check rather than a silent skip, the endpoint is
+    # idempotent so that PR's next push applies the same set, and `migrate-preview-main` re-applies
+    # everything once the branch merges. What the group DOES buy is the thing that actually
+    # corrupts state — two runs writing the shared database at the same time, where the endpoint's
+    # atomic name claim can order two runs applying the same migration but not two applying
+    # different, dependent ones.
     concurrency:
       group: migrate-preview
       cancel-in-progress: false

@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runModelPriceSync } from '../src/cron/model-prices';
-import { perM } from '../src/upstream-catalog.mjs';
+import { cacheAccountingFor, perM } from '../src/upstream-catalog.mjs';
 
 /** The unattended refresh path. Without these, "prices stay current" rests on a cron trigger
  * nobody ever exercised — and a silently stale price table produces confident, wrong dollars.
@@ -258,6 +258,39 @@ describe('model price autorefresh', () => {
     // never hands it one, so that is what this asserts.
     expect(perM(Number.MAX_VALUE), 'a rate that overflows when scaled reached sqlNum').toBe(null);
     expect(perM(Number.MAX_VALUE / 2e6), 'a large but representable rate was dropped').toBeGreaterThan(0);
+  });
+
+  it('reports a model whose catalog value is not an object as unresolved', async () => {
+    // `{"claude-opus-5": "deprecated"}` -- a truthy non-object. The candidate search picked it on
+    // truthiness, so the model was stored fully unpriced under a real litellm_key and NEVER
+    // appeared in `unresolved`. The dollars stayed right (costOfUsage reports it unpriced); what
+    // was lost is the one signal telling an operator that resolution had failed.
+    mockUpstream({ 'claude-opus-5': 'deprecated' });
+    await runModelPriceSync(testEnv);
+
+    const sync = (
+      await testEnv.DB.prepare('SELECT unresolved FROM model_prices_sync ORDER BY id DESC LIMIT 1').all<{
+        unresolved: string | null;
+      }>()
+    ).results[0]!;
+    expect(sync.unresolved ?? '', 'a non-object entry resolved as a price entry').toContain('claude-opus-5');
+    expect(await pricesFor('claude-opus-5'), 'a non-object entry produced a price row').toHaveLength(0);
+  });
+
+  it('treats a prototype-key provider as unknown accounting rather than a function', async () => {
+    // `litellm_provider: "constructor"` is a perfectly good string, so providerOf passes it, and a
+    // bare index read returns Object's constructor FUNCTION -- which `?? 'unknown'` does not catch
+    // because a function is not nullish. That function then goes into a STRICT TEXT column with a
+    // CHECK constraint on it.
+    expect(cacheAccountingFor('constructor')).toBe('unknown');
+    expect(cacheAccountingFor('toString')).toBe('unknown');
+    expect(cacheAccountingFor('anthropic'), 'a real provider stopped resolving').toBe('disjoint');
+
+    mockUpstream({ 'claude-opus-5': entry({ litellm_provider: 'constructor' }) });
+    await runModelPriceSync(testEnv);
+    // The row has to be WRITTEN, with a legal value -- a thrown batch would take every other
+    // model's price down with it.
+    expect((await pricesFor('claude-opus-5'))[0]!.cache_accounting).toBe('unknown');
   });
 
   it('rejects a negative rate instead of storing a cost that cancels real spend', async () => {

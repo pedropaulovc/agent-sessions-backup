@@ -103,7 +103,14 @@ export function undatedModel(model) {
  * reachable input, not a theoretical one.
  */
 export function lookupEntry(catalog, key) {
-  return Object.prototype.hasOwnProperty.call(catalog, key) ? catalog[key] : undefined;
+  if (!Object.prototype.hasOwnProperty.call(catalog, key)) return undefined;
+  const entry = catalog[key];
+  // Must be an OBJECT, not merely truthy. Both callers pick a candidate key on truthiness, so
+  // `{"some-model": "deprecated"}` resolved as a price entry: every perM read is null, the row is
+  // stored fully unpriced with a real litellm_key, and the model never appears in `unresolved`.
+  // The dollars stay right (costOfUsage reports it unpriced) but the audit signal is lost, which
+  // is the one thing telling an operator that resolution failed.
+  return entry !== null && typeof entry === 'object' ? entry : undefined;
 }
 
 const PROVIDER_PREFIXES = ['anthropic', 'openai', 'deepseek'];
@@ -142,5 +149,14 @@ export function providerOf(entry) {
 }
 
 export function cacheAccountingFor(provider) {
-  return CACHE_ACCOUNTING_BY_PROVIDER[provider ?? ''] ?? 'unknown';
+  // Own-property lookup, same reason as `lookupEntry`. `litellm_provider: "constructor"` is a
+  // perfectly good string, so `providerOf` passes it through, and a bare index read then returns
+  // Object's constructor FUNCTION -- which `?? 'unknown'` does not catch, because it is not
+  // nullish. The cron binds that function into a STRICT TEXT column and the manual script
+  // serialises it into SQL that violates the CHECK constraint. Provider strings come from a
+  // community JSON blob, so this is reachable input.
+  const key = provider ?? '';
+  return Object.prototype.hasOwnProperty.call(CACHE_ACCOUNTING_BY_PROVIDER, key)
+    ? CACHE_ACCOUNTING_BY_PROVIDER[key]
+    : 'unknown';
 }
