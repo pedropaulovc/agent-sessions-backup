@@ -31,8 +31,11 @@ const PER_MILLION = 1_000_000;
 /** Upstream stores dollars per token; the table stores dollars per million tokens. */
 // Round after scaling: 2e-8 * 1e6 lands on 0.019999999999999998 in binary float, which is
 // numerically irrelevant but makes the stored table look untrustworthy.
+// Mirrors hub/src/cron/model-prices.ts. Negative is rejected as well as non-finite: a negative
+// rate stores fine and prices a row as fully PRICED, producing negative cost_usd that cancels
+// legitimate spend in an aggregate. Zero is legitimate (free models).
 const perM = (v) =>
-  typeof v === 'number' && Number.isFinite(v) ? Number((v * PER_MILLION).toPrecision(12)) : null;
+  typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Number((v * PER_MILLION).toPrecision(12)) : null;
 
 const sqlStr = (v) => (v == null ? 'NULL' : `'${String(v).replaceAll("'", "''")}'`);
 
