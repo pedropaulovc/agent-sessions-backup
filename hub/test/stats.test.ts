@@ -127,12 +127,14 @@ describe('ledger', () => {
     expect(s.ledger.calls).toBe(1);
   });
 
-  it('excludes prompt-log from the panels that do NOT join sessions, too', async () => {
-    // Two different exclusion paths, and this is the one the ledger test cannot reach. The main
-    // scan joins `sessions` and excludes by harness; rhythm and the gap histogram skip that join
-    // (it costs a lookup per usage row for the sake of 7 sessions out of 31k) and exclude by
-    // session id instead. A regression in the id path would leave a synthetic row spanning months
-    // sitting in the middle of the heatmap while every dollar figure looked right.
+  it('excludes prompt-log from the narrow panels, not just the ledger', async () => {
+    // There are two exclusion paths. With no session filter set — this page — NOTHING joins
+    // `sessions` (the join costs a lookup per usage row for the sake of 7 sessions out of 31k), so
+    // every panel excludes by bound session id; the harness-filter test below is what covers the
+    // join path. The ledger reaches its numbers through the main scan, so it cannot tell you
+    // whether rhythm and the gap histogram — separate queries, same predicate — also got it right.
+    // A regression there would leave a synthetic row spanning months sitting in the middle of the
+    // heatmap while every dollar figure looked right.
     await seedSession('real');
     await seedSession('plog', { harness: 'prompt-log' });
     await seedTurn('real', '2026-07-20T10:00:00.000Z', { input: 1 });
@@ -141,6 +143,26 @@ describe('ledger', () => {
     const s = await collectStats(testEnv.DB, BASE, NOW);
     expect(s.rhythm.reduce((a, c) => a + c.calls, 0), 'prompt-log turns reached the heatmap').toBe(1);
     expect(s.rhythm[0]!.hour, 'the surviving turn is not the real one').toBe(10);
+  });
+
+  it('still excludes prompt-log once the id list outgrows the bind budget', async () => {
+    // D1 caps a statement at 100 bound parameters, and the excluded-id list is data-derived — it
+    // grows with the corpus, not with anything we control. Past the budget `filters` swaps the
+    // bound `NOT IN` for a parameter-free `NOT EXISTS`; without that arm every panel on the page
+    // would start failing outright the day someone's 81st prompt-log session landed. 81 forces it.
+    await seedSession('real');
+    await seedTurn('real', '2026-07-20T10:00:00.000Z', { input: 1_000_000 });
+    for (let i = 0; i < 81; i++) {
+      await seedSession(`plog-${i}`, { harness: 'prompt-log' });
+      await seedTurn(`plog-${i}`, '2026-07-21T03:00:00.000Z', { input: 500_000_000 });
+    }
+
+    const s = await collectStats(testEnv.DB, BASE, NOW);
+    expect(s.ledger.usd, 'prompt-log usage reached the ledger').toBeCloseTo(1, 6);
+    expect(s.ledger.calls, 'the main scan let prompt-log through').toBe(1);
+    // The narrow panels are separate queries running the same predicate, and they are the ones
+    // that would have thrown on the bind cap rather than merely miscounting.
+    expect(s.rhythm.reduce((a, c) => a + c.calls, 0), 'prompt-log turns reached the heatmap').toBe(1);
   });
 
   it('reports the cache share of spend, not of tokens', async () => {

@@ -73,6 +73,12 @@ export interface StatsQuery {
  * page rather than from each panel. */
 const EXCLUDED_HARNESS = 'prompt-log';
 
+/** How many excluded session ids may be bound before `filters` switches to the parameter-free
+ * predicate. D1 caps a statement at 100 bound parameters; the window bounds and the four column
+ * filters claim at most 6 of them, and the rest of the margin is there so the ceiling is a
+ * deliberate choice rather than a cliff one more filter would push us over. */
+const MAX_EXCLUDED_BINDS = 80;
+
 interface Filters {
   where: string;
   binds: unknown[];
@@ -119,6 +125,14 @@ function filters(
 
   if (needsSession) {
     terms.push(`COALESCE(s.harness, '') != '${EXCLUDED_HARNESS}'`);
+  } else if (opts.excludedIds.length > MAX_EXCLUDED_BINDS) {
+    // The id list is data-derived, so it is not bounded by anything we control. Past the bind
+    // budget the whole page would start 500ing, so fall back to a predicate that costs no binds
+    // at all. Correlated, hence the lookup per usage row the id list exists to avoid — but a slow
+    // page beats a broken one, and this arm is unreachable until prompt-log sessions 15x.
+    // Deliberately NOT `needsSession`: an inner join would also drop usage rows whose session was
+    // deleted, which are real spend and belong in the totals.
+    terms.push(`NOT EXISTS (SELECT 1 FROM sessions x WHERE x.session_id = u.session_id AND x.harness = '${EXCLUDED_HARNESS}')`);
   } else if (opts.excludedIds.length) {
     // The join's only remaining job on an unfiltered page. Bound, not interpolated, and the id
     // set is resolved once from a 3ms scan of `sessions` — there are 7 of them.
@@ -153,20 +167,6 @@ function filters(
     needsSession,
     hint: window.from || window.to ? 'INDEXED BY usage_ts' : '',
   };
-}
-
-/** The sessions whose usage must never appear on this page, resolved once.
- *
- * `prompt-log` is a synthetic harness: a single row spans months, so it wins any ranking it is
- * allowed into while describing no session anyone worked in. There are 7 of them against 31k
- * sessions, which is why passing the ids beats joining 300k usage rows to find them.
- */
-async function excludedSessionIds(db: D1Database): Promise<string[]> {
-  const rows = await db
-    .prepare(`SELECT session_id FROM sessions WHERE harness = ?1`)
-    .bind(EXCLUDED_HARNESS)
-    .all<{ session_id: string }>();
-  return (rows.results ?? []).map((r) => r.session_id);
 }
 
 export interface SessionMeta {
@@ -239,22 +239,26 @@ function emptyGroup(key: string | null): PricedGroup {
   };
 }
 
-interface KeyedAggRow extends UsageAggRow {
-  key: string | null;
-}
-
-/** Fold priced (key, model, epoch, shape) rows into one entry per key.
+/** Fold priced (model, epoch, shape) rows into one entry per key.
+ *
+ * The key comes from a selector rather than a `key` field on the row: the same scan is folded four
+ * different ways, and materialising a keyed copy of it per fold would be four extra copies of a
+ * 32k-row array on a fixed Worker memory ceiling, to carry one string each.
  *
  * Pricing happens per ROW here, not per key, because each row is one (model, epoch, shape) — the
  * unit `costOfUsage` is defined on. Summing tokens across models first and pricing once would
  * charge every model at whichever rate happened to be picked.
  */
-function foldByKey(rows: KeyedAggRow[], prices: Map<string, ModelPrice[]>): Map<string | null, PricedGroup> {
+function foldByKey<T extends UsageAggRow>(
+  rows: T[],
+  prices: Map<string, ModelPrice[]>,
+  keyOf: (row: T) => string | null,
+): Map<string | null, PricedGroup> {
   const out = new Map<string | null, PricedGroup>();
   for (const r of rows) {
     // Keyed by VALUE, not String(key): a NULL key and a key whose literal text is "null" both
     // stringify the same and would merge two different populations into one row.
-    const key = (r.key ?? null) as string | null;
+    const key = keyOf(r) ?? null;
     const g = out.get(key) ?? emptyGroup(key);
     const modelClass = classifyModel(r.model);
     const price = modelClass === 'billable' ? priceForGroup(prices.get(r.model as string) ?? [], String(r.epoch), r, false) : null;
@@ -323,15 +327,15 @@ interface MainRow extends UsageAggRow {
 async function windowTotal(db: D1Database, prices: Map<string, ModelPrice[]>, f: Filters): Promise<number> {
   const rows = await db
     .prepare(
-      `SELECT u.model AS key, u.model AS model, ${priceEpochExpr(prices)} AS epoch,
+      `SELECT u.model AS model, ${priceEpochExpr(prices)} AS epoch,
               ${USAGE_SHAPE_SELECT}, ${USAGE_TOKEN_SUMS}
        ${usageFrom(f)}
        ${f.where}
        GROUP BY u.model, epoch, ${USAGE_SHAPE_GROUP_BY}`,
     )
     .bind(...f.binds)
-    .all<KeyedAggRow>();
-  return totalOf(foldByKey(rows.results ?? [], prices)).usd;
+    .all<UsageAggRow>();
+  return totalOf(foldByKey(rows.results ?? [], prices, (r) => r.model ?? null)).usd;
 }
 
 function totalOf(groups: Map<string | null, PricedGroup>): PricedGroup {
@@ -378,8 +382,12 @@ export interface ClassRow {
 
 export interface DepthRow {
   label: string;
-  /** Mean dollars per call in this depth band. Mean, not median: SQLite has no median and the
-   * per-call rows are already aggregated by the time pricing runs. Labelled as a mean in the UI. */
+  /** Mean dollars per call in this depth band. Mean, not median, because the per-call rows are
+   * already summed into (session, model, epoch, band, shape) groups by the time pricing runs —
+   * there is no per-call distribution left to take a median of. (Not for lack of the function:
+   * upstream SQLite ships median()/percentile() via ext/misc/percentile.c, but D1's build does
+   * not expose them — `SELECT median(x)` there fails with `no such function: median`.)
+   * Labelled as a mean in the UI. */
   usdPerCall: number;
   calls: number;
   sessions: number;
@@ -460,6 +468,11 @@ const FIVE_MIN_S = 300;
 export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Promise<Stats> {
   const w = windows(q.range, now);
   const [prices, meta] = await Promise.all([loadPrices(db), sessionMeta(db)]);
+  // The sessions whose usage must never appear on this page. `prompt-log` is a synthetic harness:
+  // a single row spans months, so it wins any ranking it is allowed into while describing no
+  // session anyone worked in. There are 7 of them against 31k sessions — which is why passing the
+  // ids beats joining 300k usage rows to find them — and `meta` is already loaded, so this costs
+  // no query of its own.
   const excludedIds = [...meta].filter(([, m]) => m.harness === EXCLUDED_HARNESS).map(([id]) => id);
 
   // The main scan never joins: it is grouped by session_id, so session-column filters are applied
@@ -488,10 +501,10 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
     // it under an unfiltered view is correct — its tokens were still burned.
     .filter((r) => matchesSessionFilters(r.meta, q));
 
-  const byModel = foldByKey(rows.map((r) => ({ ...r, key: r.model ?? null })), prices);
-  const byBand = foldByKey(rows.map((r) => ({ ...r, key: r.band ?? null })), prices);
-  const bySession = foldByKey(rows.map((r) => ({ ...r, key: r.session_id })), prices);
-  const byAttr = foldByKey(rows.map((r) => ({ ...r, key: attributionKey(r, q.by) })), prices);
+  const byModel = foldByKey(rows, prices, (r) => r.model ?? null);
+  const byBand = foldByKey(rows, prices, (r) => r.band ?? null);
+  const bySession = foldByKey(rows, prices, (r) => r.session_id);
+  const byAttr = foldByKey(rows, prices, (r) => attributionKey(r, q.by));
   const total = totalOf(byModel);
 
   // Distinct sessions per model and per depth band, counted over the same rows the dollars came

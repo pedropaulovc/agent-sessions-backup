@@ -176,8 +176,8 @@ function depthPanel(s: Stats): string {
       'that depth — without them you would over-react to a tail containing four sessions.',
     `<table class="chart"><thead><tr><th>Depth</th><th>Mean $ / turn</th><th></th>` +
       `<th>Sessions reaching it</th><th></th></tr></thead><tbody>${rows}</tbody></table>` +
-      `<p class="small muted">Mean, not median — SQLite has no median aggregate and the rows are already grouped by ` +
-      `the time pricing runs. A single very deep session can therefore move a band.</p>`,
+      `<p class="small muted">Mean, not median — the rows are already grouped by the time pricing runs, so there is ` +
+      `no per-turn distribution left to take a median of. A single very deep session can therefore move a band.</p>`,
   );
 }
 
