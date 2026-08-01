@@ -358,6 +358,40 @@ describe('unknown cache accounting', () => {
   });
 });
 
+describe('per-class breakdown', () => {
+  // The breakdown exists so the statistics page never re-selects rates for itself. If it can
+  // drift from `usd`, it is worse than useless -- the page would show five numbers that do not
+  // add up to the total printed above them.
+  const CASES: Array<[string, Parameters<typeof costOfUsage>[0], ModelPrice, boolean]> = [
+    ['disjoint, every class', { model: 'claude-opus-5', input_tokens: 100_000, output_tokens: 10_000,
+      cache_read_tokens: 90_000, cache_creation_5m_tokens: 5_000, cache_creation_1h_tokens: 2_000 }, OPUS, false],
+    ['subset, cache exceeds input', { model: 'gpt-5.6-luna', input_tokens: 500, cache_read_tokens: 9_000 }, LUNA, false],
+    ['batch tier', { model: 'gpt-5.6-luna', input_tokens: 1_000_000, output_tokens: 1_000_000 }, LUNA, true],
+    ['output only', { model: 'claude-opus-5', output_tokens: 1_000_000 }, OPUS, false],
+  ];
+
+  it.each(CASES)('sums to usd exactly: %s', (_name, u, price, batch) => {
+    const c = costOfUsage(u, price, { batch });
+    const sum = c.byClass.input + c.byClass.output + c.byClass.cacheRead + c.byClass.cacheWrite5m + c.byClass.cacheWrite1h;
+    expect(sum, 'the per-class breakdown does not add up to the total').toBeCloseTo(c.usd, 12);
+  });
+
+  it('attributes the cache-read charge at the READ rate, not the input rate', () => {
+    // The specific thing a caller re-deriving this would get wrong: under subset accounting the
+    // cache term is billed on MIN(cache_read, input) and at cache_read_cost -- not on the raw
+    // counter, and not at whichever input rate the batch flag selected.
+    const c = costOfUsage({ model: 'gpt-5.6-luna', input_tokens: 500, cache_read_tokens: 9_000 }, LUNA, { batch: true });
+    expect(c.byClass.cacheRead).toBeCloseTo((500 * 0.02) / 1_000_000, 12);
+    expect(c.byClass.input).toBe(0);
+  });
+
+  it('reports every class as zero on an unpriced row', () => {
+    const c = costOfUsage({ model: 'nope', input_tokens: 1_000_000 }, null);
+    expect(c.unpriced).toBe(true);
+    expect(Object.values(c.byClass)).toEqual([0, 0, 0, 0, 0]);
+  });
+});
+
 describe('rates that overflow when costed', () => {
   it('reports a row whose cost overflows to Infinity as unpriced, not as priced-with-null', () => {
     // A finite rate that survives ingest can still overflow once it meets a token count:

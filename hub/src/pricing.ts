@@ -58,7 +58,25 @@ export interface Cost {
    * rates of 1/3 against new rates of 3/1 total the same when summed input equals summed output),
    * so an aggregate match can hide two genuinely different rate schedules. */
   rateSignature: string;
+  /** `usd` split across the five billing classes. Sums to `usd` exactly (same terms, same order).
+   *
+   * Here rather than in the caller because deriving it outside means re-selecting the rates —
+   * which tier applies, whether the cache-read rate falls back to the STANDARD input rate, which
+   * side of the subset clamp each class sits on — and a second copy of that selection is a second
+   * chance to get the money wrong. Every class is 0 on an unpriced row. */
+  byClass: CostByClass;
 }
+
+/** Per-class dollars. Keys match the billing classes the usage table records. */
+export interface CostByClass {
+  input: number;
+  output: number;
+  cacheRead: number;
+  cacheWrite5m: number;
+  cacheWrite1h: number;
+}
+
+const NO_CLASS_COST: CostByClass = { input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0 };
 
 const MILLION = 1_000_000;
 
@@ -141,7 +159,14 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   // know the accounting convention (a subset model's cached prefix would be wrongly included),
   // while a `<synthetic>` row never reached an API at all. Reporting a number there would let a
   // caller sum billable input across rows whose dollars are missing.
-  const unpriced: Cost = { usd: 0, unpriced: true, billableInputTokens: 0, rateSet: 'none', rateSignature: 'unpriced' };
+  const unpriced: Cost = {
+    usd: 0,
+    unpriced: true,
+    billableInputTokens: 0,
+    rateSet: 'none',
+    rateSignature: 'unpriced',
+    byClass: NO_CLASS_COST,
+  };
   // A row with no matching price but ZERO tokens in every billable class contributes no unknown
   // cost, so it is not "unpriced" in the sense the caller cares about. Counting it inflated
   // unpriced_calls, put its model in unpriced_models, and told clients the total was a floor —
@@ -154,7 +179,14 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   // class, which flipped a fully batch-priced response's cost_basis to _partial on a row worth $0.
   const anyBillableTokens = billableInput > 0 || output > 0 || billableCacheRead > 0 || cw5 > 0 || cw1h > 0;
   if (!anyBillableTokens)
-    return { usd: 0, unpriced: false, billableInputTokens: 0, rateSet: 'none', rateSignature: 'zero' };
+    return {
+      usd: 0,
+      unpriced: false,
+      billableInputTokens: 0,
+      rateSet: 'none',
+      rateSignature: 'zero',
+      byClass: NO_CLASS_COST,
+    };
   if (!price) return unpriced;
 
   // Batch rates are chosen PER CLASS, matching how rates are required per class below. An
@@ -202,13 +234,17 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   if (cw5 > 0 && price.cache_write_5m_cost == null) return unpriced;
   if (cw1h > 0 && price.cache_write_1h_cost == null) return unpriced;
 
+  // Each term kept separately and then summed, so the per-class breakdown and the total are the
+  // SAME arithmetic rather than two derivations that can disagree.
+  const byClass: CostByClass = {
+    input: (billableInput * (inRate ?? 0)) / MILLION,
+    output: (output * (outRate ?? 0)) / MILLION,
+    cacheRead: (billableCacheRead * (readRate ?? 0)) / MILLION,
+    cacheWrite5m: (cw5 * (price.cache_write_5m_cost ?? 0)) / MILLION,
+    cacheWrite1h: (cw1h * (price.cache_write_1h_cost ?? 0)) / MILLION,
+  };
   const usd =
-    (billableInput * (inRate ?? 0) +
-      output * (outRate ?? 0) +
-      billableCacheRead * (readRate ?? 0) +
-      cw5 * (price.cache_write_5m_cost ?? 0) +
-      cw1h * (price.cache_write_1h_cost ?? 0)) /
-    MILLION;
+    byClass.input + byClass.output + byClass.cacheRead + byClass.cacheWrite5m + byClass.cacheWrite1h;
 
   // Report what was actually applied to the classes this row HAS. A row with no output tokens
   // is fully batch-priced on its input batch rate alone; one that pays a batch input rate and a
@@ -258,7 +294,7 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
     .filter(Boolean)
     .join('|');
 
-  return { usd, unpriced: false, billableInputTokens: billableInput, rateSet, rateSignature };
+  return { usd, unpriced: false, billableInputTokens: billableInput, rateSet, rateSignature, byClass };
 }
 
 /** Pick the rate in effect at `ts` from a model's price history (rows newest-first). */
