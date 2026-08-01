@@ -51,41 +51,103 @@ Workers Builds owns preview uploads only. Verified on the current `main`: its ch
 `Workers Builds: sessions-hub-preview` and CI's `deploy`, with no `Workers Builds: sessions-hub`.
 
 **Preview migrations are not Workers Builds' job.** The deploy command above uploads code and
-nothing else, so `sessions-index-preview` is migrated by CI's `migrate-preview` job
-(`wrangler d1 migrations apply DB --env preview --remote`, on every same-repo PR, gated on the
-hub tests) rather than by the deploy. Note `DB --env preview` and not the database name: the
-preview D1 exists only under `env.preview`, and wrangler resolves the target against the
-selected environment's bindings. Without that job a branch preview runs new code against the
-old preview schema — PR #65 shipped migration 0016 and every `/api/v1/usage` request on its
-preview returned `no such table: model_prices` until the migration was applied by hand.
+nothing else, so `sessions-index-preview` is migrated by CI, gated on the hub tests, by two
+different mechanisms depending on the trigger:
 
-That job needs **`CLOUDFLARE_PREVIEW_API_TOKEN`** (D1:Edit + Account Settings:Read). It must NOT
-be `CLOUDFLARE_API_TOKEN`, and the job has no fallback to it: the `deploy` token can edit
-production D1, Workers, queues, R2, KV and zone routes, and `migrate-preview` runs PR-authored
-code.
+| trigger | job | how it applies |
+|---|---|---|
+| same-repo PR | `migrate-preview` | POSTs the migration SQL to the preview Worker's `/api/v1/admin/migrate`, authenticating with a GitHub OIDC token. **No Cloudflare credential** — see below. |
+| push to `main` | `migrate-preview-main` | `wrangler d1 migrations apply DB --env preview --remote` with `CLOUDFLARE_API_TOKEN` |
 
-**Create it as a secret ON THE `preview` ENVIRONMENT, never as a repository secret.** A repository
-secret is readable by *any* job in the workflow, so a PR could simply add a job that omits
-`environment: preview` and reference it directly — collecting the credential with no approval and
-defeating the entire control below. Environment secrets are only exposed to jobs that declare that
-environment, which is what makes the protection rule binding.
+Do not "fix" the PR job by giving it the wrangler command: it deliberately has no Cloudflare
+credential and could not authenticate one. On the `main` path, note `DB --env preview` and not the
+database name — the preview D1 exists only under `env.preview`, and wrangler resolves the target
+against the selected environment's bindings.
 
-**Add a required-reviewer rule to the `preview` environment BEFORE setting that secret.** Scoping
-the token is not sufficient on its own, for two compounding reasons. Cloudflare's D1 permissions
-are *account*-scoped — unlike an R2 bucket, there is no "one database" resource for D1 — so a
-"preview" token can still write the production database, whose id is committed in
-`wrangler.jsonc`. And for a same-repo PR, GitHub runs the PR's *own* copy of the workflow, so a
-PR can rewrite the job to use the token against any database and bypass the id assertion. That
-leaves approval as the control that actually holds: with a protection rule, a run cannot reach
-the credential until a human approves it.
+Both jobs share the `migrate-preview` concurrency group, because they write the same database and
+the endpoint's atomic name claim can order two runs applying the *same* migration but not two
+applying different, dependent ones. GitHub keeps at most one pending run per group, so a third
+overlapping run displaces the second; the displaced run is cancelled, and the next push re-applies
+the full pending set.
 
-If that friction is unwanted, the alternatives are to host the preview D1 in a separate
-Cloudflare account, or to drop PR-triggered migrations and apply them by hand.
+Without any of this a branch preview runs new code against the old preview schema — PR #65 shipped
+migration 0016 and every `/api/v1/usage` request on its preview returned
+`no such table: model_prices` until the migration was applied by hand.
 
-Until the secret exists the job skips with a notice and previews stay unmigrated — the intended
-failure direction, and safe by default since there is no credential to leak. `npm ci
---ignore-scripts` and the `database_id` assertion remain as defence against a compromised
-*dependency*; neither constrains a malicious author.
+That job holds **no Cloudflare credential at all**, and cannot be given one safely. Cloudflare's
+D1 token permissions are *account*-scoped — unlike an R2 bucket there is no "one database"
+resource for D1, confirmed against Cloudflare's published API schema, which carries
+`com.cloudflare.edge.r2.bucket{,.read,.write}` but no D1 resource key — and Cloudflare has no
+workload-identity federation for its API (an open request, cloudflare/workers-sdk#11434). Add that
+a same-repo PR runs its *own* copy of the workflow, and any token handed to this job can reach
+production D1 no matter how the job is written.
+
+So it uses the one construct in D1's model that bounds reach at all: the **binding**. The preview
+Worker's `DB` is `sessions-index-preview`, so CI calls `POST /api/v1/admin/migrate` on that Worker
+rather than talking to Cloudflare's API, and the call can only touch databases bound to it.
+
+**The binding alone is not sufficient, and it is worth being exact about why.** It is declared in
+`hub/wrangler.jsonc`, and Workers Builds builds each branch preview from the PR's *own* checkout —
+so a PR can repoint `env.preview.d1_databases[].database_id` at the production database (the id is
+committed in that same file) and its preview Worker would then be bound to production. Nothing in
+the deployment path stops that.
+
+The endpoint therefore **asks the database it is actually bound to whether it is the preview one**,
+immediately before it writes anything — and *after* verifying the caller's OIDC token. That order
+matters and must not be reversed: this route has no mTLS and its `workers.dev` preview alias is
+publicly reachable, so checking the marker first would let any unauthenticated POST force a query
+against the shared preview database and burn its quota. Authentication first, marker check
+immediately before any write, so the check still runs on every path that writes — which is all it
+was ever protecting. The preview database carries a
+`preview_environment_marker` row; production does not. A repointed binding gets
+`409 not_preview_database` instead of a migration, and it fails **closed** — a missing table, a
+missing row, a wrong value, or any error at all means no writes.
+
+**This stops an accident, not an attacker.** The check is itself PR-controlled code, so a hostile
+PR can delete it, and no check inside this Worker can do better, because Workers Builds builds the
+Worker from the PR. What it reliably prevents is a mistyped or copy-pasted database id, a bad
+merge, or a stale config pointing the preview at production — the realistic failure.
+
+The malicious-author case is bounded by the repository rather than by this code. The job runs only
+for same-repo PRs, so it needs push access; `main` is unprotected, so that access already permits a
+direct push to `main`, which runs CI's `deploy` job with the full-account `CLOUDFLARE_API_TOKEN`.
+This endpoint grants strictly less than such an attacker already holds — which is a statement about
+the repository's posture, not a property of the endpoint. If that posture changes (branch
+protection on `main`, or additional collaborators), the honest fix is to host preview D1 in a
+**separate Cloudflare account**, where nothing reachable from a build can name production at all.
+
+Seeding that marker is a one-time manual step, done with the production credential — deliberately
+*not* by a migration or by the endpoint, since anything a PR can cause to run could otherwise mint
+the marker on the database it just repointed itself at:
+
+```bash
+cd hub && npx wrangler d1 execute DB --env preview --remote --command \
+  "CREATE TABLE IF NOT EXISTS preview_environment_marker (value TEXT NOT NULL);
+   DELETE FROM preview_environment_marker;
+   INSERT INTO preview_environment_marker (value) VALUES ('sessions-index-preview');"
+```
+
+Authentication is a short-lived **GitHub OIDC assertion** (`permissions: id-token: write`), minted
+per run, no stored secret. The endpoint pins issuer, audience (`sessions-hub-preview-migrate`) and
+`repository`, requires RS256 against GitHub's JWKS, and validates claims only after the signature.
+It 404s unless `ENVIRONMENT=preview`, and `MIGRATE_OIDC_REPOSITORY` is set **only** in
+`env.preview.vars`, so the route cannot exist in production even by accident.
+
+Two properties worth knowing before relying on it:
+
+- **It converges rather than ordering.** Workers Builds deploys the preview independently of CI, so
+  on a brand-new branch the endpoint may not be live when the job runs. *That* case retries a few
+  times and then leaves a notice rather than a red build, because it resolves itself on the next
+  push. A response from the endpoint's own handler (any JSON body with an `error` key — 401, 409,
+  422, 500) is the opposite: it never fixes itself, so the job fails loudly. Swallowing those is
+  how #65 shipped an unapplied migration in the first place.
+- **The migration SQL comes from the PR.** That is deliberate: the preview Worker is itself built
+  from PR code, so bundling the migrations would be no less PR-controlled. The binding bounds the
+  blast radius, not the provenance of the SQL. The endpoint refuses any migration its statement
+  splitter cannot handle safely (trigger bodies, unbalanced quotes) rather than risk applying half
+  of one. The splitter is quote-aware — `'--claude-worktrees-'` in migrations 0011/0012 is a real
+  literal that a naive comment strip truncates mid-statement — and a test runs it over every
+  migration this repo ships, asserting the literals survive the round trip.
 
 **Workflow edits must be checked with `actionlint .github/workflows/*.yml` before pushing.** A bad
 Actions expression is rejected at validation time and the run produces *zero* jobs, so every other

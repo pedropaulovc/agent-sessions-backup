@@ -12,6 +12,7 @@ import { bootstrap } from './api/bootstrap';
 import { probeClientCert, renewCert } from './api/certs';
 import { search } from './api/search';
 import { getSession, getSessionRaw, listSessions } from './api/sessions';
+import { migratePreview } from './api/migrate';
 import { viewerRoute } from './viewer/router';
 
 /** decodeURIComponent that returns null instead of throwing on a malformed %-sequence, so a bad
@@ -45,6 +46,12 @@ export async function route(request: Request, env: Env, _ctx: ExecutionContext):
 
 
 async function apiRoute(request: Request, url: URL, env: Env): Promise<Response> {
+  // Preview-only migration endpoint. Deliberately BEFORE machineIdentity: it authenticates on a
+  // GitHub OIDC assertion rather than an mTLS client cert, because the whole point is that CI
+  // holds no long-lived credential of ours. It self-gates (404 outside ENVIRONMENT=preview,
+  // 401 without a valid repo-pinned token) — see api/migrate.ts.
+  if (url.pathname === '/api/v1/admin/migrate' && request.method === 'POST') return migratePreview(request, env);
+
   const identity = await machineIdentity(request, env);
   const path = url.pathname;
   const method = request.method;

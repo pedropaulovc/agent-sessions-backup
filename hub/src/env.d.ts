@@ -4,6 +4,9 @@ interface Env {
   KV: KVNamespace;
   PARSE_QUEUE: Queue<ParseMessage>;
   ENVIRONMENT: 'development' | 'preview' | 'production';
+  /** `owner/repo` whose GitHub OIDC tokens may drive /api/v1/admin/migrate. Absent = endpoint
+   * disabled; it is an allowlist, not a secret. */
+  MIGRATE_OIDC_REPOSITORY?: string;
   API_HOST: string;
   VIEWER_HOST: string;
   R2_DASHBOARD_BASE_URL: string;

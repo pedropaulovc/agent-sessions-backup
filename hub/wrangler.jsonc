@@ -113,6 +113,9 @@
       "routes": [],
       "vars": {
         "ENVIRONMENT": "preview",
+        // Allowlist for /api/v1/admin/migrate's GitHub OIDC caller. Preview ONLY: the production
+        // config must never carry this, so the endpoint cannot exist there even by accident.
+        "MIGRATE_OIDC_REPOSITORY": "pedropaulovc/agent-sessions-backup",
         "API_HOST": "api.sessions.vza.net",
         "VIEWER_HOST": "sessions.vza.net",
         "R2_DASHBOARD_BASE_URL": "https://dash.cloudflare.com/18ef3246e9f36d1560485ef53889c0ab/r2/default/buckets/agent-sessions-raw-preview"
