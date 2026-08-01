@@ -299,8 +299,18 @@ jobs:
   # `deploy` exists to prevent. After the deploy, production is always consistent and a failure
   # here means only "preview needs attention", while still showing as a red check.
   migrate-preview-main:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: deploy
+    # `!cancelled()` + an explicit hub gate, NOT a bare `needs: deploy`. A prerequisite FAILURE
+    # skips the dependent job, so a production-only problem -- a D1 conflict on `sessions-index`,
+    # a token outage, a `wrangler deploy` error -- would skip this apply entirely while Workers
+    # Builds has already published the new preview Worker. The preview would then run new code
+    # against the old schema with its migration never applied, which is the failure this job
+    # exists to prevent, triggered by something that has nothing to do with preview.
+    #
+    # The WAIT on deploy is still what we want (see the ordering note below); only the
+    # success-requirement is dropped. `hub` must still be green -- an untested migration should
+    # not reach any database.
+    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.hub.result == 'success' }}
+    needs: [hub, deploy]
     concurrency:
       group: migrate-preview
       cancel-in-progress: false

@@ -51,13 +51,28 @@ Workers Builds owns preview uploads only. Verified on the current `main`: its ch
 `Workers Builds: sessions-hub-preview` and CI's `deploy`, with no `Workers Builds: sessions-hub`.
 
 **Preview migrations are not Workers Builds' job.** The deploy command above uploads code and
-nothing else, so `sessions-index-preview` is migrated by CI's `migrate-preview` job
-(`wrangler d1 migrations apply DB --env preview --remote`, on every same-repo PR, gated on the
-hub tests) rather than by the deploy. Note `DB --env preview` and not the database name: the
-preview D1 exists only under `env.preview`, and wrangler resolves the target against the
-selected environment's bindings. Without that job a branch preview runs new code against the
-old preview schema — PR #65 shipped migration 0016 and every `/api/v1/usage` request on its
-preview returned `no such table: model_prices` until the migration was applied by hand.
+nothing else, so `sessions-index-preview` is migrated by CI, gated on the hub tests, by two
+different mechanisms depending on the trigger:
+
+| trigger | job | how it applies |
+|---|---|---|
+| same-repo PR | `migrate-preview` | POSTs the migration SQL to the preview Worker's `/api/v1/admin/migrate`, authenticating with a GitHub OIDC token. **No Cloudflare credential** — see below. |
+| push to `main` | `migrate-preview-main` | `wrangler d1 migrations apply DB --env preview --remote` with `CLOUDFLARE_API_TOKEN` |
+
+Do not "fix" the PR job by giving it the wrangler command: it deliberately has no Cloudflare
+credential and could not authenticate one. On the `main` path, note `DB --env preview` and not the
+database name — the preview D1 exists only under `env.preview`, and wrangler resolves the target
+against the selected environment's bindings.
+
+Both jobs share the `migrate-preview` concurrency group, because they write the same database and
+the endpoint's atomic name claim can order two runs applying the *same* migration but not two
+applying different, dependent ones. GitHub keeps at most one pending run per group, so a third
+overlapping run displaces the second; the displaced run is cancelled, and the next push re-applies
+the full pending set.
+
+Without any of this a branch preview runs new code against the old preview schema — PR #65 shipped
+migration 0016 and every `/api/v1/usage` request on its preview returned
+`no such table: model_prices` until the migration was applied by hand.
 
 That job holds **no Cloudflare credential at all**, and cannot be given one safely. Cloudflare's
 D1 token permissions are *account*-scoped — unlike an R2 bucket there is no "one database"
