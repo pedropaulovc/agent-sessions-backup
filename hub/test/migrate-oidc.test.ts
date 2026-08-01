@@ -426,6 +426,30 @@ describe('bound-database check', () => {
     })();
   });
 
+  it('stamps a bookkeeping-setup failure too, instead of a bodiless platform 500', async () => {
+    // The setup queries -- CREATE TABLE d1_migrations, then SELECT name FROM it -- sat outside the
+    // error boundary. A pre-existing table with an incompatible schema makes the SELECT fail
+    // deterministically, and an escaping throw is a bodiless platform 500, which the workflow
+    // classifies as "the preview is not up yet": it retries, then exits GREEN with nothing
+    // applied. That is the same green-with-stale-schema outcome the batch-error fix closed.
+    await testEnv.DB.prepare('DROP TABLE IF EXISTS d1_migrations').run();
+    await testEnv.DB.prepare('CREATE TABLE d1_migrations (wrong_column TEXT)').run();
+    try {
+      const token = await signJwt(keys.pair.privateKey, goodClaims());
+      const res = await post(token, [{ name: '9999_setup', sql: 'CREATE TABLE migrate_probe2 (a INT);' }]);
+
+      expect(res.status).toBe(500);
+      const body = await res.json<{ error: string; handler: number }>();
+      expect(body.error, 'a bookkeeping failure escaped as a bodiless 500').toBe('migration_failed');
+      // The stamp is what makes the workflow treat it as fatal rather than as a cold start.
+      expect(body.handler).toBe(MIGRATE_HANDLER_VERSION);
+    } finally {
+      // The sabotaged table outlives the test otherwise -- these tests share one D1 instance, and
+      // leaving it behind failed two unrelated cases downstream.
+      await testEnv.DB.prepare('DROP TABLE IF EXISTS d1_migrations').run();
+    }
+  });
+
   it('does not record a migration that failed to apply', async () => {
     const token = await signJwt(keys.pair.privateKey, goodClaims());
     await post(token, [{ name: '9999_broken', sql: 'ALTER TABLE table_that_does_not_exist ADD COLUMN x INT;' }]);

@@ -255,9 +255,23 @@ export async function migratePreview(request: Request, env: Env): Promise<Respon
     if (problem) return migrateJson({ error: 'unsupported_migration', detail: problem }, 422);
   }
 
-  await env.DB.prepare(MIGRATIONS_TABLE).run();
-  const appliedRows = await env.DB.prepare('SELECT name FROM d1_migrations').all<{ name: string }>();
-  const already = new Set((appliedRows.results ?? []).map((r) => r.name));
+  // Inside the SAME error boundary as the migrations themselves. These two look like setup, but
+  // they can fail deterministically -- a pre-existing `d1_migrations` with an incompatible schema
+  // (no `name` column), or D1 rejecting either query outright -- and an escaping throw produces
+  // Cloudflare's platform-generated 500 with no JSON body. CI treats a bodiless response as "the
+  // preview is not up yet", retries, and eventually exits GREEN with nothing applied. Every
+  // failure on this route has to carry the handler stamp, or the workflow cannot tell a real
+  // failure from a cold start.
+  let already: Set<string>;
+  try {
+    await env.DB.prepare(MIGRATIONS_TABLE).run();
+    const appliedRows = await env.DB.prepare('SELECT name FROM d1_migrations').all<{ name: string }>();
+    already = new Set((appliedRows.results ?? []).map((r) => r.name));
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    console.log(JSON.stringify({ event: 'hub.migrate.bookkeeping_failed', detail }));
+    return migrateJson({ error: 'migration_failed', migration: 'd1_migrations', detail, applied: [] }, 500);
+  }
 
   const applied: string[] = [];
   const skipped: string[] = [];
