@@ -40,6 +40,11 @@ export interface Cost {
   unpriced: boolean;
   /** Fresh (non-cached) input actually billed at the input rate. */
   billableInputTokens: number;
+  /** Which rate set actually produced `usd`. `batch=1` is a REQUEST, not a guarantee: a model
+   * with no published batch tier falls back to its standard rates, and the caller has to know
+   * that happened or it will label standard-priced dollars as batch-priced. `none` means
+   * nothing was priced. */
+  rateSet: 'standard' | 'batch' | 'none';
 }
 
 const MILLION = 1_000_000;
@@ -58,10 +63,28 @@ export function priceKeyCandidates(model: string): string[] {
   return out;
 }
 
-/** Models that are not models. `<synthetic>` is Claude Code's local stand-in for a response
- * that never hit the API, so it must never be priced or counted as unpriced coverage loss. */
+/** How a `usage.model` value should be treated for pricing. Three states, not a boolean,
+ * because "we know this is not an API call" and "we do not know what this was" have opposite
+ * reporting consequences and a boolean collapsed them:
+ *
+ * - `billable`  — a real model id; price it.
+ * - `sentinel`  — `<synthetic>` and friends: Claude Code's stand-in for a response that never
+ *                 hit the API. Never priced, and never counted as coverage loss either.
+ * - `unknown`   — NULL/empty model on a real usage row (e.g. a Codex `token_count` seen before
+ *                 any `turn_context`, where the parser has no `currentModel` yet). These burned
+ *                 real tokens at a rate we cannot determine, so they must be reported as
+ *                 unpriced rather than silently shown at $0 under a full-coverage claim.
+ */
+export type ModelPricingClass = 'billable' | 'sentinel' | 'unknown';
+
+export function classifyModel(model: string | null | undefined): ModelPricingClass {
+  if (model === null || model === undefined || model === '') return 'unknown';
+  return model.startsWith('<') ? 'sentinel' : 'billable';
+}
+
+/** Narrowing helper for the common "is this priceable" check. */
 export function isBillableModel(model: string | null | undefined): model is string {
-  return !!model && model !== '<synthetic>' && !model.startsWith('<');
+  return classifyModel(model) === 'billable';
 }
 
 /**
@@ -90,34 +113,45 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
       ? (u.fresh_input_tokens ?? Math.max(0, input - cacheRead))
       : input;
 
-  if (!price || price.input_cost == null || price.output_cost == null) {
-    return { usd: 0, unpriced: true, billableInputTokens: billableInput };
-  }
+  // `billableInputTokens` is 0 on every unpriced path, never the raw input count. The field's
+  // contract is "input actually billed at the input rate", and for an unmatched model we do not
+  // know the accounting convention (a subset model's cached prefix would be wrongly included),
+  // while a `<synthetic>` row never reached an API at all. Reporting a number there would let a
+  // caller sum billable input across rows whose dollars are missing.
+  const unpriced: Cost = { usd: 0, unpriced: true, billableInputTokens: 0, rateSet: 'none' };
+  if (!price) return unpriced;
 
   const batch = opts?.batch === true && price.input_cost_batch != null && price.output_cost_batch != null;
-  const inRate = batch ? price.input_cost_batch! : price.input_cost;
-  const outRate = batch ? price.output_cost_batch! : price.output_cost;
+  const inRate = batch ? price.input_cost_batch : price.input_cost;
+  const outRate = batch ? price.output_cost_batch : price.output_cost;
 
   // A missing cache READ rate falls back to the input rate: a cache read is never dearer than
   // fresh input, so that direction can only over-report, never quietly under-report.
   const readRate = price.cache_read_cost ?? inRate;
 
-  // Cache WRITES get no such fallback. They cost MORE than input -- Anthropic charges 1.25x
-  // for a 5m write and 2x for a 1h write -- so substituting the input rate (or the 5m rate for
-  // a missing 1h rate) invents a cheaper price and reports it as if it were priced. A row that
-  // actually carries cache-creation tokens with no published write rate is unpriced. Rows with
-  // no cache-creation tokens are unaffected: the missing rate never gets multiplied by anything.
-  if ((cw5 > 0 && price.cache_write_5m_cost == null) || (cw1h > 0 && price.cache_write_1h_cost == null)) {
-    return { usd: 0, unpriced: true, billableInputTokens: billableInput };
-  }
-  const w5Rate = price.cache_write_5m_cost ?? 0;
-  const w1hRate = price.cache_write_1h_cost ?? 0;
+  // A rate is required only for a token class that is actually PRESENT. Upstream routinely
+  // publishes partial entries, and discarding a known input cost because `output_cost` happens
+  // to be null throws away real, correctly-priceable usage on a row with no output tokens.
+  //
+  // Cache WRITES additionally get no rate fallback at all. They cost MORE than input --
+  // Anthropic charges 1.25x for a 5m write and 2x for a 1h write -- so substituting the input
+  // rate (or the 5m rate for a missing 1h rate) invents a cheaper price and reports it as if it
+  // were priced.
+  if (billableInput > 0 && inRate == null) return unpriced;
+  if (output > 0 && outRate == null) return unpriced;
+  if (cacheRead > 0 && readRate == null) return unpriced;
+  if (cw5 > 0 && price.cache_write_5m_cost == null) return unpriced;
+  if (cw1h > 0 && price.cache_write_1h_cost == null) return unpriced;
 
   const usd =
-    (billableInput * inRate + output * outRate + cacheRead * readRate + cw5 * w5Rate + cw1h * w1hRate) /
+    (billableInput * (inRate ?? 0) +
+      output * (outRate ?? 0) +
+      cacheRead * (readRate ?? 0) +
+      cw5 * (price.cache_write_5m_cost ?? 0) +
+      cw1h * (price.cache_write_1h_cost ?? 0)) /
     MILLION;
 
-  return { usd, unpriced: false, billableInputTokens: billableInput };
+  return { usd, unpriced: false, billableInputTokens: billableInput, rateSet: batch ? 'batch' : 'standard' };
 }
 
 /** Pick the rate in effect at `ts` from a model's price history (rows newest-first). */

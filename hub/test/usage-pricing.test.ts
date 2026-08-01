@@ -58,12 +58,22 @@ async function seedUsage(sessionId: string, ts: string, model: string, tokens: R
     .run();
 }
 
-async function fetchUsage(query: string): Promise<{ rows: Array<Record<string, number | string>> }> {
+interface UsageBody {
+  rows: Array<Record<string, number | string | null>>;
+  cost_basis: string;
+  unpriced_models: string[];
+}
+
+async function fetchUsageRaw(query: string): Promise<UsageBody> {
   const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/usage?${query}`, {
     headers: { 'x-dev-machine': MACHINE },
   });
   expect(res.status).toBe(200);
   return res.json();
+}
+
+async function fetchUsage(query: string): Promise<UsageBody> {
+  return fetchUsageRaw(query);
 }
 
 describe('usage pricing across a rate change', () => {
@@ -142,6 +152,62 @@ describe('bucket completeness', () => {
   });
 });
 
+describe('rows the aggregate must not silently drop', () => {
+  beforeAll(async () => {
+    // A session with NO repo_url: its bucket is NULL under group_by=repo.
+    await testEnv.DB.prepare(
+      `INSERT INTO sessions (session_id, harness, machine_id, repo_url, started_at, index_state)
+       VALUES ('sess-norepo', 'claude-code', 'nullbox', NULL, '2026-03-01T00:00:00Z', 'ready')`,
+    ).run();
+    await seedUsage('sess-norepo', '2026-03-01T10:00:00Z', 'claude-opus-5', { input: 7_000 });
+    // A real usage row with no model at all — a Codex `token_count` seen before any
+    // `turn_context`, where the parser has no currentModel yet.
+    await seedUsage('sess-norepo', '2026-03-01T11:00:00Z', null as unknown as string, { input: 3_000 });
+    // A row with no timestamp: not evidence that it predates every rate, just missing metadata.
+    await seedUsage('sess-norepo', null as unknown as string, 'claude-opus-5', { input: 5_000 });
+  });
+
+  // `bucket IN (subquery)` is never true for NULL, so these calls vanished from the response
+  // entirely — not zeroed, absent — even though the subquery contained the NULL bucket.
+  it('keeps the NULL bucket when group_by=repo', async () => {
+    const body = await fetchUsage('group_by=repo&machine=nullbox');
+    const nullBucket = body.rows.find((r) => r.bucket === null);
+    expect(nullBucket, 'the no-repo session disappeared from the response').toBeTruthy();
+    expect(nullBucket!.calls).toBe(3);
+  });
+
+  it('counts a NULL-model call as unpriced rather than silently free', async () => {
+    const body = await fetchUsage('group_by=machine&machine=nullbox');
+    const row = body.rows.find((r) => r.bucket === 'nullbox');
+    expect(row!.unpriced_calls as number).toBeGreaterThan(0);
+    const models = (await fetchUsageRaw('group_by=machine&machine=nullbox')).unpriced_models;
+    expect(models).toContain('(unknown)');
+  });
+
+  it('refuses to price a row with no timestamp when the model has several rates', async () => {
+    // priceAt would otherwise take its older-than-any-snapshot branch and charge the EARLIEST
+    // rate, reporting it as a real figure. claude-opus-5 has two snapshots seeded above.
+    const body = await fetchUsage('group_by=machine&machine=nullbox');
+    const row = body.rows.find((r) => r.bucket === 'nullbox');
+    // 5,000 input tokens at the earliest rate would be $0.50; it must not be counted at all.
+    expect(row!.unpriced_calls as number).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe('cost_basis honesty', () => {
+  it('does not claim batch pricing for a model with no batch tier', async () => {
+    // The seeded claude-opus-5 rows have NULL batch rates, so batch=1 falls back to standard.
+    const body = await fetchUsageRaw('group_by=model&batch=1&machine=' + MACHINE);
+    expect(body.cost_basis).not.toBe('litellm_list_price_batch');
+    expect(body.cost_basis).toBe('litellm_list_price');
+  });
+
+  it('labels a non-batch request plainly', async () => {
+    const body = await fetchUsageRaw('group_by=model&machine=' + MACHINE);
+    expect(body.cost_basis).toBe('litellm_list_price');
+  });
+});
+
 describe('priceEpochExpr', () => {
   const price = (model: string, effective_from: string): ModelPrice =>
     ({ model, effective_from }) as ModelPrice;
@@ -153,19 +219,22 @@ describe('priceEpochExpr', () => {
         ['b', [price('b', '2026-04-01')]],
       ]),
     );
-    // Newest-first arms, so the first match wins.
+    // Newest-first arms, so the first match wins. The NULL arm has to come first and be
+    // explicit — `NULL >= '2026-01-01'` is NULL, not false, so a timestamp-less row would
+    // otherwise fall through to the ELSE and be indistinguishable from a genuinely ancient one.
     expect(expr).toBe(
-      "CASE WHEN u.ts >= '2026-07-01' THEN '2026-07-01'" +
+      "CASE WHEN u.ts IS NULL THEN 'unknown'" +
+        " WHEN u.ts >= '2026-07-01' THEN '2026-07-01'" +
         " WHEN u.ts >= '2026-04-01' THEN '2026-04-01'" +
         " WHEN u.ts >= '2026-01-01' THEN '2026-01-01'" +
         " ELSE '0000-00-00' END",
     );
   });
 
-  it('falls back to a constant older than any snapshot when no prices are loaded', () => {
-    // Must NOT be an empty/falsy string: priceAt() reads a falsy ts as "no opinion" and
-    // returns the NEWEST rate, which is the very bug this expression exists to prevent.
-    expect(priceEpochExpr(new Map())).toBe("'0000-00-00'");
+  it('keeps unknown-time and older-than-any-price distinct when no prices are loaded', () => {
+    // The ELSE must NOT be an empty/falsy string: priceAt() reads a falsy ts as "no opinion"
+    // and returns the NEWEST rate, which is the very bug this expression exists to prevent.
+    expect(priceEpochExpr(new Map())).toBe("CASE WHEN u.ts IS NULL THEN 'unknown' ELSE '0000-00-00' END");
   });
 
   it('drops boundaries that are not shaped like dates rather than interpolating them', () => {

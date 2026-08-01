@@ -1,8 +1,8 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
 import {
+  classifyModel,
   costOfUsage,
-  isBillableModel,
   loadPrices,
   priceAt,
   type ModelPrice,
@@ -588,6 +588,13 @@ export async function usage(url: URL, env: Env): Promise<Response> {
        SELECT ${expr} AS bucket,
               u.model AS model,
               ${epochExpr} AS epoch,
+              -- Split groups by cache-write PRESENCE, because an absent write rate makes a row
+              -- unpriced (see costOfUsage): without this, one cache-writing call in a group
+              -- would drag every ordinary call beside it to $0/unpriced even though those are
+              -- perfectly priceable. In practice a model either writes cache or never does, so
+              -- this rarely multiplies the group count at all.
+              (COALESCE(u.cache_creation_5m_tokens,0) > 0) AS has_w5,
+              (COALESCE(u.cache_creation_1h_tokens,0) > 0) AS has_w1h,
               COUNT(*) AS calls,
               SUM(COALESCE(u.input_tokens,0)) AS input_tokens,
               SUM(COALESCE(u.output_tokens,0)) AS output_tokens,
@@ -602,10 +609,15 @@ export async function usage(url: URL, env: Env): Promise<Response> {
               SUM(MAX(0, COALESCE(u.input_tokens,0) - COALESCE(u.cache_read_tokens,0)))
                 AS fresh_input_tokens
        FROM usage u JOIN sessions s ON s.session_id = u.session_id
-       ${where} GROUP BY bucket, u.model, epoch
+       ${where} GROUP BY bucket, u.model, epoch, has_w5, has_w1h
      )
-     SELECT * FROM agg
-     WHERE bucket IN (SELECT bucket FROM agg GROUP BY bucket ORDER BY bucket DESC LIMIT ?${binds.length + 1})`,
+     SELECT a.* FROM agg a
+     JOIN (SELECT bucket FROM agg GROUP BY bucket ORDER BY bucket DESC LIMIT ?${binds.length + 1}) top
+       -- \`IS\`, not \`=\`: a NULL bucket (group_by=repo over sessions with no repo_url, or any
+       -- nullable grouping column) never equals itself, so \`bucket IN (subquery)\` silently
+       -- dropped those calls from the response entirely even though the subquery contained the
+       -- NULL bucket. SQLite's IS is NULL-safe equality.
+       ON a.bucket IS top.bucket`,
   )
     .bind(...binds, MAX_BUCKETS)
     .all<UsageAggRow>();
@@ -613,6 +625,7 @@ export async function usage(url: URL, env: Env): Promise<Response> {
   const batch = url.searchParams.get('batch') === '1';
   const byBucket = new Map<string, UsageOutRow>();
   const unpricedModels = new Set<string>();
+  const rateSetsUsed = new Set<'standard' | 'batch'>();
 
   for (const r of rows.results ?? []) {
     const key = String(r.bucket);
@@ -632,16 +645,23 @@ export async function usage(url: URL, env: Env): Promise<Response> {
     for (const k of TOKEN_COLS) agg[k] += Number(r[k] ?? 0);
     agg.calls += Number(r.calls ?? 0);
 
-    // Price the group's totals in one shot: every row in it shares a model and an epoch, and
-    // therefore one rate and one accounting convention. `epoch` — not `bucket` — is the date
-    // to price at; see the comment on the query above.
-    const price = isBillableModel(r.model) ? priceAt(prices.get(r.model) ?? [], String(r.epoch)) : null;
+    // Price the group's totals in one shot: every row in it shares a model, an epoch and a
+    // cache-write shape, and therefore one rate and one accounting convention. `epoch` — not
+    // `bucket` — is the date to price at; see the comment on the query above.
+    const modelClass = classifyModel(r.model);
+    const price = modelClass === 'billable' ? priceForGroup(prices.get(r.model as string) ?? [], String(r.epoch)) : null;
     const cost = costOfUsage(r, price, { batch });
     agg.billable_input_tokens += cost.billableInputTokens;
     agg.cost_usd += cost.usd;
-    if (cost.unpriced && isBillableModel(r.model)) {
+    if (cost.rateSet !== 'none') rateSetsUsed.add(cost.rateSet);
+
+    // `sentinel` rows (`<synthetic>`) are deliberately absent from both counters: they never hit
+    // an API, so they are not coverage we failed to price. `unknown` rows are the opposite — real
+    // tokens at a rate we cannot determine — and were previously swallowed by the same check,
+    // letting the response show their tokens at $0 while claiming complete coverage.
+    if (cost.unpriced && modelClass !== 'sentinel') {
       agg.unpriced_calls += Number(r.calls ?? 0);
-      unpricedModels.add(r.model);
+      unpricedModels.add(modelClass === 'unknown' ? UNKNOWN_MODEL_LABEL : (r.model as string));
     }
     byBucket.set(key, agg);
   }
@@ -656,11 +676,37 @@ export async function usage(url: URL, env: Env): Promise<Response> {
     group_by: groupBy,
     // Cost is list-price equivalent, not a bill: these tokens may have been burned under a
     // flat-rate plan. Saying so in the payload keeps downstream agents from reporting it as spend.
-    cost_basis: batch ? 'litellm_list_price_batch' : 'litellm_list_price',
+    cost_basis: costBasis(batch, rateSetsUsed),
     unpriced_models: [...unpricedModels],
     rows: out,
   });
 }
+
+/** Label for what the dollars in this response actually are.
+ *
+ * `batch=1` is a request, not a guarantee: `costOfUsage` falls back to a model's standard rates
+ * when it has no published batch tier (Anthropic publishes none at all), so a response that
+ * flatly claimed `..._batch` could be reporting standard-priced dollars — or a mix of both,
+ * which is the case any time a batch query spans providers. */
+function costBasis(batch: boolean, rateSetsUsed: Set<'standard' | 'batch'>): string {
+  if (!batch) return 'litellm_list_price';
+  if (!rateSetsUsed.has('standard')) return 'litellm_list_price_batch';
+  return rateSetsUsed.has('batch') ? 'litellm_list_price_batch_partial' : 'litellm_list_price';
+}
+
+/** The rate for a group, given the epoch it was bucketed into.
+ *
+ * A group with no timestamp can still be priced when the model only ever had ONE snapshot —
+ * there is no ambiguity to resolve. With two or more, any choice is a guess, so it stays
+ * unpriced rather than being charged at the earliest rate and reported as a real figure. */
+function priceForGroup(history: ModelPrice[], epoch: string): ModelPrice | null {
+  if (epoch !== EPOCH_UNKNOWN_TIME) return priceAt(history, epoch);
+  return history.length === 1 ? history[0]! : null;
+}
+
+/** Stands in for a NULL `usage.model` in `unpriced_models`. Deliberately bracketed so it cannot
+ * collide with a real model id. */
+const UNKNOWN_MODEL_LABEL = '(unknown)';
 
 /** Buckets returned by /api/v1/usage. Applied to buckets in the query, never to the
  * (bucket, model, epoch) rows that fold into them — trimming those would silently return a
@@ -670,6 +716,13 @@ const MAX_BUCKETS = 400;
 /** Sorts before every real `effective_from`, so `priceAt` takes its documented
  * older-than-any-snapshot branch instead of the falsy-ts one (which returns the NEWEST rate). */
 const EPOCH_BEFORE_ANY_PRICE = '0000-00-00';
+
+/** `usage.ts` is nullable, and a row with no timestamp is NOT evidence that the call predates
+ * every snapshot — it is evidence that we do not know when it ran. Keeping it distinct from
+ * EPOCH_BEFORE_ANY_PRICE lets the fold below refuse to price it (unless the model only ever had
+ * one rate, in which case there is nothing to be ambiguous about) instead of silently charging
+ * it at the earliest rate and reporting that as a real number. */
+const EPOCH_UNKNOWN_TIME = 'unknown';
 
 /** A SQL expression mapping `u.ts` to the price snapshot in effect at that time.
  *
@@ -686,9 +739,12 @@ export function priceEpochExpr(prices: Map<string, ModelPrice[]>): string {
     .filter((e) => /^\d{4}-\d{2}-\d{2}$/.test(e))
     .sort()
     .reverse();
-  if (!boundaries.length) return `'${EPOCH_BEFORE_ANY_PRICE}'`;
+  // The NULL-ts arm has to come first and be explicit: `NULL >= '2026-01-01'` is NULL, not
+  // false, so without it a timestamp-less row falls through to the ELSE and is
+  // indistinguishable from one that genuinely predates every snapshot.
+  if (!boundaries.length) return `CASE WHEN u.ts IS NULL THEN '${EPOCH_UNKNOWN_TIME}' ELSE '${EPOCH_BEFORE_ANY_PRICE}' END`;
   const arms = boundaries.map((e) => `WHEN u.ts >= '${e}' THEN '${e}'`).join(' ');
-  return `CASE ${arms} ELSE '${EPOCH_BEFORE_ANY_PRICE}' END`;
+  return `CASE WHEN u.ts IS NULL THEN '${EPOCH_UNKNOWN_TIME}' ${arms} ELSE '${EPOCH_BEFORE_ANY_PRICE}' END`;
 }
 
 const TOKEN_COLS = [

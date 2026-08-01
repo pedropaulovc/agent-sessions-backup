@@ -131,21 +131,34 @@ def _usage_section(usage: UsageReport) -> list[str]:
     lines = ["## Token spend per model", ""]
     if not usage.rows:
         return [*lines, "No usage recorded in range.", ""]
-    lines.append("| Model | Calls | Input | Output | Reasoning | Cache read | Cache write (5m/1h) | Cost (USD) |")
-    lines.append("|---|---|---|---|---|---|---|---|")
+    # A hub older than the pricing work sends no `cost_basis` and no `cost_usd`, which the models
+    # default to 0.0. Printing that as "$0.00" under a "these are list-rate costs" note would
+    # turn "the server did not compute pricing" into "this usage was free" during ordinary
+    # client/server version skew. The response-level basis is the honest signal that the server
+    # priced anything at all, so with it absent the column is dropped entirely.
+    priced = usage.cost_basis is not None
+    cost_header = " Cost (USD) |" if priced else ""
+    cost_divider = "---|" if priced else ""
+    lines.append(
+        "| Model | Calls | Input | Output | Reasoning | Cache read | Cache write (5m/1h) |" + cost_header
+    )
+    lines.append("|---|---|---|---|---|---|---|" + cost_divider)
     for row in sorted(usage.rows, key=lambda r: r.total_tokens, reverse=True):
         model = row.bucket or "(unknown)"
         # An unpriced row's 0.00 would read as "this was free" rather than "we have no rate".
         cost = "—" if row.unpriced_calls and not row.cost_usd else f"${row.cost_usd:,.2f}"
         lines.append(
             f"| {model} | {row.calls} | {row.input_tokens:,} | {row.output_tokens:,} | {row.reasoning_tokens:,} "
-            f"| {row.cache_read_tokens:,} | {row.cache_creation_5m_tokens:,}/{row.cache_creation_1h_tokens:,} "
-            f"| {cost} |"
+            f"| {row.cache_read_tokens:,} | {row.cache_creation_5m_tokens:,}/{row.cache_creation_1h_tokens:,} |"
+            + (f" {cost} |" if priced else "")
         )
     lines.append("")
-    lines += _cost_note(usage)
+    lines += _cost_note(usage) if priced else [_NO_PRICING_NOTE]
     lines.append("")
     return lines
+
+
+_NO_PRICING_NOTE = "_Token counts only — this hub did not return pricing, so no dollar figure is available._"
 
 
 # The number is a list-price equivalent, NOT a bill: these tokens were very likely burned under
@@ -155,6 +168,11 @@ def _usage_section(usage: UsageReport) -> list[str]:
 _COST_BASIS_NOTE = {
     "litellm_list_price": "at LiteLLM list rates",
     "litellm_list_price_batch": "at LiteLLM batch-tier list rates",
+    # `batch=1` is a request, not a guarantee: models with no published batch tier fall back to
+    # their standard rates, so a batch query spanning providers mixes the two.
+    "litellm_list_price_batch_partial": (
+        "at LiteLLM batch-tier list rates where published, standard rates for the rest"
+    ),
 }
 
 

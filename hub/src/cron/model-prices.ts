@@ -24,7 +24,15 @@ const RATE_COLS = [
   'output_cost_batch',
 ] as const;
 
+/** Non-rate columns that still change what a row COSTS, so a snapshot must be taken when they
+ * move even though every number stayed the same. `cache_accounting` is derived from `provider`,
+ * and flipping subset<->disjoint changes whether cache reads are charged on top of input or
+ * subtracted from it — upstream correcting a null provider to `anthropic` silently misprices
+ * every cached call until some unrelated rate happens to change. */
+const ACCOUNTING_COLS = ['provider', 'cache_accounting'] as const;
+
 type Rates = Record<(typeof RATE_COLS)[number], number | null>;
+type Accounting = Record<(typeof ACCOUNTING_COLS)[number], string | null>;
 
 /** Mirrors priceKeyCandidates() in ../pricing.ts and candidates() in the CLI script. */
 function candidates(model: string): string[] {
@@ -57,10 +65,11 @@ export async function runModelPriceSync(env: Env): Promise<void> {
 
     const prevRows = (
       await env.DB.prepare(
-        `SELECT model, ${RATE_COLS.join(', ')} FROM model_prices ORDER BY model, effective_from DESC`,
-      ).all<{ model: string } & Rates>()
+        `SELECT model, ${RATE_COLS.join(', ')}, ${ACCOUNTING_COLS.join(', ')}
+           FROM model_prices ORDER BY model, effective_from DESC`,
+      ).all<{ model: string } & Rates & Accounting>()
     ).results;
-    const latest = new Map<string, Rates>();
+    const latest = new Map<string, Rates & Accounting>();
     for (const r of prevRows) if (!latest.has(r.model)) latest.set(r.model, r);
 
     const stmts: D1PreparedStatement[] = [];
@@ -78,14 +87,22 @@ export async function runModelPriceSync(env: Env): Promise<void> {
         output_cost: perM(e['output_cost_per_token']),
         cache_read_cost: perM(e['cache_read_input_token_cost'] ?? e['input_cost_per_token_cache_hit']),
         cache_write_5m_cost: perM(e['cache_creation_input_token_cost']),
-        cache_write_1h_cost: perM(
-          e['cache_creation_input_token_cost_above_1hr'] ?? e['cache_creation_input_token_cost'],
-        ),
+        // NULL when upstream omits the 1h rate -- never the 5m rate standing in for it. The 1h
+        // write is 2x input where the 5m write is 1.25x, so the substitution stored a number
+        // that is wrong by ~40% AND, worse, made it indistinguishable from a published rate, so
+        // costOfUsage's missing-rate guard could never fire.
+        cache_write_1h_cost: perM(e['cache_creation_input_token_cost_above_1hr']),
         input_cost_batch: perM(e['input_cost_per_token_batches']),
         output_cost_batch: perM(e['output_cost_per_token_batches']),
       };
+      // Anthropic reports cache reads disjoint from input_tokens; the OpenAI family reports them
+      // as a subset. Charging both the same way misprices every cached turn.
+      const cacheAccounting = provider === 'anthropic' ? 'disjoint' : 'subset';
       const prev = latest.get(model);
-      if (prev && RATE_COLS.every((c) => (prev[c] ?? null) === (next[c] ?? null))) continue;
+      const ratesUnchanged = prev && RATE_COLS.every((c) => (prev[c] ?? null) === (next[c] ?? null));
+      const accountingUnchanged =
+        prev && (prev.provider ?? null) === provider && (prev.cache_accounting ?? null) === cacheAccounting;
+      if (ratesUnchanged && accountingUnchanged) continue;
 
       stmts.push(
         env.DB.prepare(
@@ -108,9 +125,7 @@ export async function runModelPriceSync(env: Env): Promise<void> {
           next.output_cost_batch,
           (e['max_input_tokens'] as number) ?? null,
           (e['max_output_tokens'] as number) ?? null,
-          // Anthropic reports cache reads disjoint from input_tokens; the OpenAI family
-          // reports them as a subset. Charging both the same way misprices every cached turn.
-          provider === 'anthropic' ? 'disjoint' : 'subset',
+          cacheAccounting,
           now,
         ),
       );

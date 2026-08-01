@@ -121,22 +121,36 @@ plus costing: `cost_usd`, `billable_input_tokens`, `unpriced_calls`. Response-le
 
 **`cost_usd` is a list-price equivalent, not a bill.** It is what these tokens would have
 cost on the metered API at the rates in `model_prices` (synced from LiteLLM, ccusage's
-source), and the tokens were very likely burned under a flat-rate plan instead. `cost_basis`
-names the rate set used (`litellm_list_price`, or `litellm_list_price_batch` with `batch=1`).
-Never present it as spend without that qualifier.
+source), and the tokens were very likely burned under a flat-rate plan instead. Never present
+it as spend without that qualifier.
 
-`unpriced_models` lists models with no published rate; their calls are counted in
-`unpriced_calls` and contribute 0 to `cost_usd`, so a non-empty list means every total is a
-floor. `billable_input_tokens` is the input actually charged at the input rate — under
-OpenAI's subset cache accounting that is `input_tokens` minus the cached prefix, clamped per
-row, so it is not derivable from the other columns once rows have been aggregated.
+`cost_basis` names the rate set that actually produced the dollars — it is not an echo of your
+`batch` param, because `batch=1` is a request rather than a guarantee (a model with no
+published batch tier falls back to its standard rates, and Anthropic publishes none at all):
+
+- `litellm_list_price` — standard rates. Also what you get for `batch=1` when *nothing* in the
+  response could be batch-priced.
+- `litellm_list_price_batch` — every priced row used batch rates.
+- `litellm_list_price_batch_partial` — a mix; some rows fell back to standard rates.
+
+`unpriced_models` lists models with no usable rate; their calls are counted in `unpriced_calls`
+and contribute 0 to `cost_usd`, so a non-empty list means every total is a floor. The literal
+`(unknown)` appears there for usage rows with a NULL model (real tokens, undeterminable rate) —
+`<synthetic>` and other `<…>` sentinels never appear, because they never hit an API and are not
+coverage you lost. A row is also unpriced when its timestamp is NULL and its model has more
+than one rate snapshot: a missing timestamp is not evidence the call predates every rate.
+
+`billable_input_tokens` is the input actually charged at the input rate — under OpenAI's subset
+cache accounting that is `input_tokens` minus the cached prefix, clamped per row, so it is not
+derivable from the other columns once rows have been aggregated. It is 0 on unpriced rows.
 
 Rows are priced at the rate in effect when the usage happened, not today's rate: the
 aggregate carries a price-epoch dimension internally so a bucket spanning a rate change is
 summed from correctly-priced parts, for every `group_by` and not just `day`.
 
 Buckets are capped at 400, and the cap is applied to buckets — a returned bucket always
-counts all of its models.
+counts all of its models. A NULL bucket (e.g. `group_by=repo` over sessions with no
+`repo_url`) is a real bucket and is returned like any other.
 
 **`cache_read_tokens` and `reasoning_tokens` are not safe to sum into a total uniformly** —
 their relationship to `input_tokens`/`output_tokens` is provider-specific:

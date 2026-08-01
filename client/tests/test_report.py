@@ -286,6 +286,38 @@ def test_report_shows_cost_and_its_basis():
     assert "not an invoice" in report
 
 
+def test_report_omits_cost_entirely_against_a_hub_that_sent_none():
+    # Version skew: an older hub sends no cost_usd and no cost_basis, and the dataclass defaults
+    # those to 0.0. Printing "$0.00" under a "these are list-rate costs" note would turn "the
+    # server did not compute pricing" into "this usage was free".
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
+    status = HubStatus(machines=[], sessions=SessionsSummary(total=1, ready=1, error=0))
+    report = build_daily_report(
+        date="2026-07-18",
+        sessions_page=sessions_page,
+        usage_report=_usage_report_one_row(),  # cost_basis defaults to None
+        status=status,
+    )
+    assert "$0.00" not in report
+    assert "Cost (USD)" not in report
+    assert "did not return pricing" in report
+    assert "not an invoice" not in report
+
+
+def test_report_labels_partial_batch_pricing_honestly():
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
+    usage_report = UsageReport(
+        group_by="model",
+        rows=[_usage_report_one_row(cost_usd=2.0).rows[0]],
+        cost_basis="litellm_list_price_batch_partial",
+    )
+    status = HubStatus(machines=[], sessions=SessionsSummary(total=1, ready=1, error=0))
+    report = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status
+    )
+    assert "standard rates for the rest" in report
+
+
 def test_report_marks_unpriced_rows_rather_than_showing_them_as_free():
     sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
     usage_report = UsageReport(

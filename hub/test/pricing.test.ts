@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { costOfUsage, isBillableModel, priceAt, priceKeyCandidates, type ModelPrice } from '../src/pricing';
+import { classifyModel, costOfUsage, isBillableModel, priceAt, priceKeyCandidates, type ModelPrice } from '../src/pricing';
 
 /** Real rates as published by LiteLLM on 2026-07-31, per million tokens. */
 const OPUS: ModelPrice = {
@@ -146,6 +146,56 @@ describe('missing prices', () => {
     expect(isBillableModel('<synthetic>')).toBe(false);
     expect(isBillableModel(null)).toBe(false);
     expect(isBillableModel('claude-opus-5')).toBe(true);
+  });
+
+  // A boolean collapsed two opposite cases: `<synthetic>` never hit an API (not coverage loss),
+  // while a NULL model burned real tokens at a rate we can't determine (very much coverage loss).
+  it('separates sentinel models from unknown ones', () => {
+    expect(classifyModel('<synthetic>')).toBe('sentinel');
+    expect(classifyModel('<any-future-sentinel>')).toBe('sentinel');
+    expect(classifyModel(null)).toBe('unknown');
+    expect(classifyModel(undefined)).toBe('unknown');
+    expect(classifyModel('')).toBe('unknown');
+    expect(classifyModel('claude-opus-5')).toBe('billable');
+  });
+
+  it('reports no billable input for a row it cannot price', () => {
+    // billableInputTokens means "input actually billed at the input rate". Returning the raw
+    // count for an unpriced row lets a caller sum billable input across rows whose dollars are
+    // missing — and for an unmatched subset model it would wrongly include the cached prefix.
+    const c = costOfUsage({ model: 'brand-new-model', input_tokens: 50_000, cache_read_tokens: 40_000 }, null);
+    expect(c.unpriced).toBe(true);
+    expect(c.billableInputTokens).toBe(0);
+    expect(c.rateSet).toBe('none');
+  });
+
+  it('requires a rate only for token classes that are actually present', () => {
+    // Upstream publishes partial entries. Discarding a known input cost because output_cost is
+    // null throws away real, correctly-priceable usage on a row that produced no output.
+    const noOutputRate: ModelPrice = { ...OPUS, output_cost: null };
+    const inputOnly = costOfUsage({ model: 'claude-opus-5', input_tokens: 1_000_000, output_tokens: 0 }, noOutputRate);
+    expect(inputOnly.unpriced).toBe(false);
+    expect(inputOnly.usd).toBeCloseTo(5, 10);
+
+    // ...but a row that DOES have output tokens still can't be priced without the rate.
+    const withOutput = costOfUsage({ model: 'claude-opus-5', input_tokens: 1_000_000, output_tokens: 1 }, noOutputRate);
+    expect(withOutput.unpriced).toBe(true);
+
+    const noInputRate: ModelPrice = { ...OPUS, input_cost: null };
+    const outputOnly = costOfUsage({ model: 'claude-opus-5', input_tokens: 0, output_tokens: 1_000_000 }, noInputRate);
+    expect(outputOnly.unpriced).toBe(false);
+    expect(outputOnly.usd).toBeCloseTo(25, 10);
+  });
+});
+
+describe('rate set reporting', () => {
+  it('reports which rate set actually priced the row', () => {
+    const u = { model: 'gpt-5.6-luna', input_tokens: 1_000_000, output_tokens: 0 };
+    expect(costOfUsage(u, LUNA).rateSet).toBe('standard');
+    expect(costOfUsage(u, LUNA, { batch: true }).rateSet).toBe('batch');
+    // Anthropic publishes no batch tier, so batch=1 silently falls back to standard rates. The
+    // caller has to be able to see that, or it will label standard dollars as batch-priced.
+    expect(costOfUsage({ model: 'claude-opus-5', input_tokens: 1 }, OPUS, { batch: true }).rateSet).toBe('standard');
   });
 });
 

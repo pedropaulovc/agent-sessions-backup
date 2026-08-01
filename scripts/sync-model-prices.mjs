@@ -101,9 +101,10 @@ function extract(entry, key, model, today) {
     output_cost: perM(entry.output_cost_per_token),
     cache_read_cost: perM(entry.cache_read_input_token_cost ?? entry.input_cost_per_token_cache_hit),
     cache_write_5m_cost: perM(entry.cache_creation_input_token_cost),
-    cache_write_1h_cost: perM(
-      entry.cache_creation_input_token_cost_above_1hr ?? entry.cache_creation_input_token_cost,
-    ),
+    // NULL when upstream omits the 1h rate -- never the 5m rate standing in for it. The 1h
+    // write is 2x input where the 5m write is 1.25x, and storing the substitute made it
+    // indistinguishable from a published rate, so the hub's missing-rate guard never fired.
+    cache_write_1h_cost: perM(entry.cache_creation_input_token_cost_above_1hr),
     input_cost_batch: perM(entry.input_cost_per_token_batches),
     output_cost_batch: perM(entry.output_cost_per_token_batches),
     max_input_tokens: entry.max_input_tokens ?? null,
@@ -121,6 +122,11 @@ const RATE_COLS = [
   'input_cost_batch',
   'output_cost_batch',
 ];
+
+// Not rates, but they change what a row costs: cache_accounting is derived from provider, and
+// flipping subset<->disjoint changes whether cache reads are charged on top of input or
+// subtracted from it. Kept in lockstep with hub/src/cron/model-prices.ts.
+const ACCOUNTING_COLS = ['provider', 'cache_accounting'];
 
 async function main() {
   const today = new Date().toISOString().slice(0, 10);
@@ -141,8 +147,8 @@ async function main() {
   process.stderr.write(`models to price: ${models.length}\n`);
 
   const existing = d1(
-    `SELECT model, effective_from, ${RATE_COLS.join(', ')} FROM model_prices
-      ORDER BY model, effective_from DESC`,
+    `SELECT model, effective_from, ${RATE_COLS.join(', ')}, ${ACCOUNTING_COLS.join(', ')}
+       FROM model_prices ORDER BY model, effective_from DESC`,
   )[0]?.results ?? [];
   const latest = new Map();
   for (const row of existing) if (!latest.has(row.model)) latest.set(row.model, row);
@@ -157,8 +163,12 @@ async function main() {
     }
     const next = extract(upstream[key], key, model, today);
     const prev = latest.get(model);
-    // Only snapshot when a rate actually moved. Re-running daily must not grow the table.
-    const changed = !prev || RATE_COLS.some((c) => (prev[c] ?? null) !== (next[c] ?? null));
+    // Only snapshot when a rate -- or the accounting convention -- actually moved. Re-running
+    // daily must not grow the table.
+    const changed =
+      !prev ||
+      RATE_COLS.some((c) => (prev[c] ?? null) !== (next[c] ?? null)) ||
+      ACCOUNTING_COLS.some((c) => (prev[c] ?? null) !== (next[c] ?? null));
     if (changed) inserts.push(next);
   }
 
