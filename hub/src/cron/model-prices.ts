@@ -10,6 +10,7 @@ import {
   cacheAccountingFor,
   intOrNull,
   perM,
+  lookupEntry,
   priceKeyCandidates,
   providerOf,
 } from '../upstream-catalog.mjs';
@@ -56,7 +57,9 @@ export async function runModelPriceSync(env: Env): Promise<void> {
   const today = new Date().toISOString().slice(0, 10);
   const now = new Date().toISOString();
   try {
-    const res = await fetch(UPSTREAM, { cf: { cacheTtl: 3600 } });
+    // Bounded: a hung upstream would otherwise hold the scheduled invocation open until the
+    // platform kills it, with no audit row written and no signal that the day's sync never ran.
+    const res = await fetch(UPSTREAM, { cf: { cacheTtl: 3600 }, signal: AbortSignal.timeout(20_000) });
     if (!res.ok) throw new Error(`upstream ${res.status} ${res.statusText}`);
     const upstream = (await res.json()) as Record<string, Record<string, unknown>>;
     const entryCount = assertLooksLikeCatalog(upstream);
@@ -82,8 +85,13 @@ export async function runModelPriceSync(env: Env): Promise<void> {
 
     const prevRows = (
       await env.DB.prepare(
-        `SELECT model, ${RATE_COLS.join(', ')}, ${ACCOUNTING_COLS.join(', ')}
-           FROM model_prices ORDER BY model, effective_from DESC`,
+        // Latest snapshot per model only. This table accumulates history indefinitely by design,
+        // and the change predicate compares against the newest row alone -- reading the whole
+        // history to discard all but the first row per model gets slower every day for nothing.
+        `SELECT p.model, ${RATE_COLS.map((c) => `p.${c}`).join(', ')}, ${ACCOUNTING_COLS.map((c) => `p.${c}`).join(', ')}
+           FROM model_prices p
+           JOIN (SELECT model, MAX(effective_from) AS newest FROM model_prices GROUP BY model) t
+             ON t.model = p.model AND t.newest = p.effective_from`,
       ).all<{ model: string } & Rates & Accounting>()
     ).results;
     const latest = new Map<string, Rates & Accounting>();
@@ -97,7 +105,7 @@ export async function runModelPriceSync(env: Env): Promise<void> {
         deferred++;
         continue;
       }
-      const key = priceKeyCandidates(model).find((c) => upstream[c]);
+      const key = priceKeyCandidates(model).find((c) => lookupEntry(upstream, c));
       if (!key) {
         unresolved.push(model);
         continue;
@@ -124,10 +132,12 @@ export async function runModelPriceSync(env: Env): Promise<void> {
       // a Claude Code row stores cache_read_input_tokens as disjoint usage, so subset accounting
       // subtracts those tokens from input and underprices every cached call -- silently, with the
       // row still reported as priced. An absent or unrecognised `litellm_provider` now stores
-      // 'unknown', which costOfUsage treats as unpriced for any row that actually has cache
-      // reads. NOT null: the column is NOT NULL, and INSERT OR REPLACE silently substitutes the
-      // column DEFAULT for a NULL rather than failing, so a nullable-looking write would have
-      // stored 'disjoint' while the code believed otherwise (see migration 0017).
+      // 'unknown' for an absent or unrecognised provider, which costOfUsage treats as unpriced
+      // for any row that actually has cache reads. NOT null: the column is NOT NULL, and
+      // INSERT OR REPLACE silently substitutes the column DEFAULT for a NULL rather than failing,
+      // so a nullable-looking write would have stored 'disjoint' while the code believed
+      // otherwise (see migration 0017). The provider->convention map lives in upstream-catalog.mjs
+      // so the cron and the manual script cannot disagree about it.
       const cacheAccounting = cacheAccountingFor(provider);
       const prev = latest.get(model);
       const ratesUnchanged = prev && RATE_COLS.every((c) => (prev[c] ?? null) === (next[c] ?? null));
@@ -193,12 +203,22 @@ export async function runModelPriceSync(env: Env): Promise<void> {
   } catch (err) {
     // A failed sync must be visible in the data, not just in logs -- a silently stale price
     // table produces confident, wrong dollar figures.
+    // If D1 itself is the problem, this INSERT throws too -- and an unguarded throw here would
+    // REPLACE the original error with a less informative one, losing the reason the sync failed.
     await env.DB.prepare(
       `INSERT INTO model_prices_sync (upstream_entries, models_seen, rows_inserted, ok, error)
        VALUES (NULL, NULL, 0, 0, ?1)`,
     )
       .bind(err instanceof Error ? err.message : String(err))
-      .run();
+      .run()
+      .catch((auditErr) => {
+        console.log(
+          JSON.stringify({
+            event: 'hub.model_prices.audit_write_failed',
+            detail: auditErr instanceof Error ? auditErr.message : String(auditErr),
+          }),
+        );
+      });
     throw err;
   }
 }

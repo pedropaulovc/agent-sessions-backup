@@ -280,4 +280,26 @@ describe('model price autorefresh', () => {
     expect(row.max_input_tokens).toBe(null);
     expect(row.max_output_tokens).toBe(null);
   });
+
+  it('does not resolve a model named after an Object.prototype key', async () => {
+    // `catalog['constructor']` is truthy on any plain object, so a bare property read resolved
+    // this model to an inherited FUNCTION and treated it as a price entry. Model ids come from
+    // transcripts and are arbitrary strings, so this is reachable input.
+    await testEnv.DB.prepare(
+      `INSERT INTO usage (session_id, turn_index, ts, model) VALUES ('sync-sess', 7, '2026-07-01T00:00:00Z', 'constructor')`,
+    ).run();
+    mockUpstream({ 'claude-opus-5': entry() });
+    await runModelPriceSync(testEnv);
+
+    const sync = (
+      await testEnv.DB.prepare('SELECT unresolved FROM model_prices_sync ORDER BY id DESC LIMIT 1').all<{
+        unresolved: string | null;
+      }>()
+    ).results[0]!;
+    expect(sync.unresolved ?? '', 'a prototype key was treated as a catalog entry').toContain('constructor');
+    const row = await testEnv.DB.prepare('SELECT model FROM model_prices WHERE model = ?1')
+      .bind('constructor')
+      .first();
+    expect(row).toBe(null);
+  });
 });

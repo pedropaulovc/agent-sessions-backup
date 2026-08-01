@@ -6,3 +6,4 @@ export declare function undatedModel(model: string): string;
 export declare function priceKeyCandidates(model: string): string[];
 export declare function providerOf(entry: unknown): string | null;
 export declare function cacheAccountingFor(provider: string | null): 'disjoint' | 'subset' | 'unknown';
+export declare function lookupEntry(catalog: Record<string, unknown>, key: string): unknown;

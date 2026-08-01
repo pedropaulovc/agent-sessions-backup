@@ -82,6 +82,17 @@ export function undatedModel(model) {
 
 /** Upstream keys to try for a model id, best match first. Shared by pricing.ts, the cron and the
  * manual script -- three copies of this drifted apart once already. */
+/** Own-property lookup for a candidate key.
+ *
+ * `upstream['constructor']` (or 'toString', '__proto__', …) is TRUTHY on any plain object, so a
+ * bare `upstream[c]` read resolves those model names to an inherited function and then treats it
+ * as a price entry. Model ids come from transcripts and are arbitrary strings, so this is
+ * reachable input, not a theoretical one.
+ */
+export function lookupEntry(catalog, key) {
+  return Object.prototype.hasOwnProperty.call(catalog, key) ? catalog[key] : undefined;
+}
+
 export function priceKeyCandidates(model) {
   const out = [model];
   const undated = undatedModel(model);

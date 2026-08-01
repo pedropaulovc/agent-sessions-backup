@@ -18,7 +18,7 @@ import { execFileSync } from 'node:child_process';
 import { writeFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 // Coercion + validation shared verbatim with hub/src/cron/model-prices.ts. These two drifted
 // three times in one review; the rules now live in one file.
 import {
@@ -26,6 +26,7 @@ import {
   cacheAccountingFor,
   intOrNull,
   perM,
+  lookupEntry,
   priceKeyCandidates,
   providerOf,
 } from '../hub/src/upstream-catalog.mjs';
@@ -38,10 +39,7 @@ const REMOTE = ARGS.has('--remote');
 const DRY = ARGS.has('--dry-run');
 const ALL = ARGS.has('--all');
 
-const PER_MILLION = 1_000_000;
 /** Upstream stores dollars per token; the table stores dollars per million tokens. */
-// Round after scaling: 2e-8 * 1e6 lands on 0.019999999999999998 in binary float, which is
-// numerically irrelevant but makes the stored table look untrustworthy.
 
 const sqlStr = (v) => (v == null ? 'NULL' : `'${String(v).replaceAll("'", "''")}'`);
 
@@ -66,7 +64,9 @@ function run(args) {
   return execFileSync('npx', ['wrangler', 'd1', 'execute', DB, REMOTE ? '--remote' : '--local', ...args], {
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
-    cwd: new URL('../hub/', import.meta.url).pathname,
+    // fileURLToPath, not .pathname: the latter is percent-ENCODED, so a checkout under a path
+    // containing a space hands execFileSync a literal %20 and it fails with ENOENT.
+    cwd: fileURLToPath(new URL('../hub/', import.meta.url)),
     env: process.env,
   });
 }
@@ -168,7 +168,7 @@ async function main() {
   const inserts = [];
   const unresolved = [];
   for (const model of models) {
-    const key = priceKeyCandidates(model).find((c) => upstream[c]);
+    const key = priceKeyCandidates(model).find((c) => lookupEntry(upstream, c));
     if (!key) {
       unresolved.push(model);
       continue;
