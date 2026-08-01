@@ -598,6 +598,12 @@ export async function usage(url: URL, env: Env): Promise<Response> {
               -- These are booleans, so the fan-out is bounded and in practice tiny: a model's
               -- calls nearly all share one shape (input+output, or input+output+cache).
               (COALESCE(u.input_tokens,0) > 0) AS has_input,
+              -- Under subset accounting the input rate applies to MAX(0, input - cache_read), not
+              -- to raw input, so THAT is the rate-dependent class. A fully-cached call
+              -- (input == cache_read) needs no input rate and stays priceable from the cache-read
+              -- rate alone; grouping it with a partly-fresh call would put positive fresh input in
+              -- the aggregate and discard its valid cost.
+              (MAX(0, COALESCE(u.input_tokens,0) - COALESCE(u.cache_read_tokens,0)) > 0) AS has_fresh_input,
               (COALESCE(u.output_tokens,0) > 0) AS has_output,
               (COALESCE(u.cache_read_tokens,0) > 0) AS has_cache_read,
               (COALESCE(u.cache_creation_5m_tokens,0) > 0) AS has_w5,
@@ -617,7 +623,7 @@ export async function usage(url: URL, env: Env): Promise<Response> {
                 AS fresh_input_tokens
        FROM usage u JOIN sessions s ON s.session_id = u.session_id
        ${where}
-       GROUP BY bucket, u.model, epoch, has_input, has_output, has_cache_read, has_w5, has_w1h
+       GROUP BY bucket, u.model, epoch, has_input, has_fresh_input, has_output, has_cache_read, has_w5, has_w1h
      )
      SELECT a.* FROM agg a
      JOIN (SELECT bucket FROM agg GROUP BY bucket ORDER BY bucket DESC LIMIT ?${binds.length + 1}) top

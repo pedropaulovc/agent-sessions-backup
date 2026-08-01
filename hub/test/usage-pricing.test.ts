@@ -253,6 +253,40 @@ describe('token-class shapes are priced independently', () => {
   });
 });
 
+describe('subset models split on fresh input, not raw input', () => {
+  beforeAll(async () => {
+    // A subset-accounting model with a cache-read rate but NO input rate. A fully-cached call
+    // (input == cache_read, so zero fresh input) needs no input rate and is priceable from the
+    // cache-read rate alone; a partly-fresh call is not.
+    await testEnv.DB.prepare(
+      `INSERT INTO model_prices
+         (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
+          cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
+          cache_accounting, source, fetched_at)
+       VALUES ('cached-only-model', '2026-01-01', 'cached-only-model', 'openai', NULL, 1, 2, 0, 0,
+               NULL, NULL, 'subset', 'test', '2026-01-01T00:00:00Z')`,
+    ).run();
+    await testEnv.DB.prepare(
+      `INSERT INTO sessions (session_id, harness, machine_id, repo_url, started_at, index_state)
+       VALUES ('sess-cached', 'codex', 'cachedbox', 'https://github.com/c/d', '2026-06-01T00:00:00Z', 'ready')`,
+    ).run();
+    // Fully cached: 1M input, all of it cached -> 0 fresh -> priceable at 1M * 2 / 1M = $2.
+    await seedUsage('sess-cached', '2026-06-01T10:00:00Z', 'cached-only-model', {
+      input: 1_000_000,
+      cacheRead: 1_000_000,
+    });
+    // Partly fresh: needs the absent input rate, so it stays unpriced.
+    await seedUsage('sess-cached', '2026-06-01T11:00:00Z', 'cached-only-model', { input: 400, cacheRead: 100 });
+  });
+
+  it('prices the fully-cached call even though the input rate is missing', async () => {
+    const body = await fetchUsage('group_by=model&machine=cachedbox');
+    const row = body.rows.find((r) => r.bucket === 'cached-only-model');
+    expect(row!.cost_usd).toBeCloseTo(2, 6);
+    expect(row!.unpriced_calls).toBe(1);
+  });
+});
+
 describe('cost_basis honesty', () => {
   it('does not claim batch pricing for a model with no batch tier', async () => {
     // The seeded claude-opus-5 rows have NULL batch rates, so batch=1 falls back to standard.

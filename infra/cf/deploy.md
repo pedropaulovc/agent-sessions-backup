@@ -54,20 +54,33 @@ selected environment's bindings. Without that job a branch preview runs new code
 old preview schema — PR #65 shipped migration 0016 and every `/api/v1/usage` request on its
 preview returned `no such table: model_prices` until the migration was applied by hand.
 
-That job needs its own repo secret, **`CLOUDFLARE_PREVIEW_API_TOKEN`**, scoped to **D1:Edit +
-Account Settings:Read and nothing else**. It must NOT be `CLOUDFLARE_API_TOKEN`, and the job
-deliberately has no fallback to it: `migrate-preview` runs on pull requests, so it executes
-PR-authored code, and for a same-repo PR GitHub runs the PR's own copy of the workflow — a PR
-can therefore print any secret the job is handed. The `deploy` token can edit production D1,
-Workers, queues, R2, KV and zone routes, so handing it to that job would put production one
-malicious (or compromised-dependency) PR away. Until the preview secret exists the job skips
-with a notice and previews stay unmigrated; that is the intended failure direction. The job
-also runs `npm ci --ignore-scripts` and asserts `env.preview`'s `database_id` matches the
-preview DB before migrating, which guards against a compromised dependency or a PR quietly
-repointing `wrangler.jsonc` at production — neither substitutes for the scoped token.
+That job needs its own repo secret, **`CLOUDFLARE_PREVIEW_API_TOKEN`** (D1:Edit + Account
+Settings:Read). It must NOT be `CLOUDFLARE_API_TOKEN`, and the job has no fallback to it: the
+`deploy` token can edit production D1, Workers, queues, R2, KV and zone routes, and
+`migrate-preview` runs PR-authored code.
 
-It runs under the `preview` GitHub Environment, which is where to attach required reviewers if
-this repo ever accepts pull requests from people who should not hold that credential.
+**Add a required-reviewer rule to the `preview` environment BEFORE setting that secret.** Scoping
+the token is not sufficient on its own, for two compounding reasons. Cloudflare's D1 permissions
+are *account*-scoped — unlike an R2 bucket, there is no "one database" resource for D1 — so a
+"preview" token can still write the production database, whose id is committed in
+`wrangler.jsonc`. And for a same-repo PR, GitHub runs the PR's *own* copy of the workflow, so a
+PR can rewrite the job to use the token against any database and bypass the id assertion. That
+leaves approval as the control that actually holds: with a protection rule, a run cannot reach
+the credential until a human approves it.
+
+If that friction is unwanted, the alternatives are to host the preview D1 in a separate
+Cloudflare account, or to drop PR-triggered migrations and apply them by hand.
+
+Until the secret exists the job skips with a notice and previews stay unmigrated — the intended
+failure direction, and safe by default since there is no credential to leak. `npm ci
+--ignore-scripts` and the `database_id` assertion remain as defence against a compromised
+*dependency*; neither constrains a malicious author.
+
+**Workflow edits must be checked with `actionlint .github/workflows/*.yml` before pushing.** A bad
+Actions expression is rejected at validation time and the run produces *zero* jobs, so every other
+check silently never runs — `152d7f1` referenced `secrets` in a step `if:` and took `hub`,
+`client` and `collector` down with it. A YAML parse does not catch this; actionlint does. CI runs
+it too, but it cannot catch a fatal error in its own file, because validation precedes scheduling.
 
 ## Stable branch preview front door
 
