@@ -202,6 +202,46 @@ def test_usage_group_by_model(hub):
     assert report.rows[0].total_tokens == 100 + 200 + 0 + 50 + 5 + 0
 
 
+def test_usage_parses_pricing_fields(hub):
+    hub.usage_rows = [
+        {
+            "bucket": "claude-sonnet-5",
+            "calls": 10,
+            "input_tokens": 100,
+            "output_tokens": 200,
+            "cost_usd": 1.25,
+            "billable_input_tokens": 60,
+            "unpriced_calls": 2,
+        }
+    ]
+    hub.usage_unpriced_models = ["brand-new-model"]
+    report = api_for(hub).usage(group_by="model")
+    assert report.rows[0].cost_usd == 1.25
+    # Not derivable from input_tokens once rows are aggregated under subset cache accounting.
+    assert report.rows[0].billable_input_tokens == 60
+    assert report.total_cost_usd == 1.25
+    assert report.unpriced_calls == 2
+    assert report.cost_basis == "litellm_list_price"
+    assert report.unpriced_models == ["brand-new-model"]
+
+
+def test_usage_forwards_batch_flag_only_when_asked(hub):
+    hub.usage_rows = []
+    api = api_for(hub)
+    api.usage(group_by="model")
+    assert "batch" not in hub.requests[-1]["params"]
+    api.usage(group_by="model", batch=True)
+    assert hub.requests[-1]["params"]["batch"] == ["1"]
+
+
+def test_usage_forwards_machine_and_harness_filters(hub):
+    hub.usage_rows = []
+    api_for(hub).usage(group_by="model", machine="amet-wsl", harness="codex")
+    params = hub.requests[-1]["params"]
+    assert params["machine"] == ["amet-wsl"]
+    assert params["harness"] == ["codex"]
+
+
 def test_status_parses_machines_and_summary(hub):
     hub.status_machines = [
         {

@@ -28,6 +28,10 @@ class FakeHub:
         self.indexed_through_by_request: list[str | None] | None = None
         self.search_hits: list[dict] = []
         self.usage_rows: list[dict] = []
+        # `str | None`, not `str`: the hub omits `cost_basis` entirely when nothing priced, and
+        # the client reads a missing value as "not priced" -- a test must be able to fake that.
+        self.usage_cost_basis: str | None = "litellm_list_price"
+        self.usage_unpriced_models: list[str] = []
         self.status_machines: list[dict] = []
         self.status_sessions: dict = {"total": 0, "ready": 0, "error": 0}
         self.sessions_limit_cap = 1000  # mirrors clampLimit()'s hard max in sessions.ts
@@ -161,7 +165,15 @@ def _make_handler(hub: FakeHub):
                 return
             if parsed.path == "/api/v1/usage":
                 group_by = (params.get("group_by") or ["day"])[0]
-                self._json(200, {"group_by": group_by, "rows": hub.usage_rows})
+                self._json(
+                    200,
+                    {
+                        "group_by": group_by,
+                        "rows": hub.usage_rows,
+                        "cost_basis": hub.usage_cost_basis,
+                        "unpriced_models": hub.usage_unpriced_models,
+                    },
+                )
                 return
             if parsed.path == "/api/v1/status":
                 self._json(200, {"machines": hub.status_machines, "sessions": hub.status_sessions})

@@ -51,6 +51,35 @@ def test_daily_report_end_to_end(hub, capsys):
     assert "claude-sonnet-5" in out
 
 
+def test_daily_report_scopes_usage_to_the_active_filters(hub):
+    # The report used to filter the sessions list by --machine/--harness while fetching
+    # fleet-wide usage, so the two halves of one report described different populations.
+    hub.sessions = [make_session_row("s1")]
+    hub.usage_rows = []
+    rc = main(
+        [
+            "daily-report",
+            "--date",
+            "2026-07-18",
+            "--machine",
+            "amet-wsl",
+            "--harness",
+            "codex",
+            "--hub-url",
+            hub.url,
+            "--bearer-token",
+            "tok",
+            "--dev-machine",
+            "test-machine",
+        ]
+    )
+    assert rc == 0
+    usage_requests = [r for r in hub.requests if r["path"] == "/api/v1/usage"]
+    assert len(usage_requests) == 1
+    assert usage_requests[0]["params"]["machine"] == ["amet-wsl"]
+    assert usage_requests[0]["params"]["harness"] == ["codex"]
+
+
 def test_daily_report_writes_to_out_file(hub, tmp_path):
     hub.sessions = []
     out_path = tmp_path / "report.md"

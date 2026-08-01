@@ -6,6 +6,26 @@ on:
     branches: [main]
 
 jobs:
+  # A workflow expression error is not a test failure — GitHub rejects the file at VALIDATION time
+  # and the run produces ZERO jobs, so every other check silently never runs. `yaml.safe_load` does
+  # not catch it (the YAML is fine; the Actions expression is not). actionlint does, and would have
+  # caught the `secrets`-in-`if:` that took this whole workflow down on 152d7f1.
+  #
+  # This job cannot catch a fatal error in its own file for the same reason it exists — validation
+  # precedes job scheduling. Run `actionlint .github/workflows/*.yml` locally before pushing
+  # workflow edits; this covers the non-fatal expression/shell mistakes and any other workflow file.
+  actions-lint:
+    runs-on: ubuntu-latest
+    steps:
+      # No credentials left in .git/config: nothing here needs to push, and a job that does not
+      # need a token should not be holding one where a compromised action could read it.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: |
+          bash <(curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash) latest .
+          ./actionlint -color
+
   hub:
     runs-on: ubuntu-latest
     defaults:
@@ -44,6 +64,125 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uv sync
       - run: uv run pytest
+
+  # Same migrate-before-code rule as `deploy` below, for the branch previews. Workers Builds owns the
+  # preview deploy (`wrangler versions upload --env preview`, configured in the dashboard — see
+  # infra/cf/deploy.md) and it applies no migrations, so a branch preview would otherwise run new code
+  # against `sessions-index-preview`'s old schema. That is not hypothetical: PR #65 added migration 0016
+  # and every `/api/v1/usage` request on its preview failed with `no such table: model_prices` because
+  # the preview DB was never migrated.
+  #
+  # This job cannot strictly order itself before the Workers Builds deploy (different systems, no shared
+  # gate), so a preview can still serve new-code-on-old-schema for the minute or two until this lands.
+  # It converges, which the status quo never does. Gated on `hub` for the same reason `deploy` is: the
+  # test suite applies every migration, so a broken one never reaches a real database.
+  #
+  # The preview D1 is shared by all branches, so an unmerged branch's migration lands here early. That
+  # is already true of every other preview resource and is the accepted cost of one shared preview env.
+  # SECURITY: this job runs PR-CONTROLLED code, so any secret it is handed is reachable by a PR.
+  # It never uses CLOUDFLARE_API_TOKEN (the `deploy` credential, which can edit production D1,
+  # Workers, queues, R2, KV and zone routes) and has no fallback to it.
+  #
+  # Least privilege alone does NOT close this, and it is worth being exact about why. Cloudflare's
+  # D1 permissions are ACCOUNT-scoped -- there is no "this one database" resource for D1 the way
+  # there is for an R2 bucket -- so a "preview" D1 token can still write the production database,
+  # whose id is committed in wrangler.jsonc. And for a same-repo PR, GitHub runs the PR's OWN copy
+  # of this workflow file, so a PR author can rewrite this job to use that token against any
+  # database and skip the assertion below entirely. That makes the workflow-level hardening here
+  # (--ignore-scripts, the database-id check) a defence against a compromised DEPENDENCY only,
+  # never against a malicious author.
+  #
+  # The control that actually works is APPROVAL: this job runs in the `preview` GitHub Environment,
+  # and that environment must carry a required-reviewer protection rule before the secret is set,
+  # so a run cannot reach the credential until a human approves it. Alternatives, if that friction
+  # is unwanted: host preview D1 in a separate Cloudflare account, or drop PR-triggered migrations
+  # and apply them manually.
+  #
+  # Safe by default: with CLOUDFLARE_PREVIEW_API_TOKEN unset the job skips and no token exists to
+  # leak. An unmigrated preview is a broken preview; a leaked account token is a bad afternoon.
+  migrate-preview:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: hub
+    # `needs: hub` only orders jobs WITHIN one run, and the preview D1 is shared by every branch —
+    # so two PRs opened around the same time can apply migrations to the same database
+    # concurrently. A repo-wide group (not per-PR) makes them queue instead of race.
+    #
+    # KNOWN LIMIT, deliberately accepted: GitHub keeps at most ONE pending run per group. A third
+    # overlapping run displaces the second, and the displaced one is CANCELLED, not queued behind
+    # it. So with three PRs landing at once, one PR's migrations may not reach the preview
+    # database on that push. That is tolerable here and a real queue is not worth building for it:
+    # the outcome is a visibly cancelled check rather than a silent skip, the endpoint is
+    # idempotent so that PR's next push applies the same set, and `migrate-preview-main` re-applies
+    # everything once the branch merges. What the group DOES buy is the thing that actually
+    # corrupts state — two runs writing the shared database at the same time, where the endpoint's
+    # atomic name claim can order two runs applying the same migration but not two applying
+    # different, dependent ones.
+    concurrency:
+      group: migrate-preview
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    environment: preview
+    defaults:
+      run:
+        working-directory: hub
+    # Secrets CANNOT be referenced in a step's `if:` — GitHub rejects the expression at workflow
+    # VALIDATION time, which fails the whole run with zero jobs (it took hub/client/collector down
+    # with it on 152d7f1, not just this job). Bind the secret to a job-level env var and test that.
+    env:
+      PREVIEW_TOKEN: ${{ secrets.CLOUDFLARE_PREVIEW_API_TOKEN }}
+    steps:
+      # This job holds a Cloudflare credential, so it must not ALSO leave the checkout token in
+      # .git/config where a compromised dependency or action could read it. It never pushes.
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: hub/package-lock.json
+      - id: token
+        run: |
+          if [ -n "$PREVIEW_TOKEN" ]; then
+            echo "present=1" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=0" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.token.outputs.present != '1'
+        run: |
+          echo "::notice::CLOUDFLARE_PREVIEW_API_TOKEN is not set — skipping preview migrations (this is the safe default)."
+          echo "::notice::Before setting it, add a required-reviewer protection rule to the 'preview' environment:"
+          echo "::notice::Cloudflare's D1 permissions are ACCOUNT-scoped, so even a D1-only token can reach the"
+          echo "::notice::production database, and a PR can rewrite this workflow to use it. Approval is the control."
+      # No lifecycle scripts: this job holds a credential, and `npm ci` otherwise executes
+      # postinstall hooks from PR-controlled package.json and its dependency tree before the
+      # token is ever used. wrangler's CLI works fine without them (no local workerd needed for
+      # a --remote migration).
+      - if: steps.token.outputs.present == '1'
+        run: npm ci --ignore-scripts
+      # wrangler resolves the migration target from wrangler.jsonc, which is PR-controlled — a PR
+      # could repoint env.preview at the PRODUCTION database id and have this job migrate prod.
+      # Pin the expected preview database id here, in the workflow, and refuse to run on a mismatch.
+      - if: steps.token.outputs.present == '1'
+        run: |
+          expected=8f2cd488-0060-4f32-8025-f5b461c9fe0a
+          actual=$(node -e '
+            const fs=require("fs");
+            const raw=fs.readFileSync("wrangler.jsonc","utf8").replace(/^\s*\/\/.*$/gm,"");
+            const db=JSON.parse(raw).env.preview.d1_databases.find(d=>d.binding==="DB");
+            process.stdout.write(db.database_id);
+          ')
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::env.preview DB id is $actual, expected the preview database $expected — refusing to migrate."
+            exit 1
+          fi
+      # `DB --env preview`, not the database name: `sessions-index-preview` is declared only under
+      # env.preview, and wrangler resolves migration targets against the selected environment's
+      # bindings, so the bare name errors with "Couldn't find a D1 DB with the name or binding".
+      - if: steps.token.outputs.present == '1'
+        run: npx wrangler d1 migrations apply DB --env preview --remote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_PREVIEW_API_TOKEN }}
 
   # Migrate D1 then deploy the hub Worker, in that order, on merge to main. This is the SOLE deployer:
   # Cloudflare Workers Builds auto-deploy is turned OFF so nothing races us. Applying migrations before

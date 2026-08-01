@@ -19,3 +19,9 @@ infra/out/
 *.pfx
 *.cer
 *.client.key
+
+# Playwright CLI page snapshots: these capture whatever was on screen, which for this
+# project is real session data (prompts, machine names, local paths, session UUIDs) served
+# from the authenticated viewer. Never commit them.
+.playwright-cli/
+actionlint

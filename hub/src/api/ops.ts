@@ -1,5 +1,13 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
+import {
+  classifyModel,
+  costOfUsage,
+  loadPrices,
+  priceAt,
+  type ModelPrice,
+  type UsageTokens,
+} from '../pricing';
 import { reservationCutoffIso } from '../queue';
 import { getClientCertFingerprint, queueRetiredIfDisplaced, rotationCas, settleRetired, type RotationState } from './certs';
 import { normalizeToBound } from './sessions';
@@ -563,22 +571,301 @@ export async function usage(url: URL, env: Env): Promise<Response> {
     filters.push(`s.harness = ?${binds.length}`);
   }
   const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+
+  const prices = await loadPrices(env.DB);
+  // Cost has to be summed per (bucket, model, price epoch). Per model, because each model has
+  // its own rates AND its own cache-accounting convention. Per epoch, because `bucket` is only
+  // a timestamp when group_by=day — for model/machine/repo it is an identifier, so pricing a
+  // whole bucket at `priceAt(bucket)` would compare a rate date against a model name and pick
+  // an arbitrary rate for all of history. The epoch restores the time dimension the bucket
+  // lost. Grouping by the distinct `effective_from` boundaries rather than by day is what
+  // keeps that affordable: rates change on snapshot boundaries (a handful, ever), so an epoch
+  // group is guaranteed to sit at one rate while the fan-out stays bucket x model x ~epochs
+  // instead of bucket x model x every-day-in-range.
+  const epochExpr = priceEpochExpr(prices);
   const rows = await env.DB.prepare(
-    `SELECT ${expr} AS bucket,
-            COUNT(*) AS calls,
-            SUM(COALESCE(u.input_tokens,0)) AS input_tokens,
-            SUM(COALESCE(u.output_tokens,0)) AS output_tokens,
-            SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens,
-            SUM(COALESCE(u.cache_read_tokens,0)) AS cache_read_tokens,
-            SUM(COALESCE(u.cache_creation_5m_tokens,0)) AS cache_creation_5m_tokens,
-            SUM(COALESCE(u.cache_creation_1h_tokens,0)) AS cache_creation_1h_tokens
-     FROM usage u JOIN sessions s ON s.session_id = u.session_id
-     ${where} GROUP BY bucket ORDER BY bucket DESC LIMIT 400`,
+    `WITH agg AS (
+       SELECT ${expr} AS bucket,
+              u.model AS model,
+              ${epochExpr} AS epoch,
+              -- Split groups by which token classes are PRESENT. Every one of these can
+              -- independently require a nullable rate, and costOfUsage marks a row unpriced when
+              -- a rate it needs is missing — so mixing shapes lets one unpriceable call drag
+              -- perfectly priceable neighbours to $0/unpriced. Concretely, with a partial
+              -- upstream entry that has an input rate but no output rate, an input-only call
+              -- grouped with an output-bearing one loses its own valid cost.
+              --
+              -- These are booleans, so the fan-out is bounded and in practice tiny: a model's
+              -- calls nearly all share one shape (input+output, or input+output+cache).
+              (COALESCE(u.input_tokens,0) > 0) AS has_input,
+              -- Under subset accounting the input rate applies to MAX(0, input - cache_read), not
+              -- to raw input, so THAT is the rate-dependent class. A fully-cached call
+              -- (input == cache_read) needs no input rate and stays priceable from the cache-read
+              -- rate alone; grouping it with a partly-fresh call would put positive fresh input in
+              -- the aggregate and discard its valid cost.
+              (MAX(0, MAX(0, COALESCE(u.input_tokens,0)) - MAX(0, COALESCE(u.cache_read_tokens,0))) > 0)
+                AS has_fresh_input,
+              (COALESCE(u.output_tokens,0) > 0) AS has_output,
+              (COALESCE(u.cache_read_tokens,0) > 0) AS has_cache_read,
+              (COALESCE(u.cache_creation_5m_tokens,0) > 0) AS has_w5,
+              (COALESCE(u.cache_creation_1h_tokens,0) > 0) AS has_w1h,
+              COUNT(*) AS calls,
+              -- MAX(0, ...) on every class: the usage table has no nonnegative constraint and both
+              -- parsers accept whatever a transcript reports, so a negative counter would
+              -- otherwise produce a negative cost_usd reported as fully priced -- and, summed,
+              -- would cancel real cost from valid calls sharing the bucket.
+              SUM(MAX(0, COALESCE(u.input_tokens,0))) AS input_tokens,
+              SUM(MAX(0, COALESCE(u.output_tokens,0))) AS output_tokens,
+              SUM(MAX(0, COALESCE(u.reasoning_tokens,0))) AS reasoning_tokens,
+              SUM(MAX(0, COALESCE(u.cache_read_tokens,0))) AS cache_read_tokens,
+              SUM(MAX(0, COALESCE(u.cache_creation_5m_tokens,0))) AS cache_creation_5m_tokens,
+              SUM(MAX(0, COALESCE(u.cache_creation_1h_tokens,0))) AS cache_creation_1h_tokens,
+              -- Subset-accounting models bill only input beyond the cached prefix, and the
+              -- clamp at 0 is nonlinear, so it has to happen per row: one truncated call with
+              -- cache_read > input would otherwise cancel fresh input from valid calls in the
+              -- same group. costOfUsage() consumes this instead of clamping the SUMs.
+              --
+              -- BOTH operands are clamped before the subtraction, not just the result. A negative
+              -- cache_read would otherwise ADD to fresh input: (5) - (-100) = 105 billable tokens
+              -- on a row whose own reported columns say input=5, cache_read=0.
+              SUM(MAX(0, MAX(0, COALESCE(u.input_tokens,0)) - MAX(0, COALESCE(u.cache_read_tokens,0))))
+                AS fresh_input_tokens,
+              -- The other half of the same clamp, and nonlinear for the same reason. Under subset
+              -- accounting cached tokens are part of input, so the cache-read CHARGE cannot exceed
+              -- input either: input=500 with cache_read=9000 is 0 fresh input AND at most 500
+              -- billable cached tokens, not 9000.
+              SUM(MIN(MAX(0, COALESCE(u.cache_read_tokens,0)), MAX(0, COALESCE(u.input_tokens,0))))
+                AS billable_cache_read_tokens
+       FROM usage u JOIN sessions s ON s.session_id = u.session_id
+       ${where}
+       GROUP BY bucket, u.model, epoch, has_input, has_fresh_input, has_output, has_cache_read, has_w5, has_w1h
+     )
+     SELECT a.* FROM agg a
+     JOIN (SELECT bucket FROM agg GROUP BY bucket ORDER BY bucket DESC LIMIT ?${binds.length + 1}) top
+       -- \`IS\`, not \`=\`: a NULL bucket (group_by=repo over sessions with no repo_url, or any
+       -- nullable grouping column) never equals itself, so \`bucket IN (subquery)\` silently
+       -- dropped those calls from the response entirely even though the subquery contained the
+       -- NULL bucket. SQLite's IS is NULL-safe equality.
+       ON a.bucket IS top.bucket`,
   )
-    .bind(...binds)
-    .all();
-  return Response.json({ group_by: groupBy, rows: rows.results });
+    .bind(...binds, MAX_BUCKETS)
+    .all<UsageAggRow>();
+
+  const batch = url.searchParams.get('batch') === '1';
+  const byBucket = new Map<string | null, UsageOutRow>();
+  const unpricedModels = new Set<string>();
+  const rateSetsUsed = new Set<'standard' | 'batch' | 'mixed'>();
+
+  for (const r of rows.results ?? []) {
+    // Key by the bucket VALUE, not String(bucket): a NULL bucket and a bucket whose literal text
+    // is "null" (a repo_url or model that really is the string "null") both stringify to "null"
+    // and would merge into one row, silently combining two different populations' calls, tokens
+    // and cost — and losing one of the two buckets from the response. A Map handles a null key
+    // natively, so no sentinel is needed.
+    const key = (r.bucket ?? null) as string | null;
+    const agg = byBucket.get(key) ?? {
+      bucket: r.bucket,
+      calls: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      reasoning_tokens: 0,
+      cache_read_tokens: 0,
+      cache_creation_5m_tokens: 0,
+      cache_creation_1h_tokens: 0,
+      billable_input_tokens: 0,
+      cost_usd: 0,
+      unpriced_calls: 0,
+    };
+    for (const k of TOKEN_COLS) agg[k] += Number(r[k] ?? 0);
+    agg.calls += Number(r.calls ?? 0);
+
+    // Price the group's totals in one shot: every row in it shares a model, an epoch and a
+    // cache-write shape, and therefore one rate and one accounting convention. `epoch` — not
+    // `bucket` — is the date to price at; see the comment on the query above.
+    const modelClass = classifyModel(r.model);
+    const price =
+      modelClass === 'billable' ? priceForGroup(prices.get(r.model as string) ?? [], String(r.epoch), r, batch) : null;
+    const cost = costOfUsage(r, price, { batch });
+    agg.billable_input_tokens += cost.billableInputTokens;
+    agg.cost_usd += cost.usd;
+    if (cost.rateSet !== 'none') rateSetsUsed.add(cost.rateSet);
+
+    // `sentinel` rows (`<synthetic>`) are deliberately absent from both counters: they never hit
+    // an API, so they are not coverage we failed to price. `unknown` rows are the opposite — real
+    // tokens at a rate we cannot determine — and were previously swallowed by the same check,
+    // letting the response show their tokens at $0 while claiming complete coverage.
+    if (cost.unpriced && modelClass !== 'sentinel') {
+      agg.unpriced_calls += Number(r.calls ?? 0);
+      unpricedModels.add(modelClass === 'unknown' ? UNKNOWN_MODEL_LABEL : (r.model as string));
+    }
+    byBucket.set(key, agg);
+  }
+
+  // No slice here: the query already returns whole buckets and at most MAX_BUCKETS of them,
+  // so trimming again could only cut a bucket that was counted in full.
+  const out = [...byBucket.values()]
+    // Mirror the query's `ORDER BY bucket DESC`, where SQLite sorts NULL last. Comparing
+    // String(null) here would instead file it among the "n"s.
+    .sort((a, b) => {
+      if (a.bucket === null) return 1;
+      if (b.bucket === null) return -1;
+      return String(b.bucket).localeCompare(String(a.bucket));
+    })
+    .map((r) => ({ ...r, cost_usd: Math.round(r.cost_usd * 1e6) / 1e6 }));
+
+  return Response.json({
+    group_by: groupBy,
+    // Cost is list-price equivalent, not a bill: these tokens may have been burned under a
+    // flat-rate plan. Saying so in the payload keeps downstream agents from reporting it as spend.
+    cost_basis: costBasis(batch, rateSetsUsed),
+    unpriced_models: [...unpricedModels],
+    rows: out,
+  });
 }
+
+/** Label for what the dollars in this response actually are.
+ *
+ * `batch=1` is a request, not a guarantee: `costOfUsage` falls back to a model's standard rates
+ * when it has no published batch tier (Anthropic publishes none at all), so a response that
+ * flatly claimed `..._batch` could be reporting standard-priced dollars — or a mix of both,
+ * which is the case any time a batch query spans providers. */
+function costBasis(batch: boolean, rateSetsUsed: Set<'standard' | 'batch' | 'mixed'>): string {
+  if (!batch) return 'litellm_list_price';
+  // `mixed` is a single row that paid a batch rate on one class and a standard rate on another,
+  // so it makes the whole response partial on its own.
+  const anyBatch = rateSetsUsed.has('batch') || rateSetsUsed.has('mixed');
+  const anyStandard = rateSetsUsed.has('standard') || rateSetsUsed.has('mixed');
+  if (!anyStandard) return anyBatch ? 'litellm_list_price_batch' : 'litellm_list_price';
+  return anyBatch ? 'litellm_list_price_batch_partial' : 'litellm_list_price';
+}
+
+/** The rate for a group, given the epoch it was bucketed into.
+ *
+ * A group with no timestamp can still be priced when every snapshot the model has would produce
+ * the SAME cost — there is no ambiguity to resolve. Counting snapshots instead of comparing them
+ * was too strict: the sync writes a new row for a metadata-only correction (a null `provider`
+ * becoming `openai`, say), and that alone made every timestamp-less call for the model unpriced
+ * even though all its snapshots compute identical dollars.
+ *
+ * The comparison asks `costOfUsage` what each snapshot would charge rather than diffing a
+ * hand-maintained list of "cost-relevant columns". Two attempts at that list were both wrong in
+ * the same direction — comparing rates the request does not select. The batch tier is the clearest
+ * case: `batch=1` takes `*_cost_batch` and FALLS BACK to standard when a model publishes none, so
+ * which columns matter depends on the request flag AND on whether the batch rate is null, and a
+ * standard-priced request was going unpriced because only `input_cost_batch` had moved.
+ *
+ * It compares `rateSignature` — the selected PER-CLASS rates — and not the scalar `usd`. Comparing
+ * the aggregate is not equivalent on a group: changes in separate classes cancel out. Old
+ * input/output rates of 1/3 against new rates of 3/1 total the same dollars whenever the group's
+ * summed input equals its summed output, so two genuinely different rate schedules would look
+ * interchangeable, and the input-heavy and output-heavy calls folded into that group may well
+ * belong to different epochs with substantially different true totals.
+ *
+ * When snapshots genuinely differ, any choice is a guess, so it stays unpriced rather than being
+ * charged at some arbitrary rate and reported as a real figure. */
+function priceForGroup(history: ModelPrice[], epoch: string, row: UsageTokens, batch: boolean): ModelPrice | null {
+  if (epoch !== EPOCH_UNKNOWN_TIME) return priceAt(history, epoch);
+  if (!history.length) return null;
+  const first = history[0]!;
+  if (history.length === 1) return first;
+  const baseline = costOfUsage(row, first, { batch }).rateSignature;
+  return history.every((p) => costOfUsage(row, p, { batch }).rateSignature === baseline) ? first : null;
+}
+
+/** Stands in for a NULL `usage.model` in `unpriced_models`. Deliberately bracketed so it cannot
+ * collide with a real model id. */
+const UNKNOWN_MODEL_LABEL = '(unknown)';
+
+/** Buckets returned by /api/v1/usage. Applied to buckets in the query, never to the
+ * (bucket, model, epoch) rows that fold into them — trimming those would silently return a
+ * bucket that counted only some of its models. */
+const MAX_BUCKETS = 400;
+
+/** Sorts before every real `effective_from`, so `priceAt` takes its documented
+ * older-than-any-snapshot branch instead of the falsy-ts one (which returns the NEWEST rate). */
+const EPOCH_BEFORE_ANY_PRICE = '0000-00-00';
+
+/** `usage.ts` is nullable, and a row with no timestamp is NOT evidence that the call predates
+ * every snapshot — it is evidence that we do not know when it ran. Keeping it distinct from
+ * EPOCH_BEFORE_ANY_PRICE lets the fold below refuse to price it (unless the model only ever had
+ * one rate, in which case there is nothing to be ambiguous about) instead of silently charging
+ * it at the earliest rate and reporting that as a real number. */
+const EPOCH_UNKNOWN_TIME = 'unknown';
+
+/** A SQL expression mapping `u.ts` to the price snapshot in effect at that time.
+ *
+ * The boundaries are pooled across all models on purpose: a shared partition means one CASE
+ * for the whole query, and a model with fewer boundaries than the pool just resolves adjacent
+ * epochs to the same rate — `priceAt` is what actually picks the model's rate, this only has
+ * to guarantee no group straddles a change. */
+export function priceEpochExpr(prices: Map<string, ModelPrice[]>): string {
+  const boundaries = [...new Set([...prices.values()].flat().map((p) => p.effective_from))]
+    // These are our own cron's values, not user input, but they are interpolated rather than
+    // bound (the arm count varies with the data, so a fixed bind list won't do), so anything
+    // not EXACTLY a bare YYYY-MM-DD is dropped rather than trusted. The anchor at both ends is
+    // the point: a prefix match would happily pass `2026-01-01'; DROP TABLE usage --` through.
+    .filter((e) => /^\d{4}-\d{2}-\d{2}$/.test(e))
+    .sort()
+    .reverse();
+  // The NULL-ts arm has to come first and be explicit: `NULL >= '2026-01-01'` is NULL, not
+  // false, so without it a timestamp-less row falls through to the ELSE and is
+  // indistinguishable from one that genuinely predates every snapshot.
+  //
+  // The same arm also catches any timestamp that is not canonical UTC. These comparisons are
+  // LEXICOGRAPHIC, which is only equivalent to chronological for `YYYY-MM-DDTHH:MM:SS...Z`.
+  // A valid but offset-bearing `2026-06-30T23:30:00-05:00` is 04:30 on July 1 UTC yet sorts
+  // before '2026-07-01' and silently takes the pre-July rate; a malformed non-empty string sorts
+  // wherever its first character lands. Neither is detectable downstream — the row looks
+  // confidently priced. Routing both to the unknown epoch means they price only when the model
+  // has a single unambiguous snapshot, and are reported as unpriced otherwise.
+  // Canonical UTC AND a real calendar date. The GLOB alone only checks digit POSITIONS, so
+  // `2026-99-99T00:00:00Z` passed it and then sorted after every boundary, confidently selecting
+  // the newest snapshot. `date()` rejects that (NULL), but on its own it is not enough either:
+  // it silently ROLLS `2026-02-31` forward to `2026-03-03` and calls it valid. Comparing the
+  // round-trip against the literal prefix catches the rollover.
+  //
+  // `IS NOT 1`, not `NOT (...)`: date() returns NULL for an unparseable value, and `NOT (NULL)`
+  // is NULL, so a plain negation would fail to fire this arm and let the row fall through to the
+  // date arms — the exact NULL-semantics trap that already produced one bug in this query.
+  //
+  // The hour bound is a third distinct hole. SQLite accepts `2026-01-01T24:00:00Z` -- verified
+  // against D1: date() returns '2026-01-01' and it does NOT roll the instant forward -- so the
+  // round-trip above agrees and the row is labelled canonical. But ISO 8601 24:00 IS midnight
+  // starting January 2, so a boundary on the 2nd is skipped and the row silently takes the 1st's
+  // rate. 25:00 and 00:60 are rejected by date() already; 24:00 is the only value that parses,
+  // dates to the wrong day, and reports itself valid.
+  //
+  // Checked with substr rather than by tightening the GLOB: the GLOB pins positions 1-11
+  // (`YYYY-MM-DDT`), so 12-13 is always the hour, and the time tail must stay `*` because every
+  // real row carries milliseconds (`2025-12-21T21:23:08.952Z` -- all 775k production rows).
+  const canonical =
+    `u.ts GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z' AND date(u.ts) = substr(u.ts, 1, 10)` +
+    ` AND substr(u.ts, 12, 2) < '24'`;
+  const unknownArm = `WHEN u.ts IS NULL OR (${canonical}) IS NOT 1 THEN '${EPOCH_UNKNOWN_TIME}'`;
+  if (!boundaries.length) return `CASE ${unknownArm} ELSE '${EPOCH_BEFORE_ANY_PRICE}' END`;
+  const arms = boundaries.map((e) => `WHEN u.ts >= '${e}' THEN '${e}'`).join(' ');
+  return `CASE ${unknownArm} ${arms} ELSE '${EPOCH_BEFORE_ANY_PRICE}' END`;
+}
+
+const TOKEN_COLS = [
+  'input_tokens',
+  'output_tokens',
+  'reasoning_tokens',
+  'cache_read_tokens',
+  'cache_creation_5m_tokens',
+  'cache_creation_1h_tokens',
+] as const;
+
+interface UsageAggRow extends UsageTokens {
+  bucket: string | null;
+  epoch: string | null;
+  calls: number;
+  [k: string]: unknown;
+}
+type UsageOutRow = { bucket: string | null; calls: number; cost_usd: number; unpriced_calls: number } & Record<
+  (typeof TOKEN_COLS)[number] | 'billable_input_tokens',
+  number
+>;
 
 // A Worker invocation gets ~1000 subrequests, and EVERY D1 query counts — including each statement in a
 // batch. One page's worst case is ~3 statements per object: a machine upsert (when every object is on a

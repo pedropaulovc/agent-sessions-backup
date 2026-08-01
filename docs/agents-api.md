@@ -42,6 +42,7 @@ completely separate auth path that doesn't apply here. Two ways to authenticate:
 ## Endpoints
 
 ### `GET /api/v1/sessions`
+
 Query params: `from`, `to` (ISO timestamp, or a bare `YYYY-MM-DD` which the hub expands to
 end-of-day server-side), `harness`, `machine`, `repo`, `limit` (default 200, **hard max
 1000**), `format=ndjson`.
@@ -83,12 +84,14 @@ for it (see `hub/src/auth/identity.ts::devHeaderIdentity`) without that machine 
 sent a heartbeat — including a plain read like this one.
 
 ### `GET /api/v1/sessions/{id}`
+
 One session, fully parsed: `{meta: <sessions row>, session: <NormalizedSession|null>}`.
 `session` is `null` if the canonical R2 object went missing (rare — actual data loss, not a
 parse failure). Either way the row's `index_state` is `'error'`; see `index_state` below for
 why the two aren't distinguishable from `meta` alone, and how to tell them apart via `/raw`.
 
 ### `GET /api/v1/sessions/{id}/raw`
+
 The response shape depends on what the session's canonical file actually is
 (`hub/src/api/sessions.ts::getSessionRaw`):
 
@@ -107,17 +110,52 @@ The response shape depends on what the session's canonical file actually is
   isn't meant to be range-read).
 
 ### `GET /api/v1/search`
+
 Params: `q` (FTS5 MATCH syntax — invalid syntax is retried as a quoted literal phrase, then
 degrades to an empty result set rather than a 500), `harness`, `machine`, `os`, `model`,
 `repo`, `project`, `cwd`, `session_date`, `session_time`, `has_star=1`, `from`, `to`,
 `limit` (default 100, max 100), `cursor` (opaque, paginates), `facets=1` (adds counts for
 the registered search facets, including `has_star`).
 
-### `GET /api/v1/usage?group_by=day|model|machine|repo&from&to`
+### `GET /api/v1/usage?group_by=day|model|machine|repo&from&to&machine&harness&batch`
+
 Token accounting, one row per bucket: `bucket, calls, input_tokens, output_tokens,
-reasoning_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens`.
-Raw token counts only — the hub has no pricing table, so there's no dollar figure anywhere
-in this response. Compute cost yourself if you need it, and caveat that it's an estimate.
+reasoning_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens`,
+plus costing: `cost_usd`, `billable_input_tokens`, `unpriced_calls`. Response-level:
+`cost_basis` and `unpriced_models`.
+
+**`cost_usd` is a list-price equivalent, not a bill.** It is what these tokens would have
+cost on the metered API at the rates in `model_prices` (synced from LiteLLM, ccusage's
+source), and the tokens were very likely burned under a flat-rate plan instead. Never present
+it as spend without that qualifier.
+
+`cost_basis` names the rate set that actually produced the dollars — it is not an echo of your
+`batch` param, because `batch=1` is a request rather than a guarantee (a model with no
+published batch tier falls back to its standard rates, and Anthropic publishes none at all):
+
+- `litellm_list_price` — standard rates. Also what you get for `batch=1` when *nothing* in the
+  response could be batch-priced.
+- `litellm_list_price_batch` — every priced row used batch rates.
+- `litellm_list_price_batch_partial` — a mix; some rows fell back to standard rates.
+
+`unpriced_models` lists models with no usable rate; their calls are counted in `unpriced_calls`
+and contribute 0 to `cost_usd`, so a non-empty list means every total is a floor. The literal
+`(unknown)` appears there for usage rows with a NULL model (real tokens, undeterminable rate) —
+`<synthetic>` and other `<…>` sentinels never appear, because they never hit an API and are not
+coverage you lost. A row is also unpriced when its timestamp is NULL and its model has more
+than one rate snapshot: a missing timestamp is not evidence the call predates every rate.
+
+`billable_input_tokens` is the input actually charged at the input rate — under OpenAI's subset
+cache accounting that is `input_tokens` minus the cached prefix, clamped per row, so it is not
+derivable from the other columns once rows have been aggregated. It is 0 on unpriced rows.
+
+Rows are priced at the rate in effect when the usage happened, not today's rate: the
+aggregate carries a price-epoch dimension internally so a bucket spanning a rate change is
+summed from correctly-priced parts, for every `group_by` and not just `day`.
+
+Buckets are capped at 400, and the cap is applied to buckets — a returned bucket always
+counts all of its models. A NULL bucket (e.g. `group_by=repo` over sessions with no
+`repo_url`) is a real bucket and is returned like any other.
 
 **`cache_read_tokens` and `reasoning_tokens` are not safe to sum into a total uniformly** —
 their relationship to `input_tokens`/`output_tokens` is provider-specific:
@@ -145,15 +183,13 @@ rows — undercount beats double-count for a spend ranking. If you're computing 
 instead of using the client, replicate the same heuristic and caveat, or cross-reference
 `harness` via `/api/v1/sessions` to discriminate properly.
 
-**No `machine`/`harness` filter.** Only `group_by`/`from`/`to` are accepted (see "Known
-contract gaps" below) — if you're building a per-machine or per-harness token report, you
-must fetch the fleet-wide rows and either accept that scope or cross-reference against
-`/api/v1/sessions` yourself. The `daily-report` CLI does the honest thing here: when
-`--machine`/`--harness` is passed, it labels the token section
-"(fleet-wide — /api/v1/usage has no machine/harness filter)" rather than presenting
-fleet-wide numbers as if they were scoped to your filter.
+**`machine` and `harness` filters are supported** (they filter on the joined `sessions` row,
+same values as `/api/v1/sessions`), so a per-machine or per-harness token report needs no
+cross-referencing. `SessionsApi.usage()` exposes both, and `daily-report` forwards its
+`--machine`/`--harness` flags, so its token section is scoped exactly like its session list.
 
 ### `GET /api/v1/status`
+
 Fleet freshness / index-completeness:
 ```jsonc
 {
@@ -170,6 +206,7 @@ that. This is the right endpoint to answer "did machine X finish syncing before 
 counts for date D": compare its `indexed_through` to D's end-of-day bound.
 
 ### `index_state`
+
 Every session row carries `index_state`: `parsing` (queued/reparsing — block/FTS content may
 be stale or absent), `ready` (fully indexed), `error` (parse failed). A report that counts
 sessions should count `error` ones too (as "present but not analyzable"), not silently drop
@@ -195,10 +232,8 @@ the plan, until they're reconciled:
 - `X-Indexed-Through` on bulk `/api/v1/sessions` is an unfiltered fleet-wide minimum — it
   does **not** narrow to the machines matching your `machine`/`harness` query params, so it
   can read more stale than your actually-filtered data really is.
-- `GET /api/v1/usage` accepts only `group_by`/`from`/`to` — no `machine`/`harness` filter at
-  all, unlike `/api/v1/sessions` and `/api/v1/search`. A report scoped to one machine or
-  harness still gets fleet-wide token totals from this endpoint; say so rather than
-  presenting them as scoped (see the CLI's behavior above).
+- ~~`GET /api/v1/usage` accepts no `machine`/`harness` filter.~~ Closed — it takes both, and
+  the client and `daily-report` forward them (see the endpoint section above).
 - `/api/v1/sessions`'s cursor is a keyset boundary `(started_at, session_id)`, not the opaque
   offset cursor `/api/v1/search` uses — the two endpoints' `cursor` params are not
   interchangeable or shaped the same, despite sharing a param name.

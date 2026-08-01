@@ -145,6 +145,16 @@ class UsageRow:
     cache_read_tokens: int
     cache_creation_5m_tokens: int
     cache_creation_1h_tokens: int
+    # List-price cost of this bucket, from the hub's `model_prices` table. See UsageReport
+    # .cost_basis before reporting it as money — it is a list-price equivalent, not a bill.
+    cost_usd: float = 0.0
+    # Fresh input actually billed at the input rate: under OpenAI's subset cache accounting
+    # that is input_tokens minus the cached prefix, so it is NOT derivable from the columns
+    # above once rows have been aggregated.
+    billable_input_tokens: int = 0
+    # Calls the hub could not price at all (no published rate for the model). A non-zero value
+    # means cost_usd is a floor, not a total.
+    unpriced_calls: int = 0
     # The `group_by` this row was fetched with — needed by total_tokens below to know whether
     # `bucket` is actually a model name (see that property's docstring). Defaults to "model"
     # so directly-constructed rows (as in existing tests that only ever use model buckets)
@@ -163,6 +173,9 @@ class UsageRow:
             cache_read_tokens=row.get("cache_read_tokens") or 0,
             cache_creation_5m_tokens=row.get("cache_creation_5m_tokens") or 0,
             cache_creation_1h_tokens=row.get("cache_creation_1h_tokens") or 0,
+            cost_usd=row.get("cost_usd") or 0.0,
+            billable_input_tokens=row.get("billable_input_tokens") or 0,
+            unpriced_calls=row.get("unpriced_calls") or 0,
             group_by=group_by,
         )
 
@@ -218,6 +231,20 @@ class UsageRow:
 class UsageReport:
     group_by: str
     rows: list[UsageRow]
+    # What the dollar figures mean. The hub prices from LiteLLM list rates, so this is what the
+    # same tokens would have cost on the metered API — the tokens may in fact have been burned
+    # under a flat-rate plan, and a report that prints it as "spend" is lying.
+    cost_basis: str | None = None
+    # Models the hub has no published rate for. Non-empty means every cost below is a floor.
+    unpriced_models: list[str] = field(default_factory=list)
+
+    @property
+    def total_cost_usd(self) -> float:
+        return sum(r.cost_usd for r in self.rows)
+
+    @property
+    def unpriced_calls(self) -> int:
+        return sum(r.unpriced_calls for r in self.rows)
 
 
 @dataclass(frozen=True)

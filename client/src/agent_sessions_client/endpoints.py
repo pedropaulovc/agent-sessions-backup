@@ -221,9 +221,35 @@ class SessionsApi:
             cursor=body.get("cursor"),
         )
 
-    def usage(self, *, group_by: str = "day", from_: str | None = None, to: str | None = None) -> UsageReport:
-        """GET /api/v1/usage?group_by=day|model|machine|repo&from&to"""
-        resp = self._client.get("/api/v1/usage", {"group_by": group_by, "from": from_, "to": to})
+    def usage(
+        self,
+        *,
+        group_by: str = "day",
+        from_: str | None = None,
+        to: str | None = None,
+        machine: str | None = None,
+        harness: str | None = None,
+        batch: bool = False,
+    ) -> UsageReport:
+        """GET /api/v1/usage?group_by=day|model|machine|repo&from&to&machine&harness&batch
+
+        `batch` asks for batch-tier list rates. It is a request, not a guarantee: models with no
+        published batch tier fall back to their standard rates, so check the returned
+        `cost_basis` rather than assuming what was asked for is what was applied.
+        """
+        resp = self._client.get(
+            "/api/v1/usage",
+            {
+                "group_by": group_by,
+                "from": from_,
+                "to": to,
+                "machine": machine,
+                "harness": harness,
+                # Omitted entirely when False: the hub tests `batch === '1'`, and sending "0"
+                # would be equivalent but makes the request line lie about what was asked.
+                "batch": "1" if batch else None,
+            },
+        )
         body = resp.json()
         # Thread the response's own group_by (not the request kwarg — same value in practice,
         # but this is what the hub actually says it grouped by) into every row: UsageRow.
@@ -232,6 +258,8 @@ class SessionsApi:
         return UsageReport(
             group_by=resolved_group_by,
             rows=[UsageRow.from_row(r, group_by=resolved_group_by) for r in body.get("rows", [])],
+            cost_basis=body.get("cost_basis"),
+            unpriced_models=body.get("unpriced_models") or [],
         )
 
     def status(self) -> HubStatus:

@@ -26,16 +26,17 @@ def build_daily_report(
     machine: str | None = None,
     harness: str | None = None,
 ) -> str:
-    # /api/v1/usage and /api/v1/status have no machine/harness query params (verified against
-    # the deployed hub — see docs/agents-api.md's contract-gaps section and task #11) — so
-    # when either CLI filter is active, those two sections cover more than the sessions list
-    # does, and must say so rather than silently presenting fleet-wide numbers as scoped ones.
+    # /api/v1/usage now takes machine/harness, and cli.py forwards both, so the usage section
+    # is scoped exactly like the sessions list and needs no fleet-wide disclaimer. /api/v1/status
+    # still has no such params, and the sessions page's `indexed_through` is still a global
+    # field — `filtered` marks those remaining spots, which must say so rather than silently
+    # presenting fleet-wide numbers as scoped ones.
     filtered = machine is not None or harness is not None
     lines: list[str] = [f"# Daily Activity Report — {date}", ""]
     lines += _caveats_section(date, sessions_page, status, machine=machine, filtered=filtered)
     lines += _counts_section(sessions_page.sessions)
     lines += _notable_sessions_section(sessions_page.sessions)
-    lines += _usage_section(usage_report, filtered=filtered)
+    lines += _usage_section(usage_report)
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -126,22 +127,88 @@ def _notable_sessions_section(sessions: list[SessionMeta]) -> list[str]:
     return lines
 
 
-def _usage_section(usage: UsageReport, *, filtered: bool) -> list[str]:
-    heading = "## Token spend per model"
-    if filtered:
-        heading += " (fleet-wide — /api/v1/usage has no machine/harness filter)"
-    lines = [heading, ""]
+def _usage_section(usage: UsageReport) -> list[str]:
+    lines = ["## Token spend per model", ""]
     if not usage.rows:
         return [*lines, "No usage recorded in range.", ""]
-    lines.append("| Model | Calls | Input | Output | Reasoning | Cache read | Cache write (5m/1h) |")
-    lines.append("|---|---|---|---|---|---|---|")
+    # A hub older than the pricing work sends no `cost_basis` and no `cost_usd`, which the models
+    # default to 0.0. Printing that as "$0.00" under a "these are list-rate costs" note would
+    # turn "the server did not compute pricing" into "this usage was free" during ordinary
+    # client/server version skew. The response-level basis is the honest signal that the server
+    # priced anything at all, so with it absent the column is dropped entirely.
+    priced = usage.cost_basis is not None
+    cost_header = " Cost (USD) |" if priced else ""
+    cost_divider = "---|" if priced else ""
+    lines.append(
+        "| Model | Calls | Input | Output | Reasoning | Cache read | Cache write (5m/1h) |" + cost_header
+    )
+    lines.append("|---|---|---|---|---|---|---|" + cost_divider)
     for row in sorted(usage.rows, key=lambda r: r.total_tokens, reverse=True):
         model = row.bucket or "(unknown)"
+        # An unpriced row's 0.00 would read as "this was free" rather than "we have no rate".
+        cost = "—" if row.unpriced_calls and not row.cost_usd else _fmt_cost(row.cost_usd)
         lines.append(
             f"| {model} | {row.calls} | {row.input_tokens:,} | {row.output_tokens:,} | {row.reasoning_tokens:,} "
             f"| {row.cache_read_tokens:,} | {row.cache_creation_5m_tokens:,}/{row.cache_creation_1h_tokens:,} |"
+            + (f" {cost} |" if priced else "")
         )
     lines.append("")
-    lines.append("_Token counts only — the hub does not track per-model pricing, so no dollar figure is computed here._")
+    lines += _cost_note(usage) if priced else [_NO_PRICING_NOTE]
     lines.append("")
     return lines
+
+
+_NO_PRICING_NOTE = "_Token counts only — this hub did not return pricing, so no dollar figure is available._"
+
+
+def _fmt_cost(usd: float) -> str:
+    """Never print a nonzero cost as `$0.00`.
+
+    Two decimals is the right resolution for a day's spend and the wrong one for a single
+    low-volume model bucket: `cost_usd=0.004` rendered as `$0.00`, and since the report carries no
+    more precise figure anywhere, real usage was presented as free. A true zero still prints
+    `$0.00` -- the marker has to mean "too small to show at this precision", not "cheap".
+    """
+    if usd == 0:
+        return "$0.00"
+    # Keyed off the rendered string, not a 0.005 threshold: the threshold has to agree with
+    # whatever rounding the format applies, and it does not have to -- 0.005 itself formats as
+    # "$0.00" under round-half-even.
+    formatted = f"${usd:,.2f}"
+    return "<$0.01" if formatted in ("$0.00", "$-0.00") else formatted
+
+
+# The number is a list-price equivalent, NOT a bill: these tokens were very likely burned under
+# a flat-rate subscription, and this hub has no visibility into what was actually charged. Any
+# report that prints a dollar figure has to carry that qualifier next to it, or a downstream
+# agent reading this file will report it as spend.
+_COST_BASIS_NOTE = {
+    "litellm_list_price": "at LiteLLM list rates",
+    "litellm_list_price_batch": "at LiteLLM batch-tier list rates",
+    # `batch=1` is a request, not a guarantee: models with no published batch tier fall back to
+    # their standard rates, so a batch query spanning providers mixes the two.
+    "litellm_list_price_batch_partial": (
+        "at LiteLLM batch-tier list rates where published, standard rates for the rest"
+    ),
+}
+
+
+def _cost_note(usage: UsageReport) -> list[str]:
+    basis = _COST_BASIS_NOTE.get(usage.cost_basis or "", "at list rates")
+    note = (
+        f"_Cost is what these tokens would have cost {basis} on the metered API — "
+        "not an invoice, and not what a flat-rate plan actually charged._"
+    )
+    if not usage.unpriced_models:
+        return [note]
+    models = ", ".join(f"`{m}`" for m in sorted(usage.unpriced_models))
+    return [
+        note,
+        "",
+        # NOT "no published rate". `unpriced_calls` is one counter for several distinct failure
+        # modes: a missing catalog rate, yes, but also a timestamp too ambiguous to pick a
+        # snapshot, an unknown cache-accounting convention, and a rate missing for just one token
+        # class the call used. Naming the catalog specifically sends readers hunting for a
+        # coverage gap that may not exist.
+        f"_Totals are a floor: {usage.unpriced_calls:,} calls could not be priced ({models})._",
+    ]

@@ -218,31 +218,170 @@ def test_report_excludes_prompt_log_from_notable_but_keeps_it_in_counts():
     assert "prompt-log" in report  # still present in the per-harness counts table
 
 
-def test_report_usage_labeled_fleet_wide_when_filtered():
-    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
-    usage_report = UsageReport(
+def _usage_report_one_row(**kwargs) -> UsageReport:
+    return UsageReport(
         group_by="model",
         rows=[
             UsageRow(
                 bucket="claude-sonnet-5", calls=1, input_tokens=1, output_tokens=1, reasoning_tokens=0,
                 cache_read_tokens=0, cache_creation_5m_tokens=0, cache_creation_1h_tokens=0,
+                **kwargs,
             )
         ],
     )
+
+
+# This assertion used to be the inverse: the usage section carried a "fleet-wide" disclaimer
+# whenever --machine/--harness was set, because /api/v1/usage accepted neither. The endpoint now
+# takes both and cli.py forwards them, so the section is scoped exactly like the sessions list
+# and the disclaimer would be the false statement.
+def test_report_usage_not_labeled_fleet_wide_now_that_usage_takes_the_filters():
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
+    usage_report = _usage_report_one_row()
     status = HubStatus(machines=[], sessions=SessionsSummary(total=1, ready=1, error=0))
 
-    unfiltered = build_daily_report(date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status)
-    assert "fleet-wide" not in unfiltered
+    for kwargs in ({}, {"machine": "m1"}, {"harness": "codex"}):
+        report = build_daily_report(
+            date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status, **kwargs
+        )
+        assert "fleet-wide" not in report
 
-    filtered_by_machine = build_daily_report(
-        date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status, machine="m1"
-    )
-    assert "fleet-wide" in filtered_by_machine
 
-    filtered_by_harness = build_daily_report(
-        date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status, harness="codex"
+def test_report_still_flags_global_indexed_through_as_fleet_wide_when_filtered():
+    # `indexed_through` on the sessions page IS still a global field — closing the usage gap
+    # must not take this caveat with it.
+    sessions_page = SessionsPage(
+        sessions=[meta(session_id="s1", machine_id="m1")], indexed_through="2026-07-18T06:00:00.000Z"
     )
-    assert "fleet-wide" in filtered_by_harness
+    status = HubStatus(machines=[], sessions=SessionsSummary(total=1, ready=1, error=0))
+    report = build_daily_report(
+        date="2026-07-18",
+        sessions_page=sessions_page,
+        usage_report=_usage_report_one_row(),
+        status=status,
+        machine="m1",
+    )
+    assert "fleet-wide" in report
+
+
+def test_report_shows_cost_and_its_basis():
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
+    usage_report = UsageReport(
+        group_by="model",
+        rows=[
+            UsageRow(
+                bucket="claude-sonnet-5", calls=2, input_tokens=1_000_000, output_tokens=0, reasoning_tokens=0,
+                cache_read_tokens=0, cache_creation_5m_tokens=0, cache_creation_1h_tokens=0, cost_usd=3.5,
+            )
+        ],
+        cost_basis="litellm_list_price",
+    )
+    status = HubStatus(machines=[], sessions=SessionsSummary(total=1, ready=1, error=0))
+    report = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status
+    )
+    assert "$3.50" in report
+    # A bare dollar figure would be read as an invoice by anything downstream.
+    assert "LiteLLM list rates" in report
+    assert "not an invoice" in report
+
+
+def test_report_omits_cost_entirely_against_a_hub_that_sent_none():
+    # Version skew: an older hub sends no cost_usd and no cost_basis, and the dataclass defaults
+    # those to 0.0. Printing "$0.00" under a "these are list-rate costs" note would turn "the
+    # server did not compute pricing" into "this usage was free".
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
+    status = HubStatus(machines=[], sessions=SessionsSummary(total=1, ready=1, error=0))
+    report = build_daily_report(
+        date="2026-07-18",
+        sessions_page=sessions_page,
+        usage_report=_usage_report_one_row(),  # cost_basis defaults to None
+        status=status,
+    )
+    assert "$0.00" not in report
+    assert "Cost (USD)" not in report
+    assert "did not return pricing" in report
+    assert "not an invoice" not in report
+
+
+def test_report_labels_partial_batch_pricing_honestly():
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
+    usage_report = UsageReport(
+        group_by="model",
+        rows=[_usage_report_one_row(cost_usd=2.0).rows[0]],
+        cost_basis="litellm_list_price_batch_partial",
+    )
+    status = HubStatus(machines=[], sessions=SessionsSummary(total=1, ready=1, error=0))
+    report = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status
+    )
+    assert "standard rates for the rest" in report
+
+
+def test_report_does_not_print_a_nonzero_cost_as_zero():
+    # $0.004 formatted to two decimals is "$0.00", and the report carries no more precise figure
+    # anywhere -- so ordinary low-volume usage was presented as free.
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
+    usage_report = UsageReport(
+        group_by="model", rows=[_usage_report_one_row(cost_usd=0.004).rows[0]], cost_basis="litellm_list_price"
+    )
+    status = HubStatus(machines=[], sessions=SessionsSummary(total=1, ready=1, error=0))
+    report = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status
+    )
+    assert "<$0.01" in report
+    assert "$0.00" not in report
+
+
+def test_report_still_prints_a_true_zero_as_zero():
+    # The marker means "too small to show at this precision", not "cheap" -- a genuinely free
+    # model must not be dressed up as costing something.
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
+    usage_report = UsageReport(
+        group_by="model", rows=[_usage_report_one_row(cost_usd=0.0).rows[0]], cost_basis="litellm_list_price"
+    )
+    status = HubStatus(machines=[], sessions=SessionsSummary(total=1, ready=1, error=0))
+    report = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status
+    )
+    assert "$0.00" in report
+    assert "<$0.01" not in report
+
+
+def test_report_does_not_blame_the_catalog_for_every_unpriced_call():
+    # `unpriced_calls` is one counter for several failure modes -- an ambiguous timestamp, an
+    # unknown cache-accounting convention, a rate missing for one token class. Saying "no
+    # published rate" sends readers hunting for a catalog gap that may not exist.
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
+    usage_report = UsageReport(
+        group_by="model",
+        rows=[_usage_report_one_row(unpriced_calls=3).rows[0]],
+        cost_basis="litellm_list_price",
+        unpriced_models=["ambiguous-model"],
+    )
+    status = HubStatus(machines=[], sessions=SessionsSummary(total=1, ready=1, error=0))
+    report = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status
+    )
+    assert "could not be priced" in report
+    assert "no published rate" not in report
+
+
+def test_report_marks_unpriced_rows_rather_than_showing_them_as_free():
+    sessions_page = SessionsPage(sessions=[meta(session_id="s1", machine_id="m1")], indexed_through=None)
+    usage_report = UsageReport(
+        group_by="model",
+        rows=[_usage_report_one_row(unpriced_calls=1).rows[0]],
+        cost_basis="litellm_list_price",
+        unpriced_models=["brand-new-model"],
+    )
+    status = HubStatus(machines=[], sessions=SessionsSummary(total=1, ready=1, error=0))
+    report = build_daily_report(
+        date="2026-07-18", sessions_page=sessions_page, usage_report=usage_report, status=status
+    )
+    assert "$0.00" not in report
+    assert "floor" in report
+    assert "`brand-new-model`" in report
 
 
 def test_report_machine_filter_scopes_staleness_caveats_to_that_machine():
