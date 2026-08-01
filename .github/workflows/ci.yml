@@ -109,9 +109,17 @@ jobs:
     steps:
       # No checkout token left in .git/config. This job holds a short-lived OIDC assertion and
       # never pushes, so a compromised action should find nothing reusable here.
+      #
+      # `ref` is the PR BRANCH HEAD, not the default synthetic merge revision. Workers Builds
+      # builds the preview from the branch head, so TARGET names that code — while the merge
+      # revision also contains whatever main has gained since. Reading EXPECTED_HANDLER and the
+      # migration payload from the merge result would then describe a Worker that does not exist
+      # at that alias, and if main has bumped the handler version the mismatch is PERMANENT: every
+      # attempt reads "stale handler" and the job never converges.
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
       # Cloudflare's branch alias lowercases the branch and replaces non-alphanumerics with '-'
       # (infra/cf/deploy.md). If that normalisation ever diverges the request 404s, which the
       # transient handling below reports as a notice rather than a red build.

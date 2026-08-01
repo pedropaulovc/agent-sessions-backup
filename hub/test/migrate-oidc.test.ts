@@ -330,6 +330,18 @@ describe('statement splitting', () => {
     expect(assertSplittable('m', 'CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;')).toContain('trigger');
   });
 
+  it('catches CREATE TEMP TRIGGER, which the bare CREATE TRIGGER pattern missed', () => {
+    // TEMP/TEMPORARY sits between CREATE and TRIGGER in valid SQLite, so these passed the guard
+    // and then had their bodies cut at the inner semicolons.
+    for (const ddl of [
+      'CREATE TEMP TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;',
+      'CREATE TEMPORARY TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;',
+      'CREATE TRIGGER IF NOT EXISTS t AFTER INSERT ON x BEGIN SELECT 1; END;',
+    ]) {
+      expect(assertSplittable('m', ddl), ddl).toContain('trigger');
+    }
+  });
+
   it('accepts BEGIN as an ordinary identifier', () => {
     // `CREATE TABLE ranges(begin TEXT)` is valid SQLite that wrangler applies. Rejecting the token
     // wherever it appeared turned an ordinary column name into a permanent 422 that blocks every
@@ -570,5 +582,16 @@ describe('bound-database check', () => {
     const unsupported = await post(token, [{ name: '9999_y', sql: 'CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;' }]);
     expect(unsupported.status).toBe(422);
     expect((await unsupported.json<{ handler: number }>()).handler).toBe(MIGRATE_HANDLER_VERSION);
+  });
+
+  it('rejects a malformed signature encoding with a 401, not a platform 500', async () => {
+    // `atob` throws on an invalid character. An unauthenticated caller can pair a real GitHub kid
+    // with a signature of `%`, so an unguarded decode turns an intended 401 into an uncaught
+    // platform 500 on a publicly reachable route.
+    const token = await signJwt(keys.pair.privateKey, goodClaims());
+    const [h, p] = token.split('.');
+    const res = await post(`${h}.${p}.%`, [{ name: '9999_probe', sql: 'SELECT 1;' }]);
+    expect(res.status).toBe(401);
+    expect((await res.json<{ reason: string }>()).reason).toBe('malformed_signature');
   });
 });

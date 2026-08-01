@@ -47,6 +47,19 @@ interface Jwk {
   e: string;
 }
 
+/** Decode, or null if the segment is not valid base64url.
+ *
+ * `atob` THROWS on an invalid character, and on this publicly reachable route an unauthenticated
+ * caller can send a syntactically valid header/payload with a signature of `%` — turning an
+ * intended, controlled 401 into an uncaught platform 500. Every caller must handle null. */
+function b64urlToBytesOrNull(s: string): Uint8Array | null {
+  try {
+    return b64urlToBytes(s);
+  } catch {
+    return null;
+  }
+}
+
 function b64urlToBytes(s: string): Uint8Array {
   const pad = s.length % 4 === 0 ? '' : '='.repeat(4 - (s.length % 4));
   const bin = atob(s.replace(/-/g, '+').replace(/_/g, '/') + pad);
@@ -176,10 +189,12 @@ export async function verifyGitHubOidc(
     ['verify'],
   );
   const signed = new TextEncoder().encode(`${headerB64}.${payloadB64}`);
+  const signature = b64urlToBytesOrNull(signatureB64);
+  if (!signature) return { ok: false, reason: 'malformed_signature' };
   const valid = await crypto.subtle.verify(
     'RSASSA-PKCS1-v1_5',
     key,
-    b64urlToBytes(signatureB64) as BufferSource,
+    signature as BufferSource,
     signed as BufferSource,
   );
   if (!valid) return { ok: false, reason: 'bad_signature' };

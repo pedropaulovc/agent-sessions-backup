@@ -189,7 +189,11 @@ export function assertSplittable(name: string, sql: string): string | null {
   // What actually defeats the splitter is a transaction or trigger BODY, and both announce
   // themselves at the start of a statement (or as CREATE TRIGGER, whose body follows).
   const startsATransaction = splitStatements(sql).some((stmt) => /^BEGIN\b/i.test(stmt.trim()));
-  if (startsATransaction || /\bCREATE\s+TRIGGER\b/i.test(unquoted)) {
+  // TEMP/TEMPORARY sits between CREATE and TRIGGER in valid SQLite, and `IF NOT EXISTS` follows
+  // TRIGGER, so a bare CREATE\s+TRIGGER missed `CREATE TEMP TRIGGER` entirely — the migration
+  // passed the guard and then had its trigger body cut at the inner semicolons.
+  const createsATrigger = /\bCREATE\s+(?:TEMP(?:ORARY)?\s+)?TRIGGER\b/i.test(unquoted);
+  if (startsATransaction || createsATrigger) {
     return `${name}: contains a trigger or BEGIN block, which this endpoint's statement splitter cannot handle safely`;
   }
   return null;
