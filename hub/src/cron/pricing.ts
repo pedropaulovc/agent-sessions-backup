@@ -3,9 +3,9 @@
  * Two populations reach this, and it handles both with the same pass:
  *   - rows the ingest path could not price when it wrote them, because the model had no published
  *     rate yet. The sync that just ran may have added one.
- *   - the backfill tail. `scripts/backfill-usage-usd.mjs` does the bulk of an existing corpus in
- *     minutes from a laptop; this is what keeps up afterwards, and what would eventually finish
- *     the job on its own if nobody ran the script.
+ *   - the backfill tail. `POST /api/v1/admin/price-usage` does the bulk of an existing corpus in
+ *     minutes by looping until it stops answering 202; this is what keeps up afterwards, and what
+ *     would eventually finish the job on its own if nobody ever called that endpoint.
  */
 import { priceUsage, type PricingPassResult } from '../pricing-pass';
 

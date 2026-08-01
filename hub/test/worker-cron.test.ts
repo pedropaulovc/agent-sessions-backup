@@ -105,6 +105,33 @@ describe('scheduled handler', () => {
     expect(row?.price_epoch, 'priced without recording which snapshot was used').not.toBeNull();
   });
 
+  it('still prices when the upstream sync fails', async () => {
+    // runModelPriceSync RETHROWS after writing its audit row, so chaining the pass with a bare
+    // `.then` skips it entirely on any upstream hiccup — and rejects the waitUntil on the way out.
+    // A stale catalog is not a reason to stop pricing: the rows that need it mostly need rates
+    // that already exist, and a backfill in progress must not be held hostage to a 500 from
+    // GitHub raw. Failing the fetch is the whole fixture.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('upstream is down', { status: 500 })),
+    );
+    await testEnv.DB.prepare(
+      `INSERT INTO model_prices (model, effective_from, litellm_key, provider, input_cost, output_cost,
+                                 cache_read_cost, cache_write_5m_cost, cache_write_1h_cost,
+                                 cache_accounting, source, fetched_at)
+       VALUES ('claude-opus-5', '2026-01-01', 'claude-opus-5', 'anthropic', 1, 1, 0.1, 2, 4,
+               'disjoint', 'test', '2026-06-01T00:00:00Z')`,
+    ).run();
+    await testEnv.DB.prepare('UPDATE usage SET input_tokens = 1000000 WHERE session_id = ?1').bind('cron-sess').run();
+
+    await fire('30 4 * * *');
+
+    const row = await testEnv.DB.prepare('SELECT usd FROM usage WHERE session_id = ?1')
+      .bind('cron-sess')
+      .first<{ usd: number | null }>();
+    expect(row?.usd, 'a failed price sync took the pricing pass down with it').toBeCloseTo(1, 6);
+  });
+
   it('does not refresh prices on the 15-minute watchdog tick', async () => {
     // 96 needless upstream fetches a day, and 96 audit rows, if these ever get crossed.
     await fire('*/15 * * * *');

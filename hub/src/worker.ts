@@ -36,6 +36,23 @@ export default {
     // sync just wrote, so running them concurrently would price today's rows against yesterday's
     // rates and, worse, mark a model that upstream published TODAY as unpriceable for another
     // full day. `.then` and not `await` — the two prunes above should not queue behind this.
-    ctx.waitUntil(runModelPriceSync(env).then(() => runDailyPricing(env)));
+    //
+    // `.catch` before the chain, not after: runModelPriceSync RETHROWS after writing its audit
+    // row, so a bare `.then` would skip the pricing pass entirely on any upstream hiccup AND
+    // reject the waitUntil. A stale catalog is not a reason to stop pricing — the rows that need
+    // it mostly need rates that already exist, and a backfill in progress must not be held
+    // hostage to a 500 from GitHub raw. The sync's own audit row is what records the failure.
+    ctx.waitUntil(
+      runModelPriceSync(env)
+        .catch((e: unknown) =>
+          console.log(
+            JSON.stringify({
+              event: 'hub.model_prices.sync_failed_before_pricing',
+              error: e instanceof Error ? e.message : String(e),
+            }),
+          ),
+        )
+        .then(() => runDailyPricing(env)),
+    );
   },
 } satisfies ExportedHandler<Env, ParseMessage>;
