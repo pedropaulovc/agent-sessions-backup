@@ -1,3 +1,4 @@
+import { runModelPriceSync } from './cron/model-prices';
 import { runDailyPrune, runPrune } from './cron/prune';
 import { runWatchdog } from './cron/watchdog';
 import { consumeParseBatch } from './ingest/consumer';
@@ -29,5 +30,8 @@ export default {
 
     ctx.waitUntil(runPrune(env));
     ctx.waitUntil(runDailyPrune(env));
+    // Refresh model pricing from LiteLLM (ccusage's source). Snapshot-on-change, so a
+    // no-op day writes one audit row and nothing else.
+    ctx.waitUntil(runModelPriceSync(env));
   },
 } satisfies ExportedHandler<Env, ParseMessage>;

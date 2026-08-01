@@ -1,5 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
+import { costOfUsage, isBillableModel, loadPrices, priceAt, type UsageTokens } from '../pricing';
 import { reservationCutoffIso } from '../queue';
 import { getClientCertFingerprint, queueRetiredIfDisplaced, rotationCas, settleRetired, type RotationState } from './certs';
 import { normalizeToBound } from './sessions';
@@ -563,8 +564,12 @@ export async function usage(url: URL, env: Env): Promise<Response> {
     filters.push(`s.harness = ?${binds.length}`);
   }
   const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
+  // Cost has to be summed per (bucket, model): one bucket can mix models, and each model has
+  // its own rates AND its own cache-accounting convention. Grouping by model too and folding
+  // the buckets back up in JS keeps that correct without a join against model_prices.
   const rows = await env.DB.prepare(
     `SELECT ${expr} AS bucket,
+            u.model AS model,
             COUNT(*) AS calls,
             SUM(COALESCE(u.input_tokens,0)) AS input_tokens,
             SUM(COALESCE(u.output_tokens,0)) AS output_tokens,
@@ -573,12 +578,80 @@ export async function usage(url: URL, env: Env): Promise<Response> {
             SUM(COALESCE(u.cache_creation_5m_tokens,0)) AS cache_creation_5m_tokens,
             SUM(COALESCE(u.cache_creation_1h_tokens,0)) AS cache_creation_1h_tokens
      FROM usage u JOIN sessions s ON s.session_id = u.session_id
-     ${where} GROUP BY bucket ORDER BY bucket DESC LIMIT 400`,
+     ${where} GROUP BY bucket, u.model ORDER BY bucket DESC LIMIT 4000`,
   )
     .bind(...binds)
-    .all();
-  return Response.json({ group_by: groupBy, rows: rows.results });
+    .all<UsageAggRow>();
+
+  const prices = await loadPrices(env.DB);
+  const batch = url.searchParams.get('batch') === '1';
+  const byBucket = new Map<string, UsageOutRow>();
+  const unpricedModels = new Set<string>();
+
+  for (const r of rows.results ?? []) {
+    const key = String(r.bucket);
+    const agg = byBucket.get(key) ?? {
+      bucket: r.bucket,
+      calls: 0,
+      input_tokens: 0,
+      output_tokens: 0,
+      reasoning_tokens: 0,
+      cache_read_tokens: 0,
+      cache_creation_5m_tokens: 0,
+      cache_creation_1h_tokens: 0,
+      billable_input_tokens: 0,
+      cost_usd: 0,
+      unpriced_calls: 0,
+    };
+    for (const k of TOKEN_COLS) agg[k] += Number(r[k] ?? 0);
+    agg.calls += Number(r.calls ?? 0);
+
+    // The bucket sum is over the whole group, so price the group's totals in one shot; every
+    // row in it shares a model and therefore one rate and one accounting convention.
+    const price = isBillableModel(r.model) ? priceAt(prices.get(r.model) ?? [], String(r.bucket)) : null;
+    const cost = costOfUsage(r, price, { batch });
+    agg.billable_input_tokens += cost.billableInputTokens;
+    agg.cost_usd += cost.usd;
+    if (cost.unpriced && isBillableModel(r.model)) {
+      agg.unpriced_calls += Number(r.calls ?? 0);
+      unpricedModels.add(r.model);
+    }
+    byBucket.set(key, agg);
+  }
+
+  const out = [...byBucket.values()]
+    .sort((a, b) => String(b.bucket).localeCompare(String(a.bucket)))
+    .slice(0, 400)
+    .map((r) => ({ ...r, cost_usd: Math.round(r.cost_usd * 1e6) / 1e6 }));
+
+  return Response.json({
+    group_by: groupBy,
+    // Cost is list-price equivalent, not a bill: these tokens may have been burned under a
+    // flat-rate plan. Saying so in the payload keeps downstream agents from reporting it as spend.
+    cost_basis: batch ? 'litellm_list_price_batch' : 'litellm_list_price',
+    unpriced_models: [...unpricedModels],
+    rows: out,
+  });
 }
+
+const TOKEN_COLS = [
+  'input_tokens',
+  'output_tokens',
+  'reasoning_tokens',
+  'cache_read_tokens',
+  'cache_creation_5m_tokens',
+  'cache_creation_1h_tokens',
+] as const;
+
+interface UsageAggRow extends UsageTokens {
+  bucket: string | null;
+  calls: number;
+  [k: string]: unknown;
+}
+type UsageOutRow = { bucket: string | null; calls: number; cost_usd: number; unpriced_calls: number } & Record<
+  (typeof TOKEN_COLS)[number] | 'billable_input_tokens',
+  number
+>;
 
 // A Worker invocation gets ~1000 subrequests, and EVERY D1 query counts — including each statement in a
 // batch. One page's worst case is ~3 statements per object: a machine upsert (when every object is on a
