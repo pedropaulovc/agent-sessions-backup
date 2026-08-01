@@ -1,6 +1,6 @@
 import { env, SELF } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
-import { collectStats, windows, type StatsQuery } from '../src/stats';
+import { collectStats, MAX_EXCLUDED_BINDS, windows, type StatsQuery } from '../src/stats';
 
 /** The statistics page. Its arithmetic is tested through `collectStats` against real D1 rather
  * than by parsing HTML; the page itself is covered by one smoke test that it renders and one
@@ -149,10 +149,13 @@ describe('ledger', () => {
     // D1 caps a statement at 100 bound parameters, and the excluded-id list is data-derived — it
     // grows with the corpus, not with anything we control. Past the budget `filters` swaps the
     // bound `NOT IN` for a parameter-free `NOT EXISTS`; without that arm every panel on the page
-    // would start failing outright the day someone's 81st prompt-log session landed. 81 forces it.
+    // would start failing outright the day one prompt-log session too many landed. The count is
+    // derived from the threshold, not written out: a literal would keep passing while quietly
+    // testing the other arm the moment the constant moved.
+    const excluded = MAX_EXCLUDED_BINDS + 1;
     await seedSession('real');
     await seedTurn('real', '2026-07-20T10:00:00.000Z', { input: 1_000_000 });
-    for (let i = 0; i < 81; i++) {
+    for (let i = 0; i < excluded; i++) {
       await seedSession(`plog-${i}`, { harness: 'prompt-log' });
       await seedTurn(`plog-${i}`, '2026-07-21T03:00:00.000Z', { input: 500_000_000 });
     }

@@ -77,7 +77,7 @@ const EXCLUDED_HARNESS = 'prompt-log';
  * predicate. D1 caps a statement at 100 bound parameters; the window bounds and the four column
  * filters claim at most 6 of them, and the rest of the margin is there so the ceiling is a
  * deliberate choice rather than a cliff one more filter would push us over. */
-const MAX_EXCLUDED_BINDS = 80;
+export const MAX_EXCLUDED_BINDS = 80;
 
 interface Filters {
   where: string;
