@@ -67,11 +67,32 @@ workload-identity federation for its API (an open request, cloudflare/workers-sd
 a same-repo PR runs its *own* copy of the workflow, and any token handed to this job can reach
 production D1 no matter how the job is written.
 
-So it uses the one construct in D1's model that does isolate: the **binding**. The preview
-Worker's `DB` is `sessions-index-preview` and it has no production binding, so CI calls
-`POST /api/v1/admin/migrate` on that Worker rather than talking to Cloudflare's API. A maximally
-hostile PR still reaches exactly one database, because that is all the capability it is calling can
-reach.
+So it uses the one construct in D1's model that bounds reach at all: the **binding**. The preview
+Worker's `DB` is `sessions-index-preview`, so CI calls `POST /api/v1/admin/migrate` on that Worker
+rather than talking to Cloudflare's API, and the call can only touch databases bound to it.
+
+**The binding alone is not sufficient, and it is worth being exact about why.** It is declared in
+`hub/wrangler.jsonc`, and Workers Builds builds each branch preview from the PR's *own* checkout —
+so a PR can repoint `env.preview.d1_databases[].database_id` at the production database (the id is
+committed in that same file) and its preview Worker would then be bound to production. Nothing in
+the deployment path stops that.
+
+What closes it is that the endpoint **asks the database it is actually bound to whether it is the
+preview one**, before authenticating the caller and before writing anything. The preview database
+carries a `preview_environment_marker` row; production does not, and a PR has no credential to add
+one. A repointed binding therefore gets `409 not_preview_database` instead of a migration. It fails
+**closed**: a missing table, a missing row, a wrong value, or any error at all means no writes.
+
+Seeding that marker is a one-time manual step, done with the production credential — deliberately
+*not* by a migration or by the endpoint, since anything a PR can cause to run could otherwise mint
+the marker on the database it just repointed itself at:
+
+```bash
+cd hub && npx wrangler d1 execute DB --env preview --remote --command \
+  "CREATE TABLE IF NOT EXISTS preview_environment_marker (value TEXT NOT NULL);
+   DELETE FROM preview_environment_marker;
+   INSERT INTO preview_environment_marker (value) VALUES ('sessions-index-preview');"
+```
 
 Authentication is a short-lived **GitHub OIDC assertion** (`permissions: id-token: write`), minted
 per run, no stored secret. The endpoint pins issuer, audience (`sessions-hub-preview-migrate`) and
@@ -82,14 +103,18 @@ It 404s unless `ENVIRONMENT=preview`, and `MIGRATE_OIDC_REPOSITORY` is set **onl
 Two properties worth knowing before relying on it:
 
 - **It converges rather than ordering.** Workers Builds deploys the preview independently of CI, so
-  on a brand-new branch the endpoint may not be live when the job runs. It retries a few times and
-  then leaves a notice — never a red build, because a failing check here would only train people to
-  ignore it. The preview picks the migration up on the next push.
+  on a brand-new branch the endpoint may not be live when the job runs. *That* case retries a few
+  times and then leaves a notice rather than a red build, because it resolves itself on the next
+  push. A response from the endpoint's own handler (any JSON body with an `error` key — 401, 409,
+  422, 500) is the opposite: it never fixes itself, so the job fails loudly. Swallowing those is
+  how #65 shipped an unapplied migration in the first place.
 - **The migration SQL comes from the PR.** That is deliberate: the preview Worker is itself built
   from PR code, so bundling the migrations would be no less PR-controlled. The binding bounds the
   blast radius, not the provenance of the SQL. The endpoint refuses any migration its statement
-  splitter cannot handle safely (trigger bodies, semicolons inside literals) rather than risk
-  applying half of one, and a test asserts every migration this repo ships stays within that.
+  splitter cannot handle safely (trigger bodies, unbalanced quotes) rather than risk applying half
+  of one. The splitter is quote-aware — `'--claude-worktrees-'` in migrations 0011/0012 is a real
+  literal that a naive comment strip truncates mid-statement — and a test runs it over every
+  migration this repo ships, asserting the literals survive the round trip.
 
 **Workflow edits must be checked with `actionlint .github/workflows/*.yml` before pushing.** A bad
 Actions expression is rejected at validation time and the run produces *zero* jobs, so every other

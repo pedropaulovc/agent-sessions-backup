@@ -5,9 +5,16 @@ import { verifyGitHubOidc } from '../auth/github-oidc';
  * This exists so CI never holds a Cloudflare credential. Cloudflare's D1 API-token permissions
  * are account-scoped (no per-database resource, unlike R2's per-bucket one) and Cloudflare has no
  * workload-identity federation, so any token given to a PR-triggered job can reach production D1.
- * A Worker binding is the one thing in D1's model that genuinely cannot: this Worker's `DB` is
- * `sessions-index-preview` and it has no production binding, so even a fully hostile caller
- * reaches exactly one database. CI authenticates with a short-lived GitHub OIDC assertion.
+ * A Worker binding is the one thing in D1's model that genuinely bounds this — a Worker reaches
+ * exactly the databases bound to it. But the binding is declared in hub/wrangler.jsonc, and
+ * Workers Builds builds branch previews from the PR's OWN checkout, so a PR can repoint
+ * env.preview at the production database id (it is committed in that same file) and this endpoint
+ * would then apply PR-authored SQL to production. The binding alone is therefore NOT the control.
+ *
+ * What closes it is `assertPreviewDatabase` below: the endpoint asks the database it is actually
+ * bound to whether it is the preview one, and refuses before any write if the answer isn't yes.
+ * Production has no such marker and a PR has no credential to add one, so a repointed binding
+ * gets a 409 rather than a migration. CI authenticates with a short-lived GitHub OIDC assertion.
  *
  * The caller supplies the migration SQL because `wrangler d1 migrations apply` is a wrangler-side
  * operation. That is deliberate rather than reluctant: the preview Worker is itself built from PR
@@ -19,6 +26,24 @@ import { verifyGitHubOidc } from '../auth/github-oidc';
  * this is not a secret — it is what stops a token minted for some OTHER service in the same repo
  * from being replayed here. */
 export const MIGRATE_OIDC_AUDIENCE = 'sessions-hub-preview-migrate';
+
+/** A row only the real preview database carries. Seeded out of band, once, by whoever holds the
+ * production credential (see infra/cf/deploy.md) — deliberately NOT created by this endpoint or by
+ * a migration, because anything a PR can cause to run could then mint the marker on the database
+ * it just repointed itself at. Its whole value is being unforgeable by the untrusted side. */
+export const PREVIEW_MARKER_TABLE = 'preview_environment_marker';
+export const PREVIEW_MARKER_VALUE = 'sessions-index-preview';
+
+/** Ask the bound database to prove it is the preview one. Fails CLOSED: a missing table, a missing
+ * row, a wrong value, or any error at all means "not proven", which means no writes. An unseeded
+ * preview database is a broken preview; a migration applied to production is a restore from
+ * backup. */
+async function assertPreviewDatabase(env: Env): Promise<boolean> {
+  const row = await env.DB.prepare(`SELECT value FROM ${PREVIEW_MARKER_TABLE} LIMIT 1`)
+    .first<{ value: string }>()
+    .catch(() => null);
+  return row?.value === PREVIEW_MARKER_VALUE;
+}
 
 /** Mirrors the table wrangler itself creates, so `wrangler d1 migrations apply` and this endpoint
  * agree on what has already run and neither re-applies the other's work. */
@@ -33,33 +58,90 @@ interface MigrationInput {
   sql: string;
 }
 
-/** Split a migration file into statements.
+/** Strip `--` line comments, skipping any that are inside a quoted literal.
  *
- * Deliberately simple, and guarded rather than clever: every migration in this repo is plain DDL
- * with no trigger bodies and no semicolons inside string literals, so splitting on `;` is exact.
- * `assertSplittable` refuses anything that breaks that assumption, so a future migration with a
- * `CREATE TRIGGER ... BEGIN ... END;` fails loudly here instead of being silently torn in half and
- * half-applied — which on a migration is the worst possible outcome.
+ * The quote-awareness is not hypothetical tidiness: migrations 0011 and 0012 both contain
+ * `instr(lower(cwd), '--claude-worktrees-')`. A naive /--.*$/ strip truncates that line at the
+ * literal's own leading dashes, producing `instr(lower(cwd), ` — an unbalanced quote and a torn
+ * statement, applied to a real database.
+ */
+function stripComments(sql: string): string {
+  let out = '';
+  let inLiteral = false;
+  for (let i = 0; i < sql.length; i++) {
+    const c = sql[i]!;
+    if (inLiteral) {
+      out += c;
+      // '' is SQL's escaped quote, not a close immediately followed by an open.
+      if (c === "'" && sql[i + 1] === "'") {
+        out += "'";
+        i++;
+        continue;
+      }
+      if (c === "'") inLiteral = false;
+      continue;
+    }
+    if (c === "'") {
+      inLiteral = true;
+      out += c;
+      continue;
+    }
+    if (c === '-' && sql[i + 1] === '-') {
+      while (i < sql.length && sql[i] !== '\n') i++;
+      out += '\n';
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
+/** Split a migration file into statements on `;`, ignoring semicolons inside quoted literals and
+ * comments. `assertSplittable` still refuses trigger bodies, whose inner semicolons are real
+ * statement terminators that must NOT split — being torn in half is the worst outcome a migration
+ * has, so that case fails loudly rather than cleverly.
  */
 export function splitStatements(sql: string): string[] {
-  return sql
-    .split('\n')
-    .map((line) => line.replace(/--.*$/, ''))
-    .join('\n')
-    .split(';')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0);
+  const stripped = stripComments(sql);
+  const out: string[] = [];
+  let cur = '';
+  let inLiteral = false;
+  for (let i = 0; i < stripped.length; i++) {
+    const c = stripped[i]!;
+    if (inLiteral) {
+      cur += c;
+      if (c === "'" && stripped[i + 1] === "'") {
+        cur += "'";
+        i++;
+        continue;
+      }
+      if (c === "'") inLiteral = false;
+      continue;
+    }
+    if (c === "'") {
+      inLiteral = true;
+      cur += c;
+      continue;
+    }
+    if (c === ';') {
+      out.push(cur);
+      cur = '';
+      continue;
+    }
+    cur += c;
+  }
+  out.push(cur);
+  return out.map((x) => x.trim()).filter((x) => x.length > 0);
 }
 
 export function assertSplittable(name: string, sql: string): string | null {
-  const stripped = sql.replace(/--.*$/gm, '');
+  const stripped = stripComments(sql);
   if (/\bBEGIN\b/i.test(stripped) || /\bCREATE\s+TRIGGER\b/i.test(stripped)) {
     return `${name}: contains a trigger or BEGIN block, which this endpoint's statement splitter cannot handle safely`;
   }
-  // A semicolon inside a quoted literal would split mid-statement.
-  for (const literal of stripped.match(/'(?:[^']|'')*'/g) ?? []) {
-    if (literal.includes(';')) return `${name}: a quoted literal contains ';', which the splitter would break on`;
-  }
+  // An unterminated literal means the scanner's idea of where statements end is not the database's.
+  const quotes = (stripped.match(/'/g) ?? []).length;
+  if (quotes % 2 !== 0) return `${name}: unbalanced quote — refusing to guess where statements end`;
   return null;
 }
 
@@ -67,6 +149,20 @@ export async function migratePreview(request: Request, env: Env): Promise<Respon
   // Preview only, and 404 rather than 403: on production this route does not exist. The check is
   // first so an unauthenticated prod request cannot even learn the endpoint is there.
   if (env.ENVIRONMENT !== 'preview') return Response.json({ error: 'not_found' }, { status: 404 });
+
+  // Before authentication even: this says nothing about the caller, only about which database
+  // this Worker was built to talk to, and a legitimate caller needs to see it as loudly as a
+  // hostile one does.
+  if (!(await assertPreviewDatabase(env))) {
+    console.log(JSON.stringify({ event: 'hub.migrate.rejected', reason: 'not_preview_database' }));
+    return Response.json(
+      {
+        error: 'not_preview_database',
+        detail: `the bound DB has no ${PREVIEW_MARKER_TABLE} row for '${PREVIEW_MARKER_VALUE}' — refusing to migrate a database that cannot prove it is the preview one`,
+      },
+      { status: 409 },
+    );
+  }
 
   const repo = env.MIGRATE_OIDC_REPOSITORY;
   if (!repo) return Response.json({ error: 'migrate_not_configured' }, { status: 503 });

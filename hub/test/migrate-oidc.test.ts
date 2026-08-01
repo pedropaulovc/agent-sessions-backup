@@ -1,6 +1,19 @@
 import { env, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { assertSplittable, splitStatements, MIGRATE_OIDC_AUDIENCE } from '../src/api/migrate';
+import {
+  assertSplittable,
+  splitStatements,
+  MIGRATE_OIDC_AUDIENCE,
+  PREVIEW_MARKER_TABLE,
+  PREVIEW_MARKER_VALUE,
+} from '../src/api/migrate';
+
+/** Stand in for the out-of-band seeding a human does once against the real preview database. */
+async function seedPreviewMarker(value: string = PREVIEW_MARKER_VALUE): Promise<void> {
+  await testEnv.DB.prepare(`CREATE TABLE IF NOT EXISTS ${PREVIEW_MARKER_TABLE} (value TEXT NOT NULL)`).run();
+  await testEnv.DB.prepare(`DELETE FROM ${PREVIEW_MARKER_TABLE}`).run();
+  await testEnv.DB.prepare(`INSERT INTO ${PREVIEW_MARKER_TABLE} (value) VALUES (?1)`).bind(value).run();
+}
 
 /** The preview migration endpoint. The interesting tests here are the ones that FORGE tokens:
  * this route deliberately bypasses mTLS, so its OIDC verification is the only thing between a
@@ -83,6 +96,7 @@ beforeEach(async () => {
   stubJwks(keys.jwk);
   testEnv.ENVIRONMENT = 'preview';
   testEnv.MIGRATE_OIDC_REPOSITORY = REPO;
+  await seedPreviewMarker();
   await testEnv.DB.prepare('DROP TABLE IF EXISTS migrate_probe').run();
   await testEnv.DB.prepare('DELETE FROM d1_migrations WHERE name LIKE ?1').bind('9999_%').run().catch(() => {});
 });
@@ -195,7 +209,11 @@ describe('statement splitting', () => {
 
   it('flags constructs it would tear in half', () => {
     expect(assertSplittable('m', 'CREATE TRIGGER t AFTER INSERT ON x BEGIN SELECT 1; END;')).toContain('trigger');
-    expect(assertSplittable('m', "INSERT INTO a VALUES ('x;y');")).toContain('quoted literal');
+    // A semicolon inside a literal used to be REFUSED because the splitter would have torn the
+    // statement in half. The splitter is now quote-aware, so this is valid input, not a hazard —
+    // see the 'statement splitting' block below for the assertion that it splits correctly.
+    expect(assertSplittable('m', "INSERT INTO a VALUES ('x;y');")).toBeNull();
+    expect(assertSplittable('m', "INSERT INTO a VALUES ('unterminated);")).toContain('unbalanced quote');
     expect(assertSplittable('m', 'CREATE TABLE a (x INT);')).toBeNull();
   });
 
@@ -205,8 +223,93 @@ describe('statement splitting', () => {
       .glob('../migrations/*.sql', { query: '?raw', import: 'default', eager: true });
     const names = Object.keys(files);
     expect(names.length).toBeGreaterThan(10);
+    // Guard the test's own premise: if no migration still contains a `--`-leading literal, the
+    // check below is vacuous and someone should be told rather than reassured.
+    expect(
+      Object.values(files).filter((sql) => /'--[^'\n]*'/.test(sql)).length,
+      'no migration contains a --literal; this test no longer proves anything',
+    ).toBeGreaterThan(0);
     for (const [name, sql] of Object.entries(files)) {
       expect(assertSplittable(name, sql), `${name} is not splittable`).toBeNull();
+      // Quote-COUNT alone is not enough either: 0011 has two `'--…'` literals, so the naive
+      // strip ate one quote from each and the total stayed even while the SQL was still mangled.
+      // Assert the literals themselves survive the round trip.
+      const rejoined = splitStatements(sql).join('\n');
+      for (const literal of sql.match(/'--[^'\n]*'/g) ?? []) {
+        expect(rejoined, `${name}: splitter destroyed the literal ${literal}`).toContain(literal);
+      }
+      // assertSplittable alone passed VACUOUSLY against the naive splitter: its comment strip
+      // deleted `'--claude-worktrees-'` (migrations 0011/0012) along with the rest of the line, so
+      // there was no literal left to object to — while splitStatements produced a truncated,
+      // unbalanced statement. Checking the emitted statements is what actually catches that.
+      for (const stmt of splitStatements(sql)) {
+        expect((stmt.match(/'/g) ?? []).length % 2, `${name}: torn statement: ${stmt.slice(0, 80)}`).toBe(0);
+      }
     }
+  });
+});
+
+describe('statement splitting', () => {
+  it('does not split or truncate on -- inside a quoted literal', () => {
+    // Verbatim from migrations 0011/0012. A naive /--.*$/ strip cuts the line at the literal's
+    // own dashes and leaves an unbalanced quote.
+    const sql = `CREATE VIEW v AS SELECT instr(lower(cwd), '--claude-worktrees-') AS w FROM sessions;`;
+    const out = splitStatements(sql);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toContain("'--claude-worktrees-'");
+    expect(assertSplittable('0011', sql)).toBe(null);
+  });
+
+  it('does not split on a semicolon inside a quoted literal', () => {
+    const out = splitStatements(`INSERT INTO t (a, b) VALUES ('x;y', 1); INSERT INTO t (a) VALUES ('z');`);
+    expect(out).toHaveLength(2);
+    expect(out[0]).toContain("'x;y'");
+  });
+
+  it("treats '' as an escaped quote, not a close-then-open", () => {
+    const out = splitStatements(`INSERT INTO t (a) VALUES ('it''s; fine'); SELECT 1;`);
+    expect(out).toHaveLength(2);
+    expect(out[0]).toContain("'it''s; fine'");
+  });
+
+  it('still strips real comments', () => {
+    expect(splitStatements("-- leading\nSELECT 1; -- trailing\nSELECT 2;")).toEqual(['SELECT 1', 'SELECT 2']);
+  });
+
+});
+
+describe('bound-database check', () => {
+  // The binding lives in hub/wrangler.jsonc, which a PR controls, and Workers Builds builds the
+  // branch preview from the PR's own checkout — so a PR can point env.preview at the PRODUCTION
+  // database id (it is committed in that same file) and reach production through this endpoint.
+  // The binding is therefore NOT the isolation control; this check is.
+  it('refuses when the bound database cannot prove it is the preview one', async () => {
+    await testEnv.DB.prepare(`DROP TABLE IF EXISTS ${PREVIEW_MARKER_TABLE}`).run();
+    const token = await signJwt(keys.pair.privateKey, goodClaims());
+    const res = await post(token, [{ name: '9999_probe', sql: 'CREATE TABLE migrate_probe (a INT);' }]);
+    expect(res.status).toBe(409);
+    expect((await res.json<{ error: string }>()).error).toBe('not_preview_database');
+  });
+
+  it('refuses when the marker exists but names a different database', async () => {
+    await seedPreviewMarker('sessions-index');
+    const token = await signJwt(keys.pair.privateKey, goodClaims());
+    const res = await post(token, [{ name: '9999_probe', sql: 'CREATE TABLE migrate_probe (a INT);' }]);
+    expect(res.status).toBe(409);
+  });
+
+  it('refuses BEFORE authenticating, and before writing anything', async () => {
+    // Ordering matters twice over: a valid token must not be a prerequisite for the refusal (or a
+    // stolen one would bypass it), and nothing may be written to a database that failed to
+    // identify itself — including the d1_migrations bookkeeping table.
+    await testEnv.DB.prepare(`DROP TABLE IF EXISTS ${PREVIEW_MARKER_TABLE}`).run();
+    await testEnv.DB.prepare('DROP TABLE IF EXISTS migrate_probe').run();
+    const res = await post('not-even-a-jwt', [{ name: '9999_probe', sql: 'CREATE TABLE migrate_probe (a INT);' }]);
+    // 409, not 401: the refusal does not depend on the caller's token being good.
+    expect(res.status).toBe(409);
+    const probe = await testEnv.DB.prepare("SELECT name FROM sqlite_master WHERE name = 'migrate_probe'")
+      .first()
+      .catch(() => null);
+    expect(probe).toBe(null);
   });
 });

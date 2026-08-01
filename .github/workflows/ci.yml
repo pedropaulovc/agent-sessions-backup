@@ -114,12 +114,17 @@ jobs:
           persist-credentials: false
       # Cloudflare's branch alias lowercases the branch and replaces non-alphanumerics with '-'
       # (infra/cf/deploy.md). If that normalisation ever diverges the request 404s, which the
-      # non-fatal handling below reports as a notice rather than a red build.
+      # transient handling below reports as a notice rather than a red build.
+      #
+      # 42, not 63: the alias becomes the first LABEL of the hostname, and Cloudflare appends
+      # `-sessions-hub-preview` (21 chars) to it. A DNS label caps at 63, so the branch part gets
+      # 63 - 21 = 42. Truncating at 63 builds an 84-character label for any branch name over 42
+      # chars, and every request to it fails to resolve.
       - id: target
         env:
           BRANCH: ${{ github.event.pull_request.head.ref }}
         run: |
-          alias=$(printf '%s' "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | cut -c1-63)
+          alias=$(printf '%s' "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | cut -c1-42)
           echo "url=https://${alias}-sessions-hub-preview.pedro-18e.workers.dev" >> "$GITHUB_OUTPUT"
       - name: Apply preview migrations
         env:
@@ -138,19 +143,36 @@ jobs:
           print(json.dumps({'migrations': [{'name': f.name, 'sql': f.read_text()} for f in files]}))
           " > /tmp/migrations.json
           # Workers Builds deploys the preview independently of this workflow, so on a brand-new
-          # branch the endpoint may not be live yet. Retry briefly, then stop: an unmigrated preview
-          # converges on the next push, and a red build here would just train people to ignore it.
+          # branch the endpoint may not be live yet. That race — and only that race — is worth
+          # tolerating: it converges on the next push, and a red build for it would just train
+          # people to ignore this job.
+          #
+          # A DETERMINISTIC failure is the opposite: 401 (OIDC broken), 409 (the Worker is bound to
+          # a database that cannot prove it is the preview one), 422 (a migration this endpoint
+          # cannot split safely), 400/500 (a bug). None of those fix themselves on the next push,
+          # and swallowing them as a notice is exactly how PR #65 shipped an unapplied migration —
+          # the failure this job exists to prevent. Retry only what is plausibly transient.
           code=000
           for attempt in 1 2 3 4 5; do
             code=$(curl -sS -o /tmp/migrate-out.json -w '%{http_code}' \
               -X POST "$TARGET/api/v1/admin/migrate" \
               -H "Authorization: Bearer $oidc" -H 'content-type: application/json' \
               --data-binary @/tmp/migrations.json) || code=000
+            body=$(cat /tmp/migrate-out.json 2>/dev/null || true)
             if [ "$code" = "200" ]; then
-              echo "::notice::preview migrations: $(cat /tmp/migrate-out.json)"
+              echo "::notice::preview migrations: $body"
               exit 0
             fi
-            echo "attempt $attempt: HTTP $code $(cat /tmp/migrate-out.json 2>/dev/null || true)"
+            # Classify by WHO answered, not by status code — the code alone gets it backwards at
+            # both ends. Our handler returns 404 when ENVIRONMENT != 'preview' and 503 when the
+            # repository allowlist is unset; both are permanent misconfigurations, while a 404 or
+            # 503 from Cloudflare's edge means the preview simply is not up yet. Every response
+            # from our handler carries a JSON `error` key, and the edge's never does.
+            if [ -n "$body" ] && printf '%s' "$body" | jq -e 'has("error")' >/dev/null 2>&1; then
+              echo "::error::preview migration rejected at $TARGET with HTTP $code: $body"
+              exit 1
+            fi
+            echo "attempt $attempt: HTTP $code (no handler response — treating as transient) $body"
             sleep 15
           done
           echo "::notice::preview migration endpoint unreachable at $TARGET (HTTP $code) — preview may run an older schema until the next push."
