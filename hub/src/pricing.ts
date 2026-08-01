@@ -178,8 +178,17 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   const batchClasses = (billableInput > 0 && useBatchIn ? 1 : 0) + (output > 0 && useBatchOut ? 1 : 0);
   const standardClasses =
     (billableInput > 0 && !useBatchIn ? 1 : 0) + (output > 0 && !useBatchOut ? 1 : 0) + (cacheClassesPresent ? 1 : 0);
+  // A row with zero tokens in every billable class produced no dollars from any rate set, so it
+  // must not claim one. Reporting 'standard' put it in rateSetsUsed and flipped a fully
+  // batch-priced response's cost_basis to _partial on the strength of a row that cost nothing.
   const rateSet: Cost['rateSet'] =
-    batchClasses > 0 && standardClasses > 0 ? 'mixed' : batchClasses > 0 ? 'batch' : 'standard';
+    batchClasses > 0 && standardClasses > 0
+      ? 'mixed'
+      : batchClasses > 0
+        ? 'batch'
+        : standardClasses > 0
+          ? 'standard'
+          : 'none';
 
   return { usd, unpriced: false, billableInputTokens: billableInput, rateSet };
 }

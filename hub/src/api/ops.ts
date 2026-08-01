@@ -780,9 +780,19 @@ export function priceEpochExpr(prices: Map<string, ModelPrice[]>): string {
   // The NULL-ts arm has to come first and be explicit: `NULL >= '2026-01-01'` is NULL, not
   // false, so without it a timestamp-less row falls through to the ELSE and is
   // indistinguishable from one that genuinely predates every snapshot.
-  if (!boundaries.length) return `CASE WHEN u.ts IS NULL THEN '${EPOCH_UNKNOWN_TIME}' ELSE '${EPOCH_BEFORE_ANY_PRICE}' END`;
+  //
+  // The same arm also catches any timestamp that is not canonical UTC. These comparisons are
+  // LEXICOGRAPHIC, which is only equivalent to chronological for `YYYY-MM-DDTHH:MM:SS...Z`.
+  // A valid but offset-bearing `2026-06-30T23:30:00-05:00` is 04:30 on July 1 UTC yet sorts
+  // before '2026-07-01' and silently takes the pre-July rate; a malformed non-empty string sorts
+  // wherever its first character lands. Neither is detectable downstream — the row looks
+  // confidently priced. Routing both to the unknown epoch means they price only when the model
+  // has a single unambiguous snapshot, and are reported as unpriced otherwise.
+  const canonical = `u.ts GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z'`;
+  const unknownArm = `WHEN u.ts IS NULL OR NOT (${canonical}) THEN '${EPOCH_UNKNOWN_TIME}'`;
+  if (!boundaries.length) return `CASE ${unknownArm} ELSE '${EPOCH_BEFORE_ANY_PRICE}' END`;
   const arms = boundaries.map((e) => `WHEN u.ts >= '${e}' THEN '${e}'`).join(' ');
-  return `CASE WHEN u.ts IS NULL THEN '${EPOCH_UNKNOWN_TIME}' ${arms} ELSE '${EPOCH_BEFORE_ANY_PRICE}' END`;
+  return `CASE ${unknownArm} ${arms} ELSE '${EPOCH_BEFORE_ANY_PRICE}' END`;
 }
 
 const TOKEN_COLS = [

@@ -8,6 +8,10 @@ import type { ModelPrice } from '../src/pricing';
  * here is that the right rate reaches it once rows have been folded into buckets. */
 
 const testEnv = env as unknown as Env;
+
+/** The canonical-UTC shape the epoch expression requires; kept here so the SQL-string assertions
+ * below read as one thing rather than a wall of bracket classes. */
+const GLOB = "u.ts GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z'";
 const MACHINE = 'pricebox';
 
 /** Two snapshots of one model, at a 10x rate cut. Any test below that mixes usage from both
@@ -344,11 +348,14 @@ describe('priceEpochExpr', () => {
         ['b', [price('b', '2026-04-01')]],
       ]),
     );
-    // Newest-first arms, so the first match wins. The NULL arm has to come first and be
+    // Newest-first arms, so the first match wins. The unknown arm has to come first and be
     // explicit — `NULL >= '2026-01-01'` is NULL, not false, so a timestamp-less row would
     // otherwise fall through to the ELSE and be indistinguishable from a genuinely ancient one.
+    // It also catches non-canonical timestamps: these comparisons are lexicographic, so an
+    // offset-bearing `2026-06-30T23:30:00-05:00` (04:30 July 1 UTC) would sort into the wrong
+    // epoch and be priced confidently wrong.
     expect(expr).toBe(
-      "CASE WHEN u.ts IS NULL THEN 'unknown'" +
+      `CASE WHEN u.ts IS NULL OR NOT (${GLOB}) THEN 'unknown'` +
         " WHEN u.ts >= '2026-07-01' THEN '2026-07-01'" +
         " WHEN u.ts >= '2026-04-01' THEN '2026-04-01'" +
         " WHEN u.ts >= '2026-01-01' THEN '2026-01-01'" +
@@ -359,11 +366,43 @@ describe('priceEpochExpr', () => {
   it('keeps unknown-time and older-than-any-price distinct when no prices are loaded', () => {
     // The ELSE must NOT be an empty/falsy string: priceAt() reads a falsy ts as "no opinion"
     // and returns the NEWEST rate, which is the very bug this expression exists to prevent.
-    expect(priceEpochExpr(new Map())).toBe("CASE WHEN u.ts IS NULL THEN 'unknown' ELSE '0000-00-00' END");
+    expect(priceEpochExpr(new Map())).toBe(
+      `CASE WHEN u.ts IS NULL OR NOT (${GLOB}) THEN 'unknown' ELSE '0000-00-00' END`,
+    );
   });
 
   it('drops boundaries that are not shaped like dates rather than interpolating them', () => {
     const expr = priceEpochExpr(new Map([['a', [price('a', "2026-01-01'; DROP TABLE usage --")]]]));
     expect(expr).not.toContain('DROP TABLE');
+  });
+
+
+  it('treats a non-UTC-offset timestamp as an unknown epoch, not a pre-boundary one', async () => {
+    // `2026-06-30T23:30:00-05:00` is 04:30 on July 1 UTC, so it belongs to NEW_RATE. But these
+    // comparisons are LEXICOGRAPHIC and it sorts before '2026-07-01', so it silently took the old
+    // 10x-more-expensive rate while looking confidently priced. With two snapshots for this model
+    // the unknown epoch cannot pick between them, so it reports unpriced rather than wrong.
+    await seedSession('tz-sess', 'tzbox', 'claude-code');
+    await seedUsage('tz-sess', '2026-06-30T23:30:00-05:00', 'claude-opus-5', { input: 1_000_000 });
+    const row = (await fetchUsage('group_by=machine&machine=tzbox')).rows[0]!;
+    // The old rate would have charged 100/M for a call that belongs at 10/M.
+    expect(Number(row.cost_usd), 'an offset timestamp was priced at the wrong epoch').not.toBeCloseTo(100, 6);
+    expect(Number(row.unpriced_calls)).toBeGreaterThan(0);
+  });
+
+  it('treats a malformed timestamp as an unknown epoch', async () => {
+    await seedSession('bad-ts-sess', 'badtsbox', 'claude-code');
+    await seedUsage('bad-ts-sess', 'not-a-timestamp', 'claude-opus-5', { input: 1_000_000 });
+    const row = (await fetchUsage('group_by=machine&machine=badtsbox')).rows[0]!;
+    expect(Number(row.unpriced_calls)).toBeGreaterThan(0);
+  });
+
+  it('still prices a canonical UTC timestamp at its own epoch', async () => {
+    // Guards the fix from over-reaching: the GLOB must not reject the ordinary shape.
+    await seedSession('ok-ts-sess', 'oktsbox', 'claude-code');
+    await seedUsage('ok-ts-sess', '2026-07-05T04:30:00.000Z', 'claude-opus-5', { input: 1_000_000 });
+    const row = (await fetchUsage('group_by=machine&machine=oktsbox')).rows[0]!;
+    expect(Number(row.unpriced_calls)).toBe(0);
+    expect(Number(row.cost_usd)).toBeCloseTo(10, 6);
   });
 });

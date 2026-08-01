@@ -254,6 +254,17 @@ describe('rate set reporting', () => {
     expect(costOfUsage(u, noCacheRate, { batch: true }).usd).toBeCloseTo(0.2, 10);
   });
 
+  it('claims no rate set at all when every billable class is zero', () => {
+    // Such a row produced no dollars from any rate set. Reporting 'standard' put it into
+    // rateSetsUsed and flipped a fully batch-priced response's cost_basis to _partial on the
+    // strength of a row that cost nothing.
+    const empty = { model: 'gpt-5.6-luna', input_tokens: 0, output_tokens: 0 };
+    const c = costOfUsage(empty, LUNA, { batch: true });
+    expect(c.usd).toBe(0);
+    expect(c.unpriced).toBe(false);
+    expect(c.rateSet).toBe('none');
+  });
+
   it('counts cache classes as standard — LiteLLM publishes no batch cache rates', () => {
     // A cached call under batch=1 pays batch rates on input/output and STANDARD rates on cache
     // read and cache write, because no batch cache columns exist upstream to pay instead. Calling
