@@ -157,7 +157,7 @@ jobs:
           # The handler version this checkout expects. A response carrying anything else came from
           # a Worker version that predates this PR, so its verdict is about different code.
           EXPECTED_HANDLER=$(node -e '
-            const src = require("fs").readFileSync("src/api/migrate.ts", "utf8");
+            const src = require("fs").readFileSync("hub/src/api/migrate.ts", "utf8");
             const m = /MIGRATE_HANDLER_VERSION\s*=\s*(\d+)/.exec(src);
             if (!m) { console.error("MIGRATE_HANDLER_VERSION not found"); process.exit(1); }
             process.stdout.write(m[1]);
