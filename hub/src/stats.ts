@@ -3,11 +3,26 @@
  * Kept out of viewer/stats.ts so the arithmetic can be tested without parsing HTML: everything
  * here takes a D1 binding plus a StatsQuery and returns plain numbers.
  *
- * Every panel is deliberately built on `usage` + `sessions` only. Both are small and indexed
- * (`usage_ts`, `usage_session`, `sessions_facets`), so the whole page is a handful of indexed
- * aggregates. The panels that would need `blocks` — rework, context bloat, tool-result waste —
- * are NOT here: `blocks` is by far the largest table (1.4M rows) and D1 bills rows read, so those
- * belong behind a nightly rollup rather than on a page load. See UNBUILT below.
+ * Every panel is deliberately built on `usage` + `sessions` only. The panels that would need
+ * `blocks` — rework, context bloat, tool-result waste — are NOT here: `blocks` is by far the
+ * largest table and D1 bills rows read, so those belong behind a nightly rollup rather than a page
+ * load. See UNBUILT below.
+ *
+ * COST, measured against the production table (776k usage rows, 31k sessions, 30-day window)
+ * rather than estimated. Three changes took the page from 5s+ to ~1.4s; each is commented where it
+ * lives, and each was verified by running the query both ways:
+ *
+ *   | step                                    | slowest query | rows read |
+ *   |-----------------------------------------|---------------|-----------|
+ *   | one query per panel, no index hint       | 5063ms        | 1.07M     |
+ *   | + INDEXED BY usage_ts                    | 634ms         | 884k      |
+ *   | + one session-grained scan for 6 panels  | 1853ms        | 873k      |
+ *   | + sessions joined in memory, all parallel| 1261ms        | 582k      |
+ *
+ * Wall-clock is now the slowest single query (~1.3s) rather than their sum (~4.3s), because every
+ * query is issued at once. Total rows read per load is ~3.8M, of which the gap histogram's window
+ * function is ~1.7M — that, and the fact that all of this scales with corpus size, is why the
+ * next step for this page is a rollup rather than more query tuning.
  */
 import { classifyModel, costOfUsage, loadPrices, type CostByClass, type ModelPrice } from './pricing';
 import {
@@ -61,14 +76,57 @@ const EXCLUDED_HARNESS = 'prompt-log';
 interface Filters {
   where: string;
   binds: unknown[];
+  /** Whether any panel still needs the `sessions` join. See `usageFrom`. */
+  needsSession: boolean;
+  /** `INDEXED BY usage_ts` when the window is bounded, empty when it is not. */
+  hint: string;
+}
+
+/** The FROM clause for a usage aggregate.
+ *
+ * Two things here are load-bearing for cost, both measured against the 776k-row production
+ * table rather than guessed:
+ *
+ * 1. `INDEXED BY usage_ts`. Left to itself SQLite picks whichever index serves the GROUP BY —
+ *    `usage_model`, typically — and then SCANS THE WHOLE TABLE, so the range filter bounds
+ *    nothing. Measured: 5063ms / 1.07M rows read for one 30-day panel, against 634ms / 884k with
+ *    the hint. The hint is applied ONLY when a bound exists: with `range=all` there is nothing to
+ *    seek to, and forcing it would walk the index and fetch every row for no benefit.
+ * 2. The `sessions` join is omitted when nothing needs it. It costs one lookup per usage row
+ *    (884k rows read against 589k without), and with no filters set the only thing it provides is
+ *    the prompt-log exclusion — which is 7 sessions out of 31k and cheaper to pass as literals.
+ */
+function usageFrom(f: Filters): string {
+  return `FROM usage u ${f.hint} ${f.needsSession ? 'JOIN sessions s ON s.session_id = u.session_id' : ''}`;
 }
 
 /** WHERE clause shared by every panel, so a filter can never apply to some numbers on the page
  * and not others. `from`/`to` are ISO strings compared against `u.ts` lexicographically, which is
  * exact for the canonical `YYYY-MM-DDTHH:MM:SS.sssZ` the parsers write. */
-function filters(q: StatsQuery, window: { from: string | null; to: string | null }): Filters {
+function filters(
+  q: StatsQuery,
+  window: { from: string | null; to: string | null },
+  opts: { excludedIds: string[]; sessionFilterMode: 'sql' | 'memory' },
+): Filters {
   const binds: unknown[] = [];
-  const terms: string[] = [`COALESCE(s.harness, '') != '${EXCLUDED_HARNESS}'`];
+  const terms: string[] = [];
+  // Exactly ONE mechanism applies the session-column filters, chosen by the caller. The main scan
+  // is grouped by session_id and filters against `sessionMeta` in memory, so it never joins; the
+  // narrow panels return pre-aggregated shapes with no session left to filter on, so they join.
+  // Running both would be two implementations of the same predicate — which is how they drift.
+  const sql = opts.sessionFilterMode === 'sql';
+  const needsSession = sql && (Boolean(q.harness) || Boolean(q.project) || Boolean(q.machine));
+
+  if (needsSession) {
+    terms.push(`COALESCE(s.harness, '') != '${EXCLUDED_HARNESS}'`);
+  } else if (opts.excludedIds.length) {
+    // The join's only remaining job on an unfiltered page. Bound, not interpolated, and the id
+    // set is resolved once from a 3ms scan of `sessions` — there are 7 of them.
+    const start = binds.length;
+    binds.push(...opts.excludedIds);
+    terms.push(`u.session_id NOT IN (${opts.excludedIds.map((_, i) => `?${start + i + 1}`).join(',')})`);
+  }
+
   if (window.from) {
     binds.push(window.from);
     terms.push(`u.ts >= ?${binds.length}`);
@@ -78,16 +136,65 @@ function filters(q: StatsQuery, window: { from: string | null; to: string | null
     terms.push(`u.ts < ?${binds.length}`);
   }
   for (const [col, val] of [
-    ['s.harness', q.harness],
+    ['s.harness', sql ? q.harness : undefined],
+    // `u.model` is a usage column, so it stays in SQL either way -- filtering it there shrinks
+    // the scan rather than discarding rows after paying for them.
     ['u.model', q.model],
-    ['s.project_name', q.project],
-    ['s.machine_id', q.machine],
+    ['s.project_name', sql ? q.project : undefined],
+    ['s.machine_id', sql ? q.machine : undefined],
   ] as const) {
     if (!val) continue;
     binds.push(val);
     terms.push(`${col} = ?${binds.length}`);
   }
-  return { where: `WHERE ${terms.join(' AND ')}`, binds };
+  return {
+    where: terms.length ? `WHERE ${terms.join(' AND ')}` : '',
+    binds,
+    needsSession,
+    hint: window.from || window.to ? 'INDEXED BY usage_ts' : '',
+  };
+}
+
+/** The sessions whose usage must never appear on this page, resolved once.
+ *
+ * `prompt-log` is a synthetic harness: a single row spans months, so it wins any ranking it is
+ * allowed into while describing no session anyone worked in. There are 7 of them against 31k
+ * sessions, which is why passing the ids beats joining 300k usage rows to find them.
+ */
+async function excludedSessionIds(db: D1Database): Promise<string[]> {
+  const rows = await db
+    .prepare(`SELECT session_id FROM sessions WHERE harness = ?1`)
+    .bind(EXCLUDED_HARNESS)
+    .all<{ session_id: string }>();
+  return (rows.results ?? []).map((r) => r.session_id);
+}
+
+export interface SessionMeta {
+  harness: string | null;
+  machine_id: string | null;
+  project_name: string | null;
+  git_branch: string | null;
+}
+
+/** Every session's attribution columns, read in one pass.
+ *
+ * This exists so the main usage scan does not have to JOIN. `sessions` is 31k rows and scanning
+ * it costs 3ms; joining it to 300k usage rows costs ~290k extra rows read and, measured, 1.2s.
+ * Attribution, outliers and the session-column filters are all resolved against this map instead.
+ *
+ * `title` is deliberately NOT selected: it is the one wide column here, and it is needed for
+ * twelve rows, which `topSessions` fetches by id.
+ */
+async function sessionMeta(db: D1Database): Promise<Map<string, SessionMeta>> {
+  const rows = await db
+    .prepare(`SELECT session_id, harness, machine_id, project_name, git_branch FROM sessions`)
+    .all<{ session_id: string } & SessionMeta>();
+  return new Map(
+    (rows.results ?? []).map((r) => [
+      r.session_id,
+      { harness: r.harness, machine_id: r.machine_id, project_name: r.project_name, git_branch: r.git_branch },
+    ]),
+  );
 }
 
 /** The half-open window a range covers, plus the equally-sized window immediately before it.
@@ -172,29 +279,59 @@ function foldByKey(rows: KeyedAggRow[], prices: Map<string, ModelPrice[]>): Map<
   return out;
 }
 
-/** One aggregate query keyed by an arbitrary SQL expression, priced and folded. */
-async function pricedBy(
-  db: D1Database,
-  prices: Map<string, ModelPrice[]>,
-  keyExpr: string,
-  f: Filters,
-  extra = '',
-): Promise<Map<string | null, PricedGroup>> {
+/** The one usage scan the page is built on.
+ *
+ * Grouped at (session, model, rate epoch, depth band, token shape) — the finest grain any panel
+ * needs. Six panels are then derived in memory instead of costing a scan each: ledger, token
+ * economics, session shape, model fit, attribution and outliers. Session attributes are joined in
+ * from `sessionMeta` afterwards rather than by SQL; see that function for the measurement.
+ *
+ * Measured on the production table: 32k result rows for a 30-day window, one scan. The
+ * alternative — a query per panel — re-read the same 300k usage rows six times over.
+ *
+ * The session columns are bare in a GROUP BY that includes `session_id`, which is legal in SQLite
+ * and unambiguous here: they are functionally dependent on the session, so every row folded into
+ * a group carries the same value.
+ */
+async function mainScan(db: D1Database, prices: Map<string, ModelPrice[]>, f: Filters): Promise<MainRow[]> {
   const rows = await db
     .prepare(
-      `SELECT ${keyExpr} AS key,
+      `SELECT u.session_id AS session_id,
               u.model AS model,
               ${priceEpochExpr(prices)} AS epoch,
+              ${DEPTH_CASE} AS band,
               ${USAGE_SHAPE_SELECT},
               ${USAGE_TOKEN_SUMS}
-       FROM usage u JOIN sessions s ON s.session_id = u.session_id
+       ${usageFrom(f)}
        ${f.where}
-       GROUP BY key, u.model, epoch, ${USAGE_SHAPE_GROUP_BY}
-       ${extra}`,
+       GROUP BY u.session_id, u.model, epoch, band, ${USAGE_SHAPE_GROUP_BY}`,
+    )
+    .bind(...f.binds)
+    .all<MainRow>();
+  return rows.results ?? [];
+}
+
+interface MainRow extends UsageAggRow {
+  session_id: string;
+  band: string | null;
+  /** Attached from `sessionMeta` after the scan, never selected in SQL. */
+  meta?: SessionMeta;
+}
+
+/** Totals-only scan, for the prior comparison window. Grouped by the pricing unit alone, because
+ * the only thing read off it is one dollar figure. */
+async function windowTotal(db: D1Database, prices: Map<string, ModelPrice[]>, f: Filters): Promise<number> {
+  const rows = await db
+    .prepare(
+      `SELECT u.model AS key, u.model AS model, ${priceEpochExpr(prices)} AS epoch,
+              ${USAGE_SHAPE_SELECT}, ${USAGE_TOKEN_SUMS}
+       ${usageFrom(f)}
+       ${f.where}
+       GROUP BY u.model, epoch, ${USAGE_SHAPE_GROUP_BY}`,
     )
     .bind(...f.binds)
     .all<KeyedAggRow>();
-  return foldByKey(rows.results ?? [], prices);
+  return totalOf(foldByKey(rows.results ?? [], prices)).usd;
 }
 
 function totalOf(groups: Map<string | null, PricedGroup>): PricedGroup {
@@ -321,24 +458,47 @@ const GAP_BANDS: ReadonlyArray<{ label: string; max: number | null }> = [
 const FIVE_MIN_S = 300;
 
 export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Promise<Stats> {
-  const prices = await loadPrices(db);
   const w = windows(q.range, now);
-  const cur = filters(q, w.current);
-  const prior = filters(q, w.prior);
+  const [prices, meta] = await Promise.all([loadPrices(db), sessionMeta(db)]);
+  const excludedIds = [...meta].filter(([, m]) => m.harness === EXCLUDED_HARNESS).map(([id]) => id);
 
-  const byModel = await pricedBy(db, prices, 'u.model', cur);
-  const total = totalOf(byModel);
-  const priorTotal = totalOf(await pricedBy(db, prices, 'u.model', prior));
+  // The main scan never joins: it is grouped by session_id, so session-column filters are applied
+  // against `meta` afterwards. The three narrow panels return pre-aggregated shapes with no
+  // session to filter on later, so those DO join whenever a session filter is set.
+  const main = filters(q, w.current, { excludedIds, sessionFilterMode: 'memory' });
+  const narrow = filters(q, w.current, { excludedIds, sessionFilterMode: 'sql' });
+  const priorF = filters(q, w.prior, { excludedIds, sessionFilterMode: 'sql' });
 
-  const shape = await sessionShape(db, prices, cur);
-  const [counts, gaps, rhythm, modelSessions] = await Promise.all([
-    sessionCounts(db, cur),
-    gapHistogram(db, cur),
-    rhythm2d(db, cur, q.tzOffsetHours),
-    sessionsPerModel(db, cur),
+  // Every query issued at once. Run sequentially these total ~4.3s against the production table;
+  // in parallel the page waits only for the slowest.
+  const [scan, gaps, rhythm, counts, priorUsd] = await Promise.all([
+    mainScan(db, prices, main),
+    gapHistogram(db, narrow),
+    rhythm2d(db, narrow, q.tzOffsetHours),
+    sessionCounts(db, narrow),
+    // `all` has no prior window to compare against, and running the query anyway would scan the
+    // whole table again to produce a number the UI then refuses to show.
+    w.prior.from ? windowTotal(db, prices, priorF) : Promise.resolve(0),
   ]);
-  const attribution = await pricedBy(db, prices, ATTRIBUTION_SQL[q.by], cur);
-  const outliers = await topSessions(db, prices, cur);
+
+  const rows = scan
+    .map((r) => ({ ...r, meta: meta.get(r.session_id) }))
+    // Session-column filters, applied here rather than in SQL. `meta` is undefined only for a
+    // usage row whose session was deleted; such a row can satisfy no session filter, and counting
+    // it under an unfiltered view is correct — its tokens were still burned.
+    .filter((r) => matchesSessionFilters(r.meta, q));
+
+  const byModel = foldByKey(rows.map((r) => ({ ...r, key: r.model ?? null })), prices);
+  const byBand = foldByKey(rows.map((r) => ({ ...r, key: r.band ?? null })), prices);
+  const bySession = foldByKey(rows.map((r) => ({ ...r, key: r.session_id })), prices);
+  const byAttr = foldByKey(rows.map((r) => ({ ...r, key: attributionKey(r, q.by) })), prices);
+  const total = totalOf(byModel);
+
+  // Distinct sessions per model and per depth band, counted over the same rows the dollars came
+  // from. A separate COUNT(DISTINCT) query would be a second scan AND could disagree with these
+  // totals if the two ever drifted apart on filters.
+  const sessionsPerModel = distinctSessions(rows, (r) => r.model ?? null);
+  const sessionsPerBand = distinctSessions(rows, (r) => r.band ?? null);
 
   const cacheUsd = total.byClass.cacheRead + total.byClass.cacheWrite5m + total.byClass.cacheWrite1h;
 
@@ -346,7 +506,7 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
     window: w.current,
     ledger: {
       usd: total.usd,
-      priorUsd: priorTotal.usd,
+      priorUsd,
       calls: total.calls,
       sessions: counts.sessions,
       activeHours: counts.activeSeconds / 3600,
@@ -360,19 +520,27 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
       { label: 'Fresh input', tokens: total.tokens.input, usd: total.byClass.input },
       { label: 'Output', tokens: total.tokens.output, usd: total.byClass.output },
     ],
-    depth: shape,
+    depth: DEPTH_BANDS.map((b) => {
+      const g = byBand.get(b.label);
+      const calls = g?.calls ?? 0;
+      return {
+        label: b.label,
+        calls,
+        usdPerCall: calls > 0 ? (g?.usd ?? 0) / calls : 0,
+        sessions: sessionsPerBand.get(b.label) ?? 0,
+      };
+    }),
     gaps,
-    attribution: [...attribution.values()]
+    attribution: [...byAttr.values()]
       .map((g) => ({ key: g.key ?? '(none)', usd: g.usd, calls: g.calls, sessions: 0 }))
       .sort((a, b) => b.usd - a.usd || b.calls - a.calls)
-      .slice(0, 12),
+      .slice(0, ATTRIBUTION_LIMIT),
     rhythm,
     models: [...byModel.values()]
       .map((g) => {
-        const model = g.key ?? UNKNOWN_MODEL_LABEL;
-        const sessions = modelSessions.get(g.key ?? null) ?? 0;
+        const sessions = sessionsPerModel.get(g.key ?? null) ?? 0;
         return {
-          model,
+          model: g.key ?? UNKNOWN_MODEL_LABEL,
           usd: g.usd,
           calls: g.calls,
           sessions,
@@ -381,45 +549,44 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
         };
       })
       .sort((a, b) => b.usd - a.usd)
-      .slice(0, 8),
-    outliers,
+      .slice(0, MODEL_LIMIT),
+    outliers: await topSessions(db, bySession, rows),
   };
 }
 
-/** Cost by turn depth, plus how many sessions are still running at each depth.
- *
- * The survival count is the load-bearing half. The cost curve alone says "deep turns are
- * expensive"; without knowing how much of the corpus is actually out there you would over-react
- * to a tail containing four sessions.
- */
-async function sessionShape(
-  db: D1Database,
-  prices: Map<string, ModelPrice[]>,
-  f: Filters,
-): Promise<DepthRow[]> {
-  const [priced, survival] = await Promise.all([
-    pricedBy(db, prices, DEPTH_CASE, f),
-    db
-      .prepare(
-        `SELECT ${DEPTH_CASE} AS key, COUNT(DISTINCT u.session_id) AS sessions
-         FROM usage u JOIN sessions s ON s.session_id = u.session_id
-         ${f.where}
-         GROUP BY key`,
-      )
-      .bind(...f.binds)
-      .all<{ key: string | null; sessions: number }>(),
-  ]);
-  const sessionsByBand = new Map((survival.results ?? []).map((r) => [r.key, Number(r.sessions ?? 0)]));
-  return DEPTH_BANDS.map((b) => {
-    const g = priced.get(b.label);
-    const calls = g?.calls ?? 0;
-    return {
-      label: b.label,
-      calls,
-      usdPerCall: calls > 0 ? (g?.usd ?? 0) / calls : 0,
-      sessions: sessionsByBand.get(b.label) ?? 0,
-    };
-  });
+/** The session-column half of the filter set, applied in memory so the main scan can skip the
+ * join. Kept beside `filters()` in behaviour: an unset filter matches everything. */
+function matchesSessionFilters(m: SessionMeta | undefined, q: StatsQuery): boolean {
+  if (q.harness && m?.harness !== q.harness) return false;
+  if (q.project && m?.project_name !== q.project) return false;
+  if (q.machine && m?.machine_id !== q.machine) return false;
+  return true;
+}
+
+const ATTRIBUTION_LIMIT = 12;
+const MODEL_LIMIT = 8;
+
+/** The attribution key for a row, chosen in memory so all five dimensions come off one scan. */
+function attributionKey(r: MainRow, by: Attribution): string {
+  const project = r.meta?.project_name ?? '(no project)';
+  if (by === 'project') return project;
+  // Branch names are not unique across repos, so a bare `main` would pool every project's trunk
+  // work into one row. The composite is the smallest key that does not lie.
+  if (by === 'branch') return `${project}@${r.meta?.git_branch ?? '(no branch)'}`;
+  if (by === 'model') return r.model ?? UNKNOWN_MODEL_LABEL;
+  if (by === 'harness') return r.meta?.harness ?? '(unknown)';
+  return r.meta?.machine_id ?? '(web — no machine)';
+}
+
+function distinctSessions(rows: MainRow[], key: (r: MainRow) => string | null): Map<string | null, number> {
+  const seen = new Map<string | null, Set<string>>();
+  for (const r of rows) {
+    const k = key(r);
+    const set = seen.get(k) ?? new Set<string>();
+    set.add(r.session_id);
+    seen.set(k, set);
+  }
+  return new Map([...seen].map(([k, v]) => [k, v.size]));
 }
 
 async function sessionCounts(db: D1Database, f: Filters): Promise<{ sessions: number; activeSeconds: number }> {
@@ -440,20 +607,6 @@ async function sessionCounts(db: D1Database, f: Filters): Promise<{ sessions: nu
     .bind(...f.binds)
     .first<{ sessions: number; active_seconds: number }>();
   return { sessions: Number(row?.sessions ?? 0), activeSeconds: Number(row?.active_seconds ?? 0) };
-}
-
-/** Distinct sessions per model, for the "turns per session" column of the model panel. */
-async function sessionsPerModel(db: D1Database, f: Filters): Promise<Map<string | null, number>> {
-  const rows = await db
-    .prepare(
-      `SELECT u.model AS model, COUNT(DISTINCT u.session_id) AS sessions
-       FROM usage u JOIN sessions s ON s.session_id = u.session_id
-       ${f.where}
-       GROUP BY u.model`,
-    )
-    .bind(...f.binds)
-    .all<{ model: string | null; sessions: number }>();
-  return new Map((rows.results ?? []).map((r) => [r.model ?? null, Number(r.sessions ?? 0)]));
 }
 
 /** Histogram of the gap between consecutive turns of a session.
@@ -523,32 +676,37 @@ const OUTLIER_LIMIT = 12;
  * Every panel above ends here: a statistic that does not terminate in a link to a specific
  * session is trivia.
  */
-async function topSessions(db: D1Database, prices: Map<string, ModelPrice[]>, f: Filters): Promise<OutlierRow[]> {
-  const priced = await pricedBy(db, prices, 'u.session_id', f);
-  const top = [...priced.values()].sort((a, b) => b.usd - a.usd).slice(0, OUTLIER_LIMIT);
-  if (!top.length) return [];
+async function topSessions(
+  db: D1Database,
+  bySession: Map<string | null, PricedGroup>,
+  rows: MainRow[],
+): Promise<OutlierRow[]> {
+  const top = [...bySession.values()].sort((a, b) => b.usd - a.usd).slice(0, OUTLIER_LIMIT);
   const ids = top.map((g) => g.key).filter((k): k is string => k !== null);
   if (!ids.length) return [];
-  const placeholders = ids.map((_, i) => `?${i + 1}`).join(',');
+  // Only titles are fetched, and only for the twelve rows actually shown. Carrying
+  // `first_interaction_title` through the main scan would attach a long string to every one of its
+  // ~32k groups in order to display twelve of them.
   const meta = await db
     .prepare(
       // first_interaction_title (migration 0013) with `title` as fallback: sessions not reparsed
       // since that migration have NULL there, so the fallback is not optional.
-      `SELECT session_id, COALESCE(first_interaction_title, title) AS title, git_branch, harness
-       FROM sessions WHERE session_id IN (${placeholders})`,
+      `SELECT session_id, COALESCE(first_interaction_title, title) AS title
+       FROM sessions WHERE session_id IN (${ids.map((_, i) => `?${i + 1}`).join(',')})`,
     )
     .bind(...ids)
-    .all<{ session_id: string; title: string | null; git_branch: string | null; harness: string | null }>();
-  const byId = new Map((meta.results ?? []).map((r) => [r.session_id, r]));
+    .all<{ session_id: string; title: string | null }>();
+  const titles = new Map((meta.results ?? []).map((r) => [r.session_id, r.title]));
+  const attrs = new Map(rows.map((r) => [r.session_id, r]));
   return top
     .filter((g) => g.key !== null)
     .map((g) => {
-      const m = byId.get(g.key as string);
+      const r = attrs.get(g.key as string);
       return {
         sessionId: g.key as string,
-        title: m?.title ?? null,
-        branch: m?.git_branch ?? null,
-        harness: m?.harness ?? null,
+        title: titles.get(g.key as string) ?? null,
+        branch: r?.meta?.git_branch ?? null,
+        harness: r?.meta?.harness ?? null,
         usd: g.usd,
         calls: g.calls,
       };

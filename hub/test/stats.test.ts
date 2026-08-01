@@ -127,6 +127,22 @@ describe('ledger', () => {
     expect(s.ledger.calls).toBe(1);
   });
 
+  it('excludes prompt-log from the panels that do NOT join sessions, too', async () => {
+    // Two different exclusion paths, and this is the one the ledger test cannot reach. The main
+    // scan joins `sessions` and excludes by harness; rhythm and the gap histogram skip that join
+    // (it costs a lookup per usage row for the sake of 7 sessions out of 31k) and exclude by
+    // session id instead. A regression in the id path would leave a synthetic row spanning months
+    // sitting in the middle of the heatmap while every dollar figure looked right.
+    await seedSession('real');
+    await seedSession('plog', { harness: 'prompt-log' });
+    await seedTurn('real', '2026-07-20T10:00:00.000Z', { input: 1 });
+    await seedTurn('plog', '2026-07-21T03:00:00.000Z', { input: 1 });
+
+    const s = await collectStats(testEnv.DB, BASE, NOW);
+    expect(s.rhythm.reduce((a, c) => a + c.calls, 0), 'prompt-log turns reached the heatmap').toBe(1);
+    expect(s.rhythm[0]!.hour, 'the surviving turn is not the real one').toBe(10);
+  });
+
   it('reports the cache share of spend, not of tokens', async () => {
     // 1M cache reads at 0.1 = $0.10; 1M output at 10 = $10. Cache is 90% of TOKENS but under 1%
     // of the bill, and it is the bill that this number is about.
