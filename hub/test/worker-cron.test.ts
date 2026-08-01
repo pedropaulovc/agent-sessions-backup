@@ -126,6 +126,15 @@ describe('scheduled handler', () => {
 
     await fire('30 4 * * *');
 
+    // Assert the FAILURE actually happened before asserting what survived it. The pricing
+    // assertion alone would also pass if the handler stopped calling runModelPriceSync alogether,
+    // at which point this test would quietly stop covering the path it is named for.
+    expect(fetch, 'the sync never ran, so nothing failed and this proves nothing').toHaveBeenCalled();
+    const sync = await testEnv.DB.prepare('SELECT ok, error FROM model_prices_sync ORDER BY id DESC LIMIT 1')
+      .first<{ ok: number; error: string | null }>();
+    expect(sync?.ok, 'the sync succeeded, so the pass was never chained off a rejection').toBe(0);
+    expect(sync?.error, 'a failed sync recorded no reason').toBeTruthy();
+
     const row = await testEnv.DB.prepare('SELECT usd FROM usage WHERE session_id = ?1')
       .bind('cron-sess')
       .first<{ usd: number | null }>();
