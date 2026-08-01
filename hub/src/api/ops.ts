@@ -732,14 +732,39 @@ function costBasis(batch: boolean, rateSetsUsed: Set<'standard' | 'batch' | 'mix
   return anyBatch ? 'litellm_list_price_batch_partial' : 'litellm_list_price';
 }
 
+/** Fields that actually change what a row COSTS. Two snapshots agreeing on all of these are
+ * interchangeable for pricing, whatever else differs between them (`effective_from`,
+ * `litellm_key`, `fetched_at`, `provider`). */
+const COST_RELEVANT_COLS = [
+  'input_cost',
+  'output_cost',
+  'cache_read_cost',
+  'cache_write_5m_cost',
+  'cache_write_1h_cost',
+  'input_cost_batch',
+  'output_cost_batch',
+  'cache_accounting',
+] as const;
+
+function costEquivalent(a: ModelPrice, b: ModelPrice): boolean {
+  return COST_RELEVANT_COLS.every((c) => (a[c] ?? null) === (b[c] ?? null));
+}
+
 /** The rate for a group, given the epoch it was bucketed into.
  *
- * A group with no timestamp can still be priced when the model only ever had ONE snapshot —
- * there is no ambiguity to resolve. With two or more, any choice is a guess, so it stays
- * unpriced rather than being charged at the earliest rate and reported as a real figure. */
+ * A group with no timestamp can still be priced when every snapshot the model has would produce
+ * the SAME cost — there is no ambiguity to resolve. Counting snapshots instead of comparing them
+ * was too strict: the sync writes a new row for a metadata-only correction (a null `provider`
+ * becoming `openai`, say), and that alone made every timestamp-less call for the model unpriced
+ * even though all its snapshots compute identical dollars.
+ *
+ * When they genuinely differ, any choice is a guess, so it stays unpriced rather than being
+ * charged at some arbitrary rate and reported as a real figure. */
 function priceForGroup(history: ModelPrice[], epoch: string): ModelPrice | null {
   if (epoch !== EPOCH_UNKNOWN_TIME) return priceAt(history, epoch);
-  return history.length === 1 ? history[0]! : null;
+  if (!history.length) return null;
+  const first = history[0]!;
+  return history.every((p) => costEquivalent(first, p)) ? first : null;
 }
 
 /** Stands in for a NULL `usage.model` in `unpriced_models`. Deliberately bracketed so it cannot

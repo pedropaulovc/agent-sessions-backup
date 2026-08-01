@@ -30,7 +30,9 @@ export interface ModelPrice {
   cache_write_1h_cost: number | null;
   input_cost_batch: number | null;
   output_cost_batch: number | null;
-  cache_accounting: 'disjoint' | 'subset';
+  /** 'unknown' when upstream gave no recognised provider — see migration 0017. A row with cache
+   * reads and an unknown convention is refused rather than priced ~2x wrong in either direction. */
+  cache_accounting: 'disjoint' | 'subset' | 'unknown';
 }
 
 /** Per-class token counts and their dollar cost. `unpriced` is set when no rate was found,
@@ -150,6 +152,13 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   // Anthropic charges 1.25x for a 5m write and 2x for a 1h write -- so substituting the input
   // rate (or the 5m rate for a missing 1h rate) invents a cheaper price and reports it as if it
   // were priced.
+  // Cache reads with an UNKNOWN accounting convention cannot be priced at all: disjoint bills
+  // them on top of input, subset bills them inside it, and picking either way is a silent ~2x
+  // error on every cached turn in one direction or the other. Rows with no cache reads are
+  // unaffected, so an unrecognised provider only costs pricing where it actually matters.
+  if (cacheRead > 0 && price.cache_accounting !== 'disjoint' && price.cache_accounting !== 'subset') {
+    return unpriced;
+  }
   if (billableInput > 0 && inRate == null) return unpriced;
   if (output > 0 && outRate == null) return unpriced;
   if (cacheRead > 0 && readRate == null) return unpriced;

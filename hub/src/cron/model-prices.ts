@@ -28,6 +28,19 @@ const RATE_COLS = [
  * every cached call until some unrelated rate happens to change. */
 const ACCOUNTING_COLS = ['provider', 'cache_accounting'] as const;
 
+/** Only providers whose cache-read convention is actually known. Anything absent from this map
+ * stores NULL rather than guessing -- see the call site. */
+/** Statements per D1 batch. Each one costs a subrequest against the invocation's ~1000 budget,
+ * which the daily handler shares with the prune jobs it runs alongside this. */
+const MAX_STATEMENTS_PER_BATCH = 100;
+
+const CACHE_ACCOUNTING_BY_PROVIDER: Record<string, 'disjoint' | 'subset'> = {
+  anthropic: 'disjoint',
+  openai: 'subset',
+  azure: 'subset',
+  deepseek: 'subset',
+};
+
 type Rates = Record<(typeof RATE_COLS)[number], number | null>;
 type Accounting = Record<(typeof ACCOUNTING_COLS)[number], string | null>;
 
@@ -83,7 +96,16 @@ export async function runModelPriceSync(env: Env): Promise<void> {
       };
       // Anthropic reports cache reads disjoint from input_tokens; the OpenAI family reports them
       // as a subset. Charging both the same way misprices every cached turn.
-      const cacheAccounting = provider === 'anthropic' ? 'disjoint' : 'subset';
+      //
+      // Defaulting the UNKNOWN case to 'subset' was a confident guess in the expensive direction:
+      // a Claude Code row stores cache_read_input_tokens as disjoint usage, so subset accounting
+      // subtracts those tokens from input and underprices every cached call -- silently, with the
+      // row still reported as priced. An absent or unrecognised `litellm_provider` now stores
+      // 'unknown', which costOfUsage treats as unpriced for any row that actually has cache
+      // reads. NOT null: the column is NOT NULL, and INSERT OR REPLACE silently substitutes the
+      // column DEFAULT for a NULL rather than failing, so a nullable-looking write would have
+      // stored 'disjoint' while the code believed otherwise (see migration 0017).
+      const cacheAccounting = CACHE_ACCOUNTING_BY_PROVIDER[provider ?? ''] ?? 'unknown';
       const prev = latest.get(model);
       const ratesUnchanged = prev && RATE_COLS.every((c) => (prev[c] ?? null) === (next[c] ?? null));
       const accountingUnchanged =
@@ -117,13 +139,27 @@ export async function runModelPriceSync(env: Env): Promise<void> {
       );
     }
 
+    const priceInserts = stmts.length;
     stmts.push(
       env.DB.prepare(
         `INSERT INTO model_prices_sync (upstream_entries, models_seen, rows_inserted, unresolved, ok)
          VALUES (?1,?2,?3,?4,1)`,
-      ).bind(entryCount, models.length, stmts.length, JSON.stringify(unresolved)),
+      ).bind(entryCount, models.length, priceInserts, JSON.stringify(unresolved)),
     );
-    await env.DB.batch(stmts);
+
+    // Chunked, because every statement in a D1 batch spends one of the invocation's ~1000
+    // subrequests (see the budget note in src/api/ops.ts) and the daily handler runs the prune
+    // jobs concurrently with this one. A first-run or catalog-wide change across ~1000 models in
+    // `usage` would otherwise exhaust the budget mid-sync and fail the whole refresh.
+    //
+    // Chunking gives up cross-chunk atomicity, which is acceptable HERE and would not be
+    // elsewhere: each statement is an idempotent INSERT OR REPLACE keyed by
+    // (model, effective_from), so a partial run leaves correct rows for the models it reached and
+    // the next run completes the rest. The audit row is last, so a partial run is not recorded as
+    // a success.
+    for (let i = 0; i < stmts.length; i += MAX_STATEMENTS_PER_BATCH) {
+      await env.DB.batch(stmts.slice(i, i + MAX_STATEMENTS_PER_BATCH));
+    }
   } catch (err) {
     // A failed sync must be visible in the data, not just in logs -- a silently stale price
     // table produces confident, wrong dollar figures.

@@ -31,7 +31,14 @@ export const perM = (v) =>
  * context length is a real limit expressed sloppily — and drops anything that is not a number.
  * Upstream is a community JSON blob, so a TypeScript `as number` there is a compile-time fiction,
  * and D1 rejects the bad value at INSERT time, taking the whole batch with it. */
-export const intOrNull = (v) => (typeof v === 'number' && Number.isFinite(v) ? Math.trunc(v) : null);
+export const intOrNull = (v) => {
+  if (typeof v !== 'number' || !Number.isFinite(v)) return null;
+  const n = Math.trunc(v);
+  // Finite is not enough: 1e100 is finite, survives Math.trunc, and is still far outside the
+  // range SQLite will store in a STRICT INTEGER column -- so it fails the INSERT and, because the
+  // snapshots go out in one batch(), takes every model's price down with it. Bound it.
+  return Number.isSafeInteger(n) ? n : null;
+};
 
 /** Throw unless `payload` actually looks like the price catalog.
  *

@@ -424,4 +424,64 @@ describe('priceEpochExpr', () => {
     expect(Number(row.unpriced_calls)).toBe(0);
     expect(Number(row.cost_usd)).toBeCloseTo(10, 6);
   });
+
+  it('prices a timestamp-less row when every snapshot costs the same', async () => {
+    // The sync writes a new snapshot for a metadata-only correction (a null `provider` becoming
+    // `openai`), which under a snapshot-COUNT check made every timestamp-less call for that model
+    // unpriced — even though both snapshots compute identical dollars. Compare the cost-relevant
+    // fields instead.
+    for (const [from, provider] of [
+      ['2026-01-01', null],
+      ['2026-05-01', 'openai'],
+    ] as const) {
+      await testEnv.DB.prepare(
+        `INSERT INTO model_prices
+           (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
+            cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
+            cache_accounting, source, fetched_at)
+         VALUES ('equiv-model', ?1, 'equiv-model', ?2, 7, 7, 0, 0, 0, NULL, NULL, 'subset', 'test',
+                 '2026-07-31T00:00:00Z')`,
+      )
+        .bind(from, provider)
+        .run();
+    }
+    await seedSession('equiv-sess', 'equivbox', 'claude-code');
+    await testEnv.DB.prepare(
+      `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens,
+                          cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens)
+       VALUES ('equiv-sess', 900, NULL, 'equiv-model', 1000000, 0, 0, 0, 0)`,
+    ).run();
+
+    const row = (await fetchUsage('group_by=machine&machine=equivbox')).rows[0]!;
+    expect(Number(row.unpriced_calls), 'two cost-identical snapshots left the row unpriced').toBe(0);
+    expect(Number(row.cost_usd)).toBeCloseTo(7, 6);
+  });
+
+  it('still refuses a timestamp-less row when snapshots genuinely differ', async () => {
+    // The other direction: the fix must not start guessing when the rates really do disagree.
+    for (const [from, cost] of [
+      ['2026-01-01', 100],
+      ['2026-05-01', 10],
+    ] as const) {
+      await testEnv.DB.prepare(
+        `INSERT INTO model_prices
+           (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
+            cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
+            cache_accounting, source, fetched_at)
+         VALUES ('differ-model', ?1, 'differ-model', 'openai', ?2, ?2, 0, 0, 0, NULL, NULL,
+                 'subset', 'test', '2026-07-31T00:00:00Z')`,
+      )
+        .bind(from, cost)
+        .run();
+    }
+    await seedSession('differ-sess', 'differbox', 'claude-code');
+    await testEnv.DB.prepare(
+      `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens,
+                          cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens)
+       VALUES ('differ-sess', 901, NULL, 'differ-model', 1000000, 0, 0, 0, 0)`,
+    ).run();
+
+    const row = (await fetchUsage('group_by=machine&machine=differbox')).rows[0]!;
+    expect(Number(row.unpriced_calls)).toBeGreaterThan(0);
+  });
 });

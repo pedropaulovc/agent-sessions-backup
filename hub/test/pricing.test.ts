@@ -322,4 +322,24 @@ describe('historical pricing', () => {
   it('falls back to the earliest snapshot for turns older than any record', () => {
     expect(priceAt(history, '2025-01-01')!.input_cost).toBe(0.4);
   });
+
+describe('unknown cache accounting', () => {
+  const UNKNOWN: ModelPrice = { ...LUNA, provider: null, cache_accounting: 'unknown' };
+
+  it('refuses to price a row that has cache reads', () => {
+    // Disjoint bills cache reads ON TOP of input, subset bills them INSIDE it. Guessing either
+    // way is a silent ~2x error on every cached turn, with the row still reported as priced.
+    const c = costOfUsage({ model: 'gpt-5.6-luna', input_tokens: 1_000_000, cache_read_tokens: 500_000 }, UNKNOWN);
+    expect(c.unpriced).toBe(true);
+    expect(c.usd).toBe(0);
+  });
+
+  it('still prices a row with no cache reads', () => {
+    // The convention cannot change the cost of a row that has no cache reads, so an unrecognised
+    // provider must not cost pricing where it does not matter.
+    const c = costOfUsage({ model: 'gpt-5.6-luna', input_tokens: 1_000_000, output_tokens: 1_000_000 }, UNKNOWN);
+    expect(c.unpriced).toBe(false);
+    expect(c.usd).toBeCloseTo(0.2 + 1.2, 10);
+  });
+});
 });

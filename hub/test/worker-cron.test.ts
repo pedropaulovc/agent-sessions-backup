@@ -36,9 +36,33 @@ async function fire(cron: string): Promise<void> {
 
 beforeEach(async () => {
   await testEnv.DB.prepare('DELETE FROM model_prices_sync').run();
+  await testEnv.DB.prepare('DELETE FROM model_prices').run();
+  // The sync only prices models it can SEE in `usage`, so without a usage row the daily cron
+  // succeeds having written nothing — which is indistinguishable from a broken cron.
+  await testEnv.DB.prepare('DELETE FROM usage').run();
+  await testEnv.DB.prepare(
+    `INSERT OR IGNORE INTO sessions (session_id, harness, index_state) VALUES ('cron-sess', 'claude-code', 'ready')`,
+  ).run();
+  await testEnv.DB.prepare(
+    `INSERT INTO usage (session_id, turn_index, ts, model) VALUES ('cron-sess', 1, '2026-07-01T00:00:00Z', 'claude-opus-5')`,
+  ).run();
+  // A REAL catalog, not `{}`. An empty object is rejected by assertLooksLikeCatalog, so the sync
+  // wrote an ok=0 audit row and rethrew into ctx()'s swallowed promise — and a bare "one audit row
+  // exists" assertion passed anyway. That made this test green for a cron that never refreshed a
+  // single price, which is precisely the regression it exists to catch.
+  const catalog: Record<string, unknown> = {
+    'claude-opus-5': {
+      litellm_provider: 'anthropic',
+      input_cost_per_token: 5e-6,
+      output_cost_per_token: 25e-6,
+    },
+  };
+  for (let i = 0; i < 200; i++) {
+    catalog[`filler-model-${i}`] = { litellm_provider: 'openai', input_cost_per_token: 1e-9, output_cost_per_token: 1e-9 };
+  }
   vi.stubGlobal(
     'fetch',
-    vi.fn(async () => new Response(JSON.stringify({}), { status: 200 })),
+    vi.fn(async () => new Response(JSON.stringify(catalog), { status: 200 })),
   );
 });
 
@@ -48,6 +72,19 @@ describe('scheduled handler', () => {
   it('refreshes model prices on the daily cron', async () => {
     await fire('30 4 * * *');
     expect(await auditCount(), 'the daily cron never reached runModelPriceSync').toBe(1);
+    // Reaching the sync is not the same as the sync WORKING. Assert the run succeeded and that a
+    // price actually landed, or a change that makes every cron sync fail stays green here.
+    const sync = (
+      await testEnv.DB.prepare('SELECT ok, error FROM model_prices_sync ORDER BY id DESC LIMIT 1').all<{
+        ok: number;
+        error: string | null;
+      }>()
+    ).results[0]!;
+    expect(sync.ok, `the daily sync failed: ${sync.error}`).toBe(1);
+    const prices = (
+      await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM model_prices').all<{ n: number }>()
+    ).results[0]!;
+    expect(prices.n, 'the cron ran but wrote no prices').toBeGreaterThan(0);
   });
 
   it('does not refresh prices on the 15-minute watchdog tick', async () => {

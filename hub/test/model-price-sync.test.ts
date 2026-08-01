@@ -114,15 +114,20 @@ describe('model price autorefresh', () => {
   });
 
   it('snapshots a cache-accounting flip even when every rate is identical', async () => {
-    // Upstream correcting a null provider to `anthropic` flips cache_accounting subset ->
+    // Upstream correcting a null provider to `anthropic` flips cache_accounting NULL ->
     // disjoint, which changes whether cache reads are charged ON TOP of input or subtracted
     // from it. A rates-only change predicate skipped this, leaving the wrong convention active
     // until some unrelated number happened to move.
+    //
+    // The unknown-provider value here used to be 'subset'. That was a confident guess that
+    // underpriced every cached Claude Code call, and it is now 'unknown' — costOfUsage refuses
+    // to price cache reads it has no convention for. This test's subject is the FLIP being
+    // snapshotted, which it still exercises; only the starting value changed.
     mockUpstream({ 'claude-opus-5': entry({ litellm_provider: null }) });
     await runModelPriceSync(testEnv);
     const first = await pricesFor('claude-opus-5');
     expect(first).toHaveLength(1);
-    expect(first[0]!.cache_accounting).toBe('subset');
+    expect(first[0]!.cache_accounting).toBe('unknown');
 
     mockUpstream({ 'claude-opus-5': entry({ litellm_provider: 'anthropic' }) });
     await runModelPriceSync(testEnv);
@@ -257,5 +262,22 @@ describe('model price autorefresh', () => {
     expect(sync.unresolved ?? '', 'an impossible date suffix resolved to the undated model').toContain('gpt-5-99999999');
     // A REAL dated suffix must still resolve, or the fix has over-reached.
     expect(sync.unresolved ?? '').not.toContain('gpt-5-20260214');
+  });
+
+  it('drops a token limit outside SQLite\'s integer range', async () => {
+    // Number.isFinite accepts 1e100 and Math.trunc leaves it there, still far outside what a
+    // STRICT INTEGER column stores — so it failed the INSERT and, since the snapshots go out in
+    // one batch(), took every model's price down with it.
+    mockUpstream({ 'claude-opus-5': entry({ max_input_tokens: 1e100, max_output_tokens: 2 ** 53 }) });
+    await runModelPriceSync(testEnv);
+    const row = (
+      await testEnv.DB.prepare(
+        'SELECT max_input_tokens, max_output_tokens FROM model_prices WHERE model = ?1',
+      )
+        .bind('claude-opus-5')
+        .all<Record<string, unknown>>()
+    ).results[0]!;
+    expect(row.max_input_tokens).toBe(null);
+    expect(row.max_output_tokens).toBe(null);
   });
 });
