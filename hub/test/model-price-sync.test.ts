@@ -262,6 +262,14 @@ describe('model price autorefresh', () => {
     expect(sync.unresolved ?? '', 'an impossible date suffix resolved to the undated model').toContain('gpt-5-99999999');
     // A REAL dated suffix must still resolve, or the fix has over-reached.
     expect(sync.unresolved ?? '').not.toContain('gpt-5-20260214');
+
+    // The audit field alone is a proxy. The harm named above is a PRICED row, so assert the
+    // table directly: a change that both resolves gpt-5-99999999 to gpt-5 and still lists it
+    // as unresolved would keep the assertions above green while writing a confident price.
+    const priced = async (model: string) =>
+      (await testEnv.DB.prepare('SELECT model FROM model_prices WHERE model = ?').bind(model).all()).results;
+    expect(await priced('gpt-5-99999999'), 'an unresolvable model was priced anyway').toHaveLength(0);
+    expect(await priced('gpt-5-20260214'), 'a real dated model lost its price').toHaveLength(1);
   });
 
   it('drops a token limit outside SQLite\'s integer range', async () => {

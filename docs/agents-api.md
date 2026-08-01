@@ -42,6 +42,7 @@ completely separate auth path that doesn't apply here. Two ways to authenticate:
 ## Endpoints
 
 ### `GET /api/v1/sessions`
+
 Query params: `from`, `to` (ISO timestamp, or a bare `YYYY-MM-DD` which the hub expands to
 end-of-day server-side), `harness`, `machine`, `repo`, `limit` (default 200, **hard max
 1000**), `format=ndjson`.
@@ -83,12 +84,14 @@ for it (see `hub/src/auth/identity.ts::devHeaderIdentity`) without that machine 
 sent a heartbeat — including a plain read like this one.
 
 ### `GET /api/v1/sessions/{id}`
+
 One session, fully parsed: `{meta: <sessions row>, session: <NormalizedSession|null>}`.
 `session` is `null` if the canonical R2 object went missing (rare — actual data loss, not a
 parse failure). Either way the row's `index_state` is `'error'`; see `index_state` below for
 why the two aren't distinguishable from `meta` alone, and how to tell them apart via `/raw`.
 
 ### `GET /api/v1/sessions/{id}/raw`
+
 The response shape depends on what the session's canonical file actually is
 (`hub/src/api/sessions.ts::getSessionRaw`):
 
@@ -107,6 +110,7 @@ The response shape depends on what the session's canonical file actually is
   isn't meant to be range-read).
 
 ### `GET /api/v1/search`
+
 Params: `q` (FTS5 MATCH syntax — invalid syntax is retried as a quoted literal phrase, then
 degrades to an empty result set rather than a 500), `harness`, `machine`, `os`, `model`,
 `repo`, `project`, `cwd`, `session_date`, `session_time`, `has_star=1`, `from`, `to`,
@@ -114,6 +118,7 @@ degrades to an empty result set rather than a 500), `harness`, `machine`, `os`, 
 the registered search facets, including `has_star`).
 
 ### `GET /api/v1/usage?group_by=day|model|machine|repo&from&to&machine&harness&batch`
+
 Token accounting, one row per bucket: `bucket, calls, input_tokens, output_tokens,
 reasoning_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens`,
 plus costing: `cost_usd`, `billable_input_tokens`, `unpriced_calls`. Response-level:
@@ -184,6 +189,7 @@ cross-referencing. `SessionsApi.usage()` exposes both, and `daily-report` forwar
 `--machine`/`--harness` flags, so its token section is scoped exactly like its session list.
 
 ### `GET /api/v1/status`
+
 Fleet freshness / index-completeness:
 ```jsonc
 {
@@ -200,6 +206,7 @@ that. This is the right endpoint to answer "did machine X finish syncing before 
 counts for date D": compare its `indexed_through` to D's end-of-day bound.
 
 ### `index_state`
+
 Every session row carries `index_state`: `parsing` (queued/reparsing — block/FTS content may
 be stale or absent), `ready` (fully indexed), `error` (parse failed). A report that counts
 sessions should count `error` ones too (as "present but not analyzable"), not silently drop

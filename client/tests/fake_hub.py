@@ -28,7 +28,9 @@ class FakeHub:
         self.indexed_through_by_request: list[str | None] | None = None
         self.search_hits: list[dict] = []
         self.usage_rows: list[dict] = []
-        self.usage_cost_basis: str = "litellm_list_price"
+        # `str | None`, not `str`: the hub omits `cost_basis` entirely when nothing priced, and
+        # the client reads a missing value as "not priced" -- a test must be able to fake that.
+        self.usage_cost_basis: str | None = "litellm_list_price"
         self.usage_unpriced_models: list[str] = []
         self.status_machines: list[dict] = []
         self.status_sessions: dict = {"total": 0, "ready": 0, "error": 0}

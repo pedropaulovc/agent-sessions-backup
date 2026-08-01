@@ -87,7 +87,10 @@ function d1(sql) {
   const out = run(['--json', '--command', sql]);
   // wrangler interleaves ANSI-coloured banners with the payload, and those escapes contain
   // '[' -- so scan for a line that *starts* a JSON array rather than the first bracket.
-  const clean = out.replace(/\[[0-9;]*m/g, '');
+  // The ESC byte is written \x1b, not pasted raw: a literal control character in source is
+  // invisible in most editors and diffs, and deleting it silently leaves '\x1b' in every line
+  // so the '[' scan below never matches.
+  const clean = out.replace(/\x1b\[[0-9;]*m/g, '');
   const lines = clean.split('\n');
   const start = lines.findIndex((l) => l.trimEnd() === '[');
   if (start < 0) throw new Error(`no JSON array in wrangler output:\n${clean}`);

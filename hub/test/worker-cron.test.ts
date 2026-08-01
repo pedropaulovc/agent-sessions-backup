@@ -90,6 +90,9 @@ describe('scheduled handler', () => {
   it('does not refresh prices on the 15-minute watchdog tick', async () => {
     // 96 needless upstream fetches a day, and 96 audit rows, if these ever get crossed.
     await fire('*/15 * * * *');
+    // Assert the fetch, not just the audit row: a sync that fetches and then FAILS writes an
+    // audit row too, so the count alone cannot tell "never ran" from "ran and errored".
+    expect(fetch, 'the watchdog tick hit the upstream catalog').not.toHaveBeenCalled();
     expect(await auditCount()).toBe(0);
   });
 

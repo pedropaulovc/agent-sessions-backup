@@ -325,6 +325,7 @@ describe('historical pricing', () => {
   it('falls back to the earliest snapshot for turns older than any record', () => {
     expect(priceAt(history, '2025-01-01')!.input_cost).toBe(0.4);
   });
+});
 
 describe('unknown cache accounting', () => {
   const UNKNOWN: ModelPrice = { ...LUNA, provider: null, cache_accounting: 'unknown' };
@@ -373,5 +374,4 @@ describe('subset cache-read clamp', () => {
     );
     expect(c.usd).toBeCloseTo((1000 * 0.02) / 1_000_000, 12);
   });
-});
 });
