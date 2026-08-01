@@ -1,6 +1,8 @@
 import { env } from 'cloudflare:test';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { priceUsage } from '../src/pricing-pass';
+import { priceUsageSlice, PRICE_ROWS_PER_INVOCATION, setPriceRowsPerInvocation } from '../src/api/ops';
+import type { Identity } from '../src/auth/identity';
 
 /** The pass that fills `usage.usd`.
  *
@@ -10,6 +12,8 @@ import { priceUsage } from '../src/pricing-pass';
 
 const testEnv = env as unknown as Env;
 const NOW = new Date('2026-08-01T12:00:00.000Z');
+/** Captured at import, before any test mutates it. */
+const PRICE_ROWS_PER_INVOCATION_DEFAULT = PRICE_ROWS_PER_INVOCATION;
 
 /** 1/M input, 10/M output, disjoint accounting. Chosen so a million input tokens costs exactly
  * $1 and every expectation below can be checked by hand. */
@@ -231,5 +235,54 @@ describe('priceUsage', () => {
     await priceUsage(testEnv.DB, { now: NOW });
 
     expect((await priced(id)).usd, 'a negative token count produced negative dollars').toBeCloseTo(10, 9);
+  });
+});
+
+/** POST /api/v1/admin/price-usage — the backfill entrypoint.
+ *
+ * The status code IS the contract: a caller loops until it stops getting 202, so a pass that
+ * returned 200 while rows remained would silently truncate the backfill and report success. */
+describe('priceUsageSlice', () => {
+  const admin: Identity = { kind: 'machine', machineId: 'opsbox', isAdmin: true, certSlot: 'current' };
+  const req = () => new Request('https://api.sessions.vza.net/api/v1/admin/price-usage', { method: 'POST' });
+
+  beforeEach(async () => {
+    await testEnv.DB.batch([
+      testEnv.DB.prepare('DELETE FROM usage'),
+      testEnv.DB.prepare('DELETE FROM model_prices'),
+    ]);
+    turn = 0;
+  });
+
+  afterEach(() => setPriceRowsPerInvocation(PRICE_ROWS_PER_INVOCATION_DEFAULT));
+
+  it('202s while rows remain and 200s only when the pass ran out of work', async () => {
+    // The status code is the whole contract: the backfill caller loops until it stops seeing 202,
+    // so a run that answered 200 with rows still unpriced would truncate the backfill silently and
+    // report success. Two rows against a one-row budget reaches the 202 arm; the real budget is
+    // 10,000, and seeding that many is a minute of fixtures for a branch this covers identically.
+    setPriceRowsPerInvocation(1);
+    await seedPrice();
+    await seedTurn('s1');
+    await seedTurn('s1');
+
+    const partial = await priceUsageSlice(req(), testEnv, admin);
+    expect(partial.status, 'a partial pass reported the backfill finished').toBe(202);
+    expect(await partial.json()).toMatchObject({ examined: 1, priced: 1, more: true });
+
+    // Second row, then nothing left — the only state that may answer 200.
+    expect((await priceUsageSlice(req(), testEnv, admin)).status).toBe(202);
+    const done = await priceUsageSlice(req(), testEnv, admin);
+    expect(done.status, 'a finished pass never reported done, so the caller would loop forever').toBe(200);
+    expect(await done.json()).toMatchObject({ examined: 0, more: false });
+  });
+
+  it('refuses a non-admin identity', async () => {
+    const plain: Identity = { kind: 'machine', machineId: 'anybox', isAdmin: false, certSlot: 'current' };
+    await seedPrice();
+    const id = await seedTurn('s1');
+
+    expect((await priceUsageSlice(req(), testEnv, plain)).status).toBe(403);
+    expect((await priced(id)).usd, 'a non-admin call still did the work').toBeNull();
   });
 });

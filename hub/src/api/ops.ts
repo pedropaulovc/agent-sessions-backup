@@ -931,7 +931,14 @@ export function objectSha256(obj: R2Object | null | undefined): string | undefin
  * is the primary mechanism, not the batch size. At PRICING_READ_BATCH=500 / PRICING_WRITE_BATCH=100
  * this is 20 reads plus 100 write batches, ~120 of the invocation's ~1000 subrequest budget.
  * Raising it to "finish in one call" is how the budget gets breached; the caller loops instead. */
-export const PRICE_ROWS_PER_INVOCATION = 10_000;
+export let PRICE_ROWS_PER_INVOCATION = 10_000;
+
+/** Test-only override, matching the pattern the ingest budget constants use. The 202 arm is only
+ * reachable when the pass stops on its budget, and seeding 10,000 usage rows to observe that
+ * would be a minute of fixture setup for a branch a two-row budget exercises exactly as well. */
+export function setPriceRowsPerInvocation(n: number): void {
+  PRICE_ROWS_PER_INVOCATION = n;
+}
 
 /** POST /api/v1/admin/price-usage — fill `usage.usd` for a BOUNDED slice of unpriced rows.
  *
