@@ -225,6 +225,15 @@ def test_usage_parses_pricing_fields(hub):
     assert report.unpriced_models == ["brand-new-model"]
 
 
+def test_usage_forwards_batch_flag_only_when_asked(hub):
+    hub.usage_rows = []
+    api = api_for(hub)
+    api.usage(group_by="model")
+    assert "batch" not in hub.requests[-1]["params"]
+    api.usage(group_by="model", batch=True)
+    assert hub.requests[-1]["params"]["batch"] == ["1"]
+
+
 def test_usage_forwards_machine_and_harness_filters(hub):
     hub.usage_rows = []
     api_for(hub).usage(group_by="model", machine="amet-wsl", harness="codex")

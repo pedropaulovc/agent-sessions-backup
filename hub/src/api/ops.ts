@@ -603,7 +603,8 @@ export async function usage(url: URL, env: Env): Promise<Response> {
               -- (input == cache_read) needs no input rate and stays priceable from the cache-read
               -- rate alone; grouping it with a partly-fresh call would put positive fresh input in
               -- the aggregate and discard its valid cost.
-              (MAX(0, COALESCE(u.input_tokens,0) - COALESCE(u.cache_read_tokens,0)) > 0) AS has_fresh_input,
+              (MAX(0, MAX(0, COALESCE(u.input_tokens,0)) - MAX(0, COALESCE(u.cache_read_tokens,0))) > 0)
+                AS has_fresh_input,
               (COALESCE(u.output_tokens,0) > 0) AS has_output,
               (COALESCE(u.cache_read_tokens,0) > 0) AS has_cache_read,
               (COALESCE(u.cache_creation_5m_tokens,0) > 0) AS has_w5,
@@ -623,7 +624,11 @@ export async function usage(url: URL, env: Env): Promise<Response> {
               -- clamp at 0 is nonlinear, so it has to happen per row: one truncated call with
               -- cache_read > input would otherwise cancel fresh input from valid calls in the
               -- same group. costOfUsage() consumes this instead of clamping the SUMs.
-              SUM(MAX(0, COALESCE(u.input_tokens,0) - COALESCE(u.cache_read_tokens,0)))
+              --
+              -- BOTH operands are clamped before the subtraction, not just the result. A negative
+              -- cache_read would otherwise ADD to fresh input: (5) - (-100) = 105 billable tokens
+              -- on a row whose own reported columns say input=5, cache_read=0.
+              SUM(MAX(0, MAX(0, COALESCE(u.input_tokens,0)) - MAX(0, COALESCE(u.cache_read_tokens,0))))
                 AS fresh_input_tokens
        FROM usage u JOIN sessions s ON s.session_id = u.session_id
        ${where}

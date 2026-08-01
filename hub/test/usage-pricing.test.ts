@@ -287,6 +287,38 @@ describe('subset models split on fresh input, not raw input', () => {
   });
 });
 
+describe('negative counters cannot inflate billable input', () => {
+  beforeAll(async () => {
+    // A FULLY priced subset model — the earlier cached-only-model has no input rate, so a row
+    // using it goes unpriced and reports 0 billable input no matter what the SQL computed,
+    // which would make this test pass without exercising anything.
+    await testEnv.DB.prepare(
+      `INSERT INTO model_prices
+         (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
+          cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
+          cache_accounting, source, fetched_at)
+       VALUES ('subset-priced-model', '2026-01-01', 'subset-priced-model', 'openai', 1, 1, 1, 0, 0,
+               NULL, NULL, 'subset', 'test', '2026-01-01T00:00:00Z')`,
+    ).run();
+    await testEnv.DB.prepare(
+      `INSERT INTO sessions (session_id, harness, machine_id, repo_url, started_at, index_state)
+       VALUES ('sess-negcache', 'codex', 'negbox', 'https://github.com/e/f', '2026-06-15T00:00:00Z', 'ready')`,
+    ).run();
+    // input=5 with cache_read=-100. Clamping only the SUBTRACTION result gives
+    // MAX(0, 5 - (-100)) = 105 fresh tokens billed, on a row whose own reported columns say
+    // input=5 and cache_read=0 — a negative counter inventing 100 tokens of spend.
+    await seedUsage('sess-negcache', '2026-06-15T10:00:00Z', 'subset-priced-model', { input: 5, cacheRead: -100 });
+  });
+
+  it('never derives more fresh input than the row reports as input', async () => {
+    const body = await fetchUsage('group_by=model&machine=negbox');
+    const row = body.rows.find((r) => r.bucket === 'subset-priced-model');
+    expect(row!.input_tokens).toBe(5);
+    expect(row!.billable_input_tokens, 'a negative cache_read inflated billable input').toBe(5);
+    expect(row!.cost_usd).toBeCloseTo(5 / 1e6, 10);
+  });
+});
+
 describe('cost_basis honesty', () => {
   it('does not claim batch pricing for a model with no batch tier', async () => {
     // The seeded claude-opus-5 rows have NULL batch rates, so batch=1 falls back to standard.

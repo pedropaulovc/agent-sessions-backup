@@ -229,11 +229,26 @@ class SessionsApi:
         to: str | None = None,
         machine: str | None = None,
         harness: str | None = None,
+        batch: bool = False,
     ) -> UsageReport:
-        """GET /api/v1/usage?group_by=day|model|machine|repo&from&to&machine&harness"""
+        """GET /api/v1/usage?group_by=day|model|machine|repo&from&to&machine&harness&batch
+
+        `batch` asks for batch-tier list rates. It is a request, not a guarantee: models with no
+        published batch tier fall back to their standard rates, so check the returned
+        `cost_basis` rather than assuming what was asked for is what was applied.
+        """
         resp = self._client.get(
             "/api/v1/usage",
-            {"group_by": group_by, "from": from_, "to": to, "machine": machine, "harness": harness},
+            {
+                "group_by": group_by,
+                "from": from_,
+                "to": to,
+                "machine": machine,
+                "harness": harness,
+                # Omitted entirely when False: the hub tests `batch === '1'`, and sending "0"
+                # would be equivalent but makes the request line lie about what was asked.
+                "batch": "1" if batch else None,
+            },
         )
         body = resp.json()
         # Thread the response's own group_by (not the request kwarg — same value in practice,
