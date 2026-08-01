@@ -277,20 +277,45 @@ jobs:
       - run: npx wrangler deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      # The preview D1, and from HERE rather than from migrate-preview. That job only runs for
-      # same-repo pull requests, but `sessions-hub-preview` has `main` as its production branch —
-      # so a direct push to main (which is unprotected) or a merged FORK PR deploys new preview
-      # code with no migration behind it, leaving the shared preview database on the old schema
-      # until some unrelated PR happens to migrate it. The `deploy` step above covers only
-      # `sessions-index`.
-      #
-      # LAST, deliberately, and this ordering is the whole point. The shared preview database
-      # carries schema from unmerged branches, so a preview migration can conflict with a main
-      # migration through no fault of this release. Running it before `wrangler deploy` would let
-      # preview-only contamination abort the job with production already migrated but still
-      # running the OLD Worker — new schema, old code, which is the exact failure this job exists
-      # to prevent. Placed after the deploy, production is always left consistent and a failure
-      # here means only "preview needs attention", while still being visible as a red check.
+
+  # The preview D1 on a main push, and from here rather than from migrate-preview. That job only
+  # runs for same-repo pull requests, but `sessions-hub-preview` has `main` as its production
+  # branch — so a direct push to main (which is unprotected) or a merged FORK PR deploys new
+  # preview code with no migration behind it, leaving the shared preview database on the old
+  # schema until some unrelated PR happens to migrate it. The `deploy` job covers only
+  # `sessions-index`.
+  #
+  # A SEPARATE JOB, not a step in `deploy`, purely so it can join `migrate-preview`'s concurrency
+  # group. Both write the same shared database, and only the PR job was in the group, so a main
+  # push overlapping a PR run wrote it concurrently. The endpoint's atomic name claim orders two
+  # runs applying the SAME migration, but it cannot order DIFFERENT ones: a PR-head migration that
+  # depends on a migration newly added on main can still run first and fail, even though the `hub`
+  # job tested the synthetic merge in the correct order. The group makes them queue.
+  #
+  # `needs: deploy` keeps the ordering that was the point of putting this last. The shared preview
+  # database carries schema from unmerged branches, so a preview migration can conflict with a main
+  # migration through no fault of this release. Running it before `wrangler deploy` would leave
+  # production migrated but still running the OLD Worker — new schema, old code, the exact failure
+  # `deploy` exists to prevent. After the deploy, production is always consistent and a failure
+  # here means only "preview needs attention", while still showing as a red check.
+  migrate-preview-main:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: deploy
+    concurrency:
+      group: migrate-preview
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hub
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: hub/package-lock.json
+      - run: npm ci
       - run: npx wrangler d1 migrations apply DB --env preview --remote
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

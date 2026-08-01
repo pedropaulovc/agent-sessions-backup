@@ -78,7 +78,12 @@ committed in that same file) and its preview Worker would then be bound to produ
 the deployment path stops that.
 
 The endpoint therefore **asks the database it is actually bound to whether it is the preview one**,
-before authenticating the caller and before writing anything. The preview database carries a
+immediately before it writes anything — and *after* verifying the caller's OIDC token. That order
+matters and must not be reversed: this route has no mTLS and its `workers.dev` preview alias is
+publicly reachable, so checking the marker first would let any unauthenticated POST force a query
+against the shared preview database and burn its quota. Authentication first, marker check
+immediately before any write, so the check still runs on every path that writes — which is all it
+was ever protecting. The preview database carries a
 `preview_environment_marker` row; production does not. A repointed binding gets
 `409 not_preview_database` instead of a migration, and it fails **closed** — a missing table, a
 missing row, a wrong value, or any error at all means no writes.
