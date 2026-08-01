@@ -87,6 +87,60 @@ describe('scheduled handler', () => {
     expect(prices.n, 'the cron ran but wrote no prices').toBeGreaterThan(0);
   });
 
+  it('prices unpriced usage rows AFTER the sync, using the rates it just wrote', async () => {
+    // The ordering is the assertion. The pricing pass is chained onto runModelPriceSync rather
+    // than being a third waitUntil, because a model whose rate upstream published TODAY would
+    // otherwise be examined before that rate landed, be recorded as unpriceable, and stay that way
+    // for another full day. The seeded row's model exists ONLY in the catalog this cron fetches --
+    // `model_prices` is emptied in beforeEach -- so a concurrent pass cannot price it.
+    await testEnv.DB.prepare('UPDATE usage SET input_tokens = 1000000 WHERE session_id = ?1').bind('cron-sess').run();
+
+    await fire('30 4 * * *');
+
+    const row = await testEnv.DB.prepare('SELECT usd, price_epoch FROM usage WHERE session_id = ?1')
+      .bind('cron-sess')
+      .first<{ usd: number | null; price_epoch: string | null }>();
+    // 1M input tokens at the catalog's 5e-6/token = $5/M.
+    expect(row?.usd, 'the daily cron never reached the pricing pass, or ran it before the sync').toBeCloseTo(5, 6);
+    expect(row?.price_epoch, 'priced without recording which snapshot was used').not.toBeNull();
+  });
+
+  it('still prices when the upstream sync fails', async () => {
+    // runModelPriceSync RETHROWS after writing its audit row, so chaining the pass with a bare
+    // `.then` skips it entirely on any upstream hiccup — and rejects the waitUntil on the way out.
+    // A stale catalog is not a reason to stop pricing: the rows that need it mostly need rates
+    // that already exist, and a backfill in progress must not be held hostage to a 500 from
+    // GitHub raw. Failing the fetch is the whole fixture.
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => new Response('upstream is down', { status: 500 })),
+    );
+    await testEnv.DB.prepare(
+      `INSERT INTO model_prices (model, effective_from, litellm_key, provider, input_cost, output_cost,
+                                 cache_read_cost, cache_write_5m_cost, cache_write_1h_cost,
+                                 cache_accounting, source, fetched_at)
+       VALUES ('claude-opus-5', '2026-01-01', 'claude-opus-5', 'anthropic', 1, 1, 0.1, 2, 4,
+               'disjoint', 'test', '2026-06-01T00:00:00Z')`,
+    ).run();
+    await testEnv.DB.prepare('UPDATE usage SET input_tokens = 1000000 WHERE session_id = ?1').bind('cron-sess').run();
+
+    await fire('30 4 * * *');
+
+    // Assert the FAILURE actually happened before asserting what survived it. The pricing
+    // assertion alone would also pass if the handler stopped calling runModelPriceSync alogether,
+    // at which point this test would quietly stop covering the path it is named for.
+    expect(fetch, 'the sync never ran, so nothing failed and this proves nothing').toHaveBeenCalled();
+    const sync = await testEnv.DB.prepare('SELECT ok, error FROM model_prices_sync ORDER BY id DESC LIMIT 1')
+      .first<{ ok: number; error: string | null }>();
+    expect(sync?.ok, 'the sync succeeded, so the pass was never chained off a rejection').toBe(0);
+    expect(sync?.error, 'a failed sync recorded no reason').toBeTruthy();
+
+    const row = await testEnv.DB.prepare('SELECT usd FROM usage WHERE session_id = ?1')
+      .bind('cron-sess')
+      .first<{ usd: number | null }>();
+    expect(row?.usd, 'a failed price sync took the pricing pass down with it').toBeCloseTo(1, 6);
+  });
+
   it('does not refresh prices on the 15-minute watchdog tick', async () => {
     // 96 needless upstream fetches a day, and 96 audit rows, if these ever get crossed.
     await fire('*/15 * * * *');

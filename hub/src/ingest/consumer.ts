@@ -3,6 +3,7 @@ import type { NormalizedSession } from './normalize';
 import { SINGLE_SESSION_HARNESSES, parseObject } from './parse';
 import { parseExportArchive } from './parsers/export-inbox';
 import { isFreshReservation, markPendingAndEnqueue, reservationCutoffIso } from '../queue';
+import { priceUsage, PRICING_WRITE_BATCH } from '../pricing-pass';
 import { deriveProjectName } from '../project-name';
 import { computeFirstInteractionTitle, type TitleBlock } from '../session-title';
 import { turnFallbackKeyOf, turnKeyOf } from '../turn-key';
@@ -225,7 +226,48 @@ export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: 
       msg.retry();
     }
   }
+
+  // Price whatever this invocation just wrote, once for the WHOLE batch rather than once per
+  // session. Per session it cost 2 subrequests each, which is charged against the same
+  // ~1000-per-invocation cap the loop above rations — and the export-slicing tests caught exactly
+  // that: sessions that used to fit began deferring. The pass is unscoped for the same reason,
+  // since one query covering every session the batch wrote beats one query per session.
+  //
+  // Skipped entirely, not deferred, when the budget is already spent: the nightly pass exists and
+  // will pick these rows up. Trading a deferred (re-delivered, re-parsed) message for a dollar
+  // figure arriving a few hours sooner is a bad trade.
+  if (invocationSpent + PRICING_SUBREQUESTS < INVOCATION_SUBREQUEST_BUDGET) {
+    // Failure must not fail the batch: every message is already acked, the sessions are indexed
+    // and searchable, and an unpriced row is a NULL the nightly pass is designed to find. A throw
+    // here would re-deliver work that already succeeded.
+    await priceUsage(env.DB, { maxRows: PRICING_MAX_ROWS }).catch((e: unknown) =>
+      console.log(
+        JSON.stringify({
+          event: 'hub.pricing.batch_pass_failed',
+          error: e instanceof Error ? e.message : String(e),
+        }),
+      ),
+    );
+  }
 }
+
+/** Rows the end-of-batch pass may price, chosen so its cost matches PRICING_SUBREQUESTS exactly.
+ *
+ * Left unbounded it defaults to PRICING_READ_BATCH (500), which is one read plus FIVE write
+ * batches — so the reservation understated the real cost by 5 and a batch finishing just under
+ * the cap could overshoot it. That is precisely the breach the reserve-on-attempt machinery above
+ * exists to prevent, and it does not fail loudly: you get a Worker killed mid-invocation.
+ *
+ * PRICING_WRITE_BATCH rows is exactly one write batch. Anything the invocation wrote beyond that
+ * stays NULL until the nightly pass, which is the correct trade — this hook is a latency
+ * optimisation for the common case (a handful of sessions, tens of turns), not the mechanism that
+ * guarantees coverage. */
+const PRICING_MAX_ROWS = PRICING_WRITE_BATCH;
+
+/** What the end-of-batch pricing pass costs, and what the guard above reserves: the `loadPrices`
+ * query (1), one read (1), one write batch (1). Counting `loadPrices` matters — it is a real
+ * round trip the first draft of this constant forgot. */
+const PRICING_SUBREQUESTS = 3;
 
 /** Defer a message to a later invocation without burning its delivery-attempt budget: ack + re-enqueue a
  * fresh copy (a fresh message resets max_retries). Fall back to retry() only if the re-send itself throws,

@@ -1,5 +1,6 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
+import { priceUsage } from '../pricing-pass';
 import { classifyModel, costOfUsage, loadPrices } from '../pricing';
 import { reservationCutoffIso } from '../queue';
 import {
@@ -922,4 +923,38 @@ export function hex(buf: ArrayBuffer): string {
  */
 export function objectSha256(obj: R2Object | null | undefined): string | undefined {
   return obj?.checksums?.sha256 ? hex(obj.checksums.sha256) : undefined;
+}
+
+/** Rows priced per invocation of the backfill endpoint.
+ *
+ * Sized like `reindex`'s MAX_PAGES_PER_INVOCATION and for the same reason: the resumable contract
+ * is the primary mechanism, not the batch size. At PRICING_READ_BATCH=500 / PRICING_WRITE_BATCH=100
+ * this is 20 reads plus 100 write batches, ~120 of the invocation's ~1000 subrequest budget.
+ * Raising it to "finish in one call" is how the budget gets breached; the caller loops instead. */
+export let PRICE_ROWS_PER_INVOCATION = 10_000;
+
+/** Test-only override, matching the pattern the ingest budget constants use. The 202 arm is only
+ * reachable when the pass stops on its budget, and seeding 10,000 usage rows to observe that
+ * would be a minute of fixture setup for a branch a two-row budget exercises exactly as well. */
+export function setPriceRowsPerInvocation(n: number): void {
+  PRICE_ROWS_PER_INVOCATION = n;
+}
+
+/** POST /api/v1/admin/price-usage — fill `usage.usd` for a BOUNDED slice of unpriced rows.
+ *
+ * Same resumable shape as `reindex`, and for the same reason: 776k rows cannot be priced inside
+ * one invocation's subrequest budget. Responds **202 Accepted** with `{ more: true }` while rows
+ * remain and **200 OK** only when the pass ran out of work, so a status-only caller cannot mistake
+ * a partial run for a finished backfill. The caller re-invokes until it sees 200.
+ *
+ * No cursor is persisted, unlike reindex — the work list IS the state. `priced_at` advances on
+ * every attempt, so re-entering simply picks up whatever is still unpriced; a crash mid-backfill
+ * costs nothing and needs no resume token.
+ */
+export async function priceUsageSlice(request: Request, env: Env, identity: Identity): Promise<Response> {
+  if (identity.kind !== 'machine' || !identity.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+
+  const res = await priceUsage(env.DB, { maxRows: PRICE_ROWS_PER_INVOCATION });
+  console.log(JSON.stringify({ event: 'hub.pricing.backfill', ...res }));
+  return Response.json(res, { status: res.more ? 202 : 200 });
 }

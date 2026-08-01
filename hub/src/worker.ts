@@ -1,4 +1,5 @@
 import { runModelPriceSync } from './cron/model-prices';
+import { runDailyPricing } from './cron/pricing';
 import { runDailyPrune, runPrune } from './cron/prune';
 import { runWatchdog } from './cron/watchdog';
 import { consumeParseBatch } from './ingest/consumer';
@@ -30,8 +31,28 @@ export default {
 
     ctx.waitUntil(runPrune(env));
     ctx.waitUntil(runDailyPrune(env));
-    // Refresh model pricing from LiteLLM (ccusage's source). Snapshot-on-change, so a
-    // no-op day writes one audit row and nothing else.
-    ctx.waitUntil(runModelPriceSync(env));
+    // Refresh model pricing from LiteLLM (ccusage's source), THEN fill in `usage.usd` for rows
+    // that still have none. Chained rather than a third waitUntil: the pass reads the catalog the
+    // sync just wrote, so running them concurrently would price today's rows against yesterday's
+    // rates and, worse, mark a model that upstream published TODAY as unpriceable for another
+    // full day. `.then` and not `await` — the two prunes above should not queue behind this.
+    //
+    // `.catch` before the chain, not after: runModelPriceSync RETHROWS after writing its audit
+    // row, so a bare `.then` would skip the pricing pass entirely on any upstream hiccup AND
+    // reject the waitUntil. A stale catalog is not a reason to stop pricing — the rows that need
+    // it mostly need rates that already exist, and a backfill in progress must not be held
+    // hostage to a 500 from GitHub raw. The sync's own audit row is what records the failure.
+    ctx.waitUntil(
+      runModelPriceSync(env)
+        .catch((e: unknown) =>
+          console.log(
+            JSON.stringify({
+              event: 'hub.model_prices.sync_failed_before_pricing',
+              error: e instanceof Error ? e.message : String(e),
+            }),
+          ),
+        )
+        .then(() => runDailyPricing(env)),
+    );
   },
 } satisfies ExportedHandler<Env, ParseMessage>;

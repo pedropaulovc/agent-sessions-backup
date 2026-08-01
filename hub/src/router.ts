@@ -7,7 +7,7 @@ import {
 } from './auth/cloudflare-oauth';
 import { checkFiles, putFile } from './api/upload';
 import { abortMultipart, completeMultipart, createMultipart, uploadPart } from './api/multipart';
-import { adminMachines, heartbeat, listMachines, reindex, status, usage } from './api/ops';
+import { adminMachines, heartbeat, listMachines, priceUsageSlice, reindex, status, usage } from './api/ops';
 import { bootstrap } from './api/bootstrap';
 import { probeClientCert, renewCert } from './api/certs';
 import { search } from './api/search';
@@ -106,6 +106,10 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
   if (path === '/api/v1/admin/reindex' && method === 'POST') {
     if (identity.certSlot !== 'current') return Response.json({ error: 'admin_requires_current_cert' }, { status: 403 });
     return reindex(request, env, identity);
+  }
+  if (path === '/api/v1/admin/price-usage' && method === 'POST') {
+    if (identity.certSlot !== 'current') return Response.json({ error: 'admin_requires_current_cert' }, { status: 403 });
+    return priceUsageSlice(request, env, identity);
   }
   if (path === '/api/v1/admin/machines' && method === 'POST') {
     if (identity.certSlot !== 'current') return Response.json({ error: 'admin_requires_current_cert' }, { status: 403 });
