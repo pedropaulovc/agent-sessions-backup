@@ -50,6 +50,14 @@ export interface Cost {
    * that happened or it will label standard-priced dollars as batch-priced. `none` means
    * nothing was priced. */
   rateSet: 'standard' | 'batch' | 'mixed' | 'none';
+  /** The rates this row would actually be charged at, per class, for the classes it HAS.
+   *
+   * Exists so callers can ask "are these two snapshots interchangeable for this row?" without
+   * re-deriving which columns matter — see `priceForGroup` in api/ops.ts. Comparing the scalar
+   * `usd` instead is not equivalent: changes in separate classes can cancel out (old input/output
+   * rates of 1/3 against new rates of 3/1 total the same when summed input equals summed output),
+   * so an aggregate match can hide two genuinely different rate schedules. */
+  rateSignature: string;
 }
 
 const MILLION = 1_000_000;
@@ -133,14 +141,20 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   // know the accounting convention (a subset model's cached prefix would be wrongly included),
   // while a `<synthetic>` row never reached an API at all. Reporting a number there would let a
   // caller sum billable input across rows whose dollars are missing.
-  const unpriced: Cost = { usd: 0, unpriced: true, billableInputTokens: 0, rateSet: 'none' };
+  const unpriced: Cost = { usd: 0, unpriced: true, billableInputTokens: 0, rateSet: 'none', rateSignature: 'unpriced' };
   // A row with no matching price but ZERO tokens in every billable class contributes no unknown
   // cost, so it is not "unpriced" in the sense the caller cares about. Counting it inflated
   // unpriced_calls, put its model in unpriced_models, and told clients the total was a floor —
   // all on the strength of a call that could not have cost anything whatever the rate turned out
   // to be. Costed at 0 and priced, so the coverage signal keeps meaning "dollars are missing".
-  const anyBillableTokens = billableInput > 0 || output > 0 || cacheRead > 0 || cw5 > 0 || cw1h > 0;
-  if (!anyBillableTokens) return { usd: 0, unpriced: false, billableInputTokens: 0, rateSet: 'none' };
+  //
+  // BILLABLE cache reads, not raw ones. Under `subset` a row with input=0 and cache_read=5000 has
+  // its cache term clamped to zero, so it cannot cost anything whatever the rates are — yet the
+  // raw counter made it demand a cache rate (and go unpriced without one) and count as a standard
+  // class, which flipped a fully batch-priced response's cost_basis to _partial on a row worth $0.
+  const anyBillableTokens = billableInput > 0 || output > 0 || billableCacheRead > 0 || cw5 > 0 || cw1h > 0;
+  if (!anyBillableTokens)
+    return { usd: 0, unpriced: false, billableInputTokens: 0, rateSet: 'none', rateSignature: 'zero' };
   if (!price) return unpriced;
 
   // Batch rates are chosen PER CLASS, matching how rates are required per class below. An
@@ -173,12 +187,18 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   // them on top of input, subset bills them inside it, and picking either way is a silent ~2x
   // error on every cached turn in one direction or the other. Rows with no cache reads are
   // unaffected, so an unrecognised provider only costs pricing where it actually matters.
-  if (cacheRead > 0 && price.cache_accounting !== 'disjoint' && price.cache_accounting !== 'subset') {
+  //
+  // These use the BILLABLE cache count for the same reason `anyBillableTokens` does: a clamped-to-
+  // zero cache term costs nothing at any rate, so demanding a rate for it only loses real pricing.
+  // (The unknown-accounting arm is unaffected in practice -- the clamp applies only under
+  // `subset`, so under an unknown convention billable and raw are the same number -- but it reads
+  // off the same value so the two cannot drift apart.)
+  if (billableCacheRead > 0 && price.cache_accounting !== 'disjoint' && price.cache_accounting !== 'subset') {
     return unpriced;
   }
   if (billableInput > 0 && inRate == null) return unpriced;
   if (output > 0 && outRate == null) return unpriced;
-  if (cacheRead > 0 && readRate == null) return unpriced;
+  if (billableCacheRead > 0 && readRate == null) return unpriced;
   if (cw5 > 0 && price.cache_write_5m_cost == null) return unpriced;
   if (cw1h > 0 && price.cache_write_1h_cost == null) return unpriced;
 
@@ -198,7 +218,7 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   // at all, so cache-read and cache-write dollars always come off the standard rates -- a cached
   // call with batch-priced input and output is therefore genuinely `mixed`, and ignoring its cache
   // classes here would label those standard dollars as batch-priced.
-  const cacheClassesPresent = cacheRead > 0 || cw5 > 0 || cw1h > 0;
+  const cacheClassesPresent = billableCacheRead > 0 || cw5 > 0 || cw1h > 0;
   const batchClasses = (billableInput > 0 && useBatchIn ? 1 : 0) + (output > 0 && useBatchOut ? 1 : 0);
   const standardClasses =
     (billableInput > 0 && !useBatchIn ? 1 : 0) + (output > 0 && !useBatchOut ? 1 : 0) + (cacheClassesPresent ? 1 : 0);
@@ -214,7 +234,23 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
           ? 'standard'
           : 'none';
 
-  return { usd, unpriced: false, billableInputTokens: billableInput, rateSet };
+  // Only the classes this row HAS, so an unused rate moving cannot make two snapshots differ.
+  // `cache_accounting` is included only when there ARE raw cache reads: it decides whether they
+  // are billed on top of input or subtracted from it, which changes the token counts and therefore
+  // the dollars even when every rate is identical. On a cache-free row it changes nothing.
+  const rateSignature = [
+    billableInput > 0 ? `i:${inRate}` : '',
+    output > 0 ? `o:${outRate}` : '',
+    billableCacheRead > 0 ? `r:${readRate}` : '',
+    cw5 > 0 ? `w5:${price.cache_write_5m_cost}` : '',
+    cw1h > 0 ? `w1:${price.cache_write_1h_cost}` : '',
+    cacheRead > 0 ? `a:${price.cache_accounting}` : '',
+    `s:${rateSet}`,
+  ]
+    .filter(Boolean)
+    .join('|');
+
+  return { usd, unpriced: false, billableInputTokens: billableInput, rateSet, rateSignature };
 }
 
 /** Pick the rate in effect at `ts` from a model's price history (rows newest-first). */

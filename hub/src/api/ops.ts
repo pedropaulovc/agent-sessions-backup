@@ -747,13 +747,19 @@ function costBasis(batch: boolean, rateSetsUsed: Set<'standard' | 'batch' | 'mix
  * becoming `openai`, say), and that alone made every timestamp-less call for the model unpriced
  * even though all its snapshots compute identical dollars.
  *
- * The comparison runs `costOfUsage` itself rather than diffing a hand-maintained list of
- * "cost-relevant columns". Two attempts at that list were both wrong in the same direction —
- * comparing rates the request does not select. The batch tier is the clearest case: `batch=1`
- * takes `*_cost_batch` and FALLS BACK to standard when a model publishes none, so which columns
- * matter depends on the request flag AND on whether the batch rate is null, and a standard-priced
- * request was going unpriced because only `input_cost_batch` had moved historically. Asking the
- * pricing function what each snapshot actually costs cannot drift from what it actually charges.
+ * The comparison asks `costOfUsage` what each snapshot would charge rather than diffing a
+ * hand-maintained list of "cost-relevant columns". Two attempts at that list were both wrong in
+ * the same direction — comparing rates the request does not select. The batch tier is the clearest
+ * case: `batch=1` takes `*_cost_batch` and FALLS BACK to standard when a model publishes none, so
+ * which columns matter depends on the request flag AND on whether the batch rate is null, and a
+ * standard-priced request was going unpriced because only `input_cost_batch` had moved.
+ *
+ * It compares `rateSignature` — the selected PER-CLASS rates — and not the scalar `usd`. Comparing
+ * the aggregate is not equivalent on a group: changes in separate classes cancel out. Old
+ * input/output rates of 1/3 against new rates of 3/1 total the same dollars whenever the group's
+ * summed input equals its summed output, so two genuinely different rate schedules would look
+ * interchangeable, and the input-heavy and output-heavy calls folded into that group may well
+ * belong to different epochs with substantially different true totals.
  *
  * When snapshots genuinely differ, any choice is a guess, so it stays unpriced rather than being
  * charged at some arbitrary rate and reported as a real figure. */
@@ -762,15 +768,8 @@ function priceForGroup(history: ModelPrice[], epoch: string, row: UsageTokens, b
   if (!history.length) return null;
   const first = history[0]!;
   if (history.length === 1) return first;
-  // `rateSet` is compared alongside the dollars: two snapshots can cost the same while one paid a
-  // batch rate and the other fell back to standard, and that difference is what `cost_basis`
-  // reports to the caller.
-  const outcome = (p: ModelPrice) => {
-    const c = costOfUsage(row, p, { batch });
-    return `${c.usd}|${c.unpriced}|${c.rateSet}`;
-  };
-  const baseline = outcome(first);
-  return history.every((p) => outcome(p) === baseline) ? first : null;
+  const baseline = costOfUsage(row, first, { batch }).rateSignature;
+  return history.every((p) => costOfUsage(row, p, { batch }).rateSignature === baseline) ? first : null;
 }
 
 /** Stands in for a NULL `usage.model` in `unpriced_models`. Deliberately bracketed so it cannot
@@ -828,8 +827,20 @@ export function priceEpochExpr(prices: Map<string, ModelPrice[]>): string {
   // `IS NOT 1`, not `NOT (...)`: date() returns NULL for an unparseable value, and `NOT (NULL)`
   // is NULL, so a plain negation would fail to fire this arm and let the row fall through to the
   // date arms — the exact NULL-semantics trap that already produced one bug in this query.
+  //
+  // The hour bound is a third distinct hole. SQLite accepts `2026-01-01T24:00:00Z` -- verified
+  // against D1: date() returns '2026-01-01' and it does NOT roll the instant forward -- so the
+  // round-trip above agrees and the row is labelled canonical. But ISO 8601 24:00 IS midnight
+  // starting January 2, so a boundary on the 2nd is skipped and the row silently takes the 1st's
+  // rate. 25:00 and 00:60 are rejected by date() already; 24:00 is the only value that parses,
+  // dates to the wrong day, and reports itself valid.
+  //
+  // Checked with substr rather than by tightening the GLOB: the GLOB pins positions 1-11
+  // (`YYYY-MM-DDT`), so 12-13 is always the hour, and the time tail must stay `*` because every
+  // real row carries milliseconds (`2025-12-21T21:23:08.952Z` -- all 775k production rows).
   const canonical =
-    `u.ts GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z' AND date(u.ts) = substr(u.ts, 1, 10)`;
+    `u.ts GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z' AND date(u.ts) = substr(u.ts, 1, 10)` +
+    ` AND substr(u.ts, 12, 2) < '24'`;
   const unknownArm = `WHEN u.ts IS NULL OR (${canonical}) IS NOT 1 THEN '${EPOCH_UNKNOWN_TIME}'`;
   if (!boundaries.length) return `CASE ${unknownArm} ELSE '${EPOCH_BEFORE_ANY_PRICE}' END`;
   const arms = boundaries.map((e) => `WHEN u.ts >= '${e}' THEN '${e}'`).join(' ');

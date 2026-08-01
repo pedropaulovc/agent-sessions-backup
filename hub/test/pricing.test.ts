@@ -377,6 +377,22 @@ describe('subset cache-read clamp', () => {
     expect(c.usd).toBeCloseTo((500 * 5 + 9000 * 0.5) / 1_000_000, 12);
   });
 
+  it('treats a fully clamped cache read as costing nothing, not as needing a rate', () => {
+    // input=0 with cache reads under subset accounting: the cache term clamps to zero, so the row
+    // cannot cost anything at any rate. The presence checks were reading the RAW counter, which
+    // made it demand a cache rate it did not need...
+    const noReadRate: ModelPrice = { ...LUNA, cache_read_cost: null, input_cost: null };
+    const c = costOfUsage({ model: 'gpt-5.6-luna', input_tokens: 0, cache_read_tokens: 5000 }, noReadRate);
+    expect(c.unpriced, 'a row that cannot cost anything was reported as unpriced').toBe(false);
+    expect(c.usd).toBe(0);
+    // ...and count as a STANDARD class, which flips a fully batch-priced response's cost_basis to
+    // _partial on the strength of a row worth $0.
+    const batched = costOfUsage({ model: 'gpt-5.6-luna', input_tokens: 0, cache_read_tokens: 5000 }, LUNA, {
+      batch: true,
+    });
+    expect(batched.rateSet, 'a $0 row claimed a rate set').toBe('none');
+  });
+
   it('uses the per-row sum when the caller pre-aggregated', () => {
     // MIN is nonlinear, so a group's totals cannot reproduce it — the SQL carries the per-row sum.
     const c = costOfUsage(

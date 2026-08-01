@@ -11,8 +11,12 @@ const testEnv = env as unknown as Env;
 
 /** The canonical-UTC shape the epoch expression requires; kept here so the SQL-string assertions
  * below read as one thing rather than a wall of bracket classes. */
+// The time tail stays `*`: every real row carries milliseconds, so pinning it to `SSZ` would
+// route all of production to the unknown epoch. The hour is bounded separately instead --
+// SQLite accepts `T24:00:00Z`, dates it to the PREVIOUS day, and reports it as valid.
 const GLOB =
-  "u.ts GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z' AND date(u.ts) = substr(u.ts, 1, 10)";
+  "u.ts GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T*Z' AND date(u.ts) = substr(u.ts, 1, 10)" +
+  " AND substr(u.ts, 12, 2) < '24'";
 const MACHINE = 'pricebox';
 
 /** Two snapshots of one model, at a 10x rate cut. Any test below that mixes usage from both
@@ -409,6 +413,40 @@ describe('priceEpochExpr', () => {
     expect(Number(row.unpriced_calls)).toBeGreaterThan(0);
   });
 
+  it('treats a 24:00 hour as an unknown epoch rather than dating it to the previous day', async () => {
+    // ISO 8601 `T24:00:00Z` is midnight STARTING the next day, but these comparisons are
+    // lexicographic, so it sorts before that day's boundary and takes the previous rate.
+    //
+    // SQLite's own normalisation catches this only sometimes, which is what makes it dangerous.
+    // Verified against production D1: it rolls the DAY field and normalises only on overflow, so
+    // `date('2026-06-30T24:00:00Z')` is '2026-07-01' (caught by the round-trip check) while
+    // `date('2026-03-15T24:00:00Z')` is '2026-03-15' -- unchanged, so the round-trip agrees and
+    // the row is labelled canonical. The date below is deliberately NOT a month end, because a
+    // month-end one passes this test with or without the hour bound.
+    for (const [from, cost] of [
+      ['2026-03-10', 100],
+      ['2026-03-16', 10],
+    ] as const) {
+      await testEnv.DB.prepare(
+        `INSERT INTO model_prices
+           (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
+            cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
+            cache_accounting, source, fetched_at)
+         VALUES ('h24-model', ?1, 'h24-model', 'anthropic', ?2, ?2, 0, 0, 0, NULL, NULL,
+                 'disjoint', 'test', '2026-07-31T00:00:00Z')`,
+      )
+        .bind(from, cost)
+        .run();
+    }
+    await seedSession('h24-sess', 'h24box', 'claude-code');
+    // 24:00 on the 15th IS 00:00 on the 16th, which is the 2026-03-16 snapshot's own epoch.
+    await seedUsage('h24-sess', '2026-03-15T24:00:00Z', 'h24-model', { input: 1_000_000 });
+
+    const row = (await fetchUsage('group_by=machine&machine=h24box')).rows[0]!;
+    expect(Number(row.cost_usd), 'a 24:00 timestamp was priced at the previous day\'s rate').not.toBeCloseTo(100, 6);
+    expect(Number(row.unpriced_calls)).toBeGreaterThan(0);
+  });
+
   it('treats a malformed timestamp as an unknown epoch', async () => {
     await seedSession('bad-ts-sess', 'badtsbox', 'claude-code');
     await seedUsage('bad-ts-sess', 'not-a-timestamp', 'claude-opus-5', { input: 1_000_000 });
@@ -564,6 +602,41 @@ describe('priceEpochExpr', () => {
     const row = (await fetchUsage('group_by=machine&machine=batchreqbox&batch=1')).rows[0]!;
     expect(Number(row.unpriced_calls), 'a standard-only rate change unpriced a batch request').toBe(0);
     expect(Number(row.cost_usd)).toBeCloseTo(5, 6);
+  });
+
+  it('refuses a timestamp-less row whose rate changes CANCEL in the aggregate', async () => {
+    // Comparing the scalar cost of the aggregate is not the same as comparing the rate schedule.
+    // Old input/output of 1/3 against new 3/1 total identical dollars whenever the group's summed
+    // input equals its summed output -- yet the input-heavy and output-heavy calls folded into
+    // that group may belong to different epochs with substantially different true totals.
+    for (const [from, inCost, outCost] of [
+      ['2026-01-01', 1, 3],
+      ['2026-05-01', 3, 1],
+    ] as const) {
+      await testEnv.DB.prepare(
+        `INSERT INTO model_prices
+           (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
+            cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
+            cache_accounting, source, fetched_at)
+         VALUES ('cancel-model', ?1, 'cancel-model', 'openai', ?2, ?3, 0, 0, 0, NULL, NULL,
+                 'subset', 'test', '2026-07-31T00:00:00Z')`,
+      )
+        .bind(from, inCost, outCost)
+        .run();
+    }
+    await seedSession('cancel-sess', 'cancelbox', 'claude-code');
+    // Summed input == summed output, which is exactly when the two schedules tie at 4/M total.
+    await testEnv.DB.prepare(
+      `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens,
+                          cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens)
+       VALUES ('cancel-sess', 930, NULL, 'cancel-model', 1000000, 1000000, 0, 0, 0)`,
+    ).run();
+
+    const row = (await fetchUsage('group_by=machine&machine=cancelbox')).rows[0]!;
+    expect(
+      Number(row.unpriced_calls),
+      'two different rate schedules were treated as equivalent because their totals tied',
+    ).toBeGreaterThan(0);
   });
 
   it('refuses a timestamp-less BATCH request when the batch tier appears mid-history', async () => {
