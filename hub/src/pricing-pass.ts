@@ -18,12 +18,17 @@
  * writes the answer back. Nothing new is implemented; it is a join of two existing pieces.
  *
  * FORWARD PROGRESS. A row can be permanently unpriceable — a model upstream publishes no rate
- * for — and those keep `usd IS NULL` forever. Selecting purely by `usd IS NULL` would therefore
- * hand every run the same first N of them and the backfill would never advance past the first
- * unpriceable cluster. Every attempt stamps `priced_at`, and a run only considers rows not
- * attempted since it started, so each pass strictly advances and each later run retries the
- * failures exactly once — which matters, because "unpriceable" is a statement about today's
- * catalog and a rate landing tomorrow should fix them.
+ * for — and those keep `usd IS NULL` however many times they are examined. Selecting purely on
+ * `usd IS NULL` would therefore make the read query return the same rows on every iteration of
+ * the loop below, and a backfill with a large budget would spin on the first unpriceable batch
+ * until it exhausted that budget instead of advancing. Every attempt stamps `priced_at`, and a
+ * run only considers rows not attempted since it started, so each read strictly advances. A
+ * LATER run does reconsider them — `priced_at < this run's start` — which is the point:
+ * "unpriceable" is a claim about today's catalog, and a rate landing tomorrow should fix them.
+ *
+ * The ORDER BY is a separate and weaker thing: priority, not correctness. NULL sorts first under
+ * ASC, so rows nobody has tried yet are served ahead of retries of known failures. Progress does
+ * not depend on it — the WHERE clause above is what guarantees that.
  */
 import { classifyModel, costOfUsage, loadPrices, type ModelPrice } from './pricing';
 import {
@@ -67,16 +72,19 @@ interface UnpricedRow extends UsageAggRow {
  */
 export async function priceUsage(
   db: D1Database,
-  opts: { sessionId?: string; maxRows?: number; now?: Date } = {},
+  opts: { sessionId?: string; maxRows?: number; readBatch?: number; now?: Date } = {},
 ): Promise<PricingPassResult> {
   const startedAt = (opts.now ?? new Date()).toISOString();
   const maxRows = opts.maxRows ?? PRICING_READ_BATCH;
+  // Injectable so the loop's re-read behaviour is testable at all: with the production batch
+  // size, reaching a second iteration takes 500 seeded rows.
+  const readBatch = opts.readBatch ?? PRICING_READ_BATCH;
   const prices = await loadPrices(db);
 
   const result: PricingPassResult = { examined: 0, priced: 0, unpriceable: 0, more: false };
 
   while (result.examined < maxRows) {
-    const take = Math.min(PRICING_READ_BATCH, maxRows - result.examined);
+    const take = Math.min(readBatch, maxRows - result.examined);
     const rows = await selectUnpriced(db, prices, startedAt, opts.sessionId, take);
     if (!rows.length) return result;
 
