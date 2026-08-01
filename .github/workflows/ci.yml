@@ -183,10 +183,21 @@ jobs:
             # repository allowlist is unset; both are permanent misconfigurations, while a 404 or
             # 503 from Cloudflare's edge means the preview simply is not up yet. Every response
             # from our handler carries a JSON `error` key, and the edge's never does.
-            # `retryable` marks a handler error that says nothing about this request — GitHub's
-            # JWKS endpoint being unreachable — so it must NOT be fatal even though the handler
-            # answered. Everything else the handler returns is permanent.
-            if [ -n "$body" ] && printf '%s' "$body" | jq -e 'has("error") and (.retryable // false | not)' >/dev/null 2>&1; then
+            # Fatal only when THIS version of the Worker answered and said no permanently.
+            #
+            # Two errors must stay retryable even though a handler produced them:
+            #   retryable      - GitHub's JWKS endpoint unreachable; says nothing about the request.
+            #   unauthorized   - on an existing branch alias CI can race Workers Builds and reach
+            #                    the PREVIOUSLY deployed version, which has no migration route and
+            #                    so 401s from the parent router. That is the deployment window this
+            #                    retry loop exists for; treating it as a permanent rejection turned
+            #                    the race into a red check. Same shape for any migrate-route change
+            #                    that lands before its own deploy.
+            #
+            # This does mean a genuinely broken OIDC setup retries five times before failing, which
+            # is the right trade: it still fails, just later.
+            if [ -n "$body" ] && printf '%s' "$body" \
+              | jq -e 'has("error") and (.retryable // false | not) and (.error != "unauthorized")' >/dev/null 2>&1; then
               echo "::error::preview migration rejected at $TARGET with HTTP $code: $body"
               exit 1
             fi

@@ -86,6 +86,7 @@ const QUOTE_CLOSERS: Record<string, string> = { "'": "'", '"': '"', '`': '`', '[
  * corruption the splitter was producing. */
 function scanSql(sql: string, emit: (ch: string, quoted: boolean) => void): { unterminated: boolean } {
   let open: string | null = null;
+  let unterminatedComment = false;
   for (let i = 0; i < sql.length; i++) {
     const c = sql[i]!;
     if (open) {
@@ -116,8 +117,13 @@ function scanSql(sql: string, emit: (ch: string, quoted: boolean) => void): { un
     if (c === '/' && sql[i + 1] === '*') {
       const close = sql.indexOf('*/', i + 2);
       if (close === -1) {
-        emit(c, false);
-        continue;
+        // SQLite accepts an unterminated block comment through EOF, so everything after this
+        // point is comment, not SQL. Emitting the slash and scanning on treated the comment body
+        // as statements -- a semicolon inside it became a boundary and produced invalid fragments
+        // while assertSplittable saw nothing wrong. Consume to EOF and report it, so the guard
+        // refuses the migration rather than the splitter silently mangling it.
+        unterminatedComment = true;
+        break;
       }
       i = close + 1;
       emit(' ', false);
@@ -125,9 +131,9 @@ function scanSql(sql: string, emit: (ch: string, quoted: boolean) => void): { un
     }
     emit(c, false);
   }
-  // A quote still open at EOF means the scanner's idea of where statements end is not the
-  // database's, so nothing derived from this scan can be trusted.
-  return { unterminated: open !== null };
+  // A quote or block comment still open at EOF means the scanner's idea of where statements end
+  // is not the database's, so nothing derived from this scan can be trusted.
+  return { unterminated: open !== null || unterminatedComment };
 }
 
 /** Split a migration file into statements on `;`, ignoring semicolons inside quoted literals,
@@ -160,7 +166,9 @@ export function assertSplittable(name: string, sql: string): string | null {
   const { unterminated } = scanSql(sql, (ch, quoted) => {
     unquoted += quoted ? ' ' : ch;
   });
-  if (unterminated) return `${name}: unterminated quote or identifier — refusing to guess where statements end`;
+  if (unterminated) {
+    return `${name}: unterminated quote, identifier or block comment — refusing to guess where statements end`;
+  }
   if (/\bBEGIN\b/i.test(unquoted) || /\bCREATE\s+TRIGGER\b/i.test(unquoted)) {
     return `${name}: contains a trigger or BEGIN block, which this endpoint's statement splitter cannot handle safely`;
   }

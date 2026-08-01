@@ -322,6 +322,16 @@ describe('statement splitting', () => {
     expect(assertSplittable('m', "SELECT 'a' BEGIN;")).toContain('trigger');
   });
 
+  it('rejects an unterminated block comment instead of scanning its body as SQL', () => {
+    // SQLite accepts an unterminated block comment through EOF, so everything after `/*` is
+    // comment. Emitting the slash and scanning on made a semicolon inside the comment a statement
+    // boundary — invalid fragments from the splitter, with the guard seeing nothing wrong.
+    const sql = 'CREATE TABLE a(x); /* rationale; details';
+    expect(assertSplittable('m', sql)).toContain('unterminated');
+    // And the guard must be what stops it — the splitter alone would emit the comment tail.
+    expect(splitStatements(sql).join(' ')).not.toContain('details');
+  });
+
   it('flags an unterminated identifier, not just an unterminated literal', () => {
     expect(assertSplittable('m', 'CREATE TABLE "audit (id INT);')).toContain('unterminated');
   });
