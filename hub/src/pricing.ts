@@ -166,8 +166,14 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   // is fully batch-priced on its input batch rate alone; one that pays a batch input rate and a
   // standard output rate is genuinely `mixed`, and calling it either pure label would misstate
   // the dollars in exactly the direction the caller is trying to detect.
+  // Cache classes count as STANDARD whenever present. LiteLLM publishes no batch cache columns
+  // at all, so cache-read and cache-write dollars always come off the standard rates -- a cached
+  // call with batch-priced input and output is therefore genuinely `mixed`, and ignoring its cache
+  // classes here would label those standard dollars as batch-priced.
+  const cacheClassesPresent = cacheRead > 0 || cw5 > 0 || cw1h > 0;
   const batchClasses = (billableInput > 0 && useBatchIn ? 1 : 0) + (output > 0 && useBatchOut ? 1 : 0);
-  const standardClasses = (billableInput > 0 && !useBatchIn ? 1 : 0) + (output > 0 && !useBatchOut ? 1 : 0);
+  const standardClasses =
+    (billableInput > 0 && !useBatchIn ? 1 : 0) + (output > 0 && !useBatchOut ? 1 : 0) + (cacheClassesPresent ? 1 : 0);
   const rateSet: Cost['rateSet'] =
     batchClasses > 0 && standardClasses > 0 ? 'mixed' : batchClasses > 0 ? 'batch' : 'standard';
 

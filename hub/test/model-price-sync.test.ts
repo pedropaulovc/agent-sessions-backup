@@ -23,7 +23,26 @@ function entry(over: Record<string, unknown> = {}): Record<string, unknown> {
   };
 }
 
+/** The sync refuses a payload too small to be the real catalog (see MIN_CATALOG_ENTRIES), which
+ * is a production guard, not something each test wants to restate. Pad every mocked payload with
+ * inert filler entries so tests can keep declaring only the models they care about. Tests that
+ * exercise the guard itself call mockUpstreamRaw and skip this. */
+function pad(payload: Record<string, unknown>): Record<string, unknown> {
+  const out = { ...payload };
+  for (let i = Object.keys(out).length; i < 200; i++) {
+    out[`filler-model-${i}`] = { litellm_provider: 'filler', input_cost_per_token: 1e-9, output_cost_per_token: 1e-9 };
+  }
+  return out;
+}
+
 function mockUpstream(payload: Record<string, unknown> | { fail: number }): void {
+  if (typeof (payload as { fail?: number }).fail !== 'number') {
+    return mockUpstreamRaw(pad(payload as Record<string, unknown>));
+  }
+  return mockUpstreamRaw(payload);
+}
+
+function mockUpstreamRaw(payload: Record<string, unknown> | { fail: number }): void {
   vi.stubGlobal(
     'fetch',
     vi.fn(async () => {
@@ -188,5 +207,33 @@ describe('model price autorefresh', () => {
     });
     // The actual point: the well-formed model still got written despite the bad neighbour.
     expect(limits.find((r) => r.model === 'claude-sonnet-5')!.max_input_tokens).toBe(200000);
+  });
+
+  it('refuses a 200 that is not the price catalog, rather than recording a successful no-op', () => {
+    // The dangerous shape: valid JSON, HTTP 200, every model unresolved, audit row ok=1 — prices
+    // silently stop tracking upstream while the sync reports success.
+    return (async () => {
+      mockUpstreamRaw({});
+      // Rethrown after the audit row is written, same as any other sync failure — the cron sees a
+      // failed invocation rather than a successful one that did nothing.
+      await expect(runModelPriceSync(testEnv)).rejects.toThrow('does not look like a price catalog');
+      const sync = (
+        await testEnv.DB.prepare('SELECT ok, error FROM model_prices_sync ORDER BY id DESC LIMIT 1').all<{
+          ok: number;
+          error: string | null;
+        }>()
+      ).results[0]!;
+      expect(sync.ok).toBe(0);
+      expect(sync.error).toContain('does not look like a price catalog');
+    })();
+  });
+
+  it('rejects a negative rate instead of storing a cost that cancels real spend', async () => {
+    mockUpstream({ 'claude-opus-5': entry({ input_cost_per_token: -5e-6 }) });
+    await runModelPriceSync(testEnv);
+    const rows = await pricesFor('claude-opus-5');
+    // Dropped to NULL, which makes the row UNPRICED and therefore visible in unpriced_calls —
+    // rather than fully priced and quietly negative.
+    expect(rows[0]!.input_cost).toBe(null);
   });
 });

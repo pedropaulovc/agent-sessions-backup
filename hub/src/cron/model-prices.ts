@@ -19,8 +19,12 @@ const PER_MILLION = 1_000_000;
 const intOrNull = (v: unknown): number | null =>
   typeof v === 'number' && Number.isFinite(v) ? Math.trunc(v) : null;
 
+// Negative is rejected, not just non-finite. A negative rate stores fine, prices a row as fully
+// PRICED, and then produces negative cost_usd that silently cancels legitimate cost elsewhere in
+// an aggregate -- an undercount with no unpriced_calls signal to catch it. Zero is legitimate
+// (free models), so the bound is >= 0.
 const perM = (v: unknown): number | null =>
-  typeof v === 'number' && Number.isFinite(v) ? Number((v * PER_MILLION).toPrecision(12)) : null;
+  typeof v === 'number' && Number.isFinite(v) && v >= 0 ? Number((v * PER_MILLION).toPrecision(12)) : null;
 
 /** Rates compared to decide whether a snapshot is a real price change. */
 const RATE_COLS = [
@@ -39,6 +43,11 @@ const RATE_COLS = [
  * subtracted from it — upstream correcting a null provider to `anthropic` silently misprices
  * every cached call until some unrelated rate happens to change. */
 const ACCOUNTING_COLS = ['provider', 'cache_accounting'] as const;
+
+/** Floor for "this response is the real catalog". LiteLLM ships thousands of entries; this is set
+ * far below that so an ordinary upstream shrink never trips it, and far above the handful a
+ * truncated or substituted payload would carry. */
+const MIN_CATALOG_ENTRIES = 100;
 
 type Rates = Record<(typeof RATE_COLS)[number], number | null>;
 type Accounting = Record<(typeof ACCOUNTING_COLS)[number], string | null>;
@@ -63,6 +72,18 @@ export async function runModelPriceSync(env: Env): Promise<void> {
     if (!res.ok) throw new Error(`upstream ${res.status} ${res.statusText}`);
     const upstream = (await res.json()) as Record<string, Record<string, unknown>>;
     const entryCount = Object.keys(upstream).length;
+    // A 200 carrying valid JSON that is not the price catalog -- `{}`, an error envelope, an HTML
+    // error page served as JSON -- would otherwise sail through this cast: every model resolves to
+    // nothing, `unresolved` fills up, and the audit row still records ok=1. Prices then silently
+    // stop tracking upstream while the sync reports success, which is the failure mode this whole
+    // job exists to prevent. LiteLLM ships thousands of models; a catalog that suddenly holds a
+    // handful is not a catalog.
+    const priced = Object.values(upstream).filter(
+      (e) => e && typeof e === 'object' && ('input_cost_per_token' in e || 'output_cost_per_token' in e),
+    ).length;
+    if (entryCount < MIN_CATALOG_ENTRIES || priced === 0) {
+      throw new Error(`upstream payload does not look like a price catalog: ${entryCount} entries, ${priced} priced`);
+    }
 
     const models = (
       await env.DB.prepare(`SELECT DISTINCT model FROM usage WHERE model IS NOT NULL`).all<{

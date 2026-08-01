@@ -23,12 +23,15 @@ a Durable Object cannot receive Cloudflare Preview URLs. Workers Builds also pin
 to the Worker connected in the dashboard, overriding Wrangler's environment `name` and
 `--name`. The DO-free `sessions-hub-preview` service therefore needs its own Git connection.
 
-For `sessions-hub`:
+For `sessions-hub` — **connected for builds only; it must not deploy.** CI's `deploy` job is the
+sole production deployer (it applies D1 migrations *then* deploys, which Workers Builds cannot do).
+Two systems deploying `main` independently race, and the one that loses ships code against the
+wrong schema — the failure that fired the parse-errors alert on 2026-07-22:
 
 - **Production branch:** `main`
+- **Deploy to production:** **disabled** — CI owns it
 - **Builds for non-production branches:** disabled (the preview Worker owns them)
 - **Build command:** `cd hub && npm ci`
-- **Deploy command:** `cd hub && npx wrangler deploy`
 
 For `sessions-hub-preview`:
 
@@ -43,7 +46,9 @@ The explicit environment is load-bearing: Workers Builds' default `versions uplo
 the top-level production bindings. `--env preview` selects the complete isolated binding
 set, while the matching explicit name makes configuration drift visible in the build log.
 
-GitHub Actions stays the PR gate (typecheck + vitest + pytest); Workers Builds owns deploys.
+GitHub Actions is the PR gate (typecheck + vitest + pytest) **and the sole production deployer**.
+Workers Builds owns preview uploads only. Verified on the current `main`: its check runs list
+`Workers Builds: sessions-hub-preview` and CI's `deploy`, with no `Workers Builds: sessions-hub`.
 
 **Preview migrations are not Workers Builds' job.** The deploy command above uploads code and
 nothing else, so `sessions-index-preview` is migrated by CI's `migrate-preview` job

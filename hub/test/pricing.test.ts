@@ -244,6 +244,25 @@ describe('rate set reporting', () => {
     // caller has to be able to see that, or it will label standard dollars as batch-priced.
     expect(costOfUsage({ model: 'claude-opus-5', input_tokens: 1 }, OPUS, { batch: true }).rateSet).toBe('standard');
   });
+
+  it('counts cache classes as standard — LiteLLM publishes no batch cache rates', () => {
+    // A cached call under batch=1 pays batch rates on input/output and STANDARD rates on cache
+    // read and cache write, because no batch cache columns exist upstream to pay instead. Calling
+    // the row 'batch' would label those standard dollars as discounted.
+    const cached = {
+      model: 'gpt-5.6-luna',
+      input_tokens: 1_000_000,
+      output_tokens: 1_000_000,
+      cache_read_tokens: 500_000,
+    };
+    expect(costOfUsage(cached, LUNA, { batch: true }).rateSet).toBe('mixed');
+    // Cache-write alone counts too, not just cache reads.
+    const written = { model: 'gpt-5.6-luna', input_tokens: 1_000_000, cache_creation_5m_tokens: 1_000 };
+    expect(costOfUsage(written, LUNA, { batch: true }).rateSet).toBe('mixed');
+    // And with no cache tokens at all it stays a clean 'batch'.
+    const plain = { model: 'gpt-5.6-luna', input_tokens: 1_000_000, output_tokens: 1_000_000 };
+    expect(costOfUsage(plain, LUNA, { batch: true }).rateSet).toBe('batch');
+  });
 });
 
 describe('model id resolution', () => {
