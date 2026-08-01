@@ -45,6 +45,15 @@ set, while the matching explicit name makes configuration drift visible in the b
 
 GitHub Actions stays the PR gate (typecheck + vitest + pytest); Workers Builds owns deploys.
 
+**Preview migrations are not Workers Builds' job.** The deploy command above uploads code and
+nothing else, so `sessions-index-preview` is migrated by CI's `migrate-preview` job
+(`wrangler d1 migrations apply DB --env preview --remote`, on every same-repo PR, gated on the
+hub tests) rather than by the deploy. Note `DB --env preview` and not the database name: the
+preview D1 exists only under `env.preview`, and wrangler resolves the target against the
+selected environment's bindings. Without that job a branch preview runs new code against the
+old preview schema — PR #65 shipped migration 0016 and every `/api/v1/usage` request on its
+preview returned `no such table: model_prices` until the migration was applied by hand.
+
 ## Stable branch preview front door
 
 Cloudflare's automatic branch aliases remain the deployment targets produced by Workers

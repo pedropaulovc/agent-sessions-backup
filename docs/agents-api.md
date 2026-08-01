@@ -113,11 +113,30 @@ degrades to an empty result set rather than a 500), `harness`, `machine`, `os`, 
 `limit` (default 100, max 100), `cursor` (opaque, paginates), `facets=1` (adds counts for
 the registered search facets, including `has_star`).
 
-### `GET /api/v1/usage?group_by=day|model|machine|repo&from&to`
+### `GET /api/v1/usage?group_by=day|model|machine|repo&from&to&machine&harness&batch`
 Token accounting, one row per bucket: `bucket, calls, input_tokens, output_tokens,
-reasoning_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens`.
-Raw token counts only — the hub has no pricing table, so there's no dollar figure anywhere
-in this response. Compute cost yourself if you need it, and caveat that it's an estimate.
+reasoning_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens`,
+plus costing: `cost_usd`, `billable_input_tokens`, `unpriced_calls`. Response-level:
+`cost_basis` and `unpriced_models`.
+
+**`cost_usd` is a list-price equivalent, not a bill.** It is what these tokens would have
+cost on the metered API at the rates in `model_prices` (synced from LiteLLM, ccusage's
+source), and the tokens were very likely burned under a flat-rate plan instead. `cost_basis`
+names the rate set used (`litellm_list_price`, or `litellm_list_price_batch` with `batch=1`).
+Never present it as spend without that qualifier.
+
+`unpriced_models` lists models with no published rate; their calls are counted in
+`unpriced_calls` and contribute 0 to `cost_usd`, so a non-empty list means every total is a
+floor. `billable_input_tokens` is the input actually charged at the input rate — under
+OpenAI's subset cache accounting that is `input_tokens` minus the cached prefix, clamped per
+row, so it is not derivable from the other columns once rows have been aggregated.
+
+Rows are priced at the rate in effect when the usage happened, not today's rate: the
+aggregate carries a price-epoch dimension internally so a bucket spanning a rate change is
+summed from correctly-priced parts, for every `group_by` and not just `day`.
+
+Buckets are capped at 400, and the cap is applied to buckets — a returned bucket always
+counts all of its models.
 
 **`cache_read_tokens` and `reasoning_tokens` are not safe to sum into a total uniformly** —
 their relationship to `input_tokens`/`output_tokens` is provider-specific:
@@ -145,13 +164,10 @@ rows — undercount beats double-count for a spend ranking. If you're computing 
 instead of using the client, replicate the same heuristic and caveat, or cross-reference
 `harness` via `/api/v1/sessions` to discriminate properly.
 
-**No `machine`/`harness` filter.** Only `group_by`/`from`/`to` are accepted (see "Known
-contract gaps" below) — if you're building a per-machine or per-harness token report, you
-must fetch the fleet-wide rows and either accept that scope or cross-reference against
-`/api/v1/sessions` yourself. The `daily-report` CLI does the honest thing here: when
-`--machine`/`--harness` is passed, it labels the token section
-"(fleet-wide — /api/v1/usage has no machine/harness filter)" rather than presenting
-fleet-wide numbers as if they were scoped to your filter.
+**`machine` and `harness` filters are supported** (they filter on the joined `sessions` row,
+same values as `/api/v1/sessions`), so a per-machine or per-harness token report needs no
+cross-referencing. `SessionsApi.usage()` exposes both, and `daily-report` forwards its
+`--machine`/`--harness` flags, so its token section is scoped exactly like its session list.
 
 ### `GET /api/v1/status`
 Fleet freshness / index-completeness:
@@ -195,10 +211,8 @@ the plan, until they're reconciled:
 - `X-Indexed-Through` on bulk `/api/v1/sessions` is an unfiltered fleet-wide minimum — it
   does **not** narrow to the machines matching your `machine`/`harness` query params, so it
   can read more stale than your actually-filtered data really is.
-- `GET /api/v1/usage` accepts only `group_by`/`from`/`to` — no `machine`/`harness` filter at
-  all, unlike `/api/v1/sessions` and `/api/v1/search`. A report scoped to one machine or
-  harness still gets fleet-wide token totals from this endpoint; say so rather than
-  presenting them as scoped (see the CLI's behavior above).
+- ~~`GET /api/v1/usage` accepts no `machine`/`harness` filter.~~ Closed — it takes both, and
+  the client and `daily-report` forward them (see the endpoint section above).
 - `/api/v1/sessions`'s cursor is a keyset boundary `(started_at, session_id)`, not the opaque
   offset cursor `/api/v1/search` uses — the two endpoints' `cursor` params are not
   interchangeable or shaped the same, despite sharing a param name.

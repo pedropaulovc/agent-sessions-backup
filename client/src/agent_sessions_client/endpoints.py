@@ -221,9 +221,20 @@ class SessionsApi:
             cursor=body.get("cursor"),
         )
 
-    def usage(self, *, group_by: str = "day", from_: str | None = None, to: str | None = None) -> UsageReport:
-        """GET /api/v1/usage?group_by=day|model|machine|repo&from&to"""
-        resp = self._client.get("/api/v1/usage", {"group_by": group_by, "from": from_, "to": to})
+    def usage(
+        self,
+        *,
+        group_by: str = "day",
+        from_: str | None = None,
+        to: str | None = None,
+        machine: str | None = None,
+        harness: str | None = None,
+    ) -> UsageReport:
+        """GET /api/v1/usage?group_by=day|model|machine|repo&from&to&machine&harness"""
+        resp = self._client.get(
+            "/api/v1/usage",
+            {"group_by": group_by, "from": from_, "to": to, "machine": machine, "harness": harness},
+        )
         body = resp.json()
         # Thread the response's own group_by (not the request kwarg — same value in practice,
         # but this is what the hub actually says it grouped by) into every row: UsageRow.
@@ -232,6 +243,8 @@ class SessionsApi:
         return UsageReport(
             group_by=resolved_group_by,
             rows=[UsageRow.from_row(r, group_by=resolved_group_by) for r in body.get("rows", [])],
+            cost_basis=body.get("cost_basis"),
+            unpriced_models=body.get("unpriced_models") or [],
         )
 
     def status(self) -> HubStatus:

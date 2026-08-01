@@ -26,16 +26,17 @@ def build_daily_report(
     machine: str | None = None,
     harness: str | None = None,
 ) -> str:
-    # /api/v1/usage and /api/v1/status have no machine/harness query params (verified against
-    # the deployed hub — see docs/agents-api.md's contract-gaps section and task #11) — so
-    # when either CLI filter is active, those two sections cover more than the sessions list
-    # does, and must say so rather than silently presenting fleet-wide numbers as scoped ones.
+    # /api/v1/usage now takes machine/harness, and cli.py forwards both, so the usage section
+    # is scoped exactly like the sessions list and needs no fleet-wide disclaimer. /api/v1/status
+    # still has no such params, and the sessions page's `indexed_through` is still a global
+    # field — `filtered` marks those remaining spots, which must say so rather than silently
+    # presenting fleet-wide numbers as scoped ones.
     filtered = machine is not None or harness is not None
     lines: list[str] = [f"# Daily Activity Report — {date}", ""]
     lines += _caveats_section(date, sessions_page, status, machine=machine, filtered=filtered)
     lines += _counts_section(sessions_page.sessions)
     lines += _notable_sessions_section(sessions_page.sessions)
-    lines += _usage_section(usage_report, filtered=filtered)
+    lines += _usage_section(usage_report)
     return "\n".join(lines).rstrip() + "\n"
 
 
@@ -126,22 +127,48 @@ def _notable_sessions_section(sessions: list[SessionMeta]) -> list[str]:
     return lines
 
 
-def _usage_section(usage: UsageReport, *, filtered: bool) -> list[str]:
-    heading = "## Token spend per model"
-    if filtered:
-        heading += " (fleet-wide — /api/v1/usage has no machine/harness filter)"
-    lines = [heading, ""]
+def _usage_section(usage: UsageReport) -> list[str]:
+    lines = ["## Token spend per model", ""]
     if not usage.rows:
         return [*lines, "No usage recorded in range.", ""]
-    lines.append("| Model | Calls | Input | Output | Reasoning | Cache read | Cache write (5m/1h) |")
-    lines.append("|---|---|---|---|---|---|---|")
+    lines.append("| Model | Calls | Input | Output | Reasoning | Cache read | Cache write (5m/1h) | Cost (USD) |")
+    lines.append("|---|---|---|---|---|---|---|---|")
     for row in sorted(usage.rows, key=lambda r: r.total_tokens, reverse=True):
         model = row.bucket or "(unknown)"
+        # An unpriced row's 0.00 would read as "this was free" rather than "we have no rate".
+        cost = "—" if row.unpriced_calls and not row.cost_usd else f"${row.cost_usd:,.2f}"
         lines.append(
             f"| {model} | {row.calls} | {row.input_tokens:,} | {row.output_tokens:,} | {row.reasoning_tokens:,} "
-            f"| {row.cache_read_tokens:,} | {row.cache_creation_5m_tokens:,}/{row.cache_creation_1h_tokens:,} |"
+            f"| {row.cache_read_tokens:,} | {row.cache_creation_5m_tokens:,}/{row.cache_creation_1h_tokens:,} "
+            f"| {cost} |"
         )
     lines.append("")
-    lines.append("_Token counts only — the hub does not track per-model pricing, so no dollar figure is computed here._")
+    lines += _cost_note(usage)
     lines.append("")
     return lines
+
+
+# The number is a list-price equivalent, NOT a bill: these tokens were very likely burned under
+# a flat-rate subscription, and this hub has no visibility into what was actually charged. Any
+# report that prints a dollar figure has to carry that qualifier next to it, or a downstream
+# agent reading this file will report it as spend.
+_COST_BASIS_NOTE = {
+    "litellm_list_price": "at LiteLLM list rates",
+    "litellm_list_price_batch": "at LiteLLM batch-tier list rates",
+}
+
+
+def _cost_note(usage: UsageReport) -> list[str]:
+    basis = _COST_BASIS_NOTE.get(usage.cost_basis or "", "at list rates")
+    note = (
+        f"_Cost is what these tokens would have cost {basis} on the metered API — "
+        "not an invoice, and not what a flat-rate plan actually charged._"
+    )
+    if not usage.unpriced_models:
+        return [note]
+    models = ", ".join(f"`{m}`" for m in sorted(usage.unpriced_models))
+    return [
+        note,
+        "",
+        f"_Totals are a floor: {usage.unpriced_calls:,} calls have no published rate ({models})._",
+    ]

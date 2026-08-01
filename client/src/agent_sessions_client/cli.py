@@ -57,7 +57,9 @@ def _daily_report(args: argparse.Namespace) -> int:
 
     try:
         sessions_page = api.list_sessions(from_=report_date, to=report_date, machine=args.machine, harness=args.harness)
-        usage_report = api.usage(group_by="model", from_=report_date, to=report_date)
+        usage_report = api.usage(
+            group_by="model", from_=report_date, to=report_date, machine=args.machine, harness=args.harness
+        )
         status = api.status()
     except HubError as e:
         print(f"error: {e}", file=sys.stderr)

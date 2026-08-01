@@ -45,6 +45,42 @@ jobs:
       - run: uv sync
       - run: uv run pytest
 
+  # Same migrate-before-code rule as `deploy` below, for the branch previews. Workers Builds owns the
+  # preview deploy (`wrangler versions upload --env preview`, configured in the dashboard — see
+  # infra/cf/deploy.md) and it applies no migrations, so a branch preview would otherwise run new code
+  # against `sessions-index-preview`'s old schema. That is not hypothetical: PR #65 added migration 0016
+  # and every `/api/v1/usage` request on its preview failed with `no such table: model_prices` because
+  # the preview DB was never migrated.
+  #
+  # This job cannot strictly order itself before the Workers Builds deploy (different systems, no shared
+  # gate), so a preview can still serve new-code-on-old-schema for the minute or two until this lands.
+  # It converges, which the status quo never does. Gated on `hub` for the same reason `deploy` is: the
+  # test suite applies every migration, so a broken one never reaches a real database.
+  #
+  # The preview D1 is shared by all branches, so an unmerged branch's migration lands here early. That
+  # is already true of every other preview resource and is the accepted cost of one shared preview env.
+  migrate-preview:
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    needs: hub
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: hub
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: hub/package-lock.json
+      - run: npm ci
+      # `DB --env preview`, not the database name: `sessions-index-preview` is declared only under
+      # env.preview, and wrangler resolves migration targets against the selected environment's
+      # bindings, so the bare name errors with "Couldn't find a D1 DB with the name or binding".
+      - run: npx wrangler d1 migrations apply DB --env preview --remote
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
   # Migrate D1 then deploy the hub Worker, in that order, on merge to main. This is the SOLE deployer:
   # Cloudflare Workers Builds auto-deploy is turned OFF so nothing races us. Applying migrations before
   # `wrangler deploy` guarantees new code never runs against the old schema — the failure mode that

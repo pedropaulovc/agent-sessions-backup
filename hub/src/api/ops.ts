@@ -1,6 +1,13 @@
 import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
-import { costOfUsage, isBillableModel, loadPrices, priceAt, type UsageTokens } from '../pricing';
+import {
+  costOfUsage,
+  isBillableModel,
+  loadPrices,
+  priceAt,
+  type ModelPrice,
+  type UsageTokens,
+} from '../pricing';
 import { reservationCutoffIso } from '../queue';
 import { getClientCertFingerprint, queueRetiredIfDisplaced, rotationCas, settleRetired, type RotationState } from './certs';
 import { normalizeToBound } from './sessions';
@@ -564,26 +571,45 @@ export async function usage(url: URL, env: Env): Promise<Response> {
     filters.push(`s.harness = ?${binds.length}`);
   }
   const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
-  // Cost has to be summed per (bucket, model): one bucket can mix models, and each model has
-  // its own rates AND its own cache-accounting convention. Grouping by model too and folding
-  // the buckets back up in JS keeps that correct without a join against model_prices.
-  const rows = await env.DB.prepare(
-    `SELECT ${expr} AS bucket,
-            u.model AS model,
-            COUNT(*) AS calls,
-            SUM(COALESCE(u.input_tokens,0)) AS input_tokens,
-            SUM(COALESCE(u.output_tokens,0)) AS output_tokens,
-            SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens,
-            SUM(COALESCE(u.cache_read_tokens,0)) AS cache_read_tokens,
-            SUM(COALESCE(u.cache_creation_5m_tokens,0)) AS cache_creation_5m_tokens,
-            SUM(COALESCE(u.cache_creation_1h_tokens,0)) AS cache_creation_1h_tokens
-     FROM usage u JOIN sessions s ON s.session_id = u.session_id
-     ${where} GROUP BY bucket, u.model ORDER BY bucket DESC LIMIT 4000`,
-  )
-    .bind(...binds)
-    .all<UsageAggRow>();
 
   const prices = await loadPrices(env.DB);
+  // Cost has to be summed per (bucket, model, price epoch). Per model, because each model has
+  // its own rates AND its own cache-accounting convention. Per epoch, because `bucket` is only
+  // a timestamp when group_by=day — for model/machine/repo it is an identifier, so pricing a
+  // whole bucket at `priceAt(bucket)` would compare a rate date against a model name and pick
+  // an arbitrary rate for all of history. The epoch restores the time dimension the bucket
+  // lost. Grouping by the distinct `effective_from` boundaries rather than by day is what
+  // keeps that affordable: rates change on snapshot boundaries (a handful, ever), so an epoch
+  // group is guaranteed to sit at one rate while the fan-out stays bucket x model x ~epochs
+  // instead of bucket x model x every-day-in-range.
+  const epochExpr = priceEpochExpr(prices);
+  const rows = await env.DB.prepare(
+    `WITH agg AS (
+       SELECT ${expr} AS bucket,
+              u.model AS model,
+              ${epochExpr} AS epoch,
+              COUNT(*) AS calls,
+              SUM(COALESCE(u.input_tokens,0)) AS input_tokens,
+              SUM(COALESCE(u.output_tokens,0)) AS output_tokens,
+              SUM(COALESCE(u.reasoning_tokens,0)) AS reasoning_tokens,
+              SUM(COALESCE(u.cache_read_tokens,0)) AS cache_read_tokens,
+              SUM(COALESCE(u.cache_creation_5m_tokens,0)) AS cache_creation_5m_tokens,
+              SUM(COALESCE(u.cache_creation_1h_tokens,0)) AS cache_creation_1h_tokens,
+              -- Subset-accounting models bill only input beyond the cached prefix, and the
+              -- clamp at 0 is nonlinear, so it has to happen per row: one truncated call with
+              -- cache_read > input would otherwise cancel fresh input from valid calls in the
+              -- same group. costOfUsage() consumes this instead of clamping the SUMs.
+              SUM(MAX(0, COALESCE(u.input_tokens,0) - COALESCE(u.cache_read_tokens,0)))
+                AS fresh_input_tokens
+       FROM usage u JOIN sessions s ON s.session_id = u.session_id
+       ${where} GROUP BY bucket, u.model, epoch
+     )
+     SELECT * FROM agg
+     WHERE bucket IN (SELECT bucket FROM agg GROUP BY bucket ORDER BY bucket DESC LIMIT ?${binds.length + 1})`,
+  )
+    .bind(...binds, MAX_BUCKETS)
+    .all<UsageAggRow>();
+
   const batch = url.searchParams.get('batch') === '1';
   const byBucket = new Map<string, UsageOutRow>();
   const unpricedModels = new Set<string>();
@@ -606,9 +632,10 @@ export async function usage(url: URL, env: Env): Promise<Response> {
     for (const k of TOKEN_COLS) agg[k] += Number(r[k] ?? 0);
     agg.calls += Number(r.calls ?? 0);
 
-    // The bucket sum is over the whole group, so price the group's totals in one shot; every
-    // row in it shares a model and therefore one rate and one accounting convention.
-    const price = isBillableModel(r.model) ? priceAt(prices.get(r.model) ?? [], String(r.bucket)) : null;
+    // Price the group's totals in one shot: every row in it shares a model and an epoch, and
+    // therefore one rate and one accounting convention. `epoch` — not `bucket` — is the date
+    // to price at; see the comment on the query above.
+    const price = isBillableModel(r.model) ? priceAt(prices.get(r.model) ?? [], String(r.epoch)) : null;
     const cost = costOfUsage(r, price, { batch });
     agg.billable_input_tokens += cost.billableInputTokens;
     agg.cost_usd += cost.usd;
@@ -619,9 +646,10 @@ export async function usage(url: URL, env: Env): Promise<Response> {
     byBucket.set(key, agg);
   }
 
+  // No slice here: the query already returns whole buckets and at most MAX_BUCKETS of them,
+  // so trimming again could only cut a bucket that was counted in full.
   const out = [...byBucket.values()]
     .sort((a, b) => String(b.bucket).localeCompare(String(a.bucket)))
-    .slice(0, 400)
     .map((r) => ({ ...r, cost_usd: Math.round(r.cost_usd * 1e6) / 1e6 }));
 
   return Response.json({
@@ -632,6 +660,35 @@ export async function usage(url: URL, env: Env): Promise<Response> {
     unpriced_models: [...unpricedModels],
     rows: out,
   });
+}
+
+/** Buckets returned by /api/v1/usage. Applied to buckets in the query, never to the
+ * (bucket, model, epoch) rows that fold into them — trimming those would silently return a
+ * bucket that counted only some of its models. */
+const MAX_BUCKETS = 400;
+
+/** Sorts before every real `effective_from`, so `priceAt` takes its documented
+ * older-than-any-snapshot branch instead of the falsy-ts one (which returns the NEWEST rate). */
+const EPOCH_BEFORE_ANY_PRICE = '0000-00-00';
+
+/** A SQL expression mapping `u.ts` to the price snapshot in effect at that time.
+ *
+ * The boundaries are pooled across all models on purpose: a shared partition means one CASE
+ * for the whole query, and a model with fewer boundaries than the pool just resolves adjacent
+ * epochs to the same rate — `priceAt` is what actually picks the model's rate, this only has
+ * to guarantee no group straddles a change. */
+export function priceEpochExpr(prices: Map<string, ModelPrice[]>): string {
+  const boundaries = [...new Set([...prices.values()].flat().map((p) => p.effective_from))]
+    // These are our own cron's values, not user input, but they are interpolated rather than
+    // bound (the arm count varies with the data, so a fixed bind list won't do), so anything
+    // not EXACTLY a bare YYYY-MM-DD is dropped rather than trusted. The anchor at both ends is
+    // the point: a prefix match would happily pass `2026-01-01'; DROP TABLE usage --` through.
+    .filter((e) => /^\d{4}-\d{2}-\d{2}$/.test(e))
+    .sort()
+    .reverse();
+  if (!boundaries.length) return `'${EPOCH_BEFORE_ANY_PRICE}'`;
+  const arms = boundaries.map((e) => `WHEN u.ts >= '${e}' THEN '${e}'`).join(' ');
+  return `CASE ${arms} ELSE '${EPOCH_BEFORE_ANY_PRICE}' END`;
 }
 
 const TOKEN_COLS = [
@@ -645,6 +702,7 @@ const TOKEN_COLS = [
 
 interface UsageAggRow extends UsageTokens {
   bucket: string | null;
+  epoch: string | null;
   calls: number;
   [k: string]: unknown;
 }

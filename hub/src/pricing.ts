@@ -13,6 +13,10 @@ export interface UsageTokens {
   cache_read_tokens?: number | null;
   cache_creation_5m_tokens?: number | null;
   cache_creation_1h_tokens?: number | null;
+  /** For a pre-aggregated group: SUM over rows of `max(0, input - cache_read)`, i.e. the
+   * subset-accounting clamp already applied per row. Absent for a single row, where deriving
+   * it from `input_tokens`/`cache_read_tokens` is exact. See `billableInput` below. */
+  fresh_input_tokens?: number | null;
 }
 
 export interface ModelPrice {
@@ -76,8 +80,15 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   const cw1h = u.cache_creation_1h_tokens ?? 0;
 
   // Under `subset`, the cached tokens are already inside input_tokens; only the remainder is
-  // fresh. clamp at 0 -- a truncated or out-of-order transcript can report cacheRead > input.
-  const billableInput = price?.cache_accounting === 'subset' ? Math.max(0, input - cacheRead) : input;
+  // fresh. Clamp at 0 -- a truncated or out-of-order transcript can report cacheRead > input.
+  //
+  // The clamp is nonlinear, so on a pre-aggregated group it must have been applied per row:
+  // clamping the group's SUMs lets one row with cacheRead > input eat fresh input belonging to
+  // its neighbours. `fresh_input_tokens` carries that per-row sum when the caller has one.
+  const billableInput =
+    price?.cache_accounting === 'subset'
+      ? (u.fresh_input_tokens ?? Math.max(0, input - cacheRead))
+      : input;
 
   if (!price || price.input_cost == null || price.output_cost == null) {
     return { usd: 0, unpriced: true, billableInputTokens: billableInput };
@@ -87,11 +98,20 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   const inRate = batch ? price.input_cost_batch! : price.input_cost;
   const outRate = batch ? price.output_cost_batch! : price.output_cost;
 
-  // A missing cache rate means "upstream doesn't publish it", not "free". Fall back to the
-  // input rate, which is the conservative direction: caching can only ever be cheaper.
+  // A missing cache READ rate falls back to the input rate: a cache read is never dearer than
+  // fresh input, so that direction can only over-report, never quietly under-report.
   const readRate = price.cache_read_cost ?? inRate;
-  const w5Rate = price.cache_write_5m_cost ?? inRate;
-  const w1hRate = price.cache_write_1h_cost ?? w5Rate;
+
+  // Cache WRITES get no such fallback. They cost MORE than input -- Anthropic charges 1.25x
+  // for a 5m write and 2x for a 1h write -- so substituting the input rate (or the 5m rate for
+  // a missing 1h rate) invents a cheaper price and reports it as if it were priced. A row that
+  // actually carries cache-creation tokens with no published write rate is unpriced. Rows with
+  // no cache-creation tokens are unaffected: the missing rate never gets multiplied by anything.
+  if ((cw5 > 0 && price.cache_write_5m_cost == null) || (cw1h > 0 && price.cache_write_1h_cost == null)) {
+    return { usd: 0, unpriced: true, billableInputTokens: billableInput };
+  }
+  const w5Rate = price.cache_write_5m_cost ?? 0;
+  const w1hRate = price.cache_write_1h_cost ?? 0;
 
   const usd =
     (billableInput * inRate + output * outRate + cacheRead * readRate + cw5 * w5Rate + cw1h * w1hRate) /

@@ -57,6 +57,29 @@ describe('cache accounting', () => {
     expect(c.billableInputTokens).toBe(0);
     expect(c.usd).toBeGreaterThanOrEqual(0);
   });
+
+  it('takes the per-row clamp sum for a group rather than clamping the group totals', () => {
+    // The clamp is nonlinear, so it cannot be applied after summing. These two calls --
+    // (500 in, 9000 cached) and (10000 in, 0 cached) -- are 0 + 10000 = 10000 fresh tokens.
+    // Clamping the SUMs instead gives max(0, 10500 - 9000) = 1500: the truncated row's excess
+    // cache reads eat fresh input belonging to a perfectly valid neighbour.
+    const group = {
+      model: 'gpt-5.6-luna',
+      input_tokens: 10_500,
+      output_tokens: 0,
+      cache_read_tokens: 9_000,
+      fresh_input_tokens: 10_000,
+    };
+    expect(costOfUsage(group, LUNA).billableInputTokens).toBe(10_000);
+  });
+
+  it('ignores fresh_input_tokens for disjoint models, where input is already fresh', () => {
+    const c = costOfUsage(
+      { model: 'claude-opus-5', input_tokens: 10_500, cache_read_tokens: 9_000, fresh_input_tokens: 10_000 },
+      OPUS,
+    );
+    expect(c.billableInputTokens).toBe(10_500);
+  });
 });
 
 describe('batch tier', () => {
@@ -83,9 +106,39 @@ describe('missing prices', () => {
     expect(c.usd).toBe(0);
   });
 
-  it('treats a missing cache rate as the input rate, not as free', () => {
-    const noCacheRate: ModelPrice = { ...OPUS, cache_read_cost: null, cache_write_5m_cost: null };
-    const c = costOfUsage({ model: 'claude-opus-5', cache_read_tokens: 1_000_000 }, noCacheRate);
+  it('treats a missing cache READ rate as the input rate, not as free', () => {
+    // Safe in this direction only: a cache read is never dearer than fresh input, so the
+    // substitution can over-report but never quietly under-report.
+    const noReadRate: ModelPrice = { ...OPUS, cache_read_cost: null };
+    const c = costOfUsage({ model: 'claude-opus-5', cache_read_tokens: 1_000_000 }, noReadRate);
+    expect(c.usd).toBeCloseTo(5, 10);
+  });
+
+  // Cache WRITES get no such fallback: OPUS above charges 6.25 for a 5m write and 10 for a 1h
+  // write against an input rate of 5, so substituting the input rate (or the 5m rate for a
+  // missing 1h rate) invents a discount and reports it as a priced number.
+  it('flags a row as unpriced when its 5m cache-write rate is unpublished', () => {
+    const noW5: ModelPrice = { ...OPUS, cache_write_5m_cost: null };
+    const c = costOfUsage({ model: 'claude-opus-5', cache_creation_5m_tokens: 1_000_000 }, noW5);
+    expect(c.unpriced).toBe(true);
+    expect(c.usd).toBe(0);
+  });
+
+  it('flags a row as unpriced when its 1h cache-write rate is unpublished', () => {
+    // The 1h rate is 2x input while the 5m rate is 1.25x, so the old w1h -> w5 fallback was
+    // the biggest under-charge of the three.
+    const noW1h: ModelPrice = { ...OPUS, cache_write_1h_cost: null };
+    const c = costOfUsage({ model: 'claude-opus-5', cache_creation_1h_tokens: 1_000_000 }, noW1h);
+    expect(c.unpriced).toBe(true);
+    expect(c.usd).toBe(0);
+  });
+
+  it('still prices a row whose missing write rate is never multiplied by anything', () => {
+    // No cache-creation tokens means the absent rate is irrelevant; refusing to price here
+    // would throw away real cost data over a column that does not apply.
+    const noWrites: ModelPrice = { ...OPUS, cache_write_5m_cost: null, cache_write_1h_cost: null };
+    const c = costOfUsage({ model: 'claude-opus-5', input_tokens: 1_000_000 }, noWrites);
+    expect(c.unpriced).toBe(false);
     expect(c.usd).toBeCloseTo(5, 10);
   });
 
