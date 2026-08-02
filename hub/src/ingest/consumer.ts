@@ -1919,7 +1919,18 @@ async function writeSession(
        cache_creation_5m_tokens = excluded.cache_creation_5m_tokens,
        cache_creation_1h_tokens = excluded.cache_creation_1h_tokens,
        cache_read_tokens = excluded.cache_read_tokens, inference_geo = excluded.inference_geo,
-       request_id = excluded.request_id`,
+       request_id = excluded.request_id,
+       -- A re-parse that CHANGED this turn invalidates its stored cost, and nothing else would
+       -- notice. The row is already at the current pricing version, so the pass -- which selects
+       -- on priced_version being BELOW the current one -- would skip it forever and it would keep
+       -- serving the cost of the token counts it used to have. Wrong money, permanently, no symptom.
+       --
+       -- The costs are cleared rather than left in place because a stale cost is worse than a
+       -- missing one: NULL reads as unpriced and is flagged as such on the page, whereas the old
+       -- number is indistinguishable from a current one. The end-of-batch pricing pass re-prices it
+       -- moments later in the same invocation.
+       priced_version = 0, priced_at = NULL, usd = NULL, usd_input = NULL, usd_output = NULL,
+       usd_cache_read = NULL, usd_cache_write_5m = NULL, usd_cache_write_1h = NULL`,
   );
 
   // Only the divergent tail is written. Token totals still come from EVERY turn — they land on the

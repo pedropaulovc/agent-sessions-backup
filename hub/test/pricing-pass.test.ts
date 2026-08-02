@@ -153,6 +153,33 @@ describe('priceUsage', () => {
     expect(r.priced_at, 'the attempt was not recorded at all').toBe(NOW.toISOString());
   });
 
+  it('re-prices a turn whose tokens changed under a re-parse', async () => {
+    // The upsert path. A re-parse that CHANGES a turn updates its tokens but the row is already at
+    // the current pricing version, so the pass -- which selects on being below it -- would skip the
+    // row forever and it would keep serving the cost of the token counts it used to have. Wrong
+    // money, permanently, with no symptom: nothing on the page distinguishes a stale cost from a
+    // current one. The conflict branch of the ingest INSERT clears the pricing state; this asserts
+    // the pass then picks the row up and lands on the NEW number.
+    await seedPrice();
+    const id = await seedTurn('s1', { input: 1_000_000 });
+    await priceUsage(testEnv.DB, { now: NOW });
+    expect((await priced(id)).usd).toBeCloseTo(1, 9);
+
+    // Exactly what the ON CONFLICT branch does: new tokens, pricing state cleared.
+    await testEnv.DB.prepare(
+      `UPDATE usage SET input_tokens = 5000000, priced_version = 0, priced_at = NULL, usd = NULL,
+                        usd_input = NULL, usd_output = NULL, usd_cache_read = NULL,
+                        usd_cache_write_5m = NULL, usd_cache_write_1h = NULL
+        WHERE id = ?1`,
+    )
+      .bind(id)
+      .run();
+
+    await priceUsage(testEnv.DB, { now: new Date('2026-08-02T12:00:00.000Z') });
+
+    expect((await priced(id)).usd, 'the re-parsed turn kept the cost of its old token counts').toBeCloseTo(5, 9);
+  });
+
   it('records which rate snapshot it used, and prices a turn at the rate in force THEN', async () => {
     // The whole reason `model_prices` is versioned rather than overwritten: an August price cut
     // must not silently rewrite what July cost. Storing the cost makes that permanent, so the
