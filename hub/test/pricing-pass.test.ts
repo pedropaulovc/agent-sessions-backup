@@ -73,6 +73,36 @@ async function priced(id: number): Promise<{
     .first())! as never;
 }
 
+/** Runs `body` with the FIRST `db.batch` call preceded by `mutate`.
+ *
+ * `db.batch` is the real seam for the mid-pass race: it runs after the pass has read its rows and
+ * priced them in JS, immediately before the write lands. Mutating the table there reproduces the
+ * interleaving exactly rather than approximating it.
+ *
+ * The interception is asserted to have fired, because the failure mode of this helper is silence —
+ * a pass that stopped using `db.batch` would leave every race test green while simulating no race
+ * at all. Restoring in `finally` matters for the same reason: a leaked stub would follow the
+ * shared binding into every later test in the file.
+ */
+async function withRaceBeforeWrite<T>(mutate: () => Promise<void>, body: () => Promise<T>): Promise<T> {
+  const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+  let intercepted = false;
+  (testEnv.DB as unknown as { batch: typeof realBatch }).batch = (async (stmts: D1PreparedStatement[]) => {
+    if (!intercepted) {
+      intercepted = true;
+      await mutate();
+    }
+    return realBatch(stmts);
+  }) as typeof realBatch;
+  try {
+    const out = await body();
+    expect(intercepted, 'the interception never fired, so no race was simulated').toBe(true);
+    return out;
+  } finally {
+    (testEnv.DB as unknown as { batch: typeof realBatch }).batch = realBatch;
+  }
+}
+
 describe('priceUsage', () => {
   beforeEach(async () => {
     // Storage is shared across tests in this pool, so every fixture here starts from an empty
@@ -193,30 +223,19 @@ describe('priceUsage', () => {
     await seedPrice();
     const id = await seedTurn('s1', { input: 1_000_000 });
 
-    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
-    let intercepted = false;
-    (testEnv.DB as unknown as { batch: typeof realBatch }).batch = (async (stmts: D1PreparedStatement[]) => {
-      if (!intercepted) {
-        intercepted = true;
-        // The concurrent re-parse: new tokens, pricing state reset — the ON CONFLICT branch.
-        await testEnv.DB.prepare(
+    const res = await withRaceBeforeWrite(
+      // The concurrent re-parse: new tokens, pricing state reset — the ON CONFLICT branch.
+      () =>
+        testEnv.DB.prepare(
           `UPDATE usage SET input_tokens = 9000000, priced_version = 0, priced_at = NULL, usd = NULL
             WHERE id = ?1`,
         )
           .bind(id)
-          .run();
-      }
-      return realBatch(stmts);
-    }) as typeof realBatch;
+          .run()
+          .then(() => undefined),
+      () => priceUsage(testEnv.DB, { now: NOW }),
+    );
 
-    let res;
-    try {
-      res = await priceUsage(testEnv.DB, { now: NOW });
-    } finally {
-      (testEnv.DB as unknown as { batch: typeof realBatch }).batch = realBatch;
-    }
-
-    expect(intercepted, 'the interception never fired, so no race was simulated').toBe(true);
     expect(res.superseded, 'the stale write was not detected as superseded').toBe(1);
     expect(res.priced, 'a write that changed nothing was counted as priced').toBe(0);
 
@@ -243,24 +262,15 @@ describe('priceUsage', () => {
     const ok = await seedTurn('s1', { input: 1_000_000 });
     const nope = await seedTurn('s1', { model: 'model-with-no-published-rate' });
 
-    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
-    let intercepted = false;
-    (testEnv.DB as unknown as { batch: typeof realBatch }).batch = (async (stmts: D1PreparedStatement[]) => {
-      if (!intercepted) {
-        intercepted = true;
-        await testEnv.DB.prepare('UPDATE usage SET input_tokens = 9000000 WHERE id = ?1').bind(nope).run();
-      }
-      return realBatch(stmts);
-    }) as typeof realBatch;
+    const res = await withRaceBeforeWrite(
+      () =>
+        testEnv.DB.prepare('UPDATE usage SET input_tokens = 9000000 WHERE id = ?1')
+          .bind(nope)
+          .run()
+          .then(() => undefined),
+      () => priceUsage(testEnv.DB, { now: NOW }),
+    );
 
-    let res;
-    try {
-      res = await priceUsage(testEnv.DB, { now: NOW });
-    } finally {
-      (testEnv.DB as unknown as { batch: typeof realBatch }).batch = realBatch;
-    }
-
-    expect(intercepted, 'the interception never fired, so no race was simulated').toBe(true);
     expect(res.superseded).toBe(1);
     expect(res.unpriceable, 'the superseded row was still counted as a completed no-rate verdict').toBe(0);
     expect(res.priced, 'the decrement landed on a row that WAS written').toBe(1);

@@ -2,6 +2,7 @@ import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { CC_SESSION_ID, ccAssistantLine, ccNoiseLines, ccUserLine } from './fixtures';
+import { PRICING_VERSION } from '../src/pricing-pass';
 
 const testEnv = env as unknown as Env;
 
@@ -1608,10 +1609,20 @@ describe('re-parse invalidates a stored cost', () => {
       .bind(SID)
       .first<{ usd: number | null; priced_version: number }>();
     expect(first?.usd, 'the ingest pricing hook did not price the new session').toBeCloseTo(1, 6);
+    expect(first?.priced_version, 'priced, but not stamped as priced -- the row stays due forever').toBe(PRICING_VERSION);
 
     // Same path, same file, five times the tokens. writeSession takes its ON CONFLICT branch.
     await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${SID}.jsonl`, transcript(5_000_000));
     await drainQueue();
+
+    // The count first, and it is not decoration. Everything below reads through `.first()`, which
+    // with no ORDER BY picks an arbitrary row -- so if the conflict branch ever stopped matching
+    // and INSERTED a second turn instead of updating the first, `.first()` could hand back the new
+    // $5 row and every assertion here would pass while the thing under test was broken.
+    const rows = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM usage WHERE session_id = ?1')
+      .bind(SID)
+      .first<{ n: number }>();
+    expect(rows?.n, 'the re-parse inserted a second usage row instead of updating the first').toBe(1);
 
     const after = await testEnv.DB.prepare(
       'SELECT usd, input_tokens, priced_version FROM usage WHERE session_id = ?1',
@@ -1620,5 +1631,8 @@ describe('re-parse invalidates a stored cost', () => {
       .first<{ usd: number | null; input_tokens: number; priced_version: number }>();
     expect(after?.input_tokens, 'the re-parse did not reach the usage row').toBe(5_000_000);
     expect(after?.usd, 'the re-parsed turn kept the cost of its old token counts').toBeCloseTo(5, 6);
+    // The reset is only half the mechanism; the row also has to come back UP to the current
+    // version, or it stays due forever and every later pass re-prices it for nothing.
+    expect(after?.priced_version, 'the re-priced row was not stamped with the current version').toBe(PRICING_VERSION);
   });
 });
