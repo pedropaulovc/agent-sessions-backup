@@ -1,0 +1,21 @@
+-- Normalise any NULL `priced_version` to 0.
+--
+-- A no-op on any database that applied 0019 as it now stands, where the column is
+-- `NOT NULL DEFAULT 0` and a NULL cannot exist. It exists for the databases that applied an
+-- EARLIER draft of 0019, in which the column was plain `INTEGER` and therefore nullable.
+--
+-- WHY THIS IS NOT COSMETIC. The pricing pass selects due rows with `priced_version < ?`, a single
+-- range so the index is usable at all (see 0019). `NULL < 2` is NULL, not true — so on a database
+-- carrying NULLs those rows match nothing, are never selected, and are never priced. Silently:
+-- no error, no warning, they simply never appear in the work list, and the only visible symptom is
+-- that a corner of the corpus stays unpriced forever while every run reports "nothing to do".
+--
+-- The hazard is worth naming because it is general, not specific to this column: EDITING AN
+-- ALREADY-APPLIED MIGRATION diverges environments permanently. D1 records migrations by filename,
+-- so a database that ran the old text has 0019 marked applied and will never see the new text,
+-- however many times the job runs. Production had not reached 0019 when the correction was made
+-- and so gets the right version; the preview database had, and would have been stuck with a
+-- nullable column and 1,937 permanently invisible rows.
+--
+-- The rule that follows: once a migration has run ANYWHERE, correct it forward in a new file.
+UPDATE usage SET priced_version = 0 WHERE priced_version IS NULL;
