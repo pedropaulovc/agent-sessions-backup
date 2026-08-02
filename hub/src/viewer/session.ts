@@ -57,7 +57,6 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
     .bind(sessionId)
     .first<SessionMeta>();
   if (!meta) return notFound();
-  const displayTitle = sessionDisplayTitle(meta.first_interaction_title, meta.title, meta.session_id);
 
   const file = await env.DB.prepare(
     `SELECT f.store, f.relpath, f.r2_key, f.content_hash FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
@@ -128,7 +127,9 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
     queue.push({ turnIndex: row.turn_index, onMainPath: row.on_main_path === 1 });
     pageTurnsByByteStart.set(row.byte_start, queue);
   }
-  const titleSkippedTurns = await loadTitleSkippedTurns(env, sessionId);
+  const titleScan = await loadTitleScan(env, sessionId);
+  const displayTitle = sessionDisplayTitle(titleScan.title || meta.first_interaction_title, meta.title, meta.session_id);
+  const titleSkippedTurns = titleScan.skipped;
 
   // Media block ids for this byte window, so <img>/<a> can point at the blob endpoint.
   const mediaIds = await loadMediaIds(env, sessionId, startByte, endByte);
@@ -205,8 +206,13 @@ interface TitleBlockRow {
   text: string | null;
 }
 
-/** Find exactly the leading turns title derivation discards without loading the whole transcript. */
-async function loadTitleSkippedTurns(env: Env, sessionId: string): Promise<ReadonlySet<number>> {
+/** Find leading title-excluded turns and derive a legacy title without loading the whole transcript. */
+interface TitleScan {
+  title: string | null;
+  skipped: ReadonlySet<number>;
+}
+
+async function loadTitleScan(env: Env, sessionId: string): Promise<TitleScan> {
   const skipped = new Set<number>();
   let lastTurn = -1;
   let lastBlock = -1;
@@ -227,7 +233,8 @@ async function loadTitleSkippedTurns(env: Env, sessionId: string): Promise<Reado
 
     for (const row of rows.results) {
       if (pending.length > 0 && pending[0]!.turnIndex !== row.turn_index) {
-        if (consumeTitleTurn(pending, skipped)) return skipped;
+        const title = consumeTitleTurn(pending, skipped);
+        if (title !== null) return { title, skipped };
         pending = [];
       }
       pending.push({
@@ -241,28 +248,26 @@ async function loadTitleSkippedTurns(env: Env, sessionId: string): Promise<Reado
     }
 
     if (rows.results.length === 0) {
-      consumeTitleTurn(pending, skipped);
-      return skipped;
+      return { title: consumeTitleTurn(pending, skipped), skipped };
     }
 
     const last = rows.results[rows.results.length - 1]!;
     lastTurn = last.turn_index;
     lastBlock = last.block_index;
     if (rows.results.length < TITLE_SCAN_PAGE_SIZE) {
-      consumeTitleTurn(pending, skipped);
-      return skipped;
+      return { title: consumeTitleTurn(pending, skipped), skipped };
     }
   }
 }
 
-/** Return true once a real first interaction has ended title's leading skip run. */
-function consumeTitleTurn(turn: TitleBlock[], skipped: Set<number>): boolean {
+/** Return the first real title in a turn, or null while extending the leading skip run. */
+function consumeTitleTurn(turn: TitleBlock[], skipped: Set<number>): string | null {
   const turnSkipped = titleSkippedTurnIndices(turn);
   if (turnSkipped.size > 0) {
     for (const turnIndex of turnSkipped) skipped.add(turnIndex);
-    return false;
+    return null;
   }
-  return computeFirstInteractionTitle(turn) !== null;
+  return computeFirstInteractionTitle(turn);
 }
 
 /** Byte offset of the first block at or after turn_index `from`, or undefined when none exists (past the end). */

@@ -690,6 +690,26 @@ describe('viewer', () => {
     expect(html).not.toContain('Same-turn text must not become the title');
   });
 
+  it('derives a detail title when the persisted title is missing or stale', async () => {
+    const before = await testEnv.DB.prepare(
+      'SELECT first_interaction_title FROM sessions WHERE session_id = ?1',
+    ).bind(PREFIXED_TURN_TITLE_SESSION).first<{ first_interaction_title: string | null }>();
+    try {
+      for (const persisted of [null, '# AGENTS.md instructions stale title']) {
+        await testEnv.DB.prepare(
+          'UPDATE sessions SET first_interaction_title = ?2 WHERE session_id = ?1',
+        ).bind(PREFIXED_TURN_TITLE_SESSION, persisted).run();
+        const html = await (await SELF.fetch(`https://sessions.vza.net/s/${PREFIXED_TURN_TITLE_SESSION}`)).text();
+        expect(html).toContain('<title>First later turn title</title>');
+        expect(html).toContain('<h2 style="margin:0">First later turn title</h2>');
+      }
+    } finally {
+      await testEnv.DB.prepare(
+        'UPDATE sessions SET first_interaction_title = ?2 WHERE session_id = ?1',
+      ).bind(PREFIXED_TURN_TITLE_SESSION, before?.first_interaction_title ?? null).run();
+    }
+  });
+
   it('skips preserved server tool metadata without suppressing real text later in the same turn', async () => {
     const html = await (await SELF.fetch('https://sessions.vza.net/?q=servertooltitlequerysentinel')).text();
     expect(html).toContain(
