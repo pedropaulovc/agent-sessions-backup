@@ -127,7 +127,7 @@ function ledgerPanel(s: Stats): string {
     tile(l.activeHours > 0 ? fmtUsd(l.usd / l.activeHours) : '—', 'Per active hour', `${l.activeHours.toFixed(1)} h of turn-to-turn wall-clock`),
     tile(l.calls > 0 ? fmtUsd(l.usd / l.calls, 4) : '—', 'Per assistant turn', 'blended across models'),
     l.staleBreakdownCalls > 0
-      ? tile('—', 'Absorbed by cache', 'unavailable while turns are being re-priced')
+      ? tile('—', 'Absorbed by cache', 'unavailable until the next pricing pass completes')
       : tile(`${(l.cacheShare * 100).toFixed(0)}%`, 'Absorbed by cache', 'reads + writes, as a share of spend'),
   ].join('');
   const unpriced = l.unpricedCalls
@@ -185,7 +185,14 @@ function depthPanel(s: Stats): string {
 
 function classesPanel(s: Stats): string {
   const totalTok = s.classes.reduce((a, c) => a + c.tokens, 0);
-  const totalUsd = s.classes.reduce((a, c) => a + c.usd, 0);
+  // Normalised against the LEDGER total, not against the sum of the classes. Identical in the
+  // normal case — the five classes sum to `usd` exactly, by construction in costOfUsage — and
+  // honest in the abnormal one: while some turns' splits are still missing, their dollars are in
+  // the ledger and in no class, so the shares here simply do not reach 100% and the bars visibly
+  // fall short. Normalising against the class sum instead would rescale the gap away and let a
+  // class read 100.0% of a denominator that excludes the missing dollars, which is worse than the
+  // absolute figures being low: a percentage looks self-normalising, so it reads as complete.
+  const totalUsd = s.ledger.usd > 0 ? s.ledger.usd : s.classes.reduce((a, c) => a + c.usd, 0);
   const rows = s.classes
     .map((c) => {
       const tokPct = totalTok > 0 ? (c.tokens / totalTok) * 100 : 0;
@@ -230,8 +237,9 @@ function staleBreakdownNotice(s: Stats): string {
   return (
     `<p class="small flag"><b>Cost side is incomplete.</b> ${fmtInt(s.ledger.staleBreakdownCalls)} of ` +
     `${fmtInt(s.ledger.calls)} turns (${pct.toFixed(1)}%) were priced before this breakdown was stored and ` +
-    `are being re-priced; their dollars count toward the totals elsewhere on this page but not toward any ` +
-    `class here, so every cost figure in this table is a lower bound. Token counts are unaffected. ` +
+    `are awaiting re-pricing; their dollars count toward the totals elsewhere on this page but not toward any ` +
+    `class here, so every cost figure in this table is a lower bound and the cost shares do not reach ` +
+    `100%. Token counts are unaffected. ` +
     `Cache share is suppressed for the same reason.</p>`
   );
 }

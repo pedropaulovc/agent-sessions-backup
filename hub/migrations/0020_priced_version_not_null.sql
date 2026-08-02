@@ -18,4 +18,17 @@
 -- nullable column and 1,937 permanently invisible rows.
 --
 -- The rule that follows: once a migration has run ANYWHERE, correct it forward in a new file.
-UPDATE usage SET priced_version = 0 WHERE priced_version IS NULL;
+UPDATE usage
+   SET priced_version = 0
+ WHERE priced_version IS NULL;
+
+-- NOT a table rebuild, deliberately. Adding the constraint to a legacy database means SQLite's
+-- 12-step dance -- new table, copy every row, drop, rename, recreate indexes -- and this migration
+-- runs everywhere, including the database that applied 0019 correctly and already HAS the
+-- constraint. That one would copy 776k rows to arrive exactly where it started.
+--
+-- So the constraint is not enforced on a legacy database, and the gap that leaves is new rows: the
+-- ingest INSERT omitting `priced_version` would write NULL there and re-create the invisible-row
+-- problem one row at a time. That is closed at the insert instead, which writes 0 explicitly --
+-- identical to the DEFAULT where the DEFAULT exists, and load-bearing where it does not. See
+-- `insertUsage` in src/ingest/consumer.ts.

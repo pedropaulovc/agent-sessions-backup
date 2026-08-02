@@ -1900,9 +1900,18 @@ async function writeSession(
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)`,
   );
   const insertUsage = db.prepare(
+    // `priced_version` is written explicitly as 0 rather than left to the column DEFAULT. On a
+    // database that applied migration 0019 as it now stands the two are identical -- the column is
+    // NOT NULL DEFAULT 0 and this changes nothing. It matters on one that applied the earlier
+    // draft, where the column is nullable with no default: there, omitting it inserts NULL, and
+    // the pricing pass selects with `priced_version < ?`, which NULL never satisfies. Every new row
+    // would be silently invisible to pricing forever. 0020 repairs the rows that exist; this is
+    // what stops new ones being created in the same state, without making production pay for a
+    // 776k-row table rebuild to add a constraint it already has.
     `INSERT INTO usage (session_id, turn_index, ts, model, service_tier, input_tokens, output_tokens, reasoning_tokens,
-                        cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, inference_geo, request_id)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                        cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, inference_geo, request_id,
+                        priced_version)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)
      ON CONFLICT (session_id, turn_index) DO UPDATE SET
        ts = excluded.ts, model = excluded.model, service_tier = excluded.service_tier,
        input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens,

@@ -123,6 +123,50 @@ describe('mixed pricing versions', () => {
     // non-zero, confidently WRONG number rather than an obvious zero.
     expect(s.ledger.cacheShare, 'a cache share was computed from a partial breakdown').toBe(0);
   });
+
+  it('renders cost shares that fall short of 100% rather than rescaling the gap away', async () => {
+    // A percentage looks self-normalising, so it reads as complete in a way a low dollar figure
+    // does not. Normalised against the sum of the CLASSES, a single surviving class reads 100.0%
+    // of cost while half the money on the page is unattributed. Normalised against the ledger, the
+    // shares just do not reach 100% and the bars visibly fall short — the gap shows itself.
+    await seedSession('s1');
+    // THREE turns with ONE rolled back, not two with one. The notice this panel renders states the
+    // stale fraction as a percentage too, and with two turns that reads "1 of 2 turns (50.0%)" —
+    // the same string the correct cost share produces, so the assertion below matched my own notice
+    // text and passed under both denominators. At three the two numbers are 33.3% and 66.7%.
+    await seedTurn('s1', '2026-07-20T10:00:00.000Z', { input: 1_000_000 });
+    await seedTurn('s1', '2026-07-20T11:00:00.000Z', { input: 1_000_000 });
+    await seedTurn('s1', '2026-07-20T12:00:00.000Z', { input: 1_000_000 });
+    await priceUsage(testEnv.DB, { now: NOW });
+    await testEnv.DB.prepare(
+      `UPDATE usage SET priced_version = 1, usd_input = NULL, usd_output = NULL, usd_cache_read = NULL,
+                        usd_cache_write_5m = NULL, usd_cache_write_1h = NULL
+        WHERE ts = ?1`,
+    )
+      .bind('2026-07-20T12:00:00.000Z')
+      .run();
+
+    const res = await SELF.fetch('https://sessions.vza.net/stats', { headers: { 'x-dev-viewer': '1' } });
+    const html = await res.text();
+
+    // Sliced to the classes panel, because the page is full of percentages: asserting on the whole
+    // document matched values other panels happened to render and passed against BOTH denominators.
+    const start = html.indexOf('id="classes"');
+    const end = html.indexOf('id="cache"');
+    // Guarded, because the first version of this slice named a panel id that does not exist:
+    // indexOf returned -1, slice(start, -1) quietly yielded the whole rest of the document, and
+    // the test then passed against BOTH denominators while appearing to be scoped.
+    expect(start, 'classes panel missing').toBeGreaterThan(-1);
+    expect(end, 'cache panel missing — the slice would run to the end of the document').toBeGreaterThan(start);
+    const panel = html.slice(start, end);
+
+    // Three identical $1 turns, one awaiting its split. Ledger $3, stored class dollars $2 — so
+    // 66.7% against the ledger, and 100.0% against the class sum. Asserting the value the correct
+    // denominator produces, not the absence of the wrong one: 100.0% is also what the TOKEN column
+    // legitimately reads here.
+    expect(panel, 'cost shares were normalised against the classes, hiding the unattributed third').toContain('66.7%');
+    expect(panel).toContain('awaiting re-pricing');
+  });
 });
 
 describe('range windows', () => {
