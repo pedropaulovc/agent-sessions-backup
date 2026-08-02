@@ -1545,6 +1545,144 @@ describe('hub.d1.write_cost telemetry', () => {
     expect(cost!.batches).toBe(3);
     expect(cost!.rows_written as number).toBe(cost!.rows_written_clear as number);
   });
+
+describe('OMP ingest end-to-end', () => {
+  const OMP_ID = '019f0000-0000-7000-8000-0000000000aa';
+  const OMP_PATH = `-home-tester-src-demo/2026-07-19T10-00-00-000Z_${OMP_ID}.jsonl`;
+  const OMP_CHILD_PATH = `-home-tester-src-demo/2026-07-19T10-00-00-000Z_${OMP_ID}/agent/child.jsonl`;
+  const OMP_CONTENT = [
+    { type: 'title', v: 1, title: 'OMP slot title', updatedAt: '2026-07-19T10:00:00.000Z', pad: '' },
+    { type: 'session', version: 3, id: OMP_ID, timestamp: '2026-07-19T10:00:00.000Z', cwd: '/home/tester/src/omp', title: 'OMP header title' },
+    { type: 'model_change', id: 'm1', parentId: null, timestamp: '2026-07-19T10:00:01.000Z', model: 'openai/gpt-test' },
+    {
+      type: 'message',
+      id: 'u1',
+      parentId: 'm1',
+      timestamp: '2026-07-19T10:00:02.000Z',
+      message: { role: 'user', content: [{ type: 'text', text: 'ompneedle user request' }], timestamp: 1_752_924_002_000 },
+    },
+    {
+      type: 'message',
+      id: 'a1',
+      parentId: 'u1',
+      timestamp: '2026-07-19T10:00:03.000Z',
+      message: {
+        role: 'assistant',
+        model: 'openai/gpt-test',
+        content: [
+          { type: 'thinking', thinking: 'private reasoning' },
+          { type: 'text', text: 'I will inspect the OMP session.' },
+          { type: 'toolCall', id: 'tc1', name: 'read', arguments: { path: 'notes.txt' } },
+        ],
+        usage: { input: 11, output: 22, cacheRead: 3, cacheWrite: 4 },
+        stopReason: 'toolUse',
+        timestamp: 1_752_924_003_000,
+      },
+    },
+    {
+      type: 'message',
+      id: 'r1',
+      parentId: 'a1',
+      timestamp: '2026-07-19T10:00:04.000Z',
+      message: {
+        role: 'toolResult',
+        toolCallId: 'tc1',
+        toolName: 'read',
+        content: [{ type: 'text', text: 'ompneedle tool output' }],
+        isError: false,
+        timestamp: 1_752_924_004_000,
+      },
+    },
+    {
+      type: 'message',
+      id: 'a2',
+      parentId: 'r1',
+      timestamp: '2026-07-19T10:00:05.000Z',
+      message: {
+        role: 'assistant',
+        model: 'openai/gpt-test',
+        content: [{ type: 'text', text: 'The OMP session is indexed.' }],
+        usage: { input: 12, output: 8 },
+        stopReason: 'stop',
+        timestamp: 1_752_924_005_000,
+      },
+    },
+  ]
+    .map((record) => JSON.stringify(record))
+    .join('\n');
+
+  beforeAll(async () => {
+    const res = await putFile('omp-box', 'omp', OMP_PATH, OMP_CONTENT);
+    expect(res.status).toBe(201);
+    await drainQueue();
+    const childContent = [
+      { type: 'session', version: 3, id: 'child-header-id', timestamp: '2026-07-19T10:01:00.000Z', cwd: '/home/tester/src/omp' },
+      {
+        type: 'message',
+        id: 'child-user',
+        parentId: null,
+        timestamp: '2026-07-19T10:01:01.000Z',
+        message: { role: 'user', content: [{ type: 'text', text: 'child OMP task' }] },
+      },
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n');
+    const child = await putFile('omp-box', 'omp', OMP_CHILD_PATH, childContent);
+    expect(child.status).toBe(201);
+    await drainQueue();
+  });
+
+  it('indexes OMP metadata, usage, tool output, and searchable text', async () => {
+    const row = await testEnv.DB.prepare(
+      'SELECT harness, cwd, title, primary_model, index_state, tokens_in, tokens_out, tokens_cached FROM sessions WHERE session_id = ?1',
+    )
+      .bind(OMP_ID)
+      .first<{ harness: string; cwd: string; title: string; primary_model: string; index_state: string; tokens_in: number; tokens_out: number; tokens_cached: number }>();
+    expect(row).toMatchObject({
+      harness: 'omp',
+      cwd: '/home/tester/src/omp',
+      title: 'OMP slot title',
+      primary_model: 'openai/gpt-test',
+      index_state: 'ready',
+    });
+    expect(Number(row?.tokens_in)).toBe(23);
+    expect(Number(row?.tokens_out)).toBe(30);
+    expect(Number(row?.tokens_cached)).toBe(3);
+
+    const blocks = await testEnv.DB.prepare(
+      'SELECT btype, role, tool_name, text FROM blocks WHERE session_id = ?1 ORDER BY turn_index, block_index',
+    )
+      .bind(OMP_ID)
+      .all<{ btype: string; role: string; tool_name: string | null; text: string | null }>();
+    expect(blocks.results.map((block) => block.btype)).toEqual(['text', 'thinking', 'text', 'tool_use', 'tool_result', 'text']);
+    expect(blocks.results.find((block) => block.btype === 'tool_result')).toMatchObject({
+      role: 'tool',
+      tool_name: null,
+      text: 'ompneedle tool output',
+    });
+
+    const search = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=ompneedle', {
+      headers: { 'x-dev-machine': 'omp-box' },
+    });
+    expect(search.status).toBe(200);
+    expect(((await search.json()) as { hits: Array<{ session_id: string }> }).hits.some((hit) => hit.session_id === OMP_ID)).toBe(true);
+  });
+
+  it('links nested OMP sidecars to their parent session', async () => {
+    const childId = `omp:${OMP_ID}:agent/child.jsonl`;
+    const row = await testEnv.DB.prepare(
+      'SELECT harness, parent_session_id, is_sidechain, index_state FROM sessions WHERE session_id = ?1',
+    )
+      .bind(childId)
+      .first<{ harness: string; parent_session_id: string; is_sidechain: number; index_state: string }>();
+    expect(row).toMatchObject({
+      harness: 'omp',
+      parent_session_id: OMP_ID,
+      is_sidechain: 1,
+      index_state: 'ready',
+    });
+  });
+});
 });
 
 /** The pricing reset on re-parse, exercised through the REAL ingest path.

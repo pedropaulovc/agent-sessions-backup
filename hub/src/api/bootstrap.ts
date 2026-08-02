@@ -24,7 +24,7 @@ export const DEFAULT_COLLECTOR_CONFIG = {
   // of store name -> filesystem root, and bootstrap is merged over that local config. Absent toggle =>
   // collector uses its own default (on). These keys MUST be the collector's actual store names, or a
   // fleet override silently no-ops. Source of truth:
-  // collector/src/agent_collector/config.py — DEFAULT_STORES ('claude', 'codex') + WEBCAPTURE_STORES
+  // collector/src/agent_collector/config.py — DEFAULT_STORES ('claude', 'codex', 'omp') + WEBCAPTURE_STORES
   // ('chatgpt-web', 'claude-web', 'export-inbox'). Note the local Claude Code store key is 'claude'
   // (the harness dir ~/.claude), NOT 'claude-code'. fleet-endpoints.test.ts asserts this ⊆ that set.
   store_toggles: {
@@ -33,6 +33,7 @@ export const DEFAULT_COLLECTOR_CONFIG = {
     'chatgpt-web': true,
     'claude-web': true,
     'export-inbox': true,
+    omp: true,
   },
   redact_env: true,
 } as const;

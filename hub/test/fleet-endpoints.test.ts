@@ -116,6 +116,7 @@ describe('GET /api/v1/bootstrap', () => {
     expect(cfg.scan_interval_seconds).toBe(DEFAULT_COLLECTOR_CONFIG.scan_interval_seconds);
     expect(cfg.max_upload_bytes).toBe(DEFAULT_COLLECTOR_CONFIG.max_upload_bytes);
     expect((cfg.store_toggles as Record<string, boolean>)['claude']).toBe(true); // collector's local Claude Code store key
+    expect((cfg.store_toggles as Record<string, boolean>)['omp']).toBe(true);
     expect(cfg.stores).toBeUndefined(); // never overwrite collector Config.stores filesystem roots
   });
 
@@ -158,9 +159,9 @@ describe('GET /api/v1/bootstrap', () => {
     // central capture control, so the keys MUST be the collector's actual store names. The local Claude
     // Code store is keyed 'claude' (the ~/.claude dir), NOT the harness name 'claude-code'. Cross-language
     // (hub is TS, collector is Python), so mirror the set with a pointer instead of a shared import.
-    // Source of truth: collector/src/agent_collector/config.py — DEFAULT_STORES {'claude','codex'} +
+    // Source of truth: collector/src/agent_collector/config.py — DEFAULT_STORES {'claude','codex','omp'} +
     // WEBCAPTURE_STORES ('chatgpt-web','claude-web','export-inbox').
-    const COLLECTOR_STORES = new Set(['claude', 'codex', 'chatgpt-web', 'claude-web', 'export-inbox']);
+    const COLLECTOR_STORES = new Set(['claude', 'codex', 'omp', 'chatgpt-web', 'claude-web', 'export-inbox']);
     for (const key of Object.keys(DEFAULT_COLLECTOR_CONFIG.store_toggles)) {
       expect(COLLECTOR_STORES.has(key)).toBe(true);
     }

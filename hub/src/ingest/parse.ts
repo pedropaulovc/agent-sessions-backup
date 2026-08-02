@@ -5,7 +5,7 @@ import { parseClaudeCode } from './parsers/claude-code';
 import { parseClaudeWeb } from './parsers/claude-web';
 import { parseCodex } from './parsers/codex';
 import { parsePromptLog } from './parsers/history';
-
+import { parseOmp } from './parsers/omp';
 /**
  * Harnesses whose raw object holds exactly ONE session and therefore flow through the standard
  * canonical/dedupe machinery. Export ZIPs are excluded — one archive fans out to many sessions and
@@ -17,6 +17,7 @@ export const SINGLE_SESSION_HARNESSES: ReadonlySet<Harness> = new Set<Harness>([
   'chatgpt-web',
   'claude-web',
   'prompt-log',
+  'omp',
 ]);
 
 /** Web-capture conversations are one JSON document (no line structure) — read whole, never windowed. */
@@ -35,5 +36,6 @@ export async function parseObject(
   const lines = readJsonlLines(obj.body);
   if (harness === 'codex') return parseCodex(lines, sessionId);
   if (harness === 'prompt-log') return parsePromptLog(lines, sessionId);
+  if (harness === 'omp') return parseOmp(lines, sessionId);
   return parseClaudeCode(lines, sessionId);
 }

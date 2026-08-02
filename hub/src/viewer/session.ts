@@ -5,6 +5,7 @@ import { parseChatgptWeb } from '../ingest/parsers/chatgpt-web';
 import { parseClaudeCode } from '../ingest/parsers/claude-code';
 import { parseClaudeWeb } from '../ingest/parsers/claude-web';
 import { parseCodex } from '../ingest/parsers/codex';
+import { parseOmp } from '../ingest/parsers/omp';
 import { parseConversationById } from '../ingest/parsers/export-inbox';
 import { parsePromptLog } from '../ingest/parsers/history';
 import { sessionDisplayTitle } from '../session-title';
@@ -243,6 +244,15 @@ async function parseRange(
     // per-conversation byte offsets still line up with windowTurns.
     const full = parseConversationById(new Uint8Array(await obj.arrayBuffer()), sessionId);
     return full ? windowTurns(full, startByte, endByte) : null;
+  }
+  if (harness === 'omp') {
+    // OMP is JSONL, but it cannot be parsed from a page-sized slice: parseOmp needs the title slot,
+    // session header, complete parent map, and final leaf to classify the active branch. Read the
+    // complete object, then windowTurns limits the rendered output to this page.
+    const obj = await env.RAW.get(file.r2_key);
+    if (!obj) return null;
+    const full = await parseOmp(readJsonlLines(obj.body), sessionId);
+    return windowTurns(full, startByte, endByte);
   }
   if (isWebHarness(harness)) {
     const obj = await env.RAW.get(file.r2_key);

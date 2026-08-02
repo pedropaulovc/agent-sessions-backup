@@ -97,9 +97,11 @@ function extractMediaAt(envelope: Record<string, unknown>, blockIndex: number): 
     if (out === blockIndex) {
       if (raw.type !== 'image' && raw.type !== 'document') return null;
       const source = isObj(raw.source) ? raw.source : undefined;
-      const data = str(source?.data);
-      if (!data) return null;
-      return { data, mediaType: str(source?.media_type) ?? '' };
+      const data = str(source?.data) ?? str(raw.data);
+      const mediaType =
+        str(source?.media_type) ?? str(raw.mimeType) ?? str(raw.mediaType) ?? str(raw.media_type);
+      if (!data || !mediaType) return null;
+      return { data, mediaType };
     }
     out++;
   }

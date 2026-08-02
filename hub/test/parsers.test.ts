@@ -1,8 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { MAX_JSONL_LINE_BYTES, readJsonlLines, type JsonlLine } from '../src/ingest/jsonl';
 import { parseClaudeCode } from '../src/ingest/parsers/claude-code';
+import { parseOmp } from '../src/ingest/parsers/omp';
 import { parseCodex } from '../src/ingest/parsers/codex';
 import { parsePromptLog } from '../src/ingest/parsers/history';
+import { detect } from '../src/ingest/detect';
 import {
   CC_SESSION_ID,
   CODEX_SESSION_ID,
@@ -181,6 +183,121 @@ describe('parsePromptLog', () => {
       'prompt-offset:0',
       `prompt-offset:${records[0]!.length + 1}`,
     ]);
+  });
+});
+
+describe('parseOmp', () => {
+  const sessionId = '019f0000-0000-7000-8000-0000000000ab';
+
+  it('parses the title slot, messages, tool results, usage, and malformed records', async () => {
+    const records = [
+      JSON.stringify({ type: 'title', v: 1, title: 'OMP slot title', updatedAt: '2026-07-19T10:00:00.000Z', pad: '' }),
+      JSON.stringify({ type: 'session', version: 3, id: sessionId, timestamp: '2026-07-19T10:00:00.000Z', cwd: '/home/tester/src/omp', title: 'header title' }),
+      JSON.stringify({ type: 'model_change', id: 'm1', parentId: null, timestamp: '2026-07-19T10:00:01.000Z', model: 'openai/gpt-test' }),
+      JSON.stringify({
+        type: 'message',
+        id: 'u1',
+        parentId: 'm1',
+        timestamp: '2026-07-19T10:00:02.000Z',
+        message: { role: 'user', content: [{ type: 'text', text: 'omp parser question' }] },
+      }),
+      JSON.stringify({
+        type: 'message',
+        id: 'a1',
+        parentId: 'u1',
+        timestamp: '2026-07-19T10:00:03.000Z',
+        message: {
+          role: 'assistant',
+          model: 'openai/gpt-test',
+          content: [
+            { type: 'thinking', thinking: 'private' },
+            { type: 'text', text: 'I will inspect it.' },
+            { type: 'toolCall', id: 'tc1', name: 'read', arguments: { path: 'notes.txt' } },
+          ],
+          usage: { input: 11, output: 22, cacheRead: 3, cacheWrite: 4 },
+        },
+      }),
+      JSON.stringify({
+        type: 'message',
+        id: 'r1',
+        parentId: 'a1',
+        timestamp: '2026-07-19T10:00:04.000Z',
+        message: { role: 'toolResult', toolCallId: 'tc1', content: [{ type: 'text', text: 'tool output' }], isError: false },
+      }),
+      JSON.stringify({
+        type: 'message',
+        id: 'a-bad-usage',
+        parentId: 'r1',
+        timestamp: '2026-07-19T10:00:05.000Z',
+        message: { role: 'assistant', model: 'openai/gpt-test', usage: { unrecognized: 1 } },
+      }),
+      'not-json',
+    ];
+    const session = await parseOmp(readJsonlLines(toStream(records)), sessionId);
+
+    expect(session).toMatchObject({
+      id: sessionId,
+      harness: 'omp',
+      cwd: '/home/tester/src/omp',
+      title: 'OMP slot title',
+      primaryModel: 'openai/gpt-test',
+    });
+    expect(session.turns.map((turn) => turn.role)).toEqual(['user', 'assistant', 'tool']);
+    expect(session.turns[1]!.usage).toMatchObject({ inputTokens: 11, outputTokens: 22, cacheReadTokens: 3, cacheCreation5mTokens: 4 });
+    expect(session.turns[1]!.blocks.map((block) => block.type)).toEqual(['thinking', 'text', 'tool_use']);
+    expect(session.turns[2]!.blocks[0]).toMatchObject({ type: 'tool_result', text: 'tool output', toolUseId: 'tc1' });
+    expect(session.stats.parseErrorLines).toBe(1);
+    expect(session.turns).toHaveLength(3);
+  });
+
+  it('fails open main-path classification after an oversized line', async () => {
+    const oversized: JsonlLine = { kind: 'oversized', byteStart: 0, byteLen: MAX_JSONL_LINE_BYTES + 1 };
+    const header = JSON.stringify({ type: 'session', version: 3, id: sessionId, timestamp: '2026-07-19T10:00:00.000Z', cwd: '/tmp/omp' });
+    const message = JSON.stringify({
+      type: 'message',
+      id: 'u1',
+      parentId: null,
+      timestamp: '2026-07-19T10:00:01.000Z',
+      message: { role: 'user', content: 'after oversized' },
+    });
+    async function* lines(): AsyncGenerator<JsonlLine> {
+      yield oversized;
+      yield { kind: 'decoded', text: header, byteStart: oversized.byteLen, byteLen: header.length + 1 };
+      yield { kind: 'decoded', text: message, byteStart: oversized.byteLen + header.length + 1, byteLen: message.length + 1 };
+    }
+    const session = await parseOmp(lines(), sessionId);
+
+    expect(session.stats.skippedLineTypes['oversized-line']).toBe(1);
+    expect(session.turns).toHaveLength(1);
+    expect(session.turns[0]!.onMainPath).toBe(true);
+  });
+
+  it('prunes abandoned branches on a clean parent chain', async () => {
+    const records = [
+      JSON.stringify({ type: 'session', version: 3, id: sessionId, timestamp: '2026-07-19T10:00:00.000Z', cwd: '/tmp/omp' }),
+      JSON.stringify({ type: 'message', id: 'u-root', parentId: null, timestamp: '2026-07-19T10:00:01.000Z', message: { role: 'user', content: 'root' } }),
+      JSON.stringify({ type: 'message', id: 'a-abandoned', parentId: 'u-root', timestamp: '2026-07-19T10:00:02.000Z', message: { role: 'assistant', content: 'abandoned' } }),
+      JSON.stringify({ type: 'message', id: 'u-active', parentId: 'u-root', timestamp: '2026-07-19T10:00:03.000Z', message: { role: 'user', content: 'active' } }),
+      JSON.stringify({ type: 'message', id: 'a-active', parentId: 'u-active', timestamp: '2026-07-19T10:00:04.000Z', message: { role: 'assistant', content: 'active answer' } }),
+    ];
+    const session = await parseOmp(readJsonlLines(toStream(records)), sessionId);
+
+    expect(session.turns.find((turn) => turn.id === 'a-abandoned')?.onMainPath).toBe(false);
+    expect(session.turns.filter((turn) => turn.id !== 'a-abandoned').every((turn) => turn.onMainPath)).toBe(true);
+  });
+
+  it('detects main sessions and nested sidecars', () => {
+    expect(detect('omp', 'project/2026-07-19T10-00-00-000Z_main123.jsonl')).toMatchObject({
+      harness: 'omp',
+      sessionId: 'main123',
+      kind: 'session',
+    });
+    expect(detect('omp', 'project/2026-07-19T10-00-00-000Z_main123/agent/foo.jsonl')).toMatchObject({
+      harness: 'omp',
+      sessionId: 'omp:main123:agent/foo.jsonl',
+      parentSessionId: 'main123',
+      kind: 'subagent',
+    });
   });
 });
 

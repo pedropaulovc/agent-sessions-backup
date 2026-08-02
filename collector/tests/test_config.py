@@ -30,6 +30,15 @@ def test_machine_id_default(monkeypatch):
     assert config.default_machine_id() == "boxname-linux"
 
 
+def test_default_config_exposes_omp_store():
+    cfg = config.Config(machine_id="m", hub_url="http://h")
+    assert cfg.stores == {
+        "claude": "~/.claude",
+        "codex": "~/.codex",
+        "omp": "~/.omp/agent/sessions",
+    }
+
+
 def test_enroll_and_load_roundtrip(tmp_path):
     path = tmp_path / "config.toml"
     cfg = config.enroll("http://localhost:8787/", dev=True, path=path, machine_id="m1")
@@ -244,6 +253,24 @@ def test_store_roots_always_includes_webcapture_stores(tmp_path):
     assert str(custom.store_roots()["export-inbox"]) == "/custom/inbox"
 
 
+def test_store_roots_injects_omp_for_persisted_config_and_preserves_custom_root(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+
+    persisted = config.Config(
+        machine_id="m",
+        hub_url="http://h",
+        stores={"claude": "~/.claude"},
+        source=tmp_path / "config.toml",
+    )
+    assert persisted.store_roots()["omp"] == home / ".omp" / "agent" / "sessions"
+
+    custom = config.Config(machine_id="m", hub_url="http://h", stores={"omp": "/custom/omp"})
+    assert custom.store_roots()["omp"] == Path("/custom/omp")
+
+
 def test_hermetic_by_construction_never_resolves_real_data_dir(tmp_path, monkeypatch):
     """Positive control for the isolate_xdg_data_home autouse fixture (conftest.py). Plants a
     decoy in a stand-in for this box's real ~/.local/share/agent-collector/webcapture/ (a
@@ -326,6 +353,39 @@ def test_wsl_drops_windows_mount_roots(monkeypatch):
     roots = cfg.store_roots()
     assert "win" not in roots and "claude" in roots
     assert set(cfg.dropped_store_roots()) == {"win"}
+
+
+def test_wsl_drops_injected_omp_root_for_persisted_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "detect_platform_tag", lambda: "wsl")
+    monkeypatch.setenv("HOME", "/mnt/c/Users/legacy")
+    cfg = config.Config(
+        machine_id="m",
+        hub_url="http://h",
+        stores={"claude": "~/.claude"},
+        source=tmp_path / "config.toml",
+    )
+
+    roots = cfg.store_roots()
+    dropped = cfg.dropped_store_roots()
+    assert "omp" not in roots
+    assert dropped["omp"] == Path("/mnt/c/Users/legacy/.omp/agent/sessions")
+
+
+def test_wsl_drops_windows_staging_roots(monkeypatch):
+    monkeypatch.setattr(config, "detect_platform_tag", lambda: "wsl")
+    staging = Path("/mnt/c/Users/legacy/.local/share/agent-collector")
+    cfg = config.Config(
+        machine_id="m",
+        hub_url="http://h",
+        stores={"claude": "/home/safe/.claude"},
+        staging_base=str(staging),
+    )
+
+    roots = cfg.store_roots()
+    dropped = cfg.dropped_store_roots()
+    assert all(name not in roots for name in config.WEBCAPTURE_STORES)
+    assert all(name in dropped for name in config.WEBCAPTURE_STORES)
+    assert dropped["export-inbox"] == staging / "export-inbox"
 
 
 def test_wsl_include_windows_mounts_true_keeps_them(monkeypatch):

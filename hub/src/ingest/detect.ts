@@ -3,12 +3,16 @@ import type { Harness } from './normalize';
 export interface Detection {
   harness: Harness;
   sessionId?: string;
-  /** For Claude Code subagent transcripts: parent session UUID from the path. */
+  /** Parent session id for nested OMP/Claude Code transcripts. */
   parentSessionId?: string;
   kind: 'session' | 'subagent' | 'subagent-meta' | 'prompt-log' | 'export-archive' | 'other';
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// OMP uses file-safe ISO timestamps, e.g. 2026-02-16T10-20-30-000Z_<id>.jsonl.
+// Keep this deliberately broad after the year/month/day prefix for older timestamp spellings.
+const OMP_MAIN_FILE_RE = /^\d{4}[-_]\d{2}[-_]\d{2}[^/]*_([^_]+)\.jsonl$/;
+const OMP_MAIN_DIR_RE = /^\d{4}[-_]\d{2}[-_]\d{2}[^/]*_([^_]+)$/;
 
 /**
  * Map (store, relpath) → harness/session identity. Unknown shapes are stored but not parsed.
@@ -23,8 +27,6 @@ export function detect(store: string, relpath: string, machineId?: string): Dete
   const base = parts[parts.length - 1] ?? '';
 
   if (store === 'export-inbox') {
-    // A whole export ZIP is an archive of MANY conversations, not one session — parsed hub-side
-    // into per-conversation sessions (see consumer.ts). Session id is assigned per conversation.
     if (base.endsWith('.zip')) return { harness: 'unknown', kind: 'export-archive' };
     return { harness: 'unknown', kind: 'other' };
   }
@@ -43,9 +45,7 @@ export function detect(store: string, relpath: string, machineId?: string): Dete
           kind: 'subagent',
         };
       }
-      if (UUID_RE.test(stem)) {
-        return { harness: 'claude-code', sessionId: stem, kind: 'session' };
-      }
+      if (UUID_RE.test(stem)) return { harness: 'claude-code', sessionId: stem, kind: 'session' };
     }
     if (base.endsWith('.meta.json') && parts.includes('subagents')) {
       return { harness: 'claude-code', kind: 'subagent-meta' };
@@ -62,6 +62,8 @@ export function detect(store: string, relpath: string, machineId?: string): Dete
     return { harness: 'unknown', kind: 'other' };
   }
 
+  if (store === 'omp' && base.endsWith('.jsonl')) return detectOmp(parts);
+
   if (store === 'chatgpt-web' && base.endsWith('.json')) {
     return { harness: 'chatgpt-web', sessionId: base.slice(0, -'.json'.length), kind: 'session' };
   }
@@ -70,6 +72,33 @@ export function detect(store: string, relpath: string, machineId?: string): Dete
   }
 
   return { harness: 'unknown', kind: 'other' };
+}
+
+function detectOmp(parts: string[]): Detection {
+  const base = parts[parts.length - 1] ?? '';
+  // A nested sidecar is below the main session's artifacts directory. OMP derives that directory
+  // by stripping `.jsonl` from the main filename, so accept both directory and literal-file forms.
+  for (let i = parts.length - 2; i >= 0; i--) {
+    const containing = parts[i];
+    const match = containing?.match(OMP_MAIN_FILE_RE) ?? containing?.match(OMP_MAIN_DIR_RE);
+    if (!match) continue;
+    const parentSessionId = match[1]!;
+    const relativePath = parts.slice(i + 1).join('/');
+    return {
+      harness: 'omp',
+      sessionId: `omp:${parentSessionId}:${relativePath}`,
+      parentSessionId,
+      kind: 'subagent',
+    };
+  }
+
+  const match = base.match(OMP_MAIN_FILE_RE);
+  if (match) return { harness: 'omp', sessionId: match[1]!, kind: 'session' };
+
+  // OMP's store is intentionally capture-all: a top-level JSONL whose filename predates the
+  // timestamp convention still gets an identity and is parsed/validated by the hub.
+  const stem = base.slice(0, -'.jsonl'.length);
+  return { harness: 'omp', sessionId: stem, kind: 'session' };
 }
 
 /**

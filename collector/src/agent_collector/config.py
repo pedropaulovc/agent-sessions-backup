@@ -54,6 +54,7 @@ DEFAULT_EXCLUDES: list[str] = [
 DEFAULT_STORES: dict[str, str] = {
     "claude": "~/.claude",
     "codex": "~/.codex",
+    "omp": "~/.omp/agent/sessions",
 }
 
 # Staging stores the webcapture host writes into (CDP JSON) or an operator drops export ZIPs
@@ -228,18 +229,24 @@ class Config:
                     "client_cert_path and client_key_path (POSIX). Run infra/cf/enroll-cert.py."
                 )
 
+    def _effective_stores(self) -> dict[str, str]:
+        """Return the store map after applying all built-in roots and staging stores."""
+        stores = dict(self.stores)
+        # Persisted configs from before OMP support need this upgrade path. Direct Config instances
+        # with an explicit custom store map retain their existing scope; fresh defaults already carry
+        # omp in DEFAULT_STORES.
+        if self.source is not None:
+            stores.setdefault("omp", DEFAULT_STORES["omp"])
+        base = Path(self.staging_base).expanduser() if self.staging_base else webcapture_dir()
+        for name in WEBCAPTURE_STORES:
+            stores.setdefault(name, str(base / name))
+        return stores
+
     def store_roots(self) -> dict[str, Path]:
         """Resolved roots to actually scan. Under WSL with include_windows_mounts=false,
         roots resolving under /mnt/<drive>/ are dropped so a WSL install never captures the
         Windows side as the WSL machine (see dropped_store_roots for what was skipped)."""
-        stores = dict(self.stores)
-        # Always expose the webcapture staging stores (setdefault: a custom configured root wins).
-        # This is the load-layer fix for the "registered only at enroll/webcapture" hole: an
-        # already-enrolled collector that upgrades and drops an export ZIP, or a webcapture host, is
-        # scanned without a re-enroll. Missing dirs are simply skipped by run/scanner (root.exists()).
-        base = Path(self.staging_base).expanduser() if self.staging_base else webcapture_dir()
-        for name in WEBCAPTURE_STORES:
-            stores.setdefault(name, str(base / name))
+        stores = self._effective_stores()
         roots = {name: Path(root).expanduser() for name, root in stores.items()}
         if not self._drop_windows_mounts():
             return roots
@@ -249,9 +256,10 @@ class Config:
         """Roots excluded by the WSL windows-mount guard, so callers can surface a warning."""
         if not self._drop_windows_mounts():
             return {}
+        stores = self._effective_stores()
         return {
             n: p
-            for n, r in self.stores.items()
+            for n, r in stores.items()
             if _root_is_windows_mount(p := Path(r).expanduser())
         }
 
