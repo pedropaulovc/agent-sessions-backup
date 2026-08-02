@@ -1900,9 +1900,18 @@ async function writeSession(
      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)`,
   );
   const insertUsage = db.prepare(
+    // `priced_version` is written explicitly as 0 rather than left to the column DEFAULT. On a
+    // database that applied migration 0019 as it now stands the two are identical -- the column is
+    // NOT NULL DEFAULT 0 and this changes nothing. It matters on one that applied the earlier
+    // draft, where the column is nullable with no default: there, omitting it inserts NULL, and
+    // the pricing pass selects with `priced_version < ?`, which NULL never satisfies. Every new row
+    // would be silently invisible to pricing forever. 0020 repairs the rows that exist; this is
+    // what stops new ones being created in the same state, without making production pay for a
+    // 776k-row table rebuild to add a constraint it already has.
     `INSERT INTO usage (session_id, turn_index, ts, model, service_tier, input_tokens, output_tokens, reasoning_tokens,
-                        cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, inference_geo, request_id)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                        cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, inference_geo, request_id,
+                        priced_version)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)
      ON CONFLICT (session_id, turn_index) DO UPDATE SET
        ts = excluded.ts, model = excluded.model, service_tier = excluded.service_tier,
        input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens,
@@ -1910,7 +1919,18 @@ async function writeSession(
        cache_creation_5m_tokens = excluded.cache_creation_5m_tokens,
        cache_creation_1h_tokens = excluded.cache_creation_1h_tokens,
        cache_read_tokens = excluded.cache_read_tokens, inference_geo = excluded.inference_geo,
-       request_id = excluded.request_id`,
+       request_id = excluded.request_id,
+       -- A re-parse that CHANGED this turn invalidates its stored cost, and nothing else would
+       -- notice. The row is already at the current pricing version, so the pass -- which selects
+       -- on priced_version being BELOW the current one -- would skip it forever and it would keep
+       -- serving the cost of the token counts it used to have. Wrong money, permanently, no symptom.
+       --
+       -- The costs are cleared rather than left in place because a stale cost is worse than a
+       -- missing one: NULL reads as unpriced and is flagged as such on the page, whereas the old
+       -- number is indistinguishable from a current one. The end-of-batch pricing pass re-prices it
+       -- moments later in the same invocation.
+       priced_version = 0, priced_at = NULL, usd = NULL, usd_input = NULL, usd_output = NULL,
+       usd_cache_read = NULL, usd_cache_write_5m = NULL, usd_cache_write_1h = NULL`,
   );
 
   // Only the divergent tail is written. Token totals still come from EVERY turn — they land on the

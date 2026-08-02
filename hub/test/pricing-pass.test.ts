@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { priceUsage } from '../src/pricing-pass';
+import { priceUsage, PRICING_VERSION } from '../src/pricing-pass';
 import { priceUsageSlice, PRICE_ROWS_PER_INVOCATION, setPriceRowsPerInvocation } from '../src/api/ops';
 import type { Identity } from '../src/auth/identity';
 
@@ -54,8 +54,21 @@ async function seedTurn(
   return res!.id;
 }
 
-async function priced(id: number): Promise<{ usd: number | null; price_epoch: string | null; priced_at: string | null }> {
-  return (await testEnv.DB.prepare('SELECT usd, price_epoch, priced_at FROM usage WHERE id = ?1')
+async function priced(id: number): Promise<{
+  usd: number | null;
+  price_epoch: string | null;
+  priced_at: string | null;
+  priced_version: number | null;
+  usd_input: number | null;
+  usd_output: number | null;
+  usd_cache_read: number | null;
+  usd_cache_write_5m: number | null;
+  usd_cache_write_1h: number | null;
+}> {
+  return (await testEnv.DB.prepare(
+    `SELECT usd, price_epoch, priced_at, priced_version, usd_input, usd_output, usd_cache_read,
+            usd_cache_write_5m, usd_cache_write_1h FROM usage WHERE id = ?1`,
+  )
     .bind(id)
     .first())! as never;
 }
@@ -81,6 +94,90 @@ describe('priceUsage', () => {
     // 2M input at $1/M + 0.5M output at $10/M.
     expect((await priced(id)).usd).toBeCloseTo(2 + 5, 9);
     expect(res).toMatchObject({ examined: 1, priced: 1, unpriceable: 0, more: false });
+  });
+
+  it('stores a per-class breakdown that sums to usd exactly', async () => {
+    // The breakdown is not a second opinion about the cost — costOfUsage computes `usd` AS the sum
+    // of these terms, so storing both is one number and its decomposition. If they can disagree,
+    // the ledger's cache share (derived from the classes) stops reconciling with the total shown
+    // beside it, and neither figure is obviously the wrong one.
+    await seedPrice();
+    const id = await seedTurn('s1', { input: 2_000_000, output: 500_000 });
+
+    await priceUsage(testEnv.DB, { now: NOW });
+    const r = await priced(id);
+
+    expect(r.usd_input).toBeCloseTo(2, 9);
+    expect(r.usd_output).toBeCloseTo(5, 9);
+    const parts =
+      (r.usd_input ?? 0) + (r.usd_output ?? 0) + (r.usd_cache_read ?? 0) +
+      (r.usd_cache_write_5m ?? 0) + (r.usd_cache_write_1h ?? 0);
+    expect(parts, 'the class breakdown does not reconcile with the stored total').toBeCloseTo(r.usd ?? 0, 9);
+  });
+
+  it('re-prices rows left behind by an older pricing version', async () => {
+    // The whole point of the version: changing what is stored, or how it is computed, must not
+    // require NULLing a column corpus-wide to force a re-run. Every row is simply due again, and
+    // its existing cost stays readable until the pass reaches it — no window where the page is $0.
+    await seedPrice();
+    const id = await seedTurn('s1');
+    await priceUsage(testEnv.DB, { now: NOW });
+    expect((await priced(id)).priced_version).toBe(PRICING_VERSION);
+
+    // Simulate a row written by an older version, with its cost intact — which is exactly the
+    // state a real bump leaves the whole table in.
+    await testEnv.DB.prepare('UPDATE usage SET priced_version = ?1, usd_input = NULL WHERE id = ?2')
+      .bind(PRICING_VERSION - 1, id)
+      .run();
+
+    const res = await priceUsage(testEnv.DB, { now: new Date('2026-08-02T12:00:00.000Z') });
+
+    expect(res.examined, 'a row below the current version was not due').toBe(1);
+    const r = await priced(id);
+    expect(r.priced_version).toBe(PRICING_VERSION);
+    expect(r.usd_input, 'the re-price did not refill the newer columns').toBeCloseTo(1, 9);
+  });
+
+  it('leaves an unpriceable row below the current version so later runs retry it', async () => {
+    // How the retry works now that the predicate is a single range: a failed attempt does NOT
+    // advance priced_version, so the row stays due forever. Advancing it would both declare
+    // "priced by version N" about a row carrying no price AND make it invisible to every later
+    // run, exactly when a catalog gaining its model is what would fix it.
+    const id = await seedTurn('s1', { model: 'never-published' });
+
+    await priceUsage(testEnv.DB, { now: NOW });
+
+    const r = await priced(id);
+    expect(r.usd).toBeNull();
+    expect(r.priced_version, 'a failed attempt advanced the version and hid the row').toBe(0);
+    expect(r.priced_at, 'the attempt was not recorded at all').toBe(NOW.toISOString());
+  });
+
+  it('re-prices a turn whose tokens changed under a re-parse', async () => {
+    // The upsert path. A re-parse that CHANGES a turn updates its tokens but the row is already at
+    // the current pricing version, so the pass -- which selects on being below it -- would skip the
+    // row forever and it would keep serving the cost of the token counts it used to have. Wrong
+    // money, permanently, with no symptom: nothing on the page distinguishes a stale cost from a
+    // current one. The conflict branch of the ingest INSERT clears the pricing state; this asserts
+    // the pass then picks the row up and lands on the NEW number.
+    await seedPrice();
+    const id = await seedTurn('s1', { input: 1_000_000 });
+    await priceUsage(testEnv.DB, { now: NOW });
+    expect((await priced(id)).usd).toBeCloseTo(1, 9);
+
+    // Exactly what the ON CONFLICT branch does: new tokens, pricing state cleared.
+    await testEnv.DB.prepare(
+      `UPDATE usage SET input_tokens = 5000000, priced_version = 0, priced_at = NULL, usd = NULL,
+                        usd_input = NULL, usd_output = NULL, usd_cache_read = NULL,
+                        usd_cache_write_5m = NULL, usd_cache_write_1h = NULL
+        WHERE id = ?1`,
+    )
+      .bind(id)
+      .run();
+
+    await priceUsage(testEnv.DB, { now: new Date('2026-08-02T12:00:00.000Z') });
+
+    expect((await priced(id)).usd, 'the re-parsed turn kept the cost of its old token counts').toBeCloseTo(5, 9);
   });
 
   it('records which rate snapshot it used, and prices a turn at the rate in force THEN', async () => {
