@@ -103,6 +103,29 @@ def test_scan_includes_and_excludes_with_nested_subagents(tmp_path):
     assert "shell-snapshots/snap.sh" not in found
 
 
+def test_scan_default_omp_root_from_temp_home(tmp_env):
+    root = tmp_env / "home" / ".omp" / "agent" / "sessions"
+    nested = root / "project" / "subagents"
+    nested.mkdir(parents=True)
+    session = nested / "human-readable-sidecar.jsonl"
+    session.write_text('{"type":"session"}\n')
+
+    cfg = config.Config(machine_id="m", hub_url="http://h")
+    with Scanner(cfg.effective_excludes()) as scanner:
+        items = [
+            item
+            for store, store_root in cfg.store_roots().items()
+            for item in scanner.scan_store(store, store_root)
+            if store == "omp"
+        ]
+
+    assert len(items) == 1
+    assert items[0].store == "omp"
+    assert items[0].relpath == "project/subagents/human-readable-sidecar.jsonl"
+    assert items[0].source_path == session
+    assert items[0].size == session.stat().st_size
+
+
 def test_prefix_capture_on_growing_file(tmp_path):
     root = tmp_path / ".claude"
     root.mkdir()

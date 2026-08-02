@@ -54,6 +54,7 @@ DEFAULT_EXCLUDES: list[str] = [
 DEFAULT_STORES: dict[str, str] = {
     "claude": "~/.claude",
     "codex": "~/.codex",
+    "omp": "~/.omp/agent/sessions",
 }
 
 # Staging stores the webcapture host writes into (CDP JSON) or an operator drops export ZIPs
@@ -233,6 +234,11 @@ class Config:
         roots resolving under /mnt/<drive>/ are dropped so a WSL install never captures the
         Windows side as the WSL machine (see dropped_store_roots for what was skipped)."""
         stores = dict(self.stores)
+        # Persisted configs from before OMP support need this upgrade path. Direct Config instances
+        # with an explicit custom store map retain their existing scope; fresh defaults already carry
+        # omp in DEFAULT_STORES.
+        if self.source is not None:
+            stores.setdefault("omp", DEFAULT_STORES["omp"])
         # Always expose the webcapture staging stores (setdefault: a custom configured root wins).
         # This is the load-layer fix for the "registered only at enroll/webcapture" hole: an
         # already-enrolled collector that upgrades and drops an export ZIP, or a webcapture host, is

@@ -7,6 +7,7 @@ export type Harness =
   | 'claude-web'
   | 'claude-cowork'
   | 'prompt-log'
+  | 'omp'
   | 'unknown';
 
 export type Role = 'user' | 'assistant' | 'system' | 'developer' | 'tool';

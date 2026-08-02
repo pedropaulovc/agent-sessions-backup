@@ -30,6 +30,15 @@ def test_machine_id_default(monkeypatch):
     assert config.default_machine_id() == "boxname-linux"
 
 
+def test_default_config_exposes_omp_store():
+    cfg = config.Config(machine_id="m", hub_url="http://h")
+    assert cfg.stores == {
+        "claude": "~/.claude",
+        "codex": "~/.codex",
+        "omp": "~/.omp/agent/sessions",
+    }
+
+
 def test_enroll_and_load_roundtrip(tmp_path):
     path = tmp_path / "config.toml"
     cfg = config.enroll("http://localhost:8787/", dev=True, path=path, machine_id="m1")
@@ -242,6 +251,24 @@ def test_store_roots_always_includes_webcapture_stores(tmp_path):
     # A custom configured root still wins over the injected default (setdefault semantics).
     custom = config.Config(machine_id="m", hub_url="http://h", stores={"export-inbox": "/custom/inbox"})
     assert str(custom.store_roots()["export-inbox"]) == "/custom/inbox"
+
+
+def test_store_roots_injects_omp_for_persisted_config_and_preserves_custom_root(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+
+    persisted = config.Config(
+        machine_id="m",
+        hub_url="http://h",
+        stores={"claude": "~/.claude"},
+        source=tmp_path / "config.toml",
+    )
+    assert persisted.store_roots()["omp"] == home / ".omp" / "agent" / "sessions"
+
+    custom = config.Config(machine_id="m", hub_url="http://h", stores={"omp": "/custom/omp"})
+    assert custom.store_roots()["omp"] == Path("/custom/omp")
 
 
 def test_hermetic_by_construction_never_resolves_real_data_dir(tmp_path, monkeypatch):

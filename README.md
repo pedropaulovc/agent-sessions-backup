@@ -2,7 +2,7 @@
 
 Backup, index, search, and render AI agent/chat sessions from every machine and harness in one place.
 
-- **Harnesses**: Claude Code, Codex CLI, ChatGPT web, Claude web (more via raw-file capture)
+- **Harnesses**: Claude Code, Codex CLI, OMP (Oh My Pi), ChatGPT web, Claude web (more via raw-file capture)
 - **Hub**: Cloudflare Workers + D1 (SQLite FTS5 index) + R2 (raw files, source of truth) + Queues
 - **Collector**: Python (uv) agent on each machine — incremental uploads over mTLS (TPM-bound client certs), heartbeats
 - **Viewer**: chat-style session rendering + faceted full-text search, passkey login
