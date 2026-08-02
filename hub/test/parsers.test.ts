@@ -4,6 +4,7 @@ import { parseClaudeCode } from '../src/ingest/parsers/claude-code';
 import { parseOmp } from '../src/ingest/parsers/omp';
 import { parseCodex } from '../src/ingest/parsers/codex';
 import { parsePromptLog } from '../src/ingest/parsers/history';
+import { CAPS } from '../src/ingest/normalize';
 import { detect } from '../src/ingest/detect';
 import {
   CC_SESSION_ID,
@@ -248,6 +249,59 @@ describe('parseOmp', () => {
     expect(session.turns[2]!.blocks[0]).toMatchObject({ type: 'tool_result', text: 'tool output', toolUseId: 'tc1' });
     expect(session.stats.parseErrorLines).toBe(1);
     expect(session.turns).toHaveLength(3);
+  });
+  it('indexes persisted effective prompts without truncating their parts or other custom metadata', async () => {
+    const firstPart = `prompt-start-${'x'.repeat(CAPS.prompt)}-prompt-tail`;
+    const secondPart = 'second prompt part';
+    const promptRecord = JSON.stringify({
+      type: 'custom',
+      customType: 'omp-system-prompt',
+      id: 'prompt-1',
+      parentId: null,
+      timestamp: '2026-07-19T10:00:01.000Z',
+      data: { systemPrompt: [firstPart, secondPart] },
+    });
+    const records = [
+      JSON.stringify({ type: 'session', version: 3, id: sessionId, timestamp: '2026-07-19T10:00:00.000Z', cwd: '/tmp/omp' }),
+      promptRecord,
+      JSON.stringify({ type: 'custom', customType: 'unrelated', data: { value: 'skip me' } }),
+      JSON.stringify({ type: 'custom', customType: 'omp-system-prompt', data: { systemPrompt: ['valid', 42] } }),
+      JSON.stringify({ type: 'custom', customType: 'omp-system-prompt', data: { systemPrompt: [] } }),
+      JSON.stringify({ type: 'message', id: 'u1', parentId: null, timestamp: '2026-07-19T10:00:02.000Z', message: { role: 'user', content: 'question' } }),
+    ];
+    const session = await parseOmp(readJsonlLines(toStream(records)), sessionId);
+
+    const promptTurn = session.turns.find((turn) => turn.id === 'prompt-1');
+    expect(promptTurn).toMatchObject({ role: 'system', parentId: undefined, onMainPath: true });
+    expect(promptTurn?.blocks.map((block) => block.type)).toEqual(['prompt', 'prompt', 'prompt']);
+    expect(promptTurn?.blocks.map((block) => block.text ?? '').join('')).toBe(firstPart + secondPart);
+    expect(promptTurn?.blocks.every((block) => (block.text?.length ?? 0) <= CAPS.prompt && !block.truncated)).toBe(true);
+    expect(new Set(promptTurn?.blocks.map((block) => block.byteStart)).size).toBe(1);
+    expect(promptTurn?.blocks[0]).toMatchObject({ byteLen: promptRecord.length + 1 });
+    expect(session.stats.skippedLineTypes.custom).toBe(1);
+    expect(session.stats.skippedLineTypes['custom.omp-system-prompt.invalid']).toBe(1);
+    expect(session.stats.skippedLineTypes['custom.omp-system-prompt.empty']).toBe(1);
+    expect(session.turns.filter((turn) => turn.role === 'system')).toHaveLength(1);
+  });
+
+  it('does not let prompt metadata rewrite conversation ancestry', async () => {
+    const records = [
+      JSON.stringify({ type: 'session', version: 3, id: sessionId, timestamp: '2026-07-19T10:00:00.000Z', cwd: '/tmp/omp' }),
+      JSON.stringify({ type: 'message', id: 'u0', parentId: null, timestamp: '2026-07-19T10:00:01.000Z', message: { role: 'user', content: 'root' } }),
+      JSON.stringify({ type: 'message', id: 'u1', parentId: 'u0', timestamp: '2026-07-19T10:00:02.000Z', message: { role: 'user', content: 'follow-up' } }),
+      JSON.stringify({
+        type: 'custom',
+        customType: 'omp-system-prompt',
+        id: 'u1',
+        parentId: null,
+        data: { systemPrompt: ['effective prompt'] },
+      }),
+      JSON.stringify({ type: 'message', id: 'a1', parentId: 'u1', timestamp: '2026-07-19T10:00:03.000Z', message: { role: 'assistant', content: 'answer' } }),
+    ];
+    const session = await parseOmp(readJsonlLines(toStream(records)), sessionId);
+
+    expect(session.turns.filter((turn) => turn.role !== 'system').every((turn) => turn.onMainPath)).toBe(true);
+    expect(session.turns.find((turn) => turn.role === 'system')?.onMainPath).toBe(true);
   });
 
   it('fails open main-path classification after an oversized line', async () => {

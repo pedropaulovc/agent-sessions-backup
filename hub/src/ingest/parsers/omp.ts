@@ -10,6 +10,8 @@ import {
   type TurnUsage,
 } from '../normalize';
 
+const OMP_SYSTEM_PROMPT_TYPE = 'omp-system-prompt';
+
 /**
  * Oh My Pi session JSONL parser.
  *
@@ -83,7 +85,9 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
 
     const id = str(o.id);
     const parentId = str(o.parentId);
-    if (id) parents.set(id, parentId);
+    // Persisted prompt metadata has ids but is not part of the conversation tree. Letting it
+    // overwrite a message's id here can hide real ancestors during main-path classification.
+    if (id && type !== 'custom') parents.set(id, parentId);
     const ts = isoTimestamp(o.timestamp);
     if (ts) updateRange(session, ts);
 
@@ -93,6 +97,10 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
         break;
       case 'custom_message':
         parseCustomMessage(o, line, ts);
+        break;
+      case 'custom':
+        if (o.customType === OMP_SYSTEM_PROMPT_TYPE) parseSystemPrompt(o, line, ts);
+        else skip(type);
         break;
       case 'compaction':
         parseSummary(o, line, ts, 'compaction');
@@ -111,8 +119,8 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
         skip(type);
         break;
       case 'session_init':
-        // This contains the full system prompt. It is intentionally metadata-only: indexing it
-        // would expose prompt internals and swamp conversation search results.
+        // This contains the full system prompt. It remains metadata-only; the persistence extension
+        // emits a bounded, explicit omp-system-prompt record when the effective prompt should be indexed.
         skip(type);
         break;
       default:
@@ -187,6 +195,31 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
       if (text) firstUserText = text.slice(0, 120);
     }
   }
+
+  function parseSystemPrompt(entry: Record<string, unknown>, line: JsonlLine, ts?: string): void {
+    const data = isObj(entry.data) ? entry.data : undefined;
+    if (!isStringArray(data?.systemPrompt)) {
+      skip('custom.omp-system-prompt.invalid');
+      return;
+    }
+
+    const blocks = promptBlocks(data.systemPrompt, line);
+    if (blocks.length === 0) {
+      skip('custom.omp-system-prompt.empty');
+      return;
+    }
+
+    session.turns.push({
+      index: session.turns.length,
+      id: str(entry.id) ?? `${OMP_SYSTEM_PROMPT_TYPE}:${line.byteStart}`,
+      parentId: str(entry.parentId),
+      onMainPath: false,
+      role: 'system',
+      ts,
+      blocks,
+    });
+  }
+
 
   function parseSummary(entry: Record<string, unknown>, line: JsonlLine, ts: string | undefined, kind: 'compaction' | 'branch_summary'): void {
     const summary = str(entry.summary) ?? str(entry.shortSummary);
@@ -272,6 +305,21 @@ function blocksFrom(content: unknown, line: JsonlLine, role: Role, toolCallId?: 
   }
   return out;
 }
+function promptBlocks(parts: readonly string[], line: JsonlLine): NormalizedBlock[] {
+  const at = { byteStart: line.byteStart, byteLen: line.byteLen };
+  const out: NormalizedBlock[] = [];
+  for (const part of parts) {
+    for (let offset = 0; offset < part.length; offset += CAPS.prompt) {
+      out.push({
+        type: 'prompt',
+        text: part.slice(offset, offset + CAPS.prompt),
+        truncated: false,
+        ...at,
+      });
+    }
+  }
+  return out;
+}
 
 function contentText(content: unknown): string {
   if (typeof content === 'string') return content;
@@ -335,6 +383,10 @@ function isoTimestamp(value: unknown): string | undefined {
 function isObj(v: unknown): v is Record<string, unknown> {
   return typeof v === 'object' && v !== null && !Array.isArray(v);
 }
+function isStringArray(v: unknown): v is string[] {
+  return Array.isArray(v) && v.every((part) => typeof part === 'string');
+}
+
 function str(v: unknown): string | undefined {
   return typeof v === 'string' && v.length > 0 ? v : undefined;
 }
