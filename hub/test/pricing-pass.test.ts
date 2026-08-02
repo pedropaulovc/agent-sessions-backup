@@ -229,6 +229,46 @@ describe('priceUsage', () => {
     expect((await priced(id)).usd, 'the superseded row was never picked up again').toBeCloseTo(9, 9);
   });
 
+  it('charges a superseded write to the bucket THAT row was counted in', async () => {
+    // A batch mixes priceable and unpriceable rows, and `db.batch` returns its results
+    // positionally. So undoing the optimistic count for a superseded write has to know which
+    // bucket that particular row incremented: always decrementing `priced` takes the count away
+    // from a DIFFERENT row that was written successfully, under-reporting real work while still
+    // reporting the failed one as done.
+    //
+    // Two rows, and the one that loses the race is the UNPRICEABLE one — the case where the two
+    // buckets disagree. The single-row race test above cannot distinguish them, because there the
+    // superseded row and the counted row are necessarily the same row.
+    await seedPrice();
+    const ok = await seedTurn('s1', { input: 1_000_000 });
+    const nope = await seedTurn('s1', { model: 'model-with-no-published-rate' });
+
+    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+    let intercepted = false;
+    (testEnv.DB as unknown as { batch: typeof realBatch }).batch = (async (stmts: D1PreparedStatement[]) => {
+      if (!intercepted) {
+        intercepted = true;
+        await testEnv.DB.prepare('UPDATE usage SET input_tokens = 9000000 WHERE id = ?1').bind(nope).run();
+      }
+      return realBatch(stmts);
+    }) as typeof realBatch;
+
+    let res;
+    try {
+      res = await priceUsage(testEnv.DB, { now: NOW });
+    } finally {
+      (testEnv.DB as unknown as { batch: typeof realBatch }).batch = realBatch;
+    }
+
+    expect(intercepted, 'the interception never fired, so no race was simulated').toBe(true);
+    expect(res.superseded).toBe(1);
+    expect(res.unpriceable, 'the superseded row was still counted as a completed no-rate verdict').toBe(0);
+    expect(res.priced, 'the decrement landed on a row that WAS written').toBe(1);
+    // And the successfully-written row is genuinely written, so `priced: 1` is not one error
+    // cancelling another.
+    expect((await priced(ok)).usd, 'the priceable row in the same batch was not written').toBeCloseTo(1, 9);
+  });
+
   it('records which rate snapshot it used, and prices a turn at the rate in force THEN', async () => {
     // The whole reason `model_prices` is versioned rather than overwritten: an August price cut
     // must not silently rewrite what July cost. Storing the cost makes that permanent, so the

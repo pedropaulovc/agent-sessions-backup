@@ -118,8 +118,11 @@ export async function priceUsage(
     const writes = rows.map((r) => {
       result.examined++;
       const cost = priceOf(r, prices);
-      if (cost === null) result.unpriceable++;
-      else result.priced++;
+      // Which bucket this row was counted into, carried alongside its statement. The counts below
+      // are optimistic — the write may yet be superseded — and a batch mixes both kinds, so
+      // undoing the count needs to know which one THIS row incremented rather than assuming.
+      const bucket: 'priced' | 'unpriceable' = cost === null ? 'unpriceable' : 'priced';
+      result[bucket]++;
       // COMPARE-AND-SET on the inputs this cost was computed FROM, not a bare `WHERE id`.
       //
       // The pass reads a row, prices it in JS, then writes the answer back — and a re-parse of the
@@ -131,7 +134,7 @@ export async function priceUsage(
       // Matching on the token columns and model means the update simply affects zero rows when the
       // inputs moved. That is not a failure: the re-parse also reset the pricing state, so the row
       // is still due and the next pass prices it from the values it now has. Superseded, not lost.
-      return db
+      const stmt = db
         .prepare(
           `UPDATE usage
               SET usd = ?1, usd_input = ?2, usd_output = ?3, usd_cache_read = ?4,
@@ -168,18 +171,26 @@ export async function priceUsage(
           r.cas_w5 ?? 0,
           r.cas_w1h ?? 0,
         );
+      return { stmt, bucket };
     });
 
     for (let i = 0; i < writes.length; i += PRICING_WRITE_BATCH) {
-      const res = await db.batch(writes.slice(i, i + PRICING_WRITE_BATCH));
+      const slice = writes.slice(i, i + PRICING_WRITE_BATCH);
+      const res = await db.batch(slice.map((w) => w.stmt));
       // A zero-change UPDATE is the compare-and-set losing to a concurrent re-parse. Reported
-      // rather than swallowed: `priced` was incremented optimistically above, and leaving it there
-      // would claim work the database did not do.
-      for (const r of res) {
-        if ((r.meta?.changes ?? 0) !== 0) continue;
+      // rather than swallowed: the row's bucket was incremented optimistically above, and leaving
+      // it there would claim work the database did not do.
+      //
+      // Decremented BY INDEX into this slice, because `db.batch` returns results positionally and a
+      // batch mixes priceable and unpriceable rows. Always decrementing `priced` would, when the
+      // superseded row was an unpriceable one, take the count away from a different row that was
+      // written successfully — under-reporting real work while still claiming the failed one.
+      res.forEach((r, j) => {
+        if ((r.meta?.changes ?? 0) !== 0) return;
         result.superseded++;
-        result.priced = Math.max(0, result.priced - 1);
-      }
+        const bucket = slice[j]!.bucket;
+        result[bucket] = Math.max(0, result[bucket] - 1);
+      });
     }
     // A short read means the query ran out of rows, not that the budget ran out. Distinguishing
     // them is the whole value of `more`: a caller that re-runs on `more` would otherwise loop
