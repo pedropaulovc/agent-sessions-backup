@@ -674,7 +674,7 @@ describe('viewer', () => {
   it('collapses title-skipped turns by default without nesting controls in the disclosure summary', async () => {
     const html = await (await SELF.fetch(`https://sessions.vza.net/s/${TITLE_SESSION}`)).text();
     const skipped = html.match(
-      /<div id="t\d+" class="turn user title-skipped"><details class="turn-content"><summary class="turnhead">[\s\S]*?<\/summary><div class="body">[\s\S]*?Injected agent instructions[\s\S]*?<\/div><\/details>/,
+      /<div id="t\d+" class="turn user collapsed"><details class="turn-content"><summary class="turnhead">[\s\S]*?<\/summary><div class="body">[\s\S]*?Injected agent instructions[\s\S]*?<\/div><\/details>/,
     );
     expect(skipped).toBeTruthy();
     expect(skipped![0]).not.toContain('<details open');
@@ -1291,15 +1291,15 @@ describe('viewer', () => {
     expect(ok.headers.get('cache-control')).toContain('immutable');
   });
 
-  it('keeps an unlinked system turn visible in effective view and undimmed in chronological', async () => {
+  it('collapses system turns by default while keeping them visible in both views', async () => {
     const chrono = await (await SELF.fetch(`https://sessions.vza.net/s/${SYSTEM_SESSION}?view=chronological`)).text();
     expect(chrono).toContain('SYSTEMREMINDER');
-    // The system turn's <article> must not carry the rewound class.
-    expect(chrono).toMatch(/<article[^>]*class="turn system"/);
-    expect(chrono).not.toMatch(/<article[^>]*class="turn system[^"]*rewound"/);
+    expect(chrono).toMatch(/<div[^>]*class="turn system collapsed"><details class="turn-content">/);
+    expect(chrono).not.toMatch(/class="turn system collapsed rewound"/);
 
     const effective = await (await SELF.fetch(`https://sessions.vza.net/s/${SYSTEM_SESSION}?view=effective`)).text();
     expect(effective).toContain('SYSTEMREMINDER'); // not hidden
+    expect(effective).toMatch(/<div[^>]*class="turn system collapsed"><details class="turn-content">/);
   });
 
   it('blobVersionOf tokenizes real sha-256 hashes and rejects unknown/short values', () => {

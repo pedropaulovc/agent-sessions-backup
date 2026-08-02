@@ -372,7 +372,9 @@ function renderTurn(
   }
   if (view === 'effective' && !onMainPath) return '';
   if (turn.blocks.length === 0) return '';
-  const titleSkipped = titleSkippedTurns.has(turnIndex ?? turn.index);
+  // Title derivation ignores system/developer turns entirely; keep those metadata turns collapsed too.
+  const collapseByDefault =
+    titleSkippedTurns.has(turnIndex ?? turn.index) || turn.role === 'system' || turn.role === 'developer';
 
   const rewound = view === 'chronological' && !onMainPath;
   const cls = `turn ${esc(turn.role)}${rewound ? ' rewound' : ''}${starred ? ' starred' : ''}`;
@@ -391,8 +393,8 @@ function renderTurn(
   const head = `<div class="turnhead">${headContent}${star}</div>`;
   const body = turn.blocks.map((b, bi) => renderBlock(b, bi, sessionId, mediaIds, blobVersion, toolPairs)).join('');
   if (!body) return '';
-  if (titleSkipped) {
-    return `<div${anchor} class="${cls} title-skipped"><details class="turn-content">` +
+  if (collapseByDefault) {
+    return `<div${anchor} class="${cls} collapsed"><details class="turn-content">` +
       `<summary class="turnhead">${headContent}</summary><div class="body">${body}</div></details>${star}</div>`;
   }
   return `<article${anchor} class="${cls}">${head}<div class="body">${body}</div></article>`;

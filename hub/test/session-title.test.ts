@@ -30,15 +30,16 @@ describe('computeFirstInteractionTitle', () => {
     expect(computeFirstInteractionTitle(turns('   ', ''))).toBe(null);
   });
 
-  it('ignores tool, system, non-text, off-main-path, and null-text blocks', () => {
+  it('ignores tool, system, developer, non-text, off-main-path, and null-text blocks', () => {
     expect(
       computeFirstInteractionTitle([
         block({ turnIndex: 0, role: 'tool', text: 'tool result' }),
         block({ turnIndex: 1, role: 'system', text: 'system prompt' }),
-        block({ turnIndex: 2, btype: 'thinking', text: 'thinking' }),
-        block({ turnIndex: 3, onMainPath: false, text: 'abandoned' }),
-        block({ turnIndex: 4, text: null }),
-        block({ turnIndex: 5, text: 'the real prompt' }),
+        block({ turnIndex: 2, role: 'developer', text: 'developer instruction' }),
+        block({ turnIndex: 3, btype: 'thinking', text: 'thinking' }),
+        block({ turnIndex: 4, onMainPath: false, text: 'abandoned' }),
+        block({ turnIndex: 5, text: null }),
+        block({ turnIndex: 6, text: 'the real prompt' }),
       ]),
     ).toBe('the real prompt');
   });
