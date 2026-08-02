@@ -229,23 +229,24 @@ class Config:
                     "client_cert_path and client_key_path (POSIX). Run infra/cf/enroll-cert.py."
                 )
 
-    def store_roots(self) -> dict[str, Path]:
-        """Resolved roots to actually scan. Under WSL with include_windows_mounts=false,
-        roots resolving under /mnt/<drive>/ are dropped so a WSL install never captures the
-        Windows side as the WSL machine (see dropped_store_roots for what was skipped)."""
+    def _effective_stores(self) -> dict[str, str]:
+        """Return the store map after applying all built-in roots and staging stores."""
         stores = dict(self.stores)
         # Persisted configs from before OMP support need this upgrade path. Direct Config instances
         # with an explicit custom store map retain their existing scope; fresh defaults already carry
         # omp in DEFAULT_STORES.
         if self.source is not None:
             stores.setdefault("omp", DEFAULT_STORES["omp"])
-        # Always expose the webcapture staging stores (setdefault: a custom configured root wins).
-        # This is the load-layer fix for the "registered only at enroll/webcapture" hole: an
-        # already-enrolled collector that upgrades and drops an export ZIP, or a webcapture host, is
-        # scanned without a re-enroll. Missing dirs are simply skipped by run/scanner (root.exists()).
         base = Path(self.staging_base).expanduser() if self.staging_base else webcapture_dir()
         for name in WEBCAPTURE_STORES:
             stores.setdefault(name, str(base / name))
+        return stores
+
+    def store_roots(self) -> dict[str, Path]:
+        """Resolved roots to actually scan. Under WSL with include_windows_mounts=false,
+        roots resolving under /mnt/<drive>/ are dropped so a WSL install never captures the
+        Windows side as the WSL machine (see dropped_store_roots for what was skipped)."""
+        stores = self._effective_stores()
         roots = {name: Path(root).expanduser() for name, root in stores.items()}
         if not self._drop_windows_mounts():
             return roots
@@ -255,9 +256,7 @@ class Config:
         """Roots excluded by the WSL windows-mount guard, so callers can surface a warning."""
         if not self._drop_windows_mounts():
             return {}
-        stores = dict(self.stores)
-        if self.source is not None:
-            stores.setdefault("omp", DEFAULT_STORES["omp"])
+        stores = self._effective_stores()
         return {
             n: p
             for n, r in stores.items()

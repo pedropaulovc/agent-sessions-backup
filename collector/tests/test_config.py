@@ -371,6 +371,23 @@ def test_wsl_drops_injected_omp_root_for_persisted_config(tmp_path, monkeypatch)
     assert dropped["omp"] == Path("/mnt/c/Users/legacy/.omp/agent/sessions")
 
 
+def test_wsl_drops_windows_staging_roots(monkeypatch):
+    monkeypatch.setattr(config, "detect_platform_tag", lambda: "wsl")
+    staging = Path("/mnt/c/Users/legacy/.local/share/agent-collector")
+    cfg = config.Config(
+        machine_id="m",
+        hub_url="http://h",
+        stores={"claude": "/home/safe/.claude"},
+        staging_base=str(staging),
+    )
+
+    roots = cfg.store_roots()
+    dropped = cfg.dropped_store_roots()
+    assert all(name not in roots for name in config.WEBCAPTURE_STORES)
+    assert all(name in dropped for name in config.WEBCAPTURE_STORES)
+    assert dropped["export-inbox"] == staging / "export-inbox"
+
+
 def test_wsl_include_windows_mounts_true_keeps_them(monkeypatch):
     monkeypatch.setattr(config, "detect_platform_tag", lambda: "wsl")
     cfg = config.Config(machine_id="m", hub_url="http://x", include_windows_mounts=True,
