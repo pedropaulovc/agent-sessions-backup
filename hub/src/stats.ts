@@ -24,16 +24,8 @@
  * function is ~1.7M — that, and the fact that all of this scales with corpus size, is why the
  * next step for this page is a rollup rather than more query tuning.
  */
-import { classifyModel, costOfUsage, loadPrices, type CostByClass, type ModelPrice } from './pricing';
-import {
-  priceEpochExpr,
-  priceForGroup,
-  UNKNOWN_MODEL_LABEL,
-  USAGE_SHAPE_GROUP_BY,
-  USAGE_SHAPE_SELECT,
-  USAGE_TOKEN_SUMS,
-  type UsageAggRow,
-} from './usage-agg';
+import { type CostByClass } from './pricing';
+import { UNKNOWN_MODEL_LABEL, USAGE_TOKEN_SUMS_ONLY } from './usage-agg';
 
 /** Ranges offered by the UI. `all` is included but is the only option that scans the whole
  * `usage` table on every panel, so it is never the default. */
@@ -239,19 +231,22 @@ function emptyGroup(key: string | null): PricedGroup {
   };
 }
 
-/** Fold priced (model, epoch, shape) rows into one entry per key.
+/** Fold already-priced rows into one entry per key.
+ *
+ * Every dollar here is read, never computed. Each `usage` row was priced individually by the
+ * pricing pass — at its own model, its own rate epoch, its own token shape — so summing across
+ * any grouping is exact, and this function needs to know nothing about rates.
+ *
+ * That is the whole reason the read path can group by what the page shows rather than by what
+ * `costOfUsage` is defined on. It used to call `costOfUsage` per row, which forced the scan above
+ * to carry the pricing unit and forced every group to be one that could have been a single call.
  *
  * The key comes from a selector rather than a `key` field on the row: the same scan is folded four
- * different ways, and materialising a keyed copy of it per fold would be four extra copies of a
- * 32k-row array on a fixed Worker memory ceiling, to carry one string each.
- *
- * Pricing happens per ROW here, not per key, because each row is one (model, epoch, shape) — the
- * unit `costOfUsage` is defined on. Summing tokens across models first and pricing once would
- * charge every model at whichever rate happened to be picked.
+ * different ways, and materialising a keyed copy of it per fold would be four extra copies of the
+ * scan on a fixed Worker memory ceiling, to carry one string each.
  */
-function foldByKey<T extends UsageAggRow>(
+function foldByKey<T extends ScanRow>(
   rows: T[],
-  prices: Map<string, ModelPrice[]>,
   keyOf: (row: T) => string | null,
 ): Map<string | null, PricedGroup> {
   const out = new Map<string | null, PricedGroup>();
@@ -260,24 +255,19 @@ function foldByKey<T extends UsageAggRow>(
     // stringify the same and would merge two different populations into one row.
     const key = keyOf(r) ?? null;
     const g = out.get(key) ?? emptyGroup(key);
-    const modelClass = classifyModel(r.model);
-    const price = modelClass === 'billable' ? priceForGroup(prices.get(r.model as string) ?? [], String(r.epoch), r, false) : null;
-    const cost = costOfUsage(r, price, { batch: false });
     g.calls += Number(r.calls ?? 0);
-    g.usd += cost.usd;
-    g.byClass.input += cost.byClass.input;
-    g.byClass.output += cost.byClass.output;
-    g.byClass.cacheRead += cost.byClass.cacheRead;
-    g.byClass.cacheWrite5m += cost.byClass.cacheWrite5m;
-    g.byClass.cacheWrite1h += cost.byClass.cacheWrite1h;
+    g.usd += Number(r.usd ?? 0);
+    g.byClass.input += Number(r.usd_input ?? 0);
+    g.byClass.output += Number(r.usd_output ?? 0);
+    g.byClass.cacheRead += Number(r.usd_cache_read ?? 0);
+    g.byClass.cacheWrite5m += Number(r.usd_cache_write_5m ?? 0);
+    g.byClass.cacheWrite1h += Number(r.usd_cache_write_1h ?? 0);
     g.tokens.input += Number(r.input_tokens ?? 0);
     g.tokens.output += Number(r.output_tokens ?? 0);
     g.tokens.cacheRead += Number(r.cache_read_tokens ?? 0);
     g.tokens.cw5 += Number(r.cache_creation_5m_tokens ?? 0);
     g.tokens.cw1h += Number(r.cache_creation_1h_tokens ?? 0);
-    // `sentinel` rows (`<synthetic>`) never hit an API, so they are not coverage we failed to
-    // price. `unknown` rows are the opposite: real tokens at a rate we cannot determine.
-    if (cost.unpriced && modelClass !== 'sentinel') g.unpricedCalls += Number(r.calls ?? 0);
+    g.unpricedCalls += Number(r.unpriced_calls ?? 0);
     out.set(key, g);
   }
   return out;
@@ -285,37 +275,75 @@ function foldByKey<T extends UsageAggRow>(
 
 /** The one usage scan the page is built on.
  *
- * Grouped at (session, model, rate epoch, depth band, token shape) — the finest grain any panel
- * needs. Six panels are then derived in memory instead of costing a scan each: ledger, token
- * economics, session shape, model fit, attribution and outliers. Session attributes are joined in
- * from `sessionMeta` afterwards rather than by SQL; see that function for the measurement.
+ * Grouped at (session, model, depth band) — the finest grain any panel actually displays. Six
+ * panels are derived in memory instead of costing a scan each: ledger, token economics, session
+ * shape, model fit, attribution and outliers. Session attributes are joined in from `sessionMeta`
+ * afterwards rather than by SQL; see that function for the measurement.
  *
- * Measured on the production table: 32k result rows for a 30-day window, one scan. The
- * alternative — a query per panel — re-read the same 300k usage rows six times over.
+ * It used to be grouped at (session, model, RATE EPOCH, band, TOKEN SHAPE) — two extra dimensions
+ * that no panel shows. They were there because `costOfUsage` is defined on them: a group handed to
+ * it has to be one that could have been a single call, or it gets priced at a rate applying to
+ * only part of itself. So the read path carried the pricing unit, fanned every group out across
+ * six shape booleans, and re-derived dollars in JS on every load.
+ *
+ * Now that each turn stores its own cost and its own class breakdown, none of that is needed here:
+ * SUM is exact over any grouping, because the summands were each priced individually at write
+ * time. The epoch and shape columns are gone, the fan-out with them, and `costOfUsage` is off the
+ * read path entirely.
+ *
+ * `unpriced_calls` is counted here rather than inferred from a NULL total: SUM skips NULLs, so a
+ * group of entirely unpriceable rows and a group of genuinely free ones both sum to nothing, and
+ * only this count distinguishes "we could not price this" from "this was free". Sentinel models
+ * are excluded from it — they store a real 0 and were never coverage we failed to achieve.
  *
  * The session columns are bare in a GROUP BY that includes `session_id`, which is legal in SQLite
  * and unambiguous here: they are functionally dependent on the session, so every row folded into
  * a group carries the same value.
  */
-async function mainScan(db: D1Database, prices: Map<string, ModelPrice[]>, f: Filters): Promise<MainRow[]> {
+async function mainScan(db: D1Database, f: Filters): Promise<MainRow[]> {
   const rows = await db
     .prepare(
       `SELECT u.session_id AS session_id,
               u.model AS model,
-              ${priceEpochExpr(prices)} AS epoch,
               ${DEPTH_CASE} AS band,
-              ${USAGE_SHAPE_SELECT},
-              ${USAGE_TOKEN_SUMS}
+              COUNT(*) AS calls,
+              SUM(u.usd) AS usd,
+              SUM(u.usd_input) AS usd_input,
+              SUM(u.usd_output) AS usd_output,
+              SUM(u.usd_cache_read) AS usd_cache_read,
+              SUM(u.usd_cache_write_5m) AS usd_cache_write_5m,
+              SUM(u.usd_cache_write_1h) AS usd_cache_write_1h,
+              SUM(CASE WHEN u.usd IS NULL AND COALESCE(u.model, '') NOT GLOB '<*' THEN 1 ELSE 0 END)
+                AS unpriced_calls,
+              ${USAGE_TOKEN_SUMS_ONLY}
        ${usageFrom(f)}
        ${f.where}
-       GROUP BY u.session_id, u.model, epoch, band, ${USAGE_SHAPE_GROUP_BY}`,
+       GROUP BY u.session_id, u.model, band`,
     )
     .bind(...f.binds)
     .all<MainRow>();
   return rows.results ?? [];
 }
 
-interface MainRow extends UsageAggRow {
+/** One row of the main scan: a (session, model, band) group with its costs already summed. */
+interface ScanRow {
+  calls: number;
+  usd: number | null;
+  usd_input: number | null;
+  usd_output: number | null;
+  usd_cache_read: number | null;
+  usd_cache_write_5m: number | null;
+  usd_cache_write_1h: number | null;
+  unpriced_calls: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_5m_tokens: number;
+  cache_creation_1h_tokens: number;
+  model: string | null;
+}
+
+interface MainRow extends ScanRow {
   session_id: string;
   band: string | null;
   /** Attached from `sessionMeta` after the scan, never selected in SQL. */
@@ -479,7 +507,10 @@ const FIVE_MIN_S = 300;
 
 export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Promise<Stats> {
   const w = windows(q.range, now);
-  const [prices, meta] = await Promise.all([loadPrices(db), sessionMeta(db)]);
+  // No `loadPrices` here any more. The catalog was loaded on every page load solely to feed
+  // `costOfUsage` and to build the epoch CASE; with costs stored, the read path needs no rates at
+  // all, and that is one query and one round trip gone from every request.
+  const meta = await sessionMeta(db);
   // The sessions whose usage must never appear on this page. `prompt-log` is a synthetic harness:
   // a single row spans months, so it wins any ranking it is allowed into while describing no
   // session anyone worked in. There are 7 of them against 31k sessions — which is why passing the
@@ -497,7 +528,7 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
   // Every query issued at once. Run sequentially these total ~4.3s against the production table;
   // in parallel the page waits only for the slowest.
   const [scan, gaps, rhythm, counts, priorUsd] = await Promise.all([
-    mainScan(db, prices, main),
+    mainScan(db, main),
     gapHistogram(db, narrow),
     rhythm2d(db, narrow, q.tzOffsetHours),
     sessionCounts(db, narrow),
@@ -513,10 +544,10 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
     // it under an unfiltered view is correct — its tokens were still burned.
     .filter((r) => matchesSessionFilters(r.meta, q));
 
-  const byModel = foldByKey(rows, prices, (r) => r.model ?? null);
-  const byBand = foldByKey(rows, prices, (r) => r.band ?? null);
-  const bySession = foldByKey(rows, prices, (r) => r.session_id);
-  const byAttr = foldByKey(rows, prices, (r) => attributionKey(r, q.by));
+  const byModel = foldByKey(rows, (r) => r.model ?? null);
+  const byBand = foldByKey(rows, (r) => r.band ?? null);
+  const bySession = foldByKey(rows, (r) => r.session_id);
+  const byAttr = foldByKey(rows, (r) => attributionKey(r, q.by));
   const total = totalOf(byModel);
 
   // Distinct sessions per model and per depth band, counted over the same rows the dollars came

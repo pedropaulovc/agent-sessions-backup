@@ -100,6 +100,25 @@ export const USAGE_TOKEN_SUMS = `
   SUM(MIN(MAX(0, COALESCE(u.cache_read_tokens,0)), MAX(0, COALESCE(u.input_tokens,0))))
     AS billable_cache_read_tokens`;
 
+/** Token sums for DISPLAY, with the same per-row clamps but none of the pricing-only derivations.
+ *
+ * `USAGE_TOKEN_SUMS` above carries two extra columns — `fresh_input_tokens` and
+ * `billable_cache_read_tokens` — that exist solely so `costOfUsage` can apply the nonlinear
+ * subset-accounting clamps per row. A caller that only wants to show token counts, now that costs
+ * are stored rather than derived, has no use for them and no business grouping by the token-shape
+ * booleans they come with.
+ *
+ * The MAX(0, ...) clamps are still here and still per class: `usage` has no nonnegative
+ * constraint, and a negative counter displayed as-is is a negative token count on the page.
+ */
+export const USAGE_TOKEN_SUMS_ONLY = `
+  SUM(MAX(0, COALESCE(u.input_tokens,0))) AS input_tokens,
+  SUM(MAX(0, COALESCE(u.output_tokens,0))) AS output_tokens,
+  SUM(MAX(0, COALESCE(u.reasoning_tokens,0))) AS reasoning_tokens,
+  SUM(MAX(0, COALESCE(u.cache_read_tokens,0))) AS cache_read_tokens,
+  SUM(MAX(0, COALESCE(u.cache_creation_5m_tokens,0))) AS cache_creation_5m_tokens,
+  SUM(MAX(0, COALESCE(u.cache_creation_1h_tokens,0))) AS cache_creation_1h_tokens`;
+
 /** A SQL expression mapping `u.ts` to the price snapshot in effect at that time.
  *
  * The boundaries are pooled across all models on purpose: a shared partition means one CASE for
