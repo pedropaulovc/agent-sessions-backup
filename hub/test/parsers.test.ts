@@ -284,6 +284,25 @@ describe('parseOmp', () => {
     expect(session.turns.filter((turn) => turn.role === 'system')).toHaveLength(1);
   });
 
+  it('does not let prompt metadata rewrite conversation ancestry', async () => {
+    const records = [
+      JSON.stringify({ type: 'session', version: 3, id: sessionId, timestamp: '2026-07-19T10:00:00.000Z', cwd: '/tmp/omp' }),
+      JSON.stringify({ type: 'message', id: 'u0', parentId: null, timestamp: '2026-07-19T10:00:01.000Z', message: { role: 'user', content: 'root' } }),
+      JSON.stringify({ type: 'message', id: 'u1', parentId: 'u0', timestamp: '2026-07-19T10:00:02.000Z', message: { role: 'user', content: 'follow-up' } }),
+      JSON.stringify({
+        type: 'custom',
+        customType: 'omp-system-prompt',
+        id: 'u1',
+        parentId: null,
+        data: { systemPrompt: ['effective prompt'] },
+      }),
+      JSON.stringify({ type: 'message', id: 'a1', parentId: 'u1', timestamp: '2026-07-19T10:00:03.000Z', message: { role: 'assistant', content: 'answer' } }),
+    ];
+    const session = await parseOmp(readJsonlLines(toStream(records)), sessionId);
+
+    expect(session.turns.filter((turn) => turn.role !== 'system').every((turn) => turn.onMainPath)).toBe(true);
+    expect(session.turns.find((turn) => turn.role === 'system')?.onMainPath).toBe(true);
+  });
 
   it('fails open main-path classification after an oversized line', async () => {
     const oversized: JsonlLine = { kind: 'oversized', byteStart: 0, byteLen: MAX_JSONL_LINE_BYTES + 1 };

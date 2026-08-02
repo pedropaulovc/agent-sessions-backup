@@ -85,7 +85,9 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
 
     const id = str(o.id);
     const parentId = str(o.parentId);
-    if (id) parents.set(id, parentId);
+    // Persisted prompt metadata has ids but is not part of the conversation tree. Letting it
+    // overwrite a message's id here can hide real ancestors during main-path classification.
+    if (id && type !== 'custom') parents.set(id, parentId);
     const ts = isoTimestamp(o.timestamp);
     if (ts) updateRange(session, ts);
 
