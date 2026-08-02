@@ -102,6 +102,21 @@ tr.stale td { background: var(--err-bg); }
 .turn > .turnhead {
   display: flex; gap: 10px; align-items: baseline; padding: 6px 12px; border-bottom: 1px solid var(--line);
 }
+.turn.collapsed { position: relative; }
+.turn.collapsed > details.turn-content > summary.turnhead {
+  display: flex; gap: 10px; align-items: baseline; padding: 6px 52px 6px 12px;
+  cursor: pointer; user-select: none; list-style: none;
+}
+.turn.collapsed > details.turn-content > summary.turnhead::-webkit-details-marker { display: none; }
+.turn.collapsed > details.turn-content > summary.turnhead::before {
+  content: "▸"; flex: 0 0 1em; color: var(--muted);
+}
+.turn.collapsed > details.turn-content[open] > summary.turnhead {
+  border-bottom: 1px solid var(--line);
+}
+.turn.collapsed > .turn-star {
+  position: absolute; top: 3px; right: 6px; z-index: 1; margin: 0;
+}
 .turn.starred { border-color: var(--star); }
 .turn-star { margin: -3px -6px -3px auto; }
 .turn-star button {

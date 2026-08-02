@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { computeFirstInteractionTitle, sessionDisplayTitle, type TitleBlock } from '../src/session-title';
+import { computeFirstInteractionTitle, sessionDisplayTitle, titleSkippedTurnIndices, type TitleBlock } from '../src/session-title';
 
 /** Build an eligible main-path user/assistant text block; override any field per case. */
 function block(overrides: Partial<TitleBlock> & { text: string | null }): TitleBlock {
@@ -30,15 +30,16 @@ describe('computeFirstInteractionTitle', () => {
     expect(computeFirstInteractionTitle(turns('   ', ''))).toBe(null);
   });
 
-  it('ignores tool, system, non-text, off-main-path, and null-text blocks', () => {
+  it('ignores tool, system, developer, non-text, off-main-path, and null-text blocks', () => {
     expect(
       computeFirstInteractionTitle([
         block({ turnIndex: 0, role: 'tool', text: 'tool result' }),
         block({ turnIndex: 1, role: 'system', text: 'system prompt' }),
-        block({ turnIndex: 2, btype: 'thinking', text: 'thinking' }),
-        block({ turnIndex: 3, onMainPath: false, text: 'abandoned' }),
-        block({ turnIndex: 4, text: null }),
-        block({ turnIndex: 5, text: 'the real prompt' }),
+        block({ turnIndex: 2, role: 'developer', text: 'developer instruction' }),
+        block({ turnIndex: 3, btype: 'thinking', text: 'thinking' }),
+        block({ turnIndex: 4, onMainPath: false, text: 'abandoned' }),
+        block({ turnIndex: 5, text: null }),
+        block({ turnIndex: 6, text: 'the real prompt' }),
       ]),
     ).toBe('the real prompt');
   });
@@ -78,6 +79,26 @@ describe('computeFirstInteractionTitle', () => {
       ]),
     ).toBe('first later turn title');
   });
+
+  it('skips recommend_plugins and INSTRUCTIONS turns before the title', () => {
+    expect(
+      computeFirstInteractionTitle(
+        turns('<recommend_plugins>plugin metadata</recommend_plugins>', '<INSTRUCTIONS>setup metadata</INSTRUCTIONS>', 'Real prompt'),
+      ),
+    ).toBe('Real prompt');
+  });
+  it('reports only injected representative turns skipped before the title', () => {
+    const skipped = titleSkippedTurnIndices([
+      block({ turnIndex: 0, text: '<system-reminder>injected</system-reminder>' }),
+      block({ turnIndex: 0, blockIndex: 1, text: 'same-turn text stays ignored' }),
+      block({ turnIndex: 1, text: '{"type":"server_tool_use","id":"x"}' }),
+      block({ turnIndex: 1, blockIndex: 1, text: 'real text in the same turn' }),
+      block({ turnIndex: 2, text: '<hook_prompt>after title</hook_prompt>' }),
+      block({ turnIndex: 3, role: 'system', text: 'system prompt' }),
+    ]);
+    expect([...skipped]).toEqual([0]);
+  });
+
 
   it('skips server-tool metadata to a real block later in the same turn', () => {
     expect(

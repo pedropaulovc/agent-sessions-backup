@@ -8,7 +8,7 @@ import { parseCodex } from '../ingest/parsers/codex';
 import { parseOmp } from '../ingest/parsers/omp';
 import { parseConversationById } from '../ingest/parsers/export-inbox';
 import { parsePromptLog } from '../ingest/parsers/history';
-import { sessionDisplayTitle } from '../session-title';
+import { computeFirstInteractionTitle, sessionDisplayTitle, titleSkippedTurnIndices, type TitleBlock } from '../session-title';
 import { turnKeyOf } from '../turn-key';
 import { esc, pageFoot, pageHead, q } from './layout';
 
@@ -58,7 +58,6 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
     .bind(sessionId)
     .first<SessionMeta>();
   if (!meta) return notFound();
-  const displayTitle = sessionDisplayTitle(meta.first_interaction_title, meta.title, meta.session_id);
 
   const file = await env.DB.prepare(
     `SELECT f.store, f.relpath, f.r2_key, f.content_hash FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1`,
@@ -129,6 +128,9 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
     queue.push({ turnIndex: row.turn_index, onMainPath: row.on_main_path === 1 });
     pageTurnsByByteStart.set(row.byte_start, queue);
   }
+  const titleScan = await loadTitleScan(env, sessionId);
+  const displayTitle = sessionDisplayTitle(titleScan.title || meta.first_interaction_title, meta.title, meta.session_id);
+  const titleSkippedTurns = titleScan.skipped;
 
   // Media block ids for this byte window, so <img>/<a> can point at the blob endpoint.
   const mediaIds = await loadMediaIds(env, sessionId, startByte, endByte);
@@ -172,6 +174,7 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
               starredKeys.has(key),
               transcriptRevision,
               blobVersion,
+              titleSkippedTurns,
               toolPairs,
             );
             if (html) {
@@ -192,6 +195,80 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
 
   console.log(JSON.stringify({ event: 'viewer.session', session: sessionId, page, view }));
   return new Response(stream, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+}
+
+const TITLE_SCAN_PAGE_SIZE = 256;
+
+interface TitleBlockRow {
+  turn_index: number;
+  block_index: number;
+  role: string;
+  btype: string;
+  text: string | null;
+}
+
+/** Find leading title-excluded turns and derive a legacy title without loading the whole transcript. */
+interface TitleScan {
+  title: string | null;
+  skipped: ReadonlySet<number>;
+}
+
+async function loadTitleScan(env: Env, sessionId: string): Promise<TitleScan> {
+  const skipped = new Set<number>();
+  let lastTurn = -1;
+  let lastBlock = -1;
+  let pending: TitleBlock[] = [];
+
+  for (;;) {
+    const rows = await env.DB.prepare(
+      `SELECT turn_index, block_index, role, btype, text
+       FROM blocks
+       WHERE session_id = ?1 AND on_main_path = 1
+         AND role IN ('user', 'assistant') AND btype IN ('text', 'prompt') AND text IS NOT NULL
+         AND (turn_index > ?2 OR (turn_index = ?2 AND block_index > ?3))
+       ORDER BY turn_index, block_index
+       LIMIT ${TITLE_SCAN_PAGE_SIZE}`,
+    )
+      .bind(sessionId, lastTurn, lastBlock)
+      .all<TitleBlockRow>();
+
+    for (const row of rows.results) {
+      if (pending.length > 0 && pending[0]!.turnIndex !== row.turn_index) {
+        const title = consumeTitleTurn(pending, skipped);
+        if (title !== null) return { title, skipped };
+        pending = [];
+      }
+      pending.push({
+        turnIndex: row.turn_index,
+        blockIndex: row.block_index,
+        role: row.role,
+        btype: row.btype,
+        text: row.text,
+        onMainPath: true,
+      });
+    }
+
+    if (rows.results.length === 0) {
+      return { title: consumeTitleTurn(pending, skipped), skipped };
+    }
+
+    const last = rows.results[rows.results.length - 1]!;
+    lastTurn = last.turn_index;
+    lastBlock = last.block_index;
+    if (rows.results.length < TITLE_SCAN_PAGE_SIZE) {
+      return { title: consumeTitleTurn(pending, skipped), skipped };
+    }
+  }
+}
+
+/** Return the first real title in a turn, or null while extending the leading skip run. */
+function consumeTitleTurn(turn: TitleBlock[], skipped: Set<number>): string | null {
+  const turnSkipped = titleSkippedTurnIndices(turn);
+  if (turnSkipped.size > 0) {
+    for (const turnIndex of turnSkipped) skipped.add(turnIndex);
+    return null;
+  }
+  return computeFirstInteractionTitle(turn);
 }
 
 /** Byte offset of the first block at or after turn_index `from`, or undefined when none exists (past the end). */
@@ -302,6 +379,7 @@ function renderTurn(
   starred: boolean,
   transcriptRevision: string,
   blobVersion: string,
+  titleSkippedTurns: ReadonlySet<number>,
   toolPairs: ToolPairs,
 ): string {
   if (turn.compaction) {
@@ -309,6 +387,9 @@ function renderTurn(
   }
   if (view === 'effective' && !onMainPath) return '';
   if (turn.blocks.length === 0) return '';
+  // Title derivation ignores system/developer turns entirely; keep those metadata turns collapsed too.
+  const collapseByDefault =
+    (turnIndex !== undefined && titleSkippedTurns.has(turnIndex)) || turn.role === 'system' || turn.role === 'developer';
 
   const rewound = view === 'chronological' && !onMainPath;
   const cls = `turn ${esc(turn.role)}${rewound ? ' rewound' : ''}${starred ? ' starred' : ''}`;
@@ -323,9 +404,14 @@ function renderTurn(
       `<input type="hidden" name="transcript_revision" value="${esc(transcriptRevision)}">` +
       `<button type="submit" aria-label="${starred ? 'Unstar' : 'Star'} turn" aria-pressed="${starred}" title="${starred ? 'Unstar' : 'Star'} turn">` +
       `${starred ? '&#9733;' : '&#9734;'}</button></form>`;
-  const head = `<div class="turnhead"><span class="role">${esc(turn.role)}</span>${model}${ts}${star}</div>`;
+  const headContent = `<span class="role">${esc(turn.role)}</span>${model}${ts}`;
+  const head = `<div class="turnhead">${headContent}${star}</div>`;
   const body = turn.blocks.map((b, bi) => renderBlock(b, bi, sessionId, mediaIds, blobVersion, toolPairs)).join('');
   if (!body) return '';
+  if (collapseByDefault) {
+    return `<div${anchor} class="${cls} collapsed"><details class="turn-content">` +
+      `<summary class="turnhead">${headContent}</summary><div class="body">${body}</div></details>${star}</div>`;
+  }
   return `<article${anchor} class="${cls}">${head}<div class="body">${body}</div></article>`;
 }
 

@@ -671,6 +671,16 @@ describe('viewer', () => {
       `<a href="/s/${INJECTED_WRAPPERS_TITLE_SESSION}">First interaction after injected wrappers</a>`,
     );
   });
+  it('collapses title-skipped turns by default without nesting controls in the disclosure summary', async () => {
+    const html = await (await SELF.fetch(`https://sessions.vza.net/s/${TITLE_SESSION}`)).text();
+    const skipped = html.match(
+      /<div id="t\d+" class="turn user collapsed"><details class="turn-content"><summary class="turnhead">[\s\S]*?<\/summary><div class="body">[\s\S]*?Injected agent instructions[\s\S]*?<\/div><\/details>/,
+    );
+    expect(skipped).toBeTruthy();
+    expect(skipped![0]).not.toContain('<details open');
+    expect(skipped![0]).not.toContain('<summary class="turnhead"><div');
+    expect(skipped![0]).not.toContain('<form class="turn-star">');
+  });
 
   it('rejects the entire turn when its first text block has an injected prefix', async () => {
     const html = await (await SELF.fetch('https://sessions.vza.net/?q=sameturntitlesentinel')).text();
@@ -678,6 +688,26 @@ describe('viewer', () => {
       `<a href="/s/${PREFIXED_TURN_TITLE_SESSION}?page=1#t2">First later turn title</a>`,
     );
     expect(html).not.toContain('Same-turn text must not become the title');
+  });
+
+  it('derives a detail title when the persisted title is missing or stale', async () => {
+    const before = await testEnv.DB.prepare(
+      'SELECT first_interaction_title FROM sessions WHERE session_id = ?1',
+    ).bind(PREFIXED_TURN_TITLE_SESSION).first<{ first_interaction_title: string | null }>();
+    try {
+      for (const persisted of [null, '# AGENTS.md instructions stale title']) {
+        await testEnv.DB.prepare(
+          'UPDATE sessions SET first_interaction_title = ?2 WHERE session_id = ?1',
+        ).bind(PREFIXED_TURN_TITLE_SESSION, persisted).run();
+        const html = await (await SELF.fetch(`https://sessions.vza.net/s/${PREFIXED_TURN_TITLE_SESSION}`)).text();
+        expect(html).toContain('<title>First later turn title</title>');
+        expect(html).toContain('<h2 style="margin:0">First later turn title</h2>');
+      }
+    } finally {
+      await testEnv.DB.prepare(
+        'UPDATE sessions SET first_interaction_title = ?2 WHERE session_id = ?1',
+      ).bind(PREFIXED_TURN_TITLE_SESSION, before?.first_interaction_title ?? null).run();
+    }
   });
 
   it('skips preserved server tool metadata without suppressing real text later in the same turn', async () => {
@@ -1281,15 +1311,15 @@ describe('viewer', () => {
     expect(ok.headers.get('cache-control')).toContain('immutable');
   });
 
-  it('keeps an unlinked system turn visible in effective view and undimmed in chronological', async () => {
+  it('collapses system turns by default while keeping them visible in both views', async () => {
     const chrono = await (await SELF.fetch(`https://sessions.vza.net/s/${SYSTEM_SESSION}?view=chronological`)).text();
     expect(chrono).toContain('SYSTEMREMINDER');
-    // The system turn's <article> must not carry the rewound class.
-    expect(chrono).toMatch(/<article[^>]*class="turn system"/);
-    expect(chrono).not.toMatch(/<article[^>]*class="turn system[^"]*rewound"/);
+    expect(chrono).toMatch(/<div[^>]*class="turn system collapsed"><details class="turn-content">/);
+    expect(chrono).not.toMatch(/class="turn system collapsed rewound"/);
 
     const effective = await (await SELF.fetch(`https://sessions.vza.net/s/${SYSTEM_SESSION}?view=effective`)).text();
     expect(effective).toContain('SYSTEMREMINDER'); // not hidden
+    expect(effective).toMatch(/<div[^>]*class="turn system collapsed"><details class="turn-content">/);
   });
 
   it('blobVersionOf tokenizes real sha-256 hashes and rejects unknown/short values', () => {
