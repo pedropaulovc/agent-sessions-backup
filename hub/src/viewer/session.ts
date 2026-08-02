@@ -379,7 +379,7 @@ function renderTurn(
   if (turn.blocks.length === 0) return '';
   // Title derivation ignores system/developer turns entirely; keep those metadata turns collapsed too.
   const collapseByDefault =
-    titleSkippedTurns.has(turnIndex ?? turn.index) || turn.role === 'system' || turn.role === 'developer';
+    (turnIndex !== undefined && titleSkippedTurns.has(turnIndex)) || turn.role === 'system' || turn.role === 'developer';
 
   const rewound = view === 'chronological' && !onMainPath;
   const cls = `turn ${esc(turn.role)}${rewound ? ' rewound' : ''}${starred ? ' starred' : ''}`;
