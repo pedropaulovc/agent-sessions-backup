@@ -94,6 +94,37 @@ beforeEach(async () => {
   await seedPrice();
 });
 
+describe('mixed pricing versions', () => {
+  it('refuses to show a class breakdown it cannot yet compute', async () => {
+    // Mid-backfill after a pricing-version bump: SOME rows have been re-priced and carry their
+    // five-way split, others still carry only a total. That mixture is the dangerous state, and it
+    // is why this fixture prices two turns and rolls back exactly one — with the split missing
+    // everywhere, every class sums to 0 and the share is 0 whether or not anything suppresses it,
+    // so the suppression would be untested. Here the surviving row's cache dollars are real, the
+    // rolled-back row's are absent, and the ratio between them is a confident understatement.
+    await seedSession('s1');
+    await seedTurn('s1', '2026-07-20T10:00:00.000Z', { input: 1_000_000, cacheRead: 10_000_000 });
+    await seedTurn('s1', '2026-07-20T11:00:00.000Z', { input: 1_000_000, cacheRead: 10_000_000 });
+    await priceUsage(testEnv.DB, { now: NOW });
+    // Exactly the state a version bump leaves behind, on one row: total intact, split gone.
+    await testEnv.DB.prepare(
+      `UPDATE usage SET priced_version = 1, usd_input = NULL, usd_output = NULL, usd_cache_read = NULL,
+                        usd_cache_write_5m = NULL, usd_cache_write_1h = NULL
+        WHERE ts = ?1`,
+    )
+      .bind('2026-07-20T11:00:00.000Z')
+      .run();
+
+    const s = await collectStats(testEnv.DB, BASE, NOW);
+
+    expect(s.ledger.staleBreakdownCalls, 'the page did not notice the missing breakdown').toBe(1);
+    expect(s.ledger.usd, 'the TOTAL should be unaffected — it comes from usd, which is intact').toBeGreaterThan(0);
+    // Half the corpus still carries its cache dollars, so an unsuppressed share here is a real,
+    // non-zero, confidently WRONG number rather than an obvious zero.
+    expect(s.ledger.cacheShare, 'a cache share was computed from a partial breakdown').toBe(0);
+  });
+});
+
 describe('range windows', () => {
   it('makes the prior window the same length and immediately before the current one', () => {
     const w = windows('30d', NOW);

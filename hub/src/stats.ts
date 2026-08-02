@@ -216,6 +216,8 @@ interface PricedGroup {
   calls: number;
   usd: number;
   unpricedCalls: number;
+  /** Calls whose total is known but whose class split is not yet stored. See the scan. */
+  staleBreakdownCalls: number;
   byClass: CostByClass;
   tokens: { input: number; output: number; cacheRead: number; cw5: number; cw1h: number };
 }
@@ -226,6 +228,7 @@ function emptyGroup(key: string | null): PricedGroup {
     calls: 0,
     usd: 0,
     unpricedCalls: 0,
+    staleBreakdownCalls: 0,
     byClass: { input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0 },
     tokens: { input: 0, output: 0, cacheRead: 0, cw5: 0, cw1h: 0 },
   };
@@ -268,6 +271,7 @@ function foldByKey<T extends ScanRow>(
     g.tokens.cw5 += Number(r.cache_creation_5m_tokens ?? 0);
     g.tokens.cw1h += Number(r.cache_creation_1h_tokens ?? 0);
     g.unpricedCalls += Number(r.unpriced_calls ?? 0);
+    g.staleBreakdownCalls += Number(r.stale_breakdown_calls ?? 0);
     out.set(key, g);
   }
   return out;
@@ -315,6 +319,13 @@ async function mainScan(db: D1Database, f: Filters): Promise<MainRow[]> {
               SUM(u.usd_cache_write_1h) AS usd_cache_write_1h,
               SUM(CASE WHEN u.usd IS NULL AND COALESCE(u.model, '') NOT GLOB '<*' THEN 1 ELSE 0 END)
                 AS unpriced_calls,
+              -- Rows that HAVE a total but not yet the five-way split: priced by an older pricing
+              -- version, awaiting re-pricing. Their class amounts sum as 0, which is
+              -- indistinguishable from free -- the exact confusion this codebase refuses to make
+              -- elsewhere by keeping NULL distinct from 0. Counted so the page can decline to show
+              -- a breakdown it cannot yet compute, rather than show a wrong one confidently.
+              SUM(CASE WHEN u.usd IS NOT NULL AND u.usd_input IS NULL THEN 1 ELSE 0 END)
+                AS stale_breakdown_calls,
               ${USAGE_TOKEN_SUMS_ONLY}
        ${usageFrom(f)}
        ${f.where}
@@ -335,6 +346,7 @@ interface ScanRow {
   usd_cache_write_5m: number | null;
   usd_cache_write_1h: number | null;
   unpriced_calls: number;
+  stale_breakdown_calls: number;
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
@@ -382,6 +394,7 @@ function totalOf(groups: Map<string | null, PricedGroup>): PricedGroup {
     t.calls += g.calls;
     t.usd += g.usd;
     t.unpricedCalls += g.unpricedCalls;
+    t.staleBreakdownCalls += g.staleBreakdownCalls;
     for (const k of Object.keys(t.byClass) as Array<keyof CostByClass>) t.byClass[k] += g.byClass[k];
     for (const k of Object.keys(t.tokens) as Array<keyof PricedGroup['tokens']>) t.tokens[k] += g.tokens[k];
   }
@@ -407,6 +420,12 @@ export interface Ledger {
   sessions: number;
   activeHours: number;
   unpricedCalls: number;
+  /** Calls whose dollar total is known but whose class split is not yet stored, because they were
+   * priced by an older pricing version and the re-pricing pass has not reached them. Non-zero only
+   * during a backfill. The token-economics panel and `cacheShare` are derived from the split, so
+   * they are NOT meaningful while this is non-zero — the page says so rather than showing a
+   * confidently wrong breakdown. */
+  staleBreakdownCalls: number;
   /** Share of dollars spent on cache reads + writes. The number the wireframe argued replaces
    * "$/day": it says how much of the bill is context you are re-sending rather than new work. */
   cacheShare: number;
@@ -568,7 +587,11 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
       sessions: counts.sessions,
       activeHours: counts.activeSeconds / 3600,
       unpricedCalls: total.unpricedCalls,
-      cacheShare: total.usd > 0 ? cacheUsd / total.usd : 0,
+      staleBreakdownCalls: total.staleBreakdownCalls,
+      // Suppressed rather than approximated while any row's split is missing: a cache share
+      // computed from a partial breakdown is not a rough number, it is a number that drifts toward
+      // 0 in proportion to how much of the corpus has not been re-priced yet.
+      cacheShare: total.staleBreakdownCalls === 0 && total.usd > 0 ? cacheUsd / total.usd : 0,
     },
     classes: [
       { label: 'Cache read', tokens: total.tokens.cacheRead, usd: total.byClass.cacheRead },

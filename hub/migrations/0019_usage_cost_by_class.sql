@@ -28,10 +28,23 @@ ALTER TABLE usage ADD COLUMN usd_cache_write_1h REAL;
 -- cost stays readable and stays correct. This is not specific to this migration -- any future
 -- change to what is stored or how it is computed is now a constant bump rather than a hand-written
 -- data migration, which is the difference between repricing being routine and being an event.
-ALTER TABLE usage ADD COLUMN priced_version INTEGER;
+-- NOT NULL DEFAULT 0, and that is load-bearing rather than tidiness. The pass asks "which rows
+-- are below the current version", and the natural way to write that over a nullable column is
+-- `priced_version IS NULL OR priced_version < ?`. SQLite cannot serve an OR across a NULL test and
+-- a range with one index: verified against this table on D1, that predicate plans as `SCAN u`,
+-- i.e. a full 776k-row scan on every run including the steady-state ones where the answer is
+-- "none". With the column NOT NULL the same question is a single range, and the same index is used
+-- AND covering:
+--
+--   OR form:    SCAN u
+--   range form: SEARCH u USING COVERING INDEX usage_due_for_pricing (priced_version<?)
+--
+-- 0 is therefore a real value meaning "not priced by any version", not a stand-in for NULL.
+ALTER TABLE usage ADD COLUMN priced_version INTEGER NOT NULL DEFAULT 0;
 
--- Finding rows due for pricing. Cannot be partial: a partial index's WHERE is fixed at creation
--- and the predicate here is "below whatever the current version is", which changes.
+-- Finding rows due for pricing: a single range over `priced_version`, which is why the column
+-- above is NOT NULL. Cannot be partial: a partial index's WHERE is fixed at creation and the
+-- predicate here is "below whatever the current version is", which changes.
 --
 -- That makes this one entry per row, unlike 0018's `usage_unpriced` -- the cost of the version
 -- mechanism, paid deliberately. It replaces that index rather than joining it: `usd IS NULL` is

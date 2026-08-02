@@ -138,6 +138,21 @@ describe('priceUsage', () => {
     expect(r.usd_input, 'the re-price did not refill the newer columns').toBeCloseTo(1, 9);
   });
 
+  it('leaves an unpriceable row below the current version so later runs retry it', async () => {
+    // How the retry works now that the predicate is a single range: a failed attempt does NOT
+    // advance priced_version, so the row stays due forever. Advancing it would both declare
+    // "priced by version N" about a row carrying no price AND make it invisible to every later
+    // run, exactly when a catalog gaining its model is what would fix it.
+    const id = await seedTurn('s1', { model: 'never-published' });
+
+    await priceUsage(testEnv.DB, { now: NOW });
+
+    const r = await priced(id);
+    expect(r.usd).toBeNull();
+    expect(r.priced_version, 'a failed attempt advanced the version and hid the row').toBe(0);
+    expect(r.priced_at, 'the attempt was not recorded at all').toBe(NOW.toISOString());
+  });
+
   it('records which rate snapshot it used, and prices a turn at the rate in force THEN', async () => {
     // The whole reason `model_prices` is versioned rather than overwritten: an August price cut
     // must not silently rewrite what July cost. Storing the cost makes that permanent, so the

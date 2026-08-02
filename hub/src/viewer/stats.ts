@@ -126,7 +126,9 @@ function ledgerPanel(s: Stats): string {
     tile(fmtUsd(l.usd), 'List-price equivalent', deltaText),
     tile(l.activeHours > 0 ? fmtUsd(l.usd / l.activeHours) : '—', 'Per active hour', `${l.activeHours.toFixed(1)} h of turn-to-turn wall-clock`),
     tile(l.calls > 0 ? fmtUsd(l.usd / l.calls, 4) : '—', 'Per assistant turn', 'blended across models'),
-    tile(`${(l.cacheShare * 100).toFixed(0)}%`, 'Absorbed by cache', 'reads + writes, as a share of spend'),
+    l.staleBreakdownCalls > 0
+      ? tile('—', 'Absorbed by cache', 'unavailable while turns are being re-priced')
+      : tile(`${(l.cacheShare * 100).toFixed(0)}%`, 'Absorbed by cache', 'reads + writes, as a share of spend'),
   ].join('');
   const unpriced = l.unpricedCalls
     ? `<p class="small flag">${fmtInt(l.unpricedCalls)} turns could not be priced, so every dollar figure on this page is a floor.</p>`
@@ -208,7 +210,29 @@ function classesPanel(s: Stats): string {
     `<table class="chart"><thead><tr><th>Class</th><th colspan="3">Share of tokens</th>` +
       `<th colspan="3">Share of cost</th></tr></thead><tbody>${rows}</tbody></table>` +
       `<p class="small muted">reasoning_tokens is deliberately absent: it is 0 for claude-code and a subset of ` +
-      `output for codex, so it is not a sixth billing class and drawing it as one would double-count.</p>`,
+      `output for codex, so it is not a sixth billing class and drawing it as one would double-count.</p>` +
+      staleBreakdownNotice(s),
+  );
+}
+
+/** Said out loud when some turns' costs are known but their class split is not yet stored.
+ *
+ * Only ever true mid-backfill, after a pricing-version bump. Those rows contribute their dollars
+ * to every total on the page and 0 to every class, so the cost side of this table under-reports by
+ * exactly their share — and 0 is indistinguishable from "this class was free", which is the same
+ * conflation the schema refuses to make by keeping an unpriced NULL distinct from a real 0.
+ *
+ * Stated rather than hidden, and rather than suppressing the panel: the token side is completely
+ * accurate throughout, and it is the more useful half. Only the money is provisional. */
+function staleBreakdownNotice(s: Stats): string {
+  if (s.ledger.staleBreakdownCalls === 0) return '';
+  const pct = s.ledger.calls > 0 ? (s.ledger.staleBreakdownCalls / s.ledger.calls) * 100 : 0;
+  return (
+    `<p class="small flag"><b>Cost side is incomplete.</b> ${fmtInt(s.ledger.staleBreakdownCalls)} of ` +
+    `${fmtInt(s.ledger.calls)} turns (${pct.toFixed(1)}%) were priced before this breakdown was stored and ` +
+    `are being re-priced; their dollars count toward the totals elsewhere on this page but not toward any ` +
+    `class here, so every cost figure in this table is a lower bound. Token counts are unaffected. ` +
+    `Cache share is suppressed for the same reason.</p>`
   );
 }
 

@@ -51,6 +51,10 @@ import {
  */
 export const PRICING_VERSION = 2;
 
+/** The version stored on a row no version successfully priced. Matches the column default, so a
+ * never-attempted row and a row whose attempt found no rate are the same kind of due. */
+const UNPRICED_VERSION = 0;
+
 /** Rows read per query. Bounded by D1's response size rather than by the parameter cap — the
  * write side chunks separately. */
 export const PRICING_READ_BATCH = 500;
@@ -121,7 +125,10 @@ export async function priceUsage(
           cost?.byClass.cacheWrite1h ?? null,
           r.epoch,
           startedAt,
-          PRICING_VERSION,
+          // A row we could not price stays at its old version, so it remains due and is retried by
+          // every later run. Advancing it would declare "priced by version N" about a row carrying
+          // no price, and it would never be reconsidered when the catalog gains its model.
+          cost === null ? UNPRICED_VERSION : PRICING_VERSION,
           r.id,
         );
     });
@@ -183,23 +190,29 @@ async function selectUnpriced(
 ): Promise<UnpricedRow[]> {
   const binds: unknown[] = [startedAt, PRICING_VERSION];
   const scope = sessionId ? `AND u.session_id = ?${binds.push(sessionId)}` : '';
-  // Three ways to be due, and they are not the same question:
-  //   priced_version IS NULL  never priced at all.
-  //   priced_version < ?2     priced by an older shape or an older arithmetic -- the repricing
-  //                           path, which is what makes a constant bump sufficient.
-  //   usd IS NULL             priced, and the answer was "no rate". Kept separate from the version
-  //                           check because such a row IS at the current version and would
-  //                           otherwise never be looked at again -- but "unpriceable" is a claim
-  //                           about the catalog on the day it was made, and catalogs gain models.
-  // The priced_at clause is orthogonal to all three: it is what stops a run re-reading rows it has
-  // already attempted this pass. See the module comment.
+  // ONE predicate, deliberately. Every reason a row is due collapses into "its stored version is
+  // below the current one":
+  //   0                never priced by any version (the column's default).
+  //   < PRICING_VERSION priced by an older shape or an older arithmetic -- the repricing path,
+  //                    which is what makes a constant bump sufficient.
+  //   also 0           priced, and the answer was "no rate". A failed attempt does NOT advance the
+  //                    version (see the write), so such a row stays due forever and is retried once
+  //                    per run -- which is what we want, since "unpriceable" is a claim about the
+  //                    catalog on the day it was made and catalogs gain models.
+  //
+  // The obvious spelling -- `priced_version IS NULL OR priced_version < ?2 OR usd IS NULL` -- reads
+  // more explicitly and is unusable: SQLite cannot serve an OR across a NULL test and a range from
+  // one index, so it plans as `SCAN u`, a full 776k-row scan on every run including the ones with
+  // nothing to do. Verified on D1; see migration 0019.
+  //
+  // The priced_at clause is orthogonal: it is what stops a run re-reading rows it has already
+  // attempted this pass. See the module comment.
   const rows = await db
     .prepare(
       `SELECT u.id AS id, u.model AS model, ${priceEpochExpr(prices)} AS epoch,
               ${USAGE_SHAPE_SELECT}, ${USAGE_TOKEN_SUMS}
          FROM usage u
-        WHERE (u.priced_version IS NULL OR u.priced_version < ?2 OR u.usd IS NULL)
-          AND (u.priced_at IS NULL OR u.priced_at < ?1) ${scope}
+        WHERE u.priced_version < ?2 AND (u.priced_at IS NULL OR u.priced_at < ?1) ${scope}
         GROUP BY u.id, u.model, epoch, ${USAGE_SHAPE_GROUP_BY}
         ORDER BY u.priced_at, u.id
         LIMIT ${limit}`,
