@@ -31,6 +31,7 @@ export async function runDailyPricing(env: Env): Promise<void> {
       examined: 0,
       priced: 0,
       unpriceable: 0,
+      superseded: 0,
       more: false,
       ms: Date.now() - started,
       ok: false,

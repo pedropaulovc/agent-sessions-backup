@@ -70,6 +70,11 @@ export interface PricingPassResult {
   priced: number;
   /** Rows left NULL because no rate could be determined. These are retried by the next run. */
   unpriceable: number;
+  /** Rows whose write was superseded: a re-parse changed the inputs between the read and the
+   * write, so the compare-and-set matched nothing. Not a failure — the re-parse also reset the
+   * pricing state, so the row is still due and the next pass prices what it now holds. Counted
+   * because a silently-dropped write and a successful one must not look the same. */
+  superseded: number;
   /** True when the pass stopped on its row budget rather than because it ran out of work — the
    * signal that a backfill needs another run, as opposed to being done. */
   more: boolean;
@@ -78,6 +83,13 @@ export interface PricingPassResult {
 interface UnpricedRow extends UsageAggRow {
   id: number;
   model: string | null;
+  /** Raw column values as read, carried only so the write can compare-and-set on them. */
+  cas_model: string | null;
+  cas_input: number | null;
+  cas_output: number | null;
+  cas_cache_read: number | null;
+  cas_w5: number | null;
+  cas_w1h: number | null;
 }
 
 /** Prices rows whose `usd` is still NULL.
@@ -96,7 +108,7 @@ export async function priceUsage(
   const readBatch = opts.readBatch ?? PRICING_READ_BATCH;
   const prices = await loadPrices(db);
 
-  const result: PricingPassResult = { examined: 0, priced: 0, unpriceable: 0, more: false };
+  const result: PricingPassResult = { examined: 0, priced: 0, unpriceable: 0, superseded: 0, more: false };
 
   while (result.examined < maxRows) {
     const take = Math.min(readBatch, maxRows - result.examined);
@@ -108,13 +120,29 @@ export async function priceUsage(
       const cost = priceOf(r, prices);
       if (cost === null) result.unpriceable++;
       else result.priced++;
+      // COMPARE-AND-SET on the inputs this cost was computed FROM, not a bare `WHERE id`.
+      //
+      // The pass reads a row, prices it in JS, then writes the answer back — and a re-parse of the
+      // same turn can land in between. The ingest conflict branch writes new token counts and
+      // resets the pricing state; a blind write by id would then stamp the OLD cost and the CURRENT
+      // version over it, at which point the row is no longer below the version threshold and no
+      // later pass ever reconsiders it. Permanently wrong money, on a row nothing marks as suspect.
+      //
+      // Matching on the token columns and model means the update simply affects zero rows when the
+      // inputs moved. That is not a failure: the re-parse also reset the pricing state, so the row
+      // is still due and the next pass prices it from the values it now has. Superseded, not lost.
       return db
         .prepare(
           `UPDATE usage
               SET usd = ?1, usd_input = ?2, usd_output = ?3, usd_cache_read = ?4,
                   usd_cache_write_5m = ?5, usd_cache_write_1h = ?6,
                   price_epoch = ?7, priced_at = ?8, priced_version = ?9
-            WHERE id = ?10`,
+            WHERE id = ?10
+              AND model IS ?11
+              AND COALESCE(input_tokens,0) IS ?12 AND COALESCE(output_tokens,0) IS ?13
+              AND COALESCE(cache_read_tokens,0) IS ?14
+              AND COALESCE(cache_creation_5m_tokens,0) IS ?15
+              AND COALESCE(cache_creation_1h_tokens,0) IS ?16`,
         )
         .bind(
           cost?.usd ?? null,
@@ -130,11 +158,28 @@ export async function priceUsage(
           // no price, and it would never be reconsidered when the catalog gains its model.
           cost === null ? UNPRICED_VERSION : PRICING_VERSION,
           r.id,
+          // The CAS operands. These are the RAW column values as they were when this row was read
+          // — deliberately not the clamped sums the shape fragments produce, which are what the
+          // cost was computed from but not what the table stores.
+          r.cas_model ?? null,
+          r.cas_input ?? 0,
+          r.cas_output ?? 0,
+          r.cas_cache_read ?? 0,
+          r.cas_w5 ?? 0,
+          r.cas_w1h ?? 0,
         );
     });
 
     for (let i = 0; i < writes.length; i += PRICING_WRITE_BATCH) {
-      await db.batch(writes.slice(i, i + PRICING_WRITE_BATCH));
+      const res = await db.batch(writes.slice(i, i + PRICING_WRITE_BATCH));
+      // A zero-change UPDATE is the compare-and-set losing to a concurrent re-parse. Reported
+      // rather than swallowed: `priced` was incremented optimistically above, and leaving it there
+      // would claim work the database did not do.
+      for (const r of res) {
+        if ((r.meta?.changes ?? 0) !== 0) continue;
+        result.superseded++;
+        result.priced = Math.max(0, result.priced - 1);
+      }
     }
     // A short read means the query ran out of rows, not that the budget ran out. Distinguishing
     // them is the whole value of `more`: a caller that re-runs on `more` would otherwise loop
@@ -210,6 +255,11 @@ async function selectUnpriced(
   const rows = await db
     .prepare(
       `SELECT u.id AS id, u.model AS model, ${priceEpochExpr(prices)} AS epoch,
+              u.model AS cas_model,
+              COALESCE(u.input_tokens,0) AS cas_input, COALESCE(u.output_tokens,0) AS cas_output,
+              COALESCE(u.cache_read_tokens,0) AS cas_cache_read,
+              COALESCE(u.cache_creation_5m_tokens,0) AS cas_w5,
+              COALESCE(u.cache_creation_1h_tokens,0) AS cas_w1h,
               ${USAGE_SHAPE_SELECT}, ${USAGE_TOKEN_SUMS}
          FROM usage u
         WHERE u.priced_version < ?2 AND (u.priced_at IS NULL OR u.priced_at < ?1) ${scope}

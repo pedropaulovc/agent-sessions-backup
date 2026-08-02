@@ -180,6 +180,55 @@ describe('priceUsage', () => {
     expect((await priced(id)).usd, 'the re-parsed turn kept the cost of its old token counts').toBeCloseTo(5, 9);
   });
 
+  it('does not overwrite a re-parse that landed mid-pass', async () => {
+    // The race. The pass reads a row, prices it in JS, then writes the answer back — and a re-parse
+    // of the same turn can land in between, replacing the token counts and resetting the pricing
+    // state. A blind `WHERE id` would stamp the OLD cost and the CURRENT version over the new data,
+    // putting the row above the version threshold so no later pass reconsiders it: permanently
+    // wrong money on a row nothing marks as suspect.
+    //
+    // `db.batch` is the real seam — it runs after the read and after pricing, immediately before
+    // the write — so mutating the row there reproduces the interleaving exactly rather than
+    // approximating it.
+    await seedPrice();
+    const id = await seedTurn('s1', { input: 1_000_000 });
+
+    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+    let intercepted = false;
+    (testEnv.DB as unknown as { batch: typeof realBatch }).batch = (async (stmts: D1PreparedStatement[]) => {
+      if (!intercepted) {
+        intercepted = true;
+        // The concurrent re-parse: new tokens, pricing state reset — the ON CONFLICT branch.
+        await testEnv.DB.prepare(
+          `UPDATE usage SET input_tokens = 9000000, priced_version = 0, priced_at = NULL, usd = NULL
+            WHERE id = ?1`,
+        )
+          .bind(id)
+          .run();
+      }
+      return realBatch(stmts);
+    }) as typeof realBatch;
+
+    let res;
+    try {
+      res = await priceUsage(testEnv.DB, { now: NOW });
+    } finally {
+      (testEnv.DB as unknown as { batch: typeof realBatch }).batch = realBatch;
+    }
+
+    expect(intercepted, 'the interception never fired, so no race was simulated').toBe(true);
+    expect(res.superseded, 'the stale write was not detected as superseded').toBe(1);
+    expect(res.priced, 'a write that changed nothing was counted as priced').toBe(0);
+
+    const r = await priced(id);
+    expect(r.usd, 'the stale cost was written over the re-parsed row').toBeNull();
+    expect(r.priced_version, 'the row was marked current and will never be re-priced').toBe(0);
+
+    // Still due, so the next pass prices what the row now actually holds: 9M tokens at $1/M.
+    await priceUsage(testEnv.DB, { now: new Date('2026-08-02T12:00:00.000Z') });
+    expect((await priced(id)).usd, 'the superseded row was never picked up again').toBeCloseTo(9, 9);
+  });
+
   it('records which rate snapshot it used, and prices a turn at the rate in force THEN', async () => {
     // The whole reason `model_prices` is versioned rather than overwritten: an August price cut
     // must not silently rewrite what July cost. Storing the cost makes that permanent, so the
