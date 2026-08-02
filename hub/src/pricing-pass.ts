@@ -30,7 +30,7 @@
  * ASC, so rows nobody has tried yet are served ahead of retries of known failures. Progress does
  * not depend on it — the WHERE clause above is what guarantees that.
  */
-import { classifyModel, costOfUsage, loadPrices, type ModelPrice } from './pricing';
+import { classifyModel, costOfUsage, loadPrices, type CostByClass, type ModelPrice } from './pricing';
 import {
   priceEpochExpr,
   priceForGroup,
@@ -39,6 +39,17 @@ import {
   USAGE_TOKEN_SUMS,
   type UsageAggRow,
 } from './usage-agg';
+
+/** What the stored costs were produced by. Bump this whenever the SHAPE of what is stored or the
+ * ARITHMETIC that produces it changes, and every row becomes due for re-pricing automatically —
+ * the cron and the backfill endpoint work through them at their own pace while each row's existing
+ * cost stays readable until the moment it is replaced. The alternative, NULLing a column corpus-
+ * wide to force a re-run, makes the statistics page read $0 for as long as the backfill takes.
+ *
+ * 1 = scalar usd only (migration 0018).
+ * 2 = usd plus the five per-class costs (migration 0019).
+ */
+export const PRICING_VERSION = 2;
 
 /** Rows read per query. Bounded by D1's response size rather than by the parameter cap — the
  * write side chunks separately. */
@@ -90,12 +101,29 @@ export async function priceUsage(
 
     const writes = rows.map((r) => {
       result.examined++;
-      const usd = priceOf(r, prices);
-      if (usd === null) result.unpriceable++;
+      const cost = priceOf(r, prices);
+      if (cost === null) result.unpriceable++;
       else result.priced++;
       return db
-        .prepare(`UPDATE usage SET usd = ?1, price_epoch = ?2, priced_at = ?3 WHERE id = ?4`)
-        .bind(usd, r.epoch, startedAt, r.id);
+        .prepare(
+          `UPDATE usage
+              SET usd = ?1, usd_input = ?2, usd_output = ?3, usd_cache_read = ?4,
+                  usd_cache_write_5m = ?5, usd_cache_write_1h = ?6,
+                  price_epoch = ?7, priced_at = ?8, priced_version = ?9
+            WHERE id = ?10`,
+        )
+        .bind(
+          cost?.usd ?? null,
+          cost?.byClass.input ?? null,
+          cost?.byClass.output ?? null,
+          cost?.byClass.cacheRead ?? null,
+          cost?.byClass.cacheWrite5m ?? null,
+          cost?.byClass.cacheWrite1h ?? null,
+          r.epoch,
+          startedAt,
+          PRICING_VERSION,
+          r.id,
+        );
     });
 
     for (let i = 0; i < writes.length; i += PRICING_WRITE_BATCH) {
@@ -117,15 +145,26 @@ export async function priceUsage(
  * hit an API, so zero IS their cost; leaving them NULL would park them in the unpriced index
  * forever and, worse, report them as pricing coverage we failed to achieve.
  */
-function priceOf(r: UnpricedRow, prices: Map<string, ModelPrice[]>): number | null {
+function priceOf(r: UnpricedRow, prices: Map<string, ModelPrice[]>): StoredCost | null {
   const modelClass = classifyModel(r.model);
-  if (modelClass === 'sentinel') return 0;
+  if (modelClass === 'sentinel') return ZERO_COST;
   if (modelClass !== 'billable') return null;
 
   const price = priceForGroup(prices.get(r.model as string) ?? [], String(r.epoch), r, false);
   const cost = costOfUsage(r, price, { batch: false });
-  return cost.unpriced ? null : cost.usd;
+  return cost.unpriced ? null : { usd: cost.usd, byClass: cost.byClass };
 }
+
+interface StoredCost {
+  usd: number;
+  byClass: CostByClass;
+}
+
+/** A sentinel model's cost, as a fresh object per read so no caller can mutate a shared one. */
+const ZERO_COST: StoredCost = Object.freeze({
+  usd: 0,
+  byClass: Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0 }),
+}) as StoredCost;
 
 /** One row per `usage` row, carrying the shape flags and clamped token sums the shared fragments
  * define.
@@ -142,14 +181,25 @@ async function selectUnpriced(
   sessionId: string | undefined,
   limit: number,
 ): Promise<UnpricedRow[]> {
-  const binds: unknown[] = [startedAt];
+  const binds: unknown[] = [startedAt, PRICING_VERSION];
   const scope = sessionId ? `AND u.session_id = ?${binds.push(sessionId)}` : '';
+  // Three ways to be due, and they are not the same question:
+  //   priced_version IS NULL  never priced at all.
+  //   priced_version < ?2     priced by an older shape or an older arithmetic -- the repricing
+  //                           path, which is what makes a constant bump sufficient.
+  //   usd IS NULL             priced, and the answer was "no rate". Kept separate from the version
+  //                           check because such a row IS at the current version and would
+  //                           otherwise never be looked at again -- but "unpriceable" is a claim
+  //                           about the catalog on the day it was made, and catalogs gain models.
+  // The priced_at clause is orthogonal to all three: it is what stops a run re-reading rows it has
+  // already attempted this pass. See the module comment.
   const rows = await db
     .prepare(
       `SELECT u.id AS id, u.model AS model, ${priceEpochExpr(prices)} AS epoch,
               ${USAGE_SHAPE_SELECT}, ${USAGE_TOKEN_SUMS}
          FROM usage u
-        WHERE u.usd IS NULL AND (u.priced_at IS NULL OR u.priced_at < ?1) ${scope}
+        WHERE (u.priced_version IS NULL OR u.priced_version < ?2 OR u.usd IS NULL)
+          AND (u.priced_at IS NULL OR u.priced_at < ?1) ${scope}
         GROUP BY u.id, u.model, epoch, ${USAGE_SHAPE_GROUP_BY}
         ORDER BY u.priced_at, u.id
         LIMIT ${limit}`,
