@@ -79,6 +79,14 @@ describe('computeFirstInteractionTitle', () => {
       ]),
     ).toBe('first later turn title');
   });
+
+  it('skips recommend_plugins and INSTRUCTIONS turns before the title', () => {
+    expect(
+      computeFirstInteractionTitle(
+        turns('<recommend_plugins>plugin metadata</recommend_plugins>', '<INSTRUCTIONS>setup metadata</INSTRUCTIONS>', 'Real prompt'),
+      ),
+    ).toBe('Real prompt');
+  });
   it('reports only injected representative turns skipped before the title', () => {
     const skipped = titleSkippedTurnIndices([
       block({ turnIndex: 0, text: '<system-reminder>injected</system-reminder>' }),

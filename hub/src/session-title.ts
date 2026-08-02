@@ -13,7 +13,9 @@
 const INJECTED_TURN_PREFIXES = [
   '# AGENTS.md instructions',
   '<local-command-',
+  '<recommend_plugins>',
   '<recommended_plugins>',
+  '<INSTRUCTIONS>',
   '<command-name>',
   '<local-command-stdout>',
   '<codex_internal_context',
