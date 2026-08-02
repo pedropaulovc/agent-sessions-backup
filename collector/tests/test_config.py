@@ -355,6 +355,22 @@ def test_wsl_drops_windows_mount_roots(monkeypatch):
     assert set(cfg.dropped_store_roots()) == {"win"}
 
 
+def test_wsl_drops_injected_omp_root_for_persisted_config(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "detect_platform_tag", lambda: "wsl")
+    monkeypatch.setenv("HOME", "/mnt/c/Users/legacy")
+    cfg = config.Config(
+        machine_id="m",
+        hub_url="http://h",
+        stores={"claude": "~/.claude"},
+        source=tmp_path / "config.toml",
+    )
+
+    roots = cfg.store_roots()
+    dropped = cfg.dropped_store_roots()
+    assert "omp" not in roots
+    assert dropped["omp"] == Path("/mnt/c/Users/legacy/.omp/agent/sessions")
+
+
 def test_wsl_include_windows_mounts_true_keeps_them(monkeypatch):
     monkeypatch.setattr(config, "detect_platform_tag", lambda: "wsl")
     cfg = config.Config(machine_id="m", hub_url="http://x", include_windows_mounts=True,

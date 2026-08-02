@@ -284,8 +284,7 @@ function extractUsage(msg: Record<string, unknown>, model?: string, requestId?: 
   const u = isObj(msg.usage) ? msg.usage : undefined;
   if (!u) return undefined;
   const cc = isObj(u.cacheCreation) ? u.cacheCreation : isObj(u.cache_creation) ? u.cache_creation : undefined;
-  const usage: TurnUsage = {
-    model,
+  const metrics = {
     inputTokens: num(u.input) ?? num(u.inputTokens) ?? num(u.input_tokens),
     outputTokens: num(u.output) ?? num(u.outputTokens) ?? num(u.output_tokens),
     reasoningTokens: num(u.reasoning) ?? num(u.reasoningTokens) ?? num(u.reasoning_tokens),
@@ -293,9 +292,9 @@ function extractUsage(msg: Record<string, unknown>, model?: string, requestId?: 
     cacheCreation5mTokens: num(u.cacheWrite) ?? num(u.cache_write) ?? num(cc?.ephemeral_5m_input_tokens),
     cacheCreation1hTokens: num(cc?.ephemeral_1h_input_tokens),
     serviceTier: str(u.serviceTier) ?? str(u.service_tier),
-    requestId,
   };
-  return Object.values(usage).some((value) => value !== undefined) ? usage : undefined;
+  if (!Object.values(metrics).some((value) => value !== undefined)) return undefined;
+  return { model, requestId, ...metrics };
 }
 
 function markMainPath(

@@ -255,9 +255,12 @@ class Config:
         """Roots excluded by the WSL windows-mount guard, so callers can surface a warning."""
         if not self._drop_windows_mounts():
             return {}
+        stores = dict(self.stores)
+        if self.source is not None:
+            stores.setdefault("omp", DEFAULT_STORES["omp"])
         return {
             n: p
-            for n, r in self.stores.items()
+            for n, r in stores.items()
             if _root_is_windows_mount(p := Path(r).expanduser())
         }
 

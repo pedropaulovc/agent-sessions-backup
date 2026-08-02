@@ -224,6 +224,13 @@ describe('parseOmp', () => {
         timestamp: '2026-07-19T10:00:04.000Z',
         message: { role: 'toolResult', toolCallId: 'tc1', content: [{ type: 'text', text: 'tool output' }], isError: false },
       }),
+      JSON.stringify({
+        type: 'message',
+        id: 'a-bad-usage',
+        parentId: 'r1',
+        timestamp: '2026-07-19T10:00:05.000Z',
+        message: { role: 'assistant', model: 'openai/gpt-test', usage: { unrecognized: 1 } },
+      }),
       'not-json',
     ];
     const session = await parseOmp(readJsonlLines(toStream(records)), sessionId);
@@ -240,9 +247,10 @@ describe('parseOmp', () => {
     expect(session.turns[1]!.blocks.map((block) => block.type)).toEqual(['thinking', 'text', 'tool_use']);
     expect(session.turns[2]!.blocks[0]).toMatchObject({ type: 'tool_result', text: 'tool output', toolUseId: 'tc1' });
     expect(session.stats.parseErrorLines).toBe(1);
+    expect(session.turns).toHaveLength(3);
   });
 
-  it('fails open main-path classification after an oversized line and identifies sidecars', async () => {
+  it('fails open main-path classification after an oversized line', async () => {
     const oversized: JsonlLine = { kind: 'oversized', byteStart: 0, byteLen: MAX_JSONL_LINE_BYTES + 1 };
     const header = JSON.stringify({ type: 'session', version: 3, id: sessionId, timestamp: '2026-07-19T10:00:00.000Z', cwd: '/tmp/omp' });
     const message = JSON.stringify({
@@ -262,6 +270,23 @@ describe('parseOmp', () => {
     expect(session.stats.skippedLineTypes['oversized-line']).toBe(1);
     expect(session.turns).toHaveLength(1);
     expect(session.turns[0]!.onMainPath).toBe(true);
+  });
+
+  it('prunes abandoned branches on a clean parent chain', async () => {
+    const records = [
+      JSON.stringify({ type: 'session', version: 3, id: sessionId, timestamp: '2026-07-19T10:00:00.000Z', cwd: '/tmp/omp' }),
+      JSON.stringify({ type: 'message', id: 'u-root', parentId: null, timestamp: '2026-07-19T10:00:01.000Z', message: { role: 'user', content: 'root' } }),
+      JSON.stringify({ type: 'message', id: 'a-abandoned', parentId: 'u-root', timestamp: '2026-07-19T10:00:02.000Z', message: { role: 'assistant', content: 'abandoned' } }),
+      JSON.stringify({ type: 'message', id: 'u-active', parentId: 'u-root', timestamp: '2026-07-19T10:00:03.000Z', message: { role: 'user', content: 'active' } }),
+      JSON.stringify({ type: 'message', id: 'a-active', parentId: 'u-active', timestamp: '2026-07-19T10:00:04.000Z', message: { role: 'assistant', content: 'active answer' } }),
+    ];
+    const session = await parseOmp(readJsonlLines(toStream(records)), sessionId);
+
+    expect(session.turns.find((turn) => turn.id === 'a-abandoned')?.onMainPath).toBe(false);
+    expect(session.turns.filter((turn) => turn.id !== 'a-abandoned').every((turn) => turn.onMainPath)).toBe(true);
+  });
+
+  it('detects main sessions and nested sidecars', () => {
     expect(detect('omp', 'project/2026-07-19T10-00-00-000Z_main123.jsonl')).toMatchObject({
       harness: 'omp',
       sessionId: 'main123',

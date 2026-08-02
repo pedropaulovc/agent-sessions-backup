@@ -246,7 +246,13 @@ async function parseRange(
     return full ? windowTurns(full, startByte, endByte) : null;
   }
   if (harness === 'omp') {
-    const obj = await env.RAW.get(file.r2_key);
+    // OMP is JSONL, but it cannot be parsed from a page-sized slice: parseOmp needs the title slot
+    // and session header plus the parent map to classify the active branch. Read from byte 0, bounded
+    // by this page's indexed end when one exists, so later pages do not pay for the unneeded tail.
+    const obj =
+      endByte === undefined
+        ? await env.RAW.get(file.r2_key)
+        : await env.RAW.get(file.r2_key, { range: { offset: 0, length: endByte } });
     if (!obj) return null;
     const full = await parseOmp(readJsonlLines(obj.body), sessionId);
     return windowTurns(full, startByte, endByte);

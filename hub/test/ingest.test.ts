@@ -1548,6 +1548,7 @@ describe('hub.d1.write_cost telemetry', () => {
 describe('OMP ingest end-to-end', () => {
   const OMP_ID = '019f0000-0000-7000-8000-0000000000aa';
   const OMP_PATH = `-home-tester-src-demo/2026-07-19T10-00-00-000Z_${OMP_ID}.jsonl`;
+  const OMP_CHILD_PATH = `-home-tester-src-demo/2026-07-19T10-00-00-000Z_${OMP_ID}/agent/child.jsonl`;
   const OMP_CONTENT = [
     { type: 'title', v: 1, title: 'OMP slot title', updatedAt: '2026-07-19T10:00:00.000Z', pad: '' },
     { type: 'session', version: 3, id: OMP_ID, timestamp: '2026-07-19T10:00:00.000Z', cwd: '/home/tester/src/omp', title: 'OMP header title' },
@@ -1613,6 +1614,21 @@ describe('OMP ingest end-to-end', () => {
     const res = await putFile('omp-box', 'omp', OMP_PATH, OMP_CONTENT);
     expect(res.status).toBe(201);
     await drainQueue();
+    const childContent = [
+      { type: 'session', version: 3, id: 'child-header-id', timestamp: '2026-07-19T10:01:00.000Z', cwd: '/home/tester/src/omp' },
+      {
+        type: 'message',
+        id: 'child-user',
+        parentId: null,
+        timestamp: '2026-07-19T10:01:01.000Z',
+        message: { role: 'user', content: [{ type: 'text', text: 'child OMP task' }] },
+      },
+    ]
+      .map((record) => JSON.stringify(record))
+      .join('\n');
+    const child = await putFile('omp-box', 'omp', OMP_CHILD_PATH, childContent);
+    expect(child.status).toBe(201);
+    await drainQueue();
   });
 
   it('indexes OMP metadata, usage, tool output, and searchable text', async () => {
@@ -1649,6 +1665,21 @@ describe('OMP ingest end-to-end', () => {
     });
     expect(search.status).toBe(200);
     expect(((await search.json()) as { hits: Array<{ session_id: string }> }).hits.some((hit) => hit.session_id === OMP_ID)).toBe(true);
+  });
+
+  it('links nested OMP sidecars to their parent session', async () => {
+    const childId = `omp:${OMP_ID}:agent/child.jsonl`;
+    const row = await testEnv.DB.prepare(
+      'SELECT harness, parent_session_id, is_sidechain, index_state FROM sessions WHERE session_id = ?1',
+    )
+      .bind(childId)
+      .first<{ harness: string; parent_session_id: string; is_sidechain: number; index_state: string }>();
+    expect(row).toMatchObject({
+      harness: 'omp',
+      parent_session_id: OMP_ID,
+      is_sidechain: 1,
+      index_state: 'ready',
+    });
   });
 });
 });
