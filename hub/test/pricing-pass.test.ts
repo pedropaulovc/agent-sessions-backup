@@ -73,6 +73,36 @@ async function priced(id: number): Promise<{
     .first())! as never;
 }
 
+/** Runs `body` with the FIRST `db.batch` call preceded by `mutate`.
+ *
+ * `db.batch` is the real seam for the mid-pass race: it runs after the pass has read its rows and
+ * priced them in JS, immediately before the write lands. Mutating the table there reproduces the
+ * interleaving exactly rather than approximating it.
+ *
+ * The interception is asserted to have fired, because the failure mode of this helper is silence —
+ * a pass that stopped using `db.batch` would leave every race test green while simulating no race
+ * at all. Restoring in `finally` matters for the same reason: a leaked stub would follow the
+ * shared binding into every later test in the file.
+ */
+async function withRaceBeforeWrite<T>(mutate: () => Promise<void>, body: () => Promise<T>): Promise<T> {
+  const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+  let intercepted = false;
+  (testEnv.DB as unknown as { batch: typeof realBatch }).batch = (async (stmts: D1PreparedStatement[]) => {
+    if (!intercepted) {
+      intercepted = true;
+      await mutate();
+    }
+    return realBatch(stmts);
+  }) as typeof realBatch;
+  try {
+    const out = await body();
+    expect(intercepted, 'the interception never fired, so no race was simulated').toBe(true);
+    return out;
+  } finally {
+    (testEnv.DB as unknown as { batch: typeof realBatch }).batch = realBatch;
+  }
+}
+
 describe('priceUsage', () => {
   beforeEach(async () => {
     // Storage is shared across tests in this pool, so every fixture here starts from an empty
@@ -178,6 +208,75 @@ describe('priceUsage', () => {
     await priceUsage(testEnv.DB, { now: new Date('2026-08-02T12:00:00.000Z') });
 
     expect((await priced(id)).usd, 'the re-parsed turn kept the cost of its old token counts').toBeCloseTo(5, 9);
+  });
+
+  it('does not overwrite a re-parse that landed mid-pass', async () => {
+    // The race. The pass reads a row, prices it in JS, then writes the answer back — and a re-parse
+    // of the same turn can land in between, replacing the token counts and resetting the pricing
+    // state. A blind `WHERE id` would stamp the OLD cost and the CURRENT version over the new data,
+    // putting the row above the version threshold so no later pass reconsiders it: permanently
+    // wrong money on a row nothing marks as suspect.
+    //
+    // `db.batch` is the real seam — it runs after the read and after pricing, immediately before
+    // the write — so mutating the row there reproduces the interleaving exactly rather than
+    // approximating it.
+    await seedPrice();
+    const id = await seedTurn('s1', { input: 1_000_000 });
+
+    const res = await withRaceBeforeWrite(
+      // The concurrent re-parse: new tokens, pricing state reset — the ON CONFLICT branch.
+      () =>
+        testEnv.DB.prepare(
+          `UPDATE usage SET input_tokens = 9000000, priced_version = 0, priced_at = NULL, usd = NULL
+            WHERE id = ?1`,
+        )
+          .bind(id)
+          .run()
+          .then(() => undefined),
+      () => priceUsage(testEnv.DB, { now: NOW }),
+    );
+
+    expect(res.superseded, 'the stale write was not detected as superseded').toBe(1);
+    expect(res.priced, 'a write that changed nothing was counted as priced').toBe(0);
+
+    const r = await priced(id);
+    expect(r.usd, 'the stale cost was written over the re-parsed row').toBeNull();
+    expect(r.priced_version, 'the row was marked current and will never be re-priced').toBe(0);
+
+    // Still due, so the next pass prices what the row now actually holds: 9M tokens at $1/M.
+    await priceUsage(testEnv.DB, { now: new Date('2026-08-02T12:00:00.000Z') });
+    expect((await priced(id)).usd, 'the superseded row was never picked up again').toBeCloseTo(9, 9);
+  });
+
+  it('charges a superseded write to the bucket THAT row was counted in', async () => {
+    // A batch mixes priceable and unpriceable rows, and `db.batch` returns its results
+    // positionally. So undoing the optimistic count for a superseded write has to know which
+    // bucket that particular row incremented: always decrementing `priced` takes the count away
+    // from a DIFFERENT row that was written successfully, under-reporting real work while still
+    // reporting the failed one as done.
+    //
+    // Two rows, and the one that loses the race is the UNPRICEABLE one — the case where the two
+    // buckets disagree. The single-row race test above cannot distinguish them, because there the
+    // superseded row and the counted row are necessarily the same row.
+    await seedPrice();
+    const ok = await seedTurn('s1', { input: 1_000_000 });
+    const nope = await seedTurn('s1', { model: 'model-with-no-published-rate' });
+
+    const res = await withRaceBeforeWrite(
+      () =>
+        testEnv.DB.prepare('UPDATE usage SET input_tokens = 9000000 WHERE id = ?1')
+          .bind(nope)
+          .run()
+          .then(() => undefined),
+      () => priceUsage(testEnv.DB, { now: NOW }),
+    );
+
+    expect(res.superseded).toBe(1);
+    expect(res.unpriceable, 'the superseded row was still counted as a completed no-rate verdict').toBe(0);
+    expect(res.priced, 'the decrement landed on a row that WAS written').toBe(1);
+    // And the successfully-written row is genuinely written, so `priced: 1` is not one error
+    // cancelling another.
+    expect((await priced(ok)).usd, 'the priceable row in the same batch was not written').toBeCloseTo(1, 9);
   });
 
   it('records which rate snapshot it used, and prices a turn at the rate in force THEN', async () => {

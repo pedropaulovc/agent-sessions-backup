@@ -2,6 +2,7 @@ import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { CC_SESSION_ID, ccAssistantLine, ccNoiseLines, ccUserLine } from './fixtures';
+import { PRICING_VERSION } from '../src/pricing-pass';
 
 const testEnv = env as unknown as Env;
 
@@ -1543,5 +1544,95 @@ describe('hub.d1.write_cost telemetry', () => {
     // that threw — not the chunks after it.
     expect(cost!.batches).toBe(3);
     expect(cost!.rows_written as number).toBe(cost!.rows_written_clear as number);
+  });
+});
+
+/** The pricing reset on re-parse, exercised through the REAL ingest path.
+ *
+ * The equivalent test in pricing-pass.test.ts mimics writeSession's ON CONFLICT branch with a
+ * hand-written UPDATE, so it asserts my model of that branch rather than the branch — it passes
+ * even with the production reset deleted. This one puts the same file twice with different usage
+ * and lets the consumer do it. */
+describe('re-parse invalidates a stored cost', () => {
+  const SID = '11111111-2222-4333-8444-555555555555';
+
+  function transcript(inputTokens: number): string {
+    return (
+      JSON.stringify({
+        parentUuid: null,
+        isSidechain: false,
+        cwd: '/home/tester/src/demo',
+        sessionId: SID,
+        version: '2.1.99',
+        gitBranch: 'main',
+        type: 'user',
+        uuid: 'u1',
+        timestamp: '2026-07-20T10:00:00.000Z',
+        message: { role: 'user', content: 'hi' },
+      }) +
+      '\n' +
+      JSON.stringify({
+        parentUuid: 'u1',
+        isSidechain: false,
+        cwd: '/home/tester/src/demo',
+        sessionId: SID,
+        version: '2.1.99',
+        gitBranch: 'main',
+        type: 'assistant',
+        uuid: 'a1',
+        requestId: 'req_reparse',
+        timestamp: '2026-07-20T10:00:01.000Z',
+        message: {
+          id: 'msg_reparse',
+          role: 'assistant',
+          model: 'reparse-model',
+          content: [{ type: 'text', text: 'ok' }],
+          usage: { input_tokens: inputTokens, output_tokens: 0, service_tier: 'standard' },
+        },
+      }) +
+      '\n'
+    );
+  }
+
+  it('re-prices a turn whose tokens changed, through writeSession', async () => {
+    await testEnv.DB.prepare(
+      `INSERT OR REPLACE INTO model_prices
+         (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
+          cache_write_5m_cost, cache_write_1h_cost, cache_accounting, source, fetched_at)
+       VALUES ('reparse-model', '2026-01-01', 'reparse-model', 'anthropic', 1, 10, 0.1, 2, 4,
+               'disjoint', 'test', '2026-07-31T00:00:00Z')`,
+    ).run();
+
+    await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${SID}.jsonl`, transcript(1_000_000));
+    await drainQueue();
+    const first = await testEnv.DB.prepare('SELECT usd, priced_version FROM usage WHERE session_id = ?1')
+      .bind(SID)
+      .first<{ usd: number | null; priced_version: number }>();
+    expect(first?.usd, 'the ingest pricing hook did not price the new session').toBeCloseTo(1, 6);
+    expect(first?.priced_version, 'priced, but not stamped as priced -- the row stays due forever').toBe(PRICING_VERSION);
+
+    // Same path, same file, five times the tokens. writeSession takes its ON CONFLICT branch.
+    await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${SID}.jsonl`, transcript(5_000_000));
+    await drainQueue();
+
+    // The count first, and it is not decoration. Everything below reads through `.first()`, which
+    // with no ORDER BY picks an arbitrary row -- so if the conflict branch ever stopped matching
+    // and INSERTED a second turn instead of updating the first, `.first()` could hand back the new
+    // $5 row and every assertion here would pass while the thing under test was broken.
+    const rows = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM usage WHERE session_id = ?1')
+      .bind(SID)
+      .first<{ n: number }>();
+    expect(rows?.n, 'the re-parse inserted a second usage row instead of updating the first').toBe(1);
+
+    const after = await testEnv.DB.prepare(
+      'SELECT usd, input_tokens, priced_version FROM usage WHERE session_id = ?1',
+    )
+      .bind(SID)
+      .first<{ usd: number | null; input_tokens: number; priced_version: number }>();
+    expect(after?.input_tokens, 'the re-parse did not reach the usage row').toBe(5_000_000);
+    expect(after?.usd, 'the re-parsed turn kept the cost of its old token counts').toBeCloseTo(5, 6);
+    // The reset is only half the mechanism; the row also has to come back UP to the current
+    // version, or it stays due forever and every later pass re-prices it for nothing.
+    expect(after?.priced_version, 'the re-priced row was not stamped with the current version').toBe(PRICING_VERSION);
   });
 });
