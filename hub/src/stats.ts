@@ -322,20 +322,30 @@ interface MainRow extends UsageAggRow {
   meta?: SessionMeta;
 }
 
-/** Totals-only scan, for the prior comparison window. Grouped by the pricing unit alone, because
- * the only thing read off it is one dollar figure. */
-async function windowTotal(db: D1Database, prices: Map<string, ModelPrice[]>, f: Filters): Promise<number> {
-  const rows = await db
-    .prepare(
-      `SELECT u.model AS model, ${priceEpochExpr(prices)} AS epoch,
-              ${USAGE_SHAPE_SELECT}, ${USAGE_TOKEN_SUMS}
-       ${usageFrom(f)}
-       ${f.where}
-       GROUP BY u.model, epoch, ${USAGE_SHAPE_GROUP_BY}`,
-    )
+/** Totals-only scan, for the prior comparison window.
+ *
+ * One number, so this is now a plain aggregate over the stored per-turn cost rather than a
+ * grouped scan folded through `costOfUsage` in JS. It used to have to reproduce the whole pricing
+ * unit — epoch, shape booleans, six clamped token sums, 30 groups — for the sole purpose of
+ * arriving at a single dollar figure.
+ *
+ * Measured on production over the same June window, old form against new:
+ *
+ *   | form                                    | time  | rows read |
+ *   |-----------------------------------------|-------|-----------|
+ *   | grouped by pricing unit, priced in JS   | 359ms | 240,869   |
+ *   | SUM(u.usd)                              |  56ms | 120,435   |
+ *
+ * `SUM` skips NULLs, which is exactly right: an unpriceable row contributes nothing rather than
+ * a zero, matching what the fold did with it. The rows themselves are still counted by the
+ * unpriced tally on the main scan, so the coverage gap stays visible rather than being absorbed
+ * into a total that looks complete. */
+async function windowTotal(db: D1Database, f: Filters): Promise<number> {
+  const row = await db
+    .prepare(`SELECT SUM(u.usd) AS usd ${usageFrom(f)} ${f.where}`)
     .bind(...f.binds)
-    .all<UsageAggRow>();
-  return totalOf(foldByKey(rows.results ?? [], prices, (r) => r.model ?? null)).usd;
+    .first<{ usd: number | null }>();
+  return Number(row?.usd ?? 0);
 }
 
 function totalOf(groups: Map<string | null, PricedGroup>): PricedGroup {
@@ -493,7 +503,7 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
     sessionCounts(db, narrow),
     // `all` has no prior window to compare against, and running the query anyway would scan the
     // whole table again to produce a number the UI then refuses to show.
-    w.prior.from ? windowTotal(db, prices, priorF) : Promise.resolve(0),
+    w.prior.from ? windowTotal(db, priorF) : Promise.resolve(0),
   ]);
 
   const rows = scan

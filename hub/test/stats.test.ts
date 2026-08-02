@@ -1,6 +1,7 @@
 import { env, SELF } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { collectStats, MAX_EXCLUDED_BINDS, windows, type StatsQuery } from '../src/stats';
+import { priceUsage } from '../src/pricing-pass';
 
 /** The statistics page. Its arithmetic is tested through `collectStats` against real D1 rather
  * than by parsing HTML; the page itself is covered by one smoke test that it renders and one
@@ -13,6 +14,17 @@ const testEnv = env as unknown as Env;
 const NOW = new Date('2026-08-01T12:00:00.000Z');
 
 const BASE: StatsQuery = { range: '30d', by: 'project', tzOffsetHours: 0 };
+
+/** The page reads dollars off `usage.usd`, which the pricing pass fills — in production from the
+ * ingest hook and the nightly cron. These fixtures INSERT into `usage` directly, so they have to
+ * run the pass themselves or every dollar assertion here would be asserting on an unpriced table.
+ *
+ * Deliberately the real pass rather than a hand-written UPDATE: a fixture that priced rows its own
+ * way could agree with itself while disagreeing with production. */
+async function stats(db: D1Database, q: StatsQuery, now: Date) {
+  await priceUsage(db, { maxRows: 100_000, now });
+  return collectStats(db, q, now);
+}
 
 /** One model, one rate, arithmetic that is easy to check by hand: 1/M input, 10/M output,
  * 0.1/M cache read, 2/M and 4/M cache writes. Disjoint accounting, so cache reads add on top. */
@@ -109,7 +121,7 @@ describe('ledger', () => {
     // Prior window (35 days back): 1M input = $1.
     await seedTurn('s1', '2026-06-27T10:00:00.000Z', { input: 1_000_000 });
 
-    const s = await collectStats(testEnv.DB, BASE, NOW);
+    const s = await stats(testEnv.DB, BASE, NOW);
     expect(s.ledger.usd).toBeCloseTo(11, 6);
     expect(s.ledger.priorUsd).toBeCloseTo(1, 6);
     expect(s.ledger.calls).toBe(1);
@@ -122,7 +134,7 @@ describe('ledger', () => {
     await seedTurn('real', '2026-07-20T10:00:00.000Z', { input: 1_000_000 });
     await seedTurn('plog', '2026-07-20T10:00:00.000Z', { input: 500_000_000 });
 
-    const s = await collectStats(testEnv.DB, BASE, NOW);
+    const s = await stats(testEnv.DB, BASE, NOW);
     expect(s.ledger.usd, 'prompt-log usage reached the ledger').toBeCloseTo(1, 6);
     expect(s.ledger.calls).toBe(1);
   });
@@ -140,7 +152,7 @@ describe('ledger', () => {
     await seedTurn('real', '2026-07-20T10:00:00.000Z', { input: 1 });
     await seedTurn('plog', '2026-07-21T03:00:00.000Z', { input: 1 });
 
-    const s = await collectStats(testEnv.DB, BASE, NOW);
+    const s = await stats(testEnv.DB, BASE, NOW);
     expect(s.rhythm.reduce((a, c) => a + c.calls, 0), 'prompt-log turns reached the heatmap').toBe(1);
     expect(s.rhythm[0]!.hour, 'the surviving turn is not the real one').toBe(10);
   });
@@ -160,7 +172,7 @@ describe('ledger', () => {
       await seedTurn(`plog-${i}`, '2026-07-21T03:00:00.000Z', { input: 500_000_000 });
     }
 
-    const s = await collectStats(testEnv.DB, BASE, NOW);
+    const s = await stats(testEnv.DB, BASE, NOW);
     expect(s.ledger.usd, 'prompt-log usage reached the ledger').toBeCloseTo(1, 6);
     expect(s.ledger.calls, 'the main scan let prompt-log through').toBe(1);
     // The narrow panels are separate queries running the same predicate, and they are the ones
@@ -173,7 +185,7 @@ describe('ledger', () => {
     // of the bill, and it is the bill that this number is about.
     await seedSession('s1');
     await seedTurn('s1', '2026-07-20T10:00:00.000Z', { cacheRead: 9_000_000, output: 1_000_000 });
-    const s = await collectStats(testEnv.DB, BASE, NOW);
+    const s = await stats(testEnv.DB, BASE, NOW);
     expect(s.ledger.cacheShare).toBeCloseTo(0.9 / 10.9, 6);
   });
 
@@ -183,7 +195,7 @@ describe('ledger', () => {
       `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens)
        VALUES ('s1', 900, '2026-07-20T10:00:00.000Z', 'no-such-model', 1000000)`,
     ).run();
-    const s = await collectStats(testEnv.DB, BASE, NOW);
+    const s = await stats(testEnv.DB, BASE, NOW);
     expect(s.ledger.unpricedCalls).toBe(1);
     expect(s.ledger.usd).toBe(0);
   });
@@ -199,7 +211,7 @@ describe('token economics', () => {
       w5: 1_000_000,
       w1h: 1_000_000,
     });
-    const s = await collectStats(testEnv.DB, BASE, NOW);
+    const s = await stats(testEnv.DB, BASE, NOW);
     const byLabel = new Map(s.classes.map((c) => [c.label, c]));
     expect(byLabel.get('Fresh input')!.usd).toBeCloseTo(1, 6);
     expect(byLabel.get('Output')!.usd).toBeCloseTo(10, 6);
@@ -218,7 +230,7 @@ describe('session shape', () => {
     await seedTurn('s1', '2026-07-20T10:00:00.000Z', { depth: 2, input: 1_000_000 });
     await seedTurn('s1', '2026-07-20T11:00:00.000Z', { depth: 120, input: 10_000_000 });
 
-    const s = await collectStats(testEnv.DB, BASE, NOW);
+    const s = await stats(testEnv.DB, BASE, NOW);
     const byBand = new Map(s.depth.map((d) => [d.label, d]));
     expect(byBand.get('1–5')!.usdPerCall).toBeCloseTo(1, 6);
     expect(byBand.get('101–200')!.usdPerCall).toBeCloseTo(10, 6);
@@ -235,7 +247,7 @@ describe('cache tuning', () => {
     await seedTurn('s1', '2026-07-20T10:00:20.000Z', { depth: 1 }); // 20s
     await seedTurn('s1', '2026-07-20T10:20:20.000Z', { depth: 2 }); // 20m
 
-    const s = await collectStats(testEnv.DB, BASE, NOW);
+    const s = await stats(testEnv.DB, BASE, NOW);
     const byBand = new Map(s.gaps.map((g) => [g.label, g]));
     expect(byBand.get('15–30s')!.turns).toBe(1);
     expect(byBand.get('15–30s')!.overFiveMin).toBe(false);
@@ -252,7 +264,7 @@ describe('cache tuning', () => {
     await seedSession('s1');
     await seedTurn('s1', '2026-07-20T10:00:00.000Z', { depth: 0 });
     await seedTurn('s1', '2026-07-20T10:30:00.000Z', { depth: 1 });
-    const s = await collectStats(testEnv.DB, BASE, NOW);
+    const s = await stats(testEnv.DB, BASE, NOW);
     const byBand = new Map(s.gaps.map((g) => [g.label, g]));
     expect(byBand.get('10–30m')!.turns).toBe(0);
     expect(byBand.get('30–60m')!.turns).toBe(1);
@@ -264,7 +276,7 @@ describe('cache tuning', () => {
     await seedSession('s1');
     await seedTurn('s1', '2026-07-20T10:00:00.000Z', { depth: 0 });
     await seedTurn('s1', '2026-07-20T10:05:00.000Z', { depth: 1 });
-    const s = await collectStats(testEnv.DB, BASE, NOW);
+    const s = await stats(testEnv.DB, BASE, NOW);
     const hit = s.gaps.find((g) => g.turns > 0)!;
     expect(hit.label).toBe('5–10m');
     expect(hit.overFiveMin, 'a 5-minute gap was counted as covered by the 5m TTL').toBe(true);
@@ -276,7 +288,7 @@ describe('cache tuning', () => {
     await seedSession('s1');
     await seedTurn('s1', '2026-07-20T10:00:00.000Z', { depth: 0 });
     await seedTurn('s1', '2026-07-20T09:00:00.000Z', { depth: 1 });
-    const s = await collectStats(testEnv.DB, BASE, NOW);
+    const s = await stats(testEnv.DB, BASE, NOW);
     expect(s.gaps.reduce((a, g) => a + g.turns, 0), 'a backwards gap was counted').toBe(0);
   });
 });
@@ -288,7 +300,7 @@ describe('attribution', () => {
     await seedTurn('a', '2026-07-20T10:00:00.000Z', { input: 1_000_000 });
     await seedTurn('b', '2026-07-20T10:00:00.000Z', { input: 2_000_000 });
 
-    const s = await collectStats(testEnv.DB, { ...BASE, by: 'branch' }, NOW);
+    const s = await stats(testEnv.DB, { ...BASE, by: 'branch' }, NOW);
     const keys = s.attribution.map((r) => r.key);
     expect(keys).toContain('alpha@main');
     expect(keys).toContain('beta@main');
@@ -301,7 +313,7 @@ describe('attribution', () => {
        VALUES ('np', 'claude-code', 'box', '2026-07-20T00:00:00Z', 'ready')`,
     ).run();
     await seedTurn('np', '2026-07-20T10:00:00.000Z', { input: 1_000_000 });
-    const s = await collectStats(testEnv.DB, { ...BASE, by: 'project' }, NOW);
+    const s = await stats(testEnv.DB, { ...BASE, by: 'project' }, NOW);
     expect(s.attribution.map((r) => r.key)).toContain('(no project)');
   });
 });
@@ -312,17 +324,17 @@ describe('rhythm', () => {
     // 02:00 UTC on Monday 2026-07-20 is 18:00 the previous day (Sunday) at UTC-8.
     await seedTurn('s1', '2026-07-20T02:00:00.000Z', { input: 1 });
 
-    const utc = await collectStats(testEnv.DB, BASE, NOW);
+    const utc = await stats(testEnv.DB, BASE, NOW);
     expect(utc.rhythm).toEqual([{ dow: 1, hour: 2, calls: 1 }]);
 
-    const pacific = await collectStats(testEnv.DB, { ...BASE, tzOffsetHours: -8 }, NOW);
+    const pacific = await stats(testEnv.DB, { ...BASE, tzOffsetHours: -8 }, NOW);
     expect(pacific.rhythm, 'the timezone offset did not move the cell').toEqual([{ dow: 0, hour: 18, calls: 1 }]);
   });
 
   it('leaves a turn with no timestamp off the clock', async () => {
     await seedSession('s1');
     await seedTurn('s1', null, { input: 1 });
-    const s = await collectStats(testEnv.DB, { ...BASE, range: 'all' }, NOW);
+    const s = await stats(testEnv.DB, { ...BASE, range: 'all' }, NOW);
     expect(s.rhythm).toEqual([]);
   });
 });
@@ -334,7 +346,7 @@ describe('outliers', () => {
     await seedTurn('cheap', '2026-07-20T10:00:00.000Z', { input: 1_000_000 });
     await seedTurn('pricey', '2026-07-20T10:00:00.000Z', { input: 50_000_000 });
 
-    const s = await collectStats(testEnv.DB, BASE, NOW);
+    const s = await stats(testEnv.DB, BASE, NOW);
     expect(s.outliers[0]!.sessionId).toBe('pricey');
     expect(s.outliers[0]!.title).toBe('the expensive one');
     expect(s.outliers[0]!.usd).toBeCloseTo(50, 6);
@@ -344,7 +356,7 @@ describe('outliers', () => {
     await seedSession('s1', { title: 'raw' });
     await testEnv.DB.prepare(`UPDATE sessions SET first_interaction_title = 'parsed' WHERE session_id = 's1'`).run();
     await seedTurn('s1', '2026-07-20T10:00:00.000Z', { input: 1_000_000 });
-    const s = await collectStats(testEnv.DB, BASE, NOW);
+    const s = await stats(testEnv.DB, BASE, NOW);
     expect(s.outliers[0]!.title).toBe('parsed');
   });
 });
@@ -356,7 +368,7 @@ describe('filters', () => {
     await seedTurn('cc', '2026-07-20T10:00:00.000Z', { input: 1_000_000 });
     await seedTurn('cx', '2026-07-20T10:00:00.000Z', { input: 9_000_000 });
 
-    const s = await collectStats(testEnv.DB, { ...BASE, harness: 'claude-code' }, NOW);
+    const s = await stats(testEnv.DB, { ...BASE, harness: 'claude-code' }, NOW);
     expect(s.ledger.usd).toBeCloseTo(1, 6);
     // The filter has to reach the other queries too. A panel built from an unfiltered query
     // would still show beta here, and nothing on the page would say so.
