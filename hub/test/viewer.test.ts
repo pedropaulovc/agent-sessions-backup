@@ -671,6 +671,16 @@ describe('viewer', () => {
       `<a href="/s/${INJECTED_WRAPPERS_TITLE_SESSION}">First interaction after injected wrappers</a>`,
     );
   });
+  it('collapses title-skipped turns by default without nesting controls in the disclosure summary', async () => {
+    const html = await (await SELF.fetch(`https://sessions.vza.net/s/${TITLE_SESSION}`)).text();
+    const skipped = html.match(
+      /<div id="t\d+" class="turn user title-skipped"><details class="turn-content"><summary class="turnhead">[\s\S]*?<\/summary><div class="body">[\s\S]*?Injected agent instructions[\s\S]*?<\/div><\/details>/,
+    );
+    expect(skipped).toBeTruthy();
+    expect(skipped![0]).not.toContain('<details open');
+    expect(skipped![0]).not.toContain('<summary class="turnhead"><div');
+    expect(skipped![0]).not.toContain('<form class="turn-star">');
+  });
 
   it('rejects the entire turn when its first text block has an injected prefix', async () => {
     const html = await (await SELF.fetch('https://sessions.vza.net/?q=sameturntitlesentinel')).text();

@@ -57,6 +57,32 @@ export interface TitleBlock {
  * skipped (dropping the whole turn) when it starts with an injected wrapper. Special harness
  * wrappers (teammate, scheduled-task, task/command messages) resolve to their embedded subject. */
 export function computeFirstInteractionTitle(blocks: TitleBlock[]): string | null {
+  for (const representative of titleRepresentatives(blocks)) {
+    if (representative.skipped) continue;
+    return deriveTitle(representative.text);
+  }
+  return null;
+}
+
+/** Return the turn indices whose representative is discarded by title derivation. This is shared
+ * with the viewer so injected setup turns are collapsed there for the same reason they are absent
+ * from the session title. */
+export function titleSkippedTurnIndices(blocks: TitleBlock[]): ReadonlySet<number> {
+  const skipped = new Set<number>();
+  for (const representative of titleRepresentatives(blocks)) {
+    if (!representative.skipped) break;
+    skipped.add(representative.turnIndex);
+  }
+  return skipped;
+}
+
+interface TitleRepresentative {
+  turnIndex: number;
+  text: string;
+  skipped: boolean;
+}
+
+function* titleRepresentatives(blocks: TitleBlock[]): Generator<TitleRepresentative> {
   const eligible = blocks
     .filter((b) =>
       (b.role === 'user' || b.role === 'assistant') &&
@@ -80,10 +106,12 @@ export function computeFirstInteractionTitle(blocks: TitleBlock[]): string | nul
 
     representativeTaken = true;
     // This block represents the turn. An injected wrapper here drops the whole turn.
-    if (startsWithAny(stripped, INJECTED_TURN_PREFIXES)) continue;
-    return deriveTitle(stripped);
+    yield {
+      turnIndex: block.turnIndex,
+      text: stripped,
+      skipped: startsWithAny(stripped, INJECTED_TURN_PREFIXES),
+    };
   }
-  return null;
 }
 
 /** Resolve the display title: the derived first-interaction title, else the harness-stored title,
