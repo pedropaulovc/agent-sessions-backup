@@ -113,9 +113,9 @@ The response shape depends on what the session's canonical file actually is
 
 Params: `q` (FTS5 MATCH syntax — invalid syntax is retried as a quoted literal phrase, then
 degrades to an empty result set rather than a 500), `harness`, `machine`, `os`, `model`,
-`repo`, `project`, `cwd`, `session_date`, `session_time`, `has_star=1`, `from`, `to`,
-`limit` (default 100, max 100), `cursor` (opaque, paginates), `facets=1` (adds counts for
-the registered search facets, including `has_star`).
+`repo`, `project`, `cwd`, `session_date`, `session_time`, `has_star=1`, `subagent=no|yes`
+(defaults to `no`), `from`, `to`, `limit` (default 100, max 100), `cursor` (opaque,
+paginates), `facets=1` (adds counts for registered facets, including `has_star` and `subagent`).
 
 ### `GET /api/v1/usage?group_by=day|model|machine|repo&from&to&machine&harness&batch`
 

@@ -90,6 +90,8 @@ form.search button { background: var(--accent); color: #fff; border-color: var(-
 .facets li a { min-width: 0; overflow-wrap: anywhere; }
 .facets li .n { flex: 0 0 auto; color: var(--muted); }
 .facets li.active { font-weight: 700; }
+.facets .facet-more { margin: 0 0 4px; }
+.facets .facet-more summary { color: var(--accent); cursor: pointer; }
 table { border-collapse: collapse; width: 100%; }
 th, td { text-align: left; padding: 6px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
 th { color: var(--muted); font-weight: 600; font-size: 12px; }

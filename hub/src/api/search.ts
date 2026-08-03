@@ -7,6 +7,7 @@ import {
   mergeFacetCounts,
   selectedValues,
   sessionDurationSql,
+  subagentSessionSql,
   totalTokensSql,
 } from '../session-filters';
 
@@ -23,7 +24,7 @@ export function searchHitsSql(where: string, sort: string | null, limit: number,
   return `SELECT b.session_id, b.turn_index, b.block_index, b.role, b.btype, b.tool_name, b.ts,
                  snippet(blocks_fts, 0, '<mark>', '</mark>', '…', 16) AS snip,
                  bm25(blocks_fts) AS rank,
-                 s.harness, s.machine_id, s.os, s.cwd, s.repo_url, s.primary_model,
+                 s.harness, s.machine_id, s.os, s.cwd, s.repo_url, s.primary_model, ${subagentSessionSql('s')} AS subagent,
                  s.first_interaction_title, s.title AS stored_title, s.started_at, s.index_state,
                  ${sessionDurationSql('s')} AS duration_seconds, ${totalTokensSql('s')} AS total_tokens
           FROM blocks_fts
@@ -48,6 +49,7 @@ export interface SearchHit {
     started_at: string | null;
     duration_seconds: number | null;
     total_tokens: number;
+    subagent: 'no' | 'yes';
     index_state: string;
   };
 }
@@ -162,6 +164,7 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
       started_at: (r.started_at as string | null) ?? null,
       duration_seconds: r.duration_seconds === null ? null : Number(r.duration_seconds),
       total_tokens: Number(r.total_tokens),
+      subagent: r.subagent === 'yes' ? 'yes' : 'no',
       index_state: r.index_state as string,
     },
   }));

@@ -15,7 +15,7 @@ type FacetOrder = 'count' | 'value-desc' | 'bucket';
 export interface MultiValueFilterDefinition {
   key: string;
   param: string;
-  kind: 'column' | 'session-date' | 'session-time' | 'has-star';
+  kind: 'column' | 'session-date' | 'session-time' | 'has-star' | 'subagent';
   column?: SessionColumn;
   label?: string;
   facetOrder?: FacetOrder;
@@ -28,11 +28,12 @@ export const FACET_DEFINITIONS: readonly MultiValueFilterDefinition[] = [
   { key: 'machine_id', param: 'machine', kind: 'column', column: 'machine_id', label: 'Machine', facetOrder: 'count', valueLimit: 200 },
   { key: 'os', param: 'os', kind: 'column', column: 'os', label: 'OS', facetOrder: 'count', valueLimit: 200 },
   { key: 'primary_model', param: 'model', kind: 'column', column: 'primary_model', label: 'Model', facetOrder: 'count', valueLimit: 200 },
-  { key: 'repo_url', param: 'repo', kind: 'column', column: 'repo_url', label: 'Repo', facetOrder: 'count' },
   { key: 'project_name', param: 'project', kind: 'column', column: 'project_name', label: 'Project', facetOrder: 'count', valueLimit: 200 },
   { key: 'session_date', param: 'session_date', kind: 'session-date', label: 'Session date/time', facetOrder: 'value-desc' },
   { key: 'session_time', param: 'session_time', kind: 'session-time', label: 'Session time', facetOrder: 'bucket' },
   { key: 'has_star', param: 'has_star', kind: 'has-star', label: 'Has star', facetOrder: 'count' },
+  { key: 'subagent', param: 'subagent', kind: 'subagent', label: 'Is subagent session', facetOrder: 'count' },
+  { key: 'repo_url', param: 'repo', kind: 'column', column: 'repo_url', label: 'Repo', facetOrder: 'count' },
 ] as const;
 
 const NON_FACET_MULTI_FILTERS: readonly MultiValueFilterDefinition[] = [
@@ -56,8 +57,13 @@ export function totalTokensSql(alias: string): string {
   return `COALESCE(${alias}.tokens_in, 0) + COALESCE(${alias}.tokens_out, 0)`;
 }
 
+export function subagentSessionSql(alias: string): string {
+  return `(CASE WHEN ${alias}.parent_session_id IS NOT NULL OR COALESCE(${alias}.is_sidechain, 0) = 1 THEN 'yes' ELSE 'no' END)`;
+}
+
 export function facetExpressionSql(definition: MultiValueFilterDefinition, alias: string): string {
   if (definition.kind === 'column') return `${alias}.${definition.column}`;
+  if (definition.kind === 'subagent') return subagentSessionSql(alias);
   if (definition.kind === 'session-date') return `substr(${alias}.started_at, 1, 10)`;
   if (definition.kind === 'has-star') {
     return `(CASE WHEN EXISTS (SELECT 1 FROM starred_turns st WHERE st.session_id = ${alias}.session_id) THEN '1' END)`;
@@ -81,6 +87,11 @@ export function facetOrderSql(definition: MultiValueFilterDefinition): string {
 }
 
 export function selectedValues(params: URLSearchParams, definition: MultiValueFilterDefinition): string[] {
+  if (definition.kind === 'subagent') {
+    const value = params.get(definition.param)?.trim();
+    return value === 'yes' || value === 'no' ? [value] : ['no'];
+  }
+
   const values: string[] = [];
   const seen = new Set<string>();
   for (const rawValue of params.getAll(definition.param)) {
@@ -103,6 +114,7 @@ export function selectedFacetValues(params: URLSearchParams): Record<string, str
 export function canonicalSessionFilterEntries(params: URLSearchParams): Array<[string, string]> {
   const entries: Array<[string, string]> = [];
   for (const definition of ALL_MULTI_FILTERS) {
+    if (definition.kind === 'subagent' && !params.has(definition.param)) continue;
     for (const value of selectedValues(params, definition)) entries.push([definition.param, value]);
   }
   for (const param of ['from', 'to'] as const) {
@@ -116,9 +128,11 @@ export function canonicalizeMultiValueFilters(params: URLSearchParams): void {
   const canonical = ALL_MULTI_FILTERS.map((definition) => ({
     definition,
     values: selectedValues(params, definition),
+    include: definition.kind !== 'subagent' || params.has(definition.param),
   }));
   for (const { definition } of canonical) params.delete(definition.param);
-  for (const { definition, values } of canonical) {
+  for (const { definition, values, include } of canonical) {
+    if (!include) continue;
     for (const value of values) params.append(definition.param, value);
   }
 }
@@ -172,6 +186,7 @@ export function facetLabelValue(definition: MultiValueFilterDefinition, value: s
     return SESSION_TIME_BUCKETS.find((bucket) => bucket.value === value)?.label ?? value;
   }
   if (definition.kind === 'has-star') return value === '1' ? 'Yes' : value;
+  if (definition.kind === 'subagent') return value === 'yes' ? 'Yes' : value === 'no' ? 'No' : value;
   return value;
 }
 
@@ -179,5 +194,6 @@ function validValue(definition: MultiValueFilterDefinition, value: string): bool
   if (definition.kind === 'session-date') return /^\d{4}-\d{2}-\d{2}$/.test(value);
   if (definition.kind === 'session-time') return SESSION_TIME_VALUES.has(value);
   if (definition.kind === 'has-star') return value === '1';
+  if (definition.kind === 'subagent') return value === 'no' || value === 'yes';
   return true;
 }
