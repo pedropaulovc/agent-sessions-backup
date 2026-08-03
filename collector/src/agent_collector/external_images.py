@@ -95,7 +95,10 @@ def _resolved_roots(declared_cwd: str | None, trusted_roots: list[str | Path] | 
     roots: list[Path] = []
     for value in values:
         try:
-            root = _windows_to_native(str(value)).expanduser().resolve(strict=True)
+            expanded = Path(str(value)).expanduser()
+            if not _is_absolute_path(str(expanded)):
+                continue
+            root = _windows_to_native(str(expanded)).resolve(strict=True)
         except (OSError, RuntimeError):
             continue
         if root not in roots:

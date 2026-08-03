@@ -267,6 +267,25 @@ def test_discovery_does_not_inherit_explicit_empty_source(tmp_path):
 
 
 
+def test_discovery_rejects_relative_trusted_root(monkeypatch, tmp_path):
+    image_root = tmp_path / "relative-assets"
+    image_root.mkdir()
+    image = image_root / "001_img01.jpeg"
+    body = b"relative root bytes"
+    image.write_bytes(body)
+    digest = hashlib.sha256(body).hexdigest()
+    transcript = tmp_path / "session.jsonl"
+    _transcript(transcript, str(tmp_path / "workspace"), digest, str(image))
+
+    monkeypatch.chdir(tmp_path)
+    assets, events = discover_external_assets(
+        transcript, "session.jsonl", None, ["relative-assets"],
+    )
+
+    assert not assets
+    assert any(event.code == "outside_cwd_or_missing" for event in events)
+
+
 def test_safe_filename_and_windows_path_shape(tmp_path):
     assert safe_asset_filename(r"C:\src\a b?.jpeg") == "a_b_.jpeg"
     assert safe_asset_filename("a" * 130 + ".jpeg") == "a" * 123 + ".jpeg"
