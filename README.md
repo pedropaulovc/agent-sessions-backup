@@ -27,6 +27,14 @@ Run this in PowerShell to update an enrolled collector to the current `main` bra
 iwr https://raw.githubusercontent.com/pedropaulovc/agent-sessions-backup/main/scripts/setup-windows-collector.ps1 | iex
 ```
 
+## Update a Linux or WSL collector
+
+Run this in a Linux shell to update an enrolled collector to the current `main` branch, replace its systemd user timer, and send an immediate heartbeat. It requires `uv` and a working `systemctl --user` session; WSL must have systemd enabled.
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pedropaulovc/agent-sessions-backup/main/scripts/setup-linux-collector.sh | bash -s -- --interval 15
+```
+
 ## Principles
 
 - **R2 is truth.** The D1 index is derived and fully rebuildable from raw files alone.
