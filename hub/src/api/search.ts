@@ -195,7 +195,12 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
     }
   } else if (wantFacets) {
     for (const definition of FACET_DEFINITIONS) {
-      facets[definition.key] = mergeFacetCounts([], selectedValues(p, definition));
+      // An invalid MATCH expression has no meaningful result set to facet. Keep the established
+      // empty-facet response for an implicit default, while retaining any explicit selection.
+      const selected = definition.kind === 'subagent' && !p.has(definition.param)
+        ? []
+        : selectedValues(p, definition);
+      facets[definition.key] = mergeFacetCounts([], selected);
     }
   }
 
