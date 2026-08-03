@@ -8,4 +8,4 @@
  * A machine reporting anything else — older, newer, or null because it never sent one — is a machine
  * whose uploads are produced by code no one reviewed against this hub.
  */
-export const EXPECTED_COLLECTOR_VERSION = '0.3.0';
+export const EXPECTED_COLLECTOR_VERSION = '0.4.0';
