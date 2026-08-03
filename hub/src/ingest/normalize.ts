@@ -33,7 +33,19 @@ export interface NormalizedBlock {
   byteLen: number;
 }
 
-const RASTER_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+const RASTER_MEDIA_TYPES: Record<string, true> = {
+  'image/jpeg': true,
+  'image/png': true,
+  'image/gif': true,
+  'image/webp': true,
+};
+const RASTER_MEDIA_BY_EXTENSION: Record<string, string> = {
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  gif: 'image/gif',
+  webp: 'image/webp',
+};
 /** Normalize a MIME value before comparing or rendering it. */
 export function normalizeMediaType(value: unknown): string | undefined {
   if (typeof value !== 'string') return undefined;
@@ -93,9 +105,15 @@ export function externalAssetFromImage(
   const sourcePath = typeof sourceMeta?.value === 'string' ? sourceMeta.value : undefined;
   const data = typeof raw.data === 'string' ? raw.data : typeof source?.data === 'string' ? source.data : undefined;
   const digest = data?.match(/^blob:sha256:([0-9a-f]{64})$/i)?.[1]?.toLowerCase();
-  const mediaType = imageMediaType(raw);
-  if (!digest || !sourcePath || !mediaType || !RASTER_MEDIA_TYPES.has(mediaType)) return undefined;
+  const mediaType = imageMediaType(raw) ?? (sourcePath ? imageMediaTypeFromFileName(sourcePath) : undefined);
+  if (!digest || !sourcePath || !mediaType || !RASTER_MEDIA_TYPES[mediaType]) return undefined;
   return { digest, fileName: safeAssetFilename(sourcePath), mediaType };
+}
+
+function imageMediaTypeFromFileName(sourcePath: string): string | undefined {
+  const fileName = safeAssetFilename(sourcePath);
+  const extension = fileName.slice(fileName.lastIndexOf('.') + 1).toLowerCase();
+  return RASTER_MEDIA_BY_EXTENSION[extension];
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

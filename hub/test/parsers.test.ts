@@ -260,7 +260,7 @@ describe('parseOmp', () => {
         parentId: null,
         message: {
           role: 'assistant',
-          content: [{ type: 'image', data: `blob:sha256:${digest.toUpperCase()}`, mimeType: 'image/jpeg; charset=binary', details: { meta: { source: { value: 'C:\\external-secret\\001_img01.jpeg' } } } }],
+          content: [{ type: 'image', data: `blob:sha256:${digest.toUpperCase()}`, details: { meta: { source: { value: 'C:\\external-secret\\001_img01.jpeg' } } } }],
         },
       }),
     ];

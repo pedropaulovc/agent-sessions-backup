@@ -189,20 +189,22 @@ function* blocksFrom(
           ...at,
         };
         for (const nested of imageItems(raw.content)) {
+          const externalAsset = externalAssetFromImage(nested, enclosingDetails);
           yield {
             type: 'image',
-            mediaType: imageMediaType(nested),
-            externalAsset: externalAssetFromImage(nested, enclosingDetails),
+            mediaType: imageMediaType(nested) ?? externalAsset?.mediaType,
+            externalAsset,
             ...at,
           };
         }
         break;
       }
       case 'image': {
+        const externalAsset = externalAssetFromImage(raw, enclosingDetails);
         yield {
           type: 'image',
-          mediaType: imageMediaType(raw),
-          externalAsset: externalAssetFromImage(raw, enclosingDetails),
+          mediaType: imageMediaType(raw) ?? externalAsset?.mediaType,
+          externalAsset,
           ...at,
         };
         break;

@@ -58,7 +58,7 @@ def test_discovery_inherits_tool_result_source_for_nested_image(tmp_path):
             "role": "toolResult",
             "content": [
                 {"type": "text", "text": "Read image file [image/jpeg]"},
-                {"type": "image", "data": f"blob:sha256:{digest}", "mimeType": "image/jpeg"},
+                {"type": "image", "data": f"blob:sha256:{digest}"},
             ],
             "details": {
                 "fileSize": len(body),

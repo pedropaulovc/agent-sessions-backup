@@ -41,6 +41,7 @@ const SEARCH_SESSION = 'aaaaaaaa-1111-4111-8111-111111111111';
 const BIG_SESSION = 'bbbbbbbb-2222-4222-8222-222222222222';
 const LONG_SESSION = 'cccccccc-3333-4333-8333-333333333333';
 const BLOB_SESSION = 'dddddddd-4444-4444-8444-444444444444';
+const NESTED_BLOB_SESSION = 'dddddddd-4444-4444-8444-444444444445';
 const REWIND_SESSION = 'eeeeeeee-5555-4555-8555-555555555555';
 const SYSTEM_SESSION = 'ffffffff-6666-4666-8666-666666666666';
 const UNVER_SESSION = '99999999-7777-4777-8777-777777777777';
@@ -286,6 +287,29 @@ describe('viewer', () => {
       ccLine(BLOB_SESSION, { uuid: 'b3', parentUuid: 'b2', role: 'user', document: { mediaType: 'text/html', data: HTML_DOC_B64 } }),
     ].join('\n');
     expect((await putFile('claude-projects', `-home-tester-src-demo/${BLOB_SESSION}.jsonl`, blobContent)).status).toBe(201);
+    const nestedBlobContent = JSON.stringify({
+      parentUuid: null,
+      isSidechain: false,
+      userType: 'external',
+      cwd: '/home/tester/src/demo',
+      sessionId: NESTED_BLOB_SESSION,
+      version: '2.1.99',
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'nested-tool',
+          content: [
+            { type: 'text', text: 'nested image output' },
+            { type: 'image', source: { type: 'base64', mimeType: 'image/png', data: TINY_PNG_B64 } },
+          ],
+        }],
+      },
+      uuid: 'nested-image-result',
+      timestamp: '2026-07-01T10:00:01.000Z',
+    });
+    expect((await putFile('claude-projects', `-home-tester-src-demo/${NESTED_BLOB_SESSION}.jsonl`, nestedBlobContent)).status).toBe(201);
     const externalAssetContent = [
       JSON.stringify({
         parentUuid: null,
@@ -318,7 +342,7 @@ describe('viewer', () => {
           content: [{
             type: 'tool_result',
             tool_use_id: 'external-tool',
-            content: [{ type: 'image', data: `blob:sha256:${EXTERNAL_ASSET_DIGEST}`, mimeType: 'image/jpeg' }],
+            content: [{ type: 'image', data: `blob:sha256:${EXTERNAL_ASSET_DIGEST}` }],
           }],
         },
         uuid: 'external-image-result',
@@ -1527,6 +1551,22 @@ describe('viewer', () => {
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toBe('image/png');
     expect(res.headers.get('cache-control')).toContain('immutable');
+    const got = new Uint8Array(await res.arrayBuffer());
+    const want = Uint8Array.from(atob(TINY_PNG_B64), (c) => c.charCodeAt(0));
+    expect([...got]).toEqual([...want]);
+  });
+
+  it('serves an inline image nested inside a tool result', async () => {
+    const block = await testEnv.DB.prepare(
+      "SELECT id, block_index FROM blocks WHERE session_id = ?1 AND btype = 'image'",
+    )
+      .bind(NESTED_BLOB_SESSION)
+      .first<{ id: number; block_index: number }>();
+    expect(block?.block_index).toBe(1);
+
+    const res = await SELF.fetch(`https://sessions.vza.net/s/${NESTED_BLOB_SESSION}/blob/${block!.id}`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('image/png');
     const got = new Uint8Array(await res.arrayBuffer());
     const want = Uint8Array.from(atob(TINY_PNG_B64), (c) => c.charCodeAt(0));
     expect([...got]).toEqual([...want]);

@@ -1,5 +1,6 @@
 /** GET /s/{id}/blob/{block_id}?v={hash} — serve a single image/document by range-reading its source line from R2. */
 
+import { imageMediaType } from '../ingest/normalize';
 import { blobVersionOf } from './session';
 
 // Only these raster types are safe to render inline from the viewer origin. Everything else —
@@ -81,7 +82,8 @@ export async function blobEndpoint(sessionId: string, blockId: string, url: URL,
 
 /**
  * Reproduce the parser's per-line block ordering and return the base64 media source at `blockIndex`.
- * Mirrors claude-code.ts blocksFrom yield conditions so block_index lines up with the indexed row.
+ * Mirrors claude-code.ts blocksFrom yield conditions, including images nested in tool_result content,
+ * so block_index lines up with the indexed row.
  */
 function extractMediaAt(envelope: Record<string, unknown>, blockIndex: number): { data: string; mediaType: string } | null {
   const msg = isObj(envelope.message) ? envelope.message : undefined;
@@ -91,21 +93,26 @@ function extractMediaAt(envelope: Record<string, unknown>, blockIndex: number): 
 
   let out = 0;
   for (const raw of list) {
-    if (!isObj(raw)) continue;
-    const yielded = yieldsBlock(raw);
-    if (!yielded) continue;
-    if (out === blockIndex) {
-      if (raw.type !== 'image' && raw.type !== 'document') return null;
-      const source = isObj(raw.source) ? raw.source : undefined;
-      const data = str(source?.data) ?? str(raw.data);
-      const mediaType =
-        str(source?.media_type) ?? str(raw.mimeType) ?? str(raw.mediaType) ?? str(raw.media_type);
-      if (!data || !mediaType) return null;
-      return { data, mediaType };
-    }
+    if (!isObj(raw) || !yieldsBlock(raw)) continue;
+    if (out === blockIndex) return mediaFromRaw(raw);
     out++;
+    if (raw.type !== 'tool_result' || !Array.isArray(raw.content)) continue;
+    for (const nested of raw.content) {
+      if (!isObj(nested) || nested.type !== 'image') continue;
+      if (out === blockIndex) return mediaFromRaw(nested);
+      out++;
+    }
   }
   return null;
+}
+
+function mediaFromRaw(raw: Record<string, unknown>): { data: string; mediaType: string } | null {
+  if (raw.type !== 'image' && raw.type !== 'document') return null;
+  const source = isObj(raw.source) ? raw.source : undefined;
+  const data = str(source?.data) ?? str(raw.data);
+  const mediaType = imageMediaType(raw);
+  if (!data || !mediaType) return null;
+  return { data, mediaType };
 }
 
 /**
