@@ -10,6 +10,8 @@ interface Env {
   API_HOST: string;
   VIEWER_HOST: string;
   R2_DASHBOARD_BASE_URL: string;
+  /** Independent HMAC secret for short-lived viewer links to captured external assets. */
+  ASSET_SIGNING_SECRET?: string;
   SETUP_TOKEN?: string;
   // Cloudflare's managed client-certificate lifecycle is authorized through a private
   // OAuth client. The singleton Durable Object owns the grant and never returns bearer

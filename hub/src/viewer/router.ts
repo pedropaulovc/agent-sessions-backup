@@ -1,5 +1,6 @@
 import { originOk, readSession } from '../auth/session';
 import { webauthnRoute } from '../auth/webauthn';
+import { assetEndpoint } from './assets';
 import { blobEndpoint } from './blob';
 import { machinesPage } from './machines';
 import { searchPage } from './search';
@@ -69,10 +70,19 @@ function handle(url: URL, env: Env): Promise<Response> {
   if (path === '/' || path === '') return searchPage(url, env);
   if (path === '/machines') return machinesPage(env);
   if (path === '/stats') return statsPage(url, env);
+  const asset = path.match(/^\/s\/([^/]+)\/asset\/([^/]+)\/([^/]+)$/);
+  if (asset) {
+    return assetEndpoint(
+      decodeURIComponent(asset[1]!),
+      decodeURIComponent(asset[2]!),
+      decodeURIComponent(asset[3]!),
+      url,
+      env,
+    );
+  }
 
   const blob = path.match(/^\/s\/([^/]+)\/blob\/([^/]+)$/);
   if (blob) return blobEndpoint(decodeURIComponent(blob[1]!), decodeURIComponent(blob[2]!), url, env);
-
   const session = path.match(/^\/s\/([^/]+)\/?$/);
   if (session) return sessionPage(decodeURIComponent(session[1]!), url, env);
 

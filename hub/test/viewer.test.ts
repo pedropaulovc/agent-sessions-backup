@@ -6,6 +6,7 @@ import { deriveProjectName } from '../src/project-name';
 import { searchHitsSql } from '../src/api/search';
 import { buildSessionFilterSql } from '../src/session-filters';
 import { viewerRoute } from '../src/viewer/router';
+import { assetEndpoint, signExternalAssetUrl } from '../src/viewer/assets';
 import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures';
 import { blobVersionOf } from '../src/viewer/session';
 import { turnFallbackKeyOf, turnKeyOf } from '../src/turn-key';
@@ -61,6 +62,9 @@ const ENCODED_SCHEDULED_TITLE_SESSION = '60606060-ffff-4fff-8fff-ffffffffffff';
 const INJECTED_WRAPPERS_TITLE_SESSION = 'injected-wrapper-title-session';
 const STAR_STABLE_SESSION = '70707070-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const STAR_STABLE_RELPATH = `-home-tester-src-demo/${STAR_STABLE_SESSION}.jsonl`;
+const EXTERNAL_ASSET_SESSION = '90909090-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
+const EXTERNAL_ASSET_DIGEST = '745e7d5e3c944e1143bf69e4af91bf24466ee45acd9ac70468f38ba2a6f0a842';
+const EXTERNAL_ASSET_RELPATH = `-home-tester-src-demo/${EXTERNAL_ASSET_SESSION}.jsonl`;
 const REPO_URL = 'https://github.com/tester/facetdemo';
 
 const WRAPPER_TITLE_CASES = [
@@ -282,6 +286,46 @@ describe('viewer', () => {
       ccLine(BLOB_SESSION, { uuid: 'b3', parentUuid: 'b2', role: 'user', document: { mediaType: 'text/html', data: HTML_DOC_B64 } }),
     ].join('\n');
     expect((await putFile('claude-projects', `-home-tester-src-demo/${BLOB_SESSION}.jsonl`, blobContent)).status).toBe(201);
+    const externalAssetContent = [
+      JSON.stringify({
+        parentUuid: null,
+        isSidechain: false,
+        userType: 'external',
+        cwd: '/home/tester/src/demo',
+        sessionId: EXTERNAL_ASSET_SESSION,
+        version: '2.1.99',
+        gitBranch: 'main',
+        type: 'assistant',
+        message: {
+          role: 'assistant',
+          content: [{ type: 'tool_use', id: 'external-tool', name: 'read', input: { path: 'references/001_img01.jpeg' } }],
+        },
+        uuid: 'external-image-call',
+        timestamp: '2026-07-01T10:00:00.000Z',
+      }),
+      JSON.stringify({
+        parentUuid: 'external-image-call',
+        isSidechain: false,
+        userType: 'external',
+        cwd: '/home/tester/src/demo',
+        sessionId: EXTERNAL_ASSET_SESSION,
+        version: '2.1.99',
+        gitBranch: 'main',
+        type: 'user',
+        message: {
+          role: 'user',
+          details: { meta: { source: { value: 'C:\\src\\harmonic-analyzer\\references\\001_img01.jpeg' } } },
+          content: [{
+            type: 'tool_result',
+            tool_use_id: 'external-tool',
+            content: [{ type: 'image', data: `blob:sha256:${EXTERNAL_ASSET_DIGEST}`, mimeType: 'image/jpeg' }],
+          }],
+        },
+        uuid: 'external-image-result',
+        timestamp: '2026-07-01T10:00:01.000Z',
+      }),
+    ].join('\n');
+    expect((await putFile('claude-projects', EXTERNAL_ASSET_RELPATH, externalAssetContent)).status).toBe(201);
 
     const rewindRelpath = `-home-tester-src-demo/${REWIND_SESSION}.jsonl`;
     const rewindRes = await putFile('claude-projects', rewindRelpath, crossPageRewindSession(REWIND_SESSION));
@@ -437,6 +481,17 @@ describe('viewer', () => {
     starStableR2Key = starStableFile!.r2_key;
 
     await drainQueue();
+    const externalAssetFile = await testEnv.DB.prepare(
+      'SELECT r2_key FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
+    )
+      .bind('testbox-wsl', 'claude-projects', EXTERNAL_ASSET_RELPATH)
+      .first<{ r2_key: string }>();
+    expect(externalAssetFile).toBeTruthy();
+    await testEnv.RAW.put(
+      `${externalAssetFile!.r2_key}.assets/${EXTERNAL_ASSET_DIGEST}/001_img01.jpeg`,
+      new TextEncoder().encode('external jpeg bytes'),
+      { sha256: EXTERNAL_ASSET_DIGEST },
+    );
 
     await testEnv.DB.batch([
       testEnv.DB.prepare(
@@ -830,6 +885,53 @@ describe('viewer', () => {
     expect(html).not.toContain('Download raw session');
     // inline image points at the blob endpoint
     expect(html).toMatch(new RegExp(`/s/${SEARCH_SESSION}/blob/\\d+`));
+  });
+  it('renders external assets through short-lived same-origin R2 links', async () => {
+    const res = await SELF.fetch(`https://sessions.vza.net/s/${EXTERNAL_ASSET_SESSION}`);
+    expect(res.status).toBe(200);
+    const html = await res.text();
+    const match = html.match(/<img class="media" loading="lazy" src="([^"]+)" alt="image">/);
+    expect(match).toBeTruthy();
+    expect(match![1]).toContain(`/asset/${EXTERNAL_ASSET_DIGEST}/001_img01.jpeg?`);
+    expect(html).not.toContain('harmonic-analyzer');
+
+    const assetUrl = new URL(match![1]!.replaceAll('&amp;', '&'), 'https://sessions.vza.net');
+    const now = Math.floor(Date.now() / 1000);
+    const exp = Number(assetUrl.searchParams.get('exp'));
+    expect(exp).toBeGreaterThan(now);
+    expect(exp).toBeLessThanOrEqual(now + 15 * 60);
+
+    const asset = await SELF.fetch(assetUrl);
+    expect(asset.status).toBe(200);
+    expect(asset.headers.get('content-type')).toBe('image/jpeg');
+    expect(new TextDecoder().decode(await asset.arrayBuffer())).toBe('external jpeg bytes');
+
+    assetUrl.searchParams.set('exp', '1');
+    expect((await SELF.fetch(assetUrl)).status).toBe(403);
+  });
+  it('rejects an invalid asset signature before querying candidate files', async () => {
+    const noQueryEnv = {
+      ...testEnv,
+      DB: { prepare: () => { throw new Error('candidate query must not run'); } },
+    } as unknown as Env;
+    const exp = Math.floor(Date.now() / 1000) + 60;
+    const url = new URL(`https://sessions.vza.net/s/${EXTERNAL_ASSET_SESSION}/asset/${EXTERNAL_ASSET_DIGEST}/001_img01.jpeg?exp=${exp}&sig=${'A'.repeat(43)}`);
+    const response = await assetEndpoint(EXTERNAL_ASSET_SESSION, EXTERNAL_ASSET_DIGEST, '001_img01.jpeg', url, noQueryEnv);
+    expect(response.status).toBe(403);
+  });
+  it('uses a dedicated production signer secret instead of the passkey bootstrap token', async () => {
+    const asset = { digest: EXTERNAL_ASSET_DIGEST, fileName: '001_img01.jpeg', mediaType: 'image/jpeg' };
+    const missing = {
+      ...testEnv,
+      ENVIRONMENT: 'production',
+      SETUP_TOKEN: 'bootstrap-only',
+      ASSET_SIGNING_SECRET: undefined,
+    } as unknown as Env;
+    expect(await signExternalAssetUrl(EXTERNAL_ASSET_SESSION, asset, missing, 1_000)).toBeUndefined();
+
+    const configured = { ...missing, ASSET_SIGNING_SECRET: 'asset-link-secret' } as unknown as Env;
+    const link = await signExternalAssetUrl(EXTERNAL_ASSET_SESSION, asset, configured, 1_000);
+    expect(link).toContain(`/s/${EXTERNAL_ASSET_SESSION}/asset/${EXTERNAL_ASSET_DIGEST}/001_img01.jpeg?exp=1900&sig=`);
   });
 
   it('keeps single-file sessions on the R2 object details page', async () => {

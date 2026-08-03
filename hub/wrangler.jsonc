@@ -149,7 +149,9 @@
       "observability": { "enabled": true, "head_sampling_rate": 1 }
     }
   }
-  // secrets: SETUP_TOKEN (passkey bootstrap). Cloudflare certificate lifecycle uses
-  // Authorization Code + PKCE; the OAuth grant lives only in CF_OAUTH_BROKER storage.
-  // preview env: DEV_AUTH (bearer gate) via `wrangler secret put DEV_AUTH --env preview`
+  // secrets: SETUP_TOKEN (passkey bootstrap), ASSET_SIGNING_SECRET (independent HMAC
+  // secret for short-lived external-asset viewer links). Cloudflare certificate lifecycle
+  // uses Authorization Code + PKCE; the OAuth grant lives only in CF_OAUTH_BROKER storage.
+  // preview env: DEV_AUTH (bearer gate) via `wrangler secret put DEV_AUTH --env preview`;
+  // optionally set ASSET_SIGNING_SECRET independently for preview asset links.
 }

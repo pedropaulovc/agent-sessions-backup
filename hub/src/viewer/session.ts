@@ -10,6 +10,7 @@ import { parseConversationById } from '../ingest/parsers/export-inbox';
 import { parsePromptLog } from '../ingest/parsers/history';
 import { computeFirstInteractionTitle, sessionDisplayTitle, titleSkippedTurnIndices, type TitleBlock } from '../session-title';
 import { turnKeyOf } from '../turn-key';
+import { signExternalAssetUrl } from './assets';
 import { esc, pageFoot, pageHead, q } from './layout';
 
 /** Turns per page. Pages are turn_index buckets [(p-1)*SIZE, p*SIZE), so a block's page is floor(turn_index/SIZE)+1. */
@@ -163,7 +164,7 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
             // D1 lookup has no matching row (e.g. compaction markers, which have no content block rows).
             const onMainPath = indexed ? indexed.onMainPath : turn.onMainPath;
             const key = turnKeyOf(turn);
-            const html = renderTurn(
+            const html = await renderTurn(
               turn,
               sessionId,
               view,
@@ -176,6 +177,7 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
               blobVersion,
               titleSkippedTurns,
               toolPairs,
+              env,
             );
             if (html) {
               controller.enqueue(encoder.encode(html));
@@ -368,7 +370,7 @@ function windowTurns(s: NormalizedSession, startByte: number | undefined, endByt
   return s;
 }
 
-function renderTurn(
+async function renderTurn(
   turn: NormalizedTurn,
   sessionId: string,
   view: View,
@@ -381,19 +383,17 @@ function renderTurn(
   blobVersion: string,
   titleSkippedTurns: ReadonlySet<number>,
   toolPairs: ToolPairs,
-): string {
+  env: Env,
+): Promise<string> {
   if (turn.compaction) {
     return `<div class="divider">── context compacted ──</div>`;
   }
   if (view === 'effective' && !onMainPath) return '';
   if (turn.blocks.length === 0) return '';
-  // Title derivation ignores system/developer turns entirely; keep those metadata turns collapsed too.
   const collapseByDefault =
     (turnIndex !== undefined && titleSkippedTurns.has(turnIndex)) || turn.role === 'system' || turn.role === 'developer';
-
   const rewound = view === 'chronological' && !onMainPath;
   const cls = `turn ${esc(turn.role)}${rewound ? ' rewound' : ''}${starred ? ' starred' : ''}`;
-  // Stable anchor id (present in every view) so search-hit deep links can scroll to the matching turn.
   const anchor = turnIndex === undefined ? '' : ` id="t${turnIndex}"`;
   const model = turn.model ? `<span class="chip">${esc(turn.model)}</span>` : '';
   const ts = turn.ts ? `<span class="muted small">${esc(turn.ts)}</span>` : '';
@@ -406,7 +406,11 @@ function renderTurn(
       `${starred ? '&#9733;' : '&#9734;'}</button></form>`;
   const headContent = `<span class="role">${esc(turn.role)}</span>${model}${ts}`;
   const head = `<div class="turnhead">${headContent}${star}</div>`;
-  const body = turn.blocks.map((b, bi) => renderBlock(b, bi, sessionId, mediaIds, blobVersion, toolPairs)).join('');
+  const bodyParts: string[] = [];
+  for (let bi = 0; bi < turn.blocks.length; bi++) {
+    bodyParts.push(await renderBlock(turn.blocks[bi]!, bi, sessionId, mediaIds, blobVersion, toolPairs, env));
+  }
+  const body = bodyParts.join('');
   if (!body) return '';
   if (collapseByDefault) {
     return `<div${anchor} class="${cls} collapsed"><details class="turn-content">` +
@@ -415,14 +419,16 @@ function renderTurn(
   return `<article${anchor} class="${cls}">${head}<div class="body">${body}</div></article>`;
 }
 
-function renderBlock(
+async function renderBlock(
   b: NormalizedBlock,
   bi: number,
   sessionId: string,
   mediaIds: Map<string, number>,
   blobVersion: string,
   toolPairs: ToolPairs,
-): string {
+  env: Env,
+  mode: BlockRenderMode = 'normal',
+): Promise<string> {
   const trunc = b.truncated ? `<div class="truncnote">… truncated for indexing</div>` : '';
   switch (b.type) {
     case 'text':
@@ -440,9 +446,13 @@ function renderBlock(
       const resultText = result.text ?? '';
       const errCls = result.isError ? ' error' : '';
       const icon = result.isError ? '⚠️' : '↩';
+      const renderedAssets: string[] = [];
+      for (const asset of toolPairs.imagesByResult.get(result) ?? []) {
+        renderedAssets.push(await renderBlock(asset, toolPairs.imageIndices.get(asset) ?? 0, sessionId, mediaIds, blobVersion, toolPairs, env, 'paired'));
+      }
       return `<details class="block tool-pair${errCls}"><summary>🔧 ${esc(toolSummary(name, input, resultText))}</summary>` +
         `<div class="tool-part"><span class="muted small">call</span><pre>${esc(input)}</pre></div>` +
-        `<div class="tool-part"><span class="muted small">${icon} result</span><pre>${esc(resultText)}</pre>${result.truncated ? '<div class="truncnote">… truncated for indexing</div>' : ''}</div>` +
+        `<div class="tool-part"><span class="muted small">${icon} result</span><pre>${esc(resultText)}</pre>${result.truncated ? '<div class="truncnote">… truncated for indexing</div>' : ''}${renderedAssets.join('')}</div>` +
         `</details>${trunc}`;
     }
     case 'tool_result': {
@@ -453,6 +463,12 @@ function renderBlock(
       return `<details class="block${errCls}"><summary>${icon} ${esc(toolResultSummary(text))}</summary><pre>${esc(text)}</pre></details>${trunc}`;
     }
     case 'image': {
+      if (mode === 'normal' && toolPairs.pairedImages.has(b)) return '';
+      if (b.externalAsset) {
+        const src = await signExternalAssetUrl(sessionId, b.externalAsset, env);
+        if (!src) return `<div class="muted small">[image unavailable]</div>`;
+        return `<img class="media" loading="lazy" src="${esc(src)}" alt="image">`;
+      }
       const id = mediaIds.get(`${b.byteStart}:${bi}`);
       if (id === undefined) return `<div class="muted small">[image${b.mediaType ? ` ${esc(b.mediaType)}` : ''} unavailable]</div>`;
       return `<img class="media" loading="lazy" src="${blobUrl(sessionId, id, blobVersion)}" alt="image">`;
@@ -468,19 +484,37 @@ function renderBlock(
   }
 }
 
-/** Pair by protocol ID, not adjacency: parallel calls may resolve in a different order. */
+type BlockRenderMode = 'normal' | 'paired';
+
 interface ToolPairs {
   byCall: Map<NormalizedBlock, NormalizedBlock>;
   results: Set<NormalizedBlock>;
+  imagesByResult: Map<NormalizedBlock, NormalizedBlock[]>;
+  pairedImages: Set<NormalizedBlock>;
+  imageIndices: Map<NormalizedBlock, number>;
 }
 
 function pairToolResults(turns: NormalizedTurn[]): ToolPairs {
   const calls = new Map<string, NormalizedBlock>();
   const results: Array<NormalizedBlock> = [];
+  const resultImages = new Map<NormalizedBlock, NormalizedBlock[]>();
+  const imageIndices = new Map<NormalizedBlock, number>();
   for (const turn of turns) {
-    for (const block of turn.blocks) {
+    let lastResult: NormalizedBlock | undefined;
+    for (let blockIndex = 0; blockIndex < turn.blocks.length; blockIndex++) {
+      const block = turn.blocks[blockIndex]!;
       if (block.type === 'tool_use' && block.toolUseId) calls.set(block.toolUseId, block);
-      if (block.type === 'tool_result' && block.toolUseId) results.push(block);
+      if (block.type === 'tool_result' && block.toolUseId) {
+        results.push(block);
+        lastResult = block;
+      } else if (block.type === 'image' && lastResult) {
+        const images = resultImages.get(lastResult) ?? [];
+        images.push(block);
+        resultImages.set(lastResult, images);
+        imageIndices.set(block, blockIndex);
+      } else if (block.type !== 'image') {
+        lastResult = undefined;
+      }
     }
   }
   const byCall = new Map<NormalizedBlock, NormalizedBlock>();
@@ -491,7 +525,11 @@ function pairToolResults(turns: NormalizedTurn[]): ToolPairs {
     byCall.set(call, result);
     pairedResults.add(result);
   }
-  return { byCall, results: pairedResults };
+  const pairedImages = new Set<NormalizedBlock>();
+  for (const result of pairedResults) {
+    for (const image of resultImages.get(result) ?? []) pairedImages.add(image);
+  }
+  return { byCall, results: pairedResults, imagesByResult: resultImages, pairedImages, imageIndices };
 }
 
 function r2DashboardBase(baseUrl: string): string {

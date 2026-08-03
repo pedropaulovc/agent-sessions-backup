@@ -7,6 +7,8 @@ import {
   type NormalizedTurn,
   type Role,
   type TurnUsage,
+  externalAssetFromImage,
+  imageMediaType,
 } from '../normalize';
 
 /**
@@ -106,7 +108,8 @@ export async function parseClaudeCode(
     }
 
     const content = msg?.content ?? o.content;
-    for (const block of blocksFrom(content, o, line, session.stats)) turn.blocks.push(block);
+    const enclosingDetails = isObj(msg?.details) ? msg.details : isObj(o.details) ? o.details : undefined;
+    for (const block of blocksFrom(content, o, line, session.stats, enclosingDetails)) turn.blocks.push(block);
 
     if (type === 'system' && turn.blocks.length === 0) {
       const text = str(o.content) ?? str(o.summary);
@@ -139,6 +142,7 @@ function* blocksFrom(
   envelope: Record<string, unknown>,
   line: JsonlLine,
   stats: NormalizedSession['stats'],
+  enclosingDetails?: Record<string, unknown>,
 ): Generator<NormalizedBlock> {
   const at = { byteStart: line.byteStart, byteLen: line.byteLen };
   const list: unknown[] =
@@ -171,8 +175,6 @@ function* blocksFrom(
       }
       case 'tool_result': {
         let text = toolResultText(raw.content);
-        // Prefer the envelope-level toolUseResult when it is the fuller form
-        // (the in-message tool_result is often a truncated rendering).
         if (toolResultBlocks === 1) {
           const fuller = toolUseResultText(envelope.toolUseResult);
           if (fuller && fuller.length > text.length) text = fuller;
@@ -186,11 +188,23 @@ function* blocksFrom(
           isError: raw.is_error === true || undefined,
           ...at,
         };
+        for (const nested of imageItems(raw.content)) {
+          yield {
+            type: 'image',
+            mediaType: imageMediaType(nested),
+            externalAsset: externalAssetFromImage(nested, enclosingDetails),
+            ...at,
+          };
+        }
         break;
       }
       case 'image': {
-        const source = isObj(raw.source) ? raw.source : undefined;
-        yield { type: 'image', mediaType: str(source?.media_type), ...at };
+        yield {
+          type: 'image',
+          mediaType: imageMediaType(raw),
+          externalAsset: externalAssetFromImage(raw, enclosingDetails),
+          ...at,
+        };
         break;
       }
       case 'document': {
@@ -216,10 +230,14 @@ function* blocksFrom(
 function toolResultText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
+
   return content
     .filter((p): p is Record<string, unknown> => isObj(p) && p.type === 'text')
     .map((p) => str(p.text) ?? '')
     .join('\n');
+}
+function imageItems(content: unknown): Record<string, unknown>[] {
+  return Array.isArray(content) ? content.filter((part): part is Record<string, unknown> => isObj(part) && part.type === 'image') : [];
 }
 
 function toolUseResultText(v: unknown): string | undefined {
