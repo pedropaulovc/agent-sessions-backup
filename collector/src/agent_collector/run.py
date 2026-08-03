@@ -725,6 +725,9 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
         discovered_parents: list[tuple[ScanItem, tuple[list[ExternalAsset], list]]] = []
         asset_triples = []
         for parent, _sha in hashed:
+            if parent.is_snapshot:
+                _cleanup_snapshot(parent)
+                continue
             discovered = discover_external_assets(
                 parent.source_path, parent.relpath, None, cfg.effective_excludes(),
             )

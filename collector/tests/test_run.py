@@ -194,6 +194,28 @@ def test_backfill_dry_run_uploads_nothing(tmp_path, hub):
     assert hub.files == {}
 
 
+def test_backfill_dry_run_skips_snapshot_asset_discovery(tmp_path, hub, monkeypatch):
+    root = tmp_path / "claude"
+    root.mkdir()
+    db = root / "session.sqlite"
+    connection = sqlite3.connect(db)
+    connection.execute("CREATE TABLE records(value TEXT)")
+    connection.commit()
+    connection.close()
+    cfg = _cfg(hub, root)
+
+    calls = {"count": 0}
+
+    def unexpected_discovery(*_args, **_kwargs):
+        calls["count"] += 1
+        raise AssertionError("SQLite snapshots are not transcript asset sources")
+
+    monkeypatch.setattr(run_mod, "discover_external_assets", unexpected_discovery)
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_backfill(cfg, st, concurrency=2, dry_run=True) == 0
+    assert calls["count"] == 0
+    assert hub.files == {}
+
 def test_backfill_returns_nonzero_on_upload_failure(tmp_path, hub, monkeypatch):
     import agent_collector.transport as transport_mod
     monkeypatch.setattr(transport_mod, "BACKOFF", (0.0, 0.0, 0.0))
