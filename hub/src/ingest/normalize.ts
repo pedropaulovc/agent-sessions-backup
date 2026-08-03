@@ -12,6 +12,12 @@ export type Harness =
 
 export type Role = 'user' | 'assistant' | 'system' | 'developer' | 'tool';
 
+export interface ExternalAssetRef {
+  digest: string;
+  fileName: string;
+  mediaType: string;
+}
+
 export interface NormalizedBlock {
   type: 'text' | 'thinking' | 'tool_use' | 'tool_result' | 'image' | 'document' | 'prompt';
   /** Indexable text, already capped. Absent for image/document. */
@@ -22,8 +28,69 @@ export interface NormalizedBlock {
   isError?: boolean;
   subagentSessionId?: string;
   mediaType?: string;
+  externalAsset?: ExternalAssetRef;
   byteStart: number;
   byteLen: number;
+}
+
+const RASTER_MEDIA_TYPES = new Set(['image/jpeg', 'image/png', 'image/gif', 'image/webp']);
+/** Normalize a MIME value before comparing or rendering it. */
+export function normalizeMediaType(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.split(';', 1)[0]?.trim().toLowerCase();
+  return normalized || undefined;
+}
+
+
+/** Convert an external source path into the bounded, R2-safe filename used for asset keys. */
+export function safeAssetFilename(sourcePath: string | undefined): string {
+  const base = (sourcePath ?? '').split(/[\\/]/).pop() ?? '';
+  let safe = base.replace(/[^A-Za-z0-9._-]/g, '_');
+  if (safe.length > 128) {
+    const dot = safe.lastIndexOf('.');
+    const suffix = dot > 0 ? safe.slice(dot) : '';
+    safe = suffix.length > 0 && suffix.length < 128
+      ? `${safe.slice(0, 128 - suffix.length)}${suffix}`
+      : safe.slice(0, 128);
+  }
+  return safe || 'asset';
+}
+
+/** Suffix for an external asset relative to the owning transcript's R2 key. */
+export function assetRelSuffix(parentRelpath: string, digest: string, fileName: string): string {
+  return `${parentRelpath}.assets/${digest.toLowerCase()}/${safeAssetFilename(fileName)}`;
+}
+
+/** Extract validated external image metadata without retaining the local source path. */
+export function externalAssetFromImage(
+  raw: Record<string, unknown>,
+  enclosingDetails?: Record<string, unknown>,
+): ExternalAssetRef | undefined {
+  const source = isRecord(raw.source) ? raw.source : undefined;
+  const rawDetails = isRecord(raw.details) ? raw.details : undefined;
+  const details = isRecord(rawDetails?.meta) ? rawDetails : enclosingDetails;
+  const meta = isRecord(details?.meta) ? details.meta : undefined;
+  const sourceMeta = isRecord(meta?.source) ? meta.source : undefined;
+  const sourcePath = typeof sourceMeta?.value === 'string' ? sourceMeta.value : undefined;
+  const data = typeof raw.data === 'string' ? raw.data : typeof source?.data === 'string' ? source.data : undefined;
+  const digest = data?.match(/^blob:sha256:([0-9a-f]{64})$/i)?.[1]?.toLowerCase();
+  const rawMediaType =
+    typeof raw.mimeType === 'string' ? raw.mimeType :
+    typeof raw.mediaType === 'string' ? raw.mediaType :
+    typeof raw.media_type === 'string' ? raw.media_type :
+    typeof raw.mime === 'string' ? raw.mime :
+    typeof source?.mimeType === 'string' ? source.mimeType :
+    typeof source?.mime_type === 'string' ? source.mime_type :
+    typeof source?.media_type === 'string' ? source.media_type :
+    typeof source?.mediaType === 'string' ? source.mediaType :
+    typeof source?.mime === 'string' ? source.mime : undefined;
+  const mediaType = normalizeMediaType(rawMediaType);
+  if (!digest || !sourcePath || !mediaType || !RASTER_MEDIA_TYPES.has(mediaType)) return undefined;
+  return { digest, fileName: safeAssetFilename(sourcePath), mediaType };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
 export interface TurnUsage {

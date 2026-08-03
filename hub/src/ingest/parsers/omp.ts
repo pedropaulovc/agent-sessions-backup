@@ -7,6 +7,8 @@ import {
   type NormalizedSession,
   type NormalizedTurn,
   type Role,
+  externalAssetFromImage,
+  normalizeMediaType,
   type TurnUsage,
 } from '../normalize';
 
@@ -161,7 +163,14 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
       usage,
       blocks: [],
     };
-    for (const block of blocksFrom(msg.content, line, role, str(msg.toolCallId), msg.isError === true)) turn.blocks.push(block);
+    for (const block of blocksFrom(
+      msg.content,
+      line,
+      role,
+      str(msg.toolCallId),
+      msg.isError === true,
+      isObj(msg.details) ? msg.details : isObj(entry.details) ? entry.details : undefined,
+    )) turn.blocks.push(block);
     if (turn.blocks.length === 0 && usage === undefined) return;
     session.turns.push(turn);
     if (turn.id) lastTurnId = turn.id;
@@ -183,7 +192,7 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
       ts,
       blocks: [],
     };
-    for (const block of blocksFrom(entry.content, line, role)) turn.blocks.push(block);
+    for (const block of blocksFrom(entry.content, line, role, undefined, false, isObj(entry.details) ? entry.details : undefined)) turn.blocks.push(block);
     if (turn.blocks.length === 0) {
       skip('custom_message.empty');
       return;
@@ -249,7 +258,14 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
   }
 }
 
-function blocksFrom(content: unknown, line: JsonlLine, role: Role, toolCallId?: string, isError = false): NormalizedBlock[] {
+function blocksFrom(
+  content: unknown,
+  line: JsonlLine,
+  role: Role,
+  toolCallId?: string,
+  isError = false,
+  enclosingDetails?: Record<string, unknown>,
+): NormalizedBlock[] {
   const at = { byteStart: line.byteStart, byteLen: line.byteLen };
   const list: unknown[] = typeof content === 'string' ? [{ type: 'text', text: content }] : Array.isArray(content) ? content : [];
   const out: NormalizedBlock[] = [];
@@ -279,14 +295,20 @@ function blocksFrom(content: unknown, line: JsonlLine, role: Role, toolCallId?: 
         break;
       }
       case 'toolResult': {
-        const text = contentText(raw.content) || safeJson(raw.content);
-        if (!text) break;
-        const c = cap(text, CAPS.tool_result);
-        out.push({ type: 'tool_result', text: c.text, truncated: c.truncated, toolUseId: str(raw.toolCallId) ?? str(raw.tool_call_id), isError: raw.isError === true || undefined, ...at });
+        const images = imageItems(raw.content);
+        const text = contentText(raw.content);
+        const fallback = text || (images.length > 0 ? '' : safeJson(raw.content));
+        if (text || images.length > 0 || fallback) {
+          const c = cap(fallback, CAPS.tool_result);
+          out.push({ type: 'tool_result', text: c.text, truncated: c.truncated, toolUseId: str(raw.toolCallId) ?? str(raw.tool_call_id), isError: raw.isError === true || undefined, ...at });
+        }
+        for (const nested of images) {
+          out.push({ type: 'image', mediaType: imageMediaType(nested), externalAsset: externalAssetFromImage(nested, isObj(raw.details) ? raw.details : enclosingDetails), ...at });
+        }
         break;
       }
       case 'image':
-        out.push({ type: 'image', mediaType: str(raw.mimeType) ?? str(raw.mediaType), ...at });
+        out.push({ type: 'image', mediaType: imageMediaType(raw), externalAsset: externalAssetFromImage(raw, enclosingDetails), ...at });
         break;
       default: {
         const c = cap(safeJson(raw), CAPS.text);
@@ -294,8 +316,10 @@ function blocksFrom(content: unknown, line: JsonlLine, role: Role, toolCallId?: 
       }
     }
   }
-  // A toolResult message's content is already a list of text/image blocks. Some old OMP versions
-  // use plain objects with `text`; preserve those as searchable tool output rather than dropping it.
+  if (role === 'tool' && out.some((block) => block.type === 'image') &&
+      !out.some((block) => block.type === 'tool_result')) {
+    out.unshift({ type: 'tool_result', text: '', toolUseId: toolCallId, isError: isError || undefined, ...at });
+  }
   if (role === 'tool' && out.length === 0) {
     const text = contentText(content);
     if (text) {
@@ -304,6 +328,19 @@ function blocksFrom(content: unknown, line: JsonlLine, role: Role, toolCallId?: 
     }
   }
   return out;
+}
+
+function imageItems(content: unknown): Record<string, unknown>[] {
+  return Array.isArray(content) ? content.filter((part): part is Record<string, unknown> => isObj(part) && part.type === 'image') : [];
+}
+
+function imageMediaType(raw: Record<string, unknown>): string | undefined {
+  const source = isObj(raw.source) ? raw.source : undefined;
+  return normalizeMediaType(
+    str(raw.mimeType) ?? str(raw.mediaType) ?? str(raw.media_type) ?? str(raw.mime) ??
+    str(source?.mimeType) ?? str(source?.mime_type) ?? str(source?.media_type) ??
+    str(source?.mediaType) ?? str(source?.mime),
+  );
 }
 function promptBlocks(parts: readonly string[], line: JsonlLine): NormalizedBlock[] {
   const at = { byteStart: line.byteStart, byteLen: line.byteLen };

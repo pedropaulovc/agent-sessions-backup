@@ -8,6 +8,7 @@ doctor    preflight checks; prints top excluded patterns so nothing silently dis
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -20,6 +21,12 @@ from pathlib import Path
 
 from . import config as config_mod
 from . import __version__
+from .external_images import (
+    ExternalAsset,
+    MAX_EXTERNAL_ASSET_BYTES,
+    discover_external_assets,
+    open_external_asset,
+)
 from .scanner import Scanner, ScanItem, read_exact, read_range, hash_bytes, hash_file_prefix
 from .state import State, OverlapLock, now_iso, state_path
 from .transport import Transport, DevAuth, MtlsAuth, Upload, MIN_CURL_VERSION, normalize_thumbprint
@@ -43,7 +50,7 @@ MULTIPART_MAX_PARTS = 10000
 # The hub finalizes a multipart upload with a single R2 put (staging -> canonical), capped at 5 GiB
 # (developers.cloudflare.com/r2/platform/limits). A larger file can't be finalized, so refuse it up
 # front rather than upload gigabytes only for complete to fail. The realistic corpus max is a few GB.
-MULTIPART_MAX_FILE_BYTES = 5 * 1024 * 1024 * 1024
+MULTIPART_MAX_FILE_BYTES = MAX_EXTERNAL_ASSET_BYTES
 
 
 def _oversize_refusal(size: int) -> str | None:
@@ -112,14 +119,123 @@ def _materialize(scanner: Scanner, data: bytes) -> str:
         raise
     return path
 
+def _snapshot_external_asset(scanner: Scanner, store: str, asset: ExternalAsset) -> tuple[ScanItem | None, str | None]:
+    """Copy and verify one external asset before handing it to the normal upload pipeline."""
+    fd, path = tempfile.mkstemp(dir=scanner.tmp_root, suffix=".asset")
+    size = 0
+    digest = hashlib.sha256()
+    oversized = False
+    try:
+        with os.fdopen(fd, "wb") as destination, open_external_asset(
+            asset.source_path, asset.root_path
+        ) as source:
+            if os.fstat(source.fileno()).st_size <= MAX_EXTERNAL_ASSET_BYTES:
+                while True:
+                    remaining = MAX_EXTERNAL_ASSET_BYTES - size
+                    chunk = source.read(min(1024 * 1024, remaining + 1))
+                    if not chunk:
+                        break
+                    if len(chunk) > remaining:
+                        oversized = True
+                        break
+                    destination.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+            else:
+                oversized = True
+    except OSError as e:
+        _safe_unlink(path)
+        return None, f"{asset.relpath}: snapshot failed: {e}"
+    if oversized:
+        _safe_unlink(path)
+        return None, f"{asset.relpath}: source exceeds size limit"
+    if size != asset.size or digest.hexdigest() != asset.digest:
+        _safe_unlink(path)
+        return None, f"{asset.relpath}: source changed after discovery"
+    return ScanItem(store, asset.relpath, size, asset.mtime_ns, Path(path), True), None
+
 
 @dataclass
 class ItemResult:
     changed: bool = False
     uploaded: bool = False
+    uploaded_count: int = 0
     bytes: int = 0
+    seen: int = 0
+    would_upload_count: int = 0
+    would_upload_bytes: int = 0
     error: str | None = None
 
+
+def _asset_event_dict(event, store: str) -> dict:
+    return {"level": event.level, "code": event.code, "message": event.message[:500],
+            "count": 1, "store": store}
+
+
+def _discover_upload_assets(
+    cfg,
+    st: State,
+    transport: Transport,
+    scanner: Scanner,
+    parent: ScanItem,
+    events: list[dict],
+    force: bool = False,
+    dry_run: bool = False,
+    totals: dict | None = None,
+) -> ItemResult:
+    if not force and st.asset_scan_ok(parent.store, parent.relpath, parent.size, parent.mtime_ns):
+        return ItemResult()
+    assets, asset_events = discover_external_assets(
+        parent.source_path, parent.relpath, None, cfg.effective_excludes(),
+    )
+    events.extend(_asset_event_dict(e, parent.store) for e in asset_events)
+    out = ItemResult(seen=len(assets))
+    if dry_run:
+        missing = _check_missing_chunk(
+            cfg,
+            transport,
+            [(parent.store, asset.relpath, asset.digest) for asset in assets],
+            totals if totals is not None else {"check_failures": 0},
+            events,
+        )
+        for asset in assets:
+            if (parent.store, asset.relpath) in missing:
+                out.would_upload_count += 1
+                out.would_upload_bytes += asset.size
+        return out
+    for asset in assets:
+        item, snapshot_error = _snapshot_external_asset(scanner, parent.store, asset)
+        if snapshot_error:
+            out.error = snapshot_error if not out.error else f"{out.error}; {snapshot_error}"
+            events.append({"level": "error", "code": "asset_snapshot_failed",
+                           "message": snapshot_error[:500], "count": 1, "store": parent.store})
+            continue
+        assert item is not None
+        try:
+            result = _process_item(cfg, st, transport, scanner, item)
+        finally:
+            _cleanup_snapshot(item)
+        out.changed |= result.changed
+        out.uploaded_count += int(result.uploaded)
+        out.uploaded |= result.uploaded
+        out.bytes += result.bytes
+        if result.error:
+            out.error = result.error if not out.error else f"{out.error}; {result.error}"
+            events.append({"level": "error", "code": "asset_upload_failed",
+                           "message": result.error[:500], "count": 1, "store": parent.store})
+    if not asset_events and not out.error:
+        st.mark_asset_scan(parent.store, parent.relpath, parent.size, parent.mtime_ns)
+    return out
+
+
+def _count_asset_result(result: ItemResult, totals: dict) -> None:
+    totals["scanned"] += result.seen
+    if result.uploaded:
+        totals["uploaded"] += result.uploaded_count
+        totals["bytes_uploaded"] += result.bytes
+    totals["would_upload"] += result.would_upload_count
+    if result.error:
+        totals["failed"] += 1
 
 # --------------------------------------------------------------------------- run
 def cmd_run(args) -> int:
@@ -170,9 +286,6 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
                 scanned += 1
                 stats[store]["files_seen"] += 1
                 res = _process_item(cfg, st, transport, scanner, item)
-                # Snapshots bypass the fast path every run, so release each DB snapshot temp
-                # file immediately — several large DBs would otherwise pile up under tmp_root
-                # for the whole run and risk ENOSPC before later files are processed.
                 _cleanup_snapshot(item)
                 if res.changed:
                     changed += 1
@@ -187,6 +300,22 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
                         "level": "error", "code": "upload_failed",
                         "message": res.error[:500], "count": 1, "store": store,
                     })
+                    continue
+                # A transcript is the owner of its assets. Never inspect/upload references when
+                # its own bytes failed to reach the hub.
+                assets_res = _discover_upload_assets(cfg, st, transport, scanner, item, events,
+                                                     force=res.changed)
+                scanned += assets_res.seen
+                stats[store]["files_seen"] += assets_res.seen
+                if assets_res.changed:
+                    changed += 1
+                if assets_res.uploaded:
+                    uploaded += assets_res.uploaded_count
+                    total_bytes += assets_res.bytes
+                    stats[store]["files_uploaded"] += assets_res.uploaded_count
+                    stats[store]["bytes_uploaded"] += assets_res.bytes
+                if assets_res.error:
+                    errors += 1
         # Traversal/snapshot warnings (walk_error, snapshot_timeout) raised during the walk.
         events.extend(scanner.events)
         errors += sum(1 for e in scanner.events if e["level"] == "error")
@@ -254,7 +383,7 @@ def _process_item(cfg, st: State, transport: Transport, scanner: Scanner, item: 
     if status == 201:
         st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "ok",
                        uploaded_size=len(data), uploaded_at=now_iso())
-        return ItemResult(changed=True, uploaded=True, bytes=len(data))
+        return ItemResult(changed=True, uploaded=True, uploaded_count=1, bytes=len(data))
     if status == 200:  # hub already had this exact content (dedup)
         st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "ok",
                        uploaded_size=len(data), uploaded_at=now_iso())
@@ -295,7 +424,7 @@ def _process_large_item(cfg, st: State, transport: Transport, item: ScanItem,
     if result == MULTIPART_UPLOADED:
         st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "ok",
                        uploaded_size=item.size, uploaded_at=now_iso())
-        return ItemResult(changed=True, uploaded=True, bytes=item.size)
+        return ItemResult(changed=True, uploaded=True, uploaded_count=1, bytes=item.size)
     if result == MULTIPART_UNCHANGED:  # hub already had these exact bytes (dedup)
         st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "ok",
                        uploaded_size=item.size, uploaded_at=now_iso())
@@ -557,6 +686,7 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
                                    totals, events)
 
     to_upload: list[tuple[ScanItem, str]] = []
+    successful_parents: list[ScanItem] = []
     for item, sha in hashed:
         if (item.store, item.relpath) in missing:
             to_upload.append((item, sha))
@@ -565,19 +695,21 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
         st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "ok",
                        uploaded_size=item.size)
         totals["already_present"] += 1
-        _cleanup_snapshot(item)
-
-    if dry_run:
-        totals["would_upload"] += len(to_upload)
-        for item, _sha in to_upload:
+        successful_parents.append(item)
+        if not dry_run:
             _cleanup_snapshot(item)
-        return
 
-    # Large files can't ride the parallel single-PUT batch (Cloudflare 413s a >100MB body); upload
-    # each sequentially via multipart, reusing the streaming hash from the pass above. Small files
-    # take the existing parallel batch path unchanged.
     large = [(it, sha) for it, sha in to_upload if it.size >= cfg.multipart_threshold_bytes]
     small = [(it, sha) for it, sha in to_upload if it.size < cfg.multipart_threshold_bytes]
+    if dry_run:
+        totals["would_upload"] += len(to_upload)
+        for parent in hashed:
+            result = _discover_upload_assets(cfg, st, transport, scanner, parent[0], events,
+                                             force=True, dry_run=True, totals=totals)
+            _count_asset_result(result, totals)
+        for item, _sha in hashed:
+            _cleanup_snapshot(item)
+        return
     for item, sha in large:
         result, detail = _upload_multipart(cfg, transport, item, sha)
         if result in (MULTIPART_UPLOADED, MULTIPART_UNCHANGED):
@@ -586,6 +718,7 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
                 totals["bytes_uploaded"] += item.size
             st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "ok",
                            uploaded_size=item.size, uploaded_at=now_iso())
+            successful_parents.append(item)
         else:
             totals["failed"] += 1
             st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "error",
@@ -627,12 +760,17 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
             totals["bytes_uploaded"] += nbytes
             st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha2, "ok",
                            uploaded_size=nbytes, uploaded_at=now_iso())
+            successful_parents.append(item)
         else:
             totals["failed"] += 1
             st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha2,
                            "error", error=f"backfill HTTP {code}")
         _safe_unlink(body_path)
         _cleanup_snapshot(item)
+
+    for parent in successful_parents:
+        result = _discover_upload_assets(cfg, st, transport, scanner, parent, events, force=True)
+        _count_asset_result(result, totals)
 
 
 def _check_missing_chunk(cfg, transport: Transport, triples, totals: dict,

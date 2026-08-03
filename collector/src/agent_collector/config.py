@@ -49,6 +49,9 @@ DEFAULT_EXCLUDES: list[str] = [
     "ide/**",
     "shell-snapshots/**",
     "projects/**/backups/**",
+    # The collector reserves each transcript's synthetic external-asset subtree so a normal file
+    # cannot collide with the digest-keyed R2 object.
+    "*.assets/**",
 ]
 
 DEFAULT_STORES: dict[str, str] = {

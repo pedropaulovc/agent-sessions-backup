@@ -40,6 +40,8 @@ def test_path_matches_security_globs():
     assert path_matches("a/b/private.key", "*.key")
     assert path_matches("deep/dir/id_rsa.pem", "*.pem")
     # sqlite sidecars excluded but the .sqlite itself is NOT
+    assert path_matches("session.jsonl.assets/abc/file.jpeg", "*.assets/**")
+    assert path_matches("session.jsonl.assets/\x00", "*.assets/**")
     assert path_matches("db.sqlite-wal", "*.sqlite-wal")
     assert not path_matches("db.sqlite", "*.sqlite-wal")
     # directory globs

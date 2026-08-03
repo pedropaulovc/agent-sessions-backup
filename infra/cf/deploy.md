@@ -203,9 +203,12 @@ security decision. Continue using a single-use `/_preview/bootstrap` URL as docu
 
 ## One-time credentials
 
-- Production secret: `SETUP_TOKEN` (set). Certificate renewal stores no API token or OAuth client
-  secret. A private Cloudflare OAuth client uses Authorization Code + PKCE, and its grant stays inside
-  the SQLite `CF_OAUTH_BROKER` Durable Object. See infra/cf/mtls.md "Cloudflare OAuth connection".
+- Production secrets: `SETUP_TOKEN` (passkey bootstrap) and `ASSET_SIGNING_SECRET` (independent HMAC
+  key for short-lived external-asset viewer links). Set both; do not reuse the bootstrap token as the
+  asset signer. Set the asset secret with `cd hub && npx wrangler versions secret put ASSET_SIGNING_SECRET`.
+  Certificate renewal stores no API token or OAuth client secret. A private Cloudflare OAuth client uses
+  Authorization Code + PKCE, and its grant stays inside the SQLite `CF_OAUTH_BROKER` Durable Object.
+  See infra/cf/mtls.md "Cloudflare OAuth connection".
 - Preview: `DEV_AUTH` — the bearer that gates the public preview URL. Until it is set, the
   preview fails closed (denies), which is safe. Set with:
   `cd hub && npx wrangler versions secret put DEV_AUTH --env preview`. A secret update creates

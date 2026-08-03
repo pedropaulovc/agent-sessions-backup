@@ -250,6 +250,76 @@ describe('parseOmp', () => {
     expect(session.stats.parseErrorLines).toBe(1);
     expect(session.turns).toHaveLength(3);
   });
+  it('keeps validated external OMP image references in memory without retaining source paths', async () => {
+    const digest = 'a'.repeat(64);
+    const records = [
+      JSON.stringify({ type: 'session', version: 3, id: sessionId, cwd: 'C:/src/project' }),
+      JSON.stringify({
+        type: 'message',
+        id: 'img1',
+        parentId: null,
+        message: {
+          role: 'assistant',
+          content: [{ type: 'image', data: `blob:sha256:${digest.toUpperCase()}`, mimeType: 'image/jpeg; charset=binary', details: { meta: { source: { value: 'C:\\\\src\\\\project\\\\references\\\\001_img01.jpeg' } } } }],
+        },
+      }),
+    ];
+    const session = await parseOmp(readJsonlLines(toStream(records)), sessionId);
+    expect(session.turns[0]?.blocks[0]).toMatchObject({
+      type: 'image',
+      mediaType: 'image/jpeg',
+      externalAsset: { digest, fileName: '001_img01.jpeg', mediaType: 'image/jpeg' },
+    });
+    expect(JSON.stringify(session)).not.toContain('C:\\\\src');
+  });
+  it('does not index OMP tool-result image metadata as tool text', async () => {
+    const digest = 'c'.repeat(64);
+    const records = [
+      JSON.stringify({ type: 'session', version: 3, id: sessionId, cwd: '/tmp/omp' }),
+      JSON.stringify({
+        type: 'message',
+        id: 'tool-image',
+        parentId: null,
+        message: {
+          role: 'toolResult',
+          details: { meta: { source: { value: '/tmp/omp/references/001_img01.jpeg' } } },
+          content: [{
+            type: 'toolResult',
+            toolCallId: 'tc-image',
+            content: [{ type: 'image', data: `blob:sha256:${digest}`, mimeType: 'image/jpeg' }],
+          }],
+        },
+      }),
+    ];
+    const session = await parseOmp(readJsonlLines(toStream(records)), sessionId);
+    expect(session.turns[0]?.blocks.map((block) => block.type)).toEqual(['tool_result', 'image']);
+    expect(session.turns[0]?.blocks[0]).toMatchObject({ text: '', toolUseId: 'tc-image' });
+    expect(session.turns[0]?.blocks[1]).toMatchObject({
+      externalAsset: { digest, fileName: '001_img01.jpeg', mediaType: 'image/jpeg' },
+    });
+    expect(JSON.stringify(session)).not.toContain('/tmp/omp/references/001_img01.jpeg');
+  });
+
+  it('preserves the outer tool id for direct image-only OMP results', async () => {
+    const digest = 'd'.repeat(64);
+    const records = [
+      JSON.stringify({ type: 'session', version: 3, id: sessionId, cwd: '/tmp/omp' }),
+      JSON.stringify({
+        type: 'message',
+        id: 'direct-tool-image',
+        parentId: null,
+        message: {
+          role: 'toolResult',
+          toolCallId: 'tc-direct-image',
+          details: { meta: { source: { value: '/tmp/omp/references/001_img01.jpeg' } } },
+          content: [{ type: 'image', data: `blob:sha256:${digest}`, mimeType: 'image/jpeg' }],
+        },
+      }),
+    ];
+    const session = await parseOmp(readJsonlLines(toStream(records)), sessionId);
+    expect(session.turns[0]?.blocks.map((block) => block.type)).toEqual(['tool_result', 'image']);
+    expect(session.turns[0]?.blocks[0]).toMatchObject({ text: '', toolUseId: 'tc-direct-image' });
+  });
   it('indexes persisted effective prompts without truncating their parts or other custom metadata', async () => {
     const firstPart = `prompt-start-${'x'.repeat(CAPS.prompt)}-prompt-tail`;
     const secondPart = 'second prompt part';
@@ -400,6 +470,38 @@ describe('parseClaudeCode', () => {
     // toolUseResult (fuller) beats the truncated in-message rendering.
     const toolResult = s.turns[2]!.blocks.find((b) => b.type === 'tool_result')!;
     expect(toolResult.text).toContain('FULL flurbo contents');
+  });
+  it('extracts nested Claude tool-result external images while preserving text pairing', async () => {
+    const digest = 'b'.repeat(64);
+    const line = JSON.stringify({
+      type: 'user',
+      uuid: 'nested-result',
+      parentUuid: null,
+      message: {
+        role: 'user',
+        details: { meta: { source: { value: 'C:\\\\src\\\\project\\\\001_img01.jpeg' } } },
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'tool-1',
+          content: [
+            { type: 'text', text: 'tool output text' },
+            { type: 'image', data: `blob:sha256:${digest}`, mimeType: 'image/jpeg' },
+            { type: 'image', data: 'blob:not-a-digest', mimeType: 'image/jpeg' },
+            { type: 'image', data: `blob:sha256:${digest}`, mimeType: 'image/jpeg', details: { meta: { source: { value: '' } } } },
+          ],
+        }],
+      },
+    });
+    const session = await parseClaudeCode(readJsonlLines(toStream([line])), CC_SESSION_ID);
+    const blocks = session.turns[0]!.blocks;
+    expect(blocks.map((block) => block.type)).toEqual(['tool_result', 'image', 'image', 'image']);
+    expect(blocks[0]).toMatchObject({ type: 'tool_result', text: 'tool output text', toolUseId: 'tool-1' });
+    expect(blocks[1]).toMatchObject({ externalAsset: { digest, fileName: '001_img01.jpeg', mediaType: 'image/jpeg' } });
+    expect(blocks[2]).toMatchObject({ type: 'image', mediaType: 'image/jpeg' });
+    expect(blocks[2]?.externalAsset).toBeUndefined();
+    expect(blocks[3]).toMatchObject({ type: 'image', mediaType: 'image/jpeg' });
+    expect(blocks[3]?.externalAsset).toBeUndefined();
+    expect(JSON.stringify(session)).not.toContain('C:\\\\src');
   });
 
   it('marks abandoned branches off the main path', async () => {

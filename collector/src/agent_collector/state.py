@@ -58,6 +58,16 @@ CREATE TABLE IF NOT EXISTS webcapture_convs (
   captured_at TEXT NOT NULL,
   PRIMARY KEY (product, conv_id)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS asset_scans (
+  store TEXT NOT NULL,
+  parent_relpath TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  mtime_ns INTEGER NOT NULL,
+  scanned_at TEXT NOT NULL,
+  PRIMARY KEY (store, parent_relpath)
+) STRICT;
+
+
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -223,6 +233,25 @@ class State:
              now_iso(), status, error),
         )
         self.conn.commit()
+
+    def asset_scan_ok(self, store: str, parent_relpath: str, size: int, mtime_ns: int) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM asset_scans WHERE store = ? AND parent_relpath = ? "
+            "AND size = ? AND mtime_ns = ?",
+            (store, parent_relpath, size, mtime_ns),
+        ).fetchone()
+        return row is not None
+
+    def mark_asset_scan(self, store: str, parent_relpath: str, size: int, mtime_ns: int) -> None:
+        self.conn.execute(
+            "INSERT INTO asset_scans(store, parent_relpath, size, mtime_ns, scanned_at) "
+            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(store, parent_relpath) DO UPDATE SET "
+            "size = excluded.size, mtime_ns = excluded.mtime_ns, scanned_at = excluded.scanned_at",
+            (store, parent_relpath, size, mtime_ns, now_iso()),
+        )
+        self.conn.commit()
+
+
 
     def touch_seen(self, store: str, relpath: str) -> None:
         self.conn.execute(
