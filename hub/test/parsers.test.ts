@@ -375,6 +375,23 @@ describe('parseOmp', () => {
     expect(session.turns.filter((turn) => turn.role !== 'system').every((turn) => turn.onMainPath)).toBe(true);
     expect(session.turns.find((turn) => turn.role === 'system')?.onMainPath).toBe(true);
   });
+  it('keeps conversation ancestry across custom metadata records', async () => {
+    const records = [
+      JSON.stringify({ type: 'session', version: 3, id: sessionId, cwd: '/tmp/omp' }),
+      JSON.stringify({ type: 'message', id: 'u0', parentId: null, message: { role: 'user', content: 'root' } }),
+      JSON.stringify({ type: 'custom', id: 'prompt-0', parentId: 'u0', customType: 'omp-system-prompt', data: { systemPrompt: ['prompt'] } }),
+      JSON.stringify({ type: 'message', id: 'a0', parentId: 'prompt-0', message: { role: 'assistant', content: 'answer' } }),
+      JSON.stringify({ type: 'custom', id: 'tool-start-0', parentId: 'a0', customType: 'tool_execution_start' }),
+      JSON.stringify({ type: 'message', id: 'r0', parentId: 'tool-start-0', message: { role: 'toolResult', content: 'result' } }),
+      JSON.stringify({ type: 'custom', id: 'tool-start-1', parentId: 'r0', customType: 'tool_execution_start' }),
+      JSON.stringify({ type: 'message', id: 'a1', parentId: 'tool-start-1', message: { role: 'assistant', content: 'final answer' } }),
+    ];
+    const session = await parseOmp(readJsonlLines(toStream(records)), sessionId);
+
+    expect(session.turns.map((turn) => turn.id)).toEqual(['u0', 'prompt-0', 'a0', 'r0', 'a1']);
+    expect(session.turns.every((turn) => turn.onMainPath)).toBe(true);
+  });
+
 
   it('fails open main-path classification after an oversized line', async () => {
     const oversized: JsonlLine = { kind: 'oversized', byteStart: 0, byteLen: MAX_JSONL_LINE_BYTES + 1 };

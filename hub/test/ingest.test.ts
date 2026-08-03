@@ -1580,9 +1580,15 @@ describe('OMP ingest end-to-end', () => {
       },
     },
     {
+      type: 'custom',
+      id: 'tool-start-1',
+      parentId: 'a1',
+      customType: 'tool_execution_start',
+    },
+    {
       type: 'message',
       id: 'r1',
-      parentId: 'a1',
+      parentId: 'tool-start-1',
       timestamp: '2026-07-19T10:00:04.000Z',
       message: {
         role: 'toolResult',
@@ -1655,17 +1661,33 @@ describe('OMP ingest end-to-end', () => {
       .bind(OMP_ID)
       .all<{ btype: string; role: string; tool_name: string | null; text: string | null }>();
     expect(blocks.results.map((block) => block.btype)).toEqual(['text', 'thinking', 'text', 'tool_use', 'tool_result', 'text']);
+    const pathFlags = await testEnv.DB.prepare(
+      'SELECT DISTINCT on_main_path FROM blocks WHERE session_id = ?1',
+    )
+      .bind(OMP_ID)
+      .all<{ on_main_path: number }>();
+    expect(pathFlags.results.map((row) => row.on_main_path)).toEqual([1]);
+
     expect(blocks.results.find((block) => block.btype === 'tool_result')).toMatchObject({
       role: 'tool',
       tool_name: null,
       text: 'ompneedle tool output',
     });
-
     const search = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=ompneedle', {
       headers: { 'x-dev-machine': 'omp-box' },
     });
     expect(search.status).toBe(200);
     expect(((await search.json()) as { hits: Array<{ session_id: string }> }).hits.some((hit) => hit.session_id === OMP_ID)).toBe(true);
+  });
+
+  it('renders OMP custom metadata ancestry in chronological and effective views', async () => {
+    const chronological = await (await SELF.fetch(`https://sessions.vza.net/s/${OMP_ID}?view=chronological`)).text();
+    expect(chronological).toContain('ompneedle user request');
+    expect(chronological).not.toContain('class="turn user rewound"');
+
+    const effective = await (await SELF.fetch(`https://sessions.vza.net/s/${OMP_ID}?view=effective`)).text();
+    expect(effective).toContain('ompneedle user request');
+    expect(effective).toContain('ompneedle tool output');
   });
 
   it('links nested OMP sidecars to their parent session', async () => {
