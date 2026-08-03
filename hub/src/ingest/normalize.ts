@@ -61,6 +61,25 @@ export function assetRelSuffix(parentRelpath: string, digest: string, fileName: 
   return `${parentRelpath}.assets/${digest.toLowerCase()}/${safeAssetFilename(fileName)}`;
 }
 
+/** Extract a normalized image MIME type using the wire format's established field precedence. */
+export function imageMediaType(raw: Record<string, unknown>): string | undefined {
+  const source = isRecord(raw.source) ? raw.source : undefined;
+  const rawMediaType =
+    nonEmptyString(raw.mimeType) ??
+    nonEmptyString(raw.mediaType) ??
+    nonEmptyString(raw.media_type) ??
+    nonEmptyString(raw.mime) ??
+    nonEmptyString(source?.mimeType) ??
+    nonEmptyString(source?.mime_type) ??
+    nonEmptyString(source?.media_type) ??
+    nonEmptyString(source?.mediaType) ??
+    nonEmptyString(source?.mime);
+  return normalizeMediaType(rawMediaType);
+}
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.length > 0 ? value : undefined;
+}
+
 /** Extract validated external image metadata without retaining the local source path. */
 export function externalAssetFromImage(
   raw: Record<string, unknown>,
@@ -74,17 +93,7 @@ export function externalAssetFromImage(
   const sourcePath = typeof sourceMeta?.value === 'string' ? sourceMeta.value : undefined;
   const data = typeof raw.data === 'string' ? raw.data : typeof source?.data === 'string' ? source.data : undefined;
   const digest = data?.match(/^blob:sha256:([0-9a-f]{64})$/i)?.[1]?.toLowerCase();
-  const rawMediaType =
-    typeof raw.mimeType === 'string' ? raw.mimeType :
-    typeof raw.mediaType === 'string' ? raw.mediaType :
-    typeof raw.media_type === 'string' ? raw.media_type :
-    typeof raw.mime === 'string' ? raw.mime :
-    typeof source?.mimeType === 'string' ? source.mimeType :
-    typeof source?.mime_type === 'string' ? source.mime_type :
-    typeof source?.media_type === 'string' ? source.media_type :
-    typeof source?.mediaType === 'string' ? source.mediaType :
-    typeof source?.mime === 'string' ? source.mime : undefined;
-  const mediaType = normalizeMediaType(rawMediaType);
+  const mediaType = imageMediaType(raw);
   if (!digest || !sourcePath || !mediaType || !RASTER_MEDIA_TYPES.has(mediaType)) return undefined;
   return { digest, fileName: safeAssetFilename(sourcePath), mediaType };
 }

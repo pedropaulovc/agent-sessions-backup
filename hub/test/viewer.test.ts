@@ -6,7 +6,7 @@ import { deriveProjectName } from '../src/project-name';
 import { searchHitsSql } from '../src/api/search';
 import { buildSessionFilterSql } from '../src/session-filters';
 import { viewerRoute } from '../src/viewer/router';
-import { signExternalAssetUrl } from '../src/viewer/assets';
+import { assetEndpoint, signExternalAssetUrl } from '../src/viewer/assets';
 import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures';
 import { blobVersionOf } from '../src/viewer/session';
 import { turnFallbackKeyOf, turnKeyOf } from '../src/turn-key';
@@ -890,10 +890,9 @@ describe('viewer', () => {
     const res = await SELF.fetch(`https://sessions.vza.net/s/${EXTERNAL_ASSET_SESSION}`);
     expect(res.status).toBe(200);
     const html = await res.text();
-    const match = html.match(
-      new RegExp(`<img class="media" loading="lazy" src="([^"]*/asset/${EXTERNAL_ASSET_DIGEST}/001_img01\\.jpeg\\?[^"]+)" alt="image">`),
-    );
+    const match = html.match(/<img class="media" loading="lazy" src="([^"]+)" alt="image">/);
     expect(match).toBeTruthy();
+    expect(match![1]).toContain(`/asset/${EXTERNAL_ASSET_DIGEST}/001_img01.jpeg?`);
     expect(html).not.toContain('harmonic-analyzer');
 
     const assetUrl = new URL(match![1]!.replaceAll('&amp;', '&'), 'https://sessions.vza.net');
@@ -909,6 +908,16 @@ describe('viewer', () => {
 
     assetUrl.searchParams.set('exp', '1');
     expect((await SELF.fetch(assetUrl)).status).toBe(403);
+  });
+  it('rejects an invalid asset signature before querying candidate files', async () => {
+    const noQueryEnv = {
+      ...testEnv,
+      DB: { prepare: () => { throw new Error('candidate query must not run'); } },
+    } as unknown as Env;
+    const exp = Math.floor(Date.now() / 1000) + 60;
+    const url = new URL(`https://sessions.vza.net/s/${EXTERNAL_ASSET_SESSION}/asset/${EXTERNAL_ASSET_DIGEST}/001_img01.jpeg?exp=${exp}&sig=${'A'.repeat(43)}`);
+    const response = await assetEndpoint(EXTERNAL_ASSET_SESSION, EXTERNAL_ASSET_DIGEST, '001_img01.jpeg', url, noQueryEnv);
+    expect(response.status).toBe(403);
   });
   it('uses a dedicated production signer secret instead of the passkey bootstrap token', async () => {
     const asset = { digest: EXTERNAL_ASSET_DIGEST, fileName: '001_img01.jpeg', mediaType: 'image/jpeg' };

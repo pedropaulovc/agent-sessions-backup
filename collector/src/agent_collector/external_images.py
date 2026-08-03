@@ -80,20 +80,47 @@ def resolve_declared_path(value: str, cwd: str | Path) -> Path:
 
     return source
 
+def _descriptor_target(fd: int) -> Path | None:
+    """Return the canonical target of an open descriptor when the platform exposes one."""
+    for link in (f"/proc/self/fd/{fd}", f"/dev/fd/{fd}"):
+        try:
+            target = os.readlink(link)
+            if target:
+                return Path(target).resolve(strict=True)
+        except (OSError, RuntimeError, ValueError):
+            continue
+    return None
+
+
 def open_external_asset(path: Path, root: Path | None = None) -> BinaryIO:
-    """Open one validated asset without following a replacement symlink on POSIX."""
+    """Open one validated asset without following a replacement symlink."""
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
     fd = os.open(path, flags)
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        opened_stat = os.fstat(fd)
+        if not stat.S_ISREG(opened_stat.st_mode):
             raise OSError(f"external asset is not a regular file: {path}")
-        if root is not None and os.name == "posix":
-            try:
-                root_real = root.resolve(strict=True)
-                opened_real = Path(os.path.realpath(f"/proc/self/fd/{fd}"))
-                opened_real.relative_to(root_real)
-            except (OSError, RuntimeError, ValueError) as e:
-                raise OSError(f"external asset escaped declared root: {path}") from e
+        if root is not None:
+            root_real = root.resolve(strict=True)
+            descriptor_target = _descriptor_target(fd)
+            if descriptor_target is not None:
+                try:
+                    descriptor_target.relative_to(root_real)
+                except ValueError as e:
+                    raise OSError(f"external asset escaped declared root: {path}") from e
+            else:
+                # Without a descriptor link, verify both the resolved path boundary and that the
+                # opened inode still belongs to the path we checked. Any uncertainty is a rejection.
+                try:
+                    path_real = path.resolve(strict=True)
+                    path_real.relative_to(root_real)
+                    path_stat = path.stat()
+                except (OSError, RuntimeError, ValueError) as e:
+                    raise OSError(f"external asset escaped declared root: {path}") from e
+                path_identity = (getattr(path_stat, "st_dev", 0), getattr(path_stat, "st_ino", 0))
+                opened_identity = (getattr(opened_stat, "st_dev", 0), getattr(opened_stat, "st_ino", 0))
+                if path_identity == (0, 0) or opened_identity == (0, 0) or path_identity != opened_identity:
+                    raise OSError(f"external asset changed while opening: {path}")
         return os.fdopen(fd, "rb")
     except BaseException:
         os.close(fd)
@@ -174,24 +201,25 @@ def _mime(item: dict, source: Path) -> str | None:
     return normalized[0] if normalized else ext_mime
 
 
-def iter_jsonl_records(transcript: Path) -> Iterator[dict]:
-    """Yield valid object records without retaining oversized lines in memory."""
+def iter_jsonl_records(transcript: Path) -> Iterator[dict | None]:
+    """Yield valid object records, or None for an oversized line, without retaining it."""
     limit = MAX_EXTERNAL_SCAN_LINE_CHARS
     with transcript.open("r", encoding="utf-8", errors="replace") as lines:
         while True:
             line = lines.readline(limit + 1)
             if not line:
                 break
-            if len(line) > limit:
-                while line and not line.endswith("\n"):
-                    line = lines.readline(limit + 1)
-                continue
+            oversized = len(line) > limit
             if len(line) == limit and not line.endswith("\n"):
                 continuation = lines.read(1)
-                if continuation:
-                    while continuation and not continuation.endswith("\n"):
-                        continuation = lines.readline(limit + 1)
-                    continue
+                oversized = bool(continuation)
+                if oversized:
+                    line = continuation
+            if oversized:
+                while line and not line.endswith("\n"):
+                    line = lines.readline(limit + 1)
+                yield None
+                continue
             try:
                 record = json.loads(line)
             except (ValueError, TypeError, RecursionError):
@@ -205,6 +233,7 @@ def _event(code: str, digest: str | None = None, filename: str | None = None) ->
     suffix = " " + "/".join(bits) if bits else ""
     return AssetEvent("warn", code, f"external asset rejected{suffix}")
 
+
 def _append_event(events: list[AssetEvent], event: AssetEvent) -> None:
     if len(events) < MAX_EXTERNAL_EVENTS:
         events.append(event)
@@ -213,22 +242,19 @@ def _append_event(events: list[AssetEvent], event: AssetEvent) -> None:
 def discover_external_assets(transcript: Path, parent_relpath: str, cwd: str | Path | None,
                              excludes: list[str] | None = None) -> tuple[list[ExternalAsset], list[AssetEvent]]:
     """Stream a JSONL transcript and return validated external image refs plus safe events."""
-    assets: list[ExternalAsset] = []
+    unique: dict[str, ExternalAsset] = {}
     events: list[AssetEvent] = []
     declared_cwd = str(cwd) if cwd else None
     try:
         for record in iter_jsonl_records(transcript):
-            if len(assets) >= MAX_EXTERNAL_ASSETS:
-                _append_event(events, _event("asset_limit"))
-                break
+            if record is None:
+                _append_event(events, _event("line_too_large"))
+                continue
             for candidate in (record.get("cwd"), record.get("payload", {}).get("cwd")
                               if isinstance(record.get("payload"), dict) else None):
                 if declared_cwd is None and isinstance(candidate, str) and candidate.strip():
                     declared_cwd = candidate
             for item in _image_items(record):
-                if len(assets) >= MAX_EXTERNAL_ASSETS:
-                    _append_event(events, _event("asset_limit"))
-                    break
                 values = _walk_values(item)
                 has_blob = False
                 blob = None
@@ -273,16 +299,22 @@ def discover_external_assets(transcript: Path, parent_relpath: str, cwd: str | P
                 if not ext_mime or mime not in _SAFE_MIME:
                     _append_event(events, _event("unsupported_image_type", digest, filename))
                     continue
+                relpath = asset_relpath(parent_relpath, digest, filename)
+                if relpath in unique:
+                    continue
+                if len(unique) >= MAX_EXTERNAL_ASSETS:
+                    _append_event(events, _event("asset_limit"))
+                    break
                 try:
-                    with open_external_asset(source_real, root_real) as source:
-                        file_stat = os.fstat(source.fileno())
+                    with open_external_asset(source_real, root_real) as source_file:
+                        file_stat = os.fstat(source_file.fileno())
                         if file_stat.st_size > MAX_EXTERNAL_ASSET_BYTES:
                             _append_event(events, _event("asset_too_large", digest, filename))
                             continue
                         h = hashlib.sha256()
                         size = 0
                         oversized = False
-                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
                             if size + len(chunk) > MAX_EXTERNAL_ASSET_BYTES:
                                 oversized = True
                                 break
@@ -297,12 +329,10 @@ def discover_external_assets(transcript: Path, parent_relpath: str, cwd: str | P
                 except OSError:
                     _append_event(events, _event("asset_read_failed", digest, filename))
                     continue
-                assets.append(ExternalAsset(digest, source_real, filename,
-                                            asset_relpath(parent_relpath, digest, filename),
-                                            size, file_stat.st_mtime_ns, root_real))
+                unique[relpath] = ExternalAsset(digest, source_real, filename,
+                                                relpath, size, file_stat.st_mtime_ns, root_real)
     except OSError:
         _append_event(events, _event("asset_read_failed"))
-    unique = {a.relpath: a for a in assets}
     return [unique[k] for k in sorted(unique)], events
 
 

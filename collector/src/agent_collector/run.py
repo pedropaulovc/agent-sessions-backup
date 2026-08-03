@@ -47,10 +47,9 @@ MULTIPART_MAX_ATTEMPTS = 3
 # refuse up front rather than upload thousands of parts only to fail on part 10001.
 MULTIPART_MAX_PARTS = 10000
 
-# The hub finalizes a multipart upload with a single R2 put (staging -> canonical), capped at 5 GiB
-# (developers.cloudflare.com/r2/platform/limits). A larger file can't be finalized, so refuse it up
-# front rather than upload gigabytes only for complete to fail. The realistic corpus max is a few GB.
-MULTIPART_MAX_FILE_BYTES = MAX_EXTERNAL_ASSET_BYTES
+# Keep this independent of the external-image limit: both currently match R2's 5 GiB
+# single-object finalize cap, but changing one policy must not silently change the other.
+MULTIPART_MAX_FILE_BYTES = 5 * 1024 * 1024 * 1024
 
 
 def _oversize_refusal(size: int) -> str | None:
@@ -128,11 +127,11 @@ def _snapshot_external_asset(scanner: Scanner, store: str, asset: ExternalAsset)
     try:
         with os.fdopen(fd, "wb") as destination, open_external_asset(
             asset.source_path, asset.root_path
-        ) as source:
-            if os.fstat(source.fileno()).st_size <= MAX_EXTERNAL_ASSET_BYTES:
+        ) as source_file:
+            if os.fstat(source_file.fileno()).st_size <= MAX_EXTERNAL_ASSET_BYTES:
                 while True:
                     remaining = MAX_EXTERNAL_ASSET_BYTES - size
-                    chunk = source.read(min(1024 * 1024, remaining + 1))
+                    chunk = source_file.read(min(1024 * 1024, remaining + 1))
                     if not chunk:
                         break
                     if len(chunk) > remaining:
@@ -163,7 +162,6 @@ class ItemResult:
     bytes: int = 0
     seen: int = 0
     would_upload_count: int = 0
-    would_upload_bytes: int = 0
     error: str | None = None
 
 
@@ -182,27 +180,47 @@ def _discover_upload_assets(
     force: bool = False,
     dry_run: bool = False,
     totals: dict | None = None,
+    missing: set[tuple[str, str]] | None = None,
+    discovered: tuple[list[ExternalAsset], list] | None = None,
 ) -> ItemResult:
     if not force and st.asset_scan_ok(parent.store, parent.relpath, parent.size, parent.mtime_ns):
         return ItemResult()
-    assets, asset_events = discover_external_assets(
-        parent.source_path, parent.relpath, None, cfg.effective_excludes(),
-    )
+    if discovered is None:
+        assets, asset_events = discover_external_assets(
+            parent.source_path, parent.relpath, None, cfg.effective_excludes(),
+        )
+    else:
+        assets, asset_events = discovered
     events.extend(_asset_event_dict(e, parent.store) for e in asset_events)
     out = ItemResult(seen=len(assets))
+    # Stable rejection warnings can be cached, but source/file failures must be retried: the
+    # transcript can reference a file that appears or is repaired without changing its own mtime.
+    retryable_events = {
+        "asset_read_failed",
+        "missing_source_or_cwd",
+        "outside_cwd_or_missing",
+        "not_regular_file",
+        "asset_too_large",
+        "digest_mismatch",
+    }
+    cacheable = (
+        all(e.level == "warn" for e in asset_events)
+        and not any(e.code in retryable_events for e in asset_events)
+    )
     if dry_run:
-        missing = _check_missing_chunk(
-            cfg,
-            transport,
-            [(parent.store, asset.relpath, asset.digest) for asset in assets],
-            totals if totals is not None else {"check_failures": 0},
-            events,
+        if missing is None:
+            missing = _check_missing_chunk(
+                cfg,
+                transport,
+                [(parent.store, asset.relpath, asset.digest) for asset in assets],
+                totals if totals is not None else {"check_failures": 0},
+                events,
+            )
+        out.would_upload_count = sum(
+            (parent.store, asset.relpath) in missing for asset in assets
         )
-        for asset in assets:
-            if (parent.store, asset.relpath) in missing:
-                out.would_upload_count += 1
-                out.would_upload_bytes += asset.size
         return out
+
     for asset in assets:
         item, snapshot_error = _snapshot_external_asset(scanner, parent.store, asset)
         if snapshot_error:
@@ -223,7 +241,7 @@ def _discover_upload_assets(
             out.error = result.error if not out.error else f"{out.error}; {result.error}"
             events.append({"level": "error", "code": "asset_upload_failed",
                            "message": result.error[:500], "count": 1, "store": parent.store})
-    if not asset_events and not out.error:
+    if cacheable and not out.error:
         st.mark_asset_scan(parent.store, parent.relpath, parent.size, parent.mtime_ns)
     return out
 
@@ -695,7 +713,8 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
         st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "ok",
                        uploaded_size=item.size)
         totals["already_present"] += 1
-        successful_parents.append(item)
+        if not item.is_snapshot:
+            successful_parents.append(item)
         if not dry_run:
             _cleanup_snapshot(item)
 
@@ -703,12 +722,25 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
     small = [(it, sha) for it, sha in to_upload if it.size < cfg.multipart_threshold_bytes]
     if dry_run:
         totals["would_upload"] += len(to_upload)
-        for parent in hashed:
-            result = _discover_upload_assets(cfg, st, transport, scanner, parent[0], events,
-                                             force=True, dry_run=True, totals=totals)
+        discovered_parents: list[tuple[ScanItem, tuple[list[ExternalAsset], list]]] = []
+        asset_triples = []
+        for parent, _sha in hashed:
+            discovered = discover_external_assets(
+                parent.source_path, parent.relpath, None, cfg.effective_excludes(),
+            )
+            discovered_parents.append((parent, discovered))
+            asset_triples.extend(
+                (parent.store, asset.relpath, asset.digest) for asset in discovered[0]
+            )
+        missing_assets = _check_missing_chunk(cfg, transport, asset_triples, totals, events)
+        for parent, discovered in discovered_parents:
+            result = _discover_upload_assets(
+                cfg, st, transport, scanner, parent, events,
+                force=True, dry_run=True, totals=totals, missing=missing_assets,
+                discovered=discovered,
+            )
             _count_asset_result(result, totals)
-        for item, _sha in hashed:
-            _cleanup_snapshot(item)
+            _cleanup_snapshot(parent)
         return
     for item, sha in large:
         result, detail = _upload_multipart(cfg, transport, item, sha)
@@ -718,7 +750,8 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
                 totals["bytes_uploaded"] += item.size
             st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "ok",
                            uploaded_size=item.size, uploaded_at=now_iso())
-            successful_parents.append(item)
+            if not item.is_snapshot:
+                successful_parents.append(item)
         else:
             totals["failed"] += 1
             st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha, "error",
@@ -760,7 +793,8 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
             totals["bytes_uploaded"] += nbytes
             st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha2, "ok",
                            uploaded_size=nbytes, uploaded_at=now_iso())
-            successful_parents.append(item)
+            if not item.is_snapshot:
+                successful_parents.append(item)
         else:
             totals["failed"] += 1
             st.upsert_file(item.store, item.relpath, item.size, item.mtime_ns, sha2,
@@ -772,22 +806,26 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
         result = _discover_upload_assets(cfg, st, transport, scanner, parent, events, force=True)
         _count_asset_result(result, totals)
 
-
 def _check_missing_chunk(cfg, transport: Transport, triples, totals: dict,
                          events: list[dict]) -> set[tuple[str, str]]:
     if not triples:
         return set()
-    body = {"files": [{"store": s, "relpath": r, "sha256": h} for s, r, h in triples]}
-    status, resp = transport.post_json(f"{cfg.hub_url}/api/v1/files/check", body)
-    if status != 200:
-        # files/check is the ONLY source of truth in dry-run; a non-200 must fail the command,
-        # not silently report everything as would_upload. Non-dry-run still falls back to the
-        # conservative treat-all-missing PUTs, but the failure is surfaced either way.
-        totals["check_failures"] += 1
-        events.append({"level": "error", "code": "check_failed",
-                       "message": f"files/check HTTP {status}", "count": 1})
-        return {(s, r) for s, r, _ in triples}  # conservative: treat all as missing
-    return {(m["store"], m["relpath"]) for m in json.loads(resp).get("missing", [])}
+    missing: set[tuple[str, str]] = set()
+    for offset in range(0, len(triples), 1000):
+        batch = triples[offset:offset + 1000]
+        body = {"files": [{"store": s, "relpath": r, "sha256": h} for s, r, h in batch]}
+        status, resp = transport.post_json(f"{cfg.hub_url}/api/v1/files/check", body)
+        if status != 200:
+            # files/check is the ONLY source of truth in dry-run; a non-200 must fail the command,
+            # not silently report everything as would_upload. Non-dry-run still falls back to the
+            # conservative treat-all-missing PUTs, but the failure is surfaced either way.
+            totals["check_failures"] += 1
+            events.append({"level": "error", "code": "check_failed",
+                           "message": f"files/check HTTP {status}", "count": 1})
+            missing.update((s, r) for s, r, _ in batch)
+            continue
+        missing.update((m["store"], m["relpath"]) for m in json.loads(resp).get("missing", []))
+    return missing
 
 
 # ------------------------------------------------------------------------ status

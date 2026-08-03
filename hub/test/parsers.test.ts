@@ -260,7 +260,7 @@ describe('parseOmp', () => {
         parentId: null,
         message: {
           role: 'assistant',
-          content: [{ type: 'image', data: `blob:sha256:${digest.toUpperCase()}`, mimeType: 'image/jpeg; charset=binary', details: { meta: { source: { value: 'C:\\\\src\\\\project\\\\references\\\\001_img01.jpeg' } } } }],
+          content: [{ type: 'image', data: `blob:sha256:${digest.toUpperCase()}`, mimeType: 'image/jpeg; charset=binary', details: { meta: { source: { value: 'C:\\external-secret\\001_img01.jpeg' } } } }],
         },
       }),
     ];
@@ -270,7 +270,7 @@ describe('parseOmp', () => {
       mediaType: 'image/jpeg',
       externalAsset: { digest, fileName: '001_img01.jpeg', mediaType: 'image/jpeg' },
     });
-    expect(JSON.stringify(session)).not.toContain('C:\\\\src');
+    expect(JSON.stringify(session)).not.toContain('external-secret');
   });
   it('does not index OMP tool-result image metadata as tool text', async () => {
     const digest = 'c'.repeat(64);
@@ -286,7 +286,8 @@ describe('parseOmp', () => {
           content: [{
             type: 'toolResult',
             toolCallId: 'tc-image',
-            content: [{ type: 'image', data: `blob:sha256:${digest}`, mimeType: 'image/jpeg' }],
+            details: { toolId: 'metadata-only' },
+            content: [{ type: 'image', data: `blob:sha256:${digest}`, mimeType: 'image/jpeg', details: { ignoredSourcePath: '/tmp/omp/leaked-nested-source.png' } }],
           }],
         },
       }),
@@ -298,6 +299,7 @@ describe('parseOmp', () => {
       externalAsset: { digest, fileName: '001_img01.jpeg', mediaType: 'image/jpeg' },
     });
     expect(JSON.stringify(session)).not.toContain('/tmp/omp/references/001_img01.jpeg');
+    expect(JSON.stringify(session)).not.toContain('/tmp/omp/leaked-nested-source.png');
   });
 
   it('preserves the outer tool id for direct image-only OMP results', async () => {
@@ -479,13 +481,14 @@ describe('parseClaudeCode', () => {
       parentUuid: null,
       message: {
         role: 'user',
-        details: { meta: { source: { value: 'C:\\\\src\\\\project\\\\001_img01.jpeg' } } },
+        details: { meta: { source: { value: 'C:\\claude-secret\\001_img01.jpeg' } } },
         content: [{
           type: 'tool_result',
           tool_use_id: 'tool-1',
+          details: { toolId: 'metadata-only' },
           content: [
             { type: 'text', text: 'tool output text' },
-            { type: 'image', data: `blob:sha256:${digest}`, mimeType: 'image/jpeg' },
+            { type: 'image', data: `blob:sha256:${digest}`, mimeType: 'image/jpeg', details: { ignoredSourcePath: 'C:\\claude-secret\\leaked-nested-source.jpeg' } },
             { type: 'image', data: 'blob:not-a-digest', mimeType: 'image/jpeg' },
             { type: 'image', data: `blob:sha256:${digest}`, mimeType: 'image/jpeg', details: { meta: { source: { value: '' } } } },
           ],
@@ -500,8 +503,8 @@ describe('parseClaudeCode', () => {
     expect(blocks[2]).toMatchObject({ type: 'image', mediaType: 'image/jpeg' });
     expect(blocks[2]?.externalAsset).toBeUndefined();
     expect(blocks[3]).toMatchObject({ type: 'image', mediaType: 'image/jpeg' });
-    expect(blocks[3]?.externalAsset).toBeUndefined();
-    expect(JSON.stringify(session)).not.toContain('C:\\\\src');
+    expect(JSON.stringify(session)).not.toContain('claude-secret');
+    expect(JSON.stringify(session)).not.toContain('leaked-nested-source.jpeg');
   });
 
   it('marks abandoned branches off the main path', async () => {

@@ -2,12 +2,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-
 from agent_collector import external_images
-from agent_collector import config
 from agent_collector import run as run_mod
+from agent_collector import config
 from agent_collector.external_images import (
     ExternalAsset,
     asset_relpath,
@@ -151,6 +151,16 @@ def test_open_external_asset_enforces_descriptor_root(tmp_path):
         open_external_asset(outside, root)
 
 
+def test_open_external_asset_accepts_file_under_root(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    asset = root / "inside.jpeg"
+    asset.write_bytes(b"inside")
+
+    with open_external_asset(asset, root) as opened:
+        assert opened.read() == b"inside"
+
+
 def test_discovery_enforces_asset_size_during_hash(monkeypatch, tmp_path):
     monkeypatch.setattr(external_images, "MAX_EXTERNAL_ASSET_BYTES", 4)
     image = tmp_path / "001_img01.jpeg"
@@ -226,18 +236,100 @@ def test_discovery_bounds_oversized_jsonl_lines(monkeypatch, tmp_path):
     image.write_bytes(body)
     digest = hashlib.sha256(body).hexdigest()
     transcript = tmp_path / "session.jsonl"
-    transcript.write_text("x" * 600 + "\n")
-    _transcript(transcript, str(tmp_path), digest, str(image))
+    valid = tmp_path / "valid.jsonl"
+    _transcript(valid, str(tmp_path), digest, str(image))
+    transcript.write_bytes(b"x" * 600 + b"\n" + valid.read_bytes())
 
     assets, events = discover_external_assets(transcript, "session.jsonl", None, [])
 
-    assert not events
+    assert any(e.code == "line_too_large" for e in events)
     assert assets[0].source_path == image
 
 
-pytestmark = pytest.mark.skipif(not Transport.curl_available(), reason="system curl not available")
+def test_discovery_limits_unique_asset_relpaths(monkeypatch, tmp_path):
+    monkeypatch.setattr(external_images, "MAX_EXTERNAL_ASSETS", 2)
+    image1 = tmp_path / "001.jpeg"
+    image2 = tmp_path / "002.jpeg"
+    image1.write_bytes(b"one")
+    image2.write_bytes(b"two")
+    digest1 = hashlib.sha256(image1.read_bytes()).hexdigest()
+    digest2 = hashlib.sha256(image2.read_bytes()).hexdigest()
+    first = tmp_path / "first.jsonl"
+    second = tmp_path / "second.jsonl"
+    _transcript(first, str(tmp_path), digest1, str(image1))
+    _transcript(second, str(tmp_path), digest2, str(image2))
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_bytes(first.read_bytes() + first.read_bytes() + second.read_bytes())
+
+    assets, events = discover_external_assets(transcript, "session.jsonl", None, [])
+
+    assert len(assets) == 2
+    assert {asset.digest for asset in assets} == {digest1, digest2}
+    assert not any(e.code == "asset_limit" for e in events)
 
 
+def test_warning_only_asset_scan_is_cached(monkeypatch, tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("{}\n")
+    parent = run_mod.ScanItem("omp", "session.jsonl", transcript.stat().st_size,
+                              transcript.stat().st_mtime_ns, transcript, False)
+    warning = external_images.AssetEvent("warn", "line_too_large", "oversized")
+    monkeypatch.setattr(run_mod, "discover_external_assets", lambda *args: ([], [warning]))
+    cfg = SimpleNamespace(effective_excludes=lambda: [])
+    events = []
+
+    with State(tmp_path / "state.db") as st:
+        result = run_mod._discover_upload_assets(
+            cfg, st, None, None, parent, events, force=True,
+        )
+        assert result.seen == 0
+        assert st.asset_scan_ok("omp", "session.jsonl", parent.size, parent.mtime_ns)
+
+
+def test_asset_read_failure_is_not_cached(monkeypatch, tmp_path):
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("{}\n")
+    parent = run_mod.ScanItem("omp", "session.jsonl", transcript.stat().st_size,
+                              transcript.stat().st_mtime_ns, transcript, False)
+    failure = external_images.AssetEvent("warn", "asset_read_failed", "failed")
+    monkeypatch.setattr(run_mod, "discover_external_assets", lambda *args: ([], [failure]))
+    cfg = SimpleNamespace(effective_excludes=lambda: [])
+    events = []
+
+    with State(tmp_path / "state.db") as st:
+        run_mod._discover_upload_assets(cfg, st, None, None, parent, events, force=True)
+        assert not st.asset_scan_ok("omp", "session.jsonl", parent.size, parent.mtime_ns)
+
+
+def test_backfill_asset_check_batches_at_hub_limit():
+    class FakeTransport:
+        def __init__(self):
+            self.calls = []
+
+        def post_json(self, url, body):
+            self.calls.append(body)
+            files = body["files"]
+            return 200, json.dumps({"missing": files[:1]})
+
+    transport = FakeTransport()
+    cfg = SimpleNamespace(hub_url="https://hub.example")
+    totals = {"check_failures": 0}
+    events = []
+    triples = [("omp", f"session-{i}.assets/x", "d" * 64) for i in range(1001)]
+
+    missing = run_mod._check_missing_chunk(cfg, transport, triples, totals, events)
+
+    assert [len(call["files"]) for call in transport.calls] == [1000, 1]
+    assert len(missing) == 2
+    assert not events
+
+
+requires_curl = pytest.mark.skipif(
+    not Transport.curl_available(), reason="system curl not available"
+)
+
+
+@requires_curl
 def test_run_uploads_external_asset_and_is_idempotent(tmp_path, hub):
     root = tmp_path / "omp"
     root.mkdir()
@@ -256,6 +348,7 @@ def test_run_uploads_external_asset_and_is_idempotent(tmp_path, hub):
     assert hub.files[key]["body"] == body
 
 
+@requires_curl
 def test_run_retries_external_asset_after_source_appears(tmp_path, hub):
     root = tmp_path / "omp"
     root.mkdir()
@@ -275,6 +368,7 @@ def test_run_retries_external_asset_after_source_appears(tmp_path, hub):
     assert hub.files[key]["body"] == body
 
 
+@requires_curl
 def test_backfill_uploads_external_asset_for_present_parent(tmp_path, hub):
     root = tmp_path / "omp"
     root.mkdir()
@@ -292,6 +386,7 @@ def test_backfill_uploads_external_asset_for_present_parent(tmp_path, hub):
     assert hub.files[key]["body"] == body
 
 
+@requires_curl
 def test_backfill_dry_run_counts_missing_external_asset(tmp_path, hub, capsys):
     root = tmp_path / "omp"
     root.mkdir()

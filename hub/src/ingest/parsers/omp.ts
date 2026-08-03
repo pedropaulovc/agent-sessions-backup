@@ -8,7 +8,7 @@ import {
   type NormalizedTurn,
   type Role,
   externalAssetFromImage,
-  normalizeMediaType,
+  imageMediaType,
   type TurnUsage,
 } from '../normalize';
 
@@ -303,7 +303,7 @@ function blocksFrom(
           out.push({ type: 'tool_result', text: c.text, truncated: c.truncated, toolUseId: str(raw.toolCallId) ?? str(raw.tool_call_id), isError: raw.isError === true || undefined, ...at });
         }
         for (const nested of images) {
-          out.push({ type: 'image', mediaType: imageMediaType(nested), externalAsset: externalAssetFromImage(nested, isObj(raw.details) ? raw.details : enclosingDetails), ...at });
+          out.push({ type: 'image', mediaType: imageMediaType(nested), externalAsset: externalAssetFromImage(nested, enclosingDetails), ...at });
         }
         break;
       }
@@ -334,14 +334,6 @@ function imageItems(content: unknown): Record<string, unknown>[] {
   return Array.isArray(content) ? content.filter((part): part is Record<string, unknown> => isObj(part) && part.type === 'image') : [];
 }
 
-function imageMediaType(raw: Record<string, unknown>): string | undefined {
-  const source = isObj(raw.source) ? raw.source : undefined;
-  return normalizeMediaType(
-    str(raw.mimeType) ?? str(raw.mediaType) ?? str(raw.media_type) ?? str(raw.mime) ??
-    str(source?.mimeType) ?? str(source?.mime_type) ?? str(source?.media_type) ??
-    str(source?.mediaType) ?? str(source?.mime),
-  );
-}
 function promptBlocks(parts: readonly string[], line: JsonlLine): NormalizedBlock[] {
   const at = { byteStart: line.byteStart, byteLen: line.byteLen };
   const out: NormalizedBlock[] = [];

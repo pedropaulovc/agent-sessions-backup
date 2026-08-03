@@ -1,7 +1,7 @@
 /** Signed same-origin links for externally captured raster assets. */
 
 import { objectSha256 } from '../api/ops';
-import { assetRelSuffix, type ExternalAssetRef } from '../ingest/normalize';
+import { assetRelSuffix, safeAssetFilename, type ExternalAssetRef } from '../ingest/normalize';
 
 export const ASSET_LINK_TTL_SECONDS = 15 * 60;
 const DEV_ASSET_SECRET = 'agent-sessions-backup-development-asset-secret';
@@ -20,6 +20,8 @@ interface AssetFile {
 }
 
 const MAX_ASSET_CANDIDATES = 32;
+const HMAC_KEY_CACHE = new Map<string, Promise<CryptoKey>>();
+const TEXT_ENCODER = new TextEncoder();
 
 function signingSecret(env: Env): string | undefined {
   if (env.ENVIRONMENT === 'production') return env.ASSET_SIGNING_SECRET || undefined;
@@ -28,8 +30,19 @@ function signingSecret(env: Env): string | undefined {
   return undefined;
 }
 
-function messageFor(sessionId: string, digest: string, fileName: string, exp: number): string {
-  return `asset\n${sessionId}\n${digest}\n${fileName}\n${exp}`;
+function messageFor(sessionId: string, digest: string, fileName: string, exp: number): Uint8Array {
+  const fields = ['asset', sessionId, digest, fileName, String(exp)].map((value) => TEXT_ENCODER.encode(value));
+  const framedLength = fields.reduce((total, field) => total + 4 + field.length, 0);
+  const message = new Uint8Array(framedLength);
+  const view = new DataView(message.buffer);
+  let offset = 0;
+  for (const field of fields) {
+    view.setUint32(offset, field.length);
+    offset += 4;
+    message.set(field, offset);
+    offset += field.length;
+  }
+  return message;
 }
 
 function bytesToBase64Url(bytes: ArrayBuffer | Uint8Array): string {
@@ -51,12 +64,52 @@ function base64UrlToBytes(value: string): Uint8Array | undefined {
   }
 }
 
+async function hmacKey(secret: string): Promise<CryptoKey> {
+  const cached = HMAC_KEY_CACHE.get(secret);
+  const pending = crypto.subtle.importKey(
+    'raw',
+    TEXT_ENCODER.encode(secret),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign', 'verify'],
+  ).catch((error) => {
+    HMAC_KEY_CACHE.delete(secret);
+    throw error;
+  });
+  HMAC_KEY_CACHE.set(secret, pending);
+  return pending;
+}
+
 async function signature(sessionId: string, digest: string, fileName: string, exp: number, env: Env): Promise<string | undefined> {
   const secret = signingSecret(env);
   if (!secret) return undefined;
-  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
-  const signed = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(messageFor(sessionId, digest, fileName, exp)));
+  let key: CryptoKey;
+  try {
+    key = await hmacKey(secret);
+  } catch {
+    return undefined;
+  }
+  const signed = await crypto.subtle.sign('HMAC', key, messageFor(sessionId, digest, fileName, exp));
   return bytesToBase64Url(signed);
+}
+
+async function verifySignature(
+  sessionId: string,
+  digest: string,
+  fileName: string,
+  exp: number,
+  supplied: Uint8Array,
+  env: Env,
+): Promise<boolean> {
+  const secret = signingSecret(env);
+  if (!secret) return false;
+  let key: CryptoKey;
+  try {
+    key = await hmacKey(secret);
+  } catch {
+    return false;
+  }
+  return crypto.subtle.verify('HMAC', key, supplied, messageFor(sessionId, digest, fileName, exp));
 }
 
 /** Sign a viewer URL for an external asset. The source path is never included. */
@@ -74,7 +127,7 @@ export async function signExternalAssetUrl(
 }
 
 export async function assetEndpoint(sessionId: string, digest: string, fileName: string, url: URL, env: Env): Promise<Response> {
-  if (!DIGEST_RE.test(digest) || !FILENAME_RE.test(fileName) || fileName !== sanitizeFileName(fileName)) return forbidden();
+  if (!DIGEST_RE.test(digest) || !FILENAME_RE.test(fileName) || fileName !== safeAssetFilename(fileName)) return forbidden();
   const expRaw = url.searchParams.get('exp');
   const sig = url.searchParams.get('sig');
   const now = Math.floor(Date.now() / 1000);
@@ -83,6 +136,8 @@ export async function assetEndpoint(sessionId: string, digest: string, fileName:
   const extension = fileName.slice(fileName.lastIndexOf('.') + 1).toLowerCase();
   const mediaType = MIME_BY_EXTENSION[extension];
   if (!mediaType) return forbidden();
+  const supplied = base64UrlToBytes(sig);
+  if (!supplied || !(await verifySignature(sessionId, digest, fileName, exp, supplied, env))) return forbidden();
 
   const candidates = await env.DB.prepare(
     `SELECT f.r2_key
@@ -94,10 +149,6 @@ export async function assetEndpoint(sessionId: string, digest: string, fileName:
      LIMIT ${MAX_ASSET_CANDIDATES}`,
   ).bind(sessionId).all<AssetFile>();
   if (candidates.results.length === 0) return notFound();
-  const expected = await signature(sessionId, digest, fileName, exp, env);
-  const supplied = base64UrlToBytes(sig);
-  const secret = signingSecret(env);
-  if (!expected || !supplied || !secret || !constantTimeEqual(expected, sig)) return forbidden();
 
   for (const candidate of candidates.results) {
     const object = await env.RAW.get(assetRelSuffix(candidate.r2_key, digest, fileName));
@@ -112,17 +163,6 @@ export async function assetEndpoint(sessionId: string, digest: string, fileName:
     });
   }
   return notFound();
-}
-
-function sanitizeFileName(fileName: string): string {
-  return fileName.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 128) || 'asset';
-}
-
-function constantTimeEqual(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  let diff = 0;
-  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
-  return diff === 0;
 }
 
 function forbidden(): Response {
