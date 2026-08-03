@@ -67,6 +67,26 @@ def test_hub_url_change_reoffers_files_and_records_event(tmp_path):
         assert any(e["code"] == "hub_url_changed" for e in events)
 
 
+@pytest.mark.parametrize("stored_version", ["0.4.2", None])
+def test_asset_scan_cache_resets_after_collector_version_change(tmp_path, stored_version):
+    db = tmp_path / "state.db"
+    with State(db) as st:
+        st.mark_asset_scan("omp", "session.jsonl", 10, 123)
+        assert st.asset_scan_ok("omp", "session.jsonl", 10, 123)
+        if stored_version is None:
+            st.conn.execute("DELETE FROM meta WHERE key = 'asset_scan_rules_version'")
+        else:
+            st.conn.execute(
+                "UPDATE meta SET value = ? WHERE key = 'asset_scan_rules_version'",
+                (stored_version,),
+            )
+        st.conn.commit()
+
+    with State(db) as st:
+        assert not st.asset_scan_ok("omp", "session.jsonl", 10, 123)
+        _ids, events = st.drain_events()
+        assert any(e["code"] == "asset_scan_rules_changed" for e in events)
+
 def test_hub_url_trailing_slash_is_noop(tmp_path):
     db = tmp_path / "state.db"
     with State(db, machine_id="A", hub_url="http://hub-a") as st:

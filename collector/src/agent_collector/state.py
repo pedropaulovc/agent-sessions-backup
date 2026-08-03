@@ -1,10 +1,3 @@
-"""SQLite state at $XDG_STATE_HOME/agent-collector/state.db (default ~/.local/state/...).
-
-STRICT tables. WAL + NORMAL. The overlap lock lives in a SIBLING lock database so a held
-BEGIN IMMEDIATE never blocks the main connection's per-file commits (same-file WAL allows
-only one writer, which would self-deadlock).
-"""
-
 from __future__ import annotations
 
 import os
@@ -12,6 +5,8 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+from . import __version__
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
@@ -130,10 +125,32 @@ class State:
         self.conn.execute("PRAGMA synchronous = NORMAL")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        self._reconcile_asset_scan_rules()
         self.machine_id_changed = False
         self.hub_url_changed = False
         if machine_id is not None or hub_url is not None:
             self._reconcile_identity(machine_id, hub_url)
+
+    def _reconcile_asset_scan_rules(self) -> None:
+        """Invalidate cached external-asset scans when collector behavior changes."""
+        key = "asset_scan_rules_version"
+        row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            self.conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (key, __version__))
+            changed = self.conn.execute("SELECT 1 FROM asset_scans LIMIT 1").fetchone() is not None
+        else:
+            changed = row["value"] != __version__
+            if changed:
+                self.conn.execute("UPDATE meta SET value = ? WHERE key = ?", (__version__, key))
+        if not changed:
+            self.conn.commit()
+            return
+        self.conn.execute("DELETE FROM asset_scans")
+        self.buffer_events([{
+            "level": "info",
+            "code": "asset_scan_rules_changed",
+            "message": "collector asset-scan rules changed; cached external-asset scans were cleared",
+        }])
 
     def _reconcile_identity(self, machine_id: str | None, hub_url: str | None) -> None:
         """Scope the local fast-path state by the hub IDENTITY (machine_id + hub_url). The hub
@@ -151,6 +168,7 @@ class State:
             self.conn.commit()  # persist any first-time meta inserts
             return
         self.conn.execute("UPDATE files SET status = 'pending', error = NULL")
+        self.conn.execute("DELETE FROM asset_scans")
         self.conn.commit()
         self.buffer_events(events)
         self.machine_id_changed = m_changed

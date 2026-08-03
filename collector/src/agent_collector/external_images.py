@@ -26,7 +26,10 @@ MAX_EXTERNAL_EVENTS = 256
 
 @dataclass(frozen=True)
 class ExternalAsset:
+    # digest is the renderer-provided logical identity used in the transcript/viewer URL.
     digest: str
+    # source_digest is the SHA-256 of the source bytes that the collector actually uploads.
+    source_digest: str
     source_path: Path
     filename: str
     relpath: str
@@ -79,6 +82,35 @@ def resolve_declared_path(value: str, cwd: str | Path) -> Path:
         source = root / source
 
     return source
+
+def _is_absolute_path(value: str) -> bool:
+    return _windows_to_native(value).is_absolute()
+
+
+def _resolved_roots(declared_cwd: str | None, trusted_roots: list[str | Path] | None) -> list[Path]:
+    values: list[str | Path] = []
+    if declared_cwd:
+        values.append(declared_cwd)
+    values.extend(trusted_roots or [])
+    roots: list[Path] = []
+    for value in values:
+        try:
+            root = _windows_to_native(str(value)).expanduser().resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if root not in roots:
+            roots.append(root)
+    return sorted(roots, key=lambda root: len(root.parts), reverse=True)
+
+
+def _root_containing(path: Path, roots: list[Path]) -> Path | None:
+    for root in roots:
+        try:
+            path.relative_to(root)
+            return root
+        except ValueError:
+            continue
+    return None
 
 def _descriptor_target(fd: int) -> Path | None:
     """Return the canonical target of an open descriptor when the platform exposes one."""
@@ -196,8 +228,8 @@ def _mime(item: dict, source: Path) -> str | None:
     normalized = [v.lower().split(";", 1)[0].strip() for v in values]
     # Tool renderers can transcode the captured bytes before recording metadata (for example,
     # a PNG source may be reported as image/webp). The source extension is the storage/viewer
-    # contract and the content hash below verifies the bytes; reject only unsupported declared
-    # media types, then use the safe source extension as the canonical MIME.
+    # contract; source bytes are hashed separately from the renderer's logical blob digest.
+    # Reject only unsupported declared media types, then use the safe source extension as canonical MIME.
     if ext_mime is None or any(v not in _SAFE_MIME for v in normalized):
         return None
     return ext_mime
@@ -233,7 +265,8 @@ def iter_jsonl_records(transcript: Path) -> Iterator[dict | None]:
 def _event(code: str, digest: str | None = None, filename: str | None = None) -> AssetEvent:
     bits = [x for x in (digest, safe_asset_filename(filename) if filename else None) if x]
     suffix = " " + "/".join(bits) if bits else ""
-    return AssetEvent("warn", code, f"external asset rejected{suffix}")
+    message = "external asset source differs" if code == "source_digest_mismatch" else "external asset rejected"
+    return AssetEvent("warn", code, f"{message}{suffix}")
 
 
 def _append_event(events: list[AssetEvent], event: AssetEvent) -> None:
@@ -242,7 +275,8 @@ def _append_event(events: list[AssetEvent], event: AssetEvent) -> None:
 
 
 def discover_external_assets(transcript: Path, parent_relpath: str, cwd: str | Path | None,
-                             excludes: list[str] | None = None) -> tuple[list[ExternalAsset], list[AssetEvent]]:
+                             excludes: list[str] | None = None,
+                             trusted_roots: list[str | Path] | None = None) -> tuple[list[ExternalAsset], list[AssetEvent]]:
     """Stream a JSONL transcript and return validated external image refs plus safe events."""
     unique: dict[str, ExternalAsset] = {}
     events: list[AssetEvent] = []
@@ -274,19 +308,27 @@ def discover_external_assets(transcript: Path, parent_relpath: str, cwd: str | P
                     _append_event(events, _event("invalid_digest", filename=filename))
                     continue
                 digest = match.group(1).lower()
-                if not source_value or not declared_cwd:
+                if not source_value or (not declared_cwd and not trusted_roots):
                     _append_event(events, _event("missing_source_or_cwd", digest, filename))
                     continue
-                # Absolute Windows paths are normalized before applying the session-cwd boundary.
-                source = resolve_declared_path(source_value, declared_cwd).expanduser()
+                if _is_absolute_path(source_value):
+                    source = _windows_to_native(source_value).expanduser()
+                elif declared_cwd:
+                    source = resolve_declared_path(source_value, declared_cwd).expanduser()
+                else:
+                    _append_event(events, _event("missing_source_or_cwd", digest, filename))
+                    continue
+                roots = _resolved_roots(declared_cwd, trusted_roots)
                 try:
-                    root_real = Path(_windows_to_native(str(declared_cwd))).expanduser().resolve(strict=True)
                     if source.is_symlink():
                         _append_event(events, _event("not_regular_file", digest, filename))
                         continue
                     source_real = source.resolve(strict=True)
-                    source_real.relative_to(root_real)
                 except (OSError, RuntimeError, ValueError):
+                    _append_event(events, _event("outside_cwd_or_missing", digest, filename))
+                    continue
+                root_real = _root_containing(source_real, roots)
+                if root_real is None:
                     _append_event(events, _event("outside_cwd_or_missing", digest, filename))
                     continue
                 if not source_real.is_file():
@@ -325,13 +367,13 @@ def discover_external_assets(transcript: Path, parent_relpath: str, cwd: str | P
                     if oversized:
                         _append_event(events, _event("asset_too_large", digest, filename))
                         continue
-                    if h.hexdigest() != digest:
-                        _append_event(events, _event("digest_mismatch", digest, filename))
-                        continue
+                    source_digest = h.hexdigest()
+                    if source_digest != digest:
+                        _append_event(events, _event("source_digest_mismatch", digest, filename))
                 except OSError:
                     _append_event(events, _event("asset_read_failed", digest, filename))
                     continue
-                unique[relpath] = ExternalAsset(digest, source_real, filename,
+                unique[relpath] = ExternalAsset(digest, source_digest, source_real, filename,
                                                 relpath, size, file_stat.st_mtime_ns, root_real)
     except OSError:
         _append_event(events, _event("asset_read_failed"))

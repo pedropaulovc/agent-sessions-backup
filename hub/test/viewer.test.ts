@@ -64,7 +64,7 @@ const INJECTED_WRAPPERS_TITLE_SESSION = 'injected-wrapper-title-session';
 const STAR_STABLE_SESSION = '70707070-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const STAR_STABLE_RELPATH = `-home-tester-src-demo/${STAR_STABLE_SESSION}.jsonl`;
 const EXTERNAL_ASSET_SESSION = '90909090-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
-const EXTERNAL_ASSET_DIGEST = '745e7d5e3c944e1143bf69e4af91bf24466ee45acd9ac70468f38ba2a6f0a842';
+const EXTERNAL_ASSET_DIGEST = '8ab6aa52fbc76cc78abb7708d68bad0df001a0ba8d88ab134b345935ee93b794';
 const EXTERNAL_ASSET_RELPATH = `-home-tester-src-demo/${EXTERNAL_ASSET_SESSION}.jsonl`;
 const REPO_URL = 'https://github.com/tester/facetdemo';
 
@@ -505,17 +505,13 @@ describe('viewer', () => {
     starStableR2Key = starStableFile!.r2_key;
 
     await drainQueue();
-    const externalAssetFile = await testEnv.DB.prepare(
-      'SELECT r2_key FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
-    )
-      .bind('testbox-wsl', 'claude-projects', EXTERNAL_ASSET_RELPATH)
-      .first<{ r2_key: string }>();
-    expect(externalAssetFile).toBeTruthy();
-    await testEnv.RAW.put(
-      `${externalAssetFile!.r2_key}.assets/${EXTERNAL_ASSET_DIGEST}/001_img01.jpeg`,
-      new TextEncoder().encode('external jpeg bytes'),
-      { sha256: EXTERNAL_ASSET_DIGEST },
-    );
+    expect(
+      (await putFile(
+        'claude-projects',
+        `${EXTERNAL_ASSET_RELPATH}.assets/${EXTERNAL_ASSET_DIGEST}/001_img01.jpeg`,
+        'external jpeg bytes',
+      )).status,
+    ).toBe(201);
 
     await testEnv.DB.batch([
       testEnv.DB.prepare(
