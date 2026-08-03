@@ -20,13 +20,17 @@ from agent_collector.state import State
 from agent_collector.transport import Transport
 
 
-def _transcript(path: Path, cwd: str, digest: str, source: str) -> None:
+def _transcript(path: Path, cwd: str, digest: str, source: str, mime_type: str | None = None) -> None:
+    image = {
+        "type": "image",
+        "data": f"blob:sha256:{digest}",
+        "details": {"meta": {"source": {"value": source}}},
+    }
+    if mime_type is not None:
+        image["mimeType"] = mime_type
     path.write_text(
         json.dumps({"type": "session_meta", "cwd": cwd}) + "\n"
-        + json.dumps({"type": "tool_result", "content": [{
-            "type": "image", "data": f"blob:sha256:{digest}",
-            "details": {"meta": {"source": {"value": source}}},
-        }]}) + "\n"
+        + json.dumps({"type": "tool_result", "content": [image]}) + "\n"
     )
 
 
@@ -71,6 +75,20 @@ def test_discovery_inherits_tool_result_source_for_nested_image(tmp_path):
 
     assert not events
     assert assets[0].source_path == image
+
+def test_discovery_accepts_safe_renderer_mime_mismatch(tmp_path):
+    image = tmp_path / "top-frame.png"
+    body = b"png bytes"
+    image.write_bytes(body)
+    digest = hashlib.sha256(body).hexdigest()
+    transcript = tmp_path / "session.jsonl"
+    _transcript(transcript, str(tmp_path), digest, str(image), mime_type="image/webp")
+
+    assets, events = discover_external_assets(transcript, "session.jsonl", None, [])
+
+    assert not events
+    assert [asset.filename for asset in assets] == ["top-frame.png"]
+    assert assets[0].digest == digest
 
 
 def test_discovery_requires_declared_cwd_for_absolute_source(tmp_path):
@@ -346,6 +364,25 @@ def test_run_uploads_external_asset_and_is_idempotent(tmp_path, hub):
         assert run_mod._do_run(cfg, st) == 0
     key = ("m1", "omp", f"session.jsonl.assets/{digest}/001_img01.jpeg")
     assert hub.files[key]["body"] == body
+
+@requires_curl
+def test_run_uploads_asset_when_renderer_mime_differs(tmp_path, hub):
+    root = tmp_path / "omp"
+    root.mkdir()
+    image = tmp_path / "top-frame.png"
+    body = b"png bytes"
+    image.write_bytes(body)
+    digest = hashlib.sha256(body).hexdigest()
+    transcript = root / "session.jsonl"
+    _transcript(transcript, str(tmp_path), digest, str(image), mime_type="image/webp")
+    cfg = config.Config(machine_id="m1", hub_url=hub.url, auth="dev", stores={"omp": str(root)})
+
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_run(cfg, st) == 0
+
+    key = ("m1", "omp", f"session.jsonl.assets/{digest}/top-frame.png")
+    assert hub.files[key]["body"] == body
+
 
 
 @requires_curl

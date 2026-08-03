@@ -194,11 +194,13 @@ def _mime(item: dict, source: Path) -> str | None:
                 values.append(source_value[key])
     ext_mime = _SAFE_EXT.get(source.suffix.lower())
     normalized = [v.lower().split(";", 1)[0].strip() for v in values]
-    if any(v not in _SAFE_MIME for v in normalized):
+    # Tool renderers can transcode the captured bytes before recording metadata (for example,
+    # a PNG source may be reported as image/webp). The source extension is the storage/viewer
+    # contract and the content hash below verifies the bytes; reject only unsupported declared
+    # media types, then use the safe source extension as the canonical MIME.
+    if ext_mime is None or any(v not in _SAFE_MIME for v in normalized):
         return None
-    if ext_mime is None or (normalized and ext_mime not in normalized):
-        return None
-    return normalized[0] if normalized else ext_mime
+    return ext_mime
 
 
 def iter_jsonl_records(transcript: Path) -> Iterator[dict | None]:
