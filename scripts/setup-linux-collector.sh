@@ -44,9 +44,19 @@ while (($#)); do
 done
 
 [[ "$interval_minutes" =~ ^[0-9]+$ ]] || fail "interval must be an integer: $interval_minutes"
-((interval_minutes >= 1 && interval_minutes <= 1440)) || fail "interval must be between 1 and 1440 minutes"
+interval_value="${interval_minutes#"${interval_minutes%%[!0]*}"}"
+interval_value="${interval_value:-0}"
+((interval_value >= 1 && interval_value <= 1440)) || fail "interval must be between 1 and 1440 minutes"
 command -v uv >/dev/null 2>&1 || fail 'uv is required: https://docs.astral.sh/uv/getting-started/installation/'
 command -v systemctl >/dev/null 2>&1 || fail 'systemctl is required for the Linux user timer'
+systemctl --user show-environment >/dev/null 2>&1 || fail 'systemctl --user is unavailable; enable systemd and retry'
+
+# Stop the timer before checking the service so it cannot start a new run during the update.
+if ! systemctl --user stop agent-collector.timer 2>/dev/null; then
+  load_state="$(systemctl --user show --property=LoadState --value agent-collector.timer 2>/dev/null || true)"
+  [[ -z "$load_state" ]] && fail 'could not stop the agent-collector systemd timer'
+  [[ "$load_state" == 'not-found' ]] || fail "could not stop the agent-collector systemd timer (load state: $load_state)"
+fi
 
 # Do not replace the tool while a systemd run is still executing. A oneshot service is
 # "activating" while its ExecStart process is alive and becomes "inactive" after it exits.
