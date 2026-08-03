@@ -304,13 +304,16 @@ function blocksFrom(
           out.push({ type: 'tool_result', text: c.text, truncated: c.truncated, toolUseId: str(raw.toolCallId) ?? str(raw.tool_call_id), isError: raw.isError === true || undefined, ...at });
         }
         for (const nested of images) {
-          out.push({ type: 'image', mediaType: imageMediaType(nested), externalAsset: externalAssetFromImage(nested, enclosingDetails), ...at });
+          const externalAsset = externalAssetFromImage(nested, enclosingDetails);
+          out.push({ type: 'image', mediaType: imageMediaType(nested) ?? externalAsset?.mediaType, externalAsset, ...at });
         }
         break;
       }
-      case 'image':
-        out.push({ type: 'image', mediaType: imageMediaType(raw), externalAsset: externalAssetFromImage(raw, enclosingDetails), ...at });
+      case 'image': {
+        const externalAsset = externalAssetFromImage(raw, enclosingDetails);
+        out.push({ type: 'image', mediaType: imageMediaType(raw) ?? externalAsset?.mediaType, externalAsset, ...at });
         break;
+      }
       default: {
         const c = cap(safeJson(raw), CAPS.text);
         if (c.text) out.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });

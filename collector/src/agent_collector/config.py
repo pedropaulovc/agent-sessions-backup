@@ -192,11 +192,13 @@ class Config:
     # somewhere else without touching environment variables (tests use this so a Config
     # built with only e.g. stores={"claude": ...} can never fall through to this box's real
     # webcapture staging dir, which may hold real export ZIPs).
-    # Placed LAST (not earlier, e.g. next to the other optional fields above) so a positional
-    # Config(...) construction elsewhere in the codebase can never silently shift `source`
-    # (or any other field) into this slot — every existing call site uses keyword args, and
-    # this ordering keeps a future positional mistake impossible rather than merely unlikely.
+    # Keep staging_base after existing fields so positional Config(...) construction elsewhere in
+    # the codebase cannot silently shift `source` (or any other existing field) into this slot.
     staging_base: str | None = None
+    # Absolute roots explicitly trusted for external image references. The recorded session cwd
+    # remains the default trust root; these roots opt in to legitimate tool outputs stored outside
+    # that cwd. Keep this after existing fields so positional Config(...) calls retain their order.
+    external_asset_roots: list[str] = field(default_factory=list)
 
     @property
     def multipart_threshold_bytes(self) -> int:
@@ -284,6 +286,11 @@ def _dump_toml(cfg: Config) -> str:
         f'auth = "{_toml_escape(cfg.auth)}"',
         f"include_windows_mounts = {str(cfg.include_windows_mounts).lower()}",
     ]
+    if cfg.external_asset_roots:
+        items = ", ".join(f'"{_toml_escape(p)}"' for p in cfg.external_asset_roots)
+        lines.append(f"external_asset_roots = [{items}]")
+    else:
+        lines.append("# external_asset_roots = []  # additional trusted roots for external image sources")
     if cfg.client_cert_path:
         lines.append(f'client_cert_path = "{_toml_escape(cfg.client_cert_path)}"')
     if cfg.client_key_path:
@@ -333,6 +340,7 @@ def load(path: Path | str | None = None) -> Config:
         client_cert_thumbprint=data.get("client_cert_thumbprint"),
         multipart_threshold_mb=threshold_mb,
         multipart_part_size_mb=part_size_mb,
+        external_asset_roots=list(data.get("external_asset_roots") or []),
         source=path,
     )
 
@@ -469,6 +477,7 @@ def enroll(
         stores=dict(existing.stores) if existing is not None else dict(DEFAULT_STORES),
         exclude=list(existing.exclude) if existing is not None else [],
         include_windows_mounts=existing.include_windows_mounts if existing is not None else False,
+        external_asset_roots=list(existing.external_asset_roots) if existing is not None else [],
         multipart_threshold_mb=existing.multipart_threshold_mb if existing is not None else DEFAULT_MULTIPART_THRESHOLD_MB,
         multipart_part_size_mb=existing.multipart_part_size_mb if existing is not None else DEFAULT_MULTIPART_PART_SIZE_MB,
     )

@@ -54,6 +54,16 @@ def test_enroll_and_load_roundtrip(tmp_path):
     assert "*.credentials.json*" in loaded.effective_excludes()
 
 
+def test_external_asset_roots_roundtrip(tmp_path):
+    root = tmp_path / "asset-source"
+    root.mkdir()
+    path = tmp_path / "config.toml"
+    cfg = config.Config(machine_id="m1", hub_url="http://h", external_asset_roots=[str(root)])
+
+    config.save(cfg, path)
+
+    assert config.load(path).external_asset_roots == [str(root)]
+
 def test_enroll_mtls_without_paths_errors(tmp_path):
     # Non-dev enrollment with no client material errors clearly (PEM paths OR a Windows thumbprint).
     with pytest.raises(ValueError, match="mTLS enrollment needs client material"):

@@ -15,8 +15,16 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   webp: 'image/webp',
 };
 
+interface CandidateFile {
+  r2_key: string;
+  machine_id: string;
+  store: string;
+  relpath: string;
+}
+
 interface AssetFile {
   r2_key: string;
+  content_hash: string;
 }
 
 const MAX_ASSET_CANDIDATES = 32;
@@ -140,19 +148,27 @@ export async function assetEndpoint(sessionId: string, digest: string, fileName:
   if (!supplied || !(await verifySignature(sessionId, digest, fileName, exp, supplied, env))) return forbidden();
 
   const candidates = await env.DB.prepare(
-    `SELECT f.r2_key
+    `SELECT f.r2_key, f.machine_id, f.store, f.relpath
      FROM files f
      WHERE f.id = (SELECT canonical_file_id FROM sessions WHERE session_id = ?1)
         OR f.session_id = ?1
      ORDER BY CASE WHEN f.id = (SELECT canonical_file_id FROM sessions WHERE session_id = ?1)
                    THEN 0 ELSE 1 END, f.id
      LIMIT ${MAX_ASSET_CANDIDATES}`,
-  ).bind(sessionId).all<AssetFile>();
-  if (candidates.results.length === 0) return notFound();
-
+  ).bind(sessionId).all<CandidateFile>();
   for (const candidate of candidates.results) {
-    const object = await env.RAW.get(assetRelSuffix(candidate.r2_key, digest, fileName));
-    if (!object || objectSha256(object) !== digest) continue;
+    // Renderer blob digests identify the reference in the raw transcript. The external asset row
+    // carries the SHA-256 of the source bytes the collector uploaded, which may differ when the
+    // renderer transcoded the image before recording its blob digest.
+    const assetRelpath = assetRelSuffix(candidate.relpath, digest, fileName);
+    const asset = await env.DB.prepare(
+      'SELECT r2_key, content_hash FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
+    ).bind(candidate.machine_id, candidate.store, assetRelpath).first<AssetFile>();
+    const object = await env.RAW.get(
+      asset?.r2_key ?? assetRelSuffix(candidate.r2_key, digest, fileName),
+    );
+    const expectedHash = asset?.content_hash ?? digest;
+    if (!object || objectSha256(object) !== expectedHash) continue;
     return new Response(object.body, {
       headers: {
         'content-type': mediaType,

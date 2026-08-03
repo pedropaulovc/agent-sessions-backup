@@ -18,7 +18,7 @@ describe('EXPECTED_COLLECTOR_VERSION', () => {
     // The moment pyproject carries its own literal again, the two can drift apart silently and the
     // test above stops being enough — so pin the derivation, not just the current values.
     expect(pyproject).toMatch(/^dynamic\s*=\s*\["version"\]/m);
-    expect(pyproject).toMatch(/^\[tool\.hatch\.version\]\npath\s*=\s*"src\/agent_collector\/__init__\.py"/m);
+    expect(pyproject).toMatch(/^\[tool\.hatch\.version\]\r?\npath\s*=\s*"src\/agent_collector\/__init__\.py"/m);
     expect(pyproject).not.toMatch(/^version\s*=/m);
   });
 });

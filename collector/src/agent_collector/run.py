@@ -148,7 +148,7 @@ def _snapshot_external_asset(scanner: Scanner, store: str, asset: ExternalAsset)
     if oversized:
         _safe_unlink(path)
         return None, f"{asset.relpath}: source exceeds size limit"
-    if size != asset.size or digest.hexdigest() != asset.digest:
+    if size != asset.size or digest.hexdigest() != asset.source_digest:
         _safe_unlink(path)
         return None, f"{asset.relpath}: source changed after discovery"
     return ScanItem(store, asset.relpath, size, asset.mtime_ns, Path(path), True), None
@@ -188,6 +188,7 @@ def _discover_upload_assets(
     if discovered is None:
         assets, asset_events = discover_external_assets(
             parent.source_path, parent.relpath, None, cfg.effective_excludes(),
+            getattr(cfg, "external_asset_roots", None),
         )
     else:
         assets, asset_events = discovered
@@ -201,7 +202,6 @@ def _discover_upload_assets(
         "outside_cwd_or_missing",
         "not_regular_file",
         "asset_too_large",
-        "digest_mismatch",
     }
     cacheable = (
         all(e.level == "warn" for e in asset_events)
@@ -212,7 +212,7 @@ def _discover_upload_assets(
             missing = _check_missing_chunk(
                 cfg,
                 transport,
-                [(parent.store, asset.relpath, asset.digest) for asset in assets],
+                [(parent.store, asset.relpath, asset.source_digest) for asset in assets],
                 totals if totals is not None else {"check_failures": 0},
                 events,
             )
@@ -730,10 +730,11 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
                 continue
             discovered = discover_external_assets(
                 parent.source_path, parent.relpath, None, cfg.effective_excludes(),
+                getattr(cfg, "external_asset_roots", None),
             )
             discovered_parents.append((parent, discovered))
             asset_triples.extend(
-                (parent.store, asset.relpath, asset.digest) for asset in discovered[0]
+                (parent.store, asset.relpath, asset.source_digest) for asset in discovered[0]
             )
         missing_assets = _check_missing_chunk(cfg, transport, asset_triples, totals, events)
         for parent, discovered in discovered_parents:

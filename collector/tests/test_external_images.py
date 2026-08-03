@@ -20,13 +20,17 @@ from agent_collector.state import State
 from agent_collector.transport import Transport
 
 
-def _transcript(path: Path, cwd: str, digest: str, source: str) -> None:
+def _transcript(path: Path, cwd: str, digest: str, source: str, mime_type: str | None = None) -> None:
+    image = {
+        "type": "image",
+        "data": f"blob:sha256:{digest}",
+        "details": {"meta": {"source": {"value": source}}},
+    }
+    if mime_type is not None:
+        image["mimeType"] = mime_type
     path.write_text(
         json.dumps({"type": "session_meta", "cwd": cwd}) + "\n"
-        + json.dumps({"type": "tool_result", "content": [{
-            "type": "image", "data": f"blob:sha256:{digest}",
-            "details": {"meta": {"source": {"value": source}}},
-        }]}) + "\n"
+        + json.dumps({"type": "tool_result", "content": [image]}) + "\n"
     )
 
 
@@ -58,7 +62,7 @@ def test_discovery_inherits_tool_result_source_for_nested_image(tmp_path):
             "role": "toolResult",
             "content": [
                 {"type": "text", "text": "Read image file [image/jpeg]"},
-                {"type": "image", "data": f"blob:sha256:{digest}", "mimeType": "image/jpeg"},
+                {"type": "image", "data": f"blob:sha256:{digest}"},
             ],
             "details": {
                 "fileSize": len(body),
@@ -72,12 +76,28 @@ def test_discovery_inherits_tool_result_source_for_nested_image(tmp_path):
     assert not events
     assert assets[0].source_path == image
 
+def test_discovery_accepts_safe_renderer_mime_and_digest_mismatch(tmp_path):
+    image = tmp_path / "top-frame.png"
+    body = b"png bytes"
+    source_digest = hashlib.sha256(body).hexdigest()
+    renderer_digest = "a" * 64
+    image.write_bytes(body)
+    transcript = tmp_path / "session.jsonl"
+    _transcript(transcript, str(tmp_path), renderer_digest, str(image), mime_type="image/webp")
+
+    assets, events = discover_external_assets(transcript, "session.jsonl", None, [])
+
+    assert [asset.filename for asset in assets] == ["top-frame.png"]
+    assert assets[0].digest == renderer_digest
+    assert assets[0].source_digest == source_digest
+    assert any(e.code == "source_digest_mismatch" for e in events)
+
 
 def test_discovery_requires_declared_cwd_for_absolute_source(tmp_path):
     image = tmp_path / "outside-workspace.jpeg"
     body = b"absolute jpeg bytes"
-    image.write_bytes(body)
     digest = hashlib.sha256(body).hexdigest()
+    image.write_bytes(body)
     transcript = tmp_path / "session.jsonl"
     transcript.write_text(json.dumps({
         "type": "tool_result",
@@ -94,14 +114,37 @@ def test_discovery_requires_declared_cwd_for_absolute_source(tmp_path):
     assert not assets
     assert any(e.code == "missing_source_or_cwd" for e in events)
 
-def test_discovery_rejects_mismatch_and_escape(tmp_path):
+
+def test_discovery_accepts_source_under_explicit_trusted_root(tmp_path):
+    workspace = tmp_path / "workspace"
+    source_root = tmp_path / "source-root"
+    workspace.mkdir()
+    source_root.mkdir()
+    image = source_root / "outside-workspace.jpeg"
+    body = b"absolute jpeg bytes"
+    image.write_bytes(body)
+    renderer_digest = "b" * 64
+    transcript = workspace / "session.jsonl"
+    _transcript(transcript, str(workspace), renderer_digest, str(image))
+
+    assets, events = discover_external_assets(
+        transcript, "session.jsonl", None, [], trusted_roots=[source_root],
+    )
+
+    assert [asset.filename for asset in assets] == ["outside-workspace.jpeg"]
+    assert assets[0].source_path == image
+    assert assets[0].source_digest == hashlib.sha256(body).hexdigest()
+    assert any(e.code == "source_digest_mismatch" for e in events)
+
+def test_discovery_accepts_renderer_mismatch_and_rejects_escape(tmp_path):
     image = tmp_path / "image.png"
     image.write_bytes(b"not the digest")
     transcript = tmp_path / "session.jsonl"
     _transcript(transcript, str(tmp_path), "0" * 64, str(image))
     assets, events = discover_external_assets(transcript, "session.jsonl", None, [])
-    assert not assets
-    assert any(e.code == "digest_mismatch" for e in events)
+    assert len(assets) == 1
+    assert assets[0].digest == "0" * 64
+    assert any(e.code == "source_digest_mismatch" for e in events)
 
     outside = tmp_path.parent / "outside.jpeg"
     outside.write_bytes(b"outside")
@@ -183,6 +226,7 @@ def test_snapshot_enforces_asset_size_limit(monkeypatch, tmp_path):
     digest = hashlib.sha256(body).hexdigest()
     asset = ExternalAsset(
         digest,
+        digest,
         image,
         image.name,
         asset_relpath("session.jsonl", digest, image.name),
@@ -223,10 +267,30 @@ def test_discovery_does_not_inherit_explicit_empty_source(tmp_path):
 
 
 
+def test_discovery_rejects_relative_trusted_root(monkeypatch, tmp_path):
+    image_root = tmp_path / "relative-assets"
+    image_root.mkdir()
+    image = image_root / "001_img01.jpeg"
+    body = b"relative root bytes"
+    image.write_bytes(body)
+    digest = hashlib.sha256(body).hexdigest()
+    transcript = tmp_path / "session.jsonl"
+    _transcript(transcript, str(tmp_path / "workspace"), digest, str(image))
+
+    monkeypatch.chdir(tmp_path)
+    assets, events = discover_external_assets(
+        transcript, "session.jsonl", None, ["relative-assets"],
+    )
+
+    assert not assets
+    assert any(event.code == "outside_cwd_or_missing" for event in events)
+
+
 def test_safe_filename_and_windows_path_shape(tmp_path):
     assert safe_asset_filename(r"C:\src\a b?.jpeg") == "a_b_.jpeg"
     assert safe_asset_filename("a" * 130 + ".jpeg") == "a" * 123 + ".jpeg"
-    assert resolve_declared_path(r"C:\src\a.jpeg", r"C:\src") == Path("/mnt/c/src/a.jpeg")
+    expected = Path(r"C:\src\a.jpeg") if os.name == "nt" else Path("/mnt/c/src/a.jpeg")
+    assert resolve_declared_path(r"C:\src\a.jpeg", r"C:\src") == expected
 
 
 def test_discovery_bounds_oversized_jsonl_lines(monkeypatch, tmp_path):
@@ -346,6 +410,33 @@ def test_run_uploads_external_asset_and_is_idempotent(tmp_path, hub):
         assert run_mod._do_run(cfg, st) == 0
     key = ("m1", "omp", f"session.jsonl.assets/{digest}/001_img01.jpeg")
     assert hub.files[key]["body"] == body
+
+@requires_curl
+def test_run_uploads_asset_when_renderer_mime_and_source_differ(tmp_path, hub):
+    root = tmp_path / "omp"
+    source_root = tmp_path / "asset-source"
+    root.mkdir()
+    source_root.mkdir()
+    image = source_root / "top-frame.png"
+    body = b"png bytes"
+    image.write_bytes(body)
+    renderer_digest = "c" * 64
+    transcript = root / "session.jsonl"
+    _transcript(transcript, str(root), renderer_digest, str(image), mime_type="image/webp")
+    cfg = config.Config(
+        machine_id="m1",
+        hub_url=hub.url,
+        auth="dev",
+        stores={"omp": str(root)},
+        external_asset_roots=[str(source_root)],
+    )
+
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_run(cfg, st) == 0
+
+    key = ("m1", "omp", f"session.jsonl.assets/{renderer_digest}/top-frame.png")
+    assert hub.files[key]["body"] == body
+
 
 
 @requires_curl
