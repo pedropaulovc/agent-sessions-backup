@@ -13,6 +13,7 @@ import {
   mergeFacetCounts,
   selectedFacetValues,
   selectedValues,
+  subagentSessionSql,
   sessionDurationSql,
   totalTokensSql,
 } from '../session-filters';
@@ -36,6 +37,7 @@ interface RecentRow {
   cwd: string | null;
   duration_seconds: number | null;
   total_tokens: number;
+  subagent: 'no' | 'yes';
 }
 
 interface RecentResult {
@@ -156,6 +158,7 @@ async function recentSessions(p: URLSearchParams, env: Env): Promise<RecentResul
   const direction = reverse ? 'ASC' : 'DESC';
   const result = await env.DB.prepare(
     `SELECT session_id, harness, machine_id, primary_model,
+            ${subagentSessionSql('sessions')} AS subagent,
             first_interaction_title, title AS stored_title, started_at, cwd,
             ${sessionDurationSql('sessions')} AS duration_seconds, ${totalTokensSql('sessions')} AS total_tokens
      FROM sessions ${where}
@@ -194,6 +197,7 @@ async function sortedRecentSessions(p: URLSearchParams, env: Env): Promise<Recen
   const order = p.get('sort') === 'session_time' ? sessionDurationSql('sessions') : totalTokensSql('sessions');
   const rows = await env.DB.prepare(
     `SELECT session_id, harness, machine_id, primary_model,
+            ${subagentSessionSql('sessions')} AS subagent,
             first_interaction_title, title AS stored_title, started_at, cwd,
             ${sessionDurationSql('sessions')} AS duration_seconds, ${totalTokensSql('sessions')} AS total_tokens
      FROM sessions ${where} ORDER BY ${order} DESC, session_id DESC LIMIT ${limit + 1} OFFSET ${offset}`,
@@ -299,6 +303,7 @@ function renderHit(h: SearchHit): string {
   const title = sessionDisplayTitle(null, s.title, h.session_id);
   const meta = [
     `<span class="badge">${esc(s.harness)}</span>`,
+    s.subagent === 'yes' ? `<span class="badge">Subagent session</span>` : '',
     s.machine_id ? `<span class="chip">${esc(s.machine_id)}</span>` : '',
     s.primary_model ? `<span class="chip">${esc(s.primary_model)}</span>` : '',
     s.started_at ? `<span class="muted small">${esc(s.started_at)}</span>` : '',
@@ -322,6 +327,7 @@ function renderRecent(r: RecentRow): string {
   const title = sessionDisplayTitle(r.first_interaction_title, r.stored_title, r.session_id);
   const meta = [
     `<span class="badge">${esc(r.harness)}</span>`,
+    r.subagent === 'yes' ? `<span class="badge">Subagent session</span>` : '',
     r.machine_id ? `<span class="chip">${esc(r.machine_id)}</span>` : '',
     r.primary_model ? `<span class="chip">${esc(r.primary_model)}</span>` : '',
     r.cwd ? `<span class="muted small">${esc(r.cwd)}</span>` : '',
@@ -366,6 +372,8 @@ function sanitizeSnippet(snip: string): string {
   return esc(snip).replaceAll('&lt;mark&gt;', '<mark>').replaceAll('&lt;/mark&gt;', '</mark>');
 }
 
+const INITIAL_FACET_VALUE_LIMIT = 10;
+
 function renderFacets(
   url: URL,
   facets: Record<string, Record<string, number>> | undefined,
@@ -377,24 +385,39 @@ function renderFacets(
     .map((definition) => {
       const values = facets[definition.key] ?? {};
       const selectedValuesForFacet = selected[definition.key] ?? [];
-      const items = Object.entries(values)
-        .map(([value, n]) => {
-          const isActive = selectedValuesForFacet.includes(value);
-          const target = new URL(url);
-          canonicalizeMultiValueFilters(target.searchParams);
-          target.searchParams.delete(definition.param);
-          const nextValues = isActive
+      const entries = Object.entries(values);
+      // Keep every active value actionable without expanding the disclosure. They displace the
+      // lowest-ranked inactive options when they would otherwise fall beyond the cutoff.
+      const activeEntries = entries.filter(([value]) => selectedValuesForFacet.includes(value));
+      const inactiveEntries = entries.filter(([value]) => !selectedValuesForFacet.includes(value));
+      const initiallyVisible = [
+        ...activeEntries,
+        ...inactiveEntries.slice(0, Math.max(0, INITIAL_FACET_VALUE_LIMIT - activeEntries.length)),
+      ];
+      const initiallyVisibleValues = new Set(initiallyVisible.map(([value]) => value));
+      const renderItem = ([value, n]: [string, number]) => {
+        const isActive = selectedValuesForFacet.includes(value);
+        const target = new URL(url);
+        canonicalizeMultiValueFilters(target.searchParams);
+        target.searchParams.delete(definition.param);
+        const nextValues = definition.param === 'subagent'
+          ? (isActive ? [] : [value])
+          : (isActive
             ? selectedValuesForFacet.filter((selectedValue) => selectedValue !== value)
-            : [...selectedValuesForFacet, value].slice(0, MAX_VALUES_PER_FILTER);
-          for (const nextValue of nextValues) target.searchParams.append(definition.param, nextValue);
-          target.searchParams.delete('cursor');
-          const href = `${target.pathname}${target.search}`;
-          return `<li class="${isActive ? 'active' : ''}">` +
-            `<a href="${esc(href)}">${isActive ? '✓ ' : ''}${esc(facetLabelValue(definition, value))}</a>` +
-            `<span class="n">${n}</span></li>`;
-        })
-        .join('');
-      return `<h3>${esc(definition.label ?? definition.key)}</h3><ul>${items}</ul>`;
+            : [...selectedValuesForFacet, value].slice(0, MAX_VALUES_PER_FILTER));
+        for (const nextValue of nextValues) target.searchParams.append(definition.param, nextValue);
+        target.searchParams.delete('cursor');
+        const href = `${target.pathname}${target.search}`;
+        return `<li class="${isActive ? 'active' : ''}">` +
+          `<a href="${esc(href)}">${isActive ? '✓ ' : ''}${esc(facetLabelValue(definition, value))}</a>` +
+          `<span class="n">${n}</span></li>`;
+      };
+      const remaining = entries.filter(([value]) => !initiallyVisibleValues.has(value));
+      const more = remaining.length
+        ? `<details class="facet-more"><summary>Add more (${remaining.length})</summary><ul>${remaining.map(renderItem).join('')}</ul></details>`
+        : '';
+      return `<h3>${esc(definition.label ?? definition.key)}</h3>` +
+        `<ul>${initiallyVisible.map(renderItem).join('')}</ul>${more}`;
     })
     .join('');
   return groups || '<p class="muted small">No facets.</p>';

@@ -1781,6 +1781,11 @@ describe('viewer result pagination and facet layout', () => {
   const MULTI_HARNESS_B = 'multi-harness-b';
   const MULTI_HARNESS_C = 'multi-harness-c';
   const MULTI_MACHINE_1 = 'multi-machine-1';
+  const SUBAGENT_HARNESS = 'viewer-subagent-test';
+  const SUBAGENT_MARKER = 'viewersubagentsentinel';
+  const SUBAGENT_PRIMARY = 'viewer-subagent-primary';
+  const SUBAGENT_CHILD = 'viewer-subagent-child';
+  const SUBAGENT_REPO = 'https://example.test/viewer-subagent';
   const MULTI_MACHINE_2 = 'multi-machine-2';
   const MULTI_PROJECT_ALPHA = deriveProjectName('/home/pedro/src/multi-project-alpha-wt-feature', null)!;
   const MULTI_PROJECT_BETA = deriveProjectName('C:\\src\\multi-project-beta\\.claude\\worktrees\\fix', null)!;
@@ -1869,6 +1874,23 @@ describe('viewer result pagination and facet layout', () => {
     await testEnv.DB.prepare(
       `INSERT INTO blocks_fts(rowid, text) SELECT id, text FROM blocks WHERE session_id LIKE 'viewer-multi-%'`,
     ).run();
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        `INSERT INTO sessions
+           (session_id, harness, machine_id, os, primary_model, repo_url, title, started_at, parent_session_id, is_sidechain, index_state)
+         VALUES
+           (?1, ?3, 'viewer-subagent-machine', 'linux', 'viewer-subagent-model', ?4, 'Primary subagent filter fixture', '2026-07-27T12:00:00Z', NULL, 0, 'ready'),
+           (?2, ?3, 'viewer-subagent-machine', 'linux', 'viewer-subagent-model', ?4, 'Subagent filter fixture', '2026-07-27T12:01:00Z', ?1, 0, 'ready')`,
+      ).bind(SUBAGENT_PRIMARY, SUBAGENT_CHILD, SUBAGENT_HARNESS, SUBAGENT_REPO),
+      testEnv.DB.prepare(
+        `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text) VALUES
+           (?1, 1, 0, 0, 'user', 'text', ?3),
+           (?2, 1, 0, 0, 'user', 'text', ?3)`,
+      ).bind(SUBAGENT_PRIMARY, SUBAGENT_CHILD, SUBAGENT_MARKER),
+    ]);
+    await testEnv.DB.prepare(
+      `INSERT INTO blocks_fts(rowid, text) SELECT id, text FROM blocks WHERE session_id IN (?1, ?2)`,
+    ).bind(SUBAGENT_PRIMARY, SUBAGENT_CHILD).run();
   });
 
   function pageHref(html: string, rel: 'next' | 'prev'): string {
@@ -1914,6 +1936,44 @@ describe('viewer result pagination and facet layout', () => {
     expect(html).toContain('.facets li .n { flex: 0 0 auto;');
     expect(html).toContain('@media (max-width: 760px)');
     expect(html).toContain('.sidebar { flex-basis: auto; width: 100%; max-width: none; }');
+  });
+
+  it('defaults to primary sessions while exposing selectable subagent results and badges', async () => {
+    const defaultRecent = await (await SELF.fetch(
+      `https://sessions.vza.net/?harness=${SUBAGENT_HARNESS}`,
+    )).text();
+    expect(defaultRecent).toContain(`/s/${SUBAGENT_PRIMARY}`);
+    expect(defaultRecent).not.toContain(`/s/${SUBAGENT_CHILD}`);
+
+    const subagentRecent = await (await SELF.fetch(
+      `https://sessions.vza.net/?harness=${SUBAGENT_HARNESS}&subagent=yes`,
+    )).text();
+    expect(subagentRecent).toContain(`/s/${SUBAGENT_CHILD}`);
+    expect(subagentRecent).not.toContain(`/s/${SUBAGENT_PRIMARY}`);
+    expect(subagentRecent).toContain('<span class="badge">Subagent session</span>');
+
+    const defaultSearch = await (await SELF.fetch(
+      `https://sessions.vza.net/?q=${SUBAGENT_MARKER}&harness=${SUBAGENT_HARNESS}`,
+    )).text();
+    expect(defaultSearch).toContain(`/s/${SUBAGENT_PRIMARY}`);
+    expect(defaultSearch).not.toContain(`/s/${SUBAGENT_CHILD}`);
+    expect(defaultSearch).toContain('>Is subagent session</h3>');
+    expect(defaultSearch).toContain('>✓ No</a>');
+    const yes = new URL(facetHref(defaultSearch, 'Yes'), 'https://sessions.vza.net');
+    expect(yes.searchParams.getAll('subagent')).toEqual(['yes']);
+    expect(yes.searchParams.has('cursor')).toBe(false);
+    const no = new URL(facetHref(defaultSearch, 'No', true), 'https://sessions.vza.net');
+    expect(no.searchParams.has('subagent')).toBe(false);
+
+    const subagentSearch = await (await SELF.fetch(
+      `https://sessions.vza.net/?q=${SUBAGENT_MARKER}&harness=${SUBAGENT_HARNESS}&subagent=yes`,
+    )).text();
+    expect(subagentSearch).toContain(`/s/${SUBAGENT_CHILD}`);
+    expect(subagentSearch).not.toContain(`/s/${SUBAGENT_PRIMARY}`);
+    expect(subagentSearch).toContain('<span class="badge">Subagent session</span>');
+
+    const headings = [...defaultSearch.matchAll(/<h3>([^<]+)<\/h3>/g)].map((match) => match[1]);
+    expect(headings.at(-1)).toBe('Repo');
   });
 
   it('ORs repeated values within a facet and ANDs different facets in recent and FTS results', async () => {
@@ -2173,7 +2233,7 @@ describe('viewer result pagination and facet layout', () => {
     const details = plan.results.map((row) => row.detail).join('\n');
     expect(details).toContain('SEARCH sessions USING INDEX sessions_facets (harness=? AND machine_id=?)');
     expect(details).not.toContain('SCAN sessions');
-    expect(filter.binds).toHaveLength(2);
+    expect(filter.binds).toHaveLength(3);
   });
 
   it('keeps repeated project filters on sessions_project', async () => {
@@ -2187,7 +2247,7 @@ describe('viewer result pagination and facet layout', () => {
     const details = plan.results.map((row) => row.detail).join('\n');
     expect(details).toContain('SEARCH sessions USING INDEX sessions_project (project_name=?)');
     expect(details).not.toContain('SCAN sessions');
-    expect(filter.binds).toEqual([JSON.stringify([MULTI_PROJECT_ALPHA, MULTI_PROJECT_BETA])]);
+    expect(filter.binds).toEqual([JSON.stringify([MULTI_PROJECT_ALPHA, MULTI_PROJECT_BETA]), '["no"]']);
   });
 
   it('paginates and filters the default recent-session list, including recovery from the last page', async () => {
@@ -2404,10 +2464,42 @@ describe('viewer facet value discovery', () => {
 
     for (const [label, value] of expected) {
       for (const html of [recent, search]) {
-        const items = html.match(new RegExp(`<h3>${label}</h3><ul>([\\s\\S]*?)</ul>`))?.[1] ?? '';
-        expect(items).toContain(value);
-        expect(items.match(/<li/g)).toHaveLength(200);
+        const group = html.match(new RegExp(`<h3>${label}</h3>([\\s\\S]*?)(?=<h3>|</aside>)`))?.[1] ?? '';
+        const initiallyVisible = group.match(/<ul>([\s\S]*?)<\/ul>/)?.[1] ?? '';
+        expect(group).toContain(value);
+        expect(initiallyVisible.match(/<li/g)).toHaveLength(10);
+        expect(group).toContain('<details class="facet-more"><summary>Add more');
+        expect(group.match(/<li/g)).toHaveLength(200);
       }
     }
+  });
+
+  it('keeps a selected value beyond the facet cutoff visible and removable', async () => {
+    const selectedHarness = 'facet-cap-harness-199';
+    const html = await (await SELF.fetch(
+      `https://sessions.vza.net/?repo=${encodeURIComponent(FACET_CAP_REPO)}&harness=${selectedHarness}`,
+    )).text();
+    const group = html.match(/<h3>Harness<\/h3>([\s\S]*?)(?=<h3>|<\/aside>)/)?.[1] ?? '';
+    const initiallyVisible = group.match(/<ul>([\s\S]*?)<\/ul>/)?.[1] ?? '';
+    expect(initiallyVisible.match(/<li/g)).toHaveLength(10);
+    expect(initiallyVisible).toContain(`>✓ ${selectedHarness}</a>`);
+    expect(group).toContain('<details class="facet-more"><summary>Add more');
+    const activeHref = initiallyVisible.match(
+      new RegExp(`<li class="active"><a href="([^"]*)">✓ ${selectedHarness}</a>`),
+    )?.[1]?.replaceAll('&amp;', '&');
+    expect(activeHref).toBeTruthy();
+    expect(new URL(activeHref!, 'https://sessions.vza.net').searchParams.has('harness')).toBe(false);
+  });
+
+  it('keeps every selected facet value removable beyond the normal ten-item cutoff', async () => {
+    const selected = Array.from({ length: 11 }, (_, index) => `facet-cap-harness-${String(189 + index).padStart(3, '0')}`);
+    const params = new URLSearchParams({ repo: FACET_CAP_REPO });
+    for (const value of selected) params.append('harness', value);
+    const html = await (await SELF.fetch(`https://sessions.vza.net/?${params}`)).text();
+    const group = html.match(/<h3>Harness<\/h3>([\s\S]*?)(?=<h3>|<\/aside>)/)?.[1] ?? '';
+    const initiallyVisible = group.match(/<ul>([\s\S]*?)<\/ul>/)?.[1] ?? '';
+
+    expect(initiallyVisible.match(/<li/g)).toHaveLength(11);
+    for (const value of selected) expect(initiallyVisible).toContain(`>✓ ${value}</a>`);
   });
 });
