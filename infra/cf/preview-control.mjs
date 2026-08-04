@@ -858,7 +858,9 @@ async function smoke() {
     purpose: 'preview-smoke',
     headers: { accept: 'application/json' },
   });
-  if (!response.ok) fail(`candidate diagnostics smoke failed with ${response.status}`);
+  if (!response.ok) {
+    fail(`candidate diagnostics smoke failed with ${response.status}: ${(await response.text()).slice(0, 500)}`);
+  }
   const diagnostics = await response.json();
   const expectedArtifact = context.candidate.artifactDigest;
   const expectedSchema = context.candidate.schemaDigest;

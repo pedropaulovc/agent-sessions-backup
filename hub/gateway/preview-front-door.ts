@@ -1455,14 +1455,17 @@ function parseJsonSegment<T>(value: string): T | null {
   try { return JSON.parse(new TextDecoder().decode(bytes)) as T; } catch { return null; }
 }
 
-async function verifyRs256Jwt(token: string, keys: JsonWebKeyWithKid[], expected: { issuer: string; audience: string; now?: number }): Promise<Record<string, unknown> | null> {
+async function verifyRs256Signature(
+  token: string,
+  keys: JsonWebKeyWithKid[],
+  now: number,
+): Promise<Record<string, unknown> | null> {
   const parts = token.split('.');
   if (parts.length !== 3) return null;
   const [h, p, s] = parts as [string, string, string];
   const header = parseJsonSegment<{ alg?: string; kid?: string }>(h);
   const claims = parseJsonSegment<Record<string, unknown>>(p);
   if (!header || header.alg !== 'RS256' || !header.kid || !claims) return null;
-  const now = expected.now ?? Math.floor(Date.now() / 1000);
   const key = keys.find((item) => item.kid === header.kid && !item.revoked && (item.notBefore === undefined || now >= item.notBefore) && (item.notAfter === undefined || now < item.notAfter));
   const signature = decodeSegment(s);
   if (!key || !signature) return null;
@@ -1470,6 +1473,13 @@ async function verifyRs256Jwt(token: string, keys: JsonWebKeyWithKid[], expected
     const imported = await crypto.subtle.importKey('jwk', key, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
     if (!await crypto.subtle.verify('RSASSA-PKCS1-v1_5', imported, signature, new TextEncoder().encode(`${h}.${p}`))) return null;
   } catch { return null; }
+  return claims;
+}
+
+async function verifyRs256Jwt(token: string, keys: JsonWebKeyWithKid[], expected: { issuer: string; audience: string; now?: number }): Promise<Record<string, unknown> | null> {
+  const now = expected.now ?? Math.floor(Date.now() / 1000);
+  const claims = await verifyRs256Signature(token, keys, now);
+  if (!claims) return null;
   const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
   if (claims.iss !== expected.issuer || !aud.includes(expected.audience) || typeof claims.exp !== 'number' || now >= claims.exp || typeof claims.iat !== 'number' || claims.iat > now + 30) return null;
   return claims;
@@ -1493,24 +1503,21 @@ async function previewOriginAssertionFailure(
   } catch {
     return 'invalid_jwks';
   }
-  const claims = await verifyRs256Jwt(token, keys, {
-    issuer: `https://${CONTROL_HOST}`,
-    audience: AUDIENCES.origin,
-  });
-  if (!claims) return 'invalid_jwt';
   const now = Math.floor(Date.now() / 1000);
+  const claims = await verifyRs256Signature(token, keys, now);
+  if (!claims) return 'invalid_signature';
+  if (claims.iss !== `https://${CONTROL_HOST}`) return 'issuer_mismatch';
+  const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+  if (!audiences.includes(AUDIENCES.origin)) return 'audience_mismatch';
+  if (typeof claims.exp !== 'number' || now >= claims.exp) return 'expired';
+  if (typeof claims.iat !== 'number' || claims.iat > now + 30) return 'invalid_clock';
   const url = new URL(request.url);
   const target = canonicalTarget(`${url.pathname}${url.search}`);
   if (!target) return 'invalid_target';
   if (claims.method !== request.method) return 'method_mismatch';
   if (claims.target !== target) return 'target_mismatch';
-  if (
-    typeof claims.iat !== 'number'
-    || typeof claims.exp !== 'number'
-    || claims.exp - claims.iat > ASSERTION_TTL_SECONDS
-  ) return 'invalid_ttl';
+  if (claims.exp - claims.iat > ASSERTION_TTL_SECONDS) return 'invalid_ttl';
   if (typeof claims.jti !== 'string' || claims.jti.length < 16) return 'invalid_jti';
-  if (claims.iat > now + 30) return 'invalid_clock';
   const digest = await bodyDigest(request);
   if (MUTATING_METHODS.has(request.method)) {
     return claims.bodyDigest === digest ? null : 'body_digest_mismatch';

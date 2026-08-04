@@ -165,7 +165,7 @@ describe('preview front door configuration', () => {
 });
 
 describe('trusted generation ingress', () => {
-  it('denies missing and wrong origin assertions before dispatching through the app binding', async () => {
+  it('classifies missing, target, and clock assertion denials before app dispatch', async () => {
     const pair = await crypto.subtle.generateKey(
       { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' },
       true,
@@ -178,7 +178,7 @@ describe('trusted generation ingress', () => {
       for (const byte of bytes) binary += String.fromCharCode(byte);
       return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
     };
-    const token = async (target: string) => {
+    const token = async (target: string, overrides: Record<string, unknown> = {}) => {
       const now = Math.floor(Date.now() / 1000);
       const header = encode({ alg: 'RS256', typ: 'JWT', kid: 'origin-test' });
       const claims = encode({
@@ -189,6 +189,7 @@ describe('trusted generation ingress', () => {
         iat: now,
         exp: now + 45,
         jti: 'origin_assertion_test_jti',
+        ...overrides,
       });
       const signature = await crypto.subtle.sign(
         'RSASSA-PKCS1-v1_5',
@@ -221,6 +222,12 @@ describe('trusted generation ingress', () => {
     }), env);
     expect(wrongTarget.status).toBe(403);
     await expect(wrongTarget.json()).resolves.toEqual({ error: 'invalid_origin_assertion', reason: 'target_mismatch' });
+    const future = Math.floor(Date.now() / 1000) + 60;
+    const wrongClock = await trustedPreviewIngress(new Request(request, {
+      headers: { 'x-preview-origin-assertion': await token('/healthz', { iat: future, exp: future + 45 }) },
+    }), env);
+    expect(wrongClock.status).toBe(403);
+    await expect(wrongClock.json()).resolves.toEqual({ error: 'invalid_origin_assertion', reason: 'invalid_clock' });
     expect(app.fetch).not.toHaveBeenCalled();
 
     const accepted = await trustedPreviewIngress(new Request(request, {
