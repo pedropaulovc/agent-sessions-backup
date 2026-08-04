@@ -16,6 +16,7 @@ import {
   inventoryGenerations,
   migrationArtifactSqlNames,
   resolveBundlerInputPath,
+  queueConsumerIdsForWorker,
   previewEdgeSessionCookie,
   requiredCloudflareAccessHeaders,
   resourceNames,
@@ -236,6 +237,25 @@ describe('trusted preview resource ownership', () => {
       'r2',
       'd1',
     ]);
+  });
+
+  it('selects only the exact application Worker Queue consumer', () => {
+    const workerName = resourceNames(42, 123, SHA).app;
+    expect(queueConsumerIdsForWorker([{
+      consumer_id: 'consumer-id',
+      script_name: workerName,
+      type: 'worker',
+    }], workerName)).toEqual(['consumer-id']);
+    expect(queueConsumerIdsForWorker([], workerName)).toEqual([]);
+    expect(() => queueConsumerIdsForWorker([{
+      consumer_id: 'foreign-consumer-id',
+      script_name: 'pr-99-g123-aaaaaaaaaaaa-app',
+      type: 'worker',
+    }], workerName)).toThrow(/foreign queue consumer/);
+    expect(() => queueConsumerIdsForWorker([{
+      consumer_id: 'http-pull-id',
+      type: 'http_pull',
+    }], workerName)).toThrow(/foreign queue consumer/);
   });
 
   it('acknowledges the original trusted identity rather than a resolved discovery ID', () => {

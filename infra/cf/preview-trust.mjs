@@ -487,6 +487,17 @@ export function sortCleanupInventory(inventory) {
   );
 }
 
+export function queueConsumerIdsForWorker(consumers, workerName) {
+  if (!Array.isArray(consumers)) fail('queue consumers must be an array');
+  required(workerName, 'queue consumer Worker name');
+  return consumers.map((consumer) => {
+    if (consumer?.type !== 'worker' || consumer.script_name !== workerName) {
+      fail(`foreign queue consumer rejected for ${workerName}`);
+    }
+    return required(consumer.consumer_id, 'queue consumer id');
+  });
+}
+
 export function inventoryGenerations(inventory) {
   if (!Array.isArray(inventory)) fail('inventory must be an array');
   const generations = new Set();

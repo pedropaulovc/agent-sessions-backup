@@ -24,6 +24,7 @@ import {
   positiveInteger,
   previewEdgeSessionCookie,
   requiredCloudflareAccessHeaders,
+  queueConsumerIdsForWorker,
   repositoryName,
   resourceNames,
   sha256Bytes,
@@ -396,15 +397,17 @@ async function resolvePlannedId(item) {
 }
 
 async function deleteInventory(inventory, ownerPr = pr) {
-  const results = [];
-  const sorted = sortCleanupInventory(inventory);
-  for (const raw of sorted) {
-    const generation = raw.generation;
+  if (!Array.isArray(inventory)) fail('inventory must be an array');
+  const validated = inventory.map((raw) => {
+    const generation = raw?.generation;
     if (!/^g[1-9][0-9]*-[0-9a-f]{12}$/.test(generation ?? '')) {
-      fail(`invalid inventory generation for ${raw.name}`);
+      fail(`invalid inventory generation for ${raw?.name}`);
     }
-    const item = assertInventoryItem(raw, ownerPr, generation, { allowMissingId: true });
-    if (workerScriptCoversVersion(item, inventory)) {
+    return assertInventoryItem(raw, ownerPr, generation, { allowMissingId: true });
+  });
+  const results = [];
+  for (const item of sortCleanupInventory(validated)) {
+    if (workerScriptCoversVersion(item, validated)) {
       results.push({
         kind: item.kind,
         id: item.id,
@@ -414,7 +417,21 @@ async function deleteInventory(inventory, ownerPr = pr) {
       });
       continue;
     }
+
     const resolvedId = await resolvePlannedId(item);
+    if (item.kind === 'queue' && resolvedId != null) {
+      const appWorkers = validated.filter((candidate) =>
+        candidate.kind === 'app-worker' && candidate.generation === item.generation);
+      if (appWorkers.length !== 1) fail(`queue ${item.name} requires exactly one application Worker`);
+      const consumers = await cf(`queues/${encodeURIComponent(resolvedId)}/consumers`, { allowNotFound: true });
+      for (const consumerId of queueConsumerIdsForWorker(consumers ?? [], appWorkers[0].name)) {
+        await cf(
+          `queues/${encodeURIComponent(resolvedId)}/consumers/${encodeURIComponent(consumerId)}`,
+          { method: 'DELETE', allowNotFound: true },
+        );
+      }
+    }
+
     if (resolvedId != null) {
       let endpoint;
       if (item.kind === 'd1') endpoint = `d1/database/${encodeURIComponent(resolvedId)}`;
