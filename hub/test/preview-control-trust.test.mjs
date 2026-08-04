@@ -214,7 +214,7 @@ describe('trusted preview resource ownership', () => {
     expect(workerScriptCoversVersion({ ...appVersion, kind: 'd1' }, inventory)).toBe(false);
   });
 
-  it('deletes Queue consumers before their application Worker', () => {
+  it('deletes Workers before their bound Queues after consumer detachment', () => {
     const kinds = [
       'd1',
       'app-version',
@@ -229,8 +229,8 @@ describe('trusted preview resource ownership', () => {
 
     expect(sortCleanupInventory(inventory).map(({ kind }) => kind)).toEqual([
       'edge-worker',
-      'queue',
       'app-worker',
+      'queue',
       'edge-version',
       'app-version',
       'kv',
