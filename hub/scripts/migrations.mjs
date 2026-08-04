@@ -8,11 +8,13 @@ import {
   canonicalMigrationBytes,
   loadAndValidateManifest,
   sha256,
+  validateHistoricalBaseline,
   validateManifestShape,
 } from './lib/migration-manifest.mjs';
 import { runMigrations } from './lib/migration-runner.mjs';
 
 const hubRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const repositoryRoot = path.resolve(hubRoot, '..');
 
 function parseArguments(argv) {
   const [command, ...rest] = argv;
@@ -34,7 +36,7 @@ function resolveOption(value) {
 
 function git(args) {
   const result = spawnSync('git', args, {
-    cwd: hubRoot,
+    cwd: repositoryRoot,
     encoding: null,
     windowsHide: true,
   });
@@ -58,7 +60,7 @@ function jsonAtRef(ref, repositoryPath) {
   }
 }
 
-function baseManifestAtRef(ref) {
+function baseManifestAtRef(ref, fallbackPolicy, fallbackHistory) {
   let manifest = jsonAtRef(ref, 'hub/migrations/manifest.json');
   if (manifest) return validateManifestShape(manifest);
   let tree = git(['ls-tree', '-r', '--name-only', ref, '--', 'hub/migrations']);
@@ -70,11 +72,8 @@ function baseManifestAtRef(ref) {
     tree = git(['ls-tree', '-r', '--name-only', ref, '--', 'hub/migrations']);
   }
   if (tree.status !== 0) throw new Error(`cannot read migration base ${ref}: ${tree.stderr.toString('utf8')}`);
-  const policyEvidence = jsonAtRef(ref, 'hub/migrations/source-baseline.json');
-  if (!policyEvidence) {
-    throw new Error(`migration base ${ref} has no manifest or independent migration policy evidence`);
-  }
-  const policy = validateManifestShape(policyEvidence);
+  const refPolicy = jsonAtRef(ref, 'hub/migrations/source-baseline.json');
+  const policy = validateManifestShape(refPolicy ?? fallbackPolicy);
   const filenames = tree.stdout.toString('utf8').split(/\r?\n/)
     .filter((name) => /^hub\/migrations\/\d{4}_[a-z0-9_]+\.sql$/.test(name))
     .sort()
@@ -88,13 +87,15 @@ function baseManifestAtRef(ref) {
       sha256: sha256(canonicalMigrationBytes(blob.stdout)),
     };
   });
-  return validateManifestShape({
+  const base = validateManifestShape({
     formatVersion: policy.formatVersion,
     hashEncoding: policy.hashEncoding,
     reservedSequences: policy.reservedSequences,
     ledgerStartsAt: policy.ledgerStartsAt,
     migrations,
   });
+  if (!refPolicy) validateHistoricalBaseline(fallbackHistory, base);
+  return base;
 }
 
 async function main() {
@@ -104,11 +105,16 @@ async function main() {
   if (command === 'check-base') {
     const suppliedBase = resolveOption(options['base-manifest'] ?? process.env.MIGRATION_BASE_MANIFEST);
     const baseRef = options['base-ref'] ?? process.env.MIGRATION_BASE_REF ?? await githubBaseSha();
+    const fallbackPolicy = JSON.parse(await readFile(path.join(migrationsDir, 'source-baseline.json'), 'utf8'));
     const base = suppliedBase
       ? validateManifestShape(JSON.parse(await readFile(suppliedBase, 'utf8')))
       : baseRef
-        ? baseManifestAtRef(baseRef)
-        : validateManifestShape(JSON.parse(await readFile(path.join(migrationsDir, 'source-baseline.json'), 'utf8')));
+        ? baseManifestAtRef(
+          baseRef,
+          fallbackPolicy,
+          JSON.parse(await readFile(path.join(migrationsDir, 'historical-baseline.json'), 'utf8')),
+        )
+        : validateManifestShape(fallbackPolicy);
     const result = await loadAndValidateManifest({
       migrationsDir,
       manifestPath,
