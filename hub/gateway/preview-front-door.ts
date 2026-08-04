@@ -5,6 +5,7 @@ const CONTROL_HOST = 'preview-control.sessions.vza.net';
 const PREVIEW_VERSION_SUFFIX = '.agent-sessions-nonproduction.workers.dev';
 const COOKIE = '__Host-preview-edge';
 const ASSERTION_TTL_SECONDS = 45;
+const ASSERTION_CLOCK_SKEW_SECONDS = 5;
 const SESSION_TTL_SECONDS = 3600;
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -1455,14 +1456,17 @@ function parseJsonSegment<T>(value: string): T | null {
   try { return JSON.parse(new TextDecoder().decode(bytes)) as T; } catch { return null; }
 }
 
-async function verifyRs256Jwt(token: string, keys: JsonWebKeyWithKid[], expected: { issuer: string; audience: string; now?: number }): Promise<Record<string, unknown> | null> {
+async function verifyRs256Signature(
+  token: string,
+  keys: JsonWebKeyWithKid[],
+  now: number,
+): Promise<Record<string, unknown> | null> {
   const parts = token.split('.');
   if (parts.length !== 3) return null;
   const [h, p, s] = parts as [string, string, string];
   const header = parseJsonSegment<{ alg?: string; kid?: string }>(h);
   const claims = parseJsonSegment<Record<string, unknown>>(p);
   if (!header || header.alg !== 'RS256' || !header.kid || !claims) return null;
-  const now = expected.now ?? Math.floor(Date.now() / 1000);
   const key = keys.find((item) => item.kid === header.kid && !item.revoked && (item.notBefore === undefined || now >= item.notBefore) && (item.notAfter === undefined || now < item.notAfter));
   const signature = decodeSegment(s);
   if (!key || !signature) return null;
@@ -1470,50 +1474,56 @@ async function verifyRs256Jwt(token: string, keys: JsonWebKeyWithKid[], expected
     const imported = await crypto.subtle.importKey('jwk', key, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, ['verify']);
     if (!await crypto.subtle.verify('RSASSA-PKCS1-v1_5', imported, signature, new TextEncoder().encode(`${h}.${p}`))) return null;
   } catch { return null; }
+  return claims;
+}
+
+async function verifyRs256Jwt(token: string, keys: JsonWebKeyWithKid[], expected: { issuer: string; audience: string; now?: number }): Promise<Record<string, unknown> | null> {
+  const now = expected.now ?? Math.floor(Date.now() / 1000);
+  const claims = await verifyRs256Signature(token, keys, now);
+  if (!claims) return null;
   const aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
   if (claims.iss !== expected.issuer || !aud.includes(expected.audience) || typeof claims.exp !== 'number' || now >= claims.exp || typeof claims.iat !== 'number' || claims.iat > now + 30) return null;
   return claims;
 }
 
-async function verifyPreviewOriginAssertion(
+async function previewOriginAssertionFailure(
   token: string,
   request: Request,
   jwksSource: string,
-): Promise<boolean> {
+): Promise<string | null> {
   const parts = token.split('.');
-  if (parts.length !== 3) return false;
+  if (parts.length !== 3) return 'malformed';
   const header = parseJsonSegment<Record<string, unknown>>(parts[0]!);
+  if (header?.alg !== 'RS256' || header.typ !== 'JWT' || typeof header.kid !== 'string') {
+    return 'invalid_header';
+  }
   let keys: JsonWebKeyWithKid[];
   try {
     const parsed = JSON.parse(jwksSource) as { keys?: JsonWebKeyWithKid[] };
     keys = Array.isArray(parsed.keys) ? parsed.keys : [];
   } catch {
-    return false;
+    return 'invalid_jwks';
   }
-  if (header?.alg !== 'RS256' || header.typ !== 'JWT' || typeof header.kid !== 'string') return false;
-  const claims = await verifyRs256Jwt(token, keys, {
-    issuer: `https://${CONTROL_HOST}`,
-    audience: AUDIENCES.origin,
-  });
-  if (!claims) return false;
   const now = Math.floor(Date.now() / 1000);
+  const claims = await verifyRs256Signature(token, keys, now);
+  if (!claims) return 'invalid_signature';
+  if (claims.iss !== `https://${CONTROL_HOST}`) return 'issuer_mismatch';
+  const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+  if (!audiences.includes(AUDIENCES.origin)) return 'audience_mismatch';
+  if (typeof claims.exp !== 'number' || now >= claims.exp) return 'expired';
+  if (typeof claims.iat !== 'number' || claims.iat > now + ASSERTION_CLOCK_SKEW_SECONDS) return 'invalid_clock';
   const url = new URL(request.url);
   const target = canonicalTarget(`${url.pathname}${url.search}`);
-  if (
-    !target
-    || claims.method !== request.method
-    || claims.target !== target
-    || typeof claims.iat !== 'number'
-    || typeof claims.exp !== 'number'
-    || claims.exp - claims.iat > ASSERTION_TTL_SECONDS
-    || typeof claims.jti !== 'string'
-    || claims.jti.length < 16
-    || claims.iat > now + 30
-  ) return false;
+  if (!target) return 'invalid_target';
+  if (claims.method !== request.method) return 'method_mismatch';
+  if (claims.target !== target) return 'target_mismatch';
+  if (claims.exp - claims.iat > ASSERTION_TTL_SECONDS) return 'invalid_ttl';
+  if (typeof claims.jti !== 'string' || claims.jti.length < 16) return 'invalid_jti';
   const digest = await bodyDigest(request);
-  return MUTATING_METHODS.has(request.method)
-    ? claims.bodyDigest === digest
-    : claims.bodyDigest === undefined;
+  if (MUTATING_METHODS.has(request.method)) {
+    return claims.bodyDigest === digest ? null : 'body_digest_mismatch';
+  }
+  return claims.bodyDigest === undefined ? null : 'unexpected_body_digest';
 }
 
 /** Authenticate trusted-front-door traffic before entering the private generation binding. */
@@ -1522,12 +1532,12 @@ export async function trustedPreviewIngress(
   env: TrustedPreviewIngressEnv,
 ): Promise<Response> {
   const assertion = request.headers.get('x-preview-origin-assertion');
-  if (!assertion || !await verifyPreviewOriginAssertion(
-    assertion,
-    request.clone(),
-    env.PREVIEW_ORIGIN_ASSERTION_JWKS,
-  )) {
-    return json({ error: 'invalid_origin_assertion' }, 403);
+  const reason = assertion
+    ? await previewOriginAssertionFailure(assertion, request.clone(), env.PREVIEW_ORIGIN_ASSERTION_JWKS)
+    : 'missing';
+  if (reason) {
+    console.warn(JSON.stringify({ event: 'preview.origin.denied', reason }));
+    return json({ error: 'invalid_origin_assertion', reason }, 403);
   }
   return env.APP.fetch(request);
 }
