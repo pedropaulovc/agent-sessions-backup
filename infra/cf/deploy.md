@@ -1,8 +1,58 @@
-# Deploying the hub (Workers Builds)
+# Deploying the hub and trusted PR previews
 
-The hub deploys from `main` on the `18ef3246…` account. Production, branch previews, and
-their stable front door target separate Workers — production must never be touched by a PR
-preview.
+Production deploys from `main` to account `18ef3246e9f36d1560485ef53889c0ab`.
+Ephemeral PR resources must use a different Cloudflare account containing no production
+resource, credential, data, route, or application secret.
+
+## Trusted per-PR preview controller
+
+The default-branch `Preview Control` workflow is the only PR resource allocator. Its
+unprivileged build job checks out the exact successful CI head, installs dependencies with
+lifecycle scripts disabled, and bundles under a network namespace using the trusted Wrangler
+and generated configuration. Only canonical bundle, migration, content, and provenance
+manifests cross into the `preview-control` environment.
+
+The credentialed job never checks out or executes the PR. It generates every name and binding,
+rejects the production account and known production resource IDs, provisions one
+`pr-<number>-g<source-run-id>-<sha12>-*` resource generation, applies the verified artifact
+migrations, uploads an immutable Worker version, and calls the trusted front door to register,
+smoke, and promote that exact tuple. PR close and scheduled janitor workflows delete only typed
+inventory released by a tombstone or janitor transition.
+
+Configure the protected GitHub `preview-control` environment with:
+
+- secret `CLOUDFLARE_API_TOKEN`;
+- variable `CLOUDFLARE_ACCOUNT_ID=cbb04a26e6fa2d0cdc4eb67c735e5669`.
+
+That account's workers.dev subdomain is `agent-sessions-nonproduction.workers.dev`. The
+account-owned token is restricted to this non-production account, expires after 90 days, and has
+Workers Scripts Write, Workers KV Storage Write, D1 Write, Workers R2 Storage Write, Queues
+Write, Account Settings Read, and Workers Tail Read. Rotate it before expiry. PR-triggered jobs
+receive neither the token nor account administration access.
+
+Configure these non-secret environment variables:
+
+- `PREVIEW_CONTROL_URL`
+- `PREVIEW_CONTROL_DEPLOY_AUD`, `PREVIEW_CONTROL_CLOSE_AUD`, and
+  `PREVIEW_CONTROL_JANITOR_AUD`
+- `PREVIEW_ASSERTION_ISSUER`
+- `PREVIEW_BROWSER_ASSERTION_JWKS`, `PREVIEW_ACTION_ASSERTION_JWKS`, and
+  `PREVIEW_ORIGIN_ASSERTION_JWKS`
+
+Each JWKS contains public keys only. Never put a signing key, Access credential, or production
+authorization in these variables or in a generated PR Worker config.
+
+Account membership is the authorization boundary, not an email string in repository code.
+Operationally, `pedro@vza.net` owns/administers the production account and
+`pedro@vezza.com.br` is the non-production-only identity. Preview administration must verify the
+selected account ID and the identity's complete membership list, and must fail if that list
+contains the production account.
+
+## Legacy pre-cutover reference
+
+The sections below describe the Workers Builds/shared-preview path that remains only until the
+separately approved final cutover. Do not use its account IDs, bindings, or authentication path
+when generating a per-PR environment.
 
 ## Environments
 

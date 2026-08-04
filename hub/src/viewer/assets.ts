@@ -32,8 +32,9 @@ const HMAC_KEY_CACHE = new Map<string, Promise<CryptoKey>>();
 const TEXT_ENCODER = new TextEncoder();
 
 function signingSecret(env: Env): string | undefined {
-  if (env.ENVIRONMENT === 'production') return env.ASSET_SIGNING_SECRET || undefined;
-  if (env.ENVIRONMENT === 'preview') return env.ASSET_SIGNING_SECRET || env.DEV_AUTH || undefined;
+  if (env.ENVIRONMENT === 'production' || env.ENVIRONMENT === 'preview') {
+    return env.ASSET_SIGNING_SECRET || undefined;
+  }
   if (env.ENVIRONMENT === 'development') return env.ASSET_SIGNING_SECRET || DEV_ASSET_SECRET;
   return undefined;
 }

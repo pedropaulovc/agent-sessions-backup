@@ -9,11 +9,38 @@
 
 const COOKIE = '__Host-session';
 const TTL_SECONDS = 30 * 24 * 60 * 60; // 30 days
+const TTL_MILLISECONDS = TTL_SECONDS * 1000;
 const SESSION_USER = 'owner';
+const SESSION_VERSION = 1;
+const SESSION_ISSUER = 'https://sessions.vza.net';
+const SESSION_AUDIENCE = 'sessions.vza.net';
+const SESSION_ENVIRONMENT = 'production';
+const TOKEN_PATTERN = /^[0-9a-f]{64}$/;
+const SIGNATURE_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const ENVELOPE_KEYS = ['claims', 'signature', 'version'];
+const CLAIM_KEYS = ['audience', 'environment', 'expiresAt', 'issuedAt', 'issuer', 'sessionId', 'user'];
+const TEXT_ENCODER = new TextEncoder();
+const SIGNING_KEY_CACHE = new Map<string, Promise<CryptoKey>>();
 
 export interface Session {
   user: string;
   created: number;
+}
+
+interface SessionClaims {
+  issuer: string;
+  audience: string;
+  environment: string;
+  user: string;
+  issuedAt: number;
+  expiresAt: number;
+  sessionId: string;
+}
+
+interface SessionEnvelope {
+  version: typeof SESSION_VERSION;
+  claims: SessionClaims;
+  signature: string;
 }
 
 /** Parse a Cookie header into a name→value map. */
@@ -34,20 +61,65 @@ export function sessionToken(request: Request): string | null {
   return parseCookies(request.headers.get('cookie'))[COOKIE] ?? null;
 }
 
-/** Resolve the current session from the request cookie, or null if absent/expired. */
+/**
+ * Resolve a production viewer session. Preview and development return before
+ * touching KV, so even a mistakenly shared namespace cannot replay a production
+ * cookie outside production.
+ */
 export async function readSession(request: Request, env: Env): Promise<Session | null> {
+  if (env.ENVIRONMENT !== SESSION_ENVIRONMENT) return null;
+  if (new URL(request.url).host !== SESSION_AUDIENCE) return null;
+
   const token = sessionToken(request);
-  if (!token) return null;
+  if (!token || !TOKEN_PATTERN.test(token)) return null;
   const raw = await env.KV.get(`sess:${token}`);
   if (!raw) return null;
-  return JSON.parse(raw) as Session;
+
+  const envelope = parseEnvelope(raw);
+  if (!envelope || envelope.claims.sessionId !== token) return null;
+  if (!(await verifyEnvelope(envelope, env.PRODUCTION_SESSION_SIGNING_KEY))) return null;
+
+  const { claims } = envelope;
+  const now = Date.now();
+  if (
+    claims.issuer !== SESSION_ISSUER ||
+    claims.audience !== SESSION_AUDIENCE ||
+    claims.environment !== SESSION_ENVIRONMENT ||
+    claims.user !== SESSION_USER ||
+    claims.issuedAt < 0 ||
+    claims.issuedAt > now ||
+    claims.expiresAt <= now ||
+    claims.expiresAt <= claims.issuedAt ||
+    claims.expiresAt - claims.issuedAt > TTL_MILLISECONDS
+  ) {
+    return null;
+  }
+  return { user: claims.user, created: claims.issuedAt };
 }
 
-/** Mint a session in KV and return the `Set-Cookie` value that binds it to the browser. */
+/** Mint an authenticated production session and return its browser cookie. */
 export async function createSession(env: Env): Promise<string> {
+  if (env.ENVIRONMENT !== SESSION_ENVIRONMENT) {
+    throw new Error('viewer sessions may only be created in production');
+  }
+  const key = await signingKey(env.PRODUCTION_SESSION_SIGNING_KEY);
+  if (!key) throw new Error('PRODUCTION_SESSION_SIGNING_KEY must be a base64url-encoded 32-byte secret');
+
   const token = randomToken();
-  const session: Session = { user: SESSION_USER, created: Date.now() };
-  await env.KV.put(`sess:${token}`, JSON.stringify(session), { expirationTtl: TTL_SECONDS });
+  const issuedAt = Date.now();
+  const claims: SessionClaims = {
+    issuer: SESSION_ISSUER,
+    audience: SESSION_AUDIENCE,
+    environment: SESSION_ENVIRONMENT,
+    user: SESSION_USER,
+    issuedAt,
+    expiresAt: issuedAt + TTL_MILLISECONDS,
+    sessionId: token,
+  };
+  const authenticated = JSON.stringify({ version: SESSION_VERSION, claims });
+  const signature = encodeBase64Url(await crypto.subtle.sign('HMAC', key, TEXT_ENCODER.encode(authenticated)));
+  const envelope: SessionEnvelope = { version: SESSION_VERSION, claims, signature };
+  await env.KV.put(`sess:${token}`, JSON.stringify(envelope), { expirationTtl: TTL_SECONDS });
   return sessionCookie(token, TTL_SECONDS);
 }
 
@@ -66,7 +138,111 @@ function sessionCookie(token: string, maxAge: number): string {
 
 function randomToken(): string {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
-  return [...bytes].map((b) => b.toString(16).padStart(2, '0')).join('');
+  let token = '';
+  for (const byte of bytes) token += byte.toString(16).padStart(2, '0');
+  return token;
+}
+
+function parseEnvelope(raw: string): SessionEnvelope | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return null;
+  }
+  if (!hasExactKeys(parsed, ENVELOPE_KEYS)) return null;
+  if (parsed.version !== SESSION_VERSION || typeof parsed.signature !== 'string' || !SIGNATURE_PATTERN.test(parsed.signature)) {
+    return null;
+  }
+  const claims = parsed.claims;
+  if (!hasExactKeys(claims, CLAIM_KEYS)) return null;
+  if (
+    typeof claims.issuer !== 'string' ||
+    typeof claims.audience !== 'string' ||
+    typeof claims.environment !== 'string' ||
+    typeof claims.user !== 'string' ||
+    typeof claims.issuedAt !== 'number' ||
+    !Number.isSafeInteger(claims.issuedAt) ||
+    typeof claims.expiresAt !== 'number' ||
+    !Number.isSafeInteger(claims.expiresAt) ||
+    typeof claims.sessionId !== 'string' ||
+    !TOKEN_PATTERN.test(claims.sessionId)
+  ) {
+    return null;
+  }
+  return {
+    version: SESSION_VERSION,
+    claims: {
+      issuer: claims.issuer,
+      audience: claims.audience,
+      environment: claims.environment,
+      user: claims.user,
+      issuedAt: claims.issuedAt,
+      expiresAt: claims.expiresAt,
+      sessionId: claims.sessionId,
+    },
+    signature: parsed.signature,
+  };
+}
+
+function hasExactKeys(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const actual = Object.keys(value).sort();
+  return actual.length === keys.length && actual.every((key, index) => key === keys[index]);
+}
+
+async function verifyEnvelope(envelope: SessionEnvelope, secret: string | undefined): Promise<boolean> {
+  let key: CryptoKey | null;
+  try {
+    key = await signingKey(secret);
+  } catch {
+    return false;
+  }
+  if (!key) return false;
+  let signature: Uint8Array;
+  try {
+    signature = decodeBase64Url(envelope.signature);
+  } catch {
+    return false;
+  }
+  const authenticated = JSON.stringify({ version: envelope.version, claims: envelope.claims });
+  return crypto.subtle.verify('HMAC', key, signature, TEXT_ENCODER.encode(authenticated));
+}
+
+async function signingKey(secret: string | undefined): Promise<CryptoKey | null> {
+  if (!secret || !SIGNATURE_PATTERN.test(secret)) return null;
+  const cached = SIGNING_KEY_CACHE.get(secret);
+  if (cached) return cached;
+
+  let bytes: Uint8Array;
+  try {
+    bytes = decodeBase64Url(secret);
+  } catch {
+    return null;
+  }
+  if (bytes.byteLength !== 32) return null;
+  const pending = crypto.subtle
+    .importKey('raw', bytes, { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify'])
+    .catch((error) => {
+      SIGNING_KEY_CACHE.delete(secret);
+      throw error;
+    });
+  SIGNING_KEY_CACHE.set(secret, pending);
+  return pending;
+}
+
+function encodeBase64Url(value: ArrayBuffer | Uint8Array): string {
+  const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function decodeBase64Url(value: string): Uint8Array {
+  const binary = atob(value.replace(/-/g, '+').replace(/_/g, '/') + '='.repeat((4 - (value.length % 4)) % 4));
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  if (encodeBase64Url(bytes) !== value) throw new Error('non-canonical base64url');
+  return bytes;
 }
 
 /**

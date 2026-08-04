@@ -5,11 +5,9 @@
   "compatibility_date": "2026-07-01",
   "compatibility_flags": ["nodejs_compat"],
   "limits": { "cpu_ms": 300000 },
-  // Keep version preview URLs enabled for both production and named environments.
-  // The preview environment has an explicit Worker name below so Workers Builds does
-  // not upload PR code into this production service (which implements a Durable Object
-  // and therefore cannot receive preview URLs).
-  "preview_urls": true,
+  // Production is never exposed through Cloudflare's generated preview URLs. PR environments are
+  // separately provisioned in the non-production account and routed through the trusted front door.
+  "preview_urls": false,
   // Routes activated in M3. Implemented as Workers Custom Domains (not zone
   // `routes` with `zone_name`) because the deploy credential is an OAuth token
   // without a dns_records scope: custom domains are provisioned through the
@@ -22,10 +20,10 @@
     { "pattern": "sessions.vza.net", "custom_domain": true }
   ],
   "account_id": "18ef3246e9f36d1560485ef53889c0ab",
-  // Fail-closed default: an un-configured `wrangler deploy` (no env override) must NOT
-  // accept the x-dev-machine dev-auth header (see src/auth/identity.ts). Local development
-  // overrides this via `npm run dev` (--var ENVIRONMENT:development); vitest overrides it
-  // via vitest.config.ts's miniflare bindings, independent of this file.
+  // Fail-closed default: an unconfigured `wrangler deploy` (no environment override) must NOT
+  // accept the loopback-only x-dev-machine identity (see src/auth/identity.ts). `npm run dev:up`
+  // migrates first, binds to loopback, and passes ENVIRONMENT:development explicitly; Vitest
+  // supplies its independent Miniflare bindings in vitest.config.ts.
   "vars": {
     "ENVIRONMENT": "production",
     "API_HOST": "api.sessions.vza.net",
@@ -82,76 +80,10 @@
     "logs": { "enabled": true, "destinations": ["agent-backup-azure-logs"], "invocation_logs": true },
     "traces": { "enabled": true, "destinations": ["agent-backup-azure-traces"] }
   },
-  // PR preview isolation. Workers Builds runs non-production branches with
-  // `wrangler versions upload`, which uses the TOP-LEVEL bindings unless an env is
-  // selected — i.e. a preview would run unreviewed PR code against PRODUCTION D1/R2/
-  // KV/queues. Non-production Builds MUST set the deploy command to `--env preview`
-  // (see infra/cf/deploy.md). This block redeclares EVERY binding against the -preview
-  // resource set — wrangler does NOT inherit bindings into named environments, so each
-  // must be restated — and pins ENVIRONMENT='preview', which turns on the DEV_AUTH
-  // bearer gate (src/auth/identity.ts) so the public *.workers.dev preview URL is not
-  // unauthenticated. Automatic Git builds and manual `--env preview` uploads both target
-  // the separate sessions-hub-preview Worker. It has never implemented the production
-  // Durable Object, so Cloudflare can create branch/version URLs for it. No routes/custom
-  // domains: previews serve from workers.dev, where zone mTLS/WAF do not apply.
-  "env": {
-    "preview": {
-      // Workers Builds is connected to sessions-hub and otherwise keeps that service as
-      // the upload target even with `--env preview`. Select the DO-free preview service
-      // explicitly so Cloudflare can generate a preview URL.
-      "name": "sessions-hub-preview",
-      // Automatic PR versions must not export the production Durable Object handler:
-      // Cloudflare suppresses preview URLs for any Worker that implements one.
-      "main": "src/preview.ts",
-      // `exports` inherits from the top-level even though durable_objects.bindings does not.
-      // Override it explicitly or upload metadata still advertises CloudflareOAuthBroker
-      // and Cloudflare sets has_preview=false despite the preview-only module surface.
-      "exports": {},
-      // Empty on purpose: unlike bindings, `routes` IS inherited into named environments,
-      // so without this a preview deploy would REASSIGN the production custom domains
-      // (api./sessions.vza.net) to sessions-hub-preview. Previews serve from workers.dev.
-      "routes": [],
-      "vars": {
-        "ENVIRONMENT": "preview",
-        // Allowlist for /api/v1/admin/migrate's GitHub OIDC caller. Preview ONLY: the production
-        // config must never carry this, so the endpoint cannot exist there even by accident.
-        "MIGRATE_OIDC_REPOSITORY": "pedropaulovc/agent-sessions-backup",
-        "API_HOST": "api.sessions.vza.net",
-        "VIEWER_HOST": "sessions.vza.net",
-        "R2_DASHBOARD_BASE_URL": "https://dash.cloudflare.com/18ef3246e9f36d1560485ef53889c0ab/r2/default/buckets/agent-sessions-raw-preview"
-      },
-      "d1_databases": [
-        {
-          "binding": "DB",
-          "database_name": "sessions-index-preview",
-          "database_id": "8f2cd488-0060-4f32-8025-f5b461c9fe0a",
-          "migrations_dir": "migrations"
-        }
-      ],
-      "r2_buckets": [{ "binding": "RAW", "bucket_name": "agent-sessions-raw-preview" }],
-      "kv_namespaces": [{ "binding": "KV", "id": "eda3b8a8ba1e416fa65e98d0c266a4bb" }],
-      // Intentionally no OAuth broker in preview: unreviewed PR code cannot reach the
-      // production account's managed certificate authority.
-      "durable_objects": { "bindings": [] },
-      "queues": {
-        "producers": [{ "binding": "PARSE_QUEUE", "queue": "parse-preview" }],
-        "consumers": [
-          {
-            "queue": "parse-preview",
-            "max_batch_size": 5,
-            "max_retries": 3,
-            "max_concurrency": 1,
-            "dead_letter_queue": "parse-dlq-preview"
-          }
-        ]
-      },
-      "triggers": { "crons": ["*/15 * * * *", "30 4 * * *"] },
-      "observability": { "enabled": true, "head_sampling_rate": 1 }
-    }
-  }
-  // secrets: SETUP_TOKEN (passkey bootstrap), ASSET_SIGNING_SECRET (independent HMAC
-  // secret for short-lived external-asset viewer links). Cloudflare certificate lifecycle
-  // uses Authorization Code + PKCE; the OAuth grant lives only in CF_OAUTH_BROKER storage.
-  // preview env: DEV_AUTH (bearer gate) via `wrangler secret put DEV_AUTH --env preview`;
-  // optionally set ASSET_SIGNING_SECRET independently for preview asset links.
+  // production secrets: SETUP_TOKEN (passkey bootstrap), ASSET_SIGNING_SECRET
+  // (independent HMAC secret for short-lived external-asset viewer links), and
+  // PRODUCTION_SESSION_SIGNING_KEY (base64url-encoded 32-byte viewer-session HMAC key).
+  // PRODUCTION_SESSION_SIGNING_KEY is deliberately absent from every preview environment.
+  // Cloudflare certificate lifecycle uses Authorization Code + PKCE; the OAuth grant lives
+  // only in CF_OAUTH_BROKER storage.
 }

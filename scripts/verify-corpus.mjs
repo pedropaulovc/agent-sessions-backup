@@ -8,10 +8,10 @@
  *  (c) 5 searches for phrases sampled from real block texts, assert the source session is among hits
  *  (d) prints a JSON summary
  *
- * Usage: node verify-corpus.mjs [--hub http://localhost:8787] [--machine amet-wsl] [--db <path-to-sqlite>]
+ * Usage: node verify-corpus.mjs [--hub http://127.0.0.1:8787] [--machine local-corpus] [--hub-dir ./hub] [--persist-to ./hub/.dev/local/default]
  */
 import { execFileSync } from 'node:child_process';
-import { readdirSync, statSync } from 'node:fs';
+import { readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
@@ -20,35 +20,17 @@ const opt = (name, dflt) => {
   const i = args.indexOf(`--${name}`);
   return i >= 0 ? args[i + 1] : dflt;
 };
-const HUB = opt('hub', 'http://localhost:8787');
-const MACHINE = opt('machine', 'amet-wsl');
+const HUB = opt('hub', 'http://127.0.0.1:8787');
+const MACHINE = opt('machine', 'local-corpus');
 const HUB_DIR = opt('hub-dir', join(process.cwd(), 'hub'));
+const PERSIST_TO = opt('persist-to', join(HUB_DIR, '.dev', 'local', 'default'));
+const WRANGLER = join(HUB_DIR, 'node_modules', 'wrangler', 'bin', 'wrangler.js');
 
-function findSqlite() {
-  const explicit = opt('db', null);
-  if (explicit) return explicit;
-  const base = join(HUB_DIR, '.wrangler', 'state', 'v3', 'd1');
-  const found = [];
-  const walk = (dir) => {
-    for (const e of readdirSync(dir, { withFileTypes: true })) {
-      const p = join(dir, e.name);
-      if (e.isDirectory()) walk(p);
-      else if (e.isFile() && e.name.endsWith('.sqlite')) found.push(p);
-    }
-  };
-  walk(base);
-  if (found.length === 0) throw new Error(`no sqlite db found under ${base}`);
-  // Prefer the largest (miniflare sometimes leaves stale empty ones around).
-  found.sort((a, b) => statSync(b).size - statSync(a).size);
-  return found[0];
-}
-
-const DB_PATH = findSqlite();
 
 function d1(sql) {
   const out = execFileSync(
-    'npx',
-    ['wrangler', 'd1', 'execute', 'sessions-index', '--local', '--json', '--command', sql],
+    process.execPath,
+    [WRANGLER, 'd1', 'execute', 'sessions-index', '--local', '--persist-to', PERSIST_TO, '--json', '--command', sql],
     { cwd: HUB_DIR, maxBuffer: 1024 * 1024 * 256 },
   ).toString();
   const parsed = JSON.parse(out);

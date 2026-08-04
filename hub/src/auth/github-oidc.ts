@@ -1,16 +1,10 @@
 /** Verification of GitHub Actions OIDC tokens.
  *
- * Why this exists: Cloudflare has no workload-identity federation for its own API (an open
- * request — cloudflare/workers-sdk#11434, no official response as of 2026-06), and D1 API-token
- * permissions are ACCOUNT-scoped, with no per-database resource the way R2 has per-bucket ones.
- * So there is no Cloudflare credential that can be handed to CI and be incapable of touching the
- * production database.
- *
- * The isolation primitive D1 does have is the Worker BINDING: "each Worker can only access the
- * bindings explicitly attached to it". The preview Worker's `DB` is `sessions-index-preview` and
- * it has no production binding at all. Authenticating CI to THAT Worker with a short-lived OIDC
- * assertion therefore gives CI a capability that is physically incapable of reaching production —
- * which no API token can offer — and leaves no long-lived secret in CI to leak in the first place.
+ * Cloudflare has no workload-identity federation for its API. The trusted preview control plane
+ * therefore verifies short-lived GitHub Actions assertions before using its own non-production
+ * account credential. It pins repository, workflow/ref, audience, event, and run identity; PR code
+ * receives neither that credential nor a reusable assertion. Production resources live in a
+ * different Cloudflare account and are absent from every preview binding.
  */
 
 const GITHUB_ISSUER = 'https://token.actions.githubusercontent.com';

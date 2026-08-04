@@ -65,7 +65,7 @@ function isTransientD1Error(e: unknown): boolean {
   return TRANSIENT_D1_ERROR_SUBSTRINGS.some((sub) => e.message.includes(sub));
 }
 
-export async function consumeParseBatch(batch: MessageBatch<ParseMessage>, env: Env): Promise<void> {
+export async function consumeParseBatch(batch: Pick<MessageBatch<ParseMessage>, 'messages'>, env: Env): Promise<void> {
   // The ~1000-per-invocation D1 cap is shared across the WHOLE batch (wrangler max_batch_size:5), so we
   // run a single INVOCATION-LEVEL budget across every message — export AND normal transcript — not just a
   // one-export-slice guard: an export slice plus a few chatty normal writes could otherwise still breach

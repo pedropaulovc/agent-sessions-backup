@@ -1,43 +1,35 @@
 import { originOk, readSession } from '../auth/session';
 import { webauthnRoute } from '../auth/webauthn';
+import { previewHumanIdentity } from '../auth/identity';
+import { debugBrowserRoute } from '../api/debug-exchange';
 import { assetEndpoint } from './assets';
 import { blobEndpoint } from './blob';
 import { machinesPage } from './machines';
 import { searchPage } from './search';
 import { statsPage } from './stats';
 import { sessionPage, TURNS_PER_PAGE } from './session';
-import { previewAccess, previewBootstrapRoute, withPreviewCookie } from './preview-auth';
 
 /**
- * Host-routed viewer. The auth surface (/login, /settings, /logout, /webauthn/*) is always
- * reachable so the owner can sign in. Everything else is gated:
+ * Host-routed viewer.
  *
- *   - development: open (never publicly reachable).
- *   - production: a valid passkey session only — fail closed to /login otherwise.
- *   - preview (Workers Builds PR previews, served from *.workers.dev): a valid passkey
- *     session OR the DEV_AUTH bearer/cookie path. Passkey ceremonies are pinned to
- *     VIEWER_HOST (auth/webauthn.ts), and a sessions.vza.net session cookie is never sent
- *     to the *.workers.dev preview host, so a preview reviewer can never obtain a passkey
- *     session there — the DEV_AUTH bearer is their way in. A request that presents the
- *     valid bearer is issued a short-lived HttpOnly cookie (browsers can't attach
- *     Authorization to ordinary navigations or <img>/blob subresource loads, so a
- *     bearer-only gate would 401 every click and lazy image after the first request);
- *     subsequent requests authorize via that cookie OR the bearer.
- *
- * Any non-'development' value that isn't 'preview' (production, an unrecognized value, or a
- * missing binding) is treated as production: passkey session only, DEV_AUTH ignored. The
- * machine API host is routed away before reaching here, so no viewer cookie is ever
- * consulted on the API.
+ * Development is loopback-only and open. Production uses only its passkey session.
+ * Preview authentication terminates at the trusted front door: PR code receives a
+ * short-lived human assertion bound to this exact request, never an Access token,
+ * production session, reusable bearer, or edge cookie.
  */
 export async function viewerRoute(request: Request, url: URL, env: Env): Promise<Response> {
-  const previewBootstrap = await previewBootstrapRoute(request, url, env);
-  if (previewBootstrap) return previewBootstrap;
-
-  const authResp = await webauthnRoute(request, url, env);
-  if (authResp) return authResp;
+  // Preview has no local login or WebAuthn surface. Those routes would create/read a
+  // production viewer session and must never be reachable through PR code.
+  if (env.ENVIRONMENT !== 'preview' && env.ENVIRONMENT !== 'development') {
+    const authResp = await webauthnRoute(request, url, env);
+    if (authResp) return authResp;
+  }
 
   const access = await viewerAccess(request, env);
   if (access === 'deny') return new Response(null, { status: 302, headers: { location: '/login' } });
+
+  const debug = await debugBrowserRoute(request, url, env);
+  if (debug) return debug;
 
   let res: Response;
   if (request.method === 'GET') {
@@ -47,22 +39,19 @@ export async function viewerRoute(request: Request, url: URL, env: Env): Promise
   } else {
     res = new Response('method not allowed', { status: 405 });
   }
-  return access === 'issue-cookie' ? withPreviewCookie(res, env) : res;
+  return res;
 }
 
-type Access = 'pass' | 'issue-cookie' | 'deny';
+type Access = 'pass' | 'deny';
 
-/** Decide viewer access without touching the response: pass, pass-and-set-cookie, or deny. */
 async function viewerAccess(request: Request, env: Env): Promise<Access> {
   if (env.ENVIRONMENT === 'development') return 'pass';
-
-  // A valid passkey session authorizes in every non-dev environment (the production path).
-  if (await readSession(request, env)) return 'pass';
-
-  // Preview-only DEV_AUTH fallback. Production ignores it entirely.
-  if (env.ENVIRONMENT === 'preview') return previewAccess(request, env);
-
-  return 'deny';
+  if (env.ENVIRONMENT === 'preview') {
+    return (await previewHumanIdentity(request, env)).kind === 'human' ? 'pass' : 'deny';
+  }
+  // Unknown or missing environments follow the production fail-closed path. Edge
+  // assertions are deliberately ignored here.
+  return (await readSession(request, env)) ? 'pass' : 'deny';
 }
 
 function handle(url: URL, env: Env): Promise<Response> {

@@ -3,16 +3,20 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev --var ENVIRONMENT:development",
+    "dev:up": "node scripts/environment.mjs local",
+    "dev:reset": "node scripts/environment.mjs reset",
+    "session:seed-corpus": "node ../scripts/seed-local.mjs",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run",
-    "migrate:local": "wrangler d1 migrations apply sessions-index --local",
-    "migrate:remote": "wrangler d1 migrations apply sessions-index --remote"
+    "test": "vitest run && npm run test:migrations",
+    "test:e2e": "playwright test",
+    "test:migrations": "node scripts/migrations.mjs check-base && node --test test/migrations.acceptance.mjs",
+    "migrations": "node scripts/migrations.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.18.5",
     "@cloudflare/workers-types": "^5.20260717.1",
+    "@playwright/test": "1.62.1",
     "typescript": "^5.9.0",
     "vitest": "^4.1.0",
     "wrangler": "^4.111.0"
