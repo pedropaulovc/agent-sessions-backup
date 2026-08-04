@@ -31,8 +31,8 @@ const INVENTORY_KINDS = new Set([
 
 const CLEANUP_KIND_ORDER = new Map([
   ['edge-worker', 0],
-  ['queue', 1],
-  ['app-worker', 2],
+  ['app-worker', 1],
+  ['queue', 2],
   ['edge-version', 3],
   ['app-version', 4],
   ['kv', 5],
