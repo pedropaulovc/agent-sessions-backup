@@ -29,6 +29,17 @@ const INVENTORY_KINDS = new Set([
   'edge-worker',
 ]);
 
+const CLEANUP_KIND_ORDER = new Map([
+  ['edge-worker', 0],
+  ['queue', 1],
+  ['app-worker', 2],
+  ['edge-version', 3],
+  ['app-version', 4],
+  ['kv', 5],
+  ['r2', 6],
+  ['d1', 7],
+]);
+
 const PRODUCTION_IDENTIFIERS = new Set([
   PRODUCTION_ACCOUNT_ID,
   '5ff65cf3-89c8-4fe6-a3c2-a370293ecea6',
@@ -466,6 +477,25 @@ export function workerScriptCoversVersion(item, inventory) {
     candidate?.kind === workerKind
     && candidate.name === item.name
     && candidate.generation === item.generation);
+}
+
+export function sortCleanupInventory(inventory) {
+  if (!Array.isArray(inventory)) fail('inventory must be an array');
+  return [...inventory].sort(
+    (a, b) => (CLEANUP_KIND_ORDER.get(a?.kind) ?? Number.MAX_SAFE_INTEGER)
+      - (CLEANUP_KIND_ORDER.get(b?.kind) ?? Number.MAX_SAFE_INTEGER),
+  );
+}
+
+export function queueConsumerIdsForWorker(consumers, workerName) {
+  if (!Array.isArray(consumers)) fail('queue consumers must be an array');
+  required(workerName, 'queue consumer Worker name');
+  return consumers.map((consumer) => {
+    if (consumer?.type !== 'worker' || consumer.script_name !== workerName) {
+      fail(`foreign queue consumer rejected for ${workerName}`);
+    }
+    return required(consumer.consumer_id, 'queue consumer id');
+  });
 }
 
 export function inventoryGenerations(inventory) {
