@@ -3,6 +3,8 @@ import { generateKeyPairSync } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
+import { SYNTHETIC_EXPECTATIONS } from '../scripts/lib/dev-seed.mjs';
+import { detect } from '../src/ingest/detect';
 import {
   PREVIEW_ACCOUNT_ID,
   acknowledgedResources,
@@ -96,6 +98,32 @@ describe('trusted preview workflow identity', () => {
       repository,
       'attacker/agent-sessions-backup/.github/workflows/preview-control.yml@refs/heads/main',
     )).toThrow(/trusted default-branch preview-control workflow/);
+  });
+});
+
+describe('trusted preview synthetic corpus', () => {
+  it('uses the same indexable Claude paths and identities as local e2e', () => {
+    expect(detect(
+      SYNTHETIC_EXPECTATIONS.store,
+      SYNTHETIC_EXPECTATIONS.primaryRelpath,
+      SYNTHETIC_EXPECTATIONS.machine,
+    )).toMatchObject({
+      kind: 'session',
+      sessionId: SYNTHETIC_EXPECTATIONS.primarySessionId,
+    });
+    expect(detect(
+      SYNTHETIC_EXPECTATIONS.store,
+      SYNTHETIC_EXPECTATIONS.pagerRelpath,
+      SYNTHETIC_EXPECTATIONS.machine,
+    )).toMatchObject({
+      kind: 'session',
+      sessionId: SYNTHETIC_EXPECTATIONS.pagerSessionId,
+    });
+    expect(detect(
+      SYNTHETIC_EXPECTATIONS.store,
+      SYNTHETIC_EXPECTATIONS.externalRelpath,
+      SYNTHETIC_EXPECTATIONS.machine,
+    )).toMatchObject({ kind: 'other' });
   });
 });
 

@@ -36,6 +36,7 @@ import {
   writeCanonicalJson,
   workerScriptCoversVersion,
 } from './preview-trust.mjs';
+import { SYNTHETIC_EXPECTATIONS } from '../../hub/scripts/lib/dev-seed.mjs';
 
 const [command, ...rest] = process.argv.slice(2);
 const allowed = new Set([
@@ -902,17 +903,27 @@ async function seed() {
   const primary = await readFile(new URL('e2e-synthetic-session.jsonl', fixtureRoot));
   const pager = await readFile(new URL('e2e-pager-session.jsonl', fixtureRoot));
   const asset = Buffer.from((await readFile(new URL('fixture-external.png.base64', fixtureRoot), 'utf8')).trim(), 'base64');
-  const externalDigest = '431ced6916a2a21a156e38701afe55bbd7f88969fbbfc56d7fe099d47f265460';
+  const {
+    externalDigest,
+    externalRelpath,
+    machine,
+    pagerRelpath,
+    pagerSearchPhrase,
+    pagerSessionId,
+    primaryRelpath,
+    primarySessionId,
+    searchPhrase,
+    store,
+  } = SYNTHETIC_EXPECTATIONS;
   if (sha256Bytes(asset) !== externalDigest) fail('synthetic external asset digest does not match fixture contract');
-  const primaryPath = '-workspace-e2e-fixtures/e2e-synthetic-session.jsonl';
   const uploads = [
-    [`${primaryPath}.assets/${externalDigest}/fixture-external.png`, asset],
-    [primaryPath, primary],
-    ['-workspace-e2e-fixtures/e2e-pager-session.jsonl', pager],
+    [externalRelpath, asset],
+    [primaryRelpath, primary],
+    [pagerRelpath, pager],
   ];
   for (const [relative, bytes] of uploads) {
     const encoded = relative.split('/').map(encodeURIComponent).join('/');
-    const target = `/api/v1/files/e2e-machine/claude-projects/${encoded}`;
+    const target = `/api/v1/files/${encodeURIComponent(machine)}/${encodeURIComponent(store)}/${encoded}`;
     const response = await candidateAction({
       accessHeaders,
       ...context,
@@ -932,15 +943,15 @@ async function seed() {
     }
   }
   const expected = [
-    ['e2e-synthetic-session', 'saffron telescope'],
-    ['e2e-pager-session', 'machine filtered pagination'],
+    [primarySessionId, searchPhrase],
+    [pagerSessionId, pagerSearchPhrase],
   ];
   for (const [sessionId, marker] of expected) {
     const deadline = Date.now() + 60_000;
     let last = '';
     let indexed = false;
     while (Date.now() < deadline) {
-      const query = new URLSearchParams({ q: marker, machine: 'e2e-machine', limit: '20' });
+      const query = new URLSearchParams({ q: marker, machine, limit: '20' });
       const response = await candidateAction({
         accessHeaders,
         ...context,
@@ -959,9 +970,19 @@ async function seed() {
       }
       await new Promise((resolve) => setTimeout(resolve, 500));
     }
-    if (!indexed) fail(`synthetic session ${sessionId} was not indexed: ${last.slice(0, 500)}`);
+    if (!indexed) {
+      const status = await candidateAction({
+        accessHeaders,
+        ...context,
+        method: 'GET',
+        target: '/api/v1/status',
+        purpose: 'preview-synthetic-seed-status',
+        headers: { accept: 'application/json' },
+      });
+      fail(`synthetic session ${sessionId} was not indexed: search=${last.slice(0, 500)}; status=${status.status}:${(await status.text()).slice(0, 1000)}`);
+    }
   }
-  process.stdout.write(`${stableJson({ generation: context.generation, seeded: ['e2e-synthetic-session', 'e2e-pager-session'] })}\n`);
+  process.stdout.write(`${stableJson({ generation: context.generation, seeded: [primarySessionId, pagerSessionId] })}\n`);
 }
 
 async function browserGrant() {

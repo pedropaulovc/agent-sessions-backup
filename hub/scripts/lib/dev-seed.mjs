@@ -22,10 +22,14 @@ export const SYNTHETIC_EXPECTATIONS = Object.freeze({
   primarySessionId: PRIMARY_SESSION_ID,
   primaryTitle: 'Find the deterministic saffron telescope browser fixture.',
   pagerSessionId: PAGER_SESSION_ID,
+  primaryRelpath: PRIMARY_RELPATH,
   pagerTitle: 'This second deterministic session verifies machine-filtered pagination.',
+  pagerRelpath: PAGER_RELPATH,
+  pagerSearchPhrase: 'machine filtered pagination',
   searchPhrase: 'saffron telescope',
   externalDigest: EXTERNAL_DIGEST,
   externalFileName: 'fixture-external.png',
+  externalRelpath: EXTERNAL_RELPATH,
 });
 
 export async function syntheticSeedManifest() {
