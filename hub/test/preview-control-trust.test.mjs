@@ -246,6 +246,10 @@ describe('trusted preview resource ownership', () => {
       script_name: workerName,
       type: 'worker',
     }], workerName)).toEqual(['consumer-id']);
+    expect(queueConsumerIdsForWorker([{
+      consumer_id: 'consumer-with-optional-type',
+      script_name: workerName,
+    }], workerName)).toEqual(['consumer-with-optional-type']);
     expect(queueConsumerIdsForWorker([], workerName)).toEqual([]);
     expect(() => queueConsumerIdsForWorker([{
       consumer_id: 'foreign-consumer-id',

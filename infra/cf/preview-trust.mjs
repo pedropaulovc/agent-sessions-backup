@@ -491,7 +491,8 @@ export function queueConsumerIdsForWorker(consumers, workerName) {
   if (!Array.isArray(consumers)) fail('queue consumers must be an array');
   required(workerName, 'queue consumer Worker name');
   return consumers.map((consumer) => {
-    if (consumer?.type !== 'worker' || consumer.script_name !== workerName) {
+    if (consumer?.script_name !== workerName
+      || consumer.type != null && consumer.type !== 'worker') {
       fail(`foreign queue consumer rejected for ${workerName}`);
     }
     return required(consumer.consumer_id, 'queue consumer id');
