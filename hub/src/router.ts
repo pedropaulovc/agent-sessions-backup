@@ -59,9 +59,10 @@ export async function route(request: Request, env: Env, _ctx: ExecutionContext):
     return completeCloudflareOAuth(url, env);
   }
 
-  const localDevelopmentViewer = env.ENVIRONMENT === 'development'
-    && (url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]');
-  if (url.pathname.startsWith('/api/') || (!localDevelopmentViewer && url.hostname === env.API_HOST)) {
+  const apiOAuthCallback = url.hostname === env.API_HOST && url.pathname === '/oauth/cloudflare/callback';
+  if (url.pathname.startsWith('/api/')
+      || apiOAuthCallback
+      || (env.ENVIRONMENT !== 'development' && url.hostname === env.API_HOST)) {
     return apiRoute(request, url, env);
   }
   return viewerRoute(request, url, env);
