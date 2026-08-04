@@ -183,6 +183,9 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         // thread in session_id. Keep the filename UUID as this session's identity so the
         // child transcript remains addressable, but link it to the root for the viewer's
         // existing subagent filtering and parent banner.
+        // `forked_from_id` also appears on ordinary interactive `codex fork` rollouts. Only
+        // Codex's explicit subagent provenance makes the relationship a sidechain.
+        if (str(payload.thread_source) !== 'subagent') break;
         const parentSessionId =
           codexSessionId(payload.forked_from_id) ??
           codexSessionId(payload.parent_thread_id) ??
