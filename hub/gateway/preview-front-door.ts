@@ -383,6 +383,11 @@ export function closePreview(current: PreviewState | undefined, input: CloseInpu
       inventory: [],
     };
   }
+  if (current.lifecycle === 'closed') {
+    if (current.epoch !== input.epoch) return { ok: false, status: 409, reason: 'stale_epoch' };
+    if (current.expectedHead !== input.head) return { ok: false, status: 409, reason: 'stale_head' };
+    return { ok: true, state: current, inventory: cleanupResources(current.deletionInventory) };
+  }
   const guard = openCas(current, input.epoch, input.head);
   if (guard) return guard;
   const inventory = [current.live, current.rollback, ...Object.values(current.candidates)].filter((tuple): tuple is RouteTuple => !!tuple);

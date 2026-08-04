@@ -400,6 +400,15 @@ describe('preview routing CAS', () => {
     expect(closed.state).toMatchObject({ lifecycle: 'closed', epoch: 2, live: null, rollback: null, candidates: {} });
     expect([...new Set(closed.inventory?.map((resource) => resource.generation))].sort())
       .toEqual(['g1-aaaaaaaaaaaa', 'g2-bbbbbbbbbbbb']);
+    const replay = closePreview(closed.state, { pr: 42, epoch: 2, head: HEAD_A }, 200);
+    expect(replay).toMatchObject({
+      ok: true,
+      state: { lifecycle: 'closed', epoch: 2, closedAt: 100 },
+    });
+    if (!replay.ok) throw new Error(replay.reason);
+    expect(replay.inventory).toEqual(closed.inventory);
+    expect(closePreview(closed.state, { pr: 42, epoch: 1, head: HEAD_A }, 200))
+      .toMatchObject({ ok: false, status: 409, reason: 'stale_epoch' });
     expect(promoteCandidate(closed.state, { pr: 42, epoch: 1, head: HEAD_A, generation: 'g2-bbbbbbbbbbbb', priorLiveGeneration: 'g1-aaaaaaaaaaaa' })).toMatchObject({ ok: false, status: 410, reason: 'closed' });
   });
 
