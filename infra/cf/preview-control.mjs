@@ -656,7 +656,7 @@ async function provision() {
       });
       if (id) edgeWorker = await recordWorker('edge-worker', id, names.edge);
     }
-    if (edgeWorker && !edgeVersion) {
+    if (edgeWorker && !edgeVersion && wrapperUrl) {
       const id = await resolvePlannedId({
         kind: 'edge-version', id: null, name: names.edge, generation: names.generation,
       });
