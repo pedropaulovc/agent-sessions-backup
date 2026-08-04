@@ -15,6 +15,7 @@ import {
   assertPreviewAccount,
   assertTrustedWorkflowRef,
   fail,
+  emptyR2Bucket,
   fileRecord,
   generatedPrivateAppConfig,
   generatedTrustedWrapperConfig,
@@ -207,21 +208,22 @@ async function frontDoor(method, pathname, audience, body, { allowMissing = fals
 
 async function cf(pathname, init = {}) {
   requireControlEnvironment({ cloudflare: true });
+  const { allowNotFound = false, returnEnvelope = false, ...fetchInit } = init;
   const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${previewAccountId}/${pathname}`, {
-    ...init,
+    ...fetchInit,
     redirect: 'error',
     headers: {
       authorization: `Bearer ${previewToken}`,
       accept: 'application/json',
-      ...(init.body ? { 'content-type': 'application/json' } : {}),
-      ...init.headers,
+      ...(fetchInit.body ? { 'content-type': 'application/json' } : {}),
+      ...fetchInit.headers,
     },
   });
-  if (init.allowNotFound && response.status === 404) return null;
+  if (allowNotFound && response.status === 404) return null;
   const text = await response.text();
   let parsed;
   try { parsed = text ? JSON.parse(text) : {}; } catch { fail(`Cloudflare returned non-JSON HTTP ${response.status}`); }
-  const notFoundEnvelope = init.allowNotFound
+  const notFoundEnvelope = allowNotFound
     && Array.isArray(parsed.errors)
     && parsed.errors.length > 0
     && parsed.errors.every((error) => /not found|does not exist/i.test(String(error?.message)));
@@ -229,7 +231,7 @@ async function cf(pathname, init = {}) {
   if (!response.ok || parsed.success === false) {
     fail(`Cloudflare ${pathname} failed with ${response.status}: ${stableJson(parsed.errors ?? parsed)}`);
   }
-  return parsed.result ?? parsed;
+  return returnEnvelope ? parsed : parsed.result ?? parsed;
 }
 
 function inventoryItem(kind, id, name, generation) {
@@ -447,8 +449,10 @@ async function deleteInventory(inventory, ownerPr = pr) {
     if (resolvedId != null) {
       let endpoint;
       if (item.kind === 'd1') endpoint = `d1/database/${encodeURIComponent(resolvedId)}`;
-      else if (item.kind === 'r2') endpoint = `r2/buckets/${encodeURIComponent(item.name)}`;
-      else if (item.kind === 'kv') endpoint = `storage/kv/namespaces/${encodeURIComponent(resolvedId)}`;
+      else if (item.kind === 'r2') {
+        await emptyR2Bucket(item.name, cf);
+        endpoint = `r2/buckets/${encodeURIComponent(item.name)}`;
+      } else if (item.kind === 'kv') endpoint = `storage/kv/namespaces/${encodeURIComponent(resolvedId)}`;
       else if (item.kind === 'queue') endpoint = `queues/${encodeURIComponent(resolvedId)}`;
       else if (item.kind.endsWith('-version')) {
         endpoint = `workers/scripts/${encodeURIComponent(item.name)}/versions/${encodeURIComponent(resolvedId)}`;

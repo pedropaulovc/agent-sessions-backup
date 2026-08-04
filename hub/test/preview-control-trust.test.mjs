@@ -12,6 +12,7 @@ import {
   assertPreviewAccount,
   assertTrustedWorkflowRef,
   assertWorkerModulePayload,
+  emptyR2Bucket,
   generatedBuildConfig,
   generatedPrivateAppConfig,
   generatedTrustedWrapperConfig,
@@ -121,6 +122,52 @@ describe('trusted preview browser grant', () => {
       target: '*',
       expiresIn: 3600,
     });
+  });
+});
+
+describe('trusted preview R2 cleanup', () => {
+  it('lists every page and deletes encoded object keys before bucket deletion', async () => {
+    const requests = [];
+    const request = async (pathname, init) => {
+      requests.push([pathname, init]);
+      if (pathname.endsWith('per_page=1000')) {
+        return {
+          result: [{ key: 'raw/space key/first?.jsonl' }],
+          result_info: { is_truncated: true, cursor: 'next/page==' },
+        };
+      }
+      if (pathname.includes('cursor=next%2Fpage%3D%3D')) {
+        return {
+          result: [{ key: 'staging/second#object' }],
+          result_info: { is_truncated: false },
+        };
+      }
+      return {};
+    };
+
+    await expect(emptyR2Bucket('preview-bucket', request)).resolves.toBe(2);
+    expect(requests).toEqual([
+      ['r2/buckets/preview-bucket/objects?per_page=1000', {
+        allowNotFound: true,
+        returnEnvelope: true,
+      }],
+      ['r2/buckets/preview-bucket/objects?per_page=1000&cursor=next%2Fpage%3D%3D', {
+        allowNotFound: true,
+        returnEnvelope: true,
+      }],
+      ['r2/buckets/preview-bucket/objects/raw/space%20key/first%3F.jsonl', {
+        method: 'DELETE',
+        allowNotFound: true,
+      }],
+      ['r2/buckets/preview-bucket/objects/staging/second%23object', {
+        method: 'DELETE',
+        allowNotFound: true,
+      }],
+    ]);
+  });
+
+  it('treats an already deleted bucket as empty', async () => {
+    await expect(emptyR2Bucket('preview-bucket', async () => null)).resolves.toBe(0);
   });
 });
 
