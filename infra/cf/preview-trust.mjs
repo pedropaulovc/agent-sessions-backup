@@ -97,6 +97,16 @@ export function previewEdgeSessionCookie(setCookieHeaders) {
   return null;
 }
 
+export function requiredCloudflareAccessHeaders(environment = process.env) {
+  const clientId = environment.CF_ACCESS_CLIENT_ID?.trim();
+  const clientSecret = environment.CF_ACCESS_CLIENT_SECRET?.trim();
+  if (!clientId || !clientSecret) fail('Cloudflare Access service credentials are required');
+  return {
+    'cf-access-client-id': clientId,
+    'cf-access-client-secret': clientSecret,
+  };
+}
+
 export function assertWorkerModulePayload(prefix) {
   if (!(prefix instanceof Uint8Array) || prefix.byteLength === 0) fail('Worker bundle is empty');
   if (prefix[0] === 0x2d && prefix[1] === 0x2d) {

@@ -21,7 +21,8 @@ inventory released by a tombstone or janitor transition.
 
 Configure the protected GitHub `preview-control` environment with:
 
-- secret `CLOUDFLARE_API_TOKEN`;
+- secrets `CLOUDFLARE_API_TOKEN`, `CF_ACCESS_CLIENT_ID`, and
+  `CF_ACCESS_CLIENT_SECRET`;
 - variable `CLOUDFLARE_ACCOUNT_ID=cbb04a26e6fa2d0cdc4eb67c735e5669`.
 
 That account's workers.dev subdomain is `agent-sessions-nonproduction.workers.dev`. The
@@ -29,6 +30,14 @@ account-owned token is restricted to this non-production account, expires after 
 Workers Scripts Write, Workers KV Storage Write, D1 Write, Workers R2 Storage Write, Queues
 Write, Account Settings Read, and Workers Tail Read. Rotate it before expiry. PR-triggered jobs
 receive neither the token nor account administration access.
+
+The Access credentials belong to a dedicated service token accepted only by a `Service Auth`
+policy on the `*-preview.sessions.vza.net` Access application. Do not attach that policy to the
+production viewer or another hostname. The trusted smoke job sends the credentials only to the
+exact PR hostname; the front door strips them before proxying to candidate code. Access admission
+still grants no route by itself: machine requests also require a short-lived, one-use front-door
+grant bound to the PR, head, generation, method, target, body digest, and non-admin identity.
+Rotate the service token before expiry and replace both protected environment secrets together.
 
 Configure these non-secret environment variables:
 

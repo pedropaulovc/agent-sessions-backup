@@ -1,7 +1,7 @@
 import { chromium, type FullConfig } from '@playwright/test';
 import { readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
-import { createPreviewStorageState } from './storage-state';
+import { createPreviewStorageState, requiredCloudflareAccessHeaders } from './storage-state';
 
 interface BootstrapEnvelope {
   bootstrapUrl?: unknown;
@@ -46,6 +46,10 @@ export default async function globalSetup(config: FullConfig): Promise<(() => Pr
   const browser = await chromium.launch();
   try {
     const context = await browser.newContext();
+    const accessHeaders = requiredCloudflareAccessHeaders(process.env);
+    await context.route(`${baseURL.origin}/**`, async (route) => {
+      await route.continue({ headers: { ...route.request().headers(), ...accessHeaders } });
+    });
     const page = await context.newPage();
     let response;
     try {

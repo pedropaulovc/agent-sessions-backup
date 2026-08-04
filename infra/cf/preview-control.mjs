@@ -23,6 +23,7 @@ import {
   parseArgs,
   positiveInteger,
   previewEdgeSessionCookie,
+  requiredCloudflareAccessHeaders,
   repositoryName,
   resourceNames,
   sha256Bytes,
@@ -761,7 +762,7 @@ function candidateOf(stateRecord, generation) {
     ?? (stateRecord.candidate?.generation === generation ? stateRecord.candidate : null);
 }
 
-async function candidateAction({ deployAudience, stateRecord, sha, sourceRunId, generation, method, target, body, headers = {}, purpose }) {
+async function candidateAction({ accessHeaders, deployAudience, stateRecord, sha, sourceRunId, generation, method, target, body, headers = {}, purpose }) {
   const digest = body === undefined ? undefined : sha256Bytes(body);
   const grant = await frontDoor('POST', '/_control/smoke-route', deployAudience, {
     pr,
@@ -781,7 +782,10 @@ async function candidateAction({ deployAudience, stateRecord, sha, sourceRunId, 
   const bootstrap = new URL(grant.bootstrapUrl);
   const origin = new URL(`https://pr-${pr}-preview.sessions.vza.net`);
   if (bootstrap.protocol !== 'https:' || bootstrap.origin !== origin.origin) fail('front door returned a foreign action bootstrap');
-  const first = await fetch(bootstrap, { redirect: 'manual', headers: { 'cache-control': 'no-store' } });
+  const first = await fetch(bootstrap, {
+    redirect: 'manual',
+    headers: { ...accessHeaders, 'cache-control': 'no-store' },
+  });
   const location = first.headers.get('location');
   const cookie = previewEdgeSessionCookie([
     ...(first.headers.getSetCookie?.() ?? []),
@@ -794,7 +798,7 @@ async function candidateAction({ deployAudience, stateRecord, sha, sourceRunId, 
   return fetch(new URL(target, origin), {
     method,
     redirect: 'error',
-    headers: { ...headers, cookie, 'cache-control': 'no-store' },
+    headers: { ...headers, ...accessHeaders, cookie, 'cache-control': 'no-store' },
     body,
   });
 }
@@ -818,8 +822,10 @@ async function candidateContext() {
 }
 
 async function smoke() {
+  const accessHeaders = requiredCloudflareAccessHeaders();
   const context = await candidateContext();
   const response = await candidateAction({
+    accessHeaders,
     ...context,
     method: 'GET',
     target: '/api/v1/preview/diagnostics',
@@ -862,6 +868,7 @@ async function smoke() {
 }
 
 async function seed() {
+  const accessHeaders = requiredCloudflareAccessHeaders();
   const context = await candidateContext();
   const fixtureRoot = new URL('../../hub/test/fixtures/local/', import.meta.url);
   const primary = await readFile(new URL('e2e-synthetic-session.jsonl', fixtureRoot));
@@ -879,6 +886,7 @@ async function seed() {
     const encoded = relative.split('/').map(encodeURIComponent).join('/');
     const target = `/api/v1/files/e2e-machine/claude-projects/${encoded}`;
     const response = await candidateAction({
+      accessHeaders,
       ...context,
       method: 'PUT',
       target,
@@ -906,6 +914,7 @@ async function seed() {
     while (Date.now() < deadline) {
       const query = new URLSearchParams({ q: marker, machine: 'e2e-machine', limit: '20' });
       const response = await candidateAction({
+        accessHeaders,
         ...context,
         method: 'GET',
         target: `/api/v1/search?${query}`,

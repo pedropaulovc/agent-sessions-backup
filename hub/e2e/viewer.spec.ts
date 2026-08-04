@@ -3,9 +3,9 @@ import { SYNTHETIC_FIXTURE as fixture } from './fixtures/synthetic';
 
 test.describe('synthetic sessions viewer', () => {
   test('reports health and renders the first page', async ({ page, appURL }) => {
-    const health = await page.request.get(appURL('/healthz'));
-    expect(health.ok()).toBeTruthy();
-    expect(await health.json()).toMatchObject({ ok: true });
+    const health = await page.goto(appURL('/healthz'));
+    expect(health?.ok()).toBeTruthy();
+    expect(await health?.json()).toMatchObject({ ok: true });
 
     const response = await page.goto(appURL('/'));
     expect(response?.ok()).toBeTruthy();
@@ -114,10 +114,17 @@ test.describe('synthetic sessions viewer', () => {
       expect(source).toBeTruthy();
       const resourceURL = new URL(source!, page.url());
       expect(resourceURL.origin).toBe(new URL(page.url()).origin);
-      const response = await page.request.get(resourceURL.toString());
-      expect(response.ok()).toBeTruthy();
-      expect(response.headers()['content-type']).toMatch(/^image\//);
-      expect((await response.body()).byteLength).toBeGreaterThan(0);
+      const response = await page.evaluate(async (url) => {
+        const result = await fetch(url);
+        return {
+          ok: result.ok,
+          contentType: result.headers.get('content-type'),
+          byteLength: (await result.arrayBuffer()).byteLength,
+        };
+      }, resourceURL.toString());
+      expect(response.ok).toBeTruthy();
+      expect(response.contentType).toMatch(/^image\//);
+      expect(response.byteLength).toBeGreaterThan(0);
     }
   });
 });
