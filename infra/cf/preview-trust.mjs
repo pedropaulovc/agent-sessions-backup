@@ -122,6 +122,47 @@ export function previewBrowserGrantRequest({ pr, epoch, head, sourceRunId, gener
   };
 }
 
+export async function emptyR2Bucket(bucketName, request) {
+  required(bucketName, 'R2 bucket name');
+  if (typeof request !== 'function') fail('R2 request function is required');
+  const bucketPath = `r2/buckets/${encodeURIComponent(bucketName)}/objects`;
+  const keys = [];
+  const seenCursors = new Set();
+  let cursor;
+
+  for (;;) {
+    const query = new URLSearchParams({ per_page: '1000' });
+    if (cursor) query.set('cursor', cursor);
+    const page = await request(`${bucketPath}?${query}`, {
+      allowNotFound: true,
+      returnEnvelope: true,
+    });
+    if (page === null) return 0;
+    if (!Array.isArray(page?.result)) fail(`R2 object listing for ${bucketName} is malformed`);
+    for (const object of page.result) {
+      if (typeof object?.key !== 'string' || object.key.length === 0) {
+        fail(`R2 object listing for ${bucketName} contains an invalid key`);
+      }
+      keys.push(object.key);
+    }
+    if (page.result_info?.is_truncated !== true) break;
+    const next = page.result_info?.cursor;
+    if (typeof next !== 'string' || next.length === 0 || seenCursors.has(next)) {
+      fail(`R2 object listing for ${bucketName} returned an invalid cursor`);
+    }
+    seenCursors.add(next);
+    cursor = next;
+  }
+
+  for (let offset = 0; offset < keys.length; offset += 32) {
+    await Promise.all(keys.slice(offset, offset + 32).map((key) => {
+      const encodedKey = key.split('/').map(encodeURIComponent).join('/');
+      return request(`${bucketPath}/${encodedKey}`, { method: 'DELETE', allowNotFound: true });
+    }));
+  }
+  return keys.length;
+}
+
 export function requiredCloudflareAccessHeaders(environment = process.env) {
   const clientId = environment.CF_ACCESS_CLIENT_ID?.trim();
   const clientSecret = environment.CF_ACCESS_CLIENT_SECRET?.trim();
