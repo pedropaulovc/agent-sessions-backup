@@ -22,6 +22,7 @@ import {
   headSha,
   parseArgs,
   positiveInteger,
+  previewEdgeSessionCookie,
   repositoryName,
   resourceNames,
   sha256Bytes,
@@ -782,9 +783,12 @@ async function candidateAction({ deployAudience, stateRecord, sha, sourceRunId, 
   if (bootstrap.protocol !== 'https:' || bootstrap.origin !== origin.origin) fail('front door returned a foreign action bootstrap');
   const first = await fetch(bootstrap, { redirect: 'manual', headers: { 'cache-control': 'no-store' } });
   const location = first.headers.get('location');
-  const cookie = first.headers.get('set-cookie')?.split(';', 1)[0];
-  if (first.status < 300 || first.status >= 400 || !location || !cookie?.startsWith('__Host-preview-edge=')) {
-    fail(`action bootstrap failed with ${first.status}`);
+  const cookie = previewEdgeSessionCookie([
+    ...(first.headers.getSetCookie?.() ?? []),
+    first.headers.get('set-cookie'),
+  ]);
+  if (first.status < 300 || first.status >= 400 || !location || !cookie) {
+    fail(`action bootstrap failed: status=${first.status}, location=${location ? 'present' : 'missing'}, sessionCookie=${cookie ? 'present' : 'missing'}`);
   }
   if (new URL(location, bootstrap).origin !== origin.origin) fail('action bootstrap redirected away from the preview host');
   return fetch(new URL(target, origin), {

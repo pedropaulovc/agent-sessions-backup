@@ -88,6 +88,15 @@ export function trustedWranglerEnvironment(source, apiToken, accountId) {
   return environment;
 }
 
+export function previewEdgeSessionCookie(setCookieHeaders) {
+  for (const header of setCookieHeaders) {
+    if (typeof header !== 'string') continue;
+    const match = /(?:^|,\s*)(__Host-preview-edge=[^;,\s]+)/.exec(header);
+    if (match) return match[1];
+  }
+  return null;
+}
+
 export function assertWorkerModulePayload(prefix) {
   if (!(prefix instanceof Uint8Array) || prefix.byteLength === 0) fail('Worker bundle is empty');
   if (prefix[0] === 0x2d && prefix[1] === 0x2d) {
