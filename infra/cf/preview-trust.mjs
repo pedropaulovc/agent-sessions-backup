@@ -493,10 +493,12 @@ export function queueConsumerIdsForWorker(consumers, workerName, queueNames) {
   required(workerName, 'queue consumer Worker name');
   const ownedQueues = new Set(queueNames.map((name) => required(name, 'queue name')));
   return consumers.map((consumer) => {
+    const hasWorkerIdentity = typeof consumer?.script_name === 'string';
+    const hasQueueIdentity = typeof consumer?.queue_name === 'string';
     const explicitForeignType = consumer?.type != null && consumer.type !== 'worker';
-    const ownedWorker = consumer?.script_name === workerName;
-    const ownedQueue = ownedQueues.has(consumer?.queue_name);
-    if (explicitForeignType || !ownedWorker && !ownedQueue) {
+    const foreignWorker = hasWorkerIdentity && consumer.script_name !== workerName;
+    const foreignQueue = hasQueueIdentity && !ownedQueues.has(consumer.queue_name);
+    if (explicitForeignType || !hasWorkerIdentity && !hasQueueIdentity || foreignWorker || foreignQueue) {
       const identity = stableJson({
         queueName: consumer?.queue_name ?? null,
         scriptName: consumer?.script_name ?? null,

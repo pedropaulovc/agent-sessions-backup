@@ -258,6 +258,18 @@ describe('trusted preview resource ownership', () => {
       type: 'worker',
     }], names.app, [names.queue, names.dlq])).toThrow(/foreign queue consumer/);
     expect(() => queueConsumerIdsForWorker([{
+      consumer_id: 'foreign-worker-on-owned-queue',
+      queue_name: names.queue,
+      script_name: 'pr-99-g123-aaaaaaaaaaaa-app',
+      type: 'worker',
+    }], names.app, [names.queue, names.dlq])).toThrow(/foreign queue consumer/);
+    expect(() => queueConsumerIdsForWorker([{
+      consumer_id: 'owned-worker-on-foreign-queue',
+      queue_name: 'pr-99-g123-aaaaaaaaaaaa-parse',
+      script_name: names.app,
+      type: 'worker',
+    }], names.app, [names.queue, names.dlq])).toThrow(/foreign queue consumer/);
+    expect(() => queueConsumerIdsForWorker([{
       consumer_id: 'http-pull-id',
       queue_name: names.queue,
       type: 'http_pull',
