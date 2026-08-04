@@ -26,6 +26,7 @@ import {
   resourceNames,
   sha256Bytes,
   stableJson,
+  trustedWranglerEnvironment,
   walkRegularFiles,
   writeCanonicalJson,
 } from './preview-trust.mjs';
@@ -270,15 +271,7 @@ async function createResources(names, journalPath, journal, control) {
 }
 
 function trustedChildEnvironment() {
-  const environment = {};
-  for (const key of ['PATH', 'Path', 'HOME', 'USERPROFILE', 'SYSTEMROOT', 'TEMP', 'TMP', 'CI']) {
-    if (process.env[key]) environment[key] = process.env[key];
-  }
-  environment.CLOUDFLARE_API_TOKEN = previewToken;
-  environment.CLOUDFLARE_ACCOUNT_ID = previewAccountId;
-  environment.WRANGLER_LOG = 'error';
-  environment.NO_COLOR = '1';
-  return environment;
+  return trustedWranglerEnvironment(process.env, previewToken, previewAccountId);
 }
 
 function runJson(commandPath, commandArgs, cwd) {
