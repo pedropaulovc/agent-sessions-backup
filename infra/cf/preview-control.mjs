@@ -408,7 +408,9 @@ async function deleteInventory(inventory, ownerPr = pr) {
   // Detach every consumer before deleting either the primary Queue or its dead-letter Queue.
   // Cloudflare refuses to delete a DLQ while any consumer still references it.
   const resolvedQueueIds = new Map();
-  for (const queue of validated.filter((item) => item.kind === 'queue')) {
+  const queues = validated.filter((item) => item.kind === 'queue');
+  const queueNames = queues.map((item) => item.name);
+  for (const queue of queues) {
     const resolvedId = await resolvePlannedId(queue);
     resolvedQueueIds.set(queue, resolvedId);
     if (resolvedId == null) continue;
@@ -416,7 +418,7 @@ async function deleteInventory(inventory, ownerPr = pr) {
       candidate.kind === 'app-worker' && candidate.generation === queue.generation);
     if (appWorkers.length !== 1) fail(`queue ${queue.name} requires exactly one application Worker`);
     const consumers = await cf(`queues/${encodeURIComponent(resolvedId)}/consumers`, { allowNotFound: true });
-    for (const consumerId of queueConsumerIdsForWorker(consumers ?? [], appWorkers[0].name)) {
+    for (const consumerId of queueConsumerIdsForWorker(consumers ?? [], appWorkers[0].name, queueNames)) {
       await cf(
         `queues/${encodeURIComponent(resolvedId)}/consumers/${encodeURIComponent(consumerId)}`,
         { method: 'DELETE', allowNotFound: true },

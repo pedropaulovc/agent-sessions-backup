@@ -239,27 +239,41 @@ describe('trusted preview resource ownership', () => {
     ]);
   });
 
-  it('selects only the exact application Worker Queue consumer', () => {
-    const workerName = resourceNames(42, 123, SHA).app;
+  it('selects only generation-owned Worker Queue consumers', () => {
+    const names = resourceNames(42, 123, SHA);
     expect(queueConsumerIdsForWorker([{
       consumer_id: 'consumer-id',
-      script_name: workerName,
+      script_name: names.app,
       type: 'worker',
-    }], workerName)).toEqual(['consumer-id']);
+    }], names.app, [names.queue, names.dlq])).toEqual(['consumer-id']);
     expect(queueConsumerIdsForWorker([{
-      consumer_id: 'consumer-with-optional-type',
-      script_name: workerName,
-    }], workerName)).toEqual(['consumer-with-optional-type']);
-    expect(queueConsumerIdsForWorker([], workerName)).toEqual([]);
+      consumer_id: 'consumer-with-queue-identity',
+      queue_name: names.queue,
+    }], names.app, [names.queue, names.dlq])).toEqual(['consumer-with-queue-identity']);
+    expect(queueConsumerIdsForWorker([], names.app, [names.queue, names.dlq])).toEqual([]);
     expect(() => queueConsumerIdsForWorker([{
       consumer_id: 'foreign-consumer-id',
+      queue_name: 'pr-99-g123-aaaaaaaaaaaa-parse',
       script_name: 'pr-99-g123-aaaaaaaaaaaa-app',
       type: 'worker',
-    }], workerName)).toThrow(/foreign queue consumer/);
+    }], names.app, [names.queue, names.dlq])).toThrow(/foreign queue consumer/);
+    expect(() => queueConsumerIdsForWorker([{
+      consumer_id: 'foreign-worker-on-owned-queue',
+      queue_name: names.queue,
+      script_name: 'pr-99-g123-aaaaaaaaaaaa-app',
+      type: 'worker',
+    }], names.app, [names.queue, names.dlq])).toThrow(/foreign queue consumer/);
+    expect(() => queueConsumerIdsForWorker([{
+      consumer_id: 'owned-worker-on-foreign-queue',
+      queue_name: 'pr-99-g123-aaaaaaaaaaaa-parse',
+      script_name: names.app,
+      type: 'worker',
+    }], names.app, [names.queue, names.dlq])).toThrow(/foreign queue consumer/);
     expect(() => queueConsumerIdsForWorker([{
       consumer_id: 'http-pull-id',
+      queue_name: names.queue,
       type: 'http_pull',
-    }], workerName)).toThrow(/foreign queue consumer/);
+    }], names.app, [names.queue, names.dlq])).toThrow(/foreign queue consumer/);
   });
 
   it('acknowledges the original trusted identity rather than a resolved discovery ID', () => {
