@@ -114,8 +114,9 @@ jobs:
   # races us. Applying migrations before the hub deploy guarantees new code never runs against the
   # old schema — the failure mode that fired the agent-backup-parse-errors alert on 2026-07-22 (PR
   # #51's migration 0013 shipped but was never applied, so every ingest threw `D1_ERROR: no such
-  # column`). Gated on the hub tests (which apply every migration via applyD1Migrations) so a broken
-  # migration never reaches prod.
+  # column`). Gated on the hub tests, which apply every migration, so a broken migration never
+  # reaches prod. A shared concurrency group plus a current-main check prevents an older run
+  # approved later from overwriting either Worker with stale code.
   # Requires production-environment secrets PRODUCTION_SCHEMA_BASELINE_ENVELOPE and
   # PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY, created by scripts/approve-production-baseline.mjs
   # through the independent human approval process.
@@ -127,6 +128,9 @@ jobs:
     needs: hub
     runs-on: ubuntu-latest
     environment: production
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
     defaults:
       run:
         working-directory: hub
@@ -138,6 +142,16 @@ jobs:
           cache: npm
           cache-dependency-path: hub/package-lock.json
       - run: npm ci
+      - name: Reject a stale main deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          if [[ "$current_head" != "$GITHUB_SHA" ]]; then
+            echo "Refusing stale deployment: run=$GITHUB_SHA current=$current_head" >&2
+            exit 1
+          fi
       - name: Materialize independent signed production schema baseline
         env:
           PRODUCTION_SCHEMA_BASELINE_ENVELOPE: ${{ secrets.PRODUCTION_SCHEMA_BASELINE_ENVELOPE }}
