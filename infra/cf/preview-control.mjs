@@ -405,6 +405,24 @@ async function deleteInventory(inventory, ownerPr = pr) {
     }
     return assertInventoryItem(raw, ownerPr, generation, { allowMissingId: true });
   });
+  // Detach every consumer before deleting either the primary Queue or its dead-letter Queue.
+  // Cloudflare refuses to delete a DLQ while any consumer still references it.
+  const resolvedQueueIds = new Map();
+  for (const queue of validated.filter((item) => item.kind === 'queue')) {
+    const resolvedId = await resolvePlannedId(queue);
+    resolvedQueueIds.set(queue, resolvedId);
+    if (resolvedId == null) continue;
+    const appWorkers = validated.filter((candidate) =>
+      candidate.kind === 'app-worker' && candidate.generation === queue.generation);
+    if (appWorkers.length !== 1) fail(`queue ${queue.name} requires exactly one application Worker`);
+    const consumers = await cf(`queues/${encodeURIComponent(resolvedId)}/consumers`, { allowNotFound: true });
+    for (const consumerId of queueConsumerIdsForWorker(consumers ?? [], appWorkers[0].name)) {
+      await cf(
+        `queues/${encodeURIComponent(resolvedId)}/consumers/${encodeURIComponent(consumerId)}`,
+        { method: 'DELETE', allowNotFound: true },
+      );
+    }
+  }
   const results = [];
   for (const item of sortCleanupInventory(validated)) {
     if (workerScriptCoversVersion(item, validated)) {
@@ -418,19 +436,9 @@ async function deleteInventory(inventory, ownerPr = pr) {
       continue;
     }
 
-    const resolvedId = await resolvePlannedId(item);
-    if (item.kind === 'queue' && resolvedId != null) {
-      const appWorkers = validated.filter((candidate) =>
-        candidate.kind === 'app-worker' && candidate.generation === item.generation);
-      if (appWorkers.length !== 1) fail(`queue ${item.name} requires exactly one application Worker`);
-      const consumers = await cf(`queues/${encodeURIComponent(resolvedId)}/consumers`, { allowNotFound: true });
-      for (const consumerId of queueConsumerIdsForWorker(consumers ?? [], appWorkers[0].name)) {
-        await cf(
-          `queues/${encodeURIComponent(resolvedId)}/consumers/${encodeURIComponent(consumerId)}`,
-          { method: 'DELETE', allowNotFound: true },
-        );
-      }
-    }
+    const resolvedId = resolvedQueueIds.has(item)
+      ? resolvedQueueIds.get(item)
+      : await resolvePlannedId(item);
 
     if (resolvedId != null) {
       let endpoint;
