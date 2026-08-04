@@ -733,9 +733,18 @@ describe('request boundary', () => {
       accept: 'text/html', authorization: 'Bearer secret', cookie: 'secret=1',
       'cf-access-jwt-assertion': 'access', 'x-forwarded-for': '127.0.0.1', 'x-unknown': 'drop',
       'content-type': 'application/json', origin: 'https://evil.example',
+      'x-content-hash': `sha256:${DIGEST}`, 'x-file-mtime': '2026-07-01T00:00:00.000Z',
+      'x-file-size': '42', 'x-part-is-last': '1', 'x-part-size': '5242880',
     }), 'https://g1.preview.workers.dev', true);
     expect(Object.fromEntries(request)).toEqual({
-      accept: 'text/html', 'content-type': 'application/json', origin: 'https://g1.preview.workers.dev',
+      accept: 'text/html',
+      'content-type': 'application/json',
+      origin: 'https://g1.preview.workers.dev',
+      'x-content-hash': `sha256:${DIGEST}`,
+      'x-file-mtime': '2026-07-01T00:00:00.000Z',
+      'x-file-size': '42',
+      'x-part-is-last': '1',
+      'x-part-size': '5242880',
     });
 
     const response = safeResponseHeaders(

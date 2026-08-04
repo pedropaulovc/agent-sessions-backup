@@ -2209,7 +2209,23 @@ async function destinationRoute(
   return json({ error: 'not_found' }, 404);
 }
 
-const REQUEST_HEADERS = new Set(['accept', 'accept-encoding', 'accept-language', 'content-type', 'content-length', 'range', 'if-match', 'if-none-match', 'if-modified-since', 'if-unmodified-since']);
+const REQUEST_HEADERS = new Set([
+  'accept',
+  'accept-encoding',
+  'accept-language',
+  'content-type',
+  'content-length',
+  'range',
+  'if-match',
+  'if-none-match',
+  'if-modified-since',
+  'if-unmodified-since',
+  'x-content-hash',
+  'x-file-mtime',
+  'x-file-size',
+  'x-part-is-last',
+  'x-part-size',
+]);
 const RESPONSE_HEADERS = new Set(['content-type', 'content-length', 'content-encoding', 'content-language', 'cache-control', 'etag', 'last-modified', 'accept-ranges', 'content-range', 'vary', 'location', 'content-disposition']);
 
 export function safeRequestHeaders(input: Headers, publicOrigin: string, mutating: boolean): Headers {
