@@ -8,6 +8,8 @@ import {
   type Role,
 } from '../normalize';
 
+const CODEX_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * Codex rollout JSONL parser.
  *
@@ -177,8 +179,21 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         const git = isObj(payload.git) ? payload.git : undefined;
         session.repoUrl ??= str(git?.repository_url);
         session.gitBranch ??= str(git?.branch);
+        // Codex stores a forked rollout in its own file/UUID while retaining the root
+        // thread in session_id. Keep the filename UUID as this session's identity so the
+        // child transcript remains addressable, but link it to the root for the viewer's
+        // existing subagent filtering and parent banner.
+        const parentSessionId =
+          codexSessionId(payload.forked_from_id) ??
+          codexSessionId(payload.parent_thread_id) ??
+          codexSessionId(payload.session_id);
+        if (parentSessionId && parentSessionId !== session.id) {
+          session.parentSessionId = parentSessionId;
+          session.isSidechain = true;
+        }
         break;
       }
+
       case 'turn_context': {
         const model = str(payload.model);
         if (model) {
@@ -364,6 +379,10 @@ function isObj(v: unknown): v is Record<string, unknown> {
 }
 function str(v: unknown): string | undefined {
   return typeof v === 'string' && v.length > 0 ? v : undefined;
+}
+function codexSessionId(v: unknown): string | undefined {
+  const id = str(v);
+  return id && CODEX_SESSION_ID_RE.test(id) ? id.toLowerCase() : undefined;
 }
 function num(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined;
