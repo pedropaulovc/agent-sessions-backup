@@ -1,5 +1,5 @@
 import { createHash, createPublicKey } from 'node:crypto';
-import { lstat, readFile, realpath, readdir, writeFile } from 'node:fs/promises';
+import { lstat, open, readFile, realpath, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 export const PRODUCTION_ACCOUNT_ID = '18ef3246e9f36d1560485ef53889c0ab';
@@ -94,6 +94,29 @@ export function assertWorkerModulePayload(prefix) {
     fail('Wrangler emitted a multipart upload envelope instead of a Worker module');
   }
   return prefix;
+}
+
+export async function wranglerWorkerBundle(outputDirectory) {
+  const workerOutputs = (await readdir(outputDirectory, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.js'))
+    .map((entry) => entry.name);
+  if (workerOutputs.length !== 1) {
+    fail(`Wrangler emitted ${workerOutputs.length} top-level JavaScript bundles instead of one`);
+  }
+  const bundle = await assertContainedRegularFile(
+    outputDirectory,
+    path.join(outputDirectory, workerOutputs[0]),
+    'Wrangler worker bundle',
+  );
+  const handle = await open(bundle, 'r');
+  try {
+    const prefix = new Uint8Array(2);
+    const { bytesRead } = await handle.read(prefix, 0, prefix.length, 0);
+    assertWorkerModulePayload(prefix.subarray(0, bytesRead));
+  } finally {
+    await handle.close();
+  }
+  return bundle;
 }
 
 export function positiveInteger(value, name) {

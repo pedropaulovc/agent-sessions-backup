@@ -1,4 +1,6 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { generateKeyPairSync } from 'node:crypto';
+import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
@@ -15,6 +17,7 @@ import {
   migrationArtifactSqlNames,
   resolveBundlerInputPath,
   resourceNames,
+  wranglerWorkerBundle,
   trustedWranglerEnvironment,
 } from '../../infra/cf/preview-trust.mjs';
 
@@ -342,6 +345,19 @@ describe('Worker bundle payload', () => {
   it('accepts JavaScript module output', () => {
     const module = new TextEncoder().encode('export default { fetch() {} };');
     expect(assertWorkerModulePayload(module)).toBe(module);
+  });
+
+  it('selects one executable module from a Wrangler output directory', async () => {
+    const output = await mkdtemp(path.join(os.tmpdir(), 'wrangler-worker-output-'));
+    try {
+      await writeFile(path.join(output, 'README.md'), 'generated');
+      await writeFile(path.join(output, 'preview.js.map'), '{}');
+      const worker = path.join(output, 'preview.js');
+      await writeFile(worker, 'export default { fetch() {} };');
+      expect(await wranglerWorkerBundle(output)).toBe(worker);
+    } finally {
+      await rm(output, { recursive: true, force: true });
+    }
   });
 });
 
