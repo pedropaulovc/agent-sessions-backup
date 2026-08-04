@@ -27,6 +27,7 @@ import {
   sha256Bytes,
   stableJson,
   trustedWranglerEnvironment,
+  wranglerWorkerBundle,
   walkRegularFiles,
   writeCanonicalJson,
 } from './preview-trust.mjs';
@@ -672,7 +673,7 @@ async function provision() {
         'export default { fetch: trustedPreviewIngress };',
         '',
       ].join('\n'), { encoding: 'utf8', flag: 'wx' });
-      const wrapperBundle = path.join(temporary, 'trusted-wrapper.mjs');
+      const wrapperOutput = path.join(temporary, 'wrangler-edge-output');
       const wrapperBuildConfigPath = path.join(temporary, 'wrangler.edge-build.generated.json');
       await writeCanonicalJson(wrapperBuildConfigPath, generatedTrustedWrapperConfig({
         accountId: previewAccountId,
@@ -681,8 +682,9 @@ async function provision() {
         originJwks: assertions.originJwks,
       }));
       runWrangler(wrangler, [
-        'deploy', '--dry-run', '--config', wrapperBuildConfigPath, '--outfile', wrapperBundle,
+        'deploy', '--dry-run', '--config', wrapperBuildConfigPath, '--outdir', wrapperOutput,
       ], trustedRoot, 'trusted wrapper build');
+      const wrapperBundle = await wranglerWorkerBundle(wrapperOutput);
       const wrapperUploadConfigPath = path.join(temporary, 'wrangler.edge-upload.generated.json');
       await writeCanonicalJson(wrapperUploadConfigPath, generatedTrustedWrapperConfig({
         accountId: previewAccountId,
