@@ -326,7 +326,14 @@ export function generatedPrivateAppConfig({
 }) {
   assertPreviewAccount(accountId);
   const issuer = new URL(required(assertions?.issuer, 'preview assertion issuer'));
-  if (issuer.protocol !== 'https:') fail('preview assertion issuer must use HTTPS');
+  if (
+    issuer.protocol !== 'https:'
+    || issuer.username
+    || issuer.password
+    || issuer.pathname !== '/'
+    || issuer.search
+    || issuer.hash
+  ) fail('preview assertion issuer must be an HTTPS origin');
   const browserJwks = publicJwks(assertions?.browserJwks, 'preview browser assertion JWKS');
   const actionJwks = publicJwks(assertions?.actionJwks, 'preview action assertion JWKS');
   if (!/^[A-Za-z0-9_-]{16,128}$/.test(resources.environmentNonce ?? '')) {
@@ -368,7 +375,7 @@ export function generatedPrivateAppConfig({
       VIEWER_HOST: names.host,
       R2_DASHBOARD_BASE_URL: `https://dash.cloudflare.com/${accountId}/r2/default/buckets/${names.r2}`,
       ENVIRONMENT_NONCE: resources.environmentNonce,
-      PREVIEW_ASSERTION_ISSUER: issuer.href,
+      PREVIEW_ASSERTION_ISSUER: issuer.origin,
       PREVIEW_PR_NUMBER: String(resources.pr),
       PREVIEW_HEAD_SHA: resources.headSha,
       PREVIEW_GENERATION: names.generation,

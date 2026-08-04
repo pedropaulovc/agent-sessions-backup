@@ -76,7 +76,7 @@ function privateAppConfig(application = {
     assertions: {
       actionJwks: ASSERTION_JWKS,
       browserJwks: ASSERTION_JWKS,
-      issuer: 'https://preview-control.example.test/',
+      issuer: 'https://preview-control.example.test',
       originJwks: ASSERTION_JWKS,
     },
     application,
@@ -290,6 +290,7 @@ describe('private preview application key bindings', () => {
   it('binds an isolated asset secret and only public debug verification keys to the private app config', () => {
     const config = privateAppConfig();
     expect(config.vars.ASSET_SIGNING_SECRET).toBe(ASSET_SECRET);
+    expect(config.vars.PREVIEW_ASSERTION_ISSUER).toBe('https://preview-control.example.test');
     expect(JSON.parse(config.vars.DEBUG_IMPORT_ASSERTION_PUBLIC_JWK)).toEqual(DEBUG_IMPORT_JWK);
     expect(JSON.parse(config.vars.DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK)).toEqual(DEBUG_MANIFEST_JWK);
     expect(JSON.stringify(config.vars)).not.toContain('"d"');
