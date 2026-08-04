@@ -19,6 +19,7 @@ import {
   migrationArtifactSqlNames,
   resolveBundlerInputPath,
   queueConsumerIdsForWorker,
+  previewBrowserGrantRequest,
   previewEdgeSessionCookie,
   requiredCloudflareAccessHeaders,
   resourceNames,
@@ -98,6 +99,28 @@ describe('trusted preview workflow identity', () => {
       repository,
       'attacker/agent-sessions-backup/.github/workflows/preview-control.yml@refs/heads/main',
     )).toThrow(/trusted default-branch preview-control workflow/);
+  });
+});
+
+describe('trusted preview browser grant', () => {
+  it('authorizes navigation and subresources for the full browser session lifetime', () => {
+    expect(previewBrowserGrantRequest({
+      pr: 42,
+      epoch: 7,
+      head: SHA,
+      sourceRunId: 123,
+      generation: GENERATION,
+    })).toEqual({
+      pr: 42,
+      epoch: 7,
+      head: SHA,
+      sourceRunId: 123,
+      generation: GENERATION,
+      audience: 'preview-browser',
+      method: '*',
+      target: '*',
+      expiresIn: 3600,
+    });
   });
 });
 

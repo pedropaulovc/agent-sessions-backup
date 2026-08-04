@@ -108,6 +108,20 @@ export function previewEdgeSessionCookie(setCookieHeaders) {
   return null;
 }
 
+export function previewBrowserGrantRequest({ pr, epoch, head, sourceRunId, generation }) {
+  return {
+    pr,
+    epoch,
+    head,
+    sourceRunId,
+    generation,
+    audience: 'preview-browser',
+    method: '*',
+    target: '*',
+    expiresIn: 3600,
+  };
+}
+
 export function requiredCloudflareAccessHeaders(environment = process.env) {
   const clientId = environment.CF_ACCESS_CLIENT_ID?.trim();
   const clientSecret = environment.CF_ACCESS_CLIENT_SECRET?.trim();
