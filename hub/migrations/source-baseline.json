@@ -1,0 +1,27 @@
+{
+  "formatVersion": 1,
+  "hashEncoding": "sha256-canonical-lf",
+  "reservedSequences": [4],
+  "ledgerStartsAt": 21,
+  "migrations": [
+    { "sequence": 1, "filename": "0001_init.sql", "sha256": "6cc2bcbfcf1c933d4ec3d54e9ce6e477a890b6d137b07e81b316bd51ca8adac7" },
+    { "sequence": 2, "filename": "0002_blocks_on_main_path.sql", "sha256": "9af15d09172c267cc3d1c03aebbe3513fc930b17fccb5e1e6e14f473009d28cd" },
+    { "sequence": 3, "filename": "0003_webauthn_challenges.sql", "sha256": "d296f2e6c8cce60809eb3b750096fada7417439b2b29aabfa440d8caa7a60fa1" },
+    { "sequence": 5, "filename": "0005_cert_rotation.sql", "sha256": "17a9f825c365b3349ca12ec27f279fdaedc1f5817cec14f635215af0059f644e" },
+    { "sequence": 6, "filename": "0006_sessions_canonical_file_index.sql", "sha256": "4de1a429802583de584a956cc6b621606de116443ce5154e6b53b2ebb9db399b" },
+    { "sequence": 7, "filename": "0007_files_reserved_at.sql", "sha256": "24ea5e0f813212c18b06721c3797711513cc311635afe1c2f4e4dc72c813a2da" },
+    { "sequence": 8, "filename": "0008_files_reserved_reason.sql", "sha256": "555db6c5602d189fa54903394e65300ffb67f5169fcec3e292e6cc98bc1c1f20" },
+    { "sequence": 9, "filename": "0009_retired_certs_reservation_source.sql", "sha256": "8c586158f323f1db67e8904e2c681046207e3b44e377f5fe2579e178c2031dce" },
+    { "sequence": 10, "filename": "0010_files_machine_state.sql", "sha256": "1418393e1e9f85497509c473429238d4caff827b8272e196748a3484f4a5d40b" },
+    { "sequence": 11, "filename": "0011_sessions_project_name.sql", "sha256": "d9c6f56616f70f9463b35df0cd44aaa1de43fd425b3ab59bccebd71baea807d8" },
+    { "sequence": 12, "filename": "0012_sessions_project_name_parity.sql", "sha256": "bb71d34c4b64813e281c4686580a6fc7f0a2f43ffa806050c5a32407326fa7a2" },
+    { "sequence": 13, "filename": "0013_sessions_first_interaction_title.sql", "sha256": "db7a6a4aa2600869e7f170f2c190571bf6e8d9816b17f4097d2c7b98839059e5" },
+    { "sequence": 14, "filename": "0014_blocks_row_hash.sql", "sha256": "c57e91c61512e0408cf5b5fddffec4db76dc72bd1e254c4a75ad02f4fe98a98f" },
+    { "sequence": 15, "filename": "0015_starred_turns.sql", "sha256": "a4da6c19593cc230064d96f52af7cae5793cead7d1d7c577ba3247155ddab2c0" },
+    { "sequence": 16, "filename": "0016_model_prices.sql", "sha256": "da18be67c4a61f796a5a5482e60bcaac1d6f608bf33e2025a785cf260bcad299" },
+    { "sequence": 17, "filename": "0017_model_prices_unknown_accounting.sql", "sha256": "a4838370f3706ceeb7e9cf7a5fc7a2e3f3370d59179a77be981c5c0287a010bf" },
+    { "sequence": 18, "filename": "0018_usage_priced.sql", "sha256": "dd4a76227d2ce7766650f59f52ac7f7fd7166598c34c820c4b2843c9ce98efba" },
+    { "sequence": 19, "filename": "0019_usage_cost_by_class.sql", "sha256": "02e829e28dd82c0a82950795a5ff809be0095863f5d3e3b07ea451c72b88da8e" },
+    { "sequence": 20, "filename": "0020_priced_version_not_null.sql", "sha256": "c4aca0781783a3a52403811d1e0a61f368a5aa28b7c6ff50d96895d9ee708122" }
+  ]
+}
