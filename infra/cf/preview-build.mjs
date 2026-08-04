@@ -15,6 +15,7 @@ import {
   positiveInteger,
   repositoryName,
   resourceNames,
+  resolveBundlerInputPath,
   sha256Bytes,
   stableJson,
   writeCanonicalJson,
@@ -144,7 +145,7 @@ try {
   const buildInputs = [];
   for (const input of Object.keys(metadata.inputs).sort()) {
     if (input.startsWith('<')) continue;
-    const file = path.resolve(sourceHub, input);
+    const file = resolveBundlerInputPath(sourceHub, input);
     await assertContainedRegularFile(sourceHub, file, `bundler input ${input}`);
     buildInputs.push(await fileRecord(file, path.relative(sourceHub, file)));
   }
