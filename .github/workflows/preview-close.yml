@@ -33,6 +33,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
+      pull-requests: read
     steps:
       - name: Check out trusted default-branch cleanup code
         uses: actions/checkout@v4
@@ -42,15 +43,31 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      - name: Validate manual recovery target
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RECOVERY_HEAD_SHA: ${{ inputs.head_sha }}
+          RECOVERY_PR: ${{ inputs.pr }}
+        shell: bash
+        run: |
+          target=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$RECOVERY_PR" --jq '[.state, .head.sha] | @tsv')
+          IFS=$'\t' read -r state actual_head_sha <<< "$target"
+          if [[ "$state" != "closed" || "$actual_head_sha" != "$RECOVERY_HEAD_SHA" ]]; then
+            echo "Recovery target must be a closed PR with the supplied head SHA" >&2
+            exit 1
+          fi
       - name: Tombstone routing and delete recorded typed inventory
         env:
           CLOUDFLARE_PREVIEW_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_PREVIEW_CONTROL_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           PREVIEW_CONTROL_CLOSE_AUD: ${{ vars.PREVIEW_CONTROL_CLOSE_AUD }}
           PREVIEW_CONTROL_URL: ${{ vars.PREVIEW_CONTROL_URL }}
+          PREVIEW_CLOSE_HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
+          PREVIEW_CLOSE_PR: ${{ github.event.pull_request.number || inputs.pr }}
         run: >-
           node infra/cf/preview-control.mjs close
           --repository "$GITHUB_REPOSITORY"
-          --pr "${{ github.event.pull_request.number || inputs.pr }}"
-          --head-sha "${{ github.event.pull_request.head.sha || inputs.head_sha }}"
+          --pr "$PREVIEW_CLOSE_PR"
+          --head-sha "$PREVIEW_CLOSE_HEAD_SHA"
           --account-id "$CLOUDFLARE_PREVIEW_ACCOUNT_ID"
