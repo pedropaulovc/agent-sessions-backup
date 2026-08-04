@@ -3,17 +3,29 @@ name: Preview Close
 on:
   pull_request_target:
     types: [closed]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Closed PR number to recover
+        required: true
+        type: number
+      head_sha:
+        description: Closed PR head SHA
+        required: true
+        type: string
 
 permissions: {}
 
 concurrency:
-  group: preview-pr-${{ github.event.pull_request.number }}
+  group: preview-pr-${{ github.event.pull_request.number || inputs.pr }}
   cancel-in-progress: false
 
 jobs:
-  # pull_request_target is used only as a trusted close signal. This job never checks out, imports,
-  # reads, or executes the PR head. The close CAS first writes a permanent tombstone and clears all
-  # routable tuples; only the typed inventory returned by that transition is eligible for deletion.
+  # pull_request_target is used only as a trusted close signal. workflow_dispatch provides a
+  # protected-environment recovery path for a close run that failed after the PR became immutable.
+  # This job never checks out, imports, reads, or executes the PR head. The close CAS first writes a
+  # permanent tombstone and clears all routable tuples; only the typed inventory returned by that
+  # transition is eligible for deletion.
   tombstone-and-clean:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -39,6 +51,6 @@ jobs:
         run: >-
           node infra/cf/preview-control.mjs close
           --repository "$GITHUB_REPOSITORY"
-          --pr "${{ github.event.pull_request.number }}"
-          --head-sha "${{ github.event.pull_request.head.sha }}"
+          --pr "${{ github.event.pull_request.number || inputs.pr }}"
+          --head-sha "${{ github.event.pull_request.head.sha || inputs.head_sha }}"
           --account-id "$CLOUDFLARE_PREVIEW_ACCOUNT_ID"
