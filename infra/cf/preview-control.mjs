@@ -692,10 +692,15 @@ async function provision() {
         names,
         originJwks: assertions.originJwks,
       }));
+      if (!edgeWorker) {
+        runWrangler(wrangler, [
+          'deploy', '--config', wrapperUploadConfigPath, '--no-bundle', '--strict',
+        ], trustedRoot, 'trusted wrapper initialization');
+        edgeWorker = await recordWorker('edge-worker', names.edge, names.edge);
+      }
       const uploaded = uploadWrapperVersion(wrangler, wrapperUploadConfigPath, trustedRoot);
       wrapperUrl = uploaded.url;
       edgeVersion = await recordWorker('edge-version', uploaded.id, names.edge, { versionUrl: wrapperUrl });
-      edgeWorker = await recordWorker('edge-worker', names.edge, names.edge);
     }
 
     const response = await frontDoor('POST', '/_control/register', deployAudience, {
