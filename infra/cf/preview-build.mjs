@@ -145,7 +145,7 @@ try {
   const buildInputs = [];
   for (const input of Object.keys(metadata.inputs).sort()) {
     if (input.startsWith('<')) continue;
-    const file = resolveBundlerInputPath(sourceHub, input);
+    const file = resolveBundlerInputPath(path.dirname(configPath), input);
     await assertContainedRegularFile(sourceHub, file, `bundler input ${input}`);
     buildInputs.push(await fileRecord(file, path.relative(sourceHub, file)));
   }

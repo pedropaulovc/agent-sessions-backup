@@ -294,24 +294,21 @@ describe('private preview application key bindings', () => {
 });
 
 describe('bundler metafile input paths', () => {
-  const posixRoot = '/home/runner/work/agent-sessions-backup/agent-sessions-backup/source/hub';
+  const posixConfigDirectory = '/tmp/sessions-preview-build-abc';
+  const posixInput = '../../home/runner/work/agent-sessions-backup/agent-sessions-backup/source/hub/node_modules/pkg/index.js';
 
-  it('restores the POSIX root stripped from Wrangler absolute input paths', () => {
-    const input = 'home/runner/work/agent-sessions-backup/agent-sessions-backup/source/hub/node_modules/pkg/index.js';
-    expect(resolveBundlerInputPath(posixRoot, input, path.posix))
-      .toBe(`/${input}`);
+  it('resolves Wrangler inputs from the generated config directory', () => {
+    expect(resolveBundlerInputPath(posixConfigDirectory, posixInput, path.posix))
+      .toBe('/home/runner/work/agent-sessions-backup/agent-sessions-backup/source/hub/node_modules/pkg/index.js');
+    expect(resolveBundlerInputPath(posixConfigDirectory, 'generated/module.js', path.posix))
+      .toBe(`${posixConfigDirectory}/generated/module.js`);
   });
 
-  it('keeps ordinary metafile inputs relative to the source Hub', () => {
-    expect(resolveBundlerInputPath(posixRoot, 'src/preview.ts', path.posix))
-      .toBe(`${posixRoot}/src/preview.ts`);
-  });
-
-  it('normalizes Windows absolute and root-stripped inputs', () => {
-    const windowsRoot = 'C:\\work\\source\\hub';
+  it('normalizes Windows relative and absolute inputs', () => {
+    const windowsConfigDirectory = 'C:\\temp\\sessions-preview-build-abc';
     const expected = 'C:\\work\\source\\hub\\node_modules\\pkg\\index.js';
-    expect(resolveBundlerInputPath(windowsRoot, expected, path.win32)).toBe(expected);
-    expect(resolveBundlerInputPath(windowsRoot, 'work/source/hub/node_modules/pkg/index.js', path.win32))
+    expect(resolveBundlerInputPath(windowsConfigDirectory, expected, path.win32)).toBe(expected);
+    expect(resolveBundlerInputPath(windowsConfigDirectory, '..\\..\\work\\source\\hub\\node_modules\\pkg\\index.js', path.win32))
       .toBe(expected);
   });
 });
