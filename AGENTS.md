@@ -8,7 +8,7 @@
 - Start the isolated loopback hub with `npm --prefix hub run dev:up`. Stop it with Ctrl+C; use `npm --prefix hub run dev:reset` only after it has stopped. Local development requires zero Wrangler scopes and no Cloudflare login.
 - Before review, run `npm --prefix hub test`, `npm --prefix hub run typecheck`, and `npm --prefix hub run test:e2e`. The same commands and browser suite must pass on Windows and Linux.
 - Open PR `<number>` with `npm --prefix hub run preview:open -- --pr <number>`. It opens `https://pr-<number>-preview.sessions.vza.net`; Cloudflare Access performs browser authentication. Do not use SQL, copy a bearer, or put credentials in a URL. Use `--print-only` only when a non-interactive job needs the URL without launching a browser.
-- Production-session debugging uses only the signed `sessions-dev-bridge` installed outside the checkout: `sessions-dev-bridge pull --session <id> --target local|pr-<number>`. Complete its production and destination browser approvals, review the exact session and destination, and provide the requested fresh passkey consent. A repository script is never the authorization client.
+- Production-session debugging uses only the signed `sessions-dev-bridge` installed outside the checkout: `sessions-dev-bridge pull --session <id> --target local|pr-<number>`. Complete its production and destination browser approvals, review the exact session and destination, and provide the requested fresh passkey consent. For a PR target's five-page approval sequence and the fields to verify, see `docs/dev-preview-redesign.md` under “Approve a production session import into a PR preview.” A repository script is never the authorization client.
 
 ## Cloudflare least privilege
 

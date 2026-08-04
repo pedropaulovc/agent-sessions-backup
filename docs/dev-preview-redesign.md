@@ -309,6 +309,29 @@ For local import, the trusted bridge decrypts directly into the immutable enviro
 
 Default to local import. Remote import requires the trusted-front-door and direct-origin auth checks, both user confirmations, an unchanged live routing tuple, and automatic deletion with the PR environment. Never commit, cache in CI, or upload plaintext or ciphertext bundles as GitHub artifacts.
 
+### Approve a production session import into a PR preview
+
+The target PR must be open and its isolated preview must have completed provisioning. A closed or merged PR has no routable destination after preview cleanup. When development runs in WSL, invoke the signed bridge from Windows PowerShell; a remote PR target does not use the checkout or require a local TPM enrollment.
+
+```powershell
+sessions-dev-bridge pull `
+  --session <exact-session-id> `
+  --target pr-<number>
+```
+
+The bridge opens five trusted approval pages in sequence. Do not construct, copy, or edit their authorization URLs.
+
+1. **Resolve the preview destination.** On **Approve preview destination**, verify the PR number and `head current live`, then click **Approve exact destination**.
+2. **Bind the session to the deployed build.** On the next **Approve preview destination** page, verify the PR number, full immutable head SHA, and exact production session ID. Compare the SHA with `gh pr view <number> --json headRefOid -q .headRefOid`, then click **Approve exact destination**.
+3. **Prepare the production snapshot.** On **Prepare production debug session**, sign in with the production passkey if redirected to `/login`. Verify `sessionIds` and the signed destination payload, including the PR, head, generation, artifact digest, size limit, and expiry. Click **Prepare encrypted snapshot**. This permits snapshot preparation but does not release production bytes.
+4. **Bind the completed inventory.** After production enumerates the source objects, approve the next **Approve preview destination** page. This extends the one-use destination attestation with the immutable inventory digest.
+5. **Release the exact snapshot.** On **Final production export approval**, verify the session ID and title, object count, total size, inventory digest, destination PR, head SHA, generation, artifact digest, session allowlist, and expiry. Click **Approve and encrypt**, then complete the fresh passkey assertion.
+
+After final approval, the bridge transfers only the authorized encrypted snapshot to the isolated preview, waits for validation and promotion, and exits when the import completes. If any PR, SHA, session ID, destination, or inventory differs from the intended request, close the page and stop the bridge with Ctrl+C. No export grant is issued without the final fresh-passkey approval.
+
+One invocation authorizes one session. Reproduce a root session and its child sessions with separate commands so each receives its own exact, auditable grant.
+
+
 ## Cloudflare and GitHub trust boundaries
 
 ### Account split
