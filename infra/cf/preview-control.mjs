@@ -32,6 +32,7 @@ import {
   wranglerWorkerBundle,
   walkRegularFiles,
   writeCanonicalJson,
+  workerScriptCoversVersion,
 } from './preview-trust.mjs';
 
 const [command, ...rest] = process.argv.slice(2);
@@ -415,6 +416,16 @@ async function deleteInventory(inventory, ownerPr = pr) {
       fail(`invalid inventory generation for ${raw.name}`);
     }
     const item = assertInventoryItem(raw, ownerPr, generation, { allowMissingId: true });
+    if (workerScriptCoversVersion(item, inventory)) {
+      results.push({
+        kind: item.kind,
+        id: item.id,
+        name: item.name,
+        generation: item.generation,
+        deleted: true,
+      });
+      continue;
+    }
     const resolvedId = await resolvePlannedId(item);
     if (resolvedId != null) {
       let endpoint;

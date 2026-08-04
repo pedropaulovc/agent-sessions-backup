@@ -454,6 +454,20 @@ export function acknowledgedResources(deleted) {
   return deleted.map(({ kind, id, name, generation }) => ({ kind, id, name, generation }));
 }
 
+export function workerScriptCoversVersion(item, inventory) {
+  if (!Array.isArray(inventory)) fail('inventory must be an array');
+  const workerKind = item?.kind === 'app-version'
+    ? 'app-worker'
+    : item?.kind === 'edge-version'
+      ? 'edge-worker'
+      : null;
+  if (!workerKind) return false;
+  return inventory.some((candidate) =>
+    candidate?.kind === workerKind
+    && candidate.name === item.name
+    && candidate.generation === item.generation);
+}
+
 export function inventoryGenerations(inventory) {
   if (!Array.isArray(inventory)) fail('inventory must be an array');
   const generations = new Set();
