@@ -33,14 +33,57 @@ jobs:
         working-directory: hub
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 22.22.2
           cache: npm
           cache-dependency-path: hub/package-lock.json
       - run: npm ci
+      - name: Verify migrations against protected base
+        env:
+          MIGRATION_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: node scripts/migrations.mjs check --base-ref "$MIGRATION_BASE_REF"
       - run: npm run typecheck
       - run: npm test
+
+  browser-e2e:
+    name: Browser e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.2
+          cache: npm
+          cache-dependency-path: hub/package-lock.json
+      - run: npm --prefix hub ci
+      - name: Install Chromium and Linux browser dependencies
+        if: runner.os == 'Linux'
+        run: npx --prefix hub playwright install --with-deps chromium
+      - name: Install Chromium
+        if: runner.os == 'Windows'
+        run: npx --prefix hub playwright install chromium
+      - run: npm --prefix hub run test:e2e
+      - name: Upload browser failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-e2e-${{ runner.os }}
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            hub/test-results/
+            hub/playwright-report/
 
   collector:
     runs-on: ubuntu-latest
@@ -65,187 +108,6 @@ jobs:
       - run: uv sync
       - run: uv run pytest
 
-  # Applies pending D1 migrations to the PREVIEW database with NO Cloudflare credential at all.
-  #
-  # This job used to hold a Cloudflare API token, which cannot be made safe here: D1 token
-  # permissions are account-scoped (there is no per-database resource as there is for an R2
-  # bucket), Cloudflare has no workload-identity federation, and a same-repo PR runs its OWN copy
-  # of this file — so any token handed to a PR-triggered job can reach production D1.
-  #
-  # A Worker binding is the one construct in D1's model that genuinely cannot. The preview Worker's
-  # DB binding is sessions-index-preview and it has no production binding, so this job calls that
-  # Worker instead and authenticates with a short-lived GitHub OIDC assertion. A maximally hostile
-  # PR — rewriting this file included — still reaches exactly one database, because that is all the
-  # capability it is talking to can reach. Nothing here is secret: `id-token: write` mints a
-  # per-run assertion, and the endpoint pins issuer, audience and repository.
-  #
-  # Gated on `hub` for the same reason `deploy` is: the test suite applies every migration, so a
-  # broken one never reaches a real database. The preview D1 is shared by all branches, so an
-  # unmerged branch's migration lands early — already true of every other preview resource.
-  migrate-preview:
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
-    needs: hub
-    # `needs: hub` only orders jobs WITHIN one run, and the preview D1 is shared by every branch —
-    # so two PRs opened around the same time can apply migrations to the same database
-    # concurrently. A repo-wide group (not per-PR) makes them queue instead of race.
-    #
-    # KNOWN LIMIT, deliberately accepted: GitHub keeps at most ONE pending run per group. A third
-    # overlapping run displaces the second, and the displaced one is CANCELLED, not queued behind
-    # it. So with three PRs landing at once, one PR's migrations may not reach the preview
-    # database on that push. That is tolerable here and a real queue is not worth building for it:
-    # the outcome is a visibly cancelled check rather than a silent skip, the endpoint is
-    # idempotent so that PR's next push applies the same set, and `migrate-preview-main` re-applies
-    # everything once the branch merges. What the group DOES buy is the thing that actually
-    # corrupts state — two runs writing the shared database at the same time, where the endpoint's
-    # atomic name claim can order two runs applying the same migration but not two applying
-    # different, dependent ones.
-    concurrency:
-      group: migrate-preview
-      cancel-in-progress: false
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      # No checkout token left in .git/config. This job holds a short-lived OIDC assertion and
-      # never pushes, so a compromised action should find nothing reusable here.
-      #
-      # `ref` is the PR BRANCH HEAD, not the default synthetic merge revision. Workers Builds
-      # builds the preview from the branch head, so TARGET names that code — while the merge
-      # revision also contains whatever main has gained since. Reading EXPECTED_HANDLER and the
-      # migration payload from the merge result would then describe a Worker that does not exist
-      # at that alias, and if main has bumped the handler version the mismatch is PERMANENT: every
-      # attempt reads "stale handler" and the job never converges.
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-          ref: ${{ github.event.pull_request.head.sha }}
-      # Cloudflare's branch alias lowercases the branch and replaces non-alphanumerics with '-'
-      # (infra/cf/deploy.md). If that normalisation ever diverges the request 404s, which the
-      # transient handling below reports as a notice rather than a red build.
-      #
-      # 42, not 63: the alias becomes the first LABEL of the hostname, and Cloudflare appends
-      # `-sessions-hub-preview` (21 chars) to it. A DNS label caps at 63, so the branch part gets
-      # 63 - 21 = 42. Truncating at 63 builds an 84-character label for any branch name over 42
-      # chars, and every request to it fails to resolve.
-      - id: target
-        env:
-          BRANCH: ${{ github.event.pull_request.head.ref }}
-        run: |
-          alias=$(printf '%s' "$BRANCH" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9]/-/g' | cut -c1-42)
-          # A DNS label may not start or end with '-', but a branch may start or end with
-          # punctuation (`_repair`, `@repair`, `fix.`) and the substitution above turns that into a
-          # leading or trailing hyphen. The resulting hostname cannot resolve, which — since the
-          # endpoint never answers — looks exactly like "the preview is not deployed yet" and
-          # exits green having applied nothing. Strip them.
-          alias=$(printf '%s' "$alias" | sed 's/^-*//; s/-*$//')
-          if [ -z "$alias" ]; then
-            echo "::error::branch '$BRANCH' normalises to an empty preview alias — cannot derive a target URL."
-            exit 1
-          fi
-          echo "url=https://${alias}-sessions-hub-preview.pedro-18e.workers.dev" >> "$GITHUB_OUTPUT"
-      - name: Apply preview migrations
-        env:
-          TARGET: ${{ steps.target.outputs.url }}
-        run: |
-          set -uo pipefail
-          # Minted inside the retry loop, not once up front. These assertions are short-lived
-          # (minutes), while the loop can span far longer — five 120s transfers plus sleeps. A
-          # token minted before a slow first attempt can be EXPIRED by the time a later attempt
-          # finally reaches the handler, which then returns the permanent `oidc_rejected` envelope
-          # and fails the job for a deployment race the retries were meant to absorb.
-          #
-          # Bounded transfers: without a deadline a server that accepts the connection and then
-          # goes quiet parks this step until the job timeout, so the loop never runs at all.
-          mint_oidc() {
-            curl -sS --connect-timeout 10 --max-time 30 \
-              -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-              "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sessions-hub-preview-migrate" | jq -r .value
-          }
-          # The handler version this checkout expects. A response carrying anything else came from
-          # a Worker version that predates this PR, so its verdict is about different code.
-          EXPECTED_HANDLER=$(node -e '
-            const src = require("fs").readFileSync("hub/src/api/migrate.ts", "utf8");
-            const m = /MIGRATE_HANDLER_VERSION\s*=\s*(\d+)/.exec(src);
-            if (!m) { console.error("MIGRATE_HANDLER_VERSION not found"); process.exit(1); }
-            process.stdout.write(m[1]);
-          ')
-          echo "expecting migrate handler v$EXPECTED_HANDLER"
-          python3 -c "
-          import json, pathlib
-          files = sorted(pathlib.Path('hub/migrations').glob('*.sql'))
-          print(json.dumps({'migrations': [{'name': f.name, 'sql': f.read_text()} for f in files]}))
-          " > /tmp/migrations.json
-          # Workers Builds deploys the preview independently of this workflow, so on a brand-new
-          # branch the endpoint may not be live yet. That race — and only that race — is worth
-          # tolerating: it converges on the next push, and a red build for it would just train
-          # people to ignore this job.
-          #
-          # A DETERMINISTIC failure is the opposite: 401 (OIDC broken), 409 (the Worker is bound to
-          # a database that cannot prove it is the preview one), 422 (a migration this endpoint
-          # cannot split safely), 400/500 (a bug). None of those fix themselves on the next push,
-          # and swallowing them as a notice is exactly how PR #65 shipped an unapplied migration —
-          # the failure this job exists to prevent. Retry only what is plausibly transient.
-          code=000
-          for attempt in 1 2 3 4 5; do
-            oidc=$(mint_oidc)
-            if [ -z "$oidc" ] || [ "$oidc" = "null" ]; then
-              # Transient too: a connection error, timeout, 5xx or non-JSON from GitHub's token
-              # service yields an empty value, and exiting here turned a brief outage into a red
-              # check even though the next attempt would have succeeded. Advance the loop instead;
-              # if every attempt fails to mint, the loop falls through to the notice below.
-              echo "attempt $attempt: could not mint an OIDC token (transient, or id-token: write unset)"
-              sleep 15
-              continue
-            fi
-            code=$(curl -sS --connect-timeout 10 --max-time 120 \
-              -o /tmp/migrate-out.json -w '%{http_code}' \
-              -X POST "$TARGET/api/v1/admin/migrate" \
-              -H "Authorization: Bearer $oidc" -H 'content-type: application/json' \
-              --data-binary @/tmp/migrations.json) || code=000
-            body=$(cat /tmp/migrate-out.json 2>/dev/null || true)
-            if [ "$code" = "200" ]; then
-              echo "::notice::preview migrations: $body"
-              exit 0
-            fi
-            # Classify by WHO answered, not by status code — the code alone gets it backwards at
-            # both ends. Our handler returns 404 when ENVIRONMENT != 'preview' and 503 when the
-            # repository allowlist is unset; both are permanent misconfigurations, while a 404 or
-            # 503 from Cloudflare's edge means the preview simply is not up yet. Every response
-            # from our handler carries a JSON `error` key, and the edge's never does.
-            # Fatal only when THIS version of the Worker answered and said no permanently.
-            #
-            # Two errors must stay retryable even though a handler produced them:
-            #   retryable      - GitHub's JWKS endpoint unreachable; says nothing about the request.
-            #   unauthorized   - on an existing branch alias CI can race Workers Builds and reach
-            #                    the PREVIOUSLY deployed version, which has no migration route and
-            #                    so 401s from the parent router. That is the deployment window this
-            #                    retry loop exists for; treating it as a permanent rejection turned
-            #                    the race into a red check. Same shape for any migrate-route change
-            #                    that lands before its own deploy.
-            #
-            # This does mean a genuinely broken OIDC setup retries five times before failing, which
-            # is the right trade: it still fails, just later.
-            # Only fatal when the CURRENT handler answered. Every response from this endpoint
-            # carries `handler` (MIGRATE_HANDLER_VERSION in hub/src/api/migrate.ts); a stale branch
-            # version answers with an older value or none at all. Without that check a migration
-            # that depends on a contemporaneous handler change gets `unsupported_migration` or
-            # `migration_failed` from the OLD version and fails immediately, when the deploy it is
-            # racing would have fixed it — the same class as the `unauthorized` case below, which
-            # is the parent router answering because the route does not exist yet.
-            handler=$(printf '%s' "$body" | jq -r '.handler // empty' 2>/dev/null || true)
-            if [ -n "$body" ] && [ "$handler" = "$EXPECTED_HANDLER" ] && printf '%s' "$body" \
-              | jq -e 'has("error") and (.retryable // false | not)' >/dev/null 2>&1; then
-              echo "::error::preview migration rejected at $TARGET with HTTP $code: $body"
-              exit 1
-            fi
-            if [ -n "$body" ] && [ -n "$handler" ] && [ "$handler" != "$EXPECTED_HANDLER" ]; then
-              echo "attempt $attempt: stale handler v$handler (expected v$EXPECTED_HANDLER) — deploy still in flight"
-            fi
-            echo "attempt $attempt: HTTP $code (no handler response — treating as transient) $body"
-            sleep 15
-          done
-          echo "::notice::preview migration endpoint unreachable at $TARGET (HTTP $code) — preview may run an older schema until the next push."
 
   # Migrate D1 then deploy the hub Worker, in that order, on merge to main. This is the SOLE deployer:
   # Cloudflare Workers Builds auto-deploy is turned OFF so nothing races us. Applying migrations before
@@ -253,13 +115,16 @@ jobs:
   # fired the agent-backup-parse-errors alert on 2026-07-22 (PR #51's migration 0013 shipped but was
   # never applied, so every ingest threw `D1_ERROR: no such column`). Gated on the hub tests (which
   # apply every migration via applyD1Migrations) so a broken migration never reaches prod.
-  # Requires repo secret CLOUDFLARE_API_TOKEN with, on this account: D1, Workers Scripts, Queues,
-  # Workers R2 Storage, Workers KV Storage (Edit) + Account Settings (Read); and on the vza.net zone:
-  # Workers Routes (Edit). account_id comes from wrangler.jsonc.
+  # Requires production-environment secrets PRODUCTION_SCHEMA_BASELINE_ENVELOPE and
+  # PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY, created by scripts/approve-production-baseline.mjs
+  # through the independent human approval process.
+  # CLOUDFLARE_MIGRATION_TOKEN is D1 Edit only. CLOUDFLARE_DEPLOY_TOKEN has Workers Scripts,
+  # Queues, R2, and KV Edit plus Account Settings Read and Workers Routes Edit on vza.net.
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: hub
     runs-on: ubuntu-latest
+    environment: production
     defaults:
       run:
         working-directory: hub
@@ -267,65 +132,39 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: 22.22.2
           cache: npm
           cache-dependency-path: hub/package-lock.json
       - run: npm ci
-      - run: npx wrangler d1 migrations apply sessions-index --remote
+      - name: Materialize independent signed production schema baseline
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          PRODUCTION_SCHEMA_BASELINE_ENVELOPE: ${{ secrets.PRODUCTION_SCHEMA_BASELINE_ENVELOPE }}
+          PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY: ${{ secrets.PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          : "${PRODUCTION_SCHEMA_BASELINE_ENVELOPE:?production environment must provide a human-approved signed schema baseline}"
+          : "${PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY:?production environment must provide its independently trusted verification key}"
+          umask 077
+          printf '%s' "$PRODUCTION_SCHEMA_BASELINE_ENVELOPE" > "$RUNNER_TEMP/production-schema-baseline.json"
+          printf '%s' "$PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY" > "$RUNNER_TEMP/production-schema-baseline-public.pem"
+      - name: Apply and verify production migrations exactly once
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
+        run: |
+          set -euo pipefail
+          artifact_digest="$(git archive --format=tar HEAD migrations | sha256sum | cut -d ' ' -f 1)"
+          node scripts/migrations.mjs apply \
+            --target production \
+            --config wrangler.jsonc \
+            --database sessions-index \
+            --journal "$RUNNER_TEMP/production-migration-${GITHUB_SHA}.json" \
+            --artifact-digest "$artifact_digest" \
+            --deployment-id "production:${GITHUB_SHA}" \
+            --base-manifest migrations/source-baseline.json \
+            --history migrations/historical-baseline.json \
+            --baseline "$RUNNER_TEMP/production-schema-baseline.json" \
+            --baseline-public-key "$RUNNER_TEMP/production-schema-baseline-public.pem"
       - run: npx wrangler deploy
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
 
-  # The preview D1 on a main push, and from here rather than from migrate-preview. That job only
-  # runs for same-repo pull requests, but `sessions-hub-preview` has `main` as its production
-  # branch — so a direct push to main (which is unprotected) or a merged FORK PR deploys new
-  # preview code with no migration behind it, leaving the shared preview database on the old
-  # schema until some unrelated PR happens to migrate it. The `deploy` job covers only
-  # `sessions-index`.
-  #
-  # A SEPARATE JOB, not a step in `deploy`, purely so it can join `migrate-preview`'s concurrency
-  # group. Both write the same shared database, and only the PR job was in the group, so a main
-  # push overlapping a PR run wrote it concurrently. The endpoint's atomic name claim orders two
-  # runs applying the SAME migration, but it cannot order DIFFERENT ones: a PR-head migration that
-  # depends on a migration newly added on main can still run first and fail, even though the `hub`
-  # job tested the synthetic merge in the correct order. The group makes them queue.
-  #
-  # `needs: deploy` keeps the ordering that was the point of putting this last. The shared preview
-  # database carries schema from unmerged branches, so a preview migration can conflict with a main
-  # migration through no fault of this release. Running it before `wrangler deploy` would leave
-  # production migrated but still running the OLD Worker — new schema, old code, the exact failure
-  # `deploy` exists to prevent. After the deploy, production is always consistent and a failure
-  # here means only "preview needs attention", while still showing as a red check.
-  migrate-preview-main:
-    # `!cancelled()` + an explicit hub gate, NOT a bare `needs: deploy`. A prerequisite FAILURE
-    # skips the dependent job, so a production-only problem -- a D1 conflict on `sessions-index`,
-    # a token outage, a `wrangler deploy` error -- would skip this apply entirely while Workers
-    # Builds has already published the new preview Worker. The preview would then run new code
-    # against the old schema with its migration never applied, which is the failure this job
-    # exists to prevent, triggered by something that has nothing to do with preview.
-    #
-    # The WAIT on deploy is still what we want (see the ordering note below); only the
-    # success-requirement is dropped. `hub` must still be green -- an untested migration should
-    # not reach any database.
-    if: ${{ !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.hub.result == 'success' }}
-    needs: [hub, deploy]
-    concurrency:
-      group: migrate-preview
-      cancel-in-progress: false
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: hub
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: hub/package-lock.json
-      - run: npm ci
-      - run: npx wrangler d1 migrations apply DB --env preview --remote
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

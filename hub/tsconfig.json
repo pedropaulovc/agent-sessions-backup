@@ -12,5 +12,6 @@
     "isolatedModules": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["src/**/*.ts", "gateway/**/*.ts", "test/**/*.ts"]
+  "include": ["src/**/*.ts", "gateway/**/*.ts", "test/**/*.ts"],
+  "exclude": ["test/playwright-harness.test.ts"]
 }

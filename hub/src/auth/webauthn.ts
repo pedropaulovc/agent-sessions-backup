@@ -135,6 +135,114 @@ async function consumeChallenge(env: Env, challenge: string, kind: 'register' | 
   return result.meta.changes === 1;
 }
 
+export type FreshAuthenticationResult =
+  | { verified: true; credentialId: string }
+  | { verified: false; error: string; status: number };
+
+/**
+ * Create a user-verifying assertion challenge for a narrow operation. Unlike normal login this
+ * never creates a viewer session. The caller supplies a digest of the exact server-side operation
+ * state (inventory, destination, device metadata, and so on); verification can consume only a
+ * challenge carrying the same purpose and digest.
+ */
+export async function freshAuthenticationOptions(
+  request: Request,
+  url: URL,
+  env: Env,
+  purpose: string,
+  bindingHash: string,
+): Promise<Response> {
+  if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
+  if (!ceremonyHostOk(url, env)) return json({ error: 'bad_host' }, 403);
+  const { rpID } = rp(url, env);
+  const creds = await env.DB.prepare('SELECT credential_id, transports FROM credentials').all<{
+    credential_id: string;
+    transports: string | null;
+  }>();
+  const options = await generateAuthenticationOptions({
+    rpID,
+    userVerification: 'required',
+    allowCredentials: creds.results.map((credential) => ({
+      id: credential.credential_id,
+      transports: parseTransports(credential.transports),
+    })),
+  });
+  const now = Date.now();
+  await env.DB.prepare('DELETE FROM debug_export_passkey_challenges WHERE expires_at <= ?1').bind(now).run();
+  await env.DB.prepare(
+    `INSERT INTO debug_export_passkey_challenges
+       (challenge, purpose, binding_hash, created_at, expires_at)
+     VALUES (?1, ?2, ?3, ?4, ?5)`,
+  )
+    .bind(options.challenge, purpose, bindingHash, now, now + CHALLENGE_TTL * 1000)
+    .run();
+  return json(options);
+}
+
+/**
+ * Consume and verify a purpose-bound fresh assertion without issuing any production session or
+ * search credential. Challenge consumption is a conditional DELETE, so wrong binding/purpose,
+ * expiry, and replay all fail closed.
+ */
+export async function verifyFreshAuthentication(
+  request: Request,
+  url: URL,
+  env: Env,
+  purpose: string,
+  bindingHash: string,
+  deps: WebAuthnDeps = REAL_DEPS,
+): Promise<FreshAuthenticationResult> {
+  if (!originOk(request)) return { verified: false, error: 'bad_origin', status: 403 };
+  if (!ceremonyHostOk(url, env)) return { verified: false, error: 'bad_host', status: 403 };
+  const parsed = await readVerifyBody<AuthenticationResponseJSON>(request);
+  if (!parsed) return { verified: false, error: 'bad_request', status: 400 };
+  const { response, challenge } = parsed;
+  if (typeof response.id !== 'string' || response.id.length === 0) {
+    return { verified: false, error: 'bad_request', status: 400 };
+  }
+  const consumed = await env.DB.prepare(
+    `DELETE FROM debug_export_passkey_challenges
+      WHERE challenge = ?1 AND purpose = ?2 AND binding_hash = ?3 AND expires_at > ?4
+      RETURNING challenge`,
+  )
+    .bind(challenge, purpose, bindingHash, Date.now())
+    .first<{ challenge: string }>();
+  if (!consumed) return { verified: false, error: 'bad_challenge', status: 400 };
+
+  const row = await env.DB.prepare(
+    'SELECT credential_id, public_key, counter, transports FROM credentials WHERE credential_id = ?1',
+  )
+    .bind(response.id)
+    .first<CredentialRow>();
+  if (!row) return { verified: false, error: 'unknown_credential', status: 400 };
+  const { rpID, origin } = rp(url, env);
+  let verification;
+  try {
+    verification = await deps.verifyAuthentication({
+      response,
+      expectedChallenge: challenge,
+      expectedOrigin: origin,
+      expectedRPID: rpID,
+      requireUserVerification: true,
+      credential: {
+        id: row.credential_id,
+        publicKey: new Uint8Array(row.public_key),
+        counter: row.counter,
+        transports: parseTransports(row.transports),
+      },
+    });
+  } catch {
+    return { verified: false, error: 'verification_failed', status: 400 };
+  }
+  if (!verification.verified) return { verified: false, error: 'verification_failed', status: 400 };
+  await env.DB.prepare(
+    "UPDATE credentials SET counter = ?1, last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE credential_id = ?2 AND counter < ?1",
+  )
+    .bind(verification.authenticationInfo.newCounter, row.credential_id)
+    .run();
+  return { verified: true, credentialId: row.credential_id };
+}
+
 /** Dispatch the viewer's auth surface. Returns null for paths it does not own. */
 export async function webauthnRoute(
   request: Request,
@@ -446,11 +554,32 @@ async function settingsPage(request: Request, env: Env): Promise<Response> {
   const session = await readSession(request, env);
   if (!session) return new Response(null, { status: 302, headers: { location: '/login' } });
   const count = await countCredentials(env);
+  const debugDevices = await env.DB.prepare(
+    `SELECT device_id,label,release_digest,key_protection,expires_at
+       FROM debug_export_devices
+      WHERE user_id = ?1 AND revoked_at IS NULL
+      ORDER BY enrolled_at DESC`,
+  ).bind(session.user).all<{
+    device_id: string;
+    label: string;
+    release_digest: string;
+    key_protection: string;
+    expires_at: number;
+  }>();
+  const deviceRows = debugDevices.results.length === 0
+    ? '<p>No debug bridge devices enrolled.</p>'
+    : `<ul>${debugDevices.results.map((device) =>
+      `<li><strong>${esc(device.label)}</strong> ` +
+      `<span class="muted">${esc(device.key_protection)} · ${esc(device.release_digest.slice(0, 12))} · ` +
+      `expires ${esc(new Date(device.expires_at).toISOString())}</span> ` +
+      `<button class="revoke-debug" data-device="${esc(device.device_id)}">Revoke</button></li>`,
+    ).join('')}</ul>`;
 
   const body =
     `<h1>Settings</h1>` +
     `<p>${count} passkey${count === 1 ? '' : 's'} registered for the owner.</p>` +
     `<button id="add">Add this device as a passkey</button>` +
+    `<h2>Production debug bridge devices</h2>${deviceRows}` +
     `<div id="msg" class="msg"></div>` +
     `<form method="post" action="/logout" style="margin-top:16px"><button type="submit" style="background:transparent;color:var(--fg)">Sign out</button></form>` +
     `<div class="links"><a href="/">← Back to sessions</a></div>`;
@@ -466,7 +595,17 @@ async function settingsPage(request: Request, env: Env): Promise<Response> {
     `var v=await fetch('/webauthn/register/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(serializeReg(cred))});` +
     `var r=await v.json();if(r.verified){say('Passkey added.');btn.disabled=false;}else{say('Verification failed.',1);btn.disabled=false;}` +
     `}catch(e){say(String(e&&e.message||e),1);btn.disabled=false;}});` +
-    SERIALIZE_REG;
+    `document.querySelectorAll('.revoke-debug').forEach(function(btn){btn.addEventListener('click',async function(){` +
+    `var id=this.dataset.device;this.disabled=true;say('Requesting fresh passkey confirmation…');try{` +
+    `var o=await fetch('/debug/devices/'+encodeURIComponent(id)+'/revoke/options',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});` +
+    `var opt=await o.json();if(!o.ok)throw new Error(opt.error||'Not allowed');opt.challenge=b64uToBuf(opt.challenge);` +
+    `if(opt.allowCredentials)opt.allowCredentials=opt.allowCredentials.map(function(c){c.id=b64uToBuf(c.id);return c;});` +
+    `var cred=await navigator.credentials.get({publicKey:opt});` +
+    `var v=await fetch('/debug/devices/'+encodeURIComponent(id)+'/revoke/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({response:serializeAuth(cred)})});` +
+    `var r=await v.json();if(!v.ok||!r.revoked)throw new Error(r.error||'Revocation failed');this.closest('li').remove();say('Debug bridge device revoked.');` +
+    `}catch(e){say(String(e&&e.message||e),1);this.disabled=false;}});});` +
+    SERIALIZE_REG +
+    SERIALIZE_AUTH;
   return authDoc('Settings', body, script);
 }
 

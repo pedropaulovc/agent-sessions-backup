@@ -1,4 +1,3 @@
-// Cloudflare does not generate preview URLs for Workers that expose a Durable Object
-// handler. Keep this entrypoint's module surface to the default Worker handler only;
-// production uses index.ts, which additionally exports CloudflareOAuthBroker.
+// Per-PR Workers expose only the application handler. Production alone exports the
+// CloudflareOAuthBroker Durable Object and is deployed from src/index.ts.
 export { default } from './worker';

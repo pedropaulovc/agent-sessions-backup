@@ -1,0 +1,26 @@
+{
+  "formatVersion": 1,
+  "throughSequence": 20,
+  "sourceImmutability": {
+    "throughSequence": 20,
+    "digest": "0c28b8691216d10d3ef13fff89ce41a9e11a16ed56b6064f9b87667425559473",
+    "evidenceStatement": "This digest anchors current repository source bytes only. It is not evidence of bytes applied to any environment."
+  },
+  "deploymentHistory": {
+    "status": "baselined-not-hash-verified",
+    "approved": false,
+    "reason": "Exact bytes applied to every persistent environment before the checksum ledger have not been proven. Current source hashes are not historical deployment evidence. Production requires a separately signed human approval before this baseline may be accepted.",
+    "requiresSignedProductionAttestation": true
+  },
+  "knownDivergence": {
+    "filename": "0019_usage_cost_by_class.sql",
+    "currentSourceSha256": "02e829e28dd82c0a82950795a5ff809be0095863f5d3e3b07ea451c72b88da8e",
+    "priorRepositorySourceRevisions": [
+      {
+        "commit": "34fec4a",
+        "sha256": "39267c343127c45d31cf4f72bfd126d8c5246c5431b859d650b51dbf60253077"
+      }
+    ],
+    "evidenceStatement": "These hashes identify repository source revisions only. This file does not assert which 0019 bytes any environment applied."
+  }
+}

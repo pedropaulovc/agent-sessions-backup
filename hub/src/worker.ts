@@ -2,6 +2,7 @@ import { runModelPriceSync } from './cron/model-prices';
 import { runDailyPricing } from './cron/pricing';
 import { runDailyPrune, runPrune } from './cron/prune';
 import { runWatchdog } from './cron/watchdog';
+import { consumeDebugExchangeMessage, expireDebugState } from './api/debug-exchange';
 import { consumeParseBatch } from './ingest/consumer';
 import { route } from './router';
 
@@ -10,8 +11,31 @@ export default {
     return route(request, env, ctx);
   },
 
-  async queue(batch: MessageBatch<ParseMessage>, env: Env): Promise<void> {
-    await consumeParseBatch(batch, env);
+  async queue(batch: MessageBatch<HubQueueMessage>, env: Env): Promise<void> {
+    const firstDebug = batch.messages.find(
+      (message): message is Message<DebugExchangeMessage> => 'debug' in message.body,
+    );
+    if (firstDebug) {
+      try {
+        await consumeDebugExchangeMessage(firstDebug.body, env);
+        firstDebug.ack();
+      } catch {
+        firstDebug.retry();
+      }
+      for (const message of batch.messages) {
+        if (message === firstDebug) continue;
+        try {
+          await env.PARSE_QUEUE.send(message.body);
+          message.ack();
+        } catch {
+          message.retry();
+        }
+      }
+      return;
+    }
+    await consumeParseBatch({
+      messages: batch.messages as Message<ParseMessage>[],
+    }, env);
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -30,6 +54,7 @@ export default {
     }
 
     ctx.waitUntil(runPrune(env));
+    ctx.waitUntil(expireDebugState(env));
     ctx.waitUntil(runDailyPrune(env));
     // Refresh model pricing from LiteLLM (ccusage's source), THEN fill in `usage.usd` for rows
     // that still have none. Chained rather than a third waitUntil: the pass reads the catalog the
@@ -55,4 +80,4 @@ export default {
         .then(() => runDailyPricing(env)),
     );
   },
-} satisfies ExportedHandler<Env, ParseMessage>;
+} satisfies ExportedHandler<Env, HubQueueMessage>;

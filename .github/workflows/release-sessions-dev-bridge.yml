@@ -1,0 +1,48 @@
+name: Release sessions-dev-bridge
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: sessions-dev-bridge-release
+  cancel-in-progress: false
+
+jobs:
+  package:
+    if: github.ref == 'refs/heads/main' && github.repository == 'pedropaulovc/agent-sessions-backup'
+    runs-on: ubuntu-latest
+    environment: sessions-dev-bridge-release
+    defaults:
+      run:
+        working-directory: sessions-dev-bridge
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.2
+          cache: npm
+          cache-dependency-path: sessions-dev-bridge/package-lock.json
+      - name: Install the pinned bridge toolchain without lifecycle code
+        run: npm ci --ignore-scripts
+      - name: Create keyless protected-workflow release provenance
+        run: npm run release:provenance
+        env:
+          DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK: ${{ vars.DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK }}
+      - name: Verify protected production manifest keys are packaged
+        run: npm run release:verify
+      - name: Pack the standalone client without lifecycle code
+        run: npm pack --ignore-scripts
+      - name: Upload the signed standalone package
+        uses: actions/upload-artifact@v4
+        with:
+          name: sessions-dev-bridge-${{ github.sha }}
+          path: sessions-dev-bridge/sessions-dev-bridge-*.tgz
+          if-no-files-found: error
+          retention-days: 14

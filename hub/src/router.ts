@@ -1,4 +1,4 @@
-import { machineIdentity } from './auth/identity';
+import { machineIdentity, requirePreviewOrigin } from './auth/identity';
 import {
   cloudflareOAuthStatus,
   completeCloudflareOAuth,
@@ -12,7 +12,7 @@ import { bootstrap } from './api/bootstrap';
 import { probeClientCert, renewCert } from './api/certs';
 import { search } from './api/search';
 import { getSession, getSessionRaw, listSessions } from './api/sessions';
-import { migratePreview } from './api/migrate';
+import { debugApiRoute } from './api/debug-exchange';
 import { viewerRoute } from './viewer/router';
 
 /** decodeURIComponent that returns null instead of throwing on a malformed %-sequence, so a bad
@@ -25,11 +25,32 @@ function safeDecode(segment: string): string | null {
   }
 }
 
+
 export async function route(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
 
+  // Preview version URLs are public infrastructure endpoints. Only the trusted front
+  // door may reach PR code; production/development deliberately ignore this header.
+  if (!await requirePreviewOrigin(request, env)) {
+    return Response.json({ error: 'direct_origin_denied' }, { status: 403 });
+  }
+
   if (url.pathname === '/healthz') {
-    return Response.json({ ok: true, environment: env.ENVIRONMENT });
+    if (env.ENVIRONMENT !== 'development') {
+      return Response.json({ ok: true, environment: env.ENVIRONMENT });
+    }
+    return Response.json({
+      ok: true,
+      environment: env.ENVIRONMENT,
+      environmentId: env.ENVIRONMENT_ID,
+      environmentNonce: env.ENVIRONMENT_NONCE,
+      buildInputDigest: env.BUILD_INPUT_DIGEST,
+      artifactDigest: env.ARTIFACT_DIGEST,
+      migrationDigest: env.MIGRATION_DIGEST,
+      schemaDigest: env.SCHEMA_DIGEST,
+      pendingMigrations: Number(env.PENDING_MIGRATIONS ?? -1),
+      seedDigest: env.SEED_DIGEST,
+    });
   }
 
   // Cloudflare's browser redirect cannot use the mTLS-only API hostname. The random, five-minute,
@@ -38,7 +59,10 @@ export async function route(request: Request, env: Env, _ctx: ExecutionContext):
     return completeCloudflareOAuth(url, env);
   }
 
-  if (url.hostname === env.API_HOST || url.pathname.startsWith('/api/')) {
+  const apiOAuthCallback = url.hostname === env.API_HOST && url.pathname === '/oauth/cloudflare/callback';
+  if (url.pathname.startsWith('/api/')
+      || apiOAuthCallback
+      || (env.ENVIRONMENT !== 'development' && url.hostname === env.API_HOST)) {
     return apiRoute(request, url, env);
   }
   return viewerRoute(request, url, env);
@@ -46,11 +70,14 @@ export async function route(request: Request, env: Env, _ctx: ExecutionContext):
 
 
 async function apiRoute(request: Request, url: URL, env: Env): Promise<Response> {
-  // Preview-only migration endpoint. Deliberately BEFORE machineIdentity: it authenticates on a
-  // GitHub OIDC assertion rather than an mTLS client cert, because the whole point is that CI
-  // holds no long-lived credential of ours. It self-gates (404 outside ENVIRONMENT=preview,
-  // 401 without a valid repo-pinned token) — see api/migrate.ts.
-  if (url.pathname === '/api/v1/admin/migrate' && request.method === 'POST') return migratePreview(request, env);
+
+  // Production debug exchange capabilities and signed destination assertions authenticate
+  // themselves. Dispatch exact handlers before the machine API gate; they never mint a viewer,
+  // search, or production machine bearer.
+  const debug = await debugApiRoute(request, url, env);
+  if (debug) return debug;
+
+  if (url.pathname === '/api/v1/preview/diagnostics') return previewDiagnostics(request, env);
 
   const identity = await machineIdentity(request, env);
   const path = url.pathname;
@@ -125,4 +152,36 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
   }
 
   return Response.json({ error: 'not_found' }, { status: 404 });
+}
+
+/** Authenticated deployment evidence for trusted preview smoke only. Public health stays terse. */
+export async function previewDiagnostics(request: Request, env: Env): Promise<Response> {
+  if (env.ENVIRONMENT !== 'preview' || request.method !== 'GET') {
+    return Response.json({ error: 'not_found' }, { status: 404 });
+  }
+  const identity = await machineIdentity(request, env);
+  if (identity.kind !== 'machine' || !identity.actor) {
+    return Response.json({ error: 'unauthorized' }, {
+      status: 401,
+      headers: { 'cache-control': 'no-store' },
+    });
+  }
+  const required = [
+    env.PREVIEW_HEAD_SHA,
+    env.PREVIEW_ARTIFACT_DIGEST,
+    env.PREVIEW_GENERATION,
+    env.SCHEMA_DIGEST,
+  ];
+  if (required.some((value) => !value)) {
+    return Response.json({ error: 'diagnostics_unconfigured' }, {
+      status: 503,
+      headers: { 'cache-control': 'no-store' },
+    });
+  }
+  return Response.json({
+    headSha: env.PREVIEW_HEAD_SHA,
+    artifactDigest: env.PREVIEW_ARTIFACT_DIGEST,
+    generation: env.PREVIEW_GENERATION,
+    schemaDigest: env.SCHEMA_DIGEST,
+  }, { headers: { 'cache-control': 'no-store' } });
 }

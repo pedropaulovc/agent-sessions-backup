@@ -2,16 +2,38 @@ interface Env {
   DB: D1Database;
   RAW: R2Bucket;
   KV: KVNamespace;
-  PARSE_QUEUE: Queue<ParseMessage>;
+  PARSE_QUEUE: Queue<HubQueueMessage>;
   ENVIRONMENT: 'development' | 'preview' | 'production';
-  /** `owner/repo` whose GitHub OIDC tokens may drive /api/v1/admin/migrate. Absent = endpoint
-   * disabled; it is an allowlist, not a secret. */
-  MIGRATE_OIDC_REPOSITORY?: string;
+  /** Local orchestration evidence; generated preview config also binds nonce and deployment digests. */
+  ENVIRONMENT_ID?: string;
+  ENVIRONMENT_NONCE?: string;
+  BUILD_INPUT_DIGEST?: string;
+  ARTIFACT_DIGEST?: string;
+  MIGRATION_DIGEST?: string;
+  SCHEMA_DIGEST?: string;
+  PENDING_MIGRATIONS?: string;
+  SEED_DIGEST?: string;
+  /** Public deployment identity bound only in generated per-generation preview config. */
+  PREVIEW_HEAD_SHA?: string;
+  PREVIEW_ARTIFACT_DIGEST?: string;
+  PREVIEW_GENERATION?: string;
   API_HOST: string;
   VIEWER_HOST: string;
   R2_DASHBOARD_BASE_URL: string;
   /** Independent HMAC secret for short-lived viewer links to captured external assets. */
   ASSET_SIGNING_SECRET?: string;
+  /** Production-only HMAC key for authenticated viewer-session envelopes. Never bind in preview. */
+  PRODUCTION_SESSION_SIGNING_KEY?: string;
+  /** Comma-separated protected bridge release digests accepted for local destination attestations. */
+  DEBUG_EXPORT_APPROVED_RELEASE_DIGESTS?: string;
+  /** Public JWK for independently signed remote/front-door destination attestations. */
+  DEBUG_EXPORT_REMOTE_ATTESTATION_PUBLIC_JWK?: string;
+  /** Production ES256 private JWK. Its public half is pinned into protected bridge releases. */
+  DEBUG_EXPORT_MANIFEST_SIGNING_PRIVATE_JWK?: string;
+  /** Public half of the production manifest signer, used by destination import validation. */
+  DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK?: string;
+  /** Public JWK for one-use import assertions minted by the trusted destination/front door. */
+  DEBUG_IMPORT_ASSERTION_PUBLIC_JWK?: string;
   SETUP_TOKEN?: string;
   // Cloudflare's managed client-certificate lifecycle is authorized through a private
   // OAuth client. The singleton Durable Object owns the grant and never returns bearer
@@ -21,8 +43,16 @@ interface Env {
   CF_OAUTH_REDIRECT_URI?: string;
   CF_OAUTH_SCOPES?: string;
   CF_OAUTH_BROKER?: DurableObjectNamespace;
-  DEV_AUTH?: string;
 }
+
+/** Debug maintenance shares the physical queue binding, but worker.queue runs at most one debug
+ * job and freshly re-enqueues every other message before returning from that invocation. */
+interface DebugExchangeMessage {
+  debug: 'export-snapshot' | 'import-promote';
+  job_id: string;
+}
+
+type HubQueueMessage = ParseMessage | DebugExchangeMessage;
 
 interface ParseMessage {
   file_id: number;

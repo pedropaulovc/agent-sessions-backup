@@ -1,4 +1,4 @@
-import { env, SELF } from 'cloudflare:test';
+import { env } from 'cloudflare:test';
 import { isoBase64URL } from '@simplewebauthn/server/helpers';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { createSession, sessionToken } from '../src/auth/session';
@@ -8,6 +8,13 @@ import { viewerRoute } from '../src/viewer/router';
 const testEnv = env as unknown as Env;
 const VIEWER = 'https://sessions.vza.net';
 const SETUP = 'test-setup-token'; // matches vitest.config.ts binding
+const SESSION_SIGNING_KEY = btoa('\x07'.repeat(32)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const productionEnv = {
+  ...testEnv,
+  ENVIRONMENT: 'production',
+  PRODUCTION_SESSION_SIGNING_KEY: SESSION_SIGNING_KEY,
+} as Env;
+
 
 // Mocked crypto seams: exercise every endpoint (challenge/KV/DB/session wiring) without
 // a real authenticator. Production wires the genuine SimpleWebAuthn verifiers.
@@ -69,7 +76,7 @@ function fakeResponse(challenge: string, type: 'webauthn.create' | 'webauthn.get
 }
 
 async function call(request: Request, deps?: WebAuthnDeps): Promise<Response> {
-  const res = await webauthnRoute(request, new URL(request.url), testEnv, deps);
+  const res = await webauthnRoute(request, new URL(request.url), productionEnv, deps);
   expect(res).not.toBeNull();
   return res!;
 }
@@ -87,6 +94,33 @@ describe('passkey auth', () => {
   beforeEach(async () => {
     await testEnv.DB.prepare('DELETE FROM credentials').run();
     await testEnv.DB.prepare('DELETE FROM webauthn_challenges').run();
+  });
+
+  it('routes the local login, settings, and WebAuthn surfaces through the viewer router', async () => {
+    const development = { ...productionEnv, ENVIRONMENT: 'development' } as Env;
+
+    const loginUrl = new URL('http://localhost:8787/login');
+    const login = await viewerRoute(new Request(loginUrl), loginUrl, development);
+    expect(login.status).toBe(200);
+    expect(await login.text()).toContain('Sign in with passkey');
+
+    const settingsUrl = new URL('http://localhost:8787/settings');
+    const settings = await viewerRoute(new Request(settingsUrl), settingsUrl, development);
+    expect(settings.status).toBe(302);
+    expect(settings.headers.get('location')).toBe('/login');
+
+    const optionsUrl = new URL('http://localhost:8787/webauthn/auth/options');
+    const options = await viewerRoute(
+      new Request(optionsUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: optionsUrl.origin },
+        body: '{}',
+      }),
+      optionsUrl,
+      development,
+    );
+    expect(options.status).toBe(200);
+    expect(await options.json()).toEqual(expect.objectContaining({ challenge: expect.any(String) }));
   });
 
   it('bootstraps the first passkey with the SETUP_TOKEN when zero credentials exist', async () => {
@@ -144,20 +178,24 @@ describe('passkey auth', () => {
     expect(row?.counter).toBe(7);
 
     const token = setCookie.match(/__Host-session=([^;]+)/)![1]!;
-    const preview = { ...testEnv, ENVIRONMENT: 'preview' } as Env;
-    const gated = await viewerRoute(
-      new Request(`${VIEWER}/`, { headers: { cookie: `__Host-session=${token}` } }),
-      new URL(`${VIEWER}/`),
-      preview,
-    );
-    expect(gated.status).toBe(200);
+    const request = new Request(`${VIEWER}/`, { headers: { cookie: `__Host-session=${token}` } });
+    const production = await viewerRoute(request, new URL(request.url), productionEnv);
+    expect(production.status).toBe(200);
+
+    // The same authenticated KV record and cookie are never authority in preview.
+    const preview = { ...productionEnv, ENVIRONMENT: 'preview' } as Env;
+    const replay = await viewerRoute(request, new URL(request.url), preview);
+    expect(replay.status).toBe(401);
+    expect(replay.headers.get('cache-control')).toBe('no-store');
+    expect(replay.headers.get('location')).toBeNull();
   });
 
-  it('redirects the gated page to /login without a session cookie', async () => {
+  it('returns a terminal no-store 401 for a gated preview page without a browser assertion', async () => {
     const preview = { ...testEnv, ENVIRONMENT: 'preview' } as Env;
     const res = await viewerRoute(new Request(`${VIEWER}/`), new URL(`${VIEWER}/`), preview);
-    expect(res.status).toBe(302);
-    expect(res.headers.get('location')).toBe('/login');
+    expect(res.status).toBe(401);
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    expect(res.headers.get('location')).toBeNull();
   });
 
   it('rejects a state-changing POST whose Origin does not match (CSRF guard)', async () => {
@@ -166,7 +204,7 @@ describe('passkey auth', () => {
   });
 
   it('logout deletes the session and clears the cookie', async () => {
-    const cookie = await createSession(testEnv);
+    const cookie = await createSession(productionEnv);
     const token = cookie.match(/__Host-session=([^;]+)/)![1]!;
     expect(await testEnv.KV.get(`sess:${token}`)).toBeTruthy();
 
@@ -186,8 +224,9 @@ describe('passkey auth', () => {
     expect(await withoutToken.text()).toContain('Sign in');
   });
 
-  it('serves /login through the full worker in production (auth surface is never gated)', async () => {
-    const res = await SELF.fetch(`${VIEWER}/login`);
+  it('serves /login through the viewer router in production (auth surface is never gated)', async () => {
+    const request = new Request(`${VIEWER}/login`);
+    const res = await viewerRoute(request, new URL(request.url), productionEnv);
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('text/html');
   });

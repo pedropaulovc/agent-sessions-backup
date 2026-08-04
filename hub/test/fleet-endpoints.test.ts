@@ -122,7 +122,7 @@ describe('GET /api/v1/bootstrap', () => {
 
   it('401s a non-machine identity', async () => {
     expect((await bootstrap(testEnv, { kind: 'anonymous' })).status).toBe(401);
-    expect((await bootstrap(testEnv, { kind: 'human' })).status).toBe(401);
+    expect((await bootstrap(testEnv, { kind: 'human', actor: 'test@example.invalid' })).status).toBe(401);
   });
 
   it('shallow-merges a meta override but keeps schema_version fixed', async () => {

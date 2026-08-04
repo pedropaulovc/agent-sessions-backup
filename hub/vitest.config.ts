@@ -1,5 +1,5 @@
 import { cloudflareTest, readD1Migrations } from '@cloudflare/vitest-pool-workers';
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 
 export default defineConfig(async () => {
   const migrations = await readD1Migrations('./migrations');
@@ -31,6 +31,7 @@ export default defineConfig(async () => {
       }),
     ],
     test: {
+      exclude: [...configDefaults.exclude, 'e2e/**', 'test/dev-lifecycle.test.mjs', 'test/preview-open.test.mjs'],
       setupFiles: ['./test/apply-migrations.ts'],
       // These are workers-pool INTEGRATION tests: a single `it` routinely drives several full
       // miniflare round-trips (HTTP PUT -> R2 -> D1, then a queue-consumer parse writing blocks +
