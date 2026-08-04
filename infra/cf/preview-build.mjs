@@ -1,4 +1,4 @@
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, open, readFile, readdir, rm } from 'node:fs/promises';
 import { constants as fsConstants } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import {
   assertContainedRegularFile,
   assertTrustedWorkflowRef,
+  assertWorkerModulePayload,
   fail,
   fileRecord,
   generatedBuildConfig,
@@ -70,6 +71,7 @@ try {
   });
   const configPath = path.join(temporary, 'wrangler.preview-build.json');
   const metafilePath = path.join(temporary, 'esbuild-meta.json');
+  const wranglerOutput = path.join(temporary, 'wrangler-output');
   await writeCanonicalJson(configPath, buildConfig);
 
   const childEnvironment = {};
@@ -85,8 +87,8 @@ try {
     '--dry-run',
     '--config',
     configPath,
-    '--outfile',
-    path.join(payload, 'worker.mjs'),
+    '--outdir',
+    wranglerOutput,
     '--metafile',
     metafilePath,
   ], {
@@ -102,8 +104,30 @@ try {
     fail(`trusted Wrangler build failed with exit ${result.status}:\n${detail}`);
   }
 
-  const worker = await fileRecord(path.join(payload, 'worker.mjs'), 'payload/worker.mjs');
-  if (worker.size === 0 || worker.size > 20 * 1024 * 1024) fail('Worker bundle has an invalid size');
+  const workerOutputs = (await readdir(wranglerOutput, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.js'))
+    .map((entry) => entry.name);
+  if (workerOutputs.length !== 1) {
+    fail(`Wrangler emitted ${workerOutputs.length} top-level JavaScript bundles instead of one`);
+  }
+  const bundledWorker = await assertContainedRegularFile(
+    temporary,
+    path.join(wranglerOutput, workerOutputs[0]),
+    'Wrangler worker bundle',
+  );
+  const workerPath = path.join(payload, 'worker.mjs');
+  await copyFile(bundledWorker, workerPath, fsConstants.COPYFILE_EXCL);
+  const workerHandle = await open(workerPath, 'r');
+  try {
+    const prefix = new Uint8Array(2);
+    const { bytesRead } = await workerHandle.read(prefix, 0, prefix.length, 0);
+    assertWorkerModulePayload(prefix.subarray(0, bytesRead));
+  } finally {
+    await workerHandle.close();
+  }
+
+  const worker = await fileRecord(workerPath, 'payload/worker.mjs');
+  if (worker.size > 20 * 1024 * 1024) fail('Worker bundle exceeds the size limit');
 
   const migrationDir = path.join(sourceHub, 'migrations');
   const migrationNames = (await readdir(migrationDir)).sort();

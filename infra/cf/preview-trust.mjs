@@ -88,6 +88,14 @@ export function trustedWranglerEnvironment(source, apiToken, accountId) {
   return environment;
 }
 
+export function assertWorkerModulePayload(prefix) {
+  if (!(prefix instanceof Uint8Array) || prefix.byteLength === 0) fail('Worker bundle is empty');
+  if (prefix[0] === 0x2d && prefix[1] === 0x2d) {
+    fail('Wrangler emitted a multipart upload envelope instead of a Worker module');
+  }
+  return prefix;
+}
+
 export function positiveInteger(value, name) {
   if (!/^[1-9][0-9]*$/.test(String(value))) fail(`${name} must be a positive integer`);
   const parsed = Number(value);
