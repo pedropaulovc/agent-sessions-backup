@@ -7,6 +7,7 @@ import {
   assertInventoryItem,
   assertPreviewAccount,
   assertTrustedWorkflowRef,
+  assertWorkerModulePayload,
   generatedBuildConfig,
   generatedPrivateAppConfig,
   generatedTrustedWrapperConfig,
@@ -331,3 +332,16 @@ describe('trusted Wrangler process environment', () => {
     });
   });
 });
+
+describe('Worker bundle payload', () => {
+  it('rejects Wrangler multipart upload envelopes before deployment', () => {
+    const multipart = new TextEncoder().encode('--boundary\\r\\nContent-Disposition: form-data');
+    expect(() => assertWorkerModulePayload(multipart)).toThrow(/multipart upload envelope/);
+  });
+
+  it('accepts JavaScript module output', () => {
+    const module = new TextEncoder().encode('export default { fetch() {} };');
+    expect(assertWorkerModulePayload(module)).toBe(module);
+  });
+});
+
