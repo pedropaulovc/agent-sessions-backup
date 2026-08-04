@@ -114,10 +114,17 @@ test.describe('synthetic sessions viewer', () => {
       expect(source).toBeTruthy();
       const resourceURL = new URL(source!, page.url());
       expect(resourceURL.origin).toBe(new URL(page.url()).origin);
-      const response = await page.request.get(resourceURL.toString());
-      expect(response.ok()).toBeTruthy();
-      expect(response.headers()['content-type']).toMatch(/^image\//);
-      expect((await response.body()).byteLength).toBeGreaterThan(0);
+      const response = await page.evaluate(async (url) => {
+        const result = await fetch(url);
+        return {
+          ok: result.ok,
+          contentType: result.headers.get('content-type'),
+          byteLength: (await result.arrayBuffer()).byteLength,
+        };
+      }, resourceURL.toString());
+      expect(response.ok).toBeTruthy();
+      expect(response.contentType).toMatch(/^image\//);
+      expect(response.byteLength).toBeGreaterThan(0);
     }
   });
 });
