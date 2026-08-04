@@ -47,6 +47,32 @@ test('DebugTransport attaches deadlines to JSON and object transfers', async () 
   }
 });
 
+test('DebugTransport accepts exact streamed ciphertext without content length and enforces declared and streamed sizes', async () => {
+  const response = (chunks, headers = {}) => new Response(new ReadableStream({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(Uint8Array.from(chunk));
+      controller.close();
+    },
+  }), { headers: { 'content-type': 'application/octet-stream', ...headers } });
+  const responses = [
+    response([[1], [2, 3]]),
+    response([[1, 2, 3]], { 'content-length': '4' }),
+    response([[1, 2]]),
+    response([[1, 2], [3, 4]]),
+  ];
+  const transport = new DebugTransport({ fetchImpl: async () => responses.shift() });
+  const object = {
+    objectId: 'object-1',
+    url: '/api/v1/debug/exchanges/Y2Fw/objects/object-1',
+    ciphertextSize: 3,
+  };
+
+  assert.deepEqual(await transport.fetchCiphertext('Y2Fw', object), Buffer.from([1, 2, 3]));
+  await assert.rejects(transport.fetchCiphertext('Y2Fw', object), /content length mismatch/);
+  await assert.rejects(transport.fetchCiphertext('Y2Fw', object), /size mismatch/);
+  await assert.rejects(transport.fetchCiphertext('Y2Fw', object), /exceeds declared size/);
+});
+
 test('DebugTransport stops streaming a JSON response as soon as its size bound is crossed', async () => {
   let pulls = 0;
   let cancelled = false;

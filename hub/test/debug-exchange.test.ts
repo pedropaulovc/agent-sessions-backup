@@ -164,6 +164,62 @@ describe('production debug exchange boundaries', () => {
     ).bind(jobId).run();
   });
 
+  it('emits each per-session target when selected sessions share one source asset', async () => {
+    const suffix = crypto.randomUUID();
+    const selected = [`shared-source-a-${suffix}`, `shared-source-b-${suffix}`];
+    const machine = `shared-source-machine-${suffix}`;
+    const assetDigest = 'd'.repeat(64);
+    const assetBytes = encoder.encode('one shared source asset');
+    const assetHash = await digest(assetBytes);
+    const sharedAssetKey = `raw/${machine}/shared-assets/image.png`;
+    await testEnv.RAW.put(sharedAssetKey, assetBytes, { sha256: assetHash });
+    await testEnv.DB.prepare("INSERT INTO machines (machine_id,os) VALUES (?1,'test')").bind(machine).run();
+    const targetRelpaths: string[] = [];
+    for (const sessionId of selected) {
+      const relpath = `project/${sessionId}.jsonl`;
+      const source = [
+        JSON.stringify({ parentUuid: null, isSidechain: false, sessionId, type: 'assistant', message: { role: 'assistant', content: [{ type: 'tool_use', id: 'tool', name: 'read', input: {} }] }, uuid: `call-${sessionId}`, timestamp: '2026-01-01T00:00:00.000Z' }),
+        JSON.stringify({ parentUuid: `call-${sessionId}`, isSidechain: false, sessionId, type: 'user', message: { role: 'user', details: { meta: { source: { value: 'C:\\safe\\image.png' } } }, content: [{ type: 'tool_result', tool_use_id: 'tool', content: [{ type: 'image', data: `blob:sha256:${assetDigest}` }, { type: 'image', data: `blob:sha256:${assetDigest}` }] }] }, uuid: `result-${sessionId}`, timestamp: '2026-01-01T00:00:01.000Z' }),
+      ].join('\n');
+      const sourceHash = await digest(source);
+      const sourceKey = `raw/${machine}/claude-projects/${relpath}`;
+      const assetRelpath = `${relpath}.assets/${assetDigest}/image.png`;
+      targetRelpaths.push(assetRelpath);
+      await testEnv.RAW.put(sourceKey, source, { sha256: sourceHash });
+      const file = await testEnv.DB.prepare(
+        "INSERT INTO files (machine_id,store,relpath,r2_key,size,content_hash,harness,session_id,parse_state) VALUES (?1,'claude-projects',?2,?3,?4,?5,'claude-code',?6,'parsed') RETURNING id",
+      ).bind(machine, relpath, sourceKey, source.length, sourceHash, sessionId).first<{ id: number }>();
+      await testEnv.DB.prepare(
+        "INSERT INTO files (machine_id,store,relpath,r2_key,size,content_hash,harness,parse_state) VALUES (?1,'claude-projects',?2,?3,?4,?5,'unknown','skipped')",
+      ).bind(machine, assetRelpath, sharedAssetKey, assetBytes.byteLength, assetHash).run();
+      await testEnv.DB.prepare(
+        "INSERT INTO sessions (session_id,harness,canonical_file_id,index_state) VALUES (?1,'claude-code',?2,'ready')",
+      ).bind(sessionId, file!.id).run();
+      await testEnv.DB.prepare(
+        "INSERT INTO blocks (session_id,file_id,turn_index,block_index,btype,text) VALUES (?1,?2,0,0,'text','indexed')",
+      ).bind(sessionId, file!.id).run();
+    }
+    const jobId = `shared-source-job-${suffix}`;
+    await insertPreparingJob(jobId, selected);
+    await consumeDebugExchangeMessage({ debug: 'export-snapshot', job_id: jobId }, testEnv);
+    const job = await testEnv.DB.prepare(
+      'SELECT status,error FROM debug_export_jobs WHERE job_id=?1',
+    ).bind(jobId).first<{ status: string; error: string | null }>();
+    expect(job).toEqual({ status: 'awaiting_consent', error: null });
+    const assets = await testEnv.DB.prepare(
+      "SELECT object_id,relpath,session_ids FROM debug_export_objects WHERE job_id=?1 AND kind='externalAsset' ORDER BY relpath",
+    ).bind(jobId).all<{ object_id: string; relpath: string; session_ids: string }>();
+    expect(assets.results).toHaveLength(2);
+    expect(assets.results.map((asset) => asset.relpath)).toEqual(targetRelpaths);
+    expect(assets.results.map((asset) => JSON.parse(asset.session_ids))).toEqual(
+      selected.map((sessionId) => [sessionId]),
+    );
+    expect(new Set(assets.results.map((asset) => asset.object_id)).size).toBe(assets.results.length);
+    await testEnv.DB.prepare(
+      "UPDATE debug_export_jobs SET status='expired' WHERE job_id=?1",
+    ).bind(jobId).run();
+  });
+
   it('exchanges only ciphertext and a signed manifest, never a production viewer/search bearer', async () => {
     const suffix = crypto.randomUUID();
     const jobId = `cipher-${suffix}`;

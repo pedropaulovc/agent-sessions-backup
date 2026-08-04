@@ -13,6 +13,22 @@ export const ARTIFACT_FILES = new Set([
   'provenance.json',
 ]);
 
+const TRUSTED_MIGRATION_METADATA = new Set([
+  'historical-baseline.json',
+  'source-baseline.json',
+]);
+
+const INVENTORY_KINDS = new Set([
+  'd1',
+  'r2',
+  'kv',
+  'queue',
+  'app-version',
+  'app-worker',
+  'edge-version',
+  'edge-worker',
+]);
+
 const PRODUCTION_IDENTIFIERS = new Set([
   PRODUCTION_ACCOUNT_ID,
   '5ff65cf3-89c8-4fe6-a3c2-a370293ecea6',
@@ -155,14 +171,11 @@ export function migrationArtifactSqlNames(entries) {
   if (!Array.isArray(entries) || !entries.includes('manifest.json')) {
     fail('preview artifact has no migration manifest');
   }
-  const trustedMetadata = {
-    'historical-baseline.json': true,
-    'source-baseline.json': true,
-  };
+  const trustedMetadata = TRUSTED_MIGRATION_METADATA;
   const sql = [];
   for (const name of entries) {
     if (/^[0-9]{4}_[a-z0-9_]+\.sql$/.test(name)) sql.push(name);
-    else if (name !== 'manifest.json' && !trustedMetadata[name]) fail(`unexpected migration entry: ${name}`);
+    else if (name !== 'manifest.json' && !trustedMetadata.has(name)) fail(`unexpected migration entry: ${name}`);
   }
   if (sql.length === 0) fail('preview artifact has no numbered SQL migrations');
   return sql.sort();
@@ -370,13 +383,20 @@ export function acknowledgedResources(deleted) {
   return deleted.map(({ kind, id, name, generation }) => ({ kind, id, name, generation }));
 }
 
+export function inventoryGenerations(inventory) {
+  if (!Array.isArray(inventory)) fail('inventory must be an array');
+  const generations = new Set();
+  for (const item of inventory) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const generation = item.generation;
+    if (/^g[1-9][0-9]*-[0-9a-f]{12}$/.test(generation ?? '')) generations.add(generation);
+  }
+  return generations;
+}
+
 export function assertInventoryItem(item, pr, knownGeneration, { allowMissingId = false } = {}) {
   if (!item || typeof item !== 'object' || Array.isArray(item)) fail('inventory item must be an object');
-  const allowedKinds = {
-    d1: true, r2: true, kv: true, queue: true,
-    'app-version': true, 'app-worker': true, 'edge-version': true, 'edge-worker': true,
-  };
-  if (!allowedKinds[item.kind]) fail(`unsupported inventory kind: ${item.kind}`);
+  if (!INVENTORY_KINDS.has(item.kind)) fail(`unsupported inventory kind: ${item.kind}`);
   const prefix = `pr-${positiveInteger(pr, 'PR number')}-${knownGeneration}-`;
   if (item.id == null) {
     if (!allowMissingId) fail('inventory id is required');

@@ -1,14 +1,10 @@
 #!/usr/bin/env node
-import { spawnSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  assertImmutableBase,
-  canonicalMigrationBytes,
   loadAndValidateManifest,
-  sha256,
-  validateHistoricalBaseline,
+  migrationManifestAtRef,
   validateManifestShape,
 } from './lib/migration-manifest.mjs';
 import { runMigrations } from './lib/migration-runner.mjs';
@@ -34,14 +30,22 @@ function resolveOption(value) {
   return value ? path.resolve(value) : undefined;
 }
 
-function git(args) {
-  const result = spawnSync('git', args, {
-    cwd: repositoryRoot,
-    encoding: null,
-    windowsHide: true,
-  });
-  if (result.error) throw new Error(`cannot execute git: ${result.error.message}`);
-  return result;
+async function trustedBaseManifest(options) {
+  const suppliedBase = resolveOption(options['base-manifest']);
+  if (suppliedBase && options['base-ref']) {
+    throw new Error('--base-manifest and --base-ref are mutually exclusive');
+  }
+  if (suppliedBase) {
+    return validateManifestShape(JSON.parse(await readFile(suppliedBase, 'utf8')));
+  }
+  const baseRef = options['base-ref'] ?? await githubBaseSha();
+  if (baseRef) {
+    if (!/^[0-9a-f]{40}$/.test(baseRef)) {
+      throw new Error('--base-ref must be a full protected commit SHA');
+    }
+    return migrationManifestAtRef({ ref: baseRef, repositoryRoot });
+  }
+  throw new Error('migration manifest validation requires independent policy evidence from --base-manifest or a protected base ref');
 }
 
 async function githubBaseSha() {
@@ -50,71 +54,12 @@ async function githubBaseSha() {
   return event.pull_request?.base?.sha;
 }
 
-function jsonAtRef(ref, repositoryPath) {
-  const result = git(['show', `${ref}:${repositoryPath}`]);
-  if (result.status !== 0) return null;
-  try {
-    return JSON.parse(result.stdout.toString('utf8'));
-  } catch (error) {
-    throw new Error(`cannot parse ${repositoryPath} from migration base ${ref}: ${error.message}`);
-  }
-}
-
-function baseManifestAtRef(ref, fallbackPolicy, fallbackHistory) {
-  let manifest = jsonAtRef(ref, 'hub/migrations/manifest.json');
-  if (manifest) return validateManifestShape(manifest);
-  let tree = git(['ls-tree', '-r', '--name-only', ref, '--', 'hub/migrations']);
-  if (tree.status !== 0) {
-    const fetched = git(['fetch', '--no-tags', '--depth=1', 'origin', ref]);
-    if (fetched.status !== 0) throw new Error(`cannot fetch migration base ${ref}: ${fetched.stderr.toString('utf8')}`);
-    manifest = jsonAtRef(ref, 'hub/migrations/manifest.json');
-    if (manifest) return validateManifestShape(manifest);
-    tree = git(['ls-tree', '-r', '--name-only', ref, '--', 'hub/migrations']);
-  }
-  if (tree.status !== 0) throw new Error(`cannot read migration base ${ref}: ${tree.stderr.toString('utf8')}`);
-  const refPolicy = jsonAtRef(ref, 'hub/migrations/source-baseline.json');
-  const policy = validateManifestShape(refPolicy ?? fallbackPolicy);
-  const filenames = tree.stdout.toString('utf8').split(/\r?\n/)
-    .filter((name) => /^hub\/migrations\/\d{4}_[a-z0-9_]+\.sql$/.test(name))
-    .sort()
-    .map((name) => path.basename(name));
-  const migrations = filenames.map((filename) => {
-    const blob = git(['show', `${ref}:hub/migrations/${filename}`]);
-    if (blob.status !== 0) throw new Error(`cannot read ${filename} from migration base ${ref}`);
-    return {
-      sequence: Number(filename.slice(0, 4)),
-      filename,
-      sha256: sha256(canonicalMigrationBytes(blob.stdout)),
-    };
-  });
-  const base = validateManifestShape({
-    formatVersion: policy.formatVersion,
-    hashEncoding: policy.hashEncoding,
-    reservedSequences: policy.reservedSequences,
-    ledgerStartsAt: policy.ledgerStartsAt,
-    migrations,
-  });
-  if (!refPolicy) validateHistoricalBaseline(fallbackHistory, base);
-  return base;
-}
-
 async function main() {
   const { command, options } = parseArguments(process.argv.slice(2));
   const migrationsDir = resolveOption(options['migrations-dir']) ?? path.join(hubRoot, 'migrations');
   const manifestPath = resolveOption(options.manifest) ?? path.join(migrationsDir, 'manifest.json');
   if (command === 'check-base') {
-    const suppliedBase = resolveOption(options['base-manifest'] ?? process.env.MIGRATION_BASE_MANIFEST);
-    const baseRef = options['base-ref'] ?? process.env.MIGRATION_BASE_REF ?? await githubBaseSha();
-    const fallbackPolicy = JSON.parse(await readFile(path.join(migrationsDir, 'source-baseline.json'), 'utf8'));
-    const base = suppliedBase
-      ? validateManifestShape(JSON.parse(await readFile(suppliedBase, 'utf8')))
-      : baseRef
-        ? baseManifestAtRef(
-          baseRef,
-          fallbackPolicy,
-          JSON.parse(await readFile(path.join(migrationsDir, 'historical-baseline.json'), 'utf8')),
-        )
-        : validateManifestShape(fallbackPolicy);
+    const base = await trustedBaseManifest(options);
     const result = await loadAndValidateManifest({
       migrationsDir,
       manifestPath,
@@ -124,8 +69,12 @@ async function main() {
     return;
   }
   if (command === 'check') {
-    const baseManifestPath = resolveOption(options['base-manifest'] ?? process.env.MIGRATION_BASE_MANIFEST);
-    const result = await loadAndValidateManifest({ migrationsDir, manifestPath, baseManifestPath });
+    const base = await trustedBaseManifest(options);
+    const result = await loadAndValidateManifest({
+      migrationsDir,
+      manifestPath,
+      trustedBaseManifest: base,
+    });
     process.stdout.write(`${JSON.stringify({ migrationDigest: result.digest })}\n`);
     return;
   }

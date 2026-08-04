@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { createHash, createPublicKey, verify as verifySignature } from 'node:crypto';
 import { lstat, readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
@@ -201,6 +202,81 @@ export function assertImmutableBase(base, candidate) {
       throw new Error(`new migration does not append after the immutable base: ${migration.filename}`);
     }
   }
+}
+
+function git(repositoryRoot, args) {
+  const result = spawnSync('git', args, {
+    cwd: repositoryRoot,
+    encoding: null,
+    windowsHide: true,
+  });
+  if (result.error) throw new Error(`cannot execute git: ${result.error.message}`);
+  return result;
+}
+
+function jsonAtRef(repositoryRoot, ref, repositoryPath) {
+  const result = git(repositoryRoot, ['show', `${ref}:${repositoryPath}`]);
+  if (result.status !== 0) return null;
+  try {
+    return JSON.parse(result.stdout.toString('utf8'));
+  } catch (error) {
+    throw new Error(`cannot parse ${repositoryPath} from migration base ${ref}: ${error.message}`);
+  }
+}
+
+export function migrationManifestAtRef({
+  ref,
+  repositoryRoot,
+  migrationsPath = 'hub/migrations',
+}) {
+  if (typeof ref !== 'string' || ref.trim() === '') {
+    throw new Error('migration base ref is required');
+  }
+  let manifest = jsonAtRef(repositoryRoot, ref, `${migrationsPath}/manifest.json`);
+  if (manifest) return validateManifestShape(manifest);
+
+  let tree = git(repositoryRoot, ['ls-tree', '-r', '--name-only', ref, '--', migrationsPath]);
+  if (tree.status !== 0) {
+    const fetched = git(repositoryRoot, ['fetch', '--no-tags', '--depth=1', 'origin', ref]);
+    if (fetched.status !== 0) {
+      throw new Error(`cannot fetch migration base ${ref}: ${fetched.stderr.toString('utf8')}`);
+    }
+    manifest = jsonAtRef(repositoryRoot, ref, `${migrationsPath}/manifest.json`);
+    if (manifest) return validateManifestShape(manifest);
+    tree = git(repositoryRoot, ['ls-tree', '-r', '--name-only', ref, '--', migrationsPath]);
+  }
+  if (tree.status !== 0) {
+    throw new Error(`cannot read migration base ${ref}: ${tree.stderr.toString('utf8')}`);
+  }
+
+  const policy = jsonAtRef(repositoryRoot, ref, `${migrationsPath}/source-baseline.json`);
+  if (!policy) {
+    throw new Error(`migration base ${ref} contains no manifest or independent policy evidence`);
+  }
+  validateManifestShape(policy);
+  const prefix = `${migrationsPath}/`;
+  const filenames = tree.stdout.toString('utf8').split(/\r?\n/)
+    .filter((name) => name.startsWith(prefix) && MIGRATION_NAME.test(name.slice(prefix.length)))
+    .map((name) => name.slice(prefix.length))
+    .sort();
+  const migrations = filenames.map((filename) => {
+    const blob = git(repositoryRoot, ['show', `${ref}:${prefix}${filename}`]);
+    if (blob.status !== 0) throw new Error(`cannot read ${filename} from migration base ${ref}`);
+    return {
+      sequence: Number(filename.slice(0, 4)),
+      filename,
+      sha256: sha256(canonicalMigrationBytes(blob.stdout)),
+    };
+  });
+  const base = validateManifestShape({
+    formatVersion: policy.formatVersion,
+    hashEncoding: policy.hashEncoding,
+    reservedSequences: policy.reservedSequences,
+    ledgerStartsAt: policy.ledgerStartsAt,
+    migrations,
+  });
+  assertManifestMatches(policy, base);
+  return base;
 }
 
 export async function loadAndValidateManifest({

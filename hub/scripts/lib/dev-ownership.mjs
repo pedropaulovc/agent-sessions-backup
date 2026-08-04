@@ -110,7 +110,14 @@ export async function acquireOwnership(stateDir, nonce, options = {}) {
         throw new Error('stale environment owner and runtime records have mismatched nonces');
       }
       if (!owner) {
-        const age = Date.now() - (await stat(lockDir)).mtimeMs;
+        let lockStat;
+        try {
+          lockStat = await stat(lockDir);
+        } catch (statError) {
+          if (statError?.code === 'ENOENT') continue;
+          throw statError;
+        }
+        const age = Date.now() - lockStat.mtimeMs;
         if (age < 30_000) throw new Error(`environment ownership is being acquired: ${stateDir}`);
       }
       const staleLock = `${lockDir}.stale-${nonce}`;
@@ -129,6 +136,7 @@ export async function acquireOwnership(stateDir, nonce, options = {}) {
       if (runtime && recordMatchesLiveProcess(runtime, inspectProcess)) {
         throw new Error(`environment has live Wrangler process ${runtime.pid}; nonce ${runtime.nonce}`);
       }
+      if (runtime) await rm(runtimePath, { force: true });
       const processStart = inspectProcess(process.pid);
       if (!processStart) throw new Error(`cannot establish the current process start identity for pid ${process.pid}`);
       const owner = {

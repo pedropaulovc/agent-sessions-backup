@@ -604,7 +604,7 @@ async function collectSnapshotObjects(selected: string[], env: Env): Promise<Sna
     harness: string | null;
   }>();
   const objects: SnapshotObject[] = [];
-  const assetKeys = new Set<string>();
+  const assetIds = new Set<string>();
   for (const file of fileRows.results) {
     const linked = await env.DB.prepare(
       'SELECT DISTINCT session_id FROM blocks WHERE file_id=?1 ORDER BY session_id',
@@ -640,7 +640,6 @@ async function collectSnapshotObjects(selected: string[], env: Env): Promise<Sna
         ).bind(file.machine_id, file.store, suffix)
           .first<{store:string;relpath:string;r2_key:string;content_hash:string;size:number}>();
         const key = assetRow?.r2_key ?? assetRelSuffix(file.r2_key, asset.digest, asset.fileName);
-        if (assetKeys.has(key)) continue;
         const object = await env.RAW.get(key);
         if (!object) throw new Error('externalAsset closure incomplete');
         if (!Number.isSafeInteger(object.size) || object.size > MAX_OBJECT_BYTES) {
@@ -651,6 +650,7 @@ async function collectSnapshotObjects(selected: string[], env: Env): Promise<Sna
         if (assetRow && digest !== assetRow.content_hash) throw new Error('externalAsset hash mismatch');
         const targetRelpath = assetRelSuffix(isolated.relpath, asset.digest, asset.fileName);
         const assetId = await sha256(`externalAsset\0${targetRelpath}\0${digest}`);
+        if (assetIds.has(assetId)) continue;
         appendSnapshotObject(objects, {
           objectId: assetId,
           kind: 'externalAsset',
@@ -660,7 +660,7 @@ async function collectSnapshotObjects(selected: string[], env: Env): Promise<Sna
           sha256: digest,
           sessionIds: [sessionId],
         });
-        assetKeys.add(key);
+        assetIds.add(assetId);
       }
     }
   }

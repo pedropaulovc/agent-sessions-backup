@@ -8,7 +8,7 @@ export function parseArguments(args) {
     let sawDeviceLabel = false;
     while (remaining.length) {
       const flag = remaining.shift();
-      if (flag === '--device-label' && remaining.length && !sawDeviceLabel) {
+      if (flag === '--device-label' && hasOptionValue(remaining) && !sawDeviceLabel) {
         sawDeviceLabel = true;
         deviceLabel = remaining.shift();
       } else throw usage();
@@ -24,13 +24,13 @@ export function parseArguments(args) {
     let sawCheckout = false;
     while (remaining.length) {
       const flag = remaining.shift();
-      if (flag === '--session' && remaining.length && !sawSession) {
+      if (flag === '--session' && hasOptionValue(remaining) && !sawSession) {
         sawSession = true;
         sessionId = remaining.shift();
-      } else if (flag === '--target' && remaining.length && !sawTarget) {
+      } else if (flag === '--target' && hasOptionValue(remaining) && !sawTarget) {
         sawTarget = true;
         target = remaining.shift();
-      } else if (flag === '--checkout' && remaining.length && !sawCheckout) {
+      } else if (flag === '--checkout' && hasOptionValue(remaining) && !sawCheckout) {
         sawCheckout = true;
         checkout = resolve(remaining.shift());
       } else throw usage();
@@ -39,6 +39,10 @@ export function parseArguments(args) {
     return { command, sessionId, target, checkout };
   }
   throw usage();
+}
+
+function hasOptionValue(remaining) {
+  return remaining.length > 0 && !remaining[0].startsWith('--');
 }
 
 function usage() {

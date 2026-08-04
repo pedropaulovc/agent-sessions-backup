@@ -60,8 +60,8 @@ export class DebugTransport {
         cancelBody(response);
         throw new Error('ciphertext response has invalid content type');
       }
-      const contentLength = Number(response.headers.get('content-length'));
-      if (Number.isFinite(contentLength) && contentLength !== object.ciphertextSize) {
+      const declaredLength = response.headers.get('content-length');
+      if (declaredLength !== null && Number(declaredLength) !== object.ciphertextSize) {
         cancelBody(response);
         throw new Error('ciphertext content length mismatch');
       }

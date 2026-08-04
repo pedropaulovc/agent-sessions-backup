@@ -33,12 +33,18 @@ jobs:
         working-directory: hub
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 22.22.2
           cache: npm
           cache-dependency-path: hub/package-lock.json
       - run: npm ci
+      - name: Verify migrations against protected base
+        env:
+          MIGRATION_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: node scripts/migrations.mjs check --base-ref "$MIGRATION_BASE_REF"
       - run: npm run typecheck
       - run: npm test
 
@@ -112,8 +118,8 @@ jobs:
   # Requires production-environment secrets PRODUCTION_SCHEMA_BASELINE_ENVELOPE and
   # PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY, created by scripts/approve-production-baseline.mjs
   # through the independent human approval process.
-  # CLOUDFLARE_API_TOKEN needs D1, Workers Scripts, Queues, R2, and KV (Edit), Account Settings
-  # (Read), and Workers Routes (Edit) on vza.net. account_id comes from wrangler.jsonc.
+  # CLOUDFLARE_MIGRATION_TOKEN is D1 Edit only. CLOUDFLARE_DEPLOY_TOKEN has Workers Scripts,
+  # Queues, R2, and KV Edit plus Account Settings Read and Workers Routes Edit on vza.net.
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: hub
@@ -143,7 +149,7 @@ jobs:
           printf '%s' "$PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY" > "$RUNNER_TEMP/production-schema-baseline-public.pem"
       - name: Apply and verify production migrations exactly once
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
         run: |
           set -euo pipefail
           artifact_digest="$(git archive --format=tar HEAD migrations | sha256sum | cut -d ' ' -f 1)"
@@ -160,5 +166,5 @@ jobs:
             --baseline-public-key "$RUNNER_TEMP/production-schema-baseline-public.pem"
       - run: npx wrangler deploy
         env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
 

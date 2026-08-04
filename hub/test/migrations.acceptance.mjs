@@ -147,12 +147,45 @@ test('manifest policy comes only from independent base evidence', async (context
     loadAndValidateManifest({ migrationsDir, manifestPath }),
     /requires independent policy evidence/,
   );
-  const bareCheck = spawnSync(process.execPath, [path.join(hubRoot, 'scripts', 'migrations.mjs'), 'check'], {
+  const cleanEnv = { ...process.env };
+  delete cleanEnv.MIGRATION_BASE_MANIFEST;
+  delete cleanEnv.MIGRATION_BASE_REF;
+  delete cleanEnv.GITHUB_EVENT_PATH;
+  for (const command of ['check', 'check-base']) {
+    const bareCheck = spawnSync(process.execPath, [path.join(hubRoot, 'scripts', 'migrations.mjs'), command], {
+      cwd: hubRoot,
+      encoding: 'utf8',
+      env: cleanEnv,
+    });
+    assert.notEqual(bareCheck.status, 0);
+    assert.match(bareCheck.stderr, /requires independent policy evidence/);
+  }
+
+  const approvalScript = path.join(hubRoot, 'scripts', 'approve-production-baseline.mjs');
+  const approvalArguments = [
+    approvalScript,
+    'measure',
+    '--output', path.join(os.tmpdir(), 'unused-production-baseline-measurement.json'),
+    '--config', path.join(hubRoot, 'wrangler.jsonc'),
+  ];
+  const bareApproval = spawnSync(process.execPath, approvalArguments, {
     cwd: hubRoot,
     encoding: 'utf8',
+    env: cleanEnv,
   });
-  assert.notEqual(bareCheck.status, 0);
-  assert.match(bareCheck.stderr, /requires independent policy evidence/);
+  assert.notEqual(bareApproval.status, 0);
+  assert.match(bareApproval.stderr, /requires an externally trusted --base-manifest or protected --base-ref/);
+
+  const worktreeApproval = spawnSync(process.execPath, [
+    ...approvalArguments,
+    '--base-manifest', sourceBaselinePath,
+  ], {
+    cwd: hubRoot,
+    encoding: 'utf8',
+    env: cleanEnv,
+  });
+  assert.notEqual(worktreeApproval.status, 0);
+  assert.match(worktreeApproval.stderr, /outside the active worktree/);
 
   const directory = await mkdtemp(path.join(os.tmpdir(), 'hub-policy-'));
   context.after(() => rm(directory, { recursive: true, force: true }));

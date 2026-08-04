@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { rmSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises';
 import os from 'node:os';
@@ -42,8 +43,9 @@ test('a dead orchestrator lock cannot be stolen while its exact Wrangler child i
   const persisted = JSON.parse(await readFile(path.join(stateDir, '.owner.lock', 'owner.json'), 'utf8'));
   assert.equal(persisted.nonce, 'first');
 });
-test('PID reuse with a different start identity does not pin a stale environment', async (t) => {
+test('stale runtime cleanup allows three successive owner generations', async (t) => {
   const stateDir = await temporaryState(t);
+  const runtimePath = path.join(stateDir, 'runtime.json');
   const firstOwner = await acquireOwnership(stateDir, 'old-generation', {
     inspectProcess: (pid) => pid === process.pid ? 'old-owner-start' : null,
   });
@@ -54,6 +56,45 @@ test('PID reuse with a different start identity does not pin a stale environment
   });
   assert.equal(replacement.nonce, 'new-generation');
   assert.equal(replacement.processStartIdentity, 'new-owner-start');
+  await assert.rejects(readFile(runtimePath), { code: 'ENOENT' });
+
+  const thirdOwner = await acquireOwnership(stateDir, 'third-generation', {
+    inspectProcess: (pid) => pid === process.pid ? 'third-owner-start' : null,
+  });
+  assert.equal(thirdOwner.nonce, 'third-generation');
+  assert.equal(thirdOwner.processStartIdentity, 'third-owner-start');
+});
+
+test('lock removal during the ownerless recency check retries acquisition', async (t) => {
+  const stateDir = await temporaryState(t);
+  const lockDir = path.join(stateDir, '.owner.lock');
+  const runtimePath = path.join(stateDir, 'runtime.json');
+  const firstOwner = await acquireOwnership(stateDir, 'old-generation', {
+    inspectProcess: (pid) => pid === process.pid ? 'old-owner-start' : null,
+  });
+  await recordRuntime(stateDir, firstOwner, 424244, () => 'old-child-start');
+  await rm(lockDir, { recursive: true, force: false });
+  await mkdir(lockDir);
+
+  let removedDuringInspection = false;
+  const replacement = await acquireOwnership(stateDir, 'replacement', {
+    inspectProcess: (pid) => {
+      if (pid === 424244) {
+        if (!removedDuringInspection) {
+          rmSync(lockDir, { recursive: true, force: false });
+          removedDuringInspection = true;
+        }
+        return null;
+      }
+      return pid === process.pid ? 'replacement-owner-start' : null;
+    },
+  });
+
+  assert.equal(removedDuringInspection, true);
+  assert.equal(replacement.nonce, 'replacement');
+  const persisted = JSON.parse(await readFile(path.join(lockDir, 'owner.json'), 'utf8'));
+  assert.equal(persisted.nonce, 'replacement');
+  await assert.rejects(readFile(runtimePath), { code: 'ENOENT' });
 });
 
 

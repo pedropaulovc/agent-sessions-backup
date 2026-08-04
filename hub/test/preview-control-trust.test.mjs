@@ -9,6 +9,7 @@ import {
   generatedBuildConfig,
   generatedPrivateAppConfig,
   generatedTrustedWrapperConfig,
+  inventoryGenerations,
   migrationArtifactSqlNames,
   resourceNames,
 } from '../../infra/cf/preview-trust.mjs';
@@ -100,6 +101,11 @@ describe('trusted migration packaging', () => {
       '0001_init.sql',
       'attacker.json',
     ])).toThrow(/unexpected migration entry/);
+    expect(() => migrationArtifactSqlNames([
+      'manifest.json',
+      '0001_init.sql',
+      'constructor',
+    ])).toThrow(/unexpected migration entry/);
   });
 });
 
@@ -119,6 +125,10 @@ describe('trusted preview resource ownership', () => {
     const planned = { kind: 'app-worker', id: null, name: resourceNames(42, 123, SHA).app, generation: GENERATION };
     expect(() => assertInventoryItem(planned, 42, GENERATION)).toThrow(/id is required/);
     expect(assertInventoryItem(planned, 42, GENERATION, { allowMissingId: true })).toBe(planned);
+    expect(() => assertInventoryItem({
+      ...planned,
+      kind: 'constructor',
+    }, 42, GENERATION, { allowMissingId: true })).toThrow(/unsupported inventory kind/);
     expect(() => assertInventoryItem({ ...planned, name: 'sessions-hub' }, 42, GENERATION, {
       allowMissingId: true,
     })).toThrow(/foreign generation inventory/);
@@ -129,6 +139,18 @@ describe('trusted preview resource ownership', () => {
       ...planned,
       name: 'pr-42-g124-bbbbbbbbbbbb-app',
     }, 42, GENERATION, { allowMissingId: true })).toThrow(/foreign generation inventory/);
+  });
+
+  it('ignores malformed janitor inventory entries without losing valid generations', () => {
+    expect([...inventoryGenerations([
+      null,
+      undefined,
+      'invalid',
+      [],
+      {},
+      { generation: 'invalid' },
+      { generation: GENERATION },
+    ])]).toEqual([GENERATION]);
   });
 
   it('keeps the prior live Worker generation disjoint from candidate rollback inventory', () => {

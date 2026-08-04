@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { generateKeyPairSync, sign } from 'node:crypto';
 import { createConnection } from 'node:net';
 import { once } from 'node:events';
 import { lstat, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -12,6 +13,7 @@ import { StateStore } from '../src/state.mjs';
 import { parseArguments } from '../src/cli-arguments.mjs';
 import { validateProductionManifestKeys } from '../src/production-keys.mjs';
 import { SnapshotVerifier } from '../src/snapshot.mjs';
+import { canonicalBytes } from '../src/canonical.mjs';
 
 const digest = (character) => character.repeat(64);
 const release = Object.freeze({ digest: digest('a') });
@@ -156,7 +158,53 @@ test('CLI flags are single-use even when checkout resolves to the default', () =
   assert.throws(() => parseArguments(['pull', '--session', 's', '--target', 'local', '--target', 'pr-84']), /usage:/);
 });
 
+test('CLI option flags cannot be consumed as option values', () => {
+  const cases = [
+    ['enroll', '--device-label', '--session'],
+    ['pull', '--session', '--target', 'local'],
+    ['pull', '--session', 'session-1', '--target', '--checkout', '.'],
+    ['pull', '--session', 'session-1', '--target', 'local', '--checkout', '--other'],
+  ];
+  for (const args of cases) assert.throws(() => parseArguments(args), /usage:/);
+});
+
 test('empty production verifier key sets fail closed', () => {
   assert.throws(() => validateProductionManifestKeys({ keys: [] }), /no protected production manifest verification keys/);
   assert.throws(() => new SnapshotVerifier([]), /no protected production manifest verification keys/);
+});
+
+test('revoked production verifier keys fail closed', () => {
+  const revokedPair = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  const revoked = { ...revokedPair.publicKey.export({ format: 'jwk' }), revoked: true };
+  const active = { ...generateKeyPairSync('ec', { namedCurve: 'P-256' }).publicKey.export({ format: 'jwk' }), revoked: false };
+  const now = Date.parse('2026-08-03T12:00:00.000Z');
+  const unsigned = {
+    format: 1,
+    sessionIds: ['session-1'],
+    inventoryDigest: digest('a'),
+    totalSize: 0,
+    objectCount: 1,
+    expiresAt: now + 60_000,
+    objects: [{}],
+  };
+  const manifest = {
+    ...unsigned,
+    signature: {
+      alg: 'ES256',
+      value: sign('sha256', canonicalBytes(unsigned), { key: revokedPair.privateKey, dsaEncoding: 'ieee-p1363' }).toString('base64url'),
+    },
+  };
+
+  assert.throws(() => validateProductionManifestKeys({ keys: [revoked] }), /no protected production manifest verification keys/);
+  const validated = validateProductionManifestKeys({ keys: [revoked, active] });
+  assert.deepEqual(validated.keys, [active]);
+  assert.throws(
+    () => new SnapshotVerifier(validated.keys, () => now).verifyManifest(manifest, {
+      sessionId: 'session-1',
+      inventoryDigest: digest('a'),
+      totalSize: 0,
+      objectCount: 1,
+    }),
+    /invalid snapshot manifest signature/,
+  );
 });

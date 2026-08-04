@@ -1,17 +1,19 @@
 #!/usr/bin/env node
 import { generateKeyPairSync, sign } from 'node:crypto';
-import { chmod, mkdir, open, readFile } from 'node:fs/promises';
+import { chmod, mkdir, open, readFile, realpath } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   canonicalJson,
   loadAndValidateManifest,
+  migrationManifestAtRef,
   sha256,
   validateHistoricalBaseline,
 } from './lib/migration-manifest.mjs';
 import { measureRemoteSchemaDigest } from './lib/migration-runner.mjs';
 
 const hubRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const repositoryRoot = path.resolve(hubRoot, '..');
 const DIGEST = /^[0-9a-f]{64}$/;
 
 function parseArguments(argv) {
@@ -49,15 +51,45 @@ async function writeNewFile(filePath, bytes, mode) {
   await chmod(filePath, mode);
 }
 
+async function assertExternalBaseArtifact(baseManifestPath) {
+  const [artifact, repository] = await Promise.all([
+    realpath(baseManifestPath),
+    realpath(repositoryRoot),
+  ]);
+  const relative = path.relative(repository, artifact);
+  if (relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))) {
+    throw new Error('--base-manifest must be an externally trusted artifact outside the active worktree');
+  }
+}
+
 async function trustedAnchors(options) {
   const migrationsDir = resolveOption(options['migrations-dir'] ?? path.join(hubRoot, 'migrations'));
   const manifestPath = resolveOption(options.manifest ?? path.join(migrationsDir, 'manifest.json'));
-  const baseManifestPath = resolveOption(options['base-manifest'] ?? path.join(migrationsDir, 'source-baseline.json'));
+  const baseManifestOption = options['base-manifest'];
+  const baseRef = options['base-ref'];
+  if (baseManifestOption && baseRef) {
+    throw new Error('--base-manifest and --base-ref are mutually exclusive');
+  }
+  if (!baseManifestOption && !baseRef) {
+    throw new Error('production baseline approval requires an externally trusted --base-manifest or protected --base-ref');
+  }
+  let baseManifestPath;
+  let trustedBaseManifest;
+  if (baseManifestOption) {
+    baseManifestPath = resolveOption(baseManifestOption);
+    await assertExternalBaseArtifact(baseManifestPath);
+  } else {
+    if (!/^[0-9a-f]{40}$/.test(baseRef)) {
+      throw new Error('--base-ref must be a full protected commit SHA');
+    }
+    trustedBaseManifest = migrationManifestAtRef({ ref: baseRef, repositoryRoot });
+  }
   const historyPath = resolveOption(options.history ?? path.join(migrationsDir, 'historical-baseline.json'));
   const { manifest, digest: migrationDigest } = await loadAndValidateManifest({
     migrationsDir,
     manifestPath,
     baseManifestPath,
+    trustedBaseManifest,
   });
   const history = JSON.parse(await readFile(historyPath, 'utf8'));
   validateHistoricalBaseline(history, manifest);

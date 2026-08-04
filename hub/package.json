@@ -16,7 +16,7 @@
     "test:e2e": "playwright test",
     "test:dev-lifecycle": "node --test test/dev-lifecycle.test.mjs",
     "test:preview-open": "node --test test/preview-open.test.mjs",
-    "test:migrations": "node scripts/migrations.mjs check-base && node --test test/migrations.acceptance.mjs",
+    "test:migrations": "node --test test/migrations.acceptance.mjs",
     "migrations": "node scripts/migrations.mjs",
     "production-baseline": "node scripts/approve-production-baseline.mjs"
   },
