@@ -36,6 +36,19 @@ test.describe('synthetic sessions viewer', () => {
     await expect(page.locator(anchor)).toContainText(fixture.searchPhrase);
   });
 
+  test('finds the pager seed through the remote smoke marker', async ({ page, appURL }) => {
+    await page.goto(appURL('/'));
+    await page.getByRole('searchbox').fill(fixture.pagerSearchPhrase);
+    await page.getByRole('button', { name: 'Search' }).click();
+
+    await expect(page).toHaveURL((url) => url.searchParams.get('q') === fixture.pagerSearchPhrase);
+    await expect(page.locator('.snip').first()).toContainText(fixture.pagerSearchPhrase);
+    const result = page.locator('.search-results .title a', { hasText: fixture.pagerTitle }).first();
+    await expect(result).toBeVisible();
+    await result.click();
+    await expect(page).toHaveURL((url) => url.pathname === `/s/${fixture.pagerSessionId}`);
+  });
+
   test('preserves filters and pagination through navigation history', async ({ page, appURL }) => {
     await page.goto(appURL('/?limit=1'));
     await page.getByRole('link', { name: fixture.machineId, exact: true }).click();
