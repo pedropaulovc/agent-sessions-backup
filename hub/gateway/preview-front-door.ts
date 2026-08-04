@@ -362,7 +362,26 @@ export function rollbackLive(current: PreviewState, input: CasInput): Transition
   return { ok: true, state: { ...current, live: current.rollback, rollback: current.live } };
 }
 
-export function closePreview(current: PreviewState, input: CloseInput, now = Date.now()): TransitionResult {
+export function closePreview(current: PreviewState | undefined, input: CloseInput, now = Date.now()): TransitionResult {
+  if (!current) {
+    if (input.epoch !== 1 || !validHead(input.head)) {
+      return { ok: false, status: 409, reason: 'invalid_initial_close' };
+    }
+    return {
+      ok: true,
+      state: {
+        lifecycle: 'closed',
+        epoch: 2,
+        expectedHead: input.head,
+        live: null,
+        rollback: null,
+        candidates: {},
+        deletionInventory: [],
+        closedAt: now,
+      },
+      inventory: [],
+    };
+  }
   const guard = openCas(current, input.epoch, input.head);
   if (guard) return guard;
   const inventory = [current.live, current.rollback, ...Object.values(current.candidates)].filter((tuple): tuple is RouteTuple => !!tuple);
@@ -579,7 +598,7 @@ export class PreviewEdgeAuth {
     let next: PreviewState | undefined;
     const response = await this.state.storage.transaction(async (tx) => {
       const current = await tx.get<PreviewState>('route');
-      if (!current && fn !== registerCandidate) return json({ error: 'not_found' }, 404);
+      if (!current && fn !== registerCandidate && fn !== closePreview) return json({ error: 'not_found' }, 404);
       const result = fn(current as never, body as never);
       if (!result.ok) return json({ error: result.reason }, result.status);
       next = result.state;
