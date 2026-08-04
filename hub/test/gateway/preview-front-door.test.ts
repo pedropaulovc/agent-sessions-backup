@@ -70,8 +70,9 @@ function promoted(generation = 'g1-aaaaaaaaaaaa'): PreviewState {
   return result.state;
 }
 
-function destinationLifecycleHarness() {
-  const data = new Map<string, unknown>([['route', promoted()]]);
+function destinationLifecycleHarness(initialRoute: PreviewState | null = promoted()) {
+  const data = new Map<string, unknown>();
+  if (initialRoute) data.set('route', initialRoute);
   let alarmAt: number | null = null;
   const storage = {
     get: async <T>(key: string) => data.get(key) as T | undefined,
@@ -321,6 +322,31 @@ describe('preview routing CAS', () => {
     const next = registerCandidate(live, candidate('g10-bbbbbbbbbbbb'));
     if (!next.ok) throw new Error(next.reason);
     expect(promoteCandidate(smoked(next.state, 'g10-bbbbbbbbbbbb'), { pr: 42, epoch: 1, head: HEAD_A, generation: 'g10-bbbbbbbbbbbb', priorLiveGeneration: null })).toMatchObject({ ok: false, reason: 'live_changed' });
+  });
+
+  it('tombstones a never-provisioned PR and blocks later registration', async () => {
+    const { object, post } = destinationLifecycleHarness(null);
+    const response = await post('close', { pr: 42, epoch: 1, head: HEAD_A });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toMatchObject({
+      state: {
+        lifecycle: 'closed',
+        epoch: 2,
+        expectedHead: HEAD_A,
+        live: null,
+        rollback: null,
+        candidates: {},
+        deletionInventory: [],
+        closedAt: expect.any(Number),
+      },
+      inventory: [],
+    });
+    const stored = await object.fetch(new Request('https://edge.internal/state'));
+    expect(stored.status).toBe(200);
+    const tombstone = await stored.json() as PreviewState;
+    expect(tombstone).toMatchObject({ lifecycle: 'closed', expectedHead: HEAD_A });
+    expect(registerCandidate(tombstone, candidate('g2-bbbbbbbbbbbb')))
+      .toMatchObject({ ok: false, status: 410, reason: 'closed' });
   });
 
   it('makes close win when it commits before promotion', () => {
