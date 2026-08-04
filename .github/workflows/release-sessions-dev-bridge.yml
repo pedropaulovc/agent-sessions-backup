@@ -35,6 +35,8 @@ jobs:
         run: npm run release:provenance
         env:
           DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK: ${{ vars.DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK }}
+      - name: Verify protected production manifest keys are packaged
+        run: npm run release:verify
       - name: Pack the standalone client without lifecycle code
         run: npm pack --ignore-scripts
       - name: Upload the signed standalone package

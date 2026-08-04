@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, createPublicKey } from 'node:crypto';
 import { lstat, readFile, realpath, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -74,13 +74,20 @@ export function repositoryName(value) {
   return value;
 }
 
+export function assertTrustedWorkflowRef(repository, workflowRef) {
+  const expected = `${repositoryName(repository)}/.github/workflows/preview-control.yml@refs/heads/main`;
+  if (workflowRef !== expected) fail('build must run from the trusted default-branch preview-control workflow');
+  return workflowRef;
+}
+
 export function resourceNames(pr, runId, sha) {
   const prefix = `pr-${positiveInteger(pr, 'PR number')}-`;
   const generation = `g${positiveInteger(runId, 'run ID')}-${headSha(sha).slice(0, 12)}`;
   const names = {
     prefix,
     generation,
-    worker: `${prefix}sessions-hub`,
+    app: `${prefix}${generation}-app`,
+    edge: `${prefix}${generation}-edge`,
     d1: `${prefix}${generation}-sessions-index`,
     r2: `${prefix}${generation}-agent-sessions`,
     kv: `${prefix}${generation}-sessions-hub-kv`,
@@ -144,14 +151,31 @@ export function assertNoProductionIdentifiers(value, at = '$') {
   }
 }
 
+export function migrationArtifactSqlNames(entries) {
+  if (!Array.isArray(entries) || !entries.includes('manifest.json')) {
+    fail('preview artifact has no migration manifest');
+  }
+  const trustedMetadata = {
+    'historical-baseline.json': true,
+    'source-baseline.json': true,
+  };
+  const sql = [];
+  for (const name of entries) {
+    if (/^[0-9]{4}_[a-z0-9_]+\.sql$/.test(name)) sql.push(name);
+    else if (name !== 'manifest.json' && !trustedMetadata[name]) fail(`unexpected migration entry: ${name}`);
+  }
+  if (sql.length === 0) fail('preview artifact has no numbered SQL migrations');
+  return sql.sort();
+}
+
 export function generatedBuildConfig({ main, workerName }) {
   const config = {
     name: workerName,
     main,
     compatibility_date: '2026-07-01',
     compatibility_flags: ['nodejs_compat'],
-    preview_urls: true,
-    workers_dev: true,
+    preview_urls: false,
+    workers_dev: false,
     routes: [],
     exports: {},
   };
@@ -180,7 +204,37 @@ function publicJwks(raw, name) {
   return stableJson(parsed);
 }
 
-export function generatedUploadConfig({ accountId, main, migrationsDir, names, resources, assertions }) {
+function publicDebugJwk(raw, name) {
+  let parsed;
+  try {
+    parsed = JSON.parse(required(raw, name));
+  } catch {
+    fail(`${name} must be valid JSON`);
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
+    || parsed.kty !== 'EC' || parsed.crv !== 'P-256'
+    || parsed.alg !== 'ES256' || parsed.use !== 'sig'
+    || !Array.isArray(parsed.key_ops) || parsed.key_ops.length !== 1 || parsed.key_ops[0] !== 'verify'
+    || !/^[A-Za-z0-9_-]{43}$/.test(parsed.x ?? '')
+    || !/^[A-Za-z0-9_-]{43}$/.test(parsed.y ?? '')
+    || parsed.revoked !== false) {
+    fail(`${name} must be a non-revoked ES256 public verification JWK`);
+  }
+  for (const privateField of ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k']) {
+    if (Object.hasOwn(parsed, privateField)) fail(`${name} contains private key material`);
+  }
+  try {
+    createPublicKey({ key: parsed, format: 'jwk' });
+  } catch {
+    fail(`${name} contains an invalid P-256 public key`);
+  }
+  return stableJson(parsed);
+}
+
+
+export function generatedPrivateAppConfig({
+  accountId, main, migrationsDir, names, resources, assertions, application,
+}) {
   assertPreviewAccount(accountId);
   const issuer = new URL(required(assertions?.issuer, 'preview assertion issuer'));
   if (issuer.protocol !== 'https:') fail('preview assertion issuer must use HTTPS');
@@ -198,14 +252,25 @@ export function generatedUploadConfig({ accountId, main, migrationsDir, names, r
     if (!/^[0-9a-f]{64}$/.test(digest ?? '')) fail(`generated preview config has an invalid ${name}`);
   }
   const originJwks = publicJwks(assertions?.originJwks, 'preview origin assertion JWKS');
+  if (!/^[A-Za-z0-9_-]{43}$/.test(application?.assetSigningSecret ?? '')) {
+    fail('preview asset signing secret must be 32 random bytes encoded as base64url');
+  }
+  const debugImportAssertionPublicJwk = publicDebugJwk(
+    application?.debugImportAssertionPublicJwk,
+    'DEBUG_IMPORT_ASSERTION_PUBLIC_JWK',
+  );
+  const debugExportManifestVerifyPublicJwk = publicDebugJwk(
+    application?.debugExportManifestVerifyPublicJwk,
+    'DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK',
+  );
   const config = {
-    name: names.worker,
+    name: names.app,
     account_id: accountId,
     main,
     compatibility_date: '2026-07-01',
     compatibility_flags: ['nodejs_compat'],
-    preview_urls: true,
-    workers_dev: true,
+    preview_urls: false,
+    workers_dev: false,
     routes: [],
     exports: {},
     vars: {
@@ -227,6 +292,9 @@ export function generatedUploadConfig({ accountId, main, migrationsDir, names, r
       PREVIEW_BROWSER_ASSERTION_JWKS: browserJwks,
       PREVIEW_ACTION_ASSERTION_JWKS: actionJwks,
       PREVIEW_ORIGIN_ASSERTION_JWKS: originJwks,
+      ASSET_SIGNING_SECRET: application.assetSigningSecret,
+      DEBUG_IMPORT_ASSERTION_PUBLIC_JWK: debugImportAssertionPublicJwk,
+      DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK: debugExportManifestVerifyPublicJwk,
     },
     d1_databases: [{
       binding: 'DB',
@@ -247,6 +315,25 @@ export function generatedUploadConfig({ accountId, main, migrationsDir, names, r
         dead_letter_queue: names.dlq,
       }],
     },
+  };
+  assertNoProductionIdentifiers(config);
+  return config;
+}
+
+export function generatedTrustedWrapperConfig({ accountId, main, names, originJwks }) {
+  assertPreviewAccount(accountId);
+  const config = {
+    name: names.edge,
+    account_id: accountId,
+    main,
+    compatibility_date: '2026-07-01',
+    preview_urls: true,
+    workers_dev: false,
+    routes: [],
+    vars: {
+      PREVIEW_ORIGIN_ASSERTION_JWKS: publicJwks(originJwks, 'preview origin assertion JWKS'),
+    },
+    services: [{ binding: 'APP', service: names.app }],
   };
   assertNoProductionIdentifiers(config);
   return config;
@@ -285,16 +372,19 @@ export function acknowledgedResources(deleted) {
 
 export function assertInventoryItem(item, pr, knownGeneration, { allowMissingId = false } = {}) {
   if (!item || typeof item !== 'object' || Array.isArray(item)) fail('inventory item must be an object');
-  const allowedKinds = new Set(['d1', 'r2', 'kv', 'queue', 'worker-version', 'worker']);
-  if (!allowedKinds.has(item.kind)) fail(`unsupported inventory kind: ${item.kind}`);
-  const prefix = `pr-${positiveInteger(pr, 'PR number')}-`;
+  const allowedKinds = {
+    d1: true, r2: true, kv: true, queue: true,
+    'app-version': true, 'app-worker': true, 'edge-version': true, 'edge-worker': true,
+  };
+  if (!allowedKinds[item.kind]) fail(`unsupported inventory kind: ${item.kind}`);
+  const prefix = `pr-${positiveInteger(pr, 'PR number')}-${knownGeneration}-`;
   if (item.id == null) {
     if (!allowMissingId) fail('inventory id is required');
   } else {
     required(item.id, 'inventory id');
   }
   const name = required(item.name, 'inventory name');
-  if (!name.startsWith(prefix)) fail(`foreign inventory name rejected: ${name}`);
+  if (!name.startsWith(prefix)) fail(`foreign generation inventory name rejected: ${name}`);
   if (item.pr != null && item.pr !== Number(pr)) fail(`inventory PR mismatch for ${name}`);
   if (item.generation !== knownGeneration) fail(`inventory generation mismatch for ${name}`);
   assertNoProductionIdentifiers(item);

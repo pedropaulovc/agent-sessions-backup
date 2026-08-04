@@ -260,7 +260,7 @@ def test_store_roots_always_includes_webcapture_stores(tmp_path):
         assert name in roots
     # A custom configured root still wins over the injected default (setdefault semantics).
     custom = config.Config(machine_id="m", hub_url="http://h", stores={"export-inbox": "/custom/inbox"})
-    assert str(custom.store_roots()["export-inbox"]) == "/custom/inbox"
+    assert custom.store_roots()["export-inbox"] == Path("/custom/inbox")
 
 
 def test_store_roots_injects_omp_for_persisted_config_and_preserves_custom_root(
@@ -268,6 +268,7 @@ def test_store_roots_injects_omp_for_persisted_config_and_preserves_custom_root(
 ):
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
 
     persisted = config.Config(
         machine_id="m",
@@ -368,6 +369,7 @@ def test_wsl_drops_windows_mount_roots(monkeypatch):
 def test_wsl_drops_injected_omp_root_for_persisted_config(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "detect_platform_tag", lambda: "wsl")
     monkeypatch.setenv("HOME", "/mnt/c/Users/legacy")
+    monkeypatch.setenv("USERPROFILE", "/mnt/c/Users/legacy")
     cfg = config.Config(
         machine_id="m",
         hub_url="http://h",

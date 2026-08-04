@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
@@ -13,10 +14,12 @@ import {
   canonicalMigrationBytes,
   loadAndValidateManifest,
   migrationDigest,
+  sha256,
   validateHistoricalBaseline,
   validateManifestShape,
   verifySignedReleaseManifest,
 } from '../scripts/lib/migration-manifest.mjs';
+import { runMigrations } from '../scripts/lib/migration-runner.mjs';
 import {
   AmbiguousJournalError,
   openMigrationJournal,
@@ -80,6 +83,54 @@ function representativeUsage(database) {
   `).run();
 }
 
+function createWranglerProcess(
+  fixture,
+  snapshot,
+  initialAppliedCount = fixture.manifest.migrations.length,
+  beforeSnapshot = snapshot,
+) {
+  const state = { applyCalls: 0, appliedReads: 0, appliedCount: initialAppliedCount };
+  const applied = fixture.manifest.migrations.map(({ filename }) => ({ name: filename }));
+  const ledger = fixture.manifest.migrations
+    .filter((migration) => migration.sequence >= fixture.manifest.ledgerStartsAt)
+    .map(({ sequence, filename, sha256: checksum }) => ({ sequence, filename, sha256: checksum }));
+  return {
+    state,
+    runProcess: async (args) => {
+      if (args[0] === 'd1' && args[1] === 'migrations' && args[2] === 'apply') {
+        state.applyCalls += 1;
+        state.appliedCount = applied.length;
+        return { stdout: '', stderr: '' };
+      }
+      const commandIndex = args.indexOf('--command');
+      assert.notEqual(commandIndex, -1, `unexpected Wrangler invocation: ${args.join(' ')}`);
+      const sql = args[commandIndex + 1];
+      const activeSnapshot = state.applyCalls === 0 ? beforeSnapshot : snapshot;
+      let rows;
+      if (sql.includes('SELECT name FROM d1_migrations')) {
+        state.appliedReads += 1;
+        rows = applied.slice(0, state.appliedCount);
+      } else if (sql.includes('INSERT OR IGNORE INTO migration_checksum_ledger')) {
+        const sequence = Number(/VALUES\s*\(\s*(\d+)/s.exec(sql)?.[1]);
+        rows = [{ sequence }];
+      } else if (sql.includes('SELECT sequence, filename, sha256 FROM migration_checksum_ledger')) {
+        rows = ledger;
+      } else if (sql.includes('SELECT type, name, tbl_name, sql FROM sqlite_master')) {
+        rows = activeSnapshot.objects;
+      } else if (sql.includes('pragma_table_xinfo')) {
+        rows = activeSnapshot.tableColumns;
+      } else if (sql.includes('pragma_index_list')) {
+        rows = activeSnapshot.indexes;
+      } else if (sql.includes('pragma_foreign_key_list')) {
+        rows = activeSnapshot.foreignKeys;
+      } else {
+        assert.fail(`unexpected migration verification query: ${sql}`);
+      }
+      return { stdout: JSON.stringify([{ results: rows }]), stderr: '' };
+    },
+  };
+}
+
 test('the checked-in manifest exactly matches canonical migration names, order, and bytes', async () => {
   const { manifest, digest } = await loadAndValidateManifest({
     migrationsDir,
@@ -89,6 +140,34 @@ test('the checked-in manifest exactly matches canonical migration names, order, 
   assert.equal(digest, migrationDigest(manifest));
   assert.deepEqual(manifest.reservedSequences, [4]);
   assert.equal(manifest.ledgerStartsAt, 21);
+});
+
+test('manifest policy comes only from independent base evidence', async (context) => {
+  await assert.rejects(
+    loadAndValidateManifest({ migrationsDir, manifestPath }),
+    /requires independent policy evidence/,
+  );
+  const bareCheck = spawnSync(process.execPath, [path.join(hubRoot, 'scripts', 'migrations.mjs'), 'check'], {
+    cwd: hubRoot,
+    encoding: 'utf8',
+  });
+  assert.notEqual(bareCheck.status, 0);
+  assert.match(bareCheck.stderr, /requires independent policy evidence/);
+
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hub-policy-'));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  await cp(migrationsDir, directory, { recursive: true });
+  const candidate = JSON.parse(await readFile(path.join(directory, 'manifest.json'), 'utf8'));
+  candidate.ledgerStartsAt += 1;
+  await writeFile(path.join(directory, 'manifest.json'), `${JSON.stringify(candidate, null, 2)}\n`);
+  await assert.rejects(
+    loadAndValidateManifest({
+      migrationsDir: directory,
+      manifestPath: path.join(directory, 'manifest.json'),
+      baseManifestPath: sourceBaselinePath,
+    }),
+    /manifest metadata mismatch/,
+  );
 });
 
 test('manifest validation rejects edited, reordered, duplicate, and non-appended migrations', async (context) => {
@@ -223,6 +302,138 @@ test('0020 repairs rows created by the historically nullable 0019 source shape',
   } finally {
     database.close();
   }
+});
+
+test('migration runner applies once, measures verify state, and requires signed production history evidence', async (context) => {
+  const fixture = await loadFixture();
+  const database = createDatabase();
+  applyPending(database, fixture);
+  const snapshot = schemaSnapshotFromDatabase(database);
+  database.close();
+  const baselineDatabase = createDatabase();
+  applyPending(baselineDatabase, fixture, fixture.manifest.ledgerStartsAt - 1);
+  const baselineSnapshot = schemaSnapshotFromDatabase(baselineDatabase);
+  baselineDatabase.close();
+
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hub-runner-'));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const localWrangler = createWranglerProcess(fixture, snapshot);
+  const localResult = await runMigrations({
+    target: 'local',
+    persistTo: directory,
+    journalPath: path.join(directory, 'local.json'),
+    artifactDigest,
+    deploymentId: 'local:acceptance',
+    migrationsDir,
+    manifestPath,
+    baseManifestPath: sourceBaselinePath,
+    historyPath,
+    runProcess: localWrangler.runProcess,
+  });
+  assert.equal(localWrangler.state.applyCalls, 1, 'the runner must invoke Wrangler apply exactly once');
+  assert.equal(localWrangler.state.appliedReads, 2, 'pending state must be read again during final verification');
+  assert.equal(localResult.pendingMigrations, 0);
+
+  const productionBase = {
+    target: 'production',
+    config: path.join(hubRoot, 'wrangler.jsonc'),
+    database: 'sessions-index',
+    artifactDigest: 'b'.repeat(64),
+    deploymentId: 'production:acceptance',
+    migrationsDir,
+    manifestPath,
+    baseManifestPath: sourceBaselinePath,
+    historyPath,
+  };
+  await assert.rejects(
+    runMigrations({ ...productionBase, journalPath: path.join(directory, 'missing-baseline.json') }),
+    /separately signed, human-approved historical baseline/,
+  );
+
+  const history = JSON.parse(await readFile(historyPath, 'utf8'));
+  const payload = {
+    kind: 'production-schema-baseline',
+    approved: true,
+    throughSequence: fixture.manifest.ledgerStartsAt - 1,
+    migrationDigest: migrationDigest(fixture.manifest),
+    historicalBaselineDigest: sha256(`${canonicalJson(history)}\n`),
+    schemaDigest: schemaDigest(baselineSnapshot),
+    approvedBy: 'migration-approver@example.com',
+    measuredAt: '2026-08-03T00:00:00.000Z',
+    reason: 'Reviewed against the measured production schema.',
+    approvedAt: '2026-08-03T00:00:00.000Z',
+  };
+  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
+  const envelope = {
+    formatVersion: 1,
+    payload,
+    signature: sign(null, Buffer.from(`${canonicalJson(payload)}\n`), privateKey).toString('base64'),
+  };
+  const baselinePath = path.join(directory, 'production-baseline.json');
+  await writeFile(baselinePath, `${JSON.stringify(envelope)}\n`);
+
+  const forged = structuredClone(envelope);
+  forged.payload.schemaDigest = 'f'.repeat(64);
+  const forgedPath = path.join(directory, 'forged-baseline.json');
+  await writeFile(forgedPath, `${JSON.stringify(forged)}\n`);
+  await assert.rejects(
+    runMigrations({
+      ...productionBase,
+      journalPath: path.join(directory, 'forged.json'),
+      baselinePath: forgedPath,
+      baselinePublicKey: publicKey,
+    }),
+    /signature is invalid/,
+  );
+
+  const preLedgerCount = fixture.manifest.migrations
+    .filter((migration) => migration.sequence < fixture.manifest.ledgerStartsAt).length;
+  const wrongSchemaPayload = { ...payload, schemaDigest: 'e'.repeat(64) };
+  const wrongSchemaEnvelope = {
+    formatVersion: 1,
+    payload: wrongSchemaPayload,
+    signature: sign(null, Buffer.from(`${canonicalJson(wrongSchemaPayload)}\n`), privateKey).toString('base64'),
+  };
+  const wrongSchemaPath = path.join(directory, 'wrong-schema-baseline.json');
+  await writeFile(wrongSchemaPath, `${JSON.stringify(wrongSchemaEnvelope)}\n`);
+  const blockedWrangler = createWranglerProcess(fixture, snapshot, preLedgerCount, baselineSnapshot);
+  await assert.rejects(
+    runMigrations({
+      ...productionBase,
+      journalPath: path.join(directory, 'wrong-schema.json'),
+      baselinePath: wrongSchemaPath,
+      baselinePublicKey: publicKey,
+      runProcess: blockedWrangler.runProcess,
+    }),
+    /does not match the signed human-approved baseline before migration/,
+  );
+  assert.equal(blockedWrangler.state.applyCalls, 0);
+
+  const productionWrangler = createWranglerProcess(fixture, snapshot, preLedgerCount, baselineSnapshot);
+  const productionResult = await runMigrations({
+    ...productionBase,
+    journalPath: path.join(directory, 'production.json'),
+    baselinePath,
+    baselinePublicKey: publicKey,
+    runProcess: productionWrangler.runProcess,
+  });
+  assert.equal(productionWrangler.state.applyCalls, 1);
+  assert.equal(productionResult.pendingMigrations, 0);
+
+  const alteredHistory = structuredClone(history);
+  alteredHistory.deploymentHistory.reason += ' altered';
+  const alteredHistoryPath = path.join(directory, 'altered-history.json');
+  await writeFile(alteredHistoryPath, `${JSON.stringify(alteredHistory)}\n`);
+  await assert.rejects(
+    runMigrations({
+      ...productionBase,
+      historyPath: alteredHistoryPath,
+      journalPath: path.join(directory, 'altered-history-journal.json'),
+      baselinePath,
+      baselinePublicKey: publicKey,
+    }),
+    /incomplete or not explicitly human-approved/,
+  );
 });
 
 test('signed release manifests bind the exact canonical ordered manifest', async () => {

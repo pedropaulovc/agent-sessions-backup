@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { lstat, mkdir, readFile, realpath, rm, writeFile } from 'node:fs/promises';
 import { basename, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { HUB_ROOT } from './dev-paths.mjs';
-import { runChecked } from './dev-process.mjs';
+import { runCaptured } from './dev-process.mjs';
 
 export function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
@@ -92,23 +92,24 @@ async function declaredInputs(metaPath) {
   return { files, digest: sha256(`${canonicalJson(files)}\n`) };
 }
 
-export async function buildReproducibly({ stateDir, wranglerPath, childEnv }) {
+export async function buildReproducibly({ stateDir, wranglerPath, childEnv, tracker, shouldAbort = () => false }) {
   const buildRoot = join(stateDir, 'build');
   await rm(buildRoot, { recursive: true, force: true });
   await mkdir(buildRoot, { recursive: true });
   const builds = [];
   for (const name of ['first', 'second']) {
+    if (shouldAbort()) throw new Error('reproducibility build aborted');
     const outdir = join(buildRoot, name);
     const metaPath = join(outdir, 'bundle-meta.json');
     await mkdir(outdir, { recursive: true });
-    runChecked(process.execPath, [
+    await runCaptured(process.execPath, [
       wranglerPath,
       'deploy',
       '--dry-run',
       '--outdir', outdir,
       '--metafile', metaPath,
       '--var', 'ENVIRONMENT:development',
-    ], { cwd: HUB_ROOT, env: childEnv, label: `Wrangler reproducibility build (${name})` });
+    ], { cwd: HUB_ROOT, env: childEnv, label: `Wrangler reproducibility build (${name})`, tracker });
     builds.push({
       artifact: await artifactManifest(outdir, metaPath),
       inputs: await declaredInputs(metaPath),

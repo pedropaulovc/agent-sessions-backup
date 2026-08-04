@@ -2,6 +2,7 @@ import { Miniflare } from 'miniflare';
 import { chmod, mkdir, rm, writeFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { canonicalBytes, randomId } from './canonical.mjs';
+import { executeD1Migrations } from './sqlite-statements.mjs';
 
 export class EmbeddedLocalEnvironmentFactory {
   constructor(stateDirectory, manifestVerificationJwk) {
@@ -49,7 +50,7 @@ export class EmbeddedLocalEnvironmentFactory {
         kvPersist: join(directory, 'destination-state', 'kv'),
       });
       const bindings = await miniflare.getBindings();
-      for (const migration of build.migrations) await bindings.DB.exec(migration.sql);
+      await executeD1Migrations(bindings.DB, build.migrations);
       const url = await miniflare.ready;
       if (url.hostname !== '127.0.0.1' && url.hostname !== 'localhost') throw new Error('local environment did not bind loopback');
       const attested = Object.freeze({

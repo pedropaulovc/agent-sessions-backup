@@ -3,17 +3,17 @@ import { createWriteStream } from 'node:fs';
 import { copyFile, lstat, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import { once } from 'node:events';
-import { runMigrations } from './lib/migration-runner.mjs';
+import { migrationDeploymentIdentity, resolveMigrationDigest, runMigrations } from './lib/migration-runner.mjs';
 import { HUB_ROOT, DEV_ROOT, assertSafeExistingStatePath, localStatePath, resolveStatePath } from './lib/dev-paths.mjs';
 import { buildReproducibly } from './lib/dev-manifests.mjs';
 import {
   acquireOwnership,
-  assertResetIsUnowned,
   createEnvironmentNonce,
   recordRuntime,
   releaseOwnership,
+  removeOwnedState,
 } from './lib/dev-ownership.mjs';
-import { reservePort, runCaptured, spawnOwned, terminateProcessTree } from './lib/dev-process.mjs';
+import { createProcessTracker, retryPortSelection, runCaptured, spawnOwned, terminateProcessTree } from './lib/dev-process.mjs';
 import { seedSynthetic, syntheticSeedManifest } from './lib/dev-seed.mjs';
 
 const HELP = `Usage: node scripts/environment.mjs <command> [options]
@@ -99,7 +99,7 @@ function wranglerPath() {
   return join(HUB_ROOT, 'node_modules', 'wrangler', 'bin', 'wrangler.js');
 }
 
-async function checkPrerequisites(port) {
+async function checkPrerequisites() {
   const major = Number(process.versions.node.split('.')[0]);
   if (!Number.isInteger(major) || major < 20) throw new Error(`Node 20 or newer is required; found ${process.version}`);
   try {
@@ -109,7 +109,6 @@ async function checkPrerequisites(port) {
     throw new Error(`pinned Wrangler is unavailable; run npm ci in ${HUB_ROOT} (${error.message})`);
   }
   await assertNoSecretFiles();
-  return reservePort(port);
 }
 
 async function waitForReadiness(baseUrl, expected, child, timeoutMs) {
@@ -161,14 +160,15 @@ async function resetEnvironment(options) {
     }
     throw error;
   }
-  await assertResetIsUnowned(stateDir);
-  await rm(stateDir, { recursive: true, force: false });
+  const nonce = createEnvironmentNonce();
+  const owner = await acquireOwnership(stateDir, nonce);
+  await removeOwnedState(stateDir, owner);
   console.log('Environment reset.');
 }
 
 async function startEnvironment(options) {
   const mode = options.command;
-  const selectedPort = await checkPrerequisites(options.port);
+  await checkPrerequisites();
   let stateDir;
   if (mode === 'local') {
     stateDir = await localStatePath(options.name, options.persistTo);
@@ -182,6 +182,7 @@ async function startEnvironment(options) {
 
   const nonce = createEnvironmentNonce();
   const owner = await acquireOwnership(stateDir, nonce);
+  const tracker = createProcessTracker();
   let child;
   let log;
   let signalExitCode;
@@ -189,7 +190,7 @@ async function startEnvironment(options) {
   const requestShutdown = (signal) => {
     shutdownRequested = true;
     if (signal) signalExitCode = signal === 'SIGINT' ? 130 : 143;
-    if (child) void terminateProcessTree(child, signal ?? 'SIGTERM').catch((error) => console.error(error.message));
+    void tracker.terminateAll(signal ?? 'SIGTERM').catch((error) => console.error(error.message));
   };
   const onSignal = (signal) => requestShutdown(signal);
   const onMessage = (message) => {
@@ -206,23 +207,59 @@ async function startEnvironment(options) {
   try {
     const childEnv = safeChildEnvironment();
     const seed = await syntheticSeedManifest();
-    const build = await buildReproducibly({ stateDir, wranglerPath: wranglerPath(), childEnv });
+    let build;
+    try {
+      build = await buildReproducibly({
+        stateDir,
+        wranglerPath: wranglerPath(),
+        childEnv,
+        tracker,
+        shouldAbort: () => shutdownRequested,
+      });
+    } catch (error) {
+      if (!shutdownRequested) throw error;
+      if (signalExitCode) process.exitCode = signalExitCode;
+      return;
+    }
     if (shutdownRequested) {
       if (signalExitCode) process.exitCode = signalExitCode;
       return;
     }
-    const migration = await runMigrations({
+    const expectedMigrationDigest = await resolveMigrationDigest();
+    if (shutdownRequested) {
+      if (signalExitCode) process.exitCode = signalExitCode;
+      return;
+    }
+    const { journalName, deploymentId } = migrationDeploymentIdentity({
       target: mode,
-      persistTo: stateDir,
-      journalPath: join(stateDir, 'migration-journals', `${build.artifactDigest}.json`),
+      stateName,
       artifactDigest: build.artifactDigest,
-      deploymentId: `${mode}:${stateName}:${build.artifactDigest}`,
-      runProcess: (args) => runCaptured(process.execPath, [wranglerPath(), ...args], {
-        cwd: HUB_ROOT,
-        env: childEnv,
-        label: 'local migration Wrangler',
-      }),
+      migrationDigest: expectedMigrationDigest,
     });
+    let migration;
+    try {
+      migration = await runMigrations({
+        target: mode,
+        persistTo: stateDir,
+        journalPath: join(stateDir, 'migration-journals', journalName),
+        artifactDigest: build.artifactDigest,
+        expectedMigrationDigest,
+        deploymentId,
+        runProcess: (args) => {
+          if (shutdownRequested) throw new Error('local migration aborted');
+          return runCaptured(process.execPath, [wranglerPath(), ...args], {
+            cwd: HUB_ROOT,
+            env: childEnv,
+            label: 'local migration Wrangler',
+            tracker,
+          });
+        },
+      });
+    } catch (error) {
+      if (!shutdownRequested) throw error;
+      if (signalExitCode) process.exitCode = signalExitCode;
+      return;
+    }
     if (migration.pendingMigrations !== 0) throw new Error(`migration verification found ${migration.pendingMigrations} pending migrations`);
     if (shutdownRequested) {
       if (signalExitCode) process.exitCode = signalExitCode;
@@ -240,50 +277,86 @@ async function startEnvironment(options) {
       pendingMigrations: 0,
       seedDigest: seed.digest,
     };
-    const manifest = {
-      formatVersion: 1,
-      mode,
-      host: '127.0.0.1',
-      port: selectedPort,
-      stateDir,
-      createdAt: new Date().toISOString(),
-      ...diagnostics,
-      syntheticFixture: {
-        machine: 'e2e-machine',
-        sessions: ['00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000002'],
-      },
-    };
-    await writeFile(join(stateDir, 'environment-manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
     await writeFile(join(stateDir, 'schema-diagnostics.json'), `${JSON.stringify(migration, null, 2)}\n`, 'utf8');
     const emptyEnv = join(stateDir, 'empty.env');
     await writeFile(emptyEnv, '', { encoding: 'utf8', mode: 0o600 });
-
-    const args = [
-      wranglerPath(), 'dev', '--local', '--ip', '127.0.0.1', '--port', String(selectedPort),
-      '--persist-to', stateDir, '--env-file', emptyEnv,
-      '--var', 'ENVIRONMENT:development',
-      '--var', `ENVIRONMENT_ID:${environmentId}`,
-      '--var', `ENVIRONMENT_NONCE:${nonce}`,
-      '--var', `BUILD_INPUT_DIGEST:${build.buildInputDigest}`,
-      '--var', `ARTIFACT_DIGEST:${build.artifactDigest}`,
-      '--var', `MIGRATION_DIGEST:${migration.migrationDigest}`,
-      '--var', `SCHEMA_DIGEST:${migration.schemaDigest}`,
-      '--var', 'PENDING_MIGRATIONS:0',
-      '--var', `SEED_DIGEST:${seed.digest}`,
-    ];
     log = createWriteStream(join(stateDir, 'wrangler.log'), { flags: 'a' });
-    child = spawnOwned(process.execPath, args, { cwd: HUB_ROOT, env: childEnv });
-    child.stdout.on('data', (chunk) => { process.stdout.write(chunk); log.write(chunk); });
-    child.stderr.on('data', (chunk) => { process.stderr.write(chunk); log.write(chunk); });
-    const exitPromise = once(child, 'exit');
-    await recordRuntime(stateDir, owner, child.pid);
 
-    const baseUrl = `http://127.0.0.1:${selectedPort}`;
-    await waitForReadiness(baseUrl, diagnostics, child, options.readinessMs);
-    await seedSynthetic(baseUrl, options.readinessMs, seed.digest);
-    console.log(`Local hub ready: ${baseUrl}`);
+    let started;
+    try {
+      started = await retryPortSelection(options.port, async (selectedPort) => {
+        if (shutdownRequested) throw new Error('Wrangler startup aborted');
+        const manifest = {
+          formatVersion: 1,
+          mode,
+          host: '127.0.0.1',
+          port: selectedPort,
+          stateDir,
+          createdAt: new Date().toISOString(),
+          ...diagnostics,
+          syntheticFixture: {
+            machine: 'e2e-machine',
+            sessions: ['00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000002'],
+          },
+        };
+        await writeFile(join(stateDir, 'environment-manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
+        const args = [
+          wranglerPath(), 'dev', '--local', '--ip', '127.0.0.1', '--port', String(selectedPort),
+          '--persist-to', stateDir, '--env-file', emptyEnv,
+          '--var', 'ENVIRONMENT:development',
+          '--var', `ENVIRONMENT_ID:${environmentId}`,
+          '--var', `ENVIRONMENT_NONCE:${nonce}`,
+          '--var', `BUILD_INPUT_DIGEST:${build.buildInputDigest}`,
+          '--var', `ARTIFACT_DIGEST:${build.artifactDigest}`,
+          '--var', `MIGRATION_DIGEST:${migration.migrationDigest}`,
+          '--var', `SCHEMA_DIGEST:${migration.schemaDigest}`,
+          '--var', 'PENDING_MIGRATIONS:0',
+          '--var', `SEED_DIGEST:${seed.digest}`,
+        ];
+        let attemptOutput = '';
+        child = spawnOwned(process.execPath, args, { cwd: HUB_ROOT, env: childEnv, tracker });
+        child.stdout.on('data', (chunk) => {
+          attemptOutput += chunk;
+          process.stdout.write(chunk);
+          log.write(chunk);
+        });
+        child.stderr.on('data', (chunk) => {
+          attemptOutput += chunk;
+          process.stderr.write(chunk);
+          log.write(chunk);
+        });
+        const exitPromise = once(child, 'exit');
+        await recordRuntime(stateDir, owner, child.pid);
+        const baseUrl = `http://127.0.0.1:${selectedPort}`;
+        try {
+          await waitForReadiness(baseUrl, diagnostics, child, options.readinessMs);
+        } catch (error) {
+          error.processOutput = attemptOutput;
+          throw error;
+        }
+        return { baseUrl, exitPromise };
+      }, {
+        onRetry: async () => {
+          await terminateProcessTree(child).catch(() => {});
+          child = undefined;
+        },
+      });
+    } catch (error) {
+      if (!shutdownRequested) throw error;
+      if (signalExitCode) process.exitCode = signalExitCode;
+      return;
+    }
+
+    try {
+      await seedSynthetic(started.baseUrl, options.readinessMs, seed.digest);
+    } catch (error) {
+      if (!shutdownRequested) throw error;
+      if (signalExitCode) process.exitCode = signalExitCode;
+      return;
+    }
+    console.log(`Local hub ready: ${started.baseUrl}`);
     console.log(`State directory: ${stateDir}`);
-    const [code, signal] = await exitPromise;
+    const [code, signal] = await started.exitPromise;
     if (signalExitCode) process.exitCode = signalExitCode;
     else if (!shutdownRequested && code !== 0) throw new Error(`Wrangler exited with ${code ?? signal}`);
   } finally {
@@ -291,7 +364,7 @@ async function startEnvironment(options) {
     process.off('SIGTERM', onSignal);
     process.off('message', onMessage);
     process.off('disconnect', onDisconnect);
-    if (child) await terminateProcessTree(child).catch((error) => console.error(`process cleanup failed: ${error.message}`));
+    await tracker.terminateAll();
     if (log) {
       log.end();
       await once(log, 'close').catch(() => {});

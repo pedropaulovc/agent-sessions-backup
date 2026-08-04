@@ -9,7 +9,8 @@
   "deploymentHistory": {
     "status": "baselined-not-hash-verified",
     "approved": false,
-    "reason": "Exact bytes applied to every persistent environment before the checksum ledger have not been proven. Current source hashes are not historical deployment evidence. Production requires a separately signed human approval before this baseline may be accepted."
+    "reason": "Exact bytes applied to every persistent environment before the checksum ledger have not been proven. Current source hashes are not historical deployment evidence. Production requires a separately signed human approval before this baseline may be accepted.",
+    "requiresSignedProductionAttestation": true
   },
   "knownDivergence": {
     "filename": "0019_usage_cost_by_class.sql",

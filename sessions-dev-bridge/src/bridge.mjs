@@ -49,7 +49,8 @@ export class SessionsDevBridge {
         enrollment: this.enrollment,
       });
       if (!result || result.deviceId !== deviceId || result.scope !== ENROLLMENT_SCOPE) throw new Error('enrollment service returned invalid metadata');
-      const expiresAt = Number.isSafeInteger(result.expiresAt) ? result.expiresAt : requestedExpiry;
+      const expiresAt = Number.isSafeInteger(result.expiresAt) ? Math.min(result.expiresAt, requestedExpiry) : requestedExpiry;
+      if (expiresAt <= this.clock()) throw new Error('enrollment service returned an expiry that is already in the past');
       await this.state.saveEnrollment({
         format: 1,
         deviceId,
@@ -92,10 +93,11 @@ export class SessionsDevBridge {
     const environment = await this.localEnvironmentFactory.start(build, identity, {
       importAssertionPublicJwk: importSigner.publicKey.export({ format: 'jwk' }),
     });
+    let prepared;
     try {
       environment.assertAttested(identity);
       const initial = await this.#attestLocal(identity, null);
-      const prepared = await this.authorization.prepare({ sessionId, destinationAttestation: initial, production: this.production });
+      prepared = await this.authorization.prepare({ sessionId, destinationAttestation: initial, production: this.production });
       const job = await pollProgress(() => this.production.getPrepareJob(prepared.jobCapability), {
         transient: ['preparing'], terminal: ['awaiting_consent'], onProgress: this.onProgress,
       });
@@ -121,6 +123,7 @@ export class SessionsDevBridge {
       });
       return Object.freeze({ target: 'local', environment, sessionId });
     } catch (error) {
+      if (prepared) await this.authorization.abort(prepared.jobCapability).catch(() => {});
       await environment.dispose().catch(() => {});
       throw error;
     }
@@ -130,14 +133,20 @@ export class SessionsDevBridge {
     if (!this.remoteDestinations) throw new Error('this protected release has no configured trusted front-door destination service');
     const destination = await this.remoteDestinations.create({ pr, sessionIds: [sessionId] });
     if (destination.pr !== pr || destination.target !== `pr-${pr}`) throw new Error('trusted front door returned a different destination');
-    const prepared = await this.authorization.prepare({ sessionId, destinationAttestation: destination.attestation, production: this.production });
-    const job = await pollProgress(() => this.production.getPrepareJob(prepared.jobCapability), { transient: ['preparing'], terminal: ['awaiting_consent'], onProgress: this.onProgress });
-    const extended = await this.remoteDestinations.extend(destination, job.inventoryDigest);
-    const authorization = await this.authorization.finalize({ approvalUrl: job.approvalUrl, jobCapability: prepared.jobCapability, destinationAttestation: extended });
-    const exchange = await this.production.exchangeAuthorization(authorization.authorizationCode, prepared.codeVerifier);
-    this.snapshotVerifier.verifyManifest(exchange.manifest, { sessionId, inventoryDigest: job.inventoryDigest, totalSize: job.totalSize, objectCount: job.objectCount });
-    await this.remoteDestinations.transfer({ destination, attestation: extended, manifest: exchange.manifest, exchangeCapability: exchange.exchangeCapability, source: this.production, onProgress: this.onProgress });
-    return Object.freeze({ target: `pr-${pr}`, sessionId });
+    let prepared;
+    try {
+      prepared = await this.authorization.prepare({ sessionId, destinationAttestation: destination.attestation, production: this.production });
+      const job = await pollProgress(() => this.production.getPrepareJob(prepared.jobCapability), { transient: ['preparing'], terminal: ['awaiting_consent'], onProgress: this.onProgress });
+      const extended = await this.remoteDestinations.extend(destination, job.inventoryDigest);
+      const authorization = await this.authorization.finalize({ approvalUrl: job.approvalUrl, jobCapability: prepared.jobCapability, destinationAttestation: extended });
+      const exchange = await this.production.exchangeAuthorization(authorization.authorizationCode, prepared.codeVerifier);
+      this.snapshotVerifier.verifyManifest(exchange.manifest, { sessionId, inventoryDigest: job.inventoryDigest, totalSize: job.totalSize, objectCount: job.objectCount });
+      await this.remoteDestinations.transfer({ destination, attestation: extended, manifest: exchange.manifest, exchangeCapability: exchange.exchangeCapability, source: this.production, onProgress: this.onProgress });
+      return Object.freeze({ target: `pr-${pr}`, sessionId });
+    } catch (error) {
+      if (prepared) await this.authorization.abort(prepared.jobCapability).catch(() => {});
+      throw error;
+    }
   }
 
   async #attestLocal(identity, inventoryDigest) {

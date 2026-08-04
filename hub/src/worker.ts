@@ -12,22 +12,30 @@ export default {
   },
 
   async queue(batch: MessageBatch<HubQueueMessage>, env: Env): Promise<void> {
-    const parseMessages: Message<ParseMessage>[] = [];
-    for (const message of batch.messages) {
-      if ('debug' in message.body) {
+    const firstDebug = batch.messages.find(
+      (message): message is Message<DebugExchangeMessage> => 'debug' in message.body,
+    );
+    if (firstDebug) {
+      try {
+        await consumeDebugExchangeMessage(firstDebug.body, env);
+        firstDebug.ack();
+      } catch {
+        firstDebug.retry();
+      }
+      for (const message of batch.messages) {
+        if (message === firstDebug) continue;
         try {
-          await consumeDebugExchangeMessage(message.body, env);
+          await env.PARSE_QUEUE.send(message.body);
           message.ack();
         } catch {
           message.retry();
         }
-      } else {
-        parseMessages.push(message as Message<ParseMessage>);
       }
+      return;
     }
-    if (parseMessages.length > 0) {
-      await consumeParseBatch({ messages: parseMessages }, env);
-    }
+    await consumeParseBatch({
+      messages: batch.messages as Message<ParseMessage>[],
+    }, env);
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {

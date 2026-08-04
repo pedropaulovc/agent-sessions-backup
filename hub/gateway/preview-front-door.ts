@@ -2,6 +2,7 @@ import { verifyGitHubOidc } from '../src/auth/github-oidc';
 
 const PUBLIC_SUFFIX = '-preview.sessions.vza.net';
 const CONTROL_HOST = 'preview-control.sessions.vza.net';
+const PREVIEW_VERSION_SUFFIX = '.agent-sessions-nonproduction.workers.dev';
 const COOKIE = '__Host-preview-edge';
 const ASSERTION_TTL_SECONDS = 45;
 const SESSION_TTL_SECONDS = 3600;
@@ -38,6 +39,15 @@ interface FrontDoorEnv {
   PREVIEW_CONTROL_DEPLOY_AUD: string;
   PREVIEW_CONTROL_CLOSE_AUD: string;
   PREVIEW_CONTROL_JANITOR_AUD: string;
+}
+
+interface PreviewAppBinding {
+  fetch(request: Request): Promise<Response>;
+}
+
+interface TrustedPreviewIngressEnv {
+  APP: PreviewAppBinding;
+  PREVIEW_ORIGIN_ASSERTION_JWKS: string;
 }
 
 type PreviewResource = { kind: string; id: string; name: string; generation: string };
@@ -97,8 +107,16 @@ interface DestinationRecord {
   actor: string;
   expiresAt: number;
   publicKeyJwk: JsonWebKey;
-  privateKeyJwk: JsonWebKey;
   sessionIds: string[];
+}
+
+interface DestinationKeyRecord {
+  destinationId: string;
+  head: string;
+  generation: string;
+  artifactDigest: string;
+  expiresAt: number;
+  privateKeyJwk: JsonWebKey;
 }
 
 interface DebugManifestObject {
@@ -123,12 +141,31 @@ interface DebugManifest {
   signature: { alg: 'ES256'; value: string };
 }
 
+type DestinationImportState = 'pending' | 'committed' | 'failed' | 'aborted' | 'expired' | 'invalidated' | 'cleaned';
+
 interface DestinationImport {
   destination: DestinationRecord;
   manifest: DebugManifest;
   upstreamCapability: string;
   usedObjectIds: string[];
-  committed: boolean;
+  reservedObjectIds: string[];
+  state: 'pending';
+  expiresAt: number;
+}
+
+interface DestinationImportTombstone {
+  id: string;
+  state: Exclude<DestinationImportState, 'pending'>;
+  expiresAt: number;
+}
+
+type StoredDestinationImport = DestinationImport | DestinationImportTombstone;
+
+interface DestinationStorage {
+  get<T>(key: string): Promise<T | undefined>;
+  put(key: string, value: unknown): Promise<void>;
+  delete(key: string): Promise<boolean>;
+  list<T>(options: { prefix: string }): Promise<Map<string, T>>;
 }
 
 interface GenerationAllocation {
@@ -136,6 +173,11 @@ interface GenerationAllocation {
   epoch: number;
   head: string;
   generation: string;
+  artifactDigest: string;
+  buildInputDigest: string;
+  environmentNonce: string;
+  schemaDigest?: string;
+  versionUrl?: string;
   planned: Array<{ kind: string; name: string }>;
   recorded: PreviewResource[];
   createdAt: number;
@@ -159,6 +201,7 @@ function cleanupResources(tuples: RouteTuple[], source: CleanupResource['source'
 }
 
 export function destinationUsable(
+
   record: Pick<DestinationRecord, 'head' | 'generation' | 'artifactDigest' | 'expiresAt'> | null,
   state: PreviewState,
   now = Date.now(),
@@ -169,6 +212,34 @@ export function destinationUsable(
     && state.live?.head === record.head
     && state.live.generation === record.generation
     && state.live.artifactDigest === record.artifactDigest;
+}
+export function validDestinationManifestTotals(manifest: DebugManifest, maxBytes: number): boolean {
+  if (
+    !Array.isArray(manifest.objects)
+    || !Number.isSafeInteger(manifest.totalSize) || manifest.totalSize < 0
+    || !Number.isSafeInteger(maxBytes) || maxBytes < 0 || manifest.totalSize > maxBytes
+  ) return false;
+  let plaintextTotal = 0;
+  let ciphertextTotal = 0;
+  for (const object of manifest.objects) {
+    if (
+      !Number.isSafeInteger(object.size) || object.size < 0
+      || !Number.isSafeInteger(object.ciphertextSize) || object.ciphertextSize < 0
+      || object.ciphertextSize !== object.size + 16
+    ) return false;
+    plaintextTotal += object.size;
+    ciphertextTotal += object.ciphertextSize;
+    if (!Number.isSafeInteger(plaintextTotal) || !Number.isSafeInteger(ciphertextTotal)) return false;
+  }
+  return plaintextTotal === manifest.totalSize;
+}
+
+function pendingDestinationImport(value: StoredDestinationImport | undefined): value is DestinationImport {
+  return value?.state === 'pending';
+}
+
+function auditDestination(destinationId: string, state: DestinationImportState | 'authorized'): void {
+  console.info('preview_destination_lifecycle', { destinationId, state });
 }
 
 export type TransitionResult = { ok: true; state: PreviewState; inventory?: CleanupResource[] } | { ok: false; status: 409 | 410; reason: string };
@@ -185,21 +256,34 @@ function validHead(head: string): boolean {
 function validTuple(input: RegisterInput): boolean {
   if (!Number.isSafeInteger(input.pr) || input.pr <= 0 || !Number.isSafeInteger(input.epoch) || input.epoch <= 0) return false;
   if (!validHead(input.head) || generationRank(input.generation) === null) return false;
+  const edgeName = `pr-${input.pr}-${input.generation}-edge`;
+  const appName = `pr-${input.pr}-${input.generation}-app`;
   try {
     const url = new URL(input.versionUrl);
     if (
-      url.protocol !== 'https:' || !url.hostname.endsWith('.workers.dev')
+      url.protocol !== 'https:' || !url.hostname.endsWith(PREVIEW_VERSION_SUFFIX)
+      || !url.hostname.includes(edgeName)
       || url.username || url.password || url.pathname !== '/' || url.search || url.hash
     ) return false;
   } catch {
     return false;
   }
-  return /^[0-9a-f]{64}$/.test(input.artifactDigest)
-    && /^[A-Za-z0-9_-]{16,128}$/.test(input.environmentNonce)
-    && /^[0-9a-f]{64}$/.test(input.buildInputDigest)
-    && /^[0-9a-f]{64}$/.test(input.schemaDigest)
-    && Array.isArray(input.resources)
-    && input.resources.every((r) => r && r.generation === input.generation && r.name?.startsWith(`pr-${input.pr}-`));
+  if (
+    !/^[0-9a-f]{64}$/.test(input.artifactDigest)
+    || !/^[A-Za-z0-9_-]{16,128}$/.test(input.environmentNonce)
+    || !/^[0-9a-f]{64}$/.test(input.buildInputDigest)
+    || !/^[0-9a-f]{64}$/.test(input.schemaDigest)
+    || !Array.isArray(input.resources)
+    || input.resources.some((resource) => !resource
+      || resource.generation !== input.generation
+      || !resource.name?.startsWith(`pr-${input.pr}-${input.generation}-`))
+  ) return false;
+  const workerIdentity = (kind: string, name: string) => input.resources
+    .filter((resource) => resource.kind === kind && resource.name === name).length === 1;
+  return workerIdentity('app-version', appName)
+    && workerIdentity('app-worker', appName)
+    && workerIdentity('edge-version', edgeName)
+    && workerIdentity('edge-worker', edgeName);
 }
 
 export function registerCandidate(current: PreviewState | undefined, input: RegisterInput): TransitionResult {
@@ -332,9 +416,12 @@ export class PreviewEdgeAuth {
     if (request.method === 'POST' && url.pathname === '/janitor-ack') return this.janitorAck(body);
     if (request.method === 'POST' && url.pathname === '/destination-start-import') return this.startDestinationImport(body);
     if (request.method === 'POST' && url.pathname === '/destination-object') return this.consumeDestinationObject(body);
+    if (request.method === 'POST' && url.pathname === '/destination-object-reserve') return this.reserveDestinationObject(body);
+    if (request.method === 'POST' && url.pathname === '/destination-object-finish') return this.finishDestinationObject(body);
     if (request.method === 'POST' && url.pathname === '/destination-exchange-create') return this.createDestinationExchange(body);
     if (request.method === 'POST' && url.pathname === '/destination-exchange-consume') return this.consumeDestinationExchange(body);
     if (request.method === 'POST' && url.pathname === '/destination-commit') return this.commitDestinationImport(body);
+    if (request.method === 'POST' && url.pathname === '/destination-finish') return this.finishDestinationImport(body);
     if (request.method === 'POST' && url.pathname === '/destination-status') return this.destinationImportStatus(body);
     return json({ error: 'not_found' }, 404);
   }
@@ -354,17 +441,26 @@ export class PreviewEdgeAuth {
     const epoch = Number(body.epoch);
     const head = String(body.head ?? '');
     const generation = String(body.generation ?? '');
-    const allowedKinds = new Set(['worker', 'worker-version', 'd1', 'r2', 'kv', 'queue']);
+    const allowedKinds: Record<string, true> = {
+      'app-worker': true, 'app-version': true, 'edge-worker': true, 'edge-version': true,
+      d1: true, r2: true, kv: true, queue: true,
+    };
     const planned = body.planned as Array<{ kind?: unknown; name?: unknown }>;
     if (
       !Number.isSafeInteger(pr) || pr <= 0 || !Number.isSafeInteger(epoch) || epoch <= 0
       || !validHead(head) || generationRank(generation) === null || planned.length === 0
-      || planned.some((item) => typeof item.kind !== 'string' || !allowedKinds.has(item.kind)
-        || typeof item.name !== 'string' || !item.name.startsWith(`pr-${pr}-`))
+      || !/^[0-9a-f]{64}$/.test(String(body.artifactDigest ?? ''))
+      || !/^[0-9a-f]{64}$/.test(String(body.buildInputDigest ?? ''))
+      || !/^[A-Za-z0-9_-]{16,128}$/.test(String(body.environmentNonce ?? ''))
+      || planned.some((item) => typeof item.kind !== 'string' || !allowedKinds[item.kind]
+        || typeof item.name !== 'string' || !item.name.startsWith(`pr-${pr}-${generation}-`))
       || new Set(planned.map((item) => `${item.kind}\0${item.name}`)).size !== planned.length
     ) return json({ error: 'invalid_plan' }, 400);
     const allocation: GenerationAllocation = {
       pr, epoch, head, generation,
+      artifactDigest: String(body.artifactDigest),
+      buildInputDigest: String(body.buildInputDigest),
+      environmentNonce: String(body.environmentNonce),
       planned: planned as Array<{ kind: string; name: string }>,
       recorded: [],
       createdAt: Date.now(),
@@ -374,7 +470,9 @@ export class PreviewEdgeAuth {
       const existing = await tx.get<GenerationAllocation>(key);
       if (existing) {
         const same = JSON.stringify(existing.planned) === JSON.stringify(allocation.planned)
-          && existing.pr === pr && existing.epoch === epoch && existing.head === head;
+          && existing.pr === pr && existing.epoch === epoch && existing.head === head
+          && existing.artifactDigest === allocation.artifactDigest
+          && existing.buildInputDigest === allocation.buildInputDigest;
         return same ? json(existing) : json({ error: 'generation_collision' }, 409);
       }
       await tx.put(key, allocation);
@@ -398,13 +496,31 @@ export class PreviewEdgeAuth {
       if (!allocation.planned.some((item) => item.kind === resource.kind && item.name === resource.name)) {
         return json({ error: 'unplanned_resource' }, 409);
       }
-      const collision = allocation.recorded.find((item) => item.id === resource.id || item.name === resource.name);
+      const collision = allocation.recorded.find((item) => item.id === resource.id
+        || item.kind === resource.kind && item.name === resource.name);
       if (collision) {
         return JSON.stringify(collision) === JSON.stringify(resource)
           ? json(allocation)
           : json({ error: 'resource_collision' }, 409);
       }
-      const next = { ...allocation, recorded: [...allocation.recorded, resource] };
+      const schemaDigest = body.schemaDigest === undefined ? allocation.schemaDigest : String(body.schemaDigest);
+      if (schemaDigest !== undefined && !/^[0-9a-f]{64}$/.test(schemaDigest)) {
+        return json({ error: 'invalid_schema_digest' }, 400);
+      }
+      let versionUrl = allocation.versionUrl;
+      if (body.versionUrl !== undefined) {
+        try {
+          const parsed = new URL(String(body.versionUrl));
+          if (resource.kind !== 'edge-version' || parsed.protocol !== 'https:'
+            || !parsed.hostname.endsWith('.workers.dev') || parsed.pathname !== '/') {
+            return json({ error: 'invalid_version_url' }, 400);
+          }
+          versionUrl = parsed.href;
+        } catch {
+          return json({ error: 'invalid_version_url' }, 400);
+        }
+      }
+      const next = { ...allocation, schemaDigest, versionUrl, recorded: [...allocation.recorded, resource] };
       await tx.put(key, next);
       return json(next, 201);
     });
@@ -460,14 +576,18 @@ export class PreviewEdgeAuth {
   }
   private async transition(body: Record<string, unknown> | null, fn: (state: never, input: never) => TransitionResult): Promise<Response> {
     if (!body) return json({ error: 'bad_json' }, 400);
-    return this.state.storage.transaction(async (tx) => {
+    let next: PreviewState | undefined;
+    const response = await this.state.storage.transaction(async (tx) => {
       const current = await tx.get<PreviewState>('route');
       if (!current && fn !== registerCandidate) return json({ error: 'not_found' }, 404);
       const result = fn(current as never, body as never);
       if (!result.ok) return json({ error: result.reason }, result.status);
+      next = result.state;
       await tx.put('route', result.state);
       return json(result.inventory ? { state: result.state, inventory: result.inventory } : result.state);
     });
+    if (response.ok && next) await this.scrubInvalidDestinations(next);
+    return response;
   }
 
   private async consume(key: string, expiresAt: number): Promise<Response> {
@@ -537,7 +657,7 @@ export class PreviewEdgeAuth {
   private async janitor(body: Record<string, unknown> | null): Promise<Response> {
     if (!body || !Array.isArray(body.deleteGenerations)) return json({ error: 'bad_json' }, 400);
     const requested = new Set(body.deleteGenerations.map(String));
-    return this.state.storage.transaction(async (tx) => {
+    const response = await this.state.storage.transaction(async (tx) => {
       const route = await tx.get<PreviewState>('route');
       const allocationRows = await tx.list<GenerationAllocation>({ prefix: 'allocation:' });
       const allocations = [...allocationRows.values()].filter((item) => requested.has(item.generation));
@@ -591,6 +711,11 @@ export class PreviewEdgeAuth {
       ];
       return json({ state: next ?? null, inventory });
     });
+    if (response.ok) {
+      const route = await this.state.storage.get<PreviewState>('route');
+      await this.scrubInvalidDestinations(route, requested);
+    }
+    return response;
   }
 
   private async janitorAck(body: Record<string, unknown> | null): Promise<Response> {
@@ -636,113 +761,399 @@ export class PreviewEdgeAuth {
     return json({ prs: await this.state.storage.get<number[]>('prs') ?? [] });
   }
 
+  private async retireDestination(
+    storage: DestinationStorage,
+    id: string,
+    state: Exclude<DestinationImportState, 'pending'>,
+  ): Promise<{ tombstone: DestinationImportTombstone; changed: boolean }> {
+    const [keyRecord, destination, storedImport] = await Promise.all([
+      storage.get<DestinationKeyRecord>(`destination-key:${id}`),
+      storage.get<DestinationRecord>(`destination:${id}`),
+      storage.get<StoredDestinationImport>(`destination-import:${id}`),
+    ]);
+    const activeImport = pendingDestinationImport(storedImport) ? storedImport : undefined;
+    let tombstone: DestinationImportTombstone;
+    if (!storedImport || pendingDestinationImport(storedImport)) {
+      tombstone = {
+        id,
+        state,
+        expiresAt: storedImport?.expiresAt ?? keyRecord?.expiresAt ?? destination?.expiresAt ?? Date.now(),
+      };
+    } else {
+      tombstone = storedImport;
+    }
+    await Promise.all([
+      storage.delete(`destination-key:${id}`),
+      storage.delete(`destination:${id}`),
+      storage.put(`destination-import:${id}`, tombstone),
+      storage.put(`destination-used:${id}`, tombstone.expiresAt),
+    ]);
+    return { tombstone, changed: !!keyRecord || !!destination || !!activeImport || !storedImport };
+  }
+
+  private async scheduleDestinationAlarm(): Promise<void> {
+    const [keys, imports] = await Promise.all([
+      this.state.storage.list<DestinationKeyRecord>({ prefix: 'destination-key:' }),
+      this.state.storage.list<StoredDestinationImport>({ prefix: 'destination-import:' }),
+    ]);
+    let earliest: number | null = null;
+    for (const record of keys.values()) {
+      if (earliest === null || record.expiresAt < earliest) earliest = record.expiresAt;
+    }
+    for (const value of imports.values()) {
+      if (pendingDestinationImport(value) && (earliest === null || value.expiresAt < earliest)) {
+        earliest = value.expiresAt;
+      }
+    }
+    if (earliest === null) {
+      if (await this.state.storage.getAlarm() !== null) await this.state.storage.deleteAlarm();
+    } else {
+      await this.state.storage.setAlarm(earliest);
+    }
+  }
+
+  private async scrubInvalidDestinations(route?: PreviewState, generations?: ReadonlySet<string>): Promise<void> {
+    const terminalState: Exclude<DestinationImportState, 'pending'> = generations ? 'cleaned' : 'invalidated';
+    const retired = await this.state.storage.transaction(async (tx) => {
+      const [keys, imports] = await Promise.all([
+        tx.list<DestinationKeyRecord>({ prefix: 'destination-key:' }),
+        tx.list<StoredDestinationImport>({ prefix: 'destination-import:' }),
+      ]);
+      const ids = new Set<string>();
+      for (const record of keys.values()) {
+        if (generations?.has(record.generation) || !route || !destinationUsable(record, route)) {
+          ids.add(record.destinationId);
+        }
+      }
+      for (const [key, value] of imports) {
+        if (
+          pendingDestinationImport(value)
+          && (generations?.has(value.destination.generation) || !route || !destinationUsable(value.destination, route))
+        ) {
+          ids.add(key.slice('destination-import:'.length));
+        }
+      }
+      const changed: string[] = [];
+      for (const id of ids) {
+        if ((await this.retireDestination(tx as unknown as DestinationStorage, id, terminalState)).changed) {
+          changed.push(id);
+        }
+      }
+      return changed;
+    });
+    for (const id of retired) auditDestination(id, terminalState);
+    if (retired.length) await this.scheduleDestinationAlarm();
+  }
+
+  async alarm(): Promise<void> {
+    const now = Date.now();
+    const retired = await this.state.storage.transaction(async (tx) => {
+      const storage = tx as unknown as DestinationStorage;
+      const [keys, imports] = await Promise.all([
+        tx.list<DestinationKeyRecord>({ prefix: 'destination-key:' }),
+        tx.list<StoredDestinationImport>({ prefix: 'destination-import:' }),
+      ]);
+      const ids = new Set<string>();
+      for (const record of keys.values()) {
+        if (record.expiresAt <= now) ids.add(record.destinationId);
+      }
+      for (const [key, value] of imports) {
+        if (pendingDestinationImport(value) && value.expiresAt <= now) {
+          ids.add(key.slice('destination-import:'.length));
+        }
+      }
+      const changed: string[] = [];
+      for (const id of ids) {
+        if ((await this.retireDestination(storage, id, 'expired')).changed) changed.push(id);
+      }
+      return changed;
+    });
+    for (const id of retired) auditDestination(id, 'expired');
+    await this.scheduleDestinationAlarm();
+  }
+
   private async createDestination(body: Record<string, unknown> | null): Promise<Response> {
     if (!body) return json({ error: 'bad_json' }, 400);
-    const record = body as unknown as DestinationRecord;
+    const { privateKeyJwk, ...publicFields } = body as unknown as DestinationRecord & { privateKeyJwk?: JsonWebKey };
+    const record = publicFields as DestinationRecord;
     const route = await this.state.storage.get<PreviewState>('route');
-    if (!destinationUsable(record, route ?? {
-      lifecycle: 'closed', epoch: 0, expectedHead: '', live: null, candidates: {}, rollback: null, deletionInventory: [],
-    })) return json({ error: 'live_tuple_changed' }, 409);
-    await this.state.storage.put(`destination:${record.id}`, record);
-    return json({ ok: true });
+    if (
+      !/^[A-Za-z0-9_-]{20,128}$/.test(record.id)
+      || privateKeyJwk?.kty !== 'RSA' || typeof privateKeyJwk.d !== 'string' || !privateKeyJwk.d
+      || !destinationUsable(record, route ?? {
+        lifecycle: 'closed', epoch: 0, expectedHead: '', live: null, candidates: {}, rollback: null, deletionInventory: [],
+      })
+    ) return json({ error: 'invalid_or_live_tuple_changed' }, 409);
+    const response = await this.state.storage.transaction(async (tx) => {
+      if (
+        await tx.get(`destination:${record.id}`)
+        || await tx.get(`destination-key:${record.id}`)
+        || await tx.get(`destination-used:${record.id}`)
+        || await tx.get(`destination-import:${record.id}`)
+      ) return json({ error: 'destination_collision' }, 409);
+      await tx.put(`destination:${record.id}`, record);
+      await tx.put(`destination-key:${record.id}`, {
+        destinationId: record.id,
+        head: record.head,
+        generation: record.generation,
+        artifactDigest: record.artifactDigest,
+        expiresAt: record.expiresAt,
+        privateKeyJwk,
+      } satisfies DestinationKeyRecord);
+      return json({ ok: true });
+    });
+    if (response.ok) {
+      auditDestination(record.id, 'authorized');
+      await this.scheduleDestinationAlarm();
+    }
+    return response;
   }
 
   private async consumeDestination(body: Record<string, unknown> | null): Promise<Response> {
     const id = String(body?.id ?? '');
     if (!/^[A-Za-z0-9_-]{20,128}$/.test(id)) return json({ error: 'invalid_destination' }, 401);
-    return this.state.storage.transaction(async (tx) => {
+    let invalidated = false;
+    const response = await this.state.storage.transaction(async (tx) => {
       const usedKey = `destination-used:${id}`;
       if (await tx.get(usedKey)) return json({ error: 'destination_replayed' }, 409);
       const key = `destination:${id}`;
       const record = await tx.get<DestinationRecord>(key);
+      const keyRecord = await tx.get<DestinationKeyRecord>(`destination-key:${id}`);
       const route = await tx.get<PreviewState>('route');
-      if (!record || !route) return json({ error: 'invalid_destination' }, 401);
-      if (!destinationUsable(record, route)) return json({ error: 'expired_or_live_changed' }, 409);
+      if (!record || !keyRecord) return json({ error: 'invalid_destination' }, 401);
+      if (!route || !destinationUsable(record, route) || !destinationUsable(keyRecord, route)) {
+        invalidated = (await this.retireDestination(tx as unknown as DestinationStorage, id, 'invalidated')).changed;
+        return json({ error: 'expired_or_live_changed' }, 409);
+      }
       await tx.delete(key);
       await tx.put(usedKey, record.expiresAt);
       return json(record);
     });
+    if (invalidated) {
+      auditDestination(id, 'invalidated');
+      await this.scheduleDestinationAlarm();
+    }
+    return response;
   }
 
   private async extendDestination(body: Record<string, unknown> | null): Promise<Response> {
     const id = String(body?.id ?? '');
     const inventoryDigest = String(body?.inventoryDigest ?? '');
     if (!/^[0-9a-f]{64}$/.test(inventoryDigest)) return json({ error: 'invalid_inventory_digest' }, 400);
-    return this.state.storage.transaction(async (tx) => {
+    let invalidated = false;
+    const response = await this.state.storage.transaction(async (tx) => {
       const key = `destination:${id}`;
       const record = await tx.get<DestinationRecord>(key);
       const route = await tx.get<PreviewState>('route');
-      if (!record || !route) return json({ error: 'invalid_destination' }, 404);
-      if (!destinationUsable(record, route) || record.inventoryDigest !== null) {
-        return json({ error: 'expired_used_or_extended' }, 409);
+      if (!record) return json({ error: 'invalid_destination' }, 404);
+      if (!route || !destinationUsable(record, route)) {
+        invalidated = (await this.retireDestination(tx as unknown as DestinationStorage, id, 'invalidated')).changed;
+        return json({ error: 'expired_or_live_changed' }, 409);
       }
+      if (record.inventoryDigest !== null) return json({ error: 'expired_used_or_extended' }, 409);
       if (body?.actor !== record.actor) return json({ error: 'actor_mismatch' }, 403);
       const next = { ...record, inventoryDigest };
       await tx.put(key, next);
       return json(next);
     });
+    if (invalidated) {
+      auditDestination(id, 'invalidated');
+      await this.scheduleDestinationAlarm();
+    }
+    return response;
   }
 
   private async startDestinationImport(body: Record<string, unknown> | null): Promise<Response> {
     if (!body) return json({ error: 'bad_json' }, 400);
-    const value = body.import as DestinationImport | undefined;
-    if (!value?.destination?.id || !value.upstreamCapability) return json({ error: 'invalid_import' }, 400);
-    const key = `destination-import:${value.destination.id}`;
-    return this.state.storage.transaction(async (tx) => {
-      if (!await tx.get(`destination-used:${value.destination.id}`)) return json({ error: 'destination_not_consumed' }, 409);
-      if (await tx.get(key)) return json({ error: 'import_exists' }, 409);
-      await tx.put(key, value);
-      return json({ importId: value.destination.id }, 201);
+    const value = body.import as Partial<DestinationImport> | undefined;
+    const destinationInput = value?.destination;
+    const manifest = value?.manifest;
+    const upstreamCapability = value?.upstreamCapability;
+    if (!destinationInput?.id || !upstreamCapability || !manifest) {
+      return json({ error: 'invalid_import' }, 400);
+    }
+    const id = destinationInput.id;
+    const expiresAt = Math.min(destinationInput.expiresAt, manifest.expiresAt, Number(value.expiresAt));
+    let invalidated = false;
+    const response = await this.state.storage.transaction(async (tx) => {
+      if (await tx.get(`destination-import:${id}`)) return json({ error: 'import_exists' }, 409);
+      if (await tx.get(`destination-used:${id}`) === undefined) return json({ error: 'destination_not_consumed' }, 409);
+      const keyRecord = await tx.get<DestinationKeyRecord>(`destination-key:${id}`);
+      const route = await tx.get<PreviewState>('route');
+      if (
+        !keyRecord || !route || !Number.isFinite(expiresAt) || expiresAt <= Date.now()
+        || !destinationUsable(destinationInput, route) || !destinationUsable(keyRecord, route)
+        || keyRecord.destinationId !== id
+      ) {
+        invalidated = (await this.retireDestination(tx as unknown as DestinationStorage, id, 'invalidated')).changed;
+        return json({ error: 'expired_or_live_changed' }, 409);
+      }
+      const { privateKeyJwk: _private, ...destination } = destinationInput as DestinationRecord & { privateKeyJwk?: unknown };
+      const stored: DestinationImport = {
+        destination,
+        manifest,
+        upstreamCapability,
+        usedObjectIds: [],
+        reservedObjectIds: [],
+        state: 'pending',
+        expiresAt,
+      };
+      await tx.put(`destination-import:${id}`, stored);
+      return json({ importId: id }, 201);
     });
+    if (invalidated) auditDestination(id, 'invalidated');
+    if (response.ok || invalidated) await this.scheduleDestinationAlarm();
+    return response;
   }
 
   private async consumeDestinationObject(body: Record<string, unknown> | null): Promise<Response> {
     const id = String(body?.id ?? '');
     const objectId = String(body?.objectId ?? '');
-    return this.state.storage.transaction(async (tx) => {
+    let invalidated = false;
+    const response = await this.state.storage.transaction(async (tx) => {
       const key = `destination-import:${id}`;
-      const value = await tx.get<DestinationImport>(key);
+      const stored = await tx.get<StoredDestinationImport>(key);
+      if (!pendingDestinationImport(stored)) return json({ error: stored ? 'import_terminal' : 'import_not_found' }, 409);
       const route = await tx.get<PreviewState>('route');
-      if (!value || !route || !destinationUsable(value.destination, route)) {
+      const keyRecord = await tx.get<DestinationKeyRecord>(`destination-key:${id}`);
+      if (!route || !keyRecord || !destinationUsable(stored.destination, route) || !destinationUsable(keyRecord, route)) {
+        invalidated = (await this.retireDestination(tx as unknown as DestinationStorage, id, 'invalidated')).changed;
         return json({ error: 'expired_or_live_changed' }, 409);
       }
-      if (value.committed || value.usedObjectIds.includes(objectId)) return json({ error: 'object_replayed' }, 409);
-      const object = value.manifest.objects.find((item) => item.objectId === objectId);
+      if (stored.usedObjectIds.includes(objectId)) return json({ error: 'object_replayed' }, 409);
+      const object = stored.manifest.objects.find((item) => item.objectId === objectId);
       if (!object) return json({ error: 'object_not_allowed' }, 404);
-      const next = { ...value, usedObjectIds: [...value.usedObjectIds, objectId] };
+      return json({ import: stored, object, privateKeyJwk: keyRecord.privateKeyJwk });
+    });
+    if (invalidated) {
+      auditDestination(id, 'invalidated');
+      await this.scheduleDestinationAlarm();
+    }
+    return response;
+  }
+
+  private async reserveDestinationObject(body: Record<string, unknown> | null): Promise<Response> {
+    const id = String(body?.id ?? '');
+    const objectId = String(body?.objectId ?? '');
+    return this.state.storage.transaction(async (tx) => {
+      const key = `destination-import:${id}`;
+      const stored = await tx.get<StoredDestinationImport>(key);
+      if (!pendingDestinationImport(stored)) return json({ error: 'import_terminal' }, 409);
+      if (stored.usedObjectIds.includes(objectId) || stored.reservedObjectIds.includes(objectId)) {
+        return json({ error: 'object_replayed' }, 409);
+      }
+      if (!stored.manifest.objects.some((item) => item.objectId === objectId)) {
+        return json({ error: 'object_not_allowed' }, 404);
+      }
+      const next: DestinationImport = {
+        ...stored,
+        reservedObjectIds: [...stored.reservedObjectIds, objectId],
+      };
       await tx.put(key, next);
-      return json({ import: next, object });
+      return json({ ok: true });
+    });
+  }
+
+  private async finishDestinationObject(body: Record<string, unknown> | null): Promise<Response> {
+    const id = String(body?.id ?? '');
+    const objectId = String(body?.objectId ?? '');
+    const delivered = body?.delivered;
+    if (typeof delivered !== 'boolean') return json({ error: 'invalid_delivery_state' }, 400);
+    return this.state.storage.transaction(async (tx) => {
+      const key = `destination-import:${id}`;
+      const stored = await tx.get<StoredDestinationImport>(key);
+      if (!pendingDestinationImport(stored)) return json({ error: 'import_terminal' }, 409);
+      if (!stored.reservedObjectIds.includes(objectId)) {
+        if (delivered && stored.usedObjectIds.includes(objectId)) return json({ ok: true });
+        if (!delivered && !stored.usedObjectIds.includes(objectId)) return json({ ok: true });
+        return json({ error: 'object_not_reserved' }, 409);
+      }
+      const next: DestinationImport = {
+        ...stored,
+        reservedObjectIds: stored.reservedObjectIds.filter((item) => item !== objectId),
+        usedObjectIds: delivered ? [...stored.usedObjectIds, objectId] : stored.usedObjectIds,
+      };
+      await tx.put(key, next);
+      return json({ ok: true });
     });
   }
 
   private async commitDestinationImport(body: Record<string, unknown> | null): Promise<Response> {
     const id = String(body?.id ?? '');
-    return this.state.storage.transaction(async (tx) => {
-      const key = `destination-import:${id}`;
-      const value = await tx.get<DestinationImport>(key);
+    let invalidated = false;
+    const response = await this.state.storage.transaction(async (tx) => {
+      const stored = await tx.get<StoredDestinationImport>(`destination-import:${id}`);
+      if (!pendingDestinationImport(stored)) return json({ error: stored ? 'commit_replayed' : 'import_not_found' }, 409);
       const route = await tx.get<PreviewState>('route');
-      if (!value || !route || !destinationUsable(value.destination, route)) {
+      const keyRecord = await tx.get<DestinationKeyRecord>(`destination-key:${id}`);
+      if (!route || !keyRecord || !destinationUsable(stored.destination, route) || !destinationUsable(keyRecord, route)) {
+        invalidated = (await this.retireDestination(tx as unknown as DestinationStorage, id, 'invalidated')).changed;
         return json({ error: 'expired_or_live_changed' }, 409);
       }
-      if (value.committed) return json({ error: 'commit_replayed' }, 409);
-      if (value.usedObjectIds.length !== value.manifest.objects.length) return json({ error: 'objects_missing' }, 409);
-      const next = {
-        ...value,
-        committed: true,
-        destination: { ...value.destination, privateKeyJwk: {} },
-      };
-      await tx.put(key, next);
-      return json({ import: next });
+      if (stored.reservedObjectIds.length || stored.usedObjectIds.length !== stored.manifest.objects.length) {
+        return json({ error: 'objects_missing' }, 409);
+      }
+      return json({ import: stored });
     });
+    if (invalidated) {
+      auditDestination(id, 'invalidated');
+      await this.scheduleDestinationAlarm();
+    }
+    return response;
+  }
+
+  private async finishDestinationImport(body: Record<string, unknown> | null): Promise<Response> {
+    const id = String(body?.id ?? '');
+    const state = body?.state;
+    if (!/^[A-Za-z0-9_-]{20,128}$/.test(id) || !['committed', 'failed', 'aborted'].includes(String(state))) {
+      return json({ error: 'invalid_terminal_state' }, 400);
+    }
+    let changed = false;
+    const response = await this.state.storage.transaction(async (tx) => {
+      const stored = await tx.get<StoredDestinationImport>(`destination-import:${id}`);
+      if (stored && !pendingDestinationImport(stored)) {
+        return stored.state === state ? json({ import: stored }) : json({ error: 'import_terminal' }, 409);
+      }
+      if (!stored && !await tx.get(`destination-key:${id}`)) return json({ error: 'import_not_found' }, 404);
+      if (state === 'committed' && !stored) return json({ error: 'import_not_found' }, 404);
+      if (
+        state === 'committed' && stored
+        && (stored.reservedObjectIds.length || stored.usedObjectIds.length !== stored.manifest.objects.length)
+      ) return json({ error: 'objects_missing' }, 409);
+      const retired = await this.retireDestination(
+        tx as unknown as DestinationStorage,
+        id,
+        state as 'committed' | 'failed' | 'aborted',
+      );
+      changed = retired.changed;
+      return json({ import: retired.tombstone });
+    });
+    if (changed) auditDestination(id, state as 'committed' | 'failed' | 'aborted');
+    if (response.ok) await this.scheduleDestinationAlarm();
+    return response;
   }
 
   private async destinationImportStatus(body: Record<string, unknown> | null): Promise<Response> {
-    const value = await this.state.storage.get<DestinationImport>(`destination-import:${String(body?.id ?? '')}`);
-    const route = await this.state.storage.get<PreviewState>('route');
-    if (!value || !route || !destinationUsable(value.destination, route)) {
-      return json({ error: 'expired_or_live_changed' }, 409);
+    const id = String(body?.id ?? '');
+    let invalidated = false;
+    const response = await this.state.storage.transaction(async (tx) => {
+      const stored = await tx.get<StoredDestinationImport>(`destination-import:${id}`);
+      if (!stored) return json({ error: 'import_not_found' }, 404);
+      if (!pendingDestinationImport(stored)) return json({ import: stored });
+      const route = await tx.get<PreviewState>('route');
+      const keyRecord = await tx.get<DestinationKeyRecord>(`destination-key:${id}`);
+      if (!route || !keyRecord || !destinationUsable(stored.destination, route) || !destinationUsable(keyRecord, route)) {
+        const retired = await this.retireDestination(tx as unknown as DestinationStorage, id, 'invalidated');
+        invalidated = retired.changed;
+        return json({ import: retired.tombstone }, 409);
+      }
+      return json({ import: stored });
+    });
+    if (invalidated) {
+      auditDestination(id, 'invalidated');
+      await this.scheduleDestinationAlarm();
     }
-    return json({ import: value });
+    return response;
   }
   private async createDestinationExchange(body: Record<string, unknown> | null): Promise<Response> {
     const code = String(body?.code ?? '');
@@ -791,6 +1202,31 @@ function prFromHost(hostname: string): number | null {
 
 function objectStub(env: FrontDoorEnv, pr: number): DurableObjectStub {
   return env.PREVIEW_EDGE_AUTH.get(env.PREVIEW_EDGE_AUTH.idFromName(`pr-${pr}`));
+}
+
+function finishDestinationLifecycle(
+  stub: DurableObjectStub,
+  id: string,
+  state: 'committed' | 'failed' | 'aborted',
+): Promise<Response> {
+  return stub.fetch('https://edge.internal/destination-finish', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id, state }),
+  });
+}
+
+function finishDestinationObjectForward(
+  stub: DurableObjectStub,
+  id: string,
+  objectId: string,
+  delivered: boolean,
+): Promise<Response> {
+  return stub.fetch('https://edge.internal/destination-object-finish', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ id, objectId, delivered }),
+  });
 }
 
 function registryStub(env: FrontDoorEnv): DurableObjectStub {
@@ -1020,6 +1456,63 @@ async function verifyRs256Jwt(token: string, keys: JsonWebKeyWithKid[], expected
   return claims;
 }
 
+async function verifyPreviewOriginAssertion(
+  token: string,
+  request: Request,
+  jwksSource: string,
+): Promise<boolean> {
+  const parts = token.split('.');
+  if (parts.length !== 3) return false;
+  const header = parseJsonSegment<Record<string, unknown>>(parts[0]!);
+  let keys: JsonWebKeyWithKid[];
+  try {
+    const parsed = JSON.parse(jwksSource) as { keys?: JsonWebKeyWithKid[] };
+    keys = Array.isArray(parsed.keys) ? parsed.keys : [];
+  } catch {
+    return false;
+  }
+  if (header?.alg !== 'RS256' || header.typ !== 'JWT' || typeof header.kid !== 'string') return false;
+  const claims = await verifyRs256Jwt(token, keys, {
+    issuer: `https://${CONTROL_HOST}`,
+    audience: AUDIENCES.origin,
+  });
+  if (!claims) return false;
+  const now = Math.floor(Date.now() / 1000);
+  const url = new URL(request.url);
+  const target = canonicalTarget(`${url.pathname}${url.search}`);
+  if (
+    !target
+    || claims.method !== request.method
+    || claims.target !== target
+    || typeof claims.iat !== 'number'
+    || typeof claims.exp !== 'number'
+    || claims.exp - claims.iat > ASSERTION_TTL_SECONDS
+    || typeof claims.jti !== 'string'
+    || claims.jti.length < 16
+    || claims.iat > now + 30
+  ) return false;
+  const digest = await bodyDigest(request);
+  return MUTATING_METHODS.has(request.method)
+    ? claims.bodyDigest === digest
+    : claims.bodyDigest === undefined;
+}
+
+/** Authenticate trusted-front-door traffic before entering the private generation binding. */
+export async function trustedPreviewIngress(
+  request: Request,
+  env: TrustedPreviewIngressEnv,
+): Promise<Response> {
+  const assertion = request.headers.get('x-preview-origin-assertion');
+  if (!assertion || !await verifyPreviewOriginAssertion(
+    assertion,
+    request.clone(),
+    env.PREVIEW_ORIGIN_ASSERTION_JWKS,
+  )) {
+    return json({ error: 'invalid_origin_assertion' }, 403);
+  }
+  return env.APP.fetch(request);
+}
+
 async function validateAccess(request: Request, env: FrontDoorEnv): Promise<{ actor: string } | null> {
   const token = request.headers.get('cf-access-jwt-assertion');
   if (!token) return null;
@@ -1113,14 +1606,14 @@ export async function signDestinationAttestation(
   return { payload, signature: b64url(new Uint8Array(signature)) };
 }
 
-async function verifyDestinationAttestation(
+export async function verifyDestinationAttestation(
   attestation: DestinationAttestation,
-  env: FrontDoorEnv,
+  env: Pick<FrontDoorEnv, 'DESTINATION_ATTESTATION_PRIVATE_JWK'>,
 ): Promise<Record<string, unknown> | null> {
   if (!attestation?.payload || typeof attestation.signature !== 'string') return null;
   let privateJwk: JsonWebKey;
   try { privateJwk = JSON.parse(env.DESTINATION_ATTESTATION_PRIVATE_JWK) as JsonWebKey; } catch { return null; }
-  const { d: _private, ...publicJwk } = privateJwk;
+  const { d: _private, key_ops: _privateOperations, ...publicJwk } = privateJwk;
   const signature = decodeSegment(attestation.signature);
   if (!signature) return null;
   try {
@@ -1217,6 +1710,32 @@ function exactSessionIds(value: unknown): string[] | null {
   if (!Array.isArray(value) || value.length === 0 || value.some((id) => typeof id !== 'string' || !id || id.length > 256)) return null;
   const sorted = [...value].sort();
   return new Set(sorted).size === sorted.length && JSON.stringify(sorted) === JSON.stringify(value) ? sorted : null;
+}
+
+async function readExactBoundedBody(request: Request, expectedBytes: number): Promise<ArrayBuffer | null> {
+  const contentLength = request.headers.get('content-length');
+  if (contentLength !== null && (!/^(?:0|[1-9]\d*)$/.test(contentLength) || Number(contentLength) !== expectedBytes)) {
+    try { await request.body?.cancel(); } catch { /* The mismatch is already terminal for this request. */ }
+    return null;
+  }
+  if (!request.body) return expectedBytes === 0 ? new ArrayBuffer(0) : null;
+  const output = new Uint8Array(expectedBytes);
+  const reader = request.body.getReader();
+  let offset = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) return offset === expectedBytes ? output.buffer : null;
+      if (offset + value.byteLength > expectedBytes) {
+        await reader.cancel();
+        return null;
+      }
+      output.set(value, offset);
+      offset += value.byteLength;
+    }
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 export function validLoopbackCallback(value: string): boolean {
@@ -1386,11 +1905,10 @@ async function destinationRoute(
       actor: access.actor,
       expiresAt,
       publicKeyJwk,
-      privateKeyJwk,
       sessionIds,
     };
     const stored = await objectStub(env, publicPr).fetch('https://edge.internal/destination-create', {
-      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(record),
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...record, privateKeyJwk }),
     });
     if (!stored.ok) return stored;
     const result = {
@@ -1446,18 +1964,26 @@ async function destinationRoute(
       || manifest.format !== 1 || manifest.inventoryDigest !== claims?.inventoryDigest
       || JSON.stringify(manifest.sessionIds) !== JSON.stringify(sessionIds)
       || manifest.objectCount !== manifest.objects?.length
-      || manifest.totalSize > Number(claims?.maxBytes)
+      || !validDestinationManifestTotals(manifest, Number(claims?.maxBytes))
       || manifest.expiresAt > Number(claims?.exp)
-      || new Set(manifest.objects?.map((item) => item.objectId)).size !== manifest.objectCount
+      || new Set(manifest.objects.map((item) => item.objectId)).size !== manifest.objectCount
     ) return json({ error: 'attestation_manifest_mismatch' }, 403);
-    const consumed = await objectStub(env, pr).fetch('https://edge.internal/destination-consume', {
+    const stub = objectStub(env, pr);
+    const consumed = await stub.fetch('https://edge.internal/destination-consume', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }),
     });
     if (!consumed.ok) return consumed;
     const destination = await consumed.json() as DestinationRecord;
-    const stateResponse = await objectStub(env, pr).fetch('https://edge.internal/state');
+    const stateResponse = await stub.fetch('https://edge.internal/state');
+    if (!stateResponse.ok) {
+      await finishDestinationLifecycle(stub, id, 'failed');
+      return json({ error: 'destination_state_unavailable' }, 502);
+    }
     const state = await stateResponse.json() as PreviewState;
-    if (!destinationUsable(destination, state) || !state.live) return json({ error: 'live_tuple_changed' }, 409);
+    if (!destinationUsable(destination, state) || !state.live) {
+      await finishDestinationLifecycle(stub, id, 'failed');
+      return json({ error: 'live_tuple_changed' }, 409);
+    }
     const now = Date.now();
     const payload = {
       format: 1,
@@ -1479,24 +2005,47 @@ async function destinationRoute(
       assertion: { payload, signature: await signDebugImportPayload(env, payload) },
       manifest,
     });
-    const downstream = await forwardDebug(
-      env, state.live, pr, 'POST', '/api/v1/debug/imports', downstreamBody,
-      { 'content-type': 'application/json' }, fetchUpstream,
-    );
-    if (downstream.status !== 201) return downstream;
-    const result = await downstream.clone().json() as { importCapability?: string; requiredObjectIds?: string[]; expiresAt?: number };
-    if (!result.importCapability) return json({ error: 'invalid_upstream_response' }, 502);
+    let downstream: Response;
+    try {
+      downstream = await forwardDebug(
+        env, state.live, pr, 'POST', '/api/v1/debug/imports', downstreamBody,
+        { 'content-type': 'application/json' }, fetchUpstream,
+      );
+    } catch {
+      await finishDestinationLifecycle(stub, id, 'failed');
+      return json({ error: 'upstream_import_failed' }, 502);
+    }
+    if (downstream.status !== 201) {
+      await finishDestinationLifecycle(stub, id, 'failed');
+      return downstream;
+    }
+    let result: { importCapability?: string; requiredObjectIds?: string[]; expiresAt?: number };
+    try {
+      result = await downstream.clone().json() as typeof result;
+    } catch {
+      await finishDestinationLifecycle(stub, id, 'failed');
+      return json({ error: 'invalid_upstream_response' }, 502);
+    }
+    if (!result.importCapability || typeof result.expiresAt !== 'number' || !Number.isFinite(result.expiresAt) || result.expiresAt <= now) {
+      await finishDestinationLifecycle(stub, id, 'failed');
+      return json({ error: 'invalid_upstream_response' }, 502);
+    }
     const started: DestinationImport = {
       destination,
       manifest,
       upstreamCapability: result.importCapability,
       usedObjectIds: [],
-      committed: false,
+      reservedObjectIds: [],
+      state: 'pending',
+      expiresAt: Math.min(destination.expiresAt, manifest.expiresAt, result.expiresAt),
     };
-    const saved = await objectStub(env, pr).fetch('https://edge.internal/destination-start-import', {
+    const saved = await stub.fetch('https://edge.internal/destination-start-import', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ import: started }),
     });
-    if (!saved.ok) return saved;
+    if (!saved.ok) {
+      await finishDestinationLifecycle(stub, id, 'failed');
+      return saved;
+    }
     return json({
       importId: id,
       uploadBaseUrl: `https://pr-${pr}${PUBLIC_SUFFIX}/_destination/imports/${id}`,
@@ -1511,19 +2060,28 @@ async function destinationRoute(
     const claimsPr = publicPr;
     if (!claimsPr) return json({ error: 'wrong_destination_host' }, 400);
     const stub = objectStub(env, claimsPr);
-    const reserved = await stub.fetch('https://edge.internal/destination-object', {
+    const metadata = await stub.fetch('https://edge.internal/destination-object', {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, objectId }),
     });
-    if (!reserved.ok) return reserved;
-    const { import: value, object } = await reserved.json() as { import: DestinationImport; object: DebugManifestObject };
-    const ciphertext = await request.arrayBuffer();
-    if (
-      ciphertext.byteLength !== object.ciphertextSize
-      || await sha256Hex(ciphertext) !== object.ciphertextSha256
-    ) return json({ error: 'ciphertext_mismatch' }, 400);
+    if (!metadata.ok) return metadata;
+    const {
+      import: value,
+      object,
+      privateKeyJwk,
+    } = await metadata.json() as {
+      import: DestinationImport;
+      object: DebugManifestObject;
+      privateKeyJwk: JsonWebKey;
+    };
+    const ciphertext = await readExactBoundedBody(request, object.ciphertextSize);
+    if (!ciphertext || await sha256Hex(ciphertext) !== object.ciphertextSha256) {
+      return json({ error: 'ciphertext_mismatch' }, 400);
+    }
+
+    let plaintext: ArrayBuffer;
     try {
       const privateKey = await crypto.subtle.importKey(
-        'jwk', value.destination.privateKeyJwk, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['decrypt'],
+        'jwk', privateKeyJwk, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['decrypt'],
       );
       const wrappedKey = decodeSegment(object.wrappedKey);
       const nonce = decodeSegment(object.nonce);
@@ -1534,7 +2092,7 @@ async function destinationRoute(
       if (!wrappedKey || !nonce) return json({ error: 'invalid_encryption_metadata' }, 400);
       const rawKey = await crypto.subtle.decrypt({ name: 'RSA-OAEP' }, privateKey, wrappedKey);
       const aesKey = await crypto.subtle.importKey('raw', rawKey, { name: 'AES-GCM' }, false, ['decrypt']);
-      const plaintext = await crypto.subtle.decrypt(
+      plaintext = await crypto.subtle.decrypt(
         { name: 'AES-GCM', iv: nonce, additionalData: aad, tagLength: 128 },
         aesKey,
         ciphertext,
@@ -1542,37 +2100,81 @@ async function destinationRoute(
       if (plaintext.byteLength !== object.size || await sha256Hex(plaintext) !== object.sha256) {
         return json({ error: 'plaintext_mismatch' }, 400);
       }
-      const stateResponse = await stub.fetch('https://edge.internal/state');
-      const state = await stateResponse.json() as PreviewState;
-      if (!destinationUsable(value.destination, state) || !state.live) return json({ error: 'live_tuple_changed' }, 409);
-      const target = `/api/v1/debug/imports/${encodeURIComponent(value.upstreamCapability)}/objects/${encodeURIComponent(objectId)}`;
-      return forwardDebug(
+    } catch {
+      return json({ error: 'decrypt_failed' }, 400);
+    }
+
+    const stateResponse = await stub.fetch('https://edge.internal/state');
+    if (!stateResponse.ok) {
+      await finishDestinationLifecycle(stub, id, 'failed');
+      return json({ error: 'destination_state_unavailable' }, 502);
+    }
+    const state = await stateResponse.json() as PreviewState;
+    if (!destinationUsable(value.destination, state) || !state.live) {
+      await finishDestinationLifecycle(stub, id, 'failed');
+      return json({ error: 'live_tuple_changed' }, 409);
+    }
+    const reservation = await stub.fetch('https://edge.internal/destination-object-reserve', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, objectId }),
+    });
+    if (!reservation.ok) return reservation;
+
+    const target = `/api/v1/debug/imports/${encodeURIComponent(value.upstreamCapability)}/objects/${encodeURIComponent(objectId)}`;
+    let forwarded: Response;
+    try {
+      forwarded = await forwardDebug(
         env, state.live, claimsPr, 'PUT', target, plaintext,
         { 'content-type': 'application/octet-stream', 'x-content-hash': `sha256:${object.sha256}` },
         fetchUpstream,
       );
     } catch {
-      return json({ error: 'decrypt_failed' }, 400);
+      await finishDestinationObjectForward(stub, id, objectId, false);
+      return json({ error: 'upstream_object_failed' }, 502);
     }
+    const completed = await finishDestinationObjectForward(stub, id, objectId, forwarded.ok);
+    if (!completed.ok) return json({ error: 'object_state_update_failed' }, 502);
+    return forwarded;
   }
 
   const importMatch = /^\/_destination\/imports\/([A-Za-z0-9_-]+)$/.exec(url.pathname);
-  if (importMatch && (request.method === 'POST' || request.method === 'GET')) {
+  if (importMatch && ['POST', 'GET', 'DELETE'].includes(request.method)) {
     const pr = publicPr;
     if (!pr) return json({ error: 'wrong_destination_host' }, 400);
     const id = importMatch[1]!;
     const stub = objectStub(env, pr);
+    if (request.method === 'DELETE') return finishDestinationLifecycle(stub, id, 'aborted');
+
     const internalPath = request.method === 'POST' ? 'destination-commit' : 'destination-status';
     const resolved = await stub.fetch(`https://edge.internal/${internalPath}`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }),
     });
     if (!resolved.ok) return resolved;
-    const { import: value } = await resolved.json() as { import: DestinationImport };
+    const { import: value } = await resolved.json() as { import: StoredDestinationImport };
+    if (!pendingDestinationImport(value)) return json({ import: value });
+
     const stateResponse = await stub.fetch('https://edge.internal/state');
+    if (!stateResponse.ok) {
+      if (request.method === 'POST') await finishDestinationLifecycle(stub, id, 'failed');
+      return json({ error: 'destination_state_unavailable' }, 502);
+    }
     const state = await stateResponse.json() as PreviewState;
-    if (!destinationUsable(value.destination, state) || !state.live) return json({ error: 'live_tuple_changed' }, 409);
+    if (!destinationUsable(value.destination, state) || !state.live) {
+      await finishDestinationLifecycle(stub, id, 'failed');
+      return json({ error: 'live_tuple_changed' }, 409);
+    }
     const target = `/api/v1/debug/imports/${encodeURIComponent(value.upstreamCapability)}${request.method === 'POST' ? '/commit' : ''}`;
-    return forwardDebug(env, state.live, pr, request.method, target, undefined, {}, fetchUpstream);
+    let forwarded: Response;
+    try {
+      forwarded = await forwardDebug(env, state.live, pr, request.method, target, undefined, {}, fetchUpstream);
+    } catch {
+      if (request.method === 'POST') await finishDestinationLifecycle(stub, id, 'failed');
+      return json({ error: 'upstream_import_failed' }, 502);
+    }
+    if (request.method === 'POST') {
+      const finished = await finishDestinationLifecycle(stub, id, forwarded.ok ? 'committed' : 'failed');
+      if (!finished.ok) return json({ error: 'import_state_update_failed' }, 502);
+    }
+    return forwarded;
   }
 
   return json({ error: 'not_found' }, 404);

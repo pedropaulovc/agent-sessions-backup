@@ -1,12 +1,8 @@
 import { defineConfig, devices } from '@playwright/test';
-import { randomUUID } from 'node:crypto';
-import { tmpdir } from 'node:os';
-import path from 'node:path';
+import { previewStorageStatePath } from './e2e/storage-state';
 
 const previewBootstrapFile = process.env.PREVIEW_BOOTSTRAP_FILE?.trim();
-const previewStorageState = previewBootstrapFile
-  ? path.join(tmpdir(), `sessions-hub-playwright-${process.pid}-${randomUUID()}.json`)
-  : undefined;
+const previewStorageState = previewStorageStatePath(previewBootstrapFile, process.env);
 
 export default defineConfig({
   testDir: './e2e',

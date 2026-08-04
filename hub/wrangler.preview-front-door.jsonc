@@ -11,6 +11,17 @@
     { "pattern": "*-preview.sessions.vza.net/*", "zone_name": "vza.net" },
     { "pattern": "preview-control.sessions.vza.net/*", "zone_name": "vza.net" }
   ],
+  "vars": {
+    "ACCESS_ALLOWED_EMAILS": "pedro@vezza.com.br",
+    "PREVIEW_CONTROL_REPOSITORY": "pedropaulovc/agent-sessions-backup",
+    "PREVIEW_CONTROL_DEFAULT_REF": "refs/heads/main",
+    "PREVIEW_CONTROL_DEPLOY_AUD": "urn:sessions:preview-control:deploy:v1",
+    "PREVIEW_CONTROL_CLOSE_AUD": "urn:sessions:preview-control:close:v1",
+    "PREVIEW_CONTROL_JANITOR_AUD": "urn:sessions:preview-control:janitor:v1",
+    "PREVIEW_CONTROL_DEPLOY_WORKFLOW_REF": "pedropaulovc/agent-sessions-backup/.github/workflows/preview-control.yml@refs/heads/main",
+    "PREVIEW_CONTROL_CLOSE_WORKFLOW_REF": "pedropaulovc/agent-sessions-backup/.github/workflows/preview-close.yml@refs/heads/main",
+    "PREVIEW_CONTROL_JANITOR_WORKFLOW_REF": "pedropaulovc/agent-sessions-backup/.github/workflows/preview-janitor.yml@refs/heads/main"
+  },
   "durable_objects": {
     "bindings": [
       { "name": "PREVIEW_EDGE_AUTH", "class_name": "PreviewEdgeAuth" }

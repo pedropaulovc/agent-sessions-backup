@@ -5,9 +5,11 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
   assertContainedRegularFile,
+  assertTrustedWorkflowRef,
   fail,
   fileRecord,
   generatedBuildConfig,
+  migrationArtifactSqlNames,
   headSha,
   parseArgs,
   positiveInteger,
@@ -40,10 +42,7 @@ const sha = headSha(args['head-sha']);
 const sourceRunId = positiveInteger(args['source-run-id'], 'source workflow run ID');
 const buildRunId = positiveInteger(args['build-run-id'], 'build workflow run ID');
 const runAttempt = positiveInteger(args['run-attempt'], 'run attempt');
-const workflowRef = args['workflow-ref'];
-if (!workflowRef?.endsWith('/.github/workflows/preview-control.yml@refs/heads/main')) {
-  fail('build must run from the trusted default-branch preview-control workflow');
-}
+const workflowRef = assertTrustedWorkflowRef(repository, args['workflow-ref']);
 
 const sourceHub = path.join(sourceRoot, 'hub');
 const trustedHub = path.join(trustedRoot, 'hub');
@@ -66,7 +65,7 @@ try {
   const names = resourceNames(pr, sourceRunId, sha);
   const buildConfig = generatedBuildConfig({
     main: path.join(sourceHub, 'src', 'preview.ts'),
-    workerName: names.worker,
+    workerName: names.app,
   });
   const configPath = path.join(temporary, 'wrangler.preview-build.json');
   const metafilePath = path.join(temporary, 'esbuild-meta.json');
@@ -107,7 +106,7 @@ try {
 
   const migrationDir = path.join(sourceHub, 'migrations');
   const migrationNames = (await readdir(migrationDir)).sort();
-  if (migrationNames.length < 2 || !migrationNames.includes('manifest.json')) fail('preview artifact has no migration manifest');
+  const migrationSqlNames = migrationArtifactSqlNames(migrationNames);
   const sourceMigrationManifest = JSON.parse(await readFile(path.join(migrationDir, 'manifest.json'), 'utf8'));
   if (sourceMigrationManifest.formatVersion !== 1
     || sourceMigrationManifest.hashEncoding !== 'sha256-canonical-lf'
@@ -119,8 +118,7 @@ try {
   const migrations = [];
   const numericPrefixes = new Set();
   const declaredByName = new Map(sourceMigrationManifest.migrations.map((item) => [item.filename, item]));
-  for (const name of migrationNames.filter((entry) => entry !== 'manifest.json')) {
-    if (!/^[0-9]{4}_[a-z0-9_]+\.sql$/.test(name)) fail(`unexpected migration entry: ${name}`);
+  for (const name of migrationSqlNames) {
     const prefix = name.slice(0, 4);
     if (numericPrefixes.has(prefix)) fail(`duplicate migration numeric prefix: ${prefix}`);
     numericPrefixes.add(prefix);

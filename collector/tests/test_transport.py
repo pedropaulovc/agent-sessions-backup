@@ -169,8 +169,10 @@ def test_build_upload_config_mtls_emits_cert_key_not_bogus_headers(tmp_path):
     t = Transport(MtlsAuth(client_cert_path=str(cert), client_key_path=str(key)))
     up = Upload("https://api.example/x", str(tmp_path / "body"), {"x-content-hash": "sha256:ab"})
     cfg = t._build_upload_config([up])
-    assert f'cert = "{cert}"' in cfg
-    assert f'key = "{key}"' in cfg
+    escaped_cert = str(cert).replace("\\", "\\\\")
+    escaped_key = str(key).replace("\\", "\\\\")
+    assert f'cert = "{escaped_cert}"' in cfg
+    assert f'key = "{escaped_key}"' in cfg
     # Regression guard: pre-fix these went through the "everything is a header" path.
     assert 'header = "--cert"' not in cfg
     assert 'header = "--key"' not in cfg

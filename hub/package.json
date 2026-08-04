@@ -2,21 +2,29 @@
   "name": "sessions-hub",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=22.13.0"
+  },
   "scripts": {
     "dev:up": "node scripts/environment.mjs local",
     "dev:reset": "node scripts/environment.mjs reset",
+    "preview:open": "node scripts/preview-open.mjs",
     "session:seed-corpus": "node ../scripts/seed-local.mjs",
     "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run && npm run test:migrations",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.e2e.json",
+    "test": "vitest run && npm run test:migrations && npm run test:dev-lifecycle && npm run test:preview-open",
     "test:e2e": "playwright test",
+    "test:dev-lifecycle": "node --test test/dev-lifecycle.test.mjs",
+    "test:preview-open": "node --test test/preview-open.test.mjs",
     "test:migrations": "node scripts/migrations.mjs check-base && node --test test/migrations.acceptance.mjs",
-    "migrations": "node scripts/migrations.mjs"
+    "migrations": "node scripts/migrations.mjs",
+    "production-baseline": "node scripts/approve-production-baseline.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.18.5",
     "@cloudflare/workers-types": "^5.20260717.1",
     "@playwright/test": "1.62.1",
+    "@types/node": "^22.20.1",
     "typescript": "^5.9.0",
     "vitest": "^4.1.0",
     "wrangler": "^4.111.0"

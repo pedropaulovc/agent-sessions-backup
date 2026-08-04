@@ -1644,12 +1644,14 @@ describe('viewer', () => {
     expect(res.status).toBe(404);
   });
 
-  it('redirects to /login in preview when unauthenticated (publicly reachable previews)', async () => {
+  it('returns a terminal no-store 401 in preview when unauthenticated', async () => {
     const url = new URL('https://sessions.vza.net/');
     const previewEnv = { ...testEnv, ENVIRONMENT: 'preview' } as unknown as Env;
     const res = await viewerRoute(new Request(url.toString()), url, previewEnv);
-    expect(res.status).toBe(302);
-    expect(res.headers.get('location')).toBe('/login');
+    expect(res.status).toBe(401);
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    expect(res.headers.get('location')).toBeNull();
+    expect(await res.text()).toBe('unauthorized');
   });
 
   it('preview rejects legacy bearer and cookie credentials', async () => {
@@ -1660,8 +1662,9 @@ describe('viewer', () => {
       new Headers({ cookie: '__Host-preview-auth=legacy-secret' }),
     ]) {
       const res = await viewerRoute(new Request(url, { headers }), url, previewEnv);
-      expect(res.status).toBe(302);
-      expect(res.headers.get('location')).toBe('/login');
+      expect(res.status).toBe(401);
+      expect(res.headers.get('cache-control')).toBe('no-store');
+      expect(res.headers.get('location')).toBeNull();
       expect(res.headers.get('set-cookie')).toBeNull();
     }
   });
@@ -1675,7 +1678,7 @@ describe('viewer', () => {
 
   it('fails closed on an unrecognized or missing ENVIRONMENT (any non-development value is gated)', async () => {
     const url = new URL('https://sessions.vza.net/');
-    // A non-allowlisted ENVIRONMENT is treated like preview/production: no session → redirect to /login.
+    // A non-allowlisted ENVIRONMENT follows the production path: no session → redirect to /login.
     const bogus = { ...testEnv, ENVIRONMENT: 'staging' } as unknown as Env;
     const bogusRes = await viewerRoute(new Request(url.toString()), url, bogus);
     expect(bogusRes.status).toBe(302);

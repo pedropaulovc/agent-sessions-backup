@@ -5,6 +5,7 @@ import { createPublicKey, randomBytes } from 'node:crypto';
 import { runProcess, zero } from './secure.mjs';
 
 const CNG_PROVIDER = 'Microsoft Platform Crypto Provider';
+const TPM_PROCESS_TIMEOUT_MS = 120_000;
 
 export function platformKeyProvider(stateDirectory, options = {}) {
   if (process.platform === 'win32') return new WindowsCngKeyProvider(options.runProcess ?? runProcess);
@@ -59,7 +60,7 @@ export class WindowsCngKeyProvider {
   #powershell(script, extraEnv = {}, stdin) {
     const encoded = Buffer.from(script, 'utf16le').toString('base64');
     return this.run('powershell.exe', ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
-      env: { ...process.env, PSModuleAutoLoadingPreference: 'None', ...extraEnv }, stdin,
+      env: { ...process.env, PSModuleAutoLoadingPreference: 'None', ...extraEnv }, stdin, timeoutMs: TPM_PROCESS_TIMEOUT_MS,
     });
   }
 }
@@ -68,7 +69,7 @@ export class LinuxTpm2KeyProvider {
   constructor(keyDirectory, run = runProcess) { this.keyDirectory = resolve(keyDirectory); this.run = run; }
   async available() {
     try {
-      const result = await this.run('openssl', ['list', '-providers', '-provider', 'default', '-provider', 'tpm2']);
+      const result = await this.run('openssl', ['list', '-providers', '-provider', 'default', '-provider', 'tpm2'], { timeoutMs: TPM_PROCESS_TIMEOUT_MS });
       return result.stdout.toString('utf8').includes('tpm2');
     } catch { return false; }
   }
@@ -79,10 +80,10 @@ export class LinuxTpm2KeyProvider {
     const keyRef = `${randomBytes(24).toString('hex')}.tss`;
     const path = join(this.keyDirectory, keyRef);
     try {
-      await this.run('openssl', ['genpkey', '-provider', 'default', '-provider', 'tpm2', '-propquery', 'provider=tpm2', '-algorithm', 'EC', '-pkeyopt', 'group:P-256', '-out', path]);
+      await this.run('openssl', ['genpkey', '-provider', 'default', '-provider', 'tpm2', '-propquery', 'provider=tpm2', '-algorithm', 'EC', '-pkeyopt', 'group:P-256', '-out', path], { timeoutMs: TPM_PROCESS_TIMEOUT_MS });
       await chmod(path, 0o600);
       await this.#assertReference(path);
-      const result = await this.run('openssl', ['pkey', '-provider', 'default', '-provider', 'tpm2', '-in', path, '-pubout', '-outform', 'DER']);
+      const result = await this.run('openssl', ['pkey', '-provider', 'default', '-provider', 'tpm2', '-in', path, '-pubout', '-outform', 'DER'], { timeoutMs: TPM_PROCESS_TIMEOUT_MS });
       return { provider: 'tpm2-pkcs11', keyRef, publicKeyJwk: createPublicKey({ key: result.stdout, format: 'der', type: 'spki' }).export({ format: 'jwk' }), hardwareBacked: true };
     } catch (error) {
       await rm(path, { force: true });
@@ -93,7 +94,7 @@ export class LinuxTpm2KeyProvider {
     const path = await this.#path(keyRef);
     const input = Buffer.from(bytes);
     try {
-      const result = await this.run('openssl', ['dgst', '-sha256', '-provider', 'default', '-provider', 'tpm2', '-sign', path], { stdin: input });
+      const result = await this.run('openssl', ['dgst', '-sha256', '-provider', 'default', '-provider', 'tpm2', '-sign', path], { stdin: input, timeoutMs: TPM_PROCESS_TIMEOUT_MS });
       return derEcdsaToP1363(result.stdout, 32);
     } finally { zero(input); }
   }

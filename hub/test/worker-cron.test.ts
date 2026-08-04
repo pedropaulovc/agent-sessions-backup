@@ -141,6 +141,21 @@ describe('scheduled handler', () => {
     expect(row?.usd, 'a failed price sync took the pricing pass down with it').toBeCloseTo(1, 6);
   });
 
+  it('expires debug exchange replay state only from scheduled maintenance', async () => {
+    const suffix = crypto.randomUUID();
+    await testEnv.DB.prepare(
+      'INSERT INTO debug_export_replays (jti,kind,expires_at) VALUES (?1,?2,?3), (?4,?5,?6)',
+    ).bind(`expired-${suffix}`, 'test', Date.now() - 1,
+      `live-${suffix}`, 'test', Date.now() + 600_000).run();
+
+    await fire('30 4 * * *');
+
+    const rows = await testEnv.DB.prepare(
+      'SELECT jti FROM debug_export_replays WHERE jti IN (?1,?2) ORDER BY jti',
+    ).bind(`expired-${suffix}`, `live-${suffix}`).all<{ jti: string }>();
+    expect(rows.results).toEqual([{ jti: `live-${suffix}` }]);
+  });
+
   it('does not refresh prices on the 15-minute watchdog tick', async () => {
     // 96 needless upstream fetches a day, and 96 audit rows, if these ever get crossed.
     await fire('*/15 * * * *');

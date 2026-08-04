@@ -4,7 +4,11 @@ import { createHash, randomBytes } from 'node:crypto';
 
 const MAX_OUTPUT = 1024 * 1024;
 
+const DEFAULT_PROCESS_TIMEOUT_MS = 120_000;
+
 export async function runProcess(command, args, options = {}) {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_PROCESS_TIMEOUT_MS;
+  if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('process timeout must be a positive finite number');
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd: options.cwd,
@@ -17,29 +21,43 @@ export async function runProcess(command, args, options = {}) {
     const stderr = [];
     let stdoutSize = 0;
     let stderrSize = 0;
+    let settled = false;
+    const finish = (settle, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      settle(value);
+    };
+    const fail = (error) => finish(reject, error);
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      fail(new Error(`${command} timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    timer.unref?.();
     const collect = (chunks, kind) => (chunk) => {
+      if (settled) return;
       if (kind === 'stdout') stdoutSize += chunk.length;
       else stderrSize += chunk.length;
       if (stdoutSize > MAX_OUTPUT || stderrSize > MAX_OUTPUT) {
-        child.kill();
-        reject(new Error(`${command} emitted excessive output`));
+        child.kill('SIGKILL');
+        fail(new Error(`${command} emitted excessive output`));
         return;
       }
       chunks.push(chunk);
     };
     child.stdout.on('data', collect(stdout, 'stdout'));
     child.stderr.on('data', collect(stderr, 'stderr'));
-    child.once('error', reject);
+    child.stdin.once('error', (error) => fail(new Error(`${command} stdin failed: ${error.message}`, { cause: error })));
+    child.once('error', fail);
     child.once('close', (code, signal) => {
       const out = Buffer.concat(stdout);
       const err = Buffer.concat(stderr);
       if (code !== 0) {
         const detail = err.toString('utf8').trim().slice(0, 1000);
-        reject(new Error(`${command} failed (${signal ?? code})${detail ? `: ${detail}` : ''}`));
-      } else resolve({ stdout: out, stderr: err });
+        fail(new Error(`${command} failed (${signal ?? code})${detail ? `: ${detail}` : ''}`));
+      } else finish(resolve, { stdout: out, stderr: err });
     });
-    if (options.stdin) child.stdin.end(options.stdin);
-    else child.stdin.end();
+    child.stdin.end(options.stdin);
   });
 }
 

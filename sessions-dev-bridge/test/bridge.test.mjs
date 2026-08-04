@@ -94,9 +94,10 @@ test('enroll binds the exact hardware public key, release, label, and local scop
       async enroll(value) {
         request = value.request;
         assert.equal(value.enrollment.transport, 'fake');
-        return { deviceId: request.deviceId, scope: 'local-destination-attest', expiresAt: request.expiresAt, counter: 7 };
+        return { deviceId: request.deviceId, scope: 'local-destination-attest', expiresAt: request.expiresAt + 60_000, counter: 7 };
       },
     },
+    clock: () => Date.parse('2026-08-03T12:00:00.000Z'),
   });
   const enrolled = await bridge.enroll('Developer device');
   assert.equal(enrolled.deviceId, request.deviceId);
@@ -107,6 +108,32 @@ test('enroll binds the exact hardware public key, release, label, and local scop
   assert.equal(saved.keyProvider, 'windows-cng-tpm');
   assert.equal(saved.keyRef, 'key-ref');
   assert.equal(saved.counter, 7);
+  assert.equal(saved.expiresAt, request.expiresAt);
+  assert.equal(enrolled.expiresAt, new Date(request.expiresAt).toISOString());
+});
+
+test('rejects an enrollment expiry that is no longer in the future and removes the new key', async () => {
+  const now = Date.parse('2026-08-03T12:00:00.000Z');
+  let removed = false;
+  const bridge = new SessionsDevBridge({
+    release,
+    state: { async saveEnrollment() { throw new Error('must not save expired enrollment'); } },
+    keyProvider: {
+      async available() { return true; },
+      async create() { return { hardwareBacked: true, provider: 'windows-cng-tpm', keyRef: 'key-ref', publicKeyJwk: { kty: 'EC', crv: 'P-256', x: 'eA', y: 'eQ' } }; },
+      async remove(value) { assert.equal(value, 'key-ref'); removed = true; },
+    },
+    enrollment: {},
+    authorization: {
+      async enroll({ request }) {
+        return { deviceId: request.deviceId, scope: 'local-destination-attest', expiresAt: now, counter: 0 };
+      },
+    },
+    clock: () => now,
+  });
+
+  await assert.rejects(bridge.enroll('Developer device'), /expiry that is already in the past/);
+  assert.equal(removed, true);
 });
 
 test('software key fallback remains disabled for enrollment and local import', async () => {

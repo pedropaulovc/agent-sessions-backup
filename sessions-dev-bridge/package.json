@@ -12,7 +12,9 @@
   ],
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "release:provenance": "node release/create-provenance.mjs"
+    "prepack": "node release/verify-package.mjs",
+    "release:provenance": "node release/create-provenance.mjs",
+    "release:verify": "node release/verify-package.mjs"
   },
   "dependencies": {
     "@simplewebauthn/server": "13.3.2",

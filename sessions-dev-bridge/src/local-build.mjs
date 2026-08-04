@@ -33,6 +33,7 @@ export class EmbeddedBuildDriver {
   async build(checkout) {
     const root = await realpath(resolve(checkout));
     if (inside(root, bridgePackageRoot)) throw new Error('sessions-dev-bridge must be installed outside the target checkout');
+    await assertRepositoryRoot(root, this.runProcess);
     const entry = join(root, ...ENTRY.split('/'));
     await assertRepoFile(root, entry);
     const first = await this.#bundle(root, entry);
@@ -121,26 +122,89 @@ async function loadMigrations(root) {
 }
 
 async function consumedDirtyPaths(root, consumedPaths, run) {
-  const result = await run('git', ['-c', 'core.fsmonitor=false', '-c', 'core.untrackedCache=false', 'status', '--porcelain=v1', '-z', '--untracked-files=all'], {
-    cwd: root,
-    env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null', GIT_OPTIONAL_LOCKS: '0' },
-  });
-  const consumed = new Set(consumedPaths);
-  const fields = result.stdout.toString('utf8').split('\0');
+  const options = gitOptions(root);
+  const status = await run('git', [
+    '-c', 'core.fsmonitor=false',
+    '-c', 'core.untrackedCache=false',
+    'status', '--porcelain=v1', '-z', '--untracked-files=all',
+  ], options);
+  const ignored = await run('git', [
+    '-c', 'core.fsmonitor=false',
+    '-c', 'core.untrackedCache=false',
+    '--literal-pathspecs',
+    'ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--',
+    ...consumedPaths,
+  ], options);
+  const tracked = await run('git', [
+    '--literal-pathspecs',
+    'ls-files', '--cached', '-z', '--',
+    ...consumedPaths,
+  ], options);
+  const consumed = new Map(consumedPaths.map((path) => [Buffer.from(path, 'utf8').toString('hex'), path]));
   const dirty = new Set();
+  const represented = new Set();
+  const matchConsumed = (pathBytes) => consumed.get(pathBytes.toString('hex'));
+  const markDirty = (pathBytes) => {
+    const path = matchConsumed(pathBytes);
+    if (path !== undefined) {
+      represented.add(path);
+      dirty.add(path);
+    }
+  };
+  const fields = splitNulFields(status.stdout);
   for (let index = 0; index < fields.length; index++) {
     const field = fields[index];
-    if (!field) continue;
-    if (field.length < 4 || field[2] !== ' ') throw new Error('unexpected git status output');
-    const status = field.slice(0, 2);
-    const path = field.slice(3).split('\\').join('/');
-    if (consumed.has(path)) dirty.add(path);
-    if (status.includes('R') || status.includes('C')) {
-      const priorPath = fields[++index]?.split('\\').join('/');
-      if (priorPath && consumed.has(priorPath)) dirty.add(priorPath);
+    if (field.length < 4 || field[2] !== 0x20) throw new Error('unexpected git status output');
+    const statusCode = field.subarray(0, 2).toString('ascii');
+    markDirty(field.subarray(3));
+    if (statusCode.includes('R') || statusCode.includes('C')) {
+      const priorPath = fields[++index];
+      if (priorPath === undefined) throw new Error('unexpected git status output');
+      markDirty(priorPath);
     }
   }
+  for (const path of splitNulFields(ignored.stdout)) markDirty(path);
+  for (const pathBytes of splitNulFields(tracked.stdout)) {
+    const path = matchConsumed(pathBytes);
+    if (path !== undefined) represented.add(path);
+  }
+  if (represented.size !== consumed.size) {
+    const missing = consumedPaths.find((path) => !represented.has(path));
+    throw new Error(`build input is not represented as a repository file: ${missing}`);
+  }
   return [...dirty].sort();
+}
+
+async function assertRepositoryRoot(root, run) {
+  const result = await run('git', ['rev-parse', '--show-prefix'], gitOptions(root));
+  if (!result.stdout.equals(Buffer.from('\n'))) {
+    throw new Error('checkout must be the repository root');
+  }
+}
+
+function gitOptions(root) {
+  const env = { ...process.env };
+  for (const name of Object.keys(env)) {
+    if (name.toUpperCase().startsWith('GIT_')) delete env[name];
+  }
+  Object.assign(env, {
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: process.platform === 'win32' ? 'NUL' : '/dev/null',
+    GIT_OPTIONAL_LOCKS: '0',
+  });
+  return { cwd: root, env };
+}
+function splitNulFields(output) {
+  if (output.length === 0) return [];
+  if (output[output.length - 1] !== 0) throw new Error('unexpected unterminated git output');
+  const fields = [];
+  let start = 0;
+  for (let index = 0; index < output.length; index++) {
+    if (output[index] !== 0) continue;
+    if (index > start) fields.push(output.subarray(start, index));
+    start = index + 1;
+  }
+  return fields;
 }
 
 async function assertRepoFile(root, absolute) {

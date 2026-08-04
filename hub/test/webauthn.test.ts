@@ -96,6 +96,33 @@ describe('passkey auth', () => {
     await testEnv.DB.prepare('DELETE FROM webauthn_challenges').run();
   });
 
+  it('routes the local login, settings, and WebAuthn surfaces through the viewer router', async () => {
+    const development = { ...productionEnv, ENVIRONMENT: 'development' } as Env;
+
+    const loginUrl = new URL('http://localhost:8787/login');
+    const login = await viewerRoute(new Request(loginUrl), loginUrl, development);
+    expect(login.status).toBe(200);
+    expect(await login.text()).toContain('Sign in with passkey');
+
+    const settingsUrl = new URL('http://localhost:8787/settings');
+    const settings = await viewerRoute(new Request(settingsUrl), settingsUrl, development);
+    expect(settings.status).toBe(302);
+    expect(settings.headers.get('location')).toBe('/login');
+
+    const optionsUrl = new URL('http://localhost:8787/webauthn/auth/options');
+    const options = await viewerRoute(
+      new Request(optionsUrl, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', origin: optionsUrl.origin },
+        body: '{}',
+      }),
+      optionsUrl,
+      development,
+    );
+    expect(options.status).toBe(200);
+    expect(await options.json()).toEqual(expect.objectContaining({ challenge: expect.any(String) }));
+  });
+
   it('bootstraps the first passkey with the SETUP_TOKEN when zero credentials exist', async () => {
     const optRes = await call(post('/webauthn/register/options', { setup: SETUP }));
     expect(optRes.status).toBe(200);
@@ -158,15 +185,17 @@ describe('passkey auth', () => {
     // The same authenticated KV record and cookie are never authority in preview.
     const preview = { ...productionEnv, ENVIRONMENT: 'preview' } as Env;
     const replay = await viewerRoute(request, new URL(request.url), preview);
-    expect(replay.status).toBe(302);
-    expect(replay.headers.get('location')).toBe('/login');
+    expect(replay.status).toBe(401);
+    expect(replay.headers.get('cache-control')).toBe('no-store');
+    expect(replay.headers.get('location')).toBeNull();
   });
 
-  it('redirects the gated page to /login without a session cookie', async () => {
+  it('returns a terminal no-store 401 for a gated preview page without a browser assertion', async () => {
     const preview = { ...testEnv, ENVIRONMENT: 'preview' } as Env;
     const res = await viewerRoute(new Request(`${VIEWER}/`), new URL(`${VIEWER}/`), preview);
-    expect(res.status).toBe(302);
-    expect(res.headers.get('location')).toBe('/login');
+    expect(res.status).toBe(401);
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    expect(res.headers.get('location')).toBeNull();
   });
 
   it('rejects a state-changing POST whose Origin does not match (CSRF guard)', async () => {

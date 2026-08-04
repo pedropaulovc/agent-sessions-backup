@@ -1,6 +1,6 @@
-import { mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { join } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { assertExactKeys } from './canonical.mjs';
 
@@ -14,10 +14,13 @@ export function defaultStateDirectory() {
 }
 
 export class StateStore {
-  constructor(directory = defaultStateDirectory()) {
+  constructor(directory = defaultStateDirectory(), options = {}) {
     this.directory = directory;
     this.enrollmentPath = join(directory, 'enrollment.json');
     this.lockPath = join(directory, '.lock');
+    this.lockTimeoutMs = options.lockTimeoutMs ?? 10_000;
+    this.processIsAlive = options.processIsAlive ?? processIsAlive;
+    if (!Number.isFinite(this.lockTimeoutMs) || this.lockTimeoutMs < 0) throw new Error('lock timeout must be a non-negative finite number');
   }
 
   async loadEnrollment() {
@@ -61,19 +64,86 @@ export class StateStore {
 
   async #withLock(operation) {
     await mkdir(this.directory, { recursive: true, mode: 0o700 });
+    const owner = Object.freeze({
+      format: 1,
+      pid: process.pid,
+      acquiredAt: Date.now(),
+      token: randomBytes(16).toString('hex'),
+    });
     const started = Date.now();
     for (;;) {
-      try {
-        await mkdir(this.lockPath, { mode: 0o700 });
-        break;
-      } catch (error) {
-        if (error.code !== 'EEXIST') throw error;
-        if (Date.now() - started > 10_000) throw new Error('another bridge process owns the device state lock');
-        await new Promise((resolve) => setTimeout(resolve, 50));
+      if (await this.#tryAcquireLock(owner)) break;
+      if (await this.#lockIsStale()) {
+        await rm(this.lockPath, { recursive: true, force: true });
+        continue;
       }
+      if (Date.now() - started > this.lockTimeoutMs) {
+        throw new Error(`another bridge process owns the device state lock at ${this.lockPath}; remove that path only if no bridge process is running`);
+      }
+      await new Promise((resolve) => setTimeout(resolve, 50));
     }
     try { return await operation(); }
-    finally { await rm(this.lockPath, { recursive: true, force: true }); }
+    finally { await this.#releaseLock(owner); }
+  }
+
+  async #tryAcquireLock(owner) {
+    const candidate = `${this.lockPath}.${owner.pid}.${owner.token}`;
+    await mkdir(candidate, { mode: 0o700 });
+    try {
+      await writeFile(join(candidate, 'owner.json'), `${JSON.stringify(owner)}\n`, { mode: 0o600, flag: 'wx' });
+      try {
+        await rename(candidate, this.lockPath);
+        return true;
+      } catch (error) {
+        if (!['EEXIST', 'ENOTEMPTY', 'EPERM'].includes(error.code)) throw error;
+        try { await lstat(this.lockPath); }
+        catch (statError) {
+          if (statError.code === 'ENOENT') throw error;
+          throw statError;
+        }
+        return false;
+      }
+    } finally {
+      await rm(candidate, { recursive: true, force: true });
+    }
+  }
+
+  async #lockIsStale() {
+    let owner;
+    try { owner = JSON.parse(await readFile(join(this.lockPath, 'owner.json'), 'utf8')); }
+    catch (error) {
+      if (error.code === 'ENOENT' || error instanceof SyntaxError) return true;
+      throw error;
+    }
+    if (
+      owner?.format !== 1
+      || !Number.isSafeInteger(owner.pid)
+      || owner.pid <= 0
+      || !Number.isSafeInteger(owner.acquiredAt)
+      || !/^[0-9a-f]{32}$/.test(owner.token ?? '')
+    ) return true;
+    return !(await this.processIsAlive(owner.pid));
+  }
+
+  async #releaseLock(owner) {
+    let current;
+    try { current = JSON.parse(await readFile(join(this.lockPath, 'owner.json'), 'utf8')); }
+    catch (error) {
+      if (error.code === 'ENOENT') return;
+      throw error;
+    }
+    if (current.token === owner.token) await rm(this.lockPath, { recursive: true, force: true });
+  }
+}
+
+function processIsAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    if (error.code === 'ESRCH') return false;
+    if (error.code === 'EPERM') return true;
+    throw error;
   }
 }
 

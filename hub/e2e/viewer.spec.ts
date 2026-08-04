@@ -68,32 +68,37 @@ test.describe('synthetic sessions viewer', () => {
   test('stars and unstars a turn with same-origin posts that persist after reload', async ({ page, appURL }) => {
     await page.goto(appURL(`/s/${fixture.sessionId}?page=1`));
     const origin = new URL(page.url()).origin;
-    const initiallyStarred = page.getByRole('button', { name: 'Unstar turn' }).first();
-    if (await initiallyStarred.isVisible()) {
-      await initiallyStarred.click();
-      await expect(page.getByRole('button', { name: 'Star turn' }).first()).toBeVisible();
+    const starToggle = page
+      .locator('form.turn-star')
+      .first()
+      .getByRole('button', { name: /^(?:Star|Unstar) turn$/ });
+
+    await expect(starToggle).toBeVisible();
+    await expect(starToggle).toHaveAttribute('aria-pressed', /^(?:true|false)$/);
+    if (await starToggle.getAttribute('aria-pressed') === 'true') {
+      await starToggle.click();
+      await expect(starToggle).toHaveAttribute('aria-pressed', 'false');
     }
-    const star = page.getByRole('button', { name: 'Star turn' }).first();
-    await expect(star).toHaveAttribute('aria-pressed', 'false');
+    await expect(starToggle).toHaveAccessibleName('Star turn');
 
     const starRequest = page.waitForRequest((request) =>
       request.method() === 'POST' && /\/turns\/\d+\/star(?:\?|$)/.test(request.url()),
     );
-    await star.click();
+    await starToggle.click();
     expect(new URL((await starRequest).url()).origin).toBe(origin);
-    const unstar = page.getByRole('button', { name: 'Unstar turn' }).first();
-    await expect(unstar).toHaveAttribute('aria-pressed', 'true');
+    await expect(starToggle).toHaveAttribute('aria-pressed', 'true');
+    await expect(starToggle).toHaveAccessibleName('Unstar turn');
     await page.reload();
-    await expect(page.getByRole('button', { name: 'Unstar turn' }).first()).toHaveAttribute('aria-pressed', 'true');
+    await expect(starToggle).toHaveAttribute('aria-pressed', 'true');
 
     const unstarRequest = page.waitForRequest((request) =>
       request.method() === 'POST' && /\/turns\/\d+\/unstar(?:\?|$)/.test(request.url()),
     );
-    await page.getByRole('button', { name: 'Unstar turn' }).first().click();
+    await starToggle.click();
     expect(new URL((await unstarRequest).url()).origin).toBe(origin);
-    await expect(page.getByRole('button', { name: 'Star turn' }).first()).toHaveAttribute('aria-pressed', 'false');
+    await expect(starToggle).toHaveAttribute('aria-pressed', 'false');
     await page.reload();
-    await expect(page.getByRole('button', { name: 'Star turn' }).first()).toHaveAttribute('aria-pressed', 'false');
+    await expect(starToggle).toHaveAttribute('aria-pressed', 'false');
   });
 
   test('loads inline blobs and captured assets as browser subresources', async ({ page, appURL }) => {

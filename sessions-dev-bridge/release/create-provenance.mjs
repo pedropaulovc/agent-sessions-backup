@@ -1,9 +1,9 @@
-import { createPublicKey } from 'node:crypto';
 import { lstat, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { sign } from 'sigstore';
 import { canonicalBytes, sha256 } from '../src/canonical.mjs';
+import { validateProductionManifestKeys } from '../src/production-keys.mjs';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const expected = {
@@ -17,9 +17,12 @@ for (const [field, value] of [['GITHUB_REPOSITORY', expected.repository], ['GITH
 if (process.env.GITHUB_WORKFLOW_REF !== `${expected.repository}/${expected.workflow}@${expected.ref}`) throw new Error('provenance may only be created by the protected bridge release workflow');
 if (!/^[0-9a-f]{40}$/.test(process.env.GITHUB_SHA ?? '') || !/^[1-9][0-9]*$/.test(process.env.GITHUB_RUN_ID ?? '')) throw new Error('invalid GitHub release identity');
 const manifestJwk = JSON.parse(process.env.DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK ?? 'null');
-if (!manifestJwk || manifestJwk.kty !== 'EC' || manifestJwk.crv !== 'P-256' || manifestJwk.d !== undefined) throw new Error('DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK must be a public P-256 JWK');
-createPublicKey({ key: manifestJwk, format: 'jwk' });
-await writeFile(join(root, 'src', 'production-manifest-key.json'), `${JSON.stringify({ keys: [manifestJwk] })}\n`, { mode: 0o644 });
+let productionKeys;
+try { productionKeys = validateProductionManifestKeys({ keys: [manifestJwk] }); }
+catch (error) {
+  throw new Error('DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK must be a public P-256 JWK', { cause: error });
+}
+await writeFile(join(root, 'src', 'production-manifest-key.json'), `${JSON.stringify(productionKeys)}\n`, { mode: 0o644 });
 
 const metadata = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'));
 const paths = ['package.json', ...(await runtimeFiles(join(root, 'src')))].sort();
@@ -44,7 +47,7 @@ const sigstoreBundle = await sign(canonicalBytes(manifest));
 const destination = join(root, 'release-provenance.json');
 const temporary = `${destination}.${process.pid}.tmp`;
 try {
-  await writeFile(temporary, `${JSON.stringify({ manifest, sigstoreBundle })}\n`, { mode: 0o600, flag: 'wx' });
+  await writeFile(temporary, `${JSON.stringify({ manifest, sigstoreBundle })}\n`, { mode: 0o644, flag: 'wx' });
   await rename(temporary, destination);
 } finally { await rm(temporary, { force: true }); }
 

@@ -1,5 +1,6 @@
 import re
 import types
+from pathlib import Path
 
 from agent_collector import schedule
 from agent_collector.schedule import systemd, taskscheduler
@@ -19,7 +20,7 @@ def test_task_executes_sibling_pythonw_with_module_arguments(monkeypatch):
     monkeypatch.setattr(taskscheduler.sys, "executable", "C:/tools/venv/Scripts/python.exe")
     script = taskscheduler._install_script(15)
     execute, argument = _parse_action(script)
-    assert execute == "C:/tools/venv/Scripts/pythonw.exe"
+    assert Path(execute) == Path("C:/tools/venv/Scripts/pythonw.exe")
     assert argument == "-m agent_collector.cli run --once"
     # arguments must NOT be folded into -Execute
     assert "agent_collector.cli" not in execute
@@ -29,8 +30,10 @@ def test_task_executes_sibling_pythonw_with_module_arguments(monkeypatch):
 def test_apostrophe_in_path_doubled_in_ps_literal(monkeypatch):
     monkeypatch.setattr(taskscheduler.sys, "executable", "C:/Users/O'Neil/venv/python.exe")
     script = taskscheduler._install_script(15)
-    assert "C:/Users/O''Neil/venv/pythonw.exe" in script
-    assert "C:/Users/O'Neil/venv/pythonw.exe" not in script
+    expected = str(Path("C:/Users/O'Neil/venv/python.exe").with_name("pythonw.exe"))
+    escaped = expected.replace("'", "''")
+    assert f"-Execute '{escaped}'" in script
+    assert f"-Execute '{expected}'" not in script
 
 
 def test_windows_install_fails_before_registration_when_pythonw_is_missing(tmp_path, monkeypatch, capsys):

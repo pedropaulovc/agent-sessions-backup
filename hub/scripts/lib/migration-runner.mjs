@@ -3,8 +3,10 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  canonicalJson,
   loadAndValidateManifest,
   migrationDigest,
+  sha256,
   validateHistoricalBaseline,
   verifySignedCanonicalPayload,
   verifySignedReleaseManifest,
@@ -117,6 +119,22 @@ function assertAppliedManifest(manifest, appliedNames) {
   }
 }
 
+function assertAppliedManifestPrefix(manifest, appliedNames) {
+  const expected = manifest.migrations.map((entry) => entry.filename);
+  if (appliedNames.length > expected.length
+      || appliedNames.some((name, index) => name !== expected[index])) {
+    throw new Error(`applied D1 migration history is not an immutable manifest prefix: found ${appliedNames.join(', ')}`);
+  }
+}
+
+function countPendingMigrations(manifest, appliedNames) {
+  const applied = new Set(appliedNames);
+  return manifest.migrations.reduce(
+    (count, migration) => count + (applied.has(migration.filename) ? 0 : 1),
+    0,
+  );
+}
+
 async function recordLedger(client, manifest, artifactDigest, deploymentId) {
   for (const entry of manifest.migrations.filter((migration) => migration.sequence >= manifest.ledgerStartsAt)) {
     await client.query(`
@@ -193,16 +211,58 @@ async function validateBaseline(options, manifest, digest) {
   }
   const envelope = JSON.parse(await readFile(options.baselinePath, 'utf8'));
   const baseline = verifySignedCanonicalPayload(envelope, options.baselinePublicKey, 'production schema baseline');
+  const historyDigest = sha256(`${canonicalJson(history)}\n`);
+  const approvedAt = Date.parse(baseline.approvedAt);
+  const measuredAt = Date.parse(baseline.measuredAt);
   if (baseline.kind !== 'production-schema-baseline'
       || baseline.approved !== true
       || baseline.throughSequence !== manifest.ledgerStartsAt - 1
       || baseline.migrationDigest !== digest
+      || baseline.historicalBaselineDigest !== historyDigest
       || !DIGEST.test(baseline.schemaDigest ?? '')
       || typeof baseline.approvedBy !== 'string'
-      || typeof baseline.approvedAt !== 'string') {
+      || baseline.approvedBy.trim().length === 0
+      || typeof baseline.reason !== 'string'
+      || baseline.reason.trim().length < 10
+      || typeof baseline.measuredAt !== 'string'
+      || !Number.isFinite(measuredAt)
+      || typeof baseline.approvedAt !== 'string'
+      || !Number.isFinite(approvedAt)
+      || approvedAt < measuredAt) {
     throw new Error('production historical baseline is incomplete or not explicitly human-approved');
   }
   return baseline;
+}
+
+export function migrationDeploymentIdentity({ target, stateName, artifactDigest, migrationDigest: digest }) {
+  if (!DIGEST.test(artifactDigest ?? '') || !DIGEST.test(digest ?? '')) {
+    throw new Error('local migration identity requires artifact and migration SHA-256 digests');
+  }
+  if (!['local', 'e2e'].includes(target) || typeof stateName !== 'string' || !stateName) {
+    throw new Error('invalid local migration identity');
+  }
+  return {
+    journalName: `${artifactDigest}-${digest}.json`,
+    deploymentId: `${target}:${stateName}:${artifactDigest}:${digest}`,
+  };
+}
+
+export async function resolveMigrationDigest(options = {}) {
+  const migrationsDir = options.migrationsDir ?? defaultMigrationsDir;
+  const { digest } = await loadAndValidateManifest({
+    migrationsDir,
+    manifestPath: options.manifestPath ?? path.join(migrationsDir, 'manifest.json'),
+    baseManifestPath: options.baseManifestPath ?? defaultSourceBaselinePath,
+  });
+  return digest;
+}
+
+export async function measureRemoteSchemaDigest(options) {
+  if (options?.target !== 'production') {
+    throw new Error('production schema measurement requires target production');
+  }
+  const client = wranglerClient(options);
+  return schemaDigest(await remoteSchemaSnapshot(client));
 }
 
 export async function runMigrations(options) {
@@ -217,6 +277,9 @@ export async function runMigrations(options) {
     manifestPath: options.manifestPath ?? path.join(migrationsDir, 'manifest.json'),
     baseManifestPath: options.baseManifestPath ?? defaultSourceBaselinePath,
   });
+  if (options.expectedMigrationDigest && options.expectedMigrationDigest !== digest) {
+    throw new Error('migration manifest changed after deployment identity was computed');
+  }
   const productionBaseline = await validateBaseline(options, manifest, digest);
   if (options.releaseManifest && options.releasePublicKey) {
     const release = verifySignedReleaseManifest(options.releaseManifest, options.releasePublicKey);
@@ -235,7 +298,16 @@ export async function runMigrations(options) {
     journalPath: options.journalPath,
     identity,
     apply: async () => {
-      await client.apply();
+      if (productionBaseline) {
+        const applied = await readAppliedNames(client);
+        assertAppliedManifestPrefix(manifest, applied);
+        if (countPendingMigrations(manifest, applied) > 0) {
+          const beforeDigest = schemaDigest(await remoteSchemaSnapshot(client));
+          if (productionBaseline.schemaDigest !== beforeDigest) {
+            throw new Error('production schema does not match the signed human-approved baseline before migration');
+          }
+        }
+      }
       await client.apply();
     },
     recordChecksums: async () => {
@@ -248,6 +320,7 @@ export async function runMigrations(options) {
     },
     verify: async () => {
       const applied = await readAppliedNames(client);
+      const pendingMigrations = countPendingMigrations(manifest, applied);
       assertAppliedManifest(manifest, applied);
       const ledger = await client.query(`
         SELECT sequence, filename, sha256 FROM migration_checksum_ledger ORDER BY sequence
@@ -255,13 +328,10 @@ export async function runMigrations(options) {
       assertLedger(manifest, ledger);
       const snapshot = await remoteSchemaSnapshot(client);
       const liveSchemaDigest = schemaDigest(snapshot);
-      if (productionBaseline && productionBaseline.schemaDigest !== liveSchemaDigest) {
-        throw new Error('production schema does not match the signed human-approved baseline');
-      }
       return {
         migrationDigest: digest,
         schemaDigest: liveSchemaDigest,
-        pendingMigrations: 0,
+        pendingMigrations,
       };
     },
     now: options.now,

@@ -1,6 +1,6 @@
 import { randomBytes } from 'node:crypto';
-import { mkdir, readFile, rm, stat, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 
 const OWNER_FILE = 'owner.json';
@@ -72,8 +72,8 @@ export function processStartIdentity(pid) {
   return posixProcessIdentity(pid);
 }
 
-export function recordMatchesLiveProcess(record) {
-  const current = processStartIdentity(record.pid);
+export function recordMatchesLiveProcess(record, inspectProcess = processStartIdentity) {
+  const current = inspectProcess(record.pid);
   return current !== null && current === record.processStartIdentity;
 }
 
@@ -86,46 +86,69 @@ async function readOptionalRecord(path, label) {
   }
 }
 
-export async function acquireOwnership(stateDir, nonce) {
+export async function acquireOwnership(stateDir, nonce, options = {}) {
+  const inspectProcess = options.inspectProcess ?? processStartIdentity;
   const lockDir = join(stateDir, LOCK_DIR);
   const ownerPath = join(lockDir, OWNER_FILE);
+  const runtimePath = join(stateDir, RUNTIME_FILE);
   await mkdir(stateDir, { recursive: true });
-  try {
-    await mkdir(lockDir);
-  } catch (error) {
-    if (error?.code !== 'EEXIST') throw error;
-    const owner = await readOptionalRecord(ownerPath, ownerPath);
-    if (!owner) {
-      const age = Date.now() - (await stat(lockDir)).mtimeMs;
-      if (age < 30_000) throw new Error(`environment ownership is being acquired: ${stateDir}`);
-      await rm(lockDir, { recursive: true, force: false });
-    } else {
-      if (recordMatchesLiveProcess(owner)) {
+
+  for (;;) {
+    try {
+      await mkdir(lockDir);
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+      const owner = await readOptionalRecord(ownerPath, 'environment owner');
+      const runtime = await readOptionalRecord(runtimePath, 'environment runtime');
+      if (owner && recordMatchesLiveProcess(owner, inspectProcess)) {
         throw new Error(`environment is owned by live process ${owner.pid}; nonce ${owner.nonce}`);
       }
-      await rm(lockDir, { recursive: true, force: false });
+      if (runtime && recordMatchesLiveProcess(runtime, inspectProcess)) {
+        throw new Error(`environment has live Wrangler process ${runtime.pid}; nonce ${runtime.nonce}`);
+      }
+      if (owner && runtime && owner.nonce !== runtime.nonce) {
+        throw new Error('stale environment owner and runtime records have mismatched nonces');
+      }
+      if (!owner) {
+        const age = Date.now() - (await stat(lockDir)).mtimeMs;
+        if (age < 30_000) throw new Error(`environment ownership is being acquired: ${stateDir}`);
+      }
+      const staleLock = `${lockDir}.stale-${nonce}`;
+      try {
+        await rename(lockDir, staleLock);
+      } catch (renameError) {
+        if (renameError?.code === 'ENOENT' || renameError?.code === 'EEXIST') continue;
+        throw renameError;
+      }
+      await rm(staleLock, { recursive: true, force: false });
+      continue;
     }
-    await mkdir(lockDir);
-  }
 
-  const processStart = processStartIdentity(process.pid);
-  if (!processStart) {
-    await rm(lockDir, { recursive: true, force: true });
-    throw new Error(`cannot establish the current process start identity for pid ${process.pid}`);
+    try {
+      const runtime = await readOptionalRecord(runtimePath, 'environment runtime');
+      if (runtime && recordMatchesLiveProcess(runtime, inspectProcess)) {
+        throw new Error(`environment has live Wrangler process ${runtime.pid}; nonce ${runtime.nonce}`);
+      }
+      const processStart = inspectProcess(process.pid);
+      if (!processStart) throw new Error(`cannot establish the current process start identity for pid ${process.pid}`);
+      const owner = {
+        version: 1,
+        pid: process.pid,
+        nonce,
+        processStartIdentity: processStart,
+        acquiredAt: new Date().toISOString(),
+      };
+      await writeFile(ownerPath, `${JSON.stringify(owner, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
+      return owner;
+    } catch (error) {
+      await rm(lockDir, { recursive: true, force: true });
+      throw error;
+    }
   }
-  const owner = {
-    version: 1,
-    pid: process.pid,
-    nonce,
-    processStartIdentity: processStart,
-    acquiredAt: new Date().toISOString(),
-  };
-  await writeFile(ownerPath, `${JSON.stringify(owner, null, 2)}\n`, { encoding: 'utf8', flag: 'wx' });
-  return owner;
 }
 
-export async function recordRuntime(stateDir, owner, childPid) {
-  const childStart = processStartIdentity(childPid);
+export async function recordRuntime(stateDir, owner, childPid, inspectProcess = processStartIdentity) {
+  const childStart = inspectProcess(childPid);
   if (!childStart) throw new Error(`cannot establish Wrangler process start identity for pid ${childPid}`);
   const runtime = {
     version: 1,
@@ -165,11 +188,11 @@ async function readEnvironmentManifest(stateDir) {
   return value;
 }
 
-async function matchingLiveNonce(stateDir, owner, runtime) {
+async function matchingLiveNonce(stateDir, runtime) {
   const manifest = await readEnvironmentManifest(stateDir);
   if (!manifest) return null;
-  if ((owner && owner.nonce !== manifest.environmentNonce) || (runtime && runtime.nonce !== manifest.environmentNonce)) {
-    throw new Error('refusing reset: ownership records and environment manifest have mismatched nonces');
+  if (runtime && runtime.nonce !== manifest.environmentNonce) {
+    throw new Error('refusing reset: runtime record and environment manifest have mismatched nonces');
   }
   try {
     const response = await fetch(`http://127.0.0.1:${manifest.port}/healthz`, { signal: AbortSignal.timeout(750) });
@@ -182,33 +205,23 @@ async function matchingLiveNonce(stateDir, owner, runtime) {
 }
 
 
-export async function assertResetIsUnowned(stateDir) {
-  const lockDir = join(stateDir, LOCK_DIR);
-  const owner = await readOptionalRecord(join(lockDir, OWNER_FILE), 'environment owner');
-  const runtime = await readOptionalRecord(join(stateDir, RUNTIME_FILE), 'environment runtime');
-
-  if (owner && recordMatchesLiveProcess(owner)) {
-    throw new Error(`refusing reset: environment owner ${owner.pid} is active (nonce ${owner.nonce})`);
+async function assertOwnedForReset(stateDir, owner, inspectProcess = processStartIdentity) {
+  const current = await readOptionalRecord(join(stateDir, LOCK_DIR, OWNER_FILE), 'environment owner');
+  if (!current || current.nonce !== owner.nonce || current.pid !== owner.pid ||
+      current.processStartIdentity !== owner.processStartIdentity) {
+    throw new Error('reset ownership changed before deletion');
   }
-  if (runtime && recordMatchesLiveProcess(runtime)) {
-    if (owner && owner.nonce !== runtime.nonce) {
-      throw new Error('refusing reset: live runtime and lock nonces disagree');
-    }
+  const runtime = await readOptionalRecord(join(stateDir, RUNTIME_FILE), 'environment runtime');
+  if (runtime && recordMatchesLiveProcess(runtime, inspectProcess)) {
     throw new Error(`refusing reset: Wrangler process ${runtime.pid} is active (nonce ${runtime.nonce})`);
   }
-  if (owner && runtime && owner.nonce !== runtime.nonce) {
-    throw new Error('refusing reset: stale ownership records have mismatched nonces');
-  }
-  const liveNonce = await matchingLiveNonce(stateDir, owner, runtime);
+  const liveNonce = await matchingLiveNonce(stateDir, runtime);
   if (liveNonce) throw new Error(`refusing reset: matching live environment nonce ${liveNonce} is active`);
+}
 
-
-  if (!owner) {
-    try {
-      const lock = await stat(lockDir);
-      if (Date.now() - lock.mtimeMs < 30_000) throw new Error('refusing reset: ownership acquisition may be in progress');
-    } catch (error) {
-      if (error?.code !== 'ENOENT') throw error;
-    }
-  }
+export async function removeOwnedState(stateDir, owner, options = {}) {
+  await assertOwnedForReset(stateDir, owner, options.inspectProcess);
+  const quarantine = join(dirname(stateDir), `.${owner.nonce}.reset`);
+  await rename(stateDir, quarantine);
+  await rm(quarantine, { recursive: true, force: false });
 }

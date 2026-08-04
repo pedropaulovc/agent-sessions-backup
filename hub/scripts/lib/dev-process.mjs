@@ -1,21 +1,6 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { createServer } from 'node:net';
 
-export function runChecked(command, args, options = {}) {
-  const result = spawnSync(command, args, {
-    cwd: options.cwd,
-    env: options.env ?? process.env,
-    encoding: 'utf8',
-    windowsHide: true,
-    maxBuffer: options.maxBuffer ?? 64 * 1024 * 1024,
-  });
-  if (result.error) throw new Error(`${options.label ?? command} could not start: ${result.error.message}`);
-  if (result.status !== 0) {
-    const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`.trim();
-    throw new Error(`${options.label ?? command} failed with exit ${result.status}${output ? `:\n${output}` : ''}`);
-  }
-  return { stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
-}
 export function runCaptured(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -23,7 +8,9 @@ export function runCaptured(command, args, options = {}) {
       env: options.env ?? process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
+      detached: process.platform !== 'win32',
     });
+    options.tracker?.track(child);
     let stdout = '';
     let stderr = '';
     child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
@@ -37,6 +24,40 @@ export function runCaptured(command, args, options = {}) {
 }
 
 
+
+export function createProcessTracker(terminate = terminateProcessTree) {
+  const children = new Set();
+  let terminating = null;
+  return {
+    track(child) {
+      children.add(child);
+      child.once('exit', () => children.delete(child));
+      child.once('error', () => children.delete(child));
+      return child;
+    },
+    async terminateAll(signal = 'SIGTERM') {
+      if (!terminating) {
+        terminating = (async () => {
+          const active = [...children];
+          const results = await Promise.allSettled(active.map((child) => terminate(child, signal)));
+          for (let index = 0; index < active.length; index += 1) {
+            if (results[index].status === 'fulfilled') children.delete(active[index]);
+          }
+          const failures = results.filter((result) => result.status === 'rejected').map((result) => result.reason);
+          if (failures.length) throw new AggregateError(failures, 'failed to terminate owned process trees');
+        })();
+      }
+      try {
+        await terminating;
+      } finally {
+        terminating = null;
+      }
+    },
+    get size() {
+      return children.size;
+    },
+  };
+}
 
 export async function reservePort(requested) {
   const port = Number(requested);
@@ -52,6 +73,26 @@ export async function reservePort(requested) {
     });
   });
 }
+export function isPortBindCollision(output) {
+  return /EADDRINUSE|address already in use|address.*in use/i.test(String(output));
+}
+
+export async function retryPortSelection(requested, launch, options = {}) {
+  const attempts = options.attempts ?? 5;
+  const reserve = options.reserve ?? reservePort;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const port = await reserve(requested);
+    try {
+      return await launch(port, attempt);
+    } catch (error) {
+      const retryable = Number(requested) === 0 && isPortBindCollision(error?.processOutput);
+      if (!retryable || attempt === attempts) throw error;
+      await options.onRetry?.(error, port, attempt);
+    }
+  }
+  throw new Error('port selection retry exhausted');
+}
+
 
 function waitForExit(child, timeoutMs) {
   if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve(true);
@@ -77,6 +118,10 @@ export async function terminateProcessTree(child, signal = 'SIGTERM') {
       encoding: 'utf8',
     });
     if (result.error && result.error.code !== 'ENOENT') throw result.error;
+    if (result.status !== 0 && !(await waitForExit(child, 250))) {
+      throw new Error(`taskkill failed for process tree ${child.pid}: ${result.stderr?.trim() || `exit ${result.status}`}`);
+    }
+    if (!(await waitForExit(child, 5000))) throw new Error(`process tree ${child.pid} did not exit after taskkill`);
     return;
   }
 
@@ -91,14 +136,17 @@ export async function terminateProcessTree(child, signal = 'SIGTERM') {
   } catch (error) {
     if (error?.code !== 'ESRCH') throw error;
   }
+  if (!(await waitForExit(child, 5000))) throw new Error(`process group ${child.pid} did not exit after SIGKILL`);
 }
 
 export function spawnOwned(command, args, options = {}) {
-  return spawn(command, args, {
+  const child = spawn(command, args, {
     cwd: options.cwd,
     env: options.env ?? process.env,
     stdio: ['inherit', 'pipe', 'pipe'],
     windowsHide: true,
     detached: process.platform !== 'win32',
   });
+  options.tracker?.track(child);
+  return child;
 }

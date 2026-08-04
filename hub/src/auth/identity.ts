@@ -9,6 +9,7 @@ const AUDIENCES = {
   origin: 'urn:sessions:preview:origin:v1',
 } as const;
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+const MUTATING_BODY_DIGESTS = new WeakMap<Request, Promise<string>>();
 
 type PreviewEnv = Env & {
   PREVIEW_ASSERTION_ISSUER?: string;
@@ -140,7 +141,15 @@ async function verifiedPreviewAssertion(request: Request, env: PreviewEnv, kind:
   if (!claims.jti || claims.jti.length > 128 || !/^[A-Za-z0-9_-]+$/.test(claims.jti)) return null;
   if (claims.pr !== Number(env.PREVIEW_PR_NUMBER) || claims.head !== env.PREVIEW_HEAD_SHA || claims.generation !== env.PREVIEW_GENERATION) return null;
   if (!target || claims.method !== request.method || claims.target !== target) return null;
-  const digest = MUTATING_METHODS.has(request.method) ? await sha256Hex(await request.clone().arrayBuffer()) : undefined;
+  let digest: string | undefined;
+  if (MUTATING_METHODS.has(request.method)) {
+    let pending = MUTATING_BODY_DIGESTS.get(request);
+    if (!pending) {
+      pending = request.clone().arrayBuffer().then(sha256Hex);
+      MUTATING_BODY_DIGESTS.set(request, pending);
+    }
+    digest = await pending;
+  }
   if (claims.bodyDigest !== digest) return null;
   if (kind === 'origin' && claims.artifactDigest !== env.PREVIEW_ARTIFACT_DIGEST) return null;
   return claims;

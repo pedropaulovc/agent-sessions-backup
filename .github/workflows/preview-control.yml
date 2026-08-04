@@ -125,6 +125,8 @@ jobs:
           CLOUDFLARE_PREVIEW_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_PREVIEW_CONTROL_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
+          DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK: ${{ vars.DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK }}
+          DEBUG_IMPORT_ASSERTION_PUBLIC_JWK: ${{ vars.DEBUG_IMPORT_ASSERTION_PUBLIC_JWK }}
           PREVIEW_ACTION_ASSERTION_JWKS: ${{ vars.PREVIEW_ACTION_ASSERTION_JWKS }}
           PREVIEW_ASSERTION_ISSUER: ${{ vars.PREVIEW_ASSERTION_ISSUER }}
           PREVIEW_BROWSER_ASSERTION_JWKS: ${{ vars.PREVIEW_BROWSER_ASSERTION_JWKS }}
@@ -144,8 +146,9 @@ jobs:
           --account-id "$CLOUDFLARE_PREVIEW_ACCOUNT_ID"
           --wrangler trusted/hub/node_modules/wrangler/bin/wrangler.js
           --migrations-cli trusted/hub/scripts/migrations.mjs
+          --trusted-root trusted
           --github-output "$GITHUB_OUTPUT"
-      - name: Remove unregistered partial generation
+      - name: Preserve tracked partial generation for exact rerun
         if: ${{ always() && steps.provision.outcome != 'success' }}
         env:
           CLOUDFLARE_PREVIEW_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}

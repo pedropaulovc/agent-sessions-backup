@@ -45,6 +45,8 @@ interface Env {
   CF_OAUTH_BROKER?: DurableObjectNamespace;
 }
 
+/** Debug maintenance shares the physical queue binding, but worker.queue runs at most one debug
+ * job and freshly re-enqueues every other message before returning from that invocation. */
 interface DebugExchangeMessage {
   debug: 'export-snapshot' | 'import-promote';
   job_id: string;

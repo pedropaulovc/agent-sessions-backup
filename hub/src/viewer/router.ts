@@ -20,13 +20,18 @@ import { sessionPage, TURNS_PER_PAGE } from './session';
 export async function viewerRoute(request: Request, url: URL, env: Env): Promise<Response> {
   // Preview has no local login or WebAuthn surface. Those routes would create/read a
   // production viewer session and must never be reachable through PR code.
-  if (env.ENVIRONMENT !== 'preview' && env.ENVIRONMENT !== 'development') {
+  if (env.ENVIRONMENT !== 'preview') {
     const authResp = await webauthnRoute(request, url, env);
     if (authResp) return authResp;
   }
 
   const access = await viewerAccess(request, env);
-  if (access === 'deny') return new Response(null, { status: 302, headers: { location: '/login' } });
+  if (access === 'deny') {
+    if (env.ENVIRONMENT === 'preview') {
+      return new Response('unauthorized', { status: 401, headers: { 'cache-control': 'no-store' } });
+    }
+    return new Response(null, { status: 302, headers: { location: '/login' } });
+  }
 
   const debug = await debugBrowserRoute(request, url, env);
   if (debug) return debug;

@@ -9,9 +9,9 @@ import { hex } from './ops';
 
 const TEXT = new TextEncoder();
 const MAX_SESSIONS = 16;
-const MAX_OBJECTS = 256;
-const MAX_OBJECT_BYTES = 128 * 1024 * 1024;
-const MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+export const MAX_OBJECTS = 32;
+export const MAX_OBJECT_BYTES = 8 * 1024 * 1024;
+export const MAX_TOTAL_BYTES = 32 * 1024 * 1024;
 const MAX_ACTIVE_PER_USER = 2;
 const MAX_DAILY_PER_USER = 10;
 const PREPARE_TTL_MS = 15 * 60_000;
@@ -93,7 +93,40 @@ function fromBase64url(value: string): Uint8Array | null {
 function randomToken(bytes = 32): string { return base64url(crypto.getRandomValues(new Uint8Array(bytes))); }
 function parseJson<T>(raw: string | null): T | null { if (!raw) return null; try { return JSON.parse(raw) as T; } catch { return null; } }
 async function bodyJson<T>(request: Request): Promise<T | null> { try { return await request.json() as T; } catch { return null; } }
+async function readBoundedBody(request: Request, maxBytes: number): Promise<Uint8Array | null> {
+  const declaredLength = request.headers.get('content-length');
+  if (declaredLength !== null
+      && (!/^\d+$/.test(declaredLength) || Number(declaredLength) > maxBytes)) return null;
+  if (!request.body) return new Uint8Array();
+  const reader = request.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.byteLength;
+    if (total > maxBytes) {
+      await reader.cancel();
+      return null;
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
 async function userFor(request: Request, env: Env): Promise<string | null> { if (env.ENVIRONMENT === 'development') return USER; return (await readSession(request, env))?.user ?? null; }
+function decodeRouteParameter(value: string): string | null {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+}
 function cleanIds(value: unknown): string[] | null {
   if (!Array.isArray(value) || value.length < 1 || value.length > MAX_SESSIONS) return null;
   const ids = [...new Set(value.filter((id): id is string => typeof id === 'string' && ID_RE.test(id)))].sort();
@@ -198,7 +231,9 @@ export async function debugBrowserRoute(request: Request, url: URL, env: Env, de
   if (url.pathname === '/debug/prepare' && request.method === 'GET') return preparePage(url);
   const consentPageMatch = url.pathname.match(/^\/debug\/jobs\/([^/]+)\/consent$/);
   if (consentPageMatch && request.method === 'GET') {
-    return finalConsentPage(url, decodeURIComponent(consentPageMatch[1]!), env, user);
+    const capability = decodeRouteParameter(consentPageMatch[1]!);
+    if (capability === null) return json({ error: 'bad_request' }, 400);
+    return finalConsentPage(url, capability, env, user);
   }
   if (url.pathname === '/debug/devices/enroll' && request.method === 'GET') {
     return deviceEnrollmentPage(url);
@@ -206,6 +241,10 @@ export async function debugBrowserRoute(request: Request, url: URL, env: Env, de
   if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
   if (url.pathname === '/debug/devices/enroll/options' && request.method === 'POST') {
     const metadata = validDeviceMetadata(await bodyJson<Record<string, unknown>>(request)); if (!metadata) return json({ error: 'bad_device_metadata' }, 400);
+    const existing = await env.DB.prepare(
+      'SELECT device_id FROM debug_export_devices WHERE device_id=?1',
+    ).bind(metadata.deviceId).first<{ device_id: string }>();
+    if (existing) return json({ error: 'device_already_enrolled' }, 409);
     return freshAuthenticationOptions(request, url, env, 'debug-device-enroll',
       await sha256(canonicalDebugJson({ metadata, scope: 'local-destination-attest', user })));
   }
@@ -216,13 +255,19 @@ export async function debugBrowserRoute(request: Request, url: URL, env: Env, de
       'debug-device-enroll',
       await sha256(canonicalDebugJson({ metadata, scope: 'local-destination-attest', user })), deps);
     if (!verified.verified) return json({ error: verified.error }, verified.status);
-    await env.DB.prepare("INSERT INTO debug_export_devices (device_id,user_id,label,public_jwk,release_digest,key_protection,scope,enrolled_at,expires_at) VALUES (?1,?2,?3,?4,?5,?6,'local-destination-attest',?7,?8)")
-      .bind(metadata.deviceId, user, metadata.label, canonicalDebugJson(metadata.publicJwk), metadata.releaseDigest, metadata.keyProtection, Date.now(), metadata.expiresAt).run();
+    const enrolled = await env.DB.prepare(
+      "INSERT INTO debug_export_devices (device_id,user_id,label,public_jwk,release_digest,key_protection,scope,enrolled_at,expires_at) VALUES (?1,?2,?3,?4,?5,?6,'local-destination-attest',?7,?8) ON CONFLICT(device_id) DO NOTHING RETURNING device_id",
+    ).bind(metadata.deviceId, user, metadata.label, canonicalDebugJson(metadata.publicJwk),
+      metadata.releaseDigest, metadata.keyProtection, Date.now(), metadata.expiresAt)
+      .first<{ device_id: string }>();
+    if (!enrolled) return json({ error: 'device_already_enrolled' }, 409);
     await audit(env, 'device.enrolled', { user, device: metadata.deviceId, detail: { releaseDigest: metadata.releaseDigest, expiresAt: metadata.expiresAt } }); return json({ enrolled: true, deviceId: metadata.deviceId }, 201);
   }
   const revoke = url.pathname.match(/^\/debug\/devices\/([^/]+)\/revoke\/(options|verify)$/);
   if (revoke && request.method === 'POST') {
-    const deviceId = decodeURIComponent(revoke[1]!); const row = await env.DB.prepare('SELECT device_id FROM debug_export_devices WHERE device_id=?1 AND user_id=?2 AND revoked_at IS NULL').bind(deviceId, user).first<{ device_id: string }>();
+    const deviceId = decodeRouteParameter(revoke[1]!);
+    if (deviceId === null) return json({ error: 'bad_request' }, 400);
+    const row = await env.DB.prepare('SELECT device_id FROM debug_export_devices WHERE device_id=?1 AND user_id=?2 AND revoked_at IS NULL').bind(deviceId, user).first<{ device_id: string }>();
     if (!row) return json({ error: 'not_found' }, 404); const binding = await sha256(canonicalDebugJson({ deviceId, operation: 'revoke' }));
     if (revoke[2] === 'options') return freshAuthenticationOptions(request, url, env, 'debug-device-revoke', binding);
     const body = await bodyJson<{ response?: AuthenticationResponseJSON }>(request); if (!body?.response) return json({ error: 'bad_request' }, 400);
@@ -231,7 +276,12 @@ export async function debugBrowserRoute(request: Request, url: URL, env: Env, de
   }
   if (url.pathname === '/debug/prepare' && request.method === 'POST') return prepareExport(request, env, user);
   const consent = url.pathname.match(/^\/debug\/jobs\/([^/]+)\/consent\/(options|verify)$/);
-  if (consent && request.method === 'POST') return finalConsent(request, url, env, user, consent[1]!, consent[2] as 'options' | 'verify', deps);
+  if (consent && request.method === 'POST') {
+    const capability = decodeRouteParameter(consent[1]!);
+    return capability === null
+      ? json({ error: 'bad_request' }, 400)
+      : finalConsent(request, url, env, user, capability, consent[2] as 'options' | 'verify', deps);
+  }
   return new Response('not found', { status: 404, headers: browserHeaders({ 'content-type': 'text/plain; charset=utf-8' }) });
 }
 
@@ -370,15 +420,41 @@ function sameDestination(a: DestinationPayload, b: DestinationPayload): boolean 
 }
 
 export async function debugApiRoute(request: Request, url: URL, env: Env): Promise<Response | null> {
-  if (!url.pathname.startsWith('/api/v1/debug/')) return null; await expireDebugState(env, 8);
+  if (!url.pathname.startsWith('/api/v1/debug/')) return null;
   if (url.pathname === '/api/v1/debug/prepare/exchange' && request.method === 'POST') return exchangePrepareCode(request, env);
-  const job = url.pathname.match(/^\/api\/v1\/debug\/jobs\/([^/]+)$/); if (job && request.method === 'GET') return pollExportJob(env, decodeURIComponent(job[1]!));
+  const job = url.pathname.match(/^\/api\/v1\/debug\/jobs\/([^/]+)$/);
+  if (job && request.method === 'GET') {
+    const capability = decodeRouteParameter(job[1]!);
+    return capability === null ? json({ error: 'bad_request' }, 400) : pollExportJob(env, capability);
+  }
   if (url.pathname === '/api/v1/debug/exchange' && request.method === 'POST') return exchangeGrant(request, env);
-  const object = url.pathname.match(/^\/api\/v1\/debug\/exchanges\/([^/]+)\/objects\/([^/]+)$/); if (object && request.method === 'GET') return downloadCiphertext(env, decodeURIComponent(object[1]!), decodeURIComponent(object[2]!));
+  const object = url.pathname.match(/^\/api\/v1\/debug\/exchanges\/([^/]+)\/objects\/([^/]+)$/);
+  if (object && request.method === 'GET') {
+    const capability = decodeRouteParameter(object[1]!);
+    const objectId = decodeRouteParameter(object[2]!);
+    return capability === null || objectId === null
+      ? json({ error: 'bad_request' }, 400)
+      : downloadCiphertext(env, capability, objectId);
+  }
   if (url.pathname === '/api/v1/debug/imports' && request.method === 'POST') return createImport(request, env);
-  const importObject = url.pathname.match(/^\/api\/v1\/debug\/imports\/([^/]+)\/objects\/([^/]+)$/); if (importObject && request.method === 'PUT') return uploadImportObject(request, env, decodeURIComponent(importObject[1]!), decodeURIComponent(importObject[2]!));
-  const importCommit = url.pathname.match(/^\/api\/v1\/debug\/imports\/([^/]+)\/commit$/); if (importCommit && request.method === 'POST') return commitImport(env, decodeURIComponent(importCommit[1]!));
-  const importPoll = url.pathname.match(/^\/api\/v1\/debug\/imports\/([^/]+)$/); if (importPoll && request.method === 'GET') return pollImport(env, decodeURIComponent(importPoll[1]!));
+  const importObject = url.pathname.match(/^\/api\/v1\/debug\/imports\/([^/]+)\/objects\/([^/]+)$/);
+  if (importObject && request.method === 'PUT') {
+    const capability = decodeRouteParameter(importObject[1]!);
+    const objectId = decodeRouteParameter(importObject[2]!);
+    return capability === null || objectId === null
+      ? json({ error: 'bad_request' }, 400)
+      : uploadImportObject(request, env, capability, objectId);
+  }
+  const importCommit = url.pathname.match(/^\/api\/v1\/debug\/imports\/([^/]+)\/commit$/);
+  if (importCommit && request.method === 'POST') {
+    const capability = decodeRouteParameter(importCommit[1]!);
+    return capability === null ? json({ error: 'bad_request' }, 400) : commitImport(env, capability);
+  }
+  const importPoll = url.pathname.match(/^\/api\/v1\/debug\/imports\/([^/]+)$/);
+  if (importPoll && request.method === 'GET') {
+    const capability = decodeRouteParameter(importPoll[1]!);
+    return capability === null ? json({ error: 'bad_request' }, 400) : pollImport(env, capability);
+  }
   return json({ error: 'not_found' }, 404);
 }
 async function exchangePrepareCode(request: Request, env: Env): Promise<Response> {
@@ -498,6 +574,14 @@ async function buildSnapshot(jobId: string, env: Env): Promise<void> {
     await env.DB.prepare("UPDATE debug_export_jobs SET status='awaiting_consent',inventory_digest=?2,inventory_size=?3,inventory_count=?4 WHERE job_id=?1 AND status='preparing'").bind(jobId, inventoryDigest, total, objects.length).run(); await audit(env, 'snapshot.created', { user: job.user_id, job: jobId, detail: { inventoryDigest, totalSize: total, objectCount: objects.length } });
   } catch (error) { await failJob(env, jobId, error); }
 }
+function appendSnapshotObject(objects: SnapshotObject[], object: SnapshotObject): void {
+  const nextTotal = objects.reduce((sum, current) => sum + current.bytes.byteLength, object.bytes.byteLength);
+  if (objects.length >= MAX_OBJECTS) throw new Error('object quota exceeded');
+  if (object.bytes.byteLength > MAX_OBJECT_BYTES || nextTotal > MAX_TOTAL_BYTES) {
+    throw new Error('byte quota exceeded');
+  }
+  objects.push(object);
+}
 async function collectSnapshotObjects(selected: string[], env: Env): Promise<SnapshotObject[]> {
   const placeholders = selected.map((_, i) => `?${i + 1}`).join(',');
   const fileRows = await env.DB.prepare(
@@ -519,21 +603,28 @@ async function collectSnapshotObjects(selected: string[], env: Env): Promise<Sna
     content_hash: string;
     harness: string | null;
   }>();
-  const objects: SnapshotObject[] = []; const assetKeys = new Set<string>();
+  const objects: SnapshotObject[] = [];
+  const assetKeys = new Set<string>();
   for (const file of fileRows.results) {
-    const linked = await env.DB.prepare('SELECT DISTINCT session_id FROM blocks WHERE file_id=?1 ORDER BY session_id')
-      .bind(file.id).all<{ session_id: string }>();
+    const linked = await env.DB.prepare(
+      'SELECT DISTINCT session_id FROM blocks WHERE file_id=?1 ORDER BY session_id',
+    ).bind(file.id).all<{ session_id: string }>();
     const linkedIds = linked.results.map((row) => row.session_id);
     const approvedForFile = linkedIds.filter((id) => selected.includes(id));
     if (approvedForFile.length === 0) continue;
     const raw = await env.RAW.get(file.r2_key);
     if (!raw) throw new Error('source object missing');
+    if (!Number.isSafeInteger(raw.size) || raw.size > MAX_OBJECT_BYTES) {
+      throw new Error('byte quota exceeded');
+    }
     const bytes = new Uint8Array(await raw.arrayBuffer());
     const sharedWithUnselected = linkedIds.some((id) => !selected.includes(id));
     for (const sessionId of approvedForFile) {
       const isolated = await isolateAndValidate(file, bytes, sessionId, sharedWithUnselected);
-      const objectId = await sha256(`source\0${file.id}\0${sessionId}\0${isolated.store}\0${isolated.relpath}\0${isolated.sha256}`);
-      objects.push({
+      const objectId = await sha256(
+        `source\0${file.id}\0${sessionId}\0${isolated.store}\0${isolated.relpath}\0${isolated.sha256}`,
+      );
+      appendSnapshotObject(objects, {
         objectId,
         kind: 'source',
         store: isolated.store,
@@ -542,10 +633,43 @@ async function collectSnapshotObjects(selected: string[], env: Env): Promise<Sna
         sha256: isolated.sha256,
         sessionIds: [sessionId],
       });
-      for (const asset of externalAssets(isolated.session)) { const suffix = assetRelSuffix(file.relpath, asset.digest, asset.fileName); const assetRow = await env.DB.prepare('SELECT store,relpath,r2_key,content_hash,size FROM files WHERE machine_id=?1 AND store=?2 AND relpath=?3').bind(file.machine_id, file.store, suffix).first<{store:string;relpath:string;r2_key:string;content_hash:string;size:number}>(); const key = assetRow?.r2_key ?? assetRelSuffix(file.r2_key, asset.digest, asset.fileName); if (assetKeys.has(key)) continue; const object = await env.RAW.get(key); if (!object) throw new Error('externalAsset closure incomplete'); const assetBytes = new Uint8Array(await object.arrayBuffer()); const digest = await sha256(assetBytes); if (assetRow && digest !== assetRow.content_hash) throw new Error('externalAsset hash mismatch'); const targetRelpath = assetRelSuffix(isolated.relpath, asset.digest, asset.fileName); const assetId = await sha256(`externalAsset\0${targetRelpath}\0${digest}`); objects.push({ objectId: assetId, kind: 'externalAsset', store: isolated.store, relpath: targetRelpath, bytes: assetBytes, sha256: digest, sessionIds: [sessionId] }); assetKeys.add(key); }
+      for (const asset of externalAssets(isolated.session)) {
+        const suffix = assetRelSuffix(file.relpath, asset.digest, asset.fileName);
+        const assetRow = await env.DB.prepare(
+          'SELECT store,relpath,r2_key,content_hash,size FROM files WHERE machine_id=?1 AND store=?2 AND relpath=?3',
+        ).bind(file.machine_id, file.store, suffix)
+          .first<{store:string;relpath:string;r2_key:string;content_hash:string;size:number}>();
+        const key = assetRow?.r2_key ?? assetRelSuffix(file.r2_key, asset.digest, asset.fileName);
+        if (assetKeys.has(key)) continue;
+        const object = await env.RAW.get(key);
+        if (!object) throw new Error('externalAsset closure incomplete');
+        if (!Number.isSafeInteger(object.size) || object.size > MAX_OBJECT_BYTES) {
+          throw new Error('byte quota exceeded');
+        }
+        const assetBytes = new Uint8Array(await object.arrayBuffer());
+        const digest = await sha256(assetBytes);
+        if (assetRow && digest !== assetRow.content_hash) throw new Error('externalAsset hash mismatch');
+        const targetRelpath = assetRelSuffix(isolated.relpath, asset.digest, asset.fileName);
+        const assetId = await sha256(`externalAsset\0${targetRelpath}\0${digest}`);
+        appendSnapshotObject(objects, {
+          objectId: assetId,
+          kind: 'externalAsset',
+          store: isolated.store,
+          relpath: targetRelpath,
+          bytes: assetBytes,
+          sha256: digest,
+          sessionIds: [sessionId],
+        });
+        assetKeys.add(key);
+      }
     }
   }
-  const covered = new Set(objects.flatMap((object) => object.kind === 'source' ? object.sessionIds : [])); if (selected.some((id) => !covered.has(id))) throw new Error('selected session cannot be isolated'); objects.sort((a, b) => a.objectId.localeCompare(b.objectId)); return objects;
+  const covered = new Set(objects.flatMap(
+    (object) => object.kind === 'source' ? object.sessionIds : [],
+  ));
+  if (selected.some((id) => !covered.has(id))) throw new Error('selected session cannot be isolated');
+  objects.sort((a, b) => a.objectId.localeCompare(b.objectId));
+  return objects;
 }
 async function isolateAndValidate(
   file: { store: string; relpath: string; harness: string | null },
@@ -706,7 +830,26 @@ async function createImport(request: Request, env: Env): Promise<Response> {
 function safeRelativePath(value: string): boolean { return value.length > 0 && value.length <= 1024 && !value.startsWith('/') && !value.includes('\\') && value.split('/').every((part) => part.length > 0 && part !== '.' && part !== '..'); }
 async function importJobByCap(env: Env, capability: string): Promise<{job_id:string;status:string;expires_at:number;checkpoint:number;object_count:number}|null> { if (!TOKEN_RE.test(capability)) return null; return env.DB.prepare('SELECT job_id,status,expires_at,checkpoint,object_count FROM debug_import_jobs WHERE capability_hash=?1').bind(await tokenHash(capability)).first(); }
 async function uploadImportObject(request: Request, env: Env, capability: string, objectId: string): Promise<Response> {
-  const job = await importJobByCap(env, capability); if (!job || job.status !== 'uploading' || job.expires_at <= Date.now()) return json({ error: 'not_found' }, 404); const object = await env.DB.prepare('SELECT staging_r2_key,size,sha256 FROM debug_import_objects WHERE job_id=?1 AND object_id=?2').bind(job.job_id, objectId).first<{ staging_r2_key:string;size:number;sha256:string }>(); const declared = request.headers.get('x-content-hash')?.match(/^sha256:([0-9a-f]{64})$/i)?.[1]?.toLowerCase(); if (!object || declared !== object.sha256) return json({ error: 'object_mismatch' }, 400); const bytes = await request.arrayBuffer(); if (bytes.byteLength !== object.size || await sha256(bytes) !== object.sha256) return json({ error: 'object_mismatch' }, 400); await env.RAW.put(object.staging_r2_key, bytes, { sha256: object.sha256 }); await audit(env, 'import.object_staged', { job: job.job_id, detail: { objectId, size: object.size } }); return json({ stored: true }, 201);
+  const job = await importJobByCap(env, capability);
+  if (!job || job.status !== 'uploading' || job.expires_at <= Date.now()) {
+    return json({ error: 'not_found' }, 404);
+  }
+  const object = await env.DB.prepare(
+    'SELECT staging_r2_key,size,sha256 FROM debug_import_objects WHERE job_id=?1 AND object_id=?2',
+  ).bind(job.job_id, objectId).first<{ staging_r2_key:string;size:number;sha256:string }>();
+  const declared = request.headers.get('x-content-hash')
+    ?.match(/^sha256:([0-9a-f]{64})$/i)?.[1]?.toLowerCase();
+  if (!object || declared !== object.sha256) return json({ error: 'object_mismatch' }, 400);
+  const bytes = await readBoundedBody(request, object.size);
+  if (!bytes || bytes.byteLength !== object.size || await sha256(bytes) !== object.sha256) {
+    return json({ error: 'object_mismatch' }, 400);
+  }
+  await env.RAW.put(object.staging_r2_key, bytes, { sha256: object.sha256 });
+  await audit(env, 'import.object_staged', {
+    job: job.job_id,
+    detail: { objectId, size: object.size },
+  });
+  return json({ stored: true }, 201);
 }
 async function commitImport(env: Env, capability: string): Promise<Response> {
   const job = await importJobByCap(env, capability); if (!job || job.status !== 'uploading' || job.expires_at <= Date.now()) return json({ error: 'not_found' }, 404); const objects = await env.DB.prepare('SELECT staging_r2_key,size,sha256 FROM debug_import_objects WHERE job_id=?1').bind(job.job_id).all<{staging_r2_key:string;size:number;sha256:string}>(); for (const object of objects.results) { const head = await env.RAW.head(object.staging_r2_key); if (!head || head.size !== object.size) return json({ error: 'objects_missing' }, 409); }

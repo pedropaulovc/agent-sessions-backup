@@ -1,12 +1,16 @@
 import { env } from 'cloudflare:test';
 import { zipSync, strToU8 } from 'fflate';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
+import worker from '../src/worker';
 import {
   canonicalDebugJson,
   consumeDebugExchangeMessage,
   debugApiRoute,
   debugBrowserRoute,
   debugCapabilityHash,
+  MAX_OBJECT_BYTES,
+  MAX_OBJECTS,
+  MAX_TOTAL_BYTES,
   sanitizeDebugObject,
 } from '../src/api/debug-exchange';
 
@@ -75,7 +79,19 @@ describe('production debug exchange boundaries', () => {
       tool: { authorization: 'Bearer production', result: 'keep' },
     });
     expect(cleaned).toEqual({ sessionId: 'selected', message: { text: 'keep', nested: [{ value: 1 }] }, tool: { result: 'keep' } });
+
     expect(JSON.stringify(cleaned)).not.toMatch(/credential|machineCert|alerts|isAdmin|Bearer production/);
+  });
+  it('caps buffered exchange objects at 8 MiB each and 32 MiB per job', () => {
+    expect({
+      maxObjects: MAX_OBJECTS,
+      maxObjectBytes: MAX_OBJECT_BYTES,
+      maxTotalBytes: MAX_TOTAL_BYTES,
+    }).toEqual({
+      maxObjects: 32,
+      maxObjectBytes: 8 * 1024 * 1024,
+      maxTotalBytes: 32 * 1024 * 1024,
+    });
   });
 
   it('isolates one conversation from a shared raw export and never snapshots the unselected session', async () => {
@@ -205,12 +221,14 @@ describe('production debug exchange boundaries', () => {
     expect(response?.status).toBe(200);
     const exchanged = await response!.json() as {
       exchangeCapability: string;
-      manifest: { signature: { alg: string; value: string }; objects: Array<{ url: string; ciphertextSize: number }> };
+      manifest: { signature: { alg: string; value: string }; objects: Array<{ objectId: string; url: string; ciphertextSize: number }> };
     };
     expect(exchanged).not.toHaveProperty('viewerToken');
     expect(exchanged).not.toHaveProperty('searchToken');
     expect(exchanged.manifest.signature.alg).toBe('ES256');
-    const objectUrl = new URL(exchanged.manifest.objects[0]!.url, 'https://api.sessions.vza.net');
+    const encodedCapability = `%${exchanged.exchangeCapability.charCodeAt(0).toString(16)}${exchanged.exchangeCapability.slice(1)}`;
+    const encodedObjectId = `%${exchanged.manifest.objects[0]!.objectId.charCodeAt(0).toString(16)}${exchanged.manifest.objects[0]!.objectId.slice(1)}`;
+    const objectUrl = new URL(`/api/v1/debug/exchanges/${encodedCapability}/objects/${encodedObjectId}`, 'https://api.sessions.vza.net');
     const ciphertext = await debugApiRoute(new Request(objectUrl), objectUrl, testEnv);
     expect(ciphertext?.status).toBe(200);
     const ciphertextBytes = new Uint8Array(await ciphertext!.arrayBuffer());
@@ -296,5 +314,171 @@ describe('production debug exchange boundaries', () => {
     const expired = await signed(signer.privateKey, payload(6, { jti: `expired-device-${suffix}`, iat: Date.now() - 600_000, exp: Date.now() - 1 }));
     const expiredResponse = await debugBrowserRoute(browserRequest('/debug/prepare', { sessionIds: [sessionId], destinationAttestation: expired, pkceChallenge: pkce, callback: 'http://127.0.0.1:43123/callback' }), new URL('https://sessions.vza.net/debug/prepare'), testEnv);
     expect(expiredResponse?.status).toBe(403);
+  });
+
+  it('does not run expiry maintenance on an unauthenticated debug API request', async () => {
+    const prepare = vi.spyOn(testEnv.DB, 'prepare');
+    try {
+      const url = new URL('https://api.sessions.vza.net/api/v1/debug/not-a-route');
+      const response = await debugApiRoute(new Request(url), url, testEnv);
+      expect(response?.status).toBe(404);
+      expect(prepare).not.toHaveBeenCalled();
+    } finally {
+      prepare.mockRestore();
+    }
+  });
+
+  it('defers parse work to a fresh delivery when debug work shares its queue invocation', async () => {
+    const parseBody: ParseMessage = {
+      file_id: 9_999_999,
+      r2_key: 'raw/does-not-exist',
+      reason: 'upload',
+    };
+    const flags = {
+      debugAcked: false,
+      debugRetried: false,
+      parseAcked: false,
+      parseRetried: false,
+    };
+    const send = vi.spyOn(testEnv.PARSE_QUEUE, 'send').mockResolvedValue(undefined as never);
+    try {
+      await worker.queue({
+        queue: 'parse',
+        messages: [
+          {
+            id: crypto.randomUUID(), timestamp: new Date(), attempts: 1,
+            body: { debug: 'export-snapshot', job_id: `missing-${crypto.randomUUID()}` },
+            ack: () => { flags.debugAcked = true; },
+            retry: () => { flags.debugRetried = true; },
+          },
+          {
+            id: crypto.randomUUID(), timestamp: new Date(), attempts: 1, body: parseBody,
+            ack: () => { flags.parseAcked = true; },
+            retry: () => { flags.parseRetried = true; },
+          },
+        ],
+        ackAll() {},
+        retryAll() {},
+      } as unknown as MessageBatch<HubQueueMessage>, testEnv);
+      expect(send).toHaveBeenCalledWith(parseBody);
+      expect(flags).toEqual({
+        debugAcked: true,
+        debugRetried: false,
+        parseAcked: true,
+        parseRetried: false,
+      });
+    } finally {
+      send.mockRestore();
+    }
+  });
+
+  it('rejects an oversized snapshot object from R2 metadata before buffering its body', async () => {
+    const suffix = crypto.randomUUID();
+    const machine = `oversize-machine-${suffix}`;
+    const sessionId = `oversize-session-${suffix}`;
+    const r2Key = `raw/${machine}/claude-projects/${sessionId}.jsonl`;
+    await testEnv.DB.prepare("INSERT INTO machines (machine_id,os) VALUES (?1,'test')")
+      .bind(machine).run();
+    const file = await testEnv.DB.prepare(
+      "INSERT INTO files (machine_id,store,relpath,r2_key,size,content_hash,harness,parse_state) VALUES (?1,'claude-projects',?2,?3,?4,?5,'claude-code','parsed') RETURNING id",
+    ).bind(machine, `${sessionId}.jsonl`, r2Key, MAX_OBJECT_BYTES + 1, 'f'.repeat(64))
+      .first<{ id: number }>();
+    await testEnv.DB.prepare(
+      "INSERT INTO sessions (session_id,harness,canonical_file_id,index_state) VALUES (?1,'claude-code',?2,'ready')",
+    ).bind(sessionId, file!.id).run();
+    await testEnv.DB.prepare(
+      "INSERT INTO blocks (session_id,file_id,turn_index,block_index,btype,text) VALUES (?1,?2,0,0,'text','indexed')",
+    ).bind(sessionId, file!.id).run();
+    const jobId = `oversize-job-${suffix}`;
+    await insertPreparingJob(jobId, [sessionId]);
+    const arrayBuffer = vi.fn(async () => {
+      throw new Error('oversized body must not be buffered');
+    });
+    const get = vi.spyOn(testEnv.RAW, 'get').mockResolvedValue({
+      size: MAX_OBJECT_BYTES + 1,
+      arrayBuffer,
+    } as unknown as R2ObjectBody);
+    try {
+      await consumeDebugExchangeMessage({ debug: 'export-snapshot', job_id: jobId }, testEnv);
+    } finally {
+      get.mockRestore();
+    }
+    const job = await testEnv.DB.prepare(
+      'SELECT status,error FROM debug_export_jobs WHERE job_id=?1',
+    ).bind(jobId).first<{ status: string; error: string }>();
+    expect(job).toEqual({ status: 'failed', error: 'byte quota exceeded' });
+    expect(arrayBuffer).not.toHaveBeenCalled();
+  });
+
+  it('rejects deterministic device re-enrollment before starting another passkey ceremony', async () => {
+    const suffix = crypto.randomUUID();
+    const signer = await signingKey();
+    const deviceId = `reenroll-device-${suffix}`;
+    const releaseDigest = '6'.repeat(64);
+    await testEnv.DB.prepare(
+      "INSERT INTO debug_export_devices (device_id,user_id,label,public_jwk,release_digest,key_protection,scope,enrolled_at,expires_at) VALUES (?1,'owner','existing',?2,?3,'windows-cng-tpm','local-destination-attest',?4,?5)",
+    ).bind(deviceId, canonicalDebugJson(signer.publicJwk), releaseDigest,
+      Date.now(), Date.now() + 600_000).run();
+    const response = await debugBrowserRoute(browserRequest('/debug/devices/enroll/options', {
+      deviceId,
+      label: 'replacement',
+      publicJwk: signer.publicJwk,
+      releaseDigest,
+      keyProtection: 'windows-cng-tpm',
+      expiresAt: Date.now() + 600_000,
+    }), new URL('https://sessions.vza.net/debug/devices/enroll/options'), testEnv);
+    expect(response?.status).toBe(409);
+    await expect(response!.json()).resolves.toEqual({ error: 'device_already_enrolled' });
+  });
+
+  it('returns a uniform client error for malformed encoded route parameters', async () => {
+    const malformedValues = ['%', '%2', '%GG', '%E0%A4%A'];
+    const routes = [
+      { method: 'GET', path: (value: string) => `/api/v1/debug/jobs/${value}` },
+      { method: 'GET', path: (value: string) => `/api/v1/debug/exchanges/${value}/objects/object-id` },
+      { method: 'GET', path: (value: string) => `/api/v1/debug/exchanges/exchange-capability-000000/objects/${value}` },
+      { method: 'PUT', path: (value: string) => `/api/v1/debug/imports/${value}/objects/object-id` },
+      { method: 'PUT', path: (value: string) => `/api/v1/debug/imports/import-capability-000000/objects/${value}` },
+      { method: 'POST', path: (value: string) => `/api/v1/debug/imports/${value}/commit` },
+      { method: 'GET', path: (value: string) => `/api/v1/debug/imports/${value}` },
+    ];
+    for (const route of routes) {
+      for (const malformed of malformedValues) {
+        const url = new URL(route.path(malformed), 'https://api.sessions.vza.net');
+        const response = await debugApiRoute(new Request(url, { method: route.method }), url, testEnv);
+        expect(response?.status, `${route.method} ${url.pathname}`).toBe(400);
+        await expect(response!.json()).resolves.toEqual({ error: 'bad_request' });
+      }
+    }
+    for (const malformed of malformedValues) {
+      const consentPageUrl = new URL(`/debug/jobs/${malformed}/consent`, 'https://sessions.vza.net');
+      const consentPage = await debugBrowserRoute(new Request(consentPageUrl), consentPageUrl, testEnv);
+      expect(consentPage?.status).toBe(400);
+      await expect(consentPage!.json()).resolves.toEqual({ error: 'bad_request' });
+
+      for (const path of [
+        `/debug/jobs/${malformed}/consent/options`,
+        `/debug/devices/${malformed}/revoke/options`,
+      ]) {
+        const url = new URL(path, 'https://sessions.vza.net');
+        const response = await debugBrowserRoute(browserRequest(path, {}), url, testEnv);
+        expect(response?.status, `POST ${url.pathname}`).toBe(400);
+        await expect(response!.json()).resolves.toEqual({ error: 'bad_request' });
+      }
+    }
+  });
+
+  it('continues to decode valid encoded job capabilities', async () => {
+    const jobId = `encoded-${crypto.randomUUID()}`;
+    const capability = `${jobId}-prepare-capability-token-000000`;
+    await insertPreparingJob(jobId, []);
+    const encodedCapability = `%${capability.charCodeAt(0).toString(16)}${capability.slice(1)}`;
+    const encodedUrl = new URL(`/api/v1/debug/jobs/${encodedCapability}`, 'https://api.sessions.vza.net');
+    const plainUrl = new URL(`/api/v1/debug/jobs/${capability}`, 'https://api.sessions.vza.net');
+    const encoded = await debugApiRoute(new Request(encodedUrl), encodedUrl, testEnv);
+    const plain = await debugApiRoute(new Request(plainUrl), plainUrl, testEnv);
+    expect(encoded?.status).toBe(plain?.status);
+    await expect(encoded!.json()).resolves.toEqual(await plain!.json());
+    await testEnv.DB.prepare("UPDATE debug_export_jobs SET status='expired' WHERE job_id=?1").bind(jobId).run();
   });
 });

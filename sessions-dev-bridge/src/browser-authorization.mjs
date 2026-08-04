@@ -42,6 +42,13 @@ export class BrowserAuthorization {
     }
   }
 
+  async abort(jobCapability) {
+    const pending = this.pending.get(jobCapability);
+    if (!pending) return;
+    this.pending.delete(jobCapability);
+    await pending.callbacks.close();
+  }
+
   async finalize({ approvalUrl, jobCapability, destinationAttestation }) {
     const pending = this.pending.get(jobCapability);
     if (!pending) throw new Error('no pending loopback authorization for debug job');
@@ -72,6 +79,7 @@ class LoopbackCallbacks {
     this.received = new Map();
     this.server = createServer((request, response) => this.#request(request, response));
     this.server.maxConnections = 4;
+    this.closed = false;
   }
   async listen() {
     await new Promise((resolve, reject) => {
@@ -82,18 +90,35 @@ class LoopbackCallbacks {
   }
   url(path) { return `http://127.0.0.1:${this.port}${path}`; }
   wait(path) {
-    if (this.received.has(path)) return Promise.resolve(this.received.get(path));
+    if (this.received.has(path)) {
+      const result = this.received.get(path);
+      this.received.delete(path);
+      return Promise.resolve(result);
+    }
     if (this.waiters.has(path)) throw new Error(`already waiting for ${path}`);
     return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.waiters.delete(path); reject(new Error('browser authorization timed out')); }, this.timeoutMs);
+      const complete = (settle, value) => {
+        clearTimeout(timer);
+        this.waiters.delete(path);
+        settle(value);
+      };
+      const timer = setTimeout(() => complete(reject, new Error('browser authorization timed out')), this.timeoutMs);
       timer.unref?.();
-      this.waiters.set(path, { resolve: (value) => { clearTimeout(timer); resolve(value); }, reject });
+      this.waiters.set(path, {
+        resolve: (value) => complete(resolve, value),
+        reject: (error) => complete(reject, error),
+      });
     });
   }
   async close() {
+    if (this.closed) return;
+    this.closed = true;
     for (const waiter of this.waiters.values()) waiter.reject(new Error('authorization callback closed'));
     this.waiters.clear();
-    await new Promise((resolve) => this.server.close(resolve));
+    this.received.clear();
+    const closed = new Promise((resolve, reject) => this.server.close((error) => error ? reject(error) : resolve()));
+    this.server.closeAllConnections();
+    await closed;
   }
   #request(request, response) {
     const headers = {

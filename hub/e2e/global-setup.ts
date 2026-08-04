@@ -1,6 +1,7 @@
 import { chromium, type FullConfig } from '@playwright/test';
-import { readFile, rm, writeFile } from 'node:fs/promises';
+import { readFile, rm } from 'node:fs/promises';
 import path from 'node:path';
+import { createPreviewStorageState } from './storage-state';
 
 interface BootstrapEnvelope {
   bootstrapUrl?: unknown;
@@ -41,6 +42,7 @@ export default async function globalSetup(config: FullConfig): Promise<(() => Pr
     throw new Error('Preview bootstrap URL does not match BASE_URL');
   }
 
+  let cleanupStorageState: () => Promise<void>;
   const browser = await chromium.launch();
   try {
     const context = await browser.newContext();
@@ -56,15 +58,10 @@ export default async function globalSetup(config: FullConfig): Promise<(() => Pr
     }
     const state = await context.storageState();
     await context.close();
-    await writeFile(storageState, `${JSON.stringify(state)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-  } catch (error) {
-    await rm(storageState, { force: true });
-    throw error;
+    cleanupStorageState = await createPreviewStorageState(storageState, state);
   } finally {
     await browser.close();
   }
 
-  return async () => {
-    await rm(storageState, { force: true });
-  };
+  return cleanupStorageState;
 }

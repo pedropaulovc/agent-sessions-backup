@@ -7,14 +7,17 @@ import { spawnSync } from 'node:child_process';
 import {
   ARTIFACT_FILES,
   MAX_ARTIFACT_BYTES,
+  assertContainedRegularFile,
   PREVIEW_WORKERS_DEV_SUFFIX,
   acknowledgedResources,
   assertInventoryItem,
   assertNoProductionIdentifiers,
   assertPreviewAccount,
+  assertTrustedWorkflowRef,
   fail,
   fileRecord,
-  generatedUploadConfig,
+  generatedPrivateAppConfig,
+  generatedTrustedWrapperConfig,
   headSha,
   parseArgs,
   positiveInteger,
@@ -30,7 +33,7 @@ const [command, ...rest] = process.argv.slice(2);
 const allowed = new Set([
   'account-id', 'artifact', 'head-sha', 'journal', 'pr', 'repository', 'run-id',
   'source-run-id', 'workflow-ref', 'wrangler', 'migrations-cli', 'generation',
-  'github-output', 'output',
+  'github-output', 'output', 'trusted-root',
 ]);
 const args = parseArgs(rest, allowed);
 const repository = repositoryName(args.repository ?? process.env.GITHUB_REPOSITORY);
@@ -231,13 +234,11 @@ async function saveJournal(file, journal) {
 
 async function createResources(names, journalPath, journal, control) {
   const created = journal.resources;
-  const create = async (kind, name, pathname, body, idFields) => {
-    const result = await cf(pathname, { method: 'POST', body: stableJson(body) });
-    const id = idFields.map((field) => result?.[field]).find((value) => typeof value === 'string' && value.length > 0);
-    if (!id) fail(`Cloudflare did not return an ID for ${kind} ${name}`);
-    const item = inventoryItem(kind, id, name, names.generation);
-    created.push(item);
-    await saveJournal(journalPath, journal);
+  const record = async (item) => {
+    if (!created.some((existing) => existing.kind === item.kind && existing.name === item.name)) {
+      created.push(item);
+      await saveJournal(journalPath, journal);
+    }
     await frontDoor('POST', '/_control/record-resource', control.deployAudience, {
       pr,
       head: control.head,
@@ -245,7 +246,19 @@ async function createResources(names, journalPath, journal, control) {
       generation: names.generation,
       resource: item,
     });
-    return id;
+    return item.id;
+  };
+  const create = async (kind, name, pathname, body, idFields) => {
+    const existing = created.find((item) => item.kind === kind && item.name === name);
+    if (existing) return existing.id;
+    const discovered = await resolvePlannedId({ kind, id: null, name, generation: names.generation });
+    if (discovered != null) {
+      return record(inventoryItem(kind, discovered, name, names.generation));
+    }
+    const result = await cf(pathname, { method: 'POST', body: stableJson(body) });
+    const id = idFields.map((field) => result?.[field]).find((value) => typeof value === 'string' && value.length > 0);
+    if (!id) fail(`Cloudflare did not return an ID for ${kind} ${name}`);
+    return record(inventoryItem(kind, id, name, names.generation));
   };
   const d1 = await create('d1', names.d1, 'd1/database', { name: names.d1 }, ['uuid', 'id']);
   const r2 = await create('r2', names.r2, 'r2/buckets', { name: names.r2 }, ['name']);
@@ -283,16 +296,8 @@ function runJson(commandPath, commandArgs, cwd) {
   try { return JSON.parse(output); } catch { fail(`trusted command did not emit one JSON object: ${output.slice(-2000)}`); }
 }
 
-async function uploadVersion(wrangler, configPath, cwd) {
-  const result = spawnSync(process.execPath, [
-    wrangler,
-    'versions',
-    'upload',
-    '--config',
-    configPath,
-    '--no-bundle',
-    '--strict',
-  ], {
+function runWrangler(wrangler, commandArgs, cwd, operation) {
+  const result = spawnSync(process.execPath, [wrangler, ...commandArgs], {
     cwd,
     env: trustedChildEnvironment(),
     encoding: 'utf8',
@@ -301,16 +306,37 @@ async function uploadVersion(wrangler, configPath, cwd) {
   });
   if (result.error) throw result.error;
   const output = `${result.stdout ?? ''}\n${result.stderr ?? ''}`;
-  if (result.status !== 0) fail(`immutable Worker version upload failed: ${output.trim().slice(-8000)}`);
-  const id = /Worker Version ID:\s*([0-9a-f]{8}-[0-9a-f-]{27})/i.exec(output)?.[1];
-  const url = /Version Preview URL:\s*(https:\/\/[^\s]+\.workers\.dev)/i.exec(output)?.[1];
+  if (result.status !== 0) fail(`${operation} failed: ${output.trim().slice(-8000)}`);
+  return output;
+}
+
+function workerVersionId(output) {
+  const id = /(?:Worker|Current) Version ID:\s*([0-9a-f]{8}-[0-9a-f-]{27})/i.exec(output)?.[1];
   if (!id) fail('Wrangler did not return an immutable Worker Version ID');
-  if (!url) fail('Wrangler did not return an immutable Version Preview URL');
+  return id.toLowerCase();
+}
+
+function deployPrivateApp(wrangler, configPath, cwd) {
+  const output = runWrangler(wrangler, [
+    'deploy', '--config', configPath, '--no-bundle', '--strict',
+  ], cwd, 'private app deployment');
+  if (/Version Preview URL:|https:\/\/[^\s]+\.workers\.dev/i.test(output)) {
+    fail('private app deployment unexpectedly exposed a public URL');
+  }
+  return { id: workerVersionId(output) };
+}
+
+function uploadWrapperVersion(wrangler, configPath, cwd) {
+  const output = runWrangler(wrangler, [
+    'versions', 'upload', '--config', configPath, '--no-bundle', '--strict',
+  ], cwd, 'trusted wrapper version upload');
+  const url = /Version Preview URL:\s*(https:\/\/[^\s]+\.workers\.dev)/i.exec(output)?.[1];
+  if (!url) fail('Wrangler did not return an immutable wrapper Version Preview URL');
   const parsedUrl = new URL(url);
   if (parsedUrl.protocol !== 'https:' || !parsedUrl.hostname.endsWith(PREVIEW_WORKERS_DEV_SUFFIX)) {
-    fail('Wrangler returned an invalid version URL');
+    fail('Wrangler returned an invalid wrapper version URL');
   }
-  return { id: id.toLowerCase(), url: parsedUrl.href };
+  return { id: workerVersionId(output), url: parsedUrl.href };
 }
 
 function flattenTypedInventory(inventory) {
@@ -332,14 +358,22 @@ function containsGenerationBinding(value, generation) {
   if (Array.isArray(value)) return value.some((item) => containsGenerationBinding(item, generation));
   if (!value || typeof value !== 'object') return false;
   if (value.name === 'PREVIEW_GENERATION' && (value.text === generation || value.value === generation)) return true;
+  if (typeof value.service === 'string' && value.service.includes(`-${generation}-app`)) return true;
   return Object.values(value).some((item) => containsGenerationBinding(item, generation));
 }
 
 async function resolvePlannedId(item) {
   if (item.id != null) return item.id;
-  if (item.kind === 'r2' || item.kind === 'worker') return item.name;
   let result;
   let rows;
+  if (item.kind === 'r2') {
+    result = await cf(`r2/buckets/${encodeURIComponent(item.name)}`, { allowNotFound: true });
+    return result ? item.name : null;
+  }
+  if (item.kind === 'app-worker' || item.kind === 'edge-worker') {
+    result = await cf(`workers/scripts/${encodeURIComponent(item.name)}/settings`, { allowNotFound: true });
+    return result ? item.name : null;
+  }
   if (item.kind === 'd1') {
     result = await cf(`d1/database?name=${encodeURIComponent(item.name)}`, { allowNotFound: true });
     rows = Array.isArray(result) ? result : result?.result ?? [];
@@ -364,7 +398,16 @@ async function resolvePlannedId(item) {
 
 async function deleteInventory(inventory, ownerPr = pr) {
   const results = [];
-  const order = { 'worker-version': 0, queue: 1, kv: 2, r2: 3, d1: 4, worker: 5 };
+  const order = {
+    'edge-worker': 0,
+    'edge-version': 1,
+    'app-worker': 2,
+    'app-version': 3,
+    queue: 4,
+    kv: 5,
+    r2: 6,
+    d1: 7,
+  };
   const sorted = [...inventory].sort((a, b) => order[a.kind] - order[b.kind]);
   for (const raw of sorted) {
     const generation = raw.generation;
@@ -379,11 +422,10 @@ async function deleteInventory(inventory, ownerPr = pr) {
       else if (item.kind === 'r2') endpoint = `r2/buckets/${encodeURIComponent(item.name)}`;
       else if (item.kind === 'kv') endpoint = `storage/kv/namespaces/${encodeURIComponent(resolvedId)}`;
       else if (item.kind === 'queue') endpoint = `queues/${encodeURIComponent(resolvedId)}`;
-      else if (item.kind === 'worker-version') {
-        if (item.name !== `pr-${ownerPr}-sessions-hub`) fail(`Worker version owner mismatch: ${item.name}`);
+      else if (item.kind.endsWith('-version')) {
         endpoint = `workers/scripts/${encodeURIComponent(item.name)}/versions/${encodeURIComponent(resolvedId)}`;
       } else {
-        if (resolvedId !== item.name) fail(`stable Worker recorded ID/name mismatch: ${item.name}`);
+        if (resolvedId !== item.name) fail(`generation Worker recorded ID/name mismatch: ${item.name}`);
         endpoint = `workers/scripts/${encodeURIComponent(item.name)}`;
       }
       await cf(endpoint, { method: 'DELETE', allowNotFound: true });
@@ -409,7 +451,7 @@ async function provision() {
   const sha = headSha(args['head-sha']);
   const runId = positiveInteger(args['run-id'], 'build workflow run ID');
   const sourceRunId = positiveInteger(args['source-run-id'], 'source workflow run ID');
-  const workflowRef = args['workflow-ref'];
+  const workflowRef = assertTrustedWorkflowRef(repository, args['workflow-ref']);
   const artifact = await verifyArtifact(args.artifact, {
     repository,
     pr,
@@ -421,7 +463,6 @@ async function provision() {
   await assertSuccessfulSourceRun(sourceRunId, sha);
   await assertCurrentPullRequest(sha);
   const names = resourceNames(pr, sourceRunId, sha);
-  const environmentNonce = randomBytes(32).toString('base64url');
   const deployAudience = process.env.PREVIEW_CONTROL_DEPLOY_AUD;
   if (!deployAudience) fail('PREVIEW_CONTROL_DEPLOY_AUD is required');
   const prior = await state(deployAudience, true);
@@ -429,7 +470,61 @@ async function provision() {
   if (priorState?.lifecycle === 'closed' || priorState?.status === 'closed' || priorState?.closed === true || priorState?.tombstone) {
     fail(`PR ${pr} has a permanent preview tombstone`);
   }
+  const exactCandidate = candidateOf(priorState ?? {}, names.generation);
+  if (exactCandidate) {
+    if (exactCandidate.head !== sha
+      || exactCandidate.artifactDigest !== artifact.provenance.artifactDigest
+      || exactCandidate.buildInputDigest !== artifact.provenance.buildInputDigest) {
+      fail(`recorded generation ${names.generation} does not match this artifact`);
+    }
+    const summary = {
+      generation: names.generation,
+      epoch: priorState.epoch,
+      priorLiveGeneration: priorState.live?.generation ?? null,
+      versionUrl: exactCandidate.versionUrl,
+      artifactDigest: exactCandidate.artifactDigest,
+      schemaDigest: exactCandidate.schemaDigest,
+    };
+    if (args['github-output']) {
+      await appendFile(path.resolve(args['github-output']), [
+        `generation=${summary.generation}`,
+        `epoch=${summary.epoch}`,
+        `prior_live_generation=${summary.priorLiveGeneration ?? ''}`,
+        `artifact_digest=${summary.artifactDigest}`,
+        `schema_digest=${summary.schemaDigest}`,
+        '',
+      ].join('\n'));
+    }
+    process.stdout.write(`${stableJson(summary)}\n`);
+    return;
+  }
+
   const journalPath = path.resolve(args.journal);
+  const epoch = priorState?.epoch ?? 1;
+  const planned = [
+    { kind: 'd1', name: names.d1 },
+    { kind: 'r2', name: names.r2 },
+    { kind: 'kv', name: names.kv },
+    { kind: 'queue', name: names.dlq },
+    { kind: 'queue', name: names.queue },
+    { kind: 'app-version', name: names.app },
+    { kind: 'app-worker', name: names.app },
+    { kind: 'edge-version', name: names.edge },
+    { kind: 'edge-worker', name: names.edge },
+  ];
+  const proposedNonce = randomBytes(32).toString('base64url');
+  const allocation = await frontDoor('POST', '/_control/begin-generation', deployAudience, {
+    pr,
+    epoch,
+    head: sha,
+    sourceRunId,
+    generation: names.generation,
+    artifactDigest: artifact.provenance.artifactDigest,
+    buildInputDigest: artifact.provenance.buildInputDigest,
+    environmentNonce: proposedNonce,
+    planned,
+  });
+  const environmentNonce = allocation.environmentNonce ?? proposedNonce;
   const journal = {
     environmentNonce,
     schema: 'sessions-preview-control-journal/v1',
@@ -438,34 +533,15 @@ async function provision() {
     headSha: sha,
     generation: names.generation,
     artifactDigest: artifact.provenance.artifactDigest,
-    phase: 'allocating',
+    phase: 'planned',
     registered: false,
-    resources: [],
+    resources: Array.isArray(allocation.recorded)
+      ? allocation.recorded.map((item) => assertInventoryItem(item, pr, names.generation))
+      : [],
   };
   await saveJournal(journalPath, journal);
-  const epoch = priorState?.epoch ?? 1;
-  const planned = [
-    { kind: 'd1', name: names.d1 },
-    { kind: 'r2', name: names.r2 },
-    { kind: 'kv', name: names.kv },
-    { kind: 'queue', name: names.dlq },
-    { kind: 'queue', name: names.queue },
-    { kind: 'worker-version', name: names.worker },
-    { kind: 'worker', name: names.worker },
-  ];
-  await frontDoor('POST', '/_control/begin-generation', deployAudience, {
-    pr,
-    epoch,
-    head: sha,
-    sourceRunId,
-    generation: names.generation,
-    planned,
-  });
-  journal.phase = 'planned';
-  await saveJournal(journalPath, journal);
-  const temporaryPath = path.join(os.tmpdir(), `sessions-preview-${pr}-${runId}`);
-  await mkdir(temporaryPath, { recursive: false });
-  const temporary = temporaryPath;
+  const temporary = path.join(os.tmpdir(), `sessions-preview-${pr}-${runId}`);
+  await mkdir(temporary, { recursive: false });
   try {
     const resources = await createResources(names, journalPath, journal, { deployAudience, head: sha, sourceRunId });
     const assertions = {
@@ -473,6 +549,11 @@ async function provision() {
       browserJwks: process.env.PREVIEW_BROWSER_ASSERTION_JWKS,
       actionJwks: process.env.PREVIEW_ACTION_ASSERTION_JWKS,
       originJwks: process.env.PREVIEW_ORIGIN_ASSERTION_JWKS,
+    };
+    const application = {
+      assetSigningSecret: randomBytes(32).toString('base64url'),
+      debugImportAssertionPublicJwk: process.env.DEBUG_IMPORT_ASSERTION_PUBLIC_JWK,
+      debugExportManifestVerifyPublicJwk: process.env.DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK,
     };
     const configResources = {
       ...resources,
@@ -483,62 +564,139 @@ async function provision() {
       artifactDigest: artifact.provenance.artifactDigest,
       migrationDigest: artifact.provenance.migrationDigest,
     };
-    const migrationConfigPath = path.join(temporary, 'wrangler.migrations.generated.json');
-    await writeCanonicalJson(migrationConfigPath, generatedUploadConfig({
-      accountId: previewAccountId,
-      main: path.join(artifact.root, 'payload', 'worker.mjs'),
-      migrationsDir: path.join(artifact.root, 'payload', 'migrations'),
-      names,
-      resources: { ...configResources, schemaDigest: '0'.repeat(64) },
-      assertions,
-    }));
-    journal.phase = 'migrating';
-    await saveJournal(journalPath, journal);
-    const migrationsCli = path.resolve(args['migrations-cli']);
     const migrationDirectory = path.join(artifact.root, 'payload', 'migrations');
-    const migrationJournalPath = `${journalPath}.${names.generation}.migrations.json`;
-    journal.migrationJournalPath = migrationJournalPath;
-    await saveJournal(journalPath, journal);
-    const migration = runJson(migrationsCli, [
-      'apply', '--target', 'preview', '--config', migrationConfigPath, '--database', 'DB',
-      '--journal', migrationJournalPath, '--artifact-digest', artifact.provenance.artifactDigest,
-      '--deployment-id', names.generation,
-      '--migrations-dir', migrationDirectory,
-      '--manifest', path.join(migrationDirectory, 'manifest.json'),
-      '--base-manifest', path.resolve(path.dirname(migrationsCli), '..', 'migrations', 'manifest.json'),
-    ], process.cwd());
-    if (migration.pendingMigrations !== 0 || !/^[0-9a-f]{64}$/.test(migration.schemaDigest ?? '')) {
-      fail('migration runner did not prove zero pending migrations and a schema digest');
+    let schemaDigest = allocation.schemaDigest;
+    if (!schemaDigest) {
+      const migrationConfigPath = path.join(temporary, 'wrangler.migrations.generated.json');
+      await writeCanonicalJson(migrationConfigPath, generatedPrivateAppConfig({
+        accountId: previewAccountId,
+        main: path.join(artifact.root, 'payload', 'worker.mjs'),
+        migrationsDir: migrationDirectory,
+        names,
+        resources: { ...configResources, schemaDigest: '0'.repeat(64) },
+        assertions,
+        application,
+      }));
+      journal.phase = 'migrating';
+      const migrationJournalPath = `${journalPath}.${names.generation}.migrations.json`;
+      journal.migrationJournalPath = migrationJournalPath;
+      await saveJournal(journalPath, journal);
+      const migration = runJson(path.resolve(args['migrations-cli']), [
+        'apply', '--target', 'preview', '--config', migrationConfigPath, '--database', 'DB',
+        '--journal', migrationJournalPath, '--artifact-digest', artifact.provenance.artifactDigest,
+        '--deployment-id', names.generation,
+        '--migrations-dir', migrationDirectory,
+        '--manifest', path.join(migrationDirectory, 'manifest.json'),
+        '--base-manifest', path.resolve(path.dirname(args['migrations-cli']), '..', 'migrations', 'manifest.json'),
+      ], process.cwd());
+      if (migration.pendingMigrations !== 0 || !/^[0-9a-f]{64}$/.test(migration.schemaDigest ?? '')) {
+        fail('migration runner did not prove zero pending migrations and a schema digest');
+      }
+      if (migration.migrationDigest !== artifact.provenance.migrationDigest) {
+        fail('applied migration digest differs from provenance');
+      }
+      schemaDigest = migration.schemaDigest;
     }
-    if (migration.migrationDigest !== artifact.provenance.migrationDigest) fail('applied migration digest differs from provenance');
-
     journal.phase = 'uploading';
-    journal.schemaDigest = migration.schemaDigest;
+    journal.schemaDigest = schemaDigest;
     await saveJournal(journalPath, journal);
-    const uploadConfigPath = path.join(temporary, 'wrangler.upload.generated.json');
-    await writeCanonicalJson(uploadConfigPath, generatedUploadConfig({
-      accountId: previewAccountId,
-      main: path.join(artifact.root, 'payload', 'worker.mjs'),
-      migrationsDir: path.join(artifact.root, 'payload', 'migrations'),
-      names,
-      resources: { ...configResources, schemaDigest: migration.schemaDigest },
-      assertions,
-    }));
-    const upload = await uploadVersion(path.resolve(args.wrangler), uploadConfigPath, artifact.root);
-    const uploadedItems = [
-      inventoryItem('worker-version', upload.id, names.worker, names.generation),
-      inventoryItem('worker', names.worker, names.worker, names.generation),
-    ];
-    journal.resources.push(...uploadedItems);
-    await saveJournal(journalPath, journal);
-    for (const resource of uploadedItems) {
+
+    const recordWorker = async (kind, id, name, extra = {}) => {
+      const item = inventoryItem(kind, id, name, names.generation);
+      if (!journal.resources.some((existing) => existing.kind === kind && existing.name === name)) {
+        journal.resources.push(item);
+        await saveJournal(journalPath, journal);
+      }
       await frontDoor('POST', '/_control/record-resource', deployAudience, {
         pr,
         head: sha,
         sourceRunId,
         generation: names.generation,
-        resource,
+        schemaDigest,
+        resource: item,
+        ...extra,
       });
+      return item;
+    };
+    const wrangler = path.resolve(args.wrangler);
+    let appVersion = journal.resources.find((item) => item.kind === 'app-version' && item.name === names.app);
+    let appWorker = journal.resources.find((item) => item.kind === 'app-worker' && item.name === names.app);
+    if (appVersion && !appWorker) {
+      const id = await resolvePlannedId({
+        kind: 'app-worker', id: null, name: names.app, generation: names.generation,
+      });
+      if (id) appWorker = await recordWorker('app-worker', id, names.app);
+    }
+    if (appWorker && !appVersion) {
+      const id = await resolvePlannedId({
+        kind: 'app-version', id: null, name: names.app, generation: names.generation,
+      });
+      if (id) appVersion = await recordWorker('app-version', id, names.app);
+    }
+    if (!appVersion || !appWorker) {
+      const appConfigPath = path.join(temporary, 'wrangler.app.generated.json');
+      await writeCanonicalJson(appConfigPath, generatedPrivateAppConfig({
+        accountId: previewAccountId,
+        main: path.join(artifact.root, 'payload', 'worker.mjs'),
+        migrationsDir: migrationDirectory,
+        names,
+        resources: { ...configResources, schemaDigest },
+        assertions,
+        application,
+      }));
+      const deployed = deployPrivateApp(wrangler, appConfigPath, artifact.root);
+      appVersion = await recordWorker('app-version', deployed.id, names.app);
+      appWorker = await recordWorker('app-worker', names.app, names.app);
+    }
+
+    let edgeVersion = journal.resources.find((item) => item.kind === 'edge-version' && item.name === names.edge);
+    let edgeWorker = journal.resources.find((item) => item.kind === 'edge-worker' && item.name === names.edge);
+    let wrapperUrl = allocation.versionUrl;
+    if (edgeVersion && !edgeWorker) {
+      const id = await resolvePlannedId({
+        kind: 'edge-worker', id: null, name: names.edge, generation: names.generation,
+      });
+      if (id) edgeWorker = await recordWorker('edge-worker', id, names.edge);
+    }
+    if (edgeWorker && !edgeVersion) {
+      const id = await resolvePlannedId({
+        kind: 'edge-version', id: null, name: names.edge, generation: names.generation,
+      });
+      if (id) edgeVersion = await recordWorker('edge-version', id, names.edge, { versionUrl: wrapperUrl });
+    }
+    if (!edgeVersion || !edgeWorker || !wrapperUrl) {
+      const trustedRoot = path.resolve(args['trusted-root'] ?? '');
+      const wrapperSource = path.join(trustedRoot, 'hub', 'gateway', 'preview-front-door.ts');
+      await assertContainedRegularFile(trustedRoot, wrapperSource, 'trusted preview wrapper');
+      const wrapperEntry = path.join(temporary, 'trusted-wrapper-entry.mjs');
+      const wrapperImport = path.relative(temporary, wrapperSource).replaceAll('\\', '/');
+      await writeFile(wrapperEntry, [
+        `import { trustedPreviewIngress } from ${JSON.stringify(wrapperImport.startsWith('.') ? wrapperImport : `./${wrapperImport}`)};`,
+        'export default { fetch: trustedPreviewIngress };',
+        '',
+      ].join('\n'), { encoding: 'utf8', flag: 'wx' });
+      const wrapperBundle = path.join(temporary, 'trusted-wrapper.mjs');
+      const wrapperBuildConfigPath = path.join(temporary, 'wrangler.edge-build.generated.json');
+      await writeCanonicalJson(wrapperBuildConfigPath, generatedTrustedWrapperConfig({
+        accountId: previewAccountId,
+        main: wrapperEntry,
+        names,
+        originJwks: assertions.originJwks,
+      }));
+      runWrangler(wrangler, [
+        'deploy', '--dry-run', '--config', wrapperBuildConfigPath, '--outfile', wrapperBundle,
+      ], trustedRoot, 'trusted wrapper build');
+      const wrapperUploadConfigPath = path.join(temporary, 'wrangler.edge-upload.generated.json');
+      await writeCanonicalJson(wrapperUploadConfigPath, generatedTrustedWrapperConfig({
+        accountId: previewAccountId,
+        main: wrapperBundle,
+        names,
+        originJwks: assertions.originJwks,
+      }));
+      const uploaded = uploadWrapperVersion(wrangler, wrapperUploadConfigPath, trustedRoot);
+      wrapperUrl = uploaded.url;
+      edgeVersion = await recordWorker('edge-version', uploaded.id, names.edge, { versionUrl: wrapperUrl });
+      edgeWorker = await recordWorker('edge-worker', names.edge, names.edge);
     }
 
     const response = await frontDoor('POST', '/_control/register', deployAudience, {
@@ -548,20 +706,27 @@ async function provision() {
       head: sha,
       sourceRunId,
       generation: names.generation,
-      versionUrl: upload.url,
+      versionUrl: wrapperUrl,
       artifactDigest: artifact.provenance.artifactDigest,
       buildInputDigest: artifact.provenance.buildInputDigest,
       environmentNonce,
-      schemaDigest: migration.schemaDigest,
+      schemaDigest,
       resources: journal.resources,
     });
     journal.phase = 'registered';
     journal.registered = true;
     journal.epoch = response.state?.epoch ?? response.epoch ?? epoch;
-    journal.priorLiveGeneration = prior?.state?.live?.generation ?? prior?.live?.generation ?? null;
-    journal.versionUrl = upload.url;
+    journal.priorLiveGeneration = priorState?.live?.generation ?? null;
+    journal.versionUrl = wrapperUrl;
     await saveJournal(journalPath, journal);
-    const summary = { generation: names.generation, epoch: journal.epoch, priorLiveGeneration: journal.priorLiveGeneration, versionUrl: upload.url, artifactDigest: artifact.provenance.artifactDigest, schemaDigest: migration.schemaDigest };
+    const summary = {
+      generation: names.generation,
+      epoch: journal.epoch,
+      priorLiveGeneration: journal.priorLiveGeneration,
+      versionUrl: wrapperUrl,
+      artifactDigest: artifact.provenance.artifactDigest,
+      schemaDigest,
+    };
     if (args['github-output']) {
       await appendFile(path.resolve(args['github-output']), [
         `generation=${summary.generation}`,
@@ -574,11 +739,9 @@ async function provision() {
     }
     process.stdout.write(`${stableJson(summary)}\n`);
   } catch (error) {
-    if (!journal.registered) {
-      try { await deleteInventory(journal.resources); } catch (cleanupError) {
-        error.message += `; cleanup also failed: ${cleanupError.message}`;
-      }
-    }
+    // The durable allocation ledger owns every recorded partial resource. Preserve it so an
+    // exact workflow rerun can resume IDs and secrets; the alarm-backed janitor retires stale
+    // unregistered generations after the recovery window.
     throw error;
   } finally {
     await rm(temporary, { recursive: true, force: true });
@@ -779,10 +942,9 @@ async function browserGrant() {
     flag: 'wx',
     mode: 0o600,
   });
-  process.stdout.write(`${stableJson({ generation: context.generation, grant: 'written' })}\n`);
 }
-
 async function promote() {
+
   const context = await candidateContext();
   const candidateHead = context.candidate.head ?? context.candidate.headSha;
   if (candidateHead !== context.sha) fail('candidate is no longer current for this head');
@@ -838,8 +1000,10 @@ async function cleanupJournal() {
     process.stdout.write(`${stableJson({ skipped: 'registered-candidate' })}\n`);
     return;
   }
-  const deleted = await deleteInventory(journal.resources ?? []);
-  process.stdout.write(`${stableJson({ deleted })}\n`);
+  process.stdout.write(`${stableJson({
+    skipped: 'tracked-partial-generation',
+    generation: journal.generation,
+  })}\n`);
 }
 
 async function janitor() {
@@ -868,6 +1032,11 @@ async function janitor() {
         deletable.add(candidate.generation);
       }
     }
+    for (const tuple of stateRecord.deletionInventory ?? []) {
+      if (tuple?.generation && !protectedGenerations.has(tuple.generation)) {
+        deletable.add(tuple.generation);
+      }
+    }
     const closed = stateRecord.lifecycle === 'closed' || stateRecord.status === 'closed' || stateRecord.closed === true || Boolean(stateRecord.tombstone);
     for (const allocation of allocations) {
       if (!/^g[1-9][0-9]*-[0-9a-f]{12}$/.test(allocation.generation ?? '')) {
@@ -881,8 +1050,8 @@ async function janitor() {
       }
     }
     if (closed) {
-      for (const item of stateRecord.deletionInventory ?? stateRecord.inventory ?? []) {
-        if (item.generation) deletable.add(item.generation);
+      for (const item of stateRecord.inventory ?? []) {
+        if (item.generation && !protectedGenerations.has(item.generation)) deletable.add(item.generation);
       }
     }
     if (deletable.size === 0 && !closed) {

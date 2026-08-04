@@ -109,13 +109,16 @@ jobs:
   # fired the agent-backup-parse-errors alert on 2026-07-22 (PR #51's migration 0013 shipped but was
   # never applied, so every ingest threw `D1_ERROR: no such column`). Gated on the hub tests (which
   # apply every migration via applyD1Migrations) so a broken migration never reaches prod.
-  # Requires repo secret CLOUDFLARE_API_TOKEN with, on this account: D1, Workers Scripts, Queues,
-  # Workers R2 Storage, Workers KV Storage (Edit) + Account Settings (Read); and on the vza.net zone:
-  # Workers Routes (Edit). account_id comes from wrangler.jsonc.
+  # Requires production-environment secrets PRODUCTION_SCHEMA_BASELINE_ENVELOPE and
+  # PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY, created by scripts/approve-production-baseline.mjs
+  # through the independent human approval process.
+  # CLOUDFLARE_API_TOKEN needs D1, Workers Scripts, Queues, R2, and KV (Edit), Account Settings
+  # (Read), and Workers Routes (Edit) on vza.net. account_id comes from wrangler.jsonc.
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: hub
     runs-on: ubuntu-latest
+    environment: production
     defaults:
       run:
         working-directory: hub
@@ -127,9 +130,34 @@ jobs:
           cache: npm
           cache-dependency-path: hub/package-lock.json
       - run: npm ci
-      - run: npx wrangler d1 migrations apply sessions-index --remote
+      - name: Materialize independent signed production schema baseline
+        env:
+          PRODUCTION_SCHEMA_BASELINE_ENVELOPE: ${{ secrets.PRODUCTION_SCHEMA_BASELINE_ENVELOPE }}
+          PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY: ${{ secrets.PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          : "${PRODUCTION_SCHEMA_BASELINE_ENVELOPE:?production environment must provide a human-approved signed schema baseline}"
+          : "${PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY:?production environment must provide its independently trusted verification key}"
+          umask 077
+          printf '%s' "$PRODUCTION_SCHEMA_BASELINE_ENVELOPE" > "$RUNNER_TEMP/production-schema-baseline.json"
+          printf '%s' "$PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY" > "$RUNNER_TEMP/production-schema-baseline-public.pem"
+      - name: Apply and verify production migrations exactly once
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+        run: |
+          set -euo pipefail
+          artifact_digest="$(git archive --format=tar HEAD migrations | sha256sum | cut -d ' ' -f 1)"
+          node scripts/migrations.mjs apply \
+            --target production \
+            --config wrangler.jsonc \
+            --database sessions-index \
+            --journal "$RUNNER_TEMP/production-migration-${GITHUB_SHA}.json" \
+            --artifact-digest "$artifact_digest" \
+            --deployment-id "production:${GITHUB_SHA}" \
+            --base-manifest migrations/source-baseline.json \
+            --history migrations/historical-baseline.json \
+            --baseline "$RUNNER_TEMP/production-schema-baseline.json" \
+            --baseline-public-key "$RUNNER_TEMP/production-schema-baseline-public.pem"
       - run: npx wrangler deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}

@@ -22,6 +22,7 @@ const opt = (name, dflt) => {
 };
 const HUB = opt('hub', 'http://127.0.0.1:8787');
 const MACHINE = opt('machine', 'local-corpus');
+if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(MACHINE)) throw new Error('invalid --machine value');
 const HUB_DIR = opt('hub-dir', join(process.cwd(), 'hub'));
 const PERSIST_TO = opt('persist-to', join(HUB_DIR, '.dev', 'local', 'default'));
 const WRANGLER = join(HUB_DIR, 'node_modules', 'wrangler', 'bin', 'wrangler.js');

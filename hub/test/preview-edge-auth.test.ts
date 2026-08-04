@@ -1,5 +1,5 @@
 import { env } from 'cloudflare:test';
-import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { machineIdentity, previewHumanIdentity, requirePreviewOrigin } from '../src/auth/identity';
 import { previewDiagnostics } from '../src/router';
 import { viewerRoute } from '../src/viewer/router';
@@ -107,9 +107,54 @@ describe('preview edge assertions', () => {
     const url = new URL('https://candidate.preview.workers.dev/');
     const accepted = await viewerRoute(new Request(url, { headers: { 'x-preview-browser-assertion': token } }), url, previewEnv());
     expect(accepted.status).toBe(200);
-    const denied = await viewerRoute(new Request(url), url, previewEnv());
-    expect(denied.status).toBe(302);
-    expect(denied.headers.get('location')).toBe('/login');
+    const deniedUrl = new URL('/login', url);
+    const denied = await viewerRoute(new Request(deniedUrl), deniedUrl, previewEnv());
+    expect(denied.status).toBe(401);
+    expect(denied.headers.get('cache-control')).toBe('no-store');
+    expect(denied.headers.get('location')).toBeNull();
+    expect(await denied.text()).toBe('unauthorized');
+  });
+
+  it('does not expose or mutate the passkey surface for an authenticated preview viewer', async () => {
+    for (const path of ['/login', '/settings']) {
+      const token = await sign(browserKeys.privateKey, 'browser-1', {
+        ...baseClaims('browser', path),
+        identity: 'human',
+        actor: 'reviewer@example.test',
+      });
+      const url = new URL(`https://candidate.preview.workers.dev${path}`);
+      const response = await viewerRoute(
+        new Request(url, { headers: { 'x-preview-browser-assertion': token } }),
+        url,
+        previewEnv(),
+      );
+      expect(response.status).toBe(404);
+    }
+
+    const path = '/webauthn/auth/options';
+    const body = '{}';
+    const token = await sign(browserKeys.privateKey, 'browser-1', {
+      ...baseClaims('browser', path, { method: 'POST', bodyDigest: await sha256Hex(body) }),
+      identity: 'human',
+      actor: 'reviewer@example.test',
+    });
+    const before = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM webauthn_challenges').first<{ n: number }>();
+    const url = new URL(`https://candidate.preview.workers.dev${path}`);
+    const response = await viewerRoute(
+      new Request(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-preview-browser-assertion': token,
+        },
+        body,
+      }),
+      url,
+      previewEnv(),
+    );
+    const after = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM webauthn_challenges').first<{ n: number }>();
+    expect(response.status).toBe(404);
+    expect(after?.n).toBe(before?.n);
   });
 
   it('rejects cross-audience and cross-key assertions', async () => {
@@ -178,6 +223,39 @@ describe('preview edge assertions', () => {
     expect(await machineIdentity(new Request(`https://candidate.preview.workers.dev${claims.target}`, {
       method: 'PUT', body: '{"fixture":false}', headers: { 'x-preview-action-assertion': bodyToken },
     }), previewEnv())).toEqual({ kind: 'anonymous' });
+  });
+
+  it('hashes one mutating body once when origin and action assertions share a request', async () => {
+    const target = '/api/v1/files/seed/raw/large.bin';
+    const body = 'the same body is covered by both assertions';
+    const bodyDigest = await sha256Hex(body);
+    const origin = await sign(originKeys.privateKey, 'origin-1', baseClaims('origin', target, {
+      method: 'PUT',
+      bodyDigest,
+    }));
+    const action = await sign(actionKeys.privateKey, 'action-1', baseClaims('action', target, {
+      method: 'PUT',
+      bodyDigest,
+      identity: 'machine',
+      actor: 'ci',
+      machineId: 'seed',
+      isAdmin: false,
+    }));
+    const request = new Request(`https://candidate.preview.workers.dev${target}`, {
+      method: 'PUT',
+      body,
+      headers: {
+        'x-preview-origin-assertion': origin,
+        'x-preview-action-assertion': action,
+      },
+    });
+    const clone = vi.spyOn(request, 'clone');
+    expect(await requirePreviewOrigin(request, previewEnv())).toBe(true);
+    expect(await machineIdentity(request, previewEnv())).toMatchObject({
+      kind: 'machine',
+      machineId: 'seed',
+    });
+    expect(clone).toHaveBeenCalledOnce();
   });
 
   it('requires a generation/artifact-bound origin assertion in preview', async () => {

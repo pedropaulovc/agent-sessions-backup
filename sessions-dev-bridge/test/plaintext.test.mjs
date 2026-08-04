@@ -1,15 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createCipheriv, createPublicKey, publicEncrypt, randomBytes, constants } from 'node:crypto';
-import { mkdtemp, readdir, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { canonicalJson, sha256 } from '../src/canonical.mjs';
 import { decryptObject, generateDestinationKey } from '../src/snapshot.mjs';
 
 test('decrypts directly to the destination consumer and zeroes transient plaintext/ciphertext', async () => {
-  const emptyDirectory = await mkdtemp(join(tmpdir(), 'bridge-no-artifact-'));
-  try {
     const destination = generateDestinationKey();
     const plaintext = Buffer.from('approved session bytes that must never become an artifact');
     const objectId = 'object-1';
@@ -41,12 +36,9 @@ test('decrypts directly to the destination consumer and zeroes transient plainte
     await decryptObject({ object, ciphertext, privateKey: destination.privateKey, consume: async (bytes) => {
       transientPlaintext = bytes;
       assert.equal(bytes.toString(), plaintext.toString());
-      assert.deepEqual(await readdir(emptyDirectory), []);
     }});
     assert.equal(transientPlaintext.every((value) => value === 0), true);
     assert.equal(ciphertext.every((value) => value === 0), true);
-    assert.deepEqual(await readdir(emptyDirectory), []);
     aesKey.fill(0);
     plaintext.fill(0);
-  } finally { await rm(emptyDirectory, { recursive: true, force: true }); }
 });

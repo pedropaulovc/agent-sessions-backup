@@ -1,8 +1,8 @@
 # Local and PR environment redesign
 
-Status: proposed
+Status: active
 
-This plan replaces the shared preview environment and the manual local setup. It does not change production data or deploy code by itself.
+This document defines the isolated local and per-PR preview paths. Production data and deployment remain separate.
 
 ## Outcome
 
@@ -12,26 +12,22 @@ The finished workflow has four supported paths:
 |---|---|---|
 | Run the hub locally | `npm --prefix hub run dev:up` | None. The server binds to loopback and uses isolated local state. |
 | Run browser tests | `npm --prefix hub run test:e2e` | None. The harness creates, migrates, seeds, starts, tests, and removes its own environment. |
-| Open a PR preview | `npm --prefix hub run preview:open -- --pr <number>` | The shortcut opens the stable front door. Cloudflare Access handles user consent; no SQL or Wrangler login is required. |
+| Open a PR preview | `npm --prefix hub run preview:open -- --pr <number>` | Opens the stable front door. Cloudflare Access handles user consent; no SQL or Wrangler login is required. |
 | Debug a production session | `sessions-dev-bridge pull --session <id> --target local\|pr-<number>` | A signed bridge installed outside the checkout opens the production and destination approvals. Transport is encrypted to the approved destination. |
 
 The same Playwright project runs against the local server on Windows and Linux, and against the deployed PR URL after preview deployment.
 
-## Why the current preview should be replaced
+## Problems addressed
 
-The existing controls prevent several accidents, but the environment model is the source of the remaining problems.
+The old preview model shared state and trust across unrelated branches:
 
-- `hub/wrangler.jsonc` binds every branch to one long-lived `sessions-index-preview` D1 database. An unmerged migration changes the schema for every branch. A branch can therefore run against a schema ahead of or incompatible with its own migration set.
-- Pull request migrations use a second migration engine in `hub/src/api/migrate.ts`. It has its own SQL scanner and accepts a smaller subset than Wrangler. The job can also finish green after the branch endpoint remains unreachable, leaving deployed code on an old schema.
-- Applied D1 migrations are identified by filename, not content hash. `hub/migrations/0020_priced_version_not_null.sql` records a real correction after preview had already applied an older version of `0019`.
-- `npm --prefix hub run dev` does not migrate local D1. Local setup, tests, and deployed environments reach schema readiness through different paths.
-- `scripts/seed-local.mjs` uploads the operator's real corpus. There is no small deterministic browser fixture or lifecycle-managed local database.
-- CI runs Vitest and Python tests only on Ubuntu. There is no Playwright dependency, browser installation, Windows job, server readiness contract, or browser artifact upload.
-- Browser access to preview requires a manually generated nonce and a hand-written D1 query. `hub/src/viewer/preview-auth.ts` then sets the preview cookie to the long-lived shared `DEV_AUTH` value. The same secret also authorizes machine API access as an admin identity.
-- Preview and production use the same Cloudflare account. A PR controls its Worker code and Wrangler configuration. It can replace the preview D1 or KV IDs with the committed production IDs and remove the in-Worker marker check. The production KV session format in `hub/src/auth/session.ts` accepts an opaque `sess:<token>` record without an environment issuer or MAC. A malicious preview bound to production KV could write a chosen production viewer session.
-- The repository's `main` branch is currently unprotected. A writer can bypass review and run the main deployment job with the production token.
+- Every branch used one long-lived preview D1 database, so an unmerged migration could break other branches.
+- Pull requests used a custom migration endpoint and SQL scanner instead of the repository's Wrangler-based migration path.
+- Local startup did not create a migrated, lifecycle-managed database.
+- One long-lived `DEV_AUTH` secret authorized both browser and machine access.
+- Preview and production shared a Cloudflare account, so account-scoped write credentials could name production resources.
 
-D1 and Workers Scripts write permissions are account-scoped. Calling a token "preview-only" does not stop it from naming production resources in the same account. A separate Cloudflare account is the security boundary. An in-Worker marker remains useful for mistakes, but it cannot be the boundary because the PR controls the check.
+The cutover isolates previews in a separate account and gives each PR head an immutable resource generation.
 
 ## Decisions
 
@@ -144,7 +140,7 @@ A missing table should never be the first indication that setup was incomplete.
 - Keep migrations forward-only after they have reached any persistent environment. A correction gets a new migration.
 - Use application reindexing for fields that SQL cannot derive from R2. Do not hide required reindex work inside a schema assertion.
 
-After the separate account path is live, remove `hub/src/api/migrate.ts`, its route and environment variables, the preview marker table, the custom SQL splitter, `migrate-preview`, `migrate-preview-main`, and their custom tests. Standard migration behavior then comes from pinned Wrangler everywhere outside Miniflare tests.
+The custom migration API, preview marker, SQL splitter, and `migrate-preview` workflows are not part of the cutover. Pinned Wrangler handles remote migrations, while Miniflare uses the same migration manifest for local tests.
 
 ### Drift gates
 
@@ -216,7 +212,7 @@ Browser review, machine import, and infrastructure management need different cre
 
 Terminate browser authentication at the stable front door, before any request reaches PR code. Put a Cloudflare Access application on `*-preview.sessions.vza.net` and restrict it to the owner's GitHub identity. The front door validates the team-domain issuer, Access application audience, signature, expiry, and allowed identity.
 
-`preview:open` only resolves the PR's current healthy URL and opens it. The agent can run the command, while the user's existing Access browser session or GitHub login completes consent. There is no Wrangler login, D1 write, copied bearer, or repository skill in this path.
+Run `npm --prefix hub run preview:open -- --pr <number>`. It opens `https://pr-<number>-preview.sessions.vza.net`; the user's existing Access session or GitHub login completes consent. This path needs no Wrangler login, D1 write, copied bearer, or repository skill.
 
 Remote Playwright cannot receive a reusable Access service token. The trusted default-branch workflow exchanges an exact GitHub OIDC identity for a one-use edge grant bound to repository, trusted `job_workflow_ref`, PR number, head SHA, run ID, audience, actor, `jti`, and a short expiry. A dedicated front-door Durable Object stores grant consumption and short edge sessions.
 
@@ -349,12 +345,11 @@ Use account-owned service tokens for CI rather than Pedro's user token. Add TTL/
 
 Local development and local Playwright require no Cloudflare authentication.
 
-For interactive work, provide scripts instead of asking the agent to construct a token:
+Interactive preview access does not require a Cloudflare token:
 
-- `npm --prefix hub run preview:open -- --pr <number>` needs no Wrangler scope. It opens the Access-protected stable front door for user-mediated preview login.
+- `npm --prefix hub run preview:open -- --pr <number>` needs no Wrangler scope. Cloudflare Access handles user-mediated preview login.
 - Production session export uses the application PKCE grant, not Wrangler.
-- `npm --prefix hub run auth:preview-admin` is an exceptional infrastructure flow, not a development prerequisite. It may use scoped OAuth only for a dedicated Cloudflare identity whose complete membership list contains the non-production account and not production. Otherwise it requires a short-lived account API token restricted to the non-production account. The script fails if `whoami` reports production or any second account.
-- The candidate preview-admin OAuth set is `account:read user:read workers:write workers_scripts:write workers_kv:write d1:write queues:write`. Wrangler exposes no R2-specific OAuth scope, so the sacrificial-resource test must determine which overlap is unavoidable before freezing the profile.
+- Preview infrastructure administration runs only in the protected `Preview Control` workflow.
 - Log access is not part of routine development. Non-production tail work requests only `account:read user:read workers_tail:read` through a nonprod-only identity or account-restricted short-lived token and revokes it after the session. Production tail requires separate explicit approval, a Worker-specific operational procedure, and never runs from a PR checkout.
 
 Wrangler 4.111.0 requests every OAuth scope when `login` is run without `--scopes` and stores OAuth tokens in plaintext unless keyring storage is enabled. Every OAuth `login`, `whoami`, and resource command runs with `CLOUDFLARE_AUTH_USE_KEYRING=true`. The scripts fail when Windows Credential Manager or Linux libsecret is unavailable, verify `whoami` reports encrypted/keyring-backed storage, and refuse to continue while a plaintext credential file exists for that profile. Selecting a non-production account in a multi-account user profile does not constrain OAuth authority and is not an acceptable boundary.
@@ -424,7 +419,7 @@ Gate: two PRs with incompatible migrations run simultaneously without sharing st
 - Put GitHub-backed Cloudflare Access on the stable front door.
 - Add front-door one-use CI grants and short edge sessions bound to PR, head SHA, workflow, run, audience, actor, `jti`, and expiry.
 - Add distinct browser, action, origin, and control assertions, key rotation/revocation, and per-destination encryption keys.
-- Add `preview:open`; it requires no Wrangler scope and lets the user finish Access login in the browser.
+- Publish the stable `https://pr-<number>-preview.sessions.vza.net` URL for browser access through Cloudflare Access.
 - Remove `DEV_AUTH` from browser, machine, asset-signing, and application flows.
 - Strip edge request credentials and upstream `Set-Cookie` before untrusted code.
 - Add the per-generation origin assertion and prove direct-origin denial.
@@ -464,18 +459,18 @@ Keep the committed instructions short. The final section should say only:
 
 - Run `npm --prefix hub run dev:up` for an isolated, migrated, synthetic local hub.
 - Run `npm --prefix hub run test:e2e` for local Playwright. It owns its server and state.
-- Run `npm --prefix hub run preview:open -- --pr <number>` to open the Access-protected PR preview. Never insert preview auth rows by hand or pass an Access credential to the Worker.
+- Run `npm --prefix hub run preview:open -- --pr <number>` to use the Access-protected PR preview. Never insert preview auth rows by hand or pass an Access credential to the Worker.
 - Run `sessions-dev-bridge pull --session <id> --target local|pr-<number>` to copy one production session. Use only the signed bridge installed outside the checkout; the user approves the destination and session in trusted browser pages.
-- Only preview infrastructure administration uses `npm --prefix hub run auth:preview-admin`; it must report the non-production account. Preview login and session export require no Wrangler scope. Never use a production Wrangler profile for preview work.
+- The protected `Preview Control` workflow owns preview infrastructure administration. Preview login and session export require no Wrangler scope. Never use a production Wrangler profile for preview work.
 - Do not edit an applied migration. Add the next numbered migration and run `npm --prefix hub run test:migrations`.
 - PR code, preview Workers, and preview CI must never receive a production binding, cookie, certificate, resource ID, or Cloudflare token.
 ```
 
-Do not document planned commands in `AGENTS.md` before implementation. This planning PR therefore leaves `AGENTS.md` unchanged. The implementation PR that adds the section must execute every exact command and argument shown above on its stated Windows, Linux, local, preview, or production path, record the evidence, and update the text to match the implemented CLI. Agent instructions must describe a working path, not an architectural intention.
+Keep `AGENTS.md` synchronized with these implemented paths. Instructions must describe working commands and URLs, not architectural intentions.
 
 ## Definition of done
 
-- Local setup, local Playwright, preview deployment, preview login, session copy, and teardown each have one supported command.
+- Local setup, local Playwright, preview deployment, preview login, session copy, and teardown each have one supported path.
 - Windows and Linux CI exercise the same local browser path.
 - Every successful preview has a fresh collision-proof D1 generation with zero pending migrations, the matching code SHA, and an exact version smoke before atomic promotion.
 - Preview credentials and bindings cannot address the production Cloudflare account.

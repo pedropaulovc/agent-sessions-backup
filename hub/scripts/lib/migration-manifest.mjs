@@ -102,7 +102,7 @@ export function validateManifestShape(manifest) {
   return manifest;
 }
 
-export async function buildMigrationManifest(migrationsDir, template = {}) {
+export async function buildMigrationManifest(migrationsDir, policy) {
   const filenames = (await readdir(migrationsDir)).filter((name) => name.endsWith('.sql')).sort();
   const migrations = [];
   for (const filename of filenames) {
@@ -113,11 +113,12 @@ export async function buildMigrationManifest(migrationsDir, template = {}) {
     const bytes = canonicalMigrationBytes(await readFile(migrationPath));
     migrations.push({ sequence: Number(match[1]), filename, sha256: sha256(bytes) });
   }
+  if (!policy) throw new Error('migration manifest validation requires independent policy evidence');
   return validateManifestShape({
-    formatVersion: 1,
-    hashEncoding: 'sha256-canonical-lf',
-    reservedSequences: template.reservedSequences ?? [4],
-    ledgerStartsAt: template.ledgerStartsAt ?? 21,
+    formatVersion: policy.formatVersion,
+    hashEncoding: policy.hashEncoding,
+    reservedSequences: policy.reservedSequences,
+    ledgerStartsAt: policy.ledgerStartsAt,
     migrations,
   });
 }
@@ -202,14 +203,22 @@ export function assertImmutableBase(base, candidate) {
   }
 }
 
-export async function loadAndValidateManifest({ migrationsDir, manifestPath, baseManifestPath }) {
-  const expected = JSON.parse(await readFile(manifestPath, 'utf8'));
-  const actual = await buildMigrationManifest(migrationsDir, expected);
-  assertManifestMatches(expected, actual);
-  if (baseManifestPath) {
-    const base = JSON.parse(await readFile(baseManifestPath, 'utf8'));
-    assertImmutableBase(base, actual);
+export async function loadAndValidateManifest({
+  migrationsDir,
+  manifestPath,
+  baseManifestPath,
+  trustedBaseManifest,
+}) {
+  if (!baseManifestPath && !trustedBaseManifest) {
+    throw new Error('migration manifest validation requires independent policy evidence');
   }
+  const expected = JSON.parse(await readFile(manifestPath, 'utf8'));
+  const base = trustedBaseManifest
+    ? validateManifestShape(trustedBaseManifest)
+    : validateManifestShape(JSON.parse(await readFile(baseManifestPath, 'utf8')));
+  const actual = await buildMigrationManifest(migrationsDir, base);
+  assertManifestMatches(expected, actual);
+  assertImmutableBase(base, actual);
   return { manifest: expected, digest: migrationDigest(expected) };
 }
 
@@ -240,7 +249,8 @@ export function validateHistoricalBaseline(history, manifest) {
     throw new Error('pre-ledger repository source changed from the immutable baseline');
   }
   if (history.deploymentHistory?.status !== 'baselined-not-hash-verified'
-      || history.deploymentHistory.approved !== false) {
+      || history.deploymentHistory.approved !== false
+      || history.deploymentHistory.requiresSignedProductionAttestation !== true) {
     throw new Error('historical deployment hashes must not be inferred from current source');
   }
   const divergence = history.knownDivergence;

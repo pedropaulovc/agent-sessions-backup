@@ -1,8 +1,7 @@
 #!/usr/bin/env node
-import { readFile } from 'node:fs/promises';
 import { createInterface } from 'node:readline/promises';
 import { stdin, stdout, stderr } from 'node:process';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { verifyInstalledRelease, packageRoot } from './provenance.mjs';
 import { StateStore, defaultStateDirectory } from './state.mjs';
 import { platformKeyProvider } from './key-provider.mjs';
@@ -14,10 +13,12 @@ import { SnapshotVerifier } from './snapshot.mjs';
 import { SessionsDevBridge } from './bridge.mjs';
 import { EnrollmentTransport, loadTrustedServiceConfig } from './trusted-services.mjs';
 import { RemoteDestinationTransport } from './remote-destination.mjs';
+import { loadProductionManifestKeys } from './production-keys.mjs';
+import { parseArguments } from './cli-arguments.mjs';
 
 try {
   const release = await verifyInstalledRelease();
-  const keys = JSON.parse(await readFile(join(packageRoot, 'src', 'production-manifest-key.json'), 'utf8'));
+  const keys = await loadProductionManifestKeys(join(packageRoot, 'src', 'production-manifest-key.json'));
   const services = await loadTrustedServiceConfig();
   const stateDirectory = defaultStateDirectory();
   const state = new StateStore(stateDirectory);
@@ -54,37 +55,6 @@ try {
   process.exitCode = 1;
 }
 
-function parseArguments(args) {
-  const command = args.shift();
-  if (command === 'enroll') {
-    let deviceLabel = `${process.env.COMPUTERNAME || process.env.HOSTNAME || 'developer device'}`;
-    while (args.length) {
-      const flag = args.shift();
-      if (flag === '--device-label' && args.length) deviceLabel = args.shift();
-      else throw usage();
-    }
-    return { command, deviceLabel };
-  }
-  if (command === 'pull') {
-    let sessionId;
-    let target;
-    let checkout = process.cwd();
-    while (args.length) {
-      const flag = args.shift();
-      if (flag === '--session' && args.length && sessionId === undefined) sessionId = args.shift();
-      else if (flag === '--target' && args.length && target === undefined) target = args.shift();
-      else if (flag === '--checkout' && args.length && checkout === process.cwd()) checkout = resolve(args.shift());
-      else throw usage();
-    }
-    if (!sessionId || !target) throw usage();
-    return { command, sessionId, target, checkout };
-  }
-  throw usage();
-}
-
-function usage() {
-  return new Error('usage: sessions-dev-bridge enroll [--device-label <label>] | sessions-dev-bridge pull --session <id> --target local|pr-<number> [--checkout <path>]');
-}
 
 async function confirmDirtyInputs(paths) {
   stderr.write('The pinned build consumes these dirty or untracked paths:\n');
