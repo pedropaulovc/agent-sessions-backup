@@ -763,6 +763,7 @@ function candidateOf(stateRecord, generation) {
 }
 
 async function candidateAction({ deployAudience, stateRecord, sha, sourceRunId, generation, method, target, body, headers = {}, purpose }) {
+  const accessHeaders = requiredCloudflareAccessHeaders();
   const digest = body === undefined ? undefined : sha256Bytes(body);
   const grant = await frontDoor('POST', '/_control/smoke-route', deployAudience, {
     pr,
@@ -782,7 +783,6 @@ async function candidateAction({ deployAudience, stateRecord, sha, sourceRunId, 
   const bootstrap = new URL(grant.bootstrapUrl);
   const origin = new URL(`https://pr-${pr}-preview.sessions.vza.net`);
   if (bootstrap.protocol !== 'https:' || bootstrap.origin !== origin.origin) fail('front door returned a foreign action bootstrap');
-  const accessHeaders = requiredCloudflareAccessHeaders();
   const first = await fetch(bootstrap, {
     redirect: 'manual',
     headers: { ...accessHeaders, 'cache-control': 'no-store' },
