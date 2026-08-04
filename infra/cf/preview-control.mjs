@@ -27,6 +27,7 @@ import {
   repositoryName,
   resourceNames,
   sha256Bytes,
+  sortCleanupInventory,
   stableJson,
   trustedWranglerEnvironment,
   wranglerWorkerBundle,
@@ -396,20 +397,7 @@ async function resolvePlannedId(item) {
 
 async function deleteInventory(inventory, ownerPr = pr) {
   const results = [];
-  const order = new Map([
-    ['edge-worker', 0],
-    ['edge-version', 1],
-    ['app-worker', 2],
-    ['app-version', 3],
-    ['queue', 4],
-    ['kv', 5],
-    ['r2', 6],
-    ['d1', 7],
-  ]);
-  const sorted = [...inventory].sort(
-    (a, b) => (order.get(a?.kind) ?? Number.MAX_SAFE_INTEGER)
-      - (order.get(b?.kind) ?? Number.MAX_SAFE_INTEGER),
-  );
+  const sorted = sortCleanupInventory(inventory);
   for (const raw of sorted) {
     const generation = raw.generation;
     if (!/^g[1-9][0-9]*-[0-9a-f]{12}$/.test(generation ?? '')) {

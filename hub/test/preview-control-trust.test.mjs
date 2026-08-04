@@ -19,6 +19,7 @@ import {
   previewEdgeSessionCookie,
   requiredCloudflareAccessHeaders,
   resourceNames,
+  sortCleanupInventory,
   wranglerWorkerBundle,
   workerScriptCoversVersion,
   trustedWranglerEnvironment,
@@ -210,6 +211,31 @@ describe('trusted preview resource ownership', () => {
       generation: 'g124-bbbbbbbbbbbb',
     }, inventory)).toBe(false);
     expect(workerScriptCoversVersion({ ...appVersion, kind: 'd1' }, inventory)).toBe(false);
+  });
+
+  it('deletes Queue consumers before their application Worker', () => {
+    const kinds = [
+      'd1',
+      'app-version',
+      'app-worker',
+      'r2',
+      'edge-version',
+      'queue',
+      'kv',
+      'edge-worker',
+    ];
+    const inventory = kinds.map((kind) => ({ kind }));
+
+    expect(sortCleanupInventory(inventory).map(({ kind }) => kind)).toEqual([
+      'edge-worker',
+      'queue',
+      'app-worker',
+      'edge-version',
+      'app-version',
+      'kv',
+      'r2',
+      'd1',
+    ]);
   });
 
   it('acknowledges the original trusted identity rather than a resolved discovery ID', () => {
