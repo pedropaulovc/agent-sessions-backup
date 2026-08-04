@@ -25,7 +25,7 @@ export const SYNTHETIC_EXPECTATIONS = Object.freeze({
   primaryRelpath: PRIMARY_RELPATH,
   pagerTitle: 'This second deterministic session verifies machine-filtered pagination.',
   pagerRelpath: PAGER_RELPATH,
-  pagerSearchPhrase: 'machine filtered pagination',
+  pagerSearchPhrase: 'machine-filtered',
   searchPhrase: 'saffron telescope',
   externalDigest: EXTERNAL_DIGEST,
   externalFileName: 'fixture-external.png',
