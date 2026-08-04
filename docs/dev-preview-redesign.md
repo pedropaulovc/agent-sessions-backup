@@ -81,7 +81,7 @@ The stable Worker is owned by the PR number and is reused across heads. Generati
 
 The workflow records the full SHA, run ID, attested Worker artifact digest, resource IDs, creation time, schema digest, uploaded Worker version, and smoke result in trusted state. PR files may supply application source and SQL migration content. They may not supply account IDs, resource IDs, routes, Worker names, secrets, lifecycle scripts, build configuration, or the generated Wrangler configuration.
 
-The front-door Durable Object is the sole routing authority. For each PR it stores one strongly consistent live tuple and optional candidate tuples: generation ID, exact immutable Worker version URL, full head SHA, attested artifact digest, schema digest, status, and previous tuple. The public host resolves through the live tuple rather than through whichever version Cloudflare marks deployed on the Worker service.
+The front-door Durable Object is the sole routing authority. For each PR it stores one strongly consistent state record: lifecycle status and epoch, expected head SHA, live tuple, optional candidate tuples, rollback tuple, and deletion inventory. Each tuple carries generation ID, exact immutable Worker version URL, full head SHA, attested artifact digest, and schema digest. The public host resolves through the live tuple rather than through whichever version Cloudflare marks deployed on the Worker service.
 
 Serialize deployment and cleanup with one concurrency group per PR. For each new head:
 
@@ -92,25 +92,25 @@ Serialize deployment and cleanup with one concurrency group per PR. For each new
 5. Trusted orchestration confirms the PR is open and the attested SHA is still the current PR head, then creates a new generation in the non-production account and writes a generated Wrangler config under a temporary directory.
 6. Pinned Wrangler from the default branch applies all migrations to the new D1 and reports zero pending migrations.
 7. The workflow uploads the attested immutable Worker version with `wrangler versions upload` or an equivalent fixed API call. It does not deploy that version to the stable Worker.
-8. The front door registers a candidate tuple through a one-use, generation-bound CI grant. Candidate routing targets only the exact version URL, injects the origin assertion, and never changes the live tuple. The workflow waits for candidate readiness, seeds synthetic data through that candidate's normal upload and queue path, then runs remote Playwright through the Access-protected candidate route.
+8. The front door registers a candidate tuple through a one-use, generation-bound CI grant. Candidate registration is a CAS requiring lifecycle status `open`, the expected epoch and head SHA, and no newer generation. Candidate routing targets only the exact version URL, injects the origin assertion, and never changes the live tuple. The workflow waits for candidate readiness, seeds synthetic data through that candidate's normal upload and queue path, then runs remote Playwright through the Access-protected candidate route.
 9. Smoke verifies the generated bindings, head SHA, artifact digest, schema digest, synthetic data, and direct-origin denial.
-10. Immediately before promotion, orchestration rechecks the open PR's current head and artifact digest. It atomically compare-and-swaps the candidate tuple into the live slot. That single state write is the promotion; there is no second Cloudflare service-promotion step that can diverge. A stale run cleans up its own generation and cannot overwrite a newer head.
-11. The previous routing tuple, Worker version, and resource tuple remain intact through the rollback window. Rollback is one front-door tuple CAS. Older versions and resources are then deleted.
+10. Immediately before promotion, orchestration rechecks the open PR's current head and artifact digest. The front door atomically compare-and-swaps the candidate into the live slot only if lifecycle status is still `open` and epoch, expected head SHA, expected candidate generation, and prior live tuple all match. That single state write is the promotion; there is no second Cloudflare service-promotion step that can diverge. A stale run cleans up its own generation and cannot overwrite a newer head.
+11. The previous routing tuple, Worker version, and resource tuple remain intact through the rollback window. Rollback is one front-door tuple CAS subject to the same open status, epoch, and head checks. Older versions and resources are then deleted.
 
-The PR-close workflow participates in the same concurrency group, marks the PR closed in trusted state before cleanup, and prevents an in-flight older run from recreating or promoting resources.
+Close is a competing atomic front-door transition, not only a workflow convention. It increments the epoch, writes a permanent closed tombstone, moves live, candidate, and rollback resource references into the deletion inventory, and clears every routable tuple before returning resources for deletion. Candidate registration, promotion, and rollback all reject a tombstone. The PR-close workflow still shares the per-PR concurrency group, but correctness does not depend on GitHub scheduling.
 
 No Cloudflare credential enters a job that executes PR package scripts, PR actions, PR configuration, or the bundle build. Before enabling the credentialed upload, prove that pinned Wrangler with the generated config and prebuilt artifact performs no artifact-code execution. If it does, use the Cloudflare REST API or a fixed uploader instead.
 
 ### Cleanup
 
-A default-branch `pull_request_target` close workflow deletes resources recorded for that PR after detaching the Worker. It never checks out the PR. A scheduled janitor independently removes:
+A default-branch `pull_request_target` close workflow executes the atomic close transition, then deletes the returned inventory. It never checks out the PR. A scheduled janitor independently removes:
 
-- recorded resources for closed PRs;
+- deletion-inventory resources for closed PRs;
 - failed or canceled generations older than 24 hours;
 - superseded generations outside the rollback window;
-- stable Workers with no matching open PR.
+- stable Workers whose trusted state has a closed tombstone and no matching open PR.
 
-Deletion treats not-found as success. For every typed resource ID, cleanup verifies the expected resource kind, the exact recorded name, the common `pr-<number>-` prefix, and generation ownership before deletion. It preserves the live and rollback tuples. Tests cover close and janitor deletion for Worker versions, D1, R2, KV, and both queues, including partial retries and foreign-name rejection.
+Deletion treats not-found as success. For every typed resource ID, cleanup verifies the expected resource kind, exact recorded name, common `pr-<number>-` prefix, and generation ownership before deletion. Janitor cleanup for an open PR preserves its live and rollback tuples. Tests cover every Worker version, D1, R2, KV, and both queues; partial retries; foreign-name rejection; and both orderings of a close-versus-promotion race. Exactly one transition wins, and a completed close always leaves no routable tuple.
 
 ## D1 lifecycle and migration policy
 
@@ -224,7 +224,7 @@ The bootstrap route is implemented by the immutable front door, not the PR Worke
 
 The front door does not copy request or response headers. It constructs requests from a versioned safe-header allowlist needed by the application, such as validated content type, content length, range, conditional cache headers, and a synthesized same-origin `Origin` for state-changing requests. It drops every cookie, authorization header, `cf-*`, forwarded/proxy header, Access field, browser bootstrap field, and unknown header. Response headers use a separate content/cache/range/rewritten-location allowlist; every `Set-Cookie` and unknown header is dropped. Sentinel tests send unknown and future-looking credential headers in both directions and prove none crosses the boundary.
 
-After Access or an edge session succeeds, the front door mints a short-lived browser request assertion with a distinct audience. It binds actor, identity kind `human`, PR, head SHA, method, path, mutation body digest when present, issued-at, expiry, and `jti`. The Worker verifies it with a public key before viewer actions such as star/unstar. Raw Access and browser credentials never cross the boundary.
+After Access or an edge session succeeds, the front door mints a short-lived browser request assertion with a distinct audience. It binds actor, identity kind `human`, PR, head SHA, method, the exact canonical request target (`pathname` plus query), mutation body digest when present, issued-at, expiry, and `jti`. The front door rejects malformed percent encodings, encoded separators, and duplicate security-sensitive selectors; mutations place the selected resource in the path or digested body rather than query-only state. The Worker compares the assertion to the exact forwarded target and verifies it with a public key before viewer actions such as star/unstar. Raw Access and browser credentials never cross the boundary.
 
 Use a separate per-generation origin assertion between the front door and the PR Worker. The Worker denies its direct `workers.dev` origin without that assertion. A hostile PR can disclose its own verifier or remove the check and can read all data the user explicitly copied into that PR, so user consent must name the exact head SHA. The control prevents accidental public access, not hostile code from seeing data intentionally given to that code. Remote production-session import remains disabled until tests prove direct-origin denial and request/response credential stripping.
 
@@ -232,7 +232,7 @@ Remove `DEV_AUTH` from browser cookies, asset signing, and Worker bindings. Remo
 
 ### Machine and test access
 
-Do not bind a reusable machine or admin secret to PR code. Synthetic seed, remote smoke setup, and debug import each begin as a one-use action grant in the trusted front-door Durable Object. This assertion uses a different key and audience from browser requests. The grant binds method, path, PR, head SHA, body digest or object manifest, byte limit, actor, purpose, expiry, and `jti`. After consuming it, the front door forwards the bounded request with a short signed assertion. The PR Worker receives only public verification material and the already-consumed assertion, never a root signing key, Cloudflare credential, or reusable machine bearer.
+Do not bind a reusable machine or admin secret to PR code. Synthetic seed, remote smoke setup, and debug import each begin as a one-use action grant in the trusted front-door Durable Object. This assertion uses a different key and audience from browser requests. The grant binds method, exact canonical request target, PR, head SHA, body digest or object manifest, byte limit, actor, purpose, expiry, and `jti`; it uses the same malformed-encoding and duplicate-selector rejection rules. After consuming it, the front door forwards that exact target with a short signed assertion. The PR Worker receives only public verification material and the already-consumed assertion, never a root signing key, Cloudflare credential, or reusable machine bearer.
 
 Production ignores every preview edge session, origin assertion, and action grant. Preserve the `ENVIRONMENT` allowlist and `src/preview.ts` module-surface test.
 
@@ -471,7 +471,7 @@ Keep the committed instructions short. The final section should say only:
 - PR code, preview Workers, and preview CI must never receive a production binding, cookie, certificate, resource ID, or Cloudflare token.
 ```
 
-Do not document planned commands in `AGENTS.md` before implementation. Agent instructions must describe a working path, not an architectural intention.
+Do not document planned commands in `AGENTS.md` before implementation. This planning PR therefore leaves `AGENTS.md` unchanged. The implementation PR that adds the section must execute every exact command and argument shown above on its stated Windows, Linux, local, preview, or production path, record the evidence, and update the text to match the implemented CLI. Agent instructions must describe a working path, not an architectural intention.
 
 ## Definition of done
 
