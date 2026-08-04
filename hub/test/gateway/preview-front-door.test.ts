@@ -213,10 +213,14 @@ describe('trusted generation ingress', () => {
       }),
     };
     const request = new Request('https://version-edge.preview.workers.dev/healthz');
-    expect((await trustedPreviewIngress(request.clone(), env)).status).toBe(403);
-    expect((await trustedPreviewIngress(new Request(request, {
+    const missing = await trustedPreviewIngress(request.clone(), env);
+    expect(missing.status).toBe(403);
+    await expect(missing.json()).resolves.toEqual({ error: 'invalid_origin_assertion', reason: 'missing' });
+    const wrongTarget = await trustedPreviewIngress(new Request(request, {
       headers: { 'x-preview-origin-assertion': await token('/wrong') },
-    }), env)).status).toBe(403);
+    }), env);
+    expect(wrongTarget.status).toBe(403);
+    await expect(wrongTarget.json()).resolves.toEqual({ error: 'invalid_origin_assertion', reason: 'target_mismatch' });
     expect(app.fetch).not.toHaveBeenCalled();
 
     const accepted = await trustedPreviewIngress(new Request(request, {

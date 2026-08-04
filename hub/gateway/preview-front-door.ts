@@ -1475,45 +1475,47 @@ async function verifyRs256Jwt(token: string, keys: JsonWebKeyWithKid[], expected
   return claims;
 }
 
-async function verifyPreviewOriginAssertion(
+async function previewOriginAssertionFailure(
   token: string,
   request: Request,
   jwksSource: string,
-): Promise<boolean> {
+): Promise<string | null> {
   const parts = token.split('.');
-  if (parts.length !== 3) return false;
+  if (parts.length !== 3) return 'malformed';
   const header = parseJsonSegment<Record<string, unknown>>(parts[0]!);
+  if (header?.alg !== 'RS256' || header.typ !== 'JWT' || typeof header.kid !== 'string') {
+    return 'invalid_header';
+  }
   let keys: JsonWebKeyWithKid[];
   try {
     const parsed = JSON.parse(jwksSource) as { keys?: JsonWebKeyWithKid[] };
     keys = Array.isArray(parsed.keys) ? parsed.keys : [];
   } catch {
-    return false;
+    return 'invalid_jwks';
   }
-  if (header?.alg !== 'RS256' || header.typ !== 'JWT' || typeof header.kid !== 'string') return false;
   const claims = await verifyRs256Jwt(token, keys, {
     issuer: `https://${CONTROL_HOST}`,
     audience: AUDIENCES.origin,
   });
-  if (!claims) return false;
+  if (!claims) return 'invalid_jwt';
   const now = Math.floor(Date.now() / 1000);
   const url = new URL(request.url);
   const target = canonicalTarget(`${url.pathname}${url.search}`);
+  if (!target) return 'invalid_target';
+  if (claims.method !== request.method) return 'method_mismatch';
+  if (claims.target !== target) return 'target_mismatch';
   if (
-    !target
-    || claims.method !== request.method
-    || claims.target !== target
-    || typeof claims.iat !== 'number'
+    typeof claims.iat !== 'number'
     || typeof claims.exp !== 'number'
     || claims.exp - claims.iat > ASSERTION_TTL_SECONDS
-    || typeof claims.jti !== 'string'
-    || claims.jti.length < 16
-    || claims.iat > now + 30
-  ) return false;
+  ) return 'invalid_ttl';
+  if (typeof claims.jti !== 'string' || claims.jti.length < 16) return 'invalid_jti';
+  if (claims.iat > now + 30) return 'invalid_clock';
   const digest = await bodyDigest(request);
-  return MUTATING_METHODS.has(request.method)
-    ? claims.bodyDigest === digest
-    : claims.bodyDigest === undefined;
+  if (MUTATING_METHODS.has(request.method)) {
+    return claims.bodyDigest === digest ? null : 'body_digest_mismatch';
+  }
+  return claims.bodyDigest === undefined ? null : 'unexpected_body_digest';
 }
 
 /** Authenticate trusted-front-door traffic before entering the private generation binding. */
@@ -1522,12 +1524,12 @@ export async function trustedPreviewIngress(
   env: TrustedPreviewIngressEnv,
 ): Promise<Response> {
   const assertion = request.headers.get('x-preview-origin-assertion');
-  if (!assertion || !await verifyPreviewOriginAssertion(
-    assertion,
-    request.clone(),
-    env.PREVIEW_ORIGIN_ASSERTION_JWKS,
-  )) {
-    return json({ error: 'invalid_origin_assertion' }, 403);
+  const reason = assertion
+    ? await previewOriginAssertionFailure(assertion, request.clone(), env.PREVIEW_ORIGIN_ASSERTION_JWKS)
+    : 'missing';
+  if (reason) {
+    console.warn(JSON.stringify({ event: 'preview.origin.denied', reason }));
+    return json({ error: 'invalid_origin_assertion', reason }, 403);
   }
   return env.APP.fetch(request);
 }
