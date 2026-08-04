@@ -1,4 +1,5 @@
 import { generateKeyPairSync } from 'node:crypto';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
 import {
   PREVIEW_ACCOUNT_ID,
@@ -11,6 +12,7 @@ import {
   generatedTrustedWrapperConfig,
   inventoryGenerations,
   migrationArtifactSqlNames,
+  resolveBundlerInputPath,
   resourceNames,
 } from '../../infra/cf/preview-trust.mjs';
 
@@ -288,5 +290,28 @@ describe('private preview application key bindings', () => {
       debugImportAssertionPublicJwk: JSON.stringify(DEBUG_IMPORT_JWK),
       debugExportManifestVerifyPublicJwk: JSON.stringify({ ...DEBUG_MANIFEST_JWK, d: 'private-scalar' }),
     })).toThrow(/private key material/);
+  });
+});
+
+describe('bundler metafile input paths', () => {
+  const posixRoot = '/home/runner/work/agent-sessions-backup/agent-sessions-backup/source/hub';
+
+  it('restores the POSIX root stripped from Wrangler absolute input paths', () => {
+    const input = 'home/runner/work/agent-sessions-backup/agent-sessions-backup/source/hub/node_modules/pkg/index.js';
+    expect(resolveBundlerInputPath(posixRoot, input, path.posix))
+      .toBe(`/${input}`);
+  });
+
+  it('keeps ordinary metafile inputs relative to the source Hub', () => {
+    expect(resolveBundlerInputPath(posixRoot, 'src/preview.ts', path.posix))
+      .toBe(`${posixRoot}/src/preview.ts`);
+  });
+
+  it('normalizes Windows absolute and root-stripped inputs', () => {
+    const windowsRoot = 'C:\\work\\source\\hub';
+    const expected = 'C:\\work\\source\\hub\\node_modules\\pkg\\index.js';
+    expect(resolveBundlerInputPath(windowsRoot, expected, path.win32)).toBe(expected);
+    expect(resolveBundlerInputPath(windowsRoot, 'work/source/hub/node_modules/pkg/index.js', path.win32))
+      .toBe(expected);
   });
 });

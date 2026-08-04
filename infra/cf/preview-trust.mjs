@@ -352,6 +352,20 @@ export function generatedTrustedWrapperConfig({ accountId, main, names, originJw
   return config;
 }
 
+export function resolveBundlerInputPath(sourceRoot, input, pathApi = path) {
+  if (typeof input !== 'string' || input.length === 0) fail('bundler input path is required');
+  const absoluteRoot = pathApi.resolve(sourceRoot);
+  const normalizedInput = pathApi.sep === '\\' ? input.replaceAll('/', '\\') : input;
+  if (pathApi.isAbsolute(normalizedInput)) return pathApi.normalize(normalizedInput);
+
+  const volumeRoot = pathApi.parse(absoluteRoot).root;
+  const unrootedSource = absoluteRoot.slice(volumeRoot.length);
+  if (normalizedInput === unrootedSource || normalizedInput.startsWith(`${unrootedSource}${pathApi.sep}`)) {
+    return pathApi.resolve(volumeRoot, normalizedInput);
+  }
+  return pathApi.resolve(absoluteRoot, normalizedInput);
+}
+
 export async function assertContainedRegularFile(root, candidate, label) {
   const rootReal = await realpath(root);
   const fileReal = await realpath(candidate);
