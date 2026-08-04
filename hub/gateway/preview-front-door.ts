@@ -5,6 +5,7 @@ const CONTROL_HOST = 'preview-control.sessions.vza.net';
 const PREVIEW_VERSION_SUFFIX = '.agent-sessions-nonproduction.workers.dev';
 const COOKIE = '__Host-preview-edge';
 const ASSERTION_TTL_SECONDS = 45;
+const ASSERTION_CLOCK_SKEW_SECONDS = 5;
 const SESSION_TTL_SECONDS = 3600;
 const MUTATING_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
 
@@ -1510,7 +1511,7 @@ async function previewOriginAssertionFailure(
   const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
   if (!audiences.includes(AUDIENCES.origin)) return 'audience_mismatch';
   if (typeof claims.exp !== 'number' || now >= claims.exp) return 'expired';
-  if (typeof claims.iat !== 'number' || claims.iat > now + 30) return 'invalid_clock';
+  if (typeof claims.iat !== 'number' || claims.iat > now + ASSERTION_CLOCK_SKEW_SECONDS) return 'invalid_clock';
   const url = new URL(request.url);
   const target = canonicalTarget(`${url.pathname}${url.search}`);
   if (!target) return 'invalid_target';

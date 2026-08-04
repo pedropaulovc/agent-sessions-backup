@@ -222,7 +222,7 @@ describe('trusted generation ingress', () => {
     }), env);
     expect(wrongTarget.status).toBe(403);
     await expect(wrongTarget.json()).resolves.toEqual({ error: 'invalid_origin_assertion', reason: 'target_mismatch' });
-    const future = Math.floor(Date.now() / 1000) + 60;
+    const future = Math.floor(Date.now() / 1000) + 6;
     const wrongClock = await trustedPreviewIngress(new Request(request, {
       headers: { 'x-preview-origin-assertion': await token('/healthz', { iat: future, exp: future + 45 }) },
     }), env);
