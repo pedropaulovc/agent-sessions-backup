@@ -3,6 +3,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs';
 import { createServer } from 'node:net';
 import path from 'node:path';
+import { requiredCloudflareAccessHeaders } from '../storage-state';
 
 interface WorkerFixtures {
   environmentURL: string;
@@ -11,6 +12,7 @@ interface WorkerFixtures {
 interface TestFixtures {
   appURL: (pathname?: string) => string;
   browserDiagnostics: void;
+  previewAccess: void;
 }
 
 interface StartedEnvironment {
@@ -60,6 +62,28 @@ export const test = base.extend<TestFixtures, WorkerFixtures>({
   appURL: async ({ environmentURL }, use) => {
     await use((pathname = '/') => new URL(pathname, environmentURL).toString());
   },
+
+  previewAccess: [
+    async ({ context, environmentURL }, use) => {
+      if (!process.env.PREVIEW_BOOTSTRAP_FILE?.trim()) {
+        await use();
+        return;
+      }
+
+      const accessHeaders = requiredCloudflareAccessHeaders(process.env);
+      const previewOrigin = new URL(environmentURL).origin;
+      const routePattern = `${previewOrigin}/**`;
+      await context.route(routePattern, async (route) => {
+        await route.continue({ headers: { ...route.request().headers(), ...accessHeaders } });
+      });
+      try {
+        await use();
+      } finally {
+        await context.unroute(routePattern);
+      }
+    },
+    { auto: true },
+  ],
 
   browserDiagnostics: [
     async ({ page }, use, testInfo) => {

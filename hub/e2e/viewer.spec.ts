@@ -3,9 +3,9 @@ import { SYNTHETIC_FIXTURE as fixture } from './fixtures/synthetic';
 
 test.describe('synthetic sessions viewer', () => {
   test('reports health and renders the first page', async ({ page, appURL }) => {
-    const health = await page.request.get(appURL('/healthz'));
-    expect(health.ok()).toBeTruthy();
-    expect(await health.json()).toMatchObject({ ok: true });
+    const health = await page.goto(appURL('/healthz'));
+    expect(health?.ok()).toBeTruthy();
+    expect(await health?.json()).toMatchObject({ ok: true });
 
     const response = await page.goto(appURL('/'));
     expect(response?.ok()).toBeTruthy();
