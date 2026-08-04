@@ -185,14 +185,24 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         // existing subagent filtering and parent banner.
         // `forked_from_id` also appears on ordinary interactive `codex fork` rollouts. Only
         // Codex's explicit subagent provenance makes the relationship a sidechain.
-        if (str(payload.thread_source) !== 'subagent') break;
+        if (str(payload.thread_source) !== 'subagent') {
+          session.parentSessionId = undefined;
+          session.parentSessionLink = 'none';
+          session.isSidechain = false;
+          break;
+        }
         const parentSessionId =
           codexSessionId(payload.forked_from_id) ??
           codexSessionId(payload.parent_thread_id) ??
           codexSessionId(payload.session_id);
         if (parentSessionId && parentSessionId !== session.id) {
           session.parentSessionId = parentSessionId;
+          session.parentSessionLink = 'linked';
           session.isSidechain = true;
+        } else {
+          session.parentSessionId = undefined;
+          session.parentSessionLink = 'none';
+          session.isSidechain = false;
         }
         break;
       }

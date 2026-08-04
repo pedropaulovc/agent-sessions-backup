@@ -161,6 +161,8 @@ export interface NormalizedSession {
   title?: string;
   startedAt?: string;
   endedAt?: string;
+  /** Whether this parser explicitly linked or ruled out a parent session; absent means unknown. */
+  parentSessionLink?: 'linked' | 'none';
   parentSessionId?: string;
   parentToolUseId?: string;
   isSidechain: boolean;

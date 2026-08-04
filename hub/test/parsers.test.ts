@@ -771,6 +771,7 @@ describe('parseCodex', () => {
 
     expect(session.id).toBe(childSessionId);
     expect(session.parentSessionId).toBe(CODEX_SESSION_ID);
+    expect(session.parentSessionLink).toBe('linked');
     expect(session.isSidechain).toBe(true);
   });
 
@@ -790,8 +791,8 @@ describe('parseCodex', () => {
     };
 
     const session = await parseCodex(readJsonlLines(toStream([JSON.stringify(forkMeta)])), forkSessionId);
-
     expect(session.parentSessionId).toBeUndefined();
+    expect(session.parentSessionLink).toBe('none');
     expect(session.isSidechain).toBe(false);
   });
 

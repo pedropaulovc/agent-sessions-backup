@@ -283,7 +283,12 @@ describe('codex fork rollouts stay under their root session', () => {
   const ROOT_SESSION_ID = '019f0000-0000-7000-8000-000000000abe';
   const CHILD_SESSION_ID = '019f0000-0000-7000-8000-000000000abf';
 
-  function rollout(sessionId: string, text: string, parentSessionId?: string): string {
+  function rollout(
+    sessionId: string,
+    text: string,
+    parentSessionId?: string,
+    threadSource: 'subagent' | 'user' = parentSessionId ? 'subagent' : 'user',
+  ): string {
     return `${[
       JSON.stringify({
         timestamp: '2026-08-04T14:48:07.205Z',
@@ -295,9 +300,9 @@ describe('codex fork rollouts stay under their root session', () => {
             ? {
                 forked_from_id: parentSessionId,
                 parent_thread_id: parentSessionId,
-                thread_source: 'subagent',
+                thread_source: threadSource,
               }
-            : { thread_source: 'user' }),
+            : { thread_source: threadSource }),
           cwd: '/home/tester/src/meshprobe',
         },
       }),
@@ -341,6 +346,25 @@ describe('codex fork rollouts stay under their root session', () => {
     const html = await recent.text();
     expect(html).toContain(`/s/${ROOT_SESSION_ID}`);
     expect(html).not.toContain(`/s/${CHILD_SESSION_ID}`);
+    const reindexedChild = await putFile(
+      'codex-sessions',
+      childPath,
+      rollout(CHILD_SESSION_ID, 'interactive fork', ROOT_SESSION_ID, 'user'),
+    );
+    expect(reindexedChild.status).toBe(201);
+    await drainQueue();
+
+    const cleared = await testEnv.DB.prepare(
+      'SELECT parent_session_id, is_sidechain FROM sessions WHERE session_id = ?1',
+    )
+      .bind(CHILD_SESSION_ID)
+      .first<{ parent_session_id: string | null; is_sidechain: number }>();
+    expect(cleared).toEqual({ parent_session_id: null, is_sidechain: 0 });
+
+    const recentAfterReindex = await SELF.fetch('https://sessions.vza.net/?harness=codex');
+    expect(recentAfterReindex.status).toBe(200);
+    const htmlAfterReindex = await recentAfterReindex.text();
+    expect(htmlAfterReindex).toContain(`/s/${CHILD_SESSION_ID}`);
   });
 });
 
