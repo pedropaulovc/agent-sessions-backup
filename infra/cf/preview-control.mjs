@@ -27,6 +27,7 @@ import {
   queueConsumerIdsForWorker,
   repositoryName,
   resourceNames,
+  previewBrowserGrantRequest,
   sha256Bytes,
   sortCleanupInventory,
   stableJson,
@@ -987,17 +988,18 @@ async function seed() {
 
 async function browserGrant() {
   const context = await candidateContext();
-  const grant = await frontDoor('POST', '/_control/grant', context.deployAudience, {
-    pr,
-    epoch: context.stateRecord.epoch,
-    head: context.sha,
-    sourceRunId: context.sourceRunId,
-    generation: context.generation,
-    audience: 'preview-browser',
-    method: 'GET',
-    target: '/',
-    expiresIn: 300,
-  });
+  const grant = await frontDoor(
+    'POST',
+    '/_control/grant',
+    context.deployAudience,
+    previewBrowserGrantRequest({
+      pr,
+      epoch: context.stateRecord.epoch,
+      head: context.sha,
+      sourceRunId: context.sourceRunId,
+      generation: context.generation,
+    }),
+  );
   const bootstrap = new URL(grant.bootstrapUrl);
   const expectedOrigin = `https://pr-${pr}-preview.sessions.vza.net`;
   if (bootstrap.protocol !== 'https:' || bootstrap.origin !== expectedOrigin || bootstrap.username || bootstrap.password) {

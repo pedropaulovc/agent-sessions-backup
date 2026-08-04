@@ -239,6 +239,38 @@ describe('trusted generation ingress', () => {
   });
 });
 
+describe('preview browser session grants', () => {
+  it('accepts a wildcard browser grant and keeps its session reusable across targets', async () => {
+    const { post } = destinationLifecycleHarness();
+    const issued = await post('grant', {
+      pr: 42,
+      epoch: 1,
+      head: HEAD_A,
+      generation: 'g1-aaaaaaaaaaaa',
+      audience: 'preview-browser',
+      method: '*',
+      target: '*',
+      actor: 'reviewer@example.test',
+      expiresIn: 3600,
+    });
+    expect(issued.status).toBe(200);
+    const grant = await issued.json() as { code: string };
+    const consumed = await post('consume-grant', { code: grant.code, host: 'pr-42-preview.sessions.vza.net' });
+    expect(consumed.status).toBe(200);
+    const session = await consumed.json() as { id: string; method: string; target: string };
+    expect(session).toMatchObject({ method: '*', target: '*' });
+
+    for (const target of ['/', '/healthz']) {
+      const routed = await post('session', { id: session.id, host: 'pr-42-preview.sessions.vza.net' });
+      expect(routed.status, target).toBe(200);
+      await expect(routed.json()).resolves.toMatchObject({
+        session: { method: '*', target: '*' },
+        tuple: { generation: 'g1-aaaaaaaaaaaa' },
+      });
+    }
+  });
+});
+
 describe('crash-safe generation inventory', () => {
   it('retains typed partial allocations after hard cancellation and blocks final register', async () => {
     const data = new Map<string, unknown>();
