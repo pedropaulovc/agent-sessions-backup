@@ -22,7 +22,7 @@ The same Playwright project runs against the local server on Windows and Linux, 
 The existing controls prevent several accidents, but the environment model is the source of the remaining problems.
 
 - `hub/wrangler.jsonc` binds every branch to one long-lived `sessions-index-preview` D1 database. An unmerged migration changes the schema for every branch. A branch can therefore run against a schema ahead of or incompatible with its own migration set.
-- Pull request migrations use a second migration engine in `hub/src/api/migrate.ts`. It has its own SQL scanner and a smaller accepted SQL language than Wrangler. The job can also finish green after the branch endpoint remains unreachable, leaving deployed code on an old schema.
+- Pull request migrations use a second migration engine in `hub/src/api/migrate.ts`. It has its own SQL scanner and accepts a smaller subset than Wrangler. The job can also finish green after the branch endpoint remains unreachable, leaving deployed code on an old schema.
 - Applied D1 migrations are identified by filename, not content hash. `hub/migrations/0020_priced_version_not_null.sql` records a real correction after preview had already applied an older version of `0019`.
 - `npm --prefix hub run dev` does not migrate local D1. Local setup, tests, and deployed environments reach schema readiness through different paths.
 - `scripts/seed-local.mjs` uploads the operator's real corpus. There is no small deterministic browser fixture or lifecycle-managed local database.
@@ -66,32 +66,36 @@ flowchart LR
 
 ### Resource generations
 
-Use the PR number for the stable Worker name and a collision-proof generation ID derived from the trusted GitHub run ID plus at least 12 SHA characters:
+Use one PR prefix, a stable Worker name owned by the PR, and a collision-proof generation ID derived from the trusted GitHub run ID plus at least 12 SHA characters:
 
-- Worker: `sessions-hub-pr-<number>`
+- PR prefix: `pr-<number>-`
+- stable Worker: `pr-<number>-sessions-hub`
 - generation: `g<run-id>-<sha12>`
-- D1: `sessions-index-pr-<number>-<generation>`
-- R2: `agent-sessions-pr-<number>-<generation>`
-- KV: `sessions-hub-kv-pr-<number>-<generation>`
-- queues: `parse-pr-<number>-<generation>` and `parse-dlq-pr-<number>-<generation>`
+- D1: `pr-<number>-<generation>-sessions-index`
+- R2: `pr-<number>-<generation>-agent-sessions`
+- KV: `pr-<number>-<generation>-sessions-hub-kv`
+- queues: `pr-<number>-<generation>-parse` and `pr-<number>-<generation>-parse-dlq`
 - public host: `pr-<number>-preview.sessions.vza.net`
 
-The allocator checks every Cloudflare naming limit and verifies that an existing name belongs to the same full SHA and run before reuse. The workflow records the full SHA, run ID, attested Worker artifact digest, resource IDs, creation time, schema digest, uploaded Worker version, and smoke result in trusted state. PR files may supply application source and SQL migration content. They may not supply account IDs, resource IDs, routes, Worker names, secrets, lifecycle scripts, build configuration, or the generated Wrangler configuration.
+The stable Worker is owned by the PR number and is reused across heads. Generation resources are owned by full SHA and run ID. The allocator checks every Cloudflare naming limit and verifies existing typed resources against trusted ownership records. A retry of the same run resumes the last recorded phase for its generation; a new run gets a new generation. It never guesses ownership from a partial name.
 
-The front-door Durable Object is the sole routing authority. For each PR it stores one strongly consistent tuple: generation ID, exact immutable Worker version URL, full head SHA, attested artifact digest, schema digest, status, and previous tuple. The public host resolves through that tuple rather than through whichever version Cloudflare marks deployed on the Worker service.
+The workflow records the full SHA, run ID, attested Worker artifact digest, resource IDs, creation time, schema digest, uploaded Worker version, and smoke result in trusted state. PR files may supply application source and SQL migration content. They may not supply account IDs, resource IDs, routes, Worker names, secrets, lifecycle scripts, build configuration, or the generated Wrangler configuration.
+
+The front-door Durable Object is the sole routing authority. For each PR it stores one strongly consistent live tuple and optional candidate tuples: generation ID, exact immutable Worker version URL, full head SHA, attested artifact digest, schema digest, status, and previous tuple. The public host resolves through the live tuple rather than through whichever version Cloudflare marks deployed on the Worker service.
 
 Serialize deployment and cleanup with one concurrency group per PR. For each new head:
 
 1. Unprivileged PR CI runs type checks, unit/integration tests, migration checks, and local Playwright on the PR checkout.
 2. After CI succeeds, a default-branch `workflow_run` build job checks out that exact head with no persisted GitHub token, Cloudflare credential, environment secret, or write permission. A default-branch build driver uses pinned tool versions, ignores package lifecycle scripts, resolves no PR build config, and runs in a sandbox with no network after dependency acquisition.
-3. The hermetic job emits only the bundled preview Worker, static assets if any, migration SQL, and a content manifest. It computes the bundle digest and emits build provenance binding that digest to repository, head SHA, trusted workflow identity, toolchain digest, and run ID.
+3. The hermetic job emits only the bundled preview Worker, static assets if any, migration SQL, and separate canonical build, migration, and content manifests. It computes the bundle digest and emits build provenance binding that digest to repository, head SHA, trusted workflow identity, toolchain digest, and run ID.
 4. A separate credentialed control job verifies the provenance and artifact digest before reading the artifact as untrusted data. It rejects path traversal, links, unexpected files, oversized entries, manifest mismatches, and any source other than the successful hermetic job. If a dependency change cannot build under this contract, update the trusted toolchain on `main` first rather than executing PR lifecycle code beside credentials.
 5. Trusted orchestration confirms the PR is open and the attested SHA is still the current PR head, then creates a new generation in the non-production account and writes a generated Wrangler config under a temporary directory.
 6. Pinned Wrangler from the default branch applies all migrations to the new D1 and reports zero pending migrations.
-7. The workflow seeds synthetic data and uploads the attested immutable Worker version with `wrangler versions upload` or an equivalent fixed API call. It does not deploy that version to the stable Worker.
-8. Remote Playwright targets the exact version preview URL and verifies its generated bindings, head SHA, artifact digest, schema digest, and synthetic data.
-9. Immediately before promotion, orchestration rechecks the open PR's current head and artifact digest. It atomically compare-and-swaps the front-door routing tuple from the previously observed generation to the exact smoke-tested version URL. That single state write is the promotion; there is no second Cloudflare service-promotion step that can diverge. A stale run cleans up its own generation and cannot overwrite a newer head.
-10. The previous routing tuple, Worker version, and resource tuple remain intact through the rollback window. Rollback is one front-door tuple CAS. Older versions and resources are then deleted.
+7. The workflow uploads the attested immutable Worker version with `wrangler versions upload` or an equivalent fixed API call. It does not deploy that version to the stable Worker.
+8. The front door registers a candidate tuple through a one-use, generation-bound CI grant. Candidate routing targets only the exact version URL, injects the origin assertion, and never changes the live tuple. The workflow waits for candidate readiness, seeds synthetic data through that candidate's normal upload and queue path, then runs remote Playwright through the Access-protected candidate route.
+9. Smoke verifies the generated bindings, head SHA, artifact digest, schema digest, synthetic data, and direct-origin denial.
+10. Immediately before promotion, orchestration rechecks the open PR's current head and artifact digest. It atomically compare-and-swaps the candidate tuple into the live slot. That single state write is the promotion; there is no second Cloudflare service-promotion step that can diverge. A stale run cleans up its own generation and cannot overwrite a newer head.
+11. The previous routing tuple, Worker version, and resource tuple remain intact through the rollback window. Rollback is one front-door tuple CAS. Older versions and resources are then deleted.
 
 The PR-close workflow participates in the same concurrency group, marks the PR closed in trusted state before cleanup, and prevents an in-flight older run from recreating or promoting resources.
 
@@ -99,14 +103,14 @@ No Cloudflare credential enters a job that executes PR package scripts, PR actio
 
 ### Cleanup
 
-A default-branch `pull_request_target` close workflow deletes resources with the exact `pr-<number>-` prefix after detaching the Worker. It never checks out the PR. A scheduled janitor independently removes:
+A default-branch `pull_request_target` close workflow deletes resources recorded for that PR after detaching the Worker. It never checks out the PR. A scheduled janitor independently removes:
 
-- resources for closed PRs;
+- recorded resources for closed PRs;
 - failed or canceled generations older than 24 hours;
 - superseded generations outside the rollback window;
-- Workers with no matching open PR.
+- stable Workers with no matching open PR.
 
-Deletion treats not-found as success. The janitor refuses names that do not match the strict naming grammar and preserves the generation currently recorded as live.
+Deletion treats not-found as success. For every typed resource ID, cleanup verifies the expected resource kind, the exact recorded name, the common `pr-<number>-` prefix, and generation ownership before deletion. It preserves the live and rollback tuples. Tests cover close and janitor deletion for Worker versions, D1, R2, KV, and both queues, including partial retries and foreign-name rejection.
 
 ## D1 lifecycle and migration policy
 
@@ -119,18 +123,24 @@ Create `hub/scripts/environment.mjs` as the command entrypoint and small testabl
 - `preview`: use the trusted generated remote config;
 - `production`: retain the main-only migrate-before-deploy workflow.
 
-Every mode performs the same sequence: validate migration corpus, apply, verify, seed if requested, start or deploy, then probe readiness. `dev:up` must migrate before starting Wrangler. A missing table should never be the first indication that setup was incomplete.
+The sequences differ only where a running HTTP path is required:
+
+- local/e2e: validate migration and build manifests, apply, verify, start, wait for readiness, seed through normal ingest, then probe indexed data;
+- preview: validate, apply to the new D1, upload the exact version, register the candidate route, wait for readiness, seed through the candidate's normal ingest, smoke, then promote the tuple;
+- production: validate, apply and verify migrations, deploy, then smoke without seeding.
+
+A missing table should never be the first indication that setup was incomplete.
 
 ### Migration invariants
 
 - Existing migration files are immutable. A PR may add a later `NNNN_name.sql`; it may not edit, remove, reuse, or reorder a migration already present on the base branch.
 - Keep the intentional `0004` gap reserved. Validate unique numeric prefixes and filenames.
-- Store a SHA-256 for every migration in a migration checksum table. Backfill the current production hashes once during cutover. Future runs fail if a recorded filename has different bytes.
-- Test both paths on every PR:
-  - clean install from `0001` through the PR head;
-  - upgrade from the base branch migration set with representative data, followed by the PR-only migrations.
+- A signed release manifest records the ordered filename and SHA-256 for every new migration. A trusted deployment journal records intended artifact digest, migration hash, and phase before Wrangler runs.
+- A checksum table created by a new migration records authoritative hashes for migrations first deployed after the ledger exists. Recording is a crash-safe state machine: intended, Wrangler-applied, checksum-recorded, committed. Reconciliation is allowed only against the same immutable artifact and journal. A disposable preview with ambiguous state is destroyed and recreated.
+- Do not backfill historical production hashes from current files. Reconstruct exact bytes from Git history, deployment evidence, and backups. The known `0019` divergence must remain explicit. If any historical bytes cannot be proven, fail closed, verify normalized live schema and data invariants, and create a separately signed, human-approved production baseline. Mark unknown history as baselined, not hash-verified.
+- Test crash and retry at every phase, partial baseline, wrong artifact, changed filename bytes, clean install from `0001`, and base-schema upgrade with representative data.
 - Run the migration command twice and require zero pending work on the second run.
-- Compare normalized `sqlite_master`, relevant PRAGMAs, FTS tables, and migration checksums between the clean and upgrade databases.
+- Compare normalized `sqlite_master`, relevant PRAGMAs, FTS tables, migration ledger, and schema digest between clean and upgrade databases.
 - Keep migrations forward-only after they have reached any persistent environment. A correction gets a new migration.
 - Use application reindexing for fields that SQL cannot derive from R2. Do not hide required reindex work inside a schema assertion.
 
@@ -144,8 +154,10 @@ A successful environment reports:
 {
   "environmentId": "local-name or pr-number/full-sha",
   "codeSha": "full git sha or dirty-worktree marker",
-  "artifactDigest": "sha256 of the actual local or attested remote build inputs and bundle",
-  "schemaDigest": "sha256 of ordered migration names and hashes",
+  "buildInputDigest": "sha256 of the canonical declared inputs",
+  "artifactDigest": "sha256 of the actual local or attested Worker bundle",
+  "migrationDigest": "sha256 of ordered migration names and hashes",
+  "schemaDigest": "sha256 of normalized live schema",
   "pendingMigrations": 0,
   "seedDigest": "fixture or debug bundle digest"
 }
@@ -162,13 +174,15 @@ Expose this on an authenticated development diagnostics route and include it in 
 1. check Node, npm, Wrangler, and the selected port;
 2. create or reuse the named loopback-only persistence directory;
 3. generate an environment nonce and record its process start identity;
-4. compute a build-input and bundle digest over the actual source, tracked and untracked local files, config, lockfile, and migrations;
-5. acquire an environment ownership lock;
-6. apply and verify migrations;
-7. start Wrangler with `ENVIRONMENT=development` and explicit host/port/persistence arguments;
-8. wait for `/healthz` and environment diagnostics carrying the same nonce, artifact digest, and schema digest;
-9. print the URL and state directory;
-10. remain in the foreground, forward Ctrl+C, and terminate the owned process tree on Windows and Linux.
+4. generate canonical, separately hashed build-input, migration, and seed manifests; the build manifest contains only the dependency lockfile, trusted config, and transitive source inputs reported by the pinned bundler in canonical relative-path order;
+5. reject symlinks escaping the repo and exclude `.env*`, credentials, private corpus files, `.dev`, `node_modules`, caches, ignored output, and unrelated untracked files; include a dirty file only when the bundler proves it is consumed;
+6. acquire an environment ownership lock;
+7. build twice and require the declared input manifest to reproduce the same bundle digest;
+8. apply and verify migrations;
+9. start Wrangler with `ENVIRONMENT=development` and explicit host/port/persistence arguments;
+10. wait for `/healthz` and environment diagnostics carrying the same nonce, build-input digest, artifact digest, migration digest, and schema digest;
+11. print the URL and state directory;
+12. remain in the foreground, forward Ctrl+C, and terminate the owned process tree on Windows and Linux.
 
 Do not provide a PID-only `dev:down`. The foreground owner or Playwright harness owns process teardown. `dev:reset` resolves and prints the selected path, rejects anything outside `.dev/`, and refuses while the environment lock or matching live nonce is present. Tests cover a stale PID, PID reuse, reset while running, a stale lock after a crash, and path traversal.
 
@@ -204,11 +218,13 @@ Terminate browser authentication at the stable front door, before any request re
 
 `preview:open` only resolves the PR's current healthy URL and opens it. The agent can run the command, while the user's existing Access browser session or GitHub login completes consent. There is no Wrangler login, D1 write, copied bearer, or repository skill in this path.
 
-Remote Playwright cannot receive a reusable Access service token. The trusted default-branch workflow exchanges an exact GitHub OIDC identity for a one-use edge grant bound to repository, trusted `job_workflow_ref`, PR number, head SHA, run ID, audience, actor, `jti`, and a short expiry. A dedicated front-door Durable Object stores grant consumption and short edge sessions. It has no production application binding or credential.
+Remote Playwright cannot receive a reusable Access service token. The trusted default-branch workflow exchanges an exact GitHub OIDC identity for a one-use edge grant bound to repository, trusted `job_workflow_ref`, PR number, head SHA, run ID, audience, actor, `jti`, and a short expiry. A dedicated front-door Durable Object stores grant consumption and short edge sessions.
 
 The bootstrap route is implemented by the immutable front door, not the PR Worker. It consumes the code without forwarding the code or query string, sets `Cache-Control: no-store` and `Referrer-Policy: no-referrer`, and creates a random `HttpOnly; Secure; SameSite=Strict; Path=/` edge cookie. The cookie is host, PR, head SHA, audience, and expiry bound.
 
 The front door does not copy request or response headers. It constructs requests from a versioned safe-header allowlist needed by the application, such as validated content type, content length, range, conditional cache headers, and a synthesized same-origin `Origin` for state-changing requests. It drops every cookie, authorization header, `cf-*`, forwarded/proxy header, Access field, browser bootstrap field, and unknown header. Response headers use a separate content/cache/range/rewritten-location allowlist; every `Set-Cookie` and unknown header is dropped. Sentinel tests send unknown and future-looking credential headers in both directions and prove none crosses the boundary.
+
+After Access or an edge session succeeds, the front door mints a short-lived browser request assertion with a distinct audience. It binds actor, identity kind `human`, PR, head SHA, method, path, mutation body digest when present, issued-at, expiry, and `jti`. The Worker verifies it with a public key before viewer actions such as star/unstar. Raw Access and browser credentials never cross the boundary.
 
 Use a separate per-generation origin assertion between the front door and the PR Worker. The Worker denies its direct `workers.dev` origin without that assertion. A hostile PR can disclose its own verifier or remove the check and can read all data the user explicitly copied into that PR, so user consent must name the exact head SHA. The control prevents accidental public access, not hostile code from seeing data intentionally given to that code. Remote production-session import remains disabled until tests prove direct-origin denial and request/response credential stripping.
 
@@ -216,7 +232,7 @@ Remove `DEV_AUTH` from browser cookies, asset signing, and Worker bindings. Remo
 
 ### Machine and test access
 
-Do not bind a reusable machine or admin secret to PR code. Synthetic seed, remote smoke setup, and debug import each begin as a one-use action grant in the trusted front-door Durable Object. The grant binds method, path, PR, head SHA, body digest or object manifest, byte limit, actor, purpose, expiry, and `jti`. After consuming it, the front door forwards the bounded request with a short signed assertion. The PR Worker receives only the public verification material and the already-consumed action assertion, never a root signing key, Cloudflare credential, or reusable machine bearer.
+Do not bind a reusable machine or admin secret to PR code. Synthetic seed, remote smoke setup, and debug import each begin as a one-use action grant in the trusted front-door Durable Object. This assertion uses a different key and audience from browser requests. The grant binds method, path, PR, head SHA, body digest or object manifest, byte limit, actor, purpose, expiry, and `jti`. After consuming it, the front door forwards the bounded request with a short signed assertion. The PR Worker receives only public verification material and the already-consumed assertion, never a root signing key, Cloudflare credential, or reusable machine bearer.
 
 Production ignores every preview edge session, origin assertion, and action grant. Preserve the `ENVIRONMENT` allowlist and `src/preview.ts` module-surface test.
 
@@ -251,9 +267,11 @@ Add a versioned bundle containing only source objects needed to reconstruct the 
 }
 ```
 
-The archive includes the manifest and R2 object bytes. Resolve objects from the session's canonical file and every distinct `blocks.file_id`; include related sessions only when the user requests them. Traverse normalized `externalAsset` references and include each bounded asset file row and R2 object, since assets are separate from block source files. If one raw object contains other sessions, show the count and byte size on the consent screen before export.
+The archive includes the manifest and R2 object bytes. Resolve objects from the session's canonical file and every distinct `blocks.file_id`; include related sessions only when the user selects their exact IDs. Traverse normalized `externalAsset` references and include each bounded asset file row and R2 object.
 
-The importer verifies archive shape, version, hashes, total and per-file size limits, relative paths, allowed stores, duplicate keys, asset references, and expected parse results. It assigns a synthetic non-admin machine identity and replays the existing upload, R2, queue, parser, D1, and FTS path. Direct SQL import is prohibited.
+By default, the exporter emits a sanitized, harness-valid raw object containing only the selected session and round-trips it through the real parser. If lossless isolation is unavailable, stop and require explicit selection of every session in the shared object. The consent page lists each exact session ID, title, and byte count. The manifest carries that allowlist. Import parses into isolated staging state and refuses promotion if any unapproved session ID appears.
+
+The importer verifies archive shape, version, hashes, total and per-file size limits, relative paths, allowed stores, duplicate keys, asset references, approved session IDs, and expected parse results. It assigns a synthetic non-admin machine identity and replays the existing upload, R2, queue, parser, D1, and FTS path. Direct SQL import is prohibited.
 
 Explicitly exclude:
 
@@ -271,7 +289,7 @@ The production-data client is a standalone `sessions-dev-bridge`, built and sign
 
 Production stores only the public key and enrollment metadata. Local attestations include the bridge release provenance, device ID, monotonic counter, `jti`, issued-at, and short expiry. Production checks signature, scope, approved release, counter, replay, expiry, and revocation before snapshot preparation. Rotation enrolls the new key before revoking the old key; the production settings page supports immediate passkey-confirmed revocation. Tests cover wrong release, wrong scope, modified destination, duplicate counter or `jti`, expired enrollment, revoked device, and exported/software-key fallback.
 
-For a local target, the bridge creates an immutable build snapshot itself, computes the full input and artifact digest, generates a one-use encryption key, and owns the launched environment. Its registered device key signs a destination attestation containing the environment nonce, artifact digest, encryption public key, inventory placeholder, expiry, and `jti`. The bridge never signs caller-supplied digest fields. The private key remains in the bridge process and the bridge streams decrypted objects directly into the exact environment it launched.
+For a local target, the bridge invokes its embedded pinned build driver, not a repository command. It derives the canonical transitive input manifest, displays every consumed dirty or untracked path for consent, builds twice, and requires a reproducible bundle digest. It rejects caller-supplied artifacts, digests, configuration, lifecycle hooks, and symlinks outside the checkout. The bridge then creates an immutable build snapshot, generates a one-use encryption key, and owns the launched environment. Its registered device key signs a destination attestation containing the environment nonce, build-input and artifact digests, encryption public key, inventory placeholder, expiry, and `jti`. The bridge never signs caller-supplied fields. The private key remains in the bridge process and the bridge streams decrypted objects directly into the exact environment it launched.
 
 For a remote target, the bridge resolves the current routing tuple from the trusted front door rather than accepting it from checkout code. Before production releases bytes, the user approves the exact PR, head SHA, attested Worker artifact digest, and size ceiling through Cloudflare Access. The front-door Durable Object creates the destination encryption key and returns a signed, one-use destination attestation. The private key remains at the front door.
 
@@ -301,7 +319,9 @@ Default to local import. Remote import requires the trusted-front-door and direc
 
 Create a new Cloudflare account for ephemeral development. The provisioning script hard-fails if its account ID equals production `18ef3246e9f36d1560485ef53889c0ab`. It also rejects the production resource names and IDs in any generated preview config.
 
-Keep the stable `*-preview.sessions.vza.net` front door in the production account because the zone lives there. Its only stateful binding is a dedicated preview-edge-auth Durable Object used for one-use CI grants and edge sessions. It has no production D1, R2, KV, Queue, OAuth broker, application session key, or other application secret. Its upstream suffix changes to the non-production workers.dev subdomain and its mapping uses PR numbers rather than branch normalization.
+Keep the stable `*-preview.sessions.vza.net` front door in the production account because the zone lives there. Its only stateful binding is a dedicated preview-edge-auth Durable Object. It has no production application D1, R2, KV, Queue, OAuth broker, session key, or other production application secret. Its preview-only cryptographic state consists of separate edge-session, browser-assertion, action-assertion, and control keys plus one-use destination encryption keypairs.
+
+Front-door private keys are available only to protected front-door code. Give each key type a distinct audience and key ID. Rotate signing keys on a fixed schedule with a bounded prior-key verification window; delete per-destination private keys immediately after import or expiry. Audit issuance, rotation, use, replay rejection, and deletion by key ID without logging key material. Tests prove one key class cannot sign for another and that expired, revoked, or deleted keys fail.
 
 ### GitHub controls
 
@@ -337,7 +357,7 @@ For interactive work, provide scripts instead of asking the agent to construct a
 - The candidate preview-admin OAuth set is `account:read user:read workers:write workers_scripts:write workers_kv:write d1:write queues:write`. Wrangler exposes no R2-specific OAuth scope, so the sacrificial-resource test must determine which overlap is unavoidable before freezing the profile.
 - Log access is not part of routine development. Non-production tail work requests only `account:read user:read workers_tail:read` through a nonprod-only identity or account-restricted short-lived token and revokes it after the session. Production tail requires separate explicit approval, a Worker-specific operational procedure, and never runs from a PR checkout.
 
-Wrangler 4.111.0 requests every OAuth scope when `login` is run without `--scopes` and stores OAuth tokens in plaintext unless keyring storage is enabled. The scripts must use named profiles, enable the OS keyring, and fail closed when Windows Credential Manager or Linux libsecret is unavailable. Selecting or verifying a non-production account in a multi-account user profile does not constrain OAuth authority and is not an acceptable boundary.
+Wrangler 4.111.0 requests every OAuth scope when `login` is run without `--scopes` and stores OAuth tokens in plaintext unless keyring storage is enabled. Every OAuth `login`, `whoami`, and resource command runs with `CLOUDFLARE_AUTH_USE_KEYRING=true`. The scripts fail when Windows Credential Manager or Linux libsecret is unavailable, verify `whoami` reports encrypted/keyring-backed storage, and refuse to continue while a plaintext credential file exists for that profile. Selecting a non-production account in a multi-account user profile does not constrain OAuth authority and is not an acceptable boundary.
 
 For the trusted preview CI account token, start with this resource-restricted set on the non-production account:
 
@@ -377,11 +397,11 @@ Gate: a clean checkout reaches a searchable local session with one command on Wi
 
 ### 3. Make migrations reproducible
 
-- Add filename and immutability checks, checksums, clean-install and base-upgrade tests, and schema comparison.
-- Backfill production migration hashes after a backup.
+- Add filename and immutability checks, signed release manifests, the trusted deployment journal, the post-cutover checksum ledger, clean-install and base-upgrade tests, and schema comparison.
+- Reconstruct historical production migration evidence after a backup. Record a human-approved schema baseline for any bytes that cannot be proven; never label current-file hashes as historical facts.
 - Route local and production through the wrapper around pinned Wrangler.
 
-Gate: editing an applied migration fails. Empty install and base upgrade produce the same schema. A second apply has no work.
+Gate: editing an applied migration fails. Empty install and base upgrade produce the same schema. A second apply has no work. Crash recovery either proves the exact immutable artifact and resumes or fails closed; an ambiguous disposable preview is recreated.
 
 ### 4. Add local Playwright
 
@@ -392,35 +412,37 @@ Gate: `npm --prefix hub run test:e2e` passes from a clean checkout on both CI op
 
 ### 5. Replace shared PR previews
 
-- Add the unprivileged artifact job and trusted default-branch deployment workflow.
+- Add the unprivileged hermetic build/provenance job and trusted default-branch deployment workflow.
 - Generate every binding outside PR-controlled files.
-- Provision a collision-proof resource generation per head, upload an immutable version, smoke its exact URL, and compare-and-swap the stable target only if the PR head is still current.
-- Serialize deployment and close cleanup per PR; add the janitor.
+- Provision a collision-proof resource generation per head, upload an immutable version, register and smoke its exact candidate route, and compare-and-swap the front-door live tuple only if the PR head is still current.
+- Serialize deployment and close cleanup per PR; add typed-resource cleanup and the janitor.
 
-Gate: two PRs with incompatible migrations run simultaneously without sharing state. Two heads of one PR cannot regress the live version. A failed, stale, or canceled deployment leaves the previous head working. Closing a PR prevents later promotion and removes all of its resources.
+Gate: two PRs with incompatible migrations run simultaneously without sharing state. Two heads of one PR cannot regress the live version. A failed, stale, or canceled deployment leaves the previous head working. Closing a PR prevents later promotion and removes every recorded Worker version, D1, R2, KV, and Queue.
 
 ### 6. Replace preview auth
 
 - Put GitHub-backed Cloudflare Access on the stable front door.
 - Add front-door one-use CI grants and short edge sessions bound to PR, head SHA, workflow, run, audience, actor, `jti`, and expiry.
+- Add distinct browser, action, origin, and control assertions, key rotation/revocation, and per-destination encryption keys.
 - Add `preview:open`; it requires no Wrangler scope and lets the user finish Access login in the browser.
 - Remove `DEV_AUTH` from browser, machine, asset-signing, and application flows.
 - Strip edge request credentials and upstream `Set-Cookie` before untrusted code.
 - Add the per-generation origin assertion and prove direct-origin denial.
 
-Gate: human Access and a CI grant work only for one PR/head. Edge credentials never reach upstream code. The cookie fails on production and another PR. Browser credentials cannot call machine admin APIs.
+Gate: human Access and a CI grant work only for one PR/head. The Worker receives a signed human identity for viewer mutations but no Access credential. Edge credentials never reach upstream code. The cookie fails on production and another PR. Browser assertions cannot call machine admin APIs, and each signing key fails for every other audience.
 
 ### 7. Add production debug bundles
 
 - Add the signed standalone bridge and its protected release/install/provenance verification.
 - Add fresh-passkey device enrollment, non-exportable Windows/Linux key storage, scoped local attestations, counter replay protection, rotation, and revocation.
+- Add the bridge-owned pinned local build, canonical input manifest, dirty-input consent, reproducibility check, and immutable destination snapshot.
 - Add independently signed local and remote destination attestations with one-use encryption keys.
-- Add the production prepare consent, immutable snapshot, final fresh-passkey consent, PKCE exchange, and end-to-end destination encryption.
-- Export only approved R2 source and external-asset objects.
-- Decrypt and replay through normal ingest only at the attested local environment or exact remote Worker version. Keep import asynchronous and checkpointed.
+- Add the production prepare consent, immutable selected-session snapshot, final fresh-passkey consent, PKCE exchange, and end-to-end destination encryption.
+- Export only approved, parser-round-tripped R2 source and external-asset objects; require an exact session-ID allowlist.
+- Decrypt and replay through isolated staging and normal ingest only at the attested local environment or exact remote Worker version. Promote only when parsed session IDs equal the approved allowlist. Keep import asynchronous and checkpointed.
 - Add audit events for device enrollment/revocation, destination attestation, grant creation, exchange, export, import, expiry, and deletion without logging keys, tokens, or transcript content.
 
-Gate: copying one session reproduces its rendered/searchable behavior. The transport and checkout never see plaintext before the attested destination. The bundle contains no auth or machine privilege state. Revoked, expired, replayed, wrong-session, wrong-destination, wrong-artifact, wrong-inventory, wrong-device, and wrong-PKCE grants fail.
+Gate: copying one session reproduces its rendered/searchable behavior without importing another session from a shared source object. The transport and checkout never see plaintext before the attested destination. The bundle contains no auth or machine privilege state. Revoked, expired, replayed, wrong-session, wrong-destination, wrong-artifact, wrong-inventory, wrong-device, and wrong-PKCE grants fail.
 
 ### 8. Cut over and remove the old path
 
