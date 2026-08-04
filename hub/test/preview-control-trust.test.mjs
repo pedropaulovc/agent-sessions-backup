@@ -14,6 +14,7 @@ import {
   migrationArtifactSqlNames,
   resolveBundlerInputPath,
   resourceNames,
+  trustedWranglerEnvironment,
 } from '../../infra/cf/preview-trust.mjs';
 
 const SHA = 'a'.repeat(40);
@@ -310,5 +311,23 @@ describe('bundler metafile input paths', () => {
     expect(resolveBundlerInputPath(windowsConfigDirectory, expected, path.win32)).toBe(expected);
     expect(resolveBundlerInputPath(windowsConfigDirectory, '..\\..\\work\\source\\hub\\node_modules\\pkg\\index.js', path.win32))
       .toBe(expected);
+  });
+});
+
+describe('trusted Wrangler process environment', () => {
+  it('preserves machine-readable output without inheriting unrelated secrets', () => {
+    expect(trustedWranglerEnvironment({
+      PATH: '/trusted/bin',
+      HOME: '/trusted/home',
+      WRANGLER_LOG: 'error',
+      UNRELATED_SECRET: 'must-not-leak',
+    }, 'preview-token', PREVIEW_ACCOUNT_ID)).toEqual({
+      PATH: '/trusted/bin',
+      HOME: '/trusted/home',
+      CLOUDFLARE_API_TOKEN: 'preview-token',
+      CLOUDFLARE_ACCOUNT_ID: PREVIEW_ACCOUNT_ID,
+      WRANGLER_LOG: 'log',
+      NO_COLOR: '1',
+    });
   });
 });

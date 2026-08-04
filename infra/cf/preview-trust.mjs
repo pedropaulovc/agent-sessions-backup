@@ -73,6 +73,21 @@ export function required(value, name) {
   return value;
 }
 
+export function trustedWranglerEnvironment(source, apiToken, accountId) {
+  required(apiToken, 'preview Cloudflare API token');
+  assertPreviewAccount(accountId);
+  const environment = {};
+  for (const key of ['PATH', 'Path', 'HOME', 'USERPROFILE', 'SYSTEMROOT', 'TEMP', 'TMP', 'CI']) {
+    if (source[key]) environment[key] = source[key];
+  }
+  environment.CLOUDFLARE_API_TOKEN = apiToken;
+  environment.CLOUDFLARE_ACCOUNT_ID = accountId;
+  // Wrangler routes --json results and deployment IDs through its normal logger.
+  environment.WRANGLER_LOG = 'log';
+  environment.NO_COLOR = '1';
+  return environment;
+}
+
 export function positiveInteger(value, name) {
   if (!/^[1-9][0-9]*$/.test(String(value))) fail(`${name} must be a positive integer`);
   const parsed = Number(value);
