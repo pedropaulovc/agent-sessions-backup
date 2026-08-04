@@ -20,6 +20,7 @@ import {
   requiredCloudflareAccessHeaders,
   resourceNames,
   wranglerWorkerBundle,
+  workerScriptCoversVersion,
   trustedWranglerEnvironment,
 } from '../../infra/cf/preview-trust.mjs';
 
@@ -179,6 +180,36 @@ describe('trusted preview resource ownership', () => {
     for (const item of rollback) {
       expect(assertInventoryItem(item, 42, candidate.generation)).toBe(item);
     }
+  });
+
+  it('does not issue redundant version deletes after deleting a Worker script', () => {
+    const names = resourceNames(42, 123, SHA);
+    const appVersion = {
+      kind: 'app-version',
+      id: 'candidate-app-version',
+      name: names.app,
+      generation: names.generation,
+    };
+    const edgeVersion = {
+      kind: 'edge-version',
+      id: 'candidate-edge-version',
+      name: names.edge,
+      generation: names.generation,
+    };
+    const inventory = [
+      appVersion,
+      { kind: 'app-worker', id: names.app, name: names.app, generation: names.generation },
+      edgeVersion,
+      { kind: 'edge-worker', id: names.edge, name: names.edge, generation: names.generation },
+    ];
+
+    expect(workerScriptCoversVersion(appVersion, inventory)).toBe(true);
+    expect(workerScriptCoversVersion(edgeVersion, inventory)).toBe(true);
+    expect(workerScriptCoversVersion({
+      ...appVersion,
+      generation: 'g124-bbbbbbbbbbbb',
+    }, inventory)).toBe(false);
+    expect(workerScriptCoversVersion({ ...appVersion, kind: 'd1' }, inventory)).toBe(false);
   });
 
   it('acknowledges the original trusted identity rather than a resolved discovery ID', () => {
