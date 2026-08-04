@@ -190,6 +190,8 @@ jobs:
         run: npx --prefix trusted/hub playwright install --with-deps chromium
       - name: Seed deterministic fixtures through one-use candidate actions
         env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           GITHUB_TOKEN: ${{ github.token }}
           PREVIEW_CONTROL_DEPLOY_AUD: ${{ vars.PREVIEW_CONTROL_DEPLOY_AUD }}
           PREVIEW_CONTROL_URL: ${{ vars.PREVIEW_CONTROL_URL }}
@@ -202,6 +204,8 @@ jobs:
           --generation "${{ needs.provision.outputs.generation }}"
       - name: Verify candidate diagnostics through exact route
         env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           GITHUB_TOKEN: ${{ github.token }}
           PREVIEW_CONTROL_DEPLOY_AUD: ${{ vars.PREVIEW_CONTROL_DEPLOY_AUD }}
           PREVIEW_CONTROL_URL: ${{ vars.PREVIEW_CONTROL_URL }}
@@ -227,6 +231,8 @@ jobs:
           --output "$RUNNER_TEMP/preview-browser-grant.json"
       - name: Run synthetic remote browser smoke
         env:
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
           BASE_URL: https://pr-${{ needs.build.outputs.pr }}-preview.sessions.vza.net
           PREVIEW_BOOTSTRAP_FILE: ${{ runner.temp }}/preview-browser-grant.json
         run: npm --prefix trusted/hub run test:e2e

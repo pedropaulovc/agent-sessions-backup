@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { createPreviewStorageState, previewStorageStatePath } from '../e2e/storage-state';
+import {
+  createPreviewStorageState,
+  previewStorageStatePath,
+  requiredCloudflareAccessHeaders,
+} from '../e2e/storage-state';
 
 const RUN_A = '11111111-1111-4111-8111-111111111111';
 const RUN_B = '22222222-2222-4222-8222-222222222222';
@@ -68,5 +72,22 @@ describe('Playwright preview storage state', () => {
     expect(removed).toBe(false);
     await cleanup();
     expect(removed).toBe(true);
+  });
+});
+
+describe('Playwright Cloudflare Access headers', () => {
+  it('requires both service credentials without forwarding unrelated environment values', () => {
+    expect(requiredCloudflareAccessHeaders({
+      CF_ACCESS_CLIENT_ID: ' client-id ',
+      CF_ACCESS_CLIENT_SECRET: ' client-secret ',
+      UNRELATED_SECRET: 'must-not-leak',
+    })).toEqual({
+      'cf-access-client-id': 'client-id',
+      'cf-access-client-secret': 'client-secret',
+    });
+    expect(() => requiredCloudflareAccessHeaders({})).toThrow(/service credentials are required/);
+    expect(() => requiredCloudflareAccessHeaders({
+      CF_ACCESS_CLIENT_SECRET: 'client-secret',
+    })).toThrow(/service credentials are required/);
   });
 });

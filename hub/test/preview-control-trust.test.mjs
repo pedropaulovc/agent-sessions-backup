@@ -17,6 +17,7 @@ import {
   migrationArtifactSqlNames,
   resolveBundlerInputPath,
   previewEdgeSessionCookie,
+  requiredCloudflareAccessHeaders,
   resourceNames,
   wranglerWorkerBundle,
   trustedWranglerEnvironment,
@@ -346,6 +347,23 @@ describe('preview edge bootstrap cookie', () => {
     expect(previewEdgeSessionCookie([
       '__cf_bm=opaque; Secure; Path=/, __Host-preview-edge=combined-token; HttpOnly; Secure; Path=/',
     ])).toBe('__Host-preview-edge=combined-token');
+  });
+});
+
+describe('Cloudflare Access service authentication', () => {
+  it('requires a complete credential pair and returns only Access headers', () => {
+    expect(requiredCloudflareAccessHeaders({
+      CF_ACCESS_CLIENT_ID: ' client-id ',
+      CF_ACCESS_CLIENT_SECRET: ' client-secret ',
+      UNRELATED_SECRET: 'must-not-leak',
+    })).toEqual({
+      'cf-access-client-id': 'client-id',
+      'cf-access-client-secret': 'client-secret',
+    });
+    expect(() => requiredCloudflareAccessHeaders({})).toThrow(/service credentials are required/);
+    expect(() => requiredCloudflareAccessHeaders({
+      CF_ACCESS_CLIENT_ID: 'client-id',
+    })).toThrow(/service credentials are required/);
   });
 });
 

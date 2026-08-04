@@ -23,6 +23,7 @@ import {
   parseArgs,
   positiveInteger,
   previewEdgeSessionCookie,
+  requiredCloudflareAccessHeaders,
   repositoryName,
   resourceNames,
   sha256Bytes,
@@ -781,7 +782,11 @@ async function candidateAction({ deployAudience, stateRecord, sha, sourceRunId, 
   const bootstrap = new URL(grant.bootstrapUrl);
   const origin = new URL(`https://pr-${pr}-preview.sessions.vza.net`);
   if (bootstrap.protocol !== 'https:' || bootstrap.origin !== origin.origin) fail('front door returned a foreign action bootstrap');
-  const first = await fetch(bootstrap, { redirect: 'manual', headers: { 'cache-control': 'no-store' } });
+  const accessHeaders = requiredCloudflareAccessHeaders();
+  const first = await fetch(bootstrap, {
+    redirect: 'manual',
+    headers: { ...accessHeaders, 'cache-control': 'no-store' },
+  });
   const location = first.headers.get('location');
   const cookie = previewEdgeSessionCookie([
     ...(first.headers.getSetCookie?.() ?? []),
@@ -794,7 +799,7 @@ async function candidateAction({ deployAudience, stateRecord, sha, sourceRunId, 
   return fetch(new URL(target, origin), {
     method,
     redirect: 'error',
-    headers: { ...headers, cookie, 'cache-control': 'no-store' },
+    headers: { ...headers, ...accessHeaders, cookie, 'cache-control': 'no-store' },
     body,
   });
 }

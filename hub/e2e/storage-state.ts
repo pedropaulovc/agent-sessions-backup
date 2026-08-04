@@ -29,6 +29,16 @@ const nodeStorageStateFileSystem: StorageStateFileSystem = {
   },
 };
 
+export function requiredCloudflareAccessHeaders(environment: Environment): Record<string, string> {
+  const clientId = environment.CF_ACCESS_CLIENT_ID?.trim();
+  const clientSecret = environment.CF_ACCESS_CLIENT_SECRET?.trim();
+  if (!clientId || !clientSecret) throw new Error('Cloudflare Access service credentials are required');
+  return {
+    'cf-access-client-id': clientId,
+    'cf-access-client-secret': clientSecret,
+  };
+}
+
 
 export function previewStorageStatePath(
   bootstrapFile: string | undefined,
