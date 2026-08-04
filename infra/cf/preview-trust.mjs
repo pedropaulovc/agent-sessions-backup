@@ -487,13 +487,22 @@ export function sortCleanupInventory(inventory) {
   );
 }
 
-export function queueConsumerIdsForWorker(consumers, workerName) {
+export function queueConsumerIdsForWorker(consumers, workerName, queueNames) {
   if (!Array.isArray(consumers)) fail('queue consumers must be an array');
+  if (!Array.isArray(queueNames)) fail('queue names must be an array');
   required(workerName, 'queue consumer Worker name');
+  const ownedQueues = new Set(queueNames.map((name) => required(name, 'queue name')));
   return consumers.map((consumer) => {
-    if (consumer?.script_name !== workerName
-      || consumer.type != null && consumer.type !== 'worker') {
-      fail(`foreign queue consumer rejected for ${workerName}`);
+    const explicitForeignType = consumer?.type != null && consumer.type !== 'worker';
+    const ownedWorker = consumer?.script_name === workerName;
+    const ownedQueue = ownedQueues.has(consumer?.queue_name);
+    if (explicitForeignType || !ownedWorker && !ownedQueue) {
+      const identity = stableJson({
+        queueName: consumer?.queue_name ?? null,
+        scriptName: consumer?.script_name ?? null,
+        type: consumer?.type ?? null,
+      });
+      fail(`foreign queue consumer rejected for ${workerName}: ${identity}`);
     }
     return required(consumer.consumer_id, 'queue consumer id');
   });
