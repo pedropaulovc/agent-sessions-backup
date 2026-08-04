@@ -16,6 +16,7 @@ import {
   inventoryGenerations,
   migrationArtifactSqlNames,
   resolveBundlerInputPath,
+  previewEdgeSessionCookie,
   resourceNames,
   wranglerWorkerBundle,
   trustedWranglerEnvironment,
@@ -333,6 +334,18 @@ describe('trusted Wrangler process environment', () => {
       WRANGLER_LOG: 'log',
       NO_COLOR: '1',
     });
+  });
+});
+
+describe('preview edge bootstrap cookie', () => {
+  it('selects the named session cookie when Cloudflare adds other cookies', () => {
+    expect(previewEdgeSessionCookie([
+      '__cf_bm=opaque; Secure; Path=/',
+      '__Host-preview-edge=session-token; HttpOnly; Secure; Path=/',
+    ])).toBe('__Host-preview-edge=session-token');
+    expect(previewEdgeSessionCookie([
+      '__cf_bm=opaque; Secure; Path=/, __Host-preview-edge=combined-token; HttpOnly; Secure; Path=/',
+    ])).toBe('__Host-preview-edge=combined-token');
   });
 });
 
