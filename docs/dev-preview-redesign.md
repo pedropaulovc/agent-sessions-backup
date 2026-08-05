@@ -313,7 +313,7 @@ Default to local import. Remote import requires the trusted-front-door and direc
 
 The target PR must be open and its isolated preview must have completed provisioning. A closed or merged PR has no routable destination after preview cleanup. A remote PR target does not use the checkout or require local TPM enrollment.
 
-Install the bridge entirely inside WSL. Prerequisites are native Linux `gh`, `curl`, `tar`, `sha256sum`, and `xdg-open`; none may resolve through `/mnt`. Authenticate WSL's `gh` to GitHub before setup. The installer pins and verifies its own Linux Node.js runtime, so WSL's system Node and npm are not used.
+Install the bridge entirely inside WSL. Prerequisites are native Linux `gh`, `curl`, `tar`, `sha256sum`, `readlink`, `dash`, and `/usr/bin/xdg-open`; none may resolve through `/mnt`. Authenticate WSL's `gh` to GitHub before setup. The installer pins and verifies its own Linux Node.js runtime, so WSL's system Node and npm are not used.
 
 Fetch the installer from trusted `main`, not from a PR checkout:
 

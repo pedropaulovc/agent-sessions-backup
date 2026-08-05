@@ -11,41 +11,49 @@ import { SessionsDevBridge } from './bridge.mjs';
 import { loadProductionManifestKeys } from './production-keys.mjs';
 import { parseArguments } from './cli-arguments.mjs';
 
-export async function runCli(argv = process.argv.slice(2)) {
-  const release = await verifyInstalledRelease();
-  const parsed = parseArguments(argv);
-  const keys = await loadProductionManifestKeys(join(packageRoot, 'src', 'production-manifest-key.json'));
+export async function runCli(argv = process.argv.slice(2), options = {}) {
+  const output = options.stdout ?? stdout;
+  const errorOutput = options.stderr ?? stderr;
+  const verifyRelease = options.verifyRelease ?? verifyInstalledRelease;
+  const parse = options.parseArguments ?? parseArguments;
+  const loadManifestKeys = options.loadProductionManifestKeys ?? loadProductionManifestKeys;
+  const release = await verifyRelease();
+  const parsed = parse(argv);
+  const keys = await loadManifestKeys(join(packageRoot, 'src', 'production-manifest-key.json'));
   let enrollment = null;
   let remoteDestinations = null;
   if (parsed.command === 'enroll') {
-    const { EnrollmentTransport, loadTrustedServiceConfig } = await import('./trusted-services.mjs');
-    const services = await loadTrustedServiceConfig();
-    enrollment = services.enrollment ? new EnrollmentTransport(services.enrollment) : null;
+    const loadEnrollment = options.loadEnrollment ?? loadEnrollmentTransport;
+    enrollment = await loadEnrollment();
   } else if (parsed.target !== 'local') {
-    const { RemoteDestinationTransport } = await import('./remote-destination.mjs');
-    remoteDestinations = new RemoteDestinationTransport();
+    const loadRemoteDestinations = options.loadRemoteDestinations ?? loadRemoteDestinationTransport;
+    remoteDestinations = await loadRemoteDestinations();
   }
   const dependencies = {
     manifestVerificationKey: keys.keys[0],
-    production: new DebugTransport(),
-    authorization: new BrowserAuthorization(),
+    production: options.production ?? new DebugTransport(),
+    authorization: options.authorization ?? new BrowserAuthorization(),
     enrollment,
     remoteDestinations,
-    snapshotVerifier: new SnapshotVerifier(keys.keys),
-    onProgress: (progress) => stderr.write(`sessions-dev-bridge: ${progress.status}${progress.checkpoint ? ` (${progress.checkpoint})` : ''}\n`),
+    snapshotVerifier: options.snapshotVerifier ?? new SnapshotVerifier(keys.keys),
+    onProgress: (progress) => errorOutput.write(`sessions-dev-bridge: ${progress.status}${progress.checkpoint ? ` (${progress.checkpoint})` : ''}\n`),
   };
-  const bridge = await createCommandBridge(release, parsed, dependencies);
+  const bridge = await createCommandBridge(release, parsed, dependencies, {
+    loadLocalDependencies: options.loadLocalDependencies,
+  });
   if (parsed.command === 'enroll') {
     const result = await bridge.enroll(parsed.deviceLabel);
-    stdout.write(`Enrolled hardware-backed device ${result.deviceId}; expires ${result.expiresAt}.\n`);
+    output.write(`Enrolled hardware-backed device ${result.deviceId}; expires ${result.expiresAt}.\n`);
     return;
   }
   const result = await bridge.pull({ sessionId: parsed.sessionId, target: parsed.target, checkout: parsed.checkout });
   if (result.target === 'local') {
-    stdout.write(`Session ${result.sessionId} imported into bridge-owned destination ${result.environment.url.href}\nPress Ctrl+C to stop it.\n`);
+    output.write(`Session ${result.sessionId} imported into bridge-owned destination ${result.environment.url.href}\nPress Ctrl+C to stop it.\n`);
     await waitForSignal();
     await result.environment.dispose();
-  } else stdout.write(`Session ${result.sessionId} imported into ${result.target}.\n`);
+    return;
+  }
+  output.write(`Session ${result.sessionId} imported into ${result.target}.\n`);
 }
 
 export async function createCommandBridge(
@@ -60,6 +68,17 @@ export async function createCommandBridge(
     ? await loadLocalDependencies(parsed, manifestVerificationKey)
     : {};
   return new SessionsDevBridge({ release, ...dependencies, ...localDependencies });
+}
+
+async function loadEnrollmentTransport() {
+  const { EnrollmentTransport, loadTrustedServiceConfig } = await import('./trusted-services.mjs');
+  const services = await loadTrustedServiceConfig();
+  return services.enrollment ? new EnrollmentTransport(services.enrollment) : null;
+}
+
+async function loadRemoteDestinationTransport() {
+  const { RemoteDestinationTransport } = await import('./remote-destination.mjs');
+  return new RemoteDestinationTransport();
 }
 
 async function loadCommandLocalDependencies(parsed, manifestVerificationKey) {

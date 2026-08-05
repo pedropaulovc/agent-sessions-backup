@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { openSystemBrowser } from '../src/browser-authorization.mjs';
-import { createCommandBridge } from '../src/cli.mjs';
+import { runCli } from '../src/cli.mjs';
+import { parseArguments } from '../src/cli-arguments.mjs';
 
 const authorizationUrl = 'https://sessions.vza.net/debug/authorize';
 const digest = (character) => character.repeat(64);
@@ -29,6 +30,7 @@ test('system browser launchers use platform commands without a shell', async (t)
       await openSystemBrowser(authorizationUrl, {
         platform: expected.platform,
         launcher: successfulLauncher(calls),
+        launchProbeMs: 0,
       });
       assert.deepEqual(calls.invocations, [{
         command: expected.command,
@@ -58,8 +60,29 @@ test('system browser launch rejects launcher spawn errors', async () => {
   assert.equal(unrefCalled, false);
 });
 
-test('remote CLI bridge routing does not load or require local dependencies', async () => {
+test('system browser launch rejects an immediate nonzero launcher exit', async () => {
+  const failingLauncher = () => {
+    const child = new EventEmitter();
+    child.unref = () => {};
+    setImmediate(() => {
+      child.emit('spawn');
+      child.emit('exit', 3, null);
+    });
+    return child;
+  };
+  await assert.rejects(
+    openSystemBrowser(authorizationUrl, {
+      platform: 'linux',
+      launcher: failingLauncher,
+      launchProbeMs: 100,
+    }),
+    /code 3/,
+  );
+});
+
+test('remote CLI verifies provenance and never loads local dependencies', async () => {
   const events = [];
+  const output = [];
   const manifest = Object.freeze({ marker: 'verified manifest' });
   const destination = Object.freeze({
     pr: 84,
@@ -67,88 +90,102 @@ test('remote CLI bridge routing does not load or require local dependencies', as
     attestation: Object.freeze({ payload: 'initial' }),
   });
   const extendedAttestation = Object.freeze({ payload: 'extended' });
-  const bridge = await createCommandBridge(
-    Object.freeze({ digest: digest('a') }),
-    Object.freeze({ command: 'pull', sessionId: 'session-1', target: 'pr-84' }),
-    {
-      manifestVerificationKey: Object.freeze({ kty: 'EC' }),
-      remoteDestinations: {
-        async create(request) {
-          events.push(['create', request]);
-          return destination;
-        },
-        async extend(receivedDestination, inventoryDigest) {
-          assert.equal(receivedDestination, destination);
-          assert.equal(inventoryDigest, digest('b'));
-          events.push(['extend']);
-          return extendedAttestation;
-        },
-        async transfer(request) {
-          assert.equal(request.destination, destination);
-          assert.equal(request.attestation, extendedAttestation);
-          assert.equal(request.manifest, manifest);
-          events.push(['transfer']);
-        },
+  const remoteDestinations = {
+    async create(request) {
+      events.push(['create', request]);
+      return destination;
+    },
+    async extend(receivedDestination, inventoryDigest) {
+      assert.equal(receivedDestination, destination);
+      assert.equal(inventoryDigest, digest('b'));
+      events.push(['extend']);
+      return extendedAttestation;
+    },
+    async transfer(request) {
+      assert.equal(request.destination, destination);
+      assert.equal(request.attestation, extendedAttestation);
+      assert.equal(request.manifest, manifest);
+      events.push(['transfer']);
+    },
+  };
+  await runCli(['pull', '--session', 'session-1', '--target', 'pr-84'], {
+    async verifyRelease() {
+      events.push(['verify-release']);
+      return Object.freeze({ digest: digest('a') });
+    },
+    parseArguments(argv) {
+      events.push(['parse']);
+      return parseArguments(argv);
+    },
+    async loadProductionManifestKeys() {
+      events.push(['load-keys']);
+      return Object.freeze({ keys: [Object.freeze({ kty: 'EC' })] });
+    },
+    async loadRemoteDestinations() {
+      events.push(['load-remote']);
+      return remoteDestinations;
+    },
+    loadLocalDependencies: async () => assert.fail('remote CLI loaded local dependencies'),
+    authorization: {
+      async prepare(request) {
+        assert.equal(request.destinationAttestation, destination.attestation);
+        events.push(['prepare']);
+        return { jobCapability: 'am9i', codeVerifier: 'dmVyaWZpZXI' };
       },
-      authorization: {
-        async prepare(request) {
-          assert.equal(request.destinationAttestation, destination.attestation);
-          events.push(['prepare']);
-          return { jobCapability: 'am9i', codeVerifier: 'dmVyaWZpZXI' };
-        },
-        async finalize(request) {
-          assert.equal(request.destinationAttestation, extendedAttestation);
-          events.push(['finalize']);
-          return { authorizationCode: 'Y29kZQ' };
-        },
-        async abort() { assert.fail('successful remote routing must not abort'); },
+      async finalize(request) {
+        assert.equal(request.destinationAttestation, extendedAttestation);
+        events.push(['finalize']);
+        return { authorizationCode: 'Y29kZQ' };
       },
-      production: {
-        async getPrepareJob() {
-          events.push(['poll']);
-          return {
-            status: 'awaiting_consent',
-            inventoryDigest: digest('b'),
-            totalSize: 0,
-            objectCount: 0,
-            approvalUrl: 'https://sessions.vza.net/debug/approve',
-          };
-        },
-        async exchangeAuthorization(code, verifier) {
-          assert.equal(code, 'Y29kZQ');
-          assert.equal(verifier, 'dmVyaWZpZXI');
-          events.push(['exchange']);
-          return { manifest, exchangeCapability: 'ZXhjaGFuZ2U' };
-        },
+      async abort() { assert.fail('successful remote routing must not abort'); },
+    },
+    production: {
+      async getPrepareJob() {
+        events.push(['poll']);
+        return {
+          status: 'awaiting_consent',
+          inventoryDigest: digest('b'),
+          totalSize: 0,
+          objectCount: 0,
+          approvalUrl: 'https://sessions.vza.net/debug/approve',
+        };
       },
-      snapshotVerifier: {
-        verifyManifest(receivedManifest, expected) {
-          assert.equal(receivedManifest, manifest);
-          assert.deepEqual(expected, {
-            sessionId: 'session-1',
-            inventoryDigest: digest('b'),
-            totalSize: 0,
-            objectCount: 0,
-          });
-          events.push(['verify']);
-        },
+      async exchangeAuthorization(code, verifier) {
+        assert.equal(code, 'Y29kZQ');
+        assert.equal(verifier, 'dmVyaWZpZXI');
+        events.push(['exchange']);
+        return { manifest, exchangeCapability: 'ZXhjaGFuZ2U' };
       },
     },
-    {
-      loadLocalDependencies: async () => assert.fail('remote routing loaded local dependencies'),
+    snapshotVerifier: {
+      verifyManifest(receivedManifest, expected) {
+        assert.equal(receivedManifest, manifest);
+        assert.deepEqual(expected, {
+          sessionId: 'session-1',
+          inventoryDigest: digest('b'),
+          totalSize: 0,
+          objectCount: 0,
+        });
+        events.push(['verify-snapshot']);
+      },
     },
-  );
+    stdout: { write(value) { output.push(value); } },
+    stderr: { write() {} },
+  });
 
-  const result = await bridge.pull({ sessionId: 'session-1', target: 'pr-84' });
-  assert.deepEqual(result, { target: 'pr-84', sessionId: 'session-1' });
+  assert.deepEqual(output, ['Session session-1 imported into pr-84.\n']);
   assert.deepEqual(events.map(([event]) => event), [
+    'verify-release',
+    'parse',
+    'load-keys',
+    'load-remote',
     'create',
     'prepare',
     'poll',
     'extend',
     'finalize',
     'exchange',
-    'verify',
+    'verify-snapshot',
     'transfer',
   ]);
 });

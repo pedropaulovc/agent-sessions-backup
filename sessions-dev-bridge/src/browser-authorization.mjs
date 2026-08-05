@@ -157,7 +157,11 @@ class LoopbackCallbacks {
   }
 }
 
-export async function openSystemBrowser(url, { platform = process.platform, launcher = spawn } = {}) {
+export async function openSystemBrowser(url, {
+  platform = process.platform,
+  launcher = spawn,
+  launchProbeMs = 1_000,
+} = {}) {
   requireHttps(url);
   const command = platform === 'win32'
     ? ['rundll32.exe', ['url.dll,FileProtocolHandler', url]]
@@ -171,10 +175,25 @@ export async function openSystemBrowser(url, { platform = process.platform, laun
       stdio: 'ignore',
       shell: false,
     });
-    child.once('error', reject);
+    let timer;
+    const complete = (error) => {
+      clearTimeout(timer);
+      child.removeListener('error', onError);
+      child.removeListener('exit', onExit);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onError = (error) => complete(error);
+    const onExit = (code, signal) => complete(
+      code === 0
+        ? null
+        : new Error(`browser launcher exited before handoff (${signal ?? `code ${code}`})`),
+    );
+    child.once('error', onError);
+    child.once('exit', onExit);
     child.once('spawn', () => {
       child.unref();
-      resolve();
+      timer = setTimeout(complete, launchProbeMs);
     });
   });
 }

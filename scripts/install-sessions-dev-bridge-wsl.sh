@@ -50,6 +50,8 @@ readonly TAR=$(native_command tar)
 readonly SHA256SUM=$(native_command sha256sum)
 readonly XDG_OPEN=$(native_command xdg-open)
 readonly DASH=$(native_command dash)
+[[ "$XDG_OPEN" == '/usr/bin/xdg-open' ]] \
+  || fail "xdg-open must resolve to /usr/bin/xdg-open, got $XDG_OPEN"
 
 case $(uname -m) in
   x86_64)
