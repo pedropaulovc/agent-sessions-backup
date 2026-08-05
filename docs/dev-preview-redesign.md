@@ -309,15 +309,65 @@ For local import, the trusted bridge decrypts directly into the immutable enviro
 
 Default to local import. Remote import requires the trusted-front-door and direct-origin auth checks, both user confirmations, an unchanged live routing tuple, and automatic deletion with the PR environment. Never commit, cache in CI, or upload plaintext or ciphertext bundles as GitHub artifacts.
 
-### Approve a production session import into a PR preview
+### Install and invoke the bridge from WSL
 
-The target PR must be open and its isolated preview must have completed provisioning. A closed or merged PR has no routable destination after preview cleanup. When development runs in WSL, invoke the signed bridge from Windows PowerShell; a remote PR target does not use the checkout or require a local TPM enrollment.
+The target PR must be open and its isolated preview must have completed provisioning. A closed or merged PR has no routable destination after preview cleanup. A remote PR target does not use the checkout or require local TPM enrollment.
+
+The bridge is a native Windows installation outside WSL. Installing it is a one-time trusted workstation bootstrap, repeated only when a new protected bridge release is published. It requires native Windows Node.js matching `sessions-dev-bridge/package.json`, authenticated `gh.exe`, and `npm.cmd`. Use only this block as committed on trusted `main`, never a version modified by PR code. It switches to a native Windows working directory before invoking `.cmd` shims, avoiding the misleading `UNC paths are not supported` warning inherited from a WSL checkout:
 
 ```powershell
-sessions-dev-bridge pull `
-  --session <exact-session-id> `
-  --target pr-<number>
+$ErrorActionPreference = 'Stop'
+Set-Location $env:USERPROFILE
+$repository = 'pedropaulovc/agent-sessions-backup'
+$workflow = 'release-sessions-dev-bridge.yml'
+$releases = @(gh.exe run list `
+  --repo $repository `
+  --workflow $workflow `
+  --branch main `
+  --event workflow_dispatch `
+  --status success `
+  --limit 1 `
+  --json databaseId,headSha | ConvertFrom-Json)
+if ($releases.Count -ne 1 -or $releases[0].headSha -notmatch '^[0-9a-f]{40}$') {
+  throw 'No protected bridge release is available.'
+}
+$release = $releases[0]
+
+$artifact = "sessions-dev-bridge-$($release.headSha)"
+$directory = Join-Path $env:TEMP "$artifact-$([guid]::NewGuid())"
+New-Item -ItemType Directory -Path $directory | Out-Null
+try {
+  gh.exe run download $release.databaseId `
+    --repo $repository `
+    --name $artifact `
+    --dir $directory
+  $packages = @(Get-ChildItem $directory -Filter 'sessions-dev-bridge-*.tgz' -File)
+  if ($packages.Count -ne 1) {
+    throw "Expected one signed package; found $($packages.Count)."
+  }
+
+  npm.cmd install --global --ignore-scripts $packages[0].FullName
+  $verification = & cmd.exe /d /c 'sessions-dev-bridge.cmd 2>&1'
+  $verificationExit = $LASTEXITCODE
+  if ($verificationExit -ne 1 -or ($verification | Out-String) -notmatch 'usage: sessions-dev-bridge') {
+    throw 'Installed bridge failed provenance verification.'
+  }
+  Get-Command sessions-dev-bridge.cmd
+} finally {
+  Remove-Item $directory -Recurse -Force
+}
 ```
+
+The installed command verifies the package's protected-workflow Sigstore provenance and packaged runtime hashes before parsing command arguments. The expected verification invocation exits with the CLI usage message because no operation was supplied. Do not replace it with an unsigned checkout build, and do not install the package with WSL's npm; `powershell.exe` would not resolve that installation.
+
+For each session, the WSL agent invokes the native bridge itself and remains attached to the process. Keep the native working-directory switch and `cmd.exe` stderr merge: without them, Windows PowerShell decorates normal bridge progress as `NativeCommandError` and prints a harmless UNC warning.
+
+```bash
+powershell.exe -NoLogo -NoProfile -Command \
+  'Set-Location $env:USERPROFILE; & cmd.exe /d /s /c "sessions-dev-bridge.cmd pull --session <exact-session-id> --target pr-<number> 2>&1"; exit $LASTEXITCODE'
+```
+
+The user does not run this command. The user completes only the trusted browser approvals and passkey touch opened by the native bridge. One invocation authorizes one session; after it exits successfully, the agent runs the next session command.
 
 The bridge opens five trusted approval pages in sequence. Do not construct, copy, or edit their authorization URLs.
 
