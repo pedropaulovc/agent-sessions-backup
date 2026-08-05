@@ -352,7 +352,7 @@ trap - EXIT
 This is a one-time per-user bootstrap, repeated after a new protected bridge release. The installer:
 
 - requires fixed native `/usr/bin` tools and supports x86-64 WSL;
-- selects one exact attempt of the latest successful protected `main` release and requires its attempt-bound artifact name;
+- selects one exact attempt of the latest successful protected `main` run, then downloads its commit-and-attempt-bound durable GitHub Release asset;
 - verifies the sealed runtime's digest, protected workflow identity, source commit, source ref, GitHub-hosted runner, and GitHub build attestation before extracting it;
 - installs the protected workflow's offline, lifecycle-disabled dependency closure; the workstation contacts no npm registry;
 - verifies the package's internal Sigstore identity, executable source hashes, and selected workflow run, attempt, and commit;

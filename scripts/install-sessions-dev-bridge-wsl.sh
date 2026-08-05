@@ -104,15 +104,23 @@ IFS=$'\t' read -r run_id head_sha run_attempt extra <<<"$release"
   && -z "${extra:-}" ]] \
   || fail 'no valid protected bridge release is available'
 
-artifact="sessions-dev-bridge-${head_sha}-attempt-${run_attempt}"
+release_tag="sessions-dev-bridge-${head_sha}-attempt-${run_attempt}"
+release_target=$(
+  "$GH" api "repos/${REPOSITORY}/git/ref/tags/${release_tag}" --jq '.object.sha'
+) || fail "protected bridge release $release_tag is unavailable"
+[[ "$release_target" == "$head_sha" ]] \
+  || fail "protected bridge release $release_tag does not target its workflow commit"
 temporary_directory=$("$MKTEMP" -d '/tmp/sessions-dev-bridge.XXXXXXXX')
-"$GH" run download "$run_id" --repo "$REPOSITORY" --name "$artifact" --dir "$temporary_directory" \
-  || fail "protected bridge artifact $artifact is unavailable"
+"$GH" release download "$release_tag" \
+  --repo "$REPOSITORY" \
+  --pattern 'sessions-dev-bridge-runtime.tgz' \
+  --dir "$temporary_directory" \
+  || fail "protected bridge release $release_tag is unavailable"
 runtime_archive="$temporary_directory/sessions-dev-bridge-runtime.tgz"
-[[ -f "$runtime_archive" ]] || fail 'the protected workflow artifact must contain the sealed bridge runtime'
-artifact_entries=("$temporary_directory"/*)
-[[ ${#artifact_entries[@]} -eq 1 && "${artifact_entries[0]}" == "$runtime_archive" ]] \
-  || fail 'the protected workflow artifact must contain exactly one file'
+[[ -f "$runtime_archive" ]] || fail 'the protected release must contain the sealed bridge runtime'
+release_entries=("$temporary_directory"/*)
+[[ ${#release_entries[@]} -eq 1 && "${release_entries[0]}" == "$runtime_archive" ]] \
+  || fail 'the protected release must contain exactly one downloaded file'
 "$GH" attestation verify "$runtime_archive" \
   --repo "$REPOSITORY" \
   --signer-workflow "github.com/${REPOSITORY}/.github/workflows/${WORKFLOW}" \

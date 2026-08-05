@@ -22,13 +22,14 @@ test('system browser launchers use platform commands without a shell', async (t)
   const cases = [
     { platform: 'linux', command: '/usr/bin/xdg-open', args: [authorizationUrl] },
     { platform: 'darwin', command: '/usr/bin/open', args: [authorizationUrl] },
-    { platform: 'win32', command: 'rundll32.exe', args: ['url.dll,FileProtocolHandler', authorizationUrl] },
+    { platform: 'win32', command: 'C:\\Windows\\System32\\rundll32.exe', args: ['url.dll,FileProtocolHandler', authorizationUrl] },
   ];
   for (const expected of cases) {
     await t.test(expected.platform, async () => {
       const calls = { invocations: [], unref: 0 };
       await openSystemBrowser(authorizationUrl, {
         platform: expected.platform,
+        windowsDirectory: 'C:\\Windows',
         launcher: successfulLauncher(calls),
         launchProbeMs: 0,
       });
@@ -78,6 +79,23 @@ test('system browser launch rejects an immediate nonzero launcher exit', async (
     }),
     /code 3/,
   );
+});
+
+test('system browser launch resolves on an immediate zero exit', async () => {
+  const quickLauncher = () => {
+    const child = new EventEmitter();
+    child.unref = () => {};
+    setImmediate(() => {
+      child.emit('spawn');
+      child.emit('exit', 0, null);
+    });
+    return child;
+  };
+  await openSystemBrowser(authorizationUrl, {
+    platform: 'linux',
+    launcher: quickLauncher,
+    launchProbeMs: 60_000,
+  });
 });
 
 test('remote CLI verifies provenance and never loads local dependencies', async () => {

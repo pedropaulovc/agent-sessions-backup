@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
   attestations: write
 
@@ -51,10 +51,14 @@ jobs:
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
           subject-path: sessions-dev-bridge/sessions-dev-bridge-runtime.tgz
-      - name: Upload the signed standalone runtime
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: sessions-dev-bridge-${{ github.sha }}-attempt-${{ github.run_attempt }}
-          path: sessions-dev-bridge/sessions-dev-bridge-runtime.tgz
-          if-no-files-found: error
-          retention-days: 90
+      - name: Publish the attested runtime as a durable protected release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="sessions-dev-bridge-${GITHUB_SHA}-attempt-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" sessions-dev-bridge-runtime.tgz \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$tag" \
+            --notes "Protected sessions-dev-bridge runtime from Actions run ${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT}." \
+            --latest=false

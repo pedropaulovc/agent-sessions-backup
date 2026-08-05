@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
+import { win32 as win32Path } from 'node:path';
 import { canonicalBytes } from './canonical.mjs';
 import { createPkce } from './secure.mjs';
 
@@ -161,10 +162,11 @@ export async function openSystemBrowser(url, {
   platform = process.platform,
   launcher = spawn,
   launchProbeMs = 1_000,
+  windowsDirectory = process.env.SystemRoot || 'C:\\Windows',
 } = {}) {
   requireHttps(url);
   const command = platform === 'win32'
-    ? ['rundll32.exe', ['url.dll,FileProtocolHandler', url]]
+    ? [windowsBrowserLauncher(windowsDirectory), ['url.dll,FileProtocolHandler', url]]
     : platform === 'darwin'
       ? ['/usr/bin/open', [url]]
       : ['/usr/bin/xdg-open', [url]];
@@ -196,6 +198,13 @@ export async function openSystemBrowser(url, {
       timer = setTimeout(complete, launchProbeMs);
     });
   });
+}
+
+function windowsBrowserLauncher(windowsDirectory) {
+  if (!win32Path.isAbsolute(windowsDirectory) || windowsDirectory.startsWith('\\\\')) {
+    throw new Error('Windows system directory must be an absolute local path');
+  }
+  return win32Path.join(windowsDirectory, 'System32', 'rundll32.exe');
 }
 
 function requireHttps(value) {
