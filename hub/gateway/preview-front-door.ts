@@ -1805,7 +1805,9 @@ function destinationAuthorizationPage(): Response {
   const script = `
 const status=document.getElementById('status'),approve=document.getElementById('approve');let request;
 try{
-  const s=location.hash.slice(1).replace(/-/g,'+').replace(/_/g,'/');
+  const encoded=new URLSearchParams(location.search).get('request');history.replaceState(null,'',location.pathname);
+  if(!encoded)throw new Error('missing request');
+  const s=encoded.replace(/-/g,'+').replace(/_/g,'/');
   request=JSON.parse(decodeURIComponent(escape(atob(s+'='.repeat((4-s.length%4)%4)))));
   if(!['resolve','attest','extend'].includes(request.operation))throw new Error('bad operation');
   status.textContent='Approve '+request.operation+' for PR '+request.pr+', head '+(request.body.head||'current live')+', sessions: '+(request.body.sessionIds||[]).join(', ');
