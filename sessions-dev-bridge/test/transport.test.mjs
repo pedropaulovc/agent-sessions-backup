@@ -185,7 +185,10 @@ test('RemoteDestinationTransport bounds JSON bodies and deadlines every transfer
 });
 
 async function completeLoopback(browserUrl) {
-  const encoded = new URL(browserUrl).hash.slice(1);
+  const url = new URL(browserUrl);
+  assert.equal(url.hash, '');
+  assert.deepEqual([...url.searchParams.keys()], ['request']);
+  const encoded = url.searchParams.get('request');
   const request = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
   const callback = new URL(request.callback);
   callback.searchParams.set('code', 'Y29kZQ');

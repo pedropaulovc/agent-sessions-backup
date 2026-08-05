@@ -92,7 +92,9 @@ export class RemoteDestinationTransport {
     const state = randomId(24);
     try {
       const request = { operation, pr, body, callback: callback.url, pkceChallenge: pkce.challenge, state };
-      await this.openBrowser(`${destinationOrigin(pr)}/_destination/authorize#${canonicalBytes(request).toString('base64url')}`);
+      const authorizationUrl = new URL('/_destination/authorize', destinationOrigin(pr));
+      authorizationUrl.searchParams.set('request', canonicalBytes(request).toString('base64url'));
+      await this.openBrowser(authorizationUrl.href);
       const result = await callback.wait();
       if (result.state !== state) throw new Error('remote destination callback state mismatch');
       return await this.#json(new URL('/_destination/exchange', 'https://preview-control.sessions.vza.net'), { method: 'POST', body: { pr, code: result.code, verifier: pkce.verifier } });
