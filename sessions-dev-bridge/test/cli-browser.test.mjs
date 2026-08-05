@@ -43,6 +43,17 @@ test('system browser launchers use platform commands without a shell', async (t)
   }
 });
 
+test('Windows browser launch rejects UNC system directories', async () => {
+  await assert.rejects(
+    openSystemBrowser(authorizationUrl, {
+      platform: 'win32',
+      windowsDirectory: '//server/share',
+      launcher: () => assert.fail('UNC launcher must not run'),
+    }),
+    /absolute local path/,
+  );
+});
+
 test('system browser launch rejects launcher spawn errors', async () => {
   let unrefCalled = false;
   const missingLauncher = () => {

@@ -201,10 +201,11 @@ export async function openSystemBrowser(url, {
 }
 
 function windowsBrowserLauncher(windowsDirectory) {
-  if (!win32Path.isAbsolute(windowsDirectory) || windowsDirectory.startsWith('\\\\')) {
+  const normalizedDirectory = win32Path.normalize(windowsDirectory);
+  if (!/^[A-Za-z]:\\/.test(normalizedDirectory)) {
     throw new Error('Windows system directory must be an absolute local path');
   }
-  return win32Path.join(windowsDirectory, 'System32', 'rundll32.exe');
+  return win32Path.join(normalizedDirectory, 'System32', 'rundll32.exe');
 }
 
 function requireHttps(value) {
