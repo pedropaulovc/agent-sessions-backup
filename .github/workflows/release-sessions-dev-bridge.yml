@@ -6,6 +6,7 @@ on:
 permissions:
   contents: read
   id-token: write
+  attestations: write
 
 concurrency:
   group: sessions-dev-bridge-release
@@ -29,8 +30,12 @@ jobs:
           node-version: 22.22.2
           cache: npm
           cache-dependency-path: sessions-dev-bridge/package-lock.json
+      - name: Parse the native WSL installer
+        run: bash -n ../scripts/install-sessions-dev-bridge-wsl.sh
       - name: Install the pinned bridge toolchain without lifecycle code
         run: npm ci --ignore-scripts
+      - name: Test the standalone client on native Linux
+        run: npm test
       - name: Create keyless protected-workflow release provenance
         run: npm run release:provenance
         env:
@@ -39,10 +44,14 @@ jobs:
         run: npm run release:verify
       - name: Pack the standalone client without lifecycle code
         run: npm pack --ignore-scripts
+      - name: Attest the package before distribution
+        uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: sessions-dev-bridge/sessions-dev-bridge-*.tgz
       - name: Upload the signed standalone package
         uses: actions/upload-artifact@v4
         with:
-          name: sessions-dev-bridge-${{ github.sha }}
+          name: sessions-dev-bridge-${{ github.sha }}-attempt-${{ github.run_attempt }}
           path: sessions-dev-bridge/sessions-dev-bridge-*.tgz
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 90

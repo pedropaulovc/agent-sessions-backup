@@ -14,7 +14,7 @@ async function fixture(change = (value) => value) {
   await writeFile(join(root, 'package.json'), packageBytes);
   await writeFile(join(root, 'src', 'main.mjs'), sourceBytes);
   let manifest = {
-    format: 1,
+    format: 2,
     name: 'sessions-dev-bridge',
     version: '1.0.0',
     repository: 'pedropaulovc/agent-sessions-backup',
@@ -22,6 +22,7 @@ async function fixture(change = (value) => value) {
     ref: 'refs/heads/main',
     workflow: '.github/workflows/release-sessions-dev-bridge.yml',
     runId: '123',
+    runAttempt: '1',
     files: [
       { path: 'package.json', sha256: sha256(packageBytes) },
       { path: 'src/main.mjs', sha256: sha256(sourceBytes) },
@@ -43,6 +44,7 @@ test('accepts only a signed exact installed payload from the protected main work
     }});
     assert.equal(verified, true);
     assert.equal(release.commit, 'a'.repeat(40));
+    assert.equal(release.runAttempt, '1');
     assert.equal(release.digest, sha256(canonicalBytes(manifest)));
   } finally { await rm(root, { recursive: true, force: true }); }
 });
@@ -51,6 +53,10 @@ test('rejects wrong release provenance and modified installed bytes before trust
   const wrong = await fixture((manifest) => ({ ...manifest, ref: 'refs/heads/feature' }));
   try { await assert.rejects(verifyInstalledRelease({ packageRoot: wrong.root, verifyBundle: async () => {} }), /protected default-branch/); }
   finally { await rm(wrong.root, { recursive: true, force: true }); }
+
+  const invalidAttempt = await fixture((manifest) => ({ ...manifest, runAttempt: '0' }));
+  try { await assert.rejects(verifyInstalledRelease({ packageRoot: invalidAttempt.root, verifyBundle: async () => {} }), /run attempt/); }
+  finally { await rm(invalidAttempt.root, { recursive: true, force: true }); }
 
   const changed = await fixture();
   try {

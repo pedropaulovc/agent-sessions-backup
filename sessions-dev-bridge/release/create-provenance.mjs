@@ -15,7 +15,11 @@ for (const [field, value] of [['GITHUB_REPOSITORY', expected.repository], ['GITH
   if (process.env[field] !== value) throw new Error(`${field} must be ${value}`);
 }
 if (process.env.GITHUB_WORKFLOW_REF !== `${expected.repository}/${expected.workflow}@${expected.ref}`) throw new Error('provenance may only be created by the protected bridge release workflow');
-if (!/^[0-9a-f]{40}$/.test(process.env.GITHUB_SHA ?? '') || !/^[1-9][0-9]*$/.test(process.env.GITHUB_RUN_ID ?? '')) throw new Error('invalid GitHub release identity');
+if (!/^[0-9a-f]{40}$/.test(process.env.GITHUB_SHA ?? '')
+  || !/^[1-9][0-9]*$/.test(process.env.GITHUB_RUN_ID ?? '')
+  || !/^[1-9][0-9]*$/.test(process.env.GITHUB_RUN_ATTEMPT ?? '')) {
+  throw new Error('invalid GitHub release identity');
+}
 const manifestJwk = JSON.parse(process.env.DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK ?? 'null');
 let productionKeys;
 try { productionKeys = validateProductionManifestKeys({ keys: [manifestJwk] }); }
@@ -33,7 +37,7 @@ for (const path of paths) {
   files.push({ path, sha256: sha256(await readFile(join(root, ...path.split('/')))) });
 }
 const manifest = {
-  format: 1,
+  format: 2,
   name: 'sessions-dev-bridge',
   version: metadata.version,
   repository: expected.repository,
@@ -41,6 +45,7 @@ const manifest = {
   ref: expected.ref,
   workflow: expected.workflow,
   runId: process.env.GITHUB_RUN_ID,
+  runAttempt: process.env.GITHUB_RUN_ATTEMPT,
   files,
 };
 const sigstoreBundle = await sign(canonicalBytes(manifest));

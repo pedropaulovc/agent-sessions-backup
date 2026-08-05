@@ -157,15 +157,26 @@ class LoopbackCallbacks {
   }
 }
 
-export async function openSystemBrowser(url) {
+export async function openSystemBrowser(url, { platform = process.platform, launcher = spawn } = {}) {
   requireHttps(url);
-  const command = process.platform === 'win32'
+  const command = platform === 'win32'
     ? ['rundll32.exe', ['url.dll,FileProtocolHandler', url]]
-    : process.platform === 'darwin'
-      ? ['open', [url]]
-      : ['xdg-open', [url]];
-  const child = spawn(command[0], command[1], { detached: true, windowsHide: true, stdio: 'ignore', shell: false });
-  child.unref();
+    : platform === 'darwin'
+      ? ['/usr/bin/open', [url]]
+      : ['/usr/bin/xdg-open', [url]];
+  await new Promise((resolve, reject) => {
+    const child = launcher(command[0], command[1], {
+      detached: true,
+      windowsHide: true,
+      stdio: 'ignore',
+      shell: false,
+    });
+    child.once('error', reject);
+    child.once('spawn', () => {
+      child.unref();
+      resolve();
+    });
+  });
 }
 
 function requireHttps(value) {
