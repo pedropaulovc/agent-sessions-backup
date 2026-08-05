@@ -279,6 +279,95 @@ describe('codex ingestion: usage.ts', () => {
   });
 });
 
+describe('codex fork rollouts stay under their root session', () => {
+  const ROOT_SESSION_ID = '019f0000-0000-7000-8000-000000000abe';
+  const CHILD_SESSION_ID = '019f0000-0000-7000-8000-000000000abf';
+
+  function rollout(
+    sessionId: string,
+    text: string,
+    parentSessionId?: string,
+    threadSource: 'subagent' | 'user' = parentSessionId ? 'subagent' : 'user',
+  ): string {
+    return `${[
+      JSON.stringify({
+        timestamp: '2026-08-04T14:48:07.205Z',
+        type: 'session_meta',
+        payload: {
+          session_id: ROOT_SESSION_ID,
+          id: sessionId,
+          ...(parentSessionId
+            ? {
+                forked_from_id: parentSessionId,
+                parent_thread_id: parentSessionId,
+                thread_source: threadSource,
+              }
+            : { thread_source: threadSource }),
+          cwd: '/home/tester/src/meshprobe',
+        },
+      }),
+      JSON.stringify({
+        timestamp: '2026-08-04T14:48:08.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text }],
+          internal_chat_message_metadata_passthrough: { turn_id: `${sessionId}-turn` },
+        },
+      }),
+    ].join('\n')}\n`;
+  }
+
+  it('persists fork metadata and hides child rollouts from the primary-session list', async () => {
+    const rootPath = `2026/08/04/rollout-2026-08-04T14-48-07-${ROOT_SESSION_ID}.jsonl`;
+    const childPath = `2026/08/04/rollout-2026-08-04T14-48-49-${CHILD_SESSION_ID}.jsonl`;
+
+    const rootRes = await putFile('codex-sessions', rootPath, rollout(ROOT_SESSION_ID, 'root task'));
+    expect(rootRes.status).toBe(201);
+    await drainQueue();
+
+    const childRes = await putFile('codex-sessions', childPath, rollout(CHILD_SESSION_ID, 'subagent task', ROOT_SESSION_ID));
+    expect(childRes.status).toBe(201);
+    await drainQueue();
+
+    const rows = await testEnv.DB.prepare(
+      'SELECT session_id, parent_session_id, is_sidechain FROM sessions WHERE session_id IN (?1, ?2) ORDER BY session_id',
+    )
+      .bind(ROOT_SESSION_ID, CHILD_SESSION_ID)
+      .all<{ session_id: string; parent_session_id: string | null; is_sidechain: number }>();
+    expect(rows.results).toEqual([
+      { session_id: ROOT_SESSION_ID, parent_session_id: null, is_sidechain: 0 },
+      { session_id: CHILD_SESSION_ID, parent_session_id: ROOT_SESSION_ID, is_sidechain: 1 },
+    ]);
+
+    const recent = await SELF.fetch('https://sessions.vza.net/?harness=codex');
+    expect(recent.status).toBe(200);
+    const html = await recent.text();
+    expect(html).toContain(`/s/${ROOT_SESSION_ID}`);
+    expect(html).not.toContain(`/s/${CHILD_SESSION_ID}`);
+    const reindexedChild = await putFile(
+      'codex-sessions',
+      childPath,
+      rollout(CHILD_SESSION_ID, 'interactive fork', ROOT_SESSION_ID, 'user'),
+    );
+    expect(reindexedChild.status).toBe(201);
+    await drainQueue();
+
+    const cleared = await testEnv.DB.prepare(
+      'SELECT parent_session_id, is_sidechain FROM sessions WHERE session_id = ?1',
+    )
+      .bind(CHILD_SESSION_ID)
+      .first<{ parent_session_id: string | null; is_sidechain: number }>();
+    expect(cleared).toEqual({ parent_session_id: null, is_sidechain: 0 });
+
+    const recentAfterReindex = await SELF.fetch('https://sessions.vza.net/?harness=codex');
+    expect(recentAfterReindex.status).toBe(200);
+    const htmlAfterReindex = await recentAfterReindex.text();
+    expect(htmlAfterReindex).toContain(`/s/${CHILD_SESSION_ID}`);
+  });
+});
+
 describe('getSessionRaw range handling', () => {
   const RANGE_SESSION_ID = '33333333-4444-4444-8444-555555555555';
   const content = `${[

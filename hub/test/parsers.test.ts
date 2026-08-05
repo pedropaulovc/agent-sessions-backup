@@ -753,6 +753,49 @@ describe('parseCodex', () => {
     expect(s.turns[4]!.compaction?.kind).toBe('codex-window');
   });
 
+  it('links a Codex fork to its root while preserving the child rollout identity', async () => {
+    const childSessionId = '019f0000-0000-7000-8000-000000000abd';
+    const rootMeta = {
+      timestamp: '2026-07-02T09:00:00.000Z',
+      type: 'session_meta',
+      payload: {
+        session_id: CODEX_SESSION_ID,
+        id: childSessionId,
+        forked_from_id: CODEX_SESSION_ID,
+        parent_thread_id: CODEX_SESSION_ID,
+        thread_source: 'subagent',
+      },
+    };
+
+    const session = await parseCodex(readJsonlLines(toStream([JSON.stringify(rootMeta)])), childSessionId);
+
+    expect(session.id).toBe(childSessionId);
+    expect(session.parentSessionId).toBe(CODEX_SESSION_ID);
+    expect(session.parentSessionLink).toBe('linked');
+    expect(session.isSidechain).toBe(true);
+  });
+
+  it('does not classify an interactive Codex fork as a subagent', async () => {
+    const forkSessionId = '019f0000-0000-7000-8000-000000000abe';
+    const forkMeta = {
+      timestamp: '2026-07-02T09:00:00.000Z',
+      type: 'session_meta',
+      payload: {
+        session_id: CODEX_SESSION_ID,
+        id: forkSessionId,
+        forked_from_id: CODEX_SESSION_ID,
+        parent_thread_id: CODEX_SESSION_ID,
+        thread_source: 'user',
+        source: 'cli',
+      },
+    };
+
+    const session = await parseCodex(readJsonlLines(toStream([JSON.stringify(forkMeta)])), forkSessionId);
+    expect(session.parentSessionId).toBeUndefined();
+    expect(session.parentSessionLink).toBe('none');
+    expect(session.isSidechain).toBe(false);
+  });
+
   it('keeps Codex source identities stable when parsing a later byte-range page', async () => {
     const records = [
       {
