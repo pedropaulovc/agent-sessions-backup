@@ -41,7 +41,7 @@ export class EmbeddedBuildDriver {
     if (first.bundleDigest !== second.bundleDigest || !first.bundle.equals(second.bundle)) {
       throw new Error('embedded build is not reproducible');
     }
-    const consumed = await this.#manifest(root, first.metafile);
+    const consumed = await this.#manifest(root, first.loadedPaths);
     const dirtyPaths = await consumedDirtyPaths(root, consumed.map((item) => item.path), this.runProcess);
     if (dirtyPaths.length) {
       const accepted = await this.consent(Object.freeze([...dirtyPaths]));
@@ -59,6 +59,7 @@ export class EmbeddedBuildDriver {
   }
 
   async #bundle(root, entry) {
+    const loadedPaths = new Set();
     const result = await esbuild({
       ...FIXED_BUILD_OPTIONS,
       absWorkingDir: root,
@@ -66,17 +67,17 @@ export class EmbeddedBuildDriver {
       metafile: true,
       outfile: 'worker.mjs',
       tsconfigRaw: { compilerOptions: { useDefineForClassFields: true } },
-      plugins: [embeddedDependencyResolver()],
+      plugins: [embeddedDependencyResolver(), consumedInputRecorder(loadedPaths)],
     });
     if (result.outputFiles.length !== 1) throw new Error('embedded build produced an unexpected output set');
     const bundle = Buffer.from(result.outputFiles[0].contents);
-    return { bundle, bundleDigest: sha256(bundle), metafile: result.metafile };
+    return { bundle, bundleDigest: sha256(bundle), loadedPaths };
   }
 
-  async #manifest(root, metafile) {
+  async #manifest(root, loadedPaths) {
     const paths = new Set(['hub/package.json', 'hub/package-lock.json']);
-    for (const input of Object.keys(metafile.inputs)) {
-      const absolute = isAbsolute(input) ? input : resolve(root, input);
+    for (const input of loadedPaths) {
+      const absolute = resolve(input);
       if (inside(bridgePackageRoot, absolute)) continue;
       const path = repoPath(root, absolute);
       if (!path.startsWith('hub/src/')) throw new Error(`build consumed checkout input outside hub/src: ${path}`);
@@ -108,6 +109,18 @@ function embeddedDependencyResolver() {
       build.onResolve({ filter: /^(?:@[^/]+\/|[A-Za-z0-9])[^:]*$/ }, (args) => {
         try { return { path: fileURLToPath(import.meta.resolve(args.path, packageJson)) }; }
         catch { return { errors: [{ text: `dependency is not in the embedded pinned toolchain: ${args.path}` }] }; }
+      });
+    },
+  };
+}
+
+function consumedInputRecorder(paths) {
+  return {
+    name: 'consumed-input-recorder',
+    setup(build) {
+      build.onLoad({ filter: /.*/ }, (args) => {
+        if (args.namespace === 'file') paths.add(args.path);
+        return undefined;
       });
     },
   };
