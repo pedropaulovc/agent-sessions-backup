@@ -318,26 +318,46 @@ Install the bridge entirely inside WSL. Prerequisites are native Linux `gh`, `cu
 Fetch the installer from trusted `main`, not from a PR checkout:
 
 ```bash
-installer=$(mktemp)
-trap 'rm -f "$installer"' EXIT
-gh api \
-  -H 'Accept: application/vnd.github.raw+json' \
-  'repos/pedropaulovc/agent-sessions-backup/contents/scripts/install-sessions-dev-bridge-wsl.sh?ref=main' \
-  >"$installer"
-/usr/bin/env -u BASH_ENV -u ENV -u NODE_OPTIONS -u NODE_PATH /usr/bin/bash "$installer"
-rm -f "$installer"
+trusted_path=/usr/sbin:/usr/bin:/sbin:/bin
+PATH=$trusted_path
+export PATH
+unset BASH_ENV ENV CDPATH GLOBIGNORE TAR_OPTIONS LD_PRELOAD LD_LIBRARY_PATH
+unset NODE_OPTIONS NODE_PATH NODE_EXTRA_CA_CERTS NODE_TLS_REJECT_UNAUTHORIZED
+unset OPENSSL_CONF OPENSSL_MODULES SSL_CERT_FILE SSL_CERT_DIR
+unset GH_TOKEN GITHUB_TOKEN HTTP_PROXY HTTPS_PROXY ALL_PROXY
+unset http_proxy https_proxy all_proxy
+installer=$(/usr/bin/mktemp)
+trap '/usr/bin/rm -f -- "$installer"' EXIT
+/usr/bin/env -i \
+  HOME="$HOME" \
+  XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}" \
+  PATH="$trusted_path" \
+  LANG=C.UTF-8 \
+  /usr/bin/gh api \
+    -H 'Accept: application/vnd.github.raw+json' \
+    'repos/pedropaulovc/agent-sessions-backup/contents/scripts/install-sessions-dev-bridge-wsl.sh?ref=main' \
+    >"$installer"
+/usr/bin/env -i \
+  HOME="$HOME" \
+  XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}" \
+  XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}" \
+  XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}" \
+  PATH="$trusted_path" \
+  LANG=C.UTF-8 \
+  /usr/bin/bash "$installer"
+/usr/bin/rm -f -- "$installer"
 trap - EXIT
 ```
 
 This is a one-time per-user bootstrap, repeated after a new protected bridge release. The installer:
 
-- rejects Windows-interoperability executables and unsupported Linux architectures;
-- downloads a checksum-pinned Node.js runtime into WSL user storage;
+- requires fixed native `/usr/bin` tools and supports x86-64 WSL;
 - selects one exact attempt of the latest successful protected `main` release and requires its attempt-bound artifact name;
-- verifies the package digest, protected workflow identity, source commit, source ref, GitHub-hosted runner, and GitHub build attestation before npm reads the archive;
-- installs with lifecycle scripts disabled and a sanitized executable path;
-- independently verifies the package's internal Sigstore identity, every packaged runtime hash, and the selected workflow run, attempt, and commit before replacing the command;
-- installs only a fixed absolute-runtime launcher with a sanitized environment at `~/.local/bin/sessions-dev-bridge`; it never requests or carries production authorization.
+- verifies the sealed runtime's digest, protected workflow identity, source commit, source ref, GitHub-hosted runner, and GitHub build attestation before extracting it;
+- installs the protected workflow's offline, lifecycle-disabled dependency closure; the workstation contacts no npm registry;
+- verifies the package's internal Sigstore identity, executable source hashes, and selected workflow run, attempt, and commit;
+- downloads a separately checksum-pinned Node.js runtime, rejects links and special files, and publishes an absolute launcher with an allowlisted environment;
+- writes only user-owned mode-0700 installation paths. It never requests or carries production authorization.
 
 For each session, the WSL agent invokes the native command and remains attached:
 
