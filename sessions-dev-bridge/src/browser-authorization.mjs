@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';
+import { win32 as win32Path } from 'node:path';
 import { canonicalBytes } from './canonical.mjs';
 import { createPkce } from './secure.mjs';
 
@@ -157,15 +158,54 @@ class LoopbackCallbacks {
   }
 }
 
-export async function openSystemBrowser(url) {
+export async function openSystemBrowser(url, {
+  platform = process.platform,
+  launcher = spawn,
+  launchProbeMs = 1_000,
+  windowsDirectory = process.env.SystemRoot || 'C:\\Windows',
+} = {}) {
   requireHttps(url);
-  const command = process.platform === 'win32'
-    ? ['rundll32.exe', ['url.dll,FileProtocolHandler', url]]
-    : process.platform === 'darwin'
-      ? ['open', [url]]
-      : ['xdg-open', [url]];
-  const child = spawn(command[0], command[1], { detached: true, windowsHide: true, stdio: 'ignore', shell: false });
-  child.unref();
+  const command = platform === 'win32'
+    ? [windowsBrowserLauncher(windowsDirectory), ['url.dll,FileProtocolHandler', url]]
+    : platform === 'darwin'
+      ? ['/usr/bin/open', [url]]
+      : ['/usr/bin/xdg-open', [url]];
+  await new Promise((resolve, reject) => {
+    const child = launcher(command[0], command[1], {
+      detached: true,
+      windowsHide: true,
+      stdio: 'ignore',
+      shell: false,
+    });
+    let timer;
+    const complete = (error) => {
+      clearTimeout(timer);
+      child.removeListener('error', onError);
+      child.removeListener('exit', onExit);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onError = (error) => complete(error);
+    const onExit = (code, signal) => complete(
+      code === 0
+        ? null
+        : new Error(`browser launcher exited before handoff (${signal ?? `code ${code}`})`),
+    );
+    child.once('error', onError);
+    child.once('exit', onExit);
+    child.once('spawn', () => {
+      child.unref();
+      timer = setTimeout(complete, launchProbeMs);
+    });
+  });
+}
+
+function windowsBrowserLauncher(windowsDirectory) {
+  const normalizedDirectory = win32Path.normalize(windowsDirectory);
+  if (!/^[A-Za-z]:\\/.test(normalizedDirectory)) {
+    throw new Error('Windows system directory must be an absolute local path');
+  }
+  return win32Path.join(normalizedDirectory, 'System32', 'rundll32.exe');
 }
 
 function requireHttps(value) {

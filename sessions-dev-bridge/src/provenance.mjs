@@ -46,6 +46,7 @@ export async function verifyInstalledRelease(options = {}) {
     commit: raw.manifest.commit,
     workflow: raw.manifest.workflow,
     runId: raw.manifest.runId,
+    runAttempt: raw.manifest.runAttempt,
     version: raw.manifest.version,
   });
 }
@@ -61,13 +62,14 @@ async function verifySigstoreBundle(bundle, payload) {
 }
 
 function validateManifest(manifest) {
-  assertExactKeys(manifest, ['format', 'name', 'version', 'repository', 'commit', 'ref', 'workflow', 'runId', 'files']);
-  if (manifest.format !== 1 || manifest.name !== 'sessions-dev-bridge') throw new Error('unsupported release provenance');
+  assertExactKeys(manifest, ['format', 'name', 'version', 'repository', 'commit', 'ref', 'workflow', 'runId', 'runAttempt', 'files']);
+  if (manifest.format !== 2 || manifest.name !== 'sessions-dev-bridge') throw new Error('unsupported release provenance');
   if (manifest.repository !== REPOSITORY || manifest.ref !== REF || manifest.workflow !== WORKFLOW) {
     throw new Error('release provenance is not from the protected default-branch workflow');
   }
   assertHex(manifest.commit, 40, 'release commit');
   if (!/^[1-9][0-9]*$/.test(String(manifest.runId))) throw new Error('invalid release workflow run id');
+  if (!/^[1-9][0-9]*$/.test(String(manifest.runAttempt))) throw new Error('invalid release workflow run attempt');
   if (!Array.isArray(manifest.files) || manifest.files.length === 0) throw new Error('empty release file manifest');
   let previous = '';
   for (const item of manifest.files) {

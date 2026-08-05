@@ -1,6 +1,6 @@
 {
   "name": "sessions-dev-bridge",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Hardware-attested, user-mediated production session replication client",
   "type": "module",
   "bin": {
@@ -20,7 +20,7 @@
     "@simplewebauthn/server": "13.3.2",
     "esbuild": "0.28.1",
     "fflate": "0.8.2",
-    "miniflare": "4.20260710.0",
+    "miniflare": "4.20260730.0",
     "sigstore": "5.0.0"
   },
   "engines": {
@@ -30,5 +30,8 @@
     "access": "public",
     "provenance": true
   },
-  "license": "UNLICENSED"
+  "license": "UNLICENSED",
+  "overrides": {
+    "undici": "7.29.0"
+  }
 }

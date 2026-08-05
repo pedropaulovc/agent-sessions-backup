@@ -313,61 +313,63 @@ Default to local import. Remote import requires the trusted-front-door and direc
 
 The target PR must be open and its isolated preview must have completed provisioning. A closed or merged PR has no routable destination after preview cleanup. A remote PR target does not use the checkout or require local TPM enrollment.
 
-The bridge is a native Windows installation outside WSL. Installing it is a one-time trusted workstation bootstrap, repeated only when a new protected bridge release is published. It requires native Windows Node.js matching `sessions-dev-bridge/package.json`, authenticated `gh.exe`, and `npm.cmd`. Use only this block as committed on trusted `main`, never a version modified by PR code. It switches to a native Windows working directory before invoking `.cmd` shims, avoiding the misleading `UNC paths are not supported` warning inherited from a WSL checkout:
+Install the bridge entirely inside WSL. Prerequisites are native Linux `gh`, `curl`, `tar`, `sha256sum`, `readlink`, `dash`, and `/usr/bin/xdg-open`; none may resolve through `/mnt`. Authenticate WSL's `gh` to GitHub before setup. The installer pins and verifies its own Linux Node.js runtime, so WSL's system Node and npm are not used.
 
-```powershell
-$ErrorActionPreference = 'Stop'
-Set-Location $env:USERPROFILE
-$repository = 'pedropaulovc/agent-sessions-backup'
-$workflow = 'release-sessions-dev-bridge.yml'
-$releases = @(gh.exe run list `
-  --repo $repository `
-  --workflow $workflow `
-  --branch main `
-  --event workflow_dispatch `
-  --status success `
-  --limit 1 `
-  --json databaseId,headSha | ConvertFrom-Json)
-if ($releases.Count -ne 1 -or $releases[0].headSha -notmatch '^[0-9a-f]{40}$') {
-  throw 'No protected bridge release is available.'
-}
-$release = $releases[0]
-
-$artifact = "sessions-dev-bridge-$($release.headSha)"
-$directory = Join-Path $env:TEMP "$artifact-$([guid]::NewGuid())"
-New-Item -ItemType Directory -Path $directory | Out-Null
-try {
-  gh.exe run download $release.databaseId `
-    --repo $repository `
-    --name $artifact `
-    --dir $directory
-  $packages = @(Get-ChildItem $directory -Filter 'sessions-dev-bridge-*.tgz' -File)
-  if ($packages.Count -ne 1) {
-    throw "Expected one signed package; found $($packages.Count)."
-  }
-
-  npm.cmd install --global --ignore-scripts $packages[0].FullName
-  $verification = & cmd.exe /d /c 'sessions-dev-bridge.cmd 2>&1'
-  $verificationExit = $LASTEXITCODE
-  if ($verificationExit -ne 1 -or ($verification | Out-String) -notmatch 'usage: sessions-dev-bridge') {
-    throw 'Installed bridge failed provenance verification.'
-  }
-  Get-Command sessions-dev-bridge.cmd
-} finally {
-  Remove-Item $directory -Recurse -Force
-}
-```
-
-The installed command verifies the package's protected-workflow Sigstore provenance and packaged runtime hashes before parsing command arguments. The expected verification invocation exits with the CLI usage message because no operation was supplied. Do not replace it with an unsigned checkout build, and do not install the package with WSL's npm; `powershell.exe` would not resolve that installation.
-
-For each session, the WSL agent invokes the native bridge itself and remains attached to the process. Keep the native working-directory switch and `cmd.exe` stderr merge: without them, Windows PowerShell decorates normal bridge progress as `NativeCommandError` and prints a harmless UNC warning.
+Fetch the installer from trusted `main`, not from a PR checkout:
 
 ```bash
-powershell.exe -NoLogo -NoProfile -Command \
-  'Set-Location $env:USERPROFILE; & cmd.exe /d /s /c "sessions-dev-bridge.cmd pull --session <exact-session-id> --target pr-<number> 2>&1"; exit $LASTEXITCODE'
+trusted_path=/usr/sbin:/usr/bin:/sbin:/bin
+PATH=$trusted_path
+export PATH
+unset BASH_ENV ENV CDPATH GLOBIGNORE TAR_OPTIONS LD_PRELOAD LD_LIBRARY_PATH
+unset NODE_OPTIONS NODE_PATH NODE_EXTRA_CA_CERTS NODE_TLS_REJECT_UNAUTHORIZED
+unset OPENSSL_CONF OPENSSL_MODULES SSL_CERT_FILE SSL_CERT_DIR
+unset GH_TOKEN GITHUB_TOKEN HTTP_PROXY HTTPS_PROXY ALL_PROXY
+unset http_proxy https_proxy all_proxy
+installer=$(/usr/bin/mktemp)
+trap '/usr/bin/rm -f -- "$installer"' EXIT
+/usr/bin/env -i \
+  HOME="$HOME" \
+  XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}" \
+  PATH="$trusted_path" \
+  LANG=C.UTF-8 \
+  /usr/bin/gh api \
+    -H 'Accept: application/vnd.github.raw+json' \
+    'repos/pedropaulovc/agent-sessions-backup/contents/scripts/install-sessions-dev-bridge-wsl.sh?ref=main' \
+    >"$installer"
+/usr/bin/env -i \
+  HOME="$HOME" \
+  XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}" \
+  XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}" \
+  XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}" \
+  PATH="$trusted_path" \
+  LANG=C.UTF-8 \
+  /usr/bin/bash "$installer"
+/usr/bin/rm -f -- "$installer"
+trap - EXIT
 ```
 
-The user does not run this command. The user completes only the trusted browser approvals and passkey touch opened by the native bridge. One invocation authorizes one session; after it exits successfully, the agent runs the next session command.
+This is a one-time per-user bootstrap, repeated after a new protected bridge release. The installer:
+
+- requires fixed native `/usr/bin` tools and supports x86-64 WSL;
+- selects one exact attempt of the latest successful protected `main` run, then downloads its commit-and-attempt-bound durable GitHub Release asset;
+- verifies the sealed runtime's digest, protected workflow identity, source commit, source ref, GitHub-hosted runner, and GitHub build attestation before extracting it;
+- installs the protected workflow's offline, lifecycle-disabled dependency closure; the workstation contacts no npm registry;
+- verifies the package's internal Sigstore identity, executable source hashes, and selected workflow run, attempt, and commit;
+- downloads a separately checksum-pinned Node.js runtime, rejects links and special files, and publishes an absolute launcher with an allowlisted environment;
+- writes only user-owned mode-0700 installation paths. It never requests or carries production authorization.
+
+For each session, the WSL agent invokes the native command and remains attached:
+
+```bash
+sessions-dev-bridge pull \
+  --session <exact-session-id> \
+  --target pr-<number>
+```
+
+The user does not run this command. The user completes only the trusted browser approvals and passkey touch opened through WSL's `xdg-open`. One invocation authorizes one session; after it exits successfully, the agent runs the next session command. A remote PR target requires no TPM enrollment. `enroll` and `--target local` remain unavailable unless WSL exposes the required Linux OpenSSL TPM2 provider.
+
+The installed command verifies the protected release before parsing arguments or loading target-specific runtime modules. Do not replace it with an unsigned checkout build.
 
 The bridge opens five trusted approval pages in sequence. Do not construct, copy, or edit their authorization URLs.
 

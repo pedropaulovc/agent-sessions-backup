@@ -4,8 +4,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   id-token: write
+  attestations: write
 
 concurrency:
   group: sessions-dev-bridge-release
@@ -20,29 +21,44 @@ jobs:
       run:
         working-directory: sessions-dev-bridge
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22.22.2
           cache: npm
           cache-dependency-path: sessions-dev-bridge/package-lock.json
+      - name: Parse the native WSL installer
+        run: bash -n ../scripts/install-sessions-dev-bridge-wsl.sh
       - name: Install the pinned bridge toolchain without lifecycle code
         run: npm ci --ignore-scripts
+      - name: Test the standalone client on native Linux
+        run: npm test
       - name: Create keyless protected-workflow release provenance
         run: npm run release:provenance
         env:
           DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK: ${{ vars.DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK }}
       - name: Verify protected production manifest keys are packaged
         run: npm run release:verify
-      - name: Pack the standalone client without lifecycle code
-        run: npm pack --ignore-scripts
-      - name: Upload the signed standalone package
-        uses: actions/upload-artifact@v4
+      - name: Assemble the sealed lockfile runtime without network or lifecycle code
+        run: |
+          node release/create-sealed-runtime.mjs
+          node release/verify-runtime-tree.mjs release/runtime
+          tar --create --gzip --file sessions-dev-bridge-runtime.tgz --directory release/runtime .
+      - name: Attest the sealed runtime before distribution
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a # v3
         with:
-          name: sessions-dev-bridge-${{ github.sha }}
-          path: sessions-dev-bridge/sessions-dev-bridge-*.tgz
-          if-no-files-found: error
-          retention-days: 14
+          subject-path: sessions-dev-bridge/sessions-dev-bridge-runtime.tgz
+      - name: Publish the attested runtime as a durable protected release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="sessions-dev-bridge-${GITHUB_SHA}-attempt-${GITHUB_RUN_ATTEMPT}"
+          gh release create "$tag" sessions-dev-bridge-runtime.tgz \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "$tag" \
+            --notes "Protected sessions-dev-bridge runtime from Actions run ${GITHUB_RUN_ID}, attempt ${GITHUB_RUN_ATTEMPT}." \
+            --latest=false
