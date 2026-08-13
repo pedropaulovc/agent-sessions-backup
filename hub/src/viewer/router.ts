@@ -1,5 +1,6 @@
 import { originOk, readSession } from '../auth/session';
 import { webauthnRoute } from '../auth/webauthn';
+import { readGrantBrowserRoute } from '../auth/read-grants';
 import { previewHumanIdentity } from '../auth/identity';
 import { debugBrowserRoute } from '../api/debug-exchange';
 import { assetEndpoint } from './assets';
@@ -23,6 +24,10 @@ export async function viewerRoute(request: Request, url: URL, env: Env): Promise
   if (env.ENVIRONMENT !== 'preview') {
     const authResp = await webauthnRoute(request, url, env);
     if (authResp) return authResp;
+    // The grant page needs no viewer session — the fresh passkey ceremony IS the auth,
+    // exactly like /login. Preview must never reach it (same rule as webauthnRoute).
+    const grantResp = await readGrantBrowserRoute(request, url, env);
+    if (grantResp) return grantResp;
   }
 
   const access = await viewerAccess(request, env);

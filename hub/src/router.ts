@@ -1,4 +1,5 @@
 import { machineIdentity, requirePreviewOrigin } from './auth/identity';
+import { grantIdentity, readGrantApiRoute, type GrantIdentity } from './auth/read-grants';
 import {
   cloudflareOAuthStatus,
   completeCloudflareOAuth,
@@ -79,6 +80,11 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
 
   if (url.pathname === '/api/v1/preview/diagnostics') return previewDiagnostics(request, env);
 
+  // Read-grant exchange authenticates itself (single-use code + PKCE verifier); it never
+  // mints anything beyond the read-only bearer the passkey ceremony approved.
+  const grantExchange = await readGrantApiRoute(request, url, env);
+  if (grantExchange) return grantExchange;
+
   const identity = await machineIdentity(request, env);
   const path = url.pathname;
   const method = request.method;
@@ -109,8 +115,14 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
   // gates itself — kept out of the read-API block below like heartbeat/upload.
   if (path === '/api/v1/certs/renew' && method === 'POST') return renewCert(request, env, identity);
 
-  // Read APIs: any enrolled machine (or dev identity) may query.
-  if (identity.kind !== 'machine') return Response.json({ error: 'unauthorized' }, { status: 401 });
+  // Read APIs: any enrolled machine (or dev identity) may query. A passkey-minted read
+  // grant reaches ONLY the explicit allow-list below — never the machine/admin routes —
+  // so anything added after this gate stays machine-only by construction.
+  if (identity.kind !== 'machine') {
+    const grant = await grantIdentity(request, env);
+    const granted = grant ? await grantReadRoute(request, url, env, grant) : null;
+    return granted ?? Response.json({ error: 'unauthorized' }, { status: 401 });
+  }
 
   if (path === '/api/v1/bootstrap' && method === 'GET') return bootstrap(env, identity);
 
@@ -152,6 +164,33 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
   }
 
   return Response.json({ error: 'not_found' }, { status: 404 });
+}
+
+/**
+ * The complete surface a passkey-minted read grant may reach: read-only session/usage/fleet
+ * queries plus an identity echo. Uploads, heartbeat, bootstrap, cert renewal, and every
+ * admin route are deliberately absent — those require machine identity.
+ */
+async function grantReadRoute(request: Request, url: URL, env: Env, grant: GrantIdentity): Promise<Response | null> {
+  if (request.method !== 'GET') return null;
+  const path = url.pathname;
+  if (path === '/api/v1/search') return search(url, env);
+  if (path === '/api/v1/sessions') return listSessions(url, env);
+  const sessionMatch = path.match(/^\/api\/v1\/sessions\/([^/]+)(\/raw)?$/);
+  if (sessionMatch) {
+    const sessionId = safeDecode(sessionMatch[1]!);
+    if (sessionId === null) return Response.json({ error: 'bad_session_id' }, { status: 400 });
+    return sessionMatch[2] ? getSessionRaw(sessionId, request, env) : getSession(sessionId, env);
+  }
+  if (path === '/api/v1/machines') return listMachines(env);
+  if (path === '/api/v1/usage') return usage(url, env);
+  if (path === '/api/v1/status') {
+    return Response.json({
+      ok: true,
+      identity: { kind: 'grant', label: grant.label, expires_at: grant.expiresAt },
+    });
+  }
+  return null;
 }
 
 /** Authenticated deployment evidence for trusted preview smoke only. Public health stays terse. */

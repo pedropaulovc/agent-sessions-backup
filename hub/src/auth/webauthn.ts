@@ -574,12 +574,27 @@ async function settingsPage(request: Request, env: Env): Promise<Response> {
       `expires ${esc(new Date(device.expires_at).toISOString())}</span> ` +
       `<button class="revoke-debug" data-device="${esc(device.device_id)}">Revoke</button></li>`,
     ).join('')}</ul>`;
+  const readGrants = await env.DB.prepare(
+    `SELECT grant_id, label, expires_at, last_used_at
+       FROM read_grants
+      WHERE revoked_at IS NULL AND expires_at > ?1
+      ORDER BY created_at DESC`,
+  ).bind(Date.now()).all<{ grant_id: string; label: string; expires_at: number; last_used_at: number | null }>();
+  const grantRows = readGrants.results.length === 0
+    ? '<p>No active read grants.</p>'
+    : `<ul>${readGrants.results.map((grant) =>
+      `<li><strong>${esc(grant.label)}</strong> ` +
+      `<span class="muted">expires ${esc(new Date(grant.expires_at).toISOString())}` +
+      `${grant.last_used_at ? ` · last used ${esc(new Date(grant.last_used_at).toISOString())}` : ''}</span> ` +
+      `<button class="revoke-grant" data-grant="${esc(grant.grant_id)}">Revoke</button></li>`,
+    ).join('')}</ul>`;
 
   const body =
     `<h1>Settings</h1>` +
     `<p>${count} passkey${count === 1 ? '' : 's'} registered for the owner.</p>` +
     `<button id="add">Add this device as a passkey</button>` +
     `<h2>Production debug bridge devices</h2>${deviceRows}` +
+    `<h2>Read grants</h2>${grantRows}` +
     `<div id="msg" class="msg"></div>` +
     `<form method="post" action="/logout" style="margin-top:16px"><button type="submit" style="background:transparent;color:var(--fg)">Sign out</button></form>` +
     `<div class="links"><a href="/">← Back to sessions</a></div>`;
@@ -603,6 +618,11 @@ async function settingsPage(request: Request, env: Env): Promise<Response> {
     `var cred=await navigator.credentials.get({publicKey:opt});` +
     `var v=await fetch('/debug/devices/'+encodeURIComponent(id)+'/revoke/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({response:serializeAuth(cred)})});` +
     `var r=await v.json();if(!v.ok||!r.revoked)throw new Error(r.error||'Revocation failed');this.closest('li').remove();say('Debug bridge device revoked.');` +
+    `}catch(e){say(String(e&&e.message||e),1);this.disabled=false;}});});` +
+    `document.querySelectorAll('.revoke-grant').forEach(function(btn){btn.addEventListener('click',async function(){` +
+    `var id=this.dataset.grant;this.disabled=true;try{` +
+    `var r=await fetch('/grants/'+encodeURIComponent(id)+'/revoke',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});` +
+    `var x=await r.json();if(!r.ok||!x.revoked)throw new Error(x.error||'Revocation failed');this.closest('li').remove();say('Read grant revoked.');` +
     `}catch(e){say(String(e&&e.message||e),1);this.disabled=false;}});});` +
     SERIALIZE_REG +
     SERIALIZE_AUTH;
