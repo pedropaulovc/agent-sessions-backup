@@ -174,6 +174,9 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
 async function grantReadRoute(request: Request, url: URL, env: Env, grant: GrantIdentity): Promise<Response | null> {
   if (request.method !== 'GET') return null;
   const path = url.pathname;
+  // Attribute passkey-approved egress: pairs with the per-resource access.* logs (which
+  // carry no identity), so "which grant read which session" stays answerable post-hoc.
+  console.log(JSON.stringify({ event: 'access.grant_read', grant: grant.grantId, label: grant.label, path }));
   if (path === '/api/v1/search') return search(url, env);
   if (path === '/api/v1/sessions') return listSessions(url, env);
   const sessionMatch = path.match(/^\/api\/v1\/sessions\/([^/]+)(\/raw)?$/);

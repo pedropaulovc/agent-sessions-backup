@@ -21,6 +21,12 @@ function b64u(bytes: ArrayBuffer | Uint8Array): string {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
+/** Mirrors grantTokenHash in read-grants.ts, so tests can seed reachable rows. */
+async function tokenHash(token: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', encoder.encode(`read-grant-token\0${token}`));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
 async function pkcePair(): Promise<{ verifier: string; challenge: string }> {
   const verifier = b64u(crypto.getRandomValues(new Uint8Array(32)));
   const challenge = b64u(await crypto.subtle.digest('SHA-256', encoder.encode(verifier)));
@@ -164,6 +170,8 @@ describe('passkey-minted read grants', () => {
     const code = await approveGrant(grantParams(challenge), credentialId);
     const { token } = await (await exchange(code, verifier)).json() as { token: string };
 
+    // Exactly 401 everywhere: each of these must fail the machine-identity gate itself, not
+    // 404/405 out of some unrelated route mismatch that would mask a widened grant surface.
     const denied: Array<[string, string]> = [
       ['GET', '/api/v1/bootstrap'],
       ['POST', '/api/v1/heartbeat'],
@@ -174,7 +182,7 @@ describe('passkey-minted read grants', () => {
     ];
     for (const [method, path] of denied) {
       const response = await bearerRequest(path, token, method);
-      expect(response.status, `${method} ${path}`).toBeGreaterThanOrEqual(400);
+      expect(response.status, `${method} ${path}`).toBe(401);
     }
   });
 
@@ -207,7 +215,7 @@ describe('passkey-minted read grants', () => {
     const staleToken = `agsr_${'a'.repeat(43)}`;
     await testEnv.DB.prepare(
       'INSERT INTO read_grants (grant_id, token_hash, label, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)',
-    ).bind(`expired-${crypto.randomUUID()}`, `stale-hash-${crypto.randomUUID()}`, 'expired', now - 7_200_000, now - 3_600_000).run();
+    ).bind(`expired-${crypto.randomUUID()}`, await tokenHash(staleToken), 'expired', now - 7_200_000, now - 3_600_000).run();
     const identity = await grantIdentity(
       new Request(`${API}/api/v1/sessions`, { headers: { authorization: `Bearer ${staleToken}` } }), testEnv,
     );
@@ -217,7 +225,8 @@ describe('passkey-minted read grants', () => {
     const credentialId = `grant-cred-${crypto.randomUUID()}`;
     await seedCredential(credentialId);
     const code = await approveGrant(grantParams(challenge), credentialId);
-    await testEnv.DB.prepare('UPDATE read_grant_codes SET expires_at = ?1').bind(now - 1000).run();
+    await testEnv.DB.prepare('UPDATE read_grant_codes SET expires_at = ?1 WHERE pkce_challenge = ?2')
+      .bind(now - 1000, challenge).run();
     const expired = await exchange(code, verifier);
     expect(expired.status).toBe(400);
     await expect(expired.json()).resolves.toEqual({ error: 'bad_code' });

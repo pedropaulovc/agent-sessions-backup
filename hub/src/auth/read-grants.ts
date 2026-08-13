@@ -36,6 +36,7 @@ const TTL_MIN_SECONDS = 300;
 const TTL_MAX_SECONDS = 86_400;
 export const TTL_DEFAULT_SECONDS = 14_400;
 const LAST_USED_WRITE_INTERVAL_MS = 60_000;
+const GRANT_RETENTION_MS = 30 * 86_400_000;
 const TEXT = new TextEncoder();
 
 export interface GrantIdentity { kind: 'grant'; grantId: string; label: string; expiresAt: number }
@@ -123,6 +124,9 @@ async function grantUser(request: Request, env: Env): Promise<string | null> {
 
 /** Viewer-host surface: the grant approval page, its passkey ceremony, and grant revocation. */
 export async function readGrantBrowserRoute(request: Request, url: URL, env: Env, deps?: WebAuthnDeps): Promise<Response | null> {
+  // Preview must never mint or revoke production grants — enforced here as well as at the
+  // viewer-router call site, so a future caller can't accidentally open the surface.
+  if (env.ENVIRONMENT === 'preview') return null;
   const path = url.pathname;
 
   if (path === '/grant' && request.method === 'GET') return grantPage(url);
@@ -192,7 +196,9 @@ export async function readGrantApiRoute(request: Request, url: URL, env: Env): P
   const token = `agsr_${randomToken()}`;
   const grantId = randomToken(16);
   const expiresAt = now + row.ttl_seconds * 1000;
-  await env.DB.prepare('DELETE FROM read_grants WHERE expires_at <= ?1').bind(now).run();
+  // Retention window: expired rows (revoked or not) stay queryable for 30 days as the
+  // audit trail of passkey-approved egress, then age out.
+  await env.DB.prepare('DELETE FROM read_grants WHERE expires_at <= ?1').bind(now - GRANT_RETENTION_MS).run();
   await env.DB.prepare(
     'INSERT INTO read_grants (grant_id, token_hash, label, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)',
   ).bind(grantId, await grantTokenHash(token), row.label, now, expiresAt).run();
@@ -206,13 +212,17 @@ export async function grantIdentity(request: Request, env: Env): Promise<GrantId
   if (!match) return null;
   const now = Date.now();
   const row = await env.DB.prepare(
-    'SELECT grant_id, label, expires_at FROM read_grants WHERE token_hash = ?1 AND revoked_at IS NULL AND expires_at > ?2',
-  ).bind(await grantTokenHash(match[1]!), now).first<{ grant_id: string; label: string; expires_at: number }>();
+    'SELECT grant_id, label, expires_at, last_used_at FROM read_grants WHERE token_hash = ?1 AND revoked_at IS NULL AND expires_at > ?2',
+  ).bind(await grantTokenHash(match[1]!), now)
+    .first<{ grant_id: string; label: string; expires_at: number; last_used_at: number | null }>();
   if (!row) return null;
-  // Throttled liveness stamp: at most one write per grant per interval, so reads stay cheap.
-  await env.DB.prepare(
-    'UPDATE read_grants SET last_used_at = ?2 WHERE grant_id = ?1 AND (last_used_at IS NULL OR last_used_at < ?3)',
-  ).bind(row.grant_id, now, now - LAST_USED_WRITE_INTERVAL_MS).run();
+  // Throttled liveness stamp: at most one write per grant per interval, and no write at all
+  // when the stamp is already fresh — reads stay a single D1 round trip in the common case.
+  if (row.last_used_at === null || row.last_used_at < now - LAST_USED_WRITE_INTERVAL_MS) {
+    await env.DB.prepare(
+      'UPDATE read_grants SET last_used_at = ?2 WHERE grant_id = ?1 AND (last_used_at IS NULL OR last_used_at < ?3)',
+    ).bind(row.grant_id, now, now - LAST_USED_WRITE_INTERVAL_MS).run();
+  }
   return { kind: 'grant', grantId: row.grant_id, label: row.label, expiresAt: row.expires_at };
 }
 
