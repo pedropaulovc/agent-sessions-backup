@@ -8,6 +8,8 @@ import {
   type Role,
 } from '../normalize';
 
+const CODEX_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * Codex rollout JSONL parser.
  *
@@ -177,8 +179,50 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         const git = isObj(payload.git) ? payload.git : undefined;
         session.repoUrl ??= str(git?.repository_url);
         session.gitBranch ??= str(git?.branch);
+        // Codex stores a forked rollout in its own file/UUID while retaining the root
+        // thread in session_id. Keep the filename UUID as this session's identity so the
+        // child transcript remains addressable, but link it to the root for the viewer's
+        // existing subagent filtering and parent banner.
+        // `forked_from_id` also appears on ordinary interactive `codex fork` rollouts. Only
+        // Codex's explicit subagent provenance makes the relationship a sidechain.
+        //
+        // A fork rollout replays the ROOT thread's session_meta after its own, so this case
+        // runs twice with two different identities. Only the record describing THIS file may
+        // touch the fork fields — otherwise the inherited copy (`thread_source: 'user'`)
+        // clears the link the child's own meta just established. A meta without `id` is
+        // pre-fork-era Codex and still falls through to the clear below.
+        const metaSessionId = codexSessionId(payload.id);
+        if (metaSessionId && metaSessionId !== session.id.toLowerCase()) break;
+        const threadSource = str(payload.thread_source);
+        if (threadSource !== 'subagent') {
+          // Absent provenance is not evidence of "no parent". Leaving parentSessionLink unset
+          // means 'unknown' downstream, which COALESCEs the stored parent instead of clearing
+          // it — so reparsing a linked rollout whose metadata predates thread_source keeps the
+          // session grouped. Only an EXPLICIT non-subagent thread_source is a real unlink, which
+          // is the interactive `codex fork` reindex case.
+          if (threadSource !== undefined) {
+            session.parentSessionId = undefined;
+            session.parentSessionLink = 'none';
+            session.isSidechain = false;
+          }
+          break;
+        }
+        const parentSessionId =
+          codexSessionId(payload.forked_from_id) ??
+          codexSessionId(payload.parent_thread_id) ??
+          codexSessionId(payload.session_id);
+        if (parentSessionId && parentSessionId !== session.id) {
+          session.parentSessionId = parentSessionId;
+          session.parentSessionLink = 'linked';
+          session.isSidechain = true;
+        } else {
+          session.parentSessionId = undefined;
+          session.parentSessionLink = 'none';
+          session.isSidechain = false;
+        }
         break;
       }
+
       case 'turn_context': {
         const model = str(payload.model);
         if (model) {
@@ -364,6 +408,10 @@ function isObj(v: unknown): v is Record<string, unknown> {
 }
 function str(v: unknown): string | undefined {
   return typeof v === 'string' && v.length > 0 ? v : undefined;
+}
+function codexSessionId(v: unknown): string | undefined {
+  const id = str(v);
+  return id && CODEX_SESSION_ID_RE.test(id) ? id.toLowerCase() : undefined;
 }
 function num(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined;

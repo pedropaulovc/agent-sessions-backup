@@ -2161,7 +2161,13 @@ async function writeSession(
              git_branch = excluded.git_branch, models = excluded.models, primary_model = excluded.primary_model,
              first_interaction_title = excluded.first_interaction_title,
              title = COALESCE(excluded.title, sessions.title), started_at = excluded.started_at, ended_at = excluded.ended_at,
-             parent_session_id = COALESCE(excluded.parent_session_id, sessions.parent_session_id),
+             parent_session_id = CASE ?25
+               WHEN 'none' THEN NULL
+               WHEN 'linked' THEN excluded.parent_session_id
+               ELSE COALESCE(excluded.parent_session_id, sessions.parent_session_id)
+             END,
+             -- 'none' is an explicit parser result; 'unknown' preserves metadata from another source.
+             -- A linked parser result supplies the current parent directly.
              -- excluded wins when non-null: a transcript reparse reads the CURRENT sibling meta live
              -- (readSiblingMeta above), so a corrected .meta.json shows up here as a fresh, non-null
              -- excluded.parent_tool_use_id and must overwrite the stale stored value. Only fall back
@@ -2199,6 +2205,7 @@ async function writeSession(
           totals.reasoning,
           totals.cached,
           firstInteractionTitle,
+          s.parentSessionLink ?? 'unknown',
         ),
       ...starReconciliation,
     ]);
