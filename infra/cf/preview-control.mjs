@@ -11,6 +11,7 @@ import {
   assertNoProductionIdentifiers,
   assertPreviewAccount,
   assertTrustedWorkflowRef,
+  deleteInDependencyPasses,
   emptyR2Bucket,
   fail,
   fileRecord,
@@ -693,8 +694,7 @@ async function closePreview() {
   // Also sweep any retired per-generation debris this PR left behind.
   const legacy = (await listOwnedResources()).filter((item) => item.pr === pr && item.legacy);
   legacy.sort((a, b) => CLEANUP_ORDER[a.kind] - CLEANUP_ORDER[b.kind]);
-  for (const item of legacy) {
-    await deleteOwnedResource(item);
+  for (const item of await deleteInDependencyPasses(legacy, deleteOwnedResource)) {
     deleted.push({ kind: item.kind, name: item.name, pr });
   }
   process.stdout.write(`${stableJson({ closed: pr, deleted })}\n`);
@@ -732,8 +732,7 @@ async function janitor() {
   deletable.sort((a, b) =>
     a.pr - b.pr || CLEANUP_ORDER[a.kind] - CLEANUP_ORDER[b.kind]);
   const deleted = [];
-  for (const item of deletable) {
-    await deleteOwnedResource(item);
+  for (const item of await deleteInDependencyPasses(deletable, deleteOwnedResource)) {
     deleted.push({ kind: item.kind, name: item.name, pr: item.pr, legacy: item.legacy });
   }
   process.stdout.write(`${stableJson({ closedPrs: [...closedPrs].sort((a, b) => a - b), deleted })}\n`);

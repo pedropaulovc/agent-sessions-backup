@@ -10,6 +10,7 @@ import {
   assertPreviewAccount,
   assertTrustedWorkflowRef,
   assertWorkerModulePayload,
+  deleteInDependencyPasses,
   emptyR2Bucket,
   generatedBuildConfig,
   generatedPrivateAppConfig,
@@ -262,6 +263,44 @@ describe('queue consumer detachment', () => {
     expect(() => queueConsumerIdsForQueue([
       { consumer_id: 'c4', script_name: 'sessions-hub' },
     ], 'pr-42-parse')).toThrow(/foreign queue consumer/);
+  });
+});
+
+describe('dependency-tolerant resource deletion', () => {
+  it('retries a service-bound worker after the worker referencing it is gone', async () => {
+    // Legacy generations deploy edge→app pairs: the edge binds the app, so deleting the
+    // app first fails with Cloudflare 10142 until the edge is removed.
+    const alive = new Set(['pr-127-edge', 'pr-127-app', 'pr-127-d1']);
+    const attempts = [];
+    const deleted = await deleteInDependencyPasses(
+      [{ name: 'pr-127-app' }, { name: 'pr-127-d1' }, { name: 'pr-127-edge' }],
+      async ({ name }) => {
+        attempts.push(name);
+        if (name === 'pr-127-app' && alive.has('pr-127-edge')) {
+          throw new Error('10142: still referenced by service bindings');
+        }
+        alive.delete(name);
+      },
+    );
+    expect(alive.size).toBe(0);
+    expect(deleted.map((item) => item.name)).toEqual(['pr-127-d1', 'pr-127-edge', 'pr-127-app']);
+    expect(attempts).toEqual(['pr-127-app', 'pr-127-d1', 'pr-127-edge', 'pr-127-app']);
+  });
+
+  it('fails loud with the first error once a full pass makes no progress', async () => {
+    await expect(deleteInDependencyPasses(
+      [{ name: 'stuck-a' }, { name: 'stuck-b' }],
+      async ({ name }) => { throw new Error(`cannot delete ${name}`); },
+    )).rejects.toThrow(/cannot delete stuck-a/);
+  });
+
+  it('deletes an unconstrained set in one pass and returns every item', async () => {
+    const deleted = await deleteInDependencyPasses(
+      [{ name: 'a' }, { name: 'b' }],
+      async () => {},
+    );
+    expect(deleted.map((item) => item.name)).toEqual(['a', 'b']);
+    expect(await deleteInDependencyPasses([], async () => { throw new Error('never'); })).toEqual([]);
   });
 });
 
