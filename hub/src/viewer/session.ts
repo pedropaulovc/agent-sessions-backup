@@ -601,12 +601,13 @@ function renderHeader(
   const filesLink = file
     ? `<a href="${esc(r2SessionUrl(meta.harness, file.r2_key, env.R2_DASHBOARD_BASE_URL))}" target="_blank" rel="noopener noreferrer">Session files in R2</a>`
     : '';
+  const exportLink = `<a href="/s/${q(meta.session_id)}/export.zip" download>Export zip</a>`;
 
   return (
     banners.join('') +
     `<div class="sesshead"><h2 style="margin:0">${esc(displayTitle)}</h2>` +
     `<div class="kv">${kv.join('')}</div>` +
-    `<div class="kv">${tokens} · ${viewToggle}${filesLink ? ` · ${filesLink}` : ''}</div></div>`
+    `<div class="kv">${tokens} · ${viewToggle}${filesLink ? ` · ${filesLink}` : ''} · ${exportLink}</div></div>`
   );
 }
 
