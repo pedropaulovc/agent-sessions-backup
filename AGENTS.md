@@ -12,6 +12,12 @@
 
 ## Cloudflare least privilege
 
+- Two identity/account pairs exist, and every Cloudflare operation belongs to exactly one
+  (full table + rules: `infra/cf/deploy.md`, "Identities and accounts"):
+  `pedro@vza.net` → production `18ef3246…` (owner-at-keyboard and protected `main`-only CI
+  ONLY — agents never authenticate there), and `pedro@vezza.com.br` → non-production
+  `cbb04a26…` (per-PR previews; the only account an agent may ever log into, and only under
+  the conditions below).
 - Preview browser access and the production-session bridge do not use Wrangler. Remote control-plane login is not part of the development or test flow.
 - Only when exceptional preview administration is explicitly authorized, use the non-production-only identity and the exact OAuth scopes `account:read user:read workers:write workers_kv:write workers_scripts:write d1:write queues:write`. Run `npx wrangler login --use-keyring --scopes account:read user:read workers:write workers_kv:write workers_scripts:write d1:write queues:write`; never run an unscoped login. OS keyring storage (Windows Credential Manager or Linux libsecret) is required, and the selected identity/account must have no production membership or resources.
 - PR code and untrusted PR CI never receive Cloudflare credentials. The protected trusted smoke job receives a preview-host-only Access service token in addition to one-use route grants; candidate code receives neither. Preview administration belongs to protected default-branch control workflows; production deployment remains protected and `main`-only.
