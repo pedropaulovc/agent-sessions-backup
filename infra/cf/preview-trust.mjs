@@ -476,3 +476,31 @@ export function queueConsumerIdsForQueue(consumers, queueName) {
     return required(consumer.consumer_id, 'queue consumer id');
   });
 }
+
+/**
+ * Delete `items` via `deleteOne`, tolerating dependency ordering: legacy generations
+ * deployed edge→app service-binding pairs, and Cloudflare refuses to delete a Worker
+ * that another Worker still binds (error 10142). Each pass retries what the previous
+ * pass could not delete — removing the edge frees its app for the next pass — and the
+ * sweep fails loud with the first error the moment a full pass makes no progress.
+ */
+export async function deleteInDependencyPasses(items, deleteOne) {
+  const deleted = [];
+  let remaining = [...items];
+  while (remaining.length > 0) {
+    const failed = [];
+    let firstError = null;
+    for (const item of remaining) {
+      try {
+        await deleteOne(item);
+        deleted.push(item);
+      } catch (error) {
+        failed.push(item);
+        firstError ??= error;
+      }
+    }
+    if (failed.length === remaining.length) throw firstError;
+    remaining = failed;
+  }
+  return deleted;
+}
