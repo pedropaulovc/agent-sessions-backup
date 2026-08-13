@@ -5,6 +5,7 @@ import { previewHumanIdentity } from '../auth/identity';
 import { debugBrowserRoute } from '../api/debug-exchange';
 import { assetEndpoint } from './assets';
 import { blobEndpoint } from './blob';
+import { exportZipEndpoint } from './export';
 import { machinesPage } from './machines';
 import { searchPage } from './search';
 import { statsPage } from './stats';
@@ -82,6 +83,8 @@ function handle(url: URL, env: Env): Promise<Response> {
 
   const blob = path.match(/^\/s\/([^/]+)\/blob\/([^/]+)$/);
   if (blob) return blobEndpoint(decodeURIComponent(blob[1]!), decodeURIComponent(blob[2]!), url, env);
+  const exportZip = path.match(/^\/s\/([^/]+)\/export\.zip$/);
+  if (exportZip) return exportZipEndpoint(decodeURIComponent(exportZip[1]!), env);
   const session = path.match(/^\/s\/([^/]+)\/?$/);
   if (session) return sessionPage(decodeURIComponent(session[1]!), url, env);
 
