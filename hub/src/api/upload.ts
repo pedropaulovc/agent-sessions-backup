@@ -40,9 +40,15 @@ export function displacedKey(r2Key: string, oldSha256: string): string {
  * rather than proceeding to destroy bytes that weren't preserved.
  */
 export async function preserveDisplacedObject(env: Env, r2Key: string, oldSha256: string): Promise<string | null> {
+  const prevKey = displacedKey(r2Key, oldSha256);
+  // WRITE-ONCE: if this predecessor was already preserved, never copy again. A crash between a
+  // rewrite's canonical put and its D1 upsert leaves the row on the OLD hash while canonical holds
+  // the NEW bytes — the collector's retry re-fails the prefix check and re-preserves, and an
+  // unconditional copy would clobber the real predecessor with the new bytes it displaced. The
+  // first preservation always wins; raw-prev/ is itself append-only.
+  if (await env.RAW.head(prevKey)) return prevKey;
   const old = await env.RAW.get(r2Key);
   if (!old) return null;
-  const prevKey = displacedKey(r2Key, oldSha256);
   const { readable, writable } = new FixedLengthStream(old.size);
   const pump = old.body.pipeTo(writable);
   await Promise.all([

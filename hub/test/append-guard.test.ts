@@ -88,6 +88,26 @@ describe('append-only upload guard (simple PUT)', () => {
     expect((await listPrevKeys(machine)).length).toBe(2);
   });
 
+  it('a crash-retry cannot clobber the preserved predecessor (write-once quarantine)', async () => {
+    // A rewrite that preserved + replaced canonical but DIED before its D1 upsert leaves the row
+    // on the OLD hash while canonical already holds the NEW bytes. The collector's retry re-fails
+    // the prefix check and re-preserves — which must NOT copy the new bytes over the real
+    // predecessor. Seed that end-state directly (same idiom as the convergence-race tests).
+    const machine = `guard-retry-${crypto.randomUUID().slice(0, 8)}`;
+    const relpath = 'conversations/conv-crash.json';
+    const v1 = enc('{"v":"old"}');
+    const v2 = enc('{"v":"new-rewrite"}');
+    const v1Sha = await sha256Hex(v1);
+    expect((await putSimple(machine, 'chatgpt-web', relpath, v1)).status).toBe(201);
+    // Crash window: predecessor already preserved, canonical already replaced, row still on v1.
+    const key = `raw/${machine}/chatgpt-web/${relpath}`;
+    await testEnv.RAW.put(displacedKey(key, v1Sha), v1);
+    await testEnv.RAW.put(key, v2, { sha256: await sha256Hex(v2) });
+    // Retry of the same rewrite: still accepted, and the preserved copy still holds the OLD bytes.
+    expect((await putSimple(machine, 'chatgpt-web', relpath, v2)).status).toBe(201);
+    expect(await prevObjectText(machine, 'chatgpt-web', relpath, v1Sha)).toBe('{"v":"old"}');
+  });
+
   it('a same-hash resync never touches raw-prev/', async () => {
     const machine = `guard-samehash-${crypto.randomUUID().slice(0, 8)}`;
     const relpath = 'projects/x/session3.jsonl';

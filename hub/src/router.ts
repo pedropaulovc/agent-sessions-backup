@@ -133,8 +133,10 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
   // (/machines, /status, /usage) stay cert-readable for unattended fleet monitoring. Development
   // keeps cert/dev reads for the local loop and this repo's tests; preview's deploy smoke reads
   // synthetic seeds back through the candidate identity, and prod bytes only ever reach preview
-  // via the passkey-gated debug exchange — so both are exempt.
-  if (env.ENVIRONMENT === 'production' && (path === '/api/v1/search' || path === '/api/v1/sessions' || path.startsWith('/api/v1/sessions/'))) {
+  // via the passkey-gated debug exchange — so both are exempt. Deny-unless-known-exempt: an
+  // unrecognized/missing ENVIRONMENT severs, matching machineIdentity's fail-closed philosophy.
+  const certReadsExempt = env.ENVIRONMENT === 'development' || env.ENVIRONMENT === 'preview';
+  if (!certReadsExempt && (path === '/api/v1/search' || path === '/api/v1/sessions' || path.startsWith('/api/v1/sessions/'))) {
     return Response.json({ error: 'passkey_grant_required' }, { status: 403 });
   }
 

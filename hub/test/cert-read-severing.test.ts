@@ -83,6 +83,16 @@ describe('production machine certs cannot read session content', () => {
     expect(response.status).toBe(200);
   });
 
+  it('an unrecognized ENVIRONMENT severs too (deny-unless-known-exempt)', async () => {
+    const fp = hexfp('sever-staging');
+    await seedMachine('sever-staging', fp);
+    const stagingEnv = { ...testEnv, ENVIRONMENT: 'staging' as Env['ENVIRONMENT'] } as Env;
+    // machineIdentity itself fails closed on an unknown ENVIRONMENT, so this lands in the 401
+    // branch — the point is that no unknown value can fall into a cert-readable path.
+    const response = await route(certReq('/api/v1/sessions', fp), stagingEnv, ctx);
+    expect([401, 403]).toContain(response.status);
+  });
+
   it('development keeps machine reads for the local loop', async () => {
     const response = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions', {
       headers: { 'x-dev-machine': 'dev-reader' },
