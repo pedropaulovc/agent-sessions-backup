@@ -13,7 +13,6 @@ import { bootstrap } from './api/bootstrap';
 import { probeClientCert, renewCert } from './api/certs';
 import { search } from './api/search';
 import { getSession, getSessionRaw, listSessions } from './api/sessions';
-import { debugApiRoute } from './api/debug-exchange';
 import { viewerRoute } from './viewer/router';
 
 /** decodeURIComponent that returns null instead of throwing on a malformed %-sequence, so a bad
@@ -68,12 +67,6 @@ export async function route(request: Request, env: Env, _ctx: ExecutionContext):
 
 
 async function apiRoute(request: Request, url: URL, env: Env): Promise<Response> {
-
-  // Production debug exchange capabilities and signed destination assertions authenticate
-  // themselves. Dispatch exact handlers before the machine API gate; they never mint a viewer,
-  // search, or production machine bearer.
-  const debug = await debugApiRoute(request, url, env);
-  if (debug) return debug;
 
   if (url.pathname === '/api/v1/preview/diagnostics') return previewDiagnostics(request, env);
 

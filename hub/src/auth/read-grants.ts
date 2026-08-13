@@ -22,7 +22,7 @@
 import type { AuthenticationResponseJSON } from '@simplewebauthn/server';
 import { freshAuthenticationOptions, verifyFreshAuthentication, type WebAuthnDeps } from './webauthn';
 import { originOk, readSession } from './session';
-import { canonicalDebugJson } from '../api/debug-exchange';
+import { canonicalJson } from './canonical-json';
 import { esc } from '../viewer/layout';
 
 const PKCE_RE = /^[A-Za-z0-9_-]{43}$/;
@@ -109,7 +109,7 @@ function validGrantParams(value: Record<string, unknown>): GrantParams | null {
 
 /** The exact server-side state the fresh passkey assertion approves — everything the page shows. */
 async function bindingHash(params: GrantParams): Promise<string> {
-  return sha256Hex(canonicalDebugJson({
+  return sha256Hex(canonicalJson({
     challenge: params.challenge,
     callback: params.callback.toString(),
     label: params.label,

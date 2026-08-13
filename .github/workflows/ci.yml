@@ -90,27 +90,6 @@ jobs:
             hub/test-results/
             hub/playwright-report/
 
-  sessions-dev-bridge:
-    name: Sessions dev bridge (native Linux)
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    defaults:
-      run:
-        working-directory: sessions-dev-bridge
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22.22.2
-          cache: npm
-          cache-dependency-path: sessions-dev-bridge/package-lock.json
-      - run: bash -n ../scripts/install-sessions-dev-bridge-wsl.sh
-      - run: npm ci --ignore-scripts
-      - run: npm test
-
   collector:
     runs-on: ubuntu-latest
     defaults:

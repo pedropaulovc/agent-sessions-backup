@@ -168,9 +168,9 @@ export async function freshAuthenticationOptions(
     })),
   });
   const now = Date.now();
-  await env.DB.prepare('DELETE FROM debug_export_passkey_challenges WHERE expires_at <= ?1').bind(now).run();
+  await env.DB.prepare('DELETE FROM passkey_freshness_challenges WHERE expires_at <= ?1').bind(now).run();
   await env.DB.prepare(
-    `INSERT INTO debug_export_passkey_challenges
+    `INSERT INTO passkey_freshness_challenges
        (challenge, purpose, binding_hash, created_at, expires_at)
      VALUES (?1, ?2, ?3, ?4, ?5)`,
   )
@@ -201,7 +201,7 @@ export async function verifyFreshAuthentication(
     return { verified: false, error: 'bad_request', status: 400 };
   }
   const consumed = await env.DB.prepare(
-    `DELETE FROM debug_export_passkey_challenges
+    `DELETE FROM passkey_freshness_challenges
       WHERE challenge = ?1 AND purpose = ?2 AND binding_hash = ?3 AND expires_at > ?4
       RETURNING challenge`,
   )
@@ -554,26 +554,6 @@ async function settingsPage(request: Request, env: Env): Promise<Response> {
   const session = await readSession(request, env);
   if (!session) return new Response(null, { status: 302, headers: { location: '/login' } });
   const count = await countCredentials(env);
-  const debugDevices = await env.DB.prepare(
-    `SELECT device_id,label,release_digest,key_protection,expires_at
-       FROM debug_export_devices
-      WHERE user_id = ?1 AND revoked_at IS NULL
-      ORDER BY enrolled_at DESC`,
-  ).bind(session.user).all<{
-    device_id: string;
-    label: string;
-    release_digest: string;
-    key_protection: string;
-    expires_at: number;
-  }>();
-  const deviceRows = debugDevices.results.length === 0
-    ? '<p>No debug bridge devices enrolled.</p>'
-    : `<ul>${debugDevices.results.map((device) =>
-      `<li><strong>${esc(device.label)}</strong> ` +
-      `<span class="muted">${esc(device.key_protection)} · ${esc(device.release_digest.slice(0, 12))} · ` +
-      `expires ${esc(new Date(device.expires_at).toISOString())}</span> ` +
-      `<button class="revoke-debug" data-device="${esc(device.device_id)}">Revoke</button></li>`,
-    ).join('')}</ul>`;
   const readGrants = await env.DB.prepare(
     `SELECT grant_id, label, expires_at, last_used_at
        FROM read_grants
@@ -593,7 +573,6 @@ async function settingsPage(request: Request, env: Env): Promise<Response> {
     `<h1>Settings</h1>` +
     `<p>${count} passkey${count === 1 ? '' : 's'} registered for the owner.</p>` +
     `<button id="add">Add this device as a passkey</button>` +
-    `<h2>Production debug bridge devices</h2>${deviceRows}` +
     `<h2>Read grants</h2>${grantRows}` +
     `<div id="msg" class="msg"></div>` +
     `<form method="post" action="/logout" style="margin-top:16px"><button type="submit" style="background:transparent;color:var(--fg)">Sign out</button></form>` +
@@ -610,15 +589,6 @@ async function settingsPage(request: Request, env: Env): Promise<Response> {
     `var v=await fetch('/webauthn/register/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(serializeReg(cred))});` +
     `var r=await v.json();if(r.verified){say('Passkey added.');btn.disabled=false;}else{say('Verification failed.',1);btn.disabled=false;}` +
     `}catch(e){say(String(e&&e.message||e),1);btn.disabled=false;}});` +
-    `document.querySelectorAll('.revoke-debug').forEach(function(btn){btn.addEventListener('click',async function(){` +
-    `var id=this.dataset.device;this.disabled=true;say('Requesting fresh passkey confirmation…');try{` +
-    `var o=await fetch('/debug/devices/'+encodeURIComponent(id)+'/revoke/options',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});` +
-    `var opt=await o.json();if(!o.ok)throw new Error(opt.error||'Not allowed');opt.challenge=b64uToBuf(opt.challenge);` +
-    `if(opt.allowCredentials)opt.allowCredentials=opt.allowCredentials.map(function(c){c.id=b64uToBuf(c.id);return c;});` +
-    `var cred=await navigator.credentials.get({publicKey:opt});` +
-    `var v=await fetch('/debug/devices/'+encodeURIComponent(id)+'/revoke/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({response:serializeAuth(cred)})});` +
-    `var r=await v.json();if(!v.ok||!r.revoked)throw new Error(r.error||'Revocation failed');this.closest('li').remove();say('Debug bridge device revoked.');` +
-    `}catch(e){say(String(e&&e.message||e),1);this.disabled=false;}});});` +
     `document.querySelectorAll('.revoke-grant').forEach(function(btn){btn.addEventListener('click',async function(){` +
     `var id=this.dataset.grant;this.disabled=true;try{` +
     `var r=await fetch('/grants/'+encodeURIComponent(id)+'/revoke',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});` +
