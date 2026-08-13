@@ -24,6 +24,7 @@
     { "sequence": 19, "filename": "0019_usage_cost_by_class.sql", "sha256": "02e829e28dd82c0a82950795a5ff809be0095863f5d3e3b07ea451c72b88da8e" },
     { "sequence": 20, "filename": "0020_priced_version_not_null.sql", "sha256": "c4aca0781783a3a52403811d1e0a61f368a5aa28b7c6ff50d96895d9ee708122" },
     { "sequence": 21, "filename": "0021_migration_checksum_ledger.sql", "sha256": "36aae897c4cdb4b64c90710f0506cf49b7ff17f01c9b7e54842b6d6ffbf4b7aa" },
-    { "sequence": 22, "filename": "0022_debug_session_exchange.sql", "sha256": "6d42a5ab2f8e2e231e83fd8a897e373fc867208634d00b06506c3689be8f8a42" }
+    { "sequence": 22, "filename": "0022_debug_session_exchange.sql", "sha256": "6d42a5ab2f8e2e231e83fd8a897e373fc867208634d00b06506c3689be8f8a42" },
+    { "sequence": 23, "filename": "0023_read_grants.sql", "sha256": "904e38ad76ffe453d0499440e92ab553f7d84f4ecd65eed70a5bae818d912678" }
   ]
 }
