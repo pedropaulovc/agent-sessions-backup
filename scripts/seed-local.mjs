@@ -19,8 +19,9 @@ Options:
   --concurrency <count>       Concurrent requests, 1-32 (default: 6)
   -h, --help                  Show this help
 
-Non-loopback destinations are intentionally rejected. Use the standalone sessions-dev-bridge
-for a consented production-session copy; never put production authorization in this checkout.
+Non-loopback destinations are intentionally rejected. For a consented production-session
+copy into a preview, use the viewer's "Export zip" button plus
+hub/scripts/preview-upload-session.mjs; never put production authorization in this checkout.
 `;
 
 function parseArguments(argv) {

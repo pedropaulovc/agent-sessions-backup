@@ -2,7 +2,6 @@ import { originOk, readSession } from '../auth/session';
 import { webauthnRoute } from '../auth/webauthn';
 import { readGrantBrowserRoute } from '../auth/read-grants';
 import { previewBearerTokenOk, previewHumanIdentity, PREVIEW_SESSION_COOKIE } from '../auth/identity';
-import { debugBrowserRoute } from '../api/debug-exchange';
 import { assetEndpoint } from './assets';
 import { blobEndpoint } from './blob';
 import { exportZipEndpoint } from './export';
@@ -54,9 +53,6 @@ export async function viewerRoute(request: Request, url: URL, env: Env): Promise
     }
     return new Response(null, { status: 302, headers: { location: '/login' } });
   }
-
-  const debug = await debugBrowserRoute(request, url, env);
-  if (debug) return debug;
 
   let res: Response;
   if (request.method === 'GET') {

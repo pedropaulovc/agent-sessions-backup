@@ -26,16 +26,6 @@ interface Env {
   ASSET_SIGNING_SECRET?: string;
   /** Production-only HMAC key for authenticated viewer-session envelopes. Never bind in preview. */
   PRODUCTION_SESSION_SIGNING_KEY?: string;
-  /** Comma-separated protected bridge release digests accepted for local destination attestations. */
-  DEBUG_EXPORT_APPROVED_RELEASE_DIGESTS?: string;
-  /** Public JWK for independently signed remote/front-door destination attestations. */
-  DEBUG_EXPORT_REMOTE_ATTESTATION_PUBLIC_JWK?: string;
-  /** Production ES256 private JWK. Its public half is pinned into protected bridge releases. */
-  DEBUG_EXPORT_MANIFEST_SIGNING_PRIVATE_JWK?: string;
-  /** Public half of the production manifest signer, used by destination import validation. */
-  DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK?: string;
-  /** Public JWK for one-use import assertions minted by the trusted destination/front door. */
-  DEBUG_IMPORT_ASSERTION_PUBLIC_JWK?: string;
   SETUP_TOKEN?: string;
   // Cloudflare's managed client-certificate lifecycle is authorized through a private
   // OAuth client. The singleton Durable Object owns the grant and never returns bearer
@@ -47,14 +37,7 @@ interface Env {
   CF_OAUTH_BROKER?: DurableObjectNamespace;
 }
 
-/** Debug maintenance shares the physical queue binding, but worker.queue runs at most one debug
- * job and freshly re-enqueues every other message before returning from that invocation. */
-interface DebugExchangeMessage {
-  debug: 'export-snapshot' | 'import-promote';
-  job_id: string;
-}
-
-type HubQueueMessage = ParseMessage | DebugExchangeMessage;
+type HubQueueMessage = ParseMessage;
 
 interface ParseMessage {
   file_id: number;
