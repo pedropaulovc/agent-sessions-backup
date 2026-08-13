@@ -49,6 +49,15 @@ export async function preserveDisplacedObject(env: Env, r2Key: string, oldSha256
   if (await env.RAW.head(prevKey)) return prevKey;
   const old = await env.RAW.get(r2Key);
   if (!old) return null;
+  // CHECKSUM-GUARDED: only bytes that actually ARE the predecessor go under its key. Two
+  // concurrent rewrites for one path can both pass the head() above, and the slower one can
+  // read the canonical key AFTER the faster one already replaced it — copying the REPLACEMENT
+  // bytes under oldSha256's name. R2's native checksums.sha256 (stamped by every put through
+  // this API) identifies what we actually read, and an R2 get is a consistent snapshot, so
+  // this check can't be raced: mismatch → the predecessor is already gone from the canonical
+  // key (the writer that displaced it ran this same guard first), skip rather than mislabel.
+  // A legacy object without a native checksum is unattestable and is likewise skipped.
+  if (objectSha256(old) !== oldSha256) return null;
   const { readable, writable } = new FixedLengthStream(old.size);
   const pump = old.body.pipeTo(writable);
   await Promise.all([

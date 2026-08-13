@@ -34,6 +34,14 @@ authenticate:
    read allow-list (`/sessions` list/get/raw, `/search`, `/usage`, `/machines`, `/status`)
    — never uploads, bootstrap, cert, or admin routes. Default TTL 4 h, max 24 h; active
    grants are listed and revocable on the viewer's `/settings` page.
+
+   Run the auth CLI from a **trusted checkout** (`main`, or your own reviewed branch) —
+   the CLI handles the minted token, so an untrusted PR branch's copy could leak it. This
+   is a deliberately lighter bar than the signed `sessions-dev-bridge` (which stays the
+   ONLY authorization client for prod→preview session export): a read grant is short-lived,
+   read-only, revocable at `/settings`, and every mint requires the owner's fresh passkey
+   on a page that displays the label/TTL being approved — it cannot move or mutate prod
+   bytes.
 2. **mTLS (ingest + fleet aggregates — collectors).** Present a machine's client cert+key
    on every request. Any enrolled machine's paths are in
    `~/.config/agent-collector/config.toml` (`client_cert_path` / `client_key_path`), e.g.:

@@ -108,6 +108,27 @@ describe('append-only upload guard (simple PUT)', () => {
     expect(await prevObjectText(machine, 'chatgpt-web', relpath, v1Sha)).toBe('{"v":"old"}');
   });
 
+  it('never stores replacement bytes under the predecessor key (concurrent-rewrite loser)', async () => {
+    // Two concurrent rewrites can both pass the write-once head check; the slower one then
+    // reads the canonical key AFTER the faster one replaced it. Seed that end-state (row
+    // still on v1's hash, canonical already holding the peer's bytes, quarantine empty):
+    // the loser's preservation must SKIP — peer bytes must never be labeled with v1's sha.
+    const machine = `guard-race-${crypto.randomUUID().slice(0, 8)}`;
+    const relpath = 'conversations/conv-race.json';
+    const v1 = enc('{"v":"original"}');
+    const peer = enc('{"v":"peer-replacement"}');
+    const mine = enc('{"v":"my-rewrite"}');
+    const v1Sha = await sha256Hex(v1);
+    expect((await putSimple(machine, 'chatgpt-web', relpath, v1)).status).toBe(201);
+    const key = `raw/${machine}/chatgpt-web/${relpath}`;
+    await testEnv.RAW.put(key, peer, { sha256: await sha256Hex(peer) }); // peer replaced canonical; row still v1
+    expect((await putSimple(machine, 'chatgpt-web', relpath, mine)).status).toBe(201);
+    expect(await prevObjectText(machine, 'chatgpt-web', relpath, v1Sha)).toBeNull();
+    expect(await listPrevKeys(machine)).toEqual([]);
+    const canonical = await testEnv.RAW.get(key);
+    expect(await canonical!.text()).toBe('{"v":"my-rewrite"}');
+  });
+
   it('a same-hash resync never touches raw-prev/', async () => {
     const machine = `guard-samehash-${crypto.randomUUID().slice(0, 8)}`;
     const relpath = 'projects/x/session3.jsonl';

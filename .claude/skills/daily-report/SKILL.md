@@ -20,8 +20,9 @@ machine API. Full endpoint contract, auth modes, and known gaps: `docs/agents-ap
    `~/.config/agent-collector/config.toml` — but in production a machine cert reaches only
    the content-free aggregates, so the session list this report needs REQUIRES a grant.
    Mint one first: `uv run agent-sessions auth` (opens a browser page; the owner approves
-   with a passkey; the token caches for ~4 h). `--out <path>` writes the markdown to a
-   file instead of stdout.
+   with a passkey; the token caches for ~4 h) — run it from a trusted checkout (`main` or a
+   reviewed branch), never an untrusted PR branch; see the auth section of
+   `docs/agents-api.md`. `--out <path>` writes the markdown to a file instead of stdout.
 
 2. **If the CLI isn't available** (no `client/` checkout, or you need a breakdown the built-in
    report doesn't produce), call the API directly per `docs/agents-api.md`. The three calls the
