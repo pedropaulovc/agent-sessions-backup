@@ -72,7 +72,7 @@ export async function exportZipEndpoint(sessionId: string, env: Env): Promise<Re
     const conv = extractConversationById(new Uint8Array(await obj.arrayBuffer()), sessionId);
     if (conv === undefined) return new Response('not found', { status: 404 });
     const narrowed = zipSync({ 'conversations.json': strToU8(`[${conv}]`) }, { mtime: parseDate(canonical.mtime) });
-    const relpath = narrowedRelpath(canonical.relpath, sessionId);
+    const relpath = narrowedRelpath(canonical.relpath, await narrowedSuffix(sessionId));
     entries.push({
       manifest: {
         machine: canonical.machine_id,
@@ -149,12 +149,25 @@ export async function exportZipEndpoint(sessionId: string, env: Env): Promise<Re
   });
 }
 
-/** `export-2026.zip` → `export-2026.<sessionId>.zip` — still an export-archive on re-ingest. */
-function narrowedRelpath(relpath: string, sessionId: string): string {
-  const safe = safeFilenamePart(sessionId);
+/** `export-2026.zip` → `export-2026.<suffix>.zip` — still an export-archive on re-ingest. */
+function narrowedRelpath(relpath: string, suffix: string): string {
   return relpath.toLowerCase().endsWith('.zip')
-    ? `${relpath.slice(0, -'.zip'.length)}.${safe}.zip`
-    : `${relpath}.${safe}.zip`;
+    ? `${relpath.slice(0, -'.zip'.length)}.${suffix}.zip`
+    : `${relpath}.${suffix}.zip`;
+}
+
+/**
+ * Path suffix for a narrowed archive, injective across session ids: sanitization alone maps
+ * distinct ids like `a/b` and `a-b` to the same string, which on re-import would collide on one
+ * collector path and overwrite. When sanitizing loses information, a digest fragment of the exact
+ * id disambiguates.
+ */
+async function narrowedSuffix(sessionId: string): Promise<string> {
+  const safe = safeFilenamePart(sessionId);
+  if (safe === sessionId) return safe;
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sessionId));
+  const hex = [...new Uint8Array(digest, 0, 8)].map((b) => b.toString(16).padStart(2, '0')).join('');
+  return `${safe}-${hex}`;
 }
 
 function safeFilenamePart(value: string): string {
@@ -232,8 +245,10 @@ function streamZip(entries: () => AsyncGenerator<ZipEntrySource>): ReadableStrea
         const { done, value } = await reader.read();
         if (done) break;
         file.push(value, false);
-        // Coarse backpressure: don't let the compressor race unboundedly ahead of the client.
-        await writer.ready;
+        // Backpressure: file.push() only QUEUES compressed output onto the write chain, and
+        // writer.ready can resolve before those writes have run — awaiting the chain itself is
+        // what stops the compressor racing unboundedly ahead of a slow client.
+        await pending;
       }
       file.push(new Uint8Array(0), true);
     }

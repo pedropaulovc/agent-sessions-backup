@@ -157,6 +157,25 @@ describe('viewer session export zip', () => {
     expect(strFromU8(inner['conversations.json']!)).not.toContain('beta must not leak');
   });
 
+  it('keeps narrowed relpaths injective for session ids that sanitize to the same string', async () => {
+    const zip = chatgptExportZip([
+      { id: 'collide/x', title: 'slash', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'slash conversation' }] },
+      { id: 'collide-x', title: 'dash', turns: [{ node: 'n1', parent: 'root-node', role: 'user', text: 'dash conversation' }] },
+    ]);
+    expect((await put('export-inbox', 'hostile-ids.zip', zip)).status).toBe(201);
+    await drainQueue();
+
+    const url = new URL(`https://sessions.vza.net/s/${encodeURIComponent('collide/x')}/export.zip`);
+    const slash = await unzipResponse(await viewerRoute(new Request(url.toString()), url, testEnv));
+    const dash = await unzipResponse(await fetchExport('collide-x'));
+    const slashRelpath = slash.manifest.entries[0]!.relpath;
+    const dashRelpath = dash.manifest.entries[0]!.relpath;
+    expect(slashRelpath).not.toBe(dashRelpath);
+    // The lossless id keeps its plain suffix; the sanitized one carries a digest disambiguator.
+    expect(dashRelpath).toBe('hostile-ids.collide-x.zip');
+    expect(slashRelpath).toMatch(/^hostile-ids\.collide-x-[0-9a-f]{16}\.zip$/);
+  });
+
   it('is gated by viewer auth in production and 404s on unknown sessions', async () => {
     const prodRes = await fetchExport(LONELY, { ENVIRONMENT: 'production' } as Env);
     expect(prodRes.status).toBe(302);
