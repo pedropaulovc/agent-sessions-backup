@@ -365,6 +365,39 @@ describe('codex fork rollouts stay under their root session', () => {
     const html = await recent.text();
     expect(html).toContain(`/s/${ROOT_SESSION_ID}`);
     expect(html).not.toContain(`/s/${CHILD_SESSION_ID}`);
+
+    // Metadata predating `thread_source` says nothing about provenance, so a reparse of it must
+    // preserve the stored link rather than read the absent field as an explicit unlink.
+    const provenanceless = `${[
+      JSON.stringify({
+        timestamp: '2026-08-04T14:48:07.205Z',
+        type: 'session_meta',
+        payload: { session_id: ROOT_SESSION_ID, id: CHILD_SESSION_ID, cwd: '/home/tester/src/meshprobe' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-08-04T14:48:08.000Z',
+        type: 'response_item',
+        payload: {
+          type: 'message',
+          role: 'user',
+          content: [{ type: 'input_text', text: 'legacy subagent task' }],
+          internal_chat_message_metadata_passthrough: { turn_id: `${CHILD_SESSION_ID}-turn` },
+        },
+      }),
+    ].join('\n')}\n`;
+    expect((await putFile('codex-sessions', childPath, provenanceless)).status).toBe(201);
+    await drainQueue();
+
+    const preserved = await testEnv.DB.prepare(
+      'SELECT parent_session_id FROM sessions WHERE session_id = ?1',
+    )
+      .bind(CHILD_SESSION_ID)
+      .first<{ parent_session_id: string | null }>();
+    expect(preserved).toEqual({ parent_session_id: ROOT_SESSION_ID });
+
+    const recentAfterLegacy = await SELF.fetch('https://sessions.vza.net/?harness=codex');
+    expect(await recentAfterLegacy.text()).not.toContain(`/s/${CHILD_SESSION_ID}`);
+
     const reindexedChild = await putFile(
       'codex-sessions',
       childPath,

@@ -193,10 +193,18 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         // pre-fork-era Codex and still falls through to the clear below.
         const metaSessionId = codexSessionId(payload.id);
         if (metaSessionId && metaSessionId !== session.id.toLowerCase()) break;
-        if (str(payload.thread_source) !== 'subagent') {
-          session.parentSessionId = undefined;
-          session.parentSessionLink = 'none';
-          session.isSidechain = false;
+        const threadSource = str(payload.thread_source);
+        if (threadSource !== 'subagent') {
+          // Absent provenance is not evidence of "no parent". Leaving parentSessionLink unset
+          // means 'unknown' downstream, which COALESCEs the stored parent instead of clearing
+          // it — so reparsing a linked rollout whose metadata predates thread_source keeps the
+          // session grouped. Only an EXPLICIT non-subagent thread_source is a real unlink, which
+          // is the interactive `codex fork` reindex case.
+          if (threadSource !== undefined) {
+            session.parentSessionId = undefined;
+            session.parentSessionLink = 'none';
+            session.isSidechain = false;
+          }
           break;
         }
         const parentSessionId =
