@@ -20,13 +20,16 @@ security boundary against a PR when preview code builds from the PR's own checko
 `wrangler.jsonc` (and therefore any database id in it) is PR-controlled, and any check
 placed inside the Worker is likewise PR-controlled and can simply be deleted.
 
-**The only real isolation is a separate Cloudflare account**, where nothing reachable
-from a build can name production at all — and that is what shipped. The 2026-08-01
-decision to defer it was SUPERSEDED on 2026-08-04 (PRs #83–#116): previews now run in a
-dedicated non-production account (`cbb04a26…`, identity pedro@vezza.com.br with no
-production membership), provisioned only by the protected `Preview Control` workflow;
-the Workers Builds previews this note originally described are retired. Current model:
-`infra/cf/deploy.md` ("Identities and accounts").
+**The only real isolation is a separate Cloudflare account** for the preview
+application resources (workers, D1, R2, queues) — and that is what shipped. The
+2026-08-01 decision to defer it was SUPERSEDED on 2026-08-04 (PRs #83–#116): previews
+now run in a dedicated non-production account (`cbb04a26…`, identity
+pedro@vezza.com.br with no production membership), provisioned only by the protected
+`Preview Control` workflow; the Workers Builds previews this note originally described
+are retired. The stable `*-preview.sessions.vza.net` front door itself stays in the
+PRODUCTION account (it owns the zone + Access) — it is trusted protected code, never
+built from a PR checkout. Current model: `infra/cf/deploy.md` ("Identities and
+accounts").
 
 See [[deploy-migrations-gap]] for who deploys what, and [[wrangler-d1-query-gotchas]]
 for the `CLOUDFLARE_ACCOUNT_ID` requirement when running `wrangler d1` against this
