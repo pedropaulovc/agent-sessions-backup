@@ -134,9 +134,17 @@ describe('append-only upload guard (simple PUT)', () => {
     const relpath = 'projects/x/session3.jsonl';
     const v1 = enc('{"line":1}\n');
     expect((await putSimple(machine, 'claude-projects', relpath, v1)).status).toBe(201);
+    // A REAL resync, not just steady-state: the canonical object is gone (lost/corrupt), so
+    // the same-hash path must RESTORE it from the request body — while still never treating
+    // the repair as a displacement (raw-prev/ stays empty).
+    await testEnv.RAW.delete(`raw/${machine}/claude-projects/${relpath}`);
     const resync = await putSimple(machine, 'claude-projects', relpath, v1);
     expect(resync.status).toBe(200);
-    expect((await resync.json<{ status: string }>()).status).toBe('unchanged');
+    const body = await resync.json<{ status: string; restored: boolean }>();
+    expect(body.status).toBe('unchanged');
+    expect(body.restored).toBe(true);
+    const canonical = await testEnv.RAW.get(`raw/${machine}/claude-projects/${relpath}`);
+    expect(await canonical!.text()).toBe('{"line":1}\n');
     expect(await listPrevKeys(machine)).toEqual([]);
   });
 });
