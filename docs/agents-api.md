@@ -14,10 +14,13 @@ this doc.
 
 Production: `https://api.sessions.vza.net`.
 
-Every endpoint under `/api/v1/` — including plain reads like `/sessions` and `/search` —
-requires an authenticated identity (`hub/src/router.ts::apiRoute`). There is no
-unauthenticated or human-cookie path into this API; the viewer's passkey session is a
-completely separate auth path that doesn't apply here. Two ways to authenticate:
+Every protected data endpoint under `/api/v1/` — including plain reads like `/sessions` and
+`/search` — requires an authenticated identity (`hub/src/router.ts::apiRoute`). The one
+exception is `POST /api/v1/grants/exchange`, which authenticates itself: the single-use
+code plus the PKCE verifier that never left the agent's process IS the credential. There is
+no unauthenticated data-read or human-cookie path into this API; the viewer's passkey
+session is a completely separate auth path that doesn't apply here. Two ways to
+authenticate:
 
 1. **Read grant (preferred for agents).** A short-lived read-only bearer the owner mints
    with a passkey touch — the system rule is *machine certs ingest, passkeys egress*: no

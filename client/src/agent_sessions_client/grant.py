@@ -145,18 +145,29 @@ def mint_grant(
 
 
 def save_grant(grant: dict, cache_path: Path | None = None) -> Path:
-    """Persist a minted grant for load_cached_token(); owner-only file mode where supported."""
+    """Persist a minted grant for load_cached_token(); owner-only file mode where supported.
+
+    The token is written to a same-directory temp file created 0o600 (O_EXCL, so an existing
+    symlink at the temp path can't be followed) and atomically renamed into place — a plain
+    write_text + chmod-after would expose the bearer at umask permissions for a window, and
+    would follow a pre-planted symlink at the cache path itself.
+    """
     path = cache_path or default_grant_cache_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({
+    payload = json.dumps({
         "token": grant["token"],
         "expiresAt": grant["expiresAt"],
         "label": grant.get("label"),
-    }))
+    })
+    temporary_path = path.with_name(f".{path.name}.{secrets.token_hex(16)}.tmp")
     try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+        fd = os.open(temporary_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+            fp.write(payload)
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
     return path
 
 

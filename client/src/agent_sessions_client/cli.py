@@ -112,7 +112,13 @@ def _auth(args: argparse.Namespace) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 1
 
-    path = save_grant(grant, Path(args.grant_cache) if args.grant_cache else None)
+    try:
+        path = save_grant(grant, Path(args.grant_cache) if args.grant_cache else None)
+    except OSError as e:
+        # The grant was minted (the owner already approved) but caching it failed — surface
+        # the documented `error: ...` + nonzero exit rather than a traceback.
+        print(f"error: failed to save read grant: {e}", file=sys.stderr)
+        return 1
     expires = datetime_cls.fromtimestamp(grant["expiresAt"] / 1000, tz=timezone.utc)
     print(f"read grant saved to {path} (label {grant.get('label')!r}, expires {expires.isoformat()})", file=sys.stderr)
     if args.print_token:

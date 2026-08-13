@@ -117,6 +117,29 @@ def test_auth_cli_end_to_end(hub, tmp_path, capsys, monkeypatch):
     assert load_cached_token(cache) is not None
 
 
+def test_auth_cli_cache_write_failure_is_a_clean_error(hub, tmp_path, capsys, monkeypatch):
+    # The grant was minted (owner already approved) but caching failed — documented
+    # `error: ...` + exit 1, never a traceback.
+    from agent_sessions_client import cli
+
+    monkeypatch.setattr(cli.webbrowser, "open", _approving_browser("code=abc123"))
+
+    def failing_save(grant, cache_path=None):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli, "save_grant", failing_save)
+    rc = cli.main(["auth", "--hub-url", hub.url, "--ttl", "1h", "--timeout", "10"])
+    assert rc == 1
+    assert "failed to save read grant" in capsys.readouterr().err
+
+
+def test_save_grant_leaves_no_temp_file_behind(tmp_path):
+    path = tmp_path / "grant.json"
+    save_grant({"token": "agsr_x", "expiresAt": (time.time() + 3600) * 1000}, path)
+    assert load_cached_token(path) == "agsr_x"
+    assert [p.name for p in tmp_path.iterdir()] == ["grant.json"]
+
+
 def test_auth_cli_rejects_bad_ttl(capsys):
     from agent_sessions_client import cli
 
