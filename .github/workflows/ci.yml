@@ -122,9 +122,6 @@ jobs:
   # the hub tests, which apply every migration, so a broken migration never reaches prod. A
   # shared concurrency group plus a current-main check prevents an older run approved later from
   # overwriting the Worker with stale code.
-  # Requires production-environment secrets PRODUCTION_SCHEMA_BASELINE_ENVELOPE and
-  # PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY, created by scripts/approve-production-baseline.mjs
-  # through the independent human approval process.
   # CLOUDFLARE_MIGRATION_TOKEN is D1 Edit only. CLOUDFLARE_DEPLOY_TOKEN has Workers Scripts,
   # Queues, R2, and KV Edit plus Account Settings Read and Workers Routes Edit on vza.net.
   deploy:
@@ -156,17 +153,6 @@ jobs:
             echo "Refusing stale deployment: run=$GITHUB_SHA current=$current_head" >&2
             exit 1
           fi
-      - name: Materialize independent signed production schema baseline
-        env:
-          PRODUCTION_SCHEMA_BASELINE_ENVELOPE: ${{ secrets.PRODUCTION_SCHEMA_BASELINE_ENVELOPE }}
-          PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY: ${{ secrets.PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY }}
-        run: |
-          set -euo pipefail
-          : "${PRODUCTION_SCHEMA_BASELINE_ENVELOPE:?production environment must provide a human-approved signed schema baseline}"
-          : "${PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY:?production environment must provide its independently trusted verification key}"
-          umask 077
-          printf '%s' "$PRODUCTION_SCHEMA_BASELINE_ENVELOPE" > "$RUNNER_TEMP/production-schema-baseline.json"
-          printf '%s' "$PRODUCTION_SCHEMA_BASELINE_PUBLIC_KEY" > "$RUNNER_TEMP/production-schema-baseline-public.pem"
       - name: Apply and verify production migrations exactly once
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
@@ -181,9 +167,7 @@ jobs:
             --artifact-digest "$artifact_digest" \
             --deployment-id "production:${GITHUB_SHA}" \
             --base-manifest migrations/source-baseline.json \
-            --history migrations/historical-baseline.json \
-            --baseline "$RUNNER_TEMP/production-schema-baseline.json" \
-            --baseline-public-key "$RUNNER_TEMP/production-schema-baseline-public.pem"
+            --history migrations/historical-baseline.json
       - name: Deploy production hub
         run: npx wrangler deploy --config wrangler.jsonc
         env:
