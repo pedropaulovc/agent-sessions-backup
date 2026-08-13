@@ -283,12 +283,30 @@ describe('codex fork rollouts stay under their root session', () => {
   const ROOT_SESSION_ID = '019f0000-0000-7000-8000-000000000abe';
   const CHILD_SESSION_ID = '019f0000-0000-7000-8000-000000000abf';
 
+  /**
+   * A real Codex fork rollout opens with TWO session_meta lines: its own, then a verbatim
+   * copy of the ROOT thread's meta (`id` = root, `thread_source: 'user'`). Reproducing both
+   * is load-bearing — a single-meta fixture cannot catch the inherited copy clobbering the
+   * fork link the first line established.
+   */
   function rollout(
     sessionId: string,
     text: string,
     parentSessionId?: string,
     threadSource: 'subagent' | 'user' = parentSessionId ? 'subagent' : 'user',
   ): string {
+    const inheritedRootMeta = JSON.stringify({
+      timestamp: '2026-08-04T14:48:07.210Z',
+      type: 'session_meta',
+      payload: {
+        session_id: ROOT_SESSION_ID,
+        id: ROOT_SESSION_ID,
+        forked_from_id: null,
+        thread_source: 'user',
+        source: 'cli',
+        cwd: '/home/tester/src/meshprobe',
+      },
+    });
     return `${[
       JSON.stringify({
         timestamp: '2026-08-04T14:48:07.205Z',
@@ -306,6 +324,7 @@ describe('codex fork rollouts stay under their root session', () => {
           cwd: '/home/tester/src/meshprobe',
         },
       }),
+      ...(sessionId === ROOT_SESSION_ID ? [] : [inheritedRootMeta]),
       JSON.stringify({
         timestamp: '2026-08-04T14:48:08.000Z',
         type: 'response_item',

@@ -185,6 +185,14 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         // existing subagent filtering and parent banner.
         // `forked_from_id` also appears on ordinary interactive `codex fork` rollouts. Only
         // Codex's explicit subagent provenance makes the relationship a sidechain.
+        //
+        // A fork rollout replays the ROOT thread's session_meta after its own, so this case
+        // runs twice with two different identities. Only the record describing THIS file may
+        // touch the fork fields — otherwise the inherited copy (`thread_source: 'user'`)
+        // clears the link the child's own meta just established. A meta without `id` is
+        // pre-fork-era Codex and still falls through to the clear below.
+        const metaSessionId = codexSessionId(payload.id);
+        if (metaSessionId && metaSessionId !== session.id.toLowerCase()) break;
         if (str(payload.thread_source) !== 'subagent') {
           session.parentSessionId = undefined;
           session.parentSessionLink = 'none';
