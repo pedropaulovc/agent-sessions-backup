@@ -2,7 +2,14 @@ import type { Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
 import { markPendingAndEnqueue } from '../queue';
 import { hex, objectSha256 } from './ops';
-import { markKnownOtherSkipped, TERMINAL_PARSE_STATES, recordUploadedObject, restampIfStale } from './upload';
+import {
+  markKnownOtherSkipped,
+  preserveDisplacedObject,
+  recordUploadedObject,
+  restampIfStale,
+  streamSha256,
+  TERMINAL_PARSE_STATES,
+} from './upload';
 
 // R2 multipart part rules (developers.cloudflare.com/r2/objects/multipart-objects): every part
 // except the last must be >= 5 MiB AND all be the same size; <= 10000 parts. The collector uploads
@@ -254,9 +261,9 @@ export async function completeMultipart(
 
   const canonicalKey = r2Key(machineId, store, relpath);
   const stagKey = await stagingKey(machineId, store, relpath, token.nonce);
-  const existing = await env.DB.prepare('SELECT id FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3')
+  const existing = await env.DB.prepare('SELECT id, content_hash, size FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3')
     .bind(machineId, store, relpath)
-    .first<{ id: number }>();
+    .first<{ id: number; content_hash: string; size: number }>();
 
   try {
     await env.RAW.resumeMultipartUpload(stagKey, token.r2UploadId).complete(r2Parts);
@@ -268,6 +275,36 @@ export async function completeMultipart(
 
   const staged = await env.RAW.get(stagKey);
   if (!staged) return Response.json({ error: 'staging_missing_after_complete' }, { status: 500 });
+
+  // Same append-only guard as the simple PUT (see putFile): changed bytes that don't EXTEND the
+  // stored file preserve the current canonical object under raw-prev/ before the final put replaces
+  // it. The staging key makes this checkable without buffering — a ranged GET of the staged object's
+  // first `existing.size` bytes stream-hashes against the stored content hash. Without this, a
+  // stolen write-only cert could route a destructive overwrite through multipart deliberately (the
+  // ~90MB threshold is client-side convention, not a server-side constraint) and bypass the simple
+  // path's preservation. Fail closed on a failed preservation copy, same as putFile.
+  if (existing && existing.content_hash !== sha256) {
+    let extendsStored = staged.size >= existing.size;
+    if (extendsStored && existing.size > 0) {
+      const prefixPart = await env.RAW.get(stagKey, { range: { offset: 0, length: existing.size } });
+      extendsStored = prefixPart !== null && (await streamSha256(prefixPart.body)) === existing.content_hash;
+    }
+    if (!extendsStored) {
+      let prevKey: string | null;
+      try {
+        prevKey = await preserveDisplacedObject(env, canonicalKey, existing.content_hash);
+      } catch (e) {
+        await env.RAW.delete(stagKey).catch(() => {});
+        return Response.json({ error: 'preserve_failed', detail: String(e) }, { status: 503 });
+      }
+      if (prevKey) {
+        console.log(JSON.stringify({
+          event: 'access.upload_rewrite_preserved', machine: machineId, key: canonicalKey,
+          preserved_key: prevKey, old_sha256: existing.content_hash, new_sha256: sha256,
+        }));
+      }
+    }
+  }
 
   // Verify-and-finalize in one pass: put({sha256}) verifies the whole object server-side while copying
   // staging -> canonical, and gives canonical a native checksum. On mismatch R2 throws WITHOUT touching

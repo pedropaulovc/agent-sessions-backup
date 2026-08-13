@@ -45,6 +45,9 @@ class FakeHub:
         # override to fake a rejection (None -> a successful token response).
         self.exchange_requests: list[dict] = []
         self.exchange_response: dict | None = None
+        # Optional {status, body} override applied to every GET — lets a test fake an
+        # auth-layer rejection (e.g. production's 403 passkey_grant_required) on read routes.
+        self.get_response_override: dict | None = None
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -181,6 +184,9 @@ def _make_handler(hub: FakeHub):
             params = urllib.parse.parse_qs(parsed.query)
             hub.requests.append({"path": parsed.path, "params": params, "headers": dict(self.headers.items())})
 
+            if hub.get_response_override is not None:
+                self._json(hub.get_response_override["status"], hub.get_response_override["body"])
+                return
             if parsed.path == "/api/v1/sessions":
                 self._handle_sessions(params)
                 return

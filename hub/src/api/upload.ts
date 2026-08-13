@@ -21,6 +21,74 @@ export async function markKnownOtherSkipped(fileId: number, contentHash: string,
   return skipped !== null;
 }
 
+/** Where a non-append rewrite's displaced bytes go: raw-prev/{machine}/{store}/{relpath}/{oldSha}.
+ * A sibling of raw/ (NOT under it), so prefix-scoped reindex — which walks raw/ — never mistakes a
+ * preserved predecessor for live data, and the prune cron (which walks mpu-staging/) never touches
+ * it. Keyed by the displaced hash: re-preserving the same predecessor (a retry) overwrites with
+ * identical bytes, and successive rewrites each keep their own predecessor. */
+export function displacedKey(r2Key: string, oldSha256: string): string {
+  return `raw-prev/${r2Key.slice('raw/'.length)}/${oldSha256}`;
+}
+
+/**
+ * Copy the current canonical object aside before a non-append rewrite replaces it. This is what
+ * makes a write-only machine cert corruption-resistant: a stolen cert can still upload garbage over
+ * a path, but it can only DISPLACE the previous backup, never destroy it — the predecessor stays
+ * recoverable under raw-prev/. Streams via FixedLengthStream (the old object can exceed the isolate
+ * memory limit — it may have arrived via multipart). Returns the preservation key, or null when
+ * there is no object at r2Key to preserve. Throws on a failed copy — callers fail the upload closed
+ * rather than proceeding to destroy bytes that weren't preserved.
+ */
+export async function preserveDisplacedObject(env: Env, r2Key: string, oldSha256: string): Promise<string | null> {
+  const prevKey = displacedKey(r2Key, oldSha256);
+  // WRITE-ONCE: if this predecessor was already preserved, never copy again. A crash between a
+  // rewrite's canonical put and its D1 upsert leaves the row on the OLD hash while canonical holds
+  // the NEW bytes — the collector's retry re-fails the prefix check and re-preserves, and an
+  // unconditional copy would clobber the real predecessor with the new bytes it displaced. The
+  // first preservation always wins; raw-prev/ is itself append-only.
+  if (await env.RAW.head(prevKey)) return prevKey;
+  const old = await env.RAW.get(r2Key);
+  if (!old) return null;
+  // CHECKSUM-GUARDED: only bytes that actually ARE the predecessor go under its key. Two
+  // concurrent rewrites for one path can both pass the head() above, and the slower one can
+  // read the canonical key AFTER the faster one already replaced it — copying the REPLACEMENT
+  // bytes under oldSha256's name. R2's native checksums.sha256 (stamped by every put through
+  // this API) identifies what we actually read, and an R2 get is a consistent snapshot, so
+  // this check can't be raced: mismatch → the predecessor is already gone from the canonical
+  // key (the writer that displaced it ran this same guard first), skip rather than mislabel.
+  // A legacy object without a native checksum is unattestable and is likewise skipped.
+  if (objectSha256(old) !== oldSha256) return null;
+  const { readable, writable } = new FixedLengthStream(old.size);
+  const pump = old.body.pipeTo(writable);
+  await Promise.all([
+    env.RAW.put(prevKey, readable, {
+      customMetadata: { displacedFrom: r2Key, displacedSha256: oldSha256, displacedAt: new Date().toISOString() },
+    }),
+    pump,
+  ]);
+  return prevKey;
+}
+
+/** sha256 of a ReadableStream without buffering it (crypto.subtle.digest needs the whole buffer;
+ * DigestStream hashes as bytes flow through). Used by the multipart append check, whose prefix can
+ * be multi-GB. */
+export async function streamSha256(stream: ReadableStream): Promise<string> {
+  const digest = new crypto.DigestStream('SHA-256');
+  await stream.pipeTo(digest);
+  return hex(await digest.digest);
+}
+
+/** Does this upload EXTEND the stored file — i.e. do its first storedSize bytes hash to the stored
+ * content hash? Append-shaped growth (JSONL session logs) is the steady state and passes; anything
+ * else (shrink, in-place rewrite) is a displacement the caller must preserve first. The Uint8Array
+ * is a zero-copy view — no second buffer next to the ~90MB body. */
+async function bodyExtendsStored(bodyBuf: ArrayBuffer, storedSize: number, storedSha256: string): Promise<boolean> {
+  if (bodyBuf.byteLength < storedSize) return false;
+  if (storedSize === 0) return true;
+  const digest = await crypto.subtle.digest('SHA-256', new Uint8Array(bodyBuf, 0, storedSize));
+  return hex(digest) === storedSha256;
+}
+
 /** R2 customMetadata values must be strings, and the x-file-mtime header is optional — build the
  * {mtime} customMetadata object only when we actually have one to record. reindex() reads this
  * back (see ops.ts) to restore files.mtime for R2 objects whose D1 row was lost/wiped; a legacy
@@ -87,10 +155,10 @@ export async function putFile(
   if (!request.body) return Response.json({ error: 'missing_body' }, { status: 400 });
 
   const existing = await env.DB.prepare(
-    'SELECT id, content_hash, parse_state, r2_key, harness, session_id FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
+    'SELECT id, content_hash, parse_state, r2_key, size, harness, session_id FROM files WHERE machine_id = ?1 AND store = ?2 AND relpath = ?3',
   )
     .bind(machineId, store, relpath)
-    .first<{ id: number; content_hash: string; parse_state: string; r2_key: string; harness: string | null; session_id: string | null }>();
+    .first<{ id: number; content_hash: string; parse_state: string; r2_key: string; size: number; harness: string | null; session_id: string | null }>();
   if (existing && existing.content_hash === sha256) {
     const det = detect(store, relpath, machineId);
     // Restamp a legacy row whose stored identity drifted (see restampIfStale) before deciding
@@ -152,6 +220,28 @@ export async function putFile(
   // 128MB memory limit gives headroom. Larger files never reach here: the collector routes them
   // through the streamed multipart path instead.
   const bodyBuf = await request.arrayBuffer();
+
+  // Changed bytes over an existing row: verify this is append-shaped growth (the steady state for
+  // session JSONL). Anything else — a shrink or an in-place rewrite (legitimate for the web-store
+  // conversation JSONs, adversarial for everything a stolen write-only cert might overwrite) — first
+  // preserves the current object under raw-prev/ so the previous backup stays recoverable. Never
+  // rejected: a backup hub refusing an upstream rewrite would silently lose the NEW data instead.
+  // Fail closed on a failed preservation copy — proceeding would destroy unpreserved bytes.
+  if (existing && !(await bodyExtendsStored(bodyBuf, existing.size, existing.content_hash))) {
+    let prevKey: string | null;
+    try {
+      prevKey = await preserveDisplacedObject(env, existing.r2_key, existing.content_hash);
+    } catch (e) {
+      return Response.json({ error: 'preserve_failed', detail: String(e) }, { status: 503 });
+    }
+    if (prevKey) {
+      console.log(JSON.stringify({
+        event: 'access.upload_rewrite_preserved', machine: machineId, key: existing.r2_key,
+        preserved_key: prevKey, old_sha256: existing.content_hash, new_sha256: sha256,
+      }));
+    }
+  }
+
   // R2 verifies the checksum server-side: a corrupt/truncated body never lands. Its returned
   // object's .size is the authoritative byte count — the x-file-size/content-length header
   // above is only an early sanity gate (rejects an obviously-bad value before we touch R2);

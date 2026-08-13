@@ -271,3 +271,22 @@ def test_read_bytes_body_stall_after_headers_raises_hub_error():
         resp = client.get("/api/v1/sessions/abc/raw")
         with pytest.raises(HubError):
             resp.read_bytes()
+
+
+def test_403_passkey_grant_required_appends_auth_hint(hub):
+    # Production severs cert-authenticated session reads; the client turns the hub's
+    # 403 passkey_grant_required into an actionable "run `agent-sessions auth`" message.
+    hub.get_response_override = {"status": 403, "body": {"error": "passkey_grant_required"}}
+    client = HubClient(grant_config(hub.url))
+    with pytest.raises(HubError) as exc_info:
+        client.get("/api/v1/sessions")
+    assert exc_info.value.status == 403
+    assert "agent-sessions auth" in str(exc_info.value)
+
+
+def test_plain_403_gets_no_auth_hint(hub):
+    hub.get_response_override = {"status": 403, "body": {"error": "machine_mismatch"}}
+    client = HubClient(grant_config(hub.url))
+    with pytest.raises(HubError) as exc_info:
+        client.get("/api/v1/sessions")
+    assert "agent-sessions auth" not in str(exc_info.value)

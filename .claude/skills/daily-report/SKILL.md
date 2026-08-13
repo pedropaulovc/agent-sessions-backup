@@ -16,11 +16,13 @@ machine API. Full endpoint contract, auth modes, and known gaps: `docs/agents-ap
    ```
    `--date` defaults to today. Auth resolves in this order: a read grant
    (`--grant-token` / `$AGENT_SESSIONS_GRANT_TOKEN` / the cache written by
-   `uv run agent-sessions auth`), then a transitional mTLS cert/key from
-   `~/.config/agent-collector/config.toml`. If neither is present — or once cert reads are
-   severed — mint a grant first: `uv run agent-sessions auth` (opens a browser page; the
-   owner approves with a passkey; the token caches for ~4 h). `--out <path>` writes the
-   markdown to a file instead of stdout.
+   `uv run agent-sessions auth`), then an mTLS cert/key from
+   `~/.config/agent-collector/config.toml` — but in production a machine cert reaches only
+   the content-free aggregates, so the session list this report needs REQUIRES a grant.
+   Mint one first: `uv run agent-sessions auth` (opens a browser page; the owner approves
+   with a passkey; the token caches for ~4 h) — run it from a trusted checkout (`main` or a
+   reviewed branch), never an untrusted PR branch; see the auth section of
+   `docs/agents-api.md`. `--out <path>` writes the markdown to a file instead of stdout.
 
 2. **If the CLI isn't available** (no `client/` checkout, or you need a breakdown the built-in
    report doesn't produce), call the API directly per `docs/agents-api.md`. The three calls the
