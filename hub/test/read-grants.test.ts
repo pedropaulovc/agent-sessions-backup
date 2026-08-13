@@ -125,10 +125,12 @@ describe('passkey-minted read grants', () => {
     }
     const status = await bearerRequest('/api/v1/status', grant.token);
     expect(status.status).toBe(200);
-    await expect(status.json()).resolves.toEqual({
-      ok: true,
-      identity: { kind: 'grant', label: 'claude on amet', expires_at: grant.expiresAt },
-    });
+    const statusPayload = await status.json() as { identity: unknown; machines: unknown; sessions: unknown };
+    expect(statusPayload.identity).toEqual({ kind: 'grant', label: 'claude on amet', expires_at: grant.expiresAt });
+    // The fleet-freshness body is the same content-free shape machine callers get —
+    // daily reports read staleness from it regardless of credential.
+    expect(Array.isArray(statusPayload.machines)).toBe(true);
+    expect(statusPayload.sessions).toBeTruthy();
   });
 
   it('rejects the exchange for a wrong or mismatched PKCE verifier', async () => {

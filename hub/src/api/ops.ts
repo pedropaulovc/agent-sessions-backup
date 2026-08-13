@@ -514,9 +514,12 @@ export async function adminMachines(request: Request, env: Env, identity: Identi
   return Response.json({ machines: rows.results });
 }
 
-/** GET /api/v1/status — index-completeness introspection for agents. */
-export async function status(env: Env, identity: Identity): Promise<Response> {
-  if (identity.kind !== 'machine') return Response.json({ error: 'unauthorized' }, { status: 401 });
+/**
+ * Fleet-freshness body shared by every /api/v1/status caller (machine certs and read
+ * grants): per-machine ingest/parse state plus session index totals. Content-free — no
+ * session bytes, titles, or transcript-derived fields.
+ */
+export async function statusBody(env: Env): Promise<Record<string, unknown>> {
   const machines = await env.DB.prepare(
     `SELECT m.machine_id, m.os, m.last_seen_at, m.last_upload_at,
             SUM(CASE WHEN f.parse_state IN ('pending', 'reserved') THEN 1 ELSE 0 END) AS files_pending,
@@ -531,14 +534,22 @@ export async function status(env: Env, identity: Identity): Promise<Response> {
             SUM(CASE WHEN index_state = 'error' THEN 1 ELSE 0 END) AS error
      FROM sessions`,
   ).first();
+  return {
+    machines: machines.results.map((m) => ({ ...m, indexed_through: m.last_seen_at })),
+    sessions,
+  };
+}
+
+/** GET /api/v1/status — index-completeness introspection for agents. */
+export async function status(env: Env, identity: Identity): Promise<Response> {
+  if (identity.kind !== 'machine') return Response.json({ error: 'unauthorized' }, { status: 401 });
   return Response.json({
     identity: {
       machine_id: identity.machineId,
       cert_fingerprint: identity.certFp ?? null,
       cert_slot: identity.certSlot,
     },
-    machines: machines.results.map((m) => ({ ...m, indexed_through: m.last_seen_at })),
-    sessions,
+    ...(await statusBody(env)),
   });
 }
 

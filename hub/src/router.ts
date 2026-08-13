@@ -8,7 +8,7 @@ import {
 } from './auth/cloudflare-oauth';
 import { checkFiles, putFile } from './api/upload';
 import { abortMultipart, completeMultipart, createMultipart, uploadPart } from './api/multipart';
-import { adminMachines, heartbeat, listMachines, priceUsageSlice, reindex, status, usage } from './api/ops';
+import { adminMachines, heartbeat, listMachines, priceUsageSlice, reindex, status, statusBody, usage } from './api/ops';
 import { bootstrap } from './api/bootstrap';
 import { probeClientCert, renewCert } from './api/certs';
 import { search } from './api/search';
@@ -185,9 +185,11 @@ async function grantReadRoute(request: Request, url: URL, env: Env, grant: Grant
   if (path === '/api/v1/machines') return listMachines(env);
   if (path === '/api/v1/usage') return usage(url, env);
   if (path === '/api/v1/status') {
+    // Same fleet-freshness body machine callers get (content-free), with the grant identity
+    // echoed instead of a machine row — daily reports need the staleness data either way.
     return Response.json({
-      ok: true,
       identity: { kind: 'grant', label: grant.label, expires_at: grant.expiresAt },
+      ...(await statusBody(env)),
     });
   }
   return null;
