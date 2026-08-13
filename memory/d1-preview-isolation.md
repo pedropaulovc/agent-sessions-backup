@@ -16,22 +16,20 @@ tokens (open request: cloudflare/workers-sdk#11434, no official response as of
 2026-06-26). So OIDC cannot be federated directly to Cloudflare.
 
 The Worker **binding** is the only construct that bounds reach — but it is **not** a
-security boundary against a PR, because **Workers Builds builds each branch preview
-from the PR's own checkout**, so `wrangler.jsonc` (and therefore
-`env.preview.d1_databases[].database_id`) is PR-controlled. Any check placed inside the
-Worker is likewise PR-controlled and can simply be deleted. PR #66 works around this
-with a `preview_environment_marker` row the endpoint checks before writing — which
-defends against **accident** (mistyped/copy-pasted db id, bad merge) and explicitly not
-against a malicious author.
+security boundary against a PR when preview code builds from the PR's own checkout:
+`wrangler.jsonc` (and therefore any database id in it) is PR-controlled, and any check
+placed inside the Worker is likewise PR-controlled and can simply be deleted.
 
-**The only real isolation is a separate Cloudflare account**, where nothing reachable
-from a build can name production at all.
-
-Decided 2026-08-01 to ship without that, because `main` has no branch protection and
-there is one collaborator — so PR-open access already implies a direct push to `main`,
-which runs CI's `deploy` job with the full-account `CLOUDFLARE_API_TOKEN`. **Revisit if
-`main` gains branch protection or the repo gains collaborators**: that shortcut closes
-and the endpoint becomes a genuine privilege escalation.
+**The only real isolation is a separate Cloudflare account** for the preview
+application resources (workers, D1, R2, queues) — and that is what shipped. The
+2026-08-01 decision to defer it was SUPERSEDED on 2026-08-04 (PRs #83–#116): previews
+now run in a dedicated non-production account (`cbb04a26…`, identity
+pedro@vezza.com.br with no production membership), provisioned only by the protected
+`Preview Control` workflow; the Workers Builds previews this note originally described
+are retired. The stable `*-preview.sessions.vza.net` front door itself stays in the
+PRODUCTION account (it owns the zone + Access) — it is trusted protected code, never
+built from a PR checkout. Current model: `infra/cf/deploy.md` ("Identities and
+accounts").
 
 See [[deploy-migrations-gap]] for who deploys what, and [[wrangler-d1-query-gotchas]]
 for the `CLOUDFLARE_ACCOUNT_ID` requirement when running `wrangler d1` against this
