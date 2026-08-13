@@ -4,6 +4,34 @@ Production deploys from `main` to account `18ef3246e9f36d1560485ef53889c0ab`.
 Ephemeral PR resources must use a different Cloudflare account containing no production
 resource, credential, data, route, or application secret.
 
+## Identities and accounts — which one, for what
+
+Every Cloudflare operation in this repo belongs to exactly one of two identity/account
+pairs. When an instruction says "log in" or "verify the account", it means one specific
+row of this table — never a choice:
+
+| identity | account | holds | used for |
+|---|---|---|---|
+| `pedro@vza.net` | **production** `18ef3246e9f36d1560485ef53889c0ab` | the live hub (`sessions.vza.net` / `api.sessions.vza.net`), production D1/R2/Queues, Access apps, the managed CA | production deploys (protected, `main`-only CI), production secrets (`wrangler secret put` after `whoami` shows this account), Access/zone administration |
+| `pedro@vezza.com.br` | **non-production** `cbb04a26e6fa2d0cdc4eb67c735e5669` (workers.dev subdomain `agent-sessions-nonproduction`) | per-PR preview generations, preview D1/R2/Queues — no production resource, credential, or data | the `Preview Control` workflow (via the account-scoped token below), and exceptional hand-run preview administration (scoped `wrangler login` per AGENTS.md) |
+
+Rules that follow from the table:
+
+- **Agents never authenticate to the production account.** Anything an agent legitimately
+  needs there is already reachable another way (the machine API, the viewer, the bridge) or
+  is a protected-CI concern. A hand-run `wrangler` command against production is an
+  owner-at-keyboard operation.
+- **`pedro@vezza.com.br` must have no production membership** — preview tooling verifies
+  the identity's complete membership list and fails if the production account appears
+  (see below). Keep it that way when accepting account invitations.
+- **Local Wrangler auth profiles are named for their account row**: the production
+  keyring/OAuth profile is `production` (historical name `production-bootstrap` — renamed,
+  since it serves all production operations, not just the one-time bootstrap), and the
+  non-production one is `preview`. A profile name that doesn't answer "which account?"
+  at a glance invites running a command against the wrong one.
+- Local development uses **neither**: the loopback hub (`npm --prefix hub run dev:up`)
+  needs zero Wrangler scopes and no Cloudflare login.
+
 ## Trusted per-PR preview controller
 
 The default-branch `Preview Control` workflow is the only PR resource allocator. Its
