@@ -5,7 +5,7 @@ from conftest import make_session_row
 
 
 def api_for(hub) -> SessionsApi:
-    config = ClientConfig(hub_url=hub.url, auth_mode=AuthMode.BEARER, bearer_token="tok", dev_machine="m")
+    config = ClientConfig(hub_url=hub.url, auth_mode=AuthMode.GRANT, grant_token="agsr_tok")
     return SessionsApi(HubClient(config))
 
 

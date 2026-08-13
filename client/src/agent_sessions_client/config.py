@@ -1,12 +1,13 @@
 """Connection config: resolves how to reach the hub and authenticate.
 
-Two auth modes (see hub/src/auth/identity.ts::machineIdentity, which this mirrors):
-- mTLS (production): client cert+key, read from ~/.config/agent-collector/config.toml
-  (the same file the collector writes) unless overridden.
-- bearer (preview envs only): `Authorization: Bearer <DEV_AUTH>` + `x-dev-machine: <id>`.
-  Production's mTLS-fronting Worker never accepts this; it only works against a Workers
-  Builds PR preview URL, which gates on DEV_AUTH precisely because it's publicly reachable
-  without a real client cert. There is no config.toml field for it — it's env/arg-only.
+Two auth modes (see hub/src/router.ts::apiRoute, which this mirrors):
+- grant (preferred): `Authorization: Bearer agsr_…` — a short-lived read-only token the
+  owner minted with a passkey touch via `agent-sessions auth` (see grant.py). Resolved
+  from an explicit arg, $AGENT_SESSIONS_GRANT_TOKEN, or the token cache grant.py writes.
+- mTLS (transitional): client cert+key, read from ~/.config/agent-collector/config.toml
+  (the same file the collector writes) unless overridden. Machine certs are moving to
+  ingest-only; cert-authenticated reads disappear once that migration completes, at which
+  point this mode dies with them.
 """
 
 from __future__ import annotations
@@ -18,12 +19,14 @@ from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
 
+from .grant import load_cached_token
+
 DEFAULT_HUB_URL = "https://api.sessions.vza.net"
 
 
 class AuthMode(str, Enum):
     MTLS = "mtls"
-    BEARER = "bearer"
+    GRANT = "grant"
 
 
 def default_config_path() -> Path:
@@ -38,11 +41,10 @@ class ClientConfig:
     auth_mode: AuthMode
     client_cert_path: Path | None = None
     client_key_path: Path | None = None
-    bearer_token: str | None = None
-    dev_machine: str | None = None
+    grant_token: str | None = None
 
     def __post_init__(self) -> None:
-        # AuthMode subclasses str, so a caller passing the plain string "mtls"/"bearer" (this
+        # AuthMode subclasses str, so a caller passing the plain string "mtls"/"grant" (this
         # class is exported — that's a reasonable thing to do) would otherwise sail past every
         # `is AuthMode.X` identity check below AND in HubClient, silently sending an
         # unauthenticated request instead of failing fast. Coerce unconditionally — AuthMode(x)
@@ -59,8 +61,8 @@ class ClientConfig:
             raise ValueError(f"invalid hub_url {self.hub_url!r}: expected an http(s) URL, e.g. https://api.sessions.vza.net")
         if self.auth_mode is AuthMode.MTLS and (self.client_cert_path is None or self.client_key_path is None):
             raise ValueError("mtls auth requires client_cert_path and client_key_path")
-        if self.auth_mode is AuthMode.BEARER and (self.bearer_token is None or self.dev_machine is None):
-            raise ValueError("bearer auth requires bearer_token and dev_machine")
+        if self.auth_mode is AuthMode.GRANT and self.grant_token is None:
+            raise ValueError("grant auth requires grant_token")
 
 
 def load_config(
@@ -69,45 +71,41 @@ def load_config(
     config_path: Path | None = None,
     client_cert_path: str | Path | None = None,
     client_key_path: str | Path | None = None,
-    bearer_token: str | None = None,
-    dev_machine: str | None = None,
+    grant_token: str | None = None,
+    grant_cache_path: Path | None = None,
 ) -> ClientConfig:
     """Resolve hub connection settings.
 
-    Precedence (highest first): explicit keyword args > environment variables >
-    ~/.config/agent-collector/config.toml (or $XDG_CONFIG_HOME override). Bearer mode
-    wins over mTLS whenever a bearer token is supplied (by arg or env) — it's meant for
-    one-off preview-env runs, never silently mixed with a machine's production cert.
+    Precedence (highest first): explicit keyword args > environment variables > the token
+    cache `agent-sessions auth` wrote > ~/.config/agent-collector/config.toml (or
+    $XDG_CONFIG_HOME override). A usable grant token wins over mTLS whenever both exist —
+    the grant is the intended read credential; the cert read path is transitional.
     """
     env = os.environ
-    # Read the config file BEFORE branching on auth mode — bearer mode used to return early
-    # here and never look at it, so a non-default hub_url configured for mTLS use (e.g. a
-    # local/preview override) was silently ignored in bearer mode, sending bearer credentials
-    # at production instead. Both modes now resolve hub_url with the same arg > env > file >
-    # default precedence.
+    # Read the config file BEFORE branching on auth mode, so a non-default hub_url configured
+    # there applies to grant mode too — both modes resolve hub_url with the same
+    # arg > env > file > default precedence.
     path = config_path or default_config_path()
     file_data: dict = {}
     if path.is_file():
         file_data = tomllib.loads(path.read_text())
     resolved_hub_url = hub_url or env.get("AGENT_SESSIONS_HUB_URL") or file_data.get("hub_url") or DEFAULT_HUB_URL
 
-    resolved_bearer = bearer_token or env.get("AGENT_SESSIONS_BEARER_TOKEN")
-    resolved_dev_machine = dev_machine or env.get("AGENT_SESSIONS_DEV_MACHINE")
-    if resolved_bearer:
+    resolved_grant = grant_token or env.get("AGENT_SESSIONS_GRANT_TOKEN") or load_cached_token(grant_cache_path)
+    if resolved_grant:
         return ClientConfig(
             hub_url=resolved_hub_url,
-            auth_mode=AuthMode.BEARER,
-            bearer_token=resolved_bearer,
-            dev_machine=resolved_dev_machine,
+            auth_mode=AuthMode.GRANT,
+            grant_token=resolved_grant,
         )
 
     resolved_cert = client_cert_path or env.get("AGENT_SESSIONS_CLIENT_CERT") or file_data.get("client_cert_path")
     resolved_key = client_key_path or env.get("AGENT_SESSIONS_CLIENT_KEY") or file_data.get("client_key_path")
     if not resolved_cert or not resolved_key:
         raise ValueError(
-            f"no mTLS client cert/key found (checked args, env vars, and {path}); "
-            "pass bearer_token/dev_machine (or --bearer-token/--dev-machine on the CLI) "
-            "for a preview-env DEV_AUTH client instead"
+            f"no read grant or mTLS client cert/key found (checked args, env vars, the grant "
+            f"cache, and {path}); run `agent-sessions auth` to mint a passkey-approved read "
+            "grant, or pass --grant-token"
         )
     return ClientConfig(
         hub_url=resolved_hub_url,

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -40,6 +41,10 @@ class FakeHub:
         # without needing 300+ fixture rows.
         self.ndjson_max_rows_per_request = 10
         self.requests: list[dict] = []  # recorded {path, params, headers} for assertions
+        # POST /api/v1/grants/exchange: recorded bodies, plus an optional {status, body}
+        # override to fake a rejection (None -> a successful token response).
+        self.exchange_requests: list[dict] = []
+        self.exchange_response: dict | None = None
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -148,6 +153,28 @@ def _make_handler(hub: FakeHub):
                 self.send_header(k, v)
             self.end_headers()
             self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            parsed = urllib.parse.urlsplit(self.path)
+            length = int(self.headers.get("content-length") or 0)
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                body = {}
+            hub.requests.append({"path": parsed.path, "params": {}, "headers": dict(self.headers.items()), "body": body})
+            if parsed.path == "/api/v1/grants/exchange":
+                hub.exchange_requests.append(body)
+                if hub.exchange_response is not None:
+                    self._json(hub.exchange_response["status"], hub.exchange_response["body"])
+                    return
+                self._json(200, {
+                    "token": f"agsr_{'x' * 43}",
+                    "tokenType": "bearer",
+                    "label": "test",
+                    "expiresAt": int((time.time() + 3600) * 1000),
+                })
+                return
+            self._json(404, {"error": "not_found"})
 
         def do_GET(self) -> None:
             parsed = urllib.parse.urlsplit(self.path)

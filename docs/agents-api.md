@@ -15,29 +15,37 @@ this doc.
 Production: `https://api.sessions.vza.net`.
 
 Every endpoint under `/api/v1/` — including plain reads like `/sessions` and `/search` —
-requires an identity of kind `machine` (`hub/src/router.ts::apiRoute`). There is no
+requires an authenticated identity (`hub/src/router.ts::apiRoute`). There is no
 unauthenticated or human-cookie path into this API; the viewer's passkey session is a
 completely separate auth path that doesn't apply here. Two ways to authenticate:
 
-1. **mTLS (production).** Present a machine's client cert+key on every request. Any
-   enrolled machine's paths are in `~/.config/agent-collector/config.toml`
-   (`client_cert_path` / `client_key_path`), e.g.:
+1. **Read grant (preferred for agents).** A short-lived read-only bearer the owner mints
+   with a passkey touch — the system rule is *machine certs ingest, passkeys egress*: no
+   agent reads production session bytes without the owner approving a grant. Mint one with
+   the shipped CLI (opens a browser approval page, delivers the token over a loopback PKCE
+   callback, caches it in `~/.config/agent-sessions/grant.json`):
+   ```bash
+   cd client && uv run agent-sessions auth --ttl 4h   # --label defaults to agent@<hostname>
+   ```
+   Then send `Authorization: Bearer agsr_…` on every request. The grant reaches ONLY the
+   read allow-list (`/sessions` list/get/raw, `/search`, `/usage`, `/machines`, `/status`)
+   — never uploads, bootstrap, cert, or admin routes. Default TTL 4 h, max 24 h; active
+   grants are listed and revocable on the viewer's `/settings` page.
+2. **mTLS (transitional — collectors, and reads until the migration completes).** Present a
+   machine's client cert+key on every request. Any enrolled machine's paths are in
+   `~/.config/agent-collector/config.toml` (`client_cert_path` / `client_key_path`), e.g.:
    ```bash
    curl --cert ~/.config/agent-collector/<machine>.client.pem \
         --key  ~/.config/agent-collector/<machine>.client.key \
         "https://api.sessions.vza.net/api/v1/status"
    ```
-2. **Bearer (preview environments only).** Workers Builds PR previews
-   (`https://<hash>-sessions-hub-preview.<account>.workers.dev`) gate on a shared
-   `DEV_AUTH` secret instead of a real cert, since preview URLs are publicly reachable and
-   don't have zone-level mTLS. Send **both** headers:
-   ```
-   Authorization: Bearer <DEV_AUTH>
-   x-dev-machine: <any-identifier>
-   ```
-   `x-dev-machine` supplies the identity (auto-registered on first use, `isAdmin=true`).
-   This path is closed in production — `env.ENVIRONMENT` there is `'production'`, which
-   `machineIdentity()` doesn't allowlist for the bearer fallback.
+   Machine certs are becoming **ingest-only** (upload, `files/check`, heartbeat, cert
+   renewal, an identity echo): cert-authenticated *reads* still work today but are
+   scheduled for removal — new tooling should use a read grant.
+
+The old preview-only `DEV_AUTH` bearer (`Authorization: Bearer <DEV_AUTH>` +
+`x-dev-machine`) is gone along with the Workers Builds previews that used it; the current
+per-PR preview stack authenticates through the preview front door, not this API.
 
 ## Endpoints
 
@@ -237,9 +245,10 @@ the plan, until they're reconciled:
 - `/api/v1/sessions`'s cursor is a keyset boundary `(started_at, session_id)`, not the opaque
   offset cursor `/api/v1/search` uses — the two endpoints' `cursor` params are not
   interchangeable or shaped the same, despite sharing a param name.
-- `GET /api/v1/bootstrap`, `POST /api/v1/certs/renew`, and `POST /api/v1/admin/machines`
-  (from the plan's API-contract section) aren't implemented. Only `POST /api/v1/admin/reindex`
-  exists under `/admin`, and it requires `isAdmin` on the calling machine's cert.
+- ~~`GET /api/v1/bootstrap`, `POST /api/v1/certs/renew`, and `POST /api/v1/admin/machines`
+  aren't implemented.~~ Closed — all three exist now (`hub/src/router.ts`), but they are
+  machine-cert-only (admin routes additionally require `isAdmin` + the current cert slot);
+  none are reachable with a read grant.
 
 ## Harness-specific gotcha: `prompt-log` sessions
 
@@ -257,7 +266,9 @@ every "notable sessions" list and make the ranking meaningless.
 ```python
 from agent_sessions_client import HubClient, SessionsApi, load_config
 
-config = load_config()  # reads ~/.config/agent-collector/config.toml by default
+# Auth resolution: --grant-token / $AGENT_SESSIONS_GRANT_TOKEN / the `agent-sessions auth`
+# token cache first, then a transitional mTLS cert from ~/.config/agent-collector/config.toml.
+config = load_config()
 api = SessionsApi(HubClient(config))
 
 page = api.list_sessions(from_="2026-07-18", to="2026-07-18")
@@ -271,37 +282,37 @@ for record in api.iter_sessions_ndjson(from_="2026-07-18", harness="claude-code"
     print(record.meta.session_id, record.session and len(record.session.get("turns", [])))
 ```
 
-Against a PR preview instead of production:
-```python
-from agent_sessions_client import HubClient, SessionsApi, load_config
-
-config = load_config(hub_url="https://<hash>-sessions-hub-preview.<account>.workers.dev",
-                      bearer_token="<DEV_AUTH>", dev_machine="my-agent")
-api = SessionsApi(HubClient(config))
-```
-
-CLI: `cd client && uv run agent-sessions daily-report [--date YYYY-MM-DD]` — see
+CLI: `cd client && uv run agent-sessions auth` mints and caches a read grant;
+`uv run agent-sessions daily-report [--date YYYY-MM-DD]` uses it automatically — see
 `.claude/skills/daily-report/SKILL.md` for how an agent should drive it.
 
 ## curl examples
 
 ```bash
-CERT=~/.config/agent-collector/amet-wsl.client.pem
-KEY=~/.config/agent-collector/amet-wsl.client.key
+# Read grant (preferred): mint once with `agent-sessions auth --print-token`, or read the
+# cache the CLI wrote.
+TOKEN=$(jq -r .token ~/.config/agent-sessions/grant.json)
+AUTH="authorization: Bearer $TOKEN"
 BASE=https://api.sessions.vza.net
 
 # today's sessions, meta only (cheap) — limit=1000 to match the CLI's request and hit the
 # hard per-page cap, not the hub's 200-row default (which would need more page fetches on a
 # busy day). If the response has a "cursor", more rows matched than fit in this page — pass
 # it back as &cursor=... to continue.
-curl --cert $CERT --key $KEY "$BASE/api/v1/sessions?from=2026-07-18&to=2026-07-18&limit=1000"
+curl -H "$AUTH" "$BASE/api/v1/sessions?from=2026-07-18&to=2026-07-18&limit=1000"
 
 # streaming NDJSON with full parsed content (expensive per row)
-curl --cert $CERT --key $KEY "$BASE/api/v1/sessions?from=2026-07-18&format=ndjson"
+curl -H "$AUTH" "$BASE/api/v1/sessions?from=2026-07-18&format=ndjson"
 
 # per-model token usage for a day
-curl --cert $CERT --key $KEY "$BASE/api/v1/usage?group_by=model&from=2026-07-18&to=2026-07-18"
+curl -H "$AUTH" "$BASE/api/v1/usage?group_by=model&from=2026-07-18&to=2026-07-18"
 
 # fleet freshness — check before trusting a report's counts
-curl --cert $CERT --key $KEY "$BASE/api/v1/status"
+curl -H "$AUTH" "$BASE/api/v1/status"
+
+# transitional mTLS equivalent (until cert reads are severed): replace -H "$AUTH" with
+#   --cert ~/.config/agent-collector/<machine>.client.pem \
+#   --key  ~/.config/agent-collector/<machine>.client.key
+# (On a TPM-backed Windows enrollment there are no PEM files — use System32 curl with
+#  --cert "CurrentUser\MY\<thumbprint>" — or just use a read grant, which needs neither.)
 ```

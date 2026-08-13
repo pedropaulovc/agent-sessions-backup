@@ -38,10 +38,8 @@ def test_daily_report_end_to_end(hub, capsys):
             "2026-07-18",
             "--hub-url",
             hub.url,
-            "--bearer-token",
-            "tok",
-            "--dev-machine",
-            "test-machine",
+            "--grant-token",
+            "agsr_tok",
         ]
     )
     assert rc == 0
@@ -67,10 +65,8 @@ def test_daily_report_scopes_usage_to_the_active_filters(hub):
             "codex",
             "--hub-url",
             hub.url,
-            "--bearer-token",
-            "tok",
-            "--dev-machine",
-            "test-machine",
+            "--grant-token",
+            "agsr_tok",
         ]
     )
     assert rc == 0
@@ -90,10 +86,8 @@ def test_daily_report_writes_to_out_file(hub, tmp_path):
             "2026-07-18",
             "--hub-url",
             hub.url,
-            "--bearer-token",
-            "tok",
-            "--dev-machine",
-            "m",
+            "--grant-token",
+            "agsr_tok",
             "--out",
             str(out_path),
         ]
@@ -104,8 +98,6 @@ def test_daily_report_writes_to_out_file(hub, tmp_path):
 
 
 def test_daily_report_missing_auth_returns_error(tmp_path, capsys, monkeypatch):
-    monkeypatch.delenv("AGENT_SESSIONS_BEARER_TOKEN", raising=False)
-    monkeypatch.delenv("AGENT_SESSIONS_DEV_MACHINE", raising=False)
     rc = main(["daily-report", "--config", str(tmp_path / "nope.toml")])
     assert rc == 2
     assert "error:" in capsys.readouterr().err
@@ -123,10 +115,8 @@ def test_daily_report_unpadded_date_rejected_before_any_api_call(hub, capsys):
             "2026-7-8",
             "--hub-url",
             hub.url,
-            "--bearer-token",
-            "tok",
-            "--dev-machine",
-            "m",
+            "--grant-token",
+            "agsr_tok",
         ]
     )
     assert rc == 2
@@ -138,7 +128,7 @@ def test_daily_report_invalid_calendar_date_rejected(hub, capsys):
     # Strict YYYY-MM-DD shape but not a real date — a regex-only check wouldn't catch this;
     # strptime is still needed alongside it for actual calendar validity.
     rc = main(
-        ["daily-report", "--date", "2026-02-30", "--hub-url", hub.url, "--bearer-token", "tok", "--dev-machine", "m"]
+        ["daily-report", "--date", "2026-02-30", "--hub-url", hub.url, "--grant-token", "agsr_tok"]
     )
     assert rc == 2
     assert "error: invalid --date '2026-02-30', expected YYYY-MM-DD" in capsys.readouterr().err
@@ -149,9 +139,7 @@ def test_daily_report_malformed_hub_url_returns_error_not_traceback(capsys, monk
     # A malformed --hub-url (no scheme) makes urllib.request.Request() raise ValueError deep
     # inside HubClient.get(), past the CLI's HubError-only handler for API calls — must be
     # caught at config-load time instead, before any request is attempted.
-    monkeypatch.delenv("AGENT_SESSIONS_BEARER_TOKEN", raising=False)
-    monkeypatch.delenv("AGENT_SESSIONS_DEV_MACHINE", raising=False)
-    rc = main(["daily-report", "--hub-url", "not-a-url", "--bearer-token", "tok", "--dev-machine", "m"])
+    rc = main(["daily-report", "--hub-url", "not-a-url", "--grant-token", "agsr_tok"])
     assert rc == 2
     assert "error:" in capsys.readouterr().err
 
@@ -162,10 +150,8 @@ def test_daily_report_connection_failure_returns_error(capsys):
             "daily-report",
             "--hub-url",
             "http://127.0.0.1:1",
-            "--bearer-token",
-            "tok",
-            "--dev-machine",
-            "m",
+            "--grant-token",
+            "agsr_tok",
         ]
     )
     assert rc == 1
@@ -175,8 +161,6 @@ def test_daily_report_connection_failure_returns_error(capsys):
 def test_daily_report_bad_mtls_cert_returns_error_not_traceback(tmp_path, capsys, monkeypatch):
     # A stale collector config pointing at a moved/rotated cert must produce the documented
     # `error: ...` + exit 2, not an unhandled FileNotFoundError/ssl.SSLError traceback.
-    monkeypatch.delenv("AGENT_SESSIONS_BEARER_TOKEN", raising=False)
-    monkeypatch.delenv("AGENT_SESSIONS_DEV_MACHINE", raising=False)
     rc = main(
         [
             "daily-report",

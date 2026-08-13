@@ -3,6 +3,22 @@ import pytest
 from fake_hub import FakeHub
 
 
+@pytest.fixture(autouse=True)
+def _isolated_auth_env(tmp_path_factory, monkeypatch):
+    """Keep every test away from the developer's real auth state: the collector config,
+    the grant token cache (both under XDG_CONFIG_HOME), and the AGENT_SESSIONS_* env vars.
+    Without this, a cached `agent-sessions auth` token on the dev box would silently win
+    load_config()'s precedence and flip tests into grant mode."""
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path_factory.mktemp("xdg-config")))
+    for var in (
+        "AGENT_SESSIONS_GRANT_TOKEN",
+        "AGENT_SESSIONS_HUB_URL",
+        "AGENT_SESSIONS_CLIENT_CERT",
+        "AGENT_SESSIONS_CLIENT_KEY",
+    ):
+        monkeypatch.delenv(var, raising=False)
+
+
 @pytest.fixture
 def hub():
     h = FakeHub().start()

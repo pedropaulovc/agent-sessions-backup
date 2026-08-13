@@ -11,30 +11,30 @@ from agent_sessions_client.config import AuthMode, ClientConfig
 from agent_sessions_client.http import HubClient, HubError
 
 
-def bearer_config(url: str) -> ClientConfig:
-    return ClientConfig(hub_url=url, auth_mode=AuthMode.BEARER, bearer_token="tok", dev_machine="test-machine")
+def grant_config(url: str) -> ClientConfig:
+    return ClientConfig(hub_url=url, auth_mode=AuthMode.GRANT, grant_token="agsr_tok")
 
 
 def test_get_json_and_headers(hub):
     hub.status_machines = [{"machine_id": "m1", "os": "linux"}]
-    client = HubClient(bearer_config(hub.url))
+    client = HubClient(grant_config(hub.url))
     resp = client.get("/api/v1/status")
     assert resp.status == 200
     body = resp.json()
     assert body["machines"] == [{"machine_id": "m1", "os": "linux"}]
 
 
-def test_bearer_and_dev_machine_headers_sent(hub):
-    client = HubClient(bearer_config(hub.url))
+def test_grant_bearer_header_sent(hub):
+    client = HubClient(grant_config(hub.url))
     client.get("/api/v1/status").json()
     assert len(hub.requests) == 1
     headers = hub.requests[0]["headers"]
-    assert headers["Authorization"] == "Bearer tok"
-    assert headers["X-Dev-Machine"] == "test-machine"
+    assert headers["Authorization"] == "Bearer agsr_tok"
+    assert "X-Dev-Machine" not in headers
 
 
 def test_query_params_encoded_and_none_values_dropped(hub):
-    client = HubClient(bearer_config(hub.url))
+    client = HubClient(grant_config(hub.url))
     client.get("/api/v1/sessions", {"from": "2026-07-18", "harness": None, "limit": 5}).json()
     params = hub.requests[0]["params"]
     assert params == {"from": ["2026-07-18"], "limit": ["5"]}
@@ -42,7 +42,7 @@ def test_query_params_encoded_and_none_values_dropped(hub):
 
 def test_response_header_case_insensitive_lookup(hub):
     hub.indexed_through = "2026-07-18T00:00:00.000Z"
-    client = HubClient(bearer_config(hub.url))
+    client = HubClient(grant_config(hub.url))
     resp = client.get("/api/v1/sessions")
     resp.json()
     # re-request since json() closes the connection; header() must be checked before draining the body
@@ -52,7 +52,7 @@ def test_response_header_case_insensitive_lookup(hub):
 
 
 def test_404_raises_hub_error_with_body(hub):
-    client = HubClient(bearer_config(hub.url))
+    client = HubClient(grant_config(hub.url))
     with pytest.raises(HubError) as exc_info:
         client.get("/api/v1/sessions/nonexistent").json()
     assert exc_info.value.status == 404
@@ -60,7 +60,7 @@ def test_404_raises_hub_error_with_body(hub):
 
 
 def test_connection_refused_raises_hub_error_with_none_status():
-    client = HubClient(bearer_config("http://127.0.0.1:1"))  # port 1 refuses
+    client = HubClient(grant_config("http://127.0.0.1:1"))  # port 1 refuses
     with pytest.raises(HubError) as exc_info:
         client.get("/api/v1/status")
     assert exc_info.value.status is None
@@ -119,7 +119,7 @@ def test_read_timeout_raises_hub_error():
     thread.start()
     try:
         host, port = server.server_address
-        client = HubClient(bearer_config(f"http://127.0.0.1:{port}"), timeout=0.05)
+        client = HubClient(grant_config(f"http://127.0.0.1:{port}"), timeout=0.05)
         with pytest.raises(HubError):
             client.get("/api/v1/status")
     finally:
@@ -158,7 +158,7 @@ def test_json_body_stall_after_headers_raises_hub_error():
             self.wfile.write(b'{"ok": true}')
 
     with _running_server(HeadersThenStallHandler) as url:
-        client = HubClient(bearer_config(url), timeout=0.05)
+        client = HubClient(grant_config(url), timeout=0.05)
         resp = client.get("/api/v1/status")  # headers arrive fine; get() returns normally
         with pytest.raises(HubError):
             resp.json()
@@ -180,7 +180,7 @@ def test_ndjson_body_stall_after_headers_raises_hub_error():
             self.wfile.write(b'{"meta": {}}\n')
 
     with _running_server(HeadersThenStallHandler) as url:
-        client = HubClient(bearer_config(url), timeout=0.05)
+        client = HubClient(grant_config(url), timeout=0.05)
         resp = client.get("/api/v1/sessions", {"format": "ndjson"})
         with pytest.raises(HubError):
             list(resp.iter_lines())
@@ -199,7 +199,7 @@ def test_connection_reset_before_headers_raises_hub_error():
             self.connection.close()
 
     with _running_server(SilentCloseHandler) as url:
-        client = HubClient(bearer_config(url))
+        client = HubClient(grant_config(url))
         with pytest.raises(HubError):
             client.get("/api/v1/status")
 
@@ -222,7 +222,7 @@ def test_truncated_content_length_raises_hub_error():
             self.connection.close()
 
     with _running_server(TruncatedContentLengthHandler) as url:
-        client = HubClient(bearer_config(url))
+        client = HubClient(grant_config(url))
         resp = client.get("/api/v1/status")  # headers arrive fine; get() returns normally
         with pytest.raises(HubError):
             resp.json()
@@ -246,7 +246,7 @@ def test_error_body_stall_raises_hub_error_with_status_preserved():
             time.sleep(0.5)  # never writes the body
 
     with _running_server(ErrorThenStallHandler) as url:
-        client = HubClient(bearer_config(url), timeout=0.05)
+        client = HubClient(grant_config(url), timeout=0.05)
         with pytest.raises(HubError) as exc_info:
             client.get("/api/v1/status")
         assert exc_info.value.status == 500
@@ -267,7 +267,7 @@ def test_read_bytes_body_stall_after_headers_raises_hub_error():
             self.wfile.write(b"raw bytes")
 
     with _running_server(HeadersThenStallHandler) as url:
-        client = HubClient(bearer_config(url), timeout=0.05)
+        client = HubClient(grant_config(url), timeout=0.05)
         resp = client.get("/api/v1/sessions/abc/raw")
         with pytest.raises(HubError):
             resp.read_bytes()
