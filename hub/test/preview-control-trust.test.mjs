@@ -14,6 +14,7 @@ import {
   generatedBuildConfig,
   generatedPrivateAppConfig,
   migrationArtifactSqlNames,
+  paginatedList,
   previewBearerToken,
   previewResourceOwner,
   queueConsumerIdsForQueue,
@@ -156,6 +157,50 @@ describe('trusted preview R2 cleanup', () => {
 
   it('treats an already deleted bucket as empty', async () => {
     await expect(emptyR2Bucket('preview-bucket', async () => null)).resolves.toBe(0);
+  });
+});
+
+describe('paginated account listings', () => {
+  it('walks page-based endpoints to exhaustion instead of reading only the first page', async () => {
+    const pages = {
+      1: { result: Array.from({ length: 2 }, (_, i) => ({ name: `row-${i}` })), result_info: { total_count: 3, per_page: 2 } },
+      2: { result: [{ name: 'row-2' }], result_info: { total_count: 3, per_page: 2 } },
+    };
+    const seen = [];
+    const rows = await paginatedList(async (pathname) => {
+      seen.push(pathname);
+      return pages[Number(new URLSearchParams(pathname.split('?')[1]).get('page'))];
+    }, 'd1/database', { pagination: 'page', rowsOf: (envelope) => envelope.result, perPage: 2 });
+    expect(rows.map((row) => row.name)).toEqual(['row-0', 'row-1', 'row-2']);
+    expect(seen).toEqual(['d1/database?per_page=2&page=1', 'd1/database?per_page=2&page=2']);
+  });
+
+  it('follows cursor-based endpoints until the cursor runs out', async () => {
+    const rows = await paginatedList(async (pathname) => {
+      if (!pathname.includes('cursor=')) {
+        return { result: { buckets: [{ name: 'pr-1-agent-sessions' }] }, result_info: { cursor: 'c2' } };
+      }
+      return { result: { buckets: [{ name: 'pr-2-agent-sessions' }] }, result_info: {} };
+    }, 'r2/buckets', { pagination: 'cursor', rowsOf: (envelope) => envelope.result?.buckets, perPage: 1 });
+    expect(rows.map((row) => row.name)).toEqual(['pr-1-agent-sessions', 'pr-2-agent-sessions']);
+  });
+
+  it('appends pagination onto an existing query string and tolerates a missing endpoint', async () => {
+    const seen = [];
+    const rows = await paginatedList(async (pathname) => {
+      seen.push(pathname);
+      return null;
+    }, 'd1/database?name=pr-1-sessions-index', { pagination: 'page', rowsOf: (envelope) => envelope.result });
+    expect(rows).toEqual([]);
+    expect(seen).toEqual(['d1/database?name=pr-1-sessions-index&per_page=100&page=1']);
+  });
+
+  it('refuses a cursor loop rather than spinning forever', async () => {
+    await expect(paginatedList(
+      async () => ({ result: { buckets: [{ name: 'x' }] }, result_info: { cursor: 'same' } }),
+      'r2/buckets',
+      { pagination: 'cursor', rowsOf: (envelope) => envelope.result?.buckets, perPage: 1 },
+    )).rejects.toThrow(/repeated a cursor/);
   });
 });
 

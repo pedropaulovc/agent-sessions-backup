@@ -73,6 +73,9 @@ export function derivePreviewBearer(seed, pr) {
   if (typeof seed !== 'string' || seed.trim().length < 32) {
     throw new Error('preview bearer seed must be at least 32 characters');
   }
+  if (!Number.isSafeInteger(pr) || pr <= 0) {
+    throw new Error('PR number must be a safe positive integer');
+  }
   return createHmac('sha256', seed.trim()).update(`sessions-preview-bearer:pr-${pr}`).digest('base64url');
 }
 

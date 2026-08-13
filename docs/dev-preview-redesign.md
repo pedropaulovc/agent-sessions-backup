@@ -11,8 +11,11 @@ Status: partially superseded (2026-08-13)
 > per-PR bearer, with persistent per-PR resources; production sessions move into a
 > preview as a hand-carried zip (viewer "Export zip" → `preview-upload-session.mjs`).
 > Current model: `infra/cf/deploy.md` ("Trusted per-PR preview controller" and "Moving a
-> production session into a preview"). The local-development and build-sandbox design
-> below remains accurate; front-door/bridge/debug-exchange sections are historical.
+> production session into a preview"). **Only the local-development and build-sandbox
+> sections below remain operational guidance.** Every other section — including
+> "Decisions", "Target environment model", and everything touching the front door,
+> generations, Access, assertions, the bridge, or the debug exchange — is preserved as
+> historical record of the superseded design and must not be followed.
 
 This document defines the isolated local and per-PR preview paths. Production data and deployment remain separate.
 

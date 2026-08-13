@@ -30,6 +30,7 @@ export function parseUploadArguments(argv) {
     if (flag === '--pr') {
       if (!/^[1-9]\d*$/.test(value)) throw new Error('--pr must be a positive integer');
       values.pr = Number(value);
+      if (!Number.isSafeInteger(values.pr)) throw new Error('--pr must be a safe positive integer');
     } else {
       values.zip = value;
     }
@@ -56,6 +57,16 @@ export function readExportZip(bytes) {
       if (typeof entry[field] !== 'string' || entry[field].length === 0) {
         throw new Error(`export manifest entry missing ${field}`);
       }
+    }
+    // fetch() normalizes `.`/`..` in the URL path BEFORE the hub routes it, so a crafted
+    // manifest entry could otherwise redirect an upload to a different machine or store.
+    // machine and store are single path segments; relpath is validated segment by segment.
+    if (entry.machine.includes('/') || entry.store.includes('/')) {
+      throw new Error(`export manifest entry has a multi-segment machine or store: ${entry.machine}/${entry.store}`);
+    }
+    const segments = [entry.machine, entry.store, ...entry.relpath.split('/')];
+    if (segments.some((segment) => segment === '' || segment === '.' || segment === '..')) {
+      throw new Error(`export manifest entry path is not normalized: ${entry.machine}/${entry.store}/${entry.relpath}`);
     }
     const name = `${entry.machine}/${entry.store}/${entry.relpath}`;
     const body = files[name];
@@ -88,6 +99,8 @@ async function putEntry(origin, token, entry, log) {
     redirect: 'error',
     headers,
     body: entry.body,
+    // A 95MB PUT over a slow uplink is legitimate; a hung socket forever is not.
+    signal: AbortSignal.timeout(10 * 60 * 1000),
   });
   if (response.status !== 200 && response.status !== 201) {
     throw new Error(`upload of ${entry.name} failed with ${response.status}: ${(await response.text()).slice(0, 500)}`);
@@ -102,6 +115,8 @@ async function waitForSession(origin, token, sessionId, log, timeoutMs = 120_000
     const response = await fetch(`${origin}/api/v1/sessions/${encodeURIComponent(sessionId)}`, {
       redirect: 'error',
       headers: { authorization: `Bearer ${token}`, accept: 'application/json', 'cache-control': 'no-store' },
+      // Each poll is bounded by the overall deadline so a hung request can't outlive it.
+      signal: AbortSignal.timeout(Math.min(15_000, Math.max(1, deadline - Date.now()))),
     });
     last = await response.text();
     if (response.ok) {

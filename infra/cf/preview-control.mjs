@@ -16,6 +16,7 @@ import {
   fileRecord,
   generatedPrivateAppConfig,
   headSha,
+  paginatedList,
   parseArgs,
   positiveInteger,
   previewBearerToken,
@@ -128,18 +129,20 @@ async function verifyArtifact(directory, expected) {
 }
 
 async function github(pathname, init = {}) {
+  const { allowNotFound = false, ...fetchInit } = init;
   const token = process.env.GITHUB_TOKEN;
   if (!token) fail('GITHUB_TOKEN is required for trusted GitHub state checks');
   const response = await fetch(`https://api.github.com${pathname}`, {
-    ...init,
+    ...fetchInit,
     headers: {
       accept: 'application/vnd.github+json',
       authorization: `Bearer ${token}`,
       'user-agent': 'sessions-preview-control',
       'x-github-api-version': '2022-11-28',
-      ...init.headers,
+      ...fetchInit.headers,
     },
   });
+  if (allowNotFound && response.status === 404) return null;
   if (!response.ok) fail(`GitHub API ${pathname} failed with ${response.status}`);
   return response.json();
 }
@@ -201,29 +204,30 @@ async function d1Query(databaseId, sql, params = []) {
 }
 
 async function resolveExistingId(kind, name) {
-  let result;
-  let rows;
   if (kind === 'r2') {
-    result = await cf(`r2/buckets/${encodeURIComponent(name)}`, { allowNotFound: true });
+    const result = await cf(`r2/buckets/${encodeURIComponent(name)}`, { allowNotFound: true });
     return result ? name : null;
   }
   if (kind === 'worker') {
-    result = await cf(`workers/scripts/${encodeURIComponent(name)}/settings`, { allowNotFound: true });
+    const result = await cf(`workers/scripts/${encodeURIComponent(name)}/settings`, { allowNotFound: true });
     return result ? name : null;
   }
   if (kind === 'd1') {
-    result = await cf(`d1/database?name=${encodeURIComponent(name)}`, { allowNotFound: true });
-    rows = Array.isArray(result) ? result : result?.result ?? [];
+    const rows = await paginatedList(cf, `d1/database?name=${encodeURIComponent(name)}`, {
+      pagination: 'page', rowsOf: (envelope) => envelope.result,
+    });
     return rows.find((row) => row.name === name)?.uuid ?? null;
   }
   if (kind === 'kv') {
-    result = await cf(`storage/kv/namespaces?title=${encodeURIComponent(name)}`, { allowNotFound: true });
-    rows = Array.isArray(result) ? result : result?.result ?? [];
+    const rows = await paginatedList(cf, `storage/kv/namespaces?title=${encodeURIComponent(name)}`, {
+      pagination: 'page', rowsOf: (envelope) => envelope.result,
+    });
     return rows.find((row) => row.title === name)?.id ?? null;
   }
   if (kind === 'queue') {
-    result = await cf('queues', { allowNotFound: true });
-    rows = Array.isArray(result) ? result : result?.queues ?? result?.result ?? [];
+    const rows = await paginatedList(cf, 'queues', {
+      pagination: 'page', rowsOf: (envelope) => envelope.result ?? envelope.queues,
+    });
     return rows.find((row) => row.queue_name === name)?.queue_id ?? null;
   }
   fail(`unsupported resource kind: ${kind}`);
@@ -257,11 +261,19 @@ async function ensureBackingResources(names) {
  * recreated empty — and migrations apply from scratch. Loud by design: the reset drops any
  * hand-uploaded session data, and re-uploading is one self-serve command.
  */
+/** A D1 error that means the table simply isn't there yet — anything else must propagate. */
+function isMissingTable(error) {
+  return /no such table/i.test(String(error?.message ?? error));
+}
+
 async function migrationDivergence(databaseId, artifactMigrations) {
   let applied;
   try {
     applied = await d1Query(databaseId, "SELECT name FROM d1_migrations ORDER BY id");
-  } catch {
+  } catch (error) {
+    // Only a provably-fresh database (no wrangler ledger table) skips the guard; an auth
+    // failure, 5xx, or network error must not silently report "not diverged".
+    if (!isMissingTable(error)) throw error;
     return { diverged: false, reason: 'fresh database (no migration ledger)' };
   }
   const appliedNames = applied.map((row) => row.name);
@@ -274,8 +286,9 @@ async function migrationDivergence(databaseId, artifactMigrations) {
   try {
     const rows = await d1Query(databaseId, 'SELECT value FROM meta WHERE key = ?1', [MIGRATION_LEDGER_KEY]);
     if (rows[0]?.value) ledger = JSON.parse(rows[0].value);
-  } catch {
-    // A pre-guard database has no meta ledger; nothing to compare against yet.
+  } catch (error) {
+    // A pre-guard database has no meta table; any other failure must propagate.
+    if (!isMissingTable(error)) throw error;
   }
   for (const name of appliedNames) {
     const recorded = ledger[name];
@@ -342,6 +355,9 @@ function deployApp(wrangler, configPath, cwd, expectedHost) {
   const urls = [...output.matchAll(/https:\/\/[^\s]+\.workers\.dev/gi)].map((match) => match[0]);
   const foreign = urls.filter((url) => new URL(url).hostname !== expectedHost);
   if (foreign.length > 0) fail(`preview deployment exposed an unexpected URL: ${foreign[0]}`);
+  // An empty match set proves nothing — require positive confirmation the deploy landed
+  // on the stable hostname, or a wrangler output-format change silently voids this gate.
+  if (urls.length === 0) fail(`preview deployment did not report the expected workers.dev URL for ${expectedHost}`);
   return output;
 }
 
@@ -376,6 +392,9 @@ async function provision() {
     process.stderr.write(`!! preview D1 reset: ${divergence.reason} — dropping ${names.d1} and reapplying from scratch\n`);
     await cf(`d1/database/${encodeURIComponent(resources.d1)}`, { method: 'DELETE', allowNotFound: true });
     resources.d1 = await ensureResource('d1', names.d1, 'd1/database', { name: names.d1 }, ['uuid', 'id']);
+    // The index rows are gone with the database, so the stored R2 objects would be
+    // unreachable orphans — drop them in the same reset to keep the two stores consistent.
+    await emptyR2Bucket(names.r2, cf);
   }
 
   const temporary = path.join(os.tmpdir(), `sessions-preview-${pr}-${runId}`);
@@ -619,26 +638,28 @@ async function listOwnedResources() {
     const owner = previewResourceOwner(name);
     if (owner) owned.push({ kind, name, id, ...owner });
   };
-  const workers = await cf('workers/scripts?per_page=100', { allowNotFound: true }) ?? [];
-  for (const script of Array.isArray(workers) ? workers : workers.result ?? []) {
-    record('worker', script.id ?? script.name, script.id ?? script.name);
-  }
-  const databases = await cf('d1/database?per_page=1000', { allowNotFound: true }) ?? [];
-  for (const database of Array.isArray(databases) ? databases : databases.result ?? []) {
-    record('d1', database.name, database.uuid);
-  }
-  const buckets = await cf('r2/buckets', { allowNotFound: true });
-  for (const bucket of buckets?.buckets ?? (Array.isArray(buckets) ? buckets : [])) {
-    record('r2', bucket.name, bucket.name);
-  }
-  const namespaces = await cf('storage/kv/namespaces?per_page=100', { allowNotFound: true }) ?? [];
-  for (const namespace of Array.isArray(namespaces) ? namespaces : namespaces.result ?? []) {
-    record('kv', namespace.title, namespace.id);
-  }
-  const queues = await cf('queues', { allowNotFound: true });
-  for (const queue of queues?.queues ?? (Array.isArray(queues) ? queues : [])) {
-    record('queue', queue.queue_name, queue.queue_id);
-  }
+  // Workers scripts is the one account list with no documented pagination; the rest are
+  // walked to exhaustion — a first-page-only read here silently leaks closed previews.
+  const workers = await paginatedList(cf, 'workers/scripts', {
+    pagination: 'none', rowsOf: (envelope) => envelope.result,
+  });
+  for (const script of workers) record('worker', script.id ?? script.name, script.id ?? script.name);
+  const databases = await paginatedList(cf, 'd1/database', {
+    pagination: 'page', rowsOf: (envelope) => envelope.result,
+  });
+  for (const database of databases) record('d1', database.name, database.uuid);
+  const buckets = await paginatedList(cf, 'r2/buckets', {
+    pagination: 'cursor', rowsOf: (envelope) => envelope.result?.buckets ?? envelope.buckets,
+  });
+  for (const bucket of buckets) record('r2', bucket.name, bucket.name);
+  const namespaces = await paginatedList(cf, 'storage/kv/namespaces', {
+    pagination: 'page', rowsOf: (envelope) => envelope.result,
+  });
+  for (const namespace of namespaces) record('kv', namespace.title, namespace.id);
+  const queues = await paginatedList(cf, 'queues', {
+    pagination: 'page', rowsOf: (envelope) => envelope.result ?? envelope.queues,
+  });
+  for (const queue of queues) record('queue', queue.queue_name, queue.queue_id);
   return owned;
 }
 
@@ -689,11 +710,25 @@ async function janitor() {
   const owned = await listOwnedResources();
   const prNumbers = [...new Set(owned.map((item) => item.pr))].sort((a, b) => a - b);
   const closedPrs = new Set();
+  const unresolvedPrs = new Set();
   for (const number of prNumbers) {
-    const pull = await github(`/repos/${repository}/pulls/${number}`).catch(() => null);
-    if (!pull || pull.state === 'closed') closedPrs.add(number);
+    let pull;
+    try {
+      // A definitive 404 means the PR number never existed — its debris is deletable.
+      pull = await github(`/repos/${repository}/pulls/${number}`, { allowNotFound: true });
+    } catch {
+      // Fail CLOSED on an unknown PR state: a GitHub rate limit or outage must never
+      // classify a live PR as closed and delete its persistent preview data.
+      unresolvedPrs.add(number);
+      continue;
+    }
+    if (pull === null || pull.state === 'closed') closedPrs.add(number);
   }
-  const deletable = owned.filter((item) => item.legacy || closedPrs.has(item.pr));
+  if (unresolvedPrs.size > 0) {
+    process.stderr.write(`!! janitor: skipping PRs with unresolved GitHub state: ${[...unresolvedPrs].sort((a, b) => a - b).join(', ')}\n`);
+  }
+  const deletable = owned.filter((item) =>
+    closedPrs.has(item.pr) || (item.legacy && !unresolvedPrs.has(item.pr)));
   deletable.sort((a, b) =>
     a.pr - b.pr || CLEANUP_ORDER[a.kind] - CLEANUP_ORDER[b.kind]);
   const deleted = [];

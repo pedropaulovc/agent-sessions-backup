@@ -49,6 +49,33 @@ test('rejects foreign zips and manifests that lie about their entries', () => {
   assert.throws(() => readExportZip(missingBody), /missing the entry its manifest lists/);
 });
 
+test('rejects manifest entries whose paths could traverse to another machine or store', () => {
+  // fetch() normalizes `.`/`..` in the URL before the hub routes it, so a crafted
+  // manifest could otherwise redirect an upload — reject at parse, never at upload.
+  const traversals = [
+    { machine: 'amet', store: 'claude-projects', relpath: '../../other-machine/other-store/file' },
+    { machine: 'amet', store: 'claude-projects', relpath: 'a/../file' },
+    { machine: 'amet', store: 'claude-projects', relpath: './file' },
+    { machine: 'amet', store: 'claude-projects', relpath: 'a//file' },
+    { machine: '..', store: 'claude-projects', relpath: 'file' },
+    { machine: 'amet', store: '.', relpath: 'file' },
+  ];
+  for (const entry of traversals) {
+    assert.throws(() => readExportZip(exportZip({ entries: [entry] })), /not normalized/, JSON.stringify(entry));
+  }
+  const multiSegment = [
+    { machine: 'a/b', store: 'claude-projects', relpath: 'file' },
+    { machine: 'amet', store: 's/t', relpath: 'file' },
+  ];
+  for (const entry of multiSegment) {
+    assert.throws(() => readExportZip(exportZip({ entries: [entry] })), /multi-segment/, JSON.stringify(entry));
+  }
+});
+
+test('rejects an unsafe --pr before deriving anything from it', () => {
+  assert.throws(() => parseUploadArguments(['--pr', '9007199254740993', '--zip', 's.zip']), /safe positive integer/);
+});
+
 test('builds the collector upload URL with per-segment encoding', () => {
   const target = uploadTarget('https://pr-42-app.agent-sessions-nonproduction.workers.dev', {
     machine: 'amet',

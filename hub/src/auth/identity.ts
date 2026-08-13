@@ -48,12 +48,25 @@ export async function previewBearerTokenOk(token: string | null, env: Env): Prom
   return tokenMatches(token, env.PREVIEW_BEARER);
 }
 
-/** True when the request presents the preview bearer via header or session cookie. */
+/**
+ * True when the request presents the preview bearer via header or session cookie.
+ * VIEWER pages only — the machine API deliberately never accepts the cookie
+ * (see previewApiBearerOk), so a cross-site top-level GET riding the SameSite=Lax
+ * cookie can reach nothing but pages same-origin policy already walls off.
+ */
 export async function previewBearerOk(request: Request, env: Env): Promise<boolean> {
   if (env.ENVIRONMENT !== 'preview' || !env.PREVIEW_BEARER) return false;
   const auth = request.headers.get('authorization');
   const presented = auth?.startsWith('Bearer ') ? auth.slice('Bearer '.length) : cookieValue(request, PREVIEW_SESSION_COOKIE);
   return previewBearerTokenOk(presented, env);
+}
+
+/** The machine-API gate: explicit `Authorization: Bearer` only, never the browser cookie. */
+async function previewApiBearerOk(request: Request, env: Env): Promise<boolean> {
+  if (env.ENVIRONMENT !== 'preview' || !env.PREVIEW_BEARER) return false;
+  const auth = request.headers.get('authorization');
+  if (!auth?.startsWith('Bearer ')) return false;
+  return previewBearerTokenOk(auth.slice('Bearer '.length), env);
 }
 
 /** Resolve a human viewer identity in preview from the per-PR bearer. */
@@ -90,14 +103,25 @@ export async function machineIdentity(request: Request, env: Env): Promise<Ident
 
   if (env.ENVIRONMENT === 'development') return devHeaderIdentity(request, env);
   if (env.ENVIRONMENT === 'preview') {
-    if (!(await previewBearerOk(request, env))) return { kind: 'anonymous' };
-    await ensureMachineRow(env, PREVIEW_BEARER_MACHINE, 'synthetic');
+    if (!(await previewApiBearerOk(request, env))) return { kind: 'anonymous' };
     return {
       kind: 'machine', machineId: PREVIEW_BEARER_MACHINE, isAdmin: true,
       certSlot: 'current', actor: PREVIEW_BEARER_MACHINE,
     };
   }
   return { kind: 'anonymous' };
+}
+
+/**
+ * The one preview gate both upload entry points share: an admin identity pushing a
+ * hand-carried zip may name machines this environment has never seen, so the target
+ * machine's row is created before the files-table FK needs it. Covers the synthetic
+ * bearer machine itself too — machineIdentity no longer writes D1 on every request.
+ */
+export async function ensurePreviewUploadMachine(env: Env, identity: Identity, machineId: string): Promise<void> {
+  if (env.ENVIRONMENT !== 'preview') return;
+  if (identity.kind !== 'machine' || !identity.isAdmin) return;
+  await ensureMachineRow(env, machineId, machineId === PREVIEW_BEARER_MACHINE ? 'synthetic' : 'unknown');
 }
 
 /**

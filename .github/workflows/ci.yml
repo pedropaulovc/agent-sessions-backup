@@ -5,6 +5,11 @@ on:
   push:
     branches: [main]
 
+# Least privilege for every job: checkout and the deploy job's current-main read only need
+# contents: read. Nothing in this workflow writes through the GitHub token.
+permissions:
+  contents: read
+
 jobs:
   # A workflow expression error is not a test failure — GitHub rejects the file at VALIDATION time
   # and the run produces ZERO jobs, so every other check silently never runs. `yaml.safe_load` does

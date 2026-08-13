@@ -94,6 +94,55 @@ export function previewBearerToken(seed, pr) {
     .digest('base64url');
 }
 
+/**
+ * Exhaustively follow one Cloudflare list endpoint's pagination. The account-level list
+ * APIs disagree on scheme — page/per_page (D1, KV, Queues), cursor (R2 buckets), or no
+ * pagination at all (Workers scripts) — and a first-page-only read makes cleanup silently
+ * leak resources and existence probes silently miss, so every caller goes through here.
+ * `rowsOf` maps one response envelope to its row array (the endpoints also disagree on
+ * where the rows live). Fails loud on a non-terminating walk rather than looping forever.
+ */
+export async function paginatedList(request, pathname, { pagination, rowsOf, perPage = 100 }) {
+  if (typeof request !== 'function') fail('list request function is required');
+  const joiner = pathname.includes('?') ? '&' : '?';
+  if (pagination === 'none') {
+    const envelope = await request(pathname, { allowNotFound: true, returnEnvelope: true });
+    return envelope === null ? [] : rowsOf(envelope) ?? [];
+  }
+  const rows = [];
+  if (pagination === 'page') {
+    for (let page = 1; page <= 1000; page += 1) {
+      const envelope = await request(`${pathname}${joiner}per_page=${perPage}&page=${page}`, {
+        allowNotFound: true, returnEnvelope: true,
+      });
+      if (envelope === null) return rows;
+      const batch = rowsOf(envelope) ?? [];
+      rows.push(...batch);
+      const total = envelope.result_info?.total_count;
+      if (batch.length === 0 || batch.length < perPage) return rows;
+      if (typeof total === 'number' && rows.length >= total) return rows;
+    }
+    fail(`page-based listing did not terminate for ${pathname}`);
+  }
+  if (pagination === 'cursor') {
+    const seenCursors = new Set();
+    let cursor;
+    for (let step = 0; step <= 1000; step += 1) {
+      const query = `${joiner}per_page=${perPage}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
+      const envelope = await request(`${pathname}${query}`, { allowNotFound: true, returnEnvelope: true });
+      if (envelope === null) return rows;
+      const batch = rowsOf(envelope) ?? [];
+      rows.push(...batch);
+      cursor = envelope.result_info?.cursor;
+      if (typeof cursor !== 'string' || cursor.length === 0 || batch.length === 0) return rows;
+      if (seenCursors.has(cursor)) fail(`cursor-based listing repeated a cursor for ${pathname}`);
+      seenCursors.add(cursor);
+    }
+    fail(`cursor-based listing did not terminate for ${pathname}`);
+  }
+  fail(`unsupported pagination mode: ${pagination}`);
+}
+
 export async function emptyR2Bucket(bucketName, request) {
   required(bucketName, 'R2 bucket name');
   if (typeof request !== 'function') fail('R2 request function is required');

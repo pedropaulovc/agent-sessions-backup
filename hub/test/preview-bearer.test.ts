@@ -48,6 +48,10 @@ describe('preview bearer auth', () => {
       { authorization: 'Bearer wrong' },
       { authorization: `Bearer ${TOKEN.slice(0, -1)}x` },
       { cookie: `${PREVIEW_SESSION_COOKIE}=wrong` },
+      // The VALID browser session cookie must never reach the machine API gate: the
+      // cookie authenticates viewer pages only, and the API requires the explicit
+      // Authorization header (a cross-site top-level GET rides SameSite=Lax cookies).
+      { cookie: `${PREVIEW_SESSION_COOKIE}=${TOKEN}` },
     ];
     for (const headers of headerCases) {
       expect(await machineIdentity(new Request(`https://${HOST}/api/v1/status`, { headers }), environment))

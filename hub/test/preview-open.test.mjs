@@ -29,6 +29,14 @@ test('the locally derived bearer matches the provisioning derivation exactly', (
   assert.throws(() => derivePreviewBearer('short', 42), /at least 32 characters/);
 });
 
+test('derivation rejects an unsafe or non-positive PR number outright', () => {
+  // Number('9007199254740993') silently rounds — a caller that skipped its own
+  // validation must not derive a bearer (and a host) for a DIFFERENT PR.
+  for (const pr of [0, -1, 1.5, Number.MAX_SAFE_INTEGER + 1, Number('9007199254740993'), NaN, '42']) {
+    assert.throws(() => derivePreviewBearer(SEED, pr), /safe positive integer/, String(pr));
+  }
+});
+
 test('seed resolution prefers the environment and falls back to the seed file', () => {
   assert.equal(readPreviewSeed({ PREVIEW_BEARER_SEED: ` ${SEED} ` }), SEED);
   assert.equal(
