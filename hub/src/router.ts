@@ -1,4 +1,4 @@
-import { machineIdentity, requirePreviewOrigin } from './auth/identity';
+import { machineIdentity } from './auth/identity';
 import { grantIdentity, readGrantApiRoute, type GrantIdentity } from './auth/read-grants';
 import {
   cloudflareOAuthStatus,
@@ -30,12 +30,6 @@ function safeDecode(segment: string): string | null {
 export async function route(request: Request, env: Env, _ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
 
-  // Preview version URLs are public infrastructure endpoints. Only the trusted front
-  // door may reach PR code; production/development deliberately ignore this header.
-  if (!await requirePreviewOrigin(request, env)) {
-    return Response.json({ error: 'direct_origin_denied' }, { status: 403 });
-  }
-
   if (url.pathname === '/healthz') {
     if (env.ENVIRONMENT !== 'development') {
       return Response.json({ ok: true, environment: env.ENVIRONMENT });
@@ -61,9 +55,12 @@ export async function route(request: Request, env: Env, _ctx: ExecutionContext):
   }
 
   const apiOAuthCallback = url.hostname === env.API_HOST && url.pathname === '/oauth/cloudflare/callback';
+  // Preview serves API and viewer from ONE workers.dev hostname (API_HOST === VIEWER_HOST),
+  // so its dispatch is by pathname alone; the host-wide API catch exists for production's
+  // mTLS-only api.sessions.vza.net, which must never serve viewer pages.
   if (url.pathname.startsWith('/api/')
       || apiOAuthCallback
-      || (env.ENVIRONMENT !== 'development' && url.hostname === env.API_HOST)) {
+      || (env.ENVIRONMENT !== 'development' && env.ENVIRONMENT !== 'preview' && url.hostname === env.API_HOST)) {
     return apiRoute(request, url, env);
   }
   return viewerRoute(request, url, env);
@@ -227,7 +224,7 @@ export async function previewDiagnostics(request: Request, env: Env): Promise<Re
   const required = [
     env.PREVIEW_HEAD_SHA,
     env.PREVIEW_ARTIFACT_DIGEST,
-    env.PREVIEW_GENERATION,
+    env.PREVIEW_PR_NUMBER,
     env.SCHEMA_DIGEST,
   ];
   if (required.some((value) => !value)) {
@@ -239,7 +236,7 @@ export async function previewDiagnostics(request: Request, env: Env): Promise<Re
   return Response.json({
     headSha: env.PREVIEW_HEAD_SHA,
     artifactDigest: env.PREVIEW_ARTIFACT_DIGEST,
-    generation: env.PREVIEW_GENERATION,
+    prNumber: Number(env.PREVIEW_PR_NUMBER),
     schemaDigest: env.SCHEMA_DIGEST,
   }, { headers: { 'cache-control': 'no-store' } });
 }

@@ -64,7 +64,7 @@ await mkdir(migrationsOut, { recursive: true });
 const temporary = await mkdtemp(path.join(os.tmpdir(), 'sessions-preview-build-'));
 
 try {
-  const names = resourceNames(pr, sourceRunId, sha);
+  const names = resourceNames(pr);
   const buildConfig = generatedBuildConfig({
     main: path.join(sourceHub, 'src', 'preview.ts'),
     workerName: names.app,

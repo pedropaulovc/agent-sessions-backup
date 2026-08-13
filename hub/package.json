@@ -12,10 +12,11 @@
     "session:seed-corpus": "node ../scripts/seed-local.mjs",
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.e2e.json",
-    "test": "vitest run && npm run test:migrations && npm run test:dev-lifecycle && npm run test:preview-open",
+    "test": "vitest run && npm run test:migrations && npm run test:dev-lifecycle && npm run test:preview-open && npm run test:preview-upload",
     "test:e2e": "playwright test",
     "test:dev-lifecycle": "node --test test/dev-lifecycle.test.mjs",
     "test:preview-open": "node --test test/preview-open.test.mjs",
+    "test:preview-upload": "node --test test/preview-upload.test.mjs",
     "test:migrations": "node --test test/migrations.acceptance.mjs",
     "migrations": "node scripts/migrations.mjs",
     "production-baseline": "node scripts/approve-production-baseline.mjs"

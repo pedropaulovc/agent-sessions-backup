@@ -1,6 +1,18 @@
 # Local and PR environment redesign
 
-Status: active
+Status: partially superseded (2026-08-13)
+
+> [!IMPORTANT]
+> **The preview edge described below was replaced.** The stable front door
+> (`pr-N-preview.sessions.vza.net`), Cloudflare Access, the signed request assertions,
+> the blue/green generation machinery, and the encrypted `sessions-dev-bridge` flow are
+> gone. Each PR now gets a **self-contained preview** at
+> `https://pr-<n>-app.agent-sessions-nonproduction.workers.dev`, gated by one derived
+> per-PR bearer, with persistent per-PR resources; production sessions move into a
+> preview as a hand-carried zip (viewer "Export zip" → `preview-upload-session.mjs`).
+> Current model: `infra/cf/deploy.md` ("Trusted per-PR preview controller" and "Moving a
+> production session into a preview"). The local-development and build-sandbox design
+> below remains accurate; front-door/bridge/debug-exchange sections are historical.
 
 This document defines the isolated local and per-PR preview paths. Production data and deployment remain separate.
 
@@ -12,8 +24,8 @@ The finished workflow has four supported paths:
 |---|---|---|
 | Run the hub locally | `npm --prefix hub run dev:up` | None. The server binds to loopback and uses isolated local state. |
 | Run browser tests | `npm --prefix hub run test:e2e` | None. The harness creates, migrates, seeds, starts, tests, and removes its own environment. |
-| Open a PR preview | `npm --prefix hub run preview:open -- --pr <number>` | Opens the stable front door. Cloudflare Access handles user consent; no SQL or Wrangler login is required. |
-| Debug a production session | `sessions-dev-bridge pull --session <id> --target local\|pr-<number>` | A signed bridge installed outside the checkout opens the production and destination approvals. Transport is encrypted to the approved destination. |
+| Open a PR preview | `npm --prefix hub run preview:open -- --pr <number>` | Prints/opens the tokenized preview URL; visiting once sets the session cookie. Token derived from the local preview seed. |
+| Debug a production session | Viewer "Export zip" (owner, passkey) → `node hub/scripts/preview-upload-session.mjs --pr <number> --zip <file>` (agent) | The export is behind the production passkey session; the upload is behind the derived per-PR bearer. |
 
 The same Playwright project runs against the local server on Windows and Linux, and against the deployed PR URL after preview deployment.
 

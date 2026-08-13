@@ -1,4 +1,4 @@
-import type { Identity } from '../auth/identity';
+import { ensureMachineRow, type Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
 import { markPendingAndEnqueue } from '../queue';
 import { hex, objectSha256 } from './ops';
@@ -110,6 +110,11 @@ export async function createMultipart(
 ): Promise<Response> {
   if (identity.kind !== 'machine') return Response.json({ error: 'unauthorized' }, { status: 401 });
   if (!ownsPath(identity, machineId)) return Response.json({ error: 'machine_mismatch' }, { status: 403 });
+  // Same rule as putFile: preview admin uploads may name machines this environment has never
+  // enrolled (hand-carried session zips keep their original machine ids).
+  if (env.ENVIRONMENT === 'preview' && identity.isAdmin && identity.machineId !== machineId) {
+    await ensureMachineRow(env, machineId);
+  }
 
   const parsed = parseObjectHeaders(request);
   if ('error' in parsed) return Response.json({ error: parsed.error }, { status: 400 });

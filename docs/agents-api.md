@@ -36,12 +36,12 @@ authenticate:
    grants are listed and revocable on the viewer's `/settings` page.
 
    Run the auth CLI from a **trusted checkout** (`main`, or your own reviewed branch) —
-   the CLI handles the minted token, so an untrusted PR branch's copy could leak it. This
-   is a deliberately lighter bar than the signed `sessions-dev-bridge` (which stays the
-   ONLY authorization client for prod→preview session export): a read grant is short-lived,
-   read-only, revocable at `/settings`, and every mint requires the owner's fresh passkey
-   on a page that displays the label/TTL being approved — it cannot move or mutate prod
-   bytes.
+   the CLI handles the minted token, so an untrusted PR branch's copy could leak it. A
+   read grant is short-lived, read-only, revocable at `/settings`, and every mint requires
+   the owner's fresh passkey on a page that displays the label/TTL being approved — it
+   cannot move or mutate prod bytes. (Prod→preview session export is likewise
+   passkey-gated: the owner downloads the session zip from the viewer's "Export zip"
+   button and hands it over; see `infra/cf/deploy.md`.)
 2. **mTLS (ingest + fleet aggregates — collectors).** Present a machine's client cert+key
    on every request. Any enrolled machine's paths are in
    `~/.config/agent-collector/config.toml` (`client_cert_path` / `client_key_path`), e.g.:
@@ -56,9 +56,11 @@ authenticate:
    `403 {"error":"passkey_grant_required"}` — session content is read-grant-only
    (`hub/src/router.ts`; development keeps cert reads for the local loop).
 
-The old preview-only `DEV_AUTH` bearer (`Authorization: Bearer <DEV_AUTH>` +
-`x-dev-machine`) is gone along with the Workers Builds previews that used it; the current
-per-PR preview stack authenticates through the preview front door, not this API.
+Per-PR previews expose this same API at
+`https://pr-<n>-app.agent-sessions-nonproduction.workers.dev`, authenticated by the
+derived per-PR bearer (`Authorization: Bearer …`; see `infra/cf/deploy.md`) — the bearer
+acts as an admin machine identity there, which is what
+`hub/scripts/preview-upload-session.mjs` uses to push hand-carried session zips.
 
 ## Endpoints
 

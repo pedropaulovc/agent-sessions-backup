@@ -1,7 +1,7 @@
 import { originOk, readSession } from '../auth/session';
 import { webauthnRoute } from '../auth/webauthn';
 import { readGrantBrowserRoute } from '../auth/read-grants';
-import { previewHumanIdentity } from '../auth/identity';
+import { previewBearerTokenOk, previewHumanIdentity, PREVIEW_SESSION_COOKIE } from '../auth/identity';
 import { debugBrowserRoute } from '../api/debug-exchange';
 import { assetEndpoint } from './assets';
 import { blobEndpoint } from './blob';
@@ -15,9 +15,9 @@ import { sessionPage, TURNS_PER_PAGE } from './session';
  * Host-routed viewer.
  *
  * Development is loopback-only and open. Production uses only its passkey session.
- * Preview authentication terminates at the trusted front door: PR code receives a
- * short-lived human assertion bound to this exact request, never an Access token,
- * production session, reusable bearer, or edge cookie.
+ * Preview browsers authenticate with the per-PR bearer: visiting `/?token=…` (the URL
+ * `preview:open` prints) sets the `__Host` session cookie and every later request rides
+ * it. There is no login page, passkey surface, or production session in preview.
  */
 export async function viewerRoute(request: Request, url: URL, env: Env): Promise<Response> {
   // Preview has no local login or WebAuthn surface. Those routes would create/read a
@@ -29,6 +29,22 @@ export async function viewerRoute(request: Request, url: URL, env: Env): Promise
     // exactly like /login. Preview must never reach it (same rule as webauthnRoute).
     const grantResp = await readGrantBrowserRoute(request, url, env);
     if (grantResp) return grantResp;
+  } else if (request.method === 'GET') {
+    const token = url.searchParams.get('token');
+    if (token !== null && await previewBearerTokenOk(token, env)) {
+      // Mint the browser session, then redirect to the same URL without the token so it
+      // doesn't linger in the address bar or get copied onward with links.
+      const clean = new URL(url);
+      clean.searchParams.delete('token');
+      return new Response(null, {
+        status: 302,
+        headers: {
+          location: clean.pathname + clean.search,
+          'set-cookie': `${PREVIEW_SESSION_COOKIE}=${token}; Secure; HttpOnly; Path=/; SameSite=Lax; Max-Age=86400`,
+          'cache-control': 'no-store',
+        },
+      });
+    }
   }
 
   const access = await viewerAccess(request, env);

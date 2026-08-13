@@ -1,5 +1,4 @@
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
-import { generateKeyPairSync } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
@@ -7,83 +6,51 @@ import { SYNTHETIC_EXPECTATIONS } from '../scripts/lib/dev-seed.mjs';
 import { detect } from '../src/ingest/detect';
 import {
   PREVIEW_ACCOUNT_ID,
-  acknowledgedResources,
-  assertInventoryItem,
+  PRODUCTION_ACCOUNT_ID,
   assertPreviewAccount,
   assertTrustedWorkflowRef,
   assertWorkerModulePayload,
   emptyR2Bucket,
   generatedBuildConfig,
   generatedPrivateAppConfig,
-  generatedTrustedWrapperConfig,
-  inventoryGenerations,
   migrationArtifactSqlNames,
+  previewBearerToken,
+  previewResourceOwner,
+  queueConsumerIdsForQueue,
   resolveBundlerInputPath,
-  queueConsumerIdsForWorker,
-  previewBrowserGrantRequest,
-  previewEdgeSessionCookie,
-  requiredCloudflareAccessHeaders,
   resourceNames,
-  sortCleanupInventory,
-  wranglerWorkerBundle,
-  workerScriptCoversVersion,
   trustedWranglerEnvironment,
+  wranglerWorkerBundle,
 } from '../../infra/cf/preview-trust.mjs';
 
 const SHA = 'a'.repeat(40);
-const GENERATION = 'g123-aaaaaaaaaaaa';
-const ASSET_SECRET = 's'.repeat(43);
-function debugPublicJwk() {
-  const { publicKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
-  return {
-    ...publicKey.export({ format: 'jwk' }),
-    alg: 'ES256',
-    key_ops: ['verify'],
-    revoked: false,
-    use: 'sig',
-  };
-}
-const DEBUG_IMPORT_JWK = debugPublicJwk();
-const DEBUG_MANIFEST_JWK = debugPublicJwk();
-const ASSERTION_JWKS = JSON.stringify({
-  keys: [{
-    kid: 'preview-key',
-    kty: 'EC',
-    notAfter: 4_102_444_800_000,
-    notBefore: 0,
-    revoked: false,
-  }],
-});
+const SEED = 's'.repeat(48);
+const ASSET_SECRET = 'S'.repeat(43);
+const DIGEST = 'd'.repeat(64);
 
-function privateAppConfig(application = {
-  assetSigningSecret: ASSET_SECRET,
-  debugImportAssertionPublicJwk: JSON.stringify(DEBUG_IMPORT_JWK),
-  debugExportManifestVerifyPublicJwk: JSON.stringify(DEBUG_MANIFEST_JWK),
-}) {
-  const names = resourceNames(42, 123, SHA);
+function appConfig(overrides = {}) {
+  const names = resourceNames(42);
   return generatedPrivateAppConfig({
     accountId: PREVIEW_ACCOUNT_ID,
-    main: '/artifact/worker.mjs',
-    migrationsDir: '/artifact/migrations',
+    main: '/tmp/payload/worker.mjs',
+    migrationsDir: '/tmp/payload/migrations',
     names,
     resources: {
-      artifactDigest: 'b'.repeat(64),
-      buildInputDigest: 'c'.repeat(64),
-      d1: 'preview-d1-id',
-      environmentNonce: 'e'.repeat(43),
-      headSha: SHA,
-      kv: 'preview-kv-id',
-      migrationDigest: 'd'.repeat(64),
+      d1: 'd1-id',
+      kv: 'kv-id',
       pr: 42,
-      schemaDigest: 'f'.repeat(64),
+      headSha: SHA,
+      buildInputDigest: DIGEST,
+      artifactDigest: DIGEST,
+      migrationDigest: DIGEST,
+      schemaDigest: DIGEST,
+      ...overrides.resources,
     },
-    assertions: {
-      actionJwks: ASSERTION_JWKS,
-      browserJwks: ASSERTION_JWKS,
-      issuer: 'https://preview-control.example.test',
-      originJwks: ASSERTION_JWKS,
+    application: {
+      assetSigningSecret: ASSET_SECRET,
+      previewBearer: previewBearerToken(SEED, 42),
+      ...overrides.application,
     },
-    application,
   });
 }
 
@@ -103,25 +70,46 @@ describe('trusted preview workflow identity', () => {
   });
 });
 
-describe('trusted preview browser grant', () => {
-  it('authorizes navigation and subresources for the full browser session lifetime', () => {
-    expect(previewBrowserGrantRequest({
-      pr: 42,
-      epoch: 7,
-      head: SHA,
-      sourceRunId: 123,
-      generation: GENERATION,
-    })).toEqual({
-      pr: 42,
-      epoch: 7,
-      head: SHA,
-      sourceRunId: 123,
-      generation: GENERATION,
-      audience: 'preview-browser',
-      method: '*',
-      target: '*',
-      expiresIn: 3600,
+describe('per-PR preview bearer derivation', () => {
+  it('is deterministic per PR, distinct across PRs, and refuses weak seeds', () => {
+    expect(previewBearerToken(SEED, 42)).toBe(previewBearerToken(SEED, 42));
+    expect(previewBearerToken(SEED, 42)).not.toBe(previewBearerToken(SEED, 43));
+    expect(previewBearerToken(SEED, 42)).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(() => previewBearerToken('short-seed', 42)).toThrow(/at least 32 characters/);
+    expect(() => previewBearerToken(SEED, 0)).toThrow(/positive integer/);
+  });
+});
+
+describe('stable per-PR resource names', () => {
+  it('derives the fixed name set and the workers.dev host from the PR number alone', () => {
+    const names = resourceNames(42);
+    expect(names).toMatchObject({
+      app: 'pr-42-app',
+      d1: 'pr-42-sessions-index',
+      r2: 'pr-42-agent-sessions',
+      kv: 'pr-42-sessions-hub-kv',
+      queue: 'pr-42-parse',
+      dlq: 'pr-42-parse-dlq',
+      host: 'pr-42-app.agent-sessions-nonproduction.workers.dev',
     });
+    expect(() => resourceNames(0)).toThrow(/positive integer/);
+  });
+
+  it('classifies resource ownership for cleanup, including legacy generation debris', () => {
+    expect(previewResourceOwner('pr-42-sessions-index')).toEqual({ pr: 42, legacy: false });
+    expect(previewResourceOwner('pr-42-app')).toEqual({ pr: 42, legacy: false });
+    expect(previewResourceOwner(`pr-17-g12345-${'a'.repeat(12)}-app`)).toEqual({ pr: 17, legacy: true });
+    expect(previewResourceOwner('sessions-index')).toBeNull();
+    expect(previewResourceOwner('pr-42-something-else')).toBeNull();
+    expect(previewResourceOwner('prefix-pr-42-app')).toBeNull();
+  });
+});
+
+describe('preview account pinning', () => {
+  it('accepts only the approved non-production account', () => {
+    expect(() => assertPreviewAccount(PREVIEW_ACCOUNT_ID)).not.toThrow();
+    expect(() => assertPreviewAccount(PRODUCTION_ACCOUNT_ID)).toThrow(/production Cloudflare account/);
+    expect(() => assertPreviewAccount('f'.repeat(32))).toThrow(/unapproved Cloudflare account/);
   });
 });
 
@@ -219,278 +207,61 @@ describe('trusted migration packaging', () => {
   });
 });
 
-describe('trusted preview resource ownership', () => {
-  it('pins every generated resource to the approved account and PR prefix', () => {
-    expect(() => assertPreviewAccount(PREVIEW_ACCOUNT_ID)).not.toThrow();
-    expect(() => assertPreviewAccount('18ef3246e9f36d1560485ef53889c0ab')).toThrow(/production/);
-    expect(() => assertPreviewAccount('f'.repeat(32))).toThrow(/unapproved/);
-    const names = resourceNames(42, 123, SHA);
-    expect(names.generation).toBe(GENERATION);
-    for (const name of [names.app, names.edge, names.d1, names.r2, names.kv, names.queue, names.dlq]) {
-      expect(name.startsWith('pr-42-')).toBe(true);
-    }
-  });
-
-  it('accepts generation-owned Workers and fail-closed planned null IDs only explicitly', () => {
-    const planned = { kind: 'app-worker', id: null, name: resourceNames(42, 123, SHA).app, generation: GENERATION };
-    expect(() => assertInventoryItem(planned, 42, GENERATION)).toThrow(/id is required/);
-    expect(assertInventoryItem(planned, 42, GENERATION, { allowMissingId: true })).toBe(planned);
-    expect(() => assertInventoryItem({
-      ...planned,
-      kind: 'constructor',
-    }, 42, GENERATION, { allowMissingId: true })).toThrow(/unsupported inventory kind/);
-    expect(() => assertInventoryItem({ ...planned, name: 'sessions-hub' }, 42, GENERATION, {
-      allowMissingId: true,
-    })).toThrow(/foreign generation inventory/);
-    expect(() => assertInventoryItem({ ...planned, generation: 'g124-bbbbbbbbbbbb' }, 42, GENERATION, {
-      allowMissingId: true,
-    })).toThrow(/generation mismatch/);
-    expect(() => assertInventoryItem({
-      ...planned,
-      name: 'pr-42-g124-bbbbbbbbbbbb-app',
-    }, 42, GENERATION, { allowMissingId: true })).toThrow(/foreign generation inventory/);
-  });
-
-  it('ignores malformed janitor inventory entries without losing valid generations', () => {
-    expect([...inventoryGenerations([
-      null,
-      undefined,
-      'invalid',
-      [],
-      {},
-      { generation: 'invalid' },
-      { generation: GENERATION },
-    ])]).toEqual([GENERATION]);
-  });
-
-  it('keeps the prior live Worker generation disjoint from candidate rollback inventory', () => {
-    const priorLive = resourceNames(42, 122, 'b'.repeat(40));
-    const candidate = resourceNames(42, 123, SHA);
-    const rollback = [
-      { kind: 'app-version', id: 'candidate-app-version', name: candidate.app, generation: candidate.generation },
-      { kind: 'app-worker', id: candidate.app, name: candidate.app, generation: candidate.generation },
-      { kind: 'edge-version', id: 'candidate-edge-version', name: candidate.edge, generation: candidate.generation },
-      { kind: 'edge-worker', id: candidate.edge, name: candidate.edge, generation: candidate.generation },
-    ];
-    const rollbackNames = new Set(rollback.map(({ name }) => name));
-
-    expect(candidate.host).toBe(priorLive.host);
-    expect(rollbackNames.has(priorLive.app)).toBe(false);
-    expect(rollbackNames.has(priorLive.edge)).toBe(false);
-    for (const item of rollback) {
-      expect(assertInventoryItem(item, 42, candidate.generation)).toBe(item);
-    }
-  });
-
-  it('does not issue redundant version deletes after deleting a Worker script', () => {
-    const names = resourceNames(42, 123, SHA);
-    const appVersion = {
-      kind: 'app-version',
-      id: 'candidate-app-version',
-      name: names.app,
-      generation: names.generation,
-    };
-    const edgeVersion = {
-      kind: 'edge-version',
-      id: 'candidate-edge-version',
-      name: names.edge,
-      generation: names.generation,
-    };
-    const inventory = [
-      appVersion,
-      { kind: 'app-worker', id: names.app, name: names.app, generation: names.generation },
-      edgeVersion,
-      { kind: 'edge-worker', id: names.edge, name: names.edge, generation: names.generation },
-    ];
-
-    expect(workerScriptCoversVersion(appVersion, inventory)).toBe(true);
-    expect(workerScriptCoversVersion(edgeVersion, inventory)).toBe(true);
-    expect(workerScriptCoversVersion({
-      ...appVersion,
-      generation: 'g124-bbbbbbbbbbbb',
-    }, inventory)).toBe(false);
-    expect(workerScriptCoversVersion({ ...appVersion, kind: 'd1' }, inventory)).toBe(false);
-  });
-
-  it('deletes Workers before their bound Queues after consumer detachment', () => {
-    const kinds = [
-      'd1',
-      'app-version',
-      'app-worker',
-      'r2',
-      'edge-version',
-      'queue',
-      'kv',
-      'edge-worker',
-    ];
-    const inventory = kinds.map((kind) => ({ kind }));
-
-    expect(sortCleanupInventory(inventory).map(({ kind }) => kind)).toEqual([
-      'edge-worker',
-      'app-worker',
-      'queue',
-      'edge-version',
-      'app-version',
-      'kv',
-      'r2',
-      'd1',
-    ]);
-  });
-
-  it('selects only generation-owned Worker Queue consumers', () => {
-    const names = resourceNames(42, 123, SHA);
-    expect(queueConsumerIdsForWorker([{
-      consumer_id: 'consumer-id',
-      script_name: names.app,
-      type: 'worker',
-    }], names.app, [names.queue, names.dlq])).toEqual(['consumer-id']);
-    expect(queueConsumerIdsForWorker([{
-      consumer_id: 'consumer-with-queue-identity',
-      queue_name: names.queue,
-    }], names.app, [names.queue, names.dlq])).toEqual(['consumer-with-queue-identity']);
-    expect(queueConsumerIdsForWorker([], names.app, [names.queue, names.dlq])).toEqual([]);
-    expect(() => queueConsumerIdsForWorker([{
-      consumer_id: 'foreign-consumer-id',
-      queue_name: 'pr-99-g123-aaaaaaaaaaaa-parse',
-      script_name: 'pr-99-g123-aaaaaaaaaaaa-app',
-      type: 'worker',
-    }], names.app, [names.queue, names.dlq])).toThrow(/foreign queue consumer/);
-    expect(() => queueConsumerIdsForWorker([{
-      consumer_id: 'foreign-worker-on-owned-queue',
-      queue_name: names.queue,
-      script_name: 'pr-99-g123-aaaaaaaaaaaa-app',
-      type: 'worker',
-    }], names.app, [names.queue, names.dlq])).toThrow(/foreign queue consumer/);
-    expect(() => queueConsumerIdsForWorker([{
-      consumer_id: 'owned-worker-on-foreign-queue',
-      queue_name: 'pr-99-g123-aaaaaaaaaaaa-parse',
-      script_name: names.app,
-      type: 'worker',
-    }], names.app, [names.queue, names.dlq])).toThrow(/foreign queue consumer/);
-    expect(() => queueConsumerIdsForWorker([{
-      consumer_id: 'http-pull-id',
-      queue_name: names.queue,
-      type: 'http_pull',
-    }], names.app, [names.queue, names.dlq])).toThrow(/foreign queue consumer/);
-  });
-
-  it('acknowledges the original trusted identity rather than a resolved discovery ID', () => {
-    expect(acknowledgedResources([{
-      kind: 'd1', id: null, name: 'pr-42-g123-aaaaaaaaaaaa-sessions-index',
-      generation: GENERATION, deleted: true, resolvedId: 'foreign-or-discovered-id',
-    }])).toEqual([{
-      kind: 'd1', id: null, name: 'pr-42-g123-aaaaaaaaaaaa-sessions-index', generation: GENERATION,
-    }]);
+describe('queue consumer detachment', () => {
+  it('detaches only preview-owned consumers and rejects foreign scripts loud', () => {
+    expect(queueConsumerIdsForQueue([
+      { consumer_id: 'c1', script_name: 'pr-42-app', queue_name: 'pr-42-parse' },
+      { consumer_id: 'c2', script_name: `pr-42-g99-${'b'.repeat(12)}-app` },
+      { consumer_id: 'c3' },
+    ], 'pr-42-parse')).toEqual(['c1', 'c2', 'c3']);
+    expect(() => queueConsumerIdsForQueue([
+      { consumer_id: 'c4', script_name: 'sessions-hub' },
+    ], 'pr-42-parse')).toThrow(/foreign queue consumer/);
   });
 });
 
-describe('private preview application key bindings', () => {
-  it('binds an isolated asset secret and only public debug verification keys to the private app config', () => {
-    const config = privateAppConfig();
-    expect(config.vars.ASSET_SIGNING_SECRET).toBe(ASSET_SECRET);
-    expect(config.vars.PREVIEW_ASSERTION_ISSUER).toBe('https://preview-control.example.test');
-    expect(JSON.parse(config.vars.DEBUG_IMPORT_ASSERTION_PUBLIC_JWK)).toEqual(DEBUG_IMPORT_JWK);
-    expect(JSON.parse(config.vars.DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK)).toEqual(DEBUG_MANIFEST_JWK);
-    expect(JSON.stringify(config.vars)).not.toContain('"d"');
-    const names = resourceNames(42, 123, SHA);
-    expect(config.name).toBe(names.app);
-    expect(config.workers_dev).toBe(false);
+describe('private preview application config', () => {
+  it('binds the bearer, the asset secret, and workers.dev exposure — nothing production-shaped', () => {
+    const config = appConfig();
+    expect(config.workers_dev).toBe(true);
     expect(config.preview_urls).toBe(false);
     expect(config.routes).toEqual([]);
-    expect(config.d1_databases).toEqual([expect.objectContaining({ binding: 'DB' })]);
-    expect(config.r2_buckets).toEqual([{ binding: 'RAW', bucket_name: names.r2 }]);
-    expect(config.kv_namespaces).toEqual([{ binding: 'KV', id: 'preview-kv-id' }]);
-
-    const wrapper = generatedTrustedWrapperConfig({
-      accountId: PREVIEW_ACCOUNT_ID,
-      main: '/trusted/preview-edge.mjs',
-      names,
-      originJwks: ASSERTION_JWKS,
-    });
-    expect(wrapper.vars).toEqual({
-      PREVIEW_ORIGIN_ASSERTION_JWKS: ASSERTION_JWKS,
-    });
-    expect(wrapper.preview_urls).toBe(true);
-    expect(wrapper.workers_dev).toBe(false);
-    expect(wrapper.routes).toEqual([]);
-    expect(wrapper.services).toEqual([{ binding: 'APP', service: names.app }]);
-    expect(JSON.stringify(wrapper)).not.toContain(ASSET_SECRET);
-    expect(JSON.stringify(wrapper)).not.toContain('DEBUG_IMPORT_ASSERTION_PUBLIC_JWK');
-    expect(JSON.stringify(wrapper)).not.toContain('DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK');
-
-    const prBuildConfig = generatedBuildConfig({
-      main: '/pr/worker.mjs',
-      workerName: 'pr-42-untrusted-build',
-    });
-    expect(prBuildConfig).toMatchObject({
-      workers_dev: false,
-      preview_urls: false,
-      routes: [],
-    });
-    expect(prBuildConfig).not.toHaveProperty('vars');
-    expect(JSON.stringify(prBuildConfig)).not.toContain(ASSET_SECRET);
-    expect(JSON.stringify(prBuildConfig)).not.toContain('DEBUG_IMPORT_ASSERTION_PUBLIC_JWK');
-    expect(JSON.stringify(prBuildConfig)).not.toContain('DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK');
-  });
-
-  it('emits both debug keys in a Worker-compatible ES256 verification form', async () => {
-    const { vars } = privateAppConfig();
-    for (const raw of [
-      vars.DEBUG_IMPORT_ASSERTION_PUBLIC_JWK,
-      vars.DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK,
+    expect(config.vars.ENVIRONMENT).toBe('preview');
+    expect(config.vars.PREVIEW_BEARER).toBe(previewBearerToken(SEED, 42));
+    expect(config.vars.ASSET_SIGNING_SECRET).toBe(ASSET_SECRET);
+    expect(config.vars.API_HOST).toBe('pr-42-app.agent-sessions-nonproduction.workers.dev');
+    expect(config.vars.VIEWER_HOST).toBe(config.vars.API_HOST);
+    expect(config.vars.PREVIEW_PR_NUMBER).toBe('42');
+    // The assertion/JWKS machinery died with the front door — its vars must never come back.
+    for (const retired of [
+      'PREVIEW_ASSERTION_ISSUER',
+      'PREVIEW_BROWSER_ASSERTION_JWKS',
+      'PREVIEW_ACTION_ASSERTION_JWKS',
+      'PREVIEW_ORIGIN_ASSERTION_JWKS',
+      'PREVIEW_GENERATION',
+      'ENVIRONMENT_NONCE',
+      'DEBUG_IMPORT_ASSERTION_PUBLIC_JWK',
+      'DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK',
+      'PRODUCTION_SESSION_SIGNING_KEY',
+      'SETUP_TOKEN',
     ]) {
-      const key = await crypto.subtle.importKey(
-        'jwk',
-        JSON.parse(raw),
-        { name: 'ECDSA', namedCurve: 'P-256' },
-        false,
-        ['verify'],
-      );
-      expect(key.algorithm).toMatchObject({ name: 'ECDSA', namedCurve: 'P-256' });
-      expect(key.usages).toEqual(['verify']);
+      expect(config.vars).not.toHaveProperty(retired);
     }
+    expect(config.d1_databases[0]).toMatchObject({ binding: 'DB', database_name: 'pr-42-sessions-index', database_id: 'd1-id' });
+    expect(config.r2_buckets[0]).toMatchObject({ binding: 'RAW', bucket_name: 'pr-42-agent-sessions' });
+    expect(config.queues.consumers[0]).toMatchObject({ queue: 'pr-42-parse', dead_letter_queue: 'pr-42-parse-dlq' });
   });
 
-  it.each([
-    ['asset signing secret', {
-      debugImportAssertionPublicJwk: JSON.stringify(DEBUG_IMPORT_JWK),
-      debugExportManifestVerifyPublicJwk: JSON.stringify(DEBUG_MANIFEST_JWK),
-    }],
-    ['import assertion key', {
-      assetSigningSecret: ASSET_SECRET,
-      debugExportManifestVerifyPublicJwk: JSON.stringify(DEBUG_MANIFEST_JWK),
-    }],
-    ['manifest verification key', {
-      assetSigningSecret: ASSET_SECRET,
-      debugImportAssertionPublicJwk: JSON.stringify(DEBUG_IMPORT_JWK),
-    }],
-  ])('rejects a missing %s', (_label, application) => {
-    expect(() => privateAppConfig(application)).toThrow();
+  it('rejects malformed bearers, secrets, and digests', () => {
+    expect(() => appConfig({ application: { previewBearer: 'not-a-token' } })).toThrow(/preview bearer/);
+    expect(() => appConfig({ application: { assetSigningSecret: 'short' } })).toThrow(/asset signing secret/);
+    expect(() => appConfig({ resources: { schemaDigest: 'xyz' } })).toThrow(/invalid schemaDigest/);
   });
 
-  it.each([
-    ['private material', { ...DEBUG_IMPORT_JWK, d: 'private-scalar' }, /private key material/],
-    ['wrong algorithm', { ...DEBUG_IMPORT_JWK, alg: 'RS256' }, /non-revoked ES256/],
-    ['wrong key use', { ...DEBUG_IMPORT_JWK, use: 'enc' }, /non-revoked ES256/],
-    ['wrong operation', { ...DEBUG_IMPORT_JWK, key_ops: ['sign'] }, /non-revoked ES256/],
-    ['revoked key', { ...DEBUG_IMPORT_JWK, revoked: true }, /non-revoked ES256/],
-    ['wrong curve', { ...DEBUG_IMPORT_JWK, crv: 'P-384' }, /non-revoked ES256/],
-    ['missing coordinate', { ...DEBUG_IMPORT_JWK, y: undefined }, /non-revoked ES256/],
-    ['off-curve coordinates', { ...DEBUG_IMPORT_JWK, x: 'x'.repeat(43) }, /invalid P-256/],
-  ])('rejects an import assertion JWK with %s', (_label, jwk, error) => {
-    expect(() => privateAppConfig({
-      assetSigningSecret: ASSET_SECRET,
-      debugImportAssertionPublicJwk: JSON.stringify(jwk),
-      debugExportManifestVerifyPublicJwk: JSON.stringify(DEBUG_MANIFEST_JWK),
-    })).toThrow(error);
-  });
-
-  it('applies the same public-only validation to the manifest verification key', () => {
-    expect(() => privateAppConfig({
-      assetSigningSecret: ASSET_SECRET,
-      debugImportAssertionPublicJwk: JSON.stringify(DEBUG_IMPORT_JWK),
-      debugExportManifestVerifyPublicJwk: JSON.stringify({ ...DEBUG_MANIFEST_JWK, d: 'private-scalar' }),
-    })).toThrow(/private key material/);
+  it('keeps the build config private (no public URL surface)', () => {
+    const config = generatedBuildConfig({ main: '/src/preview.ts', workerName: 'pr-42-app' });
+    expect(config.workers_dev).toBe(false);
+    expect(config.preview_urls).toBe(false);
   });
 });
 
@@ -532,35 +303,6 @@ describe('trusted Wrangler process environment', () => {
   });
 });
 
-describe('preview edge bootstrap cookie', () => {
-  it('selects the named session cookie when Cloudflare adds other cookies', () => {
-    expect(previewEdgeSessionCookie([
-      '__cf_bm=opaque; Secure; Path=/',
-      '__Host-preview-edge=session-token; HttpOnly; Secure; Path=/',
-    ])).toBe('__Host-preview-edge=session-token');
-    expect(previewEdgeSessionCookie([
-      '__cf_bm=opaque; Secure; Path=/, __Host-preview-edge=combined-token; HttpOnly; Secure; Path=/',
-    ])).toBe('__Host-preview-edge=combined-token');
-  });
-});
-
-describe('Cloudflare Access service authentication', () => {
-  it('requires a complete credential pair and returns only Access headers', () => {
-    expect(requiredCloudflareAccessHeaders({
-      CF_ACCESS_CLIENT_ID: ' client-id ',
-      CF_ACCESS_CLIENT_SECRET: ' client-secret ',
-      UNRELATED_SECRET: 'must-not-leak',
-    })).toEqual({
-      'cf-access-client-id': 'client-id',
-      'cf-access-client-secret': 'client-secret',
-    });
-    expect(() => requiredCloudflareAccessHeaders({})).toThrow(/service credentials are required/);
-    expect(() => requiredCloudflareAccessHeaders({
-      CF_ACCESS_CLIENT_ID: 'client-id',
-    })).toThrow(/service credentials are required/);
-  });
-});
-
 describe('Worker bundle payload', () => {
   it('rejects Wrangler multipart upload envelopes before deployment', () => {
     const multipart = new TextEncoder().encode('--boundary\\r\\nContent-Disposition: form-data');
@@ -585,4 +327,3 @@ describe('Worker bundle payload', () => {
     }
   });
 });
-

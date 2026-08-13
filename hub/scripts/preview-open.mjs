@@ -1,13 +1,21 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
+import { createHmac } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
 
 const HELP = `Usage: npm --prefix hub run preview:open -- --pr <positive integer> [--print-only]
 
 Options:
   --pr <number>  Pull request number
   --print-only   Print the URL without opening a browser
+
+Auth: the per-PR bearer is derived from the seed in ~/.config/agent-sessions/preview-seed
+(or the PREVIEW_BEARER_SEED environment variable) and appended as ?token=… — visiting it
+once sets the preview session cookie. Without a seed the bare URL is printed and the
+preview will answer 401.
 `;
 
 export function assertSupportedNode(version = process.versions.node) {
@@ -45,9 +53,34 @@ export function parsePreviewOpenArguments(argv) {
   return { pr, printOnly };
 }
 
-export function previewUrl(pr) {
+export function previewSeedPath(home = homedir()) {
+  return join(home, '.config', 'agent-sessions', 'preview-seed');
+}
+
+/** The owner's local copy of the shared seed; environment variable wins for CI-ish callers. */
+export function readPreviewSeed(environment = process.env, readFile = readFileSync) {
+  const fromEnvironment = environment.PREVIEW_BEARER_SEED?.trim();
+  if (fromEnvironment) return fromEnvironment;
+  try {
+    return readFile(previewSeedPath(), 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Must stay in lockstep with previewBearerToken in infra/cf/preview-trust.mjs. */
+export function derivePreviewBearer(seed, pr) {
+  if (typeof seed !== 'string' || seed.trim().length < 32) {
+    throw new Error('preview bearer seed must be at least 32 characters');
+  }
+  return createHmac('sha256', seed.trim()).update(`sessions-preview-bearer:pr-${pr}`).digest('base64url');
+}
+
+export function previewUrl(pr, seed = null) {
   if (!Number.isSafeInteger(pr) || pr <= 0) throw new Error('PR number must be a safe positive integer');
-  return `https://pr-${pr}-preview.sessions.vza.net`;
+  const base = `https://pr-${pr}-app.agent-sessions-nonproduction.workers.dev`;
+  if (seed === null) return base;
+  return `${base}/?token=${derivePreviewBearer(seed, pr)}`;
 }
 
 export function browserLauncher(url, platform = process.platform) {
@@ -78,8 +111,15 @@ export async function openBrowser(url, options = {}) {
 export async function main(argv = process.argv.slice(2), options = {}) {
   assertSupportedNode(options.nodeVersion);
   const parsed = parsePreviewOpenArguments(argv);
-  const url = previewUrl(parsed.pr);
-  (options.log ?? console.log)(url);
+  const seed = options.seed !== undefined ? options.seed : readPreviewSeed();
+  const log = options.log ?? console.log;
+  if (seed === null) {
+    (options.warn ?? console.error)(
+      `no preview seed found (${previewSeedPath()} or PREVIEW_BEARER_SEED) — printing the URL without a token; the preview will answer 401`,
+    );
+  }
+  const url = previewUrl(parsed.pr, seed);
+  log(url);
   if (!parsed.printOnly) await openBrowser(url, options);
   return url;
 }
