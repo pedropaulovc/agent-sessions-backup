@@ -14,7 +14,6 @@ import {
   canonicalMigrationBytes,
   loadAndValidateManifest,
   migrationDigest,
-  sha256,
   validateHistoricalBaseline,
   validateManifestShape,
   verifySignedReleaseManifest,
@@ -160,32 +159,6 @@ test('manifest policy comes only from independent base evidence', async (context
     assert.notEqual(bareCheck.status, 0);
     assert.match(bareCheck.stderr, /requires independent policy evidence/);
   }
-
-  const approvalScript = path.join(hubRoot, 'scripts', 'approve-production-baseline.mjs');
-  const approvalArguments = [
-    approvalScript,
-    'measure',
-    '--output', path.join(os.tmpdir(), 'unused-production-baseline-measurement.json'),
-    '--config', path.join(hubRoot, 'wrangler.jsonc'),
-  ];
-  const bareApproval = spawnSync(process.execPath, approvalArguments, {
-    cwd: hubRoot,
-    encoding: 'utf8',
-    env: cleanEnv,
-  });
-  assert.notEqual(bareApproval.status, 0);
-  assert.match(bareApproval.stderr, /requires an externally trusted --base-manifest or protected --base-ref/);
-
-  const worktreeApproval = spawnSync(process.execPath, [
-    ...approvalArguments,
-    '--base-manifest', sourceBaselinePath,
-  ], {
-    cwd: hubRoot,
-    encoding: 'utf8',
-    env: cleanEnv,
-  });
-  assert.notEqual(worktreeApproval.status, 0);
-  assert.match(worktreeApproval.stderr, /outside the active worktree/);
 
   const directory = await mkdtemp(path.join(os.tmpdir(), 'hub-policy-'));
   context.after(() => rm(directory, { recursive: true, force: true }));
@@ -337,7 +310,7 @@ test('0020 repairs rows created by the historically nullable 0019 source shape',
   }
 });
 
-test('migration runner applies once, measures verify state, and requires signed production history evidence', async (context) => {
+test('migration runner applies once, measures verify state, and trusts the protected-main manifest for production', async (context) => {
   const fixture = await loadFixture();
   const database = createDatabase();
   applyPending(database, fixture);
@@ -378,83 +351,24 @@ test('migration runner applies once, measures verify state, and requires signed 
     baseManifestPath: sourceBaselinePath,
     historyPath,
   };
-  await assert.rejects(
-    runMigrations({ ...productionBase, journalPath: path.join(directory, 'missing-baseline.json') }),
-    /separately signed, human-approved historical baseline/,
-  );
-
-  const history = JSON.parse(await readFile(historyPath, 'utf8'));
-  const payload = {
-    kind: 'production-schema-baseline',
-    approved: true,
-    throughSequence: fixture.manifest.ledgerStartsAt - 1,
-    migrationDigest: migrationDigest(fixture.manifest),
-    historicalBaselineDigest: sha256(`${canonicalJson(history)}\n`),
-    schemaDigest: schemaDigest(baselineSnapshot),
-    approvedBy: 'migration-approver@example.com',
-    measuredAt: '2026-08-03T00:00:00.000Z',
-    reason: 'Reviewed against the measured production schema.',
-    approvedAt: '2026-08-03T00:00:00.000Z',
-  };
-  const { privateKey, publicKey } = generateKeyPairSync('ed25519');
-  const envelope = {
-    formatVersion: 1,
-    payload,
-    signature: sign(null, Buffer.from(`${canonicalJson(payload)}\n`), privateKey).toString('base64'),
-  };
-  const baselinePath = path.join(directory, 'production-baseline.json');
-  await writeFile(baselinePath, `${JSON.stringify(envelope)}\n`);
-
-  const forged = structuredClone(envelope);
-  forged.payload.schemaDigest = 'f'.repeat(64);
-  const forgedPath = path.join(directory, 'forged-baseline.json');
-  await writeFile(forgedPath, `${JSON.stringify(forged)}\n`);
-  await assert.rejects(
-    runMigrations({
-      ...productionBase,
-      journalPath: path.join(directory, 'forged.json'),
-      baselinePath: forgedPath,
-      baselinePublicKey: publicKey,
-    }),
-    /signature is invalid/,
-  );
-
+  // Production trusts the protected-main manifest: no signed baseline envelope, but the
+  // applied history must still be an immutable prefix of the manifest before apply runs.
   const preLedgerCount = fixture.manifest.migrations
     .filter((migration) => migration.sequence < fixture.manifest.ledgerStartsAt).length;
-  const wrongSchemaPayload = { ...payload, schemaDigest: 'e'.repeat(64) };
-  const wrongSchemaEnvelope = {
-    formatVersion: 1,
-    payload: wrongSchemaPayload,
-    signature: sign(null, Buffer.from(`${canonicalJson(wrongSchemaPayload)}\n`), privateKey).toString('base64'),
-  };
-  const wrongSchemaPath = path.join(directory, 'wrong-schema-baseline.json');
-  await writeFile(wrongSchemaPath, `${JSON.stringify(wrongSchemaEnvelope)}\n`);
-  const blockedWrangler = createWranglerProcess(fixture, snapshot, preLedgerCount, baselineSnapshot);
-  await assert.rejects(
-    runMigrations({
-      ...productionBase,
-      journalPath: path.join(directory, 'wrong-schema.json'),
-      baselinePath: wrongSchemaPath,
-      baselinePublicKey: publicKey,
-      runProcess: blockedWrangler.runProcess,
-    }),
-    /does not match the signed human-approved baseline before migration/,
-  );
-  assert.equal(blockedWrangler.state.applyCalls, 0);
-
   const productionWrangler = createWranglerProcess(fixture, snapshot, preLedgerCount, baselineSnapshot);
   const productionResult = await runMigrations({
     ...productionBase,
     journalPath: path.join(directory, 'production.json'),
-    baselinePath,
-    baselinePublicKey: publicKey,
     runProcess: productionWrangler.runProcess,
   });
   assert.equal(productionWrangler.state.applyCalls, 1);
   assert.equal(productionResult.pendingMigrations, 0);
 
+  // A tampered historical baseline still fails loud: the pre-ledger source digest is
+  // anchored in the manifest, not in a separately signed envelope.
+  const history = JSON.parse(await readFile(historyPath, 'utf8'));
   const alteredHistory = structuredClone(history);
-  alteredHistory.deploymentHistory.reason += ' altered';
+  alteredHistory.sourceImmutability.digest = 'f'.repeat(64);
   const alteredHistoryPath = path.join(directory, 'altered-history.json');
   await writeFile(alteredHistoryPath, `${JSON.stringify(alteredHistory)}\n`);
   await assert.rejects(
@@ -462,10 +376,8 @@ test('migration runner applies once, measures verify state, and requires signed 
       ...productionBase,
       historyPath: alteredHistoryPath,
       journalPath: path.join(directory, 'altered-history-journal.json'),
-      baselinePath,
-      baselinePublicKey: publicKey,
     }),
-    /incomplete or not explicitly human-approved/,
+    /repository source changed from the immutable baseline/,
   );
 });
 

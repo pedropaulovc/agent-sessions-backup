@@ -18,8 +18,7 @@
     "test:preview-open": "node --test test/preview-open.test.mjs",
     "test:preview-upload": "node --test test/preview-upload.test.mjs",
     "test:migrations": "node --test test/migrations.acceptance.mjs",
-    "migrations": "node scripts/migrations.mjs",
-    "production-baseline": "node scripts/approve-production-baseline.mjs"
+    "migrations": "node scripts/migrations.mjs"
   },
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.18.5",

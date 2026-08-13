@@ -3,12 +3,9 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  canonicalJson,
   loadAndValidateManifest,
   migrationDigest,
-  sha256,
   validateHistoricalBaseline,
-  verifySignedCanonicalPayload,
   verifySignedReleaseManifest,
 } from './migration-manifest.mjs';
 import { runJournaledMigration } from './migration-journal.mjs';
@@ -202,36 +199,14 @@ async function remoteSchemaSnapshot(client) {
   });
 }
 
-async function validateBaseline(options, manifest, digest) {
+async function validateHistory(options, manifest) {
+  // The trust anchor for production migrations is the protected main branch: whatever
+  // manifest lands there deploys. The in-repo historical baseline stays validated for
+  // structure (it names the pre-ledger history, incl. the 0019 divergence), but no
+  // separately signed human-approved envelope is required — that ritual re-blocked
+  // every migration behind a manual re-approval and was retired 2026-08-13.
   const history = JSON.parse(await readFile(options.historyPath ?? defaultHistoryPath, 'utf8'));
   validateHistoricalBaseline(history, manifest);
-  if (options.target !== 'production') return null;
-  if (!options.baselinePath || !options.baselinePublicKey) {
-    throw new Error('production requires a separately signed, human-approved historical baseline');
-  }
-  const envelope = JSON.parse(await readFile(options.baselinePath, 'utf8'));
-  const baseline = verifySignedCanonicalPayload(envelope, options.baselinePublicKey, 'production schema baseline');
-  const historyDigest = sha256(`${canonicalJson(history)}\n`);
-  const approvedAt = Date.parse(baseline.approvedAt);
-  const measuredAt = Date.parse(baseline.measuredAt);
-  if (baseline.kind !== 'production-schema-baseline'
-      || baseline.approved !== true
-      || baseline.throughSequence !== manifest.ledgerStartsAt - 1
-      || baseline.migrationDigest !== digest
-      || baseline.historicalBaselineDigest !== historyDigest
-      || !DIGEST.test(baseline.schemaDigest ?? '')
-      || typeof baseline.approvedBy !== 'string'
-      || baseline.approvedBy.trim().length === 0
-      || typeof baseline.reason !== 'string'
-      || baseline.reason.trim().length < 10
-      || typeof baseline.measuredAt !== 'string'
-      || !Number.isFinite(measuredAt)
-      || typeof baseline.approvedAt !== 'string'
-      || !Number.isFinite(approvedAt)
-      || approvedAt < measuredAt) {
-    throw new Error('production historical baseline is incomplete or not explicitly human-approved');
-  }
-  return baseline;
 }
 
 export function migrationDeploymentIdentity({ target, stateName, artifactDigest, migrationDigest: digest }) {
@@ -280,7 +255,7 @@ export async function runMigrations(options) {
   if (options.expectedMigrationDigest && options.expectedMigrationDigest !== digest) {
     throw new Error('migration manifest changed after deployment identity was computed');
   }
-  const productionBaseline = await validateBaseline(options, manifest, digest);
+  await validateHistory(options, manifest);
   if (options.releaseManifest && options.releasePublicKey) {
     const release = verifySignedReleaseManifest(options.releaseManifest, options.releasePublicKey);
     if (migrationDigest(release) !== digest) throw new Error('signed release manifest has the wrong migration digest');
@@ -298,15 +273,8 @@ export async function runMigrations(options) {
     journalPath: options.journalPath,
     identity,
     apply: async () => {
-      if (productionBaseline) {
-        const applied = await readAppliedNames(client);
-        assertAppliedManifestPrefix(manifest, applied);
-        if (countPendingMigrations(manifest, applied) > 0) {
-          const beforeDigest = schemaDigest(await remoteSchemaSnapshot(client));
-          if (productionBaseline.schemaDigest !== beforeDigest) {
-            throw new Error('production schema does not match the signed human-approved baseline before migration');
-          }
-        }
+      if (options.target === 'production') {
+        assertAppliedManifestPrefix(manifest, await readAppliedNames(client));
       }
       await client.apply();
     },

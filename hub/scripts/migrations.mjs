@@ -83,8 +83,6 @@ async function main() {
   let releasePublicKey;
   if (options['release-manifest']) releaseManifest = JSON.parse(await readFile(resolveOption(options['release-manifest']), 'utf8'));
   if (options['release-public-key']) releasePublicKey = await readFile(resolveOption(options['release-public-key']), 'utf8');
-  let baselinePublicKey;
-  if (options['baseline-public-key']) baselinePublicKey = await readFile(resolveOption(options['baseline-public-key']), 'utf8');
   const result = await runMigrations({
     target: options.target,
     config: resolveOption(options.config),
@@ -99,8 +97,6 @@ async function main() {
     historyPath: resolveOption(options.history),
     releaseManifest,
     releasePublicKey,
-    baselinePath: resolveOption(options.baseline),
-    baselinePublicKey,
   });
   process.stdout.write(`${JSON.stringify(result)}\n`);
 }
