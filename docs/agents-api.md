@@ -34,17 +34,19 @@ authenticate:
    read allow-list (`/sessions` list/get/raw, `/search`, `/usage`, `/machines`, `/status`)
    — never uploads, bootstrap, cert, or admin routes. Default TTL 4 h, max 24 h; active
    grants are listed and revocable on the viewer's `/settings` page.
-2. **mTLS (transitional — collectors, and reads until the migration completes).** Present a
-   machine's client cert+key on every request. Any enrolled machine's paths are in
+2. **mTLS (ingest + fleet aggregates — collectors).** Present a machine's client cert+key
+   on every request. Any enrolled machine's paths are in
    `~/.config/agent-collector/config.toml` (`client_cert_path` / `client_key_path`), e.g.:
    ```bash
    curl --cert ~/.config/agent-collector/<machine>.client.pem \
         --key  ~/.config/agent-collector/<machine>.client.key \
         "https://api.sessions.vza.net/api/v1/status"
    ```
-   Machine certs are becoming **ingest-only** (upload, `files/check`, heartbeat, cert
-   renewal, an identity echo): cert-authenticated *reads* still work today but are
-   scheduled for removal — new tooling should use a read grant.
+   Machine certs are **ingest credentials**: upload, `files/check`, heartbeat, cert
+   renewal, bootstrap, admin, plus the content-free aggregates (`/status`, `/machines`,
+   `/usage`). In production a cert request to `/sessions*` or `/search` returns
+   `403 {"error":"passkey_grant_required"}` — session content is read-grant-only
+   (`hub/src/router.ts`; development keeps cert reads for the local loop).
 
 The old preview-only `DEV_AUTH` bearer (`Authorization: Bearer <DEV_AUTH>` +
 `x-dev-machine`) is gone along with the Workers Builds previews that used it; the current
@@ -270,7 +272,8 @@ every "notable sessions" list and make the ranking meaningless.
 from agent_sessions_client import HubClient, SessionsApi, load_config
 
 # Auth resolution: --grant-token / $AGENT_SESSIONS_GRANT_TOKEN / the `agent-sessions auth`
-# token cache first, then a transitional mTLS cert from ~/.config/agent-collector/config.toml.
+# token cache first, then an mTLS cert from ~/.config/agent-collector/config.toml (which in
+# production reaches only the content-free aggregates — session reads need a grant).
 config = load_config()
 api = SessionsApi(HubClient(config))
 
@@ -313,9 +316,11 @@ curl -H "$AUTH" "$BASE/api/v1/usage?group_by=model&from=2026-07-18&to=2026-07-18
 # fleet freshness — check before trusting a report's counts
 curl -H "$AUTH" "$BASE/api/v1/status"
 
-# transitional mTLS equivalent (until cert reads are severed): replace -H "$AUTH" with
+# mTLS works for the content-free aggregates only (/status, /machines, /usage): replace
+# -H "$AUTH" with
 #   --cert ~/.config/agent-collector/<machine>.client.pem \
 #   --key  ~/.config/agent-collector/<machine>.client.key
+# A cert request to /sessions* or /search returns 403 passkey_grant_required in production.
 # (On a TPM-backed Windows enrollment there are no PEM files — use System32 curl with
 #  --cert "CurrentUser\MY\<thumbprint>" — or just use a read grant, which needs neither.)
 ```

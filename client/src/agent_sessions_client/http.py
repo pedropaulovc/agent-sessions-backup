@@ -151,6 +151,15 @@ class HubClient:
                 body = e.read().decode("utf-8", errors="replace")
             except (TimeoutError, OSError, http.client.HTTPException):
                 body = "<body unavailable>"
+            if e.code == 403 and "passkey_grant_required" in body:
+                # Production severs cert-authenticated session reads: an mTLS caller hitting
+                # /sessions* or /search gets this error, and the fix is always the same. The
+                # hint goes in the MESSAGE (the CLI prints str(e), never .body).
+                raise HubError(
+                    e.code,
+                    f"{e.reason} — session content requires a read grant: run `agent-sessions auth`",
+                    body,
+                ) from e
             raise HubError(e.code, e.reason, body) from e
         except TimeoutError as e:
             # A connect-phase timeout comes back wrapped in URLError, but a READ-phase stall

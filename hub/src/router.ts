@@ -126,6 +126,18 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
 
   if (path === '/api/v1/bootstrap' && method === 'GET') return bootstrap(env, identity);
 
+  // No agent moves prod bytes without a passkey: in production, session CONTENT — /api/v1/sessions*
+  // (list, detail, raw, ndjson export) and /api/v1/search — is reachable only through a
+  // passkey-minted read grant (grantReadRoute above). Machine certs are ingest credentials; a
+  // stolen one must not be able to read the backup corpus. The content-free aggregates below
+  // (/machines, /status, /usage) stay cert-readable for unattended fleet monitoring. Development
+  // keeps cert/dev reads for the local loop and this repo's tests; preview's deploy smoke reads
+  // synthetic seeds back through the candidate identity, and prod bytes only ever reach preview
+  // via the passkey-gated debug exchange — so both are exempt.
+  if (env.ENVIRONMENT === 'production' && (path === '/api/v1/search' || path === '/api/v1/sessions' || path.startsWith('/api/v1/sessions/'))) {
+    return Response.json({ error: 'passkey_grant_required' }, { status: 403 });
+  }
+
   if (path === '/api/v1/search' && method === 'GET') return search(url, env);
   if (path === '/api/v1/sessions' && method === 'GET') return listSessions(url, env);
   const sessionMatch = path.match(/^\/api\/v1\/sessions\/([^/]+)(\/raw)?$/);
