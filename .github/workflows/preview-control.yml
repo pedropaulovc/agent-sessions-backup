@@ -84,8 +84,11 @@ jobs:
           retention-days: 2
           compression-level: 0
 
-  # Only this job receives the separate non-production control token. It checks out main, never
-  # the PR, and treats every downloaded artifact byte as hostile until provenance verification.
+  # Only this job receives the non-production Cloudflare token. It checks out main, never the PR,
+  # and treats every downloaded artifact byte as hostile until provenance verification. It deploys
+  # the PR's SELF-CONTAINED preview in place: stable pr-N-* resources (persistent across pushes),
+  # the Worker publicly reachable at its stable workers.dev hostname, gated by the derived per-PR
+  # bearer (HMAC of PREVIEW_BEARER_SEED — never moved through logs or artifacts).
   provision:
     needs: build
     runs-on: ubuntu-latest
@@ -94,10 +97,9 @@ jobs:
     permissions:
       actions: read
       contents: read
-      id-token: write
       pull-requests: read
     outputs:
-      generation: ${{ steps.provision.outputs.generation }}
+      url: ${{ steps.provision.outputs.url }}
       artifact_digest: ${{ steps.provision.outputs.artifact_digest }}
       schema_digest: ${{ steps.provision.outputs.schema_digest }}
     steps:
@@ -119,50 +121,35 @@ jobs:
         with:
           name: preview-${{ github.run_id }}-${{ needs.build.outputs.head_sha }}
           path: preview-artifact
-      - name: Provision, migrate, and register exact candidate
+      - name: Provision, migrate, and deploy the self-contained preview
         id: provision
         env:
           CLOUDFLARE_PREVIEW_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_PREVIEW_CONTROL_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
-          DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK: ${{ vars.DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK }}
-          DEBUG_IMPORT_ASSERTION_PUBLIC_JWK: ${{ vars.DEBUG_IMPORT_ASSERTION_PUBLIC_JWK }}
-          PREVIEW_ACTION_ASSERTION_JWKS: ${{ vars.PREVIEW_ACTION_ASSERTION_JWKS }}
-          PREVIEW_ASSERTION_ISSUER: ${{ vars.PREVIEW_ASSERTION_ISSUER }}
-          PREVIEW_BROWSER_ASSERTION_JWKS: ${{ vars.PREVIEW_BROWSER_ASSERTION_JWKS }}
-          PREVIEW_ORIGIN_ASSERTION_JWKS: ${{ vars.PREVIEW_ORIGIN_ASSERTION_JWKS }}
-          PREVIEW_CONTROL_DEPLOY_AUD: ${{ vars.PREVIEW_CONTROL_DEPLOY_AUD }}
-          PREVIEW_CONTROL_URL: ${{ vars.PREVIEW_CONTROL_URL }}
+          PREVIEW_BEARER_SEED: ${{ secrets.PREVIEW_BEARER_SEED }}
+          # Expression values are bound as environment variables, never interpolated into
+          # the shell command: this job holds credentials, so an expansion that ever came
+          # to carry shell metacharacters must stay inert data.
+          PR_NUMBER: ${{ needs.build.outputs.pr }}
+          HEAD_SHA: ${{ needs.build.outputs.head_sha }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
         run: >-
           node trusted/infra/cf/preview-control.mjs provision
           --artifact preview-artifact
-          --journal "$RUNNER_TEMP/preview-control-journal.json"
           --repository "$GITHUB_REPOSITORY"
-          --pr "${{ needs.build.outputs.pr }}"
-          --head-sha "${{ needs.build.outputs.head_sha }}"
-          --source-run-id "${{ github.event.workflow_run.id }}"
+          --pr "$PR_NUMBER"
+          --head-sha "$HEAD_SHA"
+          --source-run-id "$SOURCE_RUN_ID"
           --run-id "$GITHUB_RUN_ID"
           --workflow-ref "$GITHUB_WORKFLOW_REF"
           --account-id "$CLOUDFLARE_PREVIEW_ACCOUNT_ID"
           --wrangler trusted/hub/node_modules/wrangler/bin/wrangler.js
           --migrations-cli trusted/hub/scripts/migrations.mjs
-          --trusted-root trusted
           --github-output "$GITHUB_OUTPUT"
-      - name: Preserve tracked partial generation for exact rerun
-        if: ${{ always() && steps.provision.outcome != 'success' }}
-        env:
-          CLOUDFLARE_PREVIEW_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_PREVIEW_CONTROL_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          PREVIEW_CONTROL_URL: ${{ vars.PREVIEW_CONTROL_URL }}
-        run: >-
-          node trusted/infra/cf/preview-control.mjs cleanup-journal
-          --journal "$RUNNER_TEMP/preview-control-journal.json"
-          --repository "$GITHUB_REPOSITORY"
-          --pr "${{ needs.build.outputs.pr }}"
-          --account-id "$CLOUDFLARE_PREVIEW_ACCOUNT_ID"
 
-  # Remote smoke receives only one-use, OIDC-minted front-door grants. It has no Cloudflare token
-  # and executes trusted default-branch tests, never test code or configuration from the PR.
+  # Smoke needs no Cloudflare token: it derives the same per-PR bearer from the seed and talks to
+  # the preview over plain HTTPS, exactly like an agent or the owner's browser would.
   smoke:
     needs: [build, provision]
     runs-on: ubuntu-latest
@@ -170,7 +157,6 @@ jobs:
     environment: preview-control
     permissions:
       contents: read
-      id-token: write
       pull-requests: read
     steps:
       - name: Check out trusted smoke code
@@ -188,81 +174,30 @@ jobs:
         run: npm --prefix trusted/hub ci --ignore-scripts --no-audit --no-fund
       - name: Install Chromium
         run: npx --prefix trusted/hub playwright install --with-deps chromium
-      - name: Seed deterministic fixtures through one-use candidate actions
+      - name: Verify diagnostics and the bearer gate
         env:
-          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
-          GITHUB_TOKEN: ${{ github.token }}
-          PREVIEW_CONTROL_DEPLOY_AUD: ${{ vars.PREVIEW_CONTROL_DEPLOY_AUD }}
-          PREVIEW_CONTROL_URL: ${{ vars.PREVIEW_CONTROL_URL }}
-        run: >-
-          node trusted/infra/cf/preview-control.mjs seed
-          --repository "$GITHUB_REPOSITORY"
-          --pr "${{ needs.build.outputs.pr }}"
-          --head-sha "${{ needs.build.outputs.head_sha }}"
-          --source-run-id "${{ github.event.workflow_run.id }}"
-          --generation "${{ needs.provision.outputs.generation }}"
-      - name: Verify candidate diagnostics through exact route
-        env:
-          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
-          GITHUB_TOKEN: ${{ github.token }}
-          PREVIEW_CONTROL_DEPLOY_AUD: ${{ vars.PREVIEW_CONTROL_DEPLOY_AUD }}
-          PREVIEW_CONTROL_URL: ${{ vars.PREVIEW_CONTROL_URL }}
+          PREVIEW_BEARER_SEED: ${{ secrets.PREVIEW_BEARER_SEED }}
+          PR_NUMBER: ${{ needs.build.outputs.pr }}
+          HEAD_SHA: ${{ needs.build.outputs.head_sha }}
+          ARTIFACT_DIGEST: ${{ needs.provision.outputs.artifact_digest }}
+          SCHEMA_DIGEST: ${{ needs.provision.outputs.schema_digest }}
         run: >-
           node trusted/infra/cf/preview-control.mjs smoke
           --repository "$GITHUB_REPOSITORY"
-          --pr "${{ needs.build.outputs.pr }}"
-          --head-sha "${{ needs.build.outputs.head_sha }}"
-          --source-run-id "${{ github.event.workflow_run.id }}"
-          --generation "${{ needs.provision.outputs.generation }}"
-      - name: Mint one-use browser bootstrap without logging it
+          --pr "$PR_NUMBER"
+          --head-sha "$HEAD_SHA"
+          --artifact-digest "$ARTIFACT_DIGEST"
+          --schema-digest "$SCHEMA_DIGEST"
+      - name: Seed deterministic fixtures through the collector upload path
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-          PREVIEW_CONTROL_DEPLOY_AUD: ${{ vars.PREVIEW_CONTROL_DEPLOY_AUD }}
-          PREVIEW_CONTROL_URL: ${{ vars.PREVIEW_CONTROL_URL }}
+          PREVIEW_BEARER_SEED: ${{ secrets.PREVIEW_BEARER_SEED }}
+          PR_NUMBER: ${{ needs.build.outputs.pr }}
         run: >-
-          node trusted/infra/cf/preview-control.mjs browser-grant
+          node trusted/infra/cf/preview-control.mjs seed
           --repository "$GITHUB_REPOSITORY"
-          --pr "${{ needs.build.outputs.pr }}"
-          --head-sha "${{ needs.build.outputs.head_sha }}"
-          --source-run-id "${{ github.event.workflow_run.id }}"
-          --generation "${{ needs.provision.outputs.generation }}"
-          --output "$RUNNER_TEMP/preview-browser-grant.json"
+          --pr "$PR_NUMBER"
       - name: Run synthetic remote browser smoke
         env:
-          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
-          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
-          BASE_URL: https://pr-${{ needs.build.outputs.pr }}-preview.sessions.vza.net
-          PREVIEW_BOOTSTRAP_FILE: ${{ runner.temp }}/preview-browser-grant.json
+          BASE_URL: ${{ needs.provision.outputs.url }}
+          PREVIEW_BEARER_SEED: ${{ secrets.PREVIEW_BEARER_SEED }}
         run: npm --prefix trusted/hub run test:e2e
-
-  # Promotion is a final PR-head check and front-door tuple CAS. It cannot overwrite a newer head
-  # or a close tombstone and does not hold a Cloudflare administration credential.
-  promote:
-    needs: [build, provision, smoke]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    environment: preview-control
-    permissions:
-      contents: read
-      id-token: write
-      pull-requests: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.repository.default_branch }}
-          path: trusted
-          persist-credentials: false
-      - name: Promote exact candidate tuple
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          PREVIEW_CONTROL_DEPLOY_AUD: ${{ vars.PREVIEW_CONTROL_DEPLOY_AUD }}
-          PREVIEW_CONTROL_URL: ${{ vars.PREVIEW_CONTROL_URL }}
-        run: >-
-          node trusted/infra/cf/preview-control.mjs promote
-          --repository "$GITHUB_REPOSITORY"
-          --pr "${{ needs.build.outputs.pr }}"
-          --head-sha "${{ needs.build.outputs.head_sha }}"
-          --source-run-id "${{ github.event.workflow_run.id }}"
-          --generation "${{ needs.provision.outputs.generation }}"

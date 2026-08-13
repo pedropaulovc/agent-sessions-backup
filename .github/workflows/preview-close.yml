@@ -6,13 +6,9 @@ on:
   workflow_dispatch:
     inputs:
       pr:
-        description: Closed PR number to recover
+        description: PR number whose preview environment to tear down (also the manual RESET lever for an open PR — the next CI run reprovisions it empty)
         required: true
         type: number
-      head_sha:
-        description: Closed PR head SHA
-        required: true
-        type: string
 
 permissions: {}
 
@@ -21,18 +17,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # pull_request_target is used only as a trusted close signal. workflow_dispatch provides a
-  # protected-environment recovery path for a close run that failed after the PR became immutable.
-  # This job never checks out, imports, reads, or executes the PR head. The close CAS first writes a
-  # permanent tombstone and clears all routable tuples; only the typed inventory returned by that
-  # transition is eligible for deletion.
-  tombstone-and-clean:
+  # pull_request_target is used only as a trusted close signal; this job never checks out,
+  # imports, reads, or executes the PR head. Preview resources have deterministic stable names
+  # (pr-N-*), so teardown is a name-addressed delete — no registry or state store involved.
+  # workflow_dispatch doubles as the explicit environment RESET: dispatching against an OPEN PR
+  # deletes its persistent D1/R2/KV/queues/Worker, and the next Preview Control run (re-run CI or
+  # push) provisions a fresh environment from scratch.
+  delete-environment:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     environment: preview-control
     permissions:
       contents: read
-      id-token: write
       pull-requests: read
     steps:
       - name: Check out trusted default-branch cleanup code
@@ -43,31 +39,20 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Validate manual recovery target
+      - name: Validate manual target exists
         if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
-          RECOVERY_HEAD_SHA: ${{ inputs.head_sha }}
-          RECOVERY_PR: ${{ inputs.pr }}
+          TARGET_PR: ${{ inputs.pr }}
         shell: bash
-        run: |
-          target=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$RECOVERY_PR" --jq '[.state, .head.sha] | @tsv')
-          IFS=$'\t' read -r state actual_head_sha <<< "$target"
-          if [[ "$state" != "closed" || "$actual_head_sha" != "$RECOVERY_HEAD_SHA" ]]; then
-            echo "Recovery target must be a closed PR with the supplied head SHA" >&2
-            exit 1
-          fi
-      - name: Tombstone routing and delete recorded typed inventory
+        run: gh api "repos/$GITHUB_REPOSITORY/pulls/$TARGET_PR" --jq '.number' > /dev/null
+      - name: Delete the per-PR preview environment
         env:
           CLOUDFLARE_PREVIEW_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
           CLOUDFLARE_PREVIEW_CONTROL_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-          PREVIEW_CONTROL_CLOSE_AUD: ${{ vars.PREVIEW_CONTROL_CLOSE_AUD }}
-          PREVIEW_CONTROL_URL: ${{ vars.PREVIEW_CONTROL_URL }}
-          PREVIEW_CLOSE_HEAD_SHA: ${{ github.event.pull_request.head.sha || inputs.head_sha }}
           PREVIEW_CLOSE_PR: ${{ github.event.pull_request.number || inputs.pr }}
         run: >-
           node infra/cf/preview-control.mjs close
           --repository "$GITHUB_REPOSITORY"
           --pr "$PREVIEW_CLOSE_PR"
-          --head-sha "$PREVIEW_CLOSE_HEAD_SHA"
           --account-id "$CLOUDFLARE_PREVIEW_ACCOUNT_ID"

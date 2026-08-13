@@ -13,10 +13,12 @@ interface Env {
   SCHEMA_DIGEST?: string;
   PENDING_MIGRATIONS?: string;
   SEED_DIGEST?: string;
-  /** Public deployment identity bound only in generated per-generation preview config. */
+  /** Public deployment identity bound only in the generated per-PR preview config. */
   PREVIEW_HEAD_SHA?: string;
   PREVIEW_ARTIFACT_DIGEST?: string;
-  PREVIEW_GENERATION?: string;
+  PREVIEW_PR_NUMBER?: string;
+  /** The per-PR preview bearer (HMAC-SHA256(seed, pr)) — preview's entire auth gate. */
+  PREVIEW_BEARER?: string;
   API_HOST: string;
   VIEWER_HOST: string;
   R2_DASHBOARD_BASE_URL: string;

@@ -24,13 +24,16 @@ describe('machineIdentity', () => {
     expect(identity).toEqual({ kind: 'machine', machineId: 'devbox', isAdmin: true, certSlot: 'current' });
   });
 
-  it('preview: rejects caller-supplied machine headers and reusable bearers', async () => {
-    const preview = envWith({ ENVIRONMENT: 'preview' });
+  it('preview: rejects caller-supplied machine headers and non-matching bearers', async () => {
+    const preview = envWith({ ENVIRONMENT: 'preview', PREVIEW_BEARER: 'p'.repeat(43) });
     expect(await machineIdentity(reqWith({ 'x-dev-machine': 'previewbox' }), preview)).toEqual({ kind: 'anonymous' });
     expect(await machineIdentity(
-      reqWith({ 'x-dev-machine': 'previewbox', authorization: 'Bearer legacy-secret' }),
+      reqWith({ 'x-dev-machine': 'previewbox', authorization: 'Bearer wrong-token' }),
       preview,
     )).toEqual({ kind: 'anonymous' });
+    // A preview deployed WITHOUT a bearer var fails closed even for an empty presented token.
+    const unconfigured = envWith({ ENVIRONMENT: 'preview', PREVIEW_BEARER: undefined });
+    expect(await machineIdentity(reqWith({ authorization: 'Bearer ' }), unconfigured)).toEqual({ kind: 'anonymous' });
   });
 
   it('production: never trusts preview headers or x-dev-machine (mTLS only)', async () => {
@@ -107,17 +110,19 @@ describe('machineIdentity', () => {
 });
 
 describe('preview auth over HTTP', () => {
-  it('denies direct access to the preview origin before routing', async () => {
+  it('rejects requests without the per-PR bearer', async () => {
     const original = testEnv.ENVIRONMENT;
     testEnv.ENVIRONMENT = 'preview';
+    (testEnv as { PREVIEW_BEARER?: string }).PREVIEW_BEARER = 'p'.repeat(43);
     try {
       const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/status', {
         headers: { 'x-dev-machine': 'previewbox-http', authorization: 'Bearer legacy-secret' },
       });
-      expect(res.status).toBe(403);
-      expect(await res.json()).toEqual({ error: 'direct_origin_denied' });
+      expect(res.status).toBe(401);
+      expect(await res.json()).toEqual({ error: 'unauthorized' });
     } finally {
       testEnv.ENVIRONMENT = original;
+      delete (testEnv as { PREVIEW_BEARER?: string }).PREVIEW_BEARER;
     }
   });
 });

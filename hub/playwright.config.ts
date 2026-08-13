@@ -1,8 +1,4 @@
 import { defineConfig, devices } from '@playwright/test';
-import { previewStorageStatePath } from './e2e/storage-state';
-
-const previewBootstrapFile = process.env.PREVIEW_BOOTSTRAP_FILE?.trim();
-const previewStorageState = previewStorageStatePath(previewBootstrapFile, process.env);
 
 export default defineConfig({
   testDir: './e2e',
@@ -20,7 +16,6 @@ export default defineConfig({
   use: {
     ...devices['Desktop Chrome'],
     baseURL: process.env.BASE_URL,
-    storageState: previewStorageState,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',

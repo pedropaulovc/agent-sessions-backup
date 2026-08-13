@@ -1,4 +1,4 @@
-import type { Identity } from '../auth/identity';
+import { ensurePreviewUploadMachine, type Identity } from '../auth/identity';
 import { detect } from '../ingest/detect';
 import { markPendingAndEnqueue, reservationCutoffIso } from '../queue';
 import { hex, objectSha256 } from './ops';
@@ -135,6 +135,10 @@ export async function putFile(
   if (identity.machineId !== machineId && !identity.isAdmin) {
     return Response.json({ error: 'machine_mismatch' }, { status: 403 });
   }
+  // A hand-carried session zip re-uploads files under their ORIGINAL machine id, which this
+  // preview has never enrolled — create the row the files-table FK requires. Admin-only and
+  // preview-only: production machines exist strictly through cert enrollment.
+  await ensurePreviewUploadMachine(env, identity, machineId);
 
   const hashHeader = request.headers.get('x-content-hash') ?? '';
   const m = hashHeader.match(/^sha256:([0-9a-f]{64})$/i);

@@ -1,4 +1,4 @@
-import { createHash, createPublicKey } from 'node:crypto';
+import { createHash, createHmac, createPublicKey } from 'node:crypto';
 import { lstat, open, readFile, realpath, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -16,28 +16,6 @@ export const ARTIFACT_FILES = new Set([
 const TRUSTED_MIGRATION_METADATA = new Set([
   'historical-baseline.json',
   'source-baseline.json',
-]);
-
-const INVENTORY_KINDS = new Set([
-  'd1',
-  'r2',
-  'kv',
-  'queue',
-  'app-version',
-  'app-worker',
-  'edge-version',
-  'edge-worker',
-]);
-
-const CLEANUP_KIND_ORDER = new Map([
-  ['edge-worker', 0],
-  ['app-worker', 1],
-  ['queue', 2],
-  ['edge-version', 3],
-  ['app-version', 4],
-  ['kv', 5],
-  ['r2', 6],
-  ['d1', 7],
 ]);
 
 const PRODUCTION_IDENTIFIERS = new Set([
@@ -99,27 +77,70 @@ export function trustedWranglerEnvironment(source, apiToken, accountId) {
   return environment;
 }
 
-export function previewEdgeSessionCookie(setCookieHeaders) {
-  for (const header of setCookieHeaders) {
-    if (typeof header !== 'string') continue;
-    const match = /(?:^|,\s*)(__Host-preview-edge=[^;,\s]+)/.exec(header);
-    if (match) return match[1];
+/**
+ * The per-PR preview bearer, derived — not distributed. Every principal that needs it (the
+ * provision job baking it into the Worker, the CI smoke/e2e jobs, the owner's machines via
+ * `~/.config/agent-sessions/preview-seed`) derives the same token from one standing seed, so
+ * the public repo never has to move a secret through logs, artifacts, or job outputs. The
+ * Worker holds only the DERIVED per-PR token: leaking one preview's token compromises that
+ * one disposable preview, never the seed or the fleet.
+ */
+export function previewBearerToken(seed, pr) {
+  if (typeof seed !== 'string' || seed.trim().length < 32) {
+    fail('preview bearer seed must be at least 32 characters');
   }
-  return null;
+  return createHmac('sha256', seed.trim())
+    .update(`sessions-preview-bearer:pr-${positiveInteger(pr, 'PR number')}`)
+    .digest('base64url');
 }
 
-export function previewBrowserGrantRequest({ pr, epoch, head, sourceRunId, generation }) {
-  return {
-    pr,
-    epoch,
-    head,
-    sourceRunId,
-    generation,
-    audience: 'preview-browser',
-    method: '*',
-    target: '*',
-    expiresIn: 3600,
-  };
+/**
+ * Exhaustively follow one Cloudflare list endpoint's pagination. The account-level list
+ * APIs disagree on scheme — page/per_page (D1, KV, Queues), cursor (R2 buckets), or no
+ * pagination at all (Workers scripts) — and a first-page-only read makes cleanup silently
+ * leak resources and existence probes silently miss, so every caller goes through here.
+ * `rowsOf` maps one response envelope to its row array (the endpoints also disagree on
+ * where the rows live). Fails loud on a non-terminating walk rather than looping forever.
+ */
+export async function paginatedList(request, pathname, { pagination, rowsOf, perPage = 100 }) {
+  if (typeof request !== 'function') fail('list request function is required');
+  const joiner = pathname.includes('?') ? '&' : '?';
+  if (pagination === 'none') {
+    const envelope = await request(pathname, { allowNotFound: true, returnEnvelope: true });
+    return envelope === null ? [] : rowsOf(envelope) ?? [];
+  }
+  const rows = [];
+  if (pagination === 'page') {
+    for (let page = 1; page <= 1000; page += 1) {
+      const envelope = await request(`${pathname}${joiner}per_page=${perPage}&page=${page}`, {
+        allowNotFound: true, returnEnvelope: true,
+      });
+      if (envelope === null) return rows;
+      const batch = rowsOf(envelope) ?? [];
+      rows.push(...batch);
+      const total = envelope.result_info?.total_count;
+      if (batch.length === 0 || batch.length < perPage) return rows;
+      if (typeof total === 'number' && rows.length >= total) return rows;
+    }
+    fail(`page-based listing did not terminate for ${pathname}`);
+  }
+  if (pagination === 'cursor') {
+    const seenCursors = new Set();
+    let cursor;
+    for (let step = 0; step <= 1000; step += 1) {
+      const query = `${joiner}per_page=${perPage}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
+      const envelope = await request(`${pathname}${query}`, { allowNotFound: true, returnEnvelope: true });
+      if (envelope === null) return rows;
+      const batch = rowsOf(envelope) ?? [];
+      rows.push(...batch);
+      cursor = envelope.result_info?.cursor;
+      if (typeof cursor !== 'string' || cursor.length === 0 || batch.length === 0) return rows;
+      if (seenCursors.has(cursor)) fail(`cursor-based listing repeated a cursor for ${pathname}`);
+      seenCursors.add(cursor);
+    }
+    fail(`cursor-based listing did not terminate for ${pathname}`);
+  }
+  fail(`unsupported pagination mode: ${pagination}`);
 }
 
 export async function emptyR2Bucket(bucketName, request) {
@@ -161,16 +182,6 @@ export async function emptyR2Bucket(bucketName, request) {
     }));
   }
   return keys.length;
-}
-
-export function requiredCloudflareAccessHeaders(environment = process.env) {
-  const clientId = environment.CF_ACCESS_CLIENT_ID?.trim();
-  const clientSecret = environment.CF_ACCESS_CLIENT_SECRET?.trim();
-  if (!clientId || !clientSecret) fail('Cloudflare Access service credentials are required');
-  return {
-    'cf-access-client-id': clientId,
-    'cf-access-client-secret': clientSecret,
-  };
 }
 
 export function assertWorkerModulePayload(prefix) {
@@ -227,31 +238,41 @@ export function assertTrustedWorkflowRef(repository, workflowRef) {
   return workflowRef;
 }
 
-export function resourceNames(pr, runId, sha) {
+/**
+ * Stable per-PR resource names. Each PR gets ONE persistent environment deployed in place —
+ * the worker keeps its workers.dev hostname across pushes, and the backing resources survive
+ * so hand-uploaded session zips persist. (History: names used to carry a `g<runId>-<sha12>`
+ * generation for blue/green promote through the preview front door; the front door is gone
+ * and with it the generation machinery. The janitor still recognizes the old generation name
+ * shape — see `LEGACY_GENERATION_RE` — purely to sweep leftover debris.)
+ */
+export function resourceNames(pr) {
   const prefix = `pr-${positiveInteger(pr, 'PR number')}-`;
-  const generation = `g${positiveInteger(runId, 'run ID')}-${headSha(sha).slice(0, 12)}`;
   const names = {
     prefix,
-    generation,
-    app: `${prefix}${generation}-app`,
-    edge: `${prefix}${generation}-edge`,
-    d1: `${prefix}${generation}-sessions-index`,
-    r2: `${prefix}${generation}-agent-sessions`,
-    kv: `${prefix}${generation}-sessions-hub-kv`,
-    queue: `${prefix}${generation}-parse`,
-    dlq: `${prefix}${generation}-parse-dlq`,
-    host: `${prefix}preview.sessions.vza.net`,
+    app: `${prefix}app`,
+    d1: `${prefix}sessions-index`,
+    r2: `${prefix}agent-sessions`,
+    kv: `${prefix}sessions-hub-kv`,
+    queue: `${prefix}parse`,
+    dlq: `${prefix}parse-dlq`,
+    host: `${prefix}app${PREVIEW_WORKERS_DEV_SUFFIX}`,
   };
   for (const [kind, name] of Object.entries(names)) {
-    if (kind !== 'host' && kind !== 'generation' && kind !== 'prefix' && name.length > 63) {
+    if (kind !== 'host' && kind !== 'prefix' && name.length > 63) {
       fail(`${kind} resource name exceeds Cloudflare's 63-character limit: ${name}`);
     }
-    if (kind !== 'host' && kind !== 'generation' && !name.startsWith(prefix)) {
+    if (kind !== 'host' && !name.startsWith(prefix)) {
       fail(`${kind} resource does not share ${prefix}`);
     }
   }
   return Object.freeze(names);
 }
+
+/** Any `pr-N-…` resource name in the preview account, old or new naming scheme. */
+export const PREVIEW_RESOURCE_RE = /^pr-([1-9][0-9]*)-(app|sessions-index|agent-sessions|sessions-hub-kv|parse|parse-dlq)$/;
+/** The retired blue/green generation naming scheme — always deletable debris. */
+export const LEGACY_GENERATION_RE = /^pr-([1-9][0-9]*)-g[1-9][0-9]*-[0-9a-f]{12}-/;
 
 export function assertPreviewAccount(accountId) {
   required(accountId, 'preview account ID');
@@ -327,73 +348,10 @@ export function generatedBuildConfig({ main, workerName }) {
   return config;
 }
 
-function publicJwks(raw, name) {
-  let parsed;
-  try {
-    parsed = JSON.parse(required(raw, name));
-  } catch {
-    fail(`${name} must be valid JSON`);
-  }
-  if (!parsed || !Array.isArray(parsed.keys) || parsed.keys.length === 0) fail(`${name} has no keys`);
-  for (const key of parsed.keys) {
-    if (!key || typeof key !== 'object' || Array.isArray(key)
-      || typeof key.kid !== 'string' || typeof key.kty !== 'string'
-      || key.notBefore == null || key.notAfter == null || typeof key.revoked !== 'boolean') {
-      fail(`${name} contains an invalid public key record`);
-    }
-    for (const privateField of ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k']) {
-      if (Object.hasOwn(key, privateField)) fail(`${name} contains private key material`);
-    }
-  }
-  return stableJson(parsed);
-}
-
-function publicDebugJwk(raw, name) {
-  let parsed;
-  try {
-    parsed = JSON.parse(required(raw, name));
-  } catch {
-    fail(`${name} must be valid JSON`);
-  }
-  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)
-    || parsed.kty !== 'EC' || parsed.crv !== 'P-256'
-    || parsed.alg !== 'ES256' || parsed.use !== 'sig'
-    || !Array.isArray(parsed.key_ops) || parsed.key_ops.length !== 1 || parsed.key_ops[0] !== 'verify'
-    || !/^[A-Za-z0-9_-]{43}$/.test(parsed.x ?? '')
-    || !/^[A-Za-z0-9_-]{43}$/.test(parsed.y ?? '')
-    || parsed.revoked !== false) {
-    fail(`${name} must be a non-revoked ES256 public verification JWK`);
-  }
-  for (const privateField of ['d', 'p', 'q', 'dp', 'dq', 'qi', 'oth', 'k']) {
-    if (Object.hasOwn(parsed, privateField)) fail(`${name} contains private key material`);
-  }
-  try {
-    createPublicKey({ key: parsed, format: 'jwk' });
-  } catch {
-    fail(`${name} contains an invalid P-256 public key`);
-  }
-  return stableJson(parsed);
-}
-
-
 export function generatedPrivateAppConfig({
-  accountId, main, migrationsDir, names, resources, assertions, application,
+  accountId, main, migrationsDir, names, resources, application,
 }) {
   assertPreviewAccount(accountId);
-  const issuer = new URL(required(assertions?.issuer, 'preview assertion issuer'));
-  if (
-    issuer.protocol !== 'https:'
-    || issuer.username
-    || issuer.password
-    || issuer.pathname !== '/'
-    || issuer.search
-    || issuer.hash
-  ) fail('preview assertion issuer must be an HTTPS origin');
-  const browserJwks = publicJwks(assertions?.browserJwks, 'preview browser assertion JWKS');
-  const actionJwks = publicJwks(assertions?.actionJwks, 'preview action assertion JWKS');
-  if (!/^[A-Za-z0-9_-]{16,128}$/.test(resources.environmentNonce ?? '')) {
-    fail('generated preview config has an invalid environment nonce');
-  }
   for (const [name, digest] of Object.entries({
     buildInputDigest: resources.buildInputDigest,
     artifactDigest: resources.artifactDigest,
@@ -402,18 +360,12 @@ export function generatedPrivateAppConfig({
   })) {
     if (!/^[0-9a-f]{64}$/.test(digest ?? '')) fail(`generated preview config has an invalid ${name}`);
   }
-  const originJwks = publicJwks(assertions?.originJwks, 'preview origin assertion JWKS');
   if (!/^[A-Za-z0-9_-]{43}$/.test(application?.assetSigningSecret ?? '')) {
     fail('preview asset signing secret must be 32 random bytes encoded as base64url');
   }
-  const debugImportAssertionPublicJwk = publicDebugJwk(
-    application?.debugImportAssertionPublicJwk,
-    'DEBUG_IMPORT_ASSERTION_PUBLIC_JWK',
-  );
-  const debugExportManifestVerifyPublicJwk = publicDebugJwk(
-    application?.debugExportManifestVerifyPublicJwk,
-    'DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK',
-  );
+  if (!/^[A-Za-z0-9_-]{43}$/.test(application?.previewBearer ?? '')) {
+    fail('preview bearer must be an HMAC-SHA256 token encoded as base64url');
+  }
   const config = {
     name: names.app,
     account_id: accountId,
@@ -421,7 +373,9 @@ export function generatedPrivateAppConfig({
     compatibility_date: '2026-07-01',
     compatibility_flags: ['nodejs_compat'],
     preview_urls: false,
-    workers_dev: false,
+    // The one public exposure: each PR environment is self-contained and directly
+    // reachable at its stable workers.dev hostname, gated by PREVIEW_BEARER.
+    workers_dev: true,
     routes: [],
     exports: {},
     vars: {
@@ -429,23 +383,16 @@ export function generatedPrivateAppConfig({
       API_HOST: names.host,
       VIEWER_HOST: names.host,
       R2_DASHBOARD_BASE_URL: `https://dash.cloudflare.com/${accountId}/r2/default/buckets/${names.r2}`,
-      ENVIRONMENT_NONCE: resources.environmentNonce,
-      PREVIEW_ASSERTION_ISSUER: issuer.origin,
       PREVIEW_PR_NUMBER: String(resources.pr),
       PREVIEW_HEAD_SHA: resources.headSha,
-      PREVIEW_GENERATION: names.generation,
       PREVIEW_ARTIFACT_DIGEST: resources.artifactDigest,
       BUILD_INPUT_DIGEST: resources.buildInputDigest,
       ARTIFACT_DIGEST: resources.artifactDigest,
       MIGRATION_DIGEST: resources.migrationDigest,
       SCHEMA_DIGEST: resources.schemaDigest,
       PENDING_MIGRATIONS: '0',
-      PREVIEW_BROWSER_ASSERTION_JWKS: browserJwks,
-      PREVIEW_ACTION_ASSERTION_JWKS: actionJwks,
-      PREVIEW_ORIGIN_ASSERTION_JWKS: originJwks,
       ASSET_SIGNING_SECRET: application.assetSigningSecret,
-      DEBUG_IMPORT_ASSERTION_PUBLIC_JWK: debugImportAssertionPublicJwk,
-      DEBUG_EXPORT_MANIFEST_VERIFY_PUBLIC_JWK: debugExportManifestVerifyPublicJwk,
+      PREVIEW_BEARER: application.previewBearer,
     },
     d1_databases: [{
       binding: 'DB',
@@ -466,25 +413,6 @@ export function generatedPrivateAppConfig({
         dead_letter_queue: names.dlq,
       }],
     },
-  };
-  assertNoProductionIdentifiers(config);
-  return config;
-}
-
-export function generatedTrustedWrapperConfig({ accountId, main, names, originJwks }) {
-  assertPreviewAccount(accountId);
-  const config = {
-    name: names.edge,
-    account_id: accountId,
-    main,
-    compatibility_date: '2026-07-01',
-    preview_urls: true,
-    workers_dev: false,
-    routes: [],
-    vars: {
-      PREVIEW_ORIGIN_ASSERTION_JWKS: publicJwks(originJwks, 'preview origin assertion JWKS'),
-    },
-    services: [{ binding: 'APP', service: names.app }],
   };
   assertNoProductionIdentifiers(config);
   return config;
@@ -522,80 +450,29 @@ export async function walkRegularFiles(root) {
   return found.sort();
 }
 
-export function acknowledgedResources(deleted) {
-  if (!Array.isArray(deleted)) fail('deleted resources must be an array');
-  return deleted.map(({ kind, id, name, generation }) => ({ kind, id, name, generation }));
+/**
+ * Classify an account resource name for cleanup. Returns null for names the preview
+ * control plane does not own (never touched), otherwise `{ pr, legacy }`.
+ */
+export function previewResourceOwner(name) {
+  if (typeof name !== 'string') return null;
+  const legacy = LEGACY_GENERATION_RE.exec(name);
+  if (legacy) return { pr: Number(legacy[1]), legacy: true };
+  const current = PREVIEW_RESOURCE_RE.exec(name);
+  if (current) return { pr: Number(current[1]), legacy: false };
+  return null;
 }
 
-export function workerScriptCoversVersion(item, inventory) {
-  if (!Array.isArray(inventory)) fail('inventory must be an array');
-  const workerKind = item?.kind === 'app-version'
-    ? 'app-worker'
-    : item?.kind === 'edge-version'
-      ? 'edge-worker'
-      : null;
-  if (!workerKind) return false;
-  return inventory.some((candidate) =>
-    candidate?.kind === workerKind
-    && candidate.name === item.name
-    && candidate.generation === item.generation);
-}
-
-export function sortCleanupInventory(inventory) {
-  if (!Array.isArray(inventory)) fail('inventory must be an array');
-  return [...inventory].sort(
-    (a, b) => (CLEANUP_KIND_ORDER.get(a?.kind) ?? Number.MAX_SAFE_INTEGER)
-      - (CLEANUP_KIND_ORDER.get(b?.kind) ?? Number.MAX_SAFE_INTEGER),
-  );
-}
-
-export function queueConsumerIdsForWorker(consumers, workerName, queueNames) {
+export function queueConsumerIdsForQueue(consumers, queueName) {
   if (!Array.isArray(consumers)) fail('queue consumers must be an array');
-  if (!Array.isArray(queueNames)) fail('queue names must be an array');
-  required(workerName, 'queue consumer Worker name');
-  const ownedQueues = new Set(queueNames.map((name) => required(name, 'queue name')));
+  required(queueName, 'queue name');
   return consumers.map((consumer) => {
-    const hasWorkerIdentity = typeof consumer?.script_name === 'string';
-    const hasQueueIdentity = typeof consumer?.queue_name === 'string';
-    const explicitForeignType = consumer?.type != null && consumer.type !== 'worker';
-    const foreignWorker = hasWorkerIdentity && consumer.script_name !== workerName;
-    const foreignQueue = hasQueueIdentity && !ownedQueues.has(consumer.queue_name);
-    if (explicitForeignType || !hasWorkerIdentity && !hasQueueIdentity || foreignWorker || foreignQueue) {
-      const identity = stableJson({
-        queueName: consumer?.queue_name ?? null,
-        scriptName: consumer?.script_name ?? null,
-        type: consumer?.type ?? null,
-      });
-      fail(`foreign queue consumer rejected for ${workerName}: ${identity}`);
+    // Every consumer of a pr-N queue was attached by the preview control plane; a consumer
+    // claiming a script outside the pr- namespace means the account holds something foreign.
+    const script = consumer?.script_name;
+    if (typeof script === 'string' && previewResourceOwner(script) === null) {
+      fail(`foreign queue consumer rejected on ${queueName}: ${stableJson({ script })}`);
     }
     return required(consumer.consumer_id, 'queue consumer id');
   });
-}
-
-export function inventoryGenerations(inventory) {
-  if (!Array.isArray(inventory)) fail('inventory must be an array');
-  const generations = new Set();
-  for (const item of inventory) {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
-    const generation = item.generation;
-    if (/^g[1-9][0-9]*-[0-9a-f]{12}$/.test(generation ?? '')) generations.add(generation);
-  }
-  return generations;
-}
-
-export function assertInventoryItem(item, pr, knownGeneration, { allowMissingId = false } = {}) {
-  if (!item || typeof item !== 'object' || Array.isArray(item)) fail('inventory item must be an object');
-  if (!INVENTORY_KINDS.has(item.kind)) fail(`unsupported inventory kind: ${item.kind}`);
-  const prefix = `pr-${positiveInteger(pr, 'PR number')}-${knownGeneration}-`;
-  if (item.id == null) {
-    if (!allowMissingId) fail('inventory id is required');
-  } else {
-    required(item.id, 'inventory id');
-  }
-  const name = required(item.name, 'inventory name');
-  if (!name.startsWith(prefix)) fail(`foreign generation inventory name rejected: ${name}`);
-  if (item.pr != null && item.pr !== Number(pr)) fail(`inventory PR mismatch for ${name}`);
-  if (item.generation !== knownGeneration) fail(`inventory generation mismatch for ${name}`);
-  assertNoProductionIdentifiers(item);
-  return item;
 }
