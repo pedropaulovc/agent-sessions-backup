@@ -45,6 +45,13 @@ export default defineConfig(async () => {
       // contention rather than peppering `}, N)` onto individual heavy tests (which only moves the
       // flake to the next-heaviest one). Still bounded, so a genuinely hung test fails in time.
       testTimeout: 15000,
+      // Hooks get the same treatment for the same reason: vitest's 10s hook default is below
+      // even testTimeout, yet the fixture-heaviest hooks do MORE round-trips than any single
+      // test — viewer.test.ts's beforeAll pushes six sessions through the full upload+ingest
+      // path (one ~190KB/450-turn), and timed out at 10s on a contended CI runner (run
+      // 31673596635) with zero hub changes in the diff. Sized above testTimeout because setup
+      // legitimately batches many round-trips; still bounded.
+      hookTimeout: 30000,
     },
   };
 });
