@@ -97,11 +97,11 @@ class HubResponse:
 
 
 class HubClient:
-    """Auth-aware HTTP wrapper for https://api.sessions.vza.net (or a preview URL).
+    """Auth-aware HTTP wrapper for https://api.sessions.vza.net.
 
-    Machine API only — every read endpoint under /api/v1 requires an identity of
-    kind='machine' (see hub/src/router.ts::apiRoute), which this client's two auth modes
-    both resolve to (mTLS cert -> machines row; bearer+x-dev-machine -> dev identity).
+    Read API only — every read endpoint under /api/v1 requires an identity of
+    kind='machine' or 'grant' (see hub/src/router.ts::apiRoute), which this client's two
+    auth modes resolve to (grant bearer -> read allow-list; mTLS cert -> machines row).
     """
 
     def __init__(self, config: ClientConfig, *, timeout: float = 30.0):
@@ -129,10 +129,8 @@ class HubClient:
 
     def _headers(self) -> dict[str, str]:
         headers = {"user-agent": USER_AGENT, "accept": "application/json, application/x-ndjson"}
-        if self._config.auth_mode is AuthMode.BEARER:
-            headers["authorization"] = f"Bearer {self._config.bearer_token}"
-            if self._config.dev_machine:
-                headers["x-dev-machine"] = self._config.dev_machine
+        if self._config.auth_mode is AuthMode.GRANT:
+            headers["authorization"] = f"Bearer {self._config.grant_token}"
         return headers
 
     def get(self, path: str, params: dict[str, str | int | None] | None = None) -> HubResponse:

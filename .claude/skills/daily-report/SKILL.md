@@ -14,11 +14,13 @@ machine API. Full endpoint contract, auth modes, and known gaps: `docs/agents-ap
    ```bash
    cd client && uv run agent-sessions daily-report --date YYYY-MM-DD
    ```
-   `--date` defaults to today. Requires an mTLS cert/key, resolved from
-   `~/.config/agent-collector/config.toml` by default (already set up on any enrolled
-   machine) — override with `--client-cert`/`--client-key` if needed. Against a PR preview
-   instead of production, use `--hub-url <preview-url> --bearer-token $DEV_AUTH --dev-machine
-   <any-id>`. `--out <path>` writes the markdown to a file instead of stdout.
+   `--date` defaults to today. Auth resolves in this order: a read grant
+   (`--grant-token` / `$AGENT_SESSIONS_GRANT_TOKEN` / the cache written by
+   `uv run agent-sessions auth`), then a transitional mTLS cert/key from
+   `~/.config/agent-collector/config.toml`. If neither is present — or once cert reads are
+   severed — mint a grant first: `uv run agent-sessions auth` (opens a browser page; the
+   owner approves with a passkey; the token caches for ~4 h). `--out <path>` writes the
+   markdown to a file instead of stdout.
 
 2. **If the CLI isn't available** (no `client/` checkout, or you need a breakdown the built-in
    report doesn't produce), call the API directly per `docs/agents-api.md`. The three calls the
