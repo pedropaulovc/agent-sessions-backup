@@ -11,7 +11,8 @@ depth). This file is the runbook for standing that up on the `vza.net` zone.
 - **The worker and all data-plane resources are deployed and fail-closed.** With no
   client cert, `GET /api/v1/search`, `PUT /api/v1/files/...`, and even a forged
   `x-dev-machine` header all return `401` in production (verified). `ENVIRONMENT=production`
-  disables the dev-header and `DEV_AUTH` bypasses entirely (`src/auth/identity.ts`).
+  rejects the loopback-only dev identity; previews use their derived per-PR bearer instead
+  (`src/auth/identity.ts`).
 - **The Wrangler OAuth client cannot configure mTLS.** Its legacy `ssl_certs:write`
   grant is accepted for Wrangler's certificate surface but the zone-managed
   `/client_certificates` endpoint rejects it with auth error `10000`. The hub therefore
@@ -219,9 +220,13 @@ their current certificate and retry. A revoked/under-scoped grant emits `hub.cer
 `hub/migrations/0005_cert_rotation.sql` adds the rotation columns (`cert_id`, `prev_cert_fp_sha256`,
 `prev_cert_id`, `cert_revoke_at`), and `0009_retired_certs_reservation_source.sql` records whether a
 retired row came from a prior machine slot or is cleanup for a never-delivered minted orphan. Apply
-all pending migrations to each remote D1 before deploying the Worker that reads the new column:
+all pending migrations to the production D1 before deploying the Worker that reads the new column:
 
 ```
-cd hub && npx wrangler d1 migrations apply sessions-index --remote          # production
-cd hub && npx wrangler d1 migrations apply sessions-index-preview --remote  # preview
+cd hub && npx wrangler d1 migrations apply sessions-index --remote
 ```
+
+Preview Control applies migrations automatically to each `pr-<N>-sessions-index` before it deploys
+`pr-<N>-app`. The trusted provisioner requires zero pending migrations and a valid schema digest. If
+an applied migration's name or contents diverge from the current migration manifest, it recreates
+that PR's D1 database, empties its R2 bucket, and reapplies the migrations from scratch.

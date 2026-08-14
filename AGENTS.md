@@ -15,10 +15,16 @@
 
 - Two identity/account pairs exist, and every Cloudflare operation belongs to exactly one
   (full table + rules: `infra/cf/deploy.md`, "Identities and accounts"):
-  `pedro@vza.net` → production `18ef3246…` (owner-at-keyboard and protected `main`-only CI
-  ONLY — agents never authenticate there), and `pedro@vezza.com.br` → non-production
-  `cbb04a26…` (per-PR previews; the only account an agent may ever log into, and only under
-  the conditions below).
+  `pedro@vza.net` → production `18ef3246e9f36d1560485ef53889c0ab` (owner-at-keyboard
+  and protected `main`-only CI ONLY; agents never authenticate there), and
+  `pedro@vezza.com.br` → non-production `cbb04a26e6fa2d0cdc4eb67c735e5669`
+  (per-PR previews; the only account an agent may ever log into, and only under the
+  conditions below).
+  Each PR owns its `pr-<N>-*` Worker, D1, R2, KV, and queues in the non-production
+  account. The protected control jobs provision and migrate them, preserve them across
+  pushes, and delete them after the PR closes. The old shared preview resources and
+  GitHub `preview` environment are retired; `preview-control` is the only preview
+  environment.
 - Preview browser access and session uploads do not use Wrangler — both authenticate with the derived per-PR bearer. Remote control-plane login is not part of the development or test flow.
 - Only when exceptional preview administration is explicitly authorized, use the non-production-only identity and the exact OAuth scopes `account:read user:read workers:write workers_kv:write workers_scripts:write d1:write queues:write`. Run `npx wrangler login --use-keyring --scopes account:read user:read workers:write workers_kv:write workers_scripts:write d1:write queues:write`; never run an unscoped login. OS keyring storage (Windows Credential Manager or Linux libsecret) is required, and the selected identity/account must have no production membership or resources.
 - PR code and untrusted PR CI never receive Cloudflare credentials. Only the protected control jobs — provision, close, and the janitor, all running trusted default-branch code — hold the non-production API token; the smoke job holds only the bearer seed. PR code receives its own preview's derived bearer (blast radius: that one disposable preview). Preview administration belongs to protected default-branch control workflows; production deployment remains protected and `main`-only.

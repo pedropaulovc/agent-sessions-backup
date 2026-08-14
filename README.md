@@ -19,6 +19,18 @@ Backup, index, search, and render AI agent/chat sessions from every machine and 
 | `scripts/` | Local corpus seeding + verification tooling |
 | `memory/` | Project memory for AI agents working on this repo |
 
+## Cloudflare environments
+
+Production Sessions resources live in Cloudflare account
+`18ef3246e9f36d1560485ef53889c0ab` and deploy through the protected `production`
+GitHub environment. Pull request previews live in the PPE account
+`cbb04a26e6fa2d0cdc4eb67c735e5669`. Protected `preview-control` jobs provision and
+migrate a dedicated set of `pr-<N>-*` Worker, D1, R2, KV, and queue resources for each
+PR. Those resources persist across pushes and are deleted when the PR closes; the
+janitor removes any resources left behind by failed close cleanup.
+
+The old shared preview resources and GitHub `preview` environment are retired.
+
 ## Update a Windows collector
 
 Run this in PowerShell to update an enrolled collector to the current `main` branch, replace its scheduled task, and send an immediate heartbeat. It waits for an in-progress scheduled run before replacing the tool, so it never updates the executable under that process.
