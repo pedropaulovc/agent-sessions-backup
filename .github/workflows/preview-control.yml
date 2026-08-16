@@ -148,6 +148,46 @@ jobs:
           --migrations-cli trusted/hub/scripts/migrations.mjs
           --github-output "$GITHUB_OUTPUT"
 
+  # A separate no-secret job owns the GitHub deployment write grant. It repeats the source-run
+  # and current-head checks in trusted main code before it creates a PR-SHA deployment card.
+  deployment_card:
+    needs: [build, provision]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      deployments: write
+      pull-requests: read
+    outputs:
+      id: ${{ steps.create.outputs.deployment_id }}
+    steps:
+      - name: Check out trusted deployment-card code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Create PR-visible deployment while smoke runs
+        id: create
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.build.outputs.pr }}
+          HEAD_SHA: ${{ needs.build.outputs.head_sha }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+        run: >-
+          node trusted/infra/cf/preview-control.mjs deployment-create
+          --repository "$GITHUB_REPOSITORY"
+          --pr "$PR_NUMBER"
+          --head-sha "$HEAD_SHA"
+          --source-run-id "$SOURCE_RUN_ID"
+          --run-id "$GITHUB_RUN_ID"
+          --workflow-ref "$GITHUB_WORKFLOW_REF"
+          --github-output "$GITHUB_OUTPUT"
+
   # Smoke needs no Cloudflare token: it derives the same per-PR bearer from the seed and talks to
   # the preview over plain HTTPS, exactly like an agent or the owner's browser would.
   smoke:
@@ -201,3 +241,52 @@ jobs:
           BASE_URL: ${{ needs.provision.outputs.url }}
           PREVIEW_BEARER_SEED: ${{ secrets.PREVIEW_BEARER_SEED }}
         run: npm --prefix trusted/hub run test:e2e
+
+  # Completes the exact deployment recorded before its in-progress status write, including when
+  # that status call fails. This job has no Cloudflare or bearer secret; trusted main revalidates
+  # the PR head before the terminal status write.
+  complete_deployment_card:
+    needs: [build, provision, deployment_card, smoke]
+    if: >-
+      always() &&
+      needs.build.result == 'success' &&
+      needs.provision.result == 'success' &&
+      needs.deployment_card.outputs.id != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+      deployments: write
+      pull-requests: read
+    steps:
+      - name: Check out trusted deployment-card code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          path: trusted
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Publish the terminal preview deployment status
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ needs.build.outputs.pr }}
+          HEAD_SHA: ${{ needs.build.outputs.head_sha }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          DEPLOYMENT_ID: ${{ needs.deployment_card.outputs.id }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+        run: |
+          set -euo pipefail
+          outcome=failure
+          if [[ "$SMOKE_RESULT" == success ]]; then outcome=success; fi
+          node trusted/infra/cf/preview-control.mjs deployment-status \
+            --repository "$GITHUB_REPOSITORY" \
+            --pr "$PR_NUMBER" \
+            --head-sha "$HEAD_SHA" \
+            --source-run-id "$SOURCE_RUN_ID" \
+            --run-id "$GITHUB_RUN_ID" \
+            --workflow-ref "$GITHUB_WORKFLOW_REF" \
+            --deployment-id "$DEPLOYMENT_ID" \
+            --outcome "$outcome"

@@ -31,13 +31,18 @@ import {
   walkRegularFiles,
   writeCanonicalJson,
 } from './preview-trust.mjs';
+import {
+  completePreviewDeployment,
+  createPreviewDeployment,
+  deactivatePreviewDeployments,
+} from './preview-deployment.mjs';
 import { SYNTHETIC_EXPECTATIONS } from '../../hub/scripts/lib/dev-seed.mjs';
 
 const [command, ...rest] = process.argv.slice(2);
 const allowed = new Set([
   'account-id', 'artifact', 'head-sha', 'pr', 'repository', 'run-id',
   'source-run-id', 'workflow-ref', 'wrangler', 'migrations-cli',
-  'github-output', 'artifact-digest', 'schema-digest',
+  'github-output', 'artifact-digest', 'schema-digest', 'deployment-id', 'outcome',
 ]);
 const args = parseArgs(rest, allowed);
 const repository = repositoryName(args.repository ?? process.env.GITHUB_REPOSITORY);
@@ -130,7 +135,7 @@ async function verifyArtifact(directory, expected) {
 }
 
 async function github(pathname, init = {}) {
-  const { allowNotFound = false, ...fetchInit } = init;
+  const { allowNotFound = false, expectedStatus = null, ...fetchInit } = init;
   const token = process.env.GITHUB_TOKEN;
   if (!token) fail('GITHUB_TOKEN is required for trusted GitHub state checks');
   const response = await fetch(`https://api.github.com${pathname}`, {
@@ -144,7 +149,9 @@ async function github(pathname, init = {}) {
     },
   });
   if (allowNotFound && response.status === 404) return null;
-  if (!response.ok) fail(`GitHub API ${pathname} failed with ${response.status}`);
+  if (!response.ok || (expectedStatus != null && response.status !== expectedStatus)) {
+    fail(`GitHub API ${pathname} failed with ${response.status}`);
+  }
   return response.json();
 }
 
@@ -163,6 +170,75 @@ async function assertCurrentPullRequest(expectedSha) {
   if (pull.state !== 'open') fail(`PR ${pr} is not open`);
   if (pull.head?.sha !== expectedSha) fail(`PR ${pr} head changed before preview control`);
   return pull;
+}
+
+function previewVerifier(sha, sourceRunId) {
+  return async () => {
+    await assertSuccessfulSourceRun(sourceRunId, sha);
+    await assertCurrentPullRequest(sha);
+  };
+}
+
+function actionRunLogUrl() {
+  const runId = process.env.GITHUB_RUN_ID;
+  if (!runId) return null;
+  return `https://github.com/${repository}/actions/runs/${positiveInteger(runId, 'GitHub Actions run ID')}`;
+}
+
+async function createDeploymentCard() {
+  const sha = headSha(args['head-sha']);
+  const sourceRunId = positiveInteger(args['source-run-id'], 'source workflow run ID');
+  const runId = positiveInteger(args['run-id'], 'controller workflow run ID');
+  const githubOutput = args['github-output'];
+  const recordDeploymentId = githubOutput
+    ? async ({ deploymentId }) => appendFile(path.resolve(githubOutput), `deployment_id=${deploymentId}\n`)
+    : null;
+  assertTrustedWorkflowRef(repository, args['workflow-ref']);
+  const card = await createPreviewDeployment({
+    request: github,
+    verify: previewVerifier(sha, sourceRunId),
+    onCreated: recordDeploymentId,
+    repository,
+    pr,
+    sha,
+    sourceRunId,
+    runId,
+  });
+  process.stdout.write(`${stableJson(card)}\n`);
+}
+
+async function completeDeploymentCard() {
+  const sha = headSha(args['head-sha']);
+  const sourceRunId = positiveInteger(args['source-run-id'], 'source workflow run ID');
+  const runId = positiveInteger(args['run-id'], 'controller workflow run ID');
+  assertTrustedWorkflowRef(repository, args['workflow-ref']);
+  const card = await completePreviewDeployment({
+    request: github,
+    verify: previewVerifier(sha, sourceRunId),
+    repository,
+    pr,
+    sha,
+    sourceRunId,
+    runId,
+    deploymentId: args['deployment-id'],
+    outcome: args.outcome,
+  });
+  process.stdout.write(`${stableJson(card)}\n`);
+}
+
+async function deactivateDeploymentCards(number, description) {
+  return deactivatePreviewDeployments({
+    request: github,
+    repository,
+    pr: number,
+    description,
+    logUrl: actionRunLogUrl(),
+  });
+}
+
+async function inactivateDeploymentCards() {
+  const inactiveDeploymentIds = await deactivateDeploymentCards(pr, 'Preview environment removed');
+  process.stdout.write(`${stableJson({ pr, inactiveDeploymentIds })}\n`);
 }
 
 async function cf(pathname, init = {}) {
@@ -735,10 +811,17 @@ async function janitor() {
   for (const item of await deleteInDependencyPasses(deletable, deleteOwnedResource)) {
     deleted.push({ kind: item.kind, name: item.name, pr: item.pr, legacy: item.legacy });
   }
-  process.stdout.write(`${stableJson({ closedPrs: [...closedPrs].sort((a, b) => a - b), deleted })}\n`);
+  const closedPrNumbers = [...closedPrs].sort((a, b) => a - b);
+  if (args['github-output']) {
+    await appendFile(path.resolve(args['github-output']), `closed_prs=${stableJson(closedPrNumbers)}\n`);
+  }
+  process.stdout.write(`${stableJson({ closedPrs: closedPrNumbers, deleted })}\n`);
 }
 
 if (command === 'provision') await provision();
+else if (command === 'deployment-create') await createDeploymentCard();
+else if (command === 'deployment-status') await completeDeploymentCard();
+else if (command === 'deployment-inactivate') await inactivateDeploymentCards();
 else if (command === 'seed') await seed();
 else if (command === 'smoke') await smoke();
 else if (command === 'close') await closePreview();
