@@ -68,10 +68,17 @@ function postJson(body) {
   };
 }
 
-function completionDescription(outcome) {
-  if (outcome === 'success') return 'Preview deployed and passed remote smoke tests';
-  if (outcome === 'failure') return 'Preview provisioned, but remote smoke tests failed';
-  fail('preview deployment outcome must be success or failure');
+function completionDetails(outcome, url) {
+  if (outcome === 'success') {
+    return { state: 'success', description: 'Preview deployed and passed remote smoke tests', environmentUrl: url };
+  }
+  if (outcome === 'provision-failure') {
+    return { state: 'failure', description: 'Preview provisioning failed', environmentUrl: null };
+  }
+  if (outcome === 'smoke-failure') {
+    return { state: 'failure', description: 'Preview provisioned, but remote smoke tests failed', environmentUrl: url };
+  }
+  fail('preview deployment outcome must be success, provision-failure, or smoke-failure');
 }
 
 export function previewDeploymentEnvironment(pr) {
@@ -129,11 +136,12 @@ function precedesDeployment(candidate, current) {
 }
 
 /**
- * Create an immutable deployment card for a provisioned PR preview, then expose the stable
- * workers.dev URL while remote smoke is still running. The caller receives the deployment ID
- * before the in-progress status write so a later terminalizer can recover a failed status call.
- * Each verification immediately precedes its write: a stale trusted workflow must never
- * decorate a newer PR head.
+ * Create an immutable deployment card before the preview may exist. The controller log is
+ * available while provisioning and remote smoke run; a terminal status adds the stable
+ * workers.dev URL only after provisioning succeeds. The caller receives the deployment ID before
+ * its in-progress status write so a later terminalizer can recover a failed status call. Each
+ * verification immediately precedes its write: a stale trusted workflow must never decorate a
+ * newer PR head.
  */
 export async function createPreviewDeployment({ request, verify, onCreated = null, ...values }) {
   const context = previewContext(values);
@@ -164,8 +172,7 @@ export async function createPreviewDeployment({ request, verify, onCreated = nul
   if (recordCreated) await recordCreated({ deploymentId: id, environment, url });
 
   await verifyCurrent();
-  await postDeploymentStatus(github, context, id, 'in_progress', 'Preview provisioned; remote smoke tests running', {
-    environmentUrl: url,
+  await postDeploymentStatus(github, context, id, 'in_progress', 'Preview provisioning is in progress', {
     logUrl,
   });
 
@@ -173,8 +180,9 @@ export async function createPreviewDeployment({ request, verify, onCreated = nul
 }
 
 /**
- * Complete a deployment card after smoke. Every terminal result inactivates older transient
- * cards for this PR because GitHub's automatic inactivity excludes transient environments.
+ * Complete a deployment card after provisioning and smoke. Every terminal result inactivates
+ * older transient cards for this PR because GitHub's automatic inactivity excludes transient
+ * environments.
  */
 export async function completePreviewDeployment({ request, verify, deploymentId: id, outcome, ...values }) {
   const context = previewContext(values);
@@ -183,11 +191,11 @@ export async function completePreviewDeployment({ request, verify, deploymentId:
   const currentDeploymentId = deploymentId(id);
   const url = previewUrl(context.pr);
   const logUrl = githubRunUrl(context.repository, context.runId);
-  const description = completionDescription(outcome);
+  const completion = completionDetails(outcome, url);
 
   await verifyCurrent();
-  await postDeploymentStatus(github, context, currentDeploymentId, outcome, description, {
-    environmentUrl: url,
+  await postDeploymentStatus(github, context, currentDeploymentId, completion.state, completion.description, {
+    environmentUrl: completion.environmentUrl,
     logUrl,
   });
 

@@ -148,10 +148,11 @@ jobs:
           --migrations-cli trusted/hub/scripts/migrations.mjs
           --github-output "$GITHUB_OUTPUT"
 
-  # A separate no-secret job owns the GitHub deployment write grant. It repeats the source-run
-  # and current-head checks in trusted main code before it creates a PR-SHA deployment card.
+  # A separate no-secret job owns the GitHub deployment write grant. It starts immediately after
+  # the build so the PR card is visible while the credentialed provisioning job runs. It repeats
+  # the source-run and current-head checks in trusted main code before it creates a PR-SHA card.
   deployment_card:
-    needs: [build, provision]
+    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -171,7 +172,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Create PR-visible deployment while smoke runs
+      - name: Create PR-visible deployment while provisioning runs
         id: create
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -243,14 +244,13 @@ jobs:
         run: npm --prefix trusted/hub run test:e2e
 
   # Completes the exact deployment recorded before its in-progress status write, including when
-  # that status call fails. This job has no Cloudflare or bearer secret; trusted main revalidates
-  # the PR head before the terminal status write.
+  # either provisioning or smoke fails. This job has no Cloudflare or bearer secret; trusted main
+  # revalidates the PR head before the terminal status write.
   complete_deployment_card:
     needs: [build, provision, deployment_card, smoke]
     if: >-
       always() &&
       needs.build.result == 'success' &&
-      needs.provision.result == 'success' &&
       needs.deployment_card.outputs.id != ''
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -276,11 +276,15 @@ jobs:
           HEAD_SHA: ${{ needs.build.outputs.head_sha }}
           SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
           DEPLOYMENT_ID: ${{ needs.deployment_card.outputs.id }}
+          PROVISION_RESULT: ${{ needs.provision.result }}
           SMOKE_RESULT: ${{ needs.smoke.result }}
         run: |
           set -euo pipefail
-          outcome=failure
-          if [[ "$SMOKE_RESULT" == success ]]; then outcome=success; fi
+          outcome=provision-failure
+          if [[ "$PROVISION_RESULT" == success ]]; then
+            outcome=smoke-failure
+            if [[ "$SMOKE_RESULT" == success ]]; then outcome=success; fi
+          fi
           node trusted/infra/cf/preview-control.mjs deployment-status \
             --repository "$GITHUB_REPOSITORY" \
             --pr "$PR_NUMBER" \

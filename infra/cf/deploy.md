@@ -49,15 +49,16 @@ resources created if missing and reused across pushes. There is no front door, n
 Access, and no blue/green generation machinery — the deploy IS the promote, so a broken push
 briefly breaks that PR's preview until the next one.
 
-After a provision succeeds, a separate trusted, no-secret job creates a transient GitHub
-deployment in the `preview/pr-<number>` environment, attached to the immutable PR head SHA
-rather than the `workflow_run` controller's `main` SHA. It records the deployment ID before its
-status write so the no-secret terminalizer can recover a transient GitHub API failure. Every
-create or terminal-card write repeats the source-CI and current-head checks; the card exposes
-the stable workers.dev URL while remote smoke runs, then records the terminal smoke result and
-inactivates older cards for that PR. Separate no-secret close and janitor follow-ups mark cards
-inactive after resource removal. Only these no-secret jobs hold `deployments: write`; PR CI never
-receives it.
+After an isolated build succeeds, a separate trusted, no-secret job immediately creates a
+transient GitHub deployment in the `preview/pr-<number>` environment, attached to the immutable
+PR head SHA rather than the `workflow_run` controller's `main` SHA. It posts an in-progress
+status while credentialed provisioning runs in parallel, recording the deployment ID first so the
+no-secret terminalizer can recover a transient GitHub API failure. The initial status links to the
+controller run; its terminal status adds the stable workers.dev URL only after provisioning
+succeeds. Every create or terminal-card write repeats the source-CI and current-head checks. The
+terminalizer distinguishes provisioning failure from smoke failure, then inactivates older cards
+for that PR. Separate no-secret close and janitor follow-ups mark cards inactive after resource
+removal. Only these no-secret jobs hold `deployments: write`; PR CI never receives it.
 
 **Auth is one derived per-PR bearer.** `PREVIEW_BEARER = HMAC-SHA256(seed, "sessions-preview-bearer:pr-<n>")`
 is baked into the Worker as its only gate; browsers mint a session cookie by visiting

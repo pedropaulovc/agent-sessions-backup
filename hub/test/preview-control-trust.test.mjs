@@ -483,9 +483,8 @@ describe('PR-visible preview deployment cards', () => {
     expect(JSON.parse(requests[1].init.body)).toEqual({
       state: 'in_progress',
       environment,
-      description: 'Preview provisioned; remote smoke tests running',
+      description: 'Preview provisioning is in progress',
       auto_inactive: false,
-      environment_url: url,
       log_url: logUrl,
     });
   });
@@ -550,13 +549,13 @@ describe('PR-visible preview deployment cards', () => {
       request,
       verify: async () => {},
       deploymentId,
-      outcome: 'failure',
+      outcome: 'smoke-failure',
       ...deploymentArgs(),
     });
 
     expect(card).toEqual({
       deploymentId,
-      outcome: 'failure',
+      outcome: 'smoke-failure',
       inactiveDeploymentIds: [10],
       url,
     });
@@ -572,6 +571,33 @@ describe('PR-visible preview deployment cards', () => {
       state: 'inactive',
       environment,
       description: 'Superseded by a newer preview attempt',
+      auto_inactive: false,
+      log_url: logUrl,
+    });
+  });
+
+  it('publishes a provisioning failure without an unavailable preview URL', async () => {
+    const requests = [];
+    const request = async (pathname, init) => {
+      requests.push({ pathname, init });
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) return { state: 'failure' };
+      if (pathname === `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=1`) {
+        return [{ id: deploymentId, created_at: currentCreatedAt }];
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(completePreviewDeployment({
+      request,
+      verify: async () => {},
+      deploymentId,
+      outcome: 'provision-failure',
+      ...deploymentArgs(),
+    })).resolves.toMatchObject({ outcome: 'provision-failure', inactiveDeploymentIds: [] });
+    expect(JSON.parse(requests[0].init.body)).toEqual({
+      state: 'failure',
+      environment,
+      description: 'Preview provisioning failed',
       auto_inactive: false,
       log_url: logUrl,
     });
