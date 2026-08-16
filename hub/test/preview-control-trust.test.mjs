@@ -8,6 +8,12 @@ import {
   PREVIEW_ACCOUNT_ID,
   PRODUCTION_ACCOUNT_ID,
   assertPreviewAccount,
+  assertSameRepositoryOpenPullRequest,
+  assertTrustedPreviewQueueRun,
+  assertTrustedPreviewQueueWorkflowRef,
+  assertTrustedPreviewResetRun,
+  assertTrustedPreviewResetWorkflowRef,
+  assertTrustedSourceCiRun,
   assertTrustedWorkflowRef,
   assertWorkerModulePayload,
   deleteInDependencyPasses,
@@ -25,10 +31,15 @@ import {
   wranglerWorkerBundle,
 } from '../../infra/cf/preview-trust.mjs';
 import {
+  claimPreviewDeployment,
   completePreviewDeployment,
-  createPreviewDeployment,
   deactivatePreviewDeployments,
+  findPreviewAnnouncement,
+  inactivateSupersededPreviewDeployments,
   previewDeploymentEnvironment,
+  queuePreviewDeployment,
+  rejectQueuedPreviewDeployments,
+  settleQueuedPreviewDeployment,
 } from '../../infra/cf/preview-deployment.mjs';
 
 const SHA = 'a'.repeat(40);
@@ -63,18 +74,76 @@ function appConfig(overrides = {}) {
 }
 
 describe('trusted preview workflow identity', () => {
-  it('binds the allowed workflow ref to the validated full repository name', () => {
+  it('binds each trusted workflow ref to the validated full repository name', () => {
     const repository = 'pedropaulovc/agent-sessions-backup';
-    const expected = `${repository}/.github/workflows/preview-control.yml@refs/heads/main`;
-    expect(assertTrustedWorkflowRef(repository, expected)).toBe(expected);
+    const controller = `${repository}/.github/workflows/preview-control.yml@refs/heads/main`;
+    const queue = `${repository}/.github/workflows/preview-queue.yml@refs/heads/main`;
+    const reset = `${repository}/.github/workflows/preview-close.yml@refs/heads/main`;
+    expect(assertTrustedWorkflowRef(repository, controller)).toBe(controller);
+    expect(assertTrustedPreviewQueueWorkflowRef(repository, queue)).toBe(queue);
+    expect(assertTrustedPreviewResetWorkflowRef(repository, reset)).toBe(reset);
     expect(() => assertTrustedWorkflowRef(
       repository,
-      `lookalike/${expected}`,
+      `lookalike/${controller}`,
     )).toThrow(/trusted default-branch preview-control workflow/);
-    expect(() => assertTrustedWorkflowRef(
+    expect(() => assertTrustedPreviewQueueWorkflowRef(
       repository,
-      'attacker/agent-sessions-backup/.github/workflows/preview-control.yml@refs/heads/main',
-    )).toThrow(/trusted default-branch preview-control workflow/);
+      `attacker/${queue}`,
+    )).toThrow(/trusted default-branch preview-queue workflow/);
+  });
+});
+
+describe('GitHub PR event trust', () => {
+  const repository = 'pedropaulovc/agent-sessions-backup';
+  const pr = 42;
+
+  it('rejects a fork before a queue card can be created', () => {
+    const pull = {
+      state: 'open',
+      head: { sha: SHA, repo: { full_name: 'attacker/agent-sessions-backup' } },
+    };
+    expect(() => assertSameRepositoryOpenPullRequest(repository, pr, pull, SHA))
+      .toThrow(/same-repository PR/);
+  });
+
+  it('accepts only the expected same-repository CI and trusted announcement runs', () => {
+    const source = {
+      id: 123,
+      event: 'pull_request',
+      head_sha: SHA,
+      repository: { full_name: repository },
+      head_repository: { full_name: repository },
+      name: 'CI',
+      path: '.github/workflows/ci.yml',
+      pull_requests: [{ number: pr }],
+    };
+    const queue = {
+      id: 456,
+      event: 'pull_request_target',
+      // pull_request_target executes default-branch code, so its SHA must not be the PR SHA.
+      head_sha: 'b'.repeat(40),
+      repository: { full_name: repository },
+      head_repository: { full_name: repository },
+      name: 'Preview Queue',
+      path: '.github/workflows/preview-queue.yml',
+    };
+    const reset = {
+      id: 457,
+      event: 'workflow_dispatch',
+      repository: { full_name: repository },
+      name: 'Preview Close',
+      path: '.github/workflows/preview-close.yml',
+    };
+    expect(assertTrustedSourceCiRun(repository, pr, source, 123, SHA)).toBe(source);
+    expect(assertTrustedPreviewQueueRun(repository, queue, 456)).toBe(queue);
+    expect(assertTrustedPreviewResetRun(repository, reset, 457)).toBe(reset);
+    expect(() => assertTrustedSourceCiRun(
+      repository,
+      pr,
+      { ...source, head_repository: { full_name: 'attacker/agent-sessions-backup' } },
+      123,
+      SHA,
+    )).toThrow(/same-repository PR head/);
   });
 });
 
@@ -422,126 +491,668 @@ describe('PR-visible preview deployment cards', () => {
   const repository = 'pedropaulovc/agent-sessions-backup';
   const pr = 42;
   const sourceRunId = 123;
-  const runId = 456;
+  const controllerRunId = 456;
+  const announcementRunId = 654;
   const deploymentId = 789;
   const environment = 'preview/pr-42';
   const url = `https://${resourceNames(pr).host}`;
-  const logUrl = `https://github.com/${repository}/actions/runs/${runId}`;
+  const controllerLogUrl = `https://github.com/${repository}/actions/runs/${controllerRunId}`;
+  const queueLogUrl = `https://github.com/${repository}/actions/runs/${announcementRunId}`;
+  const queueWorkflowRef = `${repository}/.github/workflows/preview-queue.yml@refs/heads/main`;
+  const resetWorkflowRef = `${repository}/.github/workflows/preview-close.yml@refs/heads/main`;
   const olderCreatedAt = '2026-08-16T19:00:00.000Z';
   const currentCreatedAt = '2026-08-16T19:01:00.000Z';
   const newerCreatedAt = '2026-08-16T19:02:00.000Z';
 
-  function deploymentArgs(overrides = {}) {
+  function deploymentListPath() {
+    return `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=1`;
+  }
+
+  function statusListPath(id) {
+    return `/repos/${repository}/deployments/${id}/statuses?per_page=100&page=1`;
+  }
+
+  function status(id, state, createdAt = currentCreatedAt, overrides = {}) {
+    return { id, state, created_at: createdAt, ...overrides };
+  }
+
+  function queuedCard(id, createdAt, overrides = {}) {
+    const runId = overrides.announcementRunId ?? announcementRunId;
+    return {
+      id,
+      created_at: createdAt,
+      task: 'preview-announce',
+      environment,
+      ref: SHA,
+      sha: SHA,
+      transient_environment: true,
+      production_environment: false,
+      payload: {
+        schema: 'sessions-preview-announcement/v1',
+        pr,
+        head_sha: SHA,
+        announcement_run_id: runId,
+        announcement_workflow_ref: queueWorkflowRef,
+        ...overrides.payload,
+      },
+      ...overrides.deployment,
+    };
+  }
+
+  function queueArgs(overrides = {}) {
+    return {
+      repository,
+      pr,
+      sha: SHA,
+      announcementRunId,
+      workflowRef: queueWorkflowRef,
+      ...overrides,
+    };
+  }
+
+  function controllerArgs(overrides = {}) {
     return {
       repository,
       pr,
       sha: SHA,
       sourceRunId,
-      runId,
+      runId: controllerRunId,
       ...overrides,
     };
   }
 
-  it('creates an immutable PR-SHA card and marks it in progress after a fresh trust check', async () => {
+  it('queues an immutable PR-SHA card before source CI can finish', async () => {
     const checks = [];
     const requests = [];
     const request = async (pathname, init) => {
       requests.push({ pathname, init });
       if (pathname === `/repos/${repository}/deployments`) return { id: deploymentId };
-      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) return { state: 'in_progress' };
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) return { state: 'queued' };
       throw new Error(`unexpected request: ${pathname}`);
     };
 
-    const card = await createPreviewDeployment({
+    const card = await queuePreviewDeployment({
       request,
       verify: async () => { checks.push('verified'); },
-      ...deploymentArgs(),
+      ...queueArgs(),
     });
 
-    expect(previewDeploymentEnvironment(pr)).toBe(environment);
-    expect(card).toEqual({ deploymentId, environment, url });
-    expect(checks).toEqual(['verified', 'verified']);
-    expect(requests).toHaveLength(2);
-    expect(requests[0].pathname).toBe(`/repos/${repository}/deployments`);
-    expect(requests[0].init).toMatchObject({
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      expectedStatus: 201,
-    });
+    expect(checks).toEqual(['verified', 'verified', 'verified']);
+    expect(card).toEqual({ deploymentId, environment, url: null });
     expect(JSON.parse(requests[0].init.body)).toEqual({
       ref: SHA,
-      task: 'deploy',
+      task: 'preview-announce',
       auto_merge: false,
       required_contexts: [],
       environment,
-      description: 'Cloudflare preview for PR #42',
+      description: 'Preview queued for PR #42',
       transient_environment: true,
       production_environment: false,
-      payload: { pr, source_run_id: sourceRunId, controller_run_id: runId },
+      payload: {
+        schema: 'sessions-preview-announcement/v1',
+        pr,
+        head_sha: SHA,
+        announcement_run_id: announcementRunId,
+        announcement_workflow_ref: queueWorkflowRef,
+      },
     });
-    expect(requests[1].pathname).toBe(`/repos/${repository}/deployments/${deploymentId}/statuses`);
     expect(JSON.parse(requests[1].init.body)).toEqual({
-      state: 'in_progress',
+      state: 'queued',
       environment,
-      description: 'Preview provisioned; remote smoke tests running',
+      description: 'Preview is queued until CI completes',
       auto_inactive: false,
-      environment_url: url,
-      log_url: logUrl,
+      log_url: queueLogUrl,
     });
   });
 
-  it('reports the deployment ID before a failed in-progress status can orphan the card', async () => {
-    const created = [];
-    const request = async (pathname) => {
+  it('queues a reset card through the trusted reset workflow', async () => {
+    const requests = [];
+    const request = async (pathname, init) => {
+      requests.push({ pathname, init });
       if (pathname === `/repos/${repository}/deployments`) return { id: deploymentId };
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) {
+        return { state: 'queued' };
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(queuePreviewDeployment({
+      request,
+      verify: async () => {},
+      ...queueArgs({ workflowRef: resetWorkflowRef }),
+    })).resolves.toEqual({ deploymentId, environment, url: null });
+    expect(JSON.parse(requests[0].init.body)).toMatchObject({
+      task: 'preview-reset',
+      description: 'Preview reset queued for PR #42',
+      payload: { announcement_workflow_ref: resetWorkflowRef },
+    });
+  });
+
+  it('finds a verified exact announcement card', async () => {
+    const request = async (pathname) => {
+      if (pathname === deploymentListPath()) return [queuedCard(deploymentId, currentCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [status(1, 'queued')];
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(findPreviewAnnouncement({
+      request,
+      verifyAnnouncement: async (runId, task) => {
+        expect(runId).toBe(announcementRunId);
+        expect(task).toBe('preview-announce');
+      },
+      deploymentId,
+      ...controllerArgs(),
+    })).resolves.toEqual({
+      deploymentId,
+      state: 'queued',
+      announcementRunId,
+      task: 'preview-announce',
+    });
+  });
+
+  it('returns null for an absent or structurally untrusted announcement card', async () => {
+    const absentRequest = async (pathname) => {
+      if (pathname === deploymentListPath()) return [];
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+    const untrustedRequest = async (pathname) => {
+      if (pathname === deploymentListPath()) {
+        return [queuedCard(deploymentId, currentCreatedAt, {
+          payload: { announcement_workflow_ref: 'attacker/workflow@refs/heads/main' },
+        })];
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+    const verifyAnnouncement = async () => {
+      throw new Error('untrusted announcement must not be verified');
+    };
+
+    await expect(findPreviewAnnouncement({
+      request: absentRequest,
+      verifyAnnouncement,
+      deploymentId,
+      ...controllerArgs(),
+    })).resolves.toBeNull();
+    await expect(findPreviewAnnouncement({
+      request: untrustedRequest,
+      verifyAnnouncement,
+      deploymentId,
+      ...controllerArgs(),
+    })).resolves.toBeNull();
+  });
+
+  it('does not create a queue card when same-repository PR validation rejects a fork', async () => {
+    const request = async () => {
+      throw new Error('a fork must not create a deployment');
+    };
+
+    await expect(queuePreviewDeployment({
+      request,
+      verify: async () => { throw new Error('PR 42 is not a same-repository PR'); },
+      ...queueArgs(),
+    })).rejects.toThrow(/same-repository PR/);
+  });
+
+  it('never writes queued status after the PR becomes stale between queue writes', async () => {
+    let verificationCount = 0;
+    const requests = [];
+    const request = async (pathname, init) => {
+      requests.push({ pathname, init });
+      if (pathname === `/repos/${repository}/deployments`) return { id: deploymentId };
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(queuePreviewDeployment({
+      request,
+      verify: async () => {
+        verificationCount += 1;
+        if (verificationCount === 2) throw new Error('PR head changed before preview control');
+      },
+      ...queueArgs(),
+    })).rejects.toThrow(/head changed/);
+
+    expect(requests).toHaveLength(1);
+  });
+
+  it('rechecks the PR head after publishing queued status', async () => {
+    let verificationCount = 0;
+    const requests = [];
+    const request = async (pathname, init) => {
+      requests.push({ pathname, init });
+      if (pathname === `/repos/${repository}/deployments`) return { id: deploymentId };
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) {
+        return { state: 'queued' };
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(queuePreviewDeployment({
+      request,
+      verify: async () => {
+        verificationCount += 1;
+        if (verificationCount === 3) throw new Error('PR closed after queued status');
+      },
+      ...queueArgs(),
+    })).rejects.toThrow(/closed after queued/);
+
+    expect(requests).toHaveLength(2);
+  });
+
+  it('waits for the direct PR card and never manufactures a fallback after CI', async () => {
+    const waits = [];
+    const requests = [];
+    let lists = 0;
+    const request = async (pathname, init) => {
+      requests.push({ pathname, init });
+      if (pathname === deploymentListPath()) {
+        lists += 1;
+        return lists === 1 ? [] : [queuedCard(deploymentId, currentCreatedAt)];
+      }
+      if (pathname === statusListPath(deploymentId)) return [status(1, 'queued')];
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) {
+        return { state: 'in_progress' };
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    const card = await claimPreviewDeployment({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async (runId) => { expect(runId).toBe(announcementRunId); },
+      attempts: 2,
+      wait: async (attempt, attempts) => { waits.push([attempt, attempts]); },
+      ...controllerArgs(),
+    });
+
+    expect(card).toEqual({ deploymentId, environment, url: null });
+    expect(waits).toEqual([[1, 2]]);
+    expect(requests.map(({ pathname }) => pathname)).toEqual([
+      deploymentListPath(),
+      deploymentListPath(),
+      statusListPath(deploymentId),
+      `/repos/${repository}/deployments/${deploymentId}/statuses`,
+    ]);
+    expect(requests.some(({ pathname }) => pathname === `/repos/${repository}/deployments`)).toBe(false);
+    expect(JSON.parse(requests[3].init.body)).toEqual({
+      state: 'in_progress',
+      environment,
+      description: 'Preview provisioning is in progress',
+      auto_inactive: false,
+      log_url: controllerLogUrl,
+    });
+  });
+
+  it('claims a card whose initial queued-status write did not persist', async () => {
+    const request = async (pathname) => {
+      if (pathname === deploymentListPath()) return [queuedCard(deploymentId, currentCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [];
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) {
+        return { state: 'in_progress' };
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(claimPreviewDeployment({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
+      ...controllerArgs(),
+    })).resolves.toEqual({ deploymentId, environment, url: null });
+  });
+
+  it('claims a fresh manual-reset card without reviving an inactive direct queue card', async () => {
+    const resetDeploymentId = 790;
+    const request = async (pathname) => {
+      if (pathname === deploymentListPath()) {
+        return [
+          queuedCard(deploymentId, olderCreatedAt, {
+            deployment: { task: 'preview-announce' },
+          }),
+          queuedCard(resetDeploymentId, currentCreatedAt, {
+            announcementRunId: 655,
+            deployment: { task: 'preview-reset' },
+            payload: { announcement_workflow_ref: resetWorkflowRef },
+          }),
+        ];
+      }
+      if (pathname === statusListPath(deploymentId)) return [status(1, 'inactive', olderCreatedAt)];
+      if (pathname === statusListPath(resetDeploymentId)) return [status(2, 'queued', currentCreatedAt)];
+      if (pathname === `/repos/${repository}/deployments/${resetDeploymentId}/statuses`) {
+        return { state: 'in_progress' };
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+    const verified = [];
+
+    await expect(claimPreviewDeployment({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async (runId, task) => { verified.push([runId, task]); },
+      ...controllerArgs(),
+    })).resolves.toEqual({ deploymentId: resetDeploymentId, environment, url: null });
+    expect(verified).toEqual([
+      [announcementRunId, 'preview-announce'],
+      [655, 'preview-reset'],
+    ]);
+  });
+
+  it('records the selected card before an in-progress status failure can orphan it', async () => {
+    const claimed = [];
+    const request = async (pathname) => {
+      if (pathname === deploymentListPath()) return [queuedCard(deploymentId, currentCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [status(1, 'queued')];
       if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) {
         throw new Error('GitHub deployment status unavailable');
       }
       throw new Error(`unexpected request: ${pathname}`);
     };
 
-    await expect(createPreviewDeployment({
+    await expect(claimPreviewDeployment({
       request,
       verify: async () => {},
-      onCreated: async (card) => { created.push(card); },
-      ...deploymentArgs(),
+      verifyAnnouncement: async () => {},
+      onClaimed: async (card) => { claimed.push(card); },
+      ...controllerArgs(),
     })).rejects.toThrow(/status unavailable/);
 
-    expect(created).toEqual([{ deploymentId, environment, url }]);
+    expect(claimed).toEqual([{ deploymentId, environment, url: null }]);
   });
 
-  it('never writes a status after the PR becomes stale between deployment writes', async () => {
-    let verificationCount = 0;
+  it('returns an existing in-progress same-SHA card as an idempotent no-op', async () => {
     const requests = [];
     const request = async (pathname, init) => {
       requests.push({ pathname, init });
-      return { id: deploymentId };
-    };
-
-    await expect(createPreviewDeployment({
-      request,
-      verify: async () => {
-        verificationCount += 1;
-        if (verificationCount === 2) throw new Error('PR head changed before preview control');
-      },
-      ...deploymentArgs(),
-    })).rejects.toThrow(/head changed/);
-
-    expect(requests).toHaveLength(1);
-    expect(requests[0].pathname).toBe(`/repos/${repository}/deployments`);
-  });
-
-  it('publishes a failed smoke result and settles stale cards for the replaced stable URL', async () => {
-    const requests = [];
-    const request = async (pathname, init) => {
-      requests.push({ pathname, init });
-      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) return { state: 'failure' };
-      if (pathname === `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=1`) {
+      if (pathname === deploymentListPath()) {
         return [
-          { id: 10, created_at: olderCreatedAt },
-          { id: deploymentId, created_at: currentCreatedAt },
+          queuedCard(10, olderCreatedAt, { announcementRunId: 650 }),
+          queuedCard(deploymentId, currentCreatedAt),
         ];
       }
+      if (pathname === statusListPath(10)) return [status(1, 'failure', olderCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [status(2, 'in_progress', currentCreatedAt)];
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(claimPreviewDeployment({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
+      ...controllerArgs(),
+    })).resolves.toEqual({
+      deploymentId,
+      environment,
+      url: null,
+      alreadyClaimed: true,
+    });
+    expect(requests).toHaveLength(3);
+  });
+
+  it('marks an in-progress card as resumable only for this controller run', async () => {
+    const request = async (pathname) => {
+      if (pathname === deploymentListPath()) return [queuedCard(deploymentId, currentCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) {
+        return [status(1, 'in_progress', currentCreatedAt, { log_url: controllerLogUrl })];
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(claimPreviewDeployment({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
+      ...controllerArgs(),
+    })).resolves.toEqual({
+      deploymentId,
+      environment,
+      url: null,
+      alreadyClaimed: true,
+      claimedByCurrentRun: true,
+    });
+  });
+
+  it('inactivates a retried queue card when an older same-SHA card is active', async () => {
+    const activeDeploymentId = 788;
+    const requests = [];
+    const request = async (pathname, init) => {
+      requests.push({ pathname, init });
+      if (pathname === deploymentListPath()) {
+        return [
+          queuedCard(activeDeploymentId, olderCreatedAt, { announcementRunId: 650 }),
+          queuedCard(deploymentId, currentCreatedAt),
+        ];
+      }
+      if (pathname === statusListPath(activeDeploymentId)) {
+        return [status(1, 'success', olderCreatedAt)];
+      }
+      if (pathname === statusListPath(deploymentId)) return [status(2, 'queued', currentCreatedAt)];
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) {
+        return { state: 'inactive' };
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(claimPreviewDeployment({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
+      ...controllerArgs(),
+    })).resolves.toEqual({
+      deploymentId: activeDeploymentId,
+      environment,
+      url: null,
+      alreadyClaimed: true,
+    });
+    expect(JSON.parse(requests[3].init.body)).toEqual({
+      state: 'inactive',
+      environment,
+      description: 'Preview already claimed for this PR head',
+      auto_inactive: false,
+      log_url: controllerLogUrl,
+    });
+  });
+
+  it('does not write a claimed-card status after the head becomes stale', async () => {
+    let checks = 0;
+    const requests = [];
+    const request = async (pathname, init) => {
+      requests.push({ pathname, init });
+      if (pathname === deploymentListPath()) return [queuedCard(deploymentId, currentCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [status(1, 'queued')];
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(claimPreviewDeployment({
+      request,
+      verify: async () => {
+        checks += 1;
+        if (checks === 2) throw new Error('PR head changed before preview control');
+      },
+      verifyAnnouncement: async () => {},
+      ...controllerArgs(),
+    })).rejects.toThrow(/head changed/);
+    expect(requests.map(({ pathname }) => pathname)).toEqual([
+      deploymentListPath(),
+      statusListPath(deploymentId),
+    ]);
+  });
+
+  it('rejects every queued duplicate after failed CI but leaves an in-progress successor alone', async () => {
+    const requests = [];
+    const request = async (pathname, init) => {
+      requests.push({ pathname, init });
+      if (pathname === deploymentListPath()) {
+        return [
+          queuedCard(10, olderCreatedAt, { announcementRunId: 650 }),
+          queuedCard(deploymentId, currentCreatedAt),
+        ];
+      }
+      if (pathname === statusListPath(10)) return [status(1, 'queued', olderCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [status(2, 'in_progress', currentCreatedAt)];
+      if (pathname === `/repos/${repository}/deployments/10/statuses`) return { state: 'failure' };
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(rejectQueuedPreviewDeployments({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
+      ...controllerArgs(),
+    })).resolves.toEqual({ rejectedDeploymentIds: [10] });
+    expect(JSON.parse(requests.at(-1).init.body)).toEqual({
+      state: 'failure',
+      environment,
+      description: 'Preview was not provisioned because CI did not succeed',
+      auto_inactive: false,
+      log_url: controllerLogUrl,
+    });
+  });
+
+  it('rejects a card whose initial status write is absent after failed CI', async () => {
+    const request = async (pathname) => {
+      if (pathname === deploymentListPath()) return [queuedCard(deploymentId, currentCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [];
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) {
+        return { state: 'failure' };
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(rejectQueuedPreviewDeployments({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
+      ...controllerArgs(),
+    })).resolves.toEqual({ rejectedDeploymentIds: [deploymentId] });
+  });
+
+  it('does not fail a failed CI when no queue card exists', async () => {
+    const request = async (pathname) => {
+      if (pathname === deploymentListPath()) return [];
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(rejectQueuedPreviewDeployments({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
+      ...controllerArgs(),
+    })).resolves.toEqual({ rejectedDeploymentIds: [] });
+  });
+
+  it('settles a queued card after a reconciliation stale-head race', async () => {
+    const requests = [];
+    const request = async (pathname, init) => {
+      requests.push({ pathname, init });
+      if (pathname === deploymentListPath()) return [queuedCard(deploymentId, currentCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [status(1, 'queued')];
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) {
+        return { state: 'inactive' };
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(settleQueuedPreviewDeployment({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
+      deploymentId,
+      state: 'inactive',
+      description: 'Preview superseded before its queued card could be published',
+      ...queueArgs(),
+    })).resolves.toEqual({ deploymentId, settled: true });
+    expect(JSON.parse(requests.at(-1).init.body)).toMatchObject({
+      state: 'inactive',
+      description: 'Preview superseded before its queued card could be published',
+    });
+  });
+
+  it('settles a specific unstatused card after a queue-close race', async () => {
+    const request = async (pathname) => {
+      if (pathname === deploymentListPath()) return [queuedCard(deploymentId, currentCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [];
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) {
+        return { state: 'inactive' };
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(settleQueuedPreviewDeployment({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
+      deploymentId,
+      state: 'inactive',
+      description: 'Preview superseded before its queued card could be published',
+      ...queueArgs(),
+    })).resolves.toEqual({ deploymentId, settled: true });
+  });
+
+  it('retires queued and in-progress cards for a superseded SHA only', async () => {
+    const requests = [];
+    const request = async (pathname, init) => {
+      requests.push({ pathname, init });
+      if (pathname === deploymentListPath()) {
+        return [
+          queuedCard(10, olderCreatedAt, { announcementRunId: 650 }),
+          queuedCard(deploymentId, currentCreatedAt),
+        ];
+      }
+      if (pathname === statusListPath(10)) return [status(1, 'in_progress', olderCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [status(2, 'queued', currentCreatedAt)];
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`
+        || pathname === `/repos/${repository}/deployments/10/statuses`) {
+        return { state: 'inactive' };
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(inactivateSupersededPreviewDeployments({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
+      description: 'Preview superseded by a newer PR head',
+      ...controllerArgs(),
+    })).resolves.toEqual({ inactivatedDeploymentIds: [deploymentId, 10] });
+  });
+
+  it('refuses an unverified announcement payload instead of claiming it', async () => {
+    const foreignWorkflow = 'attacker/agent-sessions-backup/.github/workflows/preview-queue.yml@refs/heads/main';
+    const request = async (pathname) => {
+      if (pathname === deploymentListPath()) {
+        return [queuedCard(deploymentId, currentCreatedAt, {
+          payload: { announcement_workflow_ref: foreignWorkflow },
+        })];
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+    const verifyAnnouncement = async () => {
+      throw new Error('announcement should not be examined');
+    };
+
+    await expect(claimPreviewDeployment({
+      request,
+      verify: async () => {},
+      verifyAnnouncement,
+      ...controllerArgs(),
+    })).rejects.toThrow(/no verified queued preview deployment card/);
+  });
+
+  it('completes the exact card and retires only older verified announcement cards', async () => {
+    const requests = [];
+    const request = async (pathname, init) => {
+      requests.push({ pathname, init });
+      if (pathname === deploymentListPath()) {
+        return [
+          queuedCard(10, olderCreatedAt, { announcementRunId: 650 }),
+          queuedCard(deploymentId, currentCreatedAt),
+          queuedCard(790, newerCreatedAt, { announcementRunId: 655 }),
+        ];
+      }
+      if (pathname === statusListPath(10)) return [status(1, 'success', olderCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [status(2, 'in_progress', currentCreatedAt)];
+      if (pathname === statusListPath(790)) return [status(3, 'queued', newerCreatedAt)];
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) return { state: 'success' };
       if (pathname === `/repos/${repository}/deployments/10/statuses`) return { state: 'inactive' };
       throw new Error(`unexpected request: ${pathname}`);
     };
@@ -549,90 +1160,195 @@ describe('PR-visible preview deployment cards', () => {
     const card = await completePreviewDeployment({
       request,
       verify: async () => {},
+      verifyAnnouncement: async () => {},
       deploymentId,
-      outcome: 'failure',
-      ...deploymentArgs(),
+      outcome: 'success',
+      ...controllerArgs(),
     });
 
     expect(card).toEqual({
       deploymentId,
-      outcome: 'failure',
+      outcome: 'success',
       inactiveDeploymentIds: [10],
       url,
     });
-    expect(JSON.parse(requests[0].init.body)).toEqual({
-      state: 'failure',
+    expect(JSON.parse(requests[4].init.body)).toEqual({
+      state: 'success',
       environment,
-      description: 'Preview provisioned, but remote smoke tests failed',
+      description: 'Preview deployed and passed remote smoke tests',
       auto_inactive: false,
       environment_url: url,
-      log_url: logUrl,
+      log_url: controllerLogUrl,
     });
-    expect(JSON.parse(requests[2].init.body)).toEqual({
+    expect(JSON.parse(requests[5].init.body)).toEqual({
       state: 'inactive',
       environment,
       description: 'Superseded by a newer preview attempt',
       auto_inactive: false,
-      log_url: logUrl,
+      log_url: controllerLogUrl,
     });
   });
 
-  it('inactivates only older transient cards after a successful replacement', async () => {
+  it.each([
+    ['provision-failure', 'Preview provisioning failed', null],
+    ['smoke-failure', 'Preview provisioned, but remote smoke tests failed', url],
+  ])('records %s with the correct preview URL lifecycle', async (outcome, description, expectedUrl) => {
     const requests = [];
     const request = async (pathname, init) => {
       requests.push({ pathname, init });
-      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) return { state: 'success' };
-      if (pathname === `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=1`) {
-        return [
-          { id: 10, created_at: olderCreatedAt },
-          { id: deploymentId, created_at: currentCreatedAt },
-          { id: 11, created_at: olderCreatedAt },
-          { id: 790, created_at: newerCreatedAt },
-        ];
+      if (pathname === deploymentListPath()) return [queuedCard(deploymentId, currentCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [status(1, 'in_progress')];
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) {
+        return { state: 'failure' };
       }
-      if (pathname === `/repos/${repository}/deployments/10/statuses`) return { state: 'inactive' };
-      if (pathname === `/repos/${repository}/deployments/11/statuses`) return { state: 'inactive' };
       throw new Error(`unexpected request: ${pathname}`);
     };
 
-    const card = await completePreviewDeployment({
+    await expect(completePreviewDeployment({
       request,
       verify: async () => {},
+      verifyAnnouncement: async () => {},
       deploymentId,
-      outcome: 'success',
-      ...deploymentArgs(),
+      outcome,
+      ...controllerArgs(),
+    })).resolves.toEqual({
+      deploymentId,
+      outcome,
+      inactiveDeploymentIds: [],
+      url: expectedUrl,
     });
+    expect(JSON.parse(requests.at(-1).init.body)).toEqual({
+      state: 'failure',
+      environment,
+      description,
+      auto_inactive: false,
+      ...(expectedUrl === null ? {} : { environment_url: expectedUrl }),
+      log_url: controllerLogUrl,
+    });
+  });
 
-    expect(card).toEqual({
+  it('rejects an unsupported terminal outcome before making a request', async () => {
+    await expect(completePreviewDeployment({
+      request: async () => { throw new Error('unexpected request'); },
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
       deploymentId,
-      outcome: 'success',
-      inactiveDeploymentIds: [10, 11],
+      outcome: 'unknown',
+      ...controllerArgs(),
+    })).rejects.toThrow(/preview deployment outcome is invalid/);
+  });
+
+  it('marks cancelled provisioning as an error without publishing a URL', async () => {
+    const requests = [];
+    const request = async (pathname, init) => {
+      requests.push({ pathname, init });
+      if (pathname === deploymentListPath()) return [queuedCard(deploymentId, currentCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [status(1, 'in_progress')];
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) {
+        return { state: 'error' };
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(completePreviewDeployment({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
+      deploymentId,
+      outcome: 'provision-cancelled',
+      ...controllerArgs(),
+    })).resolves.toEqual({
+      deploymentId,
+      outcome: 'provision-cancelled',
+      inactiveDeploymentIds: [],
+      url: null,
+    });
+    expect(JSON.parse(requests.at(-1).init.body)).toEqual({
+      state: 'error',
+      environment,
+      description: 'Preview provisioning was cancelled',
+      auto_inactive: false,
+      log_url: controllerLogUrl,
+    });
+  });
+
+  it('marks skipped provisioning inactive without publishing a URL', async () => {
+    const requests = [];
+    const request = async (pathname, init) => {
+      requests.push({ pathname, init });
+      if (pathname === deploymentListPath()) return [queuedCard(deploymentId, currentCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [status(1, 'in_progress')];
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) {
+        return { state: 'inactive' };
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(completePreviewDeployment({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
+      deploymentId,
+      outcome: 'provision-skipped',
+      ...controllerArgs(),
+    })).resolves.toEqual({
+      deploymentId,
+      outcome: 'provision-skipped',
+      inactiveDeploymentIds: [],
+      url: null,
+    });
+    expect(JSON.parse(requests.at(-1).init.body)).toEqual({
+      state: 'inactive',
+      environment,
+      description: 'Preview provisioning was skipped',
+      auto_inactive: false,
+      log_url: controllerLogUrl,
+    });
+  });
+
+  it.each([
+    ['smoke-cancelled', 'Preview provisioned, but remote smoke tests were cancelled'],
+    ['smoke-skipped', 'Preview provisioned, but remote smoke tests were skipped'],
+  ])('keeps the URL after provisioned %s', async (outcome, description) => {
+    const requests = [];
+    const request = async (pathname, init) => {
+      requests.push({ pathname, init });
+      if (pathname === deploymentListPath()) return [queuedCard(deploymentId, currentCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [status(1, 'in_progress')];
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) {
+        return { state: 'error' };
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(completePreviewDeployment({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
+      deploymentId,
+      outcome,
+      ...controllerArgs(),
+    })).resolves.toEqual({
+      deploymentId,
+      outcome,
+      inactiveDeploymentIds: [],
       url,
     });
-    expect(requests.map(({ pathname }) => pathname)).toEqual([
-      `/repos/${repository}/deployments/${deploymentId}/statuses`,
-      `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=1`,
-      `/repos/${repository}/deployments/10/statuses`,
-      `/repos/${repository}/deployments/11/statuses`,
-    ]);
-    for (const request of requests.slice(2)) {
-      expect(JSON.parse(request.init.body)).toEqual({
-        state: 'inactive',
-        environment,
-        description: 'Superseded by a newer preview attempt',
-        auto_inactive: false,
-        log_url: logUrl,
-      });
-    }
+    expect(JSON.parse(requests.at(-1).init.body)).toEqual({
+      state: 'error',
+      environment,
+      description,
+      auto_inactive: false,
+      environment_url: url,
+      log_url: controllerLogUrl,
+    });
   });
 
   it('marks every PR card inactive after its preview resources are removed', async () => {
     const requests = [];
     const request = async (pathname, init) => {
       requests.push({ pathname, init });
-      if (pathname === `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=1`) {
-        return [{ id: deploymentId }];
-      }
+      if (pathname === deploymentListPath()) return [{ id: deploymentId }];
       if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) return { state: 'inactive' };
       throw new Error(`unexpected request: ${pathname}`);
     };
@@ -642,14 +1358,14 @@ describe('PR-visible preview deployment cards', () => {
       repository,
       pr,
       description: 'Preview environment removed',
-      logUrl,
+      logUrl: controllerLogUrl,
     })).resolves.toEqual([deploymentId]);
     expect(JSON.parse(requests[1].init.body)).toEqual({
       state: 'inactive',
       environment,
       description: 'Preview environment removed',
       auto_inactive: false,
-      log_url: logUrl,
+      log_url: controllerLogUrl,
     });
   });
 
@@ -658,9 +1374,7 @@ describe('PR-visible preview deployment cards', () => {
     const firstPage = Array.from({ length: 100 }, (_, index) => ({ id: index + 1 }));
     const request = async (pathname, init) => {
       requests.push({ pathname, init });
-      if (pathname === `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=1`) {
-        return firstPage;
-      }
+      if (pathname === deploymentListPath()) return firstPage;
       if (pathname === `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=2`) {
         return [{ id: 101 }];
       }
@@ -670,22 +1384,8 @@ describe('PR-visible preview deployment cards', () => {
 
     await expect(deactivatePreviewDeployments({ request, repository, pr })).resolves.toHaveLength(101);
     expect(requests.map(({ pathname }) => pathname).filter((pathname) => pathname.includes('?environment='))).toEqual([
-      `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=1`,
+      deploymentListPath(),
       `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=2`,
     ]);
-  });
-
-  it('rejects a GitHub deployment status response with the wrong state', async () => {
-    const request = async (pathname) => {
-      if (pathname === `/repos/${repository}/deployments`) return { id: deploymentId };
-      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) return { state: 'failure' };
-      throw new Error(`unexpected request: ${pathname}`);
-    };
-
-    await expect(createPreviewDeployment({
-      request,
-      verify: async () => {},
-      ...deploymentArgs(),
-    })).rejects.toThrow(/did not report in_progress/);
   });
 });
