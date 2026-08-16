@@ -232,10 +232,84 @@ export function repositoryName(value) {
   return value;
 }
 
-export function assertTrustedWorkflowRef(repository, workflowRef) {
-  const expected = `${repositoryName(repository)}/.github/workflows/preview-control.yml@refs/heads/main`;
-  if (workflowRef !== expected) fail('build must run from the trusted default-branch preview-control workflow');
+function trustedWorkflowRef(repository, workflow, workflowRef, message) {
+  const expected = `${repositoryName(repository)}/.github/workflows/${workflow}@refs/heads/main`;
+  if (workflowRef !== expected) fail(message);
   return workflowRef;
+}
+
+export function assertTrustedWorkflowRef(repository, workflowRef) {
+  return trustedWorkflowRef(
+    repository,
+    'preview-control.yml',
+    workflowRef,
+    'build must run from the trusted default-branch preview-control workflow',
+  );
+}
+
+export function assertTrustedPreviewQueueWorkflowRef(repository, workflowRef) {
+  return trustedWorkflowRef(
+    repository,
+    'preview-queue.yml',
+    workflowRef,
+    'preview queue must run from the trusted default-branch preview-queue workflow',
+  );
+}
+
+export function assertTrustedPreviewResetWorkflowRef(repository, workflowRef) {
+  return trustedWorkflowRef(
+    repository,
+    'preview-close.yml',
+    workflowRef,
+    'preview reset must run from the trusted default-branch preview-close workflow',
+  );
+}
+
+export function assertSameRepositoryOpenPullRequest(repository, pr, pull, expectedSha = null) {
+  const name = repositoryName(repository);
+  const number = positiveInteger(pr, 'PR number');
+  if (pull?.state !== 'open') fail(`PR ${number} is not open`);
+  if (pull.head?.repo?.full_name !== name) fail(`PR ${number} is not a same-repository PR`);
+  if (expectedSha != null && pull.head?.sha !== headSha(expectedSha)) {
+    fail(`PR ${number} head changed before preview control`);
+  }
+  return pull;
+}
+
+export function assertTrustedSourceCiRun(repository, pr, run, runId, expectedSha) {
+  const name = repositoryName(repository);
+  const number = positiveInteger(pr, 'PR number');
+  const id = positiveInteger(runId, 'source workflow run ID');
+  const sha = headSha(expectedSha);
+  if (run?.id !== id || run.event !== 'pull_request' || run.head_sha !== sha
+    || run.repository?.full_name !== name || run.head_repository?.full_name !== name
+    || run.name !== 'CI' || run.path !== '.github/workflows/ci.yml'
+    || !run.pull_requests?.some((pull) => pull.number === number)) {
+    fail('source workflow run is not CI for this same-repository PR head');
+  }
+  return run;
+}
+
+export function assertTrustedPreviewQueueRun(repository, run, runId) {
+  const name = repositoryName(repository);
+  const id = positiveInteger(runId, 'preview announcement workflow run ID');
+  if (run?.id !== id || run.event !== 'pull_request_target'
+    || run.repository?.full_name !== name || run.head_repository?.full_name !== name
+    || run.name !== 'Preview Queue' || run.path !== '.github/workflows/preview-queue.yml') {
+    fail('preview announcement was not created by the trusted PR queue workflow');
+  }
+  return run;
+}
+
+export function assertTrustedPreviewResetRun(repository, run, runId) {
+  const name = repositoryName(repository);
+  const id = positiveInteger(runId, 'preview reset workflow run ID');
+  if (run?.id !== id || run.event !== 'workflow_dispatch'
+    || run.repository?.full_name !== name
+    || run.name !== 'Preview Close' || run.path !== '.github/workflows/preview-close.yml') {
+    fail('preview reset was not created by the trusted Preview Close workflow');
+  }
+  return run;
 }
 
 /**

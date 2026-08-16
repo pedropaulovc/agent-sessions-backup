@@ -10,6 +10,12 @@ import {
   PREVIEW_WORKERS_DEV_SUFFIX,
   assertNoProductionIdentifiers,
   assertPreviewAccount,
+  assertSameRepositoryOpenPullRequest,
+  assertTrustedPreviewQueueRun as assertTrustedPreviewQueueWorkflowRun,
+  assertTrustedPreviewQueueWorkflowRef,
+  assertTrustedPreviewResetRun as assertTrustedPreviewResetWorkflowRun,
+  assertTrustedPreviewResetWorkflowRef,
+  assertTrustedSourceCiRun,
   assertTrustedWorkflowRef,
   deleteInDependencyPasses,
   emptyR2Bucket,
@@ -32,9 +38,14 @@ import {
   writeCanonicalJson,
 } from './preview-trust.mjs';
 import {
+  claimPreviewDeployment,
   completePreviewDeployment,
-  createPreviewDeployment,
   deactivatePreviewDeployments,
+  findPreviewAnnouncement,
+  inactivateSupersededPreviewDeployments,
+  queuePreviewDeployment,
+  rejectQueuedPreviewDeployments,
+  settleQueuedPreviewDeployment,
 } from './preview-deployment.mjs';
 import { SYNTHETIC_EXPECTATIONS } from '../../hub/scripts/lib/dev-seed.mjs';
 
@@ -53,6 +64,9 @@ const previewAccountId = args['account-id'] ?? process.env.CLOUDFLARE_PREVIEW_AC
 const previewToken = process.env.CLOUDFLARE_PREVIEW_CONTROL_TOKEN;
 
 const MIGRATION_LEDGER_KEY = 'preview_migration_files';
+
+const CARD_DISCOVERY_ATTEMPTS = 80;
+const CARD_DISCOVERY_DELAY_MS = 3_000;
 
 function requireCloudflareEnvironment() {
   assertPreviewAccount(previewAccountId);
@@ -137,7 +151,12 @@ async function verifyArtifact(directory, expected) {
 }
 
 async function github(pathname, init = {}) {
-  const { allowNotFound = false, expectedStatus = null, ...fetchInit } = init;
+  const {
+    allowNotFound = false,
+    expectedStatus = null,
+    noJson = false,
+    ...fetchInit
+  } = init;
   const token = process.env.GITHUB_TOKEN;
   if (!token) fail('GITHUB_TOKEN is required for trusted GitHub state checks');
   const response = await fetch(`https://api.github.com${pathname}`, {
@@ -154,31 +173,121 @@ async function github(pathname, init = {}) {
   if (!response.ok || (expectedStatus != null && response.status !== expectedStatus)) {
     fail(`GitHub API ${pathname} failed with ${response.status}`);
   }
+  if (noJson || response.status === 204) return null;
   return response.json();
 }
 
-async function assertSuccessfulSourceRun(runId, expectedSha) {
+async function assertSourceRun(runId, expectedSha) {
   const run = await github(`/repos/${repository}/actions/runs/${runId}`);
-  if (run.id !== runId || run.event !== 'pull_request' || run.conclusion !== 'success'
-    || run.head_sha !== expectedSha || run.repository?.full_name !== repository
-    || run.name !== 'CI' || run.path !== '.github/workflows/ci.yml'
-    || !run.pull_requests?.some((pull) => pull.number === pr)) {
-    fail('source workflow run is not the successful CI run for this PR head');
+  return assertTrustedSourceCiRun(repository, pr, run, runId, expectedSha);
+}
+
+async function assertSuccessfulSourceRun(runId, expectedSha) {
+  const run = await assertSourceRun(runId, expectedSha);
+  if (run.conclusion !== 'success') fail('source workflow run is not successful');
+}
+
+async function assertUnsuccessfulSourceRun(runId, expectedSha) {
+  const run = await assertSourceRun(runId, expectedSha);
+  if (run.conclusion == null || run.conclusion === 'success') {
+    fail('source workflow run is not a completed CI rejection');
   }
 }
 
-async function assertCurrentPullRequest(expectedSha) {
+function sourceRunCreatedAt(run) {
+  const value = Date.parse(run?.created_at ?? '');
+  if (!Number.isFinite(value)) fail('source workflow run created_at is invalid');
+  return value;
+}
+
+async function latestTrustedSourceRun(expectedSha) {
+  const query = new URLSearchParams({
+    event: 'pull_request',
+    head_sha: headSha(expectedSha),
+    per_page: '100',
+  });
+  const response = await github(`/repos/${repository}/actions/runs?${query}`);
+  if (!Array.isArray(response?.workflow_runs)) {
+    fail('GitHub source workflow list response must contain workflow_runs');
+  }
+  const candidates = [];
+  for (const run of response.workflow_runs) {
+    try {
+      candidates.push(assertTrustedSourceCiRun(repository, pr, run, run.id, expectedSha));
+    } catch {
+      // The endpoint contains runs for other workflows and may contain another PR with this SHA.
+    }
+  }
+  candidates.sort((left, right) =>
+    sourceRunCreatedAt(right) - sourceRunCreatedAt(left) || right.id - left.id);
+  return candidates[0] ?? null;
+}
+
+async function assertOpenSameRepositoryPullRequest(expectedSha = null) {
   const pull = await github(`/repos/${repository}/pulls/${pr}`);
-  if (pull.state !== 'open') fail(`PR ${pr} is not open`);
-  if (pull.head?.sha !== expectedSha) fail(`PR ${pr} head changed before preview control`);
-  return pull;
+  return assertSameRepositoryOpenPullRequest(repository, pr, pull, expectedSha);
+}
+
+async function previewPullState(expectedSha) {
+  const pull = await github(`/repos/${repository}/pulls/${pr}`);
+  if (pull?.state === 'closed') return 'superseded';
+  if (pull?.state !== 'open') fail('preview PR is neither open nor closed');
+  if (pull.head?.repo?.full_name !== repository) return 'superseded';
+  return headSha(pull.head?.sha) === expectedSha ? 'current' : 'superseded';
+}
+
+async function assertSupersededPullRequest(expectedSha) {
+  if (await previewPullState(expectedSha) === 'current') {
+    fail('preview PR head is still current');
+  }
+}
+
+async function assertPreviewQueueRun(runId) {
+  const run = await github(`/repos/${repository}/actions/runs/${runId}`);
+  return assertTrustedPreviewQueueWorkflowRun(repository, run, runId);
+}
+
+async function assertPreviewResetRun(runId) {
+  const run = await github(`/repos/${repository}/actions/runs/${runId}`);
+  return assertTrustedPreviewResetWorkflowRun(repository, run, runId);
+}
+
+async function assertPreviewAnnouncementRun(runId, task) {
+  if (task === 'preview-announce') return assertPreviewQueueRun(runId);
+  if (task === 'preview-reset') return assertPreviewResetRun(runId);
+  fail('preview announcement has an unknown task');
 }
 
 function previewVerifier(sha, sourceRunId) {
   return async () => {
     await assertSuccessfulSourceRun(sourceRunId, sha);
-    await assertCurrentPullRequest(sha);
+    await assertOpenSameRepositoryPullRequest(sha);
   };
+}
+
+function rejectionVerifier(sha, sourceRunId) {
+  return async () => {
+    await assertUnsuccessfulSourceRun(sourceRunId, sha);
+    await assertOpenSameRepositoryPullRequest();
+  };
+}
+
+function queueVerifier(sha, runId) {
+  return async () => {
+    await assertPreviewQueueRun(runId);
+    await assertOpenSameRepositoryPullRequest(sha);
+  };
+}
+
+function resetQueueVerifier(sha, runId) {
+  return async () => {
+    await assertPreviewResetRun(runId);
+    await assertOpenSameRepositoryPullRequest(sha);
+  };
+}
+
+function waitForQueuedCard() {
+  return new Promise((resolve) => setTimeout(resolve, CARD_DISCOVERY_DELAY_MS));
 }
 
 function actionRunLogUrl() {
@@ -187,26 +296,265 @@ function actionRunLogUrl() {
   return `https://github.com/${repository}/actions/runs/${positiveInteger(runId, 'GitHub Actions run ID')}`;
 }
 
-async function createDeploymentCard() {
+function errorMessage(error) {
+  return error instanceof Error ? error.message : 'non-Error rejection';
+}
+
+async function settleStaleQueueCard({ sha, runId, deploymentId, verifyRun }) {
+  const card = await settleQueuedPreviewDeployment({
+    request: github,
+    verify: async () => {
+      await verifyRun(runId);
+      await assertSupersededPullRequest(sha);
+    },
+    verifyAnnouncement: assertPreviewAnnouncementRun,
+    deploymentId,
+    state: 'inactive',
+    description: 'Preview superseded before its queued card could be published',
+    logUrl: actionRunLogUrl(),
+    repository,
+    pr,
+    sha,
+  });
+  process.stdout.write(`${stableJson(card)}\n`);
+}
+
+async function queueDeploymentCard() {
+  const sha = headSha(args['head-sha']);
+  const runId = positiveInteger(args['run-id'], 'preview announcement workflow run ID');
+  const githubOutput = args['github-output'];
+  let created = null;
+  assertTrustedPreviewQueueWorkflowRef(repository, args['workflow-ref']);
+  try {
+    const card = await queuePreviewDeployment({
+      request: github,
+      verify: queueVerifier(sha, runId),
+      onCreated: async (value) => {
+        created = value;
+        if (githubOutput) await appendFile(path.resolve(githubOutput), `deployment_id=${value.deploymentId}\n`);
+      },
+      repository,
+      pr,
+      sha,
+      announcementRunId: runId,
+      workflowRef: args['workflow-ref'],
+    });
+    process.stdout.write(`${stableJson(card)}\n`);
+  } catch (error) {
+    if (created == null || await previewPullState(sha) === 'current') throw error;
+    process.stderr.write(`Queue card failed before stale settlement: ${errorMessage(error)}\n`);
+    await settleStaleQueueCard({
+      sha,
+      runId,
+      deploymentId: created.deploymentId,
+      verifyRun: assertPreviewQueueRun,
+    });
+  }
+}
+
+async function resetQueueDeploymentCard() {
+  const runId = positiveInteger(args['run-id'], 'preview reset workflow run ID');
+  const githubOutput = args['github-output'];
+  let created = null;
+  assertTrustedPreviewResetWorkflowRef(repository, args['workflow-ref']);
+  const pull = await assertOpenSameRepositoryPullRequest();
+  const sha = headSha(pull.head.sha);
+  try {
+    const card = await queuePreviewDeployment({
+      request: github,
+      verify: resetQueueVerifier(sha, runId),
+      onCreated: async (value) => {
+        created = value;
+        if (githubOutput) await appendFile(path.resolve(githubOutput), `deployment_id=${value.deploymentId}\n`);
+      },
+      repository,
+      pr,
+      sha,
+      announcementRunId: runId,
+      workflowRef: args['workflow-ref'],
+    });
+    process.stdout.write(`${stableJson(card)}\n`);
+  } catch (error) {
+    if (created == null || await previewPullState(sha) === 'current') throw error;
+    process.stderr.write(`Reset queue card failed before stale settlement: ${errorMessage(error)}\n`);
+    await settleStaleQueueCard({
+      sha,
+      runId,
+      deploymentId: created.deploymentId,
+      verifyRun: assertPreviewResetRun,
+    });
+  }
+}
+
+
+async function reconcileQueuedDeploymentCard() {
+  const sha = headSha(args['head-sha']);
+  const queueRunId = positiveInteger(args['run-id'], 'preview announcement workflow run ID');
+  const id = positiveInteger(args['deployment-id'], 'GitHub deployment ID');
+  assertTrustedPreviewQueueWorkflowRef(repository, args['workflow-ref']);
+  await assertPreviewQueueRun(queueRunId);
+  const currentCard = async () => findPreviewAnnouncement({
+    request: github,
+    verifyAnnouncement: assertPreviewAnnouncementRun,
+    deploymentId: id,
+    repository,
+    pr,
+    sha,
+  });
+  const card = await currentCard();
+  if (card == null
+    || card.task !== 'preview-announce'
+    || card.announcementRunId !== queueRunId
+    || (card.state !== 'queued' && card.state != null)) {
+    process.stdout.write(`${stableJson({ reconciled: false, deploymentId: id })}\n`);
+    return;
+  }
+  if (await previewPullState(sha) !== 'current') {
+    await settleStaleQueueCard({
+      sha,
+      runId: queueRunId,
+      deploymentId: id,
+      verifyRun: assertPreviewQueueRun,
+    });
+    return;
+  }
+  const source = await latestTrustedSourceRun(sha);
+  if (source == null || source.conclusion == null) {
+    process.stdout.write(`${stableJson({ reconciled: false, deploymentId: id, waitingForCi: true })}\n`);
+    return;
+  }
+  if (source.conclusion !== 'success') {
+    const settled = await settleQueuedPreviewDeployment({
+      request: github,
+      verify: async () => {
+        await assertPreviewQueueRun(queueRunId);
+        await assertUnsuccessfulSourceRun(source.id, sha);
+        await assertOpenSameRepositoryPullRequest(sha);
+      },
+      verifyAnnouncement: assertPreviewAnnouncementRun,
+      deploymentId: id,
+      state: 'failure',
+      description: 'Preview was not provisioned because CI did not succeed',
+      logUrl: actionRunLogUrl(),
+      repository,
+      pr,
+      sha,
+    });
+    process.stdout.write(`${stableJson({ reconciled: true, sourceRunId: source.id, ...settled })}\n`);
+    return;
+  }
+  await assertSuccessfulSourceRun(source.id, sha);
+  await assertOpenSameRepositoryPullRequest(sha);
+  const finalCard = await currentCard();
+  if (finalCard == null
+    || finalCard.task !== 'preview-announce'
+    || finalCard.announcementRunId !== queueRunId
+    || (finalCard.state !== 'queued' && finalCard.state != null)) {
+    process.stdout.write(`${stableJson({ reconciled: false, deploymentId: id })}\n`);
+    return;
+  }
+  await assertSuccessfulSourceRun(source.id, sha);
+  await assertOpenSameRepositoryPullRequest(sha);
+  await github(`/repos/${repository}/actions/workflows/preview-control.yml/dispatches`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: stableJson({
+      ref: 'main',
+      inputs: {
+        pr: String(pr),
+        head_sha: sha,
+        source_run_id: String(source.id),
+      },
+    }),
+    expectedStatus: 204,
+    noJson: true,
+  });
+  process.stdout.write(`${stableJson({
+    reconciled: true,
+    deploymentId: id,
+    sourceRunId: source.id,
+  })}\n`);
+}
+async function claimDeploymentCard() {
   const sha = headSha(args['head-sha']);
   const sourceRunId = positiveInteger(args['source-run-id'], 'source workflow run ID');
   const runId = positiveInteger(args['run-id'], 'controller workflow run ID');
   const githubOutput = args['github-output'];
   const recordDeploymentId = githubOutput
-    ? async ({ deploymentId }) => appendFile(path.resolve(githubOutput), `deployment_id=${deploymentId}\n`)
+    ? async ({ deploymentId }) => appendFile(
+      path.resolve(githubOutput),
+      `deployment_id=${deploymentId}\nclaimed=true\n`,
+    )
     : null;
   assertTrustedWorkflowRef(repository, args['workflow-ref']);
-  const card = await createPreviewDeployment({
+  const card = await claimPreviewDeployment({
     request: github,
     verify: previewVerifier(sha, sourceRunId),
-    onCreated: recordDeploymentId,
+    verifyAnnouncement: assertPreviewAnnouncementRun,
+    onClaimed: recordDeploymentId,
+    attempts: CARD_DISCOVERY_ATTEMPTS,
+    wait: waitForQueuedCard,
     repository,
     pr,
     sha,
     sourceRunId,
     runId,
   });
+  if (githubOutput && card.alreadyClaimed) {
+    await appendFile(
+      path.resolve(githubOutput),
+      `deployment_id=${card.deploymentId}\nclaimed=${card.claimedByCurrentRun === true}\n`,
+    );
+  }
   process.stdout.write(`${stableJson(card)}\n`);
+}
+
+async function rejectDeploymentCards() {
+  const sha = headSha(args['head-sha']);
+  const sourceRunId = positiveInteger(args['source-run-id'], 'source workflow run ID');
+  const runId = positiveInteger(args['run-id'], 'controller workflow run ID');
+  assertTrustedWorkflowRef(repository, args['workflow-ref']);
+  const cards = await rejectQueuedPreviewDeployments({
+    request: github,
+    verify: rejectionVerifier(sha, sourceRunId),
+    verifyAnnouncement: assertPreviewAnnouncementRun,
+    attempts: CARD_DISCOVERY_ATTEMPTS,
+    wait: waitForQueuedCard,
+    repository,
+    pr,
+    sha,
+    sourceRunId,
+    runId,
+  });
+  process.stdout.write(`${stableJson(cards)}\n`);
+}
+
+async function supersedeDeploymentCards() {
+  const sha = headSha(args['head-sha']);
+  const sourceRunId = positiveInteger(args['source-run-id'], 'source workflow run ID');
+  const runId = positiveInteger(args['run-id'], 'controller workflow run ID');
+  assertTrustedWorkflowRef(repository, args['workflow-ref']);
+  await assertSuccessfulSourceRun(sourceRunId, sha);
+  if (await previewPullState(sha) === 'current') {
+    process.stdout.write(`${stableJson({ inactivatedDeploymentIds: [] })}\n`);
+    return;
+  }
+  const cards = await inactivateSupersededPreviewDeployments({
+    request: github,
+    verify: async () => {
+      await assertSuccessfulSourceRun(sourceRunId, sha);
+      await assertSupersededPullRequest(sha);
+    },
+    verifyAnnouncement: assertPreviewAnnouncementRun,
+    description: 'Preview superseded by a newer PR head',
+    logUrl: actionRunLogUrl(),
+    repository,
+    pr,
+    sha,
+    sourceRunId,
+    runId,
+  });
+  process.stdout.write(`${stableJson(cards)}\n`);
 }
 
 async function completeDeploymentCard() {
@@ -217,6 +565,7 @@ async function completeDeploymentCard() {
   const card = await completePreviewDeployment({
     request: github,
     verify: previewVerifier(sha, sourceRunId),
+    verifyAnnouncement: assertPreviewAnnouncementRun,
     repository,
     pr,
     sha,
@@ -474,7 +823,7 @@ async function provision() {
     trustedWorkflowRef: workflowRef,
   });
   await assertSuccessfulSourceRun(sourceRunId, sha);
-  await assertCurrentPullRequest(sha);
+  await assertOpenSameRepositoryPullRequest(sha);
   const names = resourceNames(pr);
   const migrationDirectory = path.join(artifact.root, 'payload', 'migrations');
   const artifactMigrationManifest = JSON.parse(
@@ -839,7 +1188,12 @@ async function janitor() {
 }
 
 if (command === 'provision') await provision();
-else if (command === 'deployment-create') await createDeploymentCard();
+else if (command === 'deployment-queue') await queueDeploymentCard();
+else if (command === 'deployment-reconcile') await reconcileQueuedDeploymentCard();
+else if (command === 'deployment-reset-queue') await resetQueueDeploymentCard();
+else if (command === 'deployment-claim') await claimDeploymentCard();
+else if (command === 'deployment-reject') await rejectDeploymentCards();
+else if (command === 'deployment-supersede') await supersedeDeploymentCards();
 else if (command === 'deployment-status') await completeDeploymentCard();
 else if (command === 'deployment-inactivate') await inactivateDeploymentCards();
 else if (command === 'deployment-inactivate-batch') await inactivateDeploymentCardsBatch();

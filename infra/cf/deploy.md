@@ -49,16 +49,29 @@ resources created if missing and reused across pushes. There is no front door, n
 Access, and no blue/green generation machinery — the deploy IS the promote, so a broken push
 briefly breaks that PR's preview until the next one.
 
-After an isolated build succeeds, a separate trusted, no-secret job immediately creates a
-transient GitHub deployment in the `preview/pr-<number>` environment, attached to the immutable
-PR head SHA rather than the `workflow_run` controller's `main` SHA. It posts an in-progress
-status while credentialed provisioning runs in parallel, recording the deployment ID first so the
-no-secret terminalizer can recover a transient GitHub API failure. The initial status links to the
-controller run; its terminal status adds the stable workers.dev URL only after provisioning
-succeeds. Every create or terminal-card write repeats the source-CI and current-head checks. The
-terminalizer distinguishes provisioning failure from smoke failure, then inactivates older cards
-for that PR. Separate no-secret close and janitor follow-ups mark cards inactive after resource
-removal. Only these no-secret jobs hold `deployments: write`; PR CI never receives it.
+The trusted default-branch `Preview Queue` workflow runs on `pull_request_target` for an opened,
+synchronized, or reopened **same-repository** PR. It neither checks out nor executes PR code. It
+validates the live PR head and its own trusted workflow run before and after creating a transient
+GitHub deployment in `preview/pr-<number>`, attached to that immutable PR SHA with a `queued`
+status. Queue events do not serialize: an obsolete event cannot delay the current head. A queue
+job that arrives after matching CI completed verifies its exact card and source run, then uses its
+otherwise no-secret `actions: write` grant to dispatch the trusted default-branch controller with
+those values as data.
+
+`Preview Control` validates the source run and live head again, then claims the exact queued card
+by strict announcement provenance **before** the isolated build. Its `in_progress` card is the
+durable per-head lock: a normal and recovered controller cannot provision the same SHA twice, and
+any duplicate queued card becomes inactive. A failed `in_progress` write triggers one no-secret
+same-run claim retry before build; it resumes only a card whose status belongs to that controller.
+A missing direct card still blocks the original controller, but the validated late queue path
+dispatches a retry rather than leaving a successful CI unprovisioned. A no-secret rejection path
+turns queued or unstatused cards into `failure` when CI does not succeed; a successful controller
+completes the exact card after remote smoke, then retires older verified cards.
+Queued, claimed, failed-to-provision, cancelled, and skipped cards omit the preview URL; a URL is
+published only after provisioning succeeds, including a terminal smoke failure or cancellation.
+Close, stale-head, and janitor follow-ups mark applicable cards
+inactive after resource removal. Only trusted no-secret jobs hold `deployments: write`; CI never
+receives it.
 
 **Auth is one derived per-PR bearer.** `PREVIEW_BEARER = HMAC-SHA256(seed, "sessions-preview-bearer:pr-<n>")`
 is baked into the Worker as its only gate; browsers mint a session cookie by visiting
@@ -76,7 +89,9 @@ the old schema in its persistent preview D1. The provisioner records each applie
 sha256 in the preview's `meta` table and, on divergence (edited bytes or a vanished applied
 name), deletes and recreates the D1 and reapplies from scratch — loudly, in the job log.
 Uploaded sessions vanish in that one case; re-uploading is one command. Manual full reset:
-dispatch `Preview Close` against the open PR, then re-run CI.
+dispatch `Preview Close` against the open PR; its no-secret follow-up queues a fresh reset card
+for that head, then re-run CI to claim and reprovision it. A manual dispatch against a closed PR
+still tears down resources and inactivates cards, but skips that reset queue.
 
 PR close and the scheduled janitor delete by deterministic name: close removes the
 `pr-<number>-*` set (detaching queue consumers, emptying R2 first); the janitor sweeps every
