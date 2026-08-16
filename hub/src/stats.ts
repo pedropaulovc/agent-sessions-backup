@@ -772,11 +772,15 @@ async function topSessions(
   // Only titles are fetched, and only for the twelve rows actually shown. Carrying
   // `first_interaction_title` through the main scan would attach a long string to every one of its
   // ~32k groups in order to display twelve of them.
+  // OMP's title is authoritative JSONL metadata; every other harness keeps the derived-first
+  // precedence used by the viewer.
   const meta = await db
     .prepare(
-      // first_interaction_title (migration 0013) with `title` as fallback: sessions not reparsed
-      // since that migration have NULL there, so the fallback is not optional.
-      `SELECT session_id, COALESCE(first_interaction_title, title) AS title
+      `SELECT session_id,
+              CASE WHEN harness = 'omp'
+                   THEN COALESCE(NULLIF(title, ''), NULLIF(first_interaction_title, ''))
+                   ELSE COALESCE(NULLIF(first_interaction_title, ''), NULLIF(title, ''))
+              END AS title
        FROM sessions WHERE session_id IN (${ids.map((_, i) => `?${i + 1}`).join(',')})`,
     )
     .bind(...ids)

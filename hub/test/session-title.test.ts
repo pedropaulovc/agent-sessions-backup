@@ -147,4 +147,9 @@ describe('sessionDisplayTitle', () => {
     expect(sessionDisplayTitle(null, null, 'sess-1')).toBe('sess-1');
     expect(sessionDisplayTitle('', '', 'sess-1')).toBe('sess-1');
   });
+  it('prefers an OMP JSONL title before the derived fallback', () => {
+    expect(sessionDisplayTitle('derived', 'jsonl title', 'sess-1', 'omp')).toBe('jsonl title');
+    expect(sessionDisplayTitle('derived', null, 'sess-1', 'omp')).toBe('derived');
+    expect(sessionDisplayTitle(null, null, 'sess-1', 'omp')).toBe('sess-1');
+  });
 });

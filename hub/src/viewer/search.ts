@@ -300,7 +300,7 @@ function sessionWhere(p: URLSearchParams): { where: string; binds: string[] } {
 
 function renderHit(h: SearchHit): string {
   const s = h.session;
-  const title = sessionDisplayTitle(null, s.title, h.session_id);
+  const title = sessionDisplayTitle(null, s.title, h.session_id, s.harness);
   const meta = [
     `<span class="badge">${esc(s.harness)}</span>`,
     s.subagent === 'yes' ? `<span class="badge">Subagent session</span>` : '',
@@ -324,7 +324,7 @@ function renderHit(h: SearchHit): string {
 }
 
 function renderRecent(r: RecentRow): string {
-  const title = sessionDisplayTitle(r.first_interaction_title, r.stored_title, r.session_id);
+  const title = sessionDisplayTitle(r.first_interaction_title, r.stored_title, r.session_id, r.harness);
   const meta = [
     `<span class="badge">${esc(r.harness)}</span>`,
     r.subagent === 'yes' ? `<span class="badge">Subagent session</span>` : '',
