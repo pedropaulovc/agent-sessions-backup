@@ -152,4 +152,8 @@ describe('sessionDisplayTitle', () => {
     expect(sessionDisplayTitle('derived', null, 'sess-1', 'omp')).toBe('derived');
     expect(sessionDisplayTitle(null, null, 'sess-1', 'omp')).toBe('sess-1');
   });
+  it('falls back from an empty OMP JSONL title', () => {
+    expect(sessionDisplayTitle('derived', '', 'sess-1', 'omp')).toBe('derived');
+    expect(sessionDisplayTitle(null, '', 'sess-1', 'omp')).toBe('sess-1');
+  });
 });

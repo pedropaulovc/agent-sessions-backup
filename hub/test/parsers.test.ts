@@ -266,6 +266,23 @@ describe('parseOmp', () => {
 
     expect(session.title).toBe('fallback OMP user title');
   });
+  it('falls back from an empty OMP JSONL title', async () => {
+    const records = [
+      JSON.stringify({ type: 'title', v: 1, title: '', updatedAt: '2026-07-19T10:00:00.000Z' }),
+      JSON.stringify({ type: 'session', version: 3, id: sessionId, timestamp: '2026-07-19T10:00:00.000Z' }),
+      JSON.stringify({
+        type: 'message',
+        id: 'empty-title-user',
+        parentId: null,
+        timestamp: '2026-07-19T10:00:01.000Z',
+        message: { role: 'user', content: [{ type: 'text', text: 'fallback after empty OMP title' }] },
+      }),
+    ];
+
+    const session = await parseOmp(readJsonlLines(toStream(records)), sessionId);
+
+    expect(session.title).toBe('fallback after empty OMP title');
+  });
   it('keeps validated external OMP image references in memory without retaining source paths', async () => {
     const digest = 'a'.repeat(64);
     const records = [
