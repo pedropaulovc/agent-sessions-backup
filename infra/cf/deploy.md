@@ -50,8 +50,8 @@ Access, and no blue/green generation machinery — the deploy IS the promote, so
 briefly breaks that PR's preview until the next one.
 
 After a provision succeeds, a separate trusted, no-secret job creates a transient GitHub
-deployment attached to the immutable PR head SHA (`preview/pr-<number>`), rather than the
-`workflow_run` controller's `main` SHA. It records the deployment ID before its in-progress
+deployment in the `preview/pr-<number>` environment, attached to the immutable PR head SHA
+rather than the `workflow_run` controller's `main` SHA. It records the deployment ID before its
 status write so the no-secret terminalizer can recover a transient GitHub API failure. Every
 create or terminal-card write repeats the source-CI and current-head checks; the card exposes
 the stable workers.dev URL while remote smoke runs, then records the terminal smoke result and

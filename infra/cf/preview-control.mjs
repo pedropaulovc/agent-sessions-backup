@@ -42,11 +42,13 @@ const [command, ...rest] = process.argv.slice(2);
 const allowed = new Set([
   'account-id', 'artifact', 'head-sha', 'pr', 'repository', 'run-id',
   'source-run-id', 'workflow-ref', 'wrangler', 'migrations-cli',
-  'github-output', 'artifact-digest', 'schema-digest', 'deployment-id', 'outcome',
+  'github-output', 'artifact-digest', 'schema-digest', 'deployment-id', 'outcome', 'prs',
 ]);
 const args = parseArgs(rest, allowed);
 const repository = repositoryName(args.repository ?? process.env.GITHUB_REPOSITORY);
-const pr = command === 'janitor' ? null : positiveInteger(args.pr, 'PR number');
+const pr = command === 'janitor' || command === 'deployment-inactivate-batch'
+  ? null
+  : positiveInteger(args.pr, 'PR number');
 const previewAccountId = args['account-id'] ?? process.env.CLOUDFLARE_PREVIEW_ACCOUNT_ID;
 const previewToken = process.env.CLOUDFLARE_PREVIEW_CONTROL_TOKEN;
 
@@ -226,19 +228,37 @@ async function completeDeploymentCard() {
   process.stdout.write(`${stableJson(card)}\n`);
 }
 
-async function deactivateDeploymentCards(number, description) {
+function previewPrNumbers(value) {
+  let parsed;
+  try { parsed = JSON.parse(value); } catch { fail('PR list must be a JSON array'); }
+  if (!Array.isArray(parsed) || parsed.length === 0) fail('PR list must be a non-empty JSON array');
+  const numbers = parsed.map((number) => positiveInteger(number, 'PR number'));
+  if (new Set(numbers).size !== numbers.length) fail('PR list contains duplicate PR numbers');
+  return numbers;
+}
+
+async function deactivatePreviewCards(number) {
   return deactivatePreviewDeployments({
     request: github,
     repository,
     pr: number,
-    description,
+    description: 'Preview environment removed',
     logUrl: actionRunLogUrl(),
   });
 }
 
 async function inactivateDeploymentCards() {
-  const inactiveDeploymentIds = await deactivateDeploymentCards(pr, 'Preview environment removed');
+  const inactiveDeploymentIds = await deactivatePreviewCards(pr);
   process.stdout.write(`${stableJson({ pr, inactiveDeploymentIds })}\n`);
+}
+
+async function inactivateDeploymentCardsBatch() {
+  const inactiveDeployments = {};
+  for (const number of previewPrNumbers(args.prs)) {
+    const inactiveDeploymentIds = await deactivatePreviewCards(number);
+    if (inactiveDeploymentIds.length > 0) inactiveDeployments[number] = inactiveDeploymentIds;
+  }
+  process.stdout.write(`${stableJson({ inactiveDeployments })}\n`);
 }
 
 async function cf(pathname, init = {}) {
@@ -822,6 +842,7 @@ if (command === 'provision') await provision();
 else if (command === 'deployment-create') await createDeploymentCard();
 else if (command === 'deployment-status') await completeDeploymentCard();
 else if (command === 'deployment-inactivate') await inactivateDeploymentCards();
+else if (command === 'deployment-inactivate-batch') await inactivateDeploymentCardsBatch();
 else if (command === 'seed') await seed();
 else if (command === 'smoke') await smoke();
 else if (command === 'close') await closePreview();

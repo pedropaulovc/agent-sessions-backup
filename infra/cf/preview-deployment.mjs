@@ -116,6 +116,18 @@ async function listPreviewDeployments(request, context) {
   fail(`GitHub deployment list exceeded ${MAX_DEPLOYMENT_PAGES} pages`);
 }
 
+function deploymentOrder(deployment) {
+  const id = deploymentId(deployment?.id);
+  const createdAt = Date.parse(deployment?.created_at ?? '');
+  if (!Number.isFinite(createdAt)) fail('GitHub deployment created_at must be an ISO timestamp');
+  return { id, createdAt };
+}
+
+function precedesDeployment(candidate, current) {
+  return candidate.createdAt < current.createdAt
+    || (candidate.createdAt === current.createdAt && candidate.id < current.id);
+}
+
 /**
  * Create an immutable deployment card for a provisioned PR preview, then expose the stable
  * workers.dev URL while remote smoke is still running. The caller receives the deployment ID
@@ -190,7 +202,11 @@ export async function completePreviewDeployment({ request, verify, deploymentId:
   return { deploymentId: currentDeploymentId, outcome, inactiveDeploymentIds, url };
 }
 
-/** Mark all matching transient cards inactive after their stable preview was superseded or removed. */
+/**
+ * Mark matching transient cards inactive after their stable preview was removed. When a current
+ * card is supplied, only strictly older cards are eligible; a same-SHA re-run must not retire a
+ * newer in-progress card.
+ */
 export async function deactivatePreviewDeployments({
   request,
   verify,
@@ -205,11 +221,17 @@ export async function deactivatePreviewDeployments({
   const excluded = exceptDeploymentId == null ? null : deploymentId(exceptDeploymentId);
   const deploymentLogUrl = optionalHttpsUrl(logUrl, 'log URL');
   const deployments = await listPreviewDeployments(github, context);
+  const current = excluded == null
+    ? null
+    : deployments.find((deployment) => deploymentId(deployment?.id) === excluded);
+  if (excluded != null && current == null) fail('GitHub deployment list omitted the current deployment');
+  const currentOrder = current == null ? null : deploymentOrder(current);
   const inactiveDeploymentIds = [];
 
   for (const deployment of deployments) {
     const id = deploymentId(deployment?.id);
     if (id === excluded) continue;
+    if (currentOrder && !precedesDeployment(deploymentOrder(deployment), currentOrder)) continue;
     if (verifyCurrent) await verifyCurrent();
     await postDeploymentStatus(github, context, id, 'inactive', description, { logUrl: deploymentLogUrl });
     inactiveDeploymentIds.push(id);

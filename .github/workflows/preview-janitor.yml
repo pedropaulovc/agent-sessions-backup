@@ -46,22 +46,19 @@ jobs:
           --account-id "$CLOUDFLARE_PREVIEW_ACCOUNT_ID"
           --github-output "$GITHUB_OUTPUT"
 
-  # A matrix keeps the deployment write token away from Cloudflare credentials and gives each
-  # removed PR an independently auditable inactive status.
+  # This no-secret follow-up avoids a matrix fan-out limit while preserving one auditable
+  # inactive status per removed PR.
   inactivate-deployment-cards:
     needs: clean-preview-resources
     if: >-
       needs.clean-preview-resources.result == 'success' &&
+      needs.clean-preview-resources.outputs.closed_prs != '' &&
       needs.clean-preview-resources.outputs.closed_prs != '[]'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 30
     permissions:
       contents: read
       deployments: write
-    strategy:
-      fail-fast: false
-      matrix:
-        pr: ${{ fromJSON(needs.clean-preview-resources.outputs.closed_prs) }}
     steps:
       - name: Check out trusted default-branch deployment-card code
         uses: actions/checkout@v4
@@ -74,8 +71,8 @@ jobs:
       - name: Mark removed preview deployment cards inactive
         env:
           GITHUB_TOKEN: ${{ github.token }}
-          PREVIEW_PR_NUMBER: ${{ matrix.pr }}
+          CLOSED_PRS: ${{ needs.clean-preview-resources.outputs.closed_prs }}
         run: >-
-          node infra/cf/preview-control.mjs deployment-inactivate
+          node infra/cf/preview-control.mjs deployment-inactivate-batch
           --repository "$GITHUB_REPOSITORY"
-          --pr "$PREVIEW_PR_NUMBER"
+          --prs "$CLOSED_PRS"

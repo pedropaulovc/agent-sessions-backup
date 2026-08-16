@@ -427,6 +427,9 @@ describe('PR-visible preview deployment cards', () => {
   const environment = 'preview/pr-42';
   const url = `https://${resourceNames(pr).host}`;
   const logUrl = `https://github.com/${repository}/actions/runs/${runId}`;
+  const olderCreatedAt = '2026-08-16T19:00:00.000Z';
+  const currentCreatedAt = '2026-08-16T19:01:00.000Z';
+  const newerCreatedAt = '2026-08-16T19:02:00.000Z';
 
   function deploymentArgs(overrides = {}) {
     return {
@@ -534,7 +537,10 @@ describe('PR-visible preview deployment cards', () => {
       requests.push({ pathname, init });
       if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) return { state: 'failure' };
       if (pathname === `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=1`) {
-        return [{ id: 10 }, { id: deploymentId }];
+        return [
+          { id: 10, created_at: olderCreatedAt },
+          { id: deploymentId, created_at: currentCreatedAt },
+        ];
       }
       if (pathname === `/repos/${repository}/deployments/10/statuses`) return { state: 'inactive' };
       throw new Error(`unexpected request: ${pathname}`);
@@ -571,13 +577,18 @@ describe('PR-visible preview deployment cards', () => {
     });
   });
 
-  it('inactivates earlier transient cards after a successful replacement', async () => {
+  it('inactivates only older transient cards after a successful replacement', async () => {
     const requests = [];
     const request = async (pathname, init) => {
       requests.push({ pathname, init });
       if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) return { state: 'success' };
       if (pathname === `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=1`) {
-        return [{ id: 10 }, { id: deploymentId }, { id: 11 }];
+        return [
+          { id: 10, created_at: olderCreatedAt },
+          { id: deploymentId, created_at: currentCreatedAt },
+          { id: 11, created_at: olderCreatedAt },
+          { id: 790, created_at: newerCreatedAt },
+        ];
       }
       if (pathname === `/repos/${repository}/deployments/10/statuses`) return { state: 'inactive' };
       if (pathname === `/repos/${repository}/deployments/11/statuses`) return { state: 'inactive' };
@@ -640,5 +651,41 @@ describe('PR-visible preview deployment cards', () => {
       auto_inactive: false,
       log_url: logUrl,
     });
+  });
+
+  it('walks every deployment-list page before inactivating removed preview cards', async () => {
+    const requests = [];
+    const firstPage = Array.from({ length: 100 }, (_, index) => ({ id: index + 1 }));
+    const request = async (pathname, init) => {
+      requests.push({ pathname, init });
+      if (pathname === `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=1`) {
+        return firstPage;
+      }
+      if (pathname === `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=2`) {
+        return [{ id: 101 }];
+      }
+      if (pathname.endsWith('/statuses')) return { state: 'inactive' };
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(deactivatePreviewDeployments({ request, repository, pr })).resolves.toHaveLength(101);
+    expect(requests.map(({ pathname }) => pathname).filter((pathname) => pathname.includes('?environment='))).toEqual([
+      `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=1`,
+      `/repos/${repository}/deployments?environment=preview%2Fpr-42&per_page=100&page=2`,
+    ]);
+  });
+
+  it('rejects a GitHub deployment status response with the wrong state', async () => {
+    const request = async (pathname) => {
+      if (pathname === `/repos/${repository}/deployments`) return { id: deploymentId };
+      if (pathname === `/repos/${repository}/deployments/${deploymentId}/statuses`) return { state: 'failure' };
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(createPreviewDeployment({
+      request,
+      verify: async () => {},
+      ...deploymentArgs(),
+    })).rejects.toThrow(/did not report in_progress/);
   });
 });
