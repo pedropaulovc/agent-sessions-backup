@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { spawn } from 'node:child_process';
 import { createHmac } from 'node:crypto';
-import { readFileSync } from 'node:fs';
+import { globSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { join, resolve } from 'node:path';
@@ -13,7 +13,8 @@ Options:
   --print-only   Print the URL without opening a browser
 
 Auth: the per-PR bearer is derived from the seed in ~/.config/agent-sessions/preview-seed
-(or the PREVIEW_BEARER_SEED environment variable) and appended as ?token=… — visiting it
+(or the PREVIEW_BEARER_SEED environment variable, or the Windows-side copy under /mnt when
+running in WSL) and appended as ?token=… — visiting it
 once sets the preview session cookie. Without a seed the bare URL is printed and the
 preview will answer 401.
 `;
@@ -57,15 +58,40 @@ export function previewSeedPath(home = homedir()) {
   return join(home, '.config', 'agent-sessions', 'preview-seed');
 }
 
+const WSL_SEED_GLOB = '/mnt/*/Users/*/.config/agent-sessions/preview-seed';
+
+/**
+ * Under WSL the seed lives on the Windows side of the same machine: the Linux `~/.config` is a
+ * different filesystem and is empty, so looking only there reports "no seed on this box" while
+ * the seed sits one mount away. Returns the distinct values found, so an ambiguous set is the
+ * caller's decision rather than whichever the glob happened to yield first.
+ */
+export function wslPreviewSeeds(environment = process.env, readFile = readFileSync, glob = globSync) {
+  if (!environment.WSL_DISTRO_NAME) return [];
+  const seeds = new Set();
+  for (const file of glob(WSL_SEED_GLOB)) {
+    try {
+      const value = readFile(file, 'utf8').trim();
+      if (value.length >= 32) seeds.add(value);
+    } catch { /* an unreadable Windows mount is not an error here */ }
+  }
+  return [...seeds];
+}
+
 /** The owner's local copy of the shared seed; environment variable wins for CI-ish callers. */
-export function readPreviewSeed(environment = process.env, readFile = readFileSync) {
+export function readPreviewSeed(environment = process.env, readFile = readFileSync, glob = globSync) {
   const fromEnvironment = environment.PREVIEW_BEARER_SEED?.trim();
   if (fromEnvironment) return fromEnvironment;
   try {
-    return readFile(previewSeedPath(), 'utf8').trim() || null;
-  } catch {
-    return null;
+    const fromHome = readFile(previewSeedPath(), 'utf8').trim();
+    if (fromHome) return fromHome;
+  } catch { /* no Linux-side copy; the Windows side is the usual case under WSL */ }
+  const candidates = wslPreviewSeeds(environment, readFile, glob);
+  if (candidates.length > 1) {
+    throw new Error(`found ${candidates.length} different preview seeds under /mnt — `
+      + 'set PREVIEW_BEARER_SEED to the one the previews were built with');
   }
+  return candidates[0] ?? null;
 }
 
 /** Must stay in lockstep with previewBearerToken in infra/cf/preview-trust.mjs. */
@@ -118,7 +144,7 @@ export async function main(argv = process.argv.slice(2), options = {}) {
   const log = options.log ?? console.log;
   if (seed === null) {
     (options.warn ?? console.error)(
-      `no preview seed found (${previewSeedPath()} or PREVIEW_BEARER_SEED) — printing the URL without a token; the preview will answer 401`,
+      `no preview seed found (${previewSeedPath()}, PREVIEW_BEARER_SEED, or the Windows-side copy under /mnt) — printing the URL without a token; the preview will answer 401`,
     );
   }
   const url = previewUrl(parsed.pr, seed);

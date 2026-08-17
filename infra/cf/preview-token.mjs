@@ -18,7 +18,7 @@
  * allowed to, and otherwise pasted in from the dashboard with the exact recipe printed below.
  */
 import { spawnSync } from 'node:child_process';
-import { globSync, readFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -284,30 +284,13 @@ function ghVariableNames() {
   return new Set(JSON.parse(rows).map((row) => row.name));
 }
 
-/**
- * Under WSL the seed lives on the Windows side of the same machine — `~/.config` in the Linux
- * root is empty, and looking only there is why this reads as "no seed on this box".
- */
-function wslSeed() {
-  if (!process.env.WSL_DISTRO_NAME) return null;
-  const found = new Map();
-  for (const file of globSync('/mnt/*/Users/*/.config/agent-sessions/preview-seed')) {
-    const value = readFileSync(file, 'utf8').trim();
-    if (value.length >= 32) found.set(value, file);
-  }
-  // Picking by glob order across several Windows profiles could publish a seed the owner's
-  // machines do not hold, and every open preview URL would stop authenticating at once.
-  if (found.size > 1) {
-    fail(`found ${found.size} different preview seeds under /mnt (${[...found.values()].join(', ')})`
-      + ' — pass --seed-file to say which one is the real seed');
-  }
-  return found.keys().next().value ?? null;
-}
-
 function requireSeed(seedFile) {
+  // readPreviewSeed already covers $PREVIEW_BEARER_SEED, the Linux-side file, and the Windows
+  // copy under /mnt (and throws when profiles disagree), so every consumer of the seed — this
+  // script, preview:open, preview-upload-session — resolves it identically.
   const seed = seedFile
     ? readFileSync(path.resolve(seedFile), 'utf8').trim()
-    : readPreviewSeed() ?? wslSeed();
+    : readPreviewSeed();
   if (!seed || seed.length < 32) {
     fail(`no preview bearer seed of at least 32 characters (looked at ${previewSeedPath()}, `
       + '$PREVIEW_BEARER_SEED, the Windows-side copy under /mnt, and --seed-file). It must be '

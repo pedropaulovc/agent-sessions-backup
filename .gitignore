@@ -28,3 +28,7 @@ infra/out/
 hub/test-results/
 hub/playwright-report/
 actionlint
+
+# Hand-created credential files (e.g. the Cloudflare token pasted for preview-token.mjs
+# --token-file). They belong outside the repo; this is the seatbelt for when they are not.
+*.local

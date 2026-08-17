@@ -49,6 +49,40 @@ test('seed resolution prefers the environment and falls back to the seed file', 
   assert.equal(readPreviewSeed({}, () => { throw new Error('ENOENT'); }), null);
 });
 
+test('under WSL the seed is found on the Windows side, where it actually lives', () => {
+  const wsl = { WSL_DISTRO_NAME: 'Ubuntu' };
+  const missingHome = (path) => { if (path === previewSeedPath()) throw new Error('ENOENT'); return `${SEED}\n`; };
+  const oneProfile = () => ['/mnt/c/Users/pedro/.config/agent-sessions/preview-seed'];
+
+  assert.equal(readPreviewSeed(wsl, missingHome, oneProfile), SEED);
+  // The same seed copied to several profiles is not ambiguous.
+  assert.equal(
+    readPreviewSeed(wsl, missingHome, () => ['/mnt/c/Users/a/s', '/mnt/d/Users/b/s']),
+    SEED,
+  );
+  // Without WSL the mounts are not consulted at all.
+  assert.equal(readPreviewSeed({}, missingHome, oneProfile), null);
+  // Too short to derive a bearer, so it is not a seed.
+  const shortOnMounts = (path) => {
+    if (path === previewSeedPath()) throw new Error('ENOENT');
+    return 'short';
+  };
+  assert.equal(readPreviewSeed(wsl, shortOnMounts, oneProfile), null);
+});
+
+test('refuses to guess when Windows profiles hold different seeds', () => {
+  // Guessing here publishes a bearer nobody else derives: every open preview URL breaks at once.
+  const seeds = { '/mnt/c/s': 'a'.repeat(48), '/mnt/d/s': 'b'.repeat(48) };
+  assert.throws(
+    () => readPreviewSeed(
+      { WSL_DISTRO_NAME: 'Ubuntu' },
+      (path) => seeds[path] ?? (() => { throw new Error('ENOENT'); })(),
+      () => Object.keys(seeds),
+    ),
+    /2 different preview seeds/,
+  );
+});
+
 test('enforces Node 22.13 or newer', () => {
   assert.doesNotThrow(() => assertSupportedNode('22.13.0'));
   assert.doesNotThrow(() => assertSupportedNode('24.0.0'));
