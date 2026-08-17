@@ -8,8 +8,9 @@ Status: partially superseded (2026-08-13)
 > the blue/green generation machinery, and the encrypted `sessions-dev-bridge` flow are
 > gone. Each PR now gets a **self-contained preview** at
 > `https://pr-<n>-app.sessions-ppe.workers.dev`, gated by one derived
-> per-PR bearer, with persistent per-PR resources; production sessions move into a
-> preview as a hand-carried zip (viewer "Export zip" → `preview-upload-session.mjs`).
+> per-PR bearer, with persistent per-PR resources and only synthetic or explicitly non-sensitive
+> data; the hand-carried zip path is for sanitized archives only (viewer "Export zip" →
+> `preview-upload-session.mjs`).
 > Current model: `infra/cf/deploy.md` ("Trusted per-PR preview controller" and "Moving a
 > production session into a preview"). **Only the local-development and build-sandbox
 > sections below remain operational guidance.** Every other section — including

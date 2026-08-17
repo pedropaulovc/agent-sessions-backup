@@ -11,7 +11,7 @@ export type Identity =
  * published as the disposable preview's public login code. It is presented either as an
  * `Authorization: Bearer` header (agents, CI) or via the `__Host-preview-session` cookie
  * a `/?token=…` visit sets (browsers). The blast radius of a leaked token is one
- * disposable preview holding only deliberately exported data.
+ * disposable preview holding only synthetic or explicitly non-sensitive data.
  */
 export const PREVIEW_SESSION_COOKIE = '__Host-preview-session';
 /** The machine identity a preview bearer resolves to (admin: it re-uploads any machine's files). */

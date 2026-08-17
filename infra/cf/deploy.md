@@ -73,8 +73,9 @@ principal derives the token independently from the `PREVIEW_BEARER_SEED` secret 
 secret + `~/.config/agent-sessions/preview-seed` on the owner's machines). The `preview` job
 publishes the derived bearer as the public PR login code; it never publishes the seed. The Worker
 holds only the derived token: reading one preview's Worker vars exposes that one disposable
-preview, not the seed. The URL pattern is guessable, so the token is the entire gate — acceptable
-because a preview holds only synthetic fixtures and sessions the owner deliberately exported.
+preview, not the seed. The URL pattern is guessable, so the token is the entire gate. A public
+preview must contain only synthetic or explicitly non-sensitive data; never upload production or
+sensitive archives through `preview-upload-session.mjs`.
 
 The seed is a **repository** secret, which means any same-repository branch can read the seed
 that derives every PR's bearer, not only its own. That is the same exposure as "any PR author
