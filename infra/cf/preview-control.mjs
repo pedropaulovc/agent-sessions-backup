@@ -67,8 +67,18 @@ function requireBearerSeed() {
   return seed;
 }
 
+// A rate-limit rejection means GitHub did not process the request, so replaying it is safe for
+// any method. A 5xx is ambiguous — the status may already exist — and POSTing a deployment status
+// twice records it twice, so only reads are replayed there.
 const GITHUB_RETRY_STATUS = new Set([403, 429, 500, 502, 503, 504]);
+const GITHUB_RETRY_STATUS_UNSAFE = new Set([403, 429]);
+const GITHUB_SAFE_METHODS = new Set(['GET', 'HEAD']);
 const GITHUB_ATTEMPTS = 5;
+
+function retryableStatus(method, status) {
+  const safe = GITHUB_SAFE_METHODS.has((method ?? 'GET').toUpperCase());
+  return safe ? GITHUB_RETRY_STATUS.has(status) : GITHUB_RETRY_STATUS_UNSAFE.has(status);
+}
 
 function retryDelayMs(response, attempt) {
   const retryAfter = Number(response.headers.get('retry-after'));
@@ -97,7 +107,8 @@ async function github(pathname, init = {}) {
         ...fetchInit.headers,
       },
     });
-    if (!GITHUB_RETRY_STATUS.has(response.status) || attempt === GITHUB_ATTEMPTS - 1) break;
+    if (!retryableStatus(fetchInit.method, response.status)) break;
+    if (attempt === GITHUB_ATTEMPTS - 1) break;
     const delay = retryDelayMs(response, attempt);
     process.stdout.write(`GitHub API ${pathname} returned ${response.status}; retrying in ${delay / 1000}s\n`);
     await new Promise((resolve) => { setTimeout(resolve, delay); });
