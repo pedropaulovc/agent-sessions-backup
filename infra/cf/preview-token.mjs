@@ -221,7 +221,11 @@ async function mintAccountToken(oauthToken) {
 }
 
 async function verifyApiToken(token) {
-  const verified = await cloudflare(token, '/user/tokens/verify');
+  // An account-owned token verifies under its owning account; a user-owned one under /user.
+  // The mint path above produces the former, a dashboard-pasted token may be either, so try
+  // the account endpoint first and only fall back rather than failing a freshly minted token.
+  let verified = await cloudflare(token, `/accounts/${PREVIEW_ACCOUNT_ID}/tokens/verify`);
+  if (!verified.ok) verified = await cloudflare(token, '/user/tokens/verify');
   if (!verified.ok) fail(`the API token did not verify (HTTP ${verified.status})`);
   if (verified.body.result?.status !== 'active') {
     fail(`the API token is ${verified.body.result?.status ?? 'in an unknown state'}`);
