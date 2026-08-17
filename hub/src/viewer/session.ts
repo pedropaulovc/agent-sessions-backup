@@ -130,7 +130,12 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
     pageTurnsByByteStart.set(row.byte_start, queue);
   }
   const titleScan = await loadTitleScan(env, sessionId);
-  const displayTitle = sessionDisplayTitle(titleScan.title || meta.first_interaction_title, meta.title, meta.session_id);
+  const displayTitle = sessionDisplayTitle(
+    titleScan.title || meta.first_interaction_title,
+    meta.title,
+    meta.session_id,
+    meta.harness,
+  );
   const titleSkippedTurns = titleScan.skipped;
 
   // Media block ids for this byte window, so <img>/<a> can point at the blob endpoint.

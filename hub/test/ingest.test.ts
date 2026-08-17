@@ -1677,7 +1677,18 @@ describe('OMP ingest end-to-end', () => {
       headers: { 'x-dev-machine': 'omp-box' },
     });
     expect(search.status).toBe(200);
-    expect(((await search.json()) as { hits: Array<{ session_id: string }> }).hits.some((hit) => hit.session_id === OMP_ID)).toBe(true);
+    const searchBody = (await search.json()) as {
+      hits: Array<{ session_id: string; session: { title: string | null } }>;
+    };
+    const searchHit = searchBody.hits.find((hit) => hit.session_id === OMP_ID);
+    expect(searchHit?.session.title).toBe('OMP slot title');
+
+    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=omp')).text();
+    expect(recent).toContain(`<a href="/s/${OMP_ID}">OMP slot title</a>`);
+
+    const detail = await (await SELF.fetch(`https://sessions.vza.net/s/${OMP_ID}`)).text();
+    expect(detail).toContain('<title>OMP slot title</title>');
+    expect(detail).toContain('<h2 style="margin:0">OMP slot title</h2>');
   });
 
   it('renders OMP custom metadata ancestry in chronological and effective views', async () => {

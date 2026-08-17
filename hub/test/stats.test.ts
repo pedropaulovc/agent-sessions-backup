@@ -434,6 +434,24 @@ describe('outliers', () => {
     const s = await stats(testEnv.DB, BASE, NOW);
     expect(s.outliers[0]!.title).toBe('parsed');
   });
+  it('prefers an OMP JSONL title over the derived interaction title', async () => {
+    await seedSession('omp-title', { harness: 'omp', title: 'jsonl title' });
+    await testEnv.DB.prepare(`UPDATE sessions SET first_interaction_title = 'derived title' WHERE session_id = 'omp-title'`).run();
+    await seedTurn('omp-title', '2026-07-20T10:00:00.000Z', { input: 1_000_000 });
+
+    const s = await stats(testEnv.DB, BASE, NOW);
+
+    expect(s.outliers[0]!.title).toBe('jsonl title');
+  });
+  it('falls back from an empty OMP JSONL title', async () => {
+    await seedSession('omp-empty-title', { harness: 'omp', title: '' });
+    await testEnv.DB.prepare(`UPDATE sessions SET first_interaction_title = 'derived title' WHERE session_id = 'omp-empty-title'`).run();
+    await seedTurn('omp-empty-title', '2026-07-20T10:00:00.000Z', { input: 1_000_000 });
+
+    const s = await stats(testEnv.DB, BASE, NOW);
+
+    expect(s.outliers[0]!.title).toBe('derived title');
+  });
 });
 
 describe('filters', () => {

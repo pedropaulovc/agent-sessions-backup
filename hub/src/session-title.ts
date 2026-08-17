@@ -116,13 +116,16 @@ function* titleRepresentatives(blocks: TitleBlock[]): Generator<TitleRepresentat
   }
 }
 
-/** Resolve the display title: the derived first-interaction title, else the harness-stored title,
- * else the session id. */
+/** Resolve the display title: OMP stores an authoritative title in JSONL, so use it before the
+ * derived first-interaction fallback. Other harnesses retain the derived-first behavior for
+ * legacy titles that may be stale. */
 export function sessionDisplayTitle(
   firstInteractionTitle: string | null,
   storedTitle: string | null,
   sessionId: string,
+  harness?: string,
 ): string {
+  if (harness === 'omp') return storedTitle || firstInteractionTitle || sessionId;
   return firstInteractionTitle || storedTitle || sessionId;
 }
 
