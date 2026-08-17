@@ -31,14 +31,6 @@ jobs:
           ref: main
           persist-credentials: false
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22.22.2
-          cache: npm
-          cache-dependency-path: hub/package-lock.json
-
-      - run: npm ci
-        working-directory: hub
 
       - name: Validate destructive target
         env:
@@ -51,26 +43,6 @@ jobs:
           current_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
           [[ "$current_head" == "$GITHUB_SHA" ]]
 
-      - name: Prepare immutable PPE target configuration
-        run: |
-          set -euo pipefail
-          cat > "$RUNNER_TEMP/wrangler.ppe.jsonc" <<'EOF'
-          {
-            "$schema": "node_modules/wrangler/config-schema.json",
-            "name": "sessions-ppe",
-            "account_id": "18ef3246e9f36d1560485ef53889c0ab",
-            "workers_dev": true,
-            "routes": [
-              { "pattern": "sessions.ppe.vza.net", "custom_domain": true }
-            ],
-            "d1_databases": [
-              {
-                "binding": "DB",
-                "database_name": "sessions-ppe-index"
-              }
-            ]
-          }
-          EOF
 
       - name: Verify production account boundary
         env:
@@ -104,20 +76,36 @@ jobs:
       - name: Delete PPE Worker and secrets
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
-        working-directory: hub
         run: |
           set -euo pipefail
-          npx wrangler delete sessions-ppe --config "$RUNNER_TEMP/wrangler.ppe.jsonc" --force
+          workers="$(curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            --header 'Content-Type: application/json' \
+            "$CLOUDFLARE_API_BASE/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts")"
+          while IFS= read -r worker_name; do
+            [[ -z "$worker_name" ]] && continue
+            curl --fail-with-body --silent --show-error --request DELETE \
+              --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              --header 'Content-Type: application/json' \
+              "$CLOUDFLARE_API_BASE/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/scripts/$worker_name" >/dev/null
+          done < <(jq -r '.result[]? | select((.id // .name) == "sessions-ppe") | (.id // .name)' <<<"$workers")
 
       - name: Delete isolated PPE D1
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
-        working-directory: hub
         run: |
           set -euo pipefail
-          npx wrangler d1 delete sessions-ppe-index \
-            --config "$RUNNER_TEMP/wrangler.ppe.jsonc" \
-            --skip-confirmation
+          databases="$(curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            --header 'Content-Type: application/json' \
+            "$CLOUDFLARE_API_BASE/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database?name=sessions-ppe-index")"
+          while IFS= read -r database_id; do
+            [[ -z "$database_id" ]] && continue
+            curl --fail-with-body --silent --show-error --request DELETE \
+              --header "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+              --header 'Content-Type: application/json' \
+              "$CLOUDFLARE_API_BASE/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database/$database_id" >/dev/null
+          done < <(jq -r '.result[]? | select(.name == "sessions-ppe-index") | .uuid' <<<"$databases")
 
       - name: Verify PPE resources are absent
         env:
