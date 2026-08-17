@@ -127,6 +127,15 @@ Measured 2026-08-16, so nobody re-litigates it:
   family — access token included. Two concurrent preview jobs would take each other out, and the
   repository secret would be dead rather than stale.
 
+- [OAuth clients](https://developers.cloudflare.com/fundamentals/oauth/) (account → Manage Account →
+  OAuth clients) do not rescue this either. The dashboard's **Grant type** offers only
+  Authorization Code (mandatory, not deselectable) plus optional Refresh Token, and **Token
+  Authentication Method** offers only None (PKCE), Client Secret Basic, and Client Secret POST.
+  Cloudflare's `/.well-known/openid-configuration` advertises `client_credentials` and
+  `private_key_jwt`, but that is the upstream OAuth server's generic capability list, not what
+  Cloudflare permits — checked in the dashboard 2026-08-16. Every flow on offer needs a human at a
+  browser, and lands back on a rotating refresh token.
+
 So: create the token by hand once, then `--set --token-file`. The script installs the seed and the
 account ID on its own, so the paste is the only thing left, and a 90-day account-pinned token beats
 a user-wide OAuth grant for CI anyway — it cannot follow the identity into a new account.
