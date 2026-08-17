@@ -419,6 +419,7 @@ describe('preview deployment card removal', () => {
           ? first
           : [{ id: 900 }];
       }
+      if (pathname.includes('/statuses?')) return [{ state: 'success' }];
       return { state: 'inactive' };
     };
 
@@ -440,12 +441,32 @@ describe('preview deployment card removal', () => {
   });
 
   it('rejects a GitHub deployment status response with the wrong state', async () => {
-    const request = async (pathname) => (pathname.includes('/deployments?')
-      ? [{ id: 1 }]
-      : { state: 'success' });
+    const request = async (pathname) => {
+      if (pathname.includes('/deployments?')) return [{ id: 1 }];
+      if (pathname.includes('/statuses?')) return [{ state: 'success' }];
+      return { state: 'success' };
+    };
 
     await expect(deactivatePreviewDeployments({ request, repository, pr }))
       .rejects.toThrow(/did not report inactive/);
+  });
+
+  it('leaves a card GitHub already auto-inactivated alone', async () => {
+    const calls = [];
+    const request = async (pathname) => {
+      calls.push(pathname);
+      if (pathname.includes('/deployments?')) return [{ id: 1 }, { id: 2 }];
+      if (pathname.includes('/deployments/1/statuses?')) return [{ state: 'inactive' }];
+      if (pathname.includes('/statuses?')) return [];
+      return { state: 'inactive' };
+    };
+
+    const inactivated = await deactivatePreviewDeployments({ request, repository, pr });
+
+    expect(inactivated).toEqual([2]);
+    expect(calls.filter((pathname) => pathname.endsWith('/statuses'))).toEqual([
+      `/repos/${repository}/deployments/2/statuses`,
+    ]);
   });
 
   it('refuses a non-HTTPS log URL rather than writing it onto a card', async () => {

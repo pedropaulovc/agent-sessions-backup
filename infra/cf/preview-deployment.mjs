@@ -80,10 +80,20 @@ async function listPreviewDeployments(request, context) {
   fail(`GitHub deployment list exceeded ${MAX_DEPLOYMENT_PAGES} pages`);
 }
 
+async function latestDeploymentState(request, context, id) {
+  const rows = await request(`/repos/${context.repository}/deployments/${id}/statuses?per_page=1`);
+  if (!Array.isArray(rows)) fail('GitHub deployment status list response must be an array');
+  return rows[0]?.state ?? null;
+}
+
 /**
  * Mark every card in a PR's preview environment inactive, after its Cloudflare resources were
  * removed. Every page is walked: a first-page-only read leaves older cards advertising a URL
  * that no longer resolves.
+ *
+ * A long-lived PR accumulates one card per CI run, and GitHub already auto-inactivates the
+ * earlier ones when a new deployment succeeds. Reading each card's current state first turns an
+ * N-write sweep into roughly one write — status writes are what GitHub secondary-rate-limits.
  */
 export async function deactivatePreviewDeployments({
   request,
@@ -97,6 +107,7 @@ export async function deactivatePreviewDeployments({
   const inactiveDeploymentIds = [];
   for (const deployment of await listPreviewDeployments(request, context)) {
     const id = deploymentId(deployment?.id);
+    if (await latestDeploymentState(request, context, id) === 'inactive') continue;
     await postDeploymentStatus(request, context, id, 'inactive', description, deploymentLogUrl);
     inactiveDeploymentIds.push(id);
   }

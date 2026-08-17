@@ -38,6 +38,7 @@ const WRANGLER_USERNAME = 'pedro@vezza.com.br';
 const WORKERS_DEV_SUBDOMAIN = 'agent-sessions-nonproduction';
 const TOKEN_NAME = 'agent-sessions-preview-control';
 const TOKEN_DAYS = 90;
+const MAX_ACCOUNT_PAGES = 20;
 
 /**
  * Exactly what the preview job does with the token, and nothing else. Wrangler's OAuth scopes
@@ -53,7 +54,6 @@ const WRANGLER_SCOPES = [
   'workers_kv:write',
   'd1:write',
   'queues:write',
-  'workers_tail:read',
 ];
 
 const TOKEN_PERMISSION_GROUPS = [
@@ -63,7 +63,6 @@ const TOKEN_PERMISSION_GROUPS = [
   'Workers R2 Storage Write',
   'Queues Write',
   'Account Settings Read',
-  'Workers Tail Read',
 ];
 
 const REPOSITORY_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
@@ -182,10 +181,24 @@ function wranglerOauthToken() {
  * whatever identity signed in must be able to see the preview account and must NOT be able to
  * see production. A token that can reach both accounts is disqualified here, not in CI.
  */
+async function listAllAccounts(token, label) {
+  const rows = [];
+  for (let page = 1; page <= MAX_ACCOUNT_PAGES; page += 1) {
+    const accounts = await cloudflare(token, `/accounts?per_page=50&page=${page}`);
+    if (!accounts.ok) fail(`${label} could not list its accounts (HTTP ${accounts.status})`);
+    const batch = Array.isArray(accounts.body.result) ? accounts.body.result : [];
+    rows.push(...batch);
+    const total = accounts.body.result_info?.total_count;
+    if (batch.length === 0) return rows;
+    if (typeof total === 'number' && rows.length >= total) return rows;
+  }
+  // A refusal gate that silently stops reading is a gate that can be walked around.
+  fail(`${label} has more than ${MAX_ACCOUNT_PAGES * 50} accounts — refusing to judge a partial list`);
+  return rows;
+}
+
 async function assertNonProductionMembership(token, label) {
-  const accounts = await cloudflare(token, '/accounts?per_page=50');
-  if (!accounts.ok) fail(`${label} could not list its accounts (HTTP ${accounts.status})`);
-  const rows = Array.isArray(accounts.body.result) ? accounts.body.result : [];
+  const rows = await listAllAccounts(token, label);
   const production = rows.find((row) => row.id === PRODUCTION_ACCOUNT_ID);
   if (production) fail(`${label} can reach the PRODUCTION account (${production.name}) — refusing`);
   const preview = rows.find((row) => row.id === PREVIEW_ACCOUNT_ID);
@@ -249,11 +262,18 @@ function ghVariableNames() {
  */
 function wslSeed() {
   if (!process.env.WSL_DISTRO_NAME) return null;
-  for (const home of globSync('/mnt/*/Users/*/.config/agent-sessions/preview-seed')) {
-    const value = readFileSync(home, 'utf8').trim();
-    if (value.length >= 32) return value;
+  const found = new Map();
+  for (const file of globSync('/mnt/*/Users/*/.config/agent-sessions/preview-seed')) {
+    const value = readFileSync(file, 'utf8').trim();
+    if (value.length >= 32) found.set(value, file);
   }
-  return null;
+  // Picking by glob order across several Windows profiles could publish a seed the owner's
+  // machines do not hold, and every open preview URL would stop authenticating at once.
+  if (found.size > 1) {
+    fail(`found ${found.size} different preview seeds under /mnt (${[...found.values()].join(', ')})`
+      + ' — pass --seed-file to say which one is the real seed');
+  }
+  return found.keys().next().value ?? null;
 }
 
 function requireSeed(seedFile) {

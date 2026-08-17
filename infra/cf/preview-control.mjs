@@ -49,31 +49,59 @@ const previewToken = process.env.CLOUDFLARE_PPE_API_TOKEN;
 
 const MIGRATION_LEDGER_KEY = 'preview_migration_files';
 
+// An empty credential means the repository was never provisioned, not that the code is wrong,
+// so say which value is missing and which command installs it rather than failing bare.
+const PROVISION_HINT = 'run `node infra/cf/preview-token.mjs --set` (fork PRs never receive these)';
+
 function requireCloudflareEnvironment() {
+  if (!previewAccountId) fail(`repository variable CLOUDFLARE_PPE_ACCOUNT_ID is empty — ${PROVISION_HINT}`);
   assertPreviewAccount(previewAccountId);
-  if (!previewToken) fail('CLOUDFLARE_PPE_API_TOKEN is required');
+  if (!previewToken) fail(`repository secret CLOUDFLARE_PPE_API_TOKEN is empty — ${PROVISION_HINT}`);
 }
 
 function requireBearerSeed() {
   const seed = process.env.PREVIEW_BEARER_SEED;
-  if (typeof seed !== 'string' || seed.trim().length < 32) fail('PREVIEW_BEARER_SEED is required (>= 32 characters)');
+  if (typeof seed !== 'string' || seed.trim().length < 32) {
+    fail(`repository secret PREVIEW_BEARER_SEED is missing or under 32 characters — ${PROVISION_HINT}`);
+  }
   return seed;
 }
 
+const GITHUB_RETRY_STATUS = new Set([403, 429, 500, 502, 503, 504]);
+const GITHUB_ATTEMPTS = 5;
+
+function retryDelayMs(response, attempt) {
+  const retryAfter = Number(response.headers.get('retry-after'));
+  if (Number.isFinite(retryAfter) && retryAfter > 0) return Math.min(retryAfter, 60) * 1000;
+  return Math.min(2 ** attempt, 30) * 1000;
+}
+
+/**
+ * The janitor sweeps many PRs in one run, so a single secondary-rate-limit 403 partway through
+ * would leave every later PR's cards advertising a URL that no longer resolves. Back off and
+ * retry the statuses GitHub tells us to retry; fail loudly on anything else.
+ */
 async function github(pathname, init = {}) {
   const { allowNotFound = false, expectedStatus = null, ...fetchInit } = init;
   const token = process.env.GITHUB_TOKEN;
   if (!token) fail('GITHUB_TOKEN is required for GitHub state checks');
-  const response = await fetch(`https://api.github.com${pathname}`, {
-    ...fetchInit,
-    headers: {
-      accept: 'application/vnd.github+json',
-      authorization: `Bearer ${token}`,
-      'user-agent': 'sessions-preview-control',
-      'x-github-api-version': '2022-11-28',
-      ...fetchInit.headers,
-    },
-  });
+  let response;
+  for (let attempt = 0; attempt < GITHUB_ATTEMPTS; attempt += 1) {
+    response = await fetch(`https://api.github.com${pathname}`, {
+      ...fetchInit,
+      headers: {
+        accept: 'application/vnd.github+json',
+        authorization: `Bearer ${token}`,
+        'user-agent': 'sessions-preview-control',
+        'x-github-api-version': '2022-11-28',
+        ...fetchInit.headers,
+      },
+    });
+    if (!GITHUB_RETRY_STATUS.has(response.status) || attempt === GITHUB_ATTEMPTS - 1) break;
+    const delay = retryDelayMs(response, attempt);
+    process.stdout.write(`GitHub API ${pathname} returned ${response.status}; retrying in ${delay / 1000}s\n`);
+    await new Promise((resolve) => { setTimeout(resolve, delay); });
+  }
   if (allowNotFound && response.status === 404) return null;
   if (!response.ok || (expectedStatus != null && response.status !== expectedStatus)) {
     fail(`GitHub API ${pathname} failed with ${response.status}`);
@@ -379,6 +407,8 @@ async function provision() {
   const seed = requireBearerSeed();
   const sha = headSha(args['head-sha']);
   const hubRoot = path.resolve(args.hub ?? 'hub');
+  if (!args.wrangler) fail('--wrangler is required');
+  if (!args['migrations-cli']) fail('--migrations-cli is required');
   const wrangler = path.resolve(args.wrangler);
   const names = resourceNames(pr);
 

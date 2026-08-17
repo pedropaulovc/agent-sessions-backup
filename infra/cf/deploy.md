@@ -108,14 +108,15 @@ carry secrets:
 Provision and install all three with one command, which prints the identity and account to pick
 and fails if the signed-in identity can reach production:
 
-```
+```bash
 node infra/cf/preview-token.mjs --set     # `--set` omitted: report what is missing
 ```
 
 That account's workers.dev subdomain is `agent-sessions-nonproduction.workers.dev`. The token is
 restricted to this non-production account, expires after 90 days, and has Workers Scripts Write,
-Workers KV Storage Write, D1 Write, Workers R2 Storage Write, Queues Write, Account Settings
-Read, and Workers Tail Read. Rotate it before expiry by re-running the command above.
+Workers KV Storage Write, D1 Write, Workers R2 Storage Write, Queues Write, and Account Settings
+Read — nothing tails, so there is no Workers Tail Read. Rotate it before expiry by re-running the
+command above.
 
 Account membership is the authorization boundary, not an email string in repository code.
 Operationally, `pedro@vza.net` owns/administers the production account and
