@@ -102,6 +102,12 @@ Configure the protected GitHub `preview-control` environment with:
 - secrets `CLOUDFLARE_API_TOKEN` and `PREVIEW_BEARER_SEED` (>= 32 random characters);
 - variable `CLOUDFLARE_ACCOUNT_ID=cbb04a26e6fa2d0cdc4eb67c735e5669`.
 
+Under **Deployment branches and tags**, select **Selected branches and tags** and allow the
+exact branch `main` only. Do not use protected-branches mode, wildcards, tags, PR refs, or
+PR-head branches: this environment holds the control-plane credentials. Run manual `Preview
+Control`, `Preview Close`, and `Preview Janitor` dispatches from `main`; close events are
+trusted only for PRs targeting `main`.
+
 That account's workers.dev subdomain is `agent-sessions-nonproduction.workers.dev`. The
 account-owned token is restricted to this non-production account, expires after 90 days, and has
 Workers Scripts Write, Workers KV Storage Write, D1 Write, Workers R2 Storage Write, Queues
