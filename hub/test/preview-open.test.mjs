@@ -9,6 +9,7 @@ import {
   previewSeedPath,
   previewUrl,
   readPreviewSeed,
+  wslPreviewSeeds,
 } from '../scripts/preview-open.mjs';
 import { previewBearerToken } from '../../infra/cf/preview-trust.mjs';
 
@@ -47,6 +48,61 @@ test('seed resolution prefers the environment and falls back to the seed file', 
     SEED,
   );
   assert.equal(readPreviewSeed({}, () => { throw new Error('ENOENT'); }), null);
+});
+
+test('under WSL the seed is found on the Windows side, where it actually lives', () => {
+  const wsl = { WSL_DISTRO_NAME: 'Ubuntu' };
+  const missingHome = (path) => { if (path === previewSeedPath()) throw new Error('ENOENT'); return `${SEED}\n`; };
+  const ownProfile = () => ['/mnt/c/Users/pedro/.config/agent-sessions/preview-seed'];
+
+  assert.equal(readPreviewSeed(wsl, missingHome, ownProfile, 'pedro'), SEED);
+  // The same profile mounted on two drives is not ambiguous.
+  assert.equal(
+    readPreviewSeed(wsl, missingHome, () => [
+      '/mnt/c/Users/pedro/.config/agent-sessions/preview-seed',
+      '/mnt/d/Users/pedro/.config/agent-sessions/preview-seed',
+    ], 'pedro'),
+    SEED,
+  );
+  // Without WSL the mounts are not consulted at all.
+  assert.equal(readPreviewSeed({}, missingHome, ownProfile, 'pedro'), null);
+  // Too short to derive a bearer, so it is not a seed.
+  const shortOnMounts = (path) => {
+    if (path === previewSeedPath()) throw new Error('ENOENT');
+    return 'short';
+  };
+  assert.equal(readPreviewSeed(wsl, shortOnMounts, ownProfile, 'pedro'), null);
+});
+
+test('never reads a seed out of another Windows profile', () => {
+  // A box can carry several readable profiles (a second user, sandbox accounts). Deriving a
+  // bearer from their seed would be borrowing their credential, not finding ours.
+  const wsl = { WSL_DISTRO_NAME: 'Ubuntu' };
+  const missingHome = (path) => { if (path === previewSeedPath()) throw new Error('ENOENT'); return `${SEED}\n`; };
+  const foreign = () => [
+    '/mnt/c/Users/CodexSandboxOffline/.config/agent-sessions/preview-seed',
+    '/mnt/c/Users/WsiAccount/.config/agent-sessions/preview-seed',
+  ];
+
+  assert.deepEqual(wslPreviewSeeds(wsl, missingHome, foreign, 'pedro'), []);
+  assert.equal(readPreviewSeed(wsl, missingHome, foreign, 'pedro'), null);
+});
+
+test('refuses to guess when the caller\'s own profiles hold different seeds', () => {
+  // Guessing here publishes a bearer nobody else derives: every open preview URL breaks at once.
+  const seeds = {
+    '/mnt/c/Users/pedro/.config/agent-sessions/preview-seed': 'a'.repeat(48),
+    '/mnt/d/Users/pedro/.config/agent-sessions/preview-seed': 'b'.repeat(48),
+  };
+  assert.throws(
+    () => readPreviewSeed(
+      { WSL_DISTRO_NAME: 'Ubuntu' },
+      (path) => seeds[path] ?? (() => { throw new Error('ENOENT'); })(),
+      () => Object.keys(seeds),
+      'pedro',
+    ),
+    /2 different preview seeds/,
+  );
 });
 
 test('enforces Node 22.13 or newer', () => {

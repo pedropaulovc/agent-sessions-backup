@@ -24,8 +24,8 @@ placed inside the Worker is likewise PR-controlled and can simply be deleted.
 application resources (workers, D1, R2, queues) — and that is what shipped. The
 2026-08-01 decision to defer it was SUPERSEDED on 2026-08-04 (PRs #83–#116): previews
 now run in a dedicated non-production account (`cbb04a26…`, identity
-pedro@vezza.com.br with no production membership), provisioned only by the protected
-`Preview Control` workflow; the Workers Builds previews this note originally described
+pedro@vezza.com.br with no production membership), provisioned by the PR's own
+`preview` CI job; the Workers Builds previews this note originally described
 are retired. (2026-08-13: the production-account front door + Cloudflare Access that
 briefly fronted these previews was retired too — previews are now self-contained at
 `pr-<n>-app.agent-sessions-nonproduction.workers.dev` behind a derived per-PR bearer.)

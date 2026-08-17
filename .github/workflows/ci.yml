@@ -113,6 +113,95 @@ jobs:
       - run: uv sync
       - run: uv run pytest
 
+  # Each PR builds, migrates, and deploys its own preview from its own checkout, in its own job.
+  # There is no trust barrier to enforce and therefore no release handoff: the credential is
+  # scoped to a throwaway non-production Cloudflare account whose entire contents are pr-N-*
+  # resources, so any PR author can safely deploy their own branch. That removes the artifact,
+  # provenance, and re-verification machinery a workflow_run controller needed.
+  #
+  # `environment:` IS the deployment record. GitHub opens the preview/pr-N deployment when this
+  # job starts and closes it with this job's own conclusion, so the PR can never show a state the
+  # workflow is not actually in — and because the job runs on the pull_request event, the run is
+  # a check on the PR rather than an orphaned run attached to main.
+  #
+  # Fork PRs get no secrets from GitHub, so this job fails there rather than skipping: a preview
+  # that silently does not exist is worse than one that says why.
+  preview:
+    if: github.event_name == 'pull_request'
+    needs: hub
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: preview/pr-${{ github.event.number }}
+      # The stable per-PR hostname from resourceNames() in infra/cf/preview-trust.mjs. Declared
+      # statically so the card links somewhere from the first second, and because the preview is
+      # deployed in place: on a failed run the link still reaches the previous good deploy.
+      url: https://pr-${{ github.event.number }}-app.agent-sessions-nonproduction.workers.dev
+    concurrency:
+      group: preview-pr-${{ github.event.number }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.2
+          cache: npm
+          cache-dependency-path: hub/package-lock.json
+      - run: npm --prefix hub ci
+      - name: Install Chromium
+        run: npx --prefix hub playwright install --with-deps chromium
+      - name: Provision, migrate, and deploy the preview
+        id: provision
+        env:
+          CLOUDFLARE_PPE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_PPE_ACCOUNT_ID }}
+          CLOUDFLARE_PPE_API_TOKEN: ${{ secrets.CLOUDFLARE_PPE_API_TOKEN }}
+          PREVIEW_BEARER_SEED: ${{ secrets.PREVIEW_BEARER_SEED }}
+          # Bound as environment variables, never interpolated into the shell command: this job
+          # holds credentials, so an expansion must stay inert data even if it ever came to carry
+          # shell metacharacters.
+          PR_NUMBER: ${{ github.event.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: >-
+          node infra/cf/preview-control.mjs provision
+          --repository "$GITHUB_REPOSITORY"
+          --pr "$PR_NUMBER"
+          --head-sha "$HEAD_SHA"
+          --account-id "$CLOUDFLARE_PPE_ACCOUNT_ID"
+          --hub hub
+          --wrangler hub/node_modules/wrangler/bin/wrangler.js
+          --migrations-cli hub/scripts/migrations.mjs
+          --github-output "$GITHUB_OUTPUT"
+      - name: Verify diagnostics and the bearer gate
+        env:
+          PREVIEW_BEARER_SEED: ${{ secrets.PREVIEW_BEARER_SEED }}
+          PR_NUMBER: ${{ github.event.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          ARTIFACT_DIGEST: ${{ steps.provision.outputs.artifact_digest }}
+          SCHEMA_DIGEST: ${{ steps.provision.outputs.schema_digest }}
+        run: >-
+          node infra/cf/preview-control.mjs smoke
+          --repository "$GITHUB_REPOSITORY"
+          --pr "$PR_NUMBER"
+          --head-sha "$HEAD_SHA"
+          --artifact-digest "$ARTIFACT_DIGEST"
+          --schema-digest "$SCHEMA_DIGEST"
+      - name: Seed deterministic fixtures through the collector upload path
+        env:
+          PREVIEW_BEARER_SEED: ${{ secrets.PREVIEW_BEARER_SEED }}
+          PR_NUMBER: ${{ github.event.number }}
+        run: >-
+          node infra/cf/preview-control.mjs seed
+          --repository "$GITHUB_REPOSITORY"
+          --pr "$PR_NUMBER"
+      - name: Run synthetic remote browser smoke
+        env:
+          BASE_URL: ${{ steps.provision.outputs.url }}
+          PREVIEW_BEARER_SEED: ${{ secrets.PREVIEW_BEARER_SEED }}
+        run: npm --prefix hub run test:e2e
 
   # Migrate D1, then deploy the hub Worker on merge to main. This is the SOLE deployer:
   # Cloudflare Workers Builds auto-deploy is turned OFF so nothing races us. Applying migrations

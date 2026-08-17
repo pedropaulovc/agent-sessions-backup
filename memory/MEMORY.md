@@ -8,4 +8,4 @@
 - [Alert KQL doesn't auto-deploy](alert-kql-manual-apply.md) — editing infra/azure/alerts/*.kql needs a manual provision.sh or surgical az update; how to apply one alert + diagnose what fired
 - [Reading D1 usage and cost](d1-usage-and-billing.md) — billing REST 403s with the wrangler token; use GraphQL analytics. Rows WRITTEN is the binding quota; ~9.4 billed rows per block
 - [wrangler d1 query gotchas](wrangler-d1-query-gotchas.md) — D1 lives under production 18ef3246 (owner-at-keyboard identity, post-split); run from `hub/`; `--file` returns batch stats, only `--command` returns rows
-- [D1 preview/prod isolation limits](d1-preview-isolation.md) — D1 tokens are account-scoped (no per-db resource), no workload identity federation; only a separate account truly isolates — which shipped 2026-08 (Preview Control on the non-production account)
+- [D1 preview/prod isolation limits](d1-preview-isolation.md) — D1 tokens are account-scoped (no per-db resource), no workload identity federation; only a separate account truly isolates — which shipped 2026-08 (per-PR previews on the non-production account)

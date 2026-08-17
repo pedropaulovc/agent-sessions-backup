@@ -19,14 +19,13 @@ jobs:
   clean-preview-resources:
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    environment: preview-control
     permissions:
       contents: read
       pull-requests: read
     outputs:
       closed_prs: ${{ steps.janitor.outputs.closed_prs }}
     steps:
-      - name: Check out trusted default-branch janitor
+      - name: Check out default-branch janitor
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.repository.default_branch }}
@@ -37,13 +36,13 @@ jobs:
       - name: Sweep closed-PR environments and legacy debris
         id: janitor
         env:
-          CLOUDFLARE_PREVIEW_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_PREVIEW_CONTROL_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_PPE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_PPE_ACCOUNT_ID }}
+          CLOUDFLARE_PPE_API_TOKEN: ${{ secrets.CLOUDFLARE_PPE_API_TOKEN }}
           GITHUB_TOKEN: ${{ github.token }}
         run: >-
           node infra/cf/preview-control.mjs janitor
           --repository "$GITHUB_REPOSITORY"
-          --account-id "$CLOUDFLARE_PREVIEW_ACCOUNT_ID"
+          --account-id "$CLOUDFLARE_PPE_ACCOUNT_ID"
           --github-output "$GITHUB_OUTPUT"
 
   # This no-secret follow-up avoids a matrix fan-out limit while preserving one auditable
@@ -60,7 +59,7 @@ jobs:
       contents: read
       deployments: write
     steps:
-      - name: Check out trusted default-branch deployment-card code
+      - name: Check out default-branch deployment-card code
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.repository.default_branch }}
