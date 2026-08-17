@@ -13,7 +13,7 @@ row of this table — never a choice:
 | identity | account | holds | used for |
 |---|---|---|---|
 | `pedro@vza.net` | **production** `18ef3246e9f36d1560485ef53889c0ab` | the live hub (`sessions.vza.net` / `api.sessions.vza.net`), production D1/R2/Queues, the managed CA | production deploys (protected, `main`-only CI), production secrets (`wrangler secret put` after `whoami` shows this account), zone administration |
-| `pedro@vezza.com.br` | **non-production** `cbb04a26e6fa2d0cdc4eb67c735e5669` (workers.dev subdomain `agent-sessions-nonproduction`) | per-PR self-contained previews (`pr-<n>-*` Worker + D1/R2/KV/Queues) — no production resource, credential, or data | the `Preview Control` workflow (via the account-scoped token below), and exceptional hand-run preview administration (scoped `wrangler login` per AGENTS.md) |
+| `pedro@vezza.com.br` | **non-production** `cbb04a26e6fa2d0cdc4eb67c735e5669` (workers.dev subdomain `agent-sessions-nonproduction`) | per-PR self-contained previews (`pr-<n>-*` Worker + D1/R2/KV/Queues) — no production resource, credential, or data | the `preview` job in CI (via the account-scoped token below), and exceptional hand-run preview administration (scoped `wrangler login` per AGENTS.md) |
 
 Rules that follow from the table:
 
@@ -32,56 +32,54 @@ Rules that follow from the table:
 - Local development uses **neither**: the loopback hub (`npm --prefix hub run dev:up`)
   needs zero Wrangler scopes and no Cloudflare login.
 
-## Trusted per-PR preview controller
+## Per-PR previews, deployed by the PR's own CI run
 
-The default-branch `Preview Control` workflow is the only PR resource allocator. Its
-unprivileged build job checks out the exact successful CI head, installs dependencies with
-lifecycle scripts disabled, and bundles under a network namespace using the trusted Wrangler
-and generated configuration. Only canonical bundle, migration, content, and provenance
-manifests cross into the `preview-control` environment.
+**A PR environment is safe for anyone to deploy, so nobody hands a release across a trust
+barrier to deploy it.** The `preview` job in `.github/workflows/ci.yml` runs on `pull_request`
+from the PR's own checkout and does the whole thing in one job: build, migrate, deploy, smoke,
+seed, browser e2e. It needs `needs: hub`, so a PR whose tests or migration check fail never
+reaches Cloudflare.
 
-The credentialed provision job never checks out or executes the PR. It generates every name
-and binding, rejects the production account and known production resource IDs, and deploys
-each PR's **self-contained preview in place**: one stable Worker `pr-<number>-app`, publicly
-reachable at `https://pr-<number>-app.agent-sessions-nonproduction.workers.dev`, backed by
-persistent `pr-<number>-{sessions-index,agent-sessions,sessions-hub-kv,parse,parse-dlq}`
+The credential it holds is scoped to a Cloudflare account whose entire contents are `pr-<n>-*`
+resources — no production data, route, credential, or application secret, and no path to any.
+That is what makes the barrier unnecessary, and it is the only thing that does. Everything the
+job still refuses (the pinned account ID, the production-identifier scan over every generated
+config, the `pr-<n>-` name prefix on every resource) guards against a **misconfiguration** —
+a wrong account ID, a copy-pasted production resource name — not against the PR author.
+
+Each PR gets a **self-contained preview deployed in place**: one stable Worker `pr-<number>-app`,
+publicly reachable at `https://pr-<number>-app.agent-sessions-nonproduction.workers.dev`, backed
+by persistent `pr-<number>-{sessions-index,agent-sessions,sessions-hub-kv,parse,parse-dlq}`
 resources created if missing and reused across pushes. There is no front door, no Cloudflare
 Access, and no blue/green generation machinery — the deploy IS the promote, so a broken push
 briefly breaks that PR's preview until the next one.
 
-The trusted default-branch `Preview Queue` workflow runs on `pull_request_target` for an opened,
-synchronized, or reopened **same-repository** PR. It neither checks out nor executes PR code. It
-validates the live PR head and its own trusted workflow run before and after creating a transient
-GitHub deployment in `preview/pr-<number>`, attached to that immutable PR SHA with a `queued`
-status. Queue events do not serialize: an obsolete event cannot delay the current head. A queue
-job that arrives after matching CI completed verifies its exact card and source run, then uses its
-otherwise no-secret `actions: write` grant to dispatch the trusted default-branch controller with
-those values as data.
+**The deployment card is GitHub's, not ours.** The job declares
+`environment: { name: preview/pr-<number>, url: … }`, so Actions opens the deployment when the
+job starts and closes it with the job's own conclusion. The card cannot claim a state the
+workflow is not in, there is nothing to claim, reconcile, supersede, or terminalize, and because
+the job runs on the `pull_request` event the run is a check on the PR rather than an orphaned
+run attached to `main`. Fork PRs receive no secrets from GitHub, so the job fails there rather
+than skipping: a preview that silently does not exist is worse than one that says why.
 
-`Preview Control` validates the source run and live head again, then claims the exact queued card
-by strict announcement provenance **before** the isolated build. Its `in_progress` card is the
-durable per-head lock: a normal and recovered controller cannot provision the same SHA twice, and
-any duplicate queued card becomes inactive. A failed `in_progress` write triggers one no-secret
-same-run claim retry before build; it resumes only a card whose status belongs to that controller.
-A missing direct card still blocks the original controller, but the validated late queue path
-dispatches a retry rather than leaving a successful CI unprovisioned. A no-secret rejection path
-turns queued or unstatused cards into `failure` when CI does not succeed; a successful controller
-completes the exact card after remote smoke, then retires older verified cards.
-Queued, claimed, failed-to-provision, cancelled, and skipped cards omit the preview URL; a URL is
-published only after provisioning succeeds, including a terminal smoke failure or cancellation.
-Close, stale-head, and janitor follow-ups mark applicable cards
-inactive after resource removal. Only trusted no-secret jobs hold `deployments: write`; CI never
-receives it.
+The single exception is **removal**, which is not a job conclusion: the resources are deleted
+long after the run that created them ended. `Preview Close` and `Preview Janitor` therefore hold
+`deployments: write` and mark that PR's cards inactive after the Cloudflare delete succeeds.
 
 **Auth is one derived per-PR bearer.** `PREVIEW_BEARER = HMAC-SHA256(seed, "sessions-preview-bearer:pr-<n>")`
 is baked into the Worker as its only gate; browsers mint a session cookie by visiting
 `/?token=…` (what `preview:open` prints), agents and CI send `Authorization: Bearer`. Every
-principal derives the token independently from the `PREVIEW_BEARER_SEED` secret (GitHub
-environment + `~/.config/agent-sessions/preview-seed` on the owner's machines), so the public
-repo never moves a secret through logs, artifacts, or job outputs. The Worker holds only the
-derived token: leaking one preview's token compromises that one disposable preview, never the
-seed. The URL pattern is guessable, so the token is the entire gate — acceptable because a
-preview holds only synthetic fixtures and sessions the owner deliberately exported.
+principal derives the token independently from the `PREVIEW_BEARER_SEED` secret (repository
+secret + `~/.config/agent-sessions/preview-seed` on the owner's machines), so the public repo
+never moves a secret through logs or job outputs. The Worker holds only the derived token:
+reading one preview's Worker vars exposes that one disposable preview, not the seed. The URL
+pattern is guessable, so the token is the entire gate — acceptable because a preview holds only
+synthetic fixtures and sessions the owner deliberately exported.
+
+The seed is a **repository** secret, which means any same-repository branch can read the seed
+that derives every PR's bearer, not only its own. That is the same exposure as "any PR author
+can deploy a preview" — the deliberate trade this model makes — and it is bounded by what a
+preview holds. It is not a production credential and must never become one.
 
 **Migration divergence auto-reset.** Wrangler's D1 ledger tracks applied migrations by name
 only, so a PR that edits one of its own already-applied migration files would silently keep
@@ -89,25 +87,35 @@ the old schema in its persistent preview D1. The provisioner records each applie
 sha256 in the preview's `meta` table and, on divergence (edited bytes or a vanished applied
 name), deletes and recreates the D1 and reapplies from scratch — loudly, in the job log.
 Uploaded sessions vanish in that one case; re-uploading is one command. Manual full reset:
-dispatch `Preview Close` against the open PR; its no-secret follow-up queues a fresh reset card
-for that head, then re-run CI to claim and reprovision it. A manual dispatch against a closed PR
-still tears down resources and inactivates cards, but skips that reset queue.
+dispatch `Preview Close` against the open PR, then re-run CI — the next `preview` job
+reprovisions it empty.
 
 PR close and the scheduled janitor delete by deterministic name: close removes the
 `pr-<number>-*` set (detaching queue consumers, emptying R2 first); the janitor sweeps every
 resource of a closed PR plus any debris from the retired per-generation naming scheme.
 
-Configure the protected GitHub `preview-control` environment with:
+### Credentials
 
-- secrets `CLOUDFLARE_API_TOKEN` and `PREVIEW_BEARER_SEED` (>= 32 random characters);
-- variable `CLOUDFLARE_ACCOUNT_ID=cbb04a26e6fa2d0cdc4eb67c735e5669`.
+Three values at **repository** scope, because a dynamic `preview/pr-<n>` environment cannot
+carry secrets:
 
-That account's workers.dev subdomain is `agent-sessions-nonproduction.workers.dev`. The
-account-owned token is restricted to this non-production account, expires after 90 days, and has
-Workers Scripts Write, Workers KV Storage Write, D1 Write, Workers R2 Storage Write, Queues
-Write, Account Settings Read, and Workers Tail Read. Rotate it before expiry. PR-triggered jobs
-receive neither the token nor account administration access; only the provision job holds it
-(smoke holds just the bearer seed).
+| kind | name | value |
+|---|---|---|
+| secret | `CLOUDFLARE_PPE_API_TOKEN` | account-owned, non-production-only, 90-day |
+| secret | `PREVIEW_BEARER_SEED` | the standing seed, >= 32 random characters |
+| variable | `CLOUDFLARE_PPE_ACCOUNT_ID` | `cbb04a26e6fa2d0cdc4eb67c735e5669` |
+
+Provision and install all three with one command, which prints the identity and account to pick
+and fails if the signed-in identity can reach production:
+
+```
+node infra/cf/preview-token.mjs --set     # `--set` omitted: report what is missing
+```
+
+That account's workers.dev subdomain is `agent-sessions-nonproduction.workers.dev`. The token is
+restricted to this non-production account, expires after 90 days, and has Workers Scripts Write,
+Workers KV Storage Write, D1 Write, Workers R2 Storage Write, Queues Write, Account Settings
+Read, and Workers Tail Read. Rotate it before expiry by re-running the command above.
 
 Account membership is the authorization boundary, not an email string in repository code.
 Operationally, `pedro@vza.net` owns/administers the production account and
