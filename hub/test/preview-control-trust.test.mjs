@@ -31,6 +31,7 @@ import {
   wranglerWorkerBundle,
 } from '../../infra/cf/preview-trust.mjs';
 import {
+  awaitQueuedPreviewDeployment,
   claimPreviewDeployment,
   completePreviewDeployment,
   deactivatePreviewDeployments,
@@ -680,6 +681,105 @@ describe('PR-visible preview deployment cards', () => {
       deploymentId,
       ...controllerArgs(),
     })).resolves.toBeNull();
+  });
+
+  it('waits for Preview Control to finish the exact queued card', async () => {
+    const states = ['queued', 'in_progress', 'success'];
+    const waits = [];
+    let verificationCount = 0;
+    const request = async (pathname) => {
+      if (pathname === deploymentListPath()) return [queuedCard(deploymentId, currentCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [status(1, states.shift())];
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    const card = await awaitQueuedPreviewDeployment({
+      request,
+      verify: async () => { verificationCount += 1; },
+      verifyAnnouncement: async (runId) => { expect(runId).toBe(announcementRunId); },
+      deploymentId,
+      attempts: 3,
+      wait: async (attempt, attempts) => { waits.push([attempt, attempts]); },
+      ...queueArgs(),
+    });
+
+    expect(card).toEqual({
+      deploymentId,
+      state: 'success',
+      announcementRunId,
+      task: 'preview-announce',
+    });
+    expect(waits).toEqual([[1, 3], [2, 3]]);
+    expect(verificationCount).toBe(4);
+  });
+
+  it.each(['failure', 'error', 'inactive'])(
+    'fails the queue when Preview Control finishes with %s',
+    async (state) => {
+      const request = async (pathname) => {
+        if (pathname === deploymentListPath()) return [queuedCard(deploymentId, currentCreatedAt)];
+        if (pathname === statusListPath(deploymentId)) return [status(1, state)];
+        throw new Error(`unexpected request: ${pathname}`);
+      };
+
+      await expect(awaitQueuedPreviewDeployment({
+        request,
+        verify: async () => {},
+        verifyAnnouncement: async () => {},
+        deploymentId,
+        ...queueArgs(),
+      })).rejects.toThrow(`Preview Control did not succeed: deployment card is ${state}`);
+    },
+  );
+
+  it('follows a successful same-SHA card after duplicate cleanup retires its own card', async () => {
+    const replacementDeploymentId = 790;
+    const request = async (pathname) => {
+      if (pathname === deploymentListPath()) {
+        return [
+          queuedCard(deploymentId, currentCreatedAt),
+          queuedCard(replacementDeploymentId, newerCreatedAt, {
+            announcementRunId: announcementRunId + 1,
+          }),
+        ];
+      }
+      if (pathname === statusListPath(deploymentId)) return [status(1, 'inactive')];
+      if (pathname === statusListPath(replacementDeploymentId)) return [status(2, 'success')];
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(awaitQueuedPreviewDeployment({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
+      deploymentId,
+      ...queueArgs(),
+    })).resolves.toEqual({
+      deploymentId: replacementDeploymentId,
+      state: 'success',
+      announcementRunId: announcementRunId + 1,
+      task: 'preview-announce',
+    });
+  });
+
+  it('fails instead of succeeding while Preview Control remains in progress', async () => {
+    const waits = [];
+    const request = async (pathname) => {
+      if (pathname === deploymentListPath()) return [queuedCard(deploymentId, currentCreatedAt)];
+      if (pathname === statusListPath(deploymentId)) return [status(1, 'in_progress')];
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    await expect(awaitQueuedPreviewDeployment({
+      request,
+      verify: async () => {},
+      verifyAnnouncement: async () => {},
+      deploymentId,
+      attempts: 2,
+      wait: async (attempt, attempts) => { waits.push([attempt, attempts]); },
+      ...queueArgs(),
+    })).rejects.toThrow(/Preview Control did not finish before wait deadline/);
+    expect(waits).toEqual([[1, 2]]);
   });
 
   it('does not create a queue card when same-repository PR validation rejects a fork', async () => {

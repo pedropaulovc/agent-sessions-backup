@@ -386,6 +386,85 @@ export async function findPreviewAnnouncement({
     task: card.task,
   };
 }
+
+/**
+ * Wait for the controller to resolve the exact card published by a trusted queue run.
+ * If duplicate cleanup retires that card, wait for its same-SHA queue replacement instead.
+ * A successful queue must mean that its visible PR deployment is usable, rather than
+ * merely that the controller was scheduled.
+ */
+export async function awaitQueuedPreviewDeployment({
+  request,
+  verify,
+  verifyAnnouncement,
+  deploymentId: id,
+  attempts = 1,
+  wait = async () => {},
+  ...values
+}) {
+  const context = announcementContext(values);
+  const github = assertRequest(request);
+  const verifyCurrent = assertVerify(verify);
+  const verifyQueuedAnnouncement = assertVerify(
+    verifyAnnouncement,
+    'preview announcement verification function',
+  );
+  const targetId = deploymentId(id);
+  const completionAttempts = positiveAttemptCount(attempts);
+  const waitForCompletion = optionalCallback(wait, 'preview deployment completion wait callback');
+  const task = announcementTask(context.repository, context.workflowRef);
+  let found = false;
+  let lastState = null;
+
+  for (let attempt = 1; attempt <= completionAttempts; attempt += 1) {
+    await verifyCurrent();
+    const cards = await matchedAnnouncements({
+      request: github,
+      verifyAnnouncement: verifyQueuedAnnouncement,
+      ...announcementSearchContext(context),
+    });
+    const card = cards.find((candidate) => candidate.deploymentId === targetId);
+    if (card != null) {
+      found = true;
+      if (card.task !== task || card.announcementRunId !== context.announcementRunId) {
+        fail('preview deployment card does not belong to this queue run');
+      }
+      let outcome = card;
+      if (card.state === 'inactive') {
+        const replacement = cards.find((candidate) =>
+          candidate.deploymentId !== targetId
+          && candidate.task === task
+          && (candidate.state === 'in_progress' || candidate.state === 'success'));
+        if (replacement == null) fail('Preview Control did not succeed: deployment card is inactive');
+        outcome = replacement;
+      }
+      lastState = outcome.state;
+      if (outcome.state === 'success') {
+        await verifyCurrent();
+        return {
+          deploymentId: outcome.deploymentId,
+          state: outcome.state,
+          announcementRunId: outcome.announcementRunId,
+          task: outcome.task,
+        };
+      }
+      if (outcome.state === 'failure' || outcome.state === 'error' || outcome.state === 'inactive') {
+        fail(`Preview Control did not succeed: deployment card is ${outcome.state}`);
+      }
+      if (outcome.state != null
+        && outcome.state !== 'queued'
+        && outcome.state !== 'pending'
+        && outcome.state !== 'waiting'
+        && outcome.state !== 'in_progress') {
+        fail(`preview deployment card has an unknown state: ${outcome.state}`);
+      }
+    }
+    await waitForRetry(waitForCompletion, attempt, completionAttempts);
+  }
+
+  if (!found) fail('preview deployment card was not found before Preview Control wait deadline');
+  fail(`Preview Control did not finish before wait deadline: deployment card is ${lastState}`);
+}
 /**
  * Claim a card created by queuePreviewDeployment. A completed or already-claimed card is
  * returned as an idempotent no-op so a reconciler cannot redeploy an unchanged PR head.

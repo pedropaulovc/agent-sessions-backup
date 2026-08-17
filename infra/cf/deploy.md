@@ -54,7 +54,9 @@ synchronized, or reopened **same-repository** PR. It neither checks out nor exec
 validates the live PR head and its own trusted workflow run before and after creating a transient
 GitHub deployment in `preview/pr-<number>`, attached to that immutable PR SHA with a `queued`
 status. Queue events do not serialize: an obsolete event cannot delay the current head. A queue
-job that arrives after matching CI completed verifies its exact card and source run, then uses its
+job remains running until its exact card reaches `success`; a terminal `failure`, `error`, or
+`inactive` card, or the bounded controller wait expiring, fails the queue instead. A queue job
+that arrives after matching CI completed verifies its exact card and source run, then uses its
 otherwise no-secret `actions: write` grant to dispatch the trusted default-branch controller with
 those values as data.
 

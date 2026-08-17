@@ -38,6 +38,7 @@ import {
   writeCanonicalJson,
 } from './preview-trust.mjs';
 import {
+  awaitQueuedPreviewDeployment,
   claimPreviewDeployment,
   completePreviewDeployment,
   deactivatePreviewDeployments,
@@ -67,6 +68,9 @@ const MIGRATION_LEDGER_KEY = 'preview_migration_files';
 
 const CARD_DISCOVERY_ATTEMPTS = 80;
 const CARD_DISCOVERY_DELAY_MS = 3_000;
+const PREVIEW_COMPLETION_ATTEMPTS = 720;
+const PREVIEW_COMPLETION_DELAY_MS = 15_000;
+
 
 function requireCloudflareEnvironment() {
   assertPreviewAccount(previewAccountId);
@@ -475,6 +479,28 @@ async function reconcileQueuedDeploymentCard() {
     sourceRunId: source.id,
   })}\n`);
 }
+
+async function waitForQueuedDeploymentCard() {
+  const sha = headSha(args['head-sha']);
+  const queueRunId = positiveInteger(args['run-id'], 'preview announcement workflow run ID');
+  const id = positiveInteger(args['deployment-id'], 'GitHub deployment ID');
+  assertTrustedPreviewQueueWorkflowRef(repository, args['workflow-ref']);
+  const card = await awaitQueuedPreviewDeployment({
+    request: github,
+    verify: queueVerifier(sha, queueRunId),
+    verifyAnnouncement: assertPreviewAnnouncementRun,
+    deploymentId: id,
+    attempts: PREVIEW_COMPLETION_ATTEMPTS,
+    wait: () => new Promise((resolve) => setTimeout(resolve, PREVIEW_COMPLETION_DELAY_MS)),
+    repository,
+    pr,
+    sha,
+    announcementRunId: queueRunId,
+    workflowRef: args['workflow-ref'],
+  });
+  process.stdout.write(`${stableJson(card)}\n`);
+}
+
 async function claimDeploymentCard() {
   const sha = headSha(args['head-sha']);
   const sourceRunId = positiveInteger(args['source-run-id'], 'source workflow run ID');
@@ -1190,6 +1216,7 @@ async function janitor() {
 if (command === 'provision') await provision();
 else if (command === 'deployment-queue') await queueDeploymentCard();
 else if (command === 'deployment-reconcile') await reconcileQueuedDeploymentCard();
+else if (command === 'deployment-await') await waitForQueuedDeploymentCard();
 else if (command === 'deployment-reset-queue') await resetQueueDeploymentCard();
 else if (command === 'deployment-claim') await claimDeploymentCard();
 else if (command === 'deployment-reject') await rejectDeploymentCards();

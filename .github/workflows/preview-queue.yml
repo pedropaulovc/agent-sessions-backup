@@ -9,8 +9,8 @@ on:
 permissions: {}
 
 # Queue events validate the live head immediately before and after publishing. They intentionally
-# do not serialize: an obsolete event must not delay the current head. If CI already finished
-# before a delayed queue job starts, the trusted reconciler dispatches the same locked controller.
+# do not serialize: an obsolete event must not delay the current head. Each job then holds its
+# trusted queue card until Preview Control writes a terminal result for that exact card.
 
 jobs:
   queue:
@@ -18,7 +18,8 @@ jobs:
     # must not create a durable public deployment record for untrusted source.
     if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
-    timeout-minutes: 7
+    # Five minutes covers setup and reconciliation; the remainder bounds controller completion.
+    timeout-minutes: 185
     permissions:
       actions: write
       contents: read
@@ -58,6 +59,21 @@ jobs:
           DEPLOYMENT_ID: ${{ steps.publish.outputs.deployment_id }}
         run: >-
           node trusted/infra/cf/preview-control.mjs deployment-reconcile
+          --repository "$GITHUB_REPOSITORY"
+          --pr "$PR_NUMBER"
+          --head-sha "$HEAD_SHA"
+          --deployment-id "$DEPLOYMENT_ID"
+          --run-id "$GITHUB_RUN_ID"
+          --workflow-ref "$GITHUB_WORKFLOW_REF"
+      - name: Wait for Preview Control to resolve the queued deployment
+        if: success() && steps.publish.outputs.deployment_id != ''
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          DEPLOYMENT_ID: ${{ steps.publish.outputs.deployment_id }}
+        run: >-
+          node trusted/infra/cf/preview-control.mjs deployment-await
           --repository "$GITHUB_REPOSITORY"
           --pr "$PR_NUMBER"
           --head-sha "$HEAD_SHA"
