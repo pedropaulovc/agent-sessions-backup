@@ -447,11 +447,6 @@ test('journal recovery fails closed for wrong artifacts, corrupt checksums, and 
     migrationDigest: 'c'.repeat(64),
   };
   await openMigrationJournal(journalPath, identity);
-  await openMigrationJournal(path.join(directory, 'ppe.json'), {
-    ...identity,
-    target: 'ppe',
-    deploymentId: 'ppe:release-1',
-  });
   await assert.rejects(
     openMigrationJournal(journalPath, { ...identity, artifactDigest: 'd'.repeat(64) }),
     (error) => error instanceof AmbiguousJournalError && /different immutable artifact/.test(error.message),

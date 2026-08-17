@@ -6,7 +6,8 @@ on:
     branches: [main]
 
 # Least privilege for every job: checkout and the deploy job's current-main read only need
-# contents: read. Nothing in this workflow writes through the GitHub token.
+# contents: read. The preview job additionally grants pull-requests: write so it can publish
+# the disposable preview's derived login code in the PR.
 permissions:
   contents: read
 
@@ -133,14 +134,16 @@ jobs:
     timeout-minutes: 30
     environment:
       name: preview/pr-${{ github.event.number }}
-      # Reviewers enter through the shared PPE passkey page. The page derives the per-PR
-      # bearer and redirects to the stable direct workers.dev origin.
-      url: https://sessions.ppe.vza.net/pr?id=${{ github.event.number }}
+      # The stable per-PR hostname from resourceNames() in infra/cf/preview-trust.mjs. Declared
+      # statically so the card links somewhere from the first second, and because the preview is
+      # deployed in place: on a failed run the link still reaches the previous good deploy.
+      url: https://pr-${{ github.event.number }}-app.agent-sessions-nonproduction.workers.dev
     concurrency:
       group: preview-pr-${{ github.event.number }}
       cancel-in-progress: false
     permissions:
       contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -201,6 +204,23 @@ jobs:
           BASE_URL: ${{ steps.provision.outputs.url }}
           PREVIEW_BEARER_SEED: ${{ secrets.PREVIEW_BEARER_SEED }}
         run: npm --prefix hub run test:e2e
+      - name: Publish public preview login code
+        if: github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PREVIEW_BEARER_SEED: ${{ secrets.PREVIEW_BEARER_SEED }}
+          PR_NUMBER: ${{ github.event.number }}
+        run: |
+          set -euo pipefail
+          login_url="$(node hub/scripts/preview-open.mjs --pr "$PR_NUMBER" --print-only)"
+          case "$login_url" in
+            *\?token=*) login_code="${login_url##*\?token=}" ;;
+            *) echo "preview opener did not produce a tokenized login URL" >&2; exit 1 ;;
+          esac
+          {
+            printf 'Preview login code (public): %s\n\n' "$login_code"
+            printf 'Open preview: %s\n' "$login_url"
+          } | gh pr comment "$PR_NUMBER" --body-file -
 
   # Migrate D1, then deploy the hub Worker on merge to main. This is the SOLE deployer:
   # Cloudflare Workers Builds auto-deploy is turned OFF so nothing races us. Applying migrations
@@ -260,58 +280,3 @@ jobs:
         run: npx wrangler deploy --config wrangler.jsonc
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
-
-  # The shared passkey redirect page is a production-account Worker on the PPE custom domain.
-  # Keep its deployer separate from the per-PR preview job: the main-only production token cannot
-  # be read by an untrusted PR, while the preview token cannot mutate this Worker or its D1.
-  deploy-ppe:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: hub
-    runs-on: ubuntu-latest
-    environment: production
-    concurrency:
-      group: ppe-deploy
-      cancel-in-progress: false
-    defaults:
-      run:
-        working-directory: hub
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22.22.2
-          cache: npm
-          cache-dependency-path: hub/package-lock.json
-      - run: npm ci
-      - name: Reject a stale main deployment
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          current_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
-          if [[ "$current_head" != "$GITHUB_SHA" ]]; then
-            echo "Refusing stale PPE deployment: run=$GITHUB_SHA current=$current_head" >&2
-            exit 1
-          fi
-      - name: Apply PPE migrations exactly once
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
-        run: |
-          set -euo pipefail
-          artifact_digest="$(git archive --format=tar HEAD migrations-ppe | sha256sum | cut -d ' ' -f 1)"
-          node scripts/migrations.mjs apply \
-            --target ppe \
-            --config wrangler.ppe.jsonc \
-            --database sessions-ppe-index \
-            --migrations-dir migrations-ppe \
-            --manifest migrations-ppe/manifest.json \
-            --journal "$RUNNER_TEMP/ppe-migration-${GITHUB_SHA}.json" \
-            --artifact-digest "$artifact_digest" \
-            --deployment-id "ppe:${GITHUB_SHA}" \
-            --base-manifest migrations-ppe/source-baseline.json
-      - name: Deploy shared PPE redirect Worker
-        env:
-          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
-        run: npx wrangler deploy --config wrangler.ppe.jsonc

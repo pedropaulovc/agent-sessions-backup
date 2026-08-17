@@ -20,7 +20,7 @@ function journalChecksum(record) {
 }
 
 function validateIdentity(identity) {
-  if (!identity || !['local', 'e2e', 'preview', 'ppe', 'production'].includes(identity.target)) {
+  if (!identity || !['local', 'e2e', 'preview', 'production'].includes(identity.target)) {
     throw new Error('invalid migration journal target');
   }
   if (typeof identity.deploymentId !== 'string' || identity.deploymentId.length < 1 || identity.deploymentId.length > 256) {

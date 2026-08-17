@@ -57,10 +57,9 @@ authenticate:
    (`hub/src/router.ts`; development keeps cert reads for the local loop).
 
 Per-PR previews expose this same API at
-`https://pr-<n>.sessions-ppe.workers.dev`, authenticated by the
-derived per-PR bearer (`Authorization: Bearer …`; see `infra/cf/deploy.md`). Reviewers
-enter through `https://sessions.ppe.vza.net/pr?id=<n>`, which performs the passkey-gated
-redirect; the bearer acts as an admin machine identity there, which is what
+`https://pr-<n>-app.agent-sessions-nonproduction.workers.dev`, authenticated by the
+derived per-PR bearer (`Authorization: Bearer …`; see `infra/cf/deploy.md`) — the bearer
+acts as an admin machine identity there, which is what
 `hub/scripts/preview-upload-session.mjs` uses to push hand-carried session zips.
 
 ## Endpoints

@@ -12,8 +12,8 @@ row of this table — never a choice:
 
 | identity | account | holds | used for |
 |---|---|---|---|
-| `pedro@vza.net` | **production** `18ef3246e9f36d1560485ef53889c0ab` | the live hub (`sessions.vza.net` / `api.sessions.vza.net`), production D1/R2/Queues, the shared PPE Worker (`sessions.ppe.vza.net`), its isolated PPE D1, the managed CA | production deploys and shared PPE deploys (protected, `main`-only CI), production/shared-PPE secrets (`wrangler secret put` after `whoami` shows this account), zone administration |
-| `pedro@vezza.com.br` | **non-production** `cbb04a26e6fa2d0cdc4eb67c735e5669` (workers.dev subdomain `sessions-ppe`) | per-PR self-contained previews (`pr-<n>` Worker + D1/R2/KV/Queues) — no production resource, credential, or data | the `preview` job in CI (via the account-scoped token below), and exceptional hand-run preview administration (scoped `wrangler login` per AGENTS.md) |
+| `pedro@vza.net` | **production** `18ef3246e9f36d1560485ef53889c0ab` | the live hub (`sessions.vza.net` / `api.sessions.vza.net`), production D1/R2/Queues, the managed CA | production deploys (protected, `main`-only CI), production secrets (`wrangler secret put` after `whoami` shows this account), zone administration |
+| `pedro@vezza.com.br` | **non-production** `cbb04a26e6fa2d0cdc4eb67c735e5669` (workers.dev subdomain `agent-sessions-nonproduction`) | per-PR self-contained previews (`pr-<n>-*` Worker + D1/R2/KV/Queues) — no production resource, credential, or data | the `preview` job in CI (via the account-scoped token below), and exceptional hand-run preview administration (scoped `wrangler login` per AGENTS.md) |
 
 Rules that follow from the table:
 
@@ -40,22 +40,19 @@ from the PR's own checkout and does the whole thing in one job: build, migrate, 
 seed, browser e2e. It needs `needs: hub`, so a PR whose tests or migration check fail never
 reaches Cloudflare.
 
-The credential it holds is scoped to the non-production Cloudflare account containing only
-`pr-<n>-*` preview resources — no production resource, credential, data, route, or application
-secret. That is what makes the barrier unnecessary, and it is the only thing that does. Everything
-the job still refuses (the pinned account ID, the production-identifier scan over every generated
-config, the `pr-<n>-` name prefix on every per-PR resource) guards against a **misconfiguration** —
-a wrong account ID or a copy-pasted production resource name — not against the PR author.
+The credential it holds is scoped to a Cloudflare account whose entire contents are `pr-<n>-*`
+resources — no production data, route, credential, or application secret, and no path to any.
+That is what makes the barrier unnecessary, and it is the only thing that does. Everything the
+job still refuses (the pinned account ID, the production-identifier scan over every generated
+config, the `pr-<n>-` name prefix on every resource) guards against a **misconfiguration** —
+a wrong account ID, a copy-pasted production resource name — not against the PR author.
 
-Each PR gets a **self-contained preview deployed in place**: one stable Worker `pr-<number>`,
-publicly reachable at `https://pr-<number>.sessions-ppe.workers.dev`, backed
+Each PR gets a **self-contained preview deployed in place**: one stable Worker `pr-<number>-app`,
+publicly reachable at `https://pr-<number>-app.agent-sessions-nonproduction.workers.dev`, backed
 by persistent `pr-<number>-{sessions-index,agent-sessions,sessions-hub-kv,parse,parse-dlq}`
-resources created if missing and reused across pushes. Reviewers use the shared PPE page at
-`https://sessions.ppe.vza.net/pr?id=<number>`; it authenticates with a passkey, derives the
-per-PR bearer from `PREVIEW_BEARER_SEED`, and redirects to the direct preview origin. The
-direct origin remains available to CI and the session-upload command. There is no blue/green
-generation machinery — the deploy IS the promote, so a broken push briefly breaks that PR's
-preview until the next one.
+resources created if missing and reused across pushes. There is no front door, no Cloudflare
+Access, and no blue/green generation machinery — the deploy IS the promote, so a broken push
+briefly breaks that PR's preview until the next one.
 
 **The deployment card is GitHub's, not ours.** The job declares
 `environment: { name: preview/pr-<number>, url: … }`, so Actions opens the deployment when the
@@ -70,12 +67,14 @@ long after the run that created them ended. `Preview Close` and `Preview Janitor
 `deployments: write` and mark that PR's cards inactive after the Cloudflare delete succeeds.
 
 **Auth is one derived per-PR bearer.** `PREVIEW_BEARER = HMAC-SHA256(seed, "sessions-preview-bearer:pr-<n>")`
-is baked into the Worker as its only gate; the shared PPE page derives the same token only after
-the owner's passkey assertion. Agents and CI send `Authorization: Bearer`; a browser arriving
-from PPE follows the redirect and mints the preview session cookie. Every principal that needs
-the token derives it independently from the `PREVIEW_BEARER_SEED` secret (repository secret +
-`~/.config/agent-sessions/preview-seed` on the owner's machines), so the public repo never moves
-a secret through logs or job outputs. The PR card and `preview:open` URL contain no bearer.
+is baked into the Worker as its only gate; browsers mint a session cookie by visiting
+`/?token=…` (what `preview:open` prints), agents and CI send `Authorization: Bearer`. Every
+principal derives the token independently from the `PREVIEW_BEARER_SEED` secret (repository
+secret + `~/.config/agent-sessions/preview-seed` on the owner's machines). The `preview` job
+publishes the derived bearer as the public PR login code; it never publishes the seed. The Worker
+holds only the derived token: reading one preview's Worker vars exposes that one disposable
+preview, not the seed. The URL pattern is guessable, so the token is the entire gate — acceptable
+because a preview holds only synthetic fixtures and sessions the owner deliberately exported.
 
 The seed is a **repository** secret, which means any same-repository branch can read the seed
 that derives every PR's bearer, not only its own. That is the same exposure as "any PR author
@@ -106,13 +105,9 @@ carry secrets:
 | secret | `PREVIEW_BEARER_SEED` | the standing seed, >= 32 random characters |
 | variable | `CLOUDFLARE_PPE_ACCOUNT_ID` | `cbb04a26e6fa2d0cdc4eb67c735e5669` |
 
-The shared PPE Worker also needs its own `SETUP_TOKEN` secret. It is not a repository secret and
-must never be put in a PR URL or committed configuration; it only authorizes the first passkey
-registration at `/register?setup=…`. The PPE Worker is deployed to the production account by the
-protected `deploy-ppe` job, so the per-PR credential cannot mutate or read it.
+Provision and install all three with one command, which prints the identity and account to pick
+and fails if the signed-in identity can reach production:
 
-Provision and install the three repository values with one command, which prints the identity
-and account to pick and fails if the signed-in identity can reach production:
 ```bash
 node infra/cf/preview-token.mjs --set     # `--set` omitted: report what is missing
 ```
@@ -145,33 +140,12 @@ So: create the token by hand once, then `--set --token-file`. The script install
 account ID on its own, so the paste is the only thing left, and a 90-day account-pinned token beats
 a user-wide OAuth grant for CI anyway — it cannot follow the identity into a new account.
 
-That account's workers.dev subdomain is `sessions-ppe.workers.dev`. The token is restricted to
-this non-production account, expires after 90 days, and has Workers Scripts Write, Workers KV
-Storage Write, D1 Write, Workers R2 Storage Write, Queues Write, and Account Settings Read —
-nothing tails, so there is no Workers Tail Read. Rotate it before expiry by re-running the
+That account's workers.dev subdomain is `agent-sessions-nonproduction.workers.dev`. The token is
+restricted to this non-production account, expires after 90 days, and has Workers Scripts Write,
+Workers KV Storage Write, D1 Write, Workers R2 Storage Write, Queues Write, and Account Settings
+Read — nothing tails, so there is no Workers Tail Read. Rotate it before expiry by re-running the
 command above.
 
-
-### Shared PPE Worker
-
-Deploy `hub/src/ppe.ts` with `hub/wrangler.ppe.jsonc` as the production-account Worker named
-`sessions-ppe`, with the `sessions.ppe.vza.net` custom domain. Its dedicated D1 binding `DB`
-contains only the PPE credential, challenge, and migration-ledger tables from `hub/migrations-ppe`.
-Set `ENVIRONMENT=ppe`, `VIEWER_HOST=sessions.ppe.vza.net`, and do not bind the production hub's
-D1, KV, R2, queue, session-signing, or OAuth resources.
-
-Create the isolated D1 and secrets once while `wrangler whoami` shows the production account:
-```bash
-npx wrangler d1 create sessions-ppe-index --config hub/wrangler.ppe.jsonc
-npx wrangler secret put PREVIEW_BEARER_SEED --config hub/wrangler.ppe.jsonc
-npx wrangler secret put SETUP_TOKEN --config hub/wrangler.ppe.jsonc
-```
-The first secret is the same repository seed used to bake each per-PR bearer; `SETUP_TOKEN` is
-independent and must never be put in a PR URL or committed configuration. The protected
-`deploy-ppe` job applies migrations and deploys this Worker on `main`; its production-account
-credentials are unavailable to PR jobs. The first passkey is registered through
-`/register?setup=…`; after registration, `/pr?id=…` uses a fresh, PR-bound WebAuthn assertion
-and never creates a reusable PPE session.
 Account membership is the authorization boundary, not an email string in repository code.
 Operationally, `pedro@vza.net` owns/administers the production account and
 `pedro@vezza.com.br` is the non-production-only identity. Preview administration must verify the

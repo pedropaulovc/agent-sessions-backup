@@ -3,7 +3,7 @@ interface Env {
   RAW: R2Bucket;
   KV: KVNamespace;
   PARSE_QUEUE: Queue<HubQueueMessage>;
-  ENVIRONMENT: 'development' | 'preview' | 'production' | 'ppe';
+  ENVIRONMENT: 'development' | 'preview' | 'production';
   /** Local orchestration evidence; generated preview config also binds nonce and deployment digests. */
   ENVIRONMENT_ID?: string;
   ENVIRONMENT_NONCE?: string;
@@ -19,10 +19,6 @@ interface Env {
   PREVIEW_PR_NUMBER?: string;
   /** The per-PR preview bearer (HMAC-SHA256(seed, pr)) — preview's entire auth gate. */
   PREVIEW_BEARER?: string;
-  /** Standing seed held only by the shared PPE redirect Worker. */
-  PREVIEW_BEARER_SEED?: string;
-  /** Custom domain used by the shared PPE redirect Worker. */
-  PPE_VIEWER_HOST?: string;
   API_HOST: string;
   VIEWER_HOST: string;
   R2_DASHBOARD_BASE_URL: string;

@@ -35,7 +35,7 @@ const ACCOUNT_VARIABLE = 'CLOUDFLARE_PPE_ACCOUNT_ID';
 
 const WRANGLER_PROFILE = 'preview';
 const WRANGLER_USERNAME = 'pedro@vezza.com.br';
-const WORKERS_DEV_SUBDOMAIN = 'sessions-ppe';
+const WORKERS_DEV_SUBDOMAIN = 'agent-sessions-nonproduction';
 const PREVIEW_ACCOUNT_NAME = 'sessions-ppe-vza-net';
 const TOKEN_NAME = 'agent-sessions-preview-control';
 const TOKEN_DAYS = 90;
