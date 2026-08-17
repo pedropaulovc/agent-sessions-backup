@@ -26,9 +26,11 @@ application resources (workers, D1, R2, queues) — and that is what shipped. Th
 now run in a dedicated non-production account (`cbb04a26…`, identity
 pedro@vezza.com.br with no production membership), provisioned by the PR's own
 `preview` CI job; the Workers Builds previews this note originally described
-are retired. (2026-08-13: the production-account front door + Cloudflare Access that
-briefly fronted these previews was retired too — previews are now self-contained at
-`pr-<n>-app.agent-sessions-nonproduction.workers.dev` behind a derived per-PR bearer.)
+2026-08-13: the production-account front door + Cloudflare Access that briefly fronted these
+previews was retired. The current shared PPE page is a separate production-account Worker at
+`sessions.ppe.vza.net` with an isolated PPE D1; it passkey-authenticates and redirects to
+`pr-<n>.sessions-ppe.workers.dev` with the derived per-PR bearer. Its protected-main deploy
+credentials are separate from the non-production PR token.
 Current model: `infra/cf/deploy.md` ("Identities and accounts").
 
 See [[deploy-migrations-gap]] for who deploys what, and [[wrangler-d1-query-gotchas]]

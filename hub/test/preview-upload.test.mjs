@@ -77,13 +77,13 @@ test('rejects an unsafe --pr before deriving anything from it', () => {
 });
 
 test('builds the collector upload URL with per-segment encoding', () => {
-  const target = uploadTarget('https://pr-42-app.agent-sessions-nonproduction.workers.dev', {
+  const target = uploadTarget('https://pr-42.sessions-ppe.workers.dev', {
     machine: 'amet',
     store: 'export-inbox',
     relpath: 'a dir/export.abc#1.zip',
   });
   assert.equal(
     target,
-    'https://pr-42-app.agent-sessions-nonproduction.workers.dev/api/v1/files/amet/export-inbox/a%20dir/export.abc%231.zip',
+    'https://pr-42.sessions-ppe.workers.dev/api/v1/files/amet/export-inbox/a%20dir/export.abc%231.zip',
   );
 });

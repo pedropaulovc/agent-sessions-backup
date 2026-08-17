@@ -1,0 +1,13 @@
+{
+  "formatVersion": 1,
+  "hashEncoding": "sha256-canonical-lf",
+  "reservedSequences": [],
+  "ledgerStartsAt": 1,
+  "migrations": [
+    {
+      "sequence": 1,
+      "filename": "0001_ppe_auth.sql",
+      "sha256": "b322c327091e1fed7631c48b63a1fdf0488810b8563cb7bdbcd2c22aa7bbc573"
+    }
+  ]
+}

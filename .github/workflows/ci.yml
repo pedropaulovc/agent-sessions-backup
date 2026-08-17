@@ -133,10 +133,9 @@ jobs:
     timeout-minutes: 30
     environment:
       name: preview/pr-${{ github.event.number }}
-      # The stable per-PR hostname from resourceNames() in infra/cf/preview-trust.mjs. Declared
-      # statically so the card links somewhere from the first second, and because the preview is
-      # deployed in place: on a failed run the link still reaches the previous good deploy.
-      url: https://pr-${{ github.event.number }}-app.agent-sessions-nonproduction.workers.dev
+      # Reviewers enter through the shared PPE passkey page. The page derives the per-PR
+      # bearer and redirects to the stable direct workers.dev origin.
+      url: https://sessions.ppe.vza.net/pr?id=${{ github.event.number }}
     concurrency:
       group: preview-pr-${{ github.event.number }}
       cancel-in-progress: false
@@ -262,3 +261,57 @@ jobs:
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
 
+  # The shared passkey redirect page is a production-account Worker on the PPE custom domain.
+  # Keep its deployer separate from the per-PR preview job: the main-only production token cannot
+  # be read by an untrusted PR, while the preview token cannot mutate this Worker or its D1.
+  deploy-ppe:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: hub
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: ppe-deploy
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: hub
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.22.2
+          cache: npm
+          cache-dependency-path: hub/package-lock.json
+      - run: npm ci
+      - name: Reject a stale main deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          if [[ "$current_head" != "$GITHUB_SHA" ]]; then
+            echo "Refusing stale PPE deployment: run=$GITHUB_SHA current=$current_head" >&2
+            exit 1
+          fi
+      - name: Apply PPE migrations exactly once
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
+        run: |
+          set -euo pipefail
+          artifact_digest="$(git archive --format=tar HEAD migrations-ppe | sha256sum | cut -d ' ' -f 1)"
+          node scripts/migrations.mjs apply \
+            --target ppe \
+            --config wrangler.ppe.jsonc \
+            --database sessions-ppe-index \
+            --migrations-dir migrations-ppe \
+            --manifest migrations-ppe/manifest.json \
+            --journal "$RUNNER_TEMP/ppe-migration-${GITHUB_SHA}.json" \
+            --artifact-digest "$artifact_digest" \
+            --deployment-id "ppe:${GITHUB_SHA}" \
+            --base-manifest migrations-ppe/source-baseline.json
+      - name: Deploy shared PPE redirect Worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
+        run: npx wrangler deploy --config wrangler.ppe.jsonc
