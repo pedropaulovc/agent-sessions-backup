@@ -536,6 +536,9 @@ async function previewFetch(context, target, init = {}) {
   });
 }
 
+const DIAGNOSTICS_SETTLE_MS = 90_000;
+const DIAGNOSTICS_POLL_MS = 3_000;
+
 async function smoke() {
   const context = bearerContext();
   const expectedArtifact = args['artifact-digest'];
@@ -554,17 +557,30 @@ async function smoke() {
     fail(`unauthenticated preview request was not denied (${unauthenticated.status})`);
   }
 
-  const response = await previewFetch(context, '/api/v1/preview/diagnostics', {
-    headers: { accept: 'application/json' },
-  });
-  if (!response.ok) {
-    fail(`preview diagnostics smoke failed with ${response.status}: ${(await response.text()).slice(0, 500)}`);
-  }
-  const diagnostics = await response.json();
-  if (diagnostics.headSha !== sha
-    || diagnostics.artifactDigest !== expectedArtifact
-    || diagnostics.schemaDigest !== expectedSchema) {
-    fail(`preview diagnostics do not match the provisioned artifact: ${stableJson(diagnostics)}`);
+  // A just-deployed Worker version does not reach every edge location at once, so the first
+  // diagnostics read can legitimately answer from the previous version. Waiting is not a weaker
+  // assertion — every field must still match exactly — it just refuses to call propagation lag a
+  // failed deploy. Observed on PR #139: a deploy whose bundle was unchanged served the previous
+  // headSha for seconds, then the correct one.
+  let diagnostics = null;
+  const deadline = Date.now() + DIAGNOSTICS_SETTLE_MS;
+  for (let attempt = 0; ; attempt += 1) {
+    const response = await previewFetch(context, '/api/v1/preview/diagnostics', {
+      headers: { accept: 'application/json' },
+    });
+    if (!response.ok) {
+      fail(`preview diagnostics smoke failed with ${response.status}: ${(await response.text()).slice(0, 500)}`);
+    }
+    diagnostics = await response.json();
+    if (diagnostics.headSha === sha
+      && diagnostics.artifactDigest === expectedArtifact
+      && diagnostics.schemaDigest === expectedSchema) break;
+    if (Date.now() >= deadline) {
+      fail(`preview diagnostics still do not match the provisioned artifact after `
+        + `${Math.round(DIAGNOSTICS_SETTLE_MS / 1000)}s: ${stableJson(diagnostics)}`);
+    }
+    if (attempt === 0) process.stdout.write('preview diagnostics still report the previous version; waiting for the deploy to propagate\n');
+    await new Promise((resolve) => { setTimeout(resolve, DIAGNOSTICS_POLL_MS); });
   }
   process.stdout.write(`${stableJson({ smoke: 'passed', url: context.origin, artifactDigest: expectedArtifact, schemaDigest: expectedSchema })}\n`);
 }
