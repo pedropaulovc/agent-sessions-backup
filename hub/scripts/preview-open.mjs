@@ -10,11 +10,13 @@ const HELP = `Usage: npm --prefix hub run preview:open -- --pr <positive integer
 
 Options:
   --pr <number>  Pull request number
-  --print-only   Print the PPE passkey page without opening a browser
+  --print-only   Print the URL without opening a browser
 
-Auth: the shared PPE page authenticates with the owner's passkey, derives the preview
-bearer from PREVIEW_BEARER_SEED inside the PPE Worker, and redirects to the selected
-PR environment. No bearer is placed in this URL.
+Auth: the per-PR bearer is derived from the seed in ~/.config/agent-sessions/preview-seed
+(or the PREVIEW_BEARER_SEED environment variable, or the Windows-side copy under /mnt when
+running in WSL) and appended as ?token=… — visiting it
+once sets the preview session cookie. Without a seed the bare URL is printed and the
+preview will answer 401.
 `;
 
 export function assertSupportedNode(version = process.versions.node) {
@@ -118,9 +120,11 @@ export function derivePreviewBearer(seed, pr) {
   return createHmac('sha256', seed.trim()).update(`sessions-preview-bearer:pr-${pr}`).digest('base64url');
 }
 
-export function previewUrl(pr) {
+export function previewUrl(pr, seed = null) {
   if (!Number.isSafeInteger(pr) || pr <= 0) throw new Error('PR number must be a safe positive integer');
-  return `https://sessions.ppe.vza.net/pr?id=${pr}`;
+  const base = `https://pr-${pr}-app.sessions-ppe.workers.dev`;
+  if (seed === null) return base;
+  return `${base}/?token=${derivePreviewBearer(seed, pr)}`;
 }
 
 export function browserLauncher(url, platform = process.platform) {
@@ -151,8 +155,14 @@ export async function openBrowser(url, options = {}) {
 export async function main(argv = process.argv.slice(2), options = {}) {
   assertSupportedNode(options.nodeVersion);
   const parsed = parsePreviewOpenArguments(argv);
+  const seed = options.seed !== undefined ? options.seed : readPreviewSeed();
   const log = options.log ?? console.log;
-  const url = previewUrl(parsed.pr);
+  if (seed === null) {
+    (options.warn ?? console.error)(
+      `no preview seed found (${previewSeedPath()}, PREVIEW_BEARER_SEED, or the Windows-side copy under /mnt) — printing the URL without a token; the preview will answer 401`,
+    );
+  }
+  const url = previewUrl(parsed.pr, seed);
   log(url);
   if (!parsed.printOnly) await openBrowser(url, options);
   return url;

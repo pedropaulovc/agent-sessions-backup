@@ -24,7 +24,7 @@ function targetArguments({ target, config, persistTo }) {
   if (target === 'local' || target === 'e2e') {
     if (!persistTo) throw new Error(`${target} migrations require an explicit persistTo directory`);
     args.push('--local', '--persist-to', path.resolve(persistTo));
-  } else if (target === 'preview' || target === 'ppe' || target === 'production') {
+  } else if (target === 'preview' || target === 'production') {
     if (!config) throw new Error(`${target} migrations require a trusted generated config`);
     args.push('--remote');
   } else {
@@ -200,8 +200,6 @@ async function remoteSchemaSnapshot(client) {
 }
 
 async function validateHistory(options, manifest) {
-  // PPE has an independent manifest and no pre-ledger repository history to validate.
-  if (options.target === 'ppe') return;
   // The trust anchor for production migrations is the protected main branch: whatever
   // manifest lands there deploys. The in-repo historical baseline stays validated for
   // structure (it names the pre-ledger history, incl. the 0019 divergence), but no

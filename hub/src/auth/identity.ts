@@ -6,11 +6,12 @@ export type Identity =
 /**
  * Preview auth is ONE per-PR bearer. Each self-contained preview Worker is deployed with
  * `PREVIEW_BEARER` — HMAC-SHA256(seed, pr) derived independently by the provisioner, CI,
- * and the owner's machines (`~/.config/agent-sessions/preview-seed`), never distributed
- * through the public repo's logs or artifacts. It is presented either as an
+ * and the owner's machines (`~/.config/agent-sessions/preview-seed`). The seed is never
+ * distributed through the public repo's logs or artifacts; the derived bearer is intentionally
+ * published as the disposable preview's public login code. It is presented either as an
  * `Authorization: Bearer` header (agents, CI) or via the `__Host-preview-session` cookie
  * a `/?token=…` visit sets (browsers). The blast radius of a leaked token is one
- * disposable preview holding only deliberately exported data.
+ * disposable preview holding only synthetic or explicitly non-sensitive data.
  */
 export const PREVIEW_SESSION_COOKIE = '__Host-preview-session';
 /** The machine identity a preview bearer resolves to (admin: it re-uploads any machine's files). */
