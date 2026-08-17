@@ -300,16 +300,17 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
         run: |
           set -euo pipefail
-          artifact_digest="$(git archive --format=tar HEAD migrations | sha256sum | cut -d ' ' -f 1)"
+          artifact_digest="$(git archive --format=tar HEAD migrations-ppe | sha256sum | cut -d ' ' -f 1)"
           node scripts/migrations.mjs apply \
             --target ppe \
             --config wrangler.ppe.jsonc \
             --database sessions-ppe-index \
+            --migrations-dir migrations-ppe \
+            --manifest migrations-ppe/manifest.json \
             --journal "$RUNNER_TEMP/ppe-migration-${GITHUB_SHA}.json" \
             --artifact-digest "$artifact_digest" \
             --deployment-id "ppe:${GITHUB_SHA}" \
-            --base-manifest migrations/source-baseline.json \
-            --history migrations/historical-baseline.json
+            --base-manifest migrations-ppe/source-baseline.json
       - name: Deploy shared PPE redirect Worker
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}

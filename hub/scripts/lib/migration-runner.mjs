@@ -200,6 +200,8 @@ async function remoteSchemaSnapshot(client) {
 }
 
 async function validateHistory(options, manifest) {
+  // PPE has an independent manifest and no pre-ledger repository history to validate.
+  if (options.target === 'ppe') return;
   // The trust anchor for production migrations is the protected main branch: whatever
   // manifest lands there deploys. The in-repo historical baseline stays validated for
   // structure (it names the pre-ledger history, incl. the 0019 divergence), but no

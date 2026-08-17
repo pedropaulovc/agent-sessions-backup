@@ -156,9 +156,9 @@ command above.
 
 Deploy `hub/src/ppe.ts` with `hub/wrangler.ppe.jsonc` as the production-account Worker named
 `sessions-ppe`, with the `sessions.ppe.vza.net` custom domain. Its dedicated D1 binding `DB`
-contains only PPE passkey credentials and uses the repository migrations. Set `ENVIRONMENT=ppe`,
-`VIEWER_HOST=sessions.ppe.vza.net`, and do not bind the production hub's D1, KV, R2, queue,
-session-signing, or OAuth resources.
+contains only the PPE credential, challenge, and migration-ledger tables from `hub/migrations-ppe`.
+Set `ENVIRONMENT=ppe`, `VIEWER_HOST=sessions.ppe.vza.net`, and do not bind the production hub's
+D1, KV, R2, queue, session-signing, or OAuth resources.
 
 Create the isolated D1 and secrets once while `wrangler whoami` shows the production account:
 ```bash

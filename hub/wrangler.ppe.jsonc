@@ -20,7 +20,7 @@
     {
       "binding": "DB",
       "database_name": "sessions-ppe-index",
-      "migrations_dir": "migrations"
+      "migrations_dir": "migrations-ppe"
     }
   ]
   // Secrets, set with `wrangler secret put --config wrangler.ppe.jsonc`:
