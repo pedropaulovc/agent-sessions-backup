@@ -36,6 +36,7 @@ const ACCOUNT_VARIABLE = 'CLOUDFLARE_PPE_ACCOUNT_ID';
 const WRANGLER_PROFILE = 'preview';
 const WRANGLER_USERNAME = 'pedro@vezza.com.br';
 const WORKERS_DEV_SUBDOMAIN = 'agent-sessions-nonproduction';
+const PREVIEW_ACCOUNT_NAME = 'sessions-ppe-vza-net';
 const TOKEN_NAME = 'agent-sessions-preview-control';
 const TOKEN_DAYS = 90;
 const MAX_ACCOUNT_PAGES = 20;
@@ -120,8 +121,11 @@ async function cloudflarePost(token, pathname, payload) {
 function printIdentity() {
   log('');
   log('  Cloudflare identity to sign in as : ' + WRANGLER_USERNAME);
-  log(`  Cloudflare account to select      : the one whose workers.dev subdomain is`);
-  log(`                                      ${WORKERS_DEV_SUBDOMAIN} (ID ${PREVIEW_ACCOUNT_ID})`);
+  log(`  Cloudflare account to select      : ${PREVIEW_ACCOUNT_NAME}`);
+  log(`                                      ID ${PREVIEW_ACCOUNT_ID}`);
+  log(`                                      workers.dev subdomain ${WORKERS_DEV_SUBDOMAIN}`);
+  log('  The ID is what this script checks — an account can be renamed, so if the picker');
+  log('  shows a different name, match on the ID.');
   log('  Wrangler has no account/username flags — pick both in the OAuth browser flow.');
   log('  If the account picker offers the production account, you signed in as the wrong');
   log(`  identity: ${WRANGLER_USERNAME} must have no production membership at all.`);
@@ -132,17 +136,20 @@ function printIdentity() {
 }
 
 /**
- * The exact dashboard recipe, printed only when the API cannot mint the token for us. Cloudflare
- * gates token management behind API Tokens Write, which Wrangler's OAuth grant does not carry.
+ * The exact dashboard recipe. Cloudflare gates the token APIs behind API Tokens Write, and
+ * Wrangler's OAuth grant has no scope that carries it — verified: both
+ * /accounts/<id>/tokens/permission_groups and /user/tokens/permission_groups answer an OAuth
+ * token with 403 code 9109. Minting a token needs a token, so this one step is unavoidably
+ * by hand; everything after it is automated.
  */
 function printDashboardRecipe() {
   log('');
-  log('  Wrangler OAuth cannot mint API tokens (no API Tokens Write in its grant).');
-  log('  Create it by hand, then re-run this command with --token-file:');
+  log('  This is the one step that cannot be automated: creating an API token requires an');
+  log('  existing token with API Tokens Write, which Wrangler OAuth cannot grant.');
   log('');
   log(`    1. Sign in to https://dash.cloudflare.com as ${WRANGLER_USERNAME}`);
-  log(`    2. Select the ${WORKERS_DEV_SUBDOMAIN} account (${PREVIEW_ACCOUNT_ID})`);
-  log('    3. Manage Account -> Account API Tokens -> Create Token -> Create Custom Token');
+  log(`    2. Open https://dash.cloudflare.com/${PREVIEW_ACCOUNT_ID}/api-tokens`);
+  log('    3. Create Token -> Create Custom Token');
   log(`    4. Name: ${TOKEN_NAME}`);
   log('    5. Permissions (all Account-scoped):');
   for (const group of TOKEN_PERMISSION_GROUPS) log(`         Account | ${group}`);
@@ -154,11 +161,20 @@ function printDashboardRecipe() {
   log('');
 }
 
-function wranglerOauthToken() {
+/**
+ * A stored profile can be dead while still looking perfectly well-formed on disk: Cloudflare
+ * revokes an entire OAuth grant family when a rotated refresh token is replayed, which takes the
+ * access token with it. Prove the token still works rather than handing a revoked one to the
+ * membership check, where it surfaces as a baffling 403.
+ */
+async function wranglerOauthToken() {
   const probe = run('npx', ['--prefix', 'hub', 'wrangler', 'auth', 'token', '--profile', WRANGLER_PROFILE, '--json']);
   if (probe.status === 0) {
     const auth = JSON.parse(probe.stdout);
-    if (auth?.type === 'oauth' && auth.token) return auth.token;
+    if (auth?.type === 'oauth' && auth.token) {
+      if ((await cloudflare(auth.token, '/accounts?per_page=1')).ok) return auth.token;
+      log(`Wrangler profile "${WRANGLER_PROFILE}" is no longer accepted by Cloudflare — re-authorizing.`);
+    }
   }
   log(`No usable Wrangler OAuth profile "${WRANGLER_PROFILE}" — opening the browser flow.`);
   printIdentity();
@@ -207,9 +223,18 @@ async function assertNonProductionMembership(token, label) {
   return preview;
 }
 
+function cloudflareErrors(response) {
+  const errors = response.body?.errors;
+  if (!Array.isArray(errors) || errors.length === 0) return `HTTP ${response.status}`;
+  return errors.map((error) => `${error.code}: ${error.message}`).join('; ');
+}
+
 async function mintAccountToken(oauthToken) {
   const groups = await cloudflare(oauthToken, `/accounts/${PREVIEW_ACCOUNT_ID}/tokens/permission_groups?per_page=500`);
-  if (!groups.ok) return null;
+  if (!groups.ok) {
+    log(`  Cannot list token permission groups (${cloudflareErrors(groups)}).`);
+    return null;
+  }
   const byName = new Map((groups.body.result ?? []).map((group) => [group.name, group]));
   const selected = TOKEN_PERMISSION_GROUPS.map((name) => {
     const group = byName.get(name);
@@ -226,7 +251,10 @@ async function mintAccountToken(oauthToken) {
     }],
     expires_on: expiresOn,
   });
-  if (!created.ok) return null;
+  if (!created.ok) {
+    log(`  Cannot create the account token (${cloudflareErrors(created)}).`);
+    return null;
+  }
   const value = created.body.result?.value;
   if (typeof value !== 'string' || value.length === 0) return null;
   log(`  Minted account token ${TOKEN_NAME}, expires ${expiresOn}.`);
@@ -314,32 +342,36 @@ async function provision(options) {
   log(`Provisioning preview credentials for the CI preview job.`);
   printIdentity();
 
+  // Derived before anything is installed: a bad seed should stop the run, not leave half a
+  // credential set behind.
+  const seed = requireSeed(options.seedFile);
+
   let token = options.tokenFile
     ? readFileSync(path.resolve(options.tokenFile), 'utf8').trim()
     : null;
   if (!token) {
-    const oauthToken = wranglerOauthToken();
+    const oauthToken = await wranglerOauthToken();
     await assertNonProductionMembership(oauthToken, 'Wrangler OAuth');
     token = await mintAccountToken(oauthToken);
   }
-  if (!token) {
-    printDashboardRecipe();
-    fail('no API token available to install');
-  }
-  await verifyApiToken(token);
+  if (token) await verifyApiToken(token);
 
-  const seed = requireSeed(options.seedFile);
-
-  runOrFail('gh', ['secret', 'set', TOKEN_SECRET], `failed to set ${TOKEN_SECRET}`, { input: token });
+  // The seed and the account ID never depended on the token, so install them either way: when
+  // the token has to be made by hand, that hand step should be the only thing left, not the
+  // trigger for redoing the other two.
   runOrFail('gh', ['secret', 'set', SEED_SECRET], `failed to set ${SEED_SECRET}`, { input: seed });
   runOrFail(
     'gh',
     ['variable', 'set', ACCOUNT_VARIABLE, '--body', PREVIEW_ACCOUNT_ID],
     `failed to set ${ACCOUNT_VARIABLE}`,
   );
+  if (token) {
+    runOrFail('gh', ['secret', 'set', TOKEN_SECRET], `failed to set ${TOKEN_SECRET}`, { input: token });
+  }
 
   log('');
   report();
+  if (!token) printDashboardRecipe();
 }
 
 function parse(argv) {

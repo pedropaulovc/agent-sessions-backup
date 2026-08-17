@@ -112,6 +112,25 @@ and fails if the signed-in identity can reach production:
 node infra/cf/preview-token.mjs --set     # `--set` omitted: report what is missing
 ```
 
+**Creating the token itself is the one manual step, and it is Cloudflare's floor, not ours.**
+Measured 2026-08-16, so nobody re-litigates it:
+
+- Wrangler's OAuth scope list (`wrangler login --scopes-list`) has no token-management scope at
+  all, so no `wrangler auth create` invocation can grant one.
+- With a Wrangler OAuth token, both `/accounts/<id>/tokens/permission_groups` and
+  `/user/tokens/permission_groups` answer `403` code `9109`. Minting needs API Tokens Write.
+  ([workers-sdk#13042](https://github.com/cloudflare/workers-sdk/issues/13042) is the open ask.)
+- The only programmatic mint, `POST /user/tokens`, authenticates with the **Global API Key** —
+  which is itself dashboard-only and strictly more dangerous than the token it would create.
+- Feeding CI a Wrangler **refresh token** instead is worse than unavailable, it is a trap: refresh
+  tokens rotate on every use, and replaying a rotated one makes Cloudflare revoke the whole grant
+  family — access token included. Two concurrent preview jobs would take each other out, and the
+  repository secret would be dead rather than stale.
+
+So: create the token by hand once, then `--set --token-file`. The script installs the seed and the
+account ID on its own, so the paste is the only thing left, and a 90-day account-pinned token beats
+a user-wide OAuth grant for CI anyway — it cannot follow the identity into a new account.
+
 That account's workers.dev subdomain is `agent-sessions-nonproduction.workers.dev`. The token is
 restricted to this non-production account, expires after 90 days, and has Workers Scripts Write,
 Workers KV Storage Write, D1 Write, Workers R2 Storage Write, Queues Write, and Account Settings
