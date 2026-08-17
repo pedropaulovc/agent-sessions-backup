@@ -1,76 +1,57 @@
-import { appendFile, mkdir, lstat, readFile, rm } from 'node:fs/promises';
+import { appendFile, mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
 import { randomBytes } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import {
-  ARTIFACT_FILES,
-  MAX_ARTIFACT_BYTES,
-  PREVIEW_WORKERS_DEV_SUFFIX,
-  assertNoProductionIdentifiers,
+  MAX_WORKER_BUNDLE_BYTES,
+  assertContainedRegularFile,
   assertPreviewAccount,
-  assertSameRepositoryOpenPullRequest,
-  assertTrustedPreviewQueueRun as assertTrustedPreviewQueueWorkflowRun,
-  assertTrustedPreviewQueueWorkflowRef,
-  assertTrustedPreviewResetRun as assertTrustedPreviewResetWorkflowRun,
-  assertTrustedPreviewResetWorkflowRef,
-  assertTrustedSourceCiRun,
-  assertTrustedWorkflowRef,
   deleteInDependencyPasses,
   emptyR2Bucket,
   fail,
   fileRecord,
+  generatedBuildConfig,
   generatedPrivateAppConfig,
   headSha,
+  migrationSqlNames,
   paginatedList,
   parseArgs,
   positiveInteger,
   previewBearerToken,
   previewResourceOwner,
+  previewWranglerEnvironment,
   queueConsumerIdsForQueue,
   repositoryName,
+  resolveBundlerInputPath,
   resourceNames,
   sha256Bytes,
   stableJson,
-  trustedWranglerEnvironment,
-  walkRegularFiles,
+  wranglerWorkerBundle,
   writeCanonicalJson,
 } from './preview-trust.mjs';
-import {
-  claimPreviewDeployment,
-  completePreviewDeployment,
-  deactivatePreviewDeployments,
-  findPreviewAnnouncement,
-  inactivateSupersededPreviewDeployments,
-  queuePreviewDeployment,
-  rejectQueuedPreviewDeployments,
-  settleQueuedPreviewDeployment,
-} from './preview-deployment.mjs';
+import { deactivatePreviewDeployments } from './preview-deployment.mjs';
+import { migrationDigest } from '../../hub/scripts/lib/migration-manifest.mjs';
 import { SYNTHETIC_EXPECTATIONS } from '../../hub/scripts/lib/dev-seed.mjs';
 
 const [command, ...rest] = process.argv.slice(2);
 const allowed = new Set([
-  'account-id', 'artifact', 'head-sha', 'pr', 'repository', 'run-id',
-  'source-run-id', 'workflow-ref', 'wrangler', 'migrations-cli',
-  'github-output', 'artifact-digest', 'schema-digest', 'deployment-id', 'outcome', 'prs',
+  'account-id', 'head-sha', 'hub', 'pr', 'repository', 'wrangler', 'migrations-cli',
+  'github-output', 'artifact-digest', 'schema-digest', 'prs',
 ]);
 const args = parseArgs(rest, allowed);
 const repository = repositoryName(args.repository ?? process.env.GITHUB_REPOSITORY);
 const pr = command === 'janitor' || command === 'deployment-inactivate-batch'
   ? null
   : positiveInteger(args.pr, 'PR number');
-const previewAccountId = args['account-id'] ?? process.env.CLOUDFLARE_PREVIEW_ACCOUNT_ID;
-const previewToken = process.env.CLOUDFLARE_PREVIEW_CONTROL_TOKEN;
+const previewAccountId = args['account-id'] ?? process.env.CLOUDFLARE_PPE_ACCOUNT_ID;
+const previewToken = process.env.CLOUDFLARE_PPE_API_TOKEN;
 
 const MIGRATION_LEDGER_KEY = 'preview_migration_files';
 
-const CARD_DISCOVERY_ATTEMPTS = 80;
-const CARD_DISCOVERY_DELAY_MS = 3_000;
-
 function requireCloudflareEnvironment() {
   assertPreviewAccount(previewAccountId);
-  if (!previewToken) fail('CLOUDFLARE_PREVIEW_CONTROL_TOKEN is required');
+  if (!previewToken) fail('CLOUDFLARE_PPE_API_TOKEN is required');
 }
 
 function requireBearerSeed() {
@@ -79,86 +60,10 @@ function requireBearerSeed() {
   return seed;
 }
 
-async function readCanonicalJson(file) {
-  const raw = await readFile(file, 'utf8');
-  const parsed = JSON.parse(raw);
-  if (raw !== `${stableJson(parsed)}\n`) fail(`non-canonical JSON rejected: ${file}`);
-  return parsed;
-}
-
-async function verifyArtifact(directory, expected) {
-  const root = path.resolve(directory);
-  const files = await walkRegularFiles(root);
-  let archiveBytes = 0;
-  for (const relative of files) {
-    const stat = await lstat(path.join(root, ...relative.split('/')));
-    if (!stat.isFile() || stat.size > MAX_ARTIFACT_BYTES) fail(`oversized or non-file artifact entry: ${relative}`);
-    archiveBytes += stat.size;
-    if (archiveBytes > MAX_ARTIFACT_BYTES) fail('artifact exceeds total size limit');
-  }
-  const manifests = {};
-  for (const name of ARTIFACT_FILES) manifests[name] = await readCanonicalJson(path.join(root, name));
-  const content = manifests['content-manifest.json'];
-  if (content.schema !== 'sessions-preview-content/v1' || !Array.isArray(content.files)) {
-    fail('invalid content manifest schema');
-  }
-  const expectedFiles = new Set([...ARTIFACT_FILES, ...content.files.map((item) => item.path)]);
-  if (expectedFiles.size !== files.length || files.some((file) => !expectedFiles.has(file))) {
-    fail('artifact contains missing or unexpected files');
-  }
-  let total = 0;
-  for (const declared of content.files) {
-    if (!declared || typeof declared.path !== 'string' || !/^payload\/(worker\.mjs|migrations\/(?:manifest\.json|[0-9]{4}_[a-z0-9_]+\.sql))$/.test(declared.path)) {
-      fail(`unexpected content path: ${declared?.path}`);
-    }
-    const actual = await fileRecord(path.join(root, ...declared.path.split('/')), declared.path);
-    if (stableJson(actual) !== stableJson(declared)) fail(`content digest mismatch: ${declared.path}`);
-    total += actual.size;
-  }
-  if (total > MAX_ARTIFACT_BYTES) fail('artifact exceeds size limit');
-
-  const provenance = manifests['provenance.json'];
-  if (provenance.schema !== 'sessions-preview-provenance/v1') fail('invalid provenance schema');
-  for (const [field, value] of Object.entries(expected)) {
-    if (provenance[field] !== value) fail(`provenance ${field} mismatch`);
-  }
-  const digest = sha256Bytes(stableJson(content));
-  if (provenance.artifactDigest !== digest) fail('artifact digest does not match provenance');
-  const trustedRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..');
-  const toolchainPaths = [
-    'hub/package-lock.json',
-    'infra/cf/preview-build.mjs',
-    'infra/cf/preview-trust.mjs',
-  ];
-  const toolchainInputs = [];
-  for (const relative of toolchainPaths) {
-    toolchainInputs.push(await fileRecord(path.join(trustedRoot, relative), relative));
-  }
-  if (stableJson(provenance.toolchain?.inputs) !== stableJson(toolchainInputs)
-    || provenance.toolchain?.digest !== sha256Bytes(stableJson(toolchainInputs))
-    || provenance.toolchain?.wrangler !== '4.111.0') {
-    fail('provenance toolchain does not match trusted default-branch inputs');
-  }
-  const build = manifests['build-manifest.json'];
-  const migration = manifests['migration-manifest.json'];
-  if (build.schema !== 'sessions-preview-build/v1' || build.headSha !== expected.headSha) fail('invalid build manifest');
-  if (build.output?.path !== 'payload/worker.mjs') fail('build output is not the expected Worker bundle');
-  if (migration.schema !== 'sessions-preview-migrations/v1') fail('invalid migration manifest');
-  if (migration.migrationDigest !== provenance.migrationDigest) fail('migration digest mismatch');
-  if (build.inputDigest !== provenance.buildInputDigest) fail('build input digest mismatch');
-  assertNoProductionIdentifiers(manifests);
-  return { root, provenance, build, migration, content };
-}
-
 async function github(pathname, init = {}) {
-  const {
-    allowNotFound = false,
-    expectedStatus = null,
-    noJson = false,
-    ...fetchInit
-  } = init;
+  const { allowNotFound = false, expectedStatus = null, ...fetchInit } = init;
   const token = process.env.GITHUB_TOKEN;
-  if (!token) fail('GITHUB_TOKEN is required for trusted GitHub state checks');
+  if (!token) fail('GITHUB_TOKEN is required for GitHub state checks');
   const response = await fetch(`https://api.github.com${pathname}`, {
     ...fetchInit,
     headers: {
@@ -173,408 +78,14 @@ async function github(pathname, init = {}) {
   if (!response.ok || (expectedStatus != null && response.status !== expectedStatus)) {
     fail(`GitHub API ${pathname} failed with ${response.status}`);
   }
-  if (noJson || response.status === 204) return null;
+  if (response.status === 204) return null;
   return response.json();
-}
-
-async function assertSourceRun(runId, expectedSha) {
-  const run = await github(`/repos/${repository}/actions/runs/${runId}`);
-  return assertTrustedSourceCiRun(repository, pr, run, runId, expectedSha);
-}
-
-async function assertSuccessfulSourceRun(runId, expectedSha) {
-  const run = await assertSourceRun(runId, expectedSha);
-  if (run.conclusion !== 'success') fail('source workflow run is not successful');
-}
-
-async function assertUnsuccessfulSourceRun(runId, expectedSha) {
-  const run = await assertSourceRun(runId, expectedSha);
-  if (run.conclusion == null || run.conclusion === 'success') {
-    fail('source workflow run is not a completed CI rejection');
-  }
-}
-
-function sourceRunCreatedAt(run) {
-  const value = Date.parse(run?.created_at ?? '');
-  if (!Number.isFinite(value)) fail('source workflow run created_at is invalid');
-  return value;
-}
-
-async function latestTrustedSourceRun(expectedSha) {
-  const query = new URLSearchParams({
-    event: 'pull_request',
-    head_sha: headSha(expectedSha),
-    per_page: '100',
-  });
-  const response = await github(`/repos/${repository}/actions/runs?${query}`);
-  if (!Array.isArray(response?.workflow_runs)) {
-    fail('GitHub source workflow list response must contain workflow_runs');
-  }
-  const candidates = [];
-  for (const run of response.workflow_runs) {
-    try {
-      candidates.push(assertTrustedSourceCiRun(repository, pr, run, run.id, expectedSha));
-    } catch {
-      // The endpoint contains runs for other workflows and may contain another PR with this SHA.
-    }
-  }
-  candidates.sort((left, right) =>
-    sourceRunCreatedAt(right) - sourceRunCreatedAt(left) || right.id - left.id);
-  return candidates[0] ?? null;
-}
-
-async function assertOpenSameRepositoryPullRequest(expectedSha = null) {
-  const pull = await github(`/repos/${repository}/pulls/${pr}`);
-  return assertSameRepositoryOpenPullRequest(repository, pr, pull, expectedSha);
-}
-
-async function previewPullState(expectedSha) {
-  const pull = await github(`/repos/${repository}/pulls/${pr}`);
-  if (pull?.state === 'closed') return 'superseded';
-  if (pull?.state !== 'open') fail('preview PR is neither open nor closed');
-  if (pull.head?.repo?.full_name !== repository) return 'superseded';
-  return headSha(pull.head?.sha) === expectedSha ? 'current' : 'superseded';
-}
-
-async function assertSupersededPullRequest(expectedSha) {
-  if (await previewPullState(expectedSha) === 'current') {
-    fail('preview PR head is still current');
-  }
-}
-
-async function assertPreviewQueueRun(runId) {
-  const run = await github(`/repos/${repository}/actions/runs/${runId}`);
-  return assertTrustedPreviewQueueWorkflowRun(repository, run, runId);
-}
-
-async function assertPreviewResetRun(runId) {
-  const run = await github(`/repos/${repository}/actions/runs/${runId}`);
-  return assertTrustedPreviewResetWorkflowRun(repository, run, runId);
-}
-
-async function assertPreviewAnnouncementRun(runId, task) {
-  if (task === 'preview-announce') return assertPreviewQueueRun(runId);
-  if (task === 'preview-reset') return assertPreviewResetRun(runId);
-  fail('preview announcement has an unknown task');
-}
-
-function previewVerifier(sha, sourceRunId) {
-  return async () => {
-    await assertSuccessfulSourceRun(sourceRunId, sha);
-    await assertOpenSameRepositoryPullRequest(sha);
-  };
-}
-
-function rejectionVerifier(sha, sourceRunId) {
-  return async () => {
-    await assertUnsuccessfulSourceRun(sourceRunId, sha);
-    await assertOpenSameRepositoryPullRequest();
-  };
-}
-
-function queueVerifier(sha, runId) {
-  return async () => {
-    await assertPreviewQueueRun(runId);
-    await assertOpenSameRepositoryPullRequest(sha);
-  };
-}
-
-function resetQueueVerifier(sha, runId) {
-  return async () => {
-    await assertPreviewResetRun(runId);
-    await assertOpenSameRepositoryPullRequest(sha);
-  };
-}
-
-function waitForQueuedCard() {
-  return new Promise((resolve) => setTimeout(resolve, CARD_DISCOVERY_DELAY_MS));
 }
 
 function actionRunLogUrl() {
   const runId = process.env.GITHUB_RUN_ID;
   if (!runId) return null;
   return `https://github.com/${repository}/actions/runs/${positiveInteger(runId, 'GitHub Actions run ID')}`;
-}
-
-function errorMessage(error) {
-  return error instanceof Error ? error.message : 'non-Error rejection';
-}
-
-async function settleStaleQueueCard({ sha, runId, deploymentId, verifyRun }) {
-  const card = await settleQueuedPreviewDeployment({
-    request: github,
-    verify: async () => {
-      await verifyRun(runId);
-      await assertSupersededPullRequest(sha);
-    },
-    verifyAnnouncement: assertPreviewAnnouncementRun,
-    deploymentId,
-    state: 'inactive',
-    description: 'Preview superseded before its queued card could be published',
-    logUrl: actionRunLogUrl(),
-    repository,
-    pr,
-    sha,
-  });
-  process.stdout.write(`${stableJson(card)}\n`);
-}
-
-async function queueDeploymentCard() {
-  const sha = headSha(args['head-sha']);
-  const runId = positiveInteger(args['run-id'], 'preview announcement workflow run ID');
-  const githubOutput = args['github-output'];
-  let created = null;
-  assertTrustedPreviewQueueWorkflowRef(repository, args['workflow-ref']);
-  try {
-    const card = await queuePreviewDeployment({
-      request: github,
-      verify: queueVerifier(sha, runId),
-      onCreated: async (value) => {
-        created = value;
-        if (githubOutput) await appendFile(path.resolve(githubOutput), `deployment_id=${value.deploymentId}\n`);
-      },
-      repository,
-      pr,
-      sha,
-      announcementRunId: runId,
-      workflowRef: args['workflow-ref'],
-    });
-    process.stdout.write(`${stableJson(card)}\n`);
-  } catch (error) {
-    if (created == null || await previewPullState(sha) === 'current') throw error;
-    process.stderr.write(`Queue card failed before stale settlement: ${errorMessage(error)}\n`);
-    await settleStaleQueueCard({
-      sha,
-      runId,
-      deploymentId: created.deploymentId,
-      verifyRun: assertPreviewQueueRun,
-    });
-  }
-}
-
-async function resetQueueDeploymentCard() {
-  const runId = positiveInteger(args['run-id'], 'preview reset workflow run ID');
-  const githubOutput = args['github-output'];
-  let created = null;
-  assertTrustedPreviewResetWorkflowRef(repository, args['workflow-ref']);
-  const pull = await assertOpenSameRepositoryPullRequest();
-  const sha = headSha(pull.head.sha);
-  try {
-    const card = await queuePreviewDeployment({
-      request: github,
-      verify: resetQueueVerifier(sha, runId),
-      onCreated: async (value) => {
-        created = value;
-        if (githubOutput) await appendFile(path.resolve(githubOutput), `deployment_id=${value.deploymentId}\n`);
-      },
-      repository,
-      pr,
-      sha,
-      announcementRunId: runId,
-      workflowRef: args['workflow-ref'],
-    });
-    process.stdout.write(`${stableJson(card)}\n`);
-  } catch (error) {
-    if (created == null || await previewPullState(sha) === 'current') throw error;
-    process.stderr.write(`Reset queue card failed before stale settlement: ${errorMessage(error)}\n`);
-    await settleStaleQueueCard({
-      sha,
-      runId,
-      deploymentId: created.deploymentId,
-      verifyRun: assertPreviewResetRun,
-    });
-  }
-}
-
-
-async function reconcileQueuedDeploymentCard() {
-  const sha = headSha(args['head-sha']);
-  const queueRunId = positiveInteger(args['run-id'], 'preview announcement workflow run ID');
-  const id = positiveInteger(args['deployment-id'], 'GitHub deployment ID');
-  assertTrustedPreviewQueueWorkflowRef(repository, args['workflow-ref']);
-  await assertPreviewQueueRun(queueRunId);
-  const currentCard = async () => findPreviewAnnouncement({
-    request: github,
-    verifyAnnouncement: assertPreviewAnnouncementRun,
-    deploymentId: id,
-    repository,
-    pr,
-    sha,
-  });
-  const card = await currentCard();
-  if (card == null
-    || card.task !== 'preview-announce'
-    || card.announcementRunId !== queueRunId
-    || (card.state !== 'queued' && card.state != null)) {
-    process.stdout.write(`${stableJson({ reconciled: false, deploymentId: id })}\n`);
-    return;
-  }
-  if (await previewPullState(sha) !== 'current') {
-    await settleStaleQueueCard({
-      sha,
-      runId: queueRunId,
-      deploymentId: id,
-      verifyRun: assertPreviewQueueRun,
-    });
-    return;
-  }
-  const source = await latestTrustedSourceRun(sha);
-  if (source == null || source.conclusion == null) {
-    process.stdout.write(`${stableJson({ reconciled: false, deploymentId: id, waitingForCi: true })}\n`);
-    return;
-  }
-  if (source.conclusion !== 'success') {
-    const settled = await settleQueuedPreviewDeployment({
-      request: github,
-      verify: async () => {
-        await assertPreviewQueueRun(queueRunId);
-        await assertUnsuccessfulSourceRun(source.id, sha);
-        await assertOpenSameRepositoryPullRequest(sha);
-      },
-      verifyAnnouncement: assertPreviewAnnouncementRun,
-      deploymentId: id,
-      state: 'failure',
-      description: 'Preview was not provisioned because CI did not succeed',
-      logUrl: actionRunLogUrl(),
-      repository,
-      pr,
-      sha,
-    });
-    process.stdout.write(`${stableJson({ reconciled: true, sourceRunId: source.id, ...settled })}\n`);
-    return;
-  }
-  await assertSuccessfulSourceRun(source.id, sha);
-  await assertOpenSameRepositoryPullRequest(sha);
-  const finalCard = await currentCard();
-  if (finalCard == null
-    || finalCard.task !== 'preview-announce'
-    || finalCard.announcementRunId !== queueRunId
-    || (finalCard.state !== 'queued' && finalCard.state != null)) {
-    process.stdout.write(`${stableJson({ reconciled: false, deploymentId: id })}\n`);
-    return;
-  }
-  await assertSuccessfulSourceRun(source.id, sha);
-  await assertOpenSameRepositoryPullRequest(sha);
-  await github(`/repos/${repository}/actions/workflows/preview-control.yml/dispatches`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: stableJson({
-      ref: 'main',
-      inputs: {
-        pr: String(pr),
-        head_sha: sha,
-        source_run_id: String(source.id),
-      },
-    }),
-    expectedStatus: 204,
-    noJson: true,
-  });
-  process.stdout.write(`${stableJson({
-    reconciled: true,
-    deploymentId: id,
-    sourceRunId: source.id,
-  })}\n`);
-}
-async function claimDeploymentCard() {
-  const sha = headSha(args['head-sha']);
-  const sourceRunId = positiveInteger(args['source-run-id'], 'source workflow run ID');
-  const runId = positiveInteger(args['run-id'], 'controller workflow run ID');
-  const githubOutput = args['github-output'];
-  const recordDeploymentId = githubOutput
-    ? async ({ deploymentId }) => appendFile(
-      path.resolve(githubOutput),
-      `deployment_id=${deploymentId}\nclaimed=true\n`,
-    )
-    : null;
-  assertTrustedWorkflowRef(repository, args['workflow-ref']);
-  const card = await claimPreviewDeployment({
-    request: github,
-    verify: previewVerifier(sha, sourceRunId),
-    verifyAnnouncement: assertPreviewAnnouncementRun,
-    onClaimed: recordDeploymentId,
-    attempts: CARD_DISCOVERY_ATTEMPTS,
-    wait: waitForQueuedCard,
-    repository,
-    pr,
-    sha,
-    sourceRunId,
-    runId,
-  });
-  if (githubOutput && card.alreadyClaimed) {
-    await appendFile(
-      path.resolve(githubOutput),
-      `deployment_id=${card.deploymentId}\nclaimed=${card.claimedByCurrentRun === true}\n`,
-    );
-  }
-  process.stdout.write(`${stableJson(card)}\n`);
-}
-
-async function rejectDeploymentCards() {
-  const sha = headSha(args['head-sha']);
-  const sourceRunId = positiveInteger(args['source-run-id'], 'source workflow run ID');
-  const runId = positiveInteger(args['run-id'], 'controller workflow run ID');
-  assertTrustedWorkflowRef(repository, args['workflow-ref']);
-  const cards = await rejectQueuedPreviewDeployments({
-    request: github,
-    verify: rejectionVerifier(sha, sourceRunId),
-    verifyAnnouncement: assertPreviewAnnouncementRun,
-    attempts: CARD_DISCOVERY_ATTEMPTS,
-    wait: waitForQueuedCard,
-    repository,
-    pr,
-    sha,
-    sourceRunId,
-    runId,
-  });
-  process.stdout.write(`${stableJson(cards)}\n`);
-}
-
-async function supersedeDeploymentCards() {
-  const sha = headSha(args['head-sha']);
-  const sourceRunId = positiveInteger(args['source-run-id'], 'source workflow run ID');
-  const runId = positiveInteger(args['run-id'], 'controller workflow run ID');
-  assertTrustedWorkflowRef(repository, args['workflow-ref']);
-  await assertSuccessfulSourceRun(sourceRunId, sha);
-  if (await previewPullState(sha) === 'current') {
-    process.stdout.write(`${stableJson({ inactivatedDeploymentIds: [] })}\n`);
-    return;
-  }
-  const cards = await inactivateSupersededPreviewDeployments({
-    request: github,
-    verify: async () => {
-      await assertSuccessfulSourceRun(sourceRunId, sha);
-      await assertSupersededPullRequest(sha);
-    },
-    verifyAnnouncement: assertPreviewAnnouncementRun,
-    description: 'Preview superseded by a newer PR head',
-    logUrl: actionRunLogUrl(),
-    repository,
-    pr,
-    sha,
-    sourceRunId,
-    runId,
-  });
-  process.stdout.write(`${stableJson(cards)}\n`);
-}
-
-async function completeDeploymentCard() {
-  const sha = headSha(args['head-sha']);
-  const sourceRunId = positiveInteger(args['source-run-id'], 'source workflow run ID');
-  const runId = positiveInteger(args['run-id'], 'controller workflow run ID');
-  assertTrustedWorkflowRef(repository, args['workflow-ref']);
-  const card = await completePreviewDeployment({
-    request: github,
-    verify: previewVerifier(sha, sourceRunId),
-    verifyAnnouncement: assertPreviewAnnouncementRun,
-    repository,
-    pr,
-    sha,
-    sourceRunId,
-    runId,
-    deploymentId: args['deployment-id'],
-    outcome: args.outcome,
-  });
-  process.stdout.write(`${stableJson(card)}\n`);
 }
 
 function previewPrNumbers(value) {
@@ -586,6 +97,13 @@ function previewPrNumbers(value) {
   return numbers;
 }
 
+/**
+ * The one deployment-card operation left in this script. Provisioning cards are GitHub's job:
+ * the preview job declares `environment: preview/pr-N`, so GitHub opens the deployment when the
+ * job starts and closes it with the job's own conclusion. Nothing can report a state the
+ * workflow is not in. Removal is the exception — a resource sweep is not a job conclusion, so
+ * close and the janitor retire the card explicitly after the Cloudflare delete succeeds.
+ */
 async function deactivatePreviewCards(number) {
   return deactivatePreviewDeployments({
     request: github,
@@ -758,30 +276,30 @@ async function recordMigrationLedger(databaseId, artifactMigrations, appliedName
   );
 }
 
-function trustedChildEnvironment() {
-  return trustedWranglerEnvironment(process.env, previewToken, previewAccountId);
+function previewChildEnvironment() {
+  return previewWranglerEnvironment(process.env, previewToken, previewAccountId);
 }
 
 function runJson(commandPath, commandArgs, cwd) {
   const result = spawnSync(process.execPath, [commandPath, ...commandArgs], {
     cwd,
-    env: trustedChildEnvironment(),
+    env: previewChildEnvironment(),
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 15 * 60 * 1000,
   });
   if (result.error) throw result.error;
   if (result.status !== 0) {
-    fail(`trusted command failed with exit ${result.status}: ${(result.stderr ?? result.stdout ?? '').trim().slice(-8000)}`);
+    fail(`preview command failed with exit ${result.status}: ${(result.stderr ?? result.stdout ?? '').trim().slice(-8000)}`);
   }
   const output = result.stdout.trim();
-  try { return JSON.parse(output); } catch { fail(`trusted command did not emit one JSON object: ${output.slice(-2000)}`); }
+  try { return JSON.parse(output); } catch { fail(`preview command did not emit one JSON object: ${output.slice(-2000)}`); }
 }
 
 function runWrangler(wrangler, commandArgs, cwd, operation) {
   const result = spawnSync(process.execPath, [wrangler, ...commandArgs], {
     cwd,
-    env: trustedChildEnvironment(),
+    env: previewChildEnvironment(),
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
     timeout: 15 * 60 * 1000,
@@ -807,45 +325,86 @@ function deployApp(wrangler, configPath, cwd, expectedHost) {
   return output;
 }
 
+/**
+ * Bundle the PR's own hub source with its own pinned Wrangler, in the job that deploys it.
+ * Nothing crosses a trust boundary here, so there is no artifact, manifest set, or provenance
+ * to verify: the digests below exist for DRIFT detection — smoke asserts the live Worker reports
+ * exactly the bundle and schema this run deployed — not to attest anything to a later job.
+ */
+async function buildPreviewBundle({ hubRoot, wrangler, names, workDirectory }) {
+  const entrypoint = path.join(hubRoot, 'src', 'preview.ts');
+  await assertContainedRegularFile(hubRoot, entrypoint, 'preview entrypoint');
+  const configPath = path.join(workDirectory, 'wrangler.preview-build.json');
+  const metafilePath = path.join(workDirectory, 'esbuild-meta.json');
+  const bundleDirectory = path.join(workDirectory, 'bundle');
+  await writeCanonicalJson(configPath, generatedBuildConfig({ main: entrypoint, workerName: names.app }));
+
+  runWrangler(wrangler, [
+    'deploy', '--dry-run', '--config', configPath,
+    '--outdir', bundleDirectory, '--metafile', metafilePath,
+  ], hubRoot, 'preview bundle');
+
+  const bundle = await wranglerWorkerBundle(bundleDirectory);
+  const output = await fileRecord(bundle, 'worker.mjs');
+  if (output.size > MAX_WORKER_BUNDLE_BYTES) fail('Worker bundle exceeds the size limit');
+
+  const metadata = JSON.parse(await readFile(metafilePath, 'utf8'));
+  if (!metadata.inputs || typeof metadata.inputs !== 'object') fail('Wrangler did not produce an input metafile');
+  const inputs = [];
+  for (const input of Object.keys(metadata.inputs).sort()) {
+    if (input.startsWith('<')) continue;
+    const file = resolveBundlerInputPath(path.dirname(configPath), input);
+    await assertContainedRegularFile(hubRoot, file, `bundler input ${input}`);
+    inputs.push(await fileRecord(file, path.relative(hubRoot, file)));
+  }
+  inputs.push(await fileRecord(path.join(hubRoot, 'package-lock.json'), 'package-lock.json'));
+  inputs.sort((left, right) => left.path.localeCompare(right.path));
+
+  return {
+    bundle,
+    artifactDigest: output.sha256,
+    buildInputDigest: sha256Bytes(stableJson(inputs)),
+  };
+}
+
+/**
+ * Build, migrate, and deploy one PR's self-contained preview, in place, from a single checkout.
+ * Every name is derived from the PR number, so a re-run is idempotent and a concurrent run for
+ * a different PR cannot collide. The account pin and production-identifier scan stay: they guard
+ * against a misconfigured account or a copy-pasted production ID, which is an accident this job
+ * can still plausibly have.
+ */
 async function provision() {
   requireCloudflareEnvironment();
   const seed = requireBearerSeed();
   const sha = headSha(args['head-sha']);
-  const runId = positiveInteger(args['run-id'], 'build workflow run ID');
-  const sourceRunId = positiveInteger(args['source-run-id'], 'source workflow run ID');
-  const workflowRef = assertTrustedWorkflowRef(repository, args['workflow-ref']);
-  const artifact = await verifyArtifact(args.artifact, {
-    repository,
-    pr,
-    headSha: sha,
-    sourceWorkflowRunId: sourceRunId,
-    buildWorkflowRunId: runId,
-    trustedWorkflowRef: workflowRef,
-  });
-  await assertSuccessfulSourceRun(sourceRunId, sha);
-  await assertOpenSameRepositoryPullRequest(sha);
+  const hubRoot = path.resolve(args.hub ?? 'hub');
+  const wrangler = path.resolve(args.wrangler);
   const names = resourceNames(pr);
-  const migrationDirectory = path.join(artifact.root, 'payload', 'migrations');
-  const artifactMigrationManifest = JSON.parse(
-    await readFile(path.join(migrationDirectory, 'manifest.json'), 'utf8'),
-  );
-  if (!Array.isArray(artifactMigrationManifest.migrations)) fail('artifact migration manifest has no migrations');
 
-  const resources = await ensureBackingResources(names);
+  const migrationsDirectory = path.join(hubRoot, 'migrations');
+  const migrationManifestPath = path.join(migrationsDirectory, 'manifest.json');
+  // A stray file in migrations/ would be silently ignored by the runner; reject it here.
+  migrationSqlNames(await readdir(migrationsDirectory));
+  const migrationManifest = JSON.parse(await readFile(migrationManifestPath, 'utf8'));
+  if (!Array.isArray(migrationManifest.migrations)) fail('migration manifest has no migrations');
+  const expectedMigrationDigest = migrationDigest(migrationManifest);
 
-  const divergence = await migrationDivergence(resources.d1, artifactMigrationManifest.migrations);
-  if (divergence.diverged) {
-    process.stderr.write(`!! preview D1 reset: ${divergence.reason} — dropping ${names.d1} and reapplying from scratch\n`);
-    await cf(`d1/database/${encodeURIComponent(resources.d1)}`, { method: 'DELETE', allowNotFound: true });
-    resources.d1 = await ensureResource('d1', names.d1, 'd1/database', { name: names.d1 }, ['uuid', 'id']);
-    // The index rows are gone with the database, so the stored R2 objects would be
-    // unreachable orphans — drop them in the same reset to keep the two stores consistent.
-    await emptyR2Bucket(names.r2, cf);
-  }
-
-  const temporary = path.join(os.tmpdir(), `sessions-preview-${pr}-${runId}`);
-  await mkdir(temporary, { recursive: false });
+  const temporary = await mkdtemp(path.join(os.tmpdir(), `sessions-preview-${pr}-`));
   try {
+    const build = await buildPreviewBundle({ hubRoot, wrangler, names, workDirectory: temporary });
+    const resources = await ensureBackingResources(names);
+
+    const divergence = await migrationDivergence(resources.d1, migrationManifest.migrations);
+    if (divergence.diverged) {
+      process.stderr.write(`!! preview D1 reset: ${divergence.reason} — dropping ${names.d1} and reapplying from scratch\n`);
+      await cf(`d1/database/${encodeURIComponent(resources.d1)}`, { method: 'DELETE', allowNotFound: true });
+      resources.d1 = await ensureResource('d1', names.d1, 'd1/database', { name: names.d1 }, ['uuid', 'id']);
+      // The index rows are gone with the database, so the stored R2 objects would be
+      // unreachable orphans — drop them in the same reset to keep the two stores consistent.
+      await emptyR2Bucket(names.r2, cf);
+    }
+
     const application = {
       assetSigningSecret: randomBytes(32).toString('base64url'),
       previewBearer: previewBearerToken(seed, pr),
@@ -854,53 +413,52 @@ async function provision() {
       ...resources,
       pr,
       headSha: sha,
-      buildInputDigest: artifact.provenance.buildInputDigest,
-      artifactDigest: artifact.provenance.artifactDigest,
-      migrationDigest: artifact.provenance.migrationDigest,
+      buildInputDigest: build.buildInputDigest,
+      artifactDigest: build.artifactDigest,
+      migrationDigest: expectedMigrationDigest,
     };
-
-    const migrationConfigPath = path.join(temporary, 'wrangler.migrations.generated.json');
-    await writeCanonicalJson(migrationConfigPath, generatedPrivateAppConfig({
+    const generateConfig = (file, schemaDigest) => writeCanonicalJson(file, generatedPrivateAppConfig({
       accountId: previewAccountId,
-      main: path.join(artifact.root, 'payload', 'worker.mjs'),
-      migrationsDir: migrationDirectory,
+      main: build.bundle,
+      migrationsDir: migrationsDirectory,
       names,
-      resources: { ...configResources, schemaDigest: '0'.repeat(64) },
+      resources: { ...configResources, schemaDigest },
       application,
     }));
-    const migrationJournalPath = path.join(temporary, `preview-${pr}.migrations.json`);
+
+    const migrationConfigPath = path.join(temporary, 'wrangler.migrations.generated.json');
+    await generateConfig(migrationConfigPath, '0'.repeat(64));
     const migration = runJson(path.resolve(args['migrations-cli']), [
       'apply', '--target', 'preview', '--config', migrationConfigPath, '--database', 'DB',
-      '--journal', migrationJournalPath, '--artifact-digest', artifact.provenance.artifactDigest,
+      '--journal', path.join(temporary, `preview-${pr}.migrations.json`),
+      '--artifact-digest', build.artifactDigest,
       '--deployment-id', `pr-${pr}-${sha.slice(0, 12)}`,
-      '--migrations-dir', migrationDirectory,
-      '--manifest', path.join(migrationDirectory, 'manifest.json'),
-      '--base-manifest', path.resolve(path.dirname(args['migrations-cli']), '..', 'migrations', 'manifest.json'),
-    ], process.cwd());
+      '--migrations-dir', migrationsDirectory,
+      '--manifest', migrationManifestPath,
+      // The immutable committed baseline, the same evidence production migrations use. The
+      // PR-vs-protected-base check is CI's `migrations.mjs check`, which gates this job.
+      '--base-manifest', path.join(migrationsDirectory, 'source-baseline.json'),
+    ], hubRoot);
     if (migration.pendingMigrations !== 0 || !/^[0-9a-f]{64}$/.test(migration.schemaDigest ?? '')) {
       fail('migration runner did not prove zero pending migrations and a schema digest');
     }
-    if (migration.migrationDigest !== artifact.provenance.migrationDigest) {
-      fail('applied migration digest differs from provenance');
+    if (migration.migrationDigest !== expectedMigrationDigest) {
+      fail('applied migration digest differs from the checked-out manifest');
     }
-    const appliedNames = artifactMigrationManifest.migrations.map((item) => item.filename);
-    await recordMigrationLedger(resources.d1, artifactMigrationManifest.migrations, appliedNames);
+    await recordMigrationLedger(
+      resources.d1,
+      migrationManifest.migrations,
+      migrationManifest.migrations.map((item) => item.filename),
+    );
 
     const appConfigPath = path.join(temporary, 'wrangler.app.generated.json');
-    await writeCanonicalJson(appConfigPath, generatedPrivateAppConfig({
-      accountId: previewAccountId,
-      main: path.join(artifact.root, 'payload', 'worker.mjs'),
-      migrationsDir: migrationDirectory,
-      names,
-      resources: { ...configResources, schemaDigest: migration.schemaDigest },
-      application,
-    }));
-    deployApp(path.resolve(args.wrangler), appConfigPath, artifact.root, names.host);
+    await generateConfig(appConfigPath, migration.schemaDigest);
+    deployApp(wrangler, appConfigPath, hubRoot, names.host);
 
     const summary = {
       url: `https://${names.host}`,
       d1Reset: divergence.diverged,
-      artifactDigest: artifact.provenance.artifactDigest,
+      artifactDigest: build.artifactDigest,
       schemaDigest: migration.schemaDigest,
     };
     if (args['github-output']) {
@@ -1188,13 +746,6 @@ async function janitor() {
 }
 
 if (command === 'provision') await provision();
-else if (command === 'deployment-queue') await queueDeploymentCard();
-else if (command === 'deployment-reconcile') await reconcileQueuedDeploymentCard();
-else if (command === 'deployment-reset-queue') await resetQueueDeploymentCard();
-else if (command === 'deployment-claim') await claimDeploymentCard();
-else if (command === 'deployment-reject') await rejectDeploymentCards();
-else if (command === 'deployment-supersede') await supersedeDeploymentCards();
-else if (command === 'deployment-status') await completeDeploymentCard();
 else if (command === 'deployment-inactivate') await inactivateDeploymentCards();
 else if (command === 'deployment-inactivate-batch') await inactivateDeploymentCardsBatch();
 else if (command === 'seed') await seed();

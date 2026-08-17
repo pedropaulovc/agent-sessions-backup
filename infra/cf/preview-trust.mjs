@@ -1,17 +1,11 @@
-import { createHash, createHmac, createPublicKey } from 'node:crypto';
+import { createHash, createHmac } from 'node:crypto';
 import { lstat, open, readFile, realpath, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 export const PRODUCTION_ACCOUNT_ID = '18ef3246e9f36d1560485ef53889c0ab';
 export const PREVIEW_ACCOUNT_ID = 'cbb04a26e6fa2d0cdc4eb67c735e5669';
 export const PREVIEW_WORKERS_DEV_SUFFIX = '.agent-sessions-nonproduction.workers.dev';
-export const MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
-export const ARTIFACT_FILES = new Set([
-  'build-manifest.json',
-  'content-manifest.json',
-  'migration-manifest.json',
-  'provenance.json',
-]);
+export const MAX_WORKER_BUNDLE_BYTES = 20 * 1024 * 1024;
 
 const TRUSTED_MIGRATION_METADATA = new Set([
   'historical-baseline.json',
@@ -62,7 +56,12 @@ export function required(value, name) {
   return value;
 }
 
-export function trustedWranglerEnvironment(source, apiToken, accountId) {
+/**
+ * The child environment every Wrangler/migration subprocess gets. Allow-listed, not inherited:
+ * the preview job's own environment carries GitHub tokens and the bearer seed, and none of that
+ * has any business reaching Wrangler.
+ */
+export function previewWranglerEnvironment(source, apiToken, accountId) {
   required(apiToken, 'preview Cloudflare API token');
   assertPreviewAccount(accountId);
   const environment = {};
@@ -79,11 +78,11 @@ export function trustedWranglerEnvironment(source, apiToken, accountId) {
 
 /**
  * The per-PR preview bearer, derived — not distributed. Every principal that needs it (the
- * provision job baking it into the Worker, the CI smoke/e2e jobs, the owner's machines via
+ * preview job baking it into the Worker, the smoke/e2e steps, the owner's machines via
  * `~/.config/agent-sessions/preview-seed`) derives the same token from one standing seed, so
- * the public repo never has to move a secret through logs, artifacts, or job outputs. The
- * Worker holds only the DERIVED per-PR token: leaking one preview's token compromises that
- * one disposable preview, never the seed or the fleet.
+ * the public repo never has to move a secret through logs or job outputs. The Worker holds
+ * only the DERIVED per-PR token: reading one preview's Worker vars exposes that one disposable
+ * preview, not the seed.
  */
 export function previewBearerToken(seed, pr) {
   if (typeof seed !== 'string' || seed.trim().length < 32) {
@@ -232,86 +231,6 @@ export function repositoryName(value) {
   return value;
 }
 
-function trustedWorkflowRef(repository, workflow, workflowRef, message) {
-  const expected = `${repositoryName(repository)}/.github/workflows/${workflow}@refs/heads/main`;
-  if (workflowRef !== expected) fail(message);
-  return workflowRef;
-}
-
-export function assertTrustedWorkflowRef(repository, workflowRef) {
-  return trustedWorkflowRef(
-    repository,
-    'preview-control.yml',
-    workflowRef,
-    'build must run from the trusted default-branch preview-control workflow',
-  );
-}
-
-export function assertTrustedPreviewQueueWorkflowRef(repository, workflowRef) {
-  return trustedWorkflowRef(
-    repository,
-    'preview-queue.yml',
-    workflowRef,
-    'preview queue must run from the trusted default-branch preview-queue workflow',
-  );
-}
-
-export function assertTrustedPreviewResetWorkflowRef(repository, workflowRef) {
-  return trustedWorkflowRef(
-    repository,
-    'preview-close.yml',
-    workflowRef,
-    'preview reset must run from the trusted default-branch preview-close workflow',
-  );
-}
-
-export function assertSameRepositoryOpenPullRequest(repository, pr, pull, expectedSha = null) {
-  const name = repositoryName(repository);
-  const number = positiveInteger(pr, 'PR number');
-  if (pull?.state !== 'open') fail(`PR ${number} is not open`);
-  if (pull.head?.repo?.full_name !== name) fail(`PR ${number} is not a same-repository PR`);
-  if (expectedSha != null && pull.head?.sha !== headSha(expectedSha)) {
-    fail(`PR ${number} head changed before preview control`);
-  }
-  return pull;
-}
-
-export function assertTrustedSourceCiRun(repository, pr, run, runId, expectedSha) {
-  const name = repositoryName(repository);
-  const number = positiveInteger(pr, 'PR number');
-  const id = positiveInteger(runId, 'source workflow run ID');
-  const sha = headSha(expectedSha);
-  if (run?.id !== id || run.event !== 'pull_request' || run.head_sha !== sha
-    || run.repository?.full_name !== name || run.head_repository?.full_name !== name
-    || run.name !== 'CI' || run.path !== '.github/workflows/ci.yml'
-    || !run.pull_requests?.some((pull) => pull.number === number)) {
-    fail('source workflow run is not CI for this same-repository PR head');
-  }
-  return run;
-}
-
-export function assertTrustedPreviewQueueRun(repository, run, runId) {
-  const name = repositoryName(repository);
-  const id = positiveInteger(runId, 'preview announcement workflow run ID');
-  if (run?.id !== id || run.event !== 'pull_request_target'
-    || run.repository?.full_name !== name || run.head_repository?.full_name !== name
-    || run.name !== 'Preview Queue' || run.path !== '.github/workflows/preview-queue.yml') {
-    fail('preview announcement was not created by the trusted PR queue workflow');
-  }
-  return run;
-}
-
-export function assertTrustedPreviewResetRun(repository, run, runId) {
-  const name = repositoryName(repository);
-  const id = positiveInteger(runId, 'preview reset workflow run ID');
-  if (run?.id !== id || run.event !== 'workflow_dispatch'
-    || run.repository?.full_name !== name
-    || run.name !== 'Preview Close' || run.path !== '.github/workflows/preview-close.yml') {
-    fail('preview reset was not created by the trusted Preview Close workflow');
-  }
-  return run;
-}
-
 /**
  * Stable per-PR resource names. Each PR gets ONE persistent environment deployed in place —
  * the worker keeps its workers.dev hostname across pushes, and the backing resources survive
@@ -393,9 +312,9 @@ export function assertNoProductionIdentifiers(value, at = '$') {
   }
 }
 
-export function migrationArtifactSqlNames(entries) {
+export function migrationSqlNames(entries) {
   if (!Array.isArray(entries) || !entries.includes('manifest.json')) {
-    fail('preview artifact has no migration manifest');
+    fail('hub/migrations has no manifest.json');
   }
   const trustedMetadata = TRUSTED_MIGRATION_METADATA;
   const sql = [];
@@ -403,7 +322,7 @@ export function migrationArtifactSqlNames(entries) {
     if (/^[0-9]{4}_[a-z0-9_]+\.sql$/.test(name)) sql.push(name);
     else if (name !== 'manifest.json' && !trustedMetadata.has(name)) fail(`unexpected migration entry: ${name}`);
   }
-  if (sql.length === 0) fail('preview artifact has no numbered SQL migrations');
+  if (sql.length === 0) fail('hub/migrations has no numbered SQL files');
   return sql.sort();
 }
 
@@ -506,22 +425,6 @@ export async function assertContainedRegularFile(root, candidate, label) {
   const stat = await lstat(candidate);
   if (!stat.isFile() || stat.isSymbolicLink()) fail(`${label} is not a regular file`);
   return fileReal;
-}
-
-export async function walkRegularFiles(root) {
-  const found = [];
-  async function visit(directory, relative) {
-    for (const entry of await readdir(directory, { withFileTypes: true })) {
-      const rel = relative ? `${relative}/${entry.name}` : entry.name;
-      const full = path.join(directory, entry.name);
-      if (entry.isSymbolicLink()) fail(`links are forbidden in artifacts: ${rel}`);
-      if (entry.isDirectory()) await visit(full, rel);
-      else if (entry.isFile()) found.push(rel.replaceAll('\\', '/'));
-      else fail(`non-regular artifact entry rejected: ${rel}`);
-    }
-  }
-  await visit(root, '');
-  return found.sort();
 }
 
 /**
