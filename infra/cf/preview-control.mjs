@@ -538,6 +538,7 @@ async function previewFetch(context, target, init = {}) {
 
 const DIAGNOSTICS_SETTLE_MS = 90_000;
 const DIAGNOSTICS_POLL_MS = 3_000;
+const DIAGNOSTICS_REQUEST_MS = 15_000;
 
 async function smoke() {
   const context = bearerContext();
@@ -563,23 +564,39 @@ async function smoke() {
   // failed deploy. Observed on PR #139: a deploy whose bundle was unchanged served the previous
   // headSha for seconds, then the correct one.
   let diagnostics = null;
+  let stalled = null;
   const deadline = Date.now() + DIAGNOSTICS_SETTLE_MS;
   for (let attempt = 0; ; attempt += 1) {
-    const response = await previewFetch(context, '/api/v1/preview/diagnostics', {
-      headers: { accept: 'application/json' },
-    });
-    if (!response.ok) {
+    // Every request is bounded by whichever comes first, its own cap or the settle deadline, so
+    // one stalled connection cannot stretch the wait past the budget.
+    const budget = Math.min(DIAGNOSTICS_REQUEST_MS, Math.max(deadline - Date.now(), 1_000));
+    let response = null;
+    try {
+      response = await previewFetch(context, '/api/v1/preview/diagnostics', {
+        headers: { accept: 'application/json' },
+        signal: AbortSignal.timeout(budget),
+      });
+    } catch (error) {
+      // A stalled or reset edge connection is the same transient class as a stale version;
+      // remember it so a run that only ever stalls fails saying so.
+      stalled = error;
+    }
+    if (response && !response.ok) {
       fail(`preview diagnostics smoke failed with ${response.status}: ${(await response.text()).slice(0, 500)}`);
     }
-    diagnostics = await response.json();
-    if (diagnostics.headSha === sha
-      && diagnostics.artifactDigest === expectedArtifact
-      && diagnostics.schemaDigest === expectedSchema) break;
-    if (Date.now() >= deadline) {
-      fail(`preview diagnostics still do not match the provisioned artifact after `
-        + `${Math.round(DIAGNOSTICS_SETTLE_MS / 1000)}s: ${stableJson(diagnostics)}`);
+    if (response) {
+      stalled = null;
+      diagnostics = await response.json();
+      if (diagnostics.headSha === sha
+        && diagnostics.artifactDigest === expectedArtifact
+        && diagnostics.schemaDigest === expectedSchema) break;
     }
-    if (attempt === 0) process.stdout.write('preview diagnostics still report the previous version; waiting for the deploy to propagate\n');
+    if (Date.now() >= deadline) {
+      const seen = stalled ? `last attempt failed: ${stalled.message}` : stableJson(diagnostics);
+      fail(`preview diagnostics still do not match the provisioned artifact after `
+        + `${Math.round(DIAGNOSTICS_SETTLE_MS / 1000)}s: ${seen}`);
+    }
+    if (attempt === 0) process.stdout.write('preview diagnostics do not match yet; waiting for the deploy to propagate\n');
     await new Promise((resolve) => { setTimeout(resolve, DIAGNOSTICS_POLL_MS); });
   }
   process.stdout.write(`${stableJson({ smoke: 'passed', url: context.origin, artifactDigest: expectedArtifact, schemaDigest: expectedSchema })}\n`);
