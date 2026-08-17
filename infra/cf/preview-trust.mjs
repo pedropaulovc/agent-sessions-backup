@@ -4,7 +4,7 @@ import path from 'node:path';
 
 export const PRODUCTION_ACCOUNT_ID = '18ef3246e9f36d1560485ef53889c0ab';
 export const PREVIEW_ACCOUNT_ID = 'cbb04a26e6fa2d0cdc4eb67c735e5669';
-export const PREVIEW_WORKERS_DEV_SUFFIX = '.agent-sessions-nonproduction.workers.dev';
+export const PREVIEW_WORKERS_DEV_SUFFIX = '.sessions-ppe.workers.dev';
 export const MAX_WORKER_BUNDLE_BYTES = 20 * 1024 * 1024;
 
 const TRUSTED_MIGRATION_METADATA = new Set([

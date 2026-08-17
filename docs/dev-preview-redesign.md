@@ -7,7 +7,7 @@ Status: partially superseded (2026-08-13)
 > (`pr-N-preview.sessions.vza.net`), Cloudflare Access, the signed request assertions,
 > the blue/green generation machinery, and the encrypted `sessions-dev-bridge` flow are
 > gone. Each PR now gets a **self-contained preview** at
-> `https://pr-<n>-app.agent-sessions-nonproduction.workers.dev`, gated by one derived
+> `https://pr-<n>-app.sessions-ppe.workers.dev`, gated by one derived
 > per-PR bearer, with persistent per-PR resources; production sessions move into a
 > preview as a hand-carried zip (viewer "Export zip" → `preview-upload-session.mjs`).
 > Current model: `infra/cf/deploy.md` ("Trusted per-PR preview controller" and "Moving a

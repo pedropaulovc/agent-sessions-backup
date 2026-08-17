@@ -122,7 +122,7 @@ export function derivePreviewBearer(seed, pr) {
 
 export function previewUrl(pr, seed = null) {
   if (!Number.isSafeInteger(pr) || pr <= 0) throw new Error('PR number must be a safe positive integer');
-  const base = `https://pr-${pr}-app.agent-sessions-nonproduction.workers.dev`;
+  const base = `https://pr-${pr}-app.sessions-ppe.workers.dev`;
   if (seed === null) return base;
   return `${base}/?token=${derivePreviewBearer(seed, pr)}`;
 }

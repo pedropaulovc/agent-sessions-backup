@@ -137,7 +137,7 @@ jobs:
       # The stable per-PR hostname from resourceNames() in infra/cf/preview-trust.mjs. Declared
       # statically so the card links somewhere from the first second, and because the preview is
       # deployed in place: on a failed run the link still reaches the previous good deploy.
-      url: https://pr-${{ github.event.number }}-app.agent-sessions-nonproduction.workers.dev
+      url: https://pr-${{ github.event.number }}-app.sessions-ppe.workers.dev
     concurrency:
       group: preview-pr-${{ github.event.number }}
       cancel-in-progress: false

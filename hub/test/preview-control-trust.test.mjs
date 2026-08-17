@@ -79,7 +79,7 @@ describe('stable per-PR resource names', () => {
       kv: 'pr-42-sessions-hub-kv',
       queue: 'pr-42-parse',
       dlq: 'pr-42-parse-dlq',
-      host: 'pr-42-app.agent-sessions-nonproduction.workers.dev',
+      host: 'pr-42-app.sessions-ppe.workers.dev',
     });
     expect(() => resourceNames(0)).toThrow(/positive integer/);
   });
@@ -300,7 +300,7 @@ describe('private preview application config', () => {
     expect(config.vars.ENVIRONMENT).toBe('preview');
     expect(config.vars.PREVIEW_BEARER).toBe(previewBearerToken(SEED, 42));
     expect(config.vars.ASSET_SIGNING_SECRET).toBe(ASSET_SECRET);
-    expect(config.vars.API_HOST).toBe('pr-42-app.agent-sessions-nonproduction.workers.dev');
+    expect(config.vars.API_HOST).toBe('pr-42-app.sessions-ppe.workers.dev');
     expect(config.vars.VIEWER_HOST).toBe(config.vars.API_HOST);
     expect(config.vars.PREVIEW_PR_NUMBER).toBe('42');
     // The assertion/JWKS machinery died with the front door — its vars must never come back.

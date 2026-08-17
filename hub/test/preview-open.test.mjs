@@ -17,10 +17,10 @@ const SEED = 's'.repeat(48);
 
 test('constructs the stable tokenized workers.dev URL for a valid PR', () => {
   assert.deepEqual(parsePreviewOpenArguments(['--pr', '42']), { pr: 42, printOnly: false });
-  assert.equal(previewUrl(42), 'https://pr-42-app.agent-sessions-nonproduction.workers.dev');
+  assert.equal(previewUrl(42), 'https://pr-42-app.sessions-ppe.workers.dev');
   assert.equal(
     previewUrl(42, SEED),
-    `https://pr-42-app.agent-sessions-nonproduction.workers.dev/?token=${derivePreviewBearer(SEED, 42)}`,
+    `https://pr-42-app.sessions-ppe.workers.dev/?token=${derivePreviewBearer(SEED, 42)}`,
   );
 });
 
@@ -149,14 +149,14 @@ test('a missing seed warns and prints the bare URL', async () => {
     log: (line) => output.push(line),
     warn: (line) => warnings.push(line),
   });
-  assert.equal(url, 'https://pr-7-app.agent-sessions-nonproduction.workers.dev');
+  assert.equal(url, 'https://pr-7-app.sessions-ppe.workers.dev');
   assert.deepEqual(output, [url]);
   assert.equal(warnings.length, 1);
   assert.match(warnings[0], /no preview seed found/);
 });
 
 test('uses direct argument-array launchers on Windows, macOS, and Linux', () => {
-  const url = 'https://pr-9-app.agent-sessions-nonproduction.workers.dev';
+  const url = 'https://pr-9-app.sessions-ppe.workers.dev';
   assert.deepEqual(browserLauncher(url, 'win32'), { command: 'explorer.exe', args: [url] });
   assert.deepEqual(browserLauncher(url, 'darwin'), { command: 'open', args: [url] });
   assert.deepEqual(browserLauncher(url, 'linux'), { command: 'xdg-open', args: [url] });

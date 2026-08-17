@@ -57,7 +57,7 @@ authenticate:
    (`hub/src/router.ts`; development keeps cert reads for the local loop).
 
 Per-PR previews expose this same API at
-`https://pr-<n>-app.agent-sessions-nonproduction.workers.dev`, authenticated by the
+`https://pr-<n>-app.sessions-ppe.workers.dev`, authenticated by the
 derived per-PR bearer (`Authorization: Bearer …`; see `infra/cf/deploy.md`) — the bearer
 acts as an admin machine identity there, which is what
 `hub/scripts/preview-upload-session.mjs` uses to push hand-carried session zips.

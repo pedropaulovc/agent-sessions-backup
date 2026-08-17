@@ -13,7 +13,7 @@ row of this table — never a choice:
 | identity | account | holds | used for |
 |---|---|---|---|
 | `pedro@vza.net` | **production** `18ef3246e9f36d1560485ef53889c0ab` | the live hub (`sessions.vza.net` / `api.sessions.vza.net`), production D1/R2/Queues, the managed CA | production deploys (protected, `main`-only CI), production secrets (`wrangler secret put` after `whoami` shows this account), zone administration |
-| `pedro@vezza.com.br` | **non-production** `cbb04a26e6fa2d0cdc4eb67c735e5669` (workers.dev subdomain `agent-sessions-nonproduction`) | per-PR self-contained previews (`pr-<n>-*` Worker + D1/R2/KV/Queues) — no production resource, credential, or data | the `preview` job in CI (via the account-scoped token below), and exceptional hand-run preview administration (scoped `wrangler login` per AGENTS.md) |
+| `pedro@vezza.com.br` | **non-production** `cbb04a26e6fa2d0cdc4eb67c735e5669` (workers.dev subdomain `sessions-ppe`) | per-PR self-contained previews (`pr-<n>-*` Worker + D1/R2/KV/Queues) — no production resource, credential, or data | the `preview` job in CI (via the account-scoped token below), and exceptional hand-run preview administration (scoped `wrangler login` per AGENTS.md) |
 
 Rules that follow from the table:
 
@@ -48,7 +48,7 @@ config, the `pr-<n>-` name prefix on every resource) guards against a **misconfi
 a wrong account ID, a copy-pasted production resource name — not against the PR author.
 
 Each PR gets a **self-contained preview deployed in place**: one stable Worker `pr-<number>-app`,
-publicly reachable at `https://pr-<number>-app.agent-sessions-nonproduction.workers.dev`, backed
+publicly reachable at `https://pr-<number>-app.sessions-ppe.workers.dev`, backed
 by persistent `pr-<number>-{sessions-index,agent-sessions,sessions-hub-kv,parse,parse-dlq}`
 resources created if missing and reused across pushes. There is no front door, no Cloudflare
 Access, and no blue/green generation machinery — the deploy IS the promote, so a broken push
@@ -140,7 +140,7 @@ So: create the token by hand once, then `--set --token-file`. The script install
 account ID on its own, so the paste is the only thing left, and a 90-day account-pinned token beats
 a user-wide OAuth grant for CI anyway — it cannot follow the identity into a new account.
 
-That account's workers.dev subdomain is `agent-sessions-nonproduction.workers.dev`. The token is
+That account's workers.dev subdomain is `sessions-ppe.workers.dev`. The token is
 restricted to this non-production account, expires after 90 days, and has Workers Scripts Write,
 Workers KV Storage Write, D1 Write, Workers R2 Storage Write, Queues Write, and Account Settings
 Read — nothing tails, so there is no Workers Tail Read. Rotate it before expiry by re-running the

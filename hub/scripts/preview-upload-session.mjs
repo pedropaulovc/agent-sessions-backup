@@ -137,7 +137,7 @@ export async function main(argv = process.argv.slice(2), options = {}) {
     throw new Error('no preview seed found (~/.config/agent-sessions/preview-seed or PREVIEW_BEARER_SEED)');
   }
   const token = derivePreviewBearer(seed, pr);
-  const origin = `https://pr-${pr}-app.agent-sessions-nonproduction.workers.dev`;
+  const origin = `https://pr-${pr}-app.sessions-ppe.workers.dev`;
   const { manifest, entries } = readExportZip(new Uint8Array(readFileSync(zip)));
   log(`uploading session ${manifest.session_id} (${entries.length} entries) to ${origin}`);
   for (const entry of entries) await putEntry(origin, token, entry, log);

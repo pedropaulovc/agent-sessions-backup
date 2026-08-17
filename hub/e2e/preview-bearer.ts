@@ -13,7 +13,7 @@ export function derivedPreviewBearer(
 ): string | null {
   const seed = environment.PREVIEW_BEARER_SEED?.trim();
   if (!seed || seed.length < 32) return null;
-  const match = /^pr-([1-9][0-9]*)-app\.agent-sessions-nonproduction\.workers\.dev$/
+  const match = /^pr-([1-9][0-9]*)-app\.sessions-ppe\.workers\.dev$/
     .exec(new URL(environmentURL).hostname);
   if (!match) return null;
   return createHmac('sha256', seed).update(`sessions-preview-bearer:pr-${match[1]}`).digest('base64url');
