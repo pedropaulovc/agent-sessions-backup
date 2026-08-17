@@ -8,7 +8,7 @@ import { ccAssistantLine, ccUserLine } from './fixtures';
 
 const testEnv = env as unknown as Env;
 const TOKEN = 'T'.repeat(43);
-const HOST = 'pr-42-app.agent-sessions-nonproduction.workers.dev';
+const HOST = 'pr-42.sessions-ppe.workers.dev';
 const SESSION = 'beefbeef-1111-4111-8111-111111111111';
 const MACHINE = 'original-prod-machine';
 

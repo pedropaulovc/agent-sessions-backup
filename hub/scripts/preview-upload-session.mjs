@@ -137,12 +137,12 @@ export async function main(argv = process.argv.slice(2), options = {}) {
     throw new Error('no preview seed found (~/.config/agent-sessions/preview-seed or PREVIEW_BEARER_SEED)');
   }
   const token = derivePreviewBearer(seed, pr);
-  const origin = `https://pr-${pr}-app.agent-sessions-nonproduction.workers.dev`;
+  const origin = `https://pr-${pr}.sessions-ppe.workers.dev`;
   const { manifest, entries } = readExportZip(new Uint8Array(readFileSync(zip)));
   log(`uploading session ${manifest.session_id} (${entries.length} entries) to ${origin}`);
   for (const entry of entries) await putEntry(origin, token, entry, log);
   await waitForSession(origin, token, manifest.session_id, log);
-  log(`indexed — view it at ${origin}/s/${encodeURIComponent(manifest.session_id)}?token=…  (mint the tokenized link with: npm --prefix hub run preview:open -- --pr ${pr} --print-only)`);
+  log(`indexed — open the PPE preview page with: npm --prefix hub run preview:open -- --pr ${pr}`);
   return { sessionId: manifest.session_id, origin, entries: entries.length };
 }
 

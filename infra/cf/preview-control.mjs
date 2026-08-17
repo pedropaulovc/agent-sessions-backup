@@ -690,6 +690,7 @@ async function deleteResourceSet(ownerPr, names) {
   }
   const plan = [
     ['worker', names.app, (id) => `workers/scripts/${encodeURIComponent(id)}`],
+    ['worker', names.legacyApp, (id) => `workers/scripts/${encodeURIComponent(id)}`],
     ['queue', names.queue, (id) => `queues/${encodeURIComponent(id)}`],
     ['queue', names.dlq, (id) => `queues/${encodeURIComponent(id)}`],
     ['kv', names.kv, (id) => `storage/kv/namespaces/${encodeURIComponent(id)}`],

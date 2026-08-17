@@ -24,7 +24,7 @@ function targetArguments({ target, config, persistTo }) {
   if (target === 'local' || target === 'e2e') {
     if (!persistTo) throw new Error(`${target} migrations require an explicit persistTo directory`);
     args.push('--local', '--persist-to', path.resolve(persistTo));
-  } else if (target === 'preview' || target === 'production') {
+  } else if (target === 'preview' || target === 'ppe' || target === 'production') {
     if (!config) throw new Error(`${target} migrations require a trusted generated config`);
     args.push('--remote');
   } else {

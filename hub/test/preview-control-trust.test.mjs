@@ -70,22 +70,24 @@ describe('per-PR preview bearer derivation', () => {
 });
 
 describe('stable per-PR resource names', () => {
-  it('derives the fixed name set and the workers.dev host from the PR number alone', () => {
+  it('derives the PPE worker name and workers.dev host from the PR number alone', () => {
     const names = resourceNames(42);
     expect(names).toMatchObject({
-      app: 'pr-42-app',
+      app: 'pr-42',
+      legacyApp: 'pr-42-app',
       d1: 'pr-42-sessions-index',
       r2: 'pr-42-agent-sessions',
       kv: 'pr-42-sessions-hub-kv',
       queue: 'pr-42-parse',
       dlq: 'pr-42-parse-dlq',
-      host: 'pr-42-app.agent-sessions-nonproduction.workers.dev',
+      host: 'pr-42.sessions-ppe.workers.dev',
     });
     expect(() => resourceNames(0)).toThrow(/positive integer/);
   });
 
-  it('classifies resource ownership for cleanup, including legacy generation debris', () => {
+  it('classifies resource ownership for cleanup, including the old app Worker', () => {
     expect(previewResourceOwner('pr-42-sessions-index')).toEqual({ pr: 42, legacy: false });
+    expect(previewResourceOwner('pr-42')).toEqual({ pr: 42, legacy: false });
     expect(previewResourceOwner('pr-42-app')).toEqual({ pr: 42, legacy: false });
     expect(previewResourceOwner(`pr-17-g12345-${'a'.repeat(12)}-app`)).toEqual({ pr: 17, legacy: true });
     expect(previewResourceOwner('sessions-index')).toBeNull();
@@ -300,7 +302,7 @@ describe('private preview application config', () => {
     expect(config.vars.ENVIRONMENT).toBe('preview');
     expect(config.vars.PREVIEW_BEARER).toBe(previewBearerToken(SEED, 42));
     expect(config.vars.ASSET_SIGNING_SECRET).toBe(ASSET_SECRET);
-    expect(config.vars.API_HOST).toBe('pr-42-app.agent-sessions-nonproduction.workers.dev');
+    expect(config.vars.API_HOST).toBe('pr-42.sessions-ppe.workers.dev');
     expect(config.vars.VIEWER_HOST).toBe(config.vars.API_HOST);
     expect(config.vars.PREVIEW_PR_NUMBER).toBe('42');
     // The assertion/JWKS machinery died with the front door — its vars must never come back.
@@ -330,7 +332,7 @@ describe('private preview application config', () => {
   });
 
   it('keeps the build config private (no public URL surface)', () => {
-    const config = generatedBuildConfig({ main: '/src/preview.ts', workerName: 'pr-42-app' });
+    const config = generatedBuildConfig({ main: '/src/preview.ts', workerName: 'pr-42' });
     expect(config.workers_dev).toBe(false);
     expect(config.preview_urls).toBe(false);
   });

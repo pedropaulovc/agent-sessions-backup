@@ -4,7 +4,7 @@ import path from 'node:path';
 
 export const PRODUCTION_ACCOUNT_ID = '18ef3246e9f36d1560485ef53889c0ab';
 export const PREVIEW_ACCOUNT_ID = 'cbb04a26e6fa2d0cdc4eb67c735e5669';
-export const PREVIEW_WORKERS_DEV_SUFFIX = '.agent-sessions-nonproduction.workers.dev';
+export const PREVIEW_WORKERS_DEV_SUFFIX = '.sessions-ppe.workers.dev';
 export const MAX_WORKER_BUNDLE_BYTES = 20 * 1024 * 1024;
 
 const TRUSTED_MIGRATION_METADATA = new Set([
@@ -77,12 +77,11 @@ export function previewWranglerEnvironment(source, apiToken, accountId) {
 }
 
 /**
- * The per-PR preview bearer, derived — not distributed. Every principal that needs it (the
- * preview job baking it into the Worker, the smoke/e2e steps, the owner's machines via
- * `~/.config/agent-sessions/preview-seed`) derives the same token from one standing seed, so
- * the public repo never has to move a secret through logs or job outputs. The Worker holds
- * only the DERIVED per-PR token: reading one preview's Worker vars exposes that one disposable
- * preview, not the seed.
+ * The per-PR preview bearer, derived — not distributed. Each PR Worker holds only its derived
+ * token; the shared PPE redirect Worker holds the standing seed and derives the token only after
+ * a passkey assertion. The preview job, smoke/e2e steps, and the owner's machines derive the
+ * same value independently, so the public repo never has to move a bearer through logs or job
+ * outputs.
  */
 export function previewBearerToken(seed, pr) {
   if (typeof seed !== 'string' || seed.trim().length < 32) {
@@ -232,38 +231,39 @@ export function repositoryName(value) {
 }
 
 /**
- * Stable per-PR resource names. Each PR gets ONE persistent environment deployed in place —
- * the worker keeps its workers.dev hostname across pushes, and the backing resources survive
- * so hand-uploaded session zips persist. (History: names used to carry a `g<runId>-<sha12>`
- * generation for blue/green promote through the preview front door; the front door is gone
- * and with it the generation machinery. The janitor still recognizes the old generation name
- * shape — see `LEGACY_GENERATION_RE` — purely to sweep leftover debris.)
+ * Stable per-PR resource names. Each PR gets ONE persistent environment deployed in place.
+ * The Worker name is `pr-N`, so the account's `sessions-ppe.workers.dev` subdomain exposes
+ * `pr-N.sessions-ppe.workers.dev`; the backing resources keep their `pr-N-` prefix.
+ * `legacyApp` is retained only so a cutover can delete the old `pr-N-app` Worker.
  */
 export function resourceNames(pr) {
-  const prefix = `pr-${positiveInteger(pr, 'PR number')}-`;
+  const number = positiveInteger(pr, 'PR number');
+  const worker = `pr-${number}`;
+  const prefix = `${worker}-`;
   const names = {
     prefix,
-    app: `${prefix}app`,
+    app: worker,
+    legacyApp: `${prefix}app`,
     d1: `${prefix}sessions-index`,
     r2: `${prefix}agent-sessions`,
     kv: `${prefix}sessions-hub-kv`,
     queue: `${prefix}parse`,
     dlq: `${prefix}parse-dlq`,
-    host: `${prefix}app${PREVIEW_WORKERS_DEV_SUFFIX}`,
+    host: `${worker}${PREVIEW_WORKERS_DEV_SUFFIX}`,
   };
   for (const [kind, name] of Object.entries(names)) {
     if (kind !== 'host' && kind !== 'prefix' && name.length > 63) {
       fail(`${kind} resource name exceeds Cloudflare's 63-character limit: ${name}`);
     }
-    if (kind !== 'host' && !name.startsWith(prefix)) {
+    if (kind !== 'host' && kind !== 'prefix' && !name.startsWith(prefix) && kind !== 'app') {
       fail(`${kind} resource does not share ${prefix}`);
     }
   }
   return Object.freeze(names);
 }
 
-/** Any `pr-N-…` resource name in the preview account, old or new naming scheme. */
-export const PREVIEW_RESOURCE_RE = /^pr-([1-9][0-9]*)-(app|sessions-index|agent-sessions|sessions-hub-kv|parse|parse-dlq)$/;
+/** Any current or retired `pr-N-…` resource, including old `pr-N-app` Worker names. */
+export const PREVIEW_RESOURCE_RE = /^pr-([1-9][0-9]*)(?:-(app|sessions-index|agent-sessions|sessions-hub-kv|parse|parse-dlq))?$/;
 /** The retired blue/green generation naming scheme — always deletable debris. */
 export const LEGACY_GENERATION_RE = /^pr-([1-9][0-9]*)-g[1-9][0-9]*-[0-9a-f]{12}-/;
 
