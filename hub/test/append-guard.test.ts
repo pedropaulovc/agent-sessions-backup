@@ -1,6 +1,7 @@
 import { env, SELF } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { displacedKey } from '../src/api/upload';
+import { API } from './hosts';
 
 const testEnv = env as unknown as Env;
 const MIB = 1024 * 1024;
@@ -11,7 +12,7 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
 }
 
 function fileUrl(machine: string, store: string, relpath: string): string {
-  return `https://api.sessions.vza.net/api/v1/files/${machine}/${store}/${encodeURIComponent(relpath)}`;
+  return `${API}/api/v1/files/${machine}/${store}/${encodeURIComponent(relpath)}`;
 }
 
 async function putSimple(machine: string, store: string, relpath: string, bytes: Uint8Array): Promise<Response> {

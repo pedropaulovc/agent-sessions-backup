@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 from .grant import load_cached_token
 
-DEFAULT_HUB_URL = "https://api.sessions.vza.net"
+DEFAULT_HUB_URL = "https://api.sessions.pedrovc.com.br"
 
 
 class AuthMode(str, Enum):
@@ -58,7 +58,7 @@ class ClientConfig:
         # here instead, where the CLI's config-error ValueError handler already catches it.
         parsed = urlparse(self.hub_url)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
-            raise ValueError(f"invalid hub_url {self.hub_url!r}: expected an http(s) URL, e.g. https://api.sessions.vza.net")
+            raise ValueError(f"invalid hub_url {self.hub_url!r}: expected an http(s) URL, e.g. {DEFAULT_HUB_URL}")
         if self.auth_mode is AuthMode.MTLS and (self.client_cert_path is None or self.client_key_path is None):
             raise ValueError("mtls auth requires client_cert_path and client_key_path")
         if self.auth_mode is AuthMode.GRANT and self.grant_token is None:

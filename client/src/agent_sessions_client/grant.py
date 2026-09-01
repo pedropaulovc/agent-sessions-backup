@@ -26,7 +26,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-DEFAULT_VIEWER_URL = "https://sessions.vza.net"
+DEFAULT_VIEWER_URL = "https://sessions.pedrovc.com.br"
 
 _TTL_RE = re.compile(r"^(\d+)([smh]?)$")
 _TTL_UNIT_SECONDS = {"": 1, "s": 1, "m": 60, "h": 3600}

@@ -97,7 +97,7 @@ def test_enroll_thumbprint_writes_windows_mtls_config(tmp_path):
     path = tmp_path / "config.toml"
     # Pass the thumbprint space-separated and lowercase (as certmgr shows it); enroll normalizes.
     separated = " ".join(TP[i:i + 2] for i in range(0, len(TP), 2)).lower()
-    cfg = config.enroll("https://api.sessions.vza.net/", dev=False, path=path,
+    cfg = config.enroll("https://api.sessions.pedrovc.com.br/", dev=False, path=path,
                         machine_id="amet-windows", client_cert_thumbprint=separated)
     assert cfg.auth == "mtls"
     assert cfg.client_cert_thumbprint == TP  # enroll normalizes
@@ -168,7 +168,7 @@ def test_enroll_mtls_roundtrip(tmp_path):
     cert = tmp_path / "box.client.pem"
     key = tmp_path / "box.client.key"
     cfg = config.enroll(
-        "https://api.sessions.vza.net",
+        "https://api.sessions.pedrovc.com.br",
         dev=False,
         path=path,
         machine_id="m1",

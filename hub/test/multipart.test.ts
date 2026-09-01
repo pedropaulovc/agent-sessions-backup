@@ -4,6 +4,7 @@ import worker from '../src/index';
 import { convergeMultipartRow, recordUploadedObject } from '../src/api/upload';
 import { runPrune } from '../src/cron/prune';
 import { ccAssistantLine, ccUserLine } from './fixtures';
+import { API } from './hosts';
 
 const testEnv = env as unknown as Env;
 const MIB = 1024 * 1024;
@@ -14,7 +15,7 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
 }
 
 function fileUrl(machine: string, store: string, relpath: string): string {
-  return `https://api.sessions.vza.net/api/v1/files/${machine}/${store}/${encodeURIComponent(relpath)}`;
+  return `${API}/api/v1/files/${machine}/${store}/${encodeURIComponent(relpath)}`;
 }
 
 async function stateOf(id: number): Promise<string | null> {
@@ -179,7 +180,7 @@ describe('multipart upload', () => {
       .bind('mp-box', relpath)
       .first<{ parse_state: string }>();
     expect(parsed!.parse_state).toBe('parsed');
-    const search = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=niobium', {
+    const search = await SELF.fetch(`${API}/api/v1/search?q=niobium`, {
       headers: { 'x-dev-machine': 'mp-box' },
     });
     const body = await search.json<{ hits: Array<{ session_id: string }> }>();
@@ -371,7 +372,7 @@ describe('multipart reservation repair regression', () => {
 
 describe('multipart review fixes', () => {
   async function checkFiles(machine: string, items: Array<{ store: string; relpath: string; sha256: string }>): Promise<{ missing: Array<{ store: string; relpath: string }> }> {
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+    const res = await SELF.fetch(`${API}/api/v1/files/check`, {
       method: 'POST',
       headers: { 'x-dev-machine': machine, 'content-type': 'application/json' },
       body: JSON.stringify({ files: items }),

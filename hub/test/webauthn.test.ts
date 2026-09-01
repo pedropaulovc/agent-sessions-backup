@@ -4,9 +4,9 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { createSession, sessionToken } from '../src/auth/session';
 import { webauthnRoute, type WebAuthnDeps } from '../src/auth/webauthn';
 import { viewerRoute } from '../src/viewer/router';
+import { VIEWER } from './hosts';
 
 const testEnv = env as unknown as Env;
-const VIEWER = 'https://sessions.vza.net';
 const SETUP = 'test-setup-token'; // matches vitest.config.ts binding
 const SESSION_SIGNING_KEY = btoa('\x07'.repeat(32)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 const productionEnv = {

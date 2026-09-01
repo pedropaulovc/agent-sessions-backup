@@ -74,7 +74,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_enroll = sub.add_parser("enroll", help="write config (--dev, or --client-cert/--client-key for mTLS)")
-    p_enroll.add_argument("--hub", required=True, help="hub base URL, e.g. https://api.sessions.vza.net")
+    p_enroll.add_argument("--hub", required=True, help="hub base URL, e.g. https://api.sessions.pedrovc.com.br")
     p_enroll.add_argument("--dev", action="store_true", help="dev auth (x-dev-machine header)")
     p_enroll.add_argument("--client-cert", help="POSIX mTLS: path to the PEM client cert (from enroll-cert.py)")
     p_enroll.add_argument("--client-key", help="POSIX mTLS: path to the client private key (from enroll-cert.py)")

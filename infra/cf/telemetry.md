@@ -60,13 +60,14 @@ consistently; don't mix the two conventions in the same session.
    — so re-running after the issuer URL changes actually fixes the drift
    instead of leaving Entra trusting a stale issuer).
 
-   The availability webtest defaults to pinging `https://sessions.vza.net/healthz`,
-   which only resolves once the M3 zone routes in `hub/wrangler.jsonc` are
-   uncommented and deployed. If you're running this script before M3, override
-   with a live `workers.dev` URL instead:
+   The availability webtest defaults to pinging
+   `https://sessions.pedrovc.com.br/healthz` — the viewer's custom domain
+   (`VIEWER_HOST` in `hub/wrangler.jsonc`). If you're running this script while
+   that host isn't live yet (e.g. mid zone move), override with a live
+   `workers.dev` URL instead:
    `HEALTHZ_URL=https://sessions-hub.<account>.workers.dev/healthz ./infra/azure/provision.sh <issuer-url>`,
-   then re-run without the override once M3 lands so the webtest points at the
-   real custom domain.
+   then re-run without the override once the custom domain resolves so the
+   webtest points at the real host.
 5. Fill `hub/wrangler.telemetry-gateway.jsonc`'s `vars` from
    `infra/out/azure.env`: `TENANT_ID`, `APP_CLIENT_ID`, `OTLP_TRACES_ENDPOINT`,
    `OTLP_LOGS_ENDPOINT`, **and `OIDC_ISSUER_URL`** (also written to
@@ -138,7 +139,7 @@ consistently; don't mix the two conventions in the same session.
    is the realistic bar; if you suspect the key leaked during setup, rotate it —
    see "Rotating the signing key" below.) Two Cloudflare accounts are visible to
    the wrangler token, so the script pins `CLOUDFLARE_ACCOUNT_ID` to the
-   vza.net-owning account (`18ef3246…`); override the env var if that changes.
+   pedrovc.com.br-owning account (`18ef3246…`); override the env var if that changes.
 9. Create the account-level observability destinations (one for logs, one for
    traces — **these are shared across every worker on the account**, so use
    names that won't collide with anything else, e.g. `agent-backup-azure-logs`

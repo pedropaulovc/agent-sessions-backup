@@ -1,6 +1,7 @@
 import { env, SELF } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { machineIdentity } from '../src/auth/identity';
+import { API } from './hosts';
 
 const testEnv = env as unknown as Env;
 
@@ -9,11 +10,11 @@ function envWith(overrides: Partial<Env>): Env {
 }
 
 function reqWith(headers: Record<string, string>): Request {
-  return new Request('https://api.sessions.vza.net/api/v1/status', { headers });
+  return new Request(`${API}/api/v1/status`, { headers });
 }
 
 function reqWithCert(tlsClientAuth: Record<string, string>): Request {
-  return new Request('https://api.sessions.vza.net/api/v1/status', {
+  return new Request(`${API}/api/v1/status`, {
     cf: { tlsClientAuth },
   } as unknown as RequestInit);
 }
@@ -115,7 +116,7 @@ describe('preview auth over HTTP', () => {
     testEnv.ENVIRONMENT = 'preview';
     (testEnv as { PREVIEW_BEARER?: string }).PREVIEW_BEARER = 'p'.repeat(43);
     try {
-      const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/status', {
+      const res = await SELF.fetch(`${API}/api/v1/status`, {
         headers: { 'x-dev-machine': 'previewbox-http', authorization: 'Bearer legacy-secret' },
       });
       expect(res.status).toBe(401);

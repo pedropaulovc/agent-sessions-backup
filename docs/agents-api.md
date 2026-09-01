@@ -12,7 +12,7 @@ this doc.
 
 ## Base URL & auth
 
-Production: `https://api.sessions.vza.net`.
+Production: `https://api.sessions.pedrovc.com.br`.
 
 Every protected data endpoint under `/api/v1/` — including plain reads like `/sessions` and
 `/search` — requires an authenticated identity (`hub/src/router.ts::apiRoute`). The one
@@ -48,7 +48,7 @@ authenticate:
    ```bash
    curl --cert ~/.config/agent-collector/<machine>.client.pem \
         --key  ~/.config/agent-collector/<machine>.client.key \
-        "https://api.sessions.vza.net/api/v1/status"
+        "https://api.sessions.pedrovc.com.br/api/v1/status"
    ```
    Machine certs are **ingest credentials**: upload, `files/check`, heartbeat, cert
    renewal, bootstrap, admin, plus the content-free aggregates (`/status`, `/machines`,
@@ -309,7 +309,7 @@ CLI: `cd client && uv run agent-sessions auth` mints and caches a read grant;
 # cache the CLI wrote.
 TOKEN=$(jq -r .token ~/.config/agent-sessions/grant.json)
 AUTH="authorization: Bearer $TOKEN"
-BASE=https://api.sessions.vza.net
+BASE=https://api.sessions.pedrovc.com.br
 
 # today's sessions, meta only (cheap) — limit=1000 to match the CLI's request and hit the
 # hard per-page cap, not the hub's 200-row default (which would need more page fetches on a

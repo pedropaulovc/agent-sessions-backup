@@ -2,6 +2,7 @@ import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { priceEpochExpr } from '../src/usage-agg';
 import type { ModelPrice } from '../src/pricing';
+import { API } from './hosts';
 
 /** Integration tests for /api/v1/usage's pricing aggregate — the part that has to survive
  * grouping. costOfUsage()'s own arithmetic is unit-tested in pricing.test.ts; what is tested
@@ -74,7 +75,7 @@ interface UsageBody {
 }
 
 async function fetchUsageRaw(query: string): Promise<UsageBody> {
-  const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/usage?${query}`, {
+  const res = await SELF.fetch(`${API}/api/v1/usage?${query}`, {
     headers: { 'x-dev-machine': MACHINE },
   });
   expect(res.status).toBe(200);
