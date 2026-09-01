@@ -364,6 +364,52 @@ function deployApp(wrangler, configPath, cwd, expectedHost) {
   return output;
 }
 
+const HOST_ROUTABLE_SETTLE_MS = 120_000;
+const HOST_ROUTABLE_POLL_MS = 2_000;
+const HOST_ROUTABLE_REQUEST_MS = 10_000;
+
+/**
+ * A deploy is not finished when Wrangler accepts the upload — it is finished when the hostname
+ * it just claimed routes to this Worker. A `pr-N-app` script that never existed before has no
+ * workers.dev route until Cloudflare activates one, and until then the name answers from the
+ * "no such Worker" handler with a 404. Nothing made the next step wait for that, so the first
+ * push on every new PR raced route activation and merely usually won: PR #143 read the live
+ * Worker 12ms after this step printed its summary, PR #146 read 404 after 190ms and failed the
+ * bearer gate, and the same URL answered 401 minutes later with no redeploy in between.
+ * Waiting here — not in the caller — keeps every downstream consumer (the smoke gate, the
+ * seeder, the browser suite, the deployment link on the PR) free to assume the origin is live.
+ * `/healthz` is the Worker's own unauthenticated liveness route, so a 200 proves this Worker
+ * answers rather than merely that the name resolves. A host that never answers is a real deploy
+ * failure and still fails, here, in the step that deployed it, naming the host.
+ */
+async function awaitRoutableHost(host) {
+  const origin = `https://${host}`;
+  const deadline = Date.now() + HOST_ROUTABLE_SETTLE_MS;
+  let seen = 'no response';
+  for (let attempt = 0; ; attempt += 1) {
+    // Bound every probe by whichever comes first, its own cap or the settle deadline, so one
+    // stalled connection cannot stretch the wait past the budget.
+    const budget = Math.min(HOST_ROUTABLE_REQUEST_MS, Math.max(deadline - Date.now(), 1_000));
+    try {
+      const response = await fetch(new URL('/healthz', origin), {
+        redirect: 'error',
+        headers: { accept: 'application/json', 'cache-control': 'no-store' },
+        signal: AbortSignal.timeout(budget),
+      });
+      if (response.ok) return;
+      seen = `status ${response.status}`;
+    } catch (error) {
+      seen = error.message;
+    }
+    if (Date.now() >= deadline) {
+      fail(`preview deployment is not routable at ${origin} after `
+        + `${Math.round(HOST_ROUTABLE_SETTLE_MS / 1000)}s: ${seen}`);
+    }
+    if (attempt === 0) process.stderr.write(`waiting for ${host} to become routable\n`);
+    await new Promise((resolve) => { setTimeout(resolve, HOST_ROUTABLE_POLL_MS); });
+  }
+}
+
 /**
  * Bundle the PR's own hub source with its own pinned Wrangler, in the job that deploys it.
  * Nothing crosses a trust boundary here, so there is no artifact, manifest set, or provenance
@@ -495,6 +541,7 @@ async function provision() {
     const appConfigPath = path.join(temporary, 'wrangler.app.generated.json');
     await generateConfig(appConfigPath, migration.schemaDigest);
     deployApp(wrangler, appConfigPath, hubRoot, names.host);
+    await awaitRoutableHost(names.host);
 
     const summary = {
       url: `https://${names.host}`,
