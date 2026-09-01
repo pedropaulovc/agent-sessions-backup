@@ -5,6 +5,7 @@ import { route } from '../src/router';
 import { machineIdentity, PREVIEW_BEARER_MACHINE, PREVIEW_SESSION_COOKIE } from '../src/auth/identity';
 import { viewerRoute } from '../src/viewer/router';
 import { ccAssistantLine, ccUserLine } from './fixtures';
+import { API } from './hosts';
 
 const testEnv = env as unknown as Env;
 const TOKEN = 'T'.repeat(43);
@@ -169,7 +170,7 @@ describe('preview bearer auth', () => {
   it('production and development ignore the preview bearer entirely', async () => {
     for (const environment of ['production', 'development'] as const) {
       const identity = await machineIdentity(
-        new Request('https://api.sessions.vza.net/api/v1/status', { headers: { authorization: `Bearer ${TOKEN}` } }),
+        new Request(`${API}/api/v1/status`, { headers: { authorization: `Bearer ${TOKEN}` } }),
         { ...testEnv, ENVIRONMENT: environment, PREVIEW_BEARER: TOKEN } as Env,
       );
       expect(identity).toEqual({ kind: 'anonymous' });

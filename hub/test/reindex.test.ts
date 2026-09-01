@@ -2,6 +2,7 @@ import { env } from 'cloudflare:test';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { MAX_PAGES_PER_INVOCATION, reindex } from '../src/api/ops';
 import type { Identity } from '../src/auth/identity';
+import { API } from './hosts';
 
 const testEnv = env as unknown as Env;
 const admin: Identity = { kind: 'machine', machineId: 'reindexbox', isAdmin: true, certSlot: 'current' };
@@ -13,7 +14,7 @@ function stubSendBatch() {
 }
 
 function reindexRequest(prefix?: string): Request {
-  return new Request('https://api.sessions.vza.net/api/v1/admin/reindex', {
+  return new Request(`${API}/api/v1/admin/reindex`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(prefix ? { prefix } : {}),

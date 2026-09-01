@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from agent_sessions_client.config import AuthMode, ClientConfig, load_config
+from agent_sessions_client.config import AuthMode, ClientConfig, DEFAULT_HUB_URL, load_config
 
 
 def test_grant_mode_from_explicit_args():
@@ -19,7 +19,7 @@ def test_grant_mode_from_env(monkeypatch):
     config = load_config()
     assert config.auth_mode is AuthMode.GRANT
     assert config.grant_token == "agsr_envtok"
-    assert config.hub_url == "https://api.sessions.vza.net"  # default, unset
+    assert config.hub_url == DEFAULT_HUB_URL  # default, unset
 
 
 def test_grant_mode_from_cache_file(tmp_path):
@@ -42,7 +42,7 @@ def test_expired_cache_falls_through_to_mtls_config(tmp_path):
 def test_mtls_reads_collector_config_toml(tmp_path):
     config_path = tmp_path / "config.toml"
     config_path.write_text(
-        'hub_url = "https://api.sessions.vza.net"\n'
+        f'hub_url = "{DEFAULT_HUB_URL}"\n'
         'client_cert_path = "/home/pedro/.config/agent-collector/amet-wsl.client.pem"\n'
         'client_key_path = "/home/pedro/.config/agent-collector/amet-wsl.client.key"\n'
     )

@@ -1,6 +1,7 @@
 import { env, SELF } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { route } from '../src/router';
+import { API } from './hosts';
 
 /**
  * "No agent moves prod bytes without my passkey": in production, machine certs are ingest
@@ -26,7 +27,7 @@ async function seedMachine(id: string, fp: string): Promise<void> {
 }
 
 function certReq(path: string, fp: string): Request {
-  return new Request(`https://api.sessions.vza.net${path}`, {
+  return new Request(`${API}${path}`, {
     cf: { tlsClientAuth: { certVerified: 'SUCCESS', certFingerprintSHA256: fp } },
   } as unknown as RequestInit);
 }
@@ -76,7 +77,7 @@ describe('production machine certs cannot read session content', () => {
     const token = `agsr_${'g'.repeat(43)}`;
     await seedGrant(token);
     const response = await route(
-      new Request('https://api.sessions.vza.net/api/v1/sessions', { headers: { authorization: `Bearer ${token}` } }),
+      new Request(`${API}/api/v1/sessions`, { headers: { authorization: `Bearer ${token}` } }),
       prodEnv,
       ctx,
     );
@@ -94,7 +95,7 @@ describe('production machine certs cannot read session content', () => {
   });
 
   it('development keeps machine reads for the local loop', async () => {
-    const response = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions', {
+    const response = await SELF.fetch(`${API}/api/v1/sessions`, {
       headers: { 'x-dev-machine': 'dev-reader' },
     });
     expect(response.status).toBe(200);

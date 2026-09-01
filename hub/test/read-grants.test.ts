@@ -4,10 +4,9 @@ import { describe, expect, it } from 'vitest';
 import { grantIdentity, readGrantApiRoute, readGrantBrowserRoute } from '../src/auth/read-grants';
 import { viewerRoute } from '../src/viewer/router';
 import type { WebAuthnDeps } from '../src/auth/webauthn';
+import { API, VIEWER } from './hosts';
 
 const testEnv = env as unknown as Env;
-const VIEWER = 'https://sessions.vza.net';
-const API = 'https://api.sessions.vza.net';
 const encoder = new TextEncoder();
 
 const okDeps = {

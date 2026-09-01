@@ -97,7 +97,7 @@ class HubResponse:
 
 
 class HubClient:
-    """Auth-aware HTTP wrapper for https://api.sessions.vza.net.
+    """Auth-aware HTTP wrapper for the hub API (default https://api.sessions.pedrovc.com.br).
 
     Read API only — every read endpoint under /api/v1 requires an identity of
     kind='machine' or 'grant' (see hub/src/router.ts::apiRoute), which this client's two

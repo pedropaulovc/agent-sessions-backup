@@ -1,5 +1,6 @@
 import { env, SELF } from 'cloudflare:test';
 import { describe, expect, it, vi } from 'vitest';
+import { API } from './hosts';
 
 const testEnv = env as unknown as Env;
 const MACHINE = 'files-check-cap';
@@ -60,7 +61,7 @@ describe('POST /api/v1/files/check D1 variable cap', () => {
     });
 
     try {
-      const response = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+      const response = await SELF.fetch(`${API}/api/v1/files/check`, {
         method: 'POST',
         headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
         body: JSON.stringify({ files: items }),

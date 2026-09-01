@@ -4,6 +4,7 @@ import { strFromU8, unzipSync } from 'fflate';
 import worker from '../src/index';
 import { viewerRoute } from '../src/viewer/router';
 import { ccAssistantLine, ccUserLine } from './fixtures';
+import { API, VIEWER } from './hosts';
 import { chatgptExportZip } from './web-fixtures';
 
 const testEnv = env as unknown as Env;
@@ -23,7 +24,7 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
 
 async function put(store: string, relpath: string, body: Uint8Array | string): Promise<Response> {
   const bytes = typeof body === 'string' ? new TextEncoder().encode(body) : body;
-  return SELF.fetch(`https://api.sessions.vza.net/api/v1/files/${MACHINE}/${store}/${encodeURIComponent(relpath)}`, {
+  return SELF.fetch(`${API}/api/v1/files/${MACHINE}/${store}/${encodeURIComponent(relpath)}`, {
     method: 'PUT',
     headers: {
       'x-dev-machine': MACHINE,
@@ -53,7 +54,7 @@ async function drainQueue(): Promise<void> {
 }
 
 async function fetchExport(sessionId: string, envOverride?: Env): Promise<Response> {
-  const url = new URL(`https://sessions.vza.net/s/${sessionId}/export.zip`);
+  const url = new URL(`${VIEWER}/s/${sessionId}/export.zip`);
   return viewerRoute(new Request(url.toString()), url, envOverride ?? testEnv);
 }
 
@@ -165,7 +166,7 @@ describe('viewer session export zip', () => {
     expect((await put('export-inbox', 'hostile-ids.zip', zip)).status).toBe(201);
     await drainQueue();
 
-    const url = new URL(`https://sessions.vza.net/s/${encodeURIComponent('collide/x')}/export.zip`);
+    const url = new URL(`${VIEWER}/s/${encodeURIComponent('collide/x')}/export.zip`);
     const slash = await unzipResponse(await viewerRoute(new Request(url.toString()), url, testEnv));
     const dash = await unzipResponse(await fetchExport('collide-x'));
     const slashRelpath = slash.manifest.entries[0]!.relpath;

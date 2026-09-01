@@ -12,7 +12,7 @@
  * routes are still commented in wrangler.jsonc), so deriving the rpID from `url.hostname`
  * would let a first setup on an alternate host — e.g. the `*.workers.dev` preview URL —
  * mint the sole credential scoped to the WRONG rpID. Because credentials are counted
- * globally, that bricks setup on the real viewer host (`sessions.vza.net`), where the
+ * globally, that bricks setup on the real viewer host (`env.VIEWER_HOST`), where the
  * alternate-host passkey can't be offered, until the DB is manually cleaned up. Pinning
  * the ceremony host closes that lockout.
  *
@@ -23,13 +23,13 @@
  */
 
 import {
-  generateAuthenticationOptions,
-  generateRegistrationOptions,
-  verifyAuthenticationResponse,
-  verifyRegistrationResponse,
-  type AuthenticationResponseJSON,
-  type AuthenticatorTransportFuture,
-  type RegistrationResponseJSON,
+ generateAuthenticationOptions,
+ generateRegistrationOptions,
+ verifyAuthenticationResponse,
+ verifyRegistrationResponse,
+ type AuthenticationResponseJSON,
+ type AuthenticatorTransportFuture,
+ type RegistrationResponseJSON,
 } from '@simplewebauthn/server';
 import { isoBase64URL } from '@simplewebauthn/server/helpers';
 import { esc } from '../viewer/layout';
@@ -44,49 +44,49 @@ const OWNER = 'owner';
  * the endpoints without a real authenticator. Production always uses the real ones.
  */
 export interface WebAuthnDeps {
-  verifyRegistration: typeof verifyRegistrationResponse;
-  verifyAuthentication: typeof verifyAuthenticationResponse;
+ verifyRegistration: typeof verifyRegistrationResponse;
+ verifyAuthentication: typeof verifyAuthenticationResponse;
 }
 
 const REAL_DEPS: WebAuthnDeps = {
-  verifyRegistration: verifyRegistrationResponse,
-  verifyAuthentication: verifyAuthenticationResponse,
+ verifyRegistration: verifyRegistrationResponse,
+ verifyAuthentication: verifyAuthenticationResponse,
 };
 
 interface CredentialRow {
-  credential_id: string;
-  public_key: ArrayBuffer;
-  counter: number;
-  transports: string | null;
+ credential_id: string;
+ public_key: ArrayBuffer;
+ counter: number;
+ transports: string | null;
 }
 
 /** True when this host is allowed to run a passkey ceremony (pinned to VIEWER_HOST outside dev). */
 function ceremonyHostOk(url: URL, env: Env): boolean {
-  if (env.ENVIRONMENT === 'development') return true;
-  return url.hostname === env.VIEWER_HOST;
+ if (env.ENVIRONMENT === 'development') return true;
+ return url.hostname === env.VIEWER_HOST;
 }
 
 function rp(url: URL, env: Env): { rpID: string; origin: string } {
-  if (env.ENVIRONMENT === 'development') return { rpID: url.hostname, origin: url.origin };
-  return { rpID: env.VIEWER_HOST, origin: `https://${env.VIEWER_HOST}` };
+ if (env.ENVIRONMENT === 'development') return { rpID: url.hostname, origin: url.origin };
+ return { rpID: env.VIEWER_HOST, origin: `https://${env.VIEWER_HOST}` };
 }
 
 async function countCredentials(env: Env): Promise<number> {
-  const row = await env.DB.prepare('SELECT COUNT(*) AS n FROM credentials').first<{ n: number }>();
-  return row?.n ?? 0;
+ const row = await env.DB.prepare('SELECT COUNT(*) AS n FROM credentials').first<{ n: number }>();
+ return row?.n ?? 0;
 }
 
 function json(data: unknown, status = 200, extraHeaders?: Record<string, string>): Response {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { 'content-type': 'application/json; charset=utf-8', ...extraHeaders },
-  });
+ return new Response(JSON.stringify(data), {
+  status,
+  headers: { 'content-type': 'application/json; charset=utf-8', ...extraHeaders },
+ });
 }
 
 /** The base64url challenge the browser echoes back inside clientDataJSON, if present. */
 function challengeOf(response: { response: { clientDataJSON: string } }): string | undefined {
-  const clientData = JSON.parse(isoBase64URL.toUTF8String(response.response.clientDataJSON)) as { challenge?: string };
-  return clientData.challenge;
+ const clientData = JSON.parse(isoBase64URL.toUTF8String(response.response.clientDataJSON)) as { challenge?: string };
+ return clientData.challenge;
 }
 
 /**
@@ -98,27 +98,27 @@ function challengeOf(response: { response: { clientDataJSON: string } }): string
  * returns null: an undefined challenge would otherwise reach D1 `.bind(...)` and 500.
  */
 async function readVerifyBody<T extends { response: { clientDataJSON: string } }>(
-  request: Request,
+ request: Request,
 ): Promise<{ response: T; challenge: string } | null> {
-  try {
-    const response = (await request.json()) as T;
-    const challenge = challengeOf(response);
-    if (typeof challenge !== 'string' || challenge.length === 0) return null;
-    return { response, challenge };
-  } catch {
-    return null;
-  }
+ try {
+  const response = (await request.json()) as T;
+  const challenge = challengeOf(response);
+  if (typeof challenge !== 'string' || challenge.length === 0) return null;
+  return { response, challenge };
+ } catch {
+  return null;
+ }
 }
 
 /** Persist a single-use challenge in D1, pruning any that have already expired. */
 async function storeChallenge(env: Env, challenge: string, kind: 'register' | 'auth'): Promise<void> {
-  const now = Date.now();
-  await env.DB.prepare('DELETE FROM webauthn_challenges WHERE expires_at <= ?1').bind(now).run();
-  await env.DB.prepare(
-    'INSERT INTO webauthn_challenges (challenge, kind, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)',
-  )
-    .bind(challenge, kind, now, now + CHALLENGE_TTL * 1000)
-    .run();
+ const now = Date.now();
+ await env.DB.prepare('DELETE FROM webauthn_challenges WHERE expires_at <= ?1').bind(now).run();
+ await env.DB.prepare(
+  'INSERT INTO webauthn_challenges (challenge, kind, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)',
+ )
+  .bind(challenge, kind, now, now + CHALLENGE_TTL * 1000)
+  .run();
 }
 
 /**
@@ -127,17 +127,17 @@ async function storeChallenge(env: Env, challenge: string, kind: 'register' | 'a
  * verifies can't both win, and a replay after consumption finds nothing to delete.
  */
 async function consumeChallenge(env: Env, challenge: string, kind: 'register' | 'auth'): Promise<boolean> {
-  const result = await env.DB.prepare(
-    'DELETE FROM webauthn_challenges WHERE challenge = ?1 AND kind = ?2 AND expires_at > ?3',
-  )
-    .bind(challenge, kind, Date.now())
-    .run();
-  return result.meta.changes === 1;
+ const result = await env.DB.prepare(
+  'DELETE FROM webauthn_challenges WHERE challenge = ?1 AND kind = ?2 AND expires_at > ?3',
+ )
+  .bind(challenge, kind, Date.now())
+  .run();
+ return result.meta.changes === 1;
 }
 
 export type FreshAuthenticationResult =
-  | { verified: true; credentialId: string }
-  | { verified: false; error: string; status: number };
+ | { verified: true; credentialId: string }
+ | { verified: false; error: string; status: number };
 
 /**
  * Create a user-verifying assertion challenge for a narrow operation. Unlike normal login this
@@ -146,37 +146,37 @@ export type FreshAuthenticationResult =
  * challenge carrying the same purpose and digest.
  */
 export async function freshAuthenticationOptions(
-  request: Request,
-  url: URL,
-  env: Env,
-  purpose: string,
-  bindingHash: string,
+ request: Request,
+ url: URL,
+ env: Env,
+ purpose: string,
+ bindingHash: string,
 ): Promise<Response> {
-  if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
-  if (!ceremonyHostOk(url, env)) return json({ error: 'bad_host' }, 403);
-  const { rpID } = rp(url, env);
-  const creds = await env.DB.prepare('SELECT credential_id, transports FROM credentials').all<{
-    credential_id: string;
-    transports: string | null;
-  }>();
-  const options = await generateAuthenticationOptions({
-    rpID,
-    userVerification: 'required',
-    allowCredentials: creds.results.map((credential) => ({
-      id: credential.credential_id,
-      transports: parseTransports(credential.transports),
-    })),
-  });
-  const now = Date.now();
-  await env.DB.prepare('DELETE FROM passkey_freshness_challenges WHERE expires_at <= ?1').bind(now).run();
-  await env.DB.prepare(
-    `INSERT INTO passkey_freshness_challenges
+ if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
+ if (!ceremonyHostOk(url, env)) return json({ error: 'bad_host' }, 403);
+ const { rpID } = rp(url, env);
+ const creds = await env.DB.prepare('SELECT credential_id, transports FROM credentials').all<{
+  credential_id: string;
+  transports: string | null;
+ }>();
+ const options = await generateAuthenticationOptions({
+  rpID,
+  userVerification: 'required',
+  allowCredentials: creds.results.map((credential) => ({
+   id: credential.credential_id,
+   transports: parseTransports(credential.transports),
+  })),
+ });
+ const now = Date.now();
+ await env.DB.prepare('DELETE FROM passkey_freshness_challenges WHERE expires_at <= ?1').bind(now).run();
+ await env.DB.prepare(
+  `INSERT INTO passkey_freshness_challenges
        (challenge, purpose, binding_hash, created_at, expires_at)
      VALUES (?1, ?2, ?3, ?4, ?5)`,
-  )
-    .bind(options.challenge, purpose, bindingHash, now, now + CHALLENGE_TTL * 1000)
-    .run();
-  return json(options);
+ )
+  .bind(options.challenge, purpose, bindingHash, now, now + CHALLENGE_TTL * 1000)
+  .run();
+ return json(options);
 }
 
 /**
@@ -185,92 +185,92 @@ export async function freshAuthenticationOptions(
  * expiry, and replay all fail closed.
  */
 export async function verifyFreshAuthentication(
-  request: Request,
-  url: URL,
-  env: Env,
-  purpose: string,
-  bindingHash: string,
-  deps: WebAuthnDeps = REAL_DEPS,
+ request: Request,
+ url: URL,
+ env: Env,
+ purpose: string,
+ bindingHash: string,
+ deps: WebAuthnDeps = REAL_DEPS,
 ): Promise<FreshAuthenticationResult> {
-  if (!originOk(request)) return { verified: false, error: 'bad_origin', status: 403 };
-  if (!ceremonyHostOk(url, env)) return { verified: false, error: 'bad_host', status: 403 };
-  const parsed = await readVerifyBody<AuthenticationResponseJSON>(request);
-  if (!parsed) return { verified: false, error: 'bad_request', status: 400 };
-  const { response, challenge } = parsed;
-  if (typeof response.id !== 'string' || response.id.length === 0) {
-    return { verified: false, error: 'bad_request', status: 400 };
-  }
-  const consumed = await env.DB.prepare(
-    `DELETE FROM passkey_freshness_challenges
+ if (!originOk(request)) return { verified: false, error: 'bad_origin', status: 403 };
+ if (!ceremonyHostOk(url, env)) return { verified: false, error: 'bad_host', status: 403 };
+ const parsed = await readVerifyBody<AuthenticationResponseJSON>(request);
+ if (!parsed) return { verified: false, error: 'bad_request', status: 400 };
+ const { response, challenge } = parsed;
+ if (typeof response.id !== 'string' || response.id.length === 0) {
+  return { verified: false, error: 'bad_request', status: 400 };
+ }
+ const consumed = await env.DB.prepare(
+  `DELETE FROM passkey_freshness_challenges
       WHERE challenge = ?1 AND purpose = ?2 AND binding_hash = ?3 AND expires_at > ?4
       RETURNING challenge`,
-  )
-    .bind(challenge, purpose, bindingHash, Date.now())
-    .first<{ challenge: string }>();
-  if (!consumed) return { verified: false, error: 'bad_challenge', status: 400 };
+ )
+  .bind(challenge, purpose, bindingHash, Date.now())
+  .first<{ challenge: string }>();
+ if (!consumed) return { verified: false, error: 'bad_challenge', status: 400 };
 
-  const row = await env.DB.prepare(
-    'SELECT credential_id, public_key, counter, transports FROM credentials WHERE credential_id = ?1',
-  )
-    .bind(response.id)
-    .first<CredentialRow>();
-  if (!row) return { verified: false, error: 'unknown_credential', status: 400 };
-  const { rpID, origin } = rp(url, env);
-  let verification;
-  try {
-    verification = await deps.verifyAuthentication({
-      response,
-      expectedChallenge: challenge,
-      expectedOrigin: origin,
-      expectedRPID: rpID,
-      requireUserVerification: true,
-      credential: {
-        id: row.credential_id,
-        publicKey: new Uint8Array(row.public_key),
-        counter: row.counter,
-        transports: parseTransports(row.transports),
-      },
-    });
-  } catch {
-    return { verified: false, error: 'verification_failed', status: 400 };
-  }
-  if (!verification.verified) return { verified: false, error: 'verification_failed', status: 400 };
-  await env.DB.prepare(
-    "UPDATE credentials SET counter = ?1, last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE credential_id = ?2 AND counter < ?1",
-  )
-    .bind(verification.authenticationInfo.newCounter, row.credential_id)
-    .run();
-  return { verified: true, credentialId: row.credential_id };
+ const row = await env.DB.prepare(
+  'SELECT credential_id, public_key, counter, transports FROM credentials WHERE credential_id = ?1',
+ )
+  .bind(response.id)
+  .first<CredentialRow>();
+ if (!row) return { verified: false, error: 'unknown_credential', status: 400 };
+ const { rpID, origin } = rp(url, env);
+ let verification;
+ try {
+  verification = await deps.verifyAuthentication({
+   response,
+   expectedChallenge: challenge,
+   expectedOrigin: origin,
+   expectedRPID: rpID,
+   requireUserVerification: true,
+   credential: {
+    id: row.credential_id,
+    publicKey: new Uint8Array(row.public_key),
+    counter: row.counter,
+    transports: parseTransports(row.transports),
+   },
+  });
+ } catch {
+  return { verified: false, error: 'verification_failed', status: 400 };
+ }
+ if (!verification.verified) return { verified: false, error: 'verification_failed', status: 400 };
+ await env.DB.prepare(
+  "UPDATE credentials SET counter = ?1, last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE credential_id = ?2 AND counter < ?1",
+ )
+  .bind(verification.authenticationInfo.newCounter, row.credential_id)
+  .run();
+ return { verified: true, credentialId: row.credential_id };
 }
 
 /** Dispatch the viewer's auth surface. Returns null for paths it does not own. */
 export async function webauthnRoute(
-  request: Request,
-  url: URL,
-  env: Env,
-  deps: WebAuthnDeps = REAL_DEPS,
+ request: Request,
+ url: URL,
+ env: Env,
+ deps: WebAuthnDeps = REAL_DEPS,
 ): Promise<Response | null> {
-  const path = url.pathname;
+ const path = url.pathname;
 
-  if (path === '/login' && request.method === 'GET') return loginPage(request, url, env);
-  if (path === '/settings' && request.method === 'GET') return settingsPage(request, env);
+ if (path === '/login' && request.method === 'GET') return loginPage(request, url, env);
+ if (path === '/settings' && request.method === 'GET') return settingsPage(request, env);
 
-  if (path === '/logout' && request.method === 'POST') {
-    if (!originOk(request)) return new Response('bad origin', { status: 403 });
-    const clear = await destroySession(request, env);
-    return new Response(null, { status: 302, headers: { location: '/login', 'set-cookie': clear } });
-  }
+ if (path === '/logout' && request.method === 'POST') {
+  if (!originOk(request)) return new Response('bad origin', { status: 403 });
+  const clear = await destroySession(request, env);
+  return new Response(null, { status: 302, headers: { location: '/login', 'set-cookie': clear } });
+ }
 
-  // Pin every credential ceremony to the viewer host so an alternate host (e.g. the
-  // workers.dev preview URL) can't mint the sole credential scoped to the wrong rpID.
-  if (path.startsWith('/webauthn/') && !ceremonyHostOk(url, env)) return json({ error: 'bad_host' }, 403);
+ // Pin every credential ceremony to the viewer host so an alternate host (e.g. the
+ // workers.dev preview URL) can't mint the sole credential scoped to the wrong rpID.
+ if (path.startsWith('/webauthn/') && !ceremonyHostOk(url, env)) return json({ error: 'bad_host' }, 403);
 
-  if (path === '/webauthn/register/options' && request.method === 'POST') return registerOptions(request, url, env);
-  if (path === '/webauthn/register/verify' && request.method === 'POST') return registerVerify(request, url, env, deps);
-  if (path === '/webauthn/auth/options' && request.method === 'POST') return authOptions(request, url, env);
-  if (path === '/webauthn/auth/verify' && request.method === 'POST') return authVerify(request, url, env, deps);
+ if (path === '/webauthn/register/options' && request.method === 'POST') return registerOptions(request, url, env);
+ if (path === '/webauthn/register/verify' && request.method === 'POST') return registerVerify(request, url, env, deps);
+ if (path === '/webauthn/auth/options' && request.method === 'POST') return authOptions(request, url, env);
+ if (path === '/webauthn/auth/verify' && request.method === 'POST') return authVerify(request, url, env, deps);
 
-  return null;
+ return null;
 }
 
 /**
@@ -279,192 +279,192 @@ export async function webauthnRoute(
  * needs an authenticated session. Once any credential exists the SETUP_TOKEN is dead.
  */
 async function authorizeRegistration(request: Request, env: Env, setup: string | null): Promise<boolean> {
-  const count = await countCredentials(env);
-  if (count > 0) return (await readSession(request, env)) !== null;
-  return !!env.SETUP_TOKEN && setup === env.SETUP_TOKEN;
+ const count = await countCredentials(env);
+ if (count > 0) return (await readSession(request, env)) !== null;
+ return !!env.SETUP_TOKEN && setup === env.SETUP_TOKEN;
 }
 
 async function registerOptions(request: Request, url: URL, env: Env): Promise<Response> {
-  if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
-  const body = (await request.json().catch(() => ({}))) as { setup?: string };
-  const setup = body.setup ?? url.searchParams.get('setup');
-  if (!(await authorizeRegistration(request, env, setup))) return json({ error: 'forbidden' }, 403);
+ if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
+ const body = (await request.json().catch(() => ({}))) as { setup?: string };
+ const setup = body.setup ?? url.searchParams.get('setup');
+ if (!(await authorizeRegistration(request, env, setup))) return json({ error: 'forbidden' }, 403);
 
-  const { rpID } = rp(url, env);
-  const existing = await env.DB.prepare('SELECT credential_id, transports FROM credentials').all<{
-    credential_id: string;
-    transports: string | null;
-  }>();
+ const { rpID } = rp(url, env);
+ const existing = await env.DB.prepare('SELECT credential_id, transports FROM credentials').all<{
+  credential_id: string;
+  transports: string | null;
+ }>();
 
-  const options = await generateRegistrationOptions({
-    rpName: RP_NAME,
-    rpID,
-    userName: OWNER,
-    userID: Uint8Array.from(new TextEncoder().encode(OWNER)) as Uint8Array<ArrayBuffer>,
-    attestationType: 'none',
-    excludeCredentials: existing.results.map((c) => ({
-      id: c.credential_id,
-      transports: parseTransports(c.transports),
-    })),
-    // UV required: the viewer's ONLY factor is the passkey, so a possession-only
-    // (user-presence) authenticator must not be enrolled or accepted.
-    authenticatorSelection: { residentKey: 'preferred', userVerification: 'required' },
-  });
+ const options = await generateRegistrationOptions({
+  rpName: RP_NAME,
+  rpID,
+  userName: OWNER,
+  userID: Uint8Array.from(new TextEncoder().encode(OWNER)) as Uint8Array<ArrayBuffer>,
+  attestationType: 'none',
+  excludeCredentials: existing.results.map((c) => ({
+   id: c.credential_id,
+   transports: parseTransports(c.transports),
+  })),
+  // UV required: the viewer's ONLY factor is the passkey, so a possession-only
+  // (user-presence) authenticator must not be enrolled or accepted.
+  authenticatorSelection: { residentKey: 'preferred', userVerification: 'required' },
+ });
 
-  await storeChallenge(env, options.challenge, 'register');
-  return json(options);
+ await storeChallenge(env, options.challenge, 'register');
+ return json(options);
 }
 
 async function registerVerify(request: Request, url: URL, env: Env, deps: WebAuthnDeps): Promise<Response> {
-  if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
-  const parsed = await readVerifyBody<RegistrationResponseJSON>(request);
-  if (!parsed) return json({ error: 'bad_request' }, 400);
-  const { response, challenge } = parsed;
-  const { rpID, origin } = rp(url, env);
+ if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
+ const parsed = await readVerifyBody<RegistrationResponseJSON>(request);
+ if (!parsed) return json({ error: 'bad_request' }, 400);
+ const { response, challenge } = parsed;
+ const { rpID, origin } = rp(url, env);
 
-  // An authenticated session skips the setup guard (owner adding another device); the
-  // setup-token path is only for the first credential and is enforced atomically below.
-  const authorized = (await readSession(request, env)) !== null;
+ // An authenticated session skips the setup guard (owner adding another device); the
+ // setup-token path is only for the first credential and is enforced atomically below.
+ const authorized = (await readSession(request, env)) !== null;
 
-  if (!(await consumeChallenge(env, challenge, 'register'))) return json({ error: 'bad_challenge' }, 400);
+ if (!(await consumeChallenge(env, challenge, 'register'))) return json({ error: 'bad_challenge' }, 400);
 
-  // SimpleWebAuthn throws on malformed authenticator data / bad attestation. This is a
-  // public unauthenticated surface, so a throw must surface as a 400, never a 500.
-  let verification;
-  try {
-    verification = await deps.verifyRegistration({
-      response,
-      expectedChallenge: challenge,
-      expectedOrigin: origin,
-      expectedRPID: rpID,
-      // UV required: reject an enrollment whose authenticator didn't verify the user.
-      requireUserVerification: true,
-    });
-  } catch {
-    return json({ error: 'verification_failed' }, 400);
-  }
-  if (!verification.verified || !verification.registrationInfo) return json({ verified: false }, 400);
+ // SimpleWebAuthn throws on malformed authenticator data / bad attestation. This is a
+ // public unauthenticated surface, so a throw must surface as a 400, never a 500.
+ let verification;
+ try {
+  verification = await deps.verifyRegistration({
+   response,
+   expectedChallenge: challenge,
+   expectedOrigin: origin,
+   expectedRPID: rpID,
+   // UV required: reject an enrollment whose authenticator didn't verify the user.
+   requireUserVerification: true,
+  });
+ } catch {
+  return json({ error: 'verification_failed' }, 400);
+ }
+ if (!verification.verified || !verification.registrationInfo) return json({ verified: false }, 400);
 
-  const cred = verification.registrationInfo.credential;
-  const transports = cred.transports ? JSON.stringify(cred.transports) : null;
+ const cred = verification.registrationInfo.credential;
+ const transports = cred.transports ? JSON.stringify(cred.transports) : null;
 
-  if (authorized) {
-    await env.DB.prepare(
-      `INSERT INTO credentials (credential_id, user_id, public_key, counter, transports, last_used_at)
+ if (authorized) {
+  await env.DB.prepare(
+   `INSERT INTO credentials (credential_id, user_id, public_key, counter, transports, last_used_at)
        VALUES (?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
        ON CONFLICT (credential_id) DO UPDATE SET counter = excluded.counter`,
-    )
-      .bind(cred.id, OWNER, cred.publicKey, cred.counter, transports)
-      .run();
-    return json({ verified: true });
-  }
+  )
+   .bind(cred.id, OWNER, cred.publicKey, cred.counter, transports)
+   .run();
+  return json({ verified: true });
+ }
 
-  // Setup-token path: re-check the credential count AT INSERT TIME, atomically. D1
-  // serializes writes, so a conditional `INSERT ... SELECT ... WHERE COUNT(*)=0` closes
-  // the race where two challenges were minted while the table was empty — the second
-  // insert lands 0 rows and we report setup_disabled instead of silently enrolling a
-  // second unauthenticated credential.
-  const result = await env.DB.prepare(
-    `INSERT INTO credentials (credential_id, user_id, public_key, counter, transports, last_used_at)
+ // Setup-token path: re-check the credential count AT INSERT TIME, atomically. D1
+ // serializes writes, so a conditional `INSERT ... SELECT ... WHERE COUNT(*)=0` closes
+ // the race where two challenges were minted while the table was empty — the second
+ // insert lands 0 rows and we report setup_disabled instead of silently enrolling a
+ // second unauthenticated credential.
+ const result = await env.DB.prepare(
+  `INSERT INTO credentials (credential_id, user_id, public_key, counter, transports, last_used_at)
      SELECT ?1, ?2, ?3, ?4, ?5, strftime('%Y-%m-%dT%H:%M:%fZ','now')
      WHERE (SELECT COUNT(*) FROM credentials) = 0`,
-  )
-    .bind(cred.id, OWNER, cred.publicKey, cred.counter, transports)
-    .run();
-  if (result.meta.changes === 0) return json({ error: 'setup_disabled' }, 403);
+ )
+  .bind(cred.id, OWNER, cred.publicKey, cred.counter, transports)
+  .run();
+ if (result.meta.changes === 0) return json({ error: 'setup_disabled' }, 403);
 
-  return json({ verified: true });
+ return json({ verified: true });
 }
 
 async function authOptions(request: Request, url: URL, env: Env): Promise<Response> {
-  if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
-  const { rpID } = rp(url, env);
-  const creds = await env.DB.prepare('SELECT credential_id, transports FROM credentials').all<{
-    credential_id: string;
-    transports: string | null;
-  }>();
+ if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
+ const { rpID } = rp(url, env);
+ const creds = await env.DB.prepare('SELECT credential_id, transports FROM credentials').all<{
+  credential_id: string;
+  transports: string | null;
+ }>();
 
-  const options = await generateAuthenticationOptions({
-    rpID,
-    // UV required: possession alone must not mint the viewer's only auth factor.
-    userVerification: 'required',
-    allowCredentials: creds.results.map((c) => ({
-      id: c.credential_id,
-      transports: parseTransports(c.transports),
-    })),
-  });
+ const options = await generateAuthenticationOptions({
+  rpID,
+  // UV required: possession alone must not mint the viewer's only auth factor.
+  userVerification: 'required',
+  allowCredentials: creds.results.map((c) => ({
+   id: c.credential_id,
+   transports: parseTransports(c.transports),
+  })),
+ });
 
-  await storeChallenge(env, options.challenge, 'auth');
-  return json(options);
+ await storeChallenge(env, options.challenge, 'auth');
+ return json(options);
 }
 
 async function authVerify(request: Request, url: URL, env: Env, deps: WebAuthnDeps): Promise<Response> {
-  if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
-  const parsed = await readVerifyBody<AuthenticationResponseJSON>(request);
-  if (!parsed) return json({ error: 'bad_request' }, 400);
-  const { response, challenge } = parsed;
-  const { rpID, origin } = rp(url, env);
+ if (!originOk(request)) return json({ error: 'bad_origin' }, 403);
+ const parsed = await readVerifyBody<AuthenticationResponseJSON>(request);
+ if (!parsed) return json({ error: 'bad_request' }, 400);
+ const { response, challenge } = parsed;
+ const { rpID, origin } = rp(url, env);
 
-  // Guard the credential id BEFORE consuming the challenge: it's bound into D1 below, and a
-  // missing/non-string id would raise a bind type error (500). Validating first also means a
-  // request that fails this check does not burn the single-use challenge.
-  if (typeof response.id !== 'string' || response.id.length === 0) return json({ error: 'bad_request' }, 400);
+ // Guard the credential id BEFORE consuming the challenge: it's bound into D1 below, and a
+ // missing/non-string id would raise a bind type error (500). Validating first also means a
+ // request that fails this check does not burn the single-use challenge.
+ if (typeof response.id !== 'string' || response.id.length === 0) return json({ error: 'bad_request' }, 400);
 
-  if (!(await consumeChallenge(env, challenge, 'auth'))) return json({ error: 'bad_challenge' }, 400);
+ if (!(await consumeChallenge(env, challenge, 'auth'))) return json({ error: 'bad_challenge' }, 400);
 
-  const row = await env.DB.prepare(
-    'SELECT credential_id, public_key, counter, transports FROM credentials WHERE credential_id = ?1',
-  )
-    .bind(response.id)
-    .first<CredentialRow>();
-  if (!row) return json({ error: 'unknown_credential' }, 400);
+ const row = await env.DB.prepare(
+  'SELECT credential_id, public_key, counter, transports FROM credentials WHERE credential_id = ?1',
+ )
+  .bind(response.id)
+  .first<CredentialRow>();
+ if (!row) return json({ error: 'unknown_credential' }, 400);
 
-  // SimpleWebAuthn throws on bad signatures, counter regressions, or decode errors. This
-  // is a public unauthenticated surface, so a throw must surface as a 400, never a 500.
-  let verification;
-  try {
-    verification = await deps.verifyAuthentication({
-      response,
-      expectedChallenge: challenge,
-      expectedOrigin: origin,
-      expectedRPID: rpID,
-      // UV required: possession alone must not mint the viewer's only auth factor.
-      requireUserVerification: true,
-      credential: {
-        id: row.credential_id,
-        publicKey: new Uint8Array(row.public_key),
-        counter: row.counter,
-        transports: parseTransports(row.transports),
-      },
-    });
-  } catch {
-    return json({ error: 'verification_failed' }, 400);
-  }
-  if (!verification.verified) return json({ verified: false }, 400);
+ // SimpleWebAuthn throws on bad signatures, counter regressions, or decode errors. This
+ // is a public unauthenticated surface, so a throw must surface as a 400, never a 500.
+ let verification;
+ try {
+  verification = await deps.verifyAuthentication({
+   response,
+   expectedChallenge: challenge,
+   expectedOrigin: origin,
+   expectedRPID: rpID,
+   // UV required: possession alone must not mint the viewer's only auth factor.
+   requireUserVerification: true,
+   credential: {
+    id: row.credential_id,
+    publicKey: new Uint8Array(row.public_key),
+    counter: row.counter,
+    transports: parseTransports(row.transports),
+   },
+  });
+ } catch {
+  return json({ error: 'verification_failed' }, 400);
+ }
+ if (!verification.verified) return json({ verified: false }, 400);
 
-  // Monotonic counter: the `AND counter < ?1` guard keeps the stored value from regressing
-  // when two ceremonies for the same authenticator commit out of order (both read the old
-  // value; the lower newCounter must not overwrite a higher one already committed) — a
-  // regression would weaken clone/replay detection. A zero-change result is fine: login
-  // still succeeds, and authenticators that don't implement counters legitimately stay at 0
-  // (SimpleWebAuthn returns newCounter 0, so `counter < 0` never fires — no false regression).
-  await env.DB.prepare(
-    "UPDATE credentials SET counter = ?1, last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE credential_id = ?2 AND counter < ?1",
-  )
-    .bind(verification.authenticationInfo.newCounter, row.credential_id)
-    .run();
+ // Monotonic counter: the `AND counter < ?1` guard keeps the stored value from regressing
+ // when two ceremonies for the same authenticator commit out of order (both read the old
+ // value; the lower newCounter must not overwrite a higher one already committed) — a
+ // regression would weaken clone/replay detection. A zero-change result is fine: login
+ // still succeeds, and authenticators that don't implement counters legitimately stay at 0
+ // (SimpleWebAuthn returns newCounter 0, so `counter < 0` never fires — no false regression).
+ await env.DB.prepare(
+  "UPDATE credentials SET counter = ?1, last_used_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE credential_id = ?2 AND counter < ?1",
+ )
+  .bind(verification.authenticationInfo.newCounter, row.credential_id)
+  .run();
 
-  const cookie = await createSession(env);
-  return json({ verified: true }, 200, { 'set-cookie': cookie });
+ const cookie = await createSession(env);
+ return json({ verified: true }, 200, { 'set-cookie': cookie });
 }
 
 function parseTransports(raw: string | null): AuthenticatorTransportFuture[] | undefined {
-  if (!raw) return undefined;
-  try {
-    return JSON.parse(raw) as AuthenticatorTransportFuture[];
-  } catch {
-    return undefined;
-  }
+ if (!raw) return undefined;
+ try {
+  return JSON.parse(raw) as AuthenticatorTransportFuture[];
+ } catch {
+  return undefined;
+ }
 }
 
 // ---- Pages -----------------------------------------------------------------
@@ -486,13 +486,13 @@ a{color:var(--accent)}
 `;
 
 function authDoc(title: string, bodyHtml: string, script: string): Response {
-  const html =
-    `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
-    `<meta name="viewport" content="width=device-width, initial-scale=1">` +
-    `<title>${esc(title)}</title><style>${AUTH_STYLE}</style></head><body>` +
-    `<div class="card">${bodyHtml}</div>` +
-    `<script>${script}</script></body></html>`;
-  return new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' } });
+ const html =
+  `<!doctype html><html lang="en"><head><meta charset="utf-8">` +
+  `<meta name="viewport" content="width=device-width, initial-scale=1">` +
+  `<title>${esc(title)}</title><style>${AUTH_STYLE}</style></head><body>` +
+  `<div class="card">${bodyHtml}</div>` +
+  `<script>${script}</script></body></html>`;
+ return new Response(html, { headers: { 'content-type': 'text/html; charset=utf-8' } });
 }
 
 // Shared browser-side base64url <-> ArrayBuffer helpers (no external @simplewebauthn/browser).
@@ -503,100 +503,100 @@ function say(t,err){var m=document.getElementById('msg');m.textContent=t;m.class
 `;
 
 async function loginPage(request: Request, url: URL, env: Env): Promise<Response> {
-  const count = await countCredentials(env);
-  const setup = url.searchParams.get('setup');
-  const bootstrap = count === 0 && !!env.SETUP_TOKEN && setup === env.SETUP_TOKEN;
+ const count = await countCredentials(env);
+ const setup = url.searchParams.get('setup');
+ const bootstrap = count === 0 && !!env.SETUP_TOKEN && setup === env.SETUP_TOKEN;
 
-  if (bootstrap) {
-    const body =
-      `<h1>Set up your first passkey</h1>` +
-      `<p>No passkeys exist yet. Register this device to secure the viewer.</p>` +
-      `<button id="go">Create passkey</button><div id="msg" class="msg"></div>`;
-    const script =
-      CLIENT_HELPERS +
-      `var SETUP=${JSON.stringify(setup)};` +
-      `document.getElementById('go').addEventListener('click',async function(){` +
-      `var btn=this;btn.disabled=true;say('Requesting…');try{` +
-      `var o=await fetch('/webauthn/register/options',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({setup:SETUP})});` +
-      `if(!o.ok){say('Registration not allowed.',1);btn.disabled=false;return;}var opt=await o.json();` +
-      `opt.challenge=b64uToBuf(opt.challenge);opt.user.id=b64uToBuf(opt.user.id);` +
-      `if(opt.excludeCredentials)opt.excludeCredentials=opt.excludeCredentials.map(function(c){c.id=b64uToBuf(c.id);return c;});` +
-      `var cred=await navigator.credentials.create({publicKey:opt});` +
-      `var v=await fetch('/webauthn/register/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(serializeReg(cred))});` +
-      `var r=await v.json();if(r.verified){say('Passkey created. Redirecting…');location.href='/login';}else{say('Verification failed.',1);btn.disabled=false;}` +
-      `}catch(e){say(String(e&&e.message||e),1);btn.disabled=false;}});` +
-      SERIALIZE_REG;
-    return authDoc('Set up passkey', body, script);
-  }
-
+ if (bootstrap) {
   const body =
-    `<h1>Sign in</h1>` +
-    `<p>Authenticate with your passkey to view sessions.</p>` +
-    `<button id="go">Sign in with passkey</button><div id="msg" class="msg"></div>` +
-    (count === 0 ? `<div class="links muted">No passkeys registered. Open the setup link with your token.</div>` : '');
+   `<h1>Set up your first passkey</h1>` +
+   `<p>No passkeys exist yet. Register this device to secure the viewer.</p>` +
+   `<button id="go">Create passkey</button><div id="msg" class="msg"></div>`;
   const script =
-    CLIENT_HELPERS +
-    `document.getElementById('go').addEventListener('click',async function(){` +
-    `var btn=this;btn.disabled=true;say('Requesting…');try{` +
-    `var o=await fetch('/webauthn/auth/options',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});` +
-    `if(!o.ok){say('Sign-in unavailable.',1);btn.disabled=false;return;}var opt=await o.json();` +
-    `opt.challenge=b64uToBuf(opt.challenge);` +
-    `if(opt.allowCredentials)opt.allowCredentials=opt.allowCredentials.map(function(c){c.id=b64uToBuf(c.id);return c;});` +
-    `var cred=await navigator.credentials.get({publicKey:opt});` +
-    `var v=await fetch('/webauthn/auth/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(serializeAuth(cred))});` +
-    `var r=await v.json();if(r.verified){say('Signed in. Redirecting…');location.href='/';}else{say('Sign-in failed.',1);btn.disabled=false;}` +
-    `}catch(e){say(String(e&&e.message||e),1);btn.disabled=false;}});` +
-    SERIALIZE_AUTH;
-  return authDoc('Sign in', body, script);
+   CLIENT_HELPERS +
+   `var SETUP=${JSON.stringify(setup)};` +
+   `document.getElementById('go').addEventListener('click',async function(){` +
+   `var btn=this;btn.disabled=true;say('Requesting…');try{` +
+   `var o=await fetch('/webauthn/register/options',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({setup:SETUP})});` +
+   `if(!o.ok){say('Registration not allowed.',1);btn.disabled=false;return;}var opt=await o.json();` +
+   `opt.challenge=b64uToBuf(opt.challenge);opt.user.id=b64uToBuf(opt.user.id);` +
+   `if(opt.excludeCredentials)opt.excludeCredentials=opt.excludeCredentials.map(function(c){c.id=b64uToBuf(c.id);return c;});` +
+   `var cred=await navigator.credentials.create({publicKey:opt});` +
+   `var v=await fetch('/webauthn/register/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(serializeReg(cred))});` +
+   `var r=await v.json();if(r.verified){say('Passkey created. Redirecting…');location.href='/login';}else{say('Verification failed.',1);btn.disabled=false;}` +
+   `}catch(e){say(String(e&&e.message||e),1);btn.disabled=false;}});` +
+   SERIALIZE_REG;
+  return authDoc('Set up passkey', body, script);
+ }
+
+ const body =
+  `<h1>Sign in</h1>` +
+  `<p>Authenticate with your passkey to view sessions.</p>` +
+  `<button id="go">Sign in with passkey</button><div id="msg" class="msg"></div>` +
+  (count === 0 ? `<div class="links muted">No passkeys registered. Open the setup link with your token.</div>` : '');
+ const script =
+  CLIENT_HELPERS +
+  `document.getElementById('go').addEventListener('click',async function(){` +
+  `var btn=this;btn.disabled=true;say('Requesting…');try{` +
+  `var o=await fetch('/webauthn/auth/options',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});` +
+  `if(!o.ok){say('Sign-in unavailable.',1);btn.disabled=false;return;}var opt=await o.json();` +
+  `opt.challenge=b64uToBuf(opt.challenge);` +
+  `if(opt.allowCredentials)opt.allowCredentials=opt.allowCredentials.map(function(c){c.id=b64uToBuf(c.id);return c;});` +
+  `var cred=await navigator.credentials.get({publicKey:opt});` +
+  `var v=await fetch('/webauthn/auth/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(serializeAuth(cred))});` +
+  `var r=await v.json();if(r.verified){say('Signed in. Redirecting…');location.href='/';}else{say('Sign-in failed.',1);btn.disabled=false;}` +
+  `}catch(e){say(String(e&&e.message||e),1);btn.disabled=false;}});` +
+  SERIALIZE_AUTH;
+ return authDoc('Sign in', body, script);
 }
 
 async function settingsPage(request: Request, env: Env): Promise<Response> {
-  const session = await readSession(request, env);
-  if (!session) return new Response(null, { status: 302, headers: { location: '/login' } });
-  const count = await countCredentials(env);
-  const readGrants = await env.DB.prepare(
-    `SELECT grant_id, label, expires_at, last_used_at
+ const session = await readSession(request, env);
+ if (!session) return new Response(null, { status: 302, headers: { location: '/login' } });
+ const count = await countCredentials(env);
+ const readGrants = await env.DB.prepare(
+  `SELECT grant_id, label, expires_at, last_used_at
        FROM read_grants
       WHERE revoked_at IS NULL AND expires_at > ?1
       ORDER BY created_at DESC`,
-  ).bind(Date.now()).all<{ grant_id: string; label: string; expires_at: number; last_used_at: number | null }>();
-  const grantRows = readGrants.results.length === 0
-    ? '<p>No active read grants.</p>'
-    : `<ul>${readGrants.results.map((grant) =>
-      `<li><strong>${esc(grant.label)}</strong> ` +
-      `<span class="muted">expires ${esc(new Date(grant.expires_at).toISOString())}` +
-      `${grant.last_used_at ? ` · last used ${esc(new Date(grant.last_used_at).toISOString())}` : ''}</span> ` +
-      `<button class="revoke-grant" data-grant="${esc(grant.grant_id)}">Revoke</button></li>`,
-    ).join('')}</ul>`;
+ ).bind(Date.now()).all<{ grant_id: string; label: string; expires_at: number; last_used_at: number | null }>();
+ const grantRows = readGrants.results.length === 0
+  ? '<p>No active read grants.</p>'
+  : `<ul>${readGrants.results.map((grant) =>
+   `<li><strong>${esc(grant.label)}</strong> ` +
+   `<span class="muted">expires ${esc(new Date(grant.expires_at).toISOString())}` +
+   `${grant.last_used_at ? ` · last used ${esc(new Date(grant.last_used_at).toISOString())}` : ''}</span> ` +
+   `<button class="revoke-grant" data-grant="${esc(grant.grant_id)}">Revoke</button></li>`,
+  ).join('')}</ul>`;
 
-  const body =
-    `<h1>Settings</h1>` +
-    `<p>${count} passkey${count === 1 ? '' : 's'} registered for the owner.</p>` +
-    `<button id="add">Add this device as a passkey</button>` +
-    `<h2>Read grants</h2>${grantRows}` +
-    `<div id="msg" class="msg"></div>` +
-    `<form method="post" action="/logout" style="margin-top:16px"><button type="submit" style="background:transparent;color:var(--fg)">Sign out</button></form>` +
-    `<div class="links"><a href="/">← Back to sessions</a></div>`;
-  const script =
-    CLIENT_HELPERS +
-    `document.getElementById('add').addEventListener('click',async function(){` +
-    `var btn=this;btn.disabled=true;say('Requesting…');try{` +
-    `var o=await fetch('/webauthn/register/options',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});` +
-    `if(!o.ok){say('Not allowed.',1);btn.disabled=false;return;}var opt=await o.json();` +
-    `opt.challenge=b64uToBuf(opt.challenge);opt.user.id=b64uToBuf(opt.user.id);` +
-    `if(opt.excludeCredentials)opt.excludeCredentials=opt.excludeCredentials.map(function(c){c.id=b64uToBuf(c.id);return c;});` +
-    `var cred=await navigator.credentials.create({publicKey:opt});` +
-    `var v=await fetch('/webauthn/register/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(serializeReg(cred))});` +
-    `var r=await v.json();if(r.verified){say('Passkey added.');btn.disabled=false;}else{say('Verification failed.',1);btn.disabled=false;}` +
-    `}catch(e){say(String(e&&e.message||e),1);btn.disabled=false;}});` +
-    `document.querySelectorAll('.revoke-grant').forEach(function(btn){btn.addEventListener('click',async function(){` +
-    `var id=this.dataset.grant;this.disabled=true;try{` +
-    `var r=await fetch('/grants/'+encodeURIComponent(id)+'/revoke',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});` +
-    `var x=await r.json();if(!r.ok||!x.revoked)throw new Error(x.error||'Revocation failed');this.closest('li').remove();say('Read grant revoked.');` +
-    `}catch(e){say(String(e&&e.message||e),1);this.disabled=false;}});});` +
-    SERIALIZE_REG +
-    SERIALIZE_AUTH;
-  return authDoc('Settings', body, script);
+ const body =
+  `<h1>Settings</h1>` +
+  `<p>${count} passkey${count === 1 ? '' : 's'} registered for the owner.</p>` +
+  `<button id="add">Add this device as a passkey</button>` +
+  `<h2>Read grants</h2>${grantRows}` +
+  `<div id="msg" class="msg"></div>` +
+  `<form method="post" action="/logout" style="margin-top:16px"><button type="submit" style="background:transparent;color:var(--fg)">Sign out</button></form>` +
+  `<div class="links"><a href="/">← Back to sessions</a></div>`;
+ const script =
+  CLIENT_HELPERS +
+  `document.getElementById('add').addEventListener('click',async function(){` +
+  `var btn=this;btn.disabled=true;say('Requesting…');try{` +
+  `var o=await fetch('/webauthn/register/options',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});` +
+  `if(!o.ok){say('Not allowed.',1);btn.disabled=false;return;}var opt=await o.json();` +
+  `opt.challenge=b64uToBuf(opt.challenge);opt.user.id=b64uToBuf(opt.user.id);` +
+  `if(opt.excludeCredentials)opt.excludeCredentials=opt.excludeCredentials.map(function(c){c.id=b64uToBuf(c.id);return c;});` +
+  `var cred=await navigator.credentials.create({publicKey:opt});` +
+  `var v=await fetch('/webauthn/register/verify',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(serializeReg(cred))});` +
+  `var r=await v.json();if(r.verified){say('Passkey added.');btn.disabled=false;}else{say('Verification failed.',1);btn.disabled=false;}` +
+  `}catch(e){say(String(e&&e.message||e),1);btn.disabled=false;}});` +
+  `document.querySelectorAll('.revoke-grant').forEach(function(btn){btn.addEventListener('click',async function(){` +
+  `var id=this.dataset.grant;this.disabled=true;try{` +
+  `var r=await fetch('/grants/'+encodeURIComponent(id)+'/revoke',{method:'POST',headers:{'content-type':'application/json'},body:'{}'});` +
+  `var x=await r.json();if(!r.ok||!x.revoked)throw new Error(x.error||'Revocation failed');this.closest('li').remove();say('Read grant revoked.');` +
+  `}catch(e){say(String(e&&e.message||e),1);this.disabled=false;}});});` +
+  SERIALIZE_REG +
+  SERIALIZE_AUTH;
+ return authDoc('Settings', body, script);
 }
 
 const SERIALIZE_REG = `

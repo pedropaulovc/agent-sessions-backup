@@ -6,7 +6,7 @@
 """Install, enroll, verify, and schedule the collector on this machine.
 
 The short-lived CLOUDFLARE_API_TOKEN must have these two permissions:
-  - Zone / SSL and Certificates / Edit on vza.net
+  - Zone / SSL and Certificates / Edit on pedrovc.com.br (the zone ZONE_ID names)
   - Account / D1 / Edit on Pedro's Cloudflare account
 
 No token is passed to a child process or written to disk.
@@ -43,10 +43,10 @@ from cryptography.x509.oid import NameOID
 
 
 ACCOUNT_ID = "18ef3246e9f36d1560485ef53889c0ab"
-ZONE_ID = "6a56cdda4766c1d7b5ad0fbe8331048f"
+ZONE_ID = "ff45a32e60c41cefd2fe5ff1c8eb61fb"
 DATABASE_ID = "5ff65cf3-89c8-4fe6-a3c2-a370293ecea6"
 API = "https://api.cloudflare.com/client/v4"
-HUB = "https://api.sessions.vza.net"
+HUB = "https://api.sessions.pedrovc.com.br"
 MACHINE_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 

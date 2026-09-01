@@ -13,11 +13,25 @@
   // without a dns_records scope: custom domains are provisioned through the
   // Workers API (Cloudflare manages the proxied DNS record + edge cert itself),
   // whereas a zone route requires a pre-existing proxied DNS record we cannot
-  // create with this token. Both hostnames stay fully proxied on the vza.net
-  // zone, so API Shield mTLS + the WAF cert-verified rule apply identically.
+  // create with this token. Both hostnames stay fully proxied, so API Shield
+  // mTLS + the WAF cert-verified rule apply identically.
+  //
+  // THIS ARRAY IS THE COMPLETE DESIRED SET, NOT A PARTIAL LIST. `wrangler
+  // deploy` sends one `PUT /accounts/{id}/workers/scripts/{name}/domains/records`
+  // whose `origins` body is built solely from the entries below; any Custom
+  // Domain attached to this Worker but missing here is DETACHED. Wrangler reads
+  // the API's `changeset.removed` and never prints it, so the loss is silent,
+  // in both TTY and CI. There is no --force and no --keep-routes.
+  //
+  // The pedrovc.com.br pair is the migration target (Sessions moves off the
+  // vza.net zone, which leaves this account). Both pairs are listed while the
+  // cutover is in flight; drop the vza.net pair only once every collector has
+  // moved, and do it as its own deploy.
   "routes": [
     { "pattern": "api.sessions.vza.net", "custom_domain": true },
-    { "pattern": "sessions.vza.net", "custom_domain": true }
+    { "pattern": "sessions.vza.net", "custom_domain": true },
+    { "pattern": "api.sessions.pedrovc.com.br", "custom_domain": true },
+    { "pattern": "sessions.pedrovc.com.br", "custom_domain": true }
   ],
   "account_id": "18ef3246e9f36d1560485ef53889c0ab",
   // Fail-closed default: an unconfigured `wrangler deploy` (no environment override) must NOT
@@ -26,14 +40,16 @@
   // supplies its independent Miniflare bindings in vitest.config.ts.
   "vars": {
     "ENVIRONMENT": "production",
-    "API_HOST": "api.sessions.vza.net",
-    "VIEWER_HOST": "sessions.vza.net",
+    "API_HOST": "api.sessions.pedrovc.com.br",
+    "VIEWER_HOST": "sessions.pedrovc.com.br",
     "R2_DASHBOARD_BASE_URL": "https://dash.cloudflare.com/18ef3246e9f36d1560485ef53889c0ab/r2/default/buckets/agent-sessions-raw",
-    // vza.net zone id (public — also in infra/cf/enroll-cert.py). Certificate
+    // pedrovc.com.br zone id (public — also in infra/cf/enroll-cert.py). Certificate
     // operations use a private Cloudflare OAuth client; no API token is stored.
-    "CF_ZONE_ID": "6a56cdda4766c1d7b5ad0fbe8331048f",
+    // The managed CA is account-scoped, so the certs issued in this zone verify
+    // against the retired api.sessions.vza.net hostname too (measured: 401 not 403).
+    "CF_ZONE_ID": "ff45a32e60c41cefd2fe5ff1c8eb61fb",
     "CF_OAUTH_CLIENT_ID": "0455069be2aea97dd2812497f3ba0dfe",
-    "CF_OAUTH_REDIRECT_URI": "https://sessions.vza.net/oauth/cloudflare/callback",
+    "CF_OAUTH_REDIRECT_URI": "https://sessions.pedrovc.com.br/oauth/cloudflare/callback",
     "CF_OAUTH_SCOPES": "ssl-and-certificates.write offline_access"
   },
   "d1_databases": [

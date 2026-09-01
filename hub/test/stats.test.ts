@@ -2,6 +2,7 @@ import { env, SELF } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { collectStats, MAX_EXCLUDED_BINDS, windows, type StatsQuery } from '../src/stats';
 import { priceUsage } from '../src/pricing-pass';
+import { VIEWER } from './hosts';
 
 /** The statistics page. Its arithmetic is tested through `collectStats` against real D1 rather
  * than by parsing HTML; the page itself is covered by one smoke test that it renders and one
@@ -24,6 +25,24 @@ const BASE: StatsQuery = { range: '30d', by: 'project', tzOffsetHours: 0 };
 async function stats(db: D1Database, q: StatsQuery, now: Date) {
   await priceUsage(db, { maxRows: 100_000, now });
   return collectStats(db, q, now);
+}
+
+/** A timestamp `hoursAgo` before the REAL clock, for the fixtures of the two tests that drive the
+ * page over HTTP.
+ *
+ * Every other test here calls `collectStats` with `NOW` injected, so its fixtures can be dated
+ * absolutely. The two that go through `SELF.fetch` cannot: the page reads its window from the wall
+ * clock — viewer/stats.ts calls `collectStats(env.DB, query, new Date())` — and an HTTP request has
+ * nowhere to put a `now`. Dated absolutely, those fixtures sit inside the default 30d window only
+ * until the clock walks past them, which is precisely how both page tests came to fail 30 days
+ * after they were written while the arithmetic they cover was never wrong. The file's own preamble
+ * already forbids exactly this; it just had no way to say so for the page path.
+ *
+ * Relative dating is not a looser fixture. The window is the one thing these two tests do not
+ * assert on — one checks a cost share, the other that an outlier links out — so pinning the turn
+ * inside today's window is what lets them test what they name. */
+function recent(hoursAgo: number): string {
+  return new Date(Date.now() - hoursAgo * 3_600_000).toISOString();
 }
 
 /** One model, one rate, arithmetic that is easy to check by hand: 1/M input, 10/M output,
@@ -134,19 +153,20 @@ describe('mixed pricing versions', () => {
     // stale fraction as a percentage too, and with two turns that reads "1 of 2 turns (50.0%)" —
     // the same string the correct cost share produces, so the assertion below matched my own notice
     // text and passed under both denominators. At three the two numbers are 33.3% and 66.7%.
-    await seedTurn('s1', '2026-07-20T10:00:00.000Z', { input: 1_000_000 });
-    await seedTurn('s1', '2026-07-20T11:00:00.000Z', { input: 1_000_000 });
-    await seedTurn('s1', '2026-07-20T12:00:00.000Z', { input: 1_000_000 });
+    const [first, second, stale] = [recent(4), recent(3), recent(2)];
+    await seedTurn('s1', first, { input: 1_000_000 });
+    await seedTurn('s1', second, { input: 1_000_000 });
+    await seedTurn('s1', stale, { input: 1_000_000 });
     await priceUsage(testEnv.DB, { now: NOW });
     await testEnv.DB.prepare(
       `UPDATE usage SET priced_version = 1, usd_input = NULL, usd_output = NULL, usd_cache_read = NULL,
                         usd_cache_write_5m = NULL, usd_cache_write_1h = NULL
         WHERE ts = ?1`,
     )
-      .bind('2026-07-20T12:00:00.000Z')
+      .bind(stale)
       .run();
 
-    const res = await SELF.fetch('https://sessions.vza.net/stats', { headers: { 'x-dev-viewer': '1' } });
+    const res = await SELF.fetch(`${VIEWER}/stats`, { headers: { 'x-dev-viewer': '1' } });
     const html = await res.text();
 
     // Sliced to the classes panel, because the page is full of percentages: asserting on the whole
@@ -474,9 +494,9 @@ describe('filters', () => {
 describe('the page', () => {
   it('renders with data and links its outliers to the transcript', async () => {
     await seedSession('s1', { title: 'a session' });
-    await seedTurn('s1', '2026-07-20T10:00:00.000Z', { input: 1_000_000, output: 100_000 });
+    await seedTurn('s1', recent(2), { input: 1_000_000, output: 100_000 });
 
-    const res = await SELF.fetch('https://sessions.vza.net/stats');
+    const res = await SELF.fetch(`${VIEWER}/stats`);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('Statistics');
@@ -489,7 +509,7 @@ describe('the page', () => {
   });
 
   it('renders an empty corpus without dividing by zero', async () => {
-    const res = await SELF.fetch('https://sessions.vza.net/stats');
+    const res = await SELF.fetch(`${VIEWER}/stats`);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).not.toContain('NaN');
@@ -497,7 +517,7 @@ describe('the page', () => {
   });
 
   it('falls back to defaults for an unparseable range instead of erroring', async () => {
-    const res = await SELF.fetch('https://sessions.vza.net/stats?range=lifetime&by=colour&tz=nope');
+    const res = await SELF.fetch(`${VIEWER}/stats?range=lifetime&by=colour&tz=nope`);
     expect(res.status).toBe(200);
   });
 });
