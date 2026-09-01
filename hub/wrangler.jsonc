@@ -80,10 +80,88 @@
     "logs": { "enabled": true, "destinations": ["agent-backup-azure-logs"], "invocation_logs": true },
     "traces": { "enabled": true, "destinations": ["agent-backup-azure-traces"] }
   },
+  // The STANDING sessions preview stack, selected with `wrangler deploy --env preview`.
+  // This is the mechanism that originally produced the `sessions-hub-preview` Worker (the
+  // block was dropped in a6fb19e when Workers Builds previews were retired); it is restored
+  // here because the stack itself still exists and has now been MOVED out of the production
+  // account. It is NOT the per-PR preview path: `pr-<n>-app` previews are provisioned by the
+  // `preview` CI job from generated configs (infra/cf/preview-control.mjs) and never read this.
+  //
+  // `account_id` is pinned to the non-production account (`sessions-ppe-vza-net`, workers.dev
+  // subdomain `sessions-ppe`) so a preview deploy CANNOT land in production even though the
+  // top-level `account_id` above names it. Named environments inherit `account_id`, so leaving
+  // it out is exactly the misconfiguration that put this stack in the production account.
+  //
+  // Every binding is restated: wrangler does NOT inherit bindings into named environments.
+  "env": {
+    "preview": {
+      "account_id": "cbb04a26e6fa2d0cdc4eb67c735e5669",
+      "name": "sessions-hub-preview",
+      // Preview must not export the production Durable Object: `exports` (unlike
+      // `durable_objects.bindings`) IS inherited, so both are overridden to strip
+      // CloudflareOAuthBroker. Unreviewed preview code cannot reach the managed CA.
+      "main": "src/preview.ts",
+      "exports": {},
+      "durable_objects": { "bindings": [] },
+      // Empty on purpose: `routes` IS inherited into named environments, so without this a
+      // preview deploy would REASSIGN the production custom domains (api./sessions.vza.net)
+      // to this Worker. Preview serves only from workers.dev — the vza.net zone lives in the
+      // production account, so a preview custom domain is impossible there anyway.
+      "routes": [],
+      "workers_dev": true,
+      "preview_urls": true,
+      "vars": {
+        "ENVIRONMENT": "preview",
+        // Allowlist for /api/v1/admin/migrate's GitHub OIDC caller. Preview ONLY: the
+        // production config must never carry this, so the endpoint cannot exist there.
+        "MIGRATE_OIDC_REPOSITORY": "pedropaulovc/agent-sessions-backup",
+        "API_HOST": "api.sessions.vza.net",
+        "VIEWER_HOST": "sessions.vza.net",
+        "R2_DASHBOARD_BASE_URL": "https://dash.cloudflare.com/cbb04a26e6fa2d0cdc4eb67c735e5669/r2/default/buckets/agent-sessions-raw-preview"
+      },
+      "d1_databases": [
+        {
+          "binding": "DB",
+          "database_name": "sessions-index-preview",
+          "database_id": "fb961c41-cd40-47ea-8df0-46fda279701d",
+          "migrations_dir": "migrations"
+        }
+      ],
+      "r2_buckets": [{ "binding": "RAW", "bucket_name": "agent-sessions-raw-preview" }],
+      "kv_namespaces": [{ "binding": "KV", "id": "f3413813878c4846b7586c25f01cbe24" }],
+      // Producer only, and no crons — this mirrors what the moved Worker actually ran.
+      // Workers Builds deployed it with `wrangler versions upload`, which applies neither
+      // queue consumers nor cron triggers, so the live Worker had `schedules: []` and
+      // `parse-preview` had 0 consumers. A plain `wrangler deploy` WOULD activate both, which
+      // is a behaviour change rather than a move: attaching the consumer and the 15-minute
+      // cron would immediately start mutating the migrated D1/R2. Enable them deliberately.
+      "queues": {
+        "producers": [{ "binding": "PARSE_QUEUE", "queue": "parse-preview" }]
+      },
+      "triggers": { "crons": [] },
+      // Overridden to EMPTY, not omitted: `limits` is inheritable, and the production
+      // `cpu_ms: 300000` is rejected by this account with "CPU limits are not supported for
+      // the Free plan" [code: 100328]. The non-production account is on the Free plan, which
+      // is why the generated per-PR configs for it (infra/cf/preview-trust.mjs) set no limits
+      // either. Inheriting production's value makes every preview deploy fail outright.
+      "limits": {},
+      // No `destinations`: the Azure log/trace destinations are ACCOUNT-level objects that
+      // exist only in the production account, so the inherited production block would export
+      // nowhere from here.
+      "observability": { "enabled": true, "head_sampling_rate": 1 }
+    }
+  }
   // production secrets: SETUP_TOKEN (passkey bootstrap), ASSET_SIGNING_SECRET
   // (independent HMAC secret for short-lived external-asset viewer links), and
   // PRODUCTION_SESSION_SIGNING_KEY (base64url-encoded 32-byte viewer-session HMAC key).
   // PRODUCTION_SESSION_SIGNING_KEY is deliberately absent from every preview environment.
   // Cloudflare certificate lifecycle uses Authorization Code + PKCE; the OAuth grant lives
   // only in CF_OAUTH_BROKER storage.
+  //
+  // preview secrets (`wrangler secret put <NAME> --env preview --profile preview`):
+  // PREVIEW_BEARER is the environment's ENTIRE auth gate (src/auth/identity.ts) — without it
+  // the viewer 401s and the API resolves every caller to anonymous. DEV_AUTH is carried over
+  // from the moved Worker but is INERT: the shared dev-auth bearer was retired in PR #118 and
+  // no code in src/ reads it. Neither value is recoverable from the old Worker, so both were
+  // generated fresh during the account move (DEV_AUTH is therefore ROTATED, not copied).
 }
