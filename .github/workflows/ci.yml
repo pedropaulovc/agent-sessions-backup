@@ -277,6 +277,9 @@ jobs:
             --base-manifest migrations/source-baseline.json \
             --history migrations/historical-baseline.json
       - name: Deploy production hub
-        run: npx wrangler deploy --config wrangler.jsonc
+        # `--env=""` selects the TOP-LEVEL environment explicitly. wrangler.jsonc also defines
+        # the `preview` environment, and with several environments present an unqualified
+        # `deploy` only warns before defaulting here — this states production outright.
+        run: npx wrangler deploy --config wrangler.jsonc --env=""
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
