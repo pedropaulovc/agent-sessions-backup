@@ -1,7 +1,8 @@
 # API Shield mTLS for `api.sessions.pedrovc.com.br` (spike S4)
 
 The machine API is authenticated by TPM/software-bound mTLS client certificates
-signed by Cloudflare's per-zone **managed CA**. The edge verifies the client cert,
+signed by Cloudflare's **account-scoped managed CA** (addressed through a per-zone
+API, which is not the same thing — see Notes). The edge verifies the client cert,
 a zone WAF rule blocks anything unverified, and the Worker maps
 `request.cf.tlsClientAuth.certFingerprintSHA256` to a `machines` row (defense in
 depth). This file is the runbook for standing that up on the `pedrovc.com.br` zone.
@@ -152,6 +153,21 @@ the pass fails, the key is retained and scheduling does not occur.
   per zone: the certs re-enrolled in the `pedrovc.com.br` zone during the 2026-09-01 zone
   move also verify against the retired `api.sessions.vza.net` hostname (measured: `401`,
   not `403`). Certificates minted before that move were issued in the `vza.net` zone.
+  Extended 2026-09-02, same 403-vs-401 discriminator, in the other direction: a cert minted
+  in the departed `vza.net` zone still verifies on `api.sessions.pedrovc.com.br` (`401`), and
+  **revocation propagates across zones** — after `DELETE` on the old zone the same cert flips
+  to `403`, converging within about a minute (a lagging PoP answered `401` once first). So
+  scoping is asymmetric and worth stating precisely:
+
+  | Surface | Scope |
+  |---|---|
+  | Managed CA identity, cert verification, revocation checking | **account** |
+  | Certificate inventory, mint/revoke endpoints, hostname associations, WAF rules | **zone** |
+
+  The zone column is only *addressing*. Reading it as capability is what produced the false
+  "certs leave with the zone, therefore they become unrevokeable" thesis corrected in
+  `hostname-cutover.md` §0.1/§0.4 — a zone move leaves a `status:"moved"` husk in the source
+  account that keeps serving both mint and revoke.
 
 ## M4 fleet-management endpoints
 

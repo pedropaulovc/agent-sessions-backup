@@ -245,7 +245,7 @@ and cannot half-apply because someone mis-typed one of N form fields under time 
 | Zone · SSL and Certificates · Edit | Zone: `vza.net` | revoking the old certs (§8.1) — must be minted while that zone is still in this account |
 | Account · D1 · Edit | Account: `sessions-prod` | Path B D1 writes (§6) |
 
-`infra/cf/mtls.md:38-39` suggests **API Gateway · Edit** for the hostname association. That is
+`infra/cf/mtls.md:39-40` suggests **API Gateway · Edit** for the hostname association. That is
 stale/wrong for this endpoint: the API reference for *Replace Hostname Associations* names
 `SSL and Certificates Write` as the only accepted permission. Granting SSL-and-Certificates Edit
 covers §1 and §5.4 with one permission.
@@ -277,7 +277,7 @@ Endpoint: `PUT /zones/{zone_id}/certificate_authorities/hostname_associations`
 API reference: <https://developers.cloudflare.com/api/resources/certificate_authorities/subresources/hostname_associations/methods/update/>
 
 1. **It is a REPLACE, not an append.** The operation's official title is literally
-   **"Replace Hostname Associations"**. `infra/cf/mtls.md:50-52` says the same from experience.
+   **"Replace Hostname Associations"**. `infra/cf/mtls.md:51-53` says the same from experience.
 2. **An omitted or empty `hostnames` WIPES the set.** The reference marks `hostnames` as
    *optional array of string*, and the doc page's own worked example sends `-d '{}'` — i.e. the
    empty body is a valid call whose only possible meaning is "replace the set with nothing".
@@ -293,7 +293,7 @@ API reference: <https://developers.cloudflare.com/api/resources/certificate_auth
    BYOCA (Enterprise-only) instead.
 4. **A PUT on the new zone cannot disturb `api.sessions.vza.net`.** `zone_id` is a *path*
    parameter and the association set is per-zone — the request has no way to name another zone,
-   and the response echoes only `result.hostnames` for the zone you addressed. `mtls.md:51` frames
+   and the response echoes only `result.hostnames` for the zone you addressed. `mtls.md:52` frames
    the collateral-damage risk as "any sibling host already associated **on the zone**", same
    scoping. The old zone's associations are untouched by anything in §1, which is exactly what
    makes the §8 rollback (point collectors back at the old hostname) work.
@@ -332,7 +332,7 @@ Expected 200 body: `{"success": true, "result": {"hostnames": ["api.sessions.ped
 The echoed `hostnames` IS the resulting complete set — verify it contains everything you intended
 to keep before moving on.
 
-Do **not** associate the viewer hostname. `mtls.md:62`: the viewer uses passkeys, never client
+Do **not** associate the viewer hostname. `mtls.md:64`: the viewer uses passkeys, never client
 certs, and an association there would make browsers prompt for a certificate.
 
 There is a dashboard equivalent — **SSL/TLS → Client Certificates → Hosts → Edit** — whose only
@@ -346,14 +346,14 @@ drive it, so there is no reason to hand-click a cutover step.
 **Verdict up front: this rule is belt-and-braces, NOT load-bearing. You can go live without it and
 add it afterwards.** Full reasoning and the one caveat in §2.1.
 
-Reconstructed verbatim from the existing `vza.net` rule documented at `infra/cf/mtls.md:64-78`:
+Reconstructed verbatim from the existing `vza.net` rule documented at `infra/cf/mtls.md:65-79`:
 
 ```
 Field:  (http.host eq "api.sessions.vza.net" and (not cf.tls_client_auth.cert_verified or cf.tls_client_auth.cert_revoked))
 Action: Block
 ```
 
-The `cert_revoked` disjunct is load-bearing — `mtls.md:73-76`: Cloudflare keeps `cert_verified`
+The `cert_revoked` disjunct is load-bearing — `mtls.md:74-77`: Cloudflare keeps `cert_verified`
 **true** for a revoked-but-otherwise-valid cert and reports revocation only through the separate
 `cert_revoked` field, so a rule testing `cert_verified` alone still admits a revoked machine cert.
 
@@ -439,7 +439,7 @@ unauthenticated traffic is denied.** The complete decision path, in order:
    `if (identity.kind !== 'machine') return Response.json({ error: 'unauthorized' }, { status: 401 });`
 6. Revocation is covered independently of the WAF's `cert_revoked` disjunct by step 3's `revoked`
    check, so dropping the rule opens no revoked-cert window at the Worker.
-7. This is not just code reading — it was verified in production. `infra/cf/mtls.md:11-14`: "With
+7. This is not just code reading — it was verified in production. `infra/cf/mtls.md:12-15`: "With
    no client cert, `GET /api/v1/search`, `PUT /api/v1/files/...`, and even a forged
    `x-dev-machine` header all return `401` in production (verified)."
 
@@ -497,7 +497,7 @@ presented. `cert_slot":"current"` confirms it matched the current slot, not a gr
 | What you see | Cause | Next step |
 |---|---|---|
 | `curl: (6) Could not resolve host` | DNS not delegated yet — nameservers `ned.ns.cloudflare.com` / `pearl.ns.cloudflare.com` not set at registro.br, or DNSSEC still on there. Zone will read `initializing`, not `active`. | Finish the registrar work. Nothing here is testable yet. |
-| `curl: (35)` / `curl: (60)` TLS handshake or SSL-cert error, or an SSL error naming a hostname mismatch | **Hostname not routed / no edge certificate yet.** Universal SSL does not cover a 3-label host, so `api.sessions.pedrovc.com.br` needs its own edge cert exactly like `api.sessions.vza.net` did (`infra/cf/mtls.md:23-25` — it "provisioned automatically within a few minutes"). | Wait for the Workers custom-domain edge cert. Not a CA problem. |
+| `curl: (35)` / `curl: (60)` TLS handshake or SSL-cert error, or an SSL error naming a hostname mismatch | **Hostname not routed / no edge certificate yet.** Universal SSL does not cover a 3-label host, so `api.sessions.pedrovc.com.br` needs its own edge cert exactly like `api.sessions.vza.net` did (`infra/cf/mtls.md:24-26` — it "provisioned automatically within a few minutes"). | Wait for the Workers custom-domain edge cert. Not a CA problem. |
 | HTTP `530` (Cloudflare error 1016) or `404` with a Cloudflare (not JSON) body | Zone is active and TLS works, but the Worker custom domain for `$NEW_HOST` does not exist. | `hub/wrangler.jsonc:19` route + `API_HOST` must be flipped and deployed (see the end of §7). |
 | `http_status=401` **and** body `{"error":"unauthorized"}` | **CA NOT ASSOCIATED.** TLS completed, the request reached the Worker, but the edge never asked for (or never verified) a client certificate, so `cf.tlsClientAuth` was absent and `machineIdentity` returned anonymous (`hub/src/auth/identity.ts:90,113` → `hub/src/router.ts:114`). | Re-check §1: GET the associations and confirm `api.sessions.pedrovc.com.br` is in `result.hostnames`. If it is present and this persists, the hypothesis is disproved → Path B (§5–§7). |
 | `http_status=403` with an **HTML** Cloudflare block page | The §2 WAF rule fired, i.e. `cf.tls_client_auth.cert_verified` was false at the edge. Same root cause as the row above, just caught one layer earlier. | Same as above. Temporarily disable the §2 rule to get the cleaner 401-vs-200 discrimination. |
@@ -598,7 +598,7 @@ Nothing in the hub *requires* a key type — `certFingerprint` only SHA-256s the
 fleet convention plus the one empirically verified path:
 
 * `infra/cf/enroll-cert.py:487` — `private_key = ec.generate_private_key(ec.SECP256R1())`
-* `infra/cf/mtls.md:147-149` — "ECDSA P-256 CSRs are accepted by the managed CA (the
+* `infra/cf/mtls.md:149-151` — "ECDSA P-256 CSRs are accepted by the managed CA (the
   `enroll-cert.py` default)"
 
 So: **EC P-256, `ecdsa-with-SHA256`.** RSA-2048 was not used, to avoid re-testing CA acceptance
@@ -856,7 +856,7 @@ revert customized roots (`config.py:459-462`).
 ### 7.2 `amet-windows` and `vm-solidworks-windows` — Windows / Schannel, cert store by thumbprint
 
 Windows `curl.exe` is Schannel-backed and **refuses file-based client certs**. Verified table at
-`infra/cf/mtls.md:122-126`: `--cert cert.pem --key key.pem` fails, `--cert client.p12 --type P12`
+`infra/cf/mtls.md:123-127`: `--cert cert.pem --key key.pem` fails, `--cert client.p12 --type P12`
 gives `SEC_E_INTERNAL_ERROR`, and only `--cert "CurrentUser\MY\<thumbprint>"` returns 200. The
 collector emits exactly that form with no `--key`
 (`collector/src/agent_collector/transport.py:132-136`).
