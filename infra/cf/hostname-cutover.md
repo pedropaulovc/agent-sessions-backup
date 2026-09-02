@@ -79,14 +79,37 @@ are zone-level. That raises the question of whether a `vza.net`-minted cert pres
   **Stated plainly: the docs do not answer this, and the above is inference, not fact.** Do not
   build the plan on it.
 
-**The decisive point does not depend on resolving that question.** Once `vza.net` leaves the
-account, `sessions-prod` no longer has a zone through which to address those three cert ids, so
-the only revoke verb becomes unreachable. Both branches end in the same place:
+**CORRECTION (measured 2026-09-02, after the move).** This section originally argued that once
+`vza.net` left the account, `sessions-prod` would have no zone through which to address those three
+cert ids, making the only revoke verb unreachable and the certs *permanently unrevokeable*. That
+premise is **false**, and it was never tested before being written.
+
+A registrar move does not move the zone object between accounts. It leaves a husk with
+`status: "moved"` in the source account, and the client certificates stay with that husk:
+
+```
+GET    /zones/6a56cdda4766c1d7b5ad0fbe8331048f          -> account.name "sessions-prod", status "moved"
+GET    /zones/6a56cdda…/client_certificates             -> 200, the three certs, all "active"
+```
+
+Reachability of the *list* is not the claim that matters, so the write path was proven end to end
+with a throwaway credential rather than inferred (positive control, 2026-09-02):
+
+```
+POST   /zones/6a56cdda…/client_certificates             -> 201, CN "husk-revoke-probe", active
+DELETE /zones/6a56cdda…/client_certificates/7eedeb26-…  -> 200, success true
+GET    /zones/6a56cdda…/client_certificates/7eedeb26-…  -> 200, status "revoked"
+```
+
+The three live certs were untouched throughout, and the probe's key material never left `/tmp`. A
+`moved` zone accepts both mints and revocations. So the revoke verb stays reachable from the source
+account and §8's Stage 2 remains performable at leisure — it is NOT a before-the-move-or-never step.
+The two branches no longer share an outcome:
 
 | If the edge's revocation check is… | Consequence for a `vza.net`-minted cert on `api.sessions.pedrovc.com.br` after the zone move |
 |---|---|
-| **CA-scoped** (inference above) | The edge *would* honour a revocation — but we can no longer SET the revoked bit, because the only endpoint that can is on a zone in someone else's account. Permanently unrevokeable. |
-| **Zone-scoped** | The cert never appears in `pedrovc.com.br`'s list, so `cf.tls_client_auth.cert_revoked` can never become `true` for it. Permanently unrevokeable. |
+| **CA-scoped** (inference above) | The edge *would* honour a revocation, and the revoked bit CAN still be set, on the `moved` husk. Revocation works. |
+| **Zone-scoped** | The cert never appears in `pedrovc.com.br`'s list, so `cf.tls_client_auth.cert_revoked` can never become `true` for it. Unchanged by the correction — reachability was never the obstacle in this branch. |
 
 And `hub/src/auth/identity.ts:89` cannot compensate: it reads `certRevoked` **from the edge**, so
 it inherits whatever the edge computes and adds no independent revocation capability.
@@ -97,10 +120,12 @@ it inherits whatever the edge computes and adds no independent revocation capabi
   verify (§3), flip only `hub_url` in the three collector configs (§4). No new certs, no D1 write,
   no downtime, rollback = revert one config line. This restores service on the new hostname
   immediately and decouples it from the cert work.
-* **Path B — MANDATORY, and it must complete BEFORE `vza.net` leaves the account.** Re-mint all
-  three certs from `/zones/ff45a32e…/client_certificates` (§5), write the new fingerprints into
-  D1 (§6), install them (§7), and **revoke the three old `vza.net`-minted certs on the `vza.net`
-  zone while it is still ours** (§8, last block). Do not carry a credential you cannot revoke.
+* **Path B — MANDATORY, but NOT gated on the zone move.** Re-mint all three certs from
+  `/zones/ff45a32e…/client_certificates` (§5), write the new fingerprints into D1 (§6), install
+  them (§7), and **revoke the three old `vza.net`-minted certs** (§8, last block). The original
+  text ordered the revocation before the zone move; §0.1's CORRECTION measures that premise false —
+  the `moved` zone husk stays in `sessions-prod` and keeps serving the revoke verb. Revoke once the
+  last box is running on a new cert, not before, or you strand it.
 
 This supersedes the earlier framing of Path B as an optional fallback. What remains genuinely
 deferred is only the *`cert_id` bookkeeping* (§7.5) — that is cosmetic. The re-mint itself is not.
@@ -136,13 +161,14 @@ Action: Block
 ```
 
 **TERTIARY: CA revocation** (`cf.tls_client_auth.cert_revoked` + `DELETE /zones/{zone}/client_certificates/{id}`).
-Defense in depth. It is the layer §0.1 shows we lose for the `vza.net`-minted certs.
+Defense in depth. §0.1's CORRECTION shows we do NOT lose this layer: the `moved` zone husk stays in
+this account and still exposes the revoke verb for the `vza.net`-minted certs.
 
 **Consequence for sequencing:** a compromised collector cert is fully containable today with two
 mechanisms that do not involve the CA at all. So §0.2's mandatory Path B is *sequenced work with a
-deadline*, not an active security incident. What justifies the deadline is defense in depth plus
-not wanting a live, valid, permanently-unrevokeable credential for this account's CA sitting on
-three boxes indefinitely.
+deadline*, not an active security incident. What justifies the deadline is defense in depth plus not
+wanting a live, valid credential for this account's CA sitting on three boxes indefinitely. It is no
+longer justified by *unrevokeability* — per §0.1 those certs remain revokeable after the move.
 
 **Open question, deliberately not chased:** whether the edge's revocation check is CA-scoped or
 zone-scoped (§0.1, question (a)) remains undocumented and untested. It is testable later — present
@@ -151,8 +177,9 @@ fires; the only such cert is `d2bfa96d-3599-4373-bdc0-11b44816a844`
 (`vm-solidworks-windows`' prior cert, fingerprint
 `4bc2b0c57faf9368baf07c789ca377feeca2c47a22d2e69531ee9ce2846e585c`, revoked 2026-07-20 per
 `retired_certs`), and its key material is only reachable on a box that has been offline since
-2026-08-15. **No decision in this runbook depends on the answer** — §0.1 shows both branches
-converge on the same plan. Do not block the cutover on it.
+2026-08-15. **No decision in this runbook depends on the answer.** Note the branches no longer
+converge (§0.1 CORRECTION), but they differ only in whether CA revocation *adds* anything — D1
+remains primary either way. Do not block the cutover on it.
 
 ### 0.4 What happens to the three `vza.net` client certs when that zone moves accounts
 
@@ -497,10 +524,11 @@ account — see §8.
 
 ---
 
-## 5. Path B (MANDATORY, deadline = the `vza.net` handover) — re-issue all three certs from the new zone
+## 5. Path B (MANDATORY, no zone-move deadline) — re-issue all three certs from the new zone
 
-Per §0.2 this is not optional. The old certs are issued by this account's CA but are only
-revokeable through the `vza.net` zone endpoint, which leaves the account with the zone. Complete
+Per §0.2 this is not optional. The old certs are issued by this account's CA and are revokeable only
+through the `vza.net` zone endpoint — which stayed in this account as a `moved` husk, so the
+handover imposed no deadline (§0.1 CORRECTION; the heading previously said otherwise). Complete
 §5–§7, then §8.1.
 
 ### 5.1 The three identities (read from production D1, `sessions-index`, 2026-09-01)
@@ -890,8 +918,11 @@ bridge is up, all tolerable:
   (`hub/src/api/certs.ts:484-489`). The only casualty is the *displaced* old cert — its id goes to
   `prev_cert_id` and then to `retired_certs`, where the daily prune's revoke targets the new zone
   and 404s. `revokeClientCert` maps 404 → `'revoked'` (`hub/src/api/certs.ts:90`), so the row gets
-  stamped revoked without a real revocation. Cosmetic: the cert has no hostname left to
-  authenticate against once its zone leaves the account.
+  stamped revoked without a real revocation. The reason originally given here — "the cert has no
+  hostname left to authenticate against once its zone leaves the account" — is WRONG, on the same
+  measurement as §0.1's CORRECTION and for the same reason as §7.5: the account CA still validates
+  that cert on `api.sessions.pedrovc.com.br`, so it authenticates fine. What actually bounds it is
+  D1 (`cert_revoke_at`), plus a real revoke on the `moved` husk, which remains reachable.
 * **No same-day urgency for the bookkeeping.** All three certs are valid until `2027-07-17`
   (`notAfter` on the local `amet-wsl.client.pem`; the fleet was enrolled with
   `validity_days: 365` on the same day). `amet-wsl` has already run for over a month with
@@ -959,51 +990,73 @@ Two-stage, and the ordering is the whole point:
 point 1 above. Do not revoke anything until every collector is green on
 `api.sessions.pedrovc.com.br` with a `pedrovc.com.br`-minted cert.
 
-**Stage 2 — revoke them on the `vza.net` zone BEFORE handing that zone to `vza-net-prod`.** This
-is mandatory, per §0.1: once the zone leaves the account, `DELETE /zones/{zone_id}/client_certificates/{id}`
-is the only revoke verb in existence and it is no longer reachable by anyone in `sessions-prod`.
-Three live certificates issued by this account's CA would then be permanently unrevokeable while
-that CA keeps validating them on every mTLS hostname in the account.
+**Stage 2 — revoke them once every collector is green on a `pedrovc.com.br`-minted cert.** The
+earlier text called this mandatory *before* handing `vza.net` to `vza-net-prod`, on the theory that
+the revoke verb becomes unreachable afterwards. Measured false — see §0.1's CORRECTION: the move
+leaves a `status: "moved"` husk of the zone in `sessions-prod`, and
+`GET /zones/$OLD_ZONE/client_certificates` still returns all three certs from this account. There is
+no ordering constraint against the zone move.
+
+What DOES constrain the order is the grace fallback: the old cert is a machine's only working
+credential until its new PFX is imported. Revoking early locks that box out. As of 2026-09-02
+`vm-solidworks-windows` has NOT imported its new cert, so revoking now would strand it.
+
+`DELETE /zones/{zone_id}/client_certificates/{id}` is still the only revoke verb, and the token
+below needs SSL-and-Certificates Edit on the `vza.net` zone — which, since the husk stayed behind,
+means a `sessions-prod` token, not a `vza-net-prod` one.
 
 ```bash
-# 1. list the zone's certs while vza.net is still ours, and capture the ids
+# 1. list the zone's certs (the `moved` husk still serves this) and capture the ids
 curl -sS "$CF_API/zones/$OLD_ZONE/client_certificates" \
   -H "Authorization: Bearer <token with SSL-and-Certificates Edit on vza.net>" \
   | jq -r '.result[] | "\(.id)  \(.common_name)  \(.serial_number)  \(.status)  \(.fingerprint_sha256)"'
 
-# 2. revoke each of the three
-for CID in 65913f0a-4b65-4047-9bb4-1e8e4f9f1590 \
-           2544a51d-fc9e-47f0-966e-2a789155ade0 \
-           <amet-wsl-cert-id-from-step-1>; do
-  curl -sS -X DELETE "$CF_API/zones/$OLD_ZONE/client_certificates/$CID" \
-    -H "Authorization: Bearer <token with SSL-and-Certificates Edit on vza.net>" \
-    | jq '.success, .result.status'
-done
+# 2. revoke — ONE MACHINE AT A TIME, and only after THAT box reports cert_slot='current' on its new
+#    cert. Each id below is the machine's grace credential; revoking before import strands the box.
+#    ids verified against fingerprints on the husk, 2026-09-02:
+#      65913f0a-4b65-4047-9bb4-1e8e4f9f1590  amet-windows           fp 1152bdfb152001de…  ELIGIBLE
+#      049d21f6-95ee-49a7-8efc-f92929cabaf2  amet-wsl, CN "Cloudflare"  fp 811800780425b3fe…  ELIGIBLE
+#      2544a51d-fc9e-47f0-966e-2a789155ade0  vm-solidworks-windows  fp 53ba4e2bf19dd0dd…  DO NOT
+#    ELIGIBLE = that box is confirmed running on its new cert (D1 cert_slot='current'). As of
+#    2026-09-02 none of the three has actually been revoked yet; vm-solidworks-windows has a new
+#    cert staged in D1 but has NOT imported it, so its grace credential is still load-bearing.
+CID=""   # paste exactly ONE id from the list above
+[ -n "$CID" ] || { echo "set CID to a single cert id first"; exit 1; }
+curl -sS -X DELETE "$CF_API/zones/$OLD_ZONE/client_certificates/$CID" \
+  -H "Authorization: Bearer <token with SSL-and-Certificates Edit on vza.net>" \
+  | jq '.success, .result.status'
 
 # 3. confirm. Revocation is ASYNCHRONOUS: expect pending_revocation, then revoked.
 #    Re-run until all three read "revoked" (hub/src/api/certs.ts:69-71 documents the same lifecycle).
-curl -sS "$CF_API/zones/$OLD_ZONE/client_certificates" \
+#    `?status=all` is REQUIRED: the default list returns ACTIVE ONLY, so without it a successful
+#    revoke looks like the cert vanished (measured 2026-09-02: default n=3, status=all n=5).
+curl -sS "$CF_API/zones/$OLD_ZONE/client_certificates?status=all" \
   -H "Authorization: Bearer <token with SSL-and-Certificates Edit on vza.net>" \
   | jq -r '.result[] | "\(.common_name)  \(.status)"'
 ```
 
-`amet-wsl`'s old cert has `cert_id = NULL` in D1, so its id must come from step 1 — match on
-serial `2307C4CF6D3B2A420971AF0656CDA7397DB05773` or on
+`amet-wsl`'s old cert has `cert_id = NULL` in D1, so its id could not be read from D1. It has now
+been resolved off the husk and inlined in step 2: `049d21f6-95ee-49a7-8efc-f92929cabaf2`, bound to
+serial `2307C4CF6D3B2A420971AF0656CDA7397DB05773` and
 `fingerprint_sha256 = 811800780425b3fe6455fbb2d0c45c5337fd28e741a01d621621fcc38a7b379f`. Its
-`common_name` is the string `Cloudflare` (see §5.1), not `amet-wsl`, so do not match on name.
+`common_name` is the string `Cloudflare` (see §5.1), not `amet-wsl`, so do not match on name — and
+note a *revoked* `vm-solidworks-windows` entry also exists (`d2bfa96d-…`, revoked 2026-07-20), so
+match on fingerprint, never on name plus status.
 
 Note: revoked managed-CA client certs cannot be deleted, only revoked — "It is not possible to
 permanently delete client certificates generated with the default Cloudflare-managed CA. Once
 revoked, these client certificates will still be listed … and can be restored at any time"
 (<https://developers.cloudflare.com/ssl/client-certificates/revoke-client-certificate/>). So the
-three entries will remain visible under `vza.net` with `status: revoked`, which is the intended
-end state, and the restore capability leaves with the zone.
+three entries will remain visible under `vza.net` with `status: revoked`, which is the intended end
+state — but only under `?status=all`; the default list filters them out (measured, see step 3). The
+restore capability does NOT leave with the zone: the husk stays in `sessions-prod`, so restore is
+still ours too.
 
 **Do NOT rely on the hub's prune to do this.** After `CF_ZONE_ID` is flipped, the prune would send
 `DELETE /zones/ff45a32e…/client_certificates/<old-vza-id>` — wrong zone — get a 404, and
 `revokeClientCert` maps 404 → `'revoked'` (`hub/src/api/certs.ts:90`), stamping `retired_certs`
 revoked without any real revocation having happened. That audit trail would be a false negative.
-Revoke manually via the commands above, on the old zone, while you still can.
+Revoke manually via the commands above, against the old zone's `moved` husk.
 
 ---
 
