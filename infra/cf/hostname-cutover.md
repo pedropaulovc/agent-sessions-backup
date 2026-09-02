@@ -1155,6 +1155,41 @@ Revoke manually via the commands above, against the old zone's `moved` husk.
 
 ---
 
+### 8.3 Post-merge: the CI deploy token is zone-scoped to `vza.net` and must be re-scoped
+
+**Found by the first `main` deploy after PR #146 merged (run 33587349924, 2026-09-02 03:33Z).**
+The Worker upload succeeded — version `a4f0ff91` went live with the right `API_HOST`/`VIEWER_HOST`
+and both hosts kept serving — and then `wrangler deploy` failed on the step after the upload:
+
+```
+✘ [ERROR] A request to the Cloudflare API (/zones/ff45a32e60c41cefd2fe5ff1c8eb61fb/workers/routes) failed.
+  Authentication error [code: 10000]
+📎 It looks like you are authenticating Wrangler via a custom API token set in an environment variable.
+```
+
+`hub/wrangler.jsonc:31-33` declares the two hosts as `custom_domain` routes, so after every upload
+wrangler reconciles routes on the zone that owns them — now `pedrovc.com.br`
+(`ff45a32e…`). The GitHub Actions secret `CLOUDFLARE_DEPLOY_TOKEN` was minted with "Workers
+Scripts Edit plus only the empirically required existing-binding and `vza.net` route permissions"
+(`docs/dev-preview-redesign.md:430`); the `vza.net` zone has since left this account, so the token
+has no zone grant at all on the zone the routes live in. Nothing in this runbook flipped it — this
+section is the missing step.
+
+**Impact:** none on traffic (the custom domains were already correct and the upload is what
+changes code), but every `main` push will fail its deploy job, and a future change that *does*
+need route reconciliation — a new host, a removed one — would silently not apply.
+
+**Fix (dashboard → My Profile → API Tokens → the deploy token → Edit; the token value is unchanged
+by a permission edit, so the GitHub secret does not need rotating):**
+
+| Permission | Scope |
+|---|---|
+| Zone · Workers Routes · Edit | Zone: `pedrovc.com.br` (replace the `vza.net` entry) |
+
+Then re-run the failed job (`gh run rerun 33587349924 --failed`) and confirm `deploy` goes green.
+`Read` may be enough for the list call that failed, but custom-domain reconciliation writes; use
+Edit and, per `docs/dev-preview-redesign.md:461`, trim later with a sacrificial run if desired.
+
 ### 8.2 FOLLOW-UP DEFECT (not part of this cutover, do not fix here)
 
 **Captured because it outlives this migration.** The 404 behaviour noted at the end of §8.1 is not
