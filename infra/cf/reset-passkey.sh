@@ -76,6 +76,19 @@ done
 VIEWER="https://$VIEWER_HOST"
 WRANGLER=(npx --no-install wrangler)
 
+# Every wrangler call below pins --profile, but wrangler gives CLOUDFLARE_API_TOKEN
+# (and the account-id / legacy key+email variables) precedence over the OAuth
+# profile. The cutover runbook has the operator export a token for its curl
+# steps, and a leftover one in the shell made `status` fail with an
+# authentication error that the old parser reported as `KeyError: 'results'`
+# (reproduced 2026-09-02 with CLOUDFLARE_API_TOKEN=bogus). Drop them so the
+# profile is the only credential in play, and say so.
+IGNORED_CF_ENV=()
+for v in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CLOUDFLARE_API_KEY CLOUDFLARE_EMAIL; do
+  [ -n "${!v:-}" ] && IGNORED_CF_ENV+=("$v")
+  unset "$v"
+done
+
 # wrangler chats on stderr about update checks and multi-environment configs;
 # none of it is signal here and it corrupts anything we try to parse.
 #
@@ -109,15 +122,41 @@ wr() {
   return "$rc"
 }
 
+# Buffer first, then parse STRICTLY. wr writes wrangler's diagnostics to stdout,
+# so in a `wr | python3` pipe an API error body went into the parser instead of
+# onto the terminal - and the old regex (`\[\s*\{.*\}\s*\]`) happily matched the
+# `notes: [{...}]` array inside that error object, so the failure surfaced as a
+# KeyError with the real cause swallowed. Now: nonzero wrangler exit, or any
+# output that is not `[{"success": true, "results": [...]}]`, prints the raw
+# output and aborts.
 d1_query() {
-  local sql="$1"
-  wr d1 execute "$D1_NAME" --remote --profile "$PROFILE" --command "$sql" --json \
-    | python3 -c '
-import sys, json, re
-m = re.search(r"\[\s*\{.*\}\s*\]", sys.stdin.read(), re.S)
-if not m:
-    sys.exit("could not parse wrangler d1 --json output")
-print(json.dumps(json.loads(m.group(0))[0]))
+  local sql="$1" out rc
+  if out="$(wr d1 execute "$D1_NAME" --remote --profile "$PROFILE" --command "$sql" --json)"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then
+    { echo "FATAL: wrangler d1 execute exited $rc. Output:"; printf '%s\n' "$out"; } >&2
+    exit 1
+  fi
+  printf '%s\n' "$out" | python3 -c '
+import sys, json
+raw = sys.stdin.read()
+doc = None
+# wrangler may print banner lines before the JSON; the payload starts at the first line that is "[".
+for start in (0, raw.find("\n[") + 1):
+    try:
+        doc = json.loads(raw[start:])
+        break
+    except ValueError:
+        continue
+ok = isinstance(doc, list) and len(doc) == 1 and isinstance(doc[0], dict) \
+     and doc[0].get("success") is True and isinstance(doc[0].get("results"), list)
+if not ok:
+    sys.stderr.write("FATAL: wrangler d1 --json output is not a successful result set. Raw output:\n" + raw)
+    sys.exit(1)
+print(json.dumps(doc[0]))
 '
 }
 
@@ -135,8 +174,15 @@ live_rpid() {
     | python3 -c 'import sys,json; print(json.load(sys.stdin).get("rpId",""))' 2>/dev/null || true
 }
 
+# Buffered for the same reason as d1_query: a failed `secret list` (auth error)
+# piped into grep -q read as "no", i.e. a silent wrong answer.
 setup_token_present() {
-  wr secret list --profile "$PROFILE" | grep -q '"SETUP_TOKEN"' && echo yes || echo no
+  local out
+  if ! out="$(wr secret list --profile "$PROFILE")"; then
+    { echo "FATAL: wrangler secret list failed. Output:"; printf '%s\n' "$out"; } >&2
+    exit 1
+  fi
+  printf '%s\n' "$out" | grep -q '"SETUP_TOKEN"' && echo yes || echo no
 }
 
 # Positive control for "is the window actually open". registerOptions is
@@ -158,6 +204,9 @@ preflight() {
   printf '   config API_HOST    : %s\n' "$API_HOST"
   printf '   config D1          : %s\n' "$D1_NAME"
   printf '   wrangler profile   : %s\n' "$PROFILE"
+  if [ "${#IGNORED_CF_ENV[@]}" -gt 0 ]; then
+    printf '   ignored env        : %s (would override the profile; unset for this run)\n' "${IGNORED_CF_ENV[*]}"
+  fi
 
   local rp; rp="$(live_rpid)"
   printf '   deployed rpId      : %s\n' "${rp:-<unreachable>}"
