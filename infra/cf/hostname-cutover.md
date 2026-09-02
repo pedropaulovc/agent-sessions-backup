@@ -1083,8 +1083,19 @@ leaves a `status: "moved"` husk of the zone in `sessions-prod`, and
 no ordering constraint against the zone move.
 
 What DOES constrain the order is the grace fallback: the old cert is a machine's only working
-credential until its new PFX is imported. Revoking early locks that box out. As of 2026-09-02
-`vm-solidworks-windows` has NOT imported its new cert, so revoking now would strand it.
+credential until its new PFX is imported. Revoking early locks that box out.
+
+**DONE 2026-09-02 ~03:02Z — all three revoked.** `vm-solidworks-windows` imported its new cert and
+doctor confirmed `cert_slot='current'` on the hub first; then each id below was DELETEd on the husk
+via the logged-in dashboard session (Mechanism B), one at a time, after re-reading the cert by id
+and checking its fingerprint and `status: active`. All three returned `200 success:true
+status: pending_revocation`. Measured convergence: `amet-windows` read `revoked` within seconds,
+`amet-wsl` by ~40 s, `vm-solidworks-windows` by ~2 min. At the edge, a 6-request burst with the
+old `amet-wsl` cert against `api.sessions.pedrovc.com.br/api/v1/status` went `200×6` at t=0,
+`403/200` mixed at t=40–60 s, `403×6` from t=90 s on, while the new cert answered `200×6` at every
+step — the same eventual-consistency shape §0.1 measured, and the reason a single request is not
+a verification. D1 was NOT touched: the `prev_*` grace rows are inert behind the edge's
+`cert_revoked` check and expire on their own on Sep 8–9.
 
 `DELETE /zones/{zone_id}/client_certificates/{id}` is still the only revoke verb, and the token
 below needs SSL-and-Certificates Edit on the `vza.net` zone — which, since the husk stayed behind,
@@ -1102,9 +1113,8 @@ curl -sS "$CF_API/zones/$OLD_ZONE/client_certificates" \
 #      65913f0a-4b65-4047-9bb4-1e8e4f9f1590  amet-windows           fp 1152bdfb152001de…  ELIGIBLE
 #      049d21f6-95ee-49a7-8efc-f92929cabaf2  amet-wsl, CN "Cloudflare"  fp 811800780425b3fe…  ELIGIBLE
 #      2544a51d-fc9e-47f0-966e-2a789155ade0  vm-solidworks-windows  fp 53ba4e2bf19dd0dd…  DO NOT
-#    ELIGIBLE = that box is confirmed running on its new cert (D1 cert_slot='current'). As of
-#    2026-09-02 none of the three has actually been revoked yet; vm-solidworks-windows has a new
-#    cert staged in D1 but has NOT imported it, so its grace credential is still load-bearing.
+#    ELIGIBLE = that box is confirmed running on its new cert (D1 cert_slot='current').
+#    ALL THREE REVOKED 2026-09-02 ~03:02Z (see prose above) - kept as the record of what was run.
 CID=""   # paste exactly ONE id from the list above
 [ -n "$CID" ] || { echo "set CID to a single cert id first"; exit 1; }
 curl -sS -X DELETE "$CF_API/zones/$OLD_ZONE/client_certificates/$CID" \
