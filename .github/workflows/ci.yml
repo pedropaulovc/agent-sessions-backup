@@ -231,7 +231,8 @@ jobs:
   # shared concurrency group plus a current-main check prevents an older run approved later from
   # overwriting the Worker with stale code.
   # CLOUDFLARE_MIGRATION_TOKEN is D1 Edit only. CLOUDFLARE_DEPLOY_TOKEN has Workers Scripts,
-  # Queues, R2, and KV Edit plus Account Settings Read and Workers Routes Edit on vza.net.
+  # Queues, R2, and KV Edit plus Account Settings Read and Workers Routes Edit on pedrovc.com.br
+  # (re-scoped from vza.net on 2026-09-02 - see infra/cf/hostname-cutover.md §8.3).
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: hub
