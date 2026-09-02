@@ -190,12 +190,16 @@ setup_token_present() {
 # the real token is safe and proves the token was accepted, rather than assuming
 # the secret landed. The Origin header is mandatory: originOk (webauthn.ts:288)
 # rejects first with bad_origin and would mask a genuine 403 forbidden.
+# Prints "<http_code> <body>" on one line. The body matters: the hub answers 403 for three
+# different reasons - bad_origin, bad_host, forbidden (token mismatch) - and only the last one
+# is about the token.
 probe_registration() {
   local token="$1"
-  curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+  curl -s -w '\n%{http_code}' --max-time 20 \
     -X POST "$VIEWER/webauthn/register/options" \
     -H "Origin: $VIEWER" -H 'content-type: application/json' \
-    --data "$(python3 -c 'import json,sys; print(json.dumps({"setup": sys.argv[1]}))' "$token")"
+    --data "$(python3 -c 'import json,sys; print(json.dumps({"setup": sys.argv[1]}))' "$token")" \
+    | python3 -c 'import sys; t=sys.stdin.read().rstrip("\n").rsplit("\n",1); print(t[-1], (t[0] if len(t)==2 else "")[:120])'
 }
 
 preflight() {
@@ -276,10 +280,27 @@ open)
   [ "$(credential_count)" -eq 0 ] || { echo "FATAL: credentials still present" >&2; exit 1; }
 
   # Step 3: prove the window is genuinely open with the token we just minted.
-  code="$(probe_registration "$TOKEN")"
-  echo "== registration probe: HTTP $code"
+  #
+  # `wrangler secret put` creates a NEW Worker version (it shows up in `deployments list`) and
+  # until the edge serves it, a probe reaches the PREVIOUS version, whose SETUP_TOKEN is the old
+  # value, and gets 403 {"error":"forbidden"}. The first production run of this script
+  # (2026-09-02 03:22Z) got exactly that 403 ~10 s after the put and aborted with the credentials
+  # already deleted and a token nobody had seen. Cause NOT reproduced: three timed rotations right
+  # after measured the new token accepted at +0.3 s, +0.9 s, +2.8 s, and a re-run of `open`
+  # passed at +0 s. So this loop is insurance against a slow tail, not a documented delay - and
+  # the body is printed because the hub 403s for three different reasons (bad_origin, bad_host,
+  # forbidden) and the old probe threw the body away, so that first failure cannot even be
+  # classified after the fact.
+  start=$(date +%s); code=""; body=""
+  for attempt in $(seq 1 18); do
+    read -r code body <<<"$(probe_registration "$TOKEN")"
+    [ "$code" = "200" ] && break
+    echo "   probe $attempt: HTTP $code $body ($(( $(date +%s) - start ))s after the put) - waiting for the new Worker version"
+    sleep 5
+  done
+  echo "== registration probe: HTTP $code after $(( $(date +%s) - start ))s"
   if [ "$code" != "200" ]; then
-    echo "FATAL: expected 200 from register/options with the new token, got $code." >&2
+    echo "FATAL: expected 200 from register/options with the new token, got $code $body." >&2
     echo "The window did not open; do NOT proceed. Re-run 'status' to inspect." >&2
     exit 1
   fi
@@ -317,8 +338,8 @@ finish)
   # With count > 0 the token is already inert (authorizeRegistration demands a
   # session). Assert that before retiring it, so a surprising 200 here surfaces
   # as a failure rather than being masked by the delete that follows.
-  code="$(probe_registration "definitely-not-the-token")"
-  echo "== registration closed probe: HTTP $code (expect 403)"
+  read -r code body <<<"$(probe_registration "definitely-not-the-token")"
+  echo "== registration closed probe: HTTP $code $body (expect 403)"
   [ "$code" = "403" ] || { echo "FATAL: registration still answering $code with a bogus token" >&2; exit 1; }
 
   echo "== retiring SETUP_TOKEN"
