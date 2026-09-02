@@ -878,7 +878,10 @@ def _doctor_cert_store(thumbprint: str) -> bool:
         "elseif (-not $c.HasPrivateKey) { 'NOPRIVKEY' } "
         "else { [int]($c.NotAfter - (Get-Date)).TotalDays }"
     )
-    env = {**os.environ, "AC_TP": tp}
+    # desktop_powershell_env, not os.environ: inheriting pwsh 7's PSModulePath leaves 5.1 without
+    # its Certificate provider, so `Cert:` "does not exist" and a present cert reads as MISSING —
+    # the false negative that failed the first vm-solidworks-windows enrollment (2026-09-02).
+    env = {**config_mod.desktop_powershell_env(os.environ), "AC_TP": tp}
     try:
         proc = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
                               capture_output=True, text=True, env=env)

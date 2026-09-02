@@ -2,6 +2,7 @@ import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
 import { CC_SESSION_ID, ccAssistantLine, ccNoiseLines, ccUserLine } from './fixtures';
+import { API, VIEWER } from './hosts';
 import { PRICING_VERSION } from '../src/pricing-pass';
 
 const testEnv = env as unknown as Env;
@@ -13,7 +14,7 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
 
 async function putFile(machine: string, store: string, relpath: string, content: string): Promise<Response> {
   const body = new TextEncoder().encode(content);
-  return SELF.fetch(`https://api.sessions.vza.net/api/v1/files/${machine}/${store}/${encodeURIComponent(relpath)}`, {
+  return SELF.fetch(`${API}/api/v1/files/${machine}/${store}/${encodeURIComponent(relpath)}`, {
     method: 'PUT',
     headers: {
       'x-dev-machine': machine,
@@ -109,7 +110,7 @@ describe('ingest pipeline end-to-end', () => {
   });
 
   it('finds tool_result text through full-text search with snippets and facets', async () => {
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=gallium&facets=1', {
+    const res = await SELF.fetch(`${API}/api/v1/search?q=gallium&facets=1`, {
       headers: { 'x-dev-machine': 'testbox-wsl' },
     });
     expect(res.status).toBe(200);
@@ -141,7 +142,7 @@ describe('ingest pipeline end-to-end', () => {
     expect(after!.n).toBe(before!.n + 1);
 
     // FTS stayed in sync: the new text is findable, old text findable exactly once.
-    const res2 = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=noted', {
+    const res2 = await SELF.fetch(`${API}/api/v1/search?q=noted`, {
       headers: { 'x-dev-machine': 'testbox-wsl' },
     });
     const body2 = (await res2.json()) as { hits: unknown[] };
@@ -205,7 +206,7 @@ describe('ingest pipeline end-to-end', () => {
       .bind(CC_SESSION_ID)
       .first<{ n: number }>();
 
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/admin/reindex', {
+    const res = await SELF.fetch(`${API}/api/v1/admin/reindex`, {
       method: 'POST',
       headers: { 'x-dev-machine': 'testbox-wsl', 'content-type': 'application/json' },
       body: '{}',
@@ -236,7 +237,7 @@ describe('ingest pipeline end-to-end', () => {
   });
 
   it('serves the normalized session and raw passthrough', async () => {
-    const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${CC_SESSION_ID}`, {
+    const res = await SELF.fetch(`${API}/api/v1/sessions/${CC_SESSION_ID}`, {
       headers: { 'x-dev-machine': 'testbox-wsl' },
     });
     expect(res.status).toBe(200);
@@ -244,7 +245,7 @@ describe('ingest pipeline end-to-end', () => {
     expect(body.session.harness).toBe('claude-code');
     expect(body.session.turns.length).toBeGreaterThanOrEqual(4);
 
-    const raw = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${CC_SESSION_ID}/raw`, {
+    const raw = await SELF.fetch(`${API}/api/v1/sessions/${CC_SESSION_ID}/raw`, {
       headers: { 'x-dev-machine': 'testbox-wsl' },
     });
     expect(raw.status).toBe(200);
@@ -254,7 +255,7 @@ describe('ingest pipeline end-to-end', () => {
   it('rejects uploads with a wrong content hash', async () => {
     const body = new TextEncoder().encode('{"type":"user"}\n');
     const res = await SELF.fetch(
-      `https://api.sessions.vza.net/api/v1/files/testbox-wsl/claude-projects/${encodeURIComponent('x/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.jsonl')}`,
+      `${API}/api/v1/files/testbox-wsl/claude-projects/${encodeURIComponent('x/aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee.jsonl')}`,
       {
         method: 'PUT',
         headers: {
@@ -269,7 +270,7 @@ describe('ingest pipeline end-to-end', () => {
   });
 
   it('enforces machine identity on the upload path', async () => {
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/other-machine/claude-projects/x.jsonl', {
+    const res = await SELF.fetch(`${API}/api/v1/files/other-machine/claude-projects/x.jsonl`, {
       method: 'PUT',
       headers: { 'x-content-hash': `sha256:${'0'.repeat(64)}`, 'content-length': '1' },
       body: 'x',
@@ -710,7 +711,7 @@ describe('a canonical file reparsed to zero turns clears the stale index and rec
     expect(sessionAfterA?.first_interaction_title).toBe('unique-marker-alpha searchable content');
 
     // Confirm the original content is actually searchable before we blow it away.
-    const searchBefore = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-alpha', {
+    const searchBefore = await SELF.fetch(`${API}/api/v1/search?q=unique-marker-alpha`, {
       headers: { 'x-dev-machine': 'recover-a' },
     });
     const bodyBefore = (await searchBefore.json()) as { hits: Array<{ session_id: string }> };
@@ -753,14 +754,14 @@ describe('a canonical file reparsed to zero turns clears the stale index and rec
       .first<{ n: number }>();
     expect(blocksLeft?.n).toBe(0);
 
-    const searchAfterGarbage = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-alpha', {
+    const searchAfterGarbage = await SELF.fetch(`${API}/api/v1/search?q=unique-marker-alpha`, {
       headers: { 'x-dev-machine': 'recover-a' },
     });
     const bodyAfterGarbage = (await searchAfterGarbage.json()) as { hits: Array<{ session_id: string }> };
     expect(bodyAfterGarbage.hits.some((h) => h.session_id === SESSION_ID)).toBe(false);
 
     // Raw access still resolves — it just now serves the (garbage) current bytes.
-    const rawAfterGarbage = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${SESSION_ID}/raw`, {
+    const rawAfterGarbage = await SELF.fetch(`${API}/api/v1/sessions/${SESSION_ID}/raw`, {
       headers: { 'x-dev-machine': 'recover-a' },
     });
     expect(rawAfterGarbage.status).toBe(200);
@@ -1127,7 +1128,7 @@ describe('a recovery kick leaves the candidate pending, not terminal, so a dropp
     // self-healed.
     const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
     try {
-      const checkRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+      const checkRes = await SELF.fetch(`${API}/api/v1/files/check`, {
         method: 'POST',
         headers: { 'x-dev-machine': 'kick-b', 'content-type': 'application/json' },
         body: JSON.stringify({
@@ -1170,7 +1171,7 @@ describe('a fresh reservation is left to its cleanup owner; the heal paths do no
     return r!.parse_state;
   }
   async function checkFilesResync(hash: string): Promise<Response> {
-    return SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+    return SELF.fetch(`${API}/api/v1/files/check`, {
       method: 'POST',
       headers: { 'x-dev-machine': 'res14', 'content-type': 'application/json' },
       body: JSON.stringify({ files: [{ store: 'claude-projects', relpath: RELPATH, sha256: `sha256:${hash}` }] }),
@@ -1673,7 +1674,7 @@ describe('OMP ingest end-to-end', () => {
       tool_name: null,
       text: 'ompneedle tool output',
     });
-    const search = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=ompneedle', {
+    const search = await SELF.fetch(`${API}/api/v1/search?q=ompneedle`, {
       headers: { 'x-dev-machine': 'omp-box' },
     });
     expect(search.status).toBe(200);
@@ -1683,20 +1684,20 @@ describe('OMP ingest end-to-end', () => {
     const searchHit = searchBody.hits.find((hit) => hit.session_id === OMP_ID);
     expect(searchHit?.session.title).toBe('OMP slot title');
 
-    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=omp')).text();
+    const recent = await (await SELF.fetch(`${VIEWER}/?harness=omp`)).text();
     expect(recent).toContain(`<a href="/s/${OMP_ID}">OMP slot title</a>`);
 
-    const detail = await (await SELF.fetch(`https://sessions.vza.net/s/${OMP_ID}`)).text();
+    const detail = await (await SELF.fetch(`${VIEWER}/s/${OMP_ID}`)).text();
     expect(detail).toContain('<title>OMP slot title</title>');
     expect(detail).toContain('<h2 style="margin:0">OMP slot title</h2>');
   });
 
   it('renders OMP custom metadata ancestry in chronological and effective views', async () => {
-    const chronological = await (await SELF.fetch(`https://sessions.vza.net/s/${OMP_ID}?view=chronological`)).text();
+    const chronological = await (await SELF.fetch(`${VIEWER}/s/${OMP_ID}?view=chronological`)).text();
     expect(chronological).toContain('ompneedle user request');
     expect(chronological).not.toContain('class="turn user rewound"');
 
-    const effective = await (await SELF.fetch(`https://sessions.vza.net/s/${OMP_ID}?view=effective`)).text();
+    const effective = await (await SELF.fetch(`${VIEWER}/s/${OMP_ID}?view=effective`)).text();
     expect(effective).toContain('ompneedle user request');
     expect(effective).toContain('ompneedle tool output');
   });

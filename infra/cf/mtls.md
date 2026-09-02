@@ -1,10 +1,11 @@
-# API Shield mTLS for `api.sessions.vza.net` (spike S4)
+# API Shield mTLS for `api.sessions.pedrovc.com.br` (spike S4)
 
 The machine API is authenticated by TPM/software-bound mTLS client certificates
-signed by Cloudflare's per-zone **managed CA**. The edge verifies the client cert,
+signed by Cloudflare's **account-scoped managed CA** (addressed through a per-zone
+API, which is not the same thing — see Notes). The edge verifies the client cert,
 a zone WAF rule blocks anything unverified, and the Worker maps
 `request.cf.tlsClientAuth.certFingerprintSHA256` to a `machines` row (defense in
-depth). This file is the runbook for standing that up on the `vza.net` zone.
+depth). This file is the runbook for standing that up on the `pedrovc.com.br` zone.
 
 ## S4 findings (what M3 verified)
 
@@ -20,9 +21,10 @@ depth). This file is the runbook for standing that up on the `vza.net` zone.
   target-local API token; no API token is stored in the hub.
 - **DNS/routing did not need a zone token.** Both hostnames are Workers **Custom
   Domains** (`custom_domain: true` in `wrangler.jsonc`), which Cloudflare provisions
-  (proxied record + edge cert) through the Workers API. `api.sessions.vza.net` needed a
-  dedicated edge cert because Universal SSL's `*.vza.net` does not cover a 3-label host;
-  it provisioned automatically within a few minutes.
+  (proxied record + edge cert) through the Workers API. On the old `vza.net` zone,
+  `api.sessions.vza.net` needed a dedicated edge cert because Universal SSL's
+  `*.vza.net` did not cover a 3-label host; it provisioned automatically within a few
+  minutes.
 
 ## Mint the enrollment token (dashboard, ~1 min)
 
@@ -30,7 +32,7 @@ Cloudflare dashboard → My Profile → API Tokens → Create Token → Custom t
 
 | Permission | Scope |
 |---|---|
-| Zone · **SSL and Certificates** · Edit | Zone: `vza.net` — mint and revoke client certificates |
+| Zone · **SSL and Certificates** · Edit | Zone: `pedrovc.com.br` — mint and revoke client certificates |
 | Account · **D1** · Edit | Account: `Pedro@vezza.com.br` — register and verify the machine row |
 
 Set TTL to about one hour. `enroll-cert.py` uses this token directly with the
@@ -40,10 +42,10 @@ use a separate deployment token with **API Gateway · Edit** for that operation.
 
 ## Step 1 — enable the mTLS hostname association (one-time)
 
-Associate the managed CA with `api.sessions.vza.net` so the edge requests a client
+Associate the managed CA with `api.sessions.pedrovc.com.br` so the edge requests a client
 cert during the TLS handshake (without this, `cf.tlsClientAuth` is never populated).
 
-Dashboard path: **SSL/TLS → Client Certificates → Hosts** → add `api.sessions.vza.net`
+Dashboard path: **SSL/TLS → Client Certificates → Hosts** → add `api.sessions.pedrovc.com.br`
 (and toggle "mTLS" for that hostname). The dashboard only adds the host, so it is the
 safe option.
 
@@ -54,19 +56,19 @@ read the current list first and PUT the **union**:
 ```
 # 1. read existing associations
 GET /zones/{zone}/certificate_authorities/hostname_associations
-# 2. PUT the existing hostnames PLUS api.sessions.vza.net (union of the two)
+# 2. PUT the existing hostnames PLUS api.sessions.pedrovc.com.br (union of the two)
 PUT /zones/{zone}/certificate_authorities/hostname_associations
-  { "hostnames": ["<each existing host>", "api.sessions.vza.net"] }
+  { "hostnames": ["<each existing host>", "api.sessions.pedrovc.com.br"] }
 ```
 
-Do **not** associate `sessions.vza.net` — the viewer uses passkeys, never client certs.
+Do **not** associate `sessions.pedrovc.com.br` — the viewer uses passkeys, never client certs.
 
 ## Step 2 — add the WAF rule blocking unverified certs (one-time)
 
 Dashboard: **Security → WAF → Custom rules → Create rule**, scoped to the api host:
 
 ```
-Field:  (http.host eq "api.sessions.vza.net" and (not cf.tls_client_auth.cert_verified or cf.tls_client_auth.cert_revoked))
+Field:  (http.host eq "api.sessions.pedrovc.com.br" and (not cf.tls_client_auth.cert_verified or cf.tls_client_auth.cert_revoked))
 Action: Block
 ```
 
@@ -147,6 +149,25 @@ the pass fails, the key is retained and scheduling does not occur.
 - Per-zone client-certificate limit and ECDSA acceptance were the S4 unknowns: ECDSA
   P-256 CSRs are accepted by the managed CA (the `enroll-cert.py` default); the fleet is
   5 machines, far under any per-zone cap.
+- The managed CA is **account-scoped** even though the client-certificate API is addressed
+  per zone: the certs re-enrolled in the `pedrovc.com.br` zone during the 2026-09-01 zone
+  move also verify against the retired `api.sessions.vza.net` hostname (measured: `401`,
+  not `403`). Certificates minted before that move were issued in the `vza.net` zone.
+  Extended 2026-09-02, same 403-vs-401 discriminator, in the other direction: a cert minted
+  in the departed `vza.net` zone still verifies on `api.sessions.pedrovc.com.br` (`401`), and
+  **revocation propagates across zones** — after `DELETE` on the old zone the same cert flips
+  to `403`, converging within about a minute (a lagging PoP answered `401` once first). So
+  scoping is asymmetric and worth stating precisely:
+
+  | Surface | Scope |
+  |---|---|
+  | Managed CA identity, cert verification, revocation checking | **account** |
+  | Certificate inventory, mint/revoke endpoints, hostname associations, WAF rules | **zone** |
+
+  The zone column is only *addressing*. Reading it as capability is what produced the false
+  "certs leave with the zone, therefore they become unrevokeable" thesis corrected in
+  `hostname-cutover.md` §0.1/§0.4 — a zone move leaves a `status:"moved"` husk in the source
+  account that keeps serving both mint and revoke.
 
 ## M4 fleet-management endpoints
 
@@ -182,7 +203,7 @@ third-party workloads. Cloudflare's supported no-API-token mechanism is its user
 | Grant types | `authorization_code`, `refresh_token` |
 | Response type | `code` |
 | Token authentication | `none` |
-| Redirect URL | `https://sessions.vza.net/oauth/cloudflare/callback` |
+| Redirect URL | `https://sessions.pedrovc.com.br/oauth/cloudflare/callback` |
 | Permission | `ssl-and-certificates.write` |
 
 Put the public client ID in `CF_OAUTH_CLIENT_ID` under the production `vars` in `hub/wrangler.jsonc`
@@ -192,18 +213,18 @@ certificate; PKCE S256 removes the need for a client secret.
 From a current admin identity, start authorization:
 
 ```
-POST https://api.sessions.vza.net/api/v1/admin/cloudflare-oauth/start
+POST https://api.sessions.pedrovc.com.br/api/v1/admin/cloudflare-oauth/start
 ```
 
 Open the returned `authorization_url`, select the `18ef3246…` account, and approve. The five-minute
 state is random and one-use. The refresh credential remains inside the singleton SQLite Durable Object,
-which serializes refresh rotation and exposes only sign/get/revoke calls for the hardcoded `vza.net`
-zone; the main Worker cannot retrieve the bearer credential.
+which serializes refresh rotation and exposes only sign/get/revoke calls for the one configured
+(`CF_ZONE_ID`) `pedrovc.com.br` zone; the main Worker cannot retrieve the bearer credential.
 
 Before any certificate mutation, prove the grant against the exact managed-CA endpoint:
 
 ```
-GET https://api.sessions.vza.net/api/v1/admin/cloudflare-oauth/probe?cert_id=<known-active-cert-id>
+GET https://api.sessions.pedrovc.com.br/api/v1/admin/cloudflare-oauth/probe?cert_id=<known-active-cert-id>
 ```
 
 The response must be `200` and its fingerprint/status must match the known certificate. If Cloudflare

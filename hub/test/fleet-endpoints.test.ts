@@ -6,6 +6,7 @@ import { renewCert, certFingerprint, settleRetired, revokeClientCert, pollRetire
 import { adminMachines, heartbeat, listMachines } from '../src/api/ops';
 import { runDailyPrune } from '../src/cron/prune';
 import { route } from '../src/router';
+import { API } from './hosts';
 
 const testEnv = env as unknown as Env;
 const fakeBroker = {
@@ -41,7 +42,7 @@ const machine = (machineId: string, isAdmin = false, certFp?: string, certSlot: 
 });
 
 function reqJson(body: unknown): Request {
-  return new Request('https://api.sessions.vza.net/api/v1/x', {
+  return new Request(`${API}/api/v1/x`, {
     method: 'POST',
     body: JSON.stringify(body),
     headers: { 'content-type': 'application/json' },
@@ -49,7 +50,7 @@ function reqJson(body: unknown): Request {
 }
 
 function reqWithCert(fp: string): Request {
-  return new Request('https://api.sessions.vza.net/api/v1/status', {
+  return new Request(`${API}/api/v1/status`, {
     cf: { tlsClientAuth: { certVerified: 'SUCCESS', certFingerprintSHA256: fp } },
   } as unknown as RequestInit);
 }
@@ -1754,7 +1755,7 @@ describe('POST /api/v1/admin/machines', () => {
 
 describe('POST /api/v1/heartbeat collector-event relay', () => {
   function hbReq(events: unknown[]): Request {
-    return new Request('https://api.sessions.vza.net/api/v1/heartbeat', {
+    return new Request(`${API}/api/v1/heartbeat`, {
       method: 'POST',
       body: JSON.stringify({ collector_version: 'test', events }),
       headers: { 'content-type': 'application/json' },
@@ -2023,7 +2024,7 @@ describe('admin routes require the current cert slot', () => {
   const ctx = {} as ExecutionContext;
   // A request authenticated by a specific client-cert fingerprint (mTLS), routed through the real router.
   function apiReq(path: string, fp: string, body?: unknown): Request {
-    return new Request(`https://api.sessions.vza.net${path}`, {
+    return new Request(`${API}${path}`, {
       method: 'POST',
       cf: { tlsClientAuth: { certVerified: 'SUCCESS', certFingerprintSHA256: fp } },
       ...(body !== undefined ? { body: JSON.stringify(body), headers: { 'content-type': 'application/json' } } : {}),
@@ -2067,7 +2068,7 @@ describe('admin routes require the current cert slot', () => {
 describe('grace-slot certs lose cross-machine admin power (CLASS C)', () => {
   const ctx = {} as ExecutionContext;
   function fileReq(path: string, method: string, fp: string, body?: string): Request {
-    return new Request(`https://api.sessions.vza.net${path}`, {
+    return new Request(`${API}${path}`, {
       method,
       cf: { tlsClientAuth: { certVerified: 'SUCCESS', certFingerprintSHA256: fp } },
       ...(body !== undefined ? { body } : {}),

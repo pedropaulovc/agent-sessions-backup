@@ -5,6 +5,7 @@ import worker from '../src/index';
 import { flipOwnedSessionsToParsing } from '../src/api/upload';
 import { chatgptExportZip, chatgptWebConversation, claudeWebConversation, historyLines, unrecognizedExportZip } from './web-fixtures';
 import { ccUserLine } from './fixtures';
+import { API, VIEWER } from './hosts';
 
 const CLAUDE_ROOT = '00000000-0000-4000-8000-000000000000';
 
@@ -32,7 +33,7 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
 }
 
 async function put(machine: string, store: string, relpath: string, body: Uint8Array): Promise<Response> {
-  return SELF.fetch(`https://api.sessions.vza.net/api/v1/files/${machine}/${store}/${encodeURIComponent(relpath)}`, {
+  return SELF.fetch(`${API}/api/v1/files/${machine}/${store}/${encodeURIComponent(relpath)}`, {
     method: 'PUT',
     headers: {
       'x-dev-machine': machine,
@@ -138,19 +139,19 @@ describe('chatgpt-web ingest end-to-end', () => {
     expect(row!.primary_model).toBe('gpt-test-4o');
     expect(row!.index_state).toBe('ready');
 
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=fluorescence&facets=1', { headers: { 'x-dev-machine': 'webbox' } });
+    const res = await SELF.fetch(`${API}/api/v1/search?q=fluorescence&facets=1`, { headers: { 'x-dev-machine': 'webbox' } });
     const body = (await res.json()) as { hits: Array<{ session_id: string }>; facets: Record<string, Record<string, number>> };
     expect(body.hits.some((h) => h.session_id === CONV_ID)).toBe(true);
     expect(body.facets['harness']!['chatgpt-web']).toBeGreaterThanOrEqual(1);
   });
 
   it('serves the normalized session and renders the viewer page', async () => {
-    const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${CONV_ID}`, { headers: { 'x-dev-machine': 'webbox' } });
+    const res = await SELF.fetch(`${API}/api/v1/sessions/${CONV_ID}`, { headers: { 'x-dev-machine': 'webbox' } });
     const body = (await res.json()) as { session: { turns: unknown[]; harness: string } };
     expect(body.session.harness).toBe('chatgpt-web');
     expect(body.session.turns.length).toBe(2);
 
-    const page = await SELF.fetch(`https://sessions.vza.net/s/${CONV_ID}`, { headers: { 'x-dev-machine': 'webbox' } });
+    const page = await SELF.fetch(`${VIEWER}/s/${CONV_ID}`, { headers: { 'x-dev-machine': 'webbox' } });
     expect(page.status).toBe(200);
     expect(await page.text()).toContain('fluorescence');
   });
@@ -169,7 +170,7 @@ describe('prompt-log ingest is machine-scoped (two machines, two sessions)', () 
     expect(ids).toContain('promptlog:boxA:claude');
     expect(ids).toContain('promptlog:boxB:claude');
 
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=gamma', { headers: { 'x-dev-machine': 'boxA' } });
+    const res = await SELF.fetch(`${API}/api/v1/search?q=gamma`, { headers: { 'x-dev-machine': 'boxA' } });
     expect(((await res.json()) as { hits: unknown[] }).hits.length).toBe(1);
   });
 
@@ -232,7 +233,7 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
       expect(row?.harness).toBe('chatgpt-web');
       expect(row?.index_state).toBe('ready');
     }
-    const search = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=archived', { headers: { 'x-dev-machine': 'webbox' } });
+    const search = await SELF.fetch(`${API}/api/v1/search?q=archived`, { headers: { 'x-dev-machine': 'webbox' } });
     expect(((await search.json()) as { hits: unknown[] }).hits.length).toBe(2);
   });
 
@@ -286,7 +287,7 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM blocks WHERE session_id = 'stale-b'").first<{ n: number }>()).toMatchObject({ n: 0 });
     expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'stale-a'").first<{ n: number }>()).toMatchObject({ n: 1 });
 
-    const search = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=stale-marker', { headers: { 'x-dev-machine': 'webbox' } });
+    const search = await SELF.fetch(`${API}/api/v1/search?q=stale-marker`, { headers: { 'x-dev-machine': 'webbox' } });
     const ids = ((await search.json()) as { hits: Array<{ session_id: string }> }).hits.map((h) => h.session_id);
     expect(ids).toContain('stale-a');
     expect(ids).not.toContain('stale-b');
@@ -449,7 +450,7 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
       return (realGet as (k: string, o?: unknown) => unknown)(key, opts);
     };
     try {
-      const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions?format=ndjson&machine=cachebox', {
+      const res = await SELF.fetch(`${API}/api/v1/sessions?format=ndjson&machine=cachebox`, {
         headers: { 'x-dev-machine': 'cachebox' },
       });
       const body = await res.text();
@@ -469,7 +470,7 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     expect((await put('webbox', 'export-inbox', 'raw.zip', zip)).status).toBe(201);
     await drainQueue();
 
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions/raw-a/raw', { headers: { 'x-dev-machine': 'webbox' } });
+    const res = await SELF.fetch(`${API}/api/v1/sessions/raw-a/raw`, { headers: { 'x-dev-machine': 'webbox' } });
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toContain('application/json');
     const text = await res.text();
@@ -572,7 +573,7 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
 
     // A Range on a web-capture (single-JSON) session must be IGNORED — otherwise the client gets an
     // invalid JSON fragment mislabeled application/x-ndjson.
-    const web = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions/rawweb-1/raw', {
+    const web = await SELF.fetch(`${API}/api/v1/sessions/rawweb-1/raw`, {
       headers: { 'x-dev-machine': 'webbox', range: 'bytes=0-9' },
     });
     expect(web.status).toBe(200); // NOT 206
@@ -586,7 +587,7 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     const jsonl = `${ccUserLine({ uuid: 'rr1', text: 'jsonl range control content here' })}\n`;
     expect((await putText('webbox', 'claude-projects', `-home-tester-src-rawrange/${sid}.jsonl`, jsonl)).status).toBe(201);
     await drainQueue();
-    const jl = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${sid}/raw`, {
+    const jl = await SELF.fetch(`${API}/api/v1/sessions/${sid}/raw`, {
       headers: { 'x-dev-machine': 'webbox', range: 'bytes=0-9' },
     });
     expect(jl.status).toBe(206);
@@ -689,7 +690,7 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
 
     // Reindex ONLY this archive's R2 prefix. det.sessionId is undefined for an archive, so the flip
     // must come from the export-archive branch — its owned session goes 'parsing' before the drain.
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/admin/reindex', {
+    const res = await SELF.fetch(`${API}/api/v1/admin/reindex`, {
       method: 'POST',
       headers: { 'x-dev-machine': 'webbox', 'content-type': 'application/json' },
       body: JSON.stringify({ prefix: 'raw/webbox/export-inbox/reidx-arch.zip' }),
@@ -807,14 +808,14 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     await put('webbox', 'export-inbox', 'viewpage.zip', zip);
     await drainQueue();
 
-    const page = await SELF.fetch('https://sessions.vza.net/s/view-target', { headers: { 'x-dev-machine': 'webbox' } });
+    const page = await SELF.fetch(`${VIEWER}/s/view-target`, { headers: { 'x-dev-machine': 'webbox' } });
     expect(page.status).toBe(200);
     const html = await page.text();
     expect(html).toContain('TARGETONLYMARKER');
     expect(html).not.toContain('SIBLINGMARKER'); // the sibling conversation is never surfaced
 
     // The normalized API for the archive-backed session returns exactly the target's single turn.
-    const api = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions/view-target', { headers: { 'x-dev-machine': 'webbox' } });
+    const api = await SELF.fetch(`${API}/api/v1/sessions/view-target`, { headers: { 'x-dev-machine': 'webbox' } });
     const body = (await api.json()) as { session: { turns: unknown[] } };
     expect(body.session.turns.length).toBe(1);
   });
@@ -893,7 +894,7 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
 
     expect(await testEnv.DB.prepare("SELECT index_state FROM sessions WHERE session_id = 'r13-absent'").first<{ index_state: string }>()).toMatchObject({ index_state: 'error' });
     // Row retained (not deleted), but the API honestly reports the canonical can't produce it.
-    const api = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions/r13-absent', { headers: { 'x-dev-machine': 'r13box' } });
+    const api = await SELF.fetch(`${API}/api/v1/sessions/r13-absent`, { headers: { 'x-dev-machine': 'r13box' } });
     expect(api.status).toBe(200);
     expect(((await api.json()) as { session: unknown }).session).toBeNull();
     // The good conversation, present in v2, stays healthy.
@@ -940,7 +941,7 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     );
     await put('webbox', 'export-inbox', 'apix.zip', zip);
     await drainQueue();
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions/apix-target', { headers: { 'x-dev-machine': 'webbox' } });
+    const res = await SELF.fetch(`${API}/api/v1/sessions/apix-target`, { headers: { 'x-dev-machine': 'webbox' } });
     expect(res.status).toBe(200);
     const body = (await res.json()) as { meta: { session_id: string }; session: { turns: unknown[] } };
     expect(body.meta.session_id).toBe('apix-target');
@@ -957,16 +958,16 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     const id = 'promptlog:decbox:claude';
 
     // Encoded form (what a correct client sends via encodeURIComponent) resolves to the session.
-    const enc = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${encodeURIComponent(id)}`, { headers: { 'x-dev-machine': 'decbox' } });
+    const enc = await SELF.fetch(`${API}/api/v1/sessions/${encodeURIComponent(id)}`, { headers: { 'x-dev-machine': 'decbox' } });
     expect(enc.status).toBe(200);
     expect(((await enc.json()) as { meta: { session_id: string } }).meta.session_id).toBe(id);
 
     // The raw unencoded ':' form still works (':' is a valid path character).
-    const raw = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${id}`, { headers: { 'x-dev-machine': 'decbox' } });
+    const raw = await SELF.fetch(`${API}/api/v1/sessions/${id}`, { headers: { 'x-dev-machine': 'decbox' } });
     expect(raw.status).toBe(200);
 
     // A malformed %-sequence is a 400, not an uncaught 500.
-    const bad = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions/promptlog%ZZ', { headers: { 'x-dev-machine': 'decbox' } });
+    const bad = await SELF.fetch(`${API}/api/v1/sessions/promptlog%ZZ`, { headers: { 'x-dev-machine': 'decbox' } });
     expect(bad.status).toBe(400);
   });
 });
@@ -1030,7 +1031,7 @@ describe('prompt-log file rows upgrade a legacy NULL session_id on re-upload (ro
     // now restamp + re-enqueue exactly like the PUT same-hash branch (shared restampIfStale helper).
     const sha256 = await sha256Hex(new TextEncoder().encode(content));
     const checkReq = () =>
-      SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+      SELF.fetch(`${API}/api/v1/files/check`, {
         method: 'POST',
         headers: { 'x-dev-machine': 'legacy3box', 'content-type': 'application/json' },
         body: JSON.stringify({ files: [{ store: 'claude', relpath: 'history.jsonl', sha256: `sha256:${sha256}` }] }),

@@ -97,7 +97,7 @@ def test_enroll_thumbprint_writes_windows_mtls_config(tmp_path):
     path = tmp_path / "config.toml"
     # Pass the thumbprint space-separated and lowercase (as certmgr shows it); enroll normalizes.
     separated = " ".join(TP[i:i + 2] for i in range(0, len(TP), 2)).lower()
-    cfg = config.enroll("https://api.sessions.vza.net/", dev=False, path=path,
+    cfg = config.enroll("https://api.sessions.pedrovc.com.br/", dev=False, path=path,
                         machine_id="amet-windows", client_cert_thumbprint=separated)
     assert cfg.auth == "mtls"
     assert cfg.client_cert_thumbprint == TP  # enroll normalizes
@@ -118,6 +118,30 @@ def test_pfx_import_ps_uses_securestring_when_present():
     ps = config._pfx_import_ps(has_password=True)
     assert "-Password $sec" in ps
     assert "ConvertTo-SecureString -String $env:AC_PFX_PW" in ps
+
+
+def test_powershell_env_drops_psmodulepath(tmp_path):
+    # pwsh exports a PS7-first PSModulePath; inheriting it makes Windows PowerShell 5.1 resolve PS7's
+    # .NET-Core Microsoft.PowerShell.Security manifest, fail to load it, and lose
+    # ConvertTo-SecureString entirely (CouldNotAutoloadMatchingModule). 5.1 rebuilds the default when
+    # the variable is absent, so the child must NOT inherit it.
+    pfx = tmp_path / "m.pfx"
+    pfx.write_bytes(b"")
+    base = {"PSModulePath": r"C:\Program Files\PowerShell\7\Modules", "KEEP": "1"}
+    env = config._powershell_env(base, str(pfx), "pw")
+    assert not [k for k in env if k.upper() == "PSMODULEPATH"]
+    assert env["KEEP"] == "1"  # everything else still rides through
+    assert env["AC_PFX_PW"] == "pw"
+    assert env["AC_PFX_PATH"] == str(pfx.resolve())
+
+
+def test_powershell_env_drops_psmodulepath_case_insensitively(tmp_path):
+    # os.environ upper-cases keys on Windows, the only platform this code path runs on, so an exact
+    # "PSModulePath" lookup would miss precisely where it matters.
+    pfx = tmp_path / "m.pfx"
+    pfx.write_bytes(b"")
+    env = config._powershell_env({"PSMODULEPATH": r"C:\ps7"}, str(pfx), "")
+    assert not [k for k in env if k.upper() == "PSMODULEPATH"]
 
 
 def _write_config(path, extra=""):
@@ -168,7 +192,7 @@ def test_enroll_mtls_roundtrip(tmp_path):
     cert = tmp_path / "box.client.pem"
     key = tmp_path / "box.client.key"
     cfg = config.enroll(
-        "https://api.sessions.vza.net",
+        "https://api.sessions.pedrovc.com.br",
         dev=False,
         path=path,
         machine_id="m1",
@@ -484,3 +508,10 @@ def test_security_excludes_cannot_be_removed_by_user_config(tmp_path):
     assert "*auth.json*" in effective
     assert "**/cred-profiles/**" in effective
     assert "**/cache/**" in effective
+
+
+def test_desktop_powershell_env_is_the_shared_scrub():
+    # Both powershell.exe call sites (PFX import, doctor cert probe) must share one scrub so no site
+    # can inherit PS7's PSModulePath by accident. Case-insensitive, everything else untouched.
+    env = config.desktop_powershell_env({"PSMODULEPATH": r"C:\ps7", "PSModulePath": r"C:\ps7b", "PATH": "x"})
+    assert env == {"PATH": "x"}

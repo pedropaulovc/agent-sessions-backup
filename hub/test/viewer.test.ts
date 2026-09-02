@@ -8,6 +8,7 @@ import { buildSessionFilterSql } from '../src/session-filters';
 import { viewerRoute } from '../src/viewer/router';
 import { assetEndpoint, signExternalAssetUrl } from '../src/viewer/assets';
 import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures';
+import { API, VIEWER } from './hosts';
 import { blobVersionOf } from '../src/viewer/session';
 import { turnFallbackKeyOf, turnKeyOf } from '../src/turn-key';
 
@@ -203,7 +204,7 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
 
 async function putFile(store: string, relpath: string, content: string): Promise<Response> {
   const body = new TextEncoder().encode(content);
-  return SELF.fetch(`https://api.sessions.vza.net/api/v1/files/testbox-wsl/${store}/${encodeURIComponent(relpath)}`, {
+  return SELF.fetch(`${API}/api/v1/files/testbox-wsl/${store}/${encodeURIComponent(relpath)}`, {
     method: 'PUT',
     headers: {
       'x-dev-machine': 'testbox-wsl',
@@ -639,7 +640,7 @@ describe('viewer', () => {
   });
 
   it('search page returns 200 with a highlighted snippet and a link to the session', async () => {
-    const res = await SELF.fetch('https://sessions.vza.net/?q=xenondioxide');
+    const res = await SELF.fetch(`${VIEWER}/?q=xenondioxide`);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('<mark>');
@@ -648,7 +649,7 @@ describe('viewer', () => {
   });
 
   it('empty query lists recent sessions', async () => {
-    const res = await SELF.fetch('https://sessions.vza.net/?harness=claude-code');
+    const res = await SELF.fetch(`${VIEWER}/?harness=claude-code`);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('Recent sessions');
@@ -656,7 +657,7 @@ describe('viewer', () => {
   });
 
   it('titles recent sessions from the first user/agent text, excluding system instructions, hooks, and tools', async () => {
-    const html = await (await SELF.fetch('https://sessions.vza.net/?harness=claude-code')).text();
+    const html = await (await SELF.fetch(`${VIEWER}/?harness=claude-code`)).text();
     expect(html).toContain(`<a href="/s/${TITLE_SESSION}">First real title interaction</a>`);
     expect(html).not.toContain('Generated title must not be used');
     expect(html).not.toContain('System prompt must not become the title');
@@ -669,18 +670,18 @@ describe('viewer', () => {
     expect(html).not.toContain('Injected stdout');
     expect(html).toContain(`<a href="/s/${TEAMMATE_TITLE_SESSION}">Fix &amp; verify &quot;quoted&quot; 🚀</a>`);
 
-    const sorted = await (await SELF.fetch('https://sessions.vza.net/?harness=claude-code&sort=total_tokens')).text();
+    const sorted = await (await SELF.fetch(`${VIEWER}/?harness=claude-code&sort=total_tokens`)).text();
     expect(sorted).toContain(`<a href="/s/${TITLE_SESSION}">First real title interaction</a>`);
   });
 
   it('titles query results from the first user/agent text, not the matching turn or stored title', async () => {
-    const html = await (await SELF.fetch('https://sessions.vza.net/?q=titlequerysentinel')).text();
+    const html = await (await SELF.fetch(`${VIEWER}/?q=titlequerysentinel`)).text();
     expect(html).toContain(`<a href="/s/${TITLE_SESSION}?page=1#t10">First real title interaction</a>`);
     expect(html).not.toContain('Generated title must not be used');
   });
 
   it('uses the decoded team-lead teammate summary as the title', async () => {
-    const html = await (await SELF.fetch('https://sessions.vza.net/?q=teammatetitlequerysentinel')).text();
+    const html = await (await SELF.fetch(`${VIEWER}/?q=teammatetitlequerysentinel`)).text();
     expect(html).toContain(
       `<a href="/s/${TEAMMATE_TITLE_SESSION}?page=1#t3">Fix &amp; verify &quot;quoted&quot; 🚀</a>`,
     );
@@ -688,21 +689,21 @@ describe('viewer', () => {
   });
 
   it('uses the decoded scheduled-task name instead of its Windows path or body', async () => {
-    const html = await (await SELF.fetch('https://sessions.vza.net/?q=scheduledtitlequerysentinel')).text();
+    const html = await (await SELF.fetch(`${VIEWER}/?q=scheduledtitlequerysentinel`)).text();
     expect(html).toContain(
       `<a href="/s/${SCHEDULED_TITLE_SESSION}?page=1#t1">update-daily-notes</a>`,
     );
     expect(html).not.toContain('C:\\Users\\pedro');
     expect(html).not.toContain('Scheduled body must not become the title');
 
-    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=scheduled-title-test')).text();
+    const recent = await (await SELF.fetch(`${VIEWER}/?harness=scheduled-title-test`)).text();
     expect(recent).toContain(`<a href="/s/${SCHEDULED_TITLE_SESSION}">update-daily-notes</a>`);
     expect(recent).not.toContain('C:\\Users\\pedro');
     expect(recent).not.toContain('Scheduled body must not become the title');
   });
 
   it('decodes named and numeric entities in a scheduled-task name', async () => {
-    const html = await (await SELF.fetch('https://sessions.vza.net/?q=encodedscheduledtitlequerysentinel')).text();
+    const html = await (await SELF.fetch(`${VIEWER}/?q=encodedscheduledtitlequerysentinel`)).text();
     expect(html).toContain(
       `<a href="/s/${ENCODED_SCHEDULED_TITLE_SESSION}?page=1#t1">update&amp;daily-notes</a>`,
     );
@@ -710,16 +711,16 @@ describe('viewer', () => {
 
   it('normalizes nested, teammate, JSON-assignment, command, and task wrappers', async () => {
     for (const titleCase of WRAPPER_TITLE_CASES) {
-      const searchHtml = await (await SELF.fetch(`https://sessions.vza.net/?q=${titleCase.query}`)).text();
+      const searchHtml = await (await SELF.fetch(`${VIEWER}/?q=${titleCase.query}`)).text();
       expect(searchHtml).toContain(
         `<a href="/s/${titleCase.id}?page=1#t1">${titleCase.expectedHtml}</a>`,
       );
-      const detailHtml = await (await SELF.fetch(`https://sessions.vza.net/s/${titleCase.id}`)).text();
+      const detailHtml = await (await SELF.fetch(`${VIEWER}/s/${titleCase.id}`)).text();
       expect(detailHtml).toContain(`<title>${titleCase.expectedHtml}</title>`);
       expect(detailHtml).toContain(`<h2 style="margin:0">${titleCase.expectedHtml}</h2>`);
     }
 
-    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=wrapper-title-test')).text();
+    const recent = await (await SELF.fetch(`${VIEWER}/?harness=wrapper-title-test`)).text();
     for (const titleCase of WRAPPER_TITLE_CASES) {
       expect(recent).toContain(`<a href="/s/${titleCase.id}">${titleCase.expectedHtml}</a>`);
     }
@@ -728,18 +729,18 @@ describe('viewer', () => {
   });
 
   it('skips newly recognized injected wrapper turns', async () => {
-    const query = await (await SELF.fetch('https://sessions.vza.net/?q=injectedwrapperstitlequerysentinel')).text();
+    const query = await (await SELF.fetch(`${VIEWER}/?q=injectedwrapperstitlequerysentinel`)).text();
     expect(query).toContain(
       `<a href="/s/${INJECTED_WRAPPERS_TITLE_SESSION}?page=1#t5">First interaction after injected wrappers</a>`,
     );
 
-    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=injected-title-test')).text();
+    const recent = await (await SELF.fetch(`${VIEWER}/?harness=injected-title-test`)).text();
     expect(recent).toContain(
       `<a href="/s/${INJECTED_WRAPPERS_TITLE_SESSION}">First interaction after injected wrappers</a>`,
     );
   });
   it('collapses title-skipped turns by default without nesting controls in the disclosure summary', async () => {
-    const html = await (await SELF.fetch(`https://sessions.vza.net/s/${TITLE_SESSION}`)).text();
+    const html = await (await SELF.fetch(`${VIEWER}/s/${TITLE_SESSION}`)).text();
     const skipped = html.match(
       /<div id="t\d+" class="turn user collapsed"><details class="turn-content"><summary class="turnhead">[\s\S]*?<\/summary><div class="body">[\s\S]*?Injected agent instructions[\s\S]*?<\/div><\/details>/,
     );
@@ -750,7 +751,7 @@ describe('viewer', () => {
   });
 
   it('rejects the entire turn when its first text block has an injected prefix', async () => {
-    const html = await (await SELF.fetch('https://sessions.vza.net/?q=sameturntitlesentinel')).text();
+    const html = await (await SELF.fetch(`${VIEWER}/?q=sameturntitlesentinel`)).text();
     expect(html).toContain(
       `<a href="/s/${PREFIXED_TURN_TITLE_SESSION}?page=1#t2">First later turn title</a>`,
     );
@@ -766,7 +767,7 @@ describe('viewer', () => {
         await testEnv.DB.prepare(
           'UPDATE sessions SET first_interaction_title = ?2 WHERE session_id = ?1',
         ).bind(PREFIXED_TURN_TITLE_SESSION, persisted).run();
-        const html = await (await SELF.fetch(`https://sessions.vza.net/s/${PREFIXED_TURN_TITLE_SESSION}`)).text();
+        const html = await (await SELF.fetch(`${VIEWER}/s/${PREFIXED_TURN_TITLE_SESSION}`)).text();
         expect(html).toContain('<title>First later turn title</title>');
         expect(html).toContain('<h2 style="margin:0">First later turn title</h2>');
       }
@@ -778,7 +779,7 @@ describe('viewer', () => {
   });
 
   it('skips preserved server tool metadata without suppressing real text later in the same turn', async () => {
-    const html = await (await SELF.fetch('https://sessions.vza.net/?q=servertooltitlequerysentinel')).text();
+    const html = await (await SELF.fetch(`${VIEWER}/?q=servertooltitlequerysentinel`)).text();
     expect(html).toContain(
       `<a href="/s/${SERVER_TOOL_TITLE_SESSION}?page=1#t2">Real text after server tool metadata</a>`,
     );
@@ -786,7 +787,7 @@ describe('viewer', () => {
   });
 
   it('strips every consecutive leading image wrapper before a prompt', async () => {
-    const html = await (await SELF.fetch('https://sessions.vza.net/?q=forwardimagetitlequerysentinel')).text();
+    const html = await (await SELF.fetch(`${VIEWER}/?q=forwardimagetitlequerysentinel`)).text();
     expect(html).toContain(
       `<a href="/s/${IMAGE_FORWARD_TITLE_SESSION}?page=1#t1">Please inspect the cone gear shaft drawing</a>`,
     );
@@ -794,7 +795,7 @@ describe('viewer', () => {
   });
 
   it('strips a leading fork-boilerplate wrapper and titles from the prompt after it', async () => {
-    const html = await (await SELF.fetch('https://sessions.vza.net/?q=forkboilerplatetitlequerysentinel')).text();
+    const html = await (await SELF.fetch(`${VIEWER}/?q=forkboilerplatetitlequerysentinel`)).text();
     expect(html).toContain(
       `<a href="/s/${FORK_BOILERPLATE_TITLE_SESSION}?page=1#t1">Investigate the flaky cone gear test</a>`,
     );
@@ -802,7 +803,7 @@ describe('viewer', () => {
   });
 
   it('ignores multiple image-only wrappers and uses later text in the same turn', async () => {
-    const html = await (await SELF.fetch('https://sessions.vza.net/?q=windowsimagetitlequerysentinel')).text();
+    const html = await (await SELF.fetch(`${VIEWER}/?q=windowsimagetitlequerysentinel`)).text();
     expect(html).toContain(
       `<a href="/s/${IMAGE_WINDOWS_TITLE_SESSION}?page=1#t1">Windows image prompt after wrapper-only block</a>`,
     );
@@ -822,7 +823,7 @@ describe('viewer', () => {
   });
 
   it('ignores abandoned title blocks and chooses the first main-path interaction', async () => {
-    const html = await (await SELF.fetch('https://sessions.vza.net/?q=mainpathtitlequerysentinel')).text();
+    const html = await (await SELF.fetch(`${VIEWER}/?q=mainpathtitlequerysentinel`)).text();
     expect(html).toContain(
       `<a href="/s/${OFF_MAIN_TITLE_SESSION}?page=1#t2">Main path interaction title</a>`,
     );
@@ -830,42 +831,42 @@ describe('viewer', () => {
   });
 
   it('falls back to the stored title when a session has only image and tool blocks', async () => {
-    const query = await (await SELF.fetch('https://sessions.vza.net/?q=fallbacktitlequerysentinel')).text();
+    const query = await (await SELF.fetch(`${VIEWER}/?q=fallbacktitlequerysentinel`)).text();
     expect(query).toContain(
       `<a href="/s/${STORED_FALLBACK_TITLE_SESSION}?page=1#t1">Stored fallback title</a>`,
     );
 
-    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=title-fallback-test')).text();
+    const recent = await (await SELF.fetch(`${VIEWER}/?harness=title-fallback-test`)).text();
     expect(recent).toContain(
       `<a href="/s/${STORED_FALLBACK_TITLE_SESSION}">Stored fallback title</a>`,
     );
 
     const sorted = await (await SELF.fetch(
-      'https://sessions.vza.net/?harness=title-fallback-test&sort=total_tokens',
+      `${VIEWER}/?harness=title-fallback-test&sort=total_tokens`,
     )).text();
     expect(sorted).toContain(
       `<a href="/s/${STORED_FALLBACK_TITLE_SESSION}">Stored fallback title</a>`,
     );
 
     const detail = await (await SELF.fetch(
-      `https://sessions.vza.net/s/${STORED_FALLBACK_TITLE_SESSION}`,
+      `${VIEWER}/s/${STORED_FALLBACK_TITLE_SESSION}`,
     )).text();
     expect(detail).toContain('<title>Stored fallback title</title>');
     expect(detail).toContain('<h2 style="margin:0">Stored fallback title</h2>');
   });
 
   it('uses the session id on search and detail pages when no interaction or stored title exists', async () => {
-    const recent = await (await SELF.fetch('https://sessions.vza.net/?harness=claude-code')).text();
+    const recent = await (await SELF.fetch(`${VIEWER}/?harness=claude-code`)).text();
     expect(recent).toContain(`<a href="/s/${BLOB_SESSION}">${BLOB_SESSION}</a>`);
 
-    const detail = await (await SELF.fetch(`https://sessions.vza.net/s/${BLOB_SESSION}`)).text();
+    const detail = await (await SELF.fetch(`${VIEWER}/s/${BLOB_SESSION}`)).text();
     expect(detail).toContain(`<title>${BLOB_SESSION}</title>`);
     expect(detail).toContain(`<h2 style="margin:0">${BLOB_SESSION}</h2>`);
   });
 
   it('marks a selected repo facet active with a toggle-off link that drops the repo param', async () => {
     const res = await SELF.fetch(
-      `https://sessions.vza.net/?q=facetsentinelword&repo=${encodeURIComponent(REPO_URL)}`,
+      `${VIEWER}/?q=facetsentinelword&repo=${encodeURIComponent(REPO_URL)}`,
     );
     expect(res.status).toBe(200);
     const html = await res.text();
@@ -879,7 +880,7 @@ describe('viewer', () => {
   });
 
   it('session page renders turns with role classes', async () => {
-    const res = await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`);
+    const res = await SELF.fetch(`${VIEWER}/s/${SEARCH_SESSION}`);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('<title>where is the xenondioxide note?</title>');
@@ -899,7 +900,7 @@ describe('viewer', () => {
     expect(html).toMatch(new RegExp(`/s/${SEARCH_SESSION}/blob/\\d+`));
   });
   it('renders external assets through short-lived same-origin R2 links', async () => {
-    const res = await SELF.fetch(`https://sessions.vza.net/s/${EXTERNAL_ASSET_SESSION}`);
+    const res = await SELF.fetch(`${VIEWER}/s/${EXTERNAL_ASSET_SESSION}`);
     expect(res.status).toBe(200);
     const html = await res.text();
     const match = html.match(/<img class="media" loading="lazy" src="([^"]+)" alt="image">/);
@@ -907,7 +908,7 @@ describe('viewer', () => {
     expect(match![1]).toContain(`/asset/${EXTERNAL_ASSET_DIGEST}/001_img01.jpeg?`);
     expect(html).not.toContain('harmonic-analyzer');
 
-    const assetUrl = new URL(match![1]!.replaceAll('&amp;', '&'), 'https://sessions.vza.net');
+    const assetUrl = new URL(match![1]!.replaceAll('&amp;', '&'), VIEWER);
     const now = Math.floor(Date.now() / 1000);
     const exp = Number(assetUrl.searchParams.get('exp'));
     expect(exp).toBeGreaterThan(now);
@@ -927,7 +928,7 @@ describe('viewer', () => {
       DB: { prepare: () => { throw new Error('candidate query must not run'); } },
     } as unknown as Env;
     const exp = Math.floor(Date.now() / 1000) + 60;
-    const url = new URL(`https://sessions.vza.net/s/${EXTERNAL_ASSET_SESSION}/asset/${EXTERNAL_ASSET_DIGEST}/001_img01.jpeg?exp=${exp}&sig=${'A'.repeat(43)}`);
+    const url = new URL(`${VIEWER}/s/${EXTERNAL_ASSET_SESSION}/asset/${EXTERNAL_ASSET_DIGEST}/001_img01.jpeg?exp=${exp}&sig=${'A'.repeat(43)}`);
     const response = await assetEndpoint(EXTERNAL_ASSET_SESSION, EXTERNAL_ASSET_DIGEST, '001_img01.jpeg', url, noQueryEnv);
     expect(response.status).toBe(403);
   });
@@ -947,7 +948,7 @@ describe('viewer', () => {
   });
 
   it('keeps single-file sessions on the R2 object details page', async () => {
-    const html = await (await SELF.fetch(`https://sessions.vza.net/s/${CODEX_TAIL_SESSION}`)).text();
+    const html = await (await SELF.fetch(`${VIEWER}/s/${CODEX_TAIL_SESSION}`)).text();
     const r2Key = `raw/testbox-wsl/codex-sessions/2026/07/02/rollout-2026-07-02T09-00-00-${CODEX_TAIL_SESSION}.jsonl`;
     const prefix = 'raw/testbox-wsl/codex-sessions/2026/07/02/';
     expect(html).toContain(
@@ -956,8 +957,8 @@ describe('viewer', () => {
   });
 
   it('stars and unstars a turn with a same-origin POST', async () => {
-    const endpoint = `https://sessions.vza.net/s/${SEARCH_SESSION}/turns/0`;
-    const initial = await (await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`)).text();
+    const endpoint = `${VIEWER}/s/${SEARCH_SESSION}/turns/0`;
+    const initial = await (await SELF.fetch(`${VIEWER}/s/${SEARCH_SESSION}`)).text();
     expect(initial).toContain(`action="/s/${SEARCH_SESSION}/turns/0/star?view=chronological"`);
     expect(initial).toContain('<input type="hidden" name="turn_key" value="id:u1">');
     expect(initial).toContain('<input type="hidden" name="transcript_revision"');
@@ -976,7 +977,7 @@ describe('viewer', () => {
     const indexing = await SELF.fetch(`${endpoint}/star`, {
       method: 'POST',
       headers: {
-        origin: 'https://sessions.vza.net',
+        origin: VIEWER,
         'content-type': 'application/x-www-form-urlencoded',
       },
       body: new URLSearchParams({ turn_key: 'id:u1', transcript_revision: revision }),
@@ -990,7 +991,7 @@ describe('viewer', () => {
     const starred = await SELF.fetch(`${endpoint}/star?view=chronological`, {
       method: 'POST',
       headers: {
-        origin: 'https://sessions.vza.net',
+        origin: VIEWER,
         'content-type': 'application/x-www-form-urlencoded',
       },
       body: new URLSearchParams({ turn_key: 'id:u1', transcript_revision: revision }),
@@ -999,7 +1000,7 @@ describe('viewer', () => {
     expect(starred.status).toBe(303);
     expect(starred.headers.get('location')).toBe(`/s/${SEARCH_SESSION}?page=1&view=chronological#t0`);
 
-    const starredHtml = await (await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`)).text();
+    const starredHtml = await (await SELF.fetch(`${VIEWER}/s/${SEARCH_SESSION}`)).text();
     expect(starredHtml).toContain('<article id="t0" class="turn user starred">');
     expect(starredHtml).toContain(`action="/s/${SEARCH_SESSION}/turns/0/unstar?view=chronological"`);
     expect(starredHtml).toContain('aria-label="Unstar turn" aria-pressed="true"');
@@ -1007,7 +1008,7 @@ describe('viewer', () => {
     const unstarred = await SELF.fetch(`${endpoint}/unstar?view=effective`, {
       method: 'POST',
       headers: {
-        origin: 'https://sessions.vza.net',
+        origin: VIEWER,
         'content-type': 'application/x-www-form-urlencoded',
       },
       body: new URLSearchParams({ turn_key: 'id:u1', transcript_revision: revision }),
@@ -1019,7 +1020,7 @@ describe('viewer', () => {
     const repeatedUnstar = await SELF.fetch(`${endpoint}/unstar?view=effective`, {
       method: 'POST',
       headers: {
-        origin: 'https://sessions.vza.net',
+        origin: VIEWER,
         'content-type': 'application/x-www-form-urlencoded',
       },
       body: new URLSearchParams({ turn_key: 'id:u1', transcript_revision: revision }),
@@ -1027,18 +1028,18 @@ describe('viewer', () => {
     });
     expect(repeatedUnstar.status).toBe(303);
 
-    const unstarredHtml = await (await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`)).text();
+    const unstarredHtml = await (await SELF.fetch(`${VIEWER}/s/${SEARCH_SESSION}`)).text();
     expect(unstarredHtml).toContain('<article id="t0" class="turn user">');
     expect(unstarredHtml).not.toContain('<article id="t0" class="turn user starred">');
   });
 
   it('keeps a star attached across turn insertion and session replacement', async () => {
-    const endpoint = `https://sessions.vza.net/s/${STAR_STABLE_SESSION}/turns/1/star`;
+    const endpoint = `${VIEWER}/s/${STAR_STABLE_SESSION}/turns/1/star`;
     const revision = await transcriptRevision(STAR_STABLE_SESSION);
     const starred = await SELF.fetch(endpoint, {
       method: 'POST',
       headers: {
-        origin: 'https://sessions.vza.net',
+        origin: VIEWER,
         'content-type': 'application/x-www-form-urlencoded',
       },
       body: new URLSearchParams({ turn_key: 'id:stable-target', transcript_revision: revision }),
@@ -1046,7 +1047,7 @@ describe('viewer', () => {
     });
     expect(starred.status).toBe(303);
 
-    const before = await (await SELF.fetch(`https://sessions.vza.net/s/${STAR_STABLE_SESSION}`)).text();
+    const before = await (await SELF.fetch(`${VIEWER}/s/${STAR_STABLE_SESSION}`)).text();
     expect(before).toMatch(/<article id="t1" class="turn assistant starred">[\s\S]*?stable starred target/);
 
     const updatedContent = [
@@ -1057,16 +1058,16 @@ describe('viewer', () => {
     expect((await putFile('claude-projects', STAR_STABLE_RELPATH, updatedContent)).status).toBe(201);
     await drainQueue();
 
-    const reordered = await (await SELF.fetch(`https://sessions.vza.net/s/${STAR_STABLE_SESSION}`)).text();
+    const reordered = await (await SELF.fetch(`${VIEWER}/s/${STAR_STABLE_SESSION}`)).text();
     expect(reordered).toMatch(/<article id="t2" class="turn assistant starred">[\s\S]*?stable starred target/);
     expect(reordered).not.toMatch(/<article id="t1" class="turn user starred">/);
 
     const stale = await SELF.fetch(
-      `https://sessions.vza.net/s/${STAR_STABLE_SESSION}/turns/2/unstar`,
+      `${VIEWER}/s/${STAR_STABLE_SESSION}/turns/2/unstar`,
       {
         method: 'POST',
         headers: {
-          origin: 'https://sessions.vza.net',
+          origin: VIEWER,
           'content-type': 'application/x-www-form-urlencoded',
         },
         body: new URLSearchParams({ turn_key: 'id:stable-target', transcript_revision: revision }),
@@ -1090,32 +1091,32 @@ describe('viewer', () => {
       .bind(starStableFileId)
       .first<{ parse_state: string; parse_error: string | null }>();
     expect(recoveredFile).toEqual({ parse_state: 'parsed', parse_error: null });
-    const recovered = await (await SELF.fetch(`https://sessions.vza.net/s/${STAR_STABLE_SESSION}`)).text();
+    const recovered = await (await SELF.fetch(`${VIEWER}/s/${STAR_STABLE_SESSION}`)).text();
     expect(recovered).toMatch(/<article id="t2" class="turn assistant starred">[\s\S]*?stable starred target/);
 
-    const recent = await (await SELF.fetch('https://sessions.vza.net/?has_star=1')).text();
+    const recent = await (await SELF.fetch(`${VIEWER}/?has_star=1`)).text();
     expect(recent).toContain('<h3>Has star</h3>');
     expect(recent).toContain('✓ Yes');
     expect(recent).toContain(`/s/${STAR_STABLE_SESSION}`);
     expect(recent).not.toContain(`/s/${SEARCH_SESSION}`);
 
     const sorted = await (
-      await SELF.fetch('https://sessions.vza.net/?sort=total_tokens&has_star=1')
+      await SELF.fetch(`${VIEWER}/?sort=total_tokens&has_star=1`)
     ).text();
     expect(sorted).toContain(`/s/${STAR_STABLE_SESSION}`);
 
     const searched = await (
-      await SELF.fetch('https://sessions.vza.net/?q=stable+starred+target&has_star=1')
+      await SELF.fetch(`${VIEWER}/?q=stable+starred+target&has_star=1`)
     ).text();
     expect(searched).toContain(`/s/${STAR_STABLE_SESSION}`);
 
     const recoveredRevision = await transcriptRevision(STAR_STABLE_SESSION);
     const unstarred = await SELF.fetch(
-      `https://sessions.vza.net/s/${STAR_STABLE_SESSION}/turns/2/unstar`,
+      `${VIEWER}/s/${STAR_STABLE_SESSION}/turns/2/unstar`,
       {
         method: 'POST',
         headers: {
-          origin: 'https://sessions.vza.net',
+          origin: VIEWER,
           'content-type': 'application/x-www-form-urlencoded',
         },
         body: new URLSearchParams({
@@ -1127,15 +1128,15 @@ describe('viewer', () => {
     );
     expect(unstarred.status).toBe(303);
 
-    const empty = await (await SELF.fetch('https://sessions.vza.net/?has_star=1')).text();
+    const empty = await (await SELF.fetch(`${VIEWER}/?has_star=1`)).text();
     expect(empty).not.toContain(`/s/${STAR_STABLE_SESSION}`);
 
     const starredAgain = await SELF.fetch(
-      `https://sessions.vza.net/s/${STAR_STABLE_SESSION}/turns/2/star`,
+      `${VIEWER}/s/${STAR_STABLE_SESSION}/turns/2/star`,
       {
         method: 'POST',
         headers: {
-          origin: 'https://sessions.vza.net',
+          origin: VIEWER,
           'content-type': 'application/x-www-form-urlencoded',
         },
         body: new URLSearchParams({
@@ -1175,16 +1176,16 @@ describe('viewer', () => {
       .bind(STAR_STABLE_SESSION)
       .first<{ n: number }>();
     expect(reconciled?.n).toBe(0);
-    const prunedFacet = await (await SELF.fetch('https://sessions.vza.net/?has_star=1')).text();
+    const prunedFacet = await (await SELF.fetch(`${VIEWER}/?has_star=1`)).text();
     expect(prunedFacet).not.toContain(`/s/${STAR_STABLE_SESSION}`);
 
     const cleanRevision = await transcriptRevision(STAR_STABLE_SESSION);
     const remainingStar = await SELF.fetch(
-      `https://sessions.vza.net/s/${STAR_STABLE_SESSION}/turns/1/star`,
+      `${VIEWER}/s/${STAR_STABLE_SESSION}/turns/1/star`,
       {
         method: 'POST',
         headers: {
-          origin: 'https://sessions.vza.net',
+          origin: VIEWER,
           'content-type': 'application/x-www-form-urlencoded',
         },
         body: new URLSearchParams({
@@ -1207,7 +1208,7 @@ describe('viewer', () => {
   });
 
   it('joins linked tool calls and results, with their leading JSON fields in the summary', async () => {
-    const html = await (await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`)).text();
+    const html = await (await SELF.fetch(`${VIEWER}/s/${SEARCH_SESSION}`)).text();
 
     expect(html).toContain('<details class="block tool-pair"><summary>🔧 Grep · pattern: xenondioxide → path: notes.md</summary>');
     expect(html).toContain('<span class="muted small">call</span>');
@@ -1217,33 +1218,33 @@ describe('viewer', () => {
   });
 
   it('dims off-main-path (rewound) turns in the chronological view', async () => {
-    const res = await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}?view=chronological`);
+    const res = await SELF.fetch(`${VIEWER}/s/${SEARCH_SESSION}?view=chronological`);
     const html = await res.text();
     expect(html).toContain('rewound');
     expect(html).toContain('abandoned assistant reply');
   });
 
   it('hides off-main-path turns in the effective view', async () => {
-    const res = await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}?view=effective`);
+    const res = await SELF.fetch(`${VIEWER}/s/${SEARCH_SESSION}?view=effective`);
     const html = await res.text();
     expect(html).not.toContain('abandoned assistant reply');
     expect(html).toContain('found the reference');
   });
 
   it('paginates a 450-turn session into 3 pages via byte offsets', async () => {
-    const p1 = await (await SELF.fetch(`https://sessions.vza.net/s/${BIG_SESSION}`)).text();
+    const p1 = await (await SELF.fetch(`${VIEWER}/s/${BIG_SESSION}`)).text();
     expect(p1).toContain('page 1 / 3');
     expect(p1).toContain('turn number 0 content');
     expect(p1).toContain('turn number 199 content');
     expect(p1).not.toContain('turn number 200 content');
 
-    const p2 = await (await SELF.fetch(`https://sessions.vza.net/s/${BIG_SESSION}?page=2`)).text();
+    const p2 = await (await SELF.fetch(`${VIEWER}/s/${BIG_SESSION}?page=2`)).text();
     expect(p2).toContain('page 2 / 3');
     expect(p2).toContain('turn number 200 content');
     expect(p2).toContain('turn number 399 content');
     expect(p2).not.toContain('turn number 400 content');
 
-    const p3 = await (await SELF.fetch(`https://sessions.vza.net/s/${BIG_SESSION}?page=3`)).text();
+    const p3 = await (await SELF.fetch(`${VIEWER}/s/${BIG_SESSION}?page=3`)).text();
     expect(p3).toContain('page 3 / 3');
     expect(p3).toContain('turn number 449 content');
   });
@@ -1266,34 +1267,34 @@ describe('viewer', () => {
     ).resolves.toBeTruthy();
 
     // Page count includes the marker's page…
-    const p1 = await (await SELF.fetch(`https://sessions.vza.net/s/${CODEX_TAIL_SESSION}`)).text();
+    const p1 = await (await SELF.fetch(`${VIEWER}/s/${CODEX_TAIL_SESSION}`)).text();
     expect(p1).toContain('page 1 / 2');
     expect(p1).not.toContain('context compacted');
 
     // …and the divider renders on the final page (it would be dropped without the persisted row).
-    const p2 = await (await SELF.fetch(`https://sessions.vza.net/s/${CODEX_TAIL_SESSION}?page=2`)).text();
+    const p2 = await (await SELF.fetch(`${VIEWER}/s/${CODEX_TAIL_SESSION}?page=2`)).text();
     expect(p2).toContain('page 2 / 2');
     expect(p2).toContain('context compacted');
   });
 
   it('deep-links a search hit past page 1 to the right page with a turn anchor', async () => {
-    const res = await SELF.fetch('https://sessions.vza.net/?q=zzuniquesentinel');
+    const res = await SELF.fetch(`${VIEWER}/?q=zzuniquesentinel`);
     expect(res.status).toBe(200);
     const html = await res.text();
     // turn_index 250 → page floor(250/200)+1 = 2, anchored at #t250.
     expect(html).toContain(`/s/${LONG_SESSION}?page=2#t250`);
 
     // The anchor target actually exists in the rendered page (default chronological view).
-    const p2 = await (await SELF.fetch(`https://sessions.vza.net/s/${LONG_SESSION}?page=2`)).text();
+    const p2 = await (await SELF.fetch(`${VIEWER}/s/${LONG_SESSION}?page=2`)).text();
     expect(p2).toContain('id="t250"');
     expect(p2).toContain('zzuniquesentinel');
     // And it is NOT on page 1.
-    const p1 = await (await SELF.fetch(`https://sessions.vza.net/s/${LONG_SESSION}`)).text();
+    const p1 = await (await SELF.fetch(`${VIEWER}/s/${LONG_SESSION}`)).text();
     expect(p1).not.toContain('id="t250"');
   });
 
   it('dims a cross-page rewind correctly on page 1 using the persisted main-path flag', async () => {
-    const p1 = await (await SELF.fetch(`https://sessions.vza.net/s/${REWIND_SESSION}`)).text();
+    const p1 = await (await SELF.fetch(`${VIEWER}/s/${REWIND_SESSION}`)).text();
     expect(p1).toContain('page 1 / 2');
     // Turn 100 sits deep in the abandoned branch — a page-1-only parse would call it main-path.
     expect(p1).toContain('abandonedmarker');
@@ -1303,7 +1304,7 @@ describe('viewer', () => {
   });
 
   it('hides the cross-page rewind branch in the effective view', async () => {
-    const p1 = await (await SELF.fetch(`https://sessions.vza.net/s/${REWIND_SESSION}?view=effective`)).text();
+    const p1 = await (await SELF.fetch(`${VIEWER}/s/${REWIND_SESSION}?view=effective`)).text();
     expect(p1).not.toContain('abandonedmarker');
     expect(p1).not.toContain('id="t100"');
     expect(p1).toContain('shared start prompt'); // main-path prefix still shown
@@ -1345,14 +1346,14 @@ describe('viewer', () => {
     ).bind(OFFSET_MATCH_SESSION, rows[0]!.byte_start + 2).run();
 
     const chronological = await (
-      await SELF.fetch(`https://sessions.vza.net/s/${OFFSET_MATCH_SESSION}?view=chronological`)
+      await SELF.fetch(`${VIEWER}/s/${OFFSET_MATCH_SESSION}?view=chronological`)
     ).text();
     expect(chronological).not.toContain('id="t1"');
     expect(chronological).toMatch(/<article id="t2" class="turn assistant rewound">[\s\S]*?offset second turn/);
     expect(chronological).toMatch(/<article id="t3" class="turn user">[\s\S]*?offset third turn/);
 
     const effective = await (
-      await SELF.fetch(`https://sessions.vza.net/s/${OFFSET_MATCH_SESSION}?view=effective`)
+      await SELF.fetch(`${VIEWER}/s/${OFFSET_MATCH_SESSION}?view=effective`)
     ).text();
     expect(effective).not.toContain('offset second turn');
     expect(effective).not.toContain('id="t2"');
@@ -1383,12 +1384,12 @@ describe('viewer', () => {
     expect(mainAfter?.m).toBe(1); // shared prefix still main-path
 
     // Still dimmed after reindex.
-    const p1 = await (await SELF.fetch(`https://sessions.vza.net/s/${REWIND_SESSION}`)).text();
+    const p1 = await (await SELF.fetch(`${VIEWER}/s/${REWIND_SESSION}`)).text();
     expect(p1).toMatch(/<article id="t100" class="turn user rewound"/);
   });
 
   it('versions blob URLs by the canonical file content hash', async () => {
-    const html = await (await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}`)).text();
+    const html = await (await SELF.fetch(`${VIEWER}/s/${SEARCH_SESSION}`)).text();
     const hash = await testEnv.DB.prepare(
       'SELECT f.content_hash AS h FROM sessions s JOIN files f ON f.id = s.canonical_file_id WHERE s.session_id = ?1',
     )
@@ -1409,29 +1410,29 @@ describe('viewer', () => {
     const v = hash!.h.slice(0, 12);
 
     // Stale version → 302 pointing at the current version.
-    const stale = await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}/blob/${block!.id}?v=deadbeefdead`, {
+    const stale = await SELF.fetch(`${VIEWER}/s/${SEARCH_SESSION}/blob/${block!.id}?v=deadbeefdead`, {
       redirect: 'manual',
     });
     expect(stale.status).toBe(302);
     expect(stale.headers.get('location')).toContain(`?v=${v}`);
 
     // Versionless → also redirected (so stale cached HTML still resolves).
-    const bare = await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}/blob/${block!.id}`, { redirect: 'manual' });
+    const bare = await SELF.fetch(`${VIEWER}/s/${SEARCH_SESSION}/blob/${block!.id}`, { redirect: 'manual' });
     expect(bare.status).toBe(302);
 
     // Matched version → 200 with the immutable cache header.
-    const ok = await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}/blob/${block!.id}?v=${v}`);
+    const ok = await SELF.fetch(`${VIEWER}/s/${SEARCH_SESSION}/blob/${block!.id}?v=${v}`);
     expect(ok.status).toBe(200);
     expect(ok.headers.get('cache-control')).toContain('immutable');
   });
 
   it('collapses system turns by default while keeping them visible in both views', async () => {
-    const chrono = await (await SELF.fetch(`https://sessions.vza.net/s/${SYSTEM_SESSION}?view=chronological`)).text();
+    const chrono = await (await SELF.fetch(`${VIEWER}/s/${SYSTEM_SESSION}?view=chronological`)).text();
     expect(chrono).toContain('SYSTEMREMINDER');
     expect(chrono).toMatch(/<div[^>]*class="turn system collapsed"><details class="turn-content">/);
     expect(chrono).not.toMatch(/class="turn system collapsed rewound"/);
 
-    const effective = await (await SELF.fetch(`https://sessions.vza.net/s/${SYSTEM_SESSION}?view=effective`)).text();
+    const effective = await (await SELF.fetch(`${VIEWER}/s/${SYSTEM_SESSION}?view=effective`)).text();
     expect(effective).toContain('SYSTEMREMINDER'); // not hidden
     expect(effective).toMatch(/<div[^>]*class="turn system collapsed"><details class="turn-content">/);
   });
@@ -1517,14 +1518,14 @@ describe('viewer', () => {
       .run();
 
     // The renderer must not mint a ?v= token for it.
-    const html = await (await SELF.fetch(`https://sessions.vza.net/s/${UNVER_SESSION}`)).text();
+    const html = await (await SELF.fetch(`${VIEWER}/s/${UNVER_SESSION}`)).text();
     const m = html.match(new RegExp(`/s/${UNVER_SESSION}/blob/(\\d+)("|\\?)`));
     expect(m).toBeTruthy();
     expect(html).not.toContain('?v=unknown');
     expect(html).not.toMatch(new RegExp(`/s/${UNVER_SESSION}/blob/\\d+\\?v=`));
 
     // Versionless fetch: served directly (no redirect) but revalidatable, never immutable.
-    const res = await SELF.fetch(`https://sessions.vza.net/s/${UNVER_SESSION}/blob/${m![1]}`, { redirect: 'manual' });
+    const res = await SELF.fetch(`${VIEWER}/s/${UNVER_SESSION}/blob/${m![1]}`, { redirect: 'manual' });
     expect(res.status).toBe(200);
     expect(res.headers.get('cache-control')).toBe('no-cache');
     expect(res.headers.get('cache-control')).not.toContain('immutable');
@@ -1535,7 +1536,7 @@ describe('viewer', () => {
       .bind(SEARCH_SESSION)
       .first<{ id: number }>();
     expect(block).toBeTruthy();
-    const res = await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}/blob/${block!.id}`);
+    const res = await SELF.fetch(`${VIEWER}/s/${SEARCH_SESSION}/blob/${block!.id}`);
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toBe('image/png');
     expect(res.headers.get('cache-control')).toContain('immutable');
@@ -1552,7 +1553,7 @@ describe('viewer', () => {
       .first<{ id: number; block_index: number }>();
     expect(block?.block_index).toBe(1);
 
-    const res = await SELF.fetch(`https://sessions.vza.net/s/${NESTED_BLOB_SESSION}/blob/${block!.id}`);
+    const res = await SELF.fetch(`${VIEWER}/s/${NESTED_BLOB_SESSION}/blob/${block!.id}`);
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toBe('image/png');
     const got = new Uint8Array(await res.arrayBuffer());
@@ -1572,7 +1573,7 @@ describe('viewer', () => {
       .first<{ id: number }>();
 
     // PNG: inline, but with nosniff + a scriptless sandbox CSP.
-    const png = await SELF.fetch(`https://sessions.vza.net/s/${BLOB_SESSION}/blob/${pngId}`);
+    const png = await SELF.fetch(`${VIEWER}/s/${BLOB_SESSION}/blob/${pngId}`);
     expect(png.status).toBe(200);
     expect(png.headers.get('content-type')).toBe('image/png');
     expect(png.headers.get('x-content-type-options')).toBe('nosniff');
@@ -1580,14 +1581,14 @@ describe('viewer', () => {
     expect(png.headers.get('content-disposition')).toBeNull();
 
     // SVG masquerading as an image: never inline — forced to an octet-stream attachment.
-    const svg = await SELF.fetch(`https://sessions.vza.net/s/${BLOB_SESSION}/blob/${svgId}`);
+    const svg = await SELF.fetch(`${VIEWER}/s/${BLOB_SESSION}/blob/${svgId}`);
     expect(svg.status).toBe(200);
     expect(svg.headers.get('content-type')).toBe('application/octet-stream');
     expect(svg.headers.get('x-content-type-options')).toBe('nosniff');
     expect(svg.headers.get('content-disposition')).toContain('attachment');
 
     // Document (text/html here): attachment, octet-stream.
-    const d = await SELF.fetch(`https://sessions.vza.net/s/${BLOB_SESSION}/blob/${doc!.id}`);
+    const d = await SELF.fetch(`${VIEWER}/s/${BLOB_SESSION}/blob/${doc!.id}`);
     expect(d.status).toBe(200);
     expect(d.headers.get('content-type')).toBe('application/octet-stream');
     expect(d.headers.get('content-disposition')).toContain('attachment');
@@ -1595,7 +1596,7 @@ describe('viewer', () => {
   });
 
   it('blob endpoint 404s for an unknown block', async () => {
-    const res = await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}/blob/99999999`);
+    const res = await SELF.fetch(`${VIEWER}/s/${SEARCH_SESSION}/blob/99999999`);
     expect(res.status).toBe(404);
   });
 
@@ -1615,7 +1616,7 @@ describe('viewer', () => {
       .bind(UNKNOWN_MEDIA_SESSION)
       .first<{ h: string }>();
     const res = await SELF.fetch(
-      `https://sessions.vza.net/s/${UNKNOWN_MEDIA_SESSION}/blob/${img!.id}?v=${hash!.h.slice(0, 12)}`,
+      `${VIEWER}/s/${UNKNOWN_MEDIA_SESSION}/blob/${img!.id}?v=${hash!.h.slice(0, 12)}`,
     );
     expect(res.status).toBe(200);
     expect(res.headers.get('content-type')).toBe('image/png');
@@ -1625,7 +1626,7 @@ describe('viewer', () => {
   });
 
   it('machines page lists the dev machine and corpus totals', async () => {
-    const res = await SELF.fetch('https://sessions.vza.net/machines');
+    const res = await SELF.fetch(`${VIEWER}/machines`);
     expect(res.status).toBe(200);
     const html = await res.text();
     expect(html).toContain('testbox-wsl');
@@ -1633,19 +1634,19 @@ describe('viewer', () => {
   });
 
   it('redirects to /login in production when unauthenticated', async () => {
-    const url = new URL('https://sessions.vza.net/');
+    const url = new URL(`${VIEWER}/`);
     const res = await viewerRoute(new Request(url.toString()), url, { ENVIRONMENT: 'production' } as Env);
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toBe('/login');
   });
 
   it('does not expose the obsolete viewer raw-download route', async () => {
-    const res = await SELF.fetch(`https://sessions.vza.net/s/${SEARCH_SESSION}/download`);
+    const res = await SELF.fetch(`${VIEWER}/s/${SEARCH_SESSION}/download`);
     expect(res.status).toBe(404);
   });
 
   it('returns a terminal no-store 401 in preview when unauthenticated', async () => {
-    const url = new URL('https://sessions.vza.net/');
+    const url = new URL(`${VIEWER}/`);
     const previewEnv = { ...testEnv, ENVIRONMENT: 'preview' } as unknown as Env;
     const res = await viewerRoute(new Request(url.toString()), url, previewEnv);
     expect(res.status).toBe(401);
@@ -1655,7 +1656,7 @@ describe('viewer', () => {
   });
 
   it('preview rejects legacy bearer and cookie credentials', async () => {
-    const url = new URL('https://sessions.vza.net/');
+    const url = new URL(`${VIEWER}/`);
     const previewEnv = { ...testEnv, ENVIRONMENT: 'preview' } as unknown as Env;
     for (const headers of [
       new Headers({ authorization: 'Bearer legacy-secret' }),
@@ -1670,14 +1671,14 @@ describe('viewer', () => {
   });
 
   it('leaves the development viewer open (never publicly reachable)', async () => {
-    const url = new URL('https://sessions.vza.net/');
+    const url = new URL(`${VIEWER}/`);
     const devEnv = { ...testEnv, ENVIRONMENT: 'development' } as unknown as Env;
     const res = await viewerRoute(new Request(url.toString()), url, devEnv);
     expect(res.status).toBe(200);
   });
 
   it('fails closed on an unrecognized or missing ENVIRONMENT (any non-development value is gated)', async () => {
-    const url = new URL('https://sessions.vza.net/');
+    const url = new URL(`${VIEWER}/`);
     // A non-allowlisted ENVIRONMENT follows the production path: no session → redirect to /login.
     const bogus = { ...testEnv, ENVIRONMENT: 'staging' } as unknown as Env;
     const bogusRes = await viewerRoute(new Request(url.toString()), url, bogus);
@@ -1831,7 +1832,7 @@ describe('viewer result pagination and facet layout', () => {
 
   it('renders clickable facets and sort without redundant facet dropdowns', async () => {
     const res = await SELF.fetch(
-      `https://sessions.vza.net/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&machine=${PAGINATION_MACHINE}`,
+      `${VIEWER}/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&machine=${PAGINATION_MACHINE}`,
     );
     expect(res.status).toBe(200);
     const html = await res.text();
@@ -1859,33 +1860,33 @@ describe('viewer result pagination and facet layout', () => {
 
   it('defaults to primary sessions while exposing selectable subagent results and badges', async () => {
     const defaultRecent = await (await SELF.fetch(
-      `https://sessions.vza.net/?harness=${SUBAGENT_HARNESS}`,
+      `${VIEWER}/?harness=${SUBAGENT_HARNESS}`,
     )).text();
     expect(defaultRecent).toContain(`/s/${SUBAGENT_PRIMARY}`);
     expect(defaultRecent).not.toContain(`/s/${SUBAGENT_CHILD}`);
 
     const subagentRecent = await (await SELF.fetch(
-      `https://sessions.vza.net/?harness=${SUBAGENT_HARNESS}&subagent=yes`,
+      `${VIEWER}/?harness=${SUBAGENT_HARNESS}&subagent=yes`,
     )).text();
     expect(subagentRecent).toContain(`/s/${SUBAGENT_CHILD}`);
     expect(subagentRecent).not.toContain(`/s/${SUBAGENT_PRIMARY}`);
     expect(subagentRecent).toContain('<span class="badge">Subagent session</span>');
 
     const defaultSearch = await (await SELF.fetch(
-      `https://sessions.vza.net/?q=${SUBAGENT_MARKER}&harness=${SUBAGENT_HARNESS}`,
+      `${VIEWER}/?q=${SUBAGENT_MARKER}&harness=${SUBAGENT_HARNESS}`,
     )).text();
     expect(defaultSearch).toContain(`/s/${SUBAGENT_PRIMARY}`);
     expect(defaultSearch).not.toContain(`/s/${SUBAGENT_CHILD}`);
     expect(defaultSearch).toContain('>Is subagent session</h3>');
     expect(defaultSearch).toContain('>✓ No</a>');
-    const yes = new URL(facetHref(defaultSearch, 'Yes'), 'https://sessions.vza.net');
+    const yes = new URL(facetHref(defaultSearch, 'Yes'), VIEWER);
     expect(yes.searchParams.getAll('subagent')).toEqual(['yes']);
     expect(yes.searchParams.has('cursor')).toBe(false);
-    const no = new URL(facetHref(defaultSearch, 'No', true), 'https://sessions.vza.net');
+    const no = new URL(facetHref(defaultSearch, 'No', true), VIEWER);
     expect(no.searchParams.has('subagent')).toBe(false);
 
     const subagentSearch = await (await SELF.fetch(
-      `https://sessions.vza.net/?q=${SUBAGENT_MARKER}&harness=${SUBAGENT_HARNESS}&subagent=yes`,
+      `${VIEWER}/?q=${SUBAGENT_MARKER}&harness=${SUBAGENT_HARNESS}&subagent=yes`,
     )).text();
     expect(subagentSearch).toContain(`/s/${SUBAGENT_CHILD}`);
     expect(subagentSearch).not.toContain(`/s/${SUBAGENT_PRIMARY}`);
@@ -1897,13 +1898,13 @@ describe('viewer result pagination and facet layout', () => {
 
   it('ORs repeated values within a facet and ANDs different facets in recent and FTS results', async () => {
     const filters = `harness=${MULTI_HARNESS_A}&harness=${MULTI_HARNESS_B}&machine=${MULTI_MACHINE_1}`;
-    const recent = await (await SELF.fetch(`https://sessions.vza.net/?${filters}`)).text();
+    const recent = await (await SELF.fetch(`${VIEWER}/?${filters}`)).text();
     expect(recent).toContain('Multi A1');
     expect(recent).toContain('Multi B1');
     expect(recent).not.toContain('Multi C1');
     expect(recent).not.toContain('Multi A2');
 
-    const search = await (await SELF.fetch(`https://sessions.vza.net/?q=${MULTI_MARKER}&${filters}`)).text();
+    const search = await (await SELF.fetch(`${VIEWER}/?q=${MULTI_MARKER}&${filters}`)).text();
     expect(search).toContain('Multi A1');
     expect(search).toContain('Multi B1');
     expect(search).not.toContain('Multi C1');
@@ -1913,7 +1914,7 @@ describe('viewer result pagination and facet layout', () => {
   it('filters repeated worktree-derived projects in both recent and FTS paths', async () => {
     const filters = `project=${MULTI_PROJECT_ALPHA}&project=${MULTI_PROJECT_BETA}&machine=${MULTI_MACHINE_1}`;
     for (const query of ['', `q=${MULTI_MARKER}&`]) {
-      const html = await (await SELF.fetch(`https://sessions.vza.net/?${query}${filters}`)).text();
+      const html = await (await SELF.fetch(`${VIEWER}/?${query}${filters}`)).text();
       expect(html).toContain('Multi A1');
       expect(html).toContain('Multi B1');
       expect(html).not.toContain('Multi C1');
@@ -1926,7 +1927,7 @@ describe('viewer result pagination and facet layout', () => {
 
   it('computes disjunctive project counts and retains a selected missing project at zero', async () => {
     const response = await SELF.fetch(
-      `https://api.sessions.vza.net/api/v1/search?q=${MULTI_MARKER}&facets=1` +
+      `${API}/api/v1/search?q=${MULTI_MARKER}&facets=1` +
       `&project=${MULTI_PROJECT_ALPHA}&machine=${MULTI_MACHINE_1}`,
       { headers: { 'x-dev-machine': 'testbox-wsl' } },
     );
@@ -1949,7 +1950,7 @@ describe('viewer result pagination and facet layout', () => {
     const missing = 'multi-project-missing';
     for (const query of ['', `q=${MULTI_MARKER}&`]) {
       const html = await (await SELF.fetch(
-        `https://sessions.vza.net/?${query}project=${missing}&machine=${MULTI_MACHINE_1}`,
+        `${VIEWER}/?${query}project=${missing}&machine=${MULTI_MACHINE_1}`,
       )).text();
       expect(html).toContain(`>✓ ${missing}</a><span class="n">0</span>`);
       expect(html).toContain(`>${MULTI_PROJECT_ALPHA}</a>`);
@@ -1961,7 +1962,7 @@ describe('viewer result pagination and facet layout', () => {
   it('ORs repeated session date and time buckets consistently in recent and FTS paths', async () => {
     const dateFilters = `machine=${MULTI_MACHINE_1}&session_date=2026-06-01&session_date=2026-06-02`;
     for (const query of ['', `q=${MULTI_MARKER}&`]) {
-      const html = await (await SELF.fetch(`https://sessions.vza.net/?${query}${dateFilters}`)).text();
+      const html = await (await SELF.fetch(`${VIEWER}/?${query}${dateFilters}`)).text();
       expect(html).toContain('Multi A1');
       expect(html).toContain('Multi B1');
       expect(html).not.toContain('Multi C1');
@@ -1970,7 +1971,7 @@ describe('viewer result pagination and facet layout', () => {
 
     const timeFilters = `machine=${MULTI_MACHINE_1}&session_time=under-5m&session_time=over-2h`;
     for (const query of ['', `q=${MULTI_MARKER}&`]) {
-      const html = await (await SELF.fetch(`https://sessions.vza.net/?${query}${timeFilters}`)).text();
+      const html = await (await SELF.fetch(`${VIEWER}/?${query}${timeFilters}`)).text();
       expect(html).toContain('Multi A1');
       expect(html).toContain('Multi B1');
       expect(html).not.toContain('Multi C1');
@@ -1979,7 +1980,7 @@ describe('viewer result pagination and facet layout', () => {
   });
 
   it('computes disjunctive FTS facets and retains a selected missing value with count zero', async () => {
-    const url = `https://api.sessions.vza.net/api/v1/search?q=${MULTI_MARKER}&facets=1&` +
+    const url = `${API}/api/v1/search?q=${MULTI_MARKER}&facets=1&` +
       `harness=${MULTI_HARNESS_A}&machine=${MULTI_MACHINE_1}`;
     const response = await SELF.fetch(url, { headers: { 'x-dev-machine': 'testbox-wsl' } });
     expect(response.status).toBe(200);
@@ -2001,7 +2002,7 @@ describe('viewer result pagination and facet layout', () => {
     const missing = 'multi-harness-missing';
     for (const query of ['', `q=${MULTI_MARKER}&`]) {
       const html = await (await SELF.fetch(
-        `https://sessions.vza.net/?${query}harness=${missing}&machine=${MULTI_MACHINE_1}`,
+        `${VIEWER}/?${query}harness=${missing}&machine=${MULTI_MACHINE_1}`,
       )).text();
       expect(html).toContain(`>✓ ${missing}</a><span class="n">0</span>`);
       expect(html).toContain(`>${MULTI_HARNESS_A}</a>`);
@@ -2011,16 +2012,16 @@ describe('viewer result pagination and facet layout', () => {
 
   it('appends inactive facet values, removes only the clicked active value, and resets the cursor', async () => {
     const html = await (await SELF.fetch(
-      `https://sessions.vza.net/?q=${MULTI_MARKER}&harness=${MULTI_HARNESS_A}` +
+      `${VIEWER}/?q=${MULTI_MARKER}&harness=${MULTI_HARNESS_A}` +
       `&harness=${MULTI_HARNESS_B}&machine=${MULTI_MACHINE_1}&cursor=stale`,
     )).text();
 
-    const remove = new URL(facetHref(html, MULTI_HARNESS_A, true), 'https://sessions.vza.net');
+    const remove = new URL(facetHref(html, MULTI_HARNESS_A, true), VIEWER);
     expect(remove.searchParams.getAll('harness')).toEqual([MULTI_HARNESS_B]);
     expect(remove.searchParams.getAll('machine')).toEqual([MULTI_MACHINE_1]);
     expect(remove.searchParams.has('cursor')).toBe(false);
 
-    const append = new URL(facetHref(html, MULTI_HARNESS_C), 'https://sessions.vza.net');
+    const append = new URL(facetHref(html, MULTI_HARNESS_C), VIEWER);
     expect(append.searchParams.getAll('harness')).toEqual([
       MULTI_HARNESS_A,
       MULTI_HARNESS_B,
@@ -2032,7 +2033,7 @@ describe('viewer result pagination and facet layout', () => {
 
   it('preserves repeated filters in search and sort forms and clears them with a no-JS GET button', async () => {
     const html = await (await SELF.fetch(
-      `https://sessions.vza.net/?q=${MULTI_MARKER}&harness=${MULTI_HARNESS_A}` +
+      `${VIEWER}/?q=${MULTI_MARKER}&harness=${MULTI_HARNESS_A}` +
       `&harness=${MULTI_HARNESS_B}&machine=${MULTI_MACHINE_1}&session_time=under-5m` +
       `&project=${MULTI_PROJECT_ALPHA}&project=${MULTI_PROJECT_BETA}` +
       `&sort=total_tokens&limit=10&cursor=stale`,
@@ -2066,7 +2067,7 @@ describe('viewer result pagination and facet layout', () => {
 
   it('paginates full-text results in both directions while preserving query and filter state', async () => {
     const first = await (await SELF.fetch(
-      `https://sessions.vza.net/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&machine=${PAGINATION_MACHINE}&limit=10`,
+      `${VIEWER}/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&machine=${PAGINATION_MACHINE}&limit=10`,
     )).text();
     expect(first).toContain('Showing 1–10');
     expect(first).toContain('Page 1');
@@ -2077,10 +2078,10 @@ describe('viewer result pagination and facet layout', () => {
     expect(secondHref).toContain(`harness=${PAGINATION_HARNESS}`);
     expect(secondHref).toContain(`machine=${PAGINATION_MACHINE}`);
     expect(secondHref).toContain('limit=10');
-    const second = await (await SELF.fetch(`https://sessions.vza.net${secondHref}`)).text();
+    const second = await (await SELF.fetch(`${VIEWER}${secondHref}`)).text();
     expect(second).toContain('Showing 11–20');
     expect(second).toContain('Page 2');
-    const previous = new URL(pageHref(second, 'prev'), 'https://sessions.vza.net');
+    const previous = new URL(pageHref(second, 'prev'), VIEWER);
     expect(Object.fromEntries(previous.searchParams)).toEqual({
       q: PAGINATION_MARKER,
       harness: PAGINATION_HARNESS,
@@ -2089,7 +2090,7 @@ describe('viewer result pagination and facet layout', () => {
     });
 
     const thirdHref = pageHref(second, 'next');
-    const third = await (await SELF.fetch(`https://sessions.vza.net${thirdHref}`)).text();
+    const third = await (await SELF.fetch(`${VIEWER}${thirdHref}`)).text();
     expect(third).toContain('Showing 21–25');
     expect(third).toContain('Page 3');
     expect(third).not.toContain('<a rel="next"');
@@ -2098,10 +2099,10 @@ describe('viewer result pagination and facet layout', () => {
 
   it('preserves repeated facet params through pagination', async () => {
     const first = await (await SELF.fetch(
-      `https://sessions.vza.net/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}` +
+      `${VIEWER}/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}` +
       `&harness=missing-pagination-harness&limit=10`,
     )).text();
-    const next = new URL(pageHref(first, 'next'), 'https://sessions.vza.net');
+    const next = new URL(pageHref(first, 'next'), VIEWER);
     expect(next.searchParams.getAll('harness')).toEqual([
       PAGINATION_HARNESS,
       'missing-pagination-harness',
@@ -2117,7 +2118,7 @@ describe('viewer result pagination and facet layout', () => {
     for (let index = 0; index < 105; index++) raw.append('harness', `pager-extra-${index}`);
 
     const expectCanonical = (href: string) => {
-      const values = new URL(href, 'https://sessions.vza.net').searchParams.getAll('harness');
+      const values = new URL(href, VIEWER).searchParams.getAll('harness');
       expect(values).toHaveLength(100);
       expect(values[0]).toBe(PAGINATION_HARNESS);
       expect(values.filter((value) => value === PAGINATION_HARNESS)).toHaveLength(1);
@@ -2128,14 +2129,14 @@ describe('viewer result pagination and facet layout', () => {
     for (const query of [null, PAGINATION_MARKER]) {
       const firstParams = new URLSearchParams(raw);
       if (query) firstParams.set('q', query);
-      const first = await (await SELF.fetch(`https://sessions.vza.net/?${firstParams}`)).text();
+      const first = await (await SELF.fetch(`${VIEWER}/?${firstParams}`)).text();
       const firstNext = pageHref(first, 'next');
       expectCanonical(firstNext);
 
       const secondParams = new URLSearchParams(raw);
       if (query) secondParams.set('q', query);
-      secondParams.set('cursor', new URL(firstNext, 'https://sessions.vza.net').searchParams.get('cursor')!);
-      const second = await (await SELF.fetch(`https://sessions.vza.net/?${secondParams}`)).text();
+      secondParams.set('cursor', new URL(firstNext, VIEWER).searchParams.get('cursor')!);
+      const second = await (await SELF.fetch(`${VIEWER}/?${secondParams}`)).text();
       expectCanonical(pageHref(second, 'prev'));
       expectCanonical(pageHref(second, 'next'));
     }
@@ -2171,27 +2172,27 @@ describe('viewer result pagination and facet layout', () => {
 
   it('paginates and filters the default recent-session list, including recovery from the last page', async () => {
     const first = await (await SELF.fetch(
-      `https://sessions.vza.net/?harness=${PAGINATION_HARNESS}&limit=10`,
+      `${VIEWER}/?harness=${PAGINATION_HARNESS}&limit=10`,
     )).text();
     expect(first).toContain('Showing 1–10 recent sessions');
     expect(first.match(/<div class="hit">/g)).toHaveLength(10);
 
-    const second = await (await SELF.fetch(`https://sessions.vza.net${pageHref(first, 'next')}`)).text();
-    const third = await (await SELF.fetch(`https://sessions.vza.net${pageHref(second, 'next')}`)).text();
+    const second = await (await SELF.fetch(`${VIEWER}${pageHref(first, 'next')}`)).text();
+    const third = await (await SELF.fetch(`${VIEWER}${pageHref(second, 'next')}`)).text();
     expect(third).toContain('Showing 21–25 recent sessions');
     expect(third.match(/<div class="hit">/g)).toHaveLength(5);
     expect(pageHref(third, 'prev')).toContain(`harness=${PAGINATION_HARNESS}`);
     expect(third).not.toContain(`/s/${BIG_SESSION}`);
 
-    const backToSecond = await (await SELF.fetch(`https://sessions.vza.net${pageHref(third, 'prev')}`)).text();
+    const backToSecond = await (await SELF.fetch(`${VIEWER}${pageHref(third, 'prev')}`)).text();
     expect(recentIds(backToSecond)).toEqual(recentIds(second));
   });
 
   it('resets pagination when a facet changes but preserves the text query', async () => {
     const first = await (await SELF.fetch(
-      `https://sessions.vza.net/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&limit=10`,
+      `${VIEWER}/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&limit=10`,
     )).text();
-    const second = await (await SELF.fetch(`https://sessions.vza.net${pageHref(first, 'next')}`)).text();
+    const second = await (await SELF.fetch(`${VIEWER}${pageHref(first, 'next')}`)).text();
     const controls = second.match(/<form class="facet-controls"[\s\S]*?<\/form>/)?.[0] ?? '';
     expect(controls).toContain(`name="q" value="${PAGINATION_MARKER}"`);
     expect(controls).toContain(`name="harness" value="${PAGINATION_HARNESS}"`);
@@ -2200,16 +2201,16 @@ describe('viewer result pagination and facet layout', () => {
   });
 
   it('filters by session time and sorts by session time or total tokens', async () => {
-    const relevanceSorted = await (await SELF.fetch('https://sessions.vza.net/?q=viewersortmarker&harness=viewer-sort-test')).text();
+    const relevanceSorted = await (await SELF.fetch(`${VIEWER}/?q=viewersortmarker&harness=viewer-sort-test`)).text();
     expect(relevanceSorted).toContain('<option value="recent" selected>Relevance</option>');
 
-    const timeSorted = await (await SELF.fetch('https://sessions.vza.net/?q=viewersortmarker&harness=viewer-sort-test&sort=session_time')).text();
+    const timeSorted = await (await SELF.fetch(`${VIEWER}/?q=viewersortmarker&harness=viewer-sort-test&sort=session_time`)).text();
     expect(timeSorted).toContain('<option value="session_time" selected>Session time</option>');
     expect(timeSorted).toContain('>Session time</h3>');
     expect(timeSorted.indexOf('Long session')).toBeLessThan(timeSorted.indexOf('Short session'));
     expect(timeSorted).toContain('Over 2 hours');
 
-    const tokenSorted = await (await SELF.fetch('https://sessions.vza.net/?q=viewersortmarker&harness=viewer-sort-test&sort=total_tokens')).text();
+    const tokenSorted = await (await SELF.fetch(`${VIEWER}/?q=viewersortmarker&harness=viewer-sort-test&sort=total_tokens`)).text();
     expect(tokenSorted).toContain('<option value="total_tokens" selected>Total tokens</option>');
     expect(tokenSorted.indexOf('Long session')).toBeLessThan(tokenSorted.indexOf('Short session'));
     expect(tokenSorted.indexOf('Long session')).toBeLessThan(tokenSorted.indexOf('Reasoning-heavy session'));
@@ -2217,26 +2218,26 @@ describe('viewer result pagination and facet layout', () => {
     expect(tokenSorted).toContain('30 tokens');
     expect(tokenSorted).not.toContain('530 tokens');
 
-    const shortOnly = await (await SELF.fetch('https://sessions.vza.net/?q=viewersortmarker&harness=viewer-sort-test&session_time=under-5m')).text();
+    const shortOnly = await (await SELF.fetch(`${VIEWER}/?q=viewersortmarker&harness=viewer-sort-test&session_time=under-5m`)).text();
     expect(shortOnly).toContain('Short session');
     expect(shortOnly).not.toContain('Long session');
   });
 
   it('facets calendar session dates and filters both recent and full-text results to the selected day', async () => {
     const recent = await (await SELF.fetch(
-      `https://sessions.vza.net/?harness=${PAGINATION_HARNESS}`,
+      `${VIEWER}/?harness=${PAGINATION_HARNESS}`,
     )).text();
     expect(recent).toContain('>Session date/time</h3>');
     expect(recent).toContain(`href="/?harness=${PAGINATION_HARNESS}&amp;session_date=2026-07-25"`);
 
     const recentDay = await (await SELF.fetch(
-      `https://sessions.vza.net/?harness=${PAGINATION_HARNESS}&session_date=2026-07-25`,
+      `${VIEWER}/?harness=${PAGINATION_HARNESS}&session_date=2026-07-25`,
     )).text();
     expect(recentDay).toContain('Pagination item 24');
     expect(recentDay).not.toContain('Pagination item 23');
 
     const searchDay = await (await SELF.fetch(
-      `https://sessions.vza.net/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&session_date=2026-07-25`,
+      `${VIEWER}/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&session_date=2026-07-25`,
     )).text();
     expect(searchDay).toContain('Pagination item 24');
     expect(searchDay).not.toContain('Pagination item 23');
@@ -2244,7 +2245,7 @@ describe('viewer result pagination and facet layout', () => {
 
   it('keeps the recent-session boundary stable when a newer session is ingested between pages', async () => {
     const first = await (await SELF.fetch(
-      `https://sessions.vza.net/?harness=${PAGINATION_HARNESS}&limit=10`,
+      `${VIEWER}/?harness=${PAGINATION_HARNESS}&limit=10`,
     )).text();
     const firstIds = recentIds(first);
     expect(firstIds).toEqual(
@@ -2272,7 +2273,7 @@ describe('viewer result pagination and facet layout', () => {
 
     // The viewer cursor names page 1's last (started_at, session_id), so the newly inserted
     // row cannot move its page-2 boundary. No repeat and no skipped pre-existing row.
-    const second = await (await SELF.fetch(`https://sessions.vza.net${nextHref}`)).text();
+    const second = await (await SELF.fetch(`${VIEWER}${nextHref}`)).text();
     const secondIds = recentIds(second);
     expect(secondIds).toEqual(
       Array.from({ length: 10 }, (_, i) => `viewer-pagination-${String(14 - i).padStart(2, '0')}`),
@@ -2332,13 +2333,13 @@ describe('viewer facet value discovery', () => {
       `repo=${repo}&sort=total_tokens`,
       `q=${FACET_CAP_MARKER}&repo=${repo}`,
     ]) {
-      const first = await (await SELF.fetch(`https://sessions.vza.net/?${query}`)).text();
+      const first = await (await SELF.fetch(`${VIEWER}/?${query}`)).text();
       expect(first).toContain(query.startsWith('q=') ? 'Showing 1–100 for' : 'Showing 1–100 recent sessions');
       expect(first.match(/<div class="hit">/g)).toHaveLength(100);
 
       const next = nextHref(first);
       expect(next).not.toBeNull();
-      const second = await (await SELF.fetch(`https://sessions.vza.net${next}`)).text();
+      const second = await (await SELF.fetch(`${VIEWER}${next}`)).text();
       expect(second).toContain(query.startsWith('q=') ? 'Showing 101–200 for' : 'Showing 101–200 recent sessions');
       expect(second.match(/<div class="hit">/g)).toHaveLength(100);
       expect(nextHref(second)).toBeNull();
@@ -2346,7 +2347,7 @@ describe('viewer facet value discovery', () => {
   });
 
   it('uses 100 as the FTS API default while preserving lower limits and the maximum clamp', async () => {
-    const base = `https://api.sessions.vza.net/api/v1/search?q=${FACET_CAP_MARKER}` +
+    const base = `${API}/api/v1/search?q=${FACET_CAP_MARKER}` +
       `&repo=${encodeURIComponent(FACET_CAP_REPO)}`;
     const get = async (suffix = '') => {
       const response = await SELF.fetch(base + suffix, { headers: { 'x-dev-machine': 'testbox-wsl' } });
@@ -2376,9 +2377,9 @@ describe('viewer facet value discovery', () => {
       ['Project', 'facet-cap-project-199'],
     ] as const;
     const repo = encodeURIComponent(FACET_CAP_REPO);
-    const recent = await (await SELF.fetch(`https://sessions.vza.net/?repo=${repo}`)).text();
+    const recent = await (await SELF.fetch(`${VIEWER}/?repo=${repo}`)).text();
     const search = await (await SELF.fetch(
-      `https://sessions.vza.net/?q=${FACET_CAP_MARKER}&repo=${repo}`,
+      `${VIEWER}/?q=${FACET_CAP_MARKER}&repo=${repo}`,
     )).text();
 
     for (const [label, value] of expected) {
@@ -2396,7 +2397,7 @@ describe('viewer facet value discovery', () => {
   it('keeps a selected value beyond the facet cutoff visible and removable', async () => {
     const selectedHarness = 'facet-cap-harness-199';
     const html = await (await SELF.fetch(
-      `https://sessions.vza.net/?repo=${encodeURIComponent(FACET_CAP_REPO)}&harness=${selectedHarness}`,
+      `${VIEWER}/?repo=${encodeURIComponent(FACET_CAP_REPO)}&harness=${selectedHarness}`,
     )).text();
     const group = html.match(/<h3>Harness<\/h3>([\s\S]*?)(?=<h3>|<\/aside>)/)?.[1] ?? '';
     const initiallyVisible = group.match(/<ul>([\s\S]*?)<\/ul>/)?.[1] ?? '';
@@ -2407,14 +2408,14 @@ describe('viewer facet value discovery', () => {
       new RegExp(`<li class="active"><a href="([^"]*)">✓ ${selectedHarness}</a>`),
     )?.[1]?.replaceAll('&amp;', '&');
     expect(activeHref).toBeTruthy();
-    expect(new URL(activeHref!, 'https://sessions.vza.net').searchParams.has('harness')).toBe(false);
+    expect(new URL(activeHref!, VIEWER).searchParams.has('harness')).toBe(false);
   });
 
   it('keeps every selected facet value removable beyond the normal ten-item cutoff', async () => {
     const selected = Array.from({ length: 11 }, (_, index) => `facet-cap-harness-${String(189 + index).padStart(3, '0')}`);
     const params = new URLSearchParams({ repo: FACET_CAP_REPO });
     for (const value of selected) params.append('harness', value);
-    const html = await (await SELF.fetch(`https://sessions.vza.net/?${params}`)).text();
+    const html = await (await SELF.fetch(`${VIEWER}/?${params}`)).text();
     const group = html.match(/<h3>Harness<\/h3>([\s\S]*?)(?=<h3>|<\/aside>)/)?.[1] ?? '';
     const initiallyVisible = group.match(/<ul>([\s\S]*?)<\/ul>/)?.[1] ?? '';
 

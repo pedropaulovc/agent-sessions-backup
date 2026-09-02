@@ -212,7 +212,7 @@ def test_get_sends_mtls_cert_on_health_probe(tmp_path, monkeypatch):
         return 0, 200, ""
 
     monkeypatch.setattr(t, "_run", fake_run)
-    status, _ = t.get("https://api.sessions.vza.net/healthz")
+    status, _ = t.get("https://api.sessions.pedrovc.com.br/healthz")
     assert status == 200
     argv = captured["argv"]
     assert "--cert" in argv and str(cert) in argv
@@ -229,7 +229,7 @@ def test_get_sends_dev_header_on_health_probe(monkeypatch):
         return 0, 200, ""
 
     monkeypatch.setattr(t, "_run", fake_run)
-    t.get("https://api.sessions.vza.net/healthz")
+    t.get("https://api.sessions.pedrovc.com.br/healthz")
     assert "x-dev-machine: m1" in captured["argv"]
 
 

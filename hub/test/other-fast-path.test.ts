@@ -1,6 +1,7 @@
 import { env, SELF } from 'cloudflare:test';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { convergeMultipartRow, markKnownOtherSkipped } from '../src/api/upload';
+import { API } from './hosts';
 
 const testEnv = env as unknown as Env;
 const STORE = 'claude-backup-archives';
@@ -12,7 +13,7 @@ async function sha256Hex(bytes: Uint8Array): Promise<string> {
 }
 
 function fileUrl(machine: string, relpath: string): string {
-  return `https://api.sessions.vza.net/api/v1/files/${machine}/${STORE}/${encodeURIComponent(relpath)}`;
+  return `${API}/api/v1/files/${machine}/${STORE}/${encodeURIComponent(relpath)}`;
 }
 
 async function put(machine: string, relpath: string, bytes: Uint8Array): Promise<Response> {
@@ -164,7 +165,7 @@ describe("known 'other' files bypass the parse queue", () => {
     });
 
     sendSpy.mockClear();
-    const checked = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+    const checked = await SELF.fetch(`${API}/api/v1/files/check`, {
       method: 'POST',
       headers: { 'x-dev-machine': machine, 'content-type': 'application/json' },
       body: JSON.stringify({ files: [{ store: STORE, relpath, sha256: `sha256:${changedHash}` }] }),
@@ -197,7 +198,7 @@ describe("known 'other' files bypass the parse queue", () => {
       .run();
     const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
 
-    const checked = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+    const checked = await SELF.fetch(`${API}/api/v1/files/check`, {
       method: 'POST',
       headers: { 'x-dev-machine': machine, 'content-type': 'application/json' },
       body: JSON.stringify({ files: [{ store: STORE, relpath, sha256: `sha256:${hash}` }] }),
@@ -358,7 +359,7 @@ describe("known 'other' files bypass the parse queue", () => {
     const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
     const sendBatchSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'sendBatch');
 
-    const response = await SELF.fetch('https://api.sessions.vza.net/api/v1/admin/reindex', {
+    const response = await SELF.fetch(`${API}/api/v1/admin/reindex`, {
       method: 'POST',
       headers: { 'x-dev-machine': machine, 'content-type': 'application/json' },
       body: JSON.stringify({ prefix: `raw/${machine}/${STORE}/` }),

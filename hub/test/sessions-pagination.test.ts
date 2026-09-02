@@ -5,6 +5,7 @@ import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import worker from '../src/index';
 import { ccLine, codexLines, CODEX_SESSION_ID } from './fixtures';
+import { API } from './hosts';
 import { chatgptExportZip } from './web-fixtures';
 
 const testEnv = env as unknown as Env;
@@ -15,7 +16,7 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
 }
 
 async function putBytes(machine: string, store: string, relpath: string, body: Uint8Array): Promise<Response> {
-  return SELF.fetch(`https://api.sessions.vza.net/api/v1/files/${machine}/${store}/${encodeURIComponent(relpath)}`, {
+  return SELF.fetch(`${API}/api/v1/files/${machine}/${store}/${encodeURIComponent(relpath)}`, {
     method: 'PUT',
     headers: {
       'x-dev-machine': machine,
@@ -56,7 +57,7 @@ async function drainQueue(): Promise<void> {
 }
 
 function get(qs: string): Promise<Response> {
-  return SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions?${qs}`, { headers: { 'x-dev-machine': 'reader' } });
+  return SELF.fetch(`${API}/api/v1/sessions?${qs}`, { headers: { 'x-dev-machine': 'reader' } });
 }
 
 /** A minimal one-line session: just enough for the claude-code parser to produce a row with
@@ -127,7 +128,7 @@ describe('/api/v1/sessions cursor pagination', () => {
   });
 
   it('format=ndjson streams the COMPLETE filtered set across internal pages, ignoring limit as a total cap, with no trailer cursor when under NDJSON_MAX_ROWS_PER_REQUEST', async () => {
-    const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions?machine=${MACHINE}&limit=3&format=ndjson`, {
+    const res = await SELF.fetch(`${API}/api/v1/sessions?machine=${MACHINE}&limit=3&format=ndjson`, {
       headers: { 'x-dev-machine': 'reader' },
     });
     expect(res.status).toBe(200);
@@ -337,7 +338,7 @@ describe('/api/v1/sessions format=ndjson bounds total rows per request at NDJSON
   });
 
   function ndjson(qs: string): Promise<Response> {
-    return SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions?${qs}&format=ndjson`, {
+    return SELF.fetch(`${API}/api/v1/sessions?${qs}&format=ndjson`, {
       headers: { 'x-dev-machine': 'reader' },
     });
   }
@@ -603,7 +604,7 @@ describe('X-Indexed-Through and /api/v1/usage respect the request machine/harnes
   });
 
   function usage(qs: string): Promise<Response> {
-    return SELF.fetch(`https://api.sessions.vza.net/api/v1/usage?${qs}`, { headers: { 'x-dev-machine': 'reader' } });
+    return SELF.fetch(`${API}/api/v1/usage?${qs}`, { headers: { 'x-dev-machine': 'reader' } });
   }
 
   it('usage: machine filter scopes rows to that machine only', async () => {

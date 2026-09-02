@@ -679,3 +679,25 @@ def test_run_lock_prevents_overlap(tmp_path, hub, tmp_env, monkeypatch):
         assert hub.heartbeats == []  # never ran: lock was held
     finally:
         held.release()
+
+
+def test_doctor_cert_store_drops_psmodulepath(monkeypatch, capsys):
+    # The false negative that failed the first vm-solidworks-windows enrollment (2026-09-02): the
+    # probe is a powershell.exe 5.1 child of a python process that pwsh 7 launched. Inheriting PS7's
+    # PSModulePath leaves 5.1 without its Certificate provider ("Cannot find drive ... 'Cert'"), so a
+    # present cert reads as MISSING. Measured: inherit => MISSING, dropped => 730. The probe must go
+    # through config.desktop_powershell_env like the PFX import does. Revert to `{**os.environ, ...}`
+    # and this fails on the PSMODULEPATH key.
+    seen = {}
+
+    def fake_run(*a, **k):
+        seen["env"] = k["env"]
+        return types.SimpleNamespace(stdout="730\n", stderr="", returncode=0)
+
+    monkeypatch.setattr(run_mod.sys, "platform", "win32")
+    monkeypatch.setenv("PSMODULEPATH", r"C:\Program Files\PowerShell\7\Modules")
+    monkeypatch.setenv("KEEP_ME", "1")
+    monkeypatch.setattr(run_mod.subprocess, "run", fake_run)
+    assert run_mod._doctor_cert_store(_TP) is True
+    assert not [k for k in seen["env"] if k.upper() == "PSMODULEPATH"]
+    assert seen["env"]["KEEP_ME"] == "1" and seen["env"]["AC_TP"] == _TP

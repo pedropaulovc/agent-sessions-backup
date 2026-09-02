@@ -61,13 +61,11 @@ AG_NAME="ag-pedro-email"
 WEBTEST_NAME="agent-backup-healthz"
 WORKBOOK_NAME="03c0208e-6d39-4a92-8502-b0c4a983d7e1"
 WORKBOOK_DISPLAY_NAME="Agent sessions backup - System health"
-# sessions.vza.net/healthz only resolves once the M3 zone routes in
-# hub/wrangler.jsonc are uncommented and deployed (currently commented out —
-# see that file). If you're running this script before M3, override with a
-# workers.dev URL that's live today, e.g.:
+# The webtest targets the viewer's public /healthz on the hub's custom domain
+# (VIEWER_HOST in hub/wrangler.jsonc). Override when pointing at a host that
+# isn't live yet, e.g. during a zone move:
 #   HEALTHZ_URL=https://sessions-hub.<account>.workers.dev/healthz ./infra/azure/provision.sh <issuer-url>
-# and re-run after M3 lands to point the webtest at the real custom domain.
-HEALTHZ_URL="${HEALTHZ_URL:-https://sessions.vza.net/healthz}"
+HEALTHZ_URL="${HEALTHZ_URL:-https://sessions.pedrovc.com.br/healthz}"
 
 echo "=== Azure CLI Extensions ==="
 # A fresh az CLI install has none of these; `az monitor app-insights`,

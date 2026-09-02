@@ -3,6 +3,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import worker from '../src/index';
 import { __setExportBudgetsForTest, EXPORT_SEND_FAILURE_LIMIT } from '../src/ingest/consumer';
 import { isFreshReservation, markPendingAndEnqueue } from '../src/queue';
+import { API } from './hosts';
 import { CLAUDE_WEB_ROOT, claudeExportZip, claudeWebConversation, type ClaudeConvOpts, type ClaudeWebMessage } from './web-fixtures';
 
 const testEnv = testEnvRaw as unknown as Env;
@@ -141,7 +142,7 @@ async function uploadConvs(tag: string, convs: ClaudeConvOpts[], mtime = '2026-0
   const hash = await sha256Hex(zip);
   const relpath = `claude-export-${tag}.zip`;
   const machine = `bnd-${tag}`;
-  const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/files/${machine}/export-inbox/${encodeURIComponent(relpath)}`, {
+  const res = await SELF.fetch(`${API}/api/v1/files/${machine}/export-inbox/${encodeURIComponent(relpath)}`, {
     method: 'PUT',
     headers: {
       'x-dev-machine': machine,
@@ -178,7 +179,7 @@ async function uploadClaudeWeb(tag: string, msgs: number): Promise<{ fileId: num
   const hash = await sha256Hex(bytes);
   const machine = `bnd-web-${tag}`;
   const relpath = `${uuid}.json`;
-  const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/files/${machine}/claude-web/${encodeURIComponent(relpath)}`, {
+  const res = await SELF.fetch(`${API}/api/v1/files/${machine}/claude-web/${encodeURIComponent(relpath)}`, {
     method: 'PUT',
     headers: {
       'x-dev-machine': machine,
@@ -233,7 +234,7 @@ async function reuploadRawExport(tag: string, bytes: Uint8Array): Promise<string
   const hash = await sha256Hex(bytes);
   const relpath = `claude-export-${tag}.zip`;
   const machine = `bnd-${tag}`;
-  const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/files/${machine}/export-inbox/${encodeURIComponent(relpath)}`, {
+  const res = await SELF.fetch(`${API}/api/v1/files/${machine}/export-inbox/${encodeURIComponent(relpath)}`, {
     method: 'PUT',
     headers: { 'x-dev-machine': machine, 'x-content-hash': `sha256:${hash}`, 'x-file-mtime': '2026-07-02T12:00:00Z', 'content-length': String(bytes.length) },
     body: bytes,
@@ -291,7 +292,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(await ownedSessions(fileId)).toBe(total);
 
     // Every conversation is searchable — proving the fan-out completed, not just the file flag.
-    const search = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=answer', { headers: { 'x-dev-machine': 'bndbox' } });
+    const search = await SELF.fetch(`${API}/api/v1/search?q=answer`, { headers: { 'x-dev-machine': 'bndbox' } });
     const hits = ((await search.json()) as { hits: unknown[] }).hits;
     expect(hits.length).toBeGreaterThan(0);
   });

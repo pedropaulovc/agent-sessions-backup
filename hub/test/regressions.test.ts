@@ -5,6 +5,7 @@ import { clampLimit } from '../src/api/sessions';
 import { hex } from '../src/api/ops';
 import { convergeR2WithRow } from '../src/api/upload';
 import { CODEX_SESSION_ID, ccAssistantLine, ccUserLine, codexLines } from './fixtures';
+import { API, VIEWER } from './hosts';
 
 const testEnv = env as unknown as Env;
 const MACHINE = 'regbox';
@@ -16,7 +17,7 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
 
 async function putFile(store: string, relpath: string, content: string): Promise<Response> {
   const body = new TextEncoder().encode(content);
-  return SELF.fetch(`https://api.sessions.vza.net/api/v1/files/${MACHINE}/${store}/${encodeURIComponent(relpath)}`, {
+  return SELF.fetch(`${API}/api/v1/files/${MACHINE}/${store}/${encodeURIComponent(relpath)}`, {
     method: 'PUT',
     headers: {
       'x-dev-machine': MACHINE,
@@ -118,7 +119,7 @@ describe('search handles a query whose quoted-phrase fallback is ALSO invalid FT
   // regression input since it's the one that actually exercises the fallback-also-throws path this
   // fix addresses.
   it('a NUL-byte query returns 200 with empty hits/facets, not an uncaught exception', async () => {
-    const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/search?q=${encodeURIComponent('\0')}&facets=1`, {
+    const res = await SELF.fetch(`${API}/api/v1/search?q=${encodeURIComponent('\0')}&facets=1`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(res.status).toBe(200);
@@ -156,7 +157,7 @@ describe('search classifies a failed query deterministically via a probe against
     });
     try {
       await expect(
-        SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=anything', { headers: { 'x-dev-machine': MACHINE } }),
+        SELF.fetch(`${API}/api/v1/search?q=anything`, { headers: { 'x-dev-machine': MACHINE } }),
       ).rejects.toThrow(/no such table/i);
     } finally {
       spy.mockRestore();
@@ -164,7 +165,7 @@ describe('search classifies a failed query deterministically via a probe against
   });
 
   it('a genuinely invalid FTS5 match (a bad column filter) still swallows to 200 with empty hits, not a 500', async () => {
-    const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/search?q=${encodeURIComponent('nosuchcol:term')}`, {
+    const res = await SELF.fetch(`${API}/api/v1/search?q=${encodeURIComponent('nosuchcol:term')}`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(res.status).toBe(200);
@@ -194,7 +195,7 @@ describe('search classifies a failed query deterministically via a probe against
     });
     try {
       await expect(
-        SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=anything', { headers: { 'x-dev-machine': MACHINE } }),
+        SELF.fetch(`${API}/api/v1/search?q=anything`, { headers: { 'x-dev-machine': MACHINE } }),
       ).rejects.toThrow(/no such column/i);
     } finally {
       spy.mockRestore();
@@ -224,7 +225,7 @@ describe('search classifies a failed query deterministically via a probe against
     });
     try {
       await expect(
-        SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=anything', { headers: { 'x-dev-machine': MACHINE } }),
+        SELF.fetch(`${API}/api/v1/search?q=anything`, { headers: { 'x-dev-machine': MACHINE } }),
       ).rejects.toThrow(/database is locked/i);
     } finally {
       spy.mockRestore();
@@ -234,7 +235,7 @@ describe('search classifies a failed query deterministically via a probe against
 
 describe('search/listSessions limit clamp over HTTP (regression: NaN/negative used to reach SQL as LIMIT NaN / LIMIT -1)', () => {
   it('search: a non-numeric limit no longer 500s', async () => {
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=zzznonexistentzzz&limit=abc', {
+    const res = await SELF.fetch(`${API}/api/v1/search?q=zzznonexistentzzz&limit=abc`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(res.status).toBe(200);
@@ -243,21 +244,21 @@ describe('search/listSessions limit clamp over HTTP (regression: NaN/negative us
   });
 
   it('search: a negative limit no longer 500s', async () => {
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=zzznonexistentzzz&limit=-5', {
+    const res = await SELF.fetch(`${API}/api/v1/search?q=zzznonexistentzzz&limit=-5`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(res.status).toBe(200);
   });
 
   it('listSessions: a non-numeric limit no longer 500s', async () => {
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions?limit=abc', {
+    const res = await SELF.fetch(`${API}/api/v1/sessions?limit=abc`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(res.status).toBe(200);
   });
 
   it('listSessions: a negative limit does not stream an unbounded ndjson response', async () => {
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions?format=ndjson&limit=-1', {
+    const res = await SELF.fetch(`${API}/api/v1/sessions?format=ndjson&limit=-1`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(res.status).toBe(200);
@@ -360,7 +361,7 @@ describe('codex fork rollouts stay under their root session', () => {
       { session_id: CHILD_SESSION_ID, parent_session_id: ROOT_SESSION_ID, is_sidechain: 1 },
     ]);
 
-    const recent = await SELF.fetch('https://sessions.vza.net/?harness=codex');
+    const recent = await SELF.fetch(`${VIEWER}/?harness=codex`);
     expect(recent.status).toBe(200);
     const html = await recent.text();
     expect(html).toContain(`/s/${ROOT_SESSION_ID}`);
@@ -395,7 +396,7 @@ describe('codex fork rollouts stay under their root session', () => {
       .first<{ parent_session_id: string | null }>();
     expect(preserved).toEqual({ parent_session_id: ROOT_SESSION_ID });
 
-    const recentAfterLegacy = await SELF.fetch('https://sessions.vza.net/?harness=codex');
+    const recentAfterLegacy = await SELF.fetch(`${VIEWER}/?harness=codex`);
     expect(await recentAfterLegacy.text()).not.toContain(`/s/${CHILD_SESSION_ID}`);
 
     const reindexedChild = await putFile(
@@ -413,7 +414,7 @@ describe('codex fork rollouts stay under their root session', () => {
       .first<{ parent_session_id: string | null; is_sidechain: number }>();
     expect(cleared).toEqual({ parent_session_id: null, is_sidechain: 0 });
 
-    const recentAfterReindex = await SELF.fetch('https://sessions.vza.net/?harness=codex');
+    const recentAfterReindex = await SELF.fetch(`${VIEWER}/?harness=codex`);
     expect(recentAfterReindex.status).toBe(200);
     const htmlAfterReindex = await recentAfterReindex.text();
     expect(htmlAfterReindex).toContain(`/s/${CHILD_SESSION_ID}`);
@@ -434,7 +435,7 @@ describe('getSessionRaw range handling', () => {
   });
 
   it('returns 206 with Content-Range for a valid byte range', async () => {
-    const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${RANGE_SESSION_ID}/raw`, {
+    const res = await SELF.fetch(`${API}/api/v1/sessions/${RANGE_SESSION_ID}/raw`, {
       headers: { 'x-dev-machine': MACHINE, range: 'bytes=0-9' },
     });
     expect(res.status).toBe(206);
@@ -444,7 +445,7 @@ describe('getSessionRaw range handling', () => {
   });
 
   it('falls back to a full 200 for an unparseable Range header (suffix form) — never a misleading 206', async () => {
-    const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${RANGE_SESSION_ID}/raw`, {
+    const res = await SELF.fetch(`${API}/api/v1/sessions/${RANGE_SESSION_ID}/raw`, {
       headers: { 'x-dev-machine': MACHINE, range: 'bytes=-500' },
     });
     expect(res.status).toBe(200);
@@ -453,7 +454,7 @@ describe('getSessionRaw range handling', () => {
   });
 
   it('plain 200 with no Range header at all', async () => {
-    const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${RANGE_SESSION_ID}/raw`, {
+    const res = await SELF.fetch(`${API}/api/v1/sessions/${RANGE_SESSION_ID}/raw`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(res.status).toBe(200);
@@ -461,7 +462,7 @@ describe('getSessionRaw range handling', () => {
   });
 
   it('falls back to a full 200 for an inverted range (end < start) instead of forwarding a negative length to R2 (regression: bytes=100-50 computed {offset:100, length:-49})', async () => {
-    const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${RANGE_SESSION_ID}/raw`, {
+    const res = await SELF.fetch(`${API}/api/v1/sessions/${RANGE_SESSION_ID}/raw`, {
       headers: { 'x-dev-machine': MACHINE, range: 'bytes=100-50' },
     });
     expect(res.status).toBe(200);
@@ -753,7 +754,7 @@ describe('a changed-hash re-upload of a session\'s canonical file marks the sess
       .first<{ index_state: string }>();
     expect(session3?.index_state).toBe('ready');
 
-    const search = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-canonreupload-v2', {
+    const search = await SELF.fetch(`${API}/api/v1/search?q=unique-marker-canonreupload-v2`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     const searchBody = (await search.json()) as { hits: Array<{ session_id: string }> };
@@ -855,7 +856,7 @@ describe('R2/D1 convergence after overlapping changed-hash uploads for the same 
     // The right message parses: deliver against the row's (now R2-matching) hash and confirm the
     // session shows A's content, not B's.
     await deliverOne(fileId, r2Key, hashA);
-    const search = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-converge-a', {
+    const search = await SELF.fetch(`${API}/api/v1/search?q=unique-marker-converge-a`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     const searchBody = (await search.json()) as { hits: Array<{ session_id: string }> };
@@ -941,7 +942,7 @@ describe('failed reparse surfaces as session index_state=error', () => {
     // deleting them (unlike parseOne's zero-turn branch): a throw here means we couldn't even
     // read the raw content, so those rows may be the only surviving trace of the session. The
     // stale hit must still carry index_state='error' so callers can tell it's not current.
-    const search = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=poison', {
+    const search = await SELF.fetch(`${API}/api/v1/search?q=poison`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(search.status).toBe(200);
@@ -991,7 +992,7 @@ describe('upload requires an actual size header', () => {
       },
     });
     const res = await SELF.fetch(
-      `https://api.sessions.vza.net/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent('no-size-demo/f0000000-0000-4000-8000-000000000001.jsonl')}`,
+      `${API}/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent('no-size-demo/f0000000-0000-4000-8000-000000000001.jsonl')}`,
       {
         method: 'PUT',
         headers: {
@@ -1017,7 +1018,7 @@ describe('upload requires an actual size header', () => {
       },
     });
     const res = await SELF.fetch(
-      `https://api.sessions.vza.net/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent(relpath)}`,
+      `${API}/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent(relpath)}`,
       {
         method: 'PUT',
         headers: {
@@ -1050,7 +1051,7 @@ describe('upload requires an actual size header', () => {
     // server-side but not the declared length against a header, so this is the only way to
     // reliably get a real byte mismatch to actually land in R2 in this test harness.
     const res = await SELF.fetch(
-      `https://api.sessions.vza.net/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent(relpath)}`,
+      `${API}/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent(relpath)}`,
       {
         method: 'PUT',
         headers: {
@@ -1107,7 +1108,7 @@ describe('date-only "to" bound is inclusive of the whole day', () => {
   });
 
   it('usage: from=to=<date> is non-empty (regression: to=<date> lexicographically excluded the whole day against full ISO timestamps)', async () => {
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/usage?group_by=day&from=2026-07-17&to=2026-07-17', {
+    const res = await SELF.fetch(`${API}/api/v1/usage?group_by=day&from=2026-07-17&to=2026-07-17`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(res.status).toBe(200);
@@ -1118,7 +1119,7 @@ describe('date-only "to" bound is inclusive of the whole day', () => {
   });
 
   it('search: to=<date-only> includes a session started that same day', async () => {
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=bound&from=2026-07-17&to=2026-07-17', {
+    const res = await SELF.fetch(`${API}/api/v1/search?q=bound&from=2026-07-17&to=2026-07-17`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(res.status).toBe(200);
@@ -1127,7 +1128,7 @@ describe('date-only "to" bound is inclusive of the whole day', () => {
   });
 
   it('listSessions: to=<date-only> includes a session started that same day', async () => {
-    const res = await SELF.fetch('https://api.sessions.vza.net/api/v1/sessions?from=2026-07-17&to=2026-07-17', {
+    const res = await SELF.fetch(`${API}/api/v1/sessions?from=2026-07-17&to=2026-07-17`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(res.status).toBe(200);
@@ -1155,7 +1156,7 @@ describe('files/check re-enqueues unindexed matches instead of only reporting th
     const sha256 = await sha256Hex(new TextEncoder().encode(content));
     const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
     try {
-      const checkRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+      const checkRes = await SELF.fetch(`${API}/api/v1/files/check`, {
         method: 'POST',
         headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
         body: JSON.stringify({ files: [{ store: 'claude-projects', relpath, sha256: `sha256:${sha256}` }] }),
@@ -1191,7 +1192,7 @@ describe('files/check re-enqueues unindexed matches instead of only reporting th
     const sha256 = await sha256Hex(new TextEncoder().encode(content));
     const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send');
     try {
-      const checkRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+      const checkRes = await SELF.fetch(`${API}/api/v1/files/check`, {
         method: 'POST',
         headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
         body: JSON.stringify({ files: [{ store: 'claude-projects', relpath, sha256: `sha256:${sha256}` }] }),
@@ -1224,7 +1225,7 @@ describe('files/check re-enqueues unindexed matches instead of only reporting th
     await testEnv.RAW.delete(r2Key);
 
     const sha256 = await sha256Hex(new TextEncoder().encode(content));
-    const checkRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+    const checkRes = await SELF.fetch(`${API}/api/v1/files/check`, {
       method: 'POST',
       headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
       body: JSON.stringify({ files: [{ store: 'claude-projects', relpath, sha256: `sha256:${sha256}` }] }),
@@ -1243,7 +1244,7 @@ describe('files/check re-enqueues unindexed matches instead of only reporting th
     await drainQueue();
 
     const sha256 = await sha256Hex(new TextEncoder().encode(content));
-    const checkRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+    const checkRes = await SELF.fetch(`${API}/api/v1/files/check`, {
       method: 'POST',
       headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
       body: JSON.stringify({ files: [{ store: 'claude-projects', relpath, sha256: `sha256:${sha256}` }] }),
@@ -1268,7 +1269,7 @@ describe('files/check re-enqueues unindexed matches instead of only reporting th
     await testEnv.RAW.put(r2Key, new TextEncoder().encode('completely different bytes, no sha256 option'));
 
     const sha256 = await sha256Hex(new TextEncoder().encode(content));
-    const checkRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+    const checkRes = await SELF.fetch(`${API}/api/v1/files/check`, {
       method: 'POST',
       headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
       body: JSON.stringify({ files: [{ store: 'claude-projects', relpath, sha256: `sha256:${sha256}` }] }),
@@ -1293,7 +1294,7 @@ describe('files/check re-enqueues unindexed matches instead of only reporting th
     // D1 still only has the OLD hash for this path (the collector hasn't actually uploaded the
     // new bytes yet) — a batch requesting both hashes for the same path simulates a scan racing
     // a local rewrite.
-    const checkRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/files/check', {
+    const checkRes = await SELF.fetch(`${API}/api/v1/files/check`, {
       method: 'POST',
       headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
       body: JSON.stringify({
@@ -1329,7 +1330,7 @@ describe('reindex refreshes content_hash', () => {
       .first<{ content_hash: string }>();
     expect(before?.content_hash).toBe('unknown');
 
-    const reindexRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/admin/reindex', {
+    const reindexRes = await SELF.fetch(`${API}/api/v1/admin/reindex`, {
       method: 'POST',
       headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
       body: '{}',
@@ -1367,7 +1368,7 @@ describe("reindex over a canonical file whose stored hash differs from the R2 ob
     // above uses, which reindex's upsert always corrects on every run regardless of parse_state.
     await testEnv.DB.prepare("UPDATE files SET content_hash = 'deadbeef' WHERE id = ?1").bind(fileId).run();
 
-    const reindexRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/admin/reindex', {
+    const reindexRes = await SELF.fetch(`${API}/api/v1/admin/reindex`, {
       method: 'POST',
       headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
       body: '{}',
@@ -1397,7 +1398,7 @@ describe("reindex restores files.mtime from R2 customMetadata (regression: reind
     const ORIGINAL_MTIME = '2020-03-14T15:09:26Z';
 
     const body = new TextEncoder().encode(content);
-    const putRes = await SELF.fetch(`https://api.sessions.vza.net/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent(relpath)}`, {
+    const putRes = await SELF.fetch(`${API}/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent(relpath)}`, {
       method: 'PUT',
       headers: {
         'x-dev-machine': MACHINE,
@@ -1421,7 +1422,7 @@ describe("reindex restores files.mtime from R2 customMetadata (regression: reind
     const gone = await testEnv.DB.prepare('SELECT id FROM files WHERE id = ?1').bind(fileId).first();
     expect(gone).toBeNull();
 
-    const reindexRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/admin/reindex', {
+    const reindexRes = await SELF.fetch(`${API}/api/v1/admin/reindex`, {
       method: 'POST',
       headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
       body: '{}',
@@ -1445,7 +1446,7 @@ describe('reindex-restored mtimes drive the canonical-copy tiebreak correctly (r
 
     async function putWithMtime(relpath: string, mtime: string): Promise<number> {
       const body = new TextEncoder().encode(content);
-      const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent(relpath)}`, {
+      const res = await SELF.fetch(`${API}/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent(relpath)}`, {
         method: 'PUT',
         headers: {
           'x-dev-machine': MACHINE,
@@ -1471,7 +1472,7 @@ describe('reindex-restored mtimes drive the canonical-copy tiebreak correctly (r
     // tiebreak logic from the restore-after-delete mechanics already covered above.
     await testEnv.DB.prepare('UPDATE files SET mtime = NULL WHERE id IN (?1, ?2)').bind(oldFileId, newFileId).run();
 
-    const reindexRes = await SELF.fetch('https://api.sessions.vza.net/api/v1/admin/reindex', {
+    const reindexRes = await SELF.fetch(`${API}/api/v1/admin/reindex`, {
       method: 'POST',
       headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
       body: '{}',
@@ -1547,7 +1548,7 @@ describe('subagent meta linking, both arrival orders', () => {
   it('the API response for a linked subagent session carries parentToolUseId (regression: loadNormalized reparsed the JSONL and never hydrated it from the sessions row)', async () => {
     expect(await parentToolUseId(SUBAGENT_A)).toBe('toolu_meta_first');
 
-    const res = await SELF.fetch(`https://api.sessions.vza.net/api/v1/sessions/${SUBAGENT_A}`, {
+    const res = await SELF.fetch(`${API}/api/v1/sessions/${SUBAGENT_A}`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(res.status).toBe(200);
@@ -1685,14 +1686,14 @@ describe('a transcript reparse that reads a CORRECTED sibling meta repairs a sta
 
 describe('search cursor decoding rejects non-integer offsets (regression: a finite non-integer cursor reached SQL OFFSET and 500\'d)', () => {
   it('a hand-edited cursor decoding to 1.5 is treated as offset 0 (first page), not a 500', async () => {
-    const withoutCursor = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=bound', {
+    const withoutCursor = await SELF.fetch(`${API}/api/v1/search?q=bound`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(withoutCursor.status).toBe(200);
     const firstPage = (await withoutCursor.json()) as { hits: Array<{ session_id: string }> };
     expect(firstPage.hits.length).toBeGreaterThan(0);
 
-    const withBadCursor = await SELF.fetch(`https://api.sessions.vza.net/api/v1/search?q=bound&cursor=${btoa('1.5')}`, {
+    const withBadCursor = await SELF.fetch(`${API}/api/v1/search?q=bound&cursor=${btoa('1.5')}`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(withBadCursor.status).toBe(200);
@@ -1701,14 +1702,14 @@ describe('search cursor decoding rejects non-integer offsets (regression: a fini
   });
 
   it('a cursor that is not valid base64 at all (e.g. "not-base64!") is treated as offset 0, not a 500 (atob throws)', async () => {
-    const withoutCursor = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=bound', {
+    const withoutCursor = await SELF.fetch(`${API}/api/v1/search?q=bound`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(withoutCursor.status).toBe(200);
     const firstPage = (await withoutCursor.json()) as { hits: Array<{ session_id: string }> };
     expect(firstPage.hits.length).toBeGreaterThan(0);
 
-    const withInvalidCursor = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=bound&cursor=not-base64!', {
+    const withInvalidCursor = await SELF.fetch(`${API}/api/v1/search?q=bound&cursor=not-base64!`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(withInvalidCursor.status).toBe(200);
@@ -1736,7 +1737,7 @@ describe('a stale message (redelivered after a re-upload changed the row\'s hash
     expect(rowV1?.parse_state).toBe('parsed');
     const oldHash = rowV1!.content_hash;
 
-    const searchV1Before = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-stalewrite-v1', {
+    const searchV1Before = await SELF.fetch(`${API}/api/v1/search?q=unique-marker-stalewrite-v1`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     const bodyV1Before = (await searchV1Before.json()) as { hits: Array<{ session_id: string }> };
@@ -1759,13 +1760,13 @@ describe('a stale message (redelivered after a re-upload changed the row\'s hash
 
     // ...and the session/blocks content is UNCHANGED (still V1) — the stale delivery must be
     // rejected before it ever calls writeSession, not just before markParsed.
-    const searchV1After = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-stalewrite-v1', {
+    const searchV1After = await SELF.fetch(`${API}/api/v1/search?q=unique-marker-stalewrite-v1`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     const bodyV1After = (await searchV1After.json()) as { hits: Array<{ session_id: string }> };
     expect(bodyV1After.hits.some((h) => h.session_id === SESSION_ID)).toBe(true);
 
-    const searchV2NotYet = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-stalewrite-v2', {
+    const searchV2NotYet = await SELF.fetch(`${API}/api/v1/search?q=unique-marker-stalewrite-v2`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     const bodyV2NotYet = (await searchV2NotYet.json()) as { hits: Array<{ session_id: string }> };
@@ -1779,7 +1780,7 @@ describe('a stale message (redelivered after a re-upload changed the row\'s hash
       .first<{ parse_state: string }>();
     expect(rowFresh?.parse_state).toBe('parsed');
 
-    const searchV2 = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-stalewrite-v2', {
+    const searchV2 = await SELF.fetch(`${API}/api/v1/search?q=unique-marker-stalewrite-v2`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     const bodyV2 = (await searchV2.json()) as { hits: Array<{ session_id: string }> };
@@ -1849,7 +1850,7 @@ describe('a re-upload landing strictly between the pre-writeSession recheck and 
       .first<{ index_state: string }>();
     expect(sessionAfter?.index_state).toBe('ready');
 
-    const searchV2 = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-residualrace-v2', {
+    const searchV2 = await SELF.fetch(`${API}/api/v1/search?q=unique-marker-residualrace-v2`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     const bodyV2 = (await searchV2.json()) as { hits: Array<{ session_id: string }> };
@@ -1923,7 +1924,7 @@ describe("consumeParseBatch's catch path is guarded by content_hash (regression:
       .first<{ index_state: string }>();
     expect(sessionAfter?.index_state).toBe('ready');
 
-    const searchV2After = await SELF.fetch('https://api.sessions.vza.net/api/v1/search?q=unique-marker-catchrace-v2', {
+    const searchV2After = await SELF.fetch(`${API}/api/v1/search?q=unique-marker-catchrace-v2`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     const bodyV2After = (await searchV2After.json()) as { hits: Array<{ session_id: string }> };

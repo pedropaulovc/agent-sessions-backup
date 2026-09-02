@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { priceUsage, PRICING_VERSION } from '../src/pricing-pass';
 import { priceUsageSlice, PRICE_ROWS_PER_INVOCATION, setPriceRowsPerInvocation } from '../src/api/ops';
 import type { Identity } from '../src/auth/identity';
+import { API } from './hosts';
 
 /** The pass that fills `usage.usd`.
  *
@@ -440,7 +441,7 @@ describe('priceUsage', () => {
  * returned 200 while rows remained would silently truncate the backfill and report success. */
 describe('priceUsageSlice', () => {
   const admin: Identity = { kind: 'machine', machineId: 'opsbox', isAdmin: true, certSlot: 'current' };
-  const req = () => new Request('https://api.sessions.vza.net/api/v1/admin/price-usage', { method: 'POST' });
+  const req = () => new Request(`${API}/api/v1/admin/price-usage`, { method: 'POST' });
 
   beforeEach(async () => {
     await testEnv.DB.batch([
