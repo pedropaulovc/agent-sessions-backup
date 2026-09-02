@@ -176,6 +176,21 @@ if (-not (Test-Path -LiteralPath $collector)) {
     throw "Collector not installed at '$collector'. Run scripts\setup-windows-collector.ps1 first."
 }
 
+# Refuse to enroll while a collector run is in flight. A run loads hub_url and the cert
+# thumbprint once, at start, and never re-reads them; enrolling underneath it leaves it
+# walking every file against the OLD host with the OLD cert. Measured 2026-09-02 on
+# vm-solidworks-windows: the scheduled run started 16 s before enrollment rewrote the
+# config, the old host no longer resolved (curl exit 6 in 3 ms), each request went through
+# the full retry backoff, and 25 minutes later the hub had received 0 files and 0
+# reservations while the run still held the lock. The scheduled task runs the collector
+# as pythonw.exe -m agent_collector.cli, so match the command line, not the process name.
+$running = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match 'agent_collector\.cli\s+run|agent-collector(\.exe)?"?\s+run' }
+if ($running) {
+    $running | ForEach-Object { Write-Host ("   running: pid {0} since {1}: {2}" -f $_.ProcessId, $_.CreationDate, $_.CommandLine) }
+    throw "A collector run is in progress. Let it finish, or stop it (Stop-Process -Id <pid> -Force; nothing is lost, the run checkpoints per file), then re-run this script."
+}
+
 Write-Host ''
 Write-Host '== plan'
 Write-Host "   machine id : $MachineId"
