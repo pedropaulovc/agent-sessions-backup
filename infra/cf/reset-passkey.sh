@@ -49,14 +49,17 @@ MODE="${1:-status}"
 # Config is the source of truth. Reading VIEWER_HOST and the D1 name out of
 # wrangler.jsonc rather than restating them here is the whole lesson from this
 # migration: a hostname duplicated as a literal is a latent outage. The strip
-# only removes lines whose first non-space characters are `//`, so the `https://`
-# inside values survives.
+# matches a whole double-quoted string before it considers a comment, so the
+# `//` inside `https://` - or inside any string value - is preserved, while real
+# line and block comments are removed from anywhere on the line.
 # ---------------------------------------------------------------------------
 read_cfg() {
   python3 - "$HUB_DIR/wrangler.jsonc" <<'PY'
 import json, re, sys
 raw = open(sys.argv[1]).read()
-cfg = json.loads(re.sub(r'^\s*//.*$', '', raw, flags=re.M))
+cfg = json.loads(
+    re.sub(r'("(?:\\.|[^"\\])*")|/\*[\s\S]*?\*/|//[^\n]*', lambda m: m.group(1) or '', raw)
+)
 db = (cfg.get('d1_databases') or [{}])[0]
 print(cfg.get('vars', {}).get('VIEWER_HOST', ''))
 print(cfg.get('vars', {}).get('API_HOST', ''))
@@ -87,11 +90,23 @@ WRANGLER=(npx --no-install wrangler)
 # pipeline's status - so a command that SUCCEEDED but printed only noise would
 # abort the script. Capturing first lets us report wrangler's real exit code and
 # makes the filter unable to invent a failure.
+#
+# The `if` around the substitution is also load-bearing. A bare
+# `out="$(...)"; rc=$?` is not errexit-safe: measured, an unguarded wr call whose
+# wrangler exits nonzero aborts the function AT the assignment, so `rc=$?` never
+# runs and the buffered diagnostics are never printed - a failed secret rotation
+# or D1 write would be silent. wr IS called unguarded (the `| python3` and
+# `| tail` sites below). Testing the substitution as a condition suspends errexit
+# for it, so we always print the output and return the real status.
 wr() {
   local out rc
-  out="$( cd "$HUB_DIR" && "${WRANGLER[@]}" "$@" 2>&1 )"; rc=$?
+  if out="$( cd "$HUB_DIR" && "${WRANGLER[@]}" "$@" 2>&1 )"; then
+    rc=0
+  else
+    rc=$?
+  fi
   printf '%s\n' "$out" | grep -vE 'update available|Please report|^\s*$' || true
-  return $rc
+  return "$rc"
 }
 
 d1_query() {

@@ -72,7 +72,12 @@ function Assert-NativeSuccess {
     }
 }
 
-if (-not $IsWindows -and $PSVersionTable.PSEdition -ne 'Desktop') {
+# $IsWindows does NOT exist in Windows PowerShell 5.1 - the default shell on both
+# collector boxes - so under Set-StrictMode it raises VariableIsUndefined and this
+# guard would abort the script it is meant to protect. Verified against a real
+# 5.1.26100.9168: `if (-not $IsWindows)` throws there. OSVersion.Platform is
+# present in both editions.
+if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
     throw 'This script imports into the Windows certificate store and is Windows-only.'
 }
 
@@ -134,8 +139,17 @@ if (-not $pfxPassword) {
 if (-not $HubUrl) {
     $wranglerPath = Join-Path (Split-Path -Parent $scriptDir) 'hub\wrangler.jsonc'
     if (Test-Path -LiteralPath $wranglerPath) {
-        # Strip only whole-line // comments, so the // inside https:// survives.
-        $jsonc = (Get-Content -LiteralPath $wranglerPath) -notmatch '^\s*//' -join "`n"
+        # Strip JSONC comments without eating the // inside "https://": the
+        # alternation matches a whole double-quoted string FIRST, so a comment
+        # marker living inside a string value is consumed as part of that string
+        # and handed back unchanged. Only genuine comments - line or block,
+        # anywhere on the line, not just at the start - are removed.
+        $raw = Get-Content -LiteralPath $wranglerPath -Raw
+        $jsonc = [regex]::Replace(
+            $raw,
+            '("(?:\\.|[^"\\])*")|/\*[\s\S]*?\*/|//[^\r\n]*',
+            { param($m) if ($m.Groups[1].Success) { $m.Groups[1].Value } else { '' } }
+        )
         $apiHost = ($jsonc | ConvertFrom-Json).vars.API_HOST
         if ($apiHost) {
             $HubUrl = "https://$apiHost"
@@ -168,9 +182,12 @@ Write-Host ''
 # intact and the script re-runnable; success shreds it below.
 # ---------------------------------------------------------------------------
 $tempPfx = Join-Path ([System.IO.Path]::GetTempPath()) ("{0}.{1}.pfx" -f $MachineId, [guid]::NewGuid())
-Copy-Item -LiteralPath $PfxPath -Destination $tempPfx -Force
 
 try {
+    # Inside try: a failed copy still hits finally, so a partial PFX in TEMP is
+    # cleaned up rather than left holding an exportable key.
+    Copy-Item -LiteralPath $PfxPath -Destination $tempPfx -Force
+
     # AC_PFX_PW must be PLAINTEXT: config.py:407 runs ConvertTo-SecureString
     # -AsPlainText on it. Using the env var rather than --pfx-password keeps the
     # secret out of the process table, where any other user could read it.
@@ -182,8 +199,9 @@ try {
 }
 finally {
     Remove-Item Env:\AC_PFX_PW -ErrorAction SilentlyContinue
-    # The CLI removes this on success; clean it up on every other path too, so a
-    # crash never leaves an exportable key in TEMP.
+    # The CLI removes this on success; clean it up on every other path too. This
+    # covers exceptions and normal failure - it cannot cover forced termination,
+    # reboot, or power loss, so TEMP is still worth checking after a hard crash.
     Remove-Item -LiteralPath $tempPfx -Force -ErrorAction SilentlyContinue
 }
 
