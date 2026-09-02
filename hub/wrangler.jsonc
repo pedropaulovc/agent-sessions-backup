@@ -23,13 +23,12 @@
   // the API's `changeset.removed` and never prints it, so the loss is silent,
   // in both TTY and CI. There is no --force and no --keep-routes.
   //
-  // The pedrovc.com.br pair is the migration target (Sessions moves off the
-  // vza.net zone, which leaves this account). Both pairs are listed while the
-  // cutover is in flight; drop the vza.net pair only once every collector has
-  // moved, and do it as its own deploy.
+  // The vza.net pair is GONE, not merely retired: the vza.net zone left this
+  // account with the registrar move on 2026-09-01 (zone 6a56cdda... is now
+  // status `moved`), so those two hostnames have no DNS records anywhere and
+  // cannot be re-attached from here - a cross-account Custom Domain is Error
+  // 1014. pedrovc.com.br is the only zone this Worker can serve.
   "routes": [
-    { "pattern": "api.sessions.vza.net", "custom_domain": true },
-    { "pattern": "sessions.vza.net", "custom_domain": true },
     { "pattern": "api.sessions.pedrovc.com.br", "custom_domain": true },
     { "pattern": "sessions.pedrovc.com.br", "custom_domain": true }
   ],
