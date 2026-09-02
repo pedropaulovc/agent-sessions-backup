@@ -3,12 +3,21 @@
 Re-enroll a Windows collector onto a new hub host after an mTLS zone move.
 
 .DESCRIPTION
-Cloudflare client certificates are ZONE-scoped. When `vza.net` left the account
-on 2026-09-01 the certs enrolled in that zone stopped being able to authenticate
-anywhere - so both Windows collectors are already down, and their config.toml
-still points at the retired `api.sessions.vza.net`. This script fixes both halves
-in one pass: it imports the replacement PFX into the Windows certificate store
-and rewrites the collector config to the new hub host.
+Cloudflare's client-certificate CA is ACCOUNT-scoped, not zone-scoped (measured
+2026-09-02: a cert minted in the departed `vza.net` zone still passes the edge's
+`cert_verified` check on `api.sessions.pedrovc.com.br`). So the old certs did NOT
+stop working when `vza.net` left the account on 2026-09-01. `hub/src/auth/identity.ts`
+matches them via `prev_cert_fp_sha256` and serves them from the `grace` slot, read-only
+with `is_admin` forced false, until the revoke timestamp - proven by
+`hub/test/auth.test.ts:95` ("drops admin power for an in-grace PREVIOUS cert").
+
+Both Windows collectors are down for a simpler reason: their `config.toml` still
+names `api.sessions.vza.net`, and that hostname stopped resolving when the zone
+moved. Repointing `hub_url` alone would therefore restore them read-only without
+any PFX import - a useful fallback, but it loses admin and expires at the revoke
+deadline. This script does the full job in one pass: it imports the replacement
+PFX into the Windows certificate store (promoting the box to the CURRENT slot,
+`is_admin` intact) and rewrites the collector config to the new hub host.
 
 Schannel cannot use file-based client certs, which is the entire reason this must
 run ON the box rather than from the migration host: the private key has to land
