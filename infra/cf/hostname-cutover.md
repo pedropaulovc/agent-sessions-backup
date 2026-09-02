@@ -1179,16 +1179,23 @@ section is the missing step.
 changes code), but every `main` push will fail its deploy job, and a future change that *does*
 need route reconciliation — a new host, a removed one — would silently not apply.
 
-**Fix (dashboard → My Profile → API Tokens → the deploy token → Edit; the token value is unchanged
-by a permission edit, so the GitHub secret does not need rotating):**
+**Fix — DONE 2026-09-02 ~03:40Z.** The token is `agent-sessions-production-deploy-routes`
+(id `ba5793413f34…`). Its first policy was `Workers Routes Write` on
+`com.cloudflare.api.account.zone.6a56cdda…` (`vza.net`); that one resource key was rewritten to
+`com.cloudflare.api.account.zone.ff45a32e…` (`pedrovc.com.br`) via
+`PUT /user/tokens/{id}` from the logged-in dashboard session, carrying every other field
+(the account-level policy, permission-group ids, name, status) verbatim. A permission edit does
+not change the token value, so the GitHub secret was not rotated and the update response carried
+no `value`. Read back after the PUT:
 
-| Permission | Scope |
-|---|---|
-| Zone · Workers Routes · Edit | Zone: `pedrovc.com.br` (replace the `vza.net` entry) |
+| Policy | Before | After |
+|---|---|---|
+| Workers Routes Write | zone `6a56cdda…` (`vza.net`) | zone `ff45a32e…` (`pedrovc.com.br`) |
+| Queues / R2 / KV / Workers Scripts Write, Account Settings Read | account `18ef3246…` | unchanged |
 
-Then re-run the failed job (`gh run rerun 33587349924 --failed`) and confirm `deploy` goes green.
-`Read` may be enough for the list call that failed, but custom-domain reconciliation writes; use
-Edit and, per `docs/dev-preview-redesign.md:461`, trim later with a sacrificial run if desired.
+Then `gh run rerun 33587349924 --failed`. `Read` might have sufficed for the list call that
+failed, but custom-domain reconciliation writes; Write was kept, and per
+`docs/dev-preview-redesign.md:461` it can be trimmed later with a sacrificial run.
 
 ### 8.2 FOLLOW-UP DEFECT (not part of this cutover, do not fix here)
 
