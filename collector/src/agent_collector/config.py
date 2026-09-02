@@ -415,9 +415,14 @@ def _pfx_import_ps(has_password: bool) -> str:
     )
 
 
-def _powershell_env(base: dict, pfx_path: str, password: str) -> dict:
-    """Environment for the powershell.exe child. The password rides in via the environment, never on
-    the command line, so it can't surface in a process listing or shell history.
+def desktop_powershell_env(base: dict) -> dict:
+    """Environment for ANY powershell.exe (Windows PowerShell 5.1) child we spawn. The single home
+    for the PSModulePath scrub — every call site must go through it, because the failure it prevents
+    is silent and call-site-specific: the PFX import lost ConvertTo-SecureString, and the doctor
+    cert-store probe lost the whole `Cert:` drive ("Cannot find drive. A drive with the name 'Cert'
+    does not exist"), which it then reported as the cert being MISSING while the very next check
+    authenticated to the hub with that cert (measured 2026-09-02, pwsh 7.6.5 -> python ->
+    powershell.exe 5.1: inherit => MISSING, dropped => 730 days to expiry).
 
     PSModulePath is DROPPED rather than inherited, because we are a NON-PowerShell process spawning
     Windows PowerShell 5.1. When pwsh (PowerShell 7) launches powershell.exe itself it rewrites
@@ -434,10 +439,14 @@ def _powershell_env(base: dict, pfx_path: str, password: str) -> dict:
     Popped case-insensitively: os.environ upper-cases keys on Windows ("PSMODULEPATH"), so an exact
     lookup silently misses on the only platform where this matters.
     """
-    env = {**base, "AC_PFX_PATH": str(Path(pfx_path).resolve()), "AC_PFX_PW": password}
-    for key in [k for k in env if k.upper() == "PSMODULEPATH"]:
-        del env[key]
-    return env
+    return {k: v for k, v in base.items() if k.upper() != "PSMODULEPATH"}
+
+
+def _powershell_env(base: dict, pfx_path: str, password: str) -> dict:
+    """Environment for the PFX-import powershell.exe child. The password rides in via the
+    environment, never on the command line, so it can't surface in a process listing or shell
+    history. PSModulePath handling lives in desktop_powershell_env."""
+    return {**desktop_powershell_env(base), "AC_PFX_PATH": str(Path(pfx_path).resolve()), "AC_PFX_PW": password}
 
 
 def _import_pfx_to_store(pfx_path: str, password: str | None) -> str:

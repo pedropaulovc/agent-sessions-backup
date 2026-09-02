@@ -206,7 +206,11 @@ $tempPfx = Join-Path ([System.IO.Path]::GetTempPath()) ("{0}.{1}.pfx" -f $Machin
 #
 # Restored in finally so the rest of this session is unaffected. The collector
 # carries the same fix, but this script must also work against a collector that is
-# already installed from an older revision.
+# already installed from an older revision - which is why `doctor` runs INSIDE the
+# try as well: its cert-store probe is another powershell.exe 5.1 child, and with
+# PS7's PSModulePath inherited 5.1 has no `Cert:` drive, so doctor reported the
+# freshly imported cert as MISSING (while authenticating to the hub with it) and
+# this script threw before removing the source PFX. Measured 2026-09-02.
 $savedModulePath = $env:PSModulePath
 
 try {
@@ -223,6 +227,11 @@ try {
     Write-Host '== importing PFX and writing collector config'
     & $collector enroll --hub $HubUrl --import-pfx $tempPfx --machine-id $MachineId
     Assert-NativeSuccess 'agent-collector enroll'
+
+    Write-Host ''
+    Write-Host '== verifying (cert must land in the CURRENT slot to keep is_admin)'
+    & $collector doctor --require-current-cert
+    Assert-NativeSuccess 'agent-collector doctor'
 }
 finally {
     Remove-Item Env:\AC_PFX_PW -ErrorAction SilentlyContinue
@@ -232,11 +241,6 @@ finally {
     # reboot, or power loss, so TEMP is still worth checking after a hard crash.
     Remove-Item -LiteralPath $tempPfx -Force -ErrorAction SilentlyContinue
 }
-
-Write-Host ''
-Write-Host '== verifying (cert must land in the CURRENT slot to keep is_admin)'
-& $collector doctor --require-current-cert
-Assert-NativeSuccess 'agent-collector doctor'
 
 if (-not $KeepPfx) {
     Write-Host ''

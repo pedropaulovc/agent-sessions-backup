@@ -508,3 +508,10 @@ def test_security_excludes_cannot_be_removed_by_user_config(tmp_path):
     assert "*auth.json*" in effective
     assert "**/cred-profiles/**" in effective
     assert "**/cache/**" in effective
+
+
+def test_desktop_powershell_env_is_the_shared_scrub():
+    # Both powershell.exe call sites (PFX import, doctor cert probe) must share one scrub so no site
+    # can inherit PS7's PSModulePath by accident. Case-insensitive, everything else untouched.
+    env = config.desktop_powershell_env({"PSMODULEPATH": r"C:\ps7", "PSModulePath": r"C:\ps7b", "PATH": "x"})
+    assert env == {"PATH": "x"}
