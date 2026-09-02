@@ -311,24 +311,35 @@ API — read the custom-rules entrypoint ruleset, then PUT the union of its exis
 one (same replace-semantics trap as §1):
 
 ```bash
-# 2a. read existing custom rules
+# 2a. read existing custom rules. This endpoint's PUT REPLACES the entire `rules`
+# array - anything absent from the payload is DELETED. Same trap as §1.
 curl -sS -X GET "$CF_API/zones/$NEW_ZONE/rulesets/phases/http_request_firewall_custom/entrypoint" \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq '.result.rules'
+  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq '.result.rules' > rules.json
+cat rules.json          # REVIEW: every rule here must survive step 2c
 
-# 2b. PUT existing rules PLUS the mTLS rule
+# 2b. build the union. Existing rules are carried verbatim except for the three
+# server-managed fields, which the API rejects on write; `action_parameters` and
+# `logging` MUST be preserved or a skip/challenge rule silently loses its config.
+# Filtering on our own description makes a re-run replace rather than duplicate, so DESC MUST equal
+# the description actually deployed - verified live 2026-09-02. Change it and the filter misses,
+# leaving two block rules with the same effect.
+DESC="mTLS required api.sessions.pedrovc.com.br"
+NEWRULE=$(jq -n --arg h "api.sessions.pedrovc.com.br" --arg d "$DESC" '{
+  action: "block", description: $d, enabled: true,
+  expression: "(http.host eq \"\($h)\" and (not cf.tls_client_auth.cert_verified or cf.tls_client_auth.cert_revoked))"
+}')
+# Cloudflare normalizes the stored expression - it strips these outer parentheses, so the live rule
+# reads `http.host eq "..." and (not ...)`. That is the same rule, not drift.
+jq --arg d "$DESC" --argjson new "$NEWRULE" '
+  { rules: ((. // []) | map(select(.description != $d) | del(.id, .version, .last_updated)) + [$new]) }
+' rules.json > put.json
+jq -r '.rules[] | "\(.action)\t\(.description)"' put.json   # REVIEW before sending
+
+# 2c. PUT the union
 curl -sS -X PUT "$CF_API/zones/$NEW_ZONE/rulesets/phases/http_request_firewall_custom/entrypoint" \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  --data '{
-    "rules": [
-      {
-        "action": "block",
-        "description": "api.sessions.pedrovc.com.br requires a verified, unrevoked client cert",
-        "enabled": true,
-        "expression": "(http.host eq \"api.sessions.pedrovc.com.br\" and (not cf.tls_client_auth.cert_verified or cf.tls_client_auth.cert_revoked))"
-      }
-    ]
-  }' | jq '.success, .result.rules[].description'
+  -H "Content-Type: application/json" --data @put.json \
+  | jq '.success, [.result.rules[].description]'
 ```
 
 ### 2.1 Is the WAF rule load-bearing? No — verdict and proof
@@ -666,12 +677,29 @@ unrevoked reservation to clash with a new fingerprint.
 
 ### 6.2 Recommended: new fingerprint as CURRENT, old demoted to grace
 
-One statement per machine, CAS-guarded on the old fingerprint so it is idempotent and cannot fire
-twice. Mirrors `hub/src/api/certs.ts:484-489`.
+One statement per machine, guarded on the *observed* pre-rotation state so a re-run cannot fire
+twice. `AND cert_fp_sha256 <> '$NEWFP'` is NOT such a guard — it only stops an immediate repeat of
+the same rotation. Run it after any *other* rotation and it demotes that newer current cert into
+the grace slot and restores this staged one as current. Bind the old values instead.
+
+This is weaker than `hub/src/api/certs.ts:478-489`, which CASes on the full observed row
+(`cert_fp`, `cert_id`, `prev_fp`, `prev_id`, `revoke_at`) via `rotationCas` and 409s on any drift.
+Pinning fp AND id is the floor: a NULL `cert_id` beside a matching fingerprint is a different
+state, and moving it into the prev slot is the exact stale-value bug that comment describes.
 
 ```bash
+# Pin the observed pre-rotation state. Empty string means SQL NULL: `IS nullif(...)` is NULL-safe
+# equality, so a NULL cert_id is matched deliberately rather than by accident.
+cd /home/pedro/src/agent-sessions-backup/hub
+npx wrangler d1 execute sessions-index --remote --profile sessions-prod --json --command \
+  "SELECT machine_id, cert_fp_sha256, cert_id FROM machines ORDER BY machine_id" \
+  | jq -r '.[0].results[] | [.machine_id, (.cert_fp_sha256 // ""), (.cert_id // "")] | @tsv' \
+  > "$MTLS/observed.tsv"
 cd "$MTLS"
-for m in amet-windows amet-wsl vm-solidworks-windows; do
+cat observed.tsv    # REVIEW: the guard will REQUIRE exactly these values
+
+while IFS=$'\t' read -r m OLDFP OLDID; do
+  case " amet-windows amet-wsl vm-solidworks-windows " in *" $m "*) ;; *) continue;; esac
   NEWFP=$(cat "$m.fp"); NEWID=$(cat "$m.cert_id")
   echo "UPDATE machines
            SET prev_cert_fp_sha256 = cert_fp_sha256,
@@ -680,8 +708,9 @@ for m in amet-windows amet-wsl vm-solidworks-windows; do
                cert_fp_sha256      = '$NEWFP',
                cert_id             = '$NEWID'
          WHERE machine_id = '$m'
-           AND cert_fp_sha256 <> '$NEWFP';"
-done > swap.sql
+           AND cert_fp_sha256 IS nullif('$OLDFP','')
+           AND cert_id        IS nullif('$OLDID','');"
+done < observed.tsv > swap.sql
 cat swap.sql        # REVIEW before running
 cd /home/pedro/src/agent-sessions-backup/hub
 npx wrangler d1 execute sessions-index --remote --profile sessions-prod --file "$MTLS/swap.sql"
@@ -690,6 +719,10 @@ npx wrangler d1 execute sessions-index --remote --profile sessions-prod --file "
 `+7 days` matches `CERT_GRACE_DAYS = 7` (`hub/src/api/certs.ts:8`). The timestamp format
 `%Y-%m-%dT%H:%M:%fZ` is required — `identity.ts:96` compares it lexicographically against the same
 `strftime` format.
+
+Check the reported `changes` per statement. A machine reporting **0** means the row drifted between
+the read and the write — someone else rotated, or `observed.tsv` is stale. Re-read and regenerate;
+do NOT relax the guard to force it through, which is what re-running with `<>` used to do.
 
 Verify:
 
