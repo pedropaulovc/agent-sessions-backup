@@ -307,25 +307,37 @@ curl -sS -X GET "$CF_API/zones/$NEW_ZONE/certificate_authorities/hostname_associ
 
 # 1b. PUT the UNION of whatever 1a returned PLUS the new host.
 #     If 1a returned [] or null, this exact body is correct as written.
-curl -sS -X PUT "$CF_API/zones/$NEW_ZONE/certificate_authorities/hostname_associations" \
+curl -fsS -X PUT "$CF_API/zones/$NEW_ZONE/certificate_authorities/hostname_associations" \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
   -H "Content-Type: application/json" \
   --data '{"hostnames":["api.sessions.pedrovc.com.br"]}' \
-  | jq '.success, .result.hostnames'
+  | jq -e 'if .success == true then .result.hostnames else error("association PUT failed: \(.errors)") end'
 ```
 
-If 1a returned a non-empty list, build the union mechanically instead of by hand:
+If 1a returned a non-empty list, build the union mechanically instead of by hand. The read MUST
+fail closed: this PUT replaces the complete set, so a read that degrades a failed GET into `[]`
+would silently strip mTLS from every sibling host on the zone. `curl -f` rejects HTTP errors,
+`jq -e` rejects `success:false` and a non-array `hostnames` (an absent key on a brand-new zone is
+the one legitimate empty case, hence the explicit `null` branch), and `set -o pipefail` (or checking
+`$?`) is what stops an empty `assoc.json` from reaching the PUT:
 
 ```bash
-curl -sS -X GET "$CF_API/zones/$NEW_ZONE/certificate_authorities/hostname_associations" \
+set -o pipefail
+curl -fsS -X GET "$CF_API/zones/$NEW_ZONE/certificate_authorities/hostname_associations" \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
-  | jq '{hostnames: ((.result.hostnames // []) + ["api.sessions.pedrovc.com.br"] | unique)}' \
+  | jq -e 'if .success != true then error("association read failed: \(.errors)")
+           elif (.result.hostnames | type) == "null" then []
+           elif (.result.hostnames | type) == "array" then .result.hostnames
+           else error("association read returned \(.result.hostnames | type), not an array")
+           end
+           | {hostnames: ((. + ["api.sessions.pedrovc.com.br"]) | unique)}' \
   > /tmp/mtls-reenroll/assoc.json
 cat /tmp/mtls-reenroll/assoc.json     # REVIEW: this list becomes the complete set
-curl -sS -X PUT "$CF_API/zones/$NEW_ZONE/certificate_authorities/hostname_associations" \
+curl -fsS -X PUT "$CF_API/zones/$NEW_ZONE/certificate_authorities/hostname_associations" \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
   -H "Content-Type: application/json" \
-  --data @/tmp/mtls-reenroll/assoc.json | jq '.success, .result.hostnames'
+  --data @/tmp/mtls-reenroll/assoc.json \
+  | jq -e 'if .success == true then .result.hostnames else error("association PUT failed: \(.errors)") end'
 ```
 
 Expected 200 body: `{"success": true, "result": {"hostnames": ["api.sessions.pedrovc.com.br"]}}`.
@@ -368,9 +380,16 @@ one (same replace-semantics trap as §1):
 
 ```bash
 # 2a. read existing custom rules. This endpoint's PUT REPLACES the entire `rules`
-# array - anything absent from the payload is DELETED. Same trap as §1.
-curl -sS -X GET "$CF_API/zones/$NEW_ZONE/rulesets/phases/http_request_firewall_custom/entrypoint" \
-  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" | jq '.result.rules' > rules.json
+# array - anything absent from the payload is DELETED. Same trap as §1, so the read
+# MUST fail closed: `curl -f` rejects HTTP errors, `jq -e` rejects success:false and a
+# non-array `.result.rules`, and pipefail stops an empty rules.json reaching 2b/2c. A
+# read that degraded an API error into [] would make 2c delete every other custom rule.
+set -o pipefail
+curl -fsS -X GET "$CF_API/zones/$NEW_ZONE/rulesets/phases/http_request_firewall_custom/entrypoint" \
+  -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  | jq -e 'if .success == true and (.result.rules | type) == "array" then .result.rules
+           else error("WAF rules read failed: success=\(.success) rules=\(.result.rules | type) errors=\(.errors)")
+           end' > rules.json
 cat rules.json          # REVIEW: every rule here must survive step 2c
 
 # 2b. build the union. Existing rules are carried verbatim except for the three
@@ -386,16 +405,20 @@ NEWRULE=$(jq -n --arg h "api.sessions.pedrovc.com.br" --arg d "$DESC" '{
 }')
 # Cloudflare normalizes the stored expression - it strips these outer parentheses, so the live rule
 # reads `http.host eq "..." and (not ...)`. That is the same rule, not drift.
-jq --arg d "$DESC" --argjson new "$NEWRULE" '
-  { rules: ((. // []) | map(select(.description != $d) | del(.id, .version, .last_updated)) + [$new]) }
+# `-e` + the type check: an empty or non-array rules.json (2a failed) aborts here instead
+# of degrading to a one-rule payload.
+jq -e --arg d "$DESC" --argjson new "$NEWRULE" '
+  if type != "array" then error("rules.json is not an array - 2a failed, do not PUT") else . end
+  | { rules: (map(select(.description != $d) | del(.id, .version, .last_updated)) + [$new]) }
 ' rules.json > put.json
 jq -r '.rules[] | "\(.action)\t\(.description)"' put.json   # REVIEW before sending
 
-# 2c. PUT the union
-curl -sS -X PUT "$CF_API/zones/$NEW_ZONE/rulesets/phases/http_request_firewall_custom/entrypoint" \
+# 2c. PUT the union. Fail loudly on an unsuccessful write too.
+curl -fsS -X PUT "$CF_API/zones/$NEW_ZONE/rulesets/phases/http_request_firewall_custom/entrypoint" \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
   -H "Content-Type: application/json" --data @put.json \
-  | jq '.success, [.result.rules[].description]'
+  | jq -e 'if .success == true then [.result.rules[].description]
+           else error("WAF rules PUT failed: \(.errors)") end'
 ```
 
 ### 2.1 Is the WAF rule load-bearing? No — verdict and proof
@@ -739,24 +762,39 @@ twice. `AND cert_fp_sha256 <> '$NEWFP'` is NOT such a guard — it only stops an
 the same rotation. Run it after any *other* rotation and it demotes that newer current cert into
 the grace slot and restores this staged one as current. Bind the old values instead.
 
-This is weaker than `hub/src/api/certs.ts:478-489`, which CASes on the full observed row
-(`cert_fp`, `cert_id`, `prev_fp`, `prev_id`, `revoke_at`) via `rotationCas` and 409s on any drift.
-Pinning fp AND id is the floor: a NULL `cert_id` beside a matching fingerprint is a different
-state, and moving it into the prev slot is the exact stale-value bug that comment describes.
+**This statement refuses to run against a machine that is mid-grace.** Pinning `cert_fp` + `cert_id`
+alone is not enough: a machine whose current pair still matches but whose `prev_*` slot is occupied
+would have that displaced cert overwritten, and unlike `renewCert` (`hub/src/api/certs.ts:478-489`,
+which CASes on the full observed row via `rotationCas` **and** co-commits a `retired_certs` INSERT
+for the displaced prev) nothing here queues it for retirement — it would simply be orphaned, never
+revoked. Even a five-column CAS would only make that clobber deterministic, not correct. So the
+`WHERE` additionally requires `prev_cert_fp_sha256`, `prev_cert_id` and `cert_revoke_at` to all be
+`NULL`: the only state this one-shot migration swap is written for is a clean grace slot. If a
+machine is mid-grace, wait for `cert_revoke_at` to pass (or let the collector's own renew path run,
+which handles the queueing) — do not widen the guard.
 
 ```bash
-# Pin the observed pre-rotation state. Empty string means SQL NULL: `IS nullif(...)` is NULL-safe
-# equality, so a NULL cert_id is matched deliberately rather than by accident.
+# Pin the observed pre-rotation state, INCLUDING the grace slot. Empty string means SQL NULL:
+# `IS nullif(...)` is NULL-safe equality, so a NULL cert_id is matched deliberately rather than by
+# accident. The three prev columns are read so the REVIEW line shows mid-grace BEFORE the write.
+# `|`-separated, NOT tab: bash `read` collapses runs of IFS whitespace, so an empty middle column
+# (a NULL cert_id) would shift every later field one slot left. `|` is not whitespace.
 cd /home/pedro/src/agent-sessions-backup/hub
 npx wrangler d1 execute sessions-index --remote --profile sessions-prod --json --command \
-  "SELECT machine_id, cert_fp_sha256, cert_id FROM machines ORDER BY machine_id" \
-  | jq -r '.[0].results[] | [.machine_id, (.cert_fp_sha256 // ""), (.cert_id // "")] | @tsv' \
-  > "$MTLS/observed.tsv"
+  "SELECT machine_id, cert_fp_sha256, cert_id, prev_cert_fp_sha256, prev_cert_id, cert_revoke_at FROM machines ORDER BY machine_id" \
+  | jq -r '.[0].results[] | [.machine_id, (.cert_fp_sha256 // ""), (.cert_id // ""),
+                             (.prev_cert_fp_sha256 // ""), (.prev_cert_id // ""), (.cert_revoke_at // "")] | join("|")' \
+  > "$MTLS/observed.psv"
 cd "$MTLS"
-cat observed.tsv    # REVIEW: the guard will REQUIRE exactly these values
+cat observed.psv    # REVIEW: columns 4-6 MUST be empty for every machine you intend to rotate;
+                    # a populated prev slot means mid-grace and the statement below will not fire.
 
-while IFS=$'\t' read -r m OLDFP OLDID; do
+while IFS='|' read -r m OLDFP OLDID PREVFP PREVID REVOKEAT; do
   case " amet-windows amet-wsl vm-solidworks-windows " in *" $m "*) ;; *) continue;; esac
+  if [ -n "$PREVFP$PREVID$REVOKEAT" ]; then
+    echo "-- $m: SKIPPED, mid-grace (prev=$PREVFP id=$PREVID revoke_at=$REVOKEAT)"
+    continue
+  fi
   NEWFP=$(cat "$m.fp"); NEWID=$(cat "$m.cert_id")
   echo "UPDATE machines
            SET prev_cert_fp_sha256 = cert_fp_sha256,
@@ -765,10 +803,13 @@ while IFS=$'\t' read -r m OLDFP OLDID; do
                cert_fp_sha256      = '$NEWFP',
                cert_id             = '$NEWID'
          WHERE machine_id = '$m'
-           AND cert_fp_sha256 IS nullif('$OLDFP','')
-           AND cert_id        IS nullif('$OLDID','');"
-done < observed.tsv > swap.sql
-cat swap.sql        # REVIEW before running
+           AND cert_fp_sha256      IS nullif('$OLDFP','')
+           AND cert_id             IS nullif('$OLDID','')
+           AND prev_cert_fp_sha256 IS NULL
+           AND prev_cert_id        IS NULL
+           AND cert_revoke_at      IS NULL;"
+done < observed.psv > swap.sql
+cat swap.sql        # REVIEW before running - every intended machine must have an UPDATE, not a SKIPPED line
 cd /home/pedro/src/agent-sessions-backup/hub
 npx wrangler d1 execute sessions-index --remote --profile sessions-prod --file "$MTLS/swap.sql"
 ```
@@ -777,9 +818,12 @@ npx wrangler d1 execute sessions-index --remote --profile sessions-prod --file "
 `%Y-%m-%dT%H:%M:%fZ` is required — `identity.ts:96` compares it lexicographically against the same
 `strftime` format.
 
-Check the reported `changes` per statement. A machine reporting **0** means the row drifted between
-the read and the write — someone else rotated, or `observed.tsv` is stale. Re-read and regenerate;
-do NOT relax the guard to force it through, which is what re-running with `<>` used to do.
+Check the reported `changes` per statement. A machine reporting **0** means either the row drifted
+between the read and the write (someone else rotated, or `observed.psv` is stale) **or** the machine
+entered grace since the read. Re-read and regenerate; do NOT relax the guard to force it through,
+which is what re-running with `<>` used to do. This block deliberately cannot rotate a machine
+mid-grace — as of 2026-09-02 all three fleet machines are mid-grace from this very migration, so
+re-running it today produces three `SKIPPED` lines and an empty swap, which is the correct outcome.
 
 Verify:
 
