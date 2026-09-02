@@ -318,8 +318,10 @@ If 1a returned a non-empty list, build the union mechanically instead of by hand
 fail closed: this PUT replaces the complete set, so a read that degrades a failed GET into `[]`
 would silently strip mTLS from every sibling host on the zone. `curl -f` rejects HTTP errors,
 `jq -e` rejects `success:false` and a non-array `hostnames` (an absent key on a brand-new zone is
-the one legitimate empty case, hence the explicit `null` branch), and `set -o pipefail` (or checking
-`$?`) is what stops an empty `assoc.json` from reaching the PUT:
+the one legitimate empty case, hence the explicit `null` branch). `set -o pipefail` only makes the
+read's failure visible in `$?` — in a pasted interactive shell the next line still runs — so the
+PUT is gated with `&&` on `assoc.json` actually holding an array, which is what prevents an
+empty body reaching the API:
 
 ```bash
 set -o pipefail
@@ -333,6 +335,8 @@ curl -fsS -X GET "$CF_API/zones/$NEW_ZONE/certificate_authorities/hostname_assoc
            | {hostnames: ((. + ["api.sessions.pedrovc.com.br"]) | unique)}' \
   > /tmp/mtls-reenroll/assoc.json
 cat /tmp/mtls-reenroll/assoc.json     # REVIEW: this list becomes the complete set
+# The `&&` gate is the guard: a failed read leaves assoc.json empty and the PUT never runs.
+jq -e '.hostnames | type == "array"' /tmp/mtls-reenroll/assoc.json >/dev/null && \
 curl -fsS -X PUT "$CF_API/zones/$NEW_ZONE/certificate_authorities/hostname_associations" \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
   -H "Content-Type: application/json" \
@@ -382,8 +386,9 @@ one (same replace-semantics trap as §1):
 # 2a. read existing custom rules. This endpoint's PUT REPLACES the entire `rules`
 # array - anything absent from the payload is DELETED. Same trap as §1, so the read
 # MUST fail closed: `curl -f` rejects HTTP errors, `jq -e` rejects success:false and a
-# non-array `.result.rules`, and pipefail stops an empty rules.json reaching 2b/2c. A
-# read that degraded an API error into [] would make 2c delete every other custom rule.
+# non-array `.result.rules`. pipefail only surfaces that in `$?` - a pasted shell keeps
+# going - so 2b refuses a non-array rules.json and 2c is `&&`-gated on put.json holding
+# rules. A read that degraded an API error into [] would make 2c delete every other rule.
 set -o pipefail
 curl -fsS -X GET "$CF_API/zones/$NEW_ZONE/rulesets/phases/http_request_firewall_custom/entrypoint" \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
@@ -413,7 +418,9 @@ jq -e --arg d "$DESC" --argjson new "$NEWRULE" '
 ' rules.json > put.json
 jq -r '.rules[] | "\(.action)\t\(.description)"' put.json   # REVIEW before sending
 
-# 2c. PUT the union. Fail loudly on an unsuccessful write too.
+# 2c. PUT the union, gated on put.json actually holding rules (2b failed => empty file =>
+# the PUT never runs). Fail loudly on an unsuccessful write too.
+jq -e '.rules | type == "array" and length > 0' put.json >/dev/null && \
 curl -fsS -X PUT "$CF_API/zones/$NEW_ZONE/rulesets/phases/http_request_firewall_custom/entrypoint" \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
   -H "Content-Type: application/json" --data @put.json \
@@ -810,6 +817,7 @@ while IFS='|' read -r m OLDFP OLDID PREVFP PREVID REVOKEAT; do
            AND cert_revoke_at      IS NULL;"
 done < observed.psv > swap.sql
 cat swap.sql        # REVIEW before running - every intended machine must have an UPDATE, not a SKIPPED line
+grep -q '^UPDATE' swap.sql || { echo "nothing to rotate - stop here, do not execute"; false; }
 cd /home/pedro/src/agent-sessions-backup/hub
 npx wrangler d1 execute sessions-index --remote --profile sessions-prod --file "$MTLS/swap.sql"
 ```
@@ -823,7 +831,8 @@ between the read and the write (someone else rotated, or `observed.psv` is stale
 entered grace since the read. Re-read and regenerate; do NOT relax the guard to force it through,
 which is what re-running with `<>` used to do. This block deliberately cannot rotate a machine
 mid-grace — as of 2026-09-02 all three fleet machines are mid-grace from this very migration, so
-re-running it today produces three `SKIPPED` lines and an empty swap, which is the correct outcome.
+re-running it today produces three `SKIPPED` lines and no `UPDATE`, and the `grep` guard stops
+before `wrangler d1 execute` (a comments-only file was never tested against it; don't).
 
 Verify:
 
