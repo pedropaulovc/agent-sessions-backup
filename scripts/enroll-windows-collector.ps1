@@ -183,6 +183,23 @@ Write-Host ''
 # ---------------------------------------------------------------------------
 $tempPfx = Join-Path ([System.IO.Path]::GetTempPath()) ("{0}.{1}.pfx" -f $MachineId, [guid]::NewGuid())
 
+# The collector is a Python process that shells out to powershell.exe - Windows
+# PowerShell 5.1 - to run ConvertTo-SecureString, forwarding its own environment.
+# If THIS shell is pwsh 7, that environment carries PS7's PSModulePath, in which
+# "c:\program files\powershell\7\Modules" precedes the 5.1 system path. PS7 ships a
+# .NET-Core-only Microsoft.PowerShell.Security manifest there, so 5.1 resolves it
+# first, cannot load it, and the import dies with CouldNotAutoloadMatchingModule.
+#
+# Note pwsh rewrites PSModulePath when IT launches powershell.exe, so testing that
+# pair directly shows no problem - it is the intermediate Python process that
+# defeats the fixup. Measured on this box: pwsh 7.6.5 -> python -> powershell.exe
+# 5.1.26100 fails inheriting, succeeds with the variable removed.
+#
+# Restored in finally so the rest of this session is unaffected. The collector
+# carries the same fix, but this script must also work against a collector that is
+# already installed from an older revision.
+$savedModulePath = $env:PSModulePath
+
 try {
     # Inside try: a failed copy still hits finally, so a partial PFX in TEMP is
     # cleaned up rather than left holding an exportable key.
@@ -192,6 +209,7 @@ try {
     # -AsPlainText on it. Using the env var rather than --pfx-password keeps the
     # secret out of the process table, where any other user could read it.
     $env:AC_PFX_PW = $pfxPassword
+    Remove-Item Env:\PSModulePath -ErrorAction SilentlyContinue
 
     Write-Host '== importing PFX and writing collector config'
     & $collector enroll --hub $HubUrl --import-pfx $tempPfx --machine-id $MachineId
@@ -199,6 +217,7 @@ try {
 }
 finally {
     Remove-Item Env:\AC_PFX_PW -ErrorAction SilentlyContinue
+    if ($null -ne $savedModulePath) { $env:PSModulePath = $savedModulePath }
     # The CLI removes this on success; clean it up on every other path too. This
     # covers exceptions and normal failure - it cannot cover forced termination,
     # reboot, or power loss, so TEMP is still worth checking after a hard crash.

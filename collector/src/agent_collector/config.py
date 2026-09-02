@@ -415,11 +415,35 @@ def _pfx_import_ps(has_password: bool) -> str:
     )
 
 
+def _powershell_env(base: dict, pfx_path: str, password: str) -> dict:
+    """Environment for the powershell.exe child. The password rides in via the environment, never on
+    the command line, so it can't surface in a process listing or shell history.
+
+    PSModulePath is DROPPED rather than inherited, because we are a NON-PowerShell process spawning
+    Windows PowerShell 5.1. When pwsh (PowerShell 7) launches powershell.exe itself it rewrites
+    PSModulePath for the Desktop edition, so that chain is safe — but when pwsh launches *us* and we
+    forward os.environ verbatim, 5.1 receives PS7's list, whose `c:\\program files\\powershell\\7\\
+    Modules` precedes `C:\\WINDOWS\\system32\\WindowsPowerShell\\v1.0\\Modules`. PS7 ships a
+    .NET-Core-only `Microsoft.PowerShell.Security` manifest there, 5.1 resolves it FIRST, cannot load
+    it, and ConvertTo-SecureString vanishes with `CouldNotAutoloadMatchingModule`.
+
+    Do not "simplify" this away after observing that pwsh -> powershell.exe works directly; the
+    intermediate process is what defeats the fixup. Measured on this exact chain: pwsh 7.6.5 ->
+    python -> powershell.exe 5.1.26100 gives rc=1 inheriting, rc=0 with the variable removed.
+
+    Popped case-insensitively: os.environ upper-cases keys on Windows ("PSMODULEPATH"), so an exact
+    lookup silently misses on the only platform where this matters.
+    """
+    env = {**base, "AC_PFX_PATH": str(Path(pfx_path).resolve()), "AC_PFX_PW": password}
+    for key in [k for k in env if k.upper() == "PSMODULEPATH"]:
+        del env[key]
+    return env
+
+
 def _import_pfx_to_store(pfx_path: str, password: str | None) -> str:
     """Windows only: import a PFX into Cert:\\CurrentUser\\My and return its SHA-1 thumbprint. The
     private key is imported NON-exportable (Import-PfxCertificate's default) — the software-key
-    hardening schannel gives us for free. The password rides in via the environment, never on the
-    command line, so it can't surface in a process listing or shell history."""
+    hardening schannel gives us for free."""
     if not sys.platform.startswith("win"):
         raise RuntimeError(
             "--import-pfx imports into the Windows certificate store and is Windows-only; on POSIX "
@@ -429,10 +453,9 @@ def _import_pfx_to_store(pfx_path: str, password: str | None) -> str:
     # argv/shell history entirely), else none for a password-less PFX.
     pw = password if password is not None else os.environ.get("AC_PFX_PW", "")
     ps = _pfx_import_ps(has_password=bool(pw))
-    env = {**os.environ, "AC_PFX_PATH": str(Path(pfx_path).resolve()), "AC_PFX_PW": pw}
     proc = subprocess.run(
         ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
-        capture_output=True, text=True, env=env,
+        capture_output=True, text=True, env=_powershell_env(os.environ, pfx_path, pw),
     )
     thumb = proc.stdout.strip().splitlines()[-1].strip() if proc.stdout.strip() else ""
     if proc.returncode != 0 or not thumb:
