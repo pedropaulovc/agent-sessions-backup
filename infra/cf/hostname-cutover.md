@@ -1243,6 +1243,48 @@ rather than terminal. Options, roughly in order of preference:
 Note that option 3 alone would change the behaviour §8.1 relies on being *harmless*, so whoever
 takes this should re-read §8.1 first.
 
+### 8.3 Post-merge: the CI deploy token is zone-scoped to `vza.net` and must be re-scoped
+
+**Found by the first `main` deploy after PR #146 merged (run 33587349924, 2026-09-02 03:33Z).**
+The Worker upload succeeded — version `a4f0ff91` went live with the right `API_HOST`/`VIEWER_HOST`
+and both hosts kept serving — and then `wrangler deploy` failed on the step after the upload:
+
+```text
+✘ [ERROR] A request to the Cloudflare API (/zones/ff45a32e60c41cefd2fe5ff1c8eb61fb/workers/routes) failed.
+  Authentication error [code: 10000]
+📎 It looks like you are authenticating Wrangler via a custom API token set in an environment variable.
+```
+
+`hub/wrangler.jsonc:31-33` declares the two hosts as `custom_domain` routes, so after every upload
+wrangler reconciles routes on the zone that owns them — now `pedrovc.com.br`
+(`ff45a32e…`). The GitHub Actions secret `CLOUDFLARE_DEPLOY_TOKEN` was minted with "Workers
+Scripts Edit plus only the empirically required existing-binding and `vza.net` route permissions"
+(`docs/dev-preview-redesign.md:430`); the `vza.net` zone has since left this account, so the token
+has no zone grant at all on the zone the routes live in. Nothing in this runbook flipped it — this
+section is the missing step.
+
+**Impact:** none on traffic (the custom domains were already correct and the upload is what
+changes code), but every `main` push will fail its deploy job, and a future change that *does*
+need route reconciliation — a new host, a removed one — would silently not apply.
+
+**Fix — DONE 2026-09-02 ~03:40Z.** The token is `agent-sessions-production-deploy-routes`
+(id `ba5793413f34…`). Its first policy was `Workers Routes Write` on
+`com.cloudflare.api.account.zone.6a56cdda…` (`vza.net`); that one resource key was rewritten to
+`com.cloudflare.api.account.zone.ff45a32e…` (`pedrovc.com.br`) via
+`PUT /user/tokens/{id}` from the logged-in dashboard session, carrying every other field
+(the account-level policy, permission-group ids, name, status) verbatim. A permission edit does
+not change the token value, so the GitHub secret was not rotated and the update response carried
+no `value`. Read back after the PUT:
+
+| Policy | Before | After |
+|---|---|---|
+| Workers Routes Write | zone `6a56cdda…` (`vza.net`) | zone `ff45a32e…` (`pedrovc.com.br`) |
+| Queues / R2 / KV / Workers Scripts Write, Account Settings Read | account `18ef3246…` | unchanged |
+
+Then `gh run rerun 33587349924 --failed`. `Read` might have sufficed for the list call that
+failed, but custom-domain reconciliation writes; Write was kept, and per
+`docs/dev-preview-redesign.md:461` it can be trimmed later with a sacrificial run.
+
 ---
 
 # CORRECTION + COMPLETION LOG (verified live 2026-09-01)
