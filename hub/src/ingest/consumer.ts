@@ -1869,6 +1869,9 @@ async function writeSession(
   retention: 'prefix' | 'off' = 'prefix',
 ): Promise<number> {
   const db = env.DB;
+  // Shared by ordinary parses AND export slices: invalidate before any partial rewrite is visible.
+  // Random generations also prevent an old rollup page committing after delete/recreate of this id.
+  const rollupGeneration = crypto.randomUUID();
 
   const pending = buildBlockRows(s);
   const pendingUsage = buildUsageRows(s);
@@ -1880,6 +1883,9 @@ async function writeSession(
   // matches every row of the session, `turn_index >= 0` every usage row), so the fallback is not a
   // second code path to keep correct — it is this one with an empty prefix.
   const clearRes = await db.batch([
+    db.prepare('DELETE FROM session_rollup_state WHERE session_id = ?1').bind(s.id),
+    db.prepare(`INSERT INTO session_rollup_state (session_id, generation, eligible)
+      VALUES (?1, ?2, 0)`).bind(s.id, rollupGeneration),
     db
       .prepare(
         `INSERT INTO blocks_fts (blocks_fts, rowid, text)
@@ -1893,9 +1899,9 @@ async function writeSession(
   // divergent tail, not the whole session. Both deletes count when deciding whether the session
   // already existed: a transcript of usage-only turns (codex retains those) has usage rows and NO
   // blocks, so keying off blocks alone would label every one of its re-parses 'initial'.
-  const priorBlocks = clearRes[1]?.meta?.changes ?? 0;
+  const priorBlocks = clearRes[3]?.meta?.changes ?? 0;
   // The usage deletes are a variable-length tail of the batch (chunked under the parameter cap).
-  const priorUsage = clearRes.slice(2).reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
+  const priorUsage = clearRes.slice(4).reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
 
   const insertBlock = db.prepare(
     `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, byte_start, byte_len, truncated, text, on_main_path, row_hash)
@@ -2208,6 +2214,11 @@ async function writeSession(
           s.parentSessionLink ?? 'unknown',
         ),
       ...starReconciliation,
+      db.prepare(`UPDATE session_rollup_state SET eligible = 1
+        WHERE session_id = ?1 AND generation = ?2
+          AND EXISTS (SELECT 1 FROM sessions WHERE session_id = ?1 AND index_state = 'ready')
+          AND EXISTS (SELECT 1 FROM files WHERE id = ?3 AND content_hash = ?4)`)
+        .bind(s.id, rollupGeneration, file.id, file.content_hash),
     ]);
 
     finalizeRows = sumRowsWritten(finalizeRes);

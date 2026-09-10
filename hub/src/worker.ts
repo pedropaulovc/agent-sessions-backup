@@ -1,6 +1,7 @@
 import { runModelPriceSync } from './cron/model-prices';
 import { runDailyPricing } from './cron/pricing';
 import { runDailyPrune, runPrune } from './cron/prune';
+import { runDailySessionRollup } from './cron/session-rollup';
 import { runWatchdog } from './cron/watchdog';
 import { consumeParseBatch } from './ingest/consumer';
 import { route } from './router';
@@ -33,8 +34,10 @@ export default {
 
     ctx.waitUntil(runPrune(env));
     ctx.waitUntil(runDailyPrune(env));
+    // Block-only accounting has no dependency on the pricing catalog or its upstream network.
+    ctx.waitUntil(runDailySessionRollup(env));
     // Refresh model pricing from LiteLLM (ccusage's source), THEN fill in `usage.usd` for rows
-    // that still have none. Chained rather than a third waitUntil: the pass reads the catalog the
+    // that still have none. Chained rather than independent waitUntil: the pass reads the catalog the
     // sync just wrote, so running them concurrently would price today's rows against yesterday's
     // rates and, worse, mark a model that upstream published TODAY as unpriceable for another
     // full day. `.then` and not `await` — the two prunes above should not queue behind this.

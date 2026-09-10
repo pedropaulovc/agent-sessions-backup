@@ -4,6 +4,7 @@ import worker from '../src/index';
 import { CC_SESSION_ID, ccAssistantLine, ccNoiseLines, ccUserLine } from './fixtures';
 import { API, VIEWER } from './hosts';
 import { PRICING_VERSION } from '../src/pricing-pass';
+import { runSessionRollup } from '../src/session-rollup';
 
 const testEnv = env as unknown as Env;
 
@@ -122,6 +123,11 @@ describe('ingest pipeline end-to-end', () => {
   });
 
   it('is idempotent: unchanged re-upload is a no-op; changed re-upload replaces rows without duplication', async () => {
+    await runSessionRollup(testEnv.DB);
+    const rollupBefore = await testEnv.DB.prepare(
+      'SELECT generation, status FROM session_rollup_state WHERE session_id = ?1',
+    ).bind(CC_SESSION_ID).first<{ generation: string; status: string }>();
+    expect(rollupBefore?.status).toBe('ready');
     const before = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
       .bind(CC_SESSION_ID)
       .first<{ n: number }>();
@@ -135,6 +141,15 @@ describe('ingest pipeline end-to-end', () => {
     const res = await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${CC_SESSION_ID}.jsonl`, grown);
     expect(res.status).toBe(201);
     await drainQueue();
+    const rollupAfter = await testEnv.DB.prepare(
+      'SELECT generation, status, eligible FROM session_rollup_state WHERE session_id = ?1',
+    ).bind(CC_SESSION_ID).first<{ generation: string; status: string; eligible: number }>();
+    expect(rollupAfter).toMatchObject({ status: 'pending', eligible: 1 });
+    expect(rollupAfter?.generation).not.toBe(rollupBefore?.generation);
+    await runSessionRollup(testEnv.DB);
+    expect(await testEnv.DB.prepare(
+      'SELECT SUM(assistant_turns) AS turns, SUM(tool_calls) AS calls FROM session_rollup WHERE session_id = ?1',
+    ).bind(CC_SESSION_ID).first()).toEqual({ turns: 2, calls: 1 });
 
     const after = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
       .bind(CC_SESSION_ID)

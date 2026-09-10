@@ -442,7 +442,7 @@ function wastePanel(s: Stats): string {
       'Source-span proxy, not context tokens or cost'),
     tile(d === null ? '—' : fmtInt(d.repeatedToolCalls), 'Repeated complete tool calls',
       d === null ? 'Nightly block metrics unavailable'
-        : `${fmtInt(d.comparableToolCalls)} comparable calls; ` +
+        : `${fmtInt(d.comparableToolCalls)} / ${fmtInt(d.toolCalls)} calls comparable; ` +
           (d.repeatedToolCallRate === null ? 'repeat rate unavailable' : `${(d.repeatedToolCallRate * 100).toFixed(1)}% repeated`)),
     tile(knownCost(spend.usd, spend.pricedCalls, spend.calls), 'Direct child / subagent known spend',
       `${costCoverage(spend.pricedCalls, spend.calls)}; usage window, not UTC-day scope`),
@@ -458,8 +458,7 @@ function wastePanel(s: Stats): string {
   return panel(
     'waste',
     'Waste diagnostics',
-    'Signals for transcript inspection, not proven waste or a measure of quality. Rewinds and repeated calls can be intentional; ' +
-      'these measures are not added into a total.',
+    'Rewinds and repeated calls are diagnostic signals, not proven waste or a measure of quality.',
     `<p class="small muted">${scope} ` +
       `${range.timestampScope === 'including-undated' ? 'Includes the unknown-timestamp bucket; the current partial UTC day is excluded.' : 'Only complete UTC days inside the usage window; partial days and unknown timestamps are excluded.'}</p>` +
       `<p class="small muted">Nightly coverage: ${coverageText} Coverage counts known matching sessions, not the entire archive. ` +
@@ -467,16 +466,17 @@ function wastePanel(s: Stats): string {
       `Newest covered publication: ${esc(coverage.newestCompletedAt ?? 'Unknown')}.</p>` +
       (d === null ? `<p class="small flag">No matching published block metrics. — means unavailable, not zero.</p>` : '') +
       `<div class="tiles">${tiles}</div>` +
+      `<details class="stats-limitations"><summary>Metric definitions</summary>` +
       `<p class="small muted">${comparable} Repeated calls match the tool name and exact indexed argument text across all days and models within a session. ` +
       `Each repeat after the first belongs to the later call's UTC day and model. This is not semantic equivalence or proof of unnecessary work.</p>` +
       `<p class="small muted">Tool-result <code>byte_len</code> measures indexed source spans. It is a proxy for result volume, ` +
       `not a measurement of bytes sent to the model, context occupancy, tokens, or dollars. ` +
       `Turn dates come from the first indexed block's timestamp. Block model attribution requires a unique usage record at the same turn; ` +
       `otherwise the model is unknown.</p>` +
-      `<p class="small muted">Child spend uses matching main-path usage in ${fmtInt(spend.sessions)} direct child sessions linked to ` +
+      `<p class="small muted">Child spend uses matching stored usage in ${fmtInt(spend.sessions)} direct child sessions linked to ` +
       `${fmtInt(spend.parents)} parents by <code>parent_session_id</code>, with the current usage window and filters. ` +
       `It is already part of usage cost, not an extra charge or a recursive descendant total.${unpriced} ` +
-      `Unknown cost is not zero; stored list prices are not invoices.</p>`,
+      `Unknown cost is not zero; stored list prices are not invoices. These measures are not added into a total.</p></details>`,
   );
 }
 
