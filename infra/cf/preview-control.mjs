@@ -252,7 +252,8 @@ async function ensureBackingResources(names) {
   const kv = await ensureResource('kv', names.kv, 'storage/kv/namespaces', { title: names.kv }, ['id']);
   const dlq = await ensureResource('queue', names.dlq, 'queues', { queue_name: names.dlq }, ['queue_id', 'id']);
   const queue = await ensureResource('queue', names.queue, 'queues', { queue_name: names.queue }, ['queue_id', 'id']);
-  return { d1, r2, kv, dlq, queue };
+  const rollupQueue = await ensureResource('queue', names.rollupQueue, 'queues', { queue_name: names.rollupQueue }, ['queue_id', 'id']);
+  return { d1, r2, kv, dlq, queue, rollupQueue };
 }
 
 /**
@@ -761,7 +762,7 @@ async function seed() {
 /** Detach consumers then delete one named resource set (queue-safe ordering). */
 async function deleteResourceSet(ownerPr, names) {
   const deleted = [];
-  for (const queueName of [names.queue, names.dlq]) {
+  for (const queueName of [names.queue, names.dlq, names.rollupQueue]) {
     const queueId = await resolveExistingId('queue', queueName);
     if (queueId == null) continue;
     const consumers = await cf(`queues/${encodeURIComponent(queueId)}/consumers`, { allowNotFound: true });
@@ -776,6 +777,7 @@ async function deleteResourceSet(ownerPr, names) {
     ['worker', names.app, (id) => `workers/scripts/${encodeURIComponent(id)}`],
     ['queue', names.queue, (id) => `queues/${encodeURIComponent(id)}`],
     ['queue', names.dlq, (id) => `queues/${encodeURIComponent(id)}`],
+    ['queue', names.rollupQueue, (id) => `queues/${encodeURIComponent(id)}`],
     ['kv', names.kv, (id) => `storage/kv/namespaces/${encodeURIComponent(id)}`],
     ['r2', names.r2, (id) => `r2/buckets/${encodeURIComponent(id)}`],
     ['d1', names.d1, (id) => `d1/database/${encodeURIComponent(id)}`],

@@ -14,7 +14,7 @@ export default defineConfig(async () => {
             TEST_MIGRATIONS: migrations,
             CF_OAUTH_CLIENT_ID: 'test-oauth-client',
           },
-          // The local queue simulator auto-delivers PARSE_QUEUE messages on its own real-time
+          // The local queue simulator auto-delivers parse and rollup messages on its own real-time
           // timer (wrangler.jsonc sets no max_batch_timeout, so it falls back to a short local
           // default — observed firing well under 1.5s), independent of and in addition to this
           // suite's explicit drainQueue()/deliverOne() helpers. Every test that puts a file in a
@@ -26,12 +26,15 @@ export default defineConfig(async () => {
           // and batch size) to their config maximums so the local simulator never fires on its
           // own within a test's lifetime — delivery stays fully driven by the explicit test
           // helpers, matching what the whole suite already assumes.
-          queueConsumers: { parse: { maxBatchTimeout: 60, maxBatchSize: 100 } },
+          queueConsumers: {
+            parse: { maxBatchTimeout: 60, maxBatchSize: 100 },
+            'session-rollup': { maxBatchTimeout: 60, maxBatchSize: 100 },
+          },
         },
       }),
     ],
     test: {
-      exclude: [...configDefaults.exclude, 'e2e/**', 'test/dev-lifecycle.test.mjs', 'test/preview-open.test.mjs', 'test/preview-upload.test.mjs', 'test/preview-control-seed.test.mjs'],
+      exclude: [...configDefaults.exclude, 'e2e/**', 'test/dev-lifecycle.test.mjs', 'test/preview-open.test.mjs', 'test/preview-upload.test.mjs', 'test/preview-control-seed.test.mjs', 'test/provision-queues.test.mjs'],
       setupFiles: ['./test/apply-migrations.ts'],
       // These are workers-pool INTEGRATION tests: a single `it` routinely drives several full
       // miniflare round-trips (HTTP PUT -> R2 -> D1, then a queue-consumer parse writing blocks +

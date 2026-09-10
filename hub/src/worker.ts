@@ -1,10 +1,11 @@
 import { runModelPriceSync } from './cron/model-prices';
 import { runDailyPricing } from './cron/pricing';
 import { runDailyPrune, runPrune } from './cron/prune';
-import { runDailySessionRollup } from './cron/session-rollup';
+import { runScheduledSessionRollup } from './cron/session-rollup';
 import { runWatchdog } from './cron/watchdog';
 import { consumeParseBatch } from './ingest/consumer';
 import { route } from './router';
+import { consumeSessionRollup } from './session-rollup-jobs';
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
@@ -12,9 +13,17 @@ export default {
   },
 
   async queue(batch: MessageBatch<HubQueueMessage>, env: Env): Promise<void> {
-    await consumeParseBatch({
-      messages: batch.messages as Message<ParseMessage>[],
-    }, env);
+    const rollup = batch.messages.find((message) => 'kind' in message.body && message.body.kind === 'session-rollup');
+    if (rollup) {
+      // ROLLUP_QUEUE is dedicated and configured for batch size one. If a malformed mixed
+      // batch ever arrives, defer all other messages instead of sharing the parse budget.
+      for (const message of batch.messages) {
+        if (message !== rollup) message.retry();
+      }
+      await consumeSessionRollup(rollup as Message<SessionRollupMessage>, env);
+      return;
+    }
+    await consumeParseBatch({ messages: batch.messages as Message<ParseMessage>[] }, env);
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
@@ -35,7 +44,7 @@ export default {
     ctx.waitUntil(runPrune(env));
     ctx.waitUntil(runDailyPrune(env));
     // Block-only accounting has no dependency on the pricing catalog or its upstream network.
-    ctx.waitUntil(runDailySessionRollup(env));
+    ctx.waitUntil(runScheduledSessionRollup(env));
     // Refresh model pricing from LiteLLM (ccusage's source), THEN fill in `usage.usd` for rows
     // that still have none. Chained rather than independent waitUntil: the pass reads the catalog the
     // sync just wrote, so running them concurrently would price today's rows against yesterday's

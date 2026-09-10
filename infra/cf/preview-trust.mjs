@@ -29,6 +29,8 @@ const PRODUCTION_IDENTIFIERS = new Set([
   'parse-preview',
   'parse-dlq',
   'parse-dlq-preview',
+  'session-rollup',
+  'session-rollup-preview',
   'sessions-hub',
   'sessions-hub-preview',
 ]);
@@ -249,6 +251,7 @@ export function resourceNames(pr) {
     kv: `${prefix}sessions-hub-kv`,
     queue: `${prefix}parse`,
     dlq: `${prefix}parse-dlq`,
+    rollupQueue: `${prefix}session-rollup`,
     host: `${prefix}app${PREVIEW_WORKERS_DEV_SUFFIX}`,
   };
   for (const [kind, name] of Object.entries(names)) {
@@ -263,7 +266,7 @@ export function resourceNames(pr) {
 }
 
 /** Any `pr-N-…` resource name in the preview account, old or new naming scheme. */
-export const PREVIEW_RESOURCE_RE = /^pr-([1-9][0-9]*)-(app|sessions-index|agent-sessions|sessions-hub-kv|parse|parse-dlq)$/;
+export const PREVIEW_RESOURCE_RE = /^pr-([1-9][0-9]*)-(app|sessions-index|agent-sessions|sessions-hub-kv|parse|parse-dlq|session-rollup)$/;
 /** The retired blue/green generation naming scheme — always deletable debris. */
 export const LEGACY_GENERATION_RE = /^pr-([1-9][0-9]*)-g[1-9][0-9]*-[0-9a-f]{12}-/;
 
@@ -397,13 +400,21 @@ export function generatedPrivateAppConfig({
     kv_namespaces: [{ binding: 'KV', id: resources.kv }],
     durable_objects: { bindings: [] },
     queues: {
-      producers: [{ binding: 'PARSE_QUEUE', queue: names.queue }],
+      producers: [
+        { binding: 'PARSE_QUEUE', queue: names.queue },
+        { binding: 'ROLLUP_QUEUE', queue: names.rollupQueue },
+      ],
       consumers: [{
         queue: names.queue,
         max_batch_size: 5,
         max_retries: 3,
         max_concurrency: 1,
         dead_letter_queue: names.dlq,
+      }, {
+        queue: names.rollupQueue,
+        max_batch_size: 1,
+        max_retries: 3,
+        max_concurrency: 1,
       }],
     },
   };

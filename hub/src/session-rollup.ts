@@ -6,6 +6,8 @@ export interface SessionRollupOptions {
   maxPages?: number;
   pageSize?: number;
   now?: Date;
+  /** Correlates page failures with the scheduled or manual bounded pass. */
+  run?: { run_id: string; trigger: 'scheduled' | 'manual' };
 }
 
 export interface SessionRollupResult {
@@ -115,7 +117,7 @@ export async function runSessionRollup(
       if ((deferred.meta.changes ?? 0) === 0) result.superseded++;
       result.failed++;
       failedSessions.push(checkpoint.session_id);
-      console.log(JSON.stringify({ event: 'hub.session_rollup.page_failed', session_id: checkpoint.session_id,
+      console.error(JSON.stringify({ event: 'hub.session_rollup.page_failed', ...options.run, session_id: checkpoint.session_id,
         error: error instanceof Error ? error.message : String(error) }));
     }
   }
