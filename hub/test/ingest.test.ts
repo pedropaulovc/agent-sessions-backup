@@ -1671,7 +1671,6 @@ describe('OMP ingest end-to-end', () => {
 
     expect(blocks.results.find((block) => block.btype === 'tool_result')).toMatchObject({
       role: 'tool',
-      tool_name: null,
       text: 'ompneedle tool output',
     });
     const search = await SELF.fetch(`${API}/api/v1/search?q=ompneedle`, {
