@@ -51,8 +51,8 @@ describe('buildSessionTrace', () => {
 
   it('joins out-of-order results through lifecycle metadata and links to the call, not a suppressed result', async () => {
     const turns = await parse([
-      { type: 'message', id: 'result', parentId: 'start', timestamp: new Date(epoch + 9000).toISOString(), message: {
-        role: 'toolResult', toolCallId: 'call', timestamp: epoch + 3600, isError: true,
+      { type: 'message', parentId: 'start', timestamp: new Date(epoch + 9000).toISOString(), message: {
+        id: 'result', role: 'toolResult', toolCallId: 'call', timestamp: epoch + 3600, isError: true,
         content: [{ type: 'text', text: 'first chunk' }, { type: 'text', text: 'second chunk' }],
       } },
       { type: 'custom', id: 'start', parentId: 'assistant', customType: 'tool_execution_start', data: {

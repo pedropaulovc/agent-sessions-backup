@@ -86,7 +86,7 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
       continue;
     }
 
-    const id = str(o.id);
+    const id = str(o.id) ?? (type === 'message' && isObj(o.message) ? str(o.message.id) : undefined);
     const parentId = str(o.parentId);
     // Custom records are real ancestry links: tool lifecycle metadata and persisted prompts can sit
     // between content messages. A metadata id may collide with a content id, so content records win
