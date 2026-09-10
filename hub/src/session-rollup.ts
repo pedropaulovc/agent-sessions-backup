@@ -35,9 +35,8 @@ interface SourceBlock {
   block_index: number;
   role: string | null;
   btype: string;
-  tool_name: string | null;
-  text: string | null;
-  truncated: number;
+  comparable_call: number;
+  repeated_call: number;
   on_main_path: number;
   byte_len: number | null;
   ts: string | null;
@@ -72,9 +71,8 @@ const ELIGIBLE = `eligible = 1 AND status != 'ready'
 const COMMIT_GUARD = `EXISTS (SELECT 1 FROM session_rollup_state st JOIN sessions s USING (session_id)
   WHERE st.session_id = ?1 AND st.commit_token = ?2 AND st.eligible = 1 AND s.index_state = 'ready')`;
 
-// Bound serialized UTF-8, not source characters: JSON control escapes can expand 6x.
-// Lookup chunks share one D1 batch; insert chunks share the guarded cursor transaction.
-const CALL_KEY_CHUNK_BYTES = 256 * 1024;
+const COMPARABLE_CALL = `b.role = 'assistant' AND b.btype = 'tool_use' AND b.truncated = 0
+  AND b.tool_name IS NOT NULL AND b.text IS NOT NULL`;
 
 /** Bounded durable pass. A page, its dedup keys, and its cursor commit in one D1 transaction.
  * The first block of each turn supplies its timestamp to ALL that turn's metrics; absent or
@@ -135,36 +133,31 @@ async function rollupPage(
   now: Date,
   result: SessionRollupResult,
 ): Promise<void> {
-    const blocks: SourceBlock[] = checkpoint.finishing ? [] : (await db.prepare(`SELECT b.id, b.turn_index, b.block_index, b.role, b.btype,
-        b.tool_name, b.text, b.truncated, b.on_main_path, b.byte_len, b.ts, u.model
-      FROM blocks b LEFT JOIN usage u ON u.session_id = b.session_id AND u.turn_index = b.turn_index
-      WHERE b.session_id = ?1 AND (b.turn_index, b.block_index, b.id) > (?2, ?3, ?4)
-      ORDER BY b.turn_index, b.block_index, b.id LIMIT ?5`)
+    // Materialize the indexed page BEFORE windowing. Exact identities stay in SQLite: even one
+    // legitimate uncapped tool name can exceed a transport chunk, regardless of source page size.
+    const blocks: SourceBlock[] = checkpoint.finishing ? [] : (await db.prepare(`WITH page AS MATERIALIZED (
+        SELECT b.id, b.turn_index, b.block_index, b.role, b.btype,
+          b.tool_name, b.text, b.truncated, b.on_main_path, b.byte_len, b.ts, u.model
+        FROM blocks b LEFT JOIN usage u ON u.session_id = b.session_id AND u.turn_index = b.turn_index
+        WHERE b.session_id = ?1 AND (b.turn_index, b.block_index, b.id) > (?2, ?3, ?4)
+        ORDER BY b.turn_index, b.block_index, b.id LIMIT ?5
+      ), comparable_calls AS (
+        SELECT b.id, (
+          ROW_NUMBER() OVER (PARTITION BY b.tool_name, b.text ORDER BY b.turn_index, b.block_index, b.id) > 1
+          OR EXISTS (SELECT 1 FROM session_rollup_seen_calls seen
+            WHERE seen.session_id = ?1 AND seen.tool_name = b.tool_name AND seen.text = b.text)
+        ) AS repeated_call
+        FROM page b WHERE ${COMPARABLE_CALL}
+      )
+      SELECT p.id, p.turn_index, p.block_index, p.role, p.btype, p.on_main_path, p.byte_len, p.ts, p.model,
+        CASE WHEN c.id IS NULL THEN 0 ELSE 1 END AS comparable_call,
+        COALESCE(c.repeated_call, 0) AS repeated_call
+      FROM page p LEFT JOIN comparable_calls c ON c.id = p.id
+      ORDER BY p.turn_index, p.block_index, p.id`)
       .bind(checkpoint.session_id, checkpoint.cursor_turn, checkpoint.cursor_block,
         checkpoint.cursor_id, limit).all<SourceBlock>()).results;
     result.examined += blocks.length;
 
-    const callKeys = new Map<number, string>();
-    const uniqueCalls = new Set<string>();
-    for (const block of blocks) {
-      if (!comparable(block)) continue;
-      const key = JSON.stringify([block.tool_name, block.text]);
-      callKeys.set(block.id, key);
-      uniqueCalls.add(key);
-    }
-    // Encode each key once and reuse each byte-bounded array for both lookup and insert.
-    const callChunks = chunkCallKeys(uniqueCalls);
-    const seen = new Set<string>();
-    if (callChunks.length > 0) {
-      const prior = await db.batch<{ call_key: string }>(callChunks.map((chunk) =>
-        db.prepare(`SELECT j.value AS call_key FROM json_each(?2) j
-          JOIN session_rollup_seen_calls sc ON sc.session_id = ?1
-            AND sc.tool_name = json_extract(j.value, '$[0]')
-            AND sc.text = json_extract(j.value, '$[1]')`).bind(checkpoint.session_id, chunk)));
-      for (const chunk of prior) {
-        for (const call of chunk.results) seen.add(call.call_key);
-      }
-    }
     let turn: TurnState | null = checkpoint.turn_state ? JSON.parse(checkpoint.turn_state) : null;
     const buckets = new Map<string, Bucket>();
     for (const block of blocks) {
@@ -191,12 +184,8 @@ async function rollupPage(
         // Source-span proxy: multiple blocks can share one JSONL line's byte_len.
         bucket.tool_result_source_bytes += Math.max(0, block.byte_len ?? 0);
       }
-      const callKey = callKeys.get(block.id);
-      if (callKey !== undefined) {
-        bucket.comparable_tool_calls++;
-        if (seen.has(callKey)) bucket.repeated_tool_calls++;
-        seen.add(callKey);
-      }
+      bucket.comparable_tool_calls += block.comparable_call;
+      bucket.repeated_tool_calls += block.repeated_call;
     }
 
     const last = blocks.at(-1);
@@ -222,10 +211,11 @@ async function rollupPage(
       ON CONFLICT (session_id, day, model) DO UPDATE SET
         ${METRICS.map((m) => `${m} = session_rollup.${m} + excluded.${m}`).join(', ')}`)
       .bind(checkpoint.session_id, token, JSON.stringify([...buckets.values()])),
-    ...callChunks.map((chunk) => db.prepare(`INSERT OR IGNORE INTO session_rollup_seen_calls (session_id, tool_name, text)
-      SELECT ?1, json_extract(j.value, '$[0]'), json_extract(j.value, '$[1]')
-      FROM json_each(?3) j WHERE ${COMMIT_GUARD}`)
-      .bind(checkpoint.session_id, token, chunk))];
+    db.prepare(`INSERT OR IGNORE INTO session_rollup_seen_calls (session_id, tool_name, text)
+      SELECT b.session_id, b.tool_name, b.text
+      FROM json_each(?3) page_ids JOIN blocks b ON b.id = page_ids.value
+      WHERE b.session_id = ?1 AND ${COMPARABLE_CALL} AND ${COMMIT_GUARD}`)
+      .bind(checkpoint.session_id, token, JSON.stringify(blocks.map((block) => block.id)))];
     if (complete) {
       statements.push(
         // Cleanup is checkpointed too: a giant unique-call history must not become one huge DELETE.
@@ -243,30 +233,6 @@ async function rollupPage(
     else if (complete && (committed.at(-1)?.meta.changes ?? 0) > 0) result.completed++;
 }
 
-function chunkCallKeys(keys: Iterable<string>): string[] {
-  const chunks: string[] = [];
-  const encoder = new TextEncoder();
-  let entries: string[] = [];
-  let bytes = 2; // JSON array brackets.
-  for (const key of keys) {
-    const keyBytes = encoder.encode(key).byteLength;
-    if (keyBytes + 2 > CALL_KEY_CHUNK_BYTES) throw new RangeError('Stored tool call exceeds rollup key chunk limit');
-    if (bytes + (entries.length > 0 ? 1 : 0) + keyBytes > CALL_KEY_CHUNK_BYTES) {
-      chunks.push(`[${entries.join(',')}]`);
-      entries = [];
-      bytes = 2;
-    }
-    bytes += (entries.length > 0 ? 1 : 0) + keyBytes;
-    entries.push(key);
-  }
-  if (entries.length > 0) chunks.push(`[${entries.join(',')}]`);
-  return chunks;
-}
-
-function comparable(block: SourceBlock): boolean {
-  return block.role === 'assistant' && block.btype === 'tool_use' && block.truncated === 0
-    && block.tool_name !== null && block.text !== null;
-}
 
 function utcDay(timestamp: string | null): string {
   if (!timestamp) return '';

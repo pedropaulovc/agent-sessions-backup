@@ -1,6 +1,7 @@
 import { env } from 'cloudflare:test';
 import { afterEach, describe, expect, it } from 'vitest';
 import { runSessionRollup } from '../src/session-rollup';
+import { parseChatgptWeb } from '../src/ingest/parsers/chatgpt-web';
 
 const db = (env as unknown as Env).DB;
 const PREFIX = 'rollup-regression-';
@@ -233,6 +234,38 @@ describe('nightly session rollup', () => {
     expect(await runSessionRollup(db, { pageSize: 500 })).toMatchObject({ completed: 1, failed: 0 });
     expect(await published(id)).toMatchObject([{
       assistant_turns: 501, tool_calls: 501, comparable_tool_calls: 501, repeated_tool_calls: 251,
+    }]);
+  });
+
+  it('publishes exact complete ChatGPT-web calls with large recipients across pages', async () => {
+    const id = await seedSession('large-recipient');
+    await db.prepare(`UPDATE sessions SET harness = 'chatgpt-web' WHERE session_id = ?1`).bind(id).run();
+    const recipient = 'tool_' + 'x'.repeat(300_000);
+    const raw = JSON.stringify({
+      current_node: 'c',
+      mapping: {
+        a: { parent: null, message: { author: { role: 'assistant' }, recipient,
+          create_time: 1754049600, content: { content_type: 'code', text: 'print(1)' } } },
+        b: { parent: 'a', message: { author: { role: 'assistant' }, recipient: recipient + '_other',
+          create_time: 1754049601, content: { content_type: 'code', text: 'print(1)' } } },
+        c: { parent: 'b', message: { author: { role: 'assistant' }, recipient,
+          create_time: 1754049602, content: { content_type: 'code', text: 'print(1)' } } },
+      },
+    });
+    const session = parseChatgptWeb(raw, id);
+    for (const turn of session.turns) {
+      await db.batch(turn.blocks.map((parsed, index) =>
+        db.prepare(`INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype,
+          tool_name, ts, text, truncated, on_main_path)
+          VALUES (?1, 0, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)`)
+          .bind(id, turn.index, index, turn.role, parsed.type, parsed.toolName ?? null,
+            turn.ts ?? null, parsed.text ?? null, parsed.truncated ? 1 : 0, turn.onMainPath ? 1 : 0)));
+    }
+    expect(await runSessionRollup(db, { pageSize: 1 })).toMatchObject({
+      completed: 1, failed: 0, pending: 0, remaining: 'complete',
+    });
+    expect(await published(id)).toMatchObject([{
+      assistant_turns: 3, tool_calls: 3, comparable_tool_calls: 3, repeated_tool_calls: 1,
     }]);
   });
 
