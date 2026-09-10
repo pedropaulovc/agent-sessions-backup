@@ -68,7 +68,10 @@
     "CloudflareOAuthBroker": { "type": "durable-object", "storage": "sqlite" }
   },
   "queues": {
-    "producers": [{ "binding": "PARSE_QUEUE", "queue": "parse" }],
+    "producers": [
+      { "binding": "PARSE_QUEUE", "queue": "parse" },
+      { "binding": "ROLLUP_QUEUE", "queue": "session-rollup" }
+    ],
     "consumers": [
       {
         "queue": "parse",
@@ -80,6 +83,12 @@
         // serial processing — this is not a throughput-sensitive path.
         "max_concurrency": 1,
         "dead_letter_queue": "parse-dlq"
+      },
+      {
+        "queue": "session-rollup",
+        "max_batch_size": 1,
+        "max_retries": 3,
+        "max_concurrency": 1
       }
     ]
   },
@@ -144,14 +153,20 @@
       ],
       "r2_buckets": [{ "binding": "RAW", "bucket_name": "agent-sessions-raw-preview" }],
       "kv_namespaces": [{ "binding": "KV", "id": "f3413813878c4846b7586c25f01cbe24" }],
-      // Producer only, and no crons — this mirrors what the moved Worker actually ran.
-      // Workers Builds deployed it with `wrangler versions upload`, which applies neither
-      // queue consumers nor cron triggers, so the live Worker had `schedules: []` and
-      // `parse-preview` had 0 consumers. A plain `wrangler deploy` WOULD activate both, which
-      // is a behaviour change rather than a move: attaching the consumer and the 15-minute
-      // cron would immediately start mutating the migrated D1/R2. Enable them deliberately.
+      // Keep the migrated parse consumer and crons disabled. The dedicated rollup consumer
+      // runs only explicitly submitted admin jobs, without draining the existing parse backlog.
+      // Provision its queue before deploying: node ../infra/cf/provision-queues.mjs --target preview
       "queues": {
-        "producers": [{ "binding": "PARSE_QUEUE", "queue": "parse-preview" }]
+        "producers": [
+          { "binding": "PARSE_QUEUE", "queue": "parse-preview" },
+          { "binding": "ROLLUP_QUEUE", "queue": "session-rollup-preview" }
+        ],
+        "consumers": [{
+          "queue": "session-rollup-preview",
+          "max_batch_size": 1,
+          "max_retries": 3,
+          "max_concurrency": 1
+        }]
       },
       "triggers": { "crons": [] },
       // Overridden to EMPTY, not omitted: `limits` is inheritable, and the production

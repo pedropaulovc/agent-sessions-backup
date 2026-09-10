@@ -79,6 +79,7 @@ describe('stable per-PR resource names', () => {
       kv: 'pr-42-sessions-hub-kv',
       queue: 'pr-42-parse',
       dlq: 'pr-42-parse-dlq',
+      rollupQueue: 'pr-42-session-rollup',
       host: 'pr-42-app.sessions-ppe.workers.dev',
     });
     expect(() => resourceNames(0)).toThrow(/positive integer/);
@@ -91,6 +92,13 @@ describe('stable per-PR resource names', () => {
     expect(previewResourceOwner('sessions-index')).toBeNull();
     expect(previewResourceOwner('pr-42-something-else')).toBeNull();
     expect(previewResourceOwner('prefix-pr-42-app')).toBeNull();
+  });
+
+  it('owns per-PR rollup queues without claiming standing or production queues for cleanup', () => {
+    expect(previewResourceOwner(resourceNames(42).rollupQueue)).toEqual({ pr: 42, legacy: false });
+    for (const name of ['session-rollup', 'session-rollup-preview', 'pr-42-session-rollup-preview', 'pr-0-session-rollup']) {
+      expect(previewResourceOwner(name)).toBeNull();
+    }
   });
 });
 
@@ -250,6 +258,16 @@ describe('queue consumer detachment', () => {
     expect(() => queueConsumerIdsForQueue([
       { consumer_id: 'c4', script_name: 'sessions-hub' },
     ], 'pr-42-parse')).toThrow(/foreign queue consumer/);
+  });
+
+  it('refuses to detach a foreign standing consumer from a PR rollup queue', () => {
+    const queue = resourceNames(42).rollupQueue;
+    expect(queueConsumerIdsForQueue([
+      { consumer_id: 'rollup-consumer', script_name: 'pr-42-app' },
+    ], queue)).toEqual(['rollup-consumer']);
+    expect(() => queueConsumerIdsForQueue([
+      { consumer_id: 'foreign-consumer', script_name: 'sessions-hub-preview' },
+    ], queue)).toThrow(/foreign queue consumer/);
   });
 });
 

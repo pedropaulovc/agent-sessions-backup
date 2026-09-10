@@ -1,6 +1,6 @@
-// Fires on any failed/partial bounded rollup pass or session page failure in
-// the last hour. A later healthy pass must not erase an earlier failure.
-// Source: sessions-hub's hub.session_rollup.run / hub.session_rollup.page_failed.
+// Fires on any failed/partial bounded rollup pass, session page failure, or
+// manual job delivery/persistence failure in the last hour. A later healthy
+// pass must not erase an earlier failure. Source: sessions-hub rollup events.
 // Both scheduled and authenticated manual runs use the same completion schema.
 // Pending backfill (remaining='pending', pending>0) is normal bounded progress,
 // not an error. The run outcome, not the remaining work, determines failure.
@@ -14,7 +14,7 @@ otel
 | where TimeGenerated > ago(1h)
 | where ServiceName == 'sessions-hub'
 | extend body = todynamic(Body)
-| where body.event == 'hub.session_rollup.page_failed'
+| where body.event in ('hub.session_rollup.page_failed', 'hub.session_rollup.delivery_failed')
     or (body.event == 'hub.session_rollup.run' and body.outcome in ('partial', 'failed'))
 | project TimeGenerated, ServiceName, event=tostring(body.event),
     run_id=tostring(body.run_id), trigger=tostring(body.trigger), outcome=tostring(body.outcome),

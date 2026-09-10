@@ -2,7 +2,8 @@ interface Env {
   DB: D1Database;
   RAW: R2Bucket;
   KV: KVNamespace;
-  PARSE_QUEUE: Queue<HubQueueMessage>;
+  PARSE_QUEUE: Queue<ParseMessage>;
+  ROLLUP_QUEUE: Queue<SessionRollupMessage>;
   ENVIRONMENT: 'development' | 'preview' | 'production';
   /** Local orchestration evidence; generated preview config also binds nonce and deployment digests. */
   ENVIRONMENT_ID?: string;
@@ -37,7 +38,12 @@ interface Env {
   CF_OAUTH_BROKER?: DurableObjectNamespace;
 }
 
-type HubQueueMessage = ParseMessage;
+type HubQueueMessage = ParseMessage | SessionRollupMessage;
+
+interface SessionRollupMessage {
+  kind: 'session-rollup';
+  job_id: string;
+}
 
 interface ParseMessage {
   file_id: number;
