@@ -38,7 +38,7 @@ a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
 mark { background: var(--mark); color: inherit; padding: 0 1px; border-radius: 2px; }
 header.nav {
-  display: flex; gap: 18px; align-items: baseline; padding: 12px 20px;
+  display: flex; flex-wrap: wrap; gap: 8px 18px; align-items: baseline; padding: 12px 20px;
   border-bottom: 1px solid var(--line); position: sticky; top: 0; background: var(--bg); z-index: 5;
 }
 header.nav .brand { font-weight: 700; letter-spacing: -0.02em; }
@@ -100,13 +100,14 @@ tr.stale td { background: var(--err-bg); }
 .banner { background: var(--accent-bg); border: 1px solid var(--accent); border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
 .sesshead { border-bottom: 1px solid var(--line); padding-bottom: 12px; margin-bottom: 8px; }
 .sesshead .kv { display: flex; gap: 6px 18px; flex-wrap: wrap; margin-top: 6px; }
+.sesshead h2, .sesshead .kv > span { overflow-wrap: anywhere; min-width: 0; }
 .turn { border: 1px solid var(--line); border-radius: 8px; margin: 10px 0; overflow: hidden; }
 .turn > .turnhead {
-  display: flex; gap: 10px; align-items: baseline; padding: 6px 12px; border-bottom: 1px solid var(--line);
+  display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline; padding: 6px 12px; border-bottom: 1px solid var(--line);
 }
 .turn.collapsed { position: relative; }
 .turn.collapsed > details.turn-content > summary.turnhead {
-  display: flex; gap: 10px; align-items: baseline; padding: 6px 52px 6px 12px;
+  display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline; padding: 6px 52px 6px 12px;
   cursor: pointer; user-select: none; list-style: none;
 }
 .turn.collapsed > details.turn-content > summary.turnhead::-webkit-details-marker { display: none; }

@@ -9,6 +9,8 @@ Backup, index, search, and render AI agent/chat sessions from every machine and 
 - **Agent API**: JSON search/fetch endpoints (e.g. everything from today as NDJSON) for downstream AI agents
 - **Observability**: Cloudflare Workers observability → OTLP gateway → Azure Application Insights (Entra workload identity federation, zero Azure secrets), email alerts
 
+Session details keep the transcript visible by default. Expand **Activity trace** for the current page's model and tool activity, event/error filters, and links back to turns. Duration shows recorded OMP timing spans or timestamp markers; Sequence also includes events without timestamps. Per-tool totals include only recorded durations and may overlap.
+
 ## Layout
 
 | Path | What |
