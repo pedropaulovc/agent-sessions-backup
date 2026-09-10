@@ -235,6 +235,17 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
     }
 
     const blocks = promptBlocks(data.systemPrompt, line);
+    const providerContext = isObj(data.providerContext) ? data.providerContext : undefined;
+    if (providerContext) {
+      if (Array.isArray(providerContext.tools)) {
+        blocks.push(...promptBlocks([`Tool declarations (providerContext.tools):\n${JSON.stringify(providerContext.tools, null, 2)}`], line));
+      }
+      for (const field of ['toolConfig', 'tool_config'] as const) {
+        if (isObj(providerContext[field])) {
+          blocks.push(...promptBlocks([`Tool configuration (providerContext.${field}):\n${JSON.stringify(providerContext[field], null, 2)}`], line));
+        }
+      }
+    }
     if (blocks.length === 0) {
       skip('custom.omp-system-prompt.empty');
       return;

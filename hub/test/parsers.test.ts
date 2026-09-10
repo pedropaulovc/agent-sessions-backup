@@ -389,6 +389,118 @@ describe('parseOmp', () => {
     expect(session.turns.filter((turn) => turn.role === 'system')).toHaveLength(1);
   });
 
+  it.each([
+    {
+      provider: 'OpenAI Responses',
+      tools: [{ type: 'function', name: 'bash', description: 'Execute shell commands', parameters: { type: 'object', properties: { command: { type: 'string' } }, required: ['command'] } }],
+    },
+    {
+      provider: 'OpenAI Chat Completions',
+      tools: [{ type: 'function', function: { name: 'read', description: 'Read a file', parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'], additionalProperties: false }, strict: true } }],
+    },
+    {
+      provider: 'Anthropic',
+      tools: [{ name: 'read', description: 'Read a file', input_schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] }, eager_input_streaming: true, defer_loading: true }],
+    },
+    {
+      provider: 'Google',
+      tools: [{ functionDeclarations: [{ name: 'read', description: 'Read a file', parametersJsonSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } }] }],
+    },
+  ])('preserves $provider tool declarations as prompt content without duplicating provider instructions', async ({ tools }) => {
+    const records = [
+      JSON.stringify({ type: 'session', version: 3, id: sessionId }),
+      JSON.stringify({
+        type: 'custom', customType: 'omp-system-prompt', id: 'provider-prompt',
+        data: {
+          systemPrompt: ['effective prompt'],
+          providerContext: {
+            tools,
+            instructions: 'do not duplicate instructions',
+            system: 'do not duplicate system',
+            systemInstruction: { parts: [{ text: 'do not duplicate camel case' }] },
+            system_instruction: { parts: [{ text: 'do not duplicate snake case' }] },
+            messages: [{ role: 'user', content: 'do not index conversation metadata' }],
+          },
+        },
+      }),
+    ];
+    const session = await parseOmp(readJsonlLines(toStream(records)), sessionId);
+
+    expect(session.turns).toHaveLength(1);
+    const turn = session.turns[0]!;
+    expect(turn).toMatchObject({ id: 'provider-prompt', role: 'system', onMainPath: true });
+    expect(turn.blocks.map((block) => block.type)).toEqual(['prompt', 'prompt']);
+    expect(turn.blocks[0]?.text).toBe('effective prompt');
+    const declaration = turn.blocks[1]!.text!;
+    expect(declaration.slice(0, declaration.indexOf('\n'))).toMatch(/tools/i);
+    expect(declaration.slice(declaration.indexOf('\n') + 1)).toBe(JSON.stringify(tools, null, 2));
+    expect(JSON.stringify(session)).not.toContain('do not');
+  });
+
+  it('retains both provider tool configuration spellings and explicitly empty tools', async () => {
+    const toolConfig = { functionCallingConfig: { mode: 'ANY', allowedFunctionNames: ['read'] } };
+    const tool_config = { function_calling_config: { mode: 'NONE' } };
+    const records = [
+      JSON.stringify({ type: 'session', version: 3, id: sessionId }),
+      JSON.stringify({
+        type: 'custom', customType: 'omp-system-prompt',
+        data: { systemPrompt: ['prompt'], providerContext: { tools: [], toolConfig, tool_config } },
+      }),
+    ];
+    const session = await parseOmp(readJsonlLines(toStream(records)), sessionId);
+    const blocks = session.turns[0]!.blocks;
+
+    expect(blocks.map((block) => block.type)).toEqual(['prompt', 'prompt', 'prompt', 'prompt']);
+    expect(blocks.slice(1).map((block) => JSON.parse(block.text!.slice(block.text!.indexOf('\n') + 1)))).toEqual([[], toolConfig, tool_config]);
+    expect(blocks[2]!.text!.split('\n')[0]).toContain('toolConfig');
+    expect(blocks[3]!.text!.split('\n')[0]).toContain('tool_config');
+  });
+
+  it('preserves long tool declarations and their byte windows even without system prompt text', async () => {
+    const tools = [{ type: 'function', name: 'read', description: `déclaration-${'x'.repeat(CAPS.prompt)}-schema-tail`, parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } }];
+    const header = JSON.stringify({ type: 'session', version: 3, id: sessionId, cwd: '/tmp/déclarations' });
+    const record = JSON.stringify({ type: 'custom', customType: 'omp-system-prompt', id: 'tools-only', data: { systemPrompt: [], providerContext: { tools } } });
+    const session = await parseOmp(readJsonlLines(toStream([header, record])), sessionId);
+    const turn = session.turns[0]!;
+
+    expect(turn).toMatchObject({ id: 'tools-only', role: 'system' });
+    const declaration = turn.blocks.map((block) => block.text).join('');
+    expect(declaration.slice(declaration.indexOf('\n') + 1)).toBe(JSON.stringify(tools, null, 2));
+    const encoder = new TextEncoder();
+    for (const block of turn.blocks) {
+      expect(block).toMatchObject({
+        type: 'prompt', truncated: false,
+        byteStart: encoder.encode(header + '\n').length,
+        byteLen: encoder.encode(record + '\n').length,
+      });
+      expect(block.text!.length).toBeLessThanOrEqual(CAPS.prompt);
+    }
+    expect(session.stats.skippedLineTypes['custom.omp-system-prompt.empty']).toBeUndefined();
+  });
+
+  it('keeps valid prompts when optional provider context is absent or malformed', async () => {
+    const contexts = [undefined, null, 'invalid', [], { tools: null, toolConfig: [], tool_config: 'invalid' }, { tools: {}, toolConfig: null }];
+    const records = [
+      JSON.stringify({ type: 'session', version: 3, id: sessionId }),
+      ...contexts.map((providerContext, index) => JSON.stringify({
+        type: 'custom', customType: 'omp-system-prompt', id: `prompt-${index}`,
+        data: { systemPrompt: [`prompt ${index}`], providerContext },
+      })),
+      JSON.stringify({
+        type: 'custom', customType: 'omp-system-prompt', id: 'mixed-context',
+        data: { systemPrompt: ['mixed prompt'], providerContext: { tools: 'invalid', toolConfig: { functionCallingConfig: { mode: 'NONE' } } } },
+      }),
+    ];
+    const session = await parseOmp(readJsonlLines(toStream(records)), sessionId);
+
+    expect(session.turns.slice(0, contexts.length).map((turn) => turn.blocks.map((block) => block.text))).toEqual(contexts.map((_, index) => [`prompt ${index}`]));
+    const mixedBlocks = session.turns[contexts.length]!.blocks;
+    expect(mixedBlocks[0]?.text).toBe('mixed prompt');
+    expect(mixedBlocks.map((block) => block.text).join('')).toContain('"mode": "NONE"');
+    expect(mixedBlocks.map((block) => block.text).join('')).not.toContain('invalid');
+    expect(session.stats.skippedLineTypes).toEqual({});
+  });
+
   it('does not let prompt metadata rewrite conversation ancestry', async () => {
     const records = [
       JSON.stringify({ type: 'session', version: 3, id: sessionId, timestamp: '2026-07-19T10:00:00.000Z', cwd: '/tmp/omp' }),
@@ -399,7 +511,7 @@ describe('parseOmp', () => {
         customType: 'omp-system-prompt',
         id: 'u1',
         parentId: null,
-        data: { systemPrompt: ['effective prompt'] },
+        data: { systemPrompt: ['effective prompt'], providerContext: { tools: [{ type: 'function', name: 'read', parameters: { type: 'object' } }] } },
       }),
       JSON.stringify({ type: 'message', id: 'a1', parentId: 'u1', timestamp: '2026-07-19T10:00:03.000Z', message: { role: 'assistant', content: 'answer' } }),
     ];
@@ -412,7 +524,7 @@ describe('parseOmp', () => {
     const records = [
       JSON.stringify({ type: 'session', version: 3, id: sessionId, cwd: '/tmp/omp' }),
       JSON.stringify({ type: 'message', id: 'u0', parentId: null, message: { role: 'user', content: 'root' } }),
-      JSON.stringify({ type: 'custom', id: 'prompt-0', parentId: 'u0', customType: 'omp-system-prompt', data: { systemPrompt: ['prompt'] } }),
+      JSON.stringify({ type: 'custom', id: 'prompt-0', parentId: 'u0', customType: 'omp-system-prompt', data: { systemPrompt: ['prompt'], providerContext: { tools: [] } } }),
       JSON.stringify({ type: 'message', id: 'a0', parentId: 'prompt-0', message: { role: 'assistant', content: 'answer' } }),
       JSON.stringify({ type: 'custom', id: 'tool-start-0', parentId: 'a0', customType: 'tool_execution_start' }),
       JSON.stringify({ type: 'message', id: 'r0', parentId: 'tool-start-0', message: { role: 'toolResult', content: 'result' } }),
