@@ -246,6 +246,55 @@ table.heat th.hh { font-size: 10px; color: var(--muted); font-weight: 400; text-
 table.heat td.cell { height: 15px; background: var(--accent); border: 1px solid var(--bg); border-radius: 2px; }
 ul.gaps-list { margin: 0; padding-left: 18px; }
 ul.gaps-list li { margin-bottom: 8px; }
+/* Statistics uses the viewer's existing type and color tokens. */
+.stats-page { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.stats-page h2 { margin: 0 0 4px; font-size: 24px; letter-spacing: -0.03em; }
+.stats-page .stats-scope { margin: 0 0 12px; max-width: 100ch; }
+.stats-page .statbar a, .stats-page .tabs a, .stats-panel-links a { white-space: nowrap; }
+.stats-page .statbar a.on, .stats-page .tabs a.on { background: var(--accent-bg); border-color: var(--accent); color: var(--accent); }
+.stats-page :is(a, summary, .stats-table-scroll):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.stats-page .panel { padding: 14px 0 18px; scroll-margin-top: 80px; min-width: 0; }
+.stats-page .panel h3 { font-size: 16px; margin: 0 0 4px; }
+.stats-page .panel .lede { max-width: 100ch; margin-bottom: 10px; }
+.stats-overview { margin: 16px 0 12px; padding: 12px 0 4px; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.stats-metrics, .stats-token-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px 20px; margin: 0; }
+.stats-metrics > div, .stats-token-metrics > div { min-width: 0; }
+.stats-metrics dt, .stats-token-metrics dt { color: var(--muted); font-size: 11px; }
+.stats-metrics dd, .stats-token-metrics dd { margin: 1px 0 0; font-variant-numeric: tabular-nums; }
+.stats-metrics dd { font-size: clamp(20px, 2.5vw, 30px); font-weight: 700; letter-spacing: -0.04em; }
+.stats-token-metrics { margin-top: 12px; }
+.stats-token-metrics dd { font-size: 14px; }
+.stats-overview p { margin: 10px 0 6px; font-size: 11px; }
+.stats-page .stats-ranking { margin: 0 0 14px; }
+.stats-table-scroll { max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; padding: 2px 0; }
+.stats-table-scroll table { width: 100%; margin: 0; font-size: 12px; }
+.stats-table-scroll thead th { font-size: 10px; color: var(--muted); font-weight: 500; vertical-align: bottom; }
+.stats-table-scroll th, .stats-table-scroll td { vertical-align: top; }
+.stats-page table.chart :is(th, td) { padding: 7px 8px; }
+.stats-page table.chart th[scope=row] { white-space: normal; }
+.stats-page table.chart :is(.stats-model, .stats-session) { font-weight: 400; overflow-wrap: anywhere; min-width: 160px; max-width: 34ch; }
+.stats-page table.chart .stats-session { width: 45%; min-width: 220px; }
+.stats-page .stats-cell-note { display: block; color: var(--muted); font-size: 10px; font-weight: 400; margin-top: 3px; }
+.stats-page .stats-share { min-width: 76px; font-variant-numeric: tabular-nums; }
+.stats-page .stats-share .bar { height: 5px; margin: 4px 0 5px; min-width: 0; }
+.stats-analysis, .stats-limitations { border-top: 1px solid var(--line); margin-top: 8px; padding: 14px 0; min-width: 0; }
+.stats-page summary { cursor: pointer; font-weight: 600; font-size: 14px; }
+.stats-page summary:hover { color: var(--accent); }
+.stats-analysis[open] > summary, .stats-limitations[open] > summary { margin-bottom: 14px; }
+.stats-panel-links { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 12px; margin-bottom: 14px; }
+.stats-page .tiles { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; margin-top: 14px; }
+.stats-page .tile { padding: 0; border: 0; border-radius: 0; background: transparent; min-width: 0; }
+.stats-page .tile-v { font-size: 20px; }
+.stats-page .stats-limitations { color: var(--muted); }
+.stats-page .stats-limitations > summary { color: var(--fg); }
+.stats-page table.heat { min-width: 500px; }
+@media (max-width: 760px) {
+  .stats-metrics, .stats-token-metrics, .stats-page .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .stats-page .statbar { gap: 6px; }
+  .stats-page .stats-ranking { align-items: flex-start; }
+  .stats-page .stats-ranking > span { flex-basis: 100%; }
+  .stats-page .panel { scroll-margin-top: 110px; }
+}
 @media (max-width: 760px) {
   main { padding: 14px; }
   .barcell { width: 24%; min-width: 56px; }

@@ -51,6 +51,8 @@ const ATTRIBUTION_SQL: Record<Attribution, string> = {
 export interface StatsQuery {
   range: Range;
   by: Attribution;
+  /** Ranking for model and session activity; omitted means most calls first. */
+  rank?: 'calls' | 'cost';
   /** Whole-hour offset applied to `usage.ts` before extracting weekday/hour. UTC hours are
    * meaningless as a human schedule; see `rhythm`. */
   tzOffsetHours: number;
@@ -150,6 +152,10 @@ function filters(
     ['s.machine_id', sql ? q.machine : undefined],
   ] as const) {
     if (!val) continue;
+    if (col === 'u.model' && val === UNKNOWN_MODEL_LABEL) {
+      terms.push('u.model IS NULL');
+      continue;
+    }
     binds.push(val);
     terms.push(`${col} = ?${binds.length}`);
   }
@@ -214,6 +220,7 @@ export interface Window {
 interface PricedGroup {
   key: string | null;
   calls: number;
+  pricedCalls: number;
   usd: number;
   unpricedCalls: number;
   /** Calls whose total is known but whose class split is not yet stored. See the scan. */
@@ -226,6 +233,7 @@ function emptyGroup(key: string | null): PricedGroup {
   return {
     key,
     calls: 0,
+    pricedCalls: 0,
     usd: 0,
     unpricedCalls: 0,
     staleBreakdownCalls: 0,
@@ -259,6 +267,7 @@ function foldByKey<T extends ScanRow>(
     const key = keyOf(r) ?? null;
     const g = out.get(key) ?? emptyGroup(key);
     g.calls += Number(r.calls ?? 0);
+    g.pricedCalls += Number(r.priced_calls ?? 0);
     g.usd += Number(r.usd ?? 0);
     g.byClass.input += Number(r.usd_input ?? 0);
     g.byClass.output += Number(r.usd_output ?? 0);
@@ -311,6 +320,7 @@ async function mainScan(db: D1Database, f: Filters): Promise<MainRow[]> {
               u.model AS model,
               ${DEPTH_CASE} AS band,
               COUNT(*) AS calls,
+              COUNT(u.usd) AS priced_calls,
               SUM(u.usd) AS usd,
               SUM(u.usd_input) AS usd_input,
               SUM(u.usd_output) AS usd_output,
@@ -339,6 +349,7 @@ async function mainScan(db: D1Database, f: Filters): Promise<MainRow[]> {
 /** One row of the main scan: a (session, model, band) group with its costs already summed. */
 interface ScanRow {
   calls: number;
+  priced_calls: number;
   usd: number | null;
   usd_input: number | null;
   usd_output: number | null;
@@ -376,22 +387,24 @@ interface MainRow extends ScanRow {
  *   | grouped by pricing unit, priced in JS   | 359ms | 240,869   |
  *   | SUM(u.usd)                              |  56ms | 120,435   |
  *
- * `SUM` skips NULLs, which is exactly right: an unpriceable row contributes nothing rather than
- * a zero, matching what the fold did with it. The rows themselves are still counted by the
- * unpriced tally on the main scan, so the coverage gap stays visible rather than being absorbed
- * into a total that looks complete. */
-async function windowTotal(db: D1Database, f: Filters): Promise<number> {
+ * `SUM` skips NULLs. Counting both all calls and non-NULL costs in this same scan lets the
+ * comparison distinguish a complete zero from an unknown or partial subtotal. */
+async function windowTotal(
+  db: D1Database,
+  f: Filters,
+): Promise<{ usd: number; calls: number; pricedCalls: number }> {
   const row = await db
-    .prepare(`SELECT SUM(u.usd) AS usd ${usageFrom(f)} ${f.where}`)
+    .prepare(`SELECT SUM(u.usd) AS usd, COUNT(*) AS calls, COUNT(u.usd) AS priced_calls ${usageFrom(f)} ${f.where}`)
     .bind(...f.binds)
-    .first<{ usd: number | null }>();
-  return Number(row?.usd ?? 0);
+    .first<{ usd: number | null; calls: number; priced_calls: number }>();
+  return { usd: Number(row?.usd ?? 0), calls: Number(row?.calls ?? 0), pricedCalls: Number(row?.priced_calls ?? 0) };
 }
 
 function totalOf(groups: Map<string | null, PricedGroup>): PricedGroup {
   const t = emptyGroup(null);
   for (const g of groups.values()) {
     t.calls += g.calls;
+    t.pricedCalls += g.pricedCalls;
     t.usd += g.usd;
     t.unpricedCalls += g.unpricedCalls;
     t.staleBreakdownCalls += g.staleBreakdownCalls;
@@ -403,6 +416,14 @@ function totalOf(groups: Map<string | null, PricedGroup>): PricedGroup {
 
 export interface Stats {
   window: Window;
+  activity: {
+    models: number;
+    /** Raw counters: input may include cache tokens, depending on provider accounting. */
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    cacheWriteTokens: number;
+  };
   ledger: Ledger;
   classes: ClassRow[];
   depth: DepthRow[];
@@ -416,7 +437,10 @@ export interface Stats {
 export interface Ledger {
   usd: number;
   priorUsd: number;
+  priorCalls: number;
+  priorPricedCalls: number;
   calls: number;
+  pricedCalls: number;
   sessions: number;
   activeHours: number;
   unpricedCalls: number;
@@ -439,16 +463,11 @@ export interface ClassRow {
 
 export interface DepthRow {
   label: string;
-  /** Mean dollars per call in this depth band. Mean, not median, because the per-call rows are
-   * already summed into (session, model, epoch, band, shape) groups by the time pricing runs —
-   * there is no per-call distribution left to take a median of. Labelled as a mean in the UI.
-   *
-   * Not a limit of the database: D1 does not expose median()/percentile() (`SELECT median(x)` →
-   * `no such function`), but it does have window functions, and `usage` is one row per turn — so
-   * an exact median is a `row_number()` away once a per-turn USD column exists. That column is
-   * blocked on pricing moving off the read path, which is #70. */
+  /** Mean dollars per priced call in this band. Unknown costs are excluded from the denominator;
+   * zero is the numerical fallback when pricedCalls is zero, not a claim that those calls were free. */
   usdPerCall: number;
   calls: number;
+  pricedCalls: number;
   sessions: number;
 }
 
@@ -463,6 +482,7 @@ export interface AttributionRow {
   key: string;
   usd: number;
   calls: number;
+  pricedCalls: number;
   sessions: number;
 }
 
@@ -476,6 +496,11 @@ export interface ModelRow {
   model: string;
   usd: number;
   calls: number;
+  pricedCalls: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
   sessions: number;
   usdPerCall: number;
   callsPerSession: number;
@@ -488,12 +513,14 @@ export interface OutlierRow {
   harness: string | null;
   usd: number;
   calls: number;
+  pricedCalls: number;
+  inputTokens: number;
+  outputTokens: number;
 }
 
-/** Turn-depth bands. Context grows monotonically within a session, so a turn's cost is largely a
- * function of how deep it is — these bands are what turn that into a decision about when to
- * start a fresh session. Bounds are literals in SQL, never bound parameters: they are part of
- * the CASE structure, not user input. */
+/** Turn-depth bands describe position within a session, not measured context size.
+ * Bounds are literals in SQL, never bound parameters: they are part of the CASE structure,
+ * not user input. */
 const DEPTH_BANDS: ReadonlyArray<{ label: string; min: number; max: number | null }> = [
   { label: '1–5', min: 0, max: 5 },
   { label: '6–15', min: 5, max: 15 },
@@ -546,14 +573,14 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
 
   // Every query issued at once. Run sequentially these total ~4.3s against the production table;
   // in parallel the page waits only for the slowest.
-  const [scan, gaps, rhythm, counts, priorUsd] = await Promise.all([
+  const [scan, gaps, rhythm, counts, prior] = await Promise.all([
     mainScan(db, main),
     gapHistogram(db, narrow),
     rhythm2d(db, narrow, q.tzOffsetHours),
     sessionCounts(db, narrow),
     // `all` has no prior window to compare against, and running the query anyway would scan the
     // whole table again to produce a number the UI then refuses to show.
-    w.prior.from ? windowTotal(db, priorF) : Promise.resolve(0),
+    w.prior.from ? windowTotal(db, priorF) : Promise.resolve({ usd: 0, calls: 0, pricedCalls: 0 }),
   ]);
 
   const rows = scan
@@ -580,10 +607,20 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
 
   return {
     window: w.current,
+    activity: {
+      models: byModel.size,
+      inputTokens: total.tokens.input,
+      outputTokens: total.tokens.output,
+      cacheReadTokens: total.tokens.cacheRead,
+      cacheWriteTokens: total.tokens.cw5 + total.tokens.cw1h,
+    },
     ledger: {
       usd: total.usd,
-      priorUsd,
+      priorUsd: prior.usd,
+      priorCalls: prior.calls,
+      priorPricedCalls: prior.pricedCalls,
       calls: total.calls,
+      pricedCalls: total.pricedCalls,
       sessions: counts.sessions,
       activeHours: counts.activeSeconds / 3600,
       unpricedCalls: total.unpricedCalls,
@@ -597,16 +634,18 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
       { label: 'Cache read', tokens: total.tokens.cacheRead, usd: total.byClass.cacheRead },
       { label: 'Cache write 5m', tokens: total.tokens.cw5, usd: total.byClass.cacheWrite5m },
       { label: 'Cache write 1h', tokens: total.tokens.cw1h, usd: total.byClass.cacheWrite1h },
-      { label: 'Fresh input', tokens: total.tokens.input, usd: total.byClass.input },
+      { label: 'Input', tokens: total.tokens.input, usd: total.byClass.input },
       { label: 'Output', tokens: total.tokens.output, usd: total.byClass.output },
     ],
     depth: DEPTH_BANDS.map((b) => {
       const g = byBand.get(b.label);
       const calls = g?.calls ?? 0;
+      const pricedCalls = g?.pricedCalls ?? 0;
       return {
         label: b.label,
         calls,
-        usdPerCall: calls > 0 ? (g?.usd ?? 0) / calls : 0,
+        pricedCalls,
+        usdPerCall: pricedCalls > 0 ? (g?.usd ?? 0) / pricedCalls : 0,
         sessions: sessionsPerBand.get(b.label) ?? 0,
       };
     }),
@@ -616,26 +655,32 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
         key: g.key ?? '(none)',
         usd: g.usd,
         calls: g.calls,
+        pricedCalls: g.pricedCalls,
         sessions: sessionsPerAttr.get(g.key ?? null) ?? 0,
       }))
       .sort((a, b) => b.usd - a.usd || b.calls - a.calls)
       .slice(0, ATTRIBUTION_LIMIT),
     rhythm,
     models: [...byModel.values()]
+      .sort((a, b) => compareRank(a, b, q.rank))
+      .slice(0, MODEL_LIMIT)
       .map((g) => {
         const sessions = sessionsPerModel.get(g.key ?? null) ?? 0;
         return {
           model: g.key ?? UNKNOWN_MODEL_LABEL,
           usd: g.usd,
           calls: g.calls,
+          pricedCalls: g.pricedCalls,
+          inputTokens: g.tokens.input,
+          outputTokens: g.tokens.output,
+          cacheReadTokens: g.tokens.cacheRead,
+          cacheWriteTokens: g.tokens.cw5 + g.tokens.cw1h,
           sessions,
-          usdPerCall: g.calls > 0 ? g.usd / g.calls : 0,
+          usdPerCall: g.pricedCalls > 0 ? g.usd / g.pricedCalls : 0,
           callsPerSession: sessions > 0 ? g.calls / sessions : 0,
         };
-      })
-      .sort((a, b) => b.usd - a.usd)
-      .slice(0, MODEL_LIMIT),
-    outliers: await topSessions(db, bySession, rows),
+      }),
+    outliers: await topSessions(db, bySession, rows, q.rank),
   };
 }
 
@@ -651,6 +696,16 @@ function matchesSessionFilters(m: SessionMeta | undefined, q: StatsQuery): boole
 const ATTRIBUTION_LIMIT = 12;
 const MODEL_LIMIT = 8;
 
+
+/** Numeric ties resolve by the raw group key, independent of query order or locale. */
+function compareRank(a: PricedGroup, b: PricedGroup, rank: StatsQuery['rank']): number {
+  const numeric = rank === 'cost' ? b.usd - a.usd || b.calls - a.calls : b.calls - a.calls || b.usd - a.usd;
+  if (numeric) return numeric;
+  if (a.key === b.key) return 0;
+  if (a.key === null) return -1;
+  if (b.key === null) return 1;
+  return a.key < b.key ? -1 : 1;
+}
 /** The attribution key for a row, chosen in memory so all five dimensions come off one scan. */
 function attributionKey(r: MainRow, by: Attribution): string {
   const project = r.meta?.project_name ?? '(no project)';
@@ -756,17 +811,14 @@ async function rhythm2d(db: D1Database, f: Filters, tzOffsetHours: number): Prom
 
 const OUTLIER_LIMIT = 12;
 
-/** The most expensive sessions in the window, with enough identity to click through.
- *
- * Every panel above ends here: a statistic that does not terminate in a link to a specific
- * session is trivia.
- */
+/** Highest-ranked sessions in the window, with enough identity to link to their transcripts. */
 async function topSessions(
   db: D1Database,
   bySession: Map<string | null, PricedGroup>,
   rows: MainRow[],
+  rank: StatsQuery['rank'],
 ): Promise<OutlierRow[]> {
-  const top = [...bySession.values()].sort((a, b) => b.usd - a.usd).slice(0, OUTLIER_LIMIT);
+  const top = [...bySession.values()].sort((a, b) => compareRank(a, b, rank)).slice(0, OUTLIER_LIMIT);
   const ids = top.map((g) => g.key).filter((k): k is string => k !== null);
   if (!ids.length) return [];
   // Only titles are fetched, and only for the twelve rows actually shown. Carrying
@@ -798,6 +850,9 @@ async function topSessions(
         harness: r?.meta?.harness ?? null,
         usd: g.usd,
         calls: g.calls,
+        pricedCalls: g.pricedCalls,
+        inputTokens: g.tokens.input,
+        outputTokens: g.tokens.output,
       };
     });
 }

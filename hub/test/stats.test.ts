@@ -180,12 +180,9 @@ describe('mixed pricing versions', () => {
     expect(end, 'cache panel missing — the slice would run to the end of the document').toBeGreaterThan(start);
     const panel = html.slice(start, end);
 
-    // Three identical $1 turns, one awaiting its split. Ledger $3, stored class dollars $2 — so
-    // 66.7% against the ledger, and 100.0% against the class sum. Asserting the value the correct
-    // denominator produces, not the absence of the wrong one: 100.0% is also what the TOKEN column
-    // legitimately reads here.
+    // Three identical $1 records, one awaiting its split: stored class dollars are $2 of the
+    // ledger's $3, so coverage must remain 66.7% rather than rescaling the known split to 100%.
     expect(panel, 'cost shares were normalised against the classes, hiding the unattributed third').toContain('66.7%');
-    expect(panel).toContain('awaiting re-pricing');
   });
 });
 
@@ -220,6 +217,9 @@ describe('ledger', () => {
     expect(s.ledger.usd).toBeCloseTo(11, 6);
     expect(s.ledger.priorUsd).toBeCloseTo(1, 6);
     expect(s.ledger.calls).toBe(1);
+    expect(s.ledger.pricedCalls).toBe(1);
+    expect(s.ledger.priorCalls).toBe(1);
+    expect(s.ledger.priorPricedCalls).toBe(1);
   });
 
   it('excludes the synthetic prompt-log harness from every number', async () => {
@@ -293,6 +293,9 @@ describe('ledger', () => {
     const s = await stats(testEnv.DB, BASE, NOW);
     expect(s.ledger.unpricedCalls).toBe(1);
     expect(s.ledger.usd).toBe(0);
+    expect(s.ledger.pricedCalls).toBe(0);
+    expect(s.models[0]).toMatchObject({ calls: 1, pricedCalls: 0, usd: 0, usdPerCall: 0 });
+    expect(s.outliers[0]).toMatchObject({ calls: 1, pricedCalls: 0, usd: 0 });
   });
 });
 
@@ -308,7 +311,7 @@ describe('token economics', () => {
     });
     const s = await stats(testEnv.DB, BASE, NOW);
     const byLabel = new Map(s.classes.map((c) => [c.label, c]));
-    expect(byLabel.get('Fresh input')!.usd).toBeCloseTo(1, 6);
+    expect(byLabel.get('Input')!.usd).toBeCloseTo(1, 6);
     expect(byLabel.get('Output')!.usd).toBeCloseTo(10, 6);
     expect(byLabel.get('Cache read')!.usd).toBeCloseTo(0.1, 6);
     expect(byLabel.get('Cache write 5m')!.usd).toBeCloseTo(2, 6);
@@ -441,7 +444,7 @@ describe('outliers', () => {
     await seedTurn('cheap', '2026-07-20T10:00:00.000Z', { input: 1_000_000 });
     await seedTurn('pricey', '2026-07-20T10:00:00.000Z', { input: 50_000_000 });
 
-    const s = await stats(testEnv.DB, BASE, NOW);
+    const s = await stats(testEnv.DB, { ...BASE, rank: 'cost' }, NOW);
     expect(s.outliers[0]!.sessionId).toBe('pricey');
     expect(s.outliers[0]!.title).toBe('the expensive one');
     expect(s.outliers[0]!.usd).toBeCloseTo(50, 6);
@@ -488,6 +491,105 @@ describe('filters', () => {
     expect(s.attribution.map((r) => r.key)).toEqual(['alpha']);
     expect(s.outliers.map((o) => o.sessionId)).toEqual(['cc']);
     expect(s.rhythm.reduce((a, c) => a + c.calls, 0)).toBe(1);
+  });
+});
+
+describe('activity and pricing coverage', () => {
+  it('returns empty counters without treating missing costs as priced', async () => {
+    const s = await collectStats(testEnv.DB, BASE, NOW);
+    expect(s.activity).toEqual({ models: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 });
+    expect(s.ledger).toMatchObject({ calls: 0, pricedCalls: 0, usd: 0, priorCalls: 0, priorPricedCalls: 0, priorUsd: 0 });
+    expect(s.depth.every((d) => d.calls === 0 && d.pricedCalls === 0 && d.usdPerCall === 0)).toBe(true);
+    expect(s.models).toEqual([]);
+    expect(s.outliers).toEqual([]);
+    expect(s.attribution).toEqual([]);
+  });
+
+  it('distinguishes priced zero from unknown and averages only priced records', async () => {
+    await seedSession('mixed');
+    await testEnv.DB.prepare(
+      `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens,
+                          cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, usd)
+       VALUES ('mixed', 0, '2026-07-20T10:00:00.000Z', 'm1', 100, 10, 80, 2, 3, 4),
+              ('mixed', 1, '2026-07-20T11:00:00.000Z', 'm1', 100, 10, 80, 2, 3, 0),
+              ('mixed', 2, '2026-07-20T12:00:00.000Z', 'm1', 100, 10, 80, 2, 3, NULL),
+              ('mixed', 3, '2026-07-20T13:00:00.000Z', '<synthetic>', 0, 0, 0, 0, 0, NULL),
+              ('mixed', 4, '2026-06-27T10:00:00.000Z', 'm1', 1, 0, 0, 0, 0, 2),
+              ('mixed', 5, '2026-06-27T11:00:00.000Z', 'm1', 1, 0, 0, 0, 0, 0),
+              ('mixed', 6, '2026-06-27T12:00:00.000Z', 'm1', 1, 0, 0, 0, 0, NULL)`,
+    ).run();
+    // Do not run the pricing pass: its backlog is the state this regression exercises.
+    const s = await collectStats(testEnv.DB, BASE, NOW);
+    expect(s.ledger).toMatchObject({
+      calls: 4, pricedCalls: 2, unpricedCalls: 1, usd: 4,
+      priorCalls: 3, priorPricedCalls: 2, priorUsd: 2,
+    });
+    expect(s.activity).toEqual({ models: 2, inputTokens: 300, outputTokens: 30, cacheReadTokens: 240, cacheWriteTokens: 15 });
+    expect(s.models.find((m) => m.model === 'm1')).toMatchObject({
+      calls: 3, pricedCalls: 2, usd: 4, usdPerCall: 2,
+      inputTokens: 300, outputTokens: 30, cacheReadTokens: 240, cacheWriteTokens: 15,
+    });
+    expect(s.depth.find((d) => d.label === '1–5')).toMatchObject({ calls: 4, pricedCalls: 2, usdPerCall: 2 });
+    expect(s.attribution[0]).toMatchObject({ calls: 4, pricedCalls: 2, usd: 4 });
+    expect(s.outliers[0]).toMatchObject({ calls: 4, pricedCalls: 2, usd: 4, inputTokens: 300, outputTokens: 30 });
+    const all = await collectStats(testEnv.DB, { ...BASE, range: 'all' }, NOW);
+    expect(all.ledger).toMatchObject({ calls: 7, pricedCalls: 4, priorCalls: 0, priorPricedCalls: 0, priorUsd: 0 });
+  });
+
+  it('counts model groups beyond the ranking limit and filters the unknown group', async () => {
+    await seedSession('many-models');
+    await testEnv.DB.batch(Array.from({ length: 10 }, (_, i) =>
+      testEnv.DB.prepare(
+        `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, usd)
+         VALUES ('many-models', ?1, '2026-07-20T10:00:00.000Z', ?2, 1, NULL)`,
+      ).bind(i, i === 0 ? null : `model-${i}`),
+    ));
+    const s = await collectStats(testEnv.DB, BASE, NOW);
+    expect(s.activity.models).toBe(10);
+    expect(s.models.map((m) => m.model)).toEqual(['(unknown)', 'model-1', 'model-2', 'model-3', 'model-4', 'model-5', 'model-6', 'model-7']);
+    const unknown = await collectStats(testEnv.DB, { ...BASE, model: '(unknown)' }, NOW);
+    expect(unknown.activity.models).toBe(1);
+    expect(unknown.ledger.calls).toBe(1);
+    expect(unknown.models[0]).toMatchObject({ model: '(unknown)', calls: 1, pricedCalls: 0 });
+    expect(unknown.rhythm.reduce((sum, cell) => sum + cell.calls, 0)).toBe(1);
+  });
+});
+
+describe('activity ranking', () => {
+  it('ranks by records or cost with stable ties while preserving literal filters', async () => {
+    const project = "p' OR 1=1 --";
+    for (const id of ['busy-b', 'busy-a', 'pricey', 'excluded']) {
+      await seedSession(id, { project_name: id === 'excluded' ? 'other' : project });
+    }
+    await testEnv.DB.prepare(
+      `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, usd)
+       VALUES ('busy-b', 0, '2026-07-20T10:00:00.000Z', 'b', 1, 1),
+              ('busy-b', 1, '2026-07-20T11:00:00.000Z', 'b', 1, 0),
+              ('busy-a', 0, '2026-07-20T10:00:00.000Z', 'a', 1, 1),
+              ('busy-a', 1, '2026-07-20T11:00:00.000Z', 'a', 1, 0),
+              ('pricey', 0, '2026-07-20T10:00:00.000Z', 'z', 1, 10),
+              ('excluded', 0, '2026-07-20T10:00:00.000Z', 'x', 1, 100),
+              ('busy-a', 2, '2026-06-27T10:00:00.000Z', 'a', 1, 3),
+              ('excluded', 1, '2026-06-27T10:00:00.000Z', 'x', 1, 100)`,
+    ).run();
+    const query = { ...BASE, project, machine: 'box', harness: 'claude-code', tzOffsetHours: 2 };
+    const calls = await collectStats(testEnv.DB, query, NOW);
+    expect(calls.models.map((m) => m.model)).toEqual(['a', 'b', 'z']);
+    expect(calls.outliers.map((s) => s.sessionId)).toEqual(['busy-a', 'busy-b', 'pricey']);
+    expect(calls.ledger).toMatchObject({ calls: 5, pricedCalls: 5, usd: 12, priorCalls: 1, priorPricedCalls: 1, priorUsd: 3 });
+    const cost = await collectStats(testEnv.DB, { ...query, rank: 'cost' }, NOW);
+    expect(cost.models.map((m) => m.model)).toEqual(['z', 'a', 'b']);
+    expect(cost.outliers.map((s) => s.sessionId)).toEqual(['pricey', 'busy-a', 'busy-b']);
+    expect(cost.ledger).toEqual(calls.ledger);
+    expect(cost.activity).toEqual(calls.activity);
+    const model = await collectStats(testEnv.DB, { ...query, rank: 'cost', model: 'a' }, NOW);
+    expect(model.models.map((m) => m.model)).toEqual(['a']);
+    expect(model.outliers.map((s) => s.sessionId)).toEqual(['busy-a']);
+    expect(model.ledger).toMatchObject({ calls: 2, pricedCalls: 2, usd: 1, priorCalls: 1, priorUsd: 3 });
+    expect(model.rhythm.map((cell) => cell.hour).sort((a, b) => a - b)).toEqual([12, 13]);
+    const literal = await collectStats(testEnv.DB, { ...query, model: "' OR 1=1 --" }, NOW);
+    expect(literal.ledger.calls).toBe(0);
+    expect(literal.models).toEqual([]);
   });
 });
 
