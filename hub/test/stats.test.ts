@@ -60,12 +60,15 @@ async function seedPrice(): Promise<void> {
 
 async function seedSession(
   sessionId: string,
-  over: Partial<{ harness: string; machine_id: string; project_name: string; git_branch: string; title: string }> = {},
+  over: Partial<{
+    harness: string; machine_id: string; project_name: string; git_branch: string; title: string;
+    parent_session_id: string;
+  }> = {},
 ): Promise<void> {
   await testEnv.DB.prepare(
     `INSERT INTO sessions (session_id, harness, machine_id, project_name, git_branch, title,
-                           started_at, index_state)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, '2026-07-20T00:00:00Z', 'ready')`,
+                           started_at, index_state, parent_session_id)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, '2026-07-20T00:00:00Z', 'ready', ?7)`,
   )
     .bind(
       sessionId,
@@ -74,6 +77,7 @@ async function seedSession(
       over.project_name ?? 'proj',
       over.git_branch ?? 'main',
       over.title ?? `title-${sessionId}`,
+      over.parent_session_id ?? null,
     )
     .run();
 }
@@ -102,8 +106,32 @@ async function seedTurn(
     .run();
 }
 
+async function seedRollup(
+  sessionId: string,
+  over: Partial<{
+    day: string; model: string; assistantTurns: number; rewoundAssistantTurns: number;
+    toolCalls: number; toolResultSourceBytes: number; repeatedToolCalls: number; comparableToolCalls: number;
+  }> = {},
+): Promise<void> {
+  await testEnv.DB.prepare(
+    `INSERT OR IGNORE INTO session_rollup_state (session_id, status, completed_at)
+     VALUES (?1, 'ready', '2026-08-01T02:00:00.000Z')`,
+  ).bind(sessionId).run();
+  await testEnv.DB.prepare(
+    `INSERT INTO session_rollup (session_id, day, model, assistant_turns, rewound_assistant_turns,
+                                tool_calls, tool_result_source_bytes, repeated_tool_calls, comparable_tool_calls)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)`,
+  ).bind(
+    sessionId, over.day ?? '2026-07-20', over.model ?? 'm1',
+    over.assistantTurns ?? 0, over.rewoundAssistantTurns ?? 0, over.toolCalls ?? 0,
+    over.toolResultSourceBytes ?? 0, over.repeatedToolCalls ?? 0, over.comparableToolCalls ?? 0,
+  ).run();
+}
+
 beforeEach(async () => {
   await testEnv.DB.batch([
+    testEnv.DB.prepare('DELETE FROM session_rollup'),
+    testEnv.DB.prepare('DELETE FROM session_rollup_state'),
     testEnv.DB.prepare('DELETE FROM usage'),
     testEnv.DB.prepare('DELETE FROM starred_turns'),
     testEnv.DB.prepare('DELETE FROM sessions'),
@@ -438,6 +466,25 @@ describe('rhythm', () => {
 });
 
 describe('outliers', () => {
+  it('removes metadata-less usage before ranking and limiting, but retains its spend and tokens', async () => {
+    const realIds = Array.from({ length: 12 }, (_, i) => `real-${String(i).padStart(2, '0')}`);
+    for (const id of realIds) {
+      await seedSession(id);
+      await seedTurn(id, '2026-07-20T10:00:00.000Z', { input: 1_000_000 });
+    }
+    for (let i = 0; i < 13; i++) {
+      // No sessions row; these are real historical usage, not linkable transcripts.
+      await seedTurn(`orphan-${i}`, '2026-07-20T10:00:00.000Z', { input: 100_000_000 });
+      await seedTurn(`orphan-${i}`, '2026-07-20T11:00:00.000Z', { input: 100_000_000 });
+    }
+    for (const rank of ['calls', 'cost'] as const) {
+      const s = await stats(testEnv.DB, { ...BASE, rank }, NOW);
+      expect(s.outliers.map((row) => row.sessionId)).toEqual(realIds);
+      expect(s.ledger).toMatchObject({ calls: 38, pricedCalls: 38, usd: 2612 });
+      expect(s.activity.inputTokens).toBe(2_612_000_000);
+    }
+  });
+
   it('ranks sessions by cost and carries a title through for the link', async () => {
     await seedSession('cheap', { title: 'a cheap one' });
     await seedSession('pricey', { title: 'the expensive one' });
@@ -590,6 +637,144 @@ describe('activity ranking', () => {
     const literal = await collectStats(testEnv.DB, { ...query, model: "' OR 1=1 --" }, NOW);
     expect(literal.ledger.calls).toBe(0);
     expect(literal.models).toEqual([]);
+  });
+});
+
+describe('rollup diagnostics', () => {
+  it('applies literal dimensions and both readiness gates, exposing pending coverage and block-only sessions', async () => {
+    const project = "p' OR 1=1 --";
+    for (const id of ['ready', 'pending', 'building', 'indexing', 'block-only', 'other-model']) {
+      await seedSession(id, { project_name: project });
+    }
+    await seedSession('other-harness', { project_name: project, harness: 'codex' });
+    await seedSession('other-machine', { project_name: project, machine_id: 'elsewhere' });
+    await seedSession('other-project');
+    await seedSession('synthetic', { project_name: project, harness: 'prompt-log' });
+    for (const id of ['ready', 'pending', 'building', 'indexing']) {
+      await seedTurn(id, '2026-07-20T10:00:00.000Z');
+    }
+    await seedRollup('ready', {
+      assistantTurns: 2, rewoundAssistantTurns: 1, toolCalls: 4,
+      toolResultSourceBytes: 100, repeatedToolCalls: 1, comparableToolCalls: 3,
+    });
+    await seedRollup('block-only', { assistantTurns: 3, toolCalls: 6, toolResultSourceBytes: 200 });
+    await testEnv.DB.prepare(
+      `UPDATE session_rollup_state SET completed_at = '2026-07-31T02:00:00.000Z' WHERE session_id = 'block-only'`,
+    ).run();
+    for (const id of ['building', 'indexing', 'other-harness', 'other-machine', 'other-project', 'synthetic']) {
+      await seedRollup(id, { assistantTurns: 100, toolCalls: 1000 });
+    }
+    await seedRollup('other-model', { model: 'm2', assistantTurns: 100, toolCalls: 1000 });
+    await testEnv.DB.prepare(`UPDATE session_rollup_state SET status = 'building' WHERE session_id = 'building'`).run();
+    await testEnv.DB.prepare(`UPDATE sessions SET index_state = 'pending' WHERE session_id = 'indexing'`).run();
+    // The ingestion trigger normally invalidates this state too. Keep a stale ready state here
+    // to defend the reader's independent sessions.index_state gate.
+    await testEnv.DB.prepare(
+      `UPDATE session_rollup_state SET status = 'ready', completed_at = '2026-08-01T02:00:00.000Z'
+       WHERE session_id = 'indexing'`,
+    ).run();
+    const s = await collectStats(testEnv.DB, {
+      ...BASE, harness: 'claude-code', machine: 'box', project, model: 'm1',
+    }, NOW);
+    expect(s.waste.coverage).toEqual({
+      eligibleSessions: 5, readySessions: 2, coveredSessions: 2,
+      oldestCompletedAt: '2026-07-31T02:00:00.000Z', newestCompletedAt: '2026-08-01T02:00:00.000Z',
+    });
+    expect(s.waste.diagnostics).toEqual({
+      assistantTurns: 5, rewoundAssistantTurns: 1, toolCalls: 10, toolResultSourceBytes: 300,
+      repeatedToolCalls: 1, comparableToolCalls: 3, toolCallsPerTurn: 2, rewindRate: 0.2,
+      repeatedToolCallRate: 1 / 3,
+    });
+    expect(s.models[0]).toMatchObject({ model: 'm1', calls: 4, toolCallsPerTurn: 2 });
+    expect((await collectStats(testEnv.DB, { ...BASE, harness: 'prompt-log' }, NOW)).waste.diagnostics).toBeNull();
+  });
+
+  it('excludes both partial boundary days and includes unknown timestamps only for all', async () => {
+    await seedSession('days');
+    await seedTurn('days', '2026-08-01T10:00:00.000Z');
+    for (const day of ['', '2026-07-01', '2026-07-02', '2026-07-03', '2026-07-31', '2026-08-01']) {
+      await seedRollup('days', { day, assistantTurns: 1, toolCalls: 2 });
+    }
+    const bounded = await collectStats(testEnv.DB, BASE, NOW);
+    expect(bounded.waste.range).toEqual({ from: '2026-07-03', to: '2026-08-01', timestampScope: 'dated' });
+    expect(bounded.waste.diagnostics?.assistantTurns).toBe(2);
+    expect(bounded.ledger.calls).toBe(1);
+    const midnight = await collectStats(testEnv.DB, BASE, new Date('2026-08-01T00:00:00.000Z'));
+    expect(midnight.waste.range.from).toBe('2026-07-02');
+    expect(midnight.waste.diagnostics?.assistantTurns).toBe(3);
+    const all = await collectStats(testEnv.DB, { ...BASE, range: 'all' }, NOW);
+    expect(all.waste.range).toEqual({ from: null, to: '2026-08-01', timestampScope: 'including-undated' });
+    expect(all.waste.diagnostics?.assistantTurns).toBe(5);
+  });
+
+  it('distinguishes unbuilt or empty scope from covered zero and a zero-denominator ratio', async () => {
+    await seedSession('zero');
+    await seedTurn('zero', '2026-07-20T10:00:00.000Z');
+    const unbuilt = await collectStats(testEnv.DB, BASE, NOW);
+    expect(unbuilt.waste.diagnostics).toBeNull();
+    expect(unbuilt.waste.coverage).toMatchObject({ eligibleSessions: 1, readySessions: 0, coveredSessions: 0 });
+    expect(unbuilt.models[0]!.toolCallsPerTurn).toBeNull();
+    await seedRollup('zero');
+    const zero = await collectStats(testEnv.DB, BASE, NOW);
+    expect(zero.waste.diagnostics).toMatchObject({
+      assistantTurns: 0, toolCalls: 0, toolResultSourceBytes: 0, toolCallsPerTurn: null,
+      rewindRate: null, repeatedToolCallRate: null,
+    });
+    await testEnv.DB.prepare(`UPDATE session_rollup SET assistant_turns = 4 WHERE session_id = 'zero'`).run();
+    const measured = await collectStats(testEnv.DB, BASE, NOW);
+    expect(measured.models[0]!.toolCallsPerTurn).toBe(0);
+    expect(measured.waste.diagnostics?.rewindRate).toBe(0);
+    const empty = await collectStats(testEnv.DB, { ...BASE, project: 'absent' }, NOW);
+    expect(empty.waste.coverage.eligibleSessions).toBe(0);
+    expect(empty.waste.diagnostics).toBeNull();
+  });
+
+  it('uses rolled distinct assistant turns rather than usage record counts, including the unknown model', async () => {
+    await seedSession('models');
+    await testEnv.DB.prepare(
+      `INSERT INTO usage (session_id, turn_index, ts, model)
+       VALUES ('models', 0, '2026-07-20T10:00:00.000Z', 'm1'),
+              ('models', 1, '2026-07-20T11:00:00.000Z', 'm1'),
+              ('models', 2, '2026-07-20T12:00:00.000Z', 'm1'),
+              ('models', 3, '2026-07-20T13:00:00.000Z', 'unbuilt-model'),
+              ('models', 4, '2026-07-20T14:00:00.000Z', NULL)`,
+    ).run();
+    await seedRollup('models', { assistantTurns: 2, toolCalls: 6 });
+    await seedRollup('models', { model: '(unknown)', assistantTurns: 1, toolCalls: 2 });
+    const s = await collectStats(testEnv.DB, BASE, NOW);
+    expect(s.models.find((row) => row.model === 'm1')).toMatchObject({ calls: 3, toolCallsPerTurn: 3 });
+    expect(s.models.find((row) => row.model === 'unbuilt-model')!.toolCallsPerTurn).toBeNull();
+    const unknown = await collectStats(testEnv.DB, { ...BASE, model: '(unknown)' }, NOW);
+    expect(unknown.models).toMatchObject([{ model: '(unknown)', calls: 1, toolCallsPerTurn: 2 }]);
+    expect(unknown.waste.diagnostics).toMatchObject({ assistantTurns: 1, toolCalls: 2 });
+  });
+});
+
+describe('direct linked-child spend', () => {
+  it('counts each filtered child usage group once without recursion or treating unknown cost as free', async () => {
+    await seedSession('parent', { project_name: 'outside' });
+    await seedSession('child', { parent_session_id: 'parent' });
+    await seedSession('grandchild', { parent_session_id: 'child' });
+    await seedSession('excluded-child', { parent_session_id: 'parent', project_name: 'outside' });
+    await testEnv.DB.prepare(
+      `INSERT INTO usage (session_id, turn_index, ts, model, usd)
+       VALUES ('parent', 0, '2026-07-20T10:00:00.000Z', 'm1', 100),
+              ('child', 0, '2026-07-20T10:00:00.000Z', 'm1', 1),
+              ('child', 1, '2026-07-20T11:00:00.000Z', 'm1', 0),
+              ('child', 10, '2026-07-20T12:00:00.000Z', 'm1', NULL),
+              ('child', 11, '2026-06-20T12:00:00.000Z', 'm1', 100),
+              ('grandchild', 0, '2026-07-20T10:00:00.000Z', 'm1', 2),
+              ('excluded-child', 0, '2026-07-20T10:00:00.000Z', 'm1', 100),
+              ('orphan', 0, '2026-07-20T10:00:00.000Z', 'm1', 100)`,
+    ).run();
+    const s = await collectStats(testEnv.DB, { ...BASE, project: 'proj', model: 'm1', machine: 'box' }, NOW);
+    expect(s.waste.subagentSpend).toEqual({ usd: 3, calls: 4, pricedCalls: 3, sessions: 2, parents: 2 });
+    expect(s.ledger).toMatchObject({ usd: 3, calls: 4, pricedCalls: 3 });
+    const allProjects = await collectStats(testEnv.DB, BASE, NOW);
+    expect(allProjects.waste.subagentSpend).toEqual({ usd: 103, calls: 5, pricedCalls: 4, sessions: 3, parents: 2 });
+    expect(allProjects.ledger).toMatchObject({ usd: 303, calls: 7, pricedCalls: 6 });
+    const empty = await collectStats(testEnv.DB, { ...BASE, model: 'absent' }, NOW);
+    expect(empty.waste.subagentSpend).toEqual({ usd: 0, calls: 0, pricedCalls: 0, sessions: 0, parents: 0 });
   });
 });
 

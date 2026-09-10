@@ -376,11 +376,12 @@ const HOST_ROUTABLE_REQUEST_MS = 10_000;
  * push on every new PR raced route activation and merely usually won: PR #143 read the live
  * Worker 12ms after this step printed its summary, PR #146 read 404 after 190ms and failed the
  * bearer gate, and the same URL answered 401 minutes later with no redeploy in between.
- * Waiting here — not in the caller — keeps every downstream consumer (the smoke gate, the
- * seeder, the browser suite, the deployment link on the PR) free to assume the origin is live.
  * `/healthz` is the Worker's own unauthenticated liveness route, so a 200 proves this Worker
- * answers rather than merely that the name resolves. A host that never answers is a real deploy
- * failure and still fails, here, in the step that deployed it, naming the host.
+ * answered that request rather than merely that the name resolves. This is an initial gate,
+ * not a promise that every subsequent request will route: PR #150 passed healthz and authenticated
+ * diagnostics, then its first fixture PUT got Cloudflare's HTML 404. The identical PUT later
+ * returned 201 without a redeploy. The seeder therefore handles that specific routing response
+ * on its idempotent uploads too. A host that never answers still fails here, naming the host.
  */
 async function awaitRoutableHost(host) {
   const origin = `https://${host}`;
@@ -676,7 +677,7 @@ async function seed() {
   for (const [relative, bytes] of uploads) {
     const encoded = relative.split('/').map(encodeURIComponent).join('/');
     const target = `/api/v1/files/${encodeURIComponent(machine)}/${encodeURIComponent(store)}/${encoded}`;
-    const response = await previewFetch(context, target, {
+    const init = {
       method: 'PUT',
       body: bytes,
       headers: {
@@ -685,9 +686,45 @@ async function seed() {
         'x-content-hash': `sha256:${sha256Bytes(bytes)}`,
         'x-file-mtime': '2026-07-01T00:00:00.000Z',
       },
-    });
-    if (response.status !== 200 && response.status !== 201) {
-      fail(`synthetic preview upload failed with ${response.status}: ${(await response.text()).slice(0, 500)}`);
+    };
+    // Routing is not monotonic after healthz/diagnostics pass (PR #150). Only replay these
+    // content-addressed synthetic PUTs, and only for Cloudflare's identifiable no-worker page.
+    const deadline = Date.now() + HOST_ROUTABLE_SETTLE_MS;
+    let seen = 'no response';
+    const timeout = () => fail(`synthetic preview upload timed out at ${context.origin}${target} `
+      + `after ${HOST_ROUTABLE_SETTLE_MS / 1000}s: ${seen}`);
+    for (let attempt = 1; ; attempt += 1) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) timeout();
+      let response;
+      let body;
+      try {
+        response = await previewFetch(context, target, {
+          ...init,
+          signal: AbortSignal.timeout(Math.min(HOST_ROUTABLE_REQUEST_MS, remaining)),
+        });
+        seen = `status ${response.status}`;
+        body = await response.text();
+      } catch (error) {
+        if (Date.now() >= deadline) timeout();
+        fail(`synthetic preview upload failed at ${context.origin}${target}: ${seen}; `
+          + `request ${error.name ?? 'Error'}`);
+      }
+      // Include body consumption in the deadline; a late 201 must not count as success.
+      if (Date.now() >= deadline) timeout();
+      if (response.status === 200 || response.status === 201) break;
+      const noWorker = response.status === 404
+        && /^text\/html(?:\s*;|$)/i.test(response.headers.get('content-type') ?? '')
+        && /<title>\s*Page not found\s*<\/title>/i.test(body)
+        && /<link\b(?=[^>]*\brel\s*=\s*["'](?:shortcut\s+)?icon["'])(?=[^>]*\bhref\s*=\s*["']https:\/\/workers\.cloudflare\.com\/[^"']*["'])[^>]*>/i.test(body);
+      if (!noWorker) {
+        fail(`synthetic preview upload failed at ${context.origin}${target}: ${seen}`);
+      }
+      process.stderr.write(`synthetic preview upload ${context.origin}${target} attempt ${attempt} `
+        + `returned Cloudflare no-worker 404; retrying\n`);
+      await new Promise((resolve) => {
+        setTimeout(resolve, Math.min(HOST_ROUTABLE_POLL_MS, deadline - Date.now()));
+      });
     }
   }
   const expected = [

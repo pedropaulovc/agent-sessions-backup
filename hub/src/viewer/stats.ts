@@ -29,6 +29,7 @@ export async function statsPage(url: URL, env: Env): Promise<Response> {
     rankingControls(url, query) +
     modelsPanel(stats, url) +
     outliersPanel(stats) +
+    wastePanel(stats) +
     `<details class="stats-analysis"><summary>Cost and context analysis</summary>` +
     `<nav class="stats-panel-links" aria-label="Analysis panels">` +
     `<a href="#ledger">Cost</a><a href="#shape">Depth</a><a href="#classes">Token classes</a>` +
@@ -93,7 +94,8 @@ function subhead(s: Stats, query: StatsQuery): string {
   ].filter(Boolean);
   return (
     `<p class="muted small stats-scope">Usage window: ${esc(from)} → ${esc(to)}. ` +
-    `All counts use this window and these filters; child sessions count separately.` +
+    `Usage counts use this window and these filters; child sessions count separately. ` +
+    `Nightly block metrics use the separate UTC-day scope shown below.` +
     `${filters.length ? `<br>Filtered by ${esc(filters.join(' · '))}` : ''}</p>`
   );
 }
@@ -386,16 +388,20 @@ function modelsPanel(s: Stats, url: URL): string {
       `<td class="num" title="${fmtInt(m.inputTokens)} input; ${fmtInt(m.outputTokens)} output">${fmtTokens(m.inputTokens)}<span class="stats-cell-note">${fmtTokens(m.outputTokens)}</span></td>` +
       `<td class="num" title="${fmtInt(m.cacheReadTokens)} cache read; ${fmtInt(m.cacheWriteTokens)} cache write">${fmtTokens(m.cacheReadTokens)}<span class="stats-cell-note">${fmtTokens(m.cacheWriteTokens)}</span></td>` +
       `<td class="num">${knownCost(m.usd, m.pricedCalls, m.calls)}<span class="stats-cell-note">${costCoverage(m.pricedCalls, m.calls)}</span></td>` +
-      `<td class="num">${m.pricedCalls > 0 ? fmtUsd(m.usdPerCall, 4) : '—'}</td></tr>`;
+      `<td class="num">${m.pricedCalls > 0 ? fmtUsd(m.usdPerCall, 4) : '—'}</td>` +
+      `<td class="num">${m.toolCallsPerTurn === null ? '—' : m.toolCallsPerTurn.toFixed(2)}</td></tr>`;
   }).join('');
   return panel(
     'models',
     'Model activity',
     `${s.activity.models > s.models.length ? `Top ${fmtInt(s.models.length)} of ${fmtInt(s.activity.models)} model groups. ` : ''}` +
-      'Usage share is of all matching records, including groups outside this table. Select a model to filter this page.',
+      'Usage share is of all matching records, including groups outside this table. Select a model to filter this page. ' +
+      'Tool calls per assistant turn use nightly block metrics, not usage-record counts; see the ' +
+      '<a href="#waste">separate UTC-day scope and coverage</a> below.',
     tableScroll('Model activity', `<table class="chart stats-model-table"><thead><tr><th>Model / sessions</th><th>Usage records</th><th>Usage share</th>` +
-      `<th class="num">Input<br>Output</th><th class="num">Cache read<br>Cache write</th><th class="num">Known cost / coverage</th><th class="num">Mean $ / priced record</th></tr></thead>` +
-      `<tbody>${rows || '<tr><td colspan="7" class="muted">No usage in this window.</td></tr>'}</tbody></table>`),
+      `<th class="num">Input<br>Output</th><th class="num">Cache read<br>Cache write</th><th class="num">Known cost / coverage</th><th class="num">Mean $ / priced record</th>` +
+      `<th class="num">Tool calls /<br>assistant turn</th></tr></thead>` +
+      `<tbody>${rows || '<tr><td colspan="8" class="muted">No usage in this window.</td></tr>'}</tbody></table>`),
   );
 }
 
@@ -414,6 +420,63 @@ function outliersPanel(s: Stats): string {
     `Top ${fmtInt(s.outliers.length)} sessions with matching usage. Open a transcript to inspect the work.`,
     tableScroll('Session ranking', `<table class="chart stats-session-table"><thead><tr><th>Session</th><th>Usage records</th><th>Input</th><th>Output</th><th>Known cost / coverage</th></tr></thead>` +
       `<tbody>${rows || '<tr><td colspan="5" class="muted">No usage in this window.</td></tr>'}</tbody></table>`),
+  );
+}
+
+function wastePanel(s: Stats): string {
+  const { range, coverage, diagnostics: d, subagentSpend: spend } = s.waste;
+  const scope = range.from !== null && range.to !== null && range.from >= range.to
+    ? 'No complete UTC days fall inside this usage window.'
+    : `Complete UTC-day scope: ${esc(range.from ?? 'the beginning')} → ${esc(range.to ?? 'all recorded days')}` +
+      `${range.to === null ? '' : ' (end exclusive)'}.`;
+  const coverageText = coverage.eligibleSessions > 0
+    ? `${fmtInt(coverage.readySessions)} / ${fmtInt(coverage.eligibleSessions)} known matching sessions have a current, fully published rollup; ` +
+      `${fmtInt(coverage.coveredSessions)} have buckets in this UTC-day scope.`
+    : 'No known matching sessions; nightly coverage is unavailable.';
+  const tiles = [
+    tile(d === null ? '—' : fmtInt(d.rewoundAssistantTurns), 'Rewound assistant turns',
+      d === null ? 'Nightly block metrics unavailable'
+        : `${fmtInt(d.assistantTurns)} assistant turns indexed; ` +
+          (d.rewindRate === null ? 'rewind rate unavailable' : `${(d.rewindRate * 100).toFixed(1)}% off the main path`)),
+    tile(d === null ? '—' : `${fmtInt(d.toolResultSourceBytes)} bytes`, 'Indexed tool-result source bytes',
+      'Source-span proxy, not context tokens or cost'),
+    tile(d === null ? '—' : fmtInt(d.repeatedToolCalls), 'Repeated complete tool calls',
+      d === null ? 'Nightly block metrics unavailable'
+        : `${fmtInt(d.comparableToolCalls)} / ${fmtInt(d.toolCalls)} calls comparable; ` +
+          (d.repeatedToolCallRate === null ? 'repeat rate unavailable' : `${(d.repeatedToolCallRate * 100).toFixed(1)}% repeated`)),
+    tile(knownCost(spend.usd, spend.pricedCalls, spend.calls), 'Direct child / subagent known spend',
+      `${costCoverage(spend.pricedCalls, spend.calls)}; usage window, not UTC-day scope`),
+  ].join('');
+  const comparable = d === null
+    ? 'Comparable tool-call coverage is unavailable until matching rollup buckets are published.'
+    : `Comparable tool-call coverage: ${fmtInt(d.comparableToolCalls)} / ${fmtInt(d.toolCalls)} indexed calls` +
+      (d.toolCalls > 0 ? ` (${((d.comparableToolCalls / d.toolCalls) * 100).toFixed(1)}%)` : ' (rate unavailable)') +
+      '. Only complete indexed arguments can be compared; partial or missing arguments are excluded.';
+  const unpriced = spend.pricedCalls < spend.calls
+    ? ` ${fmtInt(spend.calls - spend.pricedCalls)} child usage records are unpriced and excluded from the known subtotal.`
+    : '';
+  return panel(
+    'waste',
+    'Waste diagnostics',
+    'Rewinds and repeated calls are diagnostic signals, not proven waste or a measure of quality.',
+    `<p class="small muted">${scope} ` +
+      `${range.timestampScope === 'including-undated' ? 'Includes the unknown-timestamp bucket; the current partial UTC day is excluded.' : 'Only complete UTC days inside the usage window; partial days and unknown timestamps are excluded.'}</p>` +
+      `<p class="small muted">Nightly coverage: ${coverageText} Coverage counts known matching sessions, not the entire archive. ` +
+      `Oldest covered publication: ${esc(coverage.oldestCompletedAt ?? 'Unknown')}. ` +
+      `Newest covered publication: ${esc(coverage.newestCompletedAt ?? 'Unknown')}.</p>` +
+      (d === null ? `<p class="small flag">No matching published block metrics. — means unavailable, not zero.</p>` : '') +
+      `<div class="tiles">${tiles}</div>` +
+      `<details class="stats-limitations"><summary>Metric definitions</summary>` +
+      `<p class="small muted">${comparable} Repeated calls match the tool name and exact indexed argument text across all days and models within a session. ` +
+      `Each repeat after the first belongs to the later call's UTC day and model. This is not semantic equivalence or proof of unnecessary work.</p>` +
+      `<p class="small muted">Tool-result <code>byte_len</code> measures indexed source spans. It is a proxy for result volume, ` +
+      `not a measurement of bytes sent to the model, context occupancy, tokens, or dollars. ` +
+      `Turn dates come from the first indexed block's timestamp. Block model attribution requires a unique usage record at the same turn; ` +
+      `otherwise the model is unknown.</p>` +
+      `<p class="small muted">Child spend uses matching stored usage in ${fmtInt(spend.sessions)} direct child sessions linked to ` +
+      `${fmtInt(spend.parents)} parents by <code>parent_session_id</code>, with the current usage window and filters. ` +
+      `It is already part of usage cost, not an extra charge or a recursive descendant total.${unpriced} ` +
+      `Unknown cost is not zero; stored list prices are not invoices. These measures are not added into a total.</p></details>`,
   );
 }
 

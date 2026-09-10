@@ -13,6 +13,8 @@ Session details keep the transcript visible by default. Expand **Activity trace*
 
 **Statistics** starts with usage counts, separate reported token counters, model shares, and linked session rankings. Rank by activity or known cost, or select a model to filter the page. Cost and context analysis stays available in a disclosure. Unpriced records are marked unknown; partial costs are subtotals, and overlapping input/cache counters are not added into a token total.
 
+Nightly, checkpointed rollups supply rewound assistant turns, indexed tool-result source bytes, repeated complete tool calls, and tool calls per assistant turn without scanning transcript blocks on page loads. These diagnostics show their complete-UTC-day scope, publication time, and coverage. Repeated calls and source bytes are inspection signals, not proof of waste or quality. Direct-child spend uses the filtered usage window and retains unknown-price coverage; records without session metadata remain in usage totals but cannot enter linked rankings.
+
 ## Layout
 
 | Path | What |
