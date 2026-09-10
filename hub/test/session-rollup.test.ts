@@ -47,6 +47,33 @@ async function race(mutate: () => Promise<void>, body: () => Promise<unknown>): 
   } finally { db.batch = original; }
 }
 
+/** Fail the first source read, optionally after another runner commits a newer checkpoint. */
+async function sourceFailure(mutate: () => Promise<void>, body: () => Promise<unknown>): Promise<unknown> {
+  const originalPrepare = db.prepare.bind(db);
+  let fired = false;
+  db.prepare = (sql: string) => {
+    const statement = originalPrepare(sql);
+    if (sql.includes('FROM blocks b LEFT JOIN usage') && !fired) {
+      const originalBind = statement.bind.bind(statement);
+      statement.bind = (...values: unknown[]) => {
+        const bound = originalBind(...values);
+        bound.all = async () => {
+          fired = true;
+          await mutate();
+          throw new Error('injected source read failure');
+        };
+        return bound;
+      };
+    }
+    return statement;
+  };
+  try {
+    const result = await body();
+    expect(fired, 'a source read must actually fail').toBe(true);
+    return result;
+  } finally { db.prepare = originalPrepare; }
+}
+
 afterEach(async () => {
   await db.batch([
     db.prepare('DELETE FROM blocks WHERE session_id LIKE ?1').bind(PREFIX + '%'),
@@ -143,6 +170,70 @@ describe('nightly session rollup', () => {
     expect(await published(id)).toMatchObject([{ assistant_turns: 4, tool_calls: 4, repeated_tool_calls: 0 }]);
     expect(await db.prepare('SELECT COUNT(*) AS n FROM session_rollup_seen_calls WHERE session_id = ?1')
       .bind(id).first()).toEqual({ n: 0 });
+  });
+
+  it('defers a poisoned checkpoint once per invocation while healthy sessions continue', async () => {
+    const broken = await seedSession('a-poison');
+    const healthy = await seedSession('b-healthy');
+    await block(broken, 0, 0);
+    await block(healthy, 0, 0);
+    await db.prepare('UPDATE session_rollup_state SET turn_state = ?2 WHERE session_id = ?1')
+      .bind(broken, '{invalid json').run();
+    const result = await runSessionRollup(db, { maxPages: 5, now: new Date(DAY) });
+    expect(result).toMatchObject({ failed: 1, completed: 1, pages: 2, pending: 1, remaining: 'pending' });
+    expect(await published(healthy)).toMatchObject([{ assistant_turns: 1, tool_calls: 1 }]);
+    expect(await published(broken)).toEqual([]);
+    expect(await db.prepare('SELECT cursor_id, last_attempt FROM session_rollup_state WHERE session_id = ?1')
+      .bind(broken).first()).toEqual({ cursor_id: 0, last_attempt: new Date(DAY).getTime() });
+  });
+
+  it('counts a failed source read against the page budget without starving healthy work or losing retry progress', async () => {
+    const broken = await seedSession('a-read-failure');
+    const healthy = await seedSession('b-read-healthy');
+    await block(broken, 0, 0);
+    await block(healthy, 0, 0);
+    expect(await sourceFailure(async () => {}, () => runSessionRollup(db, { maxPages: 2 })))
+      .toMatchObject({ failed: 1, pages: 2, completed: 1, pending: 1 });
+    expect(await published(healthy)).toMatchObject([{ assistant_turns: 1 }]);
+    expect(await published(broken)).toEqual([]);
+    expect(await runSessionRollup(db)).toMatchObject({ failed: 0, completed: 1, pending: 0 });
+    expect(await published(broken)).toMatchObject([{ assistant_turns: 1, repeated_tool_calls: 0 }]);
+  });
+
+  it('does not overwrite a newer checkpoint when recording a source read failure', async () => {
+    const id = await seedSession('read-race');
+    await block(id, 0, 0);
+    await block(id, 1, 0);
+    const future = new Date('2026-08-02T12:00:00Z');
+    expect(await sourceFailure(
+      async () => { await runSessionRollup(db, { pageSize: 1, maxPages: 1, now: future }); },
+      () => runSessionRollup(db, { pageSize: 1, maxPages: 1, now: new Date(DAY) }),
+    )).toMatchObject({ failed: 1, superseded: 1, pages: 1 });
+    expect(await db.prepare('SELECT cursor_turn, last_attempt FROM session_rollup_state WHERE session_id = ?1')
+      .bind(id).first()).toEqual({ cursor_turn: 0, last_attempt: future.getTime() });
+    await runSessionRollup(db);
+    expect(await published(id)).toMatchObject([{ assistant_turns: 2, tool_calls: 2, repeated_tool_calls: 1 }]);
+  });
+
+  it('handles a maximum page of complete calls whose JSON escaping exceeds one D1 value', async () => {
+    const id = await seedSession('escaped');
+    const argument = '\u0001'.repeat(2040);
+    const rows = Array.from({ length: 500 }, (_, index) => `${index % 250}:${argument}`);
+    // This fixture crosses the 2 MiB value boundary despite each source text being below 2 KiB.
+    expect(new TextEncoder().encode(JSON.stringify(rows.map((text) => ['read', text]))).byteLength)
+      .toBeGreaterThan(2 * 1024 * 1024);
+    for (let start = 0; start < rows.length; start += 50) {
+      await db.batch(rows.slice(start, start + 50).map((text, offset) =>
+        db.prepare(`INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype,
+          tool_name, ts, text) VALUES (?1, 0, ?2, 0, 'assistant', 'tool_use', 'read', ?3, ?4)`)
+          .bind(id, start + offset, DAY, text)));
+    }
+    // A later page must look up the same escaped identity, not just deduplicate in memory.
+    await block(id, 500, 0, { text: rows[0]! });
+    expect(await runSessionRollup(db, { pageSize: 500 })).toMatchObject({ completed: 1, failed: 0 });
+    expect(await published(id)).toMatchObject([{
+      assistant_turns: 501, tool_calls: 501, comparable_tool_calls: 501, repeated_tool_calls: 251,
+    }]);
   });
 
   it('cannot publish after deletion and clears ready eligibility when a session errors', async () => {

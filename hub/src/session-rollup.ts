@@ -13,6 +13,7 @@ export interface SessionRollupResult {
   pages: number;
   completed: number;
   superseded: number;
+  failed: number;
   pending: number;
   remaining: 'pending' | 'complete';
 }
@@ -71,6 +72,10 @@ const ELIGIBLE = `eligible = 1 AND status != 'ready'
 const COMMIT_GUARD = `EXISTS (SELECT 1 FROM session_rollup_state st JOIN sessions s USING (session_id)
   WHERE st.session_id = ?1 AND st.commit_token = ?2 AND st.eligible = 1 AND s.index_state = 'ready')`;
 
+// Bound serialized UTF-8, not source characters: JSON control escapes can expand 6x.
+// Lookup chunks share one D1 batch; insert chunks share the guarded cursor transaction.
+const CALL_KEY_CHUNK_BYTES = 256 * 1024;
+
 /** Bounded durable pass. A page, its dedup keys, and its cursor commit in one D1 transaction.
  * The first block of each turn supplies its timestamp to ALL that turn's metrics; absent or
  * invalid timestamps belong to ''. Model evidence comes only from the unique usage turn row.
@@ -85,15 +90,51 @@ export async function runSessionRollup(
   const maxPages = positiveInteger(options.maxPages ?? 80, 'maxPages');
   const pageSize = Math.min(500, positiveInteger(options.pageSize ?? 250, 'pageSize'));
   const result: SessionRollupResult = {
-    examined: 0, pages: 0, completed: 0, superseded: 0, pending: 0, remaining: 'complete',
+    examined: 0, pages: 0, completed: 0, superseded: 0, failed: 0, pending: 0, remaining: 'complete',
   };
+  const failedSessions: string[] = [];
   while (result.pages < maxPages && result.examined < maxBlocks) {
     // Least recently attempted, not lowest session id: unfinished sessions rotate fairly.
     const checkpoint = await db.prepare(`SELECT session_id, generation, cursor_turn, cursor_block,
       cursor_id, turn_state, last_attempt, finishing, commit_token FROM session_rollup_state
-      WHERE ${ELIGIBLE} ORDER BY last_attempt, session_id LIMIT 1`).first<Checkpoint>();
+      WHERE ${ELIGIBLE} AND session_id NOT IN (SELECT value FROM json_each(?1))
+      ORDER BY last_attempt, session_id LIMIT 1`)
+      .bind(JSON.stringify(failedSessions)).first<Checkpoint>();
     if (!checkpoint) break;
-    const limit = Math.min(pageSize, maxBlocks - result.examined);
+    result.pages++;
+    try {
+      await rollupPage(db, checkpoint, Math.min(pageSize, maxBlocks - result.examined),
+        pageSize, options.now ?? new Date(), result);
+    } catch (error) {
+      // Do not advance a failed checkpoint or overwrite a concurrent winner. If D1 itself is
+      // unavailable this bookkeeping also throws, propagating the invocation-level failure.
+      const deferred = await db.prepare(`UPDATE session_rollup_state SET last_attempt = MAX(last_attempt, ?7)
+        WHERE session_id = ?1 AND generation = ?2 AND cursor_turn = ?3 AND cursor_block = ?4
+          AND cursor_id = ?5 AND commit_token IS ?6 AND ${ELIGIBLE}`)
+        .bind(checkpoint.session_id, checkpoint.generation, checkpoint.cursor_turn, checkpoint.cursor_block,
+          checkpoint.cursor_id, checkpoint.commit_token,
+          Math.max((options.now ?? new Date()).getTime(), checkpoint.last_attempt + 1)).run();
+      if ((deferred.meta.changes ?? 0) === 0) result.superseded++;
+      result.failed++;
+      failedSessions.push(checkpoint.session_id);
+      console.log(JSON.stringify({ event: 'hub.session_rollup.page_failed', session_id: checkpoint.session_id,
+        error: error instanceof Error ? error.message : String(error) }));
+    }
+  }
+  result.pending = (await db.prepare(`SELECT COUNT(*) AS n FROM session_rollup_state
+    WHERE ${ELIGIBLE}`).first<{ n: number }>())?.n ?? 0;
+  result.remaining = result.pending > 0 ? 'pending' : 'complete';
+  return result;
+}
+
+async function rollupPage(
+  db: D1Database,
+  checkpoint: Checkpoint,
+  limit: number,
+  pageSize: number,
+  now: Date,
+  result: SessionRollupResult,
+): Promise<void> {
     const blocks: SourceBlock[] = checkpoint.finishing ? [] : (await db.prepare(`SELECT b.id, b.turn_index, b.block_index, b.role, b.btype,
         b.tool_name, b.text, b.truncated, b.on_main_path, b.byte_len, b.ts, u.model
       FROM blocks b LEFT JOIN usage u ON u.session_id = b.session_id AND u.turn_index = b.turn_index
@@ -102,17 +143,27 @@ export async function runSessionRollup(
       .bind(checkpoint.session_id, checkpoint.cursor_turn, checkpoint.cursor_block,
         checkpoint.cursor_id, limit).all<SourceBlock>()).results;
     result.examined += blocks.length;
-    result.pages++;
 
-    const calls = blocks.filter(comparable).map((b) => [b.tool_name!, b.text!]);
+    const callKeys = new Map<number, string>();
+    const uniqueCalls = new Set<string>();
+    for (const block of blocks) {
+      if (!comparable(block)) continue;
+      const key = JSON.stringify([block.tool_name, block.text]);
+      callKeys.set(block.id, key);
+      uniqueCalls.add(key);
+    }
+    // Encode each key once and reuse each byte-bounded array for both lookup and insert.
+    const callChunks = chunkCallKeys(uniqueCalls);
     const seen = new Set<string>();
-    if (calls.length > 0) {
-      const prior = await db.prepare(`SELECT sc.tool_name, sc.text FROM json_each(?2) j
-        JOIN session_rollup_seen_calls sc ON sc.session_id = ?1
-          AND sc.tool_name = json_extract(j.value, '$[0]')
-          AND sc.text = json_extract(j.value, '$[1]')`)
-        .bind(checkpoint.session_id, JSON.stringify(calls)).all<{ tool_name: string; text: string }>();
-      for (const call of prior.results) seen.add(JSON.stringify([call.tool_name, call.text]));
+    if (callChunks.length > 0) {
+      const prior = await db.batch<{ call_key: string }>(callChunks.map((chunk) =>
+        db.prepare(`SELECT j.value AS call_key FROM json_each(?2) j
+          JOIN session_rollup_seen_calls sc ON sc.session_id = ?1
+            AND sc.tool_name = json_extract(j.value, '$[0]')
+            AND sc.text = json_extract(j.value, '$[1]')`).bind(checkpoint.session_id, chunk)));
+      for (const chunk of prior) {
+        for (const call of chunk.results) seen.add(call.call_key);
+      }
     }
     let turn: TurnState | null = checkpoint.turn_state ? JSON.parse(checkpoint.turn_state) : null;
     const buckets = new Map<string, Bucket>();
@@ -140,9 +191,9 @@ export async function runSessionRollup(
         // Source-span proxy: multiple blocks can share one JSONL line's byte_len.
         bucket.tool_result_source_bytes += Math.max(0, block.byte_len ?? 0);
       }
-      if (comparable(block)) {
+      const callKey = callKeys.get(block.id);
+      if (callKey !== undefined) {
         bucket.comparable_tool_calls++;
-        const callKey = JSON.stringify([block.tool_name, block.text]);
         if (seen.has(callKey)) bucket.repeated_tool_calls++;
         seen.add(callKey);
       }
@@ -152,7 +203,6 @@ export async function runSessionRollup(
     // An exactly full page may have a successor; an empty next page safely finishes it.
     const complete = blocks.length < limit;
     const token = crypto.randomUUID();
-    const now = options.now ?? new Date();
     const statements = [db.prepare(`UPDATE session_rollup_state SET status = 'building',
         cursor_turn = ?6, cursor_block = ?7, cursor_id = ?8, turn_state = ?9,
         last_attempt = ?10, commit_token = ?11, finishing = ?13
@@ -172,10 +222,10 @@ export async function runSessionRollup(
       ON CONFLICT (session_id, day, model) DO UPDATE SET
         ${METRICS.map((m) => `${m} = session_rollup.${m} + excluded.${m}`).join(', ')}`)
       .bind(checkpoint.session_id, token, JSON.stringify([...buckets.values()])),
-    db.prepare(`INSERT OR IGNORE INTO session_rollup_seen_calls (session_id, tool_name, text)
+    ...callChunks.map((chunk) => db.prepare(`INSERT OR IGNORE INTO session_rollup_seen_calls (session_id, tool_name, text)
       SELECT ?1, json_extract(j.value, '$[0]'), json_extract(j.value, '$[1]')
       FROM json_each(?3) j WHERE ${COMMIT_GUARD}`)
-      .bind(checkpoint.session_id, token, JSON.stringify(calls))];
+      .bind(checkpoint.session_id, token, chunk))];
     if (complete) {
       statements.push(
         // Cleanup is checkpointed too: a giant unique-call history must not become one huge DELETE.
@@ -191,11 +241,26 @@ export async function runSessionRollup(
     const committed = await db.batch(statements);
     if ((committed[0]?.meta.changes ?? 0) === 0) result.superseded++;
     else if (complete && (committed.at(-1)?.meta.changes ?? 0) > 0) result.completed++;
+}
+
+function chunkCallKeys(keys: Iterable<string>): string[] {
+  const chunks: string[] = [];
+  const encoder = new TextEncoder();
+  let entries: string[] = [];
+  let bytes = 2; // JSON array brackets.
+  for (const key of keys) {
+    const keyBytes = encoder.encode(key).byteLength;
+    if (keyBytes + 2 > CALL_KEY_CHUNK_BYTES) throw new RangeError('Stored tool call exceeds rollup key chunk limit');
+    if (bytes + (entries.length > 0 ? 1 : 0) + keyBytes > CALL_KEY_CHUNK_BYTES) {
+      chunks.push(`[${entries.join(',')}]`);
+      entries = [];
+      bytes = 2;
+    }
+    bytes += (entries.length > 0 ? 1 : 0) + keyBytes;
+    entries.push(key);
   }
-  result.pending = (await db.prepare(`SELECT COUNT(*) AS n FROM session_rollup_state
-    WHERE ${ELIGIBLE}`).first<{ n: number }>())?.n ?? 0;
-  result.remaining = result.pending > 0 ? 'pending' : 'complete';
-  return result;
+  if (entries.length > 0) chunks.push(`[${entries.join(',')}]`);
+  return chunks;
 }
 
 function comparable(block: SourceBlock): boolean {
