@@ -268,7 +268,7 @@ ul.gaps-list li { margin-bottom: 8px; }
 .stats-page .stats-ranking { margin: 0 0 14px; }
 .stats-table-scroll { max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; padding: 2px 0; }
 .stats-table-scroll table { width: 100%; margin: 0; font-size: 12px; }
-.stats-table-scroll thead th { font-size: 10px; color: var(--muted); font-weight: 500; vertical-align: bottom; }
+.stats-table-scroll thead th { font-size: 10px; color: var(--muted); font-weight: 500; vertical-align: bottom; white-space: nowrap; }
 .stats-table-scroll th, .stats-table-scroll td { vertical-align: top; }
 .stats-page table.chart :is(th, td) { padding: 7px 8px; }
 .stats-page table.chart th[scope=row] { white-space: normal; }
