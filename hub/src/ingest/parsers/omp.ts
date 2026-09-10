@@ -33,6 +33,7 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
   };
   const models = new Set<string>();
   const parents = new Map<string, string | undefined>();
+  const toolStarts = new Map<string, { callId: string; startMs: number }>();
   let headerSeen = false;
   let firstRecord = true;
   let slotTitle: string | undefined;
@@ -85,7 +86,7 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
       continue;
     }
 
-    const id = str(o.id);
+    const id = str(o.id) ?? (type === 'message' && isObj(o.message) ? str(o.message.id) : undefined);
     const parentId = str(o.parentId);
     // Custom records are real ancestry links: tool lifecycle metadata and persisted prompts can sit
     // between content messages. A metadata id may collide with a content id, so content records win
@@ -103,7 +104,13 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
         break;
       case 'custom':
         if (o.customType === OMP_SYSTEM_PROMPT_TYPE) parseSystemPrompt(o, line, ts);
-        else skip(type);
+        else if (o.customType === 'tool_execution_start') {
+          const data = isObj(o.data) ? o.data : undefined;
+          const callId = str(data?.toolCallId);
+          const startMs = timestampMs(data?.startedAt) ?? timestampMs(ts);
+          if (id && callId && startMs !== undefined) toolStarts.set(id, { callId, startMs });
+          skip(type);
+        } else skip(type);
         break;
       case 'compaction':
         parseSummary(o, line, ts, 'compaction');
@@ -137,6 +144,7 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
   session.models = [...models];
   session.primaryModel = session.models[session.models.length - 1];
   markMainPath(session.turns, lastTurnId, parents, incompleteTree || !headerSeen);
+  resolveToolLifecycles(session.turns, parents, toolStarts);
   session.turns.forEach((turn, index) => (turn.index = index));
   return session;
 
@@ -162,6 +170,12 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
       ts,
       model,
       usage,
+      timing: role === 'assistant' ? {
+        startMs: timestampMs(msg.timestamp),
+        endMs: timestampMs(msg.completedAt),
+        durationMs: num(msg.duration),
+      } : undefined,
+      isError: role === 'assistant' && (msg.stopReason === 'error' || !!str(msg.errorMessage)) || undefined,
       blocks: [],
     };
     for (const block of blocksFrom(
@@ -172,6 +186,13 @@ export async function parseOmp(lines: AsyncIterable<JsonlLine>, sessionId: strin
       msg.isError === true,
       isObj(msg.details) ? msg.details : isObj(entry.details) ? entry.details : undefined,
     )) turn.blocks.push(block);
+    if (role === 'tool') {
+      for (const block of turn.blocks) {
+        if (block.type !== 'tool_result') continue;
+        block.toolName ??= str(msg.toolName);
+        block.timing = { endMs: timestampMs(msg.timestamp) ?? timestampMs(envelopeTs) };
+      }
+    }
     if (turn.blocks.length === 0 && usage === undefined) return;
     session.turns.push(turn);
     if (turn.id) lastTurnId = turn.id;
@@ -404,6 +425,94 @@ function markMainPath(
 function updateRange(session: NormalizedSession, ts: string): void {
   if (!session.startedAt || ts < session.startedAt) session.startedAt = ts;
   if (!session.endedAt || ts > session.endedAt) session.endedAt = ts;
+}
+
+function timestampMs(value: unknown): number | undefined {
+  const iso = isoTimestamp(value);
+  return iso === undefined ? undefined : Date.parse(iso);
+}
+
+/**
+ * Walk the entry tree, not append order: a result can precede its call in a recovered journal.
+ * Scoped identities prevent reused tool ids or sibling branches from borrowing another call's start.
+ * Metadata remains outside the normalized transcript and does not change its byte windows.
+ */
+function resolveToolLifecycles(
+  turns: NormalizedTurn[],
+  parents: Map<string, string | undefined>,
+  starts: Map<string, { callId: string; startMs: number }>,
+): void {
+  const byId = new Map<string, NormalizedTurn | null>();
+  for (const turn of turns) {
+    if (turn.id) byId.set(turn.id, byId.has(turn.id) ? null : turn);
+    for (let i = 0; i < turn.blocks.length; i++) {
+      const block = turn.blocks[i]!;
+      if (block.type === 'tool_use') block.toolCallKey = `omp:${block.byteStart}:${i}`;
+      else if (block.type === 'tool_result') block.toolCallKey = null;
+    }
+  }
+  const children = new Map<string, string[]>();
+  const roots: string[] = [];
+  for (const [id, parentId] of parents) {
+    if (!parentId || !parents.has(parentId)) roots.push(id);
+    else {
+      const siblings = children.get(parentId);
+      if (siblings) siblings.push(id);
+      else children.set(parentId, [id]);
+    }
+  }
+  type Call = NormalizedBlock | null;
+  type Frame = { id: string; restore?: Array<[string, Call | undefined]>; startKey?: string; oldStart?: number };
+  const activeCalls = new Map<string, Call>();
+  const activeStarts = new Map<string, number>();
+  const visited = new Set<string>();
+  const stack: Frame[] = roots.map((id) => ({ id }));
+  while (stack.length > 0) {
+    const frame = stack.pop()!;
+    if (frame.restore) {
+      for (let i = frame.restore.length - 1; i >= 0; i--) {
+        const [key, previous] = frame.restore[i]!;
+        if (previous === undefined) activeCalls.delete(key);
+        else activeCalls.set(key, previous);
+      }
+      if (frame.startKey) {
+        if (frame.oldStart === undefined) activeStarts.delete(frame.startKey);
+        else activeStarts.set(frame.startKey, frame.oldStart);
+      }
+      continue;
+    }
+    if (visited.has(frame.id)) continue;
+    visited.add(frame.id);
+    const turn = byId.get(frame.id);
+    const restore: Array<[string, Call | undefined]> = [];
+    const localIds = new Set<string>();
+    for (const block of turn?.blocks ?? []) {
+      if (block.type !== 'tool_use' || !block.toolUseId) continue;
+      restore.push([block.toolUseId, activeCalls.get(block.toolUseId)]);
+      activeCalls.set(block.toolUseId, localIds.has(block.toolUseId) ? null : block);
+      localIds.add(block.toolUseId);
+    }
+    const exit: Frame = { id: frame.id, restore };
+    const marker = starts.get(frame.id);
+    const startedCall = marker ? activeCalls.get(marker.callId) : undefined;
+    if (marker && startedCall?.toolCallKey) {
+      exit.startKey = startedCall.toolCallKey;
+      exit.oldStart = activeStarts.get(exit.startKey);
+      activeStarts.set(exit.startKey, marker.startMs);
+      startedCall.timing ??= { startMs: marker.startMs };
+    }
+    for (const block of turn?.blocks ?? []) {
+      if (block.type !== 'tool_result' || !block.toolUseId) continue;
+      const call = activeCalls.get(block.toolUseId);
+      if (!call?.toolCallKey) continue;
+      block.toolCallKey = call.toolCallKey;
+      block.toolName ??= call.toolName;
+      block.timing = { ...block.timing, startMs: activeStarts.get(call.toolCallKey) };
+    }
+    stack.push(exit);
+    for (const child of children.get(frame.id) ?? []) stack.push({ id: child });
+  }
+  // Cyclic components have no trustworthy ancestry; their initialized null result keys stay unmatched.
 }
 
 function isoTimestamp(value: unknown): string | undefined {

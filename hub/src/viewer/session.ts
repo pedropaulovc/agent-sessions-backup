@@ -12,6 +12,8 @@ import { computeFirstInteractionTitle, sessionDisplayTitle, titleSkippedTurnIndi
 import { turnKeyOf } from '../turn-key';
 import { signExternalAssetUrl } from './assets';
 import { esc, pageFoot, pageHead, q } from './layout';
+import { buildSessionTrace, toolKey } from './trace-data';
+import { renderTrace } from './trace';
 
 /** Turns per page. Pages are turn_index buckets [(p-1)*SIZE, p*SIZE), so a block's page is floor(turn_index/SIZE)+1. */
 export const TURNS_PER_PAGE = 200;
@@ -157,9 +159,7 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
         if (!parsed) {
           controller.enqueue(encoder.encode('<p class="warn">Raw transcript unavailable (R2 object missing).</p>'));
         } else {
-          const toolPairs = pairToolResults(parsed.turns);
-          let rendered = 0;
-          for (const turn of parsed.turns) {
+          const traceTurns = parsed.turns.map((turn) => {
             const isContent = !turn.compaction && turn.blocks.length > 0;
             const byteStart = turn.blocks[0]?.byteStart ?? turn.byteStart;
             const indexed = isContent && byteStart !== undefined
@@ -167,14 +167,19 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
               : undefined;
             // Prefer the persisted main-path flag; fall back to the parser's per-page guess only when the
             // D1 lookup has no matching row (e.g. compaction markers, which have no content block rows).
-            const onMainPath = indexed ? indexed.onMainPath : turn.onMainPath;
+            return { turn, turnIndex: indexed?.turnIndex, onMainPath: indexed ? indexed.onMainPath : turn.onMainPath };
+          });
+          const toolPairs = pairToolResults(traceTurns);
+          controller.enqueue(encoder.encode(renderTrace(buildSessionTrace(traceTurns, view))));
+          let rendered = 0;
+          for (const { turn, turnIndex, onMainPath } of traceTurns) {
             const key = turnKeyOf(turn);
             const html = await renderTurn(
               turn,
               sessionId,
               view,
               mediaIds,
-              indexed?.turnIndex,
+              turnIndex,
               onMainPath,
               key,
               starredKeys.has(key),
@@ -499,18 +504,19 @@ interface ToolPairs {
   imageIndices: Map<NormalizedBlock, number>;
 }
 
-function pairToolResults(turns: NormalizedTurn[]): ToolPairs {
-  const calls = new Map<string, NormalizedBlock>();
-  const results: Array<NormalizedBlock> = [];
+function pairToolResults(turns: ReadonlyArray<{ turn: NormalizedTurn; onMainPath: boolean }>): ToolPairs {
+  const calls = new Map<string, NormalizedBlock | null>();
+  const results: Array<{ block: NormalizedBlock; key: string }> = [];
   const resultImages = new Map<NormalizedBlock, NormalizedBlock[]>();
   const imageIndices = new Map<NormalizedBlock, number>();
-  for (const turn of turns) {
+  for (const { turn, onMainPath } of turns) {
     let lastResult: NormalizedBlock | undefined;
     for (let blockIndex = 0; blockIndex < turn.blocks.length; blockIndex++) {
       const block = turn.blocks[blockIndex]!;
-      if (block.type === 'tool_use' && block.toolUseId) calls.set(block.toolUseId, block);
-      if (block.type === 'tool_result' && block.toolUseId) {
-        results.push(block);
+      const key = toolKey(block, onMainPath ? 'main' : 'branch');
+      if (block.type === 'tool_use' && key) calls.set(key, calls.has(key) ? null : block);
+      if (block.type === 'tool_result') {
+        if (key) results.push({ block, key });
         lastResult = block;
       } else if (block.type === 'image' && lastResult) {
         const images = resultImages.get(lastResult) ?? [];
@@ -524,9 +530,9 @@ function pairToolResults(turns: NormalizedTurn[]): ToolPairs {
   }
   const byCall = new Map<NormalizedBlock, NormalizedBlock>();
   const pairedResults = new Set<NormalizedBlock>();
-  for (const result of results) {
-    const call = calls.get(result.toolUseId!);
-    if (!call) continue;
+  for (const { block: result, key } of results) {
+    const call = calls.get(key);
+    if (!call || byCall.has(call)) continue;
     byCall.set(call, result);
     pairedResults.add(result);
   }

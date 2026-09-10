@@ -26,6 +26,10 @@ export interface NormalizedBlock {
   toolUseId?: string;
   toolName?: string;
   isError?: boolean;
+  /** Session-local call identity resolved by a parser; null means ancestry ruled out a match. */
+  toolCallKey?: string | null;
+  /** Recorded tool lifecycle endpoints, never inferred from adjacent messages. */
+  timing?: { startMs?: number; endMs?: number };
   subagentSessionId?: string;
   mediaType?: string;
   externalAsset?: ExternalAssetRef;
@@ -142,6 +146,9 @@ export interface NormalizedTurn {
   ts?: string;
   model?: string;
   usage?: TurnUsage;
+  /** Recorded model timing. A lone timestamp does not establish an execution duration. */
+  timing?: { startMs?: number; endMs?: number; durationMs?: number };
+  isError?: boolean;
   compaction?: { kind: 'codex-window' | 'claude-compact'; replacesTurns?: [number, number] };
   /** Source line offsets for a blockless marker turn (compaction). Lets the index writer persist a row
    * so pagination/byte-windows account for the turn even though it yields no content blocks. */
