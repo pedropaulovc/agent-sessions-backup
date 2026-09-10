@@ -1,0 +1,24 @@
+// Fires on any failed/partial bounded rollup pass or session page failure in
+// the last hour. A later healthy pass must not erase an earlier failure.
+// Source: sessions-hub's hub.session_rollup.run / hub.session_rollup.page_failed.
+// Both scheduled and authenticated manual runs use the same completion schema.
+// Pending backfill (remaining='pending', pending>0) is normal bounded progress,
+// not an error. The run outcome, not the remaining work, determines failure.
+//
+// Missing OTelLogs degrades to empty; session-rollup-missing.kql independently
+// detects absent completions, including a missing table. Azure condition: count>0.
+let otel = union isfuzzy=true
+    (datatable(TimeGenerated:datetime, Body:string, ServiceName:string)[]),
+    (OTelLogs | project TimeGenerated, Body, ServiceName);
+otel
+| where TimeGenerated > ago(1h)
+| where ServiceName == 'sessions-hub'
+| extend body = todynamic(Body)
+| where body.event == 'hub.session_rollup.page_failed'
+    or (body.event == 'hub.session_rollup.run' and body.outcome in ('partial', 'failed'))
+| project TimeGenerated, ServiceName, event=tostring(body.event),
+    run_id=tostring(body.run_id), trigger=tostring(body.trigger), outcome=tostring(body.outcome),
+    session_id=tostring(body.session_id), error=tostring(body.error),
+    examined=tolong(body.examined), pages=tolong(body.pages), completed=tolong(body.completed),
+    superseded=tolong(body.superseded), failed=tolong(body.failed), pending=tolong(body.pending),
+    remaining=tostring(body.remaining), ms=tolong(body.ms)

@@ -1,0 +1,28 @@
+// Fires when sessions-hub has no complete/partial rollup run in the last 26h.
+// Complete and partial both prove that a bounded pass returned; partial failures
+// are independently actionable in session-rollup-errors.kql. A failed run or
+// started/page_failed event does not count as completion. Manual bootstrap and
+// scheduled passes both count; pending backfill does not invalidate liveness.
+//
+// Provisioning evaluates hourly with a supported 48h Azure window, while this
+// query enforces the exact 26h horizon. Do not set evaluation-frequency to 26h
+// or use a 1h scan window: the former is unsupported, the latter loses yesterday's
+// completion. Deploy only after the first manual complete/partial summary has
+// reached OTelLogs, to avoid an expected bootstrap alert.
+//
+// The empty-datatable union preserves evaluation when OTelLogs is missing.
+// Summarize without grouping creates n=0 even for empty input, so total silence
+// and stale-only data keep alerting instead of disappearing from a baseline join.
+let otel = union isfuzzy=true
+    (datatable(TimeGenerated:datetime, Body:string, ServiceName:string)[]),
+    (OTelLogs | project TimeGenerated, Body, ServiceName);
+otel
+| where TimeGenerated > ago(26h)
+| where ServiceName == 'sessions-hub'
+| extend body = todynamic(Body)
+| where body.event == 'hub.session_rollup.run'
+| where body.trigger in ('scheduled', 'manual') and body.outcome in ('complete', 'partial')
+| summarize completions=count()
+| where completions == 0
+| project TimeGenerated=now(), ServiceName='sessions-hub',
+    reason='No complete or partial session-rollup pass in the last 26h', completions

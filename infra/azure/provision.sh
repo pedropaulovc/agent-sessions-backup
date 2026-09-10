@@ -351,7 +351,18 @@ alert_window_for() {
         cert-orphan-leaked) echo "1h" ;;
         collector-outdated) echo "1h" ;;
         parse-errors) echo "15m" ;;
+        session-rollup-errors) echo "1h" ;;
+        session-rollup-missing) echo "48h" ;;
         *) echo "15m" ;;
+    esac
+}
+
+# Frequency is independent of the scan window: the rollup liveness query needs
+# 26h of history, using Azure's supported 48h granularity, but runs every hour.
+alert_frequency_for() {
+    case "$1" in
+        session-rollup-missing) echo "1h" ;;
+        *) alert_window_for "$1" ;;
     esac
 }
 
@@ -360,6 +371,7 @@ for kql_file in "$REPO_ROOT"/infra/azure/alerts/*.kql; do
     base_name=$(basename "$kql_file" .kql)
     alert_name="agent-backup-$base_name"
     window=$(alert_window_for "$base_name")
+    frequency=$(alert_frequency_for "$base_name")
     query=$(cat "$kql_file")
 
     # --skip-query-validation: this script can run before the gateway has ever
@@ -375,21 +387,30 @@ for kql_file in "$REPO_ROOT"/infra/azure/alerts/*.kql; do
             --condition "count 'Placeholder_1' > 0" \
             --condition-query Placeholder_1="$query" \
             --description "agent-sessions-backup: $base_name (see infra/azure/alerts/$base_name.kql)" \
-            --evaluation-frequency "$window" --window-size "$window" \
+            --evaluation-frequency "$frequency" --window-size "$window" \
             --severity 2 --action-groups "$AG_ID" --skip-query-validation true --only-show-errors >/dev/null
         alert_action="created"
     else
-        # A bare existence check means editing a .kql file and rerunning this
-        # script never pushes the change to Azure — the script would print OK
-        # while the stale/broken query keeps evaluating. Compare the deployed
-        # query text (command substitution strips trailing newlines on both
-        # sides, so that alone won't cause a spurious mismatch) and update on
-        # drift.
-        CURRENT_QUERY=$(az monitor scheduled-query show --name "$alert_name" --resource-group "$RG_NAME" --query "criteria.allOf[0].query" -o tsv)
-        if [ "$CURRENT_QUERY" != "$query" ]; then
+        # Reconcile both query and timing drift. Normalize Azure ISO durations
+        # before comparing: 48h can round-trip as P2D rather than PT48H.
+        CURRENT_RULE=$(az monitor scheduled-query show --name "$alert_name" --resource-group "$RG_NAME" -o json)
+        CURRENT_QUERY=$(printf '%s' "$CURRENT_RULE" | jq -r '.criteria.allOf[0].query')
+        CURRENT_TIMING=$(printf '%s' "$CURRENT_RULE" | jq -r '
+            def minutes:
+                capture("^P(?:(?<d>[0-9]+)D)?(?:T(?:(?<h>[0-9]+)H)?(?:(?<m>[0-9]+)M)?(?:(?<s>[0-9]+)S)?)?$")
+                | ((.d // "0" | tonumber) * 1440 + (.h // "0" | tonumber) * 60
+                    + (.m // "0" | tonumber) + (.s // "0" | tonumber) / 60);
+            [(.evaluationFrequency | minutes), (.windowSize | minutes)] | @tsv')
+        EXPECTED_TIMING=$(jq -nr --arg frequency "$frequency" --arg window "$window" '
+            def minutes:
+                capture("^(?<n>[0-9]+)(?<unit>[hm])$")
+                | (.n | tonumber) * (if .unit == "h" then 60 else 1 end);
+            [($frequency | minutes), ($window | minutes)] | @tsv')
+        if [ "$CURRENT_QUERY" != "$query" ] || [ "$CURRENT_TIMING" != "$EXPECTED_TIMING" ]; then
             az monitor scheduled-query update --name "$alert_name" --resource-group "$RG_NAME" \
                 --condition "count 'Placeholder_1' > 0" \
                 --condition-query Placeholder_1="$query" \
+                --evaluation-frequency "$frequency" --window-size "$window" \
                 --skip-query-validation true --only-show-errors >/dev/null
             alert_action="updated"
         else
@@ -397,19 +418,11 @@ for kql_file in "$REPO_ROOT"/infra/azure/alerts/*.kql; do
         fi
     fi
 
-    # No overrideQueryTimeRange is set for any alert. An earlier design tried
-    # P14D for missed-heartbeat (its old absence-JOIN form needed a 14d
-    # baseline), but Azure rejects it: overrideQueryTimeRange maxes at 2880 min
-    # (48h) — "Supported granularities are: 5,10,15,30,45,60,120,180,240,300,
-    # 360,720,1440,2880". That 48h cap is itself shorter than the 72h heartbeat
-    # tolerance, which is exactly why missed-heartbeat.kql was rewritten to
-    # threshold on the hub watchdog's per-machine `hub.machine.heartbeat_age`
-    # gauge (re-emitted every 15 min for every machine, dead or alive) over a
-    # short ago(30m) window instead of a self-referential absence JOIN. With the
-    # gauge form, the rule's default query range (WindowSize) already covers the
-    # ago(30m) the query needs — no override required.
-
-    echo "OK: $alert_name ($alert_action, window=$window)"
+    # No overrideQueryTimeRange is needed: windowSize covers each query's
+    # lookback, including the 26h rollup check within a supported 48h window.
+    # Azure caps query history at 48h; missed-heartbeat therefore uses fresh
+    # age gauges rather than a baseline join for its 72h machine tolerance.
+    echo "OK: $alert_name ($alert_action, frequency=$frequency, window=$window)"
 done
 
 echo ""
