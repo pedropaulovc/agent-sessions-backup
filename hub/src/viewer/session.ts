@@ -12,7 +12,7 @@ import { computeFirstInteractionTitle, sessionDisplayTitle, titleSkippedTurnIndi
 import { turnKeyOf } from '../turn-key';
 import { signExternalAssetUrl } from './assets';
 import { esc, pageFoot, pageHead, q } from './layout';
-import { buildSessionTrace } from './trace-data';
+import { buildSessionTrace, toolKey } from './trace-data';
 import { renderTrace } from './trace';
 
 /** Turns per page. Pages are turn_index buckets [(p-1)*SIZE, p*SIZE), so a block's page is floor(turn_index/SIZE)+1. */
@@ -513,9 +513,7 @@ function pairToolResults(turns: ReadonlyArray<{ turn: NormalizedTurn; onMainPath
     let lastResult: NormalizedBlock | undefined;
     for (let blockIndex = 0; blockIndex < turn.blocks.length; blockIndex++) {
       const block = turn.blocks[blockIndex]!;
-      const key = block.toolCallKey === null ? undefined
-        : block.toolCallKey !== undefined ? `entry:${block.toolCallKey}`
-        : onMainPath && block.toolUseId ? `id:${block.toolUseId}` : undefined;
+      const key = toolKey(block, onMainPath ? 'main' : 'branch');
       if (block.type === 'tool_use' && key) calls.set(key, calls.has(key) ? null : block);
       if (block.type === 'tool_result') {
         if (key) results.push({ block, key });

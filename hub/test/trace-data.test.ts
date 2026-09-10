@@ -94,4 +94,17 @@ describe('buildSessionTrace', () => {
       { label: 'new-tool', timing: 'timestamp', startMs: epoch + 6000, turnIndex: 23 },
     ]);
   });
+
+  it('keeps abandoned fallback IDs from making active tool results ambiguous', () => {
+    const turns = [
+      { turn: { ...model(), blocks: [{ type: 'tool_use' as const, toolUseId: 'reused', toolName: 'abandoned', byteStart: 0, byteLen: 1 }] }, onMainPath: false, turnIndex: 0 },
+      { turn: { ...model(), blocks: [{ type: 'tool_use' as const, toolUseId: 'reused', toolName: 'active', byteStart: 1, byteLen: 1 }] }, onMainPath: true, turnIndex: 1 },
+      { turn: { ...model(), role: 'tool' as const, blocks: [{ type: 'tool_result' as const, toolUseId: 'reused', isError: true, byteStart: 2, byteLen: 1 }] }, onMainPath: true, turnIndex: 2 },
+    ];
+    const tools = buildSessionTrace(turns, 'chronological').events.filter(event => event.kind === 'tool');
+    expect(tools.map(event => [event.label, event.turnIndex, event.isError])).toEqual([
+      ['abandoned', 0, undefined],
+      ['active', 1, true],
+    ]);
+  });
 });

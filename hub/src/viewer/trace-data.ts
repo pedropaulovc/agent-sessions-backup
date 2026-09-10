@@ -50,7 +50,7 @@ export function buildSessionTrace(turns: ReadonlyArray<TraceTurn>, view: 'chrono
     for (let blockIndex = 0; blockIndex < turn.blocks.length; blockIndex++) {
       const block = turn.blocks[blockIndex]!;
       if (block.type !== 'tool_use' && block.type !== 'tool_result') continue;
-      const key = toolKey(block);
+      const key = toolKey(block, owner.onMainPath ? 'main' : 'branch');
       if (block.type === 'tool_result') {
         const resultKey = key ?? block.toolUseId;
         const previous = resultKey ? turnResults.get(resultKey) : undefined;
@@ -80,13 +80,9 @@ export function buildSessionTrace(turns: ReadonlyArray<TraceTurn>, view: 'chrono
   const consumed = new Set<TraceEvent>();
   const completed = new Set<TraceEvent>();
   for (const result of results) {
-    const key = toolKey(result.block);
+    const key = toolKey(result.block, result.owner.onMainPath ? 'main' : 'branch');
     const call = key ? calls.get(key) : undefined;
     if (!call || completed.has(call.event)) continue;
-    // Parsers with explicit ancestry keys already proved this relationship. Other harnesses may
-    // only join unambiguous active-path ids; abandoned branches must not borrow another result.
-    if (result.block.toolCallKey === undefined &&
-        (!call.owner.onMainPath || !result.owner.onMainPath)) continue;
     const timing = eventTiming(result.block.timing, timestamp(result.owner.turn.ts));
     call.event.startMs = timing.startMs;
     call.event.endMs = timing.endMs;
@@ -98,10 +94,11 @@ export function buildSessionTrace(turns: ReadonlyArray<TraceTurn>, view: 'chrono
   return { events: events.filter((event) => !consumed.has(event)) };
 }
 
-function toolKey(block: NormalizedBlock): string | undefined {
+/** Explicit ancestry keys are branch-safe; raw IDs may pair only on the main path. */
+export function toolKey(block: NormalizedBlock, path: 'main' | 'branch'): string | undefined {
   if (block.toolCallKey === null) return undefined;
   if (block.toolCallKey !== undefined) return `entry:${block.toolCallKey}`;
-  return block.toolUseId ? `id:${block.toolUseId}` : undefined;
+  return path === 'main' && block.toolUseId ? `id:${block.toolUseId}` : undefined;
 }
 
 function label(value: string | undefined, fallback: string): string {
