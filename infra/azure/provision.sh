@@ -359,12 +359,22 @@ alert_window_for() {
 
 # Frequency is independent of the scan window: the rollup liveness query needs
 # 26h of history, using Azure's supported 48h granularity, but runs every hour.
+# Error scans overlap to tolerate ingestion delay at evaluation boundaries.
 alert_frequency_for() {
     case "$1" in
+        session-rollup-errors) echo "15m" ;;
         session-rollup-missing) echo "1h" ;;
         *) alert_window_for "$1" ;;
     esac
 }
+
+# ARM can round-trip equivalent durations differently (P2D / PT48H).
+ISO_DURATION_MINUTES='
+    def minutes:
+        capture("^P(?:(?<d>[0-9]+)D)?(?:T(?:(?<h>[0-9]+)H)?(?:(?<m>[0-9]+)M)?(?:(?<s>[0-9]+)S)?)?$")
+        | ((.d // "0" | tonumber) * 1440 + (.h // "0" | tonumber) * 60
+            + (.m // "0" | tonumber) + (.s // "0" | tonumber) / 60);
+'
 
 for kql_file in "$REPO_ROOT"/infra/azure/alerts/*.kql; do
     [ -e "$kql_file" ] || continue
@@ -395,12 +405,8 @@ for kql_file in "$REPO_ROOT"/infra/azure/alerts/*.kql; do
         # before comparing: 48h can round-trip as P2D rather than PT48H.
         CURRENT_RULE=$(az monitor scheduled-query show --name "$alert_name" --resource-group "$RG_NAME" -o json)
         CURRENT_QUERY=$(printf '%s' "$CURRENT_RULE" | jq -r '.criteria.allOf[0].query')
-        CURRENT_TIMING=$(printf '%s' "$CURRENT_RULE" | jq -r '
-            def minutes:
-                capture("^P(?:(?<d>[0-9]+)D)?(?:T(?:(?<h>[0-9]+)H)?(?:(?<m>[0-9]+)M)?(?:(?<s>[0-9]+)S)?)?$")
-                | ((.d // "0" | tonumber) * 1440 + (.h // "0" | tonumber) * 60
-                    + (.m // "0" | tonumber) + (.s // "0" | tonumber) / 60);
-            [(.evaluationFrequency | minutes), (.windowSize | minutes)] | @tsv')
+        CURRENT_TIMING=$(printf '%s' "$CURRENT_RULE" | jq -r "$ISO_DURATION_MINUTES
+            [(.evaluationFrequency | minutes), (.windowSize | minutes)] | @tsv")
         EXPECTED_TIMING=$(jq -nr --arg frequency "$frequency" --arg window "$window" '
             def minutes:
                 capture("^(?<n>[0-9]+)(?<unit>[hm])$")
@@ -418,10 +424,31 @@ for kql_file in "$REPO_ROOT"/infra/azure/alerts/*.kql; do
         fi
     fi
 
-    # No overrideQueryTimeRange is needed: windowSize covers each query's
-    # lookback, including the 26h rollup check within a supported 48h window.
-    # Azure caps query history at 48h; missed-heartbeat therefore uses fresh
-    # age gauges rather than a baseline join for its 72h machine tolerance.
+    # CLI updates preserve overrideQueryTimeRange and offer no dedicated setter.
+    # Reconcile rollup query-range drift explicitly, including existing short
+    # overrides that would otherwise truncate the 26h liveness query.
+    query_range=""
+    case "$base_name" in
+        session-rollup-errors) query_range="PT1H" ;;
+        session-rollup-missing) query_range="P2D" ;;
+    esac
+    if [ -n "$query_range" ]; then
+        ALERT_URL="https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Insights/scheduledQueryRules/$alert_name?api-version=2021-08-01"
+        EXPECTED_RANGE_MINUTES=$(jq -nr --arg duration "$query_range" "$ISO_DURATION_MINUTES \$duration | minutes")
+        CURRENT_RANGE=$(az rest --method get --url "$ALERT_URL" --query properties.overrideQueryTimeRange -o json)
+        CURRENT_RANGE_MINUTES=$(printf '%s' "$CURRENT_RANGE" | jq -r "$ISO_DURATION_MINUTES if . == null then -1 else minutes end")
+        if [ "$CURRENT_RANGE_MINUTES" != "$EXPECTED_RANGE_MINUTES" ]; then
+            RANGE_PATCH=$(jq -n --arg duration "$query_range" '{properties: {overrideQueryTimeRange: $duration}}')
+            az rest --method patch --url "$ALERT_URL" --body "$RANGE_PATCH" --only-show-errors >/dev/null
+            [ "$alert_action" != "unchanged" ] || alert_action="updated"
+        fi
+        APPLIED_RANGE=$(az rest --method get --url "$ALERT_URL" --query properties.overrideQueryTimeRange -o json)
+        APPLIED_RANGE_MINUTES=$(printf '%s' "$APPLIED_RANGE" | jq -r "$ISO_DURATION_MINUTES if . == null then -1 else minutes end")
+        if [ "$APPLIED_RANGE_MINUTES" != "$EXPECTED_RANGE_MINUTES" ]; then
+            echo "ERROR: $alert_name query-range readback mismatch: expected $query_range, got $APPLIED_RANGE" >&2
+            exit 1
+        fi
+    fi
     echo "OK: $alert_name ($alert_action, frequency=$frequency, window=$window)"
 done
 

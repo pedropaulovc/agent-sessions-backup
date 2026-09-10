@@ -82,10 +82,13 @@ export async function consumeSessionRollup(message: Message<SessionRollupMessage
       WHERE job_id = ?1 AND status = 'queued'`)
       .bind(jobId, new Date(now).toISOString(), token, now + ATTEMPT_LEASE_MS).run();
     if ((claimed.meta.changes ?? 0) === 0) {
-      const current = await env.DB.prepare('SELECT status FROM session_rollup_jobs WHERE job_id = ?1')
-        .bind(jobId).first<{ status: string }>();
-      if (current?.status === 'running') message.retry({ delaySeconds: ATTEMPT_LEASE_MS / 1000 });
-      else message.ack(); // Terminal replay (or no durable job) must never start another pass.
+      const current = await env.DB.prepare('SELECT status, lease_until FROM session_rollup_jobs WHERE job_id = ?1')
+        .bind(jobId).first<{ status: string; lease_until: number }>();
+      if (current?.status === 'running') {
+        message.retry({ delaySeconds: Math.max(1, Math.ceil((current.lease_until - Date.now()) / 1000)) });
+        return;
+      }
+      message.ack(); // Terminal replay (or no durable job) must never start another pass.
       return;
     }
     await runSessionRollupPass(env, { run_id: jobId, trigger: 'manual' }, async (outcome: RollupOutcome) => {

@@ -186,17 +186,26 @@ describe('durable bounded session rollup jobs', () => {
       result: { completed: 1, pending: 0, remaining: 'complete' } });
   });
 
-  it('delays a duplicate while the original attempt owns a fresh lease', async () => {
+  it('retries a late duplicate at the original lease deadline without extending crash recovery', async () => {
     const id = await seedSession('active');
     const accepted = await enqueue();
-    await markRunning(accepted.job_id, Date.now() + 60_000);
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now);
+    await markRunning(accepted.job_id, now + 1500);
     const before = await checkpoint(id);
     const running = await job(accepted.job_id);
     const message = delivery(accepted.job_id);
     await consumeSessionRollup(message, testEnv);
-    expect(message.retry).toHaveBeenCalledExactlyOnceWith({ delaySeconds: 1200 });
+    expect(message.retry).toHaveBeenCalledExactlyOnceWith({ delaySeconds: 2 });
     expect(message.ack).not.toHaveBeenCalled();
     expect(await job(accepted.job_id)).toEqual(running);
+    expect(await checkpoint(id)).toEqual(before);
+    clock.mockReturnValue(now + 2000);
+    const expired = delivery(accepted.job_id);
+    await consumeSessionRollup(expired, testEnv);
+    expect(expired.ack).toHaveBeenCalledOnce();
+    expect(expired.retry).not.toHaveBeenCalled();
+    expect(await job(accepted.job_id)).toMatchObject({ status: 'failed', result: null });
     expect(await checkpoint(id)).toEqual(before);
   });
 

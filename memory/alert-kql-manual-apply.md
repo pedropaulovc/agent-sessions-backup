@@ -113,8 +113,8 @@ AG_ID="$(az monitor action-group show --subscription "$SUBSCRIPTION_ID" -g "$RG_
 # repeat with BASE=session-rollup-missing.
 BASE=session-rollup-errors
 case "$BASE" in
-  session-rollup-errors) WINDOW=1h ;;
-  session-rollup-missing) WINDOW=48h ;;
+  session-rollup-errors) WINDOW=1h; FREQUENCY=15m; QUERY_RANGE=PT1H ;;
+  session-rollup-missing) WINDOW=48h; FREQUENCY=1h; QUERY_RANGE=P2D ;;
   *) echo "Unexpected rollup rule: $BASE" >&2; exit 1 ;;
 esac
 RULE_NAME="agent-backup-$BASE"
@@ -127,26 +127,55 @@ if [ -z "$EXISTING" ]; then
     --scopes "$LAW_ID" --location westus2 \
     --condition "count 'Placeholder_1' > 0" --condition-query Placeholder_1="$QUERY" \
     --description "agent-sessions-backup: $BASE (see infra/azure/alerts/$BASE.kql)" \
-    --evaluation-frequency 1h --window-size "$WINDOW" --severity 2 \
+    --evaluation-frequency "$FREQUENCY" --window-size "$WINDOW" --severity 2 \
     --action-groups "$AG_ID" --skip-query-validation true --only-show-errors
 else
   az monitor scheduled-query update --subscription "$SUBSCRIPTION_ID" \
     --name "$RULE_NAME" --resource-group "$RG_NAME" \
     --condition "count 'Placeholder_1' > 0" --condition-query Placeholder_1="$QUERY" \
-    --evaluation-frequency 1h --window-size "$WINDOW" --severity 2 \
+    --evaluation-frequency "$FREQUENCY" --window-size "$WINDOW" --severity 2 \
     --action-groups "$AG_ID" --skip-query-validation true --only-show-errors
+fi
+# Reconcile query-range drift independently: CLI updates preserve old overrides.
+RULE_URL="https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/$RG_NAME/providers/Microsoft.Insights/scheduledQueryRules/$RULE_NAME?api-version=2021-08-01"
+ISO_DURATION_MINUTES='
+  def minutes:
+    capture("^P(?:(?<d>[0-9]+)D)?(?:T(?:(?<h>[0-9]+)H)?(?:(?<m>[0-9]+)M)?(?:(?<s>[0-9]+)S)?)?$")
+    | ((.d // "0" | tonumber) * 1440 + (.h // "0" | tonumber) * 60
+      + (.m // "0" | tonumber) + (.s // "0" | tonumber) / 60);
+'
+EXPECTED_RANGE_MINUTES="$(jq -nr --arg duration "$QUERY_RANGE" "$ISO_DURATION_MINUTES \$duration | minutes")"
+CURRENT_RANGE="$(az rest --method get --subscription "$SUBSCRIPTION_ID" --url "$RULE_URL" --query properties.overrideQueryTimeRange -o json)"
+CURRENT_RANGE_MINUTES="$(printf '%s' "$CURRENT_RANGE" | jq -r "$ISO_DURATION_MINUTES if . == null then -1 else minutes end")"
+if [ "$CURRENT_RANGE_MINUTES" != "$EXPECTED_RANGE_MINUTES" ]; then
+  RANGE_PATCH="$(jq -n --arg duration "$QUERY_RANGE" '{properties: {overrideQueryTimeRange: $duration}}')"
+  az rest --method patch --subscription "$SUBSCRIPTION_ID" --url "$RULE_URL" \
+    --body "$RANGE_PATCH" --only-show-errors
+fi
+APPLIED_RANGE="$(az rest --method get --subscription "$SUBSCRIPTION_ID" --url "$RULE_URL" --query properties.overrideQueryTimeRange -o json)"
+APPLIED_RANGE_MINUTES="$(printf '%s' "$APPLIED_RANGE" | jq -r "$ISO_DURATION_MINUTES if . == null then -1 else minutes end")"
+if [ "$APPLIED_RANGE_MINUTES" != "$EXPECTED_RANGE_MINUTES" ]; then
+  echo "ERROR: $RULE_NAME query-range readback mismatch: expected $QUERY_RANGE, got $APPLIED_RANGE" >&2
+  exit 1
 fi
 az monitor scheduled-query show --subscription "$SUBSCRIPTION_ID" \
   --name "$RULE_NAME" --resource-group "$RG_NAME" \
   --query '{enabled:enabled,frequency:evaluationFrequency,window:windowSize,override:overrideQueryTimeRange,criteria:criteria,actions:actions}' -o json
 ```
 
+The error rule evaluates every 15m over a 1h window, so overlapping scans tolerate
+ingestion delay near evaluation boundaries instead of losing late-arriving errors.
+
 The missing rule uses the supported 48h scan window with hourly evaluation; KQL
 itself applies the exact 26h horizon. Do not change the frequency to 26h or shrink
-its window to 1h. No `overrideQueryTimeRange` is needed; if an existing rule has a
-non-null override, remove it or set it to `P2D` before relying on the window.
+its window to 1h. Provisioning and the surgical commands explicitly reconcile
+`overrideQueryTimeRange` to `P2D` for missing completion and `PT1H` for errors,
+then fail on a readback mismatch (equivalent ISO duration spellings are accepted).
+This prevents a preexisting short override from silently truncating the query.
 The current [scheduled-query CLI](https://learn.microsoft.com/en-us/cli/azure/monitor/scheduled-query)
-does not expose a dedicated override flag. Azure documents the
+does not expose a dedicated override flag, so the commands use the supported
+[REST PATCH property](https://learn.microsoft.com/en-us/rest/api/monitor/scheduled-query-rules/update?view=rest-monitor-2021-08-01).
+Azure documents the
 [two-day query maximum](https://learn.microsoft.com/en-us/azure/azure-monitor/alerts/alerts-create-log-alert-rule#configure-alert-rule-conditions)
 separately from evaluation frequency.
 
@@ -187,8 +216,8 @@ only the `let otel = union ...;` declaration in either source query with the fix
 below, leaving the rule predicates untouched. Set `scenario` to each table value.
 The errors query should produce one row for partial, failed, page_failed, and
 delivery_failed; the missing query should produce one row for failed, page_failed,
-delivery_failed, missing, stale, and foreign. Complete, pending, and partial all satisfy liveness. Also test an
-unknown `trigger` on a complete summary: it must not satisfy liveness.
+delivery_failed, missing, stale, foreign, and unknown_trigger. Complete, pending,
+and partial all satisfy liveness; a complete summary with an unknown trigger does not.
 
 ```kusto
 let scenario = 'partial';
@@ -201,6 +230,7 @@ let otel = datatable(Case:string, Event:string, Outcome:string, Trigger:string, 
   'page_failed', 'hub.session_rollup.page_failed', '', 'manual', 'sessions-hub',
   'delivery_failed', 'hub.session_rollup.delivery_failed', '', 'manual', 'sessions-hub',
   'stale', 'hub.session_rollup.run', 'complete', 'scheduled', 'sessions-hub',
+  'unknown_trigger', 'hub.session_rollup.run', 'complete', 'unknown', 'sessions-hub',
   'foreign', 'hub.session_rollup.run', 'complete', 'manual', 'sessions-hub-preview'
 ]
 | where Case == scenario
