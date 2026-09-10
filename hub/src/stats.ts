@@ -3,10 +3,9 @@
  * Kept out of viewer/stats.ts so the arithmetic can be tested without parsing HTML: everything
  * here takes a D1 binding plus a StatsQuery and returns plain numbers.
  *
- * Every panel is deliberately built on `usage` + `sessions` only. The panels that would need
- * `blocks` — rework, context bloat, tool-result waste — are NOT here: `blocks` is by far the
- * largest table and D1 bills rows read, so those belong behind a nightly rollup rather than a page
- * load. See UNBUILT below.
+ * Usage and cost panels read `usage` + `sessions`. Block diagnostics read only the nightly
+ * `session_rollup` publication, never raw `blocks`; their complete UTC day scope is explicit
+ * and separate from the rolling usage window. Linked-child spend reuses the main usage scan.
  *
  * COST, measured against the production table (776k usage rows, 31k sessions, 30-day window)
  * rather than estimated. Three changes took the page from 5s+ to ~1.4s; each is commented where it
@@ -19,13 +18,13 @@
  *   | + one session-grained scan for 6 panels  | 1853ms        | 873k      |
  *   | + sessions joined in memory, all parallel| 1261ms        | 582k      |
  *
- * Wall-clock is now the slowest single query (~1.3s) rather than their sum (~4.3s), because every
- * query is issued at once. Total rows read per load is ~3.8M, of which the gap histogram's window
- * function is ~1.7M — that, and the fact that all of this scales with corpus size, is why the
- * next step for this page is a rollup rather than more query tuning.
+ * These usage-only measurements predate the block rollup reader. The usage queries run in
+ * parallel; their total rows read per load was ~3.8M, of which the gap histogram's window
+ * function was ~1.7M. Block diagnostics add a day-indexed rollup read, not a transcript scan.
  */
 import { type CostByClass } from './pricing';
 import { UNKNOWN_MODEL_LABEL, USAGE_TOKEN_SUMS_ONLY } from './usage-agg';
+import { collectRollupStats, type SubagentSpend, type WasteStats } from './session-rollup-stats';
 
 /** Ranges offered by the UI. `all` is included but is the only option that scans the whole
  * `usage` table on every panel, so it is never the default. */
@@ -172,6 +171,7 @@ export interface SessionMeta {
   machine_id: string | null;
   project_name: string | null;
   git_branch: string | null;
+  parent_session_id: string | null;
 }
 
 /** Every session's attribution columns, read in one pass.
@@ -185,12 +185,15 @@ export interface SessionMeta {
  */
 async function sessionMeta(db: D1Database): Promise<Map<string, SessionMeta>> {
   const rows = await db
-    .prepare(`SELECT session_id, harness, machine_id, project_name, git_branch FROM sessions`)
+    .prepare(`SELECT session_id, harness, machine_id, project_name, git_branch, parent_session_id FROM sessions`)
     .all<{ session_id: string } & SessionMeta>();
   return new Map(
     (rows.results ?? []).map((r) => [
       r.session_id,
-      { harness: r.harness, machine_id: r.machine_id, project_name: r.project_name, git_branch: r.git_branch },
+      {
+        harness: r.harness, machine_id: r.machine_id, project_name: r.project_name, git_branch: r.git_branch,
+        parent_session_id: r.parent_session_id,
+      },
     ]),
   );
 }
@@ -432,6 +435,7 @@ export interface Stats {
   rhythm: RhythmCell[];
   models: ModelRow[];
   outliers: OutlierRow[];
+  waste: WasteStats;
 }
 
 export interface Ledger {
@@ -504,6 +508,8 @@ export interface ModelRow {
   sessions: number;
   usdPerCall: number;
   callsPerSession: number;
+  /** Complete-day rollup tool calls / distinct assistant turns, unavailable without a denominator. */
+  toolCallsPerTurn: number | null;
 }
 
 export interface OutlierRow {
@@ -604,9 +610,37 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
   const sessionsPerAttr = distinctSessions(rows, (r) => attributionKey(r, q.by));
 
   const cacheUsd = total.byClass.cacheRead + total.byClass.cacheWrite5m + total.byClass.cacheWrite1h;
+  const usageSessionIds = new Set<string>();
+  const children = new Set<string>();
+  const parents = new Set<string>();
+  const subagentSpend: SubagentSpend = { usd: 0, calls: 0, pricedCalls: 0, sessions: 0, parents: 0 };
+  for (const row of rows) {
+    if (row.meta) usageSessionIds.add(row.session_id);
+    // Each main-scan group is consumed exactly once. A grandchild is its own direct child row,
+    // never recursively added to the parent's subtotal. Only the child's filters apply: a parent
+    // may lie outside this window or no longer have metadata without erasing the recorded link.
+    if (!row.meta?.parent_session_id) continue;
+    children.add(row.session_id);
+    parents.add(row.meta.parent_session_id);
+    subagentSpend.usd += row.usd ?? 0;
+    subagentSpend.calls += row.calls;
+    subagentSpend.pricedCalls += row.priced_calls;
+  }
+  subagentSpend.sessions = children.size;
+  subagentSpend.parents = parents.size;
+  const [rollup, outliers] = await Promise.all([
+    collectRollupStats(db, q, w.current, now, usageSessionIds),
+    topSessions(db, bySession, rows, q.rank),
+  ]);
 
   return {
     window: w.current,
+    waste: {
+      range: rollup.range,
+      coverage: rollup.coverage,
+      diagnostics: rollup.diagnostics,
+      subagentSpend,
+    },
     activity: {
       models: byModel.size,
       inputTokens: total.tokens.input,
@@ -678,9 +712,10 @@ export async function collectStats(db: D1Database, q: StatsQuery, now: Date): Pr
           sessions,
           usdPerCall: g.pricedCalls > 0 ? g.usd / g.pricedCalls : 0,
           callsPerSession: sessions > 0 ? g.calls / sessions : 0,
+          toolCallsPerTurn: rollup.modelToolCallsPerTurn.get(g.key ?? UNKNOWN_MODEL_LABEL) ?? null,
         };
       }),
-    outliers: await topSessions(db, bySession, rows, q.rank),
+    outliers,
   };
 }
 
@@ -818,7 +853,13 @@ async function topSessions(
   rows: MainRow[],
   rank: StatsQuery['rank'],
 ): Promise<OutlierRow[]> {
-  const top = [...bySession.values()].sort((a, b) => compareRank(a, b, rank)).slice(0, OUTLIER_LIMIT);
+  // Metadata-less usage still belongs in totals, but cannot link to a transcript. Exclude it
+  // before sorting and limiting so expensive orphan rows cannot displace real sessions.
+  const attrs = new Map(rows.filter((r) => r.meta !== undefined).map((r) => [r.session_id, r]));
+  const top = [...bySession.values()]
+    .filter((g) => g.key !== null && attrs.has(g.key))
+    .sort((a, b) => compareRank(a, b, rank))
+    .slice(0, OUTLIER_LIMIT);
   const ids = top.map((g) => g.key).filter((k): k is string => k !== null);
   if (!ids.length) return [];
   // Only titles are fetched, and only for the twelve rows actually shown. Carrying
@@ -838,7 +879,6 @@ async function topSessions(
     .bind(...ids)
     .all<{ session_id: string; title: string | null }>();
   const titles = new Map((meta.results ?? []).map((r) => [r.session_id, r.title]));
-  const attrs = new Map(rows.map((r) => [r.session_id, r]));
   return top
     .filter((g) => g.key !== null)
     .map((g) => {
@@ -860,17 +900,6 @@ async function topSessions(
 /** Panels the wireframe specified that this version deliberately does NOT ship, surfaced on the
  * page itself so the omissions are visible rather than quietly missing. */
 export const UNBUILT: ReadonlyArray<{ panel: string; needs: string }> = [
-  {
-    panel: 'Waste — rework, context bloat, subagent spend',
-    needs:
-      'a nightly session_rollup job. Every figure comes from `blocks` (rewound turns via on_main_path, ' +
-      'tool-result byte_len, repeated tool arguments), which is by far the largest table — D1 bills rows ' +
-      'read, so this cannot be a page-load scan.',
-  },
-  {
-    panel: 'Tool calls per turn, in the model comparison',
-    needs: 'the same rollup: tool counts live in `blocks`, not `usage`.',
-  },
   {
     panel: 'Outcome quality — did the session actually work?',
     needs:

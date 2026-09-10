@@ -461,17 +461,18 @@ function wastePanel(s: Stats): string {
     'Signals for transcript inspection, not proven waste or a measure of quality. Rewinds and repeated calls can be intentional; ' +
       'these measures are not added into a total.',
     `<p class="small muted">${scope} ` +
-      `${range.includesUnknownTimestamp ? 'Includes the unknown-timestamp bucket; the current partial UTC day is excluded.' : 'Only complete UTC days inside the usage window; partial days and unknown timestamps are excluded.'}</p>` +
+      `${range.timestampScope === 'including-undated' ? 'Includes the unknown-timestamp bucket; the current partial UTC day is excluded.' : 'Only complete UTC days inside the usage window; partial days and unknown timestamps are excluded.'}</p>` +
       `<p class="small muted">Nightly coverage: ${coverageText} Coverage counts known matching sessions, not the entire archive. ` +
       `Oldest covered publication: ${esc(coverage.oldestCompletedAt ?? 'Unknown')}. ` +
       `Newest covered publication: ${esc(coverage.newestCompletedAt ?? 'Unknown')}.</p>` +
       (d === null ? `<p class="small flag">No matching published block metrics. — means unavailable, not zero.</p>` : '') +
       `<div class="tiles">${tiles}</div>` +
-      `<p class="small muted">${comparable} Repeated calls match the tool name and exact indexed argument text within a session, ` +
-      `not semantic equivalence or proof of unnecessary work.</p>` +
+      `<p class="small muted">${comparable} Repeated calls match the tool name and exact indexed argument text across all days and models within a session. ` +
+      `Each repeat after the first belongs to the later call's UTC day and model. This is not semantic equivalence or proof of unnecessary work.</p>` +
       `<p class="small muted">Tool-result <code>byte_len</code> measures indexed source spans. It is a proxy for result volume, ` +
       `not a measurement of bytes sent to the model, context occupancy, tokens, or dollars. ` +
-      `Block model attribution requires a unique usage record at the same turn; otherwise the model is unknown.</p>` +
+      `Turn dates come from the first indexed block's timestamp. Block model attribution requires a unique usage record at the same turn; ` +
+      `otherwise the model is unknown.</p>` +
       `<p class="small muted">Child spend uses matching main-path usage in ${fmtInt(spend.sessions)} direct child sessions linked to ` +
       `${fmtInt(spend.parents)} parents by <code>parent_session_id</code>, with the current usage window and filters. ` +
       `It is already part of usage cost, not an extra charge or a recursive descendant total.${unpriced} ` +
