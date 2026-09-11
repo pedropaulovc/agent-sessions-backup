@@ -14,6 +14,7 @@ import { probeClientCert, renewCert } from './api/certs';
 import { search } from './api/search';
 import { getSession, getSessionRaw, listSessions } from './api/sessions';
 import { viewerRoute } from './viewer/router';
+import { continueReindexRange, createReindexRange, getReindexRange } from './reindex-range';
 
 /** decodeURIComponent that returns null instead of throwing on a malformed %-sequence, so a bad
  * path/id segment becomes a 400 rather than an uncaught 500. */
@@ -146,6 +147,17 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
  if (path === '/api/v1/usage' && method === 'GET') return usage(url, env);
  // Admin routes require the CURRENT cert slot, not an in-grace previous one: a rotated-out admin cert
  // must not run fleet-wide writes/reindex during its 7-day grace window (identity.ts certSlot).
+ const rangeJobMatch = path.match(/^\/api\/v1\/admin\/reindex-range\/([^/]+)$/);
+ if (path === '/api/v1/admin/reindex-range' || rangeJobMatch) {
+  if (!identity.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
+  if (identity.certSlot !== 'current') return Response.json({ error: 'admin_requires_current_cert' }, { status: 403 });
+  if (!rangeJobMatch && method === 'POST') return createReindexRange(request, env);
+  if (rangeJobMatch && (method === 'GET' || method === 'POST')) {
+   const jobId = safeDecode(rangeJobMatch[1]!);
+   if (jobId === null) return Response.json({ error: 'bad_job_id' }, { status: 400 });
+   return method === 'GET' ? getReindexRange(env, jobId) : continueReindexRange(env, jobId);
+  }
+ }
  if (path === '/api/v1/admin/reindex' && method === 'POST') {
   if (identity.certSlot !== 'current') return Response.json({ error: 'admin_requires_current_cert' }, { status: 403 });
   return reindex(request, env, identity);

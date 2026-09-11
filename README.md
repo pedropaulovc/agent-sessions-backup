@@ -17,6 +17,67 @@ OMP's collapsed System entry includes captured tool declarations and tool config
 
 Nightly, checkpointed rollups supply rewound assistant turns, indexed tool-result source bytes, repeated complete tool calls, and tool calls per assistant turn without scanning transcript blocks on page loads. These diagnostics show their complete-UTC-day scope, publication time, and coverage. Repeated calls and source bytes are inspection signals, not proof of waste or quality. Direct-child spend uses the filtered usage window and retains unknown-price coverage; records without session metadata remain in usage totals but cannot enter linked rankings.
 
+## Reindex sessions overlapping a date range
+
+After deploying the migration and Worker, use the **current admin machine certificate** on the API host.
+Reader grants, non-admin certificates, and the previous certificate slot cannot create, inspect, or continue these jobs.
+`POST /api/v1/admin/reindex-range` accepts required UTC `from`/`to` timestamps and returns `202` with a
+durable `job_id` and `status_url`; it snapshots targets but does not enqueue them. Selection is inclusive:
+`(ended_at >= from OR started_at >= from) AND started_at <= to`. Sessions with unknown start dates are
+excluded. New sessions and later date changes do not expand or shrink the snapshot.
+
+The entire job is refused with `422`, a durable failed job, and an aggregate `unsupported_count` if any
+selected canonical file is an export archive or is shared by multiple sessions, even when all those sessions
+are in range. No target is dispatched in that case: reparsing a shared file could mutate sessions outside
+the requested range. This endpoint does not read or return transcript content, titles, paths, or credentials.
+
+For a rolling seven-day window, the following Bash example needs `curl`, `jq`, GNU `date`, and an authorized
+client-certificate setup. Set `API` to the API origin (not the viewer), and `ADMIN_CERT`/`ADMIN_KEY` to the
+current admin certificate and key; use the equivalent TPM-backed client invocation where the key is non-exportable.
+
+```bash
+set -euo pipefail
+to=$(date -u +%Y-%m-%dT%H:%M:%S.000Z)
+from=$(date -u -d "$to -7 days" +%Y-%m-%dT%H:%M:%S.000Z)
+accepted=$(curl --fail-with-body --silent --show-error \
+  --cert "$ADMIN_CERT" --key "$ADMIN_KEY" \
+  -H 'Content-Type: application/json' \
+  --data "$(jq -nc --arg from "$from" --arg to "$to" '{from:$from,to:$to}')" \
+  "$API/api/v1/admin/reindex-range")
+status_url=$(jq -er '.status_url' <<<"$accepted")
+printf 'Resume/poll this job: %s%s\n' "$API" "$status_url"
+while :; do
+  progress=$(curl --fail-with-body --silent --show-error \
+    --cert "$ADMIN_CERT" --key "$ADMIN_KEY" "$API$status_url")
+  jq '{job_id,status,counts,errors,unsupported_count}' <<<"$progress"
+  case $(jq -r '.status' <<<"$progress") in
+    complete) break ;;
+    partial|failed) exit 1 ;;
+    dispatching)
+      curl --fail-with-body --silent --show-error \
+        --cert "$ADMIN_CERT" --key "$ADMIN_KEY" -X POST "$API$status_url"
+      printf '\n' ;;
+    indexing) ;;
+    *) exit 1 ;;
+  esac
+  sleep 5
+done
+```
+
+Each `POST` to the saved status URL continues at most ten files. `GET` records observed outcomes but never dispatches.
+`dispatching` includes retryable queue failures and targets blocked by a live reservation; continue the same
+job after the owner releases it. Interrupted dispatch is resumable; a concurrent caller may need to wait
+for the dispatch lease to expire. Do not create a replacement job merely to resume.
+`indexing` means dispatch has finished but successful parsing is still pending.
+`counts.enqueued` is queue acceptance, not completion, and overlaps the outcome counts.
+Only `complete` means every selected target has fresh successful file parsing **and** a ready session
+with the snapshotted canonical file and hash; an empty snapshot is also complete.
+Observed successful targets and terminal job results are durable: a later upload to an active session does
+not undo the completed snapshot, and continuing a terminal job never reparses it.
+`partial` means some targets completed and others failed; `failed` means no target completed or preflight
+refused the job. Aggregate `errors` describe missing/changed targets and parse failures without identifiers.
+Neither terminal failure state is successful indexing.
+
 ## Run a bounded session-rollup pass
 
 Using the current admin machine certificate, send `POST /api/v1/admin/session-rollup`.
