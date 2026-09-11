@@ -172,7 +172,7 @@ export async function continueReindexRange(env: Env, jobId: string): Promise<Res
   if (!claimed) return getReindexRange(env, jobId);
   const summary = { attempted: 0, enqueued: 0, rejected: 0, skipped: 0, lost_lease: 0 };
   try {
-    const reconciled = await env.DB.batch(reconcileStatements(env, jobId));
+    const reconciled = await env.DB.batch<{ status: JobRow['status'] }>(reconcileStatements(env, jobId));
     const finished = reconciled[1]!.results[0];
     if (finished) console.log(JSON.stringify({ event: 'hub.reindex_range.job.finished', job_id: jobId, status: finished.status }));
     const page = await env.DB.prepare(`${OBSERVATIONS} SELECT session_id FROM classified

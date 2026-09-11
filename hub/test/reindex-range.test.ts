@@ -112,7 +112,7 @@ beforeEach(async () => {
     return undefined as never;
   });
   vi.spyOn(testEnv.PARSE_QUEUE, 'sendBatch').mockImplementation(async (messages) => {
-    await accept(messages.map((message) => message.body));
+    await accept(Array.from(messages, (message) => message.body));
     return undefined as never;
   });
   await db.prepare("INSERT INTO machines (machine_id, os) VALUES (?1, 'linux')").bind(MACHINE).run();
