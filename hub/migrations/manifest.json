@@ -28,6 +28,7 @@
     { "sequence": 23, "filename": "0023_read_grants.sql", "sha256": "904e38ad76ffe453d0499440e92ab553f7d84f4ecd65eed70a5bae818d912678" },
     { "sequence": 24, "filename": "0024_drop_debug_exchange.sql", "sha256": "5222dec34e6a2ea10ee917a122d8dddaea46e2abdca04199e65dce5449ef2170" },
     { "sequence": 25, "filename": "0025_session_rollup.sql", "sha256": "fd4d235504bfc285c58df21fec1cc894345f8333434b3232198f62145e456533" },
-    { "sequence": 26, "filename": "0026_session_rollup_jobs.sql", "sha256": "a20f418038be2011301b1c613281864e6ad4b0453bef34e01ab816ffb8f4a8c8" }
+    { "sequence": 26, "filename": "0026_session_rollup_jobs.sql", "sha256": "a20f418038be2011301b1c613281864e6ad4b0453bef34e01ab816ffb8f4a8c8" },
+    { "sequence": 27, "filename": "0027_reindex_range.sql", "sha256": "49ed8b0a87a49fb60ff5d58d4ec04030ab3db1c8fe1af5070f10c03517552148" }
   ]
 }
