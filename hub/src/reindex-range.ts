@@ -212,7 +212,7 @@ async function dispatchTarget(env: Env, jobId: string, sessionId: string, token:
       WHERE job_id = ?1 AND session_id = ?3 AND dispatch_state NOT IN ('enqueued', 'ready', 'error') AND ${owned}`)
       .bind(jobId, reservationCutoffIso(), sessionId, token, Date.now()),
     env.DB.prepare(`UPDATE reindex_range_targets AS t SET dispatch_state = 'sending', attempt_token = ?4,
-      dispatched_at = COALESCE(dispatched_at, ${DB_NOW}), send_failed = 0,
+      dispatched_at = COALESCE(dispatched_at, ${DB_NOW}),
       reason = COALESCE((SELECT CASE WHEN f.parse_state IN ('reserved', 'pending') AND f.reserved_reason IN ('recover', 'upload')
         THEN f.reserved_reason END FROM files f WHERE f.id = t.file_id), t.reason, 'reindex')
       WHERE t.job_id = ?1 AND t.session_id = ?3 AND t.dispatch_state NOT IN ('enqueued', 'ready', 'error') AND ${owned}
@@ -240,16 +240,12 @@ async function dispatchTarget(env: Env, jobId: string, sessionId: string, token:
     console.warn(JSON.stringify({ event: 'hub.reindex_range.queue.rejected', job_id: jobId, reason: 'queue_send_rejected' }));
     // A transport rejection can be ambiguous. Retain the original timestamp and intent; the
     // next continuation first observes any successful parse, otherwise safely replays the send.
-    await env.DB.prepare(`UPDATE reindex_range_targets AS t SET send_failed = 1 WHERE job_id = ?1
-      AND session_id = ?2 AND attempt_token = ?3 AND EXISTS (SELECT 1 FROM reindex_range_jobs j
-        WHERE j.job_id = t.job_id AND j.status = 'dispatching' AND j.lease_token = ?3 AND j.lease_until > ${LEASE_NOW})`)
-      .bind(jobId, sessionId, token).run();
     return 'rejected';
   }
   await env.DB.batch([
     env.DB.prepare(`UPDATE reindex_range_targets AS t SET
       dispatch_state = CASE WHEN dispatch_state = 'sending' THEN 'enqueued' ELSE dispatch_state END,
-      enqueued_at = ${DB_NOW}, send_failed = 0
+      enqueued_at = ${DB_NOW}
       WHERE job_id = ?1 AND session_id = ?2 AND attempt_token = ?3 AND EXISTS (SELECT 1 FROM reindex_range_jobs j
         WHERE j.job_id = t.job_id AND j.status = 'dispatching' AND j.lease_token = ?3 AND j.lease_until > ${LEASE_NOW})`)
       .bind(jobId, sessionId, token),

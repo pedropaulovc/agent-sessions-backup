@@ -30,7 +30,6 @@ CREATE TABLE reindex_range_targets (
   last_attempt_at INTEGER NOT NULL DEFAULT 0,
   reason TEXT CHECK (reason IN ('reindex', 'recover', 'upload')),
   error_code TEXT,
-  send_failed INTEGER NOT NULL DEFAULT 0 CHECK (send_failed IN (0, 1)),
   PRIMARY KEY (job_id, session_id)
 ) STRICT;
 CREATE INDEX reindex_range_targets_dispatch ON reindex_range_targets (job_id, dispatch_state, session_id);
