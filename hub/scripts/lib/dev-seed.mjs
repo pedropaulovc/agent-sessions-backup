@@ -35,6 +35,7 @@ export const SYNTHETIC_EXPECTATIONS = Object.freeze({
   externalFileName: 'fixture-external.png',
   externalRelpath: EXTERNAL_RELPATH,
   skillName: SKILL_NAME,
+  skillStore: SKILL_STORE,
   skillRelpath: SKILL_RELPATH,
   skillSourceMarker: 'deterministic indigo compass skill marker',
 });

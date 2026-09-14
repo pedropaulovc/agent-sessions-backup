@@ -657,6 +657,7 @@ async function seed() {
   const primary = await readFile(new URL('e2e-synthetic-session.jsonl', fixtureRoot));
   const pager = await readFile(new URL('e2e-pager-session.jsonl', fixtureRoot));
   const asset = Buffer.from((await readFile(new URL('fixture-external.png.base64', fixtureRoot), 'utf8')).trim(), 'base64');
+  const skill = await readFile(new URL('e2e-managed-skill.md', fixtureRoot));
   const {
     externalDigest,
     externalRelpath,
@@ -667,17 +668,20 @@ async function seed() {
     primaryRelpath,
     primarySessionId,
     searchPhrase,
+    skillRelpath,
+    skillStore,
     store,
   } = SYNTHETIC_EXPECTATIONS;
   if (sha256Bytes(asset) !== externalDigest) fail('synthetic external asset digest does not match fixture contract');
   const uploads = [
-    [externalRelpath, asset],
-    [primaryRelpath, primary],
-    [pagerRelpath, pager],
+    [store, externalRelpath, asset],
+    [store, primaryRelpath, primary],
+    [store, pagerRelpath, pager],
+    [skillStore, skillRelpath, skill],
   ];
-  for (const [relative, bytes] of uploads) {
+  for (const [uploadStore, relative, bytes] of uploads) {
     const encoded = relative.split('/').map(encodeURIComponent).join('/');
-    const target = `/api/v1/files/${encodeURIComponent(machine)}/${encodeURIComponent(store)}/${encoded}`;
+    const target = `/api/v1/files/${encodeURIComponent(machine)}/${encodeURIComponent(uploadStore)}/${encoded}`;
     const init = {
       method: 'PUT',
       body: bytes,

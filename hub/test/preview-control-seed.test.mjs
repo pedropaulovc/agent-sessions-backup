@@ -11,6 +11,7 @@ import { previewBearerToken } from '../../infra/cf/preview-trust.mjs';
 const SEED = 'synthetic-preview-seed-for-cli-regression-only';
 const ORIGIN = 'https://pr-150-app.sessions-ppe.workers.dev';
 const ASSET_PATH = `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${SYNTHETIC_EXPECTATIONS.store}/${SYNTHETIC_EXPECTATIONS.externalRelpath}`;
+const SKILL_PATH = `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${SYNTHETIC_EXPECTATIONS.skillStore}/${SYNTHETIC_EXPECTATIONS.skillRelpath}`;
 const CLOUDFLARE_404 = '<!DOCTYPE html><html><head><title>Page not found</title><link rel="icon" href="https://workers.cloudflare.com/favicon.ico"></head><body>Not found</body></html>';
 const controller = process.env.PREVIEW_CONTROL_PATH
   ?? fileURLToPath(new URL('../../infra/cf/preview-control.mjs', import.meta.url));
@@ -107,7 +108,7 @@ test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then o
   const result = await runSeed({});
   assert.equal(result.status, 0, result.output);
   const uploads = result.requests.filter((request) => request.method === 'PUT');
-  assert.equal(uploads.length, 4);
+  assert.equal(uploads.length, 5);
   const { budget: firstBudget, started: firstStarted, ...first } = uploads[0];
   const { budget: secondBudget, started: secondStarted, ...second } = uploads[1];
   assert.deepEqual(second, first, 'replayed URL, method, bytes and all headers must be identical');
@@ -119,7 +120,10 @@ test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then o
   assert.ok(firstBudget > 0 && firstBudget <= 10_000);
   assert.ok(secondBudget > 0 && secondBudget <= 10_000);
   assert.ok(secondStarted > firstStarted, 'retry must back off');
-  assert.deepEqual(result.consumed, [true, true, true, true, true, true]);
+  const skillUpload = uploads.at(-1);
+  assert.equal(skillUpload.url, `${ORIGIN}${SKILL_PATH}`);
+  assert.match(Buffer.from(skillUpload.body, 'base64').toString('utf8'), new RegExp(SYNTHETIC_EXPECTATIONS.skillSourceMarker));
+  assert.deepEqual(result.consumed, [true, true, true, true, true, true, true]);
   assert.equal(result.requests.filter((request) => request.method === 'GET').length, 2);
   const summary = JSON.parse(result.stdout.trim().split('\n').at(-1));
   assert.deepEqual(summary.seeded, [SYNTHETIC_EXPECTATIONS.primarySessionId, SYNTHETIC_EXPECTATIONS.pagerSessionId]);
