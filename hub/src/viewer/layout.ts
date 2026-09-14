@@ -305,7 +305,7 @@ ul.gaps-list li { margin-bottom: 8px; }
 .skills-table-scroll code, .skill-page code { font: inherit; }
 .skill-source {
   border: 1px solid var(--line); border-radius: 8px; background: var(--card); padding: 14px;
-  max-width: 100%; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+  max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere;
 }
 .skill-files { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 12px; }
 .skill-files > summary { cursor: pointer; font-weight: 600; }
@@ -313,7 +313,7 @@ ul.gaps-list li { margin-bottom: 8px; }
 .skill-files li { display: flex; justify-content: space-between; gap: 16px; padding: 5px 0; border-bottom: 1px solid var(--line); }
 .skill-files li code { min-width: 0; overflow-wrap: anywhere; }
 .skills-page :is(a, .skills-table-scroll):focus-visible,
-.skill-page :is(a, summary, .skill-source):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.skill-page :is(a, summary):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .stats-page .stats-limitations > summary { color: var(--fg); }
 .stats-page table.heat { min-width: 500px; }
 @media (max-width: 760px) {

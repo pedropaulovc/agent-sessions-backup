@@ -100,6 +100,8 @@ describe('managed skills viewer', () => {
     expect(html).not.toContain('wrong store');
     expect(html).toContain('<a href="/skills" style="font-weight:700">Skills</a>');
     expect(html).toContain('<div class="skills-table-scroll" role="region" aria-label="Backed-up managed skills" tabindex="0">');
+    expect(html).toContain('2026-09-14T12:00:00.000Z');
+    expect(html).not.toContain('(uploaded)');
   });
 
   it('renders escaped SKILL.md source and inventories its complete backed-up package', async () => {
@@ -107,6 +109,7 @@ describe('managed skills viewer', () => {
     const skillId = await seedFile('example🚀/SKILL.md', source);
     await seedFile('example🚀/references/guide.md', 'guide');
     await seedFile('example🚀/scripts/check.py', 'print("ok")');
+    await seedFile('example🚀/🚀notes.md', 'notes');
 
     const response = await SELF.fetch(`${VIEWER}/skills/${skillId}`);
     const html = await response.text();
@@ -120,7 +123,8 @@ describe('managed skills viewer', () => {
     expect(response.headers.get('x-content-type-options')).toBe('nosniff');
     expect(html).toContain('<code>references/guide.md</code>');
     expect(html).toContain('<code>scripts/check.py</code>');
-    expect(html).toContain('3 backed-up package files');
+    expect(html).toContain('<code>🚀notes.md</code>');
+    expect(html).toContain('4 backed-up package files');
   });
 
   it('labels upload time when filesystem modification time is unavailable', async () => {

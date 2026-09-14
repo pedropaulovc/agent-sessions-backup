@@ -1,12 +1,11 @@
 import type { Identity } from '../auth/identity';
 
-// Centrally-managed collector config served to every enrolled machine at startup. The
-// collector merges this OVER its local config, so the hub can retune scan cadence, caps,
-// and per-store toggles fleet-wide without redeploying agents. Kept minimal and versioned:
-// `schema_version` lets an older collector ignore keys it doesn't understand rather than
-// choke on them. Defaults live here; an operator overrides any subset by writing a JSON
-// object to meta['collector_config'] (via POST /api/v1/admin/machines' sibling admin path
-// or wrangler d1), which is shallow-merged on top of these.
+// Collector configuration contract served to enrolled machines. The current collector does not
+// fetch this endpoint, so hub overrides affect fleet/control-plane clients only; they cannot retune
+// deployed agents. `schema_version` lets a future collector ignore keys it does not understand.
+// Defaults live here; an operator overrides any subset by writing a JSON object to
+// meta['collector_config'] (via POST /api/v1/admin/machines' sibling admin path or wrangler d1),
+// which is shallow-merged on top of these.
 export const COLLECTOR_CONFIG_SCHEMA_VERSION = 1;
 
 export const DEFAULT_COLLECTOR_CONFIG = {
@@ -21,12 +20,12 @@ export const DEFAULT_COLLECTOR_CONFIG = {
   // of truth; when the collector's is exported into the shared config, reference it here.
   max_upload_bytes: 90_000_000,
   // Store catalog for fleet and control-plane clients. The collector does not consult these
-  // booleans when building filesystem roots: DEFAULT_STORES remain enabled additively. These keys
-  // MUST still be the collector's actual store names. Source of truth:
-  // collector/src/agent_collector/config.py — DEFAULT_STORES
-  // ('claude', 'codex', 'omp', 'omp-skills') + WEBCAPTURE_STORES
-  // ('chatgpt-web', 'claude-web', 'export-inbox'). Note the local Claude Code store key is 'claude'
-  // (the harness dir ~/.claude), NOT 'claude-code'. fleet-endpoints.test.ts asserts this ⊆ that set.
+  // booleans when building filesystem roots: ADDITIVE_DEFAULT_STORES ('omp', 'omp-skills') are
+  // re-added to persisted configs, WEBCAPTURE_STORES are setdefault-ed, and other roots come from
+  // the machine's local `stores` map. These keys MUST still be actual store names. Source of truth:
+  // collector/src/agent_collector/config.py — DEFAULT_STORES + WEBCAPTURE_STORES. Note the local
+  // Claude Code store key is 'claude' (the harness dir ~/.claude), NOT 'claude-code'.
+  // fleet-endpoints.test.ts asserts this catalog is a subset of those sets.
   store_toggles: {
     claude: true,
     codex: true,
@@ -56,8 +55,8 @@ export async function bootstrap(env: Env, identity: Identity): Promise<Response>
       // hub isn't actually serving, or collectors would mis-parse a config they can't read.
       // `stores` is reserved for the collector's local name -> filesystem-root map. Never echo a stale
       // or mistaken hub override under that key: merging it over Config would replace paths with booleans
-      // (or centrally overwrite machine-specific roots) before the collector can scan. Store enablement
-      // belongs under store_toggles; roots remain local-only.
+      // or centrally overwrite machine-specific roots. Store enablement is not currently collector-enforced;
+      // store_toggles is an informational catalog for fleet/control-plane clients. Roots remain local-only.
       const safeOverride = { ...parsed };
       delete safeOverride.stores;
       merged = { ...merged, ...safeOverride, schema_version: COLLECTOR_CONFIG_SCHEMA_VERSION };

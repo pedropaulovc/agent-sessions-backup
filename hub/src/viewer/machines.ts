@@ -68,4 +68,3 @@ function isStale(lastSeen: string | null, now: number): boolean {
   const t = Date.parse(lastSeen);
   return Number.isFinite(t) && now - t > STALE_MS;
 }
-
