@@ -66,6 +66,30 @@ def test_run_records_heartbeat_with_stats(tmp_path, hub):
     assert hb["stores"]["claude"]["bytes_uploaded"] == len(b"data")
 
 
+def test_run_uploads_managed_skills_from_legacy_config(tmp_path, hub, tmp_env):
+    skills = tmp_env / "home" / ".omp" / "agent" / "managed-skills"
+    (skills / "example" / "references").mkdir(parents=True)
+    (skills / "example" / "SKILL.md").write_text("---\nname: example\n---\n")
+    (skills / "example" / "references" / "guide.md").write_text("guide")
+    claude = tmp_path / "claude"
+    path = config.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f'machine_id = "m1"\nhub_url = "{hub.url}"\nauth = "dev"\n\n'
+        f'[stores]\nclaude = "{claude}"\n'
+    )
+
+    cfg = config.load(path)
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_run(cfg, st) == 0
+
+    assert hub.files[("m1", "omp-skills", "example/SKILL.md")]["body"] == b"---\nname: example\n---\n"
+    assert hub.files[("m1", "omp-skills", "example/references/guide.md")]["body"] == b"guide"
+    stats = hub.heartbeats[-1]["stores"]["omp-skills"]
+    assert stats["files_seen"] == 2
+    assert stats["files_uploaded"] == 2
+
+
 def test_heartbeat_only_writes_without_scanning(tmp_path, hub, tmp_env, monkeypatch, capsys):
     path = config.config_path()
     config.enroll(hub.url, dev=True, path=path, machine_id="m1")

@@ -8,6 +8,7 @@ import { exportZipEndpoint } from './export';
 import { machinesPage } from './machines';
 import { searchPage } from './search';
 import { statsPage } from './stats';
+import { skillPage, skillsPage } from './skills';
 import { sessionPage, TURNS_PER_PAGE } from './session';
 
 /**
@@ -82,6 +83,15 @@ function handle(url: URL, env: Env): Promise<Response> {
   if (path === '/' || path === '') return searchPage(url, env);
   if (path === '/machines') return machinesPage(env);
   if (path === '/stats') return statsPage(url, env);
+  if (path === '/skills') return skillsPage(env);
+  const skill = path.match(/^\/skills\/(\d+)\/?$/);
+  if (skill) {
+    const fileId = Number(skill[1]);
+    if (!Number.isSafeInteger(fileId) || fileId <= 0) {
+      return Promise.resolve(new Response('skill not found', { status: 404 }));
+    }
+    return skillPage(fileId, env);
+  }
   const asset = path.match(/^\/s\/([^/]+)\/asset\/([^/]+)\/([^/]+)$/);
   if (asset) {
     return assetEndpoint(

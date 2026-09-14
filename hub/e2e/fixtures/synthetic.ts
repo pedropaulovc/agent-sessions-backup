@@ -8,4 +8,6 @@ export const SYNTHETIC_FIXTURE = Object.freeze({
   pagerTitle: SYNTHETIC_EXPECTATIONS.pagerTitle,
   pagerSearchPhrase: SYNTHETIC_EXPECTATIONS.pagerSearchPhrase,
   machineId: SYNTHETIC_EXPECTATIONS.machine,
+  skillName: SYNTHETIC_EXPECTATIONS.skillName,
+  skillSourceMarker: SYNTHETIC_EXPECTATIONS.skillSourceMarker,
 });

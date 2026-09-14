@@ -7,6 +7,7 @@ const FIXTURE_DIR = join(HUB_ROOT, 'test', 'fixtures', 'local');
 const PRIMARY = join(FIXTURE_DIR, 'e2e-synthetic-session.jsonl');
 const PAGER = join(FIXTURE_DIR, 'e2e-pager-session.jsonl');
 const EXTERNAL_BASE64 = join(FIXTURE_DIR, 'fixture-external.png.base64');
+const SKILL = join(FIXTURE_DIR, 'e2e-managed-skill.md');
 const MACHINE = 'e2e-machine';
 const STORE = 'claude-projects';
 const PRIMARY_SESSION_ID = '00000000-0000-4000-8000-000000000001';
@@ -15,6 +16,9 @@ const PRIMARY_RELPATH = `-workspace-e2e-fixtures/${PRIMARY_SESSION_ID}.jsonl`;
 const PAGER_RELPATH = `-workspace-e2e-fixtures/${PAGER_SESSION_ID}.jsonl`;
 const EXTERNAL_DIGEST = '431ced6916a2a21a156e38701afe55bbd7f88969fbbfc56d7fe099d47f265460';
 const EXTERNAL_RELPATH = `${PRIMARY_RELPATH}.assets/${EXTERNAL_DIGEST}/fixture-external.png`;
+const SKILL_STORE = 'omp-skills';
+const SKILL_NAME = 'e2e-managed-skill';
+const SKILL_RELPATH = `${SKILL_NAME}/SKILL.md`;
 
 export const SYNTHETIC_EXPECTATIONS = Object.freeze({
   machine: MACHINE,
@@ -30,15 +34,18 @@ export const SYNTHETIC_EXPECTATIONS = Object.freeze({
   externalDigest: EXTERNAL_DIGEST,
   externalFileName: 'fixture-external.png',
   externalRelpath: EXTERNAL_RELPATH,
+  skillName: SKILL_NAME,
+  skillRelpath: SKILL_RELPATH,
+  skillSourceMarker: 'deterministic indigo compass skill marker',
 });
 
 export async function syntheticSeedManifest() {
-  return seedManifest([PRIMARY, PAGER, EXTERNAL_BASE64]);
+  return seedManifest([PRIMARY, PAGER, EXTERNAL_BASE64, SKILL]);
 }
 
-async function upload(baseUrl, relpath, bytes) {
+async function upload(baseUrl, store, relpath, bytes) {
   const contentHash = sha256(bytes);
-  const response = await fetch(`${baseUrl}/api/v1/files/${MACHINE}/${STORE}/${encodeURIComponent(relpath)}`, {
+  const response = await fetch(`${baseUrl}/api/v1/files/${MACHINE}/${store}/${encodeURIComponent(relpath)}`, {
     method: 'PUT',
     headers: {
       'x-dev-machine': MACHINE,
@@ -79,17 +86,19 @@ export async function seedSynthetic(baseUrl, timeoutMs = 30_000, expectedDigest)
   if (expectedDigest && liveManifest.digest !== expectedDigest) {
     throw new Error('synthetic fixtures changed after the environment manifest was recorded');
   }
-  const [primary, pager, assetText] = await Promise.all([
+  const [primary, pager, assetText, skill] = await Promise.all([
     readFile(PRIMARY),
     readFile(PAGER),
     readFile(EXTERNAL_BASE64, 'utf8'),
+    readFile(SKILL),
   ]);
   const asset = Buffer.from(assetText.trim(), 'base64');
   if (sha256(asset) !== EXTERNAL_DIGEST) throw new Error('synthetic external asset digest does not match its fixture contract');
 
-  await upload(baseUrl, EXTERNAL_RELPATH, asset);
-  await upload(baseUrl, PRIMARY_RELPATH, primary);
-  await upload(baseUrl, PAGER_RELPATH, pager);
+  await upload(baseUrl, STORE, EXTERNAL_RELPATH, asset);
+  await upload(baseUrl, STORE, PRIMARY_RELPATH, primary);
+  await upload(baseUrl, STORE, PAGER_RELPATH, pager);
+  await upload(baseUrl, SKILL_STORE, SKILL_RELPATH, skill);
   const deadline = Date.now() + timeoutMs;
   await waitForIndexed(baseUrl, PRIMARY_SESSION_ID, 'saffron telescope', deadline);
   await waitForIndexed(baseUrl, PAGER_SESSION_ID, 'stable second page', deadline);

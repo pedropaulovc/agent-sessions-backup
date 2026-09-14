@@ -2,7 +2,7 @@
 
 Backup, index, search, and render AI agent/chat sessions from every machine and harness in one place.
 
-- **Harnesses**: Claude Code, Codex CLI, OMP (Oh My Pi), ChatGPT web, Claude web (more via raw-file capture)
+- **Harnesses and skills**: Claude Code, Codex CLI, OMP (Oh My Pi), OMP managed skills, ChatGPT web, Claude web
 - **Hub**: Cloudflare Workers + D1 (SQLite FTS5 index) + R2 (raw files, source of truth) + Queues
 - **Collector**: Python (uv) agent on each machine — incremental uploads over mTLS (TPM-bound client certs), heartbeats
 - **Viewer**: chat-style session rendering + faceted full-text search, passkey login
@@ -12,6 +12,8 @@ Backup, index, search, and render AI agent/chat sessions from every machine and 
 Session details keep the transcript visible by default. Expand **Activity trace** for the current page's model and tool activity, event/error filters, and links back to turns. Duration shows recorded OMP timing spans or timestamp markers; Sequence also includes events without timestamps. Per-tool totals include only recorded durations and may overlap.
 
 OMP's collapsed System entry includes captured tool declarations and tool configuration as formatted JSON when the raw `omp-system-prompt` record contains `data.providerContext`. Older records without those fields cannot recover historical schemas. After deploying a parser update, refresh affected sessions with the current admin machine certificate: `POST /api/v1/admin/reindex` with `{"prefix":"raw/<machine>/<omp-store>/"}`. Repeat while the response is `202` / `done:false`; `200` / `done:true` means enqueueing finished, not indexing. Wait for the sessions to return to `index_state: "ready"` before checking declaration search results and transcript links.
+
+The **Skills** tab lists every current `SKILL.md` backup from `~/.omp/agent/managed-skills`, identifies its source machine and hash, shows the escaped source text, and inventories the other files captured with that skill.
 
 **Statistics** starts with usage counts, separate reported token counters, model shares, and linked session rankings. Rank by activity or known cost, or select a model to filter the page. Cost and context analysis stays available in a disclosure. Unpriced records are marked unknown; partial costs are subtotals, and overlapping input/cache counters are not added into a token total.
 
@@ -136,5 +138,5 @@ curl -fsSL https://raw.githubusercontent.com/pedropaulovc/agent-sessions-backup/
 
 - **R2 is truth.** The D1 index is derived and fully rebuildable from raw files alone.
 - **Never delete.** Local GC or file deletion on a machine never propagates to the hub.
-- **Capture all, exclude explicitly.** Whole `~/.claude` + `~/.codex` trees, minus credentials and caches.
+- **Capture all, exclude explicitly.** Scan the complete `~/.claude` and `~/.codex` trees, plus OMP sessions and managed skills, minus credentials and caches.
 - **Zero secrets where possible.** TPM-bound keys on machines; OIDC federation to Azure; no encryption at rest by design (searchability first).
