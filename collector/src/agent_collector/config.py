@@ -58,7 +58,12 @@ DEFAULT_STORES: dict[str, str] = {
     "claude": "~/.claude",
     "codex": "~/.codex",
     "omp": "~/.omp/agent/sessions",
+    "omp-skills": "~/.omp/agent/managed-skills",
 }
+# These roots were added after the original collector shipped. Loaded persisted configs gain
+# them additively; explicit custom roots win. Direct Config instances remain exact unless they
+# carry `source`, which marks them as persisted and activates the same compatibility path.
+ADDITIVE_DEFAULT_STORES = ("omp", "omp-skills")
 
 # Staging stores the webcapture host writes into (CDP JSON) or an operator drops export ZIPs
 # into. They are ordinary `stores` entries on that host so the normal run/backfill scan uploads
@@ -237,11 +242,12 @@ class Config:
     def _effective_stores(self) -> dict[str, str]:
         """Return the store map after applying all built-in roots and staging stores."""
         stores = dict(self.stores)
-        # Persisted configs from before OMP support need this upgrade path. Direct Config instances
-        # with an explicit custom store map retain their existing scope; fresh defaults already carry
-        # omp in DEFAULT_STORES.
+        # Persisted configs from before OMP session/managed-skill support need these upgrade
+        # paths. Direct Config instances with an explicit custom store map retain their existing
+        # scope; fresh and loaded defaults already carry both roots.
         if self.source is not None:
-            stores.setdefault("omp", DEFAULT_STORES["omp"])
+            for name in ADDITIVE_DEFAULT_STORES:
+                stores.setdefault(name, DEFAULT_STORES[name])
         base = Path(self.staging_base).expanduser() if self.staging_base else webcapture_dir()
         for name in WEBCAPTURE_STORES:
             stores.setdefault(name, str(base / name))
@@ -328,12 +334,15 @@ def load(path: Path | str | None = None) -> Config:
         float(data.get("multipart_threshold_mb", DEFAULT_MULTIPART_THRESHOLD_MB)),
         float(data.get("multipart_part_size_mb", DEFAULT_MULTIPART_PART_SIZE_MB)),
     )
+    stores = dict(data.get("stores") or DEFAULT_STORES)
+    for name in ADDITIVE_DEFAULT_STORES:
+        stores.setdefault(name, DEFAULT_STORES[name])
     return Config(
         machine_id=data["machine_id"],
         hub_url=data["hub_url"].rstrip("/"),
         auth=data.get("auth", "dev"),
         include_windows_mounts=bool(data.get("include_windows_mounts", False)),
-        stores=dict(data.get("stores") or DEFAULT_STORES),
+        stores=stores,
         exclude=list(data.get("exclude") or []),
         client_cert_path=data.get("client_cert_path"),
         client_key_path=data.get("client_key_path"),

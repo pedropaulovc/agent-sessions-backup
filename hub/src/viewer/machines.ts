@@ -1,4 +1,4 @@
-import { esc, page } from './layout';
+import { esc, fmtBytes, page } from './layout';
 
 interface MachineRow {
   machine_id: string;
@@ -67,15 +67,4 @@ function isStale(lastSeen: string | null, now: number): boolean {
   if (!lastSeen) return true;
   const t = Date.parse(lastSeen);
   return Number.isFinite(t) && now - t > STALE_MS;
-}
-
-function fmtBytes(n: number): string {
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`;
 }

@@ -16,6 +16,17 @@ export function q(v: unknown): string {
   return encodeURIComponent(v == null ? '' : String(v));
 }
 
+export function fmtBytes(n: number): string {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = n;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`;
+}
+
 const STYLE = `
 :root {
   --bg: #fbfbfa; --fg: #1d1d1f; --muted: #6b6b70; --line: #e2e2df; --card: #ffffff;
@@ -286,6 +297,23 @@ ul.gaps-list li { margin-bottom: 8px; }
 .stats-page .tile { padding: 0; border: 0; border-radius: 0; background: transparent; min-width: 0; }
 .stats-page .tile-v { font-size: 20px; }
 .stats-page .stats-limitations { color: var(--muted); }
+/* ---- managed skills ---- */
+.skills-page, .skill-page { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.skills-page h2, .skill-page h2 { margin: 0 0 4px; font-size: 24px; letter-spacing: -0.03em; }
+.skills-table-scroll { max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; margin-top: 14px; }
+.skills-table-scroll table { min-width: 720px; font-size: 12px; }
+.skills-table-scroll code, .skill-page code { font: inherit; }
+.skill-source {
+  border: 1px solid var(--line); border-radius: 8px; background: var(--card); padding: 14px;
+  max-width: 100%; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+.skill-files { border-top: 1px solid var(--line); margin-top: 16px; padding-top: 12px; }
+.skill-files > summary { cursor: pointer; font-weight: 600; }
+.skill-files ul { list-style: none; margin: 8px 0 0; padding: 0; }
+.skill-files li { display: flex; justify-content: space-between; gap: 16px; padding: 5px 0; border-bottom: 1px solid var(--line); }
+.skill-files li code { min-width: 0; overflow-wrap: anywhere; }
+.skills-page :is(a, .skills-table-scroll):focus-visible,
+.skill-page :is(a, summary):focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 .stats-page .stats-limitations > summary { color: var(--fg); }
 .stats-page table.heat { min-width: 500px; }
 @media (max-width: 760px) {
@@ -335,6 +363,7 @@ function navBar(active?: string): string {
   return `<header class="nav"><span class="brand"><a href="/">sessions</a></span>` +
     link('/', 'Search', 'search') +
     link('/stats', 'Statistics', 'stats') +
+    link('/skills', 'Skills', 'skills') +
     link('/machines', 'Machines', 'machines') +
     `</header>`;
 }

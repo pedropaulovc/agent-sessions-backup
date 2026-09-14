@@ -14,6 +14,30 @@ test.describe('synthetic sessions viewer', () => {
     await expect(page.getByRole('heading', { name: 'Recent sessions' })).toBeVisible();
   });
 
+  test('navigates the Skills tab and reads a backed-up managed skill', async ({ page, appURL }) => {
+    await page.goto(appURL('/'));
+    await page.getByRole('link', { name: 'Skills', exact: true }).click();
+
+    await expect(page).toHaveURL((url) => url.pathname === '/skills');
+    await expect(page.getByRole('heading', { name: 'Skills', exact: true })).toBeVisible();
+    const skill = page.getByRole('link', { name: fixture.skillName, exact: true });
+    await expect(skill).toBeVisible();
+    await skill.click();
+
+    await expect(page.getByRole('heading', { name: fixture.skillName, exact: true })).toBeVisible();
+    await expect(page.locator('.skill-source')).toContainText(fixture.skillSourceMarker);
+    await expect(page.getByText('1 backed-up package file', { exact: true })).toBeVisible();
+  });
+
+  test('keeps the Skills tab within the viewport at supported mobile widths', async ({ page, appURL }) => {
+    for (const width of [320, 375, 414, 768]) {
+      await page.setViewportSize({ width, height: 720 });
+      await page.goto(appURL('/skills'));
+      await expect(page.getByRole('heading', { name: 'Skills', exact: true })).toBeVisible();
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+    }
+  });
+
   test('finds seeded text and navigates to its turn anchor', async ({ page, appURL }) => {
     await page.goto(appURL('/'));
     await page.getByRole('searchbox').fill(fixture.searchPhrase);

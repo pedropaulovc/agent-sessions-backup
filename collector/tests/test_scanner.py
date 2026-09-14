@@ -128,6 +128,30 @@ def test_scan_default_omp_root_from_temp_home(tmp_env):
     assert items[0].size == session.stat().st_size
 
 
+def test_scan_default_omp_managed_skills_root_from_temp_home(tmp_env):
+    root = tmp_env / "home" / ".omp" / "agent" / "managed-skills"
+    nested = root / "example" / "references"
+    nested.mkdir(parents=True)
+    skill = root / "example" / "SKILL.md"
+    skill.write_text("---\nname: example\n---\n")
+    reference = nested / "guide.md"
+    reference.write_text("guide")
+
+    cfg = config.Config(machine_id="m", hub_url="http://h")
+    with Scanner(cfg.effective_excludes()) as scanner:
+        items = [
+            item
+            for store, store_root in cfg.store_roots().items()
+            for item in scanner.scan_store(store, store_root)
+            if store == "omp-skills"
+        ]
+
+    assert [(item.relpath, item.source_path) for item in items] == [
+        ("example/SKILL.md", skill),
+        ("example/references/guide.md", reference),
+    ]
+
+
 def test_prefix_capture_on_growing_file(tmp_path):
     root = tmp_path / ".claude"
     root.mkdir()

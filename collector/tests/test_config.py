@@ -30,12 +30,13 @@ def test_machine_id_default(monkeypatch):
     assert config.default_machine_id() == "boxname-linux"
 
 
-def test_default_config_exposes_omp_store():
+def test_default_config_exposes_omp_stores():
     cfg = config.Config(machine_id="m", hub_url="http://h")
     assert cfg.stores == {
         "claude": "~/.claude",
         "codex": "~/.codex",
         "omp": "~/.omp/agent/sessions",
+        "omp-skills": "~/.omp/agent/managed-skills",
     }
 
 
@@ -247,6 +248,9 @@ def test_enroll_mtls_preserves_custom_stores_and_excludes(tmp_path):
     assert loaded.stores["claude"] == "~/.claude"
     assert loaded.stores["mystore"] == "~/custom"
     assert "export-inbox" in loaded.stores  # registered on enroll (Fix 11), custom roots preserved
+    assert loaded.stores["omp"] == "~/.omp/agent/sessions"
+    assert loaded.stores["omp-skills"] == "~/.omp/agent/managed-skills"
+    assert 'omp-skills = "~/.omp/agent/managed-skills"' in path.read_text()
     assert loaded.exclude == ["*.secret"]
     assert loaded.include_windows_mounts is True
 
@@ -287,7 +291,7 @@ def test_store_roots_always_includes_webcapture_stores(tmp_path):
     assert custom.store_roots()["export-inbox"] == Path("/custom/inbox")
 
 
-def test_store_roots_injects_omp_for_persisted_config_and_preserves_custom_root(
+def test_store_roots_injects_omp_defaults_for_persisted_config_and_preserves_custom_roots(
     tmp_path, monkeypatch
 ):
     home = tmp_path / "home"
@@ -300,10 +304,30 @@ def test_store_roots_injects_omp_for_persisted_config_and_preserves_custom_root(
         stores={"claude": "~/.claude"},
         source=tmp_path / "config.toml",
     )
-    assert persisted.store_roots()["omp"] == home / ".omp" / "agent" / "sessions"
+    roots = persisted.store_roots()
+    assert roots["omp"] == home / ".omp" / "agent" / "sessions"
+    assert roots["omp-skills"] == home / ".omp" / "agent" / "managed-skills"
 
-    custom = config.Config(machine_id="m", hub_url="http://h", stores={"omp": "/custom/omp"})
+    custom = config.Config(
+        machine_id="m",
+        hub_url="http://h",
+        stores={"omp": "/custom/omp", "omp-skills": "/custom/skills"},
+    )
     assert custom.store_roots()["omp"] == Path("/custom/omp")
+    assert custom.store_roots()["omp-skills"] == Path("/custom/skills")
+
+
+def test_load_adds_new_omp_defaults_to_legacy_store_map(tmp_path):
+    path = tmp_path / "config.toml"
+    path.write_text(
+        'machine_id = "m"\nhub_url = "http://h"\nauth = "dev"\n\n'
+        '[stores]\nclaude = "~/.claude"\nomp = "/custom/sessions"\n'
+    )
+
+    loaded = config.load(path)
+
+    assert loaded.stores["omp"] == "/custom/sessions"
+    assert loaded.stores["omp-skills"] == "~/.omp/agent/managed-skills"
 
 
 def test_hermetic_by_construction_never_resolves_real_data_dir(tmp_path, monkeypatch):
@@ -390,7 +414,7 @@ def test_wsl_drops_windows_mount_roots(monkeypatch):
     assert set(cfg.dropped_store_roots()) == {"win"}
 
 
-def test_wsl_drops_injected_omp_root_for_persisted_config(tmp_path, monkeypatch):
+def test_wsl_drops_injected_omp_roots_for_persisted_config(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "detect_platform_tag", lambda: "wsl")
     monkeypatch.setenv("HOME", "/mnt/c/Users/legacy")
     monkeypatch.setenv("USERPROFILE", "/mnt/c/Users/legacy")
@@ -404,7 +428,9 @@ def test_wsl_drops_injected_omp_root_for_persisted_config(tmp_path, monkeypatch)
     roots = cfg.store_roots()
     dropped = cfg.dropped_store_roots()
     assert "omp" not in roots
+    assert "omp-skills" not in roots
     assert dropped["omp"] == Path("/mnt/c/Users/legacy/.omp/agent/sessions")
+    assert dropped["omp-skills"] == Path("/mnt/c/Users/legacy/.omp/agent/managed-skills")
 
 
 def test_wsl_drops_windows_staging_roots(monkeypatch):
