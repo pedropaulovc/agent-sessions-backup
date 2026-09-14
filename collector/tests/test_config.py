@@ -248,6 +248,9 @@ def test_enroll_mtls_preserves_custom_stores_and_excludes(tmp_path):
     assert loaded.stores["claude"] == "~/.claude"
     assert loaded.stores["mystore"] == "~/custom"
     assert "export-inbox" in loaded.stores  # registered on enroll (Fix 11), custom roots preserved
+    assert loaded.stores["omp"] == "~/.omp/agent/sessions"
+    assert loaded.stores["omp-skills"] == "~/.omp/agent/managed-skills"
+    assert 'omp-skills = "~/.omp/agent/managed-skills"' in path.read_text()
     assert loaded.exclude == ["*.secret"]
     assert loaded.include_windows_mounts is True
 

@@ -1,6 +1,6 @@
 import { env, SELF } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { VIEWER } from './hosts';
+import { API, VIEWER } from './hosts';
 
 const testEnv = env as unknown as Env;
 const MACHINE = 'skills-viewer-box';
@@ -27,6 +27,25 @@ async function seedFile(relpath: string, content: string, store = STORE): Promis
   return row.id;
 }
 
+async function uploadFile(relpath: string, content: string): Promise<{ response: Response; fileId: number }> {
+  const bytes = new TextEncoder().encode(content);
+  const r2Key = `raw/${MACHINE}/${STORE}/${relpath}`;
+  r2Keys.push(r2Key);
+  const response = await SELF.fetch(`${API}/api/v1/files/${MACHINE}/${STORE}/${encodeURIComponent(relpath)}`, {
+    method: 'PUT',
+    headers: {
+      'x-dev-machine': MACHINE,
+      'x-content-hash': `sha256:${await sha256Hex(bytes)}`,
+      'x-file-mtime': '2026-09-14T12:00:00.000Z',
+      'content-length': String(bytes.byteLength),
+    },
+    body: bytes,
+  });
+  const payload = await response.clone().json() as { file_id?: unknown };
+  if (typeof payload.file_id !== 'number') throw new Error(`upload did not return a file id: ${response.status}`);
+  return { response, fileId: payload.file_id };
+}
+
 beforeEach(async () => {
   await testEnv.DB.prepare(
     `INSERT INTO machines (machine_id, os) VALUES (?1, 'linux')
@@ -41,6 +60,23 @@ afterEach(async () => {
 });
 
 describe('managed skills viewer', () => {
+  it('accepts managed-skill uploads as raw files without creating a session', async () => {
+    const { response, fileId } = await uploadFile('uploaded/SKILL.md', '---\nname: uploaded\n---\n');
+
+    expect(response.status).toBe(201);
+    expect(
+      await testEnv.DB.prepare('SELECT parse_state, harness, session_id FROM files WHERE id = ?1')
+        .bind(fileId)
+        .first(),
+    ).toEqual({ parse_state: 'skipped', harness: 'unknown', session_id: null });
+    expect(
+      await testEnv.DB.prepare('SELECT COUNT(*) AS count FROM sessions WHERE canonical_file_id = ?1')
+        .bind(fileId)
+        .first(),
+    ).toEqual({ count: 0 });
+    expect(await (await SELF.fetch(`${VIEWER}/skills/${fileId}`)).text()).toContain('<h2>uploaded</h2>');
+  });
+
   it('lists each direct managed-skill manifest and keeps companion files out of the skill index', async () => {
     const skillId = await seedFile('example/SKILL.md', '---\nname: example\n---\n');
     await seedFile('example/references/guide.md', 'guide');
@@ -52,6 +88,8 @@ describe('managed skills viewer', () => {
 
     expect(response.status).toBe(200);
     expect(html).toContain(`<a href="/skills/${skillId}">example</a>`);
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
     expect(html).toContain('1 managed skill · 1 backed-up copy');
     expect(html).not.toContain('nested/example');
     expect(html).not.toContain('wrong store');
@@ -72,6 +110,8 @@ describe('managed skills viewer', () => {
     expect(html).toContain('# &lt;script&gt;alert(&quot;skill-xss&quot;)&lt;/script&gt;');
     expect(html).not.toContain('<script>alert("skill-xss")</script>');
     expect(html).toContain('<code>SKILL.md</code>');
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
     expect(html).toContain('<code>references/guide.md</code>');
     expect(html).toContain('<code>scripts/check.py</code>');
     expect(html).toContain('3 backed-up package files');

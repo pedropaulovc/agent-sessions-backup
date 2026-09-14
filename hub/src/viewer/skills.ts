@@ -47,7 +47,7 @@ export async function skillsPage(env: Env): Promise<Response> {
     `<div class="skills-table-scroll"><table><thead><tr>` +
     `<th>Skill</th><th>Machine</th><th class="num">Manifest</th><th>Modified</th><th>SHA-256</th>` +
     `</tr></thead><tbody>${rows || '<tr><td colspan="5" class="muted">No managed skills backed up yet.</td></tr>'}</tbody></table></div></section>`;
-  return page({ title: 'Skills — sessions', nav: 'skills', body });
+  return skillDocument({ title: 'Skills — sessions', body });
 }
 
 /** GET /skills/:fileId — escaped source plus the complete backed-up package inventory. */
@@ -101,13 +101,20 @@ export async function skillPage(fileId: number, env: Env): Promise<Response> {
     (sourceNote ? '' : `<pre class="skill-source">${esc(source)}</pre>`) +
     `<details class="skill-files"><summary>${packageFiles.results.length} backed-up package ${packageFiles.results.length === 1 ? 'file' : 'files'}</summary>` +
     `<ul>${inventory}</ul></details></section>`;
-  return page({ title: `${name} — skills`, nav: 'skills', body });
+  return skillDocument({ title: `${name} — skills`, body });
 }
 
 function skillName(relpath: string): string | null {
   const parts = relpath.split('/');
   if (parts.length !== 2 || parts[1] !== 'SKILL.md' || parts[0] === '') return null;
   return parts[0]!;
+}
+
+function skillDocument(opts: { title: string; body: string }): Response {
+  const response = page({ ...opts, nav: 'skills' });
+  response.headers.set('cache-control', 'private, no-store');
+  response.headers.set('x-content-type-options', 'nosniff');
+  return response;
 }
 
 function formatBytes(n: number): string {
