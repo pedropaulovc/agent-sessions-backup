@@ -20,10 +20,9 @@ export const DEFAULT_COLLECTOR_CONFIG = {
   // under the decimal cap. Keep this number in lockstep with that collector constant — one source
   // of truth; when the collector's is exported into the shared config, reference it here.
   max_upload_bytes: 90_000_000,
-  // Per-store capture toggles. This MUST NOT be named `stores`: Config.stores is the collector's map
-  // of store name -> filesystem root, and bootstrap is merged over that local config. Absent toggle =>
-  // collector uses its own default (on). These keys MUST be the collector's actual store names, or a
-  // fleet override silently no-ops. Source of truth:
+  // Store catalog for fleet and control-plane clients. The collector does not consult these
+  // booleans when building filesystem roots: DEFAULT_STORES remain enabled additively. These keys
+  // MUST still be the collector's actual store names. Source of truth:
   // collector/src/agent_collector/config.py — DEFAULT_STORES
   // ('claude', 'codex', 'omp', 'omp-skills') + WEBCAPTURE_STORES
   // ('chatgpt-web', 'claude-web', 'export-inbox'). Note the local Claude Code store key is 'claude'

@@ -12,7 +12,12 @@ async function sha256Hex(data: Uint8Array): Promise<string> {
   return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-async function seedFile(relpath: string, content: string, store = STORE): Promise<number> {
+async function seedFile(
+  relpath: string,
+  content: string,
+  store = STORE,
+  mtime: string | null = '2026-09-14T12:00:00.000Z',
+): Promise<number> {
   const bytes = new TextEncoder().encode(content);
   const hash = await sha256Hex(bytes);
   const r2Key = `raw/${MACHINE}/${store}/${relpath}`;
@@ -20,9 +25,9 @@ async function seedFile(relpath: string, content: string, store = STORE): Promis
   r2Keys.push(r2Key);
   const row = await testEnv.DB.prepare(
     `INSERT INTO files (machine_id, store, relpath, r2_key, size, mtime, content_hash, harness, parse_state)
-     VALUES (?1, ?2, ?3, ?4, ?5, '2026-09-14T12:00:00.000Z', ?6, 'unknown', 'skipped')
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'unknown', 'skipped')
      RETURNING id`,
-  ).bind(MACHINE, store, relpath, r2Key, bytes.byteLength, hash).first<{ id: number }>();
+  ).bind(MACHINE, store, relpath, r2Key, bytes.byteLength, mtime, hash).first<{ id: number }>();
   if (!row) throw new Error(`failed to seed ${relpath}`);
   return row.id;
 }
@@ -94,19 +99,20 @@ describe('managed skills viewer', () => {
     expect(html).not.toContain('nested/example');
     expect(html).not.toContain('wrong store');
     expect(html).toContain('<a href="/skills" style="font-weight:700">Skills</a>');
+    expect(html).toContain('<div class="skills-table-scroll" role="region" aria-label="Backed-up managed skills" tabindex="0">');
   });
 
   it('renders escaped SKILL.md source and inventories its complete backed-up package', async () => {
-    const source = '---\nname: example\n---\n# <script>alert("skill-xss")</script>\n';
-    const skillId = await seedFile('example/SKILL.md', source);
-    await seedFile('example/references/guide.md', 'guide');
-    await seedFile('example/scripts/check.py', 'print("ok")');
+    const source = '---\nname: example-rocket\n---\n# <script>alert("skill-xss")</script>\n';
+    const skillId = await seedFile('example🚀/SKILL.md', source);
+    await seedFile('example🚀/references/guide.md', 'guide');
+    await seedFile('example🚀/scripts/check.py', 'print("ok")');
 
     const response = await SELF.fetch(`${VIEWER}/skills/${skillId}`);
     const html = await response.text();
 
     expect(response.status).toBe(200);
-    expect(html).toContain('<h2>example</h2>');
+    expect(html).toContain('<h2>example🚀</h2>');
     expect(html).toContain('# &lt;script&gt;alert(&quot;skill-xss&quot;)&lt;/script&gt;');
     expect(html).not.toContain('<script>alert("skill-xss")</script>');
     expect(html).toContain('<code>SKILL.md</code>');
@@ -115,6 +121,16 @@ describe('managed skills viewer', () => {
     expect(html).toContain('<code>references/guide.md</code>');
     expect(html).toContain('<code>scripts/check.py</code>');
     expect(html).toContain('3 backed-up package files');
+  });
+
+  it('labels upload time when filesystem modification time is unavailable', async () => {
+    const skillId = await seedFile('undated/SKILL.md', '---\nname: undated\n---\n', STORE, null);
+
+    const list = await (await SELF.fetch(`${VIEWER}/skills`)).text();
+    const detail = await (await SELF.fetch(`${VIEWER}/skills/${skillId}`)).text();
+
+    expect(list).toContain('<span class="muted small">(uploaded)</span>');
+    expect(detail).toContain('<span class="muted small">(uploaded)</span>');
   });
 
   it('does not expose arbitrary backed-up files through the skill-detail route', async () => {

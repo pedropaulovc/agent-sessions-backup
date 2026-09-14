@@ -16,6 +16,17 @@ export function q(v: unknown): string {
   return encodeURIComponent(v == null ? '' : String(v));
 }
 
+export function fmtBytes(n: number): string {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = n;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024;
+    unit++;
+  }
+  return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`;
+}
+
 const STYLE = `
 :root {
   --bg: #fbfbfa; --fg: #1d1d1f; --muted: #6b6b70; --line: #e2e2df; --card: #ffffff;

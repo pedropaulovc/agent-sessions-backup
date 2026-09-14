@@ -1,4 +1,4 @@
-import { esc, page } from './layout';
+import { esc, fmtBytes, page } from './layout';
 
 const SKILL_STORE = 'omp-skills';
 const MAX_RENDERED_SKILL_BYTES = 1024 * 1024;
@@ -36,15 +36,15 @@ export async function skillsPage(env: Env): Promise<Response> {
   const rows = skills.map(({ file, name }) =>
     `<tr><td><a href="/skills/${file.id}">${esc(name)}</a></td>` +
     `<td>${esc(file.machine_id)}</td>` +
-    `<td class="num">${formatBytes(file.size)}</td>` +
-    `<td>${esc(file.mtime ?? file.uploaded_at)}</td>` +
+    `<td class="num">${fmtBytes(file.size)}</td>` +
+    `<td>${renderModifiedTime(file)}</td>` +
     `<td><code>${esc(file.content_hash.slice(0, 12))}</code></td></tr>`,
   ).join('');
 
   const body =
     `<section class="skills-page"><h2>Skills</h2>` +
     `<p class="muted small">${distinct} managed ${distinct === 1 ? 'skill' : 'skills'} · ${skills.length} backed-up ${skills.length === 1 ? 'copy' : 'copies'}</p>` +
-    `<div class="skills-table-scroll"><table><thead><tr>` +
+    `<div class="skills-table-scroll" role="region" aria-label="Backed-up managed skills" tabindex="0"><table><thead><tr>` +
     `<th>Skill</th><th>Machine</th><th class="num">Manifest</th><th>Modified</th><th>SHA-256</th>` +
     `</tr></thead><tbody>${rows || '<tr><td colspan="5" class="muted">No managed skills backed up yet.</td></tr>'}</tbody></table></div></section>`;
   return skillDocument({ title: 'Skills — sessions', body });
@@ -62,24 +62,24 @@ export async function skillPage(fileId: number, env: Env): Promise<Response> {
   const prefix = file.relpath.slice(0, -'SKILL.md'.length);
   const packageFiles = await env.DB.prepare(
     `SELECT relpath, size FROM files
-     WHERE machine_id = ?1 AND store = ?2 AND substr(relpath, 1, ?3) = ?4
+     WHERE machine_id = ?1 AND store = ?2 AND relpath >= ?3 AND relpath < ?4
      ORDER BY relpath COLLATE NOCASE`,
-  ).bind(file.machine_id, SKILL_STORE, prefix.length, prefix).all<PackageFileRow>();
+  ).bind(file.machine_id, SKILL_STORE, prefix, `${prefix}\u{10ffff}`).all<PackageFileRow>();
   const inventory = packageFiles.results.map((item) =>
-    `<li><code>${esc(item.relpath.slice(prefix.length))}</code><span class="muted small">${formatBytes(item.size)}</span></li>`,
+    `<li><code>${esc(item.relpath.slice(prefix.length))}</code><span class="muted small">${fmtBytes(item.size)}</span></li>`,
   ).join('');
 
   let source: string;
   let sourceNote = '';
   if (file.size > MAX_RENDERED_SKILL_BYTES) {
     source = '';
-    sourceNote = `<div class="warn">SKILL.md is ${formatBytes(file.size)}; source display is limited to ${formatBytes(MAX_RENDERED_SKILL_BYTES)}.</div>`;
+    sourceNote = `<div class="warn">SKILL.md is ${fmtBytes(file.size)}; source display is limited to ${fmtBytes(MAX_RENDERED_SKILL_BYTES)}.</div>`;
   } else {
     const object = await env.RAW.get(file.r2_key);
     if (!object) return new Response('skill backup missing', { status: 404 });
     if (object.size > MAX_RENDERED_SKILL_BYTES) {
       source = '';
-      sourceNote = `<div class="warn">Stored SKILL.md exceeds the ${formatBytes(MAX_RENDERED_SKILL_BYTES)} source-display limit.</div>`;
+      sourceNote = `<div class="warn">Stored SKILL.md exceeds the ${fmtBytes(MAX_RENDERED_SKILL_BYTES)} source-display limit.</div>`;
     } else {
       const bytes = await object.arrayBuffer();
       try {
@@ -95,7 +95,7 @@ export async function skillPage(fileId: number, env: Env): Promise<Response> {
     `<section class="skill-page"><p class="small"><a href="/skills">← All skills</a></p>` +
     `<div class="sesshead"><h2>${esc(name)}</h2><div class="kv">` +
     `<span><span class="muted">machine</span> ${esc(file.machine_id)}</span>` +
-    `<span><span class="muted">modified</span> ${esc(file.mtime ?? file.uploaded_at)}</span>` +
+    `<span><span class="muted">modified</span> ${renderModifiedTime(file)}</span>` +
     `<span><span class="muted">sha256</span> <code>${esc(file.content_hash)}</code></span>` +
     `</div></div>${sourceNote}` +
     (sourceNote ? '' : `<pre class="skill-source">${esc(source)}</pre>`) +
@@ -117,13 +117,7 @@ function skillDocument(opts: { title: string; body: string }): Response {
   return response;
 }
 
-function formatBytes(n: number): string {
-  const units = ['B', 'KB', 'MB', 'GB'];
-  let value = n;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit++;
-  }
-  return `${unit === 0 ? value : value.toFixed(1)} ${units[unit]}`;
+function renderModifiedTime(file: Pick<SkillFileRow, 'mtime' | 'uploaded_at'>): string {
+  const value = esc(file.mtime ?? file.uploaded_at);
+  return file.mtime === null ? `${value} <span class="muted small">(uploaded)</span>` : value;
 }
