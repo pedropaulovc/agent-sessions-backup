@@ -82,28 +82,36 @@ export function refreshSessionCostStatements(db: D1Database, sessionIds: Iterabl
   return statements;
 }
 
+/** The recursive walk down `parent_session_id`, exposing `session_cost_tree(root, node)`: every
+ * root paired with itself and with each of its subagent descendants.
+ *
+ * `rootsSql` must yield a `session_id` column. Reads `sessions` only — never `usage` — which is
+ * the entire point of storing the cost subtotal on the row.
+ *
+ * `UNION`, not `UNION ALL`: `parent_session_id` carries no foreign key and no acyclicity
+ * guarantee (a parser can link a session to itself, and a session deleted and re-ingested under a
+ * changed parent can close a loop), so the dedupe is what stops the recursion rather than an
+ * assumption about the data. It also makes `COUNT(*) - 1` an exact descendant count, and keeps a
+ * join from `node` onto another table from multiplying that table's rows.
+ */
+export function subtreeMembersCte(rootsSql: string): string {
+  return `session_cost_tree(root, node) AS (
+             SELECT session_id, session_id FROM (${rootsSql})
+             UNION
+             SELECT t.root, s.session_id
+               FROM sessions s JOIN session_cost_tree t ON s.parent_session_id = t.node
+           )`;
+}
+
 /** The CTE list that rolls each root's own stored subtotal up with its subagent descendants'.
  *
  * Returns the definitions for a `WITH RECURSIVE` prefix, exposing
  * `session_subtree_cost(session_id, usd, calls, priced_calls, subagent_sessions)`. Composed as SQL
  * rather than run here because the list page's cost sort has to ORDER BY the rolled-up figure
  * across every matching session, which a JS-side rollup cannot do.
- *
- * `rootsSql` must yield a `session_id` column. Reads `sessions` only — never `usage` — which is
- * the entire point of storing the subtotal on the row.
- *
- * `UNION`, not `UNION ALL`: `parent_session_id` carries no foreign key and no acyclicity
- * guarantee (a parser can link a session to itself, and a session deleted and re-ingested under a
- * changed parent can close a loop), so the dedupe is what stops the recursion rather than an
- * assumption about the data. It also makes `COUNT(*) - 1` an exact descendant count.
  */
 export function subtreeCostCte(rootsSql: string): string {
-  return `session_cost_tree(root, node) AS (
-             SELECT session_id, session_id FROM (${rootsSql})
-             UNION
-             SELECT t.root, s.session_id
-               FROM sessions s JOIN session_cost_tree t ON s.parent_session_id = t.node
-           ),
+  return `${subtreeMembersCte(rootsSql)},
            session_subtree_cost AS (
              SELECT t.root AS session_id,
                     SUM(n.cost_usd) AS usd,
@@ -165,7 +173,22 @@ export async function sessionSubtreeCosts(
  * guessed, for the same reason `costOfUsage` refuses to price such a row. */
 export type CacheBasis = 'subset' | 'disjoint' | 'unknown';
 
-/** One model's activity inside a session: tokens reported, dollars stored, cache share. */
+/** Token counters as reported, summed over a set of `usage` rows. */
+export interface ModelTokens {
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite5m: number;
+  cacheWrite1h: number;
+}
+
+/** One model's activity inside a session SUBTREE: tokens reported, dollars stored, cache share.
+ *
+ * Subtree, not session: an agent harness spends most of its money in subagents, so a model that
+ * only ever ran in one — a `-luna` fan-out under a Claude parent, say — is precisely the row a
+ * reader came for, and scoping this to the parent's own `usage` rows hid it while the header
+ * figure above already counted its dollars. `own` keeps the parent's own share separable. */
 export interface ModelCost {
   /** Display label; `(unknown)` for a usage row with no model. */
   model: string;
@@ -176,14 +199,11 @@ export interface ModelCost {
   usd: number | null;
   /** Stored per-class dollars. Null when no priced row in the group carries a split yet. */
   byClass: { input: number; output: number; cacheRead: number; cacheWrite5m: number; cacheWrite1h: number } | null;
-  tokens: {
-    input: number;
-    output: number;
-    reasoning: number;
-    cacheRead: number;
-    cacheWrite5m: number;
-    cacheWrite1h: number;
-  };
+  tokens: ModelTokens;
+  /** Sessions in the subtree that reported this model, the rendered one included. */
+  sessions: number;
+  /** The rendered session's own share, or null when only its subagents used the model. */
+  own: { calls: number; tokens: ModelTokens } | null;
   basis: CacheBasis;
   /** Cached share of the prompt tokens this model was sent, or null when unmeasurable. */
   cacheHitRate: number | null;
@@ -191,6 +211,9 @@ export interface ModelCost {
 
 interface ModelCostRow {
   model: string | null;
+  /** 1 for the rendered session's own rows, 0 for its subagents'. */
+  is_own: number;
+  sessions: number;
   calls: number;
   priced_calls: number;
   stale_breakdown_calls: number;
@@ -209,11 +232,22 @@ interface ModelCostRow {
   billable_cache_read_tokens: number;
 }
 
-/** Per-model cost and token breakdown for one session, ranked by known cost then by activity.
+/** A model's running totals across the two scopes SQL returns for it. */
+interface ModelAcc extends Omit<ModelCost, 'model' | 'basis' | 'cacheHitRate'> {
+  /** Raw `usage.model`, NULL included, so the cache-basis lookup is not done on the display label. */
+  key: string | null;
+  /** `SUM(MIN(cache_read, input))`, the clamped numerator for a subset-accounting cache share. */
+  billableCacheRead: number;
+}
+
+/** Per-model cost and token breakdown for a session and its subagents, ranked by known cost then
+ * by activity.
  *
- * Grouped by model alone. The rate epoch and token-shape dimensions `usage-agg.ts` defines exist
- * so a group can be PRICED as one call; these rows sum costs that were already priced per row at
- * write time, so `SUM` is exact over any grouping and the fan-out buys nothing.
+ * Grouped by model and by scope (own rows vs subagents'). The rate epoch and token-shape
+ * dimensions `usage-agg.ts` defines exist so a group can be PRICED as one call; these rows sum
+ * costs that were already priced per row at write time, so `SUM` is exact over any grouping and
+ * the fan-out buys nothing. The scope split is not for pricing either — it is what lets the page
+ * still report the parent's own spend under rows that now include its subagents'.
  *
  * `USAGE_TOKEN_SUMS` is reused verbatim for the token columns because its two nonlinear per-row
  * clamps are needed here too: `billable_cache_read_tokens` is `SUM(MIN(cache_read, input))`, which
@@ -223,7 +257,10 @@ interface ModelCostRow {
 export async function sessionModelCosts(db: D1Database, sessionId: string): Promise<ModelCost[]> {
   const rows = await db
     .prepare(
-      `SELECT u.model AS model,
+      `WITH RECURSIVE ${subtreeMembersCte('SELECT ?1 AS session_id')}
+       SELECT u.model AS model,
+              (u.session_id = ?1) AS is_own,
+              COUNT(DISTINCT u.session_id) AS sessions,
               COUNT(u.usd) AS priced_calls,
               SUM(u.usd) AS usd,
               SUM(u.usd_input) AS usd_input,
@@ -235,54 +272,110 @@ export async function sessionModelCosts(db: D1Database, sessionId: string): Prom
                 AS stale_breakdown_calls,
               ${USAGE_TOKEN_SUMS}
          FROM usage u
-        WHERE u.session_id = ?1
-        GROUP BY u.model`,
+         JOIN session_cost_tree t ON t.node = u.session_id
+        GROUP BY u.model, is_own`,
     )
     .bind(sessionId)
     .all<ModelCostRow>();
   const groups = rows.results ?? [];
   if (!groups.length) return [];
 
-  const basis = await cacheBases(db, groups.map((r) => r.model));
-  return groups
-    .map((r) => {
-      const modelBasis = basis.get(r.model) ?? 'unknown';
-      const cacheRead = Number(r.cache_read_tokens);
-      const input = Number(r.input_tokens);
+  // At most two groups per model, folded here rather than in SQL because merging them has to keep
+  // null meaning "no stored figure in this scope" instead of collapsing it to zero dollars.
+  // `sessions` adds exactly because the scope flag is a function of `session_id`, so the two
+  // groups' distinct-session sets are disjoint by construction.
+  const accs = new Map<string | null, ModelAcc>();
+  for (const r of groups) {
+    const acc = accs.get(r.model) ?? newModelAcc(r.model);
+    acc.calls += Number(r.calls);
+    acc.pricedCalls += Number(r.priced_calls);
+    acc.staleBreakdownCalls += Number(r.stale_breakdown_calls);
+    acc.usd = addUsd(acc.usd, r.usd === null ? null : Number(r.usd));
+    acc.byClass = addByClass(acc.byClass, r);
+    acc.sessions += Number(r.sessions);
+    acc.billableCacheRead += Number(r.billable_cache_read_tokens);
+    addTokens(acc.tokens, r);
+    if (r.is_own) {
+      acc.own = acc.own ?? { calls: 0, tokens: zeroTokens() };
+      acc.own.calls += Number(r.calls);
+      addTokens(acc.own.tokens, r);
+    }
+    accs.set(r.model, acc);
+  }
+
+  const basis = await cacheBases(db, [...accs.keys()]);
+  return [...accs.values()]
+    .map(({ key, billableCacheRead, ...acc }) => {
+      const modelBasis = basis.get(key) ?? 'unknown';
       // Under subset accounting the cached tokens are already inside `input`, so the denominator
       // is `input` itself and the numerator is clamped against it per row. Under disjoint
       // accounting they are additional, so the prompt is the sum of the two.
-      const cached = modelBasis === 'subset' ? Number(r.billable_cache_read_tokens) : cacheRead;
-      const prompt = modelBasis === 'subset' ? input : input + cacheRead;
+      const cached = modelBasis === 'subset' ? billableCacheRead : acc.tokens.cacheRead;
+      const prompt = modelBasis === 'subset' ? acc.tokens.input : acc.tokens.input + acc.tokens.cacheRead;
       return {
-        model: r.model ?? UNKNOWN_MODEL_LABEL,
-        calls: Number(r.calls),
-        pricedCalls: Number(r.priced_calls),
-        staleBreakdownCalls: Number(r.stale_breakdown_calls),
-        usd: r.usd === null ? null : Number(r.usd),
-        byClass:
-          r.usd_input === null
-            ? null
-            : {
-                input: Number(r.usd_input),
-                output: Number(r.usd_output ?? 0),
-                cacheRead: Number(r.usd_cache_read ?? 0),
-                cacheWrite5m: Number(r.usd_cache_write_5m ?? 0),
-                cacheWrite1h: Number(r.usd_cache_write_1h ?? 0),
-              },
-        tokens: {
-          input,
-          output: Number(r.output_tokens),
-          reasoning: Number(r.reasoning_tokens),
-          cacheRead,
-          cacheWrite5m: Number(r.cache_creation_5m_tokens),
-          cacheWrite1h: Number(r.cache_creation_1h_tokens),
-        },
+        ...acc,
+        model: key ?? UNKNOWN_MODEL_LABEL,
         basis: modelBasis,
         cacheHitRate: modelBasis === 'unknown' || prompt <= 0 ? null : cached / prompt,
       };
     })
     .sort((a, b) => (b.usd ?? -1) - (a.usd ?? -1) || b.calls - a.calls || a.model.localeCompare(b.model));
+}
+
+function zeroTokens(): ModelTokens {
+  return { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0 };
+}
+
+function newModelAcc(key: string | null): ModelAcc {
+  return {
+    key,
+    calls: 0,
+    pricedCalls: 0,
+    staleBreakdownCalls: 0,
+    usd: null,
+    byClass: null,
+    tokens: zeroTokens(),
+    sessions: 0,
+    own: null,
+    billableCacheRead: 0,
+  };
+}
+
+function addTokens(into: ModelTokens, row: ModelCostRow): void {
+  into.input += Number(row.input_tokens);
+  into.output += Number(row.output_tokens);
+  into.reasoning += Number(row.reasoning_tokens);
+  into.cacheRead += Number(row.cache_read_tokens);
+  into.cacheWrite5m += Number(row.cache_creation_5m_tokens);
+  into.cacheWrite1h += Number(row.cache_creation_1h_tokens);
+}
+
+/** Null is "nothing in scope carried a stored cost", which is NOT zero dollars: merging an
+ * unpriced scope into a priced one leaves the priced total unchanged, and merging two unpriced
+ * scopes stays unknown rather than becoming free. */
+function addUsd(a: number | null, b: number | null): number | null {
+  if (a === null) return b;
+  if (b === null) return a;
+  return a + b;
+}
+
+function addByClass(into: ModelCost['byClass'], row: ModelCostRow): ModelCost['byClass'] {
+  if (row.usd_input === null) return into;
+  const add = {
+    input: Number(row.usd_input),
+    output: Number(row.usd_output ?? 0),
+    cacheRead: Number(row.usd_cache_read ?? 0),
+    cacheWrite5m: Number(row.usd_cache_write_5m ?? 0),
+    cacheWrite1h: Number(row.usd_cache_write_1h ?? 0),
+  };
+  if (!into) return add;
+  return {
+    input: into.input + add.input,
+    output: into.output + add.output,
+    cacheRead: into.cacheRead + add.cacheRead,
+    cacheWrite5m: into.cacheWrite5m + add.cacheWrite5m,
+    cacheWrite1h: into.cacheWrite1h + add.cacheWrite1h,
+  };
 }
 
 /** The cache-accounting convention for each model, or `unknown` where it cannot be established.

@@ -279,6 +279,50 @@ describe('per-model breakdown', () => {
     await seedSession('quiet');
     expect(await sessionModelCosts(testEnv.DB, 'quiet')).toEqual([]);
   });
+
+  it('includes subagent models at every depth and marks the ones this session never ran', async () => {
+    // The bug this covers: a fan-out to a different model counted in the header's rolled-up
+    // dollars and appeared nowhere in the only table that names models, so the model read as
+    // absent rather than as out of scope. Three levels, because a single JOIN on
+    // parent_session_id would pass a two-level test and drop the grandchild.
+    await seedSession('fan-parent');
+    await seedSession('fan-child', { parent: 'fan-parent' });
+    await seedSession('fan-grandchild', { parent: 'fan-child' });
+    await seedSession('fan-elsewhere');
+    await seedUsage('fan-parent', { model: 'opus', usd: 1, input: 100 });
+    await seedUsage('fan-child', { model: 'opus', usd: 8, input: 800 });
+    await seedUsage('fan-child', { model: 'luna', usd: 2, input: 200 });
+    await seedUsage('fan-grandchild', { model: 'luna', usd: 4, input: 400 });
+    await seedUsage('fan-elsewhere', { model: 'sol', usd: 16, input: 1600 });
+
+    const rows = await sessionModelCosts(testEnv.DB, 'fan-parent');
+    // A session outside the subtree contributes nothing, at any rank.
+    expect(rows.map((r) => r.model)).toEqual(['opus', 'luna']);
+    const byModel = new Map(rows.map((r) => [r.model, r]));
+    expect(byModel.get('luna')).toMatchObject({ usd: 6, calls: 2, sessions: 2, own: null });
+    expect(byModel.get('luna')!.tokens.input).toBe(600);
+    // The parent's own share stays separable under a row that now includes its subagents'.
+    expect(byModel.get('opus')).toMatchObject({ usd: 9, calls: 2, sessions: 2 });
+    expect(byModel.get('opus')!.own).toEqual({
+      calls: 1,
+      tokens: { input: 100, output: 0, reasoning: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0 },
+    });
+  });
+
+  it('merges an unpriced subagent scope without making a model look free or cheaper', async () => {
+    // Two scopes per model are folded in JS, where null has to keep meaning "no stored cost in
+    // this scope": SUM would have turned the unpriced half into $0 and the fully unpriced model
+    // into a free one.
+    await seedSession('merge-parent');
+    await seedSession('merge-child', { parent: 'merge-parent' });
+    await seedUsage('merge-parent', { model: 'm1', usd: 3, input: 10 });
+    await seedUsage('merge-child', { model: 'm1', usd: null, input: 10 });
+    await seedUsage('merge-child', { model: 'm2', usd: null, input: 10 });
+
+    const byModel = new Map((await sessionModelCosts(testEnv.DB, 'merge-parent')).map((r) => [r.model, r]));
+    expect(byModel.get('m1')).toMatchObject({ usd: 3, calls: 2, pricedCalls: 1 });
+    expect(byModel.get('m2')).toMatchObject({ usd: null, pricedCalls: 0, own: null });
+  });
 });
 
 async function storedCost(sessionId: string): Promise<unknown> {

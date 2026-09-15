@@ -15,6 +15,7 @@ import {
   type CacheBasis,
   type CostTotals,
   type ModelCost,
+  type ModelTokens,
   type SubtreeCost,
 } from '../session-cost';
 import { computeFirstInteractionTitle, sessionDisplayTitle, titleSkippedTurnIndices, type TitleBlock } from '../session-title';
@@ -165,11 +166,11 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
     (view === 'effective'
       ? `<p class="muted small">Effective view — replaced/abandoned turns hidden. <a href="${esc(withView(url, 'chronological'))}">Show all</a></p>`
       : '') +
-    renderModelCosts(modelCosts, {
-      usd: meta.cost_usd,
-      calls: meta.cost_calls,
-      pricedCalls: meta.cost_priced_calls,
-    });
+    renderModelCosts(
+      modelCosts,
+      { usd: meta.cost_usd, calls: meta.cost_calls, pricedCalls: meta.cost_priced_calls },
+      subtreeCosts.get(sessionId),
+    );
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
@@ -678,26 +679,33 @@ const CACHE_BASIS_NOTE: Record<CacheBasis, string> = {
   unknown: 'No single published cache-accounting convention for this model — its price snapshots disagree, or it has none — so the cached share is left uncomputed rather than guessed: the same counters would differ by roughly the cache ratio itself under the two conventions.',
 };
 
-/** Per-model cost and tokens for this session, collapsed like the activity trace above it.
+/** Per-model cost and tokens for this session AND its subagents, collapsed like the activity trace
+ * above it.
+ *
+ * Subtree-wide because the header figure is: a parent whose subagents ran a different model counted
+ * their dollars in the header and then said nothing about them here, which reads as a missing model
+ * rather than as a scope difference. The footer keeps the scopes apart — this session's own stored
+ * subtotal, then the rolled-up one — and both dollar figures come from the stored `sessions`
+ * columns rather than from summing the rows above: they agree, and reading the stored column is
+ * what makes a disagreement visible instead of invisible.
  *
  * Input and cache read stay in separate columns and are never added up: under subset accounting the
  * cached tokens are already inside input, so a "total tokens" column would double-count them for
  * half the models on the page and not the other half. The 5m and 1h cache writes ARE summed — those
  * two are disjoint from each other by construction — with the split kept in the cell's title. */
-function renderModelCosts(models: readonly ModelCost[], own: CostTotals): string {
+function renderModelCosts(models: readonly ModelCost[], own: CostTotals, subtree: SubtreeCost | undefined): string {
   if (!models.length) return '';
-  const sums = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+  const subagents = subtree?.subagentSessions ?? 0;
+  const ownSums = zeroTokenSums();
+  const allSums = zeroTokenSums();
   const rows = models
     .map((m) => {
       const cacheWrite = m.tokens.cacheWrite5m + m.tokens.cacheWrite1h;
-      sums.input += m.tokens.input;
-      sums.output += m.tokens.output;
-      sums.reasoning += m.tokens.reasoning;
-      sums.cacheRead += m.tokens.cacheRead;
-      sums.cacheWrite += cacheWrite;
+      addTokenSums(allSums, m.tokens);
+      if (m.own) addTokenSums(ownSums, m.own.tokens);
       return (
         `<tr><th scope="row" class="session-cost-model">${esc(m.model)}` +
-        `<span class="session-cost-sub">${costCoverage(m.pricedCalls, m.calls)}</span></th>` +
+        `<span class="session-cost-sub">${costCoverage(m.pricedCalls, m.calls)}${modelScope(m, subagents)}</span></th>` +
         `<td class="num">${fmtInt(m.calls)}</td>` +
         `<td class="num">${knownCost(m.usd, m.pricedCalls, m.calls)}</td>` +
         tokenCell(m.tokens.input) +
@@ -710,27 +718,21 @@ function renderModelCosts(models: readonly ModelCost[], own: CostTotals): string
       );
     })
     .join('');
-  // The footer is the session's OWN stored subtotal, not the sum of the rows' dollars: they agree,
-  // and reading the stored column is what makes a disagreement visible instead of invisible.
   const footer =
-    `<tr><th scope="row" class="session-cost-model">This session only<span class="session-cost-sub">` +
-    `excludes subagents · ${costCoverage(own.pricedCalls, own.calls)}</span></th>` +
-    `<td class="num">${fmtInt(own.calls)}</td>` +
-    `<td class="num">${knownCost(own.usd, own.pricedCalls, own.calls)}</td>` +
-    tokenCell(sums.input) +
-    tokenCell(sums.output) +
-    tokenCell(sums.reasoning) +
-    tokenCell(sums.cacheRead) +
-    tokenCell(sums.cacheWrite) +
-    `<td class="num" title="A session-wide cached share would average models billed under different cache-accounting conventions, which is why it is per model only.">—</td></tr>`;
+    costFooterRow('This session only', `excludes subagents · ${costCoverage(own.pricedCalls, own.calls)}`, own, ownSums) +
+    (subtree && subagents > 0
+      ? costFooterRow(`Including ${subagentCount(subagents)}`, costCoverage(subtree.pricedCalls, subtree.calls), subtree, allSums)
+      : '');
+  const total = subtree && subagents > 0 ? subtree : own;
   return (
     `<details class="session-cost"><summary><strong>Cost by model</strong> ` +
     `<span class="session-cost-summary">${fmtInt(models.length)} model${models.length === 1 ? '' : 's'} · ` +
-    `${knownCost(own.usd, own.pricedCalls, own.calls)} this session</span></summary>` +
-    `<div class="session-cost-body"><p class="session-cost-note">Whole session, every page. Input and cache read are ` +
-    `separate counters and are deliberately not summed — under subset accounting the cached tokens are already ` +
-    `inside input. Cache write is 5m + 1h. Subagent sessions are counted in the header figure and listed above, ` +
-    `not here.</p>` +
+    `${knownCost(total.usd, total.pricedCalls, total.calls)} ` +
+    `${subagents > 0 ? `incl. ${subagentCount(subagents)}` : 'this session'}</span></summary>` +
+    `<div class="session-cost-body"><p class="session-cost-note">This session and every subagent session below it, ` +
+    `every page. Input and cache read are separate counters and are deliberately not summed — under subset accounting ` +
+    `the cached tokens are already inside input. Cache write is 5m + 1h. The footer separates this session's own spend ` +
+    `from the rolled-up total.</p>` +
     tableScroll(
       'Cost by model',
       `<table class="chart"><thead><tr><th>Model / coverage</th><th class="num">Calls</th><th class="num">Cost</th>` +
@@ -739,6 +741,51 @@ function renderModelCosts(models: readonly ModelCost[], own: CostTotals): string
         `<tbody>${rows}</tbody><tfoot>${footer}</tfoot></table>`,
     ) +
     `</div></details>`
+  );
+}
+
+/** Which sessions a row's numbers came from, stated only when the answer is not "this one alone".
+ *
+ * A model the rendered session never called itself is the case this panel used to drop entirely,
+ * so it says so outright instead of leaving a reader to infer scope from a call count. */
+function modelScope(m: ModelCost, subagents: number): string {
+  if (!m.own) return ` · ${subagentCount(m.sessions)} only`;
+  if (m.sessions > 1) return ` · this session + ${subagentCount(m.sessions - 1)}`;
+  return subagents > 0 ? ' · this session only' : '';
+}
+
+/** Column sums for one footer scope. Cache write is the 5m + 1h total the rows already show. */
+interface TokenSums {
+  input: number;
+  output: number;
+  reasoning: number;
+  cacheRead: number;
+  cacheWrite: number;
+}
+
+function zeroTokenSums(): TokenSums {
+  return { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+}
+
+function addTokenSums(into: TokenSums, tokens: ModelTokens): void {
+  into.input += tokens.input;
+  into.output += tokens.output;
+  into.reasoning += tokens.reasoning;
+  into.cacheRead += tokens.cacheRead;
+  into.cacheWrite += tokens.cacheWrite5m + tokens.cacheWrite1h;
+}
+
+function costFooterRow(label: string, sub: string, cost: CostTotals, sums: TokenSums): string {
+  return (
+    `<tr><th scope="row" class="session-cost-model">${label}<span class="session-cost-sub">${sub}</span></th>` +
+    `<td class="num">${fmtInt(cost.calls)}</td>` +
+    `<td class="num">${knownCost(cost.usd, cost.pricedCalls, cost.calls)}</td>` +
+    tokenCell(sums.input) +
+    tokenCell(sums.output) +
+    tokenCell(sums.reasoning) +
+    tokenCell(sums.cacheRead) +
+    tokenCell(sums.cacheWrite) +
+    `<td class="num" title="A cached share spanning models would average models billed under different cache-accounting conventions, which is why it is per model only.">—</td></tr>`
   );
 }
 

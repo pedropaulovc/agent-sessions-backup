@@ -163,15 +163,24 @@ test.describe('synthetic sessions viewer', () => {
     await expect(banner).toContainText('unknown');
 
     const panel = page.locator('details.session-cost');
-    await expect(panel).toContainText(`${fixture.costParentOwnLabel} this session`);
+    // The panel covers the same subtree as the header, so its summary is the rolled-up figure.
+    await expect(panel).toContainText(`${fixture.costSubtreeLabel} incl. ${subagents} subagents`);
     await panel.locator('summary').click();
     const modelRow = panel.locator('tbody tr', { hasText: fixture.costParentModel });
     await expect(modelRow).toContainText(fixture.costParentOwnLabel);
+    await expect(modelRow).toContainText('this session only');
     // Claude reports cache reads BESIDE the input count, so the hit rate divides by their sum
     // (400k of 120k + 400k) — the check that the accounting basis reached the denominator.
     await expect(modelRow).toContainText('76.9%');
-    // The footer is the parent's own spend, which excludes the subagents rolled into the header.
+    // A model only ever run by a subagent is a row here, attributed to the subagent — this panel
+    // used to omit it while the header above counted its dollars. The unpriced one still reads
+    // as unknown rather than as free.
+    const subagentRow = panel.locator('tbody tr', { hasText: fixture.costUnpricedModel });
+    await expect(subagentRow).toContainText(`${subagents === 1 ? '1 subagent' : '1 subagent'} only`);
+    await expect(subagentRow).not.toContainText('$0.00');
+    // The footer keeps the parent's own spend and the rolled-up total on separate rows.
     await expect(panel.locator('tfoot')).toContainText(fixture.costParentOwnLabel);
+    await expect(panel.locator('tfoot')).toContainText(fixture.costSubtreeLabel);
   });
 
   test('narrows the list to a cost band from the sidebar facet', async ({ page, appURL }) => {
