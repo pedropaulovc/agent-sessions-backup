@@ -77,8 +77,13 @@ async function runSeed(scenario) {
           };
         } else if (url.pathname === '/api/v1/search') {
           const query = url.searchParams.get('q');
+          const fixture = expected.costFixtures.find((entry) => entry.marker === query);
+          // Search hides subagent sessions unless asked for them, so a sidecar probed without
+          // subagent=yes must observe nothing here too — the probe, not the index, is at fault.
+          const hidden = fixture?.kind === 'subagent' && url.searchParams.get('subagent') !== 'yes';
           const sessionId = query === expected.searchPhrase ? expected.primarySessionId
-            : query === expected.pagerSearchPhrase ? expected.pagerSessionId : null;
+            : query === expected.pagerSearchPhrase ? expected.pagerSessionId
+            : fixture && !hidden ? fixture.sessionId : null;
           response = Response.json({ hits: sessionId ? [{ session_id: sessionId }] : [] });
         } else {
           throw new Error('Unexpected request: ' + url.href);
@@ -108,7 +113,9 @@ test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then o
   const result = await runSeed({});
   assert.equal(result.status, 0, result.output);
   const uploads = result.requests.filter((request) => request.method === 'PUT');
-  assert.equal(uploads.length, 5);
+  // Asset, primary, pager, skill and one file per cost fixture, plus the replayed first upload.
+  const distinctUploads = 4 + SYNTHETIC_EXPECTATIONS.costFixtures.length;
+  assert.equal(uploads.length, distinctUploads + 1);
   const { budget: firstBudget, started: firstStarted, ...first } = uploads[0];
   const { budget: secondBudget, started: secondStarted, ...second } = uploads[1];
   assert.deepEqual(second, first, 'replayed URL, method, bytes and all headers must be identical');
@@ -120,13 +127,19 @@ test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then o
   assert.ok(firstBudget > 0 && firstBudget <= 10_000);
   assert.ok(secondBudget > 0 && secondBudget <= 10_000);
   assert.ok(secondStarted > firstStarted, 'retry must back off');
-  const skillUpload = uploads.at(-1);
-  assert.equal(skillUpload.url, `${ORIGIN}${SKILL_PATH}`);
+  const skillUpload = uploads.find((upload) => upload.url === `${ORIGIN}${SKILL_PATH}`);
+  assert.ok(skillUpload, 'the managed skill package must be uploaded');
   assert.match(Buffer.from(skillUpload.body, 'base64').toString('utf8'), new RegExp(SYNTHETIC_EXPECTATIONS.skillSourceMarker));
-  assert.deepEqual(result.consumed, [true, true, true, true, true, true, true]);
-  assert.equal(result.requests.filter((request) => request.method === 'GET').length, 2);
+  // One indexing probe per seeded session, and every response body read exactly once.
+  const probes = 2 + SYNTHETIC_EXPECTATIONS.costFixtures.length;
+  assert.equal(result.requests.filter((request) => request.method === 'GET').length, probes);
+  assert.deepEqual(result.consumed, new Array(uploads.length + probes).fill(true));
   const summary = JSON.parse(result.stdout.trim().split('\n').at(-1));
-  assert.deepEqual(summary.seeded, [SYNTHETIC_EXPECTATIONS.primarySessionId, SYNTHETIC_EXPECTATIONS.pagerSessionId]);
+  assert.deepEqual(summary.seeded, [
+    SYNTHETIC_EXPECTATIONS.primarySessionId,
+    SYNTHETIC_EXPECTATIONS.pagerSessionId,
+    ...SYNTHETIC_EXPECTATIONS.costFixtures.map((fixture) => fixture.sessionId),
+  ]);
   assert.ok(result.output.includes(ASSET_PATH), result.output);
   assert.match(result.output, /attempt/i);
 });

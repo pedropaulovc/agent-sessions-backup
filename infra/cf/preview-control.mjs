@@ -32,7 +32,7 @@ import {
 } from './preview-trust.mjs';
 import { deactivatePreviewDeployments } from './preview-deployment.mjs';
 import { migrationDigest } from '../../hub/scripts/lib/migration-manifest.mjs';
-import { SYNTHETIC_EXPECTATIONS } from '../../hub/scripts/lib/dev-seed.mjs';
+import { SYNTHETIC_EXPECTATIONS, fixtureModelPriceSql } from '../../hub/scripts/lib/dev-seed.mjs';
 
 const [command, ...rest] = process.argv.slice(2);
 const allowed = new Set([
@@ -540,6 +540,14 @@ async function provision() {
       migrationManifest.migrations.map((item) => item.filename),
     );
 
+    // Fixture prices, before the app is deployed and long before `seed` uploads any session: the
+    // ingest-time pricing hook prices a session's usage rows as it parses them, so the catalog
+    // has to exist first or every seeded session is permanently `cost unknown` until something
+    // re-ingests it. A per-PR preview runs no crons, so the daily LiteLLM sync never fills this
+    // table for it. Written here rather than in a migration because a migration would also run
+    // against production, where prices are real data.
+    await d1Query(resources.d1, fixtureModelPriceSql());
+
     const appConfigPath = path.join(temporary, 'wrangler.app.generated.json');
     await generateConfig(appConfigPath, migration.schemaDigest);
     deployApp(wrangler, appConfigPath, hubRoot, names.host);
@@ -659,6 +667,8 @@ async function seed() {
   const asset = Buffer.from((await readFile(new URL('fixture-external.png.base64', fixtureRoot), 'utf8')).trim(), 'base64');
   const skill = await readFile(new URL('e2e-managed-skill.md', fixtureRoot));
   const {
+    costFixtures,
+    costStore,
     externalDigest,
     externalRelpath,
     machine,
@@ -678,6 +688,13 @@ async function seed() {
     [store, primaryRelpath, primary],
     [store, pagerRelpath, pager],
     [skillStore, skillRelpath, skill],
+    // The cost fan-out, parent first: OMP subagent identity comes from the sidecar's path under
+    // the parent's directory, so the parent row must exist before its children are parsed.
+    ...await Promise.all(costFixtures.map(async (fixture) => [
+      costStore,
+      fixture.relpath,
+      await readFile(new URL(fixture.file, fixtureRoot)),
+    ])),
   ];
   for (const [uploadStore, relative, bytes] of uploads) {
     const encoded = relative.split('/').map(encodeURIComponent).join('/');
@@ -733,15 +750,19 @@ async function seed() {
     }
   }
   const expected = [
-    [primarySessionId, searchPhrase],
-    [pagerSessionId, pagerSearchPhrase],
+    [primarySessionId, searchPhrase, 'main'],
+    [pagerSessionId, pagerSearchPhrase, 'main'],
+    ...costFixtures.map((fixture) => [fixture.sessionId, fixture.marker, fixture.kind]),
   ];
-  for (const [sessionId, marker] of expected) {
+  for (const [sessionId, marker, kind] of expected) {
     const deadline = Date.now() + 60_000;
     let last = '';
     let indexed = false;
     while (Date.now() < deadline) {
+      // Subagent sessions are hidden from search unless asked for, so a sidecar probed without
+      // `subagent=yes` never appears however well it indexed.
       const query = new URLSearchParams({ q: marker, machine, limit: '20' });
+      if (kind === 'subagent') query.set('subagent', 'yes');
       const response = await previewFetch(context, `/api/v1/search?${query}`, {
         headers: { accept: 'application/json' },
       });
@@ -760,7 +781,10 @@ async function seed() {
       fail(`synthetic session ${sessionId} was not indexed: search=${last.slice(0, 500)}; status=${status.status}:${(await status.text()).slice(0, 1000)}`);
     }
   }
-  process.stdout.write(`${stableJson({ url: context.origin, seeded: [primarySessionId, pagerSessionId] })}\n`);
+  process.stdout.write(`${stableJson({
+    url: context.origin,
+    seeded: expected.map(([sessionId]) => sessionId),
+  })}\n`);
 }
 
 /** Detach consumers then delete one named resource set (queue-safe ordering). */

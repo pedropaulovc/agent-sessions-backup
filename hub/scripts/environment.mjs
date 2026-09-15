@@ -14,7 +14,7 @@ import {
   removeOwnedState,
 } from './lib/dev-ownership.mjs';
 import { createProcessTracker, retryPortSelection, runCaptured, spawnOwned, terminateProcessTree } from './lib/dev-process.mjs';
-import { seedSynthetic, syntheticSeedManifest } from './lib/dev-seed.mjs';
+import { SYNTHETIC_EXPECTATIONS, fixtureModelPriceSql, seedSynthetic, syntheticSeedManifest } from './lib/dev-seed.mjs';
 
 const HELP = `Usage: node scripts/environment.mjs <command> [options]
 
@@ -266,6 +266,19 @@ async function startEnvironment(options) {
       return;
     }
 
+    // Fixture prices before the worker starts, so the ingest-time pricing hook prices the seeded
+    // sessions as they are parsed. A disposable environment never runs the daily LiteLLM sync
+    // cron, so without this row set every seeded session renders `cost unknown` and the cost
+    // views can only ever be verified in one of their three states.
+    await runCaptured(process.execPath, [
+      wranglerPath(), 'd1', 'execute', 'sessions-index', '--local', '--persist-to', stateDir,
+      '--command', fixtureModelPriceSql(),
+    ], { cwd: HUB_ROOT, env: childEnv, label: 'local fixture model prices', tracker });
+    if (shutdownRequested) {
+      if (signalExitCode) process.exitCode = signalExitCode;
+      return;
+    }
+
     const environmentId = mode === 'local' ? `local-${stateName}` : `e2e-${nonce.slice(0, 12)}`;
     const diagnostics = {
       environmentId,
@@ -295,8 +308,13 @@ async function startEnvironment(options) {
           createdAt: new Date().toISOString(),
           ...diagnostics,
           syntheticFixture: {
-            machine: 'e2e-machine',
-            sessions: ['00000000-0000-4000-8000-000000000001', '00000000-0000-4000-8000-000000000002'],
+            machine: SYNTHETIC_EXPECTATIONS.machine,
+            sessions: [
+              SYNTHETIC_EXPECTATIONS.primarySessionId,
+              SYNTHETIC_EXPECTATIONS.pagerSessionId,
+              SYNTHETIC_EXPECTATIONS.costParentSessionId,
+              ...SYNTHETIC_EXPECTATIONS.costSubagentSessionIds,
+            ],
           },
         };
         await writeFile(join(stateDir, 'environment-manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');

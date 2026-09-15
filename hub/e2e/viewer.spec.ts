@@ -138,6 +138,40 @@ test.describe('synthetic sessions viewer', () => {
     await expect(starToggle).toHaveAttribute('aria-pressed', 'false');
   });
 
+  test('rolls subagent cost into the session list and breaks it down by model', async ({ page, appURL }) => {
+    // The list figure covers the whole subtree, so it must exceed what the parent spent on its
+    // own turns, and it must stay a `subtotal` while one subagent's model has no price row.
+    // Scoped to the fixture machine so a developer's own imported corpus cannot push the fixture
+    // off the first page of a cost-ranked list.
+    await page.goto(appURL(`/?sort=cost&machine=${encodeURIComponent(fixture.machineId)}`));
+    const row = page.locator('.hit', { hasText: fixture.costParentTitle }).first();
+    await expect(row).toBeVisible();
+    const subagents = fixture.costSubagentSessionIds.length;
+    await expect(row).toContainText(`${fixture.costSubtreeLabel} incl. ${subagents} subagents`);
+
+    await row.getByRole('link', { name: fixture.costParentTitle }).click();
+    await expect(page).toHaveURL((url) => url.pathname === `/s/${fixture.costParentSessionId}`);
+    await expect(page.locator('.sesshead')).toContainText(
+      `cost: ${fixture.costSubtreeLabel} · incl. ${subagents} subagents`,
+    );
+
+    // Every child is linked with its own cost, and the unpriced one says so instead of showing $0.
+    const banner = page.locator('.banner', { hasText: 'Subagents (' });
+    await expect(banner).toContainText(`Subagents (${subagents})`);
+    await expect(banner).toContainText('unknown');
+
+    const panel = page.locator('details.session-cost');
+    await expect(panel).toContainText(`${fixture.costParentOwnLabel} this session`);
+    await panel.locator('summary').click();
+    const modelRow = panel.locator('tbody tr', { hasText: fixture.costParentModel });
+    await expect(modelRow).toContainText(fixture.costParentOwnLabel);
+    // Claude reports cache reads BESIDE the input count, so the hit rate divides by their sum
+    // (400k of 120k + 400k) — the check that the accounting basis reached the denominator.
+    await expect(modelRow).toContainText('76.9%');
+    // The footer is the parent's own spend, which excludes the subagents rolled into the header.
+    await expect(panel.locator('tfoot')).toContainText(fixture.costParentOwnLabel);
+  });
+
   test('loads inline blobs and captured assets as browser subresources', async ({ page, appURL }) => {
     await page.goto(appURL(`/s/${fixture.sessionId}?page=1`));
 
