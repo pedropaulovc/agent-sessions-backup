@@ -131,7 +131,9 @@ beforeAll(async () => {
   await seedSession(PARENT);
   await seedSession(CHILD, PARENT);
   await seedUsage(PARENT, 0, 'subset-model', { input: 1_000_000 });
-  await seedUsage(CHILD, 0, 'subset-model', { input: 500_000 });
+  // A DIFFERENT model in the subagent: the parent never called it, so it is the row the panel
+  // used to drop while the header above already counted its dollars.
+  await seedUsage(CHILD, 0, 'disjoint-model', { input: 500_000 });
 
   await seedSession(UNPRICED);
   await seedUsage(UNPRICED, 0, 'no-price-model', { input: 1_000 });
@@ -218,7 +220,7 @@ describe('session cost breakdown', () => {
     expect(row).toContain('title="5,000 5m + 1,000 1h">6.0k</td>');
   });
 
-  it("totals the session's own spend in the footer, excluding subagents", async () => {
+  it("totals the session's own spend in the footer when it has no subagents", async () => {
     const panel = panelOf(await get(BREAKDOWN));
     const footer = panel.slice(panel.indexOf('<tfoot>'));
     expect(footer).toContain('This session only');
@@ -229,6 +231,31 @@ describe('session cost breakdown', () => {
     // Token columns ARE column sums: 100k + 100k + 100k + 1k + 1M + 1M input.
     expect(footer).toContain('title="2,301,000">2.3M</td>');
     expect(footer).toContain('title="270,000">270.0k</td>');
+    // Nothing to roll up, so there is no second footer row to compare against.
+    expect(footer).not.toContain('Including');
+  });
+
+  it("includes a subagent's own model and attributes the calls to the subagent", async () => {
+    // The panel was scoped to the parent's own usage rows, so a fan-out to another model was
+    // counted in the header's $1.50 and then absent from the only table that names models.
+    const html = await get(PARENT);
+    const row = rowOf(html, 'disjoint-model');
+    expect(row).toContain('1 subagent only');
+    expect(row).toContain('<td class="num">$0.50</td>');
+    expect(row).toContain('title="500,000">500.0k</td>');
+    expect(rowOf(html, 'subset-model')).toContain('this session only');
+  });
+
+  it('keeps this session and the rolled-up subtree as separate footer rows', async () => {
+    const panel = panelOf(await get(PARENT));
+    const footer = panel.slice(panel.indexOf('<tfoot>'));
+    expect(footer).toContain('This session only');
+    expect(footer).toContain('<td class="num">$1.00</td>');
+    expect(footer).toContain('Including 1 subagent');
+    expect(footer).toContain('<td class="num">$1.50</td>');
+    // Own row excludes the subagent's 500k input; the rolled-up row includes it.
+    expect(footer).toContain('title="1,000,000">1.0M</td>');
+    expect(footer).toContain('title="1,500,000">1.5M</td>');
   });
 
   it('renders no panel for a session with no usage records', async () => {
@@ -245,8 +272,8 @@ describe('session cost header', () => {
     expect(html).toContain('cost: $1.50');
     expect(html).toContain('incl. 1 subagent');
     expect(html).toContain('title="2 / 2 priced · 1 subagent"');
-    // The panel below is the session's own spend only.
-    expect(panelOf(html)).toContain('<td class="num">$1.00</td>');
+    // The panel below covers the same subtree, so the subagent's model is one of its rows.
+    expect(panelOf(html)).toContain('session-cost-model">disjoint-model<');
   });
 
   it("shows each subagent's own cost in the child list", async () => {

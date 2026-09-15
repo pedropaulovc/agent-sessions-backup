@@ -13,6 +13,7 @@ export const SYNTHETIC_FIXTURE = Object.freeze({
   costParentSessionId: SYNTHETIC_EXPECTATIONS.costParentSessionId,
   costParentTitle: SYNTHETIC_EXPECTATIONS.costParentTitle,
   costParentModel: SYNTHETIC_EXPECTATIONS.costParentModel,
+  costUnpricedModel: SYNTHETIC_EXPECTATIONS.costUnpricedModel,
   costSubagentSessionIds: SYNTHETIC_EXPECTATIONS.costSubagentSessionIds,
   costSubtreeLabel: SYNTHETIC_EXPECTATIONS.costSubtreeLabel,
   costSubtreeAmount: SYNTHETIC_EXPECTATIONS.costSubtreeAmount,
