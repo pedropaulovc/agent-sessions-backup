@@ -8,6 +8,7 @@ import {
   selectedValues,
   sessionDurationSql,
   subagentSessionSql,
+  SUBTREE_COST_ALIAS,
   totalTokensSql,
 } from '../session-filters';
 import { sessionDisplayTitle } from '../session-title';
@@ -37,6 +38,10 @@ function costRollupCte(where: string): string {
   return `WITH RECURSIVE ${subtreeCostCte(`SELECT s.session_id FROM sessions s WHERE 1 = 1 ${where}`)} `;
 }
 
+function costRollupJoin(): string {
+  return `JOIN session_subtree_cost ${SUBTREE_COST_ALIAS} ON ${SUBTREE_COST_ALIAS}.session_id = s.session_id`;
+}
+
 function searchOrder(sort: string | null): string {
   if (sort === 'session_time') return `ORDER BY ${sessionDurationSql('s')} DESC, rank, b.id`;
   if (sort === 'total_tokens') return `ORDER BY ${totalTokensSql('s')} DESC, rank, b.id`;
@@ -48,8 +53,16 @@ function searchOrder(sort: string | null): string {
 }
 
 /** @internal Exported so the query-plan regression exercises the exact production query. */
-export function searchHitsSql(where: string, sort: string | null, limit: number, offset: number): string {
-  const cost = sort === 'cost';
+export function searchHitsSql(
+  where: string,
+  costWhere: string,
+  sort: string | null,
+  limit: number,
+  offset: number,
+): string {
+  // The rollup is joined for the cost sort and for a selected cost band; `where` never contains
+  // the band, so the CTE's roots stay independent of what the band filters.
+  const cost = sort === 'cost' || costWhere !== '';
   return `${cost ? costRollupCte(where) : ''}SELECT b.session_id, b.turn_index, b.block_index, b.role, b.btype, b.tool_name, b.ts,
                  snippet(blocks_fts, 0, '<mark>', '</mark>', '…', 16) AS snip,
                  bm25(blocks_fts) AS rank,
@@ -59,8 +72,8 @@ export function searchHitsSql(where: string, sort: string | null, limit: number,
           FROM blocks_fts
           JOIN blocks b ON b.id = blocks_fts.rowid
           JOIN sessions s ON s.session_id = b.session_id
-          ${cost ? 'JOIN session_subtree_cost c ON c.session_id = s.session_id' : ''}
-          WHERE blocks_fts MATCH ?1 ${where}
+          ${cost ? costRollupJoin() : ''}
+          WHERE blocks_fts MATCH ?1 ${where} ${costWhere ? `AND ${costWhere}` : ''}
           ${searchOrder(sort)} LIMIT ${limit + 1} OFFSET ${offset}`;
 }
 
@@ -102,6 +115,7 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   const sessionFilter = buildSessionFilterSql(p, 's', 2);
   const binds = sessionFilter.binds;
   const where = sessionFilter.clause ? `AND ${sessionFilter.clause}` : '';
+  const costWhere = sessionFilter.costClause;
 
   if (!q) return { hits: [], error: 'missing_q' };
 
@@ -146,7 +160,7 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   const run = async (match: string) => {
     try {
       return await env.DB.prepare(
-        searchHitsSql(where, p.get('sort'), limit, offset),
+        searchHitsSql(where, costWhere, p.get('sort'), limit, offset),
       )
         .bind(match, ...binds)
         .all();
@@ -213,10 +227,16 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
       const filter = buildSessionFilterSql(p, 's', 2, definition.key);
       const filtered = filter.clause ? ` AND ${filter.clause}` : '';
       const expression = facetExpressionSql(definition, 's');
+      // Same rule as the list page: the cost facet needs the rollup to have a value at all, and
+      // every other facet needs it to honour a cost band the caller already selected.
+      const rollup = definition.kind === 'cost' || filter.costClause !== '';
+      const banded = filter.costClause ? ` AND ${filter.costClause}` : '';
       return env.DB.prepare(
+        `${rollup ? costRollupCte(filter.clause ? `AND ${filter.clause}` : '') : ''}` +
         `SELECT ${expression} AS v, COUNT(DISTINCT s.session_id) AS n
          FROM blocks_fts JOIN blocks b ON b.id = blocks_fts.rowid JOIN sessions s ON s.session_id = b.session_id
-         WHERE blocks_fts MATCH ?1${filtered} AND ${expression} IS NOT NULL
+         ${rollup ? costRollupJoin() : ''}
+         WHERE blocks_fts MATCH ?1${filtered}${banded} AND ${expression} IS NOT NULL
          GROUP BY v ORDER BY ${facetOrderSql(definition)} LIMIT ${definition.valueLimit ?? 20}`,
       ).bind(effectiveMatch, ...filter.binds);
     });

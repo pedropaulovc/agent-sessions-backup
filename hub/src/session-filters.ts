@@ -9,13 +9,35 @@ export const SESSION_TIME_BUCKETS = [
   { value: 'over-2h', label: 'Over 2 hours', min: 2 * 60 * 60, max: null },
 ] as const;
 
+/** Dollar bands for the rolled-up (subagent-inclusive) session cost.
+ *
+ * Half-open `[min, max)` bands over the same figure the list chip shows, so selecting a band and
+ * reading the rows agree. A session whose subtree carries no stored price has no band at all:
+ * the expression yields NULL, which the facet query skips and no selection matches — an unknown
+ * cost is not a cheap one.
+ */
+export const COST_BUCKETS = [
+  { value: 'under-1', label: 'Under $1', min: 0, max: 1 },
+  { value: '1-10', label: '$1–$10', min: 1, max: 10 },
+  { value: '10-100', label: '$10–$100', min: 10, max: 100 },
+  { value: '100-1000', label: '$100–$1,000', min: 100, max: 1000 },
+  { value: 'over-1000', label: '$1,000 and over', min: 1000, max: null },
+] as const;
+
+/** The alias a query MUST give the `session_subtree_cost` CTE for the cost facet and filter.
+ *
+ * The other filters read a column off the session row; this one reads a figure that only exists
+ * once `subtreeCostCte` has been expanded, so its SQL names a join the caller has to provide —
+ * see `SessionFilterSql.costClause`. */
+export const SUBTREE_COST_ALIAS = 'c';
+
 type SessionColumn = 'harness' | 'machine_id' | 'os' | 'primary_model' | 'repo_url' | 'project_name' | 'cwd';
 type FacetOrder = 'count' | 'value-desc' | 'bucket';
 
 export interface MultiValueFilterDefinition {
   key: string;
   param: string;
-  kind: 'column' | 'session-date' | 'session-time' | 'has-star' | 'subagent';
+  kind: 'column' | 'session-date' | 'session-time' | 'has-star' | 'subagent' | 'cost';
   column?: SessionColumn;
   label?: string;
   facetOrder?: FacetOrder;
@@ -30,6 +52,7 @@ export const FACET_DEFINITIONS: readonly MultiValueFilterDefinition[] = [
   { key: 'primary_model', param: 'model', kind: 'column', column: 'primary_model', label: 'Model', facetOrder: 'count', valueLimit: 200 },
   { key: 'project_name', param: 'project', kind: 'column', column: 'project_name', label: 'Project', facetOrder: 'count', valueLimit: 200 },
   { key: 'session_date', param: 'session_date', kind: 'session-date', label: 'Session date/time', facetOrder: 'value-desc' },
+  { key: 'cost', param: 'cost', kind: 'cost', label: 'Cost', facetOrder: 'bucket' },
   { key: 'session_time', param: 'session_time', kind: 'session-time', label: 'Session time', facetOrder: 'bucket' },
   { key: 'has_star', param: 'has_star', kind: 'has-star', label: 'Has star', facetOrder: 'count' },
   { key: 'subagent', param: 'subagent', kind: 'subagent', label: 'Is subagent session', facetOrder: 'count' },
@@ -42,9 +65,18 @@ const NON_FACET_MULTI_FILTERS: readonly MultiValueFilterDefinition[] = [
 
 const ALL_MULTI_FILTERS = [...FACET_DEFINITIONS, ...NON_FACET_MULTI_FILTERS];
 const SESSION_TIME_VALUES = new Set<string>(SESSION_TIME_BUCKETS.map((bucket) => bucket.value));
+const COST_VALUES = new Set<string>(COST_BUCKETS.map((bucket) => bucket.value));
 
 export interface SessionFilterSql {
+  /** Conditions on the session row itself; safe in any query that selects from `sessions`. */
   clause: string;
+  /** Conditions on the rolled-up cost, empty unless a cost band is selected.
+   *
+   * Separate from `clause` because it reads `c.usd` from the `session_subtree_cost` CTE, whose
+   * roots are the sessions `clause` matches: folding it in would make the rollup's own input
+   * depend on the rollup's output. A caller that has a `costClause` MUST expand the CTE and join
+   * it as `SUBTREE_COST_ALIAS`; one that drops it silently returns unfiltered rows. */
+  costClause: string;
   binds: string[];
 }
 
@@ -61,27 +93,44 @@ export function subagentSessionSql(alias: string): string {
   return `(CASE WHEN ${alias}.parent_session_id IS NOT NULL OR COALESCE(${alias}.is_sidechain, 0) = 1 THEN 'yes' ELSE 'no' END)`;
 }
 
+/** A generic half-open bucket CASE over one numeric expression. */
+function bucketCaseSql(
+  value: string,
+  buckets: ReadonlyArray<{ value: string; min: number; max: number | null }>,
+): string {
+  const cases = buckets.map((bucket) => {
+    const upper = bucket.max === null ? '' : ` AND ${value} < ${bucket.max}`;
+    return `WHEN ${value} >= ${bucket.min}${upper} THEN '${bucket.value}'`;
+  }).join(' ');
+  return `(CASE ${cases} END)`;
+}
+
+/** The cost band a session falls in, read from the joined rollup rather than from its own row.
+ *
+ * `alias` is deliberately unused: the band is a property of the session's whole subtree, which is
+ * `SUBTREE_COST_ALIAS`, not of the `sessions` row the other facets read. */
+export function costBucketSql(): string {
+  return bucketCaseSql(`${SUBTREE_COST_ALIAS}.usd`, COST_BUCKETS);
+}
+
 export function facetExpressionSql(definition: MultiValueFilterDefinition, alias: string): string {
   if (definition.kind === 'column') return `${alias}.${definition.column}`;
   if (definition.kind === 'subagent') return subagentSessionSql(alias);
   if (definition.kind === 'session-date') return `substr(${alias}.started_at, 1, 10)`;
+  if (definition.kind === 'cost') return costBucketSql();
   if (definition.kind === 'has-star') {
     return `(CASE WHEN EXISTS (SELECT 1 FROM starred_turns st WHERE st.session_id = ${alias}.session_id) THEN '1' END)`;
   }
 
-  const duration = sessionDurationSql(alias);
-  const cases = SESSION_TIME_BUCKETS.map((bucket) => {
-    const upper = bucket.max === null ? '' : ` AND ${duration} < ${bucket.max}`;
-    return `WHEN ${duration} >= ${bucket.min}${upper} THEN '${bucket.value}'`;
-  }).join(' ');
-  return `(CASE ${cases} END)`;
+  return bucketCaseSql(sessionDurationSql(alias), SESSION_TIME_BUCKETS);
 }
 
 export function facetOrderSql(definition: MultiValueFilterDefinition): string {
   if (definition.facetOrder === 'value-desc') return 'v DESC';
   if (definition.facetOrder === 'bucket') {
-    const cases = SESSION_TIME_BUCKETS.map((bucket, index) => `WHEN '${bucket.value}' THEN ${index}`).join(' ');
-    return `CASE v ${cases} ELSE ${SESSION_TIME_BUCKETS.length} END`;
+    const buckets: ReadonlyArray<{ value: string }> = definition.kind === 'cost' ? COST_BUCKETS : SESSION_TIME_BUCKETS;
+    const cases = buckets.map((bucket, index) => `WHEN '${bucket.value}' THEN ${index}`).join(' ');
+    return `CASE v ${cases} ELSE ${buckets.length} END`;
   }
   return 'n DESC, v';
 }
@@ -148,10 +197,11 @@ export function buildSessionFilterSql(
   omitFacet?: string,
 ): SessionFilterSql {
   const clauses: string[] = [];
+  const costClauses: string[] = [];
   const binds: string[] = [];
-  const add = (clause: string, value: string) => {
+  const add = (target: string[], clause: string, value: string) => {
     const placeholder = `?${startIndex + binds.length}`;
-    clauses.push(clause.replace('?', placeholder));
+    target.push(clause.replace('?', placeholder));
     binds.push(value);
   };
 
@@ -159,14 +209,18 @@ export function buildSessionFilterSql(
     if (definition.key === omitFacet) continue;
     const values = selectedValues(params, definition);
     if (values.length === 0) continue;
-    add(`${facetExpressionSql(definition, alias)} IN (SELECT value FROM json_each(?))`, JSON.stringify(values));
+    add(
+      definition.kind === 'cost' ? costClauses : clauses,
+      `${facetExpressionSql(definition, alias)} IN (SELECT value FROM json_each(?))`,
+      JSON.stringify(values),
+    );
   }
 
   const from = params.get('from');
-  if (from) add(`${alias}.started_at >= ?`, from);
+  if (from) add(clauses, `${alias}.started_at >= ?`, from);
   const to = params.get('to');
-  if (to) add(`${alias}.started_at <= ?`, normalizeToBound(to));
-  return { clause: clauses.join(' AND '), binds };
+  if (to) add(clauses, `${alias}.started_at <= ?`, normalizeToBound(to));
+  return { clause: clauses.join(' AND '), costClause: costClauses.join(' AND '), binds };
 }
 
 export function mergeFacetCounts(
@@ -185,6 +239,9 @@ export function facetLabelValue(definition: MultiValueFilterDefinition, value: s
   if (definition.kind === 'session-time') {
     return SESSION_TIME_BUCKETS.find((bucket) => bucket.value === value)?.label ?? value;
   }
+  if (definition.kind === 'cost') {
+    return COST_BUCKETS.find((bucket) => bucket.value === value)?.label ?? value;
+  }
   if (definition.kind === 'has-star') return value === '1' ? 'Yes' : value;
   if (definition.kind === 'subagent') return value === 'yes' ? 'Yes' : value === 'no' ? 'No' : value;
   return value;
@@ -193,6 +250,7 @@ export function facetLabelValue(definition: MultiValueFilterDefinition, value: s
 function validValue(definition: MultiValueFilterDefinition, value: string): boolean {
   if (definition.kind === 'session-date') return /^\d{4}-\d{2}-\d{2}$/.test(value);
   if (definition.kind === 'session-time') return SESSION_TIME_VALUES.has(value);
+  if (definition.kind === 'cost') return COST_VALUES.has(value);
   if (definition.kind === 'has-star') return value === '1';
   if (definition.kind === 'subagent') return value === 'no' || value === 'yes';
   return true;

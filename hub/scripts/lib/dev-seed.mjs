@@ -187,6 +187,10 @@ export const SYNTHETIC_EXPECTATIONS = Object.freeze({
   // string: $1.23 of Claude turns here, plus $0.215 and $0.706 of subagents, with the fourth
   // subagent unpriced — which is why the rolled-up figure is a `subtotal`.
   costSubtreeLabel: '$2.15 subtotal',
+  costSubtreeAmount: '$2.15',
+  // The band that $2.15 falls in, from COST_BUCKETS in src/session-filters.ts.
+  costBandValue: '1-10',
+  costBandLabel: '$1–$10',
   costParentOwnLabel: '$1.23',
   // Every cost fixture file with the relpath it uploads to, the session id it becomes and the
   // phrase that proves it indexed. Both seeding paths iterate this, and the browser suite reads

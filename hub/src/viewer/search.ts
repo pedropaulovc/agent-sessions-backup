@@ -13,15 +13,16 @@ import {
   mergeFacetCounts,
   selectedFacetValues,
   selectedValues,
-  subagentSessionSql,
   sessionDurationSql,
+  subagentSessionSql,
+  SUBTREE_COST_ALIAS,
   totalTokensSql,
 } from '../session-filters';
 import { esc, page, q } from './layout';
 import { TURNS_PER_PAGE } from './session';
 import { sessionDisplayTitle } from '../session-title';
 import { sessionSubtreeCosts, subtreeCostCte, type SubtreeCost } from '../session-cost';
-import { costCoverage, costLabel, fmtInt } from './format';
+import { costCoverage, costLabel, fmtInt, fmtUsd } from './format';
 
 const SORT_OPTIONS = [
   ['recent', 'Recent'],
@@ -167,14 +168,16 @@ async function recentSessions(p: URLSearchParams, env: Env): Promise<RecentResul
   const limit = clampLimit(p.get('limit'), DEFAULT_RESULT_PAGE_SIZE, DEFAULT_RESULT_PAGE_SIZE);
   const cursor = decodeRecentCursor(p.get('cursor'));
   const page = cursor?.page ?? 1;
-  const { where: baseWhere, binds } = sessionWhere(p);
+  const { clause, costClause, binds } = sessionWhere(p);
   const boundary = cursor ? recentBoundary(cursor.direction, cursor.startedAt, cursor.sessionId, binds) : '';
-  const where = boundary ? `${baseWhere || 'WHERE'}${baseWhere ? ' AND' : ''} ${boundary}` : baseWhere;
   const reverse = cursor?.direction === 'before';
   const direction = reverse ? 'ASC' : 'DESC';
+  // A cost band is the one filter the session row cannot answer, so this page joins the rollup
+  // when (and only when) one is selected.
   const result = await env.DB.prepare(
-    `SELECT ${RECENT_COLUMNS}
-     FROM sessions ${where}
+    `${costClause ? costRollupPrefix(clause) : ''}
+     SELECT ${RECENT_COLUMNS}
+     FROM sessions ${costClause ? costRollupJoin() : ''} ${whereOf(clause, boundary, costClause)}
      ORDER BY COALESCE(started_at, '') ${direction}, session_id ${direction} LIMIT ${limit + 1}`,
   ).bind(...binds).all<RecentRow>();
   const rows = result.results.slice(0, limit);
@@ -206,8 +209,8 @@ async function recentSessions(p: URLSearchParams, env: Env): Promise<RecentResul
 async function sortedRecentSessions(p: URLSearchParams, env: Env): Promise<RecentResult> {
   const limit = clampLimit(p.get('limit'), DEFAULT_RESULT_PAGE_SIZE, DEFAULT_RESULT_PAGE_SIZE);
   const offset = decodeCursor(p.get('cursor'));
-  const { where, binds } = sessionWhere(p);
-  const rows = await env.DB.prepare(sortedRecentSql(p.get('sort'), where, limit, offset))
+  const { clause, costClause, binds } = sessionWhere(p);
+  const rows = await env.DB.prepare(sortedRecentSql(p.get('sort'), clause, costClause, limit, offset))
     .bind(...binds)
     .all<RecentRow>();
   const result = rows.results.slice(0, limit);
@@ -229,22 +232,31 @@ async function sortedRecentSessions(p: URLSearchParams, env: Env): Promise<Recen
  * `sessionSubtreeCosts` instead, because display needs nothing beyond the page; both sides expand
  * the same `subtreeCostCte` definition, so the order and the number shown cannot disagree.
  *
- * The CTE's roots carry the page's own filter, so the outer query needs no WHERE of its own and
- * the caller's binds stay single-use.
+ * The CTE's roots carry the page's row filters, so the outer query's WHERE holds the selected
+ * cost band and nothing else, and the caller's binds stay single-use.
  *
  * `(c.usd IS NULL) ASC` first: an unpriced subtree has no known cost, and sorting it as if it
  * were free would put every session we cannot price at the cheap end of "total cost".
  */
-function sortedRecentSql(sort: string | null, where: string, limit: number, offset: number): string {
+function sortedRecentSql(
+  sort: string | null,
+  clause: string,
+  costClause: string,
+  limit: number,
+  offset: number,
+): string {
   const paged = `LIMIT ${limit + 1} OFFSET ${offset}`;
   if (sort === 'cost') {
-    return `WITH RECURSIVE ${subtreeCostCte(`SELECT session_id FROM sessions ${where}`)}
+    return `${costRollupPrefix(clause)}
      SELECT ${RECENT_COLUMNS}
-     FROM sessions JOIN session_subtree_cost c ON c.session_id = sessions.session_id
-     ORDER BY (c.usd IS NULL) ASC, c.usd DESC, sessions.session_id DESC ${paged}`;
+     FROM sessions ${costRollupJoin()} ${whereOf(costClause)}
+     ORDER BY (${SUBTREE_COST_ALIAS}.usd IS NULL) ASC, ${SUBTREE_COST_ALIAS}.usd DESC, sessions.session_id DESC ${paged}`;
   }
   const order = sort === 'session_time' ? sessionDurationSql('sessions') : totalTokensSql('sessions');
-  return `SELECT ${RECENT_COLUMNS} FROM sessions ${where} ORDER BY ${order} DESC, session_id DESC ${paged}`;
+  // Every other sort reads the session row, and only joins the rollup when a band is selected.
+  return `${costClause ? costRollupPrefix(clause) : ''}
+     SELECT ${RECENT_COLUMNS} FROM sessions ${costClause ? costRollupJoin() : ''}
+     ${whereOf(clause, costClause)} ORDER BY ${order} DESC, session_id DESC ${paged}`;
 }
 
 /** Recent sessions are actively ingested, so its cursor names a row boundary rather than
@@ -269,10 +281,14 @@ async function hasRecentRow(
   direction: RecentCursor['direction'],
   row: RecentRow,
 ): Promise<boolean> {
-  const { where: baseWhere, binds } = sessionWhere(p);
+  const { clause, costClause, binds } = sessionWhere(p);
   const boundary = recentBoundary(direction, startedAtKey(row), row.session_id, binds);
-  const where = `${baseWhere || 'WHERE'}${baseWhere ? ' AND' : ''} ${boundary}`;
-  return !!await env.DB.prepare(`SELECT 1 AS found FROM sessions ${where} LIMIT 1`).bind(...binds).first();
+  // The probe decides whether a Previous/Next link exists, so it has to apply the same cost band
+  // the page does — otherwise a filtered-out neighbour offers a page with nothing on it.
+  const sql = `${costClause ? costRollupPrefix(clause) : ''}
+     SELECT 1 AS found FROM sessions ${costClause ? costRollupJoin() : ''}
+     ${whereOf(clause, boundary, costClause)} LIMIT 1`;
+  return !!await env.DB.prepare(sql).bind(...binds).first();
 }
 
 function startedAtKey(row: RecentRow): string {
@@ -310,9 +326,14 @@ async function sessionFacets(p: URLSearchParams, env: Env): Promise<Record<strin
   const statements = FACET_DEFINITIONS.map((definition) => {
     const filter = buildSessionFilterSql(p, 'sessions', 1, definition.key);
     const expression = facetExpressionSql(definition, 'sessions');
-    const where = [filter.clause, `${expression} IS NOT NULL`].filter(Boolean).join(' AND ');
+    // The cost facet counts sessions by a figure only the rollup knows, and every other facet has
+    // to respect a cost band the caller already selected, so either reason joins it. The join is
+    // one row per root, so it cannot change a count on its own.
+    const rollup = definition.kind === 'cost' || filter.costClause !== '';
+    const where = [filter.clause, filter.costClause, `${expression} IS NOT NULL`].filter(Boolean).join(' AND ');
     return env.DB.prepare(
-      `SELECT ${expression} AS v, COUNT(*) AS n FROM sessions
+      `${rollup ? costRollupPrefix(filter.clause) : ''}
+       SELECT ${expression} AS v, COUNT(*) AS n FROM sessions ${rollup ? costRollupJoin() : ''}
        WHERE ${where} GROUP BY v ORDER BY ${facetOrderSql(definition)} LIMIT ${definition.valueLimit ?? 20}`,
     ).bind(...filter.binds);
   });
@@ -327,9 +348,30 @@ async function sessionFacets(p: URLSearchParams, env: Env): Promise<Record<strin
   return facets;
 }
 
-function sessionWhere(p: URLSearchParams): { where: string; binds: string[] } {
+/** The session-row conditions, the cost-band conditions and their shared binds.
+ *
+ * Two clauses rather than one because the cost band reads the rollup CTE, whose roots are the
+ * sessions the row conditions match — see `SessionFilterSql.costClause`. */
+function sessionWhere(p: URLSearchParams): { clause: string; costClause: string; binds: string[] } {
   const filter = buildSessionFilterSql(p, 'sessions');
-  return { where: filter.clause ? `WHERE ${filter.clause}` : '', binds: filter.binds };
+  return { clause: filter.clause, costClause: filter.costClause, binds: filter.binds };
+}
+
+/** `WITH RECURSIVE` prefix for the rollup, or nothing when no query needs it.
+ *
+ * Roots are the sessions matching every NON-cost condition: a band filters the rollup's output,
+ * so making it a root condition would define the rollup in terms of itself. */
+function costRollupPrefix(clause: string): string {
+  return `WITH RECURSIVE ${subtreeCostCte(`SELECT session_id FROM sessions${clause ? ` WHERE ${clause}` : ''}`)} `;
+}
+
+function costRollupJoin(): string {
+  return `JOIN session_subtree_cost ${SUBTREE_COST_ALIAS} ON ${SUBTREE_COST_ALIAS}.session_id = sessions.session_id`;
+}
+
+function whereOf(...clauses: string[]): string {
+  const parts = clauses.filter(Boolean);
+  return parts.length ? `WHERE ${parts.join(' AND ')}` : '';
 }
 
 function renderHit(h: SearchHit, cost: SubtreeCost | undefined): string {
@@ -382,19 +424,19 @@ function renderRecent(r: RecentRow, cost: SubtreeCost | undefined): string {
  * than `knownCost`'s bare `—` because among a row of chips a dash reads as a missing field; either
  * way it is never `$0.00`, which would assert the session was free.
  *
- * The subagent count is in the chip, not only the tooltip, so a parent's figure is not mistaken
- * for its own spend. */
+ * Just the figure in a list row: the coverage caveat and the subagent count are qualifiers on a
+ * number nobody reads a list for, and they crowd out the fields a row is scanned by. Both stay in
+ * the chip's tooltip, and the session page states them in full. */
 function costChip(cost: SubtreeCost | undefined): string {
   if (!cost) return '';
   const label = costLabel(cost);
   if (label.state === 'none') return '';
   const subagents = cost.subagentSessions;
   const noun = subagents === 1 ? 'subagent' : 'subagents';
-  const text = label.state === 'unknown' ? 'cost unknown' : label.text;
-  const rollup = subagents > 0 ? ` incl. ${fmtInt(subagents)} ${noun}` : '';
+  const text = label.state === 'unknown' || cost.usd === null ? 'cost unknown' : fmtUsd(cost.usd);
   const coverage = costCoverage(cost.pricedCalls, cost.calls);
   const detail = subagents > 0 ? `${coverage}, including ${fmtInt(subagents)} ${noun}` : coverage;
-  return `<span class="muted small" title="${esc(detail)}">${esc(text + rollup)}</span>`;
+  return `<span class="muted small" title="${esc(detail)}">${esc(text)}</span>`;
 }
 
 function formatSessionTime(seconds: number | null): string {

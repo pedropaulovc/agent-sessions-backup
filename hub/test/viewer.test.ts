@@ -812,14 +812,14 @@ describe('viewer', () => {
 
   it('drives full-text search off the blocks_fts index and reads the title as a stored column', async () => {
     const searchPlan = await testEnv.DB.prepare(
-      `EXPLAIN QUERY PLAN ${searchHitsSql('', null, 20, 0)}`,
+      `EXPLAIN QUERY PLAN ${searchHitsSql('', '', null, 20, 0)}`,
     ).bind('filler').all<{ detail: string }>();
     const searchDetails = searchPlan.results.map((row) => row.detail).join('\n');
     expect(searchDetails).toContain('SCAN blocks_fts VIRTUAL TABLE');
     // The first-interaction title is now a stored sessions column, not a correlated per-row
     // recursive subquery, so the search plan never materializes a blocks title lookup.
     expect(searchDetails).not.toContain('title_block');
-    expect(searchHitsSql('', null, 20, 0)).toContain('s.first_interaction_title');
+    expect(searchHitsSql('', '', null, 20, 0)).toContain('s.first_interaction_title');
   });
 
   it('ignores abandoned title blocks and chooses the first main-path interaction', async () => {
@@ -2487,8 +2487,11 @@ describe('viewer list cost', () => {
   it('shows each session cost with its subagent descendants folded in', async () => {
     const html = await (await SELF.fetch(`${VIEWER}/?harness=${COST_HARNESS}`)).text();
 
+    // The figure alone in the row; the rollup and its coverage are the chip's tooltip, because a
+    // list is scanned rather than read and the qualifiers belong on the session page.
     const parent = listRow(html, COST_PARENT);
-    expect(parent).toContain('$1.75 incl. 1 subagent');
+    expect(parent).toContain('>$1.75<');
+    expect(parent).not.toContain('incl.');
     expect(parent).toContain('title="3 / 3 priced, including 1 subagent"');
 
     // The list hides subagent sessions unless asked for them, so the child's own chip — which
@@ -2496,10 +2499,10 @@ describe('viewer list cost', () => {
     const subagents = await (await SELF.fetch(`${VIEWER}/?harness=${COST_HARNESS}&subagent=yes`)).text();
     const child = listRow(subagents, COST_CHILD);
     expect(child).toContain('$0.25');
-    expect(child).not.toContain('incl.');
+    expect(child).toContain('title="1 / 1 priced"');
   });
 
-  it('says a cost is unknown rather than zero, and marks a partly priced subtree a subtotal', async () => {
+  it('says a cost is unknown rather than zero, and keeps partial coverage in the chip title', async () => {
     const html = await (await SELF.fetch(`${VIEWER}/?harness=${COST_HARNESS}`)).text();
 
     const unpriced = listRow(html, COST_UNPRICED);
@@ -2507,8 +2510,11 @@ describe('viewer list cost', () => {
     expect(unpriced).toContain('title="Unpriced"');
     expect(unpriced).not.toContain('$');
 
+    // A partly priced subtree keeps its caveat in the tooltip: the row shows the lower bound and
+    // `2 / 4 priced` is what says it is one.
     const partial = listRow(html, COST_PARTIAL);
-    expect(partial).toContain('$0.10 subtotal');
+    expect(partial).toContain('>$0.10<');
+    expect(partial).not.toContain('subtotal');
     expect(partial).toContain('title="2 / 4 priced"');
   });
 
@@ -2540,7 +2546,43 @@ describe('viewer list cost', () => {
     ).text();
     const order = [...html.matchAll(/<a href="\/s\/(viewer-cost-[a-z]+)[?"]/g)].map((match) => match[1]!);
     expect(order).toEqual([COST_PARENT, COST_PARTIAL, COST_UNPRICED]);
-    // Hits carry the same chip as recent rows, including the subagent rollup.
-    expect(html).toContain('$1.75 incl. 1 subagent');
+    // Hits carry the same chip as recent rows.
+    expect(html).toContain('>$1.75<');
+  });
+
+  it('counts sessions into cost bands by their rolled-up figure, leaving unpriced ones out', async () => {
+    const html = await (await SELF.fetch(`${VIEWER}/?harness=${COST_HARNESS}`)).text();
+    const facet = html.match(/<h3>Cost<\/h3><ul>[\s\S]*?<\/ul>/)?.[0] ?? '';
+
+    // The parent lands in $1–$10 on $1.75 — its own $1.50 plus the subagent's $0.25 — so the band
+    // is the same number the row shows, not the session's own column. The partial subtree's known
+    // $0.10 is under $1. Neither the unpriced subtree nor the one with no usage records has a
+    // band: an unknown cost is not a cheap one.
+    expect(facet).toContain('Under $1</a><span class="n">1</span>');
+    expect(facet).toContain('$1–$10</a><span class="n">1</span>');
+    expect(facet).not.toContain('$10–$100');
+    expect(facet.match(/<li/g)).toHaveLength(2);
+
+    // Bands read in ascending order, like the session-time facet, rather than by count.
+    expect(facet.indexOf('Under $1')).toBeLessThan(facet.indexOf('$1–$10'));
+  });
+
+  it('filters the list, the sorted list and search hits by the selected cost band', async () => {
+    const banded = await (await SELF.fetch(`${VIEWER}/?harness=${COST_HARNESS}&cost=1-10`)).text();
+    expect(listRow(banded, COST_PARENT)).toContain('>$1.75<');
+    expect(banded).not.toContain(`/s/${COST_PARTIAL}`);
+    expect(banded).not.toContain(`/s/${COST_UNPRICED}`);
+
+    // The cost sort reads the same rollup the band filters on, so the two compose.
+    const sorted = await (await SELF.fetch(`${VIEWER}/?harness=${COST_HARNESS}&cost=under-1&sort=cost`)).text();
+    expect(sorted).toContain(`/s/${COST_PARTIAL}`);
+    expect(sorted).not.toContain(`/s/${COST_PARENT}`);
+
+    // FTS hits are filtered by a separate query (api/search.ts) whose rollup is rooted at the
+    // sessions the other filters match, so the band has to be applied outside those roots.
+    const hits = await (await SELF.fetch(`${VIEWER}/?q=costsortmarker&harness=${COST_HARNESS}&cost=1-10`)).text();
+    expect(hits).toContain(`/s/${COST_PARENT}`);
+    expect(hits).not.toContain(`/s/${COST_PARTIAL}`);
+    expect(hits).not.toContain(`/s/${COST_UNPRICED}`);
   });
 });
