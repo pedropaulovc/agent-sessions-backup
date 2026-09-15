@@ -47,17 +47,22 @@ async function seedUsage(
     w5?: number;
     w1h?: number;
     breakdown?: boolean;
+    /** What the transcript source counted cache reads against; NULL for an unrecognised one. */
+    basis?: 'disjoint' | 'subset' | null;
   } = {},
 ): Promise<void> {
   const usd = row.usd ?? null;
   // The five-way split is stored alongside `usd` by the pricing pass. `breakdown: false` models a
   // row priced before that column existed — still priced, but with no split to sum.
   const split = usd !== null && row.breakdown !== false ? usd / 5 : null;
+  // `basis` defaults to the convention ingest records for the harness these fixtures seed
+  // (claude-code, i.e. Anthropic-raw counters), so a row only names it when that is the point.
+  const basis = row.basis === undefined ? 'disjoint' : row.basis;
   await testEnv.DB.prepare(
     `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens, reasoning_tokens,
-                        cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens,
+                        cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, cache_basis,
                         usd, usd_input, usd_output, usd_cache_read, usd_cache_write_5m, usd_cache_write_1h)
-     VALUES (?1, ?2, '2026-07-20T00:00:00Z', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?11, ?11, ?11)`,
+     VALUES (?1, ?2, '2026-07-20T00:00:00Z', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?12, ?12, ?12, ?12)`,
   )
     .bind(
       sessionId,
@@ -69,28 +74,18 @@ async function seedUsage(
       row.cacheRead ?? 0,
       row.w5 ?? 0,
       row.w1h ?? 0,
+      basis,
       usd,
       split,
     )
     .run();
 }
 
-async function seedPrice(model: string, accounting: 'disjoint' | 'subset', effectiveFrom = '2026-01-01'): Promise<void> {
-  await testEnv.DB.prepare(
-    `INSERT INTO model_prices
-       (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
-        cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
-        cache_accounting, source, fetched_at)
-     VALUES (?1, ?2, ?1, 'test', 1, 10, 0.1, 2, 4, NULL, NULL, ?3, 'test', '2026-07-31T00:00:00Z')`,
-  )
-    .bind(model, effectiveFrom, accounting)
-    .run();
-}
-
 beforeEach(async () => {
+  // No `model_prices` cleanup, because nothing here seeds it: the cached-share convention is read
+  // from the usage row that recorded it, so the price catalog has no say in these assertions.
   await testEnv.DB.prepare('DELETE FROM usage').run();
   await testEnv.DB.prepare('DELETE FROM sessions').run();
-  await testEnv.DB.prepare('DELETE FROM model_prices').run();
   turn = 0;
 });
 
@@ -230,49 +225,109 @@ describe('per-model breakdown', () => {
     expect(row).toMatchObject({ usd: 4, pricedCalls: 1, staleBreakdownCalls: 1, byClass: null });
   });
 
-  it('measures the cached share against the convention the model is billed under', async () => {
-    // Identical reported counters, two answers. Anthropic reports cache reads ALONGSIDE input, so
-    // the prompt is input + cache_read; the OpenAI family reports them INSIDE input, so the prompt
-    // is input alone. Using one convention for both is wrong by roughly the cache ratio itself —
-    // the number most worth trusting on the page.
-    await seedPrice('disjoint-model', 'disjoint');
-    await seedPrice('subset-model', 'subset');
-    await seedSession('hit-rate');
-    await seedUsage('hit-rate', { model: 'disjoint-model', usd: 1, input: 100_000, cacheRead: 90_000 });
-    await seedUsage('hit-rate', { model: 'subset-model', usd: 1, input: 100_000, cacheRead: 90_000 });
+  it('counts cache writes in the disjoint denominator', async () => {
+    // A written token is a prompt token that MISSED, so it belongs in the denominator with the
+    // reads. Leaving the two write terms out divides 90000 by 91000 and reports 98.9% for a
+    // session that spent nine tenths of its prompt rebuilding cache — the exact shape of the
+    // "this session never missed" number that was wrong on the page.
+    await seedSession('disjoint-share');
+    await seedUsage('disjoint-share', {
+      model: 'omp-model',
+      usd: 1,
+      basis: 'disjoint',
+      input: 1_000,
+      cacheRead: 90_000,
+      w5: 6_000,
+      w1h: 3_000,
+    });
 
-    const byModel = new Map((await sessionModelCosts(testEnv.DB, 'hit-rate')).map((r) => [r.model, r]));
-    expect(byModel.get('disjoint-model')!.basis).toBe('disjoint');
-    expect(byModel.get('disjoint-model')!.cacheHitRate).toBeCloseTo(90_000 / 190_000, 10);
-    expect(byModel.get('subset-model')!.basis).toBe('subset');
-    expect(byModel.get('subset-model')!.cacheHitRate).toBeCloseTo(0.9, 10);
+    const [row] = await sessionModelCosts(testEnv.DB, 'disjoint-share');
+    expect(row).toMatchObject({ basis: 'disjoint' });
+    // 90000 / (1000 + 90000 + 6000 + 3000), exactly — not 90000 / 91000.
+    expect(row!.cacheHitRate).toBe(0.9);
   });
 
-  it('cannot exceed 100% when a provider reports more cache reads than input', async () => {
-    // Real rows do this: a subset-accounting provider can report a cached count that its own input
+  it('divides a subset row by the input its cached tokens are part of', async () => {
+    // Codex writes the cached count INSIDE input_tokens, so the 100k prompt already contains the
+    // 90k that hit and adding them again would describe a prompt that was never sent. The same two
+    // counters written by an OMP sidecar mean a 190k prompt and a 47% hit — which is why the
+    // convention is recorded per row rather than per model.
+    await seedSession('subset-share');
+    await seedUsage('subset-share', { model: 'codex-model', usd: 1, basis: 'subset', input: 100_000, cacheRead: 90_000 });
+    await seedUsage('subset-share', { model: 'omp-model', usd: 1, basis: 'disjoint', input: 100_000, cacheRead: 90_000 });
+
+    const byModel = new Map((await sessionModelCosts(testEnv.DB, 'subset-share')).map((r) => [r.model, r]));
+    expect(byModel.get('codex-model')).toMatchObject({ basis: 'subset' });
+    expect(byModel.get('codex-model')!.cacheHitRate).toBeCloseTo(0.9, 10);
+    expect(byModel.get('omp-model')).toMatchObject({ basis: 'disjoint' });
+    expect(byModel.get('omp-model')!.cacheHitRate).toBeCloseTo(90_000 / 190_000, 10);
+  });
+
+  it('cannot exceed 100% when a source reports more cache reads than input', async () => {
+    // Real rows do this: a subset-accounting source can report a cached count that its own input
     // count does not cover. Dividing raw counters would print a 900% hit rate. The clamped sum from
     // usage-agg (MIN(cache_read, input) per row) is why this is capped at the prompt.
-    await seedPrice('subset-model', 'subset');
     await seedSession('over-report');
-    await seedUsage('over-report', { model: 'subset-model', usd: 1, input: 10_000, cacheRead: 90_000 });
+    await seedUsage('over-report', { model: 'codex-model', usd: 1, basis: 'subset', input: 10_000, cacheRead: 90_000 });
 
     const [row] = await sessionModelCosts(testEnv.DB, 'over-report');
     expect(row!.cacheHitRate).toBe(1);
   });
 
-  it('declines to compute a share when the model has no single accounting convention', async () => {
-    // A model with no price row, and a model whose snapshots disagree (the sync writes a new
-    // snapshot when the provider changes). Picking the newest would restate older turns under a
-    // convention they were not billed by, so the page shows `—` instead.
-    await seedPrice('switched-model', 'disjoint', '2026-01-01');
-    await seedPrice('switched-model', 'subset', '2026-06-01');
-    await seedSession('no-basis');
-    await seedUsage('no-basis', { model: 'switched-model', usd: 1, input: 100, cacheRead: 50 });
-    await seedUsage('no-basis', { model: 'uncatalogued-model', usd: null, input: 100, cacheRead: 50 });
+  it('accumulates each convention separately for a model recorded under both', async () => {
+    // One model, two sources — an OMP sidecar and a Codex session, both archived here — which is
+    // the case a per-MODEL convention could not express at all. Each group is divided by its own
+    // denominator and the halves summed: 140000 / 300000. Applying either convention to both rows
+    // instead gives 40.0% (all disjoint) or 25.4% (all subset), and the clamps in
+    // USAGE_TOKEN_SUMS are per row, so only the SQL grouping can keep them apart.
+    await seedSession('mixed-basis');
+    await seedUsage('mixed-basis', {
+      model: 'shared-model',
+      usd: 1,
+      basis: 'disjoint',
+      input: 1_000,
+      cacheRead: 90_000,
+      w5: 6_000,
+      w1h: 3_000,
+    });
+    await seedUsage('mixed-basis', { model: 'shared-model', usd: 2, basis: 'subset', input: 200_000, cacheRead: 50_000 });
 
-    const byModel = new Map((await sessionModelCosts(testEnv.DB, 'no-basis')).map((r) => [r.model, r]));
-    expect(byModel.get('switched-model')).toMatchObject({ basis: 'unknown', cacheHitRate: null });
-    expect(byModel.get('uncatalogued-model')).toMatchObject({ basis: 'unknown', cacheHitRate: null });
+    const [row] = await sessionModelCosts(testEnv.DB, 'mixed-basis');
+    expect(row).toMatchObject({ basis: 'mixed', calls: 2, usd: 3 });
+    expect(row!.cacheHitRate).toBeCloseTo(140_000 / 300_000, 10);
+    // The convention is now part of the group key, and one session can hold rows of both, so the
+    // distinct-session count has to come from outside that grouping or this reads as 2 sessions.
+    expect(row!.sessions).toBe(1);
+  });
+
+  it('excludes a row with no recorded convention from the share rather than calling it 0%', async () => {
+    // An unrecognised transcript source has no defensible convention, and the two answers differ by
+    // roughly the cache ratio itself, so NULL stays distinct from zero all the way to the renderer:
+    // a 0% hit rate on an almost entirely cached session is worse than no answer. A model with SOME
+    // unclassified rows is `mixed` for the same reason — its share covers only the rows that could
+    // be measured, so claiming it is disjoint would overstate what was checked.
+    await seedSession('null-basis');
+    await seedUsage('null-basis', { model: 'unclassified-model', usd: null, basis: null, input: 100, cacheRead: 50 });
+    await seedUsage('null-basis', { model: 'partly-classified-model', usd: null, basis: null, input: 100, cacheRead: 50 });
+    await seedUsage('null-basis', { model: 'partly-classified-model', usd: 1, basis: 'disjoint', input: 1_000, cacheRead: 9_000 });
+
+    const byModel = new Map((await sessionModelCosts(testEnv.DB, 'null-basis')).map((r) => [r.model, r]));
+    expect(byModel.get('unclassified-model')).toMatchObject({ basis: 'unknown', cacheHitRate: null });
+    expect(byModel.get('partly-classified-model')).toMatchObject({ basis: 'mixed' });
+    expect(byModel.get('partly-classified-model')!.cacheHitRate).toBeCloseTo(0.9, 10);
+  });
+
+  it('measures the cached share of a model that has no price row at all', async () => {
+    // The original defect in miniature: the convention was read from the price catalog, so a model
+    // nobody had published rates for had no measurable cache share either — two unrelated unknowns
+    // wired together. Both the counters and the convention are on the usage row now, so an
+    // unpriced model still reports how much of its prompt was cached.
+    await seedSession('unpriced-share');
+    await seedUsage('unpriced-share', { model: 'brand-new-model', usd: null, basis: 'disjoint', input: 10_000, cacheRead: 90_000 });
+
+    const [row] = await sessionModelCosts(testEnv.DB, 'unpriced-share');
+    expect(row).toMatchObject({ usd: null, basis: 'disjoint' });
+    expect(row!.cacheHitRate).toBeCloseTo(0.9, 10);
   });
 
   it('has no rows for a session with no usage', async () => {

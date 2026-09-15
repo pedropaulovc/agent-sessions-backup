@@ -20,4 +20,9 @@ export const SYNTHETIC_FIXTURE = Object.freeze({
   costBandValue: SYNTHETIC_EXPECTATIONS.costBandValue,
   costBandLabel: SYNTHETIC_EXPECTATIONS.costBandLabel,
   costParentOwnLabel: SYNTHETIC_EXPECTATIONS.costParentOwnLabel,
+  costParentHitRate: SYNTHETIC_EXPECTATIONS.costParentHitRate,
+  costSubsetSessionId: SYNTHETIC_EXPECTATIONS.costSubsetSessionId,
+  costSubsetModel: SYNTHETIC_EXPECTATIONS.costSubsetModel,
+  costSubsetAmount: SYNTHETIC_EXPECTATIONS.costSubsetAmount,
+  costSubsetHitRate: SYNTHETIC_EXPECTATIONS.costSubsetHitRate,
 });

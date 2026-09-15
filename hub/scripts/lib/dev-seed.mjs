@@ -30,10 +30,18 @@ const SKILL_RELPATH = `${SKILL_NAME}/SKILL.md`;
 // `omp:<parent>:<relative path>` with `parent_session_id` set. The fixtures also carry
 // `parentSession` in their header, as real OMP sidecars do.
 const COST_PARENT_SESSION_ID = '00000000-0000-4000-8000-000000000003';
-const COST_STORE = 'omp';
 const COST_PARENT_STEM = `-workspace-e2e-fixtures/2026-07-02_${COST_PARENT_SESSION_ID}`;
 const COST_PARENT_RELPATH = `${COST_PARENT_STEM}.jsonl`;
 const COST_PARENT_FILE = 'e2e-cost-parent-session.jsonl';
+// The subset-accounting half of the fixture, and the reason it is a CODEX session rather than a
+// fourth OMP sidecar: how a stored row counts its cache reads follows the transcript SOURCE, not
+// the model's provider. An OMP sidecar reports `input` EXCLUDING cache for every provider it
+// records, so no OMP file can exercise subset accounting whatever model it names. Codex CLI
+// rollouts report `cached_input_tokens` INSIDE `input_tokens`, so this file is the only way the
+// browser suite sees the other denominator — on the same `gpt-5-mini` rates as the scout sidecar,
+// which makes the two hit rates directly comparable.
+const COST_CODEX_SESSION_ID = '00000000-0000-7000-8000-000000000004';
+const COST_CODEX_RELPATH = `2026/07/02/rollout-2026-07-02T11-00-00-${COST_CODEX_SESSION_ID}.jsonl`;
 // One descriptor list for both seeding paths: the local one resolves `file` inside FIXTURE_DIR,
 // the preview one against the same directory in the checkout, and both derive the session id and
 // the indexing probe from these fields rather than restating them.
@@ -44,16 +52,16 @@ const COST_PARENT_FILE = 'e2e-cost-parent-session.jsonl';
 const COST_FIXTURES = Object.freeze([
   {
     file: COST_PARENT_FILE,
+    store: 'omp',
     relpath: COST_PARENT_RELPATH,
     sessionId: COST_PARENT_SESSION_ID,
     kind: 'main',
     model: 'claude-sonnet-4-5-20250929',
     marker: 'cerulean abacus',
   },
-  // These two report cache reads INSIDE the input count (`subset` accounting), while the parent's
-  // Claude model reports them beside it — one fixture, both hit-rate denominators.
   {
     file: 'e2e-cost-scout-subagent.jsonl',
+    store: 'omp',
     relpath: `${COST_PARENT_STEM}/scout-alpha.jsonl`,
     sessionId: `omp:${COST_PARENT_SESSION_ID}:scout-alpha.jsonl`,
     kind: 'subagent',
@@ -62,6 +70,7 @@ const COST_FIXTURES = Object.freeze([
   },
   {
     file: 'e2e-cost-review-subagent.jsonl',
+    store: 'omp',
     relpath: `${COST_PARENT_STEM}/review-beta.jsonl`,
     sessionId: `omp:${COST_PARENT_SESSION_ID}:review-beta.jsonl`,
     kind: 'subagent',
@@ -72,11 +81,23 @@ const COST_FIXTURES = Object.freeze([
   // render as a `subtotal`, never as a total that silently drops an unpriced call.
   {
     file: 'e2e-cost-unpriced-subagent.jsonl',
+    store: 'omp',
     relpath: `${COST_PARENT_STEM}/tally-gamma.jsonl`,
     sessionId: `omp:${COST_PARENT_SESSION_ID}:tally-gamma.jsonl`,
     kind: 'subagent',
     model: 'local-fixture-unpriced-model',
     marker: 'Subagent gamma',
+  },
+  // Its own root session, not a sidecar: a codex rollout cannot be a child of an OMP parent, and
+  // the subtree figures above stay arithmetically independent of it because of that.
+  {
+    file: 'e2e-cost-codex-session.jsonl',
+    store: 'codex',
+    relpath: COST_CODEX_RELPATH,
+    sessionId: COST_CODEX_SESSION_ID,
+    kind: 'main',
+    model: 'gpt-5-mini',
+    marker: 'vermilion sextant',
   },
 ]);
 
@@ -92,10 +113,10 @@ const COST_FIXTURES = Object.freeze([
  * DOLLARS PER MILLION TOKENS, which is what `pricing.ts` divides by `MILLION`. Getting that unit
  * wrong is silent: the fixture still prices, just at a millionth of the real cost.
  *
- * The `cache_accounting` values are the real ones too: Anthropic reports cache reads BESIDE the
- * input count (`disjoint`), OpenAI and Google report them INSIDE it (`subset`). That distinction
- * is the denominator of the detail panel's cache hit rate, so a fixture that got it wrong would
- * prove nothing about the column.
+ * The catalog carries no cache-accounting column: how a stored row counts its cache reads is a
+ * property of the transcript that produced it (`usage.cache_basis`, set at ingest from the
+ * harness), so these rows only have to be rates. The hit-rate denominator is proved by the
+ * fixture TRANSCRIPTS instead — an OMP sidecar for disjoint, a codex rollout for subset.
  */
 export const FIXTURE_MODEL_PRICES = Object.freeze([
   {
@@ -106,7 +127,6 @@ export const FIXTURE_MODEL_PRICES = Object.freeze([
     cache_read_cost: 0.3,
     cache_write_5m_cost: 3.75,
     cache_write_1h_cost: 6,
-    cache_accounting: 'disjoint',
   },
   {
     model: 'gpt-5-mini',
@@ -116,7 +136,6 @@ export const FIXTURE_MODEL_PRICES = Object.freeze([
     cache_read_cost: 0.025,
     cache_write_5m_cost: null,
     cache_write_1h_cost: null,
-    cache_accounting: 'subset',
   },
   {
     model: 'gemini-2.5-pro',
@@ -126,7 +145,6 @@ export const FIXTURE_MODEL_PRICES = Object.freeze([
     cache_read_cost: 0.31,
     cache_write_5m_cost: null,
     cache_write_1h_cost: null,
-    cache_accounting: 'subset',
   },
 ]);
 
@@ -149,13 +167,12 @@ export function fixtureModelPriceSql() {
     price.cache_read_cost,
     price.cache_write_5m_cost ?? 'NULL',
     price.cache_write_1h_cost ?? 'NULL',
-    `'${price.cache_accounting}'`,
     `'fixture'`,
     `'2026-07-02T00:00:00.000Z'`,
   ].join(', '));
   return 'INSERT OR REPLACE INTO model_prices (model, effective_from, litellm_key, provider, '
     + 'input_cost, output_cost, cache_read_cost, cache_write_5m_cost, cache_write_1h_cost, '
-    + `cache_accounting, source, fetched_at) VALUES ${values.map((row) => `(${row})`).join(', ')};`;
+    + `source, fetched_at) VALUES ${values.map((row) => `(${row})`).join(', ')};`;
 }
 
 export const SYNTHETIC_EXPECTATIONS = Object.freeze({
@@ -176,27 +193,42 @@ export const SYNTHETIC_EXPECTATIONS = Object.freeze({
   skillStore: SKILL_STORE,
   skillRelpath: SKILL_RELPATH,
   skillSourceMarker: 'deterministic indigo compass skill marker',
-  costStore: COST_STORE,
   costParentSessionId: COST_PARENT_SESSION_ID,
   costParentTitle: 'Cost fixture: cerulean abacus fan-out',
   costSearchPhrase: 'cerulean abacus',
   costParentModel: COST_FIXTURES[0].model,
   costUnpricedModel: 'local-fixture-unpriced-model',
-  // Both figures are arithmetic on the fixture's token counts and FIXTURE_MODEL_PRICES, so the
-  // browser suite asserting them catches a pricing or rollup regression, not just a rendered
-  // string: $1.23 of Claude turns here, plus $0.215 and $0.706 of subagents, with the fourth
+  // Every figure here is arithmetic on the fixture's token counts and FIXTURE_MODEL_PRICES, so
+  // the browser suite asserting them catches a pricing or rollup regression, not just a rendered
+  // string: $1.23 of Claude turns here, plus $0.365 and $0.831 of subagents, with the fourth
   // subagent unpriced — which is why the rolled-up figure is a `subtotal`.
-  costSubtreeLabel: '$2.15 subtotal',
-  costSubtreeAmount: '$2.15',
-  // The band that $2.15 falls in, from COST_BUCKETS in src/session-filters.ts.
+  //
+  // The two subagent figures bill EVERY reported cache read at the cache rate on top of the full
+  // reported input, because an OMP sidecar's `input` excludes cache. Pricing them as if the reads
+  // were already inside `input` is the defect this fixture now pins: it turned $0.365 into $0.215
+  // and $0.831 into $0.706, and on a real session it lost 814M cache reads and 4.7x of the cost.
+  costSubtreeLabel: '$2.43 subtotal',
+  costSubtreeAmount: '$2.43',
+  // The band that $2.43 falls in, from COST_BUCKETS in src/session-filters.ts.
   costBandValue: '1-10',
   costBandLabel: '$1–$10',
   costParentOwnLabel: '$1.23',
-  // Every cost fixture file with the relpath it uploads to, the session id it becomes and the
-  // phrase that proves it indexed. Both seeding paths iterate this, and the browser suite reads
-  // the ids and models from it, so the fan-out's shape is declared exactly once.
+  // Disjoint accounting: 400k reads over 120k input + 400k reads + 80k writes. The writes belong
+  // in the denominator — they are prompt tokens the provider had to read fresh — and leaving them
+  // out is what let a cache-heavy session render a flat 100.0%.
+  costParentHitRate: '66.7%',
+  // The codex root session, the only fixture whose stored `input` already CONTAINS its cache
+  // reads: 400k of 800k input, on the same gpt-5-mini rates as the scout sidecar above.
+  costSubsetSessionId: COST_CODEX_SESSION_ID,
+  costSubsetModel: 'gpt-5-mini',
+  costSubsetSearchPhrase: 'vermilion sextant',
+  costSubsetAmount: '$0.19',
+  costSubsetHitRate: '50.0%',
+  // Every cost fixture file with the store and relpath it uploads to, the session id it becomes
+  // and the phrase that proves it indexed. Both seeding paths iterate this, and the browser suite
+  // reads the ids and models from it, so the fan-out's shape is declared exactly once.
   costFixtures: COST_FIXTURES,
-  costSubagentSessionIds: COST_FIXTURES.slice(1).map((fixture) => fixture.sessionId),
+  costSubagentSessionIds: COST_FIXTURES.filter((fixture) => fixture.kind === 'subagent').map((fixture) => fixture.sessionId),
 });
 
 export async function syntheticSeedManifest() {
@@ -269,7 +301,7 @@ export async function seedSynthetic(baseUrl, timeoutMs = 30_000, expectedDigest)
   // The parent goes up before its sidecars so a subagent row never briefly points at a missing
   // parent, which is also the order the collector produces them in.
   for (const fixture of COST_FIXTURES) {
-    await upload(baseUrl, COST_STORE, fixture.relpath, await readFile(join(FIXTURE_DIR, fixture.file)));
+    await upload(baseUrl, fixture.store, fixture.relpath, await readFile(join(FIXTURE_DIR, fixture.file)));
   }
   // One budget PER session, not one shared across all of them. Indexing is queue-driven, so the
   // sessions finish in upload order and a shared window is spent by the time the last few are

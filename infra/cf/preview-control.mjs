@@ -668,7 +668,6 @@ async function seed() {
   const skill = await readFile(new URL('e2e-managed-skill.md', fixtureRoot));
   const {
     costFixtures,
-    costStore,
     externalDigest,
     externalRelpath,
     machine,
@@ -691,7 +690,7 @@ async function seed() {
     // The cost fan-out, parent first: OMP subagent identity comes from the sidecar's path under
     // the parent's directory, so the parent row must exist before its children are parsed.
     ...await Promise.all(costFixtures.map(async (fixture) => [
-      costStore,
+      fixture.store,
       fixture.relpath,
       await readFile(new URL(fixture.file, fixtureRoot)),
     ])),

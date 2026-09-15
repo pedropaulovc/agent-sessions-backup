@@ -7,7 +7,6 @@
 
 import {
   assertLooksLikeCatalog,
-  cacheAccountingFor,
   intOrNull,
   perM,
   lookupEntry,
@@ -29,12 +28,10 @@ const RATE_COLS = [
   'output_cost_batch',
 ] as const;
 
-/** Non-rate columns that still change what a row COSTS, so a snapshot must be taken when they
- * move even though every number stayed the same. `cache_accounting` is derived from `provider`,
- * and flipping subset<->disjoint changes whether cache reads are charged on top of input or
- * subtracted from it — upstream correcting a null provider to `anthropic` silently misprices
- * every cached call until some unrelated rate happens to change. */
-const ACCOUNTING_COLS = ['provider', 'cache_accounting'] as const;
+/** Provider corrections still deserve a snapshot even when every rate stays the same.
+ * Cache accounting semantics moved to transcript usage rows; they still affect costs, but
+ * no longer belong to the catalog or its snapshot-change predicate. */
+const METADATA_COLS = ['provider'] as const;
 
 /** Statements per D1 batch. Each costs a subrequest against the invocation's ~1000 budget. */
 const MAX_STATEMENTS_PER_BATCH = 100;
@@ -50,7 +47,7 @@ const MAX_STATEMENTS_PER_BATCH = 100;
 const MAX_PRICE_WRITES_PER_RUN = 400;
 
 type Rates = Record<(typeof RATE_COLS)[number], number | null>;
-type Accounting = Record<(typeof ACCOUNTING_COLS)[number], string | null>;
+type Metadata = Record<(typeof METADATA_COLS)[number], string | null>;
 
 
 export async function runModelPriceSync(env: Env): Promise<void> {
@@ -88,13 +85,13 @@ export async function runModelPriceSync(env: Env): Promise<void> {
         // Latest snapshot per model only. This table accumulates history indefinitely by design,
         // and the change predicate compares against the newest row alone -- reading the whole
         // history to discard all but the first row per model gets slower every day for nothing.
-        `SELECT p.model, ${RATE_COLS.map((c) => `p.${c}`).join(', ')}, ${ACCOUNTING_COLS.map((c) => `p.${c}`).join(', ')}
+        `SELECT p.model, ${RATE_COLS.map((c) => `p.${c}`).join(', ')}, ${METADATA_COLS.map((c) => `p.${c}`).join(', ')}
            FROM model_prices p
            JOIN (SELECT model, MAX(effective_from) AS newest FROM model_prices GROUP BY model) t
              ON t.model = p.model AND t.newest = p.effective_from`,
-      ).all<{ model: string } & Rates & Accounting>()
+      ).all<{ model: string } & Rates & Metadata>()
     ).results;
-    const latest = new Map<string, Rates & Accounting>();
+    const latest = new Map<string, Rates & Metadata>();
     for (const r of prevRows) if (!latest.has(r.model)) latest.set(r.model, r);
 
     const stmts: D1PreparedStatement[] = [];
@@ -125,33 +122,18 @@ export async function runModelPriceSync(env: Env): Promise<void> {
         input_cost_batch: perM(e['input_cost_per_token_batches']),
         output_cost_batch: perM(e['output_cost_per_token_batches']),
       };
-      // Anthropic reports cache reads disjoint from input_tokens; the OpenAI family reports them
-      // as a subset. Charging both the same way misprices every cached turn.
-      //
-      // Defaulting the UNKNOWN case to 'subset' was a confident guess in the expensive direction:
-      // a Claude Code row stores cache_read_input_tokens as disjoint usage, so subset accounting
-      // subtracts those tokens from input and underprices every cached call -- silently, with the
-      // row still reported as priced. An absent or unrecognised `litellm_provider` now stores
-      // 'unknown' for an absent or unrecognised provider, which costOfUsage treats as unpriced
-      // for any row that actually has cache reads. NOT null: the column is NOT NULL, and
-      // INSERT OR REPLACE silently substitutes the column DEFAULT for a NULL rather than failing,
-      // so a nullable-looking write would have stored 'disjoint' while the code believed
-      // otherwise (see migration 0017). The provider->convention map lives in upstream-catalog.mjs
-      // so the cron and the manual script cannot disagree about it.
-      const cacheAccounting = cacheAccountingFor(provider);
       const prev = latest.get(model);
       const ratesUnchanged = prev && RATE_COLS.every((c) => (prev[c] ?? null) === (next[c] ?? null));
-      const accountingUnchanged =
-        prev && (prev.provider ?? null) === provider && (prev.cache_accounting ?? null) === cacheAccounting;
-      if (ratesUnchanged && accountingUnchanged) continue;
+      const providerUnchanged = prev && (prev.provider ?? null) === provider;
+      if (ratesUnchanged && providerUnchanged) continue;
 
       stmts.push(
         env.DB.prepare(
           `INSERT OR REPLACE INTO model_prices (model, effective_from, litellm_key, provider,
              input_cost, output_cost, cache_read_cost, cache_write_5m_cost, cache_write_1h_cost,
              input_cost_batch, output_cost_batch, max_input_tokens, max_output_tokens,
-             cache_accounting, source, fetched_at)
-           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'litellm',?15)`,
+             source, fetched_at)
+           VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'litellm',?14)`,
         ).bind(
           model,
           today,
@@ -166,7 +148,6 @@ export async function runModelPriceSync(env: Env): Promise<void> {
           next.output_cost_batch,
           intOrNull(e['max_input_tokens']),
           intOrNull(e['max_output_tokens']),
-          cacheAccounting,
           now,
         ),
       );

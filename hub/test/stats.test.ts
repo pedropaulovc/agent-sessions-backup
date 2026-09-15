@@ -46,15 +46,17 @@ function recent(hoursAgo: number): string {
 }
 
 /** One model, one rate, arithmetic that is easy to check by hand: 1/M input, 10/M output,
- * 0.1/M cache read, 2/M and 4/M cache writes. Disjoint accounting, so cache reads add on top. */
+ * 0.1/M cache read, 2/M and 4/M cache writes. The catalog carries rates only; whether a row's
+ * cache reads sit beside or inside its input count is recorded per usage row (`cache_basis`),
+ * which is what `seedTurn` sets. */
 async function seedPrice(): Promise<void> {
   await testEnv.DB.prepare(
     `INSERT INTO model_prices
        (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
         cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
-        cache_accounting, source, fetched_at)
+        source, fetched_at)
      VALUES ('m1', '2026-01-01', 'm1', 'anthropic', 1, 10, 0.1, 2, 4, NULL, NULL,
-             'disjoint', 'test', '2026-07-31T00:00:00Z')`,
+             'test', '2026-07-31T00:00:00Z')`,
   ).run();
 }
 
@@ -88,10 +90,13 @@ async function seedTurn(
   ts: string | null,
   tokens: Partial<{ input: number; output: number; cacheRead: number; w5: number; w1h: number; depth: number }> = {},
 ): Promise<void> {
+  // `cache_basis` is not optional here: a row with no recorded convention is deliberately
+  // unpriceable, so omitting it would leave every dollar figure in this file NULL.
   await testEnv.DB.prepare(
     `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens,
-                        cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens)
-     VALUES (?1, ?2, ?3, 'm1', ?4, ?5, ?6, ?7, ?8)`,
+                        cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens,
+                        cache_basis)
+     VALUES (?1, ?2, ?3, 'm1', ?4, ?5, ?6, ?7, ?8, 'disjoint')`,
   )
     .bind(
       sessionId,
@@ -314,9 +319,11 @@ describe('ledger', () => {
 
   it('counts turns it could not price so the total is not silently a floor', async () => {
     await seedSession('s1');
+    // A recorded basis, so the ONLY reason this row cannot be priced is that the catalog has no
+    // rate for its model — which is what the test is named for.
     await testEnv.DB.prepare(
-      `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens)
-       VALUES ('s1', 900, '2026-07-20T10:00:00.000Z', 'no-such-model', 1000000)`,
+      `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, cache_basis)
+       VALUES ('s1', 900, '2026-07-20T10:00:00.000Z', 'no-such-model', 1000000, 'disjoint')`,
     ).run();
     const s = await stats(testEnv.DB, BASE, NOW);
     expect(s.ledger.unpricedCalls).toBe(1);

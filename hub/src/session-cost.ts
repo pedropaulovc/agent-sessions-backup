@@ -13,7 +13,7 @@
  * Everything here keeps 0 and unknown apart, the same way `usage.usd` does: a session with no
  * priced usage rows has NO known subtotal, which is not the same as having cost nothing.
  */
-import { loadPrices } from './pricing';
+import type { CacheBasis } from './cache-basis';
 import { UNKNOWN_MODEL_LABEL, USAGE_TOKEN_SUMS } from './usage-agg';
 
 /** A dollar subtotal together with what it is a subtotal OF.
@@ -164,14 +164,16 @@ export async function sessionSubtreeCosts(
   return costs;
 }
 
-/** Which counter a provider's `cache_read_tokens` is measured against.
+/** What a rendered cached share is a share OF, as a DISPLAY state rather than a stored value.
  *
- * `subset` (OpenAI family) reports cached tokens as part of `input_tokens`; `disjoint` (Anthropic)
- * reports them alongside it. The same two columns therefore imply different totals, so a cached
- * share computed without knowing which convention applies is wrong by roughly the cache ratio
- * itself. `unknown` means no published convention for the model — reported as unavailable, never
- * guessed, for the same reason `costOfUsage` refuses to price such a row. */
-export type CacheBasis = 'subset' | 'disjoint' | 'unknown';
+ * The stored value is `usage.cache_basis`, recorded per row from the transcript source rather
+ * than from the provider API (src/cache-basis.ts explains why those differ). One model can
+ * therefore hold rows of both conventions inside one subtree — the same model recorded by an OMP
+ * sidecar and by a Codex session — which is `mixed`: each group is folded under its own
+ * arithmetic, so the share is still exact, but no single sentence says what it is a share of.
+ * `unknown` is a row whose harness has no defensible convention; its counters are left out of the
+ * share entirely, for the same reason `costOfUsage` refuses to price such a row. */
+export type ModelCacheBasis = CacheBasis | 'mixed' | 'unknown';
 
 /** Token counters as reported, summed over a set of `usage` rows. */
 export interface ModelTokens {
@@ -204,7 +206,7 @@ export interface ModelCost {
   sessions: number;
   /** The rendered session's own share, or null when only its subagents used the model. */
   own: { calls: number; tokens: ModelTokens } | null;
-  basis: CacheBasis;
+  basis: ModelCacheBasis;
   /** Cached share of the prompt tokens this model was sent, or null when unmeasurable. */
   cacheHitRate: number | null;
 }
@@ -213,6 +215,8 @@ interface ModelCostRow {
   model: string | null;
   /** 1 for the rendered session's own rows, 0 for its subagents'. */
   is_own: number;
+  /** The convention this group's counters were recorded under; NULL when none applies. */
+  cache_basis: CacheBasis | null;
   sessions: number;
   calls: number;
   priced_calls: number;
@@ -232,35 +236,53 @@ interface ModelCostRow {
   billable_cache_read_tokens: number;
 }
 
-/** A model's running totals across the two scopes SQL returns for it. */
+/** A model's running totals across the scopes and conventions SQL returns for it. */
 interface ModelAcc extends Omit<ModelCost, 'model' | 'basis' | 'cacheHitRate'> {
-  /** Raw `usage.model`, NULL included, so the cache-basis lookup is not done on the display label. */
+  /** Raw `usage.model`, NULL included, so the display label is never the map key. */
   key: string | null;
-  /** `SUM(MIN(cache_read, input))`, the clamped numerator for a subset-accounting cache share. */
-  billableCacheRead: number;
+  /** The cached share's two halves, each already folded under its own group's convention. */
+  cached: number;
+  prompt: number;
+  /** Every `cache_basis` seen for this model, NULL included: one value means one answer. */
+  bases: Set<CacheBasis | null>;
 }
 
 /** Per-model cost and token breakdown for a session and its subagents, ranked by known cost then
  * by activity.
  *
- * Grouped by model and by scope (own rows vs subagents'). The rate epoch and token-shape
- * dimensions `usage-agg.ts` defines exist so a group can be PRICED as one call; these rows sum
- * costs that were already priced per row at write time, so `SUM` is exact over any grouping and
- * the fan-out buys nothing. The scope split is not for pricing either — it is what lets the page
- * still report the parent's own spend under rows that now include its subagents'.
+ * Grouped by model, by scope (own rows vs subagents'), and by cache-accounting convention. The
+ * rate epoch and token-shape dimensions `usage-agg.ts` defines exist so a group can be PRICED as
+ * one call; these rows sum costs that were already priced per row at write time, so `SUM` is
+ * exact over any grouping and the fan-out buys nothing. The scope split is not for pricing either
+ * — it is what lets the page still report the parent's own spend under rows that now include its
+ * subagents'.
  *
- * `USAGE_TOKEN_SUMS` is reused verbatim for the token columns because its two nonlinear per-row
- * clamps are needed here too: `billable_cache_read_tokens` is `SUM(MIN(cache_read, input))`, which
- * is what keeps a subset-accounting cache share from exceeding 100% on a row whose reported
- * counters disagree with each other.
+ * `u.cache_basis` IS in the GROUP BY for a different reason: it is what makes each group's cache
+ * arithmetic valid. `USAGE_TOKEN_SUMS` applies two nonlinear per-row clamps —
+ * `billable_cache_read_tokens` is `SUM(MIN(cache_read, input))` — and one model's rows can carry
+ * both conventions (an OMP sidecar and a Codex session recording the same model). Summing those
+ * rows together would fold a clamped subset numerator into a disjoint denominator, which is the
+ * whole class of error this column was added to end.
  */
 export async function sessionModelCosts(db: D1Database, sessionId: string): Promise<ModelCost[]> {
   const rows = await db
     .prepare(
-      `WITH RECURSIVE ${subtreeMembersCte('SELECT ?1 AS session_id')}
+      `WITH RECURSIVE ${subtreeMembersCte('SELECT ?1 AS session_id')},
+            model_sessions AS (
+              SELECT u.model AS model, COUNT(DISTINCT u.session_id) AS sessions
+                FROM usage u
+                JOIN session_cost_tree t ON t.node = u.session_id
+               GROUP BY u.model
+            )
        SELECT u.model AS model,
               (u.session_id = ?1) AS is_own,
-              COUNT(DISTINCT u.session_id) AS sessions,
+              u.cache_basis AS cache_basis,
+              -- Counted per MODEL, outside the group key, and therefore constant across a model's
+              -- groups (MAX picks that one value). Adding up per-group distinct counts was exact
+              -- while the scope flag was the only extra dimension, because it is a function of
+              -- session_id and the groups' session sets were therefore disjoint. The accounting
+              -- convention is not: one session holding rows of both would be counted twice.
+              MAX(ms.sessions) AS sessions,
               COUNT(u.usd) AS priced_calls,
               SUM(u.usd) AS usd,
               SUM(u.usd_input) AS usd_input,
@@ -273,17 +295,17 @@ export async function sessionModelCosts(db: D1Database, sessionId: string): Prom
               ${USAGE_TOKEN_SUMS}
          FROM usage u
          JOIN session_cost_tree t ON t.node = u.session_id
-        GROUP BY u.model, is_own`,
+         JOIN model_sessions ms ON ms.model IS u.model
+        GROUP BY u.model, is_own, u.cache_basis`,
     )
     .bind(sessionId)
     .all<ModelCostRow>();
   const groups = rows.results ?? [];
   if (!groups.length) return [];
 
-  // At most two groups per model, folded here rather than in SQL because merging them has to keep
-  // null meaning "no stored figure in this scope" instead of collapsing it to zero dollars.
-  // `sessions` adds exactly because the scope flag is a function of `session_id`, so the two
-  // groups' distinct-session sets are disjoint by construction.
+  // Up to six groups per model — two scopes by three conventions, NULL included — folded here
+  // rather than in SQL because merging them has to keep null meaning "no stored figure in this
+  // group" instead of collapsing it to zero dollars.
   const accs = new Map<string | null, ModelAcc>();
   for (const r of groups) {
     const acc = accs.get(r.model) ?? newModelAcc(r.model);
@@ -292,8 +314,9 @@ export async function sessionModelCosts(db: D1Database, sessionId: string): Prom
     acc.staleBreakdownCalls += Number(r.stale_breakdown_calls);
     acc.usd = addUsd(acc.usd, r.usd === null ? null : Number(r.usd));
     acc.byClass = addByClass(acc.byClass, r);
-    acc.sessions += Number(r.sessions);
-    acc.billableCacheRead += Number(r.billable_cache_read_tokens);
+    acc.sessions = Number(r.sessions); // Per model, not per group: assigned, deliberately not summed.
+    acc.bases.add(r.cache_basis);
+    addCacheShare(acc, r);
     addTokens(acc.tokens, r);
     if (r.is_own) {
       acc.own = acc.own ?? { calls: 0, tokens: zeroTokens() };
@@ -303,22 +326,17 @@ export async function sessionModelCosts(db: D1Database, sessionId: string): Prom
     accs.set(r.model, acc);
   }
 
-  const basis = await cacheBases(db, [...accs.keys()]);
   return [...accs.values()]
-    .map(({ key, billableCacheRead, ...acc }) => {
-      const modelBasis = basis.get(key) ?? 'unknown';
-      // Under subset accounting the cached tokens are already inside `input`, so the denominator
-      // is `input` itself and the numerator is clamped against it per row. Under disjoint
-      // accounting they are additional, so the prompt is the sum of the two.
-      const cached = modelBasis === 'subset' ? billableCacheRead : acc.tokens.cacheRead;
-      const prompt = modelBasis === 'subset' ? acc.tokens.input : acc.tokens.input + acc.tokens.cacheRead;
-      return {
-        ...acc,
-        model: key ?? UNKNOWN_MODEL_LABEL,
-        basis: modelBasis,
-        cacheHitRate: modelBasis === 'unknown' || prompt <= 0 ? null : cached / prompt,
-      };
-    })
+    .map(({ key, cached, prompt, bases, ...acc }) => ({
+      ...acc,
+      model: key ?? UNKNOWN_MODEL_LABEL,
+      basis: resolveBasis(bases),
+      // A positive denominator is the only condition left: the convention comes from the rows
+      // themselves rather than from a price snapshot, so a model with no price row at all still
+      // has a measurable share. A zero denominator stays NULL — nothing measured, which the page
+      // must not render as a 0% hit rate.
+      cacheHitRate: prompt > 0 ? cached / prompt : null,
+    }))
     .sort((a, b) => (b.usd ?? -1) - (a.usd ?? -1) || b.calls - a.calls || a.model.localeCompare(b.model));
 }
 
@@ -337,7 +355,9 @@ function newModelAcc(key: string | null): ModelAcc {
     tokens: zeroTokens(),
     sessions: 0,
     own: null,
-    billableCacheRead: 0,
+    cached: 0,
+    prompt: 0,
+    bases: new Set(),
   };
 }
 
@@ -378,24 +398,44 @@ function addByClass(into: ModelCost['byClass'], row: ModelCostRow): ModelCost['b
   };
 }
 
-/** The cache-accounting convention for each model, or `unknown` where it cannot be established.
+/** The cached share's numerator and denominator, each under the convention ITS OWN group carries.
  *
- * Read from the price snapshots the model actually has, and reported as `unknown` when they
- * DISAGREE as well as when they say so. A model whose convention was corrected mid-history (the
- * sync stores a new snapshot when `provider` changes — see cron/model-prices.ts) has no single
- * answer for a session-wide share, and picking the newest would silently restate older turns
- * under a convention they were not billed by.
- */
-async function cacheBases(db: D1Database, models: ReadonlyArray<string | null>): Promise<Map<string | null, CacheBasis>> {
-  const bases = new Map<string | null, CacheBasis>();
-  const wanted = [...new Set(models)].filter((m): m is string => !!m && !m.startsWith('<'));
-  if (!wanted.length) return bases;
-  const prices = await loadPrices(db);
-  for (const model of wanted) {
-    const history = prices.get(model) ?? [];
-    const distinct = new Set(history.map((p) => p.cache_accounting));
-    const only = distinct.size === 1 ? [...distinct][0] : undefined;
-    bases.set(model, only === 'subset' || only === 'disjoint' ? only : 'unknown');
+ * Under subset accounting the cached tokens are already inside `input`, so the denominator is
+ * `input` itself and the numerator is the per-row clamped `SUM(MIN(cache_read, input))`: a row
+ * whose reported cached count exceeds its own input would otherwise push the share past 100%.
+ * Those sources report no cache CREATION at all (the columns are 0), so there is no write term to
+ * add — and adding one would double-count if a source ever folded writes into input.
+ *
+ * Under disjoint accounting the reads AND the writes are reported in addition to `input`, and a
+ * written token is a prompt token that MISSED: leaving the writes out of the denominator reported
+ * a session that rebuilt 2.3M tokens of cache as a 100% hit.
+ *
+ * A NULL basis contributes to NEITHER half. Its counters are unusable without knowing which
+ * counter the reads were measured against, and the two answers differ by roughly the cache ratio
+ * itself, so the row is excluded rather than guessed into a plausible number. */
+function addCacheShare(acc: ModelAcc, row: ModelCostRow): void {
+  if (row.cache_basis === 'subset') {
+    acc.cached += Number(row.billable_cache_read_tokens);
+    acc.prompt += Number(row.input_tokens);
+    return;
   }
-  return bases;
+  if (row.cache_basis !== 'disjoint') return;
+  acc.cached += Number(row.cache_read_tokens);
+  acc.prompt +=
+    Number(row.input_tokens) +
+    Number(row.cache_read_tokens) +
+    Number(row.cache_creation_5m_tokens) +
+    Number(row.cache_creation_1h_tokens);
+}
+
+/** One convention, or the honest name for more than one.
+ *
+ * A model with rows under both conventions still has an exact share — each group was folded under
+ * its own arithmetic above — but no single description of what the share is OF, so it is reported
+ * as `mixed` instead of borrowing one convention's wording. A NULL alongside a real basis is that
+ * same situation with one group left out of the ratio entirely, which is equally not "this model
+ * is disjoint". Only a model whose every row is unclassified is `unknown`. */
+function resolveBasis(bases: ReadonlySet<CacheBasis | null>): ModelCacheBasis {
+  if (bases.size === 1) return [...bases][0] ?? 'unknown';
+  return 'mixed';
 }

@@ -589,14 +589,14 @@ export async function usage(url: URL, env: Env): Promise<Response> {
   const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
 
   const prices = await loadPrices(env.DB);
-  // Cost has to be summed per (bucket, model, price epoch). Per model, because each model has
-  // its own rates AND its own cache-accounting convention. Per epoch, because `bucket` is only
-  // a timestamp when group_by=day — for model/machine/repo it is an identifier, so pricing a
-  // whole bucket at `priceAt(bucket)` would compare a rate date against a model name and pick
-  // an arbitrary rate for all of history. The epoch restores the time dimension the bucket
-  // lost. Grouping by the distinct `effective_from` boundaries rather than by day is what
+  // Cost has to be summed per (bucket, model, cache basis, price epoch). Per model and basis,
+  // because each row's transcript source determines its cache arithmetic; per epoch, because
+  // `bucket` is only a timestamp when group_by=day — for model/machine/repo it is an identifier,
+  // so pricing a whole bucket at `priceAt(bucket)` would compare a rate date against a model name
+  // and pick an arbitrary rate for all of history. The epoch restores the time dimension the
+  // bucket lost. Grouping by the distinct `effective_from` boundaries rather than by day is what
   // keeps that affordable: rates change on snapshot boundaries (a handful, ever), so an epoch
-  // group is guaranteed to sit at one rate while the fan-out stays bucket x model x ~epochs
+  // group is guaranteed to sit at one rate while the fan-out stays bucket x model x basis x ~epochs
   // instead of bucket x model x every-day-in-range.
   const epochExpr = priceEpochExpr(prices);
   const rows = await env.DB.prepare(
@@ -651,9 +651,9 @@ export async function usage(url: URL, env: Env): Promise<Response> {
     for (const k of TOKEN_COLS) agg[k] += Number(r[k] ?? 0);
     agg.calls += Number(r.calls ?? 0);
 
-    // Price the group's totals in one shot: every row in it shares a model, an epoch and a
-    // cache-write shape, and therefore one rate and one accounting convention. `epoch` — not
-    // `bucket` — is the date to price at; see the comment on the query above.
+    // Price the group's totals in one shot: every row in it shares a model, a cache basis, an
+    // epoch and a cache-write shape, and therefore one rate and one accounting convention.
+    // `epoch` — not `bucket` — is the date to price at; see the comment on the query above.
     const modelClass = classifyModel(r.model);
     const price =
       modelClass === 'billable' ? priceForGroup(prices.get(r.model as string) ?? [], String(r.epoch), r, batch) : null;
@@ -662,11 +662,12 @@ export async function usage(url: URL, env: Env): Promise<Response> {
     agg.cost_usd += cost.usd;
     if (cost.rateSet !== 'none') rateSetsUsed.add(cost.rateSet);
 
-    // `sentinel` rows (`<synthetic>`) are deliberately absent from both counters: they never hit
-    // an API, so they are not coverage we failed to price. `unknown` rows are the opposite — real
-    // tokens at a rate we cannot determine — and were previously swallowed by the same check,
-    // letting the response show their tokens at $0 while claiming complete coverage.
-    if (cost.unpriced && modelClass !== 'sentinel') {
+    // `sentinel` rows (`<synthetic>`) with a KNOWN basis are deliberately absent from both
+    // counters: they never hit an API, so they are not coverage we failed to price. `unknown`
+    // rows are the opposite — real tokens at a rate we cannot determine. A sentinel with a NULL
+    // basis is unknown too; keep it visible instead of letting its zero cost hide the metadata gap.
+    const basisKnown = r.cache_basis === 'disjoint' || r.cache_basis === 'subset';
+    if (cost.unpriced && (modelClass !== 'sentinel' || !basisKnown)) {
       agg.unpriced_calls += Number(r.calls ?? 0);
       unpricedModels.add(modelClass === 'unknown' ? UNKNOWN_MODEL_LABEL : (r.model as string));
     }

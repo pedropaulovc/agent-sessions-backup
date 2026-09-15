@@ -1,3 +1,4 @@
+import { cacheBasisForHarness, type CacheBasis } from '../cache-basis';
 import { detect } from './detect';
 import type { NormalizedSession } from './normalize';
 import { SINGLE_SESSION_HARNESSES, parseObject } from './parse';
@@ -1925,17 +1926,17 @@ async function writeSession(
     // what stops new ones being created in the same state, without making production pay for a
     // 776k-row table rebuild to add a constraint it already has.
     `INSERT INTO usage (session_id, turn_index, ts, model, service_tier, input_tokens, output_tokens, reasoning_tokens,
-                        cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, inference_geo, request_id,
-                        priced_version)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 0)
+                        cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, cache_basis,
+                        inference_geo, request_id, priced_version)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)
      ON CONFLICT (session_id, turn_index) DO UPDATE SET
        ts = excluded.ts, model = excluded.model, service_tier = excluded.service_tier,
        input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens,
        reasoning_tokens = excluded.reasoning_tokens,
        cache_creation_5m_tokens = excluded.cache_creation_5m_tokens,
        cache_creation_1h_tokens = excluded.cache_creation_1h_tokens,
-       cache_read_tokens = excluded.cache_read_tokens, inference_geo = excluded.inference_geo,
-       request_id = excluded.request_id,
+       cache_read_tokens = excluded.cache_read_tokens, cache_basis = excluded.cache_basis,
+       inference_geo = excluded.inference_geo, request_id = excluded.request_id,
        -- A re-parse that CHANGED this turn invalidates its stored cost, and nothing else would
        -- notice. The row is already at the current pricing version, so the pass -- which selects
        -- on priced_version being BELOW the current one -- would skip it forever and it would keep
@@ -2002,6 +2003,7 @@ async function writeSession(
         u.cacheCreation5mTokens,
         u.cacheCreation1hTokens,
         u.cacheReadTokens,
+        u.cacheBasis,
         u.inferenceGeo,
         u.requestId,
       ),
@@ -2386,7 +2388,8 @@ async function retainablePrefix(
     db
       .prepare(
         `SELECT turn_index, ts, model, service_tier, input_tokens, output_tokens, reasoning_tokens,
-                cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, inference_geo, request_id
+                cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, cache_basis,
+                inference_geo, request_id
          FROM usage WHERE session_id = ?1`,
       )
       .bind(s.id),
@@ -2453,6 +2456,7 @@ interface StoredUsage {
   cache_creation_5m_tokens: number | null;
   cache_creation_1h_tokens: number | null;
   cache_read_tokens: number | null;
+  cache_basis: CacheBasis | null;
   inference_geo: string | null;
   request_id: string | null;
 }
@@ -2474,6 +2478,7 @@ function sameUsage(a: StoredUsage, b: PendingUsage): boolean {
     a.cache_creation_5m_tokens === b.cacheCreation5mTokens &&
     a.cache_creation_1h_tokens === b.cacheCreation1hTokens &&
     a.cache_read_tokens === b.cacheReadTokens &&
+    a.cache_basis === b.cacheBasis &&
     a.inference_geo === b.inferenceGeo &&
     a.request_id === b.requestId
   );
@@ -2490,6 +2495,7 @@ interface PendingUsage {
   cacheCreation5mTokens: number | null;
   cacheCreation1hTokens: number | null;
   cacheReadTokens: number | null;
+  cacheBasis: CacheBasis | null;
   inferenceGeo: string | null;
   requestId: string | null;
 }
@@ -2511,6 +2517,7 @@ function buildUsageRows(s: NormalizedSession): PendingUsage[] {
       cacheCreation5mTokens: u.cacheCreation5mTokens ?? null,
       cacheCreation1hTokens: u.cacheCreation1hTokens ?? null,
       cacheReadTokens: u.cacheReadTokens ?? null,
+      cacheBasis: cacheBasisForHarness(s.harness),
       inferenceGeo: u.inferenceGeo ?? null,
       requestId: u.requestId ?? null,
     });

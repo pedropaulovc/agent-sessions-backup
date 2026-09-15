@@ -52,13 +52,18 @@ export interface UsageAggRow extends UsageTokens {
  * but no output rate, an input-only call grouped with an output-bearing one loses its own valid
  * cost. Booleans keep the fan-out bounded, and in practice tiny: a model's calls nearly all
  * share one shape.
+ *
+ * `cache_basis` is also a required split. `USAGE_TOKEN_SUMS` contains nonlinear per-row subset
+ * clamps; if disjoint and subset rows shared a group, one convention's arithmetic would be applied
+ * to the other's rows before `costOfUsage` could distinguish them.
  */
 export const USAGE_SHAPE_SELECT = `
+  u.cache_basis AS cache_basis,
   (COALESCE(u.input_tokens,0) > 0) AS has_input,
   -- Under subset accounting the input rate applies to MAX(0, input - cache_read), not to raw
   -- input, so THAT is the rate-dependent class. A fully-cached call (input == cache_read) needs
-  -- no input rate and stays priceable from the cache-read rate alone; grouping it with a
-  -- partly-fresh call would put positive fresh input in the aggregate and discard its valid cost.
+  -- no input rate and stays priceable from the cache-read rate alone; grouping it with a partly-
+  -- fresh call would put positive fresh input in the aggregate and discard its valid cost.
   (MAX(0, MAX(0, COALESCE(u.input_tokens,0)) - MAX(0, COALESCE(u.cache_read_tokens,0))) > 0)
     AS has_fresh_input,
   (COALESCE(u.output_tokens,0) > 0) AS has_output,
@@ -67,8 +72,11 @@ export const USAGE_SHAPE_SELECT = `
   (COALESCE(u.cache_creation_1h_tokens,0) > 0) AS has_w1h`;
 
 /** The shape columns as a GROUP BY list. Must stay in lockstep with USAGE_SHAPE_SELECT — a
- * class selected but not grouped silently re-mixes the shapes the split exists to separate. */
-export const USAGE_SHAPE_GROUP_BY = 'has_input, has_fresh_input, has_output, has_cache_read, has_w5, has_w1h';
+ * class selected but not grouped silently re-mixes the shapes the split exists to separate.
+ * Keep the basis as a raw column: the token-sum fragment folds nonlinear clamps per row, so a
+ * mixed-basis group would apply one convention's arithmetic to the other convention's rows. */
+export const USAGE_SHAPE_GROUP_BY =
+  'u.cache_basis, has_input, has_fresh_input, has_output, has_cache_read, has_w5, has_w1h';
 
 /** Token sums for a group, with both nonlinear per-row clamps pre-applied.
  *

@@ -347,6 +347,94 @@ test('0028 backfills per-session cost from the usage already stored', async () =
   }
 });
 
+test('0029 backfills cache basis from the transcript harness and leaves unknown sources unclassified', async () => {
+  const fixture = await loadFixture();
+  const database = createDatabase();
+  try {
+    applyPending(database, fixture, 28);
+    database.exec(`
+      INSERT INTO sessions (session_id, harness) VALUES
+        ('basis-codex', 'codex'),
+        ('basis-omp', 'omp'),
+        ('basis-claude', 'claude-code'),
+        ('basis-unknown', 'future-harness');
+      INSERT INTO usage (session_id, turn_index) VALUES
+        ('basis-codex', 1),
+        ('basis-omp', 1),
+        ('basis-claude', 1),
+        ('basis-unknown', 1);
+    `);
+
+    applyPending(database, fixture, 29);
+    const rows = database
+      .prepare('SELECT session_id, cache_basis FROM usage ORDER BY session_id')
+      .all()
+      .map((row) => ({ ...row }));
+    assert.deepEqual(rows, [
+      { session_id: 'basis-claude', cache_basis: 'disjoint' },
+      { session_id: 'basis-codex', cache_basis: 'subset' },
+      { session_id: 'basis-omp', cache_basis: 'disjoint' },
+      { session_id: 'basis-unknown', cache_basis: null },
+    ]);
+    assert.throws(
+      () => database.prepare("UPDATE usage SET cache_basis = 'guessed' WHERE session_id = 'basis-unknown'").run(),
+      /constraint/i,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test('0030 removes provider cache accounting without changing the remaining price catalog row', async () => {
+  const fixture = await loadFixture();
+  const database = createDatabase();
+  try {
+    applyPending(database, fixture, 29);
+    database.prepare(`
+      INSERT INTO model_prices
+        (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
+         cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
+         max_input_tokens, max_output_tokens, cache_accounting, source, fetched_at)
+      VALUES
+        ('preserved-model', '2026-09-01', 'upstream-model', 'openai', 1, 2, 3, 4, 5, 6, 7,
+         8000, 2000, 'subset', 'test', '2026-09-15T00:00:00Z')
+    `).run();
+
+    applyPending(database, fixture, 30);
+    const columns = database.prepare("SELECT name FROM pragma_table_info('model_prices') ORDER BY cid").all();
+    assert.equal(columns.some((column) => column.name === 'cache_accounting'), false);
+    assert.deepEqual(
+      { ...database.prepare("SELECT * FROM model_prices WHERE model = 'preserved-model'").get() },
+      {
+        model: 'preserved-model',
+        effective_from: '2026-09-01',
+        litellm_key: 'upstream-model',
+        provider: 'openai',
+        input_cost: 1,
+        output_cost: 2,
+        cache_read_cost: 3,
+        cache_write_5m_cost: 4,
+        cache_write_1h_cost: 5,
+        input_cost_batch: 6,
+        output_cost_batch: 7,
+        max_input_tokens: 8000,
+        max_output_tokens: 2000,
+        source: 'test',
+        fetched_at: '2026-09-15T00:00:00Z',
+      },
+    );
+    assert.deepEqual(
+      database
+        .prepare("SELECT name FROM pragma_index_list('model_prices') WHERE name = 'model_prices_model'")
+        .all()
+        .map((row) => ({ ...row })),
+      [{ name: 'model_prices_model' }],
+    );
+  } finally {
+    database.close();
+  }
+});
+
 test('migration runner applies once, measures verify state, and trusts the protected-main manifest for production', async (context) => {
   const fixture = await loadFixture();
   const database = createDatabase();
