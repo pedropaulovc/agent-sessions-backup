@@ -8,21 +8,62 @@ import {
   selectedValues,
   sessionDurationSql,
   subagentSessionSql,
+  SUBTREE_COST_ALIAS,
   totalTokensSql,
 } from '../session-filters';
 import { sessionDisplayTitle } from '../session-title';
+import { subtreeCostCte } from '../session-cost';
 
 export const DEFAULT_RESULT_PAGE_SIZE = 100;
+
+/** The rolled-up cost the `cost` sort orders by, joined in only for that sort.
+ *
+ * The other sorts order by an expression over the session row this query already joins. Cost
+ * cannot: the figure the list shows includes a session's subagent DESCENDANTS, which lives in the
+ * recursive CTE in src/session-cost.ts rather than in a column. Its roots are every session the
+ * caller's filter matches — the same clause and the same bound parameters as the outer WHERE,
+ * reused rather than re-bound — so an unfiltered search rolls up `sessions` and nothing else. It
+ * never reads `usage`, which is the point of storing the per-session subtotal on the row.
+ *
+ * Rooted at `sessions`, NOT at the sessions the FTS query hits, even though the hit set is the
+ * smaller root set for a selective term. Deriving the roots from `blocks_fts` would have to
+ * DISTINCT the term's whole postings list — unbounded by the page's LIMIT, because the ordering
+ * depends on every hit session's cost — and `blocks` is the largest table in the schema. On the
+ * sanitized local corpus (15 sessions, 6,351 blocks) the term `result` matches 4,450 blocks in 10
+ * sessions: ~8,900 rows read to name 10 roots, against 15 to name every root there is. The
+ * sessions-rooted form has a ceiling that does not move with the query; the hit-rooted one is a
+ * scan whose size the caller chooses.
+ */
+function costRollupCte(where: string): string {
+  return `WITH RECURSIVE ${subtreeCostCte(`SELECT s.session_id FROM sessions s WHERE 1 = 1 ${where}`)} `;
+}
+
+function costRollupJoin(): string {
+  return `JOIN session_subtree_cost ${SUBTREE_COST_ALIAS} ON ${SUBTREE_COST_ALIAS}.session_id = s.session_id`;
+}
 
 function searchOrder(sort: string | null): string {
   if (sort === 'session_time') return `ORDER BY ${sessionDurationSql('s')} DESC, rank, b.id`;
   if (sort === 'total_tokens') return `ORDER BY ${totalTokensSql('s')} DESC, rank, b.id`;
+  // Unpriced subtrees last: sorting "no known cost" as if it were $0 would bury every session we
+  // could not price at the cheap end of a cost ranking. `rank` still breaks ties, so hits within
+  // one session stay in relevance order.
+  if (sort === 'cost') return 'ORDER BY (c.usd IS NULL) ASC, c.usd DESC, rank, b.id';
   return 'ORDER BY rank, b.id';
 }
 
 /** @internal Exported so the query-plan regression exercises the exact production query. */
-export function searchHitsSql(where: string, sort: string | null, limit: number, offset: number): string {
-  return `SELECT b.session_id, b.turn_index, b.block_index, b.role, b.btype, b.tool_name, b.ts,
+export function searchHitsSql(
+  where: string,
+  costWhere: string,
+  sort: string | null,
+  limit: number,
+  offset: number,
+): string {
+  // The rollup is joined for the cost sort and for a selected cost band; `where` never contains
+  // the band, so the CTE's roots stay independent of what the band filters.
+  const cost = sort === 'cost' || costWhere !== '';
+  return `${cost ? costRollupCte(where) : ''}SELECT b.session_id, b.turn_index, b.block_index, b.role, b.btype, b.tool_name, b.ts,
                  snippet(blocks_fts, 0, '<mark>', '</mark>', '…', 16) AS snip,
                  bm25(blocks_fts) AS rank,
                  s.harness, s.machine_id, s.os, s.cwd, s.repo_url, s.primary_model, ${subagentSessionSql('s')} AS subagent,
@@ -31,7 +72,8 @@ export function searchHitsSql(where: string, sort: string | null, limit: number,
           FROM blocks_fts
           JOIN blocks b ON b.id = blocks_fts.rowid
           JOIN sessions s ON s.session_id = b.session_id
-          WHERE blocks_fts MATCH ?1 ${where}
+          ${cost ? costRollupJoin() : ''}
+          WHERE blocks_fts MATCH ?1 ${where} ${costWhere ? `AND ${costWhere}` : ''}
           ${searchOrder(sort)} LIMIT ${limit + 1} OFFSET ${offset}`;
 }
 
@@ -73,6 +115,7 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   const sessionFilter = buildSessionFilterSql(p, 's', 2);
   const binds = sessionFilter.binds;
   const where = sessionFilter.clause ? `AND ${sessionFilter.clause}` : '';
+  const costWhere = sessionFilter.costClause;
 
   if (!q) return { hits: [], error: 'missing_q' };
 
@@ -117,7 +160,7 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   const run = async (match: string) => {
     try {
       return await env.DB.prepare(
-        searchHitsSql(where, p.get('sort'), limit, offset),
+        searchHitsSql(where, costWhere, p.get('sort'), limit, offset),
       )
         .bind(match, ...binds)
         .all();
@@ -184,10 +227,16 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
       const filter = buildSessionFilterSql(p, 's', 2, definition.key);
       const filtered = filter.clause ? ` AND ${filter.clause}` : '';
       const expression = facetExpressionSql(definition, 's');
+      // Same rule as the list page: the cost facet needs the rollup to have a value at all, and
+      // every other facet needs it to honour a cost band the caller already selected.
+      const rollup = definition.kind === 'cost' || filter.costClause !== '';
+      const banded = filter.costClause ? ` AND ${filter.costClause}` : '';
       return env.DB.prepare(
+        `${rollup ? costRollupCte(filter.clause ? `AND ${filter.clause}` : '') : ''}` +
         `SELECT ${expression} AS v, COUNT(DISTINCT s.session_id) AS n
          FROM blocks_fts JOIN blocks b ON b.id = blocks_fts.rowid JOIN sessions s ON s.session_id = b.session_id
-         WHERE blocks_fts MATCH ?1${filtered} AND ${expression} IS NOT NULL
+         ${rollup ? costRollupJoin() : ''}
+         WHERE blocks_fts MATCH ?1${filtered}${banded} AND ${expression} IS NOT NULL
          GROUP BY v ORDER BY ${facetOrderSql(definition)} LIMIT ${definition.valueLimit ?? 20}`,
       ).bind(effectiveMatch, ...filter.binds);
     });

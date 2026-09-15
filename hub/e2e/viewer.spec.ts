@@ -138,6 +138,57 @@ test.describe('synthetic sessions viewer', () => {
     await expect(starToggle).toHaveAttribute('aria-pressed', 'false');
   });
 
+  test('rolls subagent cost into the session list and breaks it down by model', async ({ page, appURL }) => {
+    // The list figure covers the whole subtree, so it must exceed what the parent spent on its
+    // own turns; the coverage caveat and the subagent count live in the chip's tooltip and on the
+    // session page, not in the row.
+    // Scoped to the fixture machine so a developer's own imported corpus cannot push the fixture
+    // off the first page of a cost-ranked list.
+    await page.goto(appURL(`/?sort=cost&machine=${encodeURIComponent(fixture.machineId)}`));
+    const row = page.locator('.hit', { hasText: fixture.costParentTitle }).first();
+    await expect(row).toBeVisible();
+    const subagents = fixture.costSubagentSessionIds.length;
+    await expect(row).toContainText(fixture.costSubtreeAmount);
+    await expect(row).not.toContainText('incl.');
+
+    await row.getByRole('link', { name: fixture.costParentTitle }).click();
+    await expect(page).toHaveURL((url) => url.pathname === `/s/${fixture.costParentSessionId}`);
+    await expect(page.locator('.sesshead')).toContainText(
+      `cost: ${fixture.costSubtreeLabel} · incl. ${subagents} subagents`,
+    );
+
+    // Every child is linked with its own cost, and the unpriced one says so instead of showing $0.
+    const banner = page.locator('.banner', { hasText: 'Subagents (' });
+    await expect(banner).toContainText(`Subagents (${subagents})`);
+    await expect(banner).toContainText('unknown');
+
+    const panel = page.locator('details.session-cost');
+    await expect(panel).toContainText(`${fixture.costParentOwnLabel} this session`);
+    await panel.locator('summary').click();
+    const modelRow = panel.locator('tbody tr', { hasText: fixture.costParentModel });
+    await expect(modelRow).toContainText(fixture.costParentOwnLabel);
+    // Claude reports cache reads BESIDE the input count, so the hit rate divides by their sum
+    // (400k of 120k + 400k) — the check that the accounting basis reached the denominator.
+    await expect(modelRow).toContainText('76.9%');
+    // The footer is the parent's own spend, which excludes the subagents rolled into the header.
+    await expect(panel.locator('tfoot')).toContainText(fixture.costParentOwnLabel);
+  });
+
+  test('narrows the list to a cost band from the sidebar facet', async ({ page, appURL }) => {
+    await page.goto(appURL(`/?machine=${encodeURIComponent(fixture.machineId)}`));
+    // The fixture's $2.15 subtree puts it in the $1–$10 band; the unpriced sidecars have no band
+    // at all, which is why selecting one must not bring them back.
+    const band = page.locator('.sidebar li', { hasText: fixture.costBandLabel }).first();
+    await expect(band).toBeVisible();
+    await band.getByRole('link').click();
+
+    await expect(page).toHaveURL((url) => url.searchParams.get('cost') === fixture.costBandValue);
+    const row = page.locator('.hit', { hasText: fixture.costParentTitle }).first();
+    await expect(row).toContainText(fixture.costSubtreeAmount);
+    // Everything still listed carries a dollar figure: a session with no known cost has no band.
+    for (const hit of await page.locator('.hit').all()) await expect(hit).toContainText('$');
+  });
+
   test('loads inline blobs and captured assets as browser subresources', async ({ page, appURL }) => {
     await page.goto(appURL(`/s/${fixture.sessionId}?page=1`));
 

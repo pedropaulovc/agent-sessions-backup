@@ -10,4 +10,13 @@ export const SYNTHETIC_FIXTURE = Object.freeze({
   machineId: SYNTHETIC_EXPECTATIONS.machine,
   skillName: SYNTHETIC_EXPECTATIONS.skillName,
   skillSourceMarker: SYNTHETIC_EXPECTATIONS.skillSourceMarker,
+  costParentSessionId: SYNTHETIC_EXPECTATIONS.costParentSessionId,
+  costParentTitle: SYNTHETIC_EXPECTATIONS.costParentTitle,
+  costParentModel: SYNTHETIC_EXPECTATIONS.costParentModel,
+  costSubagentSessionIds: SYNTHETIC_EXPECTATIONS.costSubagentSessionIds,
+  costSubtreeLabel: SYNTHETIC_EXPECTATIONS.costSubtreeLabel,
+  costSubtreeAmount: SYNTHETIC_EXPECTATIONS.costSubtreeAmount,
+  costBandValue: SYNTHETIC_EXPECTATIONS.costBandValue,
+  costBandLabel: SYNTHETIC_EXPECTATIONS.costBandLabel,
+  costParentOwnLabel: SYNTHETIC_EXPECTATIONS.costParentOwnLabel,
 });

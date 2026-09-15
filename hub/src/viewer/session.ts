@@ -8,10 +8,20 @@ import { parseCodex } from '../ingest/parsers/codex';
 import { parseOmp } from '../ingest/parsers/omp';
 import { parseConversationById } from '../ingest/parsers/export-inbox';
 import { parsePromptLog } from '../ingest/parsers/history';
+import {
+  SESSION_COST_COLUMNS,
+  sessionModelCosts,
+  sessionSubtreeCosts,
+  type CacheBasis,
+  type CostTotals,
+  type ModelCost,
+  type SubtreeCost,
+} from '../session-cost';
 import { computeFirstInteractionTitle, sessionDisplayTitle, titleSkippedTurnIndices, type TitleBlock } from '../session-title';
 import { turnKeyOf } from '../turn-key';
 import { signExternalAssetUrl } from './assets';
-import { esc, pageFoot, pageHead, q } from './layout';
+import { costCoverage, costLabel, fmtInt, fmtTokens, knownCost } from './format';
+import { esc, pageFoot, pageHead, q, tableScroll } from './layout';
 import { buildSessionTrace, toolKey } from './trace-data';
 import { renderTrace } from './trace';
 
@@ -34,10 +44,9 @@ interface SessionMeta {
   parent_session_id: string | null;
   is_sidechain: number;
   turn_count: number | null;
-  tokens_in: number | null;
-  tokens_out: number | null;
-  tokens_reasoning: number | null;
-  tokens_cached: number | null;
+  cost_usd: number | null;
+  cost_calls: number;
+  cost_priced_calls: number;
   index_state: string;
   updated_at: string | null;
 }
@@ -55,7 +64,7 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
   const meta = await env.DB.prepare(
     `SELECT session_id, harness, machine_id, os, cwd, repo_url, git_branch, primary_model,
             first_interaction_title, title, started_at, ended_at, updated_at,
-            parent_session_id, is_sidechain, turn_count, tokens_in, tokens_out, tokens_reasoning, tokens_cached, index_state
+            parent_session_id, is_sidechain, turn_count, index_state, ${SESSION_COST_COLUMNS}
      FROM sessions WHERE session_id = ?1`,
   )
     .bind(sessionId)
@@ -88,6 +97,13 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
   )
     .bind(sessionId)
     .all<{ session_id: string; title: string | null }>();
+  // Header figure and per-child chips in ONE walk: both are subagent-inclusive, and the roots are
+  // the rendered page's own session plus its direct children, so the id set is bounded by the page.
+  const subtreeCosts = await sessionSubtreeCosts(env.DB, [
+    sessionId,
+    ...children.results.map((c) => c.session_id),
+  ]);
+  const modelCosts = await sessionModelCosts(env.DB, sessionId);
   const starredKeys = new Set(
     (
       await env.DB.prepare('SELECT turn_key FROM starred_turns WHERE session_id = ?1')
@@ -145,10 +161,15 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
 
   const head =
     pageHead(displayTitle, undefined) +
-    renderHeader(meta, displayTitle, children.results, view, url, file, env) +
+    renderHeader(meta, displayTitle, children.results, subtreeCosts, view, url, file, env) +
     (view === 'effective'
       ? `<p class="muted small">Effective view — replaced/abandoned turns hidden. <a href="${esc(withView(url, 'chronological'))}">Show all</a></p>`
-      : '');
+      : '') +
+    renderModelCosts(modelCosts, {
+      usd: meta.cost_usd,
+      calls: meta.cost_calls,
+      pricedCalls: meta.cost_priced_calls,
+    });
 
   const encoder = new TextEncoder();
   const stream = new ReadableStream<Uint8Array>({
@@ -571,6 +592,7 @@ function renderHeader(
   meta: SessionMeta,
   displayTitle: string,
   children: Array<{ session_id: string; title: string | null }>,
+  subtreeCosts: Map<string, SubtreeCost>,
   view: View,
   url: URL,
   file: SessionFile | null,
@@ -583,8 +605,20 @@ function renderHeader(
     );
   }
   if (children.length) {
+    // Each child carries its OWN subagent-inclusive cost, which is what makes the header's rolled-up
+    // figure checkable: the parent's total is its own spend plus exactly these chips.
     const links = children
-      .map((c) => `<a href="/s/${q(c.session_id)}">${esc(c.title || c.session_id)}</a>`)
+      .map((c) => {
+        const link = `<a href="/s/${q(c.session_id)}">${esc(c.title || c.session_id)}</a>`;
+        const cost = subtreeCosts.get(c.session_id);
+        if (!cost) return link;
+        const label = costLabel(cost);
+        if (label.state === 'none') return link;
+        return (
+          `${link} <span class="chip" title="${costCoverage(cost.pricedCalls, cost.calls)} · ` +
+          `${subagentCount(cost.subagentSessions)}">${label.state === 'unknown' ? 'unknown' : label.text}</span>`
+        );
+      })
       .join(' · ');
     banners.push(`<div class="banner">Subagents (${children.length}): ${links}</div>`);
   }
@@ -599,11 +633,16 @@ function renderHeader(
   if (meta.repo_url) kv.push(`<span class="muted small">${esc(meta.repo_url)}${meta.git_branch ? ` @ ${esc(meta.git_branch)}` : ''}</span>`);
   if (meta.started_at) kv.push(`<span class="muted small">${esc(meta.started_at)}</span>`);
 
-  const tokens =
-    `<span class="muted small">tokens: ${fmtNum(meta.tokens_in)} in · ${fmtNum(meta.tokens_out)} out` +
-    (meta.tokens_reasoning ? ` · ${fmtNum(meta.tokens_reasoning)} reasoning` : '') +
-    (meta.tokens_cached ? ` · ${fmtNum(meta.tokens_cached)} cached` : '') +
-    `</span>`;
+  // Cost, not tokens: what a session cost is the question the archive is actually asked, and the
+  // token counters this line used to show are now in the per-model table below, split by class
+  // instead of pre-summed across incompatible cache conventions.
+  const own = subtreeCosts.get(meta.session_id);
+  const ownLabel = own ? costLabel(own) : { state: 'none' as const };
+  const cost = own && ownLabel.state !== 'none'
+    ? `<span class="muted small" title="${costCoverage(own.pricedCalls, own.calls)} · ${subagentCount(own.subagentSessions)}">` +
+      `cost: ${ownLabel.state === 'unknown' ? 'unknown' : ownLabel.text}` +
+      `${own.subagentSessions > 0 ? ` · incl. ${subagentCount(own.subagentSessions)}` : ''}</span>`
+    : '';
 
   const viewToggle =
     view === 'chronological'
@@ -613,13 +652,99 @@ function renderHeader(
     ? `<a href="${esc(r2SessionUrl(meta.harness, file.r2_key, env.R2_DASHBOARD_BASE_URL))}" target="_blank" rel="noopener noreferrer">Session files in R2</a>`
     : '';
   const exportLink = `<a href="/s/${q(meta.session_id)}/export.zip" download>Export zip</a>`;
+  // Joined rather than concatenated: a session with no usage records contributes no cost item, and
+  // a hard-coded separator would leave the line starting with a stray bullet.
+  const actions = [cost, viewToggle, filesLink, exportLink].filter((part) => part !== '');
 
   return (
     banners.join('') +
     `<div class="sesshead"><h2 style="margin:0">${esc(displayTitle)}</h2>` +
     `<div class="kv">${kv.join('')}</div>` +
-    `<div class="kv">${tokens} · ${viewToggle}${filesLink ? ` · ${filesLink}` : ''} · ${exportLink}</div></div>`
+    `<div class="kv">${actions.join(' · ')}</div></div>`
   );
+}
+
+function subagentCount(n: number): string {
+  return `${fmtInt(n)} subagent${n === 1 ? '' : 's'}`;
+}
+
+/** What a cached share is a share OF, per accounting convention.
+ *
+ * The same two counters imply different prompt totals under the two conventions, so the number is
+ * meaningless without this note; wording follows `CacheBasis` in src/session-cost.ts. */
+const CACHE_BASIS_NOTE: Record<CacheBasis, string> = {
+  subset: 'Subset accounting (OpenAI family): cached tokens are reported as PART OF input_tokens, so this is cache read ÷ input.',
+  disjoint: 'Disjoint accounting (Anthropic): cached tokens are reported IN ADDITION TO input_tokens, so this is cache read ÷ (input + cache read).',
+  unknown: 'No single published cache-accounting convention for this model — its price snapshots disagree, or it has none — so the cached share is left uncomputed rather than guessed: the same counters would differ by roughly the cache ratio itself under the two conventions.',
+};
+
+/** Per-model cost and tokens for this session, collapsed like the activity trace above it.
+ *
+ * Input and cache read stay in separate columns and are never added up: under subset accounting the
+ * cached tokens are already inside input, so a "total tokens" column would double-count them for
+ * half the models on the page and not the other half. The 5m and 1h cache writes ARE summed — those
+ * two are disjoint from each other by construction — with the split kept in the cell's title. */
+function renderModelCosts(models: readonly ModelCost[], own: CostTotals): string {
+  if (!models.length) return '';
+  const sums = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 };
+  const rows = models
+    .map((m) => {
+      const cacheWrite = m.tokens.cacheWrite5m + m.tokens.cacheWrite1h;
+      sums.input += m.tokens.input;
+      sums.output += m.tokens.output;
+      sums.reasoning += m.tokens.reasoning;
+      sums.cacheRead += m.tokens.cacheRead;
+      sums.cacheWrite += cacheWrite;
+      return (
+        `<tr><th scope="row" class="session-cost-model">${esc(m.model)}` +
+        `<span class="session-cost-sub">${costCoverage(m.pricedCalls, m.calls)}</span></th>` +
+        `<td class="num">${fmtInt(m.calls)}</td>` +
+        `<td class="num">${knownCost(m.usd, m.pricedCalls, m.calls)}</td>` +
+        tokenCell(m.tokens.input) +
+        tokenCell(m.tokens.output) +
+        tokenCell(m.tokens.reasoning) +
+        tokenCell(m.tokens.cacheRead) +
+        `<td class="num" title="${fmtInt(m.tokens.cacheWrite5m)} 5m + ${fmtInt(m.tokens.cacheWrite1h)} 1h">${fmtTokens(cacheWrite)}</td>` +
+        `<td class="num" title="${CACHE_BASIS_NOTE[m.basis]}">` +
+        `${m.cacheHitRate === null ? '—' : `${(m.cacheHitRate * 100).toFixed(1)}%`}</td></tr>`
+      );
+    })
+    .join('');
+  // The footer is the session's OWN stored subtotal, not the sum of the rows' dollars: they agree,
+  // and reading the stored column is what makes a disagreement visible instead of invisible.
+  const footer =
+    `<tr><th scope="row" class="session-cost-model">This session only<span class="session-cost-sub">` +
+    `excludes subagents · ${costCoverage(own.pricedCalls, own.calls)}</span></th>` +
+    `<td class="num">${fmtInt(own.calls)}</td>` +
+    `<td class="num">${knownCost(own.usd, own.pricedCalls, own.calls)}</td>` +
+    tokenCell(sums.input) +
+    tokenCell(sums.output) +
+    tokenCell(sums.reasoning) +
+    tokenCell(sums.cacheRead) +
+    tokenCell(sums.cacheWrite) +
+    `<td class="num" title="A session-wide cached share would average models billed under different cache-accounting conventions, which is why it is per model only.">—</td></tr>`;
+  return (
+    `<details class="session-cost"><summary><strong>Cost by model</strong> ` +
+    `<span class="session-cost-summary">${fmtInt(models.length)} model${models.length === 1 ? '' : 's'} · ` +
+    `${knownCost(own.usd, own.pricedCalls, own.calls)} this session</span></summary>` +
+    `<div class="session-cost-body"><p class="session-cost-note">Whole session, every page. Input and cache read are ` +
+    `separate counters and are deliberately not summed — under subset accounting the cached tokens are already ` +
+    `inside input. Cache write is 5m + 1h. Subagent sessions are counted in the header figure and listed above, ` +
+    `not here.</p>` +
+    tableScroll(
+      'Cost by model',
+      `<table class="chart"><thead><tr><th>Model / coverage</th><th class="num">Calls</th><th class="num">Cost</th>` +
+        `<th class="num">Input</th><th class="num">Output</th><th class="num">Reasoning</th>` +
+        `<th class="num">Cache read</th><th class="num">Cache write</th><th class="num">Cache hit rate</th></tr></thead>` +
+        `<tbody>${rows}</tbody><tfoot>${footer}</tfoot></table>`,
+    ) +
+    `</div></details>`
+  );
+}
+
+/** Compact in the cell, exact in the title: a token count is scanned far more often than it is read. */
+function tokenCell(n: number): string {
+  return `<td class="num" title="${fmtInt(n)}">${fmtTokens(n)}</td>`;
 }
 
 function renderPager(url: URL, page: number, totalPages: number): string {
@@ -688,11 +813,6 @@ function firstJsonProperty(text: string): string | undefined {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
-
-function fmtNum(n: number | null): string {
-  return (n ?? 0).toLocaleString('en-US');
-}
-
 
 /**
  * Cache-busting version token for blob URLs: first 12 hex of the canonical file's content hash.

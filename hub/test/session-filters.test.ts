@@ -49,10 +49,11 @@ describe('session multi-value filters', () => {
     const absent = buildSessionFilterSql(new URLSearchParams(), 's');
     expect(absent).toEqual({
       clause: "(CASE WHEN s.parent_session_id IS NOT NULL OR COALESCE(s.is_sidechain, 0) = 1 THEN 'yes' ELSE 'no' END) IN (SELECT value FROM json_each(?1))",
+      costClause: '',
       binds: ['["no"]'],
     });
-    expect(buildSessionFilterSql(new URLSearchParams(), 's', 1, 'subagent')).toEqual({ clause: '', binds: [] });
-    expect(searchHitsSql('', null, 20, 0)).toContain(
+    expect(buildSessionFilterSql(new URLSearchParams(), 's', 1, 'subagent')).toEqual({ clause: '', costClause: '', binds: [] });
+    expect(searchHitsSql('', '', null, 20, 0)).toContain(
       "(CASE WHEN s.parent_session_id IS NOT NULL OR COALESCE(s.is_sidechain, 0) = 1 THEN 'yes' ELSE 'no' END) AS subagent",
     );
   });
@@ -64,6 +65,7 @@ describe('session multi-value filters', () => {
     expect(selectedValues(params, subagent)).toEqual(['yes']);
     expect(buildSessionFilterSql(params, 's')).toEqual({
       clause: "(CASE WHEN s.parent_session_id IS NOT NULL OR COALESCE(s.is_sidechain, 0) = 1 THEN 'yes' ELSE 'no' END) IN (SELECT value FROM json_each(?1))",
+      costClause: '',
       binds: ['["yes"]'],
     });
 
@@ -161,6 +163,7 @@ describe('session multi-value filters', () => {
     expect(filter.binds).toEqual(['["1"]', '["no"]']);
     expect(buildSessionFilterSql(params, 's', 1, 'has_star')).toEqual({
       clause: "(CASE WHEN s.parent_session_id IS NOT NULL OR COALESCE(s.is_sidechain, 0) = 1 THEN 'yes' ELSE 'no' END) IN (SELECT value FROM json_each(?1))",
+      costClause: '',
       binds: ['["no"]'],
     });
   });

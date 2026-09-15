@@ -31,6 +31,7 @@
  * not depend on it — the WHERE clause above is what guarantees that.
  */
 import { classifyModel, costOfUsage, loadPrices, type CostByClass, type ModelPrice } from './pricing';
+import { refreshSessionCostStatements } from './session-cost';
 import {
   priceEpochExpr,
   priceForGroup,
@@ -82,6 +83,8 @@ export interface PricingPassResult {
 
 interface UnpricedRow extends UsageAggRow {
   id: number;
+  /** Which session's stored cost subtotal a successful write invalidates. */
+  session_id: string;
   model: string | null;
   /** Raw column values as read, carried only so the write can compare-and-set on them. */
   cas_model: string | null;
@@ -109,11 +112,20 @@ export async function priceUsage(
   const prices = await loadPrices(db);
 
   const result: PricingPassResult = { examined: 0, priced: 0, unpriceable: 0, superseded: 0, more: false };
+  // `ranDry` is set when a read came back short. Every exit from the loop below must reach the
+  // `more` derivation, so the two "ran out of work" cases are `break`s that record WHY here
+  // rather than early returns — keeping `more` exact: true only when the ROW BUDGET stopped the
+  // pass, never when the query ran dry.
+  let ranDry = false;
 
-  while (result.examined < maxRows) {
+  while (!ranDry && result.examined < maxRows) {
     const take = Math.min(readBatch, maxRows - result.examined);
     const rows = await selectUnpriced(db, prices, startedAt, opts.sessionId, take);
-    if (!rows.length) return result;
+    // A short read means the query ran out of rows, not that the budget ran out. Distinguishing
+    // them is the whole value of `more`: a caller that re-runs on `more` would otherwise loop
+    // forever against a corpus that is fully priced.
+    ranDry = rows.length < take;
+    if (!rows.length) break;
 
     const writes = rows.map((r) => {
       result.examined++;
@@ -171,12 +183,21 @@ export async function priceUsage(
           r.cas_w5 ?? 0,
           r.cas_w1h ?? 0,
         );
-      return { stmt, bucket };
+      return { stmt, bucket, sessionId: r.session_id };
     });
 
     for (let i = 0; i < writes.length; i += PRICING_WRITE_BATCH) {
       const slice = writes.slice(i, i + PRICING_WRITE_BATCH);
-      const res = await db.batch(slice.map((w) => w.stmt));
+      // The cost refresh rides IN this batch, after the price writes it summarises. D1 runs a
+      // batch as one transaction, so either the row prices and the session's subtotal both land
+      // or neither does. Issued as a separate batch after the loop, a failed refresh would leave
+      // rows stamped with the current `priced_version` — which `selectUnpriced` skips forever —
+      // pointing at a session still displaying its pre-pricing subtotal, and the scheduled caller
+      // only logs the error. Every session in the slice is refreshed, including ones whose CAS
+      // lost: the statement recomputes from the rows as they now are, so a re-parse that beat us
+      // is reflected rather than assumed away.
+      const refreshes = refreshSessionCostStatements(db, slice.map((w) => w.sessionId));
+      const res = await db.batch([...slice.map((w) => w.stmt), ...refreshes]);
       // A zero-change UPDATE is the compare-and-set losing to a concurrent re-parse. Reported
       // rather than swallowed: the row's bucket was incremented optimistically above, and leaving
       // it there would claim work the database did not do.
@@ -185,20 +206,17 @@ export async function priceUsage(
       // batch mixes priceable and unpriceable rows. Always decrementing `priced` would, when the
       // superseded row was an unpriceable one, take the count away from a different row that was
       // written successfully — under-reporting real work while still claiming the failed one.
-      res.forEach((r, j) => {
+      // The trailing refresh results belong to no usage row, hence the slice bound.
+      res.slice(0, slice.length).forEach((r, j) => {
         if ((r.meta?.changes ?? 0) !== 0) return;
         result.superseded++;
         const bucket = slice[j]!.bucket;
         result[bucket] = Math.max(0, result[bucket] - 1);
       });
     }
-    // A short read means the query ran out of rows, not that the budget ran out. Distinguishing
-    // them is the whole value of `more`: a caller that re-runs on `more` would otherwise loop
-    // forever against a corpus that is fully priced.
-    if (rows.length < take) return result;
   }
 
-  result.more = true;
+  result.more = !ranDry;
   return result;
 }
 
@@ -265,7 +283,7 @@ async function selectUnpriced(
   // attempted this pass. See the module comment.
   const rows = await db
     .prepare(
-      `SELECT u.id AS id, u.model AS model, ${priceEpochExpr(prices)} AS epoch,
+      `SELECT u.id AS id, u.session_id AS session_id, u.model AS model, ${priceEpochExpr(prices)} AS epoch,
               u.model AS cas_model,
               COALESCE(u.input_tokens,0) AS cas_input, COALESCE(u.output_tokens,0) AS cas_output,
               COALESCE(u.cache_read_tokens,0) AS cas_cache_read,
@@ -274,7 +292,7 @@ async function selectUnpriced(
               ${USAGE_SHAPE_SELECT}, ${USAGE_TOKEN_SUMS}
          FROM usage u
         WHERE u.priced_version < ?2 AND (u.priced_at IS NULL OR u.priced_at < ?1) ${scope}
-        GROUP BY u.id, u.model, epoch, ${USAGE_SHAPE_GROUP_BY}
+        GROUP BY u.id, u.session_id, u.model, epoch, ${USAGE_SHAPE_GROUP_BY}
         ORDER BY u.priced_at, u.id
         LIMIT ${limit}`,
     )

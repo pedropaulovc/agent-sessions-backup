@@ -110,6 +110,24 @@ describe('ingest pipeline end-to-end', () => {
     expect(usage!.n).toBe(2); // two assistant turns
   });
 
+  it('stores a cost subtotal that agrees with the usage rows it was written alongside', async () => {
+    // The list sorts by `sessions.cost_usd` and never touches `usage`, so a subtotal the write path
+    // forgot to fill leaves every session at "no usage" forever — the columns default to 0/NULL and
+    // nothing but the ingest write and the pricing pass ever revisit them.
+    const stored = await testEnv.DB.prepare('SELECT cost_usd, cost_calls, cost_priced_calls FROM sessions WHERE session_id = ?1')
+      .bind(CC_SESSION_ID)
+      .first<{ cost_usd: number | null; cost_calls: number; cost_priced_calls: number }>();
+    const truth = await testEnv.DB.prepare(
+      'SELECT SUM(usd) AS usd, COUNT(*) AS calls, COUNT(usd) AS priced FROM usage WHERE session_id = ?1',
+    )
+      .bind(CC_SESSION_ID)
+      .first<{ usd: number | null; calls: number; priced: number }>();
+    expect(truth?.calls, 'the fixture stopped carrying usage, so this asserts nothing').toBe(2);
+    expect(stored?.cost_calls).toBe(truth?.calls);
+    expect(stored?.cost_priced_calls).toBe(truth?.priced);
+    expect(stored?.cost_usd).toBe(truth?.usd);
+  });
+
   it('finds tool_result text through full-text search with snippets and facets', async () => {
     const res = await SELF.fetch(`${API}/api/v1/search?q=gallium&facets=1`, {
       headers: { 'x-dev-machine': 'testbox-wsl' },
@@ -731,6 +749,12 @@ describe('a canonical file reparsed to zero turns clears the stale index and rec
     });
     const bodyBefore = (await searchBefore.json()) as { hits: Array<{ session_id: string }> };
     expect(bodyBefore.hits.some((h) => h.session_id === SESSION_ID)).toBe(true);
+    // A's one assistant turn is a usage row, and the write path recorded it in the session's cost
+    // subtotal. Pinned here so the post-garbage assertion below is proving a WIPE, not a default.
+    const costBefore = await testEnv.DB.prepare('SELECT cost_calls FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ cost_calls: number }>();
+    expect(costBefore?.cost_calls).toBe(1);
 
     // A lower-priority duplicate exists too — it loses to A (already canonical+parsed) and gets
     // superseded, but it's still a valid parseable copy sitting in the wings.
@@ -768,6 +792,22 @@ describe('a canonical file reparsed to zero turns clears the stale index and rec
       .bind(SESSION_ID)
       .first<{ n: number }>();
     expect(blocksLeft?.n).toBe(0);
+
+    // The clear batch deleted the usage rows; the stored subtotal is a cache of them and must go
+    // with them, in the same batch. Left behind, the session list would keep sorting this session
+    // by the cost of an index that no longer exists — 0/NULL is what "no usage rows" means.
+    const usageLeft = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM usage WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ n: number }>();
+    expect(usageLeft?.n).toBe(0);
+    const costAfterGarbage = await testEnv.DB.prepare('SELECT cost_usd, cost_calls, cost_priced_calls FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ cost_usd: number | null; cost_calls: number; cost_priced_calls: number }>();
+    expect(costAfterGarbage, 'the cleared session kept the cost subtotal of its deleted usage rows').toEqual({
+      cost_usd: null,
+      cost_calls: 0,
+      cost_priced_calls: 0,
+    });
 
     const searchAfterGarbage = await SELF.fetch(`${API}/api/v1/search?q=unique-marker-alpha`, {
       headers: { 'x-dev-machine': 'recover-a' },
@@ -1820,5 +1860,112 @@ describe('re-parse invalidates a stored cost', () => {
     // The reset is only half the mechanism; the row also has to come back UP to the current
     // version, or it stays due forever and every later pass re-prices it for nothing.
     expect(after?.priced_version, 'the re-priced row was not stamped with the current version').toBe(PRICING_VERSION);
+  });
+});
+
+/** The stored cost subtotal on `sessions`, exercised through the REAL ingest path, the same way
+ * the pricing reset above is: what matters is the write path's finalize batch, not a hand-run
+ * refresh statement. The shrinking case is the one a grouped `UPDATE ... FROM` refresh would get
+ * wrong — a session whose usage rows are all gone has no aggregate row to join to and would keep
+ * its previous subtotal forever — so it deliberately shrinks all the way to zero usage rows. */
+describe('a re-parse keeps the stored session cost true to the surviving usage rows', () => {
+  const SID = '22222222-3333-4444-8555-666666666666';
+
+  function line(o: Record<string, unknown>): string {
+    return JSON.stringify({
+      parentUuid: null,
+      isSidechain: false,
+      cwd: '/home/tester/src/demo',
+      sessionId: SID,
+      version: '2.1.99',
+      gitBranch: 'main',
+      ...o,
+    });
+  }
+
+  /** One user turn followed by `assistantTurns` priced turns of a million input tokens each. */
+  function transcript(assistantTurns: number): string {
+    const lines = [line({ type: 'user', uuid: 'u1', timestamp: '2026-07-20T10:00:00.000Z', message: { role: 'user', content: 'hi' } })];
+    for (let i = 0; i < assistantTurns; i++) {
+      lines.push(
+        line({
+          parentUuid: i === 0 ? 'u1' : `a${i}`,
+          type: 'assistant',
+          uuid: `a${i + 1}`,
+          requestId: `req_shrink_${i}`,
+          timestamp: `2026-07-20T10:00:0${i + 1}.000Z`,
+          message: {
+            id: `msg_shrink_${i}`,
+            role: 'assistant',
+            model: 'shrink-model',
+            content: [{ type: 'text', text: `ok ${i}` }],
+            usage: { input_tokens: 1_000_000, output_tokens: 0, service_tier: 'standard' },
+          },
+        }),
+      );
+    }
+    return lines.join('\n') + '\n';
+  }
+
+  async function storedCost(): Promise<{ cost_usd: number | null; cost_calls: number; cost_priced_calls: number; index_state: string }> {
+    return (await testEnv.DB.prepare('SELECT cost_usd, cost_calls, cost_priced_calls, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SID)
+      .first())! as never;
+  }
+
+  async function usageTruth(): Promise<{ usd: number | null; calls: number; priced: number }> {
+    return (await testEnv.DB.prepare('SELECT SUM(usd) AS usd, COUNT(*) AS calls, COUNT(usd) AS priced FROM usage WHERE session_id = ?1')
+      .bind(SID)
+      .first())! as never;
+  }
+
+  it('follows the session from two priced turns down to none', async () => {
+    await testEnv.DB.prepare(
+      `INSERT OR REPLACE INTO model_prices
+         (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
+          cache_write_5m_cost, cache_write_1h_cost, cache_accounting, source, fetched_at)
+       VALUES ('shrink-model', '2026-01-01', 'shrink-model', 'anthropic', 1, 10, 0.1, 2, 4,
+               'disjoint', 'test', '2026-07-31T00:00:00Z')`,
+    ).run();
+
+    await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${SID}.jsonl`, transcript(2));
+    await drainQueue();
+    // The end-of-batch pricing hook is what fills `usd`, and it must refresh the subtotal after
+    // doing so — otherwise a freshly indexed session reads as priced in `usage` and unpriced in
+    // the list. Asserted as agreement with the rows, not as "$2": the hook is a latency optimisation
+    // with a row budget, and this test is about the cache being TRUE, not about what was priced.
+    const two = await storedCost();
+    const twoTruth = await usageTruth();
+    expect(twoTruth.calls).toBe(2);
+    expect(twoTruth.priced, 'the ingest pricing hook did not price the new session').toBe(2);
+    expect(two.index_state).toBe('ready');
+    expect(two.cost_calls).toBe(2);
+    expect(two.cost_priced_calls).toBe(2);
+    expect(two.cost_usd).toBeCloseTo(twoTruth.usd!, 6);
+
+    // Same file, one turn fewer. writeSession deletes the vanished row; the subtotal must be
+    // recomputed from what survived, in the batch that upserts the session.
+    await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${SID}.jsonl`, transcript(1));
+    await drainQueue();
+    const one = await storedCost();
+    const oneTruth = await usageTruth();
+    expect(oneTruth.calls, 'the shrinking re-parse left the deleted usage row behind').toBe(1);
+    expect(one.cost_calls, 'the stored call count kept the pre-shrink figure').toBe(1);
+    expect(one.cost_priced_calls).toBe(oneTruth.priced);
+    expect(one.cost_usd).toBeCloseTo(oneTruth.usd!, 6);
+
+    // Down to no usage rows at all. This is the case that separates the correlated-subquery
+    // refresh from a grouped join: there is no aggregate row for this session any more, so a join
+    // would match nothing and leave the $1 subtotal standing on a session with nothing behind it.
+    await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${SID}.jsonl`, transcript(0));
+    await drainQueue();
+    const none = await storedCost();
+    expect((await usageTruth()).calls).toBe(0);
+    expect(none.index_state, 'the user-only transcript did not index as a session').toBe('ready');
+    expect(none, 'a session with no usage rows kept the subtotal of the rows it used to have').toMatchObject({
+      cost_usd: null,
+      cost_calls: 0,
+      cost_priced_calls: 0,
+    });
   });
 });

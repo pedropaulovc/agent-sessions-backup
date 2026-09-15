@@ -310,6 +310,43 @@ test('0020 repairs rows created by the historically nullable 0019 source shape',
   }
 });
 
+test('0028 backfills per-session cost from the usage already stored', async () => {
+  const fixture = await loadFixture();
+  const database = createDatabase();
+  try {
+    applyPending(database, fixture, 27);
+    // Pre-0028 state: an archive ingested and priced months ago. The backfill is the whole reason
+    // the migration is more than three ALTERs -- without it every already-indexed session reads as
+    // "no usage records" to the viewer, and for a settled archive nothing ever re-ingests or
+    // re-prices it to fix that.
+    database.exec(`
+      INSERT INTO sessions (session_id, harness) VALUES
+        ('cost-priced', 'claude-code'), ('cost-mixed', 'claude-code'),
+        ('cost-unpriced', 'claude-code'), ('cost-no-usage', 'claude-code');
+      INSERT INTO usage (session_id, turn_index, model, usd) VALUES
+        ('cost-priced', 1, 'm', 0.25), ('cost-priced', 2, 'm', 0.75),
+        ('cost-mixed', 1, 'm', 1.5), ('cost-mixed', 2, 'brand-new-model', NULL),
+        ('cost-unpriced', 1, 'brand-new-model', NULL);
+    `);
+    applyPending(database, fixture, 28);
+    const costs = (sessionId) => ({
+      ...database
+        .prepare('SELECT cost_usd, cost_calls, cost_priced_calls FROM sessions WHERE session_id = ?')
+        .get(sessionId),
+    });
+    assert.deepEqual(costs('cost-priced'), { cost_usd: 1, cost_calls: 2, cost_priced_calls: 2 });
+    // A partially priced session keeps all three numbers. The dollar figure is a LOWER BOUND, and
+    // the counts are what let the viewer say so instead of presenting it as the total.
+    assert.deepEqual(costs('cost-mixed'), { cost_usd: 1.5, cost_calls: 2, cost_priced_calls: 1 });
+    // NULL, not 0: a session whose model we could not price did not cost nothing.
+    assert.deepEqual(costs('cost-unpriced'), { cost_usd: null, cost_calls: 1, cost_priced_calls: 0 });
+    // No usage rows at all -- left at the column defaults, which is what they mean.
+    assert.deepEqual(costs('cost-no-usage'), { cost_usd: null, cost_calls: 0, cost_priced_calls: 0 });
+  } finally {
+    database.close();
+  }
+});
+
 test('migration runner applies once, measures verify state, and trusts the protected-main manifest for production', async (context) => {
   const fixture = await loadFixture();
   const database = createDatabase();
