@@ -1645,6 +1645,33 @@ describe('viewer', () => {
     expect(res.status).toBe(404);
   });
 
+  it('sends nosniff so a subagent page whose URL ends in .jsonl is not sniffed into a JSON viewer', async () => {
+    // An OMP subagent id carries the sidecar filename (`omp:<parent>:<Agent>.jsonl`), so the page
+    // URL ends in `.jsonl`. Firefox 155 routes that suffix to its JSON Lines viewer even for a
+    // text/html response, and the transcript rendered as a column of JSON.parse errors.
+    const parent = 'cccccccc-3333-4333-8333-333333333333';
+    const stem = `2026-07-19T10-00-00-000Z_${parent}`;
+    const header = JSON.stringify({ type: 'session', version: 3, id: parent, timestamp: '2026-07-19T10:00:00.000Z', cwd: '/home/tester/src/omp' });
+    const prompt = (text: string) => JSON.stringify({
+      type: 'message',
+      id: 'u1',
+      parentId: null,
+      timestamp: '2026-07-19T10:00:01.000Z',
+      message: { role: 'user', content: [{ type: 'text', text }] },
+    });
+    expect((await putFile('omp', `-home-tester-src-omp/${stem}.jsonl`, `${header}\n${prompt('nosniff parent task')}`)).status).toBe(201);
+    expect(
+      (await putFile('omp', `-home-tester-src-omp/${stem}/JsonlSuffixAgent.jsonl`, `${header}\n${prompt('nosniff subagent task')}`)).status,
+    ).toBe(201);
+    await drainQueue();
+
+    const res = await SELF.fetch(`${VIEWER}/s/${encodeURIComponent(`omp:${parent}:JsonlSuffixAgent.jsonl`)}`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toBe('text/html; charset=utf-8');
+    expect(res.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(await res.text()).toContain('nosniff subagent task');
+  });
+
   it('returns a terminal no-store 401 in preview when unauthenticated', async () => {
     const url = new URL(`${VIEWER}/`);
     const previewEnv = { ...testEnv, ENVIRONMENT: 'preview' } as unknown as Env;

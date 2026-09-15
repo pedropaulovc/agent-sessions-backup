@@ -20,6 +20,21 @@ import { sessionPage, TURNS_PER_PAGE } from './session';
  * it. There is no login page, passkey surface, or production session in preview.
  */
 export async function viewerRoute(request: Request, url: URL, env: Env): Promise<Response> {
+  const res = await viewerResponse(request, url, env);
+  // A viewer URL ends in the session id, and an OMP subagent id ends in `.jsonl`
+  // (`omp:<parent>:<Agent>.jsonl`). Firefox sniffs that path suffix and hands the response to its
+  // JSON Lines viewer even though it is `text/html`, so the transcript renders as a column of
+  // `JSON.parse: unexpected character` errors. `nosniff` is the documented opt-out, and it is the
+  // right header anyway for pages and blobs assembled from uploaded agent transcripts.
+  if (res.headers.get('x-content-type-options') === 'nosniff') return res;
+  // Rebuilt rather than mutated: the blob endpoint's redirects come from `Response.redirect`,
+  // whose headers are immutable. The body is moved, not copied.
+  const sniffProof = new Response(res.body, res);
+  sniffProof.headers.set('x-content-type-options', 'nosniff');
+  return sniffProof;
+}
+
+async function viewerResponse(request: Request, url: URL, env: Env): Promise<Response> {
   // Preview has no local login or WebAuthn surface. Those routes would create/read a
   // production viewer session and must never be reachable through PR code.
   if (env.ENVIRONMENT !== 'preview') {
