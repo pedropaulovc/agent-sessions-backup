@@ -31,6 +31,7 @@
  * not depend on it — the WHERE clause above is what guarantees that.
  */
 import { classifyModel, costOfUsage, loadPrices, type CostByClass, type ModelPrice } from './pricing';
+import { refreshSessionCosts } from './session-cost';
 import {
   priceEpochExpr,
   priceForGroup,
@@ -82,6 +83,8 @@ export interface PricingPassResult {
 
 interface UnpricedRow extends UsageAggRow {
   id: number;
+  /** Which session's stored cost subtotal a successful write invalidates. */
+  session_id: string;
   model: string | null;
   /** Raw column values as read, carried only so the write can compare-and-set on them. */
   cas_model: string | null;
@@ -109,11 +112,26 @@ export async function priceUsage(
   const prices = await loadPrices(db);
 
   const result: PricingPassResult = { examined: 0, priced: 0, unpriceable: 0, superseded: 0, more: false };
+  // Sessions whose rows this pass actually rewrote. `sessions.cost_*` is a cache of `usage.usd`
+  // (migration 0028) and this pass is the writer that fills `usage.usd` in, so it owns refreshing
+  // that cache — once per run at the bottom, in one batch, which is the whole reason the subtotal
+  // is not a per-row trigger. A superseded write is excluded: it changed nothing, and the re-parse
+  // that beat it refreshed the subtotal in its own finalize batch.
+  const touched = new Set<string>();
+  // Set when a read came back short. Every exit from the loop below must fall through to the
+  // refresh, so the two "ran out of work" cases are `break`s that record WHY here rather than
+  // early returns — `more` is derived from this after the loop, keeping its meaning exact: true
+  // only when the ROW BUDGET stopped the pass, never when the query ran dry.
+  let ranDry = false;
 
-  while (result.examined < maxRows) {
+  while (!ranDry && result.examined < maxRows) {
     const take = Math.min(readBatch, maxRows - result.examined);
     const rows = await selectUnpriced(db, prices, startedAt, opts.sessionId, take);
-    if (!rows.length) return result;
+    // A short read means the query ran out of rows, not that the budget ran out. Distinguishing
+    // them is the whole value of `more`: a caller that re-runs on `more` would otherwise loop
+    // forever against a corpus that is fully priced.
+    ranDry = rows.length < take;
+    if (!rows.length) break;
 
     const writes = rows.map((r) => {
       result.examined++;
@@ -171,7 +189,7 @@ export async function priceUsage(
           r.cas_w5 ?? 0,
           r.cas_w1h ?? 0,
         );
-      return { stmt, bucket };
+      return { stmt, bucket, sessionId: r.session_id };
     });
 
     for (let i = 0; i < writes.length; i += PRICING_WRITE_BATCH) {
@@ -186,19 +204,22 @@ export async function priceUsage(
       // superseded row was an unpriceable one, take the count away from a different row that was
       // written successfully — under-reporting real work while still claiming the failed one.
       res.forEach((r, j) => {
-        if ((r.meta?.changes ?? 0) !== 0) return;
+        if ((r.meta?.changes ?? 0) !== 0) {
+          touched.add(slice[j]!.sessionId);
+          return;
+        }
         result.superseded++;
         const bucket = slice[j]!.bucket;
         result[bucket] = Math.max(0, result[bucket] - 1);
       });
     }
-    // A short read means the query ran out of rows, not that the budget ran out. Distinguishing
-    // them is the whole value of `more`: a caller that re-runs on `more` would otherwise loop
-    // forever against a corpus that is fully priced.
-    if (rows.length < take) return result;
   }
 
-  result.more = true;
+  result.more = !ranDry;
+  // One batch for every session touched above, after the last usage write so the subtotal reads
+  // the final state. No-op (no batch, no subrequest) when nothing landed — the helper skips an
+  // empty id set — so a steady-state run with nothing due still costs exactly loadPrices + one read.
+  await refreshSessionCosts(db, touched);
   return result;
 }
 
@@ -265,7 +286,7 @@ async function selectUnpriced(
   // attempted this pass. See the module comment.
   const rows = await db
     .prepare(
-      `SELECT u.id AS id, u.model AS model, ${priceEpochExpr(prices)} AS epoch,
+      `SELECT u.id AS id, u.session_id AS session_id, u.model AS model, ${priceEpochExpr(prices)} AS epoch,
               u.model AS cas_model,
               COALESCE(u.input_tokens,0) AS cas_input, COALESCE(u.output_tokens,0) AS cas_output,
               COALESCE(u.cache_read_tokens,0) AS cas_cache_read,
@@ -274,7 +295,7 @@ async function selectUnpriced(
               ${USAGE_SHAPE_SELECT}, ${USAGE_TOKEN_SUMS}
          FROM usage u
         WHERE u.priced_version < ?2 AND (u.priced_at IS NULL OR u.priced_at < ?1) ${scope}
-        GROUP BY u.id, u.model, epoch, ${USAGE_SHAPE_GROUP_BY}
+        GROUP BY u.id, u.session_id, u.model, epoch, ${USAGE_SHAPE_GROUP_BY}
         ORDER BY u.priced_at, u.id
         LIMIT ${limit}`,
     )

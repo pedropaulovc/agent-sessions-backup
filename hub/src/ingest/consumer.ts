@@ -5,6 +5,7 @@ import { parseExportArchive } from './parsers/export-inbox';
 import { isFreshReservation, markPendingAndEnqueue, reservationCutoffIso } from '../queue';
 import { priceUsage, PRICING_WRITE_BATCH } from '../pricing-pass';
 import { deriveProjectName } from '../project-name';
+import { refreshSessionCostStatement } from '../session-cost';
 import { computeFirstInteractionTitle, type TitleBlock } from '../session-title';
 import { turnFallbackKeyOf, turnKeyOf } from '../turn-key';
 
@@ -267,9 +268,12 @@ export async function consumeParseBatch(batch: Pick<MessageBatch<ParseMessage>, 
 const PRICING_MAX_ROWS = PRICING_WRITE_BATCH;
 
 /** What the end-of-batch pricing pass costs, and what the guard above reserves: the `loadPrices`
- * query (1), one read (1), one write batch (1). Counting `loadPrices` matters — it is a real
- * round trip the first draft of this constant forgot. */
-const PRICING_SUBREQUESTS = 3;
+ * query (1), one read (1), one write batch (1), one batch refreshing `sessions.cost_*` for every
+ * session that write touched (1). Counting `loadPrices` matters — it is a real round trip the
+ * first draft of this constant forgot. The refresh is ONE batch however many sessions it covers:
+ * refreshSessionCosts chunks its statements at 90 ids but issues them in a single db.batch, and a
+ * batch is one subrequest regardless of statement count — so a flat +1, not a term that scales. */
+const PRICING_SUBREQUESTS = 4;
 
 /** Defer a message to a later invocation without burning its delivery-attempt budget: ack + re-enqueue a
  * fresh copy (a fresh message resets max_retries). Fall back to retry() only if the re-send itself throws,
@@ -469,6 +473,11 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
           // search metadata, and the detail header keep showing the stale title of the now-deleted
           // index (the old query-time derivation returned null once the blocks were gone).
           env.DB.prepare("UPDATE sessions SET index_state = 'error', first_interaction_title = NULL WHERE session_id = ?1").bind(det.sessionId),
+          // The usage rows just went; the stored cost subtotal is a cache of them and must follow
+          // in the same batch, or the list keeps sorting this session by a nonzero cost that no
+          // row backs. Only the ingest paths that CHANGE usage rows refresh it — the sessions-row
+          // delete in the reconciliation path removes the subtotal with the row and needs nothing.
+          refreshSessionCostStatement(env.DB, [det.sessionId]),
         ];
         const sourceComplete =
           parsed.stats.parseErrorLines === 0 && (parsed.stats.skippedLineTypes['oversized-line'] ?? 0) === 0;
@@ -2219,6 +2228,14 @@ async function writeSession(
           AND EXISTS (SELECT 1 FROM sessions WHERE session_id = ?1 AND index_state = 'ready')
           AND EXISTS (SELECT 1 FROM files WHERE id = ?3 AND content_hash = ?4)`)
         .bind(s.id, rollupGeneration, file.id, file.content_hash),
+      // Recompute `sessions.cost_*` from the usage rows this write just settled. LAST in this batch,
+      // deliberately: the sessions row must exist for the UPDATE to hit (the upsert above creates it
+      // on first index), and every usage delete/insert already landed in the batches before this
+      // one, so the subqueries see the session's final shape. Batching it with the upsert rather
+      // than issuing it afterwards is what stops a re-indexed session from ever being readable with
+      // the subtotal of its previous shape — the two writes commit together or not at all — and it
+      // costs zero extra subrequests, only one extra row write in `rows_written_finalize`.
+      refreshSessionCostStatement(db, [s.id]),
     ]);
 
     finalizeRows = sumRowsWritten(finalizeRes);
@@ -2227,7 +2244,8 @@ async function writeSession(
     // SUBREQUESTS (see the counting-model note above): prefix probe (1, only when retention is on) +
     // delete batch (1) + one batch per 90-block insert chunk (insertChunks.length) + machine SELECT (1) +
     // session/FTS batch (1). A db.batch of N statements is ONE subrequest, so a chatty conversation's cost
-    // grows with its BATCH count, not its statement count.
+    // grows with its BATCH count, not its statement count — which is also why the cost refresh
+    // appended to the finalize batch changes nothing here: it is a statement, not a batch.
     return 3 + probes + insertChunks.length;
   }
 }

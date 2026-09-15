@@ -20,12 +20,27 @@ import {
 import { esc, page, q } from './layout';
 import { TURNS_PER_PAGE } from './session';
 import { sessionDisplayTitle } from '../session-title';
+import { sessionSubtreeCosts, subtreeCostCte, type SubtreeCost } from '../session-cost';
+import { costCoverage, costLabel, fmtInt } from './format';
 
 const SORT_OPTIONS = [
   ['recent', 'Recent'],
   ['session_time', 'Session time'],
   ['total_tokens', 'Total tokens'],
+  ['cost', 'Total cost'],
 ] as const;
+
+/** Every sort but `recent` pages by OFFSET — see `sortedRecentSessions`. */
+const OFFSET_SORTS: Record<string, true> = { session_time: true, total_tokens: true, cost: true };
+
+/** The columns every recent-list query selects, so the three shapes of that query cannot drift
+ * apart. Cost is absent on purpose: it is a rollup over descendants, fetched for the rendered page
+ * by `sessionSubtreeCosts` rather than read off the row. `session_id` is qualified because the cost
+ * sort joins a CTE that exposes a column of the same name. */
+const RECENT_COLUMNS = `sessions.session_id AS session_id, harness, machine_id, primary_model,
+          ${subagentSessionSql('sessions')} AS subagent,
+          first_interaction_title, title AS stored_title, started_at, cwd,
+          ${sessionDurationSql('sessions')} AS duration_seconds`;
 interface RecentRow {
   session_id: string;
   harness: string;
@@ -36,7 +51,6 @@ interface RecentRow {
   started_at: string | null;
   cwd: string | null;
   duration_seconds: number | null;
-  total_tokens: number;
   subagent: 'no' | 'yes';
 }
 
@@ -63,8 +77,9 @@ export async function searchPage(url: URL, env: Env): Promise<Response> {
 
   if (!query) {
     const [recent, facets] = await Promise.all([recentSessions(p, env), sessionFacets(p, env)]);
+    const costs = await sessionSubtreeCosts(env.DB, recent.rows.map((row) => row.session_id));
     const list = recent.rows.length
-      ? recent.rows.map(renderRecent).join('')
+      ? recent.rows.map((row) => renderRecent(row, costs.get(row.session_id))).join('')
       : `<p class="muted">No sessions match these filters.</p>`;
     const firstResult = (recent.page - 1) * recent.limit + 1;
     const summary = recent.rows.length
@@ -81,7 +96,8 @@ export async function searchPage(url: URL, env: Env): Promise<Response> {
   const result = await runSearch(url, env, { facets: true });
   const offset = decodeCursor(p.get('cursor'));
   const limit = clampLimit(p.get('limit'), DEFAULT_RESULT_PAGE_SIZE, DEFAULT_RESULT_PAGE_SIZE);
-  const hits = result.hits.map(renderHit).join('');
+  const costs = await sessionSubtreeCosts(env.DB, result.hits.map((h) => h.session_id));
+  const hits = result.hits.map((h) => renderHit(h, costs.get(h.session_id))).join('');
   const summary = result.hits.length
     ? `<p class="muted small">Showing ${offset + 1}–${offset + result.hits.length} for “${esc(query)}”</p>`
     : '';
@@ -147,7 +163,7 @@ function renderSidebar(
 }
 
 async function recentSessions(p: URLSearchParams, env: Env): Promise<RecentResult> {
-  if (p.get('sort') === 'session_time' || p.get('sort') === 'total_tokens') return sortedRecentSessions(p, env);
+  if (OFFSET_SORTS[p.get('sort') ?? '']) return sortedRecentSessions(p, env);
   const limit = clampLimit(p.get('limit'), DEFAULT_RESULT_PAGE_SIZE, DEFAULT_RESULT_PAGE_SIZE);
   const cursor = decodeRecentCursor(p.get('cursor'));
   const page = cursor?.page ?? 1;
@@ -157,10 +173,7 @@ async function recentSessions(p: URLSearchParams, env: Env): Promise<RecentResul
   const reverse = cursor?.direction === 'before';
   const direction = reverse ? 'ASC' : 'DESC';
   const result = await env.DB.prepare(
-    `SELECT session_id, harness, machine_id, primary_model,
-            ${subagentSessionSql('sessions')} AS subagent,
-            first_interaction_title, title AS stored_title, started_at, cwd,
-            ${sessionDurationSql('sessions')} AS duration_seconds, ${totalTokensSql('sessions')} AS total_tokens
+    `SELECT ${RECENT_COLUMNS}
      FROM sessions ${where}
      ORDER BY COALESCE(started_at, '') ${direction}, session_id ${direction} LIMIT ${limit + 1}`,
   ).bind(...binds).all<RecentRow>();
@@ -194,14 +207,9 @@ async function sortedRecentSessions(p: URLSearchParams, env: Env): Promise<Recen
   const limit = clampLimit(p.get('limit'), DEFAULT_RESULT_PAGE_SIZE, DEFAULT_RESULT_PAGE_SIZE);
   const offset = decodeCursor(p.get('cursor'));
   const { where, binds } = sessionWhere(p);
-  const order = p.get('sort') === 'session_time' ? sessionDurationSql('sessions') : totalTokensSql('sessions');
-  const rows = await env.DB.prepare(
-    `SELECT session_id, harness, machine_id, primary_model,
-            ${subagentSessionSql('sessions')} AS subagent,
-            first_interaction_title, title AS stored_title, started_at, cwd,
-            ${sessionDurationSql('sessions')} AS duration_seconds, ${totalTokensSql('sessions')} AS total_tokens
-     FROM sessions ${where} ORDER BY ${order} DESC, session_id DESC LIMIT ${limit + 1} OFFSET ${offset}`,
-  ).bind(...binds).all<RecentRow>();
+  const rows = await env.DB.prepare(sortedRecentSql(p.get('sort'), where, limit, offset))
+    .bind(...binds)
+    .all<RecentRow>();
   const result = rows.results.slice(0, limit);
   const page = Math.floor(offset / limit) + 1;
   return {
@@ -211,6 +219,32 @@ async function sortedRecentSessions(p: URLSearchParams, env: Env): Promise<Recen
     page,
     limit,
   };
+}
+
+/** The offset-paginated page of one non-default sort.
+ *
+ * Cost is the odd one out: it orders by the SUBAGENT-INCLUSIVE figure, which no column holds, so
+ * the ordering has to happen in SQL over every session the filter matches — a rollup computed in
+ * JS could only ever order the rows already on the page. The chip the page renders comes from
+ * `sessionSubtreeCosts` instead, because display needs nothing beyond the page; both sides expand
+ * the same `subtreeCostCte` definition, so the order and the number shown cannot disagree.
+ *
+ * The CTE's roots carry the page's own filter, so the outer query needs no WHERE of its own and
+ * the caller's binds stay single-use.
+ *
+ * `(c.usd IS NULL) ASC` first: an unpriced subtree has no known cost, and sorting it as if it
+ * were free would put every session we cannot price at the cheap end of "total cost".
+ */
+function sortedRecentSql(sort: string | null, where: string, limit: number, offset: number): string {
+  const paged = `LIMIT ${limit + 1} OFFSET ${offset}`;
+  if (sort === 'cost') {
+    return `WITH RECURSIVE ${subtreeCostCte(`SELECT session_id FROM sessions ${where}`)}
+     SELECT ${RECENT_COLUMNS}
+     FROM sessions JOIN session_subtree_cost c ON c.session_id = sessions.session_id
+     ORDER BY (c.usd IS NULL) ASC, c.usd DESC, sessions.session_id DESC ${paged}`;
+  }
+  const order = sort === 'session_time' ? sessionDurationSql('sessions') : totalTokensSql('sessions');
+  return `SELECT ${RECENT_COLUMNS} FROM sessions ${where} ORDER BY ${order} DESC, session_id DESC ${paged}`;
 }
 
 /** Recent sessions are actively ingested, so its cursor names a row boundary rather than
@@ -298,7 +332,7 @@ function sessionWhere(p: URLSearchParams): { where: string; binds: string[] } {
   return { where: filter.clause ? `WHERE ${filter.clause}` : '', binds: filter.binds };
 }
 
-function renderHit(h: SearchHit): string {
+function renderHit(h: SearchHit, cost: SubtreeCost | undefined): string {
   const s = h.session;
   const title = sessionDisplayTitle(null, s.title, h.session_id, s.harness);
   const meta = [
@@ -308,7 +342,7 @@ function renderHit(h: SearchHit): string {
     s.primary_model ? `<span class="chip">${esc(s.primary_model)}</span>` : '',
     s.started_at ? `<span class="muted small">${esc(s.started_at)}</span>` : '',
     formatSessionTime(s.duration_seconds),
-    s.total_tokens ? `<span class="muted small">${fmtTokens(s.total_tokens)} tokens</span>` : '',
+    costChip(cost),
     s.index_state !== 'ready' ? `<span class="badge" style="color:var(--err)">${esc(s.index_state)}</span>` : '',
   ]
     .filter(Boolean)
@@ -323,7 +357,7 @@ function renderHit(h: SearchHit): string {
     `</div>`;
 }
 
-function renderRecent(r: RecentRow): string {
+function renderRecent(r: RecentRow, cost: SubtreeCost | undefined): string {
   const title = sessionDisplayTitle(r.first_interaction_title, r.stored_title, r.session_id, r.harness);
   const meta = [
     `<span class="badge">${esc(r.harness)}</span>`,
@@ -333,7 +367,7 @@ function renderRecent(r: RecentRow): string {
     r.cwd ? `<span class="muted small">${esc(r.cwd)}</span>` : '',
     r.started_at ? `<span class="muted small">${esc(r.started_at)}</span>` : '',
     formatSessionTime(r.duration_seconds),
-    r.total_tokens ? `<span class="muted small">${fmtTokens(r.total_tokens)} tokens</span>` : '',
+    costChip(cost),
   ]
     .filter(Boolean)
     .join('');
@@ -341,15 +375,33 @@ function renderRecent(r: RecentRow): string {
     `<div class="meta">${meta}</div></div>`;
 }
 
+/** What the session cost, its subagent descendants included.
+ *
+ * No chip at all when the session has no usage records: a session that reported no model calls
+ * makes no claim about what it cost, and an empty figure would read as one. `cost unknown` rather
+ * than `knownCost`'s bare `—` because among a row of chips a dash reads as a missing field; either
+ * way it is never `$0.00`, which would assert the session was free.
+ *
+ * The subagent count is in the chip, not only the tooltip, so a parent's figure is not mistaken
+ * for its own spend. */
+function costChip(cost: SubtreeCost | undefined): string {
+  if (!cost) return '';
+  const label = costLabel(cost);
+  if (label.state === 'none') return '';
+  const subagents = cost.subagentSessions;
+  const noun = subagents === 1 ? 'subagent' : 'subagents';
+  const text = label.state === 'unknown' ? 'cost unknown' : label.text;
+  const rollup = subagents > 0 ? ` incl. ${fmtInt(subagents)} ${noun}` : '';
+  const coverage = costCoverage(cost.pricedCalls, cost.calls);
+  const detail = subagents > 0 ? `${coverage}, including ${fmtInt(subagents)} ${noun}` : coverage;
+  return `<span class="muted small" title="${esc(detail)}">${esc(text + rollup)}</span>`;
+}
+
 function formatSessionTime(seconds: number | null): string {
   if (seconds === null || !Number.isFinite(seconds)) return '';
   if (seconds < 60) return `<span class="muted small">${Math.round(seconds)}s</span>`;
   if (seconds < 3600) return `<span class="muted small">${Math.round(seconds / 60)}m</span>`;
   return `<span class="muted small">${(seconds / 3600).toFixed(seconds < 10 * 3600 ? 1 : 0)}h</span>`;
-}
-
-function fmtTokens(n: number): string {
-  return new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(n);
 }
 
 function hiddenInputs(entries: Array<[string, string]>): string {

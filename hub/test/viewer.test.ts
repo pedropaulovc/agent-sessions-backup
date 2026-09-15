@@ -2215,8 +2215,6 @@ describe('viewer result pagination and facet layout', () => {
     expect(tokenSorted.indexOf('Long session')).toBeLessThan(tokenSorted.indexOf('Short session'));
     expect(tokenSorted.indexOf('Long session')).toBeLessThan(tokenSorted.indexOf('Reasoning-heavy session'));
     expect(tokenSorted.indexOf('Reasoning-heavy session')).toBeLessThan(tokenSorted.indexOf('Short session'));
-    expect(tokenSorted).toContain('30 tokens');
-    expect(tokenSorted).not.toContain('530 tokens');
 
     const shortOnly = await (await SELF.fetch(`${VIEWER}/?q=viewersortmarker&harness=viewer-sort-test&session_time=under-5m`)).text();
     expect(shortOnly).toContain('Short session');
@@ -2421,5 +2419,128 @@ describe('viewer facet value discovery', () => {
 
     expect(initiallyVisible.match(/<li/g)).toHaveLength(11);
     for (const value of selected) expect(initiallyVisible).toContain(`>✓ ${value}</a>`);
+  });
+});
+
+describe('viewer list cost', () => {
+  const COST_HARNESS = 'viewer-cost-test';
+  const COST_PARENT = 'viewer-cost-parent';
+  const COST_CHILD = 'viewer-cost-child';
+  const COST_UNPRICED = 'viewer-cost-unpriced';
+  const COST_PARTIAL = 'viewer-cost-partial';
+  const COST_RECORDLESS = 'viewer-cost-recordless';
+
+  /** The row for one session in the recent list, so a chip assertion cannot pass on a neighbour. */
+  function listRow(html: string, sessionId: string): string {
+    const row = html.match(new RegExp(`<div class="hit"><div class="title"><a href="/s/${sessionId}">[\\s\\S]*?</div></div>`));
+    expect(row, `${sessionId} should be listed`).toBeTruthy();
+    return row![0]!;
+  }
+
+  beforeAll(async () => {
+    // sessions.cost_usd/cost_calls/cost_priced_calls are a cache of `usage`, maintained by the
+    // ingest writer and the pricing pass (src/session-cost.ts). These fixtures bypass both, so the
+    // columns and the usage rows they summarise are seeded together and must agree: 1.00 + 0.50 for
+    // the parent, 0.25 for its subagent, three unpriced rows, and two of four priced for the
+    // partial session. Timestamps are deliberately ancient so these rows sit at the tail of every
+    // unfiltered recent list.
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        `INSERT INTO sessions
+           (session_id, harness, machine_id, os, primary_model, title, started_at, parent_session_id,
+            index_state, cost_usd, cost_calls, cost_priced_calls) VALUES
+         (?1, ?6, 'viewer-cost-machine', 'linux', 'cost-model', 'Cost parent session', '2019-01-01T10:00:00Z', NULL, 'ready', 1.5, 2, 2),
+         (?2, ?6, 'viewer-cost-machine', 'linux', 'cost-model', 'Cost child session', '2019-01-01T10:01:00Z', ?1, 'ready', 0.25, 1, 1),
+         (?3, ?6, 'viewer-cost-machine', 'linux', 'cost-model', 'Cost unpriced session', '2019-01-01T10:02:00Z', NULL, 'ready', NULL, 3, 0),
+         (?4, ?6, 'viewer-cost-machine', 'linux', 'cost-model', 'Cost partial session', '2019-01-01T10:03:00Z', NULL, 'ready', 0.1, 4, 2),
+         (?5, ?6, 'viewer-cost-machine', 'linux', 'cost-model', 'Cost recordless session', '2019-01-01T10:04:00Z', NULL, 'ready', NULL, 0, 0)`,
+      ).bind(COST_PARENT, COST_CHILD, COST_UNPRICED, COST_PARTIAL, COST_RECORDLESS, COST_HARNESS),
+      testEnv.DB.prepare(
+        `INSERT INTO usage (session_id, turn_index, model, input_tokens, usd) VALUES
+         (?1, 0, 'cost-model', 100, 1.0),
+         (?1, 1, 'cost-model', 100, 0.5),
+         (?2, 0, 'cost-model', 50, 0.25),
+         (?3, 0, 'cost-model', 10, NULL),
+         (?3, 1, 'cost-model', 10, NULL),
+         (?3, 2, 'cost-model', 10, NULL),
+         (?4, 0, 'cost-model', 20, 0.06),
+         (?4, 1, 'cost-model', 20, 0.04),
+         (?4, 2, 'cost-model', 20, NULL),
+         (?4, 3, 'cost-model', 20, NULL)`,
+      ).bind(COST_PARENT, COST_CHILD, COST_UNPRICED, COST_PARTIAL),
+    ]);
+    // Searchable text for the three top-level sessions, so the cost sort can be exercised in FTS
+    // mode too — where the ordering comes from a different query (api/search.ts) than the recent
+    // list's.
+    await testEnv.DB.prepare(
+      `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path)
+       VALUES (?1, 1, 0, 0, 'user', 'text', 'costsortmarker parent', 1),
+              (?2, 1, 0, 0, 'user', 'text', 'costsortmarker partial', 1),
+              (?3, 1, 0, 0, 'user', 'text', 'costsortmarker unpriced', 1)`,
+    ).bind(COST_PARENT, COST_PARTIAL, COST_UNPRICED).run();
+    await testEnv.DB.prepare(
+      `INSERT INTO blocks_fts(rowid, text)
+       SELECT id, text FROM blocks WHERE session_id IN (?1, ?2, ?3) AND text IS NOT NULL`,
+    ).bind(COST_PARENT, COST_PARTIAL, COST_UNPRICED).run();
+  });
+
+  it('shows each session cost with its subagent descendants folded in', async () => {
+    const html = await (await SELF.fetch(`${VIEWER}/?harness=${COST_HARNESS}`)).text();
+
+    const parent = listRow(html, COST_PARENT);
+    expect(parent).toContain('$1.75 incl. 1 subagent');
+    expect(parent).toContain('title="3 / 3 priced, including 1 subagent"');
+
+    // The list hides subagent sessions unless asked for them, so the child's own chip — which
+    // rolls up nothing and says so — needs the filter flipped.
+    const subagents = await (await SELF.fetch(`${VIEWER}/?harness=${COST_HARNESS}&subagent=yes`)).text();
+    const child = listRow(subagents, COST_CHILD);
+    expect(child).toContain('$0.25');
+    expect(child).not.toContain('incl.');
+  });
+
+  it('says a cost is unknown rather than zero, and marks a partly priced subtree a subtotal', async () => {
+    const html = await (await SELF.fetch(`${VIEWER}/?harness=${COST_HARNESS}`)).text();
+
+    const unpriced = listRow(html, COST_UNPRICED);
+    expect(unpriced).toContain('cost unknown');
+    expect(unpriced).toContain('title="Unpriced"');
+    expect(unpriced).not.toContain('$');
+
+    const partial = listRow(html, COST_PARTIAL);
+    expect(partial).toContain('$0.10 subtotal');
+    expect(partial).toContain('title="2 / 4 priced"');
+  });
+
+  it('shows no cost chip for a session with no usage records', async () => {
+    const html = await (await SELF.fetch(`${VIEWER}/?harness=${COST_HARNESS}`)).text();
+    const recordless = listRow(html, COST_RECORDLESS);
+    expect(recordless).not.toContain('$');
+    expect(recordless).not.toContain('cost unknown');
+    expect(recordless).not.toContain('No usage records');
+  });
+
+  it('sorts by subagent-inclusive cost and orders sessions with no known cost last', async () => {
+    const html = await (await SELF.fetch(`${VIEWER}/?harness=${COST_HARNESS}&sort=cost`)).text();
+    expect(html).toContain('<option value="cost" selected>Total cost</option>');
+    const order = [...html.matchAll(/<a href="\/s\/(viewer-cost-[^"]+)">/g)].map((match) => match[1]!);
+    // Parent ($1.75, its subagent's $0.25 included) outranks the cheaper partial subtotal ($0.10);
+    // the two sessions with no known cost sort last by id rather than sorting as if free. The
+    // subagent itself is absent because the list hides subagent sessions by default.
+    expect(order).toEqual([COST_PARENT, COST_PARTIAL, COST_UNPRICED, COST_RECORDLESS]);
+  });
+
+  it('sorts search hits by the same rolled-up cost, not by relevance', async () => {
+    // The sort dropdown is shared by both list modes, so a `cost` selection that the FTS path
+    // quietly ignored would leave the control visibly selected and doing nothing. This path builds
+    // its own query (api/search.ts) and reuses the filter's bound parameters inside the rollup
+    // CTE — a formulation that either works or fails loudly on bind count, hence the round trip.
+    const html = await (
+      await SELF.fetch(`${VIEWER}/?q=costsortmarker&harness=${COST_HARNESS}&sort=cost`)
+    ).text();
+    const order = [...html.matchAll(/<a href="\/s\/(viewer-cost-[a-z]+)[?"]/g)].map((match) => match[1]!);
+    expect(order).toEqual([COST_PARENT, COST_PARTIAL, COST_UNPRICED]);
+    // Hits carry the same chip as recent rows, including the subagent rollup.
+    expect(html).toContain('$1.75 incl. 1 subagent');
   });
 });

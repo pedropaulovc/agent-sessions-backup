@@ -433,6 +433,70 @@ describe('priceUsage', () => {
 
     expect((await priced(id)).usd, 'a negative token count produced negative dollars').toBeCloseTo(10, 9);
   });
+
+  /** `sessions.cost_*` is a cache of `usage.usd`, and this pass is the writer that fills `usd`
+   * in — so it is the one place a session can go from "unpriced" to "priced" without being
+   * re-ingested. Asserted on the columns the list and detail pages read, not on the batch. */
+  async function storedCost(sessionId: string): Promise<{ cost_usd: number | null; cost_calls: number; cost_priced_calls: number }> {
+    return (await testEnv.DB.prepare('SELECT cost_usd, cost_calls, cost_priced_calls FROM sessions WHERE session_id = ?1')
+      .bind(sessionId)
+      .first())! as never;
+  }
+
+  async function seedSession(sessionId: string): Promise<void> {
+    // OR REPLACE: the session table is not cleared between tests, and a surviving row would
+    // carry a subtotal from a previous run into this one's "before" assertion.
+    await testEnv.DB.prepare(
+      `INSERT OR REPLACE INTO sessions (session_id, harness, machine_id, started_at, index_state)
+       VALUES (?1, 'claude-code', 'pricebox', '2026-07-20T00:00:00Z', 'ready')`,
+    )
+      .bind(sessionId)
+      .run();
+  }
+
+  it('refreshes the stored session subtotal for every session it priced, leaving unpriceable rows counted but unpriced', async () => {
+    // Without the refresh the list keeps showing a nightly-priced session as costing nothing
+    // known until something happens to re-ingest it — for a settled archive, never. And the
+    // priced count has to travel with the sum: a session with an unpriceable row is a LOWER
+    // BOUND, and the viewer can only say so if `cost_priced_calls < cost_calls` reaches it.
+    await seedPrice();
+    await seedSession('cost-mixed');
+    await seedTurn('cost-mixed', { input: 2_000_000 });
+    await seedTurn('cost-mixed', { input: 1_000_000 });
+    await seedTurn('cost-mixed', { model: 'never-published' });
+    // Rows seeded straight into `usage` bypass the ingest refresh, so the session starts at the
+    // column defaults — which is also exactly what a pre-migration session looks like.
+    expect(await storedCost('cost-mixed')).toEqual({ cost_usd: null, cost_calls: 0, cost_priced_calls: 0 });
+
+    await priceUsage(testEnv.DB, { now: NOW });
+
+    const truth = await testEnv.DB.prepare('SELECT SUM(usd) AS usd, COUNT(*) AS calls, COUNT(usd) AS priced FROM usage WHERE session_id = ?1')
+      .bind('cost-mixed')
+      .first<{ usd: number; calls: number; priced: number }>();
+    expect(truth).toMatchObject({ calls: 3, priced: 2 });
+    const stored = await storedCost('cost-mixed');
+    expect(stored.cost_usd, 'the pass priced the rows but the session still reads as unpriced').toBeCloseTo(3, 9);
+    expect(stored.cost_usd).toBeCloseTo(truth!.usd, 9);
+    expect(stored.cost_calls).toBe(3);
+    expect(stored.cost_priced_calls, 'the unpriceable row was reported as priced').toBe(2);
+  });
+
+  it('refreshes the sessions it touched on every exit, including a run cut short by its row budget', async () => {
+    // The pass has three ways out — no rows, a short read, the budget — and the refresh sits
+    // after all of them. Missing it on the budget exit is the one that would bite in production:
+    // the ingest hook always runs under a row budget, so a busy batch would price its sessions
+    // and then not tell the list.
+    await seedPrice();
+    await seedSession('cost-budget');
+    await seedTurn('cost-budget');
+    await seedTurn('cost-budget');
+
+    const res = await priceUsage(testEnv.DB, { maxRows: 1, now: NOW });
+
+    expect(res.more, 'the budget exit is not the path being exercised').toBe(true);
+    // One row priced, one still NULL: the subtotal is that row's dollar and honestly partial.
+    expect(await storedCost('cost-budget')).toEqual({ cost_usd: 1, cost_calls: 2, cost_priced_calls: 1 });
+  });
 });
 
 /** POST /api/v1/admin/price-usage — the backfill entrypoint.

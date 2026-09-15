@@ -11,18 +11,37 @@ import {
   totalTokensSql,
 } from '../session-filters';
 import { sessionDisplayTitle } from '../session-title';
+import { subtreeCostCte } from '../session-cost';
 
 export const DEFAULT_RESULT_PAGE_SIZE = 100;
+
+/** The rolled-up cost the `cost` sort orders by, joined in only for that sort.
+ *
+ * The other sorts order by an expression over the session row this query already joins. Cost
+ * cannot: the figure the list shows includes a session's subagent DESCENDANTS, which lives in the
+ * recursive CTE in src/session-cost.ts rather than in a column. Its roots are every session the
+ * caller's filter matches — the same clause and the same bound parameters as the outer WHERE,
+ * reused rather than re-bound — so an unfiltered search rolls up `sessions` and nothing else. It
+ * never reads `usage`, which is the point of storing the per-session subtotal on the row.
+ */
+function costRollupCte(where: string): string {
+  return `WITH RECURSIVE ${subtreeCostCte(`SELECT s.session_id FROM sessions s WHERE 1 = 1 ${where}`)} `;
+}
 
 function searchOrder(sort: string | null): string {
   if (sort === 'session_time') return `ORDER BY ${sessionDurationSql('s')} DESC, rank, b.id`;
   if (sort === 'total_tokens') return `ORDER BY ${totalTokensSql('s')} DESC, rank, b.id`;
+  // Unpriced subtrees last: sorting "no known cost" as if it were $0 would bury every session we
+  // could not price at the cheap end of a cost ranking. `rank` still breaks ties, so hits within
+  // one session stay in relevance order.
+  if (sort === 'cost') return 'ORDER BY (c.usd IS NULL) ASC, c.usd DESC, rank, b.id';
   return 'ORDER BY rank, b.id';
 }
 
 /** @internal Exported so the query-plan regression exercises the exact production query. */
 export function searchHitsSql(where: string, sort: string | null, limit: number, offset: number): string {
-  return `SELECT b.session_id, b.turn_index, b.block_index, b.role, b.btype, b.tool_name, b.ts,
+  const cost = sort === 'cost';
+  return `${cost ? costRollupCte(where) : ''}SELECT b.session_id, b.turn_index, b.block_index, b.role, b.btype, b.tool_name, b.ts,
                  snippet(blocks_fts, 0, '<mark>', '</mark>', '…', 16) AS snip,
                  bm25(blocks_fts) AS rank,
                  s.harness, s.machine_id, s.os, s.cwd, s.repo_url, s.primary_model, ${subagentSessionSql('s')} AS subagent,
@@ -31,6 +50,7 @@ export function searchHitsSql(where: string, sort: string | null, limit: number,
           FROM blocks_fts
           JOIN blocks b ON b.id = blocks_fts.rowid
           JOIN sessions s ON s.session_id = b.session_id
+          ${cost ? 'JOIN session_subtree_cost c ON c.session_id = s.session_id' : ''}
           WHERE blocks_fts MATCH ?1 ${where}
           ${searchOrder(sort)} LIMIT ${limit + 1} OFFSET ${offset}`;
 }

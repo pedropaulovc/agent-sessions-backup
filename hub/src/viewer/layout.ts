@@ -216,6 +216,20 @@ img.media { max-width: 100%; height: auto; border: 1px solid var(--line); border
 .session-trace-tool-time { color: var(--muted); }
 .session-trace :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .session-trace [hidden] { display: none !important; }
+/* ---- per-model cost breakdown; the trace's collapsed frame, the global table.chart body ---- */
+.session-cost { border: 1px solid var(--line); border-radius: 6px; margin: 12px 0; min-width: 0; }
+.session-cost > summary { cursor: pointer; padding: 9px 12px; overflow-wrap: anywhere; }
+.session-cost[open] > summary { border-bottom: 1px solid var(--line); }
+.session-cost-summary { color: var(--muted); font-size: 12px; }
+.session-cost-body { padding: 10px 12px; min-width: 0; max-width: 100%; overflow-x: auto; overscroll-behavior-x: contain; }
+.session-cost-note { margin: 0 0 10px; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.session-cost table.chart { font-size: 12px; }
+.session-cost table.chart thead th { font-size: 10px; color: var(--muted); font-weight: 500; white-space: nowrap; vertical-align: bottom; }
+.session-cost table.chart th[scope=row] { white-space: normal; overflow-wrap: anywhere; min-width: 140px; }
+.session-cost-sub { display: block; color: var(--muted); font-size: 10px; font-weight: 400; margin-top: 3px; }
+/* Own-spend footer: ruled off so the session total is not read as one more model row. */
+.session-cost table.chart tfoot :is(th, td) { border-bottom: 0; border-top: 1px solid var(--line); font-weight: 600; }
+.session-cost :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 /* ---- statistics page ---- */
 .statbar { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; margin: 10px 0 4px; }
 .statbar a, .tabs a {
