@@ -14,6 +14,7 @@ import {
   type Stats,
   type StatsQuery,
 } from '../stats';
+import { costCoverage, fmtInt, fmtTokens, fmtUsd, knownCost } from './format';
 import { esc, page, q } from './layout';
 
 const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
@@ -144,17 +145,6 @@ function rankingControls(url: URL, query: StatsQuery): string {
     ] as const).map(([rank, label]) =>
       `<a href="${esc(withParam(url, 'rank', rank))}"${(query.rank ?? 'calls') === rank ? ' class="on" aria-current="true"' : ''}>${label}</a>`,
     ).join('') + `</nav>`;
-}
-
-function costCoverage(pricedCalls: number, calls: number): string {
-  if (calls === 0) return 'No usage records';
-  if (pricedCalls === 0) return 'Unpriced';
-  return `${fmtInt(pricedCalls)} / ${fmtInt(calls)} priced`;
-}
-
-function knownCost(usd: number, pricedCalls: number, calls: number, dp = 2): string {
-  if (pricedCalls === 0) return '—';
-  return `${fmtUsd(usd, dp)}${pricedCalls < calls ? ' subtotal' : ''}`;
 }
 
 function tableScroll(label: string, table: string): string {
@@ -496,18 +486,3 @@ function bar(pct: number, tone: 'a' | 'b'): string {
   return `<span class="bar bar-${tone}" style="width:${w.toFixed(1)}%"></span>`;
 }
 
-function fmtUsd(v: number, dp = 2): string {
-  if (!Number.isFinite(v)) return '—';
-  return `$${v.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })}`;
-}
-
-function fmtInt(v: number): string {
-  return Math.round(v).toLocaleString('en-US');
-}
-
-function fmtTokens(v: number): string {
-  if (v >= 1e9) return `${(v / 1e9).toFixed(2)}B`;
-  if (v >= 1e6) return `${(v / 1e6).toFixed(1)}M`;
-  if (v >= 1e3) return `${(v / 1e3).toFixed(1)}k`;
-  return String(Math.round(v));
-}
