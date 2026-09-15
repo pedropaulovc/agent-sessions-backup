@@ -204,6 +204,15 @@ describe('session cost breakdown', () => {
     ]);
   });
 
+  it('puts the nine-column table in a focusable, labelled scroll region', async () => {
+    // The table overflows horizontally on a narrow viewport, and an overflow box only scrolls by
+    // keyboard if it is a focus stop; the label is what stops that stop being unexplained. Same
+    // contract as the skills table, through the shared layout.tableScroll helper.
+    expect(panelOf(await get(BREAKDOWN))).toContain(
+      '<div class="stats-table-scroll" role="region" aria-label="Cost by model" tabindex="0"><table class="chart">',
+    );
+  });
+
   it('splits the 5m and 1h cache writes in the cell title', async () => {
     const row = rowOf(await get(BREAKDOWN), 'subset-model');
     expect(row).toContain('title="5,000 5m + 1,000 1h">6.0k</td>');

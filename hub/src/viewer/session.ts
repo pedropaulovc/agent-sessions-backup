@@ -21,7 +21,7 @@ import { computeFirstInteractionTitle, sessionDisplayTitle, titleSkippedTurnIndi
 import { turnKeyOf } from '../turn-key';
 import { signExternalAssetUrl } from './assets';
 import { costCoverage, costLabel, fmtInt, fmtTokens, knownCost } from './format';
-import { esc, pageFoot, pageHead, q } from './layout';
+import { esc, pageFoot, pageHead, q, tableScroll } from './layout';
 import { buildSessionTrace, toolKey } from './trace-data';
 import { renderTrace } from './trace';
 
@@ -731,10 +731,14 @@ function renderModelCosts(models: readonly ModelCost[], own: CostTotals): string
     `separate counters and are deliberately not summed — under subset accounting the cached tokens are already ` +
     `inside input. Cache write is 5m + 1h. Subagent sessions are counted in the header figure and listed above, ` +
     `not here.</p>` +
-    `<table class="chart"><thead><tr><th>Model / coverage</th><th class="num">Calls</th><th class="num">Cost</th>` +
-    `<th class="num">Input</th><th class="num">Output</th><th class="num">Reasoning</th>` +
-    `<th class="num">Cache read</th><th class="num">Cache write</th><th class="num">Cache hit rate</th></tr></thead>` +
-    `<tbody>${rows}</tbody><tfoot>${footer}</tfoot></table></div></details>`
+    tableScroll(
+      'Cost by model',
+      `<table class="chart"><thead><tr><th>Model / coverage</th><th class="num">Calls</th><th class="num">Cost</th>` +
+        `<th class="num">Input</th><th class="num">Output</th><th class="num">Reasoning</th>` +
+        `<th class="num">Cache read</th><th class="num">Cache write</th><th class="num">Cache hit rate</th></tr></thead>` +
+        `<tbody>${rows}</tbody><tfoot>${footer}</tfoot></table>`,
+    ) +
+    `</div></details>`
   );
 }
 

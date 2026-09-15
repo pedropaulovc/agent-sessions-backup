@@ -15,7 +15,7 @@ import {
   type StatsQuery,
 } from '../stats';
 import { costCoverage, fmtInt, fmtTokens, fmtUsd, knownCost } from './format';
-import { esc, page, q } from './layout';
+import { esc, page, q, tableScroll } from './layout';
 
 const DOW = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 
@@ -145,10 +145,6 @@ function rankingControls(url: URL, query: StatsQuery): string {
     ] as const).map(([rank, label]) =>
       `<a href="${esc(withParam(url, 'rank', rank))}"${(query.rank ?? 'calls') === rank ? ' class="on" aria-current="true"' : ''}>${label}</a>`,
     ).join('') + `</nav>`;
-}
-
-function tableScroll(label: string, table: string): string {
-  return `<div class="stats-table-scroll" role="region" aria-label="${esc(label)}" tabindex="0">${table}</div>`;
 }
 
 function withParam(url: URL, name: string, value: string | null): string {
