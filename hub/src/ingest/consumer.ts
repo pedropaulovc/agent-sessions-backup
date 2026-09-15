@@ -268,12 +268,11 @@ export async function consumeParseBatch(batch: Pick<MessageBatch<ParseMessage>, 
 const PRICING_MAX_ROWS = PRICING_WRITE_BATCH;
 
 /** What the end-of-batch pricing pass costs, and what the guard above reserves: the `loadPrices`
- * query (1), one read (1), one write batch (1), one batch refreshing `sessions.cost_*` for every
- * session that write touched (1). Counting `loadPrices` matters — it is a real round trip the
- * first draft of this constant forgot. The refresh is ONE batch however many sessions it covers:
- * refreshSessionCosts chunks its statements at 90 ids but issues them in a single db.batch, and a
- * batch is one subrequest regardless of statement count — so a flat +1, not a term that scales. */
-const PRICING_SUBREQUESTS = 4;
+ * query (1), one read (1), one write batch (1). Counting `loadPrices` matters — it is a real
+ * round trip the first draft of this constant forgot. The `sessions.cost_*` refresh the pass also
+ * performs adds no term: its statements ride inside that same write batch (so the two commit
+ * together), and a db.batch is one subrequest regardless of how many statements it holds. */
+const PRICING_SUBREQUESTS = 3;
 
 /** Defer a message to a later invocation without burning its delivery-attempt budget: ack + re-enqueue a
  * fresh copy (a fresh message resets max_retries). Fall back to retry() only if the re-send itself throws,

@@ -64,18 +64,22 @@ export function refreshSessionCostStatement(db: D1Database, sessionIds: readonly
     .bind(...sessionIds);
 }
 
-/** Recompute the stored subtotal for many sessions, in one batch of chunked statements.
+/** The chunked refresh statements for many sessions, for the caller to place in its OWN batch.
  *
- * Used by the pricing pass, whose whole job is filling `usage.usd`: without this the list and
- * detail pages would keep showing a session as unpriced until something re-ingested it. */
-export async function refreshSessionCosts(db: D1Database, sessionIds: Iterable<string>): Promise<void> {
+ * Statements, not an awaited batch: the pricing pass appends these to the batch that writes
+ * `usage.usd`, so a refresh failure rolls the price writes back with it. Issued afterwards
+ * instead, a failed refresh would leave rows stamped `priced_version = PRICING_VERSION` — which
+ * `selectUnpriced` skips forever — against a session still showing its pre-pricing subtotal.
+ *
+ * One statement per 90 ids; a D1 batch is one subrequest however many statements it holds, so
+ * chunking costs nothing beyond the extra statements. */
+export function refreshSessionCostStatements(db: D1Database, sessionIds: Iterable<string>): D1PreparedStatement[] {
   const ids = [...new Set(sessionIds)];
-  if (!ids.length) return;
   const statements: D1PreparedStatement[] = [];
   for (let i = 0; i < ids.length; i += REFRESH_CHUNK) {
     statements.push(refreshSessionCostStatement(db, ids.slice(i, i + REFRESH_CHUNK)));
   }
-  await db.batch(statements);
+  return statements;
 }
 
 /** The CTE list that rolls each root's own stored subtotal up with its subagent descendants'.

@@ -23,6 +23,15 @@ export const DEFAULT_RESULT_PAGE_SIZE = 100;
  * caller's filter matches — the same clause and the same bound parameters as the outer WHERE,
  * reused rather than re-bound — so an unfiltered search rolls up `sessions` and nothing else. It
  * never reads `usage`, which is the point of storing the per-session subtotal on the row.
+ *
+ * Rooted at `sessions`, NOT at the sessions the FTS query hits, even though the hit set is the
+ * smaller root set for a selective term. Deriving the roots from `blocks_fts` would have to
+ * DISTINCT the term's whole postings list — unbounded by the page's LIMIT, because the ordering
+ * depends on every hit session's cost — and `blocks` is the largest table in the schema. On the
+ * sanitized local corpus (15 sessions, 6,351 blocks) the term `result` matches 4,450 blocks in 10
+ * sessions: ~8,900 rows read to name 10 roots, against 15 to name every root there is. The
+ * sessions-rooted form has a ceiling that does not move with the query; the hit-rooted one is a
+ * scan whose size the caller chooses.
  */
 function costRollupCte(where: string): string {
   return `WITH RECURSIVE ${subtreeCostCte(`SELECT s.session_id FROM sessions s WHERE 1 = 1 ${where}`)} `;

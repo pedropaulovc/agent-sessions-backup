@@ -1,7 +1,7 @@
 import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
 import { priceUsage } from '../src/pricing-pass';
-import { refreshSessionCosts } from '../src/session-cost';
+import { refreshSessionCostStatements } from '../src/session-cost';
 import { VIEWER } from './hosts';
 
 /** The session detail page's money: the header's subagent-inclusive figure, the per-model
@@ -142,7 +142,7 @@ beforeAll(async () => {
   // Mid-backfill mixture, forced rather than waited for: one priced row of `partial-model` rolled
   // back to unpriced, so its group is a lower bound and has to say so.
   await testEnv.DB.prepare('UPDATE usage SET usd = NULL WHERE session_id = ?1 AND turn_index = 5').bind(BREAKDOWN).run();
-  await refreshSessionCosts(testEnv.DB, [BREAKDOWN, PARENT, CHILD, UNPRICED, NO_USAGE]);
+  await testEnv.DB.batch(refreshSessionCostStatements(testEnv.DB, [BREAKDOWN, PARENT, CHILD, UNPRICED, NO_USAGE]));
 });
 
 describe('session cost breakdown', () => {

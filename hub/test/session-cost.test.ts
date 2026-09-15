@@ -2,7 +2,7 @@ import { env } from 'cloudflare:test';
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
   refreshSessionCostStatement,
-  refreshSessionCosts,
+  refreshSessionCostStatements,
   sessionModelCosts,
   sessionSubtreeCosts,
 } from '../src/session-cost';
@@ -189,7 +189,7 @@ describe('stored subtotal refresh', () => {
       await seedUsage(id, { usd: 0.5 });
     }
 
-    await refreshSessionCosts(testEnv.DB, ids);
+    await testEnv.DB.batch(refreshSessionCostStatements(testEnv.DB, ids));
 
     const stale = await testEnv.DB.prepare(
       `SELECT COUNT(*) AS n FROM sessions WHERE session_id LIKE 'bulk-%' AND (cost_usd IS NOT 0.5 OR cost_calls != 1)`,
