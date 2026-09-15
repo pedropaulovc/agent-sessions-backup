@@ -270,10 +270,18 @@ async function startEnvironment(options) {
     // sessions as they are parsed. A disposable environment never runs the daily LiteLLM sync
     // cron, so without this row set every seeded session renders `cost unknown` and the cost
     // views can only ever be verified in one of their three states.
-    await runCaptured(process.execPath, [
-      wranglerPath(), 'd1', 'execute', 'sessions-index', '--local', '--persist-to', stateDir,
-      '--command', fixtureModelPriceSql(),
-    ], { cwd: HUB_ROOT, env: childEnv, label: 'local fixture model prices', tracker });
+    // Ctrl+C kills the tracked child, so this rejects on shutdown exactly as the migration run
+    // above does; report the signal's exit code rather than a crash from an aborted command.
+    try {
+      await runCaptured(process.execPath, [
+        wranglerPath(), 'd1', 'execute', 'sessions-index', '--local', '--persist-to', stateDir,
+        '--command', fixtureModelPriceSql(),
+      ], { cwd: HUB_ROOT, env: childEnv, label: 'local fixture model prices', tracker });
+    } catch (error) {
+      if (!shutdownRequested) throw error;
+      if (signalExitCode) process.exitCode = signalExitCode;
+      return;
+    }
     if (shutdownRequested) {
       if (signalExitCode) process.exitCode = signalExitCode;
       return;
