@@ -20,7 +20,8 @@ export const COST_BUCKETS = [
   { value: 'under-1', label: 'Under $1', min: 0, max: 1 },
   { value: '1-10', label: '$1–$10', min: 1, max: 10 },
   { value: '10-100', label: '$10–$100', min: 10, max: 100 },
-  { value: '100-1000', label: '$100–$1,000', min: 100, max: 1000 },
+  { value: '100-500', label: '$100–$500', min: 100, max: 500 },
+  { value: '500-1000', label: '$500–$1,000', min: 500, max: 1000 },
   { value: 'over-1000', label: '$1,000 and over', min: 1000, max: null },
 ] as const;
 
