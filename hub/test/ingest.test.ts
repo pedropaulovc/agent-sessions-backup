@@ -1461,21 +1461,29 @@ describe('hub.d1.write_cost telemetry', () => {
     expect((await putFile('testbox-wsl', 'claude-projects', shuffledPath, chained(SHUFFLED, 3))).status).toBe(201);
     await drainQueue();
 
-    // Leave the last block's id alone and lift every earlier block above it, so transcript order and
-    // id order disagree at exactly the row a re-upload diverges on (a JSONL append grows the final
-    // block's byte_len). Lifting rather than lowering keeps every id positive and SQLite-plausible:
-    // an id of 0 or below would be a different, unreachable bug, since the full-rewrite delete uses
-    // `id > 0` as its "retain nothing" sentinel. blocks_fts is external-content and keyed by rowid,
-    // so it is rebuilt afterwards — the fixture must be a consistent session, not a corrupt one.
-    const moved = await testEnv.DB.prepare(
-      'SELECT id FROM blocks WHERE session_id = ?1 ORDER BY turn_index DESC, block_index DESC LIMIT 1',
+    // Renumber the session so the delete boundary splits the PREFIX instead of the tail, which a count
+    // of the rows above that boundary cannot catch. A re-upload diverges on the final block (a JSONL
+    // append grows its byte_len), so the prefix is everything before it: put the first block above the
+    // boundary and the diverging last block below it, and exactly one row sits above `lastId` while
+    // exactly one row follows the prefix — the counts agree, yet `id > lastId` deletes the retained
+    // first block and strands the divergent last one.
+    // The new ids sit far above every existing one so the updates cannot collide, and stay positive
+    // and SQLite-plausible: an id of 0 or below would be a different, unreachable bug, since the
+    // full-rewrite delete uses `id > 0` as its "retain nothing" sentinel. blocks_fts is
+    // external-content and keyed by rowid, so it is rebuilt afterwards — the fixture must be a
+    // consistent session, not a corrupt one.
+    const stored = await testEnv.DB.prepare(
+      'SELECT id FROM blocks WHERE session_id = ?1 ORDER BY turn_index, block_index',
     )
       .bind(SHUFFLED)
-      .first<{ id: number }>();
-    const LIFT = 1_000_000;
-    await testEnv.DB.prepare('UPDATE blocks SET id = id + ?2 WHERE session_id = ?1 AND id != ?3')
-      .bind(SHUFFLED, LIFT, moved!.id)
-      .run();
+      .all<{ id: number }>();
+    const last = stored.results.length - 1;
+    expect(last).toBeGreaterThan(1);
+    const BASE = 1_000_000;
+    const shuffle = (i: number) => (i === 0 ? BASE + 9000 : i === last ? BASE + 1 : BASE + 100 + i * 10);
+    for (const [i, row] of stored.results.entries()) {
+      await testEnv.DB.prepare('UPDATE blocks SET id = ?2 WHERE id = ?1').bind(row.id, shuffle(i)).run();
+    }
     await testEnv.DB.prepare("INSERT INTO blocks_fts (blocks_fts) VALUES ('rebuild')").run();
 
     const events = captureLogs();

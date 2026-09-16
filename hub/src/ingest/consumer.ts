@@ -2438,19 +2438,22 @@ async function retainablePrefix(
     count++;
   }
 
-  // The caller deletes `id > lastId`, so the stored rows matching that are exactly the tail this
-  // write rewrites — and that count MUST equal the number of rows after the prefix. When it does
-  // not, ids do not ascend with (turn_index, block_index): either a prefix row would be deleted, or
-  // a divergent row behind the prefix would survive the delete and be re-inserted as a duplicate
-  // position. Ids do ascend for any session written in one pass, but `blocks.id` is just an INTEGER
-  // PRIMARY KEY and nothing in the schema promises the two orders agree, so retain nothing rather
-  // than assume — a shorter prefix only means rewriting more.
-  const deletedTail = stored.reduce((n, row) => n + (row.id > lastId ? 1 : 0), 0);
+  // The caller deletes `id > lastId`, so that boundary MUST separate the retained prefix from the
+  // rewritten tail: every prefix row at or below it, every later row above it. Counting the rows
+  // above the boundary is not enough — ids descending with the transcript, say `[30, 20, 10]`
+  // diverging on the third block, put exactly one row above `lastId = 20` and one row after the
+  // prefix, so the counts agree while the delete removes retained row 30 and strands divergent row
+  // 10, leaving a hole at one position and two rows at another. Ids do ascend for any session
+  // written in one pass, but `blocks.id` is just an INTEGER PRIMARY KEY and nothing in the schema
+  // promises the two orders agree, so retain nothing rather than assume — a shorter prefix only
+  // means rewriting more.
+  const partitioned = stored.every((row, i) => (i < count ? row.id <= lastId : row.id > lastId));
   // Nothing retained means `lastId` is 0 and the delete takes the whole session.
-  if (count === 0 || deletedTail !== stored.length - count) {
+  if (count === 0 || !partitioned) {
     return { ...NOTHING_RETAINED, deletedTail: stored.length, usage };
   }
-  return { count, lastId, deletedTail, usage };
+  // Proven by the partition: the rows the delete takes are exactly the ones after the prefix.
+  return { count, lastId, deletedTail: stored.length - count, usage };
 }
 
 /** The usage rows this write must REMOVE. With a probe, that is only the turns that no longer exist
