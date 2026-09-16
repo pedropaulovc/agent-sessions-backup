@@ -34,7 +34,13 @@ export default defineConfig(async () => {
       }),
     ],
     test: {
-      exclude: [...configDefaults.exclude, 'e2e/**', 'test/dev-lifecycle.test.mjs', 'test/preview-open.test.mjs', 'test/preview-upload.test.mjs', 'test/preview-control-seed.test.mjs', 'test/provision-queues.test.mjs'],
+      // Suites that run under `node --test` (own npm script each) carry a `.node.test.mjs`
+      // suffix so this stays ONE pattern. It used to be a hand-maintained list of filenames,
+      // and adding a file without adding its line handed it to the wrong runner: vitest loaded
+      // it, found no vitest `test()` registration, and failed the hub job with "0 test". A
+      // per-file list also cannot be relaxed to `*.test.mjs`, because `.mjs` alone does not
+      // imply the runner — `preview-control-trust.test.mjs` is a real vitest suite.
+      exclude: [...configDefaults.exclude, 'e2e/**', 'test/**/*.node.test.mjs'],
       setupFiles: ['./test/apply-migrations.ts'],
       // These are workers-pool INTEGRATION tests: a single `it` routinely drives several full
       // miniflare round-trips (HTTP PUT -> R2 -> D1, then a queue-consumer parse writing blocks +
