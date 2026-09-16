@@ -455,7 +455,11 @@ test('0031 drops only the costs the transcript-basis arithmetic changes', async 
       VALUES
         ('gpt-6-astra', '2026-01-01', 'gpt-6-astra', 'openai', 10, 50, 1, 'test', '2026-01-01T00:00:00Z'),
         ('claude-opus-5', '2026-01-01', 'claude-opus-5', 'anthropic', 15, 75, 1.5, 'test', '2026-01-02T00:00:00Z'),
-        ('gemini-3-pro', '2026-01-01', 'gemini-3-pro', 'vertex_ai', 2, 10, 0.2, 'test', '2026-01-01T00:00:00Z');
+        ('gemini-3-pro', '2026-01-01', 'gemini-3-pro', 'vertex_ai', 2, 10, 0.2, 'test', '2026-01-01T00:00:00Z'),
+        -- A June boundary belonging to a DIFFERENT model. priceEpochExpr pools boundaries across
+        -- every model, so a claude row timestamped in June is bucketed into this epoch even though
+        -- claude has no snapshot here and priceAt resolves it back to the January one.
+        ('gemini-3-pro', '2026-06-01', 'gemini-3-pro', 'vertex_ai', 3, 12, 0.3, 'test', '2026-06-01T00:00:00Z');
       INSERT INTO sessions (session_id, harness) VALUES
         ('v2-omp', 'omp'), ('v2-codex', 'codex'), ('v2-claude', 'claude-code'),
         ('v2-unknown', 'future-harness');
@@ -483,6 +487,12 @@ test('0031 drops only the costs the transcript-basis arithmetic changes', async 
         -- Same agreement, but priced BEFORE that snapshot was rewritten: the provider in force at
         -- pricing time is unrecoverable, so agreement with today's row proves nothing.
         ('v2-claude', 2, 'claude-opus-5', 'disjoint', 1000, 100, 900, 0.7, 0.4, 0.3, 2, '2026-01-01', '2026-01-01T12:00:00Z'),
+        -- The same case, but bucketed into a pooled epoch this model has no snapshot for. Matching
+        -- the rewritten snapshot by effective_from = price_epoch finds nothing here and leaves the
+        -- stale cost standing, which is why the rewrite test is scoped to the model.
+        ('v2-claude', 3, 'claude-opus-5', 'disjoint', 1000, 100, 900, 0.6, 0.3, 0.3, 2, '2026-06-01', '2026-01-01T12:00:00Z'),
+        -- And with the sentinel epoch a timestamp-less row gets, which is not a date at all.
+        ('v2-claude', 4, 'claude-opus-5', 'disjoint', 1000, 100, 900, 0.5, 0.2, 0.3, 2, 'unknown', '2026-01-01T12:00:00Z'),
         -- Catalog said subset, transcript says subset: unchanged.
         ('v2-codex', 1, 'gpt-6-astra', 'subset', 1000, 100, 900, 0.3, 0.2, 0.1, 2, '2026-01-01', '2026-01-03T00:00:00Z'),
         -- An unrecognised transcript source. v3 refuses a row with no basis before it looks at a
@@ -505,6 +515,8 @@ test('0031 drops only the costs the transcript-basis arithmetic changes', async 
     assert.deepEqual(usage, [
       { session_id: 'v2-claude', turn_index: 1, usd: 0.9, usd_cache_read: 0.4, priced_version: 2 },
       { session_id: 'v2-claude', turn_index: 2, usd: null, usd_cache_read: null, priced_version: 2 },
+      { session_id: 'v2-claude', turn_index: 3, usd: null, usd_cache_read: null, priced_version: 2 },
+      { session_id: 'v2-claude', turn_index: 4, usd: null, usd_cache_read: null, priced_version: 2 },
       { session_id: 'v2-codex', turn_index: 1, usd: 0.3, usd_cache_read: 0.1, priced_version: 2 },
       // Invalidated: unknown until the pass reprices it, and still due at version 2 rather than
       // reset to 0, which would be indistinguishable from never having been attempted.
@@ -523,7 +535,7 @@ test('0031 drops only the costs the transcript-basis arithmetic changes', async 
       .all()
       .map((row) => ({ ...row }));
     assert.deepEqual(costs, [
-      { session_id: 'v2-claude', cost_usd: 0.9, cost_calls: 2, cost_priced_calls: 1 },
+      { session_id: 'v2-claude', cost_usd: 0.9, cost_calls: 4, cost_priced_calls: 1 },
       { session_id: 'v2-codex', cost_usd: 0.3, cost_calls: 1, cost_priced_calls: 1 },
       { session_id: 'v2-omp', cost_usd: 2.5, cost_calls: 5, cost_priced_calls: 2 },
       // A session left with no priced row at all reports unknown, not $0.

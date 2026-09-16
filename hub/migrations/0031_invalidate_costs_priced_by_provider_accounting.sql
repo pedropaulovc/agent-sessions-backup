@@ -46,13 +46,28 @@
 --      and 0017 preserved those values, so a cached OMP or Claude Code row could have been priced
 --      as subset under a provider that today derives nothing.
 --
---   3. The snapshot it was priced against was rewritten afterwards. The sync writes with
---      `INSERT OR REPLACE` keyed on (model, effective_from), so a second run on the same day
---      corrects that day's row IN PLACE and the provider it held when the row was priced is gone.
---      0018 anticipated exactly this and stored the handles for it: `price_epoch` names the
---      snapshot used and `priced_at` when, so `fetched_at > priced_at` on that snapshot means the
---      old provider is unrecoverable. Unrecoverable is treated as disagreeing -- the alternative
---      is leaving a number nobody can justify.
+--   3. The catalog for that model was written after the row was priced. The sync writes with
+--      `INSERT OR REPLACE` keyed on (model, effective_from), so a run on the same day corrects
+--      that day's row IN PLACE and the provider it held when the row was priced is gone. 0018
+--      anticipated this and stored the handle for it -- `priced_at` -- so a snapshot whose
+--      `fetched_at` is newer than `priced_at` means the provider the row was actually priced under
+--      is unrecoverable. Unrecoverable is treated as disagreeing; the alternative is leaving a
+--      number nobody can justify.
+--
+--      Scoped to the MODEL, not to `usage.price_epoch`, even though that column names the epoch
+--      the row was bucketed into. `priceEpochExpr` pools boundaries across every model so one
+--      CASE serves the whole query, and it emits the sentinels 'unknown' and '0000-00-00'; the
+--      rate actually used is then resolved per model by `priceAt`, which walks back to the newest
+--      `effective_from` at or before that epoch (or the oldest, for a row predating them all). So
+--      `effective_from = price_epoch` frequently matches no row at all, and an arm that never
+--      fires would leave exactly the stale cost this one exists to remove.
+--
+--      The model-wide form is a superset of the true set: it also catches rows whose model merely
+--      had a rate change after they were priced. That costs nothing real. Every v2 row is already
+--      due for repricing, so the only question this migration answers is what a row displays until
+--      the pass reaches it -- a wrong number, or "unknown". The sync writes a snapshot only when
+--      rates or provider actually moved (cron/model-prices.ts), so this is not a corpus-wide blank
+--      either.
 --
 --   4. The model has no snapshot at all. A stored cost implies one existed, so its absence is the
 --      same unrecoverable case as 3.
@@ -95,7 +110,6 @@ UPDATE usage
            SELECT 1
              FROM model_prices p
             WHERE p.model = usage.model
-              AND p.effective_from IS usage.price_epoch
               AND p.fetched_at > COALESCE(usage.priced_at, '')
          )
        )
