@@ -436,6 +436,83 @@ test('0030 removes provider cache accounting without changing the remaining pric
   }
 });
 
+test('0031 drops only the costs the transcript-basis arithmetic changes', async () => {
+  const fixture = await loadFixture();
+  const database = createDatabase();
+  try {
+    applyPending(database, fixture, 30);
+    // Pre-0031 state: a corpus priced under PRICING_VERSION 2, where the convention came from the
+    // price catalog's provider. `cache_basis` is what 0029 stamped from the transcript source, so
+    // an OMP session recording an OpenAI model is exactly the disagreement that mispriced money.
+    database.exec(`
+      INSERT INTO model_prices
+        (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
+         source, fetched_at)
+      VALUES
+        ('gpt-6-astra', '2026-01-01', 'gpt-6-astra', 'openai', 10, 50, 1, 'test', '2026-01-01T00:00:00Z'),
+        ('claude-opus-5', '2026-01-01', 'claude-opus-5', 'anthropic', 15, 75, 1.5, 'test', '2026-01-01T00:00:00Z'),
+        ('gemini-3-pro', '2026-01-01', 'gemini-3-pro', 'vertex_ai', 2, 10, 0.2, 'test', '2026-01-01T00:00:00Z');
+      INSERT INTO sessions (session_id, harness) VALUES
+        ('v2-omp', 'omp'), ('v2-codex', 'codex'), ('v2-claude', 'claude-code');
+      INSERT INTO usage
+        (session_id, turn_index, model, cache_basis, input_tokens, output_tokens, cache_read_tokens,
+         usd, usd_input, usd_cache_read, priced_version)
+      VALUES
+        -- Priced subset (provider openai) against disjoint counters: the production bug.
+        ('v2-omp', 1, 'gpt-6-astra', 'disjoint', 1000, 100, 900, 0.5, 0.4, 0.1, 2),
+        -- Same disagreement, but with no cache reads the two conventions compute the same dollars.
+        ('v2-omp', 2, 'gpt-6-astra', 'disjoint', 1000, 100, 0, 0.5, 0.5, NULL, 2),
+        -- Catalog said disjoint, transcript says disjoint: the answer does not move.
+        ('v2-claude', 1, 'claude-opus-5', 'disjoint', 1000, 100, 900, 0.9, 0.5, 0.4, 2),
+        -- Catalog said subset, transcript says subset: also unchanged.
+        ('v2-codex', 1, 'gpt-6-astra', 'subset', 1000, 100, 900, 0.3, 0.2, 0.1, 2),
+        -- An unrecognised provider was never priceable WITH cache reads under v2, so this row is
+        -- already NULL and there is nothing for the migration to do to it.
+        ('v2-omp', 3, 'gemini-3-pro', 'disjoint', 1000, 100, 900, NULL, NULL, NULL, 2),
+        -- Already repriced by v3. Untouched even though its basis disagrees with the catalog --
+        -- that disagreement is the whole point of the new arithmetic.
+        ('v2-omp', 4, 'gpt-6-astra', 'disjoint', 1000, 100, 900, 2, 1.8, 0.1, 3);
+    `);
+    database.exec(`
+      UPDATE sessions
+         SET cost_usd = agg.usd, cost_calls = agg.calls, cost_priced_calls = agg.priced_calls
+        FROM (SELECT session_id, SUM(usd) AS usd, COUNT(*) AS calls, COUNT(usd) AS priced_calls
+                FROM usage GROUP BY session_id) AS agg
+       WHERE sessions.session_id = agg.session_id;
+    `);
+
+    applyPending(database, fixture, 31);
+    const usage = database
+      .prepare('SELECT session_id, turn_index, usd, usd_cache_read, priced_version FROM usage ORDER BY session_id, turn_index')
+      .all()
+      .map((row) => ({ ...row }));
+    assert.deepEqual(usage, [
+      { session_id: 'v2-claude', turn_index: 1, usd: 0.9, usd_cache_read: 0.4, priced_version: 2 },
+      { session_id: 'v2-codex', turn_index: 1, usd: 0.3, usd_cache_read: 0.1, priced_version: 2 },
+      // Invalidated: unknown until the pass reprices it, and still due at version 2 rather than
+      // reset to 0, which would be indistinguishable from never having been attempted.
+      { session_id: 'v2-omp', turn_index: 1, usd: null, usd_cache_read: null, priced_version: 2 },
+      { session_id: 'v2-omp', turn_index: 2, usd: 0.5, usd_cache_read: null, priced_version: 2 },
+      { session_id: 'v2-omp', turn_index: 3, usd: null, usd_cache_read: null, priced_version: 2 },
+      { session_id: 'v2-omp', turn_index: 4, usd: 2, usd_cache_read: 0.1, priced_version: 3 },
+    ]);
+
+    // The list page reads these columns, not `usage`. A subtotal that still included the dollars
+    // just invalidated would report a figure no row holds, at full coverage.
+    const costs = database
+      .prepare('SELECT session_id, cost_usd, cost_calls, cost_priced_calls FROM sessions ORDER BY session_id')
+      .all()
+      .map((row) => ({ ...row }));
+    assert.deepEqual(costs, [
+      { session_id: 'v2-claude', cost_usd: 0.9, cost_calls: 1, cost_priced_calls: 1 },
+      { session_id: 'v2-codex', cost_usd: 0.3, cost_calls: 1, cost_priced_calls: 1 },
+      { session_id: 'v2-omp', cost_usd: 2.5, cost_calls: 4, cost_priced_calls: 2 },
+    ]);
+  } finally {
+    database.close();
+  }
+});
+
 test('the manual price backfill writes only columns the migrated catalog still has', async () => {
   // scripts/sync-model-prices.mjs is a repo-root .mjs that no typecheck and no unit test covers,
   // and it hand-writes its INSERT against this schema. When 0030 dropped `cache_accounting` the

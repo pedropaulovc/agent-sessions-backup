@@ -150,6 +150,11 @@
       "sequence": 30,
       "filename": "0030_model_prices_drop_cache_accounting.sql",
       "sha256": "abce91cef73fe8a274ab18208fb9b4d345cb49fe6da6d9f64521c4a5173cb489"
+    },
+    {
+      "sequence": 31,
+      "filename": "0031_invalidate_costs_priced_by_provider_accounting.sql",
+      "sha256": "d05d28751ecfe1b0d793c1e46e8efe554837356c84b9e127ea69d4bad66d6335"
     }
   ]
 }
