@@ -159,6 +159,41 @@ test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then o
   assert.match(result.output, /attempt/i);
 });
 
+test('seed replays the same fixture PUT after the proven first-provision runtime 500', async () => {
+  const result = await runSeed({
+    status: 500,
+    body: 'Internal Server Error',
+    contentType: 'text/plain; charset=UTF-8',
+  });
+  assert.equal(result.status, 0, result.output);
+  const uploads = result.requests.filter((request) => request.method === 'PUT');
+  const { budget: firstBudget, started: firstStarted, ...first } = uploads[0];
+  const { budget: secondBudget, started: secondStarted, ...second } = uploads[1];
+  assert.deepEqual(second, first, 'replayed URL, method, bytes and all headers must be identical');
+  assert.ok(firstBudget > 0 && firstBudget <= 10_000);
+  assert.ok(secondBudget > 0 && secondBudget <= 10_000);
+  assert.ok(secondStarted > firstStarted, 'retry must back off');
+  assert.match(result.output, /Cloudflare runtime 500/);
+});
+
+test('permanent first-provision runtime 500 fails at the deadline without search', async () => {
+  const result = await runSeed({
+    status: 500,
+    body: 'Internal Server Error',
+    contentType: 'text/plain; charset=UTF-8',
+    permanent: true,
+    bodyDelay: 7_500,
+  });
+  assert.notEqual(result.status, 0, result.output);
+  assert.ok(result.requests.length > 1, 'the proven runtime activation failure should retry');
+  assert.ok(result.requests.every((request) => request.method === 'PUT' && request.url === `${ORIGIN}${ASSET_PATH}`));
+  assert.ok(result.requests.every((request) => request.started < 120_000));
+  assert.equal(result.elapsed, 120_000);
+  assert.ok(result.consumed.every(Boolean));
+  assert.match(result.output, /500/);
+  assert.match(result.output, /timed out|deadline|after 120s/i);
+});
+
 test('permanent Cloudflare no-worker 404 fails at the deadline without another upload or search', async () => {
   const result = await runSeed({ permanent: true, bodyDelay: 7_500 });
   assert.notEqual(result.status, 0, result.output);
@@ -190,7 +225,7 @@ for (const [name, scenario] of [
   ['Cloudflare page served as plain text', { contentType: 'text/plain' }],
   ['401 authentication denial', { status: 401 }],
   ['403 authorization denial', { status: 403 }],
-  ['500 server error', { status: 500 }],
+  ['502 server error', { status: 502 }],
 ]) {
   test(`${name} fails without replaying the fixture PUT`, async () => {
     const result = await runSeed(scenario);
