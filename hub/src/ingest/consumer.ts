@@ -1904,11 +1904,25 @@ async function writeSession(
     db.prepare('DELETE FROM blocks WHERE session_id = ?1 AND id > ?2').bind(s.id, retained.lastId),
     ...usageDeletes(db, s.id, retained, pendingUsage),
   ]);
-  // `changes` on the DELETEs is what this write actually removed — with a retained prefix that is the
-  // divergent tail, not the whole session. Both deletes count when deciding whether the session
-  // already existed: a transcript of usage-only turns (codex retains those) has usage rows and NO
-  // blocks, so keying off blocks alone would label every one of its re-parses 'initial'.
-  const priorBlocks = clearRes[3]?.meta?.changes ?? 0;
+  // How many blocks this write removed — with a retained prefix that is the divergent tail, not the
+  // whole session. `null` when nothing counted them: the export path skips the probe (to keep its
+  // subrequest estimate exact) and a session above the probe's cap is only read as far as the cap.
+  //
+  // The count comes from the probe rather than from the DELETE's own `meta.changes`, because that
+  // field is not a row count for this table: once `blocks` carries a partial index whose predicate
+  // reads `text` (migration 0032), D1 reports more changes than the statement removed. Measured
+  // 2026-09-16 against miniflare's D1 — deleting exactly one row of a six-block session reported
+  // `changes: 5`, while a before/after COUNT confirmed five rows survived, and the same index
+  // shaped as `WHERE btype = 'tool_use'` (no `text` term) reported the correct 1. Reporting `null`
+  // beats reporting a number that is wrong by an unknown factor.
+  const priorBlocks = retained.deletedTail;
+  // Classification needs only WHETHER a row was deleted, which survives the inflation: an inflated
+  // count is still 0 when the DELETE matched nothing (verified on an initial write, which reports 0
+  // with the index in place). So it reads `changes` even where the exact count is unavailable.
+  const deletedAnyBlock = (clearRes[3]?.meta?.changes ?? 0) > 0;
+  // Usage deletes count too when deciding whether the session already existed: a transcript of
+  // usage-only turns (codex retains those) has usage rows and NO blocks, so keying off blocks alone
+  // would label every one of its re-parses 'initial'.
   // The usage deletes are a variable-length tail of the batch (chunked under the parameter cap).
   const priorUsage = clearRes.slice(4).reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
 
@@ -2072,7 +2086,7 @@ async function writeSession(
         file_id: file.id,
         harness: s.harness,
         outcome,
-        write_kind: classifyWrite(retained.count, priorBlocks, priorUsage),
+        write_kind: classifyWrite(retained.count, deletedAnyBlock, priorUsage),
         blocks: blockCount,
         retained_blocks: retained.count,
         appended_blocks: blockCount - retained.count,
@@ -2253,11 +2267,14 @@ async function writeSession(
 
 /** What this write did to an existing session, as one state rather than a pile of flags:
  * `initial` nothing was there, `append` the stored rows all survived and only new ones were added,
- * `partial` a divergent tail was rewritten behind a retained prefix, `rewrite` nothing was retained. */
-function classifyWrite(retainedCount: number, deletedBlocks: number, deletedUsage: number): string {
-  if (retainedCount === 0 && deletedBlocks === 0 && deletedUsage === 0) return 'initial';
+ * `partial` a divergent tail was rewritten behind a retained prefix, `rewrite` nothing was retained.
+ *
+ * Blocks arrive as a flag rather than a count so that the state stays derivable where the exact
+ * number of deleted blocks is not (see `prior_blocks` at the call site). */
+function classifyWrite(retainedCount: number, deletedAnyBlock: boolean, deletedUsage: number): string {
+  if (retainedCount === 0 && !deletedAnyBlock && deletedUsage === 0) return 'initial';
   if (retainedCount === 0) return 'rewrite';
-  if (deletedBlocks === 0) return 'append';
+  if (!deletedAnyBlock) return 'append';
   return 'partial';
 }
 
@@ -2354,12 +2371,15 @@ interface RetainedPrefix {
   count: number;
   /** Highest `blocks.id` among them: the write deletes `id > lastId` and FTS-inserts `id > lastId`. */
   lastId: number;
+  /** How many stored blocks `id > lastId` matches: the exact size of the tail this write deletes.
+   * `null` when the probe never ran or its result was capped, so the caller has no count at all. */
+  deletedTail: number | null;
   /** Stored usage by turn index, for the independent usage diff. `null` when the probe never ran, in
    * which case the caller clears and rewrites every usage row as it always did. */
   usage: Map<number, StoredUsage> | null;
 }
 
-const NOTHING_RETAINED: RetainedPrefix = { count: 0, lastId: 0, usage: null };
+const NOTHING_RETAINED: RetainedPrefix = { count: 0, lastId: 0, deletedTail: null, usage: null };
 
 /** How much of an already-indexed session this write can leave alone.
  *
@@ -2400,7 +2420,10 @@ async function retainablePrefix(
   for (const row of (usageRes?.results ?? []) as StoredUsage[]) usage.set(row.turn_index, row);
 
   const stored = (blocksRes?.results ?? []) as StoredBlock[];
-  if (stored.length === 0 || stored.length > PREFIX_PROBE_MAX_BLOCKS) return { ...NOTHING_RETAINED, usage };
+  // Capped result: the session has more blocks than were read, so neither the prefix nor the size of
+  // the tail can be established from this probe.
+  if (stored.length > PREFIX_PROBE_MAX_BLOCKS) return { ...NOTHING_RETAINED, usage };
+  if (stored.length === 0) return { ...NOTHING_RETAINED, deletedTail: 0, usage };
 
   // No write-completeness check is needed here, and none would be sound: a torn write can leave the
   // same number of blocks it started with (all replacement chunks commit, the final batch fails), so
@@ -2410,19 +2433,27 @@ async function retainablePrefix(
   let count = 0;
   let lastId = 0;
   while (count < stored.length && count < pending.length) {
-    const a = stored[count]!;
-    const b = pending[count]!;
-    if (!sameBlock(a, b, file.id)) break;
-    // The tail is deleted by `id > lastId`, which only removes everything after the prefix if ids
-    // ascend in this order. They do when a session was written in one pass, but a session assembled
-    // by an older/partial write need not be that tidy — so verify rather than assume.
-    if (a.id <= lastId) return { ...NOTHING_RETAINED, usage };
-    lastId = a.id;
+    if (!sameBlock(stored[count]!, pending[count]!, file.id)) break;
+    lastId = stored[count]!.id;
     count++;
   }
 
-  if (count === 0) return { ...NOTHING_RETAINED, usage };
-  return { count, lastId, usage };
+  // The caller deletes `id > lastId`, so that boundary MUST separate the retained prefix from the
+  // rewritten tail: every prefix row at or below it, every later row above it. Counting the rows
+  // above the boundary is not enough — ids descending with the transcript, say `[30, 20, 10]`
+  // diverging on the third block, put exactly one row above `lastId = 20` and one row after the
+  // prefix, so the counts agree while the delete removes retained row 30 and strands divergent row
+  // 10, leaving a hole at one position and two rows at another. Ids do ascend for any session
+  // written in one pass, but `blocks.id` is just an INTEGER PRIMARY KEY and nothing in the schema
+  // promises the two orders agree, so retain nothing rather than assume — a shorter prefix only
+  // means rewriting more.
+  const partitioned = stored.every((row, i) => (i < count ? row.id <= lastId : row.id > lastId));
+  // Nothing retained means `lastId` is 0 and the delete takes the whole session.
+  if (count === 0 || !partitioned) {
+    return { ...NOTHING_RETAINED, deletedTail: stored.length, usage };
+  }
+  // Proven by the partition: the rows the delete takes are exactly the ones after the prefix.
+  return { count, lastId, deletedTail: stored.length - count, usage };
 }
 
 /** The usage rows this write must REMOVE. With a probe, that is only the turns that no longer exist

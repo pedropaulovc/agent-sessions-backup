@@ -130,6 +130,21 @@ test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then o
   const skillUpload = uploads.find((upload) => upload.url === `${ORIGIN}${SKILL_PATH}`);
   assert.ok(skillUpload, 'the managed skill package must be uploaded');
   assert.match(Buffer.from(skillUpload.body, 'base64').toString('utf8'), new RegExp(SYNTHETIC_EXPECTATIONS.skillSourceMarker));
+  // The /reports page has nothing to aggregate unless the bytes carrying the `xd://report_issue`
+  // calls reach the preview too. The browser suite only ever sees the LOCAL seeder, so without
+  // this a green Playwright run can sit beside a deployed preview whose report list is empty —
+  // the regression class PR #159 was opened for.
+  for (const report of SYNTHETIC_EXPECTATIONS.issueReports) {
+    const fixture = SYNTHETIC_EXPECTATIONS.costFixtures.find((entry) => entry.sessionId === report.sessionId);
+    assert.ok(fixture, `no seeded fixture uploads ${report.sessionId}`);
+    const encoded = fixture.relpath.split('/').map(encodeURIComponent).join('/');
+    const target = `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${fixture.store}/${encoded}`;
+    const upload = uploads.find((entry) => entry.url === `${ORIGIN}${target}`);
+    assert.ok(upload, `${fixture.file} must be uploaded to ${target}`);
+    const transcript = Buffer.from(upload.body, 'base64').toString('utf8');
+    assert.match(transcript, /xd:\/\/report_issue/, `${fixture.file} must file an issue report`);
+    assert.ok(transcript.includes(report.body), `${fixture.file} must carry its report body verbatim`);
+  }
   // One indexing probe per seeded session, and every response body read exactly once.
   const probes = 2 + SYNTHETIC_EXPECTATIONS.costFixtures.length;
   assert.equal(result.requests.filter((request) => request.method === 'GET').length, probes);

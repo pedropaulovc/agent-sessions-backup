@@ -243,4 +243,92 @@ test.describe('synthetic sessions viewer', () => {
       expect(response.byteLength).toBeGreaterThan(0);
     }
   });
+
+  test('aggregates issue reports from every session that filed one', async ({ page, appURL }) => {
+    // The e2e corpus is exactly the seeded fixtures, so both the list and the facet counts are
+    // the fixtures' own: one report from the OMP main session and one from a subagent sidecar.
+    // Two sessions is the point — a report is an ordinary tool call, and before this page the
+    // only way to find one was to already know which transcript it was buried in.
+    await page.goto(appURL('/reports'));
+    await expect(page).toHaveTitle(/Issue reports — sessions/);
+    await expect(page.getByRole('heading', { name: 'Issue reports' })).toBeVisible();
+    const reports = page.locator('.reports-page article.report');
+    await expect(reports).toHaveCount(fixture.issueReports.length);
+    await expect(page.locator('.reports-page')).toContainText(
+      `${fixture.issueReports.length} reports from ${fixture.issueReports.length} sessions`,
+    );
+    // Newest first, and the fixtures are declared in that order: the parent filed its report
+    // after the sidecar filed its own.
+    await expect(reports.first().locator('.snip')).toHaveText(fixture.issueReports[0]!.body);
+
+    for (const report of fixture.issueReports) {
+      const card = reports.filter({ hasText: report.marker });
+      await expect(card).toHaveCount(1);
+      await expect(card.locator('.snip')).toHaveText(report.body);
+      await expect(card.locator('.badge')).toHaveText(report.tool);
+      await expect(card).toContainText(`Intent: ${report.intent}`);
+      if (report.kind === 'subagent') await expect(card).toContainText('subagent');
+      // The back link addresses the reporting turn itself. The page number is the viewer's own
+      // turn-page arithmetic, so it is only required to be a page, not a particular one.
+      const target = new URL((await card.locator('.meta a').getAttribute('href'))!, page.url());
+      expect(target.pathname).toBe(`/s/${encodeURIComponent(report.sessionId)}`);
+      expect(Number(target.searchParams.get('page'))).toBeGreaterThanOrEqual(1);
+      expect(target.searchParams.get('view')).toBe('chronological');
+      expect(target.hash).toBe(`#t${report.turnIndex}`);
+    }
+  });
+
+  test('follows an issue report back to the turn that filed it', async ({ page, appURL }) => {
+    for (const report of fixture.issueReports) {
+      await page.goto(appURL('/reports'));
+      await page.locator('.reports-page article.report', { hasText: report.marker })
+        .locator('.meta a').click();
+
+      await expect(page).toHaveURL((url) =>
+        url.pathname === `/s/${encodeURIComponent(report.sessionId)}` &&
+        url.hash === `#t${report.turnIndex}`,
+      );
+      // The anchored turn is the call itself, so the report body is readable in the transcript
+      // once the tool call is expanded — which is the context the list link exists to reach.
+      const turn = page.locator(`#t${report.turnIndex}`);
+      await expect(turn).toBeVisible();
+      await turn.locator('details.tool-pair > summary').click();
+      await expect(turn.locator('details.tool-pair .tool-part pre').first()).toContainText(report.body);
+    }
+  });
+
+  test('narrows the issue report list to one reported tool', async ({ page, appURL }) => {
+    await page.goto(appURL('/reports'));
+    const filter = page.getByRole('navigation', { name: 'Filter reports by reported tool' });
+    const [selected, other] = fixture.issueReports;
+    for (const report of fixture.issueReports) {
+      await expect(filter.locator(`a[href="/reports?tool=${report.tool}"]`)).toHaveText(`${report.tool} 1`);
+    }
+
+    await filter.locator(`a[href="/reports?tool=${selected!.tool}"]`).click();
+    await expect(page).toHaveURL((url) => url.searchParams.get('tool') === selected!.tool);
+    await expect(filter.locator('a.on')).toHaveText(`${selected!.tool} 1`);
+    const reports = page.locator('.reports-page article.report');
+    await expect(reports).toHaveCount(1);
+    await expect(reports.locator('.snip')).toHaveText(selected!.body);
+    await expect(page.locator('.reports-page')).not.toContainText(other!.marker);
+
+    await filter.getByRole('link', { name: 'All', exact: true }).click();
+    await expect(reports).toHaveCount(fixture.issueReports.length);
+
+    // A label nothing carries says so rather than rendering an empty page that looks broken.
+    await page.goto(appURL('/reports?tool=no-such-tool'));
+    await expect(page.locator('.reports-page')).toContainText('No report carries that label.');
+    await expect(page.locator('.reports-page article.report')).toHaveCount(0);
+  });
+
+  test('reaches the Reports tab from the search page', async ({ page, appURL }) => {
+    await page.goto(appURL('/'));
+    await page.getByRole('link', { name: 'Reports', exact: true }).click();
+
+    await expect(page).toHaveURL((url) => url.pathname === '/reports');
+    await expect(page.getByRole('heading', { name: 'Issue reports' })).toBeVisible();
+    await expect(page.locator('.reports-page article.report').first())
+      .toContainText(fixture.issueReports[0]!.marker);
+  });
 });

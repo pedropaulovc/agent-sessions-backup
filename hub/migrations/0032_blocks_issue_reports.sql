@@ -1,0 +1,23 @@
+-- Index the `xd://report_issue` tool calls agents write, so the Reports tab is a bounded lookup.
+--
+-- `blocks` is the largest table here and D1 bills rows read, so a page a human opens cannot find a
+-- few dozen self-reported harness bugs by scanning every block. A partial index is what makes it
+-- bounded, and it is preferred to a derived table for one reason: CREATE INDEX indexes the rows
+-- that ALREADY exist, so the whole backlog of reports is queryable the moment this applies. A
+-- table would need a parser change plus a checkpointed reindex of the entire corpus to say the
+-- same thing.
+--
+-- The predicate is deliberately WIDER than "a report". SQLite matches a partial index by comparing
+-- a query's WHERE terms against the index's, so every query has to repeat this expression
+-- verbatim -- `viewer/reports.ts` holds the single copy the queries use. Keeping it structural
+-- (block type plus the device URI appearing anywhere in the recorded arguments) means reading the
+-- device's own documentation, or any future route to it, still lands in the index, and
+-- `reports.ts` decides what is a report by parsing the recorded arguments. Over-indexing costs a
+-- handful of index entries; under-indexing would silently lose reports.
+--
+-- Ingest pays for this on every block insert, which is why `btype` is the FIRST term: the AND
+-- short-circuits, so all the non-`tool_use` blocks -- the great majority -- cost one string
+-- comparison and never run the LIKE. A `tool_use` block's text is capped at 2 KB, so the scan the
+-- rest pay for is bounded too, and only ~38 rows in the current corpus reach the index itself.
+CREATE INDEX blocks_issue_reports ON blocks (ts DESC, id DESC)
+  WHERE btype = 'tool_use' AND text LIKE '%xd://report_issue%';

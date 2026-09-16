@@ -33,6 +33,10 @@ const COST_PARENT_SESSION_ID = '00000000-0000-4000-8000-000000000003';
 const COST_PARENT_STEM = `-workspace-e2e-fixtures/2026-07-02_${COST_PARENT_SESSION_ID}`;
 const COST_PARENT_RELPATH = `${COST_PARENT_STEM}.jsonl`;
 const COST_PARENT_FILE = 'e2e-cost-parent-session.jsonl';
+// Named because the issue-report expectations below have to point at this sidecar's session id,
+// and a second copy of the `omp:<parent>:<relpath>` derivation would be a copy that can rot.
+const COST_SCOUT_FILE = 'e2e-cost-scout-subagent.jsonl';
+const COST_SCOUT_SESSION_ID = `omp:${COST_PARENT_SESSION_ID}:scout-alpha.jsonl`;
 // The subset-accounting half of the fixture, and the reason it is a CODEX session rather than a
 // fourth OMP sidecar: how a stored row counts its cache reads follows the transcript SOURCE, not
 // the model's provider. An OMP sidecar reports `input` EXCLUDING cache for every provider it
@@ -60,10 +64,10 @@ const COST_FIXTURES = Object.freeze([
     marker: 'cerulean abacus',
   },
   {
-    file: 'e2e-cost-scout-subagent.jsonl',
+    file: COST_SCOUT_FILE,
     store: 'omp',
     relpath: `${COST_PARENT_STEM}/scout-alpha.jsonl`,
-    sessionId: `omp:${COST_PARENT_SESSION_ID}:scout-alpha.jsonl`,
+    sessionId: COST_SCOUT_SESSION_ID,
     kind: 'subagent',
     model: 'gpt-5-mini',
     marker: 'Subagent alpha',
@@ -230,6 +234,42 @@ export const SYNTHETIC_EXPECTATIONS = Object.freeze({
   // reads the ids and models from it, so the fan-out's shape is declared exactly once.
   costFixtures: COST_FIXTURES,
   costSubagentSessionIds: COST_FIXTURES.filter((fixture) => fixture.kind === 'subagent').map((fixture) => fixture.sessionId),
+  // The two `xd://report_issue` calls the fixtures file, which is what /reports aggregates. One
+  // sits in the OMP main session and one in a subagent sidecar, so the page has to pull reports
+  // from more than one session and link back into both shapes; the labels differ so its tool
+  // filter has two buckets to narrow between. Listed in the order the page renders them, newest
+  // first, which the parent's later timestamp puts it in.
+  //
+  // Each body opens `<tool>: ` in the strict form the page's label parser accepts — one lowercase
+  // token, colon, space — because anything looser (`Bash:`, `hub start:`, `bash:no-space`) is
+  // deliberately filed under `(unlabelled)` and would leave the tool filter with one bucket.
+  //
+  // `turnIndex` is the parser's turn ordinal, which is what the back link anchors on: the OMP
+  // parser keeps one turn per `message` record in file order, so the parent's report is turn 4 of
+  // its six (u1, a1, u2, a2, report, result) and the scout's is turn 2 of its four. Both were
+  // read back out of `parseOmp` rather than counted by eye. The reports carry NO usage — every
+  // cost figure above is arithmetic over the fixtures' usage rows, so a priced report turn would
+  // falsify all of them.
+  issueReports: Object.freeze([
+    Object.freeze({
+      sessionId: COST_PARENT_SESSION_ID,
+      kind: 'main',
+      tool: 'bash',
+      marker: 'magenta sundial',
+      body: 'bash: the persistent shell keeps a deleted magenta sundial cwd and every later command fails',
+      intent: 'Reporting the magenta sundial shell defect',
+      turnIndex: 4,
+    }),
+    Object.freeze({
+      sessionId: COST_SCOUT_SESSION_ID,
+      kind: 'subagent',
+      tool: 'hub',
+      marker: 'viridian dovetail',
+      body: 'hub: a finished viridian dovetail job reports no artifact id to its parent',
+      intent: 'Reporting the viridian dovetail job defect',
+      turnIndex: 2,
+    }),
+  ]),
 });
 
 export async function syntheticSeedManifest() {

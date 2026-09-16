@@ -6,6 +6,7 @@ import { assetEndpoint } from './assets';
 import { blobEndpoint } from './blob';
 import { exportZipEndpoint } from './export';
 import { machinesPage } from './machines';
+import { reportsPage } from './reports';
 import { searchPage } from './search';
 import { statsPage } from './stats';
 import { skillPage, skillsPage } from './skills';
@@ -99,6 +100,7 @@ function handle(url: URL, env: Env): Promise<Response> {
   if (path === '/machines') return machinesPage(env);
   if (path === '/stats') return statsPage(url, env);
   if (path === '/skills') return skillsPage(env);
+  if (path === '/reports') return reportsPage(url, env);
   const skill = path.match(/^\/skills\/(\d+)\/?$/);
   if (skill) {
     const fileId = Number(skill[1]);

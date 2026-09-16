@@ -1451,6 +1451,63 @@ describe('hub.d1.write_cost telemetry', () => {
     expect(staleFts!.n).toBe(0);
   });
 
+  it('retains nothing when stored ids do not ascend with the transcript order', async () => {
+    // The divergent tail is deleted by `id > lastId`, which only removes the rows after the retained
+    // prefix while blocks.id ascends with (turn_index, block_index). Nothing promises that — blocks.id
+    // is an INTEGER PRIMARY KEY — and on a session where the two orders disagree, retaining a prefix
+    // would leave the divergent row the delete missed AND insert a second row at its position.
+    const SHUFFLED = '66666666-5555-4444-8333-222222222222';
+    const shuffledPath = `-home-tester-src-demo/${SHUFFLED}.jsonl`;
+    expect((await putFile('testbox-wsl', 'claude-projects', shuffledPath, chained(SHUFFLED, 3))).status).toBe(201);
+    await drainQueue();
+
+    // Renumber the session so the delete boundary splits the PREFIX instead of the tail, which a count
+    // of the rows above that boundary cannot catch. A re-upload diverges on the final block (a JSONL
+    // append grows its byte_len), so the prefix is everything before it: put the first block above the
+    // boundary and the diverging last block below it, and exactly one row sits above `lastId` while
+    // exactly one row follows the prefix — the counts agree, yet `id > lastId` deletes the retained
+    // first block and strands the divergent last one.
+    // The new ids sit far above every existing one so the updates cannot collide, and stay positive
+    // and SQLite-plausible: an id of 0 or below would be a different, unreachable bug, since the
+    // full-rewrite delete uses `id > 0` as its "retain nothing" sentinel. blocks_fts is
+    // external-content and keyed by rowid, so it is rebuilt afterwards — the fixture must be a
+    // consistent session, not a corrupt one.
+    const stored = await testEnv.DB.prepare(
+      'SELECT id FROM blocks WHERE session_id = ?1 ORDER BY turn_index, block_index',
+    )
+      .bind(SHUFFLED)
+      .all<{ id: number }>();
+    const last = stored.results.length - 1;
+    expect(last).toBeGreaterThan(1);
+    const BASE = 1_000_000;
+    const shuffle = (i: number) => (i === 0 ? BASE + 9000 : i === last ? BASE + 1 : BASE + 100 + i * 10);
+    for (const [i, row] of stored.results.entries()) {
+      await testEnv.DB.prepare('UPDATE blocks SET id = ?2 WHERE id = ?1').bind(row.id, shuffle(i)).run();
+    }
+    await testEnv.DB.prepare("INSERT INTO blocks_fts (blocks_fts) VALUES ('rebuild')").run();
+
+    const events = captureLogs();
+    expect((await putFile('testbox-wsl', 'claude-projects', shuffledPath, chained(SHUFFLED, 4))).status).toBe(201);
+    await drainQueue();
+    const cost = events.filter((e) => e.event === 'hub.d1.write_cost' && e.session === SHUFFLED)[0];
+    vi.restoreAllMocks();
+
+    expect(cost).toBeTruthy();
+    expect(cost!.retained_blocks).toBe(0);
+    expect(cost!.write_kind).toBe('rewrite');
+
+    // What actually matters: the stale boundary row is gone, leaving one row per transcript position.
+    // A retained prefix here would strand it — the delete would miss it and a second row would be
+    // inserted at the same (turn_index, block_index).
+    const rows = await testEnv.DB.prepare(
+      'SELECT COUNT(*) AS n, COUNT(DISTINCT turn_index || ":" || block_index) AS distinct_positions FROM blocks WHERE session_id = ?1',
+    )
+      .bind(SHUFFLED)
+      .first<{ n: number; distinct_positions: number }>();
+    expect(rows!.n).toBe(cost!.blocks);
+    expect(rows!.distinct_positions).toBe(cost!.blocks);
+  });
+
   it('labels a session that had only usage rows a rewrite, not an initial write', async () => {
     // A codex transcript of usage-only turns indexes usage rows and NO blocks. Keying write_kind off
     // the block count alone would call every one of its re-parses 'initial' while it pays the full
