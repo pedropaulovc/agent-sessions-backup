@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
+import { pathToFileURL } from 'node:url';
 import {
   assertImmutableBase,
   assertManifestMatches,
@@ -429,6 +430,43 @@ test('0030 removes provider cache accounting without changing the remaining pric
         .all()
         .map((row) => ({ ...row })),
       [{ name: 'model_prices_model' }],
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test('the manual price backfill writes only columns the migrated catalog still has', async () => {
+  // scripts/sync-model-prices.mjs is a repo-root .mjs that no typecheck and no unit test covers,
+  // and it hand-writes its INSERT against this schema. When 0030 dropped `cache_accounting` the
+  // script kept naming it and kept importing the helper that derived it, so it was broken in two
+  // ways that only a real run would have surfaced — a run that talks to production D1.
+  //
+  // Importing it proves every named import still resolves (the module guards its own main(), so
+  // this does not sync anything), and comparing its INSERT column list against the fully migrated
+  // table proves it writes a column set the database accepts.
+  const scriptPath = path.resolve(hubRoot, '..', 'scripts', 'sync-model-prices.mjs');
+  await import(pathToFileURL(scriptPath).href);
+
+  const source = await readFile(scriptPath, 'utf8');
+  const insert = /INSERT OR REPLACE INTO model_prices \(([^)]*)\)/.exec(source);
+  assert.ok(insert, 'the script no longer contains a model_prices INSERT to check');
+  const written = insert[1]
+    .split(',')
+    .map((column) => column.trim())
+    .filter(Boolean);
+
+  const fixture = await loadFixture();
+  const database = createDatabase();
+  try {
+    applyPending(database, fixture);
+    const existing = new Set(
+      database.prepare("SELECT name FROM pragma_table_info('model_prices')").all().map((row) => row.name),
+    );
+    assert.deepEqual(
+      written.filter((column) => !existing.has(column)),
+      [],
+      'the manual backfill names model_prices columns the migrations do not define',
     );
   } finally {
     database.close();

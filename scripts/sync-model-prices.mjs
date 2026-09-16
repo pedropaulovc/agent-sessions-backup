@@ -23,7 +23,6 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 // three times in one review; the rules now live in one file.
 import {
   assertLooksLikeCatalog,
-  cacheAccountingFor,
   intOrNull,
   perM,
   lookupEntry,
@@ -99,9 +98,6 @@ function d1(sql) {
 
 const isBillable = (m) => !!m && !m.startsWith('<');
 
-/** Anthropic reports cache reads disjoint from input_tokens; OpenAI-family reports them as a
- * subset. Getting this backwards double-bills (or under-bills) every cached turn. */
-
 function extract(entry, key, model, today) {
   const provider = providerOf(entry);
   return {
@@ -121,7 +117,6 @@ function extract(entry, key, model, today) {
     output_cost_batch: perM(entry.output_cost_per_token_batches),
     max_input_tokens: intOrNull(entry.max_input_tokens),
     max_output_tokens: intOrNull(entry.max_output_tokens),
-    cache_accounting: cacheAccountingFor(provider),
   };
 }
 
@@ -135,10 +130,11 @@ const RATE_COLS = [
   'output_cost_batch',
 ];
 
-// Not rates, but they change what a row costs: cache_accounting is derived from provider, and
-// flipping subset<->disjoint changes whether cache reads are charged on top of input or
-// subtracted from it. Kept in lockstep with hub/src/cron/model-prices.ts.
-const ACCOUNTING_COLS = ['provider', 'cache_accounting'];
+// Not a rate, but a provider correction still deserves a snapshot even when every number stayed
+// the same. Cache accounting is NOT here any more: it is a property of the transcript source that
+// recorded the usage row, not of the catalog (see hub/src/cache-basis.ts). Kept in lockstep with
+// hub/src/cron/model-prices.ts.
+const METADATA_COLS = ['provider'];
 
 async function main() {
   const today = new Date().toISOString().slice(0, 10);
@@ -162,7 +158,7 @@ async function main() {
   process.stderr.write(`models to price: ${models.length}\n`);
 
   const existing = d1(
-    `SELECT model, effective_from, ${RATE_COLS.join(', ')}, ${ACCOUNTING_COLS.join(', ')}
+    `SELECT model, effective_from, ${RATE_COLS.join(', ')}, ${METADATA_COLS.join(', ')}
        FROM model_prices ORDER BY model, effective_from DESC`,
   )[0]?.results ?? [];
   const latest = new Map();
@@ -178,12 +174,12 @@ async function main() {
     }
     const next = extract(upstream[key], key, model, today);
     const prev = latest.get(model);
-    // Only snapshot when a rate -- or the accounting convention -- actually moved. Re-running
-    // daily must not grow the table.
+    // Only snapshot when a rate -- or the provider this row was read from -- actually moved.
+    // Re-running daily must not grow the table.
     const changed =
       !prev ||
       RATE_COLS.some((c) => (prev[c] ?? null) !== (next[c] ?? null)) ||
-      ACCOUNTING_COLS.some((c) => (prev[c] ?? null) !== (next[c] ?? null));
+      METADATA_COLS.some((c) => (prev[c] ?? null) !== (next[c] ?? null));
     if (changed) inserts.push(next);
   }
 
@@ -202,13 +198,13 @@ async function main() {
       `INSERT OR REPLACE INTO model_prices (model, effective_from, litellm_key, provider,
         input_cost, output_cost, cache_read_cost, cache_write_5m_cost, cache_write_1h_cost,
         input_cost_batch, output_cost_batch, max_input_tokens, max_output_tokens,
-        cache_accounting, source, fetched_at)
+        source, fetched_at)
        VALUES (${sqlStr(p.model)}, ${sqlStr(p.effective_from)}, ${sqlStr(p.litellm_key)},
         ${sqlStr(p.provider)}, ${sqlNum(p.input_cost)}, ${sqlNum(p.output_cost)},
         ${sqlNum(p.cache_read_cost)}, ${sqlNum(p.cache_write_5m_cost)},
         ${sqlNum(p.cache_write_1h_cost)}, ${sqlNum(p.input_cost_batch)},
         ${sqlNum(p.output_cost_batch)}, ${sqlNum(p.max_input_tokens)},
-        ${sqlNum(p.max_output_tokens)}, ${sqlStr(p.cache_accounting)}, 'litellm',
+        ${sqlNum(p.max_output_tokens)}, 'litellm',
         ${sqlStr(new Date().toISOString())});`,
   );
   stmts.push(
