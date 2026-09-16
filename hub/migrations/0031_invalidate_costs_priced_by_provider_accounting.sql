@@ -22,30 +22,47 @@
 -- pass rewrites them. Deliberately NOT a corpus-wide `usd = NULL`: most rows were already right,
 -- and turning a correct figure into "unknown" for the length of a backfill is its own regression.
 --
--- A row's stored cost changes only if BOTH of these hold:
+-- A row is invalidated when the v3 arithmetic would not reproduce its stored number. Four ways
+-- that happens, and the query below is one arm per way:
 --
---   1. It has cache reads. With `cache_read_tokens = 0` the two conventions compute the same
---      thing -- subset bills `input - min(read, input)` = input, disjoint bills input -- so those
---      rows keep their money.
---   2. The convention actually moved. The v2 convention was derived from the price catalog's
---      `provider` (anthropic -> disjoint; openai/azure/deepseek -> subset; anything else ->
---      unknown, which `costOfUsage` refused to price at all when a row had cache reads, so those
---      rows are already NULL and there is nothing to invalidate). `model_prices.provider` survives
---      0030, so the old answer is still recoverable here -- which is the only reason this can be
---      precise rather than corpus-wide.
+--   1. No recorded basis at all. `costOfUsage` refuses a row whose `cache_basis` is neither
+--      'disjoint' nor 'subset' BEFORE it looks at any token counter (src/pricing.ts), so such a
+--      row is unpriceable under v3 even with zero cache reads. Its stored figure is an answer the
+--      current arithmetic declines to give, so it cannot stay on display. This arm is deliberately
+--      independent of the cache-read condition below.
 --
--- Where the model has several snapshots with different providers, ANY disagreement invalidates:
--- over-invalidating costs a re-price the row was already scheduled for, while under-invalidating
--- leaves a wrong dollar figure on the statistics page. A row whose `cache_basis` is NULL (an
--- unrecognised transcript source) is invalidated for the same reason -- v3 cannot price it at all,
--- so its v2 figure is an answer the current arithmetic would refuse to give.
+-- The remaining three need cache reads to matter: with `cache_read_tokens = 0` the conventions
+-- compute the same thing -- subset bills `input - min(read, input)` = input, disjoint bills input
+-- -- so those rows keep their money. Given cache reads:
+--
+--   2. The recoverable convention disagrees. The v2 convention came from the catalog's `provider`
+--      (anthropic -> disjoint; openai/azure/deepseek -> subset; anything else -> 'unknown').
+--      `model_prices.provider` survives 0030, so that old answer is still derivable here, which is
+--      the only reason this migration can be precise rather than corpus-wide. Where a model has
+--      several snapshots, ANY disagreement invalidates: over-invalidating costs a re-price the row
+--      was already scheduled for, while under-invalidating leaves a wrong dollar figure on the
+--      statistics page. 'unknown' counts as a disagreement, which also covers the pre-0017 corpus:
+--      0016's sync stored the fallback `cache_accounting = 'subset'` for an unrecognised provider
+--      and 0017 preserved those values, so a cached OMP or Claude Code row could have been priced
+--      as subset under a provider that today derives nothing.
+--
+--   3. The snapshot it was priced against was rewritten afterwards. The sync writes with
+--      `INSERT OR REPLACE` keyed on (model, effective_from), so a second run on the same day
+--      corrects that day's row IN PLACE and the provider it held when the row was priced is gone.
+--      0018 anticipated exactly this and stored the handles for it: `price_epoch` names the
+--      snapshot used and `priced_at` when, so `fetched_at > priced_at` on that snapshot means the
+--      old provider is unrecoverable. Unrecoverable is treated as disagreeing -- the alternative
+--      is leaving a number nobody can justify.
+--
+--   4. The model has no snapshot at all. A stored cost implies one existed, so its absence is the
+--      same unrecoverable case as 3.
 --
 -- `priced_version` is left at 2 on purpose. The pass's due predicate is `priced_version < 3`, so
 -- these rows are already due, and rewriting it to 0 would make a row that was priced and
 -- invalidated indistinguishable from one nothing ever attempted.
 --
--- Cost: one scan of `usage` (776k rows) with an indexed probe per row into `model_prices`, whose
--- primary key leads with `model`. The same order of work as 0028's and 0029's backfills, once.
+-- Cost: one scan of `usage` (776k rows) with indexed probes into `model_prices`, whose primary key
+-- leads with `model`. The same order of work as 0028's and 0029's backfills, once.
 
 UPDATE usage
    SET usd = NULL,
@@ -56,25 +73,33 @@ UPDATE usage
        usd_cache_write_1h = NULL
  WHERE usd IS NOT NULL
    AND priced_version < 3
-   AND COALESCE(cache_read_tokens, 0) > 0
-   AND EXISTS (
-     SELECT 1
-       FROM model_prices p
-      WHERE p.model = usage.model
-        AND CASE p.provider
-              WHEN 'anthropic' THEN 'disjoint'
-              WHEN 'openai' THEN 'subset'
-              WHEN 'azure' THEN 'subset'
-              WHEN 'deepseek' THEN 'subset'
-              ELSE 'unknown'
-            END IN ('disjoint', 'subset')
-        AND CASE p.provider
-              WHEN 'anthropic' THEN 'disjoint'
-              WHEN 'openai' THEN 'subset'
-              WHEN 'azure' THEN 'subset'
-              WHEN 'deepseek' THEN 'subset'
-              ELSE 'unknown'
-            END IS NOT usage.cache_basis
+   AND (
+     cache_basis IS NULL
+     OR (
+       COALESCE(cache_read_tokens, 0) > 0
+       AND (
+         NOT EXISTS (SELECT 1 FROM model_prices p WHERE p.model = usage.model)
+         OR EXISTS (
+           SELECT 1
+             FROM model_prices p
+            WHERE p.model = usage.model
+              AND CASE p.provider
+                    WHEN 'anthropic' THEN 'disjoint'
+                    WHEN 'openai' THEN 'subset'
+                    WHEN 'azure' THEN 'subset'
+                    WHEN 'deepseek' THEN 'subset'
+                    ELSE 'unknown'
+                  END IS NOT usage.cache_basis
+         )
+         OR EXISTS (
+           SELECT 1
+             FROM model_prices p
+            WHERE p.model = usage.model
+              AND p.effective_from IS usage.price_epoch
+              AND p.fetched_at > COALESCE(usage.priced_at, '')
+         )
+       )
+     )
    );
 
 -- The materialized per-session subtotals are a cache of the rows just invalidated, and they are on
