@@ -388,27 +388,30 @@ async function awaitRoutableHost(host) {
   const origin = `https://${host}`;
   const deadline = Date.now() + HOST_ROUTABLE_SETTLE_MS;
   let seen = 'no response';
+  // Same budget rule as `smoke()`: every probe and every wait draws from the exact remaining
+  // deadline, with no floor that would let the last probe start with time it does not have.
+  const remaining = () => deadline - Date.now();
   for (let attempt = 0; ; attempt += 1) {
-    // Bound every probe by whichever comes first, its own cap or the settle deadline, so one
-    // stalled connection cannot stretch the wait past the budget.
-    const budget = Math.min(HOST_ROUTABLE_REQUEST_MS, Math.max(deadline - Date.now(), 1_000));
+    const left = remaining();
+    if (left <= 0) {
+      fail(`preview deployment is not routable at ${origin} after `
+        + `${Math.round(HOST_ROUTABLE_SETTLE_MS / 1000)}s: ${seen}`);
+    }
     try {
       const response = await fetch(new URL('/healthz', origin), {
         redirect: 'error',
         headers: { accept: 'application/json', 'cache-control': 'no-store' },
-        signal: AbortSignal.timeout(budget),
+        signal: AbortSignal.timeout(Math.min(HOST_ROUTABLE_REQUEST_MS, left)),
       });
       if (response.ok) return;
       seen = `status ${response.status}`;
     } catch (error) {
       seen = error.message;
     }
-    if (Date.now() >= deadline) {
-      fail(`preview deployment is not routable at ${origin} after `
-        + `${Math.round(HOST_ROUTABLE_SETTLE_MS / 1000)}s: ${seen}`);
-    }
     if (attempt === 0) process.stderr.write(`waiting for ${host} to become routable\n`);
-    await new Promise((resolve) => { setTimeout(resolve, HOST_ROUTABLE_POLL_MS); });
+    await new Promise((resolve) => {
+      setTimeout(resolve, Math.min(HOST_ROUTABLE_POLL_MS, Math.max(remaining(), 0)));
+    });
   }
 }
 
@@ -607,33 +610,41 @@ async function smoke() {
   }
 
   const deadline = Date.now() + DIAGNOSTICS_SETTLE_MS;
+  // Every request and every wait below draws from ONE budget: whatever is left of the settle
+  // deadline. An exact remainder with no floor is what keeps `smoke()` inside it — a floor would
+  // let the last request start with time it does not have — and an exhausted budget is a failure
+  // rather than a request nobody can answer in time.
+  const remaining = () => deadline - Date.now();
+  const waitForPropagation = () => new Promise((resolve) => {
+    setTimeout(resolve, Math.min(DIAGNOSTICS_POLL_MS, Math.max(remaining(), 0)));
+  });
+
   // A fresh Worker can briefly return an internal runtime error even after healthz has passed.
   // PR #165 run 35149442717 attempt 3 did so here, before this unauthenticated request could
   // reach any application binding; PRs #163 and #164 saw the same 500 on their first upload.
   // Retry only that exact status inside the existing propagation budget. Every other unexpected
-  // response still fails immediately.
+  // response still fails immediately, and so does a stall: the 500 was observed, a connection
+  // worth waiting out was not.
+  let activationError = null;
   for (let attempt = 1; ; attempt += 1) {
-    // Bounded by whichever comes first, this request's own cap or the settle deadline — the same
-    // rule the diagnostics poll below uses, so neither a stalled connection nor the retry sleep can
-    // stretch the gate check past the budget. A stall is NOT the activation-500 class this retries:
-    // it aborts and fails, because nothing has been observed to say waiting would help.
-    const budget = Math.min(DIAGNOSTICS_REQUEST_MS, Math.max(deadline - Date.now(), 1_000));
+    const left = remaining();
+    if (left <= 0) {
+      fail(`unauthenticated preview request still returns 500 after `
+        + `${Math.round(DIAGNOSTICS_SETTLE_MS / 1000)}s: ${activationError}`);
+    }
     const unauthenticated = await fetch(new URL('/api/v1/preview/diagnostics', context.origin), {
       redirect: 'error',
       headers: { accept: 'application/json', 'cache-control': 'no-store' },
-      signal: AbortSignal.timeout(budget),
+      signal: AbortSignal.timeout(Math.min(DIAGNOSTICS_REQUEST_MS, left)),
     });
     if (unauthenticated.status === 401) break;
     const body = await unauthenticated.text();
     if (unauthenticated.status !== 500) {
       fail(`unauthenticated preview request was not denied (${unauthenticated.status}): ${body.slice(0, 500)}`);
     }
-    if (Date.now() >= deadline) {
-      fail(`unauthenticated preview request still returns 500 after `
-        + `${Math.round(DIAGNOSTICS_SETTLE_MS / 1000)}s: ${body.slice(0, 500)}`);
-    }
+    activationError = body.slice(0, 500);
     if (attempt === 1) process.stderr.write('preview runtime returned 500 during activation; waiting for propagation\n');
-    await new Promise((resolve) => { setTimeout(resolve, Math.min(DIAGNOSTICS_POLL_MS, deadline - Date.now())); });
+    await waitForPropagation();
   }
 
   // A just-deployed Worker version does not reach every edge location at once, so the first
@@ -644,14 +655,17 @@ async function smoke() {
   let diagnostics = null;
   let stalled = null;
   for (let attempt = 0; ; attempt += 1) {
-    // Every request is bounded by whichever comes first, its own cap or the settle deadline, so
-    // one stalled connection cannot stretch the wait past the budget.
-    const budget = Math.min(DIAGNOSTICS_REQUEST_MS, Math.max(deadline - Date.now(), 1_000));
+    const left = remaining();
+    if (left <= 0) {
+      const seen = stalled ? `last attempt failed: ${stalled.message}` : stableJson(diagnostics);
+      fail(`preview diagnostics still do not match the provisioned artifact after `
+        + `${Math.round(DIAGNOSTICS_SETTLE_MS / 1000)}s: ${seen}`);
+    }
     let response = null;
     try {
       response = await previewFetch(context, '/api/v1/preview/diagnostics', {
         headers: { accept: 'application/json' },
-        signal: AbortSignal.timeout(budget),
+        signal: AbortSignal.timeout(Math.min(DIAGNOSTICS_REQUEST_MS, left)),
       });
     } catch (error) {
       // A stalled or reset edge connection is the same transient class as a stale version;
@@ -673,13 +687,8 @@ async function smoke() {
           && diagnostics.schemaDigest === expectedSchema) break;
       }
     }
-    if (Date.now() >= deadline) {
-      const seen = stalled ? `last attempt failed: ${stalled.message}` : stableJson(diagnostics);
-      fail(`preview diagnostics still do not match the provisioned artifact after `
-        + `${Math.round(DIAGNOSTICS_SETTLE_MS / 1000)}s: ${seen}`);
-    }
     if (attempt === 0) process.stdout.write('preview diagnostics do not match yet; waiting for the deploy to propagate\n');
-    await new Promise((resolve) => { setTimeout(resolve, DIAGNOSTICS_POLL_MS); });
+    await waitForPropagation();
   }
   process.stdout.write(`${stableJson({ smoke: 'passed', url: context.origin, artifactDigest: expectedArtifact, schemaDigest: expectedSchema })}\n`);
 }
