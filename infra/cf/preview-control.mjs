@@ -662,18 +662,23 @@ async function smoke() {
         + `${Math.round(DIAGNOSTICS_SETTLE_MS / 1000)}s: ${seen}`);
     }
     let response = null;
+    let body = null;
     try {
       response = await previewFetch(context, '/api/v1/preview/diagnostics', {
         headers: { accept: 'application/json' },
         signal: AbortSignal.timeout(Math.min(DIAGNOSTICS_REQUEST_MS, left)),
       });
+      // `fetch` resolves once headers arrive, so the abort can land while the body is still
+      // streaming. That rejection is the same transient class as a stalled connect and has to
+      // be caught here, or a mid-body reset would leave the loop instead of retrying.
+      body = await response.text();
     } catch (error) {
       // A stalled or reset edge connection is the same transient class as a stale version;
       // remember it so a run that only ever stalls fails saying so.
       stalled = error;
+      response = null;
     }
     if (response) {
-      const body = await response.text();
       if (response.status === 500) {
         stalled = new Error(`runtime returned 500: ${body.slice(0, 500)}`);
         response = null;
