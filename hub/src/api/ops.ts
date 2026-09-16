@@ -635,8 +635,11 @@ export async function usage(url: URL, env: Env): Promise<Response> {
     // and cost — and losing one of the two buckets from the response. A Map handles a null key
     // natively, so no sentinel is needed.
     const key = (r.bucket ?? null) as string | null;
-    const agg = byBucket.get(key) ?? {
+    const rowBasis = r.cache_basis === 'disjoint' || r.cache_basis === 'subset' ? r.cache_basis : null;
+    const existing = byBucket.get(key);
+    const agg = existing ?? {
       bucket: r.bucket,
+      cache_basis: rowBasis,
       calls: 0,
       input_tokens: 0,
       output_tokens: 0,
@@ -648,6 +651,9 @@ export async function usage(url: URL, env: Env): Promise<Response> {
       cost_usd: 0,
       unpriced_calls: 0,
     };
+    // The convention follows the transcript source, not the provider. Fold the stored values:
+    // neither a model label nor a bucket label is evidence (a machine bucket can be "claude-box").
+    if (existing && agg.cache_basis !== rowBasis) agg.cache_basis = 'mixed';
     for (const k of TOKEN_COLS) agg[k] += Number(r[k] ?? 0);
     agg.calls += Number(r.calls ?? 0);
 
@@ -720,10 +726,13 @@ const MAX_BUCKETS = 400;
 interface UsageBucketRow extends UsageAggRow {
   bucket: string | null;
 }
-type UsageOutRow = { bucket: string | null; calls: number; cost_usd: number; unpriced_calls: number } & Record<
-  (typeof TOKEN_COLS)[number] | 'billable_input_tokens',
-  number
->;
+type UsageOutRow = {
+  bucket: string | null;
+  cache_basis: 'disjoint' | 'subset' | 'mixed' | null;
+  calls: number;
+  cost_usd: number;
+  unpriced_calls: number;
+} & Record<(typeof TOKEN_COLS)[number] | 'billable_input_tokens', number>;
 
 // A Worker invocation gets ~1000 subrequests, and EVERY D1 query counts — including each statement in a
 // batch. One page's worst case is ~3 statements per object: a machine upsert (when every object is on a

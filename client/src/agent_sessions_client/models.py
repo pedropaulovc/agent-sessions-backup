@@ -155,15 +155,15 @@ class UsageRow:
     # Calls the hub could not price at all (no published rate for the model). A non-zero value
     # means cost_usd is a floor, not a total.
     unpriced_calls: int = 0
-    # The `group_by` this row was fetched with — needed by total_tokens below to know whether
-    # `bucket` is actually a model name (see that property's docstring). Defaults to "model"
-    # so directly-constructed rows (as in existing tests that only ever use model buckets)
-    # keep the additive-when-claude-prefixed behavior without every call site having to pass
-    # it; from_row() below always sets it explicitly from the real request/response.
-    group_by: str = "model"
+    # How this bucket's rows count their cache reads, folded by the hub from the rows
+    # themselves: "disjoint" (reads are extra tokens beside `input_tokens`), "subset" (reads
+    # are already inside `input_tokens`), "mixed" (the bucket aggregates both conventions, so
+    # no single total is right), or None (no row carried a convention). None is UNKNOWN, not
+    # zero — total_tokens must not assume either convention for it.
+    cache_basis: str | None = None
 
     @classmethod
-    def from_row(cls, row: dict, *, group_by: str) -> UsageRow:
+    def from_row(cls, row: dict) -> UsageRow:
         return cls(
             bucket=row.get("bucket"),
             calls=row.get("calls") or 0,
@@ -176,54 +176,28 @@ class UsageRow:
             cost_usd=row.get("cost_usd") or 0.0,
             billable_input_tokens=row.get("billable_input_tokens") or 0,
             unpriced_calls=row.get("unpriced_calls") or 0,
-            group_by=group_by,
+            cache_basis=row.get("cache_basis"),
         )
 
     @property
     def total_tokens(self) -> int:
-        """Provider-aware token total — `cache_read_tokens` AND `reasoning_tokens` mean
-        different things per provider and can't be summed uniformly on top of
-        `input_tokens`/`output_tokens`:
+        """Total tokens under this bucket's recorded `cache_basis`: `cache_read_tokens` is
+        added only for "disjoint", where it sits beside `input_tokens`; for "subset" it is
+        already counted inside `input_tokens` (as is `reasoning_tokens` inside
+        `output_tokens`), so adding it double-counts. "mixed" and None have no single right
+        answer, so they get the subset-style total — undercounting is safer here because this
+        value drives "biggest spender" rankings.
 
-        - Anthropic (claude-code): `cache_read_tokens` is DISJOINT from `input_tokens` (a
-          cache hit is billed/reported separately) — must be added. `reasoning_tokens` is
-          never populated for this harness (see `hub/src/ingest/parsers/claude-code.ts`, no
-          `reasoningTokens` field) — always 0, so whether it's "added" is moot; kept additive
-          here on the theory that if Anthropic ever reports a genuinely separate thinking-
-          token count, it'd behave like cache_read (a disjoint category), not like codex's
-          reasoning count.
-        - OpenAI (codex): checked `hub/src/ingest/parsers/codex.ts` — `cacheReadTokens` comes
-          from `cached_input_tokens`, a SUBSET of `input_tokens`, and `reasoningTokens` comes
-          from `reasoning_output_tokens`, a SUBSET of `output_tokens` (OpenAI's Responses API
-          reports both as breakdowns of, not additions to, `input_tokens`/`output_tokens`).
-          Adding either on top double-counts. Verified against production and against
-          `hub/test/fixtures.ts`'s codex usage fixture: input=900/cached=500/output=80/
-          reasoning=20 has a real total of 980 (900+80), not 1000 (900+80+20, reasoning
-          double-counted) and not 1480 (also double-counting cache_read).
-
-        The only per-row discriminator this dataclass has is `bucket`, which is the model
-        name ONLY when `group_by` (see the field above) is `"model"` (the daily-report CLI
-        always uses `group_by=model` — see cli.py). For any other `group_by`
-        (day/machine/repo), `bucket` mixes rows from multiple providers under one aggregate,
-        so there is no correct per-row answer; treating it as Anthropic-additive would be
-        right for the Anthropic share and wrong for the OpenAI share — and worse, `bucket`
-        could coincidentally start with `claude` for an unrelated reason (a machine_id like
-        `claude-box`, a repo path under `claude-tools/`), corrupting a mixed or even
-        entirely-Codex aggregate. The claude-prefix check below is therefore gated on
-        `group_by == "model"` first; every other grouping unconditionally gets the
-        conservative (OpenAI-style, cache_read and reasoning excluded) treatment —
-        undercounting a mixed/unresolved bucket is safer than double-counting it, since this
-        value feeds "biggest spender" rankings. Verified against production usage rows
-        (2026-07-18): every claude-code-harness model starts with `claude` (e.g.
-        `claude-fable-5`); every codex-harness model does not (`gpt-5.x`, `gpt-5.x-codex`).
-        Future provider/model-naming drift could break this — if a new provider's model names
-        start with `claude` (unlikely) or an Anthropic model line drops the prefix, this
-        heuristic needs revisiting.
+        This used to be guessed from a `claude` prefix on the bucket label, which is unsound:
+        the convention belongs to the transcript source the hub ingested, not to the model.
+        OMP reports cache reads BESIDE input for every provider it drives, while Codex reports
+        them INSIDE input — so an OMP-recorded `gpt-*` session is disjoint and the very same
+        model under Codex is subset. The prefix rule silently dropped every cache read of the
+        former, and was right about `claude` models only by coincidence.
         """
-        is_anthropic_like = self.group_by == "model" and bool(self.bucket) and self.bucket.startswith("claude")
         total = self.input_tokens + self.output_tokens + self.cache_creation_5m_tokens + self.cache_creation_1h_tokens
-        if is_anthropic_like:
-            total += self.cache_read_tokens + self.reasoning_tokens
+        if self.cache_basis == "disjoint":
+            return total + self.cache_read_tokens
         return total
 
 

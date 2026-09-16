@@ -215,8 +215,9 @@ export const SYNTHETIC_EXPECTATIONS = Object.freeze({
   costParentOwnLabel: '$1.23',
   // Disjoint accounting: 400k reads over 120k input + 400k reads + 80k writes. The writes belong
   // in the denominator — they are prompt tokens the provider had to read fresh — and leaving them
-  // out is what let a cache-heavy session render a flat 100.0%.
-  costParentHitRate: '66.7%',
+  // out is what let a cache-heavy session render a flat 100.0%. The share is 66.66…% and renders
+  // 66.6%: the formatter floors, so a hit rate is never overstated and only an exact 1 reads 100.0%.
+  costParentHitRate: '66.6%',
   // The codex root session, the only fixture whose stored `input` already CONTAINS its cache
   // reads: 400k of 800k input, on the same gpt-5-mini rates as the scout sidecar above.
   costSubsetSessionId: COST_CODEX_SESSION_ID,

@@ -229,6 +229,39 @@ describe('sentinel rows with unknown source accounting', () => {
   });
 });
 
+describe('cache accounting basis per bucket', () => {
+  beforeAll(async () => {
+    await seedSession('sess-basis-only', 'basis-only-box', 'omp');
+    await seedUsage('sess-basis-only', '2026-05-01T10:00:00Z', 'basis-model', { input: 100, cacheRead: 40 });
+
+    await seedSession('sess-basis-disjoint', 'basis-mixed-box', 'omp');
+    await seedSession('sess-basis-subset', 'basis-mixed-box', 'codex');
+    await seedUsage('sess-basis-disjoint', '2026-05-01T11:00:00Z', 'basis-model', {
+      input: 100,
+      cacheRead: 40,
+    });
+    await seedUsage('sess-basis-subset', '2026-05-01T12:00:00Z', 'basis-model', {
+      input: 100,
+      cacheRead: 40,
+    });
+
+    await seedSession('sess-basis-known', 'basis-partial-box', 'omp');
+    await seedSession('sess-basis-unknown', 'basis-partial-box', 'unknown-harness');
+    await seedUsage('sess-basis-known', '2026-05-01T13:00:00Z', 'basis-model', { input: 100 });
+    await seedUsage('sess-basis-unknown', '2026-05-01T14:00:00Z', 'basis-model', { input: 100 });
+  });
+
+  it('reports one stored convention and folds differing or partial conventions to mixed', async () => {
+    const one = (await fetchUsage('group_by=machine&machine=basis-only-box')).rows[0]!;
+    const mixed = (await fetchUsage('group_by=machine&machine=basis-mixed-box')).rows[0]!;
+    const partial = (await fetchUsage('group_by=machine&machine=basis-partial-box')).rows[0]!;
+
+    expect(one.cache_basis).toBe('disjoint');
+    expect(mixed.cache_basis).toBe('mixed');
+    expect(partial.cache_basis).toBe('mixed');
+  });
+});
+
 describe('a NULL bucket is not the string "null"', () => {
   beforeAll(async () => {
     // Two sessions on one machine: one with no repo_url at all, one whose repo_url is the

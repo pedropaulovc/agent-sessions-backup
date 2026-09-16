@@ -2,6 +2,7 @@ from agent_sessions_client.config import AuthMode, ClientConfig
 from agent_sessions_client.endpoints import MAX_SESSIONS_LIMIT, SessionsApi
 from agent_sessions_client.http import HubClient
 from conftest import make_session_row
+from fake_hub import make_usage_row
 
 
 def api_for(hub) -> SessionsApi:
@@ -186,33 +187,49 @@ def test_search_preserves_explicit_lower_limit(hub):
 
 def test_usage_group_by_model(hub):
     hub.usage_rows = [
-        {
-            "bucket": "claude-sonnet-5",
-            "calls": 10,
-            "input_tokens": 100,
-            "output_tokens": 200,
-            "reasoning_tokens": 0,
-            "cache_read_tokens": 50,
-            "cache_creation_5m_tokens": 5,
-            "cache_creation_1h_tokens": 0,
-        }
+        make_usage_row(
+            "claude-sonnet-5",
+            cache_basis="disjoint",
+            calls=10,
+            input_tokens=100,
+            output_tokens=200,
+            cache_read_tokens=50,
+            cache_creation_5m_tokens=5,
+        )
     ]
     report = api_for(hub).usage(group_by="model", from_="2026-07-18", to="2026-07-18")
     assert report.group_by == "model"
-    assert report.rows[0].total_tokens == 100 + 200 + 0 + 50 + 5 + 0
+    assert report.rows[0].cache_basis == "disjoint"
+    assert report.rows[0].total_tokens == 100 + 200 + 50 + 5
+
+
+def test_usage_takes_each_bucket_cache_basis_from_the_response(hub):
+    # Same numbers under both conventions: the client must total them from what the hub
+    # recorded per bucket, never from the bucket label (a `gpt-*` bucket is disjoint when OMP
+    # recorded the session and subset when Codex did), and must not invent a default when the
+    # hub reports no convention at all.
+    hub.usage_rows = [
+        make_usage_row("gpt-5.6-sol", cache_basis="disjoint", input_tokens=900, output_tokens=80, reasoning_tokens=20, cache_read_tokens=500),
+        make_usage_row("gpt-5.6-sol", cache_basis="subset", input_tokens=900, output_tokens=80, reasoning_tokens=20, cache_read_tokens=500),
+        make_usage_row("gpt-5.6-sol", cache_basis=None, input_tokens=900, output_tokens=80, reasoning_tokens=20, cache_read_tokens=500),
+    ]
+    rows = api_for(hub).usage(group_by="model").rows
+    assert [r.cache_basis for r in rows] == ["disjoint", "subset", None]
+    assert [r.total_tokens for r in rows] == [1480, 980, 980]
 
 
 def test_usage_parses_pricing_fields(hub):
     hub.usage_rows = [
-        {
-            "bucket": "claude-sonnet-5",
-            "calls": 10,
-            "input_tokens": 100,
-            "output_tokens": 200,
-            "cost_usd": 1.25,
-            "billable_input_tokens": 60,
-            "unpriced_calls": 2,
-        }
+        make_usage_row(
+            "claude-sonnet-5",
+            cache_basis="disjoint",
+            calls=10,
+            input_tokens=100,
+            output_tokens=200,
+            cost_usd=1.25,
+            billable_input_tokens=60,
+            unpriced_calls=2,
+        )
     ]
     hub.usage_unpriced_models = ["brand-new-model"]
     report = api_for(hub).usage(group_by="model")
