@@ -606,13 +606,28 @@ async function smoke() {
     fail('smoke requires --artifact-digest and --schema-digest from the provision step');
   }
 
-  // The bearer is the entire gate: the same request without it must be rejected.
-  const unauthenticated = await fetch(new URL('/api/v1/preview/diagnostics', context.origin), {
-    redirect: 'error',
-    headers: { accept: 'application/json', 'cache-control': 'no-store' },
-  });
-  if (unauthenticated.status !== 401) {
-    fail(`unauthenticated preview request was not denied (${unauthenticated.status})`);
+  const deadline = Date.now() + DIAGNOSTICS_SETTLE_MS;
+  // A fresh Worker can briefly return an internal runtime error even after healthz has passed.
+  // PR #165 run 35149442717 attempt 3 did so here, before this unauthenticated request could
+  // reach any application binding; PRs #163 and #164 saw the same 500 on their first upload.
+  // Retry only that exact status inside the existing propagation budget. Every other unexpected
+  // response still fails immediately.
+  for (let attempt = 1; ; attempt += 1) {
+    const unauthenticated = await fetch(new URL('/api/v1/preview/diagnostics', context.origin), {
+      redirect: 'error',
+      headers: { accept: 'application/json', 'cache-control': 'no-store' },
+    });
+    if (unauthenticated.status === 401) break;
+    const body = await unauthenticated.text();
+    if (unauthenticated.status !== 500) {
+      fail(`unauthenticated preview request was not denied (${unauthenticated.status}): ${body.slice(0, 500)}`);
+    }
+    if (Date.now() >= deadline) {
+      fail(`unauthenticated preview request still returns 500 after `
+        + `${Math.round(DIAGNOSTICS_SETTLE_MS / 1000)}s: ${body.slice(0, 500)}`);
+    }
+    if (attempt === 1) process.stderr.write('preview runtime returned 500 during activation; waiting for propagation\n');
+    await new Promise((resolve) => { setTimeout(resolve, DIAGNOSTICS_POLL_MS); });
   }
 
   // A just-deployed Worker version does not reach every edge location at once, so the first
@@ -622,7 +637,6 @@ async function smoke() {
   // headSha for seconds, then the correct one.
   let diagnostics = null;
   let stalled = null;
-  const deadline = Date.now() + DIAGNOSTICS_SETTLE_MS;
   for (let attempt = 0; ; attempt += 1) {
     // Every request is bounded by whichever comes first, its own cap or the settle deadline, so
     // one stalled connection cannot stretch the wait past the budget.
@@ -638,15 +652,20 @@ async function smoke() {
       // remember it so a run that only ever stalls fails saying so.
       stalled = error;
     }
-    if (response && !response.ok) {
-      fail(`preview diagnostics smoke failed with ${response.status}: ${(await response.text()).slice(0, 500)}`);
-    }
     if (response) {
-      stalled = null;
-      diagnostics = await response.json();
-      if (diagnostics.headSha === sha
-        && diagnostics.artifactDigest === expectedArtifact
-        && diagnostics.schemaDigest === expectedSchema) break;
+      const body = await response.text();
+      if (response.status === 500) {
+        stalled = new Error(`runtime returned 500: ${body.slice(0, 500)}`);
+        response = null;
+      } else if (!response.ok) {
+        fail(`preview diagnostics smoke failed with ${response.status}: ${body.slice(0, 500)}`);
+      } else {
+        stalled = null;
+        diagnostics = JSON.parse(body);
+        if (diagnostics.headSha === sha
+          && diagnostics.artifactDigest === expectedArtifact
+          && diagnostics.schemaDigest === expectedSchema) break;
+      }
     }
     if (Date.now() >= deadline) {
       const seen = stalled ? `last attempt failed: ${stalled.message}` : stableJson(diagnostics);
@@ -708,8 +727,11 @@ async function seed() {
         'x-file-mtime': '2026-07-01T00:00:00.000Z',
       },
     };
-    // Routing is not monotonic after healthz/diagnostics pass (PR #150). Only replay these
-    // content-addressed synthetic PUTs, and only for Cloudflare's identifiable no-worker page.
+    // These PUTs are content-addressed and therefore safe to replay during the bounded activation
+    // window. PR #150 proved routing can regress to Cloudflare's no-worker page after diagnostics;
+    // PRs #163/#164 failed their first PUT with 500, and PR #165 run 35149442717 attempt 3 proved
+    // the same 500 can occur on an unauthenticated diagnostics request before application code or
+    // bindings run. Retry only those two observed statuses; every other failure remains immediate.
     const deadline = Date.now() + HOST_ROUTABLE_SETTLE_MS;
     let seen = 'no response';
     const timeout = () => fail(`synthetic preview upload timed out at ${context.origin}${target} `
@@ -738,11 +760,14 @@ async function seed() {
         && /^text\/html(?:\s*;|$)/i.test(response.headers.get('content-type') ?? '')
         && /<title>\s*Page not found\s*<\/title>/i.test(body)
         && /<link\b(?=[^>]*\brel\s*=\s*["'](?:shortcut\s+)?icon["'])(?=[^>]*\bhref\s*=\s*["']https:\/\/workers\.cloudflare\.com\/[^"']*["'])[^>]*>/i.test(body);
-      if (!noWorker) {
-        fail(`synthetic preview upload failed at ${context.origin}${target}: ${seen}`);
+      const runtimeActivation = response.status === 500;
+      if (!noWorker && !runtimeActivation) {
+        fail(`synthetic preview upload failed at ${context.origin}${target}: ${seen}; `
+          + `body=${JSON.stringify(body.slice(0, 500))}`);
       }
+      const transient = noWorker ? 'Cloudflare no-worker 404' : 'Cloudflare runtime 500';
       process.stderr.write(`synthetic preview upload ${context.origin}${target} attempt ${attempt} `
-        + `returned Cloudflare no-worker 404; retrying\n`);
+        + `returned ${transient}; retrying\n`);
       await new Promise((resolve) => {
         setTimeout(resolve, Math.min(HOST_ROUTABLE_POLL_MS, deadline - Date.now()));
       });
