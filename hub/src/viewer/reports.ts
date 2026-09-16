@@ -123,8 +123,15 @@ export async function reportsPage(url: URL, env: Env): Promise<Response> {
   return page({ title: 'Issue reports — sessions', nav: 'reports', body });
 }
 
-/** A stored `tool_use` block's text is `<tool name> <JSON arguments>`; a report is a write whose
+/** A stored `tool_use` block's text is `<tool name> <JSON arguments>`; a report is a call whose
  * `path` is the device and which carries the `content` it wrote.
+ *
+ * The invoking tool's name is deliberately not part of that test. `write` is the documented route
+ * to a tool device and the only one the corpus this was built against uses, but the device URI is
+ * what identifies a report: a call that put content there filed a report whatever tool carried it,
+ * and no other tool takes a `path` plus a string `content` anyway. The alternative — pinning the
+ * name — would silently drop reports the day the harness adds another route, which is the same
+ * trade the index makes by matching more than it needs.
  *
  * Returns null for anything else in the index — notably a `read` of the device's documentation,
  * which has the path but no content, and a block whose arguments were cut off by the 2 KB
@@ -180,8 +187,9 @@ function renderIntro(reports: IssueReport[], capped: boolean): string {
     `documented contract. False positives are expected, so treat each one as a lead rather than a ` +
     `confirmed defect, and follow the link to read what the agent was doing.</p>` +
     (capped
-      ? `<p class="warn">More than ${MAX_REPORTS} reports are indexed. This page shows the ` +
-        `${MAX_REPORTS} most recent, and the counts below describe only those.</p>`
+      ? `<p class="warn">More than ${MAX_REPORTS} candidate rows are indexed. This page reads the ` +
+        `${MAX_REPORTS} most recent of them, so an older report may be missing and every count ` +
+        `below describes only the reports inside that window.</p>`
       : '');
 }
 
