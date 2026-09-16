@@ -613,9 +613,15 @@ async function smoke() {
   // Retry only that exact status inside the existing propagation budget. Every other unexpected
   // response still fails immediately.
   for (let attempt = 1; ; attempt += 1) {
+    // Bounded by whichever comes first, this request's own cap or the settle deadline — the same
+    // rule the diagnostics poll below uses, so neither a stalled connection nor the retry sleep can
+    // stretch the gate check past the budget. A stall is NOT the activation-500 class this retries:
+    // it aborts and fails, because nothing has been observed to say waiting would help.
+    const budget = Math.min(DIAGNOSTICS_REQUEST_MS, Math.max(deadline - Date.now(), 1_000));
     const unauthenticated = await fetch(new URL('/api/v1/preview/diagnostics', context.origin), {
       redirect: 'error',
       headers: { accept: 'application/json', 'cache-control': 'no-store' },
+      signal: AbortSignal.timeout(budget),
     });
     if (unauthenticated.status === 401) break;
     const body = await unauthenticated.text();
@@ -627,7 +633,7 @@ async function smoke() {
         + `${Math.round(DIAGNOSTICS_SETTLE_MS / 1000)}s: ${body.slice(0, 500)}`);
     }
     if (attempt === 1) process.stderr.write('preview runtime returned 500 during activation; waiting for propagation\n');
-    await new Promise((resolve) => { setTimeout(resolve, DIAGNOSTICS_POLL_MS); });
+    await new Promise((resolve) => { setTimeout(resolve, Math.min(DIAGNOSTICS_POLL_MS, deadline - Date.now())); });
   }
 
   // A just-deployed Worker version does not reach every edge location at once, so the first
