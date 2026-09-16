@@ -59,6 +59,10 @@ async function runSmoke(scenario) {
           url: new URL(input).href, authorized, budget, started: now,
           redirect: init.redirect, cacheControl: headers['cache-control'],
         });
+        // A response that takes real time makes the clock land off the poll interval. Without
+        // it every timestamp is a multiple of the poll and a loop that overshoots the deadline
+        // can still come out even, which would let a fixed sleep pass the elapsed assertion.
+        now += scenario.responseDelay ?? 0;
         if (!authorized) {
           unauthenticated += 1;
           if (scenario.activationFailures === 'always' || unauthenticated <= (scenario.activationFailures ?? 0)) {
@@ -112,6 +116,10 @@ async function runSmoke(scenario) {
 // deadline checked only after a response, lets the last request start with time it does not
 // have — both were real defects in this file, caught in review rather than here.
 function assertInsideDeadline(result) {
+  // Per-request bounds are not sufficient on their own: an overlong final wait can carry the
+  // clock past the deadline before the loop reports failure, with every request still inside it.
+  assert.ok(result.elapsed <= SETTLE_MS,
+    `smoke ran ${result.elapsed}ms, past the ${SETTLE_MS}ms settle deadline`);
   for (const request of result.requests) {
     assert.ok(request.started < SETTLE_MS,
       `request at ${request.started}ms started past the ${SETTLE_MS}ms deadline`);
@@ -152,7 +160,9 @@ test('smoke waits for a stale version to propagate instead of failing the deploy
 });
 
 test('smoke fails inside the settle deadline when the runtime never stops returning 500', async () => {
-  const result = await runSmoke({ activationFailures: 'always' });
+  // 700ms per response is deliberately not a divisor of the 3s poll: the clock lands off the
+  // interval, so a loop that sleeps a fixed 3s overshoots the deadline instead of landing on it.
+  const result = await runSmoke({ activationFailures: 'always', responseDelay: 700 });
   assert.equal(result.status, 1);
   assert.match(result.stderr, /unauthenticated preview request still returns 500 after 90s/);
   assert.match(result.stderr, /internal error/);
