@@ -54,20 +54,16 @@
 --      is unrecoverable. Unrecoverable is treated as disagreeing; the alternative is leaving a
 --      number nobody can justify.
 --
---      Scoped to the MODEL, not to `usage.price_epoch`, even though that column names the epoch
---      the row was bucketed into. `priceEpochExpr` pools boundaries across every model so one
---      CASE serves the whole query, and it emits the sentinels 'unknown' and '0000-00-00'; the
---      rate actually used is then resolved per model by `priceAt`, which walks back to the newest
---      `effective_from` at or before that epoch (or the oldest, for a row predating them all). So
---      `effective_from = price_epoch` frequently matches no row at all, and an arm that never
---      fires would leave exactly the stale cost this one exists to remove.
---
---      The model-wide form is a superset of the true set: it also catches rows whose model merely
---      had a rate change after they were priced. That costs nothing real. Every v2 row is already
---      due for repricing, so the only question this migration answers is what a row displays until
---      the pass reaches it -- a wrong number, or "unknown". The sync writes a snapshot only when
---      rates or provider actually moved (cron/model-prices.ts), so this is not a corpus-wide blank
---      either.
+--      Which snapshot is "the one it was priced against" takes a resolution step rather than an
+--      equality. `usage.price_epoch` names a bucket, not a snapshot: `priceEpochExpr` pools
+--      boundaries across every model so one CASE serves the whole query, and emits the sentinels
+--      'unknown' and '0000-00-00'. `priceAt` then picks the model's newest `effective_from` at or
+--      before that epoch, or its oldest for a row predating them all. So the arm below reproduces
+--      that selection: matching on `effective_from = price_epoch` would often match no row at all
+--      (a claude row bucketed into some other model's boundary), while accepting ANY later
+--      snapshot would blank costs the new arithmetic reproduces exactly -- a January cost priced
+--      before a February rate change is still correct, and hiding it understates the totals for
+--      the length of the backfill.
 --
 --   4. The model has no snapshot at all. A stored cost implies one existed, so its absence is the
 --      same unrecoverable case as 3.
@@ -111,6 +107,21 @@ UPDATE usage
              FROM model_prices p
             WHERE p.model = usage.model
               AND p.fetched_at > COALESCE(usage.priced_at, '')
+              AND (
+                -- The 'unknown' epoch is not resolved to one snapshot: `priceForGroup` prices such
+                -- a row only when EVERY snapshot agrees on rates, so any of them being rewritten
+                -- puts the stored figure in doubt.
+                usage.price_epoch = 'unknown'
+                -- Otherwise exactly the snapshot `priceAt` selects: the newest effective_from at
+                -- or before the epoch, falling back to the oldest for a row that predates them
+                -- all (the '0000-00-00' sentinel, and any epoch below the model's first
+                -- snapshot). A LATER snapshot is not evidence about this row: a January cost
+                -- priced before a February rate change is still what v3 recomputes.
+                OR p.effective_from = COALESCE(
+                     (SELECT MAX(q.effective_from) FROM model_prices q
+                       WHERE q.model = usage.model AND q.effective_from <= usage.price_epoch),
+                     (SELECT MIN(q.effective_from) FROM model_prices q WHERE q.model = usage.model))
+              )
          )
        )
      )
