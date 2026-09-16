@@ -25,8 +25,8 @@ async function seedPrice(
     `INSERT INTO model_prices
        (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
         cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
-        cache_accounting, source, fetched_at)
-     VALUES (?1, ?2, ?1, 'anthropic', ?3, ?4, 0.1, 2, 4, NULL, NULL, 'disjoint', 'test',
+        source, fetched_at)
+     VALUES (?1, ?2, ?1, 'anthropic', ?3, ?4, 0.1, 2, 4, NULL, NULL, 'test',
              '2026-07-31T00:00:00Z')`,
   )
     .bind(over.model ?? 'm1', over.from ?? '2026-01-01', over.input === undefined ? 1 : over.input, over.output === undefined ? 10 : over.output)
@@ -36,18 +36,19 @@ async function seedPrice(
 let turn = 0;
 async function seedTurn(
   sessionId: string,
-  over: Partial<{ ts: string | null; model: string | null; input: number; output: number }> = {},
+  over: Partial<{ ts: string | null; model: string | null; input: number; output: number; cache_basis: 'disjoint' | 'subset' | null }> = {},
 ): Promise<number> {
   turn++;
   const res = await testEnv.DB.prepare(
-    `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6) RETURNING id`,
+    `INSERT INTO usage (session_id, turn_index, ts, model, cache_basis, input_tokens, output_tokens)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) RETURNING id`,
   )
     .bind(
       sessionId,
       turn,
       over.ts === undefined ? '2026-07-20T10:00:00.000Z' : over.ts,
       over.model === undefined ? 'm1' : over.model,
+      over.cache_basis === undefined ? 'disjoint' : over.cache_basis,
       over.input ?? 1_000_000,
       over.output ?? 0,
     )
@@ -144,6 +145,27 @@ describe('priceUsage', () => {
       (r.usd_input ?? 0) + (r.usd_output ?? 0) + (r.usd_cache_read ?? 0) +
       (r.usd_cache_write_5m ?? 0) + (r.usd_cache_write_1h ?? 0);
     expect(parts, 'the class breakdown does not reconcile with the stored total').toBeCloseTo(r.usd ?? 0, 9);
+  });
+  it('leaves a row with NULL cache basis visibly unpriced', async () => {
+    // A catalog rate cannot repair missing transcript-source metadata. The pass must preserve
+    // NULL usd rather than turn the unknown accounting equation into a misleading $0.
+    await seedPrice();
+    const id = await seedTurn('s1', { cache_basis: null });
+
+    const res = await priceUsage(testEnv.DB, { now: NOW });
+
+    expect((await priced(id)).usd).toBeNull();
+    expect(res).toMatchObject({ examined: 1, priced: 0, unpriceable: 1 });
+  });
+  it('does not turn a NULL-basis sentinel into a priced zero', async () => {
+    // Synthetic rows are normally genuine zero-cost calls, but unknown source accounting is still
+    // a coverage hole. A zero here would hide the row instead of showing that its basis is unknown.
+    const id = await seedTurn('s1', { model: '<synthetic>', cache_basis: null, input: 0, output: 0 });
+
+    const res = await priceUsage(testEnv.DB, { now: NOW });
+
+    expect((await priced(id)).usd).toBeNull();
+    expect(res).toMatchObject({ examined: 1, priced: 0, unpriceable: 1 });
   });
 
   it('re-prices rows left behind by an older pricing version', async () => {

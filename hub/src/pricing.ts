@@ -1,3 +1,5 @@
+import type { CacheBasis } from './cache-basis';
+
 /** Cost computation over the `usage` table, priced from the `model_prices` table
  * (populated by scripts/sync-model-prices.mjs from LiteLLM -- ccusage's source).
  *
@@ -7,6 +9,8 @@
 /** A billing-relevant slice of a `usage` row. */
 export interface UsageTokens {
   model: string | null;
+  /** Accounting is determined by the transcript source and stored on each usage row. */
+  cache_basis?: CacheBasis | null;
   service_tier?: string | null;
   input_tokens?: number | null;
   output_tokens?: number | null;
@@ -33,9 +37,6 @@ export interface ModelPrice {
   cache_write_1h_cost: number | null;
   input_cost_batch: number | null;
   output_cost_batch: number | null;
-  /** 'unknown' when upstream gave no recognised provider — see migration 0017. A row with cache
-   * reads and an unknown convention is refused rather than priced ~2x wrong in either direction. */
-  cache_accounting: 'disjoint' | 'subset' | 'unknown';
 }
 
 /** Per-class token counts and their dollar cost. `unpriced` is set when no rate was found,
@@ -119,10 +120,11 @@ export function isBillableModel(model: string | null | undefined): model is stri
 /**
  * Cost of one usage row.
  *
- * The `cache_accounting` distinction is the part that is easy to get wrong. Anthropic
- * reports cache reads DISJOINT from input_tokens, so both are charged. OpenAI/Codex reports
- * cached_input_tokens as a SUBSET of input_tokens, so charging both double-bills the cached
- * portion at the full input rate. Same two columns, opposite arithmetic.
+ * Cache accounting belongs to the transcript source, not the provider catalog, so it is carried
+ * on each row. Measured corpus evidence fixes the conventions: OMP sidecars write `input` outside
+ * `cacheRead` for every provider (DISJOINT), Claude Code preserves Anthropic's raw counters
+ * (DISJOINT), and Codex CLI reports `cached_tokens` inside `input_tokens` (SUBSET). A missing
+ * source basis fails closed rather than guessing between two opposite billing equations.
  */
 export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { batch?: boolean }): Cost {
   // Clamp at 0. `usage` has no nonnegative constraint and both parsers store whatever counter a
@@ -143,7 +145,7 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   // clamping the group's SUMs lets one row with cacheRead > input eat fresh input belonging to
   // its neighbours. `fresh_input_tokens` carries that per-row sum when the caller has one.
   const billableInput =
-    price?.cache_accounting === 'subset'
+    u.cache_basis === 'subset'
       ? nonNegative(u.fresh_input_tokens ?? input - cacheRead)
       : input;
 
@@ -156,7 +158,7 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   // applied per row; `billable_cache_read_tokens` carries that per-row sum when the caller has
   // one. The raw counter stays untouched for reporting.
   const billableCacheRead =
-    price?.cache_accounting === 'subset'
+    u.cache_basis === 'subset'
       ? nonNegative(u.billable_cache_read_tokens ?? Math.min(cacheRead, input))
       : cacheRead;
 
@@ -173,6 +175,11 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
     rateSignature: 'unpriced',
     byClass: noClassCost(),
   };
+  // Accounting is a property of the source row, not this catalog rate. A NULL or unrecognised
+  // basis leaves the equation unknowable, even when every token counter is zero: returning a
+  // priced $0 would make an unknown row look like a free call and hide coverage loss.
+  if (u.cache_basis !== 'disjoint' && u.cache_basis !== 'subset') return unpriced;
+
   // A row with no matching price but ZERO tokens in every billable class contributes no unknown
   // cost, so it is not "unpriced" in the sense the caller cares about. Counting it inflated
   // unpriced_calls, put its model in unpriced_models, and told clients the total was a floor —
@@ -221,19 +228,6 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   // Anthropic charges 1.25x for a 5m write and 2x for a 1h write -- so substituting the input
   // rate (or the 5m rate for a missing 1h rate) invents a cheaper price and reports it as if it
   // were priced.
-  // Cache reads with an UNKNOWN accounting convention cannot be priced at all: disjoint bills
-  // them on top of input, subset bills them inside it, and picking either way is a silent ~2x
-  // error on every cached turn in one direction or the other. Rows with no cache reads are
-  // unaffected, so an unrecognised provider only costs pricing where it actually matters.
-  //
-  // These use the BILLABLE cache count for the same reason `anyBillableTokens` does: a clamped-to-
-  // zero cache term costs nothing at any rate, so demanding a rate for it only loses real pricing.
-  // (The unknown-accounting arm is unaffected in practice -- the clamp applies only under
-  // `subset`, so under an unknown convention billable and raw are the same number -- but it reads
-  // off the same value so the two cannot drift apart.)
-  if (billableCacheRead > 0 && price.cache_accounting !== 'disjoint' && price.cache_accounting !== 'subset') {
-    return unpriced;
-  }
   if (billableInput > 0 && inRate == null) return unpriced;
   if (output > 0 && outRate == null) return unpriced;
   if (billableCacheRead > 0 && readRate == null) return unpriced;
@@ -285,16 +279,17 @@ export function costOfUsage(u: UsageTokens, price: ModelPrice | null, opts?: { b
   if (!Number.isFinite(usd)) return unpriced;
 
   // Only the classes this row HAS, so an unused rate moving cannot make two snapshots differ.
-  // `cache_accounting` is included only when there ARE raw cache reads: it decides whether they
-  // are billed on top of input or subtracted from it, which changes the token counts and therefore
-  // the dollars even when every rate is identical. On a cache-free row it changes nothing.
+  // The basis is row data, not a property of `ModelPrice`; include it in the signature so
+  // `priceForGroup` can never treat otherwise-identical rates as interchangeable for rows whose
+  // cache counters require opposite arithmetic. A missing basis returned above never reaches
+  // this signature.
   const rateSignature = [
     billableInput > 0 ? `i:${inRate}` : '',
     output > 0 ? `o:${outRate}` : '',
     billableCacheRead > 0 ? `r:${readRate}` : '',
     cw5 > 0 ? `w5:${price.cache_write_5m_cost}` : '',
     cw1h > 0 ? `w1:${price.cache_write_1h_cost}` : '',
-    cacheRead > 0 ? `a:${price.cache_accounting}` : '',
+    `a:${u.cache_basis}`,
     `s:${rateSet}`,
   ]
     .filter(Boolean)
@@ -319,8 +314,7 @@ export async function loadPrices(db: D1Database): Promise<Map<string, ModelPrice
   const rows = await db
     .prepare(
       `SELECT model, effective_from, provider, input_cost, output_cost, cache_read_cost,
-              cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
-              cache_accounting
+              cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch
          FROM model_prices ORDER BY model, effective_from DESC`,
     )
     .all<ModelPrice>();

@@ -49,8 +49,10 @@ import {
  *
  * 1 = scalar usd only (migration 0018).
  * 2 = usd plus the five per-class costs (migration 0019).
+ * 3 = cache accounting moved from the provider catalog to the transcript-source basis on each
+ *    usage row; every stored cost must be recomputed under that row-level convention.
  */
-export const PRICING_VERSION = 2;
+export const PRICING_VERSION = 3;
 
 /** The version stored on a row no version successfully priced. Matches the column default, so a
  * never-attempted row and a row whose attempt found no rate are the same kind of due. */
@@ -88,6 +90,7 @@ interface UnpricedRow extends UsageAggRow {
   model: string | null;
   /** Raw column values as read, carried only so the write can compare-and-set on them. */
   cas_model: string | null;
+  cas_cache_basis: UsageAggRow['cache_basis'];
   cas_input: number | null;
   cas_output: number | null;
   cas_cache_read: number | null;
@@ -143,9 +146,10 @@ export async function priceUsage(
       // version over it, at which point the row is no longer below the version threshold and no
       // later pass ever reconsiders it. Permanently wrong money, on a row nothing marks as suspect.
       //
-      // Matching on the token columns and model means the update simply affects zero rows when the
-      // inputs moved. That is not a failure: the re-parse also reset the pricing state, so the row
-      // is still due and the next pass prices it from the values it now has. Superseded, not lost.
+      // Matching on the token columns, model, and cache basis means the update simply affects
+      // zero rows when either the transcript counters OR the accounting convention moved. That
+      // is not a failure: the re-parse also reset the pricing state, so the row is still due and
+      // the next pass prices it from the values it now has. Superseded, not lost.
       const stmt = db
         .prepare(
           `UPDATE usage
@@ -154,10 +158,11 @@ export async function priceUsage(
                   price_epoch = ?7, priced_at = ?8, priced_version = ?9
             WHERE id = ?10
               AND model IS ?11
-              AND COALESCE(input_tokens,0) IS ?12 AND COALESCE(output_tokens,0) IS ?13
-              AND COALESCE(cache_read_tokens,0) IS ?14
-              AND COALESCE(cache_creation_5m_tokens,0) IS ?15
-              AND COALESCE(cache_creation_1h_tokens,0) IS ?16`,
+              AND cache_basis IS ?12
+              AND COALESCE(input_tokens,0) IS ?13 AND COALESCE(output_tokens,0) IS ?14
+              AND COALESCE(cache_read_tokens,0) IS ?15
+              AND COALESCE(cache_creation_5m_tokens,0) IS ?16
+              AND COALESCE(cache_creation_1h_tokens,0) IS ?17`,
         )
         .bind(
           cost?.usd ?? null,
@@ -177,6 +182,7 @@ export async function priceUsage(
           // — deliberately not the clamped sums the shape fragments produce, which are what the
           // cost was computed from but not what the table stores.
           r.cas_model ?? null,
+          r.cas_cache_basis ?? null,
           r.cas_input ?? 0,
           r.cas_output ?? 0,
           r.cas_cache_read ?? 0,
@@ -222,11 +228,15 @@ export async function priceUsage(
 
 /** The dollar figure to store, or null to leave the row unpriced.
  *
- * `sentinel` models — `<synthetic>` and friends — are stored as a real 0, not as NULL. They never
- * hit an API, so zero IS their cost; leaving them NULL would park them in the unpriced index
- * forever and, worse, report them as pricing coverage we failed to achieve.
+ * `sentinel` models — `<synthetic>` and friends — normally store a real 0 because they never hit
+ * an API. A missing cache basis is the exception: it is a coverage hole even on a synthetic row,
+ * and must remain NULL rather than making unknown accounting look like a free call.
  */
 function priceOf(r: UnpricedRow, prices: Map<string, ModelPrice[]>): StoredCost | null {
+  // A sentinel normally has a genuine zero cost, but only after the transcript source is known.
+  // Missing basis is a coverage hole even on a synthetic row: storing $0 would make unknown
+  // accounting look like a free call and let it disappear from the unpriced report.
+  if (r.cache_basis !== 'disjoint' && r.cache_basis !== 'subset') return null;
   const modelClass = classifyModel(r.model);
   if (modelClass === 'sentinel') return ZERO_COST;
   if (modelClass !== 'billable') return null;
@@ -284,7 +294,7 @@ async function selectUnpriced(
   const rows = await db
     .prepare(
       `SELECT u.id AS id, u.session_id AS session_id, u.model AS model, ${priceEpochExpr(prices)} AS epoch,
-              u.model AS cas_model,
+              u.model AS cas_model, u.cache_basis AS cas_cache_basis,
               COALESCE(u.input_tokens,0) AS cas_input, COALESCE(u.output_tokens,0) AS cas_output,
               COALESCE(u.cache_read_tokens,0) AS cas_cache_read,
               COALESCE(u.cache_creation_5m_tokens,0) AS cas_w5,

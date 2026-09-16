@@ -12,8 +12,8 @@ import {
   SESSION_COST_COLUMNS,
   sessionModelCosts,
   sessionSubtreeCosts,
-  type CacheBasis,
   type CostTotals,
+  type ModelCacheBasis,
   type ModelCost,
   type ModelTokens,
   type SubtreeCost,
@@ -672,11 +672,19 @@ function subagentCount(n: number): string {
 /** What a cached share is a share OF, per accounting convention.
  *
  * The same two counters imply different prompt totals under the two conventions, so the number is
- * meaningless without this note; wording follows `CacheBasis` in src/session-cost.ts. */
-const CACHE_BASIS_NOTE: Record<CacheBasis, string> = {
-  subset: 'Subset accounting (OpenAI family): cached tokens are reported as PART OF input_tokens, so this is cache read ÷ input.',
-  disjoint: 'Disjoint accounting (Anthropic): cached tokens are reported IN ADDITION TO input_tokens, so this is cache read ÷ (input + cache read).',
-  unknown: 'No single published cache-accounting convention for this model — its price snapshots disagree, or it has none — so the cached share is left uncomputed rather than guessed: the same counters would differ by roughly the cache ratio itself under the two conventions.',
+ * meaningless without this note; wording follows `ModelCacheBasis` in src/session-cost.ts, and
+ * the convention itself is a property of the transcript source rather than of the provider (see
+ * src/cache-basis.ts). Each note names the DENOMINATOR outright, because that is the only thing a
+ * reader cannot recover from the columns next to it. */
+const CACHE_BASIS_NOTE: Record<ModelCacheBasis, string> = {
+  subset:
+    'Subset accounting (Codex transcripts): cached tokens are reported as PART OF input_tokens, so this is cache read ÷ input, with each call’s read clamped to the input it is part of.',
+  disjoint:
+    'Disjoint accounting (OMP and Claude Code transcripts): cache reads are reported IN ADDITION TO input_tokens, and so are cache writes, so this is cache read ÷ (input + cache read + cache write 5m + cache write 1h). A written token is a prompt token that MISSED, which is why a session that rebuilt part of its cache reads as 99.7% rather than 100%.',
+  mixed:
+    'Mixed accounting: this model was recorded by sources that count cache reads differently — a disjoint OMP or Claude Code transcript and a subset Codex one — so each source’s calls were divided under its own convention and the two halves summed. The share is exact; there is no single prompt total to name. Calls with no recorded convention are excluded from both halves.',
+  unknown:
+    'No cache-accounting convention recorded for these calls: the transcript source is unrecognised, so whether the cache reads sit inside input_tokens or alongside it is unknown — and the two answers differ by roughly the cache ratio itself. Left uncomputed rather than guessed, for the same reason such a call is left unpriced.',
 };
 
 /** Per-model cost and tokens for this session AND its subagents, collapsed like the activity trace
@@ -714,7 +722,7 @@ function renderModelCosts(models: readonly ModelCost[], own: CostTotals, subtree
         tokenCell(m.tokens.cacheRead) +
         `<td class="num" title="${fmtInt(m.tokens.cacheWrite5m)} 5m + ${fmtInt(m.tokens.cacheWrite1h)} 1h">${fmtTokens(cacheWrite)}</td>` +
         `<td class="num" title="${CACHE_BASIS_NOTE[m.basis]}">` +
-        `${m.cacheHitRate === null ? '—' : `${(m.cacheHitRate * 100).toFixed(1)}%`}</td></tr>`
+        `${m.cacheHitRate === null ? '—' : fmtCacheHitRate(m.cacheHitRate)}</td></tr>`
       );
     })
     .join('');
@@ -742,6 +750,15 @@ function renderModelCosts(models: readonly ModelCost[], own: CostTotals, subtree
     ) +
     `</div></details>`
   );
+}
+
+/** A cached share, FLOORED to a tenth of a percent.
+ *
+ * Rounding printed `100.0%` for 99.99%, which is the one value on this row a reader checks against
+ * intuition: a session that rebuilt megabytes of cache read as having missed nothing. Only a share
+ * where every prompt token was a cache hit reaches 100.0% now. */
+function fmtCacheHitRate(rate: number): string {
+  return `${(Math.floor(rate * 1000) / 10).toFixed(1)}%`;
 }
 
 /** Which sessions a row's numbers came from, stated only when the answer is not "this one alone".

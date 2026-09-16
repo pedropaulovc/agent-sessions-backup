@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
+import { pathToFileURL } from 'node:url';
 import {
   assertImmutableBase,
   assertManifestMatches,
@@ -342,6 +343,250 @@ test('0028 backfills per-session cost from the usage already stored', async () =
     assert.deepEqual(costs('cost-unpriced'), { cost_usd: null, cost_calls: 1, cost_priced_calls: 0 });
     // No usage rows at all -- left at the column defaults, which is what they mean.
     assert.deepEqual(costs('cost-no-usage'), { cost_usd: null, cost_calls: 0, cost_priced_calls: 0 });
+  } finally {
+    database.close();
+  }
+});
+
+test('0029 backfills cache basis from the transcript harness and leaves unknown sources unclassified', async () => {
+  const fixture = await loadFixture();
+  const database = createDatabase();
+  try {
+    applyPending(database, fixture, 28);
+    database.exec(`
+      INSERT INTO sessions (session_id, harness) VALUES
+        ('basis-codex', 'codex'),
+        ('basis-omp', 'omp'),
+        ('basis-claude', 'claude-code'),
+        ('basis-unknown', 'future-harness');
+      INSERT INTO usage (session_id, turn_index) VALUES
+        ('basis-codex', 1),
+        ('basis-omp', 1),
+        ('basis-claude', 1),
+        ('basis-unknown', 1);
+    `);
+
+    applyPending(database, fixture, 29);
+    const rows = database
+      .prepare('SELECT session_id, cache_basis FROM usage ORDER BY session_id')
+      .all()
+      .map((row) => ({ ...row }));
+    assert.deepEqual(rows, [
+      { session_id: 'basis-claude', cache_basis: 'disjoint' },
+      { session_id: 'basis-codex', cache_basis: 'subset' },
+      { session_id: 'basis-omp', cache_basis: 'disjoint' },
+      { session_id: 'basis-unknown', cache_basis: null },
+    ]);
+    assert.throws(
+      () => database.prepare("UPDATE usage SET cache_basis = 'guessed' WHERE session_id = 'basis-unknown'").run(),
+      /constraint/i,
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test('0030 removes provider cache accounting without changing the remaining price catalog row', async () => {
+  const fixture = await loadFixture();
+  const database = createDatabase();
+  try {
+    applyPending(database, fixture, 29);
+    database.prepare(`
+      INSERT INTO model_prices
+        (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
+         cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
+         max_input_tokens, max_output_tokens, cache_accounting, source, fetched_at)
+      VALUES
+        ('preserved-model', '2026-09-01', 'upstream-model', 'openai', 1, 2, 3, 4, 5, 6, 7,
+         8000, 2000, 'subset', 'test', '2026-09-15T00:00:00Z')
+    `).run();
+
+    applyPending(database, fixture, 30);
+    const columns = database.prepare("SELECT name FROM pragma_table_info('model_prices') ORDER BY cid").all();
+    assert.equal(columns.some((column) => column.name === 'cache_accounting'), false);
+    assert.deepEqual(
+      { ...database.prepare("SELECT * FROM model_prices WHERE model = 'preserved-model'").get() },
+      {
+        model: 'preserved-model',
+        effective_from: '2026-09-01',
+        litellm_key: 'upstream-model',
+        provider: 'openai',
+        input_cost: 1,
+        output_cost: 2,
+        cache_read_cost: 3,
+        cache_write_5m_cost: 4,
+        cache_write_1h_cost: 5,
+        input_cost_batch: 6,
+        output_cost_batch: 7,
+        max_input_tokens: 8000,
+        max_output_tokens: 2000,
+        source: 'test',
+        fetched_at: '2026-09-15T00:00:00Z',
+      },
+    );
+    assert.deepEqual(
+      database
+        .prepare("SELECT name FROM pragma_index_list('model_prices') WHERE name = 'model_prices_model'")
+        .all()
+        .map((row) => ({ ...row })),
+      [{ name: 'model_prices_model' }],
+    );
+  } finally {
+    database.close();
+  }
+});
+
+test('0031 drops only the costs the transcript-basis arithmetic changes', async () => {
+  const fixture = await loadFixture();
+  const database = createDatabase();
+  try {
+    applyPending(database, fixture, 30);
+    // Pre-0031 state: a corpus priced under PRICING_VERSION 2, where the convention came from the
+    // price catalog's provider. `cache_basis` is what 0029 stamped from the transcript source, so
+    // an OMP session recording an OpenAI model is exactly the disagreement that mispriced money.
+    //
+    // `claude-opus-5`'s snapshot was re-fetched on 2026-01-02, which is how an in-place provider
+    // correction looks afterwards: the sync writes INSERT OR REPLACE on (model, effective_from),
+    // so whatever provider that row held on the 1st is gone.
+    database.exec(`
+      INSERT INTO model_prices
+        (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
+         source, fetched_at)
+      VALUES
+        ('gpt-6-astra', '2026-01-01', 'gpt-6-astra', 'openai', 10, 50, 1, 'test', '2026-01-01T00:00:00Z'),
+        ('claude-opus-5', '2026-01-01', 'claude-opus-5', 'anthropic', 15, 75, 1.5, 'test', '2026-01-02T00:00:00Z'),
+        -- A LATER snapshot for the same model, fetched long after the January rows were priced. A
+        -- rate move is not evidence about a January cost, so its presence must not blank one.
+        ('claude-opus-5', '2026-06-01', 'claude-opus-5', 'anthropic', 18, 90, 1.8, 'test', '2026-06-01T00:00:00Z'),
+        ('gemini-3-pro', '2026-01-01', 'gemini-3-pro', 'vertex_ai', 2, 10, 0.2, 'test', '2026-01-01T00:00:00Z'),
+        -- A March boundary belonging to a DIFFERENT model. priceEpochExpr pools boundaries across
+        -- every model, so a claude row timestamped in March is bucketed into this epoch even
+        -- though claude has no snapshot here and priceAt resolves it back to the January one.
+        ('gemini-3-pro', '2026-03-01', 'gemini-3-pro', 'vertex_ai', 3, 12, 0.3, 'test', '2026-03-01T00:00:00Z');
+      INSERT INTO sessions (session_id, harness) VALUES
+        ('v2-omp', 'omp'), ('v2-codex', 'codex'), ('v2-claude', 'claude-code'),
+        ('v2-unknown', 'future-harness');
+      INSERT INTO usage
+        (session_id, turn_index, model, cache_basis, input_tokens, output_tokens, cache_read_tokens,
+         usd, usd_input, usd_cache_read, priced_version, price_epoch, priced_at)
+      VALUES
+        -- Priced subset (provider openai) against disjoint counters: the production bug.
+        ('v2-omp', 1, 'gpt-6-astra', 'disjoint', 1000, 100, 900, 0.5, 0.4, 0.1, 2, '2026-01-01', '2026-01-03T00:00:00Z'),
+        -- Same disagreement, but with no cache reads the two conventions compute the same dollars.
+        ('v2-omp', 2, 'gpt-6-astra', 'disjoint', 1000, 100, 0, 0.5, 0.5, NULL, 2, '2026-01-01', '2026-01-03T00:00:00Z'),
+        -- An unrecognised provider derives no convention today, and post-0017 it was refused
+        -- outright for a row with cache reads. A non-NULL cost here therefore predates 0017, when
+        -- the sync stored the fallback 'subset' for exactly this case -- a wrong guess still on
+        -- display, which is why 'unknown' has to count as a disagreement.
+        ('v2-omp', 5, 'gemini-3-pro', 'disjoint', 1000, 100, 900, 1, 0.9, 0.1, 2, '2026-01-01', '2026-01-03T00:00:00Z'),
+        -- The post-0017 shape of the same model: already NULL, nothing to do to it.
+        ('v2-omp', 3, 'gemini-3-pro', 'disjoint', 1000, 100, 900, NULL, NULL, NULL, 2, '2026-01-01', '2026-01-03T00:00:00Z'),
+        -- Already repriced by v3. Untouched even though its basis disagrees with the catalog --
+        -- that disagreement is the whole point of the new arithmetic.
+        ('v2-omp', 4, 'gpt-6-astra', 'disjoint', 1000, 100, 900, 2, 1.8, 0.1, 3, '2026-01-01', '2026-01-03T00:00:00Z'),
+        -- Catalog and transcript agree (anthropic -> disjoint), and this row was priced AFTER the
+        -- January snapshot's last write, so the provider it was priced under is the one still
+        -- stored. The June snapshot is fetched later but is not the one that priced this row, so
+        -- it must not cost this row its money.
+        ('v2-claude', 1, 'claude-opus-5', 'disjoint', 1000, 100, 900, 0.9, 0.5, 0.4, 2, '2026-01-01', '2026-01-03T00:00:00Z'),
+        -- Same agreement, but priced BEFORE the January snapshot was rewritten: the provider in
+        -- force at pricing time is unrecoverable, so agreement with today's row proves nothing.
+        ('v2-claude', 2, 'claude-opus-5', 'disjoint', 1000, 100, 900, 0.7, 0.4, 0.3, 2, '2026-01-01', '2026-01-01T12:00:00Z'),
+        -- The same case bucketed into a pooled epoch claude has no snapshot for. priceAt resolves
+        -- it back to January, so matching on effective_from = price_epoch would find nothing and
+        -- leave the stale cost standing.
+        ('v2-claude', 3, 'claude-opus-5', 'disjoint', 1000, 100, 900, 0.6, 0.3, 0.3, 2, '2026-03-01', '2026-01-01T12:00:00Z'),
+        -- The sentinel a timestamp-less row gets, which is not a date at all: priced only when
+        -- every snapshot agrees, so any of them being rewritten counts.
+        ('v2-claude', 4, 'claude-opus-5', 'disjoint', 1000, 100, 900, 0.5, 0.2, 0.3, 2, 'unknown', '2026-01-01T12:00:00Z'),
+        -- The sentinel for a row older than every snapshot, which priceAt resolves to the OLDEST.
+        ('v2-claude', 5, 'claude-opus-5', 'disjoint', 1000, 100, 900, 0.4, 0.1, 0.3, 2, '0000-00-00', '2026-01-01T12:00:00Z'),
+        -- Catalog said subset, transcript says subset: unchanged.
+        ('v2-codex', 1, 'gpt-6-astra', 'subset', 1000, 100, 900, 0.3, 0.2, 0.1, 2, '2026-01-01', '2026-01-03T00:00:00Z'),
+        -- An unrecognised transcript source. v3 refuses a row with no basis before it looks at a
+        -- single token counter, so this one goes even with zero cache reads.
+        ('v2-unknown', 1, 'gpt-6-astra', NULL, 1000, 100, 0, 0.4, 0.4, NULL, 2, '2026-01-01', '2026-01-03T00:00:00Z');
+    `);
+    database.exec(`
+      UPDATE sessions
+         SET cost_usd = agg.usd, cost_calls = agg.calls, cost_priced_calls = agg.priced_calls
+        FROM (SELECT session_id, SUM(usd) AS usd, COUNT(*) AS calls, COUNT(usd) AS priced_calls
+                FROM usage GROUP BY session_id) AS agg
+       WHERE sessions.session_id = agg.session_id;
+    `);
+
+    applyPending(database, fixture, 31);
+    const usage = database
+      .prepare('SELECT session_id, turn_index, usd, usd_cache_read, priced_version FROM usage ORDER BY session_id, turn_index')
+      .all()
+      .map((row) => ({ ...row }));
+    assert.deepEqual(usage, [
+      { session_id: 'v2-claude', turn_index: 1, usd: 0.9, usd_cache_read: 0.4, priced_version: 2 },
+      { session_id: 'v2-claude', turn_index: 2, usd: null, usd_cache_read: null, priced_version: 2 },
+      { session_id: 'v2-claude', turn_index: 3, usd: null, usd_cache_read: null, priced_version: 2 },
+      { session_id: 'v2-claude', turn_index: 4, usd: null, usd_cache_read: null, priced_version: 2 },
+      { session_id: 'v2-claude', turn_index: 5, usd: null, usd_cache_read: null, priced_version: 2 },
+      { session_id: 'v2-codex', turn_index: 1, usd: 0.3, usd_cache_read: 0.1, priced_version: 2 },
+      // Invalidated: unknown until the pass reprices it, and still due at version 2 rather than
+      // reset to 0, which would be indistinguishable from never having been attempted.
+      { session_id: 'v2-omp', turn_index: 1, usd: null, usd_cache_read: null, priced_version: 2 },
+      { session_id: 'v2-omp', turn_index: 2, usd: 0.5, usd_cache_read: null, priced_version: 2 },
+      { session_id: 'v2-omp', turn_index: 3, usd: null, usd_cache_read: null, priced_version: 2 },
+      { session_id: 'v2-omp', turn_index: 4, usd: 2, usd_cache_read: 0.1, priced_version: 3 },
+      { session_id: 'v2-omp', turn_index: 5, usd: null, usd_cache_read: null, priced_version: 2 },
+      { session_id: 'v2-unknown', turn_index: 1, usd: null, usd_cache_read: null, priced_version: 2 },
+    ]);
+
+    // The list page reads these columns, not `usage`. A subtotal that still included the dollars
+    // just invalidated would report a figure no row holds, at full coverage.
+    const costs = database
+      .prepare('SELECT session_id, cost_usd, cost_calls, cost_priced_calls FROM sessions ORDER BY session_id')
+      .all()
+      .map((row) => ({ ...row }));
+    assert.deepEqual(costs, [
+      { session_id: 'v2-claude', cost_usd: 0.9, cost_calls: 5, cost_priced_calls: 1 },
+      { session_id: 'v2-codex', cost_usd: 0.3, cost_calls: 1, cost_priced_calls: 1 },
+      { session_id: 'v2-omp', cost_usd: 2.5, cost_calls: 5, cost_priced_calls: 2 },
+      // A session left with no priced row at all reports unknown, not $0.
+      { session_id: 'v2-unknown', cost_usd: null, cost_calls: 1, cost_priced_calls: 0 },
+    ]);
+  } finally {
+    database.close();
+  }
+});
+
+test('the manual price backfill writes only columns the migrated catalog still has', async () => {
+  // scripts/sync-model-prices.mjs is a repo-root .mjs that no typecheck and no unit test covers,
+  // and it hand-writes its INSERT against this schema. When 0030 dropped `cache_accounting` the
+  // script kept naming it and kept importing the helper that derived it, so it was broken in two
+  // ways that only a real run would have surfaced — a run that talks to production D1.
+  //
+  // Importing it proves every named import still resolves (the module guards its own main(), so
+  // this does not sync anything), and comparing its INSERT column list against the fully migrated
+  // table proves it writes a column set the database accepts.
+  const scriptPath = path.resolve(hubRoot, '..', 'scripts', 'sync-model-prices.mjs');
+  await import(pathToFileURL(scriptPath).href);
+
+  const source = await readFile(scriptPath, 'utf8');
+  const insert = /INSERT OR REPLACE INTO model_prices \(([^)]*)\)/.exec(source);
+  assert.ok(insert, 'the script no longer contains a model_prices INSERT to check');
+  const written = insert[1]
+    .split(',')
+    .map((column) => column.trim())
+    .filter(Boolean);
+
+  const fixture = await loadFixture();
+  const database = createDatabase();
+  try {
+    applyPending(database, fixture);
+    const existing = new Set(
+      database.prepare("SELECT name FROM pragma_table_info('model_prices')").all().map((row) => row.name),
+    );
+    assert.deepEqual(
+      written.filter((column) => !existing.has(column)),
+      [],
+      'the manual backfill names model_prices columns the migrations do not define',
+    );
   } finally {
     database.close();
   }

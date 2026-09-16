@@ -43,8 +43,12 @@ beforeEach(async () => {
   await testEnv.DB.prepare(
     `INSERT OR IGNORE INTO sessions (session_id, harness, index_state) VALUES ('cron-sess', 'claude-code', 'ready')`,
   ).run();
+  // The session is a claude-code one, so its rows carry Anthropic's disjoint counters. Without a
+  // recorded basis the pricing pass leaves the row unpriced by design, and the assertion below
+  // that the cron priced it would fail for a reason that has nothing to do with the cron.
   await testEnv.DB.prepare(
-    `INSERT INTO usage (session_id, turn_index, ts, model) VALUES ('cron-sess', 1, '2026-07-01T00:00:00Z', 'claude-opus-5')`,
+    `INSERT INTO usage (session_id, turn_index, ts, model, cache_basis)
+     VALUES ('cron-sess', 1, '2026-07-01T00:00:00Z', 'claude-opus-5', 'disjoint')`,
   ).run();
   // A REAL catalog, not `{}`. An empty object is rejected by assertLooksLikeCatalog, so the sync
   // wrote an ok=0 audit row and rethrew into ctx()'s swallowed promise — and a bare "one audit row
@@ -118,9 +122,9 @@ describe('scheduled handler', () => {
     await testEnv.DB.prepare(
       `INSERT INTO model_prices (model, effective_from, litellm_key, provider, input_cost, output_cost,
                                  cache_read_cost, cache_write_5m_cost, cache_write_1h_cost,
-                                 cache_accounting, source, fetched_at)
+                                 source, fetched_at)
        VALUES ('claude-opus-5', '2026-01-01', 'claude-opus-5', 'anthropic', 1, 1, 0.1, 2, 4,
-               'disjoint', 'test', '2026-06-01T00:00:00Z')`,
+               'test', '2026-06-01T00:00:00Z')`,
     ).run();
     await testEnv.DB.prepare('UPDATE usage SET input_tokens = 1000000 WHERE session_id = ?1').bind('cron-sess').run();
 

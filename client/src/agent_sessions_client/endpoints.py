@@ -251,13 +251,11 @@ class SessionsApi:
             },
         )
         body = resp.json()
-        # Thread the response's own group_by (not the request kwarg — same value in practice,
-        # but this is what the hub actually says it grouped by) into every row: UsageRow.
-        # total_tokens needs it to know whether `bucket` is safe to treat as a model name.
-        resolved_group_by = body["group_by"]
         return UsageReport(
-            group_by=resolved_group_by,
-            rows=[UsageRow.from_row(r, group_by=resolved_group_by) for r in body.get("rows", [])],
+            # The response's own group_by, not the request kwarg — same value in practice, but
+            # this is what the hub actually says it grouped by.
+            group_by=body["group_by"],
+            rows=[UsageRow.from_row(r) for r in body.get("rows", [])],
             cost_basis=body.get("cost_basis"),
             unpriced_models=body.get("unpriced_models") or [],
         )

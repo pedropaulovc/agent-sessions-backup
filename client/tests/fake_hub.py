@@ -17,6 +17,38 @@ import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
+def make_usage_row(
+    bucket: str | None,
+    *,
+    cache_basis: str | None = "disjoint",
+    calls: int = 1,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    reasoning_tokens: int = 0,
+    cache_read_tokens: int = 0,
+    cache_creation_5m_tokens: int = 0,
+    cache_creation_1h_tokens: int = 0,
+    **overrides,
+) -> dict:
+    """One bucket of GET /api/v1/usage's `rows`. `cache_basis` is folded by the hub from the
+    usage rows behind the bucket ("disjoint"/"subset"/"mixed") and is the only thing that says
+    whether `cache_read_tokens` is extra tokens or already inside `input_tokens`; pass
+    cache_basis=None to fake a bucket whose rows recorded no convention."""
+    row = {
+        "bucket": bucket,
+        "calls": calls,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "cache_read_tokens": cache_read_tokens,
+        "cache_creation_5m_tokens": cache_creation_5m_tokens,
+        "cache_creation_1h_tokens": cache_creation_1h_tokens,
+        "cache_basis": cache_basis,
+    }
+    row.update(overrides)
+    return row
+
+
 class FakeHub:
     def __init__(self):
         self.sessions: list[dict] = []  # rows shaped like the hub's `sessions` table
@@ -28,7 +60,7 @@ class FakeHub:
         # None (the default) means every request just uses `indexed_through` above.
         self.indexed_through_by_request: list[str | None] | None = None
         self.search_hits: list[dict] = []
-        self.usage_rows: list[dict] = []
+        self.usage_rows: list[dict] = []  # buckets shaped by make_usage_row() above
         # `str | None`, not `str`: the hub omits `cost_basis` entirely when nothing priced, and
         # the client reads a missing value as "not priced" -- a test must be able to fake that.
         self.usage_cost_basis: str | None = "litellm_list_price"

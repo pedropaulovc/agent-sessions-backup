@@ -1,5 +1,6 @@
 import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it } from 'vitest';
+import { cacheBasisForHarness } from '../src/cache-basis';
 import { priceEpochExpr } from '../src/usage-agg';
 import type { ModelPrice } from '../src/pricing';
 import { API } from './hosts';
@@ -32,9 +33,9 @@ async function seedPrices(): Promise<void> {
         `INSERT INTO model_prices
            (model, effective_from, litellm_key, provider, input_cost, output_cost,
             cache_read_cost, cache_write_5m_cost, cache_write_1h_cost, input_cost_batch,
-            output_cost_batch, cache_accounting, source, fetched_at)
+            output_cost_batch, source, fetched_at)
          VALUES ('claude-opus-5', ?1, 'claude-opus-5', 'anthropic', ?2, ?3, 0, 0, 0,
-                 NULL, NULL, 'disjoint', 'test', '2026-07-31T00:00:00Z')`,
+                 NULL, NULL, 'test', '2026-07-31T00:00:00Z')`,
       ).bind(r.effective_from, r.input, r.output),
     ),
   );
@@ -48,19 +49,23 @@ async function seedSession(sessionId: string, machineId: string, harness: string
     .bind(sessionId, harness, machineId)
     .run();
 }
-
 let turn = 0;
 async function seedUsage(sessionId: string, ts: string, model: string, tokens: Record<string, number>): Promise<void> {
+  const session = await testEnv.DB.prepare('SELECT harness FROM sessions WHERE session_id = ?1')
+    .bind(sessionId)
+    .first<{ harness: string | null }>();
+  const cacheBasis = cacheBasisForHarness(session?.harness);
   await testEnv.DB.prepare(
-    `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens,
+    `INSERT INTO usage (session_id, turn_index, ts, model, cache_basis, input_tokens, output_tokens,
                         cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, 0)`,
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, 0)`,
   )
     .bind(
       sessionId,
       turn++,
       ts,
       model,
+      cacheBasis,
       tokens.input ?? 0,
       tokens.output ?? 0,
       tokens.cacheRead ?? 0,
@@ -141,9 +146,9 @@ describe('bucket completeness', () => {
       for (const model of MODELS) {
         stmts.push(
           testEnv.DB.prepare(
-            `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens,
+            `INSERT INTO usage (session_id, turn_index, ts, model, cache_basis, input_tokens, output_tokens,
                                 cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens)
-             VALUES ('sess-wide', ?1, ?2, ?3, 1000, 0, 0, 0, 0)`,
+             VALUES ('sess-wide', ?1, ?2, ?3, 'subset', 1000, 0, 0, 0, 0)`,
           ).bind(turn++, `${day}T12:00:00Z`, model),
         );
       }
@@ -204,6 +209,59 @@ describe('rows the aggregate must not silently drop', () => {
   });
 });
 
+describe('sentinel rows with unknown source accounting', () => {
+  beforeAll(async () => {
+    await seedSession('sess-sentinel-null-basis', 'sentinelbox', 'claude-code');
+    await testEnv.DB.prepare(
+      `INSERT INTO usage (session_id, turn_index, ts, model, cache_basis, input_tokens, output_tokens)
+       VALUES ('sess-sentinel-null-basis', ?1, '2026-03-01T10:00:00Z', '<synthetic>', NULL, 0, 0)`,
+    )
+      .bind(turn++)
+      .run();
+  });
+
+  it('surfaces a NULL-basis sentinel as unpriced instead of hiding its metadata gap', async () => {
+    const body = await fetchUsage('group_by=machine&machine=sentinelbox');
+    const row = body.rows.find((r) => r.bucket === 'sentinelbox');
+    expect(row!.calls).toBe(1);
+    expect(row!.unpriced_calls).toBe(1);
+    expect(body.unpriced_models).toContain('<synthetic>');
+  });
+});
+
+describe('cache accounting basis per bucket', () => {
+  beforeAll(async () => {
+    await seedSession('sess-basis-only', 'basis-only-box', 'omp');
+    await seedUsage('sess-basis-only', '2026-05-01T10:00:00Z', 'basis-model', { input: 100, cacheRead: 40 });
+
+    await seedSession('sess-basis-disjoint', 'basis-mixed-box', 'omp');
+    await seedSession('sess-basis-subset', 'basis-mixed-box', 'codex');
+    await seedUsage('sess-basis-disjoint', '2026-05-01T11:00:00Z', 'basis-model', {
+      input: 100,
+      cacheRead: 40,
+    });
+    await seedUsage('sess-basis-subset', '2026-05-01T12:00:00Z', 'basis-model', {
+      input: 100,
+      cacheRead: 40,
+    });
+
+    await seedSession('sess-basis-known', 'basis-partial-box', 'omp');
+    await seedSession('sess-basis-unknown', 'basis-partial-box', 'unknown-harness');
+    await seedUsage('sess-basis-known', '2026-05-01T13:00:00Z', 'basis-model', { input: 100 });
+    await seedUsage('sess-basis-unknown', '2026-05-01T14:00:00Z', 'basis-model', { input: 100 });
+  });
+
+  it('reports one stored convention and folds differing or partial conventions to mixed', async () => {
+    const one = (await fetchUsage('group_by=machine&machine=basis-only-box')).rows[0]!;
+    const mixed = (await fetchUsage('group_by=machine&machine=basis-mixed-box')).rows[0]!;
+    const partial = (await fetchUsage('group_by=machine&machine=basis-partial-box')).rows[0]!;
+
+    expect(one.cache_basis).toBe('disjoint');
+    expect(mixed.cache_basis).toBe('mixed');
+    expect(partial.cache_basis).toBe('mixed');
+  });
+});
+
 describe('a NULL bucket is not the string "null"', () => {
   beforeAll(async () => {
     // Two sessions on one machine: one with no repo_url at all, one whose repo_url is the
@@ -239,9 +297,9 @@ describe('token-class shapes are priced independently', () => {
       `INSERT INTO model_prices
          (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
           cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
-          cache_accounting, source, fetched_at)
+          source, fetched_at)
        VALUES ('partial-model', '2026-01-01', 'partial-model', 'openai', 10, NULL, 0, 0, 0,
-               NULL, NULL, 'disjoint', 'test', '2026-01-01T00:00:00Z')`,
+               NULL, NULL, 'test', '2026-01-01T00:00:00Z')`,
     ).run();
     await testEnv.DB.prepare(
       `INSERT INTO sessions (session_id, harness, machine_id, repo_url, started_at, index_state)
@@ -272,9 +330,9 @@ describe('subset models split on fresh input, not raw input', () => {
       `INSERT INTO model_prices
          (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
           cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
-          cache_accounting, source, fetched_at)
+          source, fetched_at)
        VALUES ('cached-only-model', '2026-01-01', 'cached-only-model', 'openai', NULL, 1, 2, 0, 0,
-               NULL, NULL, 'subset', 'test', '2026-01-01T00:00:00Z')`,
+               NULL, NULL, 'test', '2026-01-01T00:00:00Z')`,
     ).run();
     await testEnv.DB.prepare(
       `INSERT INTO sessions (session_id, harness, machine_id, repo_url, started_at, index_state)
@@ -306,9 +364,9 @@ describe('negative counters cannot inflate billable input', () => {
       `INSERT INTO model_prices
          (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
           cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
-          cache_accounting, source, fetched_at)
+          source, fetched_at)
        VALUES ('subset-priced-model', '2026-01-01', 'subset-priced-model', 'openai', 1, 1, 1, 0, 0,
-               NULL, NULL, 'subset', 'test', '2026-01-01T00:00:00Z')`,
+               NULL, NULL, 'test', '2026-01-01T00:00:00Z')`,
     ).run();
     await testEnv.DB.prepare(
       `INSERT INTO sessions (session_id, harness, machine_id, repo_url, started_at, index_state)
@@ -432,9 +490,9 @@ describe('priceEpochExpr', () => {
         `INSERT INTO model_prices
            (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
             cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
-            cache_accounting, source, fetched_at)
+            source, fetched_at)
          VALUES ('h24-model', ?1, 'h24-model', 'anthropic', ?2, ?2, 0, 0, 0, NULL, NULL,
-                 'disjoint', 'test', '2026-07-31T00:00:00Z')`,
+                 'test', '2026-07-31T00:00:00Z')`,
       )
         .bind(from, cost)
         .run();
@@ -477,8 +535,8 @@ describe('priceEpochExpr', () => {
         `INSERT INTO model_prices
            (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
             cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
-            cache_accounting, source, fetched_at)
-         VALUES ('equiv-model', ?1, 'equiv-model', ?2, 7, 7, 0, 0, 0, NULL, NULL, 'subset', 'test',
+            source, fetched_at)
+         VALUES ('equiv-model', ?1, 'equiv-model', ?2, 7, 7, 0, 0, 0, NULL, NULL, 'test',
                  '2026-07-31T00:00:00Z')`,
       )
         .bind(from, provider)
@@ -486,9 +544,9 @@ describe('priceEpochExpr', () => {
     }
     await seedSession('equiv-sess', 'equivbox', 'claude-code');
     await testEnv.DB.prepare(
-      `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens,
+      `INSERT INTO usage (session_id, turn_index, ts, model, cache_basis, input_tokens, output_tokens,
                           cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens)
-       VALUES ('equiv-sess', 900, NULL, 'equiv-model', 1000000, 0, 0, 0, 0)`,
+       VALUES ('equiv-sess', 900, NULL, 'equiv-model', 'disjoint', 1000000, 0, 0, 0, 0)`,
     ).run();
 
     const row = (await fetchUsage('group_by=machine&machine=equivbox')).rows[0]!;
@@ -507,18 +565,18 @@ describe('priceEpochExpr', () => {
         `INSERT INTO model_prices
            (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
             cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
-            cache_accounting, source, fetched_at)
+            source, fetched_at)
          VALUES ('unused-rate-model', ?1, 'unused-rate-model', 'openai', 7, ?2, 0, 0, 0, NULL, NULL,
-                 'subset', 'test', '2026-07-31T00:00:00Z')`,
+                 'test', '2026-07-31T00:00:00Z')`,
       )
         .bind(from, outCost)
         .run();
     }
     await seedSession('unused-sess', 'unusedbox', 'claude-code');
     await testEnv.DB.prepare(
-      `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens,
+      `INSERT INTO usage (session_id, turn_index, ts, model, cache_basis, input_tokens, output_tokens,
                           cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens)
-       VALUES ('unused-sess', 910, NULL, 'unused-rate-model', 1000000, 0, 0, 0, 0)`,
+       VALUES ('unused-sess', 910, NULL, 'unused-rate-model', 'disjoint', 1000000, 0, 0, 0, 0)`,
     ).run();
 
     const row = (await fetchUsage('group_by=machine&machine=unusedbox')).rows[0]!;
@@ -536,18 +594,18 @@ describe('priceEpochExpr', () => {
         `INSERT INTO model_prices
            (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
             cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
-            cache_accounting, source, fetched_at)
+            source, fetched_at)
          VALUES ('differ-model', ?1, 'differ-model', 'openai', ?2, ?2, 0, 0, 0, NULL, NULL,
-                 'subset', 'test', '2026-07-31T00:00:00Z')`,
+                 'test', '2026-07-31T00:00:00Z')`,
       )
         .bind(from, cost)
         .run();
     }
     await seedSession('differ-sess', 'differbox', 'claude-code');
     await testEnv.DB.prepare(
-      `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens,
+      `INSERT INTO usage (session_id, turn_index, ts, model, cache_basis, input_tokens, output_tokens,
                           cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens)
-       VALUES ('differ-sess', 901, NULL, 'differ-model', 1000000, 0, 0, 0, 0)`,
+       VALUES ('differ-sess', 901, NULL, 'differ-model', 'disjoint', 1000000, 0, 0, 0, 0)`,
     ).run();
 
     const row = (await fetchUsage('group_by=machine&machine=differbox')).rows[0]!;
@@ -566,17 +624,17 @@ describe('priceEpochExpr', () => {
         `INSERT INTO model_prices
            (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
             cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
-            cache_accounting, source, fetched_at)
-         VALUES (?1, ?2, ?1, 'openai', ?3, ?3, 0, 0, 0, ?4, ?4, 'subset', 'test', '2026-07-31T00:00:00Z')`,
+            source, fetched_at)
+         VALUES (?1, ?2, ?1, 'openai', ?3, ?3, 0, 0, 0, ?4, ?4, 'test', '2026-07-31T00:00:00Z')`,
       )
         .bind(model, from, std, batchRate)
         .run();
     }
     await seedSession(`${model}-sess`, machine, 'claude-code');
     await testEnv.DB.prepare(
-      `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens,
+      `INSERT INTO usage (session_id, turn_index, ts, model, cache_basis, input_tokens, output_tokens,
                           cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens)
-       VALUES (?1, 920, NULL, ?2, 1000000, 0, 0, 0, 0)`,
+       VALUES (?1, 920, NULL, ?2, 'disjoint', 1000000, 0, 0, 0, 0)`,
     )
       .bind(`${model}-sess`, model)
       .run();
@@ -618,9 +676,9 @@ describe('priceEpochExpr', () => {
         `INSERT INTO model_prices
            (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
             cache_write_5m_cost, cache_write_1h_cost, input_cost_batch, output_cost_batch,
-            cache_accounting, source, fetched_at)
+            source, fetched_at)
          VALUES ('cancel-model', ?1, 'cancel-model', 'openai', ?2, ?3, 0, 0, 0, NULL, NULL,
-                 'subset', 'test', '2026-07-31T00:00:00Z')`,
+                 'test', '2026-07-31T00:00:00Z')`,
       )
         .bind(from, inCost, outCost)
         .run();
@@ -628,9 +686,9 @@ describe('priceEpochExpr', () => {
     await seedSession('cancel-sess', 'cancelbox', 'claude-code');
     // Summed input == summed output, which is exactly when the two schedules tie at 4/M total.
     await testEnv.DB.prepare(
-      `INSERT INTO usage (session_id, turn_index, ts, model, input_tokens, output_tokens,
+      `INSERT INTO usage (session_id, turn_index, ts, model, cache_basis, input_tokens, output_tokens,
                           cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens)
-       VALUES ('cancel-sess', 930, NULL, 'cancel-model', 1000000, 1000000, 0, 0, 0)`,
+       VALUES ('cancel-sess', 930, NULL, 'cancel-model', 'disjoint', 1000000, 1000000, 0, 0, 0)`,
     ).run();
 
     const row = (await fetchUsage('group_by=machine&machine=cancelbox')).rows[0]!;

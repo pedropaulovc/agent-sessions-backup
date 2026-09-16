@@ -5,6 +5,7 @@ import { CC_SESSION_ID, ccAssistantLine, ccNoiseLines, ccUserLine } from './fixt
 import { API, VIEWER } from './hosts';
 import { PRICING_VERSION } from '../src/pricing-pass';
 import { runSessionRollup } from '../src/session-rollup';
+import { cacheBasisForHarness } from '../src/cache-basis';
 
 const testEnv = env as unknown as Env;
 
@@ -88,6 +89,17 @@ function projectSessionLine(sessionId: string, cwd: string, text: string): strin
   return JSON.stringify(line);
 }
 
+describe('cache basis classification', () => {
+  it('classifies known transcript sources and fails closed for unknown harnesses', () => {
+    expect(cacheBasisForHarness('omp')).toBe('disjoint');
+    expect(cacheBasisForHarness('claude-code')).toBe('disjoint');
+    expect(cacheBasisForHarness('codex')).toBe('subset');
+    expect(cacheBasisForHarness('future-harness')).toBeNull();
+    expect(cacheBasisForHarness('toString')).toBeNull();
+    expect(cacheBasisForHarness(null)).toBeNull();
+  });
+});
+
 describe('ingest pipeline end-to-end', () => {
   beforeAll(async () => {
     const res = await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${CC_SESSION_ID}.jsonl`, SESSION_CONTENT);
@@ -104,10 +116,13 @@ describe('ingest pipeline end-to-end', () => {
     expect(row!.title).toBe('Demo session about parsing');
     expect(Number(row!.tokens_in)).toBeGreaterThan(0);
 
-    const usage = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM usage WHERE session_id = ?1')
+    const usage = await testEnv.DB.prepare(
+      'SELECT COUNT(*) AS n, MIN(cache_basis) AS cache_basis FROM usage WHERE session_id = ?1',
+    )
       .bind(CC_SESSION_ID)
-      .first<{ n: number }>();
+      .first<{ n: number; cache_basis: string | null }>();
     expect(usage!.n).toBe(2); // two assistant turns
+    expect(usage!.cache_basis).toBe('disjoint');
   });
 
   it('stores a cost subtotal that agrees with the usage rows it was written alongside', async () => {
@@ -1560,13 +1575,16 @@ describe('hub.d1.write_cost telemetry', () => {
     expect((await putFile('testbox-wsl', 'codex-sessions', relpath, [...base, JSON.stringify(tokenCount)].join('\n'))).status).toBe(201);
     await drainQueue();
 
-    const after = await testEnv.DB.prepare('SELECT turn_index, input_tokens, output_tokens, cache_read_tokens FROM usage WHERE session_id = ?1')
+    const after = await testEnv.DB.prepare(
+      'SELECT turn_index, input_tokens, output_tokens, cache_read_tokens, cache_basis FROM usage WHERE session_id = ?1',
+    )
       .bind(SID)
-      .all<{ turn_index: number; input_tokens: number; output_tokens: number; cache_read_tokens: number }>();
+      .all<{ turn_index: number; input_tokens: number; output_tokens: number; cache_read_tokens: number; cache_basis: string | null }>();
     expect(after.results.length).toBe(1);
     expect(after.results[0]!.input_tokens).toBe(900);
     expect(after.results[0]!.output_tokens).toBe(80);
     expect(after.results[0]!.cache_read_tokens).toBe(500);
+    expect(after.results[0]!.cache_basis).toBe('subset');
   });
 
   it('still reports the rows it already paid for when a later batch throws', async () => {
@@ -1710,6 +1728,12 @@ describe('OMP ingest end-to-end', () => {
     expect(Number(row?.tokens_in)).toBe(23);
     expect(Number(row?.tokens_out)).toBe(30);
     expect(Number(row?.tokens_cached)).toBe(3);
+    const usageBasis = await testEnv.DB.prepare(
+      'SELECT DISTINCT cache_basis FROM usage WHERE session_id = ?1',
+    )
+      .bind(OMP_ID)
+      .all<{ cache_basis: string | null }>();
+    expect(usageBasis.results).toEqual([{ cache_basis: 'disjoint' }]);
 
     const blocks = await testEnv.DB.prepare(
       'SELECT btype, role, tool_name, text FROM blocks WHERE session_id = ?1 ORDER BY turn_index, block_index',
@@ -1781,14 +1805,15 @@ describe('OMP ingest end-to-end', () => {
  * and lets the consumer do it. */
 describe('re-parse invalidates a stored cost', () => {
   const SID = '11111111-2222-4333-8444-555555555555';
+  const BASIS_SID = '11111111-2222-4333-8444-555555555556';
 
-  function transcript(inputTokens: number): string {
+  function transcript(inputTokens: number, sessionId = SID): string {
     return (
       JSON.stringify({
         parentUuid: null,
         isSidechain: false,
         cwd: '/home/tester/src/demo',
-        sessionId: SID,
+        sessionId,
         version: '2.1.99',
         gitBranch: 'main',
         type: 'user',
@@ -1801,7 +1826,7 @@ describe('re-parse invalidates a stored cost', () => {
         parentUuid: 'u1',
         isSidechain: false,
         cwd: '/home/tester/src/demo',
-        sessionId: SID,
+        sessionId,
         version: '2.1.99',
         gitBranch: 'main',
         type: 'assistant',
@@ -1824,9 +1849,9 @@ describe('re-parse invalidates a stored cost', () => {
     await testEnv.DB.prepare(
       `INSERT OR REPLACE INTO model_prices
          (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
-          cache_write_5m_cost, cache_write_1h_cost, cache_accounting, source, fetched_at)
+          cache_write_5m_cost, cache_write_1h_cost, source, fetched_at)
        VALUES ('reparse-model', '2026-01-01', 'reparse-model', 'anthropic', 1, 10, 0.1, 2, 4,
-               'disjoint', 'test', '2026-07-31T00:00:00Z')`,
+               'test', '2026-07-31T00:00:00Z')`,
     ).run();
 
     await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${SID}.jsonl`, transcript(1_000_000));
@@ -1860,6 +1885,34 @@ describe('re-parse invalidates a stored cost', () => {
     // The reset is only half the mechanism; the row also has to come back UP to the current
     // version, or it stays due forever and every later pass re-prices it for nothing.
     expect(after?.priced_version, 'the re-priced row was not stamped with the current version').toBe(PRICING_VERSION);
+  });
+
+  it('re-writes a retained usage row when its stored cache basis is wrong', async () => {
+    const relpath = `-home-tester-src-demo/${BASIS_SID}.jsonl`;
+    await putFile('testbox-wsl', 'claude-projects', relpath, transcript(1_000_000, BASIS_SID));
+    await drainQueue();
+
+    const file = await testEnv.DB.prepare('SELECT id, r2_key FROM files WHERE session_id = ?1')
+      .bind(BASIS_SID)
+      .first<{ id: number; r2_key: string }>();
+    expect(file).toBeTruthy();
+    expect(
+      (await testEnv.DB.prepare('SELECT cache_basis FROM usage WHERE session_id = ?1')
+        .bind(BASIS_SID)
+        .first<{ cache_basis: string | null }>())?.cache_basis,
+    ).toBe('disjoint');
+
+    // Simulate a row classified under the old provider-level rule. The transcript and all token
+    // counters remain byte-identical, so cache_basis is the only field that can make sameUsage
+    // send this retained turn through the corrective upsert.
+    await testEnv.DB.prepare("UPDATE usage SET cache_basis = 'subset' WHERE session_id = ?1").bind(BASIS_SID).run();
+    await deliverOne(file!.id, file!.r2_key);
+
+    expect(
+      (await testEnv.DB.prepare('SELECT cache_basis FROM usage WHERE session_id = ?1')
+        .bind(BASIS_SID)
+        .first<{ cache_basis: string | null }>())?.cache_basis,
+    ).toBe('disjoint');
   });
 });
 
@@ -1923,9 +1976,9 @@ describe('a re-parse keeps the stored session cost true to the surviving usage r
     await testEnv.DB.prepare(
       `INSERT OR REPLACE INTO model_prices
          (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
-          cache_write_5m_cost, cache_write_1h_cost, cache_accounting, source, fetched_at)
+          cache_write_5m_cost, cache_write_1h_cost, source, fetched_at)
        VALUES ('shrink-model', '2026-01-01', 'shrink-model', 'anthropic', 1, 10, 0.1, 2, 4,
-               'disjoint', 'test', '2026-07-31T00:00:00Z')`,
+               'test', '2026-07-31T00:00:00Z')`,
     ).run();
 
     await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${SID}.jsonl`, transcript(2));

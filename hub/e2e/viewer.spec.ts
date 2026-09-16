@@ -169,9 +169,11 @@ test.describe('synthetic sessions viewer', () => {
     const modelRow = panel.locator('tbody tr', { hasText: fixture.costParentModel });
     await expect(modelRow).toContainText(fixture.costParentOwnLabel);
     await expect(modelRow).toContainText('this session only');
-    // Claude reports cache reads BESIDE the input count, so the hit rate divides by their sum
-    // (400k of 120k + 400k) — the check that the accounting basis reached the denominator.
-    await expect(modelRow).toContainText('76.9%');
+    // Disjoint accounting: the sidecar reports cache reads BESIDE the input count, so the hit
+    // rate divides the 400k reads by every prompt token the turn paid for — 120k input, 400k
+    // reads AND the 80k cache writes. Dropping the writes is what rendered cache-heavy sessions
+    // as a flat 100.0%.
+    await expect(modelRow).toContainText(fixture.costParentHitRate);
     // A model only ever run by a subagent is a row here, attributed to the subagent — this panel
     // used to omit it while the header above counted its dollars. The unpriced one still reads
     // as unknown rather than as free.
@@ -183,9 +185,26 @@ test.describe('synthetic sessions viewer', () => {
     await expect(panel.locator('tfoot')).toContainText(fixture.costSubtreeLabel);
   });
 
+  test('scores cache hits against the accounting the transcript actually used', async ({ page, appURL }) => {
+    // The same model (`gpt-5-mini`) appears in this fixture set twice: once in an OMP sidecar,
+    // whose `input` EXCLUDES cache reads, and once in this codex rollout, whose `input` already
+    // CONTAINS them. Only the recorded source distinguishes them, which is why the basis is
+    // stored per usage row — reading it off the model's provider, as this panel used to, scored
+    // the OMP rows with the wrong denominator and under-billed every cache read they reported.
+    await page.goto(appURL(`/s/${fixture.costSubsetSessionId}`));
+    const panel = page.locator('details.session-cost');
+    await expect(panel).toContainText(fixture.costSubsetAmount);
+    await panel.locator('summary').click();
+    const row = panel.locator('tbody tr', { hasText: fixture.costSubsetModel });
+    // 400k cached of 800k reported input. The denominator is the input alone: adding the reads to
+    // it would double-count tokens that are already inside it.
+    await expect(row).toContainText(fixture.costSubsetHitRate);
+    await expect(row).toContainText(fixture.costSubsetAmount);
+  });
+
   test('narrows the list to a cost band from the sidebar facet', async ({ page, appURL }) => {
     await page.goto(appURL(`/?machine=${encodeURIComponent(fixture.machineId)}`));
-    // The fixture's $2.15 subtree puts it in the $1–$10 band; the unpriced sidecars have no band
+    // The fixture's $2.43 subtree puts it in the $1–$10 band; the unpriced sidecars have no band
     // at all, which is why selecting one must not bring them back.
     const band = page.locator('.sidebar li', { hasText: fixture.costBandLabel }).first();
     await expect(band).toBeVisible();

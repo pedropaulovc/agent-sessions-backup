@@ -127,36 +127,8 @@ export function priceKeyCandidates(model) {
   return out;
 }
 
-/** Providers whose cache-read convention is actually KNOWN. Anything absent yields 'unknown'.
- *
- * Guessing here is a silent ~2x error on every cached turn — disjoint bills cache reads on top of
- * input, subset bills them inside it — and the row still reports as priced, so nothing downstream
- * can notice. See migration 0017. `litellm_provider` is community JSON typed `unknown`, so it is
- * validated as a string rather than cast: a number or object there would otherwise be bound
- * straight into a STRICT TEXT column and fail the whole batch.
- */
-const CACHE_ACCOUNTING_BY_PROVIDER = {
-  anthropic: 'disjoint',
-  openai: 'subset',
-  azure: 'subset',
-  deepseek: 'subset',
-};
-
 /** The provider string, or null if upstream gave something that is not a usable string. */
 export function providerOf(entry) {
   const v = entry?.['litellm_provider'];
   return typeof v === 'string' && v.length > 0 ? v : null;
-}
-
-export function cacheAccountingFor(provider) {
-  // Own-property lookup, same reason as `lookupEntry`. `litellm_provider: "constructor"` is a
-  // perfectly good string, so `providerOf` passes it through, and a bare index read then returns
-  // Object's constructor FUNCTION -- which `?? 'unknown'` does not catch, because it is not
-  // nullish. The cron binds that function into a STRICT TEXT column and the manual script
-  // serialises it into SQL that violates the CHECK constraint. Provider strings come from a
-  // community JSON blob, so this is reachable input.
-  const key = provider ?? '';
-  return Object.prototype.hasOwnProperty.call(CACHE_ACCOUNTING_BY_PROVIDER, key)
-    ? CACHE_ACCOUNTING_BY_PROVIDER[key]
-    : 'unknown';
 }

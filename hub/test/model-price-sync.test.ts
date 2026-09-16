@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { runModelPriceSync } from '../src/cron/model-prices';
-import { cacheAccountingFor, perM } from '../src/upstream-catalog.mjs';
+import { perM } from '../src/upstream-catalog.mjs';
 
 /** The unattended refresh path. Without these, "prices stay current" rests on a cron trigger
  * nobody ever exercised — and a silently stale price table produces confident, wrong dollars.
@@ -59,7 +59,7 @@ function mockUpstreamRaw(payload: unknown): void {
 async function pricesFor(model: string) {
   return (
     await testEnv.DB.prepare(
-      `SELECT effective_from, provider, input_cost, cache_write_5m_cost, cache_write_1h_cost, cache_accounting
+      `SELECT effective_from, provider, input_cost, cache_write_5m_cost, cache_write_1h_cost
          FROM model_prices WHERE model = ?1 ORDER BY effective_from DESC`,
     )
       .bind(model)
@@ -90,7 +90,6 @@ describe('model price autorefresh', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0]!.input_cost).toBe(5);
     expect(rows[0]!.cache_write_1h_cost).toBe(10);
-    expect(rows[0]!.cache_accounting).toBe('disjoint');
   });
 
   it('does not grow the table when nothing upstream changed', async () => {
@@ -116,30 +115,20 @@ describe('model price autorefresh', () => {
     expect(rows[0]!.cache_write_1h_cost).toBeNull();
   });
 
-  it('snapshots a cache-accounting flip even when every rate is identical', async () => {
-    // Upstream correcting a null provider to `anthropic` flips cache_accounting NULL ->
-    // disjoint, which changes whether cache reads are charged ON TOP of input or subtracted
-    // from it. A rates-only change predicate skipped this, leaving the wrong convention active
-    // until some unrelated number happened to move.
-    //
-    // The unknown-provider value here used to be 'subset'. That was a confident guess that
-    // underpriced every cached Claude Code call, and it is now 'unknown' — costOfUsage refuses
-    // to price cache reads it has no convention for. This test's subject is the FLIP being
-    // snapshotted, which it still exercises; only the starting value changed.
+  it('snapshots a provider correction even when every rate is identical', async () => {
+    // Catalog metadata must not remain stale just because its numeric rates did not change.
     mockUpstream({ 'claude-opus-5': entry({ litellm_provider: null }) });
     await runModelPriceSync(testEnv);
     const first = await pricesFor('claude-opus-5');
     expect(first).toHaveLength(1);
-    expect(first[0]!.cache_accounting).toBe('unknown');
 
     mockUpstream({ 'claude-opus-5': entry({ litellm_provider: 'anthropic' }) });
     await runModelPriceSync(testEnv);
     const after = await pricesFor('claude-opus-5');
     // Same-day reruns collapse onto one (model, effective_from) PK via INSERT OR REPLACE, so
     // the signal is the stored VALUE, not the row count: a predicate that skipped the write
-    // would leave `subset` here. (A flip on a later day appends a second snapshot instead.)
+    // would leave a null provider here. (A correction on a later day appends a snapshot instead.)
     expect(after).toHaveLength(1);
-    expect(after[0]!.cache_accounting, 'the accounting flip was not snapshotted').toBe('disjoint');
     expect(after[0]!.provider).toBe('anthropic');
   });
 
@@ -277,21 +266,6 @@ describe('model price autorefresh', () => {
     expect(await pricesFor('claude-opus-5'), 'a non-object entry produced a price row').toHaveLength(0);
   });
 
-  it('treats a prototype-key provider as unknown accounting rather than a function', async () => {
-    // `litellm_provider: "constructor"` is a perfectly good string, so providerOf passes it, and a
-    // bare index read returns Object's constructor FUNCTION -- which `?? 'unknown'` does not catch
-    // because a function is not nullish. That function then goes into a STRICT TEXT column with a
-    // CHECK constraint on it.
-    expect(cacheAccountingFor('constructor')).toBe('unknown');
-    expect(cacheAccountingFor('toString')).toBe('unknown');
-    expect(cacheAccountingFor('anthropic'), 'a real provider stopped resolving').toBe('disjoint');
-
-    mockUpstream({ 'claude-opus-5': entry({ litellm_provider: 'constructor' }) });
-    await runModelPriceSync(testEnv);
-    // The row has to be WRITTEN, with a legal value -- a thrown batch would take every other
-    // model's price down with it.
-    expect((await pricesFor('claude-opus-5'))[0]!.cache_accounting).toBe('unknown');
-  });
 
   it('rejects a negative rate instead of storing a cost that cancels real spend', async () => {
     mockUpstream({ 'claude-opus-5': entry({ input_cost_per_token: -5e-6 }) });

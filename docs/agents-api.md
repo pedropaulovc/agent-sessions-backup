@@ -142,7 +142,7 @@ paginates), `facets=1` (adds counts for registered facets, including `has_star` 
 
 ### `GET /api/v1/usage?group_by=day|model|machine|repo&from&to&machine&harness&batch`
 
-Token accounting, one row per bucket: `bucket, calls, input_tokens, output_tokens,
+Token accounting, one row per bucket: `bucket, cache_basis, calls, input_tokens, output_tokens,
 reasoning_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens`,
 plus costing: `cost_usd`, `billable_input_tokens`, `unpriced_calls`. Response-level:
 `cost_basis` and `unpriced_models`.
@@ -163,10 +163,12 @@ published batch tier falls back to its standard rates, and Anthropic publishes n
 
 `unpriced_models` lists models with no usable rate; their calls are counted in `unpriced_calls`
 and contribute 0 to `cost_usd`, so a non-empty list means every total is a floor. The literal
-`(unknown)` appears there for usage rows with a NULL model (real tokens, undeterminable rate) —
-`<synthetic>` and other `<…>` sentinels never appear, because they never hit an API and are not
-coverage you lost. A row is also unpriced when its timestamp is NULL and its model has more
-than one rate snapshot: a missing timestamp is not evidence the call predates every rate.
+`(unknown)` appears there for usage rows with a NULL model (real tokens, undeterminable rate).
+`<synthetic>` and other `<…>` sentinels are omitted when their row has a recorded `cache_basis`,
+because they never hit an API; a sentinel with a NULL basis is unpriced and its label appears,
+because the missing accounting convention is a coverage gap. A row is also unpriced when its
+timestamp is NULL and its model has more than one rate snapshot: a missing timestamp is not
+evidence the call predates every rate.
 
 `billable_input_tokens` is the input actually charged at the input rate — under OpenAI's subset
 cache accounting that is `input_tokens` minus the cached prefix, clamped per row, so it is not
@@ -180,31 +182,29 @@ Buckets are capped at 400, and the cap is applied to buckets — a returned buck
 counts all of its models. A NULL bucket (e.g. `group_by=repo` over sessions with no
 `repo_url`) is a real bucket and is returned like any other.
 
-**`cache_read_tokens` and `reasoning_tokens` are not safe to sum into a total uniformly** —
-their relationship to `input_tokens`/`output_tokens` is provider-specific:
+**`cache_read_tokens` and `reasoning_tokens` are not safe to sum into a total uniformly.**
+Use the row's `cache_basis`, which is folded from the conventions recorded on the usage rows:
 
-- Anthropic (claude-code): `cache_read_tokens` is DISJOINT from `input_tokens` (a cache hit
-  is billed/reported separately) — a real total adds it. `reasoning_tokens` is never
-  populated for this harness (checked `hub/src/ingest/parsers/claude-code.ts` — no
-  `reasoningTokens` field), always 0.
-- OpenAI (codex): checked `hub/src/ingest/parsers/codex.ts` — `cache_read_tokens` comes from
-  `cached_input_tokens`, a SUBSET of `input_tokens`, and `reasoning_tokens` comes from
-  `reasoning_output_tokens`, a SUBSET of `output_tokens` (OpenAI's Responses API reports both
-  as breakdowns of, not additions to, the input/output totals). Adding either on top
-  double-counts. Verified against `hub/test/fixtures.ts`'s codex usage fixture: input=900,
-  cached=500, output=80, reasoning=20 — the true total is 980 (900+80), not 1000 (reasoning
-  double-counted) and not 1480 (both double-counted).
+- `disjoint` — add `input_tokens + output_tokens + cache_creation_5m_tokens +
+  cache_creation_1h_tokens + cache_read_tokens`.
+- `subset` — add `input_tokens + output_tokens + cache_creation_5m_tokens +
+  cache_creation_1h_tokens`. Cache reads are already inside input, and reasoning is already
+  inside output, so adding either again double-counts.
+- `mixed` or `null` — use the same conservative total as `subset`, excluding cache reads and
+  reasoning. A mixed bucket has no single exact total; undercounting is preferable to
+  double-counting for a spend ranking. `null` means none of the bucket's rows recorded a
+  convention. A known convention combined with unrecorded rows is `mixed`, not known.
 
-This response has no explicit provider field; the client (`UsageRow.total_tokens` in
-`client/src/agent_sessions_client/models.py`) discriminates by whether `bucket` looks like an
-Anthropic model name (starts with `claude`), which only works when the request used
-`group_by=model` — verified against production usage rows on 2026-07-18 (every claude-code
-model starts with `claude`, every codex model doesn't). For any other `group_by`, `bucket`
-mixes providers under one aggregate and there's no correct per-row answer, so the client falls
-back to the conservative OpenAI-style treatment (cache_read and reasoning excluded) for those
-rows — undercount beats double-count for a spend ranking. If you're computing this yourself
-instead of using the client, replicate the same heuristic and caveat, or cross-reference
-`harness` via `/api/v1/sessions` to discriminate properly.
+For the Codex fixture with input=900, cached=500, output=80, and reasoning=20, `cache_basis` is
+`subset` and the true total is 980 (900+80), not 1000 (reasoning double-counted) or 1480 (both
+double-counted). With the same counters under `disjoint`, the total is 1480 (900+500+80);
+reasoning is still not added separately.
+
+The convention belongs to the recorded source (the harness), not to the provider or model
+name. OMP records cache reads disjointly, so an OpenAI-model session recorded by OMP is
+`disjoint`; the same model recorded by Codex is `subset`. The API therefore derives
+`cache_basis` from the rows in each bucket rather than guessing from `bucket`: a
+`group_by=machine` bucket called `claude-box` says nothing about its accounting convention.
 
 **`machine` and `harness` filters are supported** (they filter on the joined `sessions` row,
 same values as `/api/v1/sessions`), so a per-machine or per-harness token report needs no
