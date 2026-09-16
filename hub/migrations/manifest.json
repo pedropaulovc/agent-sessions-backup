@@ -155,6 +155,11 @@
       "sequence": 31,
       "filename": "0031_invalidate_costs_priced_by_provider_accounting.sql",
       "sha256": "75659060d9cd49c159d794471253b15b9f84ceb7dd8257380487babf69643211"
+    },
+    {
+      "sequence": 32,
+      "filename": "0032_blocks_issue_reports.sql",
+      "sha256": "27073ddb0a7c47b59bbe940e8a5900753ea787f54817d8a6a18b8da251f838e5"
     }
   ]
 }

@@ -174,6 +174,10 @@ details.error > summary { color: var(--err); }
 .pager { display: flex; gap: 14px; align-items: center; margin: 18px 0; justify-content: center; }
 img.media { max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 6px; }
 .truncnote { color: var(--muted); font-size: 11px; }
+.reports-page .reports-about { max-width: 100ch; margin: 2px 0 12px; }
+.reports-page .tabs { margin: 0 0 4px; }
+.reports-page .report .snip { font-weight: 600; }
+.reports-page a:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
 /* ---- page-local activity trace; inherits the viewer's light/dark tokens ---- */
 .session-trace { border: 1px solid var(--line); border-radius: 6px; margin: 12px 0; min-width: 0; }
 .session-trace > summary { cursor: pointer; padding: 9px 12px; overflow-wrap: anywhere; }
@@ -387,6 +391,7 @@ function navBar(active?: string): string {
   return `<header class="nav"><span class="brand"><a href="/">sessions</a></span>` +
     link('/', 'Search', 'search') +
     link('/stats', 'Statistics', 'stats') +
+    link('/reports', 'Reports', 'reports') +
     link('/skills', 'Skills', 'skills') +
     link('/machines', 'Machines', 'machines') +
     `</header>`;

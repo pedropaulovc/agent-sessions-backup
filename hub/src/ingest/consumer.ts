@@ -1904,11 +1904,20 @@ async function writeSession(
     db.prepare('DELETE FROM blocks WHERE session_id = ?1 AND id > ?2').bind(s.id, retained.lastId),
     ...usageDeletes(db, s.id, retained, pendingUsage),
   ]);
-  // `changes` on the DELETEs is what this write actually removed — with a retained prefix that is the
-  // divergent tail, not the whole session. Both deletes count when deciding whether the session
-  // already existed: a transcript of usage-only turns (codex retains those) has usage rows and NO
-  // blocks, so keying off blocks alone would label every one of its re-parses 'initial'.
-  const priorBlocks = clearRes[3]?.meta?.changes ?? 0;
+  // What this write actually removed — with a retained prefix that is the divergent tail, not the
+  // whole session. Both deletes count when deciding whether the session already existed: a
+  // transcript of usage-only turns (codex retains those) has usage rows and NO blocks, so keying
+  // off blocks alone would label every one of its re-parses 'initial'.
+  //
+  // The block count comes from the probe, not from the DELETE's own `meta.changes`: once `blocks`
+  // carries a partial index whose predicate reads `text` (migration 0032), D1 reports a larger
+  // `changes` for this statement than the rows it removed. Measured 2026-09-16 against miniflare's
+  // D1 — deleting exactly one row of a six-block session reported `changes: 5`, while a
+  // before/after COUNT confirmed five rows survived and the same index shaped as
+  // `WHERE btype = 'tool_use'` (no `text` term) reported the correct 1. The probe already holds
+  // every stored id, so the exact figure costs nothing; `changes` remains the only source on the
+  // export path, which skips the probe to keep its subrequest estimate exact.
+  const priorBlocks = retained.deletedTail ?? clearRes[3]?.meta?.changes ?? 0;
   // The usage deletes are a variable-length tail of the batch (chunked under the parameter cap).
   const priorUsage = clearRes.slice(4).reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
 
@@ -2354,12 +2363,15 @@ interface RetainedPrefix {
   count: number;
   /** Highest `blocks.id` among them: the write deletes `id > lastId` and FTS-inserts `id > lastId`. */
   lastId: number;
+  /** How many stored blocks `id > lastId` matches: the exact size of the tail this write deletes.
+   * `null` when the probe never ran or its result was capped, so the caller has no count at all. */
+  deletedTail: number | null;
   /** Stored usage by turn index, for the independent usage diff. `null` when the probe never ran, in
    * which case the caller clears and rewrites every usage row as it always did. */
   usage: Map<number, StoredUsage> | null;
 }
 
-const NOTHING_RETAINED: RetainedPrefix = { count: 0, lastId: 0, usage: null };
+const NOTHING_RETAINED: RetainedPrefix = { count: 0, lastId: 0, deletedTail: null, usage: null };
 
 /** How much of an already-indexed session this write can leave alone.
  *
@@ -2400,7 +2412,9 @@ async function retainablePrefix(
   for (const row of (usageRes?.results ?? []) as StoredUsage[]) usage.set(row.turn_index, row);
 
   const stored = (blocksRes?.results ?? []) as StoredBlock[];
-  if (stored.length === 0 || stored.length > PREFIX_PROBE_MAX_BLOCKS) return { ...NOTHING_RETAINED, usage };
+  // Capped result: the real block count is unknown, so the tail size is too.
+  if (stored.length > PREFIX_PROBE_MAX_BLOCKS) return { ...NOTHING_RETAINED, usage };
+  if (stored.length === 0) return { ...NOTHING_RETAINED, deletedTail: 0, usage };
 
   // No write-completeness check is needed here, and none would be sound: a torn write can leave the
   // same number of blocks it started with (all replacement chunks commit, the final batch fails), so
@@ -2416,13 +2430,17 @@ async function retainablePrefix(
     // The tail is deleted by `id > lastId`, which only removes everything after the prefix if ids
     // ascend in this order. They do when a session was written in one pass, but a session assembled
     // by an older/partial write need not be that tidy — so verify rather than assume.
-    if (a.id <= lastId) return { ...NOTHING_RETAINED, usage };
+    if (a.id <= lastId) return { ...NOTHING_RETAINED, deletedTail: stored.length, usage };
     lastId = a.id;
     count++;
   }
 
-  if (count === 0) return { ...NOTHING_RETAINED, usage };
-  return { count, lastId, usage };
+  // `id > lastId` is what the caller deletes, so counting the rows that match it is the exact size
+  // of the rewritten tail. Taken from the probe rather than from the DELETE's own `meta.changes`,
+  // which D1 does not report reliably for this table — see the call site.
+  const deletedTail = stored.reduce((n, row) => n + (row.id > lastId ? 1 : 0), 0);
+  if (count === 0) return { ...NOTHING_RETAINED, deletedTail, usage };
+  return { count, lastId, deletedTail, usage };
 }
 
 /** The usage rows this write must REMOVE. With a probe, that is only the turns that no longer exist

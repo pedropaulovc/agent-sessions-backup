@@ -25,4 +25,5 @@ export const SYNTHETIC_FIXTURE = Object.freeze({
   costSubsetModel: SYNTHETIC_EXPECTATIONS.costSubsetModel,
   costSubsetAmount: SYNTHETIC_EXPECTATIONS.costSubsetAmount,
   costSubsetHitRate: SYNTHETIC_EXPECTATIONS.costSubsetHitRate,
+  issueReports: SYNTHETIC_EXPECTATIONS.issueReports,
 });
