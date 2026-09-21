@@ -86,10 +86,12 @@ machine-certificate or read-grant paths above. The JSON body is:
 }
 ```
 
-Each request carries 1–50 entries and is limited to 256 KiB. The hub validates the
-complete batch before writing it. A successful response is
-`{"accepted":1,"duplicates":0}`. Retries are idempotent on `(installId, entry.id)`;
-already stored entries count as duplicates and still return HTTP 200.
+Each request carries 1–50 entries and is limited to 256 KiB. The endpoint is
+unauthenticated, accepts only `application/json`, and applies a per-source rate limit
+of two batches per minute. The hub validates the complete batch before writing it.
+A successful response is `{"accepted":1,"duplicates":0}`. Retries are idempotent on
+`(installId, entry.id)`; already stored entries count as duplicates and still return
+HTTP 200.
 
 The viewer lists these records under the authenticated `OMP QA` tab at `/omp-qa`.
 These reports arrive without transcript data, so they do not have session backlinks.

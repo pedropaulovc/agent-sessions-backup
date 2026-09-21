@@ -1,5 +1,5 @@
 import { env, SELF } from 'cloudflare:test';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ingestOmpQa, OMP_QA_MAX_BODY_BYTES } from '../src/api/omp-qa';
 import { route } from '../src/router';
 import { API } from './hosts';
@@ -8,6 +8,8 @@ const testEnv = env as unknown as Env;
 const prodEnv = { ...testEnv, ENVIRONMENT: 'production' } as Env;
 const ctx = {} as ExecutionContext;
 const installs = new Set<string>();
+let sourceSequence = 0;
+
 
 type QaPayload = {
   agent: { name: string; version: string };
@@ -32,9 +34,13 @@ function payload(installId: string): QaPayload {
 }
 
 async function post(body: unknown, url = `${API}/omp-qa`): Promise<Response> {
+  sourceSequence += 1;
   return SELF.fetch(url, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: {
+      'content-type': 'application/json',
+      'cf-connecting-ip': `192.0.2.${sourceSequence}`,
+    },
     body: JSON.stringify(body),
   });
 }
@@ -139,7 +145,10 @@ describe('POST /omp-qa', () => {
     const response = await route(
       new Request(`${API}/omp-qa`, {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          'cf-connecting-ip': '192.0.2.250',
+        },
         body: JSON.stringify(body),
       }),
       prodEnv,
@@ -153,10 +162,39 @@ describe('POST /omp-qa', () => {
   it('can be called directly without auth headers', async () => {
     const body = payload(`qa-${crypto.randomUUID()}`);
     const response = await ingestOmpQa(
-      new Request(`${API}/omp-qa`, { method: 'POST', body: JSON.stringify(body) }),
+      new Request(`${API}/omp-qa`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'cf-connecting-ip': '192.0.2.251' },
+        body: JSON.stringify(body),
+      }),
       testEnv,
     );
     expect(response.status).toBe(200);
     expect(await countRows(body.installId)).toBe(2);
+  });
+
+  it('rejects browser-simple content types and rate-limited sources', async () => {
+    const body = payload(`qa-${crypto.randomUUID()}`);
+    const unsupported = await ingestOmpQa(
+      new Request(`${API}/omp-qa`, { method: 'POST', headers: { 'content-type': 'text/plain' }, body: JSON.stringify(body) }),
+      testEnv,
+    );
+    expect(unsupported.status).toBe(415);
+
+    const limitedEnv = {
+      ...testEnv,
+      OMP_QA_RATE_LIMITER: { limit: vi.fn().mockResolvedValue({ success: false }) },
+    } as unknown as Env;
+    const limited = await ingestOmpQa(
+      new Request(`${API}/omp-qa`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'cf-connecting-ip': '192.0.2.252' },
+        body: JSON.stringify(body),
+      }),
+      limitedEnv,
+    );
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get('retry-after')).toBe('60');
+    expect(await countRows(body.installId)).toBe(0);
   });
 });

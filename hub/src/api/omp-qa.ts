@@ -119,6 +119,15 @@ function parsePayload(value: unknown): OmpQaPayload | null {
 
 /** POST /omp-qa — public, bounded OMP auto-QA report intake. */
 export async function ingestOmpQa(request: Request, env: Env): Promise<Response> {
+  const contentType = request.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase();
+  if (contentType !== 'application/json') return errorResponse('unsupported_media_type', 415);
+
+  const source = request.headers.get('cf-connecting-ip') ?? 'unknown';
+  const rateLimit = await env.OMP_QA_RATE_LIMITER.limit({ key: source });
+  if (!rateLimit.success) {
+    return Response.json({ error: 'rate_limited' }, { status: 429, headers: { 'retry-after': '60' } });
+  }
+
   const body = await readBoundedBody(request);
   if ('error' in body) {
     return errorResponse(body.error, body.error === 'body_too_large' ? 413 : 400);

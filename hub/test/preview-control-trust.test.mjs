@@ -338,6 +338,11 @@ describe('private preview application config', () => {
     }
     expect(config.d1_databases[0]).toMatchObject({ binding: 'DB', database_name: 'pr-42-sessions-index', database_id: 'd1-id' });
     expect(config.r2_buckets[0]).toMatchObject({ binding: 'RAW', bucket_name: 'pr-42-agent-sessions' });
+    expect(config.ratelimits).toEqual([{
+      name: 'OMP_QA_RATE_LIMITER',
+      namespace_id: '100042',
+      simple: { limit: 2, period: 60 },
+    }]);
     expect(config.queues.consumers[0]).toMatchObject({ queue: 'pr-42-parse', dead_letter_queue: 'pr-42-parse-dlq' });
   });
 

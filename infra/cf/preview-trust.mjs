@@ -398,6 +398,11 @@ export function generatedPrivateAppConfig({
     }],
     r2_buckets: [{ binding: 'RAW', bucket_name: names.r2 }],
     kv_namespaces: [{ binding: 'KV', id: resources.kv }],
+    ratelimits: [{
+      name: 'OMP_QA_RATE_LIMITER',
+      namespace_id: String(100_000 + resources.pr),
+      simple: { limit: 2, period: 60 },
+    }],
     durable_objects: { bindings: [] },
     queues: {
       producers: [
