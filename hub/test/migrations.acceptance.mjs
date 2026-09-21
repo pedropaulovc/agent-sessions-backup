@@ -253,6 +253,43 @@ test('clean install and base upgrade converge on the same normalized schema and 
   }
 });
 
+test('OMP QA batch cleanup retains only the newest 5,000 reports', async () => {
+  const fixture = await loadFixture();
+  const database = createDatabase();
+  try {
+    applyPending(database, fixture);
+    const insert = database.prepare(`
+      INSERT INTO omp_qa_reports
+        (install_id, entry_id, dedup_key, agent_name, agent_version, platform, arch, model, omp_version, tool, report)
+      VALUES ('cap-test', ?, ?, 'omp', '1', 'linux', 'x64', 'model', '1', 'read', 'report')
+    `);
+    database.exec('BEGIN');
+    for (let entryId = 1; entryId <= 5001; entryId += 1) {
+      insert.run(entryId, `cap-${entryId}`);
+    }
+    database.exec('COMMIT');
+    database.exec(`
+      DELETE FROM omp_qa_reports
+       WHERE id IN (
+         SELECT id
+           FROM omp_qa_reports
+          ORDER BY received_at DESC, id DESC
+          LIMIT -1 OFFSET 5000
+       )
+    `);
+
+    const retained = database.prepare(
+      `SELECT COUNT(*) AS count, MIN(entry_id) AS oldest, MAX(entry_id) AS newest
+         FROM omp_qa_reports WHERE install_id = 'cap-test'`,
+    ).get();
+    assert.equal(retained.count, 5000);
+    assert.equal(retained.oldest, 2);
+    assert.equal(retained.newest, 5001);
+  } finally {
+    database.close();
+  }
+});
+
 test('schema digest preserves semantically significant whitespace inside SQL literals', () => {
   const oneSpace = new DatabaseSync(':memory:');
   const twoSpaces = new DatabaseSync(':memory:');

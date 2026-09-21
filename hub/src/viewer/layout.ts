@@ -392,6 +392,7 @@ function navBar(active?: string): string {
     link('/', 'Search', 'search') +
     link('/stats', 'Statistics', 'stats') +
     link('/reports', 'Reports', 'reports') +
+    link('/omp-qa', 'OMP QA', 'omp-qa') +
     link('/skills', 'Skills', 'skills') +
     link('/machines', 'Machines', 'machines') +
     `</header>`;

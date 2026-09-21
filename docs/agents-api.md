@@ -62,6 +62,50 @@ derived per-PR bearer (`Authorization: Bearer …`; see `infra/cf/deploy.md`) �
 acts as an admin machine identity there, which is what
 `hub/scripts/preview-upload-session.mjs` uses to push hand-carried session zips.
 
+## Auto-QA intake
+### `POST https://sessions.pedrovc.com.br/omp-qa`
+
+OMP sends consented auto-QA tool reports to this public intake. It does not use the
+machine-certificate or read-grant paths above. The JSON body is:
+
+```json
+{
+  "agent": {"name": "omp", "version": "0.44.0"},
+  "installId": "6ad9ccef-70da-4bc7-b5af-50d139c11826",
+  "platform": "linux",
+  "arch": "x64",
+  "entries": [
+    {
+      "id": 42,
+      "model": "openai-codex/gpt-5.6-sol",
+      "version": "0.44.0",
+      "tool": "read",
+      "report": "returned an empty body for a readable file"
+    }
+  ]
+}
+```
+
+Each request carries 1–50 entries and is limited to 256 KiB. The endpoint is
+unauthenticated, accepts only `application/json`, and applies a per-source rate limit
+of 30 batches per minute. The hub validates the complete batch before writing it.
+A successful response is `{"accepted":1,"duplicates":0}`. To keep each accepted batch
+bounded, the hub truncates install IDs, agent/model versions, and model names to 256
+characters; platform and architecture to 32; and tool names to 128. It does not reject
+the batch for those lengths. Retries are deduplicated by the resulting content identity
+`(installId, entry.id, model, version, tool, report)`; already stored entries count as
+duplicates and still return HTTP 200. The hub retains the newest 5,000 reports for up
+to 180 days.
+
+Responses use `400` for malformed JSON or payloads, `413` for bodies over 256 KiB,
+`415` for other media types, and `429` with `Retry-After: 60` when rate-limited.
+
+The viewer lists these records under the authenticated `OMP QA` tab at `/omp-qa`,
+including the report's JSON property bag. Pagination and tool facets are bounded to
+the newest 5,000 matching reports. These reports arrive without transcript data, so
+they do not have session backlinks. D1 reserves the validated JSON-object `properties`
+column for future OMP metadata; current reports store and display an empty object.
+
 ## Endpoints
 
 ### `GET /api/v1/sessions`

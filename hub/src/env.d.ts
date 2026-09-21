@@ -2,6 +2,7 @@ interface Env {
   DB: D1Database;
   RAW: R2Bucket;
   KV: KVNamespace;
+  OMP_QA_RATE_LIMITER: RateLimit;
   PARSE_QUEUE: Queue<ParseMessage>;
   ROLLUP_QUEUE: Queue<SessionRollupMessage>;
   ENVIRONMENT: 'development' | 'preview' | 'production';

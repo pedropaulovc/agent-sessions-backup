@@ -15,6 +15,25 @@ import { pollRetired } from '../api/certs';
 
 const STAGING_PREFIX = 'mpu-staging/';
 const STALE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const OMP_QA_RETENTION_DAYS = 180;
+
+export async function pruneOmpQaReports(env: Env, batchSize = 5000): Promise<number> {
+  let deleted = 0;
+  for (;;) {
+    const result = await env.DB.prepare(
+      `DELETE FROM omp_qa_reports
+        WHERE id IN (
+          SELECT id FROM omp_qa_reports
+           WHERE received_at < strftime('%Y-%m-%dT%H:%M:%fZ', 'now', ?1)
+           ORDER BY received_at
+           LIMIT ${batchSize}
+        )`,
+    ).bind(`-${OMP_QA_RETENTION_DAYS} days`).run();
+    const changes = result.meta.changes ?? 0;
+    deleted += changes;
+    if (changes < batchSize) return deleted;
+  }
+}
 
 export async function runPrune(env: Env, nowMs: number = Date.now()): Promise<void> {
   const cutoff = nowMs - STALE_MS;
