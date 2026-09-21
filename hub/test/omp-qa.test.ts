@@ -266,15 +266,17 @@ describe('POST /omp-qa', () => {
 });
 
 describe('OMP QA retention', () => {
-  it('prunes reports older than 180 days', async () => {
+  it('drains every expired batch instead of leaving a daily backlog', async () => {
     const installId = `qa-${crypto.randomUUID()}`;
     installs.add(installId);
-    await testEnv.DB.prepare(
-      `INSERT INTO omp_qa_reports
-         (install_id, entry_id, dedup_key, agent_name, agent_version, platform, arch, model, omp_version, tool, report, received_at)
-       VALUES (?1, 1, ?2, 'omp', '1', 'linux', 'x64', 'model', '1', 'read', 'old report', '2000-01-01T00:00:00.000Z')`,
-    ).bind(installId, crypto.randomUUID()).run();
-    expect(await pruneOmpQaReports(testEnv)).toBeGreaterThanOrEqual(1);
+    await testEnv.DB.batch(Array.from({ length: 3 }, (_, index) =>
+      testEnv.DB.prepare(
+        `INSERT INTO omp_qa_reports
+           (install_id, entry_id, dedup_key, agent_name, agent_version, platform, arch, model, omp_version, tool, report, received_at)
+         VALUES (?1, ?2, ?3, 'omp', '1', 'linux', 'x64', 'model', '1', 'read', 'old report', '2000-01-01T00:00:00.000Z')`,
+      ).bind(installId, index + 1, crypto.randomUUID()),
+    ));
+    expect(await pruneOmpQaReports(testEnv, 2)).toBeGreaterThanOrEqual(3);
     expect(await countRows(installId)).toBe(0);
   });
 });

@@ -100,8 +100,9 @@ Responses use `400` for malformed JSON or payloads, `413` for bodies over 256 Ki
 `415` for other media types, and `429` with `Retry-After: 60` when rate-limited.
 
 The viewer lists these records under the authenticated `OMP QA` tab at `/omp-qa`,
-including the report's JSON property bag. These reports arrive without transcript data,
-so they do not have session backlinks. D1 reserves the validated JSON-object `properties`
+including the report's JSON property bag. Pagination and tool facets are bounded to
+the newest 5,000 matching reports. These reports arrive without transcript data, so
+they do not have session backlinks. D1 reserves the validated JSON-object `properties`
 column for future OMP metadata; current reports store and display an empty object.
 
 ## Endpoints

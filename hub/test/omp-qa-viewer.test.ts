@@ -1,6 +1,6 @@
 import { env, SELF } from 'cloudflare:test';
 import { afterEach, describe, expect, it } from 'vitest';
-import { OMP_QA_FILTERED_PAGE_QUERY, OMP_QA_PAGE_QUERY } from '../src/viewer/omp-qa';
+import { OMP_QA_FACET_QUERY, OMP_QA_FILTERED_PAGE_QUERY, OMP_QA_PAGE_QUERY } from '../src/viewer/omp-qa';
 import { VIEWER } from './hosts';
 
 const testEnv = env as unknown as Env;
@@ -185,5 +185,11 @@ describe('/omp-qa viewer', () => {
       .bind('shell', 25, 0)
       .all<{ detail: string }>();
     expect(plan.results.some((row) => row.detail.includes('omp_qa_reports_tool_received'))).toBe(true);
+  });
+
+  it('bounds facet aggregation to the indexed recent-report window', async () => {
+    const plan = await testEnv.DB.prepare(`EXPLAIN QUERY PLAN ${OMP_QA_FACET_QUERY}`)
+      .all<{ detail: string }>();
+    expect(plan.results.some((row) => row.detail.includes('omp_qa_reports_received'))).toBe(true);
   });
 });

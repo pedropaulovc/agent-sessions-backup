@@ -2,6 +2,7 @@
 import { esc, page, q } from './layout';
 
 export const OMP_QA_PAGE_SIZE = 25;
+export const OMP_QA_MAX_ROWS = 5000;
 const OMP_QA_TOOL_FACET_LIMIT = 50;
 const OMP_QA_REPORT_PREVIEW_LIMIT = 4096;
 const OMP_QA_PROPERTIES_PREVIEW_LIMIT = 1024;
@@ -19,6 +20,18 @@ export const OMP_QA_FILTERED_PAGE_QUERY =
     WHERE tool = ?1
     ORDER BY received_at DESC, id DESC
     LIMIT ?2 OFFSET ?3`;
+
+export const OMP_QA_FACET_QUERY =
+  `SELECT tool, COUNT(*) AS count
+     FROM (
+       SELECT tool
+         FROM omp_qa_reports
+        ORDER BY received_at DESC, id DESC
+        LIMIT ${OMP_QA_MAX_ROWS}
+     )
+    GROUP BY tool
+    ORDER BY count DESC, tool
+    LIMIT ${OMP_QA_TOOL_FACET_LIMIT + 1}`;
 
 interface OmpQaRow {
   id: number;
@@ -39,22 +52,27 @@ interface OmpQaRow {
 export async function ompQaPage(url: URL, env: Env): Promise<Response> {
   const selected = url.searchParams.get('tool');
   const countSql = selected === null
-    ? 'SELECT COUNT(*) AS count FROM omp_qa_reports'
-    : 'SELECT COUNT(*) AS count FROM omp_qa_reports WHERE tool = ?1';
+    ? `SELECT COUNT(*) AS count FROM (
+         SELECT 1 FROM omp_qa_reports
+          ORDER BY received_at DESC, id DESC
+          LIMIT ${OMP_QA_MAX_ROWS + 1}
+       )`
+    : `SELECT COUNT(*) AS count FROM (
+         SELECT 1 FROM omp_qa_reports
+          WHERE tool = ?1
+          ORDER BY received_at DESC, id DESC
+          LIMIT ${OMP_QA_MAX_ROWS + 1}
+       )`;
   const countStatement = selected === null
     ? env.DB.prepare(countSql)
     : env.DB.prepare(countSql).bind(selected);
   const [count, toolsResult] = await Promise.all([
     countStatement.first<{ count: number }>(),
-    env.DB.prepare(
-      `SELECT tool, COUNT(*) AS count
-         FROM omp_qa_reports
-        GROUP BY tool
-        ORDER BY count DESC, tool
-        LIMIT ${OMP_QA_TOOL_FACET_LIMIT + 1}`,
-    ).all<{ tool: string; count: number }>(),
+    env.DB.prepare(OMP_QA_FACET_QUERY).all<{ tool: string; count: number }>(),
   ]);
-  const total = count?.count ?? 0;
+  const observed = count?.count ?? 0;
+  const capped = observed > OMP_QA_MAX_ROWS;
+  const total = Math.min(observed, OMP_QA_MAX_ROWS);
   const currentPage = clampPage(url.searchParams.get('page'), total);
   const offset = (currentPage - 1) * OMP_QA_PAGE_SIZE;
   const pageStatement = selected === null
@@ -69,7 +87,11 @@ export async function ompQaPage(url: URL, env: Env): Promise<Response> {
     `<section class="omp-qa-page"><h2>OMP QA reports</h2>` +
     `<p class="muted small omp-qa-about">These are consented reports received directly from OMP and ` +
     `lack transcript backlinks.</p>` +
-    `<p class="muted small">${total} ${total === 1 ? 'report' : 'reports'}` +
+    (capped
+      ? `<p class="warn">More than ${OMP_QA_MAX_ROWS} matching reports are available; counts and ` +
+        `pagination cover the newest ${OMP_QA_MAX_ROWS}.</p>`
+      : '') +
+    `<p class="muted small">${capped ? `${OMP_QA_MAX_ROWS}+` : total} ${total === 1 ? 'report' : 'reports'}` +
     `${selected !== null ? ` · filtered to tool <code>${esc(selected)}</code>` : ''}</p>` +
     renderToolFilter(tools, selected) +
     (facetsTruncated
