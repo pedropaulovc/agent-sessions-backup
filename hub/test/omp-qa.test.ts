@@ -68,14 +68,15 @@ describe('POST /omp-qa', () => {
     expect(await response.json()).toEqual({ accepted: 2, duplicates: 0 });
 
     const rows = await testEnv.DB.prepare(
-      `SELECT install_id, entry_id, agent_name, agent_version, platform, arch, model, omp_version, tool, report,
-              received_at
+      `SELECT install_id, entry_id, properties, agent_name, agent_version, platform, arch, model,
+              omp_version, tool, report, received_at
          FROM omp_qa_reports
         WHERE install_id = ?1
         ORDER BY entry_id`,
     ).bind(installId).all<{
       install_id: string;
       entry_id: number;
+      properties: string;
       agent_name: string;
       agent_version: string;
       platform: string;
@@ -90,6 +91,7 @@ describe('POST /omp-qa', () => {
     expect(rows.results[0]).toMatchObject({
       install_id: installId,
       entry_id: 1,
+      properties: '{}',
       agent_name: 'omp',
       agent_version: '0.1.0',
       platform: 'linux',

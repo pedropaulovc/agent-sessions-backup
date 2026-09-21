@@ -101,6 +101,8 @@ Responses use `400` for malformed JSON or payloads, `413` for bodies over 256 Ki
 
 The viewer lists these records under the authenticated `OMP QA` tab at `/omp-qa`.
 These reports arrive without transcript data, so they do not have session backlinks.
+D1 reserves a validated JSON-object `properties` column for future OMP metadata; current
+reports store an empty object.
 
 ## Endpoints
 
