@@ -253,7 +253,7 @@ test('clean install and base upgrade converge on the same normalized schema and 
   }
 });
 
-test('OMP QA storage cap retains only the newest 5,000 reports', async () => {
+test('OMP QA batch cleanup retains only the newest 5,000 reports', async () => {
   const fixture = await loadFixture();
   const database = createDatabase();
   try {
@@ -268,6 +268,15 @@ test('OMP QA storage cap retains only the newest 5,000 reports', async () => {
       insert.run(entryId, `cap-${entryId}`);
     }
     database.exec('COMMIT');
+    database.exec(`
+      DELETE FROM omp_qa_reports
+       WHERE id IN (
+         SELECT id
+           FROM omp_qa_reports
+          ORDER BY received_at DESC, id DESC
+          LIMIT -1 OFFSET 5000
+       )
+    `);
 
     const retained = database.prepare(
       `SELECT COUNT(*) AS count, MIN(entry_id) AS oldest, MAX(entry_id) AS newest

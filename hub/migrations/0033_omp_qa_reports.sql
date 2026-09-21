@@ -24,19 +24,3 @@ CREATE TABLE omp_qa_reports (
 
 CREATE INDEX omp_qa_reports_received ON omp_qa_reports (received_at DESC, id DESC);
 CREATE INDEX omp_qa_reports_tool_received ON omp_qa_reports (tool, received_at DESC, id DESC);
-
--- Keep anonymous intake from consuming the shared D1 database. At the 256 KiB request
--- ceiling, 5,000 rows remain well below D1's storage limit even in the pathological
--- one-report-per-request case. Exact retries do not fire this trigger because they do
--- not insert a row.
-CREATE TRIGGER omp_qa_reports_cap
-AFTER INSERT ON omp_qa_reports
-BEGIN
-  DELETE FROM omp_qa_reports
-   WHERE id = (
-     SELECT id
-       FROM omp_qa_reports
-      ORDER BY received_at DESC, id DESC
-      LIMIT 1 OFFSET 5000
-   );
-END;

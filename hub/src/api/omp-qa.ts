@@ -1,4 +1,5 @@
 export const OMP_QA_MAX_BODY_BYTES = 256 * 1024;
+export const OMP_QA_MAX_STORED_ROWS = 5000;
 const MAX_BODY_BYTES = OMP_QA_MAX_BODY_BYTES;
 const MAX_ENTRIES = 50;
 
@@ -191,7 +192,17 @@ export async function ingestOmpQa(request: Request, env: Env): Promise<Response>
     ),
   ));
 
-  const results = await env.DB.batch(statements);
-  const accepted = results.reduce((count, result) => count + ((result.meta?.changes ?? 0) > 0 ? 1 : 0), 0);
+  const trimOverflow = env.DB.prepare(
+    `DELETE FROM omp_qa_reports
+      WHERE id IN (
+        SELECT id
+          FROM omp_qa_reports
+         ORDER BY received_at DESC, id DESC
+         LIMIT -1 OFFSET ${OMP_QA_MAX_STORED_ROWS}
+      )`,
+  );
+  const results = await env.DB.batch([...statements, trimOverflow]);
+  const accepted = results.slice(0, statements.length)
+    .reduce((count, result) => count + ((result.meta?.changes ?? 0) > 0 ? 1 : 0), 0);
   return Response.json({ accepted, duplicates: payload.entries.length - accepted });
 }
