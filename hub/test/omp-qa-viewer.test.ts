@@ -19,6 +19,7 @@ interface SeedRow {
   ompVersion?: string;
   tool?: string;
   report?: string;
+  properties?: string;
   receivedAt?: string;
 }
 
@@ -34,6 +35,7 @@ function row(overrides: SeedRow): SeedRow & Required<Omit<SeedRow, 'entryId'>> &
     ompVersion: overrides.ompVersion ?? '0.9.0',
     tool: overrides.tool ?? 'shell',
     report: overrides.report ?? 'qa report',
+    properties: overrides.properties ?? '{}',
     receivedAt: overrides.receivedAt ?? '2026-09-18T00:00:00.000Z',
   };
 }
@@ -42,11 +44,12 @@ async function seed(rows: Array<SeedRow & Required<Omit<SeedRow, 'entryId'>> & {
   for (const fixture of rows) seededInstallIds.add(fixture.installId);
   await testEnv.DB.batch(rows.map((fixture) => testEnv.DB.prepare(
     `INSERT INTO omp_qa_reports
-       (install_id, entry_id, dedup_key, agent_name, agent_version, platform, arch, model, omp_version, tool, report, received_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
+       (install_id, entry_id, properties, dedup_key, agent_name, agent_version, platform, arch, model, omp_version, tool, report, received_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)`,
   ).bind(
     fixture.installId,
     fixture.entryId,
+    fixture.properties,
     `${fixture.installId}:${fixture.entryId}:${fixture.tool}:${fixture.report}`,
     fixture.agentName,
     fixture.agentVersion,
@@ -81,6 +84,7 @@ describe('/omp-qa viewer', () => {
         ompVersion: '0.9.0',
         model: 'gpt-5.6-luna',
         report: '<script>alert("qa")</script> newest sentinel',
+        properties: JSON.stringify({ sessionId: 'session-future', note: '<script>property</script>' }),
         receivedAt: '2026-09-18T00:02:00.000Z',
       }),
       row({
@@ -104,6 +108,9 @@ describe('/omp-qa viewer', () => {
     expect(html).toContain('linux/x64');
     expect(html).toContain(`title="${newerInstall}"`);
     expect(html).toContain('received at 2026-09-18T00:02:00.000Z');
+    expect(html).toContain('properties</span> <code>{&quot;sessionId&quot;:&quot;session-future&quot;');
+    expect(html).toContain('&lt;script&gt;property&lt;/script&gt;');
+    expect(html).not.toContain('<script>property</script>');
     expect(html.indexOf('newest sentinel')).toBeLessThan(html.indexOf('older sentinel'));
   });
 

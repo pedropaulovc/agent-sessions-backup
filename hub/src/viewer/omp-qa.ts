@@ -4,15 +4,16 @@ import { esc, page, q } from './layout';
 export const OMP_QA_PAGE_SIZE = 25;
 const OMP_QA_TOOL_FACET_LIMIT = 50;
 const OMP_QA_REPORT_PREVIEW_LIMIT = 4096;
+const OMP_QA_PROPERTIES_PREVIEW_LIMIT = 1024;
 export const OMP_QA_PAGE_QUERY =
-  `SELECT id, install_id, entry_id, agent_name, agent_version, platform, arch, model,
+  `SELECT id, install_id, entry_id, properties, agent_name, agent_version, platform, arch, model,
           omp_version, tool, report, received_at
      FROM omp_qa_reports
     ORDER BY received_at DESC, id DESC
     LIMIT ?1 OFFSET ?2`;
 
 export const OMP_QA_FILTERED_PAGE_QUERY =
-  `SELECT id, install_id, entry_id, agent_name, agent_version, platform, arch, model,
+  `SELECT id, install_id, entry_id, properties, agent_name, agent_version, platform, arch, model,
           omp_version, tool, report, received_at
      FROM omp_qa_reports
     WHERE tool = ?1
@@ -23,6 +24,7 @@ interface OmpQaRow {
   id: number;
   install_id: string;
   entry_id: number;
+  properties: string;
   agent_name: string;
   agent_version: string;
   platform: string;
@@ -105,6 +107,9 @@ function renderReport(row: OmpQaRow): string {
   const report = row.report.length > OMP_QA_REPORT_PREVIEW_LIMIT
     ? `${row.report.slice(0, OMP_QA_REPORT_PREVIEW_LIMIT - 1)}…`
     : row.report;
+  const properties = row.properties.length > OMP_QA_PROPERTIES_PREVIEW_LIMIT
+    ? `${row.properties.slice(0, OMP_QA_PROPERTIES_PREVIEW_LIMIT - 1)}…`
+    : row.properties;
   const meta = [
     `<span class="badge">${esc(row.tool)}</span>`,
     `<span class="chip">model ${esc(row.model)}</span>`,
@@ -116,6 +121,7 @@ function renderReport(row: OmpQaRow): string {
   ].filter(Boolean).join('');
   return `<article class="hit omp-qa-report">` +
     `<div class="snip">${esc(report)}</div>` +
+    `<div class="small"><span class="muted">properties</span> <code>${esc(properties)}</code></div>` +
     `<div class="meta">${meta}</div>` +
     `</article>`;
 }

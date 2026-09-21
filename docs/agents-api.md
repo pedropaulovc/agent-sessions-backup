@@ -99,10 +99,10 @@ duplicates and still return HTTP 200. Reports are retained for 180 days.
 Responses use `400` for malformed JSON or payloads, `413` for bodies over 256 KiB,
 `415` for other media types, and `429` with `Retry-After: 60` when rate-limited.
 
-The viewer lists these records under the authenticated `OMP QA` tab at `/omp-qa`.
-These reports arrive without transcript data, so they do not have session backlinks.
-D1 reserves a validated JSON-object `properties` column for future OMP metadata; current
-reports store an empty object.
+The viewer lists these records under the authenticated `OMP QA` tab at `/omp-qa`,
+including the report's JSON property bag. These reports arrive without transcript data,
+so they do not have session backlinks. D1 reserves the validated JSON-object `properties`
+column for future OMP metadata; current reports store and display an empty object.
 
 ## Endpoints
 
