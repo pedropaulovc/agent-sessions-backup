@@ -94,7 +94,8 @@ bounded, the hub truncates install IDs, agent/model versions, and model names to
 characters; platform and architecture to 32; and tool names to 128. It does not reject
 the batch for those lengths. Retries are deduplicated by the resulting content identity
 `(installId, entry.id, model, version, tool, report)`; already stored entries count as
-duplicates and still return HTTP 200. Reports are retained for 180 days.
+duplicates and still return HTTP 200. The hub retains the newest 5,000 reports for up
+to 180 days.
 
 Responses use `400` for malformed JSON or payloads, `413` for bodies over 256 KiB,
 `415` for other media types, and `429` with `Retry-After: 60` when rate-limited.
