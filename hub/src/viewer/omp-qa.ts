@@ -1,18 +1,23 @@
 /** GET /omp-qa — consented auto-QA reports received directly from OMP. */
 import { esc, page, q } from './layout';
 
-/** Keep the viewer bounded even when the intake table grows without limit. */
-export const OMP_QA_MAX_ROWS = 5000;
 export const OMP_QA_PAGE_SIZE = 25;
-
-/** The only query used by this page. Read one extra candidate so the page can say when its
- * bounded window is full rather than quietly presenting an incomplete corpus. */
-export const OMP_QA_QUERY =
+const OMP_QA_TOOL_FACET_LIMIT = 50;
+const OMP_QA_REPORT_PREVIEW_LIMIT = 4096;
+export const OMP_QA_PAGE_QUERY =
   `SELECT id, install_id, entry_id, agent_name, agent_version, platform, arch, model,
           omp_version, tool, report, received_at
-   FROM omp_qa_reports
-   ORDER BY received_at DESC, id DESC
-   LIMIT ${OMP_QA_MAX_ROWS + 1}`;
+     FROM omp_qa_reports
+    ORDER BY received_at DESC, id DESC
+    LIMIT ?1 OFFSET ?2`;
+
+export const OMP_QA_FILTERED_PAGE_QUERY =
+  `SELECT id, install_id, entry_id, agent_name, agent_version, platform, arch, model,
+          omp_version, tool, report, received_at
+     FROM omp_qa_reports
+    WHERE tool = ?1
+    ORDER BY received_at DESC, id DESC
+    LIMIT ?2 OFFSET ?3`;
 
 interface OmpQaRow {
   id: number;
@@ -30,42 +35,52 @@ interface OmpQaRow {
 }
 
 export async function ompQaPage(url: URL, env: Env): Promise<Response> {
-  const result = await env.DB.prepare(OMP_QA_QUERY).all<OmpQaRow>();
-  const capped = result.results.length > OMP_QA_MAX_ROWS;
-  const reports = result.results.slice(0, OMP_QA_MAX_ROWS);
-  const tools = toolCounts(reports);
   const selected = url.searchParams.get('tool');
-  // A present query parameter is an exact filter, including the (invalid for intake) empty value.
-  const filtered = selected === null ? reports : reports.filter((row) => row.tool === selected);
-  const currentPage = clampPage(url.searchParams.get('page'), filtered.length);
-  const start = (currentPage - 1) * OMP_QA_PAGE_SIZE;
-  const shown = filtered.slice(start, start + OMP_QA_PAGE_SIZE);
+  const countSql = selected === null
+    ? 'SELECT COUNT(*) AS count FROM omp_qa_reports'
+    : 'SELECT COUNT(*) AS count FROM omp_qa_reports WHERE tool = ?1';
+  const countStatement = selected === null
+    ? env.DB.prepare(countSql)
+    : env.DB.prepare(countSql).bind(selected);
+  const [count, toolsResult] = await Promise.all([
+    countStatement.first<{ count: number }>(),
+    env.DB.prepare(
+      `SELECT tool, COUNT(*) AS count
+         FROM omp_qa_reports
+        GROUP BY tool
+        ORDER BY count DESC, tool
+        LIMIT ${OMP_QA_TOOL_FACET_LIMIT + 1}`,
+    ).all<{ tool: string; count: number }>(),
+  ]);
+  const total = count?.count ?? 0;
+  const currentPage = clampPage(url.searchParams.get('page'), total);
+  const offset = (currentPage - 1) * OMP_QA_PAGE_SIZE;
+  const pageStatement = selected === null
+    ? env.DB.prepare(OMP_QA_PAGE_QUERY).bind(OMP_QA_PAGE_SIZE, offset)
+    : env.DB.prepare(OMP_QA_FILTERED_PAGE_QUERY).bind(selected, OMP_QA_PAGE_SIZE, offset);
+  const reports = (await pageStatement.all<OmpQaRow>()).results;
+  const facetsTruncated = toolsResult.results.length > OMP_QA_TOOL_FACET_LIMIT;
+  const tools = toolsResult.results.slice(0, OMP_QA_TOOL_FACET_LIMIT)
+    .map((row): [string, number] => [row.tool, row.count]);
 
   const body =
     `<section class="omp-qa-page"><h2>OMP QA reports</h2>` +
     `<p class="muted small omp-qa-about">These are consented reports received directly from OMP and ` +
     `lack transcript backlinks.</p>` +
-    `<p class="muted small">${filtered.length} ${filtered.length === 1 ? 'report' : 'reports'}` +
+    `<p class="muted small">${total} ${total === 1 ? 'report' : 'reports'}` +
     `${selected !== null ? ` · filtered to tool <code>${esc(selected)}</code>` : ''}</p>` +
     renderToolFilter(tools, selected) +
-    (shown.length
-      ? shown.map(renderReport).join('')
-      : `<p class="muted">${reports.length === 0
+    (facetsTruncated
+      ? `<p class="warn">Showing the ${OMP_QA_TOOL_FACET_LIMIT} most common tool filters.</p>`
+      : '') +
+    (reports.length
+      ? reports.map(renderReport).join('')
+      : `<p class="muted">${tools.length === 0
         ? 'No OMP QA reports have been received yet.'
         : 'No report uses that tool.'}</p>`) +
-    (capped
-      ? `<p class="warn">More than ${OMP_QA_MAX_ROWS} reports are available. This page reads only the ` +
-        `${OMP_QA_MAX_ROWS} most recent reports.</p>`
-      : '') +
-    renderPager(url, currentPage, filtered.length) +
+    renderPager(url, currentPage, total) +
     `</section>`;
   return page({ title: 'OMP QA — sessions', nav: 'omp-qa', body });
-}
-
-function toolCounts(rows: OmpQaRow[]): Array<[string, number]> {
-  const counts = new Map<string, number>();
-  for (const row of rows) counts.set(row.tool, (counts.get(row.tool) ?? 0) + 1);
-  return [...counts].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
 }
 
 function renderToolFilter(tools: Array<[string, number]>, selected: string | null): string {
@@ -87,6 +102,9 @@ function renderReport(row: OmpQaRow): string {
     ? `<span class="chip">agent ${esc(row.agent_name)} ${esc(row.agent_version)}</span>`
     : '';
   const shortInstall = compactInstallId(row.install_id);
+  const report = row.report.length > OMP_QA_REPORT_PREVIEW_LIMIT
+    ? `${row.report.slice(0, OMP_QA_REPORT_PREVIEW_LIMIT - 1)}…`
+    : row.report;
   const meta = [
     `<span class="badge">${esc(row.tool)}</span>`,
     `<span class="chip">model ${esc(row.model)}</span>`,
@@ -97,7 +115,7 @@ function renderReport(row: OmpQaRow): string {
     `<time class="muted small" datetime="${esc(row.received_at)}">received at ${esc(row.received_at)}</time>`,
   ].filter(Boolean).join('');
   return `<article class="hit omp-qa-report">` +
-    `<div class="snip">${esc(row.report)}</div>` +
+    `<div class="snip">${esc(report)}</div>` +
     `<div class="meta">${meta}</div>` +
     `</article>`;
 }

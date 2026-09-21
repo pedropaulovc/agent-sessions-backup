@@ -1,5 +1,6 @@
 import { env, SELF } from 'cloudflare:test';
 import { afterEach, describe, expect, it } from 'vitest';
+import { OMP_QA_FILTERED_PAGE_QUERY, OMP_QA_PAGE_QUERY } from '../src/viewer/omp-qa';
 import { VIEWER } from './hosts';
 
 const testEnv = env as unknown as Env;
@@ -41,11 +42,12 @@ async function seed(rows: Array<SeedRow & Required<Omit<SeedRow, 'entryId'>> & {
   for (const fixture of rows) seededInstallIds.add(fixture.installId);
   await testEnv.DB.batch(rows.map((fixture) => testEnv.DB.prepare(
     `INSERT INTO omp_qa_reports
-       (install_id, entry_id, agent_name, agent_version, platform, arch, model, omp_version, tool, report, received_at)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
+       (install_id, entry_id, dedup_key, agent_name, agent_version, platform, arch, model, omp_version, tool, report, received_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
   ).bind(
     fixture.installId,
     fixture.entryId,
+    `${fixture.installId}:${fixture.entryId}:${fixture.tool}:${fixture.report}`,
     fixture.agentName,
     fixture.agentVersion,
     fixture.platform,
@@ -148,5 +150,33 @@ describe('/omp-qa viewer', () => {
     expect(response.status).toBe(200);
     const html = await response.text();
     expect(html).toContain('No report uses that tool.');
+  });
+
+  it('bounds public report previews and tool facets', async () => {
+    await seed(Array.from({ length: 51 }, (_, index) => row({
+      installId: `${INSTALL_PREFIX}bounds-${index}`,
+      tool: `bounds-tool-${String(index).padStart(2, '0')}`,
+      report: index === 50 ? `${'x'.repeat(5000)} tail-must-not-render` : `report ${index}`,
+      receivedAt: `2026-09-18T02:${String(index).padStart(2, '0')}:00.000Z`,
+    })));
+    const response = await SELF.fetch(`${VIEWER}/omp-qa`);
+    const html = await response.text();
+    expect(html).toContain('Showing the 50 most common tool filters.');
+    expect(html.match(/href="\/omp-qa\?tool=/g)).toHaveLength(50);
+    expect(html).not.toContain('tail-must-not-render');
+  });
+
+  it('uses the newest-first index for a bounded page query', async () => {
+    const plan = await testEnv.DB.prepare(`EXPLAIN QUERY PLAN ${OMP_QA_PAGE_QUERY}`)
+      .bind(25, 0)
+      .all<{ detail: string }>();
+    expect(plan.results.some((row) => row.detail.includes('omp_qa_reports_received'))).toBe(true);
+  });
+
+  it('uses the exact-tool index for filtered page queries', async () => {
+    const plan = await testEnv.DB.prepare(`EXPLAIN QUERY PLAN ${OMP_QA_FILTERED_PAGE_QUERY}`)
+      .bind('shell', 25, 0)
+      .all<{ detail: string }>();
+    expect(plan.results.some((row) => row.detail.includes('omp_qa_reports_tool_received'))).toBe(true);
   });
 });

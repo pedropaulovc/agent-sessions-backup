@@ -1,6 +1,7 @@
 import { env, SELF } from 'cloudflare:test';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { ingestOmpQa, OMP_QA_MAX_BODY_BYTES } from '../src/api/omp-qa';
+import { pruneOmpQaReports } from '../src/cron/prune';
 import { route } from '../src/router';
 import { API } from './hosts';
 
@@ -111,6 +112,37 @@ describe('POST /omp-qa', () => {
     expect(await countRows(body.installId)).toBe(2);
   });
 
+  it('keeps same-id reports with different content while deduplicating exact retries', async () => {
+    const firstBody = payload(`qa-${crypto.randomUUID()}`);
+    firstBody.entries = [firstBody.entries[0]!];
+    const changedBody = structuredClone(firstBody);
+    changedBody.entries[0]!.report = 'same local id from another profile';
+
+    expect((await post(firstBody)).status).toBe(200);
+    const changed = await post(changedBody);
+    expect(await changed.json()).toEqual({ accepted: 1, duplicates: 0 });
+    const replay = await post(changedBody);
+    expect(await replay.json()).toEqual({ accepted: 0, duplicates: 1 });
+    expect(await countRows(firstBody.installId)).toBe(2);
+  });
+
+  it('accepts long client-generated tool and report text within the request bound', async () => {
+    const body = payload(`qa-${crypto.randomUUID()}`);
+    body.entries = [{
+      ...body.entries[0]!,
+      tool: `tool-${'x'.repeat(256)}`,
+      report: `report-${'y'.repeat(8192)}`,
+    }];
+    const response = await post(body);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ accepted: 1, duplicates: 0 });
+    const stored = await testEnv.DB.prepare(
+      'SELECT tool, report FROM omp_qa_reports WHERE install_id = ?1',
+    ).bind(body.installId).first<{ tool: string; report: string }>();
+    expect(stored?.tool).toHaveLength(128);
+    expect(stored?.report).toHaveLength(8199);
+  });
+
   it('rejects malformed batches before any entry is written', async () => {
     const body = payload(`qa-${crypto.randomUUID()}`);
     body.entries[1]!.id = body.entries[0]!.id;
@@ -120,7 +152,7 @@ describe('POST /omp-qa', () => {
 
     const malformedJson = await SELF.fetch(`${API}/omp-qa`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'cf-connecting-ip': '192.0.2.240' },
       body: '{',
     });
     expect(malformedJson.status).toBe(400);
@@ -133,7 +165,7 @@ describe('POST /omp-qa', () => {
     expect(new TextEncoder().encode(oversized).byteLength).toBeGreaterThan(OMP_QA_MAX_BODY_BYTES);
     const response = await SELF.fetch(`${API}/omp-qa`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: { 'content-type': 'application/json', 'cf-connecting-ip': '192.0.2.241' },
       body: oversized,
     });
     expect(response.status).toBe(413);
@@ -196,5 +228,19 @@ describe('POST /omp-qa', () => {
     expect(limited.status).toBe(429);
     expect(limited.headers.get('retry-after')).toBe('60');
     expect(await countRows(body.installId)).toBe(0);
+  });
+});
+
+describe('OMP QA retention', () => {
+  it('prunes reports older than 180 days', async () => {
+    const installId = `qa-${crypto.randomUUID()}`;
+    installs.add(installId);
+    await testEnv.DB.prepare(
+      `INSERT INTO omp_qa_reports
+         (install_id, entry_id, dedup_key, agent_name, agent_version, platform, arch, model, omp_version, tool, report, received_at)
+       VALUES (?1, 1, ?2, 'omp', '1', 'linux', 'x64', 'model', '1', 'read', 'old report', '2000-01-01T00:00:00.000Z')`,
+    ).bind(installId, crypto.randomUUID()).run();
+    expect(await pruneOmpQaReports(testEnv)).toBeGreaterThanOrEqual(1);
+    expect(await countRows(installId)).toBe(0);
   });
 });

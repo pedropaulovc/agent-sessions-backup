@@ -62,7 +62,7 @@
   "r2_buckets": [{ "binding": "RAW", "bucket_name": "agent-sessions-raw" }],
   "kv_namespaces": [{ "binding": "KV", "id": "61505c2df55242daa2f572c188819961" }],
   "ratelimits": [
-    { "name": "OMP_QA_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 2, "period": 60 } }
+    { "name": "OMP_QA_RATE_LIMITER", "namespace_id": "1001", "simple": { "limit": 30, "period": 60 } }
   ],
   "durable_objects": {
     "bindings": [{ "name": "CF_OAUTH_BROKER", "class_name": "CloudflareOAuthBroker" }]
@@ -157,7 +157,7 @@
       "r2_buckets": [{ "binding": "RAW", "bucket_name": "agent-sessions-raw-preview" }],
       "kv_namespaces": [{ "binding": "KV", "id": "f3413813878c4846b7586c25f01cbe24" }],
       "ratelimits": [
-        { "name": "OMP_QA_RATE_LIMITER", "namespace_id": "2001", "simple": { "limit": 2, "period": 60 } }
+        { "name": "OMP_QA_RATE_LIMITER", "namespace_id": "2001", "simple": { "limit": 30, "period": 60 } }
       ],
       // Keep the migrated parse consumer and crons disabled. The dedicated rollup consumer
       // runs only explicitly submitted admin jobs, without draining the existing parse backlog.

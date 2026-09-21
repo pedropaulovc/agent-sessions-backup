@@ -1,6 +1,6 @@
 import { runModelPriceSync } from './cron/model-prices';
 import { runDailyPricing } from './cron/pricing';
-import { runDailyPrune, runPrune } from './cron/prune';
+import { pruneOmpQaReports, runDailyPrune, runPrune } from './cron/prune';
 import { runScheduledSessionRollup } from './cron/session-rollup';
 import { runWatchdog } from './cron/watchdog';
 import { consumeParseBatch } from './ingest/consumer';
@@ -42,6 +42,7 @@ export default {
     }
 
     ctx.waitUntil(runPrune(env));
+    ctx.waitUntil(pruneOmpQaReports(env));
     ctx.waitUntil(runDailyPrune(env));
     // Block-only accounting has no dependency on the pricing catalog or its upstream network.
     ctx.waitUntil(runScheduledSessionRollup(env));

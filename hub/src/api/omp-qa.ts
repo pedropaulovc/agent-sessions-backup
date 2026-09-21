@@ -75,10 +75,10 @@ function objectRecord(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>;
 }
 
-function boundedString(value: unknown, maxLength: number): string | null {
+function nonEmptyString(value: unknown): string | null {
   if (typeof value !== 'string') return null;
   const trimmed = value.trim();
-  return trimmed.length > 0 && trimmed.length <= maxLength ? trimmed : null;
+  return trimmed.length > 0 ? trimmed : null;
 }
 
 function parsePayload(value: unknown): OmpQaPayload | null {
@@ -87,13 +87,13 @@ function parsePayload(value: unknown): OmpQaPayload | null {
 
   const agent = objectRecord(body.agent);
   if (!agent) return null;
-  const agentName = boundedString(agent.name, 32);
-  const agentVersion = boundedString(agent.version, 256);
+  const agentName = nonEmptyString(agent.name);
+  const agentVersion = nonEmptyString(agent.version);
   if (agentName !== 'omp' || agentVersion === null) return null;
 
-  const installId = boundedString(body.installId, 256);
-  const platform = boundedString(body.platform, 32);
-  const arch = boundedString(body.arch, 32);
+  const installId = nonEmptyString(body.installId);
+  const platform = nonEmptyString(body.platform);
+  const arch = nonEmptyString(body.arch);
   if (installId === null || platform === null || arch === null || !Array.isArray(body.entries)) return null;
   if (body.entries.length < 1 || body.entries.length > MAX_ENTRIES) return null;
 
@@ -106,16 +106,30 @@ function parsePayload(value: unknown): OmpQaPayload | null {
     if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0 || ids.has(id)) return null;
     ids.add(id);
 
-    const model = boundedString(entry.model, 256);
-    const version = boundedString(entry.version, 256);
-    const tool = boundedString(entry.tool, 128);
-    const report = boundedString(entry.report, 4096);
+    const model = nonEmptyString(entry.model);
+    const version = nonEmptyString(entry.version);
+    const tool = nonEmptyString(entry.tool);
+    const report = nonEmptyString(entry.report);
     if (model === null || version === null || tool === null || report === null) return null;
-    entries.push({ id, model, version, tool, report });
+    entries.push({ id, model, version, tool: tool.slice(0, 128), report });
   }
 
   return { agentName, agentVersion, installId, platform, arch, entries };
 }
+
+async function dedupKey(payload: OmpQaPayload, entry: OmpQaEntry): Promise<string> {
+  const identity = JSON.stringify([
+    payload.installId,
+    entry.id,
+    entry.model,
+    entry.version,
+    entry.tool,
+    entry.report,
+  ]);
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(identity));
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
 
 /** POST /omp-qa — public, bounded OMP auto-QA report intake. */
 export async function ingestOmpQa(request: Request, env: Env): Promise<Response> {
@@ -143,15 +157,16 @@ export async function ingestOmpQa(request: Request, env: Env): Promise<Response>
   const payload = parsePayload(parsedJson);
   if (!payload) return errorResponse('invalid_payload');
 
-  const statements = payload.entries.map((entry) =>
+  const statements = await Promise.all(payload.entries.map(async (entry) =>
     env.DB.prepare(
       `INSERT INTO omp_qa_reports
-         (install_id, entry_id, agent_name, agent_version, platform, arch, model, omp_version, tool, report)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-       ON CONFLICT(install_id, entry_id) DO NOTHING`,
+         (install_id, entry_id, dedup_key, agent_name, agent_version, platform, arch, model, omp_version, tool, report)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+       ON CONFLICT(dedup_key) DO NOTHING`,
     ).bind(
       payload.installId,
       entry.id,
+      await dedupKey(payload, entry),
       payload.agentName,
       payload.agentVersion,
       payload.platform,
@@ -161,7 +176,7 @@ export async function ingestOmpQa(request: Request, env: Env): Promise<Response>
       entry.tool,
       entry.report,
     ),
-  );
+  ));
 
   const results = await env.DB.batch(statements);
   const accepted = results.reduce((count, result) => count + ((result.meta?.changes ?? 0) > 0 ? 1 : 0), 0);

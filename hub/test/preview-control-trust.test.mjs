@@ -341,7 +341,7 @@ describe('private preview application config', () => {
     expect(config.ratelimits).toEqual([{
       name: 'OMP_QA_RATE_LIMITER',
       namespace_id: '100042',
-      simple: { limit: 2, period: 60 },
+      simple: { limit: 30, period: 60 },
     }]);
     expect(config.queues.consumers[0]).toMatchObject({ queue: 'pr-42-parse', dead_letter_queue: 'pr-42-parse-dlq' });
   });
