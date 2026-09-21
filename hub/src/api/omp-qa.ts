@@ -111,10 +111,23 @@ function parsePayload(value: unknown): OmpQaPayload | null {
     const tool = nonEmptyString(entry.tool);
     const report = nonEmptyString(entry.report);
     if (model === null || version === null || tool === null || report === null) return null;
-    entries.push({ id, model, version, tool: tool.slice(0, 128), report });
+    entries.push({
+      id,
+      model: model.slice(0, 256),
+      version: version.slice(0, 256),
+      tool: tool.slice(0, 128),
+      report,
+    });
   }
 
-  return { agentName, agentVersion, installId, platform, arch, entries };
+  return {
+    agentName,
+    agentVersion: agentVersion.slice(0, 256),
+    installId: installId.slice(0, 256),
+    platform: platform.slice(0, 32),
+    arch: arch.slice(0, 32),
+    entries,
+  };
 }
 
 async function dedupKey(payload: OmpQaPayload, entry: OmpQaEntry): Promise<string> {

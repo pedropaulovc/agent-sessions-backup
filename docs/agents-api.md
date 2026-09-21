@@ -89,10 +89,12 @@ machine-certificate or read-grant paths above. The JSON body is:
 Each request carries 1–50 entries and is limited to 256 KiB. The endpoint is
 unauthenticated, accepts only `application/json`, and applies a per-source rate limit
 of 30 batches per minute. The hub validates the complete batch before writing it.
-A successful response is `{"accepted":1,"duplicates":0}`. OMP tool names are truncated
-to 128 characters without rejecting the batch. Retries are deduplicated by the content
-identity `(installId, entry.id, model, version, tool, report)`; already stored entries
-count as duplicates and still return HTTP 200. Reports are retained for 180 days.
+A successful response is `{"accepted":1,"duplicates":0}`. To keep each accepted batch
+bounded, the hub truncates install IDs, agent/model versions, and model names to 256
+characters; platform and architecture to 32; and tool names to 128. It does not reject
+the batch for those lengths. Retries are deduplicated by the resulting content identity
+`(installId, entry.id, model, version, tool, report)`; already stored entries count as
+duplicates and still return HTTP 200. Reports are retained for 180 days.
 
 Responses use `400` for malformed JSON or payloads, `413` for bodies over 256 KiB,
 `415` for other media types, and `429` with `Retry-After: 60` when rate-limited.

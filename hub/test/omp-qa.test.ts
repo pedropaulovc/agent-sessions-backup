@@ -126,10 +126,15 @@ describe('POST /omp-qa', () => {
     expect(await countRows(firstBody.installId)).toBe(2);
   });
 
-  it('accepts long client-generated tool and report text within the request bound', async () => {
+  it('truncates repeated metadata without rejecting long client reports', async () => {
     const body = payload(`qa-${crypto.randomUUID()}`);
+    body.agent.version = `agent-${'a'.repeat(300)}`;
+    body.platform = `platform-${'p'.repeat(64)}`;
+    body.arch = `arch-${'a'.repeat(64)}`;
     body.entries = [{
       ...body.entries[0]!,
+      model: `model-${'m'.repeat(300)}`,
+      version: `version-${'v'.repeat(300)}`,
       tool: `tool-${'x'.repeat(256)}`,
       report: `report-${'y'.repeat(8192)}`,
     }];
@@ -137,10 +142,37 @@ describe('POST /omp-qa', () => {
     expect(response.status).toBe(200);
     expect(await response.json()).toEqual({ accepted: 1, duplicates: 0 });
     const stored = await testEnv.DB.prepare(
-      'SELECT tool, report FROM omp_qa_reports WHERE install_id = ?1',
-    ).bind(body.installId).first<{ tool: string; report: string }>();
+      `SELECT agent_version, platform, arch, model, omp_version, tool, report
+         FROM omp_qa_reports WHERE install_id = ?1`,
+    ).bind(body.installId).first<{
+      agent_version: string; platform: string; arch: string; model: string;
+      omp_version: string; tool: string; report: string;
+    }>();
+    expect(stored).toMatchObject({
+      agent_version: expect.stringMatching(/^agent-/),
+      platform: expect.stringMatching(/^platform-/),
+      arch: expect.stringMatching(/^arch-/),
+    });
+    expect(stored?.agent_version).toHaveLength(256);
+    expect(stored?.platform).toHaveLength(32);
+    expect(stored?.arch).toHaveLength(32);
+    expect(stored?.model).toHaveLength(256);
+    expect(stored?.omp_version).toHaveLength(256);
     expect(stored?.tool).toHaveLength(128);
     expect(stored?.report).toHaveLength(8199);
+  });
+
+  it('truncates install ids before multiplying them across batch rows', async () => {
+    const body = payload(`install-${'i'.repeat(300)}`);
+    const storedInstallId = body.installId.slice(0, 256);
+    installs.add(storedInstallId);
+    const response = await post(body);
+    expect(response.status).toBe(200);
+    expect(await countRows(storedInstallId)).toBe(2);
+    const row = await testEnv.DB.prepare(
+      'SELECT length(install_id) AS length FROM omp_qa_reports WHERE install_id = ?1 LIMIT 1',
+    ).bind(storedInstallId).first<{ length: number }>();
+    expect(row?.length).toBe(256);
   });
 
   it('rejects malformed batches before any entry is written', async () => {
