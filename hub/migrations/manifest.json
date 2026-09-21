@@ -160,6 +160,11 @@
       "sequence": 32,
       "filename": "0032_blocks_issue_reports.sql",
       "sha256": "27073ddb0a7c47b59bbe940e8a5900753ea787f54817d8a6a18b8da251f838e5"
+    },
+    {
+      "sequence": 33,
+      "filename": "0033_omp_qa_reports.sql",
+      "sha256": "1c14c7df8f7de2d8ff3a97ac79d977b9185e2e99acf5f171e154d155e8556c6b"
     }
   ]
 }

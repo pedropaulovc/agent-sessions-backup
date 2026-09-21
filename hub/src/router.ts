@@ -6,13 +6,14 @@ import {
  disconnectCloudflareOAuth,
  startCloudflareOAuth,
 } from './auth/cloudflare-oauth';
-import { checkFiles, putFile } from './api/upload';
+import { ingestOmpQa } from './api/omp-qa';
 import { abortMultipart, completeMultipart, createMultipart, uploadPart } from './api/multipart';
 import { adminMachines, heartbeat, listMachines, priceUsageSlice, reindex, sessionRollupJob, status, statusBody, usage } from './api/ops';
 import { bootstrap } from './api/bootstrap';
 import { probeClientCert, renewCert } from './api/certs';
 import { search } from './api/search';
 import { getSession, getSessionRaw, listSessions } from './api/sessions';
+import { checkFiles, putFile } from './api/upload';
 import { viewerRoute } from './viewer/router';
 import { continueReindexRange, createReindexRange, getReindexRange } from './reindex-range';
 
@@ -46,6 +47,10 @@ export async function route(request: Request, env: Env, _ctx: ExecutionContext):
    pendingMigrations: Number(env.PENDING_MIGRATIONS ?? -1),
    seedDigest: env.SEED_DIGEST,
   });
+ }
+
+ if (url.pathname === '/omp-qa' && request.method === 'POST') {
+  return ingestOmpQa(request, env);
  }
 
  // Cloudflare's browser redirect cannot use the mTLS-only API hostname. The random, five-minute,

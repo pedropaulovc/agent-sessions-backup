@@ -62,6 +62,38 @@ derived per-PR bearer (`Authorization: Bearer …`; see `infra/cf/deploy.md`) �
 acts as an admin machine identity there, which is what
 `hub/scripts/preview-upload-session.mjs` uses to push hand-carried session zips.
 
+## Auto-QA intake
+### `POST https://sessions.pedrovc.com.br/omp-qa`
+
+OMP sends consented auto-QA tool reports to this public intake. It does not use the
+machine-certificate or read-grant paths above. The JSON body is:
+
+```json
+{
+  "agent": {"name": "omp", "version": "0.44.0"},
+  "installId": "6ad9ccef-70da-4bc7-b5af-50d139c11826",
+  "platform": "linux",
+  "arch": "x64",
+  "entries": [
+    {
+      "id": 42,
+      "model": "openai-codex/gpt-5.6-sol",
+      "version": "0.44.0",
+      "tool": "read",
+      "report": "returned an empty body for a readable file"
+    }
+  ]
+}
+```
+
+Each request carries 1–50 entries and is limited to 256 KiB. The hub validates the
+complete batch before writing it. A successful response is
+`{"accepted":1,"duplicates":0}`. Retries are idempotent on `(installId, entry.id)`;
+already stored entries count as duplicates and still return HTTP 200.
+
+The viewer lists these records under the authenticated `OMP QA` tab at `/omp-qa`.
+These reports arrive without transcript data, so they do not have session backlinks.
+
 ## Endpoints
 
 ### `GET /api/v1/sessions`
