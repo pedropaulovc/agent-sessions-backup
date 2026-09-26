@@ -23,6 +23,7 @@ interface BlockRow {
   content_hash: string;
   harness: string | null;
   size: number;
+  parse_state: string;
 }
 
 export async function blobEndpoint(sessionId: string, blockId: string, url: URL, env: Env): Promise<Response> {
@@ -31,7 +32,8 @@ export async function blobEndpoint(sessionId: string, blockId: string, url: URL,
 
   const row = await env.DB.prepare(
     `SELECT b.byte_start, b.byte_len, b.block_index, b.btype, b.media_byte_start,
-            b.media_byte_len, b.media_type, f.r2_key, f.content_hash, f.harness, f.size
+            b.media_byte_len, b.media_type, f.r2_key, f.content_hash, f.harness, f.size,
+            f.parse_state
      FROM blocks b JOIN files f ON f.id = b.file_id
      WHERE b.id = ?1 AND b.session_id = ?2`,
   )
@@ -56,7 +58,8 @@ export async function blobEndpoint(sessionId: string, blockId: string, url: URL,
     const lineEnd = row.byte_start + row.byte_len;
     // Old rows must be reindexed. Never fall back to parsing a 14 MB Codex line, and never
     // use an invalid/corrupt range to read a different part of the object.
-    if (row.btype !== 'image' || INLINE_IMAGE_TYPES[row.media_type ?? ''] !== true ||
+    if (row.parse_state !== 'parsed' || row.btype !== 'image' ||
+        INLINE_IMAGE_TYPES[row.media_type ?? ''] !== true ||
         offset === null || length === null || !Number.isSafeInteger(row.byte_start) ||
         !Number.isSafeInteger(row.byte_len) || !Number.isSafeInteger(row.size) ||
         !Number.isSafeInteger(offset) || !Number.isSafeInteger(length) ||

@@ -2305,22 +2305,23 @@ interface PendingBlock {
 /** Fill in the fingerprint of a row's non-positional content. Text is hashed with its length so a
  * value cannot be confused with a differently-split neighbour. */
 function withHash(row: Omit<PendingBlock, 'rowHash'>): PendingBlock {
-  return {
-    ...row,
-    rowHash: hashBlockRow([
-      row.role,
-      row.btype,
-      row.toolName,
-      row.ts,
-      row.truncated,
-      row.onMainPath,
-      row.text === null ? null : row.text.length,
-      row.text,
-      row.mediaByteStart,
-      row.mediaByteLen,
-      row.mediaType,
-    ]),
-  };
+  const parts = [
+    row.role,
+    row.btype,
+    row.toolName,
+    row.ts,
+    row.truncated,
+    row.onMainPath,
+    row.text === null ? null : row.text.length,
+    row.text,
+  ];
+  // Preserve pre-migration fingerprints for every existing non-media row. Only Codex image
+  // rows gain a new fingerprint, so reindex replaces their stale byte ranges without rewriting
+  // every other harness's transcript and FTS rows on its next append.
+  if (row.mediaByteStart !== null) {
+    parts.push(row.mediaByteStart, row.mediaByteLen, row.mediaType);
+  }
+  return { ...row, rowHash: hashBlockRow(parts) };
 }
 
 /** The `blocks` rows a parsed session implies, in insert order. */

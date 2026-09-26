@@ -942,11 +942,19 @@ describe('parseCodex', () => {
       expect(session.title).toBe(prompt);
       expect(session.turns).toHaveLength(1);
       const blocks = session.turns[0]!.blocks;
-      expect(blocks.map((block) => [block.type, block.text])).toEqual([
-        ['text', 'À drawing 🛠'], ['image', undefined], ['text', 'Middle note'],
-        ['image', undefined], ['text', 'Final instruction'],
-      ]);
-      for (const [block, image] of [[blocks[1]!, image1], [blocks[3]!, image2]] as const) {
+      const expected = lines[0] === event
+        ? [['text', prompt], ['image', undefined], ['image', undefined]]
+        : [
+          ['text', 'À drawing 🛠'], ['image', undefined], ['text', 'Middle note'],
+          ['image', undefined], ['text', 'Final instruction'],
+        ];
+      expect(blocks.map((block) => [block.type, block.text])).toEqual(expected);
+      if (lines[0] === event) {
+        expect(blocks[0]!.byteStart).toBe(0);
+        expect(blocks.slice(1).every((block) => block.byteStart === encoder.encode(event).length + 1)).toBe(true);
+      }
+      const images = blocks.filter((block) => block.type === 'image');
+      for (const [block, image] of [[images[0]!, image1], [images[1]!, image2]] as const) {
         const payload = image.slice(image.indexOf(',') + 1);
         expect(block.mediaByteLen).toBe(payload.length);
         expect(new TextDecoder().decode(source.subarray(block.mediaByteStart!, block.mediaByteStart! + block.mediaByteLen!)))
@@ -977,10 +985,101 @@ describe('parseCodex', () => {
       const session = await parseCodex(readJsonlLines(streamBytes(new TextEncoder().encode(lines.join('\n') + '\n'))), CODEX_SESSION_ID);
       expect(session.turns).toHaveLength(1);
       expect(session.title).toBe(prompt);
-      expect(session.turns[0]!.blocks.map((block) => [block.type, block.text])).toEqual([
-        ['image', undefined], ['image', undefined], ['text', prompt],
-      ]);
+      expect(session.turns[0]!.blocks.map((block) => [block.type, block.text])).toEqual(
+        lines[0] === event
+          ? [['text', prompt], ['image', undefined], ['image', undefined]]
+          : [['image', undefined], ['image', undefined], ['text', prompt]],
+      );
     }
+  });
+
+  it('keeps quoted image wrappers in text-only messages and still pairs their event twins', async () => {
+    const quoted = '<image name=[Image #7] path="example.png">\n</image>\nLiteral wrapper stays quoted';
+    const event = JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: quoted } });
+    const response = JSON.stringify({
+      type: 'response_item',
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: quoted }] },
+    });
+    for (const records of [[event, response], [response, event]]) {
+      const session = await parseCodex(readJsonlLines(toStream(records)), CODEX_SESSION_ID);
+      expect(session.title).toBe(quoted.slice(0, 120));
+      expect(session.turns.flatMap((turn) => turn.blocks.map((block) => block.text))).toEqual([quoted]);
+    }
+  });
+
+  it('anchors event-first image twins to the event record when reparsing its byte window', async () => {
+    const event = JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'Look at this sheet' } });
+    const response = JSON.stringify({
+      type: 'response_item',
+      payload: { type: 'message', role: 'user', content: [
+        { type: 'input_text', text: 'Look at this sheet' },
+        { type: 'input_image', image_url: 'data:image/png;base64,aGVsbG8=' },
+      ] },
+    });
+    const prefix = JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', message: 'Earlier page' } });
+    const encoder = new TextEncoder();
+    const source = encoder.encode(`${prefix}\n${event}\n${response}\n`);
+    const first = encoder.encode(prefix).length + 1;
+    const second = first + encoder.encode(event).length + 1;
+    const full = await parseCodex(readJsonlLines(streamBytes(source)), CODEX_SESSION_ID);
+    const ranged = await parseCodex(readJsonlLines(streamBytes(source.subarray(first)), first), CODEX_SESSION_ID);
+    expect(full.turns[1]!.blocks.map((block) => [block.type, block.byteStart])).toEqual([
+      ['text', first], ['image', second],
+    ]);
+    expect(ranged.turns[0]!.blocks).toEqual(full.turns[1]!.blocks);
+    expect(full.turns[1]!.blocks[0]!.text).toBe('Look at this sheet');
+  });
+
+  it('uses only parsed last duplicate payload, content and image_url fields for source media bytes', async () => {
+    const old = 'data:image/png;base64,QUFBQQ==';
+    const current = 'data:image/png;base64,QkJCQg==';
+    const image = (uri: string): string => `{"type":"input_image","image_url":"${uri}"}`;
+    const content = (uri: string): string => `{"type":"message","role":"user","content":[${image(uri)}]}`;
+    const rawLines = [
+      `{"type":"response_item","payload":${content(old)},"payload":${content(current)}}`,
+      `{"type":"response_item","payload":{"type":"message","role":"user","content":[${image(old)}],"content":[${image(current)}]}}`,
+      `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"${old}","image_url":"${current}"}]}}`,
+      `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"${old}","image\\u005furl":"${current}"}]}}`,
+    ];
+    for (const raw of rawLines) {
+      const body = new TextEncoder().encode(`{"hint":"ð 🚀"}\n${raw}\n`);
+      const session = await parseCodex(readJsonlLines(streamBytes(body)), CODEX_SESSION_ID);
+      expect(session.turns).toHaveLength(1);
+      const block = session.turns[0]!.blocks[0]!;
+      expect(block.type).toBe('image');
+      expect(new TextDecoder().decode(body.subarray(block.mediaByteStart!, block.mediaByteStart! + block.mediaByteLen!)))
+        .toBe('QkJCQg==');
+      expect(block.mediaByteStart).toBeGreaterThan(body.indexOf(0x0a));
+    }
+  });
+
+  it('fails closed when the parsed last image_url is malformed or JSON-escaped', async () => {
+    const valid = 'data:image/png;base64,aGVsbG8=';
+    const content = (trailing: string): string =>
+      `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"keep this"},` +
+      `{"type":"input_image","image_url":"${valid}","image_url":${trailing}}]}}`;
+    for (const raw of [content('"data:image/png;base64,%%%%"'), content('"data:image/png;base64,aGVsbG8\\u003d"'), content('null')]) {
+      for (const mode of ['index', 'render'] as const) {
+        const session = await parseCodex(readJsonlLines(toStream([raw])), CODEX_SESSION_ID, mode);
+        expect(session.turns[0]!.blocks.map((block) => [block.type, block.text])).toEqual([['text', 'keep this']]);
+      }
+    }
+  });
+
+  it('renders validated images without calculating source media ranges', async () => {
+    const raw = JSON.stringify({ type: 'response_item', payload: {
+      type: 'message', role: 'user', content: [
+        { type: 'input_image', image_url: 'data:image/png;base64,aGVsbG8=' },
+        { type: 'input_image', image_url: 'data:image/png;base64,%%%%' },
+      ],
+    } });
+    const source = new TextEncoder().encode(`${raw}\n`);
+    const indexed = await parseCodex(readJsonlLines(streamBytes(source)), CODEX_SESSION_ID);
+    const rendered = await parseCodex(readJsonlLines(streamBytes(source)), CODEX_SESSION_ID, 'render');
+    expect(rendered.turns[0]!.blocks.map((block) => [block.type, block.mediaType, block.byteStart]))
+      .toEqual(indexed.turns[0]!.blocks.map((block) => [block.type, block.mediaType, block.byteStart]));
+    expect(rendered.turns[0]!.blocks[0]!.mediaByteStart).toBeUndefined();
+    expect(indexed.turns[0]!.blocks[0]!.mediaByteStart).toBeGreaterThan(0);
   });
 
   it('skips records above the Codex-specific bound and resumes at the next line', async () => {

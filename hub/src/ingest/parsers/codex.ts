@@ -2,7 +2,6 @@ import type { JsonlLine } from '../jsonl';
 import {
   CAPS,
   cap,
-  type NormalizedBlock,
   type NormalizedSession,
   type NormalizedTurn,
   type Role,
@@ -20,7 +19,11 @@ const CODEX_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
  * Compaction (`compacted`/`world_state`) becomes marker turns; shapes vary across
  * CLI versions, so nothing beyond their presence is assumed.
  */
-export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: string): Promise<NormalizedSession> {
+export async function parseCodex(
+  lines: AsyncIterable<JsonlLine>,
+  sessionId: string,
+  mode: 'index' | 'render' = 'index',
+): Promise<NormalizedSession> {
   const session: NormalizedSession = {
     id: sessionId,
     harness: 'codex',
@@ -42,9 +45,6 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
   // both instances get indexed). See shouldIndexMessage below.
   const pendingFromResponseItem = new Map<string, number>();
   const pendingFromEventMsg = new Map<string, number>();
-  // Keep the event block identity so an image-bearing response_item arriving second can
-  // replace the provisional event text with source-ordered text/image blocks.
-  const pendingEventBlocks = new Map<string, NormalizedBlock[]>();
 
   const flush = () => {
     // A turn can be usage-only: token_count is the only billable event before EOF/role change
@@ -59,7 +59,6 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
     // genuine repeat of the same (role, text) in a different turn/exchange.
     pendingFromResponseItem.clear();
     pendingFromEventMsg.clear();
-    pendingEventBlocks.clear();
   };
   const sourceTurnIdentity = (
     role: Role,
@@ -280,28 +279,19 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       case 'message': {
         const role = (str(p.role) as Role) ?? 'assistant';
         const content = Array.isArray(p.content) ? p.content : [];
-        const text = Array.isArray(p.content) ? codexMessageText(content) : contentText(p.content);
-        const imageRanges = content.some((item) => isObj(item) && item.type === 'input_image')
-          ? codexImageRanges(rawText, at, content) : undefined;
+        const hasInputImages = content.some((item) => isObj(item) && item.type === 'input_image');
+        const text = Array.isArray(p.content) ? codexMessageText(content, hasInputImages) : contentText(p.content);
+        const imageRanges = hasInputImages ? codexImageRanges(rawText, at, content, mode) : undefined;
         const hasImages = (imageRanges?.size ?? 0) > 0;
         if (!text && !hasImages) break;
         // Opening the turn first clears pairing state at role/turn boundaries. An event_msg
         // copy can consume the text, but never the images, which exist only in response_item.
         const turn = openTurn(role === 'developer' ? 'developer' : role, ts, turnId, sourceItem);
-        let indexText = text ? shouldIndexMessage('response_item', role, text) : false;
-        if (text && !indexText) {
-          const twin = pendingEventBlocks.get(`${role}:${messageKey(text)}`)?.shift();
-          if (hasImages && twin) {
-            const atIndex = turn.blocks.indexOf(twin);
-            if (atIndex !== -1) {
-              turn.blocks.splice(atIndex, 1);
-              indexText = true;
-            }
-          }
-        }
+        const indexText = text ? shouldIndexMessage('response_item', role, text) : false;
         if (hasImages) {
-          // Keep the source order of sheets and text. Adjacent text items stay one capped block,
-          // while the media bytes remain in the R2 source line rather than in normalized blocks.
+          // Response-first keeps its interleaved text/image order. Event-first keeps the event
+          // text at its original byte anchor, then appends only the response item's images.
+          // Adjacent response text items stay one capped block; media bytes remain in R2.
           let textItems: string[] = [];
           const flushText = () => {
             if (indexText && textItems.length > 0) {
@@ -319,7 +309,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
               turn.blocks.push({ type: 'image', ...range, ...at });
             } else if (item.type !== 'input_image') {
               const part = str(item.text);
-              const cleaned = part && item.type === 'input_text' ? stripCodexImageWrappers(part) : part;
+              const cleaned = part && hasInputImages && item.type === 'input_text' ? stripCodexImageWrappers(part) : part;
               if (cleaned) textItems.push(cleaned);
             }
           }
@@ -404,10 +394,6 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         if (!shouldIndexMessage('event_msg', role, text)) break;
         const c = cap(text, CAPS.text);
         turn.blocks.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });
-        const key = `${role}:${messageKey(text)}`;
-        const blocks = pendingEventBlocks.get(key) ?? [];
-        blocks.push(turn.blocks[turn.blocks.length - 1]!);
-        pendingEventBlocks.set(key, blocks);
         if (!firstUserText && role === 'user') firstUserText = text.slice(0, 120);
         break;
       }
@@ -449,8 +435,8 @@ function contentText(content: unknown): string {
     .join('\n');
 }
 
-/** Image wrappers are Codex-generated input_text, not the user's prompt. Do not strip them from
- * event_msg text or other response item types (which may quote the literal syntax). */
+/** Image wrappers are Codex-generated input_text only when the same response message actually
+ * contains an input_image. Keep literal quoted wrappers in text-only messages and event text. */
 function stripCodexImageWrappers(text: string): string {
   if (/^<image name=\[Image #\d+\] path=(?:"[^"\r\n]*"|[^\s>\r\n]+)>$/.test(text) ||
       text === '</image>') return '';
@@ -461,12 +447,12 @@ function stripCodexImageWrappers(text: string): string {
   return cleaned === text ? text : cleaned.trim();
 }
 
-function codexMessageText(content: unknown[]): string {
+function codexMessageText(content: unknown[], hasInputImages: boolean): string {
   return content
     .filter(isObj)
     .map((part) => {
       const text = str(part.text);
-      return text && part.type === 'input_text' ? stripCodexImageWrappers(text) : text ?? '';
+      return text && hasInputImages && part.type === 'input_text' ? stripCodexImageWrappers(text) : text ?? '';
     })
     .filter(Boolean)
     .join('\n');
@@ -494,110 +480,165 @@ export function codexImageDataUri(imageUrl: unknown): { dataStart: number; media
   return { dataStart: start, mediaType: prefix[1]!.toLowerCase() };
 }
 
-/** Locate only payload.content[*].image_url strings in the ORIGINAL JSONL text. JSON.stringify
- * would change whitespace/escaping and string indices are UTF-16 rather than R2 byte offsets.
- * The envelope is already JSON.parse-validated; this small lexical walk skips unrelated values
- * without decoding/copying the 14 MB line again for every image. Unsupported escaped media
- * strings fail closed rather than guessing a range. */
+/** Walk the JSON-validated source once, counting UTF-8 bytes only for indexing.
+ * JSON.parse keeps the last duplicate key; mirror that rule at payload, content and image_url,
+ * then match each last raw URL to the parsed (and base64-validated) value. In particular, a
+ * previous same-length image_url must never be served in place of the parsed last value.
+ * Rendering needs the same eligibility but resolves persisted media IDs, not byte ranges. */
 function codexImageRanges(
   raw: string,
   at: { byteStart: number; byteLen: number },
   content: unknown[],
-): Map<number, { mediaByteStart: number; mediaByteLen: number; mediaType: string }> {
-  const ranges = new Map<number, { mediaByteStart: number; mediaByteLen: number; mediaType: string }>();
-  let previousChar = 0;
-  let previousByte = at.byteStart;
-  const space = (i: number): number => {
-    while (i < raw.length && (raw[i] === ' ' || raw[i] === '\t' || raw[i] === '\r' || raw[i] === '\n')) i++;
-    return i;
+  mode: 'index' | 'render',
+): Map<number, { mediaByteStart?: number; mediaByteLen?: number; mediaType: string }> {
+  type Candidate = { charStart: number; byteStart: number; rawLen: number };
+  const candidates = new Map<number, Candidate>();
+  let i = 0;
+  let byte = at.byteStart;
+  const next = (): number => {
+    const unit = raw.charCodeAt(i++);
+    if (mode === 'render') return unit;
+    if (unit < 0x80) byte++;
+    else if (unit < 0x800) byte += 2;
+    else if (unit >= 0xd800 && unit <= 0xdbff &&
+             raw.charCodeAt(i) >= 0xdc00 && raw.charCodeAt(i) <= 0xdfff) {
+      i++;
+      byte += 4;
+    } else byte += 3;
+    return unit;
   };
-  const stringEnd = (start: number): number => {
-    let i = start + 1;
+  const space = (): void => {
+    while (raw[i] === ' ' || raw[i] === '\t' || raw[i] === '\r' || raw[i] === '\n') next();
+  };
+  const scanString = (): { start: number; end: number; escaped: boolean } => {
+    const start = i;
+    next(); // opening quote
+    let escaped = false;
     while (i < raw.length) {
-      if (raw[i] === '\\') i += 2;
-      else if (raw[i++] === '"') return i;
-    }
-    return i;
-  };
-  const valueEnd = (start: number): number => {
-    if (raw[start] === '"') return stringEnd(start);
-    if (raw[start] !== '{' && raw[start] !== '[') {
-      let i = start;
-      while (i < raw.length && raw[i] !== ',' && raw[i] !== '}' && raw[i] !== ']') i++;
-      return i;
-    }
-    let depth = 0;
-    for (let i = start; i < raw.length; i++) {
-      if (raw[i] === '"') i = stringEnd(i) - 1;
-      else if (raw[i] === '{' || raw[i] === '[') depth++;
-      else if ((raw[i] === '}' || raw[i] === ']') && --depth === 0) return i + 1;
-    }
-    return raw.length;
-  };
-  const fields = (start: number, visit: (key: string, value: number) => void): void => {
-    if (raw[start] !== '{') return;
-    for (let i = space(start + 1); raw[i] === '"';) {
-      const end = stringEnd(i);
-      const key = raw.slice(i + 1, end - 1);
-      const value = space(space(end) + 1); // skip the JSON-validated colon
-      visit(key, value);
-      i = space(valueEnd(value));
-      if (raw[i] !== ',') break;
-      i = space(i + 1);
-    }
-  };
-  // An ASCII base64 span contributes exactly one byte per character. Count any UTF-8 in
-  // intervening JSON once, including multibyte prompt text before the first image.
-  const byteAt = (char: number): number => {
-    for (let i = previousChar; i < char; i++) {
-      const unit = raw.charCodeAt(i);
-      previousByte++;
-      if (unit >= 0x800) {
-        if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < char &&
-            raw.charCodeAt(i + 1) >= 0xdc00 && raw.charCodeAt(i + 1) <= 0xdfff) {
-          previousByte += 2;
-          i++;
-          previousByte++;
-        } else previousByte += 2;
-      } else if (unit >= 0x80) previousByte++;
-    }
-    previousChar = char;
-    return previousByte;
-  };
-  fields(space(0), (rootKey, payloadAt) => {
-    if (rootKey !== 'payload') return;
-    fields(payloadAt, (payloadKey, arrayAt) => {
-      if (payloadKey !== 'content' || raw[arrayAt] !== '[') return;
-      let itemIndex = 0;
-      for (let i = space(arrayAt + 1); i < raw.length && raw[i] !== ']';) {
-        const item = content[itemIndex];
-        if (isObj(item) && item.type === 'input_image') {
-          fields(i, (key, urlAt) => {
-            if (key !== 'image_url' || raw[urlAt] !== '"') return;
-            const parsed = codexImageDataUri(item.image_url);
-            if (!parsed) return;
-            const end = stringEnd(urlAt);
-            const rawLen = end - urlAt - 2;
-            // Equal lengths rule out JSON escapes (\u0041, \/, etc.); compare the short
-            // prefix to ensure the bytes we serve are the validated data URI's payload.
-            if (rawLen !== (item.image_url as string).length ||
-                raw.slice(urlAt + 1, urlAt + 1 + parsed.dataStart) !==
-                  (item.image_url as string).slice(0, parsed.dataStart)) return;
-            const dataChar = urlAt + 1 + parsed.dataStart;
-            const offset = byteAt(dataChar);
-            const len = rawLen - parsed.dataStart;
-            if (len > 0 && offset >= at.byteStart && offset + len <= at.byteStart + at.byteLen) {
-              ranges.set(itemIndex, { mediaByteStart: offset, mediaByteLen: len, mediaType: parsed.mediaType });
-            }
-          });
-        }
-        i = space(valueEnd(i));
-        itemIndex++;
-        if (raw[i] !== ',') break;
-        i = space(i + 1);
+      const unit = next();
+      if (unit === 34) break;
+      if (unit === 92) {
+        escaped = true;
+        next(); // escaped character; JSON.parse already checked its syntax
       }
+    }
+    return { start, end: i, escaped };
+  };
+  const skipValue = (): void => {
+    if (raw[i] === '"') {
+      scanString();
+    } else if (raw[i] === '{' || raw[i] === '[') {
+      let depth = 0;
+      do {
+        if (raw[i] === '"') scanString();
+        else {
+          const unit = next();
+          if (unit === 123 || unit === 91) depth++;
+          else if (unit === 125 || unit === 93) depth--;
+        }
+      } while (depth > 0 && i < raw.length);
+    } else {
+      while (i < raw.length && raw[i] !== ',' && raw[i] !== '}' && raw[i] !== ']' &&
+             raw[i] !== ' ' && raw[i] !== '\t' && raw[i] !== '\r' && raw[i] !== '\n') next();
+    }
+  };
+  const scanObject = (visit: (key: string) => void): void => {
+    next(); // opening brace
+    space();
+    while (raw[i] === '"') {
+      const key = scanString();
+      const name = key.escaped
+        ? JSON.parse(raw.slice(key.start, key.end)) as string
+        : raw.slice(key.start + 1, key.end - 1);
+      space();
+      next(); // colon
+      space();
+      visit(name); // must consume exactly this value
+      space();
+      if (raw[i] !== ',') break;
+      next();
+      space();
+    }
+    next(); // closing brace
+  };
+  const scanContent = (): void => {
+    next(); // opening bracket
+    space();
+    let index = 0;
+    while (raw[i] !== ']' && i < raw.length) {
+      if (raw[i] === '{') {
+        scanObject((key) => {
+          if (key !== 'image_url') {
+            skipValue();
+            return;
+          }
+          // A duplicate key with a non-string last value invalidates the earlier candidate.
+          candidates.delete(index);
+          if (raw[i] !== '"') {
+            skipValue();
+            return;
+          }
+          const startByte = byte;
+          const value = scanString();
+          candidates.set(index, {
+            charStart: value.start + 1,
+            byteStart: startByte + 1,
+            rawLen: value.end - value.start - 2,
+          });
+        });
+      } else skipValue();
+      index++;
+      space();
+      if (raw[i] !== ',') break;
+      next();
+      space();
+    }
+    next(); // closing bracket
+  };
+  space();
+  if (raw[i] === '{') scanObject((key) => {
+    if (key !== 'payload') {
+      skipValue();
+      return;
+    }
+    candidates.clear();
+    if (raw[i] !== '{') {
+      skipValue();
+      return;
+    }
+    scanObject((field) => {
+      if (field !== 'content') {
+        skipValue();
+        return;
+      }
+      candidates.clear();
+      if (raw[i] === '[') scanContent();
+      else skipValue();
     });
   });
+
+  const ranges = new Map<number, { mediaByteStart?: number; mediaByteLen?: number; mediaType: string }>();
+  for (const [index, candidate] of candidates) {
+    const item = content[index];
+    if (!isObj(item) || item.type !== 'input_image') continue;
+    const parsed = codexImageDataUri(item.image_url);
+    if (!parsed) continue;
+    const url = item.image_url as string;
+    // Any JSON escape increases raw character length. Equal lengths plus the exact prefix
+    // guarantee the raw base64 span is the last parsed, validated ASCII URL.
+    if (candidate.rawLen !== url.length ||
+        raw.slice(candidate.charStart, candidate.charStart + parsed.dataStart) !== url.slice(0, parsed.dataStart)) continue;
+    const len = candidate.rawLen - parsed.dataStart;
+    if (len <= 0) continue;
+    if (mode === 'render') {
+      ranges.set(index, { mediaType: parsed.mediaType });
+      continue;
+    }
+    const offset = candidate.byteStart + parsed.dataStart;
+    if (offset >= at.byteStart && offset + len <= at.byteStart + at.byteLen) {
+      ranges.set(index, { mediaByteStart: offset, mediaByteLen: len, mediaType: parsed.mediaType });
+    }
+  }
   return ranges;
 }
 

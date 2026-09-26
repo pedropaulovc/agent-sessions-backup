@@ -1399,6 +1399,23 @@ describe('viewer', () => {
     expect((await SELF.fetch(url)).status).toBe(200);
   });
 
+  it('does not serve stale Codex image ranges while a changed source is awaiting reparse', async () => {
+    const row = await testEnv.DB.prepare(
+      `SELECT b.id AS block_id, f.id AS file_id, f.content_hash
+       FROM blocks b JOIN files f ON f.id = b.file_id
+       WHERE b.session_id = ?1 AND b.btype = 'image' ORDER BY b.block_index LIMIT 1`,
+    ).bind(CODEX_IMAGES_SESSION).first<{ block_id: number; file_id: number; content_hash: string }>();
+    expect(row).toBeTruthy();
+    const url = `${VIEWER}/s/${CODEX_IMAGES_SESSION}/blob/${row!.block_id}?v=${row!.content_hash.slice(0, 12)}`;
+    try {
+      await testEnv.DB.prepare("UPDATE files SET parse_state = 'pending' WHERE id = ?1").bind(row!.file_id).run();
+      expect((await SELF.fetch(url)).status).toBe(404);
+    } finally {
+      await testEnv.DB.prepare("UPDATE files SET parse_state = 'parsed' WHERE id = ?1").bind(row!.file_id).run();
+    }
+    expect((await SELF.fetch(url)).status).toBe(200);
+  });
+
   it('paginates a trailing compaction marker onto its own page and renders the divider there', async () => {
     // The marker turn (turn_index 200) has no content blocks; the indexer persists a text-less
     // btype=compaction row so the page count and byte window include it.
