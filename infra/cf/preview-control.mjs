@@ -620,16 +620,15 @@ async function smoke() {
   });
 
   // A fresh Worker can briefly return an internal runtime error even after healthz has passed.
-  // PR #165 run 35149442717 attempt 3 did so here, before this unauthenticated request could
-  // reach any application binding; PRs #163 and #164 saw the same 500 on their first upload.
-  // Retry only that exact status inside the existing propagation budget. Every other unexpected
-  // response still fails immediately, and so does a stall: the 500 was observed, a connection
-  // worth waiting out was not.
+  // PR #165 run 35149442717 attempt 3 did so here; PR #167's healthz passed, then the
+  // diagnostics request hit Cloudflare's 1042 "no Workers script" handler at another edge.
+  // Retry only these two observed activation responses inside the existing propagation budget.
+  // Other unexpected responses fail immediately, as does a stalled connection.
   let activationError = null;
   for (let attempt = 1; ; attempt += 1) {
     const left = remaining();
     if (left <= 0) {
-      fail(`unauthenticated preview request still returns 500 after `
+      fail(`unauthenticated preview request still returns 500 or Cloudflare 1042 after `
         + `${Math.round(DIAGNOSTICS_SETTLE_MS / 1000)}s: ${activationError}`);
     }
     const unauthenticated = await fetch(new URL('/api/v1/preview/diagnostics', context.origin), {
@@ -639,11 +638,19 @@ async function smoke() {
     });
     if (unauthenticated.status === 401) break;
     const body = await unauthenticated.text();
-    if (unauthenticated.status !== 500) {
+    const missingWorker = unauthenticated.status === 404 && (() => {
+      try {
+        const error = JSON.parse(body);
+        return error?.error_code === 1042 && error?.error_name === 'workers_dev_script_not_found';
+      } catch {
+        return false;
+      }
+    })();
+    if (unauthenticated.status !== 500 && !missingWorker) {
       fail(`unauthenticated preview request was not denied (${unauthenticated.status}): ${body.slice(0, 500)}`);
     }
-    activationError = body.slice(0, 500);
-    if (attempt === 1) process.stderr.write('preview runtime returned 500 during activation; waiting for propagation\n');
+    activationError = `${unauthenticated.status}: ${body.slice(0, 500)}`;
+    if (attempt === 1) process.stderr.write('preview runtime is still activating; waiting for propagation\n');
     await waitForPropagation();
   }
 

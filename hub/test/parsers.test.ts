@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_JSONL_LINE_BYTES, readJsonlLines, type JsonlLine } from '../src/ingest/jsonl';
+import { MAX_CODEX_JSONL_LINE_BYTES, MAX_JSONL_LINE_BYTES, jsonlLineLimit, readJsonlLines, type JsonlLine } from '../src/ingest/jsonl';
+import { parseObject } from '../src/ingest/parse';
 import { parseClaudeCode } from '../src/ingest/parsers/claude-code';
 import { parseOmp } from '../src/ingest/parsers/omp';
 import { parseCodex } from '../src/ingest/parsers/codex';
@@ -17,6 +18,21 @@ import {
   codexLines,
   toStream,
 } from './fixtures';
+
+function streamBytes(body: Uint8Array): ReadableStream<Uint8Array> {
+  let offset = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (offset === body.length) {
+        controller.close();
+        return;
+      }
+      const end = Math.min(offset + 64 * 1024, body.length);
+      controller.enqueue(body.subarray(offset, end));
+      offset = end;
+    },
+  });
+}
 
 describe('readJsonlLines', () => {
   it('reports exact byte offsets across chunk boundaries', async () => {
@@ -845,6 +861,239 @@ describe('parseClaudeCode', () => {
 });
 
 describe('parseCodex', () => {
+  it('indexes text and sheets in a 14.4 MB Codex prompt without changing other harness caps or later offsets', async () => {
+    const meta = JSON.stringify({ timestamp: '2026-09-25T22:37:40Z', type: 'session_meta', payload: { cwd: '/synthetic' } });
+    const imageUrl = `data:image/png;base64,${'A'.repeat(720_000)}`;
+    const input = JSON.stringify({
+      timestamp: '2026-09-25T22:37:41Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [
+          ...Array.from({ length: 20 }, () => ({ type: 'input_image', image_url: imageUrl, detail: 'high' })),
+          ...Array.from({ length: 41 }, (_, i) => ({ type: 'input_text', text: i === 40 ? 'drawing instruction sentinel cobaltgear' : `drawing note ${i}` })),
+        ],
+      },
+    });
+    const reply = JSON.stringify({
+      timestamp: '2026-09-25T22:37:42Z',
+      type: 'response_item',
+      payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'final drawing answer' }] },
+    });
+    const body = new TextEncoder().encode(`${meta}\n${input}\n${reply}\n`);
+    expect(new TextEncoder().encode(input).length).toBeGreaterThan(MAX_JSONL_LINE_BYTES);
+    expect(new TextEncoder().encode(input).length).toBeLessThan(MAX_CODEX_JSONL_LINE_BYTES);
+
+    const session = await parseObject('codex', CODEX_SESSION_ID, { body: streamBytes(body) } as R2ObjectBody);
+    const inputOffset = new TextEncoder().encode(meta).length + 1;
+    const replyOffset = inputOffset + new TextEncoder().encode(input).length + 1;
+    expect(session.stats).toMatchObject({ lines: 3, parseErrorLines: 0 });
+    expect(session.turns.map((turn) => turn.role)).toEqual(['user', 'assistant']);
+    expect(session.turns[0]!.blocks.map((block) => block.type)).toEqual([...Array(20).fill('image'), 'text']);
+    expect(session.turns[0]!.blocks.slice(0, 20).every((block) => block.mediaType === 'image/png')).toBe(true);
+    expect(session.turns[0]!.blocks.every((block) => block.byteStart === inputOffset && block.byteLen === replyOffset - inputOffset)).toBe(true);
+    const images = session.turns[0]!.blocks.slice(0, 20);
+    expect(images.every((block) => block.mediaByteLen === 720_000 &&
+      block.mediaByteStart !== undefined && block.mediaByteStart >= inputOffset &&
+      block.mediaByteStart + block.mediaByteLen <= replyOffset)).toBe(true);
+    expect(images.every((block, i) => i === 0 ||
+      block.mediaByteStart! > images[i - 1]!.mediaByteStart! + images[i - 1]!.mediaByteLen!)).toBe(true);
+    for (const block of [images[0]!, images[10]!, images[19]!]) {
+      expect(new TextDecoder().decode(body.subarray(block.mediaByteStart!, block.mediaByteStart! + block.mediaByteLen!)))
+        .toBe('A'.repeat(720_000));
+    }
+    expect(session.turns[0]!.blocks[20]!.text).toContain('drawing instruction sentinel cobaltgear');
+    expect(session.turns[0]!.blocks[20]!.text).not.toContain('data:image/');
+    expect(session.turns[1]!.blocks[0]).toMatchObject({ type: 'text', text: 'final drawing answer', byteStart: replyOffset, byteLen: body.length - replyOffset });
+
+    // The same bytes stay too large for every other JSONL harness; the skipped span still
+    // includes its newline and does not shift the following decoded response.
+    const defaultLines: JsonlLine[] = [];
+    for await (const line of readJsonlLines(streamBytes(body), 0, jsonlLineLimit('claude-code'))) defaultLines.push(line);
+    expect(defaultLines[1]).toEqual({ kind: 'oversized', byteStart: inputOffset, byteLen: replyOffset - inputOffset });
+    expect(defaultLines[2]).toMatchObject({ kind: 'decoded', byteStart: replyOffset, byteLen: body.length - replyOffset });
+  });
+
+  it('strips only Codex input_text wrappers, keeps interleaved image ranges exact after UTF-8, and dedupes either event_msg order', async () => {
+    const prompt = 'À drawing 🛠\nMiddle note\nFinal instruction';
+    const event = JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: prompt } });
+    const image1 = 'data:image/png;base64,aGVsbG8=';
+    const image2 = 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=';
+    const response = JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message', role: 'user',
+        content: [
+          { type: 'input_text', text: '<image name=[Image #1] path="C:/drawings/first image.png">\r\n</image>\n\nÀ drawing 🛠' },
+          { type: 'input_image', image_url: image1 },
+          { type: 'input_text', text: 'Middle note' },
+          { type: 'input_image', image_url: 'data:image/svg+xml;base64,PHN2Zz4=' },
+          { type: 'input_image', image_url: 'data:image/png;base64,%%%%' },
+          { type: 'input_image', image_url: image2 },
+          { type: 'input_text', text: 'Final instruction' },
+        ],
+      },
+    }).replaceAll('"image_url":', '"image_url" : ');
+    const encoder = new TextEncoder();
+    for (const lines of [[event, response], [response, event]]) {
+      const source = encoder.encode(lines.join('\n') + '\n');
+      const session = await parseCodex(readJsonlLines(streamBytes(source), 0, jsonlLineLimit('codex')), CODEX_SESSION_ID);
+      expect(session.title).toBe(prompt);
+      expect(session.turns).toHaveLength(1);
+      const blocks = session.turns[0]!.blocks;
+      const expected = lines[0] === event
+        ? [['text', prompt], ['image', undefined], ['image', undefined]]
+        : [
+          ['text', 'À drawing 🛠'], ['image', undefined], ['text', 'Middle note'],
+          ['image', undefined], ['text', 'Final instruction'],
+        ];
+      expect(blocks.map((block) => [block.type, block.text])).toEqual(expected);
+      if (lines[0] === event) {
+        expect(blocks[0]!.byteStart).toBe(0);
+        expect(blocks.slice(1).every((block) => block.byteStart === encoder.encode(event).length + 1)).toBe(true);
+      }
+      const images = blocks.filter((block) => block.type === 'image');
+      for (const [block, image] of [[images[0]!, image1], [images[1]!, image2]] as const) {
+        const payload = image.slice(image.indexOf(',') + 1);
+        expect(block.mediaByteLen).toBe(payload.length);
+        expect(new TextDecoder().decode(source.subarray(block.mediaByteStart!, block.mediaByteStart! + block.mediaByteLen!)))
+          .toBe(payload);
+      }
+    }
+  });
+
+  it('drops separate image wrapper items from the Windows rollout shape without losing the prompt', async () => {
+    const prompt = 'Inspect both sheets — precisão matters';
+    const response = JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message', role: 'user',
+        content: [
+          { type: 'input_text', text: '<image name=[Image #1] path="C:\\src\\sheet-1.png">' },
+          { type: 'input_image', image_url: 'data:image/png;base64,aGVsbG8=' },
+          { type: 'input_text', text: '</image>' },
+          { type: 'input_text', text: '<image name=[Image #2] path="C:\\src\\sheet-2.png">' },
+          { type: 'input_image', image_url: 'data:image/png;base64,d29ybGQ=' },
+          { type: 'input_text', text: '</image>' },
+          { type: 'input_text', text: prompt },
+        ],
+      },
+    });
+    const event = JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: prompt } });
+    for (const lines of [[event, response], [response, event]]) {
+      const session = await parseCodex(readJsonlLines(streamBytes(new TextEncoder().encode(lines.join('\n') + '\n'))), CODEX_SESSION_ID);
+      expect(session.turns).toHaveLength(1);
+      expect(session.title).toBe(prompt);
+      expect(session.turns[0]!.blocks.map((block) => [block.type, block.text])).toEqual(
+        lines[0] === event
+          ? [['text', prompt], ['image', undefined], ['image', undefined]]
+          : [['image', undefined], ['image', undefined], ['text', prompt]],
+      );
+    }
+  });
+
+  it('keeps quoted image wrappers in text-only messages and still pairs their event twins', async () => {
+    const quoted = '<image name=[Image #7] path="example.png">\n</image>\nLiteral wrapper stays quoted';
+    const event = JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: quoted } });
+    const response = JSON.stringify({
+      type: 'response_item',
+      payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text: quoted }] },
+    });
+    for (const records of [[event, response], [response, event]]) {
+      const session = await parseCodex(readJsonlLines(toStream(records)), CODEX_SESSION_ID);
+      expect(session.title).toBe(quoted.slice(0, 120));
+      expect(session.turns.flatMap((turn) => turn.blocks.map((block) => block.text))).toEqual([quoted]);
+    }
+  });
+
+  it('anchors event-first image twins to the event record when reparsing its byte window', async () => {
+    const event = JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'Look at this sheet' } });
+    const response = JSON.stringify({
+      type: 'response_item',
+      payload: { type: 'message', role: 'user', content: [
+        { type: 'input_text', text: 'Look at this sheet' },
+        { type: 'input_image', image_url: 'data:image/png;base64,aGVsbG8=' },
+      ] },
+    });
+    const prefix = JSON.stringify({ type: 'event_msg', payload: { type: 'agent_message', message: 'Earlier page' } });
+    const encoder = new TextEncoder();
+    const source = encoder.encode(`${prefix}\n${event}\n${response}\n`);
+    const first = encoder.encode(prefix).length + 1;
+    const second = first + encoder.encode(event).length + 1;
+    const full = await parseCodex(readJsonlLines(streamBytes(source)), CODEX_SESSION_ID);
+    const ranged = await parseCodex(readJsonlLines(streamBytes(source.subarray(first)), first), CODEX_SESSION_ID);
+    expect(full.turns[1]!.blocks.map((block) => [block.type, block.byteStart])).toEqual([
+      ['text', first], ['image', second],
+    ]);
+    expect(ranged.turns[0]!.blocks).toEqual(full.turns[1]!.blocks);
+    expect(full.turns[1]!.blocks[0]!.text).toBe('Look at this sheet');
+  });
+
+  it('uses only parsed last duplicate payload, content and image_url fields for source media bytes', async () => {
+    const old = 'data:image/png;base64,QUFBQQ==';
+    const current = 'data:image/png;base64,QkJCQg==';
+    const image = (uri: string): string => `{"type":"input_image","image_url":"${uri}"}`;
+    const content = (uri: string): string => `{"type":"message","role":"user","content":[${image(uri)}]}`;
+    const rawLines = [
+      `{"type":"response_item","payload":${content(old)},"payload":${content(current)}}`,
+      `{"type":"response_item","payload":{"type":"message","role":"user","content":[${image(old)}],"content":[${image(current)}]}}`,
+      `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"${old}","image_url":"${current}"}]}}`,
+      `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"${old}","image\\u005furl":"${current}"}]}}`,
+    ];
+    for (const raw of rawLines) {
+      const body = new TextEncoder().encode(`{"hint":"ð 🚀"}\n${raw}\n`);
+      const session = await parseCodex(readJsonlLines(streamBytes(body)), CODEX_SESSION_ID);
+      expect(session.turns).toHaveLength(1);
+      const block = session.turns[0]!.blocks[0]!;
+      expect(block.type).toBe('image');
+      expect(new TextDecoder().decode(body.subarray(block.mediaByteStart!, block.mediaByteStart! + block.mediaByteLen!)))
+        .toBe('QkJCQg==');
+      expect(block.mediaByteStart).toBeGreaterThan(body.indexOf(0x0a));
+    }
+  });
+
+  it('fails closed when the parsed last image_url is malformed or JSON-escaped', async () => {
+    const valid = 'data:image/png;base64,aGVsbG8=';
+    const content = (trailing: string): string =>
+      `{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"keep this"},` +
+      `{"type":"input_image","image_url":"${valid}","image_url":${trailing}}]}}`;
+    for (const raw of [content('"data:image/png;base64,%%%%"'), content('"data:image/png;base64,aGVsbG8\\u003d"'), content('null')]) {
+      for (const mode of ['index', 'render'] as const) {
+        const session = await parseCodex(readJsonlLines(toStream([raw])), CODEX_SESSION_ID, mode);
+        expect(session.turns[0]!.blocks.map((block) => [block.type, block.text])).toEqual([['text', 'keep this']]);
+      }
+    }
+  });
+
+  it('renders validated images without calculating source media ranges', async () => {
+    const raw = JSON.stringify({ type: 'response_item', payload: {
+      type: 'message', role: 'user', content: [
+        { type: 'input_image', image_url: 'data:image/png;base64,aGVsbG8=' },
+        { type: 'input_image', image_url: 'data:image/png;base64,%%%%' },
+      ],
+    } });
+    const source = new TextEncoder().encode(`${raw}\n`);
+    const indexed = await parseCodex(readJsonlLines(streamBytes(source)), CODEX_SESSION_ID);
+    const rendered = await parseCodex(readJsonlLines(streamBytes(source)), CODEX_SESSION_ID, 'render');
+    expect(rendered.turns[0]!.blocks.map((block) => [block.type, block.mediaType, block.byteStart]))
+      .toEqual(indexed.turns[0]!.blocks.map((block) => [block.type, block.mediaType, block.byteStart]));
+    expect(rendered.turns[0]!.blocks[0]!.mediaByteStart).toBeUndefined();
+    expect(indexed.turns[0]!.blocks[0]!.mediaByteStart).toBeGreaterThan(0);
+  });
+
+  it('skips records above the Codex-specific bound and resumes at the next line', async () => {
+    const body = new Uint8Array(MAX_CODEX_JSONL_LINE_BYTES + 1 + '\n{"after":true}\n'.length);
+    body.fill(0x41, 0, MAX_CODEX_JSONL_LINE_BYTES + 1);
+    body.set(new TextEncoder().encode('\n{"after":true}\n'), MAX_CODEX_JSONL_LINE_BYTES + 1);
+    const out: JsonlLine[] = [];
+    for await (const line of readJsonlLines(streamBytes(body), 0, jsonlLineLimit('codex'))) out.push(line);
+    expect(out).toEqual([
+      { kind: 'oversized', byteStart: 0, byteLen: MAX_CODEX_JSONL_LINE_BYTES + 2 },
+      { kind: 'decoded', text: '{"after":true}', byteStart: MAX_CODEX_JSONL_LINE_BYTES + 2, byteLen: 15 },
+    ]);
+  });
+
   it('groups turns, folds token_count into usage, dedupes agent_message, marks compaction', async () => {
     const s = await parseCodex(readJsonlLines(toStream(codexLines())), CODEX_SESSION_ID);
 

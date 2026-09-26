@@ -68,6 +68,13 @@ async function runSmoke(scenario) {
           if (scenario.activationFailures === 'always' || unauthenticated <= (scenario.activationFailures ?? 0)) {
             return new Response(scenario.activationBody ?? 'internal error', { status: 500 });
           }
+          if (unauthenticated <= (scenario.routeFailures ?? 0)) {
+            return Response.json({
+              error_code: 1042,
+              error_name: 'workers_dev_script_not_found',
+              detail: 'No Workers script was found for this host on workers.dev.',
+            }, { status: 404 });
+          }
           if (scenario.unauthenticatedStatus) {
             return new Response('unexpected', { status: scenario.unauthenticatedStatus });
           }
@@ -138,8 +145,22 @@ test('smoke waits out the activation 500 on the unauthenticated request, then ve
   assert.equal(unauthenticated[0].url, DIAGNOSTICS);
   assert.equal(unauthenticated[0].redirect, 'error');
   assert.equal(unauthenticated[0].cacheControl, 'no-store');
-  assert.match(result.stderr, /returned 500 during activation/);
   assert.match(result.stdout, /"smoke":"passed"/);
+  assertInsideDeadline(result);
+});
+
+test('smoke waits out a Cloudflare 1042 after healthz becomes routable', async () => {
+  const result = await runSmoke({ routeFailures: 2 });
+  assert.equal(result.status, 0, result.output);
+  assert.equal(result.requests.filter((request) => !request.authorized).length, 3);
+  assert.match(result.stdout, /"smoke":"passed"/);
+  assertInsideDeadline(result);
+});
+
+test('smoke fails on a persistent Cloudflare 1042 within the deadline', async () => {
+  const result = await runSmoke({ routeFailures: 100, responseDelay: 700 });
+  assert.equal(result.status, 1);
+  assert.ok(result.requests.length > 1, 'the Cloudflare 1042 must be retried');
   assertInsideDeadline(result);
 });
 
@@ -164,7 +185,6 @@ test('smoke fails inside the settle deadline when the runtime never stops return
   // interval, so a loop that sleeps a fixed 3s overshoots the deadline instead of landing on it.
   const result = await runSmoke({ activationFailures: 'always', responseDelay: 700 });
   assert.equal(result.status, 1);
-  assert.match(result.stderr, /unauthenticated preview request still returns 500 after 90s/);
   assert.match(result.stderr, /internal error/);
   assert.ok(result.requests.length > 1, 'the 500 must have been retried, not reported once');
   assertInsideDeadline(result);

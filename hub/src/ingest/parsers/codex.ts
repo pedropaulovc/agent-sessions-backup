@@ -2,7 +2,6 @@ import type { JsonlLine } from '../jsonl';
 import {
   CAPS,
   cap,
-  type NormalizedBlock,
   type NormalizedSession,
   type NormalizedTurn,
   type Role,
@@ -20,7 +19,11 @@ const CODEX_SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0
  * Compaction (`compacted`/`world_state`) becomes marker turns; shapes vary across
  * CLI versions, so nothing beyond their presence is assumed.
  */
-export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: string): Promise<NormalizedSession> {
+export async function parseCodex(
+  lines: AsyncIterable<JsonlLine>,
+  sessionId: string,
+  mode: 'index' | 'render' = 'index',
+): Promise<NormalizedSession> {
   const session: NormalizedSession = {
     id: sessionId,
     harness: 'codex',
@@ -233,7 +236,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         break;
       }
       case 'response_item': {
-        handleResponseItem(payload, ts, at);
+        handleResponseItem(payload, ts, at, line.text);
         break;
       }
       case 'event_msg': {
@@ -260,7 +263,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
   session.turns.forEach((t, i) => (t.index = i));
   return session;
 
-  function handleResponseItem(p: Record<string, unknown>, ts: string | undefined, at: { byteStart: number; byteLen: number }) {
+  function handleResponseItem(p: Record<string, unknown>, ts: string | undefined, at: { byteStart: number; byteLen: number }, rawText: string) {
     const meta = isObj(p.internal_chat_message_metadata_passthrough)
       ? p.internal_chat_message_metadata_passthrough
       : undefined;
@@ -275,18 +278,47 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
     switch (p.type) {
       case 'message': {
         const role = (str(p.role) as Role) ?? 'assistant';
-        const text = contentText(p.content);
-        if (!text) break;
-        // Resolve/open the turn BEFORE the dedupe check: if this message starts a new turn,
-        // opening it flushes and clears the pending-pairing maps for the turn being left. Doing
-        // that first means a message that itself opens a new turn gets to register its own
-        // pending count in the FRESH map, instead of registering then immediately having its own
-        // turn-opening flush wipe it out.
+        const content = Array.isArray(p.content) ? p.content : [];
+        const hasInputImages = content.some((item) => isObj(item) && item.type === 'input_image');
+        const text = Array.isArray(p.content) ? codexMessageText(content, hasInputImages) : contentText(p.content);
+        const imageRanges = hasInputImages ? codexImageRanges(rawText, at, content, mode) : undefined;
+        const hasImages = (imageRanges?.size ?? 0) > 0;
+        if (!text && !hasImages) break;
+        // Opening the turn first clears pairing state at role/turn boundaries. An event_msg
+        // copy can consume the text, but never the images, which exist only in response_item.
         const turn = openTurn(role === 'developer' ? 'developer' : role, ts, turnId, sourceItem);
-        if (!shouldIndexMessage('response_item', role, text)) break;
-        const c = cap(text, CAPS.text);
-        turn.blocks.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });
-        if (!firstUserText && role === 'user') firstUserText = text.slice(0, 120);
+        const indexText = text ? shouldIndexMessage('response_item', role, text) : false;
+        if (hasImages) {
+          // Response-first keeps its interleaved text/image order. Event-first keeps the event
+          // text at its original byte anchor, then appends only the response item's images.
+          // Adjacent response text items stay one capped block; media bytes remain in R2.
+          let textItems: string[] = [];
+          const flushText = () => {
+            if (indexText && textItems.length > 0) {
+              const c = cap(textItems.join('\n'), CAPS.text);
+              turn.blocks.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });
+            }
+            textItems = [];
+          };
+          for (let i = 0; i < content.length; i++) {
+            const item = content[i];
+            if (!isObj(item)) continue;
+            const range = imageRanges?.get(i);
+            if (range) {
+              flushText();
+              turn.blocks.push({ type: 'image', ...range, ...at });
+            } else if (item.type !== 'input_image') {
+              const part = str(item.text);
+              const cleaned = part && hasInputImages && item.type === 'input_text' ? stripCodexImageWrappers(part) : part;
+              if (cleaned) textItems.push(cleaned);
+            }
+          }
+          flushText();
+        } else if (indexText) {
+          const c = cap(text, CAPS.text);
+          turn.blocks.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });
+        }
+        if (!firstUserText && role === 'user' && text) firstUserText = text.slice(0, 120);
         break;
       }
       case 'reasoning': {
@@ -401,6 +433,213 @@ function contentText(content: unknown): string {
     .map((p) => str(p.text) ?? '')
     .filter(Boolean)
     .join('\n');
+}
+
+/** Image wrappers are Codex-generated input_text only when the same response message actually
+ * contains an input_image. Keep literal quoted wrappers in text-only messages and event text. */
+function stripCodexImageWrappers(text: string): string {
+  if (/^<image name=\[Image #\d+\] path=(?:"[^"\r\n]*"|[^\s>\r\n]+)>$/.test(text) ||
+      text === '</image>') return '';
+  const cleaned = text.replace(
+    /(^|\r?\n)<image name=\[Image #\d+\] path=(?:"[^"\r\n]*"|[^\s>\r\n]+)>\r?\n<\/image>(?=\r?\n|$)/g,
+    '$1',
+  );
+  return cleaned === text ? text : cleaned.trim();
+}
+
+function codexMessageText(content: unknown[], hasInputImages: boolean): string {
+  return content
+    .filter(isObj)
+    .map((part) => {
+      const text = str(part.text);
+      return text && hasInputImages && part.type === 'input_text' ? stripCodexImageWrappers(text) : text ?? '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
+/** Codex image_url data URIs are served by the blob endpoint only for browser-safe raster types. */
+export function codexImageDataUri(imageUrl: unknown): { dataStart: number; mediaType: string } | undefined {
+  if (typeof imageUrl !== 'string') return undefined;
+  const prefix = /^data:(image\/(?:png|jpeg|gif|webp));base64,/i.exec(imageUrl);
+  if (!prefix || imageUrl.length === prefix[0].length) return undefined;
+  const start = prefix[0].length;
+  if ((imageUrl.length - start) % 4 !== 0) return undefined;
+  let padding = false;
+  let paddingCount = 0;
+  for (let i = start; i < imageUrl.length; i++) {
+    const c = imageUrl.charCodeAt(i);
+    if (c === 61) {
+      padding = true;
+      if (++paddingCount > 2) return undefined;
+    } else if (padding || !(
+      (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+      (c >= 48 && c <= 57) || c === 43 || c === 47
+    )) return undefined;
+  }
+  return { dataStart: start, mediaType: prefix[1]!.toLowerCase() };
+}
+
+/** Walk the JSON-validated source once, counting UTF-8 bytes only for indexing.
+ * JSON.parse keeps the last duplicate key; mirror that rule at payload, content and image_url,
+ * then match each last raw URL to the parsed (and base64-validated) value. In particular, a
+ * previous same-length image_url must never be served in place of the parsed last value.
+ * Rendering needs the same eligibility but resolves persisted media IDs, not byte ranges. */
+function codexImageRanges(
+  raw: string,
+  at: { byteStart: number; byteLen: number },
+  content: unknown[],
+  mode: 'index' | 'render',
+): Map<number, { mediaByteStart?: number; mediaByteLen?: number; mediaType: string }> {
+  type Candidate = { charStart: number; byteStart: number; rawLen: number };
+  const candidates = new Map<number, Candidate>();
+  let i = 0;
+  let byte = at.byteStart;
+  const next = (): number => {
+    const unit = raw.charCodeAt(i++);
+    if (mode === 'render') return unit;
+    if (unit < 0x80) byte++;
+    else if (unit < 0x800) byte += 2;
+    else if (unit >= 0xd800 && unit <= 0xdbff &&
+             raw.charCodeAt(i) >= 0xdc00 && raw.charCodeAt(i) <= 0xdfff) {
+      i++;
+      byte += 4;
+    } else byte += 3;
+    return unit;
+  };
+  const space = (): void => {
+    while (raw[i] === ' ' || raw[i] === '\t' || raw[i] === '\r' || raw[i] === '\n') next();
+  };
+  const scanString = (): { start: number; end: number; escaped: boolean } => {
+    const start = i;
+    next(); // opening quote
+    let escaped = false;
+    while (i < raw.length) {
+      const unit = next();
+      if (unit === 34) break;
+      if (unit === 92) {
+        escaped = true;
+        next(); // escaped character; JSON.parse already checked its syntax
+      }
+    }
+    return { start, end: i, escaped };
+  };
+  const skipValue = (): void => {
+    if (raw[i] === '"') {
+      scanString();
+    } else if (raw[i] === '{' || raw[i] === '[') {
+      let depth = 0;
+      do {
+        if (raw[i] === '"') scanString();
+        else {
+          const unit = next();
+          if (unit === 123 || unit === 91) depth++;
+          else if (unit === 125 || unit === 93) depth--;
+        }
+      } while (depth > 0 && i < raw.length);
+    } else {
+      while (i < raw.length && raw[i] !== ',' && raw[i] !== '}' && raw[i] !== ']' &&
+             raw[i] !== ' ' && raw[i] !== '\t' && raw[i] !== '\r' && raw[i] !== '\n') next();
+    }
+  };
+  const scanObject = (visit: (key: string) => void): void => {
+    next(); // opening brace
+    space();
+    while (raw[i] === '"') {
+      const key = scanString();
+      const name = key.escaped
+        ? JSON.parse(raw.slice(key.start, key.end)) as string
+        : raw.slice(key.start + 1, key.end - 1);
+      space();
+      next(); // colon
+      space();
+      visit(name); // must consume exactly this value
+      space();
+      if (raw[i] !== ',') break;
+      next();
+      space();
+    }
+    next(); // closing brace
+  };
+  const scanContent = (): void => {
+    next(); // opening bracket
+    space();
+    let index = 0;
+    while (raw[i] !== ']' && i < raw.length) {
+      if (raw[i] === '{') {
+        scanObject((key) => {
+          if (key !== 'image_url') {
+            skipValue();
+            return;
+          }
+          // A duplicate key with a non-string last value invalidates the earlier candidate.
+          candidates.delete(index);
+          if (raw[i] !== '"') {
+            skipValue();
+            return;
+          }
+          const startByte = byte;
+          const value = scanString();
+          candidates.set(index, {
+            charStart: value.start + 1,
+            byteStart: startByte + 1,
+            rawLen: value.end - value.start - 2,
+          });
+        });
+      } else skipValue();
+      index++;
+      space();
+      if (raw[i] !== ',') break;
+      next();
+      space();
+    }
+    next(); // closing bracket
+  };
+  space();
+  if (raw[i] === '{') scanObject((key) => {
+    if (key !== 'payload') {
+      skipValue();
+      return;
+    }
+    candidates.clear();
+    if (raw[i] !== '{') {
+      skipValue();
+      return;
+    }
+    scanObject((field) => {
+      if (field !== 'content') {
+        skipValue();
+        return;
+      }
+      candidates.clear();
+      if (raw[i] === '[') scanContent();
+      else skipValue();
+    });
+  });
+
+  const ranges = new Map<number, { mediaByteStart?: number; mediaByteLen?: number; mediaType: string }>();
+  for (const [index, candidate] of candidates) {
+    const item = content[index];
+    if (!isObj(item) || item.type !== 'input_image') continue;
+    const parsed = codexImageDataUri(item.image_url);
+    if (!parsed) continue;
+    const url = item.image_url as string;
+    // Any JSON escape increases raw character length. Equal lengths plus the exact prefix
+    // guarantee the raw base64 span is the last parsed, validated ASCII URL.
+    if (candidate.rawLen !== url.length ||
+        raw.slice(candidate.charStart, candidate.charStart + parsed.dataStart) !== url.slice(0, parsed.dataStart)) continue;
+    const len = candidate.rawLen - parsed.dataStart;
+    if (len <= 0) continue;
+    if (mode === 'render') {
+      ranges.set(index, { mediaType: parsed.mediaType });
+      continue;
+    }
+    const offset = candidate.byteStart + parsed.dataStart;
+    if (offset >= at.byteStart && offset + len <= at.byteStart + at.byteLen) {
+      ranges.set(index, { mediaByteStart: offset, mediaByteLen: len, mediaType: parsed.mediaType });
+    }
+  }
+  return ranges;
 }
 
 function isObj(v: unknown): v is Record<string, unknown> {
