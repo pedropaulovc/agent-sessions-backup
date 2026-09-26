@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { MAX_JSONL_LINE_BYTES, readJsonlLines, type JsonlLine } from '../src/ingest/jsonl';
+import { MAX_CODEX_JSONL_LINE_BYTES, MAX_JSONL_LINE_BYTES, jsonlLineLimit, readJsonlLines, type JsonlLine } from '../src/ingest/jsonl';
+import { parseObject } from '../src/ingest/parse';
 import { parseClaudeCode } from '../src/ingest/parsers/claude-code';
 import { parseOmp } from '../src/ingest/parsers/omp';
 import { parseCodex } from '../src/ingest/parsers/codex';
@@ -17,6 +18,21 @@ import {
   codexLines,
   toStream,
 } from './fixtures';
+
+function streamBytes(body: Uint8Array): ReadableStream<Uint8Array> {
+  let offset = 0;
+  return new ReadableStream({
+    pull(controller) {
+      if (offset === body.length) {
+        controller.close();
+        return;
+      }
+      const end = Math.min(offset + 64 * 1024, body.length);
+      controller.enqueue(body.subarray(offset, end));
+      offset = end;
+    },
+  });
+}
 
 describe('readJsonlLines', () => {
   it('reports exact byte offsets across chunk boundaries', async () => {
@@ -845,6 +861,62 @@ describe('parseClaudeCode', () => {
 });
 
 describe('parseCodex', () => {
+  it('indexes text and sheets in a 14.4 MB Codex prompt without changing other harness caps or later offsets', async () => {
+    const meta = JSON.stringify({ timestamp: '2026-09-25T22:37:40Z', type: 'session_meta', payload: { cwd: '/synthetic' } });
+    const imageUrl = `data:image/png;base64,${'A'.repeat(720_000)}`;
+    const input = JSON.stringify({
+      timestamp: '2026-09-25T22:37:41Z',
+      type: 'response_item',
+      payload: {
+        type: 'message',
+        role: 'user',
+        content: [
+          ...Array.from({ length: 20 }, () => ({ type: 'input_image', image_url: imageUrl, detail: 'high' })),
+          ...Array.from({ length: 41 }, (_, i) => ({ type: 'input_text', text: i === 40 ? 'drawing instruction sentinel cobaltgear' : `drawing note ${i}` })),
+        ],
+      },
+    });
+    const reply = JSON.stringify({
+      timestamp: '2026-09-25T22:37:42Z',
+      type: 'response_item',
+      payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'final drawing answer' }] },
+    });
+    const body = new TextEncoder().encode(`${meta}\n${input}\n${reply}\n`);
+    expect(new TextEncoder().encode(input).length).toBeGreaterThan(MAX_JSONL_LINE_BYTES);
+    expect(new TextEncoder().encode(input).length).toBeLessThan(MAX_CODEX_JSONL_LINE_BYTES);
+
+    const session = await parseObject('codex', CODEX_SESSION_ID, { body: streamBytes(body) } as R2ObjectBody);
+    const inputOffset = new TextEncoder().encode(meta).length + 1;
+    const replyOffset = inputOffset + new TextEncoder().encode(input).length + 1;
+    expect(session.stats).toMatchObject({ lines: 3, parseErrorLines: 0 });
+    expect(session.turns.map((turn) => turn.role)).toEqual(['user', 'assistant']);
+    expect(session.turns[0]!.blocks.map((block) => block.type)).toEqual([...Array(20).fill('image'), 'text']);
+    expect(session.turns[0]!.blocks.slice(0, 20).every((block) => block.mediaType === 'image/png')).toBe(true);
+    expect(session.turns[0]!.blocks.every((block) => block.byteStart === inputOffset && block.byteLen === replyOffset - inputOffset)).toBe(true);
+    expect(session.turns[0]!.blocks[20]!.text).toContain('drawing instruction sentinel cobaltgear');
+    expect(session.turns[0]!.blocks[20]!.text).not.toContain('data:image/');
+    expect(session.turns[1]!.blocks[0]).toMatchObject({ type: 'text', text: 'final drawing answer', byteStart: replyOffset, byteLen: body.length - replyOffset });
+
+    // The same bytes stay too large for every other JSONL harness; the skipped span still
+    // includes its newline and does not shift the following decoded response.
+    const defaultLines: JsonlLine[] = [];
+    for await (const line of readJsonlLines(streamBytes(body), 0, jsonlLineLimit('claude-code'))) defaultLines.push(line);
+    expect(defaultLines[1]).toEqual({ kind: 'oversized', byteStart: inputOffset, byteLen: replyOffset - inputOffset });
+    expect(defaultLines[2]).toMatchObject({ kind: 'decoded', byteStart: replyOffset, byteLen: body.length - replyOffset });
+  });
+
+  it('skips records above the Codex-specific bound and resumes at the next line', async () => {
+    const body = new Uint8Array(MAX_CODEX_JSONL_LINE_BYTES + 1 + '\n{"after":true}\n'.length);
+    body.fill(0x41, 0, MAX_CODEX_JSONL_LINE_BYTES + 1);
+    body.set(new TextEncoder().encode('\n{"after":true}\n'), MAX_CODEX_JSONL_LINE_BYTES + 1);
+    const out: JsonlLine[] = [];
+    for await (const line of readJsonlLines(streamBytes(body), 0, jsonlLineLimit('codex'))) out.push(line);
+    expect(out).toEqual([
+      { kind: 'oversized', byteStart: 0, byteLen: MAX_CODEX_JSONL_LINE_BYTES + 2 },
+      { kind: 'decoded', text: '{"after":true}', byteStart: MAX_CODEX_JSONL_LINE_BYTES + 2, byteLen: 15 },
+    ]);
+  });
+
   it('groups turns, folds token_count into usage, dedupes agent_message, marks compaction', async () => {
     const s = await parseCodex(readJsonlLines(toStream(codexLines())), CODEX_SESSION_ID);
 

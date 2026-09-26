@@ -276,17 +276,41 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
       case 'message': {
         const role = (str(p.role) as Role) ?? 'assistant';
         const text = contentText(p.content);
-        if (!text) break;
-        // Resolve/open the turn BEFORE the dedupe check: if this message starts a new turn,
-        // opening it flushes and clears the pending-pairing maps for the turn being left. Doing
-        // that first means a message that itself opens a new turn gets to register its own
-        // pending count in the FRESH map, instead of registering then immediately having its own
-        // turn-opening flush wipe it out.
+        const content = Array.isArray(p.content) ? p.content : [];
+        const hasImages = content.some((item) => isObj(item) && item.type === 'input_image' && !!codexImageDataUri(item.image_url));
+        if (!text && !hasImages) break;
+        // Opening the turn first clears pairing state at role/turn boundaries. An event_msg
+        // copy can consume the text, but never the images, which exist only in response_item.
         const turn = openTurn(role === 'developer' ? 'developer' : role, ts, turnId, sourceItem);
-        if (!shouldIndexMessage('response_item', role, text)) break;
-        const c = cap(text, CAPS.text);
-        turn.blocks.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });
-        if (!firstUserText && role === 'user') firstUserText = text.slice(0, 120);
+        const indexText = text ? shouldIndexMessage('response_item', role, text) : false;
+        if (hasImages) {
+          // Keep the source order of sheets and text. Adjacent text items stay one capped block,
+          // while the media bytes remain in the R2 source line rather than in normalized blocks.
+          let textItems: string[] = [];
+          const flushText = () => {
+            if (indexText && textItems.length > 0) {
+              const c = cap(textItems.join('\n'), CAPS.text);
+              turn.blocks.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });
+            }
+            textItems = [];
+          };
+          for (const item of content) {
+            if (!isObj(item)) continue;
+            const image = item.type === 'input_image' ? codexImageDataUri(item.image_url) : undefined;
+            if (image) {
+              flushText();
+              turn.blocks.push({ type: 'image', mediaType: image.mediaType, ...at });
+            } else {
+              const part = str(item.text);
+              if (part) textItems.push(part);
+            }
+          }
+          flushText();
+        } else if (indexText) {
+          const c = cap(text, CAPS.text);
+          turn.blocks.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });
+        }
+        if (!firstUserText && role === 'user' && text) firstUserText = text.slice(0, 120);
         break;
       }
       case 'reasoning': {
@@ -401,6 +425,14 @@ function contentText(content: unknown): string {
     .map((p) => str(p.text) ?? '')
     .filter(Boolean)
     .join('\n');
+}
+
+/** Codex image_url data URIs are served by the blob endpoint only for browser-safe raster types. */
+export function codexImageDataUri(imageUrl: unknown): { dataStart: number; mediaType: string } | undefined {
+  if (typeof imageUrl !== 'string') return undefined;
+  const prefix = /^data:(image\/(?:png|jpeg|gif|webp));base64,/i.exec(imageUrl);
+  if (!prefix || imageUrl.length === prefix[0].length) return undefined;
+  return { dataStart: prefix[0].length, mediaType: prefix[1]!.toLowerCase() };
 }
 
 function isObj(v: unknown): v is Record<string, unknown> {

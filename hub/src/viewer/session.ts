@@ -1,4 +1,4 @@
-import { readJsonlLines } from '../ingest/jsonl';
+import { jsonlLineLimit, readJsonlLines } from '../ingest/jsonl';
 import { isWebHarness } from '../ingest/parse';
 import type { NormalizedBlock, NormalizedSession, NormalizedTurn } from '../ingest/normalize';
 import { parseChatgptWeb } from '../ingest/parsers/chatgpt-web';
@@ -381,7 +381,7 @@ async function parseRange(
         : { offset: startByte };
   const obj = range ? await env.RAW.get(file.r2_key, { range }) : await env.RAW.get(file.r2_key);
   if (!obj) return null;
-  const lines = readJsonlLines(obj.body, startByte ?? 0);
+  const lines = readJsonlLines(obj.body, startByte ?? 0, jsonlLineLimit(harness));
   if (harness === 'codex') return parseCodex(lines, sessionId);
   if (harness === 'prompt-log') return parsePromptLog(lines, sessionId);
   return parseClaudeCode(lines, sessionId);

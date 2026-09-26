@@ -1,4 +1,4 @@
-import { readJsonlLines } from './jsonl';
+import { jsonlLineLimit, readJsonlLines } from './jsonl';
 import type { Harness, NormalizedSession } from './normalize';
 import { parseChatgptWeb } from './parsers/chatgpt-web';
 import { parseClaudeCode } from './parsers/claude-code';
@@ -33,7 +33,7 @@ export async function parseObject(
 ): Promise<NormalizedSession> {
   if (harness === 'chatgpt-web') return parseChatgptWeb(await obj.text(), sessionId);
   if (harness === 'claude-web') return parseClaudeWeb(await obj.text(), sessionId);
-  const lines = readJsonlLines(obj.body);
+  const lines = readJsonlLines(obj.body, 0, jsonlLineLimit(harness));
   if (harness === 'codex') return parseCodex(lines, sessionId);
   if (harness === 'prompt-log') return parsePromptLog(lines, sessionId);
   if (harness === 'omp') return parseOmp(lines, sessionId);

@@ -11,6 +11,8 @@ Backup, index, search, and render AI agent/chat sessions from every machine and 
 
 Session details keep the transcript visible by default. Expand **Activity trace** for the current page's model and tool activity, event/error filters, and links back to turns. Duration shows recorded OMP timing spans or timestamp markers; Sequence also includes events without timestamps. Per-tool totals include only recorded durations and may overlap.
 
+Codex CLI prompts containing embedded raster sheets are shown with their text and images in source order. The hub accepts Codex JSONL records up to 16 MiB while keeping the 2 MiB limit for other harnesses; larger records are skipped. Reindex previously uploaded Codex sessions after deploying this parser change to restore omitted prompts in the index.
+
 OMP's collapsed System entry includes captured tool declarations and tool configuration as formatted JSON when the raw `omp-system-prompt` record contains `data.providerContext`. Older records without those fields cannot recover historical schemas. After deploying a parser update, refresh affected sessions with the current admin machine certificate: `POST /api/v1/admin/reindex` with `{"prefix":"raw/<machine>/<omp-store>/"}`. Repeat while the response is `202` / `done:false`; `200` / `done:true` means enqueueing finished, not indexing. Wait for the sessions to return to `index_state: "ready"` before checking declaration search results and transcript links.
 
 The **Skills** tab lists every current `SKILL.md` backup from `~/.omp/agent/managed-skills`, identifies its source machine and hash, shows the escaped source text, and inventories the other files captured with that skill.

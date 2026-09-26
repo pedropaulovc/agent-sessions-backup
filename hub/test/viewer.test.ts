@@ -48,6 +48,7 @@ const SYSTEM_SESSION = 'ffffffff-6666-4666-8666-666666666666';
 const UNVER_SESSION = '99999999-7777-4777-8777-777777777777';
 const UNKNOWN_MEDIA_SESSION = '88888888-8888-4888-8888-888888888888';
 const CODEX_TAIL_SESSION = '77777777-9999-4999-8999-999999999999';
+const CODEX_IMAGES_SESSION = '78787878-9999-4999-8999-999999999999';
 const REPO_SESSION = '66666666-aaaa-4aaa-8aaa-aaaaaaaaaaaa';
 const OFFSET_MATCH_SESSION = '55555555-bbbb-4bbb-8bbb-bbbbbbbbbbbb';
 const TITLE_SESSION = '44444444-cccc-4ccc-8ccc-cccccccccccc';
@@ -193,6 +194,38 @@ function codexWithRepo(sessionId: string, repoUrl: string, text: string): string
     JSON.stringify({ timestamp: ts, type: 'session_meta', payload: { session_id: sessionId, cwd: '/home/tester/src/demo', cli_version: '0.150.0', git: { repository_url: repoUrl, branch: 'main' } } }),
     JSON.stringify({ timestamp: ts, type: 'turn_context', payload: { model: 'gpt-test-2' } }),
     JSON.stringify({ timestamp: ts, type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }], internal_chat_message_metadata_passthrough: { turn_id: 't1' } } }),
+  ].join('\n');
+}
+
+/** Synthetic image-rich rollout: source-order text/sheet interleaving and a >2 MiB user line. */
+function codexWithImages(sessionId: string): string {
+  const image = (i: number) => ({
+    type: 'input_image',
+    image_url: i === 0 ? `data:image/png;base64,${TINY_PNG_B64}`
+      : i === 19 ? 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs='
+        : `data:image/png;base64,${'A'.repeat(130_000)}`,
+  });
+  return [
+    JSON.stringify({ timestamp: '2026-07-02T09:00:00Z', type: 'session_meta', payload: { session_id: sessionId } }),
+    JSON.stringify({
+      timestamp: '2026-07-02T09:00:01Z',
+      type: 'response_item',
+      payload: {
+        type: 'message', role: 'user',
+        content: [
+          { type: 'input_text', text: 'Inspect these synthetic sheets' },
+          ...Array.from({ length: 10 }, (_, i) => image(i)),
+          { type: 'input_text', text: 'Middle drawing note' },
+          { type: 'input_image', image_url: 'https://example.com/untrusted.png' },
+          ...Array.from({ length: 10 }, (_, i) => image(i + 10)),
+          { type: 'input_text', text: 'codeximageneedle final drawing instruction' },
+        ],
+      },
+    }),
+    JSON.stringify({
+      timestamp: '2026-07-02T09:00:02Z', type: 'response_item',
+      payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'final synthetic sheet answer' }] },
+    }),
   ].join('\n');
 }
 
@@ -380,6 +413,11 @@ describe('viewer', () => {
     expect(
       (await putFile('codex-sessions', `2026/07/02/rollout-2026-07-02T09-00-00-${CODEX_TAIL_SESSION}.jsonl`,
         codexTrailingCompaction(CODEX_TAIL_SESSION, 200),
+      )).status,
+    ).toBe(201);
+    expect(
+      (await putFile('codex-sessions', `2026/07/02/rollout-2026-07-02T09-00-00-${CODEX_IMAGES_SESSION}.jsonl`,
+        codexWithImages(CODEX_IMAGES_SESSION),
       )).status,
     ).toBe(201);
 
@@ -1247,6 +1285,50 @@ describe('viewer', () => {
     const p3 = await (await SELF.fetch(`${VIEWER}/s/${BIG_SESSION}?page=3`)).text();
     expect(p3).toContain('page 3 / 3');
     expect(p3).toContain('turn number 449 content');
+  });
+
+  it('indexes and renders image-rich Codex input in source order, serving each indexed sheet', async () => {
+    const rows = (await testEnv.DB.prepare(
+      `SELECT b.block_index, b.btype, b.text, b.byte_start, b.byte_len, b.id, f.content_hash
+       FROM blocks b JOIN files f ON f.id = b.file_id
+       WHERE b.session_id = ?1 ORDER BY b.turn_index, b.block_index`,
+    ).bind(CODEX_IMAGES_SESSION).all<{
+      block_index: number; btype: string; text: string | null;
+      byte_start: number; byte_len: number; id: number; content_hash: string;
+    }>()).results;
+    expect(rows.map((r) => r.btype)).toEqual([
+      'text', ...Array(10).fill('image'), 'text', ...Array(10).fill('image'), 'text', 'text',
+    ]);
+    expect(rows[1]!.block_index).toBe(1);
+    expect(rows[21]!.block_index).toBe(21);
+    expect(rows.slice(0, 23).every((row) => row.byte_start === rows[0]!.byte_start && row.byte_len === rows[0]!.byte_len)).toBe(true);
+    expect(rows[23]!.byte_start).toBe(rows[0]!.byte_start + rows[0]!.byte_len);
+
+    const search = await (await SELF.fetch(`${VIEWER}/?q=codeximageneedle`)).text();
+    expect(search).toContain(`/s/${CODEX_IMAGES_SESSION}?page=1#t0`);
+    const page = await SELF.fetch(`${VIEWER}/s/${CODEX_IMAGES_SESSION}`);
+    expect(page.status).toBe(200);
+    const html = await page.text();
+    expect(html).toContain('codeximageneedle final drawing instruction');
+    expect(html).toContain('final synthetic sheet answer');
+    const imageUrls = [...html.matchAll(new RegExp(`/s/${CODEX_IMAGES_SESSION}/blob/(\\d+)\\?v=[0-9a-f]{12}`, 'g'))];
+    expect(imageUrls).toHaveLength(20);
+    expect(imageUrls.map((m) => Number(m[1]))).toEqual(rows.filter((row) => row.btype === 'image').map((row) => row.id));
+    expect(html.indexOf('Middle drawing note')).toBeGreaterThan(imageUrls[9]!.index!);
+    expect(html.indexOf('Middle drawing note')).toBeLessThan(imageUrls[10]!.index!);
+    expect(html.indexOf('codeximageneedle final drawing instruction')).toBeGreaterThan(imageUrls[19]!.index!);
+
+    const version = rows[0]!.content_hash.slice(0, 12);
+    const first = await SELF.fetch(`${VIEWER}/s/${CODEX_IMAGES_SESSION}/blob/${rows[1]!.id}?v=${version}`);
+    expect(first.status).toBe(200);
+    expect(first.headers.get('content-type')).toBe('image/png');
+    expect(first.headers.get('content-security-policy')).toBe('sandbox');
+    expect(new Uint8Array(await first.arrayBuffer())).toEqual(Uint8Array.from(atob(TINY_PNG_B64), (c) => c.charCodeAt(0)));
+
+    const last = await SELF.fetch(`${VIEWER}/s/${CODEX_IMAGES_SESSION}/blob/${rows[21]!.id}?v=${version}`);
+    expect(last.status).toBe(200);
+    expect(last.headers.get('content-type')).toBe('image/gif');
+    expect(new Uint8Array(await last.arrayBuffer())).toEqual(Uint8Array.from(atob('R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs='), (c) => c.charCodeAt(0)));
   });
 
   it('paginates a trailing compaction marker onto its own page and renders the divider there', async () => {

@@ -1,6 +1,7 @@
 /** GET /s/{id}/blob/{block_id}?v={hash} — serve a single image/document by range-reading its source line from R2. */
 
 import { imageMediaType } from '../ingest/normalize';
+import { codexImageDataUri } from '../ingest/parsers/codex';
 import { blobVersionOf } from './session';
 
 // Only these raster types are safe to render inline from the viewer origin. Everything else —
@@ -12,6 +13,7 @@ interface BlockRow {
   byte_start: number | null;
   byte_len: number | null;
   block_index: number;
+  image_index: number;
   btype: string;
   r2_key: string;
   content_hash: string;
@@ -22,7 +24,11 @@ export async function blobEndpoint(sessionId: string, blockId: string, url: URL,
   if (!Number.isInteger(id) || id < 0) return notFound();
 
   const row = await env.DB.prepare(
-    `SELECT b.byte_start, b.byte_len, b.block_index, b.btype, f.r2_key, f.content_hash
+    `SELECT b.byte_start, b.byte_len, b.block_index, b.btype, f.r2_key, f.content_hash,
+            (SELECT COUNT(*) FROM blocks prior
+             WHERE prior.session_id = b.session_id AND prior.file_id = b.file_id
+               AND prior.turn_index = b.turn_index AND prior.byte_start = b.byte_start
+               AND prior.btype = 'image' AND prior.block_index < b.block_index) AS image_index
      FROM blocks b JOIN files f ON f.id = b.file_id
      WHERE b.id = ?1 AND b.session_id = ?2`,
   )
@@ -50,7 +56,9 @@ export async function blobEndpoint(sessionId: string, blockId: string, url: URL,
     return notFound();
   }
 
-  const media = extractMediaAt(envelope, row.block_index);
+  const media = envelope.type === 'response_item'
+    ? row.btype === 'image' ? extractCodexImageAt(envelope, row.image_index) : null
+    : extractMediaAt(envelope, row.block_index);
   if (!media) return notFound();
 
   let bytes: Uint8Array;
@@ -102,6 +110,22 @@ function extractMediaAt(envelope: Record<string, unknown>, blockIndex: number): 
       if (out === blockIndex) return mediaFromRaw(nested);
       out++;
     }
+  }
+  return null;
+}
+
+/** Codex text is grouped into blocks independently of images, so use the indexed image ordinal
+ * rather than block_index. A duplicated event_msg may consume the text block but never an image. */
+function extractCodexImageAt(envelope: Record<string, unknown>, imageIndex: number): { data: string; mediaType: string } | null {
+  const payload = isObj(envelope.payload) ? envelope.payload : undefined;
+  if (payload?.type !== 'message' || !Array.isArray(payload.content)) return null;
+  let index = 0;
+  for (const raw of payload.content) {
+    if (!isObj(raw) || raw.type !== 'input_image' || typeof raw.image_url !== 'string') continue;
+    const image = codexImageDataUri(raw.image_url);
+    if (!image) continue;
+    if (index === imageIndex) return { data: raw.image_url.slice(image.dataStart), mediaType: image.mediaType };
+    index++;
   }
   return null;
 }

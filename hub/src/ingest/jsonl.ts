@@ -26,12 +26,19 @@ export type JsonlLine = DecodedJsonlLine | OversizedJsonlLine;
 
 /** Maximum decoded JSON record size. The delimiter is not part of the content limit. */
 export const MAX_JSONL_LINE_BYTES = 2 * 1024 * 1024;
+/** Codex embeds screenshot data URIs inside response_item/message records. Keep this exception bounded. */
+export const MAX_CODEX_JSONL_LINE_BYTES = 16 * 1024 * 1024;
+
+export function jsonlLineLimit(harness: string): number {
+  return harness === 'codex' ? MAX_CODEX_JSONL_LINE_BYTES : MAX_JSONL_LINE_BYTES;
+}
 
 const NEWLINE = 0x0a;
 
 export async function* readJsonlLines(
   stream: ReadableStream<Uint8Array>,
   baseOffset = 0,
+  maxLineBytes = MAX_JSONL_LINE_BYTES,
 ): AsyncGenerator<JsonlLine> {
   const decoder = new TextDecoder('utf-8');
   const reader = stream.getReader();
@@ -43,7 +50,7 @@ export async function* readJsonlLines(
   const append = (chunk: Uint8Array): void => {
     pendingBytes += chunk.length;
     if (oversized) return;
-    if (pendingBytes > MAX_JSONL_LINE_BYTES) {
+    if (pendingBytes > maxLineBytes) {
       oversized = true;
       pending = [];
       return;
