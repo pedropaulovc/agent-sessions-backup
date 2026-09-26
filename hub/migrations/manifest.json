@@ -165,6 +165,11 @@
       "sequence": 33,
       "filename": "0033_omp_qa_reports.sql",
       "sha256": "1542fc2d35d34e519808db982fd9fc015a970ca624a87247a775924153605abf"
+    },
+    {
+      "sequence": 34,
+      "filename": "0034_codex_image_byte_ranges.sql",
+      "sha256": "14f158fc737f1f7ea91814d820a314c2d9ad145a5e11ca49b16d8528f5c75510"
     }
   ]
 }

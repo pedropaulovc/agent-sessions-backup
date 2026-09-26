@@ -1927,8 +1927,8 @@ async function writeSession(
   const priorUsage = clearRes.slice(4).reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
 
   const insertBlock = db.prepare(
-    `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, byte_start, byte_len, truncated, text, on_main_path, row_hash)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)`,
+    `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, byte_start, byte_len, truncated, text, on_main_path, row_hash, media_byte_start, media_byte_len, media_type)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)`,
   );
   const insertUsage = db.prepare(
     // `priced_version` is written explicitly as 0 rather than left to the column DEFAULT. On a
@@ -1994,6 +1994,9 @@ async function writeSession(
       b.text,
       b.onMainPath,
       b.rowHash,
+      b.mediaByteStart,
+      b.mediaByteLen,
+      b.mediaType,
     ),
   );
   // Usage is diffed per turn, independently of the block prefix: the codex parser attaches a late
@@ -2292,6 +2295,9 @@ interface PendingBlock {
   truncated: number;
   text: string | null;
   onMainPath: number;
+  mediaByteStart: number | null;
+  mediaByteLen: number | null;
+  mediaType: string | null;
   /** Fingerprint of every field above that `sameBlock` does not compare directly. */
   rowHash: number;
 }
@@ -2310,6 +2316,9 @@ function withHash(row: Omit<PendingBlock, 'rowHash'>): PendingBlock {
       row.onMainPath,
       row.text === null ? null : row.text.length,
       row.text,
+      row.mediaByteStart,
+      row.mediaByteLen,
+      row.mediaType,
     ]),
   };
 }
@@ -2333,6 +2342,9 @@ function buildBlockRows(s: NormalizedSession): PendingBlock[] {
           truncated: b.truncated ? 1 : 0,
           text: b.text ?? null,
           onMainPath: turn.onMainPath ? 1 : 0,
+          mediaByteStart: b.mediaByteStart ?? null,
+          mediaByteLen: b.mediaByteLen ?? null,
+          mediaType: b.mediaByteStart === undefined ? null : b.mediaType ?? null,
         }),
       );
     }
@@ -2354,6 +2366,9 @@ function buildBlockRows(s: NormalizedSession): PendingBlock[] {
           truncated: 0,
           text: null,
           onMainPath: turn.onMainPath ? 1 : 0,
+          mediaByteStart: null,
+          mediaByteLen: null,
+          mediaType: null,
         }),
       );
     }
@@ -2567,9 +2582,9 @@ interface StoredBlock {
 }
 
 /** Whether a stored row and a freshly parsed one are the same block, of the same file, holding the
- * same content. Position and offsets are compared directly; everything else the row carries — role,
- * type, tool name, timestamp, truncation, main-path flag, and the indexed text itself — is folded
- * into `row_hash`, so a transcript that changed underneath identical offsets does NOT match. */
+ * same content. Position and line offsets are compared directly; everything else — including
+ * indexed text and the Codex image's exact byte range/MIME — is folded into `row_hash`, so
+ * reindexing rewrites old rows lacking media metadata even when the JSONL bytes did not change. */
 function sameBlock(a: StoredBlock, b: PendingBlock, fileId: number): boolean {
   return (
     a.file_id === fileId &&

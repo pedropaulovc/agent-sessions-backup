@@ -1,22 +1,28 @@
-/** GET /s/{id}/blob/{block_id}?v={hash} — serve a single image/document by range-reading its source line from R2. */
+/** GET /s/{id}/blob/{block_id}?v={hash} — serve an indexed image/document from R2. */
 
+import { MAX_CODEX_JSONL_LINE_BYTES } from '../ingest/jsonl';
 import { imageMediaType } from '../ingest/normalize';
-import { codexImageDataUri } from '../ingest/parsers/codex';
 import { blobVersionOf } from './session';
 
 // Only these raster types are safe to render inline from the viewer origin. Everything else —
 // documents, SVG, text/html, unknown/absent — is transcript-controlled and could execute script
 // same-origin, so it is forced to a download with an inert content-type.
-const INLINE_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/gif', 'image/webp']);
+const INLINE_IMAGE_TYPES: Record<string, true> = {
+  'image/png': true, 'image/jpeg': true, 'image/gif': true, 'image/webp': true,
+};
 
 interface BlockRow {
   byte_start: number | null;
   byte_len: number | null;
+  media_byte_start: number | null;
+  media_byte_len: number | null;
+  media_type: string | null;
   block_index: number;
-  image_index: number;
   btype: string;
   r2_key: string;
   content_hash: string;
+  harness: string | null;
+  size: number;
 }
 
 export async function blobEndpoint(sessionId: string, blockId: string, url: URL, env: Env): Promise<Response> {
@@ -24,11 +30,8 @@ export async function blobEndpoint(sessionId: string, blockId: string, url: URL,
   if (!Number.isInteger(id) || id < 0) return notFound();
 
   const row = await env.DB.prepare(
-    `SELECT b.byte_start, b.byte_len, b.block_index, b.btype, f.r2_key, f.content_hash,
-            (SELECT COUNT(*) FROM blocks prior
-             WHERE prior.session_id = b.session_id AND prior.file_id = b.file_id
-               AND prior.turn_index = b.turn_index AND prior.byte_start = b.byte_start
-               AND prior.btype = 'image' AND prior.block_index < b.block_index) AS image_index
+    `SELECT b.byte_start, b.byte_len, b.block_index, b.btype, b.media_byte_start,
+            b.media_byte_len, b.media_type, f.r2_key, f.content_hash, f.harness, f.size
      FROM blocks b JOIN files f ON f.id = b.file_id
      WHERE b.id = ?1 AND b.session_id = ?2`,
   )
@@ -45,31 +48,52 @@ export async function blobEndpoint(sessionId: string, blockId: string, url: URL,
     return Response.redirect(new URL(`${url.pathname}?v=${currentVersion}`, url).toString(), 302);
   }
 
-  const obj = await env.RAW.get(row.r2_key, { range: { offset: row.byte_start, length: row.byte_len } });
-  if (!obj) return notFound();
-  const text = await obj.text();
-
-  let envelope: Record<string, unknown>;
-  try {
-    envelope = JSON.parse(text.replace(/\n$/, '')) as Record<string, unknown>;
-  } catch {
-    return notFound();
-  }
-
-  const media = envelope.type === 'response_item'
-    ? row.btype === 'image' ? extractCodexImageAt(envelope, row.image_index) : null
-    : extractMediaAt(envelope, row.block_index);
-  if (!media) return notFound();
-
   let bytes: Uint8Array;
-  try {
-    bytes = base64ToBytes(media.data);
-  } catch {
-    return notFound();
+  let mime: string;
+  if (row.harness === 'codex') {
+    const offset = row.media_byte_start;
+    const length = row.media_byte_len;
+    const lineEnd = row.byte_start + row.byte_len;
+    // Old rows must be reindexed. Never fall back to parsing a 14 MB Codex line, and never
+    // use an invalid/corrupt range to read a different part of the object.
+    if (row.btype !== 'image' || INLINE_IMAGE_TYPES[row.media_type ?? ''] !== true ||
+        offset === null || length === null || !Number.isSafeInteger(row.byte_start) ||
+        !Number.isSafeInteger(row.byte_len) || !Number.isSafeInteger(row.size) ||
+        !Number.isSafeInteger(offset) || !Number.isSafeInteger(length) ||
+        row.byte_start < 0 || row.byte_len <= 0 || row.size <= 0 || offset < 0 ||
+        length <= 0 || length > MAX_CODEX_JSONL_LINE_BYTES ||
+        !Number.isSafeInteger(offset + length) || !Number.isSafeInteger(lineEnd) ||
+        offset < row.byte_start || offset + length > lineEnd || lineEnd > row.size) return notFound();
+    const obj = await env.RAW.get(row.r2_key, { range: { offset, length } });
+    if (!obj) return notFound();
+    const data = await obj.text();
+    if (data.length !== length || length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)) return notFound();
+    try {
+      bytes = base64ToBytes(data, false);
+    } catch {
+      return notFound();
+    }
+    mime = row.media_type!;
+  } else {
+    const obj = await env.RAW.get(row.r2_key, { range: { offset: row.byte_start, length: row.byte_len } });
+    if (!obj) return notFound();
+    const text = await obj.text();
+    let envelope: Record<string, unknown>;
+    try {
+      envelope = JSON.parse(text.replace(/\n$/, '')) as Record<string, unknown>;
+    } catch {
+      return notFound();
+    }
+    const media = extractMediaAt(envelope, row.block_index);
+    if (!media) return notFound();
+    try {
+      bytes = base64ToBytes(media.data);
+    } catch {
+      return notFound();
+    }
+    mime = media.mediaType.toLowerCase();
   }
-
-  const mime = media.mediaType.toLowerCase();
-  const inlineSafe = row.btype === 'image' && INLINE_IMAGE_TYPES.has(mime);
+  const inlineSafe = row.btype === 'image' && INLINE_IMAGE_TYPES[mime] === true;
 
   const headers: Record<string, string> = {
     // We only reach here version-matched (mismatches redirected above); an unversionable file gets no-cache.
@@ -114,21 +138,6 @@ function extractMediaAt(envelope: Record<string, unknown>, blockIndex: number): 
   return null;
 }
 
-/** Codex text is grouped into blocks independently of images, so use the indexed image ordinal
- * rather than block_index. A duplicated event_msg may consume the text block but never an image. */
-function extractCodexImageAt(envelope: Record<string, unknown>, imageIndex: number): { data: string; mediaType: string } | null {
-  const payload = isObj(envelope.payload) ? envelope.payload : undefined;
-  if (payload?.type !== 'message' || !Array.isArray(payload.content)) return null;
-  let index = 0;
-  for (const raw of payload.content) {
-    if (!isObj(raw) || raw.type !== 'input_image' || typeof raw.image_url !== 'string') continue;
-    const image = codexImageDataUri(raw.image_url);
-    if (!image) continue;
-    if (index === imageIndex) return { data: raw.image_url.slice(image.dataStart), mediaType: image.mediaType };
-    index++;
-  }
-  return null;
-}
 
 function mediaFromRaw(raw: Record<string, unknown>): { data: string; mediaType: string } | null {
   if (raw.type !== 'image' && raw.type !== 'document') return null;
@@ -169,9 +178,8 @@ function yieldsBlock(raw: Record<string, unknown>): boolean {
   }
 }
 
-function base64ToBytes(b64: string): Uint8Array {
-  const clean = b64.replace(/\s/g, '');
-  const bin = atob(clean);
+function base64ToBytes(b64: string, allowWhitespace = true): Uint8Array {
+  const bin = atob(allowWhitespace ? b64.replace(/\s/g, '') : b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
   return bytes;

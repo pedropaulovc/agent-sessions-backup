@@ -42,6 +42,9 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
   // both instances get indexed). See shouldIndexMessage below.
   const pendingFromResponseItem = new Map<string, number>();
   const pendingFromEventMsg = new Map<string, number>();
+  // Keep the event block identity so an image-bearing response_item arriving second can
+  // replace the provisional event text with source-ordered text/image blocks.
+  const pendingEventBlocks = new Map<string, NormalizedBlock[]>();
 
   const flush = () => {
     // A turn can be usage-only: token_count is the only billable event before EOF/role change
@@ -56,6 +59,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
     // genuine repeat of the same (role, text) in a different turn/exchange.
     pendingFromResponseItem.clear();
     pendingFromEventMsg.clear();
+    pendingEventBlocks.clear();
   };
   const sourceTurnIdentity = (
     role: Role,
@@ -233,7 +237,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         break;
       }
       case 'response_item': {
-        handleResponseItem(payload, ts, at);
+        handleResponseItem(payload, ts, at, line.text);
         break;
       }
       case 'event_msg': {
@@ -260,7 +264,7 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
   session.turns.forEach((t, i) => (t.index = i));
   return session;
 
-  function handleResponseItem(p: Record<string, unknown>, ts: string | undefined, at: { byteStart: number; byteLen: number }) {
+  function handleResponseItem(p: Record<string, unknown>, ts: string | undefined, at: { byteStart: number; byteLen: number }, rawText: string) {
     const meta = isObj(p.internal_chat_message_metadata_passthrough)
       ? p.internal_chat_message_metadata_passthrough
       : undefined;
@@ -275,14 +279,26 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
     switch (p.type) {
       case 'message': {
         const role = (str(p.role) as Role) ?? 'assistant';
-        const text = contentText(p.content);
         const content = Array.isArray(p.content) ? p.content : [];
-        const hasImages = content.some((item) => isObj(item) && item.type === 'input_image' && !!codexImageDataUri(item.image_url));
+        const text = Array.isArray(p.content) ? codexMessageText(content) : contentText(p.content);
+        const imageRanges = content.some((item) => isObj(item) && item.type === 'input_image')
+          ? codexImageRanges(rawText, at, content) : undefined;
+        const hasImages = (imageRanges?.size ?? 0) > 0;
         if (!text && !hasImages) break;
         // Opening the turn first clears pairing state at role/turn boundaries. An event_msg
         // copy can consume the text, but never the images, which exist only in response_item.
         const turn = openTurn(role === 'developer' ? 'developer' : role, ts, turnId, sourceItem);
-        const indexText = text ? shouldIndexMessage('response_item', role, text) : false;
+        let indexText = text ? shouldIndexMessage('response_item', role, text) : false;
+        if (text && !indexText) {
+          const twin = pendingEventBlocks.get(`${role}:${messageKey(text)}`)?.shift();
+          if (hasImages && twin) {
+            const atIndex = turn.blocks.indexOf(twin);
+            if (atIndex !== -1) {
+              turn.blocks.splice(atIndex, 1);
+              indexText = true;
+            }
+          }
+        }
         if (hasImages) {
           // Keep the source order of sheets and text. Adjacent text items stay one capped block,
           // while the media bytes remain in the R2 source line rather than in normalized blocks.
@@ -294,15 +310,17 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
             }
             textItems = [];
           };
-          for (const item of content) {
+          for (let i = 0; i < content.length; i++) {
+            const item = content[i];
             if (!isObj(item)) continue;
-            const image = item.type === 'input_image' ? codexImageDataUri(item.image_url) : undefined;
-            if (image) {
+            const range = imageRanges?.get(i);
+            if (range) {
               flushText();
-              turn.blocks.push({ type: 'image', mediaType: image.mediaType, ...at });
-            } else {
+              turn.blocks.push({ type: 'image', ...range, ...at });
+            } else if (item.type !== 'input_image') {
               const part = str(item.text);
-              if (part) textItems.push(part);
+              const cleaned = part && item.type === 'input_text' ? stripCodexImageWrappers(part) : part;
+              if (cleaned) textItems.push(cleaned);
             }
           }
           flushText();
@@ -386,6 +404,10 @@ export async function parseCodex(lines: AsyncIterable<JsonlLine>, sessionId: str
         if (!shouldIndexMessage('event_msg', role, text)) break;
         const c = cap(text, CAPS.text);
         turn.blocks.push({ type: 'text', text: c.text, truncated: c.truncated, ...at });
+        const key = `${role}:${messageKey(text)}`;
+        const blocks = pendingEventBlocks.get(key) ?? [];
+        blocks.push(turn.blocks[turn.blocks.length - 1]!);
+        pendingEventBlocks.set(key, blocks);
         if (!firstUserText && role === 'user') firstUserText = text.slice(0, 120);
         break;
       }
@@ -427,12 +449,156 @@ function contentText(content: unknown): string {
     .join('\n');
 }
 
+/** Image wrappers are Codex-generated input_text, not the user's prompt. Do not strip them from
+ * event_msg text or other response item types (which may quote the literal syntax). */
+function stripCodexImageWrappers(text: string): string {
+  if (/^<image name=\[Image #\d+\] path=(?:"[^"\r\n]*"|[^\s>\r\n]+)>$/.test(text) ||
+      text === '</image>') return '';
+  const cleaned = text.replace(
+    /(^|\r?\n)<image name=\[Image #\d+\] path=(?:"[^"\r\n]*"|[^\s>\r\n]+)>\r?\n<\/image>(?=\r?\n|$)/g,
+    '$1',
+  );
+  return cleaned === text ? text : cleaned.trim();
+}
+
+function codexMessageText(content: unknown[]): string {
+  return content
+    .filter(isObj)
+    .map((part) => {
+      const text = str(part.text);
+      return text && part.type === 'input_text' ? stripCodexImageWrappers(text) : text ?? '';
+    })
+    .filter(Boolean)
+    .join('\n');
+}
+
 /** Codex image_url data URIs are served by the blob endpoint only for browser-safe raster types. */
 export function codexImageDataUri(imageUrl: unknown): { dataStart: number; mediaType: string } | undefined {
   if (typeof imageUrl !== 'string') return undefined;
   const prefix = /^data:(image\/(?:png|jpeg|gif|webp));base64,/i.exec(imageUrl);
   if (!prefix || imageUrl.length === prefix[0].length) return undefined;
-  return { dataStart: prefix[0].length, mediaType: prefix[1]!.toLowerCase() };
+  const start = prefix[0].length;
+  if ((imageUrl.length - start) % 4 !== 0) return undefined;
+  let padding = false;
+  let paddingCount = 0;
+  for (let i = start; i < imageUrl.length; i++) {
+    const c = imageUrl.charCodeAt(i);
+    if (c === 61) {
+      padding = true;
+      if (++paddingCount > 2) return undefined;
+    } else if (padding || !(
+      (c >= 65 && c <= 90) || (c >= 97 && c <= 122) ||
+      (c >= 48 && c <= 57) || c === 43 || c === 47
+    )) return undefined;
+  }
+  return { dataStart: start, mediaType: prefix[1]!.toLowerCase() };
+}
+
+/** Locate only payload.content[*].image_url strings in the ORIGINAL JSONL text. JSON.stringify
+ * would change whitespace/escaping and string indices are UTF-16 rather than R2 byte offsets.
+ * The envelope is already JSON.parse-validated; this small lexical walk skips unrelated values
+ * without decoding/copying the 14 MB line again for every image. Unsupported escaped media
+ * strings fail closed rather than guessing a range. */
+function codexImageRanges(
+  raw: string,
+  at: { byteStart: number; byteLen: number },
+  content: unknown[],
+): Map<number, { mediaByteStart: number; mediaByteLen: number; mediaType: string }> {
+  const ranges = new Map<number, { mediaByteStart: number; mediaByteLen: number; mediaType: string }>();
+  let previousChar = 0;
+  let previousByte = at.byteStart;
+  const space = (i: number): number => {
+    while (i < raw.length && (raw[i] === ' ' || raw[i] === '\t' || raw[i] === '\r' || raw[i] === '\n')) i++;
+    return i;
+  };
+  const stringEnd = (start: number): number => {
+    let i = start + 1;
+    while (i < raw.length) {
+      if (raw[i] === '\\') i += 2;
+      else if (raw[i++] === '"') return i;
+    }
+    return i;
+  };
+  const valueEnd = (start: number): number => {
+    if (raw[start] === '"') return stringEnd(start);
+    if (raw[start] !== '{' && raw[start] !== '[') {
+      let i = start;
+      while (i < raw.length && raw[i] !== ',' && raw[i] !== '}' && raw[i] !== ']') i++;
+      return i;
+    }
+    let depth = 0;
+    for (let i = start; i < raw.length; i++) {
+      if (raw[i] === '"') i = stringEnd(i) - 1;
+      else if (raw[i] === '{' || raw[i] === '[') depth++;
+      else if ((raw[i] === '}' || raw[i] === ']') && --depth === 0) return i + 1;
+    }
+    return raw.length;
+  };
+  const fields = (start: number, visit: (key: string, value: number) => void): void => {
+    if (raw[start] !== '{') return;
+    for (let i = space(start + 1); raw[i] === '"';) {
+      const end = stringEnd(i);
+      const key = raw.slice(i + 1, end - 1);
+      const value = space(space(end) + 1); // skip the JSON-validated colon
+      visit(key, value);
+      i = space(valueEnd(value));
+      if (raw[i] !== ',') break;
+      i = space(i + 1);
+    }
+  };
+  // An ASCII base64 span contributes exactly one byte per character. Count any UTF-8 in
+  // intervening JSON once, including multibyte prompt text before the first image.
+  const byteAt = (char: number): number => {
+    for (let i = previousChar; i < char; i++) {
+      const unit = raw.charCodeAt(i);
+      previousByte++;
+      if (unit >= 0x800) {
+        if (unit >= 0xd800 && unit <= 0xdbff && i + 1 < char &&
+            raw.charCodeAt(i + 1) >= 0xdc00 && raw.charCodeAt(i + 1) <= 0xdfff) {
+          previousByte += 2;
+          i++;
+          previousByte++;
+        } else previousByte += 2;
+      } else if (unit >= 0x80) previousByte++;
+    }
+    previousChar = char;
+    return previousByte;
+  };
+  fields(space(0), (rootKey, payloadAt) => {
+    if (rootKey !== 'payload') return;
+    fields(payloadAt, (payloadKey, arrayAt) => {
+      if (payloadKey !== 'content' || raw[arrayAt] !== '[') return;
+      let itemIndex = 0;
+      for (let i = space(arrayAt + 1); i < raw.length && raw[i] !== ']';) {
+        const item = content[itemIndex];
+        if (isObj(item) && item.type === 'input_image') {
+          fields(i, (key, urlAt) => {
+            if (key !== 'image_url' || raw[urlAt] !== '"') return;
+            const parsed = codexImageDataUri(item.image_url);
+            if (!parsed) return;
+            const end = stringEnd(urlAt);
+            const rawLen = end - urlAt - 2;
+            // Equal lengths rule out JSON escapes (\u0041, \/, etc.); compare the short
+            // prefix to ensure the bytes we serve are the validated data URI's payload.
+            if (rawLen !== (item.image_url as string).length ||
+                raw.slice(urlAt + 1, urlAt + 1 + parsed.dataStart) !==
+                  (item.image_url as string).slice(0, parsed.dataStart)) return;
+            const dataChar = urlAt + 1 + parsed.dataStart;
+            const offset = byteAt(dataChar);
+            const len = rawLen - parsed.dataStart;
+            if (len > 0 && offset >= at.byteStart && offset + len <= at.byteStart + at.byteLen) {
+              ranges.set(itemIndex, { mediaByteStart: offset, mediaByteLen: len, mediaType: parsed.mediaType });
+            }
+          });
+        }
+        i = space(valueEnd(i));
+        itemIndex++;
+        if (raw[i] !== ',') break;
+        i = space(i + 1);
+      }
+    });
+  });
+  return ranges;
 }
 
 function isObj(v: unknown): v is Record<string, unknown> {

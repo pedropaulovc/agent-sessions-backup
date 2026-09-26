@@ -7,6 +7,7 @@ import { searchHitsSql } from '../src/api/search';
 import { buildSessionFilterSql } from '../src/session-filters';
 import { viewerRoute } from '../src/viewer/router';
 import { assetEndpoint, signExternalAssetUrl } from '../src/viewer/assets';
+import { blobEndpoint } from '../src/viewer/blob';
 import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures';
 import { API, VIEWER } from './hosts';
 import { blobVersionOf } from '../src/viewer/session';
@@ -197,13 +198,13 @@ function codexWithRepo(sessionId: string, repoUrl: string, text: string): string
   ].join('\n');
 }
 
-/** Synthetic image-rich rollout: source-order text/sheet interleaving and a >2 MiB user line. */
+/** Synthetic image-rich rollout: Codex wrappers, interleaved sheets and a 13 MB user line. */
 function codexWithImages(sessionId: string): string {
   const image = (i: number) => ({
     type: 'input_image',
     image_url: i === 0 ? `data:image/png;base64,${TINY_PNG_B64}`
       : i === 19 ? 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs='
-        : `data:image/png;base64,${'A'.repeat(130_000)}`,
+        : `data:image/png;base64,${'A'.repeat(720_000)}`,
   });
   return [
     JSON.stringify({ timestamp: '2026-07-02T09:00:00Z', type: 'session_meta', payload: { session_id: sessionId } }),
@@ -213,14 +214,18 @@ function codexWithImages(sessionId: string): string {
       payload: {
         type: 'message', role: 'user',
         content: [
-          { type: 'input_text', text: 'Inspect these synthetic sheets' },
+          { type: 'input_text', text: '<image name=[Image #1] path="C:\\src\\sheets\\first.png">\n</image>\n\nInspect these synthetic sheets — café 🛠' },
           ...Array.from({ length: 10 }, (_, i) => image(i)),
-          { type: 'input_text', text: 'Middle drawing note' },
+          { type: 'input_text', text: '<image name=[Image #2] path="C:\\src\\sheets\\middle.png">\n</image>\n\nMiddle drawing note' },
           { type: 'input_image', image_url: 'https://example.com/untrusted.png' },
           ...Array.from({ length: 10 }, (_, i) => image(i + 10)),
           { type: 'input_text', text: 'codeximageneedle final drawing instruction' },
         ],
       },
+    }),
+    JSON.stringify({
+      timestamp: '2026-07-02T09:00:01Z', type: 'event_msg',
+      payload: { type: 'user_message', message: 'Inspect these synthetic sheets — café 🛠\nMiddle drawing note\ncodeximageneedle final drawing instruction' },
     }),
     JSON.stringify({
       timestamp: '2026-07-02T09:00:02Z', type: 'response_item',
@@ -1289,12 +1294,14 @@ describe('viewer', () => {
 
   it('indexes and renders image-rich Codex input in source order, serving each indexed sheet', async () => {
     const rows = (await testEnv.DB.prepare(
-      `SELECT b.block_index, b.btype, b.text, b.byte_start, b.byte_len, b.id, f.content_hash
+      `SELECT b.block_index, b.btype, b.text, b.byte_start, b.byte_len, b.media_byte_start,
+              b.media_byte_len, b.media_type, b.id, f.content_hash
        FROM blocks b JOIN files f ON f.id = b.file_id
        WHERE b.session_id = ?1 ORDER BY b.turn_index, b.block_index`,
     ).bind(CODEX_IMAGES_SESSION).all<{
       block_index: number; btype: string; text: string | null;
-      byte_start: number; byte_len: number; id: number; content_hash: string;
+      byte_start: number; byte_len: number; media_byte_start: number | null;
+      media_byte_len: number | null; media_type: string | null; id: number; content_hash: string;
     }>()).results;
     expect(rows.map((r) => r.btype)).toEqual([
       'text', ...Array(10).fill('image'), 'text', ...Array(10).fill('image'), 'text', 'text',
@@ -1302,7 +1309,18 @@ describe('viewer', () => {
     expect(rows[1]!.block_index).toBe(1);
     expect(rows[21]!.block_index).toBe(21);
     expect(rows.slice(0, 23).every((row) => row.byte_start === rows[0]!.byte_start && row.byte_len === rows[0]!.byte_len)).toBe(true);
-    expect(rows[23]!.byte_start).toBe(rows[0]!.byte_start + rows[0]!.byte_len);
+    expect(rows[23]!.byte_start).toBeGreaterThan(rows[0]!.byte_start + rows[0]!.byte_len);
+    expect(rows[0]!.text).toBe('Inspect these synthetic sheets — café 🛠');
+    expect(rows[11]!.text).toBe('Middle drawing note');
+    expect(rows[22]!.text).toBe('codeximageneedle final drawing instruction');
+    expect(rows.filter((row) => row.text === 'codeximageneedle final drawing instruction')).toHaveLength(1);
+    expect(rows[2]!.media_byte_len).toBe(720_000);
+    expect(rows[2]!.media_type).toBe('image/png');
+    expect(rows[2]!.byte_len).toBeGreaterThan(12_000_000);
+    expect(rows.filter((row) => row.btype === 'image').every((row) =>
+      row.media_byte_start !== null && row.media_byte_len !== null &&
+      row.media_byte_start >= row.byte_start &&
+      row.media_byte_start + row.media_byte_len <= row.byte_start + row.byte_len)).toBe(true);
 
     const search = await (await SELF.fetch(`${VIEWER}/?q=codeximageneedle`)).text();
     expect(search).toContain(`/s/${CODEX_IMAGES_SESSION}?page=1#t0`);
@@ -1310,6 +1328,7 @@ describe('viewer', () => {
     expect(page.status).toBe(200);
     const html = await page.text();
     expect(html).toContain('codeximageneedle final drawing instruction');
+    expect(html).not.toContain('name=[Image #');
     expect(html).toContain('final synthetic sheet answer');
     const imageUrls = [...html.matchAll(new RegExp(`/s/${CODEX_IMAGES_SESSION}/blob/(\\d+)\\?v=[0-9a-f]{12}`, 'g'))];
     expect(imageUrls).toHaveLength(20);
@@ -1329,6 +1348,55 @@ describe('viewer', () => {
     expect(last.status).toBe(200);
     expect(last.headers.get('content-type')).toBe('image/gif');
     expect(new Uint8Array(await last.arrayBuffer())).toEqual(Uint8Array.from(atob('R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs='), (c) => c.charCodeAt(0)));
+
+    const ranges: { offset: number; length: number }[] = [];
+    const trackedRaw = {
+      get: (key: string, options: { range: { offset: number; length: number } }) => {
+        ranges.push(options.range);
+        return testEnv.RAW.get(key, options);
+      },
+    } as unknown as R2Bucket;
+    const medium = await blobEndpoint(
+      CODEX_IMAGES_SESSION, String(rows[2]!.id),
+      new URL(`${VIEWER}/s/${CODEX_IMAGES_SESSION}/blob/${rows[2]!.id}?v=${version}`),
+      { ...testEnv, RAW: trackedRaw },
+    );
+    expect(medium.status).toBe(200);
+    expect((await medium.arrayBuffer()).byteLength).toBe(540_000);
+    expect(ranges).toEqual([{ offset: rows[2]!.media_byte_start, length: 720_000 }]);
+    expect(ranges[0]!.length).toBeLessThan(rows[2]!.byte_len / 10);
+  });
+
+  it('fails closed for stale, out-of-bounds, malformed and non-raster Codex image metadata', async () => {
+    const row = await testEnv.DB.prepare(
+      `SELECT b.id, b.byte_start, b.byte_len, b.media_byte_start, b.media_byte_len,
+              b.media_type, f.content_hash
+       FROM blocks b JOIN files f ON f.id = b.file_id
+       WHERE b.session_id = ?1 AND b.btype = 'image' ORDER BY b.block_index LIMIT 1`,
+    ).bind(CODEX_IMAGES_SESSION).first<{
+      id: number; byte_start: number; byte_len: number;
+      media_byte_start: number; media_byte_len: number; media_type: string; content_hash: string;
+    }>();
+    expect(row).toBeTruthy();
+    const url = `${VIEWER}/s/${CODEX_IMAGES_SESSION}/blob/${row!.id}?v=${row!.content_hash.slice(0, 12)}`;
+    try {
+      for (const [start, length, mime] of [
+        [null, null, row!.media_type], // rows from before migration must be reindexed
+        [row!.byte_start + row!.byte_len, 4, row!.media_type], // outside this JSONL line
+        [row!.media_byte_start, 5, row!.media_type], // not a complete base64 payload
+        [row!.media_byte_start, row!.media_byte_len, 'image/svg+xml'], // never inline active content
+      ] as const) {
+        await testEnv.DB.prepare(
+          'UPDATE blocks SET media_byte_start = ?1, media_byte_len = ?2, media_type = ?3 WHERE id = ?4',
+        ).bind(start, length, mime, row!.id).run();
+        expect((await SELF.fetch(url)).status).toBe(404);
+      }
+    } finally {
+      await testEnv.DB.prepare(
+        'UPDATE blocks SET media_byte_start = ?1, media_byte_len = ?2, media_type = ?3 WHERE id = ?4',
+      ).bind(row!.media_byte_start, row!.media_byte_len, row!.media_type, row!.id).run();
+    }
+    expect((await SELF.fetch(url)).status).toBe(200);
   });
 
   it('paginates a trailing compaction marker onto its own page and renders the divider there', async () => {

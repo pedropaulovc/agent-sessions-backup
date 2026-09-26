@@ -32,6 +32,9 @@ export interface NormalizedBlock {
   timing?: { startMs?: number; endMs?: number };
   subagentSessionId?: string;
   mediaType?: string;
+  /** Absolute R2 byte range of the base64 payload (Codex inline images only). */
+  mediaByteStart?: number;
+  mediaByteLen?: number;
   externalAsset?: ExternalAssetRef;
   byteStart: number;
   byteLen: number;

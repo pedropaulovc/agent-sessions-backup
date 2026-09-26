@@ -893,6 +893,16 @@ describe('parseCodex', () => {
     expect(session.turns[0]!.blocks.map((block) => block.type)).toEqual([...Array(20).fill('image'), 'text']);
     expect(session.turns[0]!.blocks.slice(0, 20).every((block) => block.mediaType === 'image/png')).toBe(true);
     expect(session.turns[0]!.blocks.every((block) => block.byteStart === inputOffset && block.byteLen === replyOffset - inputOffset)).toBe(true);
+    const images = session.turns[0]!.blocks.slice(0, 20);
+    expect(images.every((block) => block.mediaByteLen === 720_000 &&
+      block.mediaByteStart !== undefined && block.mediaByteStart >= inputOffset &&
+      block.mediaByteStart + block.mediaByteLen <= replyOffset)).toBe(true);
+    expect(images.every((block, i) => i === 0 ||
+      block.mediaByteStart! > images[i - 1]!.mediaByteStart! + images[i - 1]!.mediaByteLen!)).toBe(true);
+    for (const block of [images[0]!, images[10]!, images[19]!]) {
+      expect(new TextDecoder().decode(body.subarray(block.mediaByteStart!, block.mediaByteStart! + block.mediaByteLen!)))
+        .toBe('A'.repeat(720_000));
+    }
     expect(session.turns[0]!.blocks[20]!.text).toContain('drawing instruction sentinel cobaltgear');
     expect(session.turns[0]!.blocks[20]!.text).not.toContain('data:image/');
     expect(session.turns[1]!.blocks[0]).toMatchObject({ type: 'text', text: 'final drawing answer', byteStart: replyOffset, byteLen: body.length - replyOffset });
@@ -903,6 +913,74 @@ describe('parseCodex', () => {
     for await (const line of readJsonlLines(streamBytes(body), 0, jsonlLineLimit('claude-code'))) defaultLines.push(line);
     expect(defaultLines[1]).toEqual({ kind: 'oversized', byteStart: inputOffset, byteLen: replyOffset - inputOffset });
     expect(defaultLines[2]).toMatchObject({ kind: 'decoded', byteStart: replyOffset, byteLen: body.length - replyOffset });
+  });
+
+  it('strips only Codex input_text wrappers, keeps interleaved image ranges exact after UTF-8, and dedupes either event_msg order', async () => {
+    const prompt = 'À drawing 🛠\nMiddle note\nFinal instruction';
+    const event = JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: prompt } });
+    const image1 = 'data:image/png;base64,aGVsbG8=';
+    const image2 = 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=';
+    const response = JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message', role: 'user',
+        content: [
+          { type: 'input_text', text: '<image name=[Image #1] path="C:/drawings/first image.png">\r\n</image>\n\nÀ drawing 🛠' },
+          { type: 'input_image', image_url: image1 },
+          { type: 'input_text', text: 'Middle note' },
+          { type: 'input_image', image_url: 'data:image/svg+xml;base64,PHN2Zz4=' },
+          { type: 'input_image', image_url: 'data:image/png;base64,%%%%' },
+          { type: 'input_image', image_url: image2 },
+          { type: 'input_text', text: 'Final instruction' },
+        ],
+      },
+    }).replaceAll('"image_url":', '"image_url" : ');
+    const encoder = new TextEncoder();
+    for (const lines of [[event, response], [response, event]]) {
+      const source = encoder.encode(lines.join('\n') + '\n');
+      const session = await parseCodex(readJsonlLines(streamBytes(source), 0, jsonlLineLimit('codex')), CODEX_SESSION_ID);
+      expect(session.title).toBe(prompt);
+      expect(session.turns).toHaveLength(1);
+      const blocks = session.turns[0]!.blocks;
+      expect(blocks.map((block) => [block.type, block.text])).toEqual([
+        ['text', 'À drawing 🛠'], ['image', undefined], ['text', 'Middle note'],
+        ['image', undefined], ['text', 'Final instruction'],
+      ]);
+      for (const [block, image] of [[blocks[1]!, image1], [blocks[3]!, image2]] as const) {
+        const payload = image.slice(image.indexOf(',') + 1);
+        expect(block.mediaByteLen).toBe(payload.length);
+        expect(new TextDecoder().decode(source.subarray(block.mediaByteStart!, block.mediaByteStart! + block.mediaByteLen!)))
+          .toBe(payload);
+      }
+    }
+  });
+
+  it('drops separate image wrapper items from the Windows rollout shape without losing the prompt', async () => {
+    const prompt = 'Inspect both sheets — precisão matters';
+    const response = JSON.stringify({
+      type: 'response_item',
+      payload: {
+        type: 'message', role: 'user',
+        content: [
+          { type: 'input_text', text: '<image name=[Image #1] path="C:\\src\\sheet-1.png">' },
+          { type: 'input_image', image_url: 'data:image/png;base64,aGVsbG8=' },
+          { type: 'input_text', text: '</image>' },
+          { type: 'input_text', text: '<image name=[Image #2] path="C:\\src\\sheet-2.png">' },
+          { type: 'input_image', image_url: 'data:image/png;base64,d29ybGQ=' },
+          { type: 'input_text', text: '</image>' },
+          { type: 'input_text', text: prompt },
+        ],
+      },
+    });
+    const event = JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: prompt } });
+    for (const lines of [[event, response], [response, event]]) {
+      const session = await parseCodex(readJsonlLines(streamBytes(new TextEncoder().encode(lines.join('\n') + '\n'))), CODEX_SESSION_ID);
+      expect(session.turns).toHaveLength(1);
+      expect(session.title).toBe(prompt);
+      expect(session.turns[0]!.blocks.map((block) => [block.type, block.text])).toEqual([
+        ['image', undefined], ['image', undefined], ['text', prompt],
+      ]);
+    }
   });
 
   it('skips records above the Codex-specific bound and resumes at the next line', async () => {
