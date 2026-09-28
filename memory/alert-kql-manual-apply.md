@@ -35,15 +35,52 @@ role assignments, action groups):
 infra/azure/provision.sh <issuer-url>
 ```
 
-**Or apply ONE alert surgically** (the query update below leaves timing unchanged;
-use the complete rollup commands later in this document when reconciling timing):
-```
+**Or apply ONE alert surgically** when its timing and query range are unchanged:
+```bash
 az monitor scheduled-query update \
   --name agent-backup-<base> --resource-group rg-agent-backup \
   --condition "count 'Placeholder_1' > 0" \
   --condition-query Placeholder_1="$(cat infra/azure/alerts/<base>.kql)" \
   --skip-query-validation true
 ```
+
+For `collector-errors`, apply the KQL and timing together; a query-only update would
+leave its one-hour range too short for the six-hour check. KQL filters seven hours,
+while the supported 24h query window runs hourly with `overrideQueryTimeRange=P1D`:
+
+```bash
+set -euo pipefail
+SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+RULE_NAME=agent-backup-collector-errors
+QUERY="$(cat infra/azure/alerts/collector-errors.kql)"
+az monitor scheduled-query update --subscription "$SUBSCRIPTION_ID" \
+  --name "$RULE_NAME" --resource-group rg-agent-backup \
+  --condition "count 'Placeholder_1' > 0" \
+  --condition-query Placeholder_1="$QUERY" \
+  --evaluation-frequency 1h --window-size 24h --skip-query-validation true
+RULE_URL="https://management.azure.com/subscriptions/$SUBSCRIPTION_ID/resourceGroups/rg-agent-backup/providers/Microsoft.Insights/scheduledQueryRules/$RULE_NAME?api-version=2021-08-01"
+az rest --method patch --subscription "$SUBSCRIPTION_ID" --url "$RULE_URL" \
+  --body '{"properties":{"overrideQueryTimeRange":"P1D"}}'
+APPLIED_QUERY="$(az monitor scheduled-query show --subscription "$SUBSCRIPTION_ID" \
+  --name "$RULE_NAME" --resource-group rg-agent-backup \
+  --query 'criteria.allOf[0].query' -o tsv)"
+[ "$APPLIED_QUERY" = "$QUERY" ] || { echo "ERROR: deployed query differs from source" >&2; exit 1; }
+APPLIED_TIMING="$(az rest --method get --subscription "$SUBSCRIPTION_ID" \
+  --url "$RULE_URL" \
+  --query '{frequency:properties.evaluationFrequency,window:properties.windowSize,override:properties.overrideQueryTimeRange}' -o json)"
+printf '%s' "$APPLIED_TIMING" | jq -e '
+  def minutes:
+    capture("^P(?:(?<d>[0-9]+)D)?(?:T(?:(?<h>[0-9]+)H)?(?:(?<m>[0-9]+)M)?(?:(?<s>[0-9]+)S)?)?$")
+    | ((.d // "0" | tonumber) * 1440 + (.h // "0" | tonumber) * 60
+      + (.m // "0" | tonumber) + (.s // "0" | tonumber) / 60);
+  [.frequency, .window, .override] | map(minutes) == [60, 1440, 1440]
+'
+az monitor scheduled-query show --subscription "$SUBSCRIPTION_ID" \
+  --name "$RULE_NAME" --resource-group rg-agent-backup \
+  --query '{frequency:evaluationFrequency,window:windowSize,override:overrideQueryTimeRange}' -o json
+```
+The command fails unless the deployed query matches the file and readback is 1h/24h/24h.
+
 **Creating a NEW alert** needs `create`, not `update` (update fails on a nonexistent alert), and
 unlike update it needs the scope/location/severity/action-group too — values used 2026-07-28:
 ```
@@ -55,6 +92,8 @@ az monitor scheduled-query create --name agent-backup-<base> --resource-group rg
   --action-groups "$(az monitor action-group show -g rg-agent-backup -n ag-pedro-email --query id -o tsv)" \
   --skip-query-validation true
 ```
+For a new `collector-errors` rule, use the 1h frequency and 24h window, then set
+`overrideQueryTimeRange` to `P1D` as in the collector-specific procedure above.
 Register its window in `alert_window_for()` and, when different, its frequency in
 `alert_frequency_for()` in provision.sh; provisioning reconciles query and timing drift.
 
@@ -163,15 +202,23 @@ az monitor scheduled-query show --subscription "$SUBSCRIPTION_ID" \
   --query '{enabled:enabled,frequency:evaluationFrequency,window:windowSize,override:overrideQueryTimeRange,criteria:criteria,actions:actions}' -o json
 ```
 
-The error rule evaluates every 15m over a 1h window, so overlapping scans tolerate
-ingestion delay near evaluation boundaries instead of losing late-arriving errors.
+The `collector-errors` KQL filters seven hours within Azure's supported 24h query
+window and evaluates hourly. It requires a six-hour first-to-last span with an error
+in every UTC hour bin, grouped by machine/store/code/stable target; the latest full
+message remains in the output. Collector events have no source timestamp or explicit
+recovery event, so `TimeGenerated` is receipt time. Requiring every hour prevents
+buffered heartbeat backlogs or separate error episodes from masquerading as six
+hours of continuous failure. The latest event must also be within one hour, which
+preserves normal auto-resolution. Provisioning reconciles the 1h frequency, 24h
+window, and `P1D` query-range override.
 
 The missing rule uses the supported 48h scan window with hourly evaluation; KQL
 itself applies the exact 26h horizon. Do not change the frequency to 26h or shrink
 its window to 1h. Provisioning and the surgical commands explicitly reconcile
-`overrideQueryTimeRange` to `P2D` for missing completion and `PT1H` for errors,
-then fail on a readback mismatch (equivalent ISO duration spellings are accepted).
-This prevents a preexisting short override from silently truncating the query.
+`overrideQueryTimeRange` to `P2D` for missing completion, `P1D` for collector
+errors, and `PT1H` for rollup errors, then fail on a readback mismatch (equivalent
+ISO duration spellings are accepted). This prevents a preexisting short override
+from silently truncating these queries.
 The current [scheduled-query CLI](https://learn.microsoft.com/en-us/cli/azure/monitor/scheduled-query)
 does not expose a dedicated override flag, so the commands use the supported
 [REST PATCH property](https://learn.microsoft.com/en-us/rest/api/monitor/scheduled-query-rules/update?view=rest-monitor-2021-08-01).
@@ -211,14 +258,82 @@ error message, returned-pass counters and duration, retaining raw details.
 
 ### Synthetic KQL controls
 
-These are scenarios to execute, not claims of already executed validation. Replace
-only the `let otel = union ...;` declaration in either source query with the fixture
-below, leaving the rule predicates untouched. Set `scenario` to each table value.
-The errors query should produce one row for partial, failed, page_failed, and
-delivery_failed; the missing query should produce one row for failed, page_failed,
-delivery_failed, missing, stale, foreign, and unknown_trigger. Complete, pending,
-and partial all satisfy liveness; a complete summary with an unknown trigger does not.
+These synthetic scenarios are to execute, not claims of already-executed validation.
+For the collector-errors query, replace only its `let otel = union ...;` declaration
+with the first fixture below; it should emit exactly three rows for `persistent_file`,
+`persistent_check`, and `exact_boundary`, each with its latest full message.
+For the session-rollup queries, replace the same declaration with the second fixture
+and set `scenario` to each table value. The rollup errors query should emit one row
+for partial, failed, page_failed, and delivery_failed; the missing query should emit
+one row for failed, page_failed, delivery_failed, missing, stale, foreign, and
+unknown_trigger. Complete, pending, and partial all satisfy liveness; a complete
+summary with an unknown trigger does not.
 
+#### Collector-errors persistence control
+
+The source query should emit only those three signatures, including an exact six-hour
+span. A shorter span, a missing hourly bin, buffered events delivered together, or
+a changed target must not emit a row.
+
+```kusto
+let evaluationTime = now();
+let otel = datatable(age:timespan, machine:string, store:string, code:string, message:string)
+[
+  390m, "persistent_file", "codex", "upload_failed", "socket.sock: HTTP 500 old",
+  330m, "persistent_file", "codex", "upload_failed", "socket.sock: HTTP 502",
+  270m, "persistent_file", "codex", "upload_failed", "socket.sock: HTTP 503",
+  210m, "persistent_file", "codex", "upload_failed", "socket.sock: HTTP 504",
+  150m, "persistent_file", "codex", "upload_failed", "socket.sock: HTTP 500",
+  90m, "persistent_file", "codex", "upload_failed", "socket.sock: HTTP 502",
+  20m, "persistent_file", "codex", "upload_failed", "socket.sock: HTTP 503 latest",
+  380m, "exact_boundary", "codex", "upload_failed", "boundary.sock: HTTP 500",
+  320m, "exact_boundary", "codex", "upload_failed", "boundary.sock: HTTP 500",
+  260m, "exact_boundary", "codex", "upload_failed", "boundary.sock: HTTP 500",
+  200m, "exact_boundary", "codex", "upload_failed", "boundary.sock: HTTP 500",
+  140m, "exact_boundary", "codex", "upload_failed", "boundary.sock: HTTP 500",
+  80m, "exact_boundary", "codex", "upload_failed", "boundary.sock: HTTP 500",
+  20m, "exact_boundary", "codex", "upload_failed", "boundary.sock: HTTP 503 latest",
+  390m, "persistent_check", "codex", "check_failed", "files/check HTTP 500",
+  330m, "persistent_check", "codex", "check_failed", "files/check HTTP 502",
+  270m, "persistent_check", "codex", "check_failed", "files/check HTTP 503",
+  210m, "persistent_check", "codex", "check_failed", "files/check HTTP 504",
+  150m, "persistent_check", "codex", "check_failed", "files/check HTTP 500",
+  90m, "persistent_check", "codex", "check_failed", "files/check HTTP 502",
+  20m, "persistent_check", "codex", "check_failed", "files/check HTTP 503 latest",
+  390m, "missing_hour", "codex", "upload_failed", "gap.sock: HTTP 500",
+  330m, "missing_hour", "codex", "upload_failed", "gap.sock: HTTP 500",
+  270m, "missing_hour", "codex", "upload_failed", "gap.sock: HTTP 500",
+  150m, "missing_hour", "codex", "upload_failed", "gap.sock: HTTP 500",
+  90m, "missing_hour", "codex", "upload_failed", "gap.sock: HTTP 500",
+  20m, "missing_hour", "codex", "upload_failed", "gap.sock: HTTP 500",
+  390m, "buffered_burst", "codex", "upload_failed", "buffered.sock: HTTP 500",
+  20m, "buffered_burst", "codex", "upload_failed", "buffered.sock: HTTP 500",
+  390m, "changed_target", "codex", "upload_failed", "old.sock: HTTP 500",
+  330m, "changed_target", "codex", "upload_failed", "old.sock: HTTP 500",
+  270m, "changed_target", "codex", "upload_failed", "old.sock: HTTP 500",
+  210m, "changed_target", "codex", "upload_failed", "old.sock: HTTP 500",
+  150m, "changed_target", "codex", "upload_failed", "old.sock: HTTP 500",
+  90m, "changed_target", "codex", "upload_failed", "old.sock: HTTP 500",
+  20m, "changed_target", "codex", "upload_failed", "new.sock: HTTP 503",
+  359m, "short_span", "codex", "upload_failed", "short.sock: HTTP 500",
+  299m, "short_span", "codex", "upload_failed", "short.sock: HTTP 500",
+  239m, "short_span", "codex", "upload_failed", "short.sock: HTTP 500",
+  179m, "short_span", "codex", "upload_failed", "short.sock: HTTP 500",
+  119m, "short_span", "codex", "upload_failed", "short.sock: HTTP 500",
+  59m, "short_span", "codex", "upload_failed", "short.sock: HTTP 500",
+  10m, "short_span", "codex", "upload_failed", "short.sock: HTTP 500",
+  20m, "single", "codex", "upload_failed", "single.sock: HTTP 500"
+]
+| extend TimeGenerated = evaluationTime - age,
+    Body = tostring(bag_pack("event", "collector.event", "machine", machine,
+        "payload", bag_pack("level", "error", "store", store, "code", code, "message", message)))
+| project TimeGenerated, Body;
+```
+
+#### Session-rollup controls
+
+For the session-rollup queries, replace the source query's `let otel = union ...;`
+declaration with the fixture below.
 ```kusto
 let scenario = 'partial';
 let otel = datatable(Case:string, Event:string, Outcome:string, Trigger:string, ServiceName:string)

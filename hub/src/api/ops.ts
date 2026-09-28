@@ -41,7 +41,7 @@ export async function heartbeat(request: Request, env: Env, identity: Identity):
     // collector set `event`/`machine` itself and forge a hub log line (e.g. hub.certs.cf_auth_failed) to
     // page us with a fake dead-token alert or bury a real one. `event` and `machine` (from the cert
     // identity) stay hub-controlled; nothing in `payload` can collide with them. collector-errors.kql
-    // reads body.payload.{level,code,message} to match.
+    // reads body.payload.{level,code,message} and optional store for grouping.
     console.log(JSON.stringify({ event: 'collector.event', machine: identity.machineId, payload: e }));
   }
   return Response.json({ ok: true });

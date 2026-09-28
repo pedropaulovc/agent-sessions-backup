@@ -345,7 +345,7 @@ echo "=== Scheduled Query Alerts (from infra/azure/alerts/*.kql) ==="
 alert_window_for() {
     case "$1" in
         missed-heartbeat) echo "1h" ;;
-        collector-errors) echo "1h" ;;
+        collector-errors) echo "24h" ;;
         d1-size) echo "1h" ;;
         cf-auth-failed) echo "1h" ;;
         cert-orphan-leaked) echo "1h" ;;
@@ -357,11 +357,12 @@ alert_window_for() {
     esac
 }
 
-# Frequency is independent of the scan window: the rollup liveness query needs
-# 26h of history, using Azure's supported 48h granularity, but runs every hour.
+# The collector KQL filters to 7h within Azure's 24h query range but still
+# evaluates hourly. Rollup liveness similarly scans 26h within a 48h window.
 # Error scans overlap to tolerate ingestion delay at evaluation boundaries.
 alert_frequency_for() {
     case "$1" in
+        collector-errors) echo "1h" ;;
         session-rollup-errors) echo "15m" ;;
         session-rollup-missing) echo "1h" ;;
         *) alert_window_for "$1" ;;
@@ -425,10 +426,11 @@ for kql_file in "$REPO_ROOT"/infra/azure/alerts/*.kql; do
     fi
 
     # CLI updates preserve overrideQueryTimeRange and offer no dedicated setter.
-    # Reconcile rollup query-range drift explicitly, including existing short
-    # overrides that would otherwise truncate the 26h liveness query.
+    # Reconcile long-query-range drift explicitly, including short overrides that
+    # would otherwise truncate the six-hour persistence or rollup liveness query.
     query_range=""
     case "$base_name" in
+        collector-errors) query_range="P1D" ;;
         session-rollup-errors) query_range="PT1H" ;;
         session-rollup-missing) query_range="P2D" ;;
     esac
