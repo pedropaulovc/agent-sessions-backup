@@ -260,8 +260,8 @@ error message, returned-pass counters and duration, retaining raw details.
 
 These synthetic scenarios are to execute, not claims of already-executed validation.
 For the collector-errors query, replace only its `let otel = union ...;` declaration
-with the first fixture below; it should emit exactly three rows for `persistent_file`,
-`persistent_check`, and `exact_boundary`, each with its latest full message.
+with the first fixture below; it should emit exactly four rows for `persistent_file`,
+`persistent_check`, `exact_boundary`, and `persistent_cadence`, each with its latest full message.
 For the session-rollup queries, replace the same declaration with the second fixture
 and set `scenario` to each table value. The rollup errors query should emit one row
 for partial, failed, page_failed, and delivery_failed; the missing query should emit
@@ -271,13 +271,20 @@ summary with an unknown trigger does not.
 
 #### Collector-errors persistence control
 
-The source query should emit only those three signatures, including an exact six-hour
-span. A shorter span, a missing hourly bin, buffered events delivered together, or
-a changed target must not emit a row.
+The source query should emit only those four signatures, including an exact six-hour
+span and the 15-minute cadence case. The :58 anchor places two events in its first
+hour; measuring from the last one gives only 5h45 and would suppress the alert.
+A shorter span, missing hourly bin, buffered burst, or changed target must not emit.
 
 ```kusto
-let evaluationTime = now();
-let otel = datatable(age:timespan, machine:string, store:string, code:string, message:string)
+let evaluationTime = bin(now(), 1h) + 58m;
+let cadence = range ageMinutes from 20 to 380 step 15
+| extend age = totimespan(strcat(tostring(ageMinutes), "m")),
+    machine = "persistent_cadence", store = "codex", code = "upload_failed",
+    message = "cadence.sock: HTTP 503"
+| project age, machine, store, code, message;
+let otel = union
+    (datatable(age:timespan, machine:string, store:string, code:string, message:string)
 [
   390m, "persistent_file", "codex", "upload_failed", "socket.sock: HTTP 500 old",
   330m, "persistent_file", "codex", "upload_failed", "socket.sock: HTTP 502",
@@ -323,7 +330,8 @@ let otel = datatable(age:timespan, machine:string, store:string, code:string, me
   59m, "short_span", "codex", "upload_failed", "short.sock: HTTP 500",
   10m, "short_span", "codex", "upload_failed", "short.sock: HTTP 500",
   20m, "single", "codex", "upload_failed", "single.sock: HTTP 500"
-]
+    ]),
+    cadence
 | extend TimeGenerated = evaluationTime - age,
     Body = tostring(bag_pack("event", "collector.event", "machine", machine,
         "payload", bag_pack("level", "error", "store", store, "code", code, "message", message)))

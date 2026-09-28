@@ -43,7 +43,7 @@ otel
 | where body.event == "collector.event" and body.payload.level == "error"
 | extend machine = tostring(body.machine), store = tostring(body.payload.store), code = tostring(body.payload.code), message = tostring(body.payload.message)
 | extend target = iff(message contains ": ", tostring(split(message, ": ")[0]), tostring(split(message, " ")[0]))
-| summarize lastInHour = max(TimeGenerated), arg_max(TimeGenerated, message) by machine, store, code, target, errorHour = bin(TimeGenerated, 1h)
-| summarize firstSeen = min(lastInHour), lastSeen = max(lastInHour), firstHour = min(errorHour), lastHour = max(errorHour), activeHours = count(), arg_max(lastInHour, message) by machine, store, code, target
+| summarize firstInHour = min(TimeGenerated), lastInHour = max(TimeGenerated), arg_max(TimeGenerated, message) by machine, store, code, target, errorHour = bin(TimeGenerated, 1h)
+| summarize firstSeen = min(firstInHour), lastSeen = max(lastInHour), firstHour = min(errorHour), lastHour = max(errorHour), activeHours = count(), arg_max(lastInHour, message) by machine, store, code, target
 | where lastSeen - firstSeen >= 6h and activeHours == datetime_diff("hour", lastHour, firstHour) + 1 and lastSeen > ago(1h)
 | project TimeGenerated = lastSeen, machine, level = "error", code, message
