@@ -1,6 +1,8 @@
-// Fires when sessions-hub logs a collector.event with level=error within the
-// last hour — i.e. machine-side collector errors that a collector reported
-// and the hub relayed into its own structured logs.
+// Fires only after matching errors span at least 6h with a failure in every UTC
+// hour bin and a recent occurrence. Buffered heartbeat events arrive together,
+// so a drained backlog cannot masquerade as ongoing failure.
+// Identity is machine/store/code plus a stable message target; the latest full
+// message remains in the alert output.
 //
 // This does NOT catch sessions-telemetry-gateway's own upstream-forward
 // failures (see the `collector.event`/level=error log line in
@@ -24,10 +26,10 @@
 // purpose: `event` and `machine` are hub-controlled (machine from the cert
 // identity), so a collector cannot forge `event: "hub.certs.cf_auth_failed"` (or
 // any hub event) to spoof an alert — its fields can only ever land inside
-// `payload`. That is why this query reads level/code/message from body.payload.*,
-// not body.*. ASSUMPTION TO VERIFY AT M4 DEPLOY: confirm the table/column names
-// once real data flows, and confirm `level` (not `severity` or the OTLP-native
-// SeverityText column) is the field the nested JSON payload uses.
+// `payload`. This query reads level/code/message and the optional store from
+// body.payload.*, not body.*. Target strips volatile details after the first
+// ": " or falls back to the first word. ASSUMPTION TO VERIFY AT M4 DEPLOY:
+// confirm table/column names and that level (not severity/SeverityText) is nested.
 
 // `otel` wraps OTelLogs in `union isfuzzy=true` so a missing table (before the
 // first OTLP log lands) degrades to empty instead of erroring the whole rule —
@@ -36,8 +38,12 @@ let otel = union isfuzzy=true
     (datatable(TimeGenerated:datetime, Body:string)[]),
     (OTelLogs | project TimeGenerated, Body);
 otel
-| where TimeGenerated > ago(1h)
+| where TimeGenerated > ago(7h)
 | extend body = todynamic(Body)
 | where body.event == "collector.event" and body.payload.level == "error"
-| extend machine = tostring(body.machine), code = tostring(body.payload.code), message = tostring(body.payload.message)
-| project TimeGenerated, machine, level = tostring(body.payload.level), code, message
+| extend machine = tostring(body.machine), store = tostring(body.payload.store), code = tostring(body.payload.code), message = tostring(body.payload.message)
+| extend target = iff(message contains ": ", tostring(split(message, ": ")[0]), tostring(split(message, " ")[0]))
+| summarize firstInHour = min(TimeGenerated), lastInHour = max(TimeGenerated), arg_max(TimeGenerated, message) by machine, store, code, target, errorHour = bin(TimeGenerated, 1h)
+| summarize firstSeen = min(firstInHour), lastSeen = max(lastInHour), firstHour = min(errorHour), lastHour = max(errorHour), activeHours = count(), arg_max(lastInHour, message) by machine, store, code, target
+| where lastSeen - firstSeen >= 6h and activeHours == datetime_diff("hour", lastHour, firstHour) + 1 and lastSeen > ago(1h)
+| project TimeGenerated = lastSeen, machine, level = "error", code, message
