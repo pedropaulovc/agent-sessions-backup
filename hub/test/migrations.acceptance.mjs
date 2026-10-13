@@ -138,7 +138,7 @@ function createWranglerProcess(
   };
 }
 
-async function createRemoteMigrationFixture(context, { fault } = {}) {
+async function createRemoteMigrationFixture(context, { fault, migrationDirectory = indexMigrationsDir } = {}) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'hub-remote-migration-'));
   context.after(() => rm(directory, { recursive: true, force: true }));
   const database = new DatabaseSync(':memory:');
@@ -146,6 +146,7 @@ async function createRemoteMigrationFixture(context, { fault } = {}) {
   const { unstable_splitSqlQuery: splitSqlQuery } = await import('wrangler');
   const accountId = '1'.repeat(32);
   const databaseId = 'ac2e6cc9-6ef5-4943-ac40-b7076848bd05';
+  const binding = migrationDirectory === migrationsDir ? 'DB' : 'IDX00';
   const configPath = path.join(directory, 'wrangler.json');
   const journalPath = path.join(directory, 'migration.json');
   const runnerPath = path.join(directory, 'run.mjs');
@@ -154,8 +155,8 @@ async function createRemoteMigrationFixture(context, { fault } = {}) {
     account_id: accountId,
     compatibility_date: '2026-01-01',
     d1_databases: [{
-      binding: 'IDX00', database_name: 'remote-migration-test-idx00', database_id: databaseId,
-      migrations_dir: indexMigrationsDir,
+      binding, database_name: `remote-migration-test-${binding.toLowerCase()}`, database_id: databaseId,
+      migrations_dir: migrationDirectory,
     }],
   }));
   await writeFile(runnerPath, `
@@ -238,10 +239,10 @@ async function createRemoteMigrationFixture(context, { fault } = {}) {
   }));
   const apiBaseUrl = `http://127.0.0.1:${server.address().port}/client/v4`;
   const options = {
-    target: 'production', config: configPath, database: 'IDX00', databaseId,
-    journalPath, artifactDigest, deploymentId: 'production:remote-migration-test:IDX00',
-    migrationsDir: indexMigrationsDir,
-    baseManifestPath: path.join(indexMigrationsDir, 'source-baseline.json'),
+    target: 'production', config: configPath, database: binding, databaseId,
+    journalPath, artifactDigest, deploymentId: `production:remote-migration-test:${binding}`,
+    migrationsDir: migrationDirectory,
+    baseManifestPath: path.join(migrationDirectory, 'source-baseline.json'),
   };
   const run = async () => await new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [runnerPath, JSON.stringify(options)], {
@@ -856,6 +857,61 @@ test('fresh remote shard preflight fails closed for auth, network, unrelated SQL
   }
 });
 
+test('a missing remote main ledger rejects historical migrations before canonical bootstrap', async (context) => {
+  const fixture = await loadFixture(migrationsDir);
+  assert.equal(fixture.manifest.ledgerStartsAt, 21, 'use the canonical historical main migration contract');
+  const remote = await createRemoteMigrationFixture(context, { migrationDirectory: migrationsDir });
+  const rejected = await remote.run();
+  assert.equal(rejected.signal, null, rejected.stderr);
+  assert.notEqual(rejected.status, 0, rejected.stdout);
+  assert.deepEqual(remote.database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all(), [],
+    'historical main cannot create either a migration ledger or user objects without its applied history');
+  const journal = await openMigrationJournal(remote.options.journalPath, {
+    target: 'production', deploymentId: remote.options.deploymentId,
+    artifactDigest, migrationDigest: migrationDigest(fixture.manifest),
+    databaseBinding: 'DB', databaseId: remote.options.databaseId,
+  });
+  assert.equal(journal.phase, 'intended');
+  assert.equal(journal.revision, 0);
+});
+
+test('a populated remote index without a ledger fails canonical apply and preserves real block and FTS data', async (context) => {
+  const fixture = await loadFixture(indexMigrationsDir);
+  const remote = await createRemoteMigrationFixture(context);
+  for (const sql of fixture.sql.values()) remote.database.exec(sql);
+  remote.database.exec(`
+    INSERT INTO blocks (id, session_id, file_id, turn_index, block_index, btype, text)
+      VALUES (42, 'existing-session', 7, 0, 0, 'text', 'ledgerless sentinel content');
+    INSERT INTO blocks_fts (rowid, text) SELECT id, text FROM blocks;
+  `);
+  assert.deepEqual(remote.database.prepare("SELECT name FROM sqlite_master WHERE name = 'd1_migrations'").all(), []);
+  const beforeSchema = schemaSnapshotFromDatabase(remote.database);
+  const beforeBlocks = remote.database.prepare('SELECT * FROM blocks ORDER BY id').all();
+  const beforeMatches = remote.database.prepare(`
+    SELECT rowid, text FROM blocks_fts WHERE blocks_fts MATCH 'ledgerless' ORDER BY rowid
+  `).all();
+  assert.equal(beforeMatches.length, 1, 'the sentinel must be genuinely indexed before the failed apply');
+  assert.equal(beforeMatches[0]?.rowid, 42);
+  assert.equal(beforeMatches[0]?.text, 'ledgerless sentinel content');
+  const rejected = await remote.run();
+  assert.equal(rejected.signal, null, rejected.stderr);
+  assert.notEqual(rejected.status, 0, rejected.stdout);
+  assert.deepEqual(schemaSnapshotFromDatabase(remote.database), beforeSchema);
+  assert.deepEqual(remote.database.prepare('SELECT * FROM blocks ORDER BY id').all(), beforeBlocks);
+  assert.deepEqual(remote.database.prepare(`
+    SELECT rowid, text FROM blocks_fts WHERE blocks_fts MATCH 'ledgerless' ORDER BY rowid
+  `).all(), beforeMatches, 'failed canonical apply must preserve the real source block and FTS MATCH result');
+  assert.equal(remote.database.prepare('SELECT COUNT(*) AS count FROM d1_migrations').get().count, 0);
+  assert.equal(remote.database.prepare('SELECT COUNT(*) AS count FROM migration_checksum_ledger').get().count, 0);
+  const journal = await openMigrationJournal(remote.options.journalPath, {
+    target: 'production', deploymentId: remote.options.deploymentId,
+    artifactDigest, migrationDigest: migrationDigest(fixture.manifest),
+    databaseBinding: 'IDX00', databaseId: remote.options.databaseId,
+  });
+  assert.equal(journal.phase, 'intended');
+  assert.equal(journal.revision, 0);
+});
+
 test('a missing remote migration table after Wrangler apply cannot masquerade as a fresh database', async (context) => {
   const remote = await createRemoteMigrationFixture(context, { fault: 'missing-after-apply' });
   const rejected = await remote.run();
@@ -895,7 +951,7 @@ test('production prefix and checksum integrity remain enforced for existing migr
   await assert.rejects(runMigrations({
     ...options, journalPath: path.join(directory, 'divergent.json'), runProcess: divergentProcess,
   }), /not an immutable manifest prefix/);
-  assert.equal(divergent.state.applyCalls, 0, 'an existing divergent ledger cannot use the fresh bootstrap path');
+  assert.equal(divergent.state.applyCalls, 0, 'an existing divergent applied prefix must reject before Wrangler apply');
   const corrupt = createWranglerProcess(fixture, snapshot);
   const corruptProcess = async (args) => {
     const response = await corrupt.runProcess(args);

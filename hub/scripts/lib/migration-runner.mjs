@@ -138,14 +138,14 @@ function isMissingMigrationTable(error) {
     && native.notes[0]?.text === 'no such table: d1_migrations: SQLITE_ERROR [code: 7500]';
 }
 
-async function readAppliedNames(client, { allowMissingTable = false } = {}) {
+async function readAppliedNames(client, phase = 'installed') {
   try {
     const rows = await client.query('SELECT name FROM d1_migrations ORDER BY id');
     return rows.map((row) => row.name);
   } catch (error) {
-    // Only the pre-apply guard may see no ledger. Wrangler apply owns its canonical
-    // initialization; checksum recording and final verification must find the table.
-    if (allowMissingTable && isMissingMigrationTable(error)) return [];
+    // Only an all-ledger schema's pre-apply guard may see no ledger. Wrangler owns
+    // initialization; historical schemas and every installed-state read stay strict.
+    if (phase === 'pre-apply' && isMissingMigrationTable(error)) return [];
     throw error;
   }
 }
@@ -352,7 +352,8 @@ export async function runMigrations(options) {
     identity,
     apply: async () => {
       if (options.target === 'production') {
-        assertAppliedManifestPrefix(manifest, await readAppliedNames(client, { allowMissingTable: true }));
+        const phase = manifest.ledgerStartsAt === 1 ? 'pre-apply' : 'installed';
+        assertAppliedManifestPrefix(manifest, await readAppliedNames(client, phase));
       }
       await client.apply();
     },
