@@ -293,7 +293,8 @@ async function runController(command, scenario = {}) {
           } else if (body.sql.startsWith('SELECT value')) {
             if (body.params[0] === 'preview_index_layout') {
               if (id.startsWith('existing-') && !scenario.legacy) {
-                rows = [{ value: JSON.stringify(scenario.recordedLayout ?? layout) }];
+                const recordedLayout = 'recordedLayout' in scenario ? scenario.recordedLayout : layout;
+                if (recordedLayout !== null) rows = [{ value: JSON.stringify(recordedLayout) }];
               }
             } else if (id.startsWith('existing-')) {
               const ledger = Object.fromEntries(manifest.migrations.map((entry) => [entry.filename,
@@ -634,6 +635,9 @@ for (const [name, scenario, error] of [
     binding.name === 'IDX01' ? { ...binding, type: 'plain_text' } : binding) }, /different database binding layout/],
   ['empty missing database ID', { sourceBindings: deployedBindings.map((binding) =>
     binding.name === 'IDX01' ? { ...binding, id: '' } : binding) }, /IDX01 does not bind the trusted database/],
+  ['non-string missing database ID', { sourceBindings: deployedBindings.map((binding) =>
+    binding.name === 'IDX01' ? { ...binding, id: 42 } : binding) }, /IDX01 does not bind the trusted database/],
+  ['unrecorded topology with missing shard', { recordedLayout: null }, /IDX01 does not bind the trusted database/],
   ['wrong deployed count', { sourceCount: 16 }, /deployed preview index count is immutable/],
   ['wrong recorded count', { recordedLayout: { ...LAYOUT, count: 16 } }, /count\/name layout is immutable/],
   ['unapproved account', { accountId: 'f'.repeat(32) }, /refusing unapproved Cloudflare account/],

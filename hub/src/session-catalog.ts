@@ -1,10 +1,10 @@
 // Propagation of the authoritative session catalog (main `sessions` + `starred_turns`) to every
 // index shard, so shard-local search can filter and cost-sort without cross-database joins.
 //
-// Main migration 0036 makes every INSERT/UPDATE/DELETE on `sessions` or `starred_turns` append the
-// session id to the durable `session_catalog_outbox` and stamp `session_catalog_versions.version`
-// with that outbox seq. The version is therefore strictly increasing per session across every
-// change. A sync reads version + row + stars for a session in ONE main batch (one consistent
+// Main migration 0036 appends the session id to `session_catalog_outbox` on session inserts/deletes,
+// null-safe changes to mirrored session values, and every starred-turn insert/update/delete. It
+// stamps `session_catalog_versions.version` with that outbox seq, so versions strictly increase
+// across catalog changes. A sync reads version + row + stars in ONE main batch (one consistent
 // snapshot), then applies them to every shard in batches guarded by the shard's `catalog_versions`
 // (index-layout.mjs sessionCatalogBatches): a newer version replaces, an equal version re-applies
 // identically, and an older (late, concurrent) sync changes nothing. A session absent from main is
