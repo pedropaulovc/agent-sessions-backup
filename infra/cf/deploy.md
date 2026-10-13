@@ -81,6 +81,18 @@ metadata is published, never provider SQL/error bodies or credentials.
 Fixture prices are seeded in main before deployment; synthetic sessions still upload through
 the Worker's normal file API and are verified through search, never inserted directly into shards.
 
+Queue consumer ownership remains unresolved at the native REST response boundary: the current
+Cloudflare API reference names the Worker field `script_name`, while the SDK embedded in pinned
+Wrangler 4.111.0 names it `script`. Neither establishes what the failed production GET returned.
+After deploying and verifying its own app hostname, normal PR provision logs a compact
+`queueConsumerIdentityReceipt` from native GETs of only that PR's known queues. It records the
+expected Worker, consumer field types, string consumer type, own property keys, and syntactically
+valid Worker-name values for both diagnostic owner fields — never consumer bodies, settings,
+headers, or credentials. Production's strict rejection includes the same schema facts before
+DELETE. These are diagnostics only: no alternate owner field is accepted, no deletion guard is
+relaxed, and the existing preview cleanup acceptance behavior is unchanged. Native GET failures
+fail provision through the existing scoped client's error path rather than reporting empty evidence.
+
 **Free-account quota:** this account permits at most **10 D1 databases**. Each complete PR preview
 uses three, so at most three complete previews fit when no other databases exist. Provision
 counts every account database, reuses exact per-PR names, and refuses before creating any

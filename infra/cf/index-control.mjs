@@ -230,6 +230,22 @@ async function health(config, mode) {
   return value;
 }
 
+/** Diagnostic schema only: neither owner field here authorizes consumer deletion. */
+export function queueConsumerIdentityFacts(consumer) {
+  const workerName = (value) => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,63}$/.test(value)
+    ? value : null;
+  return {
+    consumer_id: { type: typeof consumer?.consumer_id },
+    type: {
+      type: typeof consumer?.type,
+      ...(typeof consumer?.type === 'string' ? { value: consumer.type } : {}),
+    },
+    ownPropertyKeys: consumer !== null && typeof consumer === 'object' ? Object.keys(consumer) : [],
+    script_name: { type: typeof consumer?.script_name, workerName: workerName(consumer?.script_name) },
+    script: { type: typeof consumer?.script, workerName: workerName(consumer?.script) },
+  };
+}
+
 export async function pauseConsumers(api, config) {
   const queues = await paginatedList(api.cf, 'queues', { pagination: 'page', rowsOf: (envelope) => envelope.result });
   const queueNames = [...new Set(config.queues?.consumers?.map((queue) => queue.queue) ?? [])];
@@ -241,7 +257,8 @@ export async function pauseConsumers(api, config) {
     for (const consumer of consumers) {
       if ((consumer.type != null && consumer.type !== 'worker') || consumer.script_name !== config.name
         || typeof consumer.consumer_id !== 'string') {
-        throw new Error(`unexpected consumer on production queue ${name}; refusing to pause another owner`);
+        throw new Error(`unexpected consumer on production queue ${name}; refusing to pause another owner; `
+          + JSON.stringify({ expectedWorker: config.name, consumer: queueConsumerIdentityFacts(consumer) }));
       }
       await api.cf(`queues/${queue.queue_id}/consumers/${consumer.consumer_id}`, { method: 'DELETE' });
       paused += 1;
