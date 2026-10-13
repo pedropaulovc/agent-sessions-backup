@@ -510,3 +510,91 @@ describe('date reindex route authorization', () => {
     expect(await status(accepted.job_id)).toEqual(before);
   });
 });
+
+describe('reindex-restored mtimes drive the canonical-copy tiebreak correctly (regression: with mtime always NULL post-reindex, the size/priority tiebreak fell through to an arbitrary id-ASC order, potentially keeping an OLDER duplicate canonical over a genuinely newer one)', () => {
+  it('after both duplicates\' mtimes are lost and reindex restores them from R2, the NEWER-mtime copy is canonical, not the lower-id (older, first-uploaded) one', async () => {
+    const SESSION_ID = 'e0000000-0000-4000-8000-000000000008';
+    const OUTSIDE_SESSION_ID = 'e0000000-0000-4000-8000-000000000009';
+    // Identical bytes keep priority and size equal, so canonical ranking must reach mtime.
+    const content = `${ccLine(SESSION_ID, { uuid: 'dm-u1', role: 'user', text: 'duplicate mtime tiebreak content' })}\n`;
+    const OLD_MTIME = '2019-01-01T00:00:00Z';
+    const NEW_MTIME = '2026-01-01T00:00:00Z';
+    const prefix = `raw/${MACHINE}/claude-projects/dup-mtime-demo/`;
+    const oldRelpath = `dup-mtime-demo/copy-old/${SESSION_ID}.jsonl`;
+    const newRelpath = `dup-mtime-demo/copy-new/${SESSION_ID}.jsonl`;
+    const outsideRelpath = `outside-mtime-demo/${OUTSIDE_SESSION_ID}.jsonl`;
+
+    async function putWithMtime(sessionId: string, relpath: string, mtime: string, text = content): Promise<Fixture> {
+      const body = new TextEncoder().encode(text);
+      const digest = await crypto.subtle.digest('SHA-256', body);
+      const hash = [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+      const response = await route(new Request(`${API}/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent(relpath)}`, {
+        method: 'PUT',
+        headers: {
+          'x-dev-machine': MACHINE,
+          'x-content-hash': `sha256:${hash}`,
+          'x-file-mtime': mtime,
+          'content-length': String(body.length),
+        },
+        body,
+      }), testEnv, ctx);
+      expect(response.status).toBe(201);
+      const { file_id: fileId } = await response.json<{ file_id: number }>();
+      const fixture = { sessionId, fileId, key: `raw/${MACHINE}/claude-projects/${relpath}`, hash };
+      fixtures.push(fixture);
+      return fixture;
+    }
+
+    // This file intercepts both queue APIs before every test, so no earlier uploads can
+    // leave simulator deliveries behind. Direct, awaited routes also avoid SELF's
+    // background fetch callbacks. Register all uploads with the existing cleanup fixture.
+    const older = await putWithMtime(SESSION_ID, oldRelpath, OLD_MTIME);
+    const newer = await putWithMtime(SESSION_ID, newRelpath, NEW_MTIME);
+    expect(older.fileId).toBeLessThan(newer.fileId);
+    expect(older.hash).toBe(newer.hash);
+
+    // Keep an actual R2 object and pending row outside the prefix even when running alone.
+    // A broad reindex must expose its message; a global pending drain must alter its row.
+    const outside = await putWithMtime(OUTSIDE_SESSION_ID, outsideRelpath, NEW_MTIME, 'not valid JSON\n');
+    await db.batch([
+      db.prepare('UPDATE files SET mtime = NULL WHERE id IN (?1, ?2)').bind(older.fileId, newer.fileId),
+      db.prepare("UPDATE files SET mtime = NULL, content_hash = 'unknown' WHERE id = ?1").bind(outside.fileId),
+    ]);
+    // Discard setup uploads only. Everything emitted by reindex or its deliveries below
+    // remains captured without prefix/file-id filtering, including an outside message.
+    sent.length = 0;
+
+    const response = await route(new Request(`${API}/api/v1/admin/reindex`, {
+      method: 'POST',
+      headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
+      body: JSON.stringify({ prefix }),
+    }), testEnv, ctx);
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ enqueued: 2, done: true, cursor: null });
+    expect(sent).toHaveLength(2);
+    expect(sent).toEqual(expect.arrayContaining([
+      { file_id: older.fileId, r2_key: older.key, reason: 'reindex', content_hash: older.hash },
+      { file_id: newer.fileId, r2_key: newer.key, reason: 'reindex', content_hash: newer.hash },
+    ]));
+
+    // Snapshot only the two actual messages; never drain all pending rows or append
+    // continuation/recovery messages to the replay. deliver() asserts ack and no retry.
+    const messages = sent.slice();
+    for (const message of messages) await deliver(message);
+    expect(sent).toHaveLength(2); // no unconsumed continuation/recovery work
+
+    const oldRow = await db.prepare('SELECT mtime, size, content_hash, parse_state FROM files WHERE id = ?1')
+      .bind(older.fileId).first();
+    const newRow = await db.prepare('SELECT mtime, size, content_hash, parse_state FROM files WHERE id = ?1')
+      .bind(newer.fileId).first();
+    const size = new TextEncoder().encode(content).length;
+    expect(oldRow).toEqual({ mtime: OLD_MTIME, size, content_hash: older.hash, parse_state: 'superseded' });
+    expect(newRow).toEqual({ mtime: NEW_MTIME, size, content_hash: newer.hash, parse_state: 'parsed' });
+    expect(await db.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID).first()).toEqual({ canonical_file_id: newer.fileId, index_state: 'ready' });
+
+    // Neither R2 discovery nor queue delivery may repair/parse the outside-prefix file.
+    expect(await db.prepare('SELECT mtime, content_hash, parse_state, parsed_at FROM files WHERE id = ?1')
+      .bind(outside.fileId).first()).toEqual({ mtime: null, content_hash: 'unknown', parse_state: 'pending', parsed_at: null });
+  });
+});

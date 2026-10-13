@@ -423,9 +423,11 @@ D1 copy failures emit only the configured database UUID, `query`/`batch` kind,
 validated numeric HTTP status/provider codes, statement/parameter counts, encoded
 request body and parameter-JSON byte counts, an allowlisted native class, and a
 static operation phase. `failure=transport|http|statement|shape` distinguishes a
-request that did not obtain a response, a non-2xx response, an explicit provider or
-statement rejection in an HTTP-200 envelope, and an invalid response protocol/shape.
+request or response-body transport failure, a non-2xx response, an explicit provider
+or statement rejection in an HTTP-200 envelope, and an invalid response protocol/shape.
 HTTP status comes from the actual response, never a provider envelope field.
+A response-body transport failure retains the known HTTP status; invalid 429
+`Retry-After` is an HTTP failure with status 429, not permission to replay.
 Byte counts include JSON framing/escaping and are computed only on failure.
 `copy-setup` identifies column/schema setup; the initial ID-range read and
 already-complete source probes use `copy-source-page-read`.
@@ -434,6 +436,8 @@ replacement, full-row readback, and native MATCH execution. Source operations us
 `copy-source-page-read`, `copy-source-freeze-read`,
 `copy-source-freeze-install`, or `copy-source-delete-and-freeze`; checkpoint
 reads/writes and unacknowledged-page cleanup have their own static phases.
+Shared row/long-text transport invariants inherit the source-page or destination
+readback phase, including malformed byte slices and invalid scalar values.
 Map the UUID to the generated configuration's binding before attributing a failure
 to main or any particular shard. No copied row IDs, column names, SQL, parameters,
 provider messages, or transcript bytes are diagnostic output.
@@ -458,16 +462,22 @@ reports its own invariant failures as `class=assertion invariant=<allowlisted co
 (for example `fts-match`, `readback-sha256`, `source-delete`, or `freeze-missing`),
 not as an unknown SQL failure. Schema-runner errors without a public typed identity
 remain `phase=schema class=other`; raw subprocess output is never copied into this
-diagnostic. Client failures retain their allowlisted `failure` kind in the proof.
+diagnostic. D1-query and inventory/create/identity/delete client failures retain
+their allowlisted `failure` kind in the proof; HTTP 404 inventory is still a failure,
+never an empty inventory or permission to create scratch databases.
 A primary failure plus scratch cleanup failure keeps the original
 phase/class/invariant/failure kind and adds
-`cleanup=failed cleanupClass=<allowlisted class>`.
+`cleanup=failed cleanupClass=<allowlisted class>` and, for client cleanup failures,
+`cleanupFailure=<allowlisted failure kind>`.
 Cleanup still checks each known-owned database identity and attempts every safe
 deletion; failed or ownership-refused cleanup also fails an otherwise successful
 proof. The preview atomicity preflight emits a JSON diagnostic with
 `operation: "preview-atomicity"`, its control `phase`
 (`ownership`, `batch-positive`, `independent-positive`, `rollback-negative`, or
 `cleanup`), and `failure` (`assertion`, a client failure kind above, or `other`).
+A secondary owned-probe cleanup failure preserves that primary phase/failure and
+adds `cleanup: "failed"` and `cleanupFailure` (a client failure kind or `other`);
+the owned probe may remain, and foreign/user tables are never cleanup targets.
 Neither boundary logs raw causes, stacks, provider text, or copied values.
 
 After a failed/ambiguous request, source contents, shard contents, and checkpoint

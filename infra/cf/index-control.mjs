@@ -73,7 +73,10 @@ export function cloudflareRetryDelay(response) {
   if (response.status !== 429) return null;
   const seconds = Number(response.headers.get('retry-after'));
   if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 3600) {
-    throw new Error('Cloudflare HTTP 429 lacks a valid retry-after delay; checkpoint retained');
+    const error = new Error('Cloudflare HTTP 429 lacks a valid retry-after delay; checkpoint retained');
+    error.providerStatus = response.status;
+    error.d1FailureKind = 'http';
+    throw error;
   }
   return seconds * 1000;
 }
@@ -92,11 +95,18 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
       if (requestGate) requestGate();
       await permit();
       if (requestGate) requestGate();
-      const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/${pathname}`, {
-        ...request, redirect: 'error', signal: AbortSignal.timeout(60000),
-        headers: { authorization: `Bearer ${token}`, accept: 'application/json',
-          ...(request.body ? { 'content-type': 'application/json' } : {}) },
-      });
+      let response;
+      try {
+        response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/${pathname}`, {
+          ...request, redirect: 'error', signal: AbortSignal.timeout(60000),
+          headers: { authorization: `Bearer ${token}`, accept: 'application/json',
+            ...(request.body ? { 'content-type': 'application/json' } : {}) },
+        });
+      } catch (error) {
+        error.d1FailureKind = 'transport';
+        error.providerStatus = undefined; // No actual Response was received.
+        throw error;
+      }
       const delay = cloudflareRetryDelay(response);
       if (delay !== null) {
         // A 429 rejected the operation before execution. Replay only that unambiguous
@@ -106,8 +116,16 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
         await wait(delay);
         continue;
       }
+      let text;
+      try { text = await response.text(); }
+      catch {
+        const error = new Error(`Cloudflare response body read failed: HTTP ${response.status}`);
+        error.providerStatus = response.status;
+        error.d1FailureKind = 'transport';
+        throw error;
+      }
       let envelope;
-      try { envelope = await response.json(); }
+      try { envelope = JSON.parse(text); }
       catch {
         const error = new Error(`Cloudflare returned non-JSON HTTP ${response.status}`);
         error.providerStatus = response.status;
@@ -121,10 +139,8 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
         const error = new Error(`Cloudflare ${isD1 ? 'D1 query' : pathname.split('?')[0]} failed: HTTP ${response.status}, codes=${codes.join(',')}`);
         error.providerStatus = response.status;
         error.providerCodes = codes;
-        if (isD1) {
-          error.d1SqlReason = d1SqlFailureReason(envelope?.errors);
-          error.d1FailureKind = !response.ok ? 'http' : envelope?.success === false ? 'statement' : 'shape';
-        }
+        error.d1FailureKind = !response.ok ? 'http' : envelope?.success === false ? 'statement' : 'shape';
+        if (isD1) error.d1SqlReason = d1SqlFailureReason(envelope?.errors);
         throw error;
       }
       if (responseFormat === 'envelope') responseStatuses.set(envelope, response.status);

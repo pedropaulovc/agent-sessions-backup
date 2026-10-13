@@ -63,6 +63,7 @@ const quote = (name) => `"${name.replaceAll('"', '""')}"`;
 const sha = (value) => createHash('sha256').update(value).digest('hex');
 const inList = (count) => Array.from({ length: count }, () => '?').join(',');
 const DIAGNOSTIC_DB = Symbol('diagnostic-db');
+const DIAGNOSTIC_PHASE = Symbol('diagnostic-phase');
 
 // Only callers below supply literal operation names. Preserve the original rejection
 // and transaction behavior; diagnostics never authorize retry or change checkpoints.
@@ -78,7 +79,7 @@ function phaseDb(db, phase) {
       throw error;
     }
   };
-  return { [DIAGNOSTIC_DB]: db, id: db.id, query: (...args) => call('query', args), batch: (...args) => call('batch', args) };
+  return { [DIAGNOSTIC_DB]: db, [DIAGNOSTIC_PHASE]: phase, id: db.id, query: (...args) => call('query', args), batch: (...args) => call('batch', args) };
 }
 
 const sourceFreezeTriggers = ['insert', 'update', 'delete'].map((event) => ({
@@ -135,22 +136,22 @@ async function freezeEmptySource(source) {
   ]);
 }
 
-export function canonicalRow(columns, row) {
+export function canonicalRow(columns, row, phase) {
   return JSON.stringify(columns.map((column) => {
-    if (!Object.hasOwn(row, column)) throw copyInvariant(COPY_INVARIANTS.COLUMN, 'D1 omitted column');
+    if (!Object.hasOwn(row, column)) throw copyInvariant(COPY_INVARIANTS.COLUMN, 'D1 omitted column', phase);
     const value = row[column];
     if (value !== null && !['string', 'number'].includes(typeof value)) {
-      throw copyInvariant(COPY_INVARIANTS.VALUE, 'unsupported D1 value');
+      throw copyInvariant(COPY_INVARIANTS.VALUE, 'unsupported D1 value', phase);
     }
     if (typeof value === 'number' && (!Number.isFinite(value)
       || (Number.isInteger(value) && !Number.isSafeInteger(value)))) {
-      throw copyInvariant(COPY_INVARIANTS.NUMBER, 'unsafe D1 number');
+      throw copyInvariant(COPY_INVARIANTS.NUMBER, 'unsafe D1 number', phase);
     }
     return value;
   }));
 }
 
-export function rowDigest(columns, row) { return sha(canonicalRow(columns, row)); }
+export function rowDigest(columns, row, phase) { return sha(canonicalRow(columns, row, phase)); }
 
 export function assertMaintenanceHealth(health, revision, count) {
   if (health?.ok !== true || health.environment !== 'production'
@@ -431,7 +432,7 @@ async function blockCandidates(db, layout, { after, ids, descending = false }) {
     FROM candidates JOIN blocks AS b ON b.id = candidates.id ORDER BY candidates.id ${order}`, params);
 }
 
-function boundedCandidatePage(candidates, layout, start = 0) {
+function boundedCandidatePage(candidates, layout, start = 0, phase) {
   const selected = [];
   let bytes = RESPONSE_ENVELOPE_BYTES + 2;
   for (let index = start; index < candidates.length && selected.length < COPY_PAGE_ROWS; index += 1) {
@@ -439,7 +440,7 @@ function boundedCandidatePage(candidates, layout, start = 0) {
     if (!Number.isSafeInteger(candidate.id) || !Number.isSafeInteger(candidate.raw_bytes)
       || candidate.raw_bytes < 0 || (candidate.row_bytes !== null
         && (!Number.isSafeInteger(candidate.row_bytes) || candidate.row_bytes < 0))) {
-      throw copyInvariant(COPY_INVARIANTS.PAGE_METADATA, 'invalid block page size metadata');
+      throw copyInvariant(COPY_INVARIANTS.PAGE_METADATA, 'invalid block page size metadata', phase);
     }
     if (candidate.row_bytes === null) {
       if (!selected.length) selected.push(candidate);
@@ -454,23 +455,24 @@ function boundedCandidatePage(candidates, layout, start = 0) {
 }
 
 async function readBlockRows(db, columns, ids, layout = blockPageLayout(columns), candidates = null) {
+  const phase = db[DIAGNOSTIC_PHASE];
   if (!ids.length) return [];
-  if (ids.length > COPY_PAGE_ROWS) throw copyInvariant(COPY_INVARIANTS.ROW_CAP, 'block readback exceeds the copy row cap');
-  if (new Set(ids).size !== ids.length) throw copyInvariant(COPY_INVARIANTS.DUPLICATE_IDS, 'duplicate block readback IDs');
+  if (ids.length > COPY_PAGE_ROWS) throw copyInvariant(COPY_INVARIANTS.ROW_CAP, 'block readback exceeds the copy row cap', phase);
+  if (new Set(ids).size !== ids.length) throw copyInvariant(COPY_INVARIANTS.DUPLICATE_IDS, 'duplicate block readback IDs', phase);
   // Checkpoints retain their original schema. Recompute bounded response pages on
   // resume/readback rather than trusting an old or smaller copier's page dimensions.
   const sizes = candidates ?? await blockCandidates(db, layout, { ids });
-  if (sizes.length > COPY_PAGE_ROWS) throw copyInvariant(COPY_INVARIANTS.ROW_CAP, 'block readback exceeds the copy row cap');
+  if (sizes.length > COPY_PAGE_ROWS) throw copyInvariant(COPY_INVARIANTS.ROW_CAP, 'block readback exceeds the copy row cap', phase);
   const expected = new Set(ids);
   const sized = new Set();
   for (const candidate of sizes) {
-    if (!expected.has(candidate.id) || sized.has(candidate.id)) throw copyInvariant(COPY_INVARIANTS.SIZE_IDENTITY, 'block size readback identity mismatch');
+    if (!expected.has(candidate.id) || sized.has(candidate.id)) throw copyInvariant(COPY_INVARIANTS.SIZE_IDENTITY, 'block size readback identity mismatch', phase);
     sized.add(candidate.id);
   }
   const rows = [];
   const seen = new Set();
   for (let offset = 0; offset < sizes.length;) {
-    const page = boundedCandidatePage(sizes, layout, offset);
+    const page = boundedCandidatePage(sizes, layout, offset, phase);
     const pageIds = page.map((candidate) => candidate.id);
     const wanted = new Map(page.map((candidate) => [candidate.id, candidate.raw_bytes]));
     const found = await db.query(`WITH sized AS MATERIALIZED (
@@ -478,20 +480,20 @@ async function readBlockRows(db, columns, ids, layout = blockPageLayout(columns)
       WHERE b.id IN (${JSON_IDS_SQL})
     ) SELECT ${layout.selectors} FROM sized ORDER BY id`, [JSON.stringify(pageIds)]);
     for (const row of found) {
-      if (!wanted.has(row.id) || seen.has(row.id)) throw copyInvariant(COPY_INVARIANTS.ROW_IDENTITY, 'block readback cardinality/identity mismatch');
+      if (!wanted.has(row.id) || seen.has(row.id)) throw copyInvariant(COPY_INVARIANTS.ROW_IDENTITY, 'block readback cardinality/identity mismatch', phase);
       seen.add(row.id);
       const inlineBytes = wanted.get(row.id) > SMALL_ROW_BYTES ? layout.inlineBytes : SMALL_ROW_BYTES;
       let rowIdsJson;
       for (let index = 0; index < columns.length; index += 1) {
         const marker = layout.markerNames[index];
         if (!Object.hasOwn(row, columns[index]) || !Object.hasOwn(row, marker)) {
-          throw copyInvariant(COPY_INVARIANTS.LONG_COLUMN, 'D1 omitted a block column or long-column marker');
+          throw copyInvariant(COPY_INVARIANTS.LONG_COLUMN, 'D1 omitted a block column or long-column marker', phase);
         }
         const length = row[marker];
         delete row[marker];
         if (length === null) continue;
         if (!Number.isSafeInteger(length) || length <= inlineBytes || row[columns[index]] !== null) {
-          throw copyInvariant(COPY_INVARIANTS.LONG_LENGTH, 'invalid long-column byte length metadata');
+          throw copyInvariant(COPY_INVARIANTS.LONG_LENGTH, 'invalid long-column byte length metadata', phase);
         }
         const chunks = [];
         rowIdsJson ??= JSON.stringify([row.id]);
@@ -501,14 +503,14 @@ async function readBlockRows(db, columns, ids, layout = blockPageLayout(columns)
             FROM blocks WHERE id IN (${JSON_IDS_SQL})`, [byteOffset + 1, sliceBytes, rowIdsJson]);
           if (parts.length !== 1 || typeof parts[0].bytes !== 'string'
             || parts[0].bytes.length !== sliceBytes * 2 || !/^[0-9a-f]+$/i.test(parts[0].bytes)) {
-            throw copyInvariant(COPY_INVARIANTS.LONG_SLICE, 'incomplete or invalid long-column byte slice');
+            throw copyInvariant(COPY_INVARIANTS.LONG_SLICE, 'incomplete or invalid long-column byte slice', phase);
           }
           chunks.push(Buffer.from(parts[0].bytes, 'hex'));
         }
         try {
           row[columns[index]] = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks, length));
         } catch {
-          throw copyInvariant(COPY_INVARIANTS.LONG_UTF8, 'invalid long-column UTF-8');
+          throw copyInvariant(COPY_INVARIANTS.LONG_UTF8, 'invalid long-column UTF-8', phase);
         }
       }
       rows.push(row);
@@ -518,8 +520,8 @@ async function readBlockRows(db, columns, ids, layout = blockPageLayout(columns)
   return rows;
 }
 
-function canonicalPage(columns, rows) {
-  const canonical = rows.map((row) => canonicalRow(columns, row));
+function canonicalPage(columns, rows, phase) {
+  const canonical = rows.map((row) => canonicalRow(columns, row, phase));
   const sizes = canonical.map((row) => Buffer.byteLength(row));
   let count = 0;
   let bytes = 2;
@@ -536,19 +538,19 @@ function canonicalPage(columns, rows) {
 }
 
 async function readCopyPage(db, columns, layout, candidates) {
-  const selected = boundedCandidatePage(candidates, layout);
+  const selected = boundedCandidatePage(candidates, layout, 0, db[DIAGNOSTIC_PHASE]);
   const ids = selected.map((candidate) => candidate.id);
   const rows = await readBlockRows(db, columns, ids, layout, selected);
   if (rows.length !== ids.length) throw copyInvariant(COPY_INVARIANTS.SOURCE_PAGE_MISSING, 'frozen source page disappeared', COPY_PHASES.SOURCE_PAGE_READ);
   // A trim never advances the checkpoint over excluded IDs: the next keyset scan
   // starts at the last actually copied row, not the last candidate or transport row.
-  return canonicalPage(columns, rows);
+  return canonicalPage(columns, rows, db[DIAGNOSTIC_PHASE]);
 }
 
 async function replaceShardPage(db, columns, rows, layout) {
   db = phaseDb(db, COPY_PHASES.PAGE_WRITE);
   const idsJson = JSON.stringify(rows.map((row) => row.id));
-  const page = canonicalPage(columns, rows);
+  const page = canonicalPage(columns, rows, COPY_PHASES.PAGE_WRITE);
   if (page.rows.length !== rows.length) throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES, 'shard page exceeds the canonical JSON byte cap', COPY_PHASES.PAGE_WRITE);
   const insert = page.bytes <= COPY_PAGE_BYTES
     ? { sql: `INSERT INTO blocks (${layout.quoted.join(',')})
@@ -585,7 +587,7 @@ async function pendingSourceChanged(source, state, layout) {
   if (rows.length !== state.pending.rows.length) return true;
   const originals = new Map(rows.map((row) => [row.id, row]));
   return state.pending.rows.some((item) => !originals.has(item.id)
-    || rowDigest(state.columns, originals.get(item.id)) !== item.sha256);
+    || rowDigest(state.columns, originals.get(item.id), source[DIAGNOSTIC_PHASE]) !== item.sha256);
 }
 
 async function verifyPending(source, shards, state, layout) {
@@ -603,11 +605,11 @@ async function verifyPending(source, shards, state, layout) {
       throw copyInvariant(COPY_INVARIANTS.DESTINATION_IDENTITY, 'destination readback cardinality/identity mismatch; source retained', COPY_PHASES.PAGE_READBACK);
     }
     for (const item of items) {
-      if (!found.has(item.id) || rowDigest(state.columns, found.get(item.id)) !== item.sha256) {
+      if (!found.has(item.id) || rowDigest(state.columns, found.get(item.id), COPY_PHASES.PAGE_READBACK) !== item.sha256) {
         throw copyInvariant(COPY_INVARIANTS.READBACK_SHA256, 'readback SHA-256 mismatch; source retained', COPY_PHASES.PAGE_READBACK);
       }
       const original = remaining.get(item.id);
-      if (original && rowDigest(state.columns, original) !== item.sha256) {
+      if (original && rowDigest(state.columns, original, source[DIAGNOSTIC_PHASE]) !== item.sha256) {
         throw copyInvariant(COPY_INVARIANTS.SOURCE_CHANGED, 'frozen source changed; refusing deletion', COPY_PHASES.SOURCE_PAGE_READ);
       }
       if (!original && state.pending.phase !== 'verified') {
@@ -625,7 +627,7 @@ async function finishPending(source, shards, state, gate, checkpoint, layout) {
     const rows = await readBlockRows(source, state.columns, state.pending.rows.map((row) => row.id), layout);
     const found = new Map(rows.map((row) => [row.id, row]));
     for (const item of state.pending.rows) {
-      if (!found.has(item.id) || rowDigest(state.columns, found.get(item.id)) !== item.sha256) {
+      if (!found.has(item.id) || rowDigest(state.columns, found.get(item.id), source[DIAGNOSTIC_PHASE]) !== item.sha256) {
         throw copyInvariant(COPY_INVARIANTS.SOURCE_CHANGED, 'source block changed before copy', COPY_PHASES.SOURCE_PAGE_READ);
       }
     }
@@ -644,7 +646,7 @@ async function finishPending(source, shards, state, gate, checkpoint, layout) {
   const ids = state.pending.rows.map((row) => row.id);
   const phase = await sourceFreezePhase(source);
   if (state.rows > 0 && phase !== 'frozen') throw copyInvariant(COPY_INVARIANTS.FREEZE_MISSING, 'source freeze vanished after verified deletion', COPY_PHASES.SOURCE_FREEZE_READ);
-  const page = canonicalPage(state.columns, ids.map((id) => verified.get(id)));
+  const page = canonicalPage(state.columns, ids.map((id) => verified.get(id)), COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
   if (page.rows.length !== ids.length) throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES, 'verified source page exceeds the canonical JSON byte cap', COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
   const idIndex = state.columns.indexOf('id');
   const statements = [page.bytes <= COPY_PAGE_BYTES ? {

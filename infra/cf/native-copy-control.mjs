@@ -15,11 +15,12 @@ const copyInvariants = Object.freeze(Object.values(COPY_INVARIANTS));
 
 // No causes/stacks from a provider or subprocess are retained in public diagnostics.
 export class NativeCopyControlError extends Error {
-  constructor(phase, failureClass, { invariant, failureKind, cleanupClass } = {}) {
+  constructor(phase, failureClass, { invariant, failureKind, cleanupClass, cleanupFailureKind } = {}) {
     super(`native copy control phase=${phase} class=${failureClass}`
       + (invariant ? ` invariant=${invariant}` : '')
       + (failureKind ? ` failure=${failureKind}` : '')
-      + (cleanupClass ? ` cleanup=failed cleanupClass=${cleanupClass}` : ''));
+      + (cleanupClass ? ` cleanup=failed cleanupClass=${cleanupClass}` : '')
+      + (cleanupFailureKind ? ` cleanupFailure=${cleanupFailureKind}` : ''));
     this.name = 'NativeCopyControlError';
     this.nativeCopyPhase = phase;
     this.nativeCopyClass = failureClass;
@@ -28,6 +29,7 @@ export class NativeCopyControlError extends Error {
     if (cleanupClass) {
       this.nativeCopyCleanup = 'failed';
       this.nativeCopyCleanupClass = cleanupClass;
+      if (cleanupFailureKind) this.nativeCopyCleanupFailureKind = cleanupFailureKind;
     }
   }
 }
@@ -117,6 +119,7 @@ export async function withScratchD1Databases({ api, pr, nonce = randomBytes(12).
     failure = failure ? new NativeCopyControlError(failure.nativeCopyPhase, failure.nativeCopyClass, {
       invariant: failure.nativeCopyInvariant, failureKind: failure.nativeCopyFailureKind,
       cleanupClass: cleanupFailure.nativeCopyClass,
+      cleanupFailureKind: cleanupFailure.nativeCopyFailureKind,
     }) : cleanupFailure;
   }
   if (failure) throw failure;

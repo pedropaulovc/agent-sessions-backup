@@ -3,11 +3,22 @@ import { randomUUID } from 'node:crypto';
 export const D1_BATCH_PROBE_TEXT = '\ufeffD1-α😀\u0000会話-café-e\u0301';
 const PROBE_TEXT_BYTES = Buffer.byteLength(D1_BATCH_PROBE_TEXT, 'utf8');
 
-export const D1_SQL_FAILURE_REASONS = Object.freeze([
-  'malformed-json', 'capacity', 'sql-syntax', 'missing-schema', 'limits', 'type-error',
-  'quota', 'transient-reset', 'storage-timeout', 'overloaded', 'memory-limit', 'cpu-limit',
-  'writer-fence', 'other',
-]);
+const D1_SQL_FAILURE_PATTERNS = [
+  ['malformed-json', /\bmalformed JSON\b/i],
+  ['writer-fence', /\bindex_migration_frozen\b/],
+  ['capacity', /\b(?:SQLITE_FULL|database or disk is full|Exceeded maximum DB size|Your account has exceeded D1's maximum account storage limit)\b/i],
+  ['sql-syntax', /\b(?:syntax error|incomplete input|unrecognized token)\b/i],
+  ['missing-schema', /\b(?:D1_COLUMN_NOTFOUND|no such (?:table|column|module)|has no column named)\b/i],
+  ['limits', /\b(?:too many SQL variables|too many terms in compound SELECT|Expression tree is too large|string or blob too big|SQLITE_TOOBIG|statement too long)\b/i],
+  ['type-error', /\bD1_TYPE_ERROR\b/],
+  ['quota', /\bYour account has exceeded D1's free tier daily row (?:read|write) limit\b/i],
+  ['transient-reset', /\b(?:D1 DB reset because its code was updated|Internal error (?:while starting up|in) D1 DB storage caused object to be reset|Network connection lost|Replica disconnected from primary|Cannot resolve D1 DB due to transient issue on remote node|Can't read from request stream because client disconnected)\b/i],
+  ['storage-timeout', /\bD1 DB storage operation exceeded timeout which caused object to be reset\b/i],
+  ['overloaded', /\bD1 DB is overloaded\. (?:Requests queued for too long|Too many requests queued)\b/i],
+  ['memory-limit', /\bD1 DB's isolate exceeded its memory limit and was reset\b/i],
+  ['cpu-limit', /\bD1 DB exceeded its CPU time limit and was reset\b/i],
+];
+export const D1_SQL_FAILURE_REASONS = Object.freeze([...D1_SQL_FAILURE_PATTERNS.map(([reason]) => reason), 'other']);
 export const D1_FAILURE_KINDS = Object.freeze(['transport', 'http', 'statement', 'shape']);
 
 function atomicityFailure(error, phase, failure = 'assertion') {
@@ -69,9 +80,6 @@ export async function verifyD1BatchAtomicity(db) {
     }
     const retained = await exists();
     if (retained) {
-      phase = 'cleanup';
-      await remove();
-      phase = 'rollback-negative';
       reject('D1 REST batch partially committed before a failing statement; source copy forbidden');
     }
     if (!rejection || rejection.d1SqlReason !== 'malformed-json') {
@@ -97,21 +105,7 @@ export function d1SqlFailureReason(errors) {
   for (const error of Array.isArray(errors) ? errors : []) {
     const message = typeof error === 'string' ? error : error?.message;
     if (typeof message !== 'string') continue;
-    for (const [reason, pattern] of [
-      ['malformed-json', /\bmalformed JSON\b/i],
-      ['writer-fence', /\bindex_migration_frozen\b/],
-      ['capacity', /\b(?:SQLITE_FULL|database or disk is full|Exceeded maximum DB size|Your account has exceeded D1's maximum account storage limit)\b/i],
-      ['sql-syntax', /\b(?:syntax error|incomplete input|unrecognized token)\b/i],
-      ['missing-schema', /\b(?:D1_COLUMN_NOTFOUND|no such (?:table|column|module)|has no column named)\b/i],
-      ['limits', /\b(?:too many SQL variables|too many terms in compound SELECT|Expression tree is too large|string or blob too big|SQLITE_TOOBIG|statement too long)\b/i],
-      ['type-error', /\bD1_TYPE_ERROR\b/],
-      ['quota', /\bYour account has exceeded D1's free tier daily row (?:read|write) limit\b/i],
-      ['transient-reset', /\b(?:D1 DB reset because its code was updated|Internal error (?:while starting up|in) D1 DB storage caused object to be reset|Network connection lost|Replica disconnected from primary|Cannot resolve D1 DB due to transient issue on remote node|Can't read from request stream because client disconnected)\b/i],
-      ['storage-timeout', /\bD1 DB storage operation exceeded timeout which caused object to be reset\b/i],
-      ['overloaded', /\bD1 DB is overloaded\. (?:Requests queued for too long|Too many requests queued)\b/i],
-      ['memory-limit', /\bD1 DB's isolate exceeded its memory limit and was reset\b/i],
-      ['cpu-limit', /\bD1 DB exceeded its CPU time limit and was reset\b/i],
-    ]) {
+    for (const [reason, pattern] of D1_SQL_FAILURE_PATTERNS) {
       if (pattern.test(message)) reasons.add(reason);
     }
   }

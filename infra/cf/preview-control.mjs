@@ -745,6 +745,9 @@ async function provision() {
         operation: 'preview-atomicity',
         phase: error.d1AtomicityPhase,
         failure: error.d1AtomicityFailure,
+        ...(error.d1AtomicityCleanupFailure ? {
+          cleanup: 'failed', cleanupFailure: error.d1AtomicityCleanupFailure,
+        } : {}),
       })}\n`);
       throw error;
     }

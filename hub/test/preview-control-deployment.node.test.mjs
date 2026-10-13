@@ -175,6 +175,7 @@ async function runController(command, scenario = {}) {
       let created = 0;
       const shardRows = new Map();
       const probeDatabases = new Map();
+      let rejectedAtomicityBatch = false;
       const eventPath = ${JSON.stringify(eventPath)};
       const emit = (event) => appendFileSync(eventPath, JSON.stringify(event) + '\\n');
       const response = (result) => Response.json({ success: true, result });
@@ -264,6 +265,11 @@ async function runController(command, scenario = {}) {
             if (body.batch && !failureBatch && scenario.atomicityNoExecution) {
               return response(statements.map(() => ({ success: true, results: [] })));
             }
+            if (scenario.atomicityCleanupFailure && rejectedAtomicityBatch
+              && statements.some(({ sql }) => /^DROP TABLE "__index_batch_probe_[0-9a-f]+"$/.test(sql))) {
+              emit({ kind: 'probe-cleanup-fault', databaseId: id, sql: statements[0].sql });
+              return Response.json({ success: false, errors: [{ message: 'ATOMICITY_CLEANUP_PRIVATE_CANARY' }] }, { status: 503 });
+            }
             const transactional = body.batch && !scenario.atomicityPartialCommit;
             if (transactional) native.exec('BEGIN');
             try {
@@ -303,6 +309,7 @@ async function runController(command, scenario = {}) {
               return response(results);
             } catch (error) {
               if (transactional) native.exec('ROLLBACK');
+              if (failureBatch) rejectedAtomicityBatch = true;
               return Response.json({ success: false, errors: [{ message: error.message }] }, { status: 400 });
             }
           }
@@ -393,6 +400,7 @@ async function runController(command, scenario = {}) {
     const output = `${result.stdout}\n${result.stderr}`;
     for (const secret of [SEED, 'synthetic-cloudflare-token', 'synthetic-github-token',
       'atomicity-private-provider-text', 'index_batch_atomicity_intentional_invalid_json',
+      'ATOMICITY_CLEANUP_PRIVATE_CANARY',
       D1_BATCH_PROBE_TEXT, JSON.stringify(D1_BATCH_PROBE_TEXT).slice(1, -1)]) {
       assert.ok(!output.includes(secret), 'CLI evidence must not expose credentials, provider text or probe values');
     }
@@ -864,6 +872,46 @@ for (const [name, scenario] of [
     assert.ok(!result.output.includes('synthetic-cloudflare-token'));
   });
 }
+
+test('preview atomicity reports secondary cleanup failure after a real partial commit while preserving all foreign resources', async () => {
+  const foreign = [
+    { name: 'sessions-index', uuid: 'production-looking-name' },
+    { name: 'pr-151-sessions-index', uuid: 'other-pr-main' },
+    { name: 'pr-150-copy-0123456789abcdef01234567-source', uuid: 'other-owned-proof' },
+  ];
+  const result = await runController('provision', {
+    atomicityPartialCommit: true, atomicityCleanupFailure: true, extraDatabases: foreign,
+  });
+  assert.notEqual(result.status, 0, result.output);
+  const diagnostic = result.stderr.split('\n').filter((line) => line.startsWith('{'))
+    .map((line) => JSON.parse(line)).find((line) => line.operation === 'preview-atomicity');
+  assert.deepEqual(diagnostic, {
+    operation: 'preview-atomicity', phase: 'rollback-negative', failure: 'assertion',
+    cleanup: 'failed', cleanupFailure: 'http',
+  }, 'secondary HTTP cleanup cannot replace the primary non-atomicity assertion');
+  const indexMigration = result.events.find((event) => event.kind === 'migrate' && event.options.database === 'IDX00');
+  const sql = result.events.filter((event) => event.kind === 'probe-sql');
+  const creates = sql.filter((event) => event.sql.startsWith('CREATE TABLE'));
+  assert.equal(creates.length, 2, 'successful and negative controls must both execute real SQLite CREATE');
+  assert.equal(sql.filter((event) => event.sql.startsWith('INSERT INTO')).length, 2,
+    'the failed native batch must actually commit its INSERT before the invalid JSON rejection');
+  const ownedName = /^CREATE TABLE "(__index_batch_probe_[0-9a-f]+)"/.exec(creates[1].sql)[1];
+  assert.deepEqual(result.probeEvidence, [{
+    databaseId: indexMigration.options['database-id'],
+    tables: [ownedName, 'unrelated_user_table'], unrelatedValues: ['untouched'],
+  }], 'the failed final DROP leaves the real owned probe, not unrelated SQLite state');
+  assert.deepEqual(result.events.filter((event) => event.kind === 'probe-cleanup-fault'), [{
+    kind: 'probe-cleanup-fault', databaseId: indexMigration.options['database-id'], sql: `DROP TABLE "${ownedName}"`,
+  }], 'final owned cleanup is attempted exactly once without replay');
+  assert.equal(sql.filter((event) => event.sql.startsWith('DROP TABLE')).length, 1,
+    'only the positive control DROP succeeds');
+  assert.deepEqual(result.databases.filter((database) => !database.uuid.startsWith('created-')), foreign);
+  assert.equal(databaseDeletes(result).length, 0);
+  assert.equal(result.events.filter((event) => event.kind === 'migrate').length, 3);
+  assert.ok(!result.events.some((event) => event.kind === 'deploy'
+    || event.kind === 'request' && event.body?.sql?.includes('INSERT OR REPLACE INTO model_prices')));
+  assert.ok(!result.output.includes('ATOMICITY_CLEANUP_PRIVATE_CANARY'));
+});
 
 for (const command of ['close', 'janitor']) {
   test(`${command} deletes main and both shards, preserving open or untrusted resources`, async () => {

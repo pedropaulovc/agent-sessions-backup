@@ -22,7 +22,7 @@ import {
 } from '../../infra/cf/index-control.mjs';
 import { PREVIEW_ACCOUNT_ID, PRODUCTION_ACCOUNT_ID } from '../../infra/cf/preview-trust.mjs';
 import {
-  D1_BATCH_PROBE_TEXT, d1SqlFailureReason, verifyD1BatchAtomicity as currentBatchAtomicity,
+  D1_BATCH_PROBE_TEXT, D1_SQL_FAILURE_REASONS, d1SqlFailureReason, verifyD1BatchAtomicity as currentBatchAtomicity,
 } from '../../infra/cf/d1-batch-atomicity.mjs';
 import { CLOUDFLARE_REQUEST_RATE_PER_SECOND } from '../scripts/lib/cloudflare-api-budget.mjs';
 import {
@@ -2946,6 +2946,56 @@ test('the atomicity positive control detects non-atomic partial commits and remo
   assert.ok(f.trace.every((event) => event.db === db.id));
 });
 
+test('non-atomic partial commit retains its primary assertion when owned DROP fails and leaves foreign SQLite state untouched', async (context) => {
+  const canary = 'PRIVATE_ATOMICITY_CLEANUP_CANARY';
+  for (const failureKind of ['transport', 'http', 'statement', 'shape']) {
+    await context.test(failureKind, async (child) => {
+      const f = await fixture(child);
+      const db = annotateSqlProbeFailures(f.shards[0]);
+      seedBlocks(f.source, [block(32_301, 0)]);
+      seedBlocks(db, [block(32_302, 0)]);
+      const sourceBefore = blockSnapshot(f.source);
+      const indexesBefore = f.shards.map(blockSnapshot);
+      const sentinel = '__index_batch_probe_user_owned_cleanup_sentinel';
+      db.database.exec(`CREATE TABLE ${quoted(sentinel)} (value TEXT NOT NULL)`);
+      db.database.prepare(`INSERT INTO ${quoted(sentinel)} VALUES (?)`).run('keep foreign probe-like table');
+      db.atomicBatch = false;
+      let drops = 0;
+      db.beforeQuery = ({ sql }) => {
+        if (!/^DROP TABLE "__index_batch_probe_[0-9a-f]+"$/.test(sql)) return;
+        if (++drops === 2) {
+          throw Object.assign(new Error(canary), { d1FailureKind: failureKind, cause: new Error(canary) });
+        }
+      };
+      await assert.rejects(verifyD1BatchAtomicity(db), (error) => {
+        assert.equal(error.d1AtomicityPhase, 'rollback-negative');
+        assert.equal(error.d1AtomicityFailure, 'assertion');
+        assert.equal(error.d1AtomicityCleanupFailure, failureKind);
+        assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+        assert.equal(error.cause, undefined);
+        return true;
+      });
+      assert.equal(drops, 2, 'the positive control drops once; final cleanup attempts the retained owned table once');
+      const owned = probeTables(db).filter(({ name }) => name !== sentinel);
+      assert.equal(owned.length, 1, 'the failed DROP must leave the genuinely partially committed probe');
+      assert.deepEqual(db.rows(`SELECT id, value FROM ${quoted(owned[0].name)}`),
+        [{ id: 1, value: D1_BATCH_PROBE_TEXT }]);
+      assert.deepEqual(db.rows(`SELECT * FROM ${quoted(sentinel)}`), [{ value: 'keep foreign probe-like table' }]);
+      assert.deepEqual(blockSnapshot(f.source), sourceBefore);
+      assert.deepEqual(f.shards.map(blockSnapshot), indexesBefore);
+      assert.deepEqual(sourceWrites(f), []);
+      assert.ok(f.trace.every((event) => event.db === db.id));
+      const batches = f.trace.filter((event) => event.kind === 'batch');
+      assert.equal(batches.length, 2);
+      assert.equal(batches[0].committed, true);
+      assert.equal(batches[1].atomic, false);
+      assert.equal(batches[1].committed, false);
+      assert.ok(f.trace.some((event) => event.kind === 'batch-statement' && event.transaction === batches[1].transaction
+        && /^INSERT INTO/.test(event.sql) && event.success), 'SQLite must commit the insert before the intentional SQL failure');
+    });
+  }
+});
+
 test('auth/network and unclassified rejection reasons cannot masquerade as atomicity proof', async (context) => {
   for (const reason of ['auth', 'network', 'unclassified']) {
     await context.test(reason, async (child) => {
@@ -3019,6 +3069,8 @@ test('atomicity probe refuses an already-owned random name without deleting or m
 });
 
 test('D1 SQL failure classification exposes only safe reason enums and leaves absent or conflicting tokens unknown', () => {
+  assert.equal(Object.isFrozen(D1_SQL_FAILURE_REASONS), true);
+  assert.throws(() => D1_SQL_FAILURE_REASONS.push('not-a-native-reason'), TypeError);
   for (const errors of [
     ['malformed JSON'], [{ message: 'D1_ERROR: malformed JSON: SQLITE_ERROR', code: 7500 }],
     [{ message: 'MALFORMED json in intentional SQL probe' }],
@@ -3051,7 +3103,11 @@ test('D1 SQL failure classification exposes only safe reason enums and leaves ab
     ['D1 DB is overloaded. Requests queued for too long.', 'overloaded'],
     ["D1 DB's isolate exceeded its memory limit and was reset.", 'memory-limit'],
     ['D1 DB exceeded its CPU time limit and was reset.', 'cpu-limit'],
-  ]) assert.equal(d1SqlFailureReason([{ message, code: 7500 }]), reason);
+  ]) {
+    const classified = d1SqlFailureReason([{ message, code: 7500 }]);
+    assert.equal(classified, reason);
+    assert.ok(D1_SQL_FAILURE_REASONS.includes(classified), 'every recognized native token must survive diagnostic allowlisting');
+  }
   assert.equal(d1SqlFailureReason([{ code: 7500 }]), 'other');
   assert.equal(d1SqlFailureReason(['database or disk is full; malformed JSON']), 'other');
   assert.equal(d1SqlFailureReason(['index_migration_frozen; malformed JSON']), 'other');
@@ -3914,23 +3970,151 @@ test('native proof preserves copier assertion identity from real schema, FTS and
   }
 });
 
+test('shared copier transport invariants preserve source and destination readback phases across real SQLite pages', async (context) => {
+  const canary = 'PRIVATE_PHASE_TRANSPORT_CANARY';
+  for (const side of ['source-initial', 'source-pending', 'destination']) {
+    for (const invariant of ['row-identity', 'long-column', 'long-length', 'long-slice', 'long-utf8', 'value', 'number']) {
+      await context.test(`${side} ${invariant}`, async (child) => {
+        const f = await fixture(child);
+        const original = block(61_001, 0, { text: `\ufeff${canary} ${'α😀'.repeat(30_000)}\u0000suffix` });
+        seedBlocks(f.source, [original]);
+        const before = blockSnapshot(f.source);
+        const db = side === 'destination' ? f.shards[0] : f.source;
+        const marker = `__long_${BLOCK_COLUMNS.indexOf('text')}`;
+        let fullReads = 0;
+        let exercised = 0;
+        db.transformQuery = ({ sql }, rows) => {
+          const fullRow = /^\s*WITH sized AS MATERIALIZED/.test(sql);
+          const slice = /^\s*SELECT hex\(substr/.test(sql);
+          if (fullRow) fullReads += 1;
+          if (exercised || side === 'source-pending' && fullReads < 2) return rows;
+          if (['long-slice', 'long-utf8'].includes(invariant)) {
+            if (!slice) return rows;
+            assert.equal(rows.length, 1);
+            assert.ok(rows[0].bytes.length > 2, 'the fault must alter a real nonempty SQLite BLOB slice');
+            exercised += 1;
+            return [{ bytes: invariant === 'long-slice' ? rows[0].bytes.slice(0, -2) : `FF${rows[0].bytes.slice(2)}` }];
+          }
+          if (!fullRow) return rows;
+          assert.equal(rows.length, 1);
+          assert.equal(rows[0].id, original.id);
+          assert.equal(rows[0][marker], Buffer.byteLength(original.text));
+          exercised += 1;
+          if (invariant === 'row-identity') return [...rows, { ...rows[0] }];
+          if (invariant === 'long-column') delete rows[0][marker];
+          if (invariant === 'long-length') rows[0][marker] = 0;
+          if (invariant === 'value') rows[0].tool_name = true;
+          if (invariant === 'number') rows[0].row_hash = Number.MAX_SAFE_INTEGER + 1;
+          return rows;
+        };
+        await assert.rejects(copyWithNativeParameters(f.args()), (error) => {
+          assert.equal(error.code, invariant);
+          assert.equal(error.d1Phase, side === 'destination' ? 'copy-page-readback' : 'copy-source-page-read');
+          assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+          assert.equal(error.cause, undefined);
+          return true;
+        });
+        assert.equal(exercised, 1, 'the requested genuine readback boundary must reach the corruption');
+        assert.deepEqual(blockSnapshot(f.source), before, 'an invariant rejection cannot authorize source deletion or FTS mutation');
+        assert.deepEqual(sourceWrites(f), []);
+        assert.deepEqual(f.shards[1].rows('SELECT * FROM blocks'), []);
+        const state = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+        assert.equal(state.rows, 0);
+        assert.equal(state.pending?.phase ?? null, side === 'source-initial' ? null : 'copying');
+        assert.deepEqual(f.shards[0].rows('SELECT * FROM blocks'), side === 'destination' ? [original] : []);
+      });
+    }
+  }
+});
+
+test('native proof preserves source-versus-readback phase for real copier scalar and long-slice rejection', async (context) => {
+  for (const side of ['source', 'destination']) {
+    for (const invariant of ['value', 'long-slice']) {
+      await context.test(`${side} ${invariant}`, async (child) => {
+        const { account, adapters, proof } = await nativeScratchFixture(child);
+        const before = account.snapshot();
+        let exercised = 0;
+        const applySchema = proof.applySchema;
+        proof.applySchema = async (databases) => {
+          await applySchema(databases);
+          const db = side === 'source' ? databases.source : databases.shards[invariant === 'value' ? 0 : 1];
+          db.transformQuery = ({ sql }, rows) => {
+            if (exercised) return rows;
+            if (invariant === 'value' && /^\s*WITH sized AS MATERIALIZED/.test(sql)) {
+              assert.equal(rows.length, 1);
+              exercised += 1;
+              rows[0].tool_name = { private: 'PRIVATE_NATIVE_PHASE_CANARY' };
+            } else if (invariant === 'long-slice' && /^\s*SELECT hex\(substr/.test(sql)) {
+              // Seed readback uses the same hex transport. Arm only after the
+              // actual copier has written its durable checkpoint, never during seed.
+              const checkpoint = databases.shards[0].rows(
+                'SELECT value FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT],
+              )[0];
+              if (!checkpoint) return rows;
+              const state = JSON.parse(checkpoint.value);
+              assert.equal(state.identity.source, databases.source.id);
+              assert.equal(state.state, 'pending');
+              assert.equal(rows.length, 1);
+              assert.ok(rows[0].bytes.length > 2);
+              exercised += 1;
+              rows[0].bytes = rows[0].bytes.slice(0, -2);
+            }
+            return rows;
+          };
+        };
+        await assert.rejects(verifyNativeCopyControl(proof), (error) => {
+          assert.equal(error.nativeCopyPhase, side === 'source' ? 'copy-source-page-read' : 'copy-page-readback');
+          assert.equal(error.nativeCopyClass, 'assertion');
+          assert.equal(error.nativeCopyInvariant, invariant);
+          assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes('PRIVATE_NATIVE_PHASE_CANARY'));
+          assert.equal(error.cause, undefined);
+          return true;
+        });
+        assert.equal(exercised, 1);
+        const retained = adapters[0].rows('SELECT id FROM blocks ORDER BY id');
+        assert.deepEqual(retained, invariant === 'value' ? [{ id: 0 }, { id: INDEX_ID_SPAN - 1 }] : [{ id: INDEX_ID_SPAN - 1 }],
+          'the rejected page remains authoritative even if an earlier ordinary page was verified and retired');
+        assert.deepEqual(account.snapshot(), before);
+        assert.deepEqual(new Set(account.deleted.map(({ uuid }) => uuid)), new Set(account.created.map(({ uuid }) => uuid)));
+      });
+    }
+  }
+});
+
 test('real HTTP D1 failures distinguish transport, HTTP, statement and shape without retry or status spoofing', async (context) => {
   const canary = 'PRIVATE_HTTP_FAILURE_CANARY';
   const id = '95dbde60-d5ab-4e2c-989f-fcd44a3ab479';
   const originalFetch = globalThis.fetch;
   let scenario;
   const requests = [];
+  let bodyDropResponse;
   const server = createServer(async (request, response) => {
     const chunks = [];
     for await (const chunk of request) chunks.push(chunk);
     requests.push({ body: JSON.parse(Buffer.concat(chunks).toString('utf8')), scenario });
     if (scenario.transport) { request.socket.destroy(); return; }
-    response.writeHead(scenario.status ?? 200, { 'content-type': 'application/json' });
+    response.writeHead(scenario.status ?? 200, {
+      'content-type': 'application/json',
+      ...(scenario.retryAfter === undefined ? {} : { 'retry-after': scenario.retryAfter }),
+    });
+    if (scenario.bodyTransport) {
+      bodyDropResponse = response;
+      response.write(canary);
+      response.flushHeaders();
+      return;
+    }
     response.end(scenario.raw ?? JSON.stringify(scenario.envelope));
   });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const endpoint = `http://127.0.0.1:${server.address().port}`;
-  globalThis.fetch = (url, init) => originalFetch(`${endpoint}${new URL(url).pathname}`, init);
+  globalThis.fetch = async (url, init) => {
+    const response = await originalFetch(`${endpoint}${new URL(url).pathname}`, init);
+    if (scenario.bodyTransport) {
+      assert.equal(response.status, scenario.status ?? 200, 'actual headers must arrive before the server drops the body');
+      bodyDropResponse.destroy();
+    }
+    return response;
+  };
   context.after(async () => {
     globalThis.fetch = originalFetch;
     server.closeAllConnections();
@@ -3938,6 +4122,11 @@ test('real HTTP D1 failures distinguish transport, HTTP, statement and shape wit
   });
   const scenarios = [
     { transport: true, failure: 'transport', http: 'unknown' },
+    { bodyTransport: true, failure: 'transport', http: 200 },
+    { bodyTransport: true, status: 503, failure: 'transport', http: 503 },
+    ...[undefined, 'invalid', '0', '1.5', '3601'].map((retryAfter) => ({
+      status: 429, retryAfter, raw: canary, failure: 'http', http: 429,
+    })),
     { status: 503, envelope: { success: false, errors: [{ message: canary }] }, failure: 'http', http: 503 },
     { status: 502, raw: canary, failure: 'http', http: 502 },
     { envelope: { success: false, errors: [{ message: canary }] }, failure: 'statement', http: 200 },
@@ -3951,20 +4140,161 @@ test('real HTTP D1 failures distinguish transport, HTTP, statement and shape wit
     { envelope: { success: true, result: [{ success: true, results: [] }, { success: true, results: [] }] }, failure: 'shape', http: 200 },
     { envelope: { success: true, actualHTTPstatus: 599, result: [{ success: false, error: canary }] }, failure: 'statement', http: 200 },
   ];
-  for (scenario of scenarios) {
-    const before = requests.length;
-    const db = diagnosticClient(PREVIEW_ACCOUNT_ID, 'private-token', { permit: async () => {},
-      wait: async () => assert.fail('these terminal errors must not retry') }).db(id);
-    await assert.rejects(db.query(canary, [canary]), (error) => {
-      assert.equal(error.d1FailureKind, scenario.failure);
-      assert.equal(error.d1SqlReason, 'other', 'private/unrecognized provider text cannot invent a native class');
-      assert.ok(error.message.includes(`failure=${scenario.failure}`));
-      assert.ok(error.message.includes(`HTTP=${scenario.http}`));
-      assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
-      assert.equal(error.cause, undefined);
-      return true;
+  for (const [index, selected] of scenarios.entries()) {
+    await context.test(`${index}: ${selected.bodyTransport ? 'body-drop ' : ''}${selected.failure} HTTP=${selected.http}`, async () => {
+      scenario = selected;
+      const before = requests.length;
+      const db = diagnosticClient(PREVIEW_ACCOUNT_ID, 'private-token', { permit: async () => {},
+        wait: async () => assert.fail('these terminal errors must not retry') }).db(id);
+      await assert.rejects(db.query(canary, [canary]), (error) => {
+        assert.equal(error.d1FailureKind, scenario.failure);
+        assert.equal(error.d1SqlReason, 'other', 'private/unrecognized provider text cannot invent a native class');
+        assert.ok(error.message.includes(`failure=${scenario.failure}`));
+        assert.ok(error.message.includes(`HTTP=${scenario.http}`));
+        assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+        assert.equal(error.cause, undefined);
+        return true;
+      });
+      assert.equal(requests.length - before, 1, 'no ambiguous operation may be replayed');
+      assert.deepEqual(requests.at(-1).body, { sql: canary, params: [canary] });
     });
-    assert.equal(requests.length - before, 1, 'no ambiguous operation may be replayed');
-    assert.deepEqual(requests.at(-1).body, { sql: canary, params: [canary] });
+  }
+});
+
+test('real HTTP scratch inventory, create, identity and cleanup failures retain allowlisted client kinds without replay or foreign mutation', async (context) => {
+  const canary = 'PRIVATE_SCRATCH_HTTP_CANARY';
+  const token = 'private-scratch-token';
+  const originalFetch = globalThis.fetch;
+  let arm;
+  let resources;
+  let created;
+  let deleted;
+  let faultReached;
+  let bodyDropResponse;
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    assert.equal(request.headers.authorization, `Bearer ${token}`);
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const pathname = new URL(request.url, 'http://scratch.fixture').pathname;
+    const target = pathname.slice(`/client/v4/accounts/${PREVIEW_ACCOUNT_ID}/d1/database`.length);
+    const uuid = target.split('/')[1];
+    const operation = target.endsWith('/query') ? 'query'
+      : !target ? request.method === 'POST' ? 'create' : 'inventory'
+        : request.method === 'DELETE' ? 'delete' : 'identity';
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : null;
+    requests.push({ operation, uuid, body });
+    if (operation === 'query') {
+      assert.ok(arm.secondaryCleanup && resources.has(uuid));
+      assert.deepEqual(body, { sql: canary, params: [canary] });
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ success: false, errors: [{ message: `SQLITE_FULL ${canary}` }] }));
+      return;
+    }
+    if (!faultReached && operation === arm.operation
+      && (!['identity', 'delete'].includes(operation) || uuid === 'scratch-http-1')) {
+      faultReached = true;
+      if (arm.failure === 'transport' && !arm.bodyTransport) { request.socket.destroy(); return; }
+      response.writeHead(arm.status ?? 200, { 'content-type': 'application/json' });
+      if (arm.bodyTransport) {
+        bodyDropResponse = response;
+        response.write(canary);
+        response.flushHeaders();
+      } else {
+        response.end(arm.failure === 'shape' ? canary
+          : JSON.stringify({ success: false, actualHTTPstatus: 599, errors: [{ message: canary }] }));
+      }
+      return;
+    }
+    let result;
+    if (operation === 'inventory') result = [...resources.values()];
+    else if (operation === 'create') {
+      const database = { uuid: `scratch-http-${created.length + 1}`, name: body.name };
+      assert.ok(scratchNames.includes(database.name));
+      resources.set(database.uuid, database);
+      created.push(database);
+      result = database;
+    } else if (operation === 'identity') {
+      assert.ok(resources.has(uuid));
+      result = resources.get(uuid);
+    } else {
+      assert.equal(operation, 'delete');
+      assert.ok(created.some((database) => database.uuid === uuid), 'only identities actually returned by this invocation may be deleted');
+      assert.ok(resources.delete(uuid));
+      deleted.push(uuid);
+      result = {};
+    }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ success: true, result, ...(operation === 'inventory'
+      ? { result_info: { total_count: result.length } } : {}) }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const endpoint = `http://127.0.0.1:${server.address().port}`;
+  globalThis.fetch = async (url, init) => {
+    const response = await originalFetch(`${endpoint}${new URL(url).pathname}`, init);
+    if (bodyDropResponse) {
+      assert.equal(response.status, 200, 'body transport loss must follow actual HTTP headers');
+      bodyDropResponse.destroy();
+      bodyDropResponse = null;
+    }
+    return response;
+  };
+  context.after(async () => {
+    globalThis.fetch = originalFetch;
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  for (const operation of ['inventory', 'create', 'identity', 'delete', 'secondary-delete']) {
+    for (const fault of [
+      { failure: 'transport' }, { failure: 'transport', bodyTransport: true },
+      { failure: 'http', status: 403 }, { failure: 'http', status: 404 },
+      { failure: 'http', status: 429 }, { failure: 'statement' }, { failure: 'shape' },
+    ]) {
+      await context.test(`${operation} ${fault.failure} ${fault.status ?? (fault.bodyTransport ? 'body' : '')}`, async () => {
+        arm = { ...fault, operation: operation === 'secondary-delete' ? 'delete' : operation,
+          secondaryCleanup: operation === 'secondary-delete' };
+        resources = new Map(standingScratchResources().map((database) => [database.uuid, database]));
+        const before = [...resources.values()];
+        created = [];
+        deleted = [];
+        faultReached = false;
+        requests.length = 0;
+        let entered = false;
+        const api = diagnosticClient(PREVIEW_ACCOUNT_ID, token, {
+          permit: async () => {}, wait: async () => assert.fail('terminal CF failures must not retry'),
+        });
+        await assert.rejects(withScratchD1Databases({ api, pr: 42, nonce: scratchNonce, run: async ({ source }) => {
+          entered = true;
+          if (arm.secondaryCleanup) await source.query(canary, [canary]);
+          return 'successful work';
+        } }), (error) => {
+          assert.equal(error.nativeCopyPhase, arm.secondaryCleanup ? 'control'
+            : { inventory: 'preflight', create: 'create', identity: 'identity', delete: 'cleanup' }[arm.operation]);
+          assert.equal(error.nativeCopyClass, arm.secondaryCleanup ? 'capacity' : 'other',
+            'HTTP 404 is not an inventory-shape error, empty inventory or successful deletion');
+          assert.equal(error.nativeCopyFailureKind, arm.secondaryCleanup ? 'statement' : arm.failure);
+          if (arm.secondaryCleanup) {
+            assert.equal(error.nativeCopyCleanup, 'failed');
+            assert.equal(error.nativeCopyCleanupClass, 'other');
+            assert.equal(error.nativeCopyCleanupFailureKind, arm.failure);
+            assert.ok(error.message.includes(`cleanupFailure=${arm.failure}`));
+          }
+          assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+          assert.equal(error.cause, undefined);
+          return true;
+        });
+        assert.equal(faultReached, true);
+        assert.equal(entered, arm.operation === 'delete');
+        assert.equal(requests.filter((request) => request.operation === arm.operation).length,
+          arm.operation === 'identity' ? 4 : arm.operation === 'delete' ? 3 : 1,
+          'one terminal failure is not replayed; separate safe cleanup still visits each owned identity');
+        assert.equal(requests.filter((request) => request.operation === 'create').length,
+          arm.operation === 'inventory' ? 0 : arm.operation === 'create' ? 1 : 3);
+        assert.deepEqual(deleted, arm.operation === 'identity' ? created.map(({ uuid }) => uuid)
+          : arm.operation === 'delete' ? created.slice(1).map(({ uuid }) => uuid) : []);
+        assert.deepEqual([...resources.values()], arm.operation === 'delete' ? [...before, created[0]] : before,
+          'failed/refused cleanup may leave only its known owned database; every standing and foreign identity remains unchanged');
+      });
+    }
   }
 });
