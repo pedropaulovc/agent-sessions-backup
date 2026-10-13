@@ -174,12 +174,12 @@
     {
       "sequence": 35,
       "filename": "0035_drop_legacy_blocks.sql",
-      "sha256": "76115d41733ed088e6592206f330b6e5425a9039816d30a1a015011c79343a6d"
+      "sha256": "4f1c4e6f4eb50c5a506ea217d7052f7c03c6d05bf622dff40b697e9a537187a7"
     },
     {
       "sequence": 36,
       "filename": "0036_session_catalog_outbox.sql",
-      "sha256": "ad3e06db2ac927a60004d9876f2ffd84a7e2d53c585f1df969401f361f083958"
+      "sha256": "3c376115b8a39de21d316b40b729a0810f2ab298f9e6d0b4ae15e9a5bde9f7f0"
     }
   ]
 }

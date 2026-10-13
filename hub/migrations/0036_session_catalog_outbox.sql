@@ -48,7 +48,40 @@ CREATE TRIGGER session_catalog_sessions_insert AFTER INSERT ON sessions BEGIN
    WHERE NOT EXISTS (SELECT 1 FROM session_catalog_versions WHERE session_id = NEW.session_id);
 END;
 
-CREATE TRIGGER session_catalog_sessions_update AFTER UPDATE ON sessions BEGIN
+-- Pricing refreshes also match rows whose stored totals did not change. Only a changed catalog
+-- value needs replication; IS NOT compares native SQLite values and includes NULL transitions.
+-- Keep this predicate complete with SESSION_CATALOG_COLUMNS in src/index-layout.mjs.
+CREATE TRIGGER session_catalog_sessions_update AFTER UPDATE ON sessions
+WHEN OLD.session_id IS NOT NEW.session_id
+  OR OLD.harness IS NOT NEW.harness
+  OR OLD.machine_id IS NOT NEW.machine_id
+  OR OLD.os IS NOT NEW.os
+  OR OLD.canonical_file_id IS NOT NEW.canonical_file_id
+  OR OLD.cwd IS NOT NEW.cwd
+  OR OLD.repo_url IS NOT NEW.repo_url
+  OR OLD.git_branch IS NOT NEW.git_branch
+  OR OLD.models IS NOT NEW.models
+  OR OLD.primary_model IS NOT NEW.primary_model
+  OR OLD.title IS NOT NEW.title
+  OR OLD.started_at IS NOT NEW.started_at
+  OR OLD.ended_at IS NOT NEW.ended_at
+  OR OLD.parent_session_id IS NOT NEW.parent_session_id
+  OR OLD.parent_tool_use_id IS NOT NEW.parent_tool_use_id
+  OR OLD.is_sidechain IS NOT NEW.is_sidechain
+  OR OLD.turn_count IS NOT NEW.turn_count
+  OR OLD.block_count IS NOT NEW.block_count
+  OR OLD.tokens_in IS NOT NEW.tokens_in
+  OR OLD.tokens_out IS NOT NEW.tokens_out
+  OR OLD.tokens_reasoning IS NOT NEW.tokens_reasoning
+  OR OLD.tokens_cached IS NOT NEW.tokens_cached
+  OR OLD.index_state IS NOT NEW.index_state
+  OR OLD.updated_at IS NOT NEW.updated_at
+  OR OLD.project_name IS NOT NEW.project_name
+  OR OLD.first_interaction_title IS NOT NEW.first_interaction_title
+  OR OLD.cost_usd IS NOT NEW.cost_usd
+  OR OLD.cost_calls IS NOT NEW.cost_calls
+  OR OLD.cost_priced_calls IS NOT NEW.cost_priced_calls
+BEGIN
   INSERT INTO session_catalog_outbox (session_id) VALUES (NEW.session_id);
   UPDATE session_catalog_versions SET version = (SELECT max(seq) FROM session_catalog_outbox)
    WHERE session_id = NEW.session_id;

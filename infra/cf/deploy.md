@@ -62,6 +62,11 @@ names. Generated configurations set `INDEX_SHARD_COUNT='2'`, `INDEX_MODE='active
 `DEPLOYMENT_REVISION` to the full PR head SHA. Count, binding order, hash layout, and database
 names are immutable: provision validates both deployed bindings and persisted layout before
 reusing resources. There is no fallback index in `DB`.
+An existing Worker with a missing database is reset only after its recorded topology
+has been validated. Surviving binding IDs must match trusted account resources; the
+missing binding must retain a nonempty ID that is absent from the account inventory.
+The controller validates every queue consumer owner before detaching any consumer,
+then recreates the complete topology. Foreign or malformed bindings fail before mutation.
 
 The provisioner applies and verifies migrations separately against `DB`, `IDX00`, and `IDX01`
 before deployment, each with its own database-bound journal and matching source baseline.
@@ -299,6 +304,10 @@ The one-time cutover runs these operations in order, from the same checked-out m
    `DROP TABLE blocks_fts; DROP TABLE blocks`, remove the migration-freeze control
    table, then install catalog-outbox/version triggers. There are no speculative
    shadow-table mutations or FTS-retirement shortcuts.
+   The retirement SQL also refuses a populated `blocks` table independently of workflow
+   ordering, preserving the original rows and FTS if verified copying was skipped.
+   Session-catalog update triggers enqueue only null-safe changes to mirrored values;
+   unchanged pricing refreshes do not create replication backlog or block search.
 9. `seed-catalog` reads up to 96 authoritative session/star/version snapshots per
    page, applies the same byte-bounded guarded catalog SQL builders as the Worker
    to every shard, and verifies sessions/stars/versions through one native three-query

@@ -21,7 +21,7 @@
     "test:preview-seed": "node --test test/preview-control-seed.node.test.mjs test/preview-control-deployment.node.test.mjs",
     "test:preview-smoke": "node --test test/preview-control-smoke.node.test.mjs",
     "test:provision-queues": "node --test test/provision-queues.node.test.mjs",
-    "test:migrations": "node --test test/migrations.acceptance.mjs test/index-migration.node.test.mjs",
+    "test:migrations": "node --test test/migrations.acceptance.mjs test/index-migration.node.test.mjs test/catalog-migrations.node.test.mjs",
     "test:cloudflare-api-budget": "node --test test/cloudflare-api-budget.node.test.mjs",
     "migrations": "node scripts/migrations.mjs"
   },

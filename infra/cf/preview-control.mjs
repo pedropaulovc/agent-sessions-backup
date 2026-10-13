@@ -279,7 +279,7 @@ async function ensureBackingResources(names, databasePlan) {
 }
 
 /** Validate the running source's bindings before reusing any persistent resource. */
-async function assertDeployedLayout(names, databasePlan) {
+async function assertDeployedLayout(names, databasePlan, databases, recordedLayout) {
   const settings = await cf(`workers/scripts/${encodeURIComponent(names.app)}/settings`, { allowNotFound: true });
   if (settings === null) return false;
   const bindings = settings.bindings ?? [];
@@ -293,10 +293,18 @@ async function assertDeployedLayout(names, databasePlan) {
   }
   const expected = previewIndexLayout(names).databases;
   if (!legacy && indexBindings.length !== expected.length - 1) fail('deployed preview has a different index binding layout');
+  if (bindings.filter((binding) => binding.type === 'd1').length !== (legacy ? 1 : expected.length)) {
+    fail('deployed preview has a different database binding layout');
+  }
   for (const { binding, name } of legacy ? expected.slice(0, 1) : expected) {
     const configured = bindings.filter((entry) => entry.name === binding);
     if (configured.length !== 1 || configured[0].type !== 'd1'
-      || configured[0].id !== databasePlan.existing.get(binding)) {
+      || (databasePlan.existing.has(binding)
+        ? configured[0].id !== databasePlan.existing.get(binding)
+        // Only a validated recorded topology can defer a missing database's ID check
+        // to its mandatory full reset. An ID still in the account is not missing.
+        : recordedLayout === null || typeof configured[0].id !== 'string'
+          || configured[0].id.length === 0 || databases.some((database) => database.uuid === configured[0].id))) {
       fail(`deployed preview ${binding} does not bind the trusted database ${name}`);
     }
   }
@@ -568,10 +576,11 @@ async function provision() {
     pagination: 'page', rowsOf: (envelope) => envelope.result,
   });
   const databasePlan = previewDatabasePlan(databases, names);
-  const legacySource = await assertDeployedLayout(names, databasePlan);
+  // Validate the persisted names before permitting a missing binding ID to defer to reset.
   const existingMain = databasePlan.existing.get('DB');
   const recordedLayout = existingMain ? await recordedPreviewLayout(existingMain) : null;
   if (recordedLayout !== null) assertPreviewIndexLayout(recordedLayout, names);
+  const legacySource = await assertDeployedLayout(names, databasePlan, databases, recordedLayout);
   if (recordedLayout !== null && legacySource) fail('deployed preview lost its immutable index layout');
   const divergences = [];
   for (let index = 0; index < databaseDefinitions.length; index += 1) {
@@ -973,16 +982,21 @@ async function seed() {
 }
 
 async function detachQueueConsumers(names) {
+  const detachments = [];
   for (const queueName of [names.queue, names.dlq, names.rollupQueue]) {
     const queueId = await resolveExistingId('queue', queueName);
     if (queueId == null) continue;
     const consumers = await cf(`queues/${encodeURIComponent(queueId)}/consumers`, { allowNotFound: true });
     for (const consumerId of queueConsumerIdsForQueue(consumers ?? [], queueName)) {
-      await cf(
-        `queues/${encodeURIComponent(queueId)}/consumers/${encodeURIComponent(consumerId)}`,
-        { method: 'DELETE', allowNotFound: true },
-      );
+      detachments.push({ queueId, consumerId });
     }
+  }
+  // Validate every queue owner before deleting even the first consumer.
+  for (const { queueId, consumerId } of detachments) {
+    await cf(
+      `queues/${encodeURIComponent(queueId)}/consumers/${encodeURIComponent(consumerId)}`,
+      { method: 'DELETE', allowNotFound: true },
+    );
   }
 }
 

@@ -188,6 +188,9 @@ async function runController(command, scenario = {}) {
         if (!url.pathname.startsWith(prefix)) throw new Error('Unexpected account ' + url.pathname);
         const target = decodeURIComponent(url.pathname.slice(prefix.length));
         if (target === 'd1/database' && method === 'GET') {
+          if (scenario.databaseListError) {
+            return Response.json({ success: false, errors: [{ message: 'permission denied' }] }, { status: 403 });
+          }
           const name = url.searchParams.get('name');
           const rows = name ? databases.filter((database) => database.name === name) : databases;
           return Response.json({ success: true, result: rows, result_info: { total_count: rows.length } });
@@ -312,6 +315,9 @@ async function runController(command, scenario = {}) {
         }
         if (target === 'workers/scripts') return response(workerExists ? [{ id: names.app }] : []);
         if (target.endsWith('/settings')) {
+          if (scenario.settingsError) {
+            return Response.json({ success: false, errors: [{ message: 'permission denied' }] }, { status: 403 });
+          }
           if (!workerExists) return missing();
           const bindings = scenario.legacy || scenario.sourceLegacy ? [{ name: 'DB', type: 'd1', id: 'existing-0' }] : [
             { name: 'INDEX_SHARD_COUNT', type: 'plain_text', text: String(scenario.sourceCount ?? 2) },
@@ -319,7 +325,7 @@ async function runController(command, scenario = {}) {
               name: binding, type: 'd1', id: scenario.foreignBinding === binding ? 'foreign-0' : 'existing-' + index,
             })),
           ];
-          return response({ bindings });
+          return response({ bindings: scenario.sourceBindings ?? bindings });
         }
         if (target.startsWith('workers/scripts/') && method === 'DELETE') {
           workerExists = false;
@@ -333,7 +339,8 @@ async function runController(command, scenario = {}) {
         if (target.startsWith('storage/kv/namespaces/')) return response({});
         if (target === 'queues') return response([names.queue, names.dlq, names.rollupQueue]
           .map((queue_name, index) => ({ queue_name, queue_id: 'queue-' + index })));
-        if (target.endsWith('/consumers')) return response([{ consumer_id: 'consumer', script_name: names.app }]);
+        if (target.endsWith('/consumers')) return response([{ consumer_id: 'consumer',
+          script_name: scenario.foreignOwnerQueue === target.split('/')[1] ? 'pr-151-app' : names.app }]);
         if (target.startsWith('queues/')) return response({});
         throw new Error('Unexpected request ' + method + ' ' + target);
       };
@@ -346,7 +353,7 @@ async function runController(command, scenario = {}) {
       ...(command === 'janitor' ? [] : ['--pr', String(PR)]), ...args,
     ], {
       encoding: 'utf8', timeout: 10_000,
-      env: { ...process.env, CLOUDFLARE_PPE_ACCOUNT_ID: PREVIEW_ACCOUNT_ID,
+      env: { ...process.env, CLOUDFLARE_PPE_ACCOUNT_ID: scenario.accountId ?? PREVIEW_ACCOUNT_ID,
         CLOUDFLARE_PPE_API_TOKEN: 'synthetic-cloudflare-token', PREVIEW_BEARER_SEED: SEED,
         GITHUB_TOKEN: 'synthetic-github-token' },
     });
@@ -558,7 +565,7 @@ for (const [name, scenario, error] of [
 }
 
 for (const scenario of [{ edited: 'IDX01' }, { removed: 'IDX00' }, { unproven: 'DB' }, { legacy: true },
-  { partial: true, missingWorker: true }]) {
+  { partial: true }, { partial: true, missingWorker: true }]) {
   test(`divergence ${JSON.stringify(scenario)} quiesces and resets all three databases coherently`, async () => {
     const result = await runController('provision', { existing: true, foreignCount: 1, ...scenario });
     assert.equal(result.status, 0, result.output);
@@ -568,19 +575,84 @@ for (const scenario of [{ edited: 'IDX01' }, { removed: 'IDX00' }, { unproven: '
     assert.deepEqual(deletes.map((event) => new URL(event.url).pathname.split('/').at(-1)), expectedDeletedIds);
     const stopWorker = result.events.find((event) => event.kind === 'request' && event.method === 'DELETE'
       && new URL(event.url).pathname.endsWith('/workers/scripts/pr-150-app'));
+    assert.ok(stopWorker, 'the deployed source must be quiesced before its databases are reset');
     assert.ok(result.events.indexOf(stopWorker) < result.events.indexOf(deletes[0]));
     const emptyObject = result.events.find((event) => event.kind === 'request' && event.method === 'DELETE'
       && event.url.includes('/objects/'));
     const creates = result.events.filter((event) => event.kind === 'request' && event.method === 'POST'
       && new URL(event.url).pathname.endsWith('/d1/database'));
     assert.equal(creates.length, 3);
+    const detachments = result.events.filter((event) => event.kind === 'request' && event.method === 'DELETE'
+      && /\/consumers\/[^/]+$/.test(new URL(event.url).pathname));
+    assert.equal(detachments.length, 3);
+    assert.ok(detachments.every((event) => result.events.indexOf(event) < result.events.indexOf(stopWorker)));
     assert.ok(result.events.indexOf(emptyObject) < result.events.indexOf(creates[0]));
     assert.ok(result.events.indexOf(emptyObject) < result.events.indexOf(deletes[0]),
       'R2 must be empty before an interrupted reset could leave no database evidence');
     assert.ok(result.databases.some((database) => database.uuid === 'foreign-0'));
-    assert.equal(JSON.parse(result.stdout.trim().split('\n').at(-1)).d1Reset, true);
-    assert.deepEqual(result.events.filter((event) => event.kind === 'migrate').map((event) => event.options['database-id']),
+    const summary = JSON.parse(result.stdout.trim().split('\n').at(-1));
+    assert.equal(summary.d1Reset, true);
+    const migrations = result.events.filter((event) => event.kind === 'migrate');
+    assert.deepEqual(migrations.map((event) => [event.options.database, event.options['database-id']]),
+      [['DB', 'created-1'], ['IDX00', 'created-2'], ['IDX01', 'created-3']]);
+    assert.ok(result.events.indexOf(deletes.at(-1)) < result.events.indexOf(creates[0]));
+    assert.ok(result.events.indexOf(creates.at(-1)) < result.events.indexOf(migrations[0]));
+    const batchRequests = result.events.filter((event) => event.kind === 'request' && event.body?.batch);
+    assert.equal(batchRequests.length, 2);
+    assert.ok(result.events.indexOf(migrations.at(-1)) < result.events.indexOf(batchRequests[0]));
+    assert.equal(summary.indexBatchAtomicity.state, 'verified');
+    assert.equal(summary.indexBatchAtomicity.databaseId, 'created-2');
+    const prices = result.events.find((event) => event.kind === 'request'
+      && event.body?.sql?.includes('INSERT OR REPLACE INTO model_prices'));
+    const deploy = result.events.find((event) => event.kind === 'deploy');
+    assert.ok(prices);
+    assert.ok(deploy);
+    assert.ok(result.events.indexOf(batchRequests.at(-1)) < result.events.indexOf(prices));
+    assert.ok(result.events.indexOf(prices) < result.events.indexOf(deploy));
+    assert.deepEqual(deploy.config.d1_databases.map((database) => database.database_id),
       ['created-1', 'created-2', 'created-3']);
+  });
+}
+
+const deployedBindings = [
+  { name: 'INDEX_SHARD_COUNT', type: 'plain_text', text: String(LAYOUT.count) },
+  ...LAYOUT.databases.map(({ binding }, index) => ({ name: binding, type: 'd1', id: `existing-${index}` })),
+];
+
+for (const [name, scenario, error] of [
+  ['missing shard bound to a foreign database', { foreignBinding: 'IDX01' }, /IDX01 does not bind the trusted database/],
+  ['missing shard bound to another trusted database', { sourceBindings: deployedBindings.map((binding) =>
+    binding.name === 'IDX01' ? { ...binding, id: 'existing-1' } : binding) }, /IDX01 does not bind the trusted database/],
+  ['wrong surviving database ID', { foreignBinding: 'IDX00' }, /IDX00 does not bind the trusted database/],
+  ['unrelated D1 binding', { sourceBindings: [...deployedBindings,
+    { name: 'OTHER_DB', type: 'd1', id: 'foreign-0' }] }, /different database binding layout/],
+  ['renamed shard binding', { sourceBindings: deployedBindings.map((binding) =>
+    binding.name === 'IDX01' ? { ...binding, name: 'IDX02' } : binding) }, /IDX01 does not bind the trusted database/],
+  ['duplicate shard binding', { sourceBindings: [...deployedBindings,
+    { name: 'IDX01', type: 'd1', id: 'existing-2' }] }, /different index binding layout/],
+  ['wrong shard binding type', { sourceBindings: deployedBindings.map((binding) =>
+    binding.name === 'IDX01' ? { ...binding, type: 'plain_text' } : binding) }, /different database binding layout/],
+  ['empty missing database ID', { sourceBindings: deployedBindings.map((binding) =>
+    binding.name === 'IDX01' ? { ...binding, id: '' } : binding) }, /IDX01 does not bind the trusted database/],
+  ['wrong deployed count', { sourceCount: 16 }, /deployed preview index count is immutable/],
+  ['wrong recorded count', { recordedLayout: { ...LAYOUT, count: 16 } }, /count\/name layout is immutable/],
+  ['unapproved account', { accountId: 'f'.repeat(32) }, /refusing unapproved Cloudflare account/],
+  ['wrong recorded names', { recordedLayout: { ...LAYOUT, databases: LAYOUT.databases.map((database, index) =>
+    index === 2 ? { ...database, name: 'pr-151-sessions-index-idx01' } : database) } }, /count\/name layout is immutable/],
+  ['foreign owner on the last queue', { foreignOwnerQueue: 'queue-2' }, /foreign queue consumer rejected/],
+  ['foreign owner on the last queue without a Worker', { foreignOwnerQueue: 'queue-2', missingWorker: true }, /foreign queue consumer rejected/],
+  ['database listing permission failure', { databaseListError: true }, /permission denied/],
+  ['Worker settings permission failure', { settingsError: true }, /permission denied/],
+  ['recorded layout query permission failure', { queryError: 'DB' }, /permission denied/],
+  ['surviving shard query permission failure', { queryError: 'IDX00' }, /permission denied/],
+]) {
+  test(`an incomplete deployed topology refuses ${name} before any mutation`, async () => {
+    const result = await runController('provision', { existing: true, partial: true, foreignCount: 1, ...scenario });
+    assert.notEqual(result.status, 0, result.output);
+    assert.match(result.output, error);
+    assert.equal(mutations(result).length, 0);
+    assert.deepEqual(result.databases.map((database) => database.uuid), ['foreign-0', 'existing-0', 'existing-1']);
+    assert.ok(!result.events.some((event) => event.kind === 'migrate' || event.kind === 'deploy'));
   });
 }
 
