@@ -65,8 +65,8 @@ reusing resources. There is no fallback index in `DB`.
 An existing Worker with a missing database is reset only after its recorded topology
 has been validated. Surviving binding IDs must match trusted account resources; the
 missing binding must retain a nonempty ID that is absent from the account inventory.
-The controller validates every queue consumer owner before detaching any consumer,
-then recreates the complete topology. Foreign or malformed bindings fail before mutation.
+During topology reset, the controller validates the owned queues' consumer identities before
+detaching them, then recreates the complete topology. Foreign or malformed bindings fail before mutation.
 
 The provisioner applies and verifies migrations separately against `DB`, `IDX00`, and `IDX01`
 before deployment, each with its own database-bound journal and matching source baseline.
@@ -81,17 +81,22 @@ metadata is published, never provider SQL/error bodies or credentials.
 Fixture prices are seeded in main before deployment; synthetic sessions still upload through
 the Worker's normal file API and are verified through search, never inserted directly into shards.
 
-Queue consumer ownership remains unresolved at the native REST response boundary: the current
-Cloudflare API reference names the Worker field `script_name`, while the SDK embedded in pinned
-Wrangler 4.111.0 names it `script`. Neither establishes what the failed production GET returned.
-After deploying and verifying its own app hostname, normal PR provision logs a compact
+Native Queue consumer GETs identify a Worker owner with `script`, consistent with the SDK
+embedded in pinned Wrangler 4.111.0. Normal preview CI proved this on PR #172 at revision
+`2d6b0de` (Actions run `38460399098`, job `115515595462`, 2026-10-13): parse and rollup
+consumers reported `type: "worker"` and `script: "pr-172-app"`; `script_name` was absent,
+and the DLQ had no consumers. The public API reference's `script_name` field does not match
+that observed native GET contract. This evidence does not establish the production consumer's owner.
+
+After deploying and verifying its app hostname, normal PR provision logs a compact
 `queueConsumerIdentityReceipt` from native GETs of only that PR's known queues. It records the
-expected Worker, consumer field types, string consumer type, own property keys, and syntactically
-valid Worker-name values for both diagnostic owner fields — never consumer bodies, settings,
-headers, or credentials. Production's strict rejection includes the same schema facts before
-DELETE. These are diagnostics only: no alternate owner field is accepted, no deletion guard is
-relaxed, and the existing preview cleanup acceptance behavior is unchanged. Native GET failures
-fail provision through the existing scoped client's error path rather than reporting empty evidence.
+expected Worker, record kind, consumer field types, known consumer type (`worker`/`http_pull`), own property keys, and
+syntactically valid `script` Worker names — never consumer bodies, settings, headers, credentials,
+or consumer ID values. Production's strict rejection includes the same safe facts before DELETE
+and requires `script` to match its configured Worker; preview cleanup requires a known same-PR
+Worker and `type: "worker"`, rejecting missing or non-string owners. No alternate owner field is
+accepted. Native GET failures fail provision through the scoped client's existing error path
+rather than reporting empty evidence.
 
 **Free-account quota:** this account permits at most **10 D1 databases**. Each complete PR preview
 uses three, so at most three complete previews fit when no other databases exist. Provision

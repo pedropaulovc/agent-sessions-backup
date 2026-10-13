@@ -340,8 +340,11 @@ async function runController(command, scenario = {}) {
         if (target.startsWith('storage/kv/namespaces/')) return response({});
         if (target === 'queues') return response([names.queue, names.dlq, names.rollupQueue]
           .map((queue_name, index) => ({ queue_name, queue_id: 'queue-' + index })));
-        if (target.endsWith('/consumers')) return response([{ consumer_id: 'consumer',
-          script_name: scenario.foreignOwnerQueue === target.split('/')[1] ? 'pr-151-app' : names.app }]);
+        if (target.endsWith('/consumers') && method === 'GET') {
+          const queueId = target.split('/')[1];
+          return response(scenario.queueConsumers?.[queueId] ?? [{ consumer_id: 'consumer', type: 'worker',
+            script: scenario.foreignOwnerQueue === queueId ? 'pr-151-app' : names.app }]);
+        }
         if (target.startsWith('queues/')) return response({});
         throw new Error('Unexpected request ' + method + ' ' + target);
       };
@@ -614,6 +617,80 @@ for (const scenario of [{ edited: 'IDX01' }, { removed: 'IDX00' }, { unproven: '
       ['created-1', 'created-2', 'created-3']);
   });
 }
+
+for (const [name, consumer, error] of [
+  ['missing canonical owner', { consumer_id: 'consumer', type: 'worker' }, /foreign queue consumer rejected/],
+  ['owned alias without a canonical owner', { consumer_id: 'consumer', type: 'worker', script_name: NAMES.app },
+    /foreign queue consumer rejected/],
+  ['null owner', { consumer_id: 'consumer', type: 'worker', script: null, script_name: NAMES.app },
+    /foreign queue consumer rejected/],
+  ['non-string owner', { consumer_id: 'consumer', type: 'worker', script: 42, script_name: NAMES.app },
+    /foreign queue consumer rejected/],
+  ['unknown owner', { consumer_id: 'consumer', type: 'worker', script: 'pr-150-unrecognized', script_name: NAMES.app },
+    /foreign queue consumer rejected/],
+  ['foreign canonical owner despite an owned alias', {
+    consumer_id: 'consumer', type: 'worker', script: 'pr-151-app', script_name: NAMES.app,
+  }, /foreign queue consumer rejected/],
+  ['non-worker type', { consumer_id: 'consumer', type: 'http_pull', script: NAMES.app, script_name: NAMES.app },
+    /non-worker queue consumer rejected/],
+  ['missing worker type', { consumer_id: 'consumer', script: NAMES.app, script_name: NAMES.app },
+    /non-worker queue consumer rejected/],
+  ['null worker type', { consumer_id: 'consumer', type: null, script: NAMES.app, script_name: NAMES.app },
+    /non-worker queue consumer rejected/],
+  ['non-string consumer ID', { consumer_id: 42, type: 'worker', script: NAMES.app, script_name: NAMES.app },
+    /queue consumer id is required/],
+  ['null record', null, /foreign queue consumer rejected/],
+  ['array record', [], /foreign queue consumer rejected/],
+  ['primitive record', 'private primitive consumer record', /foreign queue consumer rejected/],
+]) {
+  test(`native queue preflight rejects ${name} on the last queue before any DELETE`, async () => {
+    const result = await runController('provision', {
+      existing: true, partial: true, foreignCount: 1,
+      queueConsumers: { 'queue-2': [
+        { consumer_id: 'valid-first', type: 'worker', script: NAMES.app },
+        consumer,
+      ] },
+    });
+    assert.notEqual(result.status, 0, result.output);
+    assert.match(result.output, error);
+    assert.equal(result.events.filter((event) => event.kind === 'request' && event.method === 'GET'
+      && new URL(event.url).pathname.endsWith('/consumers')).length, 3,
+    'rejection must come from the last queue after native consumers on earlier queues were checked');
+    assert.equal(mutations(result).length, 0, 'no consumer, Worker, object or database may be deleted before full identity preflight');
+    assert.deepEqual(result.databases.map((database) => database.uuid), ['foreign-0', 'existing-0', 'existing-1']);
+    assert.ok(!result.events.some((event) => event.kind === 'migrate' || event.kind === 'deploy'));
+  });
+}
+
+test('native queue rejection diagnostics redact settings, auth, consumer IDs and malformed identity strings', async () => {
+  const privateValues = {
+    consumerId: 'private-consumer-id-value',
+    settings: 'private-unrelated-settings-value',
+    auth: 'private-auth-token-value',
+    owner: 'private invalid owner/value',
+    type: 'private malformed type/value',
+    alias: 'private invalid alias/value',
+  };
+  for (const [identity, rejection] of [
+    [{ type: 'worker', script: privateValues.owner }, /foreign queue consumer rejected/],
+    [{ type: privateValues.type, script: NAMES.app }, /non-worker queue consumer rejected/],
+  ]) {
+    const result = await runController('provision', {
+      existing: true, partial: true, missingWorker: true,
+      queueConsumers: { 'queue-2': [{
+        consumer_id: privateValues.consumerId, ...identity, script_name: privateValues.alias,
+        settings: { retry: privateValues.settings }, auth: { bearer: privateValues.auth },
+      }] },
+    });
+    assert.notEqual(result.status, 0, result.output);
+    assert.match(result.output, rejection);
+    for (const value of Object.values(privateValues)) {
+      assert.ok(!result.output.includes(value), 'rejection diagnostics must not contain private response values');
+    }
+    assert.equal(mutations(result).length, 0);
+    assert.ok(!result.events.some((event) => event.kind === 'migrate' || event.kind === 'deploy'));
+  }
+});
 
 const deployedBindings = [
   { name: 'INDEX_SHARD_COUNT', type: 'plain_text', text: String(LAYOUT.count) },

@@ -29,6 +29,8 @@ const classifyActivation = process.env.INDEX_CLASSIFICATION_MODULE_PATH
   ? (await import(process.env.INDEX_CLASSIFICATION_MODULE_PATH)).classifyIndexMigration : classifyIndexMigration;
 const copyWithNativeParameters = process.env.INDEX_COPY_MODULE_PATH
   ? (await import(process.env.INDEX_COPY_MODULE_PATH)).copyFrozenIndex : copyFrozenIndex;
+const consumerControl = process.env.INDEX_CONTROL_MODULE_PATH
+  ? await import(process.env.INDEX_CONTROL_MODULE_PATH) : { pauseConsumers };
 
 const hubRoot = path.resolve(import.meta.dirname, '..');
 const revision = 'frozen-index-revision-0123456789';
@@ -2226,14 +2228,16 @@ test('reseed and actual controller phases refuse corrupt or foreign proofs witho
   }
 });
 
-async function queueControlFixture(context, consumerOwner = 'pause-worker') {
+async function queueControlFixture(context, consumerRows = [
+  { consumer_id: 'owned-consumer', type: 'worker', script: 'pause-worker' },
+]) {
   const queues = [
     { queue_id: 'consumer-id', queue_name: 'consumer-only' },
     { queue_id: 'producer-id', queue_name: 'producer-only' },
   ];
   const consumers = new Map([
-    ['consumer-id', [{ consumer_id: 'owned-consumer', type: 'worker', script_name: consumerOwner }]],
-    ['producer-id', [{ consumer_id: 'producer-consumer', type: 'worker', script_name: 'producer-worker' }]],
+    ['consumer-id', consumerRows],
+    ['producer-id', [{ consumer_id: 'producer-consumer', type: 'worker', script: 'producer-worker' }]],
   ]);
   const requests = [];
   const server = createServer((request, response) => {
@@ -2271,7 +2275,7 @@ async function queueControlFixture(context, consumerOwner = 'pause-worker') {
   return { api, consumers, requests };
 }
 
-test('actual queue pause uses intended consumers only, deduplicates queues and refuses other owners without DELETE', async (context) => {
+test('actual queue pause uses native intended consumers only and rejects invalid identities without DELETE', async (context) => {
   const config = { name: 'pause-worker', queues: {
     consumers: [{ queue: 'consumer-only' }, { queue: 'consumer-only' }],
     producers: [{ queue: 'producer-only', binding: 'OUTGOING' }],
@@ -2279,7 +2283,7 @@ test('actual queue pause uses intended consumers only, deduplicates queues and r
   await context.test('consumer-only queue paused and producer-only queue untouched', async (child) => {
     const f = await queueControlFixture(child);
     const producerBefore = structuredClone(f.consumers.get('producer-id'));
-    assert.deepEqual(await pauseConsumers(f.api, config), { pausedConsumers: 1 });
+    assert.deepEqual(await consumerControl.pauseConsumers(f.api, config), { pausedConsumers: 1 });
     assert.deepEqual(f.consumers.get('consumer-id'), [], 'the real local DELETE must remove the intended consumer');
     assert.deepEqual(f.consumers.get('producer-id'), producerBefore);
     assert.deepEqual(f.requests.filter(({ method }) => method === 'DELETE'),
@@ -2288,10 +2292,52 @@ test('actual queue pause uses intended consumers only, deduplicates queues and r
     assert.ok(!f.requests.some(({ path }) => path.startsWith('/queues/producer-id/')),
       'a producer binding must not cause listing or pausing that queue');
   });
-  await context.test('wrong Worker owner fails before any DELETE', async (child) => {
-    const f = await queueControlFixture(child, 'other-worker');
+  await context.test('canonical script owns the consumer even when an alias disagrees', async (child) => {
+    const f = await queueControlFixture(child, [
+      { consumer_id: 'owned-consumer', type: 'worker', script: config.name, script_name: 'other-worker' },
+    ]);
+    assert.deepEqual(await consumerControl.pauseConsumers(f.api, config), { pausedConsumers: 1 });
+    assert.deepEqual(f.requests.filter(({ method }) => method === 'DELETE'),
+      [{ method: 'DELETE', path: '/queues/consumer-id/consumers/owned-consumer' }]);
+  });
+  for (const [name, consumer] of [
+    ['wrong Worker owner', { consumer_id: 'owned-consumer', type: 'worker', script: 'other-worker', script_name: config.name }],
+    ['missing canonical owner despite an owned alias', { consumer_id: 'owned-consumer', type: 'worker', script_name: config.name }],
+    ['non-string canonical owner despite an owned alias', { consumer_id: 'owned-consumer', type: 'worker', script: 42, script_name: config.name }],
+    ['non-worker type', { consumer_id: 'owned-consumer', type: 'http_pull', script: config.name, script_name: config.name }],
+    ['non-string consumer ID', { consumer_id: 42, type: 'worker', script: config.name, script_name: config.name }],
+    ['null record', null],
+    ['array record', []],
+    ['primitive record', 'private primitive consumer record'],
+  ]) {
+    await context.test(`${name} fails before any DELETE`, async (child) => {
+      const f = await queueControlFixture(child, [consumer]);
+      const before = structuredClone([...f.consumers]);
+      await assert.rejects(consumerControl.pauseConsumers(f.api, config));
+      assert.ok(!f.requests.some(({ method }) => method === 'DELETE'));
+      assert.deepEqual([...f.consumers], before);
+    });
+  }
+  await context.test('rejection diagnostics redact unrelated values and malformed identity strings', async (child) => {
+    const privateValues = {
+      consumerId: 'private-consumer-id-value',
+      settings: 'private-unrelated-settings-value',
+      auth: 'private-auth-token-value',
+      owner: 'private invalid owner/value',
+      type: 'private malformed type/value',
+      alias: 'private invalid alias/value',
+    };
+    const f = await queueControlFixture(child, [{
+      consumer_id: privateValues.consumerId, type: privateValues.type, script: privateValues.owner,
+      script_name: privateValues.alias, settings: { retry: privateValues.settings }, auth: { bearer: privateValues.auth },
+    }]);
     const before = structuredClone([...f.consumers]);
-    await assert.rejects(pauseConsumers(f.api, config), /refusing to pause another owner/);
+    await assert.rejects(consumerControl.pauseConsumers(f.api, config), (error) => {
+      for (const value of Object.values(privateValues)) {
+        assert.ok(!error.message.includes(value), 'rejection diagnostics must not contain private response values');
+      }
+      return true;
+    });
     assert.ok(!f.requests.some(({ method }) => method === 'DELETE'));
     assert.deepEqual([...f.consumers], before);
   });

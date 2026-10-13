@@ -230,18 +230,19 @@ async function health(config, mode) {
   return value;
 }
 
-/** Diagnostic schema only: neither owner field here authorizes consumer deletion. */
+/** Safe native GET schema facts only; this projection never authorizes deletion. */
 export function queueConsumerIdentityFacts(consumer) {
   const workerName = (value) => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,63}$/.test(value)
     ? value : null;
   return {
+    recordKind: consumer === null ? 'null' : Array.isArray(consumer) ? 'array' : typeof consumer,
     consumer_id: { type: typeof consumer?.consumer_id },
     type: {
       type: typeof consumer?.type,
-      ...(typeof consumer?.type === 'string' ? { value: consumer.type } : {}),
+      ...(typeof consumer?.type === 'string'
+        ? { value: consumer.type === 'worker' || consumer.type === 'http_pull' ? consumer.type : null } : {}),
     },
     ownPropertyKeys: consumer !== null && typeof consumer === 'object' ? Object.keys(consumer) : [],
-    script_name: { type: typeof consumer?.script_name, workerName: workerName(consumer?.script_name) },
     script: { type: typeof consumer?.script, workerName: workerName(consumer?.script) },
   };
 }
@@ -255,8 +256,8 @@ export async function pauseConsumers(api, config) {
     if (!queue) throw new Error(`production queue ${name} is missing`);
     const consumers = await api.cf(`queues/${queue.queue_id}/consumers`);
     for (const consumer of consumers) {
-      if ((consumer.type != null && consumer.type !== 'worker') || consumer.script_name !== config.name
-        || typeof consumer.consumer_id !== 'string') {
+      if ((consumer?.type != null && consumer.type !== 'worker') || consumer?.script !== config.name
+        || typeof consumer?.consumer_id !== 'string') {
         throw new Error(`unexpected consumer on production queue ${name}; refusing to pause another owner; `
           + JSON.stringify({ expectedWorker: config.name, consumer: queueConsumerIdentityFacts(consumer) }));
       }
