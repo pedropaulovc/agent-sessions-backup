@@ -360,7 +360,35 @@ describe('date-scoped reindex snapshots and parse completion', () => {
     await resume(accepted.job_id);
     await deliver(sent[0]!);
     const completed = await status(accepted.job_id);
-    expect(completed).toMatchObject({ status: 'complete', counts: { ready: 1 } });
+    let completionEvidence: string | undefined;
+    if (completed.status !== 'complete' || completed.counts.ready !== 1) {
+      // Read only on failure: successful runs retain the original delivery/status boundary.
+      const observed = await db.prepare(`SELECT j.status AS stored_job_status, j.finished_at,
+        t.job_id, t.session_id AS snapshot_session_id, t.file_id AS snapshot_file_id,
+        t.content_hash AS snapshot_content_hash, t.baseline_parsed_at, t.baseline_updated_at,
+        t.dispatch_state, t.dispatched_at, t.enqueued_at, t.completed_at,
+        t.ready_parsed_at, t.ready_updated_at, t.error_code,
+        f.id AS current_file_id, f.session_id AS file_session_id, f.content_hash AS current_content_hash,
+        f.size, f.parsed_size, f.parse_state, f.parsed_at,
+        s.session_id AS current_session_id, s.canonical_file_id, s.index_state, s.updated_at,
+        f.content_hash IS t.content_hash AS snapshot_hash_matches,
+        s.canonical_file_id IS t.file_id AS snapshot_canonical_matches,
+        t.dispatched_at IS NOT NULL AS has_dispatch_timestamp,
+        f.parse_state = 'parsed' AS file_is_parsed, s.index_state = 'ready' AS session_is_ready,
+        f.parsed_at >= t.dispatched_at AS file_timestamp_is_fresh,
+        s.updated_at >= t.dispatched_at AS session_timestamp_is_fresh,
+        (t.dispatched_at IS NOT NULL AND f.parse_state = 'parsed' AND s.index_state = 'ready'
+          AND f.parsed_at >= t.dispatched_at AND s.updated_at >= t.dispatched_at) AS ready_predicate
+        FROM reindex_range_targets t JOIN reindex_range_jobs j ON j.job_id = t.job_id
+        LEFT JOIN files f ON f.id = t.file_id LEFT JOIN sessions s ON s.session_id = t.session_id
+        WHERE t.job_id = ?1 AND t.session_id = ?2`).bind(accepted.job_id, fixture.sessionId).first();
+      completionEvidence = JSON.stringify({
+        expected: { job_id: accepted.job_id, session_id: fixture.sessionId, file_id: fixture.fileId, content_hash: fixture.hash },
+        sent: sent.map(({ file_id, content_hash, reason }) => ({ file_id, content_hash, reason })),
+        observed,
+      });
+    }
+    expect(completed, completionEvidence).toMatchObject({ status: 'complete', counts: { ready: 1 } });
     await db.batch([
       db.prepare("UPDATE files SET content_hash = 'sha256:later-upload', parse_state = 'pending' WHERE id = ?1").bind(fixture.fileId),
       db.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(fixture.sessionId),

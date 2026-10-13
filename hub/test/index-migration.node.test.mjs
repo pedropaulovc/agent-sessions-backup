@@ -2256,12 +2256,13 @@ async function queueControlFixture(context, consumerOwner = 'pause-worker') {
   context.after(() => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
   const origin = `http://127.0.0.1:${server.address().port}`;
   const api = { cf: async (pathname, init = {}) => {
-    const { returnEnvelope = false, ...request } = init;
+    const { responseFormat = 'result', ...request } = init;
+    if (responseFormat !== 'result' && responseFormat !== 'envelope') throw new Error('invalid local queue response format');
     delete request.allowNotFound;
     const response = await fetch(`${origin}/${pathname}`, request);
     const envelope = await response.json();
     if (!response.ok || !envelope.success) throw new Error(`local queue API rejected HTTP ${response.status}`);
-    return returnEnvelope ? envelope : envelope.result;
+    return responseFormat === 'envelope' ? envelope : envelope.result;
   } };
   return { api, consumers, requests };
 }
