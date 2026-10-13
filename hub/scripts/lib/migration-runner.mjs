@@ -49,7 +49,20 @@ async function defaultRunProcess(args) {
     child.once('error', reject);
     child.once('exit', (code, signal) => {
       if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(`Wrangler exited with ${code ?? signal}: ${stderr || stdout}`));
+      else {
+        let cause;
+        if (code === 1 && args.includes('--json')) {
+          // Keep Wrangler's native API error separate from the diagnostic wrapper.
+          // Warnings may precede the JSON envelope; malformed output still fails closed.
+          for (const output of [stderr, stdout]) {
+            try {
+              cause = JSON.parse(output.slice(output.indexOf('{')))?.error;
+              if (cause) break;
+            } catch {}
+          }
+        }
+        reject(new Error(`Wrangler exited with ${code ?? signal}: ${stderr || stdout}`, { cause }));
+      }
     });
   });
 }
@@ -116,9 +129,25 @@ export async function hasLocalLegacyBlocks(options) {
   return Number(rows[0]?.has_blocks) === 1;
 }
 
-async function readAppliedNames(client) {
-  const rows = await client.query('SELECT name FROM d1_migrations ORDER BY id');
-  return rows.map((row) => row.name);
+function isMissingMigrationTable(error) {
+  const native = error?.cause;
+  return native?.name === 'APIError' && native.kind === 'error' && native.code === 7500
+    && typeof native.text === 'string'
+    && /^A request to the Cloudflare API \(\/accounts\/[^/]+\/d1\/database\/[^/]+\/query\) failed\.$/.test(native.text)
+    && Array.isArray(native.notes) && native.notes.length === 1
+    && native.notes[0]?.text === 'no such table: d1_migrations: SQLITE_ERROR [code: 7500]';
+}
+
+async function readAppliedNames(client, phase = 'installed') {
+  try {
+    const rows = await client.query('SELECT name FROM d1_migrations ORDER BY id');
+    return rows.map((row) => row.name);
+  } catch (error) {
+    // Only an all-ledger schema's pre-apply guard may see no ledger. Wrangler owns
+    // initialization; historical schemas and every installed-state read stay strict.
+    if (phase === 'pre-apply' && isMissingMigrationTable(error)) return [];
+    throw error;
+  }
 }
 
 function assertAppliedManifest(manifest, appliedNames) {
@@ -323,7 +352,8 @@ export async function runMigrations(options) {
     identity,
     apply: async () => {
       if (options.target === 'production') {
-        assertAppliedManifestPrefix(manifest, await readAppliedNames(client));
+        const phase = manifest.ledgerStartsAt === 1 ? 'pre-apply' : 'installed';
+        assertAppliedManifestPrefix(manifest, await readAppliedNames(client, phase));
       }
       await client.apply();
     },
