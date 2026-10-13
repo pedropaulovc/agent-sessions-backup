@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { migrationDigest } from '../scripts/lib/migration-manifest.mjs';
 import {
@@ -13,6 +15,7 @@ import {
   sha256Bytes,
   stableJson,
 } from '../../infra/cf/preview-trust.mjs';
+import { D1_BATCH_PROBE_TEXT } from '../../infra/cf/d1-batch-atomicity.mjs';
 
 const SHA = 'a'.repeat(40);
 const SEED = 'synthetic-preview-seed-for-deployment-regression';
@@ -28,6 +31,34 @@ const SCHEMA_DIGESTS = [
   { binding: 'IDX00', digest: 'e'.repeat(64) },
   { binding: 'IDX01', digest: 'e'.repeat(64) },
 ];
+const PROBE_TEXT_BYTES = Buffer.byteLength(D1_BATCH_PROBE_TEXT, 'utf8');
+
+function plainRows(database, sql, params = [], statement = database.prepare(sql)) {
+  const columns = statement.columns();
+  const quoted = (name) => `"${name.replaceAll('"', '""')}"`;
+  // Read stored TEXT through BLOBs: Node's TEXT getter can stop at embedded NUL.
+  // Retain each SQLite storage type so BLOBs, nulls and numbers are not coerced.
+  if (/^\s*PRAGMA\b/i.test(sql)) return statement.all(...params).map((row) => ({ ...row }));
+  const aliases = columns.map((_, index) => quoted(`__column_${index}`));
+  const selectors = aliases.flatMap((column, index) => [
+    `CASE WHEN typeof(${column}) = 'text' THEN CAST(${column} AS BLOB)
+      ELSE ${column} END AS ${quoted(`__value_${index}`)}`,
+    `typeof(${column}) AS ${quoted(`__type_${index}`)}`,
+  ]);
+  const transport = database.prepare(`WITH "__d1_result" (${aliases.join(',')}) AS MATERIALIZED (
+    ${sql.replace(/;\s*$/, '')}
+  ) SELECT ${selectors.join(',')} FROM "__d1_result"`);
+  return transport.all(...params).map((row) => Object.fromEntries(columns.map(({ name }, index) => [
+    name, row[`__type_${index}`] === 'text'
+      ? Buffer.from(row[`__value_${index}`]).toString('utf8') : row[`__value_${index}`],
+  ])));
+}
+
+function textEvidence(value) {
+  return typeof value === 'string'
+    ? { utf8Bytes: Buffer.byteLength(value, 'utf8'), sha256: createHash('sha256').update(value, 'utf8').digest('hex') }
+    : value;
+}
 
 async function runController(command, scenario = {}) {
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'preview-deployment-test-'));
@@ -96,8 +127,11 @@ async function runController(command, scenario = {}) {
     `);
     await writeFile(preload, `
       import { appendFileSync, writeFileSync } from 'node:fs';
+      import { createHash } from 'node:crypto';
       import { DatabaseSync } from 'node:sqlite';
       import { INDEX_LAYOUT } from ${JSON.stringify(layoutModule)};
+      ${plainRows.toString()}
+      ${textEvidence.toString()}
       const scenario = ${JSON.stringify(scenario)};
       const names = ${JSON.stringify(NAMES)};
       const layout = ${JSON.stringify(LAYOUT)};
@@ -135,7 +169,15 @@ async function runController(command, scenario = {}) {
         const url = new URL(input);
         const method = init.method ?? 'GET';
         const body = init.body ? JSON.parse(init.body) : null;
-        emit({ kind: 'request', url: url.href, method, body });
+        const probeRequest = body?.batch || body?.sql?.includes('__index_batch_probe_')
+          || body?.params?.some((value) => typeof value === 'string' && value.startsWith('__index_batch_probe_'));
+        const evidenceStatement = (statement) => ({
+          ...statement, params: (statement.params ?? []).map(textEvidence),
+        });
+        const evidenceBody = probeRequest
+          ? body.batch ? { batch: body.batch.map(evidenceStatement) } : evidenceStatement(body)
+          : body;
+        emit({ kind: 'request', url: url.href, method, body: evidenceBody });
         if (url.hostname === names.host && url.pathname === '/healthz') return new Response('ok');
         if (url.hostname === 'api.github.com') {
           const number = Number(url.pathname.split('/').at(-1));
@@ -167,8 +209,6 @@ async function runController(command, scenario = {}) {
           if (!database) throw new Error('Unknown database ' + id);
           // Keep the existing transport fixture, but execute the probe's ACTUAL SQL
           // against SQLite. Success evidence and rollback are never fabricated echoes.
-          const probeRequest = body.batch || body.sql?.includes('__index_batch_probe_')
-            || body.params?.some((value) => typeof value === 'string' && value.startsWith('__index_batch_probe_'));
           if (probeRequest) {
             let native = probeDatabases.get(id);
             if (!native) {
@@ -179,9 +219,10 @@ async function runController(command, scenario = {}) {
             const statements = body.batch ?? [{ sql: body.sql, params: body.params ?? [] }];
             const execute = ({ sql, params = [] }) => {
               const statement = native.prepare(sql);
-              const rows = statement.columns().length ? statement.all(...params).map((row) => ({ ...row }))
+              const rows = statement.columns().length ? plainRows(native, sql, params, statement)
                 : (statement.run(...params), []);
-              emit({ kind: 'probe-sql', databaseId: id, sql, params, rows });
+              emit({ kind: 'probe-sql', databaseId: id, sql, params: params.map(textEvidence),
+                rows: rows.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, textEvidence(value)]))) });
               return { success: true, results: rows };
             };
             const failureBatch = body.batch?.some((statement) =>
@@ -197,8 +238,36 @@ async function runController(command, scenario = {}) {
             try {
               const results = statements.map(execute);
               if (transactional) native.exec('COMMIT');
-              if (!body.batch && scenario.atomicityWrongReadback && body.sql.startsWith('SELECT id, value')) {
-                results[0].results = [];
+              const phase = body.batch ? 'batch' : 'independent';
+              if (!failureBatch && scenario.atomicityReadback?.phase === phase) {
+                const readIndex = statements.findIndex(({ sql }) => sql.startsWith('SELECT id, value'));
+                if (readIndex !== -1) {
+                  const result = results[readIndex];
+                  const row = result.results[0];
+                  const { corruption } = scenario.atomicityReadback;
+                  switch (corruption) {
+                    case 'missing-result': results.splice(readIndex, 1); break;
+                    case 'extra-result': results.push({ success: true, results: [] }); break;
+                    case 'malformed-rows': result.results = {}; break;
+                    case 'missing-rows': delete result.results; break;
+                    case 'missing-row': result.results = []; break;
+                    case 'duplicate-row': result.results.push({ ...row }); break;
+                    case 'malformed-text': row.value = { private: 'atomicity-private-provider-text' }; break;
+                    case 'missing-text': delete row.value; break;
+                    case 'nul-truncated-text': row.value = row.value.slice(0, row.value.indexOf('\\u0000')); break;
+                    case 'bom-stripped-text': row.value = row.value.slice(1); break;
+                    case 'normalized-text': row.value = row.value.normalize('NFC'); break;
+                    case 'truncated-text-and-bytes':
+                      row.value = row.value.slice(0, row.value.indexOf('\\u0000'));
+                      row.value_bytes = Buffer.byteLength(row.value, 'utf8');
+                      break;
+                    case 'missing-byte-count': delete row.value_bytes; break;
+                    case 'malformed-byte-count': row.value_bytes = String(row.value_bytes); break;
+                    case 'incorrect-byte-count': row.value_bytes -= 1; break;
+                    default: throw new Error('Unknown atomicity readback corruption');
+                  }
+                  emit({ kind: 'probe-readback-fault', databaseId: id, phase, corruption });
+                }
               }
               return response(results);
             } catch (error) {
@@ -285,7 +354,11 @@ async function runController(command, scenario = {}) {
     const events = (await readFile(eventPath, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
     const report = JSON.parse(await readFile(reportPath, 'utf8'));
     const output = `${result.stdout}\n${result.stderr}`;
-    assert.ok(!output.includes(SEED), 'the seed must not enter CLI output');
+    for (const secret of [SEED, 'synthetic-cloudflare-token', 'synthetic-github-token',
+      'atomicity-private-provider-text', 'index_batch_atomicity_intentional_invalid_json',
+      D1_BATCH_PROBE_TEXT, JSON.stringify(D1_BATCH_PROBE_TEXT).slice(1, -1)]) {
+      assert.ok(!output.includes(secret), 'CLI evidence must not expose credentials, provider text or probe values');
+    }
     return { ...result, ...report, events, output, hub, manifests };
   } finally {
     await rm(temporary, { recursive: true, force: true });
@@ -301,6 +374,43 @@ function mutations(result) {
   return result.events.filter((event) => event.kind === 'request' && event.method !== 'GET'
     && !(event.body?.sql && /^SELECT\b/i.test(event.body.sql.trim())));
 }
+
+test('SQLite REST fixture decodes stored UTF-8 generically without coercing BLOB, null or numeric values', () => {
+  const database = new DatabaseSync(':memory:');
+  try {
+    database.exec(`CREATE TABLE transport_values (
+      id INTEGER PRIMARY KEY, text_value TEXT NOT NULL, blob_value BLOB, null_value, integer_value INTEGER, real_value REAL
+    )`);
+    const blob = new Uint8Array([0, 255, 1, 128]);
+    const otherText = 'other\u0000stored-会話-😀';
+    const insert = database.prepare('INSERT INTO transport_values VALUES (?, ?, ?, ?, ?, ?)');
+    insert.run(1, D1_BATCH_PROBE_TEXT, blob, null, Number.MAX_SAFE_INTEGER, 0.125);
+    insert.run(2, otherText, blob, null, 7, 1.5);
+    for (const [id, text, integer, real] of [
+      [1, D1_BATCH_PROBE_TEXT, Number.MAX_SAFE_INTEGER, 0.125],
+      [2, otherText, 7, 1.5],
+    ]) {
+      const rows = plainRows(database, `SELECT text_value AS "quoted ""text""", blob_value,
+        null_value, integer_value, real_value, length(CAST(text_value AS BLOB)) AS value_bytes
+        FROM transport_values WHERE id = ?;`, [id]);
+      assert.equal(rows.length, 1);
+      const [row] = rows;
+      assert.ok(row['quoted "text"'] === text, 'readback must match every stored UTF-8 character without logging it');
+      assert.deepEqual(textEvidence(row['quoted "text"']), textEvidence(text));
+      assert.equal(row.value_bytes, Buffer.byteLength(text, 'utf8'));
+      assert.deepEqual(row.blob_value, blob);
+      assert.equal(row.null_value, null);
+      assert.equal(row.integer_value, integer);
+      assert.equal(row.real_value, real);
+      const stored = database.prepare('SELECT CAST(text_value AS BLOB) AS bytes FROM transport_values WHERE id = ?').get(id);
+      assert.ok(Buffer.from(stored.bytes).equals(Buffer.from(text, 'utf8')), 'readback must match actual SQLite bytes');
+      const [encoded] = plainRows(database, 'SELECT json_quote(text_value) AS encoded FROM transport_values WHERE id = ?', [id]);
+      assert.ok(JSON.parse(encoded.encoded) === text, 'independent JSON1 evidence must retain the entire stored value');
+    }
+  } finally {
+    database.close();
+  }
+});
 
 test('provision creates main plus two named shards, remotely migrates each, then seeds main prices and deploys', async () => {
   const result = await runController('provision', { foreignCount: 7 });
@@ -362,8 +472,10 @@ test('provision creates main plus two named shards, remotely migrates each, then
   assert.equal(summary.d1Reset, false);
   assert.deepEqual(summary.schemaDigests, SCHEMA_DIGESTS);
   const indexId = deploy.config.d1_databases[1].database_id;
-  assert.deepEqual(summary.indexBatchAtomicity,
-    { state: 'verified', probe: 'd1-rest-batch-atomicity', databaseId: indexId });
+  assert.deepEqual(summary.indexBatchAtomicity, {
+    state: 'verified', probe: 'd1-rest-batch-atomicity', databaseId: indexId,
+    textTransport: 'verified', textBytes: PROBE_TEXT_BYTES,
+  });
   const batchRequests = result.events.filter((event) => event.kind === 'request' && event.body?.batch);
   assert.equal(batchRequests.length, 2);
   assert.ok(batchRequests.every((event) => event.url.includes(`/d1/database/${indexId}/query`)));
@@ -372,8 +484,9 @@ test('provision creates main plus two named shards, remotely migrates each, then
   const probeSql = result.events.filter((event) => event.kind === 'probe-sql');
   const reads = probeSql.filter((event) => event.sql.startsWith('SELECT id, value'));
   assert.equal(reads.length, 2, 'successful native batch and independent readback both execute');
-  assert.deepEqual(reads.map((event) => event.rows),
-    [[{ id: 1, value: 'committed' }], [{ id: 1, value: 'committed' }]]);
+  assert.deepEqual(reads.map((event) => event.rows), Array.from({ length: 2 }, () =>
+    [{ id: 1, value: textEvidence(D1_BATCH_PROBE_TEXT), value_bytes: PROBE_TEXT_BYTES }]),
+  'actual SQLite readbacks must expose the complete UTF-8 digest and stored byte length, never the probe text');
   const createSql = probeSql.filter((event) => event.sql.startsWith('CREATE TABLE'));
   assert.equal(createSql.length, 2, 'the failure positive control executes CREATE before its rejection');
   assert.equal(probeSql.filter((event) => event.sql.startsWith('INSERT INTO')).length, 2);
@@ -474,11 +587,24 @@ for (const scenario of [{ pending: 'IDX01' }, { wrongDigest: 'IDX00' }]) {
   });
 }
 
+const readbackFailures = ['batch', 'independent'].flatMap((phase) => [
+  'missing-result', 'extra-result', 'malformed-rows', 'missing-rows', 'missing-row', 'duplicate-row',
+  'malformed-text', 'missing-text', 'nul-truncated-text', 'bom-stripped-text', 'normalized-text',
+  'truncated-text-and-bytes', 'missing-byte-count', 'malformed-byte-count', 'incorrect-byte-count',
+].map((corruption) => {
+  const resultCount = corruption === 'missing-result' || corruption === 'extra-result';
+  const resultShape = resultCount || corruption === 'malformed-rows' || corruption === 'missing-rows';
+  const error = phase === 'independent' && resultShape ? /D1 query returned an unexpected result shape/
+    : phase === 'batch' && resultCount ? /returned unexpected result count/
+      : new RegExp(`failed ${phase} text/byte readback`);
+  return [`${phase} ${corruption}`, { atomicityReadback: { phase, corruption } }, error];
+}));
+
 for (const [name, scenario, error] of [
   ['non-atomic native batch', { atomicityPartialCommit: true }, /partially committed before a failing statement/],
-  ['successful-batch transport echo', { atomicityNoExecution: true }, /successful batch positive control returned unexpected evidence/],
-  ['independent readback mismatch', { atomicityWrongReadback: true }, /failed independent readback/],
+  ['successful-batch transport echo', { atomicityNoExecution: true }, /failed batch text\/byte readback/],
   ['non-SQL failure', { atomicityWrongReason: true }, /expected SQL rejection; atomicity unproven/],
+  ...readbackFailures,
 ]) {
   test(`preview atomicity preflight rejects ${name} before prices or deployment`, async () => {
     const result = await runController('provision', scenario);
@@ -495,6 +621,25 @@ for (const [name, scenario, error] of [
       tables: ['unrelated_user_table'],
       unrelatedValues: ['untouched'],
     }], 'failed proofs remove only their owned probe, preserving unrelated data');
+    assert.equal(databaseDeletes(result).length, 0, 'a failed capability proof must not reset any database');
+    const drops = result.events.filter((event) => event.kind === 'probe-sql' && event.sql.startsWith('DROP TABLE'));
+    assert.ok(drops.every((event) => /^DROP TABLE "__index_batch_probe_[0-9a-f]+"$/.test(event.sql)),
+      'cleanup may drop only the probe table owned by this invocation');
+    if (scenario.atomicityReadback) {
+      const { phase, corruption } = scenario.atomicityReadback;
+      const faults = result.events.filter((event) => event.kind === 'probe-readback-fault');
+      assert.deepEqual(faults.map((event) => ({ phase: event.phase, corruption: event.corruption })), [{ phase, corruption }],
+        'the fault must alter an executed SQLite SELECT at the requested transport boundary');
+      const reads = result.events.filter((event) => event.kind === 'probe-sql' && event.sql.startsWith('SELECT id, value'));
+      assert.equal(reads.length, phase === 'batch' ? 1 : 2);
+      assert.ok(reads.every((event) => event.databaseId === indexMigration.options['database-id']));
+      assert.deepEqual(reads.map((event) => event.rows), reads.map(() =>
+        [{ id: 1, value: textEvidence(D1_BATCH_PROBE_TEXT), value_bytes: PROBE_TEXT_BYTES }]),
+      'corruption must target actual full-fidelity database readback, not fabricated success evidence');
+      assert.equal(drops.length, 1, 'the committed probe must be cleaned exactly once after rejection');
+      assert.equal(result.events.filter((event) => event.kind === 'probe-sql' && event.sql.startsWith('CREATE TABLE')).length, 1,
+        'text/byte rejection must precede the deliberately failing atomicity batch');
+    }
     assert.ok(!result.output.includes('atomicity-private-provider-text'));
     assert.ok(!result.output.includes('index_batch_atomicity_intentional_invalid_json'));
     assert.ok(!result.output.includes('synthetic-cloudflare-token'));

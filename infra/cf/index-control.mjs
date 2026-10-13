@@ -11,7 +11,7 @@ import {
   reconcileIndexCatalog, seedFrozenCatalog, sourceCopyForecast, verifyIndexRecords, writeCheckpoint,
 } from '../../hub/scripts/lib/index-migration.mjs';
 import { indexShardBindingName } from '../../hub/src/index-layout.mjs';
-import { d1SqlFailureReason, verifyD1BatchAtomicity } from './d1-batch-atomicity.mjs';
+import { D1_BATCH_PROBE_TEXT, d1SqlFailureReason, verifyD1BatchAtomicity } from './d1-batch-atomicity.mjs';
 
 const MAIN_ID = '5ff65cf3-89c8-4fe6-a3c2-a370293ecea6';
 const FREEZE_CHECKPOINT = 'index-maintenance-freeze-v1';
@@ -348,9 +348,10 @@ async function main() {
   if (command === 'copy') {
     const atomicity = await readCheckpoint(shards[0], ATOMICITY_CHECKPOINT);
     if (atomicity?.state !== 'verified' || atomicity.databaseId !== shards[0].id
+      || atomicity.textTransport !== 'verified' || atomicity.textBytes !== Buffer.byteLength(D1_BATCH_PROBE_TEXT, 'utf8')
       || atomicity.revision !== config.vars.DEPLOYMENT_REVISION || atomicity.cycle !== cycle
       || !Number.isSafeInteger(atomicity.verifiedAt) || atomicity.verifiedAt <= 0 || atomicity.verifiedAt > Date.now()) {
-      throw new Error('this deployment has no verified native D1 REST batch atomicity control; source copy forbidden');
+      throw new Error('this deployment has no verified native D1 REST batch atomicity/text transport control; source copy forbidden');
     }
     const copied = await copyFrozenIndex({ source, shards, gate });
     console.log(JSON.stringify({ copiedRows: copied.rows, state: copied.state, sha256: copied.sha256 }));

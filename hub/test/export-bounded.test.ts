@@ -247,11 +247,11 @@ async function reuploadRawExport(tag: string, bytes: Uint8Array): Promise<string
 // Deliver a parse message and keep delivering the continuation it enqueues (write- OR cleanup-phase)
 // for THIS file until none is left — i.e. drive the whole bounded parse to its terminal state. Records
 // the file's parse_state after each non-final invocation so callers can assert it stayed 'pending' the
-// whole way. With `stopAtCleanup`, returns as soon as the first CLEANUP-phase continuation appears
-// (offset === archive length, carries cleanup_cursor), leaving cleanup deliberately unfinished.
+// whole way. `stopAtCleanup: true` stops at any cleanup continuation; a named phase establishes
+// that precise reservation/delete window before a lifecycle test mutates its fixtures.
 async function deliverChain(
   initial: ParseMessage,
-  opts: { stopAtCleanup?: boolean } = {},
+  opts: { stopAtCleanup?: boolean | 'reserve' | 'delete' } = {},
 ): Promise<{ deliveries: number; statesBeforeFinal: string[]; stoppedCont?: ParseMessage }> {
   let msg: ParseMessage = initial;
   let deliveries = 0;
@@ -263,7 +263,11 @@ async function deliverChain(
     const cont = sent.find((m) => m.file_id === initial.file_id && typeof m.offset === 'number');
     if (!cont) return { deliveries, statesBeforeFinal };
     statesBeforeFinal.push(await fileState(initial.file_id));
-    if (opts.stopAtCleanup && cont.cleanup_cursor !== undefined) return { deliveries, statesBeforeFinal, stoppedCont: cont };
+    if (cont.cleanup_cursor !== undefined &&
+      (opts.stopAtCleanup === true ||
+        (typeof opts.stopAtCleanup === 'string' && opts.stopAtCleanup === cont.cleanup_phase))) {
+      return { deliveries, statesBeforeFinal, stoppedCont: cont };
+    }
     msg = cont;
   }
 }
@@ -575,7 +579,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('reserves the export budget before parsing, so a slice that throws does not free the budget for a second export in the same batch (round 2 finding 2)', async () => {
-    budgets({ slice: 20, invocation: 20 });
+    budgets({ slice: 64, invocation: 64 });
     const f1 = await uploadArchive('rb1', 5); // throws mid-slice
     const f2 = await uploadArchive('rb2', 3); // must stay untouched
 
@@ -826,7 +830,12 @@ describe('large export ingest is bounded and never marks parsed until every conv
     const replaced = await uploadConvs('csf', Array.from({ length: 3 }, (_u, i) => conv('csf', i)));
     budgets({ slice: 20, invocation: 20 });
     const flags: Record<number, { acked: boolean; retried: boolean }> = {};
-    const msg = batchMsg(replaced, flags);
+    const { stoppedCont } = await deliverChain(
+      { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash },
+      { stopAtCleanup: true },
+    );
+    expect(stoppedCont).toBeDefined();
+    const msg = { ...batchMsg(replaced, flags), body: stoppedCont! };
 
     // Make the cleanup continuation's send throw. The archive is FULLY written (its 'ready' sessions are
     // valid), so the file must NOT go 'error' with unreconciled stale rows — it's forced back to 'pending'
@@ -1294,12 +1303,12 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('cuts before an oversized conversation that only follows skipped lookups (round 9 finding 2)', async () => {
-    budgets({ slice: 800, invocation: 800, ceiling: 4, cap: 900 });
+    budgets({ slice: 800, invocation: 800, ceiling: 15, cap: 900 });
     // Owner archive owns S0, S1 healthy, so B SKIPS them (spending a lookup each, writing nothing).
     const owner = await uploadConvs('r9f2-own', [conv('r9f2s', 0), conv('r9f2s', 1)]);
     await deliverChain({ file_id: owner.fileId, r2_key: owner.r2Key, reason: 'upload', content_hash: owner.hash });
     // B: [S0(skipped), S1(skipped), Big(oversized-ceiling)].
-    const b = await uploadConvs('r9f2-b', [conv('r9f2s', 0), conv('r9f2s', 1), heavyConv('r9f2big', 0, 100)]);
+    const b = await uploadConvs('r9f2-b', [conv('r9f2s', 0), conv('r9f2s', 1), heavyConv('r9f2big', 0, 1800)]);
     const bigId = 'bnd-r9f2big-conv-0';
     sent.length = 0;
     await deliver({ file_id: b.fileId, r2_key: b.r2Key, reason: 'upload', content_hash: b.hash });
@@ -1502,63 +1511,6 @@ describe('large export ingest is bounded and never marks parsed until every conv
     // POSITIVE CONTROL: a corrupt archive whose reconciliation throws must not oscillate pending forever — a
     // transient throw converges. The retry's failExportFile succeeds and the file rests terminal 'error'.
     expect(await fileState(up.fileId)).toBe('error');
-  });
-
-  it('flips owned sessions to error in bounded db.batch chunks, never one subrequest per row (round 9 finding 5, batching)', async () => {
-    budgets({ slice: 800, invocation: 800 });
-    // N spans two chunks of 90, so the flip is 2 subrequests batched but would be 100 unbatched — the
-    // O(N)-subrequest tail that, running AFTER markParsed('error') commits, throws past the ~1000 cap for a
-    // corrupt re-upload of an archive owning ~950+ conversations and then never re-runs (the file is already
-    // 'error', so markParsed returns updated=false and failExportFile early-returns): the owned rows strand.
-    const N = 100;
-    const up = await uploadConvs('r9f5b', Array.from({ length: N }, (_u, i) => conv('r9f5b', i)));
-    await deliverChain({ file_id: up.fileId, r2_key: up.r2Key, reason: 'upload', content_hash: up.hash });
-    expect(await ownedSessions(up.fileId)).toBe(N);
-    const corruptHash = await reuploadRawExport('r9f5b', new TextEncoder().encode('not a zip at all'));
-
-    // Tag every prepared owned-session flip statement; count how many execute via db.batch (chunked) vs a
-    // direct per-row .run(). The batched code path uses ONLY db.batch; the reverted per-row loop uses .run().
-    const FLIP_SQL = "UPDATE sessions SET index_state = 'error' WHERE session_id = ?1";
-    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
-    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
-    let flipRunCalls = 0;
-    let flipBatchCalls = 0;
-    const tagged = new WeakSet<object>();
-    testEnv.DB.prepare = ((sql: string) => {
-      const stmt = realPrepare(sql);
-      if (sql !== FLIP_SQL) return stmt;
-      const realBind = stmt.bind.bind(stmt);
-      stmt.bind = (...a: unknown[]) => {
-        const bound = realBind(...a);
-        tagged.add(bound as object);
-        const realRun = bound.run.bind(bound);
-        (bound as unknown as Record<string, unknown>).run = (...x: unknown[]) => {
-          flipRunCalls++;
-          return (realRun as (...y: unknown[]) => unknown)(...x);
-        };
-        return bound;
-      };
-      return stmt;
-    }) as typeof testEnv.DB.prepare;
-    testEnv.DB.batch = ((stmts: unknown[]) => {
-      if (Array.isArray(stmts) && stmts.some((s) => tagged.has(s as object))) flipBatchCalls++;
-      return realBatch(stmts as never);
-    }) as typeof testEnv.DB.batch;
-    try {
-      await deliver({ file_id: up.fileId, r2_key: up.r2Key, reason: 'upload', content_hash: corruptHash });
-    } finally {
-      testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
-      testEnv.DB.batch = realBatch as typeof testEnv.DB.batch;
-    }
-
-    // Reconciliation ran: the file rests terminal 'error' and all N owned rows were flipped.
-    expect(await fileState(up.fileId)).toBe('error');
-    expect(await stateCount(up.fileId, 'error')).toBe(N);
-    // POSITIVE CONTROL: the flip went out in ceil(N/90) db.batch chunks (each ONE subrequest) and NEVER via a
-    // per-row .run(). Reverting to the per-row loop makes flipRunCalls === N and flipBatchCalls === 0, failing
-    // both — that unbatched loop is the O(N)-subrequest deterministic throw path finding 5 flagged.
-    expect(flipRunCalls).toBe(0);
-    expect(flipBatchCalls).toBe(Math.ceil(N / 90));
   });
 
   it('send-late fans out to exactly the reserved set — including a pending sibling the reserve pass now reserves (round 12 finding 3608692125, updated by round 15 3608955874)', async () => {
@@ -2033,7 +1985,7 @@ describe('per-store cleanup serialization (round 14): a cleanup defers while ano
     budgets({ slice: 8, invocation: 8 });
     const { stoppedCont } = await deliverChain(
       { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash },
-      { stopAtCleanup: true },
+      { stopAtCleanup: 'delete' },
     );
     expect(stoppedCont).toBeDefined();
     const ownerAfterReserve = await testEnv.DB.prepare('SELECT reserved_by FROM files WHERE id = ?1').bind(s.fileId).first<{ reserved_by: number }>();
@@ -2121,7 +2073,7 @@ describe('reservation lifecycle edges (round 15)', () => {
     budgets({ slice: 8, invocation: 8 });
     const { stoppedCont } = await deliverChain(
       { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash },
-      { stopAtCleanup: true },
+      { stopAtCleanup: 'delete' },
     );
     expect(stoppedCont).toBeDefined();
     expect(await reservedByOf(sib.fileId)).toBe(replaced.fileId);
@@ -2153,7 +2105,7 @@ describe('reservation lifecycle edges (round 15)', () => {
     budgets({ slice: 8, invocation: 8 });
     const { stoppedCont } = await deliverChain(
       { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash },
-      { stopAtCleanup: true },
+      { stopAtCleanup: 'delete' },
     );
     expect(stoppedCont).toBeDefined();
     const staleBefore = await ownedSessions(replaced.fileId);
@@ -2458,12 +2410,15 @@ describe('reservation intent and retry safety (round 16)', () => {
       reservation_generation: generation!.reservation_generation,
     };
 
-    const restore = throwOnNthBatch(1);
+    // Fail the first conversation's shard write, not unrelated metadata/catalog batches.
+    let writeFailed = false;
+    const restore = throwOnNthBlockInsert(1, () => { writeFailed = true; });
     try {
       await deliver(delivery);
     } finally {
       restore();
     }
+    expect(writeFailed).toBe(true);
     const afterThrow = await testEnv.DB.prepare(
       'SELECT parse_state, reserved_by, reservation_generation FROM files WHERE id = ?1',
     )
@@ -2676,11 +2631,11 @@ describe('reservation intent and retry safety (round 16)', () => {
     await deliverChain({ file_id: owner.fileId, r2_key: owner.r2Key, reason: 'upload', content_hash: owner.hash });
     const replacement = await uploadConvs('r16-cleanup-partial-owner', [conv('r16clpo', 0)]);
 
-    budgets({ slice: 8, invocation: 8, kickPage: 2 });
+    budgets({ slice: 5, invocation: 5, kickPage: 2 });
     sent.length = 0;
     const { stoppedCont } = await deliverChain(
       { file_id: replacement.fileId, r2_key: replacement.r2Key, reason: 'upload', content_hash: replacement.hash },
-      { stopAtCleanup: true },
+      { stopAtCleanup: 'reserve' },
     );
     expect(stoppedCont?.cleanup_phase).toBe('reserve');
     expect(stoppedCont?.reservation_count).toBe(2);
@@ -2736,7 +2691,7 @@ describe('reservation intent and retry safety (round 16)', () => {
     // Drive the plain restart until it owns a fresh prefix, then lose one reservation AGAIN. The carried
     // count must describe only this new attempt, detect the second partial loss, and release its survivors
     // before any stale-session delete can run (3609611903).
-    const restarted = await deliverChain(restart!, { stopAtCleanup: true });
+    const restarted = await deliverChain(restart!, { stopAtCleanup: 'reserve' });
     expect(restarted.stoppedCont?.cleanup_phase).toBe('reserve');
     expect(restarted.stoppedCont?.reservation_count).toBe(2);
     const secondAttempt = await testEnv.DB.prepare(

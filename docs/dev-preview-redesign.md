@@ -251,6 +251,20 @@ so an unchanged restart resumes each database independently. `schema-diagnostics
 retains per-database identities, migration/schema digests, and pending counts; the
 health/manifest migration and schema digests cover the ordered three-database topology.
 
+Local readiness, synthetic upload, and indexing failures report the failed method/URL,
+whether an HTTP response arrived, received status/content type for body-read failures,
+and the original error/cause chain. They never log request headers/bodies or rejected
+HTTP response bodies. A successful `/healthz` alone is not seeded readiness; diagnose
+the later failing request from those details rather than treating it as a health failure.
+
+Both synthetic seeders pass their finite Buffer bodies without a caller-supplied
+`Content-Length`; fetch owns the wire byte count. The observed full local CLI failure
+had a valid 68-byte PNG and caller length `68`, but dispatched `68, 68` into Undici,
+which rejected the duplicate before any HTTP response (`UND_ERR_INVALID_ARG`).
+Reduced native/helper controls accepted explicit headers, so this is not a claim
+that all explicit-length fetches fail. Body bytes, hashes, metadata and auth are
+unchanged; an actual initialized launch and external-asset path remain the wire proof.
+
 For normal use, run `npm --prefix hub run dev:up` or
 `npm --prefix hub run test:e2e`; neither requires Cloudflare credentials. To diagnose
 a shard manually while the local environment is stopped, use its generated config and

@@ -99,6 +99,29 @@ function fixtureKey(block: BlockFixture): string {
   return `${block.session.id}:${block.turn}:0`;
 }
 
+async function expectedOrder(marker: string, blocks: BlockFixture[], sort = 'recent'): Promise<string[]> {
+  // FTS scores depend on each shard's entire corpus, not only these identical fixture texts.
+  // Read real local scores independently of the HTTP handler's filters, ordering and paging.
+  const ranks = new Map<number, number>();
+  for (const db of indexDbs(testEnv)) {
+    const result = await db.prepare(
+      `SELECT rowid AS id, bm25(blocks_fts) AS rank
+       FROM blocks_fts WHERE blocks_fts MATCH ?1`,
+    ).bind(marker).all<{ id: number; rank: number }>();
+    for (const row of result.results) ranks.set(row.id, row.rank);
+  }
+  expect(ranks.size).toBe(blocks.length);
+  for (const block of blocks) expect(ranks.has(block.id)).toBe(true);
+  return [...blocks].sort((a, b) => {
+    const primary = sort === 'total_tokens'
+      ? b.session.tokens! - a.session.tokens!
+      : sort === 'session_time'
+        ? (b.session.seconds ?? -1) - (a.session.seconds ?? -1)
+        : 0;
+    return primary || ranks.get(a.id)! - ranks.get(b.id)! || a.id - b.id;
+  }).map(fixtureKey);
+}
+
 async function walk(params: URLSearchParams, expectedCount: number): Promise<SearchHit[]> {
   const hits: SearchHit[] = [];
   const cursors = new Set<string>();
@@ -133,46 +156,39 @@ describe('cross-shard HTTP search', () => {
   it.each(['recent', 'total_tokens', 'session_time'])(
     'walks every global %s cursor without omissions or duplicates',
     async (sort) => {
-      const marker = 'globalshardcursorproof';
+      const marker = `globalshardcursorproof${sort}`;
       const sessions: SessionFixture[] = [
-        { id: sessionOn(0, 'cursor-high'), turns: 3, tokens: 50, seconds: 300 },
-        { id: sessionOn(1, 'cursor-middle-a'), turns: 4, tokens: 40, seconds: 240 },
-        { id: sessionOn(0, 'cursor-middle-b'), turns: 2, tokens: 40, seconds: 240 },
-        { id: sessionOn(1, 'cursor-low-a'), turns: 3, tokens: 30, seconds: 180 },
-        { id: sessionOn(0, 'cursor-low-b'), turns: 2, tokens: 20, seconds: 120 },
-        { id: sessionOn(1, 'cursor-null-duration'), turns: 1, tokens: 10, seconds: null },
+        { id: sessionOn(0, `cursor-high-${sort}`), turns: 3, tokens: 50, seconds: 300 },
+        { id: sessionOn(1, `cursor-middle-a-${sort}`), turns: 4, tokens: 40, seconds: 240 },
+        { id: sessionOn(0, `cursor-middle-b-${sort}`), turns: 2, tokens: 40, seconds: 240 },
+        { id: sessionOn(1, `cursor-low-a-${sort}`), turns: 3, tokens: 30, seconds: 180 },
+        { id: sessionOn(0, `cursor-low-b-${sort}`), turns: 2, tokens: 20, seconds: 120 },
+        { id: sessionOn(1, `cursor-null-duration-${sort}`), turns: 1, tokens: 10, seconds: null },
       ];
       const blocks = await seedSearch(marker, sessions);
-      const ordered = [...blocks].sort((a, b) => {
-        // Identical documents give identical bm25: ids break relevance ties across shards.
-        const primary = sort === 'total_tokens'
-          ? b.session.tokens! - a.session.tokens!
-          : sort === 'session_time'
-            ? (b.session.seconds ?? -1) - (a.session.seconds ?? -1)
-            : 0;
-        return primary || a.id - b.id;
-      });
+      const ordered = await expectedOrder(marker, blocks, sort);
       const complete = await search(new URLSearchParams({ q: marker, sort, limit: '100' }));
       expect(complete.cursor).toBeUndefined();
-      expect(complete.hits.map(hitKey)).toEqual(ordered.map(fixtureKey));
+      expect(complete.hits.map(hitKey)).toEqual(ordered);
 
       for (const limit of [1, 4]) {
         const hits = await walk(new URLSearchParams({ q: marker, sort, limit: String(limit) }), blocks.length);
-        expect(hits.map(hitKey)).toEqual(ordered.map(fixtureKey));
+        expect(hits.map(hitKey)).toEqual(ordered);
       }
     },
   );
 
   it.each([0, 1])('walks beyond a lazy shard page with shard %s owning the long stream', async (longShard) => {
-    const marker = 'globalshardcursorrefill';
-    // A lazy shard page holds at most 257 rows. Only two session rows are needed to
-    // cross that cap and exhaust the other stream before and after the long stream.
+    const marker = `globalshardcursorrefill${longShard}`;
+    // A lazy shard page holds at most 257 rows. Two session rows cross that cap
+    // while keeping the streams uneven and exercising both long-stream owners.
     const blocks = await seedSearch(marker, [
-      { id: sessionOn(longShard, 'cursor-long-stream'), turns: 258 },
-      { id: sessionOn(1 - longShard, 'cursor-short-stream'), turns: 3 },
+      { id: sessionOn(longShard, `cursor-long-stream-${longShard}`), turns: 258 },
+      { id: sessionOn(1 - longShard, `cursor-short-stream-${longShard}`), turns: 3 },
     ]);
+    const ordered = await expectedOrder(marker, blocks);
     const hits = await walk(new URLSearchParams({ q: marker, limit: '100' }), blocks.length);
-    expect(hits.map(hitKey)).toEqual([...blocks].sort((a, b) => a.id - b.id).map(fixtureKey));
+    expect(hits.map(hitKey)).toEqual(ordered);
   });
 
   it('aggregates a globally winning facet before applying either shard or global value caps', async () => {
@@ -354,7 +370,10 @@ describe('cross-shard HTTP search', () => {
         retry: () => { retries.push(fixture.id); },
       });
     }
-    await worker.queue({ queue: 'parse', messages, ackAll() {}, retryAll() {} }, testEnv);
+    await worker.queue({
+      queue: 'parse', messages, metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } },
+      ackAll() {}, retryAll() {},
+    }, testEnv);
     expect(acknowledgements.sort()).toEqual([parent, child, competitor].sort());
     expect(retries).toEqual([]);
 
@@ -396,8 +415,8 @@ describe('cross-shard HTTP search', () => {
   it.each([false, true])(
     'preserves a committed star when catalog replication fails (queue failure: %s), then recovers',
     async (queueFails) => {
-      const marker = 'globalshardcommittedstarfailure';
-      const sessionId = sessionOn(0, 'committed-star');
+      const marker = `globalshardcommittedstarfailure${queueFails}`;
+      const sessionId = sessionOn(0, `committed-star-${queueFails}`);
       const turnKey = `id:${sessionId}-turn`;
       const hash = `sha256:${'3'.repeat(64)}`;
       const file = await testEnv.DB.prepare(
@@ -450,7 +469,7 @@ describe('cross-shard HTTP search', () => {
       await testEnv.DB.batch(Array.from({ length: 128 }, (_, index) => testEnv.DB.prepare(
         `INSERT INTO sessions (session_id, harness, machine_id, index_state)
          VALUES (?1, ?2, ?3, 'ready')`,
-      ).bind(`index-sharding-search-star-backlog-${index}`, HARNESS, MACHINE)));
+      ).bind(`index-sharding-search-star-backlog-${queueFails}-${index}`, HARNESS, MACHINE)));
       const pending: Promise<unknown>[] = [];
       const ctx = {
         waitUntil: (promise: Promise<unknown>) => { pending.push(promise); },
@@ -498,7 +517,10 @@ describe('cross-shard HTTP search', () => {
             id: 'committed-star-recovery', timestamp: new Date(), attempts: 1, body: queued[0]!,
             ack: () => { acknowledged++; }, retry: () => { retried++; },
           } satisfies Message<HubQueueMessage>;
-          await worker.queue({ queue: 'rollup', messages: [message], ackAll() {}, retryAll() {} }, faultEnv);
+          await worker.queue({
+            queue: 'rollup', messages: [message], metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } },
+            ackAll() {}, retryAll() {},
+          }, faultEnv);
           expect(acknowledged).toBe(1);
           expect(retried).toBe(0);
         }

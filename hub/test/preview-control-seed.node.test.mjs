@@ -126,7 +126,11 @@ test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then o
   assert.deepEqual(second, first, 'replayed URL, method, bytes and all headers must be identical');
   assert.equal(first.url, `${ORIGIN}${ASSET_PATH}`);
   assert.equal(first.headers['x-content-hash'], `sha256:${SYNTHETIC_EXPECTATIONS.externalDigest}`);
-  assert.equal(first.headers['content-length'], String(Buffer.from(first.body, 'base64').length));
+  assert.equal(first.headers['content-length'], undefined, 'fetch must compute the finite Buffer wire length once');
+  const assetSource = Buffer.from((await readFile(
+    new URL('./fixtures/local/fixture-external.png.base64', import.meta.url), 'utf8',
+  )).trim(), 'base64');
+  assert.deepEqual(Buffer.from(first.body, 'base64'), assetSource, 'the complete binary fixture must reach fetch unchanged');
   assert.equal(first.headers.authorization, `Bearer ${previewBearerToken(SEED, 150)}`);
   assert.equal(first.redirect, 'error');
   assert.ok(firstBudget > 0 && firstBudget <= 10_000);

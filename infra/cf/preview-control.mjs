@@ -877,11 +877,12 @@ async function seed() {
     const encoded = relative.split('/').map(encodeURIComponent).join('/');
     const target = `/api/v1/files/${encodeURIComponent(machine)}/${encodeURIComponent(uploadStore)}/${encoded}`;
     const init = {
+      // Fetch computes the wire Content-Length from the finite Buffer body.
+      // A caller-supplied copy duplicated the length in the observed local CLI.
       method: 'PUT',
       body: bytes,
       headers: {
         'content-type': 'application/octet-stream',
-        'content-length': String(bytes.length),
         'x-content-hash': `sha256:${sha256Bytes(bytes)}`,
         'x-file-mtime': '2026-07-01T00:00:00.000Z',
       },

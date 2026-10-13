@@ -98,6 +98,8 @@ describe('durable bounded session rollup jobs', () => {
   it('persists a pollable queued job before queue acceptance and commits the consumer result', async () => {
     const id = await seedSession('complete');
     vi.mocked(testEnv.ROLLUP_QUEUE.send).mockImplementation(async (message) => {
+      expect(message.kind).toBe('session-rollup');
+      if (message.kind !== 'session-rollup') throw new Error('Expected a session-rollup queue message');
       expect(await job(message.job_id)).toMatchObject({ status: 'queued', result: null, finished_at: null });
       return { metadata: { metrics: { backlogCount: 1, backlogBytes: 0 } } };
     });

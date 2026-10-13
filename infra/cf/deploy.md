@@ -241,8 +241,11 @@ The one-time cutover runs these operations in order, from the same checked-out m
 2. Apply and checksum-verify `migrations-index/` separately on every shard, with separate
    database-bound journals; initialize/check immutable hash layout and ID counters.
    `initialize` also runs an actual REST-batch atomicity positive control on `IDX00`:
-   successful CREATE/INSERT/readback/drop first, then CREATE/INSERT/intentionally
-   malformed JSON. The expected SQL rejection must leave its unique probe table
+   successful CREATE/INSERT/readback/drop first, requiring exact synthetic leading-BOM,
+   Unicode and embedded-NUL text plus its stored UTF-8 byte length through both batch
+   and independent REST readback. Missing or shortened values stop before copying.
+   Then CREATE/INSERT/intentionally malformed JSON must return the expected SQL rejection
+   and leave its unique probe table
    absent. A partially committed probe is cleaned up by its own name only and fails
    closed. A durable `index-rest-batch-atomicity-v1` proof binds revision/run/attempt
    and shard ID; `copy` refuses a different or missing proof. The source is untouched.
@@ -266,7 +269,8 @@ The one-time cutover runs these operations in order, from the same checked-out m
 6. `index-control.mjs copy`: keyset-read pages bounded by roughly 1 MiB of serialized
    data and at most 2,048 rows; route each session with the shared UTF-8 FNV layout;
    preserve every block column, ID, numeric value and `NULL`. Large values travel in
-   bounded hexadecimal byte slices and are decoded in full, never shortened. A single
+   bounded hexadecimal byte slices and are decoded in full, preserving embedded NULs
+   and leading UTF-8 BOM characters rather than shortening or normalizing them. A single
    oversized row uses individual value bindings instead of a too-large JSON scalar.
    Ordinary shard replacement is one atomic four-statement JSON1 batch, not per-row
    HTTP requests. MATCH probes use chunks of at most 48 rows within one native batch,

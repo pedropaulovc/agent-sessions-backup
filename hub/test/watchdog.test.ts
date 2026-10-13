@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { env } from 'cloudflare:test';
+import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
 import { runWatchdog } from '../src/cron/watchdog';
 import { EXPECTED_COLLECTOR_VERSION } from '../src/collector-version';
 import worker from '../src/worker';
@@ -448,12 +448,13 @@ describe('maintenance freeze', () => {
     ).first<{ id: number }>();
     expect(file).not.toBeNull();
 
-    // Snapshot actual table contents, including the pending catalog outbox and shard identity.
+    // Snapshot every application table, including the pending catalog outbox and shard identity.
+    // Provider _cf_* and SQLite sqlite_* tables are reserved, not application-owned state.
     // This catches health/reconciliation accidentally writing while the cutover is frozen.
     async function snapshot() {
       return Promise.all([testEnv.DB, testEnv.IDX00!, testEnv.IDX01!].map(async (db) => {
         const tables = await db.prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT GLOB 'sqlite_*' AND name NOT GLOB '_cf_*' ORDER BY name",
         ).all<{ name: string }>();
         return Promise.all(tables.results.map(async ({ name }) => {
           const rows = await db.prepare(`SELECT * FROM "${name.replaceAll('"', '""')}"`).all();
@@ -462,12 +463,7 @@ describe('maintenance freeze', () => {
       }));
     }
     const before = await snapshot();
-    const pending: Promise<unknown>[] = [];
-    const ctx = {
-      waitUntil: (promise: Promise<unknown>) => pending.push(promise),
-      passThroughOnException: () => {},
-      props: {},
-    } as ExecutionContext;
+    const ctx = createExecutionContext();
 
     const health = await worker.fetch(new Request('https://hub.test/healthz'), testEnv, ctx);
     expect(health.status).toBe(200);
@@ -504,8 +500,9 @@ describe('maintenance freeze', () => {
       retry: vi.fn(),
     }));
     await worker.queue({
-      queue: 'frozen-queue', messages, ackAll: vi.fn(), retryAll: vi.fn(),
-    } as MessageBatch<HubQueueMessage>, testEnv);
+      queue: 'frozen-queue', messages, metadata: { metrics: { backlogCount: 0, backlogBytes: 0 } },
+      ackAll: vi.fn(), retryAll: vi.fn(),
+    } satisfies MessageBatch<HubQueueMessage>, testEnv);
     for (const message of messages) {
       expect(message.retry).toHaveBeenCalledTimes(1);
       expect(message.retry).toHaveBeenCalledWith({ delaySeconds: 60 });
@@ -514,7 +511,7 @@ describe('maintenance freeze', () => {
     for (const cron of ['*/15 * * * *', '30 4 * * *']) {
       await worker.scheduled({ cron, scheduledTime: 0, noRetry: () => {} } as ScheduledController, testEnv, ctx);
     }
-    await Promise.all(pending);
+    await waitOnExecutionContext(ctx);
     expect(await snapshot()).toEqual(before);
   });
 });

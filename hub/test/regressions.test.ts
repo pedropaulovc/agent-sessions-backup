@@ -4,7 +4,7 @@ import worker from '../src/index';
 import { clampLimit } from '../src/api/sessions';
 import { hex } from '../src/api/ops';
 import { convergeR2WithRow } from '../src/api/upload';
-import { indexDbs } from '../src/index-shards';
+import { indexDbFor, indexDbs } from '../src/index-shards';
 import { CODEX_SESSION_ID, ccAssistantLine, ccUserLine, codexLines } from './fixtures';
 import { API, VIEWER } from './hosts';
 
@@ -1792,7 +1792,7 @@ describe('a stale message (redelivered after a re-upload changed the row\'s hash
   });
 });
 
-describe('a re-upload landing strictly between the pre-writeSession recheck and writeSession itself does not leave the session stuck advertising stale content as ready (regression: the recheck alone still had a residual window between "checked" and "wrote" — writeSession unconditionally sets index_state=ready, so a race landing in that exact gap left old content marked ready until the fresh message happened to be delivered)', () => {
+describe('a re-upload landing strictly between the pre-writeSession recheck and writeSession itself does not leave the session stuck advertising stale content as ready (regression: the recheck alone once allowed old content to be published ready after the source changed)', () => {
   it('index_state ends "parsing" (not stale "ready") right after the raced-out parse, and the fresh message then lands "ready" with the new content', async () => {
     const SESSION_ID = 'e0000000-0000-4000-8000-000000000004';
     const relpath = `residual-race-demo/${SESSION_ID}.jsonl`;
@@ -1808,13 +1808,11 @@ describe('a re-upload landing strictly between the pre-writeSession recheck and 
       .first<{ content_hash: string }>();
     const hashV1 = rowV1!.content_hash;
 
-    // Intercept the EXACT recheck query parseOne runs immediately before flipping index_state to
-    // 'parsing' and calling writeSession — and, right as that check observes the still-current
-    // hashV1 (so the check itself legitimately passes), perform a REAL re-upload. This lands the
-    // race exactly in the gap the check can't see: strictly after "checked", strictly before
-    // "wrote". Only fires once (armed), and is disarmed before awaiting the re-upload so the
-    // re-upload's own DB calls (including its own identically-worded content_hash lookup in
-    // convergeR2WithRow) pass straight through to the real implementation.
+    // Read the REAL pre-writeSession recheck result while hashV1 is still current, then land a
+    // real re-upload before returning that result. The recheck legitimately passes, but the
+    // writeSession source guard must reject stale derived writes and leave an honest 'parsing'
+    // placeholder for the pending single-session source. Disarm before the re-upload so its
+    // identically-worded content_hash lookup in convergeR2WithRow runs normally.
     const originalPrepare = testEnv.DB.prepare.bind(testEnv.DB);
     let armed = true;
     const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
@@ -1824,9 +1822,11 @@ describe('a re-upload landing strictly between the pre-writeSession recheck and 
           bind: (id: number) => ({
             first: async () => {
               expect(id).toBe(fileId);
+              const checked = await originalPrepare(sql).bind(id).first<{ content_hash: string }>();
+              expect(checked?.content_hash).toBe(hashV1);
               const res2 = await putFile('claude-projects', relpath, CONTENT_V2);
               expect(res2.status).toBe(201);
-              return { content_hash: hashV1 };
+              return checked;
             },
           }),
         } as unknown as D1PreparedStatement;
@@ -1840,14 +1840,24 @@ describe('a re-upload landing strictly between the pre-writeSession recheck and 
       spy.mockRestore();
     }
 
+    expect(armed).toBe(false);
     const session = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
       .bind(SESSION_ID)
       .first<{ index_state: string }>();
     expect(session?.index_state).toBe('parsing');
+    const staleBlocks = await indexDbFor(testEnv, SESSION_ID)
+      .prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ n: number }>();
+    expect(staleBlocks?.n).toBe(0);
+    const sourceAfterRace = await testEnv.DB.prepare('SELECT content_hash, parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ content_hash: string; parse_state: string }>();
+    expect(sourceAfterRace?.content_hash).toBe(await sha256Hex(new TextEncoder().encode(CONTENT_V2)));
+    expect(sourceAfterRace?.parse_state).toBe('pending');
 
-    // The re-upload's own fresh message is still pending (never drained above) — draining it now
-    // completes the recovery: the session lands 'ready' with the NEW content, not the stale V1
-    // blocks the raced-out parse wrote moments earlier.
+    // The re-upload's own fresh message is still pending (never drained above). Draining it now
+    // replaces the placeholder with a 'ready' session containing the NEW content.
     await drainQueue();
     const sessionAfter = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
       .bind(SESSION_ID)
@@ -1859,6 +1869,112 @@ describe('a re-upload landing strictly between the pre-writeSession recheck and 
     });
     const bodyV2 = (await searchV2.json()) as { hits: Array<{ session_id: string }> };
     expect(bodyV2.hits.some((h) => h.session_id === SESSION_ID)).toBe(true);
+  });
+});
+
+describe('a re-upload after a real shard insert commits cannot publish the superseded content ready', () => {
+  it('retains the genuine stale-block race: index_state stays parsing until the fresh message replaces the blocks and lands ready', async () => {
+    const SESSION_ID = 'e0000000-0000-4000-8000-00000000000b';
+    const relpath = `committed-residual-race-demo/${SESSION_ID}.jsonl`;
+    const MARKER_V1 = 'unique-marker-committedresidualrace-v1';
+    const MARKER_V2 = 'unique-marker-committedresidualrace-v2';
+    const CONTENT_V1 = `${ccUserLine({ uuid: 'crr-u1', text: `${MARKER_V1} original content` })}\n`;
+    const CONTENT_V2 = `${ccUserLine({ uuid: 'crr-u2', text: `${MARKER_V2} replaced content` })}\n`;
+
+    const res1 = await putFile('claude-projects', relpath, CONTENT_V1);
+    expect(res1.status).toBe(201);
+    const uploadBody: unknown = await res1.json();
+    if (!uploadBody || typeof uploadBody !== 'object' || !('file_id' in uploadBody) || typeof uploadBody.file_id !== 'number') {
+      throw new Error('upload response is missing its numeric file_id');
+    }
+    const fileId = uploadBody.file_id;
+    const r2Key = `raw/${MACHINE}/claude-projects/${relpath}`;
+    const rowV1 = await testEnv.DB.prepare('SELECT content_hash FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ content_hash: string }>();
+    const hashV1 = rowV1!.content_hash;
+
+    // The earlier boundary is now source-guarded before any stale block write. This later race
+    // instead lets an actual block+FTS batch commit, then supersedes the source BEFORE the ready
+    // publication. Identify the write by its SQL shape, never an incidental RPC count.
+    const indexDb = indexDbFor(testEnv, SESSION_ID);
+    const realBatch = indexDb.batch.bind(indexDb);
+    let raced = false;
+    let stateAtCommit: string | undefined;
+    let hashAtCommit: string | undefined;
+    const spy = vi.spyOn(indexDb, 'batch').mockImplementation(async (stmts: D1PreparedStatement[]) => {
+      const insertsBlocks = stmts.some((stmt) =>
+        'statement' in stmt && typeof stmt.statement === 'string' && stmt.statement.startsWith('INSERT INTO blocks '),
+      );
+      const result = await realBatch(stmts);
+      if (!raced && insertsBlocks) {
+        raced = true;
+        stateAtCommit = (await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+          .bind(SESSION_ID)
+          .first<{ index_state: string }>())?.index_state;
+        hashAtCommit = (await testEnv.DB.prepare('SELECT content_hash FROM files WHERE id = ?1')
+          .bind(fileId)
+          .first<{ content_hash: string }>())?.content_hash;
+        const res2 = await putFile('claude-projects', relpath, CONTENT_V2);
+        expect(res2.status).toBe(201);
+      }
+      return result;
+    });
+
+    try {
+      await deliverOne(fileId, r2Key, hashV1);
+    } finally {
+      spy.mockRestore();
+    }
+
+    // Positive controls: guarded initialization and the old-source block commit really happened.
+    expect(raced).toBe(true);
+    expect(stateAtCommit).toBe('parsing');
+    expect(hashAtCommit).toBe(hashV1);
+    const committed = await indexDb.prepare('SELECT text FROM blocks WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .all<{ text: string | null }>();
+    expect(committed.results.some((block) => block.text?.includes(MARKER_V1))).toBe(true);
+    expect(committed.results.some((block) => block.text?.includes(MARKER_V2))).toBe(false);
+    const indexedV1 = await indexDb.prepare(
+      'SELECT COUNT(*) AS n FROM blocks_fts JOIN blocks ON blocks.id = blocks_fts.rowid WHERE blocks_fts MATCH ?1 AND blocks.session_id = ?2',
+    )
+      .bind(`"${MARKER_V1}"`, SESSION_ID)
+      .first<{ n: number }>();
+    expect(indexedV1?.n).toBeGreaterThan(0);
+
+    const sourceAfterRace = await testEnv.DB.prepare('SELECT content_hash, parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ content_hash: string; parse_state: string }>();
+    expect(sourceAfterRace?.content_hash).toBe(await sha256Hex(new TextEncoder().encode(CONTENT_V2)));
+    expect(sourceAfterRace?.parse_state).toBe('pending');
+    const session = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ index_state: string }>();
+    expect(session?.index_state).toBe('parsing');
+
+    // Only the explicit fresh delivery may finish recovery; stale committed blocks must be replaced.
+    await drainQueue();
+    const sessionAfter = await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1')
+      .bind(SESSION_ID)
+      .first<{ index_state: string }>();
+    expect(sessionAfter?.index_state).toBe('ready');
+    const sourceAfterFresh = await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1')
+      .bind(fileId)
+      .first<{ parse_state: string }>();
+    expect(sourceAfterFresh?.parse_state).toBe('parsed');
+    const searchV2 = await SELF.fetch(`${API}/api/v1/search?q=${MARKER_V2}`, {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    expect(searchV2.status).toBe(200);
+    const bodyV2 = (await searchV2.json()) as { hits: Array<{ session_id: string }> };
+    expect(bodyV2.hits.some((hit) => hit.session_id === SESSION_ID)).toBe(true);
+    const searchV1 = await SELF.fetch(`${API}/api/v1/search?q=${MARKER_V1}`, {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    expect(searchV1.status).toBe(200);
+    const bodyV1 = (await searchV1.json()) as { hits: Array<{ session_id: string }> };
+    expect(bodyV1.hits.some((hit) => hit.session_id === SESSION_ID)).toBe(false);
   });
 });
 

@@ -17,6 +17,7 @@ import {
 } from './lib/dev-ownership.mjs';
 import { createProcessTracker, retryPortSelection, runCaptured, spawnOwned, terminateProcessTree } from './lib/dev-process.mjs';
 import { SYNTHETIC_EXPECTATIONS, fixtureModelPriceSql, seedSynthetic, syntheticSeedManifest } from './lib/dev-seed.mjs';
+import { waitForReadiness } from './lib/environment.mjs';
 
 const HELP = `Usage: node scripts/environment.mjs <command> [options]
 
@@ -111,29 +112,6 @@ async function checkPrerequisites() {
     throw new Error(`pinned Wrangler is unavailable; run npm ci in ${HUB_ROOT} (${error.message})`);
   }
   await assertNoSecretFiles();
-}
-
-async function waitForReadiness(baseUrl, expected, child, timeoutMs) {
-  const deadline = Date.now() + timeoutMs;
-  let last = 'not probed';
-  while (Date.now() < deadline) {
-    if (child.exitCode !== null || child.signalCode !== null) throw new Error(`Wrangler exited before readiness (${child.exitCode ?? child.signalCode})`);
-    try {
-      const response = await fetch(`${baseUrl}/healthz`, { signal: AbortSignal.timeout(1000) });
-      const text = await response.text();
-      last = `${response.status} ${text}`;
-      if (response.ok) {
-        const body = JSON.parse(text);
-        const mismatch = Object.entries(expected).find(([key, value]) => body[key] !== value);
-        if (!mismatch) return body;
-        last = `diagnostic mismatch for ${mismatch[0]}: expected ${mismatch[1]}, received ${body[mismatch[0]]}`;
-      }
-    } catch (error) {
-      last = String(error);
-    }
-    await new Promise((resolveDelay) => setTimeout(resolveDelay, 150));
-  }
-  throw new Error(`Wrangler readiness timed out after ${timeoutMs}ms; last probe: ${last}`);
 }
 
 async function copyDiagnostics(stateDir) {
@@ -454,6 +432,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(`environment: ${error.message}`);
+  console.error('environment:', error);
   process.exitCode = 1;
 });

@@ -2044,10 +2044,16 @@ async function writeSession(
   // matches every row of the session, `turn_index >= 0` every usage row), so the fallback is not a
   // second code path to keep correct — it is this one with an empty prefix.
   const mainClearRes = await db.batch([
+    // A first parse superseded at this exact boundary still needs an honest pending row for
+    // its live single-session source. Never derive an export id from changed archive bytes,
+    // nor reset any existing newer session under a stale source revision.
     db.prepare(`INSERT INTO sessions (session_id, harness, machine_id, canonical_file_id, index_state)
-      SELECT ?1, ?2, ?3, ?4, 'parsing'
-      WHERE EXISTS (SELECT 1 FROM files WHERE id = ?4 AND content_hash = ?5)
-      ON CONFLICT (session_id) DO UPDATE SET index_state = 'parsing'`)
+      SELECT ?1, ?2, ?3, ?4, 'parsing' FROM files source
+      WHERE source.id = ?4 AND (source.content_hash = ?5
+        OR (source.session_id = ?1 AND source.parse_state IN ('pending', 'reserved')
+          AND NOT EXISTS (SELECT 1 FROM sessions WHERE session_id = ?1)))
+      ON CONFLICT (session_id) DO UPDATE SET index_state = 'parsing'
+        WHERE EXISTS (SELECT 1 FROM files WHERE id = ?4 AND content_hash = ?5)`)
       .bind(s.id, s.harness, file.machine_id, file.id, file.content_hash),
     db.prepare(`DELETE FROM session_rollup_state WHERE session_id = ?1
       AND EXISTS (SELECT 1 FROM files WHERE id = ?2 AND content_hash = ?3)`)

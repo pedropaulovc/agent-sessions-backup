@@ -100,8 +100,8 @@ describe('session catalog concurrent version guards', () => {
     for (const db of indexDbs(testEnv)) {
       expect((await db.prepare('SELECT turn_key FROM starred_turns WHERE session_id = ?1')
         .bind(id).all()).results).toEqual([]);
-      expect(await db.prepare('SELECT deleted FROM catalog_versions WHERE session_id = ?1')
-        .bind(id).first()).toEqual({ deleted: 1 });
+      expect(await db.prepare('SELECT presence FROM catalog_versions WHERE session_id = ?1')
+        .bind(id).first()).toEqual({ presence: 'deleted' });
     }
   });
 

@@ -157,7 +157,7 @@ describe('ingest pipeline end-to-end', () => {
   });
 
   it('is idempotent: unchanged re-upload is a no-op; changed re-upload replaces rows without duplication', async () => {
-    await runSessionRollup(testEnv.DB);
+    await runSessionRollup(testEnv);
     const rollupBefore = await testEnv.DB.prepare(
       'SELECT generation, status FROM session_rollup_state WHERE session_id = ?1',
     ).bind(CC_SESSION_ID).first<{ generation: string; status: string }>();
@@ -180,7 +180,7 @@ describe('ingest pipeline end-to-end', () => {
     ).bind(CC_SESSION_ID).first<{ generation: string; status: string; eligible: number }>();
     expect(rollupAfter).toMatchObject({ status: 'pending', eligible: 1 });
     expect(rollupAfter?.generation).not.toBe(rollupBefore?.generation);
-    await runSessionRollup(testEnv.DB);
+    await runSessionRollup(testEnv);
     expect(await testEnv.DB.prepare(
       'SELECT SUM(assistant_turns) AS turns, SUM(tool_calls) AS calls FROM session_rollup WHERE session_id = ?1',
     ).bind(CC_SESSION_ID).first()).toEqual({ turns: 2, calls: 1 });
@@ -1793,13 +1793,13 @@ describe('OMP ingest end-to-end', () => {
       .all<{ cache_basis: string | null }>();
     expect(usageBasis.results).toEqual([{ cache_basis: 'disjoint' }]);
 
-    const blocks = await testEnv.DB.prepare(
+    const blocks = await indexDbFor(testEnv, OMP_ID).prepare(
       'SELECT btype, role, tool_name, text FROM blocks WHERE session_id = ?1 ORDER BY turn_index, block_index',
     )
       .bind(OMP_ID)
       .all<{ btype: string; role: string; tool_name: string | null; text: string | null }>();
     expect(blocks.results.map((block) => block.btype)).toEqual(['text', 'thinking', 'text', 'tool_use', 'tool_result', 'text']);
-    const pathFlags = await testEnv.DB.prepare(
+    const pathFlags = await indexDbFor(testEnv, OMP_ID).prepare(
       'SELECT DISTINCT on_main_path FROM blocks WHERE session_id = ?1',
     )
       .bind(OMP_ID)
