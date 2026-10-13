@@ -3,8 +3,10 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
+  canonicalJson,
   loadAndValidateManifest,
   migrationDigest,
+  sha256,
   validateHistoricalBaseline,
   verifySignedReleaseManifest,
 } from './migration-manifest.mjs';
@@ -14,8 +16,6 @@ import { normalizeSchemaSnapshot, schemaDigest } from './schema-digest.mjs';
 const here = path.dirname(fileURLToPath(import.meta.url));
 const hubRoot = path.resolve(here, '../..');
 const defaultMigrationsDir = path.join(hubRoot, 'migrations');
-const defaultSourceBaselinePath = path.join(defaultMigrationsDir, 'source-baseline.json');
-const defaultHistoryPath = path.join(defaultMigrationsDir, 'historical-baseline.json');
 const wranglerBin = path.join(hubRoot, 'node_modules', 'wrangler', 'bin', 'wrangler.js');
 const DIGEST = /^[0-9a-f]{64}$/;
 
@@ -88,7 +88,10 @@ function sqlLiteral(value) {
 
 function wranglerClient(options) {
   const runProcess = options.runProcess ?? defaultRunProcess;
-  const common = targetArguments(options);
+  const common = targetArguments({
+    ...options,
+    config: options.config ?? (['local', 'e2e'].includes(options.target) ? path.join(hubRoot, 'wrangler.jsonc') : undefined),
+  });
   const database = options.database ?? 'DB';
   const run = async (args) => await runProcess(args);
   return {
@@ -102,6 +105,15 @@ function wranglerClient(options) {
       return rows;
     },
   };
+}
+
+export async function hasLocalLegacyBlocks(options) {
+  if (options?.target !== 'local') throw new Error('legacy local-state inspection requires target local');
+  const client = wranglerClient(options);
+  const tables = await client.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'blocks'");
+  if (tables.length === 0) return false;
+  const rows = await client.query('SELECT EXISTS(SELECT 1 FROM blocks LIMIT 1) AS has_blocks');
+  return Number(rows[0]?.has_blocks) === 1;
 }
 
 async function readAppliedNames(client) {
@@ -199,26 +211,61 @@ async function remoteSchemaSnapshot(client) {
   });
 }
 
+export async function migrationDatabaseIdentity(options = {}) {
+  if (['local', 'e2e'].includes(options.target) && !options.persistTo) {
+    throw new Error(`${options.target} migrations require an explicit persistTo directory`);
+  }
+  const configPath = path.resolve(options.config ?? path.join(hubRoot, 'wrangler.jsonc'));
+  const { experimental_readRawConfig } = await import('wrangler');
+  const { rawConfig } = experimental_readRawConfig({ config: configPath }, { redirect: false });
+  const selector = options.database ?? 'DB';
+  const matches = (rawConfig.d1_databases ?? []).filter((database) =>
+    [database.binding, database.database_name, database.database_id].includes(selector));
+  if (matches.length !== 1 || !matches[0].binding || !matches[0].database_id) {
+    throw new Error(`migration database ${selector} must identify exactly one configured binding and database ID`);
+  }
+  const database = matches[0];
+  if (options.databaseId !== undefined && options.databaseId !== database.database_id) {
+    throw new Error(`migration database ID does not match binding ${database.binding}`);
+  }
+  const configuredMigrationsDir = path.resolve(path.dirname(configPath), database.migrations_dir ?? 'migrations');
+  const migrationsDir = path.resolve(options.migrationsDir ?? defaultMigrationsDir);
+  if (migrationsDir !== configuredMigrationsDir) {
+    throw new Error(`migration directory does not match binding ${database.binding}: ${configuredMigrationsDir}`);
+  }
+  return {
+    databaseBinding: database.binding,
+    databaseId: database.database_id,
+    ...(['local', 'e2e'].includes(options.target) ? { persistTo: path.resolve(options.persistTo) } : {}),
+  };
+}
+
 async function validateHistory(options, manifest) {
   // The trust anchor for production migrations is the protected main branch: whatever
   // manifest lands there deploys. The in-repo historical baseline stays validated for
   // structure (it names the pre-ledger history, incl. the 0019 divergence), but no
   // separately signed human-approved envelope is required — that ritual re-blocked
   // every migration behind a manual re-approval and was retired 2026-08-13.
-  const history = JSON.parse(await readFile(options.historyPath ?? defaultHistoryPath, 'utf8'));
+  if (manifest.ledgerStartsAt === 1) return; // Fresh schema: every migration is checksum-verified.
+  const migrationsDir = options.migrationsDir ?? defaultMigrationsDir;
+  const history = JSON.parse(await readFile(options.historyPath ?? path.join(migrationsDir, 'historical-baseline.json'), 'utf8'));
   validateHistoricalBaseline(history, manifest);
 }
 
-export function migrationDeploymentIdentity({ target, stateName, artifactDigest, migrationDigest: digest }) {
+export function migrationDeploymentIdentity({ target, stateName, artifactDigest, migrationDigest: digest, databaseBinding, databaseId, persistTo }) {
   if (!DIGEST.test(artifactDigest ?? '') || !DIGEST.test(digest ?? '')) {
     throw new Error('local migration identity requires artifact and migration SHA-256 digests');
   }
   if (!['local', 'e2e'].includes(target) || typeof stateName !== 'string' || !stateName) {
     throw new Error('invalid local migration identity');
   }
+  if (typeof databaseBinding !== 'string' || !databaseBinding || typeof databaseId !== 'string' || !databaseId || !persistTo) {
+    throw new Error('local migration identity requires a database binding, database ID, and persistence directory');
+  }
+  const databaseDigest = sha256(`${canonicalJson({ stateName, databaseBinding, databaseId, persistTo: path.resolve(persistTo) })}\n`);
   return {
-    journalName: `${artifactDigest}-${digest}.json`,
-    deploymentId: `${target}:${stateName}:${artifactDigest}:${digest}`,
+    journalName: `${databaseBinding}-${databaseDigest}-${artifactDigest}-${digest}.json`,
+    deploymentId: `${target}:${databaseDigest}:${artifactDigest}:${digest}`,
   };
 }
 
@@ -227,7 +274,7 @@ export async function resolveMigrationDigest(options = {}) {
   const { digest } = await loadAndValidateManifest({
     migrationsDir,
     manifestPath: options.manifestPath ?? path.join(migrationsDir, 'manifest.json'),
-    baseManifestPath: options.baseManifestPath ?? defaultSourceBaselinePath,
+    baseManifestPath: options.baseManifestPath ?? path.join(migrationsDir, 'source-baseline.json'),
   });
   return digest;
 }
@@ -250,7 +297,7 @@ export async function runMigrations(options) {
   const { manifest, digest } = await loadAndValidateManifest({
     migrationsDir,
     manifestPath: options.manifestPath ?? path.join(migrationsDir, 'manifest.json'),
-    baseManifestPath: options.baseManifestPath ?? defaultSourceBaselinePath,
+    baseManifestPath: options.baseManifestPath ?? path.join(migrationsDir, 'source-baseline.json'),
   });
   if (options.expectedMigrationDigest && options.expectedMigrationDigest !== digest) {
     throw new Error('migration manifest changed after deployment identity was computed');
@@ -262,12 +309,14 @@ export async function runMigrations(options) {
   } else if (options.releaseManifest || options.releasePublicKey) {
     throw new Error('signed release manifest and public key must be supplied together');
   }
+  const databaseIdentity = await migrationDatabaseIdentity(options);
   const client = wranglerClient(options);
   const identity = {
     target: options.target,
     deploymentId: options.deploymentId,
     artifactDigest: options.artifactDigest,
     migrationDigest: digest,
+    ...databaseIdentity,
   };
   const { result } = await runJournaledMigration({
     journalPath: options.journalPath,
@@ -297,6 +346,7 @@ export async function runMigrations(options) {
       const snapshot = await remoteSchemaSnapshot(client);
       const liveSchemaDigest = schemaDigest(snapshot);
       return {
+        ...databaseIdentity,
         migrationDigest: digest,
         schemaDigest: liveSchemaDigest,
         pendingMigrations,

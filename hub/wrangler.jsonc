@@ -39,6 +39,9 @@
   // supplies its independent Miniflare bindings in vitest.config.ts.
   "vars": {
     "ENVIRONMENT": "production",
+    "INDEX_SHARD_COUNT": "16",
+    // Protected CI generates database IDs and an exact revision marker before deployment.
+    "INDEX_MODE": "maintenance",
     "API_HOST": "api.sessions.pedrovc.com.br",
     "VIEWER_HOST": "sessions.pedrovc.com.br",
     "R2_DASHBOARD_BASE_URL": "https://dash.cloudflare.com/18ef3246e9f36d1560485ef53889c0ab/r2/default/buckets/agent-sessions-raw",
@@ -57,7 +60,23 @@
       "database_name": "sessions-index",
       "database_id": "5ff65cf3-89c8-4fe6-a3c2-a370293ecea6",
       "migrations_dir": "migrations"
-    }
+    },
+    { "binding": "IDX00", "database_name": "sessions-index-idx00", "migrations_dir": "migrations-index" },
+    { "binding": "IDX01", "database_name": "sessions-index-idx01", "migrations_dir": "migrations-index" },
+    { "binding": "IDX02", "database_name": "sessions-index-idx02", "migrations_dir": "migrations-index" },
+    { "binding": "IDX03", "database_name": "sessions-index-idx03", "migrations_dir": "migrations-index" },
+    { "binding": "IDX04", "database_name": "sessions-index-idx04", "migrations_dir": "migrations-index" },
+    { "binding": "IDX05", "database_name": "sessions-index-idx05", "migrations_dir": "migrations-index" },
+    { "binding": "IDX06", "database_name": "sessions-index-idx06", "migrations_dir": "migrations-index" },
+    { "binding": "IDX07", "database_name": "sessions-index-idx07", "migrations_dir": "migrations-index" },
+    { "binding": "IDX08", "database_name": "sessions-index-idx08", "migrations_dir": "migrations-index" },
+    { "binding": "IDX09", "database_name": "sessions-index-idx09", "migrations_dir": "migrations-index" },
+    { "binding": "IDX10", "database_name": "sessions-index-idx10", "migrations_dir": "migrations-index" },
+    { "binding": "IDX11", "database_name": "sessions-index-idx11", "migrations_dir": "migrations-index" },
+    { "binding": "IDX12", "database_name": "sessions-index-idx12", "migrations_dir": "migrations-index" },
+    { "binding": "IDX13", "database_name": "sessions-index-idx13", "migrations_dir": "migrations-index" },
+    { "binding": "IDX14", "database_name": "sessions-index-idx14", "migrations_dir": "migrations-index" },
+    { "binding": "IDX15", "database_name": "sessions-index-idx15", "migrations_dir": "migrations-index" }
   ],
   "r2_buckets": [{ "binding": "RAW", "bucket_name": "agent-sessions-raw" }],
   "kv_namespaces": [{ "binding": "KV", "id": "61505c2df55242daa2f572c188819961" }],
@@ -139,6 +158,8 @@
       "preview_urls": true,
       "vars": {
         "ENVIRONMENT": "preview",
+        "INDEX_SHARD_COUNT": "2",
+        "INDEX_MODE": "active",
         // Allowlist for /api/v1/admin/migrate's GitHub OIDC caller. Preview ONLY: the
         // production config must never carry this, so the endpoint cannot exist there.
         "MIGRATE_OIDC_REPOSITORY": "pedropaulovc/agent-sessions-backup",
@@ -149,10 +170,13 @@
       "d1_databases": [
         {
           "binding": "DB",
-          "database_name": "sessions-index-preview",
-          "database_id": "fb961c41-cd40-47ea-8df0-46fda279701d",
+          // Fresh metadata DB for the sharded standing preview. The retired single-DB
+          // sessions-index-preview is retained untouched; never drop its legacy index here.
+          "database_name": "sessions-metadata-preview",
           "migrations_dir": "migrations"
-        }
+        },
+        { "binding": "IDX00", "database_name": "sessions-metadata-preview-idx00", "migrations_dir": "migrations-index" },
+        { "binding": "IDX01", "database_name": "sessions-metadata-preview-idx01", "migrations_dir": "migrations-index" }
       ],
       "r2_buckets": [{ "binding": "RAW", "bucket_name": "agent-sessions-raw-preview" }],
       "kv_namespaces": [{ "binding": "KV", "id": "f3413813878c4846b7586c25f01cbe24" }],

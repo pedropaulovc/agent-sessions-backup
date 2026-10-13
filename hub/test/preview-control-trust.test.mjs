@@ -8,6 +8,8 @@ import {
   PREVIEW_ACCOUNT_ID,
   PRODUCTION_ACCOUNT_ID,
   assertPreviewAccount,
+  assertPreviewIndexLayout,
+  assertPreviewResourceNames,
   assertWorkerModulePayload,
   deleteInDependencyPasses,
   emptyR2Bucket,
@@ -16,6 +18,8 @@ import {
   migrationSqlNames,
   paginatedList,
   previewBearerToken,
+  previewDatabasePlan,
+  previewIndexLayout,
   previewResourceOwner,
   queueConsumerIdsForQueue,
   resolveBundlerInputPath,
@@ -34,14 +38,16 @@ const ASSET_SECRET = 'S'.repeat(43);
 const DIGEST = 'd'.repeat(64);
 
 function appConfig(overrides = {}) {
-  const names = resourceNames(42);
+  const names = overrides.names ?? resourceNames(42);
   return generatedPrivateAppConfig({
     accountId: PREVIEW_ACCOUNT_ID,
     main: '/tmp/payload/worker.mjs',
     migrationsDir: '/tmp/payload/migrations',
+    indexMigrationsDir: '/tmp/payload/migrations-index',
     names,
     resources: {
       d1: 'd1-id',
+      indexShards: ['idx00-id', 'idx01-id'],
       kv: 'kv-id',
       pr: 42,
       headSha: SHA,
@@ -75,6 +81,7 @@ describe('stable per-PR resource names', () => {
     expect(names).toMatchObject({
       app: 'pr-42-app',
       d1: 'pr-42-sessions-index',
+      indexShards: ['pr-42-sessions-index-idx00', 'pr-42-sessions-index-idx01'],
       r2: 'pr-42-agent-sessions',
       kv: 'pr-42-sessions-hub-kv',
       queue: 'pr-42-parse',
@@ -87,6 +94,14 @@ describe('stable per-PR resource names', () => {
 
   it('classifies resource ownership for cleanup, including legacy generation debris', () => {
     expect(previewResourceOwner('pr-42-sessions-index')).toEqual({ pr: 42, legacy: false });
+    for (const name of resourceNames(42).indexShards) {
+      expect(previewResourceOwner(name, 'd1')).toEqual({ pr: 42, legacy: false });
+      expect(previewResourceOwner(name, 'worker')).toBeNull();
+    }
+    expect(previewResourceOwner('pr-42-sessions-index-idx02')).toBeNull();
+    expect(previewResourceOwner('pr-42-sessions-index-idx01-extra')).toBeNull();
+    expect(previewResourceOwner('pr-42-app', 'd1')).toBeNull();
+    expect(previewResourceOwner(`pr-17-g12345-${'a'.repeat(12)}-foreign`)).toBeNull();
     expect(previewResourceOwner('pr-42-app')).toEqual({ pr: 42, legacy: false });
     expect(previewResourceOwner(`pr-17-g12345-${'a'.repeat(12)}-app`)).toEqual({ pr: 17, legacy: true });
     expect(previewResourceOwner('sessions-index')).toBeNull();
@@ -99,6 +114,41 @@ describe('stable per-PR resource names', () => {
     for (const name of ['session-rollup', 'session-rollup-preview', 'pr-42-session-rollup-preview', 'pr-0-session-rollup']) {
       expect(previewResourceOwner(name)).toBeNull();
     }
+  });
+});
+
+describe('preview immutable layout and Free database quota', () => {
+  it('rejects changed PR names, shard counts, and reordered shard names', () => {
+    const names = resourceNames(42);
+    expect(() => assertPreviewResourceNames(names, 42)).not.toThrow();
+    expect(() => assertPreviewResourceNames(names, 43)).toThrow(/immutable per-PR layout/);
+    expect(() => assertPreviewIndexLayout(previewIndexLayout(names), names)).not.toThrow();
+    expect(() => assertPreviewIndexLayout({ ...previewIndexLayout(names), count: 16 }, names)).toThrow(/immutable/);
+    expect(() => assertPreviewIndexLayout({
+      ...previewIndexLayout(names),
+      databases: [...previewIndexLayout(names).databases].reverse(),
+    }, names)).toThrow(/immutable/);
+  });
+
+  it('counts all account databases and only allocates missing trusted names', () => {
+    const names = resourceNames(42);
+    const others = Array.from({ length: 7 }, (_, index) => ({ name: `foreign-${index}`, uuid: `foreign-id-${index}` }));
+    const plan = previewDatabasePlan([...others, { name: names.d1, uuid: 'main-id' }], names);
+    expect([...plan.existing]).toEqual([['DB', 'main-id']]);
+    expect(plan.missing).toEqual([
+      { binding: 'IDX00', name: names.indexShards[0] },
+      { binding: 'IDX01', name: names.indexShards[1] },
+    ]);
+    expect(() => previewDatabasePlan([...others, { name: 'foreign-extra', uuid: 'extra' }], names))
+      .toThrow(/8\/10 databases exist, 3 required.*no other PR resources were deleted/);
+  });
+
+  it('reuses all three databases even when no quota remains and rejects duplicate trusted names', () => {
+    const names = resourceNames(42);
+    const trusted = previewIndexLayout(names).databases.map(({ name, binding }) => ({ name, uuid: binding }));
+    const others = Array.from({ length: 7 }, (_, index) => ({ name: `foreign-${index}`, uuid: `foreign-id-${index}` }));
+    expect(previewDatabasePlan([...trusted, ...others], names).missing).toEqual([]);
+    expect(() => previewDatabasePlan([...trusted, trusted[0]], names)).toThrow(/multiple preview databases/);
   });
 });
 
@@ -258,6 +308,9 @@ describe('queue consumer detachment', () => {
     expect(() => queueConsumerIdsForQueue([
       { consumer_id: 'c4', script_name: 'sessions-hub' },
     ], 'pr-42-parse')).toThrow(/foreign queue consumer/);
+    expect(() => queueConsumerIdsForQueue([
+      { consumer_id: 'other-pr', script_name: 'pr-43-app' },
+    ], 'pr-42-parse')).toThrow(/foreign queue consumer/);
   });
 
   it('refuses to detach a foreign standing consumer from a PR rollup queue', () => {
@@ -321,6 +374,9 @@ describe('private preview application config', () => {
     expect(config.vars.API_HOST).toBe('pr-42-app.sessions-ppe.workers.dev');
     expect(config.vars.VIEWER_HOST).toBe(config.vars.API_HOST);
     expect(config.vars.PREVIEW_PR_NUMBER).toBe('42');
+    expect(config.vars.INDEX_SHARD_COUNT).toBe('2');
+    expect(config.vars.INDEX_MODE).toBe('active');
+    expect(config.vars.DEPLOYMENT_REVISION).toBe(SHA);
     // The assertion/JWKS machinery died with the front door — its vars must never come back.
     for (const retired of [
       'PREVIEW_ASSERTION_ISSUER',
@@ -336,7 +392,11 @@ describe('private preview application config', () => {
     ]) {
       expect(config.vars).not.toHaveProperty(retired);
     }
-    expect(config.d1_databases[0]).toMatchObject({ binding: 'DB', database_name: 'pr-42-sessions-index', database_id: 'd1-id' });
+    expect(config.d1_databases).toEqual([
+      { binding: 'DB', database_name: 'pr-42-sessions-index', database_id: 'd1-id', migrations_dir: '/tmp/payload/migrations' },
+      { binding: 'IDX00', database_name: 'pr-42-sessions-index-idx00', database_id: 'idx00-id', migrations_dir: '/tmp/payload/migrations-index' },
+      { binding: 'IDX01', database_name: 'pr-42-sessions-index-idx01', database_id: 'idx01-id', migrations_dir: '/tmp/payload/migrations-index' },
+    ]);
     expect(config.r2_buckets[0]).toMatchObject({ binding: 'RAW', bucket_name: 'pr-42-agent-sessions' });
     expect(config.ratelimits).toEqual([{
       name: 'OMP_QA_RATE_LIMITER',
@@ -350,6 +410,14 @@ describe('private preview application config', () => {
     expect(() => appConfig({ application: { previewBearer: 'not-a-token' } })).toThrow(/preview bearer/);
     expect(() => appConfig({ application: { assetSigningSecret: 'short' } })).toThrow(/asset signing secret/);
     expect(() => appConfig({ resources: { schemaDigest: 'xyz' } })).toThrow(/invalid schemaDigest/);
+  });
+
+  it('rejects missing, duplicate, or foreign-named database layouts rather than binding main as an index', () => {
+    expect(() => appConfig({ resources: { indexShards: ['only-one'] } })).toThrow(/exactly two/);
+    expect(() => appConfig({ resources: { indexShards: ['d1-id', 'idx01-id'] } })).toThrow(/must be distinct/);
+    expect(() => appConfig({ names: { ...resourceNames(42), indexShards: ['pr-43-sessions-index-idx00', 'pr-42-sessions-index-idx01'] } }))
+      .toThrow(/immutable per-PR layout/);
+    expect(() => appConfig({ resources: { headSha: 'not-a-sha' } })).toThrow(/head SHA/);
   });
 
   it('keeps the build config private (no public URL surface)', () => {

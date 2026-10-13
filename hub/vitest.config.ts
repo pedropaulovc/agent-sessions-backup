@@ -1,21 +1,31 @@
 import { cloudflareTest, readD1Migrations } from '@cloudflare/vitest-pool-workers';
+import { fileURLToPath } from 'node:url';
+import { writeLocalConfig } from './scripts/lib/local-config.mjs';
 import { configDefaults, defineConfig } from 'vitest/config';
 
 export default defineConfig(async () => {
   const migrations = await readD1Migrations('./migrations');
+  const indexMigrations = await readD1Migrations('./migrations-index');
+  const hubRoot = fileURLToPath(new URL('.', import.meta.url));
+  const { configPath } = await writeLocalConfig({
+    stateDir: fileURLToPath(new URL('./.dev/vitest/', import.meta.url)),
+    hubRoot,
+    revision: 'test',
+  });
   return {
     plugins: [
       cloudflareTest({
-        wrangler: { configPath: './wrangler.jsonc' },
+        wrangler: { configPath },
         miniflare: {
           bindings: {
             ENVIRONMENT: 'development',
             SETUP_TOKEN: 'test-setup-token',
             TEST_MIGRATIONS: migrations,
+            TEST_INDEX_MIGRATIONS: indexMigrations,
             CF_OAUTH_CLIENT_ID: 'test-oauth-client',
           },
           // The local queue simulator auto-delivers parse and rollup messages on its own real-time
-          // timer (wrangler.jsonc sets no max_batch_timeout, so it falls back to a short local
+          // timer (the base Wrangler config sets no max_batch_timeout, so it falls back to a short local
           // default — observed firing well under 1.5s), independent of and in addition to this
           // suite's explicit drainQueue()/deliverOne() helpers. Every test that puts a file in a
           // deliberately-still-pending state (to test ordering against a LATER explicit delivery)

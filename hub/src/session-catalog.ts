@@ -8,7 +8,7 @@
 // snapshot), then applies them to every shard in batches guarded by the shard's `catalog_versions`
 // (index-layout.mjs sessionCatalogBatches): a newer version replaces, an equal version re-applies
 // identically, and an older (late, concurrent) sync changes nothing. A session absent from main is
-// recorded as a tombstone (deleted = 1), so a late older sync cannot resurrect it. Stars always
+// recorded as a tombstone (presence 'deleted'), so a late older sync cannot resurrect it. Stars always
 // mirror main's starred_turns for the session, which survive a session delete exactly as on main.
 //
 // Writers call syncSessionCatalog with the ids they changed after their main commit. Once every
@@ -111,6 +111,7 @@ function catalogEntries(
 /** One consistent main snapshot of the small sessions among `sessionIds`, plus the large ids. */
 async function readBulk(env: Env, sessionIds: readonly string[]): Promise<{ entries: SessionCatalogEntry[]; large: string[] }> {
   const ids = JSON.stringify(sessionIds);
+  // D1 batch returns one result per statement, in order.
   const [classified, sessions, stars] = await env.DB.batch([
     env.DB.prepare(`${BULK_IDS}
       SELECT ids.session_id, v.version, ids.session_id IN (SELECT session_id FROM small) AS small
@@ -119,12 +120,11 @@ async function readBulk(env: Env, sessionIds: readonly string[]): Promise<{ entr
       .bind(ids, CATALOG_BULK_ENTRY_BYTES),
     env.DB.prepare(`${BULK_IDS} ${STAR_SELECT} WHERE session_id IN (SELECT session_id FROM small) ORDER BY session_id, turn_key`)
       .bind(ids, CATALOG_BULK_ENTRY_BYTES),
-  ]);
-  const rows = classified.results as { session_id: string; version: number | null; small: number }[];
-  const small = rows.filter((row) => row.small === 1);
+  ]) as [D1Result<{ session_id: string; version: number | null; small: number }>, D1Result<CatalogRow>, D1Result<CatalogRow>];
+  const small = classified.results.filter((row) => row.small === 1);
   return {
-    entries: catalogEntries(small.map((row) => row.session_id), small, sessions.results as CatalogRow[], stars.results as CatalogRow[]),
-    large: rows.filter((row) => row.small !== 1).map((row) => row.session_id),
+    entries: catalogEntries(small.map((row) => row.session_id), small, sessions.results, stars.results),
+    large: classified.results.filter((row) => row.small !== 1).map((row) => row.session_id),
   };
 }
 
@@ -134,13 +134,8 @@ async function readOne(env: Env, sessionId: string): Promise<SessionCatalogEntry
     env.DB.prepare('SELECT session_id, version FROM session_catalog_versions WHERE session_id = ?1').bind(sessionId),
     env.DB.prepare(`${SESSION_SELECT} WHERE session_id = ?1`).bind(sessionId),
     env.DB.prepare(`${STAR_SELECT} WHERE session_id = ?1 ORDER BY turn_key`).bind(sessionId),
-  ]);
-  return catalogEntries(
-    [sessionId],
-    versions.results as { session_id: string; version: number }[],
-    sessions.results as CatalogRow[],
-    stars.results as CatalogRow[],
-  )[0];
+  ]) as [D1Result<{ session_id: string; version: number }>, D1Result<CatalogRow>, D1Result<CatalogRow>];
+  return catalogEntries([sessionId], versions.results, sessions.results, stars.results)[0];
 }
 
 /**

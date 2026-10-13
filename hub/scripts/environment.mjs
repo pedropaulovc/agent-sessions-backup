@@ -3,7 +3,9 @@ import { createWriteStream } from 'node:fs';
 import { copyFile, lstat, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { basename, join, resolve } from 'node:path';
 import { once } from 'node:events';
-import { migrationDeploymentIdentity, resolveMigrationDigest, runMigrations } from './lib/migration-runner.mjs';
+import { hasLocalLegacyBlocks, migrationDeploymentIdentity, resolveMigrationDigest, runMigrations } from './lib/migration-runner.mjs';
+import { canonicalJson, sha256 } from './lib/migration-manifest.mjs';
+import { assertReusableLocalTopology, writeLocalConfig } from './lib/local-config.mjs';
 import { HUB_ROOT, DEV_ROOT, assertSafeExistingStatePath, localStatePath, resolveStatePath } from './lib/dev-paths.mjs';
 import { buildReproducibly } from './lib/dev-manifests.mjs';
 import {
@@ -225,41 +227,75 @@ async function startEnvironment(options) {
       if (signalExitCode) process.exitCode = signalExitCode;
       return;
     }
-    const expectedMigrationDigest = await resolveMigrationDigest();
-    if (shutdownRequested) {
-      if (signalExitCode) process.exitCode = signalExitCode;
-      return;
-    }
-    const { journalName, deploymentId } = migrationDeploymentIdentity({
-      target: mode,
-      stateName,
-      artifactDigest: build.artifactDigest,
-      migrationDigest: expectedMigrationDigest,
+    const deploymentRevision = `${mode}:${build.artifactDigest}`;
+    const { config, configPath } = await writeLocalConfig({
+      stateDir, hubRoot: HUB_ROOT, revision: deploymentRevision,
     });
-    let migration;
+    const databases = [];
     try {
-      migration = await runMigrations({
-        target: mode,
-        persistTo: stateDir,
-        journalPath: join(stateDir, 'migration-journals', journalName),
-        artifactDigest: build.artifactDigest,
-        expectedMigrationDigest,
-        deploymentId,
-        runProcess: (args) => {
-          if (shutdownRequested) throw new Error('local migration aborted');
-          return runCaptured(process.execPath, [wranglerPath(), ...args], {
-            cwd: HUB_ROOT,
-            env: childEnv,
-            label: 'local migration Wrangler',
-            tracker,
-          });
-        },
-      });
+      if (mode === 'local') {
+        await assertReusableLocalTopology({
+          stateDir,
+          databases: config.d1_databases,
+          hasLegacyBlocks: () => hasLocalLegacyBlocks({
+            target: mode, config: configPath, persistTo: stateDir,
+            runProcess: (args) => {
+              if (shutdownRequested) throw new Error('local state inspection aborted');
+              return runCaptured(process.execPath, [wranglerPath(), ...args], {
+                cwd: HUB_ROOT, env: childEnv, label: 'local schema inspection', tracker,
+              });
+            },
+          }),
+        });
+      }
+      // Metadata first, then both indexes; nothing uploads fixtures until all three
+      // independent migration histories and checksum ledgers have been verified.
+      for (const database of config.d1_databases) {
+        if (shutdownRequested) throw new Error('local migration aborted');
+        const migrationsDir = database.migrations_dir;
+        const expectedMigrationDigest = await resolveMigrationDigest({ migrationsDir });
+        const { journalName, deploymentId } = migrationDeploymentIdentity({
+          target: mode,
+          stateName,
+          artifactDigest: build.artifactDigest,
+          migrationDigest: expectedMigrationDigest,
+          databaseBinding: database.binding,
+          databaseId: database.database_id,
+          persistTo: stateDir,
+        });
+        databases.push(await runMigrations({
+          target: mode,
+          config: configPath,
+          database: database.binding,
+          databaseId: database.database_id,
+          migrationsDir,
+          persistTo: stateDir,
+          journalPath: join(stateDir, 'migration-journals', journalName),
+          artifactDigest: build.artifactDigest,
+          expectedMigrationDigest,
+          deploymentId,
+          runProcess: (args) => {
+            if (shutdownRequested) throw new Error('local migration aborted');
+            return runCaptured(process.execPath, [wranglerPath(), ...args], {
+              cwd: HUB_ROOT,
+              env: childEnv,
+              label: `local migration Wrangler (${database.binding})`,
+              tracker,
+            });
+          },
+        }));
+      }
     } catch (error) {
       if (!shutdownRequested) throw error;
       if (signalExitCode) process.exitCode = signalExitCode;
       return;
     }
+    const migration = {
+      migrationDigest: sha256(`${canonicalJson(databases.map(({ databaseBinding, migrationDigest }) => ({ databaseBinding, migrationDigest })))}\n`),
+      schemaDigest: sha256(`${canonicalJson(databases.map(({ databaseBinding, schemaDigest }) => ({ databaseBinding, schemaDigest })))}\n`),
+      pendingMigrations: databases.reduce((count, database) => count + database.pendingMigrations, 0),
+      databases,
+    };
     if (migration.pendingMigrations !== 0) throw new Error(`migration verification found ${migration.pendingMigrations} pending migrations`);
     if (shutdownRequested) {
       if (signalExitCode) process.exitCode = signalExitCode;
@@ -274,7 +310,7 @@ async function startEnvironment(options) {
     // above does; report the signal's exit code rather than a crash from an aborted command.
     try {
       await runCaptured(process.execPath, [
-        wranglerPath(), 'd1', 'execute', 'sessions-index', '--local', '--persist-to', stateDir,
+        wranglerPath(), 'd1', 'execute', 'DB', '--config', configPath, '--local', '--persist-to', stateDir,
         '--command', fixtureModelPriceSql(),
       ], { cwd: HUB_ROOT, env: childEnv, label: 'local fixture model prices', tracker });
     } catch (error) {
@@ -290,6 +326,9 @@ async function startEnvironment(options) {
     const environmentId = mode === 'local' ? `local-${stateName}` : `e2e-${nonce.slice(0, 12)}`;
     const diagnostics = {
       environmentId,
+      deploymentRevision,
+      indexMode: 'active',
+      indexShardCount: 2,
       environmentNonce: nonce,
       buildInputDigest: build.buildInputDigest,
       artifactDigest: build.artifactDigest,
@@ -328,7 +367,7 @@ async function startEnvironment(options) {
         await writeFile(join(stateDir, 'environment-manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`, 'utf8');
         const args = [
           wranglerPath(), 'dev', '--local', '--ip', '127.0.0.1', '--port', String(selectedPort),
-          '--persist-to', stateDir, '--env-file', emptyEnv,
+          '--config', configPath, '--persist-to', stateDir, '--env-file', emptyEnv,
           '--var', 'ENVIRONMENT:development',
           '--var', `ENVIRONMENT_ID:${environmentId}`,
           '--var', `ENVIRONMENT_NONCE:${nonce}`,

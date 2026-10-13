@@ -108,9 +108,14 @@ severity. Successful manual completion is logged only after its durable result c
 
 The `ROLLUP_QUEUE` consumer is separate from parsing, with one message per invocation.
 Local development uses the local queue simulator without a Cloudflare login. Protected main CI
-provisions the production queue before deployment; per-PR previews create their own queue.
-For standing preview, `npm --prefix hub run deploy:preview` provisions `session-rollup-preview`
-before deploying and requires an explicitly supplied preview-scoped `CLOUDFLARE_API_TOKEN`.
+provisions the production queue and sixteen index shards. The protected first cutover freezes
+legacy block writes, verifies full-row copies before source deletion, and resumes from durable
+shard checkpoints; subsequent active-layout deployments take the ordinary fast path.
+For standing preview, `npm --prefix hub run deploy:preview` provisions and migrates fresh metadata
+plus two index databases and `session-rollup-preview` before deploying. It requires an explicit
+preview-scoped `CLOUDFLARE_PPE_API_TOKEN` or `CLOUDFLARE_API_TOKEN`; it never uses production login.
+See [deployment and cutover operations](infra/cf/deploy.md). Local `npm run deploy` intentionally
+refuses production deployment: protected main CI is the sole production control plane.
 
 ## Layout
 

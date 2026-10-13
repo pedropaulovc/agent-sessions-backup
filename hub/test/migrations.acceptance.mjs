@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { generateKeyPairSync, sign } from 'node:crypto';
-import { cp, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -19,7 +19,9 @@ import {
   validateManifestShape,
   verifySignedReleaseManifest,
 } from '../scripts/lib/migration-manifest.mjs';
-import { runMigrations } from '../scripts/lib/migration-runner.mjs';
+import { hasLocalLegacyBlocks, migrationDatabaseIdentity, resolveMigrationDigest, runMigrations } from '../scripts/lib/migration-runner.mjs';
+import { writeLocalConfig } from '../scripts/lib/local-config.mjs';
+import { fixtureModelPriceSql } from '../scripts/lib/dev-seed.mjs';
 import {
   AmbiguousJournalError,
   openMigrationJournal,
@@ -32,13 +34,14 @@ const migrationsDir = path.join(hubRoot, 'migrations');
 const manifestPath = path.join(migrationsDir, 'manifest.json');
 const sourceBaselinePath = path.join(migrationsDir, 'source-baseline.json');
 const historyPath = path.join(migrationsDir, 'historical-baseline.json');
+const indexMigrationsDir = path.join(hubRoot, 'migrations-index');
 const artifactDigest = 'a'.repeat(64);
 
-async function loadFixture() {
-  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+async function loadFixture(directory = migrationsDir) {
+  const manifest = JSON.parse(await readFile(path.join(directory, 'manifest.json'), 'utf8'));
   const sql = new Map();
   for (const migration of manifest.migrations) {
-    sql.set(migration.filename, await readFile(path.join(migrationsDir, migration.filename), 'utf8'));
+    sql.set(migration.filename, await readFile(path.join(directory, migration.filename), 'utf8'));
   }
   return { manifest, sql };
 }
@@ -237,6 +240,11 @@ test('clean install and base upgrade converge on the same normalized schema and 
     const upgradedSchema = schemaSnapshotFromDatabase(upgraded);
     assert.deepEqual(upgradedSchema, cleanSchema);
     assert.equal(schemaDigest(upgradedSchema), schemaDigest(cleanSchema));
+    assert.deepEqual(
+      clean.prepare("SELECT name FROM sqlite_master WHERE name IN ('blocks', 'blocks_fts')").all(),
+      [],
+      'the final main schema must contain metadata only, never a legacy block fallback',
+    );
     assert.deepEqual(
       upgraded.prepare('SELECT sequence, filename, sha256 FROM migration_checksum_ledger ORDER BY sequence').all(),
       clean.prepare('SELECT sequence, filename, sha256 FROM migration_checksum_ledger ORDER BY sequence').all(),
@@ -700,6 +708,209 @@ test('migration runner applies once, measures verify state, and trusts the prote
   );
 });
 
+test('local and e2e migrate independent main and two shard histories before fixture pricing', async (context) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hub-shard-migrations-'));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const fixtures = new Map([
+    [migrationsDir, await loadFixture()],
+    [indexMigrationsDir, await loadFixture(indexMigrationsDir)],
+  ]);
+  for (const target of ['local', 'e2e']) {
+    const stateDir = path.join(directory, target);
+    const { config, configPath } = await writeLocalConfig({ stateDir, hubRoot, revision: `${target}:acceptance` });
+    const databases = new Map(config.d1_databases.map(({ binding }) => [binding, createDatabase()]));
+    const applies = new Map();
+    context.after(() => { for (const database of databases.values()) database.close(); });
+    const runProcess = async (args) => {
+      assert.equal(args[args.indexOf('--config') + 1], configPath);
+      assert.equal(args[args.indexOf('--persist-to') + 1], stateDir);
+      assert.ok(args.includes('--local'));
+      assert.ok(!args.includes('--remote'));
+      const applying = args[1] === 'migrations';
+      const binding = args[applying ? 3 : 2];
+      const database = databases.get(binding);
+      assert.ok(database, `unexpected database ${binding}`);
+      const definition = config.d1_databases.find((entry) => entry.binding === binding);
+      if (applying) {
+        applies.set(binding, (applies.get(binding) ?? 0) + 1);
+        applyPending(database, fixtures.get(definition.migrations_dir));
+        return { stdout: '', stderr: '' };
+      }
+      const sql = args[args.indexOf('--command') + 1];
+      return { stdout: JSON.stringify([{ results: database.prepare(sql).all() }]), stderr: '' };
+    };
+    const optionsByBinding = new Map();
+    for (const definition of config.d1_databases) {
+      const options = {
+        target, persistTo: stateDir, config: configPath, database: definition.binding,
+        databaseId: definition.database_id, migrationsDir: definition.migrations_dir,
+        journalPath: path.join(stateDir, `${definition.binding}.json`),
+        artifactDigest, deploymentId: `${target}:same-artifact`, runProcess,
+      };
+      optionsByBinding.set(definition.binding, options);
+      const result = await runMigrations(options);
+      assert.equal(result.databaseBinding, definition.binding);
+      assert.equal(result.databaseId, definition.database_id);
+      assert.equal(result.migrationDigest, await resolveMigrationDigest({ migrationsDir: definition.migrations_dir }));
+      assert.equal(result.pendingMigrations, 0);
+      assert.deepEqual(await runMigrations(options), result, 'the exact database journal resumes without another apply');
+      assert.equal(applies.get(definition.binding), 1);
+      const database = databases.get(definition.binding);
+      const fixture = fixtures.get(definition.migrations_dir);
+      assert.deepEqual(
+        database.prepare('SELECT name FROM d1_migrations ORDER BY id').all().map(({ name }) => name),
+        fixture.manifest.migrations.map(({ filename }) => filename),
+      );
+      assert.equal(
+        database.prepare('SELECT COUNT(*) AS count FROM migration_checksum_ledger').get().count,
+        fixture.manifest.migrations.filter(({ sequence }) => sequence >= fixture.manifest.ledgerStartsAt).length,
+      );
+    }
+    assert.deepEqual([...applies.keys()], ['DB', 'IDX00', 'IDX01']);
+    const main = databases.get('DB');
+    assert.deepEqual(main.prepare("SELECT name FROM sqlite_master WHERE name IN ('blocks', 'blocks_fts')").all(), []);
+    for (const binding of ['IDX00', 'IDX01']) {
+      const shard = databases.get(binding);
+      assert.deepEqual(
+        shard.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('sessions', 'starred_turns', 'blocks', 'blocks_fts', 'catalog_versions', 'shard_meta') ORDER BY name").all().map(({ name }) => name),
+        ['blocks', 'blocks_fts', 'catalog_versions', 'sessions', 'shard_meta', 'starred_turns'],
+      );
+      assert.deepEqual(shard.prepare("SELECT name FROM sqlite_master WHERE name IN ('usage', 'files', 'model_prices')").all(), []);
+    }
+    // Prices remain authoritative metadata; uploads still use the ordinary worker path.
+    main.exec(fixtureModelPriceSql());
+    assert.ok(main.prepare('SELECT COUNT(*) AS count FROM model_prices').get().count > 0);
+    await assert.rejects(runMigrations({
+      ...optionsByBinding.get('IDX01'), journalPath: optionsByBinding.get('IDX00').journalPath,
+    }), /different immutable artifact, deployment, or database/);
+    assert.equal(applies.get('IDX01'), 1, 'another shard cannot reuse a committed journal to skip its own migration');
+    await assert.rejects(migrationDatabaseIdentity({
+      ...optionsByBinding.get('IDX00'), databaseId: 'replacement-database',
+    }), /database ID does not match/);
+    await assert.rejects(migrationDatabaseIdentity({
+      ...optionsByBinding.get('IDX00'), migrationsDir,
+    }), /migration directory does not match/);
+    const replacementConfig = structuredClone(config);
+    replacementConfig.d1_databases.find(({ binding }) => binding === 'IDX00').database_id = 'replacement-index-00';
+    const replacementConfigPath = path.join(stateDir, 'replacement.json');
+    await writeFile(replacementConfigPath, JSON.stringify(replacementConfig));
+    await assert.rejects(runMigrations({
+      ...optionsByBinding.get('IDX00'), config: replacementConfigPath, databaseId: undefined,
+    }), /different immutable artifact, deployment, or database/);
+    assert.equal(applies.get('IDX00'), 1, 'the actual configured database ID is bound even without --database-id');
+  }
+});
+
+test('the migration CLI validates the shard manifest against its own immutable base', async () => {
+  const result = spawnSync(process.execPath, [
+    path.join(hubRoot, 'scripts/migrations.mjs'), 'check',
+    '--migrations-dir', indexMigrationsDir,
+    '--base-manifest', path.join(indexMigrationsDir, 'source-baseline.json'),
+  ], { cwd: hubRoot, encoding: 'utf8' });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(JSON.parse(result.stdout).migrationDigest, await resolveMigrationDigest({ migrationsDir: indexMigrationsDir }));
+});
+
+test('protected-base shard validation bootstraps only an absent tree, then enforces immutable history', async (context) => {
+  const repository = await mkdtemp(path.join(os.tmpdir(), 'hub-shard-base-'));
+  context.after(() => rm(repository, { recursive: true, force: true }));
+  const scripts = path.join(repository, 'hub/scripts');
+  await mkdir(path.join(scripts, 'lib'), { recursive: true });
+  for (const file of [
+    'migrations.mjs', 'lib/migration-runner.mjs', 'lib/migration-manifest.mjs',
+    'lib/migration-journal.mjs', 'lib/schema-digest.mjs',
+  ]) {
+    await cp(path.join(hubRoot, 'scripts', file), path.join(scripts, file));
+  }
+  const gitEnv = {
+    ...process.env,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: path.join(repository, 'no-global-config'),
+    GIT_TERMINAL_PROMPT: '0',
+  };
+  const git = (args) => {
+    const result = spawnSync('git', [
+      '-c', 'user.name=Migration test', '-c', 'user.email=migration-test@example.invalid',
+      '-c', 'commit.gpgSign=false', '-c', `core.hooksPath=${path.join(repository, 'no-hooks')}`,
+      ...args,
+    ], { cwd: repository, encoding: 'utf8', env: gitEnv });
+    assert.equal(result.status, 0, result.stderr);
+    return result.stdout.trim();
+  };
+  git(['init', '--quiet', '--object-format=sha1']);
+  await writeFile(path.join(repository, 'README.md'), 'Initial protected base without shards.\n');
+  git(['add', 'README.md']);
+  git(['commit', '--quiet', '-m', 'Initial base']);
+  const absentBase = git(['rev-parse', 'HEAD']);
+  const candidate = path.join(repository, 'hub/migrations-index');
+  await cp(indexMigrationsDir, candidate, { recursive: true });
+  const check = (baseRef) => spawnSync(process.execPath, [
+    path.join(scripts, 'migrations.mjs'), 'check',
+    '--migrations-dir', candidate, '--base-ref', baseRef,
+  ], { cwd: repository, encoding: 'utf8', env: gitEnv });
+  const bootstrap = check(absentBase);
+  assert.equal(bootstrap.status, 0, bootstrap.stderr);
+  assert.equal(JSON.parse(bootstrap.stdout).migrationDigest, await resolveMigrationDigest({ migrationsDir: candidate }));
+
+  const initial = JSON.parse(await readFile(path.join(candidate, 'source-baseline.json'), 'utf8'));
+  const wrongPolicy = { ...initial, ledgerStartsAt: 2 };
+  await writeFile(path.join(candidate, 'source-baseline.json'), JSON.stringify(wrongPolicy));
+  const rejectedPolicy = check(absentBase);
+  assert.notEqual(rejectedPolicy.status, 0);
+  assert.match(rejectedPolicy.stderr, /initial 0001 baseline with ledgerStartsAt=1/);
+  await writeFile(path.join(candidate, 'source-baseline.json'), JSON.stringify(initial));
+
+  // Existing content without policy cannot be mistaken for a new namespace.
+  await writeFile(path.join(candidate, 'README.md'), 'Existing tree, missing protected policy.\n');
+  git(['add', 'hub/migrations-index/README.md']);
+  git(['commit', '--quiet', '-m', 'Existing tree without policy']);
+  const existingInvalid = check(git(['rev-parse', 'HEAD']));
+  assert.notEqual(existingInvalid.status, 0);
+  assert.match(existingInvalid.stderr, /no manifest or independent policy evidence/);
+
+  git(['add', 'hub/migrations-index']);
+  git(['commit', '--quiet', '-m', 'Protected initial shard history']);
+  const existingBase = git(['rev-parse', 'HEAD']);
+  const existing = check(existingBase);
+  assert.equal(existing.status, 0, existing.stderr);
+  const sqlPath = path.join(candidate, initial.migrations[0].filename);
+  await writeFile(sqlPath, `${await readFile(sqlPath, 'utf8')}\n-- changed protected SQL\n`);
+  const changed = await buildMigrationManifest(candidate, initial);
+  await writeFile(path.join(candidate, 'manifest.json'), JSON.stringify(changed));
+  await writeFile(path.join(candidate, 'source-baseline.json'), JSON.stringify(changed));
+  const edited = check(existingBase);
+  assert.notEqual(edited.status, 0);
+  assert.match(edited.stderr, /immutable base migration changed/);
+
+  const unreadable = check('0'.repeat(40));
+  assert.notEqual(unreadable.status, 0);
+  assert.match(unreadable.stderr, /cannot fetch migration base/);
+});
+
+test('unidentified local state inspection detects populated legacy blocks without migration writes', async () => {
+  const database = createDatabase();
+  const runProcess = async (args) => {
+    assert.equal(args[1], 'execute');
+    assert.equal(args[2], 'DB');
+    assert.ok(args.includes('--local'));
+    const sql = args[args.indexOf('--command') + 1];
+    return { stdout: JSON.stringify([{ results: database.prepare(sql).all() }]), stderr: '' };
+  };
+  const options = { target: 'local', persistTo: path.resolve('/tmp/local-inspection'), runProcess };
+  try {
+    assert.equal(await hasLocalLegacyBlocks(options), false);
+    database.exec('CREATE TABLE blocks (id INTEGER PRIMARY KEY, text TEXT)');
+    assert.equal(await hasLocalLegacyBlocks(options), false);
+    database.exec("INSERT INTO blocks (text) VALUES ('preserve me')");
+    assert.equal(await hasLocalLegacyBlocks(options), true);
+    assert.equal(database.prepare('SELECT text FROM blocks').get().text, 'preserve me');
+    assert.equal(database.prepare('SELECT COUNT(*) AS count FROM d1_migrations').get().count, 0);
+    await assert.rejects(hasLocalLegacyBlocks({ ...options, target: 'production' }), /requires target local/);
+  } finally {
+    database.close();
+  }
+});
+
 test('signed release manifests bind the exact canonical ordered manifest', async () => {
   const { manifest } = await loadFixture();
   const { privateKey, publicKey } = generateKeyPairSync('ed25519');
@@ -718,6 +929,8 @@ test('journal resumes every crash phase only for the exact immutable identity', 
     deploymentId: 'pr-12-g1-deadbeefcafe',
     artifactDigest,
     migrationDigest: 'b'.repeat(64),
+    databaseBinding: 'IDX00',
+    databaseId: 'preview-index-00',
   };
   const journalPath = path.join(directory, 'deployment.json');
   const durable = { apply: 0, checksums: new Set(), verify: 0 };
@@ -764,12 +977,29 @@ test('journal recovery fails closed for wrong artifacts, corrupt checksums, and 
     deploymentId: 'release-1',
     artifactDigest,
     migrationDigest: 'c'.repeat(64),
+    databaseBinding: 'IDX00',
+    databaseId: 'production-index-00',
   };
   await openMigrationJournal(journalPath, identity);
   await assert.rejects(
     openMigrationJournal(journalPath, { ...identity, artifactDigest: 'd'.repeat(64) }),
     (error) => error instanceof AmbiguousJournalError && /different immutable artifact/.test(error.message),
   );
+  for (const change of [{ databaseBinding: 'IDX01' }, { databaseId: 'replacement-index-00' }]) {
+    await assert.rejects(
+      openMigrationJournal(journalPath, { ...identity, ...change }),
+      (error) => error instanceof AmbiguousJournalError && /different immutable artifact/.test(error.message),
+    );
+  }
+  await assert.rejects(openMigrationJournal(path.join(directory, 'missing-database.json'), {
+    ...identity, databaseId: undefined,
+  }), /invalid migration journal databaseId/);
+  const legacy = JSON.parse(await readFile(journalPath, 'utf8'));
+  legacy.formatVersion = 1;
+  await writeFile(journalPath, JSON.stringify(legacy));
+  await assert.rejects(openMigrationJournal(journalPath, identity), /unknown format or phase/);
+  legacy.formatVersion = 2;
+  await writeFile(journalPath, JSON.stringify(legacy));
 
   const corrupt = JSON.parse(await readFile(journalPath, 'utf8'));
   corrupt.checksum = '0'.repeat(64);

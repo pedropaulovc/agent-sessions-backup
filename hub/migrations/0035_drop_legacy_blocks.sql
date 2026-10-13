@@ -9,3 +9,5 @@
 -- The external-content FTS index goes first: it references `blocks` as its content table.
 DROP TABLE blocks_fts;
 DROP TABLE blocks;
+-- Dropping blocks also removes the temporary legacy-writer guard triggers.
+DROP TABLE IF EXISTS index_migration_freeze;

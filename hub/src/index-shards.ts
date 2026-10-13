@@ -61,7 +61,7 @@ export function indexShardFor(env: Env, sessionId: string): number {
 /** The shard database that owns a session's blocks and FTS rows. */
 export function indexDbFor(env: Env, sessionId: string): D1Database {
   const dbs = indexDbs(env);
-  return dbs[indexShardForSessionId(sessionId, dbs.length)];
+  return dbs[indexShardForSessionId(sessionId, dbs.length)]!;
 }
 
 const MAX_SHARD_CONCURRENCY = 4;
@@ -78,7 +78,7 @@ export async function mapIndexDbs<T>(
     while (next < dbs.length) {
       const shard = next;
       next += 1;
-      results[shard] = await read(dbs[shard], shard);
+      results[shard] = await read(dbs[shard]!, shard);
     }
   };
   await Promise.all(Array.from({ length: Math.min(MAX_SHARD_CONCURRENCY, dbs.length) }, worker));
@@ -96,11 +96,12 @@ interface ShardMetaRow {
 const verifiedLayouts = new WeakMap<D1Database, Promise<string>>();
 
 async function verifyShard(db: D1Database, shard: number, count: number): Promise<string> {
+  // D1 batch returns one result per statement, in order.
   const [, selected] = await db.batch([
     db.prepare(SHARD_META_INIT_SQL).bind(shard, count, INDEX_LAYOUT, indexIdBase(shard)),
     db.prepare(SHARD_META_SELECT_SQL),
-  ]);
-  const meta = (selected.results as ShardMetaRow[])[0];
+  ]) as [D1Result, D1Result<ShardMetaRow>];
+  const meta = selected.results[0];
   const binding = indexShardBindingName(shard);
   if (!meta) throw new IndexLayoutError(`index shard ${binding} has no shard_meta row`);
   if (meta.layout !== INDEX_LAYOUT || meta.shard_index !== shard || meta.shard_count !== count) {
@@ -188,8 +189,8 @@ export async function claimIndexWrite(db: D1Database, sessionId: string, version
        WHERE excluded.version > index_write_versions.version`,
     ).bind(sessionId, version),
     db.prepare('SELECT version FROM index_write_versions WHERE session_id = ?1').bind(sessionId),
-  ]);
-  const current = (held.results as { version: number }[])[0]?.version;
+  ]) as [D1Result, D1Result<{ version: number }>];
+  const current = held.results[0]?.version;
   if (current !== version) {
     throw new IndexWriteSupersededError(
       `session ${sessionId} shard write fence is at version ${current}, not ${version}`,

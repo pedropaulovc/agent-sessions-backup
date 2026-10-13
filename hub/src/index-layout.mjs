@@ -106,9 +106,10 @@ export const STAR_CATALOG_COLUMNS = Object.freeze(['session_id', 'turn_key', 'st
  * that alone exceeds it is sent as its own batch with every value bound separately. */
 export const SESSION_CATALOG_PAYLOAD_BYTES = 1_000_000;
 
-// Payload: a JSON array of {s: session_id, v: main session_catalog_versions.version, d: 1 when the
-// session row is absent on main else 0, r: sessions row values in SESSION_CATALOG_COLUMNS order or
-// null, t: [[turn_key, starred_at], ...] (main's complete starred_turns for the session)}.
+// Payload: a JSON array of {s: session_id, v: main session_catalog_versions.version, p: presence,
+// 'deleted' when the session row is absent on main else 'present', r: sessions row values in
+// SESSION_CATALOG_COLUMNS order or null, t: [[turn_key, starred_at], ...] (main's complete
+// starred_turns for the session)}.
 // json_extract yields INTEGER, REAL, TEXT or NULL exactly as the JSON scalar was written, so every
 // column keeps its value and NULL. `applied` holds the entries whose version the shard now records:
 // a newer version just replaced the shard's, or the same version re-applies identically. An older
@@ -121,9 +122,9 @@ const CATALOG_APPLIED = `WITH applied AS (
 
 // Set-based form: run in order as ONE shard batch, each statement bound to the same payload string.
 const CATALOG_PAYLOAD_SQL = [
-  `INSERT INTO catalog_versions (session_id, version, deleted)
-   SELECT json_extract(value, '$.s'), json_extract(value, '$.v'), json_extract(value, '$.d') FROM json_each(?1) WHERE true
-   ON CONFLICT (session_id) DO UPDATE SET version = excluded.version, deleted = excluded.deleted
+  `INSERT INTO catalog_versions (session_id, version, presence)
+   SELECT json_extract(value, '$.s'), json_extract(value, '$.v'), json_extract(value, '$.p') FROM json_each(?1) WHERE true
+   ON CONFLICT (session_id) DO UPDATE SET version = excluded.version, presence = excluded.presence
    WHERE excluded.version > catalog_versions.version`,
   `${CATALOG_APPLIED} DELETE FROM sessions WHERE session_id IN (SELECT session_id FROM applied)`,
   `${CATALOG_APPLIED} DELETE FROM starred_turns WHERE session_id IN (SELECT session_id FROM applied)`,
@@ -139,8 +140,8 @@ const CATALOG_PAYLOAD_SQL = [
 // ?2 version. Each sessions value and each star value is its own bind, so only D1's per-value limit
 // applies, which main's own row already satisfies.
 const CATALOG_ENTRY_GUARD = 'EXISTS (SELECT 1 FROM catalog_versions WHERE session_id = ?1 AND version = ?2)';
-const CATALOG_ENTRY_VERSION_SQL = `INSERT INTO catalog_versions (session_id, version, deleted) VALUES (?1, ?2, ?3)
-   ON CONFLICT (session_id) DO UPDATE SET version = excluded.version, deleted = excluded.deleted
+const CATALOG_ENTRY_VERSION_SQL = `INSERT INTO catalog_versions (session_id, version, presence) VALUES (?1, ?2, ?3)
+   ON CONFLICT (session_id) DO UPDATE SET version = excluded.version, presence = excluded.presence
    WHERE excluded.version > catalog_versions.version`;
 const CATALOG_ENTRY_SESSION_SQL = `INSERT INTO sessions (${SESSION_CATALOG_COLUMNS.join(', ')})
    SELECT ${SESSION_CATALOG_COLUMNS.map((_, index) => `?${index + 3}`).join(', ')} WHERE ${CATALOG_ENTRY_GUARD}`;
@@ -156,7 +157,7 @@ export const SESSION_CATALOG_RETIRE_SQL = `DELETE FROM session_catalog_outbox WH
 
 function entryStatements({ sessionId, version, session, stars }) {
   const statements = [
-    { sql: CATALOG_ENTRY_VERSION_SQL, params: [sessionId, version, session ? 0 : 1] },
+    { sql: CATALOG_ENTRY_VERSION_SQL, params: [sessionId, version, session ? 'present' : 'deleted'] },
     { sql: `DELETE FROM sessions WHERE session_id = ?1 AND ${CATALOG_ENTRY_GUARD}`, params: [sessionId, version] },
     { sql: `DELETE FROM starred_turns WHERE session_id = ?1 AND ${CATALOG_ENTRY_GUARD}`, params: [sessionId, version] },
   ];
@@ -206,7 +207,7 @@ export function sessionCatalogBatches(entries) {
     const part = JSON.stringify({
       s: sessionId,
       v: version,
-      d: session ? 0 : 1,
+      p: session ? 'present' : 'deleted',
       r: session ? SESSION_CATALOG_COLUMNS.map((column) => session[column] ?? null) : null,
       t: stars.map((star) => [star.turn_key ?? null, star.starred_at ?? null]),
     });

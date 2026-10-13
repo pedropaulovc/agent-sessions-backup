@@ -113,6 +113,11 @@ test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then o
   const result = await runSeed({});
   assert.equal(result.status, 0, result.output);
   const uploads = result.requests.filter((request) => request.method === 'PUT');
+  assert.ok(result.requests.every((request) => new URL(request.url).origin === ORIGIN),
+    'fixtures and search probes must use the preview Worker, never direct main or shard APIs');
+  assert.ok(result.requests.every((request) =>
+    request.method === 'PUT' ? new URL(request.url).pathname.startsWith('/api/v1/files/')
+      : new URL(request.url).pathname === '/api/v1/search'));
   // Asset, primary, pager, skill and one file per cost fixture, plus the replayed first upload.
   const distinctUploads = 4 + SYNTHETIC_EXPECTATIONS.costFixtures.length;
   assert.equal(uploads.length, distinctUploads + 1);

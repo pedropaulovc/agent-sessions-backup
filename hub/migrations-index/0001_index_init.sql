@@ -125,12 +125,12 @@ CREATE TABLE starred_turns (
 CREATE INDEX starred_turns_session ON starred_turns (session_id);
 
 -- Highest main catalog version (main session_catalog_versions.version) applied to this shard's
--- catalog copy per session. deleted = 1 is a tombstone: the session row is absent on main. A late,
--- older sync can neither degrade a newer row nor resurrect a deleted one.
+-- catalog copy per session. presence 'deleted' is a tombstone: the session row is absent on main. A
+-- late, older sync can neither degrade a newer row nor resurrect a deleted one.
 CREATE TABLE catalog_versions (
   session_id TEXT PRIMARY KEY,
   version INTEGER NOT NULL,
-  deleted INTEGER NOT NULL CHECK (deleted IN (0, 1))
+  presence TEXT NOT NULL CHECK (presence IN ('present', 'deleted'))
 ) STRICT;
 
 -- Block write fence on the session's home shard: the main catalog version captured in the same main
