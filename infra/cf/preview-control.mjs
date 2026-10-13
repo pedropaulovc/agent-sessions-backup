@@ -540,6 +540,69 @@ async function buildPreviewBundle({ hubRoot, wrangler, names, workDirectory }) {
   };
 }
 
+async function loadMigrationSet(directory) {
+  const manifestPath = path.join(directory, 'manifest.json');
+  // Reject stray files instead of silently ignoring any part of the actual schema.
+  migrationSqlNames(await readdir(directory));
+  const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+  if (!Array.isArray(manifest.migrations)) fail(`migration manifest has no migrations: ${manifestPath}`);
+  return { directory, manifestPath, manifest, digest: migrationDigest(manifest) };
+}
+
+/** Explicit preview-only proof; ordinary provision never needs disposable DB quota. */
+async function nativeCopyProof() {
+  requireCloudflareEnvironment();
+  const sha = headSha(args['head-sha']);
+  const hubRoot = path.resolve(args.hub ?? 'hub');
+  if (!args['migrations-cli']) fail('--migrations-cli is required');
+  const artifactDigest = args['artifact-digest'];
+  if (!/^[0-9a-f]{64}$/.test(artifactDigest ?? '')) fail('native copy proof requires the provisioned artifact digest');
+  const names = resourceNames(pr);
+  const indexMigrations = await loadMigrationSet(path.join(hubRoot, 'migrations-index'));
+  const temporary = await mkdtemp(path.join(os.tmpdir(), `sessions-native-copy-${pr}-`));
+  try {
+    const summary = await verifyNativeCopyControl({
+      api: indexControlClient(PREVIEW_ACCOUNT_ID, previewToken),
+      pr,
+      // All three isolated databases use the entire actual index migration tree.
+      // The same CI checkout/provision artifact binds their trusted journals.
+      applySchema: async ({ identities }) => {
+        const configPath = path.join(temporary, 'wrangler.native-copy.generated.json');
+        const bindings = ['DB', 'IDX00', 'IDX01'];
+        await writeCanonicalJson(configPath, {
+          name: names.app,
+          account_id: PREVIEW_ACCOUNT_ID,
+          compatibility_date: '2026-07-01',
+          d1_databases: identities.map(({ name, id }, index) => ({
+            binding: bindings[index], database_name: name, database_id: id,
+            migrations_dir: indexMigrations.directory,
+          })),
+        });
+        for (const [index, { id }] of identities.entries()) {
+          const binding = bindings[index];
+          const migration = runJson(path.resolve(args['migrations-cli']), [
+            'apply', '--target', 'preview', '--config', configPath, '--database', binding,
+            '--database-id', id,
+            '--journal', path.join(temporary, `native-copy-${binding}.migrations.json`),
+            '--artifact-digest', artifactDigest,
+            '--deployment-id', `pr-${pr}-${sha.slice(0, 12)}-native-copy-${binding}`,
+            '--migrations-dir', indexMigrations.directory,
+            '--manifest', indexMigrations.manifestPath,
+            '--base-manifest', path.join(indexMigrations.directory, 'source-baseline.json'),
+          ], hubRoot);
+          if (migration.pendingMigrations !== 0 || migration.migrationDigest !== indexMigrations.digest
+            || !/^[0-9a-f]{64}$/.test(migration.schemaDigest ?? '')) {
+            fail('native copy schema migration proof failed');
+          }
+        }
+      },
+    });
+    process.stdout.write(`${stableJson(summary)}\n`);
+  } finally {
+    await rm(temporary, { recursive: true, force: true });
+  }
+}
+
 /**
  * Build, migrate, and deploy one PR's self-contained preview, in place, from a single checkout.
  * Every name is derived from the PR number, so a re-run is idempotent and a concurrent run for
@@ -557,14 +620,6 @@ async function provision() {
   const wrangler = path.resolve(args.wrangler);
   const names = resourceNames(pr);
 
-  const loadMigrationSet = async (directory) => {
-    const manifestPath = path.join(directory, 'manifest.json');
-    // Reject stray files in BOTH migration directories rather than silently ignoring them.
-    migrationSqlNames(await readdir(directory));
-    const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
-    if (!Array.isArray(manifest.migrations)) fail(`migration manifest has no migrations: ${manifestPath}`);
-    return { directory, manifestPath, manifest, digest: migrationDigest(manifest) };
-  };
   const mainMigrations = await loadMigrationSet(path.join(hubRoot, 'migrations'));
   const indexMigrations = await loadMigrationSet(path.join(hubRoot, 'migrations-index'));
   const layout = previewIndexLayout(names);
@@ -683,43 +738,6 @@ async function provision() {
     const indexBatchAtomicity = await verifyD1BatchAtomicity(
       indexControlClient(PREVIEW_ACCOUNT_ID, previewToken).db(resources.indexShards[0]),
     );
-    // Isolated source+destinations only: the real copier deletes/fences its source.
-    // Apply the entire actual index migration tree to all three; no legacy main
-    // prefix or catalog/layout initialization is needed for the copy protocol.
-    const indexNativeCopy = await verifyNativeCopyControl({
-      api: indexControlClient(PREVIEW_ACCOUNT_ID, previewToken),
-      pr,
-      applySchema: async ({ identities }) => {
-        const configPath = path.join(temporary, 'wrangler.native-copy.generated.json');
-        const bindings = ['DB', 'IDX00', 'IDX01'];
-        await writeCanonicalJson(configPath, {
-          name: names.app,
-          account_id: PREVIEW_ACCOUNT_ID,
-          compatibility_date: '2026-07-01',
-          d1_databases: identities.map(({ name, id }, index) => ({
-            binding: bindings[index], database_name: name, database_id: id,
-            migrations_dir: indexMigrations.directory,
-          })),
-        });
-        for (const [index, { id }] of identities.entries()) {
-          const binding = bindings[index];
-          const migration = runJson(path.resolve(args['migrations-cli']), [
-            'apply', '--target', 'preview', '--config', configPath, '--database', binding,
-            '--database-id', id,
-            '--journal', path.join(temporary, `native-copy-${binding}.migrations.json`),
-            '--artifact-digest', build.artifactDigest,
-            '--deployment-id', `pr-${pr}-${sha.slice(0, 12)}-native-copy-${binding}`,
-            '--migrations-dir', indexMigrations.directory,
-            '--manifest', indexMigrations.manifestPath,
-            '--base-manifest', path.join(indexMigrations.directory, 'source-baseline.json'),
-          ], hubRoot);
-          if (migration.pendingMigrations !== 0 || migration.migrationDigest !== indexMigrations.digest
-            || !/^[0-9a-f]{64}$/.test(migration.schemaDigest ?? '')) {
-            fail('native copy schema migration proof failed');
-          }
-        }
-      },
-    });
 
     // Fixture prices, before the app is deployed and long before `seed` uploads any session: the
     // ingest-time pricing hook prices a session's usage rows as it parses them, so the catalog
@@ -755,7 +773,6 @@ async function provision() {
       artifactDigest: build.artifactDigest,
       schemaDigest,
       indexBatchAtomicity,
-      indexNativeCopy,
       schemaDigests,
     };
     if (args['github-output']) {
@@ -1199,6 +1216,7 @@ async function janitor() {
 }
 
 if (command === 'provision') await provision();
+else if (command === 'native-copy-proof') await nativeCopyProof();
 else if (command === 'deployment-inactivate') await inactivateDeploymentCards();
 else if (command === 'deployment-inactivate-batch') await inactivateDeploymentCardsBatch();
 else if (command === 'seed') await seed();

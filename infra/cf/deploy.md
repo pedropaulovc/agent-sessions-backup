@@ -78,10 +78,13 @@ CREATE/INSERT/SELECT batch and independent readback, removes the uniquely owned 
 requires a native malformed-JSON SQL failure to roll back an entire second batch. Auth/transport
 failures, unexpected readback, or partial commits block deployment; only safe verified proof
 metadata is published, never provider SQL/error bodies or credentials.
-After all persistent migrations and this native batch-atomicity proof, provision must pass a
-native full-copy control before prices, app deployment, or fixture/session seeding. It creates
-three unique PR-owned scratch D1s: `pr-N-copy-<24hex>-source` and
-`pr-N-copy-<24hex>-{idx00,idx01}`. It applies every current `hub/migrations-index/` migration to
+After ordinary provision succeeds, preview CI runs the explicit preview-only
+`node infra/cf/preview-control.mjs native-copy-proof` command as a separate required verification
+step before smoke or fixture/session seeding. It uses the pinned PPE token, PR/head identity,
+the provisioned artifact digest, and the actual index migration manifest; ordinary provision
+does not allocate scratch databases. The proof creates three unique PR-owned scratch D1s:
+`pr-N-copy-<24hex>-source` and `pr-N-copy-<24hex>-{idx00,idx01}`.
+It applies every current `hub/migrations-index/` migration to
 the source and both scratch shards, then exercises the actual copier through native D1 REST using
 ordinary rows and a value larger than 1 MiB but smaller than 2,000,000 bytes to exercise the
 large-value fallback. Full-column SHA-256 readback must match the source exactly, preserving
@@ -89,7 +92,7 @@ Unicode, a leading BOM, and embedded NUL bytes. FTS/MATCH must find tokens on bo
 including a token after an embedded NUL. The verified checkpoint must precede source-row
 retirement. Proof also requires an empty source, a complete checkpoint, the three-trigger frozen
 writer fence, and a controlled write that is positively rejected.
-Provision deletes every known created scratch database in `finally` on success or failure, still
+The proof command deletes every known created scratch database in `finally` on success or failure, still
 attempting the other owned deletions if one fails. Any deletion failure fails the job. Output is
 limited to static success, aggregate numeric/hash evidence, or static phase/class failures—never
 row IDs, private values, SQL, or raw provider response/body artifacts. This proves the copier's
@@ -132,8 +135,9 @@ it never borrows a persistent database or deletes unrelated resources to make ro
 provisioning also counts every account database, reuses exact per-PR names, and refuses before
 creating any resource if the missing databases would exceed 10. Explicitly dispatch `Preview Close` for an
 unused preview (including an open PR's preview), or run `Preview Janitor` to remove closed-PR
-resources, then rerun CI. A deployment that already owns all three persistent databases can reuse
-them at the quota limit, but its native copy control still needs the three spare slots.
+resources, then rerun CI. Ordinary provision can reuse its three persistent databases even at
+the quota limit. The separate required CI proof still needs three spare slots and fails—not
+skips—when they are unavailable; a proof failure does not borrow or reset persistent databases.
 
 There is no front door, no Cloudflare Access, and no blue/green generation machinery — the
 deploy IS the promote, so a broken push briefly breaks that PR's preview until the next one.
