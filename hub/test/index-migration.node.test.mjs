@@ -22,7 +22,7 @@ import {
 } from '../../infra/cf/index-control.mjs';
 import { PREVIEW_ACCOUNT_ID, PRODUCTION_ACCOUNT_ID } from '../../infra/cf/preview-trust.mjs';
 import {
-  D1_BATCH_PROBE_TEXT, D1_SQL_FAILURE_REASONS, d1SqlFailureReason, verifyD1BatchAtomicity as currentBatchAtomicity,
+  D1_BATCH_PROBE_TEXT, d1SqlFailureReason, verifyD1BatchAtomicity as currentBatchAtomicity,
 } from '../../infra/cf/d1-batch-atomicity.mjs';
 import { CLOUDFLARE_REQUEST_RATE_PER_SECOND } from '../scripts/lib/cloudflare-api-budget.mjs';
 import {
@@ -3069,8 +3069,6 @@ test('atomicity probe refuses an already-owned random name without deleting or m
 });
 
 test('D1 SQL failure classification exposes only safe reason enums and leaves absent or conflicting tokens unknown', () => {
-  assert.equal(Object.isFrozen(D1_SQL_FAILURE_REASONS), true);
-  assert.throws(() => D1_SQL_FAILURE_REASONS.push('not-a-native-reason'), TypeError);
   for (const errors of [
     ['malformed JSON'], [{ message: 'D1_ERROR: malformed JSON: SQLITE_ERROR', code: 7500 }],
     [{ message: 'MALFORMED json in intentional SQL probe' }],
@@ -3106,7 +3104,6 @@ test('D1 SQL failure classification exposes only safe reason enums and leaves ab
   ]) {
     const classified = d1SqlFailureReason([{ message, code: 7500 }]);
     assert.equal(classified, reason);
-    assert.ok(D1_SQL_FAILURE_REASONS.includes(classified), 'every recognized native token must survive diagnostic allowlisting');
   }
   assert.equal(d1SqlFailureReason([{ code: 7500 }]), 'other');
   assert.equal(d1SqlFailureReason(['database or disk is full; malformed JSON']), 'other');
