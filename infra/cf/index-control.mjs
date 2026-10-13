@@ -13,7 +13,7 @@ import {
   seedFrozenCatalog, sourceCopyForecast, verifyIndexRecords, writeCheckpoint,
 } from '../../hub/scripts/lib/index-migration.mjs';
 import { indexShardBindingName } from '../../hub/src/index-layout.mjs';
-import { D1_BATCH_PROBE_TEXT, d1SqlFailureReason, verifyD1BatchAtomicity } from './d1-batch-atomicity.mjs';
+import { D1_BATCH_PROBE_TEXT, D1_FAILURE_KINDS, D1_SQL_FAILURE_REASONS, d1SqlFailureReason, verifyD1BatchAtomicity } from './d1-batch-atomicity.mjs';
 import { sharedCloudflareApiPermit } from '../../hub/scripts/lib/cloudflare-api-budget.mjs';
 
 const MAIN_ID = '5ff65cf3-89c8-4fe6-a3c2-a370293ecea6';
@@ -25,8 +25,6 @@ const providerCodes = (errors) => (Array.isArray(errors) ? errors : [])
   .map((error) => error?.code).filter((code) => Number.isSafeInteger(code) && code >= 0);
 const publicDatabaseId = (id) => typeof id === 'string'
   && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id) ? id : 'unknown';
-const nativeReasons = new Set(['malformed-json', 'capacity', 'sql-syntax', 'missing-schema', 'limits',
-  'type-error', 'quota', 'transient-reset', 'storage-timeout', 'overloaded', 'memory-limit', 'cpu-limit', 'writer-fence', 'other']);
 
 export class CopyPassBudgetExhausted extends Error {
   constructor() {
@@ -113,6 +111,7 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
       catch {
         const error = new Error(`Cloudflare returned non-JSON HTTP ${response.status}`);
         error.providerStatus = response.status;
+        error.d1FailureKind = response.ok ? 'shape' : 'http';
         throw error;
       }
       if (!response.ok || envelope?.success !== true) {
@@ -124,6 +123,7 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
         error.providerCodes = codes;
         if (isD1) {
           error.d1SqlReason = d1SqlFailureReason(envelope?.errors);
+          error.d1FailureKind = !response.ok ? 'http' : envelope?.success === false ? 'statement' : 'shape';
         }
         throw error;
       }
@@ -136,12 +136,15 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
     db(id) {
       const execute = async (body, kind) => {
         let encodedBody;
+        let failureKind = 'transport';
         try {
           const envelope = await cf(`d1/database/${encodeURIComponent(id)}/query`, {
             method: 'POST', body: encodedBody = JSON.stringify(body), responseFormat: 'envelope',
           });
           const results = envelope.result;
           if (!Array.isArray(results) || results.some((result) => result?.success !== true)) {
+            failureKind = Array.isArray(results) && results.some((result) => result?.success === false)
+              ? 'statement' : 'shape';
             const failures = Array.isArray(results)
               ? results.flatMap((result) => [result?.error,
                 ...(Array.isArray(result?.errors) ? result.errors : [])]) : [];
@@ -152,6 +155,7 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
             throw error;
           }
           if (kind === 'query' && (results.length !== 1 || !Array.isArray(results[0]?.results))) {
+            failureKind = 'shape';
             const error = new Error('D1 query returned an unexpected result shape');
             error.providerStatus = responseStatuses.get(envelope);
             throw error;
@@ -160,7 +164,8 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
         } catch (error) {
           if (error instanceof CopyPassBudgetExhausted) throw error;
           // Replace transport/provider messages too: they may contain URLs, SQL or data.
-          const reason = nativeReasons.has(error?.d1SqlReason) ? error.d1SqlReason : 'other';
+          const reason = D1_SQL_FAILURE_REASONS.includes(error?.d1SqlReason) ? error.d1SqlReason : 'other';
+          const failure = D1_FAILURE_KINDS.includes(error?.d1FailureKind) ? error.d1FailureKind : failureKind;
           const codes = Array.isArray(error?.providerCodes) ? providerCodes(error.providerCodes.map((code) => ({ code }))) : [];
           // Count already-encoded request bytes only on failure. Parameter JSON byte
           // counts include array framing/escaping and never disclose the values.
@@ -172,10 +177,12 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
           const safe = new Error(`D1 database=${publicDatabaseId(id)} kind=${kind}`
             + ` HTTP=${Number.isInteger(error?.providerStatus) && error.providerStatus >= 100 && error.providerStatus <= 599 ? error.providerStatus : 'unknown'}`
             + ` codes=${codes.join(',')}`
+            + ` failure=${failure}`
             + ` native=${reason} statements=${statements.length} parameters=${parameters}`
             + ` bodyBytes=${typeof encodedBody === 'string' ? Buffer.byteLength(encodedBody, 'utf8') : 0}`
             + ` parameterJsonBytes=${parameterJsonBytes}`);
           safe.d1SqlReason = reason;
+          safe.d1FailureKind = failure;
           safe.d1Diagnostic = true;
           throw safe;
         }

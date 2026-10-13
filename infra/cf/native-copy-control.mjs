@@ -4,38 +4,41 @@ import {
   previewCopyScratchNames, previewResourceOwner,
 } from './preview-trust.mjs';
 import {
-  COPY_CHECKPOINT, COPY_PAGE_BYTES, SOURCE_FREEZE_TABLE, canonicalRow,
+  COPY_CHECKPOINT, COPY_INVARIANTS, COPY_PAGE_BYTES, COPY_PHASES, SOURCE_FREEZE_TABLE, canonicalRow,
   copyFrozenIndex, readCheckpoint,
 } from '../../hub/scripts/lib/index-migration.mjs';
 import { BLOCK_COLUMNS, INDEX_ID_SPAN, indexShardForSessionId } from '../../hub/src/index-layout.mjs';
+import { D1_FAILURE_KINDS, D1_SQL_FAILURE_REASONS } from './d1-batch-atomicity.mjs';
 
-const COPY_PHASES = new Set([
-  'copy-setup', 'copy-checkpoint-read', 'copy-checkpoint-write', 'copy-source-page-read',
-  'copy-page-write', 'copy-page-readback', 'copy-fts-match', 'copy-discard-page',
-  'copy-source-freeze-read', 'copy-source-freeze-install', 'copy-source-delete-and-freeze',
-  'checkpoint-read', 'checkpoint-write',
-]);
-const NATIVE_CLASSES = new Set([
-  'malformed-json', 'capacity', 'sql-syntax', 'missing-schema', 'limits', 'type-error',
-  'quota', 'transient-reset', 'storage-timeout', 'overloaded', 'memory-limit', 'cpu-limit',
-  'writer-fence', 'other',
-]);
+const copyPhases = Object.freeze(Object.values(COPY_PHASES));
+const copyInvariants = Object.freeze(Object.values(COPY_INVARIANTS));
 
 // No causes/stacks from a provider or subprocess are retained in public diagnostics.
 export class NativeCopyControlError extends Error {
-  constructor(phase, failureClass) {
-    super(`native copy control phase=${phase} class=${failureClass}`);
+  constructor(phase, failureClass, { invariant, failureKind, cleanupClass } = {}) {
+    super(`native copy control phase=${phase} class=${failureClass}`
+      + (invariant ? ` invariant=${invariant}` : '')
+      + (failureKind ? ` failure=${failureKind}` : '')
+      + (cleanupClass ? ` cleanup=failed cleanupClass=${cleanupClass}` : ''));
     this.name = 'NativeCopyControlError';
     this.nativeCopyPhase = phase;
     this.nativeCopyClass = failureClass;
+    if (invariant) this.nativeCopyInvariant = invariant;
+    if (failureKind) this.nativeCopyFailureKind = failureKind;
+    if (cleanupClass) {
+      this.nativeCopyCleanup = 'failed';
+      this.nativeCopyCleanupClass = cleanupClass;
+    }
   }
 }
 const reject = (phase, failureClass = 'assertion') => { throw new NativeCopyControlError(phase, failureClass); };
 const requireProof = (condition, phase) => { if (!condition) reject(phase); };
 function safeFailure(error, phase) {
   if (error instanceof NativeCopyControlError) return error;
-  return new NativeCopyControlError(COPY_PHASES.has(error?.d1Phase) ? error.d1Phase : phase,
-    NATIVE_CLASSES.has(error?.d1SqlReason) ? error.d1SqlReason : 'other');
+  const invariant = copyInvariants.includes(error?.code) ? error.code : undefined;
+  return new NativeCopyControlError(copyPhases.includes(error?.d1Phase) ? error.d1Phase : phase,
+    invariant ? 'assertion' : D1_SQL_FAILURE_REASONS.includes(error?.d1SqlReason) ? error.d1SqlReason : 'other',
+    { invariant, failureKind: D1_FAILURE_KINDS.includes(error?.d1FailureKind) ? error.d1FailureKind : undefined });
 }
 
 function ownedIdentity(database, pr, names) {
@@ -62,12 +65,16 @@ export async function withScratchD1Databases({ api, pr, nonce = randomBytes(12).
   let phase = 'preflight';
   let ownerPr;
   let names;
+  let result;
+  let failure;
   try {
     ownerPr = positiveInteger(pr, 'PR number');
     names = previewCopyScratchNames(ownerPr, nonce);
-    const databases = await paginatedList(api.cf, 'd1/database', {
-      pagination: 'page', rowsOf: (envelope) => envelope.result,
-    });
+    const databases = await paginatedList(async (...args) => {
+      const envelope = await api.cf(...args);
+      if (!Array.isArray(envelope?.result)) reject('preflight', 'shape');
+      return envelope;
+    }, 'd1/database', { pagination: 'page', rowsOf: (envelope) => envelope.result });
     if (databases.some((database) => names.includes(database?.name))) reject(phase, 'ownership');
     if (databases.length + names.length > PREVIEW_D1_DATABASE_LIMIT) reject(phase, 'quota');
     const knownIds = new Set(databases.map((database) => database?.uuid));
@@ -89,25 +96,31 @@ export async function withScratchD1Databases({ api, pr, nonce = randomBytes(12).
     const adapters = created.map((database) => api.db(database.uuid));
     if (adapters.some((db, index) => db?.id !== created[index].uuid)) reject(phase, 'ownership');
     phase = 'control';
-    return await run({ source: adapters[0], shards: adapters.slice(1), gate,
+    result = await run({ source: adapters[0], shards: adapters.slice(1), gate,
       identities: created.map(({ name, uuid }) => ({ name, id: uuid })) });
   } catch (error) {
-    throw safeFailure(error, phase);
-  } finally {
-    let cleanupFailure;
-    for (const database of created) {
-      try {
-        if (!ownedIdentity(database, ownerPr, names)) reject('cleanup', 'ownership');
-        if (await databaseIdentity(api, database, ownerPr, names, 'allow')) {
-          await api.cf(`d1/database/${encodeURIComponent(database.uuid)}`, { method: 'DELETE' });
-        }
-      } catch (error) {
-        // One refused/failed deletion must not skip the remaining known owned DBs.
-        cleanupFailure ??= safeFailure(error, 'cleanup');
-      }
-    }
-    if (cleanupFailure) throw cleanupFailure;
+    failure = safeFailure(error, phase);
   }
+  let cleanupFailure;
+  for (const database of created) {
+    try {
+      if (!ownedIdentity(database, ownerPr, names)) reject('cleanup', 'ownership');
+      if (await databaseIdentity(api, database, ownerPr, names, 'allow')) {
+        await api.cf(`d1/database/${encodeURIComponent(database.uuid)}`, { method: 'DELETE' });
+      }
+    } catch (error) {
+      // One refused/failed deletion must not skip the remaining known owned DBs.
+      cleanupFailure ??= safeFailure(error, 'cleanup');
+    }
+  }
+  if (cleanupFailure) {
+    failure = failure ? new NativeCopyControlError(failure.nativeCopyPhase, failure.nativeCopyClass, {
+      invariant: failure.nativeCopyInvariant, failureKind: failure.nativeCopyFailureKind,
+      cleanupClass: cleanupFailure.nativeCopyClass,
+    }) : cleanupFailure;
+  }
+  if (failure) throw failure;
+  return result;
 }
 
 const quote = (column) => `"${column.replaceAll('"', '""')}"`;

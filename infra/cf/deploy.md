@@ -422,8 +422,13 @@ checkpoint and D1 migration/checksum ledgers, not runner-temporary files, carry 
 D1 copy failures emit only the configured database UUID, `query`/`batch` kind,
 validated numeric HTTP status/provider codes, statement/parameter counts, encoded
 request body and parameter-JSON byte counts, an allowlisted native class, and a
-static operation phase. Byte counts include JSON framing/escaping and are computed
-only on failure. `copy-setup` identifies schema/range setup;
+static operation phase. `failure=transport|http|statement|shape` distinguishes a
+request that did not obtain a response, a non-2xx response, an explicit provider or
+statement rejection in an HTTP-200 envelope, and an invalid response protocol/shape.
+HTTP status comes from the actual response, never a provider envelope field.
+Byte counts include JSON framing/escaping and are computed only on failure.
+`copy-setup` identifies column/schema setup; the initial ID-range read and
+already-complete source probes use `copy-source-page-read`.
 `copy-page-write`, `copy-page-readback`, and `copy-fts-match` distinguish destination
 replacement, full-row readback, and native MATCH execution. Source operations use
 `copy-source-page-read`, `copy-source-freeze-read`,
@@ -436,7 +441,8 @@ provider messages, or transcript bytes are diagnostic output.
 Native classes are `capacity` (explicit SQLITE_FULL/full-disk or documented
 database/account-storage-limit tokens), `sql-syntax`, `missing-schema`, `limits`,
 `type-error`, `quota`, `transient-reset`, `storage-timeout`, `overloaded`,
-`memory-limit`, `cpu-limit`, `malformed-json`, or `other` (unknown).
+`memory-limit`, `cpu-limit`, `writer-fence` (the explicit `index_migration_frozen`
+guard rejection), `malformed-json`, or `other` (unknown).
 The reset/resource tokens follow Cloudflare's
 [documented D1 errors](https://developers.cloudflare.com/d1/observability/debug-d1/).
 Unlike that general debugging guidance, this private-data copier never logs full
@@ -446,6 +452,23 @@ provider code 7500 alone is **not** a capacity diagnosis. A class describes a
 recognized rejection token, not proof of its root cause. In particular, malformed
 JSON can be the intentional source-comparison assertion aborting a changed page.
 These diagnostics do not establish the cause of any earlier production failure.
+
+The isolated native-copy proof preserves the copier's static operation phase and
+reports its own invariant failures as `class=assertion invariant=<allowlisted code>`
+(for example `fts-match`, `readback-sha256`, `source-delete`, or `freeze-missing`),
+not as an unknown SQL failure. Schema-runner errors without a public typed identity
+remain `phase=schema class=other`; raw subprocess output is never copied into this
+diagnostic. Client failures retain their allowlisted `failure` kind in the proof.
+A primary failure plus scratch cleanup failure keeps the original
+phase/class/invariant/failure kind and adds
+`cleanup=failed cleanupClass=<allowlisted class>`.
+Cleanup still checks each known-owned database identity and attempts every safe
+deletion; failed or ownership-refused cleanup also fails an otherwise successful
+proof. The preview atomicity preflight emits a JSON diagnostic with
+`operation: "preview-atomicity"`, its control `phase`
+(`ownership`, `batch-positive`, `independent-positive`, `rollback-negative`, or
+`cleanup`), and `failure` (`assertion`, a client failure kind above, or `other`).
+Neither boundary logs raw causes, stacks, provider text, or copied values.
 
 After a failed/ambiguous request, source contents, shard contents, and checkpoint
 progress are unknown until durable state is inspected through the protected
@@ -499,9 +522,13 @@ commands and clients have no pass budget. The clock starts after configuration,
 maintenance/drain, and atomicity prerequisites, before the copy's data reads. The
 request boundary checks before acquiring a permit, again after acquiring it, and
 before a valid 429 retry sleep. It stops if expired or if that sleep would reach the
-deadline. It never aborts or replays an in-flight request or native batch. The existing
-60-second request timeout and five-hour soft budget leave setup/drain/cleanup headroom
-within the job's 360-minute limit, rather than relying on a hard job kill mid-transaction.
+deadline. It never aborts or replays an in-flight request or native batch. This is a
+copy-process budget, not a deadline for the whole 360-minute job. Setup, the drain,
+main migrations, catalog seeding and activation share the remaining job time; a copy
+that finishes near five hours does not guarantee those later steps will fit.
+Catalog seeding has durable checkpoints, and a completed copy can be revalidated
+even after legacy blocks are retired. A hard timeout is not the explicit partial
+result below: inspect the failed operation and durable state before continuing.
 
 A budget stop emits exactly `{"status":"partial","reason":"pass-budget-exhausted"}`
 and exits **78**, leaving the job failed and production in maintenance with consumers

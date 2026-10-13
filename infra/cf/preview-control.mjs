@@ -735,9 +735,19 @@ async function provision() {
       [INDEX_LAYOUT_KEY, stableJson(layout)]);
     // Exercise the same native REST batch adapter used by protected production copy.
     // No main/source data is touched; only the first index shard receives an owned probe.
-    const indexBatchAtomicity = await verifyD1BatchAtomicity(
-      indexControlClient(PREVIEW_ACCOUNT_ID, previewToken).db(resources.indexShards[0]),
-    );
+    let indexBatchAtomicity;
+    try {
+      indexBatchAtomicity = await verifyD1BatchAtomicity(
+        indexControlClient(PREVIEW_ACCOUNT_ID, previewToken).db(resources.indexShards[0]),
+      );
+    } catch (error) {
+      process.stderr.write(`${stableJson({
+        operation: 'preview-atomicity',
+        phase: error.d1AtomicityPhase,
+        failure: error.d1AtomicityFailure,
+      })}\n`);
+      throw error;
+    }
 
     // Fixture prices, before the app is deployed and long before `seed` uploads any session: the
     // ingest-time pricing hook prices a session's usage rows as it parses them, so the catalog
