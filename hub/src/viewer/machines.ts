@@ -1,3 +1,4 @@
+import { mapIndexDbs } from '../index-shards';
 import { esc, fmtBytes, page } from './layout';
 
 interface MachineRow {
@@ -28,9 +29,13 @@ export async function machinesPage(env: Env): Promise<Response> {
   const totals = await env.DB.prepare(
     `SELECT
        (SELECT COUNT(*) FROM sessions) AS sessions,
-       (SELECT COUNT(*) FROM blocks) AS blocks,
        (SELECT COALESCE(SUM(size), 0) FROM files) AS raw_bytes`,
-  ).first<{ sessions: number; blocks: number; raw_bytes: number }>();
+  ).first<{ sessions: number; raw_bytes: number }>();
+  const blockCounts = await mapIndexDbs(env, async (db) => {
+    const row = await db.prepare('SELECT COUNT(*) AS n FROM blocks').first<{ n: number }>();
+    return row?.n ?? 0;
+  });
+  const blocks = blockCounts.reduce((sum, count) => sum + count, 0);
 
   const now = Date.now();
   const rows = machines.results
@@ -53,7 +58,7 @@ export async function machinesPage(env: Env): Promise<Response> {
 
   const body =
     `<h2>Machines</h2>` +
-    `<p class="muted small">${esc(totals?.sessions ?? 0)} sessions · ${esc(totals?.blocks ?? 0)} blocks · ${fmtBytes(totals?.raw_bytes ?? 0)} raw</p>` +
+    `<p class="muted small">${esc(totals?.sessions ?? 0)} sessions · ${esc(blocks)} blocks · ${fmtBytes(totals?.raw_bytes ?? 0)} raw</p>` +
     `<table><thead><tr>` +
     ['Machine', 'OS', 'Key', 'Collector', 'Last seen', 'Last upload', 'Pending', 'Error', 'Files']
       .map((h) => `<th>${h}</th>`)

@@ -1,0 +1,13 @@
+{
+  "formatVersion": 1,
+  "hashEncoding": "sha256-canonical-lf",
+  "reservedSequences": [],
+  "ledgerStartsAt": 1,
+  "migrations": [
+    {
+      "sequence": 1,
+      "filename": "0001_index_init.sql",
+      "sha256": "0fa89b2a83d4e2b85bbddeca77baa50e6abb324c978d53ac84ee639cee5bdde1"
+    }
+  ]
+}

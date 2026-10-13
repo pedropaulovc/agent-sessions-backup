@@ -2,13 +2,23 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import { env } from 'cloudflare:test';
 import { runWatchdog } from '../src/cron/watchdog';
 import { EXPECTED_COLLECTOR_VERSION } from '../src/collector-version';
+import worker from '../src/worker';
 
-// runWatchdog only touches env.DB, so a hand-rolled stub exercises every branch
-// without the workers D1. `prepare` dispatches on the SQL: the machines roster
-// query (SELECT ... FROM machines) vs. the size probe (SELECT 1). The size probe
-// reads bytes off the D1 result's `meta.size_after` (see watchdog.ts), so the
-// stub models meta: a numeric size_after (real bytes), an absent size_after, or a
-// throw (e.g. the production SQLITE_AUTH the PRAGMA form hit).
+// Exercise the real watchdog against independent main/shard D1 responses.
+// Main also serves the roster query; each database's size probe reads
+// `meta.size_after`, including missing metadata and SQLITE_AUTH failures.
+type SizeProbe = { throws?: boolean; bytes?: number; sizeAfterAbsent?: boolean };
+
+function sizeProbe(size?: SizeProbe) {
+  return {
+    run: async () => {
+      if (size?.throws) throw new Error('D1_ERROR: not authorized: SQLITE_AUTH');
+      const meta = size?.sizeAfterAbsent ? {} : { size_after: size?.bytes ?? 0 };
+      return { success: true, results: [], meta };
+    },
+  };
+}
+
 function makeEnv(opts: {
   machines: Array<{
     machine_id: string;
@@ -28,7 +38,8 @@ function makeEnv(opts: {
   }>;
   sessions?: { ready: number; parsing: number; error: number; total: number };
   rosterThrows?: boolean;
-  size?: { throws?: boolean; bytes?: number; sizeAfterAbsent?: boolean };
+  size?: SizeProbe;
+  shardSizes?: [SizeProbe, SizeProbe];
 }): Env {
   const sum = (key: 'files_pending' | 'files_error' | 'files_parsed' | 'files_skipped' | 'files_superseded' | 'files_complete' | 'files_total') =>
     opts.machines.reduce((total, machine) => total + (machine[key] ?? 0), 0);
@@ -82,15 +93,12 @@ function makeEnv(opts: {
           };
         }
         // Size probe (`SELECT 1`): watchdog reads probe.meta.size_after.
-        return {
-          run: async () => {
-            if (opts.size?.throws) throw new Error('D1_ERROR: not authorized: SQLITE_AUTH');
-            const meta = opts.size?.sizeAfterAbsent ? {} : { size_after: opts.size?.bytes ?? 0 };
-            return { success: true, results: [], meta };
-          },
-        };
+        return sizeProbe(opts.size);
       },
     },
+    INDEX_SHARD_COUNT: '2',
+    IDX00: { prepare: () => sizeProbe(opts.shardSizes?.[0]) },
+    IDX01: { prepare: () => sizeProbe(opts.shardSizes?.[1]) },
   } as unknown as Env;
 }
 
@@ -141,6 +149,7 @@ describe('watchdog', () => {
         ],
         sessions: { ready: 50, parsing: 2, error: 1, total: 53 },
         size: { bytes: 123456 },
+        shardSizes: [{ bytes: 987654 }, { bytes: 765432 }],
       }),
     );
     const machineHealth = events.filter((e) => e.event === 'hub.machine.health');
@@ -174,7 +183,11 @@ describe('watchdog', () => {
     const ages = events.filter((e) => e.event === 'hub.machine.heartbeat_age');
     expect(ages.map((e) => e.machine).sort()).toEqual(['amet-linux', 'win-host']);
     expect(ages.find((e) => e.machine === 'win-host')?.age_seconds).toBe(700000);
-    expect(events.find((e) => e.event === 'hub.d1.db_size_bytes')?.bytes).toBe(123456);
+    expect(events.filter((e) => e.event === 'hub.d1.db_size_bytes')).toEqual([
+      { event: 'hub.d1.db_size_bytes', database: 'main', bytes: 123456 },
+      { event: 'hub.d1.db_size_bytes', database: 'IDX00', bytes: 987654 },
+      { event: 'hub.d1.db_size_bytes', database: 'IDX01', bytes: 765432 },
+    ]);
     const run = events.find((e) => e.event === 'hub.watchdog.run');
     expect(run?.machine_count).toBe(2);
     expect(run?.roster_ok).toBe(true);
@@ -236,26 +249,71 @@ describe('watchdog', () => {
     expect(health.every((e) => e.expected_collector_version === EXPECTED_COLLECTOR_VERSION)).toBe(true);
   });
 
-  it('emits a bytes:-1 sentinel + warn when the size probe throws (e.g. SQLITE_AUTH)', async () => {
-    const events = captureLogs();
-    await runWatchdog(makeEnv({ machines: [], size: { throws: true } }));
-    expect(events.find((e) => e.event === 'hub.d1.db_size_bytes')?.bytes).toBe(-1);
-    expect(events.some((e) => e.event === 'hub.watchdog.warn' && e.tag === 'd1-size-unavailable')).toBe(true);
-  });
+  it.each(['main', 'IDX00', 'IDX01'] as const)(
+    'isolates SQLITE_AUTH size failures on %s without losing healthy database gauges',
+    async (database) => {
+      const events = captureLogs();
+      const sizes: [SizeProbe, SizeProbe, SizeProbe] = [{ bytes: 4096 }, { bytes: 8192 }, { bytes: 16384 }];
+      sizes[['main', 'IDX00', 'IDX01'].indexOf(database)] = { throws: true };
+      await runWatchdog(makeEnv({ machines: [], size: sizes[0], shardSizes: [sizes[1], sizes[2]] }));
+      expect(events.filter((e) => e.event === 'hub.d1.db_size_bytes')).toEqual(
+        ['main', 'IDX00', 'IDX01'].map((name, index) => ({
+          event: 'hub.d1.db_size_bytes',
+          database: name,
+          bytes: name === database ? -1 : [4096, 8192, 16384][index],
+        })),
+      );
+      expect(events.filter((e) => e.event === 'hub.watchdog.warn')).toEqual([
+        {
+          event: 'hub.watchdog.warn',
+          tag: 'd1-size-unavailable',
+          database,
+          error: 'Error: D1_ERROR: not authorized: SQLITE_AUTH',
+        },
+      ]);
+      expect(events.find((e) => e.event === 'hub.watchdog.run')).toMatchObject({ roster_ok: true });
+    },
+  );
 
-  it('emits real bytes from meta.size_after when present', async () => {
+  it('emits real bytes from meta.size_after for every database, including an empty shard', async () => {
     const events = captureLogs();
-    await runWatchdog(makeEnv({ machines: [], size: { bytes: 5701632 } }));
-    expect(events.find((e) => e.event === 'hub.d1.db_size_bytes')?.bytes).toBe(5701632);
+    await runWatchdog(makeEnv({
+      machines: [],
+      size: { bytes: 5701632 },
+      shardSizes: [{ bytes: 0 }, { bytes: 11403264 }],
+    }));
+    expect(events.filter((e) => e.event === 'hub.d1.db_size_bytes')).toEqual([
+      { event: 'hub.d1.db_size_bytes', database: 'main', bytes: 5701632 },
+      { event: 'hub.d1.db_size_bytes', database: 'IDX00', bytes: 0 },
+      { event: 'hub.d1.db_size_bytes', database: 'IDX01', bytes: 11403264 },
+    ]);
     expect(events.some((e) => e.event === 'hub.watchdog.warn' && e.tag === 'd1-size-unavailable')).toBe(false);
   });
 
-  it('emits a bytes:-1 sentinel + warn when the D1 result has no meta.size_after', async () => {
-    const events = captureLogs();
-    await runWatchdog(makeEnv({ machines: [], size: { sizeAfterAbsent: true } }));
-    expect(events.find((e) => e.event === 'hub.d1.db_size_bytes')?.bytes).toBe(-1);
-    expect(events.some((e) => e.event === 'hub.watchdog.warn' && e.tag === 'd1-size-unavailable')).toBe(true);
-  });
+  it.each(['main', 'IDX00', 'IDX01'] as const)(
+    'emits a database-specific sentinel and warning when %s has no meta.size_after',
+    async (database) => {
+      const events = captureLogs();
+      const sizes: [SizeProbe, SizeProbe, SizeProbe] = [{ bytes: 4096 }, { bytes: 8192 }, { bytes: 16384 }];
+      sizes[['main', 'IDX00', 'IDX01'].indexOf(database)] = { sizeAfterAbsent: true };
+      await runWatchdog(makeEnv({ machines: [], size: sizes[0], shardSizes: [sizes[1], sizes[2]] }));
+      expect(events.filter((e) => e.event === 'hub.d1.db_size_bytes')).toEqual(
+        ['main', 'IDX00', 'IDX01'].map((name, index) => ({
+          event: 'hub.d1.db_size_bytes',
+          database: name,
+          bytes: name === database ? -1 : [4096, 8192, 16384][index],
+        })),
+      );
+      expect(events.filter((e) => e.event === 'hub.watchdog.warn')).toEqual([
+        {
+          event: 'hub.watchdog.warn',
+          tag: 'd1-size-unavailable',
+          database,
+          error: 'meta.size_after absent from D1 result',
+        },
+      ]);
+    },
+  );
 
   it('preserves orphaned session counts when the machine roster is empty', async () => {
     const testEnv = env as unknown as Env;
@@ -266,6 +324,9 @@ describe('watchdog', () => {
     const events = captureLogs();
     await runWatchdog(testEnv);
     await testEnv.DB.prepare("DELETE FROM sessions WHERE session_id = 'orphan-error'").run();
+    const databaseSizes = events.filter((event) => event.event === 'hub.d1.db_size_bytes');
+    expect(databaseSizes.map((event) => event.database).sort()).toEqual(['IDX00', 'IDX01', 'main']);
+    for (const gauge of databaseSizes) expect(gauge.bytes).toBeGreaterThan(0);
 
     expect(events.some((event) => event.event === 'hub.machine.health')).toBe(false);
     expect(events.find((event) => event.event === 'hub.fleet.health')).toMatchObject({
@@ -364,5 +425,96 @@ describe('watchdog', () => {
     expect(plan.results.map((row) => row.detail).join('\n')).toContain(
       'SCAN files USING COVERING INDEX idx_files_machine_state',
     );
+  });
+});
+
+describe('maintenance freeze', () => {
+  it('serves health, rejects HTTP writes, and retries every queue kind without changing real databases', async () => {
+    const testEnv = {
+      ...env,
+      INDEX_MODE: 'maintenance',
+      DEPLOYMENT_REVISION: 'maintenance-test',
+    } as unknown as Env;
+    await testEnv.DB.prepare(
+      "INSERT INTO machines (machine_id, os) VALUES ('frozen-machine', 'linux')",
+    ).run();
+    await testEnv.DB.prepare(
+      "INSERT INTO sessions (session_id, harness, index_state) VALUES ('frozen-session', 'codex', 'parsing')",
+    ).run();
+    const file = await testEnv.DB.prepare(
+      `INSERT INTO files (machine_id, store, relpath, r2_key, size, content_hash, parse_state)
+       VALUES ('frozen-machine', 'codex-sessions', 'frozen.jsonl', 'freeze/frozen.jsonl', 100, 'frozen-hash', 'pending')
+       RETURNING id`,
+    ).first<{ id: number }>();
+    expect(file).not.toBeNull();
+
+    // Snapshot actual table contents, including the pending catalog outbox and shard identity.
+    // This catches health/reconciliation accidentally writing while the cutover is frozen.
+    async function snapshot() {
+      return Promise.all([testEnv.DB, testEnv.IDX00!, testEnv.IDX01!].map(async (db) => {
+        const tables = await db.prepare(
+          "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        ).all<{ name: string }>();
+        return Promise.all(tables.results.map(async ({ name }) => {
+          const rows = await db.prepare(`SELECT * FROM "${name.replaceAll('"', '""')}"`).all();
+          return { name, rows: rows.results.map((row) => JSON.stringify(row)).sort() };
+        }));
+      }));
+    }
+    const before = await snapshot();
+    const pending: Promise<unknown>[] = [];
+    const ctx = {
+      waitUntil: (promise: Promise<unknown>) => pending.push(promise),
+      passThroughOnException: () => {},
+      props: {},
+    } as ExecutionContext;
+
+    const health = await worker.fetch(new Request('https://hub.test/healthz'), testEnv, ctx);
+    expect(health.status).toBe(200);
+    expect(await health.json()).toMatchObject({
+      ok: true,
+      indexMode: 'maintenance',
+      deploymentRevision: 'maintenance-test',
+      indexShardCount: 2,
+    });
+    for (const request of [
+      new Request('https://hub.test/api/v1/heartbeat', { method: 'POST', body: '{}' }),
+      new Request('https://hub.test/api/v1/files/frozen-machine/codex-sessions/frozen.jsonl', {
+        method: 'PUT', body: '{"message":"must not be indexed"}',
+      }),
+      new Request('https://hub.test/'),
+    ]) {
+      const response = await worker.fetch(request, testEnv, ctx);
+      expect(response.status).toBe(503);
+      expect(response.headers.get('Retry-After')).toBe('60');
+      expect(await response.json()).toEqual({ error: 'index_migration_in_progress' });
+    }
+
+    const bodies: HubQueueMessage[] = [
+      { file_id: file!.id, r2_key: 'freeze/frozen.jsonl', reason: 'upload' },
+      { kind: 'index-catalog' },
+      { kind: 'session-rollup', job_id: 'frozen-rollup' },
+    ];
+    const messages = bodies.map((body, index) => ({
+      id: `frozen-${index}`,
+      timestamp: new Date(),
+      attempts: 1,
+      body,
+      ack: vi.fn(),
+      retry: vi.fn(),
+    }));
+    await worker.queue({
+      queue: 'frozen-queue', messages, ackAll: vi.fn(), retryAll: vi.fn(),
+    } as MessageBatch<HubQueueMessage>, testEnv);
+    for (const message of messages) {
+      expect(message.retry).toHaveBeenCalledTimes(1);
+      expect(message.retry).toHaveBeenCalledWith({ delaySeconds: 60 });
+      expect(message.ack).not.toHaveBeenCalled();
+    }
+    for (const cron of ['*/15 * * * *', '30 4 * * *']) {
+      await worker.scheduled({ cron, scheduledTime: 0, noRetry: () => {} } as ScheduledController, testEnv, ctx);
+    }
+    await Promise.all(pending);
+    expect(await snapshot()).toEqual(before);
   });
 });

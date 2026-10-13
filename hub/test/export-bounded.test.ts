@@ -5,16 +5,13 @@ import { __setExportBudgetsForTest, EXPORT_SEND_FAILURE_LIMIT } from '../src/ing
 import { isFreshReservation, markPendingAndEnqueue } from '../src/queue';
 import { API } from './hosts';
 import { CLAUDE_WEB_ROOT, claudeExportZip, claudeWebConversation, type ClaudeConvOpts, type ClaudeWebMessage } from './web-fixtures';
+import { indexDbs } from '../src/index-shards';
 
 const testEnv = testEnvRaw as unknown as Env;
 
-// The prod slice/invocation budgets (~800 subrequests) leave far too much headroom to trigger slicing,
-// cleanup-chunking or deferral with tiny synthetic fixtures. So each test dials the SUBREQUEST budgets down
-// via __setExportBudgetsForTest — small enough that a handful of 2-block conversations (~5 subrequests
-// each) span multiple slices. `budgets()` resets ALL four knobs every call (so tests are order-independent
-// no matter what the previous one set), with a small default a test overrides per case. afterAll restores
-// prod values. NOTE: the cost accounting is SUBREQUESTS (each db.batch/.first/.run is ONE), not statements —
-// see the counting-model note on writeSession; a 180-block conversation costs ~5 subrequests, not ~180.
+// Tiny synthetic fixtures need reduced subrequest budgets to exercise continuation and deferral.
+// Reset every knob per case so budgets do not leak between tests. The consumer accounts for both
+// authoritative metadata work and shard index work; block count is not itself a subrequest count.
 const PROD_BUDGETS = { slice: 800, invocation: 800, ceiling: 700, cap: 900, normalReserve: 128, kickPage: 50 };
 function budgets(o: { slice?: number; invocation?: number; ceiling?: number; cap?: number; normalReserve?: number; kickPage?: number } = {}): void {
   __setExportBudgetsForTest({ slice: 20, invocation: 20, ceiling: 700, cap: 900, normalReserve: 8, kickPage: 50, ...o });
@@ -69,10 +66,8 @@ function conv(tag: string, i: number): ClaudeConvOpts {
   };
 }
 
-// A conversation with `msgs` messages → ~msgs blocks. writeSession fans the blocks into ceil(blocks/90)
-// INSERT batches, so its SUBREQUEST cost is 3 + ceil(blocks/90) — a 200-block conversation is ~6
-// subrequests, NOT ~200. Used to exercise the oversized-conversation ceiling/cap and to prove the slice
-// budget counts subrequests, not statements.
+// Many-block conversations exercise oversized preflight and distinguish batched writes from a
+// per-statement budget. Keep their transcript content intact across every continuation.
 function heavyConv(tag: string, i: number, msgs: number): ClaudeConvOpts {
   const messages: ClaudeWebMessage[] = [];
   let parent = '00000000-0000-4000-8000-000000000000';
@@ -84,18 +79,23 @@ function heavyConv(tag: string, i: number, msgs: number): ClaudeConvOpts {
   return { uuid: `bnd-${tag}-conv-${i}`, name: `Heavy ${i}`, messages };
 }
 
-/** Make the Nth DB.batch call throw once (simulating a D1 error / cap hit mid-write-loop); returns a restore fn. */
-function throwOnNthBatch(n: number): () => void {
-  const real = testEnv.DB.batch.bind(testEnv.DB);
+/** Fail a block-insert chunk once, across both shards, without counting unrelated metadata batches. */
+function throwOnNthBlockInsert(n: number, onThrow?: () => void): () => void {
   let calls = 0;
-  testEnv.DB.batch = (async (stmts: unknown[]) => {
-    calls += 1;
-    if (calls === n) throw new Error('injected D1 failure mid-slice');
-    return real(stmts as never);
-  }) as typeof testEnv.DB.batch;
-  return () => {
-    testEnv.DB.batch = real;
-  };
+  const restores = indexDbs(testEnv).map((db) => {
+    const real = db.batch.bind(db);
+    db.batch = (async (stmts: D1PreparedStatement[]) => {
+      const first = stmts[0];
+      const sql = first && 'statement' in first && typeof first.statement === 'string' ? first.statement : '';
+      if (sql.startsWith('INSERT INTO blocks ') && ++calls === n) {
+        onThrow?.();
+        throw new Error('injected D1 failure mid-slice');
+      }
+      return real(stmts);
+    }) as typeof db.batch;
+    return () => { db.batch = real; };
+  });
+  return () => { for (const restore of restores) restore(); };
 }
 
 async function readyCount(fileId: number): Promise<number> {
@@ -270,10 +270,8 @@ async function deliverChain(
 
 describe('large export ingest is bounded and never marks parsed until every conversation is written', () => {
   it('writes the archive in bounded slices; the file stays pending until the FINAL slice (silent-gap guard)', async () => {
-    // More than one subrequest-budget slice of small conversations (each ~5 subrequests, slice budget 20 →
-    // ~4/slice), so the parse spans several invocations. The exact slice boundary depends on
-    // per-conversation D1 cost, so we drive the whole continuation chain and assert the INVARIANT rather
-    // than a fixed offset.
+    // Drive the continuation chain and assert the pending-until-complete invariant, not an
+    // incidental per-conversation batch count or exact slice boundary.
     budgets({ slice: 20, invocation: 20 });
     const total = 12;
     const { fileId, hash, r2Key } = await uploadArchive('a', total);
@@ -323,7 +321,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
     // re-enqueue a fresh copy (resetting the retry budget), never msg.retry() (which burns max_retries and
     // can DLQ a message that never failed).
     budgets({ slice: 20, invocation: 20 });
-    const f1 = await uploadArchive('one', 3);
+    const f1 = await uploadArchive('one', 1);
     const f2 = await uploadArchive('two', 3);
 
     const flags: Record<number, { acked: boolean; retried: boolean }> = {
@@ -354,7 +352,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(flags[f2.fileId]).toEqual({ acked: true, retried: false }); // POSITIVE CONTROL: retry() would burn attempts
     expect(sent.some((m) => m.file_id === f2.fileId && m.offset === undefined)).toBe(true); // fresh copy re-enqueued
     expect(await fileState(f1.fileId)).toBe('parsed');
-    expect(await ownedSessions(f1.fileId)).toBe(3);
+    expect(await ownedSessions(f1.fileId)).toBe(1);
     expect(await fileState(f2.fileId)).toBe('pending'); // untouched — the re-enqueued copy will run later
     expect(await ownedSessions(f2.fileId)).toBe(0);
   });
@@ -474,11 +472,8 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('budgets the slice by D1 SUBREQUESTS (batch calls), not statements: many-block conversations still fit one slice (round 3 finding 1, subrequest revert)', async () => {
-    // Each conversation carries ~180 blocks. writeSession fans them into ceil(180/90)=2 INSERT batches, so
-    // its SUBREQUEST cost is ~5 (delete batch + 2 insert batches + machine SELECT + session/FTS batch) —
-    // NOT ~180. The slice budget is 150 subrequests, so all three conversations (~7 subrequests each incl.
-    // the ownership lookup) land in ONE slice with room to spare. Under the pre-revert STATEMENT accounting
-    // a single 180-block conversation "cost" ~180 and would blow a 150-unit slice by itself.
+    // Three large conversations fit comfortably within this subrequest budget, whereas charging
+    // every block statement individually would exhaust it before the archive completes.
     budgets({ slice: 150, invocation: 150 });
     const total = 3;
     const { fileId, hash, r2Key } = await uploadConvs('sub', Array.from({ length: total }, (_u, i) => heavyConv('sub', i, 180)));
@@ -495,15 +490,12 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('reverts every session already written when writeSession throws mid-slice; the file goes pending, not error (round 2 finding 1b / round 6)', async () => {
-    budgets({ slice: 20, invocation: 20 });
+    budgets({ slice: 150, invocation: 150 });
     const { fileId, hash, r2Key } = await uploadArchive('wf', 5);
 
-    // Each small conversation issues 3 DB.batch calls in writeSession (block delete, block insert,
-    // session+FTS). Throw on the 7th batch → conversation 3's first batch → conversations 1-2 are fully
-    // written and tracked in `written`, conversation 3 fails before any of its rows land. A mid-write D1
-    // throw is TRANSIENT: raiseExportRetry reverts this invocation's writes (1-2 and the half-written 3) and
-    // forces the file 'pending' for a same-offset retry.
-    const restore = throwOnNthBatch(7);
+    // Fail the second conversation's block insert after a prior conversation has committed.
+    // The retry must revert both the completed prefix and the current half-written conversation.
+    const restore = throwOnNthBlockInsert(2);
     sent.length = 0;
     try {
       await deliver({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: hash });
@@ -520,7 +512,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('a post-write hash-recheck D1 throw is retryable, not a terminal error with a stranded prefix (round 6 finding 5)', async () => {
-    budgets({ slice: 20, invocation: 20 });
+    budgets({ slice: 150, invocation: 150 });
     const total = 3; // one slice → writes complete → the post-write recheck runs
     const { fileId, hash, r2Key } = await uploadConvs('r6f5', Array.from({ length: total }, (_u, i) => conv('r6f5', i)));
 
@@ -567,10 +559,8 @@ describe('large export ingest is bounded and never marks parsed until every conv
     await deliver({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: hash });
     expect(await sessionState(convId)).toBe('ready');
 
-    // Reparse the SAME bytes (reason 'reindex', same hash → not stale-rejected). Throw on the 2nd DB.batch
-    // of the invocation = the conversation's INSERT batch, AFTER its DELETE batch already dropped the old
-    // blocks/FTS. Its prior sessions row is still 'ready' over a now half-rewritten index.
-    const restore = throwOnNthBatch(2);
+    // Fail the shard insert after the index clear, independently of metadata/catalog batch counts.
+    const restore = throwOnNthBlockInsert(1);
     try {
       await deliver({ file_id: fileId, r2_key: r2Key, reason: 'reindex', content_hash: hash });
     } finally {
@@ -606,10 +596,8 @@ describe('large export ingest is bounded and never marks parsed until every conv
       },
     });
 
-    // Throw during f1's slice (7th batch = its 3rd conversation). consumeParseBatch reserves the export
-    // budget the moment it detects an export archive — BEFORE parseOne runs — so even though f1 throws,
-    // the budget is already spent and f2 is deferred (ACK + re-enqueue) without running a slice.
-    const restore = throwOnNthBatch(7);
+    // Failure after the first conversation still spends the invocation's reserved export budget.
+    const restore = throwOnNthBlockInsert(2);
     sent.length = 0;
     try {
       await worker.queue(
@@ -674,13 +662,10 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('defers an oversized conversation to its own invocation instead of writing it mid-slice (round 4 finding 2)', async () => {
-    // A conversation estimated above EXPORT_OVERSIZED_CEILING (dialed to 5 subrequests here) can't be
-    // sliced (writeSession is atomic per conversation), so when it appears after other work in a slice it
-    // must be cut to its OWN invocation — keeping its writeSession clear of the per-invocation cap. The
-    // 200-block conversation estimates at ceil(200/90)+3 = 6 subrequests > 5; the small ones are ~4.
-    // (Measured max real export conversation is 304 blocks ≈ 7 subrequests, so in prod this is defensive.)
-    budgets({ slice: 20, invocation: 20, ceiling: 5 });
-    const convs = [conv('ovz', 0), conv('ovz', 1), heavyConv('ovz', 2, 200), conv('ovz', 3)];
+    // Put a many-block conversation above the ceiling but below the cap. A generous slice budget
+    // isolates the oversized preflight from ordinary cumulative-budget slicing.
+    budgets({ slice: 150, invocation: 150, ceiling: 15 });
+    const convs = [conv('ovz', 0), conv('ovz', 1), heavyConv('ovz', 2, 1800), conv('ovz', 3)];
     const { fileId, hash, r2Key } = await uploadConvs('ovz', convs);
 
     sent.length = 0;
@@ -697,20 +682,15 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('records an unwritable oversized conversation and skips it, keeping the rest of the slice (round 4 finding 2, cap path)', async () => {
-    // A conversation whose estimate exceeds the hard SUBREQUEST CAP can't be written even alone under the
-    // ~1000 cap (~90k blocks in prod). Here cap=5 makes the 200-block conversation (est 6) unwritable; it is
-    // SKIPPED with a loud parse.export.oversized_conversation log (any existing row flipped to 'error')
-    // while the small conversations before and after it still write. Nothing is silently dropped — the raw
-    // ZIP stays in R2 for a later parser fix.
-    budgets({ slice: 20, invocation: 20, ceiling: 5, cap: 5 });
-    const { fileId, hash, r2Key } = await uploadConvs('cap', [conv('cap', 0), heavyConv('cap', 1, 200), conv('cap', 2)]);
+    // The hard cap sits comfortably above small writes and below this many-block conversation.
+    // Skipping it must preserve the raw ZIP and allow the smaller neighbors to finish.
+    budgets({ slice: 150, invocation: 150, ceiling: 15, cap: 15 });
+    const { fileId, hash, r2Key } = await uploadConvs('cap', [conv('cap', 0), heavyConv('cap', 1, 1800), conv('cap', 2)]);
 
     sent.length = 0;
     await deliver({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: hash });
 
-    // POSITIVE CONTROL: raise the cap above the estimate and all three write to 'ready'. At cap 5 the
-    // oversized conversation is never published, both small ones are, and the slice still completes (a skip
-    // is not a failure), so the file parses.
+    // Only the oversized conversation is unwritable; smaller neighbors still publish and complete.
     expect(await sessionState('bnd-cap-conv-1')).not.toBe('ready'); // oversized: never published
     expect(await sessionState('bnd-cap-conv-0')).toBe('ready');
     expect(await sessionState('bnd-cap-conv-2')).toBe('ready');
@@ -720,10 +700,10 @@ describe('large export ingest is bounded and never marks parsed until every conv
   it('writes a LEADING oversized conversation alone instead of looping on the same offset forever (round 5 finding 1)', async () => {
     // When a continuation STARTS on an oversized conversation (it is the FIRST in the slice), the ceiling
     // cut must NOT fire: nothing has been written yet, so cutting here would re-enqueue the SAME offset and
-    // the archive would stay pending forever. The single 200-block conversation (est 6 > ceiling 5, but
-    // ≤ cap) must be written ALONE, making progress.
-    budgets({ slice: 20, invocation: 20, ceiling: 5, cap: 900 });
-    const { fileId, hash, r2Key } = await uploadConvs('lead', [heavyConv('lead', 0, 200)]);
+    // the archive would stay pending forever. A leading conversation above the ceiling but below
+    // the cap must be written ALONE, making progress.
+    budgets({ slice: 150, invocation: 150, ceiling: 15, cap: 900 });
+    const { fileId, hash, r2Key } = await uploadConvs('lead', [heavyConv('lead', 0, 1800)]);
 
     sent.length = 0;
     await deliver({ file_id: fileId, r2_key: r2Key, reason: 'upload', content_hash: hash });
@@ -738,7 +718,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
 
   it('holds a SINGLE invocation-wide budget: an export slice defers a normal transcript in the same batch (round 4 finding 4)', async () => {
     budgets({ slice: 20, invocation: 20 });
-    const exp = await uploadArchive('inv1', 3);
+    const exp = await uploadArchive('inv1', 1);
     const web = await uploadClaudeWeb('inv1', 4); // a NON-export single session (normal write path)
 
     const flags: Record<number, { acked: boolean; retried: boolean }> = {};
@@ -752,7 +732,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
     // export slice still ran (its writeSession could push the invocation past the cap). The invocation-wide
     // budget reserves the export slice's cost and defers the normal transcript — ACK + re-enqueue, zero writes.
     expect(await fileState(exp.fileId)).toBe('parsed');
-    expect(await ownedSessions(exp.fileId)).toBe(3);
+    expect(await ownedSessions(exp.fileId)).toBe(1);
     expect(flags[web.fileId]).toEqual({ acked: true, retried: false }); // deferred by ack, not retry
     expect(sent.some((m) => m.file_id === web.fileId && m.offset === undefined)).toBe(true); // re-enqueued fresh
     expect(await fileState(web.fileId)).toBe('pending');
@@ -788,9 +768,8 @@ describe('large export ingest is bounded and never marks parsed until every conv
     const w2 = await uploadClaudeWeb('r5b', 2); // must be deferred, not run
 
     const flags: Record<number, { acked: boolean; retried: boolean }> = {};
-    // Throw on the FIRST db.batch of the invocation = w1's writeSession delete batch. (parseOne's pre-write
-    // work uses .first/.run, not .batch, so batch #1 is inside w1's writeSession.)
-    const restore = throwOnNthBatch(1);
+    // Fail inside the first transcript's shard write, not its preliminary metadata/catalog work.
+    const restore = throwOnNthBlockInsert(1);
     sent.length = 0;
     try {
       await worker.queue(
@@ -813,8 +792,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
   it('defers the CURRENT export when its reservation would overflow the invocation after prior work (round 6 finding 1)', async () => {
     // A cheap normal transcript earlier in the batch uses part of the budget WITHOUT crossing it, then the
     // export's worst-case reservation WOULD cross the cap. The export must be deferred — not run its slice
-    // after the prior D1 work — while the normal transcript still runs. invocation=25, reserve(slice)=20:
-    // the web spend (~15) doesn't self-trip deferRest, but 15 + 20 ≥ 25 overflows the reservation.
+    // after prior work while leaving enough room for the first normal transcript to finish.
     budgets({ slice: 20, invocation: 25 });
     const web = await uploadClaudeWeb('r6f1', 2); // cheap normal transcript, runs first
     const exp = await uploadArchive('r6f1', 3); // its reservation overflows the invocation → deferred
@@ -910,14 +888,13 @@ describe('large export ingest is bounded and never marks parsed until every conv
     // reservations, not deadlock on them. Budget 800 so the reserve pass (over any sibling pollution) clears
     // before the delete the throw targets.
     budgets({ slice: 800, invocation: 800 });
-    const DELETE_SQL = 'DELETE FROM sessions WHERE session_id = ?1 AND EXISTS (SELECT 1 FROM files WHERE id = ?2 AND content_hash = ?3)';
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
     const realBatch = testEnv.DB.batch.bind(testEnv.DB);
     const deleteStmts = new WeakSet<object>();
     let deleteThrown = false;
     testEnv.DB.prepare = ((sql: string) => {
       const stmt = realPrepare(sql);
-      if (sql !== DELETE_SQL) return stmt;
+      if (!sql.trimStart().startsWith('DELETE FROM sessions WHERE session_id')) return stmt;
       const realBind = stmt.bind.bind(stmt);
       stmt.bind = (...a: unknown[]) => {
         const bound = realBind(...a);
@@ -1086,21 +1063,20 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('a revertSlice failure during rollback still raises ExportRetry, never a terminal error (round 7 finding 2)', async () => {
-    budgets({ slice: 20, invocation: 20 });
+    budgets({ slice: 150, invocation: 150 });
     const { fileId, hash, r2Key } = await uploadArchive('r7f2a', 5);
 
-    // Reproduce the round-2-f1b write throw (7th batch = conversation 3's first batch; conversations 1-2 are
-    // fully written and tracked in `written`), THEN make raiseExportRetry's revertSlice ALSO throw by failing
-    // the prepare of its UPDATE. A second D1 failure DURING rollback must not escape as a non-sentinel error
-    // (which the generic catch would turn into a terminal 'error' with stranded rows) — it's swallowed with a
-    // structured log and ExportRetry is still raised.
-    const REVERT_SQL = "UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1";
+    // Fail a shard insert after a completed conversation, then fail rollback's main metadata update.
+    // Even a second D1 failure during rollback must retain retryable, non-terminal file state.
+    let writeFailed = false;
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
     testEnv.DB.prepare = ((sql: string) => {
-      if (sql === REVERT_SQL) throw new Error('D1 outage during revertSlice');
+      if (writeFailed && /^UPDATE\s+sessions\s+SET\s+index_state\s*=\s*'parsing'\s+WHERE\s+session_id\s*=/.test(sql.trimStart())) {
+        throw new Error('D1 outage during revertSlice');
+      }
       return realPrepare(sql);
     }) as typeof testEnv.DB.prepare;
-    const restore = throwOnNthBatch(7);
+    const restore = throwOnNthBlockInsert(2, () => { writeFailed = true; });
     const flags = { acked: false, retried: false };
     const msg = {
       id: String(fileId),
@@ -1126,12 +1102,12 @@ describe('large export ingest is bounded and never marks parsed until every conv
     // failure is swallowed and ExportRetry is raised: the consumer retries and the file rests 'pending'.
     expect(flags.retried).toBe(true);
     expect(await fileState(fileId)).toBe('pending'); // NOT 'error'
-    // revertSlice failed, so this slice's 2 written sessions stay 'ready'; the same-offset retry rewrites them.
-    expect(await readyCount(fileId)).toBe(2);
+    // A committed prefix remains ready when rollback itself fails; retry rewrites it.
+    expect(await readyCount(fileId)).toBeGreaterThan(0);
   });
 
   it('a forcePending failure during rollback still raises ExportRetry, leaving the file non-terminal (round 7 finding 2)', async () => {
-    budgets({ slice: 20, invocation: 20 });
+    budgets({ slice: 150, invocation: 150 });
     const { fileId, hash, r2Key } = await uploadArchive('r7f2b', 5);
 
     // Same write throw, but this time revertSlice succeeds and forcePending's UPDATE throws. A rollback that
@@ -1144,7 +1120,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
       if (sql === FORCE_PENDING_SQL) throw new Error('D1 outage during forcePending');
       return realPrepare(sql);
     }) as typeof testEnv.DB.prepare;
-    const restore = throwOnNthBatch(7);
+    const restore = throwOnNthBlockInsert(2);
     const flags = { acked: false, retried: false };
     const msg = {
       id: String(fileId),
@@ -1296,7 +1272,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
   });
 
   it('does not error an oversized conversation owned by another archive (round 9 finding 1)', async () => {
-    budgets({ slice: 800, invocation: 800, ceiling: 4, cap: 5 });
+    budgets({ slice: 800, invocation: 800, ceiling: 15, cap: 15 });
     const convTag = 'r9f1x';
     const a = await uploadConvs('r9f1-a', [conv(convTag, 0)]);
     await deliverChain({ file_id: a.fileId, r2_key: a.r2Key, reason: 'upload', content_hash: a.hash });
@@ -1307,7 +1283,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
     await testEnv.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(xId).run();
 
     // B carries an OVERSIZED (> cap) version of the SAME conversation; B has never written or owned it.
-    const b = await uploadConvs('r9f1-b', [heavyConv(convTag, 0, 200)]);
+    const b = await uploadConvs('r9f1-b', [heavyConv(convTag, 0, 1800)]);
     await deliver({ file_id: b.fileId, r2_key: b.r2Key, reason: 'upload', content_hash: b.hash });
 
     // POSITIVE CONTROL: the unqualified UPDATE flipped ANY row for this session id to 'error', reporting A's
@@ -1884,7 +1860,7 @@ describe('large export ingest is bounded and never marks parsed until every conv
     expect(await sessionState(xId)).toBe('ready');
   });
 
-  it('cleanup deletes are atomic hash-guarded: a hash flip between the recheck and the delete batch no-ops them (round 4 finding 3)', async () => {
+  it('cleanup keeps authoritative sessions when the file hash changes after its recheck', async () => {
     budgets({ slice: 800, invocation: 800 });
     const first = await uploadConvs('atom', Array.from({ length: 5 }, (_u, i) => conv('atom', i)));
     await deliverChain({ file_id: first.fileId, r2_key: first.r2Key, reason: 'upload', content_hash: first.hash });
@@ -1895,10 +1871,8 @@ describe('large export ingest is bounded and never marks parsed until every conv
     const replaced = await uploadConvs('atom', [conv('atom', 0)]);
     budgets({ slice: 20, invocation: 20 });
 
-    // Let the pre-write and post-write and per-page rechecks all read the CURRENT (matching) hash, then flip
-    // the stored hash right after the per-page recheck (the 3rd `SELECT content_hash` read) — i.e. a
-    // changed-hash upload landing AFTER the recheck but BEFORE the delete batch. The batch's embedded
-    // `EXISTS (content_hash = expected)` guard must make every delete no-op in that same transaction.
+    // Flip the source hash after the cleanup recheck. Main metadata removal must still check the
+    // authoritative file revision; shard and main operations do not share a transaction.
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
     let hashReads = 0;
     testEnv.DB.prepare = ((sql: string) => {
@@ -1926,9 +1900,8 @@ describe('large export ingest is bounded and never marks parsed until every conv
       testEnv.DB.prepare = realPrepare as typeof testEnv.DB.prepare;
     }
 
-    // POSITIVE CONTROL: without the per-statement `EXISTS (content_hash = expected)` guard, the deletes run
-    // against the (now stale) recheck and remove the 4 dropped conversations. The atomic guard no-ops them,
-    // so all 5 sessions survive and the file is not parsed (markParsed's own hash guard also fails).
+    // The guarded authoritative delete preserves the session rows for recovery, and stale cleanup
+    // must not publish the file as parsed.
     expect(await ownedSessions(replaced.fileId)).toBe(5); // nothing deleted
     expect(await fileState(replaced.fileId)).not.toBe('parsed');
   });

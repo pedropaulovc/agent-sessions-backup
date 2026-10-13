@@ -6,6 +6,8 @@ import { flipOwnedSessionsToParsing } from '../src/api/upload';
 import { chatgptExportZip, chatgptWebConversation, claudeWebConversation, historyLines, unrecognizedExportZip } from './web-fixtures';
 import { ccUserLine } from './fixtures';
 import { API, VIEWER } from './hosts';
+import { indexDbFor } from '../src/index-shards';
+import { syncSessionCatalog } from '../src/session-catalog';
 
 const CLAUDE_ROOT = '00000000-0000-4000-8000-000000000000';
 
@@ -91,17 +93,21 @@ async function resetExportState(): Promise<void> {
   ).all<{ session_id: string }>();
   const stmts = [];
   for (const { session_id } of owned.results) {
-    stmts.push(
-      testEnv.DB.prepare(
+    const indexDb = indexDbFor(testEnv, session_id);
+    await indexDb.batch([
+      indexDb.prepare(
         "INSERT INTO blocks_fts (blocks_fts, rowid, text) SELECT 'delete', id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL",
       ).bind(session_id),
-      testEnv.DB.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(session_id),
+      indexDb.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(session_id),
+    ]);
+    stmts.push(
       testEnv.DB.prepare('DELETE FROM usage WHERE session_id = ?1').bind(session_id),
       testEnv.DB.prepare('DELETE FROM sessions WHERE session_id = ?1').bind(session_id),
     );
   }
   stmts.push(testEnv.DB.prepare("DELETE FROM files WHERE store = 'export-inbox'"));
   await testEnv.DB.batch(stmts);
+  await syncSessionCatalog(testEnv, owned.results.map(({ session_id }) => session_id));
   enqueuedDelivery.clear();
 }
 
@@ -210,9 +216,9 @@ describe('claude-web image blocks render as inert placeholders, never blob-backe
     expect((await putText('webbox', 'claude-web', `${CONV}.json`, conv)).status).toBe(201);
     await drainQueue();
 
-    const media = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1 AND btype IN ('image','document')").bind(CONV).first<{ n: number }>();
+    const media = await indexDbFor(testEnv, CONV).prepare("SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1 AND btype IN ('image','document')").bind(CONV).first<{ n: number }>();
     expect(media?.n).toBe(0); // no blob-backed media rows -> the blob endpoint is never asked
-    const placeholder = await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1 AND text = '[image/png]'").bind(CONV).first<{ n: number }>();
+    const placeholder = await indexDbFor(testEnv, CONV).prepare("SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1 AND text = '[image/png]'").bind(CONV).first<{ n: number }>();
     expect(placeholder?.n).toBe(1);
   });
 });
@@ -284,7 +290,7 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     await drainQueue();
 
     expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'stale-b'").first<{ n: number }>()).toMatchObject({ n: 0 });
-    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM blocks WHERE session_id = 'stale-b'").first<{ n: number }>()).toMatchObject({ n: 0 });
+    expect(await indexDbFor(testEnv, 'stale-b').prepare("SELECT COUNT(*) AS n FROM blocks WHERE session_id = 'stale-b'").first<{ n: number }>()).toMatchObject({ n: 0 });
     expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'stale-a'").first<{ n: number }>()).toMatchObject({ n: 1 });
 
     const search = await SELF.fetch(`${API}/api/v1/search?q=stale-marker`, { headers: { 'x-dev-machine': 'webbox' } });
@@ -312,7 +318,7 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
     await drainQueue();
 
     expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'zt-b'").first<{ n: number }>()).toMatchObject({ n: 0 });
-    expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM blocks WHERE session_id = 'zt-b'").first<{ n: number }>()).toMatchObject({ n: 0 });
+    expect(await indexDbFor(testEnv, 'zt-b').prepare("SELECT COUNT(*) AS n FROM blocks WHERE session_id = 'zt-b'").first<{ n: number }>()).toMatchObject({ n: 0 });
     expect(await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM sessions WHERE session_id = 'zt-a'").first<{ n: number }>()).toMatchObject({ n: 1 });
   });
 

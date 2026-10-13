@@ -1,10 +1,35 @@
 interface Env {
+  /** Authoritative metadata, usage, rollups, stars, auth, pricing and jobs. Transcript blocks live in IDXnn. */
   DB: D1Database;
+  /** Fixed index shard count ("16" production, "2" elsewhere); the layout is immutable once written. */
+  INDEX_SHARD_COUNT: string;
+  /** Index shards: blocks + blocks_fts plus a catalog copy of sessions/starred_turns. Exactly
+   * IDX00..IDX{INDEX_SHARD_COUNT-1} must be bound; anything else fails closed. */
+  IDX00?: D1Database;
+  IDX01?: D1Database;
+  IDX02?: D1Database;
+  IDX03?: D1Database;
+  IDX04?: D1Database;
+  IDX05?: D1Database;
+  IDX06?: D1Database;
+  IDX07?: D1Database;
+  IDX08?: D1Database;
+  IDX09?: D1Database;
+  IDX10?: D1Database;
+  IDX11?: D1Database;
+  IDX12?: D1Database;
+  IDX13?: D1Database;
+  IDX14?: D1Database;
+  IDX15?: D1Database;
+  /** 'maintenance' freezes every writer for the protected cutover; 'active' is normal service. */
+  INDEX_MODE: 'maintenance' | 'active';
+  /** Build revision marker reported by health so CI can verify which revision is live. */
+  DEPLOYMENT_REVISION?: string;
   RAW: R2Bucket;
   KV: KVNamespace;
   OMP_QA_RATE_LIMITER: RateLimit;
   PARSE_QUEUE: Queue<ParseMessage>;
-  ROLLUP_QUEUE: Queue<SessionRollupMessage>;
+  ROLLUP_QUEUE: Queue<SessionRollupMessage | IndexCatalogMessage>;
   ENVIRONMENT: 'development' | 'preview' | 'production';
   /** Local orchestration evidence; generated preview config also binds nonce and deployment digests. */
   ENVIRONMENT_ID?: string;
@@ -39,7 +64,12 @@ interface Env {
   CF_OAUTH_BROKER?: DurableObjectNamespace;
 }
 
-type HubQueueMessage = ParseMessage | SessionRollupMessage;
+type HubQueueMessage = ParseMessage | SessionRollupMessage | IndexCatalogMessage;
+
+/** Reconciliation backstop: drain a bounded slice of the main catalog outbox into every shard. */
+interface IndexCatalogMessage {
+  kind: 'index-catalog';
+}
 
 interface SessionRollupMessage {
   kind: 'session-rollup';

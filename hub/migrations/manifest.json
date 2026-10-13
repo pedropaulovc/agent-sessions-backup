@@ -170,6 +170,16 @@
       "sequence": 34,
       "filename": "0034_codex_image_byte_ranges.sql",
       "sha256": "14f158fc737f1f7ea91814d820a314c2d9ad145a5e11ca49b16d8528f5c75510"
+    },
+    {
+      "sequence": 35,
+      "filename": "0035_drop_legacy_blocks.sql",
+      "sha256": "5da85488969f2ac97d90063da2848f26c6cda4234576023dde9c5054d75964f4"
+    },
+    {
+      "sequence": 36,
+      "filename": "0036_session_catalog_outbox.sql",
+      "sha256": "ad3e06db2ac927a60004d9876f2ffd84a7e2d53c585f1df969401f361f083958"
     }
   ]
 }

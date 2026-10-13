@@ -12,16 +12,61 @@ import { ccLine, ccLinearSession, ccSystemLine, TINY_PNG_B64 } from './fixtures'
 import { API, VIEWER } from './hosts';
 import { blobVersionOf } from '../src/viewer/session';
 import { turnFallbackKeyOf, turnKeyOf } from '../src/turn-key';
+import { assertIndexLayout, indexDbFor, indexDbs, reserveBlockIds } from '../src/index-shards';
+import { syncSessionCatalog } from '../src/session-catalog';
 
 const testEnv = env as unknown as Env;
+
+beforeAll(async () => {
+  await assertIndexLayout(testEnv);
+});
+
+interface FixtureBlock {
+  sessionId: string;
+  text: string | null;
+  turnIndex?: number;
+  blockIndex?: number;
+  role?: string;
+  btype?: string;
+  onMainPath?: number;
+}
+
+async function seedIndexBlocks(blocks: readonly FixtureBlock[]): Promise<void> {
+  await assertIndexLayout(testEnv);
+  for (const db of indexDbs(testEnv)) {
+    const rows = blocks.filter((block) => indexDbFor(testEnv, block.sessionId) === db);
+    if (rows.length === 0) continue;
+    const firstId = await reserveBlockIds(db, rows.length);
+    await db.batch([
+      ...rows.map((block, index) => db.prepare(
+        `INSERT INTO blocks
+           (id, session_id, file_id, turn_index, block_index, role, btype, text, on_main_path)
+         VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8)`,
+      ).bind(
+        firstId + index,
+        block.sessionId,
+        block.turnIndex ?? 0,
+        block.blockIndex ?? 0,
+        block.role ?? 'user',
+        block.btype ?? 'text',
+        block.text,
+        block.onMainPath ?? 1,
+      )),
+      db.prepare(
+        `INSERT INTO blocks_fts(rowid, text)
+         SELECT id, text FROM blocks WHERE id >= ?1 AND id < ?2 AND text IS NOT NULL`,
+      ).bind(firstId, firstId + rows.length),
+    ]);
+  }
+}
 
 /** Populate sessions.first_interaction_title for fixtures inserted directly into `blocks` (bypassing
  * the ingest writer that computes it). Mirrors the production backfill path (reparse → writer).
  * Sessions ingested through drainQueue already have it; recomputing is idempotent. */
-async function backfillFirstInteractionTitles(db: D1Database): Promise<void> {
-  const sessions = (await db.prepare('SELECT session_id FROM sessions').all<{ session_id: string }>()).results;
+async function backfillFirstInteractionTitles(env: Env): Promise<void> {
+  const sessions = (await env.DB.prepare('SELECT session_id FROM sessions').all<{ session_id: string }>()).results;
   for (const { session_id } of sessions) {
-    const blocks = (await db
+    const blocks = (await indexDbFor(env, session_id)
       .prepare('SELECT turn_index, block_index, role, btype, text, on_main_path FROM blocks WHERE session_id = ?1 ORDER BY turn_index, block_index')
       .bind(session_id)
       .all<{ turn_index: number; block_index: number; role: string; btype: string; text: string | null; on_main_path: number }>()).results;
@@ -35,8 +80,9 @@ async function backfillFirstInteractionTitles(db: D1Database): Promise<void> {
         onMainPath: b.on_main_path === 1,
       })),
     );
-    await db.prepare('UPDATE sessions SET first_interaction_title = ?2 WHERE session_id = ?1').bind(session_id, title).run();
+    await env.DB.prepare('UPDATE sessions SET first_interaction_title = ?2 WHERE session_id = ?1').bind(session_id, title).run();
   }
+  await syncSessionCatalog(env, sessions.map(({ session_id }) => session_id));
 }
 
 const SEARCH_SESSION = 'aaaaaaaa-1111-4111-8111-111111111111';
@@ -555,92 +601,60 @@ describe('viewer', () => {
          VALUES (?1, 'claude-code', 'testbox-wsl', 'Stored prefixed-turn title', '2026-07-01T10:00:00Z', 'ready')`,
       ).bind(PREFIXED_TURN_TITLE_SESSION),
       testEnv.DB.prepare(
-        `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text) VALUES
-         (?1, 1, 0, 0, 'user', 'text', '# AGENTS.md instructions injected in first block'),
-         (?1, 1, 0, 1, 'user', 'text', 'Same-turn text must not become the title'),
-         (?1, 1, 1, 0, 'assistant', 'text', 'First later turn title'),
-         (?1, 1, 2, 0, 'user', 'text', 'sameturntitlesentinel query target')`,
-      ).bind(PREFIXED_TURN_TITLE_SESSION),
-      testEnv.DB.prepare(
         `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
          VALUES (?1, 'image-title-test', 'testbox-wsl', 'Stored Windows image title', '2026-07-01T10:00:00Z', 'ready')`,
       ).bind(IMAGE_WINDOWS_TITLE_SESSION),
       testEnv.DB.prepare(
-        `INSERT INTO blocks
-           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
-         (?1, 1, 0, 0, 'user', 'text', ?2, 1),
-         (?1, 1, 0, 1, 'user', 'text', 'Windows image prompt after wrapper-only block', 1),
-         (?1, 1, 1, 0, 'assistant', 'text', 'windowsimagetitlequerysentinel response', 1)`,
-      ).bind(
-        IMAGE_WINDOWS_TITLE_SESSION,
-        [
-          '<image name=[Image #1] path="C:\\src\\harmonic-analyzer\\out\\sample-1.jpg">\r\n</image>',
-          '<image name=[Image #2] path="C:\\src\\harmonic-analyzer\\out\\sample-2.jpg">\r\n</image>',
-          '<image name=[Image #3] path="C:\\src\\harmonic-analyzer\\out\\sample-3.jpg">\r\n</image>',
-        ].join('\r\n\r\n'),
-      ),
-      testEnv.DB.prepare(
         `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
          VALUES (?1, 'main-path-title-test', 'testbox-wsl', 'Stored main-path title', '2026-07-01T10:00:00Z', 'ready')`,
-      ).bind(OFF_MAIN_TITLE_SESSION),
-      testEnv.DB.prepare(
-        `INSERT INTO blocks
-           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
-         (?1, 1, 0, 0, 'user', 'text', 'Abandoned earliest title', 0),
-         (?1, 1, 1, 0, 'user', 'text', 'Main path interaction title', 1),
-         (?1, 1, 2, 0, 'assistant', 'text', 'mainpathtitlequerysentinel response', 1)`,
       ).bind(OFF_MAIN_TITLE_SESSION),
       testEnv.DB.prepare(
         `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
          VALUES (?1, 'title-fallback-test', 'testbox-wsl', 'Stored fallback title', '2026-07-01T10:00:00Z', 'ready')`,
       ).bind(STORED_FALLBACK_TITLE_SESSION),
       testEnv.DB.prepare(
-        `INSERT INTO blocks
-           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
-         (?1, 1, 0, 0, 'user', 'image', NULL, 1),
-         (?1, 1, 1, 0, 'assistant', 'tool_use', 'fallbacktitlequerysentinel tool metadata', 1)`,
-      ).bind(STORED_FALLBACK_TITLE_SESSION),
-      testEnv.DB.prepare(
         `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
          VALUES (?1, 'scheduled-title-test', 'testbox-wsl', 'Stored scheduled title', '2026-07-01T11:00:00Z', 'ready')`,
       ).bind(SCHEDULED_TITLE_SESSION),
       testEnv.DB.prepare(
-        `INSERT INTO blocks
-           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
-         (?1, 1, 0, 0, 'user', 'text', ?2, 1),
-         (?1, 1, 1, 0, 'assistant', 'text', 'scheduledtitlequerysentinel response', 1)`,
-      ).bind(
-        SCHEDULED_TITLE_SESSION,
-        '<scheduled-task name="update-daily-notes" file="C:\\Users\\pedro\\.claude\\scheduled-tasks\\update-daily-notes\\SKILL.md">Scheduled body must not become the title</scheduled-task>',
-      ),
-      testEnv.DB.prepare(
         `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
          VALUES (?1, 'scheduled-title-test', 'testbox-wsl', 'Stored encoded scheduled title', '2026-07-01T10:00:00Z', 'ready')`,
       ).bind(ENCODED_SCHEDULED_TITLE_SESSION),
-      testEnv.DB.prepare(
-        `INSERT INTO blocks
-           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
-         (?1, 1, 0, 0, 'user', 'text', ?2, 1),
-         (?1, 1, 1, 0, 'assistant', 'text', 'encodedscheduledtitlequerysentinel response', 1)`,
-      ).bind(
-        ENCODED_SCHEDULED_TITLE_SESSION,
-        '<scheduled-task name="update&amp;daily&#45;notes" file="C:\\Users\\pedro\\.claude\\scheduled-tasks\\update-daily-notes\\SKILL.md">Encoded scheduled body</scheduled-task>',
-      ),
     ]);
-    await testEnv.DB.prepare(
-      `INSERT INTO blocks_fts(rowid, text)
-       SELECT id, text FROM blocks
-       WHERE session_id IN (?1, ?2, ?3, ?4, ?5, ?6) AND text IS NOT NULL`,
-    ).bind(
-      PREFIXED_TURN_TITLE_SESSION,
-      IMAGE_WINDOWS_TITLE_SESSION,
-      OFF_MAIN_TITLE_SESSION,
-      STORED_FALLBACK_TITLE_SESSION,
-      SCHEDULED_TITLE_SESSION,
-      ENCODED_SCHEDULED_TITLE_SESSION,
-    ).run();
+    await seedIndexBlocks([
+      { sessionId: PREFIXED_TURN_TITLE_SESSION, text: '# AGENTS.md instructions injected in first block' },
+      { sessionId: PREFIXED_TURN_TITLE_SESSION, blockIndex: 1, text: 'Same-turn text must not become the title' },
+      { sessionId: PREFIXED_TURN_TITLE_SESSION, turnIndex: 1, role: 'assistant', text: 'First later turn title' },
+      { sessionId: PREFIXED_TURN_TITLE_SESSION, turnIndex: 2, text: 'sameturntitlesentinel query target' },
+      {
+        sessionId: IMAGE_WINDOWS_TITLE_SESSION,
+        text: [
+          '<image name=[Image #1] path="C:\\src\\harmonic-analyzer\\out\\sample-1.jpg">\r\n</image>',
+          '<image name=[Image #2] path="C:\\src\\harmonic-analyzer\\out\\sample-2.jpg">\r\n</image>',
+          '<image name=[Image #3] path="C:\\src\\harmonic-analyzer\\out\\sample-3.jpg">\r\n</image>',
+        ].join('\r\n\r\n'),
+      },
+      { sessionId: IMAGE_WINDOWS_TITLE_SESSION, blockIndex: 1, text: 'Windows image prompt after wrapper-only block' },
+      { sessionId: IMAGE_WINDOWS_TITLE_SESSION, turnIndex: 1, role: 'assistant', text: 'windowsimagetitlequerysentinel response' },
+      { sessionId: OFF_MAIN_TITLE_SESSION, text: 'Abandoned earliest title', onMainPath: 0 },
+      { sessionId: OFF_MAIN_TITLE_SESSION, turnIndex: 1, text: 'Main path interaction title' },
+      { sessionId: OFF_MAIN_TITLE_SESSION, turnIndex: 2, role: 'assistant', text: 'mainpathtitlequerysentinel response' },
+      { sessionId: STORED_FALLBACK_TITLE_SESSION, btype: 'image', text: null },
+      { sessionId: STORED_FALLBACK_TITLE_SESSION, turnIndex: 1, role: 'assistant', btype: 'tool_use', text: 'fallbacktitlequerysentinel tool metadata' },
+      {
+        sessionId: SCHEDULED_TITLE_SESSION,
+        text: '<scheduled-task name="update-daily-notes" file="C:\\Users\\pedro\\.claude\\scheduled-tasks\\update-daily-notes\\SKILL.md">Scheduled body must not become the title</scheduled-task>',
+      },
+      { sessionId: SCHEDULED_TITLE_SESSION, turnIndex: 1, role: 'assistant', text: 'scheduledtitlequerysentinel response' },
+      {
+        sessionId: ENCODED_SCHEDULED_TITLE_SESSION,
+        text: '<scheduled-task name="update&amp;daily&#45;notes" file="C:\\Users\\pedro\\.claude\\scheduled-tasks\\update-daily-notes\\SKILL.md">Encoded scheduled body</scheduled-task>',
+      },
+      { sessionId: ENCODED_SCHEDULED_TITLE_SESSION, turnIndex: 1, role: 'assistant', text: 'encodedscheduledtitlequerysentinel response' },
+    ]);
 
     const wrapperStatements: D1PreparedStatement[] = [];
+    const wrapperBlocks: FixtureBlock[] = [];
     for (let i = 0; i < WRAPPER_TITLE_CASES.length; i++) {
       const titleCase = WRAPPER_TITLE_CASES[i]!;
       wrapperStatements.push(
@@ -648,12 +662,10 @@ describe('viewer', () => {
           `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
            VALUES (?1, 'wrapper-title-test', 'testbox-wsl', 'Stored wrapper title', ?2, 'ready')`,
         ).bind(titleCase.id, `2026-07-02T10:00:0${i}Z`),
-        testEnv.DB.prepare(
-          `INSERT INTO blocks
-             (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
-           (?1, 1, 0, 0, 'user', 'text', ?2, 1),
-           (?1, 1, 1, 0, 'assistant', 'text', ?3, 1)`,
-        ).bind(titleCase.id, titleCase.source, `${titleCase.query} response`),
+      );
+      wrapperBlocks.push(
+        { sessionId: titleCase.id, text: titleCase.source },
+        { sessionId: titleCase.id, turnIndex: 1, role: 'assistant', text: `${titleCase.query} response` },
       );
     }
     wrapperStatements.push(
@@ -661,25 +673,19 @@ describe('viewer', () => {
         `INSERT INTO sessions (session_id, harness, machine_id, title, started_at, index_state)
          VALUES (?1, 'injected-title-test', 'testbox-wsl', 'Stored injected title', '2026-07-02T11:00:00Z', 'ready')`,
       ).bind(INJECTED_WRAPPERS_TITLE_SESSION),
-      testEnv.DB.prepare(
-        `INSERT INTO blocks
-           (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path) VALUES
-         (?1, 1, 0, 0, 'user', 'text', '<codex_internal_context>injected</codex_internal_context>', 1),
-         (?1, 1, 1, 0, 'assistant', 'text', '<system-reminder>injected</system-reminder>', 1),
-         (?1, 1, 2, 0, 'user', 'text', '<environment_context>injected</environment_context>', 1),
-         (?1, 1, 3, 0, 'assistant', 'text', '<hook_prompt>injected</hook_prompt>', 1),
-         (?1, 1, 4, 0, 'user', 'text', 'First interaction after injected wrappers', 1),
-         (?1, 1, 5, 0, 'assistant', 'text', 'injectedwrapperstitlequerysentinel response', 1)`,
-      ).bind(INJECTED_WRAPPERS_TITLE_SESSION),
     );
     await testEnv.DB.batch(wrapperStatements);
-    await testEnv.DB.prepare(
-      `INSERT INTO blocks_fts(rowid, text)
-       SELECT id, text FROM blocks
-       WHERE (session_id = ?1 OR session_id LIKE 'wrapper-title-%') AND text IS NOT NULL`,
-    ).bind(INJECTED_WRAPPERS_TITLE_SESSION).run();
+    wrapperBlocks.push(
+      { sessionId: INJECTED_WRAPPERS_TITLE_SESSION, text: '<codex_internal_context>injected</codex_internal_context>' },
+      { sessionId: INJECTED_WRAPPERS_TITLE_SESSION, turnIndex: 1, role: 'assistant', text: '<system-reminder>injected</system-reminder>' },
+      { sessionId: INJECTED_WRAPPERS_TITLE_SESSION, turnIndex: 2, text: '<environment_context>injected</environment_context>' },
+      { sessionId: INJECTED_WRAPPERS_TITLE_SESSION, turnIndex: 3, role: 'assistant', text: '<hook_prompt>injected</hook_prompt>' },
+      { sessionId: INJECTED_WRAPPERS_TITLE_SESSION, turnIndex: 4, text: 'First interaction after injected wrappers' },
+      { sessionId: INJECTED_WRAPPERS_TITLE_SESSION, turnIndex: 5, role: 'assistant', text: 'injectedwrapperstitlequerysentinel response' },
+    );
+    await seedIndexBlocks(wrapperBlocks);
 
-    await backfillFirstInteractionTitles(testEnv.DB);
+    await backfillFirstInteractionTitles(testEnv);
   });
 
   it('search page returns 200 with a highlighted snippet and a link to the session', async () => {
@@ -810,6 +816,7 @@ describe('viewer', () => {
         await testEnv.DB.prepare(
           'UPDATE sessions SET first_interaction_title = ?2 WHERE session_id = ?1',
         ).bind(PREFIXED_TURN_TITLE_SESSION, persisted).run();
+        await syncSessionCatalog(testEnv, [PREFIXED_TURN_TITLE_SESSION]);
         const html = await (await SELF.fetch(`${VIEWER}/s/${PREFIXED_TURN_TITLE_SESSION}`)).text();
         expect(html).toContain('<title>First later turn title</title>');
         expect(html).toContain('<h2 style="margin:0">First later turn title</h2>');
@@ -818,6 +825,7 @@ describe('viewer', () => {
       await testEnv.DB.prepare(
         'UPDATE sessions SET first_interaction_title = ?2 WHERE session_id = ?1',
       ).bind(PREFIXED_TURN_TITLE_SESSION, before?.first_interaction_title ?? null).run();
+      await syncSessionCatalog(testEnv, [PREFIXED_TURN_TITLE_SESSION]);
     }
   });
 
@@ -853,16 +861,14 @@ describe('viewer', () => {
     expect(html).not.toContain('C:\\src\\harmonic-analyzer');
   });
 
-  it('drives full-text search off the blocks_fts index and reads the title as a stored column', async () => {
-    const searchPlan = await testEnv.DB.prepare(
-      `EXPLAIN QUERY PLAN ${searchHitsSql('', '', null, 20, 0)}`,
-    ).bind('filler').all<{ detail: string }>();
-    const searchDetails = searchPlan.results.map((row) => row.detail).join('\n');
-    expect(searchDetails).toContain('SCAN blocks_fts VIRTUAL TABLE');
-    // The first-interaction title is now a stored sessions column, not a correlated per-row
-    // recursive subquery, so the search plan never materializes a blocks title lookup.
-    expect(searchDetails).not.toContain('title_block');
-    expect(searchHitsSql('', '', null, 20, 0)).toContain('s.first_interaction_title');
+  it('drives full-text search off each shard blocks_fts index', async () => {
+    for (const db of indexDbs(testEnv)) {
+      const searchPlan = await db.prepare(
+        `EXPLAIN QUERY PLAN ${searchHitsSql('', '', null, 20, 0)}`,
+      ).bind('filler').all<{ detail: string }>();
+      const searchDetails = searchPlan.results.map((row) => row.detail).join('\n');
+      expect(searchDetails).toContain('SCAN blocks_fts VIRTUAL TABLE');
+    }
   });
 
   it('ignores abandoned title blocks and chooses the first main-path interaction', async () => {
@@ -1017,6 +1023,7 @@ describe('viewer', () => {
     await testEnv.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1")
       .bind(SEARCH_SESSION)
       .run();
+    await syncSessionCatalog(testEnv, [SEARCH_SESSION]);
     const indexing = await SELF.fetch(`${endpoint}/star`, {
       method: 'POST',
       headers: {
@@ -1029,6 +1036,7 @@ describe('viewer', () => {
     await testEnv.DB.prepare("UPDATE sessions SET index_state = 'ready' WHERE session_id = ?1")
       .bind(SEARCH_SESSION)
       .run();
+    await syncSessionCatalog(testEnv, [SEARCH_SESSION]);
     expect(indexing.status).toBe(409);
 
     const starred = await SELF.fetch(`${endpoint}/star?view=chronological`, {
@@ -1120,6 +1128,7 @@ describe('viewer', () => {
     expect(stale.status).toBe(409);
 
     await testEnv.DB.prepare('DELETE FROM sessions WHERE session_id = ?1').bind(STAR_STABLE_SESSION).run();
+    await syncSessionCatalog(testEnv, [STAR_STABLE_SESSION]);
     const preserved = await testEnv.DB.prepare(
       'SELECT turn_key FROM starred_turns WHERE session_id = ?1',
     )
@@ -1293,16 +1302,18 @@ describe('viewer', () => {
   });
 
   it('indexes and renders image-rich Codex input in source order, serving each indexed sheet', async () => {
-    const rows = (await testEnv.DB.prepare(
-      `SELECT b.block_index, b.btype, b.text, b.byte_start, b.byte_len, b.media_byte_start,
-              b.media_byte_len, b.media_type, b.id, f.content_hash
-       FROM blocks b JOIN files f ON f.id = b.file_id
-       WHERE b.session_id = ?1 ORDER BY b.turn_index, b.block_index`,
+    const rows = (await indexDbFor(testEnv, CODEX_IMAGES_SESSION).prepare(
+      `SELECT block_index, btype, text, byte_start, byte_len, media_byte_start,
+              media_byte_len, media_type, id, file_id
+       FROM blocks WHERE session_id = ?1 ORDER BY turn_index, block_index`,
     ).bind(CODEX_IMAGES_SESSION).all<{
       block_index: number; btype: string; text: string | null;
       byte_start: number; byte_len: number; media_byte_start: number | null;
-      media_byte_len: number | null; media_type: string | null; id: number; content_hash: string;
+      media_byte_len: number | null; media_type: string | null; id: number; file_id: number;
     }>()).results;
+    const file = await testEnv.DB.prepare('SELECT content_hash FROM files WHERE id = ?1')
+      .bind(rows[0]!.file_id).first<{ content_hash: string }>();
+    expect(file).toBeTruthy();
     expect(rows.map((r) => r.btype)).toEqual([
       'text', ...Array(10).fill('image'), 'text', ...Array(10).fill('image'), 'text', 'text',
     ]);
@@ -1337,7 +1348,7 @@ describe('viewer', () => {
     expect(html.indexOf('Middle drawing note')).toBeLessThan(imageUrls[10]!.index!);
     expect(html.indexOf('codeximageneedle final drawing instruction')).toBeGreaterThan(imageUrls[19]!.index!);
 
-    const version = rows[0]!.content_hash.slice(0, 12);
+    const version = file!.content_hash.slice(0, 12);
     const first = await SELF.fetch(`${VIEWER}/s/${CODEX_IMAGES_SESSION}/blob/${rows[1]!.id}?v=${version}`);
     expect(first.status).toBe(200);
     expect(first.headers.get('content-type')).toBe('image/png');
@@ -1368,17 +1379,18 @@ describe('viewer', () => {
   });
 
   it('fails closed for stale, out-of-bounds, malformed and non-raster Codex image metadata', async () => {
-    const row = await testEnv.DB.prepare(
-      `SELECT b.id, b.byte_start, b.byte_len, b.media_byte_start, b.media_byte_len,
-              b.media_type, f.content_hash
-       FROM blocks b JOIN files f ON f.id = b.file_id
-       WHERE b.session_id = ?1 AND b.btype = 'image' ORDER BY b.block_index LIMIT 1`,
+    const row = await indexDbFor(testEnv, CODEX_IMAGES_SESSION).prepare(
+      `SELECT id, byte_start, byte_len, media_byte_start, media_byte_len, media_type, file_id
+       FROM blocks WHERE session_id = ?1 AND btype = 'image' ORDER BY block_index LIMIT 1`,
     ).bind(CODEX_IMAGES_SESSION).first<{
-      id: number; byte_start: number; byte_len: number;
-      media_byte_start: number; media_byte_len: number; media_type: string; content_hash: string;
+      id: number; byte_start: number; byte_len: number; file_id: number;
+      media_byte_start: number; media_byte_len: number; media_type: string;
     }>();
     expect(row).toBeTruthy();
-    const url = `${VIEWER}/s/${CODEX_IMAGES_SESSION}/blob/${row!.id}?v=${row!.content_hash.slice(0, 12)}`;
+    const file = await testEnv.DB.prepare('SELECT content_hash FROM files WHERE id = ?1')
+      .bind(row!.file_id).first<{ content_hash: string }>();
+    expect(file).toBeTruthy();
+    const url = `${VIEWER}/s/${CODEX_IMAGES_SESSION}/blob/${row!.id}?v=${file!.content_hash.slice(0, 12)}`;
     try {
       for (const [start, length, mime] of [
         [null, null, row!.media_type], // rows from before migration must be reindexed
@@ -1386,13 +1398,13 @@ describe('viewer', () => {
         [row!.media_byte_start, 5, row!.media_type], // not a complete base64 payload
         [row!.media_byte_start, row!.media_byte_len, 'image/svg+xml'], // never inline active content
       ] as const) {
-        await testEnv.DB.prepare(
+        await indexDbFor(testEnv, CODEX_IMAGES_SESSION).prepare(
           'UPDATE blocks SET media_byte_start = ?1, media_byte_len = ?2, media_type = ?3 WHERE id = ?4',
         ).bind(start, length, mime, row!.id).run();
         expect((await SELF.fetch(url)).status).toBe(404);
       }
     } finally {
-      await testEnv.DB.prepare(
+      await indexDbFor(testEnv, CODEX_IMAGES_SESSION).prepare(
         'UPDATE blocks SET media_byte_start = ?1, media_byte_len = ?2, media_type = ?3 WHERE id = ?4',
       ).bind(row!.media_byte_start, row!.media_byte_len, row!.media_type, row!.id).run();
     }
@@ -1400,13 +1412,15 @@ describe('viewer', () => {
   });
 
   it('does not serve stale Codex image ranges while a changed source is awaiting reparse', async () => {
-    const row = await testEnv.DB.prepare(
-      `SELECT b.id AS block_id, f.id AS file_id, f.content_hash
-       FROM blocks b JOIN files f ON f.id = b.file_id
-       WHERE b.session_id = ?1 AND b.btype = 'image' ORDER BY b.block_index LIMIT 1`,
-    ).bind(CODEX_IMAGES_SESSION).first<{ block_id: number; file_id: number; content_hash: string }>();
+    const row = await indexDbFor(testEnv, CODEX_IMAGES_SESSION).prepare(
+      `SELECT id AS block_id, file_id
+       FROM blocks WHERE session_id = ?1 AND btype = 'image' ORDER BY block_index LIMIT 1`,
+    ).bind(CODEX_IMAGES_SESSION).first<{ block_id: number; file_id: number }>();
     expect(row).toBeTruthy();
-    const url = `${VIEWER}/s/${CODEX_IMAGES_SESSION}/blob/${row!.block_id}?v=${row!.content_hash.slice(0, 12)}`;
+    const file = await testEnv.DB.prepare('SELECT content_hash FROM files WHERE id = ?1')
+      .bind(row!.file_id).first<{ content_hash: string }>();
+    expect(file).toBeTruthy();
+    const url = `${VIEWER}/s/${CODEX_IMAGES_SESSION}/blob/${row!.block_id}?v=${file!.content_hash.slice(0, 12)}`;
     try {
       await testEnv.DB.prepare("UPDATE files SET parse_state = 'pending' WHERE id = ?1").bind(row!.file_id).run();
       expect((await SELF.fetch(url)).status).toBe(404);
@@ -1419,7 +1433,7 @@ describe('viewer', () => {
   it('paginates a trailing compaction marker onto its own page and renders the divider there', async () => {
     // The marker turn (turn_index 200) has no content blocks; the indexer persists a text-less
     // btype=compaction row so the page count and byte window include it.
-    const row = await testEnv.DB.prepare(
+    const row = await indexDbFor(testEnv, CODEX_TAIL_SESSION).prepare(
       "SELECT id, turn_index, text FROM blocks WHERE session_id = ?1 AND btype = 'compaction'",
     )
       .bind(CODEX_TAIL_SESSION)
@@ -1430,7 +1444,7 @@ describe('viewer', () => {
 
     // The text-less compaction rows did not desync the external-content FTS index.
     await expect(
-      testEnv.DB.prepare("INSERT INTO blocks_fts(blocks_fts) VALUES('integrity-check')").run(),
+      indexDbFor(testEnv, CODEX_TAIL_SESSION).prepare("INSERT INTO blocks_fts(blocks_fts) VALUES('integrity-check')").run(),
     ).resolves.toBeTruthy();
 
     // Page count includes the marker's page…
@@ -1479,7 +1493,7 @@ describe('viewer', () => {
 
   it('matches turn metadata at any block offset so skipped D1 records cannot shift later turns', async () => {
     const rows = (
-      await testEnv.DB.prepare(
+      await indexDbFor(testEnv, OFFSET_MATCH_SESSION).prepare(
         'SELECT turn_index, byte_start FROM blocks WHERE session_id = ?1 ORDER BY turn_index',
       )
         .bind(OFFSET_MATCH_SESSION)
@@ -1489,28 +1503,30 @@ describe('viewer', () => {
 
     // Simulate a previously indexed turn whose source record is now skipped by the bounded JSONL reader.
     // Later D1 turns keep their authoritative indices, leaving this row unmatched by the fresh raw parse.
-    await testEnv.DB.prepare(
+    await indexDbFor(testEnv, OFFSET_MATCH_SESSION).prepare(
       'UPDATE blocks SET turn_index = turn_index + 1 WHERE session_id = ?1 AND turn_index >= 1',
     ).bind(OFFSET_MATCH_SESSION).run();
-    await testEnv.DB.prepare(
+    const indexDb = indexDbFor(testEnv, OFFSET_MATCH_SESSION);
+    const firstId = await reserveBlockIds(indexDb, 2);
+    await indexDb.prepare(
       `INSERT INTO blocks
-         (session_id, file_id, turn_index, block_index, role, btype, byte_start, byte_len, truncated, text, on_main_path)
-       SELECT session_id, file_id, 1, 0, 'assistant', 'text', ?2, 1, 0, NULL, 0
+         (id, session_id, file_id, turn_index, block_index, role, btype, byte_start, byte_len, truncated, text, on_main_path)
+       SELECT ?3, session_id, file_id, 1, 0, 'assistant', 'text', ?2, 1, 0, NULL, 0
        FROM blocks WHERE session_id = ?1 AND turn_index = 0 LIMIT 1`,
-    ).bind(OFFSET_MATCH_SESSION, rows[0]!.byte_start + 1).run();
+    ).bind(OFFSET_MATCH_SESSION, rows[0]!.byte_start + 1, firstId).run();
 
     // The old turn 2 also had an oversized first block, followed by the smaller block that still exists in
     // the raw parse. Its authoritative index/main-path metadata must match at that later surviving offset,
     // not only at MIN(byte_start) for the turn.
-    await testEnv.DB.prepare(
+    await indexDb.prepare(
       'UPDATE blocks SET block_index = block_index + 1, on_main_path = 0 WHERE session_id = ?1 AND turn_index = 2',
     ).bind(OFFSET_MATCH_SESSION).run();
-    await testEnv.DB.prepare(
+    await indexDb.prepare(
       `INSERT INTO blocks
-         (session_id, file_id, turn_index, block_index, role, btype, byte_start, byte_len, truncated, text, on_main_path)
-       SELECT session_id, file_id, 2, 0, 'assistant', 'tool_result', ?2, 1, 0, NULL, 0
+         (id, session_id, file_id, turn_index, block_index, role, btype, byte_start, byte_len, truncated, text, on_main_path)
+       SELECT ?3, session_id, file_id, 2, 0, 'assistant', 'tool_result', ?2, 1, 0, NULL, 0
        FROM blocks WHERE session_id = ?1 AND turn_index = 0 LIMIT 1`,
-    ).bind(OFFSET_MATCH_SESSION, rows[0]!.byte_start + 2).run();
+    ).bind(OFFSET_MATCH_SESSION, rows[0]!.byte_start + 2, firstId + 1).run();
 
     const chronological = await (
       await SELF.fetch(`${VIEWER}/s/${OFFSET_MATCH_SESSION}?view=chronological`)
@@ -1528,7 +1544,7 @@ describe('viewer', () => {
   });
 
   it('reindex preserves persisted on_main_path flags', async () => {
-    const before = await testEnv.DB.prepare(
+    const before = await indexDbFor(testEnv, REWIND_SESSION).prepare(
       'SELECT MAX(on_main_path) AS m FROM blocks WHERE session_id = ?1 AND turn_index = 100',
     )
       .bind(REWIND_SESSION)
@@ -1537,13 +1553,13 @@ describe('viewer', () => {
 
     await deliverOne(rewindFileId, rewindR2Key); // re-parse: delete + reinsert all block rows
 
-    const after = await testEnv.DB.prepare(
+    const after = await indexDbFor(testEnv, REWIND_SESSION).prepare(
       'SELECT MAX(on_main_path) AS m FROM blocks WHERE session_id = ?1 AND turn_index = 100',
     )
       .bind(REWIND_SESSION)
       .first<{ m: number }>();
     expect(after?.m).toBe(0);
-    const mainAfter = await testEnv.DB.prepare(
+    const mainAfter = await indexDbFor(testEnv, REWIND_SESSION).prepare(
       'SELECT MAX(on_main_path) AS m FROM blocks WHERE session_id = ?1 AND turn_index = 0',
     )
       .bind(REWIND_SESSION)
@@ -1568,7 +1584,7 @@ describe('viewer', () => {
   });
 
   it('redirects a stale/versionless blob request and only serves immutable when version-matched', async () => {
-    const block = await testEnv.DB.prepare("SELECT id, file_id FROM blocks WHERE session_id = ?1 AND btype = 'image'")
+    const block = await indexDbFor(testEnv, SEARCH_SESSION).prepare("SELECT id, file_id FROM blocks WHERE session_id = ?1 AND btype = 'image'")
       .bind(SEARCH_SESSION)
       .first<{ id: number; file_id: number }>();
     const hash = await testEnv.DB.prepare('SELECT content_hash AS h FROM files WHERE id = ?1')
@@ -1699,7 +1715,7 @@ describe('viewer', () => {
   });
 
   it('blob endpoint round-trips a base64 png', async () => {
-    const block = await testEnv.DB.prepare("SELECT id FROM blocks WHERE session_id = ?1 AND btype = 'image'")
+    const block = await indexDbFor(testEnv, SEARCH_SESSION).prepare("SELECT id FROM blocks WHERE session_id = ?1 AND btype = 'image'")
       .bind(SEARCH_SESSION)
       .first<{ id: number }>();
     expect(block).toBeTruthy();
@@ -1712,8 +1728,57 @@ describe('viewer', () => {
     expect([...got]).toEqual([...want]);
   });
 
+  it('serves preserved legacy numeric block URLs from the session shard', async () => {
+    const db = indexDbFor(testEnv, SEARCH_SESSION);
+    const block = await db.prepare(
+      "SELECT id, file_id FROM blocks WHERE session_id = ?1 AND btype = 'image'",
+    ).bind(SEARCH_SESSION).first<{ id: number; file_id: number }>();
+    expect(block).toBeTruthy();
+    const file = await testEnv.DB.prepare('SELECT content_hash FROM files WHERE id = ?1')
+      .bind(block!.file_id).first<{ content_hash: string }>();
+    expect(file).toBeTruthy();
+    const legacyBlockId = 1234567; // Preserved migration IDs are below the new per-shard ranges.
+    const version = file!.content_hash.slice(0, 12);
+    await db.batch([
+      db.prepare(
+        `INSERT INTO blocks_fts(blocks_fts, rowid, text)
+         SELECT 'delete', id, text FROM blocks WHERE id = ?1 AND text IS NOT NULL`,
+      ).bind(block!.id),
+      db.prepare('UPDATE blocks SET id = ?1 WHERE id = ?2').bind(legacyBlockId, block!.id),
+      db.prepare(
+        `INSERT INTO blocks_fts(rowid, text)
+         SELECT id, text FROM blocks WHERE id = ?1 AND text IS NOT NULL`,
+      ).bind(legacyBlockId),
+    ]);
+    try {
+      const url = `${VIEWER}/s/${SEARCH_SESSION}/blob/${legacyBlockId}?v=${version}`;
+      const html = await (await SELF.fetch(`${VIEWER}/s/${SEARCH_SESSION}`)).text();
+      expect(html).toContain(`/blob/${legacyBlockId}?v=${version}`);
+      const response = await SELF.fetch(url, { redirect: 'manual' });
+      expect(response.status).toBe(200);
+      expect(response.headers.get('location')).toBeNull();
+      expect(response.headers.get('content-type')).toBe('image/png');
+      expect(response.headers.get('cache-control')).toContain('immutable');
+      expect(new Uint8Array(await response.arrayBuffer())).toEqual(
+        Uint8Array.from(atob(TINY_PNG_B64), (char) => char.charCodeAt(0)),
+      );
+    } finally {
+      await db.batch([
+        db.prepare(
+          `INSERT INTO blocks_fts(blocks_fts, rowid, text)
+           SELECT 'delete', id, text FROM blocks WHERE id = ?1 AND text IS NOT NULL`,
+        ).bind(legacyBlockId),
+        db.prepare('UPDATE blocks SET id = ?1 WHERE id = ?2').bind(block!.id, legacyBlockId),
+        db.prepare(
+          `INSERT INTO blocks_fts(rowid, text)
+           SELECT id, text FROM blocks WHERE id = ?1 AND text IS NOT NULL`,
+        ).bind(block!.id),
+      ]);
+    }
+  });
+
   it('serves an inline image nested inside a tool result', async () => {
-    const block = await testEnv.DB.prepare(
+    const block = await indexDbFor(testEnv, NESTED_BLOB_SESSION).prepare(
       "SELECT id, block_index FROM blocks WHERE session_id = ?1 AND btype = 'image'",
     )
       .bind(NESTED_BLOB_SESSION)
@@ -1729,13 +1794,13 @@ describe('viewer', () => {
   });
 
   it('serves inert images inline but forces hostile MIME (svg, documents) to a download', async () => {
-    const imgs = await testEnv.DB.prepare(
+    const imgs = await indexDbFor(testEnv, BLOB_SESSION).prepare(
       "SELECT id FROM blocks WHERE session_id = ?1 AND btype = 'image' ORDER BY byte_start",
     )
       .bind(BLOB_SESSION)
       .all<{ id: number }>();
     const [pngId, svgId] = imgs.results.map((r) => r.id);
-    const doc = await testEnv.DB.prepare("SELECT id FROM blocks WHERE session_id = ?1 AND btype = 'document'")
+    const doc = await indexDbFor(testEnv, BLOB_SESSION).prepare("SELECT id FROM blocks WHERE session_id = ?1 AND btype = 'document'")
       .bind(BLOB_SESSION)
       .first<{ id: number }>();
 
@@ -1770,7 +1835,7 @@ describe('viewer', () => {
   it('serves media that follows an unknown content item in the same message', async () => {
     // The image is stored at block_index 1 (the unknown item took index 0); the blob extractor must
     // count the unknown item too, or it would test the image against index 0 and 404.
-    const img = await testEnv.DB.prepare(
+    const img = await indexDbFor(testEnv, UNKNOWN_MEDIA_SESSION).prepare(
       "SELECT id, block_index FROM blocks WHERE session_id = ?1 AND btype = 'image'",
     )
       .bind(UNKNOWN_MEDIA_SESSION)
@@ -1910,6 +1975,7 @@ describe('viewer result pagination and facet layout', () => {
 
   beforeAll(async () => {
     const statements: D1PreparedStatement[] = [];
+    const blocks: FixtureBlock[] = [];
     for (let i = 0; i < 25; i++) {
       const id = `viewer-pagination-${String(i).padStart(2, '0')}`;
       // Exercise both halves of the keyset's total order: item 14 ties item 15's
@@ -1924,18 +1990,9 @@ describe('viewer result pagination and facet layout', () => {
            VALUES (?1, ?2, ?3, 'linux', 'pagination-model', ?4, ?5, 'ready')`,
         ).bind(id, PAGINATION_HARNESS, PAGINATION_MACHINE, `Pagination item ${i}`, startedAt),
       );
-      statements.push(
-        testEnv.DB.prepare(
-          `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text)
-           VALUES (?1, 1, 0, 0, 'user', 'text', ?2)`,
-        ).bind(id, `Pagination item ${i} ${PAGINATION_MARKER}`),
-      );
+      blocks.push({ sessionId: id, text: `Pagination item ${i} ${PAGINATION_MARKER}` });
     }
     await testEnv.DB.batch(statements);
-    await testEnv.DB.prepare(
-      `INSERT INTO blocks_fts(rowid, text)
-       SELECT id, text FROM blocks WHERE session_id LIKE 'viewer-pagination-%'`,
-    ).run();
     await testEnv.DB.batch([
       testEnv.DB.prepare(
         `INSERT INTO sessions (session_id, harness, machine_id, os, primary_model, title, started_at, ended_at, tokens_in, tokens_out, tokens_reasoning, index_state)
@@ -1949,16 +2006,12 @@ describe('viewer result pagination and facet layout', () => {
         `INSERT INTO sessions (session_id, harness, machine_id, os, primary_model, title, started_at, ended_at, tokens_in, tokens_out, tokens_reasoning, tokens_cached, index_state)
          VALUES ('viewer-sort-reasoning', 'viewer-sort-test', 'viewer-sort-machine', 'linux', 'sort-model', 'Reasoning-heavy session', '2026-07-01T10:00:00Z', '2026-07-01T10:30:00Z', 20, 10, 500, 10000, 'ready')`,
       ),
-      testEnv.DB.prepare(
-        `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text) VALUES
-         ('viewer-sort-short', 1, 0, 0, 'user', 'text', 'Short session viewersortmarker'),
-         ('viewer-sort-long', 1, 0, 0, 'user', 'text', 'Long session viewersortmarker'),
-         ('viewer-sort-reasoning', 1, 0, 0, 'user', 'text', 'Reasoning-heavy session viewersortmarker')`,
-      ),
     ]);
-    await testEnv.DB.prepare(
-      `INSERT INTO blocks_fts(rowid, text) SELECT id, text FROM blocks WHERE session_id LIKE 'viewer-sort-%'`,
-    ).run();
+    blocks.push(
+      { sessionId: 'viewer-sort-short', text: 'Short session viewersortmarker' },
+      { sessionId: 'viewer-sort-long', text: 'Long session viewersortmarker' },
+      { sessionId: 'viewer-sort-reasoning', text: 'Reasoning-heavy session viewersortmarker' },
+    );
     await testEnv.DB.batch([
       testEnv.DB.prepare(
         `INSERT INTO sessions
@@ -1977,17 +2030,13 @@ describe('viewer result pagination and facet layout', () => {
         MULTI_PROJECT_BETA,
         MULTI_PROJECT_GAMMA,
       ),
-      testEnv.DB.prepare(
-        `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text) VALUES
-         ('viewer-multi-a1', 1, 0, 0, 'user', 'text', 'Multi A1 ${MULTI_MARKER}'),
-         ('viewer-multi-b1', 1, 0, 0, 'user', 'text', 'Multi B1 ${MULTI_MARKER}'),
-         ('viewer-multi-c1', 1, 0, 0, 'user', 'text', 'Multi C1 ${MULTI_MARKER}'),
-         ('viewer-multi-a2', 1, 0, 0, 'user', 'text', 'Multi A2 ${MULTI_MARKER}')`,
-      ),
     ]);
-    await testEnv.DB.prepare(
-      `INSERT INTO blocks_fts(rowid, text) SELECT id, text FROM blocks WHERE session_id LIKE 'viewer-multi-%'`,
-    ).run();
+    blocks.push(
+      { sessionId: 'viewer-multi-a1', text: `Multi A1 ${MULTI_MARKER}` },
+      { sessionId: 'viewer-multi-b1', text: `Multi B1 ${MULTI_MARKER}` },
+      { sessionId: 'viewer-multi-c1', text: `Multi C1 ${MULTI_MARKER}` },
+      { sessionId: 'viewer-multi-a2', text: `Multi A2 ${MULTI_MARKER}` },
+    );
     await testEnv.DB.batch([
       testEnv.DB.prepare(
         `INSERT INTO sessions
@@ -1996,15 +2045,13 @@ describe('viewer result pagination and facet layout', () => {
            (?1, ?3, 'viewer-subagent-machine', 'linux', 'viewer-subagent-model', ?4, 'Primary subagent filter fixture', '2026-07-27T12:00:00Z', NULL, 0, 'ready'),
            (?2, ?3, 'viewer-subagent-machine', 'linux', 'viewer-subagent-model', ?4, 'Subagent filter fixture', '2026-07-27T12:01:00Z', ?1, 0, 'ready')`,
       ).bind(SUBAGENT_PRIMARY, SUBAGENT_CHILD, SUBAGENT_HARNESS, SUBAGENT_REPO),
-      testEnv.DB.prepare(
-        `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text) VALUES
-           (?1, 1, 0, 0, 'user', 'text', ?3),
-           (?2, 1, 0, 0, 'user', 'text', ?3)`,
-      ).bind(SUBAGENT_PRIMARY, SUBAGENT_CHILD, SUBAGENT_MARKER),
     ]);
-    await testEnv.DB.prepare(
-      `INSERT INTO blocks_fts(rowid, text) SELECT id, text FROM blocks WHERE session_id IN (?1, ?2)`,
-    ).bind(SUBAGENT_PRIMARY, SUBAGENT_CHILD).run();
+    blocks.push(
+      { sessionId: SUBAGENT_PRIMARY, text: SUBAGENT_MARKER },
+      { sessionId: SUBAGENT_CHILD, text: SUBAGENT_MARKER },
+    );
+    await seedIndexBlocks(blocks);
+    await syncSessionCatalog(testEnv, blocks.map(({ sessionId }) => sessionId));
   });
 
   function pageHref(html: string, rel: 'next' | 'prev'): string {
@@ -2260,6 +2307,10 @@ describe('viewer result pagination and facet layout', () => {
   });
 
   it('paginates full-text results in both directions while preserving query and filter state', async () => {
+    const hitIds = (html: string) =>
+      [...html.matchAll(/<a href="\/s\/(viewer-pagination-\d{2})\?page=1#t0">/g)].map((match) => match[1]!);
+    const expectedIds = Array.from({ length: 25 }, (_, index) => `viewer-pagination-${String(index).padStart(2, '0')}`);
+    expect(new Set(expectedIds.map((sessionId) => indexDbFor(testEnv, sessionId))).size).toBe(2);
     const first = await (await SELF.fetch(
       `${VIEWER}/?q=${PAGINATION_MARKER}&harness=${PAGINATION_HARNESS}&machine=${PAGINATION_MACHINE}&limit=10`,
     )).text();
@@ -2282,6 +2333,8 @@ describe('viewer result pagination and facet layout', () => {
       machine: PAGINATION_MACHINE,
       limit: '10',
     });
+    const previousHtml = await (await SELF.fetch(previous)).text();
+    expect(hitIds(previousHtml)).toEqual(hitIds(first));
 
     const thirdHref = pageHref(second, 'next');
     const third = await (await SELF.fetch(`${VIEWER}${thirdHref}`)).text();
@@ -2289,6 +2342,10 @@ describe('viewer result pagination and facet layout', () => {
     expect(third).toContain('Page 3');
     expect(third).not.toContain('<a rel="next"');
     expect(third).toContain('<span class="muted">Next →</span>');
+    expect(hitIds(first)).toHaveLength(10);
+    expect(hitIds(second)).toHaveLength(10);
+    expect(hitIds(third)).toHaveLength(5);
+    expect([...hitIds(first), ...hitIds(second), ...hitIds(third)].sort()).toEqual(expectedIds);
   });
 
   it('preserves repeated facet params through pagination', async () => {
@@ -2341,12 +2398,14 @@ describe('viewer result pagination and facet layout', () => {
       `harness=${MULTI_HARNESS_A}&harness=${MULTI_HARNESS_B}&machine=${MULTI_MACHINE_1}`,
     );
     const filter = buildSessionFilterSql(params, 'sessions');
-    const plan = await testEnv.DB.prepare(
-      `EXPLAIN QUERY PLAN SELECT session_id FROM sessions WHERE ${filter.clause}`,
-    ).bind(...filter.binds).all<{ detail: string }>();
-    const details = plan.results.map((row) => row.detail).join('\n');
-    expect(details).toContain('SEARCH sessions USING INDEX sessions_facets (harness=? AND machine_id=?)');
-    expect(details).not.toContain('SCAN sessions');
+    for (const db of [testEnv.DB, ...indexDbs(testEnv)]) {
+      const plan = await db.prepare(
+        `EXPLAIN QUERY PLAN SELECT session_id FROM sessions WHERE ${filter.clause}`,
+      ).bind(...filter.binds).all<{ detail: string }>();
+      const details = plan.results.map((row) => row.detail).join('\n');
+      expect(details).toContain('SEARCH sessions USING INDEX sessions_facets (harness=? AND machine_id=?)');
+      expect(details).not.toContain('SCAN sessions');
+    }
     expect(filter.binds).toHaveLength(3);
   });
 
@@ -2355,12 +2414,14 @@ describe('viewer result pagination and facet layout', () => {
       new URLSearchParams(`project=${MULTI_PROJECT_ALPHA}&project=${MULTI_PROJECT_BETA}`),
       'sessions',
     );
-    const plan = await testEnv.DB.prepare(
-      `EXPLAIN QUERY PLAN SELECT session_id FROM sessions WHERE ${filter.clause}`,
-    ).bind(...filter.binds).all<{ detail: string }>();
-    const details = plan.results.map((row) => row.detail).join('\n');
-    expect(details).toContain('SEARCH sessions USING INDEX sessions_project (project_name=?)');
-    expect(details).not.toContain('SCAN sessions');
+    for (const db of [testEnv.DB, ...indexDbs(testEnv)]) {
+      const plan = await db.prepare(
+        `EXPLAIN QUERY PLAN SELECT session_id FROM sessions WHERE ${filter.clause}`,
+      ).bind(...filter.binds).all<{ detail: string }>();
+      const details = plan.results.map((row) => row.detail).join('\n');
+      expect(details).toContain('SEARCH sessions USING INDEX sessions_project (project_name=?)');
+      expect(details).not.toContain('SCAN sessions');
+    }
     expect(filter.binds).toEqual([JSON.stringify([MULTI_PROJECT_ALPHA, MULTI_PROJECT_BETA]), '["no"]']);
   });
 
@@ -2458,6 +2519,7 @@ describe('viewer result pagination and facet layout', () => {
        VALUES ('viewer-pagination-new', ?1, ?2, 'linux', 'pagination-model', 'Newer concurrent session',
                '2026-07-26T12:00:00Z', 'ready')`,
     ).bind(PAGINATION_HARNESS, PAGINATION_MACHINE).run();
+    await syncSessionCatalog(testEnv, ['viewer-pagination-new']);
 
     const offsetAfter = await offsetPage();
     expect(offsetAfter).not.toEqual(offsetBefore);
@@ -2481,6 +2543,7 @@ describe('viewer facet value discovery', () => {
 
   beforeAll(async () => {
     const statements: D1PreparedStatement[] = [];
+    const blocks: FixtureBlock[] = [];
     for (let i = 0; i < 200; i++) {
       const suffix = String(i).padStart(3, '0');
       const id = `viewer-facet-cap-${suffix}`;
@@ -2500,18 +2563,11 @@ describe('viewer facet value discovery', () => {
           `Facet cap ${suffix}`,
         ),
       );
-      statements.push(
-        testEnv.DB.prepare(
-          `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text)
-           VALUES (?1, 1, 0, 0, 'user', 'text', ?2)`,
-        ).bind(id, `${FACET_CAP_MARKER} ${suffix}`),
-      );
+      blocks.push({ sessionId: id, text: `${FACET_CAP_MARKER} ${suffix}` });
     }
     await testEnv.DB.batch(statements);
-    await testEnv.DB.prepare(
-      `INSERT INTO blocks_fts(rowid, text)
-       SELECT id, text FROM blocks WHERE session_id LIKE 'viewer-facet-cap-%'`,
-    ).run();
+    await seedIndexBlocks(blocks);
+    await syncSessionCatalog(testEnv, blocks.map(({ sessionId }) => sessionId));
   });
 
   function nextHref(html: string): string | null {
@@ -2666,16 +2722,12 @@ describe('viewer list cost', () => {
     // Searchable text for the three top-level sessions, so the cost sort can be exercised in FTS
     // mode too — where the ordering comes from a different query (api/search.ts) than the recent
     // list's.
-    await testEnv.DB.prepare(
-      `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, text, on_main_path)
-       VALUES (?1, 1, 0, 0, 'user', 'text', 'costsortmarker parent', 1),
-              (?2, 1, 0, 0, 'user', 'text', 'costsortmarker partial', 1),
-              (?3, 1, 0, 0, 'user', 'text', 'costsortmarker unpriced', 1)`,
-    ).bind(COST_PARENT, COST_PARTIAL, COST_UNPRICED).run();
-    await testEnv.DB.prepare(
-      `INSERT INTO blocks_fts(rowid, text)
-       SELECT id, text FROM blocks WHERE session_id IN (?1, ?2, ?3) AND text IS NOT NULL`,
-    ).bind(COST_PARENT, COST_PARTIAL, COST_UNPRICED).run();
+    await seedIndexBlocks([
+      { sessionId: COST_PARENT, text: 'costsortmarker parent' },
+      { sessionId: COST_PARTIAL, text: 'costsortmarker partial' },
+      { sessionId: COST_UNPRICED, text: 'costsortmarker unpriced' },
+    ]);
+    await syncSessionCatalog(testEnv, [COST_PARENT, COST_CHILD, COST_UNPRICED, COST_PARTIAL, COST_RECORDLESS]);
   });
 
   it('shows each session cost with its subagent descendants folded in', async () => {

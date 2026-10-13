@@ -1,0 +1,11 @@
+-- Transcript blocks and their FTS now live on the index shards (hub/migrations-index).
+--
+-- Production applies this only through the protected cutover: under the maintenance revision, after
+-- every legacy block row has been copied to its shard with its original id and verified by exact
+-- canonical readback and FTS probes, and after the verified source rows were deleted. R2 remains the
+-- source of truth and the verified shards retain every row; nothing here is recoverable from main.
+-- Fresh local, test and preview databases have no blocks to move.
+--
+-- The external-content FTS index goes first: it references `blocks` as its content table.
+DROP TABLE blocks_fts;
+DROP TABLE blocks;

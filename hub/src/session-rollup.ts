@@ -1,4 +1,5 @@
 import { UNKNOWN_MODEL_LABEL } from './usage-agg';
+import { indexDbFor } from './index-shards';
 
 export interface SessionRollupOptions {
   /** Hard bounds on source blocks and pages, including unfinished giant sessions. */
@@ -38,11 +39,12 @@ interface SourceBlock {
   role: string | null;
   btype: string;
   comparable_call: number;
-  repeated_call: number;
+  call_key_id: number | null;
+  tool_name: string | null;
+  text: string | null;
   on_main_path: number;
   byte_len: number | null;
   ts: string | null;
-  model: string | null;
 }
 interface TurnState {
   index: number;
@@ -83,9 +85,10 @@ const COMPARABLE_CALL = `b.role = 'assistant' AND b.btype = 'tool_use' AND b.tru
  * Exact complete stored tool arguments are a diagnostic proxy, never proof of wasted work.
  */
 export async function runSessionRollup(
-  db: D1Database,
+  env: Env,
   options: SessionRollupOptions = {},
 ): Promise<SessionRollupResult> {
+  const db = env.DB;
   const maxBlocks = positiveInteger(options.maxBlocks ?? 20_000, 'maxBlocks');
   const maxPages = positiveInteger(options.maxPages ?? 80, 'maxPages');
   const pageSize = Math.min(500, positiveInteger(options.pageSize ?? 250, 'pageSize'));
@@ -103,7 +106,7 @@ export async function runSessionRollup(
     if (!checkpoint) break;
     result.pages++;
     try {
-      await rollupPage(db, checkpoint, Math.min(pageSize, maxBlocks - result.examined),
+      await rollupPage(env, checkpoint, Math.min(pageSize, maxBlocks - result.examined),
         pageSize, options.now ?? new Date(), result);
     } catch (error) {
       // Do not advance a failed checkpoint or overwrite a concurrent winner. If D1 itself is
@@ -128,43 +131,67 @@ export async function runSessionRollup(
 }
 
 async function rollupPage(
-  db: D1Database,
+  env: Env,
   checkpoint: Checkpoint,
   limit: number,
   pageSize: number,
   now: Date,
   result: SessionRollupResult,
 ): Promise<void> {
-    // Materialize the indexed page BEFORE windowing. Exact identities stay in SQLite: even one
-    // legitimate uncapped tool name can exceed a transport chunk, regardless of source page size.
-    const blocks: SourceBlock[] = checkpoint.finishing ? [] : (await db.prepare(`WITH page AS MATERIALIZED (
+    const db = env.DB;
+    // Window the exact tuple page on its shard. Carry full comparable identities only once per
+    // page; repeated blocks refer to that representative rather than copying large tool arguments.
+    const blocks: SourceBlock[] = checkpoint.finishing ? [] : (await indexDbFor(env, checkpoint.session_id)
+      .prepare(`WITH page AS MATERIALIZED (
         SELECT b.id, b.turn_index, b.block_index, b.role, b.btype,
-          b.tool_name, b.text, b.truncated, b.on_main_path, b.byte_len, b.ts, u.model
-        FROM blocks b LEFT JOIN usage u ON u.session_id = b.session_id AND u.turn_index = b.turn_index
+          b.tool_name, b.text, b.truncated, b.on_main_path, b.byte_len, b.ts
+        FROM blocks b
         WHERE b.session_id = ?1 AND (b.turn_index, b.block_index, b.id) > (?2, ?3, ?4)
         ORDER BY b.turn_index, b.block_index, b.id LIMIT ?5
       ), comparable_calls AS (
-        SELECT b.id, (
-          ROW_NUMBER() OVER (PARTITION BY b.tool_name, b.text ORDER BY b.turn_index, b.block_index, b.id) > 1
-          OR EXISTS (SELECT 1 FROM session_rollup_seen_calls seen
-            WHERE seen.session_id = ?1 AND seen.tool_name = b.tool_name AND seen.text = b.text)
-        ) AS repeated_call
+        SELECT b.id, FIRST_VALUE(b.id) OVER (
+          PARTITION BY b.tool_name, b.text ORDER BY b.turn_index, b.block_index, b.id
+        ) AS call_key_id
         FROM page b WHERE ${COMPARABLE_CALL}
       )
-      SELECT p.id, p.turn_index, p.block_index, p.role, p.btype, p.on_main_path, p.byte_len, p.ts, p.model,
-        CASE WHEN c.id IS NULL THEN 0 ELSE 1 END AS comparable_call,
-        COALESCE(c.repeated_call, 0) AS repeated_call
+      SELECT p.id, p.turn_index, p.block_index, p.role, p.btype, p.on_main_path, p.byte_len, p.ts,
+        CASE WHEN c.id IS NULL THEN 0 ELSE 1 END AS comparable_call, c.call_key_id,
+        CASE WHEN p.id = c.call_key_id THEN p.tool_name END AS tool_name,
+        CASE WHEN p.id = c.call_key_id THEN p.text END AS text
       FROM page p LEFT JOIN comparable_calls c ON c.id = p.id
       ORDER BY p.turn_index, p.block_index, p.id`)
       .bind(checkpoint.session_id, checkpoint.cursor_turn, checkpoint.cursor_block,
         checkpoint.cursor_id, limit).all<SourceBlock>()).results;
     result.examined += blocks.length;
 
+    const models = new Map<number, string | null>();
+    if (blocks.length > 0) {
+      const turns = [...new Set(blocks.map((block) => block.turn_index))];
+      const usage = await db.prepare(`SELECT turn_index, model FROM usage
+        WHERE session_id = ?1 AND turn_index IN (SELECT value FROM json_each(?2))`)
+        .bind(checkpoint.session_id, JSON.stringify(turns)).all<{ turn_index: number; model: string | null }>();
+      for (const row of usage.results) models.set(row.turn_index, row.model);
+    }
+    const calls = blocks.filter((block) => block.id === block.call_key_id);
+    const seen = new Set<number>();
+    // Separate bound values, not one JSON array: JSON escaping of a maximum page can exceed
+    // D1's value limit even when every complete stored identity is individually valid.
+    for (let start = 0; start < calls.length; start += 90) {
+      const chunk = calls.slice(start, start + 90);
+      const prior = await db.batch<{ seen: number }>(chunk.map((call) =>
+        db.prepare(`SELECT EXISTS (SELECT 1 FROM session_rollup_seen_calls
+          WHERE session_id = ?1 AND tool_name = ?2 AND text = ?3) AS seen`)
+          .bind(checkpoint.session_id, call.tool_name, call.text)));
+      for (let i = 0; i < chunk.length; i++) {
+        if (prior[i]?.results[0]?.seen) seen.add(chunk[i]!.id);
+      }
+    }
+
     let turn: TurnState | null = checkpoint.turn_state ? JSON.parse(checkpoint.turn_state) : null;
     const buckets = new Map<string, Bucket>();
     for (const block of blocks) {
       if (!turn || turn.index !== block.turn_index) {
-        turn = { index: block.turn_index, day: utcDay(block.ts), model: block.model ?? UNKNOWN_MODEL_LABEL,
+        turn = { index: block.turn_index, day: utcDay(block.ts), model: models.get(block.turn_index) ?? UNKNOWN_MODEL_LABEL,
           assistant: 'unseen', rewind: 'unseen' };
       }
       const key = JSON.stringify([turn.day, turn.model]);
@@ -187,7 +214,9 @@ async function rollupPage(
         bucket.tool_result_source_bytes += Math.max(0, block.byte_len ?? 0);
       }
       bucket.comparable_tool_calls += block.comparable_call;
-      bucket.repeated_tool_calls += block.repeated_call;
+      if (block.call_key_id !== null && (block.id !== block.call_key_id || seen.has(block.call_key_id))) {
+        bucket.repeated_tool_calls++;
+      }
     }
 
     const last = blocks.at(-1);
@@ -213,11 +242,9 @@ async function rollupPage(
       ON CONFLICT (session_id, day, model) DO UPDATE SET
         ${METRICS.map((m) => `${m} = session_rollup.${m} + excluded.${m}`).join(', ')}`)
       .bind(checkpoint.session_id, token, JSON.stringify([...buckets.values()])),
-    db.prepare(`INSERT OR IGNORE INTO session_rollup_seen_calls (session_id, tool_name, text)
-      SELECT b.session_id, b.tool_name, b.text
-      FROM json_each(?3) page_ids JOIN blocks b ON b.id = page_ids.value
-      WHERE b.session_id = ?1 AND ${COMPARABLE_CALL} AND ${COMMIT_GUARD}`)
-      .bind(checkpoint.session_id, token, JSON.stringify(blocks.map((block) => block.id)))];
+    ...calls.map((call) => db.prepare(`INSERT OR IGNORE INTO session_rollup_seen_calls (session_id, tool_name, text)
+      SELECT ?1, ?3, ?4 WHERE ${COMMIT_GUARD}`)
+      .bind(checkpoint.session_id, token, call.tool_name, call.text))];
     if (complete) {
       statements.push(
         // Cleanup is checkpointed too: a giant unique-call history must not become one huge DELETE.

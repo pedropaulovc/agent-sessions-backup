@@ -4,6 +4,7 @@ import worker from '../src/index';
 import { clampLimit } from '../src/api/sessions';
 import { hex } from '../src/api/ops';
 import { convergeR2WithRow } from '../src/api/upload';
+import { indexDbs } from '../src/index-shards';
 import { CODEX_SESSION_ID, ccAssistantLine, ccUserLine, codexLines } from './fixtures';
 import { API, VIEWER } from './hosts';
 
@@ -135,8 +136,9 @@ describe('search handles a query whose quoted-phrase fallback is ALSO invalid FT
 
 describe('search classifies a failed query deterministically via a probe against the user\'s own MATCH text, not a message regex (regression: a plain regex over the caught error masked ANY error matching a recognized shape as "invalid query" — including "no such column:", which FTS5 emits for a bad column-filter in user input AND SQLite emits for a genuine bad column on the query\'s own hardcoded outer SELECT after a bad migration. The regex could not tell these apart and silently swallowed the second, real-outage case into a fake-empty 200)', () => {
   it('a genuine non-FTS D1 error (e.g. a missing table) is NOT swallowed — it still throws/500s', async () => {
-    const originalPrepare = testEnv.DB.prepare.bind(testEnv.DB);
-    const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
+    const shard = indexDbs(testEnv)[0]!;
+    const originalPrepare = shard.prepare.bind(shard);
+    const spy = vi.spyOn(shard, 'prepare').mockImplementation((sql: string) => {
       if (sql.includes('FROM blocks_fts') && sql.includes('ORDER BY rank')) {
         // Empirically-captured real D1 error message shape for a missing table, fabricated here
         // to simulate infra breakage without actually dropping the real schema (storage isolation
@@ -174,8 +176,9 @@ describe('search classifies a failed query deterministically via a probe against
   });
 
   it('the AMBIGUOUS "no such column:" shape on the outer query is NOT swallowed when it\'s a genuine schema break, not a bad MATCH filter (regression: the old message regex could not distinguish this from FTS5\'s own column-filter rejection and swallowed it)', async () => {
-    const originalPrepare = testEnv.DB.prepare.bind(testEnv.DB);
-    const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
+    const shard = indexDbs(testEnv)[0]!;
+    const originalPrepare = shard.prepare.bind(shard);
+    const spy = vi.spyOn(shard, 'prepare').mockImplementation((sql: string) => {
       if (sql.includes('FROM blocks_fts') && sql.includes('ORDER BY rank')) {
         // Same message SHAPE ("no such column:") the FTS5 column-filter case produces, but here
         // it's fabricated as coming from the query's own outer SELECT (e.g. s.primary_model after
@@ -203,9 +206,10 @@ describe('search classifies a failed query deterministically via a probe against
   });
 
   it('a full D1/blocks_fts outage (main query AND both probes all fail) still rethrows the original error, not a fake-empty 200', async () => {
-    const originalPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    const shard = indexDbs(testEnv)[0]!;
+    const originalPrepare = shard.prepare.bind(shard);
     const PROBE_SQL = 'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?1 LIMIT 1';
-    const spy = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
+    const spy = vi.spyOn(shard, 'prepare').mockImplementation((sql: string) => {
       const isMainQuery = sql.includes('FROM blocks_fts') && sql.includes('ORDER BY rank');
       const isProbe = sql === PROBE_SQL;
       if (isMainQuery || isProbe) {

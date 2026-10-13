@@ -3,11 +3,13 @@
 Backup, index, search, and render AI agent/chat sessions from every machine and harness in one place.
 
 - **Harnesses and skills**: Claude Code, Codex CLI, OMP (Oh My Pi), OMP managed skills, ChatGPT web, Claude web
-- **Hub**: Cloudflare Workers + D1 (SQLite FTS5 index) + R2 (raw files, source of truth) + Queues
+- **Hub**: Cloudflare Workers + D1 (main catalog and session-hash-sharded SQLite FTS5 indexes) + R2 (raw files, source of truth) + Queues
 - **Collector**: Python (uv) agent on each machine — incremental uploads over mTLS (TPM-bound client certs), heartbeats
 - **Viewer**: chat-style session rendering + faceted full-text search, passkey login
 - **Agent API**: JSON search/fetch endpoints (e.g. everything from today as NDJSON) for downstream AI agents
 - **Observability**: Cloudflare Workers observability → OTLP gateway → Azure Application Insights (Entra workload identity federation, zero Azure secrets), email alerts
+
+Index sharding preserves the matching transcript blocks and text. Search relevance now uses shard-local BM25, so ranking can differ from the former single index; duration/token/cost priorities, global facet counts, media URLs, and the viewer's offset pager remain. Reads use bounded shard fan-out, not an unlimited-capacity promise. Search returns 503 while its catalog reconciliation backlog remains rather than using stale filters or costs. Offset pages are not snapshots under concurrent writes; see the [search API contract](docs/agents-api.md#get-apiv1search).
 
 Session details keep the transcript visible by default. Expand **Activity trace** for the current page's model and tool activity, event/error filters, and links back to turns. Duration shows recorded OMP timing spans or timestamp markers; Sequence also includes events without timestamps. Per-tool totals include only recorded durations and may overlap.
 

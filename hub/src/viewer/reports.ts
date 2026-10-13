@@ -7,6 +7,8 @@
  * tool calls around it. This surfaces them as a single list, newest first, each one linked back to
  * the turn that filed it so the surrounding context is one click away.
  */
+import { mapIndexDbs } from '../index-shards';
+import { drainIndexCatalog } from '../session-catalog';
 import { subagentSessionSql } from '../session-filters';
 import { sessionDisplayTitle } from '../session-title';
 import { esc, page, q } from './layout';
@@ -96,12 +98,33 @@ export const REPORTS_QUERY =
    LIMIT ${MAX_REPORTS + 1}`;
 
 export async function reportsPage(url: URL, env: Env): Promise<Response> {
-  const rows = await env.DB.prepare(REPORTS_QUERY).all<ReportRow>();
+  if ((await drainIndexCatalog(env)).state === 'pending') {
+    return new Response('index_catalog_pending', { status: 503, headers: { 'cache-control': 'no-store' } });
+  }
+  let rows: ReportRow[] = [];
+  await mapIndexDbs(env, async (db) => {
+    const shardRows = await db.prepare(REPORTS_QUERY).all<ReportRow>();
+    // Keep only the global window as each bounded shard request completes, rather than
+    // retaining shardCount copies of it. No global top-N row can be below local top-N.
+    rows = rows.concat(shardRows.results).sort((a, b) => {
+      if (a.ts === b.ts) return b.id - a.id;
+      if (a.ts === null) return 1;
+      if (b.ts === null) return -1;
+      for (let i = 0, j = 0; i < a.ts.length && j < b.ts.length;) {
+        const ac = a.ts.codePointAt(i)!;
+        const bc = b.ts.codePointAt(j)!;
+        if (ac !== bc) return bc - ac;
+        i += ac > 0xffff ? 2 : 1;
+        j += bc > 0xffff ? 2 : 1;
+      }
+      return b.ts.length - a.ts.length;
+    }).slice(0, MAX_REPORTS + 1);
+  });
 
-  const capped = rows.results.length > MAX_REPORTS;
+  const capped = rows.length > MAX_REPORTS;
   // Rows that merely MENTION the device — a `read` of its documentation — are indexed on purpose
   // (see 0032) and are dropped here, where the arguments can actually be parsed.
-  const reports = rows.results.slice(0, MAX_REPORTS).flatMap((row) => parseReport(row) ?? []);
+  const reports = rows.slice(0, MAX_REPORTS).flatMap((row) => parseReport(row) ?? []);
   const tools = toolCounts(reports);
 
   const selected = url.searchParams.get('tool');

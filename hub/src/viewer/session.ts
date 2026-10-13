@@ -1,3 +1,4 @@
+import { indexDbFor } from '../index-shards';
 import { jsonlLineLimit, readJsonlLines } from '../ingest/jsonl';
 import { isWebHarness } from '../ingest/parse';
 import type { NormalizedBlock, NormalizedSession, NormalizedTurn } from '../ingest/normalize';
@@ -77,14 +78,14 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
   )
     .bind(sessionId)
     .first<SessionFile>();
-  // Cache-busting token for blob URLs: block ids (rowids) are reused across reindexes, so the
+  // Cache-busting token for blob URLs, including legacy block ids retained by migration, so the
   // 1-year immutable cache is keyed on the canonical file's content hash prefix.
   const blobVersion = blobVersionOf(file?.content_hash);
   const transcriptRevision = `${file?.content_hash ?? ''}:${meta.updated_at ?? ''}`;
 
   const view: View = url.searchParams.get('view') === 'effective' ? 'effective' : 'chronological';
   const maxTurn = (
-    await env.DB.prepare('SELECT MAX(turn_index) AS m FROM blocks WHERE session_id = ?1')
+    await indexDbFor(env, sessionId).prepare('SELECT MAX(turn_index) AS m FROM blocks WHERE session_id = ?1')
       .bind(sessionId)
       .first<{ m: number | null }>()
   )?.m ?? null;
@@ -124,7 +125,7 @@ export async function sessionPage(sessionId: string, url: URL, env: Env): Promis
   // The value is a queue because whole-document formats can legitimately assign several turns the same
   // synthetic source offset.
   const pageTurns = (
-    await env.DB.prepare(
+    await indexDbFor(env, sessionId).prepare(
       `WITH page_blocks AS (
          SELECT turn_index, byte_start, on_main_path FROM blocks
          WHERE session_id = ?1 AND turn_index >= ?2 AND turn_index < ?3 AND btype != 'compaction'
@@ -254,7 +255,7 @@ async function loadTitleScan(env: Env, sessionId: string): Promise<TitleScan> {
   let pending: TitleBlock[] = [];
 
   for (;;) {
-    const rows = await env.DB.prepare(
+    const rows = await indexDbFor(env, sessionId).prepare(
       `SELECT turn_index, block_index, role, btype, text
        FROM blocks
        WHERE session_id = ?1 AND on_main_path = 1
@@ -307,7 +308,7 @@ function consumeTitleTurn(turn: TitleBlock[], skipped: Set<number>): string | nu
 
 /** Byte offset of the first block at or after turn_index `from`, or undefined when none exists (past the end). */
 async function firstByteFrom(env: Env, sessionId: string, from: number): Promise<number | undefined> {
-  const row = await env.DB.prepare(
+  const row = await indexDbFor(env, sessionId).prepare(
     'SELECT MIN(byte_start) AS bs FROM blocks WHERE session_id = ?1 AND turn_index >= ?2',
   )
     .bind(sessionId, from)
@@ -322,7 +323,7 @@ async function loadMediaIds(
   endByte: number | undefined,
 ): Promise<Map<string, number>> {
   const map = new Map<string, number>();
-  const rows = await env.DB.prepare(
+  const rows = await indexDbFor(env, sessionId).prepare(
     `SELECT id, byte_start, block_index FROM blocks
      WHERE session_id = ?1 AND btype IN ('image','document')
        AND byte_start >= ?2 AND (?3 IS NULL OR byte_start < ?3)`,

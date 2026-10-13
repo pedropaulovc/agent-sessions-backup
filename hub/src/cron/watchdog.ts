@@ -25,7 +25,7 @@
 // sessions-telemetry-gateway → Azure Monitor OTelLogs (see infra/cf/telemetry.md).
 
 import { EXPECTED_COLLECTOR_VERSION } from '../collector-version';
-import { indexDbs } from '../index-shards';
+import { mapIndexDbs } from '../index-shards';
 import { indexShardBindingName } from '../index-layout.mjs';
 
 interface HealthRow {
@@ -210,7 +210,7 @@ export async function runWatchdog(env: Env): Promise<void> {
   console.log(JSON.stringify({ event: 'hub.watchdog.run', machine_count: machineCount, roster_ok: rosterOk }));
 
   await probeDatabaseSize(env.DB, 'main');
-  await Promise.all(indexDbs(env).map((db, shard) => probeDatabaseSize(db, indexShardBindingName(shard))));
+  await mapIndexDbs(env, (db, shard) => probeDatabaseSize(db, indexShardBindingName(shard)));
 }
 
 async function probeDatabaseSize(db: D1Database, database: string): Promise<void> {

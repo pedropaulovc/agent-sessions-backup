@@ -5,6 +5,8 @@ import { createReindexRange, continueReindexRange, getReindexRange } from '../sr
 import { route } from '../src/router';
 import { ccLine } from './fixtures';
 import { API } from './hosts';
+import { indexDbFor } from '../src/index-shards';
+import { syncSessionCatalog } from '../src/session-catalog';
 
 const testEnv = env as unknown as Env;
 const db = testEnv.DB;
@@ -120,13 +122,21 @@ beforeEach(async () => {
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  for (const { sessionId } of fixtures) {
+    const indexDb = indexDbFor(testEnv, sessionId);
+    await indexDb.batch([
+      indexDb.prepare(
+        "INSERT INTO blocks_fts (blocks_fts, rowid, text) SELECT 'delete', id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL",
+      ).bind(sessionId),
+      indexDb.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(sessionId),
+    ]);
+  }
   await db.batch([
     ...jobs.flatMap((jobId) => [
       db.prepare('DELETE FROM reindex_range_targets WHERE job_id = ?1').bind(jobId),
       db.prepare('DELETE FROM reindex_range_jobs WHERE job_id = ?1').bind(jobId),
     ]),
     ...fixtures.flatMap(({ sessionId }) => [
-      db.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(sessionId),
       db.prepare('DELETE FROM usage WHERE session_id = ?1').bind(sessionId),
       db.prepare('DELETE FROM sessions WHERE session_id = ?1').bind(sessionId),
     ]),
@@ -134,6 +144,7 @@ afterEach(async () => {
     db.prepare('DELETE FROM machines WHERE machine_id LIKE ?1').bind(PREFIX + '%'),
     db.prepare('DELETE FROM read_grants WHERE grant_id LIKE ?1').bind(PREFIX + '%'),
   ]);
+  await syncSessionCatalog(testEnv, fixtures.map(({ sessionId }) => sessionId));
   for (const fixture of fixtures) await testEnv.RAW.delete(fixture.key);
 });
 

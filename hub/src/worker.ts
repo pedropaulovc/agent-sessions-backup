@@ -11,7 +11,8 @@ import { drainIndexCatalog } from './session-catalog';
 
 async function reconcileCatalog(env: Env): Promise<void> {
   try {
-    const result = await drainIndexCatalog(env);
+    // Leave room for the parse/maintenance work that triggered this backstop.
+    const result = await drainIndexCatalog(env, { maxSubrequests: 64 });
     if (result.state === 'pending') await env.ROLLUP_QUEUE.send({ kind: 'index-catalog' });
   } catch (error) {
     // The durable outbox remains pending; the next request, queue delivery, or cron retries it.
@@ -27,9 +28,11 @@ export default {
     const path = new URL(request.url).pathname;
     if (path === '/healthz' || env.INDEX_MODE === 'maintenance') return route(request, env, ctx);
     await assertIndexLayout(env);
-    const response = await route(request, env, ctx);
-    if (request.method !== 'GET' && request.method !== 'HEAD') ctx.waitUntil(reconcileCatalog(env));
-    return response;
+    try {
+      return await route(request, env, ctx);
+    } finally {
+      if (request.method !== 'GET' && request.method !== 'HEAD') ctx.waitUntil(reconcileCatalog(env));
+    }
   },
 
   async queue(batch: MessageBatch<HubQueueMessage>, env: Env): Promise<void> {
