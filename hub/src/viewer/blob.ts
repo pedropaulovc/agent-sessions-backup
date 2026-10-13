@@ -1,5 +1,6 @@
 /** GET /s/{id}/blob/{block_id}?v={hash} — serve an indexed image/document from R2. */
 
+import { indexDbFor } from '../index-shards';
 import { MAX_CODEX_JSONL_LINE_BYTES } from '../ingest/jsonl';
 import { imageMediaType } from '../ingest/normalize';
 import { blobVersionOf } from './session';
@@ -11,7 +12,7 @@ const INLINE_IMAGE_TYPES: Record<string, true> = {
   'image/png': true, 'image/jpeg': true, 'image/gif': true, 'image/webp': true,
 };
 
-interface BlockRow {
+interface IndexedBlockRow {
   byte_start: number | null;
   byte_len: number | null;
   media_byte_start: number | null;
@@ -19,6 +20,10 @@ interface BlockRow {
   media_type: string | null;
   block_index: number;
   btype: string;
+  file_id: number;
+}
+
+interface FileRow {
   r2_key: string;
   content_hash: string;
   harness: string | null;
@@ -28,21 +33,27 @@ interface BlockRow {
 
 export async function blobEndpoint(sessionId: string, blockId: string, url: URL, env: Env): Promise<Response> {
   const id = Number(blockId);
-  if (!Number.isInteger(id) || id < 0) return notFound();
+  if (!Number.isSafeInteger(id) || id < 0) return notFound();
 
-  const row = await env.DB.prepare(
-    `SELECT b.byte_start, b.byte_len, b.block_index, b.btype, b.media_byte_start,
-            b.media_byte_len, b.media_type, f.r2_key, f.content_hash, f.harness, f.size,
-            f.parse_state
-     FROM blocks b JOIN files f ON f.id = b.file_id
-     WHERE b.id = ?1 AND b.session_id = ?2`,
+  const block = await indexDbFor(env, sessionId).prepare(
+    `SELECT byte_start, byte_len, block_index, btype, media_byte_start,
+            media_byte_len, media_type, file_id
+     FROM blocks WHERE id = ?1 AND session_id = ?2`,
   )
     .bind(id, sessionId)
-    .first<BlockRow>();
-  if (!row || row.byte_start === null || row.byte_len === null) return notFound();
+    .first<IndexedBlockRow>();
+  if (!block) return notFound();
+  const file = await env.DB.prepare(
+    'SELECT r2_key, content_hash, harness, size, parse_state FROM files WHERE id = ?1',
+  )
+    .bind(block.file_id)
+    .first<FileRow>();
+  if (!file) return notFound();
+  const row = { ...block, ...file };
+  if (row.byte_start === null || row.byte_len === null) return notFound();
   if (row.btype !== 'image' && row.btype !== 'document') return notFound();
 
-  // block ids are reused rowids, so the URL is versioned by the canonical file's content hash. A stale/absent
+  // Bind immutable media URLs to the file bytes, including legacy block ids retained by migration. A stale/absent
   // `v` (e.g. cached HTML after a reindex) redirects to the current URL; only an exact match earns immutable.
   const currentVersion = blobVersionOf(row.content_hash);
   const suppliedV = url.searchParams.get('v');

@@ -1,11 +1,14 @@
 import { createHash, createHmac } from 'node:crypto';
 import { lstat, open, readFile, realpath, readdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { indexShardBindingName } from '../../hub/src/index-layout.mjs';
 
 export const PRODUCTION_ACCOUNT_ID = '18ef3246e9f36d1560485ef53889c0ab';
 export const PREVIEW_ACCOUNT_ID = 'cbb04a26e6fa2d0cdc4eb67c735e5669';
 export const PREVIEW_WORKERS_DEV_SUFFIX = '.sessions-ppe.workers.dev';
 export const MAX_WORKER_BUNDLE_BYTES = 20 * 1024 * 1024;
+export const PREVIEW_INDEX_SHARD_COUNT = 2;
+export const PREVIEW_D1_DATABASE_LIMIT = 10;
 
 const TRUSTED_MIGRATION_METADATA = new Set([
   'historical-baseline.json',
@@ -107,14 +110,14 @@ export async function paginatedList(request, pathname, { pagination, rowsOf, per
   if (typeof request !== 'function') fail('list request function is required');
   const joiner = pathname.includes('?') ? '&' : '?';
   if (pagination === 'none') {
-    const envelope = await request(pathname, { allowNotFound: true, returnEnvelope: true });
+    const envelope = await request(pathname, { allowNotFound: true, responseFormat: 'envelope' });
     return envelope === null ? [] : rowsOf(envelope) ?? [];
   }
   const rows = [];
   if (pagination === 'page') {
     for (let page = 1; page <= 1000; page += 1) {
       const envelope = await request(`${pathname}${joiner}per_page=${perPage}&page=${page}`, {
-        allowNotFound: true, returnEnvelope: true,
+        allowNotFound: true, responseFormat: 'envelope',
       });
       if (envelope === null) return rows;
       const batch = rowsOf(envelope) ?? [];
@@ -130,7 +133,7 @@ export async function paginatedList(request, pathname, { pagination, rowsOf, per
     let cursor;
     for (let step = 0; step <= 1000; step += 1) {
       const query = `${joiner}per_page=${perPage}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
-      const envelope = await request(`${pathname}${query}`, { allowNotFound: true, returnEnvelope: true });
+      const envelope = await request(`${pathname}${query}`, { allowNotFound: true, responseFormat: 'envelope' });
       if (envelope === null) return rows;
       const batch = rowsOf(envelope) ?? [];
       rows.push(...batch);
@@ -157,7 +160,7 @@ export async function emptyR2Bucket(bucketName, request) {
     if (cursor) query.set('cursor', cursor);
     const page = await request(`${bucketPath}?${query}`, {
       allowNotFound: true,
-      returnEnvelope: true,
+      responseFormat: 'envelope',
     });
     if (page === null) return 0;
     if (!Array.isArray(page?.result)) fail(`R2 object listing for ${bucketName} is malformed`);
@@ -247,6 +250,8 @@ export function resourceNames(pr) {
     prefix,
     app: `${prefix}app`,
     d1: `${prefix}sessions-index`,
+    indexShards: Object.freeze(Array.from({ length: PREVIEW_INDEX_SHARD_COUNT },
+      (_, index) => `${prefix}sessions-index-${indexShardBindingName(index).toLowerCase()}`)),
     r2: `${prefix}agent-sessions`,
     kv: `${prefix}sessions-hub-kv`,
     queue: `${prefix}parse`,
@@ -254,7 +259,8 @@ export function resourceNames(pr) {
     rollupQueue: `${prefix}session-rollup`,
     host: `${prefix}app${PREVIEW_WORKERS_DEV_SUFFIX}`,
   };
-  for (const [kind, name] of Object.entries(names)) {
+  for (const [kind, name] of Object.entries(names).flatMap(([kind, value]) =>
+    Array.isArray(value) ? value.map((name, index) => [`${kind}[${index}]`, name]) : [[kind, value]])) {
     if (kind !== 'host' && kind !== 'prefix' && name.length > 63) {
       fail(`${kind} resource name exceeds Cloudflare's 63-character limit: ${name}`);
     }
@@ -266,9 +272,50 @@ export function resourceNames(pr) {
 }
 
 /** Any `pr-N-…` resource name in the preview account, old or new naming scheme. */
-export const PREVIEW_RESOURCE_RE = /^pr-([1-9][0-9]*)-(app|sessions-index|agent-sessions|sessions-hub-kv|parse|parse-dlq|session-rollup)$/;
+export const PREVIEW_RESOURCE_RE = /^pr-([1-9][0-9]*)-(app|sessions-index(?:-idx0[01])?|agent-sessions|sessions-hub-kv|parse|parse-dlq|session-rollup)$/;
 /** The retired blue/green generation naming scheme — always deletable debris. */
 export const LEGACY_GENERATION_RE = /^pr-([1-9][0-9]*)-g[1-9][0-9]*-[0-9a-f]{12}-/;
+
+/** Persisted layout identity excludes IDs so an intentional full reset keeps the same layout. */
+export function previewIndexLayout(names) {
+  return {
+    count: PREVIEW_INDEX_SHARD_COUNT,
+    databases: [
+      { binding: 'DB', name: names.d1 },
+      ...names.indexShards.map((name, index) => ({ binding: indexShardBindingName(index), name })),
+    ],
+  };
+}
+
+export function assertPreviewResourceNames(names, pr) {
+  if (stableJson(names) !== stableJson(resourceNames(pr))) {
+    fail('preview resource names do not match the immutable per-PR layout');
+  }
+}
+
+export function assertPreviewIndexLayout(layout, names) {
+  if (stableJson(layout) !== stableJson(previewIndexLayout(names))) {
+    fail('preview index count/name layout is immutable; refusing to reuse a different topology');
+  }
+}
+
+/** Refuse before creating ANY resource; never make room by deleting another PR's database. */
+export function previewDatabasePlan(databases, names) {
+  const missing = [];
+  const existing = new Map();
+  for (const { binding, name } of previewIndexLayout(names).databases) {
+    const matches = databases.filter((database) => database.name === name);
+    if (matches.length > 1) fail(`multiple preview databases have the trusted name ${name}`);
+    if (matches.length === 0) missing.push({ binding, name });
+    else existing.set(binding, required(matches[0].uuid, `database ID for ${name}`));
+  }
+  if (databases.length + missing.length > PREVIEW_D1_DATABASE_LIMIT) {
+    fail(`preview D1 quota: ${databases.length}/${PREVIEW_D1_DATABASE_LIMIT} databases exist, `
+      + `${missing.length} required for ${names.prefix.slice(0, -1)}; refusing creation. `
+      + 'Close unused previews explicitly or run the closed-PR janitor; no other PR resources were deleted.');
+  }
+  return { existing, missing };
+}
 
 export function assertPreviewAccount(accountId) {
   required(accountId, 'preview account ID');
@@ -345,9 +392,21 @@ export function generatedBuildConfig({ main, workerName }) {
 }
 
 export function generatedPrivateAppConfig({
-  accountId, main, migrationsDir, names, resources, application,
+  accountId, main, migrationsDir, indexMigrationsDir, names, resources, application,
 }) {
   assertPreviewAccount(accountId);
+  assertPreviewResourceNames(names, resources.pr);
+  headSha(resources.headSha);
+  required(resources.d1, 'main preview database ID');
+  required(resources.kv, 'preview KV namespace ID');
+  required(indexMigrationsDir, 'index migrations directory');
+  if (!Array.isArray(resources.indexShards) || resources.indexShards.length !== PREVIEW_INDEX_SHARD_COUNT) {
+    fail('preview requires exactly two index shard database IDs');
+  }
+  for (const id of resources.indexShards) required(id, 'preview index database ID');
+  if (new Set([resources.d1, ...resources.indexShards]).size !== PREVIEW_INDEX_SHARD_COUNT + 1) {
+    fail('preview main and index shard database IDs must be distinct');
+  }
   for (const [name, digest] of Object.entries({
     buildInputDigest: resources.buildInputDigest,
     artifactDigest: resources.artifactDigest,
@@ -376,6 +435,9 @@ export function generatedPrivateAppConfig({
     exports: {},
     vars: {
       ENVIRONMENT: 'preview',
+      INDEX_SHARD_COUNT: String(PREVIEW_INDEX_SHARD_COUNT),
+      INDEX_MODE: 'active',
+      DEPLOYMENT_REVISION: resources.headSha,
       API_HOST: names.host,
       VIEWER_HOST: names.host,
       R2_DASHBOARD_BASE_URL: `https://dash.cloudflare.com/${accountId}/r2/default/buckets/${names.r2}`,
@@ -390,12 +452,20 @@ export function generatedPrivateAppConfig({
       ASSET_SIGNING_SECRET: application.assetSigningSecret,
       PREVIEW_BEARER: application.previewBearer,
     },
-    d1_databases: [{
-      binding: 'DB',
-      database_name: names.d1,
-      database_id: resources.d1,
-      migrations_dir: migrationsDir,
-    }],
+    d1_databases: [
+      {
+        binding: 'DB',
+        database_name: names.d1,
+        database_id: resources.d1,
+        migrations_dir: migrationsDir,
+      },
+      ...names.indexShards.map((name, index) => ({
+        binding: indexShardBindingName(index),
+        database_name: name,
+        database_id: resources.indexShards[index],
+        migrations_dir: indexMigrationsDir,
+      })),
+    ],
     r2_buckets: [{ binding: 'RAW', bucket_name: names.r2 }],
     kv_namespaces: [{ binding: 'KV', id: resources.kv }],
     ratelimits: [{
@@ -447,23 +517,33 @@ export async function assertContainedRegularFile(root, candidate, label) {
  * Classify an account resource name for cleanup. Returns null for names the preview
  * control plane does not own (never touched), otherwise `{ pr, legacy }`.
  */
-export function previewResourceOwner(name) {
+export function previewResourceOwner(name, kind) {
   if (typeof name !== 'string') return null;
   const legacy = LEGACY_GENERATION_RE.exec(name);
-  if (legacy) return { pr: Number(legacy[1]), legacy: true };
   const current = PREVIEW_RESOURCE_RE.exec(name);
-  if (current) return { pr: Number(current[1]), legacy: false };
-  return null;
+  if (!legacy && !current) return null;
+  const suffix = legacy ? name.slice(legacy[0].length) : current[2];
+  const resourceKind = /^(app|edge)$/.test(suffix) ? 'worker'
+    : /^sessions-index(?:-idx0[01])?$/.test(suffix) ? 'd1'
+    : suffix === 'agent-sessions' ? 'r2'
+    : suffix === 'sessions-hub-kv' ? 'kv'
+    : /^(parse|parse-dlq|session-rollup)$/.test(suffix) ? 'queue'
+    : null;
+  if (!resourceKind || (kind !== undefined && resourceKind !== kind)) return null;
+  const ownerPr = Number((legacy ?? current)[1]);
+  if (!Number.isSafeInteger(ownerPr)) return null;
+  return { pr: ownerPr, legacy: legacy !== null };
 }
 
 export function queueConsumerIdsForQueue(consumers, queueName) {
   if (!Array.isArray(consumers)) fail('queue consumers must be an array');
   required(queueName, 'queue name');
   return consumers.map((consumer) => {
-    // Every consumer of a pr-N queue was attached by the preview control plane; a consumer
-    // claiming a script outside the pr- namespace means the account holds something foreign.
+    // Never detach a different PR's consumer, even if it lives in the preview namespace.
     const script = consumer?.script_name;
-    if (typeof script === 'string' && previewResourceOwner(script) === null) {
+    const queueOwner = previewResourceOwner(queueName, 'queue');
+    const scriptOwner = previewResourceOwner(script, 'worker');
+    if (typeof script === 'string' && (!queueOwner || !scriptOwner || scriptOwner.pr !== queueOwner.pr)) {
       fail(`foreign queue consumer rejected on ${queueName}: ${stableJson({ script })}`);
     }
     return required(consumer.consumer_id, 'queue consumer id');

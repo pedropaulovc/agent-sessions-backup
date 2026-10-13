@@ -95,6 +95,12 @@ export async function searchPage(url: URL, env: Env): Promise<Response> {
   }
 
   const result = await runSearch(url, env, { facets: true });
+  if (result.error) {
+    return new Response(result.error, {
+      status: result.status ?? 400,
+      headers: { 'cache-control': 'no-store', 'content-type': 'text/plain; charset=utf-8' },
+    });
+  }
   const offset = decodeCursor(p.get('cursor'));
   const limit = clampLimit(p.get('limit'), DEFAULT_RESULT_PAGE_SIZE, DEFAULT_RESULT_PAGE_SIZE);
   const costs = await sessionSubtreeCosts(env.DB, result.hits.map((h) => h.session_id));

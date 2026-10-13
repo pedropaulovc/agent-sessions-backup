@@ -190,15 +190,102 @@ Expose this on an authenticated development diagnostics route and include it in 
 5. reject symlinks escaping the repo and exclude `.env*`, credentials, private corpus files, `.dev`, `node_modules`, caches, ignored output, and unrelated untracked files; include a dirty file only when the bundler proves it is consumed;
 6. acquire an environment ownership lock;
 7. build twice and require the declared input manifest to reproduce the same bundle digest;
-8. apply and verify migrations;
-9. start Wrangler with `ENVIRONMENT=development` and explicit host/port/persistence arguments;
-10. wait for `/healthz` and environment diagnostics carrying the same nonce, build-input digest, artifact digest, migration digest, and schema digest;
+8. apply and verify `hub/migrations/` on metadata `DB`, then `hub/migrations-index/` on `IDX00` and `IDX01`, with a separate checksum ledger and resumable journal for every database;
+9. start Wrangler with the generated local config, `ENVIRONMENT=development`, `INDEX_MODE=active`, `INDEX_SHARD_COUNT=2`, and explicit host/port/persistence arguments;
+10. wait for `/healthz` and environment diagnostics carrying the same nonce, deployment revision, active index mode, shard count, build-input digest, artifact digest, migration digest, and schema digest;
 11. print the URL and state directory;
 12. remain in the foreground, forward Ctrl+C, and terminate the owned process tree on Windows and Linux.
 
 Do not provide a PID-only `dev:down`. The foreground owner or Playwright harness owns process teardown. `dev:reset` resolves and prints the selected path, rejects anything outside `.dev/`, and refuses while the environment lock or matching live nonce is present. Tests cover a stale PID, PID reuse, reset while running, a stale lock after a crash, and path traversal.
 
 Replace the real-corpus default with a small synthetic fixture checked into the existing test fixture area. Keep `scripts/seed-local.mjs` as an explicit private-data tool, renamed or wrapped as `session:seed-corpus`, with a schema-readiness probe and a warning that it uploads local transcripts.
+
+### Local databases and migration recovery
+
+Local development, local Playwright, and the Workers Vitest pool use exactly three D1
+databases: metadata/pricing `DB`, and full-fidelity search indexes `IDX00`/`IDX01`.
+Production's sixteen-shard Wrangler configuration is not the local runtime configuration.
+`environment.mjs` writes `wrangler.local.json` inside the owned persistence directory,
+using absolute entrypoint/migration paths and stable local shard IDs. Vitest generates
+the same topology under `hub/.dev/vitest/`, applies both schema trees to their respective
+databases, and initializes shard layout metadata in `beforeAll` before per-test rollback.
+
+Startup finishes all three migration histories and checksum ledgers before it inserts
+fixture prices into `DB`, starts the worker, or uploads synthetic fixtures. Fixture uploads
+still use the normal worker/queue ingest path; no local seeder writes blocks directly.
+Main no longer has `blocks` or `blocks_fts`, and there is no main-database search fallback.
+
+Named local state from before sharding is refused before migration DML, rather than
+dropping a populated old index and hoping unchanged uploads will reparse it. Startup
+checks the recorded database topology/IDs; if diagnostics are missing, it reads the
+main schema and refuses when legacy blocks contain rows. Interrupted fresh startup
+without populated legacy blocks may resume its database-aware journals. Refusal
+leaves data in place and prints `npm --prefix hub run dev:reset -- --name <name>`.
+Stop the owner and explicitly reset disposable local state to adopt the new layout;
+local development does not run the production frozen-copy migration.
+
+The migration CLI's `--migrations-dir` selects the matching manifest and immutable
+`source-baseline.json`; `--manifest`, `--base-manifest`, and `--history` may explicitly
+override those paths. A binding's configured migration directory must match the selected
+directory, so a shard can never accidentally apply main migrations. `--base-ref` looks up
+the selected migration tree, not always `hub/migrations`. Main validates its historical
+baseline; shard history starts with checksum-ledger migration 0001 (`ledgerStartsAt=1`),
+so shards have no pre-ledger historical baseline.
+
+For the initial shard cutover only, `check --migrations-dir migrations-index
+--base-ref <protected-sha>` first proves via Git that `hub/migrations-index` is
+absent at that protected commit. It then accepts the initial `0001` source baseline
+only with `ledgerStartsAt=1` and no reserved sequences. An unreadable commit or an
+existing tree without valid policy is not treated as absence. Once the tree exists
+on the protected branch, its checked-in manifest is the immutable base, exactly as
+for main migrations.
+
+Every version-2 migration journal binds the artifact, manifest, deployment, actual
+database binding, database ID, and (for local/e2e) absolute persistence directory.
+`--database` accepts the configured binding/name/ID; optional `--database-id` must match
+the actual configured ID. A journal from `IDX00` cannot be resumed by `IDX01`, even
+when both use identical SQL and the same deployment. Unknown or pre-database-aware
+journal formats fail closed rather than guessing whether another database was migrated.
+Local journal filenames and deployment identities include the database/storage identity,
+so an unchanged restart resumes each database independently. `schema-diagnostics.json`
+retains per-database identities, migration/schema digests, and pending counts; the
+health/manifest migration and schema digests cover the ordered three-database topology.
+
+Local readiness, synthetic upload, and indexing failures report the failed method/URL,
+whether an HTTP response arrived, received status/content type for body-read failures,
+and the original error/cause chain. They never log request headers/bodies or rejected
+HTTP response bodies. A successful `/healthz` alone is not seeded readiness; diagnose
+the later failing request from those details rather than treating it as a health failure.
+
+Both synthetic seeders pass their finite Buffer bodies without a caller-supplied
+`Content-Length`; fetch owns the wire byte count. The observed full local CLI failure
+had a valid 68-byte PNG and caller length `68`, but dispatched `68, 68` into Undici,
+which rejected the duplicate before any HTTP response (`UND_ERR_INVALID_ARG`).
+Reduced native/helper controls accepted explicit headers, so this is not a claim
+that all explicit-length fetches fail. Body bytes, hashes, metadata and auth are
+unchanged; an actual initialized launch and external-asset path remain the wire proof.
+
+For normal use, run `npm --prefix hub run dev:up` or
+`npm --prefix hub run test:e2e`; neither requires Cloudflare credentials. To diagnose
+a shard manually while the local environment is stopped, use its generated config and
+a distinct journal, for example (from the repository root):
+
+```sh
+node hub/scripts/migrations.mjs apply \
+  --target local --database IDX00 \
+  --config hub/.dev/local/default/wrangler.local.json \
+  --migrations-dir hub/migrations-index \
+  --persist-to hub/.dev/local/default \
+  --journal hub/.dev/local/default/migration-journals/manual-IDX00.json \
+  --artifact-digest <exact-build-artifact-sha256> \
+  --deployment-id local-manual-IDX00
+```
+
+Use the exact artifact digest recorded in that environment's `build-manifest.json`.
+An ambiguous journal is not permission to delete its phase history and retry against
+unidentified storage; use the explicit stopped-environment `dev:reset` flow for
+disposable local state. Fresh e2e environments are removed by their owner on exit.
+
 
 ### Playwright contract
 
@@ -216,7 +303,7 @@ Initial browser coverage should prove observable behavior that Vitest cannot:
 - a one-time preview login works once, sets an environment-scoped session, and cannot be replayed;
 - a preview session/cookie is rejected by production and by another PR environment.
 
-Run Chromium on `ubuntu-latest` and `windows-latest` with Node 22. Linux installs Chromium with system dependencies; Windows installs Chromium only. Use one database per run and one Playwright worker until mutating fixtures are namespaced. On failure, upload the full Wrangler log, Playwright trace, screenshot, video, environment manifest, and schema diagnostics. Never upload a production debug bundle.
+Run Chromium on `ubuntu-latest` and `windows-latest` with Node 22. Linux installs Chromium with system dependencies; Windows installs Chromium only. Use one isolated main-plus-two-shard database topology per run and one Playwright worker until mutating fixtures are namespaced. On failure, upload the full Wrangler log, Playwright trace, screenshot, video, environment manifest, and schema diagnostics. Never upload a production debug bundle.
 
 The remote smoke job runs only after deployment and uses synthetic data. Fork PRs still run local Playwright; remote deployment can be limited to trusted PRs until the preview workflow's artifact boundary is verified.
 

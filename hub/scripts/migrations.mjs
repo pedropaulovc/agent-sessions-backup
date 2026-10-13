@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { spawnSync } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,7 +31,7 @@ function resolveOption(value) {
   return value ? path.resolve(value) : undefined;
 }
 
-async function trustedBaseManifest(options) {
+async function trustedBaseManifest(options, migrationsDir) {
   const suppliedBase = resolveOption(options['base-manifest']);
   if (suppliedBase && options['base-ref']) {
     throw new Error('--base-manifest and --base-ref are mutually exclusive');
@@ -43,7 +44,38 @@ async function trustedBaseManifest(options) {
     if (!/^[0-9a-f]{40}$/.test(baseRef)) {
       throw new Error('--base-ref must be a full protected commit SHA');
     }
-    return migrationManifestAtRef({ ref: baseRef, repositoryRoot });
+    const migrationsPath = path.relative(repositoryRoot, migrationsDir).split(path.sep).join('/');
+    if (migrationsPath === '..' || migrationsPath.startsWith('../') || path.isAbsolute(migrationsPath)) {
+      throw new Error('--base-ref requires a migrations directory inside the repository');
+    }
+    // A new shard namespace has no deployed history to preserve. Prove its absence
+    // at the protected base before accepting the initial all-ledger schema policy.
+    // An unreadable ref or an existing-but-invalid tree is never an empty history.
+    if (migrationsPath === 'hub/migrations-index') {
+      const gitOptions = { cwd: repositoryRoot, encoding: 'utf8', windowsHide: true };
+      const treeArgs = ['ls-tree', '-r', '--name-only', baseRef, '--', migrationsPath];
+      let tree = spawnSync('git', treeArgs, gitOptions);
+      if (tree.error) throw new Error(`cannot execute git: ${tree.error.message}`);
+      if (tree.status !== 0) {
+        const fetched = spawnSync('git', ['fetch', '--no-tags', '--depth=1', 'origin', baseRef], gitOptions);
+        if (fetched.error || fetched.status !== 0) {
+          throw new Error(`cannot fetch migration base ${baseRef}: ${fetched.error?.message ?? fetched.stderr}`);
+        }
+        tree = spawnSync('git', treeArgs, gitOptions);
+      }
+      if (tree.error || tree.status !== 0) {
+        throw new Error(`cannot read migration base ${baseRef}: ${tree.error?.message ?? tree.stderr}`);
+      }
+      if (!tree.stdout.trim()) {
+        const initial = validateManifestShape(JSON.parse(await readFile(path.join(migrationsDir, 'source-baseline.json'), 'utf8')));
+        if (initial.ledgerStartsAt !== 1 || initial.reservedSequences?.length !== 0
+            || initial.migrations.length !== 1 || initial.migrations[0].sequence !== 1) {
+          throw new Error('a new shard migration tree requires an initial 0001 baseline with ledgerStartsAt=1 and no reserved sequences');
+        }
+        return initial;
+      }
+    }
+    return migrationManifestAtRef({ ref: baseRef, repositoryRoot, migrationsPath });
   }
   throw new Error('migration manifest validation requires independent policy evidence from --base-manifest or a protected base ref');
 }
@@ -59,7 +91,7 @@ async function main() {
   const migrationsDir = resolveOption(options['migrations-dir']) ?? path.join(hubRoot, 'migrations');
   const manifestPath = resolveOption(options.manifest) ?? path.join(migrationsDir, 'manifest.json');
   if (command === 'check-base') {
-    const base = await trustedBaseManifest(options);
+    const base = await trustedBaseManifest(options, migrationsDir);
     const result = await loadAndValidateManifest({
       migrationsDir,
       manifestPath,
@@ -69,7 +101,7 @@ async function main() {
     return;
   }
   if (command === 'check') {
-    const base = await trustedBaseManifest(options);
+    const base = await trustedBaseManifest(options, migrationsDir);
     const result = await loadAndValidateManifest({
       migrationsDir,
       manifestPath,
@@ -87,6 +119,7 @@ async function main() {
     target: options.target,
     config: resolveOption(options.config),
     database: options.database ?? 'DB',
+    databaseId: options['database-id'],
     persistTo: resolveOption(options['persist-to']),
     journalPath: resolveOption(options.journal),
     artifactDigest: options['artifact-digest'],

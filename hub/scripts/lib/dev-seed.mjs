@@ -2,6 +2,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { HUB_ROOT } from './dev-paths.mjs';
 import { seedManifest, sha256 } from './dev-manifests.mjs';
+import { fetchEnvironmentText } from './environment.mjs';
 
 const FIXTURE_DIR = join(HUB_ROOT, 'test', 'fixtures', 'local');
 const PRIMARY = join(FIXTURE_DIR, 'e2e-synthetic-session.jsonl');
@@ -281,19 +282,20 @@ export async function syntheticSeedManifest() {
 
 async function upload(baseUrl, store, relpath, bytes) {
   const contentHash = sha256(bytes);
-  const response = await fetch(`${baseUrl}/api/v1/files/${MACHINE}/${store}/${encodeURIComponent(relpath)}`, {
+  const url = `${baseUrl}/api/v1/files/${MACHINE}/${store}/${encodeURIComponent(relpath)}`;
+  // Fetch owns the wire Content-Length for this exact Buffer. The observed
+  // local CLI dispatched "68, 68" when a manual "68" header was supplied too.
+  const { response } = await fetchEnvironmentText(url, {
     method: 'PUT',
     headers: {
       'x-dev-machine': MACHINE,
       'x-content-hash': `sha256:${contentHash}`,
       'x-file-mtime': '2026-07-01T00:00:00.000Z',
-      'content-length': String(bytes.length),
     },
     body: bytes,
   });
-  const text = await response.text();
   if (response.status !== 200 && response.status !== 201) {
-    throw new Error(`synthetic upload ${relpath} failed (${response.status}): ${text.slice(0, 500)}`);
+    throw new Error(`synthetic upload PUT ${url} failed (HTTP ${response.status})`);
   }
 }
 
@@ -302,23 +304,27 @@ async function waitForIndexed(baseUrl, sessionId, marker, deadline, kind = 'main
   // same filter the viewer would use to see it.
   const query = new URLSearchParams({ q: marker, machine: MACHINE, limit: '20' });
   if (kind === 'subagent') query.set('subagent', 'yes');
+  const url = `${baseUrl}/api/v1/search?${query}`;
   let last = 'not probed';
+  let lastError;
   while (Date.now() < deadline) {
     try {
-      const response = await fetch(`${baseUrl}/api/v1/search?${query}`, {
+      const { response, text } = await fetchEnvironmentText(url, {
         headers: { 'x-dev-machine': MACHINE },
       });
-      last = `${response.status} ${await response.text()}`;
+      lastError = undefined;
+      last = `GET ${url}: HTTP ${response.status}`;
       if (response.ok) {
-        const body = JSON.parse(last.slice(last.indexOf(' ') + 1));
+        const body = JSON.parse(text);
         if (Array.isArray(body.hits) && body.hits.some((hit) => hit.session_id === sessionId)) return;
       }
     } catch (error) {
+      lastError = error;
       last = String(error);
     }
     await new Promise((resolve) => setTimeout(resolve, 200));
   }
-  throw new Error(`synthetic session ${sessionId} was not indexed before timeout; last probe: ${last.slice(0, 500)}`);
+  throw new Error(`synthetic session ${sessionId} was not indexed before timeout; last probe: ${last}`, { cause: lastError });
 }
 
 export async function seedSynthetic(baseUrl, timeoutMs = 30_000, expectedDigest) {

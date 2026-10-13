@@ -25,6 +25,8 @@
 // sessions-telemetry-gateway → Azure Monitor OTelLogs (see infra/cf/telemetry.md).
 
 import { EXPECTED_COLLECTOR_VERSION } from '../collector-version';
+import { mapIndexDbs } from '../index-shards';
+import { indexShardBindingName } from '../index-layout.mjs';
 
 interface HealthRow {
   row_kind: 'machine' | 'fleet';
@@ -207,29 +209,28 @@ export async function runWatchdog(env: Env): Promise<void> {
   // stale-machine detection and must itself alert).
   console.log(JSON.stringify({ event: 'hub.watchdog.run', machine_count: machineCount, roster_ok: rosterOk }));
 
-  // D1 size gauge (plan wants an alert at ~7 GB). Read the size from the query
-  // result's `meta.size_after` (bytes after the statement ran) rather than a
-  // PRAGMA: production D1 rejects `pragma_page_count()`/`pragma_page_size()` with
-  // `D1_ERROR: not authorized: SQLITE_AUTH` (it worked under miniflare but is
-  // blocked in prod), whereas every D1 result carries `meta.size_after` and needs
-  // no special authorization. A trivial `SELECT 1` is enough to get the meta.
-  // If `size_after` is somehow absent (an older/local D1 that doesn't populate it),
-  // emit the explicit FAILING signal `bytes: -1` rather than dropping the metric —
-  // this run never crashes on it (heartbeat-age above is load-bearing), but a
-  // silent drop would make d1-size.kql see zero size rows exactly when the probe
-  // breaks while heartbeat_age keeps missed-heartbeat.kql "healthy". d1-size.kql
-  // fires on `bytes < 0` too, so a broken probe is alertable. The human-readable
-  // warn is kept alongside the sentinel.
+  await probeDatabaseSize(env.DB, 'main');
+  await mapIndexDbs(env, (db, shard) => probeDatabaseSize(db, indexShardBindingName(shard)));
+}
+
+async function probeDatabaseSize(db: D1Database, database: string): Promise<void> {
+  // Production D1 rejects page-count PRAGMAs; the query metadata provides the size.
+  // Each database needs its own gauge: a healthy small shard must not hide a full sibling.
   try {
-    const probe = await env.DB.prepare('SELECT 1').run();
+    const probe = await db.prepare('SELECT 1').run();
     const sizeAfter = probe.meta?.size_after;
     const bytes = typeof sizeAfter === 'number' && sizeAfter >= 0 ? sizeAfter : -1;
-    console.log(JSON.stringify({ event: 'hub.d1.db_size_bytes', bytes }));
+    console.log(JSON.stringify({ event: 'hub.d1.db_size_bytes', database, bytes }));
     if (bytes < 0) {
-      console.log(JSON.stringify({ event: 'hub.watchdog.warn', tag: 'd1-size-unavailable', error: 'meta.size_after absent from D1 result' }));
+      console.log(JSON.stringify({
+        event: 'hub.watchdog.warn', tag: 'd1-size-unavailable', database,
+        error: 'meta.size_after absent from D1 result',
+      }));
     }
-  } catch (e) {
-    console.log(JSON.stringify({ event: 'hub.d1.db_size_bytes', bytes: -1 }));
-    console.log(JSON.stringify({ event: 'hub.watchdog.warn', tag: 'd1-size-unavailable', error: String(e) }));
+  } catch (error) {
+    console.log(JSON.stringify({ event: 'hub.d1.db_size_bytes', database, bytes: -1 }));
+    console.log(JSON.stringify({
+      event: 'hub.watchdog.warn', tag: 'd1-size-unavailable', database, error: String(error),
+    }));
   }
 }

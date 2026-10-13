@@ -1,8 +1,10 @@
 import { env, SELF } from 'cloudflare:test';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { REPORTS_QUERY } from '../src/viewer/reports';
 import { TURNS_PER_PAGE } from '../src/viewer/session';
 import { VIEWER } from './hosts';
+import { assertIndexLayout, indexDbFor, indexDbs, indexShardFor, reserveBlockIds } from '../src/index-shards';
+import { syncSessionCatalog } from '../src/session-catalog';
 
 const testEnv = env as unknown as Env;
 const RUN_ID = crypto.randomUUID();
@@ -12,6 +14,10 @@ const REPORT_DEVICE = 'xd://report_issue';
 const seededSessionIds = new Set<string>();
 const seededFileIds = new Set<number>();
 const seededMachineIds = new Set<string>();
+
+beforeAll(async () => {
+  await assertIndexLayout(testEnv);
+});
 
 interface SeedBlock {
   text: string;
@@ -38,7 +44,14 @@ function toolCall(tool: string, args: unknown): string {
   return `${tool} ${JSON.stringify(args)}`;
 }
 
-async function seedSession(fixture: SeedSession): Promise<void> {
+function sessionIdOnShard(name: string, shard: number): string {
+  for (let suffix = 0; ; suffix++) {
+    const sessionId = `${RUN_ID}-${name}-${suffix}`;
+    if (indexShardFor(testEnv, sessionId) === shard) return sessionId;
+  }
+}
+
+async function seedSession(fixture: SeedSession): Promise<number[]> {
   await testEnv.DB.prepare(
     `INSERT INTO machines (machine_id, os, hostname) VALUES (?1, 'linux', ?2)`,
   ).bind(fixture.machineId, fixture.machineId).run();
@@ -76,12 +89,16 @@ async function seedSession(fixture: SeedSession): Promise<void> {
   ).run();
   seededSessionIds.add(fixture.sessionId);
 
-  for (const [blockIndex, block] of fixture.blocks.entries()) {
-    await testEnv.DB.prepare(
+  await assertIndexLayout(testEnv);
+  const db = indexDbFor(testEnv, fixture.sessionId);
+  const firstId = await reserveBlockIds(db, fixture.blocks.length);
+  await db.batch([
+    ...fixture.blocks.map((block, blockIndex) => db.prepare(
       `INSERT INTO blocks
-         (session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, truncated, text, on_main_path)
-       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)`,
+         (id, session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, truncated, text, on_main_path)
+       VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)`,
     ).bind(
+      firstId + blockIndex,
       fixture.sessionId,
       file.id,
       block.turnIndex ?? 0,
@@ -93,15 +110,30 @@ async function seedSession(fixture: SeedSession): Promise<void> {
       block.truncated ?? 0,
       block.text,
       block.onMainPath ?? 1,
-    ).run();
-  }
+    )),
+    db.prepare(
+      `INSERT INTO blocks_fts(rowid, text)
+       SELECT id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL`,
+    ).bind(fixture.sessionId),
+  ]);
+  await syncSessionCatalog(testEnv, [fixture.sessionId]);
+  return fixture.blocks.map((_, index) => firstId + index);
 }
 
 afterEach(async () => {
+  for (const db of indexDbs(testEnv)) {
+    const indexStatements = [...seededSessionIds]
+      .filter((sessionId) => indexDbFor(testEnv, sessionId) === db)
+      .flatMap((sessionId) => [
+        db.prepare(
+          `INSERT INTO blocks_fts(blocks_fts, rowid, text)
+           SELECT 'delete', id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL`,
+        ).bind(sessionId),
+        db.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(sessionId),
+      ]);
+    if (indexStatements.length > 0) await db.batch(indexStatements);
+  }
   const statements = [
-    ...[...seededSessionIds].map((sessionId) =>
-      testEnv.DB.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(sessionId),
-    ),
     ...[...seededSessionIds].map((sessionId) =>
       testEnv.DB.prepare('DELETE FROM sessions WHERE session_id = ?1').bind(sessionId),
     ),
@@ -113,15 +145,17 @@ afterEach(async () => {
     ),
   ];
   if (statements.length > 0) await testEnv.DB.batch(statements);
+  if (seededSessionIds.size > 0) await syncSessionCatalog(testEnv, [...seededSessionIds]);
   seededSessionIds.clear();
   seededFileIds.clear();
   seededMachineIds.clear();
 });
 
 describe('/reports viewer', () => {
-  it('aggregates reports from different sessions newest first by block timestamp', async () => {
-    const olderSession = `${RUN_ID}-aggregation-older`;
-    const newerSession = `${RUN_ID}-aggregation-newer`;
+  it('aggregates reports from different shards newest first by block timestamp', async () => {
+    const olderSession = sessionIdOnShard('aggregation-older', 0);
+    const newerSession = sessionIdOnShard('aggregation-newer', 1);
+    expect(indexDbFor(testEnv, olderSession)).not.toBe(indexDbFor(testEnv, newerSession));
     await seedSession({
       sessionId: olderSession,
       machineId: `${RUN_ID}-machine-older`,
@@ -154,23 +188,24 @@ describe('/reports viewer', () => {
     expect(olderAt).toBeGreaterThanOrEqual(0);
     expect(newerAt).toBeLessThan(olderAt);
   });
-  it('paginates 26 reports and preserves filters while clamping an oversized page', async () => {
-    const sessionId = `${RUN_ID}-pager`;
+  it('paginates 26 interleaved reports across shards and preserves filters while clamping an oversized page', async () => {
     const reportBody = (number: number) => `bash: pager report #${String(number).padStart(2, '0')}`;
-    await seedSession({
-      sessionId,
-      machineId: `${RUN_ID}-machine-pager`,
-      title: 'Pager session',
-      startedAt: '2026-09-16T11:30:00.000Z',
-      blocks: Array.from({ length: 26 }, (_, index) => {
-        const number = index + 1;
-        return {
-          text: toolCall('write', { path: REPORT_DEVICE, content: reportBody(number) }),
-          toolName: 'write',
-          ts: `2026-09-16T11:${String(59 - index).padStart(2, '0')}:00.000Z`,
-        };
-      }),
-    });
+    for (let shard = 0; shard < 2; shard++) {
+      await seedSession({
+        sessionId: sessionIdOnShard(`pager-${shard}`, shard),
+        machineId: `${RUN_ID}-machine-pager-${shard}`,
+        title: `Pager session ${shard}`,
+        startedAt: '2026-09-16T11:30:00.000Z',
+        blocks: Array.from({ length: 13 }, (_, index) => {
+          const number = index * 2 + shard + 1;
+          return {
+            text: toolCall('write', { path: REPORT_DEVICE, content: reportBody(number) }),
+            toolName: 'write',
+            ts: `2026-09-16T11:${String(60 - number).padStart(2, '0')}:00.000Z`,
+          };
+        }),
+      });
+    }
 
     const pageOne = await SELF.fetch(`${VIEWER}/reports?tool=bash`);
     expect(pageOne.status).toBe(200);
@@ -178,6 +213,9 @@ describe('/reports viewer', () => {
     expect(pageOneHtml).toContain(reportBody(1));
     expect(pageOneHtml).toContain(reportBody(25));
     expect(pageOneHtml).not.toContain(reportBody(26));
+    expect([...pageOneHtml.matchAll(/bash: pager report #(\d{2})/g)].map((match) => Number(match[1])))
+      .toEqual(Array.from({ length: 25 }, (_, index) => index + 1));
+    expect(pageOneHtml).toContain('bash 26</a>');
     expect(pageOneHtml).toContain('<nav class="pager" aria-label="Issue report pages">');
     expect(pageOneHtml).toContain('<a href="/reports?tool=bash&amp;page=2">Next →</a>');
 
@@ -193,6 +231,30 @@ describe('/reports viewer', () => {
     const clampedHtml = await clamped.text();
     expect(clampedHtml).toContain(reportBody(26));
     expect(clampedHtml).toContain('<span class="small">Page 2 / 2</span>');
+  });
+
+  it('breaks equal report timestamp ties by globally unique block id across shards', async () => {
+    const timestamp = '2026-09-16T11:00:00.000Z';
+    const reports: { id: number; body: string }[] = [];
+    for (let shard = 0; shard < 2; shard++) {
+      const body = `bash: timestamp tie shard ${shard}`;
+      const [id] = await seedSession({
+        sessionId: sessionIdOnShard(`timestamp-tie-${shard}`, shard),
+        machineId: `${RUN_ID}-machine-timestamp-tie-${shard}`,
+        title: `Timestamp tie session ${shard}`,
+        startedAt: timestamp,
+        blocks: [{ text: toolCall('write', { path: REPORT_DEVICE, content: body }), toolName: 'write', ts: timestamp }],
+      });
+      reports.push({ id: id!, body });
+    }
+    expect(reports[0]!.id).not.toBe(reports[1]!.id);
+    const response = await SELF.fetch(`${VIEWER}/reports?tool=bash`);
+    expect(response.status).toBe(200);
+    const html = await response.text();
+    const ordered = reports.sort((a, b) => b.id - a.id);
+    for (const report of ordered) expect(html).toContain(report.body);
+    expect(html.indexOf(ordered[0]!.body)).toBeLessThan(html.indexOf(ordered[1]!.body));
+    expect(html).toContain('bash 2</a>');
   });
 
   it('links each report to its encoded session and turn page', async () => {
@@ -408,8 +470,10 @@ describe('/reports viewer', () => {
     expect(await response.text()).toContain('No agent has filed an issue report in this corpus yet.');
   });
 
-  it('uses blocks_issue_reports for the reports page query', async () => {
-    const plan = await testEnv.DB.prepare(`EXPLAIN QUERY PLAN ${REPORTS_QUERY}`).all<{ detail?: string }>();
-    expect(plan.results.some((row) => row.detail?.includes('blocks_issue_reports'))).toBe(true);
+  it('uses blocks_issue_reports for the reports page query on every shard', async () => {
+    for (const db of indexDbs(testEnv)) {
+      const plan = await db.prepare(`EXPLAIN QUERY PLAN ${REPORTS_QUERY}`).all<{ detail?: string }>();
+      expect(plan.results.some((row) => row.detail?.includes('blocks_issue_reports'))).toBe(true);
+    }
   });
 });

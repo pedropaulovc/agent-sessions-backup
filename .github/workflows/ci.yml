@@ -50,7 +50,9 @@ jobs:
       - name: Verify migrations against protected base
         env:
           MIGRATION_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: node scripts/migrations.mjs check --base-ref "$MIGRATION_BASE_REF"
+        run: |
+          node scripts/migrations.mjs check --base-ref "$MIGRATION_BASE_REF"
+          node scripts/migrations.mjs check --migrations-dir migrations-index --base-ref "$MIGRATION_BASE_REF"
       - run: npm run typecheck
       - run: npm test
 
@@ -222,22 +224,21 @@ jobs:
             printf 'Open preview: %s\n' "$login_url"
           } | gh pr comment "$PR_NUMBER" --body-file -
 
-  # Migrate D1, then deploy the hub Worker on merge to main. This is the SOLE deployer:
-  # Cloudflare Workers Builds auto-deploy is turned OFF so nothing races us. Applying migrations
-  # before the hub deploy guarantees new code never runs against the old schema — the failure
-  # mode that fired the agent-backup-parse-errors alert on 2026-07-22 (PR #51's migration 0013
-  # shipped but was never applied, so every ingest threw `D1_ERROR: no such column`). Gated on
-  # the hub tests, which apply every migration, so a broken migration never reaches prod. A
-  # shared concurrency group plus a current-main check prevents an older run approved later from
-  # overwriting the Worker with stale code.
-  # CLOUDFLARE_MIGRATION_TOKEN is D1 Edit only. CLOUDFLARE_DEPLOY_TOKEN has Workers Scripts,
-  # Queues, R2, and KV Edit plus Account Settings Read and Workers Routes Edit on pedrovc.com.br
-  # (re-scoped from vza.net on 2026-09-02 - see infra/cf/hostname-cutover.md §8.3).
+  # Sole production control plane. Index shards are created/migrated first; the main D1
+  # cannot afford even checksum-ledger writes until verified copies free source pages.
+  # Exact-revision maintenance, detached queue consumers and a durable 16-minute drain
+  # gate precede bounded full-column copy/readback/delete. Abort leaves maintenance; a
+  # later protected main run resumes from IDX00, never from an ephemeral runner journal.
+  # D1 Create/Read/Write stays on CLOUDFLARE_MIGRATION_TOKEN, not the Worker deploy token.
   deploy:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: hub
     runs-on: ubuntu-latest
     environment: production
+    timeout-minutes: 360
+    env:
+      PROTECTED_PRODUCTION_MIGRATION: "1"
+      CLOUDFLARE_ACCOUNT_ID: "18ef3246e9f36d1560485ef53889c0ab"
     concurrency:
       group: production-deploy
       cancel-in-progress: false
@@ -246,6 +247,8 @@ jobs:
         working-directory: hub
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 22.22.2
@@ -262,29 +265,117 @@ jobs:
             echo "Refusing stale deployment: run=$GITHUB_SHA current=$current_head" >&2
             exit 1
           fi
-      - name: Apply and verify production migrations exactly once
+      - name: Provision immutable production index bindings
+        id: index-provision
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
+        run: >-
+          node ../infra/cf/index-control.mjs provision --target production
+          --config wrangler.jsonc
+          --output "$RUNNER_TEMP/index-maintenance.json"
+          --active-output "$RUNNER_TEMP/index-active.json"
+      - name: Apply schema and ledger only to index shards
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
         run: |
           set -euo pipefail
-          artifact_digest="$(git archive --format=tar HEAD migrations | sha256sum | cut -d ' ' -f 1)"
-          node scripts/migrations.mjs apply \
-            --target production \
-            --config wrangler.jsonc \
-            --database sessions-index \
-            --journal "$RUNNER_TEMP/production-migration-${GITHUB_SHA}.json" \
-            --artifact-digest "$artifact_digest" \
-            --deployment-id "production:${GITHUB_SHA}" \
-            --base-manifest migrations/source-baseline.json \
-            --history migrations/historical-baseline.json
+          artifact_digest="$(git archive --format=tar HEAD migrations migrations-index | sha256sum | cut -d ' ' -f 1)"
+          for index in $(seq -w 0 15); do
+            node scripts/migrations.mjs apply \
+              --target production \
+              --config "$RUNNER_TEMP/index-maintenance.json" \
+              --database "IDX${index}" \
+              --migrations-dir migrations-index \
+              --journal "$RUNNER_TEMP/production-IDX${index}-${GITHUB_SHA}.json" \
+              --artifact-digest "$artifact_digest" \
+              --deployment-id "production:${GITHUB_SHA}:IDX${index}" \
+              --base-manifest migrations-index/source-baseline.json
+          done
+          node ../infra/cf/index-control.mjs initialize --config "$RUNNER_TEMP/index-maintenance.json"
+      - name: Classify the durable index layout
+        id: index-layout
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
+        run: >-
+          node ../infra/cf/index-control.mjs state
+          --config "$RUNNER_TEMP/index-maintenance.json"
+          --github-output "$GITHUB_OUTPUT"
       - name: Ensure dedicated production rollup queue
         run: node ../infra/cf/provision-queues.mjs --target production
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
-      - name: Deploy production hub
-        # `--env=""` selects the TOP-LEVEL environment explicitly. wrangler.jsonc also defines
-        # the `preview` environment, and with several environments present an unqualified
-        # `deploy` only warns before defaulting here — this states production outright.
-        run: npx wrangler deploy --config wrangler.jsonc --env=""
+      - name: Pause production queue consumers without draining messages
+        id: index-pause
+        if: steps.index-layout.outputs.layout_state != 'active'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
+        run: node ../infra/cf/index-control.mjs pause-consumers --config "$RUNNER_TEMP/index-active.json"
+      - name: Deploy exact maintenance revision
+        if: steps.index-layout.outputs.layout_state != 'active'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
+        run: npx wrangler deploy --config "$RUNNER_TEMP/index-maintenance.json" --env=""
+      - name: Verify maintenance revision and drain old queues and crons
+        if: steps.index-layout.outputs.layout_state != 'active'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
+        run: |
+          node ../infra/cf/index-control.mjs health --config "$RUNNER_TEMP/index-maintenance.json" --mode maintenance
+          node ../infra/cf/index-control.mjs drain --config "$RUNNER_TEMP/index-maintenance.json"
+      - name: Resume full-fidelity copy and verified source deletion
+        if: steps.index-layout.outputs.layout_state != 'active'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
+        run: node ../infra/cf/index-control.mjs copy --config "$RUNNER_TEMP/index-maintenance.json"
+      - name: Apply and verify main migrations after any required source copy
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
+        run: |
+          set -euo pipefail
+          artifact_digest="$(git archive --format=tar HEAD migrations migrations-index | sha256sum | cut -d ' ' -f 1)"
+          node scripts/migrations.mjs apply \
+            --target production \
+            --config "$RUNNER_TEMP/index-maintenance.json" \
+            --database DB \
+            --journal "$RUNNER_TEMP/production-DB-${GITHUB_SHA}.json" \
+            --artifact-digest "$artifact_digest" \
+            --deployment-id "production:${GITHUB_SHA}:DB" \
+            --base-manifest migrations/source-baseline.json \
+            --history migrations/historical-baseline.json
+      - name: Seed and readback-verify the complete session and star catalogs
+        if: steps.index-layout.outputs.layout_state != 'active'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
+        run: |
+          node ../infra/cf/index-control.mjs seed-catalog --config "$RUNNER_TEMP/index-maintenance.json"
+          node ../infra/cf/index-control.mjs ready --config "$RUNNER_TEMP/index-maintenance.json"
+      - name: Reject a stale activation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          current_head="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq '.object.sha')"
+          if [[ "$current_head" != "$GITHUB_SHA" ]]; then
+            echo "Main advanced during maintenance; retain the freeze for the next protected run." >&2
+            exit 1
+          fi
+      - name: Deploy active revision and restore queue consumers
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
+        run: npx wrangler deploy --config "$RUNNER_TEMP/index-active.json" --env=""
+      - name: Verify active revision, shard SQL and viewer login
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
+        run: |
+          node ../infra/cf/index-control.mjs health --config "$RUNNER_TEMP/index-active.json" --mode active
+          node ../infra/cf/index-control.mjs reconcile-catalog --config "$RUNNER_TEMP/index-active.json"
+          node ../infra/cf/index-control.mjs verify-active --config "$RUNNER_TEMP/index-active.json"
+      - name: Fail closed after an interrupted or failed cutover
+        if: ${{ always() && (failure() || cancelled()) && steps.index-provision.outcome == 'success' && steps.index-layout.outputs.layout_state != 'active' && (steps.index-pause.outcome == 'success' || steps.index-pause.outcome == 'failure' || steps.index-pause.outcome == 'cancelled') }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
+        run: |
+          pause_status=0
+          node ../infra/cf/index-control.mjs pause-consumers --config "$RUNNER_TEMP/index-active.json" || pause_status=$?
+          npx wrangler deploy --config "$RUNNER_TEMP/index-maintenance.json" --env=""
+          exit "$pause_status"

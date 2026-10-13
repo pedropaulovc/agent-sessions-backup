@@ -9,6 +9,8 @@ import { deriveProjectName } from '../project-name';
 import { refreshSessionCostStatement } from '../session-cost';
 import { computeFirstInteractionTitle, type TitleBlock } from '../session-title';
 import { turnFallbackKeyOf, turnKeyOf } from '../turn-key';
+import { assertIndexLayout, claimIndexWrite, indexDbFor, indexWriteFence, IndexWriteSupersededError, reserveBlockIds } from '../index-shards';
+import { sessionCatalogSyncSubrequests, syncSessionCatalog } from '../session-catalog';
 
 interface FileRow {
   id: number;
@@ -25,6 +27,52 @@ interface FileRow {
   reserved_at: string | null;
   reserved_by: number | null;
   reservation_generation: number;
+}
+
+interface ExportFileRow extends FileRow {
+  /** Generations this delivery observed or wrote; rollback must not reset a newer writer. */
+  readyGenerations: Map<string, string | null>;
+}
+
+type WrittenSessions = Map<string, string>;
+
+interface ParseAttempt {
+  written: WrittenSessions;
+  sourceHash?: string;
+}
+
+/** The main generation and the exact source revision must both still belong to this writer. */
+function mainWriteGuard(sessionParam: number, generationParam: number, fileParam: number, hashParam: number): string {
+  return `EXISTS (SELECT 1 FROM session_rollup_state
+    WHERE session_id = ?${sessionParam} AND generation = ?${generationParam})
+    AND EXISTS (SELECT 1 FROM files WHERE id = ?${fileParam} AND content_hash = ?${hashParam})`;
+}
+
+/** Committed data remains valid when catalog propagation fails. The durable outbox and queue
+ * reconcile it; search fails closed meanwhile instead of reparsing a good transcript. */
+async function syncCommittedCatalog(env: Env, sessionIds: readonly string[], maxSubrequests = 64): Promise<number> {
+  if (sessionIds.length === 0) return 0;
+  let spent: number;
+  let pending: boolean;
+  try {
+    const synced = await syncSessionCatalog(env, sessionIds, { maxSubrequests });
+    spent = synced.subrequests;
+    pending = synced.state === 'pending';
+  } catch (error) {
+    console.error(JSON.stringify({ event: 'hub.index_catalog.sync_failed', error: String(error) }));
+    // Partial propagation has unknown spend. Defer the rest of this invocation, never rewrite
+    // successfully committed transcript data just because its catalog propagation failed.
+    spent = Math.max(INVOCATION_SUBREQUEST_BUDGET, EXPORT_QUERY_BUDGET);
+    pending = true;
+  }
+  if (pending) {
+    try {
+      await env.ROLLUP_QUEUE.send({ kind: 'index-catalog' });
+    } catch (queueError) {
+      console.error(JSON.stringify({ event: 'hub.index_catalog.enqueue_failed', error: String(queueError) }));
+    }
+  }
+  return spent;
 }
 
 /** Thrown by an export parse to signal a RETRYABLE (transient) failure: any throw out of an export parse
@@ -68,6 +116,7 @@ function isTransientD1Error(e: unknown): boolean {
 }
 
 export async function consumeParseBatch(batch: Pick<MessageBatch<ParseMessage>, 'messages'>, env: Env): Promise<void> {
+  await assertIndexLayout(env);
   // worker.queue never enters this function after debug work in the same invocation: mixed
   // deliveries are freshly re-enqueued there, so this budget starts at zero only for parse-only work.
   // The ~1000-per-invocation D1 cap is shared across the WHOLE batch (wrangler max_batch_size:5), so we
@@ -117,8 +166,11 @@ export async function consumeParseBatch(batch: Pick<MessageBatch<ParseMessage>, 
       }
       invocationSpent += NORMAL_RESERVE; // reserve worst-case on ATTEMPT, before any work
     }
+    const parseBudget = Math.max(0, INVOCATION_SUBREQUEST_BUDGET - invocationSpent
+      + (isExport ? EXPORT_QUERY_BUDGET : NORMAL_RESERVE));
+    const attempt: ParseAttempt = { written: new Map() };
     try {
-      const spent = await parseOne(msg.body, env);
+      const spent = await parseOne(msg.body, env, attempt, parseBudget);
       msg.ack();
       if (!isExport) {
         invocationSpent += spent - NORMAL_RESERVE; // release the up-front reserve, charge the ACTUAL cost
@@ -136,6 +188,12 @@ export async function consumeParseBatch(batch: Pick<MessageBatch<ParseMessage>, 
         // an owner-tagged reservation deferral deliberately leaves it 'reserved'. Do NOT markError in either
         // case: retry the exact message/capability. Even if retries exhaust to the DLQ, the non-terminal row
         // remains visible to pipeline-stuck alerts and the files/check healing path.
+        msg.retry();
+        continue;
+      }
+      if (e instanceof IndexWriteSupersededError) {
+        // A newer generation owns the shard; retry source/canonical selection, not its error flip.
+        console.log(JSON.stringify({ event: 'parse.superseded_write', file_id: msg.body.file_id }));
         msg.retry();
         continue;
       }
@@ -157,12 +215,13 @@ export async function consumeParseBatch(batch: Pick<MessageBatch<ParseMessage>, 
       // Without this guard, a slow/retried stale delivery throwing (e.g. r2_object_missing on an
       // R2 key a re-upload since overwrote) could flip a row the fresh parse already marked
       // 'parsed' back to 'error', or race the fresh parse's own writes.
-      const guarded = msg.body.content_hash !== undefined;
+      const sourceHash = msg.body.content_hash ?? attempt.sourceHash;
+      const guarded = sourceHash !== undefined;
       const errStmt = env.DB.prepare(
         `UPDATE files SET parse_state = 'error', parse_error = ?2 WHERE id = ?1${guarded ? ' AND content_hash = ?3' : ''}`,
       );
       const errUpdate = await (guarded
-        ? errStmt.bind(msg.body.file_id, String(e).slice(0, 2000), msg.body.content_hash)
+        ? errStmt.bind(msg.body.file_id, String(e).slice(0, 2000), sourceHash)
         : errStmt.bind(msg.body.file_id, String(e).slice(0, 2000))
       ).run();
       if (guarded && (errUpdate.meta?.changes ?? 0) === 0) {
@@ -194,11 +253,16 @@ export async function consumeParseBatch(batch: Pick<MessageBatch<ParseMessage>, 
       if (fileRow) {
         const updated = await env.DB.prepare(
           `UPDATE sessions SET index_state = 'error'
-           WHERE session_id = ?1 AND (canonical_file_id IS NULL OR canonical_file_id = ?2)
+           WHERE session_id = ?1
+             AND ((?3 IS NULL AND (canonical_file_id IS NULL OR canonical_file_id = ?2))
+               OR EXISTS (SELECT 1 FROM session_rollup_state WHERE session_id = ?1 AND generation = ?3))
+             ${guarded ? 'AND EXISTS (SELECT 1 FROM files WHERE id = ?2 AND content_hash = ?4)' : ''}
            RETURNING session_id`,
         )
-          .bind(fileRow.session_id, msg.body.file_id)
+          .bind(fileRow.session_id, msg.body.file_id, attempt.written.get(fileRow.session_id) ?? null,
+            ...(guarded ? [sourceHash] : []))
           .first<{ session_id: string }>();
+        if (updated) await syncCommittedCatalog(env, [fileRow.session_id], 0);
         // A recovery-kicked duplicate (reason: 'recover') failing does NOT match the guard above:
         // canonical_file_id still points at the session's ORIGINAL canonical file until some
         // recovery attempt actually succeeds, so this predicate would otherwise halt the chain the
@@ -300,13 +364,14 @@ function isExportArchiveKey(r2Key: string): boolean {
 // so consumeParseBatch can hold a single invocation-wide budget across every message in the batch (see
 // INVOCATION_SUBREQUEST_BUDGET). The count is dominated by writeSession / parseExportInto; the surrounding
 // lookups/guards are folded in as small fixed terms — precision isn't needed, the budget is a coarse gate.
-async function parseOne(job: ParseMessage, env: Env): Promise<number> {
+async function parseOne(job: ParseMessage, env: Env, attempt: ParseAttempt, budget: number): Promise<number> {
   const file = await env.DB.prepare(
     'SELECT id, machine_id, store, relpath, r2_key, size, mtime, harness, session_id, content_hash, parse_state, reserved_at, reserved_by, reservation_generation FROM files WHERE id = ?1',
   )
     .bind(job.file_id)
     .first<FileRow>();
   if (!file) return 1;
+  attempt.sourceHash = file.content_hash;
 
   // Consume-time reservation guard (round 15, 3608955874): a row a live export cleanup has FRESH-reserved
   // must be re-parsed ONLY by that cleanup's owner-tagged send-late message. A redundant queued 'upload'/'files-check'/
@@ -373,9 +438,9 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
   const det = detect(file.store, file.relpath, file.machine_id);
 
   if (det.kind === 'subagent-meta') {
-    await linkSubagentMeta(file, env);
-    await markParsed(file.id, env, 'parsed', undefined, undefined, job.content_hash);
-    return 4;
+    const linked = await linkSubagentMeta(file, env, Math.max(0, budget - 3));
+    await markParsed(file.id, env, 'parsed', undefined, undefined, file.content_hash);
+    return 3 + linked;
   }
   if (det.kind === 'export-archive') {
     // A 'send-late' continuation (round 15, 3608955881) resumes ONLY the recover fan-out from the carried
@@ -448,7 +513,8 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
     // one exists — remains free to become or stay canonical.
     const state = parsed.stats.parseErrorLines > 0 ? 'error' : 'skipped';
     const parseError = state === 'error' ? `empty_parse:${parsed.stats.parseErrorLines}/${parsed.stats.lines} lines malformed` : null;
-    const { updated } = await markParsed(file.id, env, state, file.size, parseError, job.content_hash);
+    let cleanupSpent = 0;
+    const { updated } = await markParsed(file.id, env, state, file.size, parseError, file.content_hash);
     // A re-upload can change this row's content_hash while this parse was reading the OLD R2
     // body. If the row no longer matches the hash this message was enqueued for, a fresher
     // message already re-enqueued the new content — leave everything else alone.
@@ -463,34 +529,10 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
         // actually-parseable content — now stale, since the current bytes produced nothing.
         // Clear the derived rows (keep the sessions row itself so facets/raw access still
         // resolve) and mark the session errored.
-        const clearStatements = [
-          env.DB.prepare(
-            `INSERT INTO blocks_fts (blocks_fts, rowid, text) SELECT 'delete', id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL`,
-          ).bind(det.sessionId),
-          env.DB.prepare('DELETE FROM blocks WHERE session_id = ?1').bind(det.sessionId),
-          env.DB.prepare('DELETE FROM usage WHERE session_id = ?1').bind(det.sessionId),
-          // Clear the derived title alongside the blocks it was computed from — otherwise listings,
-          // search metadata, and the detail header keep showing the stale title of the now-deleted
-          // index (the old query-time derivation returned null once the blocks were gone).
-          env.DB.prepare("UPDATE sessions SET index_state = 'error', first_interaction_title = NULL WHERE session_id = ?1").bind(det.sessionId),
-          // The usage rows just went; the stored cost subtotal is a cache of them and must follow
-          // in the same batch, or the list keeps sorting this session by a nonzero cost that no
-          // row backs. Only the ingest paths that CHANGE usage rows refresh it — the sessions-row
-          // delete in the reconciliation path removes the subtotal with the row and needs nothing.
-          refreshSessionCostStatement(env.DB, [det.sessionId]),
-        ];
         const sourceComplete =
           parsed.stats.parseErrorLines === 0 && (parsed.stats.skippedLineTypes['oversized-line'] ?? 0) === 0;
-        if (sourceComplete) {
-          clearStatements.push(
-            env.DB.prepare(
-              `DELETE FROM starred_turns
-               WHERE session_id = ?1
-                 AND EXISTS (SELECT 1 FROM files source WHERE source.id = ?2 AND source.content_hash = ?3)`,
-            ).bind(det.sessionId, file.id, file.content_hash),
-          );
-        }
-        await env.DB.batch(clearStatements);
+        cleanupSpent += await clearSessionDerived(det.sessionId, file, env, false, sourceComplete, file.content_hash, attempt.written);
+        cleanupSpent += await syncCommittedCatalog(env, [det.sessionId], Math.max(0, budget - 10 - cleanupSpent));
       }
       // A recovery-kicked duplicate (reason: 'recover') parsing to zero turns instead of throwing
       // doesn't match the canonical check above: canonical_file_id still points at the session's
@@ -510,7 +552,7 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
         if (recovery) await markPendingAndEnqueue(recovery, 'recover', env, { force: true });
       }
     }
-    return 10;
+    return 10 + cleanupSpent;
   }
 
   // The sibling .meta.json may have already been parsed (and found no sessions row yet,
@@ -554,34 +596,28 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
     if (recheck?.content_hash !== job.content_hash) return 6;
   }
 
-  await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(det.sessionId).run();
-  const wrote = await writeSession(parsed, file, env);
-  // Guarded by content_hash: if a re-upload changed this row's hash while writeSession above was
-  // running off the OLD R2 body, don't claim 'parsed' for content that's no longer current — the
-  // newer upload already enqueued its own fresh parse. The stale write to sessions/blocks/usage
-  // above is superseded moments later when that fresh parse completes (writeSession is a full
-  // delete+reinsert per session_id), so it's a harmless transient rather than a lasting error.
-  const { updated } = await markParsed(file.id, env, 'parsed', file.size, undefined, job.content_hash);
+  const written = attempt.written;
+  const wrote = await writeSession(parsed, file, env, written);
+  // The ready upsert checked the source atomically; markParsed covers the later window too.
+  const { updated } = await markParsed(file.id, env, 'parsed', file.size, undefined, file.content_hash,
+    { sessionId: det.sessionId, generation: written.get(det.sessionId)! });
   if (!updated) {
-    // The recheck above passed, but the row moved on during writeSession itself (R2 read /
-    // insert-heavy write can take a while). writeSession unconditionally just wrote this file's
-    // OLD content and flipped index_state to 'ready' (see writeSession's ON CONFLICT clause) —
-    // belt-and-braces: flip it back to 'parsing' so the session doesn't advertise stale content
-    // as ready while the fresh message (which owns this row now) does its own rewrite. Safe to
-    // do unconditionally: the parse queue runs with max_concurrency: 1 (wrangler.jsonc), so the
-    // fresh message's own parseOne cannot be running concurrently with this one — it hasn't had
-    // a chance to write its own 'ready' yet, so there's nothing legitimate to clobber here.
-    await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(det.sessionId).run();
-    return 8 + wrote;
+    await revertSlice(written, env);
+    const catalogSpent = await syncCommittedCatalog(env, [det.sessionId], Math.max(0, budget - 11 - wrote));
+    return 8 + wrote + catalogSpent;
   }
   // The recheck above already proved nothing PARSED outranks this file, so it's safe to claim the
   // supersede-others role unconditionally here (max_concurrency: 1 means nothing else could have
   // become 'parsed' in between). A worse-priority file that wrote because the preferred copy was
   // still unparsed must not claim that role — the preferred copy supersedes this one itself once
   // IT completes and runs its own recheck; that's exactly the case the recheck above filters out.
-  await env.DB.prepare("UPDATE files SET parse_state = 'superseded' WHERE session_id = ?1 AND id != ?2 AND parse_state = 'parsed'")
-    .bind(det.sessionId, file.id)
+  await env.DB.prepare(`UPDATE files SET parse_state = 'superseded'
+    WHERE session_id = ?1 AND id != ?2 AND parse_state = 'parsed'
+      AND ${mainWriteGuard(1, 3, 2, 4)}
+      AND EXISTS (SELECT 1 FROM sessions WHERE session_id = ?1 AND canonical_file_id = ?2 AND index_state = 'ready')`)
+    .bind(det.sessionId, file.id, written.get(det.sessionId), file.content_hash)
     .run();
+  const catalogSpent = await syncCommittedCatalog(env, [det.sessionId], Math.max(0, budget - 11 - wrote));
 
   console.log(
     JSON.stringify({
@@ -595,7 +631,7 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
       skipped: parsed.stats.skippedLineTypes,
     }),
   );
-  return 11 + wrote;
+  return 11 + wrote + catalogSpent;
 }
 
 /**
@@ -621,7 +657,7 @@ async function parseOne(job: ParseMessage, env: Env): Promise<number> {
 const FLIP_BATCH_CHUNK = 90;
 
 async function failExportFile(
-  file: FileRow,
+  file: ExportFileRow,
   env: Env,
   contentHash: string | undefined,
   errorLabel: string,
@@ -731,9 +767,14 @@ async function failExportFile(
   // so ~950 owned rows cost ~11 subrequests rather than one .run() each.
   for (let i = 0; i < owned.results.length; i += FLIP_BATCH_CHUNK) {
     const chunk = owned.results.slice(i, i + FLIP_BATCH_CHUNK);
-    await env.DB.batch(chunk.map(({ session_id }) => env.DB.prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1").bind(session_id)));
+    await env.DB.batch(chunk.map(({ session_id }) => env.DB.prepare(`UPDATE sessions SET index_state = 'error'
+      WHERE session_id = ?1 AND canonical_file_id = ?2
+        AND EXISTS (SELECT 1 FROM files WHERE id = ?2 AND content_hash = ?3)
+        AND ?4 IS (SELECT generation FROM session_rollup_state WHERE session_id = ?1)`)
+      .bind(session_id, file.id, contentHash ?? file.content_hash, file.readyGenerations.get(session_id) ?? null)));
     spent += 1;
   }
+  spent += await syncCommittedCatalog(env, owned.results.map((row) => row.session_id), Math.max(0, EXPORT_QUERY_BUDGET - spent));
   // SEND-LATE (round 12): fan out recover messages to exactly the 'reserved' siblings via the SAME helper —
   // paged, failed sends charged to budget, aborting after EXPORT_SEND_FAILURE_LIMIT consecutive failures. A
   // reserved sibling holds a conversation this errored file owned; its recover parse re-claims it. Recheck
@@ -810,18 +851,19 @@ export function __setExportBudgetsForTest(o: { slice?: number; invocation?: numb
   if (o.kickPage !== undefined) EXPORT_KICK_PAGE = o.kickPage;
 }
 
-/** Real per-invocation SUBREQUEST cost of writeSession WITHOUT writing (each db.batch is ONE subrequest):
- * delete batch (1) + ceil(rows/90) insert batches + machine SELECT (1) + session/FTS batch (1), where
- * rows = one per block / compaction marker / usage row. Lets the export slicer preflight a conversation.
- * No prefix probe: the export call site passes retention 'off' precisely so this estimate stays exact. */
+/** Base per-conversation D1 cost, excluding the one catalog sync shared by an export slice.
+ * Main invalidation, usage clear, shard fence claim + clear, machine read, fence check, and
+ * finalization cost seven calls; new blocks add an allocator call and separate insert batches.
+ * Export retention is off, so there are no prefix probes. */
 function estimateWriteSubrequests(s: NormalizedSession): number {
-  let rows = 0;
+  let blocks = 0;
+  let usage = 0;
   for (const turn of s.turns) {
-    rows += turn.blocks.length;
-    if (turn.blocks.length === 0 && turn.compaction && turn.byteStart !== undefined && turn.byteLen !== undefined) rows += 1;
-    if (turn.usage) rows += 1;
+    blocks += turn.blocks.length;
+    if (turn.blocks.length === 0 && turn.compaction && turn.byteStart !== undefined && turn.byteLen !== undefined) blocks++;
+    if (turn.usage) usage++;
   }
-  return 3 + Math.ceil(rows / 90);
+  return 7 + (blocks > 0 ? 1 : 0) + Math.ceil(blocks / 90) + Math.ceil(usage / 90);
 }
 
 /** True only when the current owner archive is STRICTLY newer than ours by file mtime. Equal, NULL, or
@@ -855,9 +897,15 @@ async function parseExportInto(
   reservationCount = 0,
   reservationDelivery: ReservationDelivery = null,
 ): Promise<number> {
-  const written = new Set<string>();
+  const written: WrittenSessions = new Map();
   try {
-    return await runExportParse(file, env, reason, contentHash, offset, cleanupCursor, cleanupPhase, kickCursor, reservationCount, written, reservationDelivery);
+    const owned = await env.DB.prepare(`SELECT s.session_id, st.generation FROM sessions s
+      LEFT JOIN session_rollup_state st USING (session_id) WHERE s.canonical_file_id = ?1`)
+      .bind(file.id).all<{ session_id: string; generation: string | null }>();
+    const exportFile: ExportFileRow = {
+      ...file, readyGenerations: new Map(owned.results.map((row) => [row.session_id, row.generation])),
+    };
+    return 1 + await runExportParse(exportFile, env, reason, contentHash, offset, cleanupCursor, cleanupPhase, kickCursor, reservationCount, written, reservationDelivery);
   } catch (e) {
     if (e instanceof ExportRetry) throw e; // raising site already reverted + restored retryable state; pass through
     return await raiseExportRetry(file, env, written, contentHash, e, reservationDelivery);
@@ -865,7 +913,7 @@ async function parseExportInto(
 }
 
 async function runExportParse(
-  file: FileRow,
+  file: ExportFileRow,
   env: Env,
   reason: ParseMessage['reason'],
   contentHash: string | undefined,
@@ -874,7 +922,7 @@ async function runExportParse(
   cleanupPhase: ParseMessage['cleanup_phase'],
   kickCursor: number | undefined,
   reservationCount: number,
-  written: Set<string>,
+  written: WrittenSessions,
   reservationDelivery: ReservationDelivery,
 ): Promise<number> {
   const obj = await env.RAW.get(file.r2_key);
@@ -930,6 +978,13 @@ async function runExportParse(
   // half-written conversation 'ready', never reverting earlier slices a same-offset retry won't rewrite.
   const maxEnd = Math.min(offset + EXPORT_MAX_CONVERSATIONS_PER_SLICE, archive.sessions.length);
   let spent = 0;
+  const catalogChanged = new Set<string>();
+  const syncChangedCatalog = async (): Promise<void> => {
+    if (catalogChanged.size === 0) return;
+    const ids = [...catalogChanged];
+    spent += await syncCommittedCatalog(env, ids, Math.max(0, EXPORT_QUERY_BUDGET - spent));
+    catalogChanged.clear();
+  };
   let idx = offset;
   try {
     for (; idx < maxEnd; idx++) {
@@ -999,14 +1054,18 @@ async function runExportParse(
         // archive still marks parsed. Qualified by canonical_file_id, a row owned by another file is left
         // untouched (logged owned:false). Measured max export conversation is 304 blocks (~7 subrequests).
         const flip = await env.DB
-          .prepare("UPDATE sessions SET index_state = 'error' WHERE session_id = ?1 AND canonical_file_id = ?2 RETURNING session_id")
-          .bind(session.id, file.id)
+          .prepare(`UPDATE sessions SET index_state = 'error' WHERE session_id = ?1 AND canonical_file_id = ?2
+            AND EXISTS (SELECT 1 FROM files WHERE id = ?2 AND content_hash = ?3)
+            AND ?4 IS (SELECT generation FROM session_rollup_state WHERE session_id = ?1) RETURNING session_id`)
+          .bind(session.id, file.id, file.content_hash, file.readyGenerations.get(session.id) ?? null)
           .first<{ session_id: string }>();
         spent += 1;
+        if (flip) catalogChanged.add(session.id);
         console.log(JSON.stringify({ event: 'parse.export.oversized_conversation', file_id: file.id, session: session.id, est_subrequests: estSubreq, owned: flip !== null }));
         continue;
       }
-      if (spentBefore > 0 && (estSubreq > EXPORT_OVERSIZED_CEILING || spent + estSubreq > EXPORT_QUERY_BUDGET)) {
+      const projectedCatalog = sessionCatalogSyncSubrequests(env, catalogChanged.size + (catalogChanged.has(session.id) ? 0 : 1));
+      if (spentBefore > 0 && (estSubreq > EXPORT_OVERSIZED_CEILING || spent + estSubreq + projectedCatalog > EXPORT_QUERY_BUDGET)) {
         // Cut BEFORE writing this conversation, deferring it to the next invocation, when EITHER:
         //  - it is oversized (> CEILING) and deserves its own invocation for cap headroom; OR
         //  - its estimated cost would push THIS slice's cumulative spend past the budget (3608782615). Two
@@ -1025,18 +1084,20 @@ async function runExportParse(
       // slice/superseded logs, and it's the exact set revertSlice reverts if a write throws — including the
       // in-flight conversation whose blocks are half-rewritten. The skip-paths above (empty / healthy live
       // capture / healthy other owner) return before this line, so they never enter `written`.
-      written.add(session.id);
+      catalogChanged.add(session.id);
       // 'off': an export writes each conversation once, so a prefix probe would buy nothing here — and
       // it would add a subrequest per conversation that estimateWriteSubrequests (and the slice arithmetic
       // built on it) would have to carry for every archive.
-      spent += await writeSession(session, file, env, 'off');
+      spent += await writeSession(session, file, env, written, 'off');
+      file.readyGenerations.set(session.id, written.get(session.id) ?? file.readyGenerations.get(session.id) ?? null);
       // Cut once the query budget is spent — but only AFTER writing this conversation, so a single
       // over-budget conversation still makes progress alone rather than looping forever.
-      if (spent >= EXPORT_QUERY_BUDGET) {
+      if (spent + sessionCatalogSyncSubrequests(env, catalogChanged.size) >= EXPORT_QUERY_BUDGET) {
         idx++;
         break;
       }
     }
+    await syncChangedCatalog();
   } catch (e) {
     // A transient D1 throw mid-slice. Revert THIS invocation's writes (the in-flight conversation + this
     // slice) and retry the same message at the same offset — NOT a whole-file revert, which would strand
@@ -1215,9 +1276,11 @@ async function runExportParse(
   // any delete. This is the round-6-finding-4 ordering in durable-'reserved'-state form: no session is
   // deleted until every overlapping sibling is at least 'reserved'. A clean re-parse (no stale) never reaches
   // the reserve branch, so it never touches a sibling.
-  const cleanupGuardSql = contentHash !== undefined ? ' AND EXISTS (SELECT 1 FROM files WHERE id = ?2 AND content_hash = ?3)' : '';
+  const cleanupGuardSql = ` AND canonical_file_id = ?2
+    AND EXISTS (SELECT 1 FROM files WHERE id = ?2 AND content_hash = ?3)
+    AND ?4 IS (SELECT generation FROM session_rollup_state WHERE session_id = ?1)`;
   const bindCleanup = (stmt: D1PreparedStatement, sessionId: string): D1PreparedStatement =>
-    contentHash !== undefined ? stmt.bind(sessionId, file.id, contentHash) : stmt.bind(sessionId);
+    stmt.bind(sessionId, file.id, contentHash ?? file.content_hash, file.readyGenerations.get(sessionId) ?? null);
   let cursor = phase === 'scan' ? '' : cleanupCursor ?? '';
   const recovered = new Set<string>();
   let cleanupComplete = false;
@@ -1235,7 +1298,7 @@ async function runExportParse(
     if (await supersededDuringCleanup(reserved ? 'cleanup-delete' : 'cleanup-scan', cursor)) return spent;
     let budgetHit = false;
     for (const { session_id } of page.results) {
-      if (spent >= EXPORT_QUERY_BUDGET) {
+      if (spent + sessionCatalogSyncSubrequests(env, catalogChanged.size) >= EXPORT_QUERY_BUDGET) {
         budgetHit = true;
         break;
       }
@@ -1297,22 +1360,12 @@ async function runExportParse(
       }
       cursor = session_id; // advance past a reconciled row (decided)
       if (archive.skipped === 0) {
-        await env.DB.batch([
-          bindCleanup(
-            env.DB.prepare(
-              `INSERT INTO blocks_fts (blocks_fts, rowid, text) SELECT 'delete', id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL${cleanupGuardSql}`,
-            ),
-            session_id,
-          ),
-          bindCleanup(env.DB.prepare(`DELETE FROM blocks WHERE session_id = ?1${cleanupGuardSql}`), session_id),
-          bindCleanup(env.DB.prepare(`DELETE FROM usage WHERE session_id = ?1${cleanupGuardSql}`), session_id),
-          bindCleanup(env.DB.prepare(`DELETE FROM sessions WHERE session_id = ?1${cleanupGuardSql}`), session_id),
-        ]);
-        spent += 1; // one db.batch = one subrequest, regardless of the 4 statements inside it
+        spent += await clearSessionDerived(session_id, file, env, true, false, contentHash ?? file.content_hash, written);
       } else {
         await bindCleanup(env.DB.prepare(`UPDATE sessions SET index_state = 'error' WHERE session_id = ?1${cleanupGuardSql}`), session_id).run();
         spent += 1;
       }
+      catalogChanged.add(session_id);
       recovered.add(session_id);
     }
     if (budgetHit) break;
@@ -1321,6 +1374,7 @@ async function runExportParse(
       break;
     }
   }
+  await syncChangedCatalog();
 
   // Cleanup exhausted the budget with rows still to scan/delete: re-enqueue a continuation preserving the
   // phase (still 'scan' if no stale has been found yet, else 'delete') and STOP — still WITHOUT markParsed,
@@ -1469,7 +1523,7 @@ async function releaseOwnedReservations(file: FileRow, env: Env): Promise<number
  * the subrequest cost, whether every sibling is now reserved, the advanced id cursor, and whether OUR file
  * was superseded mid-pass (a re-upload changed its bytes → reverted our 'ready' rows, caller must stop). */
 async function reserveSiblings(
-  file: FileRow,
+  file: ExportFileRow,
   env: Env,
   contentHash: string | undefined,
   kickCursor: number,
@@ -1711,22 +1765,24 @@ async function chooseRecoveryCandidate(
   return row ?? null;
 }
 
-async function linkSubagentMeta(file: FileRow, env: Env): Promise<void> {
+async function linkSubagentMeta(file: FileRow, env: Env, budget: number): Promise<number> {
   const obj = await env.RAW.get(file.r2_key);
-  if (!obj) return;
+  if (!obj) return 0;
+  let meta: { toolUseId?: string; agentType?: string };
   try {
-    const meta = (await obj.json()) as { toolUseId?: string; agentType?: string };
-    const agentId = file.relpath.split('/').pop()?.replace(/^agent-/, '').replace(/\.meta\.json$/, '');
-    if (agentId && meta.toolUseId) {
-      // No-op (0 rows) if the subagent transcript hasn't been parsed into a sessions row
-      // yet — that ordering is covered by the sibling-meta read in parseOne above instead.
-      await env.DB.prepare('UPDATE sessions SET parent_tool_use_id = ?2 WHERE session_id = ?1')
-        .bind(agentId, meta.toolUseId)
-        .run();
-    }
+    meta = (await obj.json()) as { toolUseId?: string; agentType?: string };
   } catch {
-    // Malformed meta is non-fatal; the transcript itself still indexes.
+    // Malformed meta is non-fatal; D1 failures must retry rather than be swallowed.
+    return 0;
   }
+  const agentId = file.relpath.split('/').pop()?.replace(/^agent-/, '').replace(/\.meta\.json$/, '');
+  if (agentId && meta.toolUseId) {
+    // No-op if the transcript has not created its main session metadata yet.
+    const updated = await env.DB.prepare('UPDATE sessions SET parent_tool_use_id = ?2 WHERE session_id = ?1')
+      .bind(agentId, meta.toolUseId).run();
+    return 1 + ((updated.meta.changes ?? 0) > 0 ? await syncCommittedCatalog(env, [agentId], Math.max(0, budget - 1)) : 0);
+  }
+  return 0;
 }
 
 /** Read the .meta.json sibling of a subagent transcript's r2_key (agent-X.jsonl -> agent-X.meta.json), if present. */
@@ -1758,6 +1814,7 @@ async function markParsed(
   parsedSize?: number,
   parseError?: string | null,
   requireContentHash?: string,
+  requireIndex?: { sessionId: string; generation: string },
 ): Promise<{ updated: boolean }> {
   const guarded = requireContentHash !== undefined;
   // Clear the reservation tuple as the row leaves 'reserved': its owner-tagged recover/upload parse ends here,
@@ -1765,13 +1822,15 @@ async function markParsed(
   // blocking new cleanups (contention probe) or being claimed by a stale send-late owner. A no-op for the common
   // case (already NULL).
   const sql = `UPDATE files SET parse_state = ?2, parsed_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), parsed_size = ?3, parse_error = ?4, reserved_at = NULL, reserved_by = NULL, reserved_reason = NULL
-     WHERE id = ?1${guarded ? ' AND content_hash = ?5' : ''}`;
-  const stmt = env.DB.prepare(sql);
-  const result = await (guarded
-    ? stmt.bind(fileId, state, parsedSize ?? null, parseError ?? null, requireContentHash)
-    : stmt.bind(fileId, state, parsedSize ?? null, parseError ?? null)
-  ).run();
-  return { updated: !guarded || (result.meta?.changes ?? 0) > 0 };
+     WHERE id = ?1${guarded ? ' AND content_hash = ?5' : ''}${requireIndex
+       ? ` AND EXISTS (SELECT 1 FROM sessions s JOIN session_rollup_state st USING (session_id)
+           WHERE s.session_id = ?6 AND st.generation = ?7 AND s.canonical_file_id = ?1 AND s.index_state = 'ready')`
+       : ''}`;
+  const params: unknown[] = [fileId, state, parsedSize ?? null, parseError ?? null];
+  if (guarded || requireIndex) params.push(requireContentHash ?? null);
+  if (requireIndex) params.push(requireIndex.sessionId, requireIndex.generation);
+  const result = await env.DB.prepare(sql).bind(...params).run();
+  return { updated: (!guarded && !requireIndex) || (result.meta?.changes ?? 0) > 0 };
 }
 
 /** Revert every 'ready' session this file is canonical for back to index_state='parsing', in ONE
@@ -1782,17 +1841,27 @@ async function markParsed(
  * searchable in the gap. NOT used on transient-throw paths — those retry the SAME message at the SAME
  * offset, which never rewrites earlier slices, so reverting them would strand valid rows (see revertSlice
  * / raiseExportRetry, round 6 finding 2). */
-async function revertOwnedReady(file: FileRow, env: Env): Promise<void> {
-  await env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE canonical_file_id = ?1 AND index_state = 'ready'").bind(file.id).run();
+async function revertOwnedReady(file: ExportFileRow, env: Env): Promise<void> {
+  // The snapshot includes previous export slices. A competing writer replaces its generation,
+  // so this old delivery cannot knock the newer complete index back to parsing.
+  // Separate values avoid a corpus-sized JSON bind overflowing D1's per-value limit.
+  const statements = [...file.readyGenerations].map(([sessionId, generation]) =>
+    env.DB.prepare(`UPDATE sessions SET index_state = 'parsing'
+      WHERE session_id = ?1 AND canonical_file_id = ?2 AND index_state = 'ready'
+        AND ?3 IS (SELECT generation FROM session_rollup_state WHERE session_id = ?1)`)
+      .bind(sessionId, file.id, generation));
+  if (statements.length > 0) await env.DB.batch(statements);
 }
 
 /** Revert ONLY the sessions THIS invocation wrote (its `written` set) back to 'parsing', batched (chunks
  * of 90) to stay within the subrequest budget. Used on transient-throw paths, where the SAME message
  * retries at the SAME offset and rewrites exactly this invocation's slice — so earlier slices (valid for
  * the current bytes, not in `written`, not rewritten by the retry) must be left 'ready'. */
-async function revertSlice(written: Set<string>, env: Env): Promise<void> {
+async function revertSlice(written: WrittenSessions, env: Env): Promise<void> {
   if (written.size === 0) return;
-  const stmts = [...written].map((id) => env.DB.prepare("UPDATE sessions SET index_state = 'parsing' WHERE session_id = ?1").bind(id));
+  const stmts = [...written].map(([id, generation]) => env.DB.prepare(`UPDATE sessions SET index_state = 'parsing'
+    WHERE session_id = ?1 AND EXISTS (SELECT 1 FROM session_rollup_state WHERE session_id = ?1 AND generation = ?2)`)
+    .bind(id, generation));
   for (const chunk of chunkArr(stmts, 90)) await env.DB.batch(chunk);
 }
 
@@ -1839,7 +1908,7 @@ async function forcePending(
 async function raiseExportRetry(
   file: FileRow,
   env: Env,
-  written: Set<string>,
+  written: WrittenSessions,
   contentHash: string | undefined,
   e: unknown,
   reservationDelivery: ReservationDelivery,
@@ -1858,6 +1927,87 @@ async function raiseExportRetry(
   throw new ExportRetry(String(e));
 }
 
+/** A lost fence changes no block/FTS rows. Check it in the same transaction as each page. */
+async function fencedIndexBatch(
+  db: D1Database,
+  statements: D1PreparedStatement[],
+  sessionId: string,
+  version: number,
+): Promise<D1Result[]> {
+  const results = await db.batch([
+    ...statements,
+    db.prepare('SELECT version FROM index_write_versions WHERE session_id = ?1 AND version = ?2')
+      .bind(sessionId, version),
+  ]);
+  if (results.at(-1)?.results.length !== 1) throw new IndexWriteSupersededError(`index_write_superseded:${sessionId}`);
+  return results;
+}
+
+/** Keep the main row until shard cleanup commits, making a crash rediscoverable by the same cursor.
+ * Main generation and monotonic shard fence prevent an older cleanup deleting a newer write. */
+async function clearSessionDerived(
+  sessionId: string,
+  file: FileRow,
+  env: Env,
+  removeSession: boolean,
+  clearStars: boolean,
+  contentHash: string,
+  written: WrittenSessions,
+): Promise<number> {
+  const db = env.DB;
+  const indexDb = indexDbFor(env, sessionId);
+  const generation = crypto.randomUUID();
+  written.set(sessionId, generation);
+  const sourceGuard = 'canonical_file_id = ?2 AND EXISTS (SELECT 1 FROM files WHERE id = ?2 AND content_hash = ?3)';
+  const started = await db.batch([
+    db.prepare(`UPDATE sessions SET index_state = '${removeSession ? 'parsing' : 'error'}'
+      ${removeSession ? '' : ', first_interaction_title = NULL'} WHERE session_id = ?1 AND ${sourceGuard}`)
+      .bind(sessionId, file.id, contentHash),
+    db.prepare(`INSERT INTO session_rollup_state (session_id, generation, eligible)
+      SELECT ?1, ?4, 0 WHERE EXISTS (SELECT 1 FROM sessions WHERE session_id = ?1 AND ${sourceGuard})`)
+      .bind(sessionId, file.id, contentHash, generation),
+    db.prepare('SELECT version FROM session_catalog_versions WHERE session_id = ?1').bind(sessionId),
+  ]);
+  if ((started[1]?.meta.changes ?? 0) === 0) return 1;
+  const captured = started[2]?.results[0] as { version: number } | undefined;
+  if (!captured || !Number.isSafeInteger(captured.version)) throw new Error(`missing_index_write_version:${sessionId}`);
+  const version = captured.version;
+  await claimIndexWrite(indexDb, sessionId, version);
+  await fencedIndexBatch(indexDb, [
+    indexDb.prepare(`INSERT INTO blocks_fts (blocks_fts, rowid, text)
+      SELECT 'delete', id, text FROM blocks
+      WHERE session_id = ?1 AND text IS NOT NULL AND ${indexWriteFence(1, 2)}`)
+      .bind(sessionId, version),
+    indexDb.prepare(`DELETE FROM blocks WHERE session_id = ?1 AND ${indexWriteFence(1, 2)}`)
+      .bind(sessionId, version),
+  ], sessionId, version);
+  const fence = await indexDb.prepare('SELECT version FROM index_write_versions WHERE session_id = ?1 AND version = ?2')
+    .bind(sessionId, version).first<{ version: number }>();
+  if (!fence) throw new IndexWriteSupersededError(`index_write_superseded:${sessionId}`);
+  const guard = `${mainWriteGuard(1, 2, 3, 4)}
+    AND EXISTS (SELECT 1 FROM sessions WHERE session_id = ?1 AND canonical_file_id = ?3)`;
+  const committed = [
+    db.prepare(`DELETE FROM usage WHERE session_id = ?1 AND ${guard}`)
+      .bind(sessionId, generation, file.id, contentHash),
+  ];
+  if (removeSession) {
+    committed.push(db.prepare(`DELETE FROM sessions WHERE session_id = ?1 AND ${guard}`)
+      .bind(sessionId, generation, file.id, contentHash));
+  } else {
+    if (clearStars) {
+      committed.push(db.prepare(`DELETE FROM starred_turns WHERE session_id = ?1 AND ${guard}`)
+        .bind(sessionId, generation, file.id, contentHash));
+    }
+    committed.push(
+      refreshSessionCostStatement(db, [sessionId]),
+      db.prepare(`DELETE FROM session_rollup_state WHERE session_id = ?1 AND ${guard}`)
+        .bind(sessionId, generation, file.id, contentHash),
+    );
+  }
+  await db.batch(committed);
+  return 5;
+}
+
 /** Replace a session's index rows atomically-enough: FTS delete → blocks delete → reinsert → FTS
  * rebuild from blocks. Returns the number of D1 SUBREQUESTS it issued (one per db.batch / .first / .run
  * call) so the export slicer can budget by the ACTUAL per-invocation limit.
@@ -1865,45 +2015,72 @@ async function raiseExportRetry(
  * COUNTING MODEL — the ~1000/invocation cap counts SUBREQUESTS, not SQL statements: a `db.batch([...])`
  * of any size is ONE subrequest (a single round trip). Positive control (measured 2026-07-18, prod
  * `sessions-index`): a claude-code session (id shape aaaaaaaa-…) with 7,686 blocks — ≈7,692 STATEMENTS
- * but only ≈89 batches/SUBREQUESTS — exists fully, written atomically by ONE writeSession invocation;
+ * but only ≈89 batches/SUBREQUESTS — existed fully after ONE legacy writeSession invocation;
  * that is impossible under a 1,000-STATEMENT cap, so the statement-cap model is falsified. Corroboration:
  * the original export under-produced at ~245 conversations (~5 subrequests each ≈ 1,000), and PR #14's
- * 1101 was fixed by BATCHING unbatched per-object writes (fewer subrequests). So cost = delete batch (1)
- * + one batch per 90-block insert chunk + machine SELECT (1) + session/FTS batch (1). See
- * memory/d1-invocation-limits.md. */
+ * 1101 was fixed by BATCHING unbatched per-object writes (fewer subrequests). Sharded writes now
+ * also invalidate main, claim/check the shard fence, and keep usage batches on main;
+ * the bounded export estimator and this function both count those round trips. */
 async function writeSession(
   s: NormalizedSession,
   file: FileRow,
   env: Env,
+  written: WrittenSessions,
   retention: 'prefix' | 'off' = 'prefix',
 ): Promise<number> {
   const db = env.DB;
-  // Shared by ordinary parses AND export slices: invalidate before any partial rewrite is visible.
-  // Random generations also prevent an old rollup page committing after delete/recreate of this id.
+  const indexDb = indexDbFor(env, s.id);
+  // Main invalidation precedes every shard mutation. The generation guards usage/publication;
+  // the captured main catalog version fences even an older in-flight shard writer.
   const rollupGeneration = crypto.randomUUID();
+  written.set(s.id, rollupGeneration);
 
   const pending = buildBlockRows(s);
   const pendingUsage = buildUsageRows(s);
-  const probes = retention === 'off' || pending.length === 0 ? 0 : 1;
-  const retained = probes === 0 ? NOTHING_RETAINED : await retainablePrefix(s, file, pending, db);
+  const probes = retention === 'off' || pending.length === 0 ? 0 : 2;
 
   // Everything from the first divergent block onward is rewritten; everything before it is left in
   // place. `retained.count === 0` reproduces the original unconditional full rewrite exactly (`id > 0`
   // matches every row of the session, `turn_index >= 0` every usage row), so the fallback is not a
   // second code path to keep correct — it is this one with an empty prefix.
-  const clearRes = await db.batch([
-    db.prepare('DELETE FROM session_rollup_state WHERE session_id = ?1').bind(s.id),
+  const mainClearRes = await db.batch([
+    // A first parse superseded at this exact boundary still needs an honest pending row for
+    // its live single-session source. Never derive an export id from changed archive bytes,
+    // nor reset any existing newer session under a stale source revision.
+    db.prepare(`INSERT INTO sessions (session_id, harness, machine_id, canonical_file_id, index_state)
+      SELECT ?1, ?2, ?3, ?4, 'parsing' FROM files source
+      WHERE source.id = ?4 AND (source.content_hash = ?5
+        OR (source.session_id = ?1 AND source.parse_state IN ('pending', 'reserved')
+          AND NOT EXISTS (SELECT 1 FROM sessions WHERE session_id = ?1)))
+      ON CONFLICT (session_id) DO UPDATE SET index_state = 'parsing'
+        WHERE EXISTS (SELECT 1 FROM files WHERE id = ?4 AND content_hash = ?5)`)
+      .bind(s.id, s.harness, file.machine_id, file.id, file.content_hash),
+    db.prepare(`DELETE FROM session_rollup_state WHERE session_id = ?1
+      AND EXISTS (SELECT 1 FROM files WHERE id = ?2 AND content_hash = ?3)`)
+      .bind(s.id, file.id, file.content_hash),
     db.prepare(`INSERT INTO session_rollup_state (session_id, generation, eligible)
-      VALUES (?1, ?2, 0)`).bind(s.id, rollupGeneration),
-    db
-      .prepare(
-        `INSERT INTO blocks_fts (blocks_fts, rowid, text)
-         SELECT 'delete', id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL AND id > ?2`,
-      )
-      .bind(s.id, retained.lastId),
-    db.prepare('DELETE FROM blocks WHERE session_id = ?1 AND id > ?2').bind(s.id, retained.lastId),
-    ...usageDeletes(db, s.id, retained, pendingUsage),
+      SELECT ?1, ?2, 0 WHERE EXISTS (SELECT 1 FROM files WHERE id = ?3 AND content_hash = ?4)`)
+      .bind(s.id, rollupGeneration, file.id, file.content_hash),
+    db.prepare('SELECT version FROM session_catalog_versions WHERE session_id = ?1').bind(s.id),
   ]);
+  if ((mainClearRes[2]?.meta.changes ?? 0) === 0) throw new IndexWriteSupersededError(`index_source_superseded:${s.id}`);
+  const captured = mainClearRes.at(-1)?.results[0] as { version: number } | undefined;
+  if (!captured || !Number.isSafeInteger(captured.version)) throw new Error(`missing_index_write_version:${s.id}`);
+  const writeVersion = captured.version;
+  await claimIndexWrite(indexDb, s.id, writeVersion);
+  // Probe after claiming: an older writer can no longer change this retained prefix.
+  // A newer writer is caught by guarded shard batches and the final main generation.
+  const retained = probes === 0 ? NOTHING_RETAINED : await retainablePrefix(s, file, pending, indexDb, db);
+  const usageClear = usageDeletes(db, s.id, retained, pendingUsage, rollupGeneration, file);
+  const usageClearRes = usageClear.length > 0 ? await db.batch(usageClear) : [];
+  const clearRes = await fencedIndexBatch(indexDb, [
+    indexDb.prepare(`INSERT INTO blocks_fts (blocks_fts, rowid, text)
+      SELECT 'delete', id, text FROM blocks
+      WHERE session_id = ?1 AND text IS NOT NULL AND id > ?2 AND ${indexWriteFence(1, 3)}`)
+      .bind(s.id, retained.lastId, writeVersion),
+    indexDb.prepare(`DELETE FROM blocks WHERE session_id = ?1 AND id > ?2 AND ${indexWriteFence(1, 3)}`)
+      .bind(s.id, retained.lastId, writeVersion),
+  ], s.id, writeVersion);
   // How many blocks this write removed — with a retained prefix that is the divergent tail, not the
   // whole session. `null` when nothing counted them: the export path skips the probe (to keep its
   // subrequest estimate exact) and a session above the probe's cap is only read as far as the cap.
@@ -1919,16 +2096,17 @@ async function writeSession(
   // Classification needs only WHETHER a row was deleted, which survives the inflation: an inflated
   // count is still 0 when the DELETE matched nothing (verified on an initial write, which reports 0
   // with the index in place). So it reads `changes` even where the exact count is unavailable.
-  const deletedAnyBlock = (clearRes[3]?.meta?.changes ?? 0) > 0;
+  const deletedAnyBlock = (clearRes[1]?.meta?.changes ?? 0) > 0;
   // Usage deletes count too when deciding whether the session already existed: a transcript of
   // usage-only turns (codex retains those) has usage rows and NO blocks, so keying off blocks alone
   // would label every one of its re-parses 'initial'.
   // The usage deletes are a variable-length tail of the batch (chunked under the parameter cap).
-  const priorUsage = clearRes.slice(4).reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
+  const priorUsage = usageClearRes.reduce((n, r) => n + (r.meta?.changes ?? 0), 0);
 
-  const insertBlock = db.prepare(
-    `INSERT INTO blocks (session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, byte_start, byte_len, truncated, text, on_main_path, row_hash, media_byte_start, media_byte_len, media_type)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)`,
+  const insertBlock = indexDb.prepare(
+    `INSERT INTO blocks (id, session_id, file_id, turn_index, block_index, role, btype, tool_name, ts, byte_start, byte_len, truncated, text, on_main_path, row_hash, media_byte_start, media_byte_len, media_type)
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18
+     WHERE ${indexWriteFence(2, 19)}`,
   );
   const insertUsage = db.prepare(
     // `priced_version` is written explicitly as 0 rather than left to the column DEFAULT. On a
@@ -1942,7 +2120,8 @@ async function writeSession(
     `INSERT INTO usage (session_id, turn_index, ts, model, service_tier, input_tokens, output_tokens, reasoning_tokens,
                         cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, cache_basis,
                         inference_geo, request_id, priced_version)
-     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0)
+     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, 0
+     WHERE ${mainWriteGuard(1, 15, 16, 17)}
      ON CONFLICT (session_id, turn_index) DO UPDATE SET
        ts = excluded.ts, model = excluded.model, service_tier = excluded.service_tier,
        input_tokens = excluded.input_tokens, output_tokens = excluded.output_tokens,
@@ -1978,8 +2157,10 @@ async function writeSession(
 
   const blockCount = pending.length;
   const newBlocks = pending.slice(retained.count);
-  const blockStmts: D1PreparedStatement[] = newBlocks.map((b) =>
+  const firstBlockId = newBlocks.length > 0 ? await reserveBlockIds(indexDb, newBlocks.length) : 0;
+  const blockStmts: D1PreparedStatement[] = newBlocks.map((b, index) =>
     insertBlock.bind(
+      firstBlockId + index,
       s.id,
       file.id,
       b.turnIndex,
@@ -1997,6 +2178,7 @@ async function writeSession(
       b.mediaByteStart,
       b.mediaByteLen,
       b.mediaType,
+      writeVersion,
     ),
   );
   // Usage is diffed per turn, independently of the block prefix: the codex parser attaches a late
@@ -2023,6 +2205,9 @@ async function writeSession(
         u.cacheBasis,
         u.inferenceGeo,
         u.requestId,
+        rollupGeneration,
+        file.id,
+        file.content_hash,
       ),
     );
   }
@@ -2054,25 +2239,15 @@ async function writeSession(
   // returns 1 for a never-indexed row (verified against real D1), because a rowid lookup on an
   // external-content table is answered from the content table, not the index.
   //
-  // Chunks are contiguous in (turn_index, block_index), and the clear batch already removed anything that
-  // previously occupied those positions, so the range predicate matches precisely this chunk's rows.
-  const insertChunks: D1PreparedStatement[][] = chunkArr(blockStmts, 90).map((chunk, i) => {
-    const first = newBlocks[i * 90]!;
-    const last = newBlocks[Math.min(i * 90 + chunk.length, newBlocks.length) - 1]!;
-    return [
-      ...chunk,
-      db
-        .prepare(
-          `INSERT INTO blocks_fts (rowid, text)
-           SELECT id, text FROM blocks
-           WHERE session_id = ?1 AND text IS NOT NULL
-             AND (turn_index > ?2 OR (turn_index = ?2 AND block_index >= ?3))
-             AND (turn_index < ?4 OR (turn_index = ?4 AND block_index <= ?5))`,
-        )
-        .bind(s.id, first.turnIndex, first.blockIndex, last.turnIndex, last.blockIndex),
-    ];
-  });
-  insertChunks.push(...chunkArr(usageStmts, 90));
+  // Reserved ids identify exactly each inserted chunk, including legacy retained prefixes.
+  const blockChunks: D1PreparedStatement[][] = chunkArr(blockStmts, 90).map((chunk, i) => [
+    ...chunk,
+    indexDb.prepare(`INSERT INTO blocks_fts (rowid, text)
+      SELECT id, text FROM blocks WHERE session_id = ?1 AND text IS NOT NULL
+        AND id >= ?2 AND id < ?3 AND ${indexWriteFence(1, 4)}`)
+      .bind(s.id, firstBlockId + i * 90, firstBlockId + i * 90 + chunk.length, writeVersion),
+  ]);
+  const usageChunks = chunkArr(usageStmts, 90);
 
   let insertRows = 0;
   let finalizeRows = 0;
@@ -2080,7 +2255,7 @@ async function writeSession(
   // the work that actually ran, and a large session throwing on its first chunk would otherwise report
   // dozens of batches it never reached. The prefix probe (when it ran) and the clear batch are the ones
   // already spent by the time we get here.
-  let batchesRun = 1 + probes;
+  let batchesRun = 3 + probes + (usageClear.length > 0 ? 1 : 0) + (newBlocks.length > 0 ? 1 : 0);
   const emitWriteCost = (outcome: 'ok' | 'failed') =>
     console.log(
       JSON.stringify({
@@ -2095,8 +2270,8 @@ async function writeSession(
         appended_blocks: blockCount - retained.count,
         prior_blocks: priorBlocks,
         prior_usage: priorUsage,
-        rows_written: sumRowsWritten(clearRes) + insertRows + finalizeRows,
-        rows_written_clear: sumRowsWritten(clearRes),
+        rows_written: sumRowsWritten(mainClearRes) + sumRowsWritten(usageClearRes) + sumRowsWritten(clearRes) + insertRows + finalizeRows,
+        rows_written_clear: sumRowsWritten(mainClearRes) + sumRowsWritten(usageClearRes) + sumRowsWritten(clearRes),
         rows_written_insert: insertRows,
         rows_written_finalize: finalizeRows,
         batches: batchesRun,
@@ -2113,7 +2288,11 @@ async function writeSession(
   /** The billed half of the write, in one scope so the catch above can report what it already paid
    * for. Declared (not inlined) purely to keep that try block one statement deep. */
   async function runWrite(): Promise<number> {
-    for (const chunk of insertChunks) {
+    for (const chunk of blockChunks) {
+      batchesRun++;
+      insertRows += sumRowsWritten(await fencedIndexBatch(indexDb, chunk, s.id, writeVersion));
+    }
+    for (const chunk of usageChunks) {
       batchesRun++;
       insertRows += sumRowsWritten(await db.batch(chunk));
     }
@@ -2124,6 +2303,11 @@ async function writeSession(
         .bind(file.machine_id)
         .first<{ os: string }>()
     )?.os;
+    batchesRun++;
+    const fence = await indexDb.prepare(`SELECT version FROM index_write_versions
+      WHERE session_id = ?1 AND version = ?2`).bind(s.id, writeVersion).first<{ version: number }>();
+    batchesRun++;
+    if (!fence) throw new IndexWriteSupersededError(`index_write_superseded:${s.id}`);
 
     // Derive the first-interaction title from the same blocks just written (block_index == bi, the
     // per-turn insert order above), so the listing queries read a stored column instead of an
@@ -2159,8 +2343,8 @@ async function writeSession(
          JOIN json_each(?2) mapping ON mapping.key = st.turn_key
          WHERE st.session_id = ?1
            AND st.turn_key != mapping.value
-           AND EXISTS (SELECT 1 FROM files source WHERE source.id = ?3 AND source.content_hash = ?4)`,
-      ).bind(s.id, encodedKeys, file.id, file.content_hash),
+           AND ${mainWriteGuard(1, 5, 3, 4)}`,
+      ).bind(s.id, encodedKeys, file.id, file.content_hash, rollupGeneration),
     ];
     const sourceComplete =
       s.stats.parseErrorLines === 0 && (s.stats.skippedLineTypes['oversized-line'] ?? 0) === 0;
@@ -2169,11 +2353,11 @@ async function writeSession(
         db.prepare(
           `DELETE FROM starred_turns
            WHERE session_id = ?1
-             AND EXISTS (SELECT 1 FROM files source WHERE source.id = ?3 AND source.content_hash = ?4)
+             AND ${mainWriteGuard(1, 5, 3, 4)}
              AND NOT EXISTS (
                SELECT 1 FROM json_each(?2) live WHERE live.value = starred_turns.turn_key
              )`,
-        ).bind(s.id, encodedKeys, file.id, file.content_hash),
+        ).bind(s.id, encodedKeys, file.id, file.content_hash, rollupGeneration),
       );
     }
 
@@ -2185,8 +2369,9 @@ async function writeSession(
                                  primary_model, title, started_at, ended_at, parent_session_id, parent_tool_use_id, is_sidechain,
                                  turn_count, block_count, tokens_in, tokens_out, tokens_reasoning, tokens_cached,
                                  first_interaction_title, index_state, updated_at)
-           VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 'ready',
-                   strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+           SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, 'ready',
+                  strftime('%Y-%m-%dT%H:%M:%fZ','now')
+           WHERE ${mainWriteGuard(1, 26, 5, 27)}
            ON CONFLICT (session_id) DO UPDATE SET
              harness = excluded.harness, machine_id = excluded.machine_id, os = excluded.os,
              canonical_file_id = excluded.canonical_file_id, cwd = excluded.cwd, repo_url = excluded.repo_url,
@@ -2239,6 +2424,8 @@ async function writeSession(
           totals.cached,
           firstInteractionTitle,
           s.parentSessionLink ?? 'unknown',
+          rollupGeneration,
+          file.content_hash,
         ),
       ...starReconciliation,
       db.prepare(`UPDATE session_rollup_state SET eligible = 1
@@ -2257,14 +2444,12 @@ async function writeSession(
     ]);
 
     finalizeRows = sumRowsWritten(finalizeRes);
+    if ((finalizeRes[0]?.meta.changes ?? 0) === 0) throw new IndexWriteSupersededError(`index_source_superseded:${s.id}`);
     emitWriteCost('ok');
 
-    // SUBREQUESTS (see the counting-model note above): prefix probe (1, only when retention is on) +
-    // delete batch (1) + one batch per 90-block insert chunk (insertChunks.length) + machine SELECT (1) +
-    // session/FTS batch (1). A db.batch of N statements is ONE subrequest, so a chatty conversation's cost
-    // grows with its BATCH count, not its statement count — which is also why the cost refresh
-    // appended to the finalize batch changes nothing here: it is a statement, not a batch.
-    return 3 + probes + insertChunks.length;
+    // Count both stores, the allocator/fence, and any immediate catalog propagation. Each
+    // transactional batch is one D1 call regardless of its number of SQL statements.
+    return batchesRun;
   }
 }
 
@@ -2413,22 +2598,23 @@ async function retainablePrefix(
   file: FileRow,
   pending: PendingBlock[],
   db: D1Database,
+  mainDb: D1Database,
 ): Promise<RetainedPrefix> {
-  const [blocksRes, usageRes] = await db.batch([
+  const [blocksRes, usageRes] = await Promise.all([
     db
       .prepare(
         `SELECT id, file_id, turn_index, block_index, byte_start, byte_len, row_hash
          FROM blocks WHERE session_id = ?1 ORDER BY turn_index, block_index LIMIT ?2`,
       )
-      .bind(s.id, PREFIX_PROBE_MAX_BLOCKS + 1),
-    db
+      .bind(s.id, PREFIX_PROBE_MAX_BLOCKS + 1).all<StoredBlock>(),
+    mainDb
       .prepare(
         `SELECT turn_index, ts, model, service_tier, input_tokens, output_tokens, reasoning_tokens,
                 cache_creation_5m_tokens, cache_creation_1h_tokens, cache_read_tokens, cache_basis,
                 inference_geo, request_id
          FROM usage WHERE session_id = ?1`,
       )
-      .bind(s.id),
+      .bind(s.id).all<StoredUsage>(),
   ]);
 
   // Usage is diffed independently of the blocks, and stays valid even when no block is retained.
@@ -2479,15 +2665,17 @@ async function retainablePrefix(
  * Returns a LIST because D1 binds at most 100 parameters per statement: a transcript that lost 100+
  * usage-bearing turns would otherwise blow the limit and fail the whole clear batch, turning an edited
  * transcript into a parse error instead of a reindex. */
-function usageDeletes(db: D1Database, sessionId: string, retained: RetainedPrefix, pending: PendingUsage[]): D1PreparedStatement[] {
-  if (retained.usage === null) return [db.prepare('DELETE FROM usage WHERE session_id = ?1').bind(sessionId)];
+function usageDeletes(db: D1Database, sessionId: string, retained: RetainedPrefix, pending: PendingUsage[], generation: string, file: FileRow): D1PreparedStatement[] {
+  const guard = mainWriteGuard(1, 2, 3, 4);
+  if (retained.usage === null) return [db.prepare(`DELETE FROM usage WHERE session_id = ?1 AND ${guard}`)
+    .bind(sessionId, generation, file.id, file.content_hash)];
   const live = new Set(pending.map((u) => u.turnIndex));
   const gone = [...retained.usage.keys()].filter((t) => !live.has(t));
   // 90 turn indexes + the session id stays under the 100-parameter cap, matching the insert chunk size.
   return chunkArr(gone, 90).map((batch) =>
     db
-      .prepare(`DELETE FROM usage WHERE session_id = ?1 AND turn_index IN (${batch.map(() => '?').join(', ')})`)
-      .bind(sessionId, ...batch),
+      .prepare(`DELETE FROM usage WHERE session_id = ?1 AND ${guard} AND turn_index IN (${batch.map(() => '?').join(', ')})`)
+      .bind(sessionId, generation, file.id, file.content_hash, ...batch),
   );
 }
 

@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { SYNTHETIC_EXPECTATIONS } from '../scripts/lib/dev-seed.mjs';
 import { previewBearerToken } from '../../infra/cf/preview-trust.mjs';
@@ -93,16 +93,25 @@ async function runSeed(scenario) {
       };
     `);
     const result = spawnSync(process.execPath, [
-      '--import', preload, controller, 'seed', '--pr', '150', '--repository', 'example/sessions',
+      '--import', pathToFileURL(preload).href, controller, 'seed', '--pr', '150', '--repository', 'example/sessions',
     ], {
       encoding: 'utf8', timeout: 10_000,
       env: { ...process.env, PREVIEW_BEARER_SEED: SEED },
     });
-    assert.ifError(result.error);
-    const report = JSON.parse(await readFile(reportPath, 'utf8'));
     const output = `${result.stdout}\n${result.stderr}`;
     assert.ok(!output.includes(SEED), 'CLI output must not expose bearer seed');
     assert.ok(!output.includes(previewBearerToken(SEED, 150)), 'CLI output must not expose bearer token');
+    if (result.error) {
+      throw new Error(`preview seed fixture child failed to launch (status ${result.status}, signal ${result.signal})\n${output}`,
+        { cause: result.error });
+    }
+    let report;
+    try {
+      report = JSON.parse(await readFile(reportPath, 'utf8'));
+    } catch (cause) {
+      throw new Error(`preview seed fixture could not read child report (status ${result.status}, signal ${result.signal})\n${output}`,
+        { cause });
+    }
     return { ...result, ...report, output };
   } finally {
     await rm(temporary, { recursive: true, force: true });
@@ -113,6 +122,11 @@ test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then o
   const result = await runSeed({});
   assert.equal(result.status, 0, result.output);
   const uploads = result.requests.filter((request) => request.method === 'PUT');
+  assert.ok(result.requests.every((request) => new URL(request.url).origin === ORIGIN),
+    'fixtures and search probes must use the preview Worker, never direct main or shard APIs');
+  assert.ok(result.requests.every((request) =>
+    request.method === 'PUT' ? new URL(request.url).pathname.startsWith('/api/v1/files/')
+      : new URL(request.url).pathname === '/api/v1/search'));
   // Asset, primary, pager, skill and one file per cost fixture, plus the replayed first upload.
   const distinctUploads = 4 + SYNTHETIC_EXPECTATIONS.costFixtures.length;
   assert.equal(uploads.length, distinctUploads + 1);
@@ -121,7 +135,11 @@ test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then o
   assert.deepEqual(second, first, 'replayed URL, method, bytes and all headers must be identical');
   assert.equal(first.url, `${ORIGIN}${ASSET_PATH}`);
   assert.equal(first.headers['x-content-hash'], `sha256:${SYNTHETIC_EXPECTATIONS.externalDigest}`);
-  assert.equal(first.headers['content-length'], String(Buffer.from(first.body, 'base64').length));
+  assert.equal(first.headers['content-length'], undefined, 'fetch must compute the finite Buffer wire length once');
+  const assetSource = Buffer.from((await readFile(
+    new URL('./fixtures/local/fixture-external.png.base64', import.meta.url), 'utf8',
+  )).trim(), 'base64');
+  assert.deepEqual(Buffer.from(first.body, 'base64'), assetSource, 'the complete binary fixture must reach fetch unchanged');
   assert.equal(first.headers.authorization, `Bearer ${previewBearerToken(SEED, 150)}`);
   assert.equal(first.redirect, 'error');
   assert.ok(firstBudget > 0 && firstBudget <= 10_000);

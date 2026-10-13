@@ -26,13 +26,22 @@ function validateIdentity(identity) {
   if (typeof identity.deploymentId !== 'string' || identity.deploymentId.length < 1 || identity.deploymentId.length > 256) {
     throw new Error('invalid migration deployment ID');
   }
+  for (const field of ['databaseBinding', 'databaseId']) {
+    if (typeof identity[field] !== 'string' || !identity[field].trim() || identity[field].length > 256) {
+      throw new Error(`invalid migration journal ${field}`);
+    }
+  }
+  if (['local', 'e2e'].includes(identity.target)
+      && (typeof identity.persistTo !== 'string' || !path.isAbsolute(identity.persistTo))) {
+    throw new Error('local migration journal requires an absolute persistence directory');
+  }
   if (!DIGEST.test(identity.artifactDigest ?? '') || !DIGEST.test(identity.migrationDigest ?? '')) {
     throw new Error('invalid migration journal digest');
   }
 }
 
 function assertJournal(record) {
-  if (record?.formatVersion !== 1 || !PHASES.includes(record.phase)) {
+  if (record?.formatVersion !== 2 || !PHASES.includes(record.phase)) {
     throw new AmbiguousJournalError('migration journal has an unknown format or phase');
   }
   try {
@@ -90,7 +99,7 @@ export async function openMigrationJournal(filePath, identity, now = () => new D
   try {
     const record = assertJournal(JSON.parse(await readFile(filePath, 'utf8')));
     if (!sameIdentity(record.identity, identity)) {
-      throw new AmbiguousJournalError('migration journal belongs to a different immutable artifact or deployment');
+      throw new AmbiguousJournalError('migration journal belongs to a different immutable artifact, deployment, or database');
     }
     return record;
   } catch (error) {
@@ -100,7 +109,7 @@ export async function openMigrationJournal(filePath, identity, now = () => new D
     }
   }
   const record = {
-    formatVersion: 1,
+    formatVersion: 2,
     identity,
     phase: 'intended',
     revision: 0,

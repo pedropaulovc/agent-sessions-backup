@@ -1,9 +1,10 @@
 import { env } from 'cloudflare:test';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { route } from '../src/router';
 import { runSessionRollup } from '../src/session-rollup';
 import { consumeSessionRollup, enqueueSessionRollup, getSessionRollupJob } from '../src/session-rollup-jobs';
 import { API } from './hosts';
+import { assertIndexLayout, indexDbFor, indexDbs, reserveBlockIds } from '../src/index-shards';
 
 const testEnv = env as unknown as Env;
 const db = testEnv.DB;
@@ -40,11 +41,15 @@ async function seedSession(suffix: string, blocks = 1): Promise<string> {
   await db.batch([
     db.prepare(`INSERT INTO sessions (session_id, harness, index_state) VALUES (?1, 'omp', 'ready')`).bind(id),
     db.prepare('INSERT INTO session_rollup_state (session_id) VALUES (?1)').bind(id),
-    ...Array.from({ length: blocks }, (_, turn) => db.prepare(`INSERT INTO blocks
-      (session_id, file_id, turn_index, block_index, role, btype, ts, text, on_main_path)
-      VALUES (?1, 0, ?2, 0, 'assistant', 'text', '2026-08-01T12:00:00Z', 'synthetic answer', 1)`)
-      .bind(id, turn)),
   ]);
+  const shard = indexDbFor(testEnv, id);
+  if (blocks > 0) {
+    const firstBlockId = await reserveBlockIds(shard, blocks);
+    await shard.batch(Array.from({ length: blocks }, (_, turn) => shard.prepare(`INSERT INTO blocks
+      (id, session_id, file_id, turn_index, block_index, role, btype, ts, text, on_main_path)
+      VALUES (?3, ?1, 0, ?2, 0, 'assistant', 'text', '2026-08-01T12:00:00Z', 'synthetic answer', 1)`)
+      .bind(id, turn, firstBlockId + turn)));
+  }
   return id;
 }
 
@@ -66,6 +71,10 @@ function certRequest(path: string, method: string, fingerprint?: string): Reques
   } as unknown as RequestInit);
 }
 
+beforeAll(async () => {
+  await assertIndexLayout(testEnv);
+});
+
 beforeEach(() => {
   // Never let the local queue auto-deliver; each test explicitly drives the real consumer.
   vi.spyOn(testEnv.ROLLUP_QUEUE, 'send').mockResolvedValue(undefined as never);
@@ -73,9 +82,11 @@ beforeEach(() => {
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  for (const shard of indexDbs(testEnv)) {
+    await shard.prepare('DELETE FROM blocks WHERE session_id LIKE ?1').bind(PREFIX + '%').run();
+  }
   await db.batch([
     db.prepare('DELETE FROM session_rollup_jobs WHERE requested_by LIKE ?1').bind(PREFIX + '%'),
-    db.prepare('DELETE FROM blocks WHERE session_id LIKE ?1').bind(PREFIX + '%'),
     db.prepare('DELETE FROM usage WHERE session_id LIKE ?1').bind(PREFIX + '%'),
     db.prepare('DELETE FROM sessions WHERE session_id LIKE ?1').bind(PREFIX + '%'),
     db.prepare('DELETE FROM machines WHERE machine_id LIKE ?1').bind(PREFIX + '%'),
@@ -87,6 +98,8 @@ describe('durable bounded session rollup jobs', () => {
   it('persists a pollable queued job before queue acceptance and commits the consumer result', async () => {
     const id = await seedSession('complete');
     vi.mocked(testEnv.ROLLUP_QUEUE.send).mockImplementation(async (message) => {
+      expect(message.kind).toBe('session-rollup');
+      if (message.kind !== 'session-rollup') throw new Error('Expected a session-rollup queue message');
       expect(await job(message.job_id)).toMatchObject({ status: 'queued', result: null, finished_at: null });
       return { metadata: { metrics: { backlogCount: 1, backlogBytes: 0 } } };
     });
@@ -211,7 +224,7 @@ describe('durable bounded session rollup jobs', () => {
 
   it.each(['delivery', 'poll'] as const)('recovers an expired attempt through %s without rerunning its committed checkpoint', async (recovery) => {
     const id = await seedSession('interrupted', 2);
-    await runSessionRollup(db, { maxBlocks: 1, maxPages: 1, pageSize: 1 });
+    await runSessionRollup(testEnv, { maxBlocks: 1, maxPages: 1, pageSize: 1 });
     const before = await checkpoint(id);
     expect(before).toMatchObject({ status: 'building', cursor_turn: 0 });
     const accepted = await enqueue();

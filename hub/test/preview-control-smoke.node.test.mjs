@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { previewBearerToken } from '../../infra/cf/preview-trust.mjs';
 
@@ -101,18 +101,31 @@ async function runSmoke(scenario) {
       };
     `);
     const result = spawnSync(process.execPath, [
-      '--import', preload, controller, 'smoke',
+      '--import', pathToFileURL(preload).href, controller, 'smoke',
       '--pr', String(PR), '--repository', 'example/sessions',
       '--head-sha', SHA, '--artifact-digest', ARTIFACT, '--schema-digest', SCHEMA,
     ], {
       encoding: 'utf8', timeout: 10_000,
       env: { ...process.env, PREVIEW_BEARER_SEED: SEED },
     });
-    assert.ifError(result.error);
-    const report = JSON.parse(await readFile(reportPath, 'utf8'));
     const output = `${result.stdout}\n${result.stderr}`;
     assert.ok(!output.includes(SEED), 'CLI output must not expose bearer seed');
     assert.ok(!output.includes(previewBearerToken(SEED, PR)), 'CLI output must not expose bearer token');
+    const childContext = [
+      `status: ${result.status}`,
+      `signal: ${result.signal}`,
+      `stdout: ${result.stdout}`,
+      `stderr: ${result.stderr}`,
+    ].join('\n');
+    if (result.error) {
+      throw new Error(`Preview smoke child failed\n${childContext}`, { cause: result.error });
+    }
+    let report;
+    try {
+      report = JSON.parse(await readFile(reportPath, 'utf8'));
+    } catch (cause) {
+      throw new Error(`Failed to read or parse smoke report\n${childContext}`, { cause });
+    }
     return { ...result, ...report, output };
   } finally {
     await rm(temporary, { recursive: true, force: true });

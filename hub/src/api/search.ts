@@ -1,6 +1,9 @@
+import { indexDbs, mapIndexDbs } from '../index-shards';
+import { drainIndexCatalog } from '../session-catalog';
 import { clampLimit, decodeCursor, encodeCursor } from './sessions';
 import {
   buildSessionFilterSql,
+  COST_BUCKETS,
   FACET_DEFINITIONS,
   facetExpressionSql,
   facetOrderSql,
@@ -8,13 +11,67 @@ import {
   selectedValues,
   sessionDurationSql,
   subagentSessionSql,
+  SESSION_TIME_BUCKETS,
   SUBTREE_COST_ALIAS,
   totalTokensSql,
+  type MultiValueFilterDefinition,
 } from '../session-filters';
 import { sessionDisplayTitle } from '../session-title';
 import { subtreeCostCte } from '../session-cost';
 
 export const DEFAULT_RESULT_PAGE_SIZE = 100;
+const SHARD_HIT_PAGE_SIZE = 256;
+
+interface SearchRow {
+  id: number;
+  rank: number;
+  duration_seconds: number | null;
+  total_tokens: number;
+  subtree_usd: number | null;
+  [key: string]: unknown;
+}
+
+/** SQLite orders NULL before numbers in ASC and after numbers in DESC. */
+function compareNumber(a: number | null, b: number | null): number {
+  if (a === b) return 0;
+  if (a === null) return -1;
+  if (b === null) return 1;
+  return a - b;
+}
+
+function compareHits(a: SearchRow, b: SearchRow, sort: string | null): number {
+  let primary = 0;
+  if (sort === 'session_time') primary = compareNumber(b.duration_seconds, a.duration_seconds);
+  if (sort === 'total_tokens') primary = compareNumber(b.total_tokens, a.total_tokens);
+  if (sort === 'cost') primary = compareNumber(b.subtree_usd, a.subtree_usd);
+  return primary || compareNumber(a.rank, b.rank) || a.id - b.id;
+}
+
+/** BINARY text order is UTF-8/code-point order, not locale or JS UTF-16 order. */
+function compareText(a: string, b: string): number {
+  for (let i = 0, j = 0; i < a.length && j < b.length;) {
+    const ac = a.codePointAt(i)!;
+    const bc = b.codePointAt(j)!;
+    if (ac !== bc) return ac - bc;
+    i += ac > 0xffff ? 2 : 1;
+    j += bc > 0xffff ? 2 : 1;
+  }
+  return a.length - b.length;
+}
+
+function compareFacets(
+  a: { v: string; n: number },
+  b: { v: string; n: number },
+  definition: MultiValueFilterDefinition,
+): number {
+  if (definition.facetOrder === 'value-desc') return compareText(b.v, a.v);
+  if (definition.facetOrder === 'bucket') {
+    const buckets = definition.kind === 'cost' ? COST_BUCKETS : SESSION_TIME_BUCKETS;
+    return buckets.findIndex((bucket) => bucket.value === a.v) -
+      buckets.findIndex((bucket) => bucket.value === b.v);
+  }
+  return b.n - a.n || compareText(a.v, b.v);
+}
 
 /** The rolled-up cost the `cost` sort orders by, joined in only for that sort.
  *
@@ -63,12 +120,13 @@ export function searchHitsSql(
   // The rollup is joined for the cost sort and for a selected cost band; `where` never contains
   // the band, so the CTE's roots stay independent of what the band filters.
   const cost = sort === 'cost' || costWhere !== '';
-  return `${cost ? costRollupCte(where) : ''}SELECT b.session_id, b.turn_index, b.block_index, b.role, b.btype, b.tool_name, b.ts,
+  return `${cost ? costRollupCte(where) : ''}SELECT b.id, b.session_id, b.turn_index, b.block_index, b.role, b.btype, b.tool_name, b.ts,
                  snippet(blocks_fts, 0, '<mark>', '</mark>', '…', 16) AS snip,
                  bm25(blocks_fts) AS rank,
                  s.harness, s.machine_id, s.os, s.cwd, s.repo_url, s.primary_model, ${subagentSessionSql('s')} AS subagent,
                  s.first_interaction_title, s.title AS stored_title, s.started_at, s.index_state,
-                 ${sessionDurationSql('s')} AS duration_seconds, ${totalTokensSql('s')} AS total_tokens
+                 ${sessionDurationSql('s')} AS duration_seconds, ${totalTokensSql('s')} AS total_tokens,
+                 ${cost ? `${SUBTREE_COST_ALIAS}.usd` : 'NULL'} AS subtree_usd
           FROM blocks_fts
           JOIN blocks b ON b.id = blocks_fts.rowid
           JOIN sessions s ON s.session_id = b.session_id
@@ -102,6 +160,7 @@ export interface SearchResult {
   facets?: Record<string, Record<string, number>>;
   cursor?: string;
   error?: string;
+  status?: 400 | 503;
 }
 
 /** Core FTS search over blocks with session-level filters and optional facet counts. Shared by the API and the viewer. */
@@ -109,6 +168,7 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   const q = url.searchParams.get('q')?.trim() ?? '';
   const limit = clampLimit(url.searchParams.get('limit'), DEFAULT_RESULT_PAGE_SIZE, DEFAULT_RESULT_PAGE_SIZE);
   const offset = decodeCursor(url.searchParams.get('cursor'));
+  const shardPageSize = Math.min(SHARD_HIT_PAGE_SIZE, offset + limit);
   const wantFacets = opts.facets ?? url.searchParams.get('facets') === '1';
 
   const p = url.searchParams;
@@ -118,6 +178,11 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   const costWhere = sessionFilter.costClause;
 
   if (!q) return { hits: [], error: 'missing_q' };
+  // Only a bounded reconciliation slice belongs on a read request. A remaining backlog is an
+  // unavailable index, not permission to return hits with stale metadata, stars or costs.
+  if ((await drainIndexCatalog(env)).state === 'pending') {
+    return { hits: [], error: 'index_catalog_pending', status: 503 };
+  }
 
   // Returns null (rather than throwing) on invalid FTS5 syntax, so the two-step fallback below
   // can tell "this match string didn't work" apart from a genuine infra error without a second
@@ -145,29 +210,83 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   // arguments when the cursor opens (i.e. at .all() time), not at statement prepare, so a minimal
   // probe sharing only the MATCH clause reproduces exactly the same class of failure the real
   // query would hit from that same text, no more and no less.
-  const ftsProbeOk = async (match: string): Promise<boolean> => {
+  const ftsProbeOk = async (db: D1Database, match: string): Promise<boolean> => {
     try {
-      await env.DB.prepare('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?1 LIMIT 1').bind(match).all();
+      await db.prepare('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?1 LIMIT 1').bind(match).all();
       return true;
     } catch {
       return false;
     }
   };
-  const isInvalidUserQuery = async (match: string): Promise<boolean> => {
-    if (await ftsProbeOk(match)) return false; // failure wasn't about this match text at all
-    return ftsProbeOk('"x"'); // control: does blocks_fts work at all for a known-good match?
+  const isInvalidUserQuery = async (db: D1Database, match: string): Promise<boolean> => {
+    if (await ftsProbeOk(db, match)) return false;
+    return ftsProbeOk(db, '"x"');
   };
-  const run = async (match: string) => {
+  const sort = p.get('sort');
+  const readPage = async (db: D1Database, match: string, localOffset: number): Promise<SearchRow[] | null> => {
     try {
-      return await env.DB.prepare(
-        searchHitsSql(where, costWhere, p.get('sort'), limit, offset),
-      )
-        .bind(match, ...binds)
-        .all();
+      const rows = await db.prepare(
+        searchHitsSql(where, costWhere, sort, shardPageSize, localOffset),
+      ).bind(match, ...binds).all<SearchRow>();
+      return rows.results;
     } catch (e) {
-      if (!(await isInvalidUserQuery(match))) throw e;
+      if (!(await isInvalidUserQuery(db, match))) throw e;
       return null;
     }
+  };
+  const run = async (match: string): Promise<SearchRow[] | null> => {
+    // Do not allocate offset+limit hits per shard. Each sorted stream holds one bounded page;
+    // only the stream whose head wins the merge can need another page.
+    const dbs = indexDbs(env);
+    const initial = await mapIndexDbs(env, (db) => readPage(db, match, 0));
+    if (initial.some((rows) => rows === null)) return null;
+    const streams = initial.map((rows, shard) => ({
+      db: dbs[shard]!,
+      rows: rows!,
+      position: 0,
+      nextOffset: rows!.length,
+      done: rows!.length <= shardPageSize,
+    }));
+    const head = (shard: number): SearchRow => {
+      const stream = streams[shard]!;
+      return stream.rows[stream.position]!;
+    };
+    const compare = (a: number, b: number) => compareHits(head(a), head(b), sort);
+    // A sorted array is also a valid min-heap. Thereafter only its root can change.
+    const heap = streams.flatMap((stream, shard) => stream.rows.length ? [shard] : []).sort(compare);
+    const merged: SearchRow[] = [];
+    let consumed = 0;
+    while (heap.length > 0) {
+      const shard = heap[0]!;
+      const stream = streams[shard]!;
+      if (consumed >= offset) merged.push(head(shard));
+      consumed++;
+      if (merged.length === limit + 1) break;
+      stream.position++;
+      if (stream.position === stream.rows.length && !stream.done) {
+        const rows = await readPage(stream.db, match, stream.nextOffset);
+        if (rows === null) return null;
+        stream.rows = rows;
+        stream.position = 0;
+        stream.nextOffset += rows.length;
+        stream.done = rows.length <= shardPageSize;
+      }
+      if (stream.position === stream.rows.length) {
+        const last = heap.pop()!;
+        if (heap.length === 0) break;
+        heap[0] = last;
+      }
+      for (let parent = 0;;) {
+        const left = parent * 2 + 1;
+        if (left >= heap.length) break;
+        const right = left + 1;
+        const child = right < heap.length && compare(heap[right]!, heap[left]!) < 0 ? right : left;
+        if (compare(heap[parent]!, heap[child]!) <= 0) break;
+        [heap[parent], heap[child]] = [heap[child]!, heap[parent]!];
+        parent = child;
+      }
+    }
+    return merged;
   };
 
   // User query wasn't valid FTS5 syntax — retry as a quoted phrase. That fallback can ALSO be
@@ -182,7 +301,7 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
     rows = await run(quoted);
     effectiveMatch = rows ? quoted : null;
   }
-  const results = rows?.results ?? [];
+  const results = rows ?? [];
 
   const returnedResults = results.slice(0, limit);
 
@@ -223,30 +342,40 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   // facets clause would ALSO reject. Skip it and report empty facets rather than retrying with a
   // match string already known to be broken.
   if (wantFacets && effectiveMatch !== null) {
-    const statements = FACET_DEFINITIONS.map((definition) => {
-      const filter = buildSessionFilterSql(p, 's', 2, definition.key);
-      const filtered = filter.clause ? ` AND ${filter.clause}` : '';
-      const expression = facetExpressionSql(definition, 's');
-      // Same rule as the list page: the cost facet needs the rollup to have a value at all, and
-      // every other facet needs it to honour a cost band the caller already selected.
-      const rollup = definition.kind === 'cost' || filter.costClause !== '';
-      const banded = filter.costClause ? ` AND ${filter.costClause}` : '';
-      return env.DB.prepare(
-        `${rollup ? costRollupCte(filter.clause ? `AND ${filter.clause}` : '') : ''}` +
-        `SELECT ${expression} AS v, COUNT(DISTINCT s.session_id) AS n
-         FROM blocks_fts JOIN blocks b ON b.id = blocks_fts.rowid JOIN sessions s ON s.session_id = b.session_id
-         ${rollup ? costRollupJoin() : ''}
-         WHERE blocks_fts MATCH ?1${filtered}${banded} AND ${expression} IS NOT NULL
-         GROUP BY v ORDER BY ${facetOrderSql(definition)} LIMIT ${definition.valueLimit ?? 20}`,
-      ).bind(effectiveMatch, ...filter.binds);
+    const shardFacets = await mapIndexDbs(env, async (db) => {
+      const statements = FACET_DEFINITIONS.map((definition) => {
+        const filter = buildSessionFilterSql(p, 's', 2, definition.key);
+        const filtered = filter.clause ? ` AND ${filter.clause}` : '';
+        const expression = facetExpressionSql(definition, 's');
+        // Complete catalog replicas keep descendant costs exact even when a child belongs
+        // to another shard. Omit only this facet's own selected predicate, as before.
+        const rollup = definition.kind === 'cost' || filter.costClause !== '';
+        const banded = filter.costClause ? ` AND ${filter.costClause}` : '';
+        return db.prepare(
+          `${rollup ? costRollupCte(filter.clause ? `AND ${filter.clause}` : '') : ''}` +
+          `SELECT ${expression} AS v, COUNT(DISTINCT s.session_id) AS n
+           FROM blocks_fts JOIN blocks b ON b.id = blocks_fts.rowid JOIN sessions s ON s.session_id = b.session_id
+           ${rollup ? costRollupJoin() : ''}
+           WHERE blocks_fts MATCH ?1${filtered}${banded} AND ${expression} IS NOT NULL
+           GROUP BY v ORDER BY ${facetOrderSql(definition)}`,
+        ).bind(effectiveMatch, ...filter.binds);
+      });
+      return db.batch<{ v: string; n: number }>(statements);
     });
-    const results = await env.DB.batch<{ v: string; n: number }>(statements);
     for (let index = 0; index < FACET_DEFINITIONS.length; index++) {
       const definition = FACET_DEFINITIONS[index]!;
-      facets[definition.key] = mergeFacetCounts(
-        results[index]!.results,
-        selectedValues(p, definition),
-      );
+      const counts = new Map<string, number>();
+      for (const shard of shardFacets) {
+        for (const row of shard[index]!.results) {
+          counts.set(row.v, (counts.get(row.v) ?? 0) + Number(row.n));
+        }
+      }
+      // A value below every shard's local top-N can still be a global winner. Apply the
+      // established ordering/limit only after summing ALL groups, then retain selections.
+      const ordered = [...counts].map(([v, n]) => ({ v, n }))
+        .sort((a, b) => compareFacets(a, b, definition))
+        .slice(0, definition.valueLimit ?? 20);
+      facets[definition.key] = mergeFacetCounts(ordered, selectedValues(p, definition));
     }
   } else if (wantFacets) {
     for (const definition of FACET_DEFINITIONS) {
@@ -269,6 +398,6 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
 /** GET /api/v1/search — FTS over blocks with session-level filters and facet counts. */
 export async function search(url: URL, env: Env): Promise<Response> {
   const result = await runSearch(url, env);
-  if (result.error) return Response.json({ error: result.error }, { status: 400 });
+  if (result.error) return Response.json({ error: result.error }, { status: result.status ?? 400 });
   return Response.json({ hits: result.hits, facets: result.facets, cursor: result.cursor });
 }

@@ -2,6 +2,8 @@ import { originOk, readSession } from '../auth/session';
 import { webauthnRoute } from '../auth/webauthn';
 import { readGrantBrowserRoute } from '../auth/read-grants';
 import { previewBearerTokenOk, previewHumanIdentity, PREVIEW_SESSION_COOKIE } from '../auth/identity';
+import { indexDbFor } from '../index-shards';
+import { syncSessionCatalog } from '../session-catalog';
 import { assetEndpoint } from './assets';
 import { blobEndpoint } from './blob';
 import { exportZipEndpoint } from './export';
@@ -140,25 +142,19 @@ async function handlePost(request: Request, url: URL, env: Env): Promise<Respons
 
   const sessionId = decodeURIComponent(turnStar[1]!);
   const turnIndex = Number(turnStar[2]);
+  if (!Number.isSafeInteger(turnIndex)) return new Response('turn not found', { status: 404 });
   const turn = await env.DB.prepare(
-    `SELECT f.content_hash, s.updated_at, s.index_state,
-            EXISTS (
-              SELECT 1 FROM blocks b
-              WHERE b.session_id = s.session_id
-                AND b.file_id = s.canonical_file_id
-                AND b.turn_index = ?2
-                AND b.btype != 'compaction'
-            ) AS turn_present
+    `SELECT f.content_hash, s.canonical_file_id, s.updated_at, s.index_state
      FROM sessions s
      JOIN files f ON f.id = s.canonical_file_id
      WHERE s.session_id = ?1`,
   )
-    .bind(sessionId, turnIndex)
+    .bind(sessionId)
     .first<{
       content_hash: string;
+      canonical_file_id: number;
       updated_at: string | null;
       index_state: string;
-      turn_present: number;
     }>();
   if (!turn) return new Response('turn not found', { status: 404 });
 
@@ -176,63 +172,71 @@ async function handlePost(request: Request, url: URL, env: Env): Promise<Respons
   ) {
     return new Response('stale transcript', { status: 409 });
   }
-  if (turn.turn_present !== 1) return new Response('turn not found', { status: 404 });
+  const present = await indexDbFor(env, sessionId).prepare(
+    `SELECT 1 AS present FROM blocks
+     WHERE session_id = ?1 AND file_id = ?2 AND turn_index = ?3 AND btype != 'compaction'
+     LIMIT 1`,
+  )
+    .bind(sessionId, turn.canonical_file_id, turnIndex)
+    .first<{ present: number }>();
+  if (!present) return new Response('turn not found', { status: 404 });
 
+  // The shard existence check is not a cross-database transaction. Ingest invalidates main
+  // readiness before replacing blocks; this main-only CAS rechecks that same source revision
+  // and canonical file before either mutation can commit.
+  const revisionGuard = `SELECT 1
+    FROM sessions s JOIN files f ON f.id = s.canonical_file_id
+    WHERE s.session_id = ?1
+      AND s.index_state = 'ready'
+      AND s.canonical_file_id = ?3
+      AND f.content_hash || ':' || COALESCE(s.updated_at, '') = ?4`;
   let applied: { applied: number } | null;
   if (turnStar[3] === 'star') {
     applied = await env.DB.prepare(
       `INSERT INTO starred_turns (session_id, turn_key)
-       SELECT ?1, ?2
-       WHERE EXISTS (
-         SELECT 1
-         FROM sessions s
-         JOIN files f ON f.id = s.canonical_file_id
-         JOIN blocks b ON b.session_id = s.session_id AND b.file_id = s.canonical_file_id
-         WHERE s.session_id = ?1
-           AND s.index_state = 'ready'
-           AND b.turn_index = ?3
-           AND b.btype != 'compaction'
-           AND f.content_hash || ':' || COALESCE(s.updated_at, '') = ?4
-       )
+       SELECT ?1, ?2 WHERE EXISTS (${revisionGuard})
        ON CONFLICT (session_id, turn_key) DO UPDATE SET turn_key = excluded.turn_key
        RETURNING 1 AS applied`,
     )
-      .bind(sessionId, turnKey, turnIndex, transcriptRevision)
+      .bind(sessionId, turnKey, turn.canonical_file_id, transcriptRevision)
       .first<{ applied: number }>();
   } else {
     const [guard] = await env.DB.batch<{ applied: number }>([
-      env.DB.prepare(
-        `SELECT 1 AS applied
-         FROM sessions s
-         JOIN files f ON f.id = s.canonical_file_id
-         JOIN blocks b ON b.session_id = s.session_id AND b.file_id = s.canonical_file_id
-         WHERE s.session_id = ?1
-           AND s.index_state = 'ready'
-           AND b.turn_index = ?3
-           AND b.btype != 'compaction'
-           AND f.content_hash || ':' || COALESCE(s.updated_at, '') = ?4
-         LIMIT 1`,
-      ).bind(sessionId, turnKey, turnIndex, transcriptRevision),
+      env.DB.prepare(`SELECT 1 AS applied WHERE EXISTS (${revisionGuard})`)
+        .bind(sessionId, turnKey, turn.canonical_file_id, transcriptRevision),
       env.DB.prepare(
         `DELETE FROM starred_turns
-         WHERE session_id = ?1
-           AND turn_key = ?2
-           AND EXISTS (
-             SELECT 1
-             FROM sessions s
-             JOIN files f ON f.id = s.canonical_file_id
-             JOIN blocks b ON b.session_id = s.session_id AND b.file_id = s.canonical_file_id
-             WHERE s.session_id = ?1
-               AND s.index_state = 'ready'
-               AND b.turn_index = ?3
-               AND b.btype != 'compaction'
-               AND f.content_hash || ':' || COALESCE(s.updated_at, '') = ?4
-           )`,
-      ).bind(sessionId, turnKey, turnIndex, transcriptRevision),
+         WHERE session_id = ?1 AND turn_key = ?2 AND EXISTS (${revisionGuard})`,
+      ).bind(sessionId, turnKey, turn.canonical_file_id, transcriptRevision),
     ]);
     applied = guard?.results[0] ?? null;
   }
   if (!applied) return new Response('stale transcript', { status: 409 });
+  let catalogPending = false;
+  try {
+    catalogPending = (await syncSessionCatalog(env, [sessionId])).state === 'pending';
+  } catch (error) {
+    catalogPending = true;
+    // The main star mutation has committed. Its trigger-backed outbox remains durable if
+    // replication fails, so do not turn an applied mutation into an apparent HTTP failure.
+    console.error(JSON.stringify({
+      event: 'hub.index_catalog.sync_failed',
+      session_id: sessionId,
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+  if (catalogPending) {
+    try {
+      await env.ROLLUP_QUEUE.send({ kind: 'index-catalog' });
+    } catch (queueError) {
+      // Request-completion and scheduled reconciliation can still drain the durable outbox.
+      console.error(JSON.stringify({
+        event: 'hub.index_catalog.enqueue_failed',
+        session_id: sessionId,
+        error: queueError instanceof Error ? queueError.message : String(queueError),
+      }));
+    }
+  }
 
   const page = Math.floor(turnIndex / TURNS_PER_PAGE) + 1;
   const view = url.searchParams.get('view') === 'effective' ? 'effective' : 'chronological';

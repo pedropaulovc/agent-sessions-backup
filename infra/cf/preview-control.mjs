@@ -5,7 +5,11 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import {
   MAX_WORKER_BUNDLE_BYTES,
+  PREVIEW_ACCOUNT_ID,
+  PREVIEW_INDEX_SHARD_COUNT,
   assertContainedRegularFile,
+  assertPreviewIndexLayout,
+  assertPreviewResourceNames,
   assertPreviewAccount,
   deleteInDependencyPasses,
   emptyR2Bucket,
@@ -19,6 +23,8 @@ import {
   parseArgs,
   positiveInteger,
   previewBearerToken,
+  previewDatabasePlan,
+  previewIndexLayout,
   previewResourceOwner,
   previewWranglerEnvironment,
   queueConsumerIdsForQueue,
@@ -31,8 +37,16 @@ import {
   writeCanonicalJson,
 } from './preview-trust.mjs';
 import { deactivatePreviewDeployments } from './preview-deployment.mjs';
+import { indexControlClient } from './index-control.mjs';
+import { verifyD1BatchAtomicity } from './d1-batch-atomicity.mjs';
 import { migrationDigest } from '../../hub/scripts/lib/migration-manifest.mjs';
 import { SYNTHETIC_EXPECTATIONS, fixtureModelPriceSql } from '../../hub/scripts/lib/dev-seed.mjs';
+import {
+  INDEX_LAYOUT,
+  SHARD_META_INIT_SQL,
+  SHARD_META_SELECT_SQL,
+  indexIdBase,
+} from '../../hub/src/index-layout.mjs';
 
 const [command, ...rest] = process.argv.slice(2);
 const allowed = new Set([
@@ -48,6 +62,7 @@ const previewAccountId = args['account-id'] ?? process.env.CLOUDFLARE_PPE_ACCOUN
 const previewToken = process.env.CLOUDFLARE_PPE_API_TOKEN;
 
 const MIGRATION_LEDGER_KEY = 'preview_migration_files';
+const INDEX_LAYOUT_KEY = 'preview_index_layout';
 
 // An empty credential means the repository was never provisioned, not that the code is wrong,
 // so say which value is missing and which command installs it rather than failing bare.
@@ -169,7 +184,8 @@ async function inactivateDeploymentCardsBatch() {
 
 async function cf(pathname, init = {}) {
   requireCloudflareEnvironment();
-  const { allowNotFound = false, returnEnvelope = false, ...fetchInit } = init;
+  const { allowNotFound = false, responseFormat = 'result', ...fetchInit } = init;
+  if (responseFormat !== 'result' && responseFormat !== 'envelope') fail('Cloudflare response format must be result or envelope');
   const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${previewAccountId}/${pathname}`, {
     ...fetchInit,
     redirect: 'error',
@@ -192,7 +208,7 @@ async function cf(pathname, init = {}) {
   if (!response.ok || parsed.success === false) {
     fail(`Cloudflare ${pathname} failed with ${response.status}: ${stableJson(parsed.errors ?? parsed)}`);
   }
-  return returnEnvelope ? parsed : parsed.result ?? parsed;
+  return responseFormat === 'envelope' ? parsed : parsed.result ?? parsed;
 }
 
 /** One parameterized statement against a preview D1 over the REST API. */
@@ -240,37 +256,73 @@ async function ensureResource(kind, name, pathname, body, idFields) {
   const existing = await resolveExistingId(kind, name);
   if (existing != null) return existing;
   const result = await cf(pathname, { method: 'POST', body: stableJson(body) });
+  const returnedName = result?.name ?? result?.title ?? result?.queue_name;
+  if (returnedName !== undefined && returnedName !== name) fail(`Cloudflare returned a foreign name for ${kind} ${name}`);
   const id = idFields.map((field) => result?.[field]).find((value) => typeof value === 'string' && value.length > 0);
   if (!id) fail(`Cloudflare did not return an ID for ${kind} ${name}`);
   return id;
 }
 
 /** Create-if-missing for the persistent per-PR backing resources; idempotent on rerun. */
-async function ensureBackingResources(names) {
-  const d1 = await ensureResource('d1', names.d1, 'd1/database', { name: names.d1 }, ['uuid', 'id']);
+async function ensureBackingResources(names, databasePlan) {
+  const ids = new Map(databasePlan.existing);
+  for (const { binding, name } of databasePlan.missing) {
+    ids.set(binding, await ensureResource('d1', name, 'd1/database', { name }, ['uuid', 'id']));
+  }
   const r2 = await ensureResource('r2', names.r2, 'r2/buckets', { name: names.r2 }, ['name']);
   const kv = await ensureResource('kv', names.kv, 'storage/kv/namespaces', { title: names.kv }, ['id']);
   const dlq = await ensureResource('queue', names.dlq, 'queues', { queue_name: names.dlq }, ['queue_id', 'id']);
   const queue = await ensureResource('queue', names.queue, 'queues', { queue_name: names.queue }, ['queue_id', 'id']);
   const rollupQueue = await ensureResource('queue', names.rollupQueue, 'queues', { queue_name: names.rollupQueue }, ['queue_id', 'id']);
-  return { d1, r2, kv, dlq, queue, rollupQueue };
+  const databases = previewIndexLayout(names).databases;
+  return { d1: ids.get('DB'), indexShards: databases.slice(1).map(({ binding }) => ids.get(binding)), r2, kv, dlq, queue, rollupQueue };
+}
+
+/** Validate the running source's bindings before reusing any persistent resource. */
+async function assertDeployedLayout(names, databasePlan, databases, recordedLayout) {
+  const settings = await cf(`workers/scripts/${encodeURIComponent(names.app)}/settings`, { allowNotFound: true });
+  if (settings === null) return false;
+  const bindings = settings.bindings ?? [];
+  const counts = bindings.filter((binding) => binding.name === 'INDEX_SHARD_COUNT');
+  const indexBindings = bindings.filter((binding) => /^IDX/.test(binding.name ?? ''));
+  // A pre-sharding preview is reset below, never read through its old main index.
+  const legacy = counts.length === 0 && indexBindings.length === 0;
+  if (!legacy && (counts.length !== 1 || counts[0].type !== 'plain_text'
+    || counts[0].text !== String(previewIndexLayout(names).count))) {
+    fail('deployed preview index count is immutable; refusing to change its topology');
+  }
+  const expected = previewIndexLayout(names).databases;
+  if (!legacy && indexBindings.length !== expected.length - 1) fail('deployed preview has a different index binding layout');
+  if (bindings.filter((binding) => binding.type === 'd1').length !== (legacy ? 1 : expected.length)) {
+    fail('deployed preview has a different database binding layout');
+  }
+  for (const { binding, name } of legacy ? expected.slice(0, 1) : expected) {
+    const configured = bindings.filter((entry) => entry.name === binding);
+    if (configured.length !== 1 || configured[0].type !== 'd1'
+      || (databasePlan.existing.has(binding)
+        ? configured[0].id !== databasePlan.existing.get(binding)
+        // Only a validated recorded topology can defer a missing database's ID check
+        // to its mandatory full reset. An ID still in the account is not missing.
+        : recordedLayout === null || typeof configured[0].id !== 'string'
+          || configured[0].id.length === 0 || databases.some((database) => database.uuid === configured[0].id))) {
+      fail(`deployed preview ${binding} does not bind the trusted database ${name}`);
+    }
+  }
+  return legacy;
 }
 
 /**
  * The persistent-D1 divergence guard. Wrangler's ledger tracks applied migrations by NAME
- * only, so a PR that edits a migration file its own preview already applied would silently
- * keep the old schema — the classic mystery drift. We record each applied file's sha256 in
- * the preview's `meta` table; when the artifact disagrees with what was actually applied
- * (edited bytes, or an applied name that left the manifest), the D1 is reset — deleted and
- * recreated empty — and migrations apply from scratch. Loud by design: the reset drops any
- * hand-uploaded session data, and re-uploading is one self-serve command.
+ * only. Each database records applied SHA-256s in its own metadata table. If any database
+ * disagrees with the artifact, the whole main+index topology resets together. Loud by
+ * design: a reset drops hand-uploaded session data; re-uploading is one self-serve command.
  */
 /** A D1 error that means the table simply isn't there yet — anything else must propagate. */
 function isMissingTable(error) {
   return /no such table/i.test(String(error?.message ?? error));
 }
 
-async function migrationDivergence(databaseId, artifactMigrations) {
+async function migrationDivergence(databaseId, artifactMigrations, indexShard = false) {
   let applied;
   try {
     applied = await d1Query(databaseId, "SELECT name FROM d1_migrations ORDER BY id");
@@ -281,14 +333,16 @@ async function migrationDivergence(databaseId, artifactMigrations) {
     return { diverged: false, reason: 'fresh database (no migration ledger)' };
   }
   const appliedNames = applied.map((row) => row.name);
-  if (appliedNames.length === 0) return { diverged: false, reason: 'no applied migrations' };
+  if (appliedNames.length === 0) return { diverged: false, applied: false, reason: 'no applied migrations' };
   const byName = new Map(artifactMigrations.map((item) => [item.filename, item.sha256]));
   for (const name of appliedNames) {
-    if (!byName.has(name)) return { diverged: true, reason: `applied migration ${name} left the manifest` };
+    if (!byName.has(name)) return { diverged: true, applied: true, reason: `applied migration ${name} left the manifest` };
   }
   let ledger = {};
   try {
-    const rows = await d1Query(databaseId, 'SELECT value FROM meta WHERE key = ?1', [MIGRATION_LEDGER_KEY]);
+    const rows = await d1Query(databaseId, indexShard
+      ? 'SELECT value FROM index_migration_state WHERE name = ?1'
+      : 'SELECT value FROM meta WHERE key = ?1', [MIGRATION_LEDGER_KEY]);
     if (rows[0]?.value) ledger = JSON.parse(rows[0].value);
   } catch (error) {
     // A pre-guard database has no meta table; any other failure must propagate.
@@ -296,14 +350,14 @@ async function migrationDivergence(databaseId, artifactMigrations) {
   }
   for (const name of appliedNames) {
     const recorded = ledger[name];
-    if (recorded && recorded !== byName.get(name)) {
-      return { diverged: true, reason: `applied migration ${name} was edited after it ran here` };
+    if (recorded !== byName.get(name)) {
+      return { diverged: true, applied: true, reason: `applied migration ${name} has missing or changed checksum evidence` };
     }
   }
-  return { diverged: false, reason: 'applied prefix matches the artifact' };
+  return { diverged: false, applied: true, reason: 'applied prefix matches the artifact' };
 }
 
-async function recordMigrationLedger(databaseId, artifactMigrations, appliedNames) {
+async function recordMigrationLedger(databaseId, artifactMigrations, appliedNames, indexShard = false) {
   const byName = new Map(artifactMigrations.map((item) => [item.filename, item.sha256]));
   const ledger = {};
   for (const name of appliedNames) {
@@ -311,9 +365,37 @@ async function recordMigrationLedger(databaseId, artifactMigrations, appliedName
   }
   await d1Query(
     databaseId,
-    'INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value',
+    indexShard
+      ? 'INSERT INTO index_migration_state (name, value) VALUES (?1, ?2) ON CONFLICT (name) DO UPDATE SET value = excluded.value'
+      : 'INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value',
     [MIGRATION_LEDGER_KEY, stableJson(ledger)],
   );
+}
+
+async function recordedPreviewLayout(databaseId) {
+  try {
+    const rows = await d1Query(databaseId, 'SELECT value FROM meta WHERE key = ?1', [INDEX_LAYOUT_KEY]);
+    return rows[0]?.value ? JSON.parse(rows[0].value) : null;
+  } catch (error) {
+    if (!isMissingTable(error)) throw error;
+    return null;
+  }
+}
+
+async function assertShardLayout(databaseId, shard, initialize = false) {
+  const count = PREVIEW_INDEX_SHARD_COUNT;
+  if (initialize) await d1Query(databaseId, SHARD_META_INIT_SQL, [shard, count, INDEX_LAYOUT, indexIdBase(shard)]);
+  let rows;
+  try {
+    rows = await d1Query(databaseId, SHARD_META_SELECT_SQL);
+  } catch (error) {
+    if (!initialize && isMissingTable(error)) return;
+    throw error;
+  }
+  if (!initialize && rows.length === 0) return;
+  if (rows.length !== 1 || rows[0].shard_index !== shard || rows[0].shard_count !== count || rows[0].layout !== INDEX_LAYOUT) {
+    fail(`preview shard ${shard} has a different immutable count/hash layout`);
+  }
 }
 
 function previewChildEnvironment() {
@@ -474,28 +556,72 @@ async function provision() {
   const wrangler = path.resolve(args.wrangler);
   const names = resourceNames(pr);
 
-  const migrationsDirectory = path.join(hubRoot, 'migrations');
-  const migrationManifestPath = path.join(migrationsDirectory, 'manifest.json');
-  // A stray file in migrations/ would be silently ignored by the runner; reject it here.
-  migrationSqlNames(await readdir(migrationsDirectory));
-  const migrationManifest = JSON.parse(await readFile(migrationManifestPath, 'utf8'));
-  if (!Array.isArray(migrationManifest.migrations)) fail('migration manifest has no migrations');
-  const expectedMigrationDigest = migrationDigest(migrationManifest);
+  const loadMigrationSet = async (directory) => {
+    const manifestPath = path.join(directory, 'manifest.json');
+    // Reject stray files in BOTH migration directories rather than silently ignoring them.
+    migrationSqlNames(await readdir(directory));
+    const manifest = JSON.parse(await readFile(manifestPath, 'utf8'));
+    if (!Array.isArray(manifest.migrations)) fail(`migration manifest has no migrations: ${manifestPath}`);
+    return { directory, manifestPath, manifest, digest: migrationDigest(manifest) };
+  };
+  const mainMigrations = await loadMigrationSet(path.join(hubRoot, 'migrations'));
+  const indexMigrations = await loadMigrationSet(path.join(hubRoot, 'migrations-index'));
+  const layout = previewIndexLayout(names);
+  const databaseDefinitions = layout.databases.map((database, index) => ({
+    ...database, indexShard: index !== 0, migrations: index === 0 ? mainMigrations : indexMigrations,
+  }));
+  const expectedMigrationDigest = sha256Bytes(stableJson(databaseDefinitions.map(({ binding, migrations }) =>
+    ({ binding, digest: migrations.digest }))));
+  const databases = await paginatedList(cf, 'd1/database', {
+    pagination: 'page', rowsOf: (envelope) => envelope.result,
+  });
+  const databasePlan = previewDatabasePlan(databases, names);
+  // Validate the persisted names before permitting a missing binding ID to defer to reset.
+  const existingMain = databasePlan.existing.get('DB');
+  const recordedLayout = existingMain ? await recordedPreviewLayout(existingMain) : null;
+  if (recordedLayout !== null) assertPreviewIndexLayout(recordedLayout, names);
+  const legacySource = await assertDeployedLayout(names, databasePlan, databases, recordedLayout);
+  if (recordedLayout !== null && legacySource) fail('deployed preview lost its immutable index layout');
+  const divergences = [];
+  for (let index = 0; index < databaseDefinitions.length; index += 1) {
+    const database = databaseDefinitions[index];
+    const id = databasePlan.existing.get(database.binding);
+    if (!id) {
+      divergences.push({ diverged: false, applied: false, reason: 'fresh database' });
+      continue;
+    }
+    if (database.indexShard) await assertShardLayout(id, index - 1);
+    divergences.push(await migrationDivergence(id, database.migrations.manifest.migrations, database.indexShard));
+  }
 
   const temporary = await mkdtemp(path.join(os.tmpdir(), `sessions-preview-${pr}-`));
   try {
     const build = await buildPreviewBundle({ hubRoot, wrangler, names, workDirectory: temporary });
-    const resources = await ensureBackingResources(names);
-
-    const divergence = await migrationDivergence(resources.d1, migrationManifest.migrations);
-    if (divergence.diverged) {
-      process.stderr.write(`!! preview D1 reset: ${divergence.reason} — dropping ${names.d1} and reapplying from scratch\n`);
-      await cf(`d1/database/${encodeURIComponent(resources.d1)}`, { method: 'DELETE', allowNotFound: true });
-      resources.d1 = await ensureResource('d1', names.d1, 'd1/database', { name: names.d1 }, ['uuid', 'id']);
-      // The index rows are gone with the database, so the stored R2 objects would be
-      // unreachable orphans — drop them in the same reset to keep the two stores consistent.
+    let provisionPlan = databasePlan;
+    // An old single-DB preview or an interrupted first migration cannot preserve a partial
+    // catalog/index set. Missing databases in a previously recorded topology also reset all.
+    const incomplete = (recordedLayout === null && divergences.some((item) => item.applied))
+      || (recordedLayout !== null && databasePlan.missing.length > 0);
+    const reset = incomplete || divergences.some((item) => item.diverged);
+    if (reset) {
+      const reason = incomplete ? 'legacy or incomplete main+index topology'
+        : divergences.find((item) => item.diverged).reason;
+      process.stderr.write(`!! preview D1 reset: ${reason} — dropping all three databases and reapplying from scratch\n`);
+      // Quiesce the old source before destroying its catalog/index. If interrupted, no
+      // Worker can write a mixed generation and the next provision detects partial state.
+      await detachQueueConsumers(names);
+      await cf(`workers/scripts/${encodeURIComponent(names.app)}`, { method: 'DELETE', allowNotFound: true });
+      // Empty R2 BEFORE the last database disappears: an interrupted reset must not
+      // look like a fresh topology while retaining unreachable old uploads.
       await emptyR2Bucket(names.r2, cf);
+      for (const { binding } of databaseDefinitions) {
+        const id = databasePlan.existing.get(binding);
+        if (id) await cf(`d1/database/${encodeURIComponent(id)}`, { method: 'DELETE', allowNotFound: true });
+      }
+      provisionPlan = { existing: new Map(), missing: layout.databases };
     }
+    const resources = await ensureBackingResources(names, provisionPlan);
+    const databaseId = (index) => index === 0 ? resources.d1 : resources.indexShards[index - 1];
 
     const application = {
       assetSigningSecret: randomBytes(32).toString('base64url'),
@@ -512,7 +638,8 @@ async function provision() {
     const generateConfig = (file, schemaDigest) => writeCanonicalJson(file, generatedPrivateAppConfig({
       accountId: previewAccountId,
       main: build.bundle,
-      migrationsDir: migrationsDirectory,
+      migrationsDir: mainMigrations.directory,
+      indexMigrationsDir: indexMigrations.directory,
       names,
       resources: { ...configResources, schemaDigest },
       application,
@@ -520,27 +647,40 @@ async function provision() {
 
     const migrationConfigPath = path.join(temporary, 'wrangler.migrations.generated.json');
     await generateConfig(migrationConfigPath, '0'.repeat(64));
-    const migration = runJson(path.resolve(args['migrations-cli']), [
-      'apply', '--target', 'preview', '--config', migrationConfigPath, '--database', 'DB',
-      '--journal', path.join(temporary, `preview-${pr}.migrations.json`),
-      '--artifact-digest', build.artifactDigest,
-      '--deployment-id', `pr-${pr}-${sha.slice(0, 12)}`,
-      '--migrations-dir', migrationsDirectory,
-      '--manifest', migrationManifestPath,
-      // The immutable committed baseline, the same evidence production migrations use. The
-      // PR-vs-protected-base check is CI's `migrations.mjs check`, which gates this job.
-      '--base-manifest', path.join(migrationsDirectory, 'source-baseline.json'),
-    ], hubRoot);
-    if (migration.pendingMigrations !== 0 || !/^[0-9a-f]{64}$/.test(migration.schemaDigest ?? '')) {
-      fail('migration runner did not prove zero pending migrations and a schema digest');
+    const schemaDigests = [];
+    for (let index = 0; index < databaseDefinitions.length; index += 1) {
+      const { binding, indexShard, migrations } = databaseDefinitions[index];
+      const migration = runJson(path.resolve(args['migrations-cli']), [
+        'apply', '--target', 'preview', '--config', migrationConfigPath, '--database', binding,
+        '--database-id', databaseId(index),
+        '--journal', path.join(temporary, `preview-${pr}-${binding}.migrations.json`),
+        '--artifact-digest', build.artifactDigest,
+        '--deployment-id', `pr-${pr}-${sha.slice(0, 12)}-${binding}`,
+        '--migrations-dir', migrations.directory,
+        '--manifest', migrations.manifestPath,
+        '--base-manifest', path.join(migrations.directory, 'source-baseline.json'),
+        // Shards begin checksum-ledger coverage at migration 1; they have no historical range.
+        ...(!indexShard ? ['--history', path.join(migrations.directory, 'historical-baseline.json')] : []),
+      ], hubRoot);
+      if (migration.pendingMigrations !== 0 || !/^[0-9a-f]{64}$/.test(migration.schemaDigest ?? '')) {
+        fail(`${binding} migration runner did not prove zero pending migrations and a schema digest`);
+      }
+      if (migration.migrationDigest !== migrations.digest) {
+        fail(`${binding} applied migration digest differs from the checked-out manifest`);
+      }
+      await recordMigrationLedger(databaseId(index), migrations.manifest.migrations,
+        migrations.manifest.migrations.map((item) => item.filename), indexShard);
+      if (indexShard) await assertShardLayout(databaseId(index), index - 1, true);
+      schemaDigests.push({ binding, digest: migration.schemaDigest });
     }
-    if (migration.migrationDigest !== expectedMigrationDigest) {
-      fail('applied migration digest differs from the checked-out manifest');
-    }
-    await recordMigrationLedger(
-      resources.d1,
-      migrationManifest.migrations,
-      migrationManifest.migrations.map((item) => item.filename),
+    const schemaDigest = sha256Bytes(stableJson(schemaDigests));
+    await d1Query(resources.d1,
+      'INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT (key) DO UPDATE SET value = excluded.value',
+      [INDEX_LAYOUT_KEY, stableJson(layout)]);
+    // Exercise the same native REST batch adapter used by protected production copy.
+    // No main/source data is touched; only the first index shard receives an owned probe.
+    const indexBatchAtomicity = await verifyD1BatchAtomicity(
+      indexControlClient(PREVIEW_ACCOUNT_ID, previewToken).db(resources.indexShards[0]),
     );
 
     // Fixture prices, before the app is deployed and long before `seed` uploads any session: the
@@ -552,15 +692,17 @@ async function provision() {
     await d1Query(resources.d1, fixtureModelPriceSql());
 
     const appConfigPath = path.join(temporary, 'wrangler.app.generated.json');
-    await generateConfig(appConfigPath, migration.schemaDigest);
+    await generateConfig(appConfigPath, schemaDigest);
     deployApp(wrangler, appConfigPath, hubRoot, names.host);
     await awaitRoutableHost(names.host);
 
     const summary = {
       url: `https://${names.host}`,
-      d1Reset: divergence.diverged,
+      d1Reset: reset,
       artifactDigest: build.artifactDigest,
-      schemaDigest: migration.schemaDigest,
+      schemaDigest,
+      indexBatchAtomicity,
+      schemaDigests,
     };
     if (args['github-output']) {
       await appendFile(path.resolve(args['github-output']), [
@@ -745,11 +887,12 @@ async function seed() {
     const encoded = relative.split('/').map(encodeURIComponent).join('/');
     const target = `/api/v1/files/${encodeURIComponent(machine)}/${encodeURIComponent(uploadStore)}/${encoded}`;
     const init = {
+      // Fetch computes the wire Content-Length from the finite Buffer body.
+      // A caller-supplied copy duplicated the length in the observed local CLI.
       method: 'PUT',
       body: bytes,
       headers: {
         'content-type': 'application/octet-stream',
-        'content-length': String(bytes.length),
         'x-content-hash': `sha256:${sha256Bytes(bytes)}`,
         'x-file-mtime': '2026-07-01T00:00:00.000Z',
       },
@@ -838,20 +981,30 @@ async function seed() {
   })}\n`);
 }
 
-/** Detach consumers then delete one named resource set (queue-safe ordering). */
-async function deleteResourceSet(ownerPr, names) {
-  const deleted = [];
+async function detachQueueConsumers(names) {
+  const detachments = [];
   for (const queueName of [names.queue, names.dlq, names.rollupQueue]) {
     const queueId = await resolveExistingId('queue', queueName);
     if (queueId == null) continue;
     const consumers = await cf(`queues/${encodeURIComponent(queueId)}/consumers`, { allowNotFound: true });
     for (const consumerId of queueConsumerIdsForQueue(consumers ?? [], queueName)) {
-      await cf(
-        `queues/${encodeURIComponent(queueId)}/consumers/${encodeURIComponent(consumerId)}`,
-        { method: 'DELETE', allowNotFound: true },
-      );
+      detachments.push({ queueId, consumerId });
     }
   }
+  // Validate every queue owner before deleting even the first consumer.
+  for (const { queueId, consumerId } of detachments) {
+    await cf(
+      `queues/${encodeURIComponent(queueId)}/consumers/${encodeURIComponent(consumerId)}`,
+      { method: 'DELETE', allowNotFound: true },
+    );
+  }
+}
+
+/** Detach consumers then delete one named resource set (queue-safe ordering). */
+async function deleteResourceSet(ownerPr, names) {
+  assertPreviewResourceNames(names, ownerPr);
+  const deleted = [];
+  await detachQueueConsumers(names);
   const plan = [
     ['worker', names.app, (id) => `workers/scripts/${encodeURIComponent(id)}`],
     ['queue', names.queue, (id) => `queues/${encodeURIComponent(id)}`],
@@ -860,6 +1013,7 @@ async function deleteResourceSet(ownerPr, names) {
     ['kv', names.kv, (id) => `storage/kv/namespaces/${encodeURIComponent(id)}`],
     ['r2', names.r2, (id) => `r2/buckets/${encodeURIComponent(id)}`],
     ['d1', names.d1, (id) => `d1/database/${encodeURIComponent(id)}`],
+    ...names.indexShards.map((name) => ['d1', name, (id) => `d1/database/${encodeURIComponent(id)}`]),
   ];
   for (const [kind, name, endpoint] of plan) {
     const id = await resolveExistingId(kind, name);
@@ -878,7 +1032,7 @@ async function deleteResourceSet(ownerPr, names) {
 async function listOwnedResources() {
   const owned = [];
   const record = (kind, name, id) => {
-    const owner = previewResourceOwner(name);
+    const owner = previewResourceOwner(name, kind);
     if (owner) owned.push({ kind, name, id, ...owner });
   };
   // Workers scripts is the one account list with no documented pagination; the rest are
@@ -907,6 +1061,10 @@ async function listOwnedResources() {
 }
 
 async function deleteOwnedResource(item) {
+  const owner = previewResourceOwner(item.name, item.kind);
+  if (!owner || owner.pr !== item.pr || owner.legacy !== item.legacy || !item.id) {
+    fail('refusing cleanup of an untrusted preview resource');
+  }
   if (item.kind === 'queue') {
     const consumers = await cf(`queues/${encodeURIComponent(item.id)}/consumers`, { allowNotFound: true });
     for (const consumerId of queueConsumerIdsForQueue(consumers ?? [], item.name)) {

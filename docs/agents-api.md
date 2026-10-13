@@ -180,9 +180,32 @@ The response shape depends on what the session's canonical file actually is
 
 Params: `q` (FTS5 MATCH syntax — invalid syntax is retried as a quoted literal phrase, then
 degrades to an empty result set rather than a 500), `harness`, `machine`, `os`, `model`,
-`repo`, `project`, `cwd`, `session_date`, `session_time`, `has_star=1`, `subagent=no|yes`
-(defaults to `no`), `from`, `to`, `limit` (default 100, max 100), `cursor` (opaque,
-paginates), `facets=1` (adds counts for registered facets, including `has_star` and `subagent`).
+`repo`, `project`, `cwd`, `session_date`, `session_time`, `cost`, `has_star=1`, `subagent=no|yes`
+(defaults to `no`), `from`, `to`, `sort` (`relevance`, `session_time`, `total_tokens`, or
+`cost`), `limit` (default 100, max 100), `cursor` (opaque, paginates), `facets=1` (adds
+counts for registered facets, including `has_star` and `subagent`).
+
+The block index is session-hash sharded; every shard has the complete session/star
+catalog for filters and descendant-inclusive costs. All shards participate in hits
+and facet counts. Facet limits apply after global aggregation, not within each shard.
+No transcript or searchable block text is shortened to make the index fit.
+
+Relevance uses **shard-local FTS5 BM25** followed by globally unique block ID. This
+intentionally changes relevance order from the former single-corpus index; it does
+not change the matching corpus. The other sorts retain their primary descending
+session duration, token, or subtree-cost order, with the same relevance/ID tie-break.
+NULL duration and unknown subtree cost sort last; unknown cost is not treated as $0.
+
+The cursor still encodes a **global result offset**, with lazy bounded shard pages.
+Use the same query, filters, sort and limit when following it. It is not a snapshot:
+concurrent ingest, metadata, pricing or star changes can move hits between pages.
+Deep offsets require reading earlier hits again; sharding does not remove D1 request
+or Worker invocation limits. Fan-out uses at most four concurrent shard operations.
+
+Before searching, the hub reconciles a bounded slice of the durable catalog outbox.
+A remaining backlog returns `503 {"error":"index_catalog_pending"}`, never stale
+filter/cost results. Database/schema failures remain errors; they are not classified
+as invalid MATCH syntax or silently replaced by partial-shard results.
 
 ### `GET /api/v1/usage?group_by=day|model|machine|repo&from&to&machine&harness&batch`
 

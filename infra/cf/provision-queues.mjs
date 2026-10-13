@@ -30,7 +30,8 @@ const queueName = target === 'production' ? 'session-rollup' : 'session-rollup-p
 async function cf(pathname, init = {}) {
   // paginatedList requests its envelope explicitly. A failed list must never be treated as
   // an empty account: authentication and API errors stop deployment before any resource write.
-  const { returnEnvelope = false, allowNotFound: _allowNotFound, ...fetchInit } = init;
+  const { responseFormat = 'result', allowNotFound: _allowNotFound, ...fetchInit } = init;
+  if (responseFormat !== 'result' && responseFormat !== 'envelope') fail('Cloudflare response format must be result or envelope');
   const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/${pathname}`, {
     ...fetchInit,
     redirect: 'error',
@@ -45,7 +46,7 @@ async function cf(pathname, init = {}) {
   if (!response.ok || envelope.success !== true) {
     fail(`Cloudflare ${pathname} failed with ${response.status}: ${stableJson(envelope.errors ?? envelope)}`);
   }
-  return returnEnvelope ? envelope : envelope.result;
+  return responseFormat === 'envelope' ? envelope : envelope.result;
 }
 
 const queues = await paginatedList(cf, 'queues', {

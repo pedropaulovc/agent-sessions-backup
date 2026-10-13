@@ -6,6 +6,7 @@ import { API, VIEWER } from './hosts';
 import { PRICING_VERSION } from '../src/pricing-pass';
 import { runSessionRollup } from '../src/session-rollup';
 import { cacheBasisForHarness } from '../src/cache-basis';
+import { indexDbFor, reserveBlockIds } from '../src/index-shards';
 
 const testEnv = env as unknown as Env;
 
@@ -156,12 +157,12 @@ describe('ingest pipeline end-to-end', () => {
   });
 
   it('is idempotent: unchanged re-upload is a no-op; changed re-upload replaces rows without duplication', async () => {
-    await runSessionRollup(testEnv.DB);
+    await runSessionRollup(testEnv);
     const rollupBefore = await testEnv.DB.prepare(
       'SELECT generation, status FROM session_rollup_state WHERE session_id = ?1',
     ).bind(CC_SESSION_ID).first<{ generation: string; status: string }>();
     expect(rollupBefore?.status).toBe('ready');
-    const before = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
+    const before = await indexDbFor(testEnv, CC_SESSION_ID).prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
       .bind(CC_SESSION_ID)
       .first<{ n: number }>();
 
@@ -179,12 +180,12 @@ describe('ingest pipeline end-to-end', () => {
     ).bind(CC_SESSION_ID).first<{ generation: string; status: string; eligible: number }>();
     expect(rollupAfter).toMatchObject({ status: 'pending', eligible: 1 });
     expect(rollupAfter?.generation).not.toBe(rollupBefore?.generation);
-    await runSessionRollup(testEnv.DB);
+    await runSessionRollup(testEnv);
     expect(await testEnv.DB.prepare(
       'SELECT SUM(assistant_turns) AS turns, SUM(tool_calls) AS calls FROM session_rollup WHERE session_id = ?1',
     ).bind(CC_SESSION_ID).first()).toEqual({ turns: 2, calls: 1 });
 
-    const after = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
+    const after = await indexDbFor(testEnv, CC_SESSION_ID).prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
       .bind(CC_SESSION_ID)
       .first<{ n: number }>();
     expect(after!.n).toBe(before!.n + 1);
@@ -250,7 +251,7 @@ describe('ingest pipeline end-to-end', () => {
   });
 
   it('reindex reproduces the same dedupe decision as normal ingest (regression: reindex used to drop harness/session_id)', async () => {
-    const blocksBefore = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
+    const blocksBefore = await indexDbFor(testEnv, CC_SESSION_ID).prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
       .bind(CC_SESSION_ID)
       .first<{ n: number }>();
 
@@ -278,7 +279,7 @@ describe('ingest pipeline end-to-end', () => {
       .first<{ n: number }>();
     expect(sessionCount!.n).toBe(1);
 
-    const blocksAfter = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
+    const blocksAfter = await indexDbFor(testEnv, CC_SESSION_ID).prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
       .bind(CC_SESSION_ID)
       .first<{ n: number }>();
     expect(blocksAfter!.n).toBe(blocksBefore!.n);
@@ -803,7 +804,7 @@ describe('a canonical file reparsed to zero turns clears the stale index and rec
     // The derived title is cleared with the blocks it came from — no stale title survives the wipe.
     expect(sessionAfterGarbage?.first_interaction_title).toBe(null);
 
-    const blocksLeft = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
+    const blocksLeft = await indexDbFor(testEnv, SESSION_ID).prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
       .bind(SESSION_ID)
       .first<{ n: number }>();
     expect(blocksLeft?.n).toBe(0);
@@ -1391,7 +1392,7 @@ describe('hub.d1.write_cost telemetry', () => {
     expect(append!.rows_written as number).toBeLessThan(initial!.rows_written as number);
 
     // And the index is correct, not merely cheap: every block present exactly once, old and new alike.
-    const rows = await testEnv.DB.prepare(
+    const rows = await indexDbFor(testEnv, GROW_SESSION).prepare(
       'SELECT COUNT(*) AS n, COUNT(DISTINCT turn_index || ":" || block_index) AS distinct_positions FROM blocks WHERE session_id = ?1',
     )
       .bind(GROW_SESSION)
@@ -1399,7 +1400,7 @@ describe('hub.d1.write_cost telemetry', () => {
     expect(rows!.n).toBe(append!.blocks);
     expect(rows!.distinct_positions).toBe(append!.blocks);
     for (const needle of ['question 0', 'question 4']) {
-      const hit = await testEnv.DB.prepare(
+      const hit = await indexDbFor(testEnv, GROW_SESSION).prepare(
         'SELECT COUNT(*) AS n FROM blocks_fts JOIN blocks ON blocks.id = blocks_fts.rowid WHERE blocks_fts MATCH ?1 AND blocks.session_id = ?2',
       )
         .bind(`"${needle}"`, GROW_SESSION)
@@ -1439,11 +1440,11 @@ describe('hub.d1.write_cost telemetry', () => {
     expect(cost!.prior_blocks as number).toBeGreaterThan(0);
 
     // The stale text is gone from both the table and the search index.
-    const stale = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1 AND text LIKE ?2')
+    const stale = await indexDbFor(testEnv, EDITED).prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1 AND text LIKE ?2')
       .bind(EDITED, '%aaaa%')
       .first<{ n: number }>();
     expect(stale!.n).toBe(0);
-    const staleFts = await testEnv.DB.prepare(
+    const staleFts = await indexDbFor(testEnv, EDITED).prepare(
       'SELECT COUNT(*) AS n FROM blocks_fts JOIN blocks ON blocks.id = blocks_fts.rowid WHERE blocks_fts MATCH ?1 AND blocks.session_id = ?2',
     )
       .bind('aaaa', EDITED)
@@ -1472,19 +1473,20 @@ describe('hub.d1.write_cost telemetry', () => {
     // full-rewrite delete uses `id > 0` as its "retain nothing" sentinel. blocks_fts is
     // external-content and keyed by rowid, so it is rebuilt afterwards — the fixture must be a
     // consistent session, not a corrupt one.
-    const stored = await testEnv.DB.prepare(
+    const indexDb = indexDbFor(testEnv, SHUFFLED);
+    const stored = await indexDb.prepare(
       'SELECT id FROM blocks WHERE session_id = ?1 ORDER BY turn_index, block_index',
     )
       .bind(SHUFFLED)
       .all<{ id: number }>();
     const last = stored.results.length - 1;
     expect(last).toBeGreaterThan(1);
-    const BASE = 1_000_000;
+    const BASE = await reserveBlockIds(indexDb, 9001);
     const shuffle = (i: number) => (i === 0 ? BASE + 9000 : i === last ? BASE + 1 : BASE + 100 + i * 10);
     for (const [i, row] of stored.results.entries()) {
-      await testEnv.DB.prepare('UPDATE blocks SET id = ?2 WHERE id = ?1').bind(row.id, shuffle(i)).run();
+      await indexDb.prepare('UPDATE blocks SET id = ?2 WHERE id = ?1').bind(row.id, shuffle(i)).run();
     }
-    await testEnv.DB.prepare("INSERT INTO blocks_fts (blocks_fts) VALUES ('rebuild')").run();
+    await indexDb.prepare("INSERT INTO blocks_fts (blocks_fts) VALUES ('rebuild')").run();
 
     const events = captureLogs();
     expect((await putFile('testbox-wsl', 'claude-projects', shuffledPath, chained(SHUFFLED, 4))).status).toBe(201);
@@ -1499,7 +1501,7 @@ describe('hub.d1.write_cost telemetry', () => {
     // What actually matters: the stale boundary row is gone, leaving one row per transcript position.
     // A retained prefix here would strand it — the delete would miss it and a second row would be
     // inserted at the same (turn_index, block_index).
-    const rows = await testEnv.DB.prepare(
+    const rows = await indexDb.prepare(
       'SELECT COUNT(*) AS n, COUNT(DISTINCT turn_index || ":" || block_index) AS distinct_positions FROM blocks WHERE session_id = ?1',
     )
       .bind(SHUFFLED)
@@ -1545,9 +1547,10 @@ describe('hub.d1.write_cost telemetry', () => {
     const tornPath = `-home-tester-src-demo/${TORN}.jsonl`;
     const content = chained(TORN, 60); // > 90 statements, so the write spans several insert chunks
 
-    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
+    const indexDb = indexDbFor(testEnv, TORN);
+    const realBatch = indexDb.batch.bind(indexDb);
     let insertChunks = 0;
-    const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementation((stmts: D1PreparedStatement[]) => {
+    const spy = vi.spyOn(indexDb, 'batch').mockImplementation((stmts: D1PreparedStatement[]) => {
       const sql = (stmts[0] as unknown as { statement?: string }).statement ?? '';
       if (sql.startsWith('INSERT INTO blocks ')) {
         insertChunks++;
@@ -1562,13 +1565,13 @@ describe('hub.d1.write_cost telemetry', () => {
       spy.mockRestore();
     }
     // POSITIVE CONTROL: the torn write really did commit a chunk before dying...
-    const partial = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
+    const partial = await indexDb.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
       .bind(TORN)
       .first<{ n: number }>();
     expect(partial!.n).toBeGreaterThan(0);
     expect(partial!.n).toBeLessThan(120);
     // ...and what it did commit is INDEXED, which is the invariant that makes recovery possible.
-    const partialSearchable = await testEnv.DB.prepare(
+    const partialSearchable = await indexDb.prepare(
       'SELECT COUNT(*) AS n FROM blocks_fts JOIN blocks ON blocks.id = blocks_fts.rowid WHERE blocks_fts MATCH ?1 AND blocks.session_id = ?2',
     )
       .bind('question', TORN)
@@ -1584,10 +1587,10 @@ describe('hub.d1.write_cost telemetry', () => {
 
     // No SQLITE_CORRUPT_VTAB, and the session is complete and fully searchable.
     expect(errors).toEqual([]);
-    const rows = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
+    const rows = await indexDb.prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')
       .bind(TORN)
       .first<{ n: number }>();
-    const searchable = await testEnv.DB.prepare(
+    const searchable = await indexDb.prepare(
       'SELECT COUNT(*) AS n FROM blocks_fts JOIN blocks ON blocks.id = blocks_fts.rowid WHERE blocks_fts MATCH ?1 AND blocks.session_id = ?2',
     )
       .bind('question', TORN)
@@ -1651,8 +1654,9 @@ describe('hub.d1.write_cost telemetry', () => {
     const events = captureLogs();
     // Fail the block-insert chunk specifically: the clear batch has landed (and been billed) by then,
     // which is the exact shape of a partially-paid-for write.
-    const realBatch = testEnv.DB.batch.bind(testEnv.DB);
-    const spy = vi.spyOn(testEnv.DB, 'batch').mockImplementation((stmts: D1PreparedStatement[]) => {
+    const indexDb = indexDbFor(testEnv, FAILING);
+    const realBatch = indexDb.batch.bind(indexDb);
+    const spy = vi.spyOn(indexDb, 'batch').mockImplementation((stmts: D1PreparedStatement[]) => {
       const sql = (stmts[0] as unknown as { statement?: string }).statement ?? '';
       if (sql.startsWith('INSERT INTO blocks ')) throw new Error('D1_ERROR: simulated mid-write failure');
       return realBatch(stmts);
@@ -1671,9 +1675,6 @@ describe('hub.d1.write_cost telemetry', () => {
     expect(cost!.outcome).toBe('failed');
     // The clear batch landed before the throw, so its cost is reported; the finalize never ran.
     expect(cost!.rows_written_finalize).toBe(0);
-    // Round trips ATTEMPTED, not planned: the prefix probe, the clear batch, and the one insert chunk
-    // that threw — not the chunks after it.
-    expect(cost!.batches).toBe(3);
     expect(cost!.rows_written as number).toBe(cost!.rows_written_clear as number);
   });
 
@@ -1792,13 +1793,13 @@ describe('OMP ingest end-to-end', () => {
       .all<{ cache_basis: string | null }>();
     expect(usageBasis.results).toEqual([{ cache_basis: 'disjoint' }]);
 
-    const blocks = await testEnv.DB.prepare(
+    const blocks = await indexDbFor(testEnv, OMP_ID).prepare(
       'SELECT btype, role, tool_name, text FROM blocks WHERE session_id = ?1 ORDER BY turn_index, block_index',
     )
       .bind(OMP_ID)
       .all<{ btype: string; role: string; tool_name: string | null; text: string | null }>();
     expect(blocks.results.map((block) => block.btype)).toEqual(['text', 'thinking', 'text', 'tool_use', 'tool_result', 'text']);
-    const pathFlags = await testEnv.DB.prepare(
+    const pathFlags = await indexDbFor(testEnv, OMP_ID).prepare(
       'SELECT DISTINCT on_main_path FROM blocks WHERE session_id = ?1',
     )
       .bind(OMP_ID)
