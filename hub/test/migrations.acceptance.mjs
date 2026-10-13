@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { cp, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -19,7 +20,6 @@ import {
   validateManifestShape,
   verifySignedReleaseManifest,
 } from '../scripts/lib/migration-manifest.mjs';
-import { hasLocalLegacyBlocks, migrationDatabaseIdentity, resolveMigrationDigest, runMigrations } from '../scripts/lib/migration-runner.mjs';
 import { writeLocalConfig } from '../scripts/lib/local-config.mjs';
 import { fixtureModelPriceSql } from '../scripts/lib/dev-seed.mjs';
 import {
@@ -36,6 +36,10 @@ const sourceBaselinePath = path.join(migrationsDir, 'source-baseline.json');
 const historyPath = path.join(migrationsDir, 'historical-baseline.json');
 const indexMigrationsDir = path.join(hubRoot, 'migrations-index');
 const artifactDigest = 'a'.repeat(64);
+const migrationRunnerUrl = process.env.MIGRATION_RUNNER_PATH
+  ? pathToFileURL(path.resolve(process.env.MIGRATION_RUNNER_PATH)).href
+  : new URL('../scripts/lib/migration-runner.mjs', import.meta.url).href;
+const { hasLocalLegacyBlocks, migrationDatabaseIdentity, resolveMigrationDigest, runMigrations } = await import(migrationRunnerUrl);
 
 async function loadFixture(directory = migrationsDir) {
   const manifest = JSON.parse(await readFile(path.join(directory, 'manifest.json'), 'utf8'));
@@ -132,6 +136,142 @@ function createWranglerProcess(
       return { stdout: JSON.stringify([{ results: rows }]), stderr: '' };
     },
   };
+}
+
+async function createRemoteMigrationFixture(context, { fault } = {}) {
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hub-remote-migration-'));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const database = new DatabaseSync(':memory:');
+  context.after(() => database.close());
+  const { unstable_splitSqlQuery: splitSqlQuery } = await import('wrangler');
+  const accountId = '1'.repeat(32);
+  const databaseId = 'ac2e6cc9-6ef5-4943-ac40-b7076848bd05';
+  const configPath = path.join(directory, 'wrangler.json');
+  const journalPath = path.join(directory, 'migration.json');
+  const runnerPath = path.join(directory, 'run.mjs');
+  await writeFile(configPath, JSON.stringify({
+    name: 'remote-migration-test',
+    account_id: accountId,
+    compatibility_date: '2026-01-01',
+    d1_databases: [{
+      binding: 'IDX00', database_name: 'remote-migration-test-idx00', database_id: databaseId,
+      migrations_dir: indexMigrationsDir,
+    }],
+  }));
+  await writeFile(runnerPath, `
+    import { runMigrations } from ${JSON.stringify(migrationRunnerUrl)};
+    try {
+      console.log(JSON.stringify(await runMigrations(JSON.parse(process.argv[2]))));
+    } catch (error) {
+      console.error(error.stack ?? error.message);
+      process.exitCode = 1;
+    }
+  `);
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    const event = { method: request.method, path: request.url };
+    requests.push(event);
+    const send = (status, body) => {
+      response.writeHead(status, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify(body));
+    };
+    try {
+      assert.equal(request.method, 'POST');
+      assert.equal(request.url, `/client/v4/accounts/${accountId}/d1/database/${databaseId}/query`);
+      assert.equal(request.headers.authorization, 'Bearer synthetic-migration-test-token');
+      let body = '';
+      for await (const chunk of request) body += chunk;
+      const { sql } = JSON.parse(body);
+      event.sql = sql;
+      const appliedRead = sql === 'SELECT name FROM d1_migrations ORDER BY id';
+      if (appliedRead && fault === 'auth') {
+        event.failure = 'auth';
+        // Even ledger-like diagnostic text cannot override a native permission code.
+        send(403, { success: false, errors: [{ code: 10000, message: 'no such table: d1_migrations: SQLITE_ERROR' }] });
+        return;
+      }
+      if (appliedRead && fault === 'network') {
+        event.failure = 'network';
+        request.socket.destroy();
+        return;
+      }
+      if (appliedRead && fault === 'malformed') {
+        event.failure = 'malformed';
+        send(200, { success: true, result: [{ success: true, results: {} }] });
+        return;
+      }
+      const actualSql = appliedRead && fault === 'unrelated-sql'
+        ? 'SELECT name FROM unrelated_missing_table ORDER BY id' : sql;
+      database.exec('BEGIN');
+      let results;
+      try {
+        results = splitSqlQuery(actualSql).map((statementSql) => {
+          const statement = database.prepare(statementSql);
+          const rows = statement.columns().length ? statement.all().map((row) => ({ ...row }))
+            : (statement.run(), []);
+          return { success: true, results: rows, meta: { duration: 0 } };
+        });
+        database.exec('COMMIT');
+      } catch (error) {
+        database.exec('ROLLBACK');
+        throw error;
+      }
+      event.success = true;
+      if (fault === 'missing-after-apply' && /INSERT INTO\s+"d1_migrations"/i.test(sql)) {
+        database.exec('DROP TABLE d1_migrations');
+      }
+      send(200, { success: true, result: results, errors: [], messages: [] });
+    } catch (error) {
+      event.failure = error.message;
+      // Wrangler converts this real SQLite REST rejection into the captured native
+      // JSON APIError (code 7500, notes[].text), exercising the actual process boundary.
+      send(400, { success: false, errors: [{ code: 7500, message: `${error.message}: SQLITE_ERROR` }] });
+    }
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  context.after(() => new Promise((resolve, reject) => {
+    server.close((error) => error ? reject(error) : resolve());
+    server.closeAllConnections();
+  }));
+  const apiBaseUrl = `http://127.0.0.1:${server.address().port}/client/v4`;
+  const options = {
+    target: 'production', config: configPath, database: 'IDX00', databaseId,
+    journalPath, artifactDigest, deploymentId: 'production:remote-migration-test:IDX00',
+    migrationsDir: indexMigrationsDir,
+    baseManifestPath: path.join(indexMigrationsDir, 'source-baseline.json'),
+  };
+  const run = async () => await new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [runnerPath, JSON.stringify(options)], {
+      cwd: hubRoot,
+      env: {
+        ...process.env,
+        NODE_OPTIONS: '',
+        CI: 'true',
+        CLOUDFLARE_ACCOUNT_ID: accountId,
+        CLOUDFLARE_API_TOKEN: 'synthetic-migration-test-token',
+        CLOUDFLARE_API_KEY: '',
+        CLOUDFLARE_EMAIL: '',
+        CLOUDFLARE_API_BASE_URL: apiBaseUrl,
+        CF_API_BASE_URL: apiBaseUrl,
+        WRANGLER_SEND_METRICS: 'false',
+        WRANGLER_LOG_PATH: path.join(directory, 'wrangler.log'),
+        XDG_CONFIG_HOME: directory,
+      },
+      windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      timeout: 60_000,
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.setEncoding('utf8').on('data', (chunk) => { stdout += chunk; });
+    child.stderr.setEncoding('utf8').on('data', (chunk) => { stderr += chunk; });
+    child.once('error', reject);
+    child.once('close', (status, signal) => resolve({ status, signal, stdout, stderr }));
+  });
+  return { database, requests, options, run };
 }
 
 test('the checked-in manifest exactly matches canonical migration names, order, and bytes', async () => {
@@ -635,6 +775,143 @@ test('the manual price backfill writes only columns the migrated catalog still h
   } finally {
     database.close();
   }
+});
+
+test('fresh remote shard apply bootstraps through Wrangler and commits the verified SQLite schema and ledger', async (context) => {
+  const fixture = await loadFixture(indexMigrationsDir);
+  const remote = await createRemoteMigrationFixture(context);
+  assert.deepEqual(remote.database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all(), [],
+    'the regression starts with a genuinely empty SQLite database, not a pre-created ledger');
+  const applied = await remote.run();
+  assert.equal(applied.signal, null, applied.stderr);
+  assert.equal(remote.requests[0]?.sql, 'SELECT name FROM d1_migrations ORDER BY id', applied.stderr);
+  assert.equal(remote.requests[0]?.failure, 'no such table: d1_migrations', applied.stderr);
+  assert.equal(applied.status, 0, applied.stderr);
+  const result = JSON.parse(applied.stdout);
+  assert.equal(result.databaseBinding, 'IDX00');
+  assert.equal(result.databaseId, remote.options.databaseId);
+  assert.equal(result.migrationDigest, migrationDigest(fixture.manifest));
+  assert.equal(result.pendingMigrations, 0);
+  assert.equal(result.schemaDigest, schemaDigest(schemaSnapshotFromDatabase(remote.database)));
+  assert.ok(remote.requests.some(({ sql }) => /^\s*CREATE TABLE IF NOT EXISTS "d1_migrations"/.test(sql ?? '')),
+    'normal Wrangler apply must own the canonical ledger bootstrap');
+  assert.equal(remote.requests.filter(({ sql }) => /INSERT INTO\s+"d1_migrations"/i.test(sql ?? '')).length, 1,
+    'Wrangler must really execute the checked-in shard migration');
+  assert.deepEqual(
+    remote.database.prepare('SELECT name FROM d1_migrations ORDER BY id').all().map(({ name }) => name),
+    fixture.manifest.migrations.map(({ filename }) => filename),
+  );
+  const ledger = remote.database.prepare(`
+    SELECT sequence, filename, sha256, artifact_sha256, deployment_id FROM migration_checksum_ledger ORDER BY sequence
+  `).all().map((row) => ({ ...row }));
+  assert.deepEqual(ledger, fixture.manifest.migrations.map(({ sequence, filename, sha256 }) => ({
+    sequence, filename, sha256, artifact_sha256: artifactDigest, deployment_id: remote.options.deploymentId,
+  })));
+  const identity = {
+    target: remote.options.target, deploymentId: remote.options.deploymentId,
+    artifactDigest, migrationDigest: result.migrationDigest,
+    databaseBinding: 'IDX00', databaseId: remote.options.databaseId,
+  };
+  const journal = await openMigrationJournal(remote.options.journalPath, identity);
+  assert.equal(journal.phase, 'committed');
+  assert.equal(journal.revision, 3);
+  const firstRequestCount = remote.requests.length;
+  const resumed = await remote.run();
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.deepEqual(JSON.parse(resumed.stdout), result);
+  assert.ok(remote.requests.length > firstRequestCount, 'committed resume must still reverify live state');
+  assert.ok(remote.requests.slice(firstRequestCount).every(({ sql }) => /^\s*SELECT\b/i.test(sql)),
+    'the exact committed journal resumes read-only, without another bootstrap, apply or checksum write');
+  assert.deepEqual(remote.database.prepare(`
+    SELECT sequence, filename, sha256, artifact_sha256, deployment_id FROM migration_checksum_ledger ORDER BY sequence
+  `).all().map((row) => ({ ...row })), ledger, 'resume cannot rewrite historical checksum evidence');
+});
+
+test('fresh remote shard preflight fails closed for auth, network, unrelated SQLite and malformed responses', async (context) => {
+  for (const [fault, expectedError] of [
+    ['auth', /\[code: 10000\]/],
+    ['network', /fetch failed|ECONNRESET|socket|other side closed/i],
+    ['unrelated-sql', /no such table: unrelated_missing_table/],
+    ['malformed', /Wrangler D1 response contains no result rows/],
+    ['missing-column', /no such column: name/],
+  ]) {
+    await context.test(fault, async (child) => {
+      const remote = await createRemoteMigrationFixture(child, { fault });
+      if (fault === 'missing-column') {
+        remote.database.exec('CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY, filename TEXT)');
+      }
+      const before = schemaSnapshotFromDatabase(remote.database);
+      const rejected = await remote.run();
+      assert.equal(rejected.signal, null, rejected.stderr);
+      assert.notEqual(rejected.status, 0, rejected.stdout);
+      assert.match(rejected.stderr, expectedError);
+      assert.ok(remote.requests.length > 0, 'the native remote preflight must encounter the chosen failure');
+      assert.ok(remote.requests.every(({ sql }) => sql === 'SELECT name FROM d1_migrations ORDER BY id'),
+        'a rejected preflight cannot enter Wrangler bootstrap or apply');
+      assert.deepEqual(schemaSnapshotFromDatabase(remote.database), before);
+      const journal = JSON.parse(await readFile(remote.options.journalPath, 'utf8'));
+      assert.equal(journal.phase, 'intended');
+      assert.equal(journal.revision, 0);
+    });
+  }
+});
+
+test('a missing remote migration table after Wrangler apply cannot masquerade as a fresh database', async (context) => {
+  const remote = await createRemoteMigrationFixture(context, { fault: 'missing-after-apply' });
+  const rejected = await remote.run();
+  assert.equal(rejected.signal, null, rejected.stderr);
+  assert.notEqual(rejected.status, 0, rejected.stdout);
+  assert.match(rejected.stderr, /no such table: d1_migrations: SQLITE_ERROR \[code: 7500\]/);
+  assert.ok(remote.requests.some(({ sql, success }) => success && /INSERT INTO\s+"d1_migrations"/i.test(sql ?? '')),
+    'the failure must follow genuine schema installation, not the original preflight defect');
+  assert.equal(remote.database.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'blocks'").get().count, 1);
+  assert.equal(remote.database.prepare('SELECT COUNT(*) AS count FROM migration_checksum_ledger').get().count, 0);
+  const journal = JSON.parse(await readFile(remote.options.journalPath, 'utf8'));
+  assert.equal(journal.phase, 'wrangler-applied', 'checksum recording must not advance past missing applied history');
+  assert.equal(journal.revision, 1);
+});
+
+test('production prefix and checksum integrity remain enforced for existing migration histories', async (context) => {
+  const fixture = await loadFixture();
+  const database = createDatabase();
+  context.after(() => database.close());
+  applyPending(database, fixture);
+  const snapshot = schemaSnapshotFromDatabase(database);
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hub-existing-history-'));
+  context.after(() => rm(directory, { recursive: true, force: true }));
+  const options = {
+    target: 'production', config: path.join(hubRoot, 'wrangler.jsonc'), database: 'sessions-index',
+    artifactDigest, deploymentId: 'production:existing-history', migrationsDir,
+    manifestPath, baseManifestPath: sourceBaselinePath, historyPath,
+  };
+  const divergent = createWranglerProcess(fixture, snapshot);
+  const divergentProcess = async (args) => {
+    const response = await divergent.runProcess(args);
+    if (args[args.indexOf('--command') + 1] === 'SELECT name FROM d1_migrations ORDER BY id') {
+      return { ...response, stdout: JSON.stringify([{ results: [{ name: '9999_removed.sql' }] }]) };
+    }
+    return response;
+  };
+  await assert.rejects(runMigrations({
+    ...options, journalPath: path.join(directory, 'divergent.json'), runProcess: divergentProcess,
+  }), /not an immutable manifest prefix/);
+  assert.equal(divergent.state.applyCalls, 0, 'an existing divergent ledger cannot use the fresh bootstrap path');
+  const corrupt = createWranglerProcess(fixture, snapshot);
+  const corruptProcess = async (args) => {
+    const response = await corrupt.runProcess(args);
+    if (args[args.indexOf('--command') + 1]?.includes('SELECT sequence, filename, sha256 FROM migration_checksum_ledger')) {
+      const value = JSON.parse(response.stdout);
+      value[0].results[0].sha256 = '0'.repeat(64);
+      return { ...response, stdout: JSON.stringify(value) };
+    }
+    return response;
+  };
+  await assert.rejects(runMigrations({
+    ...options, journalPath: path.join(directory, 'corrupt.json'), runProcess: corruptProcess,
+  }), /migration checksum mismatch/);
+  assert.equal(corrupt.state.applyCalls, 1);
+  const journal = JSON.parse(await readFile(path.join(directory, 'corrupt.json'), 'utf8'));
+  assert.equal(journal.phase, 'wrangler-applied', 'corrupt ledger evidence must never be marked checksum-recorded');
 });
 
 test('migration runner applies once, measures verify state, and trusts the protected-main manifest for production', async (context) => {

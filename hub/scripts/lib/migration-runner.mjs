@@ -49,7 +49,20 @@ async function defaultRunProcess(args) {
     child.once('error', reject);
     child.once('exit', (code, signal) => {
       if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(`Wrangler exited with ${code ?? signal}: ${stderr || stdout}`));
+      else {
+        let cause;
+        if (code === 1 && args.includes('--json')) {
+          // Keep Wrangler's native API error separate from the diagnostic wrapper.
+          // Warnings may precede the JSON envelope; malformed output still fails closed.
+          for (const output of [stderr, stdout]) {
+            try {
+              cause = JSON.parse(output.slice(output.indexOf('{')))?.error;
+              if (cause) break;
+            } catch {}
+          }
+        }
+        reject(new Error(`Wrangler exited with ${code ?? signal}: ${stderr || stdout}`, { cause }));
+      }
     });
   });
 }
@@ -116,9 +129,25 @@ export async function hasLocalLegacyBlocks(options) {
   return Number(rows[0]?.has_blocks) === 1;
 }
 
-async function readAppliedNames(client) {
-  const rows = await client.query('SELECT name FROM d1_migrations ORDER BY id');
-  return rows.map((row) => row.name);
+function isMissingMigrationTable(error) {
+  const native = error?.cause;
+  return native?.name === 'APIError' && native.kind === 'error' && native.code === 7500
+    && typeof native.text === 'string'
+    && /^A request to the Cloudflare API \(\/accounts\/[^/]+\/d1\/database\/[^/]+\/query\) failed\.$/.test(native.text)
+    && Array.isArray(native.notes) && native.notes.length === 1
+    && native.notes[0]?.text === 'no such table: d1_migrations: SQLITE_ERROR [code: 7500]';
+}
+
+async function readAppliedNames(client, { allowMissingTable = false } = {}) {
+  try {
+    const rows = await client.query('SELECT name FROM d1_migrations ORDER BY id');
+    return rows.map((row) => row.name);
+  } catch (error) {
+    // Only the pre-apply guard may see no ledger. Wrangler apply owns its canonical
+    // initialization; checksum recording and final verification must find the table.
+    if (allowMissingTable && isMissingMigrationTable(error)) return [];
+    throw error;
+  }
 }
 
 function assertAppliedManifest(manifest, appliedNames) {
@@ -323,7 +352,7 @@ export async function runMigrations(options) {
     identity,
     apply: async () => {
       if (options.target === 'production') {
-        assertAppliedManifestPrefix(manifest, await readAppliedNames(client));
+        assertAppliedManifestPrefix(manifest, await readAppliedNames(client, { allowMissingTable: true }));
       }
       await client.apply();
     },

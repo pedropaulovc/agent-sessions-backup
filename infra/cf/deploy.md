@@ -253,6 +253,11 @@ The one-time cutover runs these operations in order, from the same checked-out m
    configurations, preserving the entire production custom-domain set and main DB ID.
 2. Apply and checksum-verify `migrations-index/` separately on every shard, with separate
    database-bound journals; initialize/check immutable hash layout and ID counters.
+   A fresh shard has no `d1_migrations` table yet. Only the production pre-apply
+   history-prefix read accepts Wrangler's exact native missing-ledger API error;
+   normal Wrangler migration application then creates its canonical ledger.
+   Checksum recording and final verification require that ledger to exist.
+   Authentication, transport, malformed responses, and unrelated SQL errors fail closed.
    `initialize` also runs an actual REST-batch atomicity positive control on `IDX00`:
    successful CREATE/INSERT/readback/drop first, requiring exact synthetic leading-BOM,
    Unicode and embedded-NUL text plus its stored UTF-8 byte length through both batch
