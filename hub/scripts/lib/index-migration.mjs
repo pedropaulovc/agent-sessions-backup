@@ -4,9 +4,12 @@ import {
   SESSION_CATALOG_COLUMNS, STAR_CATALOG_COLUMNS, SESSION_CATALOG_RETIRE_SQL, sessionCatalogBatches,
   indexShardForSessionId,
 } from '../../src/index-layout.mjs';
+import { CLOUDFLARE_REQUEST_RATE_PER_SECOND } from './cloudflare-api-budget.mjs';
 
 export const COPY_CHECKPOINT = 'full-fidelity-index-copy-v1';
 export const SEED_CHECKPOINT = 'full-fidelity-index-catalog-v1';
+export const READY_CHECKPOINT = 'full-fidelity-index-ready-v1';
+export const ACTIVATION_CHECKPOINT = 'full-fidelity-index-activated-v1';
 export const DRAIN_MILLISECONDS = 16 * 60 * 1000;
 export const SOURCE_FREEZE_TABLE = 'index_migration_freeze';
 export const COPY_PAGE_ROWS = 2048;
@@ -100,7 +103,12 @@ export function assertMaintenanceHealth(health, revision, count) {
 
 export async function readCheckpoint(db, name) {
   const rows = await db.query('SELECT value FROM index_migration_state WHERE name = ?', [name]);
-  return rows.length ? JSON.parse(rows[0].value) : null;
+  if (!rows.length) return null;
+  const value = JSON.parse(rows[0].value);
+  // Only a missing row is absence. Stored null/primitives/arrays are corruption,
+  // never permission to initialize or overwrite a workflow checkpoint.
+  if (!isProofRecord(value)) throw new Error('invalid index migration checkpoint payload');
+  return value;
 }
 
 export async function writeCheckpoint(db, name, value) {
@@ -149,6 +157,121 @@ function assertIdentity(state, identity) {
   }
 }
 
+const isProofRecord = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
+  && [Object.prototype, null].includes(Object.getPrototypeOf(value));
+const isSha256 = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
+const isCounter = (value) => Number.isSafeInteger(value) && value >= 0;
+
+// Sort every object key so checkpoint/proof hashes survive JSON roundtrips and key ordering.
+// Hash the complete checkpoints, not only their status or aggregate counts.
+function proofJson(value) {
+  if (value === null || ['string', 'boolean'].includes(typeof value)) return JSON.stringify(value);
+  if (typeof value === 'number' && Number.isFinite(value)
+    && (!Number.isInteger(value) || Number.isSafeInteger(value))) return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${Array.from(value, proofJson).join(',')}]`;
+  if (isProofRecord(value)) return `{${Object.keys(value).sort().map((key) =>
+    `${JSON.stringify(key)}:${proofJson(value[key])}`).join(',')}}`;
+  throw new Error('invalid durable proof JSON value');
+}
+
+function completedProofBindings({ source, shards, copy, seed }) {
+  if (typeof source?.id !== 'string' || !source.id || !Array.isArray(shards) || !shards.length
+    || shards.some((db) => typeof db?.id !== 'string' || !db.id)
+    || new Set([source.id, ...shards.map((db) => db.id)]).size !== shards.length + 1) {
+    throw new Error('invalid durable proof database identity');
+  }
+  const identity = copyIdentity(source, shards);
+  if (!isProofRecord(copy) || !isProofRecord(seed)) throw new Error('durable proof requires completed copy and seed checkpoints');
+  assertIdentity(copy, identity);
+  assertIdentity(seed, identity);
+  if (copy.state !== 'complete' || seed.state !== 'complete' || copy.pending !== null
+    || !isSha256(copy.sha256) || !isCounter(copy.rows) || !isCounter(seed.rows)
+    || !Number.isSafeInteger(copy.after) || copy.after < -1 || copy.after >= INDEX_ID_SPAN
+    || (copy.rows === 0 ? copy.after !== -1 : copy.after < 0) || typeof seed.after !== 'string'
+    || !Array.isArray(copy.columns) || !copy.columns.length || copy.columns.length > 100
+    || !copy.columns.includes('id') || copy.columns.some((column) => typeof column !== 'string' || !column)
+    || new Set(copy.columns).size !== copy.columns.length) {
+    throw new Error('invalid completed copy or seed snapshot for durable proof');
+  }
+  return {
+    identity,
+    copy: { columns: [...copy.columns], sha256: copy.sha256, rows: copy.rows, after: copy.after,
+      checkpointSha256: sha(proofJson(copy)) },
+    seed: { rows: seed.rows, checkpointSha256: sha(proofJson(seed)) },
+  };
+}
+
+function assertProofProvenance(revision, cycle, verifiedAt) {
+  if (typeof revision !== 'string' || !/^[a-f0-9]{40}$/.test(revision)
+    || typeof cycle !== 'string' || !/^[1-9]\d*:[1-9]\d*$/.test(cycle)
+    || !Number.isSafeInteger(verifiedAt) || verifiedAt <= 0) {
+    throw new Error('invalid durable proof revision, cycle or verification timestamp');
+  }
+}
+
+function evidenceDigest(evidence) {
+  if (!isProofRecord(evidence) || !Object.keys(evidence).length) throw new Error('durable proof requires verification evidence');
+  return sha(proofJson(evidence));
+}
+
+function readyProofBody({ source, shards, copy, seed, revision, cycle, verifiedAt, evidenceSha256 }) {
+  assertProofProvenance(revision, cycle, verifiedAt);
+  if (!isSha256(evidenceSha256)) throw new Error('invalid ready proof evidence digest');
+  return { format: 1, state: 'ready', ...completedProofBindings({ source, shards, copy, seed }),
+    revision, cycle, verifiedAt, evidenceSha256 };
+}
+
+function sealProof(body) { return { ...body, digest: sha(proofJson(body)) }; }
+
+function assertSealedProof(proof, body, name) {
+  if (!isSha256(proof.digest) || proofJson(proof) !== proofJson(sealProof(body))) {
+    throw new Error(`${name} proof integrity or snapshot binding mismatch`);
+  }
+}
+
+/** Pure durable readiness binding; the controller supplies actual frozen verification evidence. */
+export function buildReadyProof({ source, shards, copy, seed, revision, cycle, verifiedAt, evidence }) {
+  return sealProof(readyProofBody({ source, shards, copy, seed, revision, cycle, verifiedAt,
+    evidenceSha256: evidenceDigest(evidence) }));
+}
+
+export function assertReadyProof({ source, shards, copy, seed, ready, revision, cycle }) {
+  if (!isProofRecord(ready) || ready.format !== 1 || ready.state !== 'ready') throw new Error('invalid ready proof state or format');
+  const body = readyProofBody({ source, shards, copy, seed, revision: ready.revision, cycle: ready.cycle,
+    verifiedAt: ready.verifiedAt, evidenceSha256: ready.evidenceSha256 });
+  assertSealedProof(ready, body, 'ready');
+  if ((revision !== undefined && revision !== ready.revision) || (cycle !== undefined && cycle !== ready.cycle)) {
+    throw new Error('ready proof does not identify the current revision/cycle');
+  }
+}
+
+function activationProofBody({ source, shards, ready, revision, cycle, verifiedAt, evidenceSha256 }) {
+  assertProofProvenance(revision, cycle, verifiedAt);
+  if (revision !== ready.revision || cycle !== ready.cycle || verifiedAt < ready.verifiedAt
+    || !isSha256(evidenceSha256)) throw new Error('invalid activation proof provenance, timestamp or evidence digest');
+  return {
+    format: 1, state: 'active', identity: copyIdentity(source, shards), revision, cycle, verifiedAt,
+    copySha256: ready.copy.sha256, copyCheckpointSha256: ready.copy.checkpointSha256,
+    seedCheckpointSha256: ready.seed.checkpointSha256, readyDigest: ready.digest, evidenceSha256,
+  };
+}
+
+/** Call only after the controller completes active health/index/login checks; no DB side effects. */
+export function buildActivationProof({ source, shards, copy, seed, ready, revision, cycle, verifiedAt, evidence }) {
+  assertReadyProof({ source, shards, copy, seed, ready, revision, cycle });
+  return sealProof(activationProofBody({ source, shards, ready, revision, cycle, verifiedAt,
+    evidenceSha256: evidenceDigest(evidence) }));
+}
+
+export function assertActivationProof({ source, shards, copy, seed, ready, activation }) {
+  assertReadyProof({ source, shards, copy, seed, ready });
+  if (!isProofRecord(activation) || activation.format !== 1 || activation.state !== 'active') {
+    throw new Error('invalid activation proof state or format');
+  }
+  assertSealedProof(activation, activationProofBody({ source, shards, ready, revision: activation.revision,
+    cycle: activation.cycle, verifiedAt: activation.verifiedAt, evidenceSha256: activation.evidenceSha256 }), 'activation');
+}
+
 function firstMatchToken(text) {
   return typeof text === 'string'
     ? text.match(/[\p{L}\p{N}\p{Co}_.-][\p{L}\p{N}\p{M}\p{Co}_.-]*/u)?.[0] ?? null
@@ -160,8 +283,10 @@ async function verifyFts(db, rows) {
   const statements = [];
   for (let offset = 0; offset < probes.length; offset += 48) {
     const chunk = probes.slice(offset, offset + 48);
+    // FTS5 can omit the equality recheck for REAL-bound integral ids. These ids are
+    // already validated safe integers; make their SQL storage class normative too.
     statements.push({
-      sql: chunk.map(() => 'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = ?').join(' UNION ALL '),
+      sql: chunk.map(() => 'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = CAST(? AS INTEGER)').join(' UNION ALL '),
       params: chunk.flatMap(({ id, token }) => [
         token ? `"${token.replaceAll('"', '""')}"` : '"index-migration-tokenless-probe"', id,
       ]),
@@ -209,6 +334,8 @@ function blockPageLayout(columns) {
       / (6 * columns.length),
   ));
   if (inlineBytes < 1) throw new Error('block column names exceed the bounded response budget');
+  // SQLite length(TEXT) stops at an embedded NUL. BLOB lengths count every stored UTF-8
+  // byte, including JSON-escaped NULs in the response budget below.
   const selectors = quoted.flatMap((column, index) => {
     const long = `typeof(${column}) = 'text' AND length(CAST(${column} AS BLOB)) >
       CASE WHEN "__copy_raw_bytes" > ${SMALL_ROW_BYTES} THEN ${inlineBytes} ELSE ${SMALL_ROW_BYTES} END`;
@@ -314,7 +441,7 @@ async function readBlockRows(db, columns, ids, layout = blockPageLayout(columns)
           }
           chunks.push(Buffer.from(parts[0].bytes, 'hex'));
         }
-        row[columns[index]] = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks, length));
+        row[columns[index]] = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks, length));
       }
       rows.push(row);
     }
@@ -620,8 +747,8 @@ export async function sourceCopyForecast({ source, shards }) {
     observedRowBytes: { total: totalRowBytes, mean: sampledRows ? totalRowBytes / sampledRows : 0, max: maximumRowBytes },
     observedPageRows: { mean: meanPageRows, max: maximumPageRows },
     observedShardFanout: { mean: meanFanout, max: maximumShardFanout },
-    estimatedRemainingPages, estimatedRemainingRequests, requestRatePerSecond: 4,
-    estimatedApiTimeLowerBoundSeconds: estimatedRemainingRequests / 4,
+    estimatedRemainingPages, estimatedRemainingRequests, requestRatePerSecond: CLOUDFLARE_REQUEST_RATE_PER_SECOND,
+    estimatedApiTimeLowerBoundSeconds: estimatedRemainingRequests / CLOUDFLARE_REQUEST_RATE_PER_SECOND,
   };
 }
 
@@ -633,6 +760,15 @@ export async function seedFrozenCatalog({ source, shards, gate, checkpointHook }
   const identity = copyIdentity(source, shards);
   if (copied?.state !== 'complete') throw new Error('catalog seed requires a completed verified index copy');
   assertIdentity(copied, identity);
+  let state = await readCheckpoint(shards[0], SEED_CHECKPOINT);
+  if (state !== null) assertIdentity(state, identity);
+  const ready = await readCheckpoint(shards[0], READY_CHECKPOINT);
+  const activation = await readCheckpoint(shards[0], ACTIVATION_CHECKPOINT);
+  if (activation !== null) {
+    assertActivationProof({ source, shards, copy: copied, seed: state, ready, activation });
+    throw new Error('initial activation is already proven; refusing catalog reseed');
+  }
+  if (ready !== null) assertReadyProof({ source, shards, copy: copied, seed: state, ready });
   const sessionColumns = await columnsFor(source, 'sessions');
   const starColumns = await columnsFor(source, 'starred_turns');
   await assertColumns(shards, 'sessions', sessionColumns);
@@ -641,8 +777,10 @@ export async function seedFrozenCatalog({ source, shards, gate, checkpointHook }
     || JSON.stringify(starColumns) !== JSON.stringify(STAR_CATALOG_COLUMNS)) {
     throw new Error('catalog schema differs from the shared replication column contract');
   }
-  let state = await readCheckpoint(shards[0], SEED_CHECKPOINT);
-  if (state) assertIdentity(state, identity);
+  // A deliberate pre-activation reseed invalidates its old READY before the seed snapshot
+  // becomes pending. A crash at either boundary must classify pending, not as a corrupt proof.
+  // Never clear an initial activation, and never discard malformed or foreign proofs.
+  if (ready !== null) await shards[0].query('DELETE FROM index_migration_state WHERE name = ?', [READY_CHECKPOINT]);
   if (!state || state.state === 'complete') state = { identity, after: '', rows: 0, state: 'pending' };
   const checkpoint = async () => {
     await writeCheckpoint(shards[0], SEED_CHECKPOINT, state);
@@ -770,12 +908,15 @@ export async function verifyIndexRecords({ source, shards, catalogConsistency = 
   return { mainSessions: main.sessions, mainStars: main.stars, shards: evidence };
 }
 
-export function classifyIndexMigration({ source, shards, legacyTables, copy, seed }) {
+export function classifyIndexMigration({ source, shards, legacyTables, copy, seed, ready, activation }) {
   const identity = copyIdentity(source, shards);
-  if (copy) assertIdentity(copy, identity);
-  if (seed) assertIdentity(seed, identity);
+  if (copy !== undefined && copy !== null) assertIdentity(copy, identity);
+  if (seed !== undefined && seed !== null) assertIdentity(seed, identity);
+  if (ready !== undefined && ready !== null) assertReadyProof({ source, shards, copy, seed, ready });
+  if (activation !== undefined && activation !== null) assertActivationProof({ source, shards, copy, seed, ready, activation });
   if (legacyTables.includes('blocks') || legacyTables.includes('blocks_fts')) return copy ? 'pending' : 'legacy';
-  if (copy?.state === 'complete' && seed?.state === 'complete' && !legacyTables.includes(SOURCE_FREEZE_TABLE)) return 'active';
+  if (copy?.state === 'complete' && seed?.state === 'complete' && activation
+    && !legacyTables.includes(SOURCE_FREEZE_TABLE)) return 'active';
   if (copy?.state === 'complete') return 'pending';
   throw new Error('main has no legacy source and no completed verified copy; refusing deployment');
 }

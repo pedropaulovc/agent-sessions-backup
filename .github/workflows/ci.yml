@@ -309,7 +309,7 @@ jobs:
         if: steps.index-layout.outputs.layout_state != 'active'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
-        run: node ../infra/cf/index-control.mjs pause-consumers --config "$RUNNER_TEMP/index-maintenance.json"
+        run: node ../infra/cf/index-control.mjs pause-consumers --config "$RUNNER_TEMP/index-active.json"
       - name: Deploy exact maintenance revision
         if: steps.index-layout.outputs.layout_state != 'active'
         env:
@@ -376,6 +376,6 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
         run: |
           pause_status=0
-          node ../infra/cf/index-control.mjs pause-consumers --config "$RUNNER_TEMP/index-maintenance.json" || pause_status=$?
+          node ../infra/cf/index-control.mjs pause-consumers --config "$RUNNER_TEMP/index-active.json" || pause_status=$?
           npx wrangler deploy --config "$RUNNER_TEMP/index-maintenance.json" --env=""
           exit "$pause_status"

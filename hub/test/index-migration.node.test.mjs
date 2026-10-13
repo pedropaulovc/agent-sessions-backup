@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import {
-  COPY_CHECKPOINT, SEED_CHECKPOINT, SOURCE_FREEZE_TABLE, assertMaintenanceHealth, canonicalRow,
+  ACTIVATION_CHECKPOINT, COPY_CHECKPOINT, READY_CHECKPOINT, SEED_CHECKPOINT, SOURCE_FREEZE_TABLE,
+  assertActivationProof, assertMaintenanceHealth, assertReadyProof, buildActivationProof, buildReadyProof, canonicalRow,
   classifyIndexMigration, copyFrozenIndex, initializeShardLayouts, readCheckpoint, reconcileIndexCatalog, rowDigest,
   seedFrozenCatalog, sourceCopyForecast, verifyIndexRecords, writeCheckpoint,
 } from '../scripts/lib/index-migration.mjs';
@@ -14,9 +16,19 @@ import {
   BLOCK_COLUMNS, INDEX_ID_SPAN, INDEX_LAYOUT, SESSION_CATALOG_COLUMNS,
   STAR_CATALOG_COLUMNS, indexIdBase, indexShardForSessionId,
 } from '../src/index-layout.mjs';
-import { cloudflareRetryDelay, requireProtectedProduction } from '../../infra/cf/index-control.mjs';
+import {
+  cloudflareRetryDelay, pauseConsumers, requireProtectedProduction, verifyActiveIndex, verifyReadyIndex,
+} from '../../infra/cf/index-control.mjs';
 import { PREVIEW_ACCOUNT_ID, PRODUCTION_ACCOUNT_ID } from '../../infra/cf/preview-trust.mjs';
-import { d1SqlFailureReason, verifyD1BatchAtomicity } from '../../infra/cf/d1-batch-atomicity.mjs';
+import { D1_BATCH_PROBE_TEXT, d1SqlFailureReason, verifyD1BatchAtomicity } from '../../infra/cf/d1-batch-atomicity.mjs';
+import { CLOUDFLARE_REQUEST_RATE_PER_SECOND } from '../scripts/lib/cloudflare-api-budget.mjs';
+
+// Historical controls replace only classification, so older modules missing the new proof
+// exports still execute the load-bearing pending/active assertions rather than failing import.
+const classifyActivation = process.env.INDEX_CLASSIFICATION_MODULE_PATH
+  ? (await import(process.env.INDEX_CLASSIFICATION_MODULE_PATH)).classifyIndexMigration : classifyIndexMigration;
+const copyWithNativeParameters = process.env.INDEX_COPY_MODULE_PATH
+  ? (await import(process.env.INDEX_COPY_MODULE_PATH)).copyFrozenIndex : copyFrozenIndex;
 
 const hubRoot = path.resolve(import.meta.dirname, '..');
 const revision = 'frozen-index-revision-0123456789';
@@ -31,7 +43,33 @@ const isWrite = (sql) => /^\s*(?:INSERT|UPDATE|DELETE|REPLACE|CREATE|ALTER|DROP)
   || /^\s*WITH\b[^;]*\b(?:INSERT|UPDATE|DELETE|REPLACE)\b/is.test(sql);
 const selectsTable = (sql, table) => /^\s*(?:SELECT|WITH)\b/i.test(sql) && !isWrite(sql)
   && new RegExp(`\\bFROM\\s+"?${table}"?\\b`, 'i').test(sql);
-const plainRows = (statement, params = []) => statement.all(...params).map((row) => ({ ...row }));
+// D1's JSON integer parameters are SQLite INTEGERs. Older Node SQLite binds every
+// Number as REAL; FTS5 omits the rowid-equality recheck and only bounds INTEGER values,
+// so a REAL-bound id can incorrectly return all rows sharing the MATCH term.
+const sqliteParams = (params) => params.map((value) =>
+  typeof value === 'number' && Number.isSafeInteger(value) ? BigInt(value) : value);
+
+function plainRows(database, sql, params = [], statement = database.prepare(sql)) {
+  const columns = statement.columns();
+  // Schema PRAGMAs contain no stored text values. For SELECT results, native Node SQLite
+  // decodes TEXT through a NUL-terminated string, even though SQLite stores the entire value.
+  // Project TEXT as BLOB before crossing that boundary; retain its storage type so real
+  // BLOBs, nulls and numbers are not silently converted into strings.
+  if (/^\s*PRAGMA\b/i.test(sql)) return statement.all(...sqliteParams(params)).map((row) => ({ ...row }));
+  const aliases = columns.map((_, index) => quoted(`__column_${index}`));
+  const selectors = aliases.flatMap((column, index) => [
+    `CASE WHEN typeof(${column}) = 'text' THEN CAST(${column} AS BLOB)
+      ELSE ${column} END AS ${quoted(`__value_${index}`)}`,
+    `typeof(${column}) AS ${quoted(`__type_${index}`)}`,
+  ]);
+  const transport = database.prepare(`WITH "__d1_result" (${aliases.join(',')}) AS MATERIALIZED (
+    ${sql.replace(/;\s*$/, '')}
+  ) SELECT ${selectors.join(',')} FROM "__d1_result"`);
+  return transport.all(...sqliteParams(params)).map((row) => Object.fromEntries(columns.map(({ name }, index) => [
+    name, row[`__type_${index}`] === 'text'
+      ? Buffer.from(row[`__value_${index}`]).toString('utf8') : row[`__value_${index}`],
+  ])));
+}
 let nextTransaction = 0;
 
 // The copier's real REST adapter exposes D1 result records, not SQLite statement objects. Execute
@@ -54,8 +92,8 @@ class SqliteD1 {
 
   execute(sql, params) {
     const statement = this.database.prepare(sql);
-    if (statement.columns().length) return plainRows(statement, params);
-    statement.run(...params);
+    if (statement.columns().length) return plainRows(this.database, sql, params, statement);
+    statement.run(...sqliteParams(params));
     return [];
   }
 
@@ -101,7 +139,7 @@ class SqliteD1 {
   }
 
   rows(sql, params = []) {
-    return plainRows(this.database.prepare(sql), params);
+    return plainRows(this.database, sql, params);
   }
 
   close() {
@@ -245,8 +283,8 @@ function destinationBatchCount(f) {
 }
 
 function assertVerifiedBeforeDelete(f) {
-  let deletedCalls = 0;
-  const beforeSourceStatement = ({ sql, params }) => {
+  let verifiedRows = 0;
+  const beforeSourceStatement = ({ sql }) => {
     if (!isWrite(sql)) return;
     const deletingBlock = /\bDELETE\s+FROM\s+"?blocks"?\b/i.test(sql);
     if (!deletingBlock) {
@@ -262,15 +300,6 @@ function assertVerifiedBeforeDelete(f) {
       'SELECT value FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT],
     )[0].value);
     assert.equal(checkpoint.pending.phase, 'verified', 'verification must be durable BEFORE deletion');
-    const tuples = params.length === 1 && typeof params[0] === 'string' ? JSON.parse(params[0]) : [params];
-    assert.ok(Array.isArray(tuples) && tuples.length > 0);
-    for (const tuple of tuples) {
-      const target = checkpoint.pending.rows.find(({ id }) => id === tuple[checkpoint.columns.indexOf('id')]);
-      assert.ok(target, 'conditional source deletion must identify a verified pending block');
-      const verifiedRow = f.shards[target.shard].rows('SELECT * FROM blocks WHERE id = ?', [target.id])[0];
-      assert.deepEqual(tuple, checkpoint.columns.map((column) => verifiedRow[column]),
-        'conditional deletion must bind every verified source column, not only an id');
-    }
     for (const item of checkpoint.pending.rows) {
       const shard = f.shards[item.shard];
       const reads = f.trace.filter((event) => event.db === shard.id
@@ -286,12 +315,65 @@ function assertVerifiedBeforeDelete(f) {
         && (!hasToken || event.rows.some((row) => row.rowid === item.id))),
       `successful adapter FTS MATCH for block ${item.id} must precede source deletion`);
     }
-    deletedCalls += tuples.length;
+    verifiedRows += checkpoint.pending.rows.length;
   };
   f.source.beforeQuery = beforeSourceStatement;
   f.source.beforeStatement = beforeSourceStatement;
-  return () => deletedCalls;
+  return () => verifiedRows;
 }
+
+test('native SQLite transport reads stored UTF-8 past NUL without coercing scalar or BLOB types', async (context) => {
+  const f = await fixture(context);
+  const text = '\u0000transport_head 😀 e\u0301\u0000会話\ntransport_tail\u0000';
+  const row = block(0, 0, { text, role: '', tool_name: null, byte_start: 0, row_hash: Number.MAX_SAFE_INTEGER });
+  seedBlocks(f.source, [row]);
+  assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [row]);
+  assert.deepEqual(await f.source.query('SELECT * FROM blocks'), [row]);
+  const readback = await f.source.batch([{ sql: 'SELECT * FROM blocks', params: [] }]);
+  assert.deepEqual(readback[0].results, [row]);
+  const stored = f.source.rows('SELECT CAST(text AS BLOB) AS bytes FROM blocks')[0].bytes;
+  assert.deepEqual(Buffer.from(stored), Buffer.from(text), 'expectations must match actual SQLite bytes, not a cached fixture');
+  const [sizes] = await f.source.query(`SELECT length(text) AS text_length,
+    length(CAST(text AS BLOB)) AS byte_length, json_quote(text) AS encoded,
+    length(CAST(json_quote(text) AS BLOB)) AS json_bytes FROM blocks`);
+  assert.equal(sizes.text_length, 0, 'native TEXT length stops at the leading NUL');
+  assert.equal(sizes.byte_length, Buffer.byteLength(text));
+  assert.equal(JSON.parse(sizes.encoded), text, 'JSON1 must escape every NUL and retain its suffix');
+  assert.equal(sizes.json_bytes, Buffer.byteLength(JSON.stringify(text)));
+  const binary = new Uint8Array([0, 255, 65, 0]);
+  const [scalars] = await f.source.query(`SELECT ? AS text, ? AS binary, ? AS nil,
+    ? AS empty, ? AS zero, ? AS integer, ? AS real`, [text, binary, null, '', 0, Number.MAX_SAFE_INTEGER, 0.125]);
+  assert.equal(scalars.text, text);
+  assert.deepEqual(scalars.binary, binary);
+  assert.deepEqual({ ...scalars, text: undefined, binary: undefined },
+    { text: undefined, binary: undefined, nil: null, empty: '', zero: 0, integer: Number.MAX_SAFE_INTEGER, real: 0.125 });
+  assert.deepEqual(await f.source.query(`SELECT typeof(?) AS zero_type, typeof(?) AS id_type,
+    typeof(?) AS max_type, typeof(?) AS real_type`, [0, 600, Number.MAX_SAFE_INTEGER, 0.125]),
+  [{ zero_type: 'integer', id_type: 'integer', max_type: 'integer', real_type: 'real' }],
+  'native D1 transport must preserve integer binds as INTEGER and fractional binds as REAL');
+  f.restart();
+  assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [row], 'reopened transport must recover all stored bytes');
+});
+
+test('checkpoint reads distinguish missing rows from persisted JSON null, primitives and arrays', async (context) => {
+  const f = await fixture(context);
+  const db = f.shards[0];
+  for (const name of [COPY_CHECKPOINT, SEED_CHECKPOINT, READY_CHECKPOINT, ACTIVATION_CHECKPOINT]) {
+    assert.equal(await readCheckpoint(db, name), null);
+    for (const raw of ['null', 'false', 'true', '0', '"complete"', '[]', '[{}]']) {
+      db.database.prepare(`INSERT INTO index_migration_state (name, value) VALUES (?, ?)
+        ON CONFLICT (name) DO UPDATE SET value = excluded.value`).run(name, raw);
+      await assert.rejects(readCheckpoint(db, name), /invalid index migration checkpoint payload/);
+      assert.deepEqual(db.rows('SELECT name, value FROM index_migration_state WHERE name = ?', [name]),
+        [{ name, value: raw }], 'invalid persisted payloads must remain intact, not be mistaken for absent checkpoints');
+    }
+    const object = { state: 'pending', pending: null, counter: 0 };
+    await writeCheckpoint(db, name, object);
+    assert.deepEqual(await readCheckpoint(db, name), object, 'nested null fields inside a checkpoint object remain valid JSON transport');
+    db.database.prepare('DELETE FROM index_migration_state WHERE name = ?').run(name);
+    assert.equal(await readCheckpoint(db, name), null, 'physical absence is the only missing-checkpoint representation');
+  }
+});
 
 test('canonical rows preserve column order, every column, null/empty, Unicode and exact numeric types', () => {
   const row = block(INDEX_ID_SPAN - 1, 0, {
@@ -377,7 +459,7 @@ test('wrong layout metadata and exhausted or out-of-range allocators fail closed
 
 test('full-fidelity copy retains long Unicode text, all columns and FTS beyond former text caps', async (context) => {
   const f = await fixture(context);
-  const longText = `long_head α😀 café 会話\n${'naïve e\u0301 Ελληνικά 😀\u0000\n'.repeat(40_000)}long_tail_unique`;
+  const longText = `\uFEFFlong_head α😀 café 会話\n${'naïve e\u0301 Ελληνικά 😀\u0000\n'.repeat(40_000)}long_tail_unique`;
   assert.ok(Buffer.byteLength(longText) > 1024 * 1024);
   assert.ok(Buffer.byteLength(longText) < 2_000_000, 'fixture must remain a valid D1 scalar while exceeding a REST read page');
   const rows = [
@@ -389,6 +471,8 @@ test('full-fidelity copy retains long Unicode text, all columns and FTS beyond f
     block(INDEX_ID_SPAN - 1, 1, { text: 'last_legacy_id 私用\uE000 token_with-dot.name' }),
   ];
   seedBlocks(f.source, rows);
+  assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), rows,
+    'source expectations must retain the complete original UTF-8 values, including BOM and NUL suffixes');
   const deletes = assertVerifiedBeforeDelete(f);
   const checkpoints = [];
   const result = await copyFrozenIndex(f.args({ checkpointHook: (state) => checkpoints.push(state) }));
@@ -398,7 +482,7 @@ test('full-fidelity copy retains long Unicode text, all columns and FTS beyond f
   assert.match(result.sha256, /^[a-f0-9]{64}$/);
   assertCopied(f, rows);
   assert.deepEqual(f.shards[0].rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?', ['"long_tail_unique"']), [{ rowid: 1 }]);
-  assert.equal(deletes(), rows.length, 'every source tuple must be conditionally deleted only after its proof');
+  assert.equal(deletes(), rows.length, 'every deleted source tuple must have durable full-row and FTS readback proof');
   const sourcePages = f.trace.filter((event) => event.db === f.source.id && event.kind === 'batch');
   assert.ok(sourcePages.length >= 2, 'byte bounds must separate the oversized row from ordinary deletion pages');
   const copying = checkpoints.filter((state) => state.pending?.phase === 'copying');
@@ -413,6 +497,225 @@ test('full-fidelity copy retains long Unicode text, all columns and FTS beyond f
   assert.ok(!sourceWrites(f).some(({ sql }) => /\bblocks_fts\b/i.test(sql)), 'legacy source FTS must never receive DML');
   assert.deepEqual(f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
   assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).state, 'complete');
+});
+
+test('ordinary NUL-rich rows preserve JSON1 text and bound pages by escaped UTF-8 bytes', async (context) => {
+  const f = await fixture(context);
+  const rows = Array.from({ length: 4 }, (_, index) => block(501 + index, 0, {
+    text: `json_nul_head_${index} ${'\u0000'.repeat(60_000)} json_nul_tail_${index}`,
+  }));
+  seedBlocks(f.source, rows);
+  assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), rows);
+  assert.deepEqual(f.source.rows(`SELECT id, length(CAST(json_quote(text) AS BLOB)) AS bytes
+    FROM blocks ORDER BY id`), rows.map(({ id, text }) => ({ id, bytes: Buffer.byteLength(JSON.stringify(text)) })));
+  assertVerifiedBeforeDelete(f);
+  const pages = [];
+  const result = await copyFrozenIndex(f.args({ checkpointHook: (state) => {
+    if (state.pending?.phase === 'copying') pages.push(state.pending.rows);
+  } }));
+  assert.equal(result.state, 'complete');
+  assert.equal(result.rows, rows.length);
+  assert.ok(pages.length > 1, 'NUL escape expansion, not raw TEXT length, must split the bounded response pages');
+  assertCopied(f, rows);
+  for (let index = 0; index < rows.length; index += 1) {
+    assert.deepEqual(f.shards[0].rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?',
+      [`"json_nul_tail_${index}"`]), [{ rowid: rows[index].id }], 'FTS must retain tokens after embedded NULs');
+  }
+  assertNativeRequestLimits(f);
+  for (const batch of assertAtomicBlockBatches(f)) assert.equal(batch.statements.length, 4);
+});
+
+test('shared first MATCH terms with embedded NUL copy exactly and retire source rows on the same and different shards', async (context) => {
+  for (const distribution of ['same-shard', 'across-shards']) {
+    await context.test(distribution, async (child) => {
+      const f = await fixture(child);
+      for (const db of [f.source, ...f.shards]) {
+        db.database.exec('ALTER TABLE blocks ADD COLUMN future_text TEXT; ALTER TABLE blocks ADD COLUMN future_real REAL');
+      }
+      const columns = [...BLOCK_COLUMNS, 'future_text', 'future_real'];
+      const untouched = block(599, 0, { future_text: '', future_real: null });
+      // Retain the original CAS matrix's pre-mutation shared-term/NUL values, width and
+      // numeric/null edges. Each populated shard stays below one 48-probe MATCH chunk.
+      const originals = columns.filter((column) => column !== 'id').map((_, index) =>
+        block(600 + index, distribution === 'same-shard' ? 0 : index % 2, {
+          role: '', tool_name: null, ts: null, byte_start: 0, byte_len: Number.MAX_SAFE_INTEGER,
+          text: 'all_columns_cas_needle\u0000original_tail', on_main_path: 0,
+          future_text: 'future_prefix\u0000original_tail', future_real: 0.125,
+        }));
+      const rows = [untouched, ...originals];
+      const assertStoredRows = (db, expected) => {
+        assert.deepEqual(db.rows('SELECT * FROM blocks ORDER BY id'), expected);
+        assert.deepEqual(db.rows(`SELECT id, CAST(text AS BLOB) AS text_bytes,
+          CAST(future_text AS BLOB) AS future_bytes FROM blocks ORDER BY id`).map((row) => ({
+          id: row.id, text_bytes: Buffer.from(row.text_bytes), future_bytes: Buffer.from(row.future_bytes),
+        })), expected.map((row) => ({
+          id: row.id, text_bytes: Buffer.from(row.text), future_bytes: Buffer.from(row.future_text),
+        })), 'full native stored bytes must agree with the originals, including both NUL suffixes');
+      };
+      const assertSharedMatches = (db, expected) => {
+        const ids = expected.filter((row) => row.id !== untouched.id).map(({ id }) => ({ rowid: id }));
+        for (const token of ['all_columns_cas_needle', 'original_tail']) {
+          assert.deepEqual(db.rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? ORDER BY rowid',
+            [`"${token}"`]), ids, 'shared first terms and after-NUL terms must expose each real row once');
+          for (const { rowid } of ids) {
+            assert.deepEqual(db.rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = ?',
+              [`"${token}"`, rowid]), [{ rowid }], 'each real MATCH probe must retain its requested row identity');
+          }
+        }
+      };
+      seedBlocks(f.source, rows, columns);
+      assertStoredRows(f.source, rows);
+      assertSharedMatches(f.source, rows);
+      const protectedRows = assertVerifiedBeforeDelete(f);
+      let verifiedBeforeRetirement = false;
+      const copied = await copyFrozenIndex(f.args({ checkpointHook: (state) => {
+        if (state.pending?.phase !== 'verified') return;
+        verifiedBeforeRetirement = true;
+        assertStoredRows(f.source, rows);
+        for (let index = 0; index < f.shards.length; index += 1) {
+          const expected = rows.filter((row) => indexShardForSessionId(row.session_id, 2) === index);
+          assertStoredRows(f.shards[index], expected);
+          assertSharedMatches(f.shards[index], expected);
+        }
+      } }));
+      assert.equal(verifiedBeforeRetirement, true, 'shared-token identity verification must finish before any source retirement');
+      assert.equal(copied.state, 'complete');
+      assert.equal(copied.rows, rows.length);
+      assert.equal(protectedRows(), rows.length);
+      assertCopied(f, rows);
+      assert.deepEqual(f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
+      assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).state, 'complete');
+      const matchRows = f.trace.filter((event) => event.db !== f.source.id
+        && ['query', 'batch-statement'].includes(event.kind) && /\bMATCH\b/i.test(event.sql));
+      assert.ok(matchRows.every((event) => event.success), 'native grouped shared-token probes must all succeed');
+      assert.deepEqual(matchRows.flatMap((event) => event.rows.map(({ rowid }) => rowid)).sort((a, b) => a - b),
+        rows.map(({ id }) => id), 'grouping must not duplicate, lose or substitute any requested row identity');
+      const snapshots = f.shards.map(blockSnapshot);
+      f.trace.length = 0;
+      const evidence = await verifyIndexRecords({ source: f.source, shards: f.shards, catalogConsistency: 'required' });
+      assert.deepEqual(evidence, {
+        mainSessions: 0, mainStars: 0,
+        shards: f.shards.map((_db, index) => {
+          const expected = rows.filter((row) => indexShardForSessionId(row.session_id, 2) === index);
+          return {
+            shard: index, blockCount: expected.length, sessionCount: 0, starCount: 0,
+            blockSampleSha256: sha256(JSON.stringify(expected.slice(0, 4).map((row) => canonicalRow(columns, row)))),
+            catalogSampleSha256: sha256('[]'),
+          };
+        }),
+      }, 'readonly consumer evidence must preserve full-column identities for shared-token samples too');
+      assertReadonlyEvidenceCalls(f);
+      assert.deepEqual(f.shards.map(blockSnapshot), snapshots);
+    });
+  }
+});
+
+test('actual copier MATCH SQL preserves shared-term row identities with native Number-bound parameters', async (context) => {
+  const f = await fixture(context);
+  const rows = Array.from({ length: 100 }, (_, index) => block(40_001 + index, index % 2, {
+    text: 'native_binding_probe\u0000shared_tail 会話',
+  }));
+  seedBlocks(f.source, rows);
+  let nativeMatchCalls = 0;
+  for (const shard of f.shards) {
+    const execute = shard.execute.bind(shard);
+    // Only the numeric-only MATCH result transport uses Node's native Number bindings.
+    // Execute the producer's SQL unchanged against the real FTS index; never echo hits.
+    shard.execute = (sql, params) => {
+      if (!/\bMATCH\b/i.test(sql)) return execute(sql, params);
+      nativeMatchCalls += 1;
+      assert.ok(params.some((value) => typeof value === 'number' && Number.isSafeInteger(value)));
+      return shard.database.prepare(sql).all(...params).map((row) => ({ ...row }));
+    };
+  }
+  const protectedRows = assertVerifiedBeforeDelete(f);
+  const copied = await copyWithNativeParameters(f.args());
+  assert.equal(copied.state, 'complete');
+  assert.equal(copied.rows, rows.length);
+  assert.equal(protectedRows(), rows.length);
+  assert.ok(nativeMatchCalls > 0);
+  assertCopied(f, rows);
+  const matches = f.trace.filter((event) => ['query', 'batch-statement'].includes(event.kind)
+    && event.db !== f.source.id && /\bMATCH\b/i.test(event.sql));
+  assert.deepEqual(matches.flatMap((event) => event.rows.map(({ rowid }) => rowid)).sort((a, b) => a - b),
+    rows.map(({ id }) => id), 'shared terms must return each requested identity exactly once even with native SDK Number bindings');
+  assertNativeRequestLimits(f);
+  f.trace.length = 0;
+  const evidence = await verifyIndexRecords({ source: f.source, shards: f.shards, catalogConsistency: 'required' });
+  assert.deepEqual(evidence.shards.map(({ blockCount }) => blockCount), [50, 50]);
+  assertReadonlyEvidenceCalls(f);
+});
+
+test('actual configured FTS tokenizer preserves empty, punctuation, Unicode and shared after-NUL copy results', async (context) => {
+  const f = await fixture(context);
+  const cases = [
+    { text: null, tokens: [] },
+    { text: '', tokens: [] },
+    { text: ' \t\n\u0000', tokens: [] },
+    { text: '! ? : ; ( ) [ ] { }', tokens: [] },
+    // The schema explicitly adds these punctuation characters to unicode61 tokenchars.
+    // Probe the real source index instead of assuming the default tokenizer's behavior.
+    { text: '---', tokens: ['---'] },
+    { text: '___', tokens: ['___'] },
+    { text: '...', tokens: ['...'] },
+    { text: '--- separator_tail', tokens: ['---', 'separator_tail'] },
+    { text: '会話 café Ελληνικά e\u0301', tokens: ['会話', 'café', 'Ελληνικά', 'e\u0301'] },
+    { text: '😀\u0000会話_unicode_tail', tokens: ['会話_unicode_tail'] },
+    { text: 'shared_visible_term\u0000shared_tail_0 会話', tokens: ['shared_visible_term', 'shared_tail_0', '会話'] },
+    { text: 'shared_visible_term\u0000shared_tail_1 Ελληνικά', tokens: ['shared_visible_term', 'shared_tail_1', 'Ελληνικά'] },
+    { text: 'shared_visible_term\u0000shared_tail_2 café', tokens: ['shared_visible_term', 'shared_tail_2', 'café'] },
+  ];
+  const rows = cases.map(({ text }, index) => block(800 + index, index % 2, {
+    text, byte_len: text === null ? null : Buffer.byteLength(text),
+  }));
+  const assertBytesAndMatches = (db, expected) => {
+    assert.deepEqual(db.rows('SELECT * FROM blocks ORDER BY id'), expected);
+    assert.deepEqual(db.rows('SELECT id, CAST(text AS BLOB) AS bytes FROM blocks ORDER BY id').map((row) => ({
+      id: row.id, bytes: row.bytes === null ? null : Buffer.from(row.bytes),
+    })), expected.map((row) => ({
+      id: row.id, bytes: row.text === null ? null : Buffer.from(row.text),
+    })), 'empty/null/punctuation/Unicode rows must retain every original stored UTF-8 byte');
+    for (const row of expected) {
+      const { tokens } = cases[row.id - 800];
+      for (const token of tokens.length ? tokens : ['index-migration-tokenless-probe']) {
+        assert.deepEqual(db.rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = ?',
+          [`"${token}"`, row.id]), tokens.length ? [{ rowid: row.id }] : [],
+        'actual row-scoped MATCH must agree before and after copy, including punctuation tokenchars and NUL suffixes');
+      }
+    }
+  };
+  seedBlocks(f.source, rows);
+  assertBytesAndMatches(f.source, rows);
+  const protectedRows = assertVerifiedBeforeDelete(f);
+  let verifiedBeforeRetirement = false;
+  const copied = await copyFrozenIndex(f.args({ checkpointHook: (state) => {
+    if (state.pending?.phase !== 'verified') return;
+    verifiedBeforeRetirement = true;
+    assertBytesAndMatches(f.source, rows);
+    for (let index = 0; index < f.shards.length; index += 1) {
+      assertBytesAndMatches(f.shards[index], rows.filter((row) => indexShardForSessionId(row.session_id, 2) === index));
+    }
+  } }));
+  assert.equal(verifiedBeforeRetirement, true);
+  assert.equal(copied.state, 'complete');
+  assert.equal(copied.rows, rows.length);
+  assert.equal(protectedRows(), rows.length);
+  assertCopied(f, rows);
+  f.trace.length = 0;
+  const evidence = await verifyIndexRecords({ source: f.source, shards: f.shards, catalogConsistency: 'required' });
+  assert.deepEqual(evidence, {
+    mainSessions: 0, mainStars: 0,
+    shards: f.shards.map((_db, index) => {
+      const expected = rows.filter((row) => indexShardForSessionId(row.session_id, 2) === index);
+      return {
+        shard: index, blockCount: expected.length, sessionCount: 0, starCount: 0,
+        blockSampleSha256: sha256(JSON.stringify(expected.slice(0, 4).map((row) => canonicalRow(BLOCK_COLUMNS, row)))),
+        catalogSampleSha256: sha256('[]'),
+      };
+    }),
+  });
+  assertReadonlyEvidenceCalls(f);
+  assert.deepEqual(f.source.rows('SELECT * FROM blocks'), []);
 });
 
 test('crash checkpoints survive reopened databases and reuse verified blocks plus FTS without rewriting', async (context) => {
@@ -534,6 +837,8 @@ test('malformed long-column byte slices fail closed without dropping the origina
       await assert.rejects(copyFrozenIndex(f.args()));
       assert.equal(exercised, true, 'fault must affect an actual long-text destination readback');
       assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [row]);
+      assert.deepEqual(Buffer.from(f.source.rows('SELECT CAST(text AS BLOB) AS bytes FROM blocks')[0].bytes),
+        Buffer.from(row.text), 'malformed destination slices cannot alter any byte of the original source transcript');
       assert.deepEqual(sourceWrites(f), []);
       assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).pending.phase, 'copying');
     });
@@ -1165,6 +1470,119 @@ test('readonly sampled catalog evidence refuses absent/zero versions and live-ro
   }
 });
 
+test('full-column source CAS independently rejects every changed scalar column, including NUL suffixes and future columns', async (context) => {
+  const f = await fixture(context);
+  for (const db of [f.source, ...f.shards]) {
+    db.database.exec('ALTER TABLE blocks ADD COLUMN future_text TEXT; ALTER TABLE blocks ADD COLUMN future_real REAL');
+  }
+  const columns = [...BLOCK_COLUMNS, 'future_text', 'future_real'];
+  const compared = columns.filter((column) => column !== 'id');
+  const untouched = block(599, 0, { future_text: '', future_real: null });
+  const originals = compared.map((column, index) => block(600 + index, 0, {
+    role: '', tool_name: null, ts: null, byte_start: 0, byte_len: Number.MAX_SAFE_INTEGER,
+    // Distinct first MATCH terms keep this matrix focused on independent CAS columns,
+    // rather than making every FTS probe search the same multi-row posting list.
+    text: `all_columns_cas_needle_${column}\u0000original_tail`, on_main_path: 0,
+    future_text: 'future_prefix\u0000original_tail', future_real: 0.125,
+  }));
+  const integerNulls = new Set(['byte_start', 'byte_len', 'media_byte_start', 'media_byte_len']);
+  const changed = originals.map((row, index) => {
+    const column = compared[index];
+    const value = row[column];
+    const replacement = value === null ? (integerNulls.has(column) ? 0 : '')
+      : typeof value === 'number' ? (column === 'future_real' ? 0.25 : value === 0 ? 1 : value - 1)
+        : column === 'role' ? null
+          : ['text', 'future_text'].includes(column) ? value.replace('original_tail', 'changed_tail') : `${value} changed`;
+    return { ...row, [column]: replacement };
+  });
+  seedBlocks(f.source, [untouched, ...originals], columns);
+  const expectedSource = [untouched, ...originals];
+  assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), expectedSource);
+  for (const row of originals) {
+    assert.deepEqual(Buffer.from(f.source.rows('SELECT CAST(text AS BLOB) AS bytes FROM blocks WHERE id = ?', [row.id])[0].bytes),
+      Buffer.from(row.text), 'each original source transcript must retain its complete NUL suffix');
+    assert.deepEqual(f.source.rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = ?',
+      [`"all_columns_cas_needle_${compared[row.id - 600]}"`, row.id]), [{ rowid: row.id }],
+    'the unmodified source row must satisfy its actual first-token MATCH probe');
+    assert.deepEqual(f.source.rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = ?',
+      ['"original_tail"', row.id]), [{ rowid: row.id }], 'source FTS must index text after NUL too');
+  }
+  assertVerifiedBeforeDelete(f);
+  let mutated = false;
+  let observedDeletion = false;
+  f.source.afterStatement = ({ sql }) => {
+    if (!/\bDELETE\s+FROM\s+blocks\b/i.test(sql)) return;
+    observedDeletion = true;
+    assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), changed,
+      'each independently changed column must retain its own row while the unchanged neighbor is provisionally deleted');
+  };
+  await assert.rejects(copyFrozenIndex(f.args({ checkpointHook: (state) => {
+    if (mutated || state.pending?.phase !== 'verified') return;
+    assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), expectedSource,
+      'the mutation checkpoint must be reached with every original source byte still intact');
+    assert.deepEqual(f.shards[0].rows('SELECT * FROM blocks ORDER BY id'), expectedSource,
+      'all-column destination readback must succeed before introducing the CAS counterexamples');
+    for (let index = 0; index < originals.length; index += 1) {
+      const row = originals[index];
+      assert.deepEqual(f.shards[0].rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = ?',
+        [`"all_columns_cas_needle_${compared[index]}"`, row.id]), [{ rowid: row.id }],
+      'destination first-token FTS MATCH must be a positive control before source mutation');
+      assert.deepEqual(f.shards[0].rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = ?',
+        ['"original_tail"', row.id]), [{ rowid: row.id }], 'destination FTS must retain the original NUL suffix token');
+    }
+    mutated = true;
+    for (let index = 0; index < changed.length; index += 1) {
+      const column = compared[index];
+      f.source.database.prepare(`UPDATE blocks SET ${quoted(column)} = ? WHERE id = ?`)
+        .run(changed[index][column], changed[index].id);
+    }
+  } })), /malformed JSON/);
+  assert.equal(mutated, true, 'all mutations must occur after durable full-row verification');
+  assert.equal(observedDeletion, true, 'the native CAS must actually execute against the changed rows');
+  assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), [untouched, ...changed],
+    'the same-transaction source-empty assertion must roll back the unchanged neighbor too');
+  assert.deepEqual(f.shards[0].rows('SELECT * FROM blocks ORDER BY id'), [untouched, ...originals]);
+  const pending = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+  assert.equal(pending.pending.phase, 'verified');
+  assert.equal(pending.rows, 0);
+  assert.deepEqual(f.source.rows('SELECT name FROM sqlite_master WHERE name = ?', [SOURCE_FREEZE_TABLE]), [],
+    'failed full-column comparison must not install the first source guard');
+  assert.equal(f.trace.find((event) => event.db === f.source.id && event.kind === 'batch').committed, false);
+});
+
+test('oversized per-field source CAS cannot delete a transcript changed only after an embedded NUL', async (context) => {
+  const f = await fixture(context);
+  const text = `oversized_cas_needle\u0000${'😀 e\u0301 会話\n'.repeat(80_000)}oversized_original_tail`;
+  assert.ok(Buffer.byteLength(text) > 1024 * 1024);
+  assert.ok(Buffer.byteLength(text) < 2_000_000);
+  const original = block(701, 0, { text, byte_len: Buffer.byteLength(text) });
+  const changed = { ...original, text: text.replace('oversized_original_tail', 'oversized_changed_tail') };
+  seedBlocks(f.source, [original]);
+  assertVerifiedBeforeDelete(f);
+  let mutated = false;
+  let observedDeletion = false;
+  f.source.afterStatement = ({ sql }) => {
+    if (!/\bDELETE\s+FROM\s+blocks\b/i.test(sql)) return;
+    observedDeletion = true;
+    assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [changed],
+      'a matching id, row hash and pre-NUL prefix cannot authorize deleting changed suffix bytes');
+  };
+  await assert.rejects(copyFrozenIndex(f.args({ checkpointHook: (state) => {
+    if (mutated || state.pending?.phase !== 'verified') return;
+    mutated = true;
+    f.source.database.prepare('UPDATE blocks SET text = ? WHERE id = ?').run(changed.text, changed.id);
+  } })), /malformed JSON/);
+  assert.equal(mutated, true);
+  assert.equal(observedDeletion, true);
+  assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [changed]);
+  assert.deepEqual(f.shards[0].rows('SELECT * FROM blocks'), [original]);
+  const pending = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+  assert.equal(pending.pending.phase, 'verified');
+  assert.equal(pending.rows, 0);
+  assert.deepEqual(f.source.rows('SELECT name FROM sqlite_master WHERE name = ?', [SOURCE_FREEZE_TABLE]), []);
+  assert.equal(f.trace.find((event) => event.db === f.source.id && event.kind === 'batch').committed, false);
+});
+
 test('a late source mutation aborts the whole verified deletion transaction and preserves every original source row', async (context) => {
   const f = await fixture(context);
   const untouched = block(400, 0, { text: 'untouched_verified_neighbor' });
@@ -1271,7 +1689,7 @@ test('the committed SQL barrier rejects pre-existing source writers after CI abo
   f.source.afterStatement = ({ sql }) => {
     if (/^\s*UPDATE\s+index_migration_freeze\b.*'copying'/is.test(sql)) {
       observedCopyingTransaction = true;
-      assert.deepEqual(plainRows(staleDatabase.prepare(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`)),
+      assert.deepEqual(plainRows(staleDatabase, `SELECT * FROM ${SOURCE_FREEZE_TABLE}`),
         [{ id: 1, state: 'frozen' }], 'an old connection must never observe a committed copying/unfrozen state');
     }
   };
@@ -1370,7 +1788,7 @@ test('migration classification distinguishes legacy, pending and active states w
   assert.equal(classify({ copy }), 'pending');
   assert.equal(classify({ copy, seed: { identity, state: 'pending' } }), 'pending');
   assert.equal(classify({ copy, seed, legacyTables: [SOURCE_FREEZE_TABLE] }), 'pending');
-  assert.equal(classify({ copy, seed }), 'active');
+  assert.equal(classify({ copy, seed }), 'pending', 'completed copy and seed do not prove successful initial activation');
   for (const extra of [{}, { seed }, { copy: { identity, state: 'pending' }, seed }, { legacyTables: [SOURCE_FREEZE_TABLE] }]) {
     assert.throws(() => classify(extra), /no legacy source and no completed verified copy/);
   }
@@ -1398,6 +1816,480 @@ test('classification rejects copy and seed checkpoints for different database id
       }
     }
   }
+});
+
+function activationProofFixture() {
+  const source = Object.freeze({ id: 'activation-main' });
+  const shards = [Object.freeze({ id: 'activation-00' }), Object.freeze({ id: 'activation-01' })];
+  const identity = { format: 1, layout: INDEX_LAYOUT, source: source.id, shards: shards.map(({ id }) => id) };
+  const copy = { identity, columns: [...BLOCK_COLUMNS], after: 7, rows: 1, sha256: sha256('complete copy'),
+    pending: null, state: 'complete' };
+  const seed = { identity, after: 'catalog-00', rows: 1, state: 'complete' };
+  const args = { source, shards, copy, seed, revision: 'a'.repeat(40), cycle: '12345:1',
+    verifiedAt: 1_760_001_600_000, evidence: { outbox: 'empty', verifiedRows: 1 } };
+  const ready = buildReadyProof(args);
+  const activation = buildActivationProof({ ...args, ready, verifiedAt: args.verifiedAt + 1 });
+  return { ...args, ready, activation };
+}
+
+test('durable readiness and activation proofs bind complete snapshots, provenance and evidence without DB calls', () => {
+  const args = activationProofFixture();
+  const { ready, activation, copy, seed } = args;
+  assert.equal(READY_CHECKPOINT, 'full-fidelity-index-ready-v1');
+  assert.equal(ACTIVATION_CHECKPOINT, 'full-fidelity-index-activated-v1');
+  assert.equal(new Set([COPY_CHECKPOINT, SEED_CHECKPOINT, READY_CHECKPOINT, ACTIVATION_CHECKPOINT]).size, 4);
+  assert.equal(ready.state, 'ready');
+  assert.equal(activation.state, 'active');
+  assert.deepEqual(ready.copy.columns, copy.columns);
+  assert.notEqual(ready.copy.columns, copy.columns);
+  assert.equal(ready.copy.sha256, copy.sha256);
+  assert.equal(ready.copy.rows, copy.rows);
+  assert.equal(ready.copy.after, copy.after);
+  assert.equal(ready.seed.rows, seed.rows);
+  assert.ok(!Object.hasOwn(ready.seed, 'after'), 'proofs must hash, not expose, the seed session-id cursor');
+  assert.equal(activation.readyDigest, ready.digest);
+  assert.equal(activation.copyCheckpointSha256, ready.copy.checkpointSha256);
+  assert.equal(activation.seedCheckpointSha256, ready.seed.checkpointSha256);
+  for (const value of [ready.digest, activation.digest, ready.evidenceSha256, ready.copy.checkpointSha256,
+    ready.seed.checkpointSha256]) assert.match(value, /^[a-f0-9]{64}$/);
+  const roundtrip = JSON.parse(JSON.stringify({ ready, activation }));
+  assertReadyProof({ ...args, ready: roundtrip.ready });
+  assertActivationProof({ ...args, ...roundtrip });
+  const reverseKeys = (value) => Object.fromEntries(Object.entries(value).reverse());
+  assertReadyProof({ ...args, ready: reverseKeys(roundtrip.ready) });
+  assertActivationProof({ ...args, activation: reverseKeys(roundtrip.activation) });
+  assert.deepEqual(buildReadyProof({ ...args, copy: reverseKeys(copy), seed: reverseKeys(seed),
+    evidence: reverseKeys(args.evidence) }), ready, 'hashes must not depend on object insertion order');
+  const evidence = { records: { rows: 1 }, privateMarker: 'evidence-content-must-not-be-stored' };
+  const privateReady = buildReadyProof({ ...args, evidence });
+  assert.ok(!JSON.stringify(privateReady).includes(evidence.privateMarker));
+  assert.notEqual(privateReady.evidenceSha256, ready.evidenceSha256);
+});
+
+test('durable proof validation refuses missing states, unsafe counters, invalid attempts and incomplete snapshots', () => {
+  const args = activationProofFixture();
+  for (const proof of [undefined, null, false, true, {}, [], { ...args.ready, state: true },
+    { ...args.ready, state: 'complete' }, { ...args.ready, format: 2 }]) {
+    assert.throws(() => assertReadyProof({ ...args, ready: proof }), /ready proof/);
+  }
+  for (const proof of [undefined, null, false, true, {}, [], { ...args.activation, state: true },
+    { ...args.activation, state: 'complete' }, { ...args.activation, format: 2 }]) {
+    assert.throws(() => assertActivationProof({ ...args, activation: proof }), /activation proof/);
+  }
+  for (const extra of [
+    { copy: undefined }, { seed: undefined }, { copy: { ...args.copy, state: 'pending' } },
+    { seed: { ...args.seed, state: 'pending' } }, { copy: { ...args.copy, pending: { phase: 'verified' } } },
+    { copy: { ...args.copy, sha256: 'not-a-hash' } }, { copy: { ...args.copy, rows: -1 } },
+    { copy: { ...args.copy, rows: Number.MAX_SAFE_INTEGER + 1 } }, { copy: { ...args.copy, after: INDEX_ID_SPAN } },
+    { copy: { ...args.copy, columns: ['id', 'id'] } }, { copy: { ...args.copy, columns: ['text'] } },
+    { seed: { ...args.seed, rows: '1' } }, { seed: { ...args.seed, after: null } },
+    { revision: 'A'.repeat(40) }, { revision: true }, { revision: 'a'.repeat(39) },
+    { cycle: '12345' }, { cycle: '12345:0' }, { cycle: false },
+    { verifiedAt: 0 }, { verifiedAt: 0.5 }, { verifiedAt: Number.MAX_SAFE_INTEGER + 1 },
+    { evidence: undefined }, { evidence: true }, { evidence: [] }, { evidence: {} }, { evidence: { rows: undefined } },
+  ]) assert.throws(() => buildReadyProof({ ...args, ...extra }), /proof|snapshot|checkpoint/);
+  for (const evidence of [undefined, true, [], {}, { rows: NaN }]) {
+    assert.throws(() => buildActivationProof({ ...args, evidence }), /proof/);
+  }
+  assert.throws(() => buildActivationProof({ ...args, verifiedAt: args.ready.verifiedAt - 1 }), /activation proof/);
+  assert.throws(() => buildActivationProof({ ...args, revision: 'b'.repeat(40) }), /current revision\/cycle/);
+  assert.throws(() => buildActivationProof({ ...args, cycle: '12345:2' }), /current revision\/cycle/);
+  const empty = { ...args, copy: { ...args.copy, rows: 0, after: -1 }, seed: { ...args.seed, rows: 0, after: '' } };
+  assertReadyProof({ ...empty, ready: buildReadyProof(empty) });
+});
+
+test('durable proofs reject substituted same-identity checkpoints and every altered binding field', () => {
+  const args = activationProofFixture();
+  const snapshots = [
+    { copy: { ...args.copy, sha256: sha256('different copied contents') } },
+    { copy: { ...args.copy, columns: [...args.copy.columns].reverse() } },
+    { copy: { ...args.copy, rows: 2 } }, { copy: { ...args.copy, after: 8 } },
+    { copy: { ...args.copy, additionalSnapshotField: 1 } },
+    { seed: { ...args.seed, rows: 2 } }, { seed: { ...args.seed, after: 'catalog-01' } },
+    { seed: { ...args.seed, additionalSnapshotField: 1 } },
+  ];
+  for (const extra of snapshots) {
+    assert.throws(() => assertReadyProof({ ...args, ...extra }), /binding mismatch/);
+    assert.throws(() => assertActivationProof({ ...args, ...extra }), /binding mismatch/);
+  }
+  for (const extra of [
+    { source: { id: 'different-main' } }, { shards: [...args.shards].reverse() },
+    { shards: [args.shards[0]] }, { copy: { ...args.copy, identity: { ...args.copy.identity, layout: 'different' } } },
+  ]) assert.throws(() => assertReadyProof({ ...args, ...extra }), /different databases\/layout/);
+  for (const key of ['digest', 'evidenceSha256', 'revision', 'cycle', 'verifiedAt', 'identity', 'copy', 'seed']) {
+    const ready = structuredClone(args.ready);
+    ready[key] = key === 'verifiedAt' ? ready[key] + 1
+      : key === 'identity' ? { ...ready.identity, source: 'another-main' }
+        : key === 'copy' ? { ...ready.copy, after: ready.copy.after + 1 }
+          : key === 'seed' ? { ...ready.seed, rows: ready.seed.rows + 1 }
+            : key === 'revision' ? 'b'.repeat(40) : key === 'cycle' ? '12345:2' : '0'.repeat(64);
+    assert.throws(() => assertReadyProof({ ...args, ready }), /proof/);
+  }
+  for (const key of ['digest', 'readyDigest', 'evidenceSha256', 'copySha256',
+    'copyCheckpointSha256', 'seedCheckpointSha256', 'revision', 'cycle', 'verifiedAt', 'identity']) {
+    const activation = structuredClone(args.activation);
+    activation[key] = key === 'verifiedAt' ? activation[key] + 1
+      : key === 'identity' ? { ...activation.identity, source: 'another-main' }
+        : key === 'revision' ? 'b'.repeat(40) : key === 'cycle' ? '12345:2' : '0'.repeat(64);
+    assert.throws(() => assertActivationProof({ ...args, activation }), /proof/);
+  }
+  assert.throws(() => assertReadyProof({ ...args, revision: 'b'.repeat(40) }), /current revision\/cycle/);
+  assert.throws(() => assertReadyProof({ ...args, cycle: '12345:2' }), /current revision\/cycle/);
+  assert.throws(() => assertReadyProof({ ...args, ready: { ...args.ready, extraField: 'unbound' } }), /binding mismatch/);
+});
+
+test('initial activation classification remains pending until valid durable activation and preserves ordinary redeploys', () => {
+  const args = activationProofFixture();
+  const classify = (extra = {}) => classifyActivation({ ...args, legacyTables: [], ...extra });
+  assert.equal(classify({ ready: undefined, activation: undefined }), 'pending',
+    'completed copy and seed cannot silently enter the active fast path');
+  assert.equal(classify({ activation: undefined }), 'pending', 'READY alone cannot authorize activation');
+  assert.equal(classify(), 'active');
+  assert.equal(classify({ revision: 'b'.repeat(40), cycle: '99999:3' }), 'active',
+    'a valid original activation must survive later ordinary deploy revisions and CI attempts');
+  for (const legacyTables of [['blocks'], ['blocks_fts'], [SOURCE_FREEZE_TABLE]]) {
+    assert.equal(classify({ legacyTables }), 'pending');
+  }
+  for (const extra of [
+    { ready: false }, { activation: false }, { ready: undefined },
+    { activation: { ...args.activation, state: 'complete' } },
+    { ready: { ...args.ready, identity: { ...args.ready.identity, source: 'another-main' } } },
+    { seed: { ...args.seed, after: 'another-completed-seed' } },
+  ]) assert.throws(() => classify(extra), /proof/);
+  assert.throws(() => classify({ legacyTables: ['blocks'], activation: false }), /proof/,
+    'legacy tables must not hide a malformed present activation proof');
+});
+
+test('durable initial activation resumes pending after failed real index verification and survives database reopening', async (context) => {
+  const sid = 'catalog-00';
+  const row = block(50_001, indexShardForSessionId(sid, 2), { session_id: sid, text: 'activation_verified_needle\u0000original_tail' });
+  const f = await catalogFixture(context, [row], 3);
+  await seedFrozenCatalog(f.args());
+  const copy = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+  const seed = await readCheckpoint(f.shards[0], SEED_CHECKPOINT);
+  const evidence = await verifyIndexRecords({ source: f.source, shards: f.shards, catalogConsistency: 'required' });
+  assert.deepEqual(f.source.rows('SELECT * FROM session_catalog_outbox'), []);
+  const legacyTables = f.source.rows(`SELECT name FROM sqlite_master WHERE type = 'table'
+    AND name IN ('blocks', 'blocks_fts', '${SOURCE_FREEZE_TABLE}') ORDER BY name`).map(({ name }) => name);
+  assert.deepEqual(legacyTables, [], 'real main migrations must have retired the legacy source and its writer barrier');
+  const args = { source: f.source, shards: f.shards, copy, seed, revision: 'c'.repeat(40),
+    cycle: '54321:1', verifiedAt: 1_760_001_600_000, evidence };
+  const calls = f.trace.length;
+  const ready = buildReadyProof(args);
+  assertReadyProof({ ...args, ready });
+  assert.equal(classifyActivation({ ...args, ready, legacyTables }), 'pending');
+  assert.equal(f.trace.length, calls, 'proof construction/assertion/classification must not query any database');
+  await writeCheckpoint(f.shards[0], READY_CHECKPOINT, ready);
+  f.restart();
+  const resumed = { ...args, source: f.source, shards: f.shards,
+    ready: await readCheckpoint(f.shards[0], READY_CHECKPOINT) };
+  assert.deepEqual(resumed.ready, ready);
+  assert.equal(await readCheckpoint(f.shards[0], ACTIVATION_CHECKPOINT), null);
+  assert.equal(classifyActivation({ ...resumed, legacyTables }), 'pending');
+  const shard = f.shards[indexShardForSessionId(sid, 2)];
+  shard.database.prepare("INSERT INTO blocks_fts (blocks_fts, rowid, text) VALUES ('delete', ?, ?)").run(row.id, row.text);
+  await assert.rejects(verifyIndexRecords({ source: f.source, shards: f.shards, catalogConsistency: 'required' }),
+    /FTS MATCH verification failed/);
+  assert.equal(await readCheckpoint(f.shards[0], ACTIVATION_CHECKPOINT), null,
+    'failed actual index verification must leave initial activation unwritten');
+  f.restart();
+  const retried = { ...resumed, source: f.source, shards: f.shards,
+    ready: await readCheckpoint(f.shards[0], READY_CHECKPOINT) };
+  assert.equal(classifyActivation({ ...retried, legacyTables }), 'pending');
+  f.shards[indexShardForSessionId(sid, 2)].database.prepare('INSERT INTO blocks_fts (rowid, text) VALUES (?, ?)')
+    .run(row.id, row.text);
+  const activeEvidence = await verifyIndexRecords({ source: f.source, shards: f.shards, catalogConsistency: 'required' });
+  const activation = buildActivationProof({ ...retried, verifiedAt: args.verifiedAt + 1, evidence: activeEvidence });
+  assertActivationProof({ ...retried, activation });
+  await writeCheckpoint(f.shards[0], ACTIVATION_CHECKPOINT, activation);
+  f.restart();
+  const activated = { ...retried, source: f.source, shards: f.shards,
+    ready: await readCheckpoint(f.shards[0], READY_CHECKPOINT),
+    activation: await readCheckpoint(f.shards[0], ACTIVATION_CHECKPOINT) };
+  assertActivationProof(activated);
+  assert.equal(classifyActivation({ ...activated, legacyTables }), 'active');
+  assert.equal(classifyActivation({ ...activated, legacyTables, revision: 'd'.repeat(40), cycle: '54321:2' }), 'active');
+  assert.deepEqual(f.shards[indexShardForSessionId(sid, 2)].rows('SELECT * FROM blocks'), [row]);
+});
+
+test('actual controller phases persist readiness and activation only after all checks and resume failures without overwriting proofs', async (context) => {
+  const sid = 'catalog-00';
+  const row = block(50_002, indexShardForSessionId(sid, 2), { session_id: sid, text: 'controller_phase_needle\u0000original_tail' });
+  const f = await catalogFixture(context, [row], 3);
+  await seedFrozenCatalog(f.args());
+  const initialRevision = 'e'.repeat(40);
+  const initialCycle = '67890:1';
+  const args = (extra = {}) => ({ source: f.source, shards: f.shards,
+    revision: initialRevision, cycle: initialCycle, ...extra });
+  const healthFor = (indexMode, deploymentRevision = initialRevision) => ({
+    ...health, indexMode, deploymentRevision,
+  });
+  const maintenanceGate = async () => {
+    const current = healthFor('maintenance');
+    assertMaintenanceHealth(current, initialRevision, 2);
+    return current;
+  };
+  const activeGate = async () => healthFor('active');
+  const proofs = async () => ({
+    copy: await readCheckpoint(f.shards[0], COPY_CHECKPOINT),
+    seed: await readCheckpoint(f.shards[0], SEED_CHECKPOINT),
+    ready: await readCheckpoint(f.shards[0], READY_CHECKPOINT),
+    activation: await readCheckpoint(f.shards[0], ACTIVATION_CHECKPOINT),
+  });
+  const classifyPersisted = async () => {
+    const legacyTables = f.source.rows(`SELECT name FROM sqlite_master WHERE type = 'table'
+      AND name IN ('blocks', 'blocks_fts', '${SOURCE_FREEZE_TABLE}')`).map(({ name }) => name);
+    return classifyActivation({ ...args(), ...await proofs(), legacyTables });
+  };
+  const missing = f.shards[1].rows('SELECT * FROM sessions WHERE session_id = ?', [sid])[0];
+  f.shards[1].database.prepare('DELETE FROM sessions WHERE session_id = ?').run(sid);
+  await assert.rejects(verifyReadyIndex(args({ gate: maintenanceGate })), /complete catalog counts differ/);
+  assert.equal((await proofs()).ready, null, 'failed actual strict readback cannot persist READY');
+  assert.equal((await proofs()).activation, null);
+  assert.equal(await classifyPersisted(), 'pending');
+  insert(f.shards[1], 'sessions', SESSION_CATALOG_COLUMNS, missing);
+  const failedReadyHealth = new Error('final maintenance health failed');
+  let readyGates = 0;
+  await assert.rejects(verifyReadyIndex(args({ gate: async () => {
+    if (++readyGates === 2) throw failedReadyHealth;
+    return maintenanceGate();
+  } })), (error) => error === failedReadyHealth);
+  assert.equal(readyGates, 2, 'the final readiness health check must run after actual strict verification');
+  assert.equal((await proofs()).ready, null);
+  f.restart();
+  assert.equal(await classifyPersisted(), 'pending');
+  const prepared = await verifyReadyIndex(args({ gate: maintenanceGate }));
+  assert.equal(prepared.state, 'ready');
+  const preparedProofs = await proofs();
+  assertReadyProof({ ...args(), ...preparedProofs });
+  assert.equal(preparedProofs.activation, null);
+  const readyValue = f.shards[0].rows('SELECT value FROM index_migration_state WHERE name = ?', [READY_CHECKPOINT])[0].value;
+  let prematureChecks = 0;
+  await assert.rejects(verifyActiveIndex(args({ revision: 'f'.repeat(40), cycle: '67890:2',
+    gate: async () => { prematureChecks += 1; return activeGate(); },
+    login: async () => { prematureChecks += 1; },
+  })), /current revision\/cycle/);
+  assert.equal(prematureChecks, 0, 'initial current-revision READY must be checked before active health or login');
+  const failedLogin = new Error('real login verification failed');
+  const loginFailureOrder = [];
+  await assert.rejects(verifyActiveIndex(args({
+    gate: async () => { loginFailureOrder.push('health'); return activeGate(); },
+    login: async () => { loginFailureOrder.push('login'); throw failedLogin; },
+  })), (error) => error === failedLogin);
+  assert.deepEqual(loginFailureOrder, ['health', 'login']);
+  assert.equal((await proofs()).activation, null, 'failed login must not authorize initial activation');
+  f.restart();
+  assert.equal(await classifyPersisted(), 'pending');
+  assert.equal(f.shards[0].rows('SELECT value FROM index_migration_state WHERE name = ?', [READY_CHECKPOINT])[0].value, readyValue);
+  const failedActiveHealth = new Error('final active health failed');
+  let activeGates = 0;
+  let successfulLogins = 0;
+  await assert.rejects(verifyActiveIndex(args({
+    gate: async () => {
+      if (++activeGates === 2) throw failedActiveHealth;
+      return activeGate();
+    },
+    login: async () => { successfulLogins += 1; },
+  })), (error) => error === failedActiveHealth);
+  assert.equal(activeGates, 2);
+  assert.equal(successfulLogins, 1);
+  assert.equal((await proofs()).activation, null, 'final health failure after login must still leave activation unwritten');
+  f.restart();
+  assert.equal(await classifyPersisted(), 'pending');
+  const activated = await verifyActiveIndex(args({ gate: activeGate, login: async () => { successfulLogins += 1; } }));
+  assert.equal(activated.state, 'active');
+  assert.equal(activated.activationState, 'initial');
+  assertActivationProof({ ...args(), ...await proofs() });
+  const activationValue = f.shards[0].rows('SELECT value FROM index_migration_state WHERE name = ?', [ACTIVATION_CHECKPOINT])[0].value;
+  f.restart();
+  assert.equal(await classifyPersisted(), 'active');
+  let redeployGates = 0;
+  let redeployLogins = 0;
+  const redeployed = await verifyActiveIndex(args({ revision: 'f'.repeat(40), cycle: '67890:2',
+    gate: async () => { redeployGates += 1; return healthFor('active', 'f'.repeat(40)); },
+    login: async () => { redeployLogins += 1; },
+  }));
+  assert.equal(redeployed.activationState, 'existing');
+  assert.equal(redeployGates, 2);
+  assert.equal(redeployLogins, 1);
+  assert.equal(f.shards[0].rows('SELECT value FROM index_migration_state WHERE name = ?', [READY_CHECKPOINT])[0].value, readyValue);
+  assert.equal(f.shards[0].rows('SELECT value FROM index_migration_state WHERE name = ?', [ACTIVATION_CHECKPOINT])[0].value, activationValue,
+    'ordinary deploys must retain the exact original durable activation proof');
+  assertActivationProof({ ...args(), ...await proofs() });
+  assert.deepEqual(f.shards[indexShardForSessionId(sid, 2)].rows('SELECT * FROM blocks'), [row]);
+});
+
+test('failed initial activation can abort and resume an intentional reseed without retaining stale READY or clearing activation', async (context) => {
+  const sid = 'catalog-00';
+  const row = block(50_003, indexShardForSessionId(sid, 2), { session_id: sid, text: 'reseed_resume_needle\u0000original_tail' });
+  const f = await catalogFixture(context, [row], 3);
+  await seedFrozenCatalog(f.args());
+  const proofRevision = '1'.repeat(40);
+  const cycle = '77777:1';
+  const args = (extra = {}) => ({ source: f.source, shards: f.shards, revision: proofRevision, cycle, ...extra });
+  const maintenanceGate = async () => {
+    const current = { ...health, deploymentRevision: proofRevision };
+    assertMaintenanceHealth(current, proofRevision, 2);
+    return current;
+  };
+  const activeGate = async () => ({ ...health, indexMode: 'active', deploymentRevision: proofRevision });
+  const persisted = async () => ({
+    ...args(),
+    copy: await readCheckpoint(f.shards[0], COPY_CHECKPOINT),
+    seed: await readCheckpoint(f.shards[0], SEED_CHECKPOINT),
+    ready: await readCheckpoint(f.shards[0], READY_CHECKPOINT),
+    activation: await readCheckpoint(f.shards[0], ACTIVATION_CHECKPOINT),
+    legacyTables: f.source.rows(`SELECT name FROM sqlite_master WHERE type = 'table'
+      AND name IN ('blocks', 'blocks_fts', '${SOURCE_FREEZE_TABLE}')`).map(({ name }) => name),
+  });
+  await verifyReadyIndex(args({ gate: maintenanceGate }));
+  const original = await persisted();
+  assertReadyProof(original);
+  const failedLogin = new Error('login failed before initial activation');
+  await assert.rejects(verifyActiveIndex(args({ gate: activeGate, login: async () => { throw failedLogin; } })),
+    (error) => error === failedLogin);
+  assert.equal((await persisted()).activation, null);
+  assert.equal(classifyActivation(await persisted()), 'pending');
+  const crash = new Error('CI aborted after reseed checkpoint reset');
+  let abortedAfterReset = false;
+  await assert.rejects(seedFrozenCatalog(f.args({ checkpointHook: async (state) => {
+    if (state.state !== 'pending') return;
+    abortedAfterReset = true;
+    assert.equal(await readCheckpoint(f.shards[0], READY_CHECKPOINT), null,
+      'the old READY must already be durably absent when SEED first becomes pending');
+    assert.equal(await readCheckpoint(f.shards[0], ACTIVATION_CHECKPOINT), null);
+    throw crash;
+  } })), (error) => error === crash);
+  assert.equal(abortedAfterReset, true);
+  const aborted = await persisted();
+  assert.equal(aborted.seed.state, 'pending');
+  assert.equal(aborted.ready, null);
+  assert.equal(aborted.activation, null);
+  assert.deepEqual(aborted.copy, original.copy);
+  assert.equal(classifyActivation(aborted), 'pending', 'an intentional unactivated reseed must remain resumable, not throw for stale READY');
+  f.restart();
+  assert.equal(classifyActivation(await persisted()), 'pending');
+  await assert.rejects(verifyReadyIndex(args({ gate: maintenanceGate })), /prerequisites incomplete/);
+  assert.equal((await persisted()).ready, null);
+  const reseeded = await seedFrozenCatalog(f.args());
+  assert.equal(reseeded.state, 'complete');
+  assert.equal(classifyActivation(await persisted()), 'pending');
+  await verifyReadyIndex(args({ gate: maintenanceGate }));
+  assertReadyProof(await persisted());
+  await verifyActiveIndex(args({ gate: activeGate, login: async () => {} }));
+  const activated = await persisted();
+  assertActivationProof(activated);
+  assert.equal(classifyActivation(activated), 'active');
+  const before = verifierSnapshot(f);
+  await assert.rejects(seedFrozenCatalog(f.args()), /initial activation is already proven; refusing catalog reseed/);
+  assert.deepEqual(verifierSnapshot(f), before, 'a proven initial activation and its READY/SEED must never be cleared or reseeded');
+  assert.deepEqual(f.shards[indexShardForSessionId(sid, 2)].rows('SELECT * FROM blocks'), [row]);
+});
+
+test('reseed and actual controller phases refuse corrupt or foreign proofs without deleting or replacing them', async (context) => {
+  for (const corruption of ['ready-digest', 'ready-identity', 'ready-null', 'activation-state', 'activation-null']) {
+    await context.test(corruption, async (child) => {
+      const f = await catalogFixture(child, [], 2);
+      await seedFrozenCatalog(f.args());
+      const proofRevision = '2'.repeat(40);
+      const args = { source: f.source, shards: f.shards, revision: proofRevision, cycle: '88888:1',
+        gate: async () => ({ ...health, deploymentRevision: proofRevision }) };
+      await verifyReadyIndex(args);
+      const ready = await readCheckpoint(f.shards[0], READY_CHECKPOINT);
+      const name = corruption.startsWith('activation-') ? ACTIVATION_CHECKPOINT : READY_CHECKPOINT;
+      const corrupt = corruption.endsWith('-null') ? null : corruption === 'activation-state' ? false
+        : corruption === 'ready-digest' ? { ...ready, digest: '0'.repeat(64) }
+          : { ...ready, identity: { ...ready.identity, source: 'foreign-main' } };
+      const raw = JSON.stringify(corrupt);
+      f.shards[0].database.prepare(`INSERT INTO index_migration_state (name, value) VALUES (?, ?)
+        ON CONFLICT (name) DO UPDATE SET value = excluded.value`).run(name, raw);
+      assert.deepEqual(f.shards[0].rows('SELECT value FROM index_migration_state WHERE name = ?', [name]), [{ value: raw }]);
+      const expectedError = corrupt === null || corrupt === false
+        ? /invalid index migration checkpoint payload/ : /proof/;
+      const before = verifierSnapshot(f);
+      await assert.rejects(seedFrozenCatalog(f.args()), expectedError);
+      assert.deepEqual(verifierSnapshot(f), before, 'malformed present proof data must fail closed, never be discarded to permit reseeding');
+      await assert.rejects(verifyReadyIndex(args), expectedError);
+      assert.deepEqual(verifierSnapshot(f), before, 'readiness must not silently replace an invalid existing proof');
+      let activeChecks = 0;
+      await assert.rejects(verifyActiveIndex({ ...args,
+        gate: async () => { activeChecks += 1; return { ...health, indexMode: 'active', deploymentRevision: proofRevision }; },
+        login: async () => { activeChecks += 1; },
+      }), expectedError);
+      assert.equal(activeChecks, 0, 'malformed persisted proof state must fail before active health or login');
+      assert.deepEqual(verifierSnapshot(f), before, 'active verification must never treat a false or corrupt activation as absent');
+    });
+  }
+});
+
+async function queueControlFixture(context, consumerOwner = 'pause-worker') {
+  const queues = [
+    { queue_id: 'consumer-id', queue_name: 'consumer-only' },
+    { queue_id: 'producer-id', queue_name: 'producer-only' },
+  ];
+  const consumers = new Map([
+    ['consumer-id', [{ consumer_id: 'owned-consumer', type: 'worker', script_name: consumerOwner }]],
+    ['producer-id', [{ consumer_id: 'producer-consumer', type: 'worker', script_name: 'producer-worker' }]],
+  ]);
+  const requests = [];
+  const server = createServer((request, response) => {
+    const url = new URL(request.url, 'http://queue.fixture');
+    const parts = url.pathname.split('/').filter(Boolean);
+    requests.push({ method: request.method, path: url.pathname });
+    const reply = (status, result) => {
+      response.writeHead(status, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ success: status === 200, result,
+        result_info: { total_count: queues.length } }));
+    };
+    if (request.method === 'GET' && url.pathname === '/queues') return reply(200, queues);
+    if (parts[0] !== 'queues' || parts[2] !== 'consumers' || !consumers.has(parts[1])) return reply(404, null);
+    if (request.method === 'GET' && parts.length === 3) return reply(200, consumers.get(parts[1]));
+    if (request.method === 'DELETE' && parts.length === 4) {
+      const entries = consumers.get(parts[1]);
+      if (!entries.some(({ consumer_id }) => consumer_id === parts[3])) return reply(404, null);
+      consumers.set(parts[1], entries.filter(({ consumer_id }) => consumer_id !== parts[3]));
+      return reply(200, null);
+    }
+    return reply(400, null);
+  });
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  context.after(() => new Promise((resolve, reject) => server.close((error) => error ? reject(error) : resolve())));
+  const origin = `http://127.0.0.1:${server.address().port}`;
+  const api = { cf: async (pathname, init = {}) => {
+    const { returnEnvelope = false, ...request } = init;
+    delete request.allowNotFound;
+    const response = await fetch(`${origin}/${pathname}`, request);
+    const envelope = await response.json();
+    if (!response.ok || !envelope.success) throw new Error(`local queue API rejected HTTP ${response.status}`);
+    return returnEnvelope ? envelope : envelope.result;
+  } };
+  return { api, consumers, requests };
+}
+
+test('actual queue pause uses intended consumers only, deduplicates queues and refuses other owners without DELETE', async (context) => {
+  const config = { name: 'pause-worker', queues: {
+    consumers: [{ queue: 'consumer-only' }, { queue: 'consumer-only' }],
+    producers: [{ queue: 'producer-only', binding: 'OUTGOING' }],
+  } };
+  await context.test('consumer-only queue paused and producer-only queue untouched', async (child) => {
+    const f = await queueControlFixture(child);
+    const producerBefore = structuredClone(f.consumers.get('producer-id'));
+    assert.deepEqual(await pauseConsumers(f.api, config), { pausedConsumers: 1 });
+    assert.deepEqual(f.consumers.get('consumer-id'), [], 'the real local DELETE must remove the intended consumer');
+    assert.deepEqual(f.consumers.get('producer-id'), producerBefore);
+    assert.deepEqual(f.requests.filter(({ method }) => method === 'DELETE'),
+      [{ method: 'DELETE', path: '/queues/consumer-id/consumers/owned-consumer' }]);
+    assert.equal(f.requests.filter(({ path }) => path === '/queues/consumer-id/consumers').length, 1);
+    assert.ok(!f.requests.some(({ path }) => path.startsWith('/queues/producer-id/')),
+      'a producer binding must not cause listing or pausing that queue');
+  });
+  await context.test('wrong Worker owner fails before any DELETE', async (child) => {
+    const f = await queueControlFixture(child, 'other-worker');
+    const before = structuredClone([...f.consumers]);
+    await assert.rejects(pauseConsumers(f.api, config), /refusing to pause another owner/);
+    assert.ok(!f.requests.some(({ method }) => method === 'DELETE'));
+    assert.deepEqual([...f.consumers], before);
+  });
 });
 
 test('active catalog reconciliation drains at most 16 distinct outbox sessions without performing a full seed', async (context) => {
@@ -1580,7 +2472,7 @@ function assertNativeRequestLimits(f) {
 test('a dense 600-row copy uses native JSON bulk writes/deletion and bounded MATCH batches rather than one RPC per row', async (context) => {
   const f = await fixture(context);
   const rows = Array.from({ length: 600 }, (_, index) => block(10_001 + index, index % 2, {
-    text: `dense_needle_${index} café 会話 😀`,
+    text: `dense_needle_${index} café\u0000会話 😀 dense_tail_${index}`,
     role: index % 3 ? '' : null, on_main_path: index % 2, row_hash: 2 ** 32 - index,
   }));
   seedBlocks(f.source, rows);
@@ -1610,8 +2502,6 @@ test('a dense 600-row copy uses native JSON bulk writes/deletion and bounded MAT
   }
   const deletion = sourceWrites(f).filter(({ sql }) => /\bDELETE\s+FROM\s+blocks\b/i.test(sql));
   assert.equal(deletion.length, 1, 'an ordinary source page must use one native full-column bulk CAS');
-  assert.equal(deletion[0].params.length, 1);
-  assert.deepEqual(JSON.parse(deletion[0].params[0]), rows.map((row) => BLOCK_COLUMNS.map((column) => row[column])));
   const matchBatches = f.trace.filter((event) => event.kind === 'batch'
     && event.statements.every(({ sql }) => /\bMATCH\b/i.test(sql)));
   assert.equal(matchBatches.length, 2, 'all MATCH chunks of a populated shard share one native read transaction');
@@ -1645,8 +2535,8 @@ test('source copy forecast measures real SQLite density/fanout and reports only 
       mean: sizes.reduce((sum, size) => sum + size, 0) / rows.length, max: Math.max(...sizes) },
     observedPageRows: { mean: rows.length, max: rows.length },
     observedShardFanout: { mean: 2, max: 2 },
-    estimatedRemainingPages: 1, estimatedRemainingRequests: 20, requestRatePerSecond: 4,
-    estimatedApiTimeLowerBoundSeconds: 5,
+    estimatedRemainingPages: 1, estimatedRemainingRequests: 20, requestRatePerSecond: CLOUDFLARE_REQUEST_RATE_PER_SECOND,
+    estimatedApiTimeLowerBoundSeconds: 20 / CLOUDFLARE_REQUEST_RATE_PER_SECOND,
   });
   assertReadonlyEvidenceCalls(f);
   assertNativeRequestLimits(f);
@@ -1670,7 +2560,7 @@ test('empty-source forecasting is read-only and explicitly estimates zero remain
     kind: 'estimate', remainingRows: 0, shardCount: 2, rowCap: 2048, byteCap: 1024 * 1024,
     sampledRows: 0, sampledPages: 0, observedRowBytes: { total: 0, mean: 0, max: 0 },
     observedPageRows: { mean: 0, max: 0 }, observedShardFanout: { mean: 0, max: 0 },
-    estimatedRemainingPages: 0, estimatedRemainingRequests: 0, requestRatePerSecond: 4,
+    estimatedRemainingPages: 0, estimatedRemainingRequests: 0, requestRatePerSecond: CLOUDFLARE_REQUEST_RATE_PER_SECOND,
     estimatedApiTimeLowerBoundSeconds: 0,
   });
   assertReadonlyEvidenceCalls(f);
@@ -1770,14 +2660,19 @@ function probeTables(db) {
   return db.rows("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE '__index_batch_probe_%'");
 }
 
-test('D1 atomicity positive control proves native commit/readback followed by intentional SQL rollback using real SQLite', async (context) => {
+test('D1 atomicity positive control proves exact BOM/Unicode/NUL text bytes, native commit/readback and intentional SQL rollback using real SQLite', async (context) => {
   const f = await fixture(context);
   const db = annotateSqlProbeFailures(f.shards[0]);
   seedBlocks(f.source, [block(32_001)]);
   const sourceBefore = blockSnapshot(f.source);
   const indexBefore = blockSnapshot(db);
+  const textBytes = Buffer.byteLength(D1_BATCH_PROBE_TEXT, 'utf8');
+  const expectedReadback = [{ id: 1, value: D1_BATCH_PROBE_TEXT, value_bytes: textBytes }];
   const result = await verifyD1BatchAtomicity(db);
-  assert.deepEqual(result, { state: 'verified', probe: 'd1-rest-batch-atomicity', databaseId: db.id });
+  assert.deepEqual(result, {
+    state: 'verified', probe: 'd1-rest-batch-atomicity', databaseId: db.id,
+    textTransport: 'verified', textBytes,
+  });
   const batches = f.trace.filter((event) => event.kind === 'batch');
   assert.equal(batches.length, 2);
   assert.equal(batches[0].atomic, true);
@@ -1785,13 +2680,121 @@ test('D1 atomicity positive control proves native commit/readback followed by in
   assert.equal(batches[0].statements.length, 3);
   assert.equal(batches[1].atomic, true);
   assert.equal(batches[1].committed, false);
-  assert.ok(f.trace.some((event) => event.kind === 'query' && event.success
-    && event.rows?.some((row) => row.id === 1 && row.value === 'committed')),
-  'successful batch evidence requires an independent committed readback');
+  const readbacks = f.trace.filter((event) => event.success
+    && ['query', 'batch-statement'].includes(event.kind)
+    && event.rows?.some((row) => Object.hasOwn(row, 'value')));
+  assert.deepEqual(readbacks.map(({ kind, rows }) => ({ kind, rows })), [
+    { kind: 'batch-statement', rows: expectedReadback },
+    { kind: 'query', rows: expectedReadback },
+  ], 'native and independent SQL getters must preserve the complete text and stored UTF-8 byte length');
+  for (const { rows } of readbacks) {
+    assert.deepEqual(Buffer.from(rows[0].value, 'utf8'), Buffer.from(D1_BATCH_PROBE_TEXT, 'utf8'));
+    assert.equal(Buffer.byteLength(rows[0].value, 'utf8'), rows[0].value_bytes);
+  }
   assert.deepEqual(probeTables(db), []);
   assert.deepEqual(blockSnapshot(f.source), sourceBefore);
   assert.deepEqual(blockSnapshot(db), indexBefore);
   assert.ok(f.trace.every((event) => event.db === db.id), 'the atomicity probe must never write or query the source database');
+});
+
+test('corrupt native or independent atomicity text/byte readbacks fail closed and clean only the owned table before copy', async (context) => {
+  for (const phase of ['batch', 'independent']) {
+    for (const corruption of ['missing-text', 'nul-suffix-truncation', 'bom-strip', 'missing-byte-length',
+      'byte-length-mismatch', 'missing-row', 'duplicate-row']) {
+      await context.test(`${phase}: ${corruption}`, async (child) => {
+        const f = await fixture(child);
+        const db = annotateSqlProbeFailures(f.shards[0]);
+        seedBlocks(f.source, [block(32_101, 0)]);
+        seedBlocks(db, [block(32_102, 0)]);
+        const sourceBefore = blockSnapshot(f.source);
+        const indexesBefore = f.shards.map(blockSnapshot);
+        const sentinel = '__index_batch_probe_user_owned_text_sentinel';
+        db.database.exec(`CREATE TABLE ${quoted(sentinel)} (value TEXT NOT NULL)`);
+        db.database.prepare(`INSERT INTO ${quoted(sentinel)} (value) VALUES (?)`).run('keep user-owned table');
+        const textBytes = Buffer.byteLength(D1_BATCH_PROBE_TEXT, 'utf8');
+        let exercised = 0;
+        db.transformQuery = ({ kind }, rows) => {
+          if (kind !== (phase === 'batch' ? 'batch-statement' : 'query')
+            || !rows.some((row) => Object.hasOwn(row, 'value_bytes'))) return rows;
+          exercised += 1;
+          assert.deepEqual(rows, [{ id: 1, value: D1_BATCH_PROBE_TEXT, value_bytes: textBytes }],
+            'the fault must corrupt genuine SQL readback, not substitute a fabricated successful response');
+          if (corruption === 'missing-row') return [];
+          if (corruption === 'duplicate-row') return [...rows, { ...rows[0] }];
+          return rows.map((row) => {
+            const changed = { ...row };
+            if (corruption === 'missing-text') delete changed.value;
+            if (corruption === 'nul-suffix-truncation') changed.value = changed.value.slice(0, changed.value.indexOf('\u0000'));
+            if (corruption === 'bom-strip') changed.value = changed.value.slice(1);
+            if (corruption === 'missing-byte-length') delete changed.value_bytes;
+            if (corruption === 'byte-length-mismatch') changed.value_bytes -= 1;
+            return changed;
+          });
+        };
+        await assert.rejects(verifyD1BatchAtomicity(db), new RegExp(`failed ${phase} text/byte readback`));
+        assert.equal(exercised, 1, 'the selected native or independent SQL readback must encounter the fault');
+        const batches = f.trace.filter((event) => event.kind === 'batch');
+        assert.equal(batches.length, 1);
+        assert.equal(batches[0].committed, true, 'real CREATE/INSERT/SELECT must commit before transport corruption is rejected');
+        assert.ok(!f.trace.some((event) => event.sql?.includes('index_batch_atomicity_intentional_invalid_json')),
+          'rollback proof cannot start after text transport proof fails');
+        const drops = f.trace.filter((event) => event.kind === 'query' && /^\s*DROP TABLE\b/i.test(event.sql));
+        assert.equal(drops.length, 1);
+        assert.ok(drops[0].sql.includes('__index_batch_probe_'));
+        assert.ok(!drops[0].sql.includes(sentinel), 'a similarly named pre-existing table is not owned by the probe');
+        assert.deepEqual(probeTables(db), [{ name: sentinel }]);
+        assert.deepEqual(db.rows(`SELECT * FROM ${quoted(sentinel)}`), [{ value: 'keep user-owned table' }]);
+        assert.deepEqual(blockSnapshot(f.source), sourceBefore);
+        assert.deepEqual(f.shards.map(blockSnapshot), indexesBefore);
+        assert.deepEqual(sourceWrites(f), []);
+        assert.ok(f.trace.every((event) => event.db === db.id));
+        assert.ok(f.trace.every((event) => !event.sql
+          || selectsTable(event.sql, 'sqlite_master') || event.sql.includes('__index_batch_probe_')),
+        'text transport rejection must precede every data-table operation');
+      });
+    }
+  }
+});
+
+test('unexpected native atomicity result counts fail closed after real SQL commit and owned cleanup', async (context) => {
+  for (const corruption of ['missing-result', 'extra-result']) {
+    await context.test(corruption, async (child) => {
+      const f = await fixture(child);
+      const db = annotateSqlProbeFailures(f.shards[0]);
+      seedBlocks(f.source, [block(32_201, 0)]);
+      seedBlocks(db, [block(32_202, 0)]);
+      const sourceBefore = blockSnapshot(f.source);
+      const indexesBefore = f.shards.map(blockSnapshot);
+      const native = db.batch.bind(db);
+      let exercised = 0;
+      db.batch = async (statements) => {
+        const results = await native(statements);
+        assert.equal(results.length, 3);
+        assert.deepEqual(results[2].results, [{
+          id: 1, value: D1_BATCH_PROBE_TEXT, value_bytes: Buffer.byteLength(D1_BATCH_PROBE_TEXT, 'utf8'),
+        }], 'result-count corruption starts only after genuine SQLite text/byte readback');
+        exercised += 1;
+        return corruption === 'missing-result' ? results.slice(0, -1) : [...results, results.at(-1)];
+      };
+      await assert.rejects(verifyD1BatchAtomicity(db), /unexpected result count/);
+      assert.equal(exercised, 1);
+      const batches = f.trace.filter((event) => event.kind === 'batch');
+      assert.equal(batches.length, 1);
+      assert.equal(batches[0].committed, true);
+      assert.ok(!f.trace.some((event) => event.sql?.includes('index_batch_atomicity_intentional_invalid_json')));
+      const drops = f.trace.filter((event) => event.kind === 'query' && /^\s*DROP TABLE\b/i.test(event.sql));
+      assert.equal(drops.length, 1);
+      assert.ok(drops[0].sql.includes('__index_batch_probe_'));
+      assert.deepEqual(probeTables(db), []);
+      assert.deepEqual(blockSnapshot(f.source), sourceBefore);
+      assert.deepEqual(f.shards.map(blockSnapshot), indexesBefore);
+      assert.deepEqual(sourceWrites(f), []);
+      assert.ok(f.trace.every((event) => event.db === db.id));
+      assert.ok(f.trace.every((event) => !event.sql
+        || selectsTable(event.sql, 'sqlite_master') || event.sql.includes('__index_batch_probe_')),
+      'invalid native result counts must be rejected before any data-table operation');
+    });
+  }
 });
 
 test('the atomicity positive control detects non-atomic partial commits and removes only its own random probe table', async (context) => {

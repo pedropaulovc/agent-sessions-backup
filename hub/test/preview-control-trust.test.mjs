@@ -184,11 +184,11 @@ describe('preview R2 cleanup', () => {
     expect(requests).toEqual([
       ['r2/buckets/preview-bucket/objects?per_page=1000', {
         allowNotFound: true,
-        returnEnvelope: true,
+        responseFormat: 'envelope',
       }],
       ['r2/buckets/preview-bucket/objects?per_page=1000&cursor=next%2Fpage%3D%3D', {
         allowNotFound: true,
-        returnEnvelope: true,
+        responseFormat: 'envelope',
       }],
       ['r2/buckets/preview-bucket/objects/raw/space%20key/first%3F.jsonl', {
         method: 'DELETE',

@@ -110,14 +110,14 @@ export async function paginatedList(request, pathname, { pagination, rowsOf, per
   if (typeof request !== 'function') fail('list request function is required');
   const joiner = pathname.includes('?') ? '&' : '?';
   if (pagination === 'none') {
-    const envelope = await request(pathname, { allowNotFound: true, returnEnvelope: true });
+    const envelope = await request(pathname, { allowNotFound: true, responseFormat: 'envelope' });
     return envelope === null ? [] : rowsOf(envelope) ?? [];
   }
   const rows = [];
   if (pagination === 'page') {
     for (let page = 1; page <= 1000; page += 1) {
       const envelope = await request(`${pathname}${joiner}per_page=${perPage}&page=${page}`, {
-        allowNotFound: true, returnEnvelope: true,
+        allowNotFound: true, responseFormat: 'envelope',
       });
       if (envelope === null) return rows;
       const batch = rowsOf(envelope) ?? [];
@@ -133,7 +133,7 @@ export async function paginatedList(request, pathname, { pagination, rowsOf, per
     let cursor;
     for (let step = 0; step <= 1000; step += 1) {
       const query = `${joiner}per_page=${perPage}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`;
-      const envelope = await request(`${pathname}${query}`, { allowNotFound: true, returnEnvelope: true });
+      const envelope = await request(`${pathname}${query}`, { allowNotFound: true, responseFormat: 'envelope' });
       if (envelope === null) return rows;
       const batch = rowsOf(envelope) ?? [];
       rows.push(...batch);
@@ -160,7 +160,7 @@ export async function emptyR2Bucket(bucketName, request) {
     if (cursor) query.set('cursor', cursor);
     const page = await request(`${bucketPath}?${query}`, {
       allowNotFound: true,
-      returnEnvelope: true,
+      responseFormat: 'envelope',
     });
     if (page === null) return 0;
     if (!Array.isArray(page?.result)) fail(`R2 object listing for ${bucketName} is malformed`);

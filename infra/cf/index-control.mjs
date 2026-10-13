@@ -6,12 +6,15 @@ import {
   PREVIEW_ACCOUNT_ID, PRODUCTION_ACCOUNT_ID, paginatedList, parseArgs,
 } from './preview-trust.mjs';
 import {
-  COPY_CHECKPOINT, SEED_CHECKPOINT, DRAIN_MILLISECONDS, assertMaintenanceHealth,
-  SOURCE_FREEZE_TABLE, classifyIndexMigration, copyFrozenIndex, initializeShardLayouts, readCheckpoint,
-  reconcileIndexCatalog, seedFrozenCatalog, sourceCopyForecast, verifyIndexRecords, writeCheckpoint,
+  COPY_CHECKPOINT, SEED_CHECKPOINT, READY_CHECKPOINT, ACTIVATION_CHECKPOINT,
+  DRAIN_MILLISECONDS, assertMaintenanceHealth, assertReadyProof, assertActivationProof,
+  buildReadyProof, buildActivationProof, SOURCE_FREEZE_TABLE, classifyIndexMigration,
+  copyFrozenIndex, initializeShardLayouts, readCheckpoint, reconcileIndexCatalog,
+  seedFrozenCatalog, sourceCopyForecast, verifyIndexRecords, writeCheckpoint,
 } from '../../hub/scripts/lib/index-migration.mjs';
 import { indexShardBindingName } from '../../hub/src/index-layout.mjs';
 import { D1_BATCH_PROBE_TEXT, d1SqlFailureReason, verifyD1BatchAtomicity } from './d1-batch-atomicity.mjs';
+import { sharedCloudflareApiPermit } from '../../hub/scripts/lib/cloudflare-api-budget.mjs';
 
 const MAIN_ID = '5ff65cf3-89c8-4fe6-a3c2-a370293ecea6';
 const FREEZE_CHECKPOINT = 'index-maintenance-freeze-v1';
@@ -41,13 +44,17 @@ export function cloudflareRetryDelay(response) {
   return seconds * 1000;
 }
 
-export function indexControlClient(accountId, token) {
+export function indexControlClient(accountId, token, { permit = sharedCloudflareApiPermit, wait = sleep } = {}) {
   if (accountId === PRODUCTION_ACCOUNT_ID) requireProtectedProduction();
   else if (accountId !== PREVIEW_ACCOUNT_ID) throw new Error('index control account must be production or preview');
   if (!token) throw new Error('CLOUDFLARE_API_TOKEN is required');
   const cf = async (pathname, init = {}) => {
-    const { returnEnvelope = false, ...request } = init;
+    const { responseFormat = 'result', ...request } = init;
+    if (responseFormat !== 'result' && responseFormat !== 'envelope') {
+      throw new Error('Cloudflare response format must be result or envelope');
+    }
     for (;;) {
+      await permit();
       const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/${pathname}`, {
         ...request, redirect: 'error', signal: AbortSignal.timeout(60000),
         headers: { authorization: `Bearer ${token}`, accept: 'application/json',
@@ -58,7 +65,7 @@ export function indexControlClient(accountId, token) {
         // A 429 rejected the operation before execution. Replay only that unambiguous
         // rejection; network errors and 5xx leave recovery to durable checkpoints.
         await response.body?.cancel();
-        await sleep(delay);
+        await wait(delay);
         continue;
       }
       let envelope;
@@ -73,7 +80,7 @@ export function indexControlClient(accountId, token) {
         }
         throw error;
       }
-      return returnEnvelope ? envelope : envelope.result;
+      return responseFormat === 'envelope' ? envelope : envelope.result;
     }
   };
   return {
@@ -223,9 +230,9 @@ async function health(config, mode) {
   return value;
 }
 
-async function pauseConsumers(api, config) {
+export async function pauseConsumers(api, config) {
   const queues = await paginatedList(api.cf, 'queues', { pagination: 'page', rowsOf: (envelope) => envelope.result });
-  const queueNames = config.queues?.producers?.map((queue) => queue.queue) ?? [];
+  const queueNames = [...new Set(config.queues?.consumers?.map((queue) => queue.queue) ?? [])];
   let paused = 0;
   for (const name of queueNames) {
     const queue = queues.find((item) => item.queue_name === name);
@@ -240,7 +247,63 @@ async function pauseConsumers(api, config) {
       paused += 1;
     }
   }
-  console.log(JSON.stringify({ pausedConsumers: paused }));
+  return { pausedConsumers: paused };
+}
+
+/** Persist readiness only after the actual frozen data and final outbox checks pass. */
+export async function verifyReadyIndex({ source, shards, revision, cycle, gate }) {
+  await gate();
+  const copied = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+  const seeded = await readCheckpoint(shards[0], SEED_CHECKPOINT);
+  const existingReady = await readCheckpoint(shards[0], READY_CHECKPOINT);
+  const activation = await readCheckpoint(shards[0], ACTIVATION_CHECKPOINT);
+  if (activation !== null) {
+    assertActivationProof({ source, shards, copy: copied, seed: seeded, ready: existingReady, activation });
+    throw new Error('initial activation is already proven; refusing to replace its readiness checkpoint');
+  }
+  if (existingReady !== null) {
+    assertReadyProof({ source, shards, copy: copied, seed: seeded, ready: existingReady });
+  }
+  if (copied?.state !== 'complete' || seeded?.state !== 'complete'
+    || (await source.query('SELECT seq FROM session_catalog_outbox LIMIT 1')).length) {
+    throw new Error('verified copy/catalog prerequisites incomplete; active deployment forbidden');
+  }
+  await initializeShardLayouts(shards);
+  const legacy = await source.query(`SELECT name FROM sqlite_master WHERE type = 'table'
+    AND name IN ('blocks', 'blocks_fts', '${SOURCE_FREEZE_TABLE}')`);
+  if (legacy.length) throw new Error('main legacy index/freeze objects remain; migrations must complete before activation');
+  const evidence = await verifyIndexRecords({ source, shards, catalogConsistency: 'required' });
+  await gate();
+  if ((await source.query('SELECT seq FROM session_catalog_outbox LIMIT 1')).length) {
+    throw new Error('catalog changed during strict readiness verification; active deployment forbidden');
+  }
+  const ready = buildReadyProof({ source, shards, copy: copied, seed: seeded,
+    revision, cycle, verifiedAt: Date.now(), evidence });
+  await writeCheckpoint(shards[0], READY_CHECKPOINT, ready);
+  return { state: 'ready', ...evidence };
+}
+
+/** The initial activation marker is written only after real active/login checks. */
+export async function verifyActiveIndex({ source, shards, revision, cycle, gate, login }) {
+  const copied = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+  const seeded = await readCheckpoint(shards[0], SEED_CHECKPOINT);
+  const ready = await readCheckpoint(shards[0], READY_CHECKPOINT);
+  const activation = await readCheckpoint(shards[0], ACTIVATION_CHECKPOINT);
+  const activationState = activation === null ? 'initial' : 'existing';
+  const proofContext = { source, shards, copy: copied, seed: seeded, ready };
+  if (activationState === 'existing') assertActivationProof({ ...proofContext, activation });
+  else assertReadyProof({ ...proofContext, revision, cycle });
+  await gate();
+  const evidence = await verifyIndexRecords({ source, shards, catalogConsistency: 'observe' });
+  await login();
+  await gate();
+  if (activationState === 'initial') {
+    const proof = buildActivationProof({ ...proofContext, revision, cycle,
+      verifiedAt: Date.now(), evidence });
+    await writeCheckpoint(shards[0], ACTIVATION_CHECKPOINT, proof);
+  }
+  return { state: 'active', activationState,
+    copiedRows: copied.rows, copySha256: copied.sha256, ...evidence };
 }
 
 async function main() {
@@ -255,7 +318,10 @@ async function main() {
   const api = indexControlClient(account, process.env.CLOUDFLARE_API_TOKEN);
   if (command === 'provision') return await provision(api, args, target);
   const config = await generatedConfig(args);
-  if (command === 'pause-consumers') return await pauseConsumers(api, config);
+  if (command === 'pause-consumers') {
+    console.log(JSON.stringify(await pauseConsumers(api, config)));
+    return;
+  }
   if (command === 'health') {
     if (!['maintenance', 'active'].includes(args.mode)) throw new Error('health requires --mode maintenance|active');
     const deadline = Date.now() + 180000;
@@ -266,6 +332,7 @@ async function main() {
   }
   const source = api.db(config.d1_databases[0].database_id);
   const shards = config.d1_databases.slice(1).map((db) => api.db(db.database_id));
+  const cycle = `${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`;
   if (command === 'state') {
     const legacy = await source.query(`SELECT name FROM sqlite_master WHERE type = 'table'
       AND name IN ('blocks', 'blocks_fts', '${SOURCE_FREEZE_TABLE}')`);
@@ -273,6 +340,8 @@ async function main() {
       source, shards, legacyTables: legacy.map((row) => row.name),
       copy: await readCheckpoint(shards[0], COPY_CHECKPOINT),
       seed: await readCheckpoint(shards[0], SEED_CHECKPOINT),
+      ready: await readCheckpoint(shards[0], READY_CHECKPOINT),
+      activation: await readCheckpoint(shards[0], ACTIVATION_CHECKPOINT),
     });
     if (args['github-output']) await appendFile(path.resolve(args['github-output']), `layout_state=${layoutState}\n`);
     const copyForecast = legacy.some((row) => row.name === 'blocks')
@@ -298,28 +367,24 @@ async function main() {
     return;
   }
   if (command === 'verify-active') {
-    await health(config, 'active');
-    const copied = await readCheckpoint(shards[0], COPY_CHECKPOINT);
-    const seeded = await readCheckpoint(shards[0], SEED_CHECKPOINT);
-    if (copied?.state !== 'complete' || seeded?.state !== 'complete' || copied.identity.source !== source.id
-      || JSON.stringify(copied.identity.shards) !== JSON.stringify(shards.map((db) => db.id))) {
-      throw new Error('active verification lacks completed copy/catalog identity evidence');
-    }
-    const evidence = await verifyIndexRecords({ source, shards, catalogConsistency: 'observe' });
-    const login = await fetch(`https://${config.vars.VIEWER_HOST}/login`, {
-      redirect: 'error', signal: AbortSignal.timeout(30000),
+    const result = await verifyActiveIndex({
+      source, shards, revision: config.vars.DEPLOYMENT_REVISION, cycle,
+      gate: async () => await health(config, 'active'),
+      login: async () => {
+        const response = await fetch(`https://${config.vars.VIEWER_HOST}/login`, {
+          redirect: 'error', signal: AbortSignal.timeout(30000),
+        });
+        if (response.status !== 200 || !response.headers.get('content-type')?.includes('text/html')) {
+          throw new Error('active viewer login smoke failed');
+        }
+        await response.body?.cancel();
+      },
     });
-    if (login.status !== 200 || !login.headers.get('content-type')?.includes('text/html')) {
-      throw new Error('active viewer login smoke failed');
-    }
-    await login.body?.cancel();
-    await health(config, 'active');
-    console.log(JSON.stringify({ state: 'active', copiedRows: copied.rows, copySha256: copied.sha256, ...evidence }));
+    console.log(JSON.stringify(result));
     return;
   }
   const gate = async () => await health(config, 'maintenance');
   await gate();
-  const cycle = `${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`;
   if (command === 'drain') {
     let frozen = await readCheckpoint(shards[0], FREEZE_CHECKPOINT);
     if (!frozen || frozen.revision !== config.vars.DEPLOYMENT_REVISION || frozen.cycle !== cycle) {
@@ -359,18 +424,9 @@ async function main() {
     const seeded = await seedFrozenCatalog({ source, shards, gate });
     console.log(JSON.stringify({ catalogRows: seeded.rows, state: seeded.state }));
   } else if (command === 'ready') {
-    const copied = await readCheckpoint(shards[0], COPY_CHECKPOINT);
-    const seeded = await readCheckpoint(shards[0], SEED_CHECKPOINT);
-    if (copied?.state !== 'complete' || seeded?.state !== 'complete' || (await source.query('SELECT seq FROM session_catalog_outbox LIMIT 1')).length) {
-      throw new Error('verified copy/catalog prerequisites incomplete; active deployment forbidden');
-    }
-    await initializeShardLayouts(shards);
-    const legacy = await source.query(`SELECT name FROM sqlite_master WHERE type = 'table'
-      AND name IN ('blocks', 'blocks_fts', '${SOURCE_FREEZE_TABLE}')`);
-    if (legacy.length) throw new Error('main legacy index/freeze objects remain; migrations must complete before activation');
-    const evidence = await verifyIndexRecords({ source, shards, catalogConsistency: 'required' });
-    await gate();
-    console.log(JSON.stringify({ state: 'ready', ...evidence }));
+    console.log(JSON.stringify(await verifyReadyIndex({
+      source, shards, revision: config.vars.DEPLOYMENT_REVISION, cycle, gate,
+    })));
   } else throw new Error(`unknown index control command: ${command}`);
 }
 

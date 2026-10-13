@@ -184,7 +184,8 @@ async function inactivateDeploymentCardsBatch() {
 
 async function cf(pathname, init = {}) {
   requireCloudflareEnvironment();
-  const { allowNotFound = false, returnEnvelope = false, ...fetchInit } = init;
+  const { allowNotFound = false, responseFormat = 'result', ...fetchInit } = init;
+  if (responseFormat !== 'result' && responseFormat !== 'envelope') fail('Cloudflare response format must be result or envelope');
   const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${previewAccountId}/${pathname}`, {
     ...fetchInit,
     redirect: 'error',
@@ -207,7 +208,7 @@ async function cf(pathname, init = {}) {
   if (!response.ok || parsed.success === false) {
     fail(`Cloudflare ${pathname} failed with ${response.status}: ${stableJson(parsed.errors ?? parsed)}`);
   }
-  return returnEnvelope ? parsed : parsed.result ?? parsed;
+  return responseFormat === 'envelope' ? parsed : parsed.result ?? parsed;
 }
 
 /** One parameterized statement against a preview D1 over the REST API. */

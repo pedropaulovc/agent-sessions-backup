@@ -212,8 +212,11 @@ local production deployment; do not bypass it with a local production Wrangler l
 
 ### Operational prerequisites
 
-- The protected `production` GitHub environment and main-only deployment concurrency
-  remain the authorization boundary. Workers Builds must remain disabled.
+- Both `CLOUDFLARE_MIGRATION_TOKEN` and `CLOUDFLARE_DEPLOY_TOKEN` belong to the protected
+  `production` GitHub environment, not a PR-readable credential path. The environment
+  was verified to contain both secrets, allow only protected `main` deployments, and
+  disallow administrator bypass. Main-only deployment concurrency remains enabled;
+  Workers Builds must remain disabled.
 - `CLOUDFLARE_MIGRATION_TOKEN` needs account-scoped D1 Read/Write, including database
   creation, on production. D1 tokens cannot be scoped to one database. The account must
   permit at least seventeen databases and the index storage they require.
@@ -227,12 +230,17 @@ local production deployment; do not bypass it with a local production Wrangler l
 
 ### Enforced ordering
 
-The protected job first classifies the durable layout as `legacy`, `pending`, or
-`active`. `legacy`/`pending` execute the one-time cutover below. An already-active
-layout takes the ordinary deployment fast path: migrate/check per-DB ledgers,
-deploy the new active revision, verify health, reconcile at most sixteen catalog
-IDs, and run read-only index/login smoke checks. It does **not** pause consumers,
-enter maintenance, wait sixteen minutes, copy the index, or reseed every session.
+The protected job classifies the durable layout as `legacy`, `pending`, or `active`.
+Completed copy and seed checkpoints alone are **pending**, including after a failed
+readiness check or first activation smoke. `active` requires valid durable readiness
+and initial-activation proofs bound to the exact completed copy/seed snapshots.
+
+A valid initial activation takes the ordinary deployment fast path on later pushes:
+migrate/check per-DB ledgers, initialize/check layout and the temporary capability
+probe, deploy the new active revision, verify health, reconcile at most sixteen catalog
+IDs, and run read-only index/login smoke checks. The original proof deliberately is
+not tied to the new revision: ordinary deployments do **not** pause consumers, enter
+maintenance, wait sixteen minutes, copy the index, or reseed every session.
 
 The one-time cutover runs these operations in order, from the same checked-out main revision:
 
@@ -295,11 +303,20 @@ The one-time cutover runs these operations in order, from the same checked-out m
    page, applies the same byte-bounded guarded catalog SQL builders as the Worker
    to every shard, and verifies sessions/stars/versions through one native three-query
    readback batch per shard. Only fully verified versions retire their outbox entries.
+   An initial-attempt rerun validates and removes only its unactivated READY marker
+   before resetting the seed checkpoint. An aborted reseed therefore remains
+   resumable pending instead of retaining a proof bound to its old completed seed.
+   Once valid initial ACTIVATION exists, full reseeding is forbidden.
    `ready` requires a completed copy, completed seed, empty outbox, matching layout,
-   and catalog counts. This full scan runs once; active reconciliation remains 16 IDs.
+   and strict catalog counts/readback. It checks the outbox again after verification
+   and persists `full-fidelity-index-ready-v1`, binding the completed snapshots,
+   current revision/run/attempt, evidence hashes and time. Initial failure/resume
+   retains the pending flow; full reseeding is not repeated after proven activation.
 10. Recheck current main, deploy `INDEX_MODE=active`, and restore configured consumers.
-    Verify exact live health, bounded shard counts/full-row sample SHA/MATCH evidence,
-    catalog layout, and the unauthenticated HTML login page.
+    Initial activation requires this attempt's valid READY proof. Verify exact live
+    health, bounded shard counts/full-row sample SHA/MATCH evidence, catalog layout,
+    the unauthenticated HTML login page, and health again. Only then persist
+    `full-fidelity-index-activated-v1`, bound to READY and the copied snapshots.
 
 The authoritative workflow is `.github/workflows/ci.yml`; the production CLI refuses
 non-GitHub, PR/fork, non-main, wrong-account or malformed-revision contexts **before**
@@ -309,12 +326,14 @@ not by running the production copier locally.
 ### Abort, resume, and failure policy
 
 Copy and seed checkpoint statuses are the explicit enum `state: "pending" | "complete"`;
-CLI readiness results use `state: "ready"` or `state: "active"`. Boolean-only status
-records are not accepted as a compatibility format.
+durable readiness/activation proofs and CLI results use `state: "ready"` or
+`state: "active"`. Malformed checkpoint values, invalid states, wrong database
+identities or changed proof digests fail closed; none is treated as a missing
+checkpoint or accepted as a compatibility format.
 
 `IDX00.index_migration_state` stores `full-fidelity-index-copy-v1`,
-`full-fidelity-index-catalog-v1`, `index-maintenance-freeze-v1`, and the current
-`index-rest-batch-atomicity-v1` proof. The copy records the
+`full-fidelity-index-catalog-v1`, `index-maintenance-freeze-v1`, the current
+`index-rest-batch-atomicity-v1`, and READY/ACTIVATION proofs. The copy records the
 immutable source/shard IDs, complete column list, acknowledged ID cursor, verified row
 count, chained SHA-256 audit digest, and pending per-row hashes. A lost source-delete
 response is safe: a pending verified page is read back again and only remaining source
@@ -333,8 +352,12 @@ Database-bound migration journals are useful per-run evidence; the durable shard
 checkpoint and D1 migration/checksum ledgers, not runner-temporary files, carry recovery.
 
 Abort or timeout during copying leaves maintenance and detached consumers in place.
-The failure handler also attempts to detach consumers and redeploy maintenance after
-an activation/smoke failure. If a deploy/control-plane operation itself fails, its error
+A failed readiness check or initial activation smoke writes no activation proof, so
+the next attempt remains pending and cannot bypass strict readiness or fail-closed
+cleanup. That cleanup selects intended consumers from the generated **active**
+configuration (maintenance has an empty consumer list), detaches them, and redeploys
+maintenance. Producers are not the consumer ownership list. If a deploy/control-plane
+operation itself fails, its error
 is reported rather than claiming a successful fail-closed redeployment. Once any source
 row has been deleted, an old Worker rollback is **not** a recovery plan: continue the
 protected migration from its verified shard copies. R2 backups are never deleted.
@@ -349,10 +372,15 @@ exercised merely because its scripts and Node behavior tests exist.
 
 Cloudflare's account/user API quota is
 [1,200 requests per five minutes](https://developers.cloudflare.com/fundamentals/api/reference/limits/).
+The index-control REST client shares FIFO permits with at least 300 ms between request
+starts, including concurrent callers and every 429 retry. Its nominal 1,000 starts per
+five minutes leave headroom below the quota; other account activity can still consume
+that headroom. HTTP completion is not serialized.
+
 The copier amortizes requests over byte-bounded pages and native batches instead of
 issuing one RPC per row. The protected `state` sample estimates request count using
-observed page occupancy and shard fanout; its four-requests/second time is a lower
-bound before latency, other account activity, and extra long-value byte-slice reads.
+observed page occupancy and shard fanout; its paced request-rate time is a lower bound
+before latency, other account activity, and extra long-value byte-slice reads.
 `copyForecast.kind = "estimate"` distinguishes it from copied/verified checkpoint
 evidence. A first/middle/last sample cannot establish the distribution of every page.
 
