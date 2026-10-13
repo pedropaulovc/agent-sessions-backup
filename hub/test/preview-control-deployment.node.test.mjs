@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { migrationDigest } from '../scripts/lib/migration-manifest.mjs';
@@ -342,7 +342,7 @@ async function runController(command, scenario = {}) {
       '--head-sha', SHA, '--hub', hub, '--wrangler', wrangler, '--migrations-cli', migrationsCli,
     ] : [];
     const result = spawnSync(process.execPath, [
-      '--import', preload, controller, command, '--repository', 'example/sessions',
+      '--import', pathToFileURL(preload).href, controller, command, '--repository', 'example/sessions',
       ...(command === 'janitor' ? [] : ['--pr', String(PR)]), ...args,
     ], {
       encoding: 'utf8', timeout: 10_000,
@@ -350,14 +350,28 @@ async function runController(command, scenario = {}) {
         CLOUDFLARE_PPE_API_TOKEN: 'synthetic-cloudflare-token', PREVIEW_BEARER_SEED: SEED,
         GITHUB_TOKEN: 'synthetic-github-token' },
     });
-    assert.ifError(result.error);
-    const events = (await readFile(eventPath, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
-    const report = JSON.parse(await readFile(reportPath, 'utf8'));
     const output = `${result.stdout}\n${result.stderr}`;
     for (const secret of [SEED, 'synthetic-cloudflare-token', 'synthetic-github-token',
       'atomicity-private-provider-text', 'index_batch_atomicity_intentional_invalid_json',
       D1_BATCH_PROBE_TEXT, JSON.stringify(D1_BATCH_PROBE_TEXT).slice(1, -1)]) {
       assert.ok(!output.includes(secret), 'CLI evidence must not expose credentials, provider text or probe values');
+    }
+    if (result.error) {
+      throw new Error(
+        `Failed to spawn ${command} controller (status=${result.status}, signal=${result.signal})\nstdout:\n${result.stdout ?? ''}\nstderr:\n${result.stderr ?? ''}`,
+        { cause: result.error },
+      );
+    }
+    let events;
+    let report;
+    try {
+      events = (await readFile(eventPath, 'utf8')).trim().split('\n').filter(Boolean).map((line) => JSON.parse(line));
+      report = JSON.parse(await readFile(reportPath, 'utf8'));
+    } catch (cause) {
+      throw new Error(
+        `Failed to read or parse ${command} controller artifacts (status=${result.status}, signal=${result.signal})\nstdout:\n${result.stdout ?? ''}\nstderr:\n${result.stderr ?? ''}`,
+        { cause },
+      );
     }
     return { ...result, ...report, events, output, hub, manifests };
   } finally {

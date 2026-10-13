@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import { SYNTHETIC_EXPECTATIONS } from '../scripts/lib/dev-seed.mjs';
 import { previewBearerToken } from '../../infra/cf/preview-trust.mjs';
@@ -93,16 +93,25 @@ async function runSeed(scenario) {
       };
     `);
     const result = spawnSync(process.execPath, [
-      '--import', preload, controller, 'seed', '--pr', '150', '--repository', 'example/sessions',
+      '--import', pathToFileURL(preload).href, controller, 'seed', '--pr', '150', '--repository', 'example/sessions',
     ], {
       encoding: 'utf8', timeout: 10_000,
       env: { ...process.env, PREVIEW_BEARER_SEED: SEED },
     });
-    assert.ifError(result.error);
-    const report = JSON.parse(await readFile(reportPath, 'utf8'));
     const output = `${result.stdout}\n${result.stderr}`;
     assert.ok(!output.includes(SEED), 'CLI output must not expose bearer seed');
     assert.ok(!output.includes(previewBearerToken(SEED, 150)), 'CLI output must not expose bearer token');
+    if (result.error) {
+      throw new Error(`preview seed fixture child failed to launch (status ${result.status}, signal ${result.signal})\n${output}`,
+        { cause: result.error });
+    }
+    let report;
+    try {
+      report = JSON.parse(await readFile(reportPath, 'utf8'));
+    } catch (cause) {
+      throw new Error(`preview seed fixture could not read child report (status ${result.status}, signal ${result.signal})\n${output}`,
+        { cause });
+    }
     return { ...result, ...report, output };
   } finally {
     await rm(temporary, { recursive: true, force: true });
