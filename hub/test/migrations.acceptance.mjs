@@ -866,11 +866,7 @@ test('a missing remote main ledger rejects historical migrations before canonica
   assert.notEqual(rejected.status, 0, rejected.stdout);
   assert.deepEqual(remote.database.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all(), [],
     'historical main cannot create either a migration ledger or user objects without its applied history');
-  const journal = await openMigrationJournal(remote.options.journalPath, {
-    target: 'production', deploymentId: remote.options.deploymentId,
-    artifactDigest, migrationDigest: migrationDigest(fixture.manifest),
-    databaseBinding: 'DB', databaseId: remote.options.databaseId,
-  });
+  const journal = JSON.parse(await readFile(remote.options.journalPath, 'utf8'));
   assert.equal(journal.phase, 'intended');
   assert.equal(journal.revision, 0);
 });
