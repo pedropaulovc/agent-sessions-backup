@@ -65,8 +65,8 @@ reusing resources. There is no fallback index in `DB`.
 An existing Worker with a missing database is reset only after its recorded topology
 has been validated. Surviving binding IDs must match trusted account resources; the
 missing binding must retain a nonempty ID that is absent from the account inventory.
-The controller validates every queue consumer owner before detaching any consumer,
-then recreates the complete topology. Foreign or malformed bindings fail before mutation.
+During topology reset, the controller validates the owned queues' consumer identities before
+detaching them, then recreates the complete topology. Foreign or malformed bindings fail before mutation.
 
 The provisioner applies and verifies migrations separately against `DB`, `IDX00`, and `IDX01`
 before deployment, each with its own database-bound journal and matching source baseline.
@@ -80,6 +80,31 @@ failures, unexpected readback, or partial commits block deployment; only safe ve
 metadata is published, never provider SQL/error bodies or credentials.
 Fixture prices are seeded in main before deployment; synthetic sessions still upload through
 the Worker's normal file API and are verified through search, never inserted directly into shards.
+
+Native Queue consumer GETs identify a Worker owner with `script`, consistent with the SDK
+embedded in pinned Wrangler 4.111.0. Normal preview CI proved this on PR #172 at revision
+`2d6b0de` (Actions run `38460399098`, job `115515595462`, 2026-10-13): parse and rollup
+consumers reported `type: "worker"` and `script: "pr-172-app"`; `script_name` was absent,
+and the DLQ had no consumers. The public API reference's `script_name` field does not match
+that observed native GET contract. This evidence does not establish the production consumer's owner.
+
+After deploying and verifying its app hostname, normal PR provision logs a compact
+`queueConsumerIdentityReceipt` from native GETs of only that PR's known queues. It records the
+expected Worker, record kind, consumer field types, known consumer type (`worker`/`http_pull`),
+`recognizedPropertyKeys`, `unknownPropertyKeyCount`, and syntactically valid `script` Worker names.
+The recognized keys are `script`, `dead_letter_queue`, `settings`, `type`, `queue_name`, `queue_id`,
+`consumer_id`, and `created_on`; unknown property names are never logged, only their count.
+Neither receipts nor rejection diagnostics include consumer bodies, settings values, headers,
+credentials, or consumer ID values. Harmless extra fields do not change ownership authorization.
+Production pause preflights the complete configured consumer target set before any DELETE:
+every queue must exist and every consumer must satisfy the existing type, canonical `script`,
+and consumer ID checks. A bad later record or missing later queue leaves all consumers untouched.
+Only the exact validated queue/consumer IDs are then deleted; duplicate configured queue names
+are handled once and producer-only queues are excluded. Production requires `script` to match
+its configured Worker and allows an absent/null type but rejects an explicitly non-worker type;
+preview cleanup requires a known same-PR Worker and `type: "worker"`, rejecting missing or
+non-string owners. No alternate owner field is accepted. Native GET failures fail provision
+through the scoped client's existing error path rather than reporting empty evidence.
 
 **Free-account quota:** this account permits at most **10 D1 databases**. Each complete PR preview
 uses three, so at most three complete previews fit when no other databases exist. Provision

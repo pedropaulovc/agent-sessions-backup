@@ -37,7 +37,7 @@ import {
   writeCanonicalJson,
 } from './preview-trust.mjs';
 import { deactivatePreviewDeployments } from './preview-deployment.mjs';
-import { indexControlClient } from './index-control.mjs';
+import { indexControlClient, queueConsumerIdentityFacts } from './index-control.mjs';
 import { verifyD1BatchAtomicity } from './d1-batch-atomicity.mjs';
 import { migrationDigest } from '../../hub/scripts/lib/migration-manifest.mjs';
 import { SYNTHETIC_EXPECTATIONS, fixtureModelPriceSql } from '../../hub/scripts/lib/dev-seed.mjs';
@@ -695,6 +695,21 @@ async function provision() {
     await generateConfig(appConfigPath, schemaDigest);
     deployApp(wrangler, appConfigPath, hubRoot, names.host);
     await awaitRoutableHost(names.host);
+    // Native wire evidence from only this PR's known queues; no owner acceptance or mutation.
+    const consumerApi = indexControlClient(PREVIEW_ACCOUNT_ID, previewToken);
+    const queueConsumerSchemas = [];
+    for (const [queueName, queueId] of [
+      [names.queue, resources.queue],
+      [names.dlq, resources.dlq],
+      [names.rollupQueue, resources.rollupQueue],
+    ]) {
+      const consumers = await consumerApi.cf(`queues/${encodeURIComponent(queueId)}/consumers`);
+      if (!Array.isArray(consumers)) fail(`queue consumer schema receipt expected an array for ${queueName}`);
+      queueConsumerSchemas.push({ queue: queueName, consumers: consumers.map(queueConsumerIdentityFacts) });
+    }
+    process.stdout.write(`${stableJson({
+      queueConsumerIdentityReceipt: { expectedWorker: names.app, queues: queueConsumerSchemas },
+    })}\n`);
 
     const summary = {
       url: `https://${names.host}`,

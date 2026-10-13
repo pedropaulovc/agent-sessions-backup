@@ -299,28 +299,92 @@ describe('preview migration packaging', () => {
 });
 
 describe('queue consumer detachment', () => {
-  it('detaches only preview-owned consumers and rejects foreign scripts loud', () => {
+  it('accepts native worker consumers owned by the same PR, including known legacy workers', () => {
     expect(queueConsumerIdsForQueue([
-      { consumer_id: 'c1', script_name: 'pr-42-app', queue_name: 'pr-42-parse' },
-      { consumer_id: 'c2', script_name: `pr-42-g99-${'b'.repeat(12)}-app` },
-      { consumer_id: 'c3' },
-    ], 'pr-42-parse')).toEqual(['c1', 'c2', 'c3']);
-    expect(() => queueConsumerIdsForQueue([
-      { consumer_id: 'c4', script_name: 'sessions-hub' },
-    ], 'pr-42-parse')).toThrow(/foreign queue consumer/);
-    expect(() => queueConsumerIdsForQueue([
-      { consumer_id: 'other-pr', script_name: 'pr-43-app' },
-    ], 'pr-42-parse')).toThrow(/foreign queue consumer/);
+      { consumer_id: 'c1', type: 'worker', script: 'pr-42-app', queue_name: 'pr-42-parse' },
+      { consumer_id: 'c2', type: 'worker', script: `pr-42-g99-${'b'.repeat(12)}-app` },
+    ], 'pr-42-parse')).toEqual(['c1', 'c2']);
+    expect(queueConsumerIdsForQueue([
+      { consumer_id: 'canonical-owner', type: 'worker', script: 'pr-42-app', script_name: 'pr-43-app',
+        ['PRIVATE PROPERTY KEY accepted preview consumer canary']: 'harmless extra metadata' },
+    ], 'pr-42-parse')).toEqual(['canonical-owner']);
+  });
+
+  for (const [name, consumer] of [
+    ['missing canonical owner', { consumer_id: 'c3', type: 'worker' }],
+    ['owned alias without a canonical owner', { consumer_id: 'c3', type: 'worker', script_name: 'pr-42-app' }],
+    ['null owner', { consumer_id: 'c3', type: 'worker', script: null, script_name: 'pr-42-app' }],
+    ['non-string owner', { consumer_id: 'c3', type: 'worker', script: 42, script_name: 'pr-42-app' }],
+    ['unknown owner', { consumer_id: 'c3', type: 'worker', script: 'pr-42-unrecognized', script_name: 'pr-42-app' }],
+    ['standing foreign owner', { consumer_id: 'c4', type: 'worker', script: 'sessions-hub', script_name: 'pr-42-app' }],
+    ['another PR owner', { consumer_id: 'other-pr', type: 'worker', script: 'pr-43-app', script_name: 'pr-42-app' }],
+    ['null record', null],
+    ['array record', []],
+    ['primitive record', 'private primitive consumer record'],
+  ]) {
+    it(`rejects ${name} instead of returning a partial detachment list`, () => {
+      expect(() => queueConsumerIdsForQueue([
+        { consumer_id: 'valid-first', type: 'worker', script: 'pr-42-app' },
+        consumer,
+      ], 'pr-42-parse')).toThrow();
+    });
+  }
+
+  for (const type of [undefined, null, 'http_pull', 42]) {
+    it(`rejects non-worker type ${String(type)} even with a known same-PR owner`, () => {
+      expect(() => queueConsumerIdsForQueue([
+        { consumer_id: 'non-worker', type, script: 'pr-42-app', script_name: 'pr-42-app' },
+      ], 'pr-42-parse')).toThrow();
+    });
+  }
+
+  for (const consumerId of [undefined, null, 42, '']) {
+    it(`rejects invalid consumer ID ${String(consumerId)} after checking the owner and type`, () => {
+      expect(() => queueConsumerIdsForQueue([
+        { consumer_id: consumerId, type: 'worker', script: 'pr-42-app' },
+      ], 'pr-42-parse')).toThrow();
+    });
+  }
+
+  it('redacts unrelated settings, auth, consumer IDs and malformed identity strings in rejection diagnostics', () => {
+    const privateValues = {
+      consumerId: 'private-consumer-id-value',
+      settings: 'private-unrelated-settings-value',
+      auth: 'private-auth-token-value',
+      owner: 'private invalid owner/value',
+      type: 'private malformed type/value',
+      alias: 'private invalid alias/value',
+      propertyKey: 'PRIVATE PROPERTY KEY preview rejection canary',
+    };
+    for (const identity of [
+      { type: 'worker', script: privateValues.owner },
+      { type: privateValues.type, script: 'pr-42-app' },
+    ]) {
+      let rejection;
+      try {
+        queueConsumerIdsForQueue([{
+          consumer_id: privateValues.consumerId, ...identity, script_name: privateValues.alias,
+          settings: { retry: privateValues.settings }, auth: { bearer: privateValues.auth },
+          [privateValues.propertyKey]: privateValues.auth,
+        }], 'pr-42-parse');
+      } catch (error) {
+        rejection = error;
+      }
+      if (!rejection) expect.unreachable('malformed queue consumer identity must be rejected');
+      for (const value of Object.values(privateValues)) {
+        expect(rejection.message).not.toContain(value);
+      }
+    }
   });
 
   it('refuses to detach a foreign standing consumer from a PR rollup queue', () => {
     const queue = resourceNames(42).rollupQueue;
     expect(queueConsumerIdsForQueue([
-      { consumer_id: 'rollup-consumer', script_name: 'pr-42-app' },
+      { consumer_id: 'rollup-consumer', type: 'worker', script: 'pr-42-app' },
     ], queue)).toEqual(['rollup-consumer']);
     expect(() => queueConsumerIdsForQueue([
-      { consumer_id: 'foreign-consumer', script_name: 'sessions-hub-preview' },
-    ], queue)).toThrow(/foreign queue consumer/);
+      { consumer_id: 'foreign-consumer', type: 'worker', script: 'sessions-hub-preview' },
+    ], queue)).toThrow();
   });
 });
 

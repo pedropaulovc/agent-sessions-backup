@@ -540,12 +540,13 @@ export function queueConsumerIdsForQueue(consumers, queueName) {
   required(queueName, 'queue name');
   return consumers.map((consumer) => {
     // Never detach a different PR's consumer, even if it lives in the preview namespace.
-    const script = consumer?.script_name;
+    const script = consumer?.script;
     const queueOwner = previewResourceOwner(queueName, 'queue');
     const scriptOwner = previewResourceOwner(script, 'worker');
-    if (typeof script === 'string' && (!queueOwner || !scriptOwner || scriptOwner.pr !== queueOwner.pr)) {
-      fail(`foreign queue consumer rejected on ${queueName}: ${stableJson({ script })}`);
+    if (typeof script !== 'string' || !queueOwner || !scriptOwner || scriptOwner.pr !== queueOwner.pr) {
+      fail(`foreign queue consumer rejected on ${queueName}`);
     }
+    if (consumer.type !== 'worker') fail(`non-worker queue consumer rejected on ${queueName}`);
     return required(consumer.consumer_id, 'queue consumer id');
   });
 }

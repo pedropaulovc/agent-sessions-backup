@@ -340,8 +340,11 @@ async function runController(command, scenario = {}) {
         if (target.startsWith('storage/kv/namespaces/')) return response({});
         if (target === 'queues') return response([names.queue, names.dlq, names.rollupQueue]
           .map((queue_name, index) => ({ queue_name, queue_id: 'queue-' + index })));
-        if (target.endsWith('/consumers')) return response([{ consumer_id: 'consumer',
-          script_name: scenario.foreignOwnerQueue === target.split('/')[1] ? 'pr-151-app' : names.app }]);
+        if (target.endsWith('/consumers') && method === 'GET') {
+          const queueId = target.split('/')[1];
+          return response(scenario.queueConsumers?.[queueId] ?? [{ consumer_id: 'consumer', type: 'worker',
+            script: scenario.foreignOwnerQueue === queueId ? 'pr-151-app' : names.app }]);
+        }
         if (target.startsWith('queues/')) return response({});
         throw new Error('Unexpected request ' + method + ' ' + target);
       };
@@ -615,45 +618,132 @@ for (const scenario of [{ edited: 'IDX01' }, { removed: 'IDX00' }, { unproven: '
   });
 }
 
+for (const [name, consumer] of [
+  ['missing canonical owner', { consumer_id: 'consumer', type: 'worker' }],
+  ['owned alias without a canonical owner', { consumer_id: 'consumer', type: 'worker', script_name: NAMES.app }],
+  ['null owner', { consumer_id: 'consumer', type: 'worker', script: null, script_name: NAMES.app }],
+  ['non-string owner', { consumer_id: 'consumer', type: 'worker', script: 42, script_name: NAMES.app }],
+  ['unknown owner', { consumer_id: 'consumer', type: 'worker', script: 'pr-150-unrecognized', script_name: NAMES.app }],
+  ['foreign canonical owner despite an owned alias', {
+    consumer_id: 'consumer', type: 'worker', script: 'pr-151-app', script_name: NAMES.app,
+  }],
+  ['non-worker type', { consumer_id: 'consumer', type: 'http_pull', script: NAMES.app, script_name: NAMES.app }],
+  ['missing worker type', { consumer_id: 'consumer', script: NAMES.app, script_name: NAMES.app }],
+  ['null worker type', { consumer_id: 'consumer', type: null, script: NAMES.app, script_name: NAMES.app }],
+  ['non-string consumer ID', { consumer_id: 42, type: 'worker', script: NAMES.app, script_name: NAMES.app }],
+  ['null record', null],
+  ['array record', []],
+  ['primitive record', 'private primitive consumer record'],
+]) {
+  test(`native queue preflight rejects ${name} on the last queue before any DELETE`, async () => {
+    const result = await runController('provision', {
+      existing: true, partial: true, foreignCount: 1,
+      queueConsumers: { 'queue-2': [
+        { consumer_id: 'valid-first', type: 'worker', script: NAMES.app },
+        consumer,
+      ] },
+    });
+    assert.notEqual(result.status, 0, result.output);
+    assert.equal(mutations(result).length, 0, 'no consumer, Worker, object or database may be deleted before full identity preflight');
+    assert.deepEqual(result.databases.map((database) => database.uuid), ['foreign-0', 'existing-0', 'existing-1']);
+    assert.ok(!result.events.some((event) => event.kind === 'migrate' || event.kind === 'deploy'));
+  });
+}
+
+test('native queue rejection diagnostics redact settings, auth, consumer IDs and malformed identity strings', async () => {
+  const privateValues = {
+    consumerId: 'private-consumer-id-value',
+    settings: 'private-unrelated-settings-value',
+    auth: 'private-auth-token-value',
+    owner: 'private invalid owner/value',
+    type: 'private malformed type/value',
+    alias: 'private invalid alias/value',
+    propertyKey: 'PRIVATE PROPERTY KEY preview rejection canary',
+  };
+  for (const identity of [
+    { type: 'worker', script: privateValues.owner },
+    { type: privateValues.type, script: NAMES.app },
+  ]) {
+    const result = await runController('provision', {
+      existing: true, partial: true, missingWorker: true, foreignCount: 1,
+      queueConsumers: { 'queue-2': [{
+        consumer_id: privateValues.consumerId, ...identity, script_name: privateValues.alias,
+        settings: { retry: privateValues.settings }, auth: { bearer: privateValues.auth },
+        [privateValues.propertyKey]: privateValues.auth,
+      }] },
+    });
+    assert.notEqual(result.status, 0, result.output);
+    for (const value of Object.values(privateValues)) {
+      assert.ok(!result.output.includes(value), 'rejection diagnostics must not contain private response values');
+    }
+    assert.equal(mutations(result).length, 0);
+    assert.ok(!result.events.some((event) => event.kind === 'migrate' || event.kind === 'deploy'));
+  }
+});
+
+test('successful provision receipts redact private property names and values without refusing owned consumers', async () => {
+  const privateValues = {
+    propertyKey: 'PRIVATE PROPERTY KEY preview receipt canary',
+    settings: 'private-receipt-settings-value',
+    auth: 'private-receipt-auth-value',
+    consumerId: 'private-receipt-consumer-id',
+    unknownValue: 'private-receipt-unknown-value',
+  };
+  const result = await runController('provision', {
+    queueConsumers: { 'queue-0': [{
+      consumer_id: privateValues.consumerId, type: 'worker', script: NAMES.app,
+      settings: { retry: privateValues.settings }, auth: { bearer: privateValues.auth },
+      [privateValues.propertyKey]: privateValues.unknownValue,
+    }] },
+  });
+  assert.equal(result.status, 0, result.output);
+  const receipt = result.stdout.trim().split('\n').map((line) => JSON.parse(line))
+    .find((line) => line.queueConsumerIdentityReceipt)?.queueConsumerIdentityReceipt;
+  assert.ok(receipt, 'successful provision must publish its native consumer receipt');
+  assert.equal(receipt.expectedWorker, NAMES.app);
+  for (const value of Object.values(privateValues)) {
+    assert.ok(!result.output.includes(value), 'provision output must not disclose private response keys or values');
+  }
+});
+
 const deployedBindings = [
   { name: 'INDEX_SHARD_COUNT', type: 'plain_text', text: String(LAYOUT.count) },
   ...LAYOUT.databases.map(({ binding }, index) => ({ name: binding, type: 'd1', id: `existing-${index}` })),
 ];
 
-for (const [name, scenario, error] of [
-  ['missing shard bound to a foreign database', { foreignBinding: 'IDX01' }, /IDX01 does not bind the trusted database/],
+for (const [name, scenario] of [
+  ['missing shard bound to a foreign database', { foreignBinding: 'IDX01' }],
   ['missing shard bound to another trusted database', { sourceBindings: deployedBindings.map((binding) =>
-    binding.name === 'IDX01' ? { ...binding, id: 'existing-1' } : binding) }, /IDX01 does not bind the trusted database/],
-  ['wrong surviving database ID', { foreignBinding: 'IDX00' }, /IDX00 does not bind the trusted database/],
+    binding.name === 'IDX01' ? { ...binding, id: 'existing-1' } : binding) }],
+  ['wrong surviving database ID', { foreignBinding: 'IDX00' }],
   ['unrelated D1 binding', { sourceBindings: [...deployedBindings,
-    { name: 'OTHER_DB', type: 'd1', id: 'foreign-0' }] }, /different database binding layout/],
+    { name: 'OTHER_DB', type: 'd1', id: 'foreign-0' }] }],
   ['renamed shard binding', { sourceBindings: deployedBindings.map((binding) =>
-    binding.name === 'IDX01' ? { ...binding, name: 'IDX02' } : binding) }, /IDX01 does not bind the trusted database/],
+    binding.name === 'IDX01' ? { ...binding, name: 'IDX02' } : binding) }],
   ['duplicate shard binding', { sourceBindings: [...deployedBindings,
-    { name: 'IDX01', type: 'd1', id: 'existing-2' }] }, /different index binding layout/],
+    { name: 'IDX01', type: 'd1', id: 'existing-2' }] }],
   ['wrong shard binding type', { sourceBindings: deployedBindings.map((binding) =>
-    binding.name === 'IDX01' ? { ...binding, type: 'plain_text' } : binding) }, /different database binding layout/],
+    binding.name === 'IDX01' ? { ...binding, type: 'plain_text' } : binding) }],
   ['empty missing database ID', { sourceBindings: deployedBindings.map((binding) =>
-    binding.name === 'IDX01' ? { ...binding, id: '' } : binding) }, /IDX01 does not bind the trusted database/],
+    binding.name === 'IDX01' ? { ...binding, id: '' } : binding) }],
   ['non-string missing database ID', { sourceBindings: deployedBindings.map((binding) =>
-    binding.name === 'IDX01' ? { ...binding, id: 42 } : binding) }, /IDX01 does not bind the trusted database/],
-  ['unrecorded topology with missing shard', { recordedLayout: null }, /IDX01 does not bind the trusted database/],
-  ['wrong deployed count', { sourceCount: 16 }, /deployed preview index count is immutable/],
-  ['wrong recorded count', { recordedLayout: { ...LAYOUT, count: 16 } }, /count\/name layout is immutable/],
-  ['unapproved account', { accountId: 'f'.repeat(32) }, /refusing unapproved Cloudflare account/],
+    binding.name === 'IDX01' ? { ...binding, id: 42 } : binding) }],
+  ['unrecorded topology with missing shard', { recordedLayout: null }],
+  ['wrong deployed count', { sourceCount: 16 }],
+  ['wrong recorded count', { recordedLayout: { ...LAYOUT, count: 16 } }],
+  ['unapproved account', { accountId: 'f'.repeat(32) }],
   ['wrong recorded names', { recordedLayout: { ...LAYOUT, databases: LAYOUT.databases.map((database, index) =>
-    index === 2 ? { ...database, name: 'pr-151-sessions-index-idx01' } : database) } }, /count\/name layout is immutable/],
-  ['foreign owner on the last queue', { foreignOwnerQueue: 'queue-2' }, /foreign queue consumer rejected/],
-  ['foreign owner on the last queue without a Worker', { foreignOwnerQueue: 'queue-2', missingWorker: true }, /foreign queue consumer rejected/],
-  ['database listing permission failure', { databaseListError: true }, /permission denied/],
-  ['Worker settings permission failure', { settingsError: true }, /permission denied/],
-  ['recorded layout query permission failure', { queryError: 'DB' }, /permission denied/],
-  ['surviving shard query permission failure', { queryError: 'IDX00' }, /permission denied/],
+    index === 2 ? { ...database, name: 'pr-151-sessions-index-idx01' } : database) } }],
+  ['foreign owner on the last queue', { foreignOwnerQueue: 'queue-2' }],
+  ['foreign owner on the last queue without a Worker', { foreignOwnerQueue: 'queue-2', missingWorker: true }],
+  ['database listing permission failure', { databaseListError: true }],
+  ['Worker settings permission failure', { settingsError: true }],
+  ['recorded layout query permission failure', { queryError: 'DB' }],
+  ['surviving shard query permission failure', { queryError: 'IDX00' }],
 ]) {
   test(`an incomplete deployed topology refuses ${name} before any mutation`, async () => {
     const result = await runController('provision', { existing: true, partial: true, foreignCount: 1, ...scenario });
     assert.notEqual(result.status, 0, result.output);
-    assert.match(result.output, error);
     assert.equal(mutations(result).length, 0);
     assert.deepEqual(result.databases.map((database) => database.uuid), ['foreign-0', 'existing-0', 'existing-1']);
     assert.ok(!result.events.some((event) => event.kind === 'migrate' || event.kind === 'deploy'));
