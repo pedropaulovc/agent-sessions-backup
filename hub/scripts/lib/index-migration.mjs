@@ -23,6 +23,24 @@ const JSON_IDS_SQL = 'SELECT value FROM json_each(?)';
 const quote = (name) => `"${name.replaceAll('"', '""')}"`;
 const sha = (value) => createHash('sha256').update(value).digest('hex');
 const inList = (count) => Array.from({ length: count }, () => '?').join(',');
+const DIAGNOSTIC_DB = Symbol('diagnostic-db');
+
+// Only callers below supply literal operation names. Preserve the original rejection
+// and transaction behavior; diagnostics never authorize retry or change checkpoints.
+function phaseDb(db, phase) {
+  db = db[DIAGNOSTIC_DB] ?? db;
+  const call = async (kind, args) => {
+    try { return await db[kind](...args); }
+    catch (error) {
+      if (!error.d1Phase) {
+        error.d1Phase = phase;
+        if (error.d1Diagnostic) error.message += ` phase=${phase}`;
+      }
+      throw error;
+    }
+  };
+  return { [DIAGNOSTIC_DB]: db, id: db.id, query: (...args) => call('query', args), batch: (...args) => call('batch', args) };
+}
 
 const sourceFreezeTriggers = ['insert', 'update', 'delete'].map((event) => ({
   sql: `CREATE TRIGGER IF NOT EXISTS index_migration_blocks_${event} BEFORE ${event.toUpperCase()} ON blocks
@@ -32,6 +50,7 @@ const sourceFreezeTriggers = ['insert', 'update', 'delete'].map((event) => ({
 }));
 
 async function sourceFreezePhase(source) {
+  source = phaseDb(source, 'copy-source-freeze-read');
   const objects = await source.query(`SELECT type, name FROM sqlite_master
     WHERE name IN ('${SOURCE_FREEZE_TABLE}', 'index_migration_blocks_insert',
       'index_migration_blocks_update', 'index_migration_blocks_delete')`);
@@ -69,6 +88,7 @@ function sourceEmptyAssertion(ids = null) {
 }
 
 async function freezeEmptySource(source) {
+  source = phaseDb(source, 'copy-source-freeze-install');
   if (await sourceFreezePhase(source) === 'frozen') return;
   await source.batch([
     sourceEmptyAssertion(), ...sourceFreezeInstall(),
@@ -78,14 +98,14 @@ async function freezeEmptySource(source) {
 
 export function canonicalRow(columns, row) {
   return JSON.stringify(columns.map((column) => {
-    if (!Object.hasOwn(row, column)) throw new Error(`D1 omitted column ${column}`);
+    if (!Object.hasOwn(row, column)) throw new Error('D1 omitted column');
     const value = row[column];
     if (value !== null && !['string', 'number'].includes(typeof value)) {
-      throw new Error(`unsupported D1 value in ${column}`);
+      throw new Error('unsupported D1 value');
     }
     if (typeof value === 'number' && (!Number.isFinite(value)
       || (Number.isInteger(value) && !Number.isSafeInteger(value)))) {
-      throw new Error(`unsafe D1 number in ${column}`);
+      throw new Error('unsafe D1 number');
     }
     return value;
   }));
@@ -102,9 +122,12 @@ export function assertMaintenanceHealth(health, revision, count) {
 }
 
 export async function readCheckpoint(db, name) {
+  if (!db[DIAGNOSTIC_DB]) db = phaseDb(db, 'checkpoint-read');
   const rows = await db.query('SELECT value FROM index_migration_state WHERE name = ?', [name]);
   if (!rows.length) return null;
-  const value = JSON.parse(rows[0].value);
+  let value;
+  try { value = JSON.parse(rows[0].value); }
+  catch { throw new Error('invalid index migration checkpoint payload'); }
   // Only a missing row is absence. Stored null/primitives/arrays are corruption,
   // never permission to initialize or overwrite a workflow checkpoint.
   if (!isProofRecord(value)) throw new Error('invalid index migration checkpoint payload');
@@ -112,6 +135,7 @@ export async function readCheckpoint(db, name) {
 }
 
 export async function writeCheckpoint(db, name, value) {
+  if (!db[DIAGNOSTIC_DB]) db = phaseDb(db, 'checkpoint-write');
   await db.query(`INSERT INTO index_migration_state (name, value) VALUES (?, ?)
     ON CONFLICT (name) DO UPDATE SET value = excluded.value`, [name, JSON.stringify(value)]);
 }
@@ -279,6 +303,7 @@ function firstMatchToken(text) {
 }
 
 async function verifyFts(db, rows) {
+  db = phaseDb(db, 'copy-fts-match');
   const probes = rows.map((row) => ({ id: row.id, token: firstMatchToken(row.text) }));
   const statements = [];
   for (let offset = 0; offset < probes.length; offset += 48) {
@@ -312,7 +337,7 @@ async function verifyFts(db, rows) {
     found.add(row.rowid);
   }
   for (const { id, token } of probes) {
-    if (token && !found.has(id)) throw new Error(`FTS MATCH verification failed for block ${id}`);
+    if (token && !found.has(id)) throw new Error('FTS MATCH verification failed');
   }
 }
 
@@ -478,6 +503,7 @@ async function readCopyPage(db, columns, layout, candidates) {
 }
 
 async function replaceShardPage(db, columns, rows, layout) {
+  db = phaseDb(db, 'copy-page-write');
   const idsJson = JSON.stringify(rows.map((row) => row.id));
   const page = canonicalPage(columns, rows);
   if (page.rows.length !== rows.length) throw new Error('shard page exceeds the canonical JSON byte cap');
@@ -503,7 +529,7 @@ async function discardUnacknowledgedPage(shards, pending) {
   for (let index = 0; index < shards.length; index += 1) {
     if (!idsByShard[index].length) continue;
     const idsJson = JSON.stringify(idsByShard[index]);
-    await shards[index].batch([
+    await phaseDb(shards[index], 'copy-discard-page').batch([
       { sql: `INSERT INTO blocks_fts (blocks_fts, rowid, text)
         SELECT 'delete', id, text FROM blocks WHERE id IN (${JSON_IDS_SQL})`, params: [idsJson] },
       { sql: `DELETE FROM blocks WHERE id IN (${JSON_IDS_SQL})`, params: [idsJson] },
@@ -527,7 +553,7 @@ async function verifyPending(source, shards, state, layout) {
     const items = state.pending.rows.filter((row) => row.shard === shard);
     if (!items.length) continue;
     const expected = new Set(items.map((item) => item.id));
-    const destination = await readBlockRows(shards[shard], state.columns, [...expected], layout);
+    const destination = await readBlockRows(phaseDb(shards[shard], 'copy-page-readback'), state.columns, [...expected], layout);
     const found = new Map(destination.map((row) => [row.id, row]));
     if (destination.length !== items.length || found.size !== items.length
       || destination.some((row) => !expected.has(row.id))) {
@@ -535,14 +561,14 @@ async function verifyPending(source, shards, state, layout) {
     }
     for (const item of items) {
       if (!found.has(item.id) || rowDigest(state.columns, found.get(item.id)) !== item.sha256) {
-        throw new Error(`readback SHA-256 mismatch for block ${item.id}; source retained`);
+        throw new Error('readback SHA-256 mismatch; source retained');
       }
       const original = remaining.get(item.id);
       if (original && rowDigest(state.columns, original) !== item.sha256) {
-        throw new Error(`frozen source changed for block ${item.id}; refusing deletion`);
+        throw new Error('frozen source changed; refusing deletion');
       }
       if (!original && state.pending.phase !== 'verified') {
-        throw new Error(`unverified source block ${item.id} disappeared`);
+        throw new Error('unverified source block disappeared');
       }
     }
     await verifyFts(shards[shard], destination);
@@ -557,7 +583,7 @@ async function finishPending(source, shards, state, gate, checkpoint, layout) {
     const found = new Map(rows.map((row) => [row.id, row]));
     for (const item of state.pending.rows) {
       if (!found.has(item.id) || rowDigest(state.columns, found.get(item.id)) !== item.sha256) {
-        throw new Error(`source block ${item.id} changed before copy`);
+        throw new Error('source block changed before copy');
       }
     }
     const routed = shards.map(() => []);
@@ -600,7 +626,7 @@ async function finishPending(source, shards, state, gate, checkpoint, layout) {
   );
   // The temporary copying state and every delete are one transaction. Old HTTP
   // invocations never observe an unfrozen commit or delete newly changed row content.
-  const deletion = await source.batch(statements);
+  const deletion = await phaseDb(source, 'copy-source-delete-and-freeze').batch(statements);
   if (deletion.length !== statements.length || !Array.isArray(deletion.at(-1)?.results)
     || deletion.at(-1).results.length) throw new Error('verified source deletion did not remove the whole page');
   state.after = ids.at(-1);
@@ -612,13 +638,15 @@ async function finishPending(source, shards, state, gate, checkpoint, layout) {
 
 /** Frozen, bounded, resumable full-column copy. No source writes occur before verified readback. */
 export async function copyFrozenIndex({ source, shards, gate, checkpointHook }) {
+  source = phaseDb(source, 'copy-source-page-read');
+  shards = shards.map((db) => phaseDb(db, 'copy-setup'));
   await gate();
   const identity = copyIdentity(source, shards);
   const checkpoint = async (state) => {
-    await writeCheckpoint(shards[0], COPY_CHECKPOINT, state);
+    await writeCheckpoint(phaseDb(shards[0], 'copy-checkpoint-write'), COPY_CHECKPOINT, state);
     await checkpointHook?.(structuredClone(state));
   };
-  let state = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+  let state = await readCheckpoint(phaseDb(shards[0], 'copy-checkpoint-read'), COPY_CHECKPOINT);
   if (state) assertIdentity(state, identity);
   if (state?.state === 'complete') {
     const tables = await source.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'blocks'");
@@ -628,7 +656,7 @@ export async function copyFrozenIndex({ source, shards, gate, checkpointHook }) 
     if (tables.length) await freezeEmptySource(source);
     return state;
   }
-  const columns = await columnsFor(source, 'blocks');
+  const columns = await columnsFor(phaseDb(source, 'copy-setup'), 'blocks');
   const layout = blockPageLayout(columns);
   await assertColumns(shards, 'blocks', columns);
   if (!state) {

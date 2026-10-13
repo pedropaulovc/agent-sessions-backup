@@ -17,7 +17,7 @@ import {
   STAR_CATALOG_COLUMNS, indexIdBase, indexShardForSessionId,
 } from '../src/index-layout.mjs';
 import {
-  cloudflareRetryDelay, pauseConsumers, requireProtectedProduction, verifyActiveIndex, verifyReadyIndex,
+  cloudflareRetryDelay, indexControlClient, pauseConsumers, requireProtectedProduction, verifyActiveIndex, verifyReadyIndex,
 } from '../../infra/cf/index-control.mjs';
 import { PREVIEW_ACCOUNT_ID, PRODUCTION_ACCOUNT_ID } from '../../infra/cf/preview-trust.mjs';
 import { D1_BATCH_PROBE_TEXT, d1SqlFailureReason, verifyD1BatchAtomicity } from '../../infra/cf/d1-batch-atomicity.mjs';
@@ -2981,7 +2981,7 @@ test('atomicity probe refuses an already-owned random name without deleting or m
   assert.ok(!f.trace.some((event) => event.sql && isWrite(event.sql)), 'the existing table must never enter probe cleanup');
 });
 
-test('D1 SQL failure classification exposes only safe reason enums and treats absent or unrelated messages as other', () => {
+test('D1 SQL failure classification exposes only safe reason enums and leaves absent or conflicting tokens unknown', () => {
   for (const errors of [
     ['malformed JSON'], [{ message: 'D1_ERROR: malformed JSON: SQLITE_ERROR', code: 7500 }],
     [{ message: 'MALFORMED json in intentional SQL probe' }],
@@ -2990,6 +2990,112 @@ test('D1 SQL failure classification exposes only safe reason enums and treats ab
     [], [null, undefined, {}], [{ code: 10000 }], [{ message: 42 }],
     ['authentication failed'], [{ message: 'connection reset' }], [{ message: 'not valid JSON' }],
   ]) assert.equal(d1SqlFailureReason(errors), 'other');
+  for (const [message, reason] of [
+    ['D1_ERROR: database or disk is full: SQLITE_FULL', 'capacity'],
+    ['near "private_sql": syntax error', 'sql-syntax'],
+    ['no such table: private_schema', 'missing-schema'],
+    ['too many SQL variables', 'limits'],
+    ['too many terms in compound SELECT', 'limits'],
+    ['string or blob too big: SQLITE_TOOBIG', 'limits'],
+    ['Exceeded maximum DB size.', 'capacity'],
+    ["Your account has exceeded D1's maximum account storage limit, please contact Cloudflare to raise your limit", 'capacity'],
+    ["Your account has exceeded D1's free tier daily row read limit.", 'quota'],
+    ['D1_COLUMN_NOTFOUND: private_column', 'missing-schema'],
+    ['D1_TYPE_ERROR: private_value', 'type-error'],
+    ['D1 DB reset because its code was updated.', 'transient-reset'],
+    ['Internal error while starting up D1 DB storage caused object to be reset.', 'transient-reset'],
+    ['Network connection lost.', 'transient-reset'],
+    ['Replica disconnected from primary.', 'transient-reset'],
+    ['Cannot resolve D1 DB due to transient issue on remote node.', 'transient-reset'],
+    ['D1 DB storage operation exceeded timeout which caused object to be reset.', 'storage-timeout'],
+    ['D1 DB is overloaded. Requests queued for too long.', 'overloaded'],
+    ["D1 DB's isolate exceeded its memory limit and was reset.", 'memory-limit'],
+    ['D1 DB exceeded its CPU time limit and was reset.', 'cpu-limit'],
+  ]) assert.equal(d1SqlFailureReason([{ message, code: 7500 }]), reason);
+  assert.equal(d1SqlFailureReason([{ code: 7500 }]), 'other');
+  assert.equal(d1SqlFailureReason(['database or disk is full; malformed JSON']), 'other');
+});
+
+test('REST D1 diagnostics sanitize envelope, result and transport failures without replay', async (context) => {
+  const originalFetch = globalThis.fetch;
+  context.after(() => { globalThis.fetch = originalFetch; });
+  const id = '95dbde60-d5ab-4e2c-989f-fcd44a3ab479';
+  const canary = 'PRIVATE_SQL_TRANSCRIPT_CANARY';
+  const failure = { message: `no such table: ${canary}`, code: 7500 };
+  for (const scenario of ['envelope', 'result', 'transport', 'non-json']) {
+    let requests = 0;
+    globalThis.fetch = async () => {
+      requests += 1;
+      if (scenario === 'transport') throw new Error(canary);
+      if (scenario === 'non-json') return new Response(canary, { status: 502 });
+      return Response.json(scenario === 'envelope'
+        ? { success: false, errors: [failure, { code: canary }, { code: -1 }, { code: 1.5 }] }
+        : { success: true, result: [{ success: false, error: failure.message, errors: [failure, { code: canary }] }] },
+      { status: scenario === 'envelope' ? 400 : 200 });
+    };
+    const db = indexControlClient(PREVIEW_ACCOUNT_ID, 'private-token', { permit: async () => {} }).db(id);
+    await assert.rejects(db.batch([{ sql: canary, params: [canary] }]), (error) => {
+      assert.equal(error.d1SqlReason, ['envelope', 'result'].includes(scenario) ? 'missing-schema' : 'other');
+      assert.ok(error.message.includes(id));
+      assert.ok(error.message.includes('kind=batch'));
+      assert.ok(!error.message.includes(canary));
+      assert.ok(!JSON.stringify(error).includes(canary));
+      if (['envelope', 'result'].includes(scenario)) assert.ok(error.message.includes('codes=7500'));
+      return true;
+    });
+    assert.equal(requests, 1, 'an ambiguous failure must not replay a batch');
+  }
+});
+
+test('copy preserves native rejection and retained source across semantic failure phases', async (context) => {
+  for (const phase of ['copy-setup', 'copy-page-write', 'copy-page-readback', 'copy-fts-match', 'copy-source-delete-and-freeze']) {
+    await context.test(phase, async (child) => {
+      const f = await fixture(child);
+      const original = block(801, 0);
+      seedBlocks(f.source, [original]);
+      const rejection = new Error('safe native rejection');
+      rejection.d1SqlReason = 'missing-schema';
+      rejection.d1Diagnostic = true;
+      const db = phase === 'copy-source-delete-and-freeze' ? f.source : f.shards[0];
+      for (const kind of ['query', 'batch']) {
+        const native = db[kind].bind(db);
+        db[kind] = async (...args) => {
+          const sql = kind === 'query' ? args[0] : args[0].map((statement) => statement.sql).join('\n');
+          const fail = phase === 'copy-setup' ? /^PRAGMA table_info/.test(sql)
+            : phase === 'copy-page-write' ? kind === 'batch' && /INSERT INTO blocks \(/.test(sql)
+              : phase === 'copy-page-readback' ? kind === 'query' && /WITH candidates AS MATERIALIZED/.test(sql)
+                : phase === 'copy-fts-match' ? /blocks_fts MATCH/.test(sql)
+                  : kind === 'batch' && /DELETE FROM blocks/.test(sql);
+          if (fail) throw rejection;
+          return native(...args);
+        };
+      }
+      await assert.rejects(copyFrozenIndex(f.args()), (error) => {
+        assert.equal(error, rejection);
+        assert.equal(error.d1Phase, phase);
+        assert.equal(error.d1SqlReason, 'missing-schema');
+        return true;
+      });
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [original], 'no rejected phase authorizes source deletion');
+      const state = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      if (phase !== 'copy-setup') {
+        assert.equal(state.rows, 0);
+        assert.equal(state.pending.phase, phase === 'copy-source-delete-and-freeze' ? 'verified' : 'copying');
+      }
+    });
+  }
+});
+
+test('row and malformed checkpoint validation do not disclose unknown metadata or payload bytes', async () => {
+  const canary = 'PRIVATE_METADATA_TRANSCRIPT_CANARY';
+  for (const action of [
+    () => canonicalRow([canary], {}),
+    () => canonicalRow([canary], { [canary]: true }),
+    () => canonicalRow([canary], { [canary]: Infinity }),
+  ]) assert.throws(action, (error) => !error.message.includes(canary));
+  await assert.rejects(readCheckpoint({
+    id: 'fixture', query: async () => [{ value: canary }],
+  }, COPY_CHECKPOINT), (error) => !error.message.includes(canary));
 });
 
 test('checkpoint classification refuses missing, boolean and unknown workflow state enums instead of treating them as completion', () => {

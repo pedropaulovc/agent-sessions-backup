@@ -392,6 +392,41 @@ versions, including changes behind its saved scan cursor, with readback before a
 Database-bound migration journals are useful per-run evidence; the durable shard
 checkpoint and D1 migration/checksum ledgers, not runner-temporary files, carry recovery.
 
+D1 copy failures emit only the configured database UUID, `query`/`batch` kind,
+validated numeric HTTP status/provider codes, statement/parameter counts, encoded
+request body and parameter-JSON byte counts, an allowlisted native class, and a
+static operation phase. Byte counts include JSON framing/escaping and are computed
+only on failure. `copy-setup` identifies schema/range setup;
+`copy-page-write`, `copy-page-readback`, and `copy-fts-match` distinguish destination
+replacement, full-row readback, and native MATCH execution. Source operations use
+`copy-source-page-read`, `copy-source-freeze-read`,
+`copy-source-freeze-install`, or `copy-source-delete-and-freeze`; checkpoint
+reads/writes and unacknowledged-page cleanup have their own static phases.
+Map the UUID to the generated configuration's binding before attributing a failure
+to main or any particular shard. No copied row IDs, column names, SQL, parameters,
+provider messages, or transcript bytes are diagnostic output.
+
+Native classes are `capacity` (explicit SQLITE_FULL/full-disk or documented
+database/account-storage-limit tokens), `sql-syntax`, `missing-schema`, `limits`,
+`type-error`, `quota`, `transient-reset`, `storage-timeout`, `overloaded`,
+`memory-limit`, `cpu-limit`, `malformed-json`, or `other` (unknown).
+The reset/resource tokens follow Cloudflare's
+[documented D1 errors](https://developers.cloudflare.com/d1/observability/debug-d1/).
+Unlike that general debugging guidance, this private-data copier never logs full
+native messages or SQL. These classes do not authorize retries.
+Absent, unrelated, or conflicting native tokens remain `other`; HTTP 400 or
+provider code 7500 alone is **not** a capacity diagnosis. A class describes a
+recognized rejection token, not proof of its root cause. In particular, malformed
+JSON can be the intentional source-comparison assertion aborting a changed page.
+These diagnostics do not establish the cause of any earlier production failure.
+
+After a failed/ambiguous request, source contents, shard contents, and checkpoint
+progress are unknown until durable state is inspected through the protected
+workflow. Do not infer rollback from a generic API code, advance a cursor, blindly
+retry, or apply speculative capacity/schema changes. Keep maintenance and paused
+consumers in place; use the existing verified-readback/checkpoint recovery rules
+before approving a protected continuation. Diagnostics add no retry or mutation.
+
 Abort or timeout during copying leaves maintenance and detached consumers in place.
 A failed readiness check or initial activation smoke writes no activation proof, so
 the next attempt remains pending and cannot bypass strict readiness or fail-closed

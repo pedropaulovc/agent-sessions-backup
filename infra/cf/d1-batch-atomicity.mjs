@@ -61,10 +61,29 @@ export async function verifyD1BatchAtomicity(db) {
   }
 }
 
-/** Preserve only a safe SQL-rejection enum; never expose provider SQL/error text. */
+/** Classify native tokens only; provider codes (including 7500) imply no SQL cause. */
 export function d1SqlFailureReason(errors) {
-  return errors.some((error) => {
+  const reasons = new Set();
+  for (const error of Array.isArray(errors) ? errors : []) {
     const message = typeof error === 'string' ? error : error?.message;
-    return typeof message === 'string' && /\bmalformed JSON\b/i.test(message);
-  }) ? 'malformed-json' : 'other';
+    if (typeof message !== 'string') continue;
+    for (const [reason, pattern] of [
+      ['malformed-json', /\bmalformed JSON\b/i],
+      ['capacity', /\b(?:SQLITE_FULL|database or disk is full|Exceeded maximum DB size|Your account has exceeded D1's maximum account storage limit)\b/i],
+      ['sql-syntax', /\b(?:syntax error|incomplete input|unrecognized token)\b/i],
+      ['missing-schema', /\b(?:D1_COLUMN_NOTFOUND|no such (?:table|column|module)|has no column named)\b/i],
+      ['limits', /\b(?:too many SQL variables|too many terms in compound SELECT|Expression tree is too large|string or blob too big|SQLITE_TOOBIG|statement too long)\b/i],
+      ['type-error', /\bD1_TYPE_ERROR\b/],
+      ['quota', /\bYour account has exceeded D1's free tier daily row (?:read|write) limit\b/i],
+      ['transient-reset', /\b(?:D1 DB reset because its code was updated|Internal error (?:while starting up|in) D1 DB storage caused object to be reset|Network connection lost|Replica disconnected from primary|Cannot resolve D1 DB due to transient issue on remote node|Can't read from request stream because client disconnected)\b/i],
+      ['storage-timeout', /\bD1 DB storage operation exceeded timeout which caused object to be reset\b/i],
+      ['overloaded', /\bD1 DB is overloaded\. (?:Requests queued for too long|Too many requests queued)\b/i],
+      ['memory-limit', /\bD1 DB's isolate exceeded its memory limit and was reset\b/i],
+      ['cpu-limit', /\bD1 DB exceeded its CPU time limit and was reset\b/i],
+    ]) {
+      if (pattern.test(message)) reasons.add(reason);
+    }
+  }
+  // Conflicting tokens are not evidence for a single cause.
+  return reasons.size === 1 ? [...reasons][0] : 'other';
 }

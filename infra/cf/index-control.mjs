@@ -21,6 +21,13 @@ const FREEZE_CHECKPOINT = 'index-maintenance-freeze-v1';
 const ATOMICITY_CHECKPOINT = 'index-rest-batch-atomicity-v1';
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const decimalIdentifier = (value) => typeof value === 'string' && value.length > 0 && !/[^0-9]/.test(value);
+const providerCodes = (errors) => (Array.isArray(errors) ? errors : [])
+  .map((error) => error?.code).filter((code) => Number.isSafeInteger(code) && code >= 0);
+const publicDatabaseId = (id) => typeof id === 'string'
+  && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id) ? id : 'unknown';
+const RESPONSE_STATUS = Symbol('response-status');
+const nativeReasons = new Set(['malformed-json', 'capacity', 'sql-syntax', 'missing-schema', 'limits',
+  'type-error', 'quota', 'transient-reset', 'storage-timeout', 'overloaded', 'memory-limit', 'cpu-limit', 'other']);
 
 export function requireProtectedProduction(env = process.env) {
   if (env.GITHUB_ACTIONS !== 'true' || env.GITHUB_EVENT_NAME !== 'push'
@@ -70,44 +77,82 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
       }
       let envelope;
       try { envelope = await response.json(); }
-      catch { throw new Error(`Cloudflare returned non-JSON HTTP ${response.status}`); }
-      if (!response.ok || envelope.success !== true) {
+      catch {
+        const error = new Error(`Cloudflare returned non-JSON HTTP ${response.status}`);
+        error.providerStatus = response.status;
+        throw error;
+      }
+      if (!response.ok || envelope?.success !== true) {
         // Never emit SQL, response bodies, transcript data, or credentials into CI logs.
-        const codes = (envelope.errors ?? []).map((error) => error.code).join(',');
-        const error = new Error(`Cloudflare ${pathname.split('?')[0]} failed: HTTP ${response.status}, codes=${codes}`);
-        if (/^d1\/database\/[^/]+\/query$/.test(pathname)) {
-          error.d1SqlReason = d1SqlFailureReason(envelope.errors ?? []);
+        const codes = providerCodes(envelope?.errors);
+        const isD1 = /^d1\/database\/[^/]+\/query$/.test(pathname);
+        const error = new Error(`Cloudflare ${isD1 ? 'D1 query' : pathname.split('?')[0]} failed: HTTP ${response.status}, codes=${codes.join(',')}`);
+        error.providerStatus = response.status;
+        error.providerCodes = codes;
+        if (isD1) {
+          error.d1SqlReason = d1SqlFailureReason(envelope?.errors);
         }
         throw error;
       }
+      if (responseFormat === 'envelope') envelope[RESPONSE_STATUS] = response.status;
       return responseFormat === 'envelope' ? envelope : envelope.result;
     }
   };
   return {
     cf,
     db(id) {
-      const execute = async (body) => {
-        const results = await cf(`d1/database/${encodeURIComponent(id)}/query`, {
-          method: 'POST', body: JSON.stringify(body),
-        });
-        if (!Array.isArray(results) || results.some((result) => result.success !== true)) {
-          const error = new Error(`D1 statement batch failed on database ${id}`);
-          error.d1SqlReason = d1SqlFailureReason(Array.isArray(results)
-            ? results.flatMap((result) => [result.error, ...(result.errors ?? [])]) : []);
-          throw error;
+      const execute = async (body, kind) => {
+        let encodedBody;
+        try {
+          const envelope = await cf(`d1/database/${encodeURIComponent(id)}/query`, {
+            method: 'POST', body: encodedBody = JSON.stringify(body), responseFormat: 'envelope',
+          });
+          const results = envelope.result;
+          if (!Array.isArray(results) || results.some((result) => result?.success !== true)) {
+            const failures = Array.isArray(results)
+              ? results.flatMap((result) => [result?.error,
+                ...(Array.isArray(result?.errors) ? result.errors : [])]) : [];
+            const error = new Error('D1 statement rejection');
+            error.d1SqlReason = d1SqlFailureReason(failures);
+            error.providerCodes = providerCodes([...failures, ...(Array.isArray(envelope.errors) ? envelope.errors : [])]);
+            error.providerStatus = envelope[RESPONSE_STATUS];
+            throw error;
+          }
+          if (kind === 'query' && (results.length !== 1 || !Array.isArray(results[0]?.results))) {
+            const error = new Error('D1 query returned an unexpected result shape');
+            error.providerStatus = envelope[RESPONSE_STATUS];
+            throw error;
+          }
+          return results;
+        } catch (error) {
+          // Replace transport/provider messages too: they may contain URLs, SQL or data.
+          const reason = nativeReasons.has(error?.d1SqlReason) ? error.d1SqlReason : 'other';
+          const codes = Array.isArray(error?.providerCodes) ? providerCodes(error.providerCodes.map((code) => ({ code }))) : [];
+          // Count already-encoded request bytes only on failure. Parameter JSON byte
+          // counts include array framing/escaping and never disclose the values.
+          const statements = kind === 'batch' && Array.isArray(body.batch) ? body.batch : [body];
+          const parameters = statements.reduce((count, statement) =>
+            count + (Array.isArray(statement?.params) ? statement.params.length : 0), 0);
+          const parameterJsonBytes = typeof encodedBody === 'string' ? statements.reduce((bytes, statement) =>
+            bytes + Buffer.byteLength(JSON.stringify(statement?.params ?? []), 'utf8'), 0) : 0;
+          const safe = new Error(`D1 database=${publicDatabaseId(id)} kind=${kind}`
+            + ` HTTP=${Number.isInteger(error?.providerStatus) && error.providerStatus >= 100 && error.providerStatus <= 599 ? error.providerStatus : 'unknown'}`
+            + ` codes=${codes.join(',')}`
+            + ` native=${reason} statements=${statements.length} parameters=${parameters}`
+            + ` bodyBytes=${typeof encodedBody === 'string' ? Buffer.byteLength(encodedBody, 'utf8') : 0}`
+            + ` parameterJsonBytes=${parameterJsonBytes}`);
+          safe.d1SqlReason = reason;
+          safe.d1Diagnostic = true;
+          throw safe;
         }
-        return results;
       };
       return {
         id,
         async query(sql, params = []) {
-          const result = await execute({ sql, params });
-          if (result.length !== 1 || !Array.isArray(result[0].results)) {
-            throw new Error('D1 query returned an unexpected result shape');
-          }
+          const result = await execute({ sql, params }, 'query');
           return result[0].results;
         },
-        async batch(batch) { return await execute({ batch }); },
+        async batch(batch) { return await execute({ batch }, 'batch'); },
       };
     },
   };
