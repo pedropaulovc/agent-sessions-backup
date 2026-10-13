@@ -69,6 +69,7 @@ export function d1SqlFailureReason(errors) {
     if (typeof message !== 'string') continue;
     for (const [reason, pattern] of [
       ['malformed-json', /\bmalformed JSON\b/i],
+      ['writer-fence', /\bindex_migration_frozen\b/],
       ['capacity', /\b(?:SQLITE_FULL|database or disk is full|Exceeded maximum DB size|Your account has exceeded D1's maximum account storage limit)\b/i],
       ['sql-syntax', /\b(?:syntax error|incomplete input|unrecognized token)\b/i],
       ['missing-schema', /\b(?:D1_COLUMN_NOTFOUND|no such (?:table|column|module)|has no column named)\b/i],

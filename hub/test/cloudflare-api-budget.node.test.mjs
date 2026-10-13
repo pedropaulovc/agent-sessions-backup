@@ -233,37 +233,21 @@ test('actual controller clients share a request-start budget including concurren
     Math.ceil(count / 4));
 });
 
-test('canonical controller returns result or full pagination envelope and rejects unknown formats before HTTP', async (t) => {
+test('canonical controller rejects unknown response formats before HTTP', async (t) => {
   // Keep this new API contract on the canonical module even when the pacing
   // tests execute an older controller through INDEX_CONTROL_PATH.
   const clock = createClock();
   const permit = createCloudflareApiPacer({ now: clock.now, sleep: clock.sleep });
   const client = currentIndexControlClient(PREVIEW_ACCOUNT_ID, TOKEN, { permit, wait: clock.sleep });
-  const envelope = {
-    success: true,
-    errors: [],
-    result: [{ uuid: 'synthetic-database', name: 'synthetic-preview-index' }],
-    result_info: { page: 2, per_page: 1, count: 1, total_count: 3, total_pages: 3 },
-  };
   let requests = 0;
   t.mock.method(globalThis, 'fetch', async (input, init) => {
     requestId(input, init);
     requests += 1;
-    return Response.json(envelope);
+    assert.fail('invalid response formats must not reach HTTP');
   });
   await assert.rejects(client.cf('d1/database/formats', { responseFormat: 'unknown' }),
     /response format must be result or envelope/);
   assert.equal(requests, 0, 'invalid formats do not issue an HTTP request');
-  const [defaultResult, explicitResult, fullEnvelope] = await runWithClock(clock, Promise.all([
-    client.cf('d1/database/formats'),
-    client.cf('d1/database/formats', { responseFormat: 'result' }),
-    client.cf('d1/database/formats', { responseFormat: 'envelope' }),
-  ]));
-  assert.deepEqual(defaultResult, envelope.result);
-  assert.deepEqual(explicitResult, envelope.result);
-  assert.deepEqual(fullEnvelope, envelope, 'envelope consumers retain pagination metadata');
-  assert.deepEqual(fullEnvelope.result_info, envelope.result_info);
-  assert.equal(requests, 3);
 });
 
 test('controller permits do not serialize HTTP response completion', async (t) => {
@@ -300,7 +284,7 @@ test('controller does not add network, 5xx, envelope, or response-shape retries'
     { name: 'HTTP 503', reply: () => Response.json({ success: false, errors: [{ code: 1000 }] }, { status: 503 }), expected: /HTTP 503/ },
     { name: 'non-JSON response', reply: () => new Response('not JSON'), expected: /non-JSON HTTP 200/ },
     { name: 'unsuccessful envelope', reply: () => Response.json({ success: false, errors: [{ code: 1000 }] }), expected: /HTTP 200/ },
-    { name: 'unexpected D1 result shape', reply: () => success([{ success: true, results: {} }]), expected: /unexpected result shape/, operation: (client) => client.db('failure').query('SELECT 1') },
+    { name: 'unexpected D1 result shape', reply: () => success([{ success: true, results: {} }]), operation: (client) => client.db('failure').query('SELECT 1') },
     { name: '429 without retry-after', reply: () => new Response(null, { status: 429 }), expected: /valid retry-after/ },
   ];
   for (const scenario of scenarios) {

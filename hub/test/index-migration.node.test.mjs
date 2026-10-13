@@ -17,11 +17,13 @@ import {
   STAR_CATALOG_COLUMNS, indexIdBase, indexShardForSessionId,
 } from '../src/index-layout.mjs';
 import {
-  cloudflareRetryDelay, indexControlClient, pauseConsumers, requireProtectedProduction, verifyActiveIndex, verifyReadyIndex,
+  CopyPassBudgetExhausted, cloudflareRetryDelay, createCopyPassRequestGate, indexControlClient,
+  pauseConsumers, requireProtectedProduction, runCopyPass, verifyActiveIndex, verifyReadyIndex,
 } from '../../infra/cf/index-control.mjs';
 import { PREVIEW_ACCOUNT_ID, PRODUCTION_ACCOUNT_ID } from '../../infra/cf/preview-trust.mjs';
 import { D1_BATCH_PROBE_TEXT, d1SqlFailureReason, verifyD1BatchAtomicity } from '../../infra/cf/d1-batch-atomicity.mjs';
 import { CLOUDFLARE_REQUEST_RATE_PER_SECOND } from '../scripts/lib/cloudflare-api-budget.mjs';
+import { verifyNativeCopyControl, withScratchD1Databases } from '../../infra/cf/native-copy-control.mjs';
 
 // Historical controls replace only classification, so older modules missing the new proof
 // exports still execute the load-bearing pending/active assertions rather than failing import.
@@ -2989,8 +2991,11 @@ test('D1 SQL failure classification exposes only safe reason enums and leaves ab
   for (const errors of [
     [], [null, undefined, {}], [{ code: 10000 }], [{ message: 42 }],
     ['authentication failed'], [{ message: 'connection reset' }], [{ message: 'not valid JSON' }],
+    ['index_migration_frozen_extra'], ['INDEX_MIGRATION_FROZEN'], ['SQLITE_CONSTRAINT'],
   ]) assert.equal(d1SqlFailureReason(errors), 'other');
   for (const [message, reason] of [
+    ['index_migration_frozen', 'writer-fence'],
+    ['D1_ERROR: index_migration_frozen: SQLITE_CONSTRAINT [code: 7500]', 'writer-fence'],
     ['D1_ERROR: database or disk is full: SQLITE_FULL', 'capacity'],
     ['near "private_sql": syntax error', 'sql-syntax'],
     ['no such table: private_schema', 'missing-schema'],
@@ -3014,6 +3019,7 @@ test('D1 SQL failure classification exposes only safe reason enums and leaves ab
   ]) assert.equal(d1SqlFailureReason([{ message, code: 7500 }]), reason);
   assert.equal(d1SqlFailureReason([{ code: 7500 }]), 'other');
   assert.equal(d1SqlFailureReason(['database or disk is full; malformed JSON']), 'other');
+  assert.equal(d1SqlFailureReason(['index_migration_frozen; malformed JSON']), 'other');
 });
 
 test('REST D1 diagnostics sanitize envelope, result and transport failures without replay', async (context) => {
@@ -3111,4 +3117,581 @@ test('checkpoint classification refuses missing, boolean and unknown workflow st
       }), /invalid index migration checkpoint state/);
     }
   }
+});
+
+const sqliteCopyControlContexts = new WeakSet();
+
+// Exercise the production REST client against native SQLite commits, including the
+// boundary between a successful response and the next request's budget check.
+function sqliteCopyControl(context, f, options = {}) {
+  if (!sqliteCopyControlContexts.has(context)) {
+    const originalFetch = globalThis.fetch;
+    context.after(() => { globalThis.fetch = originalFetch; });
+    sqliteCopyControlContexts.add(context);
+  }
+  const requests = [];
+  globalThis.fetch = async (url, init) => {
+    const id = decodeURIComponent(new URL(url).pathname.match(/\/d1\/database\/([^/]+)\/query$/)[1]);
+    const adapter = [f.source, ...f.shards].find((db) => db.id === id);
+    assert.ok(adapter, 'REST requests must target a real fixture database');
+    const body = JSON.parse(init.body);
+    requests.push({ id, body, signal: init.signal });
+    const results = body.batch
+      ? await adapter.batch(body.batch)
+      : [{ success: true, results: await adapter.query(body.sql, body.params) }];
+    return Response.json({ success: true, result: results });
+  };
+  const client = indexControlClient(PREVIEW_ACCOUNT_ID, 'private-token', {
+    permit: async () => {}, ...options,
+  });
+  return { requests, args: { source: client.db(f.source.id),
+    shards: f.shards.map(({ id }) => client.db(id)), gate } };
+}
+
+test('copy pass budgets reject unsafe durations and expire synchronously at exact elapsed or wait boundaries', () => {
+  for (const value of [0, -1, 0.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1,
+    '1', null, undefined]) {
+    assert.throws(() => createCopyPassRequestGate(value), /positive.*safe integer/i);
+  }
+  for (const budget of [1, 1000, Number.MAX_SAFE_INTEGER]) {
+    let time = 0;
+    const requestGate = createCopyPassRequestGate(budget, { now: () => time });
+    assert.equal(requestGate(), undefined, 'gate must not schedule asynchronous work');
+    assert.equal(requestGate(budget - 1), undefined);
+    assert.throws(() => requestGate(budget), CopyPassBudgetExhausted);
+    time = budget;
+    assert.throws(() => requestGate(), CopyPassBudgetExhausted);
+  }
+  let time = 50;
+  const requestGate = createCopyPassRequestGate(1000, { now: () => time });
+  time = 750;
+  assert.equal(requestGate(299), undefined);
+  assert.throws(() => requestGate(300), CopyPassBudgetExhausted);
+});
+
+test('REST budget gates stop before permit and after permit without fetching or sanitizing the budget identity', async (context) => {
+  for (const boundary of ['before-permit', 'after-permit']) {
+    await context.test(boundary, async (child) => {
+      const f = await fixture(child);
+      const original = block(40_101, 0);
+      seedBlocks(f.source, [original]);
+      let time = 0;
+      let permits = 0;
+      const budgetGate = createCopyPassRequestGate(10, { now: () => time });
+      let rejection;
+      const requestGate = (delay) => {
+        try { return budgetGate(delay); }
+        catch (error) { rejection = error; throw error; }
+      };
+      const control = sqliteCopyControl(child, f, { requestGate, permit: async () => {
+        permits += 1;
+        time = 10;
+      } });
+      if (boundary === 'before-permit') time = 10;
+      await assert.rejects(control.args.source.query('SELECT * FROM blocks'), (error) => {
+        assert.ok(error instanceof CopyPassBudgetExhausted);
+        assert.equal(error, rejection, 'D1 sanitization must retain the precise budget exception');
+        return true;
+      });
+      assert.equal(permits, boundary === 'before-permit' ? 0 : 1);
+      assert.deepEqual(control.requests, []);
+      assert.deepEqual(f.trace, []);
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [original]);
+    });
+  }
+});
+
+test('budget-limited native copy passes resume committed copying and verified pages with full fidelity', async (context) => {
+  const rows = [
+    block(40_201, 0, { text: '\uFEFFbudget_needle_0 café\u0000tail_0 😀', row_hash: Number.MAX_SAFE_INTEGER }),
+    block(40_202, 1, { text: 'budget_needle_1 会話\u0000tail_1', role: '', tool_name: null }),
+    block(40_203, 0, { text: null, role: null, byte_start: null, byte_len: null }),
+    block(40_204, 1, { text: '', media_byte_start: 2 ** 40, media_byte_len: 0, media_type: '' }),
+  ];
+  for (const boundary of ['before-first-request', 'committed-shard-write', 'committed-source-freeze']) {
+    await context.test(boundary, async (child) => {
+      const baseline = await fixture(child);
+      seedBlocks(baseline.source, rows);
+      const expected = await copyFrozenIndex(baseline.args());
+      const f = await fixture(child);
+      seedBlocks(f.source, rows);
+      const verifiedRows = assertVerifiedBeforeDelete(f);
+      const deletedRowCounts = [];
+      const observeDeletedRows = () => {
+        f.source.afterStatement = ({ sql }) => {
+          if (/\bDELETE\s+FROM\s+"?blocks"?\b/i.test(sql)) {
+            deletedRowCounts.push(f.source.rows('SELECT changes() AS n')[0].n);
+          }
+        };
+      };
+      observeDeletedRows();
+      const initialShardSnapshots = f.shards.map(blockSnapshot);
+      let time = 0;
+      const requestGate = createCopyPassRequestGate(100, { now: () => time });
+      let expiredAtCommit = false;
+      if (boundary === 'committed-shard-write') {
+        for (const shard of f.shards) shard.afterBatch = ({ statements, committed }) => {
+          if (statements.some(({ sql }) => /\bINSERT\s+INTO\s+"?blocks"?\s*\(/i.test(sql))) {
+            assert.equal(committed, true);
+            expiredAtCommit = true;
+            time = 100;
+          }
+        };
+      } else if (boundary === 'committed-source-freeze') {
+        f.source.afterBatch = ({ statements, committed }) => {
+          if (statements.some(({ sql }) => /\bDELETE\s+FROM\s+"?blocks"?\b/i.test(sql))) {
+            assert.equal(committed, true);
+            assert.deepEqual(f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
+            expiredAtCommit = true;
+            time = 100;
+          }
+        };
+      } else time = 100;
+      const control = sqliteCopyControl(child, f, { requestGate });
+      assert.deepEqual(await runCopyPass(control.args), { status: 'partial', reason: 'pass-budget-exhausted' });
+      const saved = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      if (boundary === 'before-first-request') {
+        assert.equal(saved, null);
+        assert.deepEqual(control.requests, []);
+        assert.equal(destinationBatchCount(f), 0);
+        assert.deepEqual(f.shards.map(blockSnapshot), initialShardSnapshots);
+      } else {
+        assert.equal(expiredAtCommit, true);
+        assert.equal(saved.state, 'pending', 'partial must not publish complete');
+        assert.equal(saved.rows, 0, 'no IDX00 retirement acknowledgement may cross the budget');
+        assert.equal(saved.pending.phase, boundary === 'committed-shard-write' ? 'copying' : 'verified');
+        assert.deepEqual(saved.pending.rows.map(({ id }) => id), rows.map(({ id }) => id));
+        assertAtomicBlockBatches(f);
+        if (boundary === 'committed-shard-write') {
+          assert.deepEqual(f.shards[0].rows('SELECT * FROM blocks ORDER BY id'), rows.filter((row) =>
+            indexShardForSessionId(row.session_id, 2) === 0));
+          assert.deepEqual(blockSnapshot(f.shards[1]), initialShardSnapshots[1],
+            'the next shard batch must not start once the previous commit exhausts the pass');
+        }
+      }
+      assert.ok(f.trace.filter(({ kind }) => kind === 'batch').every(({ committed }) => committed),
+        'budget exhaustion must never abort an in-flight native transaction');
+      assert.ok(control.requests.every(({ signal }) => !signal.aborted));
+      const retired = boundary === 'committed-source-freeze';
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), retired ? [] : rows);
+      assert.equal(verifiedRows(), retired ? rows.length : 0);
+      const deletionsBeforeResume = sourceWrites(f).filter(({ sql }) => /\bDELETE\s+FROM\s+"?blocks"?\b/i.test(sql));
+      assert.equal(deletionsBeforeResume.length, retired ? 1 : 0);
+      const shardSnapshots = f.shards.map(blockSnapshot);
+      const writesBeforeResume = destinationBatchCount(f);
+      f.restart();
+      assertVerifiedBeforeDelete(f);
+      observeDeletedRows();
+      time = 0;
+      const resumed = sqliteCopyControl(child, f, {
+        requestGate: createCopyPassRequestGate(100, { now: () => time }),
+      });
+      assert.deepEqual(await runCopyPass(resumed.args), {
+        copiedRows: rows.length, state: 'complete', sha256: expected.sha256,
+      });
+      assertCopied(f, rows);
+      assert.deepEqual(f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
+      const completed = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      assert.equal(completed.state, 'complete');
+      assert.equal(completed.pending, null);
+      assert.equal(completed.rows, rows.length);
+      assert.equal(completed.sha256, expected.sha256);
+      const deletions = sourceWrites(f).filter(({ sql }) => /\bDELETE\s+FROM\s+"?blocks"?\b/i.test(sql));
+      assert.equal(deletions.length, retired ? 2 : 1);
+      assert.deepEqual(deletedRowCounts, retired ? [rows.length, 0] : [rows.length],
+        'verified resume may replay the CAS, but must delete every original tuple exactly once');
+      assert.equal(deletedRowCounts.reduce((sum, count) => sum + count, 0), rows.length);
+      if (retired) {
+        assert.equal(destinationBatchCount(f), writesBeforeResume);
+        assert.deepEqual(f.shards.map(blockSnapshot), shardSnapshots,
+          'verified resume must reuse committed block bytes and exact FTS postings');
+      }
+      assert.ok(f.trace.filter(({ kind }) => kind === 'batch').every(({ committed }) => committed));
+    });
+  }
+});
+
+test('valid 429 waits cannot reach or cross the copy pass deadline, but an affordable wait retries native reads', async (context) => {
+  for (const remaining of [999, 1000, 1001]) {
+    await context.test(`remaining=${remaining}`, async (child) => {
+      const f = await fixture(child);
+      seedBlocks(f.source, [block(40_301, 0)]);
+      let time = 0;
+      const waits = [];
+      const control = sqliteCopyControl(child, f, {
+        requestGate: createCopyPassRequestGate(2000, { now: () => time }),
+        wait: async (delay) => { waits.push(delay); time += delay; },
+      });
+      const nativeFetch = globalThis.fetch;
+      let attempts = 0;
+      globalThis.fetch = async (...args) => {
+        attempts += 1;
+        if (attempts === 1) {
+          time = 2000 - remaining;
+          return new Response('rate limited', { status: 429, headers: { 'retry-after': '1' } });
+        }
+        return nativeFetch(...args);
+      };
+      if (remaining <= 1000) {
+        assert.deepEqual(await runCopyPass(control.args), { status: 'partial', reason: 'pass-budget-exhausted' });
+        assert.deepEqual(waits, []);
+        assert.equal(attempts, 1);
+        assert.deepEqual(f.trace, []);
+        assert.equal(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), null);
+        assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [block(40_301, 0)]);
+      } else {
+        assert.deepEqual(await control.args.source.query('SELECT id FROM blocks'), [{ id: 40_301 }]);
+        assert.deepEqual(waits, [1000]);
+        assert.equal(attempts, 2);
+        assert.equal(time, 1999);
+        assert.equal(control.requests.length, 1);
+      }
+    });
+  }
+});
+
+test('copy pass never turns native HTTP 400 or ambiguous network failures into partial success or replays', async (context) => {
+  for (const failure of ['native-400', 'network']) {
+    await context.test(failure, async (child) => {
+      const f = await fixture(child);
+      const original = block(40_401, 0);
+      seedBlocks(f.source, [original]);
+      const control = sqliteCopyControl(child, f, {
+        requestGate: createCopyPassRequestGate(100, { now: () => 0 }),
+        wait: async () => assert.fail('terminal failures must not schedule retries'),
+      });
+      let attempts = 0;
+      globalThis.fetch = async () => {
+        attempts += 1;
+        if (failure === 'network') throw new Error('private network failure');
+        return Response.json({ success: false, errors: [{ code: 7500, message: 'no such table: private_table' }] },
+          { status: 400 });
+      };
+      await assert.rejects(runCopyPass(control.args), (error) => {
+        assert.ok(!(error instanceof CopyPassBudgetExhausted));
+        assert.equal(error.d1Diagnostic, true);
+        assert.equal(error.d1SqlReason, failure === 'native-400' ? 'missing-schema' : 'other');
+        assert.ok(!error.message.includes('private'));
+        return true;
+      });
+      assert.equal(attempts, 1);
+      assert.deepEqual(f.trace, []);
+      assert.equal(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), null);
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [original]);
+    });
+  }
+});
+
+const scratchNonce = '0123456789abcdef01234567';
+const scratchNames = ['source', 'idx00', 'idx01'].map((role) => `pr-42-copy-${scratchNonce}-${role}`);
+
+// A stateful account registry, not an HTTP echo: every create/delete changes the
+// resources subsequent list and identity reads observe. Faults model provider drift.
+function scratchAccount(existing = [], faults = {}) {
+  const resources = new Map(existing.map((database) => [database.uuid, { ...database }]));
+  const created = [];
+  const deleted = [];
+  const adapters = new Map();
+  let sequence = 0;
+  const api = {
+    async cf(pathname, init = {}) {
+      const method = init.method ?? 'GET';
+      if (pathname.startsWith('d1/database?') && method === 'GET') {
+        const parameters = new URLSearchParams(pathname.split('?')[1]);
+        const page = Number(parameters.get('page') ?? 1);
+        const perPage = Number(parameters.get('per_page') ?? 100);
+        const all = [...resources.values()];
+        return {
+          result: all.slice((page - 1) * perPage, page * perPage).map((database) => ({ ...database })),
+          result_info: { page, per_page: perPage, total_count: all.length, total_pages: Math.ceil(all.length / perPage) },
+        };
+      }
+      if (pathname === 'd1/database' && method === 'POST') {
+        const { name } = JSON.parse(init.body);
+        faults.beforeCreate?.(name, resources);
+        assert.ok(![...resources.values()].some((database) => database.name === name), 'provider rejects duplicate names');
+        const database = { uuid: `scratch-created-${++sequence}`, name };
+        resources.set(database.uuid, database);
+        created.push({ ...database });
+        return faults.createResponse?.({ ...database }, resources) ?? { ...database };
+      }
+      const match = /^d1\/database\/([^/?]+)$/.exec(pathname);
+      assert.ok(match, `unexpected registry resource ${pathname}`);
+      const uuid = decodeURIComponent(match[1]);
+      const database = resources.get(uuid);
+      if (!database) throw Object.assign(new Error('private missing database'), { providerStatus: 404 });
+      if (method === 'GET') return faults.identity ? faults.identity({ ...database }, resources) : { ...database };
+      assert.equal(method, 'DELETE');
+      faults.beforeDelete?.({ ...database }, resources);
+      resources.delete(uuid);
+      deleted.push({ ...database });
+      return {};
+    },
+    db(uuid) {
+      assert.ok(resources.has(uuid), 'native adapter requires an existing database');
+      const adapter = { id: uuid };
+      adapters.set(uuid, adapter);
+      return adapter;
+    },
+  };
+  return {
+    api, resources, created, deleted, adapters,
+    snapshot: () => [...resources.values()].map((database) => ({ ...database })).sort((a, b) => a.uuid.localeCompare(b.uuid)),
+  };
+}
+
+function standingScratchResources(foreignCount = 2) {
+  return [
+    { uuid: 'persistent-main', name: 'pr-42-sessions-index' },
+    { uuid: 'persistent-idx00', name: 'pr-42-sessions-index-idx00' },
+    { uuid: 'persistent-idx01', name: 'pr-42-sessions-index-idx01' },
+    ...Array.from({ length: foreignCount }, (_, index) => ({ uuid: `foreign-${index}`, name: `unrelated-account-db-${index}` })),
+  ];
+}
+
+function allocateScratch(account, run) {
+  return withScratchD1Databases({ api: account.api, pr: 42, nonce: scratchNonce, run });
+}
+
+async function rejectsPrivateScratchFailure(operation) {
+  await assert.rejects(operation, (error) => {
+    assert.ok(error instanceof Error);
+    assert.ok(!error.message.includes('private'), 'allocator must sanitize provider and callback errors');
+    return true;
+  });
+}
+
+test('scratch allocator proves whole-account capacity before creation, including foreign databases', async (context) => {
+  for (const foreignCount of [5, 7]) {
+    await context.test(`${3 + foreignCount} existing databases`, async () => {
+      const account = scratchAccount(standingScratchResources(foreignCount));
+      const before = account.snapshot();
+      await assert.rejects(allocateScratch(account, async () => assert.fail('exhausted account must not run')));
+      assert.deepEqual(account.created, [], 'quota rejection must not transiently allocate any scratch database');
+      assert.deepEqual(account.deleted, []);
+      assert.deepEqual(account.snapshot(), before);
+    });
+  }
+});
+
+test('scratch allocator never adopts or deletes an exact generated-name collision', async () => {
+  const account = scratchAccount([
+    ...standingScratchResources(),
+    { uuid: 'previous-interrupted-run', name: scratchNames[2] },
+  ]);
+  const before = account.snapshot();
+  await assert.rejects(allocateScratch(account, async () => assert.fail('colliding run must not execute')));
+  assert.deepEqual(account.created, []);
+  assert.deepEqual(account.deleted, []);
+  assert.deepEqual(account.snapshot(), before);
+});
+
+test('scratch allocator uses three unique native adapters at the exact capacity boundary and preserves all standing resources', async () => {
+  const account = scratchAccount(standingScratchResources(4));
+  const before = account.snapshot();
+  const result = await allocateScratch(account, async ({ source, shards }) => {
+    assert.equal(shards.length, 2);
+    const native = [source, ...shards];
+    assert.equal(new Set(native.map(({ id }) => id)).size, 3);
+    assert.deepEqual(native.map(({ id }) => account.resources.get(id).name), scratchNames);
+    for (const adapter of native) assert.equal(adapter, account.adapters.get(adapter.id));
+    assert.equal(account.resources.size, 10);
+    return { completed: true };
+  });
+  assert.deepEqual(result, { completed: true });
+  assert.deepEqual(account.created.map(({ name }) => name), scratchNames);
+  assert.deepEqual(account.snapshot(), before);
+  assert.deepEqual(new Set(account.deleted.map(({ uuid }) => uuid)), new Set(account.created.map(({ uuid }) => uuid)));
+});
+
+test('scratch callback failure cleans all three owned databases and redacts callback details', async () => {
+  const account = scratchAccount(standingScratchResources());
+  const before = account.snapshot();
+  let entered = false;
+  await rejectsPrivateScratchFailure(allocateScratch(account, async ({ source, shards }) => {
+    entered = true;
+    assert.deepEqual([source, ...shards].map(({ id }) => account.resources.get(id).name), scratchNames);
+    throw new Error('private callback payload');
+  }));
+  assert.equal(entered, true);
+  assert.deepEqual(account.created.map(({ name }) => name), scratchNames);
+  assert.deepEqual(account.snapshot(), before);
+});
+
+test('scratch partial creation failure cleans only validated known creations and never invokes the callback', async (context) => {
+  for (const failingName of scratchNames.slice(1)) {
+    await context.test(failingName, async () => {
+      const account = scratchAccount(standingScratchResources(), {
+        beforeCreate(name) {
+          if (name === failingName) throw new Error('private provider creation error');
+        },
+      });
+      const before = account.snapshot();
+      await rejectsPrivateScratchFailure(allocateScratch(account, async () => assert.fail('partial allocation must not run')));
+      assert.deepEqual(account.created.map(({ name }) => name), scratchNames.slice(0, scratchNames.indexOf(failingName)));
+      assert.deepEqual(account.deleted.map(({ uuid }) => uuid).sort(), account.created.map(({ uuid }) => uuid).sort());
+      assert.deepEqual(account.snapshot(), before);
+    });
+  }
+});
+
+test('scratch allocator refuses foreign create responses without adopting or deleting their identities', async (context) => {
+  for (const responseKind of ['foreign-name', 'prior-uuid', 'duplicate-created-uuid', 'missing-uuid']) {
+    await context.test(responseKind, async () => {
+      const account = scratchAccount(standingScratchResources(), {
+        createResponse(database, resources) {
+          if (database.name !== scratchNames[1]) return database;
+          if (responseKind === 'foreign-name') {
+            resources.set(database.uuid, { ...database, name: 'foreign-response-database' });
+            return { ...database, name: 'foreign-response-database' };
+          }
+          if (responseKind === 'prior-uuid') return { ...database, uuid: 'foreign-0' };
+          if (responseKind === 'duplicate-created-uuid') return { ...database, uuid: 'scratch-created-1' };
+          return { name: database.name };
+        },
+      });
+      const before = account.snapshot();
+      await assert.rejects(allocateScratch(account, async () => assert.fail('untrusted response must not run')));
+      assert.deepEqual(account.created.map(({ name }) => name), scratchNames.slice(0, 2));
+      assert.deepEqual(account.deleted, [account.created[0]]);
+      assert.deepEqual(account.snapshot(), [
+        ...before,
+        { uuid: 'scratch-created-2', name: responseKind === 'foreign-name' ? 'foreign-response-database' : scratchNames[1] },
+      ].sort((a, b) => a.uuid.localeCompare(b.uuid)));
+    });
+  }
+});
+
+test('scratch cleanup refuses identity drift while still removing every other known owned database', async (context) => {
+  for (const drift of ['name', 'uuid', 'other-pr']) {
+    await context.test(drift, async () => {
+      let driftEnabled = false;
+      const account = scratchAccount(standingScratchResources(), {
+        identity(database) {
+          return driftEnabled && database.uuid === 'scratch-created-1' && drift === 'uuid'
+            ? { ...database, uuid: 'foreign-0' } : database;
+        },
+      });
+      const before = account.snapshot();
+      let entered = false;
+      const survivorName = drift === 'name' ? 'foreign-renamed-database'
+        : drift === 'other-pr' ? scratchNames[0].replace('pr-42-', 'pr-43-') : scratchNames[0];
+      await assert.rejects(allocateScratch(account, async ({ source }) => {
+        entered = true;
+        driftEnabled = true;
+        account.resources.set(source.id, { uuid: source.id, name: survivorName });
+        return 'successful callback';
+      }));
+      assert.equal(entered, true);
+      assert.deepEqual(account.deleted.map(({ name }) => name).sort(), scratchNames.slice(1).sort());
+      assert.deepEqual(account.snapshot(), [
+        ...before, { uuid: 'scratch-created-1', name: survivorName },
+      ].sort((a, b) => a.uuid.localeCompare(b.uuid)));
+    });
+  }
+});
+
+test('scratch cleanup deletion failure fails successful work and attempts the remaining owned deletions', async () => {
+  const account = scratchAccount(standingScratchResources(), {
+    beforeDelete(database) {
+      if (database.name === scratchNames[0]) throw new Error('private provider deletion error');
+    },
+  });
+  const before = account.snapshot();
+  let entered = false;
+  await rejectsPrivateScratchFailure(allocateScratch(account, async () => { entered = true; return 'success'; }));
+  assert.equal(entered, true);
+  assert.deepEqual(account.deleted.map(({ name }) => name).sort(), scratchNames.slice(1).sort());
+  assert.deepEqual(account.snapshot(), [...before, account.created[0]].sort((a, b) => a.uuid.localeCompare(b.uuid)));
+});
+
+test('scratch cleanup rejects successful null metadata without deleting that resource and cleans other owned databases', async () => {
+  let nullMetadataEnabled = false;
+  const account = scratchAccount(standingScratchResources(), {
+    identity(database) {
+      return nullMetadataEnabled && database.name === scratchNames[0] ? null : database;
+    },
+  });
+  const before = account.snapshot();
+  await assert.rejects(allocateScratch(account, async () => {
+    nullMetadataEnabled = true;
+    return 'successful callback';
+  }), (error) => {
+    assert.equal(error.nativeCopyPhase, 'cleanup');
+    assert.equal(error.nativeCopyClass, 'ownership');
+    return true;
+  });
+  assert.deepEqual(account.deleted.map(({ name }) => name).sort(), scratchNames.slice(1).sort());
+  assert.deepEqual(account.snapshot(), [...before, account.created[0]].sort((a, b) => a.uuid.localeCompare(b.uuid)));
+});
+
+test('scratch cleanup accepts native HTTP 404 absence without touching standing resources', async () => {
+  const account = scratchAccount(standingScratchResources());
+  const before = account.snapshot();
+  await allocateScratch(account, async ({ source }) => {
+    assert.equal(account.resources.delete(source.id), true);
+  });
+  assert.deepEqual(account.deleted.map(({ name }) => name).sort(), scratchNames.slice(1).sort());
+  assert.deepEqual(account.snapshot(), before);
+});
+
+test('native full-copy control runs real SQLite schema, copier, independent readback and scratch cleanup end to end', async (context) => {
+  const directory = await mkdtemp(path.join(tmpdir(), 'native-copy-control-test-'));
+  const account = scratchAccount(standingScratchResources());
+  const before = account.snapshot();
+  const adapters = [];
+  context.after(async () => {
+    for (const adapter of adapters) adapter.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+  account.api.db = (uuid) => {
+    assert.ok(account.resources.has(uuid));
+    const adapter = new SqliteD1(uuid, path.join(directory, `${uuid}.sqlite`), []);
+    // Preserve actual SQLite execution and errors, adding only the native
+    // client's public SQL classification that the fence proof consumes.
+    for (const method of ['query', 'batch']) {
+      const execute = adapter[method].bind(adapter);
+      adapter[method] = async (...args) => {
+        try { return await execute(...args); }
+        catch (error) {
+          error.d1SqlReason = d1SqlFailureReason([{ message: error.message }]);
+          throw error;
+        }
+      };
+    }
+    adapters.push(adapter);
+    return adapter;
+  };
+  const indexMigrations = await migrations(path.join(hubRoot, 'migrations-index'));
+  const result = await verifyNativeCopyControl({
+    api: account.api,
+    pr: 42,
+    applySchema: async ({ source, shards }) => {
+      for (const database of [source, ...shards]) {
+        for (const migration of indexMigrations) database.database.exec(migration.sql);
+      }
+    },
+  });
+  assert.equal(result.state, 'verified');
+  assert.equal(result.probe, 'd1-native-full-copy');
+  assert.equal(result.rows, 2);
+  assert.equal(result.columns, BLOCK_COLUMNS.length);
+  assert.equal(result.shards, 2);
+  assert.ok(Number.isSafeInteger(result.ordinaryPages) && result.ordinaryPages > 0);
+  assert.ok(Number.isSafeInteger(result.fallbackPages) && result.fallbackPages > 0);
+  assert.equal(result.ftsMatches, 4);
+  assert.equal(result.freezeTriggers, 3);
+  assert.match(result.sha256, /^[0-9a-f]{64}$/);
+  const [source, ...shards] = adapters;
+  assert.deepEqual(source.rows('SELECT COUNT(*) AS rows FROM blocks'), [{ rows: 0 }]);
+  assert.deepEqual(source.rows(`SELECT state FROM ${SOURCE_FREEZE_TABLE}`), [{ state: 'frozen' }]);
+  const copied = shards.flatMap((database) => database.rows('SELECT * FROM blocks')).sort((a, b) => a.id - b.id);
+  assert.equal(copied.length, result.rows);
+  assert.equal(sha256(JSON.stringify(copied.map((row) => JSON.parse(canonicalRow(BLOCK_COLUMNS, row))))), result.sha256);
+  assert.equal((await readCheckpoint(shards[0], COPY_CHECKPOINT)).state, 'complete');
+  assert.deepEqual(account.snapshot(), before);
+  assert.equal(account.created.length, 3);
+  assert.equal(new Set(account.created.map(({ name }) => name)).size, 3);
+  for (const { name } of account.created) assert.match(name, /^pr-42-copy-[0-9a-f]{24}-(?:source|idx00|idx01)$/);
+  assert.deepEqual(new Set(account.deleted.map(({ uuid }) => uuid)), new Set(account.created.map(({ uuid }) => uuid)));
 });

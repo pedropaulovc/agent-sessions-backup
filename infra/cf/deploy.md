@@ -72,12 +72,29 @@ The provisioner applies and verifies migrations separately against `DB`, `IDX00`
 before deployment, each with its own database-bound journal and matching source baseline.
 Only the main migration set has historical-baseline evidence; shard checksums start at migration
 1. The published schema and migration digests cover all three databases, not only main.
-Before deployment or fixture seeding, the provisioner also exercises the production copier's
-actual D1 REST batch adapter against `IDX00`. It proves a successful CREATE/INSERT/SELECT batch
-through independent readback, removes its uniquely owned probe table, then requires a native
-malformed-JSON SQL failure to roll back an entire second batch. Authentication/transport
+Before prices are seeded, the app is deployed, or fixtures are uploaded, the provisioner exercises
+the production copier's actual D1 REST batch adapter against `IDX00`. It requires a successful
+CREATE/INSERT/SELECT batch and independent readback, removes the uniquely owned probe table, then
+requires a native malformed-JSON SQL failure to roll back an entire second batch. Auth/transport
 failures, unexpected readback, or partial commits block deployment; only safe verified proof
 metadata is published, never provider SQL/error bodies or credentials.
+After all persistent migrations and this native batch-atomicity proof, provision must pass a
+native full-copy control before prices, app deployment, or fixture/session seeding. It creates
+three unique PR-owned scratch D1s: `pr-N-copy-<24hex>-source` and
+`pr-N-copy-<24hex>-{idx00,idx01}`. It applies every current `hub/migrations-index/` migration to
+the source and both scratch shards, then exercises the actual copier through native D1 REST using
+ordinary rows and a value larger than 1 MiB but smaller than 2,000,000 bytes to exercise the
+large-value fallback. Full-column SHA-256 readback must match the source exactly, preserving
+Unicode, a leading BOM, and embedded NUL bytes. FTS/MATCH must find tokens on both shards,
+including a token after an embedded NUL. The verified checkpoint must precede source-row
+retirement. Proof also requires an empty source, a complete checkpoint, the three-trigger frozen
+writer fence, and a controlled write that is positively rejected.
+Provision deletes every known created scratch database in `finally` on success or failure, still
+attempting the other owned deletions if one fails. Any deletion failure fails the job. Output is
+limited to static success, aggregate numeric/hash evidence, or static phase/class failures—never
+row IDs, private values, SQL, or raw provider response/body artifacts. This proves the copier's
+SQL/native protocol, not production D1 capacity or throughput, and makes no claim of a 1 MiB REST
+body cap. It is preview-only; the protected production CLI gate below is unchanged.
 Fixture prices are seeded in main before deployment; synthetic sessions still upload through
 the Worker's normal file API and are verified through search, never inserted directly into shards.
 
@@ -107,12 +124,16 @@ non-string owners. No alternate owner field is accepted. Native GET failures fai
 through the scoped client's existing error path rather than reporting empty evidence.
 
 **Free-account quota:** this account permits at most **10 D1 databases**. Each complete PR preview
-uses three, so at most three complete previews fit when no other databases exist. Provision
-counts every account database, reuses exact per-PR names, and refuses before creating any
-resource if the missing databases would exceed 10. It never deletes a different PR's resources
-to make room. Explicitly dispatch `Preview Close` for an unused preview (including an open PR's
-preview), or run `Preview Janitor` to remove closed-PR resources, then rerun CI. A deployment
-that already owns all three databases can reuse them at the quota limit.
+uses three persistent databases, so at most three fit in steady state when no other databases
+exist. The native copy control additionally needs three free account slots beyond all persistent
+and other account databases while its scratch D1s exist. It enumerates every account D1, verifies
+the three generated names are absent, and refuses before scratch creation if `account count + 3 > 10`;
+it never borrows a persistent database or deletes unrelated resources to make room. Persistent
+provisioning also counts every account database, reuses exact per-PR names, and refuses before
+creating any resource if the missing databases would exceed 10. Explicitly dispatch `Preview Close` for an
+unused preview (including an open PR's preview), or run `Preview Janitor` to remove closed-PR
+resources, then rerun CI. A deployment that already owns all three persistent databases can reuse
+them at the quota limit, but its native copy control still needs the three spare slots.
 
 There is no front door, no Cloudflare Access, and no blue/green generation machinery — the
 deploy IS the promote, so a broken push briefly breaks that PR's preview until the next one.
@@ -157,11 +178,13 @@ count/name/hash layout refuses reuse rather than changing placement in place. Ma
 dispatch `Preview Close` against the open PR, then rerun CI — the next `preview` job reprovisions
 main and both index shards empty.
 
-PR close and the scheduled janitor delete by deterministic name: close removes the
-`pr-<number>-*` set, including main and both shard databases (detaching only same-PR queue
-consumers, emptying R2 first); the janitor sweeps every resource of a closed PR plus any debris
-from the retired per-generation naming scheme. Resource kind and exact trusted names are
-checked before deletion; another PR's active shards are never quota-relief targets.
+PR close and the scheduled janitor delete only resources whose kind and trusted ownership match.
+`Preview Close` removes the requested PR's `pr-<number>-*` resources, including main and both
+shards (detaching only same-PR queue consumers and emptying R2 first). Native-copy scratch names
+have the distinct shape `pr-N-copy-<24hex>-{source,idx00,idx01}`; the owner classifier lets close
+recover scratch databases left by an interrupted control. The janitor sweeps scratch only for
+closed PRs, never for active runs, along with other resources of closed PRs and debris from the
+retired per-generation naming scheme. Another PR's active shards are never quota-relief targets.
 
 ### Credentials
 
@@ -462,10 +485,37 @@ evidence. A first/middle/last sample cannot establish the distribution of every 
 
 The client retries only an unambiguous HTTP 429 rejection with a valid `retry-after`
 delay. It never automatically replays a network error, malformed response, or 5xx
-whose execution outcome is unknown. Re-run the protected job after such failures or
-its 360-minute deadline; durable copy/seed checkpoints allow bounded continuations
-without re-exporting the database or discarding verified work. New attempts still
-reverify the deployed revision and repeat the queue/cron drain before source writes.
+whose execution outcome is unknown. Native/provider/transport failures remain terminal
+errors: inspect their evidence and durable state before approving any continuation,
+not an automatic retry.
+
+The protected copy invocation passes `--pass-budget-ms 18000000` (five hours).
+This positive safe integer millisecond argument is optional for `copy` only; other
+commands and clients have no pass budget. The clock starts after configuration,
+maintenance/drain, and atomicity prerequisites, before the copy's data reads. The
+request boundary checks before acquiring a permit, again after acquiring it, and
+before a valid 429 retry sleep. It stops if expired or if that sleep would reach the
+deadline. It never aborts or replays an in-flight request or native batch. The existing
+60-second request timeout and five-hour soft budget leave setup/drain/cleanup headroom
+within the job's 360-minute limit, rather than relying on a hard job kill mid-transaction.
+
+A budget stop emits exactly `{"status":"partial","reason":"pass-budget-exhausted"}`
+and exits **78**, leaving the job failed and production in maintenance with consumers
+detached. It does not mark the copy complete or acknowledge additional rows. Subsequent
+main migrations, catalog seeding, activation, and consumer restoration do not run.
+Only this distinct budget exception is partial; arbitrary native HTTP 400/code 7500,
+network failures, and other errors are not relabeled as budget stops.
+
+For that explicit partial result, rerun the **same protected main-push job at the same
+commit** using GitHub Actions' rerun control (or `gh run rerun <run-id> --failed`).
+There is no `workflow_dispatch`, automatic restart, or `continue-on-error`. Each rerun
+gets a fresh five-hour budget, revalidates the deployed revision, and repeats the
+queue/cron drain with the new run attempt before source writes. Durable pending copy
+state recovers both committed partial shard writes and a committed source
+compare/delete/freeze transaction whose `IDX00` acknowledgment was not yet sent;
+verified work is neither discarded nor blindly acknowledged. Repeat protected
+continuations until the normal complete proof authorizes the remaining steps.
+The budget is process-local, not a persisted global deadline.
 Native D1 batches must fit the
 [30-second batch limit](https://developers.cloudflare.com/d1/platform/limits/);
 a real provider failure remains fail-closed evidence, not permission to reduce fidelity.

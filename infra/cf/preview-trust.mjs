@@ -271,10 +271,19 @@ export function resourceNames(pr) {
   return Object.freeze(names);
 }
 
-/** Any `pr-N-…` resource name in the preview account, old or new naming scheme. */
+/** Stable persistent per-PR names; scratch probes have a separate exact classifier. */
 export const PREVIEW_RESOURCE_RE = /^pr-([1-9][0-9]*)-(app|sessions-index(?:-idx0[01])?|agent-sessions|sessions-hub-kv|parse|parse-dlq|session-rollup)$/;
 /** The retired blue/green generation naming scheme — always deletable debris. */
 export const LEGACY_GENERATION_RE = /^pr-([1-9][0-9]*)-g[1-9][0-9]*-[0-9a-f]{12}-/;
+
+/** Native-copy controls are disposable, not persistent previews or retired generations. */
+export const PREVIEW_COPY_SCRATCH_RE = /^pr-([1-9][0-9]*)-copy-[0-9a-f]{24}-(source|idx00|idx01)$/;
+
+export function previewCopyScratchNames(pr, nonce) {
+  if (!/^[0-9a-f]{24}$/.test(nonce ?? '')) fail('native copy scratch nonce must be 24 lowercase hexadecimal characters');
+  const prefix = `pr-${positiveInteger(pr, 'PR number')}-copy-${nonce}-`;
+  return ['source', 'idx00', 'idx01'].map((role) => `${prefix}${role}`);
+}
 
 /** Persisted layout identity excludes IDs so an intentional full reset keeps the same layout. */
 export function previewIndexLayout(names) {
@@ -514,11 +523,17 @@ export async function assertContainedRegularFile(root, candidate, label) {
 }
 
 /**
- * Classify an account resource name for cleanup. Returns null for names the preview
- * control plane does not own (never touched), otherwise `{ pr, legacy }`.
+ * Classify exact account names for cleanup; scratch ownership never implies that an
+ * active PR's probe is stale. Close and the closed-PR janitor recover interrupted probes.
  */
 export function previewResourceOwner(name, kind) {
   if (typeof name !== 'string') return null;
+  const scratch = PREVIEW_COPY_SCRATCH_RE.exec(name);
+  if (scratch) {
+    const ownerPr = Number(scratch[1]);
+    return Number.isSafeInteger(ownerPr) && (kind === undefined || kind === 'd1')
+      ? { pr: ownerPr, legacy: false, scope: 'copy-probe' } : null;
+  }
   const legacy = LEGACY_GENERATION_RE.exec(name);
   const current = PREVIEW_RESOURCE_RE.exec(name);
   if (!legacy && !current) return null;
@@ -532,7 +547,7 @@ export function previewResourceOwner(name, kind) {
   if (!resourceKind || (kind !== undefined && resourceKind !== kind)) return null;
   const ownerPr = Number((legacy ?? current)[1]);
   if (!Number.isSafeInteger(ownerPr)) return null;
-  return { pr: ownerPr, legacy: legacy !== null };
+  return { pr: ownerPr, legacy: legacy !== null, scope: 'preview' };
 }
 
 export function queueConsumerIdsForQueue(consumers, queueName) {

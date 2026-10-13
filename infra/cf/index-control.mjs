@@ -25,9 +25,38 @@ const providerCodes = (errors) => (Array.isArray(errors) ? errors : [])
   .map((error) => error?.code).filter((code) => Number.isSafeInteger(code) && code >= 0);
 const publicDatabaseId = (id) => typeof id === 'string'
   && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id) ? id : 'unknown';
-const RESPONSE_STATUS = Symbol('response-status');
 const nativeReasons = new Set(['malformed-json', 'capacity', 'sql-syntax', 'missing-schema', 'limits',
-  'type-error', 'quota', 'transient-reset', 'storage-timeout', 'overloaded', 'memory-limit', 'cpu-limit', 'other']);
+  'type-error', 'quota', 'transient-reset', 'storage-timeout', 'overloaded', 'memory-limit', 'cpu-limit', 'writer-fence', 'other']);
+
+export class CopyPassBudgetExhausted extends Error {
+  constructor() {
+    super('copy pass request budget exhausted');
+    this.name = 'CopyPassBudgetExhausted';
+  }
+}
+
+/** Soft boundary only: never cancel an in-flight request or native transaction. */
+export function createCopyPassRequestGate(budgetMs, { now = Date.now } = {}) {
+  if (!Number.isSafeInteger(budgetMs) || budgetMs <= 0) {
+    throw new Error('--pass-budget-ms must be a positive safe integer number of milliseconds');
+  }
+  const startedAt = now();
+  return (delayMs = 0) => {
+    const remaining = budgetMs - (now() - startedAt);
+    if (remaining <= 0 || delayMs >= remaining) throw new CopyPassBudgetExhausted();
+  };
+}
+
+/** Only the explicit boundary exception is a resumable partial pass. */
+export async function runCopyPass({ source, shards, gate }) {
+  try {
+    const copied = await copyFrozenIndex({ source, shards, gate });
+    return { copiedRows: copied.rows, state: copied.state, sha256: copied.sha256 };
+  } catch (error) {
+    if (!(error instanceof CopyPassBudgetExhausted)) throw error;
+    return { status: 'partial', reason: 'pass-budget-exhausted' };
+  }
+}
 
 export function requireProtectedProduction(env = process.env) {
   if (env.GITHUB_ACTIONS !== 'true' || env.GITHUB_EVENT_NAME !== 'push'
@@ -51,17 +80,20 @@ export function cloudflareRetryDelay(response) {
   return seconds * 1000;
 }
 
-export function indexControlClient(accountId, token, { permit = sharedCloudflareApiPermit, wait = sleep } = {}) {
+export function indexControlClient(accountId, token, { permit = sharedCloudflareApiPermit, wait = sleep, requestGate } = {}) {
   if (accountId === PRODUCTION_ACCOUNT_ID) requireProtectedProduction();
   else if (accountId !== PREVIEW_ACCOUNT_ID) throw new Error('index control account must be production or preview');
   if (!token) throw new Error('CLOUDFLARE_API_TOKEN is required');
+  const responseStatuses = new WeakMap();
   const cf = async (pathname, init = {}) => {
     const { responseFormat = 'result', ...request } = init;
     if (responseFormat !== 'result' && responseFormat !== 'envelope') {
       throw new Error('Cloudflare response format must be result or envelope');
     }
     for (;;) {
+      if (requestGate) requestGate();
       await permit();
+      if (requestGate) requestGate();
       const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/${pathname}`, {
         ...request, redirect: 'error', signal: AbortSignal.timeout(60000),
         headers: { authorization: `Bearer ${token}`, accept: 'application/json',
@@ -72,6 +104,7 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
         // A 429 rejected the operation before execution. Replay only that unambiguous
         // rejection; network errors and 5xx leave recovery to durable checkpoints.
         await response.body?.cancel();
+        if (requestGate) requestGate(delay);
         await wait(delay);
         continue;
       }
@@ -94,7 +127,7 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
         }
         throw error;
       }
-      if (responseFormat === 'envelope') envelope[RESPONSE_STATUS] = response.status;
+      if (responseFormat === 'envelope') responseStatuses.set(envelope, response.status);
       return responseFormat === 'envelope' ? envelope : envelope.result;
     }
   };
@@ -115,16 +148,17 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
             const error = new Error('D1 statement rejection');
             error.d1SqlReason = d1SqlFailureReason(failures);
             error.providerCodes = providerCodes([...failures, ...(Array.isArray(envelope.errors) ? envelope.errors : [])]);
-            error.providerStatus = envelope[RESPONSE_STATUS];
+            error.providerStatus = responseStatuses.get(envelope);
             throw error;
           }
           if (kind === 'query' && (results.length !== 1 || !Array.isArray(results[0]?.results))) {
             const error = new Error('D1 query returned an unexpected result shape');
-            error.providerStatus = envelope[RESPONSE_STATUS];
+            error.providerStatus = responseStatuses.get(envelope);
             throw error;
           }
           return results;
         } catch (error) {
+          if (error instanceof CopyPassBudgetExhausted) throw error;
           // Replace transport/provider messages too: they may contain URLs, SQL or data.
           const reason = nativeReasons.has(error?.d1SqlReason) ? error.d1SqlReason : 'other';
           const codes = Array.isArray(error?.providerCodes) ? providerCodes(error.providerCodes.map((code) => ({ code }))) : [];
@@ -378,7 +412,12 @@ export async function verifyActiveIndex({ source, shards, revision, cycle, gate,
 
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
-  const args = parseArgs(rest, new Set(['target', 'config', 'output', 'active-output', 'revision', 'mode', 'github-output']));
+  const args = parseArgs(rest, new Set(['target', 'config', 'output', 'active-output', 'revision', 'mode', 'github-output', 'pass-budget-ms']));
+  if (args['pass-budget-ms'] !== undefined && (command !== 'copy'
+    || !/^[0-9]+$/.test(args['pass-budget-ms'])
+    || !Number.isSafeInteger(Number(args['pass-budget-ms'])) || Number(args['pass-budget-ms']) <= 0)) {
+    throw new Error('--pass-budget-ms requires copy and a positive safe integer number of milliseconds');
+  }
   const target = args.target ?? 'production';
   if (!['production', 'preview'].includes(target)) throw new Error('target must be production or preview');
   if (target === 'production') requireProtectedProduction();
@@ -488,8 +527,18 @@ async function main() {
       || !Number.isSafeInteger(atomicity.verifiedAt) || atomicity.verifiedAt <= 0 || atomicity.verifiedAt > Date.now()) {
       throw new Error('this deployment has no verified native D1 REST batch atomicity/text transport control; source copy forbidden');
     }
-    const copied = await copyFrozenIndex({ source, shards, gate });
-    console.log(JSON.stringify({ copiedRows: copied.rows, state: copied.state, sha256: copied.sha256 }));
+    // Setup/drain/atomicity prerequisites use the unbudgeted client. Only this copy
+    // process's data requests receive a fresh, non-persisted pass boundary.
+    const copyApi = args['pass-budget-ms'] === undefined ? api
+      : indexControlClient(account, process.env.CLOUDFLARE_API_TOKEN, {
+        requestGate: createCopyPassRequestGate(Number(args['pass-budget-ms'])),
+      });
+    const result = await runCopyPass({
+      source: copyApi.db(config.d1_databases[0].database_id),
+      shards: config.d1_databases.slice(1).map((db) => copyApi.db(db.database_id)), gate,
+    });
+    console.log(JSON.stringify(result));
+    if (result.status === 'partial') process.exitCode = 78;
   } else if (command === 'seed-catalog') {
     const seeded = await seedFrozenCatalog({ source, shards, gate });
     console.log(JSON.stringify({ catalogRows: seeded.rows, state: seeded.state }));

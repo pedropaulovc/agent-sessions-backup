@@ -19,6 +19,7 @@ import {
   paginatedList,
   previewBearerToken,
   previewDatabasePlan,
+  previewCopyScratchNames,
   previewIndexLayout,
   previewResourceOwner,
   queueConsumerIdsForQueue,
@@ -93,24 +94,59 @@ describe('stable per-PR resource names', () => {
   });
 
   it('classifies resource ownership for cleanup, including legacy generation debris', () => {
-    expect(previewResourceOwner('pr-42-sessions-index')).toEqual({ pr: 42, legacy: false });
+    expect(previewResourceOwner('pr-42-sessions-index')).toEqual({ pr: 42, legacy: false, scope: 'preview' });
     for (const name of resourceNames(42).indexShards) {
-      expect(previewResourceOwner(name, 'd1')).toEqual({ pr: 42, legacy: false });
+      expect(previewResourceOwner(name, 'd1')).toEqual({ pr: 42, legacy: false, scope: 'preview' });
       expect(previewResourceOwner(name, 'worker')).toBeNull();
     }
     expect(previewResourceOwner('pr-42-sessions-index-idx02')).toBeNull();
     expect(previewResourceOwner('pr-42-sessions-index-idx01-extra')).toBeNull();
     expect(previewResourceOwner('pr-42-app', 'd1')).toBeNull();
     expect(previewResourceOwner(`pr-17-g12345-${'a'.repeat(12)}-foreign`)).toBeNull();
-    expect(previewResourceOwner('pr-42-app')).toEqual({ pr: 42, legacy: false });
-    expect(previewResourceOwner(`pr-17-g12345-${'a'.repeat(12)}-app`)).toEqual({ pr: 17, legacy: true });
+    expect(previewResourceOwner('pr-42-app')).toEqual({ pr: 42, legacy: false, scope: 'preview' });
+    expect(previewResourceOwner(`pr-17-g12345-${'a'.repeat(12)}-app`)).toEqual({ pr: 17, legacy: true, scope: 'preview' });
     expect(previewResourceOwner('sessions-index')).toBeNull();
     expect(previewResourceOwner('pr-42-something-else')).toBeNull();
     expect(previewResourceOwner('prefix-pr-42-app')).toBeNull();
   });
 
+  it('names and owns only the exact three nonce-scoped D1 copy scratch databases', () => {
+    const nonce = '0123456789abcdef01234567';
+    const names = previewCopyScratchNames(42, nonce);
+    expect(names).toEqual([
+      `pr-42-copy-${nonce}-source`,
+      `pr-42-copy-${nonce}-idx00`,
+      `pr-42-copy-${nonce}-idx01`,
+    ]);
+    expect(new Set(names).size).toBe(3);
+    for (const name of names) {
+      expect(previewResourceOwner(name, 'd1')).toEqual({ pr: 42, legacy: false, scope: 'copy-probe' });
+      for (const kind of ['worker', 'queue', 'r2', 'kv']) {
+        expect(previewResourceOwner(name, kind)).toBeNull();
+      }
+    }
+    for (const name of [
+      `pr-0-copy-${nonce}-source`,
+      `pr-042-copy-${nonce}-source`,
+      `prefix-pr-42-copy-${nonce}-source`,
+      `pr-42-copy-${nonce}-source-extra`,
+      `pr-42-copy-${nonce}-idx02`,
+      `pr-42-copy-${nonce}-foreign`,
+      `pr-42-copy-${nonce.slice(1)}-source`,
+      `pr-42-copy-${nonce}0-source`,
+      `pr-42-copy-${nonce.toUpperCase()}-source`,
+      `pr-42-copy-${'g'.repeat(24)}-source`,
+    ]) {
+      expect(previewResourceOwner(name, 'd1')).toBeNull();
+    }
+    expect(() => previewCopyScratchNames(0, nonce)).toThrow();
+    for (const invalidNonce of ['', nonce.slice(1), `${nonce}0`, nonce.toUpperCase(), 'g'.repeat(24)]) {
+      expect(() => previewCopyScratchNames(42, invalidNonce)).toThrow();
+    }
+  });
+
   it('owns per-PR rollup queues without claiming standing or production queues for cleanup', () => {
-    expect(previewResourceOwner(resourceNames(42).rollupQueue)).toEqual({ pr: 42, legacy: false });
+    expect(previewResourceOwner(resourceNames(42).rollupQueue)).toEqual({ pr: 42, legacy: false, scope: 'preview' });
     for (const name of ['session-rollup', 'session-rollup-preview', 'pr-42-session-rollup-preview', 'pr-0-session-rollup']) {
       expect(previewResourceOwner(name)).toBeNull();
     }

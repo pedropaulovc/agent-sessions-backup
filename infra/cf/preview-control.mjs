@@ -39,6 +39,7 @@ import {
 import { deactivatePreviewDeployments } from './preview-deployment.mjs';
 import { indexControlClient, queueConsumerIdentityFacts } from './index-control.mjs';
 import { verifyD1BatchAtomicity } from './d1-batch-atomicity.mjs';
+import { verifyNativeCopyControl } from './native-copy-control.mjs';
 import { migrationDigest } from '../../hub/scripts/lib/migration-manifest.mjs';
 import { SYNTHETIC_EXPECTATIONS, fixtureModelPriceSql } from '../../hub/scripts/lib/dev-seed.mjs';
 import {
@@ -682,6 +683,43 @@ async function provision() {
     const indexBatchAtomicity = await verifyD1BatchAtomicity(
       indexControlClient(PREVIEW_ACCOUNT_ID, previewToken).db(resources.indexShards[0]),
     );
+    // Isolated source+destinations only: the real copier deletes/fences its source.
+    // Apply the entire actual index migration tree to all three; no legacy main
+    // prefix or catalog/layout initialization is needed for the copy protocol.
+    const indexNativeCopy = await verifyNativeCopyControl({
+      api: indexControlClient(PREVIEW_ACCOUNT_ID, previewToken),
+      pr,
+      applySchema: async ({ identities }) => {
+        const configPath = path.join(temporary, 'wrangler.native-copy.generated.json');
+        const bindings = ['DB', 'IDX00', 'IDX01'];
+        await writeCanonicalJson(configPath, {
+          name: names.app,
+          account_id: PREVIEW_ACCOUNT_ID,
+          compatibility_date: '2026-07-01',
+          d1_databases: identities.map(({ name, id }, index) => ({
+            binding: bindings[index], database_name: name, database_id: id,
+            migrations_dir: indexMigrations.directory,
+          })),
+        });
+        for (const [index, { id }] of identities.entries()) {
+          const binding = bindings[index];
+          const migration = runJson(path.resolve(args['migrations-cli']), [
+            'apply', '--target', 'preview', '--config', configPath, '--database', binding,
+            '--database-id', id,
+            '--journal', path.join(temporary, `native-copy-${binding}.migrations.json`),
+            '--artifact-digest', build.artifactDigest,
+            '--deployment-id', `pr-${pr}-${sha.slice(0, 12)}-native-copy-${binding}`,
+            '--migrations-dir', indexMigrations.directory,
+            '--manifest', indexMigrations.manifestPath,
+            '--base-manifest', path.join(indexMigrations.directory, 'source-baseline.json'),
+          ], hubRoot);
+          if (migration.pendingMigrations !== 0 || migration.migrationDigest !== indexMigrations.digest
+            || !/^[0-9a-f]{64}$/.test(migration.schemaDigest ?? '')) {
+            fail('native copy schema migration proof failed');
+          }
+        }
+      },
+    });
 
     // Fixture prices, before the app is deployed and long before `seed` uploads any session: the
     // ingest-time pricing hook prices a session's usage rows as it parses them, so the catalog
@@ -717,6 +755,7 @@ async function provision() {
       artifactDigest: build.artifactDigest,
       schemaDigest,
       indexBatchAtomicity,
+      indexNativeCopy,
       schemaDigests,
     };
     if (args['github-output']) {
@@ -1077,7 +1116,7 @@ async function listOwnedResources() {
 
 async function deleteOwnedResource(item) {
   const owner = previewResourceOwner(item.name, item.kind);
-  if (!owner || owner.pr !== item.pr || owner.legacy !== item.legacy || !item.id) {
+  if (!owner || owner.pr !== item.pr || owner.legacy !== item.legacy || owner.scope !== item.scope || !item.id) {
     fail('refusing cleanup of an untrusted preview resource');
   }
   if (item.kind === 'queue') {
@@ -1106,10 +1145,10 @@ async function closePreview() {
   requireCloudflareEnvironment();
   const names = resourceNames(pr);
   const deleted = await deleteResourceSet(pr, names);
-  // Also sweep any retired per-generation debris this PR left behind.
-  const legacy = (await listOwnedResources()).filter((item) => item.pr === pr && item.legacy);
-  legacy.sort((a, b) => CLEANUP_ORDER[a.kind] - CLEANUP_ORDER[b.kind]);
-  for (const item of await deleteInDependencyPasses(legacy, deleteOwnedResource)) {
+  // Recover retired generations and this closed PR's interrupted native probes.
+  const debris = (await listOwnedResources()).filter((item) => item.pr === pr && (item.legacy || item.scope === 'copy-probe'));
+  debris.sort((a, b) => CLEANUP_ORDER[a.kind] - CLEANUP_ORDER[b.kind]);
+  for (const item of await deleteInDependencyPasses(debris, deleteOwnedResource)) {
     deleted.push({ kind: item.kind, name: item.name, pr });
   }
   process.stdout.write(`${stableJson({ closed: pr, deleted })}\n`);
@@ -1119,6 +1158,8 @@ async function closePreview() {
  * Daily sweep. Deletes (a) every resource of a CLOSED PR — covering closes the close
  * workflow missed or raced — and (b) all retired per-generation debris regardless of PR
  * state, since the current control plane never creates that shape.
+ * Scratch probes are recoverable closed-PR resources, never always-deletable legacy
+ * debris: an open PR's probe may still be running.
  */
 async function janitor() {
   requireCloudflareEnvironment();
