@@ -337,12 +337,13 @@ test('real client pagination preserves the inventory boundary used by scratch qu
           result_info: { page, per_page: 100, total_count: 101, total_pages: 2 },
         });
       });
+      // A native HTTP rejection never produced an inventory envelope to classify.
+      const expectedClass = { quota: 'quota', collision: 'ownership', 'not-found': 'other' }[scenario] ?? 'shape';
       await assert.rejects(runWithClock(clock, withScratchD1Databases({
         api, pr: 150, nonce, run: async () => assert.fail('refused inventory must not enter the native control'),
       })), (error) => {
         assert.equal(error.nativeCopyPhase, 'preflight');
-        assert.equal(error.nativeCopyClass, scenario === 'quota' ? 'quota'
-          : scenario === 'collision' ? 'ownership' : 'shape');
+        assert.equal(error.nativeCopyClass, expectedClass);
         return true;
       });
       assert.deepEqual(requests, ['empty-shape', 'not-found'].includes(scenario)
