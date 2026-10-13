@@ -234,6 +234,10 @@ async function health(config, mode) {
 export function queueConsumerIdentityFacts(consumer) {
   const workerName = (value) => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,63}$/.test(value)
     ? value : null;
+  const recognizedKeys = new Set([
+    'script', 'dead_letter_queue', 'settings', 'type', 'queue_name', 'queue_id', 'consumer_id', 'created_on',
+  ]);
+  const propertyKeys = consumer !== null && typeof consumer === 'object' ? Object.keys(consumer) : [];
   return {
     recordKind: consumer === null ? 'null' : Array.isArray(consumer) ? 'array' : typeof consumer,
     consumer_id: { type: typeof consumer?.consumer_id },
@@ -242,7 +246,8 @@ export function queueConsumerIdentityFacts(consumer) {
       ...(typeof consumer?.type === 'string'
         ? { value: consumer.type === 'worker' || consumer.type === 'http_pull' ? consumer.type : null } : {}),
     },
-    ownPropertyKeys: consumer !== null && typeof consumer === 'object' ? Object.keys(consumer) : [],
+    recognizedPropertyKeys: propertyKeys.filter((key) => recognizedKeys.has(key)),
+    unknownPropertyKeyCount: propertyKeys.filter((key) => !recognizedKeys.has(key)).length,
     script: { type: typeof consumer?.script, workerName: workerName(consumer?.script) },
   };
 }
@@ -250,7 +255,7 @@ export function queueConsumerIdentityFacts(consumer) {
 export async function pauseConsumers(api, config) {
   const queues = await paginatedList(api.cf, 'queues', { pagination: 'page', rowsOf: (envelope) => envelope.result });
   const queueNames = [...new Set(config.queues?.consumers?.map((queue) => queue.queue) ?? [])];
-  let paused = 0;
+  const validatedConsumers = [];
   for (const name of queueNames) {
     const queue = queues.find((item) => item.queue_name === name);
     if (!queue) throw new Error(`production queue ${name} is missing`);
@@ -261,11 +266,13 @@ export async function pauseConsumers(api, config) {
         throw new Error(`unexpected consumer on production queue ${name}; refusing to pause another owner; `
           + JSON.stringify({ expectedWorker: config.name, consumer: queueConsumerIdentityFacts(consumer) }));
       }
-      await api.cf(`queues/${queue.queue_id}/consumers/${consumer.consumer_id}`, { method: 'DELETE' });
-      paused += 1;
+      validatedConsumers.push({ queueId: queue.queue_id, consumerId: consumer.consumer_id });
     }
   }
-  return { pausedConsumers: paused };
+  for (const { queueId, consumerId } of validatedConsumers) {
+    await api.cf(`queues/${queueId}/consumers/${consumerId}`, { method: 'DELETE' });
+  }
+  return { pausedConsumers: validatedConsumers.length };
 }
 
 /** Persist readiness only after the actual frozen data and final outbox checks pass. */

@@ -305,7 +305,8 @@ describe('queue consumer detachment', () => {
       { consumer_id: 'c2', type: 'worker', script: `pr-42-g99-${'b'.repeat(12)}-app` },
     ], 'pr-42-parse')).toEqual(['c1', 'c2']);
     expect(queueConsumerIdsForQueue([
-      { consumer_id: 'canonical-owner', type: 'worker', script: 'pr-42-app', script_name: 'pr-43-app' },
+      { consumer_id: 'canonical-owner', type: 'worker', script: 'pr-42-app', script_name: 'pr-43-app',
+        ['PRIVATE PROPERTY KEY accepted preview consumer canary']: 'harmless extra metadata' },
     ], 'pr-42-parse')).toEqual(['canonical-owner']);
   });
 
@@ -353,6 +354,7 @@ describe('queue consumer detachment', () => {
       owner: 'private invalid owner/value',
       type: 'private malformed type/value',
       alias: 'private invalid alias/value',
+      propertyKey: 'PRIVATE PROPERTY KEY preview rejection canary',
     };
     for (const identity of [
       { type: 'worker', script: privateValues.owner },
@@ -363,6 +365,7 @@ describe('queue consumer detachment', () => {
         queueConsumerIdsForQueue([{
           consumer_id: privateValues.consumerId, ...identity, script_name: privateValues.alias,
           settings: { retry: privateValues.settings }, auth: { bearer: privateValues.auth },
+          [privateValues.propertyKey]: privateValues.auth,
         }], 'pr-42-parse');
       } catch (error) {
         rejection = error;

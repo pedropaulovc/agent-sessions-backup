@@ -2230,14 +2230,16 @@ test('reseed and actual controller phases refuse corrupt or foreign proofs witho
 
 async function queueControlFixture(context, consumerRows = [
   { consumer_id: 'owned-consumer', type: 'worker', script: 'pause-worker' },
-]) {
+], additionalQueues = []) {
   const queues = [
     { queue_id: 'consumer-id', queue_name: 'consumer-only' },
     { queue_id: 'producer-id', queue_name: 'producer-only' },
+    ...additionalQueues.map(({ queue_id, queue_name }) => ({ queue_id, queue_name })),
   ];
   const consumers = new Map([
     ['consumer-id', consumerRows],
     ['producer-id', [{ consumer_id: 'producer-consumer', type: 'worker', script: 'producer-worker' }]],
+    ...additionalQueues.map(({ queue_id, consumers: rows }) => [queue_id, rows]),
   ]);
   const requests = [];
   const server = createServer((request, response) => {
@@ -2300,6 +2302,59 @@ test('actual queue pause uses native intended consumers only and rejects invalid
     assert.deepEqual(f.requests.filter(({ method }) => method === 'DELETE'),
       [{ method: 'DELETE', path: '/queues/consumer-id/consumers/owned-consumer' }]);
   });
+  await context.test('all-owned multi-target pause deletes both consumers and preserves producer-only state', async (child) => {
+    const f = await queueControlFixture(child, [
+      { consumer_id: 'first-owned', type: 'worker', script: config.name, harmless_extra: 'ignored metadata' },
+    ], [{
+      queue_id: 'last-id', queue_name: 'last-target',
+      consumers: [{ consumer_id: 'last-owned', script: config.name }],
+    }]);
+    const producerBefore = structuredClone(f.consumers.get('producer-id'));
+    const targets = { ...config, queues: { ...config.queues,
+      consumers: [...config.queues.consumers, { queue: 'last-target' }, { queue: 'last-target' }],
+    } };
+    assert.deepEqual(await consumerControl.pauseConsumers(f.api, targets), { pausedConsumers: 2 });
+    assert.deepEqual([...f.consumers], [
+      ['consumer-id', []], ['producer-id', producerBefore], ['last-id', []],
+    ]);
+    assert.deepEqual(f.requests.filter(({ method }) => method === 'DELETE'), [
+      { method: 'DELETE', path: '/queues/consumer-id/consumers/first-owned' },
+      { method: 'DELETE', path: '/queues/last-id/consumers/last-owned' },
+    ]);
+  });
+  for (const [name, laterConsumer] of [
+    ['foreign owner', { consumer_id: 'foreign-consumer', type: 'worker', script: 'other-worker' }],
+    ['non-worker type', { consumer_id: 'invalid-consumer', type: 'http_pull', script: config.name }],
+    ['invalid consumer ID', { consumer_id: 42, type: 'worker', script: config.name }],
+  ]) {
+    for (const location of ['same target after owned consumer', 'last configured target']) {
+      await context.test(`${name} on ${location} rejects the whole pause without DELETE`, async (child) => {
+        const owned = { consumer_id: 'first-owned', type: 'worker', script: config.name };
+        const sameTarget = location === 'same target after owned consumer';
+        const f = await queueControlFixture(child, sameTarget ? [owned, laterConsumer] : [owned],
+          sameTarget ? [] : [{
+            queue_id: 'last-id', queue_name: 'last-target', consumers: [laterConsumer],
+          }]);
+        const targets = { ...config, queues: { ...config.queues,
+          consumers: sameTarget ? config.queues.consumers : [...config.queues.consumers, { queue: 'last-target' }],
+        } };
+        const before = structuredClone([...f.consumers]);
+        await assert.rejects(consumerControl.pauseConsumers(f.api, targets));
+        assert.deepEqual(f.requests.filter(({ method }) => method === 'DELETE'), []);
+        assert.deepEqual([...f.consumers], before);
+      });
+    }
+  }
+  await context.test('missing last configured queue rejects the whole pause without DELETE', async (child) => {
+    const f = await queueControlFixture(child);
+    const targets = { ...config, queues: { ...config.queues,
+      consumers: [...config.queues.consumers, { queue: 'missing-target' }],
+    } };
+    const before = structuredClone([...f.consumers]);
+    await assert.rejects(consumerControl.pauseConsumers(f.api, targets));
+    assert.deepEqual(f.requests.filter(({ method }) => method === 'DELETE'), []);
+    assert.deepEqual([...f.consumers], before);
+  });
   for (const [name, consumer] of [
     ['wrong Worker owner', { consumer_id: 'owned-consumer', type: 'worker', script: 'other-worker', script_name: config.name }],
     ['missing canonical owner despite an owned alias', { consumer_id: 'owned-consumer', type: 'worker', script_name: config.name }],
@@ -2326,10 +2381,12 @@ test('actual queue pause uses native intended consumers only and rejects invalid
       owner: 'private invalid owner/value',
       type: 'private malformed type/value',
       alias: 'private invalid alias/value',
+      propertyKey: 'PRIVATE PROPERTY KEY production consumer canary',
     };
     const f = await queueControlFixture(child, [{
       consumer_id: privateValues.consumerId, type: privateValues.type, script: privateValues.owner,
       script_name: privateValues.alias, settings: { retry: privateValues.settings }, auth: { bearer: privateValues.auth },
+      [privateValues.propertyKey]: privateValues.auth,
     }]);
     const before = structuredClone([...f.consumers]);
     await assert.rejects(consumerControl.pauseConsumers(f.api, config), (error) => {

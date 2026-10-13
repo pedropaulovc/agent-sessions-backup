@@ -658,6 +658,7 @@ test('native queue rejection diagnostics redact settings, auth, consumer IDs and
     owner: 'private invalid owner/value',
     type: 'private malformed type/value',
     alias: 'private invalid alias/value',
+    propertyKey: 'PRIVATE PROPERTY KEY preview rejection canary',
   };
   for (const identity of [
     { type: 'worker', script: privateValues.owner },
@@ -668,6 +669,7 @@ test('native queue rejection diagnostics redact settings, auth, consumer IDs and
       queueConsumers: { 'queue-2': [{
         consumer_id: privateValues.consumerId, ...identity, script_name: privateValues.alias,
         settings: { retry: privateValues.settings }, auth: { bearer: privateValues.auth },
+        [privateValues.propertyKey]: privateValues.auth,
       }] },
     });
     assert.notEqual(result.status, 0, result.output);
@@ -676,6 +678,31 @@ test('native queue rejection diagnostics redact settings, auth, consumer IDs and
     }
     assert.equal(mutations(result).length, 0);
     assert.ok(!result.events.some((event) => event.kind === 'migrate' || event.kind === 'deploy'));
+  }
+});
+
+test('successful provision receipts redact private property names and values without refusing owned consumers', async () => {
+  const privateValues = {
+    propertyKey: 'PRIVATE PROPERTY KEY preview receipt canary',
+    settings: 'private-receipt-settings-value',
+    auth: 'private-receipt-auth-value',
+    consumerId: 'private-receipt-consumer-id',
+    unknownValue: 'private-receipt-unknown-value',
+  };
+  const result = await runController('provision', {
+    queueConsumers: { 'queue-0': [{
+      consumer_id: privateValues.consumerId, type: 'worker', script: NAMES.app,
+      settings: { retry: privateValues.settings }, auth: { bearer: privateValues.auth },
+      [privateValues.propertyKey]: privateValues.unknownValue,
+    }] },
+  });
+  assert.equal(result.status, 0, result.output);
+  const receipt = result.stdout.trim().split('\n').map((line) => JSON.parse(line))
+    .find((line) => line.queueConsumerIdentityReceipt)?.queueConsumerIdentityReceipt;
+  assert.ok(receipt, 'successful provision must publish its native consumer receipt');
+  assert.equal(receipt.expectedWorker, NAMES.app);
+  for (const value of Object.values(privateValues)) {
+    assert.ok(!result.output.includes(value), 'provision output must not disclose private response keys or values');
   }
 });
 
