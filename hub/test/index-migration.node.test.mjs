@@ -1662,44 +1662,48 @@ test('the committed SQL barrier rejects pre-existing source writers after CI abo
   let staleInsert;
   let staleUpdate;
   let staleDelete;
-  const { f, rows, saved } = await frozenFirstPageFixture(context, (current) => {
-    // Prepare the old invocation's statements BEFORE the copier installs its trigger schema.
-    // SQLite must invalidate/reprepare them so a long-lived HTTP invocation cannot commit later.
-    staleDatabase = new DatabaseSync(current.source.filename);
-    staleInsert = staleDatabase.prepare(`INSERT INTO blocks (${BLOCK_COLUMNS.map(quoted).join(',')})
-      VALUES (${BLOCK_COLUMNS.map(() => '?').join(',')})`);
-    staleUpdate = staleDatabase.prepare('UPDATE blocks SET text = ? WHERE id = ?');
-    staleDelete = staleDatabase.prepare('DELETE FROM blocks WHERE id = ?');
-    context.after(() => staleDatabase.close());
-  });
-  const remaining = rows.slice(saved.rows);
-  const attempted = block(999, 0, { text: 'old_invocation_new_unverified_text' });
-  const assertOldWritesBlocked = () => {
+  try {
+    const { f, rows, saved } = await frozenFirstPageFixture(context, (current) => {
+      // Prepare the old invocation's statements BEFORE the copier installs its trigger schema.
+      // SQLite must invalidate/reprepare them so a long-lived HTTP invocation cannot commit later.
+      staleDatabase = new DatabaseSync(current.source.filename);
+      staleInsert = staleDatabase.prepare(`INSERT INTO blocks (${BLOCK_COLUMNS.map(quoted).join(',')})
+        VALUES (${BLOCK_COLUMNS.map(() => '?').join(',')})`);
+      staleUpdate = staleDatabase.prepare('UPDATE blocks SET text = ? WHERE id = ?');
+      staleDelete = staleDatabase.prepare('DELETE FROM blocks WHERE id = ?');
+    });
+    const remaining = rows.slice(saved.rows);
+    const attempted = block(999, 0, { text: 'old_invocation_new_unverified_text' });
+    const assertOldWritesBlocked = () => {
+      assert.throws(() => staleInsert.run(...BLOCK_COLUMNS.map((column) => attempted[column])), /index_migration_frozen/);
+      assert.throws(() => staleUpdate.run('old invocation replacement', remaining[0].id), /index_migration_frozen/);
+      assert.throws(() => staleDelete.run(remaining[0].id), /index_migration_frozen/);
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), remaining);
+    };
+    assertOldWritesBlocked();
+    f.restart();
+    assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), saved);
+    assertOldWritesBlocked();
+    assertVerifiedBeforeDelete(f);
+    let observedCopyingTransaction = false;
+    f.source.afterStatement = ({ sql }) => {
+      if (/^\s*UPDATE\s+index_migration_freeze\b.*'copying'/is.test(sql)) {
+        observedCopyingTransaction = true;
+        assert.deepEqual(plainRows(staleDatabase, `SELECT * FROM ${SOURCE_FREEZE_TABLE}`),
+          [{ id: 1, state: 'frozen' }], 'an old connection must never observe a committed copying/unfrozen state');
+      }
+    };
+    const result = await copyFrozenIndex(f.args());
+    assert.equal(result.state, 'complete');
+    assert.equal(result.rows, rows.length);
+    assert.equal(observedCopyingTransaction, true);
+    assertCopied(f, rows);
+    assert.deepEqual(f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
     assert.throws(() => staleInsert.run(...BLOCK_COLUMNS.map((column) => attempted[column])), /index_migration_frozen/);
-    assert.throws(() => staleUpdate.run('old invocation replacement', remaining[0].id), /index_migration_frozen/);
-    assert.throws(() => staleDelete.run(remaining[0].id), /index_migration_frozen/);
-    assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), remaining);
-  };
-  assertOldWritesBlocked();
-  f.restart();
-  assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), saved);
-  assertOldWritesBlocked();
-  assertVerifiedBeforeDelete(f);
-  let observedCopyingTransaction = false;
-  f.source.afterStatement = ({ sql }) => {
-    if (/^\s*UPDATE\s+index_migration_freeze\b.*'copying'/is.test(sql)) {
-      observedCopyingTransaction = true;
-      assert.deepEqual(plainRows(staleDatabase, `SELECT * FROM ${SOURCE_FREEZE_TABLE}`),
-        [{ id: 1, state: 'frozen' }], 'an old connection must never observe a committed copying/unfrozen state');
-    }
-  };
-  const result = await copyFrozenIndex(f.args());
-  assert.equal(result.state, 'complete');
-  assert.equal(result.rows, rows.length);
-  assert.equal(observedCopyingTransaction, true);
-  assertCopied(f, rows);
-  assert.deepEqual(f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
-  assert.throws(() => staleInsert.run(...BLOCK_COLUMNS.map((column) => attempted[column])), /index_migration_frozen/);
+  } finally {
+    // Release the independently opened writer before the fixture's after-hook unlinks its files.
+    staleDatabase?.close();
+  }
 });
 
 test('malformed persisted copying state or missing source freeze triggers fails closed without repairing or deleting source rows', async (context) => {
