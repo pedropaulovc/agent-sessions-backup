@@ -33,11 +33,20 @@ export async function route(request: Request, env: Env, _ctx: ExecutionContext):
 
  if (url.pathname === '/healthz') {
   if (env.ENVIRONMENT !== 'development') {
-   return Response.json({ ok: true, environment: env.ENVIRONMENT });
+   return Response.json({
+    ok: true,
+    environment: env.ENVIRONMENT,
+    indexMode: env.INDEX_MODE,
+    deploymentRevision: env.DEPLOYMENT_REVISION,
+    indexShardCount: Number(env.INDEX_SHARD_COUNT),
+   }, { headers: { 'Cache-Control': 'no-store' } });
   }
   return Response.json({
    ok: true,
    environment: env.ENVIRONMENT,
+   indexMode: env.INDEX_MODE,
+   deploymentRevision: env.DEPLOYMENT_REVISION,
+   indexShardCount: Number(env.INDEX_SHARD_COUNT),
    environmentId: env.ENVIRONMENT_ID,
    environmentNonce: env.ENVIRONMENT_NONCE,
    buildInputDigest: env.BUILD_INPUT_DIGEST,
@@ -46,6 +55,13 @@ export async function route(request: Request, env: Env, _ctx: ExecutionContext):
    schemaDigest: env.SCHEMA_DIGEST,
    pendingMigrations: Number(env.PENDING_MIGRATIONS ?? -1),
    seedDigest: env.SEED_DIGEST,
+  });
+ }
+
+ if (env.INDEX_MODE === 'maintenance') {
+  return Response.json({ error: 'index_migration_in_progress' }, {
+   status: 503,
+   headers: { 'Retry-After': '60', 'Cache-Control': 'no-store' },
   });
  }
 

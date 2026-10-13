@@ -191,7 +191,7 @@ adding credentials:
 | `hub.machine.health` | One per enrolled machine | OS, collector version, exact last-seen/upload timestamps and ages, pending/error/parsed/skipped/superseded/complete/total file counts |
 | `hub.fleet.health` | One aggregate | Machine count, all file-state totals, ready/parsing/error/total session counts |
 | `hub.watchdog.run` | One liveness beacon | Roster-read health and machine count |
-| `hub.d1.db_size_bytes` | One storage gauge | Current D1 bytes |
+| `hub.d1.db_size_bytes` | One gauge per metadata/index database | Database binding and current bytes |
 | `parse.done`, `parse.error` | Per parse attempt | Parse throughput, failures, and malformed-line totals |
 | `access.upload`, `access.multipart_create` | Per upload operation | Upload/ingress throughput |
 

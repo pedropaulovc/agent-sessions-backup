@@ -29,7 +29,7 @@ export async function runSessionRollupPass(
   console.log(JSON.stringify({ event: 'hub.session_rollup.started', ...run }));
   let outcome: RollupOutcome;
   try {
-    const result = await runSessionRollup(env.DB, { maxBlocks: 20_000, maxPages: 80, pageSize: 250, run });
+    const result = await runSessionRollup(env, { maxBlocks: 20_000, maxPages: 80, pageSize: 250, run });
     outcome = { outcome: result.failed > 0 ? 'partial' : 'complete', result, ms: Date.now() - started };
   } catch (error) {
     // Committed checkpoints survive; do not report zero pending work after an interrupted pass.

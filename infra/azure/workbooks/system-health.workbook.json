@@ -154,7 +154,7 @@
       "content": {
         "version": "KqlItem/1.0",
         "title": "D1 database size (14d)",
-        "query": "let logs = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, Body:string)[]),\n    (OTelLogs | project TimeGenerated, Body);\nlogs\n| where TimeGenerated > ago(14d)\n| extend body = todynamic(Body)\n| where body.event == 'hub.d1.db_size_bytes'\n| extend SizeGiB=round(toreal(body.bytes) / 1073741824.0, 3)\n| project TimeGenerated, SizeGiB\n| order by TimeGenerated asc",
+        "query": "let logs = union isfuzzy=true\n    (datatable(TimeGenerated:datetime, Body:string)[]),\n    (OTelLogs | project TimeGenerated, Body);\nlogs\n| where TimeGenerated > ago(14d)\n| extend body = todynamic(Body)\n| where body.event == 'hub.d1.db_size_bytes'\n| extend Database=iff(isempty(tostring(body.database)), 'main', tostring(body.database)), SizeGiB=round(toreal(body.bytes) / 1073741824.0, 3)\n| project TimeGenerated, Database, SizeGiB\n| order by TimeGenerated asc",
         "size": 0,
         "queryType": 0,
         "resourceType": "microsoft.operationalinsights/workspaces",

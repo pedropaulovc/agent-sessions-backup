@@ -4,29 +4,81 @@ import { pruneOmpQaReports, runDailyPrune, runPrune } from './cron/prune';
 import { runScheduledSessionRollup } from './cron/session-rollup';
 import { runWatchdog } from './cron/watchdog';
 import { consumeParseBatch } from './ingest/consumer';
+import { assertIndexLayout } from './index-shards';
 import { route } from './router';
 import { consumeSessionRollup } from './session-rollup-jobs';
+import { drainIndexCatalog } from './session-catalog';
+
+async function reconcileCatalog(env: Env): Promise<void> {
+  try {
+    const result = await drainIndexCatalog(env);
+    if (result.state === 'pending') await env.ROLLUP_QUEUE.send({ kind: 'index-catalog' });
+  } catch (error) {
+    // The durable outbox remains pending; the next request, queue delivery, or cron retries it.
+    console.error(JSON.stringify({
+      event: 'hub.index_catalog.reconcile_failed',
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  }
+}
 
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-    return route(request, env, ctx);
+    const path = new URL(request.url).pathname;
+    if (path === '/healthz' || env.INDEX_MODE === 'maintenance') return route(request, env, ctx);
+    await assertIndexLayout(env);
+    const response = await route(request, env, ctx);
+    if (request.method !== 'GET' && request.method !== 'HEAD') ctx.waitUntil(reconcileCatalog(env));
+    return response;
   },
 
   async queue(batch: MessageBatch<HubQueueMessage>, env: Env): Promise<void> {
+    if (env.INDEX_MODE === 'maintenance') {
+      for (const message of batch.messages) message.retry({ delaySeconds: 60 });
+      return;
+    }
+    await assertIndexLayout(env);
+    const catalog = batch.messages.find((message) => 'kind' in message.body && message.body.kind === 'index-catalog');
+    if (catalog) {
+      for (const message of batch.messages) {
+        if (message !== catalog) message.retry();
+      }
+      try {
+        const result = await drainIndexCatalog(env);
+        if (result.state === 'pending') catalog.retry({ delaySeconds: 1 });
+        else catalog.ack();
+      } catch (error) {
+        console.error(JSON.stringify({
+          event: 'hub.index_catalog.delivery_failed',
+          error: error instanceof Error ? error.message : String(error),
+        }));
+        catalog.retry({ delaySeconds: 60 });
+      }
+      return;
+    }
     const rollup = batch.messages.find((message) => 'kind' in message.body && message.body.kind === 'session-rollup');
     if (rollup) {
-      // ROLLUP_QUEUE is dedicated and configured for batch size one. If a malformed mixed
-      // batch ever arrives, defer all other messages instead of sharing the parse budget.
+      // Rollup work shares the queue with catalog reconciliation; each delivery has its own budget.
       for (const message of batch.messages) {
         if (message !== rollup) message.retry();
       }
-      await consumeSessionRollup(rollup as Message<SessionRollupMessage>, env);
+      try {
+        await consumeSessionRollup(rollup as Message<SessionRollupMessage>, env);
+      } finally {
+        await reconcileCatalog(env);
+      }
       return;
     }
-    await consumeParseBatch({ messages: batch.messages as Message<ParseMessage>[] }, env);
+    try {
+      await consumeParseBatch({ messages: batch.messages as Message<ParseMessage>[] }, env);
+    } finally {
+      await reconcileCatalog(env);
+    }
   },
 
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+    if (env.INDEX_MODE === 'maintenance') return;
+    await assertIndexLayout(env);
     // */15 = observability watchdog (per-machine heartbeat-age gauge + D1 size).
     // 30 4 * * * = daily prune: sweep leaked multipart staging objects (mpu-staging/) older than 7d.
     // It also revokes rotated-out client certs whose grace window elapsed. Incomplete multipart
@@ -34,6 +86,7 @@ export default {
     // Audit-log polling (CF Audit Logs API) is a later M4 step, wired here once added.
     if (controller.cron === '*/15 * * * *') {
       ctx.waitUntil(runWatchdog(env));
+      ctx.waitUntil(reconcileCatalog(env));
       return;
     }
 
@@ -67,7 +120,8 @@ export default {
             }),
           ),
         )
-        .then(() => runDailyPricing(env)),
+        .then(() => runDailyPricing(env))
+        .then(() => reconcileCatalog(env)),
     );
   },
 } satisfies ExportedHandler<Env, HubQueueMessage>;
