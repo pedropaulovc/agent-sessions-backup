@@ -1447,9 +1447,15 @@ describe('reindex-restored mtimes drive the canonical-copy tiebreak correctly (r
     const content = `${ccUserLine({ uuid: 'dm-u1', text: 'duplicate mtime tiebreak content' })}\n`;
     const OLD_MTIME = '2019-01-01T00:00:00Z';
     const NEW_MTIME = '2026-01-01T00:00:00Z';
+    const prefix = `raw/${MACHINE}/claude-projects/dup-mtime-demo/`;
+    const oldRelpath = `dup-mtime-demo/copy-old/${SESSION_ID}.jsonl`;
+    const newRelpath = `dup-mtime-demo/copy-new/${SESSION_ID}.jsonl`;
+    const outsideRelpath = 'outside-mtime-demo/e0000000-0000-4000-8000-000000000009.jsonl';
+    const outsideKey = `raw/${MACHINE}/claude-projects/${outsideRelpath}`;
+    const contentHash = await sha256Hex(new TextEncoder().encode(content));
 
-    async function putWithMtime(relpath: string, mtime: string): Promise<number> {
-      const body = new TextEncoder().encode(content);
+    async function putWithMtime(relpath: string, mtime: string, text = content): Promise<number> {
+      const body = new TextEncoder().encode(text);
       const res = await SELF.fetch(`${API}/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent(relpath)}`, {
         method: 'PUT',
         headers: {
@@ -1464,35 +1470,86 @@ describe('reindex-restored mtimes drive the canonical-copy tiebreak correctly (r
       return ((await res.json()) as { file_id: number }).file_id;
     }
 
-    // Older copy uploaded (and thus assigned its row id) FIRST, so an id-ASC fallback would wrongly
-    // pick it over the genuinely newer copy — a real distinguishing test, not one that happens to
-    // pass either way.
-    const oldFileId = await putWithMtime(`dup-mtime-demo/copy-old/${SESSION_ID}.jsonl`, OLD_MTIME);
-    const newFileId = await putWithMtime(`dup-mtime-demo/copy-new/${SESSION_ID}.jsonl`, NEW_MTIME);
-    expect(oldFileId).toBeLessThan(newFileId);
-
-    // Simulate both rows' mtime having been lost (same scenario the previous test exercises
-    // directly) — wipe it in place rather than deleting the rows, so this test isolates the
-    // tiebreak logic from the restore-after-delete mechanics already covered above.
-    await testEnv.DB.prepare('UPDATE files SET mtime = NULL WHERE id IN (?1, ?2)').bind(oldFileId, newFileId).run();
-
-    const reindexRes = await SELF.fetch(`${API}/api/v1/admin/reindex`, {
-      method: 'POST',
-      headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
-      body: '{}',
+    // Storage is shared across this file's tests. Intercept BOTH queue APIs, as in
+    // reindex-range.test.ts: explicit deliveries must not leave simulator messages behind
+    // to auto-flush later by count/time and reparse unrelated earlier fixtures.
+    const sent: ParseMessage[] = [];
+    const sendSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'send').mockImplementation(async (message) => {
+      sent.push(message);
+      return undefined as never;
     });
-    expect(reindexRes.status).toBe(200);
-    await drainQueue();
+    const sendBatchSpy = vi.spyOn(testEnv.PARSE_QUEUE, 'sendBatch').mockImplementation(async (messages) => {
+      sent.push(...Array.from(messages, (message) => message.body));
+      return undefined as never;
+    });
+    let outsideFileId: number | undefined;
+    try {
+      // Older copy uploaded (and thus assigned its row id) FIRST, so an id-ASC fallback would wrongly
+      // pick it over the genuinely newer copy — a real distinguishing test, not one that happens to
+      // pass either way.
+      const oldFileId = await putWithMtime(oldRelpath, OLD_MTIME);
+      const newFileId = await putWithMtime(newRelpath, NEW_MTIME);
+      expect(oldFileId).toBeLessThan(newFileId);
 
-    const oldRow = await testEnv.DB.prepare('SELECT mtime FROM files WHERE id = ?1').bind(oldFileId).first<{ mtime: string | null }>();
-    const newRow = await testEnv.DB.prepare('SELECT mtime FROM files WHERE id = ?1').bind(newFileId).first<{ mtime: string | null }>();
-    expect(oldRow?.mtime).toBe(OLD_MTIME);
-    expect(newRow?.mtime).toBe(NEW_MTIME);
+      // An unrelated pending file makes the isolation oracle work even when this test runs alone.
+      // Malformed content also ensures a mistakenly global drain cannot create derived session data.
+      outsideFileId = await putWithMtime(outsideRelpath, NEW_MTIME, 'not valid JSON\n');
+      await testEnv.DB.batch([
+        // Wipe mtimes in place to isolate the tiebreak from restore-after-delete mechanics.
+        testEnv.DB.prepare('UPDATE files SET mtime = NULL WHERE id IN (?1, ?2)').bind(oldFileId, newFileId),
+        testEnv.DB.prepare("UPDATE files SET mtime = NULL, content_hash = 'unknown' WHERE id = ?1").bind(outsideFileId),
+      ]);
+      expect(sent).toHaveLength(3);
+      // Deliver the actual reindex messages below, not the superseded upload deliveries.
+      sent.length = 0;
 
-    const session = await testEnv.DB.prepare('SELECT canonical_file_id FROM sessions WHERE session_id = ?1')
-      .bind(SESSION_ID)
-      .first<{ canonical_file_id: number }>();
-    expect(session?.canonical_file_id).toBe(newFileId);
+      // The existing prefix API bounds R2 discovery as well as queue fan-out. An empty body walks
+      // every earlier fixture, and drainQueue() additionally consumes every pending DB row.
+      const reindexRes = await SELF.fetch(`${API}/api/v1/admin/reindex`, {
+        method: 'POST',
+        headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
+        body: JSON.stringify({ prefix }),
+      });
+      expect(reindexRes.status).toBe(200);
+      expect(await reindexRes.json()).toEqual({ enqueued: 2, done: true, cursor: null });
+      expect(sent).toHaveLength(2);
+      expect(sent).toEqual(expect.arrayContaining([
+        { file_id: oldFileId, r2_key: `${prefix}copy-old/${SESSION_ID}.jsonl`, reason: 'reindex', content_hash: contentHash },
+        { file_id: newFileId, r2_key: `${prefix}copy-new/${SESSION_ID}.jsonl`, reason: 'reindex', content_hash: contentHash },
+      ]));
+
+      // Replay only the captured bodies, preserving reindex intent and the source-hash guard.
+      const messages = sent.map((body) => ({
+        id: String(body.file_id), timestamp: new Date(), attempts: 1, body, ack: vi.fn(), retry: vi.fn(),
+      }));
+      await worker.queue({ queue: 'parse', messages, ackAll() {}, retryAll() {} } as unknown as MessageBatch<ParseMessage>, testEnv);
+      for (const message of messages) {
+        expect(message.ack).toHaveBeenCalledOnce();
+        expect(message.retry).not.toHaveBeenCalled();
+      }
+      expect(sent).toHaveLength(2); // no unconsumed continuation/recovery work
+
+      const oldRow = await testEnv.DB.prepare('SELECT mtime, size, content_hash, parse_state FROM files WHERE id = ?1')
+        .bind(oldFileId).first();
+      const newRow = await testEnv.DB.prepare('SELECT mtime, size, content_hash, parse_state FROM files WHERE id = ?1')
+        .bind(newFileId).first();
+      const size = new TextEncoder().encode(content).length;
+      expect(oldRow).toEqual({ mtime: OLD_MTIME, size, content_hash: contentHash, parse_state: 'superseded' });
+      expect(newRow).toEqual({ mtime: NEW_MTIME, size, content_hash: contentHash, parse_state: 'parsed' });
+
+      const session = await testEnv.DB.prepare('SELECT canonical_file_id, index_state FROM sessions WHERE session_id = ?1')
+        .bind(SESSION_ID).first();
+      expect(session).toEqual({ canonical_file_id: newFileId, index_state: 'ready' });
+
+      // Neither R2 discovery nor queue delivery may repair/parse the outside-prefix pending file.
+      expect(await testEnv.DB.prepare('SELECT mtime, content_hash, parse_state, parsed_at FROM files WHERE id = ?1')
+        .bind(outsideFileId).first()).toEqual({ mtime: null, content_hash: 'unknown', parse_state: 'pending', parsed_at: null });
+    } finally {
+      sendSpy.mockRestore();
+      sendBatchSpy.mockRestore();
+      if (outsideFileId !== undefined) await testEnv.DB.prepare('DELETE FROM files WHERE id = ?1').bind(outsideFileId).run();
+      await testEnv.RAW.delete(outsideKey);
+    }
   });
 });
 
