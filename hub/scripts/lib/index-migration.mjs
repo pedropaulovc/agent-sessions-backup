@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import {
   INDEX_ID_SPAN, INDEX_LAYOUT, SHARD_META_INIT_SQL, indexIdBase,
   SESSION_CATALOG_COLUMNS, STAR_CATALOG_COLUMNS, SESSION_CATALOG_RETIRE_SQL, sessionCatalogBatches,
@@ -36,6 +37,7 @@ export const COPY_INVARIANTS = Object.freeze({
   CHECKPOINT_STATE: 'checkpoint-state', CHECKPOINT_IDENTITY: 'checkpoint-identity',
   FREEZE_SCHEMA: 'freeze-schema', FREEZE_STATE: 'freeze-state', FREEZE_MISSING: 'freeze-missing',
   FTS_IDENTITY: 'fts-identity', FTS_MATCH: 'fts-match',
+  FTS_TOKENIZER_SCHEMA: 'fts-tokenizer-schema', FTS_TOKENIZER: 'fts-tokenizer',
   COLUMN_LAYOUT: 'column-layout', COLUMN_BUDGET: 'column-budget', PAGE_METADATA: 'page-metadata',
   ROW_CAP: 'row-cap', DUPLICATE_IDS: 'duplicate-ids', SIZE_IDENTITY: 'size-identity',
   ROW_IDENTITY: 'row-identity', LONG_COLUMN: 'long-column', LONG_LENGTH: 'long-length',
@@ -336,15 +338,76 @@ export function assertActivationProof({ source, shards, copy, seed, ready, activ
     cycle: activation.cycle, verifiedAt: activation.verifiedAt, evidenceSha256: activation.evidenceSha256 }), 'activation');
 }
 
-function firstMatchToken(text) {
-  return typeof text === 'string'
-    ? text.match(/[\p{L}\p{N}\p{Co}_.-][\p{L}\p{N}\p{M}\p{Co}_.-]*/u)?.[0] ?? null
-    : null;
+// One lazy in-memory native oracle per operation. Clone the destination's trusted
+// declaration rather than maintaining a second tokenizer configuration in JS.
+// Only one row is indexed at a time; neither SQL nor text nor terms leave memory.
+function createFtsTokenizer() {
+  const schemas = new Map();
+  let database;
+  let configuredSql;
+  let clear;
+  let insert;
+  let first;
+  return {
+    async probes(db, rows) {
+      if (!rows.length) return [];
+      let sql = schemas.get(db.id);
+      if (sql === undefined) {
+        const schema = await phaseDb(db, COPY_PHASES.FTS_MATCH).query(
+          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'blocks_fts'",
+        );
+        if (schema.length !== 1 || typeof schema[0].sql !== 'string'
+          || !/^\s*CREATE\s+VIRTUAL\s+TABLE\s+(?:blocks_fts|"blocks_fts")\s+USING\s+fts5\s*\(/i.test(schema[0].sql)) {
+          throw copyInvariant(COPY_INVARIANTS.FTS_TOKENIZER_SCHEMA, 'native FTS tokenizer schema is unavailable', COPY_PHASES.FTS_MATCH);
+        }
+        sql = schema[0].sql;
+        schemas.set(db.id, sql);
+      }
+      if (sql !== configuredSql) {
+        try {
+          if (!database) {
+            database = new DatabaseSync(':memory:');
+            database.exec('CREATE TABLE blocks (id INTEGER PRIMARY KEY, text TEXT)');
+          } else {
+            database.exec('DROP TABLE tokenizer_vocab; DROP TABLE blocks_fts');
+          }
+          database.exec(sql);
+          database.exec("CREATE VIRTUAL TABLE tokenizer_vocab USING fts5vocab(blocks_fts, 'instance')");
+          clear = database.prepare("INSERT INTO blocks_fts (blocks_fts) VALUES ('delete-all')");
+          insert = database.prepare('INSERT INTO blocks_fts (rowid, text) VALUES (1, ?)');
+          first = database.prepare("SELECT term FROM tokenizer_vocab WHERE doc = 1 AND col = 'text' AND offset = 0 LIMIT 1");
+          configuredSql = sql;
+        } catch {
+          throw copyInvariant(COPY_INVARIANTS.FTS_TOKENIZER_SCHEMA, 'native FTS tokenizer initialization failed', COPY_PHASES.FTS_MATCH);
+        }
+      }
+      try {
+        const probes = rows.map((row) => {
+          if (row.text !== null && typeof row.text !== 'string') throw new Error();
+          clear.run();
+          insert.run(row.text);
+          const token = first.get()?.term ?? null;
+          if (token !== null && (typeof token !== 'string' || !token.length)) throw new Error();
+          return { id: row.id, token };
+        });
+        clear.run();
+        return probes;
+      } catch {
+        throw copyInvariant(COPY_INVARIANTS.FTS_TOKENIZER, 'native FTS token derivation failed', COPY_PHASES.FTS_MATCH);
+      }
+    },
+    close() {
+      try { database?.close(); }
+      catch {
+        throw copyInvariant(COPY_INVARIANTS.FTS_TOKENIZER, 'native FTS tokenizer closure failed', COPY_PHASES.FTS_MATCH);
+      }
+    },
+  };
 }
 
-async function verifyFts(db, rows) {
+async function verifyFts(db, rows, tokenizer) {
   db = phaseDb(db, COPY_PHASES.FTS_MATCH);
-  const probes = rows.map((row) => ({ id: row.id, token: firstMatchToken(row.text) }));
+  const probes = await tokenizer.probes(db, rows);
   if (!probes.length) return;
   // Keep probes outermost so each MATCH is correlated with its requested row in
   // one native read snapshot, without expanding SQLite's compound-select grammar.
@@ -366,7 +429,9 @@ async function verifyFts(db, rows) {
     found.add(row.rowid);
   }
   for (const { id, token } of probes) {
-    if (token && !found.has(id)) throw copyInvariant(COPY_INVARIANTS.FTS_MATCH, 'FTS MATCH verification failed', COPY_PHASES.FTS_MATCH);
+    if (token ? !found.has(id) : found.has(id)) {
+      throw copyInvariant(COPY_INVARIANTS.FTS_MATCH, 'FTS MATCH verification failed', COPY_PHASES.FTS_MATCH);
+    }
   }
 }
 
@@ -579,7 +644,7 @@ async function pendingSourceChanged(source, state, layout) {
     || rowDigest(state.columns, originals.get(item.id), source[DIAGNOSTIC_PHASE]) !== item.sha256);
 }
 
-async function verifyPending(source, shards, state, layout) {
+async function verifyPending(source, shards, state, layout, tokenizer) {
   const ids = state.pending.rows.map((row) => row.id);
   const remaining = new Map((await readBlockRows(source, state.columns, ids, layout)).map((row) => [row.id, row]));
   const verified = new Map();
@@ -605,13 +670,13 @@ async function verifyPending(source, shards, state, layout) {
         throw copyInvariant(COPY_INVARIANTS.SOURCE_MISSING, 'unverified source block disappeared', COPY_PHASES.SOURCE_PAGE_READ);
       }
     }
-    await verifyFts(shards[shard], destination);
+    await verifyFts(shards[shard], destination, tokenizer);
     for (const row of destination) verified.set(row.id, row);
   }
   return verified;
 }
 
-async function finishPending(source, shards, state, gate, checkpoint, layout) {
+async function finishPending(source, shards, state, gate, checkpoint, layout, tokenizer) {
   if (state.pending.phase === 'copying') {
     const rows = await readBlockRows(source, state.columns, state.pending.rows.map((row) => row.id), layout);
     const found = new Map(rows.map((row) => [row.id, row]));
@@ -626,7 +691,7 @@ async function finishPending(source, shards, state, gate, checkpoint, layout) {
       if (routed[shard].length) await replaceShardPage(shards[shard], state.columns, routed[shard], layout);
     }
   }
-  const verified = await verifyPending(source, shards, state, layout);
+  const verified = await verifyPending(source, shards, state, layout, tokenizer);
   await gate();
   state.pending.phase = 'verified';
   await checkpoint(state);
@@ -715,26 +780,31 @@ export async function copyFrozenIndex({ source, shards, gate, checkpointHook }) 
     state.pending = null;
     await checkpoint(state);
   }
-  for (;;) {
-    await gate();
-    if (state.pending) await finishPending(source, shards, state, gate, checkpoint, layout);
-    // The first bounded, verified page makes room for the atomic source-write barrier.
-    const candidates = await blockCandidates(source, layout, { after: state.after });
-    if (!candidates.length) {
-      if ((await source.query('SELECT id FROM blocks LIMIT 1')).length) {
-        throw copyInvariant(COPY_INVARIANTS.SOURCE_BEHIND_CURSOR, 'source contains rows behind the checkpoint; freeze invariant violated', COPY_PHASES.SOURCE_PAGE_READ);
+  const tokenizer = createFtsTokenizer();
+  try {
+    for (;;) {
+      await gate();
+      if (state.pending) await finishPending(source, shards, state, gate, checkpoint, layout, tokenizer);
+      // The first bounded, verified page makes room for the atomic source-write barrier.
+      const candidates = await blockCandidates(source, layout, { after: state.after });
+      if (!candidates.length) {
+        if ((await source.query('SELECT id FROM blocks LIMIT 1')).length) {
+          throw copyInvariant(COPY_INVARIANTS.SOURCE_BEHIND_CURSOR, 'source contains rows behind the checkpoint; freeze invariant violated', COPY_PHASES.SOURCE_PAGE_READ);
+        }
+        await freezeEmptySource(source);
+        state.state = 'complete';
+        await checkpoint(state);
+        return state;
       }
-      await freezeEmptySource(source);
-      state.state = 'complete';
+      const selected = await readCopyPage(source, columns, layout, candidates);
+      const page = selected.rows.map((row, index) => ({
+        id: row.id, shard: indexShardForSessionId(row.session_id, shards.length), sha256: sha(selected.canonical[index]),
+      }));
+      state.pending = { phase: 'copying', rows: page };
       await checkpoint(state);
-      return state;
     }
-    const selected = await readCopyPage(source, columns, layout, candidates);
-    const page = selected.rows.map((row, index) => ({
-      id: row.id, shard: indexShardForSessionId(row.session_id, shards.length), sha256: sha(selected.canonical[index]),
-    }));
-    state.pending = { phase: 'copying', rows: page };
-    await checkpoint(state);
+  } finally {
+    tokenizer.close();
   }
 }
 
@@ -934,40 +1004,45 @@ export async function verifyIndexRecords({ source, shards, catalogConsistency = 
     (SELECT COUNT(*) FROM sessions) AS sessions,
     (SELECT COUNT(*) FROM starred_turns) AS stars`);
   const evidence = [];
-  for (let index = 0; index < shards.length; index += 1) {
-    const db = shards[index];
-    const [meta] = await db.query('SELECT * FROM shard_meta WHERE id = 1');
-    if (!meta || meta.shard_index !== index || meta.shard_count !== shards.length || meta.layout !== INDEX_LAYOUT) {
-      throw new Error('live index shard layout mismatch');
-    }
-    const [counts] = await db.query(`SELECT
-      (SELECT COUNT(*) FROM blocks) AS blocks,
-      (SELECT COUNT(*) FROM sessions) AS sessions,
-      (SELECT COUNT(*) FROM starred_turns) AS stars`);
-    if (catalogConsistency === 'required' && (counts.sessions !== main.sessions || counts.stars !== main.stars)) {
-      throw new Error('frozen complete catalog counts differ from main');
-    }
-    const columns = await columnsFor(db, 'blocks');
-    const ids = (await db.query('SELECT id FROM blocks ORDER BY id LIMIT 4')).map((row) => row.id);
-    const blocks = ids.length ? await readBlockRows(db, columns, ids) : [];
-    for (const row of blocks) {
-      if (indexShardForSessionId(row.session_id, shards.length) !== index) throw new Error('sampled block is routed to the wrong shard');
-      if (row.id >= INDEX_ID_SPAN && (row.id < indexIdBase(index) || row.id >= indexIdBase(index) + INDEX_ID_SPAN)) {
-        throw new Error('sampled block has an invalid shard allocator ID');
+  const tokenizer = createFtsTokenizer();
+  try {
+    for (let index = 0; index < shards.length; index += 1) {
+      const db = shards[index];
+      const [meta] = await db.query('SELECT * FROM shard_meta WHERE id = 1');
+      if (!meta || meta.shard_index !== index || meta.shard_count !== shards.length || meta.layout !== INDEX_LAYOUT) {
+        throw new Error('live index shard layout mismatch');
       }
+      const [counts] = await db.query(`SELECT
+        (SELECT COUNT(*) FROM blocks) AS blocks,
+        (SELECT COUNT(*) FROM sessions) AS sessions,
+        (SELECT COUNT(*) FROM starred_turns) AS stars`);
+      if (catalogConsistency === 'required' && (counts.sessions !== main.sessions || counts.stars !== main.stars)) {
+        throw new Error('frozen complete catalog counts differ from main');
+      }
+      const columns = await columnsFor(db, 'blocks');
+      const ids = (await db.query('SELECT id FROM blocks ORDER BY id LIMIT 4')).map((row) => row.id);
+      const blocks = ids.length ? await readBlockRows(db, columns, ids) : [];
+      for (const row of blocks) {
+        if (indexShardForSessionId(row.session_id, shards.length) !== index) throw new Error('sampled block is routed to the wrong shard');
+        if (row.id >= INDEX_ID_SPAN && (row.id < indexIdBase(index) || row.id >= indexIdBase(index) + INDEX_ID_SPAN)) {
+          throw new Error('sampled block has an invalid shard allocator ID');
+        }
+      }
+      if (blocks.length) await verifyFts(db, blocks, tokenizer);
+      else await db.query('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? LIMIT 1', ['\"index-migration-empty-probe\"']);
+      const catalog = await db.query(`SELECT s.*, c.version AS __version, c.presence AS __presence
+        FROM sessions s LEFT JOIN catalog_versions c USING (session_id) ORDER BY s.session_id LIMIT 4`);
+      if (catalog.some((row) => !Number.isSafeInteger(row.__version) || row.__version < 1 || row.__presence !== 'present')) {
+        throw new Error('sampled live catalog version/tombstone mismatch');
+      }
+      evidence.push({ shard: index, blockCount: counts.blocks, sessionCount: counts.sessions, starCount: counts.stars,
+        blockSampleSha256: sha(JSON.stringify(blocks.map((row) => canonicalRow(columns, row)))),
+        catalogSampleSha256: sha(JSON.stringify(catalog.map((row) => canonicalRow(SESSION_CATALOG_COLUMNS, row)))) });
     }
-    if (blocks.length) await verifyFts(db, blocks);
-    else await db.query('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? LIMIT 1', ['\"index-migration-empty-probe\"']);
-    const catalog = await db.query(`SELECT s.*, c.version AS __version, c.presence AS __presence
-      FROM sessions s LEFT JOIN catalog_versions c USING (session_id) ORDER BY s.session_id LIMIT 4`);
-    if (catalog.some((row) => !Number.isSafeInteger(row.__version) || row.__version < 1 || row.__presence !== 'present')) {
-      throw new Error('sampled live catalog version/tombstone mismatch');
-    }
-    evidence.push({ shard: index, blockCount: counts.blocks, sessionCount: counts.sessions, starCount: counts.stars,
-      blockSampleSha256: sha(JSON.stringify(blocks.map((row) => canonicalRow(columns, row)))),
-      catalogSampleSha256: sha(JSON.stringify(catalog.map((row) => canonicalRow(SESSION_CATALOG_COLUMNS, row)))) });
+    return { mainSessions: main.sessions, mainStars: main.stars, shards: evidence };
+  } finally {
+    tokenizer.close();
   }
-  return { mainSessions: main.sessions, mainStars: main.stars, shards: evidence };
 }
 
 export function classifyIndexMigration({ source, shards, legacyTables, copy, seed, ready, activation }) {

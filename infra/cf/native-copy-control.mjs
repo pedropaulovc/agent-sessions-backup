@@ -133,6 +133,24 @@ const INSERT_BLOCK = `INSERT INTO blocks (${BLOCK_COLUMNS.map(quote).join(',')})
 const blockStatement = (row) => ({ sql: INSERT_BLOCK, params: BLOCK_COLUMNS.map((column) => row[column]) });
 const DENSE_ROWS = 1461;
 const DENSE_SUFFIX_TOKEN = 'nativedensesuffix';
+const DENSE_TOKENIZER_CASES = [
+  { text: 'nativevariedalpha', tokens: ['nativevariedalpha'] },
+  { text: 'nativevariedbravo', tokens: ['nativevariedbravo'] },
+  { text: 'nativevariedcharlie', tokens: ['nativevariedcharlie'] },
+  { text: 'nativevarieddelta', tokens: ['nativevarieddelta'] },
+  { text: 'nativevariedecho', tokens: ['nativevariedecho'] },
+  { text: 'nativevariedfoxtrot', tokens: ['nativevariedfoxtrot'] },
+  { text: '🫠alpha', tokens: ['🫠alpha'], absent: ['alpha'] },
+  { text: '🫠 alpha', tokens: ['🫠', 'alpha'] },
+  { text: '🧮alpha', tokens: ['🧮alpha'], absent: ['alpha'] },
+  { text: '🧠alpha', tokens: ['🧠alpha'], absent: ['alpha'] },
+  { text: '🛠alpha', tokens: ['🛠alpha'], absent: ['alpha'] },
+  { text: 'al🫠pha', tokens: ['al🫠pha'], absent: ['al'] },
+  { text: '₿alpha', tokens: ['₿alpha'], absent: ['alpha'] },
+  { text: '\u{1CF00}alpha', tokens: ['\u{1CF00}alpha'], absent: ['alpha'] },
+  { text: '🫠', tokens: ['🫠'], only: true },
+  { text: '! ? : ; ( ) [ ] { } \t\n\u0000', tokens: [], absent: ['index-migration-tokenless-probe', '🫠', 'alpha'], only: true },
+];
 const READBACK_PAGE_ROWS = 256;
 function sessionOn(shard) {
   for (let index = 0; ; index += 1) {
@@ -163,7 +181,9 @@ function fixtures() {
     id: index + 1, session_id: long.session_id, file_id: 0,
     turn_index: 0, block_index: index, role: null, btype: 'text', tool_name: null,
     ts: '', byte_start: 0, byte_len: 0, truncated: 0,
-    text: `nativedensevisible\u0000 ${DENSE_SUFFIX_TOKEN}`, on_main_path: 1, row_hash: index + 1,
+    text: DENSE_TOKENIZER_CASES[index]?.only ? DENSE_TOKENIZER_CASES[index].text
+      : `${DENSE_TOKENIZER_CASES[index]?.text ?? `nativevaried_${index}`}\u0000 ${DENSE_SUFFIX_TOKEN}`,
+    on_main_path: 1, row_hash: index + 1,
     media_byte_start: null, media_byte_len: 0, media_type: '',
   }));
   const ordinaryRows = [ordinary, ...dense];
@@ -254,9 +274,19 @@ async function proveNativeCopy({ source, shards, gate }) {
         params: [`[${dense.map((row) => canonicalRow(BLOCK_COLUMNS, row)).join(',')}]`],
       },
       blockStatement(long),
+      { sql: 'INSERT INTO blocks_fts (rowid, text) SELECT id, text FROM blocks', params: [] },
     ]);
     phase = 'seed-readback';
     requireProof(rowsSha256(await readRows(source, 'seed-readback')) === expectedSha256, 'seed-readback');
+    phase = 'tokenizer-before';
+    // A native negative control, not another implementation of the old regex:
+    // for this public adjacent-emoji row, alpha is not an indexed first term.
+    const boundaryRow = dense[6];
+    const legacyProbe = await source.query('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = CAST(? AS INTEGER)',
+      ['"alpha"', boundaryRow.id]);
+    const nativeProbe = await source.query('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = CAST(? AS INTEGER)',
+      ['"🫠alpha"', boundaryRow.id]);
+    requireProof(legacyProbe.length === 0 && nativeProbe.length === 1 && nativeProbe[0].rowid === boundaryRow.id, phase);
     let verifiedCheckpoint;
     let deletedRows = 0;
     let ordinaryPages = 0;
@@ -336,10 +366,26 @@ async function proveNativeCopy({ source, shards, gate }) {
         ftsMatches += 1;
       }
     }
+    // Public Unicode-boundary cases share the same dense shard. Check whole
+    // native terms, separated controls, emoji-only postings and tokenless misses
+    // independently of the copier's derived JSON probes.
+    for (const [index, { tokens, absent = [] }] of DENSE_TOKENIZER_CASES.entries()) {
+      const row = dense[index];
+      const db = shards[indexShardForSessionId(row.session_id, 2)];
+      for (const [terms, required] of [[tokens, true], [absent, false]]) {
+        for (const term of terms) {
+          const matches = await db.query('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = CAST(? AS INTEGER)',
+            [`"${term.replaceAll('"', '""')}"`, row.id]);
+          requireProof(required ? matches.length === 1 && matches[0].rowid === row.id : matches.length === 0, phase);
+          if (required) ftsMatches += 1;
+        }
+      }
+    }
     // This token occurs only after the NUL, unlike the copier's first-token
-    // probes. One query per shard proves the complete routed dense ID set.
+    // probes. The two deliberately suffix-free rows have separate checks above.
     for (const [index, db] of shards.entries()) {
-      const wanted = dense.filter((row) => indexShardForSessionId(row.session_id, 2) === index);
+      const wanted = dense.filter((row) => indexShardForSessionId(row.session_id, 2) === index
+        && row.text.includes(DENSE_SUFFIX_TOKEN));
       const matches = await db.query('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? ORDER BY rowid', [DENSE_SUFFIX_TOKEN]);
       requireProof(matches.length === wanted.length
         && matches.every((row, offset) => Number.isSafeInteger(row.rowid) && row.rowid === wanted[offset].id), phase);
@@ -372,6 +418,7 @@ async function proveNativeCopy({ source, shards, gate }) {
     await gate();
     return { state: 'verified', probe: 'd1-native-full-copy', rows: expected.length, columns: BLOCK_COLUMNS.length,
       shards: shards.length, denseRows: dense.length, ordinaryPages, fallbackPages, ftsMatches, freezeTriggers: 3,
+      legacyProbeMatches: legacyProbe.length, nativeProbeMatches: nativeProbe.length,
       longTextBytes: Buffer.byteLength(long.text), sha256: expectedSha256 };
   } catch (error) {
     throw safeFailure(error, phase);

@@ -949,7 +949,8 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
   assert.equal(summary.denseRows, 1461);
   assert.equal(summary.columns, 18);
   assert.equal(summary.shards, 2);
-  assert.equal(summary.ftsMatches, 1465);
+  assert.equal(summary.legacyProbeMatches, 0);
+  assert.equal(summary.nativeProbeMatches, 1);
   assert.equal(summary.freezeTriggers, 3);
   assert.equal(summary.ordinaryPages, 2);
   assert.equal(summary.fallbackPages, 1);
@@ -957,17 +958,64 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
   assert.match(summary.sha256, /^[0-9a-f]{64}$/);
   const sql = result.events.filter((event) => event.kind === 'probe-sql');
   const denseIds = Array.from({ length: summary.denseRows }, (_, index) => index + 1);
-  const denseMatches = sql.filter((event) => /\bMATCH\b/.test(event.sql) && /ORDER BY rowid$/.test(event.sql));
-  assert.equal(denseMatches.length, 2, 'the CLI must execute complete independent dense FTS queries on both shards');
-  assert.deepEqual(denseMatches.map(({ databaseId, rows }) => ({ databaseId, rows })), [
-    { databaseId: 'created-2', rows: [] },
-    { databaseId: 'created-3', rows: denseIds.map((rowid) => ({ rowid })) },
-  ]);
+  const suffixIds = denseIds.filter((id) => ![15, 16].includes(id));
+  const suffixEvidence = textEvidence('nativedensesuffix');
+  const denseMatches = sql.filter((event) => /\bMATCH\b/.test(event.sql)
+    && event.params.length === 1 && event.params[0]?.sha256 === suffixEvidence.sha256);
+  for (const [databaseId, expected] of [['created-2', []], ['created-3', suffixIds]]) {
+    const matches = denseMatches.filter((event) => event.databaseId === databaseId);
+    assert.ok(matches.length > 0, 'both shards require independent native after-NUL suffix evidence');
+    for (const { rows } of matches) assert.deepEqual(rows, expected.map((rowid) => ({ rowid })));
+  }
+  const points = sql.filter((event) => /\bMATCH\b/.test(event.sql) && event.params.length === 2);
+  const assertPoint = (databaseId, term, id, expected) => {
+    const evidence = textEvidence(term);
+    const matches = points.filter((event) => event.databaseId === databaseId
+      && event.params[0]?.sha256 === evidence.sha256 && event.params[1] === id);
+    assert.ok(matches.length > 0, 'the CLI must execute actual independent native point checks');
+    for (const { rows } of matches) assert.deepEqual(rows, expected);
+    return matches;
+  };
+  const oldSource = assertPoint('created-1', '"alpha"', 7, []);
+  const nativeSource = assertPoint('created-1', '"🫠alpha"', 7, [{ rowid: 7 }]);
+  const firstCopyWrite = sql.findIndex((event) => event.databaseId !== 'created-1'
+    && /^INSERT INTO blocks \(/.test(event.sql));
+  assert.ok(firstCopyWrite >= 0);
+  assert.ok([...oldSource, ...nativeSource].every((event) => sql.indexOf(event) < firstCopyWrite),
+    'native old-alpha-negative and whole-term-positive controls must run before the copier writes');
+  const nativePoints = [
+    ...['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot'].map((word, index) =>
+      [index + 1, [`nativevaried${word}`]]),
+    [7, ['🫠alpha']], [8, ['🫠', 'alpha']], [9, ['🧮alpha']], [10, ['🧠alpha']],
+    [11, ['🛠alpha']], [12, ['al🫠pha']], [13, ['₿alpha']], [14, ['\u{1CF00}alpha']], [15, ['🫠']],
+  ];
+  for (const [id, terms] of nativePoints) {
+    for (const term of terms) assertPoint('created-3', `"${term}"`, id, [{ rowid: id }]);
+  }
+  for (const [id, terms] of [
+    [7, ['alpha']], [9, ['alpha']], [10, ['alpha']], [11, ['alpha']], [12, ['al']],
+    [13, ['alpha']], [14, ['alpha']], [16, ['index-migration-tokenless-probe', '🫠', 'alpha']],
+  ]) {
+    for (const term of terms) assertPoint('created-3', `"${term}"`, id, []);
+  }
+  const independent = [...points.filter((event) => event.databaseId !== 'created-1'), ...denseMatches];
+  assert.equal(summary.ftsMatches, independent.reduce((count, { rows }) => count + rows.length, 0),
+    'summary FTS matches must be derived from observed independent point and suffix hits');
   const sourceBulk = sql.filter((event) => event.databaseId === 'created-1'
     && /^INSERT INTO blocks \(/.test(event.sql) && /FROM json_each\(\?\)/.test(event.sql));
   assert.equal(sourceBulk.length, 1, 'all dense source rows are seeded by one real JSON1 statement');
   assert.equal(sourceBulk[0].params.length, 1);
   assert.ok(sourceBulk[0].params[0].utf8Bytes < 1_048_576);
+  const sourceSeed = result.events.find((event) => event.kind === 'request' && event.body?.batch
+    && new URL(event.url).pathname.endsWith('/created-1/query')
+    && event.body.batch.some(({ sql }) => /^INSERT INTO blocks \(/.test(sql)));
+  assert.ok(sourceSeed);
+  assert.equal(sourceSeed.body.batch.length, 4, 'source content and native postings must seed in one bounded request');
+  assert.equal(sourceSeed.body.batch.filter(({ sql }) => /^INSERT INTO blocks_fts\b/.test(sql)).length, 1);
+  const sourceFtsWrites = sql.filter((event) => event.databaseId === 'created-1'
+    && /\bblocks_fts\b/.test(event.sql) && /^(?:INSERT|UPDATE|DELETE)\b/.test(event.sql));
+  assert.equal(sourceFtsWrites.length, 1, 'source retirement must not issue legacy FTS mutations after seeding');
+  assert.equal(sourceFtsWrites[0].sql, sourceSeed.body.batch.find(({ sql }) => /^INSERT INTO blocks_fts\b/.test(sql)).sql);
   const finalSourceCount = sql.filter((event) => event.databaseId === 'created-1'
     && event.sql === 'SELECT COUNT(*) AS rows FROM blocks').at(-1);
   assert.deepEqual(finalSourceCount.rows, [{ rows: 0 }]);
