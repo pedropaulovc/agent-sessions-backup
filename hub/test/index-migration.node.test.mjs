@@ -17,11 +17,18 @@ import {
   STAR_CATALOG_COLUMNS, indexIdBase, indexShardForSessionId,
 } from '../src/index-layout.mjs';
 import {
-  cloudflareRetryDelay, pauseConsumers, requireProtectedProduction, verifyActiveIndex, verifyReadyIndex,
+  CopyPassBudgetExhausted, cloudflareRetryDelay, createCopyPassRequestGate, indexControlClient,
+  pauseConsumers, requireProtectedProduction, runCopyPass, verifyActiveIndex, verifyReadyIndex,
 } from '../../infra/cf/index-control.mjs';
 import { PREVIEW_ACCOUNT_ID, PRODUCTION_ACCOUNT_ID } from '../../infra/cf/preview-trust.mjs';
-import { D1_BATCH_PROBE_TEXT, d1SqlFailureReason, verifyD1BatchAtomicity } from '../../infra/cf/d1-batch-atomicity.mjs';
+import {
+  D1_BATCH_PROBE_TEXT, d1SqlFailureReason, verifyD1BatchAtomicity as currentBatchAtomicity,
+} from '../../infra/cf/d1-batch-atomicity.mjs';
 import { CLOUDFLARE_REQUEST_RATE_PER_SECOND } from '../scripts/lib/cloudflare-api-budget.mjs';
+import {
+  verifyNativeCopyControl as currentNativeCopyControl,
+  withScratchD1Databases as currentScratchD1Databases,
+} from '../../infra/cf/native-copy-control.mjs';
 
 // Historical controls replace only classification, so older modules missing the new proof
 // exports still execute the load-bearing pending/active assertions rather than failing import.
@@ -31,6 +38,12 @@ const copyWithNativeParameters = process.env.INDEX_COPY_MODULE_PATH
   ? (await import(process.env.INDEX_COPY_MODULE_PATH)).copyFrozenIndex : copyFrozenIndex;
 const consumerControl = process.env.INDEX_CONTROL_MODULE_PATH
   ? await import(process.env.INDEX_CONTROL_MODULE_PATH) : { pauseConsumers };
+const diagnosticClient = consumerControl.indexControlClient ?? indexControlClient;
+const { verifyNativeCopyControl, withScratchD1Databases } = process.env.NATIVE_COPY_CONTROL_MODULE_PATH
+  ? await import(process.env.NATIVE_COPY_CONTROL_MODULE_PATH)
+  : { verifyNativeCopyControl: currentNativeCopyControl, withScratchD1Databases: currentScratchD1Databases };
+const verifyD1BatchAtomicity = process.env.D1_ATOMICITY_MODULE_PATH
+  ? (await import(process.env.D1_ATOMICITY_MODULE_PATH)).verifyD1BatchAtomicity : currentBatchAtomicity;
 
 const hubRoot = path.resolve(import.meta.dirname, '..');
 const revision = 'frozen-index-revision-0123456789';
@@ -2839,7 +2852,11 @@ test('corrupt native or independent atomicity text/byte readbacks fail closed an
             return changed;
           });
         };
-        await assert.rejects(verifyD1BatchAtomicity(db), new RegExp(`failed ${phase} text/byte readback`));
+        await assert.rejects(verifyD1BatchAtomicity(db), (error) => {
+          assert.equal(error.d1AtomicityPhase, phase === 'batch' ? 'batch-positive' : 'independent-positive');
+          assert.equal(error.d1AtomicityFailure, 'assertion');
+          return true;
+        });
         assert.equal(exercised, 1, 'the selected native or independent SQL readback must encounter the fault');
         const batches = f.trace.filter((event) => event.kind === 'batch');
         assert.equal(batches.length, 1);
@@ -2884,7 +2901,11 @@ test('unexpected native atomicity result counts fail closed after real SQL commi
         exercised += 1;
         return corruption === 'missing-result' ? results.slice(0, -1) : [...results, results.at(-1)];
       };
-      await assert.rejects(verifyD1BatchAtomicity(db), /unexpected result count/);
+      await assert.rejects(verifyD1BatchAtomicity(db), (error) => {
+        assert.equal(error.d1AtomicityPhase, 'batch-positive');
+        assert.equal(error.d1AtomicityFailure, 'assertion');
+        return true;
+      });
       assert.equal(exercised, 1);
       const batches = f.trace.filter((event) => event.kind === 'batch');
       assert.equal(batches.length, 1);
@@ -2912,13 +2933,67 @@ test('the atomicity positive control detects non-atomic partial commits and remo
   // autocommits CREATE/INSERT before the invalid JSON statement. This is the negative control.
   db.atomicBatch = false;
   db.database.exec("CREATE TABLE user_owned_atomicity_sentinel (value TEXT); INSERT INTO user_owned_atomicity_sentinel VALUES ('keep')");
-  await assert.rejects(verifyD1BatchAtomicity(db), /partially committed before a failing statement; source copy forbidden/);
+  await assert.rejects(verifyD1BatchAtomicity(db), (error) => {
+    assert.equal(error.d1AtomicityPhase, 'rollback-negative');
+    assert.equal(error.d1AtomicityFailure, 'assertion');
+    return true;
+  });
   assert.deepEqual(probeTables(db), []);
   assert.deepEqual(db.rows('SELECT * FROM user_owned_atomicity_sentinel'), [{ value: 'keep' }]);
   const drops = f.trace.filter((event) => event.kind === 'query' && /^\s*DROP TABLE\b/i.test(event.sql));
   assert.equal(drops.length, 2, 'successful proof table and detected partial-commit table are both owned and cleaned');
   assert.ok(drops.every(({ sql }) => sql.includes('__index_batch_probe_')));
   assert.ok(f.trace.every((event) => event.db === db.id));
+});
+
+test('non-atomic partial commit retains its primary assertion when owned DROP fails and leaves foreign SQLite state untouched', async (context) => {
+  const canary = 'PRIVATE_ATOMICITY_CLEANUP_CANARY';
+  for (const failureKind of ['transport', 'http', 'statement', 'shape']) {
+    await context.test(failureKind, async (child) => {
+      const f = await fixture(child);
+      const db = annotateSqlProbeFailures(f.shards[0]);
+      seedBlocks(f.source, [block(32_301, 0)]);
+      seedBlocks(db, [block(32_302, 0)]);
+      const sourceBefore = blockSnapshot(f.source);
+      const indexesBefore = f.shards.map(blockSnapshot);
+      const sentinel = '__index_batch_probe_user_owned_cleanup_sentinel';
+      db.database.exec(`CREATE TABLE ${quoted(sentinel)} (value TEXT NOT NULL)`);
+      db.database.prepare(`INSERT INTO ${quoted(sentinel)} VALUES (?)`).run('keep foreign probe-like table');
+      db.atomicBatch = false;
+      let drops = 0;
+      db.beforeQuery = ({ sql }) => {
+        if (!/^DROP TABLE "__index_batch_probe_[0-9a-f]+"$/.test(sql)) return;
+        if (++drops === 2) {
+          throw Object.assign(new Error(canary), { d1FailureKind: failureKind, cause: new Error(canary) });
+        }
+      };
+      await assert.rejects(verifyD1BatchAtomicity(db), (error) => {
+        assert.equal(error.d1AtomicityPhase, 'rollback-negative');
+        assert.equal(error.d1AtomicityFailure, 'assertion');
+        assert.equal(error.d1AtomicityCleanupFailure, failureKind);
+        assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+        assert.equal(error.cause, undefined);
+        return true;
+      });
+      assert.equal(drops, 2, 'the positive control drops once; final cleanup attempts the retained owned table once');
+      const owned = probeTables(db).filter(({ name }) => name !== sentinel);
+      assert.equal(owned.length, 1, 'the failed DROP must leave the genuinely partially committed probe');
+      assert.deepEqual(db.rows(`SELECT id, value FROM ${quoted(owned[0].name)}`),
+        [{ id: 1, value: D1_BATCH_PROBE_TEXT }]);
+      assert.deepEqual(db.rows(`SELECT * FROM ${quoted(sentinel)}`), [{ value: 'keep foreign probe-like table' }]);
+      assert.deepEqual(blockSnapshot(f.source), sourceBefore);
+      assert.deepEqual(f.shards.map(blockSnapshot), indexesBefore);
+      assert.deepEqual(sourceWrites(f), []);
+      assert.ok(f.trace.every((event) => event.db === db.id));
+      const batches = f.trace.filter((event) => event.kind === 'batch');
+      assert.equal(batches.length, 2);
+      assert.equal(batches[0].committed, true);
+      assert.equal(batches[1].atomic, false);
+      assert.equal(batches[1].committed, false);
+      assert.ok(f.trace.some((event) => event.kind === 'batch-statement' && event.transaction === batches[1].transaction
+        && /^INSERT INTO/.test(event.sql) && event.success), 'SQLite must commit the insert before the intentional SQL failure');
+    });
+  }
 });
 
 test('auth/network and unclassified rejection reasons cannot masquerade as atomicity proof', async (context) => {
@@ -2935,7 +3010,11 @@ test('auth/network and unclassified rejection reasons cannot masquerade as atomi
         }
         return native(statements);
       };
-      await assert.rejects(verifyD1BatchAtomicity(db), /expected SQL rejection; atomicity unproven/);
+      await assert.rejects(verifyD1BatchAtomicity(db), (error) => {
+        assert.equal(error.d1AtomicityPhase, 'rollback-negative');
+        assert.equal(error.d1AtomicityFailure, 'other');
+        return true;
+      });
       assert.deepEqual(probeTables(db), []);
       assert.equal(f.trace.filter((event) => event.kind === 'batch').length, 1,
         'only the real successful batch ran; table absence after an unexecuted request is not rollback evidence');
@@ -2954,7 +3033,11 @@ test('unsupported SQL in the successful atomicity control fails closed and leave
       db.execute('SELECT index_atomicity_unsupported_capability()', []);
     }
   };
-  await assert.rejects(verifyD1BatchAtomicity(db), /no such function: index_atomicity_unsupported_capability/);
+  await assert.rejects(verifyD1BatchAtomicity(db), (error) => {
+    assert.equal(error.d1AtomicityPhase, 'batch-positive');
+    assert.equal(error.d1AtomicityFailure, 'other');
+    return true;
+  });
   assert.deepEqual(probeTables(db), []);
   const batches = f.trace.filter((event) => event.kind === 'batch');
   assert.equal(batches.length, 1);
@@ -2974,14 +3057,18 @@ test('atomicity probe refuses an already-owned random name without deleting or m
       db.database.prepare(`INSERT INTO ${quoted(existingName)} (value) VALUES (?)`).run('pre-existing owner sentinel');
     }
   };
-  await assert.rejects(verifyD1BatchAtomicity(db), /name already exists; refusing ownership/);
+  await assert.rejects(verifyD1BatchAtomicity(db), (error) => {
+    assert.equal(error.d1AtomicityPhase, 'ownership');
+    assert.equal(error.d1AtomicityFailure, 'assertion');
+    return true;
+  });
   assert.ok(existingName);
   assert.deepEqual(db.rows(`SELECT * FROM ${quoted(existingName)}`), [{ value: 'pre-existing owner sentinel' }]);
   assert.equal(f.trace.filter((event) => event.kind === 'batch').length, 0);
   assert.ok(!f.trace.some((event) => event.sql && isWrite(event.sql)), 'the existing table must never enter probe cleanup');
 });
 
-test('D1 SQL failure classification exposes only safe reason enums and treats absent or unrelated messages as other', () => {
+test('D1 SQL failure classification exposes only safe reason enums and leaves absent or conflicting tokens unknown', () => {
   for (const errors of [
     ['malformed JSON'], [{ message: 'D1_ERROR: malformed JSON: SQLITE_ERROR', code: 7500 }],
     [{ message: 'MALFORMED json in intentional SQL probe' }],
@@ -2989,7 +3076,122 @@ test('D1 SQL failure classification exposes only safe reason enums and treats ab
   for (const errors of [
     [], [null, undefined, {}], [{ code: 10000 }], [{ message: 42 }],
     ['authentication failed'], [{ message: 'connection reset' }], [{ message: 'not valid JSON' }],
+    ['index_migration_frozen_extra'], ['INDEX_MIGRATION_FROZEN'], ['SQLITE_CONSTRAINT'],
   ]) assert.equal(d1SqlFailureReason(errors), 'other');
+  for (const [message, reason] of [
+    ['index_migration_frozen', 'writer-fence'],
+    ['D1_ERROR: index_migration_frozen: SQLITE_CONSTRAINT [code: 7500]', 'writer-fence'],
+    ['D1_ERROR: database or disk is full: SQLITE_FULL', 'capacity'],
+    ['near "private_sql": syntax error', 'sql-syntax'],
+    ['no such table: private_schema', 'missing-schema'],
+    ['too many SQL variables', 'limits'],
+    ['too many terms in compound SELECT', 'limits'],
+    ['string or blob too big: SQLITE_TOOBIG', 'limits'],
+    ['Exceeded maximum DB size.', 'capacity'],
+    ["Your account has exceeded D1's maximum account storage limit, please contact Cloudflare to raise your limit", 'capacity'],
+    ["Your account has exceeded D1's free tier daily row read limit.", 'quota'],
+    ['D1_COLUMN_NOTFOUND: private_column', 'missing-schema'],
+    ['D1_TYPE_ERROR: private_value', 'type-error'],
+    ['D1 DB reset because its code was updated.', 'transient-reset'],
+    ['Internal error while starting up D1 DB storage caused object to be reset.', 'transient-reset'],
+    ['Network connection lost.', 'transient-reset'],
+    ['Replica disconnected from primary.', 'transient-reset'],
+    ['Cannot resolve D1 DB due to transient issue on remote node.', 'transient-reset'],
+    ['D1 DB storage operation exceeded timeout which caused object to be reset.', 'storage-timeout'],
+    ['D1 DB is overloaded. Requests queued for too long.', 'overloaded'],
+    ["D1 DB's isolate exceeded its memory limit and was reset.", 'memory-limit'],
+    ['D1 DB exceeded its CPU time limit and was reset.', 'cpu-limit'],
+  ]) {
+    const classified = d1SqlFailureReason([{ message, code: 7500 }]);
+    assert.equal(classified, reason);
+  }
+  assert.equal(d1SqlFailureReason([{ code: 7500 }]), 'other');
+  assert.equal(d1SqlFailureReason(['database or disk is full; malformed JSON']), 'other');
+  assert.equal(d1SqlFailureReason(['index_migration_frozen; malformed JSON']), 'other');
+});
+
+test('REST D1 diagnostics sanitize envelope, result and transport failures without replay', async (context) => {
+  const originalFetch = globalThis.fetch;
+  context.after(() => { globalThis.fetch = originalFetch; });
+  const id = '95dbde60-d5ab-4e2c-989f-fcd44a3ab479';
+  const canary = 'PRIVATE_SQL_TRANSCRIPT_CANARY';
+  const failure = { message: `no such table: ${canary}`, code: 7500 };
+  for (const scenario of ['envelope', 'result', 'transport', 'non-json']) {
+    let requests = 0;
+    globalThis.fetch = async () => {
+      requests += 1;
+      if (scenario === 'transport') throw new Error(canary);
+      if (scenario === 'non-json') return new Response(canary, { status: 502 });
+      return Response.json(scenario === 'envelope'
+        ? { success: false, errors: [failure, { code: canary }, { code: -1 }, { code: 1.5 }] }
+        : { success: true, result: [{ success: false, error: failure.message, errors: [failure, { code: canary }] }] },
+      { status: scenario === 'envelope' ? 400 : 200 });
+    };
+    const db = diagnosticClient(PREVIEW_ACCOUNT_ID, 'private-token', { permit: async () => {} }).db(id);
+    await assert.rejects(db.batch([{ sql: canary, params: [canary] }]), (error) => {
+      assert.equal(error.d1SqlReason, ['envelope', 'result'].includes(scenario) ? 'missing-schema' : 'other');
+      assert.equal(error.d1FailureKind, scenario === 'transport' ? 'transport'
+        : scenario === 'result' ? 'statement' : 'http');
+      assert.ok(error.message.includes(id));
+      assert.ok(error.message.includes('kind=batch'));
+      assert.ok(!error.message.includes(canary));
+      assert.ok(!JSON.stringify(error).includes(canary));
+      if (['envelope', 'result'].includes(scenario)) assert.ok(error.message.includes('codes=7500'));
+      return true;
+    });
+    assert.equal(requests, 1, 'an ambiguous failure must not replay a batch');
+  }
+});
+
+test('copy preserves native rejection and retained source across semantic failure phases', async (context) => {
+  for (const phase of ['copy-setup', 'copy-page-write', 'copy-page-readback', 'copy-fts-match', 'copy-source-delete-and-freeze']) {
+    await context.test(phase, async (child) => {
+      const f = await fixture(child);
+      const original = block(801, 0);
+      seedBlocks(f.source, [original]);
+      const rejection = new Error('safe native rejection');
+      rejection.d1SqlReason = 'missing-schema';
+      rejection.d1Diagnostic = true;
+      const db = phase === 'copy-source-delete-and-freeze' ? f.source : f.shards[0];
+      for (const kind of ['query', 'batch']) {
+        const native = db[kind].bind(db);
+        db[kind] = async (...args) => {
+          const sql = kind === 'query' ? args[0] : args[0].map((statement) => statement.sql).join('\n');
+          const fail = phase === 'copy-setup' ? /^PRAGMA table_info/.test(sql)
+            : phase === 'copy-page-write' ? kind === 'batch' && /INSERT INTO blocks \(/.test(sql)
+              : phase === 'copy-page-readback' ? kind === 'query' && /WITH candidates AS MATERIALIZED/.test(sql)
+                : phase === 'copy-fts-match' ? /blocks_fts MATCH/.test(sql)
+                  : kind === 'batch' && /DELETE FROM blocks/.test(sql);
+          if (fail) throw rejection;
+          return native(...args);
+        };
+      }
+      await assert.rejects(copyFrozenIndex(f.args()), (error) => {
+        assert.equal(error, rejection);
+        assert.equal(error.d1Phase, phase);
+        assert.equal(error.d1SqlReason, 'missing-schema');
+        return true;
+      });
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [original], 'no rejected phase authorizes source deletion');
+      const state = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      if (phase !== 'copy-setup') {
+        assert.equal(state.rows, 0);
+        assert.equal(state.pending.phase, phase === 'copy-source-delete-and-freeze' ? 'verified' : 'copying');
+      }
+    });
+  }
+});
+
+test('row and malformed checkpoint validation do not disclose unknown metadata or payload bytes', async () => {
+  const canary = 'PRIVATE_METADATA_TRANSCRIPT_CANARY';
+  for (const action of [
+    () => canonicalRow([canary], {}),
+    () => canonicalRow([canary], { [canary]: true }),
+    () => canonicalRow([canary], { [canary]: Infinity }),
+  ]) assert.throws(action, (error) => !error.message.includes(canary));
+  await assert.rejects(readCheckpoint({
+    id: 'fixture', query: async () => [{ value: canary }],
+  }, COPY_CHECKPOINT), (error) => !error.message.includes(canary));
 });
 
 test('checkpoint classification refuses missing, boolean and unknown workflow state enums instead of treating them as completion', () => {
@@ -3003,6 +3205,1093 @@ test('checkpoint classification refuses missing, boolean and unknown workflow st
         source, shards, legacyTables: [], copy: valid, seed: valid,
         [key]: { identity, state },
       }), /invalid index migration checkpoint state/);
+    }
+  }
+});
+
+const sqliteCopyControlContexts = new WeakSet();
+
+// Exercise the production REST client against native SQLite commits, including the
+// boundary between a successful response and the next request's budget check.
+function sqliteCopyControl(context, f, options = {}) {
+  if (!sqliteCopyControlContexts.has(context)) {
+    const originalFetch = globalThis.fetch;
+    context.after(() => { globalThis.fetch = originalFetch; });
+    sqliteCopyControlContexts.add(context);
+  }
+  const requests = [];
+  globalThis.fetch = async (url, init) => {
+    const id = decodeURIComponent(new URL(url).pathname.match(/\/d1\/database\/([^/]+)\/query$/)[1]);
+    const adapter = [f.source, ...f.shards].find((db) => db.id === id);
+    assert.ok(adapter, 'REST requests must target a real fixture database');
+    const body = JSON.parse(init.body);
+    requests.push({ id, body, signal: init.signal });
+    const results = body.batch
+      ? await adapter.batch(body.batch)
+      : [{ success: true, results: await adapter.query(body.sql, body.params) }];
+    return Response.json({ success: true, result: results });
+  };
+  const client = indexControlClient(PREVIEW_ACCOUNT_ID, 'private-token', {
+    permit: async () => {}, ...options,
+  });
+  return { requests, args: { source: client.db(f.source.id),
+    shards: f.shards.map(({ id }) => client.db(id)), gate } };
+}
+
+test('copy pass budgets reject unsafe durations and expire synchronously at exact elapsed or wait boundaries', () => {
+  for (const value of [0, -1, 0.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1,
+    '1', null, undefined]) {
+    assert.throws(() => createCopyPassRequestGate(value), /positive.*safe integer/i);
+  }
+  for (const budget of [1, 1000, Number.MAX_SAFE_INTEGER]) {
+    let time = 0;
+    const requestGate = createCopyPassRequestGate(budget, { now: () => time });
+    assert.equal(requestGate(), undefined, 'gate must not schedule asynchronous work');
+    assert.equal(requestGate(budget - 1), undefined);
+    assert.throws(() => requestGate(budget), CopyPassBudgetExhausted);
+    time = budget;
+    assert.throws(() => requestGate(), CopyPassBudgetExhausted);
+  }
+  let time = 50;
+  const requestGate = createCopyPassRequestGate(1000, { now: () => time });
+  time = 750;
+  assert.equal(requestGate(299), undefined);
+  assert.throws(() => requestGate(300), CopyPassBudgetExhausted);
+});
+
+test('REST budget gates stop before permit and after permit without fetching or sanitizing the budget identity', async (context) => {
+  for (const boundary of ['before-permit', 'after-permit']) {
+    await context.test(boundary, async (child) => {
+      const f = await fixture(child);
+      const original = block(40_101, 0);
+      seedBlocks(f.source, [original]);
+      let time = 0;
+      let permits = 0;
+      const budgetGate = createCopyPassRequestGate(10, { now: () => time });
+      let rejection;
+      const requestGate = (delay) => {
+        try { return budgetGate(delay); }
+        catch (error) { rejection = error; throw error; }
+      };
+      const control = sqliteCopyControl(child, f, { requestGate, permit: async () => {
+        permits += 1;
+        time = 10;
+      } });
+      if (boundary === 'before-permit') time = 10;
+      await assert.rejects(control.args.source.query('SELECT * FROM blocks'), (error) => {
+        assert.ok(error instanceof CopyPassBudgetExhausted);
+        assert.equal(error, rejection, 'D1 sanitization must retain the precise budget exception');
+        return true;
+      });
+      assert.equal(permits, boundary === 'before-permit' ? 0 : 1);
+      assert.deepEqual(control.requests, []);
+      assert.deepEqual(f.trace, []);
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [original]);
+    });
+  }
+});
+
+test('budget-limited native copy passes resume committed copying and verified pages with full fidelity', async (context) => {
+  const rows = [
+    block(40_201, 0, { text: '\uFEFFbudget_needle_0 café\u0000tail_0 😀', row_hash: Number.MAX_SAFE_INTEGER }),
+    block(40_202, 1, { text: 'budget_needle_1 会話\u0000tail_1', role: '', tool_name: null }),
+    block(40_203, 0, { text: null, role: null, byte_start: null, byte_len: null }),
+    block(40_204, 1, { text: '', media_byte_start: 2 ** 40, media_byte_len: 0, media_type: '' }),
+  ];
+  for (const boundary of ['before-first-request', 'committed-shard-write', 'committed-source-freeze']) {
+    await context.test(boundary, async (child) => {
+      const baseline = await fixture(child);
+      seedBlocks(baseline.source, rows);
+      const expected = await copyFrozenIndex(baseline.args());
+      const f = await fixture(child);
+      seedBlocks(f.source, rows);
+      const verifiedRows = assertVerifiedBeforeDelete(f);
+      const deletedRowCounts = [];
+      const observeDeletedRows = () => {
+        f.source.afterStatement = ({ sql }) => {
+          if (/\bDELETE\s+FROM\s+"?blocks"?\b/i.test(sql)) {
+            deletedRowCounts.push(f.source.rows('SELECT changes() AS n')[0].n);
+          }
+        };
+      };
+      observeDeletedRows();
+      const initialShardSnapshots = f.shards.map(blockSnapshot);
+      let time = 0;
+      const requestGate = createCopyPassRequestGate(100, { now: () => time });
+      let expiredAtCommit = false;
+      if (boundary === 'committed-shard-write') {
+        for (const shard of f.shards) shard.afterBatch = ({ statements, committed }) => {
+          if (statements.some(({ sql }) => /\bINSERT\s+INTO\s+"?blocks"?\s*\(/i.test(sql))) {
+            assert.equal(committed, true);
+            expiredAtCommit = true;
+            time = 100;
+          }
+        };
+      } else if (boundary === 'committed-source-freeze') {
+        f.source.afterBatch = ({ statements, committed }) => {
+          if (statements.some(({ sql }) => /\bDELETE\s+FROM\s+"?blocks"?\b/i.test(sql))) {
+            assert.equal(committed, true);
+            assert.deepEqual(f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
+            expiredAtCommit = true;
+            time = 100;
+          }
+        };
+      } else time = 100;
+      const control = sqliteCopyControl(child, f, { requestGate });
+      assert.deepEqual(await runCopyPass(control.args), { status: 'partial', reason: 'pass-budget-exhausted' });
+      const saved = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      if (boundary === 'before-first-request') {
+        assert.equal(saved, null);
+        assert.deepEqual(control.requests, []);
+        assert.equal(destinationBatchCount(f), 0);
+        assert.deepEqual(f.shards.map(blockSnapshot), initialShardSnapshots);
+      } else {
+        assert.equal(expiredAtCommit, true);
+        assert.equal(saved.state, 'pending', 'partial must not publish complete');
+        assert.equal(saved.rows, 0, 'no IDX00 retirement acknowledgement may cross the budget');
+        assert.equal(saved.pending.phase, boundary === 'committed-shard-write' ? 'copying' : 'verified');
+        assert.deepEqual(saved.pending.rows.map(({ id }) => id), rows.map(({ id }) => id));
+        assertAtomicBlockBatches(f);
+        if (boundary === 'committed-shard-write') {
+          assert.deepEqual(f.shards[0].rows('SELECT * FROM blocks ORDER BY id'), rows.filter((row) =>
+            indexShardForSessionId(row.session_id, 2) === 0));
+          assert.deepEqual(blockSnapshot(f.shards[1]), initialShardSnapshots[1],
+            'the next shard batch must not start once the previous commit exhausts the pass');
+        }
+      }
+      assert.ok(f.trace.filter(({ kind }) => kind === 'batch').every(({ committed }) => committed),
+        'budget exhaustion must never abort an in-flight native transaction');
+      assert.ok(control.requests.every(({ signal }) => !signal.aborted));
+      const retired = boundary === 'committed-source-freeze';
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), retired ? [] : rows);
+      assert.equal(verifiedRows(), retired ? rows.length : 0);
+      const deletionsBeforeResume = sourceWrites(f).filter(({ sql }) => /\bDELETE\s+FROM\s+"?blocks"?\b/i.test(sql));
+      assert.equal(deletionsBeforeResume.length, retired ? 1 : 0);
+      const shardSnapshots = f.shards.map(blockSnapshot);
+      const writesBeforeResume = destinationBatchCount(f);
+      f.restart();
+      assertVerifiedBeforeDelete(f);
+      observeDeletedRows();
+      time = 0;
+      const resumed = sqliteCopyControl(child, f, {
+        requestGate: createCopyPassRequestGate(100, { now: () => time }),
+      });
+      assert.deepEqual(await runCopyPass(resumed.args), {
+        copiedRows: rows.length, state: 'complete', sha256: expected.sha256,
+      });
+      assertCopied(f, rows);
+      assert.deepEqual(f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
+      const completed = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      assert.equal(completed.state, 'complete');
+      assert.equal(completed.pending, null);
+      assert.equal(completed.rows, rows.length);
+      assert.equal(completed.sha256, expected.sha256);
+      const deletions = sourceWrites(f).filter(({ sql }) => /\bDELETE\s+FROM\s+"?blocks"?\b/i.test(sql));
+      assert.equal(deletions.length, retired ? 2 : 1);
+      assert.deepEqual(deletedRowCounts, retired ? [rows.length, 0] : [rows.length],
+        'verified resume may replay the CAS, but must delete every original tuple exactly once');
+      assert.equal(deletedRowCounts.reduce((sum, count) => sum + count, 0), rows.length);
+      if (retired) {
+        assert.equal(destinationBatchCount(f), writesBeforeResume);
+        assert.deepEqual(f.shards.map(blockSnapshot), shardSnapshots,
+          'verified resume must reuse committed block bytes and exact FTS postings');
+      }
+      assert.ok(f.trace.filter(({ kind }) => kind === 'batch').every(({ committed }) => committed));
+    });
+  }
+});
+
+test('valid 429 waits cannot reach or cross the copy pass deadline, but an affordable wait retries native reads', async (context) => {
+  for (const remaining of [999, 1000, 1001]) {
+    await context.test(`remaining=${remaining}`, async (child) => {
+      const f = await fixture(child);
+      seedBlocks(f.source, [block(40_301, 0)]);
+      let time = 0;
+      const waits = [];
+      const control = sqliteCopyControl(child, f, {
+        requestGate: createCopyPassRequestGate(2000, { now: () => time }),
+        wait: async (delay) => { waits.push(delay); time += delay; },
+      });
+      const nativeFetch = globalThis.fetch;
+      let attempts = 0;
+      globalThis.fetch = async (...args) => {
+        attempts += 1;
+        if (attempts === 1) {
+          time = 2000 - remaining;
+          return new Response('rate limited', { status: 429, headers: { 'retry-after': '1' } });
+        }
+        return nativeFetch(...args);
+      };
+      if (remaining <= 1000) {
+        assert.deepEqual(await runCopyPass(control.args), { status: 'partial', reason: 'pass-budget-exhausted' });
+        assert.deepEqual(waits, []);
+        assert.equal(attempts, 1);
+        assert.deepEqual(f.trace, []);
+        assert.equal(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), null);
+        assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [block(40_301, 0)]);
+      } else {
+        assert.deepEqual(await control.args.source.query('SELECT id FROM blocks'), [{ id: 40_301 }]);
+        assert.deepEqual(waits, [1000]);
+        assert.equal(attempts, 2);
+        assert.equal(time, 1999);
+        assert.equal(control.requests.length, 1);
+      }
+    });
+  }
+});
+
+test('copy pass never turns native HTTP 400 or ambiguous network failures into partial success or replays', async (context) => {
+  for (const failure of ['native-400', 'network']) {
+    await context.test(failure, async (child) => {
+      const f = await fixture(child);
+      const original = block(40_401, 0);
+      seedBlocks(f.source, [original]);
+      const control = sqliteCopyControl(child, f, {
+        requestGate: createCopyPassRequestGate(100, { now: () => 0 }),
+        wait: async () => assert.fail('terminal failures must not schedule retries'),
+      });
+      let attempts = 0;
+      globalThis.fetch = async () => {
+        attempts += 1;
+        if (failure === 'network') throw new Error('private network failure');
+        return Response.json({ success: false, errors: [{ code: 7500, message: 'no such table: private_table' }] },
+          { status: 400 });
+      };
+      await assert.rejects(runCopyPass(control.args), (error) => {
+        assert.ok(!(error instanceof CopyPassBudgetExhausted));
+        assert.equal(error.d1Diagnostic, true);
+        assert.equal(error.d1SqlReason, failure === 'native-400' ? 'missing-schema' : 'other');
+        assert.ok(!error.message.includes('private'));
+        return true;
+      });
+      assert.equal(attempts, 1);
+      assert.deepEqual(f.trace, []);
+      assert.equal(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), null);
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [original]);
+    });
+  }
+});
+
+const scratchNonce = '0123456789abcdef01234567';
+const scratchNames = ['source', 'idx00', 'idx01'].map((role) => `pr-42-copy-${scratchNonce}-${role}`);
+
+// A stateful account registry, not an HTTP echo: every create/delete changes the
+// resources subsequent list and identity reads observe. Faults model provider drift.
+function scratchAccount(existing = [], faults = {}) {
+  const resources = new Map(existing.map((database) => [database.uuid, { ...database }]));
+  const created = [];
+  const deleted = [];
+  const adapters = new Map();
+  let sequence = 0;
+  const api = {
+    async cf(pathname, init = {}) {
+      const method = init.method ?? 'GET';
+      if (pathname.startsWith('d1/database?') && method === 'GET') {
+        const parameters = new URLSearchParams(pathname.split('?')[1]);
+        const page = Number(parameters.get('page') ?? 1);
+        const perPage = Number(parameters.get('per_page') ?? 100);
+        const all = [...resources.values()];
+        return {
+          result: all.slice((page - 1) * perPage, page * perPage).map((database) => ({ ...database })),
+          result_info: { page, per_page: perPage, total_count: all.length, total_pages: Math.ceil(all.length / perPage) },
+        };
+      }
+      if (pathname === 'd1/database' && method === 'POST') {
+        const { name } = JSON.parse(init.body);
+        faults.beforeCreate?.(name, resources);
+        assert.ok(![...resources.values()].some((database) => database.name === name), 'provider rejects duplicate names');
+        const database = { uuid: `scratch-created-${++sequence}`, name };
+        resources.set(database.uuid, database);
+        created.push({ ...database });
+        return faults.createResponse?.({ ...database }, resources) ?? { ...database };
+      }
+      const match = /^d1\/database\/([^/?]+)$/.exec(pathname);
+      assert.ok(match, `unexpected registry resource ${pathname}`);
+      const uuid = decodeURIComponent(match[1]);
+      const database = resources.get(uuid);
+      if (!database) throw Object.assign(new Error('private missing database'), { providerStatus: 404 });
+      if (method === 'GET') return faults.identity ? faults.identity({ ...database }, resources) : { ...database };
+      assert.equal(method, 'DELETE');
+      faults.beforeDelete?.({ ...database }, resources);
+      resources.delete(uuid);
+      deleted.push({ ...database });
+      return {};
+    },
+    db(uuid) {
+      assert.ok(resources.has(uuid), 'native adapter requires an existing database');
+      const adapter = { id: uuid };
+      adapters.set(uuid, adapter);
+      return adapter;
+    },
+  };
+  return {
+    api, resources, created, deleted, adapters,
+    snapshot: () => [...resources.values()].map((database) => ({ ...database })).sort((a, b) => a.uuid.localeCompare(b.uuid)),
+  };
+}
+
+function standingScratchResources(foreignCount = 2) {
+  return [
+    { uuid: 'persistent-main', name: 'pr-42-sessions-index' },
+    { uuid: 'persistent-idx00', name: 'pr-42-sessions-index-idx00' },
+    { uuid: 'persistent-idx01', name: 'pr-42-sessions-index-idx01' },
+    ...Array.from({ length: foreignCount }, (_, index) => ({ uuid: `foreign-${index}`, name: `unrelated-account-db-${index}` })),
+  ];
+}
+
+function allocateScratch(account, run) {
+  return withScratchD1Databases({ api: account.api, pr: 42, nonce: scratchNonce, run });
+}
+
+async function rejectsPrivateScratchFailure(operation) {
+  await assert.rejects(operation, (error) => {
+    assert.ok(error instanceof Error);
+    assert.ok(!error.message.includes('private'), 'allocator must sanitize provider and callback errors');
+    return true;
+  });
+}
+
+test('scratch allocator proves whole-account capacity before creation, including foreign databases', async (context) => {
+  for (const foreignCount of [5, 7]) {
+    await context.test(`${3 + foreignCount} existing databases`, async () => {
+      const account = scratchAccount(standingScratchResources(foreignCount));
+      const before = account.snapshot();
+      await assert.rejects(allocateScratch(account, async () => assert.fail('exhausted account must not run')));
+      assert.deepEqual(account.created, [], 'quota rejection must not transiently allocate any scratch database');
+      assert.deepEqual(account.deleted, []);
+      assert.deepEqual(account.snapshot(), before);
+    });
+  }
+});
+
+test('scratch allocator never adopts or deletes an exact generated-name collision', async () => {
+  const account = scratchAccount([
+    ...standingScratchResources(),
+    { uuid: 'previous-interrupted-run', name: scratchNames[2] },
+  ]);
+  const before = account.snapshot();
+  await assert.rejects(allocateScratch(account, async () => assert.fail('colliding run must not execute')));
+  assert.deepEqual(account.created, []);
+  assert.deepEqual(account.deleted, []);
+  assert.deepEqual(account.snapshot(), before);
+});
+
+test('scratch allocator uses three unique native adapters at the exact capacity boundary and preserves all standing resources', async () => {
+  const account = scratchAccount(standingScratchResources(4));
+  const before = account.snapshot();
+  const result = await allocateScratch(account, async ({ source, shards }) => {
+    assert.equal(shards.length, 2);
+    const native = [source, ...shards];
+    assert.equal(new Set(native.map(({ id }) => id)).size, 3);
+    assert.deepEqual(native.map(({ id }) => account.resources.get(id).name), scratchNames);
+    for (const adapter of native) assert.equal(adapter, account.adapters.get(adapter.id));
+    assert.equal(account.resources.size, 10);
+    return { completed: true };
+  });
+  assert.deepEqual(result, { completed: true });
+  assert.deepEqual(account.created.map(({ name }) => name), scratchNames);
+  assert.deepEqual(account.snapshot(), before);
+  assert.deepEqual(new Set(account.deleted.map(({ uuid }) => uuid)), new Set(account.created.map(({ uuid }) => uuid)));
+});
+
+test('scratch callback failure cleans all three owned databases and redacts callback details', async () => {
+  const account = scratchAccount(standingScratchResources());
+  const before = account.snapshot();
+  let entered = false;
+  await rejectsPrivateScratchFailure(allocateScratch(account, async ({ source, shards }) => {
+    entered = true;
+    assert.deepEqual([source, ...shards].map(({ id }) => account.resources.get(id).name), scratchNames);
+    throw new Error('private callback payload');
+  }));
+  assert.equal(entered, true);
+  assert.deepEqual(account.created.map(({ name }) => name), scratchNames);
+  assert.deepEqual(account.snapshot(), before);
+});
+
+test('scratch partial creation failure cleans only validated known creations and never invokes the callback', async (context) => {
+  for (const failingName of scratchNames.slice(1)) {
+    await context.test(failingName, async () => {
+      const account = scratchAccount(standingScratchResources(), {
+        beforeCreate(name) {
+          if (name === failingName) throw new Error('private provider creation error');
+        },
+      });
+      const before = account.snapshot();
+      await rejectsPrivateScratchFailure(allocateScratch(account, async () => assert.fail('partial allocation must not run')));
+      assert.deepEqual(account.created.map(({ name }) => name), scratchNames.slice(0, scratchNames.indexOf(failingName)));
+      assert.deepEqual(account.deleted.map(({ uuid }) => uuid).sort(), account.created.map(({ uuid }) => uuid).sort());
+      assert.deepEqual(account.snapshot(), before);
+    });
+  }
+});
+
+test('scratch allocator refuses foreign create responses without adopting or deleting their identities', async (context) => {
+  for (const responseKind of ['foreign-name', 'prior-uuid', 'duplicate-created-uuid', 'missing-uuid']) {
+    await context.test(responseKind, async () => {
+      const account = scratchAccount(standingScratchResources(), {
+        createResponse(database, resources) {
+          if (database.name !== scratchNames[1]) return database;
+          if (responseKind === 'foreign-name') {
+            resources.set(database.uuid, { ...database, name: 'foreign-response-database' });
+            return { ...database, name: 'foreign-response-database' };
+          }
+          if (responseKind === 'prior-uuid') return { ...database, uuid: 'foreign-0' };
+          if (responseKind === 'duplicate-created-uuid') return { ...database, uuid: 'scratch-created-1' };
+          return { name: database.name };
+        },
+      });
+      const before = account.snapshot();
+      await assert.rejects(allocateScratch(account, async () => assert.fail('untrusted response must not run')));
+      assert.deepEqual(account.created.map(({ name }) => name), scratchNames.slice(0, 2));
+      assert.deepEqual(account.deleted, [account.created[0]]);
+      assert.deepEqual(account.snapshot(), [
+        ...before,
+        { uuid: 'scratch-created-2', name: responseKind === 'foreign-name' ? 'foreign-response-database' : scratchNames[1] },
+      ].sort((a, b) => a.uuid.localeCompare(b.uuid)));
+    });
+  }
+});
+
+test('scratch cleanup refuses identity drift while still removing every other known owned database', async (context) => {
+  for (const drift of ['name', 'uuid', 'other-pr']) {
+    await context.test(drift, async () => {
+      let driftEnabled = false;
+      const account = scratchAccount(standingScratchResources(), {
+        identity(database) {
+          return driftEnabled && database.uuid === 'scratch-created-1' && drift === 'uuid'
+            ? { ...database, uuid: 'foreign-0' } : database;
+        },
+      });
+      const before = account.snapshot();
+      let entered = false;
+      const survivorName = drift === 'name' ? 'foreign-renamed-database'
+        : drift === 'other-pr' ? scratchNames[0].replace('pr-42-', 'pr-43-') : scratchNames[0];
+      await assert.rejects(allocateScratch(account, async ({ source }) => {
+        entered = true;
+        driftEnabled = true;
+        account.resources.set(source.id, { uuid: source.id, name: survivorName });
+        return 'successful callback';
+      }));
+      assert.equal(entered, true);
+      assert.deepEqual(account.deleted.map(({ name }) => name).sort(), scratchNames.slice(1).sort());
+      assert.deepEqual(account.snapshot(), [
+        ...before, { uuid: 'scratch-created-1', name: survivorName },
+      ].sort((a, b) => a.uuid.localeCompare(b.uuid)));
+    });
+  }
+});
+
+test('scratch cleanup deletion failure fails successful work and attempts the remaining owned deletions', async () => {
+  const account = scratchAccount(standingScratchResources(), {
+    beforeDelete(database) {
+      if (database.name === scratchNames[0]) throw new Error('private provider deletion error');
+    },
+  });
+  const before = account.snapshot();
+  let entered = false;
+  await rejectsPrivateScratchFailure(allocateScratch(account, async () => { entered = true; return 'success'; }));
+  assert.equal(entered, true);
+  assert.deepEqual(account.deleted.map(({ name }) => name).sort(), scratchNames.slice(1).sort());
+  assert.deepEqual(account.snapshot(), [...before, account.created[0]].sort((a, b) => a.uuid.localeCompare(b.uuid)));
+});
+
+test('scratch cleanup rejects successful null metadata without deleting that resource and cleans other owned databases', async () => {
+  let nullMetadataEnabled = false;
+  const account = scratchAccount(standingScratchResources(), {
+    identity(database) {
+      return nullMetadataEnabled && database.name === scratchNames[0] ? null : database;
+    },
+  });
+  const before = account.snapshot();
+  await assert.rejects(allocateScratch(account, async () => {
+    nullMetadataEnabled = true;
+    return 'successful callback';
+  }), (error) => {
+    assert.equal(error.nativeCopyPhase, 'cleanup');
+    assert.equal(error.nativeCopyClass, 'ownership');
+    return true;
+  });
+  assert.deepEqual(account.deleted.map(({ name }) => name).sort(), scratchNames.slice(1).sort());
+  assert.deepEqual(account.snapshot(), [...before, account.created[0]].sort((a, b) => a.uuid.localeCompare(b.uuid)));
+});
+
+test('scratch cleanup accepts native HTTP 404 absence without touching standing resources', async () => {
+  const account = scratchAccount(standingScratchResources());
+  const before = account.snapshot();
+  await allocateScratch(account, async ({ source }) => {
+    assert.equal(account.resources.delete(source.id), true);
+  });
+  assert.deepEqual(account.deleted.map(({ name }) => name).sort(), scratchNames.slice(1).sort());
+  assert.deepEqual(account.snapshot(), before);
+});
+
+async function nativeScratchFixture(context, faults = {}) {
+  const directory = await mkdtemp(path.join(tmpdir(), 'native-copy-control-test-'));
+  const account = scratchAccount(standingScratchResources(), faults);
+  const adapters = [];
+  context.after(async () => {
+    for (const adapter of adapters) adapter.close();
+    await rm(directory, { recursive: true, force: true });
+  });
+  account.api.db = (uuid) => {
+    assert.ok(account.resources.has(uuid));
+    const adapter = new SqliteD1(uuid, path.join(directory, `${uuid}.sqlite`), []);
+    // Preserve actual SQLite execution and errors, adding only the native
+    // client's public SQL classification that the fence proof consumes.
+    for (const method of ['query', 'batch']) {
+      const execute = adapter[method].bind(adapter);
+      adapter[method] = async (...args) => {
+        try { return await execute(...args); }
+        catch (error) {
+          error.d1SqlReason = d1SqlFailureReason([{ message: error.message }]);
+          throw error;
+        }
+      };
+    }
+    adapters.push(adapter);
+    return adapter;
+  };
+  const indexMigrations = await migrations(path.join(hubRoot, 'migrations-index'));
+  return { account, adapters, proof: {
+    api: account.api,
+    pr: 42,
+    applySchema: async ({ source, shards }) => {
+      for (const database of [source, ...shards]) {
+        for (const migration of indexMigrations) database.database.exec(migration.sql);
+      }
+    },
+  } };
+}
+
+test('native full-copy control runs real SQLite schema, copier, independent readback and scratch cleanup end to end', async (context) => {
+  const { account, adapters, proof } = await nativeScratchFixture(context);
+  const before = account.snapshot();
+  const result = await verifyNativeCopyControl(proof);
+  assert.equal(result.state, 'verified');
+  assert.equal(result.probe, 'd1-native-full-copy');
+  assert.equal(result.rows, 2);
+  assert.equal(result.columns, BLOCK_COLUMNS.length);
+  assert.equal(result.shards, 2);
+  assert.ok(Number.isSafeInteger(result.ordinaryPages) && result.ordinaryPages > 0);
+  assert.ok(Number.isSafeInteger(result.fallbackPages) && result.fallbackPages > 0);
+  assert.equal(result.ftsMatches, 4);
+  assert.equal(result.freezeTriggers, 3);
+  assert.match(result.sha256, /^[0-9a-f]{64}$/);
+  const [source, ...shards] = adapters;
+  assert.deepEqual(source.rows('SELECT COUNT(*) AS rows FROM blocks'), [{ rows: 0 }]);
+  assert.deepEqual(source.rows(`SELECT state FROM ${SOURCE_FREEZE_TABLE}`), [{ state: 'frozen' }]);
+  const copied = shards.flatMap((database) => database.rows('SELECT * FROM blocks')).sort((a, b) => a.id - b.id);
+  assert.equal(copied.length, result.rows);
+  assert.equal(sha256(JSON.stringify(copied.map((row) => JSON.parse(canonicalRow(BLOCK_COLUMNS, row))))), result.sha256);
+  assert.equal((await readCheckpoint(shards[0], COPY_CHECKPOINT)).state, 'complete');
+  assert.deepEqual(account.snapshot(), before);
+  assert.equal(account.created.length, 3);
+  assert.equal(new Set(account.created.map(({ name }) => name)).size, 3);
+  for (const { name } of account.created) assert.match(name, /^pr-42-copy-[0-9a-f]{24}-(?:source|idx00|idx01)$/);
+  assert.deepEqual(new Set(account.deleted.map(({ uuid }) => uuid)), new Set(account.created.map(({ uuid }) => uuid)));
+});
+
+test('scratch double failure preserves the primary diagnostic and attempts every safe owned cleanup', async (context) => {
+  const canary = 'PRIVATE_DOUBLE_FAILURE_CANARY';
+  for (const failingOperation of ['identity', 'delete']) {
+    await context.test(failingOperation, async () => {
+      let cleanupEnabled = false;
+      const identities = [];
+      const deletions = [];
+      const account = scratchAccount(standingScratchResources(), {
+        identity(database) {
+          if (cleanupEnabled) {
+            identities.push(database.uuid);
+            if (failingOperation === 'identity' && database.name === scratchNames[0]) {
+              throw new Error(`${canary} identity provider body`);
+            }
+          }
+          return database;
+        },
+        beforeDelete(database) {
+          deletions.push(database.uuid);
+          if (failingOperation === 'delete' && database.name === scratchNames[0]) {
+            throw new Error(`${canary} deletion provider body`);
+          }
+        },
+      });
+      const before = account.snapshot();
+      await assert.rejects(allocateScratch(account, async () => {
+        cleanupEnabled = true;
+        throw Object.assign(new Error(`${canary} SQL/parameter/provider bytes`), {
+          d1Phase: 'copy-page-write', d1SqlReason: 'capacity', d1FailureKind: 'statement', cause: new Error(canary),
+        });
+      }), (error) => {
+        assert.equal(error.nativeCopyPhase, 'copy-page-write', 'cleanup must not replace the first semantic phase');
+        assert.equal(error.nativeCopyClass, 'capacity');
+        assert.equal(error.nativeCopyFailureKind, 'statement');
+        assert.equal(error.nativeCopyCleanup, 'failed');
+        assert.equal(error.nativeCopyCleanupClass, 'other');
+        assert.match(error.message, /cleanup=failed cleanupClass=other/);
+        assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+        assert.equal(error.cause, undefined);
+        return true;
+      });
+      assert.deepEqual(identities, account.created.map(({ uuid }) => uuid));
+      assert.deepEqual(deletions, account.created.slice(failingOperation === 'identity' ? 1 : 0).map(({ uuid }) => uuid));
+      assert.deepEqual(account.deleted, account.created.slice(1));
+      assert.deepEqual(account.snapshot(), [...before, account.created[0]].sort((a, b) => a.uuid.localeCompare(b.uuid)));
+    });
+  }
+});
+
+test('scratch unknown failure fields cannot become public diagnostic identities', async () => {
+  const canary = 'PRIVATE_UNKNOWN_FAILURE_CANARY';
+  const account = scratchAccount(standingScratchResources());
+  const before = account.snapshot();
+  await assert.rejects(allocateScratch(account, async () => {
+    throw Object.assign(new Error(canary), { d1Phase: canary, d1SqlReason: canary, code: canary });
+  }), (error) => {
+    assert.equal(error.nativeCopyPhase, 'control');
+    assert.equal(error.nativeCopyClass, 'other');
+    assert.equal(error.nativeCopyInvariant, undefined);
+    assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+    return true;
+  });
+  assert.deepEqual(account.snapshot(), before);
+});
+
+test('copier invariant codes identify physical FTS and SHA failures and an incomplete committed delete response', async (context) => {
+  for (const [fault, code, phase] of [
+    ['fts', 'fts-match', 'copy-fts-match'],
+    ['sha', 'readback-sha256', 'copy-page-readback'],
+    ['delete-response', 'source-delete', 'copy-source-delete-and-freeze'],
+  ]) {
+    await context.test(fault, async (child) => {
+      const f = await fixture(child);
+      const original = block(51_001, 0);
+      seedBlocks(f.source, [original]);
+      let mutated = false;
+      if (fault === 'delete-response') {
+        const batch = f.source.batch.bind(f.source);
+        f.source.batch = async (statements) => {
+          const results = await batch(statements);
+          if (statements.some(({ sql }) => /\bDELETE FROM blocks\b/.test(sql))) {
+            mutated = true;
+            return results.slice(0, -1);
+          }
+          return results;
+        };
+      } else {
+        f.shards[0].afterBatch = ({ statements, committed }) => {
+          if (!statements.some(({ sql }) => /^INSERT INTO blocks \(/.test(sql))) return;
+          assert.equal(committed, true);
+          mutated = true;
+          if (fault === 'fts') {
+            f.shards[0].database.exec("INSERT INTO blocks_fts (blocks_fts, rowid, text) SELECT 'delete', id, text FROM blocks");
+          } else {
+            f.shards[0].database.prepare('UPDATE blocks SET tool_name = ?').run('PRIVATE_INVARIANT_CANARY');
+          }
+        };
+      }
+      await assert.rejects(copyWithNativeParameters(f.args()), (error) => {
+        assert.equal(error.code, code);
+        assert.equal(error.d1Phase, phase);
+        assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes('PRIVATE_INVARIANT_CANARY'));
+        return true;
+      });
+      assert.equal(mutated, true);
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks'), fault === 'delete-response' ? [] : [original]);
+      const state = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      assert.equal(state.rows, 0);
+      assert.equal(state.pending.phase, fault === 'delete-response' ? 'verified' : 'copying');
+      if (fault === 'delete-response') {
+        assert.deepEqual(f.source.rows(`SELECT state FROM ${SOURCE_FREEZE_TABLE}`), [{ state: 'frozen' }]);
+      }
+    });
+  }
+});
+
+test('native proof preserves copier assertion identity from real schema, FTS and full-row SHA failures', async (context) => {
+  for (const [fault, invariant, phase] of [
+    ['schema', 'schema-columns', 'copy-setup'],
+    ['fts', 'fts-match', 'copy-fts-match'],
+    ['sha', 'readback-sha256', 'copy-page-readback'],
+    ['sha-cleanup', 'readback-sha256', 'copy-page-readback'],
+  ]) {
+    await context.test(fault, async (child) => {
+      const cleanupAttempts = [];
+      const { account, adapters, proof } = await nativeScratchFixture(child, {
+        beforeDelete(database) {
+          cleanupAttempts.push(database.uuid);
+          if (fault === 'sha-cleanup' && /-source$/.test(database.name)) {
+            throw new Error('PRIVATE_SCHEMA_CANARY cleanup provider body');
+          }
+        },
+      });
+      const before = account.snapshot();
+      let mutated = false;
+      const applySchema = proof.applySchema;
+      proof.applySchema = async (databases) => {
+        await applySchema(databases);
+        const shard = databases.shards[0];
+        if (fault === 'schema') {
+          shard.database.exec('ALTER TABLE blocks ADD COLUMN PRIVATE_SCHEMA_CANARY TEXT');
+          mutated = true;
+        } else {
+          shard.afterBatch = ({ statements, committed }) => {
+            if (!statements.some(({ sql }) => /^INSERT INTO blocks \(/.test(sql))) return;
+            assert.equal(committed, true);
+            mutated = true;
+            if (fault === 'fts') {
+              shard.database.exec("INSERT INTO blocks_fts (blocks_fts, rowid, text) SELECT 'delete', id, text FROM blocks");
+            } else {
+              shard.database.prepare('UPDATE blocks SET tool_name = ?').run('PRIVATE_SCHEMA_CANARY');
+            }
+          };
+        }
+      };
+      await assert.rejects(verifyNativeCopyControl(proof), (error) => {
+        assert.equal(error.nativeCopyPhase, phase);
+        assert.equal(error.nativeCopyClass, 'assertion');
+        assert.equal(error.nativeCopyInvariant, invariant);
+        if (fault === 'sha-cleanup') {
+          assert.equal(error.nativeCopyCleanup, 'failed');
+          assert.equal(error.nativeCopyCleanupClass, 'other');
+        }
+        assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes('PRIVATE_SCHEMA_CANARY'));
+        return true;
+      });
+      assert.equal(mutated, true);
+      assert.deepEqual(adapters[0].rows('SELECT COUNT(*) AS rows FROM blocks'), [{ rows: 2 }]);
+      assert.deepEqual(cleanupAttempts, account.created.map(({ uuid }) => uuid));
+      assert.deepEqual(account.snapshot(), fault === 'sha-cleanup'
+        ? [...before, account.created[0]].sort((a, b) => a.uuid.localeCompare(b.uuid)) : before);
+      assert.equal(account.deleted.length, fault === 'sha-cleanup' ? 2 : 3);
+    });
+  }
+});
+
+test('shared copier transport invariants preserve source and destination readback phases across real SQLite pages', async (context) => {
+  const canary = 'PRIVATE_PHASE_TRANSPORT_CANARY';
+  for (const side of ['source-initial', 'source-pending', 'destination']) {
+    for (const invariant of ['row-identity', 'long-column', 'long-length', 'long-slice', 'long-utf8', 'value', 'number']) {
+      await context.test(`${side} ${invariant}`, async (child) => {
+        const f = await fixture(child);
+        const original = block(61_001, 0, { text: `\ufeff${canary} ${'α😀'.repeat(30_000)}\u0000suffix` });
+        seedBlocks(f.source, [original]);
+        const before = blockSnapshot(f.source);
+        const db = side === 'destination' ? f.shards[0] : f.source;
+        const marker = `__long_${BLOCK_COLUMNS.indexOf('text')}`;
+        let fullReads = 0;
+        let exercised = 0;
+        db.transformQuery = ({ sql }, rows) => {
+          const fullRow = /^\s*WITH sized AS MATERIALIZED/.test(sql);
+          const slice = /^\s*SELECT hex\(substr/.test(sql);
+          if (fullRow) fullReads += 1;
+          if (exercised || side === 'source-pending' && fullReads < 2) return rows;
+          if (['long-slice', 'long-utf8'].includes(invariant)) {
+            if (!slice) return rows;
+            assert.equal(rows.length, 1);
+            assert.ok(rows[0].bytes.length > 2, 'the fault must alter a real nonempty SQLite BLOB slice');
+            exercised += 1;
+            return [{ bytes: invariant === 'long-slice' ? rows[0].bytes.slice(0, -2) : `FF${rows[0].bytes.slice(2)}` }];
+          }
+          if (!fullRow) return rows;
+          assert.equal(rows.length, 1);
+          assert.equal(rows[0].id, original.id);
+          assert.equal(rows[0][marker], Buffer.byteLength(original.text));
+          exercised += 1;
+          if (invariant === 'row-identity') return [...rows, { ...rows[0] }];
+          if (invariant === 'long-column') delete rows[0][marker];
+          if (invariant === 'long-length') rows[0][marker] = 0;
+          if (invariant === 'value') rows[0].tool_name = true;
+          if (invariant === 'number') rows[0].row_hash = Number.MAX_SAFE_INTEGER + 1;
+          return rows;
+        };
+        await assert.rejects(copyWithNativeParameters(f.args()), (error) => {
+          assert.equal(error.code, invariant);
+          assert.equal(error.d1Phase, side === 'destination' ? 'copy-page-readback' : 'copy-source-page-read');
+          assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+          assert.equal(error.cause, undefined);
+          return true;
+        });
+        assert.equal(exercised, 1, 'the requested genuine readback boundary must reach the corruption');
+        assert.deepEqual(blockSnapshot(f.source), before, 'an invariant rejection cannot authorize source deletion or FTS mutation');
+        assert.deepEqual(sourceWrites(f), []);
+        assert.deepEqual(f.shards[1].rows('SELECT * FROM blocks'), []);
+        const state = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+        assert.equal(state.rows, 0);
+        assert.equal(state.pending?.phase ?? null, side === 'source-initial' ? null : 'copying');
+        assert.deepEqual(f.shards[0].rows('SELECT * FROM blocks'), side === 'destination' ? [original] : []);
+      });
+    }
+  }
+});
+
+test('native proof preserves source-versus-readback phase for real copier scalar and long-slice rejection', async (context) => {
+  for (const side of ['source', 'destination']) {
+    for (const invariant of ['value', 'long-slice']) {
+      await context.test(`${side} ${invariant}`, async (child) => {
+        const { account, adapters, proof } = await nativeScratchFixture(child);
+        const before = account.snapshot();
+        let exercised = 0;
+        const applySchema = proof.applySchema;
+        proof.applySchema = async (databases) => {
+          await applySchema(databases);
+          const db = side === 'source' ? databases.source : databases.shards[invariant === 'value' ? 0 : 1];
+          db.transformQuery = ({ sql }, rows) => {
+            if (exercised) return rows;
+            if (invariant === 'value' && /^\s*WITH sized AS MATERIALIZED/.test(sql)) {
+              assert.equal(rows.length, 1);
+              exercised += 1;
+              rows[0].tool_name = { private: 'PRIVATE_NATIVE_PHASE_CANARY' };
+            } else if (invariant === 'long-slice' && /^\s*SELECT hex\(substr/.test(sql)) {
+              // Seed readback uses the same hex transport. Arm only after the
+              // actual copier has written its durable checkpoint, never during seed.
+              const checkpoint = databases.shards[0].rows(
+                'SELECT value FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT],
+              )[0];
+              if (!checkpoint) return rows;
+              const state = JSON.parse(checkpoint.value);
+              assert.equal(state.identity.source, databases.source.id);
+              assert.equal(state.state, 'pending');
+              assert.equal(rows.length, 1);
+              assert.ok(rows[0].bytes.length > 2);
+              exercised += 1;
+              rows[0].bytes = rows[0].bytes.slice(0, -2);
+            }
+            return rows;
+          };
+        };
+        await assert.rejects(verifyNativeCopyControl(proof), (error) => {
+          assert.equal(error.nativeCopyPhase, side === 'source' ? 'copy-source-page-read' : 'copy-page-readback');
+          assert.equal(error.nativeCopyClass, 'assertion');
+          assert.equal(error.nativeCopyInvariant, invariant);
+          assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes('PRIVATE_NATIVE_PHASE_CANARY'));
+          assert.equal(error.cause, undefined);
+          return true;
+        });
+        assert.equal(exercised, 1);
+        const retained = adapters[0].rows('SELECT id FROM blocks ORDER BY id');
+        assert.deepEqual(retained, invariant === 'value' ? [{ id: 0 }, { id: INDEX_ID_SPAN - 1 }] : [{ id: INDEX_ID_SPAN - 1 }],
+          'the rejected page remains authoritative even if an earlier ordinary page was verified and retired');
+        assert.deepEqual(account.snapshot(), before);
+        assert.deepEqual(new Set(account.deleted.map(({ uuid }) => uuid)), new Set(account.created.map(({ uuid }) => uuid)));
+      });
+    }
+  }
+});
+
+test('real HTTP D1 failures distinguish transport, HTTP, statement and shape without retry or status spoofing', async (context) => {
+  const canary = 'PRIVATE_HTTP_FAILURE_CANARY';
+  const id = '95dbde60-d5ab-4e2c-989f-fcd44a3ab479';
+  const originalFetch = globalThis.fetch;
+  let scenario;
+  const requests = [];
+  let bodyDropResponse;
+  const server = createServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    requests.push({ body: JSON.parse(Buffer.concat(chunks).toString('utf8')), scenario });
+    if (scenario.transport) { request.socket.destroy(); return; }
+    response.writeHead(scenario.status ?? 200, {
+      'content-type': 'application/json',
+      ...(scenario.retryAfter === undefined ? {} : { 'retry-after': scenario.retryAfter }),
+    });
+    if (scenario.bodyTransport) {
+      bodyDropResponse = response;
+      response.write(canary);
+      response.flushHeaders();
+      return;
+    }
+    response.end(scenario.raw ?? JSON.stringify(scenario.envelope));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const endpoint = `http://127.0.0.1:${server.address().port}`;
+  globalThis.fetch = async (url, init) => {
+    const response = await originalFetch(`${endpoint}${new URL(url).pathname}`, init);
+    if (scenario.bodyTransport) {
+      assert.equal(response.status, scenario.status ?? 200, 'actual headers must arrive before the server drops the body');
+      bodyDropResponse.destroy();
+    }
+    return response;
+  };
+  context.after(async () => {
+    globalThis.fetch = originalFetch;
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  const scenarios = [
+    { transport: true, failure: 'transport', http: 'unknown' },
+    { bodyTransport: true, failure: 'transport', http: 200 },
+    { bodyTransport: true, status: 503, failure: 'transport', http: 503 },
+    ...[undefined, 'invalid', '0', '1.5', '3601'].map((retryAfter) => ({
+      status: 429, retryAfter, raw: canary, failure: 'http', http: 429,
+    })),
+    { status: 503, envelope: { success: false, errors: [{ message: canary }] }, failure: 'http', http: 503 },
+    { status: 502, raw: canary, failure: 'http', http: 502 },
+    { envelope: { success: false, errors: [{ message: canary }] }, failure: 'statement', http: 200 },
+    { envelope: { success: true, result: [{ success: false, error: canary }] }, failure: 'statement', http: 200 },
+    { raw: canary, failure: 'shape', http: 200 },
+    { envelope: { success: true }, failure: 'shape', http: 200 },
+    { envelope: { success: true, result: {} }, failure: 'shape', http: 200 },
+    { envelope: { success: true, result: [] }, failure: 'shape', http: 200 },
+    { envelope: { success: true, result: [{ success: true }] }, failure: 'shape', http: 200 },
+    { envelope: { success: true, result: [{ success: true, results: {} }] }, failure: 'shape', http: 200 },
+    { envelope: { success: true, result: [{ success: true, results: [] }, { success: true, results: [] }] }, failure: 'shape', http: 200 },
+    { envelope: { success: true, actualHTTPstatus: 599, result: [{ success: false, error: canary }] }, failure: 'statement', http: 200 },
+  ];
+  for (const [index, selected] of scenarios.entries()) {
+    await context.test(`${index}: ${selected.bodyTransport ? 'body-drop ' : ''}${selected.failure} HTTP=${selected.http}`, async () => {
+      scenario = selected;
+      const before = requests.length;
+      const db = diagnosticClient(PREVIEW_ACCOUNT_ID, 'private-token', { permit: async () => {},
+        wait: async () => assert.fail('these terminal errors must not retry') }).db(id);
+      await assert.rejects(db.query(canary, [canary]), (error) => {
+        assert.equal(error.d1FailureKind, scenario.failure);
+        assert.equal(error.d1SqlReason, 'other', 'private/unrecognized provider text cannot invent a native class');
+        assert.ok(error.message.includes(`failure=${scenario.failure}`));
+        assert.ok(error.message.includes(`HTTP=${scenario.http}`));
+        assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+        assert.equal(error.cause, undefined);
+        return true;
+      });
+      assert.equal(requests.length - before, 1, 'no ambiguous operation may be replayed');
+      assert.deepEqual(requests.at(-1).body, { sql: canary, params: [canary] });
+    });
+  }
+});
+
+test('real HTTP scratch inventory, create, identity and cleanup failures retain allowlisted client kinds without replay or foreign mutation', async (context) => {
+  const canary = 'PRIVATE_SCRATCH_HTTP_CANARY';
+  const token = 'private-scratch-token';
+  const originalFetch = globalThis.fetch;
+  let arm;
+  let resources;
+  let created;
+  let deleted;
+  let faultReached;
+  let bodyDropResponse;
+  const requests = [];
+  const server = createServer(async (request, response) => {
+    assert.equal(request.headers.authorization, `Bearer ${token}`);
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const pathname = new URL(request.url, 'http://scratch.fixture').pathname;
+    const target = pathname.slice(`/client/v4/accounts/${PREVIEW_ACCOUNT_ID}/d1/database`.length);
+    const uuid = target.split('/')[1];
+    const operation = target.endsWith('/query') ? 'query'
+      : !target ? request.method === 'POST' ? 'create' : 'inventory'
+        : request.method === 'DELETE' ? 'delete' : 'identity';
+    const body = chunks.length ? JSON.parse(Buffer.concat(chunks).toString('utf8')) : null;
+    requests.push({ operation, uuid, body });
+    if (operation === 'query') {
+      assert.ok(arm.secondaryCleanup && resources.has(uuid));
+      assert.deepEqual(body, { sql: canary, params: [canary] });
+      response.writeHead(200, { 'content-type': 'application/json' });
+      response.end(JSON.stringify({ success: false, errors: [{ message: `SQLITE_FULL ${canary}` }] }));
+      return;
+    }
+    if (!faultReached && operation === arm.operation
+      && (!['identity', 'delete'].includes(operation) || uuid === 'scratch-http-1')) {
+      faultReached = true;
+      if (arm.failure === 'transport' && !arm.bodyTransport) { request.socket.destroy(); return; }
+      response.writeHead(arm.status ?? 200, { 'content-type': 'application/json' });
+      if (arm.bodyTransport) {
+        bodyDropResponse = response;
+        response.write(canary);
+        response.flushHeaders();
+      } else {
+        response.end(arm.failure === 'shape' ? canary
+          : JSON.stringify({ success: false, actualHTTPstatus: 599, errors: [{ message: canary }] }));
+      }
+      return;
+    }
+    let result;
+    if (operation === 'inventory') result = [...resources.values()];
+    else if (operation === 'create') {
+      const database = { uuid: `scratch-http-${created.length + 1}`, name: body.name };
+      assert.ok(scratchNames.includes(database.name));
+      resources.set(database.uuid, database);
+      created.push(database);
+      result = database;
+    } else if (operation === 'identity') {
+      assert.ok(resources.has(uuid));
+      result = resources.get(uuid);
+    } else {
+      assert.equal(operation, 'delete');
+      assert.ok(created.some((database) => database.uuid === uuid), 'only identities actually returned by this invocation may be deleted');
+      assert.ok(resources.delete(uuid));
+      deleted.push(uuid);
+      result = {};
+    }
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end(JSON.stringify({ success: true, result, ...(operation === 'inventory'
+      ? { result_info: { total_count: result.length } } : {}) }));
+  });
+  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const endpoint = `http://127.0.0.1:${server.address().port}`;
+  globalThis.fetch = async (url, init) => {
+    const response = await originalFetch(`${endpoint}${new URL(url).pathname}`, init);
+    if (bodyDropResponse) {
+      assert.equal(response.status, 200, 'body transport loss must follow actual HTTP headers');
+      bodyDropResponse.destroy();
+      bodyDropResponse = null;
+    }
+    return response;
+  };
+  context.after(async () => {
+    globalThis.fetch = originalFetch;
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+  });
+  for (const operation of ['inventory', 'create', 'identity', 'delete', 'secondary-delete']) {
+    for (const fault of [
+      { failure: 'transport' }, { failure: 'transport', bodyTransport: true },
+      { failure: 'http', status: 403 }, { failure: 'http', status: 404 },
+      { failure: 'http', status: 429 }, { failure: 'statement' }, { failure: 'shape' },
+    ]) {
+      await context.test(`${operation} ${fault.failure} ${fault.status ?? (fault.bodyTransport ? 'body' : '')}`, async () => {
+        arm = { ...fault, operation: operation === 'secondary-delete' ? 'delete' : operation,
+          secondaryCleanup: operation === 'secondary-delete' };
+        resources = new Map(standingScratchResources().map((database) => [database.uuid, database]));
+        const before = [...resources.values()];
+        created = [];
+        deleted = [];
+        faultReached = false;
+        requests.length = 0;
+        let entered = false;
+        const api = diagnosticClient(PREVIEW_ACCOUNT_ID, token, {
+          permit: async () => {}, wait: async () => assert.fail('terminal CF failures must not retry'),
+        });
+        await assert.rejects(withScratchD1Databases({ api, pr: 42, nonce: scratchNonce, run: async ({ source }) => {
+          entered = true;
+          if (arm.secondaryCleanup) await source.query(canary, [canary]);
+          return 'successful work';
+        } }), (error) => {
+          assert.equal(error.nativeCopyPhase, arm.secondaryCleanup ? 'control'
+            : { inventory: 'preflight', create: 'create', identity: 'identity', delete: 'cleanup' }[arm.operation]);
+          assert.equal(error.nativeCopyClass, arm.secondaryCleanup ? 'capacity' : 'other',
+            'HTTP 404 is not an inventory-shape error, empty inventory or successful deletion');
+          assert.equal(error.nativeCopyFailureKind, arm.secondaryCleanup ? 'statement' : arm.failure);
+          if (arm.secondaryCleanup) {
+            assert.equal(error.nativeCopyCleanup, 'failed');
+            assert.equal(error.nativeCopyCleanupClass, 'other');
+            assert.equal(error.nativeCopyCleanupFailureKind, arm.failure);
+            assert.ok(error.message.includes(`cleanupFailure=${arm.failure}`));
+          }
+          assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
+          assert.equal(error.cause, undefined);
+          return true;
+        });
+        assert.equal(faultReached, true);
+        assert.equal(entered, arm.operation === 'delete');
+        assert.equal(requests.filter((request) => request.operation === arm.operation).length,
+          arm.operation === 'identity' ? 4 : arm.operation === 'delete' ? 3 : 1,
+          'one terminal failure is not replayed; separate safe cleanup still visits each owned identity');
+        assert.equal(requests.filter((request) => request.operation === 'create').length,
+          arm.operation === 'inventory' ? 0 : arm.operation === 'create' ? 1 : 3);
+        assert.deepEqual(deleted, arm.operation === 'identity' ? created.map(({ uuid }) => uuid)
+          : arm.operation === 'delete' ? created.slice(1).map(({ uuid }) => uuid) : []);
+        assert.deepEqual([...resources.values()], arm.operation === 'delete' ? [...before, created[0]] : before,
+          'failed/refused cleanup may leave only its known owned database; every standing and foreign identity remains unchanged');
+      });
     }
   }
 });

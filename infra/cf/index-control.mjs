@@ -13,7 +13,7 @@ import {
   seedFrozenCatalog, sourceCopyForecast, verifyIndexRecords, writeCheckpoint,
 } from '../../hub/scripts/lib/index-migration.mjs';
 import { indexShardBindingName } from '../../hub/src/index-layout.mjs';
-import { D1_BATCH_PROBE_TEXT, d1SqlFailureReason, verifyD1BatchAtomicity } from './d1-batch-atomicity.mjs';
+import { D1_BATCH_PROBE_TEXT, D1_FAILURE_KINDS, D1_SQL_FAILURE_REASONS, d1SqlFailureReason, verifyD1BatchAtomicity } from './d1-batch-atomicity.mjs';
 import { sharedCloudflareApiPermit } from '../../hub/scripts/lib/cloudflare-api-budget.mjs';
 
 const MAIN_ID = '5ff65cf3-89c8-4fe6-a3c2-a370293ecea6';
@@ -21,6 +21,40 @@ const FREEZE_CHECKPOINT = 'index-maintenance-freeze-v1';
 const ATOMICITY_CHECKPOINT = 'index-rest-batch-atomicity-v1';
 const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 const decimalIdentifier = (value) => typeof value === 'string' && value.length > 0 && !/[^0-9]/.test(value);
+const providerCodes = (errors) => (Array.isArray(errors) ? errors : [])
+  .map((error) => error?.code).filter((code) => Number.isSafeInteger(code) && code >= 0);
+const publicDatabaseId = (id) => typeof id === 'string'
+  && /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(id) ? id : 'unknown';
+
+export class CopyPassBudgetExhausted extends Error {
+  constructor() {
+    super('copy pass request budget exhausted');
+    this.name = 'CopyPassBudgetExhausted';
+  }
+}
+
+/** Soft boundary only: never cancel an in-flight request or native transaction. */
+export function createCopyPassRequestGate(budgetMs, { now = Date.now } = {}) {
+  if (!Number.isSafeInteger(budgetMs) || budgetMs <= 0) {
+    throw new Error('--pass-budget-ms must be a positive safe integer number of milliseconds');
+  }
+  const startedAt = now();
+  return (delayMs = 0) => {
+    const remaining = budgetMs - (now() - startedAt);
+    if (remaining <= 0 || delayMs >= remaining) throw new CopyPassBudgetExhausted();
+  };
+}
+
+/** Only the explicit boundary exception is a resumable partial pass. */
+export async function runCopyPass({ source, shards, gate }) {
+  try {
+    const copied = await copyFrozenIndex({ source, shards, gate });
+    return { copiedRows: copied.rows, state: copied.state, sha256: copied.sha256 };
+  } catch (error) {
+    if (!(error instanceof CopyPassBudgetExhausted)) throw error;
+    return { status: 'partial', reason: 'pass-budget-exhausted' };
+  }
+}
 
 export function requireProtectedProduction(env = process.env) {
   if (env.GITHUB_ACTIONS !== 'true' || env.GITHUB_EVENT_NAME !== 'push'
@@ -39,75 +73,143 @@ export function cloudflareRetryDelay(response) {
   if (response.status !== 429) return null;
   const seconds = Number(response.headers.get('retry-after'));
   if (!Number.isSafeInteger(seconds) || seconds < 1 || seconds > 3600) {
-    throw new Error('Cloudflare HTTP 429 lacks a valid retry-after delay; checkpoint retained');
+    const error = new Error('Cloudflare HTTP 429 lacks a valid retry-after delay; checkpoint retained');
+    error.providerStatus = response.status;
+    error.d1FailureKind = 'http';
+    throw error;
   }
   return seconds * 1000;
 }
 
-export function indexControlClient(accountId, token, { permit = sharedCloudflareApiPermit, wait = sleep } = {}) {
+export function indexControlClient(accountId, token, { permit = sharedCloudflareApiPermit, wait = sleep, requestGate } = {}) {
   if (accountId === PRODUCTION_ACCOUNT_ID) requireProtectedProduction();
   else if (accountId !== PREVIEW_ACCOUNT_ID) throw new Error('index control account must be production or preview');
   if (!token) throw new Error('CLOUDFLARE_API_TOKEN is required');
+  const responseStatuses = new WeakMap();
   const cf = async (pathname, init = {}) => {
     const { responseFormat = 'result', ...request } = init;
     if (responseFormat !== 'result' && responseFormat !== 'envelope') {
       throw new Error('Cloudflare response format must be result or envelope');
     }
     for (;;) {
+      if (requestGate) requestGate();
       await permit();
-      const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/${pathname}`, {
-        ...request, redirect: 'error', signal: AbortSignal.timeout(60000),
-        headers: { authorization: `Bearer ${token}`, accept: 'application/json',
-          ...(request.body ? { 'content-type': 'application/json' } : {}) },
-      });
+      if (requestGate) requestGate();
+      let response;
+      try {
+        response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/${pathname}`, {
+          ...request, redirect: 'error', signal: AbortSignal.timeout(60000),
+          headers: { authorization: `Bearer ${token}`, accept: 'application/json',
+            ...(request.body ? { 'content-type': 'application/json' } : {}) },
+        });
+      } catch (error) {
+        error.d1FailureKind = 'transport';
+        error.providerStatus = undefined; // No actual Response was received.
+        throw error;
+      }
       const delay = cloudflareRetryDelay(response);
       if (delay !== null) {
         // A 429 rejected the operation before execution. Replay only that unambiguous
         // rejection; network errors and 5xx leave recovery to durable checkpoints.
         await response.body?.cancel();
+        if (requestGate) requestGate(delay);
         await wait(delay);
         continue;
       }
-      let envelope;
-      try { envelope = await response.json(); }
-      catch { throw new Error(`Cloudflare returned non-JSON HTTP ${response.status}`); }
-      if (!response.ok || envelope.success !== true) {
-        // Never emit SQL, response bodies, transcript data, or credentials into CI logs.
-        const codes = (envelope.errors ?? []).map((error) => error.code).join(',');
-        const error = new Error(`Cloudflare ${pathname.split('?')[0]} failed: HTTP ${response.status}, codes=${codes}`);
-        if (/^d1\/database\/[^/]+\/query$/.test(pathname)) {
-          error.d1SqlReason = d1SqlFailureReason(envelope.errors ?? []);
-        }
+      let text;
+      try { text = await response.text(); }
+      catch {
+        const error = new Error(`Cloudflare response body read failed: HTTP ${response.status}`);
+        error.providerStatus = response.status;
+        error.d1FailureKind = 'transport';
         throw error;
       }
+      let envelope;
+      try { envelope = JSON.parse(text); }
+      catch {
+        const error = new Error(`Cloudflare returned non-JSON HTTP ${response.status}`);
+        error.providerStatus = response.status;
+        error.d1FailureKind = response.ok ? 'shape' : 'http';
+        throw error;
+      }
+      if (!response.ok || envelope?.success !== true) {
+        // Never emit SQL, response bodies, transcript data, or credentials into CI logs.
+        const codes = providerCodes(envelope?.errors);
+        const isD1 = /^d1\/database\/[^/]+\/query$/.test(pathname);
+        const error = new Error(`Cloudflare ${isD1 ? 'D1 query' : pathname.split('?')[0]} failed: HTTP ${response.status}, codes=${codes.join(',')}`);
+        error.providerStatus = response.status;
+        error.providerCodes = codes;
+        error.d1FailureKind = !response.ok ? 'http' : envelope?.success === false ? 'statement' : 'shape';
+        if (isD1) error.d1SqlReason = d1SqlFailureReason(envelope?.errors);
+        throw error;
+      }
+      if (responseFormat === 'envelope') responseStatuses.set(envelope, response.status);
       return responseFormat === 'envelope' ? envelope : envelope.result;
     }
   };
   return {
     cf,
     db(id) {
-      const execute = async (body) => {
-        const results = await cf(`d1/database/${encodeURIComponent(id)}/query`, {
-          method: 'POST', body: JSON.stringify(body),
-        });
-        if (!Array.isArray(results) || results.some((result) => result.success !== true)) {
-          const error = new Error(`D1 statement batch failed on database ${id}`);
-          error.d1SqlReason = d1SqlFailureReason(Array.isArray(results)
-            ? results.flatMap((result) => [result.error, ...(result.errors ?? [])]) : []);
-          throw error;
+      const execute = async (body, kind) => {
+        let encodedBody;
+        let failureKind = 'transport';
+        try {
+          const envelope = await cf(`d1/database/${encodeURIComponent(id)}/query`, {
+            method: 'POST', body: encodedBody = JSON.stringify(body), responseFormat: 'envelope',
+          });
+          const results = envelope.result;
+          if (!Array.isArray(results) || results.some((result) => result?.success !== true)) {
+            failureKind = Array.isArray(results) && results.some((result) => result?.success === false)
+              ? 'statement' : 'shape';
+            const failures = Array.isArray(results)
+              ? results.flatMap((result) => [result?.error,
+                ...(Array.isArray(result?.errors) ? result.errors : [])]) : [];
+            const error = new Error('D1 statement rejection');
+            error.d1SqlReason = d1SqlFailureReason(failures);
+            error.providerCodes = providerCodes([...failures, ...(Array.isArray(envelope.errors) ? envelope.errors : [])]);
+            error.providerStatus = responseStatuses.get(envelope);
+            throw error;
+          }
+          if (kind === 'query' && (results.length !== 1 || !Array.isArray(results[0]?.results))) {
+            failureKind = 'shape';
+            const error = new Error('D1 query returned an unexpected result shape');
+            error.providerStatus = responseStatuses.get(envelope);
+            throw error;
+          }
+          return results;
+        } catch (error) {
+          if (error instanceof CopyPassBudgetExhausted) throw error;
+          // Replace transport/provider messages too: they may contain URLs, SQL or data.
+          const reason = D1_SQL_FAILURE_REASONS.includes(error?.d1SqlReason) ? error.d1SqlReason : 'other';
+          const failure = D1_FAILURE_KINDS.includes(error?.d1FailureKind) ? error.d1FailureKind : failureKind;
+          const codes = Array.isArray(error?.providerCodes) ? providerCodes(error.providerCodes.map((code) => ({ code }))) : [];
+          // Count already-encoded request bytes only on failure. Parameter JSON byte
+          // counts include array framing/escaping and never disclose the values.
+          const statements = kind === 'batch' && Array.isArray(body.batch) ? body.batch : [body];
+          const parameters = statements.reduce((count, statement) =>
+            count + (Array.isArray(statement?.params) ? statement.params.length : 0), 0);
+          const parameterJsonBytes = typeof encodedBody === 'string' ? statements.reduce((bytes, statement) =>
+            bytes + Buffer.byteLength(JSON.stringify(statement?.params ?? []), 'utf8'), 0) : 0;
+          const safe = new Error(`D1 database=${publicDatabaseId(id)} kind=${kind}`
+            + ` HTTP=${Number.isInteger(error?.providerStatus) && error.providerStatus >= 100 && error.providerStatus <= 599 ? error.providerStatus : 'unknown'}`
+            + ` codes=${codes.join(',')}`
+            + ` failure=${failure}`
+            + ` native=${reason} statements=${statements.length} parameters=${parameters}`
+            + ` bodyBytes=${typeof encodedBody === 'string' ? Buffer.byteLength(encodedBody, 'utf8') : 0}`
+            + ` parameterJsonBytes=${parameterJsonBytes}`);
+          safe.d1SqlReason = reason;
+          safe.d1FailureKind = failure;
+          safe.d1Diagnostic = true;
+          throw safe;
         }
-        return results;
       };
       return {
         id,
         async query(sql, params = []) {
-          const result = await execute({ sql, params });
-          if (result.length !== 1 || !Array.isArray(result[0].results)) {
-            throw new Error('D1 query returned an unexpected result shape');
-          }
+          const result = await execute({ sql, params }, 'query');
           return result[0].results;
         },
-        async batch(batch) { return await execute({ batch }); },
+        async batch(batch) { return await execute({ batch }, 'batch'); },
       };
     },
   };
@@ -333,7 +435,12 @@ export async function verifyActiveIndex({ source, shards, revision, cycle, gate,
 
 async function main() {
   const [command, ...rest] = process.argv.slice(2);
-  const args = parseArgs(rest, new Set(['target', 'config', 'output', 'active-output', 'revision', 'mode', 'github-output']));
+  const args = parseArgs(rest, new Set(['target', 'config', 'output', 'active-output', 'revision', 'mode', 'github-output', 'pass-budget-ms']));
+  if (args['pass-budget-ms'] !== undefined && (command !== 'copy'
+    || !/^[0-9]+$/.test(args['pass-budget-ms'])
+    || !Number.isSafeInteger(Number(args['pass-budget-ms'])) || Number(args['pass-budget-ms']) <= 0)) {
+    throw new Error('--pass-budget-ms requires copy and a positive safe integer number of milliseconds');
+  }
   const target = args.target ?? 'production';
   if (!['production', 'preview'].includes(target)) throw new Error('target must be production or preview');
   if (target === 'production') requireProtectedProduction();
@@ -443,8 +550,18 @@ async function main() {
       || !Number.isSafeInteger(atomicity.verifiedAt) || atomicity.verifiedAt <= 0 || atomicity.verifiedAt > Date.now()) {
       throw new Error('this deployment has no verified native D1 REST batch atomicity/text transport control; source copy forbidden');
     }
-    const copied = await copyFrozenIndex({ source, shards, gate });
-    console.log(JSON.stringify({ copiedRows: copied.rows, state: copied.state, sha256: copied.sha256 }));
+    // Setup/drain/atomicity prerequisites use the unbudgeted client. Only this copy
+    // process's data requests receive a fresh, non-persisted pass boundary.
+    const copyApi = args['pass-budget-ms'] === undefined ? api
+      : indexControlClient(account, process.env.CLOUDFLARE_API_TOKEN, {
+        requestGate: createCopyPassRequestGate(Number(args['pass-budget-ms'])),
+      });
+    const result = await runCopyPass({
+      source: copyApi.db(config.d1_databases[0].database_id),
+      shards: config.d1_databases.slice(1).map((db) => copyApi.db(db.database_id)), gate,
+    });
+    console.log(JSON.stringify(result));
+    if (result.status === 'partial') process.exitCode = 78;
   } else if (command === 'seed-catalog') {
     const seeded = await seedFrozenCatalog({ source, shards, gate });
     console.log(JSON.stringify({ catalogRows: seeded.rows, state: seeded.state }));

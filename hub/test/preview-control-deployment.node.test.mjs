@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -10,6 +10,7 @@ import test from 'node:test';
 import { migrationDigest } from '../scripts/lib/migration-manifest.mjs';
 import {
   PREVIEW_ACCOUNT_ID,
+  PRODUCTION_ACCOUNT_ID,
   previewIndexLayout,
   resourceNames,
   sha256Bytes,
@@ -68,9 +69,12 @@ async function runController(command, scenario = {}) {
   const preload = path.join(temporary, 'preload.mjs');
   const wrangler = path.join(temporary, 'wrangler.mjs');
   const migrationsCli = path.join(temporary, 'migrations.mjs');
+  const native = command === 'native-copy-proof';
+  const sqliteDirectory = path.join(temporary, 'sqlite');
   const manifests = {};
   try {
     await mkdir(path.join(hub, 'src'), { recursive: true });
+    await mkdir(sqliteDirectory);
     await writeFile(path.join(hub, 'src', 'preview.ts'), 'export default {};\n');
     await writeFile(path.join(hub, 'package-lock.json'), '{}\n');
     await writeFile(eventPath, '');
@@ -90,6 +94,14 @@ async function runController(command, scenario = {}) {
       await writeFile(path.join(root, 'manifest.json'), stableJson(manifest));
       await writeFile(path.join(root, 'source-baseline.json'), stableJson(manifest));
       if (directory === 'migrations') await writeFile(path.join(root, 'historical-baseline.json'), '{}');
+    }
+    if (native) {
+      const source = fileURLToPath(new URL('../migrations-index/', import.meta.url));
+      for (const filename of await readdir(source)) {
+        await writeFile(path.join(hub, 'migrations-index', filename), await readFile(path.join(source, filename)));
+      }
+      await rm(path.join(hub, 'migrations-index', '0001_index.sql'));
+      manifests['migrations-index'] = JSON.parse(await readFile(path.join(source, 'manifest.json'), 'utf8'));
     }
     await writeFile(wrangler, `
       import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
@@ -112,6 +124,8 @@ async function runController(command, scenario = {}) {
     await writeFile(migrationsCli, `
       import { appendFileSync, readFileSync } from 'node:fs';
       import { migrationDigest } from ${JSON.stringify(manifestModule)};
+      import { DatabaseSync } from 'node:sqlite';
+      import path from 'node:path';
       const scenario = ${JSON.stringify(scenario)};
       const [command, ...args] = process.argv.slice(2);
       const options = Object.fromEntries(Array.from({ length: args.length / 2 }, (_, index) =>
@@ -119,6 +133,14 @@ async function runController(command, scenario = {}) {
       const config = JSON.parse(readFileSync(options.config, 'utf8'));
       appendFileSync(${JSON.stringify(eventPath)}, JSON.stringify({ kind: 'migrate', command, options, config }) + '\\n');
       const manifest = JSON.parse(readFileSync(options.manifest, 'utf8'));
+      if (${native} && !scenario.pending && !scenario.wrongDigest) {
+        const binding = config.d1_databases.find((database) => database.binding === options.database);
+        if (binding.database_id !== options['database-id'] || binding.migrations_dir !== options['migrations-dir']
+          || config.account_id !== ${JSON.stringify(PREVIEW_ACCOUNT_ID)}) throw new Error('invalid native schema identity');
+        const database = new DatabaseSync(path.join(${JSON.stringify(sqliteDirectory)}, binding.database_id + '.sqlite'));
+        for (const migration of manifest.migrations) database.exec(readFileSync(path.join(options['migrations-dir'], migration.filename), 'utf8'));
+        database.close();
+      }
       console.log(JSON.stringify({
         pendingMigrations: scenario.pending === options.database ? 1 : 0,
         schemaDigest: options.database === 'DB' ? 'd'.repeat(64) : 'e'.repeat(64),
@@ -142,6 +164,7 @@ async function runController(command, scenario = {}) {
       }));
       if (scenario.existing) databases.push(...databaseNames.flatMap((name, index) =>
         scenario.legacy && index !== 0 ? [] : [{ name, uuid: 'existing-' + index }]));
+      databases.push(...(scenario.extraDatabases ?? []));
       if (scenario.partial) databases.splice(databases.findIndex((database) => database.name === names.indexShards[1]), 1);
       if (scenario.untrustedNames) databases.push(
         { name: 'sessions-index', uuid: 'production-looking-name' },
@@ -152,6 +175,7 @@ async function runController(command, scenario = {}) {
       let created = 0;
       const shardRows = new Map();
       const probeDatabases = new Map();
+      let rejectedAtomicityBatch = false;
       const eventPath = ${JSON.stringify(eventPath)};
       const emit = (event) => appendFileSync(eventPath, JSON.stringify(event) + '\\n');
       const response = (result) => Response.json({ success: true, result });
@@ -160,7 +184,8 @@ async function runController(command, scenario = {}) {
         const probeEvidence = [...probeDatabases].map(([databaseId, database]) => ({
           databaseId,
           tables: database.prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name").all().map((row) => row.name),
-          unrelatedValues: database.prepare('SELECT value FROM unrelated_user_table').all().map((row) => row.value),
+          unrelatedValues: database.prepare("SELECT name FROM sqlite_master WHERE name = 'unrelated_user_table'").get()
+            ? database.prepare('SELECT value FROM unrelated_user_table').all().map((row) => row.value) : [],
         }));
         for (const database of probeDatabases.values()) database.close();
         writeFileSync(${JSON.stringify(reportPath)}, JSON.stringify({ databases, probeEvidence }));
@@ -200,6 +225,10 @@ async function runController(command, scenario = {}) {
           databases.push(database);
           return response(database);
         }
+        if (target.startsWith('d1/database/') && method === 'GET' && !target.endsWith('/query')) {
+          const database = databases.find((entry) => entry.uuid === target.slice('d1/database/'.length));
+          return database ? response(database) : missing();
+        }
         if (target.startsWith('d1/database/') && method === 'DELETE') {
           const id = target.slice('d1/database/'.length);
           const index = databases.findIndex((database) => database.uuid === id);
@@ -212,11 +241,11 @@ async function runController(command, scenario = {}) {
           if (!database) throw new Error('Unknown database ' + id);
           // Keep the existing transport fixture, but execute the probe's ACTUAL SQL
           // against SQLite. Success evidence and rollback are never fabricated echoes.
-          if (probeRequest) {
+          if (probeRequest || ${native}) {
             let native = probeDatabases.get(id);
             if (!native) {
-              native = new DatabaseSync(':memory:');
-              native.exec("CREATE TABLE unrelated_user_table (value TEXT NOT NULL); INSERT INTO unrelated_user_table VALUES ('untouched')");
+              native = new DatabaseSync(${native} ? ${JSON.stringify(sqliteDirectory)} + '/' + id + '.sqlite' : ':memory:');
+              if (!${native}) native.exec("CREATE TABLE unrelated_user_table (value TEXT NOT NULL); INSERT INTO unrelated_user_table VALUES ('untouched')");
               probeDatabases.set(id, native);
             }
             const statements = body.batch ?? [{ sql: body.sql, params: body.params ?? [] }];
@@ -235,6 +264,11 @@ async function runController(command, scenario = {}) {
             }
             if (body.batch && !failureBatch && scenario.atomicityNoExecution) {
               return response(statements.map(() => ({ success: true, results: [] })));
+            }
+            if (scenario.atomicityCleanupFailure && rejectedAtomicityBatch
+              && statements.some(({ sql }) => /^DROP TABLE "__index_batch_probe_[0-9a-f]+"$/.test(sql))) {
+              emit({ kind: 'probe-cleanup-fault', databaseId: id, sql: statements[0].sql });
+              return Response.json({ success: false, errors: [{ message: 'ATOMICITY_CLEANUP_PRIVATE_CANARY' }] }, { status: 503 });
             }
             const transactional = body.batch && !scenario.atomicityPartialCommit;
             if (transactional) native.exec('BEGIN');
@@ -275,6 +309,7 @@ async function runController(command, scenario = {}) {
               return response(results);
             } catch (error) {
               if (transactional) native.exec('ROLLBACK');
+              if (failureBatch) rejectedAtomicityBatch = true;
               return Response.json({ success: false, errors: [{ message: error.message }] }, { status: 400 });
             }
           }
@@ -349,14 +384,15 @@ async function runController(command, scenario = {}) {
         throw new Error('Unexpected request ' + method + ' ' + target);
       };
     `);
-    const args = command === 'provision' ? [
-      '--head-sha', SHA, '--hub', hub, '--wrangler', wrangler, '--migrations-cli', migrationsCli,
+    const args = command === 'provision' || native ? [
+      '--head-sha', scenario.headSha ?? SHA, '--hub', hub, '--wrangler', wrangler, '--migrations-cli', migrationsCli,
+      ...(native ? ['--artifact-digest', scenario.artifactDigest ?? 'c'.repeat(64)] : []),
     ] : [];
     const result = spawnSync(process.execPath, [
       '--import', pathToFileURL(preload).href, controller, command, '--repository', 'example/sessions',
-      ...(command === 'janitor' ? [] : ['--pr', String(PR)]), ...args,
+      ...(command === 'janitor' ? [] : ['--pr', String(scenario.pr ?? PR)]), ...args,
     ], {
-      encoding: 'utf8', timeout: 10_000,
+      encoding: 'utf8', timeout: native ? 120_000 : 10_000,
       env: { ...process.env, CLOUDFLARE_PPE_ACCOUNT_ID: scenario.accountId ?? PREVIEW_ACCOUNT_ID,
         CLOUDFLARE_PPE_API_TOKEN: 'synthetic-cloudflare-token', PREVIEW_BEARER_SEED: SEED,
         GITHUB_TOKEN: 'synthetic-github-token' },
@@ -364,6 +400,7 @@ async function runController(command, scenario = {}) {
     const output = `${result.stdout}\n${result.stderr}`;
     for (const secret of [SEED, 'synthetic-cloudflare-token', 'synthetic-github-token',
       'atomicity-private-provider-text', 'index_batch_atomicity_intentional_invalid_json',
+      'ATOMICITY_CLEANUP_PRIVATE_CANARY',
       D1_BATCH_PROBE_TEXT, JSON.stringify(D1_BATCH_PROBE_TEXT).slice(1, -1)]) {
       assert.ok(!output.includes(secret), 'CLI evidence must not expose credentials, provider text or probe values');
     }
@@ -384,7 +421,12 @@ async function runController(command, scenario = {}) {
         { cause },
       );
     }
-    return { ...result, ...report, events, output, hub, manifests };
+    const migrationConfigsRemoved = await Promise.all(events.filter((event) => event.kind === 'migrate')
+      .map(async (event) => {
+        try { await access(event.options.config); return false; }
+        catch (error) { if (error.code === 'ENOENT') return true; throw error; }
+      }));
+    return { ...result, ...report, events, output, hub, manifests, migrationConfigsRemoved };
   } finally {
     await rm(temporary, { recursive: true, force: true });
   }
@@ -771,25 +813,30 @@ const readbackFailures = ['batch', 'independent'].flatMap((phase) => [
   'missing-result', 'extra-result', 'malformed-rows', 'missing-rows', 'missing-row', 'duplicate-row',
   'malformed-text', 'missing-text', 'nul-truncated-text', 'bom-stripped-text', 'normalized-text',
   'truncated-text-and-bytes', 'missing-byte-count', 'malformed-byte-count', 'incorrect-byte-count',
-].map((corruption) => {
-  const resultCount = corruption === 'missing-result' || corruption === 'extra-result';
-  const resultShape = resultCount || corruption === 'malformed-rows' || corruption === 'missing-rows';
-  const error = phase === 'independent' && resultShape ? /D1 query returned an unexpected result shape/
-    : phase === 'batch' && resultCount ? /returned unexpected result count/
-      : new RegExp(`failed ${phase} text/byte readback`);
-  return [`${phase} ${corruption}`, { atomicityReadback: { phase, corruption } }, error];
-}));
+].map((corruption) => [
+  `${phase} ${corruption}`, { atomicityReadback: { phase, corruption } },
+]));
 
-for (const [name, scenario, error] of [
-  ['non-atomic native batch', { atomicityPartialCommit: true }, /partially committed before a failing statement/],
-  ['successful-batch transport echo', { atomicityNoExecution: true }, /failed batch text\/byte readback/],
-  ['non-SQL failure', { atomicityWrongReason: true }, /expected SQL rejection; atomicity unproven/],
+for (const [name, scenario] of [
+  ['non-atomic native batch', { atomicityPartialCommit: true }],
+  ['successful-batch transport echo', { atomicityNoExecution: true }],
+  ['non-SQL failure', { atomicityWrongReason: true }],
   ...readbackFailures,
 ]) {
   test(`preview atomicity preflight rejects ${name} before prices or deployment`, async () => {
     const result = await runController('provision', scenario);
     assert.notEqual(result.status, 0, result.output);
-    assert.match(result.output, error);
+    const diagnostic = result.stderr.split('\n').filter((line) => line.startsWith('{'))
+      .map((line) => JSON.parse(line)).find((line) => line.operation === 'preview-atomicity');
+    const expectedPhase = scenario.atomicityReadback
+      ? `${scenario.atomicityReadback.phase === 'batch' ? 'batch' : 'independent'}-positive`
+      : scenario.atomicityNoExecution ? 'batch-positive' : 'rollback-negative';
+    assert.deepEqual(diagnostic, {
+      operation: 'preview-atomicity', phase: expectedPhase,
+      failure: scenario.atomicityReadback?.phase === 'independent'
+        && ['missing-result', 'extra-result', 'malformed-rows', 'missing-rows'].includes(scenario.atomicityReadback.corruption)
+        ? 'shape' : scenario.atomicityWrongReason ? 'http' : 'assertion',
+    }, 'only the reached atomicity control may supply the rejection identity');
     assert.equal(result.events.filter((event) => event.kind === 'migrate').length, 3,
       'runtime proof must follow every database migration');
     assert.ok(!result.events.some((event) => event.kind === 'deploy'));
@@ -826,6 +873,46 @@ for (const [name, scenario, error] of [
   });
 }
 
+test('preview atomicity reports secondary cleanup failure after a real partial commit while preserving all foreign resources', async () => {
+  const foreign = [
+    { name: 'sessions-index', uuid: 'production-looking-name' },
+    { name: 'pr-151-sessions-index', uuid: 'other-pr-main' },
+    { name: 'pr-150-copy-0123456789abcdef01234567-source', uuid: 'other-owned-proof' },
+  ];
+  const result = await runController('provision', {
+    atomicityPartialCommit: true, atomicityCleanupFailure: true, extraDatabases: foreign,
+  });
+  assert.notEqual(result.status, 0, result.output);
+  const diagnostic = result.stderr.split('\n').filter((line) => line.startsWith('{'))
+    .map((line) => JSON.parse(line)).find((line) => line.operation === 'preview-atomicity');
+  assert.deepEqual(diagnostic, {
+    operation: 'preview-atomicity', phase: 'rollback-negative', failure: 'assertion',
+    cleanup: 'failed', cleanupFailure: 'http',
+  }, 'secondary HTTP cleanup cannot replace the primary non-atomicity assertion');
+  const indexMigration = result.events.find((event) => event.kind === 'migrate' && event.options.database === 'IDX00');
+  const sql = result.events.filter((event) => event.kind === 'probe-sql');
+  const creates = sql.filter((event) => event.sql.startsWith('CREATE TABLE'));
+  assert.equal(creates.length, 2, 'successful and negative controls must both execute real SQLite CREATE');
+  assert.equal(sql.filter((event) => event.sql.startsWith('INSERT INTO')).length, 2,
+    'the failed native batch must actually commit its INSERT before the invalid JSON rejection');
+  const ownedName = /^CREATE TABLE "(__index_batch_probe_[0-9a-f]+)"/.exec(creates[1].sql)[1];
+  assert.deepEqual(result.probeEvidence, [{
+    databaseId: indexMigration.options['database-id'],
+    tables: [ownedName, 'unrelated_user_table'], unrelatedValues: ['untouched'],
+  }], 'the failed final DROP leaves the real owned probe, not unrelated SQLite state');
+  assert.deepEqual(result.events.filter((event) => event.kind === 'probe-cleanup-fault'), [{
+    kind: 'probe-cleanup-fault', databaseId: indexMigration.options['database-id'], sql: `DROP TABLE "${ownedName}"`,
+  }], 'final owned cleanup is attempted exactly once without replay');
+  assert.equal(sql.filter((event) => event.sql.startsWith('DROP TABLE')).length, 1,
+    'only the positive control DROP succeeds');
+  assert.deepEqual(result.databases.filter((database) => !database.uuid.startsWith('created-')), foreign);
+  assert.equal(databaseDeletes(result).length, 0);
+  assert.equal(result.events.filter((event) => event.kind === 'migrate').length, 3);
+  assert.ok(!result.events.some((event) => event.kind === 'deploy'
+    || event.kind === 'request' && event.body?.sql?.includes('INSERT OR REPLACE INTO model_prices')));
+  assert.ok(!result.output.includes('ATOMICITY_CLEANUP_PRIVATE_CANARY'));
+});
+
 for (const command of ['close', 'janitor']) {
   test(`${command} deletes main and both shards, preserving open or untrusted resources`, async () => {
     const result = await runController(command, { existing: true, foreignCount: 1, untrustedNames: true });
@@ -837,5 +924,95 @@ for (const command of ['close', 'janitor']) {
     const summary = JSON.parse(result.stdout.trim().split('\n').at(-1));
     assert.deepEqual(summary.deleted.filter((resource) => resource.kind === 'd1').map((resource) => resource.name),
       LAYOUT.databases.map((database) => database.name));
+  });
+}
+
+for (const scenario of [
+  { accountId: PRODUCTION_ACCOUNT_ID }, { accountId: 'f'.repeat(32) }, { pr: 0 },
+  { headSha: 'not-a-head' }, { artifactDigest: 'not-a-digest' },
+]) {
+  test(`native-copy-proof refuses invalid identity before requests ${JSON.stringify(scenario)}`, async () => {
+    const result = await runController('native-copy-proof', scenario);
+    assert.notEqual(result.status, 0, result.output);
+    assert.deepEqual(result.events, [], 'account, PR, head and artifact checks precede even inventory reads');
+    assert.deepEqual(result.databases, []);
+  });
+}
+
+test('native-copy-proof runs the real helper through CLI schema bindings and cleans only its scratch', async () => {
+  const result = await runController('native-copy-proof', { existing: true, foreignCount: 1 });
+  assert.equal(result.status, 0, result.output);
+  const summary = JSON.parse(result.stdout.trim().split('\n').at(-1));
+  assert.equal(summary.state, 'verified');
+  assert.equal(summary.probe, 'd1-native-full-copy');
+  assert.equal(summary.rows, 2);
+  assert.equal(summary.ftsMatches, 4);
+  assert.equal(summary.freezeTriggers, 3);
+  assert.ok(summary.ordinaryPages > 0 && summary.fallbackPages > 0);
+  const migrations = result.events.filter((event) => event.kind === 'migrate');
+  assert.equal(migrations.length, 3);
+  const creations = result.events.filter((event) => event.kind === 'request' && event.method === 'POST'
+    && new URL(event.url).pathname.endsWith('/d1/database'));
+  assert.equal(creations.length, 3);
+  for (const [index, migration] of migrations.entries()) {
+    const binding = ['DB', 'IDX00', 'IDX01'][index];
+    assert.equal(migration.command, 'apply');
+    assert.equal(migration.options.target, 'preview');
+    assert.equal(migration.options.database, binding);
+    assert.equal(migration.options['database-id'], `created-${index + 1}`);
+    assert.equal(migration.options['artifact-digest'], 'c'.repeat(64));
+    assert.equal(migration.options['deployment-id'], `pr-${PR}-${SHA.slice(0, 12)}-native-copy-${binding}`);
+    assert.equal(migration.options['base-manifest'], path.join(result.hub, 'migrations-index', 'source-baseline.json'));
+    assert.equal(migration.config.account_id, PREVIEW_ACCOUNT_ID);
+    assert.deepEqual(migration.config.d1_databases.map((database) => [
+      database.binding, database.database_name, database.database_id, database.migrations_dir,
+    ]), creations.map((event, offset) => [
+      ['DB', 'IDX00', 'IDX01'][offset], event.body.name, `created-${offset + 1}`,
+      path.join(result.hub, 'migrations-index'),
+    ]));
+  }
+  assert.deepEqual(result.migrationConfigsRemoved, [true, true, true]);
+  assert.deepEqual(databaseDeletes(result).map((event) => new URL(event.url).pathname.split('/').at(-1)),
+    ['created-1', 'created-2', 'created-3']);
+  assert.deepEqual(result.databases.map((database) => database.uuid),
+    ['foreign-0', 'existing-0', 'existing-1', 'existing-2']);
+  assert.ok(!result.events.some((event) => event.kind === 'build' || event.kind === 'deploy'));
+});
+
+test('native-copy-proof refuses unverified migration and removes all owned scratch', async () => {
+  const result = await runController('native-copy-proof', { existing: true, pending: 'IDX00' });
+  assert.notEqual(result.status, 0, result.output);
+  assert.ok(result.output.includes('NativeCopyControlError'));
+  assert.ok(result.output.includes('phase=schema'));
+  assert.deepEqual(result.events.filter((event) => event.kind === 'migrate').map((event) => event.options.database),
+    ['DB', 'IDX00']);
+  assert.equal(result.probeEvidence.length, 0, 'schema rejection precedes native copy writes');
+  assert.deepEqual(databaseDeletes(result).map((event) => new URL(event.url).pathname.split('/').at(-1)),
+    ['created-1', 'created-2', 'created-3']);
+  assert.deepEqual(result.databases.map((database) => database.uuid), ['existing-0', 'existing-1', 'existing-2']);
+  assert.deepEqual(result.migrationConfigsRemoved, [true, true]);
+});
+
+for (const command of ['close', 'janitor']) {
+  test(`${command} recovers closed PR copy probes without touching open PR or near-match names`, async () => {
+    const nonce = '0123456789abcdef01234567';
+    const owned = ['source', 'idx00', 'idx01'].map((role, index) => ({
+      name: `pr-${PR}-copy-${nonce}-${role}`, uuid: `closed-copy-${index}`,
+    }));
+    const preserved = [
+      { name: `pr-151-copy-${nonce}-source`, uuid: 'open-copy' },
+      { name: `pr-${PR}-copy-${nonce}-idx02`, uuid: 'wrong-role' },
+      { name: `pr-${PR}-copy-${nonce}-source-extra`, uuid: 'suffix' },
+      { name: `pr-${PR}-copy-short-source`, uuid: 'short-nonce' },
+      { name: 'sessions-index', uuid: 'production-looking' },
+    ];
+    const result = await runController(command, { extraDatabases: [...owned, ...preserved] });
+    assert.equal(result.status, 0, result.output);
+    assert.deepEqual(databaseDeletes(result).map((event) => new URL(event.url).pathname.split('/').at(-1)),
+      owned.map((database) => database.uuid));
+    assert.deepEqual(result.databases, preserved);
+    const summary = JSON.parse(result.stdout.trim().split('\n').at(-1));
+    assert.deepEqual(summary.deleted.filter((resource) => resource.kind === 'd1').map((resource) => resource.name),
+      owned.map((database) => database.name));
   });
 }

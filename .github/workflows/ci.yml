@@ -179,6 +179,22 @@ jobs:
           --wrangler hub/node_modules/wrangler/bin/wrangler.js
           --migrations-cli hub/scripts/migrations.mjs
           --github-output "$GITHUB_OUTPUT"
+      - name: Verify the native full-copy protocol
+        env:
+          CLOUDFLARE_PPE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_PPE_ACCOUNT_ID }}
+          CLOUDFLARE_PPE_API_TOKEN: ${{ secrets.CLOUDFLARE_PPE_API_TOKEN }}
+          PR_NUMBER: ${{ github.event.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          ARTIFACT_DIGEST: ${{ steps.provision.outputs.artifact_digest }}
+        run: >-
+          node infra/cf/preview-control.mjs native-copy-proof
+          --repository "$GITHUB_REPOSITORY"
+          --pr "$PR_NUMBER"
+          --head-sha "$HEAD_SHA"
+          --account-id "$CLOUDFLARE_PPE_ACCOUNT_ID"
+          --hub hub
+          --migrations-cli hub/scripts/migrations.mjs
+          --artifact-digest "$ARTIFACT_DIGEST"
       - name: Verify diagnostics and the bearer gate
         env:
           PREVIEW_BEARER_SEED: ${{ secrets.PREVIEW_BEARER_SEED }}
@@ -326,7 +342,7 @@ jobs:
         if: steps.index-layout.outputs.layout_state != 'active'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
-        run: node ../infra/cf/index-control.mjs copy --config "$RUNNER_TEMP/index-maintenance.json"
+        run: node ../infra/cf/index-control.mjs copy --config "$RUNNER_TEMP/index-maintenance.json" --pass-budget-ms 18000000
       - name: Apply and verify main migrations after any required source copy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}

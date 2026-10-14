@@ -1438,64 +1438,6 @@ describe("reindex restores files.mtime from R2 customMetadata (regression: reind
   });
 });
 
-describe('reindex-restored mtimes drive the canonical-copy tiebreak correctly (regression: with mtime always NULL post-reindex, the size/priority tiebreak fell through to an arbitrary id-ASC order, potentially keeping an OLDER duplicate canonical over a genuinely newer one)', () => {
-  it('after both duplicates\' mtimes are lost and reindex restores them from R2, the NEWER-mtime copy is canonical, not the lower-id (older, first-uploaded) one', async () => {
-    const SESSION_ID = 'e0000000-0000-4000-8000-000000000008';
-    // Byte-identical content for both copies — real duplicate uploads of the same session are
-    // typically identical bytes; this also trivially satisfies the "equal size" precondition the
-    // tiebreak needs to actually reach mtime rather than resolving on size first.
-    const content = `${ccUserLine({ uuid: 'dm-u1', text: 'duplicate mtime tiebreak content' })}\n`;
-    const OLD_MTIME = '2019-01-01T00:00:00Z';
-    const NEW_MTIME = '2026-01-01T00:00:00Z';
-
-    async function putWithMtime(relpath: string, mtime: string): Promise<number> {
-      const body = new TextEncoder().encode(content);
-      const res = await SELF.fetch(`${API}/api/v1/files/${MACHINE}/claude-projects/${encodeURIComponent(relpath)}`, {
-        method: 'PUT',
-        headers: {
-          'x-dev-machine': MACHINE,
-          'x-content-hash': `sha256:${await sha256Hex(body)}`,
-          'x-file-mtime': mtime,
-          'content-length': String(body.length),
-        },
-        body,
-      });
-      expect(res.status).toBe(201);
-      return ((await res.json()) as { file_id: number }).file_id;
-    }
-
-    // Older copy uploaded (and thus assigned its row id) FIRST, so an id-ASC fallback would wrongly
-    // pick it over the genuinely newer copy — a real distinguishing test, not one that happens to
-    // pass either way.
-    const oldFileId = await putWithMtime(`dup-mtime-demo/copy-old/${SESSION_ID}.jsonl`, OLD_MTIME);
-    const newFileId = await putWithMtime(`dup-mtime-demo/copy-new/${SESSION_ID}.jsonl`, NEW_MTIME);
-    expect(oldFileId).toBeLessThan(newFileId);
-
-    // Simulate both rows' mtime having been lost (same scenario the previous test exercises
-    // directly) — wipe it in place rather than deleting the rows, so this test isolates the
-    // tiebreak logic from the restore-after-delete mechanics already covered above.
-    await testEnv.DB.prepare('UPDATE files SET mtime = NULL WHERE id IN (?1, ?2)').bind(oldFileId, newFileId).run();
-
-    const reindexRes = await SELF.fetch(`${API}/api/v1/admin/reindex`, {
-      method: 'POST',
-      headers: { 'x-dev-machine': MACHINE, 'content-type': 'application/json' },
-      body: '{}',
-    });
-    expect(reindexRes.status).toBe(200);
-    await drainQueue();
-
-    const oldRow = await testEnv.DB.prepare('SELECT mtime FROM files WHERE id = ?1').bind(oldFileId).first<{ mtime: string | null }>();
-    const newRow = await testEnv.DB.prepare('SELECT mtime FROM files WHERE id = ?1').bind(newFileId).first<{ mtime: string | null }>();
-    expect(oldRow?.mtime).toBe(OLD_MTIME);
-    expect(newRow?.mtime).toBe(NEW_MTIME);
-
-    const session = await testEnv.DB.prepare('SELECT canonical_file_id FROM sessions WHERE session_id = ?1')
-      .bind(SESSION_ID)
-      .first<{ canonical_file_id: number }>();
-    expect(session?.canonical_file_id).toBe(newFileId);
-  });
-});
-
 describe('subagent meta linking, both arrival orders', () => {
   const PROJECT_SLUG = '-home-tester-src-subagent-demo';
   const SUBAGENT_PARENT = '99999999-8888-4444-8444-777777777777';

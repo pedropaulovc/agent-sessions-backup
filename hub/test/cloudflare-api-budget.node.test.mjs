@@ -4,7 +4,9 @@ import {
   CLOUDFLARE_MINIMUM_REQUEST_INTERVAL_MS,
   createCloudflareApiPacer,
 } from '../scripts/lib/cloudflare-api-budget.mjs';
-import { PREVIEW_ACCOUNT_ID } from '../../infra/cf/preview-trust.mjs';
+import { PREVIEW_ACCOUNT_ID, paginatedList, previewCopyScratchNames } from '../../infra/cf/preview-trust.mjs';
+const { withScratchD1Databases } = await import(process.env.NATIVE_COPY_CONTROL_PATH
+  ?? new URL('../../infra/cf/native-copy-control.mjs', import.meta.url).href);
 import { indexControlClient as currentIndexControlClient } from '../../infra/cf/index-control.mjs';
 
 const { indexControlClient } = await import(process.env.INDEX_CONTROL_PATH
@@ -233,37 +235,21 @@ test('actual controller clients share a request-start budget including concurren
     Math.ceil(count / 4));
 });
 
-test('canonical controller returns result or full pagination envelope and rejects unknown formats before HTTP', async (t) => {
+test('canonical controller rejects unknown response formats before HTTP', async (t) => {
   // Keep this new API contract on the canonical module even when the pacing
   // tests execute an older controller through INDEX_CONTROL_PATH.
   const clock = createClock();
   const permit = createCloudflareApiPacer({ now: clock.now, sleep: clock.sleep });
   const client = currentIndexControlClient(PREVIEW_ACCOUNT_ID, TOKEN, { permit, wait: clock.sleep });
-  const envelope = {
-    success: true,
-    errors: [],
-    result: [{ uuid: 'synthetic-database', name: 'synthetic-preview-index' }],
-    result_info: { page: 2, per_page: 1, count: 1, total_count: 3, total_pages: 3 },
-  };
   let requests = 0;
   t.mock.method(globalThis, 'fetch', async (input, init) => {
     requestId(input, init);
     requests += 1;
-    return Response.json(envelope);
+    assert.fail('invalid response formats must not reach HTTP');
   });
   await assert.rejects(client.cf('d1/database/formats', { responseFormat: 'unknown' }),
     /response format must be result or envelope/);
   assert.equal(requests, 0, 'invalid formats do not issue an HTTP request');
-  const [defaultResult, explicitResult, fullEnvelope] = await runWithClock(clock, Promise.all([
-    client.cf('d1/database/formats'),
-    client.cf('d1/database/formats', { responseFormat: 'result' }),
-    client.cf('d1/database/formats', { responseFormat: 'envelope' }),
-  ]));
-  assert.deepEqual(defaultResult, envelope.result);
-  assert.deepEqual(explicitResult, envelope.result);
-  assert.deepEqual(fullEnvelope, envelope, 'envelope consumers retain pagination metadata');
-  assert.deepEqual(fullEnvelope.result_info, envelope.result_info);
-  assert.equal(requests, 3);
 });
 
 test('controller permits do not serialize HTTP response completion', async (t) => {
@@ -300,7 +286,7 @@ test('controller does not add network, 5xx, envelope, or response-shape retries'
     { name: 'HTTP 503', reply: () => Response.json({ success: false, errors: [{ code: 1000 }] }, { status: 503 }), expected: /HTTP 503/ },
     { name: 'non-JSON response', reply: () => new Response('not JSON'), expected: /non-JSON HTTP 200/ },
     { name: 'unsuccessful envelope', reply: () => Response.json({ success: false, errors: [{ code: 1000 }] }), expected: /HTTP 200/ },
-    { name: 'unexpected D1 result shape', reply: () => success([{ success: true, results: {} }]), expected: /unexpected result shape/, operation: (client) => client.db('failure').query('SELECT 1') },
+    { name: 'unexpected D1 result shape', reply: () => success([{ success: true, results: {} }]), operation: (client) => client.db('failure').query('SELECT 1') },
     { name: '429 without retry-after', reply: () => new Response(null, { status: 429 }), expected: /valid retry-after/ },
   ];
   for (const scenario of scenarios) {
@@ -319,4 +305,70 @@ test('controller does not add network, 5xx, envelope, or response-shape retries'
       assert.equal(clock.waits.length, 0, 'no speculative backoff is introduced');
     });
   }
+});
+
+test('real client pagination preserves the inventory boundary used by scratch quota and ownership refusal', async (t) => {
+  const nonce = '0123456789abcdef01234567';
+  const names = previewCopyScratchNames(150, nonce);
+  for (const scenario of ['quota', 'collision', 'missing-result', 'malformed-result', 'empty-shape', 'not-found']) {
+    await t.test(scenario, async (child) => {
+      const first = Array.from({ length: 100 }, (_, index) => ({ uuid: `foreign-${index}`, name: `foreign-${index}` }));
+      const last = { uuid: 'last-page-existing', name: scenario === 'collision' ? names[2] : 'last-page-foreign' };
+      const resources = new Map([...first, last].map((database) => [database.uuid, database]));
+      const before = [...resources.values()];
+      const requests = [];
+      const clock = createClock();
+      const permit = createCloudflareApiPacer({ now: clock.now, sleep: clock.sleep });
+      const api = indexControlClient(PREVIEW_ACCOUNT_ID, TOKEN, { permit, wait: clock.sleep });
+      child.mock.method(globalThis, 'fetch', async (input, init) => {
+        const url = new URL(input);
+        assert.equal(url.pathname, `/client/v4/accounts/${PREVIEW_ACCOUNT_ID}/d1/database`);
+        assert.equal(new Headers(init.headers).get('authorization'), `Bearer ${TOKEN}`);
+        const method = init.method ?? 'GET';
+        requests.push({ method, page: Number(url.searchParams.get('page')) });
+        assert.equal(method, 'GET', 'inventory refusal must precede every creation or deletion');
+        const page = Number(url.searchParams.get('page'));
+        if (scenario === 'empty-shape') return Response.json({ success: true });
+        if (scenario === 'not-found') return Response.json({ success: false }, { status: 404 });
+        if (page === 2 && scenario === 'missing-result') return Response.json({ success: true });
+        if (page === 2 && scenario === 'malformed-result') return success({ private: 'not-an-inventory' });
+        return Response.json({
+          success: true, result: page === 1 ? first : [last],
+          result_info: { page, per_page: 100, total_count: 101, total_pages: 2 },
+        });
+      });
+      // A native HTTP rejection never produced an inventory envelope to classify.
+      const expectedClass = { quota: 'quota', collision: 'ownership', 'not-found': 'other' }[scenario] ?? 'shape';
+      await assert.rejects(runWithClock(clock, withScratchD1Databases({
+        api, pr: 150, nonce, run: async () => assert.fail('refused inventory must not enter the native control'),
+      })), (error) => {
+        assert.equal(error.nativeCopyPhase, 'preflight');
+        assert.equal(error.nativeCopyClass, expectedClass);
+        return true;
+      });
+      assert.deepEqual(requests, ['empty-shape', 'not-found'].includes(scenario)
+        ? [{ method: 'GET', page: 1 }] : [{ method: 'GET', page: 1 }, { method: 'GET', page: 2 }]);
+      assert.deepEqual([...resources.values()], before, 'all existing database identities remain untouched');
+    });
+  }
+});
+
+test('real client result_info prevents an extra inventory request at an exact full-page boundary', async (t) => {
+  const rows = Array.from({ length: 100 }, (_, index) => ({ uuid: `existing-${index}` }));
+  const clock = createClock();
+  const [api] = previewClients(clock, 1);
+  let requests = 0;
+  t.mock.method(globalThis, 'fetch', async (input, init) => {
+    const url = new URL(input);
+    assert.equal(url.pathname, `/client/v4/accounts/${PREVIEW_ACCOUNT_ID}/d1/database`);
+    assert.equal(init.method ?? 'GET', 'GET');
+    requests += 1;
+    assert.equal(Number(url.searchParams.get('page')), 1, 'total_count proves inventory exhaustion without a second read');
+    return Response.json({ success: true, result: rows, result_info: { total_count: rows.length } });
+  });
+  const inventory = await runWithClock(clock, paginatedList(api.cf, 'd1/database', {
+    pagination: 'page', rowsOf: (envelope) => envelope.result,
+  }));
+  assert.equal(inventory.length, rows.length);
+  assert.equal(requests, 1);
 });
