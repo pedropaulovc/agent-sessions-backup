@@ -17,6 +17,7 @@ import {
   stableJson,
 } from '../../infra/cf/preview-trust.mjs';
 import { D1_BATCH_PROBE_TEXT } from '../../infra/cf/d1-batch-atomicity.mjs';
+import { BLOCK_COLUMNS } from '../src/index-layout.mjs';
 
 const SHA = 'a'.repeat(40);
 const SEED = 'synthetic-preview-seed-for-deployment-regression';
@@ -253,6 +254,9 @@ async function runController(command, scenario = {}) {
               const statement = native.prepare(sql);
               const rows = statement.columns().length ? plainRows(native, sql, params, statement)
                 : (statement.run(...params), []);
+              if (${native} && sql.startsWith('INSERT INTO blocks (') && sql.includes('FROM json_each(?)')) {
+                emit({ kind: 'native-fixture-seed', databaseId: id, tuples: JSON.parse(params[0]) });
+              }
               emit({ kind: 'probe-sql', databaseId: id, sql, params: params.map(textEvidence),
                 rows: rows.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, textEvidence(value)]))) });
               return { success: true, results: rows };
@@ -958,7 +962,23 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
   assert.match(summary.sha256, /^[0-9a-f]{64}$/);
   const sql = result.events.filter((event) => event.kind === 'probe-sql');
   const denseIds = Array.from({ length: summary.denseRows }, (_, index) => index + 1);
-  const suffixIds = denseIds.filter((id) => ![15, 16].includes(id));
+  const denseSeed = result.events.find((event) => event.kind === 'native-fixture-seed' && event.databaseId === 'created-1');
+  assert.ok(denseSeed, 'suffix membership must come from the publicly synthetic fixture actually seeded by the CLI');
+  assert.equal(denseSeed.tuples.length, summary.denseRows);
+  assert.ok(denseSeed.tuples.every((tuple) => tuple.length === BLOCK_COLUMNS.length));
+  const denseRows = denseSeed.tuples.map((tuple) => Object.fromEntries(BLOCK_COLUMNS.map((column, index) => [column, tuple[index]])));
+  assert.deepEqual(denseRows.map(({ id }) => id), denseIds);
+  const longWords = [`a${'中'.repeat(11000)}`, `a${'🫠'.repeat(8250)}`,
+    `a${'Ж'.repeat(16500)}`, `a${'ø'.repeat(16500)}`];
+  for (const [index, text] of longWords.entries()) {
+    assert.equal(Buffer.byteLength(text), 33001);
+    assert.equal(denseRows[16 + index].text, text, 'long boundary rows must contain only the original full valid word');
+  }
+  for (const [index, { text }] of denseRows.entries()) {
+    if (index >= 16 + longWords.length) assert.equal(text, `v${index}\u0000 nativedensesuffix`,
+      'compact remaining prefixes must preserve the bounded dense source page');
+  }
+  const suffixIds = denseRows.filter(({ text }) => text.includes('\u0000 nativedensesuffix')).map(({ id }) => id);
   const suffixEvidence = textEvidence('nativedensesuffix');
   const denseMatches = sql.filter((event) => /\bMATCH\b/.test(event.sql)
     && event.params.length === 1 && event.params[0]?.sha256 === suffixEvidence.sha256);
@@ -988,6 +1008,7 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
       [index + 1, [`nativevaried${word}`]]),
     [7, ['🫠alpha']], [8, ['🫠', 'alpha']], [9, ['🧮alpha']], [10, ['🧠alpha']],
     [11, ['🛠alpha']], [12, ['al🫠pha']], [13, ['₿alpha']], [14, ['\u{1CF00}alpha']], [15, ['🫠']],
+    ...longWords.map((text, index) => [17 + index, [text]]),
   ];
   for (const [id, terms] of nativePoints) {
     for (const term of terms) assertPoint('created-3', `"${term}"`, id, [{ rowid: id }]);

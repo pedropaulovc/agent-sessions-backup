@@ -150,6 +150,12 @@ const DENSE_TOKENIZER_CASES = [
   { text: '\u{1CF00}alpha', tokens: ['\u{1CF00}alpha'], absent: ['alpha'] },
   { text: '🫠', tokens: ['🫠'], only: true },
   { text: '! ? : ; ( ) [ ] { } \t\n\u0000', tokens: [], absent: ['index-migration-tokenless-probe', '🫠', 'alpha'], only: true },
+  ...[
+    `a${'中'.repeat(11000)}`,
+    `a${'🫠'.repeat(8250)}`,
+    `a${'Ж'.repeat(16500)}`,
+    `a${'ø'.repeat(16500)}`,
+  ].map((text) => ({ text, tokens: [text], only: true })),
 ];
 const READBACK_PAGE_ROWS = 256;
 function sessionOn(shard) {
@@ -175,14 +181,15 @@ function fixtures() {
     on_main_path: 0, row_hash: Number.MIN_SAFE_INTEGER,
     media_byte_start: 4_294_967_311, media_byte_len: null, media_type: 'image/α😀',
   };
-  // The first source page contains the ordinary row on IDX00 and exactly 1,461
-  // small rows on IDX01. Keep the last-id long row on its own fallback page.
+  // One source page contains the ordinary row on IDX00 and all 1,461 dense
+  // rows on IDX01, including four 33,001-byte no-tail words. Compact remaining
+  // prefixes keep that geometry bounded; the long row keeps its fallback page.
   const dense = Array.from({ length: DENSE_ROWS }, (_, index) => ({
     id: index + 1, session_id: long.session_id, file_id: 0,
     turn_index: 0, block_index: index, role: null, btype: 'text', tool_name: null,
     ts: '', byte_start: 0, byte_len: 0, truncated: 0,
     text: DENSE_TOKENIZER_CASES[index]?.only ? DENSE_TOKENIZER_CASES[index].text
-      : `${DENSE_TOKENIZER_CASES[index]?.text ?? `nativevaried_${index}`}\u0000 ${DENSE_SUFFIX_TOKEN}`,
+      : `${DENSE_TOKENIZER_CASES[index]?.text ?? `v${index}`}\u0000 ${DENSE_SUFFIX_TOKEN}`,
     on_main_path: 1, row_hash: index + 1,
     media_byte_start: null, media_byte_len: 0, media_type: '',
   }));
@@ -366,9 +373,9 @@ async function proveNativeCopy({ source, shards, gate }) {
         ftsMatches += 1;
       }
     }
-    // Public Unicode-boundary cases share the same dense shard. Check whole
-    // native terms, separated controls, emoji-only postings and tokenless misses
-    // independently of the copier's derived JSON probes.
+    // Public Unicode and UTF-8 truncation boundaries share the same dense shard.
+    // Long no-tail words are probed in their full original valid form, not with
+    // the copier's completion; all point checks are independent of its probes.
     for (const [index, { tokens, absent = [] }] of DENSE_TOKENIZER_CASES.entries()) {
       const row = dense[index];
       const db = shards[indexShardForSessionId(row.session_id, 2)];
@@ -381,8 +388,8 @@ async function proveNativeCopy({ source, shards, gate }) {
         }
       }
     }
-    // This token occurs only after the NUL, unlike the copier's first-token
-    // probes. The two deliberately suffix-free rows have separate checks above.
+    // Independent after-NUL common-token queries prove the complete routed ID
+    // subset; deliberately suffix-free rows have separate whole-word checks above.
     for (const [index, db] of shards.entries()) {
       const wanted = dense.filter((row) => indexShardForSessionId(row.session_id, 2) === index
         && row.text.includes(DENSE_SUFFIX_TOKEN));

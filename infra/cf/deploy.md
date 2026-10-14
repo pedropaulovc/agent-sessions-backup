@@ -93,9 +93,13 @@ preserving Unicode, a leading BOM, and embedded NUL bytes. Before copying, indep
 row-scoped queries require `alpha` to miss the public `🫠alpha` row while the whole `🫠alpha`
 term finds its exact identity. After copying, independent MATCH checks include that whole term,
 the whitespace-separated `🫠 alpha` control, a modern-emoji-only posting and a truly tokenless
-negative probe. The shared after-NUL token independently finds all 1,459 dense rows that carry
-it; the two suffix-free emoji-only/tokenless rows have separate checks. The fixture remains
-1,463 rows total. The verified checkpoint must precede source-row retirement. Proof also
+negative probe. Four additional standalone 33,001-byte CJK, modern-emoji, uppercase-Cyrillic
+and ø words exercise native term truncation without any later word to rescue a bad probe.
+Independent MATCH uses each full original valid word, not the copier's completed probe.
+Compact remaining dense prefixes preserve the bounded ordinary-page geometry. The shared
+after-NUL token independently finds every dense row that actually carries it; suffix-free
+rows have separate point checks. The fixture remains 1,463 rows total. The verified
+checkpoint must precede source-row retirement. Proof also
 requires an empty source, a complete checkpoint, the three-trigger frozen writer fence,
 and a controlled write that is positively rejected.
 The proof command deletes every known created scratch database in `finally` on success or failure, still
@@ -358,10 +362,14 @@ The one-time cutover runs these operations in order, from the same checked-out m
    all probes one consistent native read snapshot without expanding SQL per row.
    Probe terms come from one scoped, reusable in-memory native SQLite FTS index, cloned
    from the actual destination `sqlite_master` FTS declaration. `fts5vocab` instance
-   offset zero supplies the first real indexed term; no JavaScript Unicode-category
-   approximation or separate tokenizer configuration is used. Truly tokenless rows
-   require a negative MATCH result, while modern emoji that unicode61 indexes require
-   a positive posting just like every other native term.
+   offset zero supplies the first real indexed term as raw BLOB bytes. Strict UTF-8
+   decoding preserves a BOM rather than silently dropping it or replacing malformed bytes.
+   Only a trailing partial UTF-8 sequence may be completed, and native byte identity
+   plus a local original-row MATCH must verify the candidate before the unchanged
+   destination MATCH. There is no JavaScript Unicode-category approximation, separate
+   tokenizer configuration, source-text clipping, skipped word or later-term fallback.
+   Truly tokenless rows require a negative MATCH result, while modern emoji that
+   unicode61 indexes require a positive posting just like every other native term.
 7. For every page, compare SHA-256 canonical full-row readback and exercise real FTS
    `MATCH` probes. Persist the verified page checkpoint on `IDX00` **before** deleting
    its source rows. Each source `DELETE` compares **every** column with the verified
@@ -534,6 +542,62 @@ derivation/closure failures expose only the static `fts-tokenizer-schema` or
 tokens or transcript bytes. The full-row SHA, exact identity checks, checkpoint
 ordering, source comparison/acknowledgment and writer fence are unchanged.
 
+Native review of the initial oracle at `a169514` demonstrated a separate local
+long-word regression before release: FTS5's 32,768-byte term limit can split a
+multi-byte UTF-8 character. Reading that vocabulary term as SQLite TEXT loses the
+raw suffix bytes by decoding them as U+FFFD, so the quoted replacement-character
+probe misses even though the full valid original word is searchable. Actual
+Miniflare/workerd copies rejected ten 40–45 KB public CJK, modern-emoji, Cyrillic
+and ø cases, including single words with no later term. All destination columns
+and text bytes were intact; the exact source rows/FTS remained and the checkpoint
+stayed pending/copying with zero acknowledged rows and cursor `-1`. Four ASCII,
+diacritic-folded and valid/aligned UTF-8 controls completed.
+
+The byte-preserving repair strictly decodes the BLOB first. If decoding fails,
+every earlier byte must be valid and only the final incomplete UTF-8 sequence may
+be completed. It enumerates at most 4,096 valid suffix candidates using UTF-8's
+valid continuation ranges, with one reused sequence buffer. A candidate is accepted
+only when indexing it alone through the actual native tokenizer yields exactly one
+term whose raw bytes equal the original stored term. The oracle then restores the
+full original row and requires a positive row-scoped whole-candidate MATCH before
+the unchanged actual-D1 grouped MATCH. This does not reconstruct or alter source
+text, assume zero padding or folding, use a synthetic prefix, skip the term or rely
+on a later word. Non-trailing corruption, exhausted candidates or failed native
+identity/MATCH are static `fts-tokenizer` failures and authorize no acknowledgment.
+
+One local native SQLite 3.51.2 review sweep verified all 17,593 distinct partial
+prefixes of native unicode61 token characters through both exact native term-byte
+identity and original-row MATCH, with at most 247 valid candidates observed. The
+generated repair also completed all fourteen actual Miniflare/workerd full-copy
+cases. Those are retained local reviewer observations, not permanent implementation
+statistics, Node/Windows-wide proof or real Cloudflare evidence. Permanent regressions
+exercise full no-tail words, folded/aligned controls, read-only verification and
+physical missing postings rather than constructor wiring or allocation-count hooks.
+The real-PPE fixture's four 33,001-byte no-tail words exercise the same truncation
+boundaries while preserving the dense ordinary-page and long-row fallback proof.
+
+To isolate this long-term regression, materialize the exact `a169514` module as a
+temporary sibling of `hub/scripts/lib/index-migration.mjs`, preserving relative
+imports, and set `INDEX_COPY_MODULE_PATH` to its absolute `file:` URL:
+
+```sh
+node --test --test-name-pattern='native tokenizer.*long|native workerd.*long' hub/test/index-migration.node.test.mjs
+```
+
+The no-tail CJK, modern-emoji, Cyrillic and ø copier cases must expose the former
+lossy-term MATCH rejection before acknowledgment; ASCII/folded/aligned controls
+retain their positive meaning. Run with the override unset for the repaired copier
+and remove the historical module afterward. These long-word controls substitute
+both the copier and read-only verifier from the selected historical module.
+
+The preceding short-term-only native PPE proof on PR #176 at head `c32add7` was observed
+on 2026-10-13 at 04:39:08 UTC in Actions run `38511682800`, job `115682982238`.
+It verified all 18 columns, 1,463 rows/1,461 dense rows, two shards, two ordinary
+pages, one long fallback, the full-row SHA and three source fences, with native
+`legacyProbeMatches=0` and `nativeProbeMatches=1`. That run predates the expanded
+no-tail B3 fixture: it proves the short modern-Unicode counterexample and existing
+full-copy protocol, not the new long-term byte completion or production recovery.
+
 For the revision-level before-control, materialize the exact `67cdc05` module as a
 temporary sibling of `hub/scripts/lib/index-migration.mjs`, preserving relative
 imports, then set `INDEX_COPY_MODULE_PATH` to its absolute `file:` URL:
@@ -542,8 +606,10 @@ imports, then set `INDEX_COPY_MODULE_PATH` to its absolute `file:` URL:
 node --test --test-name-pattern='native tokenizer|configured FTS tokenizer|missing FTS posting|native workerd.*tokenizer' hub/test/index-migration.node.test.mjs
 ```
 
-The boundary-copy regressions must fail with the old semantic MATCH rejection;
-ASCII, whitespace-separated and truly tokenless controls remain meaningful.
+The short adjacent-modern-Unicode copy regressions expose the old semantic MATCH
+rejection; ASCII, whitespace-separated and truly tokenless controls remain meaningful.
+Some long valid-word controls already pass `67cdc05`; the separate `a169514` control
+above isolates the native TEXT-decoding regression rather than misattributing it.
 Run the same command with `INDEX_COPY_MODULE_PATH` unset for the native-derived
 control, and remove the historical module afterward. A missing real modern-emoji-only
 posting must now fail rather than being mislabeled tokenless. The real-CF isolated

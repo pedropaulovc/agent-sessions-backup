@@ -338,6 +338,56 @@ export function assertActivationProof({ source, shards, copy, seed, ready, activ
     cycle: activation.cycle, verifiedAt: activation.verifiedAt, evidenceSha256: activation.evidenceSha256 }), 'activation');
 }
 
+const TOKEN_UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+const TOKEN_COMPLETION_CANDIDATES = 4096;
+
+function decodeTokenUtf8(bytes) {
+  try { return TOKEN_UTF8.decode(bytes); }
+  catch { return null; }
+}
+
+// FTS5 can cut its stored term in the middle of a UTF-8 sequence. Complete only
+// that trailing sequence; native byte identity and MATCH decide which completion
+// is searchable. No source text is shortened, normalized or used as a fallback.
+function completeTruncatedToken(bytes, accept) {
+  let lead = bytes.length - 1;
+  while (lead >= 0 && bytes.length - lead <= 3 && (bytes[lead] & 0xc0) === 0x80) lead -= 1;
+  if (lead < 0) return null;
+  const head = bytes[lead];
+  const width = head >= 0xc2 && head <= 0xdf ? 2
+    : head >= 0xe0 && head <= 0xef ? 3
+      : head >= 0xf0 && head <= 0xf4 ? 4 : 0;
+  const present = bytes.length - lead;
+  if (!width || present >= width) return null;
+  const prefix = decodeTokenUtf8(bytes.subarray(0, lead));
+  if (prefix === null) return null;
+  // UTF-8's second-byte ranges exclude overlongs, surrogates and values above
+  // U+10FFFF before enumeration, rather than fatally decoding known invalid bytes.
+  const secondMin = head === 0xe0 ? 0xa0 : head === 0xf0 ? 0x90 : 0x80;
+  const secondMax = head === 0xed ? 0x9f : head === 0xf4 ? 0x8f : 0xbf;
+  if (present > 1 && (bytes[lead + 1] < secondMin || bytes[lead + 1] > secondMax)) return null;
+  const sequence = new Uint8Array(width);
+  sequence.set(bytes.subarray(lead));
+  for (let index = present; index < width; index += 1) sequence[index] = index === 1 ? secondMin : 0x80;
+  for (let attempts = 0; attempts < TOKEN_COMPLETION_CANDIDATES; attempts += 1) {
+    const character = decodeTokenUtf8(sequence);
+    if (character === null) return null;
+    const candidate = prefix + character;
+    if (accept(candidate)) return candidate;
+    let index = width - 1;
+    for (; index >= present; index -= 1) {
+      const maximum = index === 1 ? secondMax : 0xbf;
+      if (sequence[index] < maximum) {
+        sequence[index] += 1;
+        break;
+      }
+      sequence[index] = index === 1 ? secondMin : 0x80;
+    }
+    if (index < present) return null;
+  }
+  return null;
+}
+
 // One lazy in-memory native oracle per operation. Clone the destination's trusted
 // declaration rather than maintaining a second tokenizer configuration in JS.
 // Only one row is indexed at a time; neither SQL nor text nor terms leave memory.
@@ -348,6 +398,8 @@ function createFtsTokenizer() {
   let clear;
   let insert;
   let first;
+  let terms;
+  let oracleMatch;
   return {
     async probes(db, rows) {
       if (!rows.length) return [];
@@ -375,7 +427,9 @@ function createFtsTokenizer() {
           database.exec("CREATE VIRTUAL TABLE tokenizer_vocab USING fts5vocab(blocks_fts, 'instance')");
           clear = database.prepare("INSERT INTO blocks_fts (blocks_fts) VALUES ('delete-all')");
           insert = database.prepare('INSERT INTO blocks_fts (rowid, text) VALUES (1, ?)');
-          first = database.prepare("SELECT term FROM tokenizer_vocab WHERE doc = 1 AND col = 'text' AND offset = 0 LIMIT 1");
+          first = database.prepare("SELECT CAST(term AS BLOB) AS bytes FROM tokenizer_vocab WHERE doc = 1 AND col = 'text' AND offset = 0 LIMIT 1");
+          terms = database.prepare("SELECT CAST(term AS BLOB) AS bytes FROM tokenizer_vocab WHERE doc = 1 AND col = 'text' LIMIT 2");
+          oracleMatch = database.prepare('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = 1');
           configuredSql = sql;
         } catch {
           throw copyInvariant(COPY_INVARIANTS.FTS_TOKENIZER_SCHEMA, 'native FTS tokenizer initialization failed', COPY_PHASES.FTS_MATCH);
@@ -386,8 +440,24 @@ function createFtsTokenizer() {
           if (row.text !== null && typeof row.text !== 'string') throw new Error();
           clear.run();
           insert.run(row.text);
-          const token = first.get()?.term ?? null;
-          if (token !== null && (typeof token !== 'string' || !token.length)) throw new Error();
+          const bytes = first.get()?.bytes ?? null;
+          if (bytes === null) return { id: row.id, token: null };
+          if (!(bytes instanceof Uint8Array) || !bytes.length) throw new Error();
+          let token = decodeTokenUtf8(bytes);
+          if (token === null) {
+            token = completeTruncatedToken(bytes, (candidate) => {
+              clear.run();
+              insert.run(candidate);
+              const derived = terms.all();
+              return derived.length === 1 && derived[0].bytes instanceof Uint8Array
+                && Buffer.compare(derived[0].bytes, bytes) === 0;
+            });
+            if (token === null) throw new Error();
+            clear.run();
+            insert.run(row.text);
+            if (oracleMatch.get(`"${token.replaceAll('"', '""')}"`)?.rowid !== 1) throw new Error();
+          }
+          if (!token.length) throw new Error();
           return { id: row.id, token };
         });
         clear.run();
