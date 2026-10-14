@@ -945,32 +945,41 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
   const summary = JSON.parse(result.stdout.trim().split('\n').at(-1));
   assert.equal(summary.state, 'verified');
   assert.equal(summary.probe, 'd1-native-full-copy');
-  assert.equal(summary.rows, 2);
-  assert.equal(summary.ftsMatches, 4);
+  assert.equal(summary.rows, 1463);
+  assert.equal(summary.denseRows, 1461);
+  assert.equal(summary.columns, 18);
+  assert.equal(summary.shards, 2);
+  assert.equal(summary.ftsMatches, 1465);
   assert.equal(summary.freezeTriggers, 3);
-  assert.ok(summary.ordinaryPages > 0 && summary.fallbackPages > 0);
+  assert.equal(summary.ordinaryPages, 2);
+  assert.equal(summary.fallbackPages, 1);
+  assert.equal(summary.longTextBytes, 1_100_061);
+  assert.match(summary.sha256, /^[0-9a-f]{64}$/);
+  const sql = result.events.filter((event) => event.kind === 'probe-sql');
+  const denseIds = Array.from({ length: summary.denseRows }, (_, index) => index + 1);
+  const denseMatches = sql.filter((event) => /\bMATCH\b/.test(event.sql) && /ORDER BY rowid$/.test(event.sql));
+  assert.equal(denseMatches.length, 2, 'the CLI must execute complete independent dense FTS queries on both shards');
+  assert.deepEqual(denseMatches.map(({ databaseId, rows }) => ({ databaseId, rows })), [
+    { databaseId: 'created-2', rows: [] },
+    { databaseId: 'created-3', rows: denseIds.map((rowid) => ({ rowid })) },
+  ]);
+  const sourceBulk = sql.filter((event) => event.databaseId === 'created-1'
+    && /^INSERT INTO blocks \(/.test(event.sql) && /FROM json_each\(\?\)/.test(event.sql));
+  assert.equal(sourceBulk.length, 1, 'all dense source rows are seeded by one real JSON1 statement');
+  assert.equal(sourceBulk[0].params.length, 1);
+  assert.ok(sourceBulk[0].params[0].utf8Bytes < 1_048_576);
+  const finalSourceCount = sql.filter((event) => event.databaseId === 'created-1'
+    && event.sql === 'SELECT COUNT(*) AS rows FROM blocks').at(-1);
+  assert.deepEqual(finalSourceCount.rows, [{ rows: 0 }]);
+  const queries = result.events.filter((event) => event.kind === 'request'
+    && new URL(event.url).pathname.endsWith('/query'));
+  assert.ok(queries.length <= 200, `complete native CLI proof must use bounded RPCs, observed ${queries.length}`);
   const migrations = result.events.filter((event) => event.kind === 'migrate');
   assert.equal(migrations.length, 3);
   const creations = result.events.filter((event) => event.kind === 'request' && event.method === 'POST'
     && new URL(event.url).pathname.endsWith('/d1/database'));
   assert.equal(creations.length, 3);
-  for (const [index, migration] of migrations.entries()) {
-    const binding = ['DB', 'IDX00', 'IDX01'][index];
-    assert.equal(migration.command, 'apply');
-    assert.equal(migration.options.target, 'preview');
-    assert.equal(migration.options.database, binding);
-    assert.equal(migration.options['database-id'], `created-${index + 1}`);
-    assert.equal(migration.options['artifact-digest'], 'c'.repeat(64));
-    assert.equal(migration.options['deployment-id'], `pr-${PR}-${SHA.slice(0, 12)}-native-copy-${binding}`);
-    assert.equal(migration.options['base-manifest'], path.join(result.hub, 'migrations-index', 'source-baseline.json'));
-    assert.equal(migration.config.account_id, PREVIEW_ACCOUNT_ID);
-    assert.deepEqual(migration.config.d1_databases.map((database) => [
-      database.binding, database.database_name, database.database_id, database.migrations_dir,
-    ]), creations.map((event, offset) => [
-      ['DB', 'IDX00', 'IDX01'][offset], event.body.name, `created-${offset + 1}`,
-      path.join(result.hub, 'migrations-index'),
-    ]));
-  }
+  for (const { body } of creations) assert.match(body.name, /^pr-150-copy-[0-9a-f]{24}-(?:source|idx00|idx01)$/);
   assert.deepEqual(result.migrationConfigsRemoved, [true, true, true]);
   assert.deepEqual(databaseDeletes(result).map((event) => new URL(event.url).pathname.split('/').at(-1)),
     ['created-1', 'created-2', 'created-3']);

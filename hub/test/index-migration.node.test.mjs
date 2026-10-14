@@ -3769,12 +3769,14 @@ test('native full-copy control runs real SQLite schema, copier, independent read
   const result = await verifyNativeCopyControl(proof);
   assert.equal(result.state, 'verified');
   assert.equal(result.probe, 'd1-native-full-copy');
-  assert.equal(result.rows, 2);
+  assert.equal(result.rows, 1463);
+  assert.equal(result.denseRows, 1461);
   assert.equal(result.columns, BLOCK_COLUMNS.length);
   assert.equal(result.shards, 2);
-  assert.ok(Number.isSafeInteger(result.ordinaryPages) && result.ordinaryPages > 0);
-  assert.ok(Number.isSafeInteger(result.fallbackPages) && result.fallbackPages > 0);
-  assert.equal(result.ftsMatches, 4);
+  assert.equal(result.ordinaryPages, 2);
+  assert.equal(result.fallbackPages, 1);
+  assert.equal(result.ftsMatches, 1465);
+  assert.equal(result.longTextBytes, 1_100_061);
   assert.equal(result.freezeTriggers, 3);
   assert.match(result.sha256, /^[0-9a-f]{64}$/);
   const [source, ...shards] = adapters;
@@ -3783,6 +3785,32 @@ test('native full-copy control runs real SQLite schema, copier, independent read
   const copied = shards.flatMap((database) => database.rows('SELECT * FROM blocks')).sort((a, b) => a.id - b.id);
   assert.equal(copied.length, result.rows);
   assert.equal(sha256(JSON.stringify(copied.map((row) => JSON.parse(canonicalRow(BLOCK_COLUMNS, row))))), result.sha256);
+  const dense = copied.filter(({ id }) => id >= 1 && id <= result.denseRows);
+  const denseIds = Array.from({ length: result.denseRows }, (_, index) => index + 1);
+  assert.deepEqual(dense.map(({ id }) => id), denseIds);
+  assert.ok(dense.every(({ session_id }) => indexShardForSessionId(session_id, 2) === 1));
+  assert.deepEqual(shards[0].rows('SELECT id FROM blocks ORDER BY id'), [{ id: 0 }]);
+  assert.deepEqual(shards[1].rows('SELECT id FROM blocks ORDER BY id'),
+    [...denseIds, INDEX_ID_SPAN - 1].map((id) => ({ id })));
+  const seed = source.trace.find(({ kind }) => kind === 'batch');
+  assert.equal(seed.statements.length, 3, 'dense source seeding remains one bounded batch, not one statement per row');
+  const bulkSeed = seed.statements.filter(({ sql }) => /FROM json_each\(\?\)/.test(sql));
+  assert.equal(bulkSeed.length, 1);
+  assert.equal(bulkSeed[0].params.length, 1);
+  assert.deepEqual(JSON.parse(bulkSeed[0].params[0]), dense.map((row) => BLOCK_COLUMNS.map((column) => row[column])));
+  const denseFtsQueries = shards.map((database) => database.trace.filter(({ kind, sql }) =>
+    kind === 'query' && /\bMATCH\b/.test(sql) && /ORDER BY rowid$/.test(sql)));
+  for (const [index, queries] of denseFtsQueries.entries()) {
+    assert.equal(queries.length, 1, 'independent dense FTS proof uses one common-token query per shard');
+    assert.equal(queries[0].params.length, 1);
+    assert.deepEqual(queries[0].rows, (index === 1 ? denseIds : []).map((rowid) => ({ rowid })));
+  }
+  const requests = adapters.flatMap(({ trace }) => trace.filter(({ kind }) => ['query', 'batch'].includes(kind)));
+  assert.ok(requests.length <= 200, `complete native proof must use bounded RPCs, observed ${requests.length}`);
+  const statements = adapters.flatMap(({ trace }) => trace.filter(({ kind }) => ['query', 'batch-statement'].includes(kind)));
+  assert.ok(statements.every(({ params }) => params.length <= 100));
+  assert.ok(statements.every(({ responseBytes }) => responseBytes === undefined || responseBytes <= 1_048_576),
+    'full-row and independent readback responses stay within the ordinary response budget');
   assert.equal((await readCheckpoint(shards[0], COPY_CHECKPOINT)).state, 'complete');
   assert.deepEqual(account.snapshot(), before);
   assert.equal(account.created.length, 3);
@@ -3958,7 +3986,7 @@ test('native proof preserves copier assertion identity from real schema, FTS and
         return true;
       });
       assert.equal(mutated, true);
-      assert.deepEqual(adapters[0].rows('SELECT COUNT(*) AS rows FROM blocks'), [{ rows: 2 }]);
+      assert.deepEqual(adapters[0].rows('SELECT COUNT(*) AS rows FROM blocks'), [{ rows: 1463 }]);
       assert.deepEqual(cleanupAttempts, account.created.map(({ uuid }) => uuid));
       assert.deepEqual(account.snapshot(), fault === 'sha-cleanup'
         ? [...before, account.created[0]].sort((a, b) => a.uuid.localeCompare(b.uuid)) : before);
