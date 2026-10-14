@@ -75,7 +75,7 @@ async function orderDispatchAfterBaseline(jobId: string): Promise<void> {
   // The fixtures start at OLD. Give dispatch a fixed, strictly newer lower bound;
   // actual consumer writes must still refresh BOTH timestamps to cross it. This
   // controls stored test preconditions, not SQL, responses, or consumer state.
-  // Comparing real-time samples from separate workerd events is nondeterministic.
+  // Keep fixture ordering independent of wall-clock samples across workerd events.
   await db.prepare(`UPDATE reindex_range_targets SET dispatched_at = ?2
     WHERE job_id = ?1 AND dispatched_at IS NOT NULL AND dispatch_state NOT IN ('ready', 'error')`)
     .bind(jobId, DISPATCHED).run();
