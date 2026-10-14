@@ -5031,7 +5031,7 @@ test('native full-copy control runs real SQLite schema, copier, independent read
   'the pre-copy source oracle must prove the old alpha miss and native whole-term hit');
   const suffixIds = dense.filter(({ text }) => text.includes('\u0000 nativedensesuffix')).map(({ id }) => id);
   const independentMatches = shards.flatMap((database) => database.trace.filter(({ kind, sql, params }) =>
-    kind === 'query' && /\bMATCH\b/.test(sql)
+    ['query', 'batch-statement'].includes(kind) && /\bMATCH\b/.test(sql)
     && (params.length === 2 || params[0] === 'nativedensesuffix')));
   for (const [index, database] of shards.entries()) {
     const suffix = independentMatches.filter(({ db, params }) => db === database.id
@@ -5045,11 +5045,31 @@ test('native full-copy control runs real SQLite schema, copier, independent read
       && JSON.stringify(rows) === JSON.stringify([{ rowid: index + 1 }])),
     'all synthetic boundary points must have independent native positive results');
   }
+  const growthIds = new Set(growth.map(({ id }) => id));
+  const originalWordBatches = shards[1].trace.filter(({ kind, statements }) => kind === 'batch'
+    && statements.length > 0 && statements.every(({ sql, params }) => /\bMATCH\b/.test(sql)
+      && params.length === 2 && growthIds.has(params[1])));
+  const growthPages = copying.filter(({ pending }) => pending.rows.some(({ id }) => growthIds.has(id)));
+  assert.equal(originalWordBatches.length, growthPages.length + 1,
+    'every real growth page needs independent ORIGINAL-word verification before ACK, plus final verification');
+  for (const { statements, transaction } of originalWordBatches) {
+    assert.ok(statements.length <= result.growthRows);
+    assert.ok(Buffer.byteLength(JSON.stringify({ batch: statements })) <= COPY_PAGE_BYTES,
+      'the entire independent point batch must fit the internal request budget');
+    const calls = shards[1].trace.filter((event) => event.kind === 'batch-statement' && event.transaction === transaction);
+    assert.equal(calls.length, statements.length);
+    for (const call of calls) {
+      const row = growth.find(({ id }) => id === call.params[1]);
+      assert.equal(call.params[0], `"${row.text}"`, 'independent inputs must be ORIGINAL whole valid words, not copier completions');
+      assert.equal(call.success, true);
+      assert.deepEqual(call.rows, [{ rowid: row.id }], 'every statement needs its actual native posting identity');
+    }
+  }
   assert.equal(result.ftsMatches, independentMatches.reduce((count, { rows }) => count + rows.length, 0),
     'summary FTS evidence must count the actual independent positive point and suffix hits');
   const requests = adapters.flatMap(({ trace }) => trace.filter(({ kind }) => ['query', 'batch'].includes(kind)));
   assert.ok(requests.length <= 200 + result.growthRows * 6,
-    `complete native proof must retain bulk copying with bounded independent growth point/slice checks, observed ${requests.length}`);
+    `complete native proof must retain bulk copying with bounded independent growth point batches/slice checks, observed ${requests.length}`);
   const statements = adapters.flatMap(({ trace }) => trace.filter(({ kind }) => ['query', 'batch-statement'].includes(kind)));
   assert.ok(statements.every(({ params }) => params.length <= 100));
   assert.ok(statements.every(({ responseBytes }) => responseBytes === undefined || responseBytes <= 1_048_576),
@@ -5311,18 +5331,29 @@ test('native proof preserves source-versus-readback phase for real copier scalar
         proof.applySchema = async (databases) => {
           await applySchema(databases);
           const db = side === 'source' ? databases.source : databases.shards[invariant === 'value' ? 0 : 1];
-          db.transformQuery = ({ sql }, rows) => {
+          let copierLongIds = new Set();
+          db.transformQuery = ({ sql, params }, rows) => {
             if (exercised) return rows;
-            const scalar = invariant === 'value' && /^\s*WITH sized AS MATERIALIZED/.test(sql);
-            const slice = invariant === 'long-slice' && /^\s*SELECT hex\(substr/.test(sql);
+            const fullRow = /^\s*WITH sized AS MATERIALIZED/.test(sql);
+            if (fullRow) {
+              const marker = `__long_${BLOCK_COLUMNS.indexOf('text')}`;
+              copierLongIds = new Set(rows.filter((row) => row.text === null
+                && Number.isSafeInteger(row[marker]) && row[marker] > 0).map(({ id }) => id));
+            }
+            const scalar = invariant === 'value' && fullRow;
+            const slice = invariant === 'long-slice' && /^\s*SELECT hex\(substr/.test(sql)
+              && typeof params[2] === 'string' && JSON.parse(params[2]).some((id) => copierLongIds.has(id));
             if (!scalar && !slice) return rows;
-            // Seed readback also uses hex slices. Neither corruption may arm
-            // before the real copier has written its durable checkpoint.
+            // Independent seed/growth/final readers also use hex slices. Only a
+            // long row observed in the copier's sized read and expected pending
+            // phase may arm; a checkpoint alone is not a copier-readback oracle.
             const checkpoint = databases.shards[0].rows(
               'SELECT value FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT],
             )[0];
             if (!checkpoint) return rows;
             const state = JSON.parse(checkpoint.value);
+            if (state.state !== 'pending'
+              || (state.pending?.phase ?? null) !== (side === 'destination' ? 'copying' : null)) return rows;
             assert.equal(state.identity.source, databases.source.id);
             assert.equal(state.state, 'pending');
             assert.equal(state.pending?.phase ?? null, side === 'destination' ? 'copying' : null);

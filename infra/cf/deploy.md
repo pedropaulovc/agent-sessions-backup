@@ -100,8 +100,15 @@ Compact remaining dense prefixes preserve the original ordinary first-page geome
 one ordinary row and all 1,461 dense rows, including the four no-tail boundary words.
 After that dense phase, 46 distinct same-shard rows containing `a` plus 11,000 `Ⱥ`
 characters and a numeric suffix exercise native folding growth. Independent MATCH
-uses every ORIGINAL whole growth word, before its source ACK and after retirement,
-and independent sliced readback checks all columns and the full-row SHA. The proof
+uses every ORIGINAL whole growth word, before its source ACK and after retirement.
+The unchanged row-scoped point SQL is sent in native read batches of at most the
+fixture's 46 growth rows, with each complete serialized `{batch: statements}`
+request at most 1 MiB. Every statement must succeed with exactly one safe, unique,
+actual native rowid matching its requested identity; requested-ID projection alone
+is not MATCH evidence. This avoids one paced HTTP request per point without
+changing the controller's 300 ms request pacing or bypassing any full-word check.
+These independent point batches are not counted as copier split-probe groups.
+Independent sliced readback still checks all columns and the full-row SHA. The proof
 reader hex-transports values above 16 KiB in existing bounded BLOB slices so the
 growth rows cannot make its 256-row independent response exceed the byte budget;
 this does not change the copier's source-page or readback budgets. The shared

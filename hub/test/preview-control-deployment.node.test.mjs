@@ -203,7 +203,8 @@ async function runController(command, scenario = {}) {
         const evidenceBody = probeRequest
           ? body.batch ? { batch: body.batch.map(evidenceStatement) } : evidenceStatement(body)
           : body;
-        emit({ kind: 'request', url: url.href, method, body: evidenceBody });
+        emit({ kind: 'request', url: url.href, method, body: evidenceBody,
+          bodyBytes: ${native} && init.body ? Buffer.byteLength(init.body) : undefined });
         if (url.hostname === names.host && url.pathname === '/healthz') return new Response('ok');
         if (url.hostname === 'api.github.com') {
           const number = Number(url.pathname.split('/').at(-1));
@@ -1041,8 +1042,18 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
   assert.ok(growthGroups.length > 1, 'appended fold growth must actually execute multiple native MATCH groups');
   assert.deepEqual(growthGroups.flatMap(({ rows }) => rows.map(({ rowid }) => rowid)).sort((a, b) => a - b),
     growthRows.map(({ id }) => id));
+  const growthIds = new Set(growthRows.map(({ id }) => id));
+  const originalWordBatches = result.events.filter(({ kind, body }) => kind === 'request'
+    && body?.batch?.length > 0 && body.batch.every(({ sql, params }) => /\bMATCH\b/.test(sql)
+      && params.length === 2 && growthIds.has(params[1])));
+  for (const batch of originalWordBatches) {
+    assert.ok(batch.body.batch.length <= summary.growthRows);
+    assert.ok(batch.bodyBytes > 0 && batch.bodyBytes <= 1_048_576,
+      'the entire actual serialized independent ORIGINAL-word batch must obey the byte budget');
+  }
   let splitPages = 0;
   let maxUnsplitBytes = 0;
+  let growthPages = 0;
   const pendingGroups = new Map();
   for (const event of sql) {
     if (event.ftsProbeIds !== undefined) {
@@ -1051,7 +1062,9 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
     }
     if (event.databaseId !== 'created-1' || !/\bDELETE FROM blocks\b/.test(event.sql)) continue;
     let split = false;
+    let hasGrowth = false;
     for (const groups of pendingGroups.values()) {
+      if (groups.some(({ ftsProbeIds }) => ftsProbeIds.some((id) => growthIds.has(id)))) hasGrowth = true;
       // Reconstitute the exact escaped params envelope from actual byte counts:
       // remove each six-byte envelope and add the inter-group entry commas.
       const bytes = 6 + groups.reduce((bytes, group) => bytes + group.parametersBytes - 6, 0) + groups.length - 1;
@@ -1062,15 +1075,18 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
       }
     }
     if (split) splitPages += 1;
+    if (hasGrowth) growthPages += 1;
     pendingGroups.clear();
   }
   assert.equal(summary.splitFtsProbePages, splitPages);
   assert.equal(summary.maxUnsplitFtsParametersBytes, maxUnsplitBytes);
+  assert.equal(originalWordBatches.length, growthPages + 1,
+    'every real growth page needs a native ORIGINAL-word point batch before ACK and another after retirement');
   const ordinaryWrites = sql.filter(({ databaseId, sql, params }) => databaseId !== 'created-1'
     && /^INSERT INTO blocks \(/.test(sql) && params.length === 1);
   assert.equal(summary.ordinaryPages, ordinaryWrites.length, 'ordinary page counts must reflect actual native writes');
   // Each original growth word is independently probed before its source ACK as
-  // well as after retirement; the CLI trace must show actual native point hits.
+  // well as after retirement; batched statements must retain actual native point hits.
   for (const row of growthRows) {
     const points = assertPoint('created-3', `"${row.text}"`, row.id, [{ rowid: row.id }]);
     const group = growthGroups.find(({ ftsProbeIds }) => ftsProbeIds.includes(row.id));
@@ -1111,7 +1127,7 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
   const queries = result.events.filter((event) => event.kind === 'request'
     && new URL(event.url).pathname.endsWith('/query'));
   assert.ok(queries.length <= 200 + summary.growthRows * 6,
-    `complete native CLI proof must retain bulk copying with bounded independent growth point/slice checks, observed ${queries.length}`);
+    `complete native CLI proof must retain bulk copying with bounded independent growth point batches/slice checks, observed ${queries.length}`);
   const migrations = result.events.filter((event) => event.kind === 'migrate');
   assert.equal(migrations.length, 3);
   const creations = result.events.filter((event) => event.kind === 'request' && event.method === 'POST'

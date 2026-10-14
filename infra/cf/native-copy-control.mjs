@@ -269,6 +269,29 @@ async function readRows(db, phase) {
   }
   return rows;
 }
+
+// Preserve the independent ORIGINAL whole-word point SQL, but send the fixture's
+// at-most-46 statements in one bounded native read batch instead of 46 paced RPCs.
+// Neither these inputs nor these actual rowid results come from the copier oracle.
+async function matchOriginalGrowthWords(db, rows, phase) {
+  requireProof(rows.length > 0 && rows.length <= GROWTH_ROWS, phase);
+  const statements = rows.map((row) => ({
+    sql: 'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = CAST(? AS INTEGER)',
+    params: [`"${row.text.replaceAll('"', '""')}"`, row.id],
+  }));
+  requireProof(Buffer.byteLength(JSON.stringify({ batch: statements })) <= COPY_PAGE_BYTES, phase);
+  const results = await db.batch(statements);
+  requireProof(Array.isArray(results) && results.length === rows.length, phase);
+  const found = new Set();
+  for (const [index, result] of results.entries()) {
+    const hits = result?.results;
+    requireProof(result?.success === true && Array.isArray(hits) && hits.length === 1
+      && Number.isSafeInteger(hits[0].rowid) && hits[0].rowid === rows[index].id
+      && !found.has(hits[0].rowid), phase);
+    found.add(hits[0].rowid);
+  }
+  return found.size;
+}
 async function assertFrozen(source) {
   const objects = await source.query(`SELECT type, name FROM sqlite_master WHERE name IN (
     '${SOURCE_FREEZE_TABLE}', 'index_migration_blocks_insert', 'index_migration_blocks_update', 'index_migration_blocks_delete')`);
@@ -399,15 +422,7 @@ async function proveNativeCopy({ source, shards, gate }) {
             const stored = (await readRows(shards[1], 'growth-before-ack')).filter((row) => ids.has(row.id));
             requireProof(stored.length === wantedGrowth.length && rowsSha256(stored) === rowsSha256(wantedGrowth),
               'growth-before-ack');
-            for (const row of wantedGrowth) {
-              // ORIGINAL whole valid words, independent of the copier's native
-              // first-token completion, must match before any source ACK.
-              const matches = await shards[1].query(
-                'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = CAST(? AS INTEGER)',
-                [`"${row.text}"`, row.id]);
-              requireProof(matches.length === 1 && matches[0].rowid === row.id, 'growth-before-ack');
-              growthVerifiedRows += 1;
-            }
+            growthVerifiedRows += await matchOriginalGrowthWords(shards[1], wantedGrowth, 'growth-before-ack');
           }
           verifiedCheckpoint = JSON.stringify(checkpoint.pending);
         }
@@ -459,13 +474,7 @@ async function proveNativeCopy({ source, shards, gate }) {
         }
       }
     }
-    for (const row of growth) {
-      const matches = await shards[1].query(
-        'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = CAST(? AS INTEGER)',
-        [`"${row.text}"`, row.id]);
-      requireProof(matches.length === 1 && matches[0].rowid === row.id, phase);
-      ftsMatches += 1;
-    }
+    ftsMatches += await matchOriginalGrowthWords(shards[1], growth, phase);
     // Independent after-NUL common-token queries prove the complete routed ID
     // subset; deliberately suffix-free rows have separate whole-word checks above.
     for (const [index, db] of shards.entries()) {
