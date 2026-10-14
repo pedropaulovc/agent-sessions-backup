@@ -318,18 +318,46 @@ async function generatedConfig(args) {
   return config;
 }
 
-async function health(config, mode) {
-  const response = await fetch(`https://${config.vars.VIEWER_HOST}/healthz`, {
-    redirect: 'error', signal: AbortSignal.timeout(30000), headers: { 'cache-control': 'no-cache' },
-  });
-  if (!response.ok) throw new Error(`health revision gate HTTP ${response.status}`);
-  const value = await response.json();
-  if (mode === 'maintenance') assertMaintenanceHealth(value, config.vars.DEPLOYMENT_REVISION, 16);
-  else if (value.ok !== true || value.environment !== 'production' || value.indexMode !== 'active'
-    || value.deploymentRevision !== config.vars.DEPLOYMENT_REVISION || value.indexShardCount !== 16) {
-    throw new Error('live active revision/layout mismatch');
+function healthFailure(command, mode, failure, attempts, status) {
+  const safeCommand = ['health', 'reconcile-catalog', 'verify-active', 'drain', 'copy', 'seed-catalog', 'ready']
+    .includes(command) ? command : 'unknown';
+  return new Error(`health operation=revision-gate command=${safeCommand} mode=${mode === 'active' ? 'active' : 'maintenance'}`
+    + ` failure=${failure} HTTP=${Number.isInteger(status) && status >= 100 && status <= 599 ? status : 'unknown'}`
+    + ` attempts=${attempts}`);
+}
+
+async function health(config, mode, { command, requestGate } = {}) {
+  for (let attempt = 1; attempt <= 3; attempt += 1) {
+    if (requestGate) requestGate();
+    let response;
+    let text;
+    try {
+      response = await fetch(`https://${config.vars.VIEWER_HOST}/healthz`, {
+        redirect: 'error', signal: AbortSignal.timeout(30000), headers: { 'cache-control': 'no-cache' },
+      });
+      if (response.ok) text = await response.text();
+    } catch (error) {
+      if (error instanceof CopyPassBudgetExhausted) throw error;
+      if (attempt === 3) throw healthFailure(command, mode, 'transport', attempt, response?.status);
+      // Only this read-only GET is safe to replay after an ambiguous transport
+      // interruption. The same copy boundary gates starts and retry waits.
+      if (requestGate) requestGate(1000);
+      await sleep(1000);
+      continue;
+    }
+    if (!response.ok) throw healthFailure(command, mode, 'http', attempt, response.status);
+    let value;
+    try { value = JSON.parse(text); }
+    catch { throw healthFailure(command, mode, 'json', attempt, response.status); }
+    try {
+      if (mode === 'maintenance') assertMaintenanceHealth(value, config.vars.DEPLOYMENT_REVISION, 16);
+      else if (value?.ok !== true || value.environment !== 'production' || value.indexMode !== 'active'
+        || value.deploymentRevision !== config.vars.DEPLOYMENT_REVISION || value.indexShardCount !== 16) {
+        throw new Error('live active revision/layout mismatch');
+      }
+    } catch { throw healthFailure(command, mode, 'mismatch', attempt, response.status); }
+    return value;
   }
-  return value;
 }
 
 /** Safe native GET schema facts only; this projection never authorizes deletion. */
@@ -458,7 +486,7 @@ async function main() {
     if (!['maintenance', 'active'].includes(args.mode)) throw new Error('health requires --mode maintenance|active');
     const deadline = Date.now() + 180000;
     for (;;) {
-      try { console.log(JSON.stringify(await health(config, args.mode))); return; }
+      try { console.log(JSON.stringify(await health(config, args.mode, { command }))); return; }
       catch (error) { if (Date.now() >= deadline) throw error; await sleep(2000); }
     }
   }
@@ -482,9 +510,9 @@ async function main() {
     return;
   }
   if (command === 'reconcile-catalog') {
-    await health(config, 'active');
+    await health(config, 'active', { command });
     const result = await reconcileIndexCatalog({ source, shards });
-    await health(config, 'active');
+    await health(config, 'active', { command });
     console.log(JSON.stringify(result));
     return;
   }
@@ -501,7 +529,7 @@ async function main() {
   if (command === 'verify-active') {
     const result = await verifyActiveIndex({
       source, shards, revision: config.vars.DEPLOYMENT_REVISION, cycle,
-      gate: async () => await health(config, 'active'),
+      gate: async () => await health(config, 'active', { command }),
       login: async () => {
         const response = await fetch(`https://${config.vars.VIEWER_HOST}/login`, {
           redirect: 'error', signal: AbortSignal.timeout(30000),
@@ -515,7 +543,7 @@ async function main() {
     console.log(JSON.stringify(result));
     return;
   }
-  const gate = async () => await health(config, 'maintenance');
+  const gate = async () => await health(config, 'maintenance', { command });
   await gate();
   if (command === 'drain') {
     let frozen = await readCheckpoint(shards[0], FREEZE_CHECKPOINT);
@@ -550,15 +578,15 @@ async function main() {
       || !Number.isSafeInteger(atomicity.verifiedAt) || atomicity.verifiedAt <= 0 || atomicity.verifiedAt > Date.now()) {
       throw new Error('this deployment has no verified native D1 REST batch atomicity/text transport control; source copy forbidden');
     }
-    // Setup/drain/atomicity prerequisites use the unbudgeted client. Only this copy
-    // process's data requests receive a fresh, non-persisted pass boundary.
-    const copyApi = args['pass-budget-ms'] === undefined ? api
-      : indexControlClient(account, process.env.CLOUDFLARE_API_TOKEN, {
-        requestGate: createCopyPassRequestGate(Number(args['pass-budget-ms'])),
-      });
+    // Setup/drain/atomicity prerequisites stay unbudgeted. Copy data requests and
+    // fresh health gates share this process's non-persisted pass boundary.
+    const requestGate = args['pass-budget-ms'] === undefined ? undefined
+      : createCopyPassRequestGate(Number(args['pass-budget-ms']));
+    const copyApi = requestGate ? indexControlClient(account, process.env.CLOUDFLARE_API_TOKEN, { requestGate }) : api;
     const result = await runCopyPass({
       source: copyApi.db(config.d1_databases[0].database_id),
-      shards: config.d1_databases.slice(1).map((db) => copyApi.db(db.database_id)), gate,
+      shards: config.d1_databases.slice(1).map((db) => copyApi.db(db.database_id)),
+      gate: async () => await health(config, 'maintenance', { command, requestGate }),
     });
     console.log(JSON.stringify(result));
     if (result.status === 'partial') process.exitCode = 78;
