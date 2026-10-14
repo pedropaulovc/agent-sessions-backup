@@ -4059,26 +4059,41 @@ test('native proof preserves source-versus-readback phase for real copier scalar
         const { account, adapters, proof } = await nativeScratchFixture(child);
         const before = account.snapshot();
         let exercised = 0;
+        let authoritativeRows;
+        let armedCheckpoint;
         const applySchema = proof.applySchema;
         proof.applySchema = async (databases) => {
           await applySchema(databases);
           const db = side === 'source' ? databases.source : databases.shards[invariant === 'value' ? 0 : 1];
           db.transformQuery = ({ sql }, rows) => {
             if (exercised) return rows;
-            if (invariant === 'value' && /^\s*WITH sized AS MATERIALIZED/.test(sql)) {
-              assert.equal(rows.length, 1);
+            const scalar = invariant === 'value' && /^\s*WITH sized AS MATERIALIZED/.test(sql);
+            const slice = invariant === 'long-slice' && /^\s*SELECT hex\(substr/.test(sql);
+            if (!scalar && !slice) return rows;
+            // Seed readback also uses hex slices. Neither corruption may arm
+            // before the real copier has written its durable checkpoint.
+            const checkpoint = databases.shards[0].rows(
+              'SELECT value FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT],
+            )[0];
+            if (!checkpoint) return rows;
+            const state = JSON.parse(checkpoint.value);
+            assert.equal(state.identity.source, databases.source.id);
+            assert.equal(state.state, 'pending');
+            assert.equal(state.pending?.phase ?? null, side === 'destination' ? 'copying' : null);
+            authoritativeRows = databases.source.rows('SELECT * FROM blocks ORDER BY id');
+            armedCheckpoint = state;
+            if (scalar) {
+              assert.ok(rows.length > 0, 'the scalar fault must alter a row returned by the actual copier');
+              const authoritativeIds = new Set(authoritativeRows.map(({ id }) => id));
+              assert.ok(rows.every(({ id }) => authoritativeIds.has(id)));
+              if (side === 'destination') {
+                const shard = databases.shards.indexOf(db);
+                assert.deepEqual(rows.map(({ id }) => id),
+                  state.pending.rows.filter((row) => row.shard === shard).map(({ id }) => id));
+              }
               exercised += 1;
               rows[0].tool_name = { private: 'PRIVATE_NATIVE_PHASE_CANARY' };
-            } else if (invariant === 'long-slice' && /^\s*SELECT hex\(substr/.test(sql)) {
-              // Seed readback uses the same hex transport. Arm only after the
-              // actual copier has written its durable checkpoint, never during seed.
-              const checkpoint = databases.shards[0].rows(
-                'SELECT value FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT],
-              )[0];
-              if (!checkpoint) return rows;
-              const state = JSON.parse(checkpoint.value);
-              assert.equal(state.identity.source, databases.source.id);
-              assert.equal(state.state, 'pending');
+            } else {
               assert.equal(rows.length, 1);
               assert.ok(rows[0].bytes.length > 2);
               exercised += 1;
@@ -4096,9 +4111,22 @@ test('native proof preserves source-versus-readback phase for real copier scalar
           return true;
         });
         assert.equal(exercised, 1);
-        const retained = adapters[0].rows('SELECT id FROM blocks ORDER BY id');
-        assert.deepEqual(retained, invariant === 'value' ? [{ id: 0 }, { id: INDEX_ID_SPAN - 1 }] : [{ id: INDEX_ID_SPAN - 1 }],
-          'the rejected page remains authoritative even if an earlier ordinary page was verified and retired');
+        assert.ok(authoritativeRows.length > 0);
+        assert.deepEqual(adapters[0].rows('SELECT * FROM blocks ORDER BY id'), authoritativeRows,
+          'every full source row at the rejected boundary remains authoritative, including dense rows on the pending page');
+        const checkpoint = await readCheckpoint(adapters[1], COPY_CHECKPOINT);
+        assert.deepEqual(checkpoint, armedCheckpoint, 'rejection cannot advance or verify the durable copy checkpoint');
+        assert.equal(checkpoint.pending?.phase ?? null, side === 'destination' ? 'copying' : null);
+        if (invariant === 'long-slice') {
+          assert.ok(checkpoint.rows > 0, 'the earlier complete ordinary page must have been verified and retired');
+        } else {
+          assert.equal(checkpoint.rows, 0, 'the rejected first ordinary page cannot retire any source rows');
+        }
+        if (checkpoint.pending) {
+          const retainedIds = new Set(authoritativeRows.map(({ id }) => id));
+          assert.ok(checkpoint.pending.rows.every(({ id }) => retainedIds.has(id)),
+            'the entire actual durable pending page remains in the source');
+        }
         assert.deepEqual(account.snapshot(), before);
         assert.deepEqual(new Set(account.deleted.map(({ uuid }) => uuid)), new Set(account.created.map(({ uuid }) => uuid)));
       });
