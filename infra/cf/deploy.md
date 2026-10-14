@@ -96,12 +96,25 @@ the whitespace-separated `🫠 alpha` control, a modern-emoji-only posting and a
 negative probe. Four additional standalone 33,001-byte CJK, modern-emoji, uppercase-Cyrillic
 and ø words exercise native term truncation without any later word to rescue a bad probe.
 Independent MATCH uses each full original valid word, not the copier's completed probe.
-Compact remaining dense prefixes preserve the bounded ordinary-page geometry. The shared
-after-NUL token independently finds every dense row that actually carries it; suffix-free
-rows have separate point checks. The fixture remains 1,463 rows total. The verified
-checkpoint must precede source-row retirement. Proof also
-requires an empty source, a complete checkpoint, the three-trigger frozen writer fence,
-and a controlled write that is positively rejected.
+Compact remaining dense prefixes preserve the original ordinary first-page geometry:
+one ordinary row and all 1,461 dense rows, including the four no-tail boundary words.
+After that dense phase, 46 distinct same-shard rows containing `a` plus 11,000 `Ⱥ`
+characters and a numeric suffix exercise native folding growth. Independent MATCH
+uses every ORIGINAL whole growth word, before its source ACK and after retirement,
+and independent sliced readback checks all columns and the full-row SHA. The proof
+reader hex-transports values above 16 KiB in existing bounded BLOB slices so the
+growth rows cannot make its 256-row independent response exceed the byte budget;
+this does not change the copier's source-page or readback budgets. The shared
+after-NUL token still independently finds every dense row that actually carries it.
+The fixture has 1,509 rows total and retains the huge row's separate fallback.
+Later growth-page geometry is checked from real checkpoints rather than a pinned
+page count. At least one logical same-shard page must have an unsplit serialized
+probe-parameter envelope above 1 MiB, while every actual group envelope stays at
+or below 1 MiB. All groups and the verified checkpoint must precede source-row
+retirement. Aggregate `maxFtsParametersBytes`, `maxUnsplitFtsParametersBytes` and
+`splitFtsProbePages` describe those actual requests/pages, never terms or contents.
+Proof also requires an empty source, a complete checkpoint, the three-trigger
+frozen writer fence, and a controlled write that is positively rejected.
 The proof command deletes every known created scratch database in `finally` on success or failure, still
 attempting the other owned deletions if one fails. Any deletion failure fails the job. Output is
 limited to static success, aggregate numeric/hash evidence, or static phase/class failures—never
@@ -355,11 +368,23 @@ The one-time cutover runs these operations in order, from the same checked-out m
    and leading UTF-8 BOM characters rather than shortening or normalizing them. A single
    oversized row uses individual value bindings instead of a too-large JSON scalar.
    Ordinary shard replacement is one atomic four-statement JSON1 batch, not per-row
-   HTTP requests. Each populated shard's MATCH verification uses one fixed JSON1
-   query with one JSON bind containing every `[quoted token, id]` probe. An outer
-   `json_each` joined to FTS correlates each token with its copied row; the rowid
-   comparison explicitly casts the JSON id to SQLite INTEGER. The statement gives
-   all probes one consistent native read snapshot without expanding SQL per row.
+   HTTP requests. Each populated shard's MATCH verification reuses one fixed JSON1
+   query with one JSON bind per byte-bounded group of `[quoted token, id]` probes.
+   The complete serialized parameters envelope, including JSON escaping, brackets,
+   quotes and commas, must be at most `COPY_PAGE_BYTES` (1 MiB). Each pair is encoded
+   once and an overflow pair is carried into the next group, without clipping,
+   prefix probes or skipping rows. A single oversized entry fails closed with a
+   static `fts-match` error. An outer `json_each` joined to FTS correlates each token
+   with its copied row; the rowid comparison explicitly casts the JSON id to SQLite
+   INTEGER. Each group has one native read snapshot, not a shared snapshot across
+   the whole page; the unchanged maintenance drain/quiescence, source comparison
+   and checkpoint/writer fences remain required across groups. Each response must
+   contain only safe INTEGER IDs requested by THAT group, without duplicates in
+   that response or earlier groups. Positive native terms and tokenless negatives
+   must all verify before any page is persisted as verified or acknowledged.
+   This 1 MiB serialized-parameter budget is internal policy, not a native API
+   rejection threshold or REST body cap. D1's documented maximum string size is
+   2,000,000 bytes ([D1 limits](https://developers.cloudflare.com/d1/platform/limits/)).
    Probe terms come from one scoped, reusable in-memory native SQLite FTS index, cloned
    from the actual destination `sqlite_master` FTS declaration. `fts5vocab` instance
    offset zero supplies the first real indexed term as raw BLOB bytes. Strict UTF-8
@@ -370,9 +395,10 @@ The one-time cutover runs these operations in order, from the same checked-out m
    tokenizer configuration, source-text clipping, skipped word or later-term fallback.
    Truly tokenless rows require a negative MATCH result, while modern emoji that
    unicode61 indexes require a positive posting just like every other native term.
-7. For every page, compare SHA-256 canonical full-row readback and exercise real FTS
-   `MATCH` probes. Persist the verified page checkpoint on `IDX00` **before** deleting
-   its source rows. Each source `DELETE` compares **every** column with the verified
+7. For every page, compare SHA-256 canonical full-row readback and exercise every
+   real FTS `MATCH` probe group. Only after ALL groups pass, persist the verified page
+   checkpoint on `IDX00` **before** deleting its source rows. Each source `DELETE`
+   compares **every** column with the verified
    full-row snapshot using null-safe `IS` predicates; comparison and deletion run in
    one main D1 transaction. A late changed row is retained and stops cursor advancement.
    No main schema change or migration-ledger write precedes this proof. The first
@@ -508,6 +534,42 @@ Source paging remains at most 2,048 rows and roughly 1 MiB, with full-column SHA
 source comparison and writer fencing unchanged. Local workerd evidence is not
 real PPE D1 REST proof or production recovery evidence; those require their own
 isolated native-copy CI run and protected production observation, respectively.
+
+Native folding can increase probe UTF-8 bytes beyond the source page's serialized
+size. A prior controlled local workerd case accepted a 1,508,093-byte unsplit
+parameter envelope for 46 `a` + 11,000 `Ⱥ` words plus two ASCII rows, with complete
+native MATCH/full-row SHA/verified-before-ACK evidence. That demonstrates an
+internal 1 MiB budget violation, **not** a reproduced native D1 rejection or a
+production-cause diagnosis. The byte-bounded verifier now measures the complete
+escaped outer params envelope exactly rather than reserving an arbitrary fraction
+of the source-page budget. All groups must succeed before the existing verified
+checkpoint/ACK boundary.
+
+The permanent SQLite and Miniflare/workerd fold-growth regressions copy that
+same-shard geometry, independently probe ORIGINAL whole valid words and preserve
+all 18 columns/full UTF-8/full-row SHA. A physical missing posting in a later group
+must retain exact source rows, native FTS pages, cursor and pending/copying checkpoint;
+earlier groups remain real positive controls. Separate genuine-hit controls reject
+identities that belong to a different group, even when they belong to the page.
+For the exact pre-budget `4c5cb33696a2a6c1fd39f75e71b3b3209a1544ff` historical
+module, materialize a temporary sibling and set `INDEX_COPY_MODULE_PATH` to its
+absolute `file:` URL:
+
+```sh
+node --test --test-name-pattern='fold-growth (probe budget|later missing posting)' hub/test/index-migration.node.test.mjs
+```
+
+The older copier must still complete the positive native copy and retirement,
+then fail the new **internal parameter-budget** assertion. Its physical-missing-
+posting negative control must still reject before ACK. With the override unset,
+the current copier must use actual split groups, obey every serialized envelope
+bound and preserve both positive/negative semantics. Run the full fold-growth
+identity coverage with `--test-name-pattern='fold-growth'`. Remove only the
+temporary historical module created for the control; do not commit it. The expanded
+real-CF fixture must be exercised by a fresh isolated `native-copy-proof` run:
+local regressions or static packing calculations do not prove its deployed page
+geometry, native REST behavior or production recovery.
+
 
 A later protected pass at `67cdc05ff2e72888856b34e4e464c875a052e88f`
 stopped on 2026-10-13 at approximately 03:30 UTC with the semantic

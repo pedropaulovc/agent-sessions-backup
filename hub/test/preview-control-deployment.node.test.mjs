@@ -17,7 +17,7 @@ import {
   stableJson,
 } from '../../infra/cf/preview-trust.mjs';
 import { D1_BATCH_PROBE_TEXT } from '../../infra/cf/d1-batch-atomicity.mjs';
-import { BLOCK_COLUMNS } from '../src/index-layout.mjs';
+import { BLOCK_COLUMNS, INDEX_ID_SPAN } from '../src/index-layout.mjs';
 
 const SHA = 'a'.repeat(40);
 const SEED = 'synthetic-preview-seed-for-deployment-regression';
@@ -258,6 +258,9 @@ async function runController(command, scenario = {}) {
                 emit({ kind: 'native-fixture-seed', databaseId: id, tuples: JSON.parse(params[0]) });
               }
               emit({ kind: 'probe-sql', databaseId: id, sql, params: params.map(textEvidence),
+                parametersBytes: Buffer.byteLength(JSON.stringify(params)),
+                ftsProbeIds: /\\bMATCH\\b/.test(sql) && params.length === 1 && params[0].startsWith('[')
+                  ? JSON.parse(params[0]).map(([, rowid]) => rowid) : undefined,
                 rows: rows.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, textEvidence(value)]))) });
               return { success: true, results: rows };
             };
@@ -949,25 +952,36 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
   const summary = JSON.parse(result.stdout.trim().split('\n').at(-1));
   assert.equal(summary.state, 'verified');
   assert.equal(summary.probe, 'd1-native-full-copy');
-  assert.equal(summary.rows, 1463);
+  assert.equal(summary.growthRows, 46);
+  assert.equal(summary.rows, summary.denseRows + summary.growthRows + 2);
   assert.equal(summary.denseRows, 1461);
   assert.equal(summary.columns, 18);
   assert.equal(summary.shards, 2);
   assert.equal(summary.legacyProbeMatches, 0);
   assert.equal(summary.nativeProbeMatches, 1);
   assert.equal(summary.freezeTriggers, 3);
-  assert.equal(summary.ordinaryPages, 2);
+  assert.ok(summary.splitFtsProbePages > 0);
+  assert.ok(summary.maxFtsParametersBytes <= 1_048_576);
+  assert.ok(summary.maxUnsplitFtsParametersBytes > 1_048_576);
   assert.equal(summary.fallbackPages, 1);
   assert.equal(summary.longTextBytes, 1_100_061);
   assert.match(summary.sha256, /^[0-9a-f]{64}$/);
   const sql = result.events.filter((event) => event.kind === 'probe-sql');
   const denseIds = Array.from({ length: summary.denseRows }, (_, index) => index + 1);
-  const denseSeed = result.events.find((event) => event.kind === 'native-fixture-seed' && event.databaseId === 'created-1');
-  assert.ok(denseSeed, 'suffix membership must come from the publicly synthetic fixture actually seeded by the CLI');
+  const seeds = result.events.filter((event) => event.kind === 'native-fixture-seed' && event.databaseId === 'created-1');
+  assert.equal(seeds.length, 2, 'the original dense phase and appended fold-growth phase must both execute native JSON1 seeding');
+  const denseSeed = seeds[0];
+  const growthSeed = seeds[1];
   assert.equal(denseSeed.tuples.length, summary.denseRows);
-  assert.ok(denseSeed.tuples.every((tuple) => tuple.length === BLOCK_COLUMNS.length));
+  assert.equal(growthSeed.tuples.length, summary.growthRows);
+  assert.ok(seeds.every(({ tuples }) => tuples.every((tuple) => tuple.length === BLOCK_COLUMNS.length)));
   const denseRows = denseSeed.tuples.map((tuple) => Object.fromEntries(BLOCK_COLUMNS.map((column, index) => [column, tuple[index]])));
+  const growthRows = growthSeed.tuples.map((tuple) => Object.fromEntries(BLOCK_COLUMNS.map((column, index) => [column, tuple[index]])));
   assert.deepEqual(denseRows.map(({ id }) => id), denseIds);
+  for (const [index, row] of growthRows.entries()) {
+    assert.equal(row.id, summary.denseRows + index + 1);
+    assert.equal(row.text, `a${'Ⱥ'.repeat(11000)}${index}`);
+  }
   const longWords = [`a${'中'.repeat(11000)}`, `a${'🫠'.repeat(8250)}`,
     `a${'Ж'.repeat(16500)}`, `a${'ø'.repeat(16500)}`];
   for (const [index, text] of longWords.entries()) {
@@ -1013,6 +1027,59 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
   for (const [id, terms] of nativePoints) {
     for (const term of terms) assertPoint('created-3', `"${term}"`, id, [{ rowid: id }]);
   }
+  for (const row of growthRows) assertPoint('created-3', `"${row.text}"`, row.id, [{ rowid: row.id }]);
+  const probeGroups = sql.filter(({ ftsProbeIds }) => ftsProbeIds !== undefined);
+  assert.equal(summary.maxFtsParametersBytes, Math.max(...probeGroups.map(({ parametersBytes }) => parametersBytes)));
+  assert.ok(probeGroups.every(({ parametersBytes }) => parametersBytes <= 1_048_576),
+    'actual serialized group params envelopes must obey the internal budget, not an assumed native rejection threshold');
+  assert.deepEqual(probeGroups.filter(({ databaseId }) => databaseId === 'created-2').flatMap(({ ftsProbeIds }) => ftsProbeIds), [0]);
+  assert.deepEqual(probeGroups.filter(({ databaseId }) => databaseId === 'created-3').flatMap(({ ftsProbeIds }) => ftsProbeIds),
+    [...denseIds, ...growthRows.map(({ id }) => id), INDEX_ID_SPAN - 1]);
+  const denseGroup = probeGroups.find(({ databaseId }) => databaseId === 'created-3');
+  assert.deepEqual(denseGroup.ftsProbeIds, denseIds, 'the original 1461-row dense first phase must retain its native geometry');
+  const growthGroups = probeGroups.filter(({ ftsProbeIds }) => ftsProbeIds.some((id) => id > summary.denseRows && id < INDEX_ID_SPAN - 1));
+  assert.ok(growthGroups.length > 1, 'appended fold growth must actually execute multiple native MATCH groups');
+  assert.deepEqual(growthGroups.flatMap(({ rows }) => rows.map(({ rowid }) => rowid)).sort((a, b) => a - b),
+    growthRows.map(({ id }) => id));
+  let splitPages = 0;
+  let maxUnsplitBytes = 0;
+  const pendingGroups = new Map();
+  for (const event of sql) {
+    if (event.ftsProbeIds !== undefined) {
+      if (!pendingGroups.has(event.databaseId)) pendingGroups.set(event.databaseId, []);
+      pendingGroups.get(event.databaseId).push(event);
+    }
+    if (event.databaseId !== 'created-1' || !/\bDELETE FROM blocks\b/.test(event.sql)) continue;
+    let split = false;
+    for (const groups of pendingGroups.values()) {
+      // Reconstitute the exact escaped params envelope from actual byte counts:
+      // remove each six-byte envelope and add the inter-group entry commas.
+      const bytes = 6 + groups.reduce((bytes, group) => bytes + group.parametersBytes - 6, 0) + groups.length - 1;
+      maxUnsplitBytes = Math.max(maxUnsplitBytes, bytes);
+      if (bytes > 1_048_576) {
+        assert.ok(groups.length > 1, 'one actual logical source page must split its oversized native probe parameters');
+        split = true;
+      }
+    }
+    if (split) splitPages += 1;
+    pendingGroups.clear();
+  }
+  assert.equal(summary.splitFtsProbePages, splitPages);
+  assert.equal(summary.maxUnsplitFtsParametersBytes, maxUnsplitBytes);
+  const ordinaryWrites = sql.filter(({ databaseId, sql, params }) => databaseId !== 'created-1'
+    && /^INSERT INTO blocks \(/.test(sql) && params.length === 1);
+  assert.equal(summary.ordinaryPages, ordinaryWrites.length, 'ordinary page counts must reflect actual native writes');
+  // Each original growth word is independently probed before its source ACK as
+  // well as after retirement; the CLI trace must show actual native point hits.
+  for (const row of growthRows) {
+    const points = assertPoint('created-3', `"${row.text}"`, row.id, [{ rowid: row.id }]);
+    const group = growthGroups.find(({ ftsProbeIds }) => ftsProbeIds.includes(row.id));
+    const retirement = sql.findIndex((event, index) => index > sql.indexOf(group)
+      && event.databaseId === 'created-1' && /\bDELETE FROM blocks\b/.test(event.sql));
+    assert.ok(retirement > sql.indexOf(group));
+    assert.ok(points.some((event) => sql.indexOf(event) > sql.indexOf(group) && sql.indexOf(event) < retirement),
+      'independent whole-word evidence must precede the ACK of its actual source page');
+  }
   for (const [id, terms] of [
     [7, ['alpha']], [9, ['alpha']], [10, ['alpha']], [11, ['alpha']], [12, ['al']],
     [13, ['alpha']], [14, ['alpha']], [16, ['index-migration-tokenless-probe', '🫠', 'alpha']],
@@ -1024,14 +1091,15 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
     'summary FTS matches must be derived from observed independent point and suffix hits');
   const sourceBulk = sql.filter((event) => event.databaseId === 'created-1'
     && /^INSERT INTO blocks \(/.test(event.sql) && /FROM json_each\(\?\)/.test(event.sql));
-  assert.equal(sourceBulk.length, 1, 'all dense source rows are seeded by one real JSON1 statement');
-  assert.equal(sourceBulk[0].params.length, 1);
-  assert.ok(sourceBulk[0].params[0].utf8Bytes < 1_048_576);
+  assert.equal(sourceBulk.length, 2);
+  assert.ok(sourceBulk.every(({ params }) => params.length === 1 && params[0].utf8Bytes < 1_048_576),
+    'both actual JSON1 seed strings must be bounded, including the unexpanded source words');
   const sourceSeed = result.events.find((event) => event.kind === 'request' && event.body?.batch
     && new URL(event.url).pathname.endsWith('/created-1/query')
     && event.body.batch.some(({ sql }) => /^INSERT INTO blocks \(/.test(sql)));
   assert.ok(sourceSeed);
-  assert.equal(sourceSeed.body.batch.length, 4, 'source content and native postings must seed in one bounded request');
+  assert.equal(sourceSeed.body.batch.filter(({ sql }) => /^INSERT INTO blocks \(/.test(sql)).length, 4,
+    'one ordinary row, dense phase, appended growth and huge fallback must actually be seeded');
   assert.equal(sourceSeed.body.batch.filter(({ sql }) => /^INSERT INTO blocks_fts\b/.test(sql)).length, 1);
   const sourceFtsWrites = sql.filter((event) => event.databaseId === 'created-1'
     && /\bblocks_fts\b/.test(event.sql) && /^(?:INSERT|UPDATE|DELETE)\b/.test(event.sql));
@@ -1042,7 +1110,8 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
   assert.deepEqual(finalSourceCount.rows, [{ rows: 0 }]);
   const queries = result.events.filter((event) => event.kind === 'request'
     && new URL(event.url).pathname.endsWith('/query'));
-  assert.ok(queries.length <= 200, `complete native CLI proof must use bounded RPCs, observed ${queries.length}`);
+  assert.ok(queries.length <= 200 + summary.growthRows * 6,
+    `complete native CLI proof must retain bulk copying with bounded independent growth point/slice checks, observed ${queries.length}`);
   const migrations = result.events.filter((event) => event.kind === 'migrate');
   assert.equal(migrations.length, 3);
   const creations = result.events.filter((event) => event.kind === 'request' && event.method === 'POST'

@@ -157,7 +157,13 @@ const DENSE_TOKENIZER_CASES = [
     `a${'ø'.repeat(16500)}`,
   ].map((text) => ({ text, tokens: [text], only: true })),
 ];
+const GROWTH_ROWS = 46;
+const GROWTH_WORD = `a${'Ⱥ'.repeat(11000)}`;
 const READBACK_PAGE_ROWS = 256;
+// Fold-growth words would otherwise create a multi-MiB hex response at 256
+// rows. Only this independent proof reader uses the existing slice transport
+// above 16 KiB; the copier's source/readback budgets are unchanged.
+const READBACK_INLINE_BYTES = 16384;
 function sessionOn(shard) {
   for (let index = 0; ; index += 1) {
     const sessionId = `native-copy-会話-${shard}-${index}`;
@@ -193,6 +199,10 @@ function fixtures() {
     on_main_path: 1, row_hash: index + 1,
     media_byte_start: null, media_byte_len: 0, media_type: '',
   }));
+  const growth = Array.from({ length: GROWTH_ROWS }, (_, index) => ({
+    ...dense[0], id: DENSE_ROWS + index + 1, block_index: DENSE_ROWS + index,
+    row_hash: DENSE_ROWS + index + 1, text: `${GROWTH_WORD}${index}`,
+  }));
   const ordinaryRows = [ordinary, ...dense];
   requireProof(ordinaryRows.length <= COPY_PAGE_ROWS
     && Buffer.byteLength(`[${ordinaryRows.map((row) => canonicalRow(BLOCK_COLUMNS, row)).join(',')}]`) < COPY_PAGE_BYTES,
@@ -201,7 +211,7 @@ function fixtures() {
   requireProof(Buffer.byteLength(canonicalRow(BLOCK_COLUMNS, long)) > COPY_PAGE_BYTES
     && BLOCK_COLUMNS.reduce((bytes, column) => bytes + (long[column] === null ? 0 : Buffer.byteLength(String(long[column]))), 0) < 2_000_000,
   'fixture');
-  return { ordinary, long, dense, rows: [...ordinaryRows, long] };
+  return { ordinary, long, dense, growth, rows: [...ordinaryRows, ...growth, long] };
 }
 
 /** Independent native readback: TEXT is hex transported, long TEXT in bounded BLOB slices. */
@@ -209,7 +219,7 @@ async function readRows(db, phase) {
   const selectors = BLOCK_COLUMNS.flatMap((column, index) => {
     const name = quote(column);
     return [
-      `CASE WHEN typeof(${name}) = 'text' THEN CASE WHEN length(CAST(${name} AS BLOB)) <= 65536 THEN hex(CAST(${name} AS BLOB)) ELSE NULL END ELSE ${name} END AS ${name}`,
+      `CASE WHEN typeof(${name}) = 'text' THEN CASE WHEN length(CAST(${name} AS BLOB)) <= ${READBACK_INLINE_BYTES} THEN hex(CAST(${name} AS BLOB)) ELSE NULL END ELSE ${name} END AS ${name}`,
       `typeof(${name}) AS "__type_${index}"`,
       `CASE WHEN typeof(${name}) = 'text' THEN length(CAST(${name} AS BLOB)) ELSE NULL END AS "__bytes_${index}"`,
     ];
@@ -234,7 +244,7 @@ async function readRows(db, phase) {
         }
         requireProof(Number.isSafeInteger(length) && length >= 0 && length < 2_000_000, phase);
         let bytes;
-        if (length <= 65536) {
+        if (length <= READBACK_INLINE_BYTES) {
           requireProof(typeof value === 'string' && value.length === length * 2 && /^[0-9a-f]*$/i.test(value), phase);
           bytes = Buffer.from(value, 'hex');
         } else {
@@ -271,7 +281,7 @@ async function assertFrozen(source) {
 async function proveNativeCopy({ source, shards, gate }) {
   let phase = 'seed';
   try {
-    const { ordinary, long, dense, rows: expected } = fixtures();
+    const { ordinary, long, dense, growth, rows: expected } = fixtures();
     const expectedSha256 = rowsSha256(expected);
     await source.batch([
       blockStatement(ordinary),
@@ -279,6 +289,11 @@ async function proveNativeCopy({ source, shards, gate }) {
         sql: `INSERT INTO blocks (${BLOCK_COLUMNS.map(quote).join(',')})
           SELECT ${BLOCK_COLUMNS.map((_, index) => `json_extract(value,'$[${index}]')`).join(',')} FROM json_each(?)`,
         params: [`[${dense.map((row) => canonicalRow(BLOCK_COLUMNS, row)).join(',')}]`],
+      },
+      {
+        sql: `INSERT INTO blocks (${BLOCK_COLUMNS.map(quote).join(',')})
+          SELECT ${BLOCK_COLUMNS.map((_, index) => `json_extract(value,'$[${index}]')`).join(',')} FROM json_each(?)`,
+        params: [`[${growth.map((row) => canonicalRow(BLOCK_COLUMNS, row)).join(',')}]`],
       },
       blockStatement(long),
       { sql: 'INSERT INTO blocks_fts (rowid, text) SELECT id, text FROM blocks', params: [] },
@@ -298,6 +313,12 @@ async function proveNativeCopy({ source, shards, gate }) {
     let deletedRows = 0;
     let ordinaryPages = 0;
     let fallbackPages = 0;
+    let maxFtsParametersBytes = 0;
+    let maxUnsplitFtsParametersBytes = 0;
+    let splitFtsProbePages = 0;
+    let growthVerifiedRows = 0;
+    const pageProbes = shards.map(() => []);
+    const pageGroups = shards.map(() => 0);
     const observedSource = {
       id: source.id, query: (...args) => source.query(...args),
       async batch(statements) {
@@ -317,8 +338,18 @@ async function proveNativeCopy({ source, shards, gate }) {
         return result;
       },
     };
-    const observedShards = shards.map((db) => ({
-      id: db.id, query: (...args) => db.query(...args),
+    const observedShards = shards.map((db, index) => ({
+      id: db.id,
+      async query(sql, params = []) {
+        if (/\bMATCH\b/.test(sql)) {
+          const bytes = Buffer.byteLength(JSON.stringify(params));
+          requireProof(params.length === 1 && bytes <= COPY_PAGE_BYTES, 'fts-parameter-budget');
+          maxFtsParametersBytes = Math.max(maxFtsParametersBytes, bytes);
+          pageProbes[index].push(...JSON.parse(params[0]));
+          pageGroups[index] += 1;
+        }
+        return await db.query(sql, params);
+      },
       async batch(statements) {
         const insert = statements.find(({ sql }) => /^INSERT INTO blocks \(/.test(sql));
         if (insert) {
@@ -336,17 +367,57 @@ async function proveNativeCopy({ source, shards, gate }) {
         const durable = await readCheckpoint(shards[0], COPY_CHECKPOINT);
         requireProof(JSON.stringify(durable) === JSON.stringify(checkpoint), 'checkpoint-observation');
         if (checkpoint.pending?.phase === 'copying') {
-          const wanted = checkpoint.rows === 0 ? [ordinary, ...dense] : [long];
-          requireProof(checkpoint.pending.rows.length === wanted.length
+          const wanted = expected.slice(checkpoint.rows, checkpoint.rows + checkpoint.pending.rows.length);
+          requireProof(wanted.length > 0 && checkpoint.pending.rows.length === wanted.length
             && checkpoint.pending.rows.every((row, index) => row.id === wanted[index].id
               && row.shard === indexShardForSessionId(wanted[index].session_id, 2)), 'copy-page-geometry');
+          if (checkpoint.rows === 0) {
+            requireProof(wanted.length === dense.length + 1 && wanted.at(-1).id === dense.at(-1).id,
+              'copy-page-geometry');
+          }
+          // Subsequent pages are derived from the real source response budget,
+          // not a guessed count. The huge row must retain its own fallback page.
+          if (wanted.some((row) => row.id === long.id)) requireProof(wanted.length === 1, 'copy-page-geometry');
+          for (const probes of pageProbes) probes.length = 0;
+          pageGroups.fill(0);
         }
-        if (checkpoint.pending?.phase === 'verified') verifiedCheckpoint = JSON.stringify(checkpoint.pending);
+        if (checkpoint.pending?.phase === 'verified') {
+          let split = false;
+          for (const [index, probes] of pageProbes.entries()) {
+            const wanted = checkpoint.pending.rows.filter((row) => row.shard === index).map(({ id }) => id);
+            requireProof(probes.length === wanted.length
+              && probes.every((probe, offset) => probe[1] === wanted[offset]), 'fts-probe-geometry');
+            const unsplitBytes = Buffer.byteLength(JSON.stringify([JSON.stringify(probes)]));
+            maxUnsplitFtsParametersBytes = Math.max(maxUnsplitFtsParametersBytes, unsplitBytes);
+            requireProof(unsplitBytes <= COPY_PAGE_BYTES || pageGroups[index] > 1, 'fts-parameter-budget');
+            if (unsplitBytes > COPY_PAGE_BYTES && pageGroups[index] > 1) split = true;
+          }
+          if (split) splitFtsProbePages += 1;
+          const wantedGrowth = growth.filter((row) => checkpoint.pending.rows.some((item) => item.id === row.id));
+          if (wantedGrowth.length) {
+            const ids = new Set(wantedGrowth.map(({ id }) => id));
+            const stored = (await readRows(shards[1], 'growth-before-ack')).filter((row) => ids.has(row.id));
+            requireProof(stored.length === wantedGrowth.length && rowsSha256(stored) === rowsSha256(wantedGrowth),
+              'growth-before-ack');
+            for (const row of wantedGrowth) {
+              // ORIGINAL whole valid words, independent of the copier's native
+              // first-token completion, must match before any source ACK.
+              const matches = await shards[1].query(
+                'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = CAST(? AS INTEGER)',
+                [`"${row.text}"`, row.id]);
+              requireProof(matches.length === 1 && matches[0].rowid === row.id, 'growth-before-ack');
+              growthVerifiedRows += 1;
+            }
+          }
+          verifiedCheckpoint = JSON.stringify(checkpoint.pending);
+        }
       },
     });
     requireProof(state.state === 'complete' && state.rows === expected.length && state.pending === null
       && JSON.stringify(state.columns) === JSON.stringify(BLOCK_COLUMNS)
-      && deletedRows === expected.length && ordinaryPages === 2 && fallbackPages === 1, 'copy-complete');
+      && deletedRows === expected.length && ordinaryPages >= 3 && fallbackPages === 1
+      && growthVerifiedRows === growth.length && splitFtsProbePages > 0
+      && maxFtsParametersBytes <= COPY_PAGE_BYTES, 'copy-complete');
     phase = 'checkpoint-proof';
     requireProof(JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === JSON.stringify(state), phase);
     requireProof((await source.query('SELECT COUNT(*) AS rows FROM blocks'))[0]?.rows === 0, 'source-empty');
@@ -361,7 +432,7 @@ async function proveNativeCopy({ source, shards, gate }) {
     }
     requireProof(rowsSha256(copied.sort((a, b) => a.id - b.id)) === expectedSha256, phase);
     phase = 'independent-fts';
-    let ftsMatches = 0;
+    let ftsMatches = growthVerifiedRows;
     for (const [row, tokens] of [
       [ordinary, ['nativeordinaryvisible', 'nativeordinarysuffix']],
       [long, ['nativelongvisible', 'nativelongsuffix']],
@@ -387,6 +458,13 @@ async function proveNativeCopy({ source, shards, gate }) {
           if (required) ftsMatches += 1;
         }
       }
+    }
+    for (const row of growth) {
+      const matches = await shards[1].query(
+        'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = CAST(? AS INTEGER)',
+        [`"${row.text}"`, row.id]);
+      requireProof(matches.length === 1 && matches[0].rowid === row.id, phase);
+      ftsMatches += 1;
     }
     // Independent after-NUL common-token queries prove the complete routed ID
     // subset; deliberately suffix-free rows have separate whole-word checks above.
@@ -424,7 +502,8 @@ async function proveNativeCopy({ source, shards, gate }) {
     requireProof(JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === JSON.stringify(state), 'checkpoint-proof');
     await gate();
     return { state: 'verified', probe: 'd1-native-full-copy', rows: expected.length, columns: BLOCK_COLUMNS.length,
-      shards: shards.length, denseRows: dense.length, ordinaryPages, fallbackPages, ftsMatches, freezeTriggers: 3,
+      shards: shards.length, denseRows: dense.length, growthRows: growth.length, ordinaryPages, fallbackPages,
+      ftsMatches, freezeTriggers: 3, maxFtsParametersBytes, maxUnsplitFtsParametersBytes, splitFtsProbePages,
       legacyProbeMatches: legacyProbe.length, nativeProbeMatches: nativeProbe.length,
       longTextBytes: Buffer.byteLength(long.text), sha256: expectedSha256 };
   } catch (error) {

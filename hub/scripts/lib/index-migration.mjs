@@ -480,23 +480,53 @@ async function verifyFts(db, rows, tokenizer) {
   const probes = await tokenizer.probes(db, rows);
   if (!probes.length) return;
   // Keep probes outermost so each MATCH is correlated with its requested row in
-  // one native read snapshot, without expanding SQLite's compound-select grammar.
+  // one native read snapshot per byte-bounded group. Migration quiescence and
+  // the existing source/checkpoint fences remain required across all groups.
   // FTS5 can omit the equality recheck for REAL-valued integral ids; retain the
   // explicit INTEGER storage class even though every copied id is already safe.
-  const matches = await db.query(`SELECT blocks_fts.rowid
-    FROM json_each(?) AS probe CROSS JOIN blocks_fts
-    WHERE blocks_fts MATCH json_extract(probe.value,'$[0]')
-      AND blocks_fts.rowid = CAST(json_extract(probe.value,'$[1]') AS INTEGER)`,
-  [JSON.stringify(probes.map(({ id, token }) => [
-    token ? `"${token.replaceAll('"', '""')}"` : '"index-migration-tokenless-probe"', id,
-  ]))]);
-  const expected = new Set(probes.map((probe) => probe.id));
+  const entries = [];
+  const expected = new Set();
   const found = new Set();
-  for (const row of matches) {
-    if (!Number.isSafeInteger(row.rowid) || !expected.has(row.rowid) || found.has(row.rowid)) {
-      throw copyInvariant(COPY_INVARIANTS.FTS_IDENTITY, 'FTS MATCH readback cardinality/identity mismatch', COPY_PHASES.FTS_MATCH);
+  let index = 0;
+  let entry;
+  let entryBytes;
+  while (index < probes.length) {
+    // The serialized params are ["[entries]"]: six envelope bytes, escaped pair
+    // bytes and unescaped commas. This is our internal 1 MiB parameter budget,
+    // not a claim about the native D1 string limit.
+    let bytes = 6;
+    while (index < probes.length) {
+      const { id, token } = probes[index];
+      if (entry === undefined) {
+        entry = JSON.stringify([
+          token ? `"${token.replaceAll('"', '""')}"` : '"index-migration-tokenless-probe"', id,
+        ]);
+        entryBytes = Buffer.byteLength(JSON.stringify(entry)) - 2;
+        if (6 + entryBytes > COPY_PAGE_BYTES) {
+          throw copyInvariant(COPY_INVARIANTS.FTS_MATCH, 'FTS MATCH probe exceeds the parameter budget', COPY_PHASES.FTS_MATCH);
+        }
+      }
+      const nextBytes = bytes + entryBytes + (entries.length ? 1 : 0);
+      if (nextBytes > COPY_PAGE_BYTES) break;
+      entries.push(entry);
+      expected.add(id);
+      bytes = nextBytes;
+      index += 1;
+      entry = undefined;
     }
-    found.add(row.rowid);
+    const matches = await db.query(`SELECT blocks_fts.rowid
+      FROM json_each(?) AS probe CROSS JOIN blocks_fts
+      WHERE blocks_fts MATCH json_extract(probe.value,'$[0]')
+        AND blocks_fts.rowid = CAST(json_extract(probe.value,'$[1]') AS INTEGER)`,
+    [`[${entries.join(',')}]`]);
+    for (const row of matches) {
+      if (!Number.isSafeInteger(row.rowid) || !expected.has(row.rowid) || found.has(row.rowid)) {
+        throw copyInvariant(COPY_INVARIANTS.FTS_IDENTITY, 'FTS MATCH readback cardinality/identity mismatch', COPY_PHASES.FTS_MATCH);
+      }
+      found.add(row.rowid);
+    }
+    entries.length = 0;
+    expected.clear();
   }
   for (const { id, token } of probes) {
     if (token ? !found.has(id) : found.has(id)) {
