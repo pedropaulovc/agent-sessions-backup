@@ -345,8 +345,11 @@ The one-time cutover runs these operations in order, from the same checked-out m
    and leading UTF-8 BOM characters rather than shortening or normalizing them. A single
    oversized row uses individual value bindings instead of a too-large JSON scalar.
    Ordinary shard replacement is one atomic four-statement JSON1 batch, not per-row
-   HTTP requests. MATCH probes use chunks of at most 48 rows within one native batch,
-   keeping each statement below D1's 100-bound-parameter limit.
+   HTTP requests. Each populated shard's MATCH verification uses one fixed JSON1
+   query with one JSON bind containing every `[quoted token, id]` probe. An outer
+   `json_each` joined to FTS correlates each token with its copied row; the rowid
+   comparison explicitly casts the JSON id to SQLite INTEGER. The statement gives
+   all probes one consistent native read snapshot without expanding SQL per row.
 7. For every page, compare SHA-256 canonical full-row readback and exercise real FTS
    `MATCH` probes. Persist the verified page checkpoint on `IDX00` **before** deleting
    its source rows. Each source `DELETE` compares **every** column with the verified
@@ -456,6 +459,35 @@ provider code 7500 alone is **not** a capacity diagnosis. A class describes a
 recognized rejection token, not proof of its root cause. In particular, malformed
 JSON can be the intentional source-comparison assertion aborting a changed page.
 These diagnostics do not establish the cause of any earlier production failure.
+
+The former FTS verifier joined up to 48 row-scoped SELECTs with `UNION ALL`.
+Keeping each such statement at 96 binds did not make its compound-select grammar
+valid in the native runtime. In controlled local Miniflare/workerd, the exact
+deployed `d34375393afcf1a496e57ee2cd50380056e7a00c` copier rejected the
+1,461-row same-shard case with `too many terms in compound SELECT` at
+`copy-fts-match`. The corrected copier verified all 1,461 requested identities
+and excluded a matching row outside the probe set. These are measured fixture
+sizes, not claims of a documented compound-select maximum.
+
+To repeat the before-control, materialize that revision's
+`hub/scripts/lib/index-migration.mjs` as a temporary sibling module (preserving
+its relative imports). Set `INDEX_COPY_MODULE_PATH` to its absolute `file:` URL
+and run:
+
+```sh
+node --test --test-name-pattern='^native workerd actual copier verifies 1461 same-shard rows' hub/test/index-migration.node.test.mjs
+```
+
+The historical copier must fail with the native compound-select rejection.
+Run the same command with `INDEX_COPY_MODULE_PATH` unset for the passing control.
+Remove the historical module after the comparison; do not commit it.
+The constant-size query changes only FTS transport/grammar: safe-integer,
+expected-ID, duplicate-ID and required-token checks still reject incomplete or
+incorrect MATCH results before the verified checkpoint or any source acknowledgment.
+Source paging remains at most 2,048 rows and roughly 1 MiB, with full-column SHA-256,
+source comparison and writer fencing unchanged. Local workerd evidence is not
+real PPE D1 REST proof or production recovery evidence; those require their own
+isolated native-copy CI run and protected production observation, respectively.
 
 The isolated native-copy proof preserves the copier's static operation phase and
 reports its own invariant failures as `class=assertion invariant=<allowlisted code>`

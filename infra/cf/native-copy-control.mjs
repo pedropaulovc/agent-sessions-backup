@@ -4,7 +4,7 @@ import {
   previewCopyScratchNames, previewResourceOwner,
 } from './preview-trust.mjs';
 import {
-  COPY_CHECKPOINT, COPY_INVARIANTS, COPY_PAGE_BYTES, COPY_PHASES, SOURCE_FREEZE_TABLE, canonicalRow,
+  COPY_CHECKPOINT, COPY_INVARIANTS, COPY_PAGE_BYTES, COPY_PAGE_ROWS, COPY_PHASES, SOURCE_FREEZE_TABLE, canonicalRow,
   copyFrozenIndex, readCheckpoint,
 } from '../../hub/scripts/lib/index-migration.mjs';
 import { BLOCK_COLUMNS, INDEX_ID_SPAN, indexShardForSessionId } from '../../hub/src/index-layout.mjs';
@@ -131,6 +131,9 @@ const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 const rowsSha256 = (rows) => sha256(`[${rows.map((row) => canonicalRow(BLOCK_COLUMNS, row)).join(',')}]`);
 const INSERT_BLOCK = `INSERT INTO blocks (${BLOCK_COLUMNS.map(quote).join(',')}) VALUES (${BLOCK_COLUMNS.map(() => '?').join(',')})`;
 const blockStatement = (row) => ({ sql: INSERT_BLOCK, params: BLOCK_COLUMNS.map((column) => row[column]) });
+const DENSE_ROWS = 1461;
+const DENSE_SUFFIX_TOKEN = 'nativedensesuffix';
+const READBACK_PAGE_ROWS = 256;
 function sessionOn(shard) {
   for (let index = 0; ; index += 1) {
     const sessionId = `native-copy-会話-${shard}-${index}`;
@@ -154,11 +157,24 @@ function fixtures() {
     on_main_path: 0, row_hash: Number.MIN_SAFE_INTEGER,
     media_byte_start: 4_294_967_311, media_byte_len: null, media_type: 'image/α😀',
   };
+  // The first source page contains the ordinary row on IDX00 and exactly 1,461
+  // small rows on IDX01. Keep the last-id long row on its own fallback page.
+  const dense = Array.from({ length: DENSE_ROWS }, (_, index) => ({
+    id: index + 1, session_id: long.session_id, file_id: 0,
+    turn_index: 0, block_index: index, role: null, btype: 'text', tool_name: null,
+    ts: '', byte_start: 0, byte_len: 0, truncated: 0,
+    text: `nativedensevisible\u0000 ${DENSE_SUFFIX_TOKEN}`, on_main_path: 1, row_hash: index + 1,
+    media_byte_start: null, media_byte_len: 0, media_type: '',
+  }));
+  const ordinaryRows = [ordinary, ...dense];
+  requireProof(ordinaryRows.length <= COPY_PAGE_ROWS
+    && Buffer.byteLength(`[${ordinaryRows.map((row) => canonicalRow(BLOCK_COLUMNS, row)).join(',')}]`) < COPY_PAGE_BYTES,
+  'fixture');
   requireProof(Buffer.byteLength(canonicalRow(BLOCK_COLUMNS, ordinary)) < COPY_PAGE_BYTES, 'fixture');
   requireProof(Buffer.byteLength(canonicalRow(BLOCK_COLUMNS, long)) > COPY_PAGE_BYTES
     && BLOCK_COLUMNS.reduce((bytes, column) => bytes + (long[column] === null ? 0 : Buffer.byteLength(String(long[column]))), 0) < 2_000_000,
   'fixture');
-  return [ordinary, long];
+  return { ordinary, long, dense, rows: [...ordinaryRows, long] };
 }
 
 /** Independent native readback: TEXT is hex transported, long TEXT in bounded BLOB slices. */
@@ -171,40 +187,48 @@ async function readRows(db, phase) {
       `CASE WHEN typeof(${name}) = 'text' THEN length(CAST(${name} AS BLOB)) ELSE NULL END AS "__bytes_${index}"`,
     ];
   });
-  const result = await db.query(`SELECT ${selectors.join(',')} FROM blocks ORDER BY id`);
   const rows = [];
-  for (const encoded of result) {
-    const row = {};
-    for (const [index, column] of BLOCK_COLUMNS.entries()) {
-      const type = encoded[`__type_${index}`];
-      const length = encoded[`__bytes_${index}`];
-      const value = encoded[column];
-      if (type !== 'text') {
-        requireProof((type === 'null' && value === null) || (type === 'integer' && Number.isSafeInteger(value)), phase);
-        row[column] = value;
-        continue;
-      }
-      requireProof(Number.isSafeInteger(length) && length >= 0 && length < 2_000_000, phase);
-      let bytes;
-      if (length <= 65536) {
-        requireProof(typeof value === 'string' && value.length === length * 2 && /^[0-9a-f]*$/i.test(value), phase);
-        bytes = Buffer.from(value, 'hex');
-      } else {
-        requireProof(value === null, phase);
-        const chunks = [];
-        for (let offset = 0; offset < length; offset += 131072) {
-          const count = Math.min(131072, length - offset);
-          const parts = await db.query(`SELECT hex(substr(CAST(${quote(column)} AS BLOB), ?, ?)) AS bytes FROM blocks WHERE id = CAST(? AS INTEGER)`,
-            [offset + 1, count, encoded.id]);
-          requireProof(parts.length === 1 && typeof parts[0].bytes === 'string'
-            && parts[0].bytes.length === count * 2 && /^[0-9a-f]+$/i.test(parts[0].bytes), phase);
-          chunks.push(Buffer.from(parts[0].bytes, 'hex'));
+  let after = -1;
+  for (;;) {
+    const result = await db.query(`SELECT ${selectors.join(',')} FROM blocks WHERE id > CAST(? AS INTEGER) ORDER BY id LIMIT ?`,
+      [after, READBACK_PAGE_ROWS]);
+    requireProof(result.length <= READBACK_PAGE_ROWS, phase);
+    for (const encoded of result) {
+      requireProof(Number.isSafeInteger(encoded.id) && encoded.id > after, phase);
+      const row = {};
+      for (const [index, column] of BLOCK_COLUMNS.entries()) {
+        const type = encoded[`__type_${index}`];
+        const length = encoded[`__bytes_${index}`];
+        const value = encoded[column];
+        if (type !== 'text') {
+          requireProof((type === 'null' && value === null) || (type === 'integer' && Number.isSafeInteger(value)), phase);
+          row[column] = value;
+          continue;
         }
-        bytes = Buffer.concat(chunks, length);
+        requireProof(Number.isSafeInteger(length) && length >= 0 && length < 2_000_000, phase);
+        let bytes;
+        if (length <= 65536) {
+          requireProof(typeof value === 'string' && value.length === length * 2 && /^[0-9a-f]*$/i.test(value), phase);
+          bytes = Buffer.from(value, 'hex');
+        } else {
+          requireProof(value === null, phase);
+          const chunks = [];
+          for (let offset = 0; offset < length; offset += 131072) {
+            const count = Math.min(131072, length - offset);
+            const parts = await db.query(`SELECT hex(substr(CAST(${quote(column)} AS BLOB), ?, ?)) AS bytes FROM blocks WHERE id = CAST(? AS INTEGER)`,
+              [offset + 1, count, encoded.id]);
+            requireProof(parts.length === 1 && typeof parts[0].bytes === 'string'
+              && parts[0].bytes.length === count * 2 && /^[0-9a-f]+$/i.test(parts[0].bytes), phase);
+            chunks.push(Buffer.from(parts[0].bytes, 'hex'));
+          }
+          bytes = Buffer.concat(chunks, length);
+        }
+        row[column] = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
       }
-      row[column] = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+      rows.push(row);
+      after = row.id;
     }
-    rows.push(row);
+    if (result.length < READBACK_PAGE_ROWS) break;
   }
   return rows;
 }
@@ -220,9 +244,17 @@ async function assertFrozen(source) {
 async function proveNativeCopy({ source, shards, gate }) {
   let phase = 'seed';
   try {
-    const expected = fixtures();
+    const { ordinary, long, dense, rows: expected } = fixtures();
     const expectedSha256 = rowsSha256(expected);
-    await source.batch(expected.map(blockStatement));
+    await source.batch([
+      blockStatement(ordinary),
+      {
+        sql: `INSERT INTO blocks (${BLOCK_COLUMNS.map(quote).join(',')})
+          SELECT ${BLOCK_COLUMNS.map((_, index) => `json_extract(value,'$[${index}]')`).join(',')} FROM json_each(?)`,
+        params: [`[${dense.map((row) => canonicalRow(BLOCK_COLUMNS, row)).join(',')}]`],
+      },
+      blockStatement(long),
+    ]);
     phase = 'seed-readback';
     requireProof(rowsSha256(await readRows(source, 'seed-readback')) === expectedSha256, 'seed-readback');
     let verifiedCheckpoint;
@@ -266,12 +298,18 @@ async function proveNativeCopy({ source, shards, gate }) {
       checkpointHook: async (checkpoint) => {
         const durable = await readCheckpoint(shards[0], COPY_CHECKPOINT);
         requireProof(JSON.stringify(durable) === JSON.stringify(checkpoint), 'checkpoint-observation');
+        if (checkpoint.pending?.phase === 'copying') {
+          const wanted = checkpoint.rows === 0 ? [ordinary, ...dense] : [long];
+          requireProof(checkpoint.pending.rows.length === wanted.length
+            && checkpoint.pending.rows.every((row, index) => row.id === wanted[index].id
+              && row.shard === indexShardForSessionId(wanted[index].session_id, 2)), 'copy-page-geometry');
+        }
         if (checkpoint.pending?.phase === 'verified') verifiedCheckpoint = JSON.stringify(checkpoint.pending);
       },
     });
     requireProof(state.state === 'complete' && state.rows === expected.length && state.pending === null
       && JSON.stringify(state.columns) === JSON.stringify(BLOCK_COLUMNS)
-      && deletedRows === expected.length && ordinaryPages > 0 && fallbackPages > 0, 'copy-complete');
+      && deletedRows === expected.length && ordinaryPages === 2 && fallbackPages === 1, 'copy-complete');
     phase = 'checkpoint-proof';
     requireProof(JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === JSON.stringify(state), phase);
     requireProof((await source.query('SELECT COUNT(*) AS rows FROM blocks'))[0]?.rows === 0, 'source-empty');
@@ -287,14 +325,25 @@ async function proveNativeCopy({ source, shards, gate }) {
     requireProof(rowsSha256(copied.sort((a, b) => a.id - b.id)) === expectedSha256, phase);
     phase = 'independent-fts';
     let ftsMatches = 0;
-    for (const [index, row] of expected.entries()) {
-      const tokens = index === 0 ? ['nativeordinaryvisible', 'nativeordinarysuffix'] : ['nativelongvisible', 'nativelongsuffix'];
+    for (const [row, tokens] of [
+      [ordinary, ['nativeordinaryvisible', 'nativeordinarysuffix']],
+      [long, ['nativelongvisible', 'nativelongsuffix']],
+    ]) {
       const db = shards[indexShardForSessionId(row.session_id, 2)];
       for (const token of tokens) {
         const matches = await db.query('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = CAST(? AS INTEGER)', [token, row.id]);
         requireProof(matches.length === 1 && matches[0].rowid === row.id, phase);
         ftsMatches += 1;
       }
+    }
+    // This token occurs only after the NUL, unlike the copier's first-token
+    // probes. One query per shard proves the complete routed dense ID set.
+    for (const [index, db] of shards.entries()) {
+      const wanted = dense.filter((row) => indexShardForSessionId(row.session_id, 2) === index);
+      const matches = await db.query('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? ORDER BY rowid', [DENSE_SUFFIX_TOKEN]);
+      requireProof(matches.length === wanted.length
+        && matches.every((row, offset) => Number.isSafeInteger(row.rowid) && row.rowid === wanted[offset].id), phase);
+      ftsMatches += matches.length;
     }
     // The identical INSERT must first succeed in copying state with all three
     // triggers installed. Remove it before freezing so a duplicate key cannot
@@ -322,8 +371,8 @@ async function proveNativeCopy({ source, shards, gate }) {
     requireProof(JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === JSON.stringify(state), 'checkpoint-proof');
     await gate();
     return { state: 'verified', probe: 'd1-native-full-copy', rows: expected.length, columns: BLOCK_COLUMNS.length,
-      shards: shards.length, ordinaryPages, fallbackPages, ftsMatches, freezeTriggers: 3,
-      longTextBytes: Buffer.byteLength(expected[1].text), sha256: expectedSha256 };
+      shards: shards.length, denseRows: dense.length, ordinaryPages, fallbackPages, ftsMatches, freezeTriggers: 3,
+      longTextBytes: Buffer.byteLength(long.text), sha256: expectedSha256 };
   } catch (error) {
     throw safeFailure(error, phase);
   }

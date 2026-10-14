@@ -35,7 +35,7 @@ export const COPY_INVARIANTS = Object.freeze({
   SHARD_LAYOUT: 'shard-layout', SCHEMA_MISSING: 'schema-missing', SCHEMA_COLUMNS: 'schema-columns',
   CHECKPOINT_STATE: 'checkpoint-state', CHECKPOINT_IDENTITY: 'checkpoint-identity',
   FREEZE_SCHEMA: 'freeze-schema', FREEZE_STATE: 'freeze-state', FREEZE_MISSING: 'freeze-missing',
-  FTS_SHAPE: 'fts-shape', FTS_IDENTITY: 'fts-identity', FTS_MATCH: 'fts-match',
+  FTS_IDENTITY: 'fts-identity', FTS_MATCH: 'fts-match',
   COLUMN_LAYOUT: 'column-layout', COLUMN_BUDGET: 'column-budget', PAGE_METADATA: 'page-metadata',
   ROW_CAP: 'row-cap', DUPLICATE_IDS: 'duplicate-ids', SIZE_IDENTITY: 'size-identity',
   ROW_IDENTITY: 'row-identity', LONG_COLUMN: 'long-column', LONG_LENGTH: 'long-length',
@@ -345,29 +345,18 @@ function firstMatchToken(text) {
 async function verifyFts(db, rows) {
   db = phaseDb(db, COPY_PHASES.FTS_MATCH);
   const probes = rows.map((row) => ({ id: row.id, token: firstMatchToken(row.text) }));
-  const statements = [];
-  for (let offset = 0; offset < probes.length; offset += 48) {
-    const chunk = probes.slice(offset, offset + 48);
-    // FTS5 can omit the equality recheck for REAL-bound integral ids. These ids are
-    // already validated safe integers; make their SQL storage class normative too.
-    statements.push({
-      sql: chunk.map(() => 'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = CAST(? AS INTEGER)').join(' UNION ALL '),
-      params: chunk.flatMap(({ id, token }) => [
-        token ? `"${token.replaceAll('"', '""')}"` : '"index-migration-tokenless-probe"', id,
-      ]),
-    });
-  }
-  if (!statements.length) return;
-  let matches;
-  if (statements.length === 1) {
-    matches = await db.query(statements[0].sql, statements[0].params);
-  } else {
-    const results = await db.batch(statements);
-    if (results.length !== statements.length || results.some((result) => !Array.isArray(result.results))) {
-      throw copyInvariant(COPY_INVARIANTS.FTS_SHAPE, 'FTS MATCH batch returned incomplete results', COPY_PHASES.FTS_MATCH);
-    }
-    matches = results.flatMap((result) => result.results);
-  }
+  if (!probes.length) return;
+  // Keep probes outermost so each MATCH is correlated with its requested row in
+  // one native read snapshot, without expanding SQLite's compound-select grammar.
+  // FTS5 can omit the equality recheck for REAL-valued integral ids; retain the
+  // explicit INTEGER storage class even though every copied id is already safe.
+  const matches = await db.query(`SELECT blocks_fts.rowid
+    FROM json_each(?) AS probe CROSS JOIN blocks_fts
+    WHERE blocks_fts MATCH json_extract(probe.value,'$[0]')
+      AND blocks_fts.rowid = CAST(json_extract(probe.value,'$[1]') AS INTEGER)`,
+  [JSON.stringify(probes.map(({ id, token }) => [
+    token ? `"${token.replaceAll('"', '""')}"` : '"index-migration-tokenless-probe"', id,
+  ]))]);
   const expected = new Set(probes.map((probe) => probe.id));
   const found = new Set();
   for (const row of matches) {
