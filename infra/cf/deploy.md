@@ -512,12 +512,12 @@ adds `cleanup: "failed"` and `cleanupFailure` (a client failure kind or `other`)
 the owned probe may remain, and foreign/user tables are never cleanup targets.
 Neither boundary logs raw causes, stacks, provider text, or copied values.
 
-After a failed/ambiguous request, source contents, shard contents, and checkpoint
+After a failed/ambiguous D1 request, source contents, shard contents, and checkpoint
 progress are unknown until durable state is inspected through the protected
 workflow. Do not infer rollback from a generic API code, advance a cursor, blindly
 retry, or apply speculative capacity/schema changes. Keep maintenance and paused
 consumers in place; use the existing verified-readback/checkpoint recovery rules
-before approving a protected continuation. Diagnostics add no retry or mutation.
+before approving a protected continuation. D1 diagnostics add no retry or mutation.
 
 Abort or timeout during copying leaves maintenance and detached consumers in place.
 A failed readiness check or initial activation smoke writes no activation proof, so
@@ -552,19 +552,44 @@ before latency, other account activity, and extra long-value byte-slice reads.
 `copyForecast.kind = "estimate"` distinguishes it from copied/verified checkpoint
 evidence. A first/middle/last sample cannot establish the distribution of every page.
 
-The client retries only an unambiguous HTTP 429 rejection with a valid `retry-after`
-delay. It never automatically replays a network error, malformed response, or 5xx
-whose execution outcome is unknown. Native/provider/transport failures remain terminal
-errors: inspect their evidence and durable state before approving any continuation,
-not an automatic retry.
+The Cloudflare API/D1 client retries only an unambiguous HTTP 429 rejection with a
+valid `retry-after` delay. It never automatically replays a network error, malformed
+response, or 5xx whose execution outcome is unknown. Native/provider/transport
+failures remain terminal errors: inspect their evidence and durable state before
+approving any continuation, not an automatic retry. This includes read-only SQL:
+its D1 REST POST is not covered by the health GET policy below.
+
+The direct read-only `/healthz` revision gate permits at most **three total attempts**
+when `fetch` rejects or a successful response's body cannot be read, with one second
+between attempts (at most two waits). Each attempt makes a fresh uncached GET with
+the existing 30-second request timeout. A successful attempt must still assert the
+exact expected mode, deployment revision, production environment, and 16-shard layout
+before it authorizes further copy work. HTTP errors (including 429/5xx), malformed
+JSON, and health-payload mismatches are terminal at direct gates: they are not
+transport failures and are never retried into source acknowledgment. There is no
+cached-health fallback. The standalone `health` command retains its separate,
+existing 180-second deployment-propagation settle loop; that command-only polling
+does not weaken the gates used by `copy`, readiness, or activation.
+
+Health errors emit only `operation=revision-gate`, an allowlisted command and mode,
+`failure=transport|http|json|mismatch`, safe actual HTTP status (or `unknown`), and
+attempt count. Raw URLs, headers, response bodies, exception messages, stacks, and
+nested causes are not logged. Exhaustion leaves the source authoritative and the
+unacknowledged copy page/checkpoint intact; a later protected pass revalidates that
+durable work. This policy and its local CLI/native-SQLite regressions neither
+identify the DNS/TLS/socket cause of an earlier `fetch failed` nor establish that
+the production migration or missing-backup recovery has completed.
 
 The protected copy invocation passes `--pass-budget-ms 18000000` (five hours).
 This positive safe integer millisecond argument is optional for `copy` only; other
 commands and clients have no pass budget. The clock starts after configuration,
-maintenance/drain, and atomicity prerequisites, before the copy's data reads. The
-request boundary checks before acquiring a permit, again after acquiring it, and
-before a valid 429 retry sleep. It stops if expired or if that sleep would reach the
-deadline. It never aborts or replays an in-flight request or native batch. This is a
+maintenance/drain, and atomicity prerequisites, before the copy's data reads and
+fresh health checks. The same request boundary checks D1 requests before acquiring
+a permit, again after acquiring it, and before a valid 429 retry sleep. It also
+checks before every copy health GET and before each one-second health transport
+retry wait. It stops if expired or if either retry wait would reach the deadline;
+a delayed wait must pass the boundary again before starting another request.
+It never aborts or replays an in-flight request or native batch. This is a
 copy-process budget, not a deadline for the whole 360-minute job. Setup, the drain,
 main migrations, catalog seeding and activation share the remaining job time; a copy
 that finishes near five hours does not guarantee those later steps will fit.
@@ -577,7 +602,8 @@ and exits **78**, leaving the job failed and production in maintenance with cons
 detached. It does not mark the copy complete or acknowledge additional rows. Subsequent
 main migrations, catalog seeding, activation, and consumer restoration do not run.
 Only this distinct budget exception is partial; arbitrary native HTTP 400/code 7500,
-network failures, and other errors are not relabeled as budget stops.
+exhausted health transport failures, invalid health payloads, D1 network failures,
+and other errors are not relabeled as budget stops.
 
 For that explicit partial result, rerun the **same protected main-push job at the same
 commit** using GitHub Actions' rerun control (or `gh run rerun <run-id> --failed`).

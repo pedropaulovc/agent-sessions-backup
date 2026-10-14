@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import {
   ACTIVATION_CHECKPOINT, COPY_CHECKPOINT, READY_CHECKPOINT, SEED_CHECKPOINT, SOURCE_FREEZE_TABLE,
@@ -169,10 +171,9 @@ async function migrations(directory) {
   })));
 }
 
-async function fixture(context) {
+async function fixture(context, { identities = ['main-database', 'index-database-00', 'index-database-01'] } = {}) {
   const directory = await mkdtemp(path.join(tmpdir(), 'index-migration-test-'));
   const trace = [];
-  const identities = ['main-database', 'index-database-00', 'index-database-01'];
   const filenames = identities.map((id) => path.join(directory, `${id}.sqlite`));
   let adapters = identities.map((id, index) => new SqliteD1(id, filenames[index], trace));
   const mainMigrations = await migrations(path.join(hubRoot, 'migrations'));
@@ -373,7 +374,7 @@ function assertCopied(f, rows) {
   assert.deepEqual(f.source.rows('SELECT * FROM blocks'), []);
   for (let index = 0; index < f.shards.length; index += 1) {
     const shard = f.shards[index];
-    const expected = rows.filter((row) => indexShardForSessionId(row.session_id, 2) === index)
+    const expected = rows.filter((row) => indexShardForSessionId(row.session_id, f.shards.length) === index)
       .sort((left, right) => left.id - right.id);
     assert.deepEqual(shard.rows('SELECT * FROM blocks ORDER BY id'), expected);
     for (const row of expected.filter((row) => row.text)) {
@@ -3691,6 +3692,341 @@ test('copy pass never turns native HTTP 400 or ambiguous network failures into p
       assert.deepEqual(f.trace, []);
       assert.equal(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), null);
       assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [original]);
+    });
+  }
+});
+
+const copyCliRevision = 'a'.repeat(40);
+const copyCliStart = 10_000_000;
+const copyCliCanary = 'PRIVATE_HEALTH_URL_HEADER_BODY_CAUSE_CANARY';
+const copyCliController = process.env.INDEX_CONTROL_CLI_PATH
+  ?? fileURLToPath(new URL('../../infra/cf/index-control.mjs', import.meta.url));
+
+// Run the actual protected copy verb, retaining the existing native SQLite REST
+// transaction adapter. The preload changes only fetch/clock boundaries, never SQL,
+// copier results, acknowledgments, checkpoints, or health-gate implementation.
+async function copyCliFixture(context) {
+  const identities = ['5ff65cf3-89c8-4fe6-a3c2-a370293ecea6',
+    ...Array.from({ length: 16 }, (_, index) => `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`)];
+  const f = await fixture(context, { identities });
+  const rows = [
+    block(40_501, 0, { session_id: 'copy-health-session-0',
+      text: '\uFEFFhealthneedle café\u0000tail 😀', row_hash: Number.MAX_SAFE_INTEGER }),
+    block(40_502, 1, { session_id: 'copy-health-session-1',
+      text: `healthlong ${'会話 😀\u0000'.repeat(4000)}healthtail`, role: '', tool_name: null }),
+    block(40_503, 0, { session_id: 'copy-health-session-2',
+      text: null, role: null, byte_start: null, byte_len: null }),
+    block(40_504, 1, { session_id: 'copy-health-session-3',
+      text: '', media_byte_start: 2 ** 40, media_byte_len: 0, media_type: '' }),
+  ];
+  seedBlocks(f.source, rows);
+  const directory = path.dirname(f.source.filename);
+  const configPath = path.join(directory, 'generated.json');
+  const preload = path.join(directory, 'preload.mjs');
+  const reportPath = path.join(directory, 'report.json');
+  const config = {
+    account_id: PRODUCTION_ACCOUNT_ID, name: 'sessions-hub',
+    vars: { INDEX_SHARD_COUNT: '16', DEPLOYMENT_REVISION: copyCliRevision,
+      VIEWER_HOST: `${copyCliCanary.toLowerCase()}.invalid`, INDEX_MODE: 'maintenance' },
+    d1_databases: identities.map((id, index) => {
+      const binding = index ? `IDX${String(index - 1).padStart(2, '0')}` : 'DB';
+      return { binding, database_id: id,
+        database_name: index ? `sessions-index-${binding.toLowerCase()}` : 'sessions-index' };
+    }),
+  };
+  await writeFile(configPath, JSON.stringify(config));
+  await writeCheckpoint(f.shards[0], 'index-maintenance-freeze-v1', {
+    revision: copyCliRevision, cycle: '12345:1', observedAt: copyCliStart - 16 * 60 * 1000 - 1,
+    source: f.source.id, shards: f.shards.map(({ id }) => id),
+  });
+  await writeCheckpoint(f.shards[0], 'index-rest-batch-atomicity-v1', {
+    state: 'verified', databaseId: f.shards[0].id, textTransport: 'verified',
+    textBytes: Buffer.byteLength(D1_BATCH_PROBE_TEXT, 'utf8'), revision: copyCliRevision,
+    cycle: '12345:1', verifiedAt: copyCliStart - 1,
+  });
+  return {
+    f, rows,
+    async run(scenario = {}) {
+      const budget = scenario.budget ?? 120_000;
+      await writeFile(preload, `
+        import assert from 'node:assert/strict';
+        import { writeFileSync } from 'node:fs';
+        import { DatabaseSync } from 'node:sqlite';
+        const quoted = ${quoted.toString()};
+        const sqliteParams = ${sqliteParams.toString()};
+        const isWrite = ${isWrite.toString()};
+        const selectsTable = ${selectsTable.toString()};
+        ${plainRows.toString()}
+        let nextTransaction = 0;
+        ${SqliteD1.toString()}
+        ${assertVerifiedBeforeDelete.toString()}
+        const scenario = ${JSON.stringify(scenario)};
+        const budget = ${budget};
+        const trace = [];
+        const adapters = ${JSON.stringify([f.source, ...f.shards].map(({ id, filename }) => ({ id, filename })))}
+          .map(({ id, filename }) => new SqliteD1(id, filename, trace));
+        const f = { source: adapters[0], shards: adapters.slice(1), trace };
+        const verifiedRows = assertVerifiedBeforeDelete(f);
+        const checkpoint = () => {
+          const saved = f.shards[0].rows('SELECT value FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT]);
+          return saved.length ? JSON.parse(saved[0].value) : null;
+        };
+        const verifiedPending = () => {
+          const saved = checkpoint();
+          return saved?.pending?.phase === 'copying' && saved.pending.rows.every((item) => {
+            const shard = f.shards[item.shard];
+            return trace.some((event) => event.db === shard.id && event.success
+              && ['query', 'batch-statement'].includes(event.kind) && selectsTable(event.sql, 'blocks')
+              && event.rows.some((row) => row.id === item.id && Object.hasOwn(row, 'text')
+                && rowDigest(saved.columns, row) === item.sha256))
+              && trace.some((event) => event.db === shard.id && event.success
+                && ['query', 'batch-statement'].includes(event.kind) && /\\bMATCH\\b/i.test(event.sql)
+                && JSON.parse(event.params[0]).some(([, id]) => id === item.id));
+          });
+        };
+        let now = ${copyCliStart};
+        let copyStarted;
+        let faultIndex = 0;
+        let awaitingRetry = false;
+        let expired = false;
+        const requests = [];
+        const healthCalls = [];
+        const healthWaits = [];
+        const signals = new WeakMap();
+        Date.now = () => now;
+        AbortSignal.timeout = (milliseconds) => {
+          const signal = new AbortController().signal;
+          signals.set(signal, milliseconds);
+          return signal;
+        };
+        globalThis.setTimeout = (callback, delay, ...args) => {
+          if (awaitingRetry) {
+            healthWaits.push({ started: now, delay });
+            awaitingRetry = false;
+          }
+          now += delay;
+          queueMicrotask(() => callback(...args));
+          return 0;
+        };
+        // Install the clock before importing the copier's transitive API pacer:
+        // its process-wide permit function captures Date.now at module load.
+        const { rowDigest, COPY_CHECKPOINT, SOURCE_FREEZE_TABLE } = await import(${JSON.stringify(new URL('../scripts/lib/index-migration.mjs', import.meta.url).href)});
+        process.on('exit', () => {
+          writeFileSync(${JSON.stringify(reportPath)}, JSON.stringify({
+            now, copyStarted, requests, healthCalls, healthWaits, trace,
+            verifiedRows: verifiedRows(), checkpoint: checkpoint(),
+          }));
+          for (const adapter of adapters) adapter.close();
+        });
+        const fail = (fault) => {
+          awaitingRetry = fault === 'fetch' || fault === 'body';
+          if (fault === 'fetch') throw new Error(${JSON.stringify(copyCliCanary)}, {
+            cause: new Error('https://' + ${JSON.stringify(copyCliCanary)} + '/private?token=secret'),
+          });
+          if (fault === 'body') return new Response(new ReadableStream({
+            start(controller) { controller.error(new Error(${JSON.stringify(copyCliCanary)})); },
+          }), { status: 200 });
+          if (fault === 'http') return new Response(${JSON.stringify(copyCliCanary)}, { status: scenario.httpStatus ?? 503 });
+          if (fault === 'json') return new Response('{"' + ${JSON.stringify(copyCliCanary)}, { status: 200 });
+          return Response.json({
+            ok: true, environment: fault === 'environment' ? ${JSON.stringify(copyCliCanary)} : 'production',
+            indexMode: fault === 'mode' ? 'active' : 'maintenance',
+            deploymentRevision: fault === 'revision' ? ${JSON.stringify(copyCliCanary)} : ${JSON.stringify(copyCliRevision)},
+            indexShardCount: fault === 'shards' ? 2 : 16,
+          });
+        };
+        globalThis.fetch = async (input, init = {}) => {
+          const url = new URL(input);
+          const started = now;
+          if (url.hostname === ${JSON.stringify(config.vars.VIEWER_HOST)} && url.pathname === '/healthz') {
+            assert.equal(init.method ?? 'GET', 'GET');
+            assert.equal(init.redirect, 'error');
+            assert.equal(init.headers['cache-control'], 'no-cache');
+            if (healthCalls.length === 1) copyStarted = now;
+            const postVerification = verifiedPending();
+            const fault = postVerification ? (scenario.faults ?? [])[faultIndex++] : undefined;
+            healthCalls.push({ started, signalBudget: signals.get(init.signal), fault,
+              postVerification, checkpointBefore: checkpoint(), sourceCount: f.source.rows('SELECT COUNT(*) AS n FROM blocks')[0].n });
+            requests.push({ kind: 'health', started, aborted: init.signal.aborted });
+            now += 7; // Deliberately unaligned with both pacing and retry intervals.
+            if (postVerification && scenario.remaining !== undefined && fault) now = copyStarted + budget - scenario.remaining;
+            return fail(fault);
+          }
+          assert.equal(url.hostname, 'api.cloudflare.com');
+          assert.equal(init.method, 'POST');
+          assert.ok(url.pathname.startsWith('/client/v4/accounts/${PRODUCTION_ACCOUNT_ID}/d1/database/'));
+          const id = decodeURIComponent(url.pathname.match(/\\/d1\\/database\\/([^/]+)\\/query$/)[1]);
+          const adapter = adapters.find((db) => db.id === id);
+          assert.ok(adapter, 'D1 requests must address actual fixture databases');
+          const body = JSON.parse(init.body);
+          requests.push({ kind: 'd1', started, aborted: init.signal.aborted });
+          const result = body.batch ? await adapter.batch(body.batch)
+            : [{ success: true, results: await adapter.query(body.sql, body.params) }];
+          now += 7;
+          if (scenario.expireBeforeHealth && !expired && verifiedPending()) {
+            expired = true;
+            now = copyStarted + budget;
+          }
+          return Response.json({ success: true, result });
+        };
+      `);
+      const result = spawnSync(process.execPath, ['--import', pathToFileURL(preload).href, copyCliController,
+        'copy', '--config', configPath, '--pass-budget-ms', String(budget)], {
+        encoding: 'utf8', timeout: 30_000,
+        env: { ...process.env, NODE_NO_WARNINGS: '1', GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'push',
+          GITHUB_REPOSITORY: 'pedropaulovc/agent-sessions-backup', GITHUB_REF: 'refs/heads/main',
+          PROTECTED_PRODUCTION_MIGRATION: '1', GITHUB_SHA: copyCliRevision,
+          GITHUB_RUN_ID: '12345', GITHUB_RUN_ATTEMPT: '1',
+          CLOUDFLARE_ACCOUNT_ID: PRODUCTION_ACCOUNT_ID, CLOUDFLARE_API_TOKEN: copyCliCanary },
+      });
+      assert.ifError(result.error);
+      assert.equal(result.signal, null);
+      let report;
+      try { report = JSON.parse(await readFile(reportPath, 'utf8')); }
+      catch {
+        const failure = result.stderr.includes('ERR_UNSUPPORTED_ESM_URL_SCHEME')
+          ? 'unsupported-esm-url-scheme' : 'report-unavailable';
+        throw new Error(`copy CLI fixture report unavailable: exit=${result.status} failure=${failure}`);
+      }
+      return { ...result, ...report, budget };
+    },
+  };
+}
+
+function assertCopyCliPrivate(result) {
+  assert.ok(!`${result.stdout}${result.stderr}`.includes(copyCliCanary));
+  assert.ok(!`${result.stdout}${result.stderr}`.includes(copyCliCanary.toLowerCase()));
+}
+
+function assertCopyCliRetained(f, rows, result) {
+  assert.equal(result.verifiedRows, 0, 'unhealthy gates cannot authorize any source acknowledgment');
+  assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), rows);
+  assert.equal(result.checkpoint.state, 'pending');
+  assert.equal(result.checkpoint.rows, 0);
+  assert.equal(result.checkpoint.after, -1);
+  assert.equal(result.checkpoint.pending.phase, 'copying');
+  assert.deepEqual(result.checkpoint.pending.rows, rows.map((row) => ({
+    id: row.id, shard: indexShardForSessionId(row.session_id, 16),
+    sha256: rowDigest(result.checkpoint.columns, row),
+  })));
+  assert.ok(!result.trace.some((event) => event.db === f.source.id && event.sql && isWrite(event.sql)),
+    'no source barrier or DELETE may run before successful fresh health');
+  for (let shard = 0; shard < f.shards.length; shard += 1) {
+    assert.deepEqual(f.shards[shard].rows('SELECT * FROM blocks ORDER BY id'),
+      rows.filter((row) => indexShardForSessionId(row.session_id, 16) === shard));
+  }
+}
+
+test('copy CLI recovers read-only fetch and response-body interruptions only with fresh full-fidelity health', async (context) => {
+  for (const faults of [[], ['fetch'], ['body'], ['fetch', 'body']]) {
+    await context.test(faults.join('-') || 'no-fault-baseline', async (child) => {
+      const { f, rows, run } = await copyCliFixture(child);
+      const result = await run({ faults });
+      assert.equal(result.status, 0, 'a recovered fresh health gate must complete the actual copy');
+      assertCopyCliPrivate(result);
+      const copied = JSON.parse(result.stdout.trim());
+      assert.equal(copied.state, 'complete');
+      assert.equal(copied.copiedRows, rows.length);
+      assert.equal(result.checkpoint.sha256, copied.sha256);
+      assert.equal(result.checkpoint.pending, null);
+      assert.equal(result.verifiedRows, rows.length, 'native full-row readback and MATCH must precede source ACK');
+      const attempts = result.healthCalls.filter(({ postVerification }) => postVerification);
+      assert.equal(attempts.length, faults.length + 1);
+      assert.deepEqual(attempts.map(({ fault }) => fault), [...faults, undefined]);
+      assert.ok(attempts.every(({ sourceCount, checkpointBefore }) =>
+        sourceCount === rows.length && checkpointBefore.pending.phase === 'copying'));
+      assert.equal(result.healthWaits.length, faults.length);
+      assert.ok(result.healthWaits.every(({ delay }) => delay === 1000));
+      assertCopied(f, rows);
+      assertAtomicBlockBatches({ ...f, trace: result.trace });
+    });
+  }
+});
+
+test('copy CLI exhausted health transport is sanitized and preserves the verified but unacknowledged native page', async (context) => {
+  for (const fault of ['fetch', 'body']) {
+    await context.test(fault, async (child) => {
+      const { f, rows, run } = await copyCliFixture(child);
+      const result = await run({ faults: [fault, fault, fault] });
+      assert.equal(result.status, 1);
+      assert.equal(result.stdout, '');
+      const attempts = result.healthCalls.filter(({ postVerification }) => postVerification);
+      assert.equal(attempts.length, 3);
+      assert.equal(result.healthWaits.length, 2);
+      assertCopyCliRetained(f, rows, result);
+      assert.deepEqual(result.checkpoint, attempts[0].checkpointBefore,
+        'exhaustion cannot publish verification, advance a cursor, or discard the pending page');
+      assertCopyCliPrivate(result);
+      assert.equal(result.stderr.trim(), `health operation=revision-gate command=copy mode=maintenance failure=transport HTTP=${fault === 'body' ? 200 : 'unknown'} attempts=3`);
+      const snapshots = f.shards.map((db) => db.rows('SELECT * FROM blocks ORDER BY id'));
+      f.restart();
+      const resumed = await run();
+      assert.equal(resumed.status, 0, resumed.stderr);
+      assert.equal(resumed.verifiedRows, rows.length);
+      assertCopied(f, rows);
+      assert.deepEqual(f.shards.map((db) => db.rows('SELECT * FROM blocks ORDER BY id')), snapshots,
+        'durable copying-page resume retains every column while rebuilding and checking actual FTS');
+    });
+  }
+});
+
+test('copy CLI never retries HTTP, JSON, or fresh revision/layout mismatch into source authorization', async (context) => {
+  for (const { faults, failure, httpStatus = 503 } of [
+    { faults: ['fetch', 'revision'], failure: 'mismatch' },
+    { faults: ['body', 'environment'], failure: 'mismatch' },
+    { faults: ['mode'], failure: 'mismatch' },
+    { faults: ['shards'], failure: 'mismatch' },
+    { faults: ['http'], failure: 'http', httpStatus: 429 },
+    { faults: ['http'], failure: 'http', httpStatus: 503 },
+    { faults: ['json'], failure: 'json' },
+  ]) {
+    await context.test(`${faults.join('-')}-${httpStatus}`, async (child) => {
+      const { f, rows, run } = await copyCliFixture(child);
+      const result = await run({ faults, httpStatus });
+      assert.equal(result.status, 1);
+      assert.equal(result.stdout, '');
+      const attempts = result.healthCalls.filter(({ postVerification }) => postVerification);
+      assert.equal(attempts.length, faults.length, 'invalid fresh responses are terminal, not transport retries');
+      assert.equal(result.healthWaits.length, faults.length - 1);
+      assertCopyCliRetained(f, rows, result);
+      assert.deepEqual(result.checkpoint, attempts[0].checkpointBefore);
+      assertCopyCliPrivate(result);
+      assert.equal(result.stderr.trim(), `health operation=revision-gate command=copy mode=maintenance failure=${failure} HTTP=${failure === 'http' ? httpStatus : 200} attempts=${faults.length}`);
+    });
+  }
+});
+
+test('copy CLI shares the fresh soft budget with health starts and retry waits and resumes durable native state', async (context) => {
+  for (const scenario of [
+    { expireBeforeHealth: true },
+    { faults: ['fetch'], remaining: 999 },
+    { faults: ['body'], remaining: 1000 },
+    { faults: ['fetch'], remaining: 1001 },
+  ]) {
+    await context.test(JSON.stringify(scenario), async (child) => {
+      const { f, rows, run } = await copyCliFixture(child);
+      const result = await run(scenario);
+      assert.equal(result.status, 78, 'health boundary exhaustion must remain an explicit partial copy pass');
+      assertCopyCliPrivate(result);
+      assert.deepEqual(JSON.parse(result.stdout.trim()), { status: 'partial', reason: 'pass-budget-exhausted' });
+      assert.equal(result.stderr, '');
+      const attempts = result.healthCalls.filter(({ postVerification }) => postVerification);
+      assert.equal(attempts.length, scenario.expireBeforeHealth ? 0 : scenario.remaining === 1001 ? 2 : 1);
+      assert.equal(result.healthWaits.length, scenario.remaining === 1001 ? 1 : 0);
+      const deadline = result.copyStarted + result.budget;
+      assert.ok(result.requests.filter(({ started }) => started >= result.copyStarted)
+        .every(({ started, aborted }) => started < deadline && !aborted),
+      'neither health nor D1 may start after the shared boundary or cancel in-flight work');
+      assert.ok(result.healthWaits.every(({ started, delay }) => started + delay < deadline));
+      assert.ok(result.now <= deadline + 7, 'only an already-started response may cross the soft boundary');
+      assertCopyCliRetained(f, rows, result);
+      const snapshots = f.shards.map((db) => db.rows('SELECT * FROM blocks ORDER BY id'));
+      f.restart();
+      const resumed = await run();
+      assert.equal(resumed.status, 0, resumed.stderr);
+      assert.equal(resumed.verifiedRows, rows.length);
+      assertCopied(f, rows);
+      assert.deepEqual(f.shards.map((db) => db.rows('SELECT * FROM blocks ORDER BY id')), snapshots);
     });
   }
 });
