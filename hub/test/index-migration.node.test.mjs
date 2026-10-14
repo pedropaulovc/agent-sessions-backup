@@ -209,6 +209,120 @@ async function fixture(context) {
   return result;
 }
 
+// The same query/batch result-record boundary as SqliteD1, but every statement
+// executes in workerd's real D1 implementation, with no SQL rewriting or hit echo.
+class WorkerdD1 {
+  constructor(id, database, trace) {
+    this.id = id;
+    this.database = database;
+    this.trace = trace;
+    this.beforeQuery = null;
+    this.beforeStatement = null;
+    this.transformQuery = null;
+  }
+
+  async rows(sql, params = []) {
+    return (await this.database.prepare(sql).bind(...params).all()).results;
+  }
+
+  async query(sql, params = []) {
+    const event = { db: this.id, kind: 'query', sql, params: [...params], success: false };
+    this.trace.push(event);
+    await this.beforeQuery?.(event);
+    let rows = await this.rows(sql, params);
+    if (this.transformQuery) rows = await this.transformQuery(event, rows);
+    event.rows = rows;
+    event.responseBytes = Buffer.byteLength(JSON.stringify(rows));
+    event.success = true;
+    return rows;
+  }
+
+  async batch(statements) {
+    const transaction = `${this.id}:${++nextTransaction}`;
+    const event = { db: this.id, kind: 'batch', transaction, statements, atomic: true, committed: false };
+    this.trace.push(event);
+    const calls = [];
+    // Hooks observe the request before workerd executes the entire native batch;
+    // they do not turn it into separate per-statement RPCs or transactions.
+    for (const { sql, params = [] } of statements) {
+      const call = { db: this.id, kind: 'batch-statement', transaction, sql, params, success: false };
+      this.trace.push(call);
+      calls.push(call);
+      await this.beforeStatement?.(call);
+    }
+    const results = await this.database.batch(statements.map(({ sql, params = [] }) =>
+      this.database.prepare(sql).bind(...params)));
+    event.committed = true;
+    for (let index = 0; index < calls.length; index += 1) {
+      calls[index].rows = results[index].results;
+      calls[index].responseBytes = Buffer.byteLength(JSON.stringify(results[index].results));
+      calls[index].success = results[index].success;
+    }
+    return results;
+  }
+}
+
+async function workerdFixture(context) {
+  const { Miniflare } = await import('miniflare');
+  const { unstable_splitSqlQuery: splitSqlQuery } = await import('wrangler');
+  const identities = { DB: 'workerd-copy-source', IDX00: 'workerd-copy-index-00', IDX01: 'workerd-copy-index-01' };
+  const native = new Miniflare({
+    modules: true,
+    script: 'export default { fetch() { return new Response("index-copy-test"); } };',
+    compatibilityDate: '2026-07-17',
+    d1Databases: identities,
+  });
+  // Register disposal before setup so failures cannot leave the native process running.
+  context.after(() => native.dispose());
+  const trace = [];
+  const adapters = await Promise.all(Object.entries(identities).map(async ([binding, id]) =>
+    new WorkerdD1(id, await native.getD1Database(binding), trace)));
+  const indexMigrations = await migrations(path.join(hubRoot, 'migrations-index'));
+  // Like the isolated native-copy control, use the actual index schema for its
+  // source as well as both shards; its blocks layout/tokenizer is the legacy layout.
+  for (const adapter of adapters) {
+    for (const migration of indexMigrations) {
+      await adapter.batch(splitSqlQuery(migration.sql).map((sql) => ({ sql, params: [] })));
+    }
+  }
+  const [source, ...shards] = adapters;
+  await initializeShardLayouts(shards);
+  trace.length = 0;
+  return { source, shards, trace, args: (extra = {}) => ({ source, shards, gate, ...extra }) };
+}
+
+async function seedWorkerdBlocks(db, rows) {
+  const ids = JSON.stringify(rows.map(({ id }) => id));
+  await db.batch([
+    {
+      sql: `INSERT INTO blocks (${BLOCK_COLUMNS.map(quoted).join(',')})
+        SELECT ${BLOCK_COLUMNS.map((_, index) => `json_extract(value,'$[${index}]')`).join(',')} FROM json_each(?)`,
+      params: [JSON.stringify(rows.map((row) => BLOCK_COLUMNS.map((column) => row[column])))],
+    },
+    { sql: 'INSERT INTO blocks_fts (rowid, text) SELECT id, text FROM blocks WHERE id IN (SELECT value FROM json_each(?))',
+      params: [ids] },
+  ]);
+}
+
+async function nativeSnapshot(db) {
+  const results = await db.database.batch([
+    'SELECT * FROM blocks ORDER BY id',
+    'SELECT * FROM blocks_fts_data ORDER BY id',
+    'SELECT * FROM blocks_fts_idx ORDER BY segid, term',
+  ].map((sql) => db.database.prepare(sql)));
+  return { blocks: results[0].results, ftsData: results[1].results, ftsIndex: results[2].results };
+}
+
+function nativeDenseRows(count) {
+  const session_id = sessionOn(1);
+  return Array.from({ length: count }, (_, index) => ({
+    id: index + 1, session_id, file_id: 0, turn_index: 0, block_index: index,
+    role: null, btype: 'text', tool_name: null, ts: '', byte_start: 0, byte_len: 0,
+    truncated: 0, text: 'nativedensevisible\u0000 nativedensesuffix', on_main_path: 1,
+    row_hash: index + 1, media_byte_start: null, media_byte_len: 0, media_type: '',
+  }));
+}
+
 function insert(db, table, columns, row) {
   db.database.prepare(`INSERT INTO ${quoted(table)} (${columns.map(quoted).join(',')})
     VALUES (${columns.map(() => '?').join(',')})`).run(...columns.map((column) => row[column]));
@@ -326,7 +440,8 @@ function assertVerifiedBeforeDelete(f) {
       const hasToken = typeof destination.text === 'string'
         && /[\p{L}\p{N}\p{Co}_.-]/u.test(destination.text);
       assert.ok(f.trace.some((event) => event.db === shard.id && ['query', 'batch-statement'].includes(event.kind)
-        && event.success && /\bMATCH\b/i.test(event.sql) && event.params.includes(item.id)
+        && event.success && /\bMATCH\b/i.test(event.sql)
+        && JSON.parse(event.params[0]).some(([, id]) => id === item.id)
         && (!hasToken || event.rows.some((row) => row.rowid === item.id))),
       `successful adapter FTS MATCH for block ${item.id} must precede source deletion`);
     }
@@ -549,8 +664,8 @@ test('shared first MATCH terms with embedded NUL copy exactly and retire source 
       }
       const columns = [...BLOCK_COLUMNS, 'future_text', 'future_real'];
       const untouched = block(599, 0, { future_text: '', future_real: null });
-      // Retain the original CAS matrix's pre-mutation shared-term/NUL values, width and
-      // numeric/null edges. Each populated shard stays below one 48-probe MATCH chunk.
+      // Retain the original CAS matrix's pre-mutation shared-term/NUL values,
+      // column width and numeric/null edges.
       const originals = columns.filter((column) => column !== 'id').map((_, index) =>
         block(600 + index, distribution === 'same-shard' ? 0 : index % 2, {
           role: '', tool_name: null, ts: null, byte_start: 0, byte_len: Number.MAX_SAFE_INTEGER,
@@ -625,7 +740,7 @@ test('shared first MATCH terms with embedded NUL copy exactly and retire source 
   }
 });
 
-test('actual copier MATCH SQL preserves shared-term row identities with native Number-bound parameters', async (context) => {
+test('actual copier MATCH SQL preserves shared-term row identities with uncoerced native parameters', async (context) => {
   const f = await fixture(context);
   const rows = Array.from({ length: 100 }, (_, index) => block(40_001 + index, index % 2, {
     text: 'native_binding_probe\u0000shared_tail 会話',
@@ -639,7 +754,7 @@ test('actual copier MATCH SQL preserves shared-term row identities with native N
     shard.execute = (sql, params) => {
       if (!/\bMATCH\b/i.test(sql)) return execute(sql, params);
       nativeMatchCalls += 1;
-      assert.ok(params.some((value) => typeof value === 'number' && Number.isSafeInteger(value)));
+      // Do not normalize bindings or substitute results for the producer's query.
       return shard.database.prepare(sql).all(...params).map((row) => ({ ...row }));
     };
   }
@@ -659,6 +774,119 @@ test('actual copier MATCH SQL preserves shared-term row identities with native N
   const evidence = await verifyIndexRecords({ source: f.source, shards: f.shards, catalogConsistency: 'required' });
   assert.deepEqual(evidence.shards.map(({ blockCount }) => blockCount), [50, 50]);
   assertReadonlyEvidenceCalls(f);
+});
+
+test('native workerd actual copier verifies 1461 same-shard rows and excludes an outside-probe MATCH before source acknowledgment', async (context) => {
+  const f = await workerdFixture(context);
+  const rows = nativeDenseRows(1461);
+  const ids = rows.map(({ id }) => id);
+  const outside = { ...rows[0], id: 1462, block_index: 1462, row_hash: 1462 };
+  await seedWorkerdBlocks(f.source, rows);
+  await seedWorkerdBlocks(f.shards[1], [outside]);
+  const before = await nativeSnapshot(f.source);
+  assert.deepEqual(before.blocks, rows, 'native source must store every complete tuple, including text past NUL');
+  f.trace.length = 0;
+  let verifiedBeforeAck = false;
+  let acknowledgedRows = 0;
+  const beforeSourceWrite = async ({ sql }) => {
+    if (!isWrite(sql)) return;
+    assert.equal(verifiedBeforeAck, true, 'full-row and FTS proof must precede all source writes');
+    const durable = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+    assert.equal(durable.pending?.phase, 'verified', 'the native verified checkpoint must be durable before source writes');
+    assert.deepEqual(durable.pending.rows.map(({ id }) => id), ids);
+    if (/\bDELETE\s+FROM\s+"?blocks"?\b/i.test(sql)) acknowledgedRows += durable.pending.rows.length;
+  };
+  f.source.beforeQuery = beforeSourceWrite;
+  f.source.beforeStatement = beforeSourceWrite;
+  // This is the historical-module injection seam, not the helper's imported copier.
+  // The exact pre-fix module must reach its native compound-select rejection here.
+  const copied = await copyWithNativeParameters(f.args({ checkpointHook: async (state) => {
+    if (state.pending?.phase !== 'verified') return;
+    assert.deepEqual(state.pending.rows.map(({ id }) => id), ids, 'the dense fixture must be verified as one complete source page');
+    assert.deepEqual(await nativeSnapshot(f.source), before, 'verification must not acknowledge or mutate source data');
+    assert.deepEqual((await nativeSnapshot(f.shards[0])).blocks, []);
+    const destination = (await nativeSnapshot(f.shards[1])).blocks;
+    assert.deepEqual(destination, [...rows, outside], 'native full-row readback must preserve the outside row and every copied column');
+    for (const item of state.pending.rows) {
+      assert.equal(item.shard, 1);
+      assert.equal(item.sha256, rowDigest(state.columns, destination[item.id - 1]));
+      assert.ok(f.trace.some((event) => event.db === f.shards[1].id && event.success
+        && selectsTable(event.sql, 'blocks') && event.rows.some((row) => row.id === item.id
+          && Object.hasOwn(row, 'text') && rowDigest(state.columns, row) === item.sha256)),
+      'each source tuple needs successful full-column consumer readback before acknowledgment');
+    }
+    const matchRows = f.trace.filter((event) => event.db === f.shards[1].id
+      && ['query', 'batch-statement'].includes(event.kind) && /\bMATCH\b/i.test(event.sql));
+    assert.ok(matchRows.every((event) => event.success));
+    assert.deepEqual(matchRows.flatMap((event) => event.rows.map(({ rowid }) => rowid)).sort((a, b) => a - b), ids,
+      'shared MATCH terms must return every requested id once and never the matching outside-probe id');
+    verifiedBeforeAck = true;
+  } }));
+  assert.equal(copied.state, 'complete');
+  assert.equal(copied.rows, rows.length);
+  assert.equal(acknowledgedRows, rows.length, 'every complete source tuple must be acknowledged only after durable proof');
+  const after = await nativeSnapshot(f.source);
+  assert.deepEqual(after.blocks, []);
+  assert.deepEqual(after.ftsData, before.ftsData, 'source acknowledgment must not issue legacy FTS mutations');
+  assert.deepEqual(after.ftsIndex, before.ftsIndex);
+  assert.deepEqual(await f.shards[1].rows('SELECT * FROM blocks ORDER BY id'), [...rows, outside]);
+  for (const token of ['nativedensevisible', 'nativedensesuffix']) {
+    assert.deepEqual(await f.shards[1].rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? ORDER BY rowid',
+      [`"${token}"`]), [...ids, outside.id].map((rowid) => ({ rowid })), 'independent native MATCH must retain tokens before and after NUL');
+  }
+  assert.deepEqual(await f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
+  assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).state, 'complete');
+  assertAtomicBlockBatches(f);
+  assertNativeRequestLimits(f);
+  const requests = f.trace.filter((event) => ['query', 'batch'].includes(event.kind));
+  assert.ok(requests.length <= 100, `dense native verification must not make per-row RPCs, observed ${requests.length}`);
+});
+
+test('native workerd copier rejects missing, wrong, duplicate and out-of-probe MATCH identities before source acknowledgment', async (context) => {
+  const f = await workerdFixture(context);
+  const rows = nativeDenseRows(48);
+  const ids = rows.map(({ id }) => id);
+  const outside = { ...rows[0], id: 1462, block_index: 1462, row_hash: 1462 };
+  await seedWorkerdBlocks(f.source, rows);
+  await seedWorkerdBlocks(f.shards[1], [outside]);
+  const before = await nativeSnapshot(f.source);
+  for (const [fault, code] of [
+    ['missing', 'fts-match'], ['wrong', 'fts-identity'], ['duplicate', 'fts-identity'],
+    ['out-of-probe', 'fts-identity'], ['unsafe', 'fts-identity'], ['wrong-type', 'fts-identity'],
+  ]) {
+    await context.test(fault, async () => {
+      f.trace.length = 0;
+      let exercised = false;
+      f.shards[1].transformQuery = async (event, matches) => {
+        if (!/\bMATCH\b/i.test(event.sql)) return matches;
+        exercised = true;
+        assert.deepEqual(matches.map(({ rowid }) => rowid).sort((a, b) => a - b), ids,
+          'faults must alter genuine native results from the actual copier, not an echoed expected response');
+        if (fault === 'missing') return matches.slice(1);
+        if (fault === 'duplicate') return [...matches, { ...matches[0] }];
+        if (fault === 'out-of-probe') return f.shards[1].rows(
+          'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? ORDER BY rowid', ['"nativedensevisible"']);
+        return matches.map((row, index) => index ? row : {
+          rowid: fault === 'wrong' ? row.rowid + 0.25
+            : fault === 'unsafe' ? Number.MAX_SAFE_INTEGER + 1 : String(row.rowid),
+        });
+      };
+      await assert.rejects(copyWithNativeParameters(f.args()), (error) => {
+        assert.equal(error.code, code);
+        assert.equal(error.d1Phase, 'copy-fts-match');
+        return true;
+      });
+      assert.equal(exercised, true, 'the consumer must reach the real native MATCH boundary');
+      assert.deepEqual(await nativeSnapshot(f.source), before, 'invalid MATCH evidence must retain all source bytes and postings');
+      assert.deepEqual(sourceWrites(f), [], 'invalid native result identities cannot authorize source writes');
+      const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      assert.equal(checkpoint.pending.phase, 'copying', 'invalid MATCH evidence must never persist verified acknowledgment authority');
+      assert.equal(checkpoint.rows, 0);
+      assert.equal(checkpoint.after, -1);
+      assert.deepEqual(await f.shards[1].rows('SELECT * FROM blocks ORDER BY id'), [...rows, outside]);
+      assertNativeRequestLimits(f);
+    });
+  }
 });
 
 test('actual configured FTS tokenizer preserves empty, punctuation, Unicode and shared after-NUL copy results', async (context) => {
@@ -2590,7 +2818,7 @@ function assertNativeRequestLimits(f) {
   }
 }
 
-test('a dense 600-row copy uses native JSON bulk writes/deletion and bounded MATCH batches rather than one RPC per row', async (context) => {
+test('a dense 600-row copy uses bounded native bulk writes, MATCH verification and deletion rather than one RPC per row', async (context) => {
   const f = await fixture(context);
   const rows = Array.from({ length: 600 }, (_, index) => block(10_001 + index, index % 2, {
     text: `dense_needle_${index} café\u0000会話 😀 dense_tail_${index}`,
@@ -2623,15 +2851,10 @@ test('a dense 600-row copy uses native JSON bulk writes/deletion and bounded MAT
   }
   const deletion = sourceWrites(f).filter(({ sql }) => /\bDELETE\s+FROM\s+blocks\b/i.test(sql));
   assert.equal(deletion.length, 1, 'an ordinary source page must use one native full-column bulk CAS');
-  const matchBatches = f.trace.filter((event) => event.kind === 'batch'
-    && event.statements.every(({ sql }) => /\bMATCH\b/i.test(sql)));
-  assert.equal(matchBatches.length, 2, 'all MATCH chunks of a populated shard share one native read transaction');
-  assert.ok(matchBatches.every((event) => event.committed && event.statements.length > 1));
   const matches = f.trace.filter((event) => ['query', 'batch-statement'].includes(event.kind) && /\bMATCH\b/i.test(event.sql));
-  assert.ok(matches.every((event) => event.params.length <= 96), '48 probes bind at most 96 MATCH/id parameters');
-  assert.equal(Math.max(...matches.map((event) => event.params.length)), 96);
-  assert.deepEqual(new Set(matches.flatMap((event) => event.rows.map(({ rowid }) => rowid))),
-    new Set(rows.map(({ id }) => id)));
+  assert.ok(matches.every((event) => event.success), 'every native MATCH read must complete before acknowledgment');
+  assert.deepEqual(matches.flatMap((event) => event.rows.map(({ rowid }) => rowid)).sort((a, b) => a - b),
+    rows.map(({ id }) => id), 'FTS verification must return every requested identity exactly once');
   const requests = f.trace.filter((event) => ['query', 'batch'].includes(event.kind));
   assert.ok(requests.length <= 50, `dense copy must use bounded native RPCs, observed ${requests.length}`);
 });
