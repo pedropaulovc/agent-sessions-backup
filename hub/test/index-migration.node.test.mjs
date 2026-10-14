@@ -148,6 +148,7 @@ class SqliteD1 {
       }
       if (this.atomicBatch) this.database.exec('COMMIT');
       event.committed = true;
+      event.responseBytes = Buffer.byteLength(JSON.stringify(results));
       await this.afterBatch?.(event);
       return results;
     } catch (error) {
@@ -255,6 +256,7 @@ class WorkerdD1 {
     const results = await this.database.batch(statements.map(({ sql, params = [] }) =>
       this.database.prepare(sql).bind(...params)));
     event.committed = true;
+    event.responseBytes = Buffer.byteLength(JSON.stringify(results));
     for (let index = 0; index < calls.length; index += 1) {
       calls[index].rows = results[index].results;
       calls[index].responseBytes = Buffer.byteLength(JSON.stringify(results[index].results));
@@ -5065,6 +5067,37 @@ test('native full-copy control runs real SQLite schema, copier, independent read
       assert.deepEqual(call.rows, [{ rowid: row.id }], 'every statement needs its actual native posting identity');
     }
   }
+  const sliceBatches = adapters.flatMap(({ trace }) => trace.filter(({ kind, statements }) => kind === 'batch'
+    && statements.length > 0 && statements.every(({ sql }) => /^SELECT hex\(substr/.test(sql))));
+  assert.ok(sliceBatches.length > 0, 'independent full-byte transport must execute actual native slice batches');
+  for (const { db, statements, transaction, responseBytes } of sliceBatches) {
+    assert.ok(statements.length <= 100);
+    assert.ok(Buffer.byteLength(JSON.stringify({ batch: statements })) <= COPY_PAGE_BYTES);
+    const reserve = 4096 + statements.reduce((bytes, { params }) => bytes + params[1] * 2 + 4096, 0);
+    assert.ok(reserve <= COPY_PAGE_BYTES, 'known hex payloads plus conservative internal result/envelope reserves must stay bounded');
+    assert.ok(responseBytes <= COPY_PAGE_BYTES, 'the aggregate ACTUAL native result JSON must also fit the response budget');
+    const calls = adapters.find((adapter) => adapter.id === db).trace.filter((event) =>
+      event.kind === 'batch-statement' && event.transaction === transaction);
+    assert.equal(calls.length, statements.length);
+    for (const call of calls) {
+      assert.equal(call.success, true);
+      assert.equal(call.rows.length, 1);
+      assert.ok(call.params.every(Number.isSafeInteger));
+      assert.ok(call.params[0] >= 1 && call.params[1] > 0 && call.params[1] <= 131072);
+      assert.equal(call.rows[0].bytes.length, call.params[1] * 2);
+      assert.match(call.rows[0].bytes, /^[0-9a-f]+$/i);
+    }
+  }
+  assert.ok(sliceBatches.some(({ statements }) => statements.length > 1),
+    'actual independent slice transport must batch multiple real native statements');
+  assert.ok(sliceBatches.some(({ db, statements }, index) => {
+    const next = sliceBatches[index + 1];
+    const last = statements.at(-1);
+    if (!next || next.db !== db || !growthIds.has(last.params[2])
+      || next.statements[0].params[2] !== last.params[2] + 1) return false;
+    const reserved = 4096 + statements.reduce((bytes, { params }) => bytes + params[1] * 2 + 4096, 0);
+    return statements.length < 100 && reserved + next.statements[0].params[1] * 2 + 4096 > COPY_PAGE_BYTES;
+  }), 'actual adjacent growth slices must cross the conservative response-byte boundary, not just a count cap');
   assert.equal(result.ftsMatches, independentMatches.reduce((count, { rows }) => count + rows.length, 0),
     'summary FTS evidence must count the actual independent positive point and suffix hits');
   const requests = adapters.flatMap(({ trace }) => trace.filter(({ kind }) => ['query', 'batch'].includes(kind)));
@@ -5080,6 +5113,68 @@ test('native full-copy control runs real SQLite schema, copier, independent read
   assert.equal(new Set(account.created.map(({ name }) => name)).size, 3);
   for (const { name } of account.created) assert.match(name, /^pr-42-copy-[0-9a-f]{24}-(?:source|idx00|idx01)$/);
   assert.deepEqual(new Set(account.deleted.map(({ uuid }) => uuid)), new Set(account.created.map(({ uuid }) => uuid)));
+});
+
+test('native proof actual batched BLOB slice faults retain growth source and block acknowledgment', async (context) => {
+  for (const fault of ['missing-result', 'failed-statement', 'missing-row', 'truncated-hex', 'invalid-hex', 'invalid-utf8', 'reordered-results']) {
+    await context.test(fault, async (child) => {
+      const { account, adapters, proof } = await nativeScratchFixture(child);
+      const beforeAccount = account.snapshot();
+      const applySchema = proof.applySchema;
+      let exercised = false;
+      let sourceBefore;
+      let checkpointBefore;
+      let sourceTraceStart;
+      proof.applySchema = async (databases) => {
+        await applySchema(databases);
+        const shard = databases.shards[1];
+        const execute = shard.batch.bind(shard);
+        shard.batch = async (statements) => {
+          const actual = await execute(statements);
+          if (exercised || !statements.length || !statements.every(({ sql }) => /^SELECT hex\(substr/.test(sql))
+            || !statements.some(({ params }) => params[2] > 1461 && params[2] < INDEX_ID_SPAN - 1)) return actual;
+          const checkpoint = await readCheckpoint(databases.shards[0], COPY_CHECKPOINT);
+          if (checkpoint?.pending?.phase !== 'verified') return actual;
+          checkpointBefore = checkpoint;
+          sourceBefore = blockSnapshot(databases.source);
+          sourceTraceStart = databases.source.trace.length;
+          assert.equal(actual.length, statements.length);
+          assert.ok(actual.every(({ success, results }) => success && results.length === 1
+            && typeof results[0].bytes === 'string' && results[0].bytes.length > 2),
+          'faults must alter genuine executed SQLite slice results, never mock expected bytes');
+          exercised = true;
+          if (fault === 'missing-result') return actual.slice(1);
+          if (fault === 'failed-statement') return actual.map((result, index) =>
+            index ? result : { ...result, success: false });
+          if (fault === 'missing-row') return actual.map((result, index) =>
+            index ? result : { ...result, results: [] });
+          if (fault === 'reordered-results') {
+            assert.notEqual(actual[0].results[0].bytes, actual[1].results[0].bytes);
+            [actual[0], actual[1]] = [actual[1], actual[0]];
+          } else {
+            const row = actual[0].results[0];
+            row.bytes = fault === 'truncated-hex' ? row.bytes.slice(0, -2)
+              : `${fault === 'invalid-hex' ? 'GG' : 'FF'}${row.bytes.slice(2)}`;
+          }
+          return actual;
+        };
+      };
+      await assert.rejects(verifyNativeCopyControl(proof), (error) => {
+        assert.equal(error.nativeCopyPhase, 'growth-before-ack');
+        assert.equal(error.nativeCopyClass, 'assertion');
+        assert.equal(error.cause, undefined);
+        assert.ok(!`${error.message} ${error.stack} ${JSON.stringify(error)}`.includes('Ⱥ'.repeat(32)));
+        return true;
+      });
+      assert.equal(exercised, true);
+      assert.deepEqual(blockSnapshot(adapters[0]), sourceBefore, 'a rejected native slice batch must retain every exact source field and physical FTS page');
+      assert.deepEqual(await readCheckpoint(adapters[1], COPY_CHECKPOINT), checkpointBefore);
+      assert.deepEqual(adapters[0].trace.slice(sourceTraceStart).filter(({ sql }) => sql && isWrite(sql)), [],
+        'no source ACK or fence write may follow rejected independent full-byte evidence');
+      assert.deepEqual(account.snapshot(), beforeAccount);
+      assert.equal(account.deleted.length, 3);
+    });
+  }
 });
 
 test('scratch double failure preserves the primary diagnostic and attempts every safe owned cleanup', async (context) => {

@@ -164,6 +164,8 @@ const READBACK_PAGE_ROWS = 256;
 // rows. Only this independent proof reader uses the existing slice transport
 // above 16 KiB; the copier's source/readback budgets are unchanged.
 const READBACK_INLINE_BYTES = 16384;
+const READBACK_BATCH_STATEMENTS = 100;
+const READBACK_RESPONSE_RESERVE_BYTES = 4096;
 function sessionOn(shard) {
   for (let index = 0; ; index += 1) {
     const sessionId = `native-copy-会話-${shard}-${index}`;
@@ -214,6 +216,62 @@ function fixtures() {
   return { ordinary, long, dense, growth, rows: [...ordinaryRows, ...growth, long] };
 }
 
+// Execute the same native per-cell slices, packing requests AND their known hex
+// responses. The 4 KiB per-result/outer reserves are conservative internal policy,
+// not a native API limit; never widen the inline pages to hide response growth.
+async function readLongCells(db, cells, phase) {
+  let statements = [];
+  let slices = [];
+  let requestBytes = 12; // {"batch":[]}
+  let responseBytes = READBACK_RESPONSE_RESERVE_BYTES;
+  const flush = async () => {
+    const results = await db.batch(statements);
+    requireProof(Array.isArray(results) && results.length === slices.length
+      && Buffer.byteLength(JSON.stringify(results)) <= COPY_PAGE_BYTES, phase);
+    for (const [index, result] of results.entries()) {
+      const parts = result?.results;
+      const { cell, count, offset } = slices[index];
+      requireProof(result?.success === true && Array.isArray(parts) && parts.length === 1
+        && typeof parts[0].bytes === 'string' && parts[0].bytes.length === count * 2
+        && /^[0-9a-f]+$/i.test(parts[0].bytes) && cell.written === offset
+        && offset + count <= cell.length, phase);
+      requireProof(cell.bytes.write(parts[0].bytes, offset, count, 'hex') === count, phase);
+      cell.written += count;
+    }
+    statements = [];
+    slices = [];
+    requestBytes = 12;
+    responseBytes = READBACK_RESPONSE_RESERVE_BYTES;
+  };
+  for (const cell of cells) {
+    requireProof(Number.isSafeInteger(cell.row.id) && Number.isSafeInteger(cell.length)
+      && cell.length > READBACK_INLINE_BYTES && cell.bytes.length === cell.length, phase);
+    for (let offset = 0; offset < cell.length; offset += 131072) {
+      const count = Math.min(131072, cell.length - offset);
+      const statement = {
+        sql: `SELECT hex(substr(CAST(${quote(cell.column)} AS BLOB), ?, ?)) AS bytes FROM blocks WHERE id = CAST(? AS INTEGER)`,
+        params: [offset + 1, count, cell.row.id],
+      };
+      const bytes = Buffer.byteLength(JSON.stringify(statement));
+      const replyBytes = count * 2 + READBACK_RESPONSE_RESERVE_BYTES;
+      requireProof(12 + bytes <= COPY_PAGE_BYTES
+        && READBACK_RESPONSE_RESERVE_BYTES + replyBytes <= COPY_PAGE_BYTES, phase);
+      if (statements.length && (statements.length === READBACK_BATCH_STATEMENTS
+        || requestBytes + bytes + 1 > COPY_PAGE_BYTES || responseBytes + replyBytes > COPY_PAGE_BYTES)) await flush();
+      requestBytes += bytes + (statements.length ? 1 : 0);
+      responseBytes += replyBytes;
+      statements.push(statement);
+      slices.push({ cell, count, offset });
+    }
+  }
+  if (statements.length) await flush();
+  for (const { row, column, length, bytes, written } of cells) {
+    requireProof(written === length, phase);
+    try { row[column] = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes); }
+    catch { reject(phase); }
+  }
+}
+
 /** Independent native readback: TEXT is hex transported, long TEXT in bounded BLOB slices. */
 async function readRows(db, phase) {
   const selectors = BLOCK_COLUMNS.flatMap((column, index) => {
@@ -230,6 +288,7 @@ async function readRows(db, phase) {
     const result = await db.query(`SELECT ${selectors.join(',')} FROM blocks WHERE id > CAST(? AS INTEGER) ORDER BY id LIMIT ?`,
       [after, READBACK_PAGE_ROWS]);
     requireProof(result.length <= READBACK_PAGE_ROWS, phase);
+    const longCells = [];
     for (const encoded of result) {
       requireProof(Number.isSafeInteger(encoded.id) && encoded.id > after, phase);
       const row = {};
@@ -249,22 +308,15 @@ async function readRows(db, phase) {
           bytes = Buffer.from(value, 'hex');
         } else {
           requireProof(value === null, phase);
-          const chunks = [];
-          for (let offset = 0; offset < length; offset += 131072) {
-            const count = Math.min(131072, length - offset);
-            const parts = await db.query(`SELECT hex(substr(CAST(${quote(column)} AS BLOB), ?, ?)) AS bytes FROM blocks WHERE id = CAST(? AS INTEGER)`,
-              [offset + 1, count, encoded.id]);
-            requireProof(parts.length === 1 && typeof parts[0].bytes === 'string'
-              && parts[0].bytes.length === count * 2 && /^[0-9a-f]+$/i.test(parts[0].bytes), phase);
-            chunks.push(Buffer.from(parts[0].bytes, 'hex'));
-          }
-          bytes = Buffer.concat(chunks, length);
+          longCells.push({ row, column, length, bytes: Buffer.allocUnsafe(length), written: 0 });
+          continue;
         }
         row[column] = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
       }
       rows.push(row);
       after = row.id;
     }
+    if (longCells.length) await readLongCells(db, longCells, phase);
     if (result.length < READBACK_PAGE_ROWS) break;
   }
   return rows;

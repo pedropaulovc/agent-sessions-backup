@@ -110,8 +110,20 @@ changing the controller's 300 ms request pacing or bypassing any full-word check
 These independent point batches are not counted as copier split-probe groups.
 Independent sliced readback still checks all columns and the full-row SHA. The proof
 reader hex-transports values above 16 KiB in existing bounded BLOB slices so the
-growth rows cannot make its 256-row independent response exceed the byte budget;
-this does not change the copier's source-page or readback budgets. The shared
+growth rows cannot make its 256-row independent response exceed the byte budget.
+The unchanged native per-cell/per-offset 128 KiB slice queries are packed across
+long cells in each metadata page: at most 100 statements, an exact complete
+serialized `{batch: statements}` request at most 1 MiB, and known hex response bytes
+plus a conservative internal 4 KiB per-result/4 KiB outer reserve at most 1 MiB.
+Those reserves are internal policy, not a native API maximum. Actual aggregate
+result JSON must also fit 1 MiB; every statement must succeed with one full-length
+hex result. Safe origin IDs, exact offsets, length/alphabet and complete buffer
+coverage are checked before strict UTF-8 decode and full-row SHA. One known-length
+cell buffer is filled directly from hex; no truncated text or partially filled
+buffer escapes. Missing, failed, corrupt, truncated or byte-altering reordered
+native slice results must block source ACK. This changes only independent proof read batching,
+not the 16 KiB inline/256-row/128 KiB slice geometry, copier/source budgets, request
+pacing or CLI deadline. The shared
 after-NUL token still independently finds every dense row that actually carries it.
 The fixture has 1,509 rows total and retains the huge row's separate fallback.
 Later growth-page geometry is checked from real checkpoints rather than a pinned
@@ -122,6 +134,14 @@ retirement. Aggregate `maxFtsParametersBytes`, `maxUnsplitFtsParametersBytes` an
 `splitFtsProbePages` describe those actual requests/pages, never terms or contents.
 Proof also requires an empty source, a complete checkpoint, the three-trigger
 frozen writer fence, and a controlled write that is positively rejected.
+The CLI contract's failure diagnostics read complete appended events before fixture
+cleanup and expose only aggregate counts/byte maxima and an allowlisted last-query
+kind. `traceState` is `complete`, `truncated` for an ignored partial final NDJSON
+record, or `unavailable` with null counts if the trace cannot be read/validated.
+Malformed earlier records never become a falsely complete zero-count trace.
+Successful contract runs also print safe aggregate counts to measure actual paced
+completion. Neither diagnostics nor request-count upper bounds establish native
+failure cause or substitute for an observed finishing run.
 The proof command deletes every known created scratch database in `finally` on success or failure, still
 attempting the other owned deletions if one fails. Any deletion failure fails the job. Output is
 limited to static success, aggregate numeric/hash evidence, or static phase/class failures—never

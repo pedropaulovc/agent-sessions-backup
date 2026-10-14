@@ -62,6 +62,45 @@ function textEvidence(value) {
     : value;
 }
 
+// Public test diagnostics retain only aggregate numeric evidence and static kinds,
+// never the appended request SQL, parameters, fixture contents or provider text.
+function nativeControllerProgress(events, truncatedLastRecord = false) {
+  const unavailable = events === null;
+  events ??= [];
+  const count = (value) => unavailable ? null : value;
+  const requests = events.filter(({ kind, url }) => kind === 'request'
+    && new URL(url).hostname === 'api.cloudflare.com');
+  const statements = events.filter(({ kind }) => kind === 'probe-sql');
+  const sliceBatches = events.filter(({ kind }) => kind === 'native-slice-batch');
+  const queryKind = (event) => {
+    if (!event) return 'none';
+    if (/^\s*SELECT hex\(substr/.test(event.sql)) return 'blob-slice-read';
+    if (/\bMATCH\b/.test(event.sql)) return event.params.length === 2 ? 'fts-point-read' : 'fts-probe-group-read';
+    if (/^\s*WITH sized AS MATERIALIZED/.test(event.sql)) return 'copier-row-read';
+    if (/\bDELETE FROM blocks\b/.test(event.sql)) return 'source-retirement';
+    if (/^INSERT INTO blocks \(/.test(event.sql)) return 'block-write';
+    if (/index_migration_state/.test(event.sql)) return 'checkpoint';
+    if (/index_migration_freeze/.test(event.sql)) return 'source-fence';
+    return 'other';
+  };
+  return {
+    traceState: unavailable ? 'unavailable' : truncatedLastRecord ? 'truncated' : 'complete',
+    completeEvents: count(events.length),
+    cloudflareRequests: count(requests.length),
+    queryRequests: count(requests.filter(({ url }) => new URL(url).pathname.endsWith('/query')).length),
+    batchRequests: count(requests.filter(({ body }) => Array.isArray(body?.batch)).length),
+    executedStatements: count(statements.length),
+    blobSliceStatements: count(statements.filter((event) => queryKind(event) === 'blob-slice-read').length),
+    ftsPointStatements: count(statements.filter((event) => queryKind(event) === 'fts-point-read').length),
+    ftsProbeGroupStatements: count(statements.filter(({ ftsProbeIds }) => ftsProbeIds !== undefined).length),
+    sliceBatches: count(sliceBatches.length),
+    maxRequestBytes: count(Math.max(0, ...requests.map(({ bodyBytes }) => bodyBytes ?? 0))),
+    maxParametersBytes: count(Math.max(0, ...statements.map(({ parametersBytes }) => parametersBytes ?? 0))),
+    maxSliceBatchResponseBytes: count(Math.max(0, ...sliceBatches.map(({ responseBytes }) => responseBytes))),
+    lastSafeQueryKind: unavailable ? 'unavailable' : queryKind(statements.at(-1)),
+  };
+}
+
 async function runController(command, scenario = {}) {
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'preview-deployment-test-'));
   const hub = path.join(temporary, 'hub');
@@ -260,6 +299,7 @@ async function runController(command, scenario = {}) {
               }
               emit({ kind: 'probe-sql', databaseId: id, sql, params: params.map(textEvidence),
                 parametersBytes: Buffer.byteLength(JSON.stringify(params)),
+                responseRowsBytes: Buffer.byteLength(JSON.stringify(rows)),
                 ftsProbeIds: /\\bMATCH\\b/.test(sql) && params.length === 1 && params[0].startsWith('[')
                   ? JSON.parse(params[0]).map(([, rowid]) => rowid) : undefined,
                 rows: rows.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, textEvidence(value)]))) });
@@ -313,6 +353,11 @@ async function runController(command, scenario = {}) {
                   }
                   emit({ kind: 'probe-readback-fault', databaseId: id, phase, corruption });
                 }
+              }
+              if (${native} && body.batch && statements.every(({ sql }) => /^SELECT hex\\(substr/.test(sql))) {
+                emit({ kind: 'native-slice-batch', statementCount: statements.length,
+                  requestBytes: Buffer.byteLength(init.body), responseBytes: Buffer.byteLength(JSON.stringify(results)),
+                  reservedResponseBytes: 4096 + statements.reduce((bytes, { params }) => bytes + params[1] * 2 + 4096, 0) });
               }
               return response(results);
             } catch (error) {
@@ -405,16 +450,29 @@ async function runController(command, scenario = {}) {
         CLOUDFLARE_PPE_API_TOKEN: 'synthetic-cloudflare-token', PREVIEW_BEARER_SEED: SEED,
         GITHUB_TOKEN: 'synthetic-github-token' },
     });
-    const output = `${result.stdout}\n${result.stderr}`;
+    let output = `${result.stdout}\n${result.stderr}`;
     for (const secret of [SEED, 'synthetic-cloudflare-token', 'synthetic-github-token',
       'atomicity-private-provider-text', 'index_batch_atomicity_intentional_invalid_json',
       'ATOMICITY_CLEANUP_PRIVATE_CANARY',
       D1_BATCH_PROBE_TEXT, JSON.stringify(D1_BATCH_PROBE_TEXT).slice(1, -1)]) {
       assert.ok(!output.includes(secret), 'CLI evidence must not expose credentials, provider text or probe values');
     }
+    let failureProgress = '';
+    if (native && (result.error || result.status !== 0)) {
+      let progress = nativeControllerProgress(null);
+      try {
+        const lines = (await readFile(eventPath, 'utf8')).split('\n');
+        const truncatedLastRecord = lines.pop().length > 0;
+        progress = nativeControllerProgress(lines.map((line) => JSON.parse(line)), truncatedLastRecord);
+      } catch {
+        // Do not forward parsing/read errors: they may quote private event data.
+      }
+      failureProgress = `\nnativeProgress=${JSON.stringify(progress)}`;
+      output += failureProgress;
+    }
     if (result.error) {
       throw new Error(
-        `Failed to spawn ${command} controller (status=${result.status}, signal=${result.signal})\nstdout:\n${result.stdout ?? ''}\nstderr:\n${result.stderr ?? ''}`,
+        `Failed to spawn ${command} controller (status=${result.status}, signal=${result.signal})\nstdout:\n${result.stdout ?? ''}\nstderr:\n${result.stderr ?? ''}${failureProgress}`,
         { cause: result.error },
       );
     }
@@ -947,9 +1005,10 @@ for (const scenario of [
   });
 }
 
-test('native-copy-proof runs the real helper through CLI schema bindings and cleans only its scratch', async () => {
+test('native-copy-proof runs the real helper through CLI schema bindings and cleans only its scratch', async (context) => {
   const result = await runController('native-copy-proof', { existing: true, foreignCount: 1 });
   assert.equal(result.status, 0, result.output);
+  context.diagnostic(`nativeProgress=${JSON.stringify(nativeControllerProgress(result.events))}`);
   const summary = JSON.parse(result.stdout.trim().split('\n').at(-1));
   assert.equal(summary.state, 'verified');
   assert.equal(summary.probe, 'd1-native-full-copy');
@@ -1085,6 +1144,17 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
   const ordinaryWrites = sql.filter(({ databaseId, sql, params }) => databaseId !== 'created-1'
     && /^INSERT INTO blocks \(/.test(sql) && params.length === 1);
   assert.equal(summary.ordinaryPages, ordinaryWrites.length, 'ordinary page counts must reflect actual native writes');
+  const sliceBatches = result.events.filter(({ kind }) => kind === 'native-slice-batch');
+  assert.ok(sliceBatches.length > 0, 'the CLI must execute actual native full-byte slice batches');
+  assert.ok(sliceBatches.some(({ statementCount }) => statementCount > 1),
+    'the actual native CLI must pack multiple slice statements per request');
+  for (const { statementCount, requestBytes, responseBytes, reservedResponseBytes } of sliceBatches) {
+    assert.ok(statementCount > 0 && statementCount <= 100);
+    assert.ok(requestBytes <= 1_048_576);
+    assert.ok(reservedResponseBytes <= 1_048_576,
+      'known hex bytes plus conservative INTERNAL reserves must fit the response budget');
+    assert.ok(responseBytes <= 1_048_576, 'actual aggregate native result JSON must stay bounded too');
+  }
   // Each original growth word is independently probed before its source ACK as
   // well as after retirement; batched statements must retain actual native point hits.
   for (const row of growthRows) {
