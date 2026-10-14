@@ -355,8 +355,9 @@ describe('date-scoped reindex snapshots and parse completion', () => {
       parse_state: 'parsed', index_state: 'ready', content_hash: healthy.hash, canonical_file_id: healthy.fileId,
       reserved_at: null, reserved_by: null, reserved_reason: null, reservation_generation: 0,
     });
-    expect(healthyState.parsed_at !== null && healthyState.parsed_at >= DISPATCHED).toBe(true);
-    expect(healthyState.updated_at !== null && healthyState.updated_at >= DISPATCHED).toBe(true);
+    // Ingest completion must be newer than every fixture/transcript timestamp.
+    expect(healthyState.parsed_at !== null && healthyState.parsed_at > TO).toBe(true);
+    expect(healthyState.updated_at !== null && healthyState.updated_at > TO).toBe(true);
     expect(await state(reserved)).toEqual(before);
     const progressed = await status(accepted.job_id);
     let readinessEvidence: string | undefined;
