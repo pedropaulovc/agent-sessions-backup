@@ -6,7 +6,7 @@ import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import {
   ACTIVATION_CHECKPOINT, COPY_CHECKPOINT, READY_CHECKPOINT, SEED_CHECKPOINT, SOURCE_FREEZE_TABLE,
@@ -3870,7 +3870,7 @@ async function copyCliFixture(context) {
           return Response.json({ success: true, result });
         };
       `);
-      const result = spawnSync(process.execPath, ['--import', preload, copyCliController,
+      const result = spawnSync(process.execPath, ['--import', pathToFileURL(preload).href, copyCliController,
         'copy', '--config', configPath, '--pass-budget-ms', String(budget)], {
         encoding: 'utf8', timeout: 30_000,
         env: { ...process.env, NODE_NO_WARNINGS: '1', GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'push',
@@ -3881,7 +3881,13 @@ async function copyCliFixture(context) {
       });
       assert.ifError(result.error);
       assert.equal(result.signal, null);
-      const report = JSON.parse(await readFile(reportPath, 'utf8'));
+      let report;
+      try { report = JSON.parse(await readFile(reportPath, 'utf8')); }
+      catch {
+        const failure = result.stderr.includes('ERR_UNSUPPORTED_ESM_URL_SCHEME')
+          ? 'unsupported-esm-url-scheme' : 'report-unavailable';
+        throw new Error(`copy CLI fixture report unavailable: exit=${result.status} failure=${failure}`);
+      }
       return { ...result, ...report, budget };
     },
   };
