@@ -86,12 +86,62 @@ does not allocate scratch databases. The proof creates three unique PR-owned scr
 `pr-N-copy-<24hex>-source` and `pr-N-copy-<24hex>-{idx00,idx01}`.
 It applies every current `hub/migrations-index/` migration to
 the source and both scratch shards, then exercises the actual copier through native D1 REST using
-ordinary rows and a value larger than 1 MiB but smaller than 2,000,000 bytes to exercise the
-large-value fallback. Full-column SHA-256 readback must match the source exactly, preserving
-Unicode, a leading BOM, and embedded NUL bytes. FTS/MATCH must find tokens on both shards,
-including a token after an embedded NUL. The verified checkpoint must precede source-row
-retirement. Proof also requires an empty source, a complete checkpoint, the three-trigger frozen
-writer fence, and a controlled write that is positively rejected.
+ordinary rows, 1,461 small rows on the same dense shard with varied ASCII and modern-Unicode
+first terms, and a value larger than 1 MiB but smaller than 2,000,000 bytes to exercise the
+large-value fallback. Full-column SHA-256 readback must match all 18 source columns exactly,
+preserving Unicode, a leading BOM, and embedded NUL bytes. Before copying, independent native
+row-scoped queries require `alpha` to miss the public `🫠alpha` row while the whole `🫠alpha`
+term finds its exact identity. After copying, independent MATCH checks include that whole term,
+the whitespace-separated `🫠 alpha` control, a modern-emoji-only posting and a truly tokenless
+negative probe. Four additional standalone 33,001-byte CJK, modern-emoji, uppercase-Cyrillic
+and ø words exercise native term truncation without any later word to rescue a bad probe.
+Independent MATCH uses each full original valid word, not the copier's completed probe.
+Compact remaining dense prefixes preserve the original ordinary first-page geometry:
+one ordinary row and all 1,461 dense rows, including the four no-tail boundary words.
+After that dense phase, 46 distinct same-shard rows containing `a` plus 11,000 `Ⱥ`
+characters and a numeric suffix exercise native folding growth. Independent MATCH
+uses every ORIGINAL whole growth word, before its source ACK and after retirement.
+The unchanged row-scoped point SQL is sent in native read batches of at most the
+fixture's 46 growth rows, with each complete serialized `{batch: statements}`
+request at most 1 MiB. Every statement must succeed with exactly one safe, unique,
+actual native rowid matching its requested identity; requested-ID projection alone
+is not MATCH evidence. This avoids one paced HTTP request per point without
+changing the controller's 300 ms request pacing or bypassing any full-word check.
+These independent point batches are not counted as copier split-probe groups.
+Independent sliced readback still checks all columns and the full-row SHA. The proof
+reader hex-transports values above 16 KiB in existing bounded BLOB slices so the
+growth rows cannot make its 256-row independent response exceed the byte budget.
+The unchanged native per-cell/per-offset 128 KiB slice queries are packed across
+long cells in each metadata page: at most 100 statements, an exact complete
+serialized `{batch: statements}` request at most 1 MiB, and known hex response bytes
+plus a conservative internal 4 KiB per-result/4 KiB outer reserve at most 1 MiB.
+Those reserves are internal policy, not a native API maximum. Actual aggregate
+result JSON must also fit 1 MiB; every statement must succeed with one full-length
+hex result. Safe origin IDs, exact offsets, length/alphabet and complete buffer
+coverage are checked before strict UTF-8 decode and full-row SHA. One known-length
+cell buffer is filled directly from hex; no truncated text or partially filled
+buffer escapes. Missing, failed, corrupt, truncated or byte-altering reordered
+native slice results must block source ACK. This changes only independent proof read batching,
+not the 16 KiB inline/256-row/128 KiB slice geometry, copier/source budgets, request
+pacing or CLI deadline. The shared
+after-NUL token still independently finds every dense row that actually carries it.
+The fixture has 1,509 rows total and retains the huge row's separate fallback.
+Later growth-page geometry is checked from real checkpoints rather than a pinned
+page count. At least one logical same-shard page must have an unsplit serialized
+probe-parameter envelope above 1 MiB, while every actual group envelope stays at
+or below 1 MiB. All groups and the verified checkpoint must precede source-row
+retirement. Aggregate `maxFtsParametersBytes`, `maxUnsplitFtsParametersBytes` and
+`splitFtsProbePages` describe those actual requests/pages, never terms or contents.
+Proof also requires an empty source, a complete checkpoint, the three-trigger
+frozen writer fence, and a controlled write that is positively rejected.
+The CLI contract's failure diagnostics read complete appended events before fixture
+cleanup and expose only aggregate counts/byte maxima and an allowlisted last-query
+kind. `traceState` is `complete`, `truncated` for an ignored partial final NDJSON
+record, or `unavailable` with null counts if the trace cannot be read/validated.
+Malformed earlier records never become a falsely complete zero-count trace.
+Successful contract runs also print safe aggregate counts to measure actual paced
+completion. Neither diagnostics nor request-count upper bounds establish native
+failure cause or substitute for an observed finishing run.
 The proof command deletes every known created scratch database in `finally` on success or failure, still
 attempting the other owned deletions if one fails. Any deletion failure fails the job. Output is
 limited to static success, aggregate numeric/hash evidence, or static phase/class failures—never
@@ -345,14 +395,37 @@ The one-time cutover runs these operations in order, from the same checked-out m
    and leading UTF-8 BOM characters rather than shortening or normalizing them. A single
    oversized row uses individual value bindings instead of a too-large JSON scalar.
    Ordinary shard replacement is one atomic four-statement JSON1 batch, not per-row
-   HTTP requests. Each populated shard's MATCH verification uses one fixed JSON1
-   query with one JSON bind containing every `[quoted token, id]` probe. An outer
-   `json_each` joined to FTS correlates each token with its copied row; the rowid
-   comparison explicitly casts the JSON id to SQLite INTEGER. The statement gives
-   all probes one consistent native read snapshot without expanding SQL per row.
-7. For every page, compare SHA-256 canonical full-row readback and exercise real FTS
-   `MATCH` probes. Persist the verified page checkpoint on `IDX00` **before** deleting
-   its source rows. Each source `DELETE` compares **every** column with the verified
+   HTTP requests. Each populated shard's MATCH verification reuses one fixed JSON1
+   query with one JSON bind per byte-bounded group of `[quoted token, id]` probes.
+   The complete serialized parameters envelope, including JSON escaping, brackets,
+   quotes and commas, must be at most `COPY_PAGE_BYTES` (1 MiB). Each pair is encoded
+   once and an overflow pair is carried into the next group, without clipping,
+   prefix probes or skipping rows. A single oversized entry fails closed with a
+   static `fts-match` error. An outer `json_each` joined to FTS correlates each token
+   with its copied row; the rowid comparison explicitly casts the JSON id to SQLite
+   INTEGER. Each group has one native read snapshot, not a shared snapshot across
+   the whole page; the unchanged maintenance drain/quiescence, source comparison
+   and checkpoint/writer fences remain required across groups. Each response must
+   contain only safe INTEGER IDs requested by THAT group, without duplicates in
+   that response or earlier groups. Positive native terms and tokenless negatives
+   must all verify before any page is persisted as verified or acknowledged.
+   This 1 MiB serialized-parameter budget is internal policy, not a native API
+   rejection threshold or REST body cap. D1's documented maximum string size is
+   2,000,000 bytes ([D1 limits](https://developers.cloudflare.com/d1/platform/limits/)).
+   Probe terms come from one scoped, reusable in-memory native SQLite FTS index, cloned
+   from the actual destination `sqlite_master` FTS declaration. `fts5vocab` instance
+   offset zero supplies the first real indexed term as raw BLOB bytes. Strict UTF-8
+   decoding preserves a BOM rather than silently dropping it or replacing malformed bytes.
+   Only a trailing partial UTF-8 sequence may be completed, and native byte identity
+   plus a local original-row MATCH must verify the candidate before the unchanged
+   destination MATCH. There is no JavaScript Unicode-category approximation, separate
+   tokenizer configuration, source-text clipping, skipped word or later-term fallback.
+   Truly tokenless rows require a negative MATCH result, while modern emoji that
+   unicode61 indexes require a positive posting just like every other native term.
+7. For every page, compare SHA-256 canonical full-row readback and exercise every
+   real FTS `MATCH` probe group. Only after ALL groups pass, persist the verified page
+   checkpoint on `IDX00` **before** deleting its source rows. Each source `DELETE`
+   compares **every** column with the verified
    full-row snapshot using null-safe `IS` predicates; comparison and deletion run in
    one main D1 transaction. A late changed row is retained and stops cursor advancement.
    No main schema change or migration-ledger write precedes this proof. The first
@@ -475,7 +548,7 @@ its relative imports). Set `INDEX_COPY_MODULE_PATH` to its absolute `file:` URL
 and run:
 
 ```sh
-node --test --test-name-pattern='^native workerd actual copier verifies 1461 same-shard rows' hub/test/index-migration.node.test.mjs
+node --test --test-name-pattern='^native workerd actual copier tokenizer boundaries verify 1461 same-shard rows' hub/test/index-migration.node.test.mjs
 ```
 
 The historical copier must fail with the native compound-select rejection.
@@ -488,6 +561,153 @@ Source paging remains at most 2,048 rows and roughly 1 MiB, with full-column SHA
 source comparison and writer fencing unchanged. Local workerd evidence is not
 real PPE D1 REST proof or production recovery evidence; those require their own
 isolated native-copy CI run and protected production observation, respectively.
+
+Native folding can increase probe UTF-8 bytes beyond the source page's serialized
+size. A prior controlled local workerd case accepted a 1,508,093-byte unsplit
+parameter envelope for 46 `a` + 11,000 `Ⱥ` words plus two ASCII rows, with complete
+native MATCH/full-row SHA/verified-before-ACK evidence. That demonstrates an
+internal 1 MiB budget violation, **not** a reproduced native D1 rejection or a
+production-cause diagnosis. The byte-bounded verifier now measures the complete
+escaped outer params envelope exactly rather than reserving an arbitrary fraction
+of the source-page budget. All groups must succeed before the existing verified
+checkpoint/ACK boundary.
+
+The permanent SQLite and Miniflare/workerd fold-growth regressions copy that
+same-shard geometry, independently probe ORIGINAL whole valid words and preserve
+all 18 columns/full UTF-8/full-row SHA. A physical missing posting in a later group
+must retain exact source rows, native FTS pages, cursor and pending/copying checkpoint;
+earlier groups remain real positive controls. Separate genuine-hit controls reject
+identities that belong to a different group, even when they belong to the page.
+For the exact pre-budget `4c5cb33696a2a6c1fd39f75e71b3b3209a1544ff` historical
+module, materialize a temporary sibling and set `INDEX_COPY_MODULE_PATH` to its
+absolute `file:` URL:
+
+```sh
+node --test --test-name-pattern='fold-growth (probe budget|later missing posting)' hub/test/index-migration.node.test.mjs
+```
+
+The older copier must still complete the positive native copy and retirement,
+then fail the new **internal parameter-budget** assertion. Its physical-missing-
+posting negative control must still reject before ACK. With the override unset,
+the current copier must use actual split groups, obey every serialized envelope
+bound and preserve both positive/negative semantics. Run the full fold-growth
+identity coverage with `--test-name-pattern='fold-growth'`. Remove only the
+temporary historical module created for the control; do not commit it. The expanded
+real-CF fixture must be exercised by a fresh isolated `native-copy-proof` run:
+local regressions or static packing calculations do not prove its deployed page
+geometry, native REST behavior or production recovery.
+
+
+A later protected pass at `67cdc05ff2e72888856b34e4e464c875a052e88f`
+stopped on 2026-10-13 at approximately 03:30 UTC with the semantic
+`FTS MATCH verification failed` guard, rather than the older native compound-select
+rejection. The normal enrolled health observation at 03:55:12 UTC still showed
+maintenance mode at that revision with sixteen shards. No production transcript term,
+pending page, source acknowledgment or copy progress was observed; neither this
+failure message nor that health response identifies the production cause or proves recovery.
+
+The exact unchanged `67cdc05` copier and actual migration schema have a separate
+demonstrated local failure mechanism in native SQLite and Miniflare/workerd:
+public text `🫠alpha copiersuffix` is indexed by configured unicode61 with first term
+`🫠alpha`, but the former JavaScript Unicode regex chose `alpha`. Independent native
+row-scoped MATCH returned no `alpha` hit and exactly the requested identity for
+`🫠alpha`; the actual grouped JSON query agreed. Full destination rows and UTF-8
+bytes remained intact, while the full source rows/postings stayed unchanged and the
+checkpoint remained pending/copying with zero acknowledged rows and cursor `-1`.
+The whitespace-separated `🫠 alpha` control passed. Six different ASCII first terms
+on the same shard also matched their independent point queries and completed copying.
+Other public adjacent/embedded post-Unicode-6.1 emoji, Bitcoin and U+1CF00 cases
+reproduced the token-boundary disagreement. These observations demonstrate a native
+unicode61-versus-current-JavaScript tokenization mismatch, not a JSON query-planner
+or transport defect and not the cause of the unseen production page.
+
+The replacement oracle reads each used destination's actual FTS declaration once
+per operation and keeps that SQL, transcript text and derived terms in memory only.
+Its native database and prepared statements are reused for every row/page, indexing
+at most one row at a time; a `finally` closes the resource on copy/verification
+success, native failure, gate failure or checkpoint failure. Initialization and
+derivation/closure failures expose only the static `fts-tokenizer-schema` or
+`fts-tokenizer` invariant at `copy-fts-match`, never local native messages, SQL,
+tokens or transcript bytes. The full-row SHA, exact identity checks, checkpoint
+ordering, source comparison/acknowledgment and writer fence are unchanged.
+
+Native review of the initial oracle at `a169514` demonstrated a separate local
+long-word regression before release: FTS5's 32,768-byte term limit can split a
+multi-byte UTF-8 character. Reading that vocabulary term as SQLite TEXT loses the
+raw suffix bytes by decoding them as U+FFFD, so the quoted replacement-character
+probe misses even though the full valid original word is searchable. Actual
+Miniflare/workerd copies rejected ten 40–45 KB public CJK, modern-emoji, Cyrillic
+and ø cases, including single words with no later term. All destination columns
+and text bytes were intact; the exact source rows/FTS remained and the checkpoint
+stayed pending/copying with zero acknowledged rows and cursor `-1`. Four ASCII,
+diacritic-folded and valid/aligned UTF-8 controls completed.
+
+The byte-preserving repair strictly decodes the BLOB first. If decoding fails,
+every earlier byte must be valid and only the final incomplete UTF-8 sequence may
+be completed. It enumerates at most 4,096 valid suffix candidates using UTF-8's
+valid continuation ranges, with one reused sequence buffer. A candidate is accepted
+only when indexing it alone through the actual native tokenizer yields exactly one
+term whose raw bytes equal the original stored term. The oracle then restores the
+full original row and requires a positive row-scoped whole-candidate MATCH before
+the unchanged actual-D1 grouped MATCH. This does not reconstruct or alter source
+text, assume zero padding or folding, use a synthetic prefix, skip the term or rely
+on a later word. Non-trailing corruption, exhausted candidates or failed native
+identity/MATCH are static `fts-tokenizer` failures and authorize no acknowledgment.
+
+One local native SQLite 3.51.2 review sweep verified all 17,593 distinct partial
+prefixes of native unicode61 token characters through both exact native term-byte
+identity and original-row MATCH, with at most 247 valid candidates observed. The
+generated repair also completed all fourteen actual Miniflare/workerd full-copy
+cases. Those are retained local reviewer observations, not permanent implementation
+statistics, Node/Windows-wide proof or real Cloudflare evidence. Permanent regressions
+exercise full no-tail words, folded/aligned controls, read-only verification and
+physical missing postings rather than constructor wiring or allocation-count hooks.
+The real-PPE fixture's four 33,001-byte no-tail words exercise the same truncation
+boundaries while preserving the dense ordinary-page and long-row fallback proof.
+
+To isolate this long-term regression, materialize the exact `a169514` module as a
+temporary sibling of `hub/scripts/lib/index-migration.mjs`, preserving relative
+imports, and set `INDEX_COPY_MODULE_PATH` to its absolute `file:` URL:
+
+```sh
+node --test --test-name-pattern='native tokenizer.*long|native workerd.*long' hub/test/index-migration.node.test.mjs
+```
+
+The no-tail CJK, modern-emoji, Cyrillic and ø copier cases must expose the former
+lossy-term MATCH rejection before acknowledgment; ASCII/folded/aligned controls
+retain their positive meaning. Run with the override unset for the repaired copier
+and remove the historical module afterward. These long-word controls substitute
+both the copier and read-only verifier from the selected historical module.
+
+The preceding short-term-only native PPE proof on PR #176 at head `c32add7` was observed
+on 2026-10-13 at 04:39:08 UTC in Actions run `38511682800`, job `115682982238`.
+It verified all 18 columns, 1,463 rows/1,461 dense rows, two shards, two ordinary
+pages, one long fallback, the full-row SHA and three source fences, with native
+`legacyProbeMatches=0` and `nativeProbeMatches=1`. That run predates the expanded
+no-tail B3 fixture: it proves the short modern-Unicode counterexample and existing
+full-copy protocol, not the new long-term byte completion or production recovery.
+
+For the revision-level before-control, materialize the exact `67cdc05` module as a
+temporary sibling of `hub/scripts/lib/index-migration.mjs`, preserving relative
+imports, then set `INDEX_COPY_MODULE_PATH` to its absolute `file:` URL:
+
+```sh
+node --test --test-name-pattern='native tokenizer|configured FTS tokenizer|missing FTS posting|native workerd.*tokenizer' hub/test/index-migration.node.test.mjs
+```
+
+The short adjacent-modern-Unicode copy regressions expose the old semantic MATCH
+rejection; ASCII, whitespace-separated and truly tokenless controls remain meaningful.
+Some long valid-word controls already pass `67cdc05`; the separate `a169514` control
+above isolates the native TEXT-decoding regression rather than misattributing it.
+Run the same command with `INDEX_COPY_MODULE_PATH` unset for the native-derived
+control, and remove the historical module afterward. A missing real modern-emoji-only
+posting must now fail rather than being mislabeled tokenless. The real-CF isolated
+fixture uses the current copier only: its independent `alpha` miss and whole-term
+hit are the native tokenizer counterexample, followed by current full-copy/SHA/
+checkpoint/fence evidence. It ships no historical copier, old-regex implementation
+or guard bypass. The proof's `legacyProbeMatches=0` and `nativeProbeMatches=1` are
+aggregate public synthetic evidence, not production diagnostics. Neither local
+controls nor a later PPE proof establish production cause, acknowledgment or recovery.
 
 The isolated native-copy proof preserves the copier's static operation phase and
 reports its own invariant failures as `class=assertion invariant=<allowlisted code>`

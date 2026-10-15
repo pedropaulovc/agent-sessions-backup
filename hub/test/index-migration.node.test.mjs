@@ -9,7 +9,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
 import {
-  ACTIVATION_CHECKPOINT, COPY_CHECKPOINT, READY_CHECKPOINT, SEED_CHECKPOINT, SOURCE_FREEZE_TABLE,
+  ACTIVATION_CHECKPOINT, COPY_CHECKPOINT, COPY_PAGE_BYTES, READY_CHECKPOINT, SEED_CHECKPOINT, SOURCE_FREEZE_TABLE,
   assertActivationProof, assertMaintenanceHealth, assertReadyProof, buildActivationProof, buildReadyProof, canonicalRow,
   classifyIndexMigration, copyFrozenIndex, initializeShardLayouts, readCheckpoint, reconcileIndexCatalog, rowDigest,
   seedFrozenCatalog, sourceCopyForecast, verifyIndexRecords, writeCheckpoint,
@@ -36,8 +36,9 @@ import {
 // exports still execute the load-bearing pending/active assertions rather than failing import.
 const classifyActivation = process.env.INDEX_CLASSIFICATION_MODULE_PATH
   ? (await import(process.env.INDEX_CLASSIFICATION_MODULE_PATH)).classifyIndexMigration : classifyIndexMigration;
-const copyWithNativeParameters = process.env.INDEX_COPY_MODULE_PATH
-  ? (await import(process.env.INDEX_COPY_MODULE_PATH)).copyFrozenIndex : copyFrozenIndex;
+const nativeParameters = process.env.INDEX_COPY_MODULE_PATH
+  ? await import(process.env.INDEX_COPY_MODULE_PATH) : { copyFrozenIndex, verifyIndexRecords };
+const { copyFrozenIndex: copyWithNativeParameters, verifyIndexRecords: verifyWithNativeParameters } = nativeParameters;
 const consumerControl = process.env.INDEX_CONTROL_MODULE_PATH
   ? await import(process.env.INDEX_CONTROL_MODULE_PATH) : { pauseConsumers };
 const diagnosticClient = consumerControl.indexControlClient ?? indexControlClient;
@@ -147,6 +148,7 @@ class SqliteD1 {
       }
       if (this.atomicBatch) this.database.exec('COMMIT');
       event.committed = true;
+      event.responseBytes = Buffer.byteLength(JSON.stringify(results));
       await this.afterBatch?.(event);
       return results;
     } catch (error) {
@@ -254,6 +256,7 @@ class WorkerdD1 {
     const results = await this.database.batch(statements.map(({ sql, params = [] }) =>
       this.database.prepare(sql).bind(...params)));
     event.committed = true;
+    event.responseBytes = Buffer.byteLength(JSON.stringify(results));
     for (let index = 0; index < calls.length; index += 1) {
       calls[index].rows = results[index].results;
       calls[index].responseBytes = Buffer.byteLength(JSON.stringify(results[index].results));
@@ -314,12 +317,15 @@ async function nativeSnapshot(db) {
   return { blocks: results[0].results, ftsData: results[1].results, ftsIndex: results[2].results };
 }
 
-function nativeDenseRows(count) {
+function nativeDenseRows(count, { tokenizerBoundaries = false } = {}) {
   const session_id = sessionOn(1);
+  const cases = tokenizerBoundaries ? nativeTokenizerBoundaryCases() : [];
   return Array.from({ length: count }, (_, index) => ({
     id: index + 1, session_id, file_id: 0, turn_index: 0, block_index: index,
     role: null, btype: 'text', tool_name: null, ts: '', byte_start: 0, byte_len: 0,
-    truncated: 0, text: 'nativedensevisible\u0000 nativedensesuffix', on_main_path: 1,
+    truncated: 0, text: cases[index]?.only ? cases[index].text
+      : `${cases[index]?.text ?? (tokenizerBoundaries ? `v${index}` : 'nativedensevisible')}\u0000 nativedensesuffix`,
+    on_main_path: 1,
     row_hash: index + 1, media_byte_start: null, media_byte_len: 0, media_type: '',
   }));
 }
@@ -361,6 +367,91 @@ function seedBlocks(source, rows, columns = BLOCK_COLUMNS) {
   }
 }
 
+function nativeTokenizerBoundaryCases() {
+  return [
+    ...['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot'].map((word) => ({
+      text: `nativevaried${word}`, tokens: [`nativevaried${word}`],
+    })),
+    { text: '🫠alpha', tokens: ['🫠alpha'], absent: ['alpha'] },
+    { text: '🫠 alpha', tokens: ['🫠', 'alpha'] },
+    { text: '🧮alpha', tokens: ['🧮alpha'], absent: ['alpha'] },
+    { text: '🧠alpha', tokens: ['🧠alpha'], absent: ['alpha'] },
+    { text: '🛠alpha', tokens: ['🛠alpha'], absent: ['alpha'] },
+    { text: 'al🫠pha', tokens: ['al🫠pha'], absent: ['al', 'pha'] },
+    { text: '₿alpha', tokens: ['₿alpha'], absent: ['alpha'] },
+    { text: '\u{1CF00}alpha', tokens: ['\u{1CF00}alpha'], absent: ['alpha'] },
+    { text: '🫠', tokens: ['🫠'], absent: ['index-migration-tokenless-probe', 'alpha'], only: true },
+    { text: '! ? : ; ( ) [ ] { } \t\n\u0000', tokens: [],
+      absent: ['index-migration-tokenless-probe', '🫠', 'alpha'], only: true },
+    ...[`a${'中'.repeat(11000)}`, `a${'🫠'.repeat(8250)}`,
+      `a${'Ж'.repeat(16500)}`, `a${'ø'.repeat(16500)}`].map((text) => ({
+      text, tokens: [text], only: true,
+    })),
+  ];
+}
+
+async function assertNativeTokenizerBoundaryMatches(db, rows) {
+  for (const [index, { tokens, absent = [] }] of nativeTokenizerBoundaryCases().entries()) {
+    const row = rows[index];
+    for (const [terms, present] of [[tokens, true], [absent, false]]) {
+      for (const term of terms) {
+        assert.deepEqual(await db.rows(
+          'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = CAST(? AS INTEGER)',
+          [`"${term.replaceAll('"', '""')}"`, row.id],
+        ), present ? [{ rowid: row.id }] : [],
+        'native whole terms and old alpha/al misses must agree on actual source and destination postings');
+      }
+    }
+  }
+}
+
+function nativeLongWordCases() {
+  // These original full words use the reviewer's actual 40k/45k native geometries.
+  // No expectation is computed from the copier's repaired or truncated probe.
+  const cjk = '中'.repeat(15000);
+  const emoji = '🫠'.repeat(10000);
+  return [
+    { name: 'cjk-notail-cut1', text: `a${cjk}`, tokens: [`a${cjk}`] },
+    { name: 'cjk-notail-cut2', text: `abc${cjk}`, tokens: [`abc${cjk}`] },
+    { name: 'cjk-tail', text: `a${cjk} tail`, tokens: [`a${cjk}`, 'tail'] },
+    { name: 'modernemoji-notail-cut3', text: `a${emoji}`, tokens: [`a${emoji}`] },
+    { name: 'modernemoji-notail-cut2', text: `ab${emoji}`, tokens: [`ab${emoji}`] },
+    { name: 'modernemoji-notail-cut1', text: `abc${emoji}`, tokens: [`abc${emoji}`] },
+    { name: 'modernemoji-tail', text: `a${emoji} tail`, tokens: [`a${emoji}`, 'tail'] },
+    { name: 'cyrillic-lower-notail', text: `a${'ж'.repeat(20000)}`, tokens: [`a${'ж'.repeat(20000)}`] },
+    { name: 'cyrillic-upper-fold-changing-notail', text: `a${'Ж'.repeat(20000)}`,
+      tokens: [`a${'Ж'.repeat(20000)}`, `a${'ж'.repeat(20000)}`] },
+    { name: 'oslash-notail', text: `a${'ø'.repeat(20000)}`, tokens: [`a${'ø'.repeat(20000)}`] },
+    { name: 'control-ascii-notail', text: 'a'.repeat(40000), tokens: ['a'.repeat(40000)] },
+    { name: 'control-fold-eacute-notail', text: `a${'é'.repeat(20000)}`,
+      tokens: [`a${'é'.repeat(20000)}`, `a${'e'.repeat(20000)}`] },
+    { name: 'control-ascii-then-eacute-tail', text: `${'x'.repeat(32767)}éy tail`,
+      tokens: [`${'x'.repeat(32767)}éy`, 'tail'] },
+    { name: 'control-cjk-validutf8-aligned-notail', text: `ab${cjk}`, tokens: [`ab${cjk}`] },
+  ];
+}
+
+async function storedBlockSnapshot(db) {
+  return db instanceof SqliteD1 ? blockSnapshot(db) : nativeSnapshot(db);
+}
+
+async function assertNativeLongWordIdentity(db, row, tokens, { posting = true } = {}) {
+  const stored = await db.rows('SELECT * FROM blocks WHERE id = ?', [row.id]);
+  assert.deepEqual(stored, [row], 'all 18 original columns must survive native storage and copy');
+  const [bytes] = await db.rows('SELECT hex(CAST(text AS BLOB)) AS bytes FROM blocks WHERE id = ?', [row.id]);
+  assert.equal(bytes.bytes, Buffer.from(row.text).toString('hex').toUpperCase(),
+    'native storage must preserve every byte of the original full valid UTF-8 word');
+  assert.equal(rowDigest(BLOCK_COLUMNS, stored[0]), sha256(JSON.stringify(BLOCK_COLUMNS.map((column) => row[column]))),
+    'full-row SHA must include all 18 columns, not only the indexed word');
+  for (const term of tokens) {
+    assert.deepEqual(await db.rows(
+      'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = CAST(? AS INTEGER)',
+      [`"${term.replaceAll('"', '""')}"`, row.id],
+    ), posting ? [{ rowid: row.id }] : [],
+    'independent native MATCH must use the original whole valid word, including native folding');
+  }
+}
+
 function blockSnapshot(db) {
   return {
     blocks: db.rows('SELECT * FROM blocks ORDER BY id'),
@@ -370,6 +461,16 @@ function blockSnapshot(db) {
   };
 }
 
+function nativeSourceTokenRows(source) {
+  // Read independent physical row membership, not the copier's tokenizer or a JS
+  // Unicode approximation. Raw terms may end in partial UTF-8; never decode them into MATCH probes.
+  // This TEMP view does not mutate legacy FTS pages.
+  source.database.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS temp.__test_source_fts_vocab
+    USING fts5vocab(main, blocks_fts, 'instance')`);
+  return new Set(source.rows(`SELECT doc FROM temp.__test_source_fts_vocab
+    WHERE col = 'text' AND offset = 0 ORDER BY doc`).map(({ doc }) => doc));
+}
+
 function assertCopied(f, rows) {
   assert.deepEqual(f.source.rows('SELECT * FROM blocks'), []);
   for (let index = 0; index < f.shards.length; index += 1) {
@@ -377,13 +478,6 @@ function assertCopied(f, rows) {
     const expected = rows.filter((row) => indexShardForSessionId(row.session_id, f.shards.length) === index)
       .sort((left, right) => left.id - right.id);
     assert.deepEqual(shard.rows('SELECT * FROM blocks ORDER BY id'), expected);
-    for (const row of expected.filter((row) => row.text)) {
-      const token = row.text.match(/[\p{L}\p{N}\p{Co}_.-][\p{L}\p{N}\p{M}\p{Co}_.-]*/u)?.[0];
-      if (token) assert.deepEqual(shard.rows(
-        'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = ?',
-        [`"${token.replaceAll('"', '""')}"`, row.id],
-      ), [{ rowid: row.id }]);
-    }
     shard.database.exec("INSERT INTO blocks_fts (blocks_fts, rank) VALUES ('integrity-check', 1)");
   }
 }
@@ -413,6 +507,7 @@ function destinationBatchCount(f) {
 }
 
 function assertVerifiedBeforeDelete(f) {
+  const tokenRows = nativeSourceTokenRows(f.source);
   let verifiedRows = 0;
   const beforeSourceStatement = ({ sql }) => {
     if (!isWrite(sql)) return;
@@ -437,13 +532,11 @@ function assertVerifiedBeforeDelete(f) {
       assert.ok(reads.some((event) => event.rows.some((row) => row.id === item.id
         && Object.hasOwn(row, 'text') && rowDigest(checkpoint.columns, row) === item.sha256)),
       `block ${item.id} must have a successful full-row adapter readback before source deletion`);
-      const destination = shard.rows('SELECT * FROM blocks WHERE id = ?', [item.id])[0];
-      const hasToken = typeof destination.text === 'string'
-        && /[\p{L}\p{N}\p{Co}_.-]/u.test(destination.text);
+      const hasToken = tokenRows.has(item.id);
       assert.ok(f.trace.some((event) => event.db === shard.id && ['query', 'batch-statement'].includes(event.kind)
         && event.success && /\bMATCH\b/i.test(event.sql)
         && JSON.parse(event.params[0]).some(([, id]) => id === item.id)
-        && (!hasToken || event.rows.some((row) => row.rowid === item.id))),
+        && event.rows.some((row) => row.rowid === item.id) === hasToken),
       `successful adapter FTS MATCH for block ${item.id} must precede source deletion`);
     }
     verifiedRows += checkpoint.pending.rows.length;
@@ -777,15 +870,17 @@ test('actual copier MATCH SQL preserves shared-term row identities with uncoerce
   assertReadonlyEvidenceCalls(f);
 });
 
-test('native workerd actual copier verifies 1461 same-shard rows and excludes an outside-probe MATCH before source acknowledgment', async (context) => {
+test('native workerd actual copier tokenizer boundaries verify 1461 same-shard rows before source acknowledgment', async (context) => {
   const f = await workerdFixture(context);
-  const rows = nativeDenseRows(1461);
+  const rows = nativeDenseRows(1461, { tokenizerBoundaries: true });
+  const boundaryCases = nativeTokenizerBoundaryCases();
   const ids = rows.map(({ id }) => id);
   const outside = { ...rows[0], id: 1462, block_index: 1462, row_hash: 1462 };
   await seedWorkerdBlocks(f.source, rows);
   await seedWorkerdBlocks(f.shards[1], [outside]);
   const before = await nativeSnapshot(f.source);
   assert.deepEqual(before.blocks, rows, 'native source must store every complete tuple, including text past NUL');
+  await assertNativeTokenizerBoundaryMatches(f.source, rows);
   f.trace.length = 0;
   let verifiedBeforeAck = false;
   let acknowledgedRows = 0;
@@ -799,8 +894,8 @@ test('native workerd actual copier verifies 1461 same-shard rows and excludes an
   };
   f.source.beforeQuery = beforeSourceWrite;
   f.source.beforeStatement = beforeSourceWrite;
-  // This is the historical-module injection seam, not the helper's imported copier.
-  // The exact pre-fix module must reach its native compound-select rejection here.
+  // The historical-module seam must execute the actual older copier and expose
+  // its Unicode-version mismatch, not substitute the current implementation.
   const copied = await copyWithNativeParameters(f.args({ checkpointHook: async (state) => {
     if (state.pending?.phase !== 'verified') return;
     assert.deepEqual(state.pending.rows.map(({ id }) => id), ids, 'the dense fixture must be verified as one complete source page');
@@ -819,8 +914,10 @@ test('native workerd actual copier verifies 1461 same-shard rows and excludes an
     const matchRows = f.trace.filter((event) => event.db === f.shards[1].id
       && ['query', 'batch-statement'].includes(event.kind) && /\bMATCH\b/i.test(event.sql));
     assert.ok(matchRows.every((event) => event.success));
-    assert.deepEqual(matchRows.flatMap((event) => event.rows.map(({ rowid }) => rowid)).sort((a, b) => a - b), ids,
-      'shared MATCH terms must return every requested id once and never the matching outside-probe id');
+    assert.deepEqual(matchRows.flatMap((event) => event.rows.map(({ rowid }) => rowid)).sort((a, b) => a - b),
+      rows.filter((_row, index) => boundaryCases[index]?.tokens.length !== 0).map(({ id }) => id),
+      'native-token rows need one hit; truly tokenless rows and the outside-probe id need none');
+    await assertNativeTokenizerBoundaryMatches(f.shards[1], rows);
     verifiedBeforeAck = true;
   } }));
   assert.equal(copied.state, 'complete');
@@ -831,10 +928,11 @@ test('native workerd actual copier verifies 1461 same-shard rows and excludes an
   assert.deepEqual(after.ftsData, before.ftsData, 'source acknowledgment must not issue legacy FTS mutations');
   assert.deepEqual(after.ftsIndex, before.ftsIndex);
   assert.deepEqual(await f.shards[1].rows('SELECT * FROM blocks ORDER BY id'), [...rows, outside]);
-  for (const token of ['nativedensevisible', 'nativedensesuffix']) {
-    assert.deepEqual(await f.shards[1].rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? ORDER BY rowid',
-      [`"${token}"`]), [...ids, outside.id].map((rowid) => ({ rowid })), 'independent native MATCH must retain tokens before and after NUL');
-  }
+  await assertNativeTokenizerBoundaryMatches(f.shards[1], rows);
+  assert.deepEqual(await f.shards[1].rows(
+    'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? ORDER BY rowid', ['"nativedensesuffix"'],
+  ), [...rows, outside].filter(({ text }) => text.includes('\u0000 nativedensesuffix')).map(({ id }) => ({ rowid: id })),
+  'the independent common suffix must include exactly the rows whose stored text has the post-NUL suffix');
   assert.deepEqual(await f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
   assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).state, 'complete');
   assertAtomicBlockBatches(f);
@@ -890,9 +988,328 @@ test('native workerd copier rejects missing, wrong, duplicate and out-of-probe M
   }
 });
 
-test('actual configured FTS tokenizer preserves empty, punctuation, Unicode and shared after-NUL copy results', async (context) => {
+for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerdFixture]]) {
+  test(`native ${backend} fold-growth probe budget copies a complete same-shard page before acknowledgment`, async (context) => {
+    const f = await createFixture(context);
+    const word = `a${'Ⱥ'.repeat(11000)}`;
+    const rows = nativeDenseRows(48).map((row, index) => ({
+      ...row, text: index < 46 ? word : `foldgrowthascii${index}`,
+    }));
+    const sourceBytes = Buffer.byteLength(`[${rows.map((row) => canonicalRow(BLOCK_COLUMNS, row)).join(',')}]`);
+    assert.ok(sourceBytes < COPY_PAGE_BYTES, 'the unexpanded original words must fit one canonical source page');
+    if (backend === 'SQLite') seedBlocks(f.source, rows);
+    else await seedWorkerdBlocks(f.source, rows);
+    const before = await storedBlockSnapshot(f.source);
+    for (const row of rows) await assertNativeLongWordIdentity(f.source, row, [row.text]);
+    f.trace.length = 0;
+    let verifiedBeforeAck = false;
+    let acknowledgedRows = 0;
+    const beforeSourceWrite = async ({ sql }) => {
+      if (!isWrite(sql)) return;
+      const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      assert.equal(checkpoint.pending?.phase, 'verified');
+      assert.equal(verifiedBeforeAck, true, 'all full-word/native/full-row evidence must precede every source write');
+      if (/\bDELETE\s+FROM\s+blocks\b/i.test(sql)) acknowledgedRows += checkpoint.pending.rows.length;
+    };
+    f.source.beforeQuery = beforeSourceWrite;
+    f.source.beforeStatement = beforeSourceWrite;
+    // Run the actual selected historical module through full retirement too. The
+    // pre-grouping 4c5cb33 copier succeeds natively but violates our internal budget.
+    const result = await copyWithNativeParameters(f.args({ checkpointHook: async (state) => {
+      if (state.pending?.phase !== 'verified') return;
+      assert.deepEqual(state.columns, BLOCK_COLUMNS);
+      assert.deepEqual(state.pending.rows, rows.map((row) => ({
+        id: row.id, shard: 1, sha256: rowDigest(BLOCK_COLUMNS, row),
+      })), 'all 48 source rows must share one full-row SHA checkpoint');
+      assert.deepEqual(await storedBlockSnapshot(f.source), before, 'verified authority must not mutate source bytes or postings');
+      assert.deepEqual(await f.shards[0].rows('SELECT * FROM blocks'), []);
+      for (const row of rows) await assertNativeLongWordIdentity(f.shards[1], row, [row.text]);
+      verifiedBeforeAck = true;
+    } }));
+    assert.equal(result.state, 'complete');
+    assert.equal(result.rows, rows.length);
+    assert.equal(result.after, rows.at(-1).id);
+    assert.equal(acknowledgedRows, rows.length);
+    assert.deepEqual(await f.source.rows('SELECT * FROM blocks'), []);
+    assert.deepEqual(await f.shards[1].rows('SELECT * FROM blocks ORDER BY id'), rows);
+    assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).state, 'complete');
+    assert.deepEqual(await f.source.rows(`SELECT id, state FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
+    const groups = f.trace.filter(({ db, kind, sql, params }) => db === f.shards[1].id
+      && kind === 'query' && /\bMATCH\b/.test(sql) && params.length === 1);
+    assert.ok(groups.length > 0 && groups.every(({ success }) => success), 'actual native grouped MATCH must complete');
+    assert.deepEqual(groups.flatMap(({ rows: matches }) => matches.map(({ rowid }) => rowid)).sort((a, b) => a - b),
+      rows.map(({ id }) => id), 'every complete native posting must return exactly once');
+    const pairs = groups.flatMap(({ params }) => JSON.parse(params[0]));
+    assert.deepEqual(pairs.map(([, id]) => id), rows.map(({ id }) => id));
+    assert.ok(Buffer.byteLength(JSON.stringify([JSON.stringify(pairs)])) > COPY_PAGE_BYTES,
+      'native folding must grow this otherwise bounded source page beyond the internal unsplit parameter budget');
+    for (const { params } of groups) assert.ok(Buffer.byteLength(JSON.stringify(params)) <= COPY_PAGE_BYTES,
+      'internal FTS parameter budget violation: every actual serialized params envelope must fit 1 MiB; this is not a native API rejection');
+    assert.ok(groups.length > 1, 'the real same-shard fold-growth page must exercise multiple native verification groups');
+  });
+
+  test(`native ${backend} fold-growth later missing posting retains exact source and pending proof`, async (context) => {
+    const f = await createFixture(context);
+    const word = `a${'Ⱥ'.repeat(11000)}`;
+    const rows = nativeDenseRows(48).map((row, index) => ({
+      ...row, text: index < 46 ? word : `foldgrowthascii${index}`,
+    }));
+    if (backend === 'SQLite') seedBlocks(f.source, rows);
+    else await seedWorkerdBlocks(f.source, rows);
+    const before = await storedBlockSnapshot(f.source);
+    const missing = rows[45];
+    let deletedPosting = false;
+    let earlierGroups = 0;
+    f.trace.length = 0;
+    f.shards[1].beforeQuery = async ({ sql, params }) => {
+      if (!/\bMATCH\b/.test(sql) || params.length !== 1) return;
+      const ids = JSON.parse(params[0]).map(([, id]) => id);
+      if (!ids.includes(missing.id)) {
+        earlierGroups += 1;
+        return;
+      }
+      assert.equal(deletedPosting, false);
+      // This independent whole ORIGINAL word is a native positive control before
+      // physical deletion; no copier-derived completion or fabricated result.
+      await assertNativeLongWordIdentity(f.shards[1], missing, [missing.text]);
+      const earlier = f.trace.filter(({ db, kind, sql, success }) => db === f.shards[1].id
+        && kind === 'query' && /\bMATCH\b/.test(sql) && success);
+      assert.equal(earlier.length, earlierGroups);
+      for (const event of earlier) assert.deepEqual(event.rows.map(({ rowid }) => rowid).sort((a, b) => a - b),
+        JSON.parse(event.params[0]).map(([, id]) => id), 'all earlier native groups must pass before the later posting is removed');
+      if (backend === 'SQLite') f.shards[1].database.prepare(
+        'INSERT INTO blocks_fts (blocks_fts, rowid, text) VALUES (?, ?, ?)',
+      ).run('delete', missing.id, missing.text);
+      else await f.shards[1].database.prepare(
+        'INSERT INTO blocks_fts (blocks_fts, rowid, text) VALUES (?, ?, ?)',
+      ).bind('delete', missing.id, missing.text).run();
+      deletedPosting = true;
+    };
+    await assert.rejects(copyWithNativeParameters(f.args()), (error) => {
+      assert.equal(error.code, 'fts-match');
+      assert.equal(error.d1Phase, 'copy-fts-match');
+      assert.equal(error.cause, undefined);
+      assert.ok(!`${error.message} ${error.stack} ${JSON.stringify(error)}`.includes(word),
+        'verification errors must not retain transcript terms or native causes');
+      return true;
+    });
+    assert.equal(deletedPosting, true, 'the negative control must physically remove a real native posting');
+    assert.deepEqual(await storedBlockSnapshot(f.source), before);
+    assert.deepEqual(sourceWrites(f), [], 'missing later-group evidence must not authorize any source writes');
+    assert.deepEqual(await f.shards[1].rows('SELECT * FROM blocks ORDER BY id'), rows);
+    await assertNativeLongWordIdentity(f.shards[1], missing, [missing.text], { posting: false });
+    const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+    assert.equal(checkpoint.state, 'pending');
+    assert.equal(checkpoint.after, -1);
+    assert.equal(checkpoint.rows, 0);
+    assert.equal(checkpoint.pending.phase, 'copying');
+    assert.deepEqual(checkpoint.pending.rows, rows.map((row) => ({
+      id: row.id, shard: 1, sha256: rowDigest(BLOCK_COLUMNS, row),
+    })));
+    // Historical 4c5cb33 is deliberately still a valid negative posting control:
+    // it rejects missing native evidence even though it sends one oversized group.
+  });
+
+  test(`native ${backend} fold-growth rejects genuine hits belonging to another probe group`, async (context) => {
+    for (const fault of ['future-group', 'previous-group']) {
+      await context.test(fault, async (child) => {
+        const f = await createFixture(child);
+        const word = `a${'Ⱥ'.repeat(11000)}`;
+        const rows = nativeDenseRows(48).map((row, index) => ({
+          ...row, text: index < 46 ? word : `foldgrowthascii${index}`,
+        }));
+        if (backend === 'SQLite') seedBlocks(f.source, rows);
+        else await seedWorkerdBlocks(f.source, rows);
+        const before = await storedBlockSnapshot(f.source);
+        f.trace.length = 0;
+        let groups = 0;
+        let exercised = false;
+        f.shards[1].transformQuery = async (event, matches) => {
+          if (!/\bMATCH\b/.test(event.sql) || event.params.length !== 1) return matches;
+          groups += 1;
+          const ids = JSON.parse(event.params[0]).map(([, id]) => id);
+          assert.deepEqual(matches.map(({ rowid }) => rowid).sort((a, b) => a - b), ids,
+            'the fault must alter genuine native results after every requested posting matched');
+          if (fault === 'previous-group' && groups === 1) return matches;
+          const outside = fault === 'future-group' ? rows[45] : rows[0];
+          assert.ok(!ids.includes(outside.id), 'the injected native hit must belong to the page but not this group');
+          const hits = await f.shards[1].rows(
+            'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = CAST(? AS INTEGER)',
+            [`"${outside.text}"`, outside.id]);
+          assert.deepEqual(hits, [{ rowid: outside.id }], 'use a genuine independently queried posting, never an echoed row');
+          exercised = true;
+          return [...matches.slice(1), ...hits];
+        };
+        await assert.rejects(copyWithNativeParameters(f.args()), (error) => {
+          assert.equal(error.code, 'fts-identity');
+          assert.equal(error.d1Phase, 'copy-fts-match');
+          return true;
+        });
+        assert.equal(exercised, true);
+        assert.equal(groups, fault === 'future-group' ? 1 : 2);
+        assert.deepEqual(await storedBlockSnapshot(f.source), before);
+        assert.deepEqual(sourceWrites(f), []);
+        const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+        assert.equal(checkpoint.pending.phase, 'copying');
+        assert.equal(checkpoint.rows, 0);
+        assert.equal(checkpoint.after, -1);
+      });
+    }
+  });
+}
+
+for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerdFixture]]) {
+  const nativeBackend = backend === 'SQLite' ? 'native tokenizer' : 'native workerd tokenizer';
+  test(`${nativeBackend} B3 long UTF8 copier verifies original words before acknowledgment and resumes durable proof`, async (context) => {
+    for (const { name, text, tokens } of nativeLongWordCases()) {
+      await context.test(name, async (child) => {
+        const f = await createFixture(child);
+        const row = block(41, 1, {
+          text, byte_len: Buffer.byteLength(text), role: '', tool_name: null,
+          on_main_path: 0, media_byte_start: 2 ** 40 + 17, media_byte_len: 0, media_type: '',
+        });
+        if (backend === 'SQLite') seedBlocks(f.source, [row]);
+        else await seedWorkerdBlocks(f.source, [row]);
+        await assertNativeLongWordIdentity(f.source, row, tokens);
+        const before = await storedBlockSnapshot(f.source);
+        f.trace.length = 0;
+        const stop = new Error('stop after durable native long-word verification, before source acknowledgment');
+        let verifiedBeforeAck = false;
+        let acknowledgedRows = 0;
+        const beforeSourceWrite = async ({ sql }) => {
+          if (!isWrite(sql)) return;
+          assert.equal(verifiedBeforeAck, true, 'independent original-word proof must precede all source writes');
+          const durable = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+          assert.equal(durable.pending?.phase, 'verified');
+          assert.deepEqual(durable.pending.rows, [{ id: row.id, shard: 1, sha256: rowDigest(BLOCK_COLUMNS, row) }]);
+          if (/\bDELETE\s+FROM\s+"?blocks"?\b/i.test(sql)) acknowledgedRows += durable.pending.rows.length;
+        };
+        f.source.beforeQuery = beforeSourceWrite;
+        f.source.beforeStatement = beforeSourceWrite;
+        await assert.rejects(copyWithNativeParameters(f.args({ checkpointHook: async (state) => {
+          if (state.pending?.phase !== 'verified') return;
+          assert.deepEqual(state.columns, BLOCK_COLUMNS);
+          assert.deepEqual(state.pending.rows, [{ id: row.id, shard: 1, sha256: rowDigest(BLOCK_COLUMNS, row) }]);
+          assert.deepEqual(await storedBlockSnapshot(f.source), before,
+            'verified long-word proof must retain the exact source content and physical postings');
+          await assertNativeLongWordIdentity(f.source, row, tokens);
+          await assertNativeLongWordIdentity(f.shards[1], row, tokens);
+          assert.deepEqual(await f.shards[0].rows('SELECT * FROM blocks'), []);
+          assert.ok(f.trace.some((event) => event.db === f.shards[1].id && event.success
+            && selectsTable(event.sql, 'blocks') && event.rows.some((stored) => stored.id === row.id
+              && Object.hasOwn(stored, 'text') && rowDigest(BLOCK_COLUMNS, stored) === rowDigest(BLOCK_COLUMNS, row))),
+          'actual copier readback must independently recover every original column');
+          assert.ok(f.trace.some((event) => event.db === f.shards[1].id && event.success
+            && /\bMATCH\b/i.test(event.sql) && event.rows.some(({ rowid }) => rowid === row.id)),
+          'actual grouped copier MATCH must succeed before durable acknowledgment authority');
+          verifiedBeforeAck = true;
+          throw stop;
+        } })), (error) => error === stop);
+        assert.equal(verifiedBeforeAck, true);
+        assert.deepEqual(sourceWrites(f), []);
+        const saved = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+        assert.equal(saved.state, 'pending');
+        assert.equal(saved.pending.phase, 'verified');
+        assert.equal(saved.rows, 0);
+        assert.equal(saved.after, -1);
+        const destinationBeforeResume = await Promise.all(f.shards.map(storedBlockSnapshot));
+        const batchesBeforeResume = destinationBatchCount(f);
+        if (backend === 'SQLite') f.restart();
+        assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), saved,
+          'resume must read the actual saved native proof, including after reopening SQLite');
+        assert.deepEqual(await storedBlockSnapshot(f.source), before);
+        f.source.beforeQuery = beforeSourceWrite;
+        f.source.beforeStatement = beforeSourceWrite;
+        const result = await copyWithNativeParameters(f.args());
+        assert.equal(result.state, 'complete');
+        assert.equal(result.rows, 1);
+        assert.equal(result.after, row.id);
+        assert.equal(acknowledgedRows, 1);
+        assert.equal(destinationBatchCount(f), batchesBeforeResume,
+          'verified resume must not rewrite the copied full word or regenerate native postings');
+        assert.deepEqual(await Promise.all(f.shards.map(storedBlockSnapshot)), destinationBeforeResume);
+        await assertNativeLongWordIdentity(f.shards[1], row, tokens);
+        const retired = await storedBlockSnapshot(f.source);
+        assert.deepEqual(retired.blocks, []);
+        assert.deepEqual(retired.ftsData, before.ftsData, 'source retirement must retain the original FTS backing pages');
+        assert.deepEqual(retired.ftsIndex, before.ftsIndex);
+        assert.ok(!sourceWrites(f).some(({ sql }) => /\bblocks_fts\b/i.test(sql)));
+        assert.deepEqual(await f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
+        assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).state, 'complete');
+        assertAtomicBlockBatches(f);
+        assertNativeRequestLimits(f);
+      });
+    }
+  });
+
+  test(`${nativeBackend} B3 long UTF8 readonly verification uses original words and rejects physical missing postings without writes`, async (context) => {
+    for (const { name, text, tokens } of nativeLongWordCases()) {
+      for (const missing of [false, true]) {
+        await context.test(`${name}-${missing ? 'missing-posting' : 'native-positive'}`, async (child) => {
+          const f = await createFixture(child);
+          const sourceRow = block(900, 0, { text: 'readonly_source_guard\u0000retained_source_tail' });
+          const row = block(41, 1, { text, byte_len: Buffer.byteLength(text) });
+          if (backend === 'SQLite') {
+            seedBlocks(f.source, [sourceRow]);
+            seedBlocks(f.shards[1], [row]);
+          } else {
+            await seedWorkerdBlocks(f.source, [sourceRow]);
+            await seedWorkerdBlocks(f.shards[1], [row]);
+          }
+          await assertNativeLongWordIdentity(f.shards[1], row, tokens);
+          if (missing) {
+            const deletion = f.shards[1].database.prepare(
+              'INSERT INTO blocks_fts (blocks_fts, rowid, text) VALUES (?, ?, ?)',
+            );
+            if (backend === 'SQLite') deletion.run('delete', row.id, row.text);
+            else await deletion.bind('delete', row.id, row.text).run();
+            await assertNativeLongWordIdentity(f.shards[1], row, tokens, { posting: false });
+          }
+          const sourceBefore = await storedBlockSnapshot(f.source);
+          const shardsBefore = await Promise.all(f.shards.map(storedBlockSnapshot));
+          const metadata = async () => Promise.all(f.shards.map(async (db) => ({
+            layout: await db.rows('SELECT * FROM shard_meta'),
+            checkpoints: await db.rows('SELECT * FROM index_migration_state ORDER BY name'),
+          })));
+          const metadataBefore = await metadata();
+          f.trace.length = 0;
+          const operation = verifyWithNativeParameters({
+            source: f.source, shards: f.shards, catalogConsistency: 'required',
+          });
+          if (missing) await assert.rejects(operation, (error) => {
+            assert.equal(error.code, 'fts-match');
+            assert.equal(error.d1Phase, 'copy-fts-match');
+            return true;
+          });
+          else {
+            const evidence = await operation;
+            assert.deepEqual(evidence, {
+              mainSessions: 0, mainStars: 0,
+              shards: [0, 1].map((shard) => ({
+                shard, blockCount: shard === 1 ? 1 : 0, sessionCount: 0, starCount: 0,
+                blockSampleSha256: sha256(JSON.stringify(shard === 1 ? [canonicalRow(BLOCK_COLUMNS, row)] : [])),
+                catalogSampleSha256: sha256('[]'),
+              })),
+            });
+          }
+          assertReadonlyEvidenceCalls(f);
+          assert.deepEqual(await storedBlockSnapshot(f.source), sourceBefore,
+            'readonly native completion must not alter the retained source row or its physical postings');
+          assert.deepEqual(await Promise.all(f.shards.map(storedBlockSnapshot)), shardsBefore);
+          assert.deepEqual(await metadata(), metadataBefore);
+          await assertNativeLongWordIdentity(f.source, sourceRow, ['readonly_source_guard', 'retained_source_tail']);
+          await assertNativeLongWordIdentity(f.shards[1], row, tokens, { posting: !missing });
+          assertNativeRequestLimits(f);
+        });
+      }
+    }
+  });
+}
+
+test('native tokenizer configured FTS tokenizer preserves Unicode61 boundaries, empty and after-NUL copy results', async (context) => {
   const f = await fixture(context);
   const cases = [
+    ...nativeTokenizerBoundaryCases(),
     { text: null, tokens: [] },
     { text: '', tokens: [] },
     { text: ' \t\n\u0000', tokens: [] },
@@ -909,7 +1326,7 @@ test('actual configured FTS tokenizer preserves empty, punctuation, Unicode and 
     { text: 'shared_visible_term\u0000shared_tail_1 Ελληνικά', tokens: ['shared_visible_term', 'shared_tail_1', 'Ελληνικά'] },
     { text: 'shared_visible_term\u0000shared_tail_2 café', tokens: ['shared_visible_term', 'shared_tail_2', 'café'] },
   ];
-  const rows = cases.map(({ text }, index) => block(800 + index, index % 2, {
+  const rows = cases.map(({ text }, index) => block(800 + index, 1, {
     text, byte_len: text === null ? null : Buffer.byteLength(text),
   }));
   const assertBytesAndMatches = (db, expected) => {
@@ -920,22 +1337,33 @@ test('actual configured FTS tokenizer preserves empty, punctuation, Unicode and 
       id: row.id, bytes: row.text === null ? null : Buffer.from(row.text),
     })), 'empty/null/punctuation/Unicode rows must retain every original stored UTF-8 byte');
     for (const row of expected) {
-      const { tokens } = cases[row.id - 800];
+      const { tokens, absent = [] } = cases[row.id - 800];
       for (const token of tokens.length ? tokens : ['index-migration-tokenless-probe']) {
         assert.deepEqual(db.rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = ?',
           [`"${token}"`, row.id]), tokens.length ? [{ rowid: row.id }] : [],
         'actual row-scoped MATCH must agree before and after copy, including punctuation tokenchars and NUL suffixes');
       }
+      for (const term of absent) {
+        assert.deepEqual(db.rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = ?',
+          [`"${term.replaceAll('"', '""')}"`, row.id]), [],
+        'old alpha/al probes and tokenless sentinels must remain actual native misses');
+      }
     }
   };
   seedBlocks(f.source, rows);
   assertBytesAndMatches(f.source, rows);
+  const before = blockSnapshot(f.source);
   const protectedRows = assertVerifiedBeforeDelete(f);
   let verifiedBeforeRetirement = false;
-  const copied = await copyFrozenIndex(f.args({ checkpointHook: (state) => {
+  const copied = await copyWithNativeParameters(f.args({ checkpointHook: (state) => {
     if (state.pending?.phase !== 'verified') return;
     verifiedBeforeRetirement = true;
     assertBytesAndMatches(f.source, rows);
+    assert.deepEqual(blockSnapshot(f.source), before, 'durable verification must retain the exact source bytes and postings');
+    assert.deepEqual(state.columns, BLOCK_COLUMNS);
+    assert.deepEqual(state.pending.rows, rows.map((row) => ({
+      id: row.id, shard: 1, sha256: rowDigest(BLOCK_COLUMNS, row),
+    })));
     for (let index = 0; index < f.shards.length; index += 1) {
       assertBytesAndMatches(f.shards[index], rows.filter((row) => indexShardForSessionId(row.session_id, 2) === index));
     }
@@ -945,6 +1373,10 @@ test('actual configured FTS tokenizer preserves empty, punctuation, Unicode and 
   assert.equal(copied.rows, rows.length);
   assert.equal(protectedRows(), rows.length);
   assertCopied(f, rows);
+  const retired = blockSnapshot(f.source);
+  assert.deepEqual(retired.ftsData, before.ftsData);
+  assert.deepEqual(retired.ftsIndex, before.ftsIndex);
+  assert.ok(!sourceWrites(f).some(({ sql }) => /\bblocks_fts\b/i.test(sql)), 'source retirement must never mutate legacy FTS');
   f.trace.length = 0;
   const evidence = await verifyIndexRecords({ source: f.source, shards: f.shards, catalogConsistency: 'required' });
   assert.deepEqual(evidence, {
@@ -962,16 +1394,19 @@ test('actual configured FTS tokenizer preserves empty, punctuation, Unicode and 
   assert.deepEqual(f.source.rows('SELECT * FROM blocks'), []);
 });
 
-test('crash checkpoints survive reopened databases and reuse verified blocks plus FTS without rewriting', async (context) => {
+test('native tokenizer crash checkpoints reuse Unicode61 blocks and exact FTS postings after reopening', async (context) => {
   for (const stage of ['before-copy', 'verified-before-delete', 'after-delete']) {
     await context.test(stage, async (child) => {
       const f = await fixture(child);
-      const rows = [block(11, 0, { on_main_path: 0, text: 'resume_needle 会話 😀' })];
+      const cases = [...nativeTokenizerBoundaryCases(), { text: null }, { text: '' }];
+      const rows = cases.map(({ text }, index) => block(11 + index, 1, { on_main_path: 0, text }));
       seedBlocks(f.source, rows);
+      const sourceBefore = blockSnapshot(f.source);
+      await assertNativeTokenizerBoundaryMatches(f.source, rows);
       const deleted = assertVerifiedBeforeDelete(f);
       const crash = new Error(`simulated process crash ${stage}`);
       let crashed = false;
-      await assert.rejects(copyFrozenIndex(f.args({ checkpointHook: (state) => {
+      await assert.rejects(copyWithNativeParameters(f.args({ checkpointHook: (state) => {
         const target = stage === 'before-copy' ? state.pending?.phase === 'copying'
           : stage === 'verified-before-delete' ? state.pending?.phase === 'verified'
             : !state.pending && state.rows > 0 && state.state === 'pending';
@@ -979,9 +1414,16 @@ test('crash checkpoints survive reopened databases and reuse verified blocks plu
       } })), (error) => error === crash);
       assert.equal(crashed, true);
       const saved = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      if (saved.pending) assert.deepEqual(saved.pending.rows, rows.map((row) => ({
+        id: row.id, shard: 1, sha256: rowDigest(BLOCK_COLUMNS, row),
+      })));
+      const sourceAtCrash = blockSnapshot(f.source);
+      assert.deepEqual(sourceAtCrash.blocks, stage === 'after-delete' ? [] : rows);
+      assert.deepEqual(sourceAtCrash.ftsData, sourceBefore.ftsData);
+      assert.deepEqual(sourceAtCrash.ftsIndex, sourceBefore.ftsIndex);
       const snapshots = f.shards.map(blockSnapshot);
       const batchesBeforeRestart = destinationBatchCount(f);
-      assert.equal(deleted(), stage === 'after-delete' ? 1 : 0);
+      assert.equal(deleted(), stage === 'after-delete' ? rows.length : 0);
       assert.equal(f.source.rows('SELECT COUNT(*) AS n FROM blocks')[0].n, stage === 'after-delete' ? 0 : rows.length);
       assert.equal(saved.pending?.phase ?? null, stage === 'before-copy' ? 'copying'
         : stage === 'verified-before-delete' ? 'verified' : null);
@@ -990,10 +1432,12 @@ test('crash checkpoints survive reopened databases and reuse verified blocks plu
       f.restart();
       assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), saved);
       assertVerifiedBeforeDelete(f);
-      const result = await copyFrozenIndex(f.args());
+      const result = await copyWithNativeParameters(f.args());
       assert.equal(result.rows, rows.length);
       assert.equal(result.state, 'complete');
       assertCopied(f, rows);
+      await assertNativeTokenizerBoundaryMatches(f.shards[1], rows);
+      assert.ok(!sourceWrites(f).some(({ sql }) => /\bblocks_fts\b/i.test(sql)));
       if (stage !== 'before-copy') {
         assert.equal(destinationBatchCount(f), batchesBeforeRestart,
           'verified-page restart must not replace rows or regenerate their FTS postings');
@@ -1089,19 +1533,179 @@ test('malformed long-column byte slices fail closed without dropping the origina
   }
 });
 
-test('a real missing FTS posting blocks deletion despite intact content and row hash', async (context) => {
-  const f = await fixture(context);
-  const row = block(41, 1, { text: 'missing_match_needle café Unicode会話' });
-  seedBlocks(f.source, [row]);
-  f.shards[1].afterBatch = () => {
-    f.shards[1].database.prepare('INSERT INTO blocks_fts (blocks_fts, rowid, text) VALUES (?, ?, ?)')
-      .run('delete', row.id, row.text);
-  };
-  await assert.rejects(copyFrozenIndex(f.args()), /FTS MATCH verification failed/);
-  assert.deepEqual(f.shards[1].rows('SELECT * FROM blocks'), [row]);
-  assert.deepEqual(f.shards[1].rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?', ['"missing_match_needle"']), []);
-  assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [row]);
-  assert.deepEqual(sourceWrites(f), []);
+test('native tokenizer real missing FTS posting blocks deletion for ASCII, modernemoji-only and long UTF8 words', async (context) => {
+  for (const [name, text, term] of [
+    ['ascii', 'missing_match_needle café Unicode会話', 'missing_match_needle'],
+    ['modernemoji-only', '🫠', '🫠'],
+    ...nativeLongWordCases().map(({ name, text, tokens }) => [name, text, tokens[0]]),
+  ]) {
+    await context.test(name, async (child) => {
+      const f = await fixture(child);
+      const row = block(41, 1, { text });
+      seedBlocks(f.source, [row]);
+      const before = blockSnapshot(f.source);
+      assert.deepEqual(f.source.rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?', [`"${term}"`]),
+        [{ rowid: row.id }]);
+      await assertNativeLongWordIdentity(f.source, row, [term]);
+      let deletedPosting = false;
+      f.shards[1].beforeQuery = ({ sql }) => {
+        if (!/\bMATCH\b/.test(sql) || deletedPosting) return;
+        assert.deepEqual(f.shards[1].rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?', [`"${term}"`]),
+          [{ rowid: row.id }], 'the fault must remove a genuine native posting');
+        f.shards[1].database.prepare('INSERT INTO blocks_fts (blocks_fts, rowid, text) VALUES (?, ?, ?)')
+          .run('delete', row.id, row.text);
+        deletedPosting = true;
+      };
+      await assert.rejects(copyWithNativeParameters(f.args()), (error) => {
+        assert.equal(error.code, 'fts-match');
+        assert.equal(error.d1Phase, 'copy-fts-match');
+        return true;
+      });
+      assert.equal(deletedPosting, true);
+      assert.deepEqual(f.shards[1].rows('SELECT * FROM blocks'), [row]);
+      assert.deepEqual(f.shards[1].rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?', [`"${term}"`]), []);
+      await assertNativeLongWordIdentity(f.shards[1], row, [term], { posting: false });
+      assert.deepEqual(blockSnapshot(f.source), before);
+      assert.deepEqual(sourceWrites(f), []);
+      const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      assert.equal(checkpoint.rows, 0);
+      assert.equal(checkpoint.after, -1);
+      assert.equal(checkpoint.pending.phase, 'copying');
+      assert.deepEqual(checkpoint.pending.rows, [{ id: row.id, shard: 1, sha256: rowDigest(BLOCK_COLUMNS, row) }]);
+    });
+  }
+});
+
+test('native workerd tokenizer rejects real missing modernemoji-only and long UTF8 postings before source acknowledgment', async (context) => {
+  for (const { name, text, tokens } of [
+    { name: 'modernemoji-only', text: '🫠', tokens: ['🫠'] }, ...nativeLongWordCases(),
+  ]) {
+    await context.test(name, async (child) => {
+      const f = await workerdFixture(child);
+      const row = block(41, 1, { text });
+      await seedWorkerdBlocks(f.source, [row]);
+      const before = await nativeSnapshot(f.source);
+      await assertNativeLongWordIdentity(f.source, row, tokens);
+      f.trace.length = 0;
+      let deletedPosting = false;
+      f.shards[1].beforeQuery = async ({ sql }) => {
+        if (!/\bMATCH\b/.test(sql) || deletedPosting) return;
+        await assertNativeLongWordIdentity(f.shards[1], row, tokens);
+        await f.shards[1].database.prepare('INSERT INTO blocks_fts (blocks_fts, rowid, text) VALUES (?, ?, ?)')
+          .bind('delete', row.id, row.text).run();
+        deletedPosting = true;
+      };
+      await assert.rejects(copyWithNativeParameters(f.args()), (error) => {
+        assert.equal(error.code, 'fts-match');
+        assert.equal(error.d1Phase, 'copy-fts-match');
+        return true;
+      });
+      assert.equal(deletedPosting, true, 'the fault must remove genuine native postings, not substitute MATCH results');
+      assert.deepEqual(await nativeSnapshot(f.source), before);
+      await assertNativeLongWordIdentity(f.shards[1], row, tokens, { posting: false });
+      assert.deepEqual(sourceWrites(f), []);
+      const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      assert.equal(checkpoint.rows, 0);
+      assert.equal(checkpoint.after, -1);
+      assert.equal(checkpoint.pending.phase, 'copying');
+      assert.deepEqual(checkpoint.pending.rows, [{ id: row.id, shard: 1, sha256: rowDigest(BLOCK_COLUMNS, row) }]);
+      assertNativeRequestLimits(f);
+    });
+  }
+});
+
+test('native tokenizer readonly samples use whole native terms and reject missing modernemoji-only postings without writes', async (context) => {
+  for (const missing of [false, true]) {
+    await context.test(missing ? 'missing-modernemoji-only' : 'native-positive', async (child) => {
+      const f = await fixture(child);
+      const cases = [6, 7, 11, 14].map((index) => nativeTokenizerBoundaryCases()[index]);
+      const rows = cases.map(({ text }, index) => block(900 + index, 1, { text }));
+      seedBlocks(f.shards[1], rows);
+      for (const [index, { tokens, absent = [] }] of cases.entries()) {
+        for (const [terms, present] of [[tokens, true], [absent, false]]) {
+          for (const term of terms) {
+            assert.deepEqual(f.shards[1].rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = ?',
+              [`"${term}"`, rows[index].id]), present ? [{ rowid: rows[index].id }] : []);
+          }
+        }
+      }
+      if (missing) f.shards[1].database.prepare(
+        'INSERT INTO blocks_fts (blocks_fts, rowid, text) VALUES (?, ?, ?)',
+      ).run('delete', rows[3].id, rows[3].text);
+      const before = f.shards.map(blockSnapshot);
+      f.trace.length = 0;
+      const operation = verifyIndexRecords({ source: f.source, shards: f.shards, catalogConsistency: 'required' });
+      if (missing) await assert.rejects(operation, (error) => {
+        assert.equal(error.code, 'fts-match');
+        assert.equal(error.d1Phase, 'copy-fts-match');
+        return true;
+      });
+      else {
+        const evidence = await operation;
+        assert.equal(evidence.shards[1].blockCount, rows.length);
+        assert.equal(evidence.shards[1].blockSampleSha256,
+          sha256(JSON.stringify(rows.map((row) => canonicalRow(BLOCK_COLUMNS, row)))));
+      }
+      assertReadonlyEvidenceCalls(f);
+      assert.deepEqual(f.shards.map(blockSnapshot), before);
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks'), []);
+    });
+  }
+});
+
+test('native tokenizer rejects malformed schema readback and native clone errors without private diagnostics or source acknowledgment', async (context) => {
+  for (const operation of ['copy', 'readonly']) {
+    for (const fault of ['missing-schema', 'unsupported-tokenizer']) {
+      await context.test(`${operation}-${fault}`, async (child) => {
+        const f = await fixture(child);
+        const row = block(1100, 1, { text: '🫠' });
+        seedBlocks(operation === 'copy' ? f.source : f.shards[1], [row]);
+        const sourceBefore = blockSnapshot(f.source);
+        const shardsBefore = f.shards.map(blockSnapshot);
+        const [schema] = f.shards[1].rows(
+          "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'blocks_fts'",
+        );
+        assert.equal(typeof schema?.sql, 'string');
+        let exercised = false;
+        f.shards[1].transformQuery = (_event, rows) => {
+          if (rows.length !== 1 || rows[0]?.sql !== schema.sql) return rows;
+          assert.equal(exercised, false, 'the fault must alter the actual destination schema readback');
+          exercised = true;
+          // This declaration reaches native SQLite and rejects an unsupported
+          // tokenizer. No successful token or MATCH result is substituted.
+          return fault === 'missing-schema' ? [] : [{
+            sql: `CREATE VIRTUAL TABLE blocks_fts USING fts5(text, content='blocks', content_rowid='id',
+              tokenize='PRIVATE_NATIVE_ORACLE_ERROR_CANARY')`,
+          }];
+        };
+        await assert.rejects(operation === 'copy' ? copyWithNativeParameters(f.args())
+          : verifyIndexRecords({ source: f.source, shards: f.shards, catalogConsistency: 'required' }), (error) => {
+          assert.equal(error.code, 'fts-tokenizer-schema');
+          assert.equal(error.d1Phase, 'copy-fts-match');
+          assert.equal(error.cause, undefined);
+          assert.ok(!`${error.message} ${error.stack} ${JSON.stringify(error)}`.includes('PRIVATE_NATIVE_ORACLE_ERROR_CANARY'),
+            'native errors, causes and schema SQL must never become public diagnostics');
+          return true;
+        });
+        assert.equal(exercised, true, 'the fault must reach actual destination schema readback');
+        assert.deepEqual(blockSnapshot(f.source), sourceBefore);
+        assert.deepEqual(sourceWrites(f), []);
+        if (operation === 'readonly') {
+          assert.deepEqual(f.shards.map(blockSnapshot), shardsBefore);
+          assertReadonlyEvidenceCalls(f);
+        } else {
+          assert.deepEqual(f.shards[1].rows('SELECT * FROM blocks'), [row]);
+          assert.deepEqual(f.shards[1].rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?', ['"🫠"']),
+            [{ rowid: row.id }], 'schema rejection must retain the genuine copied posting without authorizing source retirement');
+          const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+          assert.equal(checkpoint.rows, 0);
+          assert.equal(checkpoint.after, -1);
+          assert.equal(checkpoint.pending.phase, 'copying');
+          assert.deepEqual(checkpoint.pending.rows, [{ id: row.id, shard: 1, sha256: rowDigest(BLOCK_COLUMNS, row) }]);
+        }
+      });
+    }
+  }
 });
 
 test('a changed maintenance revision after readback retains the source', async (context) => {
@@ -2809,7 +3413,7 @@ function assertNativeRequestLimits(f) {
     assert.ok(params.length <= 100, `native D1 statement exceeds 100 binds: ${params.length}`);
     assert.ok(Buffer.byteLength(sql) <= 100_000, 'native SQL must remain below the 100 KB statement cap');
     assert.ok(Buffer.byteLength(JSON.stringify(params)) <= 1024 * 1024,
-      'ordinary serialized D1 parameters must stay within the actual 1 MiB JSON budget');
+      'ordinary serialized D1 parameters must stay within the internal 1 MiB JSON budget');
     if (responseBytes !== undefined) assert.ok(responseBytes <= 1024 * 1024,
       'readback must budget object keys and long markers, not only canonical row values');
   }
@@ -3759,6 +4363,7 @@ async function copyCliFixture(context) {
         ${plainRows.toString()}
         let nextTransaction = 0;
         ${SqliteD1.toString()}
+        ${nativeSourceTokenRows.toString()}
         ${assertVerifiedBeforeDelete.toString()}
         const scenario = ${JSON.stringify(scenario)};
         const budget = ${budget};
@@ -4328,13 +4933,17 @@ test('native full-copy control runs real SQLite schema, copier, independent read
   const result = await verifyNativeCopyControl(proof);
   assert.equal(result.state, 'verified');
   assert.equal(result.probe, 'd1-native-full-copy');
-  assert.equal(result.rows, 1463);
+  assert.equal(result.growthRows, 46);
+  assert.equal(result.rows, result.denseRows + result.growthRows + 2, 'ordinary, dense, growth and huge rows all need full-copy proof');
   assert.equal(result.denseRows, 1461);
   assert.equal(result.columns, BLOCK_COLUMNS.length);
   assert.equal(result.shards, 2);
-  assert.equal(result.ordinaryPages, 2);
+  assert.ok(result.splitFtsProbePages > 0);
+  assert.ok(result.maxFtsParametersBytes <= COPY_PAGE_BYTES);
+  assert.ok(result.maxUnsplitFtsParametersBytes > COPY_PAGE_BYTES);
   assert.equal(result.fallbackPages, 1);
-  assert.equal(result.ftsMatches, 1465);
+  assert.equal(result.legacyProbeMatches, 0);
+  assert.equal(result.nativeProbeMatches, 1);
   assert.equal(result.longTextBytes, 1_100_061);
   assert.equal(result.freezeTriggers, 3);
   assert.match(result.sha256, /^[0-9a-f]{64}$/);
@@ -4348,24 +4957,152 @@ test('native full-copy control runs real SQLite schema, copier, independent read
   const denseIds = Array.from({ length: result.denseRows }, (_, index) => index + 1);
   assert.deepEqual(dense.map(({ id }) => id), denseIds);
   assert.ok(dense.every(({ session_id }) => indexShardForSessionId(session_id, 2) === 1));
+  const boundaryCases = nativeTokenizerBoundaryCases();
+  for (const [index, row] of dense.entries()) {
+    const boundary = boundaryCases[index];
+    assert.equal(row.text, boundary?.only ? boundary.text
+      : `${boundary?.text ?? `v${index}`}\u0000 nativedensesuffix`);
+  }
+  await assertNativeTokenizerBoundaryMatches(shards[1], dense);
+  const growth = copied.filter(({ id }) => id > result.denseRows && id < INDEX_ID_SPAN - 1);
+  assert.equal(growth.length, result.growthRows);
+  for (const [index, row] of growth.entries()) {
+    assert.equal(row.id, result.denseRows + index + 1);
+    assert.equal(row.text, `a${'Ⱥ'.repeat(11000)}${index}`);
+    assert.equal(indexShardForSessionId(row.session_id, 2), 1);
+    await assertNativeLongWordIdentity(shards[1], row, [row.text]);
+  }
   assert.deepEqual(shards[0].rows('SELECT id FROM blocks ORDER BY id'), [{ id: 0 }]);
   assert.deepEqual(shards[1].rows('SELECT id FROM blocks ORDER BY id'),
-    [...denseIds, INDEX_ID_SPAN - 1].map((id) => ({ id })));
+    [...denseIds, ...growth.map(({ id }) => id), INDEX_ID_SPAN - 1].map((id) => ({ id })));
   const seed = source.trace.find(({ kind }) => kind === 'batch');
-  assert.equal(seed.statements.length, 3, 'dense source seeding remains one bounded batch, not one statement per row');
+  assert.equal(seed.statements.filter(({ sql }) => /^INSERT INTO blocks \(/.test(sql)).length, 4,
+    'one ordinary row, the preserved dense phase, separate growth rows and the huge fallback must actually be seeded');
+  assert.equal(seed.statements.filter(({ sql }) => /^INSERT INTO blocks_fts\b/.test(sql)).length, 1);
   const bulkSeed = seed.statements.filter(({ sql }) => /FROM json_each\(\?\)/.test(sql));
-  assert.equal(bulkSeed.length, 1);
-  assert.equal(bulkSeed[0].params.length, 1);
-  assert.deepEqual(JSON.parse(bulkSeed[0].params[0]), dense.map((row) => BLOCK_COLUMNS.map((column) => row[column])));
-  const denseFtsQueries = shards.map((database) => database.trace.filter(({ kind, sql }) =>
-    kind === 'query' && /\bMATCH\b/.test(sql) && /ORDER BY rowid$/.test(sql)));
-  for (const [index, queries] of denseFtsQueries.entries()) {
-    assert.equal(queries.length, 1, 'independent dense FTS proof uses one common-token query per shard');
-    assert.equal(queries[0].params.length, 1);
-    assert.deepEqual(queries[0].rows, (index === 1 ? denseIds : []).map((rowid) => ({ rowid })));
+  assert.equal(bulkSeed.length, 2);
+  assert.ok(bulkSeed.every(({ params }) => params.length === 1));
+  assert.deepEqual(bulkSeed.flatMap(({ params }) => JSON.parse(params[0])),
+    [...dense, ...growth].map((row) => BLOCK_COLUMNS.map((column) => row[column])));
+  const sourceFtsWrites = source.trace.filter(({ sql }) => typeof sql === 'string'
+    && isWrite(sql) && /\bblocks_fts\b/.test(sql));
+  assert.equal(sourceFtsWrites.length, 1);
+  assert.equal(sourceFtsWrites[0].transaction, seed.transaction,
+    'source retirement must leave the originally seeded legacy FTS pages unchanged');
+  const copying = shards[0].trace.filter(({ sql, params }) => /^INSERT INTO index_migration_state\b/.test(sql)
+    && params[0] === COPY_CHECKPOINT && JSON.parse(params[1]).pending?.phase === 'copying')
+    .map(({ params }) => JSON.parse(params[1]));
+  assert.deepEqual(copying[0].pending.rows.map(({ id }) => id), [0, ...denseIds],
+    'growth must not alter the original first dense source-page geometry');
+  assert.deepEqual(copying.flatMap(({ pending }) => pending.rows.map(({ id }) => id)), copied.map(({ id }) => id));
+  const writes = shards.flatMap(({ trace }) => trace.filter(({ kind, statements }) => kind === 'batch'
+    && statements.some(({ sql }) => /^INSERT INTO blocks \(/.test(sql))));
+  const ordinaryWrites = writes.filter(({ statements }) => statements.some(({ sql, params }) =>
+    /^INSERT INTO blocks \(/.test(sql) && params.length === 1));
+  assert.equal(result.ordinaryPages, ordinaryWrites.length, 'page aggregate must come from real ordinary writes, not an incidental pinned count');
+  const probeGroups = shards.flatMap(({ trace }) => trace.filter(({ kind, sql, params }) =>
+    kind === 'query' && /\bMATCH\b/.test(sql) && params.length === 1 && params[0].startsWith('[')));
+  assert.equal(result.maxFtsParametersBytes, Math.max(...probeGroups.map(({ params }) => Buffer.byteLength(JSON.stringify(params)))));
+  assert.ok(probeGroups.every(({ params }) => Buffer.byteLength(JSON.stringify(params)) <= COPY_PAGE_BYTES));
+  let splitPages = 0;
+  let maxUnsplitBytes = 0;
+  for (const { pending } of copying) {
+    let split = false;
+    for (const [index, database] of shards.entries()) {
+      const wanted = pending.rows.filter(({ shard }) => shard === index).map(({ id }) => id);
+      const groups = probeGroups.filter(({ db, params }) => db === database.id
+        && JSON.parse(params[0]).some(([, id]) => wanted.includes(id)));
+      const pairs = groups.flatMap(({ params }) => JSON.parse(params[0]));
+      assert.deepEqual(pairs.map(([, id]) => id), wanted);
+      const bytes = Buffer.byteLength(JSON.stringify([JSON.stringify(pairs)]));
+      maxUnsplitBytes = Math.max(maxUnsplitBytes, bytes);
+      if (bytes > COPY_PAGE_BYTES) {
+        assert.ok(groups.length > 1, 'an actual over-budget logical page needs multiple native groups');
+        split = true;
+      }
+    }
+    if (split) splitPages += 1;
   }
+  assert.equal(result.maxUnsplitFtsParametersBytes, maxUnsplitBytes);
+  assert.equal(result.splitFtsProbePages, splitPages);
+  const sourcePoints = source.trace.filter(({ kind, sql, params }) =>
+    kind === 'query' && /\bMATCH\b/.test(sql) && params.length === 2 && params[1] === 7);
+  assert.ok(sourcePoints.some(({ params, rows }) => params[0] === '"alpha"' && rows.length === 0));
+  assert.ok(sourcePoints.some(({ params, rows }) => params[0] === '"🫠alpha"'
+    && JSON.stringify(rows) === JSON.stringify([{ rowid: 7 }])),
+  'the pre-copy source oracle must prove the old alpha miss and native whole-term hit');
+  const suffixIds = dense.filter(({ text }) => text.includes('\u0000 nativedensesuffix')).map(({ id }) => id);
+  const independentMatches = shards.flatMap((database) => database.trace.filter(({ kind, sql, params }) =>
+    ['query', 'batch-statement'].includes(kind) && /\bMATCH\b/.test(sql)
+    && (params.length === 2 || params[0] === 'nativedensesuffix')));
+  for (const [index, database] of shards.entries()) {
+    const suffix = independentMatches.filter(({ db, params }) => db === database.id
+      && params[0] === 'nativedensesuffix');
+    assert.ok(suffix.length > 0, 'each shard needs actual independent after-NUL suffix evidence');
+    for (const { rows } of suffix) assert.deepEqual(rows, (index === 1 ? suffixIds : []).map((rowid) => ({ rowid })));
+  }
+  for (const [index, { tokens }] of boundaryCases.entries()) {
+    for (const term of tokens) assert.ok(independentMatches.some(({ db, params, rows }) => db === shards[1].id
+      && params[0] === `"${term}"` && params[1] === index + 1
+      && JSON.stringify(rows) === JSON.stringify([{ rowid: index + 1 }])),
+    'all synthetic boundary points must have independent native positive results');
+  }
+  const growthIds = new Set(growth.map(({ id }) => id));
+  const originalWordBatches = shards[1].trace.filter(({ kind, statements }) => kind === 'batch'
+    && statements.length > 0 && statements.every(({ sql, params }) => /\bMATCH\b/.test(sql)
+      && params.length === 2 && growthIds.has(params[1])));
+  const growthPages = copying.filter(({ pending }) => pending.rows.some(({ id }) => growthIds.has(id)));
+  assert.equal(originalWordBatches.length, growthPages.length + 1,
+    'every real growth page needs independent ORIGINAL-word verification before ACK, plus final verification');
+  for (const { statements, transaction } of originalWordBatches) {
+    assert.ok(statements.length <= result.growthRows);
+    assert.ok(Buffer.byteLength(JSON.stringify({ batch: statements })) <= COPY_PAGE_BYTES,
+      'the entire independent point batch must fit the internal request budget');
+    const calls = shards[1].trace.filter((event) => event.kind === 'batch-statement' && event.transaction === transaction);
+    assert.equal(calls.length, statements.length);
+    for (const call of calls) {
+      const row = growth.find(({ id }) => id === call.params[1]);
+      assert.equal(call.params[0], `"${row.text}"`, 'independent inputs must be ORIGINAL whole valid words, not copier completions');
+      assert.equal(call.success, true);
+      assert.deepEqual(call.rows, [{ rowid: row.id }], 'every statement needs its actual native posting identity');
+    }
+  }
+  const sliceBatches = adapters.flatMap(({ trace }) => trace.filter(({ kind, statements }) => kind === 'batch'
+    && statements.length > 0 && statements.every(({ sql }) => /^SELECT hex\(substr/.test(sql))));
+  assert.ok(sliceBatches.length > 0, 'independent full-byte transport must execute actual native slice batches');
+  for (const { db, statements, transaction, responseBytes } of sliceBatches) {
+    assert.ok(statements.length <= 100);
+    assert.ok(Buffer.byteLength(JSON.stringify({ batch: statements })) <= COPY_PAGE_BYTES);
+    const reserve = 4096 + statements.reduce((bytes, { params }) => bytes + params[1] * 2 + 4096, 0);
+    assert.ok(reserve <= COPY_PAGE_BYTES, 'known hex payloads plus conservative internal result/envelope reserves must stay bounded');
+    assert.ok(responseBytes <= COPY_PAGE_BYTES, 'the aggregate ACTUAL native result JSON must also fit the response budget');
+    const calls = adapters.find((adapter) => adapter.id === db).trace.filter((event) =>
+      event.kind === 'batch-statement' && event.transaction === transaction);
+    assert.equal(calls.length, statements.length);
+    for (const call of calls) {
+      assert.equal(call.success, true);
+      assert.equal(call.rows.length, 1);
+      assert.ok(call.params.every(Number.isSafeInteger));
+      assert.ok(call.params[0] >= 1 && call.params[1] > 0 && call.params[1] <= 131072);
+      assert.equal(call.rows[0].bytes.length, call.params[1] * 2);
+      assert.match(call.rows[0].bytes, /^[0-9a-f]+$/i);
+    }
+  }
+  assert.ok(sliceBatches.some(({ statements }) => statements.length > 1),
+    'actual independent slice transport must batch multiple real native statements');
+  assert.ok(sliceBatches.some(({ db, statements }, index) => {
+    const next = sliceBatches[index + 1];
+    const last = statements.at(-1);
+    if (!next || next.db !== db || !growthIds.has(last.params[2])
+      || next.statements[0].params[2] !== last.params[2] + 1) return false;
+    const reserved = 4096 + statements.reduce((bytes, { params }) => bytes + params[1] * 2 + 4096, 0);
+    return statements.length < 100 && reserved + next.statements[0].params[1] * 2 + 4096 > COPY_PAGE_BYTES;
+  }), 'actual adjacent growth slices must cross the conservative response-byte boundary, not just a count cap');
+  assert.equal(result.ftsMatches, independentMatches.reduce((count, { rows }) => count + rows.length, 0),
+    'summary FTS evidence must count the actual independent positive point and suffix hits');
   const requests = adapters.flatMap(({ trace }) => trace.filter(({ kind }) => ['query', 'batch'].includes(kind)));
-  assert.ok(requests.length <= 200, `complete native proof must use bounded RPCs, observed ${requests.length}`);
+  assert.ok(requests.length <= 200 + result.growthRows * 6,
+    `complete native proof must retain bulk copying with bounded independent growth point batches/slice checks, observed ${requests.length}`);
   const statements = adapters.flatMap(({ trace }) => trace.filter(({ kind }) => ['query', 'batch-statement'].includes(kind)));
   assert.ok(statements.every(({ params }) => params.length <= 100));
   assert.ok(statements.every(({ responseBytes }) => responseBytes === undefined || responseBytes <= 1_048_576),
@@ -4376,6 +5113,68 @@ test('native full-copy control runs real SQLite schema, copier, independent read
   assert.equal(new Set(account.created.map(({ name }) => name)).size, 3);
   for (const { name } of account.created) assert.match(name, /^pr-42-copy-[0-9a-f]{24}-(?:source|idx00|idx01)$/);
   assert.deepEqual(new Set(account.deleted.map(({ uuid }) => uuid)), new Set(account.created.map(({ uuid }) => uuid)));
+});
+
+test('native proof actual batched BLOB slice faults retain growth source and block acknowledgment', async (context) => {
+  for (const fault of ['missing-result', 'failed-statement', 'missing-row', 'truncated-hex', 'invalid-hex', 'invalid-utf8', 'reordered-results']) {
+    await context.test(fault, async (child) => {
+      const { account, adapters, proof } = await nativeScratchFixture(child);
+      const beforeAccount = account.snapshot();
+      const applySchema = proof.applySchema;
+      let exercised = false;
+      let sourceBefore;
+      let checkpointBefore;
+      let sourceTraceStart;
+      proof.applySchema = async (databases) => {
+        await applySchema(databases);
+        const shard = databases.shards[1];
+        const execute = shard.batch.bind(shard);
+        shard.batch = async (statements) => {
+          const actual = await execute(statements);
+          if (exercised || !statements.length || !statements.every(({ sql }) => /^SELECT hex\(substr/.test(sql))
+            || !statements.some(({ params }) => params[2] > 1461 && params[2] < INDEX_ID_SPAN - 1)) return actual;
+          const checkpoint = await readCheckpoint(databases.shards[0], COPY_CHECKPOINT);
+          if (checkpoint?.pending?.phase !== 'verified') return actual;
+          checkpointBefore = checkpoint;
+          sourceBefore = blockSnapshot(databases.source);
+          sourceTraceStart = databases.source.trace.length;
+          assert.equal(actual.length, statements.length);
+          assert.ok(actual.every(({ success, results }) => success && results.length === 1
+            && typeof results[0].bytes === 'string' && results[0].bytes.length > 2),
+          'faults must alter genuine executed SQLite slice results, never mock expected bytes');
+          exercised = true;
+          if (fault === 'missing-result') return actual.slice(1);
+          if (fault === 'failed-statement') return actual.map((result, index) =>
+            index ? result : { ...result, success: false });
+          if (fault === 'missing-row') return actual.map((result, index) =>
+            index ? result : { ...result, results: [] });
+          if (fault === 'reordered-results') {
+            assert.notEqual(actual[0].results[0].bytes, actual[1].results[0].bytes);
+            [actual[0], actual[1]] = [actual[1], actual[0]];
+          } else {
+            const row = actual[0].results[0];
+            row.bytes = fault === 'truncated-hex' ? row.bytes.slice(0, -2)
+              : `${fault === 'invalid-hex' ? 'GG' : 'FF'}${row.bytes.slice(2)}`;
+          }
+          return actual;
+        };
+      };
+      await assert.rejects(verifyNativeCopyControl(proof), (error) => {
+        assert.equal(error.nativeCopyPhase, 'growth-before-ack');
+        assert.equal(error.nativeCopyClass, 'assertion');
+        assert.equal(error.cause, undefined);
+        assert.ok(!`${error.message} ${error.stack} ${JSON.stringify(error)}`.includes('Ⱥ'.repeat(32)));
+        return true;
+      });
+      assert.equal(exercised, true);
+      assert.deepEqual(blockSnapshot(adapters[0]), sourceBefore, 'a rejected native slice batch must retain every exact source field and physical FTS page');
+      assert.deepEqual(await readCheckpoint(adapters[1], COPY_CHECKPOINT), checkpointBefore);
+      assert.deepEqual(adapters[0].trace.slice(sourceTraceStart).filter(({ sql }) => sql && isWrite(sql)), [],
+        'no source ACK or fence write may follow rejected independent full-byte evidence');
+      assert.deepEqual(account.snapshot(), beforeAccount);
+      assert.equal(account.deleted.length, 3);
+    });
+  }
 });
 
 test('scratch double failure preserves the primary diagnostic and attempts every safe owned cleanup', async (context) => {
@@ -4545,7 +5344,10 @@ test('native proof preserves copier assertion identity from real schema, FTS and
         return true;
       });
       assert.equal(mutated, true);
-      assert.deepEqual(adapters[0].rows('SELECT COUNT(*) AS rows FROM blocks'), [{ rows: 1463 }]);
+      const seed = adapters[0].trace.find(({ kind }) => kind === 'batch');
+      const seededRows = seed.statements.filter(({ sql }) => /^INSERT INTO blocks \(/.test(sql))
+        .reduce((count, { params }) => count + (params.length === 1 ? JSON.parse(params[0]).length : 1), 0);
+      assert.deepEqual(adapters[0].rows('SELECT COUNT(*) AS rows FROM blocks'), [{ rows: seededRows }]);
       assert.deepEqual(cleanupAttempts, account.created.map(({ uuid }) => uuid));
       assert.deepEqual(account.snapshot(), fault === 'sha-cleanup'
         ? [...before, account.created[0]].sort((a, b) => a.uuid.localeCompare(b.uuid)) : before);
@@ -4624,18 +5426,29 @@ test('native proof preserves source-versus-readback phase for real copier scalar
         proof.applySchema = async (databases) => {
           await applySchema(databases);
           const db = side === 'source' ? databases.source : databases.shards[invariant === 'value' ? 0 : 1];
-          db.transformQuery = ({ sql }, rows) => {
+          let copierLongIds = new Set();
+          db.transformQuery = ({ sql, params }, rows) => {
             if (exercised) return rows;
-            const scalar = invariant === 'value' && /^\s*WITH sized AS MATERIALIZED/.test(sql);
-            const slice = invariant === 'long-slice' && /^\s*SELECT hex\(substr/.test(sql);
+            const fullRow = /^\s*WITH sized AS MATERIALIZED/.test(sql);
+            if (fullRow) {
+              const marker = `__long_${BLOCK_COLUMNS.indexOf('text')}`;
+              copierLongIds = new Set(rows.filter((row) => row.text === null
+                && Number.isSafeInteger(row[marker]) && row[marker] > 0).map(({ id }) => id));
+            }
+            const scalar = invariant === 'value' && fullRow;
+            const slice = invariant === 'long-slice' && /^\s*SELECT hex\(substr/.test(sql)
+              && typeof params[2] === 'string' && JSON.parse(params[2]).some((id) => copierLongIds.has(id));
             if (!scalar && !slice) return rows;
-            // Seed readback also uses hex slices. Neither corruption may arm
-            // before the real copier has written its durable checkpoint.
+            // Independent seed/growth/final readers also use hex slices. Only a
+            // long row observed in the copier's sized read and expected pending
+            // phase may arm; a checkpoint alone is not a copier-readback oracle.
             const checkpoint = databases.shards[0].rows(
               'SELECT value FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT],
             )[0];
             if (!checkpoint) return rows;
             const state = JSON.parse(checkpoint.value);
+            if (state.state !== 'pending'
+              || (state.pending?.phase ?? null) !== (side === 'destination' ? 'copying' : null)) return rows;
             assert.equal(state.identity.source, databases.source.id);
             assert.equal(state.state, 'pending');
             assert.equal(state.pending?.phase ?? null, side === 'destination' ? 'copying' : null);

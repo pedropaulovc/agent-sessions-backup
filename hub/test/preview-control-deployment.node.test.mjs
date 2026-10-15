@@ -17,6 +17,7 @@ import {
   stableJson,
 } from '../../infra/cf/preview-trust.mjs';
 import { D1_BATCH_PROBE_TEXT } from '../../infra/cf/d1-batch-atomicity.mjs';
+import { BLOCK_COLUMNS, INDEX_ID_SPAN } from '../src/index-layout.mjs';
 
 const SHA = 'a'.repeat(40);
 const SEED = 'synthetic-preview-seed-for-deployment-regression';
@@ -59,6 +60,45 @@ function textEvidence(value) {
   return typeof value === 'string'
     ? { utf8Bytes: Buffer.byteLength(value, 'utf8'), sha256: createHash('sha256').update(value, 'utf8').digest('hex') }
     : value;
+}
+
+// Public test diagnostics retain only aggregate numeric evidence and static kinds,
+// never the appended request SQL, parameters, fixture contents or provider text.
+function nativeControllerProgress(events, truncatedLastRecord = false) {
+  const unavailable = events === null;
+  events ??= [];
+  const count = (value) => unavailable ? null : value;
+  const requests = events.filter(({ kind, url }) => kind === 'request'
+    && new URL(url).hostname === 'api.cloudflare.com');
+  const statements = events.filter(({ kind }) => kind === 'probe-sql');
+  const sliceBatches = events.filter(({ kind }) => kind === 'native-slice-batch');
+  const queryKind = (event) => {
+    if (!event) return 'none';
+    if (/^\s*SELECT hex\(substr/.test(event.sql)) return 'blob-slice-read';
+    if (/\bMATCH\b/.test(event.sql)) return event.params.length === 2 ? 'fts-point-read' : 'fts-probe-group-read';
+    if (/^\s*WITH sized AS MATERIALIZED/.test(event.sql)) return 'copier-row-read';
+    if (/\bDELETE FROM blocks\b/.test(event.sql)) return 'source-retirement';
+    if (/^INSERT INTO blocks \(/.test(event.sql)) return 'block-write';
+    if (/index_migration_state/.test(event.sql)) return 'checkpoint';
+    if (/index_migration_freeze/.test(event.sql)) return 'source-fence';
+    return 'other';
+  };
+  return {
+    traceState: unavailable ? 'unavailable' : truncatedLastRecord ? 'truncated' : 'complete',
+    completeEvents: count(events.length),
+    cloudflareRequests: count(requests.length),
+    queryRequests: count(requests.filter(({ url }) => new URL(url).pathname.endsWith('/query')).length),
+    batchRequests: count(requests.filter(({ body }) => Array.isArray(body?.batch)).length),
+    executedStatements: count(statements.length),
+    blobSliceStatements: count(statements.filter((event) => queryKind(event) === 'blob-slice-read').length),
+    ftsPointStatements: count(statements.filter((event) => queryKind(event) === 'fts-point-read').length),
+    ftsProbeGroupStatements: count(statements.filter(({ ftsProbeIds }) => ftsProbeIds !== undefined).length),
+    sliceBatches: count(sliceBatches.length),
+    maxRequestBytes: count(Math.max(0, ...requests.map(({ bodyBytes }) => bodyBytes ?? 0))),
+    maxParametersBytes: count(Math.max(0, ...statements.map(({ parametersBytes }) => parametersBytes ?? 0))),
+    maxSliceBatchResponseBytes: count(Math.max(0, ...sliceBatches.map(({ responseBytes }) => responseBytes))),
+    lastSafeQueryKind: unavailable ? 'unavailable' : queryKind(statements.at(-1)),
+  };
 }
 
 async function runController(command, scenario = {}) {
@@ -202,7 +242,8 @@ async function runController(command, scenario = {}) {
         const evidenceBody = probeRequest
           ? body.batch ? { batch: body.batch.map(evidenceStatement) } : evidenceStatement(body)
           : body;
-        emit({ kind: 'request', url: url.href, method, body: evidenceBody });
+        emit({ kind: 'request', url: url.href, method, body: evidenceBody,
+          bodyBytes: ${native} && init.body ? Buffer.byteLength(init.body) : undefined });
         if (url.hostname === names.host && url.pathname === '/healthz') return new Response('ok');
         if (url.hostname === 'api.github.com') {
           const number = Number(url.pathname.split('/').at(-1));
@@ -253,7 +294,14 @@ async function runController(command, scenario = {}) {
               const statement = native.prepare(sql);
               const rows = statement.columns().length ? plainRows(native, sql, params, statement)
                 : (statement.run(...params), []);
+              if (${native} && sql.startsWith('INSERT INTO blocks (') && sql.includes('FROM json_each(?)')) {
+                emit({ kind: 'native-fixture-seed', databaseId: id, tuples: JSON.parse(params[0]) });
+              }
               emit({ kind: 'probe-sql', databaseId: id, sql, params: params.map(textEvidence),
+                parametersBytes: Buffer.byteLength(JSON.stringify(params)),
+                responseRowsBytes: Buffer.byteLength(JSON.stringify(rows)),
+                ftsProbeIds: /\\bMATCH\\b/.test(sql) && params.length === 1 && params[0].startsWith('[')
+                  ? JSON.parse(params[0]).map(([, rowid]) => rowid) : undefined,
                 rows: rows.map((row) => Object.fromEntries(Object.entries(row).map(([key, value]) => [key, textEvidence(value)]))) });
               return { success: true, results: rows };
             };
@@ -305,6 +353,11 @@ async function runController(command, scenario = {}) {
                   }
                   emit({ kind: 'probe-readback-fault', databaseId: id, phase, corruption });
                 }
+              }
+              if (${native} && body.batch && statements.every(({ sql }) => /^SELECT hex\\(substr/.test(sql))) {
+                emit({ kind: 'native-slice-batch', statementCount: statements.length,
+                  requestBytes: Buffer.byteLength(init.body), responseBytes: Buffer.byteLength(JSON.stringify(results)),
+                  reservedResponseBytes: 4096 + statements.reduce((bytes, { params }) => bytes + params[1] * 2 + 4096, 0) });
               }
               return response(results);
             } catch (error) {
@@ -397,16 +450,29 @@ async function runController(command, scenario = {}) {
         CLOUDFLARE_PPE_API_TOKEN: 'synthetic-cloudflare-token', PREVIEW_BEARER_SEED: SEED,
         GITHUB_TOKEN: 'synthetic-github-token' },
     });
-    const output = `${result.stdout}\n${result.stderr}`;
+    let output = `${result.stdout}\n${result.stderr}`;
     for (const secret of [SEED, 'synthetic-cloudflare-token', 'synthetic-github-token',
       'atomicity-private-provider-text', 'index_batch_atomicity_intentional_invalid_json',
       'ATOMICITY_CLEANUP_PRIVATE_CANARY',
       D1_BATCH_PROBE_TEXT, JSON.stringify(D1_BATCH_PROBE_TEXT).slice(1, -1)]) {
       assert.ok(!output.includes(secret), 'CLI evidence must not expose credentials, provider text or probe values');
     }
+    let failureProgress = '';
+    if (native && (result.error || result.status !== 0)) {
+      let progress = nativeControllerProgress(null);
+      try {
+        const lines = (await readFile(eventPath, 'utf8')).split('\n');
+        const truncatedLastRecord = lines.pop().length > 0;
+        progress = nativeControllerProgress(lines.map((line) => JSON.parse(line)), truncatedLastRecord);
+      } catch {
+        // Do not forward parsing/read errors: they may quote private event data.
+      }
+      failureProgress = `\nnativeProgress=${JSON.stringify(progress)}`;
+      output += failureProgress;
+    }
     if (result.error) {
       throw new Error(
-        `Failed to spawn ${command} controller (status=${result.status}, signal=${result.signal})\nstdout:\n${result.stdout ?? ''}\nstderr:\n${result.stderr ?? ''}`,
+        `Failed to spawn ${command} controller (status=${result.status}, signal=${result.signal})\nstdout:\n${result.stdout ?? ''}\nstderr:\n${result.stderr ?? ''}${failureProgress}`,
         { cause: result.error },
       );
     }
@@ -939,41 +1005,199 @@ for (const scenario of [
   });
 }
 
-test('native-copy-proof runs the real helper through CLI schema bindings and cleans only its scratch', async () => {
+test('native-copy-proof runs the real helper through CLI schema bindings and cleans only its scratch', async (context) => {
   const result = await runController('native-copy-proof', { existing: true, foreignCount: 1 });
   assert.equal(result.status, 0, result.output);
+  context.diagnostic(`nativeProgress=${JSON.stringify(nativeControllerProgress(result.events))}`);
   const summary = JSON.parse(result.stdout.trim().split('\n').at(-1));
   assert.equal(summary.state, 'verified');
   assert.equal(summary.probe, 'd1-native-full-copy');
-  assert.equal(summary.rows, 1463);
+  assert.equal(summary.growthRows, 46);
+  assert.equal(summary.rows, summary.denseRows + summary.growthRows + 2);
   assert.equal(summary.denseRows, 1461);
   assert.equal(summary.columns, 18);
   assert.equal(summary.shards, 2);
-  assert.equal(summary.ftsMatches, 1465);
+  assert.equal(summary.legacyProbeMatches, 0);
+  assert.equal(summary.nativeProbeMatches, 1);
   assert.equal(summary.freezeTriggers, 3);
-  assert.equal(summary.ordinaryPages, 2);
+  assert.ok(summary.splitFtsProbePages > 0);
+  assert.ok(summary.maxFtsParametersBytes <= 1_048_576);
+  assert.ok(summary.maxUnsplitFtsParametersBytes > 1_048_576);
   assert.equal(summary.fallbackPages, 1);
   assert.equal(summary.longTextBytes, 1_100_061);
   assert.match(summary.sha256, /^[0-9a-f]{64}$/);
   const sql = result.events.filter((event) => event.kind === 'probe-sql');
   const denseIds = Array.from({ length: summary.denseRows }, (_, index) => index + 1);
-  const denseMatches = sql.filter((event) => /\bMATCH\b/.test(event.sql) && /ORDER BY rowid$/.test(event.sql));
-  assert.equal(denseMatches.length, 2, 'the CLI must execute complete independent dense FTS queries on both shards');
-  assert.deepEqual(denseMatches.map(({ databaseId, rows }) => ({ databaseId, rows })), [
-    { databaseId: 'created-2', rows: [] },
-    { databaseId: 'created-3', rows: denseIds.map((rowid) => ({ rowid })) },
-  ]);
+  const seeds = result.events.filter((event) => event.kind === 'native-fixture-seed' && event.databaseId === 'created-1');
+  assert.equal(seeds.length, 2, 'the original dense phase and appended fold-growth phase must both execute native JSON1 seeding');
+  const denseSeed = seeds[0];
+  const growthSeed = seeds[1];
+  assert.equal(denseSeed.tuples.length, summary.denseRows);
+  assert.equal(growthSeed.tuples.length, summary.growthRows);
+  assert.ok(seeds.every(({ tuples }) => tuples.every((tuple) => tuple.length === BLOCK_COLUMNS.length)));
+  const denseRows = denseSeed.tuples.map((tuple) => Object.fromEntries(BLOCK_COLUMNS.map((column, index) => [column, tuple[index]])));
+  const growthRows = growthSeed.tuples.map((tuple) => Object.fromEntries(BLOCK_COLUMNS.map((column, index) => [column, tuple[index]])));
+  assert.deepEqual(denseRows.map(({ id }) => id), denseIds);
+  for (const [index, row] of growthRows.entries()) {
+    assert.equal(row.id, summary.denseRows + index + 1);
+    assert.equal(row.text, `a${'Ⱥ'.repeat(11000)}${index}`);
+  }
+  const longWords = [`a${'中'.repeat(11000)}`, `a${'🫠'.repeat(8250)}`,
+    `a${'Ж'.repeat(16500)}`, `a${'ø'.repeat(16500)}`];
+  for (const [index, text] of longWords.entries()) {
+    assert.equal(Buffer.byteLength(text), 33001);
+    assert.equal(denseRows[16 + index].text, text, 'long boundary rows must contain only the original full valid word');
+  }
+  for (const [index, { text }] of denseRows.entries()) {
+    if (index >= 16 + longWords.length) assert.equal(text, `v${index}\u0000 nativedensesuffix`,
+      'compact remaining prefixes must preserve the bounded dense source page');
+  }
+  const suffixIds = denseRows.filter(({ text }) => text.includes('\u0000 nativedensesuffix')).map(({ id }) => id);
+  const suffixEvidence = textEvidence('nativedensesuffix');
+  const denseMatches = sql.filter((event) => /\bMATCH\b/.test(event.sql)
+    && event.params.length === 1 && event.params[0]?.sha256 === suffixEvidence.sha256);
+  for (const [databaseId, expected] of [['created-2', []], ['created-3', suffixIds]]) {
+    const matches = denseMatches.filter((event) => event.databaseId === databaseId);
+    assert.ok(matches.length > 0, 'both shards require independent native after-NUL suffix evidence');
+    for (const { rows } of matches) assert.deepEqual(rows, expected.map((rowid) => ({ rowid })));
+  }
+  const points = sql.filter((event) => /\bMATCH\b/.test(event.sql) && event.params.length === 2);
+  const assertPoint = (databaseId, term, id, expected) => {
+    const evidence = textEvidence(term);
+    const matches = points.filter((event) => event.databaseId === databaseId
+      && event.params[0]?.sha256 === evidence.sha256 && event.params[1] === id);
+    assert.ok(matches.length > 0, 'the CLI must execute actual independent native point checks');
+    for (const { rows } of matches) assert.deepEqual(rows, expected);
+    return matches;
+  };
+  const oldSource = assertPoint('created-1', '"alpha"', 7, []);
+  const nativeSource = assertPoint('created-1', '"🫠alpha"', 7, [{ rowid: 7 }]);
+  const firstCopyWrite = sql.findIndex((event) => event.databaseId !== 'created-1'
+    && /^INSERT INTO blocks \(/.test(event.sql));
+  assert.ok(firstCopyWrite >= 0);
+  assert.ok([...oldSource, ...nativeSource].every((event) => sql.indexOf(event) < firstCopyWrite),
+    'native old-alpha-negative and whole-term-positive controls must run before the copier writes');
+  const nativePoints = [
+    ...['alpha', 'bravo', 'charlie', 'delta', 'echo', 'foxtrot'].map((word, index) =>
+      [index + 1, [`nativevaried${word}`]]),
+    [7, ['🫠alpha']], [8, ['🫠', 'alpha']], [9, ['🧮alpha']], [10, ['🧠alpha']],
+    [11, ['🛠alpha']], [12, ['al🫠pha']], [13, ['₿alpha']], [14, ['\u{1CF00}alpha']], [15, ['🫠']],
+    ...longWords.map((text, index) => [17 + index, [text]]),
+  ];
+  for (const [id, terms] of nativePoints) {
+    for (const term of terms) assertPoint('created-3', `"${term}"`, id, [{ rowid: id }]);
+  }
+  for (const row of growthRows) assertPoint('created-3', `"${row.text}"`, row.id, [{ rowid: row.id }]);
+  const probeGroups = sql.filter(({ ftsProbeIds }) => ftsProbeIds !== undefined);
+  assert.equal(summary.maxFtsParametersBytes, Math.max(...probeGroups.map(({ parametersBytes }) => parametersBytes)));
+  assert.ok(probeGroups.every(({ parametersBytes }) => parametersBytes <= 1_048_576),
+    'actual serialized group params envelopes must obey the internal budget, not an assumed native rejection threshold');
+  assert.deepEqual(probeGroups.filter(({ databaseId }) => databaseId === 'created-2').flatMap(({ ftsProbeIds }) => ftsProbeIds), [0]);
+  assert.deepEqual(probeGroups.filter(({ databaseId }) => databaseId === 'created-3').flatMap(({ ftsProbeIds }) => ftsProbeIds),
+    [...denseIds, ...growthRows.map(({ id }) => id), INDEX_ID_SPAN - 1]);
+  const denseGroup = probeGroups.find(({ databaseId }) => databaseId === 'created-3');
+  assert.deepEqual(denseGroup.ftsProbeIds, denseIds, 'the original 1461-row dense first phase must retain its native geometry');
+  const growthGroups = probeGroups.filter(({ ftsProbeIds }) => ftsProbeIds.some((id) => id > summary.denseRows && id < INDEX_ID_SPAN - 1));
+  assert.ok(growthGroups.length > 1, 'appended fold growth must actually execute multiple native MATCH groups');
+  assert.deepEqual(growthGroups.flatMap(({ rows }) => rows.map(({ rowid }) => rowid)).sort((a, b) => a - b),
+    growthRows.map(({ id }) => id));
+  const growthIds = new Set(growthRows.map(({ id }) => id));
+  const originalWordBatches = result.events.filter(({ kind, body }) => kind === 'request'
+    && body?.batch?.length > 0 && body.batch.every(({ sql, params }) => /\bMATCH\b/.test(sql)
+      && params.length === 2 && growthIds.has(params[1])));
+  for (const batch of originalWordBatches) {
+    assert.ok(batch.body.batch.length <= summary.growthRows);
+    assert.ok(batch.bodyBytes > 0 && batch.bodyBytes <= 1_048_576,
+      'the entire actual serialized independent ORIGINAL-word batch must obey the byte budget');
+  }
+  let splitPages = 0;
+  let maxUnsplitBytes = 0;
+  let growthPages = 0;
+  const pendingGroups = new Map();
+  for (const event of sql) {
+    if (event.ftsProbeIds !== undefined) {
+      if (!pendingGroups.has(event.databaseId)) pendingGroups.set(event.databaseId, []);
+      pendingGroups.get(event.databaseId).push(event);
+    }
+    if (event.databaseId !== 'created-1' || !/\bDELETE FROM blocks\b/.test(event.sql)) continue;
+    let split = false;
+    let hasGrowth = false;
+    for (const groups of pendingGroups.values()) {
+      if (groups.some(({ ftsProbeIds }) => ftsProbeIds.some((id) => growthIds.has(id)))) hasGrowth = true;
+      // Reconstitute the exact escaped params envelope from actual byte counts:
+      // remove each six-byte envelope and add the inter-group entry commas.
+      const bytes = 6 + groups.reduce((bytes, group) => bytes + group.parametersBytes - 6, 0) + groups.length - 1;
+      maxUnsplitBytes = Math.max(maxUnsplitBytes, bytes);
+      if (bytes > 1_048_576) {
+        assert.ok(groups.length > 1, 'one actual logical source page must split its oversized native probe parameters');
+        split = true;
+      }
+    }
+    if (split) splitPages += 1;
+    if (hasGrowth) growthPages += 1;
+    pendingGroups.clear();
+  }
+  assert.equal(summary.splitFtsProbePages, splitPages);
+  assert.equal(summary.maxUnsplitFtsParametersBytes, maxUnsplitBytes);
+  assert.equal(originalWordBatches.length, growthPages + 1,
+    'every real growth page needs a native ORIGINAL-word point batch before ACK and another after retirement');
+  const ordinaryWrites = sql.filter(({ databaseId, sql, params }) => databaseId !== 'created-1'
+    && /^INSERT INTO blocks \(/.test(sql) && params.length === 1);
+  assert.equal(summary.ordinaryPages, ordinaryWrites.length, 'ordinary page counts must reflect actual native writes');
+  const sliceBatches = result.events.filter(({ kind }) => kind === 'native-slice-batch');
+  assert.ok(sliceBatches.length > 0, 'the CLI must execute actual native full-byte slice batches');
+  assert.ok(sliceBatches.some(({ statementCount }) => statementCount > 1),
+    'the actual native CLI must pack multiple slice statements per request');
+  for (const { statementCount, requestBytes, responseBytes, reservedResponseBytes } of sliceBatches) {
+    assert.ok(statementCount > 0 && statementCount <= 100);
+    assert.ok(requestBytes <= 1_048_576);
+    assert.ok(reservedResponseBytes <= 1_048_576,
+      'known hex bytes plus conservative INTERNAL reserves must fit the response budget');
+    assert.ok(responseBytes <= 1_048_576, 'actual aggregate native result JSON must stay bounded too');
+  }
+  // Each original growth word is independently probed before its source ACK as
+  // well as after retirement; batched statements must retain actual native point hits.
+  for (const row of growthRows) {
+    const points = assertPoint('created-3', `"${row.text}"`, row.id, [{ rowid: row.id }]);
+    const group = growthGroups.find(({ ftsProbeIds }) => ftsProbeIds.includes(row.id));
+    const retirement = sql.findIndex((event, index) => index > sql.indexOf(group)
+      && event.databaseId === 'created-1' && /\bDELETE FROM blocks\b/.test(event.sql));
+    assert.ok(retirement > sql.indexOf(group));
+    assert.ok(points.some((event) => sql.indexOf(event) > sql.indexOf(group) && sql.indexOf(event) < retirement),
+      'independent whole-word evidence must precede the ACK of its actual source page');
+  }
+  for (const [id, terms] of [
+    [7, ['alpha']], [9, ['alpha']], [10, ['alpha']], [11, ['alpha']], [12, ['al']],
+    [13, ['alpha']], [14, ['alpha']], [16, ['index-migration-tokenless-probe', '🫠', 'alpha']],
+  ]) {
+    for (const term of terms) assertPoint('created-3', `"${term}"`, id, []);
+  }
+  const independent = [...points.filter((event) => event.databaseId !== 'created-1'), ...denseMatches];
+  assert.equal(summary.ftsMatches, independent.reduce((count, { rows }) => count + rows.length, 0),
+    'summary FTS matches must be derived from observed independent point and suffix hits');
   const sourceBulk = sql.filter((event) => event.databaseId === 'created-1'
     && /^INSERT INTO blocks \(/.test(event.sql) && /FROM json_each\(\?\)/.test(event.sql));
-  assert.equal(sourceBulk.length, 1, 'all dense source rows are seeded by one real JSON1 statement');
-  assert.equal(sourceBulk[0].params.length, 1);
-  assert.ok(sourceBulk[0].params[0].utf8Bytes < 1_048_576);
+  assert.equal(sourceBulk.length, 2);
+  assert.ok(sourceBulk.every(({ params }) => params.length === 1 && params[0].utf8Bytes < 1_048_576),
+    'both actual JSON1 seed strings must be bounded, including the unexpanded source words');
+  const sourceSeed = result.events.find((event) => event.kind === 'request' && event.body?.batch
+    && new URL(event.url).pathname.endsWith('/created-1/query')
+    && event.body.batch.some(({ sql }) => /^INSERT INTO blocks \(/.test(sql)));
+  assert.ok(sourceSeed);
+  assert.equal(sourceSeed.body.batch.filter(({ sql }) => /^INSERT INTO blocks \(/.test(sql)).length, 4,
+    'one ordinary row, dense phase, appended growth and huge fallback must actually be seeded');
+  assert.equal(sourceSeed.body.batch.filter(({ sql }) => /^INSERT INTO blocks_fts\b/.test(sql)).length, 1);
+  const sourceFtsWrites = sql.filter((event) => event.databaseId === 'created-1'
+    && /\bblocks_fts\b/.test(event.sql) && /^(?:INSERT|UPDATE|DELETE)\b/.test(event.sql));
+  assert.equal(sourceFtsWrites.length, 1, 'source retirement must not issue legacy FTS mutations after seeding');
+  assert.equal(sourceFtsWrites[0].sql, sourceSeed.body.batch.find(({ sql }) => /^INSERT INTO blocks_fts\b/.test(sql)).sql);
   const finalSourceCount = sql.filter((event) => event.databaseId === 'created-1'
     && event.sql === 'SELECT COUNT(*) AS rows FROM blocks').at(-1);
   assert.deepEqual(finalSourceCount.rows, [{ rows: 0 }]);
   const queries = result.events.filter((event) => event.kind === 'request'
     && new URL(event.url).pathname.endsWith('/query'));
-  assert.ok(queries.length <= 200, `complete native CLI proof must use bounded RPCs, observed ${queries.length}`);
+  assert.ok(queries.length <= 200 + summary.growthRows * 6,
+    `complete native CLI proof must retain bulk copying with bounded independent growth point batches/slice checks, observed ${queries.length}`);
   const migrations = result.events.filter((event) => event.kind === 'migrate');
   assert.equal(migrations.length, 3);
   const creations = result.events.filter((event) => event.kind === 'request' && event.method === 'POST'

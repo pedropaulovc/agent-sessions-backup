@@ -16,6 +16,7 @@ const PATH = '/api/v1/admin/reindex-range';
 const FROM = '2026-09-03T12:00:00.000Z';
 const TO = '2026-09-10T12:00:00.000Z';
 const OLD = '2020-01-01T00:00:00.000Z';
+const DISPATCHED = '2020-01-01T00:00:00.001Z';
 const ctx = {} as ExecutionContext;
 
 interface Accepted {
@@ -29,6 +30,18 @@ interface Status extends Accepted {
   counts: { selected: number; enqueued: number; ready: number; pending: number; error: number; blocked: number };
 }
 interface Fixture { sessionId: string; fileId: number; key: string; hash: string }
+interface FixtureState {
+  parse_state: string;
+  parsed_at: string | null;
+  reserved_at: string | null;
+  reserved_by: number | null;
+  reserved_reason: string | null;
+  reservation_generation: number;
+  content_hash: string;
+  canonical_file_id: number | null;
+  index_state: string | null;
+  updated_at: string | null;
+}
 let fixtures: Fixture[];
 let jobs: string[];
 let sent: ParseMessage[];
@@ -58,9 +71,20 @@ async function status(jobId: string): Promise<Status> {
   return response.json<Status>();
 }
 
+async function orderDispatchAfterBaseline(jobId: string): Promise<void> {
+  // The fixtures start at OLD. Give dispatch a fixed, strictly newer lower bound;
+  // actual consumer writes must still refresh BOTH timestamps to cross it. This
+  // controls stored test preconditions, not SQL, responses, or consumer state.
+  // Keep fixture ordering independent of wall-clock samples across workerd events.
+  await db.prepare(`UPDATE reindex_range_targets SET dispatched_at = ?2
+    WHERE job_id = ?1 AND dispatched_at IS NOT NULL AND dispatch_state NOT IN ('ready', 'error')`)
+    .bind(jobId, DISPATCHED).run();
+}
+
 async function resume(jobId: string): Promise<Status> {
   const response = await continueReindexRange(testEnv, jobId);
   expect([200, 202]).toContain(response.status);
+  await orderDispatchAfterBaseline(jobId);
   return response.json<Status>();
 }
 
@@ -98,9 +122,9 @@ async function deliver(message: ParseMessage): Promise<void> {
 
 async function state(fixture: Fixture) {
   return db.prepare(`SELECT f.parse_state, f.parsed_at, f.reserved_at, f.reserved_by, f.reserved_reason,
-    f.reservation_generation, s.index_state, s.updated_at FROM files f
+    f.reservation_generation, f.content_hash, s.canonical_file_id, s.index_state, s.updated_at FROM files f
     LEFT JOIN sessions s ON s.session_id = ?2 WHERE f.id = ?1`)
-    .bind(fixture.fileId, fixture.sessionId).first();
+    .bind(fixture.fileId, fixture.sessionId).first<FixtureState>();
 }
 
 beforeEach(async () => {
@@ -211,7 +235,34 @@ describe('date-scoped reindex snapshots and parse completion', () => {
     expect(await status(accepted.job_id)).toMatchObject({ status: 'indexing', counts: { ready: 0 } });
     await db.prepare("UPDATE sessions SET index_state = 'ready' WHERE session_id = ?1").bind(fixture.sessionId).run();
     expect(await status(accepted.job_id)).toMatchObject({ counts: { ready: 0 } });
+    const target = await db.prepare('SELECT dispatched_at FROM reindex_range_targets WHERE job_id = ?1 AND session_id = ?2')
+      .bind(accepted.job_id, fixture.sessionId).first<{ dispatched_at: string }>();
+    const atDispatch = target!.dispatched_at;
+    const beforeDispatch = new Date(Date.parse(atDispatch) - 1).toISOString();
+    // Either stale side must keep the target pending, even if the other side is exactly fresh.
+    await db.batch([
+      db.prepare('UPDATE files SET parsed_at = ?2 WHERE id = ?1').bind(fixture.fileId, atDispatch),
+      db.prepare('UPDATE sessions SET updated_at = ?2 WHERE session_id = ?1').bind(fixture.sessionId, beforeDispatch),
+    ]);
+    expect(await status(accepted.job_id)).toMatchObject({ status: 'indexing', counts: { ready: 0 } });
+    await db.batch([
+      db.prepare('UPDATE files SET parsed_at = ?2 WHERE id = ?1').bind(fixture.fileId, beforeDispatch),
+      db.prepare('UPDATE sessions SET updated_at = ?2 WHERE session_id = ?1').bind(fixture.sessionId, atDispatch),
+    ]);
+    expect(await status(accepted.job_id)).toMatchObject({ status: 'indexing', counts: { ready: 0 } });
+    // The actual parse must replace the stale side; do not repair its state in the fixture.
     await deliver(sent[0]!);
+    const parsed = (await state(fixture))!;
+    expect(parsed).toMatchObject({
+      parse_state: 'parsed', index_state: 'ready', content_hash: fixture.hash, canonical_file_id: fixture.fileId,
+    });
+    expect(parsed.parsed_at !== null && parsed.parsed_at >= atDispatch).toBe(true);
+    expect(parsed.updated_at !== null && parsed.updated_at > atDispatch).toBe(true);
+    // Exact equality is fresh on both sides, not a reason to wait for another parse.
+    await db.batch([
+      db.prepare('UPDATE files SET parsed_at = ?2 WHERE id = ?1').bind(fixture.fileId, atDispatch),
+      db.prepare('UPDATE sessions SET updated_at = ?2 WHERE session_id = ?1').bind(fixture.sessionId, atDispatch),
+    ]);
     expect(await status(accepted.job_id)).toMatchObject({ status: 'complete', counts: { selected: 1, enqueued: 1, ready: 1, pending: 0, error: 0, blocked: 0 } });
     await resume(accepted.job_id);
     expect(sent).toHaveLength(1);
@@ -293,8 +344,37 @@ describe('date-scoped reindex snapshots and parse completion', () => {
     await resume(accepted.job_id);
     expect(await state(reserved)).toEqual(before);
     expect(sent.map((message) => message.file_id)).toEqual([healthy.fileId]);
+    expect(await db.prepare(`SELECT baseline_parsed_at, baseline_updated_at, dispatched_at
+      FROM reindex_range_targets WHERE job_id = ?1 AND session_id = ?2`)
+      .bind(accepted.job_id, healthy.sessionId).first()).toEqual({
+      baseline_parsed_at: OLD, baseline_updated_at: OLD, dispatched_at: DISPATCHED,
+    });
     await deliver(sent[0]!);
-    expect(await status(accepted.job_id)).toMatchObject({ counts: { ready: 1, blocked: 1 } });
+    const healthyState = (await state(healthy))!;
+    expect(healthyState).toMatchObject({
+      parse_state: 'parsed', index_state: 'ready', content_hash: healthy.hash, canonical_file_id: healthy.fileId,
+      reserved_at: null, reserved_by: null, reserved_reason: null, reservation_generation: 0,
+    });
+    // Ingest completion must be newer than every fixture/transcript timestamp.
+    expect(healthyState.parsed_at !== null && healthyState.parsed_at > TO).toBe(true);
+    expect(healthyState.updated_at !== null && healthyState.updated_at > TO).toBe(true);
+    expect(await state(reserved)).toEqual(before);
+    const progressed = await status(accepted.job_id);
+    let readinessEvidence: string | undefined;
+    if (progressed.counts.ready !== 1 || progressed.counts.blocked !== 1) {
+      const observed = await db.prepare(`SELECT t.dispatch_state, t.dispatched_at, t.enqueued_at,
+        t.baseline_parsed_at, t.baseline_updated_at, t.error_code,
+        f.parse_state, f.parsed_at, s.index_state, s.updated_at,
+        f.content_hash IS t.content_hash AS source_matches,
+        s.canonical_file_id IS t.file_id AS canonical_matches,
+        f.parsed_at >= t.dispatched_at AS file_time_fresh,
+        s.updated_at >= t.dispatched_at AS session_time_fresh
+        FROM reindex_range_targets t LEFT JOIN files f ON f.id = t.file_id
+        LEFT JOIN sessions s ON s.session_id = t.session_id
+        WHERE t.job_id = ?1 AND t.session_id = ?2`).bind(accepted.job_id, healthy.sessionId).first();
+      readinessEvidence = JSON.stringify({ progressed, observed, healthyState, reservation: await state(reserved) });
+    }
+    expect(progressed, readinessEvidence).toMatchObject({ counts: { ready: 1, blocked: 1 } });
     // The owner releases its reservation; the same fixed job can now proceed.
     await db.prepare(`UPDATE files SET parse_state = 'parsed', reserved_at = NULL, reserved_by = NULL,
       reserved_reason = NULL WHERE id = ?1`).bind(reserved.fileId).run();
@@ -463,6 +543,7 @@ describe('date reindex route authorization', () => {
     const continued = await route(request(accepted.status_url, 'POST', current), production, ctx);
     expect([200, 202]).toContain(continued.status);
     expect(await continued.json()).toMatchObject({ counts: { enqueued: 1, ready: 0 } });
+    await orderDispatchAfterBaseline(accepted.job_id);
     await deliver(sent[0]!);
     const polled = await route(request(accepted.status_url, 'GET', current), production, ctx);
     expect(polled.status).toBe(200);
