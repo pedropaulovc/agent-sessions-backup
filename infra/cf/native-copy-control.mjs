@@ -353,6 +353,123 @@ async function assertFrozen(source) {
   requireProof(rows.length === 1 && rows[0].id === 1 && rows[0].state === 'frozen', 'source-fence');
 }
 
+// Run only after the complete public positive proof, reusing its owned scratch
+// databases. Raw invalid TEXT never crosses the REST response or public output:
+// only the copier itself attempts that transport; retention uses SQL hex().
+async function proveNativeRetirementDiagnostic({ source, shards, gate, ordinary, expected }) {
+  const phase = 'retirement-diagnostic';
+  const probe = { ...ordinary, id: INDEX_ID_SPAN - 2, text: 'nativeinvalidtext' };
+  requireProof(!expected.some((row) => row.id === probe.id), phase);
+  const decoded = await source.query("SELECT hex(unhex('61FF62')) AS bytes");
+  requireProof(decoded.length === 1 && decoded[0].bytes === '61FF62', phase);
+  // Only this disposable copy checkpoint is reset; no catalog/activation state
+  // and no destination rows from the 1,509-row proof are removed.
+  await shards[0].query('DELETE FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT]);
+  requireProof(await readCheckpoint(shards[0], COPY_CHECKPOINT) === null, phase);
+  const textIndex = BLOCK_COLUMNS.indexOf('text');
+  await source.batch([
+    { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'copying' WHERE id = 1`, params: [] },
+    {
+      sql: `INSERT INTO blocks (${BLOCK_COLUMNS.map(quote).join(',')})
+        VALUES (${BLOCK_COLUMNS.map((_, index) => index === textIndex ? "CAST(X'61FF62' AS TEXT)" : '?').join(',')})`,
+      params: BLOCK_COLUMNS.filter((_, index) => index !== textIndex).map((column) => probe[column]),
+    },
+    { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'frozen' WHERE id = 1`, params: [] },
+  ]);
+  const rawSource = () => source.query(
+    'SELECT id, typeof(text) AS storage_type, hex(CAST(text AS BLOB)) AS bytes FROM blocks ORDER BY id');
+  const before = await rawSource();
+  requireProof(before.length === 1 && before[0].id === probe.id
+    && before[0].storage_type === 'text' && before[0].bytes === '61FF62', phase);
+  await assertFrozen(source);
+  let checkpointSnapshot = JSON.stringify(null);
+  let originalError;
+  let retirementBatches = 0;
+  let diagnosticQueries = 0;
+  let writesAfterFailure = 0;
+  const observedSource = {
+    id: source.id,
+    async query(sql, params = []) {
+      if (originalError) {
+        diagnosticQueries += 1;
+        requireProof(/^\s*WITH verified\b/.test(sql), phase);
+      }
+      return await source.query(sql, params);
+    },
+    async batch(statements) {
+      if (originalError) writesAfterFailure += 1;
+      const retirement = statements.some(({ sql }) => /\bDELETE FROM blocks\b/.test(sql));
+      if (retirement) {
+        retirementBatches += 1;
+        requireProof(statements.length === 5
+          && statements.reduce((count, statement) => count + statement.params.length, 0) === 3, phase);
+        const durable = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+        requireProof(durable?.pending?.phase === 'verified'
+          && JSON.stringify(durable) === checkpointSnapshot, phase);
+        await assertFrozen(source);
+      }
+      try { return await source.batch(statements); }
+      catch (error) {
+        if (retirement) originalError = error;
+        throw error;
+      }
+    },
+  };
+  let failure;
+  try {
+    await copyFrozenIndex({
+      source: observedSource, shards, gate,
+      checkpointHook: async (checkpoint) => {
+        const durable = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+        requireProof(JSON.stringify(durable) === JSON.stringify(checkpoint), phase);
+        checkpointSnapshot = JSON.stringify(durable);
+      },
+    });
+  } catch (error) { failure = error; }
+  requireProof(failure !== undefined && writesAfterFailure === 0, phase);
+  requireProof(JSON.stringify(await rawSource()) === JSON.stringify(before), phase);
+  await assertFrozen(source);
+  const retained = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+  requireProof(JSON.stringify(retained) === checkpointSnapshot, phase);
+  // The negative copy can add its collision-free row, but must not change any
+  // original destination value or its native FTS entry.
+  for (const [index, db] of shards.entries()) {
+    const rows = (await readRows(db, phase)).filter((row) => row.id !== probe.id);
+    const wanted = expected.filter((row) => indexShardForSessionId(row.session_id, shards.length) === index);
+    requireProof(rows.length === wanted.length && rowsSha256(rows) === rowsSha256(wanted), phase);
+    const indexed = await db.query('SELECT rowid FROM blocks_fts WHERE rowid != CAST(? AS INTEGER) ORDER BY rowid', [probe.id]);
+    requireProof(indexed.length === wanted.length
+      && indexed.every((row, offset) => row.rowid === wanted[offset].id), phase);
+  }
+  if (!retirementBatches) {
+    // REST may reject invalid TEXT before the verified retirement transaction.
+    // Report that public boundary honestly, rather than claiming the diagnostic
+    // was exercised. Only allowlisted native classification leaves this helper.
+    const safe = safeFailure(failure, phase);
+    return { outcome: 'rejected-before-retirement', phase: safe.nativeCopyPhase,
+      nativeClass: safe.nativeCopyClass,
+      ...(safe.nativeCopyInvariant ? { invariant: safe.nativeCopyInvariant } : {}),
+      ...(safe.nativeCopyFailureKind ? { failureKind: safe.nativeCopyFailureKind } : {}),
+      sourceRetention: 'retained', freezeRetention: 'frozen', checkpointRetention: 'retained',
+      positiveRowsRetained: expected.length };
+  }
+  requireProof(retirementBatches === 1 && failure === originalError
+    && failure.d1Phase === COPY_PHASES.SOURCE_DELETE_AND_FREEZE
+    && failure.d1SqlReason === 'malformed-json' && diagnosticQueries === 1
+    && retained?.pending?.phase === 'verified' && retained.rows === 0
+    && retained.pending.rows.length === 1 && retained.pending.rows[0].id === probe.id, phase);
+  const comparison = {
+    status: 'mismatch', expectedRows: 1, presentRows: 1, missingRows: 0, mismatchingRows: 1,
+    columns: [{ index: textIndex, mismatchingRows: 1, typeMismatchRows: 0,
+      byteMismatchRows: 1, lengthMismatchRows: 1, sourceTypes: ['text'], snapshotTypes: ['text'] }],
+  };
+  requireProof(JSON.stringify(failure.d1SourceComparison) === JSON.stringify(comparison), phase);
+  return { outcome: 'verified', phase: COPY_PHASES.SOURCE_DELETE_AND_FREEZE,
+    nativeClass: 'malformed-json', statements: 5, binds: 3, comparison,
+    sourceRetention: 'retained', freezeRetention: 'frozen', checkpointRetention: 'retained',
+    positiveRowsRetained: expected.length };
+}
+
 async function proveNativeCopy({ source, shards, gate }) {
   let phase = 'seed';
   try {
@@ -561,12 +678,14 @@ async function proveNativeCopy({ source, shards, gate }) {
     requireProof((await source.query('SELECT COUNT(*) AS rows FROM blocks'))[0]?.rows === 0, 'source-empty');
     await assertFrozen(source);
     requireProof(JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === JSON.stringify(state), 'checkpoint-proof');
+    phase = 'retirement-diagnostic';
+    const retirementDiagnostic = await proveNativeRetirementDiagnostic({ source, shards, gate, ordinary, expected });
     await gate();
     return { state: 'verified', probe: 'd1-native-full-copy', rows: expected.length, columns: BLOCK_COLUMNS.length,
       shards: shards.length, denseRows: dense.length, growthRows: growth.length, ordinaryPages, fallbackPages,
       ftsMatches, freezeTriggers: 3, maxFtsParametersBytes, maxUnsplitFtsParametersBytes, splitFtsProbePages,
       legacyProbeMatches: legacyProbe.length, nativeProbeMatches: nativeProbe.length,
-      longTextBytes: Buffer.byteLength(long.text), sha256: expectedSha256 };
+      longTextBytes: Buffer.byteLength(long.text), sha256: expectedSha256, retirementDiagnostic };
   } catch (error) {
     throw safeFailure(error, phase);
   }

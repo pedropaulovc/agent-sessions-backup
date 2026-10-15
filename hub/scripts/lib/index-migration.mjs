@@ -782,36 +782,44 @@ async function verifyPending(source, shards, state, layout, tokenizer) {
 async function sourceRetirementComparison(source, columns, layout, page) {
   const unavailable = (reason) => ({ status: 'unavailable', reason });
   if (page.json === null) return unavailable('canonical-budget');
-  const flags = columns.flatMap((_, index) => {
-    const stored = `b.${layout.quoted[index]}`, copied = `json_extract(v.row,${layout.paths[index]})`;
-    return [
-      `(${stored} IS ${copied}) AS e${index}`,
-      `(typeof(${stored}) IS typeof(${copied})) AS t${index}`,
-      `(CAST(${stored} AS BLOB) IS CAST(${copied} AS BLOB)) AS b${index}`,
-      `(length(CAST(${stored} AS BLOB)) IS length(CAST(${copied} AS BLOB))) AS l${index}`,
-      `typeof(${stored}) AS s${index}`, `typeof(${copied}) AS v${index}`,
-    ];
-  });
+  const idIndex = columns.indexOf('id');
   const types = ['null', 'integer', 'real', 'text', 'blob'];
-  const typeBits = (column) => `CASE ${column} ${types.map((type, index) =>
+  const typeBits = (value) => `CASE typeof(${value}) ${types.map((type, index) =>
     `WHEN '${type}' THEN ${1 << index}`).join(' ')} ELSE 0 END`;
-  const counters = columns.flatMap((_, index) => [
-    `COALESCE(SUM(present AND NOT e${index}),0) AS m${index}`,
-    `COALESCE(SUM(present AND NOT e${index} AND NOT t${index}),0) AS t${index}`,
-    `COALESCE(SUM(present AND NOT e${index} AND NOT b${index}),0) AS b${index}`,
-    `COALESCE(SUM(present AND NOT e${index} AND NOT l${index}),0) AS l${index}`,
-    `COALESCE(SUM(DISTINCT CASE WHEN present AND NOT e${index} THEN ${typeBits(`s${index}`)} ELSE 0 END),0) AS s${index}`,
-    `COALESCE(SUM(DISTINCT CASE WHEN present AND NOT e${index} THEN ${typeBits(`v${index}`)} ELSE 0 END),0) AS v${index}`,
-  ]);
+  // Native D1 limits every SELECT to 100 columns, including materialized CTEs.
+  // Each column's six numeric flags share one JSON cell; the joined primary key
+  // is already equal, so omitting it leaves at most 99 cells plus presence.
+  const flags = columns.flatMap((_, index) => {
+    if (index === idIndex) return [];
+    const stored = `b.${layout.quoted[index]}`, copied = `json_extract(v.row,${layout.paths[index]})`;
+    return [`json_array(${stored} IS ${copied},
+      typeof(${stored}) IS typeof(${copied}),
+      CAST(${stored} AS BLOB) IS CAST(${copied} AS BLOB),
+      length(CAST(${stored} AS BLOB)) IS length(CAST(${copied} AS BLOB)),
+      ${typeBits(stored)}, ${typeBits(copied)}) AS c${index}`];
+  });
+  const flag = (index, offset) => index === idIndex ? '1' : `json_extract(c${index},'$[${offset}]')`;
+  const counters = columns.map((_, index) => {
+    if (index === idIndex) return 'json_array(0,0,0,0,0,0)';
+    const mismatch = `present AND NOT ${flag(index, 0)}`;
+    return `json_array(COALESCE(SUM(${mismatch}),0),
+      ${[1, 2, 3].map((offset) => `COALESCE(SUM(${mismatch} AND NOT ${flag(index, offset)}),0)`).join(',')},
+      ${[4, 5].map((offset) => `COALESCE(SUM(DISTINCT CASE WHEN ${mismatch} THEN ${flag(index, offset)} ELSE 0 END),0)`).join(',')})`;
+  });
+  // Small nested arrays also avoid native function-argument limits on wide layouts.
+  const groups = [];
+  for (let index = 0; index < counters.length; index += 16) {
+    groups.push(`json_array(${counters.slice(index, index + 16).join(',')})`);
+  }
   const sql = `WITH verified(id,row) AS MATERIALIZED (
-    SELECT json_extract(value,${layout.paths[columns.indexOf('id')]}), value FROM json_each(?)
+    SELECT json_extract(value,${layout.paths[idIndex]}), value FROM json_each(?)
   ), compared AS MATERIALIZED (
-    SELECT b.id IS NOT NULL AS present, ${flags.join(',')}
+    SELECT b.id IS NOT NULL AS present${flags.length ? `,${flags.join(',')}` : ''}
     FROM verified AS v LEFT JOIN blocks AS b ON b.id = v.id
-  ) SELECT COUNT(*) AS expected_rows, COALESCE(SUM(present),0) AS present_rows,
-    COALESCE(SUM(NOT present),0) AS missing_rows,
-    COALESCE(SUM(present AND NOT (${columns.map((_, index) => `e${index}`).join(' AND ')})),0) AS mismatching_rows,
-    ${counters.join(',')} FROM compared`;
+  ) SELECT json_array(COUNT(*), COALESCE(SUM(present),0),
+    COALESCE(SUM(NOT present),0),
+    COALESCE(SUM(present AND NOT (${columns.map((_, index) => flag(index, 0)).join(' AND ')})),0),
+    json_array(${groups.join(',')})) AS source_comparison FROM compared`;
   // The original canonical cap remains unchanged. The additional failure-only
   // request must also fit that cap after framing/escaping, or is explicitly skipped.
   const requestBytes = Buffer.byteLength(JSON.stringify({ sql, params: [] }))
@@ -820,28 +828,38 @@ async function sourceRetirementComparison(source, columns, layout, page) {
   let results;
   try { results = await source.query(sql, [page.json]); }
   catch { return unavailable('query-failed'); }
-  const row = results?.[0], expected = page.rows.length;
-  const count = (key, maximum = expected) => Number.isSafeInteger(row?.[key])
-    && row[key] >= 0 && row[key] <= maximum;
-  if (!Array.isArray(results) || results.length !== 1
-    || !['expected_rows', 'present_rows', 'missing_rows', 'mismatching_rows'].every((key) => count(key))
-    || row.expected_rows !== expected || row.present_rows + row.missing_rows !== expected
-    || row.mismatching_rows > row.present_rows
-    || !columns.every((_, index) => ['m', 't', 'b', 'l'].every((prefix) => count(`${prefix}${index}`, row.mismatching_rows))
-      && ['s', 'v'].every((prefix) => count(`${prefix}${index}`, 31))
-      && ['t', 'b', 'l'].every((prefix) => row[`${prefix}${index}`] <= row[`m${index}`]))) {
-    return unavailable('response-shape');
-  }
+  const encoded = results?.[0]?.source_comparison, expected = page.rows.length;
+  let summary;
+  try {
+    if (typeof encoded !== 'string' || Buffer.byteLength(encoded) > RESPONSE_ENVELOPE_BYTES) {
+      return unavailable('response-shape');
+    }
+    summary = JSON.parse(encoded);
+  } catch { return unavailable('response-shape'); }
+  const count = (value, maximum = expected) => Number.isSafeInteger(value) && value >= 0 && value <= maximum;
+  if (!Array.isArray(results) || results.length !== 1 || !Array.isArray(summary) || summary.length !== 5
+    || !summary.slice(0, 4).every((value) => count(value))
+    || summary[0] !== expected || summary[1] + summary[2] !== expected || summary[3] > summary[1]
+    || !Array.isArray(summary[4]) || summary[4].length !== groups.length
+    || !summary[4].every((group, index) => Array.isArray(group)
+      && group.length === Math.min(16, columns.length - index * 16))) return unavailable('response-shape');
+  const cells = summary[4].flat();
+  if (!cells.every((cell) => Array.isArray(cell) && cell.length === 6
+    && cell.slice(0, 4).every((value) => count(value, summary[3]))
+    && cell.slice(4).every((value) => count(value, 31))
+    && cell.slice(1, 4).every((value) => value <= cell[0])
+    && (cell[0] ? cell[4] > 0 && cell[5] > 0 : cell.every((value) => value === 0)))
+    || cells[idIndex].some((value) => value !== 0)
+    || cells.reduce((sum, cell) => sum + cell[0], 0) < summary[3]) return unavailable('response-shape');
   const typeClasses = (bits) => types.filter((_, index) => bits & (1 << index));
   return {
-    status: row.mismatching_rows ? row.missing_rows ? 'mismatch-and-missing' : 'mismatch'
-      : row.missing_rows ? 'missing' : 'clean',
-    expectedRows: expected, presentRows: row.present_rows, missingRows: row.missing_rows,
-    mismatchingRows: row.mismatching_rows,
-    columns: columns.flatMap((_, index) => row[`m${index}`] ? [{
-      index, mismatchingRows: row[`m${index}`], typeMismatchRows: row[`t${index}`],
-      byteMismatchRows: row[`b${index}`], lengthMismatchRows: row[`l${index}`],
-      sourceTypes: typeClasses(row[`s${index}`]), snapshotTypes: typeClasses(row[`v${index}`]),
+    status: summary[3] ? summary[2] ? 'mismatch-and-missing' : 'mismatch'
+      : summary[2] ? 'missing' : 'clean',
+    expectedRows: expected, presentRows: summary[1], missingRows: summary[2], mismatchingRows: summary[3],
+    columns: cells.flatMap((cell, index) => cell[0] ? [{
+      index, mismatchingRows: cell[0], typeMismatchRows: cell[1],
+      byteMismatchRows: cell[2], lengthMismatchRows: cell[3],
+      sourceTypes: typeClasses(cell[4]), snapshotTypes: typeClasses(cell[5]),
     }] : []),
   };
 }
