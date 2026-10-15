@@ -433,8 +433,14 @@ The one-time cutover runs these operations in order, from the same checked-out m
    Turn keys are owner-annotation keys, not routing IDs. Valid existing keys retain
    those same characters (and BOM/non-ASCII bytes) exactly through catalog seed and
    reconciliation; the viewer already accepts nonempty keys up to 1024 code units.
-   Ordinary shard replacement is one atomic four-statement JSON1 batch, not per-row
-   HTTP requests. Each populated shard's MATCH verification reuses one fixed JSON1
+   Ordinary shard replacement is one atomic four-statement JSON1 batch per bounded
+   typed-JSON transport group, not per-row HTTP requests. Private REAL wrappers can
+   outgrow an otherwise valid canonical page (for example, after malformed TEXT
+   expands into its private byte tag). Only transport groups split: original row
+   digests, durable pending identities/cursor and full-page retirement hash chaining
+   are unchanged, including when resuming an existing copying/verified checkpoint
+   or repairing a validated legacy checkpoint. No overflow row is skipped.
+   Each populated shard's MATCH verification reuses one fixed JSON1
    query with one JSON bind per byte-bounded group of `[quoted token, id]` probes.
    The complete serialized parameters envelope, including JSON escaping, brackets,
    quotes and commas, must be at most `COPY_PAGE_BYTES` (1 MiB). Each pair is encoded
@@ -472,6 +478,11 @@ The one-time cutover runs these operations in order, from the same checked-out m
    TEXT before comparison, never compared as objects or replacement strings.
    Comparison and deletion run in one main D1 transaction. A late changed byte,
    including one with an identical lossy rendering, is retained and stops advancement.
+   Typed-JSON CAS groups remain in **one atomic native source batch** with the
+   original full pending-page empty assertion and freeze transition; they are not
+   independently acknowledged or dispatched as separate retirement transactions.
+   A changed row in a later group rolls back earlier group deletions too. The
+   unchanged 4 MiB whole-request bound is checked before dispatching that batch.
    No main schema change or migration-ledger write precedes this proof. The first
    verified deletion and installation of `index_migration_freeze` plus three standard
    blocks write triggers share that **same transaction**. Its committed state is

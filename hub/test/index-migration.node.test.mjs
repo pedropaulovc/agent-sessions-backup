@@ -6547,6 +6547,130 @@ for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerd
     }
   });
 
+  test(`byte-exact ${backend} REAL transport expansion preserves logical checkpoints and atomic multi-group source CAS`, async (context) => {
+    const f = await createFixture(context);
+    for (const db of [f.source, ...f.shards]) {
+      const sql = 'ALTER TABLE blocks ADD COLUMN future_real REAL';
+      if (db instanceof SqliteD1) db.database.exec(sql);
+      else await db.batch([{ sql, params: [] }]);
+    }
+    const columns = [...BLOCK_COLUMNS, 'future_real'];
+    const tail = Buffer.concat([Buffer.alloc(720, 0x61), Buffer.from([0xff]), Buffer.from(' tail')]);
+    const rows = nativeDenseRows(1100);
+    const originals = new Map(rows.map((row) => [row.id, { ...row, future_real: 1,
+      text: { x: Buffer.concat([Buffer.from(`realexpand${row.id} `), tail]).toString('hex') } }]));
+    await f.source.batch([
+      { sql: `INSERT INTO blocks (${BLOCK_COLUMNS.map(quoted).join(',')})
+        SELECT ${BLOCK_COLUMNS.map((_, index) => `json_extract(value,'$[${index}]')`).join(',')} FROM json_each(?)`,
+      params: [JSON.stringify(rows.map((row) => BLOCK_COLUMNS.map((column) => row[column])))] },
+      { sql: `UPDATE blocks SET future_real=CAST(1 AS REAL),
+        text='realexpand'||id||' '||CAST(unhex(?) AS TEXT)`, params: [tail.toString('hex')] },
+      { sql: 'INSERT INTO blocks_fts(rowid,text) SELECT id,text FROM blocks', params: [] },
+    ]);
+    const before = await publicRawSnapshot(f.source, columns), sourceFts = await storedBlockSnapshot(f.source);
+    assert.ok(before.every((row) => row.t18 === 'real' && row.v18 === 1));
+    f.trace.length = 0;
+    const copyingStop = new Error('public copying checkpoint boundary');
+    await assert.rejects(copyWithNativeParameters(f.args({ checkpointHook: (state) => {
+      if (state.pending?.phase === 'copying') throw copyingStop;
+    } })), (error) => error === copyingStop);
+    const copying = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+    const originalPage = copying.pending.rows.map(({ id }) => originals.get(id));
+    const canonicalBytes = Buffer.byteLength(JSON.stringify(originalPage.map((row) => columns.map((column) => row[column]))));
+    const typedBytes = Buffer.byteLength(JSON.stringify(originalPage.map((row) => columns.map((column) =>
+      column === 'future_real' ? { r: row[column] } : row[column]))));
+    assert.ok(canonicalBytes <= COPY_PAGE_BYTES && typedBytes > COPY_PAGE_BYTES,
+      'actual native malformed-TEXT expansion must fill a valid canonical page whose REAL wrappers cross the transport cap');
+    for (const item of copying.pending.rows) {
+      assert.equal(item.sha256, sha256(JSON.stringify(columns.map((column) => originals.get(item.id)[column]))));
+    }
+    const verifiedStop = new Error('public verified checkpoint boundary');
+    await assert.rejects(copyWithNativeParameters(f.args({ checkpointHook: (state) => {
+      if (state.pending?.phase === 'verified') throw verifiedStop;
+    } })), (error) => error === verifiedStop);
+    const verified = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+    assert.deepEqual(verified.pending.rows, copying.pending.rows, 'transport groups cannot trim or rehash a durable logical page');
+    assert.deepEqual(verified.pending.types, copying.pending.types);
+    assert.deepEqual(await publicRawSnapshot(f.source, columns), before);
+    const pendingIds = new Set(verified.pending.rows.map(({ id }) => id));
+    const destination = await publicRawSnapshot(f.shards[1], columns), destinationFts = await storedBlockSnapshot(f.shards[1]);
+    assert.deepEqual(destination, before.filter((row) => pendingIds.has(row.v0)));
+    const nativeBatch = f.source.batch.bind(f.source);
+    const lateId = verified.pending.rows.at(-1).id;
+    let groups, changed, provisionallyDeleted = false;
+    if (f.source instanceof SqliteD1) f.source.afterStatement = ({ sql }) => {
+      if (provisionallyDeleted || !/\bDELETE\s+FROM\s+blocks\b/i.test(sql)) return;
+      const remaining = new Set(f.source.rows('SELECT id FROM blocks').map(({ id }) => id));
+      assert.ok(groups[0].every((id) => !remaining.has(id)), 'the first native subgroup must execute before the later CAS fails');
+      provisionallyDeleted = true;
+    };
+    f.source.batch = async (statements) => {
+      const deletes = statements.filter(({ sql }) => /\bDELETE\s+FROM\s+blocks\b/i.test(sql));
+      if (!changed && deletes.length) {
+        groups = deletes.map(({ params }) => JSON.parse(params[0]).map((row) => row[0]));
+        assert.ok(groups.length > 1, 'source CAS must split actual typed transport, not fail or drop the overflow rows');
+        assert.deepEqual(groups.flat(), verified.pending.rows.map(({ id }) => id));
+        assert.ok(!groups[0].includes(lateId) && groups.at(-1).includes(lateId));
+        for (const { params } of deletes) assert.ok(Buffer.byteLength(params[0]) <= COPY_PAGE_BYTES);
+        await f.source.query('UPDATE blocks SET future_real=CAST(2 AS REAL) WHERE id=CAST(? AS INTEGER)', [lateId]);
+        changed = await publicRawSnapshot(f.source, columns);
+        assert.deepEqual(changed, before.map((row) => row.v0 === lateId ? { ...row, v18: 2 } : row));
+      }
+      return nativeBatch(statements);
+    };
+    await assert.rejects(copyWithNativeParameters(f.args()), /malformed JSON/);
+    f.source.batch = nativeBatch;
+    f.source.afterStatement = null;
+    assert.ok(changed, 'a later-group row must really change after durable verification');
+    if (f.source instanceof SqliteD1) assert.equal(provisionallyDeleted, true);
+    assert.deepEqual(await publicRawSnapshot(f.source, columns), changed,
+      'a failed later CAS must roll back every earlier subgroup deletion');
+    assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), verified);
+    assert.deepEqual(await f.source.rows('SELECT name FROM sqlite_master WHERE name=?', [SOURCE_FREEZE_TABLE]), [],
+      'no first-page freeze may commit after partial subgroup retirement');
+    const failed = f.trace.find((event) => event.db === f.source.id && event.kind === 'batch'
+      && event.statements.some(({ sql }) => /\bDELETE\s+FROM\s+blocks\b/i.test(sql)));
+    assert.equal(failed.committed, false);
+    assert.deepEqual(await publicRawSnapshot(f.shards[1], columns), destination);
+    const afterFailureFts = await storedBlockSnapshot(f.shards[1]);
+    assert.deepEqual(afterFailureFts.ftsData, destinationFts.ftsData);
+    assert.deepEqual(afterFailureFts.ftsIndex, destinationFts.ftsIndex);
+    await f.source.query('UPDATE blocks SET future_real=CAST(1 AS REAL) WHERE id=CAST(? AS INTEGER)', [lateId]);
+    const pages = [verified.pending.rows];
+    const result = await copyWithNativeParameters(f.args({ checkpointHook: (state) => {
+      if (state.pending?.phase !== 'copying') return;
+      for (const item of state.pending.rows) {
+        assert.equal(item.sha256, sha256(JSON.stringify(columns.map((column) => originals.get(item.id)[column]))));
+      }
+      pages.push(state.pending.rows);
+    } }));
+    assert.equal(result.state, 'complete');
+    assert.equal(result.rows, rows.length);
+    assert.equal(result.after, rows.at(-1).id);
+    assert.equal(result.sha256, pages.reduce((chain, page) => sha256(`${chain}:${JSON.stringify(page)}`), sha256('')),
+      'retired-prefix chaining uses each original full logical page, not typed subgroups');
+    assert.deepEqual(await publicRawSnapshot(f.source, columns), []);
+    assert.deepEqual(await publicRawSnapshot(f.shards[1], columns), before);
+    assert.deepEqual(await publicRawSnapshot(f.shards[0], columns), []);
+    for (const id of [rows[0].id, rows.at(-1).id]) {
+      await assertPublicRawFts(f.shards[1], { id }, Buffer.from(originals.get(id).text.x, 'hex'));
+    }
+    const after = await storedBlockSnapshot(f.source);
+    assert.deepEqual(after.ftsData, sourceFts.ftsData);
+    assert.deepEqual(after.ftsIndex, sourceFts.ftsIndex);
+    for (const event of f.trace) {
+      if (event.kind === 'batch' || event.kind === 'query') {
+        const request = event.kind === 'batch' ? event.statements : { sql: event.sql, params: event.params };
+        assert.ok(Buffer.byteLength(JSON.stringify(request)) + 4096 <= 4 * 1024 * 1024);
+      }
+      if (event.kind === 'batch-statement' || event.kind === 'query') {
+        assert.ok(event.params.length <= 100);
+        assert.ok(Buffer.byteLength(event.sql) <= 100_000);
+        assert.ok(event.params.every((value) => typeof value !== 'string' || Buffer.byteLength(value) <= 2_000_000));
+      }
+    }
+  });
+
   test(`byte-exact ${backend} copier preserves short and sliced malformed TEXT in every scalar text column and exact FTS`, async (context) => {
     const f = await createFixture(context);
     for (const db of [f.source, ...f.shards]) {

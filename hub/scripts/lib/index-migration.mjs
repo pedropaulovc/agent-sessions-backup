@@ -861,9 +861,23 @@ async function readLegacyBlockRows(db, columns, ids, layout) {
   return readBlockRows(db, columns, ids, legacyLayout, null, true);
 }
 
-function transportValue(columns, row, index) {
-  const value = row[columns[index]];
-  return rowTypes(columns, row)[index] === 'real' ? { r: value } : value;
+function transportRow(columns, row) {
+  const types = rowTypes(columns, row);
+  return columns.map((column, index) => types[index] === 'real' ? { r: row[column] } : row[column]);
+}
+
+function transportPage(columns, rows) {
+  const encoded = [];
+  let bytes = 2;
+  for (const row of rows) {
+    const json = JSON.stringify(transportRow(columns, row));
+    const next = Buffer.byteLength(json) + (encoded.length ? 1 : 0);
+    if (encoded.length && bytes + next > COPY_PAGE_BYTES) break;
+    encoded.push(json);
+    bytes += next;
+  }
+  return { rows: encoded.length === rows.length ? rows : rows.slice(0, encoded.length),
+    json: bytes <= COPY_PAGE_BYTES ? `[${encoded.join(',')}]` : null };
 }
 
 function decodedSql(row, path) {
@@ -904,38 +918,43 @@ function boundRow(columns, row, phase) {
   return { values, params };
 }
 
-function pageInsert(columns, rows, layout) {
-  const json = JSON.stringify(rows.map((row) => columns.map((_, index) => transportValue(columns, row, index))));
-  if (Buffer.byteLength(json) <= COPY_PAGE_BYTES) return assertRequest({
+function pageInsert(columns, page, layout) {
+  if (page.json !== null) return assertRequest({
     sql: `INSERT INTO blocks (${layout.quoted.join(',')})
       SELECT ${layout.paths.map((path) => decodedSql('value', path)).join(',')} FROM json_each(?)`,
-    params: [json],
+    params: [page.json],
   }, COPY_PHASES.PAGE_WRITE);
-  if (rows.length !== 1) throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES, 'shard page exceeds the canonical JSON byte cap', COPY_PHASES.PAGE_WRITE);
-  const bound = boundRow(columns, rows[0], COPY_PHASES.PAGE_WRITE);
+  if (page.rows.length !== 1) throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES, 'shard page exceeds the encoded JSON byte cap', COPY_PHASES.PAGE_WRITE);
+  const bound = boundRow(columns, page.rows[0], COPY_PHASES.PAGE_WRITE);
   return assertRequest({ sql: `INSERT INTO blocks (${layout.quoted.join(',')}) VALUES (${bound.values.join(',')})`,
     params: bound.params }, COPY_PHASES.PAGE_WRITE);
 }
 
 async function replaceShardPage(db, columns, rows, layout) {
   db = phaseDb(db, COPY_PHASES.PAGE_WRITE);
-  const idsJson = JSON.stringify(rows.map((row) => row.id));
-  const page = canonicalPage(columns, rows, COPY_PHASES.PAGE_WRITE);
-  if (page.rows.length !== rows.length) throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES, 'shard page exceeds the canonical JSON byte cap', COPY_PHASES.PAGE_WRITE);
-  const insert = pageInsert(columns, rows, layout);
-  // Ordinary pages use exactly four statements, independent of their row count.
-  const statements = [
-    { sql: `INSERT INTO blocks_fts (blocks_fts, rowid, text)
-      SELECT 'delete', id, text FROM blocks WHERE id IN (${JSON_IDS_SQL})`, params: [idsJson] },
-    { sql: `DELETE FROM blocks WHERE id IN (${JSON_IDS_SQL})`, params: [idsJson] },
-    insert,
-    { sql: `INSERT INTO blocks_fts (rowid, text)
-      SELECT id, text FROM blocks WHERE id IN (${JSON_IDS_SQL})`, params: [idsJson] },
-  ];
-  if (Buffer.byteLength(JSON.stringify(statements)) + RESPONSE_ENVELOPE_BYTES > MAX_REQUEST_BYTES) {
-    throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES, 'destination batch exceeds bounded transport limits', COPY_PHASES.PAGE_WRITE);
+  const canonical = canonicalPage(columns, rows, COPY_PHASES.PAGE_WRITE);
+  if (canonical.rows.length !== rows.length) throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES, 'shard page exceeds the canonical JSON byte cap', COPY_PHASES.PAGE_WRITE);
+  // Typed REAL wrappers can outgrow a valid canonical page. Split transport only:
+  // the durable pending row set, row hashes and retirement chain stay unchanged.
+  for (let offset = 0; offset < rows.length;) {
+    const page = transportPage(columns, rows.slice(offset));
+    const idsJson = JSON.stringify(page.rows.map((row) => row.id));
+    const insert = pageInsert(columns, page, layout);
+    // Every transport group replaces blocks and physical FTS atomically.
+    const statements = [
+      { sql: `INSERT INTO blocks_fts (blocks_fts, rowid, text)
+        SELECT 'delete', id, text FROM blocks WHERE id IN (${JSON_IDS_SQL})`, params: [idsJson] },
+      { sql: `DELETE FROM blocks WHERE id IN (${JSON_IDS_SQL})`, params: [idsJson] },
+      insert,
+      { sql: `INSERT INTO blocks_fts (rowid, text)
+        SELECT id, text FROM blocks WHERE id IN (${JSON_IDS_SQL})`, params: [idsJson] },
+    ];
+    if (Buffer.byteLength(JSON.stringify(statements)) + RESPONSE_ENVELOPE_BYTES > MAX_REQUEST_BYTES) {
+      throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES, 'destination batch exceeds bounded transport limits', COPY_PHASES.PAGE_WRITE);
+    }
+    await db.batch(statements);
+    offset += page.rows.length;
   }
-  await db.batch(statements);
 }
 
 async function discardUnacknowledgedPage(shards, pending) {
@@ -1119,16 +1138,16 @@ function exactComparison(stored, copied) {
 function retirementDeletes(columns, rows, layout) {
   const statements = [];
   for (let offset = 0; offset < rows.length;) {
-    const page = canonicalPage(columns, rows.slice(offset), COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
-    const json = JSON.stringify(page.rows.map((row) => columns.map((_, index) => transportValue(columns, row, index))));
+    const canonical = canonicalPage(columns, rows.slice(offset), COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
+    const page = transportPage(columns, canonical.rows);
     const compare = layout.quoted.map((column) => exactComparison(`blocks.${column}`, `verified.${column}`)).join(' AND ');
     let sql, params;
-    if (Buffer.byteLength(json) <= COPY_PAGE_BYTES) {
+    if (page.json !== null) {
       sql = `WITH verified AS MATERIALIZED (SELECT ${layout.paths.map((path, index) =>
         `${decodedSql('value', path)} AS ${layout.quoted[index]}`).join(',')} FROM json_each(?))
         DELETE FROM blocks WHERE id IN (SELECT id FROM verified)
           AND EXISTS (SELECT 1 FROM verified WHERE verified.id = blocks.id AND ${compare})`;
-      params = [json];
+      params = [page.json];
     } else {
       if (page.rows.length !== 1) throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES,
         'source page exceeds the encoded JSON byte cap', COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
@@ -1287,7 +1306,7 @@ async function finishPending(source, shards, state, gate, checkpoint, layout, to
   }
   const verifiedRows = ids.map((id) => verified.get(id));
   const canonical = verifiedRows.map((row) => canonicalRow(state.columns, row));
-  const diagnosticJson = JSON.stringify(verifiedRows.map((row) => state.columns.map((_, index) => transportValue(state.columns, row, index))));
+  const diagnosticJson = JSON.stringify(verifiedRows.map((row) => transportRow(state.columns, row)));
   const page = { rows: verifiedRows, canonical,
     json: Buffer.byteLength(diagnosticJson) <= COPY_PAGE_BYTES ? diagnosticJson : null };
   const statements = retirementDeletes(state.columns, verifiedRows, layout);
