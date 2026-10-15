@@ -2054,23 +2054,44 @@ test('catalog star and version/tombstone readback corruption also blocks every s
   for (const table of ['starred_turns', 'catalog_versions']) {
     await context.test(table, async (child) => {
       const f = await catalogFixture(child);
+      const expected = expectedCatalog(f);
       const outbox = f.source.rows('SELECT * FROM session_catalog_outbox ORDER BY seq');
-      let exercised = false;
-      f.shards[1].beforeQuery = ({ sql }) => {
+      let exercised = false, checkpointAtFault, restore;
+      const corruptReadback = async ({ sql, params }) => {
         if (exercised || !selectsTable(sql, table)) return;
-        const [row] = f.shards[1].rows(`SELECT * FROM ${quoted(table)} LIMIT 1`);
+        const shard = f.shards[1];
+        const [row] = shard.rows(`SELECT * FROM ${quoted(table)}
+          WHERE session_id IN (SELECT value FROM json_each(?)) LIMIT 1`, [JSON.stringify(params)]);
         if (!row) return;
         exercised = true;
-        if (table === 'starred_turns') f.shards[1].database.prepare(
-          'UPDATE starred_turns SET turn_key = ? WHERE session_id = ? AND turn_key = ?',
-        ).run('not-the-authoritative-content-key', row.session_id, row.turn_key);
-        else f.shards[1].database.prepare('UPDATE catalog_versions SET presence = ? WHERE session_id = ?')
-          .run(row.presence === 'deleted' ? 'present' : 'deleted', row.session_id);
+        checkpointAtFault = await readCheckpoint(f.shards[0], SEED_CHECKPOINT);
+        const field = table === 'starred_turns' ? 'turn_key' : 'presence';
+        const changed = table === 'starred_turns' ? 'not-the-authoritative-content-key'
+          : row.presence === 'deleted' ? 'present' : 'deleted';
+        const key = table === 'starred_turns' ? ' AND turn_key = ?' : '';
+        const update = shard.database.prepare(`UPDATE ${quoted(table)} SET ${quoted(field)} = ? WHERE session_id = ?${key}`);
+        update.run(changed, row.session_id, ...(key ? [row.turn_key] : []));
+        const [stored] = shard.rows(`SELECT * FROM ${quoted(table)} WHERE session_id = ?${key}`,
+          [row.session_id, ...(key ? [changed] : [])]);
+        assert.equal(stored[field], changed, 'the fault must change native stored content on the actual readback page');
+        assert.deepEqual({ ...stored, [field]: row[field] }, row, 'only the intended catalog scalar may change');
+        restore = () => update.run(row[field], row.session_id, ...(key ? [changed] : []));
       };
-      await assert.rejects(seedFrozenCatalog(f.args()));
+      f.shards[1].beforeQuery = corruptReadback;
+      f.shards[1].beforeStatement = corruptReadback;
+      await assert.rejects(seedFrozenCatalog(f.args()), (error) =>
+        error instanceof Error && !(error instanceof TypeError));
       assert.equal(exercised, true);
       assert.deepEqual(f.source.rows('SELECT * FROM session_catalog_outbox ORDER BY seq'), outbox);
       assert.deepEqual(sourceWrites(f), []);
+      assert.deepEqual(await readCheckpoint(f.shards[0], SEED_CHECKPOINT), checkpointAtFault);
+      f.shards[1].beforeQuery = null;
+      f.shards[1].beforeStatement = null;
+      restore();
+      assert.equal((await seedFrozenCatalog(f.args())).state, 'complete',
+        'restoring the one physical fault must allow the same durable page to complete');
+      for (const shard of f.shards) assert.deepEqual(catalogSnapshot(shard), expected);
+      assert.deepEqual(f.source.rows('SELECT * FROM session_catalog_outbox'), []);
     });
   }
 });
@@ -2151,7 +2172,7 @@ test('a lost response after source deletion resumes its durable verified page wi
       throw new Error('lost response after committed source deletion');
     }
   };
-  await assert.rejects(copyFrozenIndex(f.args()), /lost response after committed source deletion/);
+  await assert.rejects(copyWithNativeParameters(f.args()), /lost response after committed source deletion/);
   assert.deepEqual(f.source.rows('SELECT * FROM blocks'), []);
   const saved = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
   assert.equal(saved.pending.phase, 'verified');
@@ -2162,7 +2183,7 @@ test('a lost response after source deletion resumes its durable verified page wi
   f.restart();
   assertVerifiedBeforeDelete(f);
   const resumedAt = f.trace.length;
-  const result = await copyFrozenIndex(f.args());
+  const result = await copyWithNativeParameters(f.args());
   assert.equal(result.rows, rows.length);
   assert.equal(result.state, 'complete');
   assertCopied(f, rows);
@@ -2644,22 +2665,36 @@ test('malformed persisted copying state or missing source freeze triggers fails 
   for (const corruption of ['copying-state', 'missing-trigger', 'missing-control-row']) {
     await context.test(corruption, async (child) => {
       const { f, rows, saved } = await frozenFirstPageFixture(child);
+      let restore;
       if (corruption === 'copying-state') {
         f.source.database.exec(`UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'copying' WHERE id = 1`);
+        restore = () => f.source.database.exec(`UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'frozen' WHERE id = 1`);
       } else if (corruption === 'missing-trigger') {
+        const [{ sql }] = f.source.rows("SELECT sql FROM sqlite_master WHERE name = 'index_migration_blocks_insert'");
+        restore = () => f.source.database.exec(sql);
         f.source.database.exec('DROP TRIGGER index_migration_blocks_insert');
       } else {
         f.source.database.exec(`DELETE FROM ${SOURCE_FREEZE_TABLE} WHERE id = 1`);
+        restore = () => f.source.database.exec(`INSERT INTO ${SOURCE_FREEZE_TABLE}(id,state) VALUES(1,'frozen')`);
       }
       const before = f.source.rows('SELECT * FROM blocks ORDER BY id');
       const controlBefore = f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`);
       f.trace.length = 0;
-      await assert.rejects(copyFrozenIndex(f.args()));
+      await assert.rejects(copyFrozenIndex(f.args()), (error) => {
+        assert.equal(error.code, corruption === 'missing-trigger' ? 'freeze-schema' : 'freeze-state');
+        assert.equal(error.d1Phase, 'copy-source-freeze-read');
+        return true;
+      });
       assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), before);
       assert.deepEqual(before, rows.slice(saved.rows));
       assert.deepEqual(f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), controlBefore);
       assert.deepEqual(sourceWrites(f), [], 'invalid committed barrier state must not be repaired into permission to delete');
       assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), saved);
+      restore();
+      const completed = await copyFrozenIndex(f.args());
+      assert.equal(completed.state, 'complete');
+      assert.equal(completed.rows, rows.length);
+      assertCopied(f, rows);
     });
   }
 });
@@ -5930,13 +5965,14 @@ test('shared copier transport invariants preserve source and destination readbac
           if (invariant === 'row-identity') return [...rows, { ...rows[0] }];
           if (invariant === 'long-column') delete rows[0][marker];
           if (invariant === 'long-length') rows[0][marker] = 0;
-          if (invariant === 'value') rows[0].tool_name = true;
+          if (invariant === 'value') rows[0].file_id = true;
           if (invariant === 'number') rows[0].row_hash = Number.MAX_SAFE_INTEGER + 1;
           return rows;
         };
         await assert.rejects(copyWithNativeParameters(f.args()), (error) => {
-          if (invariant !== 'value') assert.equal(error.code, invariant === 'changed-slice'
-            ? side === 'destination' ? 'readback-sha256' : 'source-changed' : invariant);
+          assert.equal(error.code, invariant === 'changed-slice'
+            ? side === 'destination' ? 'readback-sha256' : 'source-changed'
+            : invariant === 'value' && side === 'destination' ? 'readback-sha256' : invariant);
           assert.equal(error.d1Phase, side === 'destination' ? 'copy-page-readback' : 'copy-source-page-read');
           assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
           assert.equal(error.cause, undefined);
@@ -6009,7 +6045,7 @@ test('native proof preserves source-versus-readback phase for real copier scalar
                   state.pending.rows.filter((row) => row.shard === shard).map(({ id }) => id));
               }
               exercised += 1;
-              rows[0].tool_name = { private: 'PRIVATE_NATIVE_PHASE_CANARY' };
+              rows[0].file_id = { private: 'PRIVATE_NATIVE_PHASE_CANARY' };
             } else {
               assert.equal(rows.length, 1);
               assert.ok(rows[0].bytes.length > 2);
@@ -6022,7 +6058,7 @@ test('native proof preserves source-versus-readback phase for real copier scalar
         await assert.rejects(verifyNativeCopyControl(proof), (error) => {
           assert.equal(error.nativeCopyPhase, side === 'source' ? 'copy-source-page-read' : 'copy-page-readback');
           assert.equal(error.nativeCopyClass, 'assertion');
-          if (invariant !== 'value') assert.equal(error.nativeCopyInvariant, invariant);
+          assert.equal(error.nativeCopyInvariant, invariant === 'value' && side === 'destination' ? 'readback-sha256' : invariant);
           assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes('PRIVATE_NATIVE_PHASE_CANARY'));
           assert.equal(error.cause, undefined);
           return true;
