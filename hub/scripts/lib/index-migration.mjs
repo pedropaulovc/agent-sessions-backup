@@ -820,6 +820,8 @@ async function sourceRetirementComparison(source, columns, layout, page) {
     COALESCE(SUM(NOT present),0),
     COALESCE(SUM(present AND NOT (${columns.map((_, index) => flag(index, 0)).join(' AND ')})),0),
     json_array(${groups.join(',')})) AS source_comparison FROM compared`;
+  // D1's 100,000-byte per-statement limit is independent of the JSON request cap.
+  if (Buffer.byteLength(sql) > 100_000) return unavailable('request-budget');
   // The original canonical cap remains unchanged. The additional failure-only
   // request must also fit that cap after framing/escaping, or is explicitly skipped.
   const requestBytes = Buffer.byteLength(JSON.stringify({ sql, params: [] }))

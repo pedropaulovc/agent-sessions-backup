@@ -535,19 +535,31 @@ These diagnostics do not establish the cause of any earlier production failure.
 
 After a rejected `copy-source-delete-and-freeze` batch, the copier attempts one
 read-only aggregate comparison against the **same already-verified canonical
-snapshot**, never against a new copy or a retry. Its additional JSON diagnostic
+snapshot**, never against a new copy or a replayed source batch. Its additional JSON diagnostic
 reports `clean`, `mismatch`, `missing`, `mismatch-and-missing`, or `unavailable`;
 present/missing/mismatching row counts; static zero-based column indexes; allowlisted
 SQLite storage-type classes; and counts of type, BLOB-byte and byte-length inequality
 on mismatched columns. SQL-equal INTEGER/REAL values are not reported as CAS misses.
 No IDs, column names, scalar values, text, search terms, SQL, parameters or native
-diagnostic errors are emitted. The query is skipped when its fully JSON-encoded
-request would exceed the existing 1 MiB copy budget, or when a canonical snapshot is
-unavailable for the oversized per-column branch; query/response failures are also
-explicitly `unavailable`. The original error object/message remains unchanged.
+diagnostic errors are emitted. The query is skipped with `unavailable/request-budget`
+when its fully JSON-encoded request would exceed the existing 1 MiB copy budget, or
+its SQL exceeds D1's separate [100,000-byte statement limit](https://developers.cloudflare.com/d1/platform/limits/).
+The oversized per-column branch has no bounded canonical snapshot and is explicitly
+`unavailable/canonical-budget`; query/response failures are also `unavailable`.
+The original error object/message remains unchanged. Public native workerd accepts
+harmless statements of exactly 100,000 bytes and rejects 100,001 bytes. The generated
+18-column diagnostic is 21,127 SQL bytes; a public 100-column layout with 82 additional
+TEXT columns generates 124,999 bytes and is skipped before any diagnostic request.
+
+“One comparison” means one logical read-only SQL query. The existing REST client
+may replay that query after an unambiguous HTTP 429 with a validated `Retry-After`,
+within the same configured pass/request budget. It never replays the rejected
+source retirement batch. Diagnostic retry or budget exhaustion makes the diagnostic
+unavailable; the original hard retirement error is still thrown, not replaced by
+the diagnostic failure or converted into a partial-copy exit 78.
 
 This observation does not identify the original failing statement or authorize
-source writes, ACK, checkpoint advance, or retry. A clean current comparison does
+source writes, ACK, checkpoint advance, or a semantic batch retry. A clean current comparison does
 not prove a failed batch committed or that its earlier comparison was clean; a
 missing row can also follow an ambiguous transport failure. The source fence and
 full-column deletion predicate remain unchanged. Public native SQLite/workerd

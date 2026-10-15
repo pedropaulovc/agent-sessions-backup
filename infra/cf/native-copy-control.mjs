@@ -441,29 +441,70 @@ async function proveNativeRetirementDiagnostic({ source, shards, gate, ordinary,
     requireProof(indexed.length === wanted.length
       && indexed.every((row, offset) => row.rowid === wanted[offset].id), phase);
   }
-  if (!retirementBatches) {
-    // REST may reject invalid TEXT before the verified retirement transaction.
-    // Report that public boundary honestly, rather than claiming the diagnostic
-    // was exercised. Only allowlisted native classification leaves this helper.
-    const safe = safeFailure(failure, phase);
-    return { outcome: 'rejected-before-retirement', phase: safe.nativeCopyPhase,
-      nativeClass: safe.nativeCopyClass,
-      ...(safe.nativeCopyInvariant ? { invariant: safe.nativeCopyInvariant } : {}),
-      ...(safe.nativeCopyFailureKind ? { failureKind: safe.nativeCopyFailureKind } : {}),
-      sourceRetention: 'retained', freezeRetention: 'frozen', checkpointRetention: 'retained',
-      positiveRowsRetained: expected.length };
-  }
+  // An earlier REST rejection means the retirement diagnostic was not exercised.
+  // Retention alone is not a successful proof: preserve its actual public
+  // phase/class and fail closed, including for unrelated copier regressions.
+  if (!retirementBatches) throw safeFailure(failure, phase);
   requireProof(retirementBatches === 1 && failure === originalError
     && failure.d1Phase === COPY_PHASES.SOURCE_DELETE_AND_FREEZE
     && failure.d1SqlReason === 'malformed-json' && diagnosticQueries === 1
     && retained?.pending?.phase === 'verified' && retained.rows === 0
     && retained.pending.rows.length === 1 && retained.pending.rows[0].id === probe.id, phase);
+  const snapshot = await shards[indexShardForSessionId(probe.session_id, shards.length)].query(
+    `SELECT typeof(text) AS storage_type, length(CAST(text AS BLOB)) AS byte_length,
+      hex(CAST(text AS BLOB)) AS bytes FROM blocks WHERE id = CAST(? AS INTEGER)`, [probe.id]);
+  const stored = snapshot[0];
+  // Inspect bytes only inside the disposable proof. REST's representation of
+  // invalid source TEXT is not assumed to be replacement text rather than NULL.
+  requireProof(snapshot.length === 1 && ['text', 'null'].includes(stored?.storage_type)
+    && (stored.storage_type === 'null'
+      ? stored.byte_length === null && stored.bytes === ''
+      : Number.isSafeInteger(stored.byte_length) && stored.byte_length >= 0
+        && stored.byte_length <= COPY_PAGE_BYTES && typeof stored.bytes === 'string'
+        && /^[0-9A-F]*$/.test(stored.bytes) && stored.bytes.length === stored.byte_length * 2), phase);
+  requireProof(stored.storage_type !== 'text' || stored.bytes !== before[0].bytes, phase);
   const comparison = {
     status: 'mismatch', expectedRows: 1, presentRows: 1, missingRows: 0, mismatchingRows: 1,
-    columns: [{ index: textIndex, mismatchingRows: 1, typeMismatchRows: 0,
-      byteMismatchRows: 1, lengthMismatchRows: 1, sourceTypes: ['text'], snapshotTypes: ['text'] }],
+    columns: [{ index: textIndex, mismatchingRows: 1,
+      typeMismatchRows: Number(stored.storage_type !== 'text'),
+      byteMismatchRows: Number(stored.storage_type === 'null' || stored.bytes !== before[0].bytes),
+      lengthMismatchRows: Number(stored.byte_length !== before[0].bytes.length / 2),
+      sourceTypes: ['text'], snapshotTypes: [stored.storage_type] }],
   };
-  requireProof(JSON.stringify(failure.d1SourceComparison) === JSON.stringify(comparison), phase);
+  if (JSON.stringify(failure.d1SourceComparison) !== JSON.stringify(comparison)) {
+    // Only validated aggregate vocabulary/counts may escape on a failed proof.
+    // Never attach the raw provider error, SQL response or byte descriptors.
+    const actual = failure.d1SourceComparison;
+    const count = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 1;
+    const types = ['null', 'integer', 'real', 'text', 'blob'];
+    const safeTypes = (values) => Array.isArray(values) && values.length <= types.length
+      && values.every((value) => types.includes(value)) && new Set(values).size === values.length;
+    let measured;
+    if (actual?.status === 'unavailable'
+      && ['canonical-budget', 'request-budget', 'query-failed', 'response-shape'].includes(actual.reason)) {
+      measured = { status: 'unavailable', reason: actual.reason };
+    } else if (['clean', 'mismatch', 'missing', 'mismatch-and-missing'].includes(actual?.status)
+      && ['expectedRows', 'presentRows', 'missingRows', 'mismatchingRows'].every((key) => count(actual[key]))
+      && Array.isArray(actual.columns) && actual.columns.length <= BLOCK_COLUMNS.length
+      && actual.columns.every((column) => Number.isSafeInteger(column?.index)
+        && column.index >= 0 && column.index < BLOCK_COLUMNS.length
+        && ['mismatchingRows', 'typeMismatchRows', 'byteMismatchRows', 'lengthMismatchRows'].every((key) => count(column[key]))
+        && safeTypes(column.sourceTypes) && safeTypes(column.snapshotTypes))) {
+      measured = { status: actual.status, expectedRows: actual.expectedRows, presentRows: actual.presentRows,
+        missingRows: actual.missingRows, mismatchingRows: actual.mismatchingRows,
+        columns: actual.columns.map((column) => ({
+          index: column.index, mismatchingRows: column.mismatchingRows, typeMismatchRows: column.typeMismatchRows,
+          byteMismatchRows: column.byteMismatchRows, lengthMismatchRows: column.lengthMismatchRows,
+          sourceTypes: [...column.sourceTypes], snapshotTypes: [...column.snapshotTypes],
+        })) };
+    }
+    const error = new NativeCopyControlError(phase, 'assertion');
+    if (measured) {
+      error.nativeCopySourceComparison = measured;
+      error.message += ` sourceRetirementComparison=${JSON.stringify(measured)}`;
+    }
+    throw error;
+  }
   return { outcome: 'verified', phase: COPY_PHASES.SOURCE_DELETE_AND_FREEZE,
     nativeClass: 'malformed-json', statements: 5, binds: 3, comparison,
     sourceRetention: 'retained', freezeRetention: 'frozen', checkpointRetention: 'retained',
