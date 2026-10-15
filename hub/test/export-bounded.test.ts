@@ -823,13 +823,19 @@ describe('large export ingest is bounded and never marks parsed until every conv
   // Destructive cleanup fan-out (kicks sibling export-inbox files to 'pending') — kept near the end.
   it('a cleanup-continuation send failure leaves the file pending, not error, and retries the cleanup page (round 4 finding 1)', async () => {
     budgets({ slice: 800, invocation: 800 });
-    const first = await uploadConvs('csf', Array.from({ length: 30 }, (_u, i) => conv('csf', i)));
+    const cleanupBudget = 20;
+    const keptCount = 3;
+    // Each stale delete costs five subrequests; leave more than two chunks' raw delete capacity so the
+    // continuation we deliberately fail must itself need another continuation: 2 * floor(20 / 5) + 1 = 9.
+    const staleCount = 2 * Math.floor(cleanupBudget / 5) + 1;
+    const initialCount = keptCount + staleCount;
+    const first = await uploadConvs('csf', Array.from({ length: initialCount }, (_u, i) => conv('csf', i)));
     await deliverChain({ file_id: first.fileId, r2_key: first.r2Key, reason: 'upload', content_hash: first.hash });
-    expect(await ownedSessions(first.fileId)).toBe(30);
+    expect(await ownedSessions(first.fileId)).toBe(initialCount);
 
-    // Replace with 3 conversations → ~27 stale to clean; a small budget makes cleanup need a continuation.
-    const replaced = await uploadConvs('csf', Array.from({ length: 3 }, (_u, i) => conv('csf', i)));
-    budgets({ slice: 20, invocation: 20 });
+    // Replace with the three kept conversations; the budget-derived stale count forces two cleanup chunks.
+    const replaced = await uploadConvs('csf', Array.from({ length: keptCount }, (_u, i) => conv('csf', i)));
+    budgets({ slice: cleanupBudget, invocation: cleanupBudget });
     const flags: Record<number, { acked: boolean; retried: boolean }> = {};
     const { stoppedCont } = await deliverChain(
       { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash },
@@ -856,12 +862,12 @@ describe('large export ingest is bounded and never marks parsed until every conv
     // reconcile stale sessions of a session_id-NULL row). The sentinel keeps it 'pending' and retries.
     expect(flags[replaced.fileId]).toEqual({ acked: false, retried: true });
     expect(await fileState(replaced.fileId)).toBe('pending'); // NOT 'error'
-    expect(await ownedSessions(replaced.fileId)).toBeGreaterThan(3); // stale not fully cleaned yet
+    expect(await ownedSessions(replaced.fileId)).toBeGreaterThan(keptCount); // stale not fully cleaned yet
 
     // With the queue restored, redelivery drains cleanup to completion — parsed, zero stale.
     await deliverChain({ file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash });
     expect(await fileState(replaced.fileId)).toBe('parsed');
-    expect(await ownedSessions(replaced.fileId)).toBe(3);
+    expect(await ownedSessions(replaced.fileId)).toBe(keptCount);
   });
 
   it('a cleanup-phase D1 throw is retryable and preserves the valid written sessions (round 6 finding 6)', async () => {
