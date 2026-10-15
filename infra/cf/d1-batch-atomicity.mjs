@@ -17,8 +17,22 @@ const D1_SQL_FAILURE_PATTERNS = [
   ['overloaded', /\bD1 DB is overloaded\. (?:Requests queued for too long|Too many requests queued)\b/i],
   ['memory-limit', /\bD1 DB's isolate exceeded its memory limit and was reset\b/i],
   ['cpu-limit', /\bD1 DB exceeded its CPU time limit and was reset\b/i],
+  // Fine native signatures share this matcher with the existing coarse classes.
+  // Never classify provider codes, arbitrary function names, or unrecognized text.
+  ['limits', /\btoo many arguments on function\b/i, 'function-arguments'],
+  ['limits', /\bExpression tree is too large\b/i, 'expression-depth'],
+  ['limits', /\b(?:statement too long|SQL statement is too long|SQL code exceeded max size)\b/i, 'statement-length'],
+  ['limits', /\btoo many columns in (?:result set|table|SELECT)\b/i, 'column-limit'],
+  ['type-error', /\bJSON cannot hold BLOB values\b/i, 'json-blob'],
+  ['missing-schema', /\bno such function:/i, 'function-unavailable'],
+  ['other', /\b(?:not authorized|SQLITE_AUTH)\b/i, 'authorization'],
+  ['other', /\binvalid UTF-8\b/i, 'invalid-utf8'],
+  ['other', /\bmisuse of aggregate(?: function)?\b/i, 'aggregate-misuse'],
+  ['limits', /\bparser stack overflow\b/i, 'parser-stack-overflow'],
 ];
-export const D1_SQL_FAILURE_REASONS = Object.freeze([...D1_SQL_FAILURE_PATTERNS.map(([reason]) => reason), 'other']);
+export const D1_SQL_FAILURE_REASONS = Object.freeze([...new Set([...D1_SQL_FAILURE_PATTERNS.map(([reason]) => reason), 'other'])]);
+export const D1_NATIVE_FAILURE_SIGNATURES = Object.freeze(D1_SQL_FAILURE_PATTERNS
+  .flatMap(([, , signature]) => signature ? [signature] : []));
 export const D1_FAILURE_KINDS = Object.freeze(['transport', 'http', 'statement', 'shape']);
 
 function atomicityFailure(error, phase, failure = 'assertion') {
@@ -99,16 +113,23 @@ export async function verifyD1BatchAtomicity(db) {
   throw failure;
 }
 
-/** Classify native tokens only; provider codes (including 7500) imply no SQL cause. */
-export function d1SqlFailureReason(errors) {
-  const reasons = new Set();
+/** Classify fixed native tokens only; provider codes imply no SQL cause or subtype. */
+export function d1SqlFailureMetadata(errors) {
+  const reasons = new Set(), signatures = new Set();
   for (const error of Array.isArray(errors) ? errors : []) {
     const message = typeof error === 'string' ? error : error?.message;
     if (typeof message !== 'string') continue;
-    for (const [reason, pattern] of D1_SQL_FAILURE_PATTERNS) {
-      if (pattern.test(message)) reasons.add(reason);
+    for (const [reason, pattern, signature] of D1_SQL_FAILURE_PATTERNS) {
+      if (!pattern.test(message)) continue;
+      reasons.add(reason);
+      if (signature) signatures.add(signature);
     }
   }
-  // Conflicting tokens are not evidence for a single cause.
-  return reasons.size === 1 ? [...reasons][0] : 'other';
+  // Conflicting tokens are not evidence for a single cause or subtype.
+  return { reason: reasons.size === 1 ? [...reasons][0] : 'other',
+    ...(reasons.size === 1 && signatures.size === 1 ? { nativeSignature: [...signatures][0] } : {}) };
+}
+
+export function d1SqlFailureReason(errors) {
+  return d1SqlFailureMetadata(errors).reason;
 }

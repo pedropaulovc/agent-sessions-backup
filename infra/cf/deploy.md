@@ -558,6 +558,18 @@ source retirement batch. Diagnostic retry or budget exhaustion makes the diagnos
 unavailable; the original hard retirement error is still thrown, not replaced by
 the diagnostic failure or converted into a partial-copy exit 78.
 
+The disposable native copy control also records a rejected diagnostic query using
+the shared allowlisted SQL class and optional fixed native subtype, validated
+actual HTTP status (100–599), and at most 16 nonnegative safe-integer provider
+codes. Unknown or conflicting subtype tokens are omitted; neither native messages
+nor provider payloads are retained. These labels describe recognized tokens, not
+a production-cause conclusion. On that source-query failure only, the control
+executes the identical aggregate SQL and canonical snapshot against its already
+verified disposable destination. It reports a clean result or a bounded rejection/
+unexpected-result outcome, without retrying the source query. Even a clean
+destination control cannot authorize source deletion or turn the original failed
+proof into success; the source, freeze and verified checkpoint remain retained.
+
 This observation does not identify the original failing statement or authorize
 source writes, ACK, checkpoint advance, or a semantic batch retry. A clean current comparison does
 not prove a failed batch committed or that its earlier comparison was clean; a

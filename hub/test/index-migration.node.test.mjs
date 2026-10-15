@@ -4032,6 +4032,10 @@ test('REST D1 diagnostics sanitize envelope, result and transport failures witho
       assert.equal(error.d1SqlReason, ['envelope', 'result'].includes(scenario) ? 'missing-schema' : 'other');
       assert.equal(error.d1FailureKind, scenario === 'transport' ? 'transport'
         : scenario === 'result' ? 'statement' : 'http');
+      assert.equal(error.providerStatus, scenario === 'transport' ? undefined
+        : scenario === 'envelope' ? 400 : scenario === 'result' ? 200 : 502);
+      assert.deepEqual(error.providerCodes, ['envelope', 'result'].includes(scenario) ? [7500] : []);
+      assert.equal(error.d1NativeSignature, undefined);
       assert.ok(error.message.includes(id));
       assert.ok(error.message.includes('kind=batch'));
       assert.ok(!error.message.includes(canary));
@@ -4040,6 +4044,59 @@ test('REST D1 diagnostics sanitize envelope, result and transport failures witho
       return true;
     });
     assert.equal(requests, 1, 'an ambiguous failure must not replay a batch');
+  }
+});
+
+test('REST D1 diagnostics retain bounded fixed native signatures and typed HTTP evidence without provider text', async (context) => {
+  const originalFetch = globalThis.fetch;
+  context.after(() => { globalThis.fetch = originalFetch; });
+  const canary = 'PRIVATE_NATIVE_SIGNATURE_SQL_PROVIDER_CANARY';
+  const signatures = [
+    ['too many arguments on function private_function', 'limits', 'function-arguments'],
+    ['Expression tree is too large (maximum depth 1000)', 'limits', 'expression-depth'],
+    ['statement too long', 'limits', 'statement-length'],
+    ['too many columns in result set', 'limits', 'column-limit'],
+    ['JSON cannot hold BLOB values', 'type-error', 'json-blob'],
+    ['no such function: private_function', 'missing-schema', 'function-unavailable'],
+    ['not authorized: SQLITE_AUTH', 'other', 'authorization'],
+    ['invalid UTF-8', 'other', 'invalid-utf8'],
+    ['misuse of aggregate function COUNT()', 'other', 'aggregate-misuse'],
+    ['parser stack overflow', 'limits', 'parser-stack-overflow'],
+    ['unrecognized private provider condition', 'other', undefined],
+    ['malformed JSON; statement too long', 'other', undefined],
+    ['too many arguments on function json_array; Expression tree is too large', 'limits', undefined],
+  ];
+  for (const route of ['envelope', 'result']) {
+    for (const [message, reason, signature] of signatures) {
+      await context.test(`${route}: ${signature ?? message}`, async () => {
+        let requests = 0;
+        globalThis.fetch = async () => {
+          requests += 1;
+          const errors = Array.from({ length: 20 }, (_, index) => ({
+            code: 7500 + index, ...(index ? {} : { message: `${message} ${canary}` }),
+          }));
+          errors.push({ code: canary }, { code: -1 }, { code: 1.5 }, { code: Number.MAX_SAFE_INTEGER + 1 });
+          return Response.json(route === 'envelope' ? { success: false, errors }
+            : { success: true, result: [{ success: false, error: `${message} ${canary}`, errors }] },
+          { status: route === 'envelope' ? 400 : 200 });
+        };
+        const db = diagnosticClient(PREVIEW_ACCOUNT_ID, canary, { permit: async () => {} })
+          .db('95dbde60-d5ab-4e2c-989f-fcd44a3ab479');
+        await assert.rejects(db.query(canary, [canary]), (error) => {
+          assert.equal(error.d1SqlReason, reason);
+          assert.equal(error.d1NativeSignature, signature);
+          assert.equal(error.providerStatus, route === 'envelope' ? 400 : 200);
+          assert.deepEqual(error.providerCodes, Array.from({ length: 16 }, (_, index) => 7500 + index));
+          assert.equal(error.d1FailureKind, route === 'envelope' ? 'http' : 'statement');
+          assert.ok(error.message.includes(`native=${reason}`));
+          assert.ok(!`${error.message} ${error.stack} ${JSON.stringify(error)}`.includes(canary));
+          assert.ok(!error.message.includes('private_function'));
+          assert.equal(error.cause, undefined);
+          return true;
+        });
+        assert.equal(requests, 1, 'classification must not replay a rejected operation');
+      });
+    }
   }
 });
 
@@ -5444,6 +5501,81 @@ test('native diagnostic proof derives exact NULL transport flags and fails close
   }
 });
 
+test('native diagnostic proof bounds rejected query metadata and compiles the identical aggregate on its destination', async (context) => {
+  for (const scenario of ['typed-evidence', 'invalid-evidence']) {
+    await context.test(scenario, async (child) => {
+      const canary = 'PRIVATE_NATIVE_DIAGNOSTIC_QUERY_CANARY';
+      const diagnosticId = INDEX_ID_SPAN - 2;
+      const { account, adapters, proof } = await nativeScratchFixture(child);
+      const beforeAccount = account.snapshot(), applySchema = proof.applySchema;
+      let sourceBefore, checkpointBefore, diagnosticStatement;
+      let sourceQueries = 0, positiveQueries = 0, retirementAttempts = 0;
+      proof.applySchema = async (databases) => {
+        await applySchema(databases);
+        databases.source.beforeStatement = async ({ sql }) => {
+          if (!sql.includes(SOURCE_FREEZE_TABLE) || !sql.includes("SET state = 'copying'")
+            || !databases.source.rows('SELECT id FROM blocks WHERE id = ?', [diagnosticId]).length) return;
+          retirementAttempts += 1;
+          sourceBefore = blockSnapshot(databases.source);
+          checkpointBefore = await readCheckpoint(databases.shards[0], COPY_CHECKPOINT);
+          assert.equal(checkpointBefore.pending.phase, 'verified');
+        };
+        databases.source.beforeQuery = (event) => {
+          if (!event.sql.includes('AS source_comparison FROM compared')) return;
+          sourceQueries += 1; diagnosticStatement = event;
+          assert.ok(!isWrite(event.sql));
+          try {
+            // An actual native compile failure with private text, not a fabricated aggregate.
+            databases.source.database.prepare(`SELECT * FROM "${canary}"`).all();
+            assert.fail('the deliberately absent relation must reject');
+          } catch (error) {
+            if (error.code === 'ERR_ASSERTION') throw error;
+            Object.assign(error, scenario === 'typed-evidence'
+              ? { providerStatus: 400, providerCodes: [7500], d1FailureKind: 'http' }
+              : { providerStatus: '400', providerCodes: [7500, canary],
+                d1FailureKind: canary, d1NativeSignature: canary, d1Phase: canary });
+            throw error;
+          }
+        };
+        for (const shard of databases.shards) shard.beforeQuery = (event) => {
+          if (!event.sql.includes('AS source_comparison FROM compared')) return;
+          positiveQueries += 1;
+          assert.ok(!isWrite(event.sql));
+          assert.equal(event.sql, diagnosticStatement.sql);
+          assert.deepEqual(event.params, diagnosticStatement.params,
+            'the failure-only positive control must compile the exact public SQL and canonical snapshot');
+        };
+      };
+      await assert.rejects(verifyNativeCopyControl(proof), (error) => {
+        assert.equal(error.nativeCopyPhase, 'retirement-diagnostic');
+        assert.equal(error.nativeCopyClass, 'assertion');
+        assert.deepEqual(error.nativeCopySourceComparison, { status: 'unavailable', reason: 'query-failed' });
+        assert.deepEqual(error.nativeCopyDiagnosticQueryFailure, {
+          phase: 'copy-source-delete-and-freeze', nativeClass: 'missing-schema', sqlReason: 'missing-schema',
+          ...(scenario === 'typed-evidence' ? { failureKind: 'http', httpStatus: 400, providerCodes: [7500] } : {}),
+        });
+        assert.deepEqual(error.nativeCopyDiagnosticPositiveControl, { outcome: 'verified' });
+        assert.ok(error.message.includes('diagnosticQueryFailure='));
+        assert.ok(error.message.includes('diagnosticPositiveControl='));
+        for (const value of [canary, String(diagnosticId), '61FF62', 'a\uFFFDb', 'SELECT * FROM',
+          'nativeordinaryvisible']) assert.ok(!`${error.message} ${error.stack} ${JSON.stringify(error)}`.includes(value));
+        assert.equal(error.cause, undefined);
+        return true;
+      }, 'an unavailable source comparison must remain a hard failure despite a clean destination control');
+      assert.equal(sourceQueries, 1); assert.equal(positiveQueries, 1); assert.equal(retirementAttempts, 1);
+      assert.deepEqual(blockSnapshot(adapters[0]), sourceBefore);
+      assert.deepEqual(adapters[0].rows('SELECT id, hex(CAST(text AS BLOB)) AS bytes FROM blocks'),
+        [{ id: diagnosticId, bytes: '61FF62' }]);
+      assert.deepEqual(adapters[0].rows(`SELECT state FROM ${SOURCE_FREEZE_TABLE}`), [{ state: 'frozen' }]);
+      assert.deepEqual(await readCheckpoint(adapters[1], COPY_CHECKPOINT), checkpointBefore);
+      assert.equal(adapters.slice(1).reduce((count, db) =>
+        count + db.rows('SELECT COUNT(*) AS n FROM blocks WHERE id != ?', [diagnosticId])[0].n, 0), 1509);
+      assert.deepEqual(account.snapshot(), beforeAccount);
+      assert.equal(account.created.length, 3); assert.equal(account.deleted.length, 3);
+    });
+  }
+});
+
 test('native proof actual batched BLOB slice faults retain growth source and block acknowledgment', async (context) => {
   for (const fault of ['missing-result', 'failed-statement', 'missing-row', 'truncated-hex', 'invalid-hex', 'invalid-utf8', 'reordered-results']) {
     await context.test(fault, async (child) => {
@@ -5903,6 +6035,10 @@ test('real HTTP D1 failures distinguish transport, HTTP, statement and shape wit
       await assert.rejects(db.query(canary, [canary]), (error) => {
         assert.equal(error.d1FailureKind, scenario.failure);
         assert.equal(error.d1SqlReason, 'other', 'private/unrecognized provider text cannot invent a native class');
+        assert.equal(error.providerStatus, scenario.http === 'unknown' ? undefined : scenario.http,
+          'typed HTTP evidence must use the actual response, never an envelope status field');
+        assert.deepEqual(error.providerCodes, []);
+        assert.equal(error.d1NativeSignature, undefined);
         assert.ok(error.message.includes(`failure=${scenario.failure}`));
         assert.ok(error.message.includes(`HTTP=${scenario.http}`));
         assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));

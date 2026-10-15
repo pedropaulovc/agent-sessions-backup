@@ -8,7 +8,7 @@ import {
   copyFrozenIndex, readCheckpoint,
 } from '../../hub/scripts/lib/index-migration.mjs';
 import { BLOCK_COLUMNS, INDEX_ID_SPAN, indexShardForSessionId } from '../../hub/src/index-layout.mjs';
-import { D1_FAILURE_KINDS, D1_SQL_FAILURE_REASONS } from './d1-batch-atomicity.mjs';
+import { D1_FAILURE_KINDS, D1_NATIVE_FAILURE_SIGNATURES, D1_SQL_FAILURE_REASONS } from './d1-batch-atomicity.mjs';
 
 const copyPhases = Object.freeze(Object.values(COPY_PHASES));
 const copyInvariants = Object.freeze(Object.values(COPY_INVARIANTS));
@@ -41,6 +41,21 @@ function safeFailure(error, phase) {
   return new NativeCopyControlError(copyPhases.includes(error?.d1Phase) ? error.d1Phase : phase,
     invariant ? 'assertion' : D1_SQL_FAILURE_REASONS.includes(error?.d1SqlReason) ? error.d1SqlReason : 'other',
     { invariant, failureKind: D1_FAILURE_KINDS.includes(error?.d1FailureKind) ? error.d1FailureKind : undefined });
+}
+
+function queryFailureMetadata(error) {
+  const safe = safeFailure(error, COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
+  return {
+    phase: safe.nativeCopyPhase, nativeClass: safe.nativeCopyClass,
+    ...(D1_SQL_FAILURE_REASONS.includes(error?.d1SqlReason) ? { sqlReason: error.d1SqlReason } : {}),
+    ...(D1_NATIVE_FAILURE_SIGNATURES.includes(error?.d1NativeSignature) ? { nativeSignature: error.d1NativeSignature } : {}),
+    ...(D1_FAILURE_KINDS.includes(error?.d1FailureKind) ? { failureKind: error.d1FailureKind } : {}),
+    ...(Number.isInteger(error?.providerStatus) && error.providerStatus >= 100 && error.providerStatus <= 599
+      ? { httpStatus: error.providerStatus } : {}),
+    ...(Array.isArray(error?.providerCodes) && error.providerCodes.length <= 16
+      && error.providerCodes.every((code) => Number.isSafeInteger(code) && code >= 0)
+      ? { providerCodes: [...error.providerCodes] } : {}),
+  };
 }
 
 function ownedIdentity(database, pr, names) {
@@ -387,6 +402,8 @@ async function proveNativeRetirementDiagnostic({ source, shards, gate, ordinary,
   let retirementBatches = 0;
   let diagnosticQueries = 0;
   let writesAfterFailure = 0;
+  let diagnosticQueryFailure;
+  let diagnosticPositiveControl;
   const observedSource = {
     id: source.id,
     async query(sql, params = []) {
@@ -394,7 +411,32 @@ async function proveNativeRetirementDiagnostic({ source, shards, gate, ordinary,
         diagnosticQueries += 1;
         requireProof(/^\s*WITH verified\b/.test(sql), phase);
       }
-      return await source.query(sql, params);
+      try { return await source.query(sql, params); }
+      catch (error) {
+        if (originalError) {
+          diagnosticQueryFailure = queryFailureMetadata(error);
+          // Disposable-proof-only positive control: the identical query and
+          // verified snapshot must compile and compare cleanly against the
+          // destination's valid representation. Never retry the source query.
+          try {
+            const results = await shards[indexShardForSessionId(probe.session_id, shards.length)].query(sql, params);
+            const encoded = results?.[0]?.source_comparison;
+            let summary;
+            if (typeof encoded === 'string' && Buffer.byteLength(encoded) <= 4096) summary = JSON.parse(encoded);
+            const clean = Array.isArray(results) && results.length === 1
+              && Array.isArray(summary) && summary.length === 5
+              && JSON.stringify(summary.slice(0, 4)) === '[1,1,0,0]'
+              && Array.isArray(summary[4]) && summary[4].every((group) => Array.isArray(group))
+              && summary[4].flat().length === BLOCK_COLUMNS.length
+              && summary[4].flat().every((cell) => Array.isArray(cell) && cell.length === 6
+                && cell.every((value) => value === 0));
+            diagnosticPositiveControl = { outcome: clean ? 'verified' : 'unexpected-result' };
+          } catch (controlError) {
+            diagnosticPositiveControl = { outcome: 'rejected', ...queryFailureMetadata(controlError) };
+          }
+        }
+        throw error;
+      }
     },
     async batch(statements) {
       if (originalError) writesAfterFailure += 1;
@@ -502,6 +544,14 @@ async function proveNativeRetirementDiagnostic({ source, shards, gate, ordinary,
     if (measured) {
       error.nativeCopySourceComparison = measured;
       error.message += ` sourceRetirementComparison=${JSON.stringify(measured)}`;
+    }
+    if (diagnosticQueryFailure) {
+      error.nativeCopyDiagnosticQueryFailure = diagnosticQueryFailure;
+      error.message += ` diagnosticQueryFailure=${JSON.stringify(diagnosticQueryFailure)}`;
+    }
+    if (diagnosticPositiveControl) {
+      error.nativeCopyDiagnosticPositiveControl = diagnosticPositiveControl;
+      error.message += ` diagnosticPositiveControl=${JSON.stringify(diagnosticPositiveControl)}`;
     }
     throw error;
   }
