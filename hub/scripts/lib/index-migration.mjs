@@ -786,40 +786,50 @@ async function sourceRetirementComparison(source, columns, layout, page) {
   const types = ['null', 'integer', 'real', 'text', 'blob'];
   const typeBits = (value) => `CASE typeof(${value}) ${types.map((type, index) =>
     `WHEN '${type}' THEN ${1 << index}`).join(' ')} ELSE 0 END`;
-  // Native D1 limits every SELECT to 100 columns, including materialized CTEs.
-  // Each column's six numeric flags share one JSON cell; the joined primary key
-  // is already equal, so omitting it leaves at most 99 cells plus presence.
-  const flags = columns.flatMap((_, index) => {
-    if (index === idIndex) return [];
-    const stored = `b.${layout.quoted[index]}`, copied = `json_extract(v.row,${layout.paths[index]})`;
-    return [`json_array(${stored} IS ${copied},
-      typeof(${stored}) IS typeof(${copied}),
-      CAST(${stored} AS BLOB) IS CAST(${copied} AS BLOB),
-      length(CAST(${stored} AS BLOB)) IS length(CAST(${copied} AS BLOB)),
-      ${typeBits(stored)}, ${typeBits(copied)}) AS c${index}`];
-  });
-  const flag = (index, offset) => index === idIndex ? '1' : `json_extract(c${index},'$[${offset}]')`;
-  const counters = columns.map((_, index) => {
-    if (index === idIndex) return 'json_array(0,0,0,0,0,0)';
-    const mismatch = `present AND NOT ${flag(index, 0)}`;
-    return `json_array(COALESCE(SUM(${mismatch}),0),
-      ${[1, 2, 3].map((offset) => `COALESCE(SUM(${mismatch} AND NOT ${flag(index, offset)}),0)`).join(',')},
-      ${[4, 5].map((offset) => `COALESCE(SUM(DISTINCT CASE WHEN ${mismatch} THEN ${flag(index, offset)} ELSE 0 END),0)`).join(',')})`;
-  });
-  // Small nested arrays also avoid native function-argument limits on wide layouts.
-  const groups = [];
-  for (let index = 0; index < counters.length; index += 16) {
-    groups.push(`json_array(${counters.slice(index, index + 16).join(',')})`);
-  }
+  // Keep the source column's affinity in the exact CAS equality predicate.
+  // A CASE selecting only stored values would lose that affinity before IS.
+  const stored = `CASE c.n ${columns.map((_, index) =>
+    `WHEN ${index} THEN b.${layout.quoted[index]}`).join(' ')} END`;
+  const equal = `CASE c.n ${columns.map((_, index) =>
+    `WHEN ${index} THEN b.${layout.quoted[index]} IS json_extract(v.row,${layout.paths[index]})`).join(' ')} END`;
+  const groupCount = Math.ceil(columns.length / 16);
+  // One row per cell keeps every SELECT narrow. Only two DISTINCT aggregates
+  // collect type-bit sets, grouped by column, rather than two per source column.
   const sql = `WITH verified(id,row) AS MATERIALIZED (
     SELECT json_extract(value,${layout.paths[idIndex]}), value FROM json_each(?)
+  ), column_indexes(n) AS (VALUES ${columns.map((_, index) => `(${index})`).join(',')}
+  ), cells AS MATERIALIZED (
+    SELECT v.id, c.n, b.id IS NOT NULL AS present, ${stored} AS stored,
+      json_extract(v.row,'$[' || c.n || ']') AS copied, ${equal} AS is_equal
+    FROM verified AS v LEFT JOIN blocks AS b ON b.id = v.id CROSS JOIN column_indexes AS c
+  ), flags AS MATERIALIZED (
+    SELECT id, n, present, present AND NOT is_equal AS mismatch,
+      typeof(stored) IS NOT typeof(copied) AS type_mismatch,
+      CAST(stored AS BLOB) IS NOT CAST(copied AS BLOB) AS byte_mismatch,
+      length(CAST(stored AS BLOB)) IS NOT length(CAST(copied AS BLOB)) AS length_mismatch,
+      ${typeBits('stored')} AS source_type, ${typeBits('copied')} AS snapshot_type
+    FROM cells
+  ), column_counts AS MATERIALIZED (
+    SELECT n, SUM(mismatch) AS mismatches,
+      SUM(mismatch AND type_mismatch) AS type_mismatches,
+      SUM(mismatch AND byte_mismatch) AS byte_mismatches,
+      SUM(mismatch AND length_mismatch) AS length_mismatches,
+      SUM(DISTINCT CASE WHEN mismatch THEN source_type ELSE 0 END) AS source_types,
+      SUM(DISTINCT CASE WHEN mismatch THEN snapshot_type ELSE 0 END) AS snapshot_types
+    FROM flags GROUP BY n
+  ), row_flags AS MATERIALIZED (
+    SELECT id, MAX(present) AS present, MAX(mismatch) AS mismatch FROM flags GROUP BY id
+  ), group_cells AS MATERIALIZED (
+    SELECT n / 16 AS ordinal,
+      json_group_array(json_array(mismatches,type_mismatches,byte_mismatches,
+        length_mismatches,source_types,snapshot_types) ORDER BY n) AS cells
+    FROM column_counts GROUP BY n / 16
   ), compared AS MATERIALIZED (
-    SELECT b.id IS NOT NULL AS present${flags.length ? `,${flags.join(',')}` : ''}
-    FROM verified AS v LEFT JOIN blocks AS b ON b.id = v.id
-  ) SELECT json_array(COUNT(*), COALESCE(SUM(present),0),
-    COALESCE(SUM(NOT present),0),
-    COALESCE(SUM(present AND NOT (${columns.map((_, index) => flag(index, 0)).join(' AND ')})),0),
-    json_array(${groups.join(',')})) AS source_comparison FROM compared`;
+    SELECT COUNT(*) AS expected, COALESCE(SUM(present),0) AS present,
+      COALESCE(SUM(NOT present),0) AS missing, COALESCE(SUM(mismatch),0) AS mismatch FROM row_flags
+  ) SELECT json_array(expected,present,missing,mismatch,
+    json((SELECT json_group_array(json(cells) ORDER BY ordinal) FROM group_cells)))
+    AS source_comparison FROM compared`;
   // D1's 100,000-byte per-statement limit is independent of the JSON request cap.
   if (Buffer.byteLength(sql) > 100_000) return unavailable('request-budget');
   // The original canonical cap remains unchanged. The additional failure-only
@@ -842,7 +852,7 @@ async function sourceRetirementComparison(source, columns, layout, page) {
   if (!Array.isArray(results) || results.length !== 1 || !Array.isArray(summary) || summary.length !== 5
     || !summary.slice(0, 4).every((value) => count(value))
     || summary[0] !== expected || summary[1] + summary[2] !== expected || summary[3] > summary[1]
-    || !Array.isArray(summary[4]) || summary[4].length !== groups.length
+    || !Array.isArray(summary[4]) || summary[4].length !== groupCount
     || !summary[4].every((group, index) => Array.isArray(group)
       && group.length === Math.min(16, columns.length - index * 16))) return unavailable('response-shape');
   const cells = summary[4].flat();

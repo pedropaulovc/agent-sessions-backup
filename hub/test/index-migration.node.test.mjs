@@ -4141,23 +4141,25 @@ test('copy preserves native rejection and retained source across semantic failur
 
 test('retirement failure diagnostics preserve the native error and source checkpoint while exposing only bounded aggregates', async (context) => {
   const canary = 'PRIVATE_RETIRED_DATA_CANARY';
-  for (const scenario of ['clean', 'mismatch', 'missing', 'mismatch-and-missing', 'query-failed', 'response-shape', 'request-budget', 'sql-budget', 'oversized']) {
+  for (const scenario of ['clean', 'mismatch', 'missing', 'mismatch-and-missing', 'query-failed', 'response-shape', 'request-budget', 'wide-mismatch', 'oversized']) {
     await context.test(scenario, async (child) => {
       const f = await fixture(child);
       const columns = [...BLOCK_COLUMNS];
-      if (scenario === 'sql-budget') {
+      if (scenario === 'wide-mismatch') {
         const added = Array.from({ length: 100 - columns.length }, (_, index) => `public_future_${String(index).padStart(3, '0')}`);
         columns.push(...added);
         for (const db of [f.source, ...f.shards]) for (const column of added) {
           db.database.exec(`ALTER TABLE blocks ADD COLUMN ${quoted(column)} TEXT`);
         }
       }
-      const hasMismatch = ['mismatch', 'mismatch-and-missing'].includes(scenario);
+      const hasMismatch = ['mismatch', 'mismatch-and-missing', 'wide-mismatch'].includes(scenario);
       const hasMissing = ['missing', 'mismatch-and-missing'].includes(scenario);
-      const large = scenario === 'request-budget' ? '\u0000'.repeat(148_000)
+      const large = scenario === 'request-budget' ? '\u0000'.repeat(150_000)
         : scenario === 'oversized' ? 'x'.repeat(COPY_PAGE_BYTES + 2) : '';
-      const originals = (large ? [block(811, 0, { text: `${canary} ${large}` })]
-        : [block(811, 0, { text: `${canary}\u0000original_tail`, role: null }), block(812, 1)])
+      const originals = (scenario === 'wide-mismatch'
+        ? Array.from({ length: 82 }, (_, index) => block(811 + index, index % 2))
+        : large ? [block(811, 0, { text: `${canary} ${large}` })]
+          : [block(811, 0, { text: `${canary}\u0000original_tail`, role: null }), block(812, 1)])
         .map((row) => ({ ...row, ...Object.fromEntries(columns.slice(BLOCK_COLUMNS.length).map((column) => [column, null])) }));
       seedBlocks(f.source, originals, columns);
       const rejection = new Error('safe native retirement rejection');
@@ -4188,7 +4190,16 @@ test('retirement failure diagnostics preserve the native error and source checkp
         if (state.pending?.phase !== 'verified') return;
         verified = state;
         assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), state);
-        if (hasMismatch) {
+        if (scenario === 'wide-mismatch') {
+          // Unique mismatch counts at every added ordinal catch column/group transposition.
+          expected = originals.map((row, rowIndex) => ({ ...row, ...Object.fromEntries(
+            columns.slice(BLOCK_COLUMNS.length).map((column, index) => [column, rowIndex <= index ? 'changed' : null]),
+          ) }));
+          for (const [index, column] of columns.slice(BLOCK_COLUMNS.length).entries()) {
+            f.source.database.prepare(`UPDATE blocks SET ${quoted(column)} = ? WHERE id <= ?`)
+              .run('changed', originals[index].id);
+          }
+        } else if (hasMismatch) {
           expected = [{ ...originals[0], role: '', text: `${canary}\u0000changed_tail` }, originals[1]];
           f.source.database.prepare('UPDATE blocks SET role = ?, text = ? WHERE id = ?')
             .run(expected[0].role, expected[0].text, expected[0].id);
@@ -4206,16 +4217,20 @@ test('retirement failure diagnostics preserve the native error and source checkp
         assert.ok(comparison, 'the historical copier must fail this load-bearing metadata assertion');
         assert.ok(!JSON.stringify(comparison).includes(canary));
         assert.ok(!JSON.stringify(comparison).includes('original_tail'));
-        if (['query-failed', 'response-shape', 'request-budget', 'sql-budget', 'oversized'].includes(scenario)) {
-          assert.deepEqual(comparison, { status: 'unavailable', reason: scenario === 'oversized' ? 'canonical-budget'
-            : scenario === 'sql-budget' ? 'request-budget' : scenario });
+        if (['query-failed', 'response-shape', 'request-budget', 'oversized'].includes(scenario)) {
+          assert.deepEqual(comparison, { status: 'unavailable', reason: scenario === 'oversized' ? 'canonical-budget' : scenario });
         } else {
-          assert.equal(comparison.status, scenario);
+          assert.equal(comparison.status, scenario === 'wide-mismatch' ? 'mismatch' : scenario);
           assert.equal(comparison.expectedRows, originals.length);
           assert.equal(comparison.presentRows, expected.length);
           assert.equal(comparison.missingRows, hasMissing ? 1 : 0);
-          assert.equal(comparison.mismatchingRows, hasMismatch ? 1 : 0);
-          assert.deepEqual(comparison.columns, hasMismatch ? [
+          assert.equal(comparison.mismatchingRows, scenario === 'wide-mismatch' ? originals.length : hasMismatch ? 1 : 0);
+          assert.deepEqual(comparison.columns, scenario === 'wide-mismatch'
+            ? columns.slice(BLOCK_COLUMNS.length).map((_, index) => ({
+              index: BLOCK_COLUMNS.length + index, mismatchingRows: index + 1, typeMismatchRows: index + 1,
+              byteMismatchRows: index + 1, lengthMismatchRows: index + 1,
+              sourceTypes: ['text'], snapshotTypes: ['null'],
+            })) : hasMismatch ? [
             { index: 5, mismatchingRows: 1, typeMismatchRows: 1, byteMismatchRows: 1, lengthMismatchRows: 1,
               sourceTypes: ['text'], snapshotTypes: ['null'] },
             { index: 12, mismatchingRows: 1, typeMismatchRows: 0, byteMismatchRows: 1, lengthMismatchRows: 1,
@@ -4225,9 +4240,109 @@ test('retirement failure diagnostics preserve the native error and source checkp
         return true;
       });
       assert.equal(retirementAttempts, 1, 'diagnostics never replay or ACK a rejected source batch');
-      assert.equal(diagnosticQueries, ['request-budget', 'sql-budget', 'oversized'].includes(scenario) ? 0 : 1);
+      assert.equal(diagnosticQueries, ['request-budget', 'oversized'].includes(scenario) ? 0 : 1);
       assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), expected, 'every remaining source tuple survives');
       assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), verified, 'no diagnostic checkpoint advance');
+    });
+  }
+});
+
+test('retirement aggregate preserves CAS affinity and mixed storage byte flags on native adapters', async (context) => {
+  for (const backend of ['sqlite', 'workerd']) {
+    await context.test(backend, async (child) => {
+      const f = backend === 'sqlite' ? await fixture(child) : await workerdFixture(child);
+      const added = [['public_untyped', ''], ['public_text', 'TEXT'], ['public_integer', 'INTEGER']];
+      const columns = [...BLOCK_COLUMNS, ...added.map(([name]) => name)];
+      for (const db of [f.source, ...f.shards]) for (const [name, affinity] of added) {
+        await db.query(`ALTER TABLE blocks ADD COLUMN ${quoted(name)} ${affinity}`);
+      }
+      await copyWithNativeParameters(f.args());
+      await f.shards[0].query('DELETE FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT]);
+      const values = ['same\u0000bytes', 11, 0.1, null, 'blob\u0000bytes', 7, 'number',
+        '\uFEFFsame\u0000😀"\\tail', null, 'missing', 0.3];
+      const originals = values.map((value, index) => block(1100 + index, index % 2, {
+        role: index ? 'assistant' : null, text: '\uFEFFprivate_affinity\u0000searchtail 😀',
+        public_untyped: value, public_text: '7', public_integer: 11,
+      }));
+      await f.source.batch([
+        { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'copying' WHERE id = 1`, params: [] },
+        { sql: `INSERT INTO blocks (${columns.map(quoted).join(',')})
+          SELECT ${columns.map((_, index) => `json_extract(value,'$[${index}]')`).join(',')} FROM json_each(?)`,
+        params: [JSON.stringify(originals.map((row) => columns.map((column) => row[column])))] },
+        { sql: 'INSERT INTO blocks_fts (rowid, text) SELECT id, text FROM blocks', params: [] },
+        { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'frozen' WHERE id = 1`, params: [] },
+      ]);
+      const physical = () => f.source.query(`SELECT ${columns.flatMap((column, index) => [
+        `typeof(${quoted(column)}) AS t${index}`, `hex(CAST(${quoted(column)} AS BLOB)) AS b${index}`,
+      ]).join(',')} FROM blocks ORDER BY id`);
+      let verified, retained, captured, originalError, originalMessage, retirementAttempts = 0, diagnosticQueries = 0;
+      const nativeBatch = f.source.batch.bind(f.source), nativeQuery = f.source.query.bind(f.source);
+      f.source.batch = async (statements) => {
+        if (!statements.some(({ sql }) => sql.includes('AS source_empty'))
+          || !statements.some(({ sql }) => /DELETE FROM blocks/.test(sql))) return nativeBatch(statements);
+        retirementAttempts += 1;
+        try { return await nativeBatch(statements); }
+        catch (error) { originalError = error; originalMessage = error.message; throw error; }
+      };
+      f.source.query = async (sql, params) => {
+        if (sql.includes('AS source_comparison FROM compared')) {
+          diagnosticQueries += 1; captured = { sql, params };
+          assert.ok(!isWrite(sql));
+          assert.ok(Buffer.byteLength(sql) <= 100_000);
+          assert.ok(Buffer.byteLength(JSON.stringify(captured)) <= COPY_PAGE_BYTES);
+        }
+        return nativeQuery(sql, params);
+      };
+      await assert.rejects(copyWithNativeParameters(f.args({ checkpointHook: async (state) => {
+        if (state.pending?.phase !== 'verified') return;
+        verified = state;
+        await f.source.batch([
+          { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'copying' WHERE id = 1`, params: [] },
+          ...[[0, null], [1, 12], [2, 0.2], [3, 'new'], [10, 0.4]].map(([index, value]) => ({
+            sql: 'UPDATE blocks SET public_untyped = ? WHERE id = ?', params: [value, originals[index].id],
+          })),
+          { sql: 'UPDATE blocks SET role = ? WHERE id = ?', params: ['', originals[0].id] },
+          { sql: 'UPDATE blocks SET public_untyped = unhex(?) WHERE id = ?',
+            params: [Buffer.from(originals[4].public_untyped).toString('hex'), originals[4].id] },
+          { sql: 'UPDATE blocks SET public_untyped = CAST(? AS REAL) WHERE id = ?', params: [7, originals[5].id] },
+          { sql: 'DELETE FROM blocks WHERE id = ?', params: [originals[9].id] },
+          { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'frozen' WHERE id = 1`, params: [] },
+        ]);
+        retained = await physical();
+      } })), (error) => {
+        assert.equal(error, originalError); assert.equal(error.message, originalMessage);
+        assert.equal(d1SqlFailureReason([error.message]), 'malformed-json');
+        assert.deepEqual(error.d1SourceComparison, {
+          status: 'mismatch-and-missing', expectedRows: 11, presentRows: 10, missingRows: 1, mismatchingRows: 6,
+          columns: [
+            { index: 5, mismatchingRows: 1, typeMismatchRows: 1, byteMismatchRows: 1, lengthMismatchRows: 1,
+              sourceTypes: ['text'], snapshotTypes: ['null'] },
+            { index: 18, mismatchingRows: 6, typeMismatchRows: 3, byteMismatchRows: 5, lengthMismatchRows: 2,
+              sourceTypes: ['null', 'integer', 'real', 'text', 'blob'], snapshotTypes: ['null', 'integer', 'real', 'text'] },
+          ],
+        });
+        assert.ok(!JSON.stringify(error.d1SourceComparison).includes('private_affinity'));
+        return true;
+      });
+      assert.equal(retirementAttempts, 1); assert.equal(diagnosticQueries, 1);
+      assert.deepEqual(await physical(), retained);
+      assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), verified);
+      assert.deepEqual(await f.source.query(`SELECT state FROM ${SOURCE_FREEZE_TABLE}`), [{ state: 'frozen' }]);
+      // A separate read-only control changes only the public canonical snapshot.
+      // Direct column IS applies affinity; CASE-stored IS without it would invent two misses.
+      const snapshot = JSON.parse(captured.params[0]);
+      snapshot[6][19] = 7; snapshot[6][20] = '11';
+      const response = await nativeQuery(captured.sql, [JSON.stringify(snapshot)]);
+      const summary = JSON.parse(response[0].source_comparison);
+      assert.deepEqual(summary.slice(0, 4), [11, 10, 1, 6]);
+      const cells = summary[4].flat();
+      assert.deepEqual(cells[0], [0, 0, 0, 0, 0, 0], 'the joined primary key is never a mismatched cell');
+      assert.deepEqual(cells[18], [6, 3, 5, 2, 31, 15],
+        'duplicate REAL types must not add duplicate bits or count one row twice');
+      assert.deepEqual(cells[19], [0, 0, 0, 0, 0, 0], 'TEXT affinity must preserve SQL-equal numeric snapshots');
+      assert.deepEqual(cells[20], [0, 0, 0, 0, 0, 0], 'INTEGER affinity must preserve SQL-equal text snapshots');
+      assert.deepEqual(await physical(), retained);
+      assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), verified);
     });
   }
 });
@@ -5502,7 +5617,7 @@ test('native diagnostic proof derives exact NULL transport flags and fails close
 });
 
 test('native diagnostic proof bounds rejected query metadata and compiles the identical aggregate on its destination', async (context) => {
-  for (const scenario of ['typed-evidence', 'invalid-evidence']) {
+  for (const scenario of ['typed-evidence', 'invalid-evidence', 'malformed-summary', 'destination-query-rejected']) {
     await context.test(scenario, async (child) => {
       const canary = 'PRIVATE_NATIVE_DIAGNOSTIC_QUERY_CANARY';
       const diagnosticId = INDEX_ID_SPAN - 2;
@@ -5530,21 +5645,31 @@ test('native diagnostic proof bounds rejected query metadata and compiles the id
             assert.fail('the deliberately absent relation must reject');
           } catch (error) {
             if (error.code === 'ERR_ASSERTION') throw error;
-            Object.assign(error, scenario === 'typed-evidence'
-              ? { providerStatus: 400, providerCodes: [7500], d1FailureKind: 'http' }
-              : { providerStatus: '400', providerCodes: [7500, canary],
-                d1FailureKind: canary, d1NativeSignature: canary, d1Phase: canary });
+            Object.assign(error, scenario === 'invalid-evidence'
+              ? { providerStatus: '400', providerCodes: [7500, canary],
+                d1FailureKind: canary, d1NativeSignature: canary, d1Phase: canary }
+              : { providerStatus: 400, providerCodes: [7500], d1FailureKind: 'http' });
             throw error;
           }
         };
-        for (const shard of databases.shards) shard.beforeQuery = (event) => {
-          if (!event.sql.includes('AS source_comparison FROM compared')) return;
-          positiveQueries += 1;
-          assert.ok(!isWrite(event.sql));
-          assert.equal(event.sql, diagnosticStatement.sql);
-          assert.deepEqual(event.params, diagnosticStatement.params,
-            'the failure-only positive control must compile the exact public SQL and canonical snapshot');
-        };
+        for (const shard of databases.shards) {
+          shard.beforeQuery = (event) => {
+            if (!event.sql.includes('AS source_comparison FROM compared')) return;
+            positiveQueries += 1;
+            assert.ok(!isWrite(event.sql));
+            assert.equal(event.sql, diagnosticStatement.sql);
+            assert.deepEqual(event.params, diagnosticStatement.params,
+              'the failure-only positive control must compile the exact public SQL and canonical snapshot');
+            if (scenario === 'destination-query-rejected') {
+              try { shard.database.prepare(`SELECT * FROM "${canary}"`).all(); }
+              catch (error) { throw Object.assign(error, { providerStatus: 400, providerCodes: [7500], d1FailureKind: 'http' }); }
+              assert.fail('the deliberately absent destination relation must reject');
+            }
+          };
+          shard.transformQuery = ({ sql }, rows) => scenario === 'malformed-summary'
+            && sql.includes('AS source_comparison FROM compared')
+            ? [{ ...rows[0], source_comparison: `{${canary}` }] : rows;
+        }
       };
       await assert.rejects(verifyNativeCopyControl(proof), (error) => {
         assert.equal(error.nativeCopyPhase, 'retirement-diagnostic');
@@ -5552,9 +5677,13 @@ test('native diagnostic proof bounds rejected query metadata and compiles the id
         assert.deepEqual(error.nativeCopySourceComparison, { status: 'unavailable', reason: 'query-failed' });
         assert.deepEqual(error.nativeCopyDiagnosticQueryFailure, {
           phase: 'copy-source-delete-and-freeze', nativeClass: 'missing-schema', sqlReason: 'missing-schema',
-          ...(scenario === 'typed-evidence' ? { failureKind: 'http', httpStatus: 400, providerCodes: [7500] } : {}),
+          ...(scenario !== 'invalid-evidence' ? { failureKind: 'http', httpStatus: 400, providerCodes: [7500] } : {}),
         });
-        assert.deepEqual(error.nativeCopyDiagnosticPositiveControl, { outcome: 'verified' });
+        assert.deepEqual(error.nativeCopyDiagnosticPositiveControl, scenario === 'malformed-summary'
+          ? { outcome: 'unexpected-result' } : scenario === 'destination-query-rejected'
+            ? { outcome: 'rejected', phase: 'copy-source-delete-and-freeze', nativeClass: 'missing-schema',
+              sqlReason: 'missing-schema', failureKind: 'http', httpStatus: 400, providerCodes: [7500] }
+            : { outcome: 'verified' });
         assert.ok(error.message.includes('diagnosticQueryFailure='));
         assert.ok(error.message.includes('diagnosticPositiveControl='));
         for (const value of [canary, String(diagnosticId), '61FF62', 'a\uFFFDb', 'SELECT * FROM',

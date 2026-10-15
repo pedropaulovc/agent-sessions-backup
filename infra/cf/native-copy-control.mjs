@@ -419,10 +419,13 @@ async function proveNativeRetirementDiagnostic({ source, shards, gate, ordinary,
           // verified snapshot must compile and compare cleanly against the
           // destination's valid representation. Never retry the source query.
           try {
-            const results = await shards[indexShardForSessionId(probe.session_id, shards.length)].query(sql, params);
+            const destination = shards[indexShardForSessionId(probe.session_id, shards.length)];
+            const results = await destination.query(sql, params);
             const encoded = results?.[0]?.source_comparison;
             let summary;
-            if (typeof encoded === 'string' && Buffer.byteLength(encoded) <= 4096) summary = JSON.parse(encoded);
+            if (typeof encoded === 'string' && Buffer.byteLength(encoded) <= 4096) {
+              try { summary = JSON.parse(encoded); } catch { /* An invalid response is not a rejected query. */ }
+            }
             const clean = Array.isArray(results) && results.length === 1
               && Array.isArray(summary) && summary.length === 5
               && JSON.stringify(summary.slice(0, 4)) === '[1,1,0,0]'

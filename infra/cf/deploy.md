@@ -547,9 +547,25 @@ its SQL exceeds D1's separate [100,000-byte statement limit](https://developers.
 The oversized per-column branch has no bounded canonical snapshot and is explicitly
 `unavailable/canonical-budget`; query/response failures are also `unavailable`.
 The original error object/message remains unchanged. Public native workerd accepts
-harmless statements of exactly 100,000 bytes and rejects 100,001 bytes. The generated
-18-column diagnostic is 21,127 SQL bytes; a public 100-column layout with 82 additional
-TEXT columns generates 124,999 bytes and is skipped before any diagnostic request.
+harmless statements of exactly 100,000 bytes and rejects 100,001 bytes; both the
+statement and fully encoded request caps are checked before the diagnostic query.
+
+The comparison uses a controlled numeric column-index relation and one source
+LEFT JOIN to form narrow cell rows. Per-column grouped counters use only two
+DISTINCT type-mask aggregates, while per-row flags count a row only once even if
+several columns differ. Equality retains each original `b.column IS copied`
+predicate inside its CASE, preserving SQLite column affinity; stored-value CASE
+results are used only for storage-type and BLOB-byte/length flags. The nested
+numeric summary and public diagnostic object are unchanged. This is a query-shape
+compatibility candidate, not a confirmed explanation of an earlier native rejection
+or the protected production source-retirement failure.
+
+Column cells and their containing groups use explicit aggregate ORDER BY clauses,
+not incidental GROUP BY sorter order. Public native SQLite and workerd controls
+verify the nested numeric encoding, mixed storage-type masks, affinity-equal cells,
+and distinct mismatch counts across a 100-column layout. Native Cloudflare
+acceptance remains a separate protected control; local semantic equivalence alone
+does not identify the cause of a remote rejection.
 
 “One comparison” means one logical read-only SQL query. The existing REST client
 may replay that query after an unambiguous HTTP 429 with a validated `Retry-After`,
