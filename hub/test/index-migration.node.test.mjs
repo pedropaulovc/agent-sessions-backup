@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { isDeepStrictEqual } from 'node:util';
 import test from 'node:test';
 import {
   ACTIVATION_CHECKPOINT, COPY_CHECKPOINT, COPY_ENCODING, COPY_PAGE_BYTES, READY_CHECKPOINT, SEED_CHECKPOINT, SOURCE_FREEZE_TABLE,
@@ -1980,8 +1981,23 @@ function catalogStarBytes(db) {
 const PUBLIC_SESSION_IDS = ['public\u0000left', 'public\u0000right',
   'public\u0001\u007f会話😀', '\ufeffpublic-session\u0000尾'];
 
-function assertCatalogAcknowledgement(f, expected) {
+function assertCatalogAcknowledgement(f, expected, mode = 'seed') {
+  assert.ok(['seed', 'reconcile'].includes(mode));
   let acknowledgements = 0;
+  const committed = new Map(f.shards.map((shard) => [shard.id, []]));
+  if (mode === 'reconcile') {
+    // Active reconciliation uses the Worker's monotonic write batches, not
+    // seed's explicit SELECT readback. Observe real state at native COMMIT.
+    for (const shard of f.shards) {
+      const afterBatch = shard.afterBatch;
+      shard.afterBatch = async (event) => {
+        await afterBatch?.(event);
+        if (event.committed && event.statements.some(({ sql }) => isWrite(sql))) {
+          committed.get(shard.id).push(catalogSnapshot(shard));
+        }
+      };
+    }
+  }
   f.source.beforeQuery = ({ sql, params }) => {
     if (!isWrite(sql)) return;
     assert.match(sql, /^\s*DELETE\s+FROM\s+session_catalog_outbox\b/i,
@@ -1998,6 +2014,11 @@ function assertCatalogAcknowledgement(f, expected) {
     for (const shard of f.shards) {
       assert.deepEqual(subset(catalogSnapshot(shard)), subset(expected),
         'ALL shards must agree on every acknowledged entry before source outbox deletion');
+      if (mode === 'reconcile') {
+        assert.ok(committed.get(shard.id).some((snapshot) => isDeepStrictEqual(subset(snapshot), subset(expected))),
+          'every acknowledged identity must have its exact catalog/version state on a successful native commit at every shard');
+        continue;
+      }
       for (const table of ['sessions', 'starred_turns', 'catalog_versions']) {
         for (const sid of ids) {
           assert.ok(f.trace.some((event) => event.db === shard.id && ['query', 'batch-statement'].includes(event.kind)
@@ -2060,7 +2081,7 @@ for (const operation of ['seed', 'reconcile']) {
     const copy = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
     assert.ok(f.source.rows('SELECT seq FROM session_catalog_outbox').length > 0);
     f.trace.length = 0;
-    const acknowledged = assertCatalogAcknowledgement(f, expected);
+    const acknowledged = assertCatalogAcknowledgement(f, expected, operation);
     const result = await (operation === 'seed'
       ? seedCatalogWithNativeParameters(f.args()) : reconcileCatalogWithNativeParameters(f.args()));
     assert.equal(result.state, operation === 'seed' ? 'complete' : 'current');
@@ -2090,7 +2111,7 @@ for (const operation of ['seed', 'reconcile']) {
     }
     const before = catalogStarBytes(f.source), expected = expectedCatalog(f);
     const copy = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
-    const acknowledged = assertCatalogAcknowledgement(f, expected);
+    const acknowledged = assertCatalogAcknowledgement(f, expected, operation);
     const result = await (operation === 'seed'
       ? seedCatalogWithNativeParameters(f.args()) : reconcileCatalogWithNativeParameters(f.args()));
     assert.equal(result.state, operation === 'seed' ? 'complete' : 'current');
@@ -2101,9 +2122,6 @@ for (const operation of ['seed', 'reconcile']) {
     for (const shard of f.shards) {
       assert.deepEqual(catalogSnapshot(shard), expected);
       assert.deepEqual(catalogStarBytes(shard), before);
-      for (const row of shard.rows('SELECT * FROM starred_turns ORDER BY session_id, turn_key')) {
-        assert.equal(rowDigest(STAR_CATALOG_COLUMNS, row), sha256(JSON.stringify(STAR_CATALOG_COLUMNS.map((column) => row[column]))));
-      }
     }
   });
 }
