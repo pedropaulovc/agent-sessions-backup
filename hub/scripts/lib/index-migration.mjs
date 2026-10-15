@@ -776,6 +776,76 @@ async function verifyPending(source, shards, state, layout, tokenizer) {
   return verified;
 }
 
+// Failure-only observation of the already verified canonical snapshot. This never
+// authorizes a retry or ACK: even a clean comparison cannot prove a failed batch
+// committed, and a diagnostic request may itself be unavailable after the failure.
+async function sourceRetirementComparison(source, columns, layout, page) {
+  const unavailable = (reason) => ({ status: 'unavailable', reason });
+  if (page.json === null) return unavailable('canonical-budget');
+  const flags = columns.flatMap((_, index) => {
+    const stored = `b.${layout.quoted[index]}`, copied = `json_extract(v.row,${layout.paths[index]})`;
+    return [
+      `(${stored} IS ${copied}) AS e${index}`,
+      `(typeof(${stored}) IS typeof(${copied})) AS t${index}`,
+      `(CAST(${stored} AS BLOB) IS CAST(${copied} AS BLOB)) AS b${index}`,
+      `(length(CAST(${stored} AS BLOB)) IS length(CAST(${copied} AS BLOB))) AS l${index}`,
+      `typeof(${stored}) AS s${index}`, `typeof(${copied}) AS v${index}`,
+    ];
+  });
+  const types = ['null', 'integer', 'real', 'text', 'blob'];
+  const typeBits = (column) => `CASE ${column} ${types.map((type, index) =>
+    `WHEN '${type}' THEN ${1 << index}`).join(' ')} ELSE 0 END`;
+  const counters = columns.flatMap((_, index) => [
+    `COALESCE(SUM(present AND NOT e${index}),0) AS m${index}`,
+    `COALESCE(SUM(present AND NOT e${index} AND NOT t${index}),0) AS t${index}`,
+    `COALESCE(SUM(present AND NOT e${index} AND NOT b${index}),0) AS b${index}`,
+    `COALESCE(SUM(present AND NOT e${index} AND NOT l${index}),0) AS l${index}`,
+    `COALESCE(SUM(DISTINCT CASE WHEN present AND NOT e${index} THEN ${typeBits(`s${index}`)} ELSE 0 END),0) AS s${index}`,
+    `COALESCE(SUM(DISTINCT CASE WHEN present AND NOT e${index} THEN ${typeBits(`v${index}`)} ELSE 0 END),0) AS v${index}`,
+  ]);
+  const sql = `WITH verified(id,row) AS MATERIALIZED (
+    SELECT json_extract(value,${layout.paths[columns.indexOf('id')]}), value FROM json_each(?)
+  ), compared AS MATERIALIZED (
+    SELECT b.id IS NOT NULL AS present, ${flags.join(',')}
+    FROM verified AS v LEFT JOIN blocks AS b ON b.id = v.id
+  ) SELECT COUNT(*) AS expected_rows, COALESCE(SUM(present),0) AS present_rows,
+    COALESCE(SUM(NOT present),0) AS missing_rows,
+    COALESCE(SUM(present AND NOT (${columns.map((_, index) => `e${index}`).join(' AND ')})),0) AS mismatching_rows,
+    ${counters.join(',')} FROM compared`;
+  // The original canonical cap remains unchanged. The additional failure-only
+  // request must also fit that cap after framing/escaping, or is explicitly skipped.
+  const requestBytes = Buffer.byteLength(JSON.stringify({ sql, params: [] }))
+    + Buffer.byteLength(JSON.stringify([page.json])) - 2;
+  if (requestBytes > COPY_PAGE_BYTES) return unavailable('request-budget');
+  let results;
+  try { results = await source.query(sql, [page.json]); }
+  catch { return unavailable('query-failed'); }
+  const row = results?.[0], expected = page.rows.length;
+  const count = (key, maximum = expected) => Number.isSafeInteger(row?.[key])
+    && row[key] >= 0 && row[key] <= maximum;
+  if (!Array.isArray(results) || results.length !== 1
+    || !['expected_rows', 'present_rows', 'missing_rows', 'mismatching_rows'].every((key) => count(key))
+    || row.expected_rows !== expected || row.present_rows + row.missing_rows !== expected
+    || row.mismatching_rows > row.present_rows
+    || !columns.every((_, index) => ['m', 't', 'b', 'l'].every((prefix) => count(`${prefix}${index}`, row.mismatching_rows))
+      && ['s', 'v'].every((prefix) => count(`${prefix}${index}`, 31))
+      && ['t', 'b', 'l'].every((prefix) => row[`${prefix}${index}`] <= row[`m${index}`]))) {
+    return unavailable('response-shape');
+  }
+  const typeClasses = (bits) => types.filter((_, index) => bits & (1 << index));
+  return {
+    status: row.mismatching_rows ? row.missing_rows ? 'mismatch-and-missing' : 'mismatch'
+      : row.missing_rows ? 'missing' : 'clean',
+    expectedRows: expected, presentRows: row.present_rows, missingRows: row.missing_rows,
+    mismatchingRows: row.mismatching_rows,
+    columns: columns.flatMap((_, index) => row[`m${index}`] ? [{
+      index, mismatchingRows: row[`m${index}`], typeMismatchRows: row[`t${index}`],
+      byteMismatchRows: row[`b${index}`], lengthMismatchRows: row[`l${index}`],
+      sourceTypes: typeClasses(row[`s${index}`]), snapshotTypes: typeClasses(row[`v${index}`]),
+    }] : []),
+  };
+}
+
 async function finishPending(source, shards, state, gate, checkpoint, layout, tokenizer) {
   if (state.pending.phase === 'copying') {
     const rows = await readBlockRows(source, state.columns, state.pending.rows.map((row) => row.id), layout);
@@ -825,7 +895,19 @@ async function finishPending(source, shards, state, gate, checkpoint, layout, to
   );
   // The temporary copying state and every delete are one transaction. Old HTTP
   // invocations never observe an unfrozen commit or delete newly changed row content.
-  const deletion = await phaseDb(source, COPY_PHASES.SOURCE_DELETE_AND_FREEZE).batch(statements);
+  const retirementSource = phaseDb(source, COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
+  let deletion;
+  try { deletion = await retirementSource.batch(statements); }
+  catch (error) {
+    // Preserve the original error, message, phase and rejection semantics, including
+    // when a request gate or the diagnostic itself rejects. No source writes follow.
+    let comparison;
+    try { comparison = await sourceRetirementComparison(retirementSource, state.columns, layout, page); }
+    catch { comparison = { status: 'unavailable', reason: 'query-failed' }; }
+    try { error.d1SourceComparison = comparison; }
+    catch { /* Non-extensible errors must still retain their original rejection. */ }
+    throw error;
+  }
   if (deletion.length !== statements.length || !Array.isArray(deletion.at(-1)?.results)
     || deletion.at(-1).results.length) throw copyInvariant(COPY_INVARIANTS.SOURCE_DELETE, 'verified source deletion did not remove the whole page', COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
   state.after = ids.at(-1);

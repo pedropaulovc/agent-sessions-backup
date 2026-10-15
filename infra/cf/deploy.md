@@ -533,6 +533,31 @@ recognized rejection token, not proof of its root cause. In particular, malforme
 JSON can be the intentional source-comparison assertion aborting a changed page.
 These diagnostics do not establish the cause of any earlier production failure.
 
+After a rejected `copy-source-delete-and-freeze` batch, the copier attempts one
+read-only aggregate comparison against the **same already-verified canonical
+snapshot**, never against a new copy or a retry. Its additional JSON diagnostic
+reports `clean`, `mismatch`, `missing`, `mismatch-and-missing`, or `unavailable`;
+present/missing/mismatching row counts; static zero-based column indexes; allowlisted
+SQLite storage-type classes; and counts of type, BLOB-byte and byte-length inequality
+on mismatched columns. SQL-equal INTEGER/REAL values are not reported as CAS misses.
+No IDs, column names, scalar values, text, search terms, SQL, parameters or native
+diagnostic errors are emitted. The query is skipped when its fully JSON-encoded
+request would exceed the existing 1 MiB copy budget, or when a canonical snapshot is
+unavailable for the oversized per-column branch; query/response failures are also
+explicitly `unavailable`. The original error object/message remains unchanged.
+
+This observation does not identify the original failing statement or authorize
+source writes, ACK, checkpoint advance, or retry. A clean current comparison does
+not prove a failed batch committed or that its earlier comparison was clean; a
+missing row can also follow an ambiguous transport failure. The source fence and
+full-column deletion predicate remain unchanged. Public native SQLite/workerd
+controls reproduce the intentional malformed-JSON assertion for a changed source,
+while unchanged valid-UTF-8 pages with the protected 5-statement/3-parameter request
+geometry pass. Invalid-UTF-8 SQLite TEXT is a separate public transport counterexample:
+a short native TEXT read may replace raw bytes before JavaScript verification while
+the SQL CAS still sees the original bytes. Neither that counterexample nor these
+aggregate diagnostics establishes the private production cause or repairs it.
+
 The former FTS verifier joined up to 48 row-scoped SELECTs with `UNION ALL`.
 Keeping each such statement at 96 binds did not make its compound-select grammar
 valid in the native runtime. In controlled local Miniflare/workerd, the exact

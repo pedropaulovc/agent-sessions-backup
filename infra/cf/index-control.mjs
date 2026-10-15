@@ -601,5 +601,9 @@ async function main() {
 }
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
-  main().catch((error) => { console.error(error.message); process.exitCode = 1; });
+  main().catch((error) => {
+    if (error.d1SourceComparison) console.error(JSON.stringify({ sourceRetirementComparison: error.d1SourceComparison }));
+    console.error(error.message);
+    process.exitCode = 1;
+  });
 }

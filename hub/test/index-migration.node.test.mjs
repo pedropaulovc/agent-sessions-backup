@@ -4010,6 +4010,85 @@ test('copy preserves native rejection and retained source across semantic failur
   }
 });
 
+test('retirement failure diagnostics preserve the native error and source checkpoint while exposing only bounded aggregates', async (context) => {
+  const canary = 'PRIVATE_RETIRED_DATA_CANARY';
+  for (const scenario of ['clean', 'mismatch', 'missing', 'query-failed', 'response-shape', 'request-budget', 'oversized']) {
+    await context.test(scenario, async (child) => {
+      const f = await fixture(child);
+      const large = scenario === 'request-budget' ? '\u0000'.repeat(148_000)
+        : scenario === 'oversized' ? 'x'.repeat(COPY_PAGE_BYTES + 2) : '';
+      const originals = large ? [block(811, 0, { text: `${canary} ${large}` })]
+        : [block(811, 0, { text: `${canary}\u0000original_tail`, role: null }), block(812, 1)];
+      seedBlocks(f.source, originals);
+      const rejection = new Error('safe native retirement rejection');
+      rejection.d1SqlReason = 'malformed-json';
+      let observedError, verified, diagnosticQueries = 0, retirementAttempts = 0;
+      let expected = originals;
+      const nativeBatch = f.source.batch.bind(f.source);
+      f.source.batch = async (statements) => {
+        if (!statements.some(({ sql }) => sql.includes('AS source_empty'))
+          || !statements.some(({ sql }) => /DELETE FROM blocks/.test(sql))) return nativeBatch(statements);
+        retirementAttempts += 1;
+        if (scenario !== 'mismatch') { observedError = rejection; throw rejection; }
+        try { return await nativeBatch(statements); }
+        catch (error) { observedError = error; throw error; }
+      };
+      const nativeQuery = f.source.query.bind(f.source);
+      f.source.query = async (sql, params) => {
+        if (!sql.includes('compared AS MATERIALIZED')) return nativeQuery(sql, params);
+        diagnosticQueries += 1;
+        assert.ok(!isWrite(sql), 'failure diagnostics must be read-only');
+        assert.equal(params.length, 1, 'reuse one already verified canonical snapshot');
+        assert.ok(Buffer.byteLength(JSON.stringify({ sql, params })) <= COPY_PAGE_BYTES);
+        if (scenario === 'query-failed') throw new Error(canary);
+        if (scenario === 'response-shape') return [{ expected_rows: canary }];
+        return nativeQuery(sql, params);
+      };
+      await assert.rejects(copyWithNativeParameters(f.args({ checkpointHook: async (state) => {
+        if (state.pending?.phase !== 'verified') return;
+        verified = state;
+        assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), state);
+        if (scenario === 'mismatch') {
+          expected = [{ ...originals[0], role: '', text: `${canary}\u0000changed_tail` }, originals[1]];
+          f.source.database.prepare('UPDATE blocks SET role = ?, text = ? WHERE id = ?')
+            .run(expected[0].role, expected[0].text, expected[0].id);
+        } else if (scenario === 'missing') {
+          expected = originals.slice(1);
+          f.source.database.prepare('DELETE FROM blocks WHERE id = ?').run(originals[0].id);
+        }
+      } })), (error) => {
+        assert.equal(error, observedError, 'diagnostic failures must never replace the original rejection');
+        assert.equal(error.d1Phase, 'copy-source-delete-and-freeze');
+        assert.equal(error.message, scenario === 'mismatch' ? 'malformed JSON' : rejection.message);
+        const comparison = error.d1SourceComparison;
+        assert.ok(comparison, 'the historical copier must fail this load-bearing metadata assertion');
+        assert.ok(!JSON.stringify(comparison).includes(canary));
+        assert.ok(!JSON.stringify(comparison).includes('original_tail'));
+        if (['query-failed', 'response-shape', 'request-budget', 'oversized'].includes(scenario)) {
+          assert.deepEqual(comparison, { status: 'unavailable', reason: scenario === 'oversized' ? 'canonical-budget' : scenario });
+        } else {
+          assert.equal(comparison.status, scenario);
+          assert.equal(comparison.expectedRows, originals.length);
+          assert.equal(comparison.presentRows, expected.length);
+          assert.equal(comparison.missingRows, scenario === 'missing' ? 1 : 0);
+          assert.equal(comparison.mismatchingRows, scenario === 'mismatch' ? 1 : 0);
+          assert.deepEqual(comparison.columns, scenario === 'mismatch' ? [
+            { index: 5, mismatchingRows: 1, typeMismatchRows: 1, byteMismatchRows: 1, lengthMismatchRows: 1,
+              sourceTypes: ['text'], snapshotTypes: ['null'] },
+            { index: 12, mismatchingRows: 1, typeMismatchRows: 0, byteMismatchRows: 1, lengthMismatchRows: 1,
+              sourceTypes: ['text'], snapshotTypes: ['text'] },
+          ] : []);
+        }
+        return true;
+      });
+      assert.equal(retirementAttempts, 1, 'diagnostics never replay or ACK a rejected source batch');
+      assert.equal(diagnosticQueries, ['request-budget', 'oversized'].includes(scenario) ? 0 : 1);
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), expected, 'every remaining source tuple survives');
+      assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), verified, 'no diagnostic checkpoint advance');
+    });
+  }
+});
+
 test('row and malformed checkpoint validation do not disclose unknown metadata or payload bytes', async () => {
   const canary = 'PRIVATE_METADATA_TRANSCRIPT_CANARY';
   for (const action of [
