@@ -628,23 +628,24 @@ describe('large export ingest is bounded and never marks parsed until every conv
   // Runs LAST: its stale-session cleanup fan-out re-enqueues sibling export files (all share the
   // 'export-inbox' store), flipping them to 'pending' — harmless once earlier tests have asserted.
   it('bounds the final stale-session cleanup and marks parsed ONLY once it fully drains (round 3 finding 3)', async () => {
-    // Parse a large archive (at a big budget so it lands in one fast slice) so the file owns many
-    // sessions, then replace it with a much smaller valid archive that DROPS most conversations. At a small
-    // reparse budget the dropped sessions must be cleaned in budgeted chunks (one delete SUBREQUEST each)
-    // across several invocations — never one unbounded pass after markParsed.
+    // `clearSessionDerived` charges five subrequests per stale session; with an eight-subrequest cleanup
+    // budget, floor(8 / 5) + 1 = 2 stale sessions is the smallest set whose deletes exceed one chunk.
+    // Keep the two surviving conversations asserted below, so the minimum initial fixture is four.
+    const cleanupBudget = 8;
+    const keptCount = 2;
+    const staleCount = Math.floor(cleanupBudget / 5) + 1;
     budgets({ slice: 800, invocation: 800 });
-    const big = Array.from({ length: 30 }, (_u, i) => conv('cln', i));
+    const big = Array.from({ length: keptCount + staleCount }, (_u, i) => conv('cln', i));
     const first = await uploadConvs('cln', big);
     await deliverChain({ file_id: first.fileId, r2_key: first.r2Key, reason: 'upload', content_hash: first.hash });
     expect(await fileState(first.fileId)).toBe('parsed');
-    expect(await ownedSessions(first.fileId)).toBe(30);
+    expect(await ownedSessions(first.fileId)).toBe(keptCount + staleCount);
 
-    // Replace the archive in place (same machine/relpath → same file id, new bytes) with 2 conversations,
-    // and shrink the budget so cleanup of the ~28 stale sessions must span multiple invocations.
-    const small = Array.from({ length: 2 }, (_u, i) => conv('cln', i));
+    // Replace in place with the two conversations to keep, leaving only the budget-derived stale rows.
+    const small = Array.from({ length: keptCount }, (_u, i) => conv('cln', i));
     const replaced = await uploadConvs('cln', small);
     expect(replaced.fileId).toBe(first.fileId); // updated the same file row, not a new one
-    budgets({ slice: 8, invocation: 8 });
+    budgets({ slice: cleanupBudget, invocation: cleanupBudget });
 
     // Drive the reparse only until cleanup FIRST needs a continuation (stale rows still remain).
     const reparse: ParseMessage = { file_id: replaced.fileId, r2_key: replaced.r2Key, reason: 'upload', content_hash: replaced.hash };
