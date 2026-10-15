@@ -978,8 +978,10 @@ async function verifyPending(source, shards, state, layout, tokenizer) {
       || destination.some((row) => !expected.has(row.id))) {
       throw copyInvariant(COPY_INVARIANTS.DESTINATION_IDENTITY, 'destination readback cardinality/identity mismatch; source retained', COPY_PHASES.PAGE_READBACK);
     }
-    for (const item of items) {
-      const expectedTypes = state.pending.types[state.pending.rows.indexOf(item)];
+    for (let index = 0; index < state.pending.rows.length; index += 1) {
+      const item = state.pending.rows[index];
+      if (item.shard !== shard) continue;
+      const expectedTypes = state.pending.types[index];
       if (!found.has(item.id) || JSON.stringify(rowTypes(state.columns, found.get(item.id))) !== JSON.stringify(expectedTypes)
         || rowDigest(state.columns, found.get(item.id), COPY_PHASES.PAGE_READBACK) !== item.sha256) {
         throw copyInvariant(COPY_INVARIANTS.READBACK_SHA256, 'readback SHA-256 mismatch; source retained', COPY_PHASES.PAGE_READBACK);
@@ -1129,9 +1131,12 @@ function retirementDeletes(columns, rows, layout) {
           AND EXISTS (SELECT 1 FROM verified WHERE verified.id = blocks.id AND ${compare})`;
       params = [json];
     } else {
+      if (page.rows.length !== 1) throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES,
+        'source page exceeds the encoded JSON byte cap', COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
       const bound = boundRow(columns, page.rows[0], COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
       sql = `WITH verified (${layout.quoted.join(',')}) AS MATERIALIZED (SELECT ${bound.values.join(',')})
-        DELETE FROM blocks WHERE EXISTS (SELECT 1 FROM verified WHERE ${compare})`;
+        DELETE FROM blocks WHERE id IN (SELECT id FROM verified)
+          AND EXISTS (SELECT 1 FROM verified WHERE ${compare})`;
       params = bound.params;
     }
     statements.push(assertRequest({ sql, params }, COPY_PHASES.SOURCE_DELETE_AND_FREEZE));
@@ -1251,9 +1256,10 @@ async function finishPending(source, shards, state, gate, checkpoint, layout, to
   if (state.pending.phase === 'copying') {
     const rows = await readBlockRows(source, state.columns, state.pending.rows.map((row) => row.id), layout);
     const found = new Map(rows.map((row) => [row.id, row]));
-    for (const item of state.pending.rows) {
+    for (let index = 0; index < state.pending.rows.length; index += 1) {
+      const item = state.pending.rows[index];
       if (!found.has(item.id) || rowDigest(state.columns, found.get(item.id), source[DIAGNOSTIC_PHASE]) !== item.sha256
-        || JSON.stringify(rowTypes(state.columns, found.get(item.id))) !== JSON.stringify(state.pending.types[state.pending.rows.indexOf(item)])) {
+        || JSON.stringify(rowTypes(state.columns, found.get(item.id))) !== JSON.stringify(state.pending.types[index])) {
         throw copyInvariant(COPY_INVARIANTS.SOURCE_CHANGED, 'source block changed before copy', COPY_PHASES.SOURCE_PAGE_READ);
       }
     }
