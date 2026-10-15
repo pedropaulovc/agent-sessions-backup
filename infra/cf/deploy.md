@@ -533,6 +533,71 @@ recognized rejection token, not proof of its root cause. In particular, malforme
 JSON can be the intentional source-comparison assertion aborting a changed page.
 These diagnostics do not establish the cause of any earlier production failure.
 
+After a rejected `copy-source-delete-and-freeze` batch, the copier attempts one
+read-only aggregate comparison against the **same already-verified canonical
+snapshot**, never against a new copy or a replayed source batch. Its additional JSON diagnostic
+reports `clean`, `mismatch`, `missing`, `mismatch-and-missing`, or `unavailable`;
+present/missing/mismatching row counts; static zero-based column indexes; allowlisted
+SQLite storage-type classes; and counts of type, BLOB-byte and byte-length inequality
+on mismatched columns. SQL-equal INTEGER/REAL values are not reported as CAS misses.
+No IDs, column names, scalar values, text, search terms, SQL, parameters or native
+diagnostic errors are emitted. The query is skipped with `unavailable/request-budget`
+when its fully JSON-encoded request would exceed the existing 1 MiB copy budget, or
+its SQL exceeds D1's separate [100,000-byte statement limit](https://developers.cloudflare.com/d1/platform/limits/).
+The oversized per-column branch has no bounded canonical snapshot and is explicitly
+`unavailable/canonical-budget`; query/response failures are also `unavailable`.
+The original error object/message remains unchanged. Public native workerd accepts
+harmless statements of exactly 100,000 bytes and rejects 100,001 bytes; both the
+statement and fully encoded request caps are checked before the diagnostic query.
+
+The comparison uses a controlled numeric column-index relation and one source
+LEFT JOIN to form narrow cell rows. Per-column grouped counters use only two
+DISTINCT type-mask aggregates, while per-row flags count a row only once even if
+several columns differ. Equality retains each original `b.column IS copied`
+predicate inside its CASE, preserving SQLite column affinity; stored-value CASE
+results are used only for storage-type and BLOB-byte/length flags. The nested
+numeric summary and public diagnostic object are unchanged. This is a query-shape
+compatibility candidate, not a confirmed explanation of an earlier native rejection
+or the protected production source-retirement failure.
+
+Column cells and their containing groups use explicit aggregate ORDER BY clauses,
+not incidental GROUP BY sorter order. Public native SQLite and workerd controls
+verify the nested numeric encoding, mixed storage-type masks, affinity-equal cells,
+and distinct mismatch counts across a 100-column layout. Native Cloudflare
+acceptance remains a separate protected control; local semantic equivalence alone
+does not identify the cause of a remote rejection.
+
+“One comparison” means one logical read-only SQL query. The existing REST client
+may replay that query after an unambiguous HTTP 429 with a validated `Retry-After`,
+within the same configured pass/request budget. It never replays the rejected
+source retirement batch. Diagnostic retry or budget exhaustion makes the diagnostic
+unavailable; the original hard retirement error is still thrown, not replaced by
+the diagnostic failure or converted into a partial-copy exit 78.
+
+The disposable native copy control also records a rejected diagnostic query using
+the shared allowlisted SQL class and optional fixed native subtype, validated
+actual HTTP status (100–599), and at most 16 nonnegative safe-integer provider
+codes. Unknown or conflicting subtype tokens are omitted; neither native messages
+nor provider payloads are retained. These labels describe recognized tokens, not
+a production-cause conclusion. On that source-query failure only, the control
+executes the identical aggregate SQL and canonical snapshot against its already
+verified disposable destination. It reports a clean result or a bounded rejection/
+unexpected-result outcome, without retrying the source query. Even a clean
+destination control cannot authorize source deletion or turn the original failed
+proof into success; the source, freeze and verified checkpoint remain retained.
+
+This observation does not identify the original failing statement or authorize
+source writes, ACK, checkpoint advance, or a semantic batch retry. A clean current comparison does
+not prove a failed batch committed or that its earlier comparison was clean; a
+missing row can also follow an ambiguous transport failure. The source fence and
+full-column deletion predicate remain unchanged. Public native SQLite/workerd
+controls reproduce the intentional malformed-JSON assertion for a changed source,
+while unchanged valid-UTF-8 pages with the protected 5-statement/3-parameter request
+geometry pass. Invalid-UTF-8 SQLite TEXT is a separate public transport counterexample:
+a short native TEXT read may replace raw bytes before JavaScript verification while
+the SQL CAS still sees the original bytes. Neither that counterexample nor these
+aggregate diagnostics establishes the private production cause or repairs it.
+
 The former FTS verifier joined up to 48 row-scoped SELECTs with `UNION ALL`.
 Keeping each such statement at 96 binds did not make its compound-select grammar
 valid in the native runtime. In controlled local Miniflare/workerd, the exact

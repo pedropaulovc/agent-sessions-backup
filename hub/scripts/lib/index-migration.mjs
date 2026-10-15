@@ -776,6 +776,106 @@ async function verifyPending(source, shards, state, layout, tokenizer) {
   return verified;
 }
 
+// Failure-only observation of the already verified canonical snapshot. This never
+// authorizes a retry or ACK: even a clean comparison cannot prove a failed batch
+// committed, and a diagnostic request may itself be unavailable after the failure.
+async function sourceRetirementComparison(source, columns, layout, page) {
+  const unavailable = (reason) => ({ status: 'unavailable', reason });
+  if (page.json === null) return unavailable('canonical-budget');
+  const idIndex = columns.indexOf('id');
+  const types = ['null', 'integer', 'real', 'text', 'blob'];
+  const typeBits = (value) => `CASE typeof(${value}) ${types.map((type, index) =>
+    `WHEN '${type}' THEN ${1 << index}`).join(' ')} ELSE 0 END`;
+  // Keep the source column's affinity in the exact CAS equality predicate.
+  // A CASE selecting only stored values would lose that affinity before IS.
+  const stored = `CASE c.n ${columns.map((_, index) =>
+    `WHEN ${index} THEN b.${layout.quoted[index]}`).join(' ')} END`;
+  const equal = `CASE c.n ${columns.map((_, index) =>
+    `WHEN ${index} THEN b.${layout.quoted[index]} IS json_extract(v.row,${layout.paths[index]})`).join(' ')} END`;
+  const groupCount = Math.ceil(columns.length / 16);
+  // One row per cell keeps every SELECT narrow. Only two DISTINCT aggregates
+  // collect type-bit sets, grouped by column, rather than two per source column.
+  const sql = `WITH verified(id,row) AS MATERIALIZED (
+    SELECT json_extract(value,${layout.paths[idIndex]}), value FROM json_each(?)
+  ), column_indexes(n) AS (VALUES ${columns.map((_, index) => `(${index})`).join(',')}
+  ), cells AS MATERIALIZED (
+    SELECT v.id, c.n, b.id IS NOT NULL AS present, ${stored} AS stored,
+      json_extract(v.row,'$[' || c.n || ']') AS copied, ${equal} AS is_equal
+    FROM verified AS v LEFT JOIN blocks AS b ON b.id = v.id CROSS JOIN column_indexes AS c
+  ), flags AS MATERIALIZED (
+    SELECT id, n, present, present AND NOT is_equal AS mismatch,
+      typeof(stored) IS NOT typeof(copied) AS type_mismatch,
+      CAST(stored AS BLOB) IS NOT CAST(copied AS BLOB) AS byte_mismatch,
+      length(CAST(stored AS BLOB)) IS NOT length(CAST(copied AS BLOB)) AS length_mismatch,
+      ${typeBits('stored')} AS source_type, ${typeBits('copied')} AS snapshot_type
+    FROM cells
+  ), column_counts AS MATERIALIZED (
+    SELECT n, SUM(mismatch) AS mismatches,
+      SUM(mismatch AND type_mismatch) AS type_mismatches,
+      SUM(mismatch AND byte_mismatch) AS byte_mismatches,
+      SUM(mismatch AND length_mismatch) AS length_mismatches,
+      SUM(DISTINCT CASE WHEN mismatch THEN source_type ELSE 0 END) AS source_types,
+      SUM(DISTINCT CASE WHEN mismatch THEN snapshot_type ELSE 0 END) AS snapshot_types
+    FROM flags GROUP BY n
+  ), row_flags AS MATERIALIZED (
+    SELECT id, MAX(present) AS present, MAX(mismatch) AS mismatch FROM flags GROUP BY id
+  ), group_cells AS MATERIALIZED (
+    SELECT n / 16 AS ordinal,
+      json_group_array(json_array(mismatches,type_mismatches,byte_mismatches,
+        length_mismatches,source_types,snapshot_types) ORDER BY n) AS cells
+    FROM column_counts GROUP BY n / 16
+  ), compared AS MATERIALIZED (
+    SELECT COUNT(*) AS expected, COALESCE(SUM(present),0) AS present,
+      COALESCE(SUM(NOT present),0) AS missing, COALESCE(SUM(mismatch),0) AS mismatch FROM row_flags
+  ) SELECT json_array(expected,present,missing,mismatch,
+    json((SELECT json_group_array(json(cells) ORDER BY ordinal) FROM group_cells)))
+    AS source_comparison FROM compared`;
+  // D1's 100,000-byte per-statement limit is independent of the JSON request cap.
+  if (Buffer.byteLength(sql) > 100_000) return unavailable('request-budget');
+  // The original canonical cap remains unchanged. The additional failure-only
+  // request must also fit that cap after framing/escaping, or is explicitly skipped.
+  const requestBytes = Buffer.byteLength(JSON.stringify({ sql, params: [] }))
+    + Buffer.byteLength(JSON.stringify([page.json])) - 2;
+  if (requestBytes > COPY_PAGE_BYTES) return unavailable('request-budget');
+  let results;
+  try { results = await source.query(sql, [page.json]); }
+  catch { return unavailable('query-failed'); }
+  const encoded = results?.[0]?.source_comparison, expected = page.rows.length;
+  let summary;
+  try {
+    if (typeof encoded !== 'string' || Buffer.byteLength(encoded) > RESPONSE_ENVELOPE_BYTES) {
+      return unavailable('response-shape');
+    }
+    summary = JSON.parse(encoded);
+  } catch { return unavailable('response-shape'); }
+  const count = (value, maximum = expected) => Number.isSafeInteger(value) && value >= 0 && value <= maximum;
+  if (!Array.isArray(results) || results.length !== 1 || !Array.isArray(summary) || summary.length !== 5
+    || !summary.slice(0, 4).every((value) => count(value))
+    || summary[0] !== expected || summary[1] + summary[2] !== expected || summary[3] > summary[1]
+    || !Array.isArray(summary[4]) || summary[4].length !== groupCount
+    || !summary[4].every((group, index) => Array.isArray(group)
+      && group.length === Math.min(16, columns.length - index * 16))) return unavailable('response-shape');
+  const cells = summary[4].flat();
+  if (!cells.every((cell) => Array.isArray(cell) && cell.length === 6
+    && cell.slice(0, 4).every((value) => count(value, summary[3]))
+    && cell.slice(4).every((value) => count(value, 31))
+    && cell.slice(1, 4).every((value) => value <= cell[0])
+    && (cell[0] ? cell[4] > 0 && cell[5] > 0 : cell.every((value) => value === 0)))
+    || cells[idIndex].some((value) => value !== 0)
+    || cells.reduce((sum, cell) => sum + cell[0], 0) < summary[3]) return unavailable('response-shape');
+  const typeClasses = (bits) => types.filter((_, index) => bits & (1 << index));
+  return {
+    status: summary[3] ? summary[2] ? 'mismatch-and-missing' : 'mismatch'
+      : summary[2] ? 'missing' : 'clean',
+    expectedRows: expected, presentRows: summary[1], missingRows: summary[2], mismatchingRows: summary[3],
+    columns: cells.flatMap((cell, index) => cell[0] ? [{
+      index, mismatchingRows: cell[0], typeMismatchRows: cell[1],
+      byteMismatchRows: cell[2], lengthMismatchRows: cell[3],
+      sourceTypes: typeClasses(cell[4]), snapshotTypes: typeClasses(cell[5]),
+    }] : []),
+  };
+}
+
 async function finishPending(source, shards, state, gate, checkpoint, layout, tokenizer) {
   if (state.pending.phase === 'copying') {
     const rows = await readBlockRows(source, state.columns, state.pending.rows.map((row) => row.id), layout);
@@ -825,7 +925,19 @@ async function finishPending(source, shards, state, gate, checkpoint, layout, to
   );
   // The temporary copying state and every delete are one transaction. Old HTTP
   // invocations never observe an unfrozen commit or delete newly changed row content.
-  const deletion = await phaseDb(source, COPY_PHASES.SOURCE_DELETE_AND_FREEZE).batch(statements);
+  const retirementSource = phaseDb(source, COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
+  let deletion;
+  try { deletion = await retirementSource.batch(statements); }
+  catch (error) {
+    // Preserve the original error, message, phase and rejection semantics, including
+    // when a request gate or the diagnostic itself rejects. No source writes follow.
+    let comparison;
+    try { comparison = await sourceRetirementComparison(retirementSource, state.columns, layout, page); }
+    catch { comparison = { status: 'unavailable', reason: 'query-failed' }; }
+    try { error.d1SourceComparison = comparison; }
+    catch { /* Non-extensible errors must still retain their original rejection. */ }
+    throw error;
+  }
   if (deletion.length !== statements.length || !Array.isArray(deletion.at(-1)?.results)
     || deletion.at(-1).results.length) throw copyInvariant(COPY_INVARIANTS.SOURCE_DELETE, 'verified source deletion did not remove the whole page', COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
   state.after = ids.at(-1);

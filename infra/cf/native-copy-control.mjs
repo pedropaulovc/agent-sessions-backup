@@ -8,7 +8,7 @@ import {
   copyFrozenIndex, readCheckpoint,
 } from '../../hub/scripts/lib/index-migration.mjs';
 import { BLOCK_COLUMNS, INDEX_ID_SPAN, indexShardForSessionId } from '../../hub/src/index-layout.mjs';
-import { D1_FAILURE_KINDS, D1_SQL_FAILURE_REASONS } from './d1-batch-atomicity.mjs';
+import { D1_FAILURE_KINDS, D1_NATIVE_FAILURE_SIGNATURES, D1_SQL_FAILURE_REASONS } from './d1-batch-atomicity.mjs';
 
 const copyPhases = Object.freeze(Object.values(COPY_PHASES));
 const copyInvariants = Object.freeze(Object.values(COPY_INVARIANTS));
@@ -41,6 +41,21 @@ function safeFailure(error, phase) {
   return new NativeCopyControlError(copyPhases.includes(error?.d1Phase) ? error.d1Phase : phase,
     invariant ? 'assertion' : D1_SQL_FAILURE_REASONS.includes(error?.d1SqlReason) ? error.d1SqlReason : 'other',
     { invariant, failureKind: D1_FAILURE_KINDS.includes(error?.d1FailureKind) ? error.d1FailureKind : undefined });
+}
+
+function queryFailureMetadata(error) {
+  const safe = safeFailure(error, COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
+  return {
+    phase: safe.nativeCopyPhase, nativeClass: safe.nativeCopyClass,
+    ...(D1_SQL_FAILURE_REASONS.includes(error?.d1SqlReason) ? { sqlReason: error.d1SqlReason } : {}),
+    ...(D1_NATIVE_FAILURE_SIGNATURES.includes(error?.d1NativeSignature) ? { nativeSignature: error.d1NativeSignature } : {}),
+    ...(D1_FAILURE_KINDS.includes(error?.d1FailureKind) ? { failureKind: error.d1FailureKind } : {}),
+    ...(Number.isInteger(error?.providerStatus) && error.providerStatus >= 100 && error.providerStatus <= 599
+      ? { httpStatus: error.providerStatus } : {}),
+    ...(Array.isArray(error?.providerCodes) && error.providerCodes.length <= 16
+      && error.providerCodes.every((code) => Number.isSafeInteger(code) && code >= 0)
+      ? { providerCodes: [...error.providerCodes] } : {}),
+  };
 }
 
 function ownedIdentity(database, pr, names) {
@@ -353,6 +368,202 @@ async function assertFrozen(source) {
   requireProof(rows.length === 1 && rows[0].id === 1 && rows[0].state === 'frozen', 'source-fence');
 }
 
+// Run only after the complete public positive proof, reusing its owned scratch
+// databases. Raw invalid TEXT never crosses the REST response or public output:
+// only the copier itself attempts that transport; retention uses SQL hex().
+async function proveNativeRetirementDiagnostic({ source, shards, gate, ordinary, expected }) {
+  const phase = 'retirement-diagnostic';
+  const probe = { ...ordinary, id: INDEX_ID_SPAN - 2, text: 'nativeinvalidtext' };
+  requireProof(!expected.some((row) => row.id === probe.id), phase);
+  const decoded = await source.query("SELECT hex(unhex('61FF62')) AS bytes");
+  requireProof(decoded.length === 1 && decoded[0].bytes === '61FF62', phase);
+  // Only this disposable copy checkpoint is reset; no catalog/activation state
+  // and no destination rows from the 1,509-row proof are removed.
+  await shards[0].query('DELETE FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT]);
+  requireProof(await readCheckpoint(shards[0], COPY_CHECKPOINT) === null, phase);
+  const textIndex = BLOCK_COLUMNS.indexOf('text');
+  await source.batch([
+    { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'copying' WHERE id = 1`, params: [] },
+    {
+      sql: `INSERT INTO blocks (${BLOCK_COLUMNS.map(quote).join(',')})
+        VALUES (${BLOCK_COLUMNS.map((_, index) => index === textIndex ? "CAST(X'61FF62' AS TEXT)" : '?').join(',')})`,
+      params: BLOCK_COLUMNS.filter((_, index) => index !== textIndex).map((column) => probe[column]),
+    },
+    { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'frozen' WHERE id = 1`, params: [] },
+  ]);
+  const rawSource = () => source.query(
+    'SELECT id, typeof(text) AS storage_type, hex(CAST(text AS BLOB)) AS bytes FROM blocks ORDER BY id');
+  const before = await rawSource();
+  requireProof(before.length === 1 && before[0].id === probe.id
+    && before[0].storage_type === 'text' && before[0].bytes === '61FF62', phase);
+  await assertFrozen(source);
+  let checkpointSnapshot = JSON.stringify(null);
+  let originalError;
+  let retirementBatches = 0;
+  let diagnosticQueries = 0;
+  let writesAfterFailure = 0;
+  let diagnosticQueryFailure;
+  let diagnosticPositiveControl;
+  const observedSource = {
+    id: source.id,
+    async query(sql, params = []) {
+      if (originalError) {
+        diagnosticQueries += 1;
+        requireProof(/^\s*WITH verified\b/.test(sql), phase);
+      }
+      try { return await source.query(sql, params); }
+      catch (error) {
+        if (originalError) {
+          diagnosticQueryFailure = queryFailureMetadata(error);
+          // Disposable-proof-only positive control: the identical query and
+          // verified snapshot must compile and compare cleanly against the
+          // destination's valid representation. Never retry the source query.
+          try {
+            const destination = shards[indexShardForSessionId(probe.session_id, shards.length)];
+            const results = await destination.query(sql, params);
+            const encoded = results?.[0]?.source_comparison;
+            let summary;
+            if (typeof encoded === 'string' && Buffer.byteLength(encoded) <= 4096) {
+              try { summary = JSON.parse(encoded); } catch { /* An invalid response is not a rejected query. */ }
+            }
+            const clean = Array.isArray(results) && results.length === 1
+              && Array.isArray(summary) && summary.length === 5
+              && JSON.stringify(summary.slice(0, 4)) === '[1,1,0,0]'
+              && Array.isArray(summary[4]) && summary[4].every((group) => Array.isArray(group))
+              && summary[4].flat().length === BLOCK_COLUMNS.length
+              && summary[4].flat().every((cell) => Array.isArray(cell) && cell.length === 6
+                && cell.every((value) => value === 0));
+            diagnosticPositiveControl = { outcome: clean ? 'verified' : 'unexpected-result' };
+          } catch (controlError) {
+            diagnosticPositiveControl = { outcome: 'rejected', ...queryFailureMetadata(controlError) };
+          }
+        }
+        throw error;
+      }
+    },
+    async batch(statements) {
+      if (originalError) writesAfterFailure += 1;
+      const retirement = statements.some(({ sql }) => /\bDELETE FROM blocks\b/.test(sql));
+      if (retirement) {
+        retirementBatches += 1;
+        requireProof(statements.length === 5
+          && statements.reduce((count, statement) => count + statement.params.length, 0) === 3, phase);
+        const durable = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+        requireProof(durable?.pending?.phase === 'verified'
+          && JSON.stringify(durable) === checkpointSnapshot, phase);
+        await assertFrozen(source);
+      }
+      try { return await source.batch(statements); }
+      catch (error) {
+        if (retirement) originalError = error;
+        throw error;
+      }
+    },
+  };
+  let failure;
+  try {
+    await copyFrozenIndex({
+      source: observedSource, shards, gate,
+      checkpointHook: async (checkpoint) => {
+        const durable = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+        requireProof(JSON.stringify(durable) === JSON.stringify(checkpoint), phase);
+        checkpointSnapshot = JSON.stringify(durable);
+      },
+    });
+  } catch (error) { failure = error; }
+  requireProof(failure !== undefined && writesAfterFailure === 0, phase);
+  requireProof(JSON.stringify(await rawSource()) === JSON.stringify(before), phase);
+  await assertFrozen(source);
+  const retained = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+  requireProof(JSON.stringify(retained) === checkpointSnapshot, phase);
+  // The negative copy can add its collision-free row, but must not change any
+  // original destination value or its native FTS entry.
+  for (const [index, db] of shards.entries()) {
+    const rows = (await readRows(db, phase)).filter((row) => row.id !== probe.id);
+    const wanted = expected.filter((row) => indexShardForSessionId(row.session_id, shards.length) === index);
+    requireProof(rows.length === wanted.length && rowsSha256(rows) === rowsSha256(wanted), phase);
+    const indexed = await db.query('SELECT rowid FROM blocks_fts WHERE rowid != CAST(? AS INTEGER) ORDER BY rowid', [probe.id]);
+    requireProof(indexed.length === wanted.length
+      && indexed.every((row, offset) => row.rowid === wanted[offset].id), phase);
+  }
+  // An earlier REST rejection means the retirement diagnostic was not exercised.
+  // Retention alone is not a successful proof: preserve its actual public
+  // phase/class and fail closed, including for unrelated copier regressions.
+  if (!retirementBatches) throw safeFailure(failure, phase);
+  requireProof(retirementBatches === 1 && failure === originalError
+    && failure.d1Phase === COPY_PHASES.SOURCE_DELETE_AND_FREEZE
+    && failure.d1SqlReason === 'malformed-json' && diagnosticQueries === 1
+    && retained?.pending?.phase === 'verified' && retained.rows === 0
+    && retained.pending.rows.length === 1 && retained.pending.rows[0].id === probe.id, phase);
+  const snapshot = await shards[indexShardForSessionId(probe.session_id, shards.length)].query(
+    `SELECT typeof(text) AS storage_type, length(CAST(text AS BLOB)) AS byte_length,
+      hex(CAST(text AS BLOB)) AS bytes FROM blocks WHERE id = CAST(? AS INTEGER)`, [probe.id]);
+  const stored = snapshot[0];
+  // Inspect bytes only inside the disposable proof. REST's representation of
+  // invalid source TEXT is not assumed to be replacement text rather than NULL.
+  requireProof(snapshot.length === 1 && ['text', 'null'].includes(stored?.storage_type)
+    && (stored.storage_type === 'null'
+      ? stored.byte_length === null && stored.bytes === ''
+      : Number.isSafeInteger(stored.byte_length) && stored.byte_length >= 0
+        && stored.byte_length <= COPY_PAGE_BYTES && typeof stored.bytes === 'string'
+        && /^[0-9A-F]*$/.test(stored.bytes) && stored.bytes.length === stored.byte_length * 2), phase);
+  requireProof(stored.storage_type !== 'text' || stored.bytes !== before[0].bytes, phase);
+  const comparison = {
+    status: 'mismatch', expectedRows: 1, presentRows: 1, missingRows: 0, mismatchingRows: 1,
+    columns: [{ index: textIndex, mismatchingRows: 1,
+      typeMismatchRows: Number(stored.storage_type !== 'text'),
+      byteMismatchRows: Number(stored.storage_type === 'null' || stored.bytes !== before[0].bytes),
+      lengthMismatchRows: Number(stored.byte_length !== before[0].bytes.length / 2),
+      sourceTypes: ['text'], snapshotTypes: [stored.storage_type] }],
+  };
+  if (JSON.stringify(failure.d1SourceComparison) !== JSON.stringify(comparison)) {
+    // Only validated aggregate vocabulary/counts may escape on a failed proof.
+    // Never attach the raw provider error, SQL response or byte descriptors.
+    const actual = failure.d1SourceComparison;
+    const count = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 1;
+    const types = ['null', 'integer', 'real', 'text', 'blob'];
+    const safeTypes = (values) => Array.isArray(values) && values.length <= types.length
+      && values.every((value) => types.includes(value)) && new Set(values).size === values.length;
+    let measured;
+    if (actual?.status === 'unavailable'
+      && ['canonical-budget', 'request-budget', 'query-failed', 'response-shape'].includes(actual.reason)) {
+      measured = { status: 'unavailable', reason: actual.reason };
+    } else if (['clean', 'mismatch', 'missing', 'mismatch-and-missing'].includes(actual?.status)
+      && ['expectedRows', 'presentRows', 'missingRows', 'mismatchingRows'].every((key) => count(actual[key]))
+      && Array.isArray(actual.columns) && actual.columns.length <= BLOCK_COLUMNS.length
+      && actual.columns.every((column) => Number.isSafeInteger(column?.index)
+        && column.index >= 0 && column.index < BLOCK_COLUMNS.length
+        && ['mismatchingRows', 'typeMismatchRows', 'byteMismatchRows', 'lengthMismatchRows'].every((key) => count(column[key]))
+        && safeTypes(column.sourceTypes) && safeTypes(column.snapshotTypes))) {
+      measured = { status: actual.status, expectedRows: actual.expectedRows, presentRows: actual.presentRows,
+        missingRows: actual.missingRows, mismatchingRows: actual.mismatchingRows,
+        columns: actual.columns.map((column) => ({
+          index: column.index, mismatchingRows: column.mismatchingRows, typeMismatchRows: column.typeMismatchRows,
+          byteMismatchRows: column.byteMismatchRows, lengthMismatchRows: column.lengthMismatchRows,
+          sourceTypes: [...column.sourceTypes], snapshotTypes: [...column.snapshotTypes],
+        })) };
+    }
+    const error = new NativeCopyControlError(phase, 'assertion');
+    if (measured) {
+      error.nativeCopySourceComparison = measured;
+      error.message += ` sourceRetirementComparison=${JSON.stringify(measured)}`;
+    }
+    if (diagnosticQueryFailure) {
+      error.nativeCopyDiagnosticQueryFailure = diagnosticQueryFailure;
+      error.message += ` diagnosticQueryFailure=${JSON.stringify(diagnosticQueryFailure)}`;
+    }
+    if (diagnosticPositiveControl) {
+      error.nativeCopyDiagnosticPositiveControl = diagnosticPositiveControl;
+      error.message += ` diagnosticPositiveControl=${JSON.stringify(diagnosticPositiveControl)}`;
+    }
+    throw error;
+  }
+  return { outcome: 'verified', phase: COPY_PHASES.SOURCE_DELETE_AND_FREEZE,
+    nativeClass: 'malformed-json', statements: 5, binds: 3, comparison,
+    sourceRetention: 'retained', freezeRetention: 'frozen', checkpointRetention: 'retained',
+    positiveRowsRetained: expected.length };
+}
+
 async function proveNativeCopy({ source, shards, gate }) {
   let phase = 'seed';
   try {
@@ -561,12 +772,14 @@ async function proveNativeCopy({ source, shards, gate }) {
     requireProof((await source.query('SELECT COUNT(*) AS rows FROM blocks'))[0]?.rows === 0, 'source-empty');
     await assertFrozen(source);
     requireProof(JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === JSON.stringify(state), 'checkpoint-proof');
+    phase = 'retirement-diagnostic';
+    const retirementDiagnostic = await proveNativeRetirementDiagnostic({ source, shards, gate, ordinary, expected });
     await gate();
     return { state: 'verified', probe: 'd1-native-full-copy', rows: expected.length, columns: BLOCK_COLUMNS.length,
       shards: shards.length, denseRows: dense.length, growthRows: growth.length, ordinaryPages, fallbackPages,
       ftsMatches, freezeTriggers: 3, maxFtsParametersBytes, maxUnsplitFtsParametersBytes, splitFtsProbePages,
       legacyProbeMatches: legacyProbe.length, nativeProbeMatches: nativeProbe.length,
-      longTextBytes: Buffer.byteLength(long.text), sha256: expectedSha256 };
+      longTextBytes: Buffer.byteLength(long.text), sha256: expectedSha256, retirementDiagnostic };
   } catch (error) {
     throw safeFailure(error, phase);
   }

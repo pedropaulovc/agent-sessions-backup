@@ -1026,7 +1026,23 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
   assert.equal(summary.fallbackPages, 1);
   assert.equal(summary.longTextBytes, 1_100_061);
   assert.match(summary.sha256, /^[0-9a-f]{64}$/);
-  const sql = result.events.filter((event) => event.kind === 'probe-sql');
+  assert.equal(summary.retirementDiagnostic.outcome, 'verified');
+  assert.equal(summary.retirementDiagnostic.nativeClass, 'malformed-json');
+  assert.equal(summary.retirementDiagnostic.sourceRetention, 'retained');
+  assert.equal(summary.retirementDiagnostic.freezeRetention, 'frozen');
+  assert.equal(summary.retirementDiagnostic.checkpointRetention, 'retained');
+  assert.equal(summary.retirementDiagnostic.positiveRowsRetained, summary.rows);
+  assert.deepEqual(summary.retirementDiagnostic.comparison, {
+    status: 'mismatch', expectedRows: 1, presentRows: 1, missingRows: 0, mismatchingRows: 1,
+    columns: [{ index: BLOCK_COLUMNS.indexOf('text'), mismatchingRows: 1, typeMismatchRows: 0,
+      byteMismatchRows: 1, lengthMismatchRows: 1, sourceTypes: ['text'], snapshotTypes: ['text'] }],
+  });
+  // The second, intentionally failing copy must not inflate successful-copy
+  // FTS, page or source-retirement evidence from the first complete copy.
+  const diagnosticStart = result.events.findIndex(({ kind, sql }) => kind === 'probe-sql'
+    && sql === "SELECT hex(unhex('61FF62')) AS bytes");
+  assert.ok(diagnosticStart >= 0);
+  const sql = result.events.slice(0, diagnosticStart).filter((event) => event.kind === 'probe-sql');
   const denseIds = Array.from({ length: summary.denseRows }, (_, index) => index + 1);
   const seeds = result.events.filter((event) => event.kind === 'native-fixture-seed' && event.databaseId === 'created-1');
   assert.equal(seeds.length, 2, 'the original dense phase and appended fold-growth phase must both execute native JSON1 seeding');

@@ -13,7 +13,10 @@ import {
   seedFrozenCatalog, sourceCopyForecast, verifyIndexRecords, writeCheckpoint,
 } from '../../hub/scripts/lib/index-migration.mjs';
 import { indexShardBindingName } from '../../hub/src/index-layout.mjs';
-import { D1_BATCH_PROBE_TEXT, D1_FAILURE_KINDS, D1_SQL_FAILURE_REASONS, d1SqlFailureReason, verifyD1BatchAtomicity } from './d1-batch-atomicity.mjs';
+import {
+  D1_BATCH_PROBE_TEXT, D1_FAILURE_KINDS, D1_NATIVE_FAILURE_SIGNATURES, D1_SQL_FAILURE_REASONS,
+  d1SqlFailureMetadata, verifyD1BatchAtomicity,
+} from './d1-batch-atomicity.mjs';
 import { sharedCloudflareApiPermit } from '../../hub/scripts/lib/cloudflare-api-budget.mjs';
 
 const MAIN_ID = '5ff65cf3-89c8-4fe6-a3c2-a370293ecea6';
@@ -140,7 +143,11 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
         error.providerStatus = response.status;
         error.providerCodes = codes;
         error.d1FailureKind = !response.ok ? 'http' : envelope?.success === false ? 'statement' : 'shape';
-        if (isD1) error.d1SqlReason = d1SqlFailureReason(envelope?.errors);
+        if (isD1) {
+          const diagnostic = d1SqlFailureMetadata(envelope?.errors);
+          error.d1SqlReason = diagnostic.reason;
+          if (diagnostic.nativeSignature) error.d1NativeSignature = diagnostic.nativeSignature;
+        }
         throw error;
       }
       if (responseFormat === 'envelope') responseStatuses.set(envelope, response.status);
@@ -165,7 +172,9 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
               ? results.flatMap((result) => [result?.error,
                 ...(Array.isArray(result?.errors) ? result.errors : [])]) : [];
             const error = new Error('D1 statement rejection');
-            error.d1SqlReason = d1SqlFailureReason(failures);
+            const diagnostic = d1SqlFailureMetadata(failures);
+            error.d1SqlReason = diagnostic.reason;
+            if (diagnostic.nativeSignature) error.d1NativeSignature = diagnostic.nativeSignature;
             error.providerCodes = providerCodes([...failures, ...(Array.isArray(envelope.errors) ? envelope.errors : [])]);
             error.providerStatus = responseStatuses.get(envelope);
             throw error;
@@ -183,6 +192,8 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
           const reason = D1_SQL_FAILURE_REASONS.includes(error?.d1SqlReason) ? error.d1SqlReason : 'other';
           const failure = D1_FAILURE_KINDS.includes(error?.d1FailureKind) ? error.d1FailureKind : failureKind;
           const codes = Array.isArray(error?.providerCodes) ? providerCodes(error.providerCodes.map((code) => ({ code }))) : [];
+          const status = Number.isInteger(error?.providerStatus) && error.providerStatus >= 100 && error.providerStatus <= 599
+            ? error.providerStatus : undefined;
           // Count already-encoded request bytes only on failure. Parameter JSON byte
           // counts include array framing/escaping and never disclose the values.
           const statements = kind === 'batch' && Array.isArray(body.batch) ? body.batch : [body];
@@ -191,7 +202,7 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
           const parameterJsonBytes = typeof encodedBody === 'string' ? statements.reduce((bytes, statement) =>
             bytes + Buffer.byteLength(JSON.stringify(statement?.params ?? []), 'utf8'), 0) : 0;
           const safe = new Error(`D1 database=${publicDatabaseId(id)} kind=${kind}`
-            + ` HTTP=${Number.isInteger(error?.providerStatus) && error.providerStatus >= 100 && error.providerStatus <= 599 ? error.providerStatus : 'unknown'}`
+            + ` HTTP=${status ?? 'unknown'}`
             + ` codes=${codes.join(',')}`
             + ` failure=${failure}`
             + ` native=${reason} statements=${statements.length} parameters=${parameters}`
@@ -199,6 +210,12 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
             + ` parameterJsonBytes=${parameterJsonBytes}`);
           safe.d1SqlReason = reason;
           safe.d1FailureKind = failure;
+          // Typed failure-only metadata is validated independently of the redacted message.
+          safe.providerStatus = status;
+          safe.providerCodes = codes.slice(0, 16);
+          if (D1_NATIVE_FAILURE_SIGNATURES.includes(error?.d1NativeSignature)) {
+            safe.d1NativeSignature = error.d1NativeSignature;
+          }
           safe.d1Diagnostic = true;
           throw safe;
         }
@@ -601,5 +618,11 @@ async function main() {
 }
 
 if (process.argv[1] && pathToFileURL(path.resolve(process.argv[1])).href === import.meta.url) {
-  main().catch((error) => { console.error(error.message); process.exitCode = 1; });
+  main().catch((error) => {
+    if (error.d1Phase === 'copy-source-delete-and-freeze' && error.d1SourceComparison) {
+      console.error(JSON.stringify({ sourceRetirementComparison: error.d1SourceComparison }));
+    }
+    console.error(error.message);
+    process.exitCode = 1;
+  });
 }

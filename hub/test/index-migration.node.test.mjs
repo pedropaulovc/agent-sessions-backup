@@ -941,6 +941,78 @@ test('native workerd actual copier tokenizer boundaries verify 1461 same-shard r
   assert.ok(requests.length <= 100, `dense native verification must not make per-row RPCs, observed ${requests.length}`);
 });
 
+test('native workerd short invalid-UTF-8 TEXT exposes a byte-only retirement mismatch without changing the guard or error', async (context) => {
+  const f = await workerdFixture(context);
+  await seedWorkerdBlocks(f.source, nativeDenseRows(1));
+  await copyWithNativeParameters(f.args());
+  await f.shards[1].batch([
+    { sql: "INSERT INTO blocks_fts (blocks_fts, rowid, text) SELECT 'delete', id, text FROM blocks", params: [] },
+    { sql: 'DELETE FROM blocks', params: [] },
+  ]);
+  await f.shards[0].query('DELETE FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT]);
+  const rows = nativeDenseRows(3).map((row, index) => ({ ...row, id: 901 + index,
+    text: `private_native_needle_${index}\u0000private_native_tail` }));
+  const invalidHex = Buffer.concat([Buffer.from('private_native_needle_0 a'), Buffer.from([0xff]),
+    Buffer.from('b\u0000private_native_tail')]).toString('hex').toUpperCase();
+  await f.source.batch([
+    { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'copying' WHERE id = 1`, params: [] },
+    { sql: `INSERT INTO blocks (${BLOCK_COLUMNS.map(quoted).join(',')})
+      SELECT ${BLOCK_COLUMNS.map((_, index) => `json_extract(value,'$[${index}]')`).join(',')} FROM json_each(?)`,
+      params: [JSON.stringify(rows.map((row) => BLOCK_COLUMNS.map((column) => row[column])))] },
+    { sql: 'INSERT INTO blocks_fts (rowid, text) SELECT id, text FROM blocks', params: [] },
+    { sql: 'UPDATE blocks SET text = CAST(unhex(?) AS TEXT) WHERE id = ?', params: [invalidHex, rows[0].id] },
+    { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'frozen' WHERE id = 1`, params: [] },
+  ]);
+  const sourceBefore = await nativeSnapshot(f.source);
+  const decoded = [{ ...rows[0], text: Buffer.from(invalidHex, 'hex').toString('utf8') }, ...rows.slice(1)];
+  let verified, originalError, originalMessage, diagnosticQueries = 0, retirementAttempts = 0;
+  const nativeBatch = f.source.batch.bind(f.source);
+  f.source.batch = async (statements) => {
+    if (!statements.some(({ sql }) => sql.includes('AS source_empty'))) return nativeBatch(statements);
+    retirementAttempts += 1;
+    assert.equal(statements.length, 5);
+    assert.equal(statements.reduce((count, { params }) => count + params.length, 0), 3);
+    try { return await nativeBatch(statements); }
+    catch (error) { originalError = error; originalMessage = error.message; throw error; }
+  };
+  const nativeQuery = f.source.query.bind(f.source);
+  f.source.query = async (sql, params) => {
+    if (sql.includes('compared AS MATERIALIZED')) {
+      diagnosticQueries += 1;
+      assert.ok(!isWrite(sql));
+      assert.ok(Buffer.byteLength(JSON.stringify({ sql, params })) <= COPY_PAGE_BYTES);
+    }
+    return nativeQuery(sql, params);
+  };
+  await assert.rejects(copyWithNativeParameters(f.args({ checkpointHook: async (state) => {
+    if (state.pending?.phase !== 'verified') return;
+    verified = state;
+    assert.deepEqual(await f.shards[1].rows('SELECT * FROM blocks ORDER BY id'), decoded,
+      'native source and destination JS strings can agree despite lossy raw TEXT transport');
+    assert.deepEqual(await f.source.rows('SELECT hex(CAST(text AS BLOB)) AS bytes FROM blocks WHERE id = ?', [rows[0].id]),
+      [{ bytes: invalidHex }], 'the original invalid raw bytes still exist before acknowledgment');
+    assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), state);
+  } })), (error) => {
+    assert.equal(error, originalError); assert.equal(error.message, originalMessage);
+    assert.equal(error.d1Phase, 'copy-source-delete-and-freeze');
+    assert.equal(d1SqlFailureReason([error.message]), 'malformed-json');
+    assert.deepEqual(error.d1SourceComparison, {
+      status: 'mismatch', expectedRows: 3, presentRows: 3, missingRows: 0, mismatchingRows: 1,
+      columns: [{ index: 12, mismatchingRows: 1, typeMismatchRows: 0, byteMismatchRows: 1, lengthMismatchRows: 1,
+        sourceTypes: ['text'], snapshotTypes: ['text'] }],
+    });
+    assert.ok(!JSON.stringify(error.d1SourceComparison).includes('private_native'));
+    return true;
+  });
+  assert.equal(retirementAttempts, 1); assert.equal(diagnosticQueries, 1);
+  assert.deepEqual(await nativeSnapshot(f.source), sourceBefore, 'failure diagnostics retain every source tuple and legacy FTS byte');
+  assert.deepEqual(await f.source.rows('SELECT hex(CAST(text AS BLOB)) AS bytes FROM blocks WHERE id = ?', [rows[0].id]),
+    [{ bytes: invalidHex }], 'the atomic failure must retain the original raw TEXT bytes');
+  assert.deepEqual(await f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
+  assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), verified);
+});
+
+
 test('native workerd copier rejects missing, wrong, duplicate and out-of-probe MATCH identities before source acknowledgment', async (context) => {
   const f = await workerdFixture(context);
   const rows = nativeDenseRows(48);
@@ -3960,6 +4032,10 @@ test('REST D1 diagnostics sanitize envelope, result and transport failures witho
       assert.equal(error.d1SqlReason, ['envelope', 'result'].includes(scenario) ? 'missing-schema' : 'other');
       assert.equal(error.d1FailureKind, scenario === 'transport' ? 'transport'
         : scenario === 'result' ? 'statement' : 'http');
+      assert.equal(error.providerStatus, scenario === 'transport' ? undefined
+        : scenario === 'envelope' ? 400 : scenario === 'result' ? 200 : 502);
+      assert.deepEqual(error.providerCodes, ['envelope', 'result'].includes(scenario) ? [7500] : []);
+      assert.equal(error.d1NativeSignature, undefined);
       assert.ok(error.message.includes(id));
       assert.ok(error.message.includes('kind=batch'));
       assert.ok(!error.message.includes(canary));
@@ -3968,6 +4044,59 @@ test('REST D1 diagnostics sanitize envelope, result and transport failures witho
       return true;
     });
     assert.equal(requests, 1, 'an ambiguous failure must not replay a batch');
+  }
+});
+
+test('REST D1 diagnostics retain bounded fixed native signatures and typed HTTP evidence without provider text', async (context) => {
+  const originalFetch = globalThis.fetch;
+  context.after(() => { globalThis.fetch = originalFetch; });
+  const canary = 'PRIVATE_NATIVE_SIGNATURE_SQL_PROVIDER_CANARY';
+  const signatures = [
+    ['too many arguments on function private_function', 'limits', 'function-arguments'],
+    ['Expression tree is too large (maximum depth 1000)', 'limits', 'expression-depth'],
+    ['statement too long', 'limits', 'statement-length'],
+    ['too many columns in result set', 'limits', 'column-limit'],
+    ['JSON cannot hold BLOB values', 'type-error', 'json-blob'],
+    ['no such function: private_function', 'missing-schema', 'function-unavailable'],
+    ['not authorized: SQLITE_AUTH', 'other', 'authorization'],
+    ['invalid UTF-8', 'other', 'invalid-utf8'],
+    ['misuse of aggregate function COUNT()', 'other', 'aggregate-misuse'],
+    ['parser stack overflow', 'limits', 'parser-stack-overflow'],
+    ['unrecognized private provider condition', 'other', undefined],
+    ['malformed JSON; statement too long', 'other', undefined],
+    ['too many arguments on function json_array; Expression tree is too large', 'limits', undefined],
+  ];
+  for (const route of ['envelope', 'result']) {
+    for (const [message, reason, signature] of signatures) {
+      await context.test(`${route}: ${signature ?? message}`, async () => {
+        let requests = 0;
+        globalThis.fetch = async () => {
+          requests += 1;
+          const errors = Array.from({ length: 20 }, (_, index) => ({
+            code: 7500 + index, ...(index ? {} : { message: `${message} ${canary}` }),
+          }));
+          errors.push({ code: canary }, { code: -1 }, { code: 1.5 }, { code: Number.MAX_SAFE_INTEGER + 1 });
+          return Response.json(route === 'envelope' ? { success: false, errors }
+            : { success: true, result: [{ success: false, error: `${message} ${canary}`, errors }] },
+          { status: route === 'envelope' ? 400 : 200 });
+        };
+        const db = diagnosticClient(PREVIEW_ACCOUNT_ID, canary, { permit: async () => {} })
+          .db('95dbde60-d5ab-4e2c-989f-fcd44a3ab479');
+        await assert.rejects(db.query(canary, [canary]), (error) => {
+          assert.equal(error.d1SqlReason, reason);
+          assert.equal(error.d1NativeSignature, signature);
+          assert.equal(error.providerStatus, route === 'envelope' ? 400 : 200);
+          assert.deepEqual(error.providerCodes, Array.from({ length: 16 }, (_, index) => 7500 + index));
+          assert.equal(error.d1FailureKind, route === 'envelope' ? 'http' : 'statement');
+          assert.ok(error.message.includes(`native=${reason}`));
+          assert.ok(!`${error.message} ${error.stack} ${JSON.stringify(error)}`.includes(canary));
+          assert.ok(!error.message.includes('private_function'));
+          assert.equal(error.cause, undefined);
+          return true;
+        });
+        assert.equal(requests, 1, 'classification must not replay a rejected operation');
+      });
+    }
   }
 });
 
@@ -4006,6 +4135,217 @@ test('copy preserves native rejection and retained source across semantic failur
         assert.equal(state.rows, 0);
         assert.equal(state.pending.phase, phase === 'copy-source-delete-and-freeze' ? 'verified' : 'copying');
       }
+    });
+  }
+});
+
+test('retirement failure diagnostics preserve the native error and source checkpoint while exposing only bounded aggregates', async (context) => {
+  const canary = 'PRIVATE_RETIRED_DATA_CANARY';
+  for (const scenario of ['clean', 'mismatch', 'missing', 'mismatch-and-missing', 'query-failed', 'response-shape', 'request-budget', 'wide-mismatch', 'oversized']) {
+    await context.test(scenario, async (child) => {
+      const f = await fixture(child);
+      const columns = [...BLOCK_COLUMNS];
+      if (scenario === 'wide-mismatch') {
+        const added = Array.from({ length: 100 - columns.length }, (_, index) => `public_future_${String(index).padStart(3, '0')}`);
+        columns.push(...added);
+        for (const db of [f.source, ...f.shards]) for (const column of added) {
+          db.database.exec(`ALTER TABLE blocks ADD COLUMN ${quoted(column)} TEXT`);
+        }
+      }
+      const hasMismatch = ['mismatch', 'mismatch-and-missing', 'wide-mismatch'].includes(scenario);
+      const hasMissing = ['missing', 'mismatch-and-missing'].includes(scenario);
+      const large = scenario === 'request-budget' ? '\u0000'.repeat(150_000)
+        : scenario === 'oversized' ? 'x'.repeat(COPY_PAGE_BYTES + 2) : '';
+      const originals = (scenario === 'wide-mismatch'
+        ? Array.from({ length: 82 }, (_, index) => block(811 + index, index % 2))
+        : large ? [block(811, 0, { text: `${canary} ${large}` })]
+          : [block(811, 0, { text: `${canary}\u0000original_tail`, role: null }), block(812, 1)])
+        .map((row) => ({ ...row, ...Object.fromEntries(columns.slice(BLOCK_COLUMNS.length).map((column) => [column, null])) }));
+      seedBlocks(f.source, originals, columns);
+      const rejection = new Error('safe native retirement rejection');
+      rejection.d1SqlReason = 'malformed-json';
+      let observedError, verified, diagnosticQueries = 0, retirementAttempts = 0;
+      let expected = originals;
+      const nativeBatch = f.source.batch.bind(f.source);
+      f.source.batch = async (statements) => {
+        if (!statements.some(({ sql }) => sql.includes('AS source_empty'))
+          || !statements.some(({ sql }) => /DELETE FROM blocks/.test(sql))) return nativeBatch(statements);
+        retirementAttempts += 1;
+        if (!hasMismatch) { observedError = rejection; throw rejection; }
+        try { return await nativeBatch(statements); }
+        catch (error) { observedError = error; throw error; }
+      };
+      const nativeQuery = f.source.query.bind(f.source);
+      f.source.query = async (sql, params) => {
+        if (!sql.includes('compared AS MATERIALIZED')) return nativeQuery(sql, params);
+        diagnosticQueries += 1;
+        assert.ok(!isWrite(sql), 'failure diagnostics must be read-only');
+        assert.equal(params.length, 1, 'reuse one already verified canonical snapshot');
+        assert.ok(Buffer.byteLength(JSON.stringify({ sql, params })) <= COPY_PAGE_BYTES);
+        if (scenario === 'query-failed') throw new Error(canary);
+        if (scenario === 'response-shape') return [{ expected_rows: canary }];
+        return nativeQuery(sql, params);
+      };
+      await assert.rejects(copyWithNativeParameters(f.args({ checkpointHook: async (state) => {
+        if (state.pending?.phase !== 'verified') return;
+        verified = state;
+        assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), state);
+        if (scenario === 'wide-mismatch') {
+          // Unique mismatch counts at every added ordinal catch column/group transposition.
+          expected = originals.map((row, rowIndex) => ({ ...row, ...Object.fromEntries(
+            columns.slice(BLOCK_COLUMNS.length).map((column, index) => [column, rowIndex <= index ? 'changed' : null]),
+          ) }));
+          for (const [index, column] of columns.slice(BLOCK_COLUMNS.length).entries()) {
+            f.source.database.prepare(`UPDATE blocks SET ${quoted(column)} = ? WHERE id <= ?`)
+              .run('changed', originals[index].id);
+          }
+        } else if (hasMismatch) {
+          expected = [{ ...originals[0], role: '', text: `${canary}\u0000changed_tail` }, originals[1]];
+          f.source.database.prepare('UPDATE blocks SET role = ?, text = ? WHERE id = ?')
+            .run(expected[0].role, expected[0].text, expected[0].id);
+        }
+        if (hasMissing) {
+          const removedId = hasMismatch ? originals[1].id : originals[0].id;
+          expected = expected.filter(({ id }) => id !== removedId);
+          f.source.database.prepare('DELETE FROM blocks WHERE id = ?').run(removedId);
+        }
+      } })), (error) => {
+        assert.equal(error, observedError, 'diagnostic failures must never replace the original rejection');
+        assert.equal(error.d1Phase, 'copy-source-delete-and-freeze');
+        assert.equal(error.message, hasMismatch ? 'malformed JSON' : rejection.message);
+        const comparison = error.d1SourceComparison;
+        assert.ok(comparison, 'the historical copier must fail this load-bearing metadata assertion');
+        assert.ok(!JSON.stringify(comparison).includes(canary));
+        assert.ok(!JSON.stringify(comparison).includes('original_tail'));
+        if (['query-failed', 'response-shape', 'request-budget', 'oversized'].includes(scenario)) {
+          assert.deepEqual(comparison, { status: 'unavailable', reason: scenario === 'oversized' ? 'canonical-budget' : scenario });
+        } else {
+          assert.equal(comparison.status, scenario === 'wide-mismatch' ? 'mismatch' : scenario);
+          assert.equal(comparison.expectedRows, originals.length);
+          assert.equal(comparison.presentRows, expected.length);
+          assert.equal(comparison.missingRows, hasMissing ? 1 : 0);
+          assert.equal(comparison.mismatchingRows, scenario === 'wide-mismatch' ? originals.length : hasMismatch ? 1 : 0);
+          assert.deepEqual(comparison.columns, scenario === 'wide-mismatch'
+            ? columns.slice(BLOCK_COLUMNS.length).map((_, index) => ({
+              index: BLOCK_COLUMNS.length + index, mismatchingRows: index + 1, typeMismatchRows: index + 1,
+              byteMismatchRows: index + 1, lengthMismatchRows: index + 1,
+              sourceTypes: ['text'], snapshotTypes: ['null'],
+            })) : hasMismatch ? [
+            { index: 5, mismatchingRows: 1, typeMismatchRows: 1, byteMismatchRows: 1, lengthMismatchRows: 1,
+              sourceTypes: ['text'], snapshotTypes: ['null'] },
+            { index: 12, mismatchingRows: 1, typeMismatchRows: 0, byteMismatchRows: 1, lengthMismatchRows: 1,
+              sourceTypes: ['text'], snapshotTypes: ['text'] },
+          ] : []);
+        }
+        return true;
+      });
+      assert.equal(retirementAttempts, 1, 'diagnostics never replay or ACK a rejected source batch');
+      assert.equal(diagnosticQueries, ['request-budget', 'oversized'].includes(scenario) ? 0 : 1);
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), expected, 'every remaining source tuple survives');
+      assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), verified, 'no diagnostic checkpoint advance');
+    });
+  }
+});
+
+test('retirement aggregate preserves CAS affinity and mixed storage byte flags on native adapters', async (context) => {
+  for (const backend of ['sqlite', 'workerd']) {
+    await context.test(backend, async (child) => {
+      const f = backend === 'sqlite' ? await fixture(child) : await workerdFixture(child);
+      const added = [['public_untyped', 'ANY'], ['public_text', 'TEXT'], ['public_integer', 'INTEGER']];
+      const columns = [...BLOCK_COLUMNS, ...added.map(([name]) => name)];
+      for (const db of [f.source, ...f.shards]) for (const [name, affinity] of added) {
+        const sql = `ALTER TABLE blocks ADD COLUMN ${quoted(name)} ${affinity}`;
+        if (backend === 'sqlite') db.database.exec(sql);
+        else await db.batch([{ sql, params: [] }]);
+      }
+      await copyWithNativeParameters(f.args());
+      await f.shards[0].batch([{ sql: 'DELETE FROM index_migration_state WHERE name = ?', params: [COPY_CHECKPOINT] }]);
+      const values = ['same\u0000bytes', 11, 0.1, null, 'blob\u0000bytes', 7, 'number',
+        '\uFEFFsame\u0000😀"\\tail', null, 'missing', 0.3];
+      const originals = values.map((value, index) => block(1100 + index, index % 2, {
+        role: index ? 'assistant' : null, text: '\uFEFFprivate_affinity\u0000searchtail 😀',
+        public_untyped: value, public_text: '7', public_integer: 11,
+      }));
+      await f.source.batch([
+        { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'copying' WHERE id = 1`, params: [] },
+        { sql: `INSERT INTO blocks (${columns.map(quoted).join(',')})
+          SELECT ${columns.map((_, index) => `json_extract(value,'$[${index}]')`).join(',')} FROM json_each(?)`,
+        params: [JSON.stringify(originals.map((row) => columns.map((column) => row[column])))] },
+        { sql: 'INSERT INTO blocks_fts (rowid, text) SELECT id, text FROM blocks', params: [] },
+        { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'frozen' WHERE id = 1`, params: [] },
+      ]);
+      const physical = () => f.source.query(`SELECT ${columns.flatMap((column, index) => [
+        `typeof(${quoted(column)}) AS t${index}`, `hex(CAST(${quoted(column)} AS BLOB)) AS b${index}`,
+      ]).join(',')} FROM blocks ORDER BY id`);
+      let verified, retained, captured, originalError, originalMessage, retirementAttempts = 0, diagnosticQueries = 0;
+      const nativeBatch = f.source.batch.bind(f.source), nativeQuery = f.source.query.bind(f.source);
+      f.source.batch = async (statements) => {
+        if (!statements.some(({ sql }) => sql.includes('AS source_empty'))
+          || !statements.some(({ sql }) => /DELETE FROM blocks/.test(sql))) return nativeBatch(statements);
+        retirementAttempts += 1;
+        try { return await nativeBatch(statements); }
+        catch (error) { originalError = error; originalMessage = error.message; throw error; }
+      };
+      f.source.query = async (sql, params) => {
+        if (sql.includes('AS source_comparison FROM compared')) {
+          diagnosticQueries += 1; captured = { sql, params };
+          assert.ok(!isWrite(sql));
+          assert.ok(Buffer.byteLength(sql) <= 100_000);
+          assert.ok(Buffer.byteLength(JSON.stringify(captured)) <= COPY_PAGE_BYTES);
+        }
+        return nativeQuery(sql, params);
+      };
+      await assert.rejects(copyWithNativeParameters(f.args({ checkpointHook: async (state) => {
+        if (state.pending?.phase !== 'verified') return;
+        verified = state;
+        await f.source.batch([
+          { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'copying' WHERE id = 1`, params: [] },
+          ...[[0, null], [1, 12], [2, 0.2], [3, 'new'], [10, 0.4]].map(([index, value]) => ({
+            sql: `UPDATE blocks SET public_untyped = ${index === 1 ? 'CAST(? AS INTEGER)' : '?'} WHERE id = ?`,
+            params: [value, originals[index].id],
+          })),
+          { sql: 'UPDATE blocks SET role = ? WHERE id = ?', params: ['', originals[0].id] },
+          { sql: 'UPDATE blocks SET public_untyped = unhex(?) WHERE id = ?',
+            params: [Buffer.from(originals[4].public_untyped).toString('hex'), originals[4].id] },
+          { sql: 'UPDATE blocks SET public_untyped = CAST(? AS REAL) WHERE id = ?', params: [7, originals[5].id] },
+          { sql: 'DELETE FROM blocks WHERE id = ?', params: [originals[9].id] },
+          { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'frozen' WHERE id = 1`, params: [] },
+        ]);
+        retained = await physical();
+      } })), (error) => {
+        assert.equal(error, originalError); assert.equal(error.message, originalMessage);
+        assert.equal(d1SqlFailureReason([error.message]), 'malformed-json');
+        assert.deepEqual(error.d1SourceComparison, {
+          status: 'mismatch-and-missing', expectedRows: 11, presentRows: 10, missingRows: 1, mismatchingRows: 6,
+          columns: [
+            { index: 5, mismatchingRows: 1, typeMismatchRows: 1, byteMismatchRows: 1, lengthMismatchRows: 1,
+              sourceTypes: ['text'], snapshotTypes: ['null'] },
+            { index: 18, mismatchingRows: 6, typeMismatchRows: 3, byteMismatchRows: 5, lengthMismatchRows: 2,
+              sourceTypes: ['null', 'integer', 'real', 'text', 'blob'], snapshotTypes: ['null', 'integer', 'real', 'text'] },
+          ],
+        });
+        assert.ok(!JSON.stringify(error.d1SourceComparison).includes('private_affinity'));
+        return true;
+      });
+      assert.equal(retirementAttempts, 1); assert.equal(diagnosticQueries, 1);
+      assert.deepEqual(await physical(), retained);
+      assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), verified);
+      assert.deepEqual(await f.source.query(`SELECT state FROM ${SOURCE_FREEZE_TABLE}`), [{ state: 'frozen' }]);
+      // A separate read-only control changes only the public canonical snapshot.
+      // Direct column IS applies affinity; CASE-stored IS without it would invent two misses.
+      const snapshot = JSON.parse(captured.params[0]);
+      snapshot[6][19] = 7; snapshot[6][20] = '11';
+      const response = await nativeQuery(captured.sql, [JSON.stringify(snapshot)]);
+      const summary = JSON.parse(response[0].source_comparison);
+      assert.deepEqual(summary.slice(0, 4), [11, 10, 1, 6]);
+      const cells = summary[4].flat();
+      assert.deepEqual(cells[0], [0, 0, 0, 0, 0, 0], 'the joined primary key is never a mismatched cell');
+      assert.deepEqual(cells[18], [6, 3, 5, 2, 31, 15],
+        'duplicate REAL types must not add duplicate bits or count one row twice');
+      assert.deepEqual(cells[19], [0, 0, 0, 0, 0, 0], 'TEXT affinity must preserve SQL-equal numeric snapshots');
+      assert.deepEqual(cells[20], [0, 0, 0, 0, 0, 0], 'INTEGER affinity must preserve SQL-equal text snapshots');
+      assert.deepEqual(await physical(), retained);
+      assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), verified);
     });
   }
 });
@@ -4948,9 +5288,22 @@ test('native full-copy control runs real SQLite schema, copier, independent read
   assert.equal(result.freezeTriggers, 3);
   assert.match(result.sha256, /^[0-9a-f]{64}$/);
   const [source, ...shards] = adapters;
-  assert.deepEqual(source.rows('SELECT COUNT(*) AS rows FROM blocks'), [{ rows: 0 }]);
+  const diagnosticId = INDEX_ID_SPAN - 2;
+  assert.deepEqual(result.retirementDiagnostic, {
+    outcome: 'verified', phase: 'copy-source-delete-and-freeze', nativeClass: 'malformed-json',
+    statements: 5, binds: 3,
+    comparison: {
+      status: 'mismatch', expectedRows: 1, presentRows: 1, missingRows: 0, mismatchingRows: 1,
+      columns: [{ index: 12, mismatchingRows: 1, typeMismatchRows: 0, byteMismatchRows: 1, lengthMismatchRows: 1,
+        sourceTypes: ['text'], snapshotTypes: ['text'] }],
+    },
+    sourceRetention: 'retained', freezeRetention: 'frozen', checkpointRetention: 'retained', positiveRowsRetained: result.rows,
+  });
+  assert.deepEqual(source.rows('SELECT id, hex(CAST(text AS BLOB)) AS bytes FROM blocks'), [{ id: diagnosticId, bytes: '61FF62' }],
+    'only the later collision-free negative control stays authoritative after the positive source copy completed');
   assert.deepEqual(source.rows(`SELECT state FROM ${SOURCE_FREEZE_TABLE}`), [{ state: 'frozen' }]);
-  const copied = shards.flatMap((database) => database.rows('SELECT * FROM blocks')).sort((a, b) => a.id - b.id);
+  const copied = shards.flatMap((database) => database.rows('SELECT * FROM blocks'))
+    .filter(({ id }) => id !== diagnosticId).sort((a, b) => a.id - b.id);
   assert.equal(copied.length, result.rows);
   assert.equal(sha256(JSON.stringify(copied.map((row) => JSON.parse(canonicalRow(BLOCK_COLUMNS, row))))), result.sha256);
   const dense = copied.filter(({ id }) => id >= 1 && id <= result.denseRows);
@@ -4972,7 +5325,7 @@ test('native full-copy control runs real SQLite schema, copier, independent read
     assert.equal(indexShardForSessionId(row.session_id, 2), 1);
     await assertNativeLongWordIdentity(shards[1], row, [row.text]);
   }
-  assert.deepEqual(shards[0].rows('SELECT id FROM blocks ORDER BY id'), [{ id: 0 }]);
+  assert.deepEqual(shards[0].rows('SELECT id FROM blocks WHERE id != ? ORDER BY id', [diagnosticId]), [{ id: 0 }]);
   assert.deepEqual(shards[1].rows('SELECT id FROM blocks ORDER BY id'),
     [...denseIds, ...growth.map(({ id }) => id), INDEX_ID_SPAN - 1].map((id) => ({ id })));
   const seed = source.trace.find(({ kind }) => kind === 'batch');
@@ -4991,17 +5344,21 @@ test('native full-copy control runs real SQLite schema, copier, independent read
     'source retirement must leave the originally seeded legacy FTS pages unchanged');
   const copying = shards[0].trace.filter(({ sql, params }) => /^INSERT INTO index_migration_state\b/.test(sql)
     && params[0] === COPY_CHECKPOINT && JSON.parse(params[1]).pending?.phase === 'copying')
-    .map(({ params }) => JSON.parse(params[1]));
+    .map(({ params }) => JSON.parse(params[1]))
+    .filter(({ pending }) => pending.rows.every(({ id }) => id !== diagnosticId));
   assert.deepEqual(copying[0].pending.rows.map(({ id }) => id), [0, ...denseIds],
     'growth must not alter the original first dense source-page geometry');
   assert.deepEqual(copying.flatMap(({ pending }) => pending.rows.map(({ id }) => id)), copied.map(({ id }) => id));
   const writes = shards.flatMap(({ trace }) => trace.filter(({ kind, statements }) => kind === 'batch'
-    && statements.some(({ sql }) => /^INSERT INTO blocks \(/.test(sql))));
+    && statements.some(({ sql }) => /^INSERT INTO blocks \(/.test(sql))))
+    .filter(({ statements }) => !statements.some(({ sql, params }) => /^INSERT INTO blocks \(/.test(sql)
+      && (params.length === 1 ? JSON.parse(params[0]).some((row) => row[0] === diagnosticId) : params[0] === diagnosticId)));
   const ordinaryWrites = writes.filter(({ statements }) => statements.some(({ sql, params }) =>
     /^INSERT INTO blocks \(/.test(sql) && params.length === 1));
   assert.equal(result.ordinaryPages, ordinaryWrites.length, 'page aggregate must come from real ordinary writes, not an incidental pinned count');
   const probeGroups = shards.flatMap(({ trace }) => trace.filter(({ kind, sql, params }) =>
-    kind === 'query' && /\bMATCH\b/.test(sql) && params.length === 1 && params[0].startsWith('[')));
+    kind === 'query' && /\bMATCH\b/.test(sql) && params.length === 1 && params[0].startsWith('[')))
+    .filter(({ params }) => JSON.parse(params[0]).every(([, id]) => id !== diagnosticId));
   assert.equal(result.maxFtsParametersBytes, Math.max(...probeGroups.map(({ params }) => Buffer.byteLength(JSON.stringify(params)))));
   assert.ok(probeGroups.every(({ params }) => Buffer.byteLength(JSON.stringify(params)) <= COPY_PAGE_BYTES));
   let splitPages = 0;
@@ -5107,12 +5464,248 @@ test('native full-copy control runs real SQLite schema, copier, independent read
   assert.ok(statements.every(({ params }) => params.length <= 100));
   assert.ok(statements.every(({ responseBytes }) => responseBytes === undefined || responseBytes <= 1_048_576),
     'full-row and independent readback responses stay within the ordinary response budget');
-  assert.equal((await readCheckpoint(shards[0], COPY_CHECKPOINT)).state, 'complete');
+  const retainedCheckpoint = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+  assert.equal(retainedCheckpoint.state, 'pending');
+  assert.equal(retainedCheckpoint.rows, 0);
+  assert.equal(retainedCheckpoint.pending.phase, 'verified');
+  assert.deepEqual(retainedCheckpoint.pending.rows.map(({ id }) => id), [diagnosticId]);
+  assert.ok(shards[0].trace.some(({ sql, params }) => /^INSERT INTO index_migration_state\b/.test(sql)
+    && params[0] === COPY_CHECKPOINT && JSON.parse(params[1]).state === 'complete'
+    && JSON.parse(params[1]).rows === result.rows), 'the full positive proof must complete before its scratch-only checkpoint reset');
   assert.deepEqual(account.snapshot(), before);
   assert.equal(account.created.length, 3);
   assert.equal(new Set(account.created.map(({ name }) => name)).size, 3);
   for (const { name } of account.created) assert.match(name, /^pr-42-copy-[0-9a-f]{24}-(?:source|idx00|idx01)$/);
   assert.deepEqual(new Set(account.deleted.map(({ uuid }) => uuid)), new Set(account.created.map(({ uuid }) => uuid)));
+});
+
+test('native proof rejects an unexpected early failure in the diagnostic copy instead of reporting a verified control', async (context) => {
+  const canary = 'PRIVATE_EARLY_DIAGNOSTIC_FAILURE_CANARY';
+  const { account, adapters, proof } = await nativeScratchFixture(context);
+  const beforeAccount = account.snapshot();
+  const applySchema = proof.applySchema;
+  let exercised = false, sourceBefore, checkpointBefore, sourceTraceStart;
+  proof.applySchema = async (databases) => {
+    await applySchema(databases);
+    databases.source.beforeQuery = async ({ sql }) => {
+      if (exercised || !sql.includes('WITH candidates AS MATERIALIZED')
+        || !databases.source.rows('SELECT id FROM blocks WHERE id = ?', [INDEX_ID_SPAN - 2]).length) return;
+      exercised = true;
+      sourceBefore = blockSnapshot(databases.source);
+      checkpointBefore = await readCheckpoint(databases.shards[0], COPY_CHECKPOINT);
+      sourceTraceStart = databases.source.trace.length;
+      assert.ok(databases.shards[0].trace.some(({ sql: statement, params }) =>
+        /^INSERT INTO index_migration_state\b/.test(statement) && params[0] === COPY_CHECKPOINT
+        && JSON.parse(params[1]).state === 'complete' && JSON.parse(params[1]).rows === 1509),
+      'the fault must occur only after the full public positive proof completed');
+      throw Object.assign(new Error(`syntax error ${canary}`), { d1FailureKind: 'statement' });
+    };
+  };
+  await assert.rejects(verifyNativeCopyControl(proof), (error) => {
+    assert.equal(error.nativeCopyPhase, 'copy-source-page-read');
+    assert.equal(error.nativeCopyClass, 'sql-syntax');
+    assert.equal(error.nativeCopyFailureKind, 'statement');
+    assert.equal(error.cause, undefined);
+    assert.ok(!`${error.message} ${error.stack} ${JSON.stringify(error)}`.includes(canary));
+    return true;
+  }, 'the historical native helper must fail this assertion by returning a green rejected-before-retirement result');
+  assert.equal(exercised, true);
+  assert.deepEqual(blockSnapshot(adapters[0]), sourceBefore);
+  assert.deepEqual(await readCheckpoint(adapters[1], COPY_CHECKPOINT), checkpointBefore);
+  assert.deepEqual(adapters[0].trace.slice(sourceTraceStart).filter(({ sql }) => sql && isWrite(sql)), [],
+    'an unrelated early failure must not ACK or modify retained source rows');
+  assert.deepEqual(adapters[0].rows('SELECT id, hex(CAST(text AS BLOB)) AS bytes FROM blocks'),
+    [{ id: INDEX_ID_SPAN - 2, bytes: '61FF62' }]);
+  assert.deepEqual(adapters[0].rows(`SELECT state FROM ${SOURCE_FREEZE_TABLE}`), [{ state: 'frozen' }]);
+  assert.equal(adapters.slice(1).reduce((count, db) => count + db.rows('SELECT COUNT(*) AS n FROM blocks')[0].n, 0), 1509);
+  assert.deepEqual(account.snapshot(), beforeAccount);
+  assert.equal(account.created.length, 3);
+  assert.equal(account.deleted.length, 3);
+});
+
+test('native diagnostic proof derives exact NULL transport flags and fails closed on mismatched aggregate evidence', async (context) => {
+  for (const scenario of ['null-transport', 'wrong-aggregate']) {
+    await context.test(scenario, async (child) => {
+      const canary = 'PRIVATE_DIAGNOSTIC_PROVIDER_CANARY';
+      const diagnosticId = INDEX_ID_SPAN - 2;
+      const { account, adapters, proof } = await nativeScratchFixture(child);
+      const beforeAccount = account.snapshot();
+      const applySchema = proof.applySchema;
+      let nullReads = 0, diagnosticQueries = 0, retirementAttempts = 0;
+      let sourceBefore, checkpointBefore;
+      proof.applySchema = async (databases) => {
+        await applySchema(databases);
+        databases.source.beforeStatement = async ({ sql }) => {
+          if (!sql.includes(SOURCE_FREEZE_TABLE) || !sql.includes("SET state = 'copying'")
+            || !databases.source.rows('SELECT id FROM blocks WHERE id = ?', [diagnosticId]).length) return;
+          retirementAttempts += 1;
+          sourceBefore = blockSnapshot(databases.source);
+          checkpointBefore = await readCheckpoint(databases.shards[0], COPY_CHECKPOINT);
+          assert.equal(checkpointBefore.pending.phase, 'verified');
+          assert.deepEqual(checkpointBefore.pending.rows.map(({ id }) => id), [diagnosticId]);
+        };
+        databases.source.transformQuery = ({ sql }, rows) => {
+          if (scenario === 'null-transport' && /^\s*WITH sized AS MATERIALIZED/.test(sql)) {
+            // A controlled nullable TEXT transport edge, not a claim about Cloudflare.
+            // The underlying source bytes and every native SQL operation remain real.
+            return rows.map((row) => {
+              if (row.id !== diagnosticId) return row;
+              nullReads += 1;
+              return { ...row, text: null };
+            });
+          }
+          if (!sql.includes('AS source_comparison FROM compared')) return rows;
+          diagnosticQueries += 1;
+          assert.ok(!isWrite(sql));
+          assert.equal(rows.length, 1);
+          const aggregate = JSON.parse(rows[0].source_comparison);
+          assert.deepEqual(aggregate.slice(0, 4), [1, 1, 0, 1],
+            'the actual native comparison must observe the real retained invalid-TEXT row');
+          if (scenario !== 'wrong-aggregate') return rows;
+          const cell = aggregate[4][Math.floor(12 / 16)][12 % 16];
+          assert.deepEqual(cell, [1, 0, 1, 1, 8, 8]);
+          cell[3] = 0; // Valid bounded vocabulary, but false independent byte-length evidence.
+          return [{ ...rows[0], source_comparison: JSON.stringify(aggregate),
+            providerPayload: `${canary} SELECT text FROM blocks WHERE id = ${diagnosticId}` }];
+        };
+      };
+      const expected = {
+        status: 'mismatch', expectedRows: 1, presentRows: 1, missingRows: 0, mismatchingRows: 1,
+        columns: [{ index: 12, mismatchingRows: 1, typeMismatchRows: scenario === 'null-transport' ? 1 : 0,
+          byteMismatchRows: 1, lengthMismatchRows: scenario === 'null-transport' ? 1 : 0,
+          sourceTypes: ['text'], snapshotTypes: [scenario === 'null-transport' ? 'null' : 'text'] }],
+      };
+      if (scenario === 'null-transport') {
+        const result = await verifyNativeCopyControl(proof);
+        assert.equal(result.state, 'verified');
+        assert.equal(result.rows, 1509);
+        assert.equal(result.retirementDiagnostic.outcome, 'verified');
+        assert.deepEqual(result.retirementDiagnostic.comparison, expected,
+          'descriptor-derived evidence must agree exactly with the actual SQL text/null mismatch');
+        assert.equal(result.retirementDiagnostic.sourceRetention, 'retained');
+        assert.equal(result.retirementDiagnostic.freezeRetention, 'frozen');
+        assert.equal(result.retirementDiagnostic.checkpointRetention, 'retained');
+        assert.ok(nullReads > 0, 'the nullable boundary must be exercised by actual copier reads');
+      } else {
+        await assert.rejects(verifyNativeCopyControl(proof), (error) => {
+          assert.equal(error.nativeCopyPhase, 'retirement-diagnostic');
+          assert.equal(error.nativeCopyClass, 'assertion');
+          assert.deepEqual(error.nativeCopySourceComparison, expected);
+          assert.ok(error.message.includes('sourceRetirementComparison='));
+          const emitted = `${error.message} ${error.stack} ${JSON.stringify(error)}`;
+          for (const value of [canary, String(diagnosticId), '61FF62', 'a\uFFFDb',
+            'nativeordinaryvisible', 'SELECT text FROM blocks']) assert.ok(!emitted.includes(value));
+          assert.equal(error.cause, undefined);
+          return true;
+        }, 'a validated but incorrect aggregate cannot replace independent native byte/type evidence');
+        assert.equal(nullReads, 0);
+      }
+      assert.equal(retirementAttempts, 1, 'the rejected retirement batch must not replay');
+      assert.equal(diagnosticQueries, 1, 'one real read-only aggregate follows the native assertion abort');
+      assert.deepEqual(blockSnapshot(adapters[0]), sourceBefore);
+      assert.deepEqual(adapters[0].rows('SELECT id, hex(CAST(text AS BLOB)) AS bytes FROM blocks'),
+        [{ id: diagnosticId, bytes: '61FF62' }], 'the original invalid raw TEXT must survive every outcome');
+      assert.deepEqual(adapters[0].rows(`SELECT state FROM ${SOURCE_FREEZE_TABLE}`), [{ state: 'frozen' }]);
+      assert.deepEqual(await readCheckpoint(adapters[1], COPY_CHECKPOINT), checkpointBefore);
+      assert.equal(adapters.slice(1).reduce((count, db) =>
+        count + db.rows('SELECT COUNT(*) AS n FROM blocks WHERE id != ?', [diagnosticId])[0].n, 0), 1509,
+      'all original positive destination rows remain intact');
+      const copiedProbe = adapters.slice(1).flatMap((db) =>
+        db.rows('SELECT typeof(text) AS storage_type FROM blocks WHERE id = ?', [diagnosticId]));
+      assert.deepEqual(copiedProbe, [{ storage_type: scenario === 'null-transport' ? 'null' : 'text' }]);
+      assert.deepEqual(account.snapshot(), beforeAccount);
+      assert.equal(account.created.length, 3); assert.equal(account.deleted.length, 3);
+    });
+  }
+});
+
+test('native diagnostic proof bounds rejected query metadata and compiles the identical aggregate on its destination', async (context) => {
+  for (const scenario of ['typed-evidence', 'invalid-evidence', 'malformed-summary', 'destination-query-rejected']) {
+    await context.test(scenario, async (child) => {
+      const canary = 'PRIVATE_NATIVE_DIAGNOSTIC_QUERY_CANARY';
+      const diagnosticId = INDEX_ID_SPAN - 2;
+      const { account, adapters, proof } = await nativeScratchFixture(child);
+      const beforeAccount = account.snapshot(), applySchema = proof.applySchema;
+      let sourceBefore, checkpointBefore, diagnosticStatement;
+      let sourceQueries = 0, positiveQueries = 0, retirementAttempts = 0;
+      proof.applySchema = async (databases) => {
+        await applySchema(databases);
+        databases.source.beforeStatement = async ({ sql }) => {
+          if (!sql.includes(SOURCE_FREEZE_TABLE) || !sql.includes("SET state = 'copying'")
+            || !databases.source.rows('SELECT id FROM blocks WHERE id = ?', [diagnosticId]).length) return;
+          retirementAttempts += 1;
+          sourceBefore = blockSnapshot(databases.source);
+          checkpointBefore = await readCheckpoint(databases.shards[0], COPY_CHECKPOINT);
+          assert.equal(checkpointBefore.pending.phase, 'verified');
+        };
+        databases.source.beforeQuery = (event) => {
+          if (!event.sql.includes('AS source_comparison FROM compared')) return;
+          sourceQueries += 1; diagnosticStatement = event;
+          assert.ok(!isWrite(event.sql));
+          try {
+            // An actual native compile failure with private text, not a fabricated aggregate.
+            databases.source.database.prepare(`SELECT * FROM "${canary}"`).all();
+            assert.fail('the deliberately absent relation must reject');
+          } catch (error) {
+            if (error.code === 'ERR_ASSERTION') throw error;
+            Object.assign(error, scenario === 'invalid-evidence'
+              ? { providerStatus: '400', providerCodes: [7500, canary],
+                d1FailureKind: canary, d1NativeSignature: canary, d1Phase: canary }
+              : { providerStatus: 400, providerCodes: [7500], d1FailureKind: 'http' });
+            throw error;
+          }
+        };
+        for (const shard of databases.shards) {
+          shard.beforeQuery = (event) => {
+            if (!event.sql.includes('AS source_comparison FROM compared')) return;
+            positiveQueries += 1;
+            assert.ok(!isWrite(event.sql));
+            assert.equal(event.sql, diagnosticStatement.sql);
+            assert.deepEqual(event.params, diagnosticStatement.params,
+              'the failure-only positive control must compile the exact public SQL and canonical snapshot');
+            if (scenario === 'destination-query-rejected') {
+              try { shard.database.prepare(`SELECT * FROM "${canary}"`).all(); }
+              catch (error) { throw Object.assign(error, { providerStatus: 400, providerCodes: [7500], d1FailureKind: 'http' }); }
+              assert.fail('the deliberately absent destination relation must reject');
+            }
+          };
+          shard.transformQuery = ({ sql }, rows) => scenario === 'malformed-summary'
+            && sql.includes('AS source_comparison FROM compared')
+            ? [{ ...rows[0], source_comparison: `{${canary}` }] : rows;
+        }
+      };
+      await assert.rejects(verifyNativeCopyControl(proof), (error) => {
+        assert.equal(error.nativeCopyPhase, 'retirement-diagnostic');
+        assert.equal(error.nativeCopyClass, 'assertion');
+        assert.deepEqual(error.nativeCopySourceComparison, { status: 'unavailable', reason: 'query-failed' });
+        assert.deepEqual(error.nativeCopyDiagnosticQueryFailure, {
+          phase: 'copy-source-delete-and-freeze', nativeClass: 'missing-schema', sqlReason: 'missing-schema',
+          ...(scenario !== 'invalid-evidence' ? { failureKind: 'http', httpStatus: 400, providerCodes: [7500] } : {}),
+        });
+        assert.deepEqual(error.nativeCopyDiagnosticPositiveControl, scenario === 'malformed-summary'
+          ? { outcome: 'unexpected-result' } : scenario === 'destination-query-rejected'
+            ? { outcome: 'rejected', phase: 'copy-source-delete-and-freeze', nativeClass: 'missing-schema',
+              sqlReason: 'missing-schema', failureKind: 'http', httpStatus: 400, providerCodes: [7500] }
+            : { outcome: 'verified' });
+        assert.ok(error.message.includes('diagnosticQueryFailure='));
+        assert.ok(error.message.includes('diagnosticPositiveControl='));
+        for (const value of [canary, String(diagnosticId), '61FF62', 'a\uFFFDb', 'SELECT * FROM',
+          'nativeordinaryvisible']) assert.ok(!`${error.message} ${error.stack} ${JSON.stringify(error)}`.includes(value));
+        assert.equal(error.cause, undefined);
+        return true;
+      }, 'an unavailable source comparison must remain a hard failure despite a clean destination control');
+      assert.equal(sourceQueries, 1); assert.equal(positiveQueries, 1); assert.equal(retirementAttempts, 1);
+      assert.deepEqual(blockSnapshot(adapters[0]), sourceBefore);
+      assert.deepEqual(adapters[0].rows('SELECT id, hex(CAST(text AS BLOB)) AS bytes FROM blocks'),
+        [{ id: diagnosticId, bytes: '61FF62' }]);
+      assert.deepEqual(adapters[0].rows(`SELECT state FROM ${SOURCE_FREEZE_TABLE}`), [{ state: 'frozen' }]);
+      assert.deepEqual(await readCheckpoint(adapters[1], COPY_CHECKPOINT), checkpointBefore);
+      assert.equal(adapters.slice(1).reduce((count, db) =>
+        count + db.rows('SELECT COUNT(*) AS n FROM blocks WHERE id != ?', [diagnosticId])[0].n, 0), 1509);
+      assert.deepEqual(account.snapshot(), beforeAccount);
+      assert.equal(account.created.length, 3); assert.equal(account.deleted.length, 3);
+    });
+  }
 });
 
 test('native proof actual batched BLOB slice faults retain growth source and block acknowledgment', async (context) => {
@@ -5574,6 +6167,10 @@ test('real HTTP D1 failures distinguish transport, HTTP, statement and shape wit
       await assert.rejects(db.query(canary, [canary]), (error) => {
         assert.equal(error.d1FailureKind, scenario.failure);
         assert.equal(error.d1SqlReason, 'other', 'private/unrecognized provider text cannot invent a native class');
+        assert.equal(error.providerStatus, scenario.http === 'unknown' ? undefined : scenario.http,
+          'typed HTTP evidence must use the actual response, never an envelope status field');
+        assert.deepEqual(error.providerCodes, []);
+        assert.equal(error.d1NativeSignature, undefined);
         assert.ok(error.message.includes(`failure=${scenario.failure}`));
         assert.ok(error.message.includes(`HTTP=${scenario.http}`));
         assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
