@@ -4251,13 +4251,15 @@ test('retirement aggregate preserves CAS affinity and mixed storage byte flags o
   for (const backend of ['sqlite', 'workerd']) {
     await context.test(backend, async (child) => {
       const f = backend === 'sqlite' ? await fixture(child) : await workerdFixture(child);
-      const added = [['public_untyped', ''], ['public_text', 'TEXT'], ['public_integer', 'INTEGER']];
+      const added = [['public_untyped', 'ANY'], ['public_text', 'TEXT'], ['public_integer', 'INTEGER']];
       const columns = [...BLOCK_COLUMNS, ...added.map(([name]) => name)];
       for (const db of [f.source, ...f.shards]) for (const [name, affinity] of added) {
-        await db.query(`ALTER TABLE blocks ADD COLUMN ${quoted(name)} ${affinity}`);
+        const sql = `ALTER TABLE blocks ADD COLUMN ${quoted(name)} ${affinity}`;
+        if (backend === 'sqlite') db.database.exec(sql);
+        else await db.batch([{ sql, params: [] }]);
       }
       await copyWithNativeParameters(f.args());
-      await f.shards[0].query('DELETE FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT]);
+      await f.shards[0].batch([{ sql: 'DELETE FROM index_migration_state WHERE name = ?', params: [COPY_CHECKPOINT] }]);
       const values = ['same\u0000bytes', 11, 0.1, null, 'blob\u0000bytes', 7, 'number',
         '\uFEFFsame\u0000😀"\\tail', null, 'missing', 0.3];
       const originals = values.map((value, index) => block(1100 + index, index % 2, {
@@ -4299,7 +4301,8 @@ test('retirement aggregate preserves CAS affinity and mixed storage byte flags o
         await f.source.batch([
           { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'copying' WHERE id = 1`, params: [] },
           ...[[0, null], [1, 12], [2, 0.2], [3, 'new'], [10, 0.4]].map(([index, value]) => ({
-            sql: 'UPDATE blocks SET public_untyped = ? WHERE id = ?', params: [value, originals[index].id],
+            sql: `UPDATE blocks SET public_untyped = ${index === 1 ? 'CAST(? AS INTEGER)' : '?'} WHERE id = ?`,
+            params: [value, originals[index].id],
           })),
           { sql: 'UPDATE blocks SET role = ? WHERE id = ?', params: ['', originals[0].id] },
           { sql: 'UPDATE blocks SET public_untyped = unhex(?) WHERE id = ?',
