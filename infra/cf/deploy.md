@@ -118,9 +118,11 @@ plus a conservative internal 4 KiB per-result/4 KiB outer reserve at most 1 MiB.
 Those reserves are internal policy, not a native API maximum. Actual aggregate
 result JSON must also fit 1 MiB; every statement must succeed with one full-length
 hex result. Safe origin IDs, exact offsets, length/alphabet and complete buffer
-coverage are checked before strict UTF-8 decode and full-row SHA. One known-length
-cell buffer is filled directly from hex; no truncated text or partially filled
-buffer escapes. Missing, failed, corrupt, truncated or byte-altering reordered
+coverage are checked before complete UTF-8 decoding and full-row SHA. Valid UTF-8
+is scalar canonical JSON; malformed TEXT uses the same strictly validated private
+byte tag as the copier. One known-length cell buffer is filled directly from hex;
+no truncated text or partially filled buffer escapes. Missing, failed, corrupt or
+byte-altering reordered
 native slice results must block source ACK. This changes only independent proof read batching,
 not the 16 KiB inline/256-row/128 KiB slice geometry, copier/source budgets, request
 pacing or CLI deadline. The shared
@@ -134,6 +136,22 @@ retirement. Aggregate `maxFtsParametersBytes`, `maxUnsplitFtsParametersBytes` an
 `splitFtsProbePages` describe those actual requests/pages, never terms or contents.
 Proof also requires an empty source, a complete checkpoint, the three-trigger
 frozen writer fence, and a controlled write that is positively rejected.
+A separate byte-exact recovery phase then retains those 1,509 positive destination
+rows while proving a twelve-row public fixture: a three-row retired prefix, three
+legacy verified pending rows (two lossy TEXT cells), two malformed long TEXT cells
+(300,000 and 1,900,000 bytes), and malformed short values in the other TEXT columns.
+It proves the legacy reader's hashes first, observes one durable `recovering`
+checkpoint before repair, retains the prefix chain, and checks exact storage bytes,
+full-row digests and independent raw-token/old-lossy-token FTS results. After long
+readback, a one-byte mutation with the same lossy rendering must trigger the
+unchanged malformed-JSON CAS assertion; source, destination, freeze and verified
+checkpoint remain intact, with no subsequent writes. A stale rerun must reject
+before any write, and restoring the original public fixture byte must complete.
+The `byteExactRecovery` summary contains only aggregate counts, byte/request maxima,
+encoding, digests and the allowlisted guard result. An unrelated failure, malformed
+raw transport, false aggregate or unavailable diagnostic is a failed proof, never
+a green retained-data “negative control.”
+
 The CLI contract's failure diagnostics read complete appended events before fixture
 cleanup and expose only aggregate counts/byte maxima and an allowlisted last-query
 kind. `traceState` is `complete`, `truncated` for an ignored partial final NDJSON
@@ -390,12 +408,39 @@ The one-time cutover runs these operations in order, from the same checked-out m
    writers instead of relying on a longer blind wait.
 6. `index-control.mjs copy`: keyset-read pages bounded by roughly 1 MiB of serialized
    data and at most 2,048 rows; route each session with the shared UTF-8 FNV layout;
-   preserve every block column, ID, numeric value and `NULL`. Large values travel in
-   bounded hexadecimal byte slices and are decoded in full, preserving embedded NULs
-   and leading UTF-8 BOM characters rather than shortening or normalizing them. A single
-   oversized row uses individual value bindings instead of a too-large JSON scalar.
-   Ordinary shard replacement is one atomic four-statement JSON1 batch, not per-row
-   HTTP requests. Each populated shard's MATCH verification reuses one fixed JSON1
+   preserve every block column, ID, numeric value, SQLite storage class and `NULL`.
+   **Every TEXT column**, not just transcript `text`, is read as its original BLOB
+   bytes over ASCII hexadecimal transport, including short values. Longer cells use
+   131,072-byte raw slices; concatenate all slices before fatal UTF-8 decoding, so a
+   valid multibyte sequence crossing a slice boundary is not misclassified. Valid
+   UTF-8 retains the existing scalar canonical JSON/hash, including NULs and BOMs.
+   Malformed UTF-8 TEXT is an explicit, validated private `{x: lowercase-even-hex}`
+   canonical value; empty, valid-UTF-8, extra-key or noncanonical tags are refused.
+   Reconstruction uses `unhex` and `CAST(... AS TEXT)`, not replacement characters.
+   Oversized rows reconstruct TEXT from ordered 32,768-byte chunks (65,536 hex
+   characters per bind), with at most 100 binds, 100,000 SQL bytes and a 4 MiB
+   encoded write request. Each cell is at most 2,000,000 original bytes. Multiple
+   large columns must also fit those row/request limits; exceeding one fails closed
+   before any source retirement. These are bounded transport policies, not a promise
+   that every D1 REST deployment accepts the maximum; disposable native REST proof
+   is separate from local SQLite/workerd proof. The existing 100-column ceiling is
+   unchanged. REST response sizing includes hex expansion and column/marker keys.
+   INTEGER/REAL reconstruction is explicitly typed, even for integral REALs in
+   affinity-free columns. Raw tags never route a session or enter catalog builders:
+   malformed UTF-8 identities/catalog strings and empty identity keys fail closed.
+   Nonempty valid UTF-8 session IDs retain their original UTF-8 hash/routing
+   contract, including NUL/C0/DEL; migration does not add an ingestion allowlist.
+   Turn keys are owner-annotation keys, not routing IDs. Valid existing keys retain
+   those same characters (and BOM/non-ASCII bytes) exactly through catalog seed and
+   reconciliation; the viewer already accepts nonempty keys up to 1024 code units.
+   Ordinary shard replacement is one atomic four-statement JSON1 batch per bounded
+   typed-JSON transport group, not per-row HTTP requests. Private REAL wrappers can
+   outgrow an otherwise valid canonical page (for example, after malformed TEXT
+   expands into its private byte tag). Only transport groups split: original row
+   digests, durable pending identities/cursor and full-page retirement hash chaining
+   are unchanged, including when resuming an existing copying/verified checkpoint
+   or repairing a validated legacy checkpoint. No overflow row is skipped.
+   Each populated shard's MATCH verification reuses one fixed JSON1
    query with one JSON bind per byte-bounded group of `[quoted token, id]` probes.
    The complete serialized parameters envelope, including JSON escaping, brackets,
    quotes and commas, must be at most `COPY_PAGE_BYTES` (1 MiB). Each pair is encoded
@@ -414,20 +459,30 @@ The one-time cutover runs these operations in order, from the same checked-out m
    2,000,000 bytes ([D1 limits](https://developers.cloudflare.com/d1/platform/limits/)).
    Probe terms come from one scoped, reusable in-memory native SQLite FTS index, cloned
    from the actual destination `sqlite_master` FTS declaration. `fts5vocab` instance
-   offset zero supplies the first real indexed term as raw BLOB bytes. Strict UTF-8
-   decoding preserves a BOM rather than silently dropping it or replacing malformed bytes.
-   Only a trailing partial UTF-8 sequence may be completed, and native byte identity
-   plus a local original-row MATCH must verify the candidate before the unchanged
-   destination MATCH. There is no JavaScript Unicode-category approximation, separate
-   tokenizer configuration, source-text clipping, skipped word or later-term fallback.
+   offset zero supplies the first real indexed term as raw BLOB bytes. The oracle
+   receives the **original stored TEXT bytes** via a BLOB-to-TEXT cast, including
+   malformed UTF-8; it never tokenizes a lossy JavaScript rendering. A malformed
+   native term travels as a byte-quoted phrase reconstructed inside SQLite MATCH.
+   For valid UTF-8 text only, a trailing partial native term may be completed;
+   native term-byte identity plus a local original-row MATCH verifies that candidate.
+   There is no JavaScript Unicode-category approximation, separate tokenizer
+   configuration, source-text clipping, skipped word or later-term fallback.
    Truly tokenless rows require a negative MATCH result, while modern emoji that
    unicode61 indexes require a positive posting just like every other native term.
 7. For every page, compare SHA-256 canonical full-row readback and exercise every
    real FTS `MATCH` probe group. Only after ALL groups pass, persist the verified page
    checkpoint on `IDX00` **before** deleting its source rows. Each source `DELETE`
-   compares **every** column with the verified
-   full-row snapshot using null-safe `IS` predicates; comparison and deletion run in
-   one main D1 transaction. A late changed row is retained and stops cursor advancement.
+   compares **every** column with the verified full-row snapshot using null-safe
+   `IS`, exact storage-class equality, and BLOB equality for TEXT (independent of
+   column collation). The JSON snapshot's private raw tags are reconstructed as
+   TEXT before comparison, never compared as objects or replacement strings.
+   Comparison and deletion run in one main D1 transaction. A late changed byte,
+   including one with an identical lossy rendering, is retained and stops advancement.
+   Typed-JSON CAS groups remain in **one atomic native source batch** with the
+   original full pending-page empty assertion and freeze transition; they are not
+   independently acknowledged or dispatched as separate retirement transactions.
+   A changed row in a later group rolls back earlier group deletions too. The
+   unchanged 4 MiB whole-request bound is checked before dispatching that batch.
    No main schema change or migration-ledger write precedes this proof. The first
    verified deletion and installation of `index_migration_freeze` plus three standard
    blocks write triggers share that **same transaction**. Its committed state is
@@ -479,10 +534,13 @@ checkpoint or accepted as a compatibility format.
 `full-fidelity-index-catalog-v1`, `index-maintenance-freeze-v1`, the current
 `index-rest-batch-atomicity-v1`, and READY/ACTIVATION proofs. The copy records the
 immutable source/shard IDs, complete column list, acknowledged ID cursor, verified row
-count, chained SHA-256 audit digest, and pending per-row hashes. A lost source-delete
-response is safe: a pending verified page is read back again and only remaining source
-rows are deleted. An unverified missing row, changed layout/column list, failed SHA,
-failed MATCH, or changed deployed revision stops the job without authorizing deletion.
+count, chained SHA-256 audit digest, and pending per-row hashes. New snapshots name
+`encoding: "sqlite-text-bytes-v1"` and retain per-row storage-class proof separately
+from the canonical row hash. A lost source-delete response is safe: re-read and
+verify the exact destination and physical FTS, require the durable frozen barrier,
+then acknowledge an entirely absent source page without replaying its DELETE.
+Partial absence, an unverified missing row, changed layout/column list, failed SHA,
+failed MATCH, or changed deployed revision stops without authorizing deletion.
 If the first exact-delete transaction fails because an old HTTP writer changed its
 snapshot, that attempt stops without advancing. A later protected attempt may
 discard/replan just that unacknowledged pending page only when its source rows really
@@ -494,6 +552,41 @@ requests can still complete; the full catalog seed then drains all captured outb
 versions, including changes behind its saved scan cursor, with readback before ack.
 Database-bound migration journals are useful per-run evidence; the durable shard
 checkpoint and D1 migration/checksum ledgers, not runner-temporary files, carry recovery.
+
+An absent copy `encoding` is accepted only by the explicit one-time legacy
+checkpoint upgrade, not by a general alternate-reader fallback. Before changing a
+legacy `copying`/`verified` pending proof, re-run the actual old bounded reader
+(including its original inline thresholds and fatal long-value decoder) on source
+and existing destination and prove the old per-row hashes. Existing destination
+replicas must also match those hashes under the new exact reader and pass physical
+FTS verification. A copying page may have wholly absent, uncommitted shard replicas;
+a verified page may not. An entirely absent verified source page is accepted only
+with the frozen old atomic-delete barrier and an exact unchanged destination proof;
+a partially absent page is refused.
+
+Only then persist the explicit `recovering` page, its original legacy rows,
+exact target hashes/storage classes, and exact destination baselines **before**
+correcting any destination cell. Resume accepts only the original destination
+baseline or the already-completed exact target; an exact repair is verified, not
+replayed. Recheck source bytes, correct only proven differing replicas, verify
+full raw rows and native raw-token FTS, and checkpoint `verified` before the ordinary
+exact CAS retirement. Every recovery checkpoint/write/delete boundary is resumable.
+The acknowledged cursor, row count and existing retired-prefix SHA chain are never
+reset or rehashed; only the recovered pending page adds its new canonical hashes
+through the normal chain step. Unknown encodings, malformed recovery records and
+foreign database identities fail closed before repair writes. Already-complete
+legacy checkpoints remain bound to their original proof snapshot; their successful
+old CAS is not replaced by a rewritten historical digest.
+
+The legacy hash proves only the old reader's representation: two malformed byte
+sequences can have the same lossy rendering. It cannot prove historical invalid
+bytes that were never recorded. Recovery preserves the current frozen authoritative
+source bytes and proves them exactly through new readback and CAS; it does not
+claim to reconstruct a vanished earlier byte sequence. The observed production
+comparison (420 present, zero missing, two byte/length-different TEXT cells) is
+concrete byte-loss evidence, not disclosure of those private bytes or by itself a
+definitive claim that their original encoding was invalid UTF-8.
+
 
 D1 copy failures emit only the configured database UUID, `query`/`batch` kind,
 validated numeric HTTP status/provider codes, statement/parameter counts, encoded
@@ -539,7 +632,7 @@ snapshot**, never against a new copy or a replayed source batch. Its additional 
 reports `clean`, `mismatch`, `missing`, `mismatch-and-missing`, or `unavailable`;
 present/missing/mismatching row counts; static zero-based column indexes; allowlisted
 SQLite storage-type classes; and counts of type, BLOB-byte and byte-length inequality
-on mismatched columns. SQL-equal INTEGER/REAL values are not reported as CAS misses.
+on mismatched columns. INTEGER/REAL storage-class changes are also exact CAS misses.
 No IDs, column names, scalar values, text, search terms, SQL, parameters or native
 diagnostic errors are emitted. The query is skipped with `unavailable/request-budget`
 when its fully JSON-encoded request would exceed the existing 1 MiB copy budget, or
@@ -553,19 +646,14 @@ statement and fully encoded request caps are checked before the diagnostic query
 The comparison uses a controlled numeric column-index relation and one source
 LEFT JOIN to form narrow cell rows. Per-column grouped counters use only two
 DISTINCT type-mask aggregates, while per-row flags count a row only once even if
-several columns differ. Equality retains each original `b.column IS copied`
-predicate inside its CASE, preserving SQLite column affinity; stored-value CASE
-results are used only for storage-type and BLOB-byte/length flags. The nested
-numeric summary and public diagnostic object are unchanged. This is a query-shape
-compatibility candidate, not a confirmed explanation of an earlier native rejection
-or the protected production source-retirement failure.
-
-Column cells and their containing groups use explicit aggregate ORDER BY clauses,
-not incidental GROUP BY sorter order. Public native SQLite and workerd controls
-verify the nested numeric encoding, mixed storage-type masks, affinity-equal cells,
-and distinct mismatch counts across a 100-column layout. Native Cloudflare
-acceptance remains a separate protected control; local semantic equivalence alone
-does not identify the cause of a remote rejection.
+several columns differ. Stored and reconstructed values retain their storage class;
+the same exact type/value/TEXT-byte predicate as retirement defines a mismatch,
+so a column collation or a CASE's missing affinity cannot hide a physical change.
+Column cells and containing groups use explicit aggregate ORDER BY clauses rather
+than incidental GROUP BY sorter order. Public SQLite/workerd controls exercise
+raw bytes, type masks and distinct counts. Native Cloudflare acceptance remains a
+separate protected control; local semantic equivalence alone neither diagnoses nor
+repairs a remote rejection.
 
 “One comparison” means one logical read-only SQL query. The existing REST client
 may replay that query after an unambiguous HTTP 429 with a validated `Retry-After`,
@@ -574,29 +662,35 @@ source retirement batch. Diagnostic retry or budget exhaustion makes the diagnos
 unavailable; the original hard retirement error is still thrown, not replaced by
 the diagnostic failure or converted into a partial-copy exit 78.
 
-The disposable native copy control also records a rejected diagnostic query using
-the shared allowlisted SQL class and optional fixed native subtype, validated
-actual HTTP status (100–599), and at most 16 nonnegative safe-integer provider
-codes. Unknown or conflicting subtype tokens are omitted; neither native messages
-nor provider payloads are retained. These labels describe recognized tokens, not
-a production-cause conclusion. On that source-query failure only, the control
-executes the identical aggregate SQL and canonical snapshot against its already
-verified disposable destination. It reports a clean result or a bounded rejection/
-unexpected-result outcome, without retrying the source query. Even a clean
-destination control cannot authorize source deletion or turn the original failed
-proof into success; the source, freeze and verified checkpoint remain retained.
+The disposable native copy control now requires affirmative byte-exact recovery,
+including exact full-row/destination proof and native raw-token FTS, rather than
+accepting a lossy copied page plus a rejected retirement as successful recovery.
+Its deliberately late, equal-length byte mutation must yield one bounded mismatch
+comparison and preserve all four source/destination/freeze/checkpoint fences. An
+unavailable or false comparison fails the proof; a destination compile control is
+not an alternate oracle or permission to turn that failure into success.
 
-This observation does not identify the original failing statement or authorize
-source writes, ACK, checkpoint advance, or a semantic batch retry. A clean current comparison does
-not prove a failed batch committed or that its earlier comparison was clean; a
-missing row can also follow an ambiguous transport failure. The source fence and
-full-column deletion predicate remain unchanged. Public native SQLite/workerd
-controls reproduce the intentional malformed-JSON assertion for a changed source,
-while unchanged valid-UTF-8 pages with the protected 5-statement/3-parameter request
-geometry pass. Invalid-UTF-8 SQLite TEXT is a separate public transport counterexample:
-a short native TEXT read may replace raw bytes before JavaScript verification while
-the SQL CAS still sees the original bytes. Neither that counterexample nor these
-aggregate diagnostics establishes the private production cause or repairs it.
+The control is paced, not CPU-bound. Timestamped local controller/stub runs measured
+328 Cloudflare requests in 104 s for `359f3e2` (252 positive, 76 old diagnostic) and
+631 in 197 s for the byte-exact helper (260 positive, 371 recovery). Of the latter
+371, 320 were `/query`; the rest were registry/identity gate checks and cleanup.
+627 of 630 inter-request gaps were 295–340 ms, with none above 400 ms in recovery,
+consistent with the controller's unchanged shared 300 ms Cloudflare pacer. The
+native-only deployment test therefore caps total HTTP requests at 700 and recovery
+queries at 360, and derives its spawn deadline as `700 × 300 ms + 30 s = 240 s`.
+Its former 120 s harness deadline was below the roughly 190 s paced floor; this is
+not a production timeout/pacer change or removal of proof controls. Expect about
+3.2 minutes plus real HTTP latency for the native-copy proof. These are local stub
+timings, not real D1 REST long-cell acceptance or production recovery evidence.
+
+
+A failure-only comparison does not identify the original failing statement or
+authorize source writes, ACK, checkpoint advance, or a semantic batch retry. A clean
+current comparison cannot prove a failed batch committed or that its earlier
+comparison was clean. Local malformed-TEXT counterexamples demonstrate the legacy
+reader's possible loss; neither they nor aggregate diagnostics disclose private
+production bytes or establish their original encoding. Recovery must independently
+complete through the current raw source, exact readback, FTS and CAS.
 
 The former FTS verifier joined up to 48 row-scoped SELECTs with `UNION ALL`.
 Keeping each such statement at 96 binds did not make its compound-select grammar
@@ -626,6 +720,19 @@ Source paging remains at most 2,048 rows and roughly 1 MiB, with full-column SHA
 source comparison and writer fencing unchanged. Local workerd evidence is not
 real PPE D1 REST proof or production recovery evidence; those require their own
 isolated native-copy CI run and protected production observation, respectively.
+
+The byte-exact regression controls use the same `INDEX_COPY_MODULE_PATH` seam with
+the pre-upgrade `359f3e2` module. Run the `byte-exact` named cases against that exact
+historical file and against the current module; the native 420-row legacy-pending
+case must reach the original loss/retirement failure under the old core rather
+than merely fail an import. The cases include all TEXT columns, sliced malformed
+values, independent raw-token FTS, unchanged valid scalar hashes, preserved retired
+prefixes, durable recovery/write/delete crash boundaries and tamper/encoding guards.
+Raw hex response subpages are independently bounded without shrinking logical copy
+pages or avoiding the existing fold-growth FTS grouping controls. Remove the
+temporary historical sibling after comparison. No historical module or public
+scratch fixture is a production reader fallback.
+
 
 Native folding can increase probe UTF-8 bytes beyond the source page's serialized
 size. A prior controlled local workerd case accepted a 1,508,093-byte unsplit

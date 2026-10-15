@@ -5,10 +5,10 @@ import {
 } from './preview-trust.mjs';
 import {
   COPY_CHECKPOINT, COPY_INVARIANTS, COPY_PAGE_BYTES, COPY_PAGE_ROWS, COPY_PHASES, SOURCE_FREEZE_TABLE, canonicalRow,
-  copyFrozenIndex, readCheckpoint,
+  copyFrozenIndex, readCheckpoint, writeCheckpoint,
 } from '../../hub/scripts/lib/index-migration.mjs';
 import { BLOCK_COLUMNS, INDEX_ID_SPAN, indexShardForSessionId } from '../../hub/src/index-layout.mjs';
-import { D1_FAILURE_KINDS, D1_NATIVE_FAILURE_SIGNATURES, D1_SQL_FAILURE_REASONS } from './d1-batch-atomicity.mjs';
+import { D1_FAILURE_KINDS, D1_SQL_FAILURE_REASONS } from './d1-batch-atomicity.mjs';
 
 const copyPhases = Object.freeze(Object.values(COPY_PHASES));
 const copyInvariants = Object.freeze(Object.values(COPY_INVARIANTS));
@@ -41,21 +41,6 @@ function safeFailure(error, phase) {
   return new NativeCopyControlError(copyPhases.includes(error?.d1Phase) ? error.d1Phase : phase,
     invariant ? 'assertion' : D1_SQL_FAILURE_REASONS.includes(error?.d1SqlReason) ? error.d1SqlReason : 'other',
     { invariant, failureKind: D1_FAILURE_KINDS.includes(error?.d1FailureKind) ? error.d1FailureKind : undefined });
-}
-
-function queryFailureMetadata(error) {
-  const safe = safeFailure(error, COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
-  return {
-    phase: safe.nativeCopyPhase, nativeClass: safe.nativeCopyClass,
-    ...(D1_SQL_FAILURE_REASONS.includes(error?.d1SqlReason) ? { sqlReason: error.d1SqlReason } : {}),
-    ...(D1_NATIVE_FAILURE_SIGNATURES.includes(error?.d1NativeSignature) ? { nativeSignature: error.d1NativeSignature } : {}),
-    ...(D1_FAILURE_KINDS.includes(error?.d1FailureKind) ? { failureKind: error.d1FailureKind } : {}),
-    ...(Number.isInteger(error?.providerStatus) && error.providerStatus >= 100 && error.providerStatus <= 599
-      ? { httpStatus: error.providerStatus } : {}),
-    ...(Array.isArray(error?.providerCodes) && error.providerCodes.length <= 16
-      && error.providerCodes.every((code) => Number.isSafeInteger(code) && code >= 0)
-      ? { providerCodes: [...error.providerCodes] } : {}),
-  };
 }
 
 function ownedIdentity(database, pr, names) {
@@ -143,7 +128,21 @@ export async function withScratchD1Databases({ api, pr, nonce = randomBytes(12).
 
 const quote = (column) => `"${column.replaceAll('"', '""')}"`;
 const sha256 = (value) => createHash('sha256').update(value).digest('hex');
-const rowsSha256 = (rows) => sha256(`[${rows.map((row) => canonicalRow(BLOCK_COLUMNS, row)).join(',')}]`);
+// Independent of the copier under test: the contract's canonical row is the JSON
+// array of column values, with malformed TEXT as its exact {x} byte tag.
+function canonical(row) {
+  requireProof(BLOCK_COLUMNS.every((column) => Object.hasOwn(row, column)), 'canonical');
+  return JSON.stringify(BLOCK_COLUMNS.map((column) => row[column]));
+}
+const rowsSha256 = (rows) => sha256(`[${rows.map(canonical).join(',')}]`);
+const STRICT_UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+const LOSSY_UTF8 = new TextDecoder('utf-8', { ignoreBOM: true });
+// The copy contract's only representation of stored malformed TEXT: its exact
+// lowercase bytes. Valid TEXT, including BOM/NUL, stays an ordinary string.
+function storedText(bytes) {
+  try { return STRICT_UTF8.decode(bytes); } catch { return { x: bytes.toString('hex') }; }
+}
+const storedBytes = (value) => (typeof value === 'string' ? Buffer.from(value) : Buffer.from(value.x, 'hex'));
 const INSERT_BLOCK = `INSERT INTO blocks (${BLOCK_COLUMNS.map(quote).join(',')}) VALUES (${BLOCK_COLUMNS.map(() => '?').join(',')})`;
 const blockStatement = (row) => ({ sql: INSERT_BLOCK, params: BLOCK_COLUMNS.map((column) => row[column]) });
 const DENSE_ROWS = 1461;
@@ -282,13 +281,12 @@ async function readLongCells(db, cells, phase) {
   if (statements.length) await flush();
   for (const { row, column, length, bytes, written } of cells) {
     requireProof(written === length, phase);
-    try { row[column] = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes); }
-    catch { reject(phase); }
+    row[column] = storedText(bytes);
   }
 }
 
 /** Independent native readback: TEXT is hex transported, long TEXT in bounded BLOB slices. */
-async function readRows(db, phase) {
+async function readRows(db, phase, { after: start = -1, before = INDEX_ID_SPAN } = {}) {
   const selectors = BLOCK_COLUMNS.flatMap((column, index) => {
     const name = quote(column);
     return [
@@ -298,10 +296,10 @@ async function readRows(db, phase) {
     ];
   });
   const rows = [];
-  let after = -1;
+  let after = start;
   for (;;) {
-    const result = await db.query(`SELECT ${selectors.join(',')} FROM blocks WHERE id > CAST(? AS INTEGER) ORDER BY id LIMIT ?`,
-      [after, READBACK_PAGE_ROWS]);
+    const result = await db.query(`SELECT ${selectors.join(',')} FROM blocks
+      WHERE id > CAST(? AS INTEGER) AND id < CAST(? AS INTEGER) ORDER BY id LIMIT ?`, [after, before, READBACK_PAGE_ROWS]);
     requireProof(result.length <= READBACK_PAGE_ROWS, phase);
     const longCells = [];
     for (const encoded of result) {
@@ -326,7 +324,7 @@ async function readRows(db, phase) {
           longCells.push({ row, column, length, bytes: Buffer.allocUnsafe(length), written: 0 });
           continue;
         }
-        row[column] = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+        row[column] = storedText(bytes);
       }
       rows.push(row);
       after = row.id;
@@ -368,200 +366,522 @@ async function assertFrozen(source) {
   requireProof(rows.length === 1 && rows[0].id === 1 && rows[0].state === 'frozen', 'source-fence');
 }
 
-// Run only after the complete public positive proof, reusing its owned scratch
-// databases. Raw invalid TEXT never crosses the REST response or public output:
-// only the copier itself attempts that transport; retention uses SQL hex().
-async function proveNativeRetirementDiagnostic({ source, shards, gate, ordinary, expected }) {
-  const phase = 'retirement-diagnostic';
-  const probe = { ...ordinary, id: INDEX_ID_SPAN - 2, text: 'nativeinvalidtext' };
-  requireProof(!expected.some((row) => row.id === probe.id), phase);
+// ---- Byte-exact malformed TEXT copy and one-time legacy checkpoint recovery ----
+// Runs only after the complete positive proof, on the same owned scratch
+// databases. Every fixture byte is public and synthetic. Malformed TEXT is
+// written and read back only as SQL hex; public output is counts and digests.
+const RECOVERY_BASE_ID = 2_000_000;
+const RECOVERY_SPAN = 1_000;
+const TRUNCATED_EMOJI = [0xf0, 0x9f, 0x98];
+const GUARD_UNIT = 40;
+const fixtureBytes = (...parts) => Buffer.concat(parts.map((part) => Buffer.from(part)));
+const MATCH_RAW = 'SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH CAST(unhex(?) AS TEXT) AND rowid = CAST(? AS INTEGER)';
+
+function recoveryRow(offset, shard, cells) {
+  const id = RECOVERY_BASE_ID + offset;
+  return {
+    id, session_id: fixtureBytes(sessionOn(shard)), file_id: id, turn_index: 0, block_index: offset,
+    role: null, btype: fixtureBytes('text'), tool_name: null, ts: null, byte_start: 0, byte_len: 0, truncated: 0,
+    text: null, on_main_path: 1, row_hash: id, media_byte_start: null, media_byte_len: 0, media_type: fixtureBytes(''),
+    ...cells,
+  };
+}
+
+// Long malformed TEXT is grown natively from one bounded unit, then framed by
+// its exact head/tail; no request carries the whole cell during seeding.
+function longRecoveryRow({ offset, shard, total, unit, head, tail }) {
+  const bodyLength = total - head.length - tail.length;
+  let doublings = 0;
+  while (unit * 2 ** doublings < bodyLength) doublings += 1;
+  const pattern = Buffer.alloc(unit, 0x20);
+  pattern[unit - 1] = 0xff;
+  const body = Buffer.alloc(unit * 2 ** doublings);
+  for (let at = 0; at < body.length; at += unit) pattern.copy(body, at);
+  const row = recoveryRow(offset, shard, { text: Buffer.concat([head, body.subarray(0, bodyLength), tail]) });
+  return { row, head, tail, unit, pattern, doublings, bodyLength };
+}
+
+function recoveryFixtures() {
+  const prefix = [1, 2, 3].map((k) => recoveryRow(k, k % 2, { text: fixtureBytes(`nativeprefixretired${k}`) }));
+  const legacy = [
+    recoveryRow(10, 0, { tool_name: fixtureBytes('tool-α'), text: fixtureBytes('\ufeffnativelegacyvalid café e\u0301', [0], ' x') }),
+    recoveryRow(11, 1, { text: fixtureBytes('nivsa', TRUNCATED_EMOJI, 'nivsb nativelegacyshort ', [0xff], ' end') }),
+    recoveryRow(12, 0, { tool_name: fixtureBytes('tool', [0xff], 'x'), text: fixtureBytes('nativelegacytool') }),
+  ];
+  const long = [
+    longRecoveryRow({ offset: 20, shard: 1, total: 300_000, unit: 4096,
+      head: fixtureBytes('\ufeffnivla', TRUNCATED_EMOJI, 'nivlb nativelonginvalidhead ', [0xed, 0xa0, 0x80], ' ', [0], ' '),
+      tail: fixtureBytes(' nativelonginvalidtail ', TRUNCATED_EMOJI) }),
+    // Near the bounded 2,000,000-byte cell cap: its copy is a ~3.8 MB chunked request.
+    longRecoveryRow({ offset: 21, shard: 0, total: 1_900_000, unit: 3750,
+      head: fixtureBytes('nivma', TRUNCATED_EMOJI, 'nivmb nativemaxinvalidhead ', [0xc0, 0x80], ' '),
+      tail: fixtureBytes(' nativemaxinvalidtail ', [0xff]) }),
+  ];
+  const short = [
+    recoveryRow(30, 0, { role: fixtureBytes('assistant', [0xc0, 0x80]), text: fixtureBytes('nativeshortrole') }),
+    recoveryRow(31, 1, { btype: fixtureBytes('text', [0xed, 0xa0, 0x80]), ts: fixtureBytes('2026-10-14', [0xfe]),
+      text: fixtureBytes('nativeshortbtype') }),
+    recoveryRow(32, 0, { media_type: fixtureBytes('image/', [0xff]),
+      text: fixtureBytes('\ufeffnivsc', [0xe4, 0xb8], 'nivsd ', [0x80, 0], ' nativeshortmedia') }),
+    recoveryRow(33, 1, { tool_name: fixtureBytes(TRUNCATED_EMOJI), text: fixtureBytes([0xff]) }),
+  ];
+  const [guarded] = long;
+  const guard = { row: guarded.row, offset: guarded.head.length + GUARD_UNIT * guarded.unit + guarded.unit - 1 };
+  requireProof(guard.offset > 131_072 && guard.row.text[guard.offset] === 0xff, 'byte-exact-fixture');
+  // Truncated F0 9F 98 reads as one letter inside a raw-byte FTS token but as a
+  // separator in its lossy rendering, so raw and lossy terms are disjoint.
+  const fts = [
+    { row: legacy[1], region: legacy[1].text, raw: fixtureBytes('nivsa', TRUNCATED_EMOJI, 'nivsb'),
+      valid: 'nivsa\u07d8nivsb', lossy: ['nivsa', 'nivsb'], common: ['nativelegacyshort'] },
+    { row: long[0].row, region: long[0].head, raw: fixtureBytes('nivla', TRUNCATED_EMOJI, 'nivlb'),
+      valid: 'nivla\u07d8nivlb', lossy: ['nivla', 'nivlb'], common: ['nativelonginvalidhead', 'nativelonginvalidtail'] },
+    { row: long[1].row, region: long[1].head, raw: fixtureBytes('nivma', TRUNCATED_EMOJI, 'nivmb'),
+      valid: 'nivma\u07d8nivmb', lossy: ['nivma', 'nivmb'], common: ['nativemaxinvalidhead', 'nativemaxinvalidtail'] },
+    { row: short[2], region: short[2].text, raw: fixtureBytes('nivsc', [0xe4, 0xb8], 'nivsd'),
+      lossy: ['nivsc', 'nivsd'], common: ['nativeshortmedia'] },
+  ].map((item, index) => ({ ...item, controlId: RECOVERY_BASE_ID + 100 + index, control: LOSSY_UTF8.decode(item.region) }));
+  requireProof(fts.every((item) => item.control.includes('\ufffd')), 'byte-exact-fixture');
+  const words = [
+    ...prefix.map((row) => [row, row.text.toString()]),
+    [legacy[0], 'nativelegacyvalid'], [legacy[2], 'nativelegacytool'], [short[0], 'nativeshortrole'], [short[1], 'nativeshortbtype'],
+  ];
+  return { prefix, legacy, long, short, guard, fts, words };
+}
+
+function exactInsert(row, override = {}) {
+  const params = [];
+  const values = BLOCK_COLUMNS.map((column) => {
+    const value = Object.hasOwn(override, column) ? override[column] : row[column];
+    if (!Buffer.isBuffer(value)) {
+      params.push(value);
+      return '?';
+    }
+    if (!value.length) return "''";
+    params.push(value.toString('hex'));
+    return 'CAST(unhex(?) AS TEXT)';
+  });
+  return { sql: `INSERT INTO blocks (${BLOCK_COLUMNS.map(quote).join(',')}) VALUES (${values.join(',')})`, params };
+}
+
+// Independent native FTS oracle: each byte-exact phrase is reconstructed by
+// SQLite from hex, so its tokens are derived from exact stored bytes.
+async function ftsProbes(db, probes, phase) {
+  const statements = probes.map(({ term, rowid }) => {
+    const bytes = Buffer.from(term);
+    requireProof(bytes.length > 0 && !bytes.includes(0x22), phase);
+    return { sql: MATCH_RAW, params: [fixtureBytes('"', bytes, '"').toString('hex'), rowid] };
+  });
+  requireProof(Buffer.byteLength(JSON.stringify({ batch: statements })) <= COPY_PAGE_BYTES, phase);
+  const results = await db.batch(statements);
+  requireProof(Array.isArray(results) && results.length === probes.length, phase);
+  for (const [index, { rowid, hit }] of probes.entries()) {
+    const rows = results[index]?.results;
+    requireProof(results[index]?.success === true && Array.isArray(rows) && rows.length === Number(hit)
+      && rows.every((row) => row.rowid === rowid), phase);
+  }
+  return probes.length;
+}
+
+// Only validated aggregate vocabulary/counts may escape on a failed proof.
+function measuredComparison(actual) {
+  const count = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 1;
+  const types = ['null', 'integer', 'real', 'text', 'blob'];
+  const safeTypes = (values) => Array.isArray(values) && values.length <= types.length
+    && values.every((value) => types.includes(value)) && new Set(values).size === values.length;
+  if (actual?.status === 'unavailable'
+    && ['canonical-budget', 'request-budget', 'query-failed', 'response-shape'].includes(actual.reason)) {
+    return { status: 'unavailable', reason: actual.reason };
+  }
+  if (['clean', 'mismatch', 'missing', 'mismatch-and-missing'].includes(actual?.status)
+    && ['expectedRows', 'presentRows', 'missingRows', 'mismatchingRows'].every((key) => count(actual[key]))
+    && Array.isArray(actual.columns) && actual.columns.length <= BLOCK_COLUMNS.length
+    && actual.columns.every((column) => Number.isSafeInteger(column?.index)
+      && column.index >= 0 && column.index < BLOCK_COLUMNS.length
+      && ['mismatchingRows', 'typeMismatchRows', 'byteMismatchRows', 'lengthMismatchRows'].every((key) => count(column[key]))
+      && safeTypes(column.sourceTypes) && safeTypes(column.snapshotTypes))) {
+    return { status: actual.status, expectedRows: actual.expectedRows, presentRows: actual.presentRows,
+      missingRows: actual.missingRows, mismatchingRows: actual.mismatchingRows,
+      columns: actual.columns.map((column) => ({
+        index: column.index, mismatchingRows: column.mismatchingRows, typeMismatchRows: column.typeMismatchRows,
+        byteMismatchRows: column.byteMismatchRows, lengthMismatchRows: column.lengthMismatchRows,
+        sourceTypes: [...column.sourceTypes], snapshotTypes: [...column.snapshotTypes],
+      })) };
+  }
+  return undefined;
+}
+
+// The legacy checkpoint is lossy: its pending hashes came from the old reader's
+// rendering of malformed TEXT, and those bytes are not recoverable from it. The
+// copier must prove that rendering from the still-frozen authoritative source,
+// then copy and CAS-retire the source's exact bytes, retaining the prefix chain.
+async function proveByteExactRecovery({ source, shards, gate, positive, positiveRows }) {
+  let phase = 'byte-exact-seed';
+  // First statement of this phase; the deployment harness uses it as the marker.
   const decoded = await source.query("SELECT hex(unhex('61FF62')) AS bytes");
   requireProof(decoded.length === 1 && decoded[0].bytes === '61FF62', phase);
-  // Only this disposable copy checkpoint is reset; no catalog/activation state
-  // and no destination rows from the 1,509-row proof are removed.
-  await shards[0].query('DELETE FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT]);
-  requireProof(await readCheckpoint(shards[0], COPY_CHECKPOINT) === null, phase);
-  const textIndex = BLOCK_COLUMNS.indexOf('text');
-  await source.batch([
-    { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'copying' WHERE id = 1`, params: [] },
-    {
-      sql: `INSERT INTO blocks (${BLOCK_COLUMNS.map(quote).join(',')})
-        VALUES (${BLOCK_COLUMNS.map((_, index) => index === textIndex ? "CAST(X'61FF62' AS TEXT)" : '?').join(',')})`,
-      params: BLOCK_COLUMNS.filter((_, index) => index !== textIndex).map((column) => probe[column]),
-    },
-    { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'frozen' WHERE id = 1`, params: [] },
-  ]);
-  const rawSource = () => source.query(
-    'SELECT id, typeof(text) AS storage_type, hex(CAST(text AS BLOB)) AS bytes FROM blocks ORDER BY id');
-  const before = await rawSource();
-  requireProof(before.length === 1 && before[0].id === probe.id
-    && before[0].storage_type === 'text' && before[0].bytes === '61FF62', phase);
+  requireProof(positive?.state === 'complete' && positive.identity, phase);
+  const { prefix, legacy, long, short, guard, fts, words } = recoveryFixtures();
+  const longRows = long.map(({ row }) => row);
+  const pendingRows = [...legacy, ...longRows, ...short];
+  const allRows = [...prefix, ...pendingRows];
+  const fixtureById = new Map(allRows.map((row) => [row.id, row]));
+  const exactRow = (row) => Object.fromEntries(BLOCK_COLUMNS.map((column) =>
+    [column, Buffer.isBuffer(row[column]) ? storedText(row[column]) : row[column]]));
+  const exactById = new Map(allRows.map((row) => [row.id, exactRow(row)]));
+  const exactRows = (rows) => rows.map((row) => exactById.get(row.id));
+  const exactDigest = (id) => sha256(canonical(exactById.get(id)));
+  const shardOf = (row) => indexShardForSessionId(row.session_id.toString(), shards.length);
+  const ids = (rows) => rows.map(({ id }) => id);
+  const invalid = (row) => BLOCK_COLUMNS.filter((column) => typeof exactById.get(row.id)[column] === 'object'
+    && exactById.get(row.id)[column] !== null);
+  requireProof([...prefix, legacy[0]].every((row) => invalid(row).length === 0)
+    && [legacy[1], legacy[2], ...longRows, ...short].every((row) => invalid(row).length > 0)
+    && Math.max(...longRows.map((row) => row.text.length)) < 2_000_000, 'byte-exact-fixture');
+  const fence = (state) => ({ sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = '${state}' WHERE id = 1`, params: [] });
+  const fenced = (statements) => source.batch([fence('copying'), ...statements, fence('frozen')]);
+  const indexRows = (rows) => ({
+    sql: 'INSERT INTO blocks_fts (rowid, text) SELECT id, text FROM blocks WHERE id IN (SELECT value FROM json_each(?))',
+    params: [JSON.stringify(ids(rows))],
+  });
   await assertFrozen(source);
-  let checkpointSnapshot = JSON.stringify(null);
-  let originalError;
-  let retirementBatches = 0;
-  let diagnosticQueries = 0;
-  let writesAfterFailure = 0;
-  let diagnosticQueryFailure;
-  let diagnosticPositiveControl;
+  requireProof((await source.query('SELECT COUNT(*) AS rows FROM blocks'))[0]?.rows === 0, phase);
+  // Lossy U+FFFD controls are FTS-only rows: they show the old rendering's terms.
+  await fenced([...legacy, ...short].map((row) => exactInsert(row)).concat(indexRows([...legacy, ...short]),
+    fts.map(({ controlId, control }) => ({
+      sql: 'INSERT INTO blocks_fts (rowid, text) VALUES (CAST(? AS INTEGER), ?)', params: [controlId, control],
+    }))));
+  for (const { row, head, tail, pattern, doublings, bodyLength } of long) {
+    await fenced([
+      exactInsert(row, { text: pattern }),
+      ...Array.from({ length: doublings }, () => ({
+        sql: 'UPDATE blocks SET text = CAST(CAST(text AS BLOB) || CAST(text AS BLOB) AS TEXT) WHERE id = CAST(? AS INTEGER)',
+        params: [row.id],
+      })),
+      {
+        sql: `UPDATE blocks SET text = CAST(unhex(?) || substr(CAST(text AS BLOB), 1, ?) || unhex(?) AS TEXT)
+          WHERE id = CAST(? AS INTEGER)`,
+        params: [head.toString('hex'), bodyLength, tail.toString('hex'), row.id],
+      },
+      indexRows([row]),
+    ]);
+  }
+  await assertFrozen(source);
+  phase = 'byte-exact-seed-readback';
+  const sourceBefore = await readRows(source, phase, { after: RECOVERY_BASE_ID, before: RECOVERY_BASE_ID + RECOVERY_SPAN });
+  requireProof(rowsSha256(sourceBefore) === rowsSha256(exactRows(pendingRows)), phase);
+  phase = 'byte-exact-fts-before';
+  let ftsMatches = 0;
+  for (const item of fts) {
+    const terms = [item.raw, ...(item.valid ? [item.valid] : [])];
+    ftsMatches += await ftsProbes(source, [
+      ...terms.map((term) => ({ term, rowid: item.row.id, hit: true })),
+      ...item.lossy.map((term) => ({ term, rowid: item.row.id, hit: false })),
+      ...item.common.map((term) => ({ term, rowid: item.row.id, hit: true })),
+      ...terms.map((term) => ({ term, rowid: item.controlId, hit: false })),
+      ...item.lossy.map((term) => ({ term, rowid: item.controlId, hit: true })),
+    ], phase);
+  }
+
+  // Synthesize exactly what the old copier left: its reader's rendering of the
+  // pending source page, a destination replica of that rendering, and a verified
+  // checkpoint without an encoding after an already retired valid prefix.
+  phase = 'byte-exact-legacy-seed';
+  const legacyRead = await source.query(`SELECT ${BLOCK_COLUMNS.map(quote).join(',')} FROM blocks
+    WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id`, [JSON.stringify(ids(legacy))]);
+  requireProof(legacyRead.length === legacy.length && legacyRead.every((row, index) => row.id === legacy[index].id
+    && BLOCK_COLUMNS.every((column) => row[column] === null || ['string', 'number'].includes(typeof row[column]))), phase);
+  const legacyItems = legacyRead.map((row) => ({
+    id: row.id, shard: indexShardForSessionId(row.session_id, shards.length), sha256: sha256(canonical(row)),
+  }));
+  // Valid rows keep their legacy hash; only malformed TEXT changes representation.
+  requireProof(legacyItems.every((item, index) => item.shard === shardOf(legacy[index])
+    && (item.sha256 === exactDigest(item.id)) === (index === 0)), phase);
+  const replica = [
+    ...prefix.map((row) => ({ id: row.id, shard: shardOf(row), canonical: canonical(exactById.get(row.id)) })),
+    ...legacyRead.map((row, index) => ({ id: row.id, shard: legacyItems[index].shard, canonical: canonical(row) })),
+  ];
+  for (const [index, db] of shards.entries()) {
+    const page = replica.filter((row) => row.shard === index);
+    if (!page.length) continue;
+    await db.batch([
+      {
+        sql: `INSERT INTO blocks (${BLOCK_COLUMNS.map(quote).join(',')})
+          SELECT ${BLOCK_COLUMNS.map((_, column) => `json_extract(value, '$[${column}]')`).join(',')} FROM json_each(?)`,
+        params: [`[${page.map(({ canonical }) => canonical).join(',')}]`],
+      },
+      indexRows(page),
+    ]);
+  }
+  const prefixItems = prefix.map((row) => ({ id: row.id, shard: shardOf(row), sha256: exactDigest(row.id) }));
+  const legacyState = {
+    identity: positive.identity, columns: [...BLOCK_COLUMNS], after: prefix.at(-1).id, rows: prefix.length,
+    sha256: sha256(`${sha256('')}:${JSON.stringify(prefixItems)}`),
+    pending: { phase: 'verified', rows: legacyItems }, state: 'pending',
+  };
+  await writeCheckpoint(shards[0], COPY_CHECKPOINT, legacyState);
+  requireProof(JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === JSON.stringify(legacyState), phase);
+  phase = 'byte-exact-legacy-loss';
+  let lossyReplicaCells = 0;
+  for (const [index, row] of legacy.entries()) {
+    const db = shards[shardOf(row)];
+    const rendered = await db.query(`SELECT ${BLOCK_COLUMNS.map(quote).join(',')} FROM blocks WHERE id = CAST(? AS INTEGER)`, [row.id]);
+    requireProof(rendered.length === 1 && sha256(canonical(rendered[0])) === legacyItems[index].sha256, phase);
+    const [stored] = await readRows(db, phase, { after: row.id - 1, before: row.id + 1 });
+    for (const column of BLOCK_COLUMNS.filter((name) => Buffer.isBuffer(row[name]))) {
+      const same = stored?.[column] != null && storedBytes(stored[column]).equals(row[column]);
+      requireProof(same === !invalid(row).includes(column), phase);
+      lossyReplicaCells += Number(!same);
+    }
+  }
+  requireProof(lossyReplicaCells === 2, phase);
+  ftsMatches += await ftsProbes(shards[shardOf(fts[0].row)], [fts[0].raw, fts[0].valid]
+    .map((term) => ({ term, rowid: fts[0].row.id, hit: false })), phase);
+
+  phase = 'byte-exact-recovery';
+  const guardComparison = {
+    status: 'mismatch', expectedRows: 1, presentRows: 1, missingRows: 0, mismatchingRows: 1,
+    columns: [{ index: BLOCK_COLUMNS.indexOf('text'), mismatchingRows: 1, typeMismatchRows: 0, byteMismatchRows: 1,
+      lengthMismatchRows: 0, sourceTypes: ['text'], snapshotTypes: ['text'] }],
+  };
+  // FF and FE have the same lossy rendering: only an exact-byte CAS sees the change.
+  const setGuardByte = async (byte) => {
+    await fenced([{
+      sql: `UPDATE blocks SET text = CAST(substr(CAST(text AS BLOB), 1, ?) || unhex(?) || substr(CAST(text AS BLOB), ?) AS TEXT)
+        WHERE id = CAST(? AS INTEGER)`,
+      params: [guard.offset, byte, guard.offset + 2, guard.row.id],
+    }]);
+    await assertGuardByte(byte);
+  };
+  const assertGuardByte = async (byte) => {
+    const probe = await source.query(`SELECT typeof(text) AS storage_type, length(CAST(text AS BLOB)) AS byte_length,
+      hex(substr(CAST(text AS BLOB), ?, 1)) AS byte FROM blocks WHERE id = CAST(? AS INTEGER)`, [guard.offset + 1, guard.row.id]);
+    requireProof(probe.length === 1 && probe[0].storage_type === 'text' && probe[0].byte_length === guard.row.text.length
+      && probe[0].byte === byte.toUpperCase(), phase);
+  };
+  const trace = {
+    failure: undefined, sourceWrites: 0, shardWrites: 0, hooks: 0, writesAfterFailure: 0, diagnosticQueries: 0,
+    retirements: [], pages: [], jsonPages: 0, boundPages: 0, maxBoundParams: 0, maxBoundRequestBytes: 0,
+  };
+  let guardMutated = false;
+  let recovering = 0;
+  let verifiedSnapshot;
+  let lastVerified = null;
+  let chain = legacyState.sha256;
+  let chainRows = legacyState.rows;
   const observedSource = {
     id: source.id,
     async query(sql, params = []) {
-      if (originalError) {
-        diagnosticQueries += 1;
-        requireProof(/^\s*WITH verified\b/.test(sql), phase);
+      if (trace.failure) {
+        trace.diagnosticQueries += 1;
+        requireProof(/^\s*WITH verified\b/.test(sql), 'byte-exact-guard');
       }
-      try { return await source.query(sql, params); }
-      catch (error) {
-        if (originalError) {
-          diagnosticQueryFailure = queryFailureMetadata(error);
-          // Disposable-proof-only positive control: the identical query and
-          // verified snapshot must compile and compare cleanly against the
-          // destination's valid representation. Never retry the source query.
-          try {
-            const destination = shards[indexShardForSessionId(probe.session_id, shards.length)];
-            const results = await destination.query(sql, params);
-            const encoded = results?.[0]?.source_comparison;
-            let summary;
-            if (typeof encoded === 'string' && Buffer.byteLength(encoded) <= 4096) {
-              try { summary = JSON.parse(encoded); } catch { /* An invalid response is not a rejected query. */ }
-            }
-            const clean = Array.isArray(results) && results.length === 1
-              && Array.isArray(summary) && summary.length === 5
-              && JSON.stringify(summary.slice(0, 4)) === '[1,1,0,0]'
-              && Array.isArray(summary[4]) && summary[4].every((group) => Array.isArray(group))
-              && summary[4].flat().length === BLOCK_COLUMNS.length
-              && summary[4].flat().every((cell) => Array.isArray(cell) && cell.length === 6
-                && cell.every((value) => value === 0));
-            diagnosticPositiveControl = { outcome: clean ? 'verified' : 'unexpected-result' };
-          } catch (controlError) {
-            diagnosticPositiveControl = { outcome: 'rejected', ...queryFailureMetadata(controlError) };
-          }
-        }
-        throw error;
-      }
+      return await source.query(sql, params);
     },
     async batch(statements) {
-      if (originalError) writesAfterFailure += 1;
-      const retirement = statements.some(({ sql }) => /\bDELETE FROM blocks\b/.test(sql));
-      if (retirement) {
-        retirementBatches += 1;
-        requireProof(statements.length === 5
-          && statements.reduce((count, statement) => count + statement.params.length, 0) === 3, phase);
+      if (trace.failure) trace.writesAfterFailure += 1;
+      trace.sourceWrites += 1;
+      let armed = false;
+      if (statements.some(({ sql }) => /\bDELETE FROM blocks\b/.test(sql))) {
         const durable = await readCheckpoint(shards[0], COPY_CHECKPOINT);
-        requireProof(durable?.pending?.phase === 'verified'
-          && JSON.stringify(durable) === checkpointSnapshot, phase);
+        requireProof(durable?.pending?.phase === 'verified' && JSON.stringify(durable) === verifiedSnapshot, phase);
         await assertFrozen(source);
+        const retiring = ids(durable.pending.rows);
+        trace.retirements.push(retiring);
+        if (!guardMutated && retiring.length === 1 && retiring[0] === guard.row.id) {
+          // A real byte change after verification and before the CAS retirement.
+          await setGuardByte('fe');
+          guardMutated = true;
+          armed = true;
+        }
       }
-      try { return await source.batch(statements); }
+      let result;
+      try { result = await source.batch(statements); }
       catch (error) {
-        if (retirement) originalError = error;
+        if (armed) trace.failure = error;
         throw error;
       }
+      requireProof(!armed, 'byte-exact-guard');
+      return result;
     },
   };
-  let failure;
-  try {
-    await copyFrozenIndex({
-      source: observedSource, shards, gate,
-      checkpointHook: async (checkpoint) => {
-        const durable = await readCheckpoint(shards[0], COPY_CHECKPOINT);
-        requireProof(JSON.stringify(durable) === JSON.stringify(checkpoint), phase);
-        checkpointSnapshot = JSON.stringify(durable);
-      },
-    });
-  } catch (error) { failure = error; }
-  requireProof(failure !== undefined && writesAfterFailure === 0, phase);
-  requireProof(JSON.stringify(await rawSource()) === JSON.stringify(before), phase);
-  await assertFrozen(source);
-  const retained = await readCheckpoint(shards[0], COPY_CHECKPOINT);
-  requireProof(JSON.stringify(retained) === checkpointSnapshot, phase);
-  // The negative copy can add its collision-free row, but must not change any
-  // original destination value or its native FTS entry.
-  for (const [index, db] of shards.entries()) {
-    const rows = (await readRows(db, phase)).filter((row) => row.id !== probe.id);
-    const wanted = expected.filter((row) => indexShardForSessionId(row.session_id, shards.length) === index);
-    requireProof(rows.length === wanted.length && rowsSha256(rows) === rowsSha256(wanted), phase);
-    const indexed = await db.query('SELECT rowid FROM blocks_fts WHERE rowid != CAST(? AS INTEGER) ORDER BY rowid', [probe.id]);
-    requireProof(indexed.length === wanted.length
-      && indexed.every((row, offset) => row.rowid === wanted[offset].id), phase);
-  }
-  // An earlier REST rejection means the retirement diagnostic was not exercised.
-  // Retention alone is not a successful proof: preserve its actual public
-  // phase/class and fail closed, including for unrelated copier regressions.
-  if (!retirementBatches) throw safeFailure(failure, phase);
-  requireProof(retirementBatches === 1 && failure === originalError
-    && failure.d1Phase === COPY_PHASES.SOURCE_DELETE_AND_FREEZE
-    && failure.d1SqlReason === 'malformed-json' && diagnosticQueries === 1
-    && retained?.pending?.phase === 'verified' && retained.rows === 0
-    && retained.pending.rows.length === 1 && retained.pending.rows[0].id === probe.id, phase);
-  const snapshot = await shards[indexShardForSessionId(probe.session_id, shards.length)].query(
-    `SELECT typeof(text) AS storage_type, length(CAST(text AS BLOB)) AS byte_length,
-      hex(CAST(text AS BLOB)) AS bytes FROM blocks WHERE id = CAST(? AS INTEGER)`, [probe.id]);
-  const stored = snapshot[0];
-  // Inspect bytes only inside the disposable proof. REST's representation of
-  // invalid source TEXT is not assumed to be replacement text rather than NULL.
-  requireProof(snapshot.length === 1 && ['text', 'null'].includes(stored?.storage_type)
-    && (stored.storage_type === 'null'
-      ? stored.byte_length === null && stored.bytes === ''
-      : Number.isSafeInteger(stored.byte_length) && stored.byte_length >= 0
-        && stored.byte_length <= COPY_PAGE_BYTES && typeof stored.bytes === 'string'
-        && /^[0-9A-F]*$/.test(stored.bytes) && stored.bytes.length === stored.byte_length * 2), phase);
-  requireProof(stored.storage_type !== 'text' || stored.bytes !== before[0].bytes, phase);
-  const comparison = {
-    status: 'mismatch', expectedRows: 1, presentRows: 1, missingRows: 0, mismatchingRows: 1,
-    columns: [{ index: textIndex, mismatchingRows: 1,
-      typeMismatchRows: Number(stored.storage_type !== 'text'),
-      byteMismatchRows: Number(stored.storage_type === 'null' || stored.bytes !== before[0].bytes),
-      lengthMismatchRows: Number(stored.byte_length !== before[0].bytes.length / 2),
-      sourceTypes: ['text'], snapshotTypes: [stored.storage_type] }],
-  };
-  if (JSON.stringify(failure.d1SourceComparison) !== JSON.stringify(comparison)) {
-    // Only validated aggregate vocabulary/counts may escape on a failed proof.
-    // Never attach the raw provider error, SQL response or byte descriptors.
-    const actual = failure.d1SourceComparison;
-    const count = (value) => Number.isSafeInteger(value) && value >= 0 && value <= 1;
-    const types = ['null', 'integer', 'real', 'text', 'blob'];
-    const safeTypes = (values) => Array.isArray(values) && values.length <= types.length
-      && values.every((value) => types.includes(value)) && new Set(values).size === values.length;
-    let measured;
-    if (actual?.status === 'unavailable'
-      && ['canonical-budget', 'request-budget', 'query-failed', 'response-shape'].includes(actual.reason)) {
-      measured = { status: 'unavailable', reason: actual.reason };
-    } else if (['clean', 'mismatch', 'missing', 'mismatch-and-missing'].includes(actual?.status)
-      && ['expectedRows', 'presentRows', 'missingRows', 'mismatchingRows'].every((key) => count(actual[key]))
-      && Array.isArray(actual.columns) && actual.columns.length <= BLOCK_COLUMNS.length
-      && actual.columns.every((column) => Number.isSafeInteger(column?.index)
-        && column.index >= 0 && column.index < BLOCK_COLUMNS.length
-        && ['mismatchingRows', 'typeMismatchRows', 'byteMismatchRows', 'lengthMismatchRows'].every((key) => count(column[key]))
-        && safeTypes(column.sourceTypes) && safeTypes(column.snapshotTypes))) {
-      measured = { status: actual.status, expectedRows: actual.expectedRows, presentRows: actual.presentRows,
-        missingRows: actual.missingRows, mismatchingRows: actual.mismatchingRows,
-        columns: actual.columns.map((column) => ({
-          index: column.index, mismatchingRows: column.mismatchingRows, typeMismatchRows: column.typeMismatchRows,
-          byteMismatchRows: column.byteMismatchRows, lengthMismatchRows: column.lengthMismatchRows,
-          sourceTypes: [...column.sourceTypes], snapshotTypes: [...column.snapshotTypes],
-        })) };
+  const observedShards = shards.map((db) => ({
+    id: db.id,
+    query: (sql, params) => db.query(sql, params),
+    async batch(statements) {
+      if (trace.failure) trace.writesAfterFailure += 1;
+      trace.shardWrites += 1;
+      const insert = statements.find(({ sql }) => /^INSERT INTO blocks \(/.test(sql));
+      if (insert?.params.length === 1 && /FROM json_each\(\?\)/.test(insert.sql)) trace.jsonPages += 1;
+      else if (insert && /VALUES \(/.test(insert.sql) && insert.params.length <= 100) {
+        trace.boundPages += 1;
+        trace.maxBoundParams = Math.max(trace.maxBoundParams, insert.params.length);
+        trace.maxBoundRequestBytes = Math.max(trace.maxBoundRequestBytes, Buffer.byteLength(JSON.stringify(statements)));
+      } else if (insert) reject('copy-write-shape');
+      return await db.batch(statements);
+    },
+  }));
+  const checkpointHook = async (checkpoint) => {
+    trace.hooks += 1;
+    requireProof(!trace.failure, 'byte-exact-guard');
+    const durable = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+    requireProof(JSON.stringify(durable) === JSON.stringify(checkpoint), 'checkpoint-observation');
+    const pending = checkpoint.pending;
+    if (recovering === 0 && pending?.phase !== 'recovering') {
+      // A copier without the one-time recovery (the old lossy reader) is only
+      // observed: it must still fail closed at its own native boundary, and run 1
+      // below then requires the recovery it skipped.
+      if (pending?.phase === 'verified') verifiedSnapshot = JSON.stringify(checkpoint);
+      return;
     }
+    requireProof(typeof positive.encoding === 'string' && positive.encoding.length > 0
+      && checkpoint.encoding === positive.encoding
+      && JSON.stringify(checkpoint.identity) === JSON.stringify(legacyState.identity), 'byte-exact-encoding');
+    if (pending?.phase === 'recovering') {
+      // Persisted once, before any write, with the retired prefix chain untouched.
+      requireProof(recovering === 0 && trace.shardWrites === 0 && trace.sourceWrites === 0
+        && checkpoint.after === legacyState.after && checkpoint.rows === legacyState.rows
+        && checkpoint.sha256 === legacyState.sha256
+        && JSON.stringify(pending.recovery?.legacyRows) === JSON.stringify(legacyItems)
+        && pending.rows.length === legacyItems.length
+        && pending.rows.every((item, index) => item.id === legacyItems[index].id
+          && item.shard === legacyItems[index].shard && item.sha256 === exactDigest(item.id)), 'legacy-recovery');
+      recovering += 1;
+      return;
+    }
+    if (pending) {
+      requireProof(['copying', 'verified'].includes(pending.phase) && checkpoint.state === 'pending'
+        && checkpoint.rows === chainRows && checkpoint.sha256 === chain && pending.rows.length > 0
+        && pending.rows.every((item) => fixtureById.has(item.id) && item.id > checkpoint.after
+          && item.shard === shardOf(fixtureById.get(item.id)) && item.sha256 === exactDigest(item.id)), 'byte-exact-geometry');
+      if (pending.phase === 'copying') trace.pages.push(ids(pending.rows));
+      else {
+        verifiedSnapshot = JSON.stringify(checkpoint);
+        lastVerified = pending.rows;
+      }
+      return;
+    }
+    if (lastVerified) {
+      requireProof(checkpoint.state === 'pending' && checkpoint.sha256 === sha256(`${chain}:${JSON.stringify(lastVerified)}`)
+        && checkpoint.rows === chainRows + lastVerified.length && checkpoint.after === lastVerified.at(-1).id, 'byte-exact-chain');
+      chain = checkpoint.sha256;
+      chainRows = checkpoint.rows;
+      lastVerified = null;
+    } else {
+      requireProof(checkpoint.state === 'complete' && checkpoint.sha256 === chain && checkpoint.rows === chainRows, 'byte-exact-chain');
+    }
+  };
+  const copy = () => copyFrozenIndex({ source: observedSource, shards: observedShards, gate, checkpointHook });
+  const resetRun = () => Object.assign(trace, {
+    failure: undefined, sourceWrites: 0, shardWrites: 0, hooks: 0, writesAfterFailure: 0, diagnosticQueries: 0,
+  });
+
+  // Run 1: one-time legacy recovery, then the exact-byte CAS rejects the mutation.
+  let failure;
+  try { await copy(); } catch (error) { failure = error; }
+  phase = 'byte-exact-guard';
+  // An earlier rejection never reached the guard: keep its actual public phase/class.
+  if (!trace.failure) throw failure === undefined ? new NativeCopyControlError(phase, 'assertion') : safeFailure(failure, 'byte-exact-recovery');
+  requireProof(failure === trace.failure && failure.d1Phase === COPY_PHASES.SOURCE_DELETE_AND_FREEZE
+    && failure.d1SqlReason === 'malformed-json' && trace.writesAfterFailure === 0 && trace.diagnosticQueries === 1
+    && recovering === 1 && JSON.stringify(trace.retirements) === JSON.stringify([ids(legacy), [guard.row.id]])
+    && JSON.stringify(trace.pages) === JSON.stringify([[guard.row.id]]), phase);
+  if (JSON.stringify(failure.d1SourceComparison) !== JSON.stringify(guardComparison)) {
+    // Never attach the raw provider error, SQL response or byte descriptors.
+    const measured = measuredComparison(failure.d1SourceComparison);
     const error = new NativeCopyControlError(phase, 'assertion');
     if (measured) {
       error.nativeCopySourceComparison = measured;
       error.message += ` sourceRetirementComparison=${JSON.stringify(measured)}`;
     }
-    if (diagnosticQueryFailure) {
-      error.nativeCopyDiagnosticQueryFailure = diagnosticQueryFailure;
-      error.message += ` diagnosticQueryFailure=${JSON.stringify(diagnosticQueryFailure)}`;
-    }
-    if (diagnosticPositiveControl) {
-      error.nativeCopyDiagnosticPositiveControl = diagnosticPositiveControl;
-      error.message += ` diagnosticPositiveControl=${JSON.stringify(diagnosticPositiveControl)}`;
-    }
     throw error;
   }
-  return { outcome: 'verified', phase: COPY_PHASES.SOURCE_DELETE_AND_FREEZE,
-    nativeClass: 'malformed-json', statements: 5, binds: 3, comparison,
-    sourceRetention: 'retained', freezeRetention: 'frozen', checkpointRetention: 'retained',
-    positiveRowsRetained: expected.length };
+  requireProof(JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === verifiedSnapshot, phase);
+  const remaining = await source.query('SELECT id FROM blocks ORDER BY id');
+  requireProof(JSON.stringify(ids(remaining)) === JSON.stringify(ids([...longRows, ...short])), phase);
+  await assertGuardByte('fe');
+  await assertFrozen(source);
+  const guardCopy = await readRows(shards[shardOf(guard.row)], phase, { after: guard.row.id - 1, before: guard.row.id + 1 });
+  requireProof(guardCopy.length === 1 && rowsSha256(guardCopy) === rowsSha256(exactRows([guard.row])), phase);
+
+  // Run 2: an unrestored source is refused before any write.
+  phase = 'byte-exact-stale';
+  resetRun();
+  let stale;
+  try { await copy(); } catch (error) { stale = error; }
+  if (stale?.code !== COPY_INVARIANTS.SOURCE_CHANGED) throw stale ? safeFailure(stale, phase) : new NativeCopyControlError(phase, 'assertion');
+  requireProof(trace.sourceWrites === 0 && trace.shardWrites === 0 && trace.hooks === 0
+    && JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === verifiedSnapshot, phase);
+  await assertGuardByte('fe');
+
+  // Run 3: the restored authoritative bytes complete from the retained checkpoint.
+  phase = 'byte-exact-complete';
+  await setGuardByte('ff');
+  resetRun();
+  const state = await copy();
+  requireProof(state.state === 'complete' && state.pending === null && state.encoding === positive.encoding
+    && state.rows === allRows.length && chainRows === state.rows && state.after === short.at(-1).id && state.sha256 === chain
+    && JSON.stringify(trace.pages) === JSON.stringify([[guard.row.id], [longRows[1].id], ids(short)])
+    && JSON.stringify(trace.retirements) === JSON.stringify([ids(legacy), [guard.row.id], [guard.row.id], [longRows[1].id], ids(short)])
+    && trace.boundPages === 1 && trace.jsonPages >= 3 && trace.maxBoundParams <= 100, phase);
+  requireProof(JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === JSON.stringify(state), phase);
+  requireProof((await source.query('SELECT COUNT(*) AS rows FROM blocks'))[0]?.rows === 0, 'source-empty');
+  await assertFrozen(source);
+
+  phase = 'byte-exact-readback';
+  const sourceById = new Map(sourceBefore.map((row) => [row.id, row]));
+  const digestOf = (value) => (typeof value === 'string' || typeof value?.x === 'string' ? sha256(storedBytes(value)) : null);
+  let invalidCells = 0;
+  let rawSha256Matches = 0;
+  const copied = [];
+  for (const [index, db] of shards.entries()) {
+    const rows = await readRows(db, phase, { after: RECOVERY_BASE_ID, before: RECOVERY_BASE_ID + RECOVERY_SPAN });
+    const wanted = allRows.filter((row) => shardOf(row) === index);
+    requireProof(rows.length === wanted.length && rowsSha256(rows) === rowsSha256(exactRows(wanted)), phase);
+    for (const row of rows) {
+      const fixture = fixtureById.get(row.id);
+      for (const column of BLOCK_COLUMNS.filter((name) => Buffer.isBuffer(fixture[name]))) {
+        const digest = sha256(fixture[column]);
+        requireProof(digestOf(row[column]) === digest
+          && (!sourceById.has(row.id) || digestOf(sourceById.get(row.id)[column]) === digest), phase);
+        rawSha256Matches += 1;
+        invalidCells += Number(typeof row[column] !== 'string');
+      }
+    }
+    copied.push(...rows);
+    // The positive proof's destination rows are untouched by this phase.
+    const [retained] = await db.query(`SELECT COUNT(*) AS rows FROM blocks
+      WHERE id < CAST(? AS INTEGER) OR id >= CAST(? AS INTEGER)`, [RECOVERY_BASE_ID, RECOVERY_BASE_ID + RECOVERY_SPAN]);
+    requireProof(retained?.rows === positiveRows.filter((row) => indexShardForSessionId(row.session_id, shards.length) === index).length, phase);
+  }
+  const recoveredSha256 = rowsSha256(exactRows(allRows));
+  requireProof(rowsSha256(copied.sort((a, b) => a.id - b.id)) === recoveredSha256
+    && invalidCells === allRows.reduce((total, row) => total + invalid(row).length, 0), phase);
+
+  phase = 'byte-exact-fts-after';
+  for (const item of fts) {
+    ftsMatches += await ftsProbes(shards[shardOf(item.row)], [
+      ...[item.raw, ...(item.valid ? [item.valid] : []), ...item.common].map((term) => ({ term, rowid: item.row.id, hit: true })),
+      ...item.lossy.map((term) => ({ term, rowid: item.row.id, hit: false })),
+    ], phase);
+  }
+  for (const [index, db] of shards.entries()) {
+    const own = words.filter(([row]) => shardOf(row) === index);
+    if (own.length) ftsMatches += await ftsProbes(db, own.map(([row, term]) => ({ term, rowid: row.id, hit: true })), phase);
+  }
+  return {
+    outcome: 'verified', encoding: state.encoding, rows: allRows.length, prefixRows: prefix.length,
+    legacyPendingRows: legacy.length, legacyInvalidRows: legacy.filter((row) => invalid(row).length).length,
+    lossyReplicaCells, recoveringCheckpoints: recovering, invalidCells, rawSha256Matches,
+    longInvalidTextBytes: longRows.map((row) => row.text.length), boundPages: trace.boundPages,
+    maxBoundParams: trace.maxBoundParams, maxBoundRequestBytes: trace.maxBoundRequestBytes, ftsMatches,
+    guard: {
+      mutation: 'ff-to-fe', phase: COPY_PHASES.SOURCE_DELETE_AND_FREEZE, nativeClass: 'malformed-json',
+      comparison: guardComparison, writesAfterFailure: 0, diagnosticQueries: 1,
+      sourceRetention: 'retained', freezeRetention: 'frozen', checkpointRetention: 'retained',
+      destinationRetention: 'retained', staleRerun: COPY_INVARIANTS.SOURCE_CHANGED, restoredRun: 'complete',
+    },
+    sha256: recoveredSha256, positiveRowsRetained: positiveRows.length,
+  };
 }
 
 async function proveNativeCopy({ source, shards, gate }) {
@@ -640,7 +960,7 @@ async function proveNativeCopy({ source, shards, gate }) {
         const insert = statements.find(({ sql }) => /^INSERT INTO blocks \(/.test(sql));
         if (insert) {
           if (insert.params.length === 1 && /FROM json_each\(\?\)/.test(insert.sql)) ordinaryPages += 1;
-          else if (insert.params.length === BLOCK_COLUMNS.length && /VALUES \(/.test(insert.sql)) fallbackPages += 1;
+          else if (/VALUES \(/.test(insert.sql) && insert.params.length <= 100) fallbackPages += 1;
           else reject('copy-write-shape');
         }
         return await db.batch(statements);
@@ -772,14 +1092,14 @@ async function proveNativeCopy({ source, shards, gate }) {
     requireProof((await source.query('SELECT COUNT(*) AS rows FROM blocks'))[0]?.rows === 0, 'source-empty');
     await assertFrozen(source);
     requireProof(JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === JSON.stringify(state), 'checkpoint-proof');
-    phase = 'retirement-diagnostic';
-    const retirementDiagnostic = await proveNativeRetirementDiagnostic({ source, shards, gate, ordinary, expected });
+    phase = 'byte-exact-recovery';
+    const byteExactRecovery = await proveByteExactRecovery({ source, shards, gate, positive: state, positiveRows: expected });
     await gate();
     return { state: 'verified', probe: 'd1-native-full-copy', rows: expected.length, columns: BLOCK_COLUMNS.length,
       shards: shards.length, denseRows: dense.length, growthRows: growth.length, ordinaryPages, fallbackPages,
       ftsMatches, freezeTriggers: 3, maxFtsParametersBytes, maxUnsplitFtsParametersBytes, splitFtsProbePages,
       legacyProbeMatches: legacyProbe.length, nativeProbeMatches: nativeProbe.length,
-      longTextBytes: Buffer.byteLength(long.text), sha256: expectedSha256, retirementDiagnostic };
+      longTextBytes: Buffer.byteLength(long.text), sha256: expectedSha256, byteExactRecovery };
   } catch (error) {
     throw safeFailure(error, phase);
   }

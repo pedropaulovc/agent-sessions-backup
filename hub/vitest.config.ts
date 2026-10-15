@@ -1,4 +1,5 @@
 import { cloudflareTest, readD1Migrations } from '@cloudflare/vitest-pool-workers';
+import { availableParallelism } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { writeLocalConfig } from './scripts/lib/local-config.mjs';
 import { configDefaults, defineConfig } from 'vitest/config';
@@ -52,19 +53,15 @@ export default defineConfig(async () => {
       // imply the runner — `preview-control-trust.test.mjs` is a real vitest suite.
       exclude: [...configDefaults.exclude, 'e2e/**', 'test/**/*.node.test.mjs'],
       setupFiles: ['./test/apply-migrations.ts'],
-      // These are workers-pool INTEGRATION tests: a single `it` routinely drives several full
-      // miniflare round-trips (HTTP PUT -> R2 -> D1, then a queue-consumer parse writing blocks +
-      // FTS5 + sessions + usage). A clean local run of the heaviest of them (e.g. the subagent
-      // meta-linking pair: 2x putFile + 2x drainQueue) is ~1.7s. vitest's 5s default is a
-      // UNIT-test budget: under the CPU contention of CI (or many test files running in parallel
-      // in the shared pool) those round-trips fan out and the same test spikes past 5s, timing out
-      // nondeterministically — whichever heavy test happens to land in the contention window, not
-      // any one test in particular (reproduced: 5/6 full-suite runs under load timed out, on two
-      // different subagent tests). Give the whole integration suite a budget sized for that
-      // contention rather than peppering `}, N)` onto individual heavy tests (which only moves the
-      // flake to the next-heaviest one). Still bounded, so a genuinely hung test fails in time.
+      // Bound integration-test workerd/R2/D1 RPC fan-out, preserving Vitest's
+      // lower run-mode default on small hosts. A full-suite control observed
+      // the two ~16s cases at ~2s with four workers; fixtures, storage isolation
+      // and the 15s deadline were unchanged.
+      // Reproduce on a 16-thread host with --maxWorkers=15 versus 4:
+      // npm exec -- vitest run --maxWorkers=4 --reporter=verbose
+      maxWorkers: Math.min(4, Math.max(availableParallelism() - 1, 1)),
       testTimeout: 15000,
-      // Hooks get the same treatment for the same reason: vitest's 10s hook default is below
+      // Hooks need a larger integration bound: vitest's 10s default is below
       // even testTimeout, yet the fixture-heaviest hooks do MORE round-trips than any single
       // test — viewer.test.ts's beforeAll pushes six sessions through the full upload+ingest
       // path (one ~190KB/450-turn), and timed out at 10s on a contended CI runner (run
