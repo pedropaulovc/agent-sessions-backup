@@ -17,6 +17,7 @@ import {
   stableJson,
 } from '../../infra/cf/preview-trust.mjs';
 import { D1_BATCH_PROBE_TEXT } from '../../infra/cf/d1-batch-atomicity.mjs';
+import { COPY_ENCODING } from '../scripts/lib/index-migration.mjs';
 import { BLOCK_COLUMNS, INDEX_ID_SPAN } from '../src/index-layout.mjs';
 
 const SHA = 'a'.repeat(40);
@@ -1026,19 +1027,32 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
   assert.equal(summary.fallbackPages, 1);
   assert.equal(summary.longTextBytes, 1_100_061);
   assert.match(summary.sha256, /^[0-9a-f]{64}$/);
-  assert.equal(summary.retirementDiagnostic.outcome, 'verified');
-  assert.equal(summary.retirementDiagnostic.nativeClass, 'malformed-json');
-  assert.equal(summary.retirementDiagnostic.sourceRetention, 'retained');
-  assert.equal(summary.retirementDiagnostic.freezeRetention, 'frozen');
-  assert.equal(summary.retirementDiagnostic.checkpointRetention, 'retained');
-  assert.equal(summary.retirementDiagnostic.positiveRowsRetained, summary.rows);
-  assert.deepEqual(summary.retirementDiagnostic.comparison, {
-    status: 'mismatch', expectedRows: 1, presentRows: 1, missingRows: 0, mismatchingRows: 1,
-    columns: [{ index: BLOCK_COLUMNS.indexOf('text'), mismatchingRows: 1, typeMismatchRows: 0,
-      byteMismatchRows: 1, lengthMismatchRows: 1, sourceTypes: ['text'], snapshotTypes: ['text'] }],
+  const recovery = summary.byteExactRecovery;
+  assert.equal(recovery.outcome, 'verified');
+  assert.equal(recovery.encoding, COPY_ENCODING);
+  assert.equal(recovery.rows, recovery.prefixRows + recovery.legacyPendingRows + 6);
+  assert.equal(recovery.legacyInvalidRows, 2);
+  assert.equal(recovery.lossyReplicaCells, 2, 'the synthesized legacy replica must actually be lossy');
+  assert.equal(recovery.recoveringCheckpoints, 1);
+  assert.ok(recovery.invalidCells > recovery.legacyInvalidRows);
+  assert.deepEqual(recovery.longInvalidTextBytes, [300_000, 1_900_000]);
+  assert.equal(recovery.boundPages, 1);
+  assert.ok(recovery.maxBoundParams > BLOCK_COLUMNS.length && recovery.maxBoundParams <= 100);
+  assert.ok(recovery.maxBoundRequestBytes > 3_000_000);
+  assert.match(recovery.sha256, /^[0-9a-f]{64}$/);
+  assert.equal(recovery.positiveRowsRetained, summary.rows);
+  assert.deepEqual(recovery.guard, {
+    mutation: 'ff-to-fe', phase: 'copy-source-delete-and-freeze', nativeClass: 'malformed-json',
+    comparison: {
+      status: 'mismatch', expectedRows: 1, presentRows: 1, missingRows: 0, mismatchingRows: 1,
+      columns: [{ index: BLOCK_COLUMNS.indexOf('text'), mismatchingRows: 1, typeMismatchRows: 0,
+        byteMismatchRows: 1, lengthMismatchRows: 0, sourceTypes: ['text'], snapshotTypes: ['text'] }],
+    },
+    writesAfterFailure: 0, diagnosticQueries: 1, sourceRetention: 'retained', freezeRetention: 'frozen',
+    checkpointRetention: 'retained', destinationRetention: 'retained', staleRerun: 'source-changed', restoredRun: 'complete',
   });
-  // The second, intentionally failing copy must not inflate successful-copy
-  // FTS, page or source-retirement evidence from the first complete copy.
+  // The byte-exact recovery phase must not inflate the complete positive copy's
+  // FTS, page or source-retirement evidence.
   const diagnosticStart = result.events.findIndex(({ kind, sql }) => kind === 'probe-sql'
     && sql === "SELECT hex(unhex('61FF62')) AS bytes");
   assert.ok(diagnosticStart >= 0);
@@ -1212,8 +1226,15 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
   assert.deepEqual(finalSourceCount.rows, [{ rows: 0 }]);
   const queries = result.events.filter((event) => event.kind === 'request'
     && new URL(event.url).pathname.endsWith('/query'));
-  assert.ok(queries.length <= 200 + summary.growthRows * 6,
-    `complete native CLI proof must retain bulk copying with bounded independent growth point batches/slice checks, observed ${queries.length}`);
+  const positiveQueries = queries.filter((event) => result.events.indexOf(event) < diagnosticStart);
+  assert.ok(positiveQueries.length <= 200 + summary.growthRows * 6,
+    `complete native CLI proof must retain bulk copying with bounded independent growth point batches/slice checks, observed ${positiveQueries.length}`);
+  assert.ok(queries.length - positiveQueries.length <= 400,
+    `byte-exact recovery must stay a bounded fixed-size phase, observed ${queries.length - positiveQueries.length}`);
+  const recoveredSourceCount = result.events.filter((event) => event.kind === 'probe-sql' && event.databaseId === 'created-1'
+    && event.sql === 'SELECT COUNT(*) AS rows FROM blocks').at(-1);
+  assert.ok(result.events.indexOf(recoveredSourceCount) > diagnosticStart);
+  assert.deepEqual(recoveredSourceCount.rows, [{ rows: 0 }], 'the recovered source must be fully retired');
   const migrations = result.events.filter((event) => event.kind === 'migrate');
   assert.equal(migrations.length, 3);
   const creations = result.events.filter((event) => event.kind === 'request' && event.method === 'POST'

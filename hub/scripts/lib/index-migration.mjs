@@ -15,6 +15,7 @@ export const DRAIN_MILLISECONDS = 16 * 60 * 1000;
 export const SOURCE_FREEZE_TABLE = 'index_migration_freeze';
 export const COPY_PAGE_ROWS = 2048;
 export const COPY_PAGE_BYTES = 1024 * 1024;
+export const COPY_ENCODING = 'sqlite-text-bytes-v1';
 
 export const COPY_PHASES = Object.freeze({
   SETUP: 'copy-setup',
@@ -60,6 +61,55 @@ const SEED_PAGE_ROWS = 96;
 const SMALL_ROW_BYTES = 65536;
 const LONG_SLICE_BYTES = 131072;
 const RESPONSE_ENVELOPE_BYTES = 4096;
+const WRITE_SLICE_BYTES = 32768;
+const MAX_CELL_BYTES = 2_000_000;
+const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
+const STORAGE_CLASSES = Symbol('sqlite-storage-classes');
+const TEXT_UTF8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+function invalidText(value, phase) {
+  const property = isProofRecord(value) ? Object.getOwnPropertyDescriptor(value, 'x') : null;
+  if (!property?.enumerable || Reflect.ownKeys(value).length !== 1
+    || typeof property.value !== 'string' || !/^(?:[a-f0-9]{2})+$/.test(property.value)
+    || property.value.length > MAX_CELL_BYTES * 2) {
+    throw copyInvariant(COPY_INVARIANTS.VALUE, 'unsupported D1 value', phase);
+  }
+  try { TEXT_UTF8.decode(Buffer.from(property.value, 'hex')); }
+  catch { return value; }
+  throw copyInvariant(COPY_INVARIANTS.VALUE, 'noncanonical raw TEXT encoding', phase);
+}
+
+function decodedText(hex, length, phase) {
+  if (typeof hex !== 'string' || hex.length !== length * 2 || !/^(?:[a-f0-9]{2})*$/i.test(hex)) {
+    throw copyInvariant(COPY_INVARIANTS.LONG_SLICE, 'incomplete or invalid TEXT byte transport', phase);
+  }
+  const bytes = Buffer.from(hex, 'hex');
+  try { return TEXT_UTF8.decode(bytes); }
+  catch { return { x: hex.toLowerCase() }; }
+}
+
+function textBytes(value) {
+  if (value === null) return null;
+  return typeof value === 'string' ? Buffer.from(value) : Buffer.from(invalidText(value).x, 'hex');
+}
+
+function safeIdentity(value, phase) {
+  if (typeof value !== 'string' || !value.length || /[\u0000-\u001f\u007f]/.test(value)
+    || TEXT_UTF8.decode(Buffer.from(value)) !== value) {
+    throw copyInvariant(COPY_INVARIANTS.ROW_IDENTITY, 'invalid stored migration identity', phase);
+  }
+  return value;
+}
+
+function routeRow(row, count, phase) {
+  return indexShardForSessionId(safeIdentity(row.session_id, phase), count);
+}
+
+function rowTypes(columns, row) {
+  return columns.map((column) => row[STORAGE_CLASSES]?.[column]
+    ?? (row[column] === null ? 'null' : typeof row[column] === 'number'
+      ? Number.isInteger(row[column]) ? 'integer' : 'real' : 'text'));
+}
 const JSON_IDS_SQL = 'SELECT value FROM json_each(?)';
 const quote = (name) => `"${name.replaceAll('"', '""')}"`;
 const sha = (value) => createHash('sha256').update(value).digest('hex');
@@ -142,6 +192,7 @@ export function canonicalRow(columns, row, phase) {
   return JSON.stringify(columns.map((column) => {
     if (!Object.hasOwn(row, column)) throw copyInvariant(COPY_INVARIANTS.COLUMN, 'D1 omitted column', phase);
     const value = row[column];
+    if (value !== null && typeof value === 'object') return invalidText(value, phase);
     if (value !== null && !['string', 'number'].includes(typeof value)) {
       throw copyInvariant(COPY_INVARIANTS.VALUE, 'unsupported D1 value', phase);
     }
@@ -221,12 +272,62 @@ function assertIdentity(state, identity) {
   if (JSON.stringify(state.identity) !== JSON.stringify(identity)) {
     throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_IDENTITY, 'durable checkpoint identifies different databases/layout');
   }
+  if (Object.hasOwn(state, 'encoding') && state.encoding !== COPY_ENCODING) {
+    throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_STATE, 'unknown copy checkpoint encoding');
+  }
+  if (Object.hasOwn(state, 'recovery')) throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_STATE, 'invalid copy checkpoint recovery field');
+  if (['columns', 'pending', 'encoding'].some((key) => Object.hasOwn(state, key))) validateCopyState(state, identity.shards.length);
 }
 
 const isProofRecord = (value) => value !== null && typeof value === 'object' && !Array.isArray(value)
   && [Object.prototype, null].includes(Object.getPrototypeOf(value));
 const isSha256 = (value) => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
 const isCounter = (value) => Number.isSafeInteger(value) && value >= 0;
+
+function validateCopyState(state, shardCount) {
+  const fail = () => { throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_STATE, 'invalid copy checkpoint proof'); };
+  if (!Array.isArray(state.columns) || !state.columns.length || state.columns.length > 100
+    || !state.columns.includes('id') || state.columns.some((column) => typeof column !== 'string' || !column)
+    || new Set(state.columns).size !== state.columns.length || !isCounter(state.rows) || !isSha256(state.sha256)
+    || !Number.isSafeInteger(state.after) || state.after < -1 || state.after >= INDEX_ID_SPAN
+    || (state.rows === 0 ? state.after !== -1 : state.after < 0)
+    || Object.hasOwn(state, 'recovery') || state.state === 'complete' && state.pending !== null) fail();
+  if (state.pending === null) return;
+  const pending = state.pending;
+  const itemsValid = (items) => Array.isArray(items) && items.length > 0 && items.length <= COPY_PAGE_ROWS
+    && items.every((item, index) => isProofRecord(item) && Object.keys(item).length === 3
+      && Object.keys(item).every((key) => ['id', 'shard', 'sha256'].includes(key)) && Number.isSafeInteger(item.id)
+      && item.id > (index ? items[index - 1].id : state.after) && item.id < INDEX_ID_SPAN
+      && Number.isSafeInteger(item.shard) && item.shard >= 0 && item.shard < shardCount && isSha256(item.sha256));
+  const typesValid = (types) => Array.isArray(types) && types.length === pending.rows.length
+    && types.every((row) => Array.isArray(row) && row.length === state.columns.length
+      && row.every((type) => ['null', 'integer', 'real', 'text'].includes(type)));
+  if (!isProofRecord(pending) || !['copying', 'verified', 'recovering'].includes(pending.phase)
+    || !itemsValid(pending.rows)
+    || Object.keys(pending).some((key) => !['phase', 'rows', 'types', 'recovery'].includes(key))) fail();
+  if (state.encoding === COPY_ENCODING) {
+    if (!typesValid(pending.types)) fail();
+  } else if (pending.phase === 'recovering' || Object.hasOwn(pending, 'types') || Object.hasOwn(pending, 'recovery')) fail();
+  if (pending.phase === 'recovering' && !pending.recovery
+    || Object.hasOwn(pending, 'recovery') && (!isProofRecord(pending.recovery) || pending.phase === 'copying')) fail();
+  if (pending.recovery) {
+    const recovery = pending.recovery;
+    if (!isProofRecord(recovery) || Object.keys(recovery).some((key) => !['legacyRows', 'destinations', 'missingSource'].includes(key))
+      || !itemsValid(recovery.legacyRows)
+      || recovery.legacyRows.length !== pending.rows.length
+      || recovery.legacyRows.some((item, index) => item.id !== pending.rows[index].id
+        || item.shard !== pending.rows[index].shard)
+      || !Array.isArray(recovery.destinations) || recovery.destinations.length !== pending.rows.length
+      || recovery.destinations.some((item) => item !== null && (!isProofRecord(item)
+        || Object.keys(item).some((key) => !['sha256', 'types'].includes(key))
+        || !isSha256(item.sha256) || !Array.isArray(item.types) || item.types.length !== state.columns.length
+        || item.types.some((type) => !['null', 'integer', 'real', 'text'].includes(type))))
+      || !Array.isArray(recovery.missingSource) || new Set(recovery.missingSource).size !== recovery.missingSource.length
+      || recovery.missingSource.length !== 0 && recovery.missingSource.length !== pending.rows.length
+      || recovery.missingSource.some((id, index) => id !== pending.rows[index].id)
+      || recovery.missingSource.length && recovery.destinations.some((item) => item === null)) fail();
+  }
+}
 
 // Sort every object key so checkpoint/proof hashes survive JSON roundtrips and key ordering.
 // Hash the complete checkpoints, not only their status or aggregate counts.
@@ -426,7 +527,7 @@ function createFtsTokenizer() {
           database.exec(sql);
           database.exec("CREATE VIRTUAL TABLE tokenizer_vocab USING fts5vocab(blocks_fts, 'instance')");
           clear = database.prepare("INSERT INTO blocks_fts (blocks_fts) VALUES ('delete-all')");
-          insert = database.prepare('INSERT INTO blocks_fts (rowid, text) VALUES (1, ?)');
+          insert = database.prepare('INSERT INTO blocks_fts (rowid, text) VALUES (1, CAST(? AS TEXT))');
           first = database.prepare("SELECT CAST(term AS BLOB) AS bytes FROM tokenizer_vocab WHERE doc = 1 AND col = 'text' AND offset = 0 LIMIT 1");
           terms = database.prepare("SELECT CAST(term AS BLOB) AS bytes FROM tokenizer_vocab WHERE doc = 1 AND col = 'text' LIMIT 2");
           oracleMatch = database.prepare('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? AND rowid = 1');
@@ -437,24 +538,29 @@ function createFtsTokenizer() {
       }
       try {
         const probes = rows.map((row) => {
-          if (row.text !== null && typeof row.text !== 'string') throw new Error();
+          if (row.text !== null && typeof row.text !== 'string') invalidText(row.text, COPY_PHASES.FTS_MATCH);
           clear.run();
-          insert.run(row.text);
+          insert.run(textBytes(row.text));
           const bytes = first.get()?.bytes ?? null;
           if (bytes === null) return { id: row.id, token: null };
           if (!(bytes instanceof Uint8Array) || !bytes.length) throw new Error();
           let token = decodeTokenUtf8(bytes);
+          if (token === null && typeof row.text === 'object' && row.text !== null) {
+            // Malformed UTF-8 terms are valid native FTS bytes, not replacement text.
+            const phrase = Buffer.from(`"${Buffer.from(bytes).toString('latin1').replaceAll('"', '""')}"`, 'latin1');
+            return { id: row.id, token: { x: phrase.toString('hex') } };
+          }
           if (token === null) {
             token = completeTruncatedToken(bytes, (candidate) => {
               clear.run();
-              insert.run(candidate);
+              insert.run(Buffer.from(candidate));
               const derived = terms.all();
               return derived.length === 1 && derived[0].bytes instanceof Uint8Array
                 && Buffer.compare(derived[0].bytes, bytes) === 0;
             });
             if (token === null) throw new Error();
             clear.run();
-            insert.run(row.text);
+            insert.run(textBytes(row.text));
             if (oracleMatch.get(`"${token.replaceAll('"', '""')}"`)?.rowid !== 1) throw new Error();
           }
           if (!token.length) throw new Error();
@@ -499,7 +605,7 @@ async function verifyFts(db, rows, tokenizer) {
       const { id, token } = probes[index];
       if (entry === undefined) {
         entry = JSON.stringify([
-          token ? `"${token.replaceAll('"', '""')}"` : '"index-migration-tokenless-probe"', id,
+          token && typeof token === 'object' ? token : token ? `"${token.replaceAll('"', '""')}"` : '"index-migration-tokenless-probe"', id,
         ]);
         entryBytes = Buffer.byteLength(JSON.stringify(entry)) - 2;
         if (6 + entryBytes > COPY_PAGE_BYTES) {
@@ -516,7 +622,9 @@ async function verifyFts(db, rows, tokenizer) {
     }
     const matches = await db.query(`SELECT blocks_fts.rowid
       FROM json_each(?) AS probe CROSS JOIN blocks_fts
-      WHERE blocks_fts MATCH json_extract(probe.value,'$[0]')
+      WHERE blocks_fts MATCH CASE WHEN json_type(probe.value,'$[0]') = 'object'
+          THEN CAST(unhex(json_extract(probe.value,'$[0].x')) AS TEXT)
+          ELSE json_extract(probe.value,'$[0]') END
         AND blocks_fts.rowid = CAST(json_extract(probe.value,'$[1]') AS INTEGER)`,
     [`[${entries.join(',')}]`]);
     for (const row of matches) {
@@ -545,7 +653,7 @@ function blockPageLayout(columns) {
   // marker, including null markers; dense short rows must budget these bytes too.
   const responseOverhead = columns.reduce((bytes, column, index) => bytes
     + Buffer.byteLength(JSON.stringify(column)) + 1
-    + Buffer.byteLength(JSON.stringify(markerNames[index])) + 6, 0);
+    + Buffer.byteLength(JSON.stringify(markerNames[index])) + 7, 0);
   // Even an unusually wide single row remains bounded when many individually short
   // TEXT columns need escaping. Larger values use the same lossless hex transport.
   const inlineBytes = Math.min(SMALL_ROW_BYTES, Math.floor(
@@ -553,21 +661,39 @@ function blockPageLayout(columns) {
       / (6 * columns.length),
   ));
   if (inlineBytes < 1) throw copyInvariant(COPY_INVARIANTS.COLUMN_BUDGET, 'block column names exceed the bounded response budget', COPY_PHASES.SETUP);
+  const legacyResponseOverhead = responseOverhead - columns.length;
+  const legacyInlineBytes = Math.min(SMALL_ROW_BYTES, Math.floor(
+    (COPY_PAGE_BYTES - RESPONSE_ENVELOPE_BYTES - legacyResponseOverhead - columns.length * 32)
+      / (6 * columns.length),
+  ));
   // SQLite length(TEXT) stops at an embedded NUL. BLOB lengths count every stored UTF-8
   // byte, including JSON-escaped NULs in the response budget below.
-  const selectors = quoted.flatMap((column, index) => {
+  const legacySelectors = quoted.flatMap((column, index) => {
     const long = `typeof(${column}) = 'text' AND length(CAST(${column} AS BLOB)) >
-      CASE WHEN "__copy_raw_bytes" > ${SMALL_ROW_BYTES} THEN ${inlineBytes} ELSE ${SMALL_ROW_BYTES} END`;
+      CASE WHEN "__copy_raw_bytes" > ${SMALL_ROW_BYTES} THEN ${legacyInlineBytes} ELSE ${SMALL_ROW_BYTES} END`;
     return [
       `CASE WHEN ${long} THEN NULL ELSE ${column} END AS ${column}`,
       `CASE WHEN ${long} THEN length(CAST(${column} AS BLOB)) ELSE NULL END AS ${quote(markerNames[index])}`,
     ];
   }).join(',');
+  // All TEXT, including short values, crosses JSON only as ASCII hex. A negative
+  // marker retains REAL storage class without adding another result column.
+  const selectors = quoted.flatMap((column, index) => {
+    const length = `length(CAST(${column} AS BLOB))`;
+    const threshold = `CASE WHEN "__copy_raw_bytes" > ${SMALL_ROW_BYTES} THEN ${inlineBytes} ELSE ${SMALL_ROW_BYTES} END`;
+    return [
+      `CASE WHEN typeof(${column}) = 'text' THEN CASE WHEN ${length} > ${threshold}
+        THEN NULL ELSE hex(CAST(${column} AS BLOB)) END ELSE ${column} END AS ${column}`,
+      `CASE typeof(${column}) WHEN 'text' THEN ${length} WHEN 'real' THEN -1 ELSE NULL END AS ${quote(markerNames[index])}`,
+    ];
+  }).join(',');
   return {
-    quoted, paths, markerNames, inlineBytes, responseOverhead, selectors,
+    quoted, paths, markerNames, inlineBytes, responseOverhead, selectors, legacySelectors, legacyInlineBytes, legacyResponseOverhead,
     rawSize: qualified.map((column) => `COALESCE(length(CAST(${column} AS BLOB)),0)`).join('+'),
     hasBlob: qualified.map((column) => `typeof(${column}) = 'blob'`).join(' OR '),
     jsonSize: `${qualified.map((column) => `length(CAST(json_quote(${column}) AS BLOB))`).join('+')}+${columns.length + 1}`,
+    transportSize: `${qualified.map((column) => `CASE WHEN typeof(${column}) = 'text'
+      THEN 2 * length(CAST(${column} AS BLOB)) + 2 ELSE length(CAST(json_quote(${column}) AS BLOB)) END`).join('+')}+${columns.length + 1}`,
   };
 }
 
@@ -582,25 +708,28 @@ async function blockCandidates(db, layout, { after, ids, descending = false }) {
     FROM blocks AS b WHERE ${where} ORDER BY b.id ${order} LIMIT ?
   ) SELECT candidates.id, raw_bytes,
     CASE WHEN raw_bytes > ${SMALL_ROW_BYTES} OR has_blob THEN NULL
-      ELSE (${layout.jsonSize}) END AS row_bytes
+      ELSE (${layout.jsonSize}) END AS row_bytes,
+    CASE WHEN raw_bytes > ${SMALL_ROW_BYTES} OR has_blob THEN NULL
+      ELSE (${layout.transportSize}) END AS transport_bytes
     FROM candidates JOIN blocks AS b ON b.id = candidates.id ORDER BY candidates.id ${order}`, params);
 }
 
-function boundedCandidatePage(candidates, layout, start = 0, phase) {
+function boundedCandidatePage(candidates, layout, start = 0, phase, mode = 'transport') {
   const selected = [];
   let bytes = RESPONSE_ENVELOPE_BYTES + 2;
   for (let index = start; index < candidates.length && selected.length < COPY_PAGE_ROWS; index += 1) {
     const candidate = candidates[index];
     if (!Number.isSafeInteger(candidate.id) || !Number.isSafeInteger(candidate.raw_bytes)
-      || candidate.raw_bytes < 0 || (candidate.row_bytes !== null
-        && (!Number.isSafeInteger(candidate.row_bytes) || candidate.row_bytes < 0))) {
+      || candidate.raw_bytes < 0 || ['row_bytes', 'transport_bytes'].some((key) => candidate[key] !== null
+        && (!Number.isSafeInteger(candidate[key]) || candidate[key] < 0))) {
       throw copyInvariant(COPY_INVARIANTS.PAGE_METADATA, 'invalid block page size metadata', phase);
     }
-    if (candidate.row_bytes === null) {
+    const size = mode === 'transport' ? candidate.transport_bytes : candidate.row_bytes;
+    if (size === null) {
       if (!selected.length) selected.push(candidate);
       break;
     }
-    const rowBytes = candidate.row_bytes + layout.responseOverhead + 1;
+    const rowBytes = size + layout.responseOverhead + 1;
     if (selected.length && bytes + rowBytes > COPY_PAGE_BYTES) break;
     selected.push(candidate);
     bytes += rowBytes;
@@ -608,7 +737,7 @@ function boundedCandidatePage(candidates, layout, start = 0, phase) {
   return selected;
 }
 
-async function readBlockRows(db, columns, ids, layout = blockPageLayout(columns), candidates = null) {
+async function readBlockRows(db, columns, ids, layout = blockPageLayout(columns), candidates = null, legacy = false) {
   const phase = db[DIAGNOSTIC_PHASE];
   if (!ids.length) return [];
   if (ids.length > COPY_PAGE_ROWS) throw copyInvariant(COPY_INVARIANTS.ROW_CAP, 'block readback exceeds the copy row cap', phase);
@@ -626,18 +755,20 @@ async function readBlockRows(db, columns, ids, layout = blockPageLayout(columns)
   const rows = [];
   const seen = new Set();
   for (let offset = 0; offset < sizes.length;) {
-    const page = boundedCandidatePage(sizes, layout, offset, phase);
+    const page = boundedCandidatePage(sizes, layout, offset, phase, legacy ? 'legacy' : 'transport');
     const pageIds = page.map((candidate) => candidate.id);
     const wanted = new Map(page.map((candidate) => [candidate.id, candidate.raw_bytes]));
     const found = await db.query(`WITH sized AS MATERIALIZED (
       SELECT b.*, (${layout.rawSize}) AS "__copy_raw_bytes" FROM blocks AS b
       WHERE b.id IN (${JSON_IDS_SQL})
-    ) SELECT ${layout.selectors} FROM sized ORDER BY id`, [JSON.stringify(pageIds)]);
+    ) SELECT ${legacy ? layout.legacySelectors : layout.selectors} FROM sized ORDER BY id`, [JSON.stringify(pageIds)]);
     for (const row of found) {
       if (!wanted.has(row.id) || seen.has(row.id)) throw copyInvariant(COPY_INVARIANTS.ROW_IDENTITY, 'block readback cardinality/identity mismatch', phase);
       seen.add(row.id);
       const inlineBytes = wanted.get(row.id) > SMALL_ROW_BYTES ? layout.inlineBytes : SMALL_ROW_BYTES;
       let rowIdsJson;
+      const types = {};
+      Object.defineProperty(row, STORAGE_CLASSES, { value: types });
       for (let index = 0; index < columns.length; index += 1) {
         const marker = layout.markerNames[index];
         if (!Object.hasOwn(row, columns[index]) || !Object.hasOwn(row, marker)) {
@@ -645,8 +776,26 @@ async function readBlockRows(db, columns, ids, layout = blockPageLayout(columns)
         }
         const length = row[marker];
         delete row[marker];
-        if (length === null) continue;
-        if (!Number.isSafeInteger(length) || length <= inlineBytes || row[columns[index]] !== null) {
+        const column = columns[index];
+        if (length === null) {
+          types[column] = row[column] === null ? 'null' : typeof row[column] === 'number'
+            ? Number.isInteger(row[column]) ? 'integer' : 'real' : 'text';
+          continue;
+        }
+        if (!legacy && length === -1 && typeof row[column] === 'number') {
+          types[column] = 'real';
+          continue;
+        }
+        types[column] = 'text';
+        if (!legacy && Number.isSafeInteger(length) && length >= 0 && length <= inlineBytes) {
+          if (typeof row[column] !== 'string') {
+            throw copyInvariant(COPY_INVARIANTS.LONG_LENGTH, 'invalid inline TEXT byte length metadata', phase);
+          }
+          row[column] = decodedText(row[column], length, phase);
+          continue;
+        }
+        if (!Number.isSafeInteger(length) || length <= inlineBytes || row[column] !== null
+          || !legacy && length > MAX_CELL_BYTES) {
           throw copyInvariant(COPY_INVARIANTS.LONG_LENGTH, 'invalid long-column byte length metadata', phase);
         }
         const chunks = [];
@@ -661,11 +810,11 @@ async function readBlockRows(db, columns, ids, layout = blockPageLayout(columns)
           }
           chunks.push(Buffer.from(parts[0].bytes, 'hex'));
         }
-        try {
-          row[columns[index]] = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.concat(chunks, length));
-        } catch {
-          throw copyInvariant(COPY_INVARIANTS.LONG_UTF8, 'invalid long-column UTF-8', phase);
-        }
+        const bytes = Buffer.concat(chunks, length);
+        if (legacy) {
+          try { row[column] = TEXT_UTF8.decode(bytes); }
+          catch { throw copyInvariant(COPY_INVARIANTS.LONG_UTF8, 'invalid long-column UTF-8', phase); }
+        } else row[column] = decodedText(bytes.toString('hex'), length, phase);
       }
       rows.push(row);
     }
@@ -692,7 +841,11 @@ function canonicalPage(columns, rows, phase) {
 }
 
 async function readCopyPage(db, columns, layout, candidates) {
-  const selected = boundedCandidatePage(candidates, layout, 0, db[DIAGNOSTIC_PHASE]);
+  // Preserve logical page dimensions/hash grouping, then apply the canonical
+  // cap below. Raw hex response groups are independently bounded inside the
+  // reader, so expansion cannot evade a later FTS verification group.
+  const selected = boundedCandidatePage(candidates, { ...layout, responseOverhead: layout.legacyResponseOverhead },
+    0, db[DIAGNOSTIC_PHASE], 'legacy');
   const ids = selected.map((candidate) => candidate.id);
   const rows = await readBlockRows(db, columns, ids, layout, selected);
   if (rows.length !== ids.length) throw copyInvariant(COPY_INVARIANTS.SOURCE_PAGE_MISSING, 'frozen source page disappeared', COPY_PHASES.SOURCE_PAGE_READ);
@@ -700,26 +853,90 @@ async function readCopyPage(db, columns, layout, candidates) {
   // starts at the last actually copied row, not the last candidate or transport row.
   return canonicalPage(columns, rows, db[DIAGNOSTIC_PHASE]);
 }
+// Only the one-time checkpoint upgrade calls the old reader. In particular, do
+// not emulate its malformed-TEXT rendering: the same runtime must prove its hash.
+async function readLegacyBlockRows(db, columns, ids, layout) {
+  const legacyLayout = { ...layout, inlineBytes: layout.legacyInlineBytes,
+    responseOverhead: layout.legacyResponseOverhead, jsonSize: `${layout.quoted.map((column) =>
+    `length(CAST(json_quote(b.${column}) AS BLOB))`).join('+')}+${columns.length + 1}` };
+  return readBlockRows(db, columns, ids, legacyLayout, null, true);
+}
+
+function transportValue(columns, row, index) {
+  const value = row[columns[index]];
+  return rowTypes(columns, row)[index] === 'real' ? { r: value } : value;
+}
+
+function decodedSql(row, path) {
+  return `CASE WHEN json_type(${row},${path}) = 'object' THEN
+    CASE WHEN json_type(${row},${path.slice(0, -1)}.x') = 'text'
+      THEN CAST(unhex(json_extract(${row},${path.slice(0, -1)}.x')) AS TEXT)
+      ELSE CAST(json_extract(${row},${path.slice(0, -1)}.r') AS REAL) END
+    ELSE json_extract(${row},${path}) END`;
+}
+
+function assertRequest(statement, phase) {
+  if (statement.params.length > 100 || Buffer.byteLength(statement.sql) > 100_000
+    || Buffer.byteLength(JSON.stringify(statement)) > MAX_REQUEST_BYTES) {
+    throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES, 'exact TEXT request exceeds bounded transport limits', phase);
+  }
+  return statement;
+}
+
+function boundRow(columns, row, phase) {
+  const params = [];
+  const values = columns.map((column, index) => {
+    const value = row[column];
+    const type = rowTypes(columns, row)[index];
+    if (type !== 'text') {
+      params.push(value);
+      return type === 'real' ? 'CAST(? AS REAL)' : type === 'integer' ? 'CAST(? AS INTEGER)' : '?';
+    }
+    const bytes = textBytes(value);
+    if (bytes.length > MAX_CELL_BYTES) throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES, 'TEXT cell exceeds bounded transport limits', phase);
+    const chunks = [];
+    for (let offset = 0; offset < bytes.length || offset === 0; offset += WRITE_SLICE_BYTES) {
+      chunks.push(`(${chunks.length},?)`);
+      params.push(bytes.subarray(offset, offset + WRITE_SLICE_BYTES).toString('hex'));
+    }
+    return `CAST((SELECT group_concat(unhex(column2), '' ORDER BY column1)
+      FROM (VALUES ${chunks.join(',')})) AS TEXT)`;
+  });
+  return { values, params };
+}
+
+function pageInsert(columns, rows, layout) {
+  const json = JSON.stringify(rows.map((row) => columns.map((_, index) => transportValue(columns, row, index))));
+  if (Buffer.byteLength(json) <= COPY_PAGE_BYTES) return assertRequest({
+    sql: `INSERT INTO blocks (${layout.quoted.join(',')})
+      SELECT ${layout.paths.map((path) => decodedSql('value', path)).join(',')} FROM json_each(?)`,
+    params: [json],
+  }, COPY_PHASES.PAGE_WRITE);
+  if (rows.length !== 1) throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES, 'shard page exceeds the canonical JSON byte cap', COPY_PHASES.PAGE_WRITE);
+  const bound = boundRow(columns, rows[0], COPY_PHASES.PAGE_WRITE);
+  return assertRequest({ sql: `INSERT INTO blocks (${layout.quoted.join(',')}) VALUES (${bound.values.join(',')})`,
+    params: bound.params }, COPY_PHASES.PAGE_WRITE);
+}
 
 async function replaceShardPage(db, columns, rows, layout) {
   db = phaseDb(db, COPY_PHASES.PAGE_WRITE);
   const idsJson = JSON.stringify(rows.map((row) => row.id));
   const page = canonicalPage(columns, rows, COPY_PHASES.PAGE_WRITE);
   if (page.rows.length !== rows.length) throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES, 'shard page exceeds the canonical JSON byte cap', COPY_PHASES.PAGE_WRITE);
-  const insert = page.bytes <= COPY_PAGE_BYTES
-    ? { sql: `INSERT INTO blocks (${layout.quoted.join(',')})
-        SELECT ${layout.paths.map((path) => `json_extract(value,${path})`).join(',')} FROM json_each(?)`, params: [page.json] }
-    : { sql: `INSERT INTO blocks (${layout.quoted.join(',')}) VALUES (${inList(columns.length)})`,
-        params: columns.map((column) => rows[0][column]) };
+  const insert = pageInsert(columns, rows, layout);
   // Ordinary pages use exactly four statements, independent of their row count.
-  await db.batch([
+  const statements = [
     { sql: `INSERT INTO blocks_fts (blocks_fts, rowid, text)
       SELECT 'delete', id, text FROM blocks WHERE id IN (${JSON_IDS_SQL})`, params: [idsJson] },
     { sql: `DELETE FROM blocks WHERE id IN (${JSON_IDS_SQL})`, params: [idsJson] },
     insert,
     { sql: `INSERT INTO blocks_fts (rowid, text)
       SELECT id, text FROM blocks WHERE id IN (${JSON_IDS_SQL})`, params: [idsJson] },
-  ]);
+  ];
+  if (Buffer.byteLength(JSON.stringify(statements)) + RESPONSE_ENVELOPE_BYTES > MAX_REQUEST_BYTES) {
+    throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES, 'destination batch exceeds bounded transport limits', COPY_PHASES.PAGE_WRITE);
+  }
+  await db.batch(statements);
 }
 
 async function discardUnacknowledgedPage(shards, pending) {
@@ -747,6 +964,9 @@ async function pendingSourceChanged(source, state, layout) {
 async function verifyPending(source, shards, state, layout, tokenizer) {
   const ids = state.pending.rows.map((row) => row.id);
   const remaining = new Map((await readBlockRows(source, state.columns, ids, layout)).map((row) => [row.id, row]));
+  if (remaining.size !== 0 && remaining.size !== ids.length) {
+    throw copyInvariant(COPY_INVARIANTS.SOURCE_MISSING, 'pending source page is partially missing', COPY_PHASES.SOURCE_PAGE_READ);
+  }
   const verified = new Map();
   for (let shard = 0; shard < shards.length; shard += 1) {
     const items = state.pending.rows.filter((row) => row.shard === shard);
@@ -759,11 +979,15 @@ async function verifyPending(source, shards, state, layout, tokenizer) {
       throw copyInvariant(COPY_INVARIANTS.DESTINATION_IDENTITY, 'destination readback cardinality/identity mismatch; source retained', COPY_PHASES.PAGE_READBACK);
     }
     for (const item of items) {
-      if (!found.has(item.id) || rowDigest(state.columns, found.get(item.id), COPY_PHASES.PAGE_READBACK) !== item.sha256) {
+      const expectedTypes = state.pending.types[state.pending.rows.indexOf(item)];
+      if (!found.has(item.id) || JSON.stringify(rowTypes(state.columns, found.get(item.id))) !== JSON.stringify(expectedTypes)
+        || rowDigest(state.columns, found.get(item.id), COPY_PHASES.PAGE_READBACK) !== item.sha256) {
         throw copyInvariant(COPY_INVARIANTS.READBACK_SHA256, 'readback SHA-256 mismatch; source retained', COPY_PHASES.PAGE_READBACK);
       }
       const original = remaining.get(item.id);
-      if (original && rowDigest(state.columns, original, source[DIAGNOSTIC_PHASE]) !== item.sha256) {
+      if (original && (rowDigest(state.columns, original, source[DIAGNOSTIC_PHASE]) !== item.sha256
+        || JSON.stringify(rowTypes(state.columns, original)) !== JSON.stringify(expectedTypes)
+        || routeRow(original, shards.length, COPY_PHASES.SOURCE_PAGE_READ) !== shard)) {
         throw copyInvariant(COPY_INVARIANTS.SOURCE_CHANGED, 'frozen source changed; refusing deletion', COPY_PHASES.SOURCE_PAGE_READ);
       }
       if (!original && state.pending.phase !== 'verified') {
@@ -773,7 +997,147 @@ async function verifyPending(source, shards, state, layout, tokenizer) {
     await verifyFts(shards[shard], destination, tokenizer);
     for (const row of destination) verified.set(row.id, row);
   }
-  return verified;
+  return { verified, remainingRows: remaining.size };
+}
+
+async function migrateLegacyCopy(source, shards, state, checkpoint, layout, tokenizer) {
+  if (state.encoding === COPY_ENCODING) return;
+  if (!state.pending) {
+    state.encoding = COPY_ENCODING;
+    await checkpoint(state);
+    return;
+  }
+  const pending = state.pending, ids = pending.rows.map((item) => item.id);
+  const freeze = await sourceFreezePhase(source);
+  if (state.rows > 0 && freeze !== 'frozen') throw copyInvariant(COPY_INVARIANTS.FREEZE_MISSING,
+    'legacy recovery requires its acknowledged source freeze', COPY_PHASES.SOURCE_FREEZE_READ);
+  const legacy = new Map((await readLegacyBlockRows(source, state.columns, ids, layout)).map((row) => [row.id, row]));
+  const exact = new Map((await readBlockRows(source, state.columns, ids, layout)).map((row) => [row.id, row]));
+  if (exact.size !== 0 && exact.size !== pending.rows.length) {
+    throw copyInvariant(COPY_INVARIANTS.SOURCE_MISSING, 'legacy pending source is partially missing', COPY_PHASES.SOURCE_PAGE_READ);
+  }
+  const legacyDestinations = new Map(), rawDestinations = new Map();
+  for (let shard = 0; shard < shards.length; shard += 1) {
+    const shardIds = pending.rows.filter((item) => item.shard === shard).map((item) => item.id);
+    if (!shardIds.length) continue;
+    const db = phaseDb(shards[shard], COPY_PHASES.PAGE_READBACK);
+    const oldRows = await readLegacyBlockRows(db, state.columns, shardIds, layout);
+    const rawRows = await readBlockRows(db, state.columns, shardIds, layout);
+    for (const row of oldRows) legacyDestinations.set(row.id, row);
+    for (const row of rawRows) rawDestinations.set(row.id, row);
+    await verifyFts(shards[shard], rawRows, tokenizer);
+  }
+  const next = [], types = [], destinations = [], missingSource = [];
+  for (const item of pending.rows) {
+    const old = legacy.get(item.id), row = exact.get(item.id);
+    if (Boolean(old) !== Boolean(row) || old && rowDigest(state.columns, old) !== item.sha256) {
+      throw copyInvariant(COPY_INVARIANTS.SOURCE_CHANGED, 'legacy pending source proof changed', COPY_PHASES.SOURCE_PAGE_READ);
+    }
+    if (row) {
+      if (routeRow(row, shards.length, COPY_PHASES.SOURCE_PAGE_READ) !== item.shard
+        || state.columns.some((column) => typeof row[column] !== 'object' || row[column] === null
+          ? JSON.stringify(row[column]) !== JSON.stringify(old[column]) : (invalidText(row[column]), false))) {
+        throw copyInvariant(COPY_INVARIANTS.SOURCE_CHANGED, 'legacy source differs outside raw TEXT recovery', COPY_PHASES.SOURCE_PAGE_READ);
+      }
+    } else if (pending.phase !== 'verified' || freeze !== 'frozen') {
+      throw copyInvariant(COPY_INVARIANTS.SOURCE_MISSING, 'legacy unverified source block disappeared', COPY_PHASES.SOURCE_PAGE_READ);
+    }
+    const oldDest = legacyDestinations.get(item.id), rawDest = rawDestinations.get(item.id);
+    if (Boolean(oldDest) !== Boolean(rawDest) || !oldDest && pending.phase !== 'copying'
+      || oldDest && (rowDigest(state.columns, oldDest) !== item.sha256
+        || rowDigest(state.columns, rawDest) !== item.sha256)) {
+      throw copyInvariant(COPY_INVARIANTS.READBACK_SHA256, 'legacy pending destination proof changed', COPY_PHASES.PAGE_READBACK);
+    }
+    if (!row) missingSource.push(item.id);
+    const target = row ?? rawDest;
+    next.push({ ...item, sha256: rowDigest(state.columns, target) });
+    types.push(rowTypes(state.columns, target));
+    destinations.push(rawDest ? { sha256: rowDigest(state.columns, rawDest), types: rowTypes(state.columns, rawDest) } : null);
+  }
+  // Never replace a legacy pending proof before both original views have passed.
+  // The old digest cannot distinguish malformed byte sequences with equal lossy
+  // rendering. The frozen authoritative source, not that digest, supplies bytes.
+  state.encoding = COPY_ENCODING;
+  state.pending = { phase: 'recovering', rows: next, types,
+    recovery: { legacyRows: pending.rows, destinations, missingSource } };
+  await checkpoint(state);
+}
+
+async function repairLegacyPending(source, shards, state, checkpoint, layout, tokenizer) {
+  const pending = state.pending;
+  const originals = new Map((await readBlockRows(source, state.columns, pending.rows.map((item) => item.id), layout))
+    .map((row) => [row.id, row]));
+  const repairs = shards.map(() => []);
+  const destinations = new Map();
+  for (let shard = 0; shard < shards.length; shard += 1) {
+    const ids = pending.rows.filter((item) => item.shard === shard).map((item) => item.id);
+    if (!ids.length) continue;
+    const rows = await readBlockRows(phaseDb(shards[shard], COPY_PHASES.PAGE_READBACK), state.columns, ids, layout);
+    for (const row of rows) destinations.set(row.id, row);
+    await verifyFts(shards[shard], rows, tokenizer);
+  }
+  for (let index = 0; index < pending.rows.length; index += 1) {
+    const item = pending.rows[index], original = originals.get(item.id);
+    if (original ? rowDigest(state.columns, original) !== item.sha256
+      || JSON.stringify(rowTypes(state.columns, original)) !== JSON.stringify(pending.types[index])
+      || routeRow(original, shards.length, COPY_PHASES.SOURCE_PAGE_READ) !== item.shard
+      : !pending.recovery.missingSource.includes(item.id)) {
+      throw copyInvariant(COPY_INVARIANTS.SOURCE_CHANGED, 'raw recovery source proof changed', COPY_PHASES.SOURCE_PAGE_READ);
+    }
+    const baseline = pending.recovery.destinations[index], row = destinations.get(item.id);
+    const digest = row && rowDigest(state.columns, row), storage = row && JSON.stringify(rowTypes(state.columns, row));
+    const complete = row && digest === item.sha256 && storage === JSON.stringify(pending.types[index]);
+    if (!complete && (baseline ? !row || digest !== baseline.sha256
+      || storage !== JSON.stringify(baseline.types) : Boolean(row))) {
+      throw copyInvariant(COPY_INVARIANTS.READBACK_SHA256, 'raw recovery destination proof changed', COPY_PHASES.PAGE_READBACK);
+    }
+    if (!complete) {
+      if (!original) throw copyInvariant(COPY_INVARIANTS.SOURCE_MISSING, 'raw recovery source is missing', COPY_PHASES.SOURCE_PAGE_READ);
+      repairs[item.shard].push(original);
+    }
+  }
+  for (let shard = 0; shard < shards.length; shard += 1) {
+    // A legacy page can exceed the new hex/canonical page dimensions. Rechunk
+    // destination writes only; the durable pending proof/cursor stays intact.
+    for (let offset = 0; offset < repairs[shard].length;) {
+      const page = canonicalPage(state.columns, repairs[shard].slice(offset), COPY_PHASES.PAGE_WRITE);
+      await replaceShardPage(shards[shard], state.columns, page.rows, layout);
+      offset += page.rows.length;
+    }
+  }
+  pending.phase = 'verified';
+  await verifyPending(source, shards, state, layout, tokenizer);
+  await checkpoint(state);
+}
+
+function exactComparison(stored, copied) {
+  return `(typeof(${stored}) IS typeof(${copied}) AND ${stored} IS ${copied}
+    AND (typeof(${stored}) != 'text' OR CAST(${stored} AS BLOB) IS CAST(${copied} AS BLOB)))`;
+}
+
+function retirementDeletes(columns, rows, layout) {
+  const statements = [];
+  for (let offset = 0; offset < rows.length;) {
+    const page = canonicalPage(columns, rows.slice(offset), COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
+    const json = JSON.stringify(page.rows.map((row) => columns.map((_, index) => transportValue(columns, row, index))));
+    const compare = layout.quoted.map((column) => exactComparison(`blocks.${column}`, `verified.${column}`)).join(' AND ');
+    let sql, params;
+    if (Buffer.byteLength(json) <= COPY_PAGE_BYTES) {
+      sql = `WITH verified AS MATERIALIZED (SELECT ${layout.paths.map((path, index) =>
+        `${decodedSql('value', path)} AS ${layout.quoted[index]}`).join(',')} FROM json_each(?))
+        DELETE FROM blocks WHERE id IN (SELECT id FROM verified)
+          AND EXISTS (SELECT 1 FROM verified WHERE verified.id = blocks.id AND ${compare})`;
+      params = [json];
+    } else {
+      const bound = boundRow(columns, page.rows[0], COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
+      sql = `WITH verified (${layout.quoted.join(',')}) AS MATERIALIZED (SELECT ${bound.values.join(',')})
+        DELETE FROM blocks WHERE EXISTS (SELECT 1 FROM verified WHERE ${compare})`;
+      params = bound.params;
+    }
+    statements.push(assertRequest({ sql, params }, COPY_PHASES.SOURCE_DELETE_AND_FREEZE));
+    offset += page.rows.length;
+  }
+  return statements;
 }
 
 // Failure-only observation of the already verified canonical snapshot. This never
@@ -786,12 +1150,11 @@ async function sourceRetirementComparison(source, columns, layout, page) {
   const types = ['null', 'integer', 'real', 'text', 'blob'];
   const typeBits = (value) => `CASE typeof(${value}) ${types.map((type, index) =>
     `WHEN '${type}' THEN ${1 << index}`).join(' ')} ELSE 0 END`;
-  // Keep the source column's affinity in the exact CAS equality predicate.
-  // A CASE selecting only stored values would lose that affinity before IS.
+  // Storage class and TEXT bytes are compared explicitly, so neither a CASE's
+  // missing affinity nor a column collation can hide a physical difference.
   const stored = `CASE c.n ${columns.map((_, index) =>
     `WHEN ${index} THEN b.${layout.quoted[index]}`).join(' ')} END`;
-  const equal = `CASE c.n ${columns.map((_, index) =>
-    `WHEN ${index} THEN b.${layout.quoted[index]} IS json_extract(v.row,${layout.paths[index]})`).join(' ')} END`;
+  const copied = `CASE c.n ${columns.map((_, index) => `WHEN ${index} THEN ${decodedSql('v.row', layout.paths[index])}`).join(' ')} END`;
   const groupCount = Math.ceil(columns.length / 16);
   // One row per cell keeps every SELECT narrow. Only two DISTINCT aggregates
   // collect type-bit sets, grouped by column, rather than two per source column.
@@ -799,11 +1162,10 @@ async function sourceRetirementComparison(source, columns, layout, page) {
     SELECT json_extract(value,${layout.paths[idIndex]}), value FROM json_each(?)
   ), column_indexes(n) AS (VALUES ${columns.map((_, index) => `(${index})`).join(',')}
   ), cells AS MATERIALIZED (
-    SELECT v.id, c.n, b.id IS NOT NULL AS present, ${stored} AS stored,
-      json_extract(v.row,'$[' || c.n || ']') AS copied, ${equal} AS is_equal
+    SELECT v.id, c.n, b.id IS NOT NULL AS present, ${stored} AS stored, ${copied} AS copied
     FROM verified AS v LEFT JOIN blocks AS b ON b.id = v.id CROSS JOIN column_indexes AS c
   ), flags AS MATERIALIZED (
-    SELECT id, n, present, present AND NOT is_equal AS mismatch,
+    SELECT id, n, present, present AND NOT ${exactComparison('stored', 'copied')} AS mismatch,
       typeof(stored) IS NOT typeof(copied) AS type_mismatch,
       CAST(stored AS BLOB) IS NOT CAST(copied AS BLOB) AS byte_mismatch,
       length(CAST(stored AS BLOB)) IS NOT length(CAST(copied AS BLOB)) AS length_mismatch,
@@ -876,22 +1238,32 @@ async function sourceRetirementComparison(source, columns, layout, page) {
   };
 }
 
+async function acknowledgePending(state, checkpoint) {
+  state.after = state.pending.rows.at(-1).id;
+  state.rows += state.pending.rows.length;
+  state.sha256 = sha(`${state.sha256}:${JSON.stringify(state.pending.rows)}`);
+  state.pending = null;
+  await checkpoint(state);
+}
+
 async function finishPending(source, shards, state, gate, checkpoint, layout, tokenizer) {
+  if (state.pending.phase === 'recovering') await repairLegacyPending(source, shards, state, checkpoint, layout, tokenizer);
   if (state.pending.phase === 'copying') {
     const rows = await readBlockRows(source, state.columns, state.pending.rows.map((row) => row.id), layout);
     const found = new Map(rows.map((row) => [row.id, row]));
     for (const item of state.pending.rows) {
-      if (!found.has(item.id) || rowDigest(state.columns, found.get(item.id), source[DIAGNOSTIC_PHASE]) !== item.sha256) {
+      if (!found.has(item.id) || rowDigest(state.columns, found.get(item.id), source[DIAGNOSTIC_PHASE]) !== item.sha256
+        || JSON.stringify(rowTypes(state.columns, found.get(item.id))) !== JSON.stringify(state.pending.types[state.pending.rows.indexOf(item)])) {
         throw copyInvariant(COPY_INVARIANTS.SOURCE_CHANGED, 'source block changed before copy', COPY_PHASES.SOURCE_PAGE_READ);
       }
     }
     const routed = shards.map(() => []);
-    for (const row of rows) routed[indexShardForSessionId(row.session_id, shards.length)].push(row);
+    for (const row of rows) routed[routeRow(row, shards.length, COPY_PHASES.SOURCE_PAGE_READ)].push(row);
     for (let shard = 0; shard < shards.length; shard += 1) {
       if (routed[shard].length) await replaceShardPage(shards[shard], state.columns, routed[shard], layout);
     }
   }
-  const verified = await verifyPending(source, shards, state, layout, tokenizer);
+  const { verified, remainingRows } = await verifyPending(source, shards, state, layout, tokenizer);
   await gate();
   state.pending.phase = 'verified';
   await checkpoint(state);
@@ -900,20 +1272,20 @@ async function finishPending(source, shards, state, gate, checkpoint, layout, to
   const ids = state.pending.rows.map((row) => row.id);
   const phase = await sourceFreezePhase(source);
   if (state.rows > 0 && phase !== 'frozen') throw copyInvariant(COPY_INVARIANTS.FREEZE_MISSING, 'source freeze vanished after verified deletion', COPY_PHASES.SOURCE_FREEZE_READ);
-  const page = canonicalPage(state.columns, ids.map((id) => verified.get(id)), COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
-  if (page.rows.length !== ids.length) throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES, 'verified source page exceeds the canonical JSON byte cap', COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
-  const idIndex = state.columns.indexOf('id');
-  const statements = [page.bytes <= COPY_PAGE_BYTES ? {
-    sql: `WITH verified(id,row) AS MATERIALIZED (
-      SELECT json_extract(value,${layout.paths[idIndex]}), value FROM json_each(?)
-    ) DELETE FROM blocks WHERE id IN (SELECT id FROM verified)
-      AND EXISTS (SELECT 1 FROM verified WHERE verified.id = blocks.id
-        AND ${layout.quoted.map((column, index) => `blocks.${column} IS json_extract(verified.row,${layout.paths[index]})`).join(' AND ')})`,
-    params: [page.json],
-  } : {
-    sql: `DELETE FROM blocks WHERE ${layout.quoted.map((column) => `${column} IS ?`).join(' AND ')}`,
-    params: state.columns.map((column) => page.rows[0][column]),
-  }];
+  if (!remainingRows) {
+    if (phase !== 'frozen') throw copyInvariant(COPY_INVARIANTS.FREEZE_MISSING,
+      'acknowledged source page lacks its atomic freeze', COPY_PHASES.SOURCE_FREEZE_READ);
+    // An ambiguous successful DELETE is observed, not replayed. Full exact
+    // destination/FTS verification and the committed freeze prove safe ACK.
+    await acknowledgePending(state, checkpoint);
+    return;
+  }
+  const verifiedRows = ids.map((id) => verified.get(id));
+  const canonical = verifiedRows.map((row) => canonicalRow(state.columns, row));
+  const diagnosticJson = JSON.stringify(verifiedRows.map((row) => state.columns.map((_, index) => transportValue(state.columns, row, index))));
+  const page = { rows: verifiedRows, canonical,
+    json: Buffer.byteLength(diagnosticJson) <= COPY_PAGE_BYTES ? diagnosticJson : null };
+  const statements = retirementDeletes(state.columns, verifiedRows, layout);
   if (phase === 'frozen') statements.unshift({
     sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'copying' WHERE id = 1`, params: [],
   });
@@ -923,6 +1295,9 @@ async function finishPending(source, shards, state, gate, checkpoint, layout, to
     { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'frozen' WHERE id = 1`, params: [] },
     { sql: `SELECT id FROM blocks WHERE id IN (${JSON_IDS_SQL})`, params: [JSON.stringify(ids)] },
   );
+  if (Buffer.byteLength(JSON.stringify(statements)) + RESPONSE_ENVELOPE_BYTES > MAX_REQUEST_BYTES) {
+    throw copyInvariant(COPY_INVARIANTS.PAGE_BYTES, 'source retirement batch exceeds bounded transport limits', COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
+  }
   // The temporary copying state and every delete are one transaction. Old HTTP
   // invocations never observe an unfrozen commit or delete newly changed row content.
   const retirementSource = phaseDb(source, COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
@@ -940,11 +1315,7 @@ async function finishPending(source, shards, state, gate, checkpoint, layout, to
   }
   if (deletion.length !== statements.length || !Array.isArray(deletion.at(-1)?.results)
     || deletion.at(-1).results.length) throw copyInvariant(COPY_INVARIANTS.SOURCE_DELETE, 'verified source deletion did not remove the whole page', COPY_PHASES.SOURCE_DELETE_AND_FREEZE);
-  state.after = ids.at(-1);
-  state.rows += ids.length;
-  state.sha256 = sha(`${state.sha256}:${JSON.stringify(state.pending.rows)}`);
-  state.pending = null;
-  await checkpoint(state);
+  await acknowledgePending(state, checkpoint);
 }
 
 /** Frozen, bounded, resumable full-column copy. No source writes occur before verified readback. */
@@ -954,11 +1325,12 @@ export async function copyFrozenIndex({ source, shards, gate, checkpointHook }) 
   await gate();
   const identity = copyIdentity(source, shards);
   const checkpoint = async (state) => {
+    validateCopyState(state, shards.length);
     await writeCheckpoint(phaseDb(shards[0], COPY_PHASES.CHECKPOINT_WRITE), COPY_CHECKPOINT, state);
     await checkpointHook?.(structuredClone(state));
   };
   let state = await readCheckpoint(phaseDb(shards[0], COPY_PHASES.CHECKPOINT_READ), COPY_CHECKPOINT);
-  if (state) assertIdentity(state, identity);
+  if (state) { assertIdentity(state, identity); validateCopyState(state, shards.length); }
   if (state?.state === 'complete') {
     const tables = await source.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'blocks'");
     if (tables.length && (await source.query('SELECT id FROM blocks LIMIT 1')).length) {
@@ -976,12 +1348,15 @@ export async function copyFrozenIndex({ source, shards, gate, checkpointHook }) 
       || (range.last_id !== null && (!Number.isSafeInteger(range.last_id) || range.last_id >= INDEX_ID_SPAN))) {
       throw copyInvariant(COPY_INVARIANTS.SOURCE_RANGE, 'legacy block IDs exceed reserved safe copy range', COPY_PHASES.SOURCE_PAGE_READ);
     }
-    state = { identity, columns, after: -1, rows: 0, sha256: sha(''), pending: null, state: 'pending' };
+    state = { identity, encoding: COPY_ENCODING, columns, after: -1, rows: 0, sha256: sha(''), pending: null, state: 'pending' };
     await checkpoint(state);
   } else if (JSON.stringify(state.columns) !== JSON.stringify(columns)) {
     throw copyInvariant(COPY_INVARIANTS.SOURCE_COLUMNS, 'source columns changed since the frozen copy checkpoint', COPY_PHASES.SETUP);
   }
-  if (state.rows === 0 && state.pending && await sourceFreezePhase(source) === 'absent'
+  if (state.rows > 0 && await sourceFreezePhase(source) !== 'frozen') {
+    throw copyInvariant(COPY_INVARIANTS.FREEZE_MISSING, 'source freeze vanished after verified deletion', COPY_PHASES.SOURCE_FREEZE_READ);
+  }
+  if (state.encoding === COPY_ENCODING && !state.pending?.recovery && state.rows === 0 && state.pending && await sourceFreezePhase(source) === 'absent'
     && await pendingSourceChanged(source, state, layout)) {
     // Entry-only recovery: absence of the transactionally installed guard proves
     // the first source DELETE never committed. Replan only changed/missing source
@@ -994,6 +1369,7 @@ export async function copyFrozenIndex({ source, shards, gate, checkpointHook }) 
   }
   const tokenizer = createFtsTokenizer();
   try {
+    await migrateLegacyCopy(source, shards, state, checkpoint, layout, tokenizer);
     for (;;) {
       await gate();
       if (state.pending) await finishPending(source, shards, state, gate, checkpoint, layout, tokenizer);
@@ -1010,9 +1386,9 @@ export async function copyFrozenIndex({ source, shards, gate, checkpointHook }) 
       }
       const selected = await readCopyPage(source, columns, layout, candidates);
       const page = selected.rows.map((row, index) => ({
-        id: row.id, shard: indexShardForSessionId(row.session_id, shards.length), sha256: sha(selected.canonical[index]),
+        id: row.id, shard: routeRow(row, shards.length, COPY_PHASES.SOURCE_PAGE_READ), sha256: sha(selected.canonical[index]),
       }));
-      state.pending = { phase: 'copying', rows: page };
+      state.pending = { phase: 'copying', rows: page, types: selected.rows.map((row) => rowTypes(columns, row)) };
       await checkpoint(state);
     }
   } finally {
@@ -1059,13 +1435,13 @@ export async function sourceCopyForecast({ source, shards }) {
       const rawBytesById = new Map(candidates.map((candidate) => [candidate.id, candidate.raw_bytes]));
       for (let index = 0; index < page.rows.length; index += 1) {
         const row = page.rows[index];
-        fanout.add(indexShardForSessionId(row.session_id, shards.length));
+        fanout.add(routeRow(row, shards.length, COPY_PHASES.SOURCE_PAGE_READ));
         totalRowBytes += page.sizes[index];
         maximumRowBytes = Math.max(maximumRowBytes, page.sizes[index]);
         const inlineBytes = rawBytesById.get(row.id) > SMALL_ROW_BYTES ? layout.inlineBytes : SMALL_ROW_BYTES;
         for (const column of columns) {
-          if (typeof row[column] !== 'string') continue;
-          const bytes = Buffer.byteLength(row[column]);
+          if (row[column] === null || typeof row[column] === 'number') continue;
+          const bytes = textBytes(row[column]).length;
           if (bytes > inlineBytes) totalLongSlices += Math.ceil(bytes / LONG_SLICE_BYTES);
         }
       }
@@ -1096,6 +1472,40 @@ export async function sourceCopyForecast({ source, shards }) {
   };
 }
 
+// Catalog builders accept only scalar UTF-8 strings. Inspect stored bytes before
+// calling them, never let a lossy API rendering become a routing/catalog identity.
+const VERSION_COLUMNS = ['session_id', 'version'];
+const COPIED_VERSION_COLUMNS = ['session_id', 'version', 'presence'];
+function catalogProjection(columns, prefix = '') {
+  return columns.flatMap((column, index) => {
+    const stored = `${prefix}${quote(column)}`;
+    return [`CASE WHEN typeof(${stored}) = 'text' THEN hex(CAST(${stored} AS BLOB))
+      ELSE ${stored} END AS ${quote(column)}`,
+    `typeof(${stored}) = 'text' AS ${quote(`__catalog_text_${index}`)}`];
+  }).join(',');
+}
+
+function catalogRows(rows, columns) {
+  for (const row of rows) {
+    for (let index = 0; index < columns.length; index += 1) {
+      const column = columns[index], marker = `__catalog_text_${index}`;
+      if (!Object.hasOwn(row, column) || ![0, 1].includes(row[marker])) {
+        throw copyInvariant(COPY_INVARIANTS.VALUE, 'invalid catalog scalar transport');
+      }
+      if (row[marker]) {
+        const hex = row[column];
+        if (typeof hex !== 'string' || hex.length > MAX_CELL_BYTES * 2) throw copyInvariant(COPY_INVARIANTS.VALUE, 'invalid catalog TEXT transport');
+        row[column] = decodedText(hex, hex.length / 2);
+        if (typeof row[column] !== 'string') throw copyInvariant(COPY_INVARIANTS.VALUE, 'invalid catalog UTF-8');
+      }
+      delete row[marker];
+    }
+    if (Object.hasOwn(row, 'session_id')) safeIdentity(row.session_id);
+    if (Object.hasOwn(row, 'turn_key')) safeIdentity(row.turn_key);
+    canonicalRow(columns, row);
+  }
+  return rows;
+}
 
 /** Full metadata/stars seed after main DDL; a page is acknowledged only after all shards agree. */
 export async function seedFrozenCatalog({ source, shards, gate, checkpointHook }) {
@@ -1104,6 +1514,7 @@ export async function seedFrozenCatalog({ source, shards, gate, checkpointHook }
   const identity = copyIdentity(source, shards);
   if (copied?.state !== 'complete') throw new Error('catalog seed requires a completed verified index copy');
   assertIdentity(copied, identity);
+  validateCopyState(copied, shards.length);
   let state = await readCheckpoint(shards[0], SEED_CHECKPOINT);
   if (state !== null) assertIdentity(state, identity);
   const ready = await readCheckpoint(shards[0], READY_CHECKPOINT);
@@ -1133,15 +1544,15 @@ export async function seedFrozenCatalog({ source, shards, gate, checkpointHook }
   await checkpoint();
   for (;;) {
     await gate();
-    let versions = await source.query(`SELECT session_id, version FROM session_catalog_versions
-      WHERE session_id > ? ORDER BY session_id LIMIT ?`, [state.after, SEED_PAGE_ROWS]);
+    let versions = catalogRows(await source.query(`SELECT ${catalogProjection(VERSION_COLUMNS)} FROM session_catalog_versions
+      WHERE session_id > ? ORDER BY session_id LIMIT ?`, [state.after, SEED_PAGE_ROWS]), VERSION_COLUMNS);
     const advancingScan = versions.length > 0;
     if (!advancingScan) {
       // Old HTTP metadata writes may finish after the queue/cron drain. Their outbox
       // entries, including versions behind the durable scan cursor, must be seeded too.
-      versions = await source.query(`SELECT session_id, version FROM session_catalog_versions
+      versions = catalogRows(await source.query(`SELECT ${catalogProjection(VERSION_COLUMNS)} FROM session_catalog_versions
         WHERE session_id IN (SELECT session_id FROM session_catalog_outbox
-          GROUP BY session_id ORDER BY MIN(seq) LIMIT ?) ORDER BY session_id`, [SEED_PAGE_ROWS]);
+          GROUP BY session_id ORDER BY MIN(seq) LIMIT ?) ORDER BY session_id`, [SEED_PAGE_ROWS]), VERSION_COLUMNS);
       if (!versions.length) {
         if ((await source.query('SELECT seq FROM session_catalog_outbox LIMIT 1')).length) {
           throw new Error('outbox entry lacks an authoritative catalog version');
@@ -1151,17 +1562,17 @@ export async function seedFrozenCatalog({ source, shards, gate, checkpointHook }
     }
     const ids = versions.map((row) => row.session_id);
     const snapshot = await source.batch([
-      { sql: `SELECT session_id, version FROM session_catalog_versions WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id`, params: ids },
-      { sql: `SELECT * FROM sessions WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id`, params: ids },
-      { sql: `SELECT * FROM starred_turns WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id, turn_key`, params: ids },
+      { sql: `SELECT ${catalogProjection(VERSION_COLUMNS)} FROM session_catalog_versions WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id`, params: ids },
+      { sql: `SELECT ${catalogProjection(sessionColumns)} FROM sessions WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id`, params: ids },
+      { sql: `SELECT ${catalogProjection(starColumns)} FROM starred_turns WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id, turn_key`, params: ids },
     ]);
     if (snapshot.length !== 3 || snapshot.some((result) => !Array.isArray(result.results))
-      || JSON.stringify(snapshot[0].results.map((row) => [row.session_id, row.version]))
+      || JSON.stringify(catalogRows(snapshot[0].results, VERSION_COLUMNS).map((row) => [row.session_id, row.version]))
         !== JSON.stringify(versions.map((row) => [row.session_id, row.version]))) {
       throw new Error('frozen catalog version snapshot changed');
     }
-    const sessions = snapshot[1].results;
-    const stars = snapshot[2].results;
+    const sessions = catalogRows(snapshot[1].results, sessionColumns);
+    const stars = catalogRows(snapshot[2].results, starColumns);
     const existing = new Set(sessions.map((row) => row.session_id));
     const sessionsById = new Map(sessions.map((row) => [row.session_id, row]));
     const entries = versions.map((row) => ({
@@ -1172,15 +1583,16 @@ export async function seedFrozenCatalog({ source, shards, gate, checkpointHook }
     for (const db of shards) {
       for (const batch of batches) await db.batch(batch.statements);
       const readback = await db.batch([
-        { sql: `SELECT * FROM sessions WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id`, params: ids },
-        { sql: `SELECT * FROM starred_turns WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id, turn_key`, params: ids },
-        { sql: `SELECT session_id, version, presence FROM catalog_versions
+        { sql: `SELECT ${catalogProjection(sessionColumns)} FROM sessions WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id`, params: ids },
+        { sql: `SELECT ${catalogProjection(starColumns)} FROM starred_turns WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id, turn_key`, params: ids },
+        { sql: `SELECT ${catalogProjection(COPIED_VERSION_COLUMNS)} FROM catalog_versions
           WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id`, params: ids },
       ]);
       if (readback.length !== 3 || readback.some((result) => !Array.isArray(result.results))) {
         throw new Error('catalog readback batch returned incomplete results');
       }
-      const [catalog, copiedStars, copiedVersions] = readback.map((result) => result.results);
+      const [catalog, copiedStars, copiedVersions] = readback.map((result, index) =>
+        catalogRows(result.results, [sessionColumns, starColumns, COPIED_VERSION_COLUMNS][index]));
       if (sha(JSON.stringify(catalog.map((row) => canonicalRow(sessionColumns, row))))
         !== sha(JSON.stringify(sessions.map((row) => canonicalRow(sessionColumns, row))))) {
         throw new Error('session catalog readback differs from authoritative main');
@@ -1212,6 +1624,8 @@ export async function seedFrozenCatalog({ source, shards, gate, checkpointHook }
 /** Read-only bounded operational evidence; exact full-copy proof lives in COPY_CHECKPOINT. */
 export async function verifyIndexRecords({ source, shards, catalogConsistency = 'observe' }) {
   if (!['required', 'observe'].includes(catalogConsistency)) throw new Error('invalid catalog consistency mode');
+  const copy = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+  if (copy) { assertIdentity(copy, copyIdentity(source, shards)); validateCopyState(copy, shards.length); }
   const [main] = await source.query(`SELECT
     (SELECT COUNT(*) FROM sessions) AS sessions,
     (SELECT COUNT(*) FROM starred_turns) AS stars`);
@@ -1235,15 +1649,16 @@ export async function verifyIndexRecords({ source, shards, catalogConsistency = 
       const ids = (await db.query('SELECT id FROM blocks ORDER BY id LIMIT 4')).map((row) => row.id);
       const blocks = ids.length ? await readBlockRows(db, columns, ids) : [];
       for (const row of blocks) {
-        if (indexShardForSessionId(row.session_id, shards.length) !== index) throw new Error('sampled block is routed to the wrong shard');
+        if (routeRow(row, shards.length, COPY_PHASES.PAGE_READBACK) !== index) throw new Error('sampled block is routed to the wrong shard');
         if (row.id >= INDEX_ID_SPAN && (row.id < indexIdBase(index) || row.id >= indexIdBase(index) + INDEX_ID_SPAN)) {
           throw new Error('sampled block has an invalid shard allocator ID');
         }
       }
       if (blocks.length) await verifyFts(db, blocks, tokenizer);
       else await db.query('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? LIMIT 1', ['\"index-migration-empty-probe\"']);
-      const catalog = await db.query(`SELECT s.*, c.version AS __version, c.presence AS __presence
-        FROM sessions s LEFT JOIN catalog_versions c USING (session_id) ORDER BY s.session_id LIMIT 4`);
+      const catalog = catalogRows(await db.query(`SELECT ${catalogProjection(SESSION_CATALOG_COLUMNS, 's.')},
+        c.version AS __version, c.presence AS __presence
+        FROM sessions s LEFT JOIN catalog_versions c USING (session_id) ORDER BY s.session_id LIMIT 4`), SESSION_CATALOG_COLUMNS);
       if (catalog.some((row) => !Number.isSafeInteger(row.__version) || row.__version < 1 || row.__presence !== 'present')) {
         throw new Error('sampled live catalog version/tombstone mismatch');
       }
@@ -1272,18 +1687,19 @@ export function classifyIndexMigration({ source, shards, legacyTables, copy, see
 
 /** One bounded active-mode outbox page, using exactly the Worker's monotonic builders. */
 export async function reconcileIndexCatalog({ source, shards }) {
-  const pending = await source.query(`SELECT session_id FROM session_catalog_outbox
-    GROUP BY session_id ORDER BY MIN(seq) LIMIT ?`, [CATALOG_PAGE_ROWS]);
+  const pending = catalogRows(await source.query(`SELECT ${catalogProjection(['session_id'])} FROM session_catalog_outbox
+    GROUP BY session_id ORDER BY MIN(seq) LIMIT ?`, [CATALOG_PAGE_ROWS]), ['session_id']);
   if (!pending.length) return { state: 'current', synced: 0 };
   const ids = pending.map((row) => row.session_id);
   const snapshot = await source.batch([
-    { sql: `SELECT session_id, version FROM session_catalog_versions WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id`, params: ids },
-    { sql: `SELECT * FROM sessions WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id`, params: ids },
-    { sql: `SELECT * FROM starred_turns WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id, turn_key`, params: ids },
+    { sql: `SELECT ${catalogProjection(VERSION_COLUMNS)} FROM session_catalog_versions WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id`, params: ids },
+    { sql: `SELECT ${catalogProjection(SESSION_CATALOG_COLUMNS)} FROM sessions WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id`, params: ids },
+    { sql: `SELECT ${catalogProjection(STAR_CATALOG_COLUMNS)} FROM starred_turns WHERE session_id IN (${inList(ids.length)}) ORDER BY session_id, turn_key`, params: ids },
   ]);
   if (snapshot.length !== 3 || snapshot.some((result) => !Array.isArray(result.results))
     || snapshot[0].results.length !== ids.length) throw new Error('outbox catalog snapshot is incomplete');
-  const [versions, sessions, stars] = snapshot.map((result) => result.results);
+  const [versions, sessions, stars] = snapshot.map((result, index) =>
+    catalogRows(result.results, [VERSION_COLUMNS, SESSION_CATALOG_COLUMNS, STAR_CATALOG_COLUMNS][index]));
   const byId = new Map(sessions.map((row) => [row.session_id, row]));
   const versionById = new Map(versions.map((row) => [row.session_id, row.version]));
   const batches = sessionCatalogBatches(versions.map((row) => ({
