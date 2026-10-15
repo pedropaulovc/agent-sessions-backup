@@ -17,6 +17,7 @@ import {
   stableJson,
 } from '../../infra/cf/preview-trust.mjs';
 import { D1_BATCH_PROBE_TEXT } from '../../infra/cf/d1-batch-atomicity.mjs';
+import { CLOUDFLARE_MINIMUM_REQUEST_INTERVAL_MS } from '../scripts/lib/cloudflare-api-budget.mjs';
 import { COPY_ENCODING } from '../scripts/lib/index-migration.mjs';
 import { BLOCK_COLUMNS, INDEX_ID_SPAN } from '../src/index-layout.mjs';
 
@@ -29,6 +30,18 @@ const controller = process.env.PREVIEW_CONTROL_PATH
   ?? fileURLToPath(new URL('../../infra/cf/preview-control.mjs', import.meta.url));
 const manifestModule = new URL('../scripts/lib/migration-manifest.mjs', import.meta.url).href;
 const layoutModule = new URL('../src/index-layout.mjs', import.meta.url).href;
+// native-copy-proof runtime is set by the controller's real shared Cloudflare pacer,
+// not by local CPU: measured with timestamped stub events, the 359f3e2 helper made
+// 328 requests in 104 s, and the byte-exact recovery helper makes 631 in 197 s, with
+// 627 of 630 inter-request gaps at 295-340 ms and none in the recovery phase above
+// 400 ms. The asserted total HTTP cap therefore bounds both PPE API use and runtime.
+// The margin covers process spawn, schema setup and timer lateness only; request
+// handling below the 300 ms permit interval is hidden by the pacer. Other controller
+// invocations keep their own 10 s bound.
+const NATIVE_PROOF_CLOUDFLARE_REQUEST_CAP = 700;
+const NATIVE_PROOF_LOCAL_MARGIN_MS = 30_000;
+const NATIVE_PROOF_TIMEOUT_MS = NATIVE_PROOF_CLOUDFLARE_REQUEST_CAP * CLOUDFLARE_MINIMUM_REQUEST_INTERVAL_MS
+  + NATIVE_PROOF_LOCAL_MARGIN_MS;
 const SCHEMA_DIGESTS = [
   { binding: 'DB', digest: 'd'.repeat(64) },
   { binding: 'IDX00', digest: 'e'.repeat(64) },
@@ -446,7 +459,7 @@ async function runController(command, scenario = {}) {
       '--import', pathToFileURL(preload).href, controller, command, '--repository', 'example/sessions',
       ...(command === 'janitor' ? [] : ['--pr', String(scenario.pr ?? PR)]), ...args,
     ], {
-      encoding: 'utf8', timeout: native ? 120_000 : 10_000,
+      encoding: 'utf8', timeout: native ? NATIVE_PROOF_TIMEOUT_MS : 10_000,
       env: { ...process.env, CLOUDFLARE_PPE_ACCOUNT_ID: scenario.accountId ?? PREVIEW_ACCOUNT_ID,
         CLOUDFLARE_PPE_API_TOKEN: 'synthetic-cloudflare-token', PREVIEW_BEARER_SEED: SEED,
         GITHUB_TOKEN: 'synthetic-github-token' },
@@ -1229,8 +1242,14 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
   const positiveQueries = queries.filter((event) => result.events.indexOf(event) < diagnosticStart);
   assert.ok(positiveQueries.length <= 200 + summary.growthRows * 6,
     `complete native CLI proof must retain bulk copying with bounded independent growth point batches/slice checks, observed ${positiveQueries.length}`);
-  assert.ok(queries.length - positiveQueries.length <= 400,
+  assert.ok(queries.length - positiveQueries.length <= 360,
     `byte-exact recovery must stay a bounded fixed-size phase, observed ${queries.length - positiveQueries.length}`);
+  // Every paced Cloudflare request, including registry/identity gates and cleanup,
+  // must fit the cap that derives this test's controller deadline.
+  const cloudflareRequests = result.events.filter((event) => event.kind === 'request'
+    && new URL(event.url).hostname === 'api.cloudflare.com');
+  assert.ok(cloudflareRequests.length <= NATIVE_PROOF_CLOUDFLARE_REQUEST_CAP,
+    `native proof must stay within its paced Cloudflare request budget, observed ${cloudflareRequests.length}`);
   const recoveredSourceCount = result.events.filter((event) => event.kind === 'probe-sql' && event.databaseId === 'created-1'
     && event.sql === 'SELECT COUNT(*) AS rows FROM blocks').at(-1);
   assert.ok(result.events.indexOf(recoveredSourceCount) > diagnosticStart);

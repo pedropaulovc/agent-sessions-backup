@@ -93,16 +93,15 @@ function textBytes(value) {
   return typeof value === 'string' ? Buffer.from(value) : Buffer.from(invalidText(value).x, 'hex');
 }
 
-function safeIdentity(value, phase) {
-  if (typeof value !== 'string' || !value.length || /[\u0000-\u001f\u007f]/.test(value)
-    || TEXT_UTF8.decode(Buffer.from(value)) !== value) {
+function storedUtf8Key(value, phase) {
+  if (typeof value !== 'string' || !value.length || TEXT_UTF8.decode(Buffer.from(value)) !== value) {
     throw copyInvariant(COPY_INVARIANTS.ROW_IDENTITY, 'invalid stored migration identity', phase);
   }
   return value;
 }
 
 function routeRow(row, count, phase) {
-  return indexShardForSessionId(safeIdentity(row.session_id, phase), count);
+  return indexShardForSessionId(storedUtf8Key(row.session_id, phase), count);
 }
 
 function rowTypes(columns, row) {
@@ -1506,8 +1505,8 @@ function catalogRows(rows, columns) {
       }
       delete row[marker];
     }
-    if (Object.hasOwn(row, 'session_id')) safeIdentity(row.session_id);
-    if (Object.hasOwn(row, 'turn_key')) safeIdentity(row.turn_key);
+    if (Object.hasOwn(row, 'session_id')) storedUtf8Key(row.session_id);
+    if (Object.hasOwn(row, 'turn_key')) storedUtf8Key(row.turn_key);
     canonicalRow(columns, row);
   }
   return rows;

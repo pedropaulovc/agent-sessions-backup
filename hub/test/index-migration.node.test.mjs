@@ -37,8 +37,12 @@ import {
 const classifyActivation = process.env.INDEX_CLASSIFICATION_MODULE_PATH
   ? (await import(process.env.INDEX_CLASSIFICATION_MODULE_PATH)).classifyIndexMigration : classifyIndexMigration;
 const nativeParameters = process.env.INDEX_COPY_MODULE_PATH
-  ? await import(process.env.INDEX_COPY_MODULE_PATH) : { copyFrozenIndex, verifyIndexRecords };
-const { copyFrozenIndex: copyWithNativeParameters, verifyIndexRecords: verifyWithNativeParameters } = nativeParameters;
+  ? await import(process.env.INDEX_COPY_MODULE_PATH)
+  : { copyFrozenIndex, verifyIndexRecords, seedFrozenCatalog, reconcileIndexCatalog };
+const {
+  copyFrozenIndex: copyWithNativeParameters, verifyIndexRecords: verifyWithNativeParameters,
+  seedFrozenCatalog: seedCatalogWithNativeParameters, reconcileIndexCatalog: reconcileCatalogWithNativeParameters,
+} = nativeParameters;
 const consumerControl = process.env.INDEX_CONTROL_MODULE_PATH
   ? await import(process.env.INDEX_CONTROL_MODULE_PATH) : { pauseConsumers };
 const diagnosticClient = consumerControl.indexControlClient ?? indexControlClient;
@@ -1965,6 +1969,17 @@ function expectedCatalog(f) {
   };
 }
 
+function catalogStarBytes(db) {
+  return db.rows(`SELECT hex(CAST(session_id AS BLOB)) AS session_bytes,
+    hex(CAST(turn_key AS BLOB)) AS key_bytes, hex(CAST(starred_at AS BLOB)) AS timestamp_bytes,
+    typeof(turn_key) AS storage_class FROM starred_turns ORDER BY session_id, turn_key`);
+}
+
+// The export archive parser and shared UTF-8 router accept all nonempty strings;
+// control characters are not a separate migration identity policy.
+const PUBLIC_SESSION_IDS = ['public\u0000left', 'public\u0000right',
+  'public\u0001\u007f会話😀', '\ufeffpublic-session\u0000尾'];
+
 function assertCatalogAcknowledgement(f, expected) {
   let acknowledgements = 0;
   f.source.beforeQuery = ({ sql, params }) => {
@@ -2021,6 +2036,102 @@ test('catalog seed copies every session/star column, versions and tombstones ide
     && event.statements.every(({ sql }) => /^\s*SELECT\b/i.test(sql))),
   'versions, sessions and stars must come from a single atomic main snapshot per page');
 });
+
+for (const operation of ['seed', 'reconcile']) {
+  test(`catalog ${operation} preserves viewer-accepted control-character turn keys byte exactly`, async (context) => {
+    const f = await catalogFixture(context, [], 3);
+    if (operation === 'reconcile') await seedFrozenCatalog(f.args());
+    // These are distinct valid UTF-8 values admitted by the viewer's existing
+    // nonempty <=1024-code-unit form field contract, including two NUL-prefix keys.
+    const keys = ['public\u0000left', 'public\u0000right', '\u0001start', 'end\u001f',
+      '\u007fDEL', '\ufeff会話\u0000😀', 'public\n\tline'];
+    for (const turn_key of keys) {
+      assert.ok(turn_key.length > 0 && turn_key.length <= 1024);
+      assert.equal(new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(Buffer.from(turn_key)), turn_key);
+      insert(f.source, 'starred_turns', STAR_CATALOG_COLUMNS, {
+        session_id: 'catalog-00', turn_key, starred_at: '2026-10-15T12:34:56.123Z',
+      });
+      assert.deepEqual(f.source.rows('SELECT turn_key FROM starred_turns WHERE session_id = ? AND turn_key = ?',
+        ['catalog-00', turn_key]), [{ turn_key }], 'each key must exist distinctly in native SQLite, including its post-NUL suffix');
+    }
+    const before = catalogStarBytes(f.source), expected = expectedCatalog(f);
+    const hashes = new Map(expected.stars.map((row) => [JSON.stringify([row.session_id, row.turn_key]),
+      sha256(JSON.stringify(STAR_CATALOG_COLUMNS.map((column) => row[column])))]));
+    const copy = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+    assert.ok(f.source.rows('SELECT seq FROM session_catalog_outbox').length > 0);
+    f.trace.length = 0;
+    const acknowledged = assertCatalogAcknowledgement(f, expected);
+    const result = await (operation === 'seed'
+      ? seedCatalogWithNativeParameters(f.args()) : reconcileCatalogWithNativeParameters(f.args()));
+    assert.equal(result.state, operation === 'seed' ? 'complete' : 'current');
+    assert.ok(acknowledged() > 0, 'outbox retirement requires actual complete catalog replication on every shard');
+    assert.deepEqual(f.source.rows('SELECT * FROM session_catalog_outbox'), []);
+    assert.deepEqual(catalogStarBytes(f.source), before);
+    assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), copy);
+    for (const shard of f.shards) {
+      assert.deepEqual(catalogSnapshot(shard), expected);
+      assert.deepEqual(catalogStarBytes(shard), before);
+      for (const row of shard.rows('SELECT * FROM starred_turns ORDER BY session_id, turn_key')) {
+        assert.equal(rowDigest(STAR_CATALOG_COLUMNS, row), hashes.get(JSON.stringify([row.session_id, row.turn_key])));
+      }
+    }
+  });
+}
+
+for (const operation of ['seed', 'reconcile']) {
+  test(`catalog ${operation} preserves valid UTF-8 control-bearing session identities`, async (context) => {
+    const f = await catalogFixture(context, [], 1);
+    if (operation === 'reconcile') await seedFrozenCatalog(f.args());
+    for (const sid of PUBLIC_SESSION_IDS) {
+      insert(f.source, 'sessions', SESSION_CATALOG_COLUMNS, session(sid));
+      insert(f.source, 'starred_turns', STAR_CATALOG_COLUMNS, {
+        session_id: sid, turn_key: 'public-ordinary-key', starred_at: '2026-10-15T12:34:56.123Z',
+      });
+    }
+    const before = catalogStarBytes(f.source), expected = expectedCatalog(f);
+    const copy = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+    const acknowledged = assertCatalogAcknowledgement(f, expected);
+    const result = await (operation === 'seed'
+      ? seedCatalogWithNativeParameters(f.args()) : reconcileCatalogWithNativeParameters(f.args()));
+    assert.equal(result.state, operation === 'seed' ? 'complete' : 'current');
+    assert.ok(acknowledged() > 0);
+    assert.deepEqual(f.source.rows('SELECT * FROM session_catalog_outbox'), []);
+    assert.deepEqual(catalogStarBytes(f.source), before);
+    assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), copy);
+    for (const shard of f.shards) {
+      assert.deepEqual(catalogSnapshot(shard), expected);
+      assert.deepEqual(catalogStarBytes(shard), before);
+      for (const row of shard.rows('SELECT * FROM starred_turns ORDER BY session_id, turn_key')) {
+        assert.equal(rowDigest(STAR_CATALOG_COLUMNS, row), sha256(JSON.stringify(STAR_CATALOG_COLUMNS.map((column) => row[column]))));
+      }
+    }
+  });
+}
+
+test('catalog key validation still refuses empty and malformed native turn keys without acknowledging the outbox', async (context) => {
+  for (const operation of ['seed', 'reconcile']) for (const fault of ['empty', 'malformed-utf8']) {
+    await context.test(`${operation} ${fault}`, async (child) => {
+      const f = await catalogFixture(child, [], 1);
+      if (operation === 'reconcile') await seedFrozenCatalog(f.args());
+      insert(f.source, 'starred_turns', STAR_CATALOG_COLUMNS, {
+        session_id: 'catalog-00', turn_key: 'public-invalid-key', starred_at: '2026-10-15T12:34:56.123Z',
+      });
+      f.source.database.prepare(`UPDATE starred_turns SET turn_key = ${fault === 'empty' ? "''" : "CAST(unhex('61ff6200') AS TEXT)"}
+        WHERE session_id = ? AND turn_key = ?`).run('catalog-00', 'public-invalid-key');
+      const source = catalogStarBytes(f.source), before = f.shards.map(catalogSnapshot);
+      const outbox = f.source.rows('SELECT * FROM session_catalog_outbox ORDER BY seq');
+      f.trace.length = 0;
+      await assert.rejects(operation === 'seed'
+        ? seedCatalogWithNativeParameters(f.args()) : reconcileCatalogWithNativeParameters(f.args()),
+      (error) => error.code === (fault === 'empty' ? 'row-identity' : 'value'));
+      assert.deepEqual(catalogStarBytes(f.source), source);
+      assert.deepEqual(f.shards.map(catalogSnapshot), before);
+      assert.deepEqual(f.source.rows('SELECT * FROM session_catalog_outbox ORDER BY seq'), outbox);
+      assert.deepEqual(sourceWrites(f), []);
+    });
+  }
+});
+
 
 test('partial catalog shard failure retains the entire outbox and resumes from the durable page after reopening databases', async (context) => {
   const f = await catalogFixture(context);
@@ -6378,6 +6489,46 @@ test('canonical raw TEXT tags are unambiguous and leave every valid scalar diges
 });
 
 for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerdFixture]]) {
+  test(`byte-exact ${backend} copier retains valid UTF-8 session identity bytes, routing and scalar hashes`, async (context) => {
+    const f = await createFixture(context);
+    const rows = PUBLIC_SESSION_IDS.map((session_id, index) =>
+      block(92_001 + index, 0, { session_id, text: `publicidentityneedle_${index}` }));
+    const homes = new Map(rows.map((row) => {
+      let hash = 0x811c9dc5;
+      for (const byte of Buffer.from(row.session_id)) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
+      for (const count of [2, 16]) assert.equal(indexShardForSessionId(row.session_id, count), hash % count);
+      return [row.id, hash % 2];
+    }));
+    await seedPublicRawBlocks(f.source, rows, new Map());
+    const before = await publicRawSnapshot(f.source), sourceFts = await storedBlockSnapshot(f.source);
+    let verified = 0;
+    const result = await copyWithNativeParameters(f.args({ checkpointHook: async (state) => {
+      if (state.pending?.phase !== 'verified') return;
+      verified += state.pending.rows.length;
+      const remaining = await publicRawSnapshot(f.source);
+      for (const item of state.pending.rows) {
+        const original = rows.find((row) => row.id === item.id);
+        const expected = before.find((row) => row.v0 === item.id);
+        assert.equal(item.shard, homes.get(item.id));
+        assert.equal(item.sha256, sha256(JSON.stringify(BLOCK_COLUMNS.map((column) => original[column]))));
+        assert.deepEqual(remaining.find((row) => row.v0 === item.id), expected);
+        assert.deepEqual((await publicRawSnapshot(f.shards[item.shard])).find((row) => row.v0 === item.id), expected);
+        assert.equal(expected.v1, Buffer.from(original.session_id).toString('hex').toUpperCase());
+        assert.deepEqual(await f.shards[item.shard].rows(`SELECT rowid FROM blocks_fts
+          WHERE blocks_fts MATCH ? AND rowid = CAST(? AS INTEGER)`, [`"${original.text}"`, item.id]), [{ rowid: item.id }]);
+      }
+    } }));
+    assert.equal(result.state, 'complete');
+    assert.equal(verified, rows.length);
+    const after = await storedBlockSnapshot(f.source);
+    assert.deepEqual(after.blocks, []);
+    assert.deepEqual(after.ftsData, sourceFts.ftsData);
+    assert.deepEqual(after.ftsIndex, sourceFts.ftsIndex);
+    for (let shard = 0; shard < f.shards.length; shard += 1) {
+      assert.deepEqual(await f.shards[shard].rows('SELECT * FROM blocks ORDER BY id'), rows.filter((row) => homes.get(row.id) === shard));
+    }
+  });
+
   test(`byte-exact ${backend} copier preserves short and sliced malformed TEXT in every scalar text column and exact FTS`, async (context) => {
     const f = await createFixture(context);
     for (const db of [f.source, ...f.shards]) {

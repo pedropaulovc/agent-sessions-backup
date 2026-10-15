@@ -427,7 +427,12 @@ The one-time cutover runs these operations in order, from the same checked-out m
    unchanged. REST response sizing includes hex expansion and column/marker keys.
    INTEGER/REAL reconstruction is explicitly typed, even for integral REALs in
    affinity-free columns. Raw tags never route a session or enter catalog builders:
-   malformed UTF-8 identities/catalog strings and unsafe identity controls fail closed.
+   malformed UTF-8 identities/catalog strings and empty identity keys fail closed.
+   Nonempty valid UTF-8 session IDs retain their original UTF-8 hash/routing
+   contract, including NUL/C0/DEL; migration does not add an ingestion allowlist.
+   Turn keys are owner-annotation keys, not routing IDs. Valid existing keys retain
+   those same characters (and BOM/non-ASCII bytes) exactly through catalog seed and
+   reconciliation; the viewer already accepts nonempty keys up to 1024 code units.
    Ordinary shard replacement is one atomic four-statement JSON1 batch, not per-row
    HTTP requests. Each populated shard's MATCH verification reuses one fixed JSON1
    query with one JSON bind per byte-bounded group of `[quoted token, id]` probes.
@@ -653,6 +658,20 @@ Its deliberately late, equal-length byte mutation must yield one bounded mismatc
 comparison and preserve all four source/destination/freeze/checkpoint fences. An
 unavailable or false comparison fails the proof; a destination compile control is
 not an alternate oracle or permission to turn that failure into success.
+
+The control is paced, not CPU-bound. Timestamped local controller/stub runs measured
+328 Cloudflare requests in 104 s for `359f3e2` (252 positive, 76 old diagnostic) and
+631 in 197 s for the byte-exact helper (260 positive, 371 recovery). Of the latter
+371, 320 were `/query`; the rest were registry/identity gate checks and cleanup.
+627 of 630 inter-request gaps were 295–340 ms, with none above 400 ms in recovery,
+consistent with the controller's unchanged shared 300 ms Cloudflare pacer. The
+native-only deployment test therefore caps total HTTP requests at 700 and recovery
+queries at 360, and derives its spawn deadline as `700 × 300 ms + 30 s = 240 s`.
+Its former 120 s harness deadline was below the roughly 190 s paced floor; this is
+not a production timeout/pacer change or removal of proof controls. Expect about
+3.2 minutes plus real HTTP latency for the native-copy proof. These are local stub
+timings, not real D1 REST long-cell acceptance or production recovery evidence.
+
 
 A failure-only comparison does not identify the original failing statement or
 authorize source writes, ACK, checkpoint advance, or a semantic batch retry. A clean
