@@ -208,7 +208,7 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
             const header = (response ?? responses.get(error))?.headers?.get('cf-ray');
             if (header !== null && header !== undefined) {
               rayState = 'invalid';
-              // `$` alone also matches before a final newline; require exact length.
+              // Canonical Ray IDs contain exactly 16 or 20 ASCII characters.
               if (typeof header === 'string' && /^[0-9a-f]{16}(?:-[A-Z]{3})?$/.test(header)
                 && (header.length === 16 || header.length === 20)) {
                 ray = header;
