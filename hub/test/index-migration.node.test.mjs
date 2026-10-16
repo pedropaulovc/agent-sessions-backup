@@ -4225,6 +4225,56 @@ test('REST D1 diagnostics sanitize envelope, result and transport failures witho
   }
 });
 
+test('REST D1 correlation rejects control text and broken header access without masking the original failure', async (context) => {
+  const originalFetch = globalThis.fetch;
+  context.after(() => { globalThis.fetch = originalFetch; });
+  const canary = 'PRIVATE_RAY_HEADER_SQL_TOKEN_CANARY';
+  for (const mode of ['headers-throw', 'get-throw', 'missing-headers', 'newline', 'injection', 'non-string']) {
+    for (const bodyDrop of [false, true]) {
+      await context.test(`${mode}: ${bodyDrop ? 'body-drop' : 'provider-rejection'}`, async () => {
+        let requests = 0;
+        globalThis.fetch = async () => {
+          requests += 1;
+          return {
+            status: 500, ok: false,
+            get headers() {
+              if (mode === 'headers-throw') throw new Error(canary);
+              if (mode === 'missing-headers') return undefined;
+              return { get() {
+                if (mode === 'get-throw') throw new Error(canary);
+                if (mode === 'newline') return '0123456789abcdef-LHR\n';
+                if (mode === 'injection') return `0123456789abcdef-LHR\r\n${canary}`;
+                return { toString() { throw new Error(canary); } };
+              } };
+            },
+            async text() {
+              if (bodyDrop) throw new Error(canary);
+              return JSON.stringify({ success: false, errors: [{ code: 7500, message: canary }] });
+            },
+          };
+        };
+        const db = diagnosticClient(PREVIEW_ACCOUNT_ID, canary, {
+          permit: async () => {}, wait: async () => assert.fail('terminal failures must not retry'),
+        }).db('95dbde60-d5ab-4e2c-989f-fcd44a3ab479');
+        await assert.rejects(db.batch([{ sql: canary, params: [canary] }]), (error) => {
+          assert.equal(error.d1FailureKind, bodyDrop ? 'transport' : 'http');
+          assert.equal(error.providerStatus, 500);
+          assert.deepEqual(error.providerCodes, bodyDrop ? [] : [7500]);
+          assert.equal(error.d1SqlReason, 'other');
+          assert.equal(error.d1NativeSignature, undefined);
+          assert.equal(Object.hasOwn(error, 'providerRay'), false);
+          assert.ok(error.message.includes(` ray=${mode === 'missing-headers' ? 'absent' : 'invalid'} `));
+          assert.ok(!`${error.message} ${error.stack} ${JSON.stringify(error)}`.includes(canary));
+          assert.ok(!error.message.includes('\r') && !error.message.includes('\n'));
+          assert.equal(error.cause, undefined);
+          return true;
+        });
+        assert.equal(requests, 1, 'header diagnostics must never replay the failed operation');
+      });
+    }
+  }
+});
+
 test('REST D1 diagnostics retain bounded fixed native signatures and typed HTTP evidence without provider text', async (context) => {
   const originalFetch = globalThis.fetch;
   context.after(() => { globalThis.fetch = originalFetch; });
@@ -6231,6 +6281,7 @@ test('real HTTP D1 failures distinguish transport, HTTP, statement and shape wit
     response.writeHead(scenario.status ?? 200, {
       'content-type': 'application/json',
       ...(scenario.retryAfter === undefined ? {} : { 'retry-after': scenario.retryAfter }),
+      ...(scenario.ray === undefined ? {} : { 'cf-ray': scenario.ray }),
     });
     if (scenario.bodyTransport) {
       bodyDropResponse = response;
@@ -6257,10 +6308,10 @@ test('real HTTP D1 failures distinguish transport, HTTP, statement and shape wit
   });
   const scenarios = [
     { transport: true, failure: 'transport', http: 'unknown' },
-    { bodyTransport: true, failure: 'transport', http: 200 },
-    { bodyTransport: true, status: 503, failure: 'transport', http: 503 },
+    { bodyTransport: true, ray: '0123456789abcdef-LHR', failure: 'transport', http: 200 },
+    { bodyTransport: true, status: 503, ray: canary, failure: 'transport', http: 503 },
     ...[undefined, 'invalid', '0', '1.5', '3601'].map((retryAfter) => ({
-      status: 429, retryAfter, raw: canary, failure: 'http', http: 429,
+      status: 429, retryAfter, ray: '0123456789abcdef-LHR', raw: canary, failure: 'http', http: 429,
     })),
     { status: 503, envelope: { success: false, errors: [{ message: canary }] }, failure: 'http', http: 503 },
     { status: 502, raw: canary, failure: 'http', http: 502 },
@@ -6274,6 +6325,15 @@ test('real HTTP D1 failures distinguish transport, HTTP, statement and shape wit
     { envelope: { success: true, result: [{ success: true, results: {} }] }, failure: 'shape', http: 200 },
     { envelope: { success: true, result: [{ success: true, results: [] }, { success: true, results: [] }] }, failure: 'shape', http: 200 },
     { envelope: { success: true, actualHTTPstatus: 599, result: [{ success: false, error: canary }] }, failure: 'statement', http: 200 },
+    ...[undefined, '0123456789abcdef', '0123456789abcdef-LHR', '', 'not-a-ray',
+      '0123456789abcdef-lhr', '0123456789abcdeé-LHR', '0123456789abcdef-LHR-extra',
+      'a'.repeat(1024), canary, `0123456789abcdef-LHR ${canary}`].map((ray) => ({
+      status: 500, ray, envelope: { success: false, errors: [{ code: 7500, message: canary }] },
+      codes: [7500], failure: 'http', http: 500,
+    })),
+    { ray: '0123456789abcdef-LHR', envelope: { success: true,
+      result: [{ success: false, error: canary }] }, failure: 'statement', http: 200 },
+    { ray: '0123456789abcdef-LHR', raw: canary, failure: 'shape', http: 200 },
   ];
   for (const [index, selected] of scenarios.entries()) {
     await context.test(`${index}: ${selected.bodyTransport ? 'body-drop ' : ''}${selected.failure} HTTP=${selected.http}`, async () => {
@@ -6286,8 +6346,13 @@ test('real HTTP D1 failures distinguish transport, HTTP, statement and shape wit
         assert.equal(error.d1SqlReason, 'other', 'private/unrecognized provider text cannot invent a native class');
         assert.equal(error.providerStatus, scenario.http === 'unknown' ? undefined : scenario.http,
           'typed HTTP evidence must use the actual response, never an envelope status field');
-        assert.deepEqual(error.providerCodes, []);
+        assert.deepEqual(error.providerCodes, scenario.codes ?? []);
         assert.equal(error.d1NativeSignature, undefined);
+        const validRay = ['0123456789abcdef', '0123456789abcdef-LHR'].includes(scenario.ray);
+        assert.equal(error.providerRay, validRay ? scenario.ray : undefined);
+        assert.equal(Object.hasOwn(error, 'providerRay'), validRay);
+        assert.ok(error.message.includes(` ray=${validRay ? scenario.ray
+          : scenario.ray === undefined ? 'absent' : 'invalid'} `));
         assert.ok(error.message.includes(`failure=${scenario.failure}`));
         assert.ok(error.message.includes(`HTTP=${scenario.http}`));
         assert.ok(!`${error.stack} ${JSON.stringify(error)}`.includes(canary));
