@@ -590,13 +590,25 @@ definitive claim that their original encoding was invalid UTF-8.
 
 D1 copy failures emit only the configured database UUID, `query`/`batch` kind,
 validated numeric HTTP status/provider codes, statement/parameter counts, encoded
-request body and parameter-JSON byte counts, an allowlisted native class, and a
-static operation phase. `failure=transport|http|statement|shape` distinguishes a
+request body and parameter-JSON byte counts, an allowlisted native class, validated
+CF-Ray correlation, and a static operation phase. `failure=transport|http|statement|shape` distinguishes a
 request or response-body transport failure, a non-2xx response, an explicit provider
 or statement rejection in an HTTP-200 envelope, and an invalid response protocol/shape.
 HTTP status comes from the actual response, never a provider envelope field.
 A response-body transport failure retains the known HTTP status; invalid 429
 `Retry-After` is an HTTP failure with status 429, not permission to replay.
+Failure-only `ray=<id>` comes from the actual response's `CF-Ray` header and accepts
+only 16 lowercase ASCII hex digits, optionally followed by a hyphen and three
+uppercase ASCII letters (`^[0-9a-f]{16}(?:-[A-Z]{3})?$`, with no trailing bytes).
+Only a valid ID is also retained as typed `providerRay` error metadata.
+`ray=absent` means no response/header was available; `ray=invalid` means a malformed
+or unreadable header was discarded. Neither sentinel contains raw header text.
+Body-read failures can retain a valid ray even when the body is unavailable.
+Use a valid ray with the failing operation's HTTP status, provider codes and phase
+to correlate the request with Cloudflare; it does not identify the cause of a
+failure, including HTTP 500/code 7500. Missing or invalid rays leave that cause
+unknown too. No other response headers are logged; these diagnostics do not add
+retries or change checkpoint recovery.
 Byte counts include JSON framing/escaping and are computed only on failure.
 `copy-setup` identifies column/schema setup; the initial ID-range read and
 already-complete source probes use `copy-source-page-read`.

@@ -88,7 +88,7 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
   if (accountId === PRODUCTION_ACCOUNT_ID) requireProtectedProduction();
   else if (accountId !== PREVIEW_ACCOUNT_ID) throw new Error('index control account must be production or preview');
   if (!token) throw new Error('CLOUDFLARE_API_TOKEN is required');
-  const responseStatuses = new WeakMap();
+  const responses = new WeakMap();
   const cf = async (pathname, init = {}) => {
     const { responseFormat = 'result', ...request } = init;
     if (responseFormat !== 'result' && responseFormat !== 'envelope') {
@@ -110,48 +110,53 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
         error.providerStatus = undefined; // No actual Response was received.
         throw error;
       }
-      const delay = cloudflareRetryDelay(response);
-      if (delay !== null) {
-        // A 429 rejected the operation before execution. Replay only that unambiguous
-        // rejection; network errors and 5xx leave recovery to durable checkpoints.
-        await response.body?.cancel();
-        if (requestGate) requestGate(delay);
-        await wait(delay);
-        continue;
-      }
-      let text;
-      try { text = await response.text(); }
-      catch {
-        const error = new Error(`Cloudflare response body read failed: HTTP ${response.status}`);
-        error.providerStatus = response.status;
-        error.d1FailureKind = 'transport';
-        throw error;
-      }
-      let envelope;
-      try { envelope = JSON.parse(text); }
-      catch {
-        const error = new Error(`Cloudflare returned non-JSON HTTP ${response.status}`);
-        error.providerStatus = response.status;
-        error.d1FailureKind = response.ok ? 'shape' : 'http';
-        throw error;
-      }
-      if (!response.ok || envelope?.success !== true) {
-        // Never emit SQL, response bodies, transcript data, or credentials into CI logs.
-        const codes = providerCodes(envelope?.errors);
-        const isD1 = /^d1\/database\/[^/]+\/query$/.test(pathname);
-        const error = new Error(`Cloudflare ${isD1 ? 'D1 query' : pathname.split('?')[0]} failed: HTTP ${response.status}, codes=${codes.join(',')}`);
-        error.providerStatus = response.status;
-        error.providerCodes = codes;
-        error.d1FailureKind = !response.ok ? 'http' : envelope?.success === false ? 'statement' : 'shape';
-        if (isD1) {
-          const diagnostic = d1SqlFailureMetadata(envelope?.errors);
-          error.d1SqlReason = diagnostic.reason;
-          if (diagnostic.nativeSignature) error.d1NativeSignature = diagnostic.nativeSignature;
+      try {
+        const delay = cloudflareRetryDelay(response);
+        if (delay !== null) {
+          // A 429 rejected the operation before execution. Replay only that unambiguous
+          // rejection; network errors and 5xx leave recovery to durable checkpoints.
+          await response.body?.cancel();
+          if (requestGate) requestGate(delay);
+          await wait(delay);
+          continue;
         }
+        let text;
+        try { text = await response.text(); }
+        catch {
+          const error = new Error(`Cloudflare response body read failed: HTTP ${response.status}`);
+          error.providerStatus = response.status;
+          error.d1FailureKind = 'transport';
+          throw error;
+        }
+        let envelope;
+        try { envelope = JSON.parse(text); }
+        catch {
+          const error = new Error(`Cloudflare returned non-JSON HTTP ${response.status}`);
+          error.providerStatus = response.status;
+          error.d1FailureKind = response.ok ? 'shape' : 'http';
+          throw error;
+        }
+        if (!response.ok || envelope?.success !== true) {
+          // Never emit SQL, response bodies, transcript data, or credentials into CI logs.
+          const codes = providerCodes(envelope?.errors);
+          const isD1 = /^d1\/database\/[^/]+\/query$/.test(pathname);
+          const error = new Error(`Cloudflare ${isD1 ? 'D1 query' : pathname.split('?')[0]} failed: HTTP ${response.status}, codes=${codes.join(',')}`);
+          error.providerStatus = response.status;
+          error.providerCodes = codes;
+          error.d1FailureKind = !response.ok ? 'http' : envelope?.success === false ? 'statement' : 'shape';
+          if (isD1) {
+            const diagnostic = d1SqlFailureMetadata(envelope?.errors);
+            error.d1SqlReason = diagnostic.reason;
+            if (diagnostic.nativeSignature) error.d1NativeSignature = diagnostic.nativeSignature;
+          }
+          throw error;
+        }
+        if (responseFormat === 'envelope') responses.set(envelope, response);
+        return responseFormat === 'envelope' ? envelope : envelope.result;
+      } catch (error) {
+        if (error && typeof error === 'object') responses.set(error, response);
         throw error;
       }
-      if (responseFormat === 'envelope') responseStatuses.set(envelope, response.status);
-      return responseFormat === 'envelope' ? envelope : envelope.result;
     }
   };
   return {
@@ -159,11 +164,13 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
     db(id) {
       const execute = async (body, kind) => {
         let encodedBody;
+        let response;
         let failureKind = 'transport';
         try {
           const envelope = await cf(`d1/database/${encodeURIComponent(id)}/query`, {
             method: 'POST', body: encodedBody = JSON.stringify(body), responseFormat: 'envelope',
           });
+          response = responses.get(envelope);
           const results = envelope.result;
           if (!Array.isArray(results) || results.some((result) => result?.success !== true)) {
             failureKind = Array.isArray(results) && results.some((result) => result?.success === false)
@@ -176,13 +183,13 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
             error.d1SqlReason = diagnostic.reason;
             if (diagnostic.nativeSignature) error.d1NativeSignature = diagnostic.nativeSignature;
             error.providerCodes = providerCodes([...failures, ...(Array.isArray(envelope.errors) ? envelope.errors : [])]);
-            error.providerStatus = responseStatuses.get(envelope);
+            error.providerStatus = response?.status;
             throw error;
           }
           if (kind === 'query' && (results.length !== 1 || !Array.isArray(results[0]?.results))) {
             failureKind = 'shape';
             const error = new Error('D1 query returned an unexpected result shape');
-            error.providerStatus = responseStatuses.get(envelope);
+            error.providerStatus = response?.status;
             throw error;
           }
           return results;
@@ -194,6 +201,21 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
           const codes = Array.isArray(error?.providerCodes) ? providerCodes(error.providerCodes.map((code) => ({ code }))) : [];
           const status = Number.isInteger(error?.providerStatus) && error.providerStatus >= 100 && error.providerStatus <= 599
             ? error.providerStatus : undefined;
+          // Read correlation only on failure, and never let broken headers mask it.
+          let rayState = 'absent';
+          let ray;
+          try {
+            const header = (response ?? responses.get(error))?.headers?.get('cf-ray');
+            if (header !== null && header !== undefined) {
+              rayState = 'invalid';
+              // Canonical Ray IDs contain exactly 16 or 20 ASCII characters.
+              if (typeof header === 'string' && /^[0-9a-f]{16}(?:-[A-Z]{3})?$/.test(header)
+                && (header.length === 16 || header.length === 20)) {
+                ray = header;
+                rayState = 'valid';
+              }
+            }
+          } catch { rayState = 'invalid'; }
           // Count already-encoded request bytes only on failure. Parameter JSON byte
           // counts include array framing/escaping and never disclose the values.
           const statements = kind === 'batch' && Array.isArray(body.batch) ? body.batch : [body];
@@ -205,6 +227,7 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
             + ` HTTP=${status ?? 'unknown'}`
             + ` codes=${codes.join(',')}`
             + ` failure=${failure}`
+            + ` ray=${rayState === 'valid' ? ray : rayState}`
             + ` native=${reason} statements=${statements.length} parameters=${parameters}`
             + ` bodyBytes=${typeof encodedBody === 'string' ? Buffer.byteLength(encodedBody, 'utf8') : 0}`
             + ` parameterJsonBytes=${parameterJsonBytes}`);
@@ -213,6 +236,7 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
           // Typed failure-only metadata is validated independently of the redacted message.
           safe.providerStatus = status;
           safe.providerCodes = codes.slice(0, 16);
+          if (rayState === 'valid') safe.providerRay = ray;
           if (D1_NATIVE_FAILURE_SIGNATURES.includes(error?.d1NativeSignature)) {
             safe.d1NativeSignature = error.d1NativeSignature;
           }
