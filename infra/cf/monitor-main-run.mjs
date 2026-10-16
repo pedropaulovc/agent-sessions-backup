@@ -40,30 +40,49 @@ export function migrationProgressQuery({ revision, runId, attempt }) {
   return `OTelLogs
 | where TimeGenerated > ago(24h)
 | where ServiceName == 'sessions-index-migration'
-| extend body = todynamic(Body), IngestedAt = ingestion_time()
-| where body.event == 'migration.copy.progress' and toint(body.schemaVersion) == 1
+| extend originalBody = tostring(Body), IngestedAt = ingestion_time()
+| extend body = todynamic(originalBody)
+| where toint(body.schemaVersion) == 1
+| where body.event in ('migration.copy.progress', 'migration.copy.failure')
+    or (body.event == 'migration.auth.diagnostic' and body.stage in ('preflight', 'copy_failure'))
 | where tostring(body.revision) == '${revision}' and tostring(body.runId) == '${runId}' and tostring(body.attempt) == '${attempt}'
-| extend RecordedAt = todatetime(body.recordedAt)
+| extend RecordedAt = todatetime(body.recordedAt),
+    EvidenceKind = iff(body.event == 'migration.auth.diagnostic', strcat(tostring(body.event), ':', tostring(body.stage)), tostring(body.event))
 | where isnotnull(RecordedAt)
-| top 1 by RecordedAt desc
-| project Body, IngestedAt, TimeGenerated`;
+| summarize arg_max(RecordedAt, *) by EvidenceKind
+| take 4
+| project Body = originalBody, IngestedAt, TimeGenerated`;
 }
 
-export function migrationProgressEvidence(rows, correlation, now = Date.now()) {
+// Revalidate the original JSON text locally: Kusto dynamic coercion must not turn
+// a string counter/schema version into an accepted numeric contract field.
+function correlatedEvents(rows, correlation, now) {
   if (!Array.isArray(rows)) throw new Error('Invalid Azure query response');
   const valid = [];
   for (const row of rows) {
+    if (typeof row?.Body !== 'string') continue;
     let body;
-    try { body = typeof row.Body === 'string' ? JSON.parse(row.Body) : row.Body; } catch { continue; }
+    try { body = JSON.parse(row.Body); } catch { continue; }
     const event = migrationTelemetryEvent(body);
     if (!event || event.revision !== correlation.revision || event.runId !== correlation.runId
       || event.attempt !== String(correlation.attempt)) continue;
     const recorded = Date.parse(event.recordedAt);
     const ingested = Date.parse(row.IngestedAt);
+    if (!Number.isFinite(ingested) || recorded > now + 60_000 || ingested > now + 60_000
+      || ingested < recorded - 60_000) continue;
+    valid.push({ event, recorded, ingested });
+  }
+  return valid;
+}
+
+export function migrationProgressEvidence(rows, correlation, now = Date.now()) {
+  const valid = [];
+  for (const item of correlatedEvents(rows, correlation, now)) {
+    const { event, recorded } = item;
+    if (event.event !== 'migration.copy.progress') continue;
     const lastAck = event.lastProgressAt === null ? null : Date.parse(event.lastProgressAt);
-    if (!Number.isFinite(ingested) || recorded > now + 60_000 || ingested > now + 60_000 || ingested < recorded - 60_000
-      || (lastAck !== null && (lastAck > recorded || event.acknowledgedRows === null))) continue;
-    valid.push({ event, recorded, ingested, lastAck });
+    if (lastAck !== null && (lastAck > recorded || event.acknowledgedRows === null)) continue;
+    valid.push({ ...item, lastAck });
   }
   valid.sort((left, right) => right.recorded - left.recorded);
   const latest = valid[0];
@@ -87,6 +106,29 @@ export function migrationProgressEvidence(rows, correlation, now = Date.now()) {
   };
 }
 
+// Diagnostics are independent observations, never heartbeats or durable ACKs.
+export function migrationDiagnosticEvidence(rows, correlation, now = Date.now()) {
+  const evidence = { copyFailure: null, auth: { preflight: null, copy_failure: null } };
+  const valid = correlatedEvents(rows, correlation, now).sort((left, right) => right.recorded - left.recorded);
+  for (const { event, recorded, ingested } of valid) {
+    const failure = event.event === 'migration.copy.failure';
+    const auth = event.event === 'migration.auth.diagnostic';
+    if (!failure && !auth) continue;
+    if (failure ? evidence.copyFailure !== null : evidence.auth[event.stage] !== null) continue;
+    const observation = {
+      ...event,
+      ageSeconds: Math.max(0, (now - recorded) / 1000),
+      ingestedAt: new Date(ingested).toISOString(),
+      ingestionLagSeconds: Math.max(0, (ingested - recorded) / 1000),
+      ...(auth ? { permissionEvidence: 'not-established',
+        caveat: 'Active token verification is not proof of D1 permissions' } : {}),
+    };
+    if (failure) evidence.copyFailure = observation;
+    else evidence.auth[event.stage] = observation;
+  }
+  return evidence;
+}
+
 function githubEntries(run) {
   const entries = new Map();
   entries.set('workflow', { scope: 'workflow', status: run.status,
@@ -108,6 +150,7 @@ export async function monitorMainRun(options, {
 } = {}) {
   let previous = null;
   let previousEvidence = null;
+  const previousDiagnostics = new Map();
   let consecutiveReadFailures = 0;
   let nextAzureQuery = 0;
   let rows = [];
@@ -166,6 +209,18 @@ export async function monitorMainRun(options, {
       const comparison = JSON.stringify({ ...evidence, heartbeatAgeSeconds: undefined });
       if (comparison !== previousEvidence) log(`migration progress ${JSON.stringify(evidence)}`);
       previousEvidence = comparison;
+      const diagnostics = azureError ? { copyFailure: null, auth: { preflight: null, copy_failure: null } }
+        : migrationDiagnosticEvidence(rows, options, now());
+      for (const [kind, observation] of [
+        ['copy failure', diagnostics.copyFailure],
+        ['auth preflight', diagnostics.auth.preflight],
+        ['auth copy_failure', diagnostics.auth.copy_failure],
+      ]) {
+        const diagnostic = observation ?? { availability: 'unknown', reason: azureError ?? 'no-correlated-diagnostic' };
+        const comparison = JSON.stringify({ ...diagnostic, ageSeconds: undefined });
+        if (comparison !== previousDiagnostics.get(kind)) log(`migration ${kind} ${JSON.stringify(diagnostic)}`);
+        previousDiagnostics.set(kind, comparison);
+      }
     }
     if (run.status === 'completed') {
       log(`Protected run finished: ${run.conclusion}; Azure may still be ingesting the final event`);

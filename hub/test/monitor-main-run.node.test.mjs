@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import test from 'node:test';
-import { migrationProgressEvidence, migrationProgressQuery, monitorMainRun, parseMonitorArguments } from '../../infra/cf/monitor-main-run.mjs';
+import { migrationDiagnosticEvidence, migrationProgressEvidence, migrationProgressQuery, monitorMainRun, parseMonitorArguments } from '../../infra/cf/monitor-main-run.mjs';
 
 const time = Date.parse('2026-10-16T16:00:00.000Z');
 const correlation = { revision: 'c'.repeat(40), runId: '38887942689', attempt: '2' };
@@ -24,6 +24,24 @@ const run = (changes = {}) => ({ databaseId: correlation.runId, attempt: 2, head
   jobs: [{ databaseId: 42, name: 'deploy', status: 'in_progress', conclusion: '', steps: [
     { name: 'Copy frozen source', status: 'in_progress', conclusion: '' },
   ] }], ...changes });
+const auth = (changes = {}) => ({
+  event: 'migration.auth.diagnostic', schemaVersion: 1, ...correlation,
+  recordedAt: new Date(time).toISOString(), stage: 'preflight', verification: 'active', tokenStatus: 'active',
+  notBefore: null, expiresOn: null, httpStatus: 200, providerCodes: [], providerReason: 'unknown',
+  cfRay: null, providerDate: null, requestDurationMs: 12, ...changes,
+});
+const failure = (changes = {}) => ({
+  event: 'migration.copy.failure', schemaVersion: 1, ...correlation,
+  recordedAt: new Date(time).toISOString(), phase: 'copy-checkpoint-write', failureKind: 'http',
+  httpStatus: 401, providerCodes: [10000], providerReason: 'authentication', cfRay: '0123456789abcdef-LAX',
+  providerDate: new Date(time).toISOString(), requestDurationMs: 25, requestAttempt: 1,
+  lastSuccessfulRequestAt: null, statementCount: 1, parameterCount: 2, bodyBytes: 100,
+  parameterJsonBytes: 20, databaseId: options.workspace, ...changes,
+});
+const eventRow = (event, ingested = time + 30_000) => ({
+  Body: JSON.stringify(event), IngestedAt: new Date(ingested).toISOString(),
+  TimeGenerated: event.recordedAt,
+});
 
 test('explicit run/full revision/attempt and Azure choice reject ambiguous identities and KQL input', () => {
   const args = ['--run-id', correlation.runId, '--head', correlation.revision, '--attempt', correlation.attempt];
@@ -232,4 +250,177 @@ test('actual CLI distinguishes concluded workflow failure from blind reads and i
       if (expectedStatus === 2) assert.doesNotMatch(child.stdout, /Protected run finished:/);
     }
   } finally { await rm(temporary, { recursive: true, force: true }); }
+});
+
+test('bounded query selects latest progress, failure and each auth stage while returning original JSON text', () => {
+  const query = migrationProgressQuery(correlation);
+  assert.ok(query.indexOf('originalBody = tostring(Body)') < query.indexOf('body = todynamic(originalBody)'));
+  assert.match(query, /summarize arg_max\(RecordedAt, \*\) by EvidenceKind/);
+  assert.match(query, /take 4/);
+  assert.match(query, /project Body = originalBody, IngestedAt, TimeGenerated/);
+  assert.match(query, /body\.stage in \('preflight', 'copy_failure'\)/);
+  for (const value of Object.values(correlation)) assert.ok(query.includes(`'${value}'`));
+  assert.doesNotMatch(query, /tostring\(body\)\s*[,;]?\s*$/m);
+});
+
+test('original JSON types survive the query boundary and dynamic objects cannot bypass local validation', () => {
+  for (const candidate of [
+    eventRow(progress({ schemaVersion: '1' })),
+    eventRow(progress({ acknowledgedRows: '500' })),
+    { ...row(), Body: progress({ acknowledgedRows: 500 }) },
+    { ...row(), Body: '{invalid json' },
+  ]) {
+    assert.equal(migrationProgressEvidence([candidate], correlation, time + 40_000).delivery, 'unknown');
+  }
+  const malformed = [
+    eventRow(auth({ schemaVersion: '1' })),
+    eventRow(auth({ httpStatus: '200' })),
+    eventRow(failure({ providerCodes: ['10000'] })),
+    eventRow(failure({ parameterCount: '2' })),
+    { ...eventRow(auth()), Body: auth() },
+  ];
+  assert.deepEqual(migrationDiagnosticEvidence(malformed, correlation, time + 40_000),
+    { copyFailure: null, auth: { preflight: null, copy_failure: null } });
+});
+
+test('diagnostics independently select newest correlated kind and stage, rejecting invalid identity and timing', () => {
+  const latest = new Date(time + 10_000).toISOString();
+  const rows = [eventRow(auth()), eventRow(auth({ recordedAt: latest, requestDurationMs: 50 })),
+    eventRow(auth({ stage: 'copy_failure', verification: 'unavailable', tokenStatus: null })),
+    eventRow(failure()), eventRow(failure({ recordedAt: latest, httpStatus: 403, providerReason: 'authorization' }))];
+  for (const changes of [{ runId: '999' }, { attempt: '3' }, { revision: 'd'.repeat(40) },
+    { recordedAt: new Date(time + 200_000).toISOString() }]) {
+    rows.push(eventRow(auth(changes)), eventRow(failure(changes)));
+  }
+  rows.push(eventRow(auth({ recordedAt: new Date(time + 20_000).toISOString() }), time - 100_000));
+  rows.push(eventRow(failure({ recordedAt: latest }), time + 200_000));
+  const evidence = migrationDiagnosticEvidence(rows, correlation, time + 40_000);
+  assert.equal(evidence.copyFailure.httpStatus, 403);
+  assert.equal(evidence.copyFailure.recordedAt, latest);
+  assert.equal(evidence.auth.preflight.requestDurationMs, 50);
+  assert.equal(evidence.auth.copy_failure.verification, 'unavailable');
+  assert.equal(evidence.auth.preflight.permissionEvidence, 'not-established');
+  assert.match(evidence.auth.preflight.caveat, /not proof of D1 permissions/);
+});
+
+test('auth and failure use their own recency and ingestion timing without refreshing stale progress or ETA', () => {
+  const recent = time + 300_000;
+  const rows = [row({ acknowledgedRows: 500, rowsPerSecond: 2, remainingRows: 100, etaSeconds: 50,
+    lastProgressAt: new Date(time - 1000).toISOString() }, recent),
+  eventRow(auth({ recordedAt: new Date(recent).toISOString() }), recent + 10_000),
+  eventRow(failure({ recordedAt: new Date(recent - 20_000).toISOString() }), recent + 10_000)];
+  const progressEvidence = migrationProgressEvidence(rows, correlation, recent + 40_000);
+  assert.equal(progressEvidence.delivery, 'stale');
+  assert.equal(progressEvidence.heartbeatRecordedAt, new Date(time).toISOString());
+  assert.equal(progressEvidence.ackEvidence, 'unknown-stale-heartbeat');
+  assert.equal(progressEvidence.rowsPerSecond, null);
+  assert.equal(progressEvidence.etaSeconds, null);
+  const diagnostics = migrationDiagnosticEvidence(rows, correlation, recent + 40_000);
+  assert.equal(diagnostics.auth.preflight.ageSeconds, 40);
+  assert.equal(diagnostics.auth.preflight.ingestionLagSeconds, 10);
+  assert.equal(diagnostics.auth.preflight.ingestedAt, new Date(recent + 10_000).toISOString());
+  assert.equal(diagnostics.copyFailure.ageSeconds, 60);
+  assert.equal(diagnostics.copyFailure.ingestionLagSeconds, 30);
+  assert.equal(migrationProgressEvidence(rows.slice(1), correlation, recent + 40_000).delivery, 'unknown');
+  for (const observation of [diagnostics.auth.preflight, diagnostics.copyFailure]) {
+    for (const key of ['acknowledgedRows', 'lastProgressAt', 'rowsPerSecond', 'etaSeconds', 'heartbeatRecordedAt']) {
+      assert.equal(Object.hasOwn(observation, key), false);
+    }
+  }
+});
+
+test('diagnostic evidence and monitor output exclude raw errors, headers, SQL, parameters and unrecognized fields', async () => {
+  const privateFields = { token: 'PRIVATE_TOKEN', error: 'PRIVATE_ERROR', headers: { Authorization: 'PRIVATE_HEADER' },
+    sql: 'PRIVATE_SQL', params: ['PRIVATE_PARAMETER'], session: 'PRIVATE_SESSION', rows: ['PRIVATE_ROW'],
+    acknowledgedRows: 999, rowsPerSecond: 999, etaSeconds: 1 };
+  const rows = [eventRow(auth(privateFields)), eventRow(failure(privateFields))];
+  const evidence = migrationDiagnosticEvidence(rows, correlation, time + 40_000);
+  assert.ok(evidence.auth.preflight && evidence.copyFailure);
+  assert.doesNotMatch(JSON.stringify(evidence), /PRIVATE_|acknowledgedRows|rowsPerSecond|etaSeconds/);
+  const logs = [];
+  await monitorMainRun(options, {
+    now: () => time + 40_000, log: (line) => logs.push(line), warn: assert.fail,
+    async execute(binary) {
+      return { stdout: JSON.stringify(binary === 'gh' ? run({ status: 'completed', conclusion: 'failure' }) : rows) };
+    },
+  });
+  assert.doesNotMatch(logs.join('\n'), /PRIVATE_|999/);
+  assert.ok(logs.some((line) => line.startsWith('migration auth preflight ') && line.includes('"verification":"active"')));
+  assert.ok(logs.some((line) => line.startsWith('migration copy failure ') && line.includes('"httpStatus":401')));
+  assert.ok(logs.some((line) => line.startsWith('migration progress ') && line.includes('"delivery":"unknown"')));
+});
+
+test('terminal query captures post-failure auth without extra queries, while unchanged diagnostics stay quiet', async () => {
+  let clock = time + 40_000;
+  let reads = 0;
+  let queries = 0;
+  const logs = [];
+  const result = await monitorMainRun(options, {
+    now: () => clock, sleep: async (ms) => { clock += ms; }, log: (line) => logs.push(line), warn: assert.fail,
+    async execute(binary) {
+      if (binary === 'gh') return { stdout: JSON.stringify(run(++reads === 4
+        ? { status: 'completed', conclusion: 'failure' } : {})) };
+      queries += 1;
+      const rows = [row({ acknowledgedRows: 500 }), eventRow(auth()), eventRow(failure())];
+      if (reads === 4) rows.push(eventRow(auth({ stage: 'copy_failure',
+        recordedAt: new Date(time + 120_000).toISOString(), verification: 'inactive', tokenStatus: 'expired' }),
+      time + 125_000));
+      return { stdout: JSON.stringify(rows) };
+    },
+  });
+  assert.equal(result, 1);
+  assert.equal(reads, 4);
+  assert.equal(queries, 3, 'initial, sixty-second cadence, final only; no ingestion settle loop');
+  assert.equal(logs.filter((line) => line.startsWith('migration auth preflight ')).length, 1);
+  assert.equal(logs.filter((line) => line.startsWith('migration copy failure ')).length, 1);
+  const postFailure = logs.filter((line) => line.startsWith('migration auth copy_failure '));
+  assert.equal(postFailure.length, 2, 'unknown initially, observed only from terminal query');
+  const observed = JSON.parse(postFailure.at(-1).slice('migration auth copy_failure '.length));
+  assert.equal(observed.tokenStatus, 'expired');
+  assert.equal(observed.ageSeconds, 10);
+  assert.equal(observed.ingestionLagSeconds, 5);
+  assert.match(logs.at(-1), /Azure may still be ingesting the final event/);
+});
+
+test('Azure query failure invalidates diagnostics instead of presenting cached auth as current evidence', async () => {
+  let clock = time + 40_000;
+  let reads = 0;
+  let queries = 0;
+  const logs = [];
+  const warnings = [];
+  await monitorMainRun(options, {
+    now: () => clock, sleep: async (ms) => { clock += ms; },
+    log: (line) => logs.push(line), warn: (line) => warnings.push(line),
+    async execute(binary) {
+      if (binary === 'gh') return { stdout: JSON.stringify(run(++reads === 3
+        ? { status: 'completed', conclusion: 'failure' } : {})) };
+      if (++queries === 1) return { stdout: JSON.stringify([eventRow(auth()), eventRow(failure())]) };
+      throw new Error('PRIVATE_PROVIDER_ERROR');
+    },
+  });
+  for (const prefix of ['migration auth preflight ', 'migration copy failure ']) {
+    const observations = logs.filter((line) => line.startsWith(prefix)).map((line) => JSON.parse(line.slice(prefix.length)));
+    assert.equal(observations.length, 2);
+    assert.equal(observations[0].recordedAt, new Date(time).toISOString());
+    assert.deepEqual(observations[1], { availability: 'unknown', reason: 'query-failed' });
+  }
+  assert.equal(warnings.length, 1);
+  assert.doesNotMatch([...logs, ...warnings].join('\n'), /PRIVATE_PROVIDER_ERROR/);
+});
+
+test('no-Azure optout performs only the GitHub read and emits no auth or failure observations', async () => {
+  const logs = [];
+  let reads = 0;
+  const result = await monitorMainRun({ ...options, azure: false }, {
+    log: (line) => logs.push(line), warn: assert.fail,
+    async execute(binary) {
+      assert.equal(binary, 'gh');
+      reads += 1;
+      return { stdout: JSON.stringify(run({ status: 'completed', conclusion: 'success' })) };
+    },
+  });
+  assert.equal(result, 0);
+  assert.equal(reads, 1);
+  assert.ok(logs.some((line) => line.includes('durable ACK count, rate and ETA are unknown')));
+  assert.equal(logs.some((line) => /^migration (auth|copy failure) /.test(line)), false);
 });

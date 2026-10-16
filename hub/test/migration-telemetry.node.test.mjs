@@ -18,6 +18,25 @@ const progress = (changes = {}) => ({
   acknowledgedRows: null, passRows: null, pendingRows: null, elapsedMs: 0,
   rowsPerSecond: null, remainingRows: null, etaSeconds: null, lastProgressAt: null, ...changes,
 });
+const provider = {
+  httpStatus: 401, providerCodes: [10000], providerReason: 'authentication',
+  cfRay: 'a4b8dcbe9f86579a-IAD', providerDate: new Date(initial).toISOString(), requestDurationMs: 25,
+};
+const failure = (changes = {}) => ({
+  event: 'migration.copy.failure', schemaVersion: 1,
+  recordedAt: new Date(initial).toISOString(), revision: 'c'.repeat(40), runId: '38887942689', attempt: '2',
+  phase: 'copy-checkpoint-write', failureKind: 'http', ...provider, requestAttempt: 1,
+  lastSuccessfulRequestAt: new Date(initial - 500).toISOString(),
+  statementCount: 1, parameterCount: 3, bodyBytes: 240, parameterJsonBytes: 120,
+  databaseId: '11111111-2222-3333-4444-555555555555', ...changes,
+});
+const auth = (changes = {}) => ({
+  event: 'migration.auth.diagnostic', schemaVersion: 1,
+  recordedAt: new Date(initial).toISOString(), revision: 'c'.repeat(40), runId: '38887942689', attempt: '2',
+  stage: 'preflight', verification: 'active', tokenStatus: 'active',
+  notBefore: '2026-10-14T00:00:00.000Z', expiresOn: '2026-11-15T00:00:00.000Z',
+  ...provider, httpStatus: 200, providerCodes: [], providerReason: 'unknown', ...changes,
+});
 const deferred = () => {
   let resolve;
   let reject;
@@ -60,6 +79,18 @@ function logBody(bytes) {
   }
   return JSON.parse(new TextDecoder().decode(bytes));
 }
+function logBodies(bytes) {
+  for (const number of [1, 2]) {
+    bytes = fields(bytes).find((field) => field.number === number)?.bytes;
+    assert.ok(bytes, `required protobuf field ${number}`);
+  }
+  return fields(bytes).filter((field) => field.number === 2).map((record) => {
+    let value = record.bytes;
+    for (const number of [5, 1]) value = fields(value).find((field) => field.number === number)?.bytes;
+    assert.ok(value, 'required log body');
+    return JSON.parse(new TextDecoder().decode(value));
+  });
+}
 
 test('privacy allowlist preserves unknown counters, strips contents and rejects invalid aggregate evidence', () => {
   const event = migrationTelemetryEvent(progress({ session: 'private session text', rowId: 'private ID', error: new Error('secret') }));
@@ -76,6 +107,59 @@ test('privacy allowlist preserves unknown counters, strips contents and rejects 
     assert.equal(migrationTelemetryEvent(progress(changes)), null);
   }
   assert.equal(migrationTelemetryEvent(progress({ acknowledgedRows: 0 })).acknowledgedRows, 0);
+});
+
+test('finite failure and auth allowlists preserve safe context without accepting raw provider data', () => {
+  const secrets = { Authorization: 'private bearer', tokenId: 'private token id',
+    message: 'private provider message', body: 'private response', sql: 'private SQL',
+    params: ['private parameter'], session: 'private session', url: 'https://private.test/?token=private' };
+  const codes = [10000];
+  const event = migrationTelemetryEvent(failure({ ...secrets, providerCodes: codes }));
+  assert.equal(event.phase, 'copy-checkpoint-write');
+  assert.equal(event.httpStatus, 401);
+  assert.equal(event.providerReason, 'authentication', '401 is not evidence of token expiry');
+  assert.ok(Object.isFrozen(event));
+  assert.ok(Object.isFrozen(event.providerCodes));
+  codes[0] = 999;
+  assert.deepEqual(event.providerCodes, [10000], 'the queue owns a bounded immutable copy');
+  for (const key of Object.keys(secrets)) assert.equal(Object.hasOwn(event, key), false);
+  const diagnostic = migrationTelemetryEvent(auth(secrets));
+  assert.equal(diagnostic.verification, 'active');
+  assert.equal(diagnostic.tokenStatus, 'active');
+  assert.equal(diagnostic.notBefore, '2026-10-14T00:00:00.000Z');
+  assert.equal(diagnostic.expiresOn, '2026-11-15T00:00:00.000Z');
+  assert.doesNotMatch(JSON.stringify([event, diagnostic]), /private|Authorization|tokenId/);
+  for (const verification of ['unavailable', 'not_configured']) {
+    assert.ok(migrationTelemetryEvent(auth({ verification, tokenStatus: null, notBefore: null, expiresOn: null })));
+  }
+  assert.ok(migrationTelemetryEvent(auth({ verification: 'inactive', tokenStatus: 'expired' })));
+});
+
+test('diagnostic bounds reject malformed correlation, statuses, dates, provider codes and request context', () => {
+  const invalid = [{ schemaVersion: 2 }, { revision: null }, { runId: '0' }, { attempt: '0' },
+    { recordedAt: '2026-10-16T16:00:00Z' }, { httpStatus: 99 }, { httpStatus: 600 }, { httpStatus: '401' },
+    { providerCodes: [10000, 'secret'] }, { providerCodes: Array(1) }, { providerCodes: Array(17).fill(1) },
+    { providerCodes: [-1] }, { providerCodes: [Infinity] }, { providerCodes: [Number.MAX_SAFE_INTEGER + 1] },
+    { providerReason: 'private provider text' }, { cfRay: 'private ray' }, { cfRay: 'a4b8dcbe9f86579a-IAD?token=secret' },
+    { providerDate: 'Fri, 16 Oct 2026 16:00:00 GMT' }, { requestDurationMs: -1 }, { requestDurationMs: Infinity }];
+  for (const changes of invalid) {
+    assert.equal(migrationTelemetryEvent(failure(changes)), null, JSON.stringify(changes));
+    assert.equal(migrationTelemetryEvent(auth(changes)), null, JSON.stringify(changes));
+  }
+  for (const changes of [{ phase: 'copying' }, { phase: 'private phase' }, { failureKind: 'private error' },
+    { requestAttempt: 0 }, { requestAttempt: 1.5 }, { lastSuccessfulRequestAt: 'private date' },
+    { statementCount: -1 }, { parameterCount: 0.5 }, { bodyBytes: NaN }, { parameterJsonBytes: '120' },
+    { databaseId: 'private database' }]) assert.equal(migrationTelemetryEvent(failure(changes)), null);
+  for (const changes of [{ stage: 'private stage' }, { verification: 'valid' }, { tokenStatus: 'private token' },
+    { verification: 'active', tokenStatus: 'disabled' }, { verification: 'inactive', tokenStatus: 'active' },
+    { verification: 'unavailable', tokenStatus: 'active' }, { notBefore: 'private date' },
+    { expiresOn: '2026-11-15' }]) assert.equal(migrationTelemetryEvent(auth(changes)), null);
+  const unknown = migrationTelemetryEvent(failure({ phase: 'unknown', failureKind: 'unknown', httpStatus: null,
+    providerCodes: [], providerReason: 'unknown', cfRay: null, providerDate: null, requestDurationMs: null,
+    requestAttempt: null, lastSuccessfulRequestAt: null, statementCount: null, parameterCount: null,
+    bodyBytes: null, parameterJsonBytes: null, databaseId: null }));
+  assert.equal(unknown.requestAttempt, null);
+  assert.equal(unknown.databaseId, null);
 });
 
 test('absent credentials and unsafe endpoint boundaries perform no network and emit only typed warnings', async () => {
@@ -209,6 +293,92 @@ test('one in-flight ingestion coalesces to newest immutable progress without del
   assert.equal(warnings.find((event) => event.code === 'delivery-summary').coalescedEvents, 98);
 });
 
+test('bounded priority batches preserve failure and both auth stages independently of heartbeat coalescing', async () => {
+  const entered = deferred();
+  const release = deferred();
+  const requests = [];
+  const warnings = [];
+  let active = 0;
+  let maximum = 0;
+  const sink = await createMigrationTelemetry({ env, getAccessToken: async () => 'private-token',
+    warn: (event) => warnings.push(event), async fetch(_url, options) {
+      active += 1;
+      maximum = Math.max(maximum, active);
+      assert.ok(options.body.byteLength <= 16 * 1024);
+      requests.push(logBodies(options.body));
+      if (requests.length === 1) { entered.resolve(); await release.promise; }
+      active -= 1;
+      return new Response(null, { status: 204 });
+    },
+  });
+  sink.emit(progress({ acknowledgedRows: 1 }));
+  await entered.promise;
+  for (let count = 1; count <= 100; count += 1) {
+    sink.emit(failure({ requestAttempt: count }));
+    sink.emit(auth({ stage: 'preflight' }));
+    sink.emit(auth({ stage: 'copy_failure' }));
+    sink.emit(progress({ acknowledgedRows: count, status: count === 100 ? 'failed' : 'running' }));
+  }
+  release.resolve();
+  await sink.close();
+  assert.equal(maximum, 1);
+  assert.equal(requests.length, 2, 'one initial request and one bounded flush, not per-record network work');
+  assert.deepEqual(requests[1].map((event) => [event.event, event.stage ?? event.status]), [
+    ['migration.copy.failure', undefined], ['migration.auth.diagnostic', 'copy_failure'],
+    ['migration.auth.diagnostic', 'preflight'], ['migration.copy.progress', 'failed'],
+  ]);
+  assert.equal(requests[1][0].requestAttempt, 100);
+  assert.equal(requests[1][3].acknowledgedRows, 100);
+  assert.equal(warnings.find((event) => event.code === 'delivery-summary').coalescedEvents, 396);
+});
+
+test('adjacent terminal failure and failed progress share one request without replacing each other or retrying', async () => {
+  for (const status of [204, 403]) {
+    const requests = [];
+    const warnings = [];
+    const sink = await createMigrationTelemetry({ env, getAccessToken: async () => 'private-token',
+      warn: (event) => warnings.push(event), async fetch(_url, options) {
+        requests.push(logBodies(options.body));
+        return new Response(status === 204 ? null : 'private provider response', { status });
+      },
+    });
+    sink.emit(progress({ status: 'failed' }));
+    sink.emit(failure());
+    await sink.close();
+    assert.equal(requests.length, 1);
+    assert.deepEqual(requests[0].map((event) => event.event), ['migration.copy.failure', 'migration.copy.progress']);
+    assert.equal(warnings.some((event) => event.code === 'event-invalid'), false);
+    if (status === 403) assert.equal(warnings.find((event) => event.code === 'delivery-summary').failedEvents, 2);
+    assert.doesNotMatch(JSON.stringify(warnings), /private/);
+  }
+});
+
+test('maximum bounded diagnostic fields remain complete original JSON within the existing transport cap', async () => {
+  const maximum = Number.MAX_SAFE_INTEGER;
+  const context = { providerCodes: Array(16).fill(maximum), requestDurationMs: maximum };
+  const records = [
+    failure({ ...context, requestAttempt: maximum, statementCount: maximum, parameterCount: maximum,
+      bodyBytes: maximum, parameterJsonBytes: maximum }),
+    auth({ ...context, stage: 'copy_failure' }),
+    auth(context),
+    progress({ status: 'failed', acknowledgedRows: maximum, passRows: maximum,
+      pendingRows: maximum, remainingRows: maximum, elapsedMs: maximum,
+      rowsPerSecond: maximum, etaSeconds: maximum }),
+  ];
+  const requests = [];
+  const sink = await createMigrationTelemetry({ env, getAccessToken: async () => 'private-token', warn: assert.fail,
+    async fetch(_url, options) {
+      assert.ok(options.body.byteLength <= 16 * 1024);
+      requests.push(logBodies(options.body));
+      return new Response(null, { status: 204 });
+    },
+  });
+  for (const record of records) sink.emit(record);
+  await sink.close();
+  assert.equal(requests.length, 1);
+  assert.deepEqual(requests[0], records.map(migrationTelemetryEvent), 'the shared encoder must not truncate diagnostic JSON');
+});
+
 test('authorization failures drop without replay and never reveal response or exception text', async () => {
   const warnings = [];
   let requests = 0;
@@ -271,6 +441,8 @@ test('close is a quiescent diagnostics boundary even when authentication or inge
         },
       });
       sink.emit(progress());
+      sink.emit(failure());
+      sink.emit(auth({ stage: 'copy_failure' }));
       // Start close before the later auth/ingest stages are entered, exercising
       // its earlier total deadline rather than only the per-request timeout.
       const closing = sink.close();

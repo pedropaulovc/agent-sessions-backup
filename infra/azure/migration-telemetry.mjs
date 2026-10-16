@@ -1,12 +1,25 @@
 // Protected GitHub Actions -> existing Azure DCR OTLP logs. No Azure API key,
 // gateway bearer, session contents, retry queue, or dependency on the copy ACK path.
 import { MIGRATION_COPY_PHASES } from '../cf/migration-progress.mjs';
+import { COPY_PHASES } from '../../hub/scripts/lib/index-migration.mjs';
 
 const GUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const PHASES = new Set(MIGRATION_COPY_PHASES);
+const FAILURE_PHASES = new Set([...Object.values(COPY_PHASES), 'unknown']);
 const STATUSES = new Set(['running', 'complete', 'partial', 'failed']);
 const COUNTERS = ['acknowledgedRows', 'passRows', 'pendingRows', 'remainingRows'];
 const MEASURES = ['elapsedMs', 'rowsPerSecond', 'etaSeconds'];
+const EVENTS = new Set(['migration.copy.progress', 'migration.copy.failure', 'migration.auth.diagnostic']);
+const FAILURE_KINDS = new Set(['http', 'network', 'provider', 'invariant', 'unknown']);
+const PROVIDER_REASONS = new Set(['authentication', 'authorization', 'token_expired', 'token_not_yet_valid',
+  'ip_restricted', 'rate_limit', 'unknown']);
+const AUTH_STAGES = new Set(['preflight', 'copy_failure']);
+const VERIFICATIONS = new Set(['active', 'inactive', 'unavailable', 'not_configured']);
+const TOKEN_STATUSES = new Set(['active', 'disabled', 'expired']);
+const REQUEST_COUNTS = ['statementCount', 'parameterCount', 'bodyBytes', 'parameterJsonBytes'];
+// One newest pending record per finite kind/stage, with critical evidence first.
+const DELIVERY_ORDER = ['migration.copy.failure', 'migration.auth.diagnostic:copy_failure',
+  'migration.auth.diagnostic:preflight', 'migration.copy.progress'];
 const REQUEST_MS = 1000;
 const CLOSE_MS = 1000;
 
@@ -19,30 +32,78 @@ function validDate(value) {
     && Number.isFinite(Date.parse(value)) && new Date(value).toISOString() === value;
 }
 
-// Copy only aggregate contract fields; never stringify arbitrary input or errors.
+// Copy only finite contract fields; never stringify arbitrary input or errors.
 export function migrationTelemetryEvent(input) {
-  if (!input || input.event !== 'migration.copy.progress' || input.schemaVersion !== 1
-    || !STATUSES.has(input.status) || !PHASES.has(input.phase) || !validDate(input.recordedAt)
+  if (!input || !EVENTS.has(input.event) || input.schemaVersion !== 1 || !validDate(input.recordedAt)
     || typeof input.revision !== 'string' || !/^[a-f0-9]{40}$/.test(input.revision)
     || typeof input.runId !== 'string' || !/^[1-9][0-9]{0,19}$/.test(input.runId)
     || !/^[1-9][0-9]{0,8}$/.test(String(input.attempt ?? ''))) return null;
   const event = {
-    event: 'migration.copy.progress', schemaVersion: 1, status: input.status, phase: input.phase,
-    recordedAt: input.recordedAt, revision: input.revision, runId: input.runId, attempt: String(input.attempt),
+    event: input.event, schemaVersion: 1, recordedAt: input.recordedAt,
+    revision: input.revision, runId: input.runId, attempt: String(input.attempt),
   };
-  for (const key of COUNTERS) {
-    const value = input[key];
-    if (value !== null && (!Number.isSafeInteger(value) || value < 0)) return null;
-    event[key] = value;
+  if (input.event === 'migration.copy.progress') {
+    if (!STATUSES.has(input.status) || !PHASES.has(input.phase)) return null;
+    event.status = input.status;
+    event.phase = input.phase;
+    for (const key of COUNTERS) {
+      const value = input[key];
+      if (value !== null && (!Number.isSafeInteger(value) || value < 0)) return null;
+      event[key] = value;
+    }
+    for (const key of MEASURES) {
+      const value = input[key];
+      if (value !== null && (typeof value !== 'number' || !Number.isFinite(value) || value < 0)) return null;
+      event[key] = value;
+    }
+    if (event.elapsedMs === null || !Number.isSafeInteger(event.elapsedMs)
+      || (input.lastProgressAt !== null && !validDate(input.lastProgressAt))) return null;
+    event.lastProgressAt = input.lastProgressAt;
+    return Object.freeze(event);
   }
-  for (const key of MEASURES) {
-    const value = input[key];
-    if (value !== null && (typeof value !== 'number' || !Number.isFinite(value) || value < 0)) return null;
-    event[key] = value;
+  if ((input.httpStatus !== null && (!Number.isInteger(input.httpStatus) || input.httpStatus < 100 || input.httpStatus > 599))
+    || !Array.isArray(input.providerCodes) || input.providerCodes.length > 16
+    || !PROVIDER_REASONS.has(input.providerReason)
+    || (input.cfRay !== null && (typeof input.cfRay !== 'string' || !/^[a-fA-F0-9]{16}(?:-[A-Z]{3})?$/.test(input.cfRay)))
+    || (input.providerDate !== null && !validDate(input.providerDate))
+    || (input.requestDurationMs !== null && (typeof input.requestDurationMs !== 'number'
+      || !Number.isFinite(input.requestDurationMs) || input.requestDurationMs < 0
+      || input.requestDurationMs > Number.MAX_SAFE_INTEGER))) return null;
+  for (const code of input.providerCodes) if (!Number.isSafeInteger(code) || code < 0) return null;
+  event.httpStatus = input.httpStatus;
+  event.providerCodes = Object.freeze([...input.providerCodes]);
+  event.providerReason = input.providerReason;
+  event.cfRay = input.cfRay;
+  event.providerDate = input.providerDate;
+  event.requestDurationMs = input.requestDurationMs;
+  if (input.event === 'migration.copy.failure') {
+    if (!FAILURE_PHASES.has(input.phase) || !FAILURE_KINDS.has(input.failureKind)
+      || (input.requestAttempt !== null && (!Number.isSafeInteger(input.requestAttempt) || input.requestAttempt < 1))
+      || (input.lastSuccessfulRequestAt !== null && !validDate(input.lastSuccessfulRequestAt))
+      || (input.databaseId !== null && (typeof input.databaseId !== 'string' || !GUID.test(input.databaseId)))) return null;
+    event.phase = input.phase;
+    event.failureKind = input.failureKind;
+    event.requestAttempt = input.requestAttempt;
+    event.lastSuccessfulRequestAt = input.lastSuccessfulRequestAt;
+    for (const key of REQUEST_COUNTS) {
+      if (input[key] !== null && (!Number.isSafeInteger(input[key]) || input[key] < 0)) return null;
+      event[key] = input[key];
+    }
+    event.databaseId = input.databaseId;
+  } else {
+    if (!AUTH_STAGES.has(input.stage) || !VERIFICATIONS.has(input.verification)
+      || (input.tokenStatus !== null && !TOKEN_STATUSES.has(input.tokenStatus))
+      || (input.notBefore !== null && !validDate(input.notBefore))
+      || (input.expiresOn !== null && !validDate(input.expiresOn))
+      || (input.verification === 'active' && input.tokenStatus !== 'active')
+      || (input.verification === 'inactive' && !['disabled', 'expired'].includes(input.tokenStatus))
+      || (['unavailable', 'not_configured'].includes(input.verification) && input.tokenStatus !== null)) return null;
+    event.stage = input.stage;
+    event.verification = input.verification;
+    event.tokenStatus = input.tokenStatus;
+    event.notBefore = input.notBefore;
+    event.expiresOn = input.expiresOn;
   }
-  if (event.elapsedMs === null || !Number.isSafeInteger(event.elapsedMs)
-    || (input.lastProgressAt !== null && !validDate(input.lastProgressAt))) return null;
-  event.lastProgressAt = input.lastProgressAt;
   return Object.freeze(event);
 }
 
@@ -140,7 +201,7 @@ export async function createMigrationTelemetry({
     ({ encodeLogsChunks } = await import('../../hub/gateway/otlp-protobuf.ts'));
   } catch { return disabled('encoder-unavailable'); }
   let cache = null;
-  let pending = null;
+  const pending = new Map();
   let inflight = null;
   let activeController = null;
   let scheduled = false;
@@ -200,22 +261,22 @@ export async function createMigrationTelemetry({
     return cache.token;
   }
 
-  async function send(event) {
+  async function send(events) {
     const accessToken = await token();
     if (stopped) return;
     const { chunks, dropped } = encodeLogsChunks({ resourceLogs: [{
       resource: { attributes: [{ key: 'service.name', value: { stringValue: 'sessions-index-migration' } }] },
-      scopeLogs: [{ scope: { name: 'migration-progress', version: '1' }, logRecords: [{
+      scopeLogs: [{ scope: { name: 'migration-progress', version: '1' }, logRecords: events.map((event) => ({
         timeUnixNano: (BigInt(Date.parse(event.recordedAt)) * 1_000_000n).toString(),
         severityNumber: 9, severityText: 'INFO', body: { stringValue: JSON.stringify(event) },
-      }] }],
+      })) }],
     }] }, 16 * 1024);
     if (dropped || chunks.length !== 1) throw new TelemetryFailure('encoding-failed');
     try {
       await request(endpoint, { method: 'POST',
         headers: { 'Content-Type': 'application/x-protobuf', Authorization: `Bearer ${accessToken}` },
         body: chunks[0] }, 'ingest');
-      sentEvents += 1;
+      sentEvents += events.length;
     } catch (error) {
       if (error?.status === 401 || error?.status === 403) cache = null;
       throw error;
@@ -224,20 +285,20 @@ export async function createMigrationTelemetry({
 
   function start() {
     scheduled = false;
-    if (inflight || stopped || !pending) return;
+    if (inflight || stopped || !pending.size) return;
     inflight = (async () => {
-      while (pending && !stopped) {
-        const event = pending;
-        pending = null;
-        try { await send(event); }
+      while (pending.size && !stopped) {
+        const events = DELIVERY_ORDER.filter((key) => pending.has(key)).map((key) => pending.get(key));
+        pending.clear();
+        try { await send(events); }
         catch (error) {
-          failedEvents += 1;
+          failedEvents += events.length;
           warning(error instanceof TelemetryFailure ? error.code : 'transport-failed', error?.status);
         }
       }
     })().finally(() => {
       inflight = null;
-      if (pending && !stopped) start();
+      if (pending.size && !stopped) start();
     });
   }
 
@@ -247,8 +308,9 @@ export async function createMigrationTelemetry({
       try {
         const event = migrationTelemetryEvent(input);
         if (!event) { droppedEvents += 1; warning('event-invalid'); return; }
-        if (pending) coalescedEvents += 1;
-        pending = event;
+        const key = event.event === 'migration.auth.diagnostic' ? `${event.event}:${event.stage}` : event.event;
+        if (pending.has(key)) coalescedEvents += 1;
+        pending.set(key, event);
         if (!inflight && !scheduled) { scheduled = true; queueMicrotask(start); }
       } catch { droppedEvents += 1; warning('event-invalid'); }
     },
@@ -263,7 +325,7 @@ export async function createMigrationTelemetry({
       finally {
         stopped = true;
         activeController?.abort();
-        pending = null;
+        pending.clear();
         cache = null;
       }
       if (failedEvents || coalescedEvents || droppedEvents) warning('delivery-summary');
