@@ -584,17 +584,19 @@ only while the unfenced key still holds, as TEXT, exactly the bytes `initialize`
 and validated (`typeof(value) = 'text' AND CAST(value AS BLOB) = CAST(? AS BLOB)`; no
 re-serialized or normalized comparison), and only while the fenced key is absent. It
 requires exactly one returned row with generation 1. A late unfenced write that
-commits between that read and the insert (a newer value, a deletion, a same-byte BLOB
-rewrite) or a concurrently created fenced key matches no row: that is the
-`checkpoint-fence` invariant, never retried, and nothing is written. Rerun the
-workflow; `initialize` re-reads both keys. A lost import response is resolved the
-same way (`current` if it committed). An unfenced value stored as a BLOB is a
-checkpoint payload error, not importable. Boundaries: this closes only the window
-between the import's read and its insert. It cannot detect unfenced history that was
-already stale when read (a delayed older UPSERT that landed earlier, as in the
-attempt-3 rewind), nor a rewrite back to the identical bytes before the insert (ABA);
-the copier's own source/destination proofs still apply to whatever is imported, and
-this is not a repair of earlier unfenced history.
+commits between that read and the insert (a newer value or a deletion) or a
+concurrently created fenced key matches no row: that is the `checkpoint-fence`
+invariant, never retried, and nothing is written. Rerun the workflow; `initialize`
+re-reads both keys. A lost import response is resolved the same way (`current` if it
+committed). The `STRICT` table's `value TEXT` column already refuses BLOB values; the
+`typeof`/BLOB-byte comparison only makes the match exact bytes rather than a
+collation or normalized comparison. Boundaries: this closes only the window between
+the import's read and its insert. It cannot detect unfenced history that was already
+stale when read (a delayed older UPSERT that landed before the import, as the
+delayed-UPSERT regression fixtures reproduce; no production rewind has been
+observed), nor a rewrite back to the identical bytes before the insert (ABA); the
+copier's own source/destination proofs still apply to whatever is imported, and this
+is not a repair of earlier unfenced history.
 
 Historical regression controls predate the fence. Whenever `INDEX_COPY_MODULE_PATH`,
 `INDEX_CONTROL_CLI_PATH` or `NATIVE_COPY_CONTROL_MODULE_PATH` selects a pre-fence
@@ -744,8 +746,9 @@ after a scratch-only reset, an unfenced value changed and then deleted between t
 import's read and its insert each match zero rows (the fence, no fenced key written);
 the stable value imports exactly `{format: 1, generation: 1, state}` with the unfenced
 TEXT archive byte-identical. These key resets/reseeds exist only in this disposable
-fixture, never in the product importer. The phase adds about 21 recovery `/query`
-requests (counted from the code, not yet measured) within the unchanged caps below.
+fixture, never in the product importer. A local controller/stub run including this
+phase measured 656 Cloudflare requests in total (574 `/query`), 21 more `/query`
+requests than without it, within the unchanged caps below.
 
 The control is paced, not CPU-bound. Timestamped local controller/stub runs measured
 328 Cloudflare requests in 104 s for `359f3e2` (252 positive, 76 old diagnostic) and

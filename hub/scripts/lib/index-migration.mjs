@@ -279,10 +279,11 @@ const COPY_CHECKPOINT_UPDATE_SQL = `UPDATE index_migration_state SET value = ?2
 
 // The one-time import inserts the envelope only while the unfenced key still holds
 // the exact TEXT bytes that were read and validated, and only if the fenced key is
-// absent. A concurrent unfenced rewrite between that read and this insert (including
-// a same-byte BLOB) matches no row and fails closed. This closes only that window: it
-// cannot detect unfenced history that was already stale when read, or a rewrite back
-// to the identical bytes before the insert (ABA).
+// absent. A concurrent unfenced rewrite or deletion between that read and this insert
+// matches no row and fails closed. The STRICT TEXT column already refuses BLOBs; the
+// typeof/BLOB comparison only makes the match exact bytes, never collated/normalized.
+// This closes only that window: it cannot detect unfenced history that was already
+// stale when read, or a rewrite back to the identical bytes before the insert (ABA).
 const COPY_CHECKPOINT_IMPORT_SQL = `INSERT INTO index_migration_state (name, value)
   SELECT ?1, ?2 FROM index_migration_state
   WHERE name = ?3 AND typeof(value) = 'text' AND CAST(value AS BLOB) = CAST(?4 AS BLOB)

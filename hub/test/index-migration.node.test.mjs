@@ -7060,7 +7060,8 @@ test('catalog copy rejects malformed stored UTF-8 before scalar builders or iden
 });
 
 // The unfenced copier's key and its exact checkpoint write, as still in flight from
-// runs that predate the generation fence (production attempt 3 lost this response).
+// runs that predate the generation fence (production attempt 3 ended with an unknown
+// checkpoint-write outcome; a rewind has been reproduced only in these fixtures).
 const LEGACY_COPY_KEY = 'full-fidelity-index-copy-v1';
 const UNFENCED_COPY_UPSERT = `INSERT INTO index_migration_state (name, value) VALUES (?, ?)
     ON CONFLICT (name) DO UPDATE SET value = excluded.value`;
@@ -7445,7 +7446,6 @@ test('the initialize import fails closed when the unfenced value changes between
   const cases = [
     ...['copying', 'verified', 'ack'].map((stale) => ({ stale, race: 'newer-valid' })),
     { stale: 'copying', race: 'deleted' },
-    { stale: 'ack', race: 'same-bytes-blob' },
     { stale: 'ack', race: 'concurrent-fenced-insert' },
   ];
   for (const { stale, race } of cases) {
@@ -7453,7 +7453,8 @@ test('the initialize import fails closed when the unfenced value changes between
       const expected = await uninterruptedCopy(child);
       const { f, rows, latest, stale: snapshots } = await unfencedDeadRun(child);
       const old = snapshots[stale];
-      // The dead run's late older write (art1392 rewind) is the value the import reads.
+      // A late older write from the dead run, as in the delayed-UPSERT regression above,
+      // is the value the import reads.
       lateUnfencedWrite(f.shards[0], old);
       const concurrentEnvelope = JSON.stringify({ format: 1, generation: 1, state: latest });
       let raced = 0;
@@ -7464,14 +7465,8 @@ test('the initialize import fails closed when the unfenced value changes between
         const db = f.shards[0].database;
         if (race === 'newer-valid') lateUnfencedWrite(f.shards[0], latest);
         else if (race === 'deleted') db.prepare('DELETE FROM index_migration_state WHERE name = ?').run(LEGACY_COPY_KEY);
-        else if (race === 'same-bytes-blob') {
-          db.prepare('UPDATE index_migration_state SET value = CAST(value AS BLOB) WHERE name = ?').run(LEGACY_COPY_KEY);
-        } else {
-          db.prepare('INSERT INTO index_migration_state (name, value) VALUES (?, ?)').run(COPY_CHECKPOINT, concurrentEnvelope);
-        }
+        else db.prepare('INSERT INTO index_migration_state (name, value) VALUES (?, ?)').run(COPY_CHECKPOINT, concurrentEnvelope);
       };
-      const legacyBefore = () => f.shards[0].rows(
-        'SELECT typeof(value) AS type, hex(CAST(value AS BLOB)) AS bytes FROM index_migration_state WHERE name = ?', [LEGACY_COPY_KEY]);
       await assert.rejects(importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), (error) =>
         error.code === CHECKPOINT_FENCE && error.d1Phase !== undefined && error.d1FailureKind === undefined);
       f.shards[0].beforeQuery = null;
@@ -7480,14 +7475,6 @@ test('the initialize import fails closed when the unfenced value changes between
       assert.deepEqual(importRequests.map(({ rows: returned }) => returned), [[]], 'one request, zero rows, never retried');
       assert.equal(storedValue(f.shards[0], COPY_CHECKPOINT), race === 'concurrent-fenced-insert' ? concurrentEnvelope : null,
         'the import never persists a superseded unfenced snapshot or overwrites a fenced key');
-      if (race === 'same-bytes-blob') {
-        assert.deepEqual(legacyBefore(), [{ type: 'blob', bytes: Buffer.from(JSON.stringify(old)).toString('hex').toUpperCase() }]);
-        // A BLOB unfenced value is corruption, not a value to import.
-        await assert.rejects(importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), (error) =>
-          error.code === 'checkpoint-payload');
-        assert.equal(storedValue(f.shards[0], COPY_CHECKPOINT), null);
-        return;
-      }
       f.restart();
       f.trace.length = 0;
       if (race === 'deleted') {
