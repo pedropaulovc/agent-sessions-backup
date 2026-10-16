@@ -579,6 +579,17 @@ it, so a late UPSERT to it changes nothing. It is never deleted. While it exists
 without the fenced key, `copy` fails closed before any write instead of starting a
 fresh copy; run `initialize` (the normal workflow does so before `state`).
 
+Historical regression controls predate the fence. Whenever `INDEX_COPY_MODULE_PATH`,
+`INDEX_CONTROL_CLI_PATH` or `NATIVE_COPY_CONTROL_MODULE_PATH` selects a pre-fence
+revision (every historical control in this runbook), also set
+`INDEX_COPY_CHECKPOINT_FORMAT=unfenced-v1` so the test observers read that
+implementation's flat `full-fidelity-index-copy-v1` checkpoint. The default,
+`fenced-v2`, reads only the strict envelope; the observer never chooses a layout from
+whichever key exists, and a mismatched selected copy module refuses to load. To show
+the fence is load-bearing, run the `unfenced checkpoint UPSERT` cases with the
+pre-fence `f44a39c` module and CLI selected this way: they must fail at the rewound
+copy, and pass with the variables unset.
+
 An absent copy `encoding` is accepted only by the explicit one-time legacy
 checkpoint upgrade, not by a general alternate-reader fallback. Before changing a
 legacy `copying`/`verified` pending proof, re-run the actual old bounded reader
