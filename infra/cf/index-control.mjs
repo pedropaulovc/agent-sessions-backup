@@ -6,7 +6,7 @@ import {
   PREVIEW_ACCOUNT_ID, PRODUCTION_ACCOUNT_ID, paginatedList, parseArgs,
 } from './preview-trust.mjs';
 import {
-  SEED_CHECKPOINT, READY_CHECKPOINT, ACTIVATION_CHECKPOINT,
+  SEED_CHECKPOINT, READY_CHECKPOINT, ACTIVATION_CHECKPOINT, COPY_INVARIANTS, COPY_PHASES,
   DRAIN_MILLISECONDS, assertMaintenanceHealth, assertReadyProof, assertActivationProof,
   buildReadyProof, buildActivationProof, SOURCE_FREEZE_TABLE, classifyIndexMigration,
   copyFrozenIndex, importLegacyCopyCheckpoint, initializeShardLayouts, readCheckpoint, readCopyCheckpoint,
@@ -18,6 +18,11 @@ import {
   d1SqlFailureMetadata, verifyD1BatchAtomicity,
 } from './d1-batch-atomicity.mjs';
 import { sharedCloudflareApiPermit } from '../../hub/scripts/lib/cloudflare-api-budget.mjs';
+import { MIGRATION_COPY_PHASES, createMigrationProgressReporter } from './migration-progress.mjs';
+import { createMigrationTelemetry } from '../azure/migration-telemetry.mjs';
+import {
+  PROVIDER_REASONS, classifyProviderReason, cloudflareRay, providerDate,
+} from './migration-auth-diagnostics.mjs';
 
 const MAIN_ID = '5ff65cf3-89c8-4fe6-a3c2-a370293ecea6';
 const FREEZE_CHECKPOINT = 'index-maintenance-freeze-v1';
@@ -48,15 +53,103 @@ export function createCopyPassRequestGate(budgetMs, { now = Date.now } = {}) {
   };
 }
 
-/** Only the explicit boundary exception is a resumable partial pass. */
-export async function runCopyPass({ source, shards, gate }) {
+/**
+ * Only the explicit boundary exception is a resumable partial pass. `progress` is
+ * optional telemetry (`createMigrationProgressReporter` options): one terminal
+ * event per pass, complete/partial/failed, with no error detail; never a result.
+ */
+export async function runCopyPass({ source, shards, gate, progress }) {
+  const reporter = progress ? createMigrationProgressReporter(progress) : null;
+  let status = 'failed';
   try {
-    const copied = await copyFrozenIndex({ source, shards, gate });
+    const copied = await copyFrozenIndex({ source, shards, gate, progress: reporter && {
+      observe: reporter.observe, isPassBoundary: (error) => error instanceof CopyPassBudgetExhausted,
+    } });
+    status = 'complete';
     return { copiedRows: copied.rows, state: copied.state, sha256: copied.sha256 };
   } catch (error) {
     if (!(error instanceof CopyPassBudgetExhausted)) throw error;
+    status = 'partial';
     return { status: 'partial', reason: 'pass-budget-exhausted' };
+  } finally {
+    reporter?.finish(status);
   }
+}
+
+const TELEMETRY_WARNING_COUNTS = ['httpStatus', 'sentEvents', 'failedEvents', 'coalescedEvents', 'droppedEvents', 'abandonedEvents'];
+
+// Only allowlisted aggregate fields reach CI logs: a code and safe integer counts.
+function printTelemetryWarning(warning) {
+  const code = typeof warning?.code === 'string' && /^[a-z0-9-]{1,64}$/.test(warning.code) ? warning.code : 'unknown';
+  const counts = TELEMETRY_WARNING_COUNTS.filter((key) => Number.isSafeInteger(warning?.[key]) && warning[key] >= 0)
+    .map((key) => [key, warning[key]]);
+  console.log(JSON.stringify({ event: 'migration.telemetry.warning', code, ...Object.fromEntries(counts) }));
+}
+
+/** Correlated stdout + Azure progress/failure sink for one protected copy pass; never throws. */
+async function copyProgressSink(revision) {
+  const identifier = (value) => (decimalIdentifier(value) ? value : null);
+  const correlation = {
+    revision: typeof revision === 'string' && /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(revision) ? revision : null,
+    runId: identifier(process.env.GITHUB_RUN_ID), attempt: identifier(process.env.GITHUB_RUN_ATTEMPT),
+  };
+  const warn = (warning) => { try { printTelemetryWarning(warning); } catch { /* Logging only. */ } };
+  let telemetry = null;
+  try { telemetry = await createMigrationTelemetry({ env: process.env, warn }); }
+  catch { warn({ code: 'telemetry-unavailable' }); }
+  return {
+    emit(event) {
+      const record = { ...event, ...correlation };
+      try { console.log(JSON.stringify(record)); } catch { /* Logging only. */ }
+      try { telemetry?.emit(record); } catch { /* Telemetry never reaches the copy. */ }
+    },
+    async close() {
+      try { await telemetry?.close(); } catch { /* Never masks the copy outcome. */ }
+    },
+  };
+}
+
+const COPY_OPERATION_PHASES = new Set(Object.values(COPY_PHASES));
+const COPY_INVARIANT_CODES = new Set(Object.values(COPY_INVARIANTS));
+const COPY_FAILURE_KINDS = new Map([['http', 'http'], ['transport', 'network'], ['statement', 'provider'], ['shape', 'provider']]);
+
+/**
+ * Terminal copy failure as closed-vocabulary context. `phase` is the copy state
+ * last observed by the progress reporter; `operationPhase` is the failed request's
+ * existing `d1Phase` annotation. Only typed metadata of this client's own redacted
+ * D1 failure (`d1Diagnostic`) is trusted, never a message, stack, cause or
+ * provider text; a 401/10000 never implies credential expiry.
+ */
+export function migrationCopyFailureEvent(error, { recordedAt = Date.now(), copyPhase } = {}) {
+  const typed = error?.d1Diagnostic === true ? error : null;
+  const count = (value) => (Number.isSafeInteger(value) && value >= 0 ? value : null);
+  const status = typed?.providerStatus;
+  const date = typed?.providerDate;
+  const lastSuccess = typed?.lastSuccessfulRequestAtMs;
+  return {
+    event: 'migration.copy.failure', schemaVersion: 1, recordedAt: new Date(recordedAt).toISOString(),
+    phase: MIGRATION_COPY_PHASES.includes(copyPhase) ? copyPhase : 'unknown',
+    operationPhase: COPY_OPERATION_PHASES.has(error?.d1Phase) ? error.d1Phase : 'unknown',
+    failureKind: COPY_INVARIANT_CODES.has(error?.code) ? 'invariant'
+      : COPY_FAILURE_KINDS.get(typed?.d1FailureKind) ?? 'unknown',
+    httpStatus: Number.isInteger(status) && status >= 100 && status <= 599 ? status : null,
+    providerCodes: Array.isArray(typed?.providerCodes)
+      ? typed.providerCodes.filter((code) => Number.isSafeInteger(code) && code >= 0).slice(0, 16) : [],
+    providerReason: PROVIDER_REASONS.includes(typed?.providerReason) ? typed.providerReason : 'unknown',
+    cfRay: typeof typed?.providerRay === 'string' && /^[0-9a-f]{16}(?:-[A-Z]{3})?$/.test(typed.providerRay)
+      ? typed.providerRay : null,
+    providerDate: typeof date === 'string' && Number.isFinite(Date.parse(date))
+      && new Date(date).toISOString() === date ? date : null,
+    requestDurationMs: count(typed?.requestDurationMs),
+    requestAttempt: Number.isSafeInteger(typed?.requestAttempt) && typed.requestAttempt > 0 ? typed.requestAttempt : null,
+    lastSuccessfulRequestAt: Number.isSafeInteger(lastSuccess) && lastSuccess > 0
+      ? new Date(lastSuccess).toISOString() : null,
+    statementCount: count(typed?.statementCount),
+    parameterCount: count(typed?.parameterCount),
+    bodyBytes: count(typed?.bodyBytes),
+    parameterJsonBytes: count(typed?.parameterJsonBytes),
+    databaseId: publicDatabaseId(typed?.databaseId) === 'unknown' ? null : typed.databaseId,
+  };
 }
 
 export function requireProtectedProduction(env = process.env) {
@@ -84,20 +177,29 @@ export function cloudflareRetryDelay(response) {
   return seconds * 1000;
 }
 
-export function indexControlClient(accountId, token, { permit = sharedCloudflareApiPermit, wait = sleep, requestGate } = {}) {
+export function indexControlClient(accountId, token, {
+  permit = sharedCloudflareApiPermit, wait = sleep, requestGate, now = Date.now,
+} = {}) {
   if (accountId === PRODUCTION_ACCOUNT_ID) requireProtectedProduction();
   else if (accountId !== PREVIEW_ACCOUNT_ID) throw new Error('index control account must be production or preview');
   if (!token) throw new Error('CLOUDFLARE_API_TOKEN is required');
+  // Envelope/error -> { response, attempt, durationMs } of the exchange that produced it.
   const responses = new WeakMap();
+  // Epoch ms of the last D1 request whose every statement succeeded; ISO only on failure.
+  let lastSuccessAt = null;
   const cf = async (pathname, init = {}) => {
     const { responseFormat = 'result', ...request } = init;
     if (responseFormat !== 'result' && responseFormat !== 'envelope') {
       throw new Error('Cloudflare response format must be result or envelope');
     }
+    let attempt = 0;
     for (;;) {
       if (requestGate) requestGate();
       await permit();
       if (requestGate) requestGate();
+      attempt += 1;
+      const startedAt = now();
+      const exchange = (response) => ({ response, attempt, durationMs: now() - startedAt });
       let response;
       try {
         response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${accountId}/${pathname}`, {
@@ -108,6 +210,7 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
       } catch (error) {
         error.d1FailureKind = 'transport';
         error.providerStatus = undefined; // No actual Response was received.
+        if (error && typeof error === 'object') responses.set(error, exchange(undefined));
         throw error;
       }
       try {
@@ -134,6 +237,7 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
           const error = new Error(`Cloudflare returned non-JSON HTTP ${response.status}`);
           error.providerStatus = response.status;
           error.d1FailureKind = response.ok ? 'shape' : 'http';
+          error.providerReason = classifyProviderReason(response.status, []);
           throw error;
         }
         if (!response.ok || envelope?.success !== true) {
@@ -143,6 +247,8 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
           const error = new Error(`Cloudflare ${isD1 ? 'D1 query' : pathname.split('?')[0]} failed: HTTP ${response.status}, codes=${codes.join(',')}`);
           error.providerStatus = response.status;
           error.providerCodes = codes;
+          // Exact known phrases map to a closed reason in memory; the text is discarded.
+          error.providerReason = classifyProviderReason(response.status, envelope?.errors);
           error.d1FailureKind = !response.ok ? 'http' : envelope?.success === false ? 'statement' : 'shape';
           if (isD1) {
             const diagnostic = d1SqlFailureMetadata(envelope?.errors);
@@ -151,10 +257,10 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
           }
           throw error;
         }
-        if (responseFormat === 'envelope') responses.set(envelope, response);
+        if (responseFormat === 'envelope') responses.set(envelope, exchange(response));
         return responseFormat === 'envelope' ? envelope : envelope.result;
       } catch (error) {
-        if (error && typeof error === 'object') responses.set(error, response);
+        if (error && typeof error === 'object') responses.set(error, exchange(response));
         throw error;
       }
     }
@@ -164,13 +270,13 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
     db(id) {
       const execute = async (body, kind) => {
         let encodedBody;
-        let response;
+        let exchange;
         let failureKind = 'transport';
         try {
           const envelope = await cf(`d1/database/${encodeURIComponent(id)}/query`, {
             method: 'POST', body: encodedBody = JSON.stringify(body), responseFormat: 'envelope',
           });
-          response = responses.get(envelope);
+          exchange = responses.get(envelope);
           const results = envelope.result;
           if (!Array.isArray(results) || results.some((result) => result?.success !== true)) {
             failureKind = Array.isArray(results) && results.some((result) => result?.success === false)
@@ -183,15 +289,16 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
             error.d1SqlReason = diagnostic.reason;
             if (diagnostic.nativeSignature) error.d1NativeSignature = diagnostic.nativeSignature;
             error.providerCodes = providerCodes([...failures, ...(Array.isArray(envelope.errors) ? envelope.errors : [])]);
-            error.providerStatus = response?.status;
+            error.providerStatus = exchange?.response?.status;
             throw error;
           }
           if (kind === 'query' && (results.length !== 1 || !Array.isArray(results[0]?.results))) {
             failureKind = 'shape';
             const error = new Error('D1 query returned an unexpected result shape');
-            error.providerStatus = response?.status;
+            error.providerStatus = exchange?.response?.status;
             throw error;
           }
+          lastSuccessAt = now();
           return results;
         } catch (error) {
           if (error instanceof CopyPassBudgetExhausted) throw error;
@@ -202,20 +309,10 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
           const status = Number.isInteger(error?.providerStatus) && error.providerStatus >= 100 && error.providerStatus <= 599
             ? error.providerStatus : undefined;
           // Read correlation only on failure, and never let broken headers mask it.
-          let rayState = 'absent';
-          let ray;
-          try {
-            const header = (response ?? responses.get(error))?.headers?.get('cf-ray');
-            if (header !== null && header !== undefined) {
-              rayState = 'invalid';
-              // Canonical Ray IDs contain exactly 16 or 20 ASCII characters.
-              if (typeof header === 'string' && /^[0-9a-f]{16}(?:-[A-Z]{3})?$/.test(header)
-                && (header.length === 16 || header.length === 20)) {
-                ray = header;
-                rayState = 'valid';
-              }
-            }
-          } catch { rayState = 'invalid'; }
+          const failed = exchange ?? responses.get(error);
+          const rayHeader = cloudflareRay(failed?.response);
+          const rayState = rayHeader.state;
+          const ray = rayHeader.ray;
           // Count already-encoded request bytes only on failure. Parameter JSON byte
           // counts include array framing/escaping and never disclose the values.
           const statements = kind === 'batch' && Array.isArray(body.batch) ? body.batch : [body];
@@ -223,13 +320,14 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
             count + (Array.isArray(statement?.params) ? statement.params.length : 0), 0);
           const parameterJsonBytes = typeof encodedBody === 'string' ? statements.reduce((bytes, statement) =>
             bytes + Buffer.byteLength(JSON.stringify(statement?.params ?? []), 'utf8'), 0) : 0;
+          const bodyBytes = typeof encodedBody === 'string' ? Buffer.byteLength(encodedBody, 'utf8') : 0;
           const safe = new Error(`D1 database=${publicDatabaseId(id)} kind=${kind}`
             + ` HTTP=${status ?? 'unknown'}`
             + ` codes=${codes.join(',')}`
             + ` failure=${failure}`
             + ` ray=${rayState === 'valid' ? ray : rayState}`
             + ` native=${reason} statements=${statements.length} parameters=${parameters}`
-            + ` bodyBytes=${typeof encodedBody === 'string' ? Buffer.byteLength(encodedBody, 'utf8') : 0}`
+            + ` bodyBytes=${bodyBytes}`
             + ` parameterJsonBytes=${parameterJsonBytes}`);
           safe.d1SqlReason = reason;
           safe.d1FailureKind = failure;
@@ -237,6 +335,19 @@ export function indexControlClient(accountId, token, { permit = sharedCloudflare
           safe.providerStatus = status;
           safe.providerCodes = codes.slice(0, 16);
           if (rayState === 'valid') safe.providerRay = ray;
+          // Closed-vocabulary request context for structured failure telemetry only.
+          safe.providerReason = PROVIDER_REASONS.includes(error?.providerReason)
+            ? error.providerReason : classifyProviderReason(status, []);
+          safe.providerDate = providerDate(failed?.response);
+          safe.requestAttempt = Number.isSafeInteger(failed?.attempt) && failed.attempt > 0 ? failed.attempt : null;
+          safe.requestDurationMs = Number.isSafeInteger(failed?.durationMs) && failed.durationMs >= 0
+            ? failed.durationMs : null;
+          safe.lastSuccessfulRequestAtMs = lastSuccessAt;
+          safe.statementCount = statements.length;
+          safe.parameterCount = parameters;
+          safe.bodyBytes = typeof encodedBody === 'string' ? bodyBytes : null;
+          safe.parameterJsonBytes = typeof encodedBody === 'string' ? parameterJsonBytes : null;
+          safe.databaseId = publicDatabaseId(id) === 'unknown' ? null : id;
           if (D1_NATIVE_FAILURE_SIGNATURES.includes(error?.d1NativeSignature)) {
             safe.d1NativeSignature = error.d1NativeSignature;
           }
@@ -587,6 +698,57 @@ async function main() {
     return;
   }
   const gate = async () => await health(config, 'maintenance', { command });
+  // The durable drain gate that copy, seed-catalog and ready require; drain writes it.
+  const assertDrained = async () => {
+    const frozen = await readCheckpoint(shards[0], FREEZE_CHECKPOINT);
+    if (frozen?.revision !== config.vars.DEPLOYMENT_REVISION || frozen.cycle !== cycle
+      || !Number.isSafeInteger(frozen.observedAt) || frozen.observedAt <= 0 || frozen.observedAt > Date.now()
+      || frozen.source !== source.id || JSON.stringify(frozen.shards) !== JSON.stringify(shards.map((db) => db.id))
+      || Date.now() - frozen.observedAt < DRAIN_MILLISECONDS) {
+      throw new Error('queue and scheduled work has not passed the durable maintenance drain gate');
+    }
+  };
+  if (command === 'copy') {
+    // The telemetry sink is prepared once, outside the copy budget, and closes even
+    // on failure. Its final warnings precede the unchanged result line, which stays
+    // the last stdout line; a failed pass prints no result, keeps its own error and
+    // additionally emits one structured `migration.copy.failure` telemetry event.
+    // The unbudgeted prerequisites run inside that report in their existing order.
+    const sink = await copyProgressSink(config.vars.DEPLOYMENT_REVISION);
+    let result;
+    // The copy state of the last progress event (including the terminal `failed` one).
+    let copyPhase;
+    try {
+      await gate();
+      await assertDrained();
+      const atomicity = await readCheckpoint(shards[0], ATOMICITY_CHECKPOINT);
+      if (atomicity?.state !== 'verified' || atomicity.databaseId !== shards[0].id
+        || atomicity.textTransport !== 'verified' || atomicity.textBytes !== Buffer.byteLength(D1_BATCH_PROBE_TEXT, 'utf8')
+        || atomicity.revision !== config.vars.DEPLOYMENT_REVISION || atomicity.cycle !== cycle
+        || !Number.isSafeInteger(atomicity.verifiedAt) || atomicity.verifiedAt <= 0 || atomicity.verifiedAt > Date.now()) {
+        throw new Error('this deployment has no verified native D1 REST batch atomicity/text transport control; source copy forbidden');
+      }
+      // Setup/drain/atomicity prerequisites stay unbudgeted. Copy data requests and
+      // fresh health gates share this process's non-persisted pass boundary.
+      const requestGate = args['pass-budget-ms'] === undefined ? undefined
+        : createCopyPassRequestGate(Number(args['pass-budget-ms']));
+      const copyApi = requestGate ? indexControlClient(account, process.env.CLOUDFLARE_API_TOKEN, { requestGate }) : api;
+      result = await runCopyPass({
+        source: copyApi.db(config.d1_databases[0].database_id),
+        shards: config.d1_databases.slice(1).map((db) => copyApi.db(db.database_id)),
+        gate: async () => await health(config, 'maintenance', { command, requestGate }),
+        progress: { emit: (event) => { copyPhase = event?.phase; sink.emit(event); } },
+      });
+    } catch (error) {
+      try { sink.emit(migrationCopyFailureEvent(error, { copyPhase })); } catch { /* Telemetry never masks the copy error. */ }
+      throw error;
+    } finally {
+      await sink.close();
+    }
+    console.log(JSON.stringify(result));
+    if (result.status === 'partial') process.exitCode = 78;
+    return;
+  }
   await gate();
   if (command === 'drain') {
     let frozen = await readCheckpoint(shards[0], FREEZE_CHECKPOINT);
@@ -606,34 +768,8 @@ async function main() {
     console.log(JSON.stringify({ drainedRevision: frozen.revision, milliseconds: DRAIN_MILLISECONDS }));
     return;
   }
-  const frozen = await readCheckpoint(shards[0], FREEZE_CHECKPOINT);
-  if (frozen?.revision !== config.vars.DEPLOYMENT_REVISION || frozen.cycle !== cycle
-    || !Number.isSafeInteger(frozen.observedAt) || frozen.observedAt <= 0 || frozen.observedAt > Date.now()
-    || frozen.source !== source.id || JSON.stringify(frozen.shards) !== JSON.stringify(shards.map((db) => db.id))
-    || Date.now() - frozen.observedAt < DRAIN_MILLISECONDS) {
-    throw new Error('queue and scheduled work has not passed the durable maintenance drain gate');
-  }
-  if (command === 'copy') {
-    const atomicity = await readCheckpoint(shards[0], ATOMICITY_CHECKPOINT);
-    if (atomicity?.state !== 'verified' || atomicity.databaseId !== shards[0].id
-      || atomicity.textTransport !== 'verified' || atomicity.textBytes !== Buffer.byteLength(D1_BATCH_PROBE_TEXT, 'utf8')
-      || atomicity.revision !== config.vars.DEPLOYMENT_REVISION || atomicity.cycle !== cycle
-      || !Number.isSafeInteger(atomicity.verifiedAt) || atomicity.verifiedAt <= 0 || atomicity.verifiedAt > Date.now()) {
-      throw new Error('this deployment has no verified native D1 REST batch atomicity/text transport control; source copy forbidden');
-    }
-    // Setup/drain/atomicity prerequisites stay unbudgeted. Copy data requests and
-    // fresh health gates share this process's non-persisted pass boundary.
-    const requestGate = args['pass-budget-ms'] === undefined ? undefined
-      : createCopyPassRequestGate(Number(args['pass-budget-ms']));
-    const copyApi = requestGate ? indexControlClient(account, process.env.CLOUDFLARE_API_TOKEN, { requestGate }) : api;
-    const result = await runCopyPass({
-      source: copyApi.db(config.d1_databases[0].database_id),
-      shards: config.d1_databases.slice(1).map((db) => copyApi.db(db.database_id)),
-      gate: async () => await health(config, 'maintenance', { command, requestGate }),
-    });
-    console.log(JSON.stringify(result));
-    if (result.status === 'partial') process.exitCode = 78;
-  } else if (command === 'seed-catalog') {
+  await assertDrained();
+  if (command === 'seed-catalog') {
     const seeded = await seedFrozenCatalog({ source, shards, gate });
     console.log(JSON.stringify({ catalogRows: seeded.rows, state: seeded.state }));
   } else if (command === 'ready') {

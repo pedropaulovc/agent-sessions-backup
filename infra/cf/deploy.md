@@ -1069,7 +1069,7 @@ Catalog seeding has durable checkpoints, and a completed copy can be revalidated
 even after legacy blocks are retired. A hard timeout is not the explicit partial
 result below: inspect the failed operation and durable state before continuing.
 
-A budget stop emits exactly `{"status":"partial","reason":"pass-budget-exhausted"}`
+A budget stop prints the result line exactly `{"status":"partial","reason":"pass-budget-exhausted"}`
 and exits **78**, leaving the job failed and production in maintenance with consumers
 detached. It does not mark the copy complete or acknowledge additional rows. Subsequent
 main migrations, catalog seeding, activation, and consumer restoration do not run.
@@ -1079,7 +1079,8 @@ and other errors are not relabeled as budget stops.
 
 For that explicit partial result, rerun the **same protected main-push job at the same
 commit** using GitHub Actions' rerun control (or `gh run rerun <run-id> --failed`).
-There is no `workflow_dispatch`, automatic restart, or `continue-on-error`. Each rerun
+There is no `workflow_dispatch`, automatic restart, or `continue-on-error` on the
+copy step (only the read-only diagnostic steps below are best-effort). Each rerun
 gets a fresh five-hour budget, revalidates the deployed revision, and repeats the
 queue/cron drain with the new run attempt before source writes. Durable pending copy
 state recovers both committed partial shard writes and a committed source
@@ -1095,6 +1096,125 @@ Cloudflare documents
 [unlimited HTTP duration while a client remains connected](https://developers.cloudflare.com/workers/platform/limits/#duration).
 Do not treat the queue/cron drain as proof that old HTTP writes have ended. The SQL
 barrier, exact full-column compare/delete, and transaction rollback are that proof.
+
+### Copy progress telemetry
+
+`copy` prints telemetry as JSON lines on stdout before its unchanged final result
+line (failed passes print no final result line; stderr keeps the redacted error).
+Each `migration.copy.progress` event (`schemaVersion: 1`, from
+`infra/cf/migration-progress.mjs`) is flat and aggregate-only: `status`
+(`running`, then exactly one terminal `complete`/`partial`/`failed` with no error
+text), `phase` (`initializing`, `recovering`, `planning`, `copying`, `verifying`,
+`retiring`, `finalizing`, `complete`; anything else is `unknown`), `recordedAt`,
+`elapsedMs`, `acknowledgedRows`, `passRows`, `pendingRows`, `rowsPerSecond`,
+`remainingRows`, `etaSeconds` and `lastProgressAt`, plus the CLI's `revision`,
+`runId` and `attempt` (null unless well-formed). No database or session ID, cursor,
+digest, SQL or text is ever included. The same records go to the Azure sink from
+`infra/azure/migration-telemetry.mjs` (see `telemetry.md`); sink problems print one
+`migration.telemetry.warning` line with an allowlisted code and aggregate counts,
+and never change the copy outcome.
+
+Counters come only from durable state: the validated stored copy checkpoint at
+start, then each fenced checkpoint write whose single-row witness returned. An
+attempted, rejected, or response-lost write is never reported, so a resumed pass
+starts from the stored count (`passRows: 0`) and `null` means not yet known, never
+zero. `lastProgressAt` is the time this process observed a durable ACK increase; the
+initially stored count, heartbeats and phase changes never set it.
+`rowsPerSecond` is the unrounded ACK delta over at most the last ten minutes (a
+shorter span only at startup or when the bounded sample history no longer reaches
+that far), falls to 0 once no ACK lands within the window, and stays null until
+this pass acknowledges a page. `etaSeconds` is the remaining count divided by that
+same published rate, rounded up.
+
+`remainingRows` comes from one bounded `COUNT(*)` of source rows past the durable
+cursor, issued once per pass and only once the source is provably frozen: the
+stored checkpoint already acknowledges rows. That ACK is a separate fenced
+destination write, made only after the source retirement transaction that
+installs the freeze barrier has committed. Before that, maintenance
+does not stop a late in-flight source write, so a fresh copy reports `null`
+until its first ACK. The stored state must also be unambiguous: no pending page,
+or a page still `copying` (source retirement requires the persisted `verified`
+transition first). A `verified` or `recovering` page may already be deleted
+without its ACK, so the count waits until that page is acknowledged.
+The read uses the copy's request budget; a budget stop there is still the partial
+result, while any other failure leaves `remainingRows` and `etaSeconds` null for
+the pass. `etaSeconds` exists only with both a known remainder and a positive rate.
+
+Events are emitted at start, when counters first become known, on coarse stage
+changes (setup, legacy recovery, the page loop, finalizing), every 30 seconds by
+heartbeat, and once at the end. Per-page steps (`planning` → `copying` →
+`verifying` → `retiring`) appear only in the next heartbeat's `phase`, bounding log
+volume. Heartbeats read nothing from D1 and never block a checkpoint; the timer is
+cleared at the terminal progress event, after which the reporter emits no progress.
+
+### Failure context and read-only token diagnostics
+
+A terminal copy error additionally emits one `migration.copy.failure` record to
+stdout and the existing Azure sink without changing the original error, failure
+status, source/checkpoint state or retry rules. It carries the last observed coarse
+copy `phase` from progress (or `unknown`) separately from the allowlisted
+`operationPhase` (for example `copy-checkpoint-write`, or `unknown`), failure category, actual
+HTTP status, bounded numeric provider codes and closed-category reason, validated
+Cloudflare ray/provider timestamp, request duration/attempt, last successful
+request timestamp, statement/parameter/body-size aggregates, and a validated D1
+database UUID. Unknown numeric/time/ID fields are null. It contains no SQL,
+parameter values, rows/sessions, raw provider body/message, request URL,
+credentials, token ID/value/fingerprint or exception message. In particular a
+401/code 10000 is not automatically classified as an expired token.
+
+Immediately before a required copy, the protected production main-push workflow
+runs `migration-auth-diagnostics.mjs --stage preflight`; after the **copy step
+itself fails**, it runs `--stage copy_failure`. An unrelated earlier failure or
+skipped copy does not trigger the post-copy probe. `copy_failure` describes the
+failed GitHub Actions step, not an authentication-failure diagnosis: it also runs
+for an expected copy-process budget exit 78 because GitHub marks that step failed.
+Both steps are best-effort, with one-minute hard caps; they cannot mask a failed
+copy, relabel a provider error as partial, change original exit 78/partial-copy
+semantics or allow later migrations/activation to run after a failure. The existing
+five-hour copy-process budget and fail-closed cleanup stay unchanged.
+
+Each diagnostic makes one GET to the fixed Cloudflare **user-token**
+`/client/v4/user/tokens/verify` endpoint using the existing migration secret,
+under the protected main-push guard only. The request/body deadline is at most
+one second; redirects and retries are forbidden. Only this one-shot CLI requests
+eager Azure authentication before emitting its record: one GitHub OIDC hop and
+one Entra hop, each bounded by the existing one-second request/body deadline
+(or one at-most-one-second injected token acquisition in local tests). A failed
+eager acquisition is sanitized and counted as failed delivery for emitted records,
+with no identity retry or ingest request. Normal copying remains lazy. The
+unchanged Azure close has its own one-second total deadline. There is no
+endpoint/account-token fallback or new secret/scope. Do not run real
+production-token diagnostics from a workstation, PR or preview; local tests
+inject synthetic fetches only. The CLI guard does not replace
+production-environment security.
+
+The safe `migration.auth.diagnostic` record reports its stage, own `recordedAt`,
+`verification` (`active`, `inactive`, `unavailable`, `not_configured`), endpoint
+`tokenStatus` (`active`, `disabled`, `expired`, or null), optional normalized
+`notBefore` / `expiresOn`, and bounded HTTP/code/reason/ray/date/duration evidence.
+**Active validity is not D1 permission or account-access proof, nor a guarantee
+that a long pass remains healthy.** Unsupported verification, missing/malformed
+results and diagnostic transport failures are unknown, not evidence of expiry or
+missing permission. A preflight success cannot authorize replay after a later
+ambiguous D1 failure.
+
+Use the exact revision/run/attempt read-only monitor described in
+[`telemetry.md`](telemetry.md#read-only-live-monitor-successor) to inspect copy
+progress, copy failure and preflight/post-failure auth **separately**. Auth/failure
+observations have their own age and ingestion lag and never replace durable ACK
+progress or refresh its ETA. The bounded sink preserves one pending record per
+kind/stage and prioritizes critical records in a batch, but close/transport loss
+can still prevent Azure delivery; retain stdout evidence. On close deadline the
+separate `abandonedEvents` count includes the in-flight batch and every pending
+record exactly once, not a claimed failed delivery whose in-flight outcome is
+unknown. Deadline/summary warnings include that count; late settlements or repeated
+closes cannot change the terminal counters or emit more warnings. The final
+monitor query does not wait for ingestion or prove the absence of a missing final
+record.
+Keep maintenance and consumers paused, inspect the original failed operation and
+durable recovery state, and obtain approval for a protected continuation. No
+credential rotation/repair, policy change, automatic resume or new attempt follows
+from telemetry alone.
 
 ## Standing preview deployment
 

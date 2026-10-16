@@ -1368,9 +1368,13 @@ async function acknowledgePending(state, checkpoint) {
   await checkpoint(state);
 }
 
-async function finishPending(source, shards, state, gate, checkpoint, layout, tokenizer) {
-  if (state.pending.phase === 'recovering') await repairLegacyPending(source, shards, state, checkpoint, layout, tokenizer);
+async function finishPending(source, shards, state, gate, checkpoint, layout, tokenizer, progress) {
+  if (state.pending.phase === 'recovering') {
+    progress?.phase('recovering');
+    await repairLegacyPending(source, shards, state, checkpoint, layout, tokenizer);
+  }
   if (state.pending.phase === 'copying') {
+    progress?.phase('copying');
     const rows = await readBlockRows(source, state.columns, state.pending.rows.map((row) => row.id), layout);
     const found = new Map(rows.map((row) => [row.id, row]));
     for (let index = 0; index < state.pending.rows.length; index += 1) {
@@ -1386,7 +1390,9 @@ async function finishPending(source, shards, state, gate, checkpoint, layout, to
       if (routed[shard].length) await replaceShardPage(shards[shard], state.columns, routed[shard], layout);
     }
   }
+  progress?.phase('verifying');
   const { verified, remainingRows } = await verifyPending(source, shards, state, layout, tokenizer);
+  progress?.phase('retiring');
   await gate();
   state.pending.phase = 'verified';
   await checkpoint(state);
@@ -1441,8 +1447,68 @@ async function finishPending(source, shards, state, gate, checkpoint, layout, to
   await acknowledgePending(state, checkpoint);
 }
 
-/** Frozen, bounded, resumable full-column copy. No source writes occur before verified readback. */
-export async function copyFrozenIndex({ source, shards, gate, checkpointHook }) {
+// Telemetry-only copy progress. Counters come only from a stored checkpoint that
+// passed validation or from a fenced write's witness, never from attempted state.
+// The observer is synchronous and its failures are swallowed: it cannot change any
+// request, checkpoint, proof or rejection of the copy itself.
+function copyProgressObserver({ observe, isPassBoundary = () => false }) {
+  let phase = 'initializing';
+  let durable = null;
+  let baseline = null;
+  let baselineAttempted = false;
+  const report = () => {
+    let remainingRows = null;
+    if (durable?.complete) remainingRows = 0;
+    else if (durable && baseline) {
+      const remaining = baseline.remainingRows - (durable.acknowledgedRows - baseline.acknowledgedRows);
+      // The unacknowledged page is still counted; anything less is not a known value.
+      if (remaining >= durable.pendingRows) remainingRows = remaining;
+    }
+    try {
+      observe({ phase, acknowledgedRows: durable?.acknowledgedRows ?? null,
+        pendingRows: durable?.pendingRows ?? null, remainingRows });
+    } catch { /* Telemetry never reaches the copy. */ }
+  };
+  return {
+    phase(next) { phase = next; report(); },
+    witness(state) {
+      durable = { acknowledgedRows: state.rows, pendingRows: state.pending?.rows.length ?? 0,
+        complete: state.state === 'complete' };
+      report();
+    },
+    // At most one bounded read per pass, and only once the source is provably
+    // frozen and its rows past the cursor are exactly the unacknowledged ones. A
+    // durable ACK (rows > 0) exists only after the first transactional freeze
+    // barrier; before it, maintenance does not stop late in-flight source writes,
+    // so a count could under- or over-state the remainder. The stored state must
+    // also have no pending page, or a current-encoding page still 'copying'
+    // (source retirement happens only after the persisted 'verified' transition):
+    // a verified/recovering page may already be deleted without its ACK.
+    // The read uses the copy's own request gate; only its pass boundary propagates.
+    async baseline(source, state) {
+      if (baselineAttempted || state.state !== 'pending' || state.encoding !== COPY_ENCODING || state.rows === 0
+        || state.pending && (state.pending.phase !== 'copying' || state.pending.recovery)) return;
+      baselineAttempted = true;
+      try {
+        const [row] = await source.query('SELECT COUNT(*) AS remaining_rows FROM blocks WHERE id > ?', [state.after]);
+        if (isCounter(row?.remaining_rows)) {
+          baseline = { remainingRows: row.remaining_rows, acknowledgedRows: state.rows };
+          report();
+        }
+      } catch (error) {
+        if (isPassBoundary(error)) throw error;
+      }
+    },
+  };
+}
+
+/**
+ * Frozen, bounded, resumable full-column copy. No source writes occur before verified readback.
+ * `progress` is optional telemetry, `{ observe(snapshot), isPassBoundary?(error) }`.
+ */
+export async function copyFrozenIndex({ source, shards, gate, checkpointHook, progress }) {
+  const observer = progress ? copyProgressObserver(progress) : null;
+  observer?.phase('initializing');
   source = phaseDb(source, COPY_PHASES.SOURCE_PAGE_READ);
   shards = shards.map((db) => phaseDb(db, COPY_PHASES.SETUP));
   await gate();
@@ -1455,10 +1521,15 @@ export async function copyFrozenIndex({ source, shards, gate, checkpointHook }) 
   const checkpoint = async (state) => {
     validateCopyState(state, shards.length);
     generation = await writeCopyCheckpoint(checkpointDb, state, generation);
+    observer?.witness(state);
     await checkpointHook?.(structuredClone(state));
   };
   let state = stored?.state ?? null;
-  if (state) { assertIdentity(state, identity); validateCopyState(state, shards.length); }
+  if (state) {
+    assertIdentity(state, identity);
+    validateCopyState(state, shards.length);
+    observer?.witness(state);
+  }
   // The unfenced key is never read as progress. While it exists without its explicit
   // initialize import, a fresh copy would rewind acknowledged source retirement.
   else if ((await phaseDb(shards[0], COPY_PHASES.CHECKPOINT_READ).query(
@@ -1467,11 +1538,13 @@ export async function copyFrozenIndex({ source, shards, gate, checkpointHook }) 
       'unfenced copy checkpoint has not been imported by index control initialize', COPY_PHASES.CHECKPOINT_READ);
   }
   if (state?.state === 'complete') {
+    observer?.phase('finalizing');
     const tables = await source.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'blocks'");
     if (tables.length && (await source.query('SELECT id FROM blocks LIMIT 1')).length) {
       throw copyInvariant(COPY_INVARIANTS.SOURCE_REAPPEARED, 'source blocks reappeared after completed cutover', COPY_PHASES.SOURCE_PAGE_READ);
     }
     if (tables.length) await freezeEmptySource(source);
+    observer?.phase('complete');
     return state;
   }
   const columns = await columnsFor(phaseDb(source, COPY_PHASES.SETUP), 'blocks');
@@ -1504,19 +1577,24 @@ export async function copyFrozenIndex({ source, shards, gate, checkpointHook }) 
   }
   const tokenizer = createFtsTokenizer();
   try {
+    if (state.encoding !== COPY_ENCODING) observer?.phase('recovering');
     await migrateLegacyCopy(source, shards, state, checkpoint, layout, tokenizer);
     for (;;) {
       await gate();
-      if (state.pending) await finishPending(source, shards, state, gate, checkpoint, layout, tokenizer);
+      await observer?.baseline(source, state);
+      if (state.pending) await finishPending(source, shards, state, gate, checkpoint, layout, tokenizer, observer);
+      observer?.phase('planning');
       // The first bounded, verified page makes room for the atomic source-write barrier.
       const candidates = await blockCandidates(source, layout, { after: state.after });
       if (!candidates.length) {
         if ((await source.query('SELECT id FROM blocks LIMIT 1')).length) {
           throw copyInvariant(COPY_INVARIANTS.SOURCE_BEHIND_CURSOR, 'source contains rows behind the checkpoint; freeze invariant violated', COPY_PHASES.SOURCE_PAGE_READ);
         }
+        observer?.phase('finalizing');
         await freezeEmptySource(source);
         state.state = 'complete';
         await checkpoint(state);
+        observer?.phase('complete');
         return state;
       }
       const selected = await readCopyPage(source, columns, layout, candidates);

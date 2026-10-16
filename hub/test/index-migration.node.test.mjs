@@ -25,6 +25,7 @@ import {
   pauseConsumers, requireProtectedProduction, runCopyPass, verifyActiveIndex, verifyReadyIndex,
 } from '../../infra/cf/index-control.mjs';
 import { PREVIEW_ACCOUNT_ID, PRODUCTION_ACCOUNT_ID } from '../../infra/cf/preview-trust.mjs';
+import { MIGRATION_COPY_PHASES, createMigrationProgressReporter } from '../../infra/cf/migration-progress.mjs';
 import {
   D1_BATCH_PROBE_TEXT, d1SqlFailureReason, verifyD1BatchAtomicity as currentBatchAtomicity,
 } from '../../infra/cf/d1-batch-atomicity.mjs';
@@ -5051,7 +5052,9 @@ async function copyCliFixture(context) {
         let copyStarted;
         let faultIndex = 0;
         let awaitingRetry = false;
+        let authRejected = false;
         let expired = false;
+        let longPage = false;
         const requests = [];
         const healthCalls = [];
         const healthWaits = [];
@@ -5062,21 +5065,51 @@ async function copyCliFixture(context) {
           signals.set(signal, milliseconds);
           return signal;
         };
+        // A configured telemetry sink keeps its real bounded deadlines: they must not
+        // move the copy's fake clock, and its close must finish before the result line.
+        const realSetTimeout = globalThis.setTimeout;
+        const azureRequests = [];
         globalThis.setTimeout = (callback, delay, ...args) => {
+          if (scenario.azure && /migration-telemetry\\.mjs/.test(new Error().stack)) return realSetTimeout(callback, delay, ...args);
           if (awaitingRetry) {
             healthWaits.push({ started: now, delay });
             awaitingRetry = false;
           }
           now += delay;
+          tick();
           queueMicrotask(() => callback(...args));
           return 0;
         };
+        // Progress heartbeats run on this same fake clock. A heartbeat records the
+        // durable count and trace length around its synchronous callback.
+        const intervals = [];
+        const heartbeats = [];
+        globalThis.setInterval = (callback, delay, ...args) => {
+          const timer = { id: intervals.length + 1, delay, due: now + delay, cleared: false, fired: 0,
+            callback: () => callback(...args), unref() { return this; } };
+          intervals.push(timer);
+          return timer;
+        };
+        globalThis.clearInterval = (timer) => { if (timer) timer.cleared = true; };
+        function tick() {
+          for (const timer of intervals) {
+            while (!timer.cleared && timer.due <= now) {
+              timer.due += timer.delay;
+              timer.fired += 1;
+              const traceBefore = trace.length;
+              timer.callback();
+              heartbeats.push({ at: now, durableRows: checkpoint()?.rows ?? null,
+                durablePending: checkpoint()?.pending?.phase ?? null, traceBefore, traceAfter: trace.length });
+            }
+          }
+        }
         // Install the clock before importing the copier's transitive API pacer:
         // its process-wide permit function captures Date.now at module load.
         const { rowDigest, SOURCE_FREEZE_TABLE } = await import(${JSON.stringify(new URL('../scripts/lib/index-migration.mjs', import.meta.url).href)});
         process.on('exit', () => {
           writeFileSync(${JSON.stringify(reportPath)}, JSON.stringify({
-            now, copyStarted, requests, healthCalls, healthWaits, trace,
+            now, copyStarted, requests, healthCalls, healthWaits, trace, heartbeats, azureRequests,
+            intervals: intervals.map(({ id, delay, cleared, fired }) => ({ id, delay, cleared, fired })),
             verifiedRows: verifiedRows(), checkpoint: checkpoint(),
           }));
           for (const adapter of adapters) adapter.close();
@@ -5101,6 +5134,20 @@ async function copyCliFixture(context) {
         globalThis.fetch = async (input, init = {}) => {
           const url = new URL(input);
           const started = now;
+          if (scenario.azure && url.hostname === 'pipelines.actions.githubusercontent.com') {
+            azureRequests.push({ stage: 'github-oidc' });
+            return Response.json({ value: 'test-oidc-assertion' });
+          }
+          if (scenario.azure && url.hostname === 'login.microsoftonline.com') {
+            azureRequests.push({ stage: 'entra' });
+            return Response.json({ access_token: 'test-azure-access-token', expires_in: 3600 });
+          }
+          if (scenario.azure && url.hostname.endsWith('.ingest.monitor.azure.com')) {
+            // The terminal record never lands, so the sink can only finish (and warn) at close.
+            const terminal = Buffer.from(init.body).includes('"status":"complete"');
+            azureRequests.push({ stage: 'ingest', terminal });
+            return terminal ? new Promise(() => {}) : new Response(null, { status: 204 });
+          }
           if (url.hostname === ${JSON.stringify(config.vars.VIEWER_HOST)} && url.pathname === '/healthz') {
             assert.equal(init.method ?? 'GET', 'GET');
             assert.equal(init.redirect, 'error');
@@ -5113,6 +5160,7 @@ async function copyCliFixture(context) {
             requests.push({ kind: 'health', started, aborted: init.signal.aborted });
             now += 7; // Deliberately unaligned with both pacing and retry intervals.
             if (postVerification && scenario.remaining !== undefined && fault) now = copyStarted + budget - scenario.remaining;
+            tick();
             return fail(fault);
           }
           assert.equal(url.hostname, 'api.cloudflare.com');
@@ -5122,25 +5170,59 @@ async function copyCliFixture(context) {
           const adapter = adapters.find((db) => db.id === id);
           assert.ok(adapter, 'D1 requests must address actual fixture databases');
           const body = JSON.parse(init.body);
+          // A synthetic provider credential rejection of the first matching IDX00 request:
+          // the fenced copy checkpoint update, or a named prerequisite checkpoint read.
+          // Its provider message and SQL never reach any log or telemetry event.
+          const rejects = scenario.authReject === 'copy-checkpoint'
+            ? /^UPDATE index_migration_state SET value = \\?2/.test(body.sql ?? '')
+            : /^SELECT value FROM index_migration_state WHERE name = \\?$/.test(body.sql ?? '')
+              && body.params?.[0] === scenario.authReject;
+          if (scenario.authReject && !authRejected && id === f.shards[0].id && rejects) {
+            authRejected = true;
+            now += 11;
+            const providerDate = new Date(now).toUTCString();
+            requests.push({ kind: 'd1-auth-reject', started, providerDate,
+              bodyBytes: Buffer.byteLength(init.body, 'utf8'),
+              parameterJsonBytes: Buffer.byteLength(JSON.stringify(body.params), 'utf8') });
+            return Response.json({ success: false, errors: [{ code: 10000, message: 'Authentication error' }],
+              messages: [${JSON.stringify(copyCliCanary)}] },
+            { status: 401, headers: { 'cf-ray': 'a4b8dcbe9f86579a-IAD', date: providerDate } });
+          }
           requests.push({ kind: 'd1', started, aborted: init.signal.aborted });
           const result = body.batch ? await adapter.batch(body.batch)
             : [{ success: true, results: await adapter.query(body.sql, body.params) }];
           now += 7;
+          // One long destination page: the durable page is still unacknowledged.
+          if (scenario.longPageMs && !longPage && body.batch && adapter !== adapters[0]
+            && checkpoint()?.pending?.phase === 'copying') {
+            longPage = true;
+            now += scenario.longPageMs;
+          }
           if (scenario.expireBeforeHealth && !expired && verifiedPending()) {
             expired = true;
             now = copyStarted + budget;
           }
+          tick();
           return Response.json({ success: true, result });
         };
       `);
       const result = spawnSync(process.execPath, ['--import', pathToFileURL(preload).href, copyCliController,
         'copy', '--config', configPath, '--pass-budget-ms', String(budget)], {
         encoding: 'utf8', timeout: 30_000,
-        env: { ...process.env, NODE_NO_WARNINGS: '1', GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'push',
+        // The fixture never reaches Azure: inherited sink configuration is removed.
+        env: { ...Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('MIGRATION_AZURE_'))),
+          NODE_NO_WARNINGS: '1', GITHUB_ACTIONS: 'true', GITHUB_EVENT_NAME: 'push',
           GITHUB_REPOSITORY: 'pedropaulovc/agent-sessions-backup', GITHUB_REF: 'refs/heads/main',
           PROTECTED_PRODUCTION_MIGRATION: '1', GITHUB_SHA: copyCliRevision,
           GITHUB_RUN_ID: '12345', GITHUB_RUN_ATTEMPT: '1',
-          CLOUDFLARE_ACCOUNT_ID: PRODUCTION_ACCOUNT_ID, CLOUDFLARE_API_TOKEN: copyCliCanary },
+          CLOUDFLARE_ACCOUNT_ID: PRODUCTION_ACCOUNT_ID, CLOUDFLARE_API_TOKEN: copyCliCanary,
+          ...(scenario.azure ? {
+            MIGRATION_AZURE_TENANT_ID: '00000000-0000-4000-8000-000000000001',
+            MIGRATION_AZURE_CLIENT_ID: '00000000-0000-4000-8000-000000000002',
+            MIGRATION_AZURE_LOGS_ENDPOINT: `https://dce-test.westus2-1.ingest.monitor.azure.com/dataCollectionRules/dcr-${'0'.repeat(32)}/streams/Microsoft-OTLP-Logs/otlp/v1/logs`,
+            ACTIONS_ID_TOKEN_REQUEST_URL: 'https://pipelines.actions.githubusercontent.com/oidc?api-version=2.0',
+            ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'test-oidc-request-token',
+          } : {}) },
       });
       assert.ifError(result.error);
       assert.equal(result.signal, null);
@@ -5159,6 +5241,16 @@ async function copyCliFixture(context) {
 function assertCopyCliPrivate(result) {
   assert.ok(!`${result.stdout}${result.stderr}`.includes(copyCliCanary));
   assert.ok(!`${result.stdout}${result.stderr}`.includes(copyCliCanary.toLowerCase()));
+}
+
+// Progress and telemetry-warning JSON lines (each with an `event` field) precede the
+// copy verb's single result line, which is unchanged and absent on failure.
+function copyCliStdout(result) {
+  const lines = result.stdout.split('\n').filter((line) => line !== '').map((line) => JSON.parse(line));
+  const results = lines.filter((line) => typeof line?.event !== 'string');
+  assert.ok(results.length <= 1, 'the copy verb prints at most one result line');
+  assert.ok(!results.length || lines.at(-1) === results[0], 'the result line is the last stdout line');
+  return { events: lines.filter((line) => typeof line?.event === 'string'), result: results[0] ?? null };
 }
 
 function assertCopyCliRetained(f, rows, result) {
@@ -5187,7 +5279,7 @@ test('copy CLI recovers read-only fetch and response-body interruptions only wit
       const result = await run({ faults });
       assert.equal(result.status, 0, 'a recovered fresh health gate must complete the actual copy');
       assertCopyCliPrivate(result);
-      const copied = JSON.parse(result.stdout.trim());
+      const copied = copyCliStdout(result).result;
       assert.equal(copied.state, 'complete');
       assert.equal(copied.copiedRows, rows.length);
       assert.equal(result.checkpoint.sha256, copied.sha256);
@@ -5212,7 +5304,7 @@ test('copy CLI exhausted health transport is sanitized and preserves the verifie
       const { f, rows, run } = await copyCliFixture(child);
       const result = await run({ faults: [fault, fault, fault] });
       assert.equal(result.status, 1);
-      assert.equal(result.stdout, '');
+      assert.equal(copyCliStdout(result).result, null);
       const attempts = result.healthCalls.filter(({ postVerification }) => postVerification);
       assert.equal(attempts.length, 3);
       assert.equal(result.healthWaits.length, 2);
@@ -5233,6 +5325,95 @@ test('copy CLI exhausted health transport is sanitized and preserves the verifie
   }
 });
 
+test('copy CLI credential rejection is terminal and emits one bounded structured failure event', async (context) => {
+  const { f, rows, run } = await copyCliFixture(context);
+  const result = await run({ authReject: 'copy-checkpoint' });
+  assert.equal(result.status, 1);
+  assertCopyCliPrivate(result);
+  const output = `${result.stdout}${result.stderr}`;
+  for (const secret of ['Authentication error', 'index_migration_state', 'Bearer']) {
+    assert.ok(!output.includes(secret), 'provider text, SQL and credentials never reach CI logs');
+  }
+  const { events, result: copied } = copyCliStdout(result);
+  assert.equal(copied, null, 'a failed pass prints no result line');
+  const rejectIndex = result.requests.findIndex(({ kind }) => kind === 'd1-auth-reject');
+  assert.ok(rejectIndex >= 0, 'the fixture must reject an actual IDX00 checkpoint update');
+  assert.deepEqual(result.requests.slice(rejectIndex + 1), [], 'no replay and no later request follows the rejection');
+  const rejection = result.requests[rejectIndex];
+  const failures = events.filter(({ event }) => event === 'migration.copy.failure');
+  assert.equal(failures.length, 1);
+  const [failure] = failures;
+  const progress = events.filter(({ event }) => event === 'migration.copy.progress');
+  assert.equal(progress.at(-1).status, 'failed');
+  assert.ok(events.indexOf(progress.at(-1)) < events.indexOf(failure), 'the failed progress event is retained, not replaced');
+  const lastSuccess = Date.parse(failure.lastSuccessfulRequestAt);
+  assert.ok(lastSuccess >= copyCliStart && lastSuccess <= rejection.started);
+  assert.ok(MIGRATION_COPY_PHASES.includes(progress.at(-1).phase));
+  assert.deepEqual(failure, {
+    event: 'migration.copy.failure', schemaVersion: 1, recordedAt: failure.recordedAt,
+    phase: progress.at(-1).phase, operationPhase: 'copy-checkpoint-write',
+    failureKind: 'http', httpStatus: 401, providerCodes: [10000],
+    providerReason: 'authentication', cfRay: 'a4b8dcbe9f86579a-IAD',
+    providerDate: new Date(Date.parse(rejection.providerDate)).toISOString(),
+    requestDurationMs: 11, requestAttempt: 1, lastSuccessfulRequestAt: failure.lastSuccessfulRequestAt,
+    statementCount: 1, parameterCount: 3, bodyBytes: rejection.bodyBytes,
+    parameterJsonBytes: rejection.parameterJsonBytes, databaseId: f.shards[0].id,
+    revision: copyCliRevision, runId: '12345', attempt: '1',
+  });
+  assert.ok(Date.parse(failure.recordedAt) >= rejection.started);
+  assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), rows, 'a rejected checkpoint acknowledges nothing');
+  f.restart();
+  const resumed = await run();
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.equal(copyCliStdout(resumed).result.state, 'complete');
+  assert.ok(!copyCliStdout(resumed).events.some(({ event }) => event === 'migration.copy.failure'));
+  assertCopied(f, rows);
+});
+
+test('copy CLI prerequisite credential rejection reports the same bounded failure before any copy request', async (context) => {
+  for (const checkpoint of ['index-maintenance-freeze-v1', 'index-rest-batch-atomicity-v1']) {
+    await context.test(checkpoint, async (child) => {
+      const { f, rows, run } = await copyCliFixture(child);
+      const result = await run({ authReject: checkpoint });
+      assert.equal(result.status, 1);
+      assertCopyCliPrivate(result);
+      const output = `${result.stdout}${result.stderr}`;
+      for (const secret of ['Authentication error', 'index_migration_state', 'Bearer']) {
+        assert.ok(!output.includes(secret), 'provider text, SQL and credentials never reach CI logs');
+      }
+      const { events, result: copied } = copyCliStdout(result);
+      assert.equal(copied, null, 'a failed prerequisite prints no result line');
+      const rejectIndex = result.requests.findIndex(({ kind }) => kind === 'd1-auth-reject');
+      assert.ok(rejectIndex >= 0, 'the fixture must reject the actual prerequisite read');
+      assert.deepEqual(result.requests.slice(rejectIndex + 1), [], 'no replay and no later request follows the rejection');
+      assert.equal(result.healthCalls.length, 1, 'only the initial maintenance gate precedes the prerequisites');
+      assert.ok(!events.some(({ event }) => event === 'migration.copy.progress'), 'no copy pass started');
+      const rejection = result.requests[rejectIndex];
+      const failures = events.filter(({ event }) => event === 'migration.copy.failure');
+      assert.equal(failures.length, 1);
+      const [failure] = failures;
+      const freeze = checkpoint === 'index-maintenance-freeze-v1';
+      // The freeze read is this invocation's first D1 request; the atomicity read follows it.
+      if (freeze) assert.equal(failure.lastSuccessfulRequestAt, null);
+      else assert.ok(Date.parse(failure.lastSuccessfulRequestAt) <= rejection.started);
+      assert.deepEqual(failure, {
+        event: 'migration.copy.failure', schemaVersion: 1, recordedAt: failure.recordedAt,
+        phase: 'unknown', operationPhase: 'checkpoint-read',
+        failureKind: 'http', httpStatus: 401, providerCodes: [10000],
+        providerReason: 'authentication', cfRay: 'a4b8dcbe9f86579a-IAD',
+        providerDate: new Date(Date.parse(rejection.providerDate)).toISOString(),
+        requestDurationMs: 11, requestAttempt: 1, lastSuccessfulRequestAt: failure.lastSuccessfulRequestAt,
+        statementCount: 1, parameterCount: 1, bodyBytes: rejection.bodyBytes,
+        parameterJsonBytes: rejection.parameterJsonBytes, databaseId: f.shards[0].id,
+        revision: copyCliRevision, runId: '12345', attempt: '1',
+      });
+      assert.ok(!result.trace.some((event) => event.sql && isWrite(event.sql)), 'no D1 write follows the rejection');
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), rows);
+      assert.equal(result.checkpoint, null, 'no copy checkpoint is written');
+    });
+  }
+});
+
 test('copy CLI never retries HTTP, JSON, or fresh revision/layout mismatch into source authorization', async (context) => {
   for (const { faults, failure, httpStatus = 503 } of [
     { faults: ['fetch', 'revision'], failure: 'mismatch' },
@@ -5247,7 +5428,7 @@ test('copy CLI never retries HTTP, JSON, or fresh revision/layout mismatch into 
       const { f, rows, run } = await copyCliFixture(child);
       const result = await run({ faults, httpStatus });
       assert.equal(result.status, 1);
-      assert.equal(result.stdout, '');
+      assert.equal(copyCliStdout(result).result, null);
       const attempts = result.healthCalls.filter(({ postVerification }) => postVerification);
       assert.equal(attempts.length, faults.length, 'invalid fresh responses are terminal, not transport retries');
       assert.equal(result.healthWaits.length, faults.length - 1);
@@ -5271,7 +5452,7 @@ test('copy CLI shares the fresh soft budget with health starts and retry waits a
       const result = await run(scenario);
       assert.equal(result.status, 78, 'health boundary exhaustion must remain an explicit partial copy pass');
       assertCopyCliPrivate(result);
-      assert.deepEqual(JSON.parse(result.stdout.trim()), { status: 'partial', reason: 'pass-budget-exhausted' });
+      assert.deepEqual(copyCliStdout(result).result, { status: 'partial', reason: 'pass-budget-exhausted' });
       assert.equal(result.stderr, '');
       const attempts = result.healthCalls.filter(({ postVerification }) => postVerification);
       assert.equal(attempts.length, scenario.expireBeforeHealth ? 0 : scenario.remaining === 1001 ? 2 : 1);
@@ -5292,6 +5473,445 @@ test('copy CLI shares the fresh soft budget with health starts and retry waits a
       assert.deepEqual(f.shards.map((db) => db.rows('SELECT * FROM blocks ORDER BY id')), snapshots);
     });
   }
+});
+
+const PROGRESS_EVENT_KEYS = ['acknowledgedRows', 'elapsedMs', 'etaSeconds', 'event', 'lastProgressAt', 'passRows',
+  'pendingRows', 'phase', 'recordedAt', 'remainingRows', 'rowsPerSecond', 'schemaVersion', 'status'];
+const isBaselineRead = (f, { db, sql }) => db === f.source.id && /\bAS remaining_rows\b/.test(sql ?? '');
+
+// Three ~560 KB rows cannot share one ~1 MiB page: every row is its own acknowledged page.
+function progressRows() {
+  return [0, 1, 2].map((index) => block(81_001 + index, index % 2,
+    { text: `progresspage${index} ${'progressword '.repeat(43_000)}` }));
+}
+
+// The real reporter on a fake clock. Heartbeats fire synchronously only when the test
+// advances time between copy requests; every event records the durable checkpoint read
+// directly from SQLite at the moment it was emitted.
+function progressHarness(f) {
+  const start = 1_000_000;
+  let time = start;
+  let firing = false;
+  const events = [];
+  const timers = [];
+  const heartbeats = [];
+  const progress = {
+    emit(event) {
+      const durable = durableCopyState(f.shards[0]);
+      events.push({ event, heartbeat: firing, durableRows: durable?.rows ?? null,
+        durablePending: durable ? durable.pending?.rows.length ?? 0 : null });
+    },
+    now: () => time,
+    setInterval(callback, delay) {
+      const timer = { callback, delay, due: time + delay, cleared: false };
+      timers.push(timer);
+      return timer;
+    },
+    clearInterval(timer) { timer.cleared = true; },
+  };
+  const advance = (milliseconds) => {
+    time += milliseconds;
+    for (const timer of timers) {
+      while (!timer.cleared && timer.due <= time) {
+        timer.due += timer.delay;
+        const before = f.trace.length;
+        firing = true;
+        try { timer.callback(); } finally { firing = false; }
+        heartbeats.push({ at: time, traceGrowth: f.trace.length - before });
+      }
+    }
+  };
+  return { start, events, timers, heartbeats, progress, advance, get time() { return time; } };
+}
+
+// Consumer-visible invariants of every emitted event. `exact` requires the reported
+// count to equal the stored checkpoint; otherwise a committed but unwitnessed
+// checkpoint may be ahead of the report, never behind it.
+function assertDurableProgress(entries, totalRows, { exact = true } = {}) {
+  let previous = null;
+  for (const { event, durableRows, durablePending } of entries) {
+    assert.deepEqual(Object.keys(event).sort(), PROGRESS_EVENT_KEYS);
+    assert.ok(Object.isFrozen(event));
+    assert.equal(event.event, 'migration.copy.progress');
+    assert.equal(event.schemaVersion, 1);
+    assert.ok(MIGRATION_COPY_PHASES.includes(event.phase));
+    if (event.acknowledgedRows !== null) {
+      if (exact) {
+        assert.equal(event.acknowledgedRows, durableRows, 'only a witnessed durable ACK count is reported');
+        assert.equal(event.pendingRows, durablePending);
+      } else assert.ok(event.acknowledgedRows <= durableRows);
+    }
+    if (event.remainingRows !== null) assert.equal(event.remainingRows, totalRows - event.acknowledgedRows);
+    if (event.remainingRows === 0) assert.equal(event.etaSeconds, 0);
+    else if (event.remainingRows === null || !(event.rowsPerSecond > 0)) assert.equal(event.etaSeconds, null);
+    if (event.lastProgressAt === null) assert.equal(event.rowsPerSecond, null);
+    if (previous) {
+      assert.ok(event.recordedAt >= previous.recordedAt);
+      if (previous.acknowledgedRows !== null) assert.ok(event.acknowledgedRows >= previous.acknowledgedRows);
+      if (event.acknowledgedRows === previous.acknowledgedRows) {
+        assert.equal(event.lastProgressAt, previous.lastProgressAt, 'heartbeats and phases never imply an ACK');
+      } else if (previous.acknowledgedRows !== null) {
+        assert.ok(event.lastProgressAt !== null && (previous.lastProgressAt === null
+          || event.lastProgressAt >= previous.lastProgressAt) && event.lastProgressAt <= event.recordedAt);
+      }
+    }
+    previous = event;
+  }
+}
+
+test('the progress reporter coalesces page steps, decays its recent ACK rate and never emits after its terminal event', () => {
+  let time = 0;
+  let heartbeat = null;
+  let cleared = 0;
+  const events = [];
+  const reporter = createMigrationProgressReporter({
+    emit: (event) => events.push(event), now: () => time,
+    setInterval: (callback, delay) => { assert.equal(delay, 30_000); heartbeat = callback; return 7; },
+    clearInterval: (timer) => { assert.equal(timer, 7); cleared += 1; },
+  });
+  assert.deepEqual(events, [{
+    event: 'migration.copy.progress', schemaVersion: 1, status: 'running', phase: 'initializing',
+    recordedAt: new Date(0).toISOString(), acknowledgedRows: null, passRows: null, pendingRows: null, elapsedMs: 0,
+    rowsPerSecond: null, remainingRows: null, etaSeconds: null, lastProgressAt: null,
+  }], 'the start event distinguishes an unknown count from zero');
+  reporter.observe({ phase: 'private-phase', acknowledgedRows: 0, pendingRows: 0, remainingRows: 500,
+    sha256: 'f'.repeat(64), text: 'private row text' });
+  assert.equal(events.length, 2);
+  assert.equal(events[1].phase, 'unknown');
+  assert.deepEqual(Object.keys(events[1]).sort(), PROGRESS_EVENT_KEYS);
+  assert.ok(!JSON.stringify(events).includes('private') && !JSON.stringify(events).includes('f'.repeat(64)));
+  for (const phase of ['planning', 'copying', 'verifying', 'retiring', 'planning', 'copying']) {
+    reporter.observe({ phase, acknowledgedRows: 0, pendingRows: 1, remainingRows: 500 });
+  }
+  assert.deepEqual(events.slice(2).map(({ phase }) => phase), ['planning'], 'per-page steps never emit on their own');
+  time = 10_000;
+  reporter.observe({ phase: 'retiring', acknowledgedRows: 100, pendingRows: 0, remainingRows: 400 });
+  assert.equal(events.length, 3, 'an ACK alone waits for the next heartbeat');
+  time = 20_000;
+  heartbeat();
+  assert.deepEqual({ ...events.at(-1) }, {
+    event: 'migration.copy.progress', schemaVersion: 1, status: 'running', phase: 'retiring',
+    recordedAt: new Date(20_000).toISOString(), acknowledgedRows: 100, passRows: 100, pendingRows: 0, elapsedMs: 20_000,
+    rowsPerSecond: 5, remainingRows: 400, etaSeconds: 80, lastProgressAt: new Date(10_000).toISOString(),
+  });
+  time = 15 * 60_000;
+  heartbeat();
+  assert.deepEqual([events.at(-1).rowsPerSecond, events.at(-1).etaSeconds, events.at(-1).lastProgressAt],
+    [0, null, new Date(10_000).toISOString()], 'a stall outside the recent window has no rate and no ETA');
+  reporter.finish('running');
+  assert.equal(events.at(-1).status, 'failed', 'only a terminal status ends a pass');
+  assert.equal(cleared, 1);
+  const emitted = events.length;
+  reporter.finish('complete');
+  reporter.observe({ phase: 'finalizing', acknowledgedRows: 500, pendingRows: 0, remainingRows: 0 });
+  heartbeat();
+  reporter.close();
+  assert.equal(events.length, emitted);
+  assert.equal(cleared, 1);
+
+  // Without a known remaining count the rate is reported but no ETA is invented,
+  // and a throwing sink never reaches the caller.
+  const unknown = [];
+  const throwing = createMigrationProgressReporter({ now: () => time,
+    emit: (event) => { unknown.push(event); throw new Error('sink failure'); },
+    setInterval: () => 1, clearInterval: () => {} });
+  throwing.observe({ phase: 'planning', acknowledgedRows: 0, pendingRows: 0, remainingRows: null });
+  time += 10_000;
+  throwing.observe({ phase: 'finalizing', acknowledgedRows: 50, pendingRows: 0, remainingRows: null });
+  throwing.finish('partial');
+  assert.deepEqual(unknown.map(({ status, rowsPerSecond, etaSeconds }) => [status, rowsPerSecond, etaSeconds]),
+    [['running', null, null], ['running', null, null], ['running', 5, null], ['partial', 5, null]]);
+
+  // A sparse ACK after 35 quiet minutes is measured over the last ten minutes only,
+  // and its published (unrounded) rate is exactly the one the ETA uses.
+  let clock = 0;
+  let beat = null;
+  const sparse = [];
+  const slow = createMigrationProgressReporter({ emit: (event) => sparse.push(event), now: () => clock,
+    setInterval: (callback) => { beat = callback; return 1; }, clearInterval: () => {} });
+  slow.observe({ phase: 'planning', acknowledgedRows: 0, pendingRows: 0, remainingRows: 2 });
+  clock = 35 * 60_000;
+  slow.observe({ phase: 'planning', acknowledgedRows: 1, pendingRows: 0, remainingRows: 1 });
+  clock += 30_000;
+  beat();
+  const recent = sparse.at(-1);
+  assert.equal(recent.rowsPerSecond, 1 / 600, 'one ACK over the ten-minute window, not over 35 minutes');
+  assert.equal(recent.etaSeconds, Math.ceil(recent.remainingRows / recent.rowsPerSecond));
+  assert.ok(recent.etaSeconds >= 600 && recent.etaSeconds <= 601);
+  clock = 35 * 60_000 + 10 * 60_000 + 1;
+  beat();
+  assert.deepEqual([sparse.at(-1).rowsPerSecond, sparse.at(-1).etaSeconds], [0, null],
+    'no ACK within the last ten minutes: zero rate and no ETA');
+  slow.finish('complete');
+});
+
+test('copy progress reports only witnessed ACK counts, page heartbeats, one bounded baseline and a single terminal event', async (context) => {
+  const f = await fixture(context);
+  const rows = progressRows();
+  seedBlocks(f.source, rows);
+  const h = progressHarness(f);
+  for (const db of [f.source, ...f.shards]) db.beforeQuery = () => h.advance(1000);
+  // Every destination page write is a long page: several heartbeats pass before its ACK.
+  for (const shard of f.shards) shard.afterBatch = ({ statements }) => {
+    if (statements.some(({ sql }) => /\bINSERT\s+INTO\s+"?blocks"?\s*\(/i.test(sql))) h.advance(95_000);
+  };
+  const result = await runCopyPass({ ...sqliteCopyControl(context, f).args, progress: h.progress });
+  assert.equal(result.state, 'complete');
+  assert.equal(result.copiedRows, rows.length);
+  assertCopied(f, rows);
+  assertDurableProgress(h.events, rows.length);
+  // The source is provably frozen only after the first ACK, so remaining is known from then on.
+  assert.deepEqual(h.events.filter(({ heartbeat }) => !heartbeat).map(({ event }) =>
+    [event.status, event.phase, event.acknowledgedRows, event.remainingRows]), [
+    ['running', 'initializing', null, null], ['running', 'initializing', 0, null], ['running', 'planning', 0, null],
+    ['running', 'planning', 1, 2], ['running', 'finalizing', 3, 0], ['complete', 'complete', 3, 0],
+  ], 'only lifecycle, newly known counters and coarse stages emit between heartbeats');
+  const pageBeats = h.events.filter(({ heartbeat, event }) => heartbeat && event.phase === 'copying');
+  assert.ok(pageBeats.length >= 3 * rows.length, 'each long page is visible through its heartbeats');
+  assert.ok(pageBeats.every(({ event }) => event.pendingRows === 1 && event.status === 'running'));
+  assert.ok(h.heartbeats.every(({ traceGrowth }) => traceGrowth === 0), 'a heartbeat issues no D1 request');
+  assert.deepEqual(f.trace.filter((event) => isBaselineRead(f, event)).map(({ params }) => params), [[rows[0].id]],
+    'one count, from the first acknowledged cursor');
+  const final = h.events.at(-1).event;
+  assert.equal(final.passRows, rows.length);
+  assert.equal(final.pendingRows, 0);
+  assert.equal(final.elapsedMs, h.time - h.start);
+  assert.ok(final.rowsPerSecond > 0 && final.lastProgressAt !== null);
+  assert.ok(h.timers.length === 1 && h.timers[0].cleared);
+  const emitted = h.events.length;
+  h.advance(60 * 60_000);
+  assert.equal(h.events.length, emitted, 'nothing is emitted after the terminal event');
+
+  // Progress is opt-in: the same copy without an observer makes no baseline read.
+  const plain = await fixture(context);
+  seedBlocks(plain.source, progressRows());
+  assert.equal((await runCopyPass(sqliteCopyControl(context, plain).args)).state, 'complete');
+  assert.ok(!plain.trace.some((event) => isBaselineRead(plain, event)));
+});
+
+test('a failed or unwitnessed ACK checkpoint is never reported, and resume defers remaining past an ambiguous page', async (context) => {
+  for (const mode of ['rejected-before-commit', 'lost-after-commit']) {
+    await context.test(mode, async (child) => {
+      const f = await fixture(child);
+      const rows = progressRows();
+      seedBlocks(f.source, rows);
+      const isAck = (event) => isCopyWrite(event) && copyWriteState(event).state === 'pending'
+        && copyWriteState(event).pending === null && copyWriteState(event).rows > 0;
+      const fault = new Error(`private checkpoint fault ${mode}`);
+      let faulted = false;
+      f.shards[0].beforeQuery = (event) => {
+        if (mode === 'rejected-before-commit' && !faulted && isAck(event)) { faulted = true; throw fault; }
+      };
+      f.shards[0].transformQuery = (event, result) => {
+        if (mode === 'lost-after-commit' && !faulted && isAck(event)) { faulted = true; throw fault; }
+        return result;
+      };
+      const h = progressHarness(f);
+      await assert.rejects(runCopyPass({ ...sqliteCopyControl(child, f).args, progress: h.progress }),
+        (error) => !(error instanceof CopyPassBudgetExhausted));
+      assert.ok(faulted);
+      const durable = durableCopyState(f.shards[0]);
+      if (mode === 'rejected-before-commit') {
+        assert.equal(durable.rows, 0);
+        assert.equal(durable.pending.phase, 'verified');
+        assert.equal(f.source.rows('SELECT COUNT(*) AS n FROM blocks')[0].n, rows.length - 1,
+          'the verified page was retired without its ACK');
+      } else {
+        assert.equal(durable.rows, 1);
+        assert.equal(durable.pending, null);
+      }
+      assertDurableProgress(h.events, rows.length, { exact: false });
+      assert.ok(h.events.every(({ event }) => event.acknowledgedRows === null || event.acknowledgedRows === 0));
+      const failed = h.events.at(-1).event;
+      assert.deepEqual([failed.status, failed.phase, failed.acknowledgedRows, failed.passRows, failed.lastProgressAt,
+        failed.rowsPerSecond], ['failed', 'retiring', 0, 0, null, null]);
+      assert.ok(!JSON.stringify(h.events.map(({ event }) => event)).includes('private'), 'no failure cause in events');
+      assert.ok(h.timers.every(({ cleared }) => cleared));
+
+      f.restart();
+      f.trace.length = 0;
+      const resumed = progressHarness(f);
+      const result = await runCopyPass({ ...sqliteCopyControl(child, f).args, progress: resumed.progress });
+      assert.equal(result.state, 'complete');
+      assert.equal(result.copiedRows, rows.length);
+      assertCopied(f, rows);
+      assertDurableProgress(resumed.events, rows.length);
+      const events = resumed.events.map(({ event }) => event);
+      const stored = mode === 'lost-after-commit' ? 1 : 0;
+      const firstKnown = events.find(({ acknowledgedRows }) => acknowledgedRows !== null);
+      assert.deepEqual([firstKnown.acknowledgedRows, firstKnown.passRows, firstKnown.lastProgressAt, firstKnown.rowsPerSecond],
+        [stored, 0, null, null], 'a stored count is not progress of this pass');
+      const baseline = f.trace.findIndex((event) => isBaselineRead(f, event));
+      assert.ok(baseline >= 0);
+      if (mode === 'rejected-before-commit') {
+        const ack = f.trace.findIndex((event) => event.kind === 'query' && event.success && isAck(event) && event.rows.length === 1);
+        assert.ok(ack >= 0 && baseline > ack, 'a page that may already be retired is acknowledged before the count');
+        assert.ok(events.filter(({ acknowledgedRows }) => acknowledgedRows === 0)
+          .every(({ remainingRows }) => remainingRows === null), 'no remaining count while the ambiguous page is pending');
+      }
+      const final = events.at(-1);
+      assert.deepEqual([final.status, final.acknowledgedRows, final.passRows, final.remainingRows],
+        ['complete', rows.length, rows.length - stored, 0]);
+    });
+  }
+});
+
+test('copy progress keeps pass-budget partials, unavailable baselines and completed checkpoints truthful', async (context) => {
+  await context.test('a pass boundary at the baseline read ends the pass without further copy requests', async (child) => {
+    const f = await fixture(child);
+    seedBlocks(f.source, progressRows());
+    // The boundary fires once, at the first gate after the first ACK: the loop-top
+    // gate whose next request is the baseline read. Swallowing it would let the copy continue.
+    let armed = false;
+    let used = false;
+    let boundaryAt = null;
+    const control = sqliteCopyControl(child, f, {
+      requestGate: () => { if (armed) { armed = false; throw new CopyPassBudgetExhausted(); } },
+    });
+    const h = progressHarness(f);
+    const result = await runCopyPass({ ...control.args, progress: h.progress, gate: async () => {
+      const durable = durableCopyState(f.shards[0]);
+      if (!used && durable?.rows > 0) { used = armed = true; boundaryAt = f.trace.length; }
+      return await gate();
+    } });
+    assert.deepEqual(result, { status: 'partial', reason: 'pass-budget-exhausted' });
+    assert.ok(used);
+    assert.equal(f.trace.length, boundaryAt, 'neither the baseline read nor any copy request follows the boundary');
+    assert.ok(!f.trace.some((event) => isBaselineRead(f, event)));
+    assertDurableProgress(h.events, 3);
+    assert.deepEqual([h.events.at(-1).event.status, h.events.at(-1).event.acknowledgedRows, h.events.at(-1).event.remainingRows],
+      ['partial', 1, null]);
+  });
+  await context.test('an unavailable baseline read leaves remaining and ETA unknown without failing the copy', async (child) => {
+    const f = await fixture(child);
+    const rows = progressRows();
+    seedBlocks(f.source, rows);
+    f.source.transformQuery = (event, result) => {
+      if (isBaselineRead(f, event)) throw new Error('private baseline failure');
+      return result;
+    };
+    const h = progressHarness(f);
+    const result = await runCopyPass({ ...sqliteCopyControl(child, f).args, progress: h.progress });
+    assert.equal(result.state, 'complete');
+    assertCopied(f, rows);
+    assertDurableProgress(h.events, rows.length);
+    assert.equal(f.trace.filter((event) => isBaselineRead(f, event)).length, 1, 'the baseline is never retried');
+    assert.ok(h.events.filter(({ event }) => event.acknowledgedRows < rows.length)
+      .every(({ event }) => event.remainingRows === null && event.etaSeconds === null));
+    assert.deepEqual([h.events.at(-1).event.status, h.events.at(-1).event.remainingRows], ['complete', 0]);
+  });
+  await context.test('an already complete checkpoint reports its stored count without claiming progress', async (child) => {
+    const f = await fixture(child);
+    const rows = progressRows();
+    seedBlocks(f.source, rows);
+    const copied = await runCopyPass(sqliteCopyControl(child, f).args);
+    f.trace.length = 0;
+    const h = progressHarness(f);
+    assert.deepEqual(await runCopyPass({ ...sqliteCopyControl(child, f).args, progress: h.progress }), copied);
+    assertDurableProgress(h.events, rows.length);
+    assert.deepEqual(h.events.map(({ event }) => [event.status, event.phase, event.acknowledgedRows, event.remainingRows]), [
+      ['running', 'initializing', null, null], ['running', 'initializing', 3, 0],
+      ['running', 'finalizing', 3, 0], ['complete', 'complete', 3, 0],
+    ]);
+    const final = h.events.at(-1).event;
+    assert.deepEqual([final.passRows, final.lastProgressAt, final.rowsPerSecond, final.etaSeconds], [0, null, null, 0]);
+    assert.ok(!f.trace.some((event) => isBaselineRead(f, event)));
+  });
+});
+
+test('remaining is unknown until the first ACK freezes the source, so late pre-barrier writes never skew it', async (context) => {
+  const f = await fixture(context);
+  const rows = progressRows();
+  seedBlocks(f.source, rows);
+  const late = [81_010, 81_011].map((id, index) => block(id, index % 2,
+    { text: `progresslate${index} ${'progressword '.repeat(43_000)}` }));
+  // Maintenance does not stop an in-flight source write before the first freeze
+  // barrier: while the first page is still unacknowledged, two later rows land and
+  // one future row disappears. A count taken then would be one row short forever.
+  let mutated = false;
+  for (const shard of f.shards) shard.afterBatch = ({ statements }) => {
+    if (mutated || !statements.some(({ sql }) => /\bINSERT\s+INTO\s+"?blocks"?\s*\(/i.test(sql))) return;
+    mutated = true;
+    assert.equal(durableCopyState(f.shards[0]).rows, 0);
+    seedBlocks(f.source, late);
+    f.source.database.prepare('DELETE FROM blocks WHERE id = ?').run(BigInt(rows[2].id));
+  };
+  const h = progressHarness(f);
+  const result = await runCopyPass({ ...sqliteCopyControl(context, f).args, progress: h.progress });
+  const copied = [rows[0], rows[1], ...late];
+  assert.ok(mutated);
+  assert.equal(result.state, 'complete');
+  assert.equal(result.copiedRows, copied.length);
+  assertCopied(f, copied);
+  assertDurableProgress(h.events, copied.length);
+  const events = h.events.map(({ event }) => event);
+  assert.ok(events.filter(({ acknowledgedRows }) => !(acknowledgedRows > 0))
+    .every(({ remainingRows, etaSeconds }) => remainingRows === null && etaSeconds === null), 'no count before the barrier');
+  assert.deepEqual(f.trace.filter((event) => isBaselineRead(f, event)).map(({ params }) => params), [[rows[0].id]]);
+  assert.deepEqual(events.filter(({ remainingRows }) => remainingRows !== null)
+    .map(({ acknowledgedRows, remainingRows }) => [acknowledgedRows, remainingRows]).filter(([ack], index, all) =>
+      index === 0 || ack !== all[index - 1][0]), [[1, 3], [4, 0]], 'exact from the first ACK');
+});
+
+test('copy CLI streams correlated progress with long-page heartbeats before its unchanged result line', async (context) => {
+  const { f, rows, run } = await copyCliFixture(context);
+  const result = await run({ longPageMs: 95_000 });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, '');
+  assertCopyCliPrivate(result);
+  assertCopied(f, rows);
+  const { events, result: copied } = copyCliStdout(result);
+  assert.deepEqual(copied, { copiedRows: rows.length, state: 'complete', sha256: result.checkpoint.sha256 });
+  const warnings = events.filter(({ event }) => event === 'migration.telemetry.warning');
+  assert.deepEqual(warnings.map(({ code }) => code), ['configuration-absent'], 'an unconfigured sink is visible, not silent');
+  const progress = events.filter(({ event }) => event === 'migration.copy.progress');
+  assert.equal(events.length, warnings.length + progress.length);
+  for (const event of progress) {
+    const { revision: eventRevision, runId, attempt, ...body } = event;
+    assert.deepEqual([eventRevision, runId, attempt], [copyCliRevision, '12345', '1']);
+    assert.deepEqual(Object.keys(body).sort(), PROGRESS_EVENT_KEYS);
+    if (body.remainingRows !== null) assert.equal(body.remainingRows, rows.length - body.acknowledgedRows);
+  }
+  assert.deepEqual([progress[0].status, progress[0].acknowledgedRows], ['running', null]);
+  assert.deepEqual([progress.at(-1).status, progress.at(-1).acknowledgedRows, progress.at(-1).remainingRows],
+    ['complete', rows.length, 0]);
+  assert.ok(progress.slice(0, -1).every(({ status }) => status === 'running'));
+  const pageBeats = result.heartbeats.filter(({ durablePending }) => durablePending === 'copying');
+  assert.ok(pageBeats.length >= 3, 'the long page is covered by heartbeats');
+  assert.ok(result.heartbeats.every(({ traceBefore, traceAfter }) => traceBefore === traceAfter), 'a heartbeat issues no D1 request');
+  for (const beat of pageBeats) {
+    assert.ok(progress.some((event) => event.recordedAt === new Date(beat.at).toISOString() && event.phase === 'copying'
+      && event.acknowledgedRows === beat.durableRows && event.pendingRows === rows.length && event.lastProgressAt === null));
+  }
+  assert.deepEqual(result.intervals.filter(({ delay }) => delay === 30_000).map(({ cleared }) => cleared), [true],
+    'one progress heartbeat timer, cleared at the terminal event');
+  // One pending page: its ACK leaves no candidates, so the copy completes before
+  // any loop iteration could count a provably frozen source.
+  assert.equal(result.trace.filter((event) => isBaselineRead(f, event)).length, 0);
+});
+
+test('copy CLI prints its result only after a configured telemetry sink has closed and reported', async (context) => {
+  const { f, rows, run } = await copyCliFixture(context);
+  // Real sink, real bounded deadlines: the terminal ingest never answers and ignores
+  // its abort, so the sink can only report that loss while closing.
+  const result = await run({ azure: true });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stderr, '');
+  assertCopyCliPrivate(result);
+  assertCopied(f, rows);
+  const { events, result: copied } = copyCliStdout(result);
+  assert.deepEqual(copied, { copiedRows: rows.length, state: 'complete', sha256: result.checkpoint.sha256 });
+  const ingests = result.azureRequests.filter(({ stage }) => stage === 'ingest');
+  assert.ok(ingests.length >= 2 && ingests.at(-1).terminal && ingests.filter(({ terminal }) => terminal).length === 1);
+  const warnings = events.filter(({ event }) => event === 'migration.telemetry.warning');
+  const closing = warnings.filter(({ code }) => ['close-deadline', 'delivery-summary'].includes(code));
+  assert.ok(closing.length >= 1 && closing.at(-1).sentEvents >= 1, 'the sink reports its lost terminal event at close');
+  assert.ok(closing.at(-1).failedEvents + closing.at(-1).abandonedEvents >= 1,
+    'the undelivered terminal event is counted as a failed or unconfirmed delivery');
+  assert.ok(!warnings.some(({ code }) => code === 'configuration-absent'));
+  const lines = result.stdout.trim().split('\n').map((line) => JSON.parse(line));
+  assert.equal(lines.at(-2).event, 'migration.telemetry.warning', 'close diagnostics precede the result line');
+  assert.deepEqual(lines.at(-1), copied);
 });
 
 const scratchNonce = '0123456789abcdef01234567';
@@ -6957,7 +7577,23 @@ test('byte-exact legacy recovery resumes every durable checkpoint and ambiguous 
       }
       f.restart();
       const resumedAt = f.trace.length;
-      const resumed = await copyWithNativeParameters(f.args());
+      // The current copier also reports progress through this ambiguous legacy resume:
+      // never ahead of the stored checkpoint, and any remaining count exact.
+      const observed = [];
+      const progress = copyWithNativeParameters === copyFrozenIndex ? { observe(snapshot) {
+        observed.push({ ...snapshot, durableRows: durableCopyState(f.shards[0])?.rows ?? null });
+      } } : undefined;
+      const resumed = await copyWithNativeParameters(f.args(progress ? { progress } : {}));
+      if (progress) {
+        assert.ok(observed.length > 0);
+        for (const { phase, acknowledgedRows, remainingRows, durableRows } of observed) {
+          assert.ok(MIGRATION_COPY_PHASES.includes(phase));
+          if (acknowledgedRows !== null) assert.equal(acknowledgedRows, durableRows);
+          if (remainingRows !== null) assert.equal(remainingRows, resumed.rows - acknowledgedRows);
+        }
+        assert.deepEqual([observed.at(-1).phase, observed.at(-1).acknowledgedRows, observed.at(-1).remainingRows],
+          ['complete', resumed.rows, 0]);
+      }
       assert.equal(resumed.state, 'complete');
       assert.equal(resumed.sha256, sha256(`${f.prefix.sha256}:${JSON.stringify(f.exactPending)}`));
       if (['verified', 'source-delete', 'acknowledged'].includes(stage)) assert.equal(blockWrites(), writes);
@@ -7103,7 +7739,7 @@ test('copy CLI rerun after a delayed unfenced checkpoint UPSERT keeps the comple
   const { f, rows, run } = await copyCliFixture(context);
   const first = await run();
   assert.equal(first.status, 0, first.stderr);
-  const completed = JSON.parse(first.stdout.trim());
+  const completed = copyCliStdout(first).result;
   const stale = committedCopyWrites(first.trace.filter((event) => event.db === f.shards[0].id))
     .map(({ state }) => state).find((state) => state.pending?.phase === 'copying');
   assert.ok(stale, 'the actual CLI must have persisted a copying page before completion');
@@ -7113,7 +7749,7 @@ test('copy CLI rerun after a delayed unfenced checkpoint UPSERT keeps the comple
   lateUnfencedWrite(f.shards[0], stale);
   const rerun = await run();
   assert.equal(rerun.status, 0, rerun.stderr);
-  assert.deepEqual(JSON.parse(rerun.stdout.trim()), completed);
+  assert.deepEqual(copyCliStdout(rerun).result, completed);
   assert.equal(storedValue(f.shards[0], COPY_CHECKPOINT), durable);
   assert.deepEqual(rerun.checkpoint, first.checkpoint);
   assert.ok(!rerun.trace.some((event) => event.sql && isWrite(event.sql) && /\bblocks\b/.test(event.sql)));
