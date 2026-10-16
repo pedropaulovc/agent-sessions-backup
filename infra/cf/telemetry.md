@@ -359,8 +359,9 @@ include `sentEvents`, `failedEvents`, `coalescedEvents`, `droppedEvents` and
 warning/summary, and repeated/concurrent closes share the same terminal boundary.
 There is no replay/retry loop or telemetry I/O in checkpoint ACKs. Warnings contain
 only typed codes and aggregate delivery counts, never tokens, headers, upstream
-bodies, errors, row IDs, hashes, or session text. CLI stdout remains the independent
-telemetry record if Azure delivery fails.
+bodies, errors, row IDs, hashes, or session text. The copy CLI also preserves all
+five delivery counters in stdout warning records, so unavailable Azure delivery
+does not hide abandonment.
 
 ### Failure context and token validity
 

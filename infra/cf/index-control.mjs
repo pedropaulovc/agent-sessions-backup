@@ -76,7 +76,7 @@ export async function runCopyPass({ source, shards, gate, progress }) {
   }
 }
 
-const TELEMETRY_WARNING_COUNTS = ['httpStatus', 'sentEvents', 'failedEvents', 'coalescedEvents', 'droppedEvents'];
+const TELEMETRY_WARNING_COUNTS = ['httpStatus', 'sentEvents', 'failedEvents', 'coalescedEvents', 'droppedEvents', 'abandonedEvents'];
 
 // Only allowlisted aggregate fields reach CI logs: a code and safe integer counts.
 function printTelemetryWarning(warning) {
