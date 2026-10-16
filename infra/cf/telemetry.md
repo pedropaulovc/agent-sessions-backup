@@ -340,11 +340,23 @@ remains the independent progress record if Azure delivery fails.
 
 ### Verify ingestion without Cloudflare credentials
 
-Use the owner's existing authorized Azure session for a **smoke only**. The
-programmatic `getAccessToken({ signal })` injection returns a token string and
-exists for tests/this smoke; production does not use it. Keep a smoke's run ID
-separate from any real/protected workflow (for example synthetic run ID `1`) so
-its unknown counters cannot be mistaken for real migration evidence.
+Use a principal authorized to publish telemetry to this DCR for a **smoke only**.
+Subscription Owner access does not include the **Monitoring Metrics Publisher**
+data actions. The existing publisher managed identity already has the DCR-scoped
+role and can run the smoke from temporary Azure compute with that identity
+attached. If using a local user, verify its DCR publish authorization first:
+[RBAC changes can take up to ten minutes and may require a refreshed token](https://learn.microsoft.com/en-us/azure/role-based-access-control/troubleshooting#symptom---role-assignment-changes-are-not-being-detected).
+A local-user 403 alone does not establish that GitHub federation is broken or
+that native OTLP rejects every delegated-user token.
+
+The programmatic `getAccessToken({ signal })` injection returns a token string
+and exists for tests/this smoke; production does not use it. The local-user
+example below uses Azure CLI; an identity-attached Azure runtime can instead
+obtain its managed-identity token before creating the sink. Never print either
+token. Delete temporary compute and any temporary smoke-only role grant after
+verification. Keep a smoke's run ID separate from any real/protected workflow
+(for example synthetic run ID `1`) so its unknown counters cannot be mistaken
+for real migration evidence.
 
 With the three nonsecret variables exported and `SMOKE_REVISION` set to the
 feature's full SHA, run from the repository root:
