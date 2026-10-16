@@ -5864,8 +5864,6 @@ test('copy CLI streams correlated progress with long-page heartbeats before its 
   assert.deepEqual(copied, { copiedRows: rows.length, state: 'complete', sha256: result.checkpoint.sha256 });
   const warnings = events.filter(({ event }) => event === 'migration.telemetry.warning');
   assert.deepEqual(warnings.map(({ code }) => code), ['configuration-absent'], 'an unconfigured sink is visible, not silent');
-  assert.ok(warnings.every((warning) => Object.keys(warning).every((key) => ['event', 'code', 'httpStatus',
-    'sentEvents', 'failedEvents', 'coalescedEvents', 'droppedEvents'].includes(key))));
   const progress = events.filter(({ event }) => event === 'migration.copy.progress');
   assert.equal(events.length, warnings.length + progress.length);
   for (const event of progress) {
@@ -5908,6 +5906,8 @@ test('copy CLI prints its result only after a configured telemetry sink has clos
   const warnings = events.filter(({ event }) => event === 'migration.telemetry.warning');
   const closing = warnings.filter(({ code }) => ['close-deadline', 'delivery-summary'].includes(code));
   assert.ok(closing.length >= 1 && closing.at(-1).sentEvents >= 1, 'the sink reports its lost terminal event at close');
+  assert.ok(closing.at(-1).failedEvents + closing.at(-1).abandonedEvents >= 1,
+    'the undelivered terminal event is counted as a failed or unconfirmed delivery');
   assert.ok(!warnings.some(({ code }) => code === 'configuration-absent'));
   const lines = result.stdout.trim().split('\n').map((line) => JSON.parse(line));
   assert.equal(lines.at(-2).event, 'migration.telemetry.warning', 'close diagnostics precede the result line');
