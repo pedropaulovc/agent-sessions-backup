@@ -217,17 +217,24 @@ export function assertMaintenanceHealth(health, revision, count) {
   }
 }
 
-async function readStoredCheckpoint(db, name) {
+// The stored row as { raw, value }: `raw` is the exact stored value as returned by the
+// transport (never re-serialized), `value` its parsed record.
+async function readStoredCheckpointRow(db, name) {
   if (!db[DIAGNOSTIC_DB]) db = phaseDb(db, COPY_PHASES.GENERAL_CHECKPOINT_READ);
   const rows = await db.query('SELECT value FROM index_migration_state WHERE name = ?', [name]);
   if (!rows.length) return null;
+  const raw = rows[0].value;
   let value;
-  try { value = JSON.parse(rows[0].value); }
+  try { value = JSON.parse(raw); }
   catch { throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_PAYLOAD, 'invalid index migration checkpoint payload'); }
   // Only a missing row is absence. Stored null/primitives/arrays are corruption,
   // never permission to initialize or overwrite a workflow checkpoint.
   if (!isProofRecord(value)) throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_PAYLOAD, 'invalid index migration checkpoint payload');
-  return value;
+  return { raw, value };
+}
+
+async function readStoredCheckpoint(db, name) {
+  return (await readStoredCheckpointRow(db, name))?.value ?? null;
 }
 
 const isCopyCheckpointName = (name) => name === COPY_CHECKPOINT || name === LEGACY_COPY_CHECKPOINT;
@@ -268,6 +275,18 @@ const COPY_CHECKPOINT_UPDATE_SQL = `UPDATE index_migration_state SET value = ?2
       AND json_type(value, '$.state') = 'object'
       AND json_type(value, '$.generation') = 'integer' AND json_extract(value, '$.generation') = ?3
     ELSE 0 END
+  RETURNING json_extract(value, '$.generation') AS generation`;
+
+// The one-time import inserts the envelope only while the unfenced key still holds
+// the exact TEXT bytes that were read and validated, and only if the fenced key is
+// absent. A concurrent unfenced rewrite between that read and this insert (including
+// a same-byte BLOB) matches no row and fails closed. This closes only that window: it
+// cannot detect unfenced history that was already stale when read, or a rewrite back
+// to the identical bytes before the insert (ABA).
+const COPY_CHECKPOINT_IMPORT_SQL = `INSERT INTO index_migration_state (name, value)
+  SELECT ?1, ?2 FROM index_migration_state
+  WHERE name = ?3 AND typeof(value) = 'text' AND CAST(value AS BLOB) = CAST(?4 AS BLOB)
+  ON CONFLICT (name) DO NOTHING
   RETURNING json_extract(value, '$.generation') AS generation`;
 
 /**
@@ -1526,12 +1545,23 @@ export async function importLegacyCopyCheckpoint({ source, shards }) {
     validateCopyState(current.state, shards.length);
     return 'current';
   }
-  const legacy = await readStoredCheckpoint(phaseDb(shards[0], COPY_PHASES.GENERAL_CHECKPOINT_READ), LEGACY_COPY_CHECKPOINT);
+  const legacy = await readStoredCheckpointRow(phaseDb(shards[0], COPY_PHASES.GENERAL_CHECKPOINT_READ), LEGACY_COPY_CHECKPOINT);
   if (!legacy) return 'absent';
+  if (typeof legacy.raw !== 'string') {
+    throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_PAYLOAD, 'invalid index migration checkpoint payload', COPY_PHASES.GENERAL_CHECKPOINT_READ);
+  }
   // The exact semantic state is wrapped verbatim, so proofs sealed over it still bind it.
-  assertIdentity(legacy, identity);
-  validateCopyState(legacy, shards.length);
-  await writeCopyCheckpoint(phaseDb(shards[0], COPY_PHASES.GENERAL_CHECKPOINT_WRITE), legacy, 0);
+  assertIdentity(legacy.value, identity);
+  validateCopyState(legacy.value, shards.length);
+  const envelope = JSON.stringify({ format: COPY_CHECKPOINT_FORMAT, generation: 1, state: legacy.value });
+  const rows = await phaseDb(shards[0], COPY_PHASES.GENERAL_CHECKPOINT_WRITE).query(COPY_CHECKPOINT_IMPORT_SQL,
+    [COPY_CHECKPOINT, envelope, LEGACY_COPY_CHECKPOINT, legacy.raw]);
+  // Never retried: a changed/absent unfenced value or an existing fenced key is resolved
+  // by rerunning initialize, which re-reads both keys; so is a lost response.
+  if (!Array.isArray(rows) || rows.length !== 1 || rows[0]?.generation !== 1) {
+    throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_FENCE, 'unfenced copy checkpoint changed during its import',
+      COPY_PHASES.GENERAL_CHECKPOINT_WRITE);
+  }
   return 'imported';
 }
 

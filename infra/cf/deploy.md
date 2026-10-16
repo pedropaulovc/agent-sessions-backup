@@ -393,7 +393,7 @@ The one-time cutover runs these operations in order, from the same checked-out m
    (see the fenced copy checkpoint below). It reports `copyCheckpoint` as `current`
    (the fenced key exists; the unfenced key is never read), `imported` (the unfenced
    state passed the identity and full shape checks and was wrapped verbatim at
-   generation 1), or `absent`.
+   generation 1 by the conditional import below), or `absent`.
 3. `index-control.mjs state` checks source objects and durable checkpoint identities,
    then reports a bounded first/middle/last source sample as `copyForecast`. It logs
    aggregate row bytes, page occupancy, shard fanout, estimated remaining requests,
@@ -579,6 +579,23 @@ it, so a late UPSERT to it changes nothing. It is never deleted. While it exists
 without the fenced key, `copy` fails closed before any write instead of starting a
 fresh copy; run `initialize` (the normal workflow does so before `state`).
 
+The import is one conditional `INSERT ... SELECT`: it writes the generation-1 envelope
+only while the unfenced key still holds, as TEXT, exactly the bytes `initialize` read
+and validated (`typeof(value) = 'text' AND CAST(value AS BLOB) = CAST(? AS BLOB)`; no
+re-serialized or normalized comparison), and only while the fenced key is absent. It
+requires exactly one returned row with generation 1. A late unfenced write that
+commits between that read and the insert (a newer value, a deletion, a same-byte BLOB
+rewrite) or a concurrently created fenced key matches no row: that is the
+`checkpoint-fence` invariant, never retried, and nothing is written. Rerun the
+workflow; `initialize` re-reads both keys. A lost import response is resolved the
+same way (`current` if it committed). An unfenced value stored as a BLOB is a
+checkpoint payload error, not importable. Boundaries: this closes only the window
+between the import's read and its insert. It cannot detect unfenced history that was
+already stale when read (a delayed older UPSERT that landed earlier, as in the
+attempt-3 rewind), nor a rewrite back to the identical bytes before the insert (ABA);
+the copier's own source/destination proofs still apply to whatever is imported, and
+this is not a repair of earlier unfenced history.
+
 Historical regression controls predate the fence. Whenever `INDEX_COPY_MODULE_PATH`,
 `INDEX_CONTROL_CLI_PATH` or `NATIVE_COPY_CONTROL_MODULE_PATH` selects a pre-fence
 revision (every historical control in this runbook), also set
@@ -718,6 +735,17 @@ Its deliberately late, equal-length byte mutation must yield one bounded mismatc
 comparison and preserve all four source/destination/freeze/checkpoint fences. An
 unavailable or false comparison fails the proof; a destination compile control is
 not an alternate oracle or permission to turn that failure into success.
+
+On its owned scratch IDX00 only, the control's `byte-exact-checkpoint-fence` phase
+proves one advanced-generation witness and zero-row stale UPDATE/insert replays, and
+`byte-exact-checkpoint-import` then runs the real conditional import natively: with the
+fenced key present the import reports `current` and leaves both raw keys unchanged;
+after a scratch-only reset, an unfenced value changed and then deleted between the
+import's read and its insert each match zero rows (the fence, no fenced key written);
+the stable value imports exactly `{format: 1, generation: 1, state}` with the unfenced
+TEXT archive byte-identical. These key resets/reseeds exist only in this disposable
+fixture, never in the product importer. The phase adds about 21 recovery `/query`
+requests (counted from the code, not yet measured) within the unchanged caps below.
 
 The control is paced, not CPU-bound. Timestamped local controller/stub runs measured
 328 Cloudflare requests in 104 s for `359f3e2` (252 positive, 76 old diagnostic) and

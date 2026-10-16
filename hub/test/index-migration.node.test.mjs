@@ -5809,14 +5809,30 @@ test('native full-copy control runs real SQLite schema, copier, independent read
     .find(({ state }) => state.state === 'complete' && state.rows === result.rows);
   assert.ok(positiveComplete, 'the full positive proof must complete before its scratch-only checkpoint reset');
   // The stale replays are fenced-v2 requests by contract: an unfenced control has none.
+  const isImport = (sql) => /^INSERT INTO index_migration_state \(name, value\)\s+SELECT\b/.test(sql);
   const fenceRejections = adapters[1].trace.filter(({ kind, sql, params, success, rows }) => kind === 'query' && success
-    && /^(?:INSERT INTO|UPDATE) index_migration_state\b/.test(sql) && params[0] === COPY_CHECKPOINT && rows.length === 0);
+    && /^(?:INSERT INTO|UPDATE) index_migration_state\b/.test(sql) && !isImport(sql) && params[0] === COPY_CHECKPOINT
+    && rows.length === 0);
   assert.deepEqual(fenceRejections.map(({ sql, params }) => [sql.split(' ')[0], params.length,
     JSON.stringify(JSON.parse(params[1]).state)]), [
     ['UPDATE', 3, JSON.stringify(positiveComplete.state)],
     ['INSERT', 2, JSON.stringify(positiveComplete.state)],
   ], 'the stale transition replay and stale insert execute natively once each and match zero rows');
   assert.equal(fenceRejections[0].params[2], JSON.parse(positiveComplete.event.params[1]).generation);
+  // The real conditional import runs natively three times: an unfenced value changed and
+  // then deleted after its read each match zero rows; the stable value commits generation 1.
+  const imports = adapters[1].trace.filter(({ kind, sql, success }) => kind === 'query' && success && isImport(sql));
+  assert.deepEqual(imports.map(({ rows }) => rows), [[], [], [{ generation: 1 }]]);
+  assert.ok(imports.every(({ params }) => params.length === 4 && params[0] === COPY_CHECKPOINT
+    && params[2] === 'full-fidelity-index-copy-v1' && params[3] === JSON.stringify(JSON.parse(params[1]).state)
+    && params[1] === JSON.stringify({ format: 1, generation: 1, state: JSON.parse(params[3]) })));
+  const raceIndex = (pattern) => adapters[1].trace.findIndex(({ sql, params }) => pattern.test(sql ?? '')
+    && params?.at(-1) === 'full-fidelity-index-copy-v1');
+  const changedAt = raceIndex(/^UPDATE index_migration_state SET value = \? WHERE name = \?$/);
+  const deletedAt = raceIndex(/^DELETE FROM index_migration_state WHERE name = \?$/);
+  assert.ok(changedAt >= 0 && changedAt < adapters[1].trace.indexOf(imports[0])
+    && deletedAt > adapters[1].trace.indexOf(imports[0]) && deletedAt < adapters[1].trace.indexOf(imports[1]),
+  'each concurrent unfenced change commits natively before the import insert it invalidates');
   assert.deepEqual(account.snapshot(), before);
   assert.equal(account.created.length, 3);
   assert.equal(new Set(account.created.map(({ name }) => name)).size, 3);
@@ -7388,6 +7404,137 @@ test('the one-time initialize import wraps an unfenced checkpoint verbatim and n
     await assert.rejects(importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), /different databases\/layout/);
     assert.equal(storedValue(f.shards[0], COPY_CHECKPOINT), null);
     assert.equal(storedValue(f.shards[0], LEGACY_COPY_KEY), JSON.stringify(foreign));
+  });
+});
+
+// A real run that stopped after acknowledging page 2 of 3 (pages 1-2 genuinely retired),
+// recreated in the pre-fence layout: every committed semantic state and the latest one.
+async function unfencedDeadRun(context) {
+  const f = await fixture(context);
+  const rows = multiPageRows();
+  seedBlocks(f.source, rows);
+  const states = [];
+  const stop = new Error('dead run stopped after its page-2 acknowledgment');
+  await assert.rejects(copyFrozenIndex(f.args({ checkpointHook: (state) => {
+    states.push(structuredClone(state));
+    if (state.state === 'pending' && state.pending === null && state.rows === 2) throw stop;
+  } })), (error) => error === stop);
+  const latest = states.at(-1);
+  assert.deepEqual(await readCopyState(f.shards[0]), latest);
+  assert.equal(f.source.rows('SELECT COUNT(*) AS n FROM blocks')[0].n, 1, 'pages 1 and 2 were genuinely retired');
+  const stale = {
+    copying: states.find((state) => state.rows === 0 && state.pending?.phase === 'copying'),
+    verified: states.find((state) => state.rows === 0 && state.pending?.phase === 'verified'),
+    ack: states.find((state) => state.rows === 1 && state.pending === null),
+  };
+  assert.ok(stale.copying && stale.verified && stale.ack);
+  f.shards[0].database.prepare('DELETE FROM index_migration_state WHERE name = ?').run(COPY_CHECKPOINT);
+  f.restart();
+  return { f, rows, latest, stale };
+}
+
+async function uninterruptedCopy(context) {
+  const f = await fixture(context);
+  seedBlocks(f.source, multiPageRows());
+  return copyFrozenIndex(f.args());
+}
+
+test('the initialize import fails closed when the unfenced value changes between its validated read and its insert', async (context) => {
+  const isImportInsert = ({ sql, params }) => /^INSERT INTO index_migration_state \(name, value\)\s+SELECT\b/.test(sql)
+    && params[0] === COPY_CHECKPOINT;
+  const cases = [
+    ...['copying', 'verified', 'ack'].map((stale) => ({ stale, race: 'newer-valid' })),
+    { stale: 'copying', race: 'deleted' },
+    { stale: 'ack', race: 'same-bytes-blob' },
+    { stale: 'ack', race: 'concurrent-fenced-insert' },
+  ];
+  for (const { stale, race } of cases) {
+    await context.test(`${race}-after-stale-${stale}`, async (child) => {
+      const expected = await uninterruptedCopy(child);
+      const { f, rows, latest, stale: snapshots } = await unfencedDeadRun(child);
+      const old = snapshots[stale];
+      // The dead run's late older write (art1392 rewind) is the value the import reads.
+      lateUnfencedWrite(f.shards[0], old);
+      const concurrentEnvelope = JSON.stringify({ format: 1, generation: 1, state: latest });
+      let raced = 0;
+      f.shards[0].beforeQuery = (event) => {
+        if (raced || !isImportInsert(event)) return;
+        raced += 1;
+        assert.equal(event.params[3], JSON.stringify(old), 'the guard binds the exact raw TEXT that was read');
+        const db = f.shards[0].database;
+        if (race === 'newer-valid') lateUnfencedWrite(f.shards[0], latest);
+        else if (race === 'deleted') db.prepare('DELETE FROM index_migration_state WHERE name = ?').run(LEGACY_COPY_KEY);
+        else if (race === 'same-bytes-blob') {
+          db.prepare('UPDATE index_migration_state SET value = CAST(value AS BLOB) WHERE name = ?').run(LEGACY_COPY_KEY);
+        } else {
+          db.prepare('INSERT INTO index_migration_state (name, value) VALUES (?, ?)').run(COPY_CHECKPOINT, concurrentEnvelope);
+        }
+      };
+      const legacyBefore = () => f.shards[0].rows(
+        'SELECT typeof(value) AS type, hex(CAST(value AS BLOB)) AS bytes FROM index_migration_state WHERE name = ?', [LEGACY_COPY_KEY]);
+      await assert.rejects(importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), (error) =>
+        error.code === CHECKPOINT_FENCE && error.d1Phase !== undefined && error.d1FailureKind === undefined);
+      f.shards[0].beforeQuery = null;
+      assert.equal(raced, 1, 'the concurrent write landed inside the read-to-insert window');
+      const importRequests = f.trace.filter((event) => event.kind === 'query' && isImportInsert(event));
+      assert.deepEqual(importRequests.map(({ rows: returned }) => returned), [[]], 'one request, zero rows, never retried');
+      assert.equal(storedValue(f.shards[0], COPY_CHECKPOINT), race === 'concurrent-fenced-insert' ? concurrentEnvelope : null,
+        'the import never persists a superseded unfenced snapshot or overwrites a fenced key');
+      if (race === 'same-bytes-blob') {
+        assert.deepEqual(legacyBefore(), [{ type: 'blob', bytes: Buffer.from(JSON.stringify(old)).toString('hex').toUpperCase() }]);
+        // A BLOB unfenced value is corruption, not a value to import.
+        await assert.rejects(importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), (error) =>
+          error.code === 'checkpoint-payload');
+        assert.equal(storedValue(f.shards[0], COPY_CHECKPOINT), null);
+        return;
+      }
+      f.restart();
+      f.trace.length = 0;
+      if (race === 'deleted') {
+        // Nothing remains to import; the import writes nothing rather than inventing state.
+        assert.equal(await importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), 'absent');
+        assert.equal(storedValue(f.shards[0], COPY_CHECKPOINT), null);
+        return;
+      }
+      // Rerunning initialize re-reads both keys: the current value is imported once.
+      assert.equal(await importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }),
+        race === 'concurrent-fenced-insert' ? 'current' : 'imported');
+      assert.deepEqual(await readCopyCheckpoint(f.shards[0]), { generation: 1, state: latest });
+      assert.equal(storedValue(f.shards[0], LEGACY_COPY_KEY), JSON.stringify(race === 'newer-valid' ? latest : old),
+        'the unfenced archive is never rewritten or deleted by the import');
+      assert.deepEqual(await copyFrozenIndex(f.args()), expected);
+      assertCopied(f, rows);
+    });
+  }
+  await context.test('control-no-interleaving', async (child) => {
+    const expected = await uninterruptedCopy(child);
+    const { f, rows, latest, stale } = await unfencedDeadRun(child);
+    lateUnfencedWrite(f.shards[0], stale.copying);
+    lateUnfencedWrite(f.shards[0], latest);
+    f.trace.length = 0;
+    assert.equal(await importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), 'imported');
+    const importRequests = f.trace.filter((event) => event.kind === 'query' && isImportInsert(event));
+    assert.deepEqual(importRequests.map(({ params, rows: returned }) => [params.length, params[2], params[3], returned]),
+      [[4, LEGACY_COPY_KEY, JSON.stringify(latest), [{ generation: 1 }]]]);
+    assert.deepEqual(await readCopyCheckpoint(f.shards[0]), { generation: 1, state: latest });
+    assert.deepEqual(await copyFrozenIndex(f.args()), expected);
+    assertCopied(f, rows);
+  });
+  await context.test('control-lost-response-after-commit', async (child) => {
+    const expected = await uninterruptedCopy(child);
+    const { f, rows, latest } = await unfencedDeadRun(child);
+    lateUnfencedWrite(f.shards[0], latest);
+    const lost = new Error('import response lost after commit');
+    f.shards[0].transformQuery = (event, result) => {
+      if (isImportInsert(event)) throw lost;
+      return result;
+    };
+    await assert.rejects(importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), (error) => error === lost);
+    f.restart();
+    assert.equal(await importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), 'current');
+    assert.deepEqual(await readCopyCheckpoint(f.shards[0]), { generation: 1, state: latest });
+    assert.deepEqual(await copyFrozenIndex(f.args()), expected);
+    assertCopied(f, rows);
   });
 });
 

@@ -1265,8 +1265,12 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
   assert.ok(fencedWrites.filter(({ rows }) => rows.length === 1)
     .every(({ rows }) => Number.isSafeInteger(rows[0].generation) && rows[0].generation >= 1));
   assert.ok(fencedWrites.filter(({ rows }) => rows.length === 1).length >= 6);
-  assert.deepEqual(fencedWrites.filter(({ rows }) => rows.length === 0).map(({ sql }) => sql.split(' ')[0]),
+  const isImport = ({ sql }) => /^INSERT INTO index_migration_state \(name, value\)\s+SELECT\b/.test(sql);
+  assert.deepEqual(fencedWrites.filter((event) => !isImport(event) && event.rows.length === 0).map(({ sql }) => sql.split(' ')[0]),
     ['UPDATE', 'INSERT'], 'only the native control\'s two stale checkpoint replays are fenced');
+  // The conditional one-time import: changed and deleted unfenced values match no row;
+  // the stable value commits exactly one generation-1 witness.
+  assert.deepEqual(fencedWrites.filter(isImport).map(({ rows }) => rows.map(({ generation }) => generation)), [[], [], [1]]);
   assert.ok(fencedWrites.every(({ rows }) => rows.length <= 1));
   const migrations = result.events.filter((event) => event.kind === 'migrate');
   assert.equal(migrations.length, 3);

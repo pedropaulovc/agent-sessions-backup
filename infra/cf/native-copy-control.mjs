@@ -4,8 +4,8 @@ import {
   previewCopyScratchNames, previewResourceOwner,
 } from './preview-trust.mjs';
 import {
-  COPY_INVARIANTS, COPY_PAGE_BYTES, COPY_PAGE_ROWS, COPY_PHASES, SOURCE_FREEZE_TABLE, canonicalRow,
-  copyFrozenIndex, readCopyCheckpoint, writeCopyCheckpoint,
+  COPY_CHECKPOINT, COPY_INVARIANTS, COPY_PAGE_BYTES, COPY_PAGE_ROWS, COPY_PHASES, SOURCE_FREEZE_TABLE, canonicalRow,
+  copyFrozenIndex, importLegacyCopyCheckpoint, readCopyCheckpoint, writeCopyCheckpoint,
 } from '../../hub/scripts/lib/index-migration.mjs';
 import { BLOCK_COLUMNS, INDEX_ID_SPAN, indexShardForSessionId } from '../../hub/src/index-layout.mjs';
 import { D1_FAILURE_KINDS, D1_SQL_FAILURE_REASONS } from './d1-batch-atomicity.mjs';
@@ -640,6 +640,62 @@ async function proveByteExactRecovery({ source, shards, gate, positive, positive
   const fencedStored = await readCopyCheckpoint(shards[0]);
   requireProof(fencedStored.generation === fencedGeneration
     && JSON.stringify(fencedStored.state) === JSON.stringify(legacyState), phase);
+  // Native one-time import: the real conditional INSERT ... SELECT executes on the owned
+  // scratch IDX00. An existing fenced key wins; an unfenced value changed or deleted
+  // between the import's read and its insert matches zero rows and fails closed as the
+  // fence; a stable value is imported at generation 1. Key resets are scratch-only.
+  phase = 'byte-exact-checkpoint-import';
+  const unfencedKey = 'full-fidelity-index-copy-v1';
+  const unfencedText = JSON.stringify(legacyState);
+  const rawKeys = async () => Object.fromEntries((await shards[0].query(
+    'SELECT name, typeof(value) AS type, value FROM index_migration_state WHERE name IN (?, ?) ORDER BY name',
+    [COPY_CHECKPOINT, unfencedKey])).map(({ name, type, value }) => [name, { type, value }]));
+  const setUnfenced = { sql: `INSERT INTO index_migration_state (name, value) VALUES (?, ?)
+    ON CONFLICT (name) DO UPDATE SET value = excluded.value`, params: [unfencedKey, unfencedText] };
+  await shards[0].query(setUnfenced.sql, [unfencedKey, JSON.stringify(positive)]);
+  const fencedRaw = (await rawKeys())[COPY_CHECKPOINT];
+  requireProof(await importLegacyCopyCheckpoint({ source, shards }) === 'current', phase);
+  const precedence = await rawKeys();
+  requireProof(JSON.stringify(precedence[COPY_CHECKPOINT]) === JSON.stringify(fencedRaw)
+    && precedence[unfencedKey]?.value === JSON.stringify(positive), phase);
+  const importFences = [];
+  for (const [race, raceSql, raceParams] of [
+    ['changed', 'UPDATE index_migration_state SET value = ? WHERE name = ?', [JSON.stringify(positive), unfencedKey]],
+    ['deleted', 'DELETE FROM index_migration_state WHERE name = ?', [unfencedKey]],
+  ]) {
+    await shards[0].batch([
+      { sql: 'DELETE FROM index_migration_state WHERE name = ?', params: [COPY_CHECKPOINT] },
+      setUnfenced,
+    ]);
+    let raced = 0;
+    const racing = {
+      id: shards[0].id,
+      batch: (statements) => shards[0].batch(statements),
+      async query(sql, params = []) {
+        if (!raced && /^INSERT INTO index_migration_state \(name, value\)\s+SELECT\b/.test(sql)
+          && params[0] === COPY_CHECKPOINT && params[2] === unfencedKey && params[3] === unfencedText) {
+          raced += 1;
+          await shards[0].query(raceSql, raceParams);
+        }
+        return shards[0].query(sql, params);
+      },
+    };
+    try { await importLegacyCopyCheckpoint({ source, shards: [racing, ...shards.slice(1)] }); } catch (error) {
+      if (error?.code !== COPY_INVARIANTS.CHECKPOINT_FENCE) throw safeFailure(error, phase);
+      requireProof(error.d1Phase === COPY_PHASES.GENERAL_CHECKPOINT_WRITE && error.d1FailureKind === undefined, phase);
+      importFences.push(race);
+    }
+    const after = await rawKeys();
+    requireProof(raced === 1 && after[COPY_CHECKPOINT] === undefined
+      && (race === 'changed' ? after[unfencedKey]?.value === JSON.stringify(positive) : after[unfencedKey] === undefined), phase);
+  }
+  requireProof(importFences.length === 2, phase);
+  await shards[0].query(setUnfenced.sql, setUnfenced.params);
+  requireProof(await importLegacyCopyCheckpoint({ source, shards }) === 'imported', phase);
+  const imported = await rawKeys();
+  requireProof(imported[COPY_CHECKPOINT]?.type === 'text' && imported[unfencedKey]?.type === 'text'
+    && imported[unfencedKey].value === unfencedText
+    && imported[COPY_CHECKPOINT].value === JSON.stringify({ format: 1, generation: 1, state: legacyState }), phase);
   phase = 'byte-exact-legacy-loss';
   let lossyReplicaCells = 0;
   for (const [index, row] of legacy.entries()) {
