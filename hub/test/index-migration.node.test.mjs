@@ -12,8 +12,9 @@ import test from 'node:test';
 import {
   ACTIVATION_CHECKPOINT, COPY_CHECKPOINT, COPY_ENCODING, COPY_PAGE_BYTES, READY_CHECKPOINT, SEED_CHECKPOINT, SOURCE_FREEZE_TABLE,
   assertActivationProof, assertMaintenanceHealth, assertReadyProof, buildActivationProof, buildReadyProof, canonicalRow,
-  classifyIndexMigration, copyFrozenIndex, initializeShardLayouts, readCheckpoint, reconcileIndexCatalog, rowDigest,
-  seedFrozenCatalog, sourceCopyForecast, verifyIndexRecords, writeCheckpoint,
+  classifyIndexMigration, copyFrozenIndex, importLegacyCopyCheckpoint, initializeShardLayouts, readCheckpoint,
+  readCopyCheckpoint, reconcileIndexCatalog, rowDigest, seedFrozenCatalog, sourceCopyForecast, verifyIndexRecords,
+  writeCheckpoint, writeCopyCheckpoint,
 } from '../scripts/lib/index-migration.mjs';
 import {
   BLOCK_COLUMNS, INDEX_ID_SPAN, INDEX_LAYOUT, SESSION_CATALOG_COLUMNS,
@@ -52,6 +53,8 @@ const { verifyNativeCopyControl, withScratchD1Databases } = process.env.NATIVE_C
   : { verifyNativeCopyControl: currentNativeCopyControl, withScratchD1Databases: currentScratchD1Databases };
 const verifyD1BatchAtomicity = process.env.D1_ATOMICITY_MODULE_PATH
   ? (await import(process.env.D1_ATOMICITY_MODULE_PATH)).verifyD1BatchAtomicity : currentBatchAtomicity;
+// Consumers see only the semantic copy state; the fence generation stays in its envelope.
+const readCopyState = async (db) => (await readCopyCheckpoint(db))?.state ?? null;
 
 const hubRoot = path.resolve(import.meta.dirname, '..');
 const revision = 'frozen-index-revision-0123456789';
@@ -115,9 +118,14 @@ class SqliteD1 {
 
   execute(sql, params) {
     const statement = this.database.prepare(sql);
-    if (statement.columns().length) return plainRows(this.database, sql, params, statement);
-    statement.run(...sqliteParams(params));
-    return [];
+    if (!statement.columns().length) {
+      statement.run(...sqliteParams(params));
+      return [];
+    }
+    // DML RETURNING cannot be wrapped in the SELECT transport CTE; it returns D1's
+    // ordinary result rows directly (the copier only returns integer witnesses).
+    if (isWrite(sql)) return statement.all(...sqliteParams(params)).map((row) => ({ ...row }));
+    return plainRows(this.database, sql, params, statement);
   }
 
   async query(sql, params = []) {
@@ -567,13 +575,13 @@ function assertVerifiedBeforeDelete(f) {
         'the only additional source writes may install or transact the persistent blocks writer barrier');
       const saved = JSON.parse(f.shards[0].rows(
         'SELECT value FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT],
-      )[0].value);
+      )[0].value).state;
       assert.equal(saved.pending?.phase, 'verified', 'source barrier writes also require durable row verification');
       return;
     }
     const checkpoint = JSON.parse(f.shards[0].rows(
       'SELECT value FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT],
-    )[0].value);
+    )[0].value).state;
     assert.equal(checkpoint.pending.phase, 'verified', 'verification must be durable BEFORE deletion');
     for (const item of checkpoint.pending.rows) {
       const shard = f.shards[item.shard];
@@ -630,19 +638,22 @@ test('checkpoint reads distinguish missing rows from persisted JSON null, primit
   const f = await fixture(context);
   const db = f.shards[0];
   for (const name of [COPY_CHECKPOINT, SEED_CHECKPOINT, READY_CHECKPOINT, ACTIVATION_CHECKPOINT]) {
-    assert.equal(await readCheckpoint(db, name), null);
+    const read = () => name === COPY_CHECKPOINT ? readCopyState(db) : readCheckpoint(db, name);
+    assert.equal(await read(), null);
     for (const raw of ['null', 'false', 'true', '0', '"complete"', '[]', '[{}]']) {
       db.database.prepare(`INSERT INTO index_migration_state (name, value) VALUES (?, ?)
         ON CONFLICT (name) DO UPDATE SET value = excluded.value`).run(name, raw);
-      await assert.rejects(readCheckpoint(db, name), /invalid index migration checkpoint payload/);
+      await assert.rejects(read(), /invalid index migration checkpoint payload/);
       assert.deepEqual(db.rows('SELECT name, value FROM index_migration_state WHERE name = ?', [name]),
         [{ name, value: raw }], 'invalid persisted payloads must remain intact, not be mistaken for absent checkpoints');
     }
-    const object = { state: 'pending', pending: null, counter: 0 };
-    await writeCheckpoint(db, name, object);
-    assert.deepEqual(await readCheckpoint(db, name), object, 'nested null fields inside a checkpoint object remain valid JSON transport');
     db.database.prepare('DELETE FROM index_migration_state WHERE name = ?').run(name);
-    assert.equal(await readCheckpoint(db, name), null, 'physical absence is the only missing-checkpoint representation');
+    const object = { state: 'pending', pending: null, counter: 0 };
+    if (name === COPY_CHECKPOINT) await writeCopyCheckpoint(db, object, 0);
+    else await writeCheckpoint(db, name, object);
+    assert.deepEqual(await read(), object, 'nested null fields inside a checkpoint object remain valid JSON transport');
+    db.database.prepare('DELETE FROM index_migration_state WHERE name = ?').run(name);
+    assert.equal(await read(), null, 'physical absence is the only missing-checkpoint representation');
   }
 });
 
@@ -767,7 +778,7 @@ test('full-fidelity copy retains long Unicode text, all columns and FTS beyond f
   assertAtomicBlockBatches(f);
   assert.ok(!sourceWrites(f).some(({ sql }) => /\bblocks_fts\b/i.test(sql)), 'legacy source FTS must never receive DML');
   assert.deepEqual(f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
-  assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).state, 'complete');
+  assert.equal((await readCopyState(f.shards[0])).state, 'complete');
 });
 
 test('ordinary NUL-rich rows preserve JSON1 text and bound pages by escaped UTF-8 bytes', async (context) => {
@@ -855,7 +866,7 @@ test('shared first MATCH terms with embedded NUL copy exactly and retire source 
       assert.equal(protectedRows(), rows.length);
       assertCopied(f, rows);
       assert.deepEqual(f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
-      assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).state, 'complete');
+      assert.equal((await readCopyState(f.shards[0])).state, 'complete');
       const matchRows = f.trace.filter((event) => event.db !== f.source.id
         && ['query', 'batch-statement'].includes(event.kind) && /\bMATCH\b/i.test(event.sql));
       assert.ok(matchRows.every((event) => event.success), 'native grouped shared-token probes must all succeed');
@@ -934,7 +945,7 @@ test('native workerd actual copier tokenizer boundaries verify 1461 same-shard r
   const beforeSourceWrite = async ({ sql }) => {
     if (!isWrite(sql)) return;
     assert.equal(verifiedBeforeAck, true, 'full-row and FTS proof must precede all source writes');
-    const durable = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+    const durable = await readCopyState(f.shards[0]);
     assert.equal(durable.pending?.phase, 'verified', 'the native verified checkpoint must be durable before source writes');
     assert.deepEqual(durable.pending.rows.map(({ id }) => id), ids);
     if (/\bDELETE\s+FROM\s+"?blocks"?\b/i.test(sql)) acknowledgedRows += durable.pending.rows.length;
@@ -981,7 +992,7 @@ test('native workerd actual copier tokenizer boundaries verify 1461 same-shard r
   ), [...rows, outside].filter(({ text }) => text.includes('\u0000 nativedensesuffix')).map(({ id }) => ({ rowid: id })),
   'the independent common suffix must include exactly the rows whose stored text has the post-NUL suffix');
   assert.deepEqual(await f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
-  assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).state, 'complete');
+  assert.equal((await readCopyState(f.shards[0])).state, 'complete');
   assertAtomicBlockBatches(f);
   assertNativeRequestLimits(f);
   const requests = f.trace.filter((event) => ['query', 'batch'].includes(event.kind));
@@ -1059,7 +1070,7 @@ test('native workerd copier rejects missing, wrong, duplicate and out-of-probe M
       assert.equal(exercised, true, 'the consumer must reach the real native MATCH boundary');
       assert.deepEqual(await nativeSnapshot(f.source), before, 'invalid MATCH evidence must retain all source bytes and postings');
       assert.deepEqual(sourceWrites(f), [], 'invalid native result identities cannot authorize source writes');
-      const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      const checkpoint = await readCopyState(f.shards[0]);
       assert.equal(checkpoint.pending.phase, 'copying', 'invalid MATCH evidence must never persist verified acknowledgment authority');
       assert.equal(checkpoint.rows, 0);
       assert.equal(checkpoint.after, -1);
@@ -1087,7 +1098,7 @@ for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerd
     let acknowledgedRows = 0;
     const beforeSourceWrite = async ({ sql }) => {
       if (!isWrite(sql)) return;
-      const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      const checkpoint = await readCopyState(f.shards[0]);
       assert.equal(checkpoint.pending?.phase, 'verified');
       assert.equal(verifiedBeforeAck, true, 'all full-word/native/full-row evidence must precede every source write');
       if (/\bDELETE\s+FROM\s+blocks\b/i.test(sql)) acknowledgedRows += checkpoint.pending.rows.length;
@@ -1113,7 +1124,7 @@ for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerd
     assert.equal(acknowledgedRows, rows.length);
     assert.deepEqual(await f.source.rows('SELECT * FROM blocks'), []);
     assert.deepEqual(await f.shards[1].rows('SELECT * FROM blocks ORDER BY id'), rows);
-    assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).state, 'complete');
+    assert.equal((await readCopyState(f.shards[0])).state, 'complete');
     assert.deepEqual(await f.source.rows(`SELECT id, state FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
     const groups = f.trace.filter(({ db, kind, sql, params }) => db === f.shards[1].id
       && kind === 'query' && /\bMATCH\b/.test(sql) && params.length === 1);
@@ -1179,7 +1190,7 @@ for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerd
     assert.deepEqual(sourceWrites(f), [], 'missing later-group evidence must not authorize any source writes');
     assert.deepEqual(await f.shards[1].rows('SELECT * FROM blocks ORDER BY id'), rows);
     await assertNativeLongWordIdentity(f.shards[1], missing, [missing.text], { posting: false });
-    const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+    const checkpoint = await readCopyState(f.shards[0]);
     assert.equal(checkpoint.state, 'pending');
     assert.equal(checkpoint.after, -1);
     assert.equal(checkpoint.rows, 0);
@@ -1230,7 +1241,7 @@ for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerd
         assert.equal(groups, fault === 'future-group' ? 1 : 2);
         assert.deepEqual(await storedBlockSnapshot(f.source), before);
         assert.deepEqual(sourceWrites(f), []);
-        const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+        const checkpoint = await readCopyState(f.shards[0]);
         assert.equal(checkpoint.pending.phase, 'copying');
         assert.equal(checkpoint.rows, 0);
         assert.equal(checkpoint.after, -1);
@@ -1260,7 +1271,7 @@ for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerd
         const beforeSourceWrite = async ({ sql }) => {
           if (!isWrite(sql)) return;
           assert.equal(verifiedBeforeAck, true, 'independent original-word proof must precede all source writes');
-          const durable = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+          const durable = await readCopyState(f.shards[0]);
           assert.equal(durable.pending?.phase, 'verified');
           assert.deepEqual(durable.pending.rows, [{ id: row.id, shard: 1, sha256: rowDigest(BLOCK_COLUMNS, row) }]);
           if (/\bDELETE\s+FROM\s+"?blocks"?\b/i.test(sql)) acknowledgedRows += durable.pending.rows.length;
@@ -1288,7 +1299,7 @@ for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerd
         } })), (error) => error === stop);
         assert.equal(verifiedBeforeAck, true);
         assert.deepEqual(sourceWrites(f), []);
-        const saved = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+        const saved = await readCopyState(f.shards[0]);
         assert.equal(saved.state, 'pending');
         assert.equal(saved.pending.phase, 'verified');
         assert.equal(saved.rows, 0);
@@ -1296,7 +1307,7 @@ for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerd
         const destinationBeforeResume = await Promise.all(f.shards.map(storedBlockSnapshot));
         const batchesBeforeResume = destinationBatchCount(f);
         if (backend === 'SQLite') f.restart();
-        assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), saved,
+        assert.deepEqual(await readCopyState(f.shards[0]), saved,
           'resume must read the actual saved native proof, including after reopening SQLite');
         assert.deepEqual(await storedBlockSnapshot(f.source), before);
         f.source.beforeQuery = beforeSourceWrite;
@@ -1316,7 +1327,7 @@ for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerd
         assert.deepEqual(retired.ftsIndex, before.ftsIndex);
         assert.ok(!sourceWrites(f).some(({ sql }) => /\bblocks_fts\b/i.test(sql)));
         assert.deepEqual(await f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
-        assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).state, 'complete');
+        assert.equal((await readCopyState(f.shards[0])).state, 'complete');
         assertAtomicBlockBatches(f);
         assertNativeRequestLimits(f);
       });
@@ -1494,7 +1505,7 @@ test('native tokenizer crash checkpoints reuse Unicode61 blocks and exact FTS po
         if (target && !crashed) { crashed = true; throw crash; }
       } })), (error) => error === crash);
       assert.equal(crashed, true);
-      const saved = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      const saved = await readCopyState(f.shards[0]);
       if (saved.pending) assert.deepEqual(saved.pending.rows, rows.map((row) => ({
         id: row.id, shard: 1, sha256: rowDigest(BLOCK_COLUMNS, row),
       })));
@@ -1511,7 +1522,7 @@ test('native tokenizer crash checkpoints reuse Unicode61 blocks and exact FTS po
       if (stage === 'before-copy') assert.equal(batchesBeforeRestart, 0);
       else assert.equal(batchesBeforeRestart, 1);
       f.restart();
-      assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), saved);
+      assert.deepEqual(await readCopyState(f.shards[0]), saved);
       assertVerifiedBeforeDelete(f);
       const result = await copyWithNativeParameters(f.args());
       assert.equal(result.rows, rows.length);
@@ -1545,7 +1556,7 @@ test('a failed shard batch rolls back content and FTS atomically; a copying-page
   assert.equal(f.shards[0].rows('SELECT COUNT(*) AS n FROM blocks')[0].n, 1);
   assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), rows);
   assert.deepEqual(sourceWrites(f), []);
-  assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).pending.phase, 'copying');
+  assert.equal((await readCopyState(f.shards[0])).pending.phase, 'copying');
   f.restart();
   assertVerifiedBeforeDelete(f);
   await copyFrozenIndex(f.args());
@@ -1582,7 +1593,7 @@ test('malformed destination readback never authorizes source deletion', async (c
       assert.equal(exercised, true);
       assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [row]);
       assert.deepEqual(sourceWrites(f), []);
-      assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).pending.phase, 'copying');
+      assert.equal((await readCopyState(f.shards[0])).pending.phase, 'copying');
     });
   }
 });
@@ -1609,7 +1620,7 @@ test('malformed long-column byte slices fail closed without dropping the origina
       assert.deepEqual(Buffer.from(f.source.rows('SELECT CAST(text AS BLOB) AS bytes FROM blocks')[0].bytes),
         Buffer.from(row.text), 'malformed destination slices cannot alter any byte of the original source transcript');
       assert.deepEqual(sourceWrites(f), []);
-      assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).pending.phase, 'copying');
+      assert.equal((await readCopyState(f.shards[0])).pending.phase, 'copying');
     });
   }
 });
@@ -1648,7 +1659,7 @@ test('native tokenizer real missing FTS posting blocks deletion for ASCII, moder
       await assertNativeLongWordIdentity(f.shards[1], row, [term], { posting: false });
       assert.deepEqual(blockSnapshot(f.source), before);
       assert.deepEqual(sourceWrites(f), []);
-      const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      const checkpoint = await readCopyState(f.shards[0]);
       assert.equal(checkpoint.rows, 0);
       assert.equal(checkpoint.after, -1);
       assert.equal(checkpoint.pending.phase, 'copying');
@@ -1685,7 +1696,7 @@ test('native workerd tokenizer rejects real missing modernemoji-only and long UT
       assert.deepEqual(await nativeSnapshot(f.source), before);
       await assertNativeLongWordIdentity(f.shards[1], row, tokens, { posting: false });
       assert.deepEqual(sourceWrites(f), []);
-      const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      const checkpoint = await readCopyState(f.shards[0]);
       assert.equal(checkpoint.rows, 0);
       assert.equal(checkpoint.after, -1);
       assert.equal(checkpoint.pending.phase, 'copying');
@@ -1778,7 +1789,7 @@ test('native tokenizer rejects malformed schema readback and native clone errors
           assert.deepEqual(f.shards[1].rows('SELECT * FROM blocks'), [row]);
           assert.deepEqual(f.shards[1].rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?', ['"🫠"']),
             [{ rowid: row.id }], 'schema rejection must retain the genuine copied posting without authorizing source retirement');
-          const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+          const checkpoint = await readCopyState(f.shards[0]);
           assert.equal(checkpoint.rows, 0);
           assert.equal(checkpoint.after, -1);
           assert.equal(checkpoint.pending.phase, 'copying');
@@ -1799,7 +1810,7 @@ test('a changed maintenance revision after readback retains the source', async (
   assert.deepEqual(f.shards[0].rows('SELECT * FROM blocks'), [row]);
   assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [row]);
   assert.deepEqual(sourceWrites(f), []);
-  assert.equal((await readCheckpoint(f.shards[0], COPY_CHECKPOINT)).pending.phase, 'copying');
+  assert.equal((await readCopyState(f.shards[0])).pending.phase, 'copying');
 });
 
 test('durable checkpoints bind the exact source and ordered shard database identities', async (context) => {
@@ -1808,7 +1819,7 @@ test('durable checkpoints bind the exact source and ordered shard database ident
   await assert.rejects(copyFrozenIndex(f.args({ checkpointHook: (state) => {
     if (state.pending) throw new Error('stop with pending durable page');
   } })), /stop with pending durable page/);
-  const saved = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+  const saved = await readCopyState(f.shards[0]);
   assert.deepEqual(saved.identity, {
     format: 1, layout: INDEX_LAYOUT, source: f.source.id, shards: f.shards.map(({ id }) => id),
   });
@@ -1821,9 +1832,10 @@ test('durable checkpoints bind the exact source and ordered shard database ident
   await assert.rejects(copyFrozenIndex(f.args()), /different databases\/layout/);
   f.shards[1].id = originalShardId;
   await assert.rejects(copyFrozenIndex(f.args({ shards: [f.shards[0]] })), /different databases\/layout/);
-  await writeCheckpoint(f.shards[1], COPY_CHECKPOINT, saved);
+  await writeCopyCheckpoint(f.shards[1], saved, 0);
   await assert.rejects(copyFrozenIndex(f.args({ shards: [...f.shards].reverse() })), /different databases\/layout/);
-  await writeCheckpoint(f.shards[0], COPY_CHECKPOINT, { ...saved, identity: { ...saved.identity, layout: 'changed-layout' } });
+  const { generation } = await readCopyCheckpoint(f.shards[0]);
+  await writeCopyCheckpoint(f.shards[0], { ...saved, identity: { ...saved.identity, layout: 'changed-layout' } }, generation);
   await assert.rejects(copyFrozenIndex(f.args()), /different databases\/layout/);
   assert.deepEqual(sourceWrites(f), []);
   assert.equal(f.source.rows('SELECT COUNT(*) AS n FROM blocks')[0].n, 1);
@@ -1891,7 +1903,7 @@ test('unsafe legacy ID ranges are refused before checkpointing or copying', asyn
       const f = await fixture(child);
       seedBlocks(f.source, [block(id, 0)]);
       await assert.rejects(copyFrozenIndex(f.args()), /legacy block IDs exceed reserved safe copy range/);
-      assert.equal(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), null);
+      assert.equal(await readCopyState(f.shards[0]), null);
       assert.equal(f.trace.filter((event) => event.kind === 'batch').length, 0);
       assert.deepEqual(sourceWrites(f), []);
       assert.equal(f.source.rows('SELECT id FROM blocks')[0].id, id);
@@ -2078,7 +2090,7 @@ for (const operation of ['seed', 'reconcile']) {
     const before = catalogStarBytes(f.source), expected = expectedCatalog(f);
     const hashes = new Map(expected.stars.map((row) => [JSON.stringify([row.session_id, row.turn_key]),
       sha256(JSON.stringify(STAR_CATALOG_COLUMNS.map((column) => row[column])))]));
-    const copy = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+    const copy = await readCopyState(f.shards[0]);
     assert.ok(f.source.rows('SELECT seq FROM session_catalog_outbox').length > 0);
     f.trace.length = 0;
     const acknowledged = assertCatalogAcknowledgement(f, expected, operation);
@@ -2088,7 +2100,7 @@ for (const operation of ['seed', 'reconcile']) {
     assert.ok(acknowledged() > 0, 'outbox retirement requires actual complete catalog replication on every shard');
     assert.deepEqual(f.source.rows('SELECT * FROM session_catalog_outbox'), []);
     assert.deepEqual(catalogStarBytes(f.source), before);
-    assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), copy);
+    assert.deepEqual(await readCopyState(f.shards[0]), copy);
     for (const shard of f.shards) {
       assert.deepEqual(catalogSnapshot(shard), expected);
       assert.deepEqual(catalogStarBytes(shard), before);
@@ -2110,7 +2122,7 @@ for (const operation of ['seed', 'reconcile']) {
       });
     }
     const before = catalogStarBytes(f.source), expected = expectedCatalog(f);
-    const copy = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+    const copy = await readCopyState(f.shards[0]);
     const acknowledged = assertCatalogAcknowledgement(f, expected, operation);
     const result = await (operation === 'seed'
       ? seedCatalogWithNativeParameters(f.args()) : reconcileCatalogWithNativeParameters(f.args()));
@@ -2118,7 +2130,7 @@ for (const operation of ['seed', 'reconcile']) {
     assert.ok(acknowledged() > 0);
     assert.deepEqual(f.source.rows('SELECT * FROM session_catalog_outbox'), []);
     assert.deepEqual(catalogStarBytes(f.source), before);
-    assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), copy);
+    assert.deepEqual(await readCopyState(f.shards[0]), copy);
     for (const shard of f.shards) {
       assert.deepEqual(catalogSnapshot(shard), expected);
       assert.deepEqual(catalogStarBytes(shard), before);
@@ -2303,7 +2315,7 @@ test('a lost response after source deletion resumes its durable verified page wi
   };
   await assert.rejects(copyWithNativeParameters(f.args()), /lost response after committed source deletion/);
   assert.deepEqual(f.source.rows('SELECT * FROM blocks'), []);
-  const saved = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+  const saved = await readCopyState(f.shards[0]);
   assert.equal(saved.pending.phase, 'verified');
   assert.equal(saved.rows, 0);
   const snapshots = f.shards.map(blockSnapshot);
@@ -2626,7 +2638,7 @@ test('full-column source CAS independently rejects every changed scalar column, 
   assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), [untouched, ...changed],
     'the same-transaction source-empty assertion must roll back the unchanged neighbor too');
   assert.deepEqual(f.shards[0].rows('SELECT * FROM blocks ORDER BY id'), [untouched, ...originals]);
-  const pending = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+  const pending = await readCopyState(f.shards[0]);
   assert.equal(pending.pending.phase, 'verified');
   assert.equal(pending.rows, 0);
   assert.deepEqual(f.source.rows('SELECT name FROM sqlite_master WHERE name = ?', [SOURCE_FREEZE_TABLE]), [],
@@ -2660,7 +2672,7 @@ test('oversized per-field source CAS cannot delete a transcript changed only aft
   assert.equal(observedDeletion, true);
   assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [changed]);
   assert.deepEqual(f.shards[0].rows('SELECT * FROM blocks'), [original]);
-  const pending = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+  const pending = await readCopyState(f.shards[0]);
   assert.equal(pending.pending.phase, 'verified');
   assert.equal(pending.rows, 0);
   assert.deepEqual(f.source.rows('SELECT name FROM sqlite_master WHERE name = ?', [SOURCE_FREEZE_TABLE]), []);
@@ -2697,7 +2709,7 @@ test('a late source mutation aborts the whole verified deletion transaction and 
   assert.deepEqual(f.shards[0].rows('SELECT * FROM blocks ORDER BY id'), [untouched, original]);
   assert.deepEqual(f.shards[0].rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?', ['"verified_original_needle"']),
     [{ rowid: original.id }]);
-  const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+  const checkpoint = await readCopyState(f.shards[0]);
   assert.equal(checkpoint.pending.phase, 'verified');
   assert.equal(checkpoint.rows, 0);
   const deletions = sourceWrites(f);
@@ -2710,9 +2722,9 @@ test('a late source mutation aborts the whole verified deletion transaction and 
     'remaining-row verification must run in the SAME source transaction as the conditional deletion');
   assert.deepEqual(f.source.rows('SELECT name FROM sqlite_master WHERE name = ?', [SOURCE_FREEZE_TABLE]), [],
     'a failed comparison must occur before any source barrier allocation');
-  const beforeRetry = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+  const beforeRetry = await readCopyState(f.shards[0]);
   f.restart();
-  assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), beforeRetry);
+  assert.deepEqual(await readCopyState(f.shards[0]), beforeRetry);
   assertVerifiedBeforeDelete(f);
   const recovered = await copyFrozenIndex(f.args());
   assert.equal(recovered.state, 'complete');
@@ -2731,7 +2743,7 @@ async function frozenFirstPageFixture(context, beforeCopy) {
   await assert.rejects(copyFrozenIndex(f.args({ checkpointHook: (state) => {
     if (!state.pending && state.rows > 0 && state.state === 'pending') throw new Error('CI aborted after first frozen source page');
   } })), /CI aborted after first frozen source page/);
-  const saved = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+  const saved = await readCopyState(f.shards[0]);
   assert.ok(saved.rows > 100 && saved.rows <= 2048,
     'the first dense page must exceed the former tiny cap while respecting the native row and actual response-byte bounds');
   assert.equal(saved.pending, null);
@@ -2766,7 +2778,7 @@ test('the committed SQL barrier rejects pre-existing source writers after CI abo
     };
     assertOldWritesBlocked();
     f.restart();
-    assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), saved);
+    assert.deepEqual(await readCopyState(f.shards[0]), saved);
     assertOldWritesBlocked();
     assertVerifiedBeforeDelete(f);
     let observedCopyingTransaction = false;
@@ -2818,7 +2830,7 @@ test('malformed persisted copying state or missing source freeze triggers fails 
       assert.deepEqual(before, rows.slice(saved.rows));
       assert.deepEqual(f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), controlBefore);
       assert.deepEqual(sourceWrites(f), [], 'invalid committed barrier state must not be repaired into permission to delete');
-      assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), saved);
+      assert.deepEqual(await readCopyState(f.shards[0]), saved);
       restore();
       const completed = await copyFrozenIndex(f.args());
       assert.equal(completed.state, 'complete');
@@ -2855,7 +2867,7 @@ test('first source barrier DDL failure rolls back every verified deletion and re
   assert.deepEqual(f.source.rows(`SELECT name FROM sqlite_master
     WHERE name = ? OR name LIKE 'index_migration_blocks_%'`, [SOURCE_FREEZE_TABLE]), [],
   'rolled-back barrier DDL must leave no table or partially installed triggers');
-  const saved = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+  const saved = await readCopyState(f.shards[0]);
   assert.equal(saved.pending.phase, 'verified');
   assert.equal(saved.rows, 0);
   const sourceBatch = f.trace.find((event) => event.db === f.source.id && event.kind === 'batch');
@@ -3067,7 +3079,7 @@ test('durable initial activation resumes pending after failed real index verific
   const row = block(50_001, indexShardForSessionId(sid, 2), { session_id: sid, text: 'activation_verified_needle\u0000original_tail' });
   const f = await catalogFixture(context, [row], 3);
   await seedFrozenCatalog(f.args());
-  const copy = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+  const copy = await readCopyState(f.shards[0]);
   const seed = await readCheckpoint(f.shards[0], SEED_CHECKPOINT);
   const evidence = await verifyIndexRecords({ source: f.source, shards: f.shards, catalogConsistency: 'required' });
   assert.deepEqual(f.source.rows('SELECT * FROM session_catalog_outbox'), []);
@@ -3133,7 +3145,7 @@ test('actual controller phases persist readiness and activation only after all c
   };
   const activeGate = async () => healthFor('active');
   const proofs = async () => ({
-    copy: await readCheckpoint(f.shards[0], COPY_CHECKPOINT),
+    copy: await readCopyState(f.shards[0]),
     seed: await readCheckpoint(f.shards[0], SEED_CHECKPOINT),
     ready: await readCheckpoint(f.shards[0], READY_CHECKPOINT),
     activation: await readCheckpoint(f.shards[0], ACTIVATION_CHECKPOINT),
@@ -3237,7 +3249,7 @@ test('failed initial activation can abort and resume an intentional reseed witho
   const activeGate = async () => ({ ...health, indexMode: 'active', deploymentRevision: proofRevision });
   const persisted = async () => ({
     ...args(),
-    copy: await readCheckpoint(f.shards[0], COPY_CHECKPOINT),
+    copy: await readCopyState(f.shards[0]),
     seed: await readCheckpoint(f.shards[0], SEED_CHECKPOINT),
     ready: await readCheckpoint(f.shards[0], READY_CHECKPOINT),
     activation: await readCheckpoint(f.shards[0], ACTIVATION_CHECKPOINT),
@@ -3780,7 +3792,7 @@ test('first-page recovery removes unacknowledged shard rows and FTS for source I
     }
   } })), /malformed JSON/);
   assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [updated]);
-  const saved = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+  const saved = await readCopyState(f.shards[0]);
   assert.equal(saved.rows, 0);
   assert.equal(saved.pending.phase, 'verified');
   assert.deepEqual(f.source.rows('SELECT name FROM sqlite_master WHERE name = ?', [SOURCE_FREEZE_TABLE]), []);
@@ -3814,7 +3826,7 @@ test('a committed first-page writer barrier forbids checkpoint replan after lost
       await assert.rejects(copyFrozenIndex(f.args()), /lost committed first-page response/);
       assert.deepEqual(f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
       assert.deepEqual(f.source.rows('SELECT * FROM blocks'), []);
-      const originalProof = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      const originalProof = await readCopyState(f.shards[0]);
       assert.equal(originalProof.pending.phase, 'verified');
       assert.equal(originalProof.rows, 0);
       if (corruption === 'destination') {
@@ -3833,7 +3845,7 @@ test('a committed first-page writer barrier forbids checkpoint replan after lost
       f.restart();
       f.trace.length = 0;
       await assert.rejects(copyFrozenIndex(f.args()), /readback SHA-256 mismatch|frozen source changed/);
-      assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), originalProof,
+      assert.deepEqual(await readCopyState(f.shards[0]), originalProof,
         'an irreversible first-page commit must retain its original IDs and digests, never reset a proof to match corruption');
       assert.deepEqual(f.shards.map(blockSnapshot), destinationBefore);
       assert.deepEqual(sourceWrites(f), []);
@@ -4358,7 +4370,7 @@ test('copy preserves native rejection and retained source across semantic failur
         return true;
       });
       assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [original], 'no rejected phase authorizes source deletion');
-      const state = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      const state = await readCopyState(f.shards[0]);
       if (phase !== 'copy-setup') {
         assert.equal(state.rows, 0);
         assert.equal(state.pending.phase, phase === 'copy-source-delete-and-freeze' ? 'verified' : 'copying');
@@ -4417,7 +4429,7 @@ test('retirement failure diagnostics preserve the native error and source checkp
       await assert.rejects(copyWithNativeParameters(f.args({ checkpointHook: async (state) => {
         if (state.pending?.phase !== 'verified') return;
         verified = state;
-        assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), state);
+        assert.deepEqual(await readCopyState(f.shards[0]), state);
         if (scenario === 'wide-mismatch') {
           // Unique mismatch counts at every added ordinal catch column/group transposition.
           expected = originals.map((row, rowIndex) => ({ ...row, ...Object.fromEntries(
@@ -4470,7 +4482,7 @@ test('retirement failure diagnostics preserve the native error and source checkp
       assert.equal(retirementAttempts, 1, 'diagnostics never replay or ACK a rejected source batch');
       assert.equal(diagnosticQueries, ['request-budget', 'oversized'].includes(scenario) ? 0 : 1);
       assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), expected, 'every remaining source tuple survives');
-      assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), verified, 'no diagnostic checkpoint advance');
+      assert.deepEqual(await readCopyState(f.shards[0]), verified, 'no diagnostic checkpoint advance');
     });
   }
 });
@@ -4589,7 +4601,7 @@ test('retirement aggregate preserves exact storage classes and mixed storage byt
       });
       assert.equal(retirementAttempts, 1); assert.equal(diagnosticQueries, 1);
       assert.deepEqual(await physical(), retained);
-      assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), verified);
+      assert.deepEqual(await readCopyState(f.shards[0]), verified);
       assert.deepEqual(await f.source.query(`SELECT state FROM ${SOURCE_FREEZE_TABLE}`), [{ state: 'frozen' }]);
       // A separate read-only control changes only the public canonical snapshot.
       // Affinity-equal scalars must now expose the exact storage-class difference.
@@ -4606,7 +4618,7 @@ test('retirement aggregate preserves exact storage classes and mixed storage byt
       assert.deepEqual(summary[4].flat()[0], [0, 0, 0, 0, 0, 0],
         'the joined primary key is never a mismatched cell');
       assert.deepEqual(await physical(), retained);
-      assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), verified);
+      assert.deepEqual(await readCopyState(f.shards[0]), verified);
     });
   }
 });
@@ -4618,9 +4630,9 @@ test('row and malformed checkpoint validation do not disclose unknown metadata o
     () => canonicalRow([canary], { [canary]: true }),
     () => canonicalRow([canary], { [canary]: Infinity }),
   ]) assert.throws(action, (error) => !error.message.includes(canary));
-  await assert.rejects(readCheckpoint({
+  await assert.rejects(readCopyState({
     id: 'fixture', query: async () => [{ value: canary }],
-  }, COPY_CHECKPOINT), (error) => !error.message.includes(canary));
+  }), (error) => !error.message.includes(canary));
 });
 
 test('checkpoint classification refuses missing, boolean and unknown workflow state enums instead of treating them as completion', () => {
@@ -4768,7 +4780,7 @@ test('budget-limited native copy passes resume committed copying and verified pa
       } else time = 100;
       const control = sqliteCopyControl(child, f, { requestGate });
       assert.deepEqual(await runCopyPass(control.args), { status: 'partial', reason: 'pass-budget-exhausted' });
-      const saved = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      const saved = await readCopyState(f.shards[0]);
       if (boundary === 'before-first-request') {
         assert.equal(saved, null);
         assert.deepEqual(control.requests, []);
@@ -4810,7 +4822,7 @@ test('budget-limited native copy passes resume committed copying and verified pa
       });
       assertCopied(f, rows);
       assert.deepEqual(f.source.rows(`SELECT * FROM ${SOURCE_FREEZE_TABLE}`), [{ id: 1, state: 'frozen' }]);
-      const completed = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      const completed = await readCopyState(f.shards[0]);
       assert.equal(completed.state, 'complete');
       assert.equal(completed.pending, null);
       assert.equal(completed.rows, rows.length);
@@ -4856,7 +4868,7 @@ test('valid 429 waits cannot reach or cross the copy pass deadline, but an affor
         assert.deepEqual(waits, []);
         assert.equal(attempts, 1);
         assert.deepEqual(f.trace, []);
-        assert.equal(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), null);
+        assert.equal(await readCopyState(f.shards[0]), null);
         assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [block(40_301, 0)]);
       } else {
         assert.deepEqual(await control.args.source.query('SELECT id FROM blocks'), [{ id: 40_301 }]);
@@ -4895,7 +4907,7 @@ test('copy pass never turns native HTTP 400 or ambiguous network failures into p
       });
       assert.equal(attempts, 1);
       assert.deepEqual(f.trace, []);
-      assert.equal(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), null);
+      assert.equal(await readCopyState(f.shards[0]), null);
       assert.deepEqual(f.source.rows('SELECT * FROM blocks'), [original]);
     });
   }
@@ -4976,7 +4988,7 @@ async function copyCliFixture(context) {
         const verifiedRows = assertVerifiedBeforeDelete(f);
         const checkpoint = () => {
           const saved = f.shards[0].rows('SELECT value FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT]);
-          return saved.length ? JSON.parse(saved[0].value) : null;
+          return saved.length ? JSON.parse(saved[0].value).state : null;
         };
         const verifiedPending = () => {
           const saved = checkpoint();
@@ -5624,9 +5636,10 @@ test('native full-copy control runs real SQLite schema, copier, independent read
   assert.equal(sourceFtsWrites.length, 1);
   assert.equal(sourceFtsWrites[0].transaction, seed.transaction,
     'source retirement must leave the originally seeded legacy FTS pages unchanged');
-  const copying = shards[0].trace.filter(({ sql, params }) => /^INSERT INTO index_migration_state\b/.test(sql)
-    && params[0] === COPY_CHECKPOINT && JSON.parse(params[1]).pending?.phase === 'copying')
-    .map(({ params }) => JSON.parse(params[1]));
+  const copyWrite = /^(?:INSERT INTO|UPDATE) index_migration_state\b/;
+  const copying = shards[0].trace.filter(({ sql, params, rows }) => copyWrite.test(sql) && rows?.length === 1
+    && params[0] === COPY_CHECKPOINT && JSON.parse(params[1]).state.pending?.phase === 'copying')
+    .map(({ params }) => JSON.parse(params[1]).state);
   assert.deepEqual(copying[0].pending.rows.map(({ id }) => id), [0, ...denseIds],
     'growth must not alter the original first dense source-page geometry');
   assert.deepEqual(copying.flatMap(({ pending }) => pending.rows.map(({ id }) => id)), copied.map(({ id }) => id));
@@ -5742,14 +5755,23 @@ test('native full-copy control runs real SQLite schema, copier, independent read
   assert.ok(statements.every(({ params }) => params.length <= 100));
   assert.ok(statements.every(({ responseBytes }) => responseBytes === undefined || responseBytes <= 1_048_576),
     'full-row and independent readback responses stay within the ordinary response budget');
-  const retainedCheckpoint = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+  const retainedCheckpoint = await readCopyState(shards[0]);
   assert.equal(retainedCheckpoint.state, 'complete');
   assert.equal(retainedCheckpoint.encoding, COPY_ENCODING);
   assert.equal(retainedCheckpoint.rows, recovery.rows);
   assert.equal(retainedCheckpoint.pending, null);
-  assert.ok(shards[0].trace.some(({ sql, params }) => /^INSERT INTO index_migration_state\b/.test(sql)
-    && params[0] === COPY_CHECKPOINT && JSON.parse(params[1]).state === 'complete'
-    && JSON.parse(params[1]).rows === result.rows), 'the full positive proof must complete before its scratch-only checkpoint reset');
+  const positiveComplete = adapters[1].trace.find(({ sql, params, rows }) => copyWrite.test(sql) && rows?.length === 1
+    && params[0] === COPY_CHECKPOINT && JSON.parse(params[1]).state.state === 'complete'
+    && JSON.parse(params[1]).state.rows === result.rows);
+  assert.ok(positiveComplete, 'the full positive proof must complete before its scratch-only checkpoint reset');
+  const fenceRejections = adapters[1].trace.filter(({ kind, sql, params, success, rows }) => kind === 'query' && success
+    && copyWrite.test(sql) && params[0] === COPY_CHECKPOINT && rows.length === 0);
+  assert.deepEqual(fenceRejections.map(({ sql, params }) => [sql.split(' ')[0], params.length,
+    JSON.stringify(JSON.parse(params[1]).state)]), [
+    ['UPDATE', 3, JSON.stringify(JSON.parse(positiveComplete.params[1]).state)],
+    ['INSERT', 2, JSON.stringify(JSON.parse(positiveComplete.params[1]).state)],
+  ], 'the stale transition replay and stale insert execute natively once each and match zero rows');
+  assert.equal(fenceRejections[0].params[2], JSON.parse(positiveComplete.params[1]).generation);
   assert.deepEqual(account.snapshot(), before);
   assert.equal(account.created.length, 3);
   assert.equal(new Set(account.created.map(({ name }) => name)).size, 3);
@@ -5768,7 +5790,7 @@ test('native proof rejects an unrelated failure before byte-exact recovery inste
       if (exercised || sql !== "SELECT hex(unhex('61FF62')) AS bytes") return;
       exercised = true;
       sourceBefore = blockSnapshot(databases.source);
-      checkpointBefore = await readCheckpoint(databases.shards[0], COPY_CHECKPOINT);
+      checkpointBefore = await readCopyState(databases.shards[0]);
       sourceTraceStart = databases.source.trace.length;
       assert.equal(checkpointBefore.state, 'complete');
       assert.equal(checkpointBefore.rows, 1509);
@@ -5785,7 +5807,7 @@ test('native proof rejects an unrelated failure before byte-exact recovery inste
   });
   assert.equal(exercised, true);
   assert.deepEqual(blockSnapshot(adapters[0]), sourceBefore);
-  assert.deepEqual(await readCheckpoint(adapters[1], COPY_CHECKPOINT), checkpointBefore);
+  assert.deepEqual(await readCopyState(adapters[1]), checkpointBefore);
   assert.deepEqual(adapters[0].trace.slice(sourceTraceStart).filter(({ sql }) => sql && isWrite(sql)), []);
   assert.deepEqual(adapters[0].rows('SELECT id FROM blocks'), []);
   assert.deepEqual(adapters[0].rows(`SELECT state FROM ${SOURCE_FREEZE_TABLE}`), [{ state: 'frozen' }]);
@@ -5805,7 +5827,7 @@ test('native byte-exact recovery refuses nullable transport and false or unavail
       const capture = async (databases) => {
         exercised = true;
         sourceBefore = await publicRawSnapshot(databases.source);
-        checkpointBefore = await readCheckpoint(databases.shards[0], COPY_CHECKPOINT);
+        checkpointBefore = await readCopyState(databases.shards[0]);
         sourceTraceStart = databases.source.trace.length;
       };
       proof.applySchema = async (databases) => {
@@ -5858,7 +5880,7 @@ test('native byte-exact recovery refuses nullable transport and false or unavail
       });
       assert.equal(exercised, true);
       assert.deepEqual(await publicRawSnapshot(adapters[0]), sourceBefore);
-      assert.deepEqual(await readCheckpoint(adapters[1], COPY_CHECKPOINT), checkpointBefore);
+      assert.deepEqual(await readCopyState(adapters[1]), checkpointBefore);
       assert.deepEqual(adapters[0].trace.slice(sourceTraceStart).filter(({ sql }) => sql && isWrite(sql)), [],
         'a failed raw read or aggregate must never repair, delete or ACK by a fallback');
       assert.deepEqual(adapters[0].rows(`SELECT state FROM ${SOURCE_FREEZE_TABLE}`), [{ state: 'frozen' }]);
@@ -5888,7 +5910,7 @@ test('native proof actual batched BLOB slice faults retain growth source and blo
           const actual = await execute(statements);
           if (exercised || !statements.length || !statements.every(({ sql }) => /^SELECT hex\(substr/.test(sql))
             || !statements.some(({ params }) => params[2] > 1461 && params[2] < INDEX_ID_SPAN - 1)) return actual;
-          const checkpoint = await readCheckpoint(databases.shards[0], COPY_CHECKPOINT);
+          const checkpoint = await readCopyState(databases.shards[0]);
           if (checkpoint?.pending?.phase !== 'verified') return actual;
           checkpointBefore = checkpoint;
           sourceBefore = blockSnapshot(databases.source);
@@ -5923,7 +5945,7 @@ test('native proof actual batched BLOB slice faults retain growth source and blo
       });
       assert.equal(exercised, true);
       assert.deepEqual(blockSnapshot(adapters[0]), sourceBefore, 'a rejected native slice batch must retain every exact source field and physical FTS page');
-      assert.deepEqual(await readCheckpoint(adapters[1], COPY_CHECKPOINT), checkpointBefore);
+      assert.deepEqual(await readCopyState(adapters[1]), checkpointBefore);
       assert.deepEqual(adapters[0].trace.slice(sourceTraceStart).filter(({ sql }) => sql && isWrite(sql)), [],
         'no source ACK or fence write may follow rejected independent full-byte evidence');
       assert.deepEqual(account.snapshot(), beforeAccount);
@@ -6038,7 +6060,7 @@ test('copier invariant codes identify physical FTS and SHA failures and an incom
       });
       assert.equal(mutated, true);
       assert.deepEqual(f.source.rows('SELECT * FROM blocks'), fault === 'delete-response' ? [] : [original]);
-      const state = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      const state = await readCopyState(f.shards[0]);
       assert.equal(state.rows, 0);
       assert.equal(state.pending.phase, fault === 'delete-response' ? 'verified' : 'copying');
       if (fault === 'delete-response') {
@@ -6161,7 +6183,7 @@ test('shared copier transport invariants preserve source and destination readbac
         assert.deepEqual(blockSnapshot(f.source), before, 'an invariant rejection cannot authorize source deletion or FTS mutation');
         assert.deepEqual(sourceWrites(f), []);
         assert.deepEqual(f.shards[1].rows('SELECT * FROM blocks'), []);
-        const state = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+        const state = await readCopyState(f.shards[0]);
         assert.equal(state.rows, 0);
         assert.equal(state.pending?.phase ?? null,
           side === 'source-initial' && invariant !== 'changed-slice' ? null : 'copying');
@@ -6206,7 +6228,7 @@ test('native proof preserves source-versus-readback phase for real copier scalar
               'SELECT value FROM index_migration_state WHERE name = ?', [COPY_CHECKPOINT],
             )[0];
             if (!checkpoint) return rows;
-            const state = JSON.parse(checkpoint.value);
+            const { state } = JSON.parse(checkpoint.value);
             if (state.state !== 'pending'
               || (state.pending?.phase ?? null) !== (side === 'destination' ? 'copying' : null)) return rows;
             assert.equal(state.identity.source, databases.source.id);
@@ -6246,7 +6268,7 @@ test('native proof preserves source-versus-readback phase for real copier scalar
         assert.ok(authoritativeRows.length > 0);
         assert.deepEqual(adapters[0].rows('SELECT * FROM blocks ORDER BY id'), authoritativeRows,
           'every full source row at the rejected boundary remains authoritative, including dense rows on the pending page');
-        const checkpoint = await readCheckpoint(adapters[1], COPY_CHECKPOINT);
+        const checkpoint = await readCopyState(adapters[1]);
         assert.deepEqual(checkpoint, armedCheckpoint, 'rejection cannot advance or verify the durable copy checkpoint');
         assert.equal(checkpoint.pending?.phase ?? null, side === 'destination' ? 'copying' : null);
         if (invariant === 'long-slice') {
@@ -6639,7 +6661,7 @@ for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerd
     await assert.rejects(copyWithNativeParameters(f.args({ checkpointHook: (state) => {
       if (state.pending?.phase === 'copying') throw copyingStop;
     } })), (error) => error === copyingStop);
-    const copying = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+    const copying = await readCopyState(f.shards[0]);
     const originalPage = copying.pending.rows.map(({ id }) => originals.get(id));
     const canonicalBytes = Buffer.byteLength(JSON.stringify(originalPage.map((row) => columns.map((column) => row[column]))));
     const typedBytes = Buffer.byteLength(JSON.stringify(originalPage.map((row) => columns.map((column) =>
@@ -6653,7 +6675,7 @@ for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerd
     await assert.rejects(copyWithNativeParameters(f.args({ checkpointHook: (state) => {
       if (state.pending?.phase === 'verified') throw verifiedStop;
     } })), (error) => error === verifiedStop);
-    const verified = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+    const verified = await readCopyState(f.shards[0]);
     assert.deepEqual(verified.pending.rows, copying.pending.rows, 'transport groups cannot trim or rehash a durable logical page');
     assert.deepEqual(verified.pending.types, copying.pending.types);
     assert.deepEqual(await publicRawSnapshot(f.source, columns), before);
@@ -6690,7 +6712,7 @@ for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerd
     if (f.source instanceof SqliteD1) assert.equal(provisionallyDeleted, true);
     assert.deepEqual(await publicRawSnapshot(f.source, columns), changed,
       'a failed later CAS must roll back every earlier subgroup deletion');
-    assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), verified);
+    assert.deepEqual(await readCopyState(f.shards[0]), verified);
     assert.deepEqual(await f.source.rows('SELECT name FROM sqlite_master WHERE name=?', [SOURCE_FREEZE_TABLE]), [],
       'no first-page freeze may commit after partial subgroup retirement');
     const failed = f.trace.find((event) => event.db === f.source.id && event.kind === 'batch'
@@ -6798,7 +6820,7 @@ async function publicLegacyPending(context, createFixture, { count = 420, phase 
     sha256: rowDigest(BLOCK_COLUMNS, row) }));
   const state = { ...prefix, state: 'pending', pending: { phase, rows: pendingRows } };
   delete state.encoding;
-  await writeCheckpoint(f.shards[0], COPY_CHECKPOINT, state);
+  await writeCopyCheckpoint(f.shards[0], state, (await readCopyCheckpoint(f.shards[0])).generation);
   const exactRows = rows.map((row) => ({ ...row, ...Object.fromEntries(Object.entries(cells.get(row.id) ?? {})
     .map(([column, bytes]) => [column, { x: bytes.toString('hex') }])) }));
   return Object.assign(f, { prefix, legacy: state, rows, cells, exactPending: exactRows.map((row) =>
@@ -6908,9 +6930,9 @@ test('byte-exact legacy recovery refuses source/destination tamper, physical FTS
           if (state.pending?.phase === 'recovering') throw new Error('public stop');
         } })), /public stop/);
       }
-      const state = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
-      if (fault === 'unknown-encoding') { state.encoding = 'future-unknown'; await writeCheckpoint(f.shards[0], COPY_CHECKPOINT, state); }
-      if (fault === 'unknown-recovery') { state.pending.recovery.unknown = true; await writeCheckpoint(f.shards[0], COPY_CHECKPOINT, state); }
+      const { generation, state } = await readCopyCheckpoint(f.shards[0]);
+      if (fault === 'unknown-encoding') { state.encoding = 'future-unknown'; await writeCopyCheckpoint(f.shards[0], state, generation); }
+      if (fault === 'unknown-recovery') { state.pending.recovery.unknown = true; await writeCopyCheckpoint(f.shards[0], state, generation); }
       if (fault === 'destination' || fault === 'recovery-destination') await f.shards[0].query("UPDATE blocks SET role = 'changed' WHERE id = ?", [f.rows[0].id]);
       if (fault === 'physical-fts') await f.shards[0].query(
         "INSERT INTO blocks_fts (blocks_fts,rowid,text) SELECT 'delete',id,text FROM blocks WHERE id = ?", [f.rows[0].id]);
@@ -6922,11 +6944,11 @@ test('byte-exact legacy recovery refuses source/destination tamper, physical FTS
         { sql: `UPDATE ${SOURCE_FREEZE_TABLE} SET state = 'frozen' WHERE id = 1`, params: [] },
       ]);
       const before = await publicRawSnapshot(f.source);
-      const checkpoint = await readCheckpoint(f.shards[0], COPY_CHECKPOINT);
+      const checkpoint = await readCopyState(f.shards[0]);
       f.trace.length = 0;
       await assert.rejects(copyWithNativeParameters(f.args()));
       assert.deepEqual(await publicRawSnapshot(f.source), before);
-      assert.deepEqual(await readCheckpoint(f.shards[0], COPY_CHECKPOINT), checkpoint);
+      assert.deepEqual(await readCopyState(f.shards[0]), checkpoint);
       assert.deepEqual(sourceWrites(f), []);
       assert.ok(!f.trace.some((event) => event.kind === 'batch' && event.statements.some(({ sql }) => /INSERT INTO blocks \(/.test(sql))),
         'invalid recovery proof cannot authorize a destination repair');
