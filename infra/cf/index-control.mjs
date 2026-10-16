@@ -18,6 +18,8 @@ import {
   d1SqlFailureMetadata, verifyD1BatchAtomicity,
 } from './d1-batch-atomicity.mjs';
 import { sharedCloudflareApiPermit } from '../../hub/scripts/lib/cloudflare-api-budget.mjs';
+import { createMigrationProgressReporter } from './migration-progress.mjs';
+import { createMigrationTelemetry } from '../azure/migration-telemetry.mjs';
 
 const MAIN_ID = '5ff65cf3-89c8-4fe6-a3c2-a370293ecea6';
 const FREEZE_CHECKPOINT = 'index-maintenance-freeze-v1';
@@ -48,15 +50,60 @@ export function createCopyPassRequestGate(budgetMs, { now = Date.now } = {}) {
   };
 }
 
-/** Only the explicit boundary exception is a resumable partial pass. */
-export async function runCopyPass({ source, shards, gate }) {
+/**
+ * Only the explicit boundary exception is a resumable partial pass. `progress` is
+ * optional telemetry (`createMigrationProgressReporter` options): one terminal
+ * event per pass, complete/partial/failed, with no error detail; never a result.
+ */
+export async function runCopyPass({ source, shards, gate, progress }) {
+  const reporter = progress ? createMigrationProgressReporter(progress) : null;
+  let status = 'failed';
   try {
-    const copied = await copyFrozenIndex({ source, shards, gate });
+    const copied = await copyFrozenIndex({ source, shards, gate, progress: reporter && {
+      observe: reporter.observe, isPassBoundary: (error) => error instanceof CopyPassBudgetExhausted,
+    } });
+    status = 'complete';
     return { copiedRows: copied.rows, state: copied.state, sha256: copied.sha256 };
   } catch (error) {
     if (!(error instanceof CopyPassBudgetExhausted)) throw error;
+    status = 'partial';
     return { status: 'partial', reason: 'pass-budget-exhausted' };
+  } finally {
+    reporter?.finish(status);
   }
+}
+
+const TELEMETRY_WARNING_COUNTS = ['httpStatus', 'sentEvents', 'failedEvents', 'coalescedEvents', 'droppedEvents'];
+
+// Only allowlisted aggregate fields reach CI logs: a code and safe integer counts.
+function printTelemetryWarning(warning) {
+  const code = typeof warning?.code === 'string' && /^[a-z0-9-]{1,64}$/.test(warning.code) ? warning.code : 'unknown';
+  const counts = TELEMETRY_WARNING_COUNTS.filter((key) => Number.isSafeInteger(warning?.[key]) && warning[key] >= 0)
+    .map((key) => [key, warning[key]]);
+  console.log(JSON.stringify({ event: 'migration.telemetry.warning', code, ...Object.fromEntries(counts) }));
+}
+
+/** Correlated stdout + Azure progress sink for one protected copy pass; never throws. */
+async function copyProgressSink(revision) {
+  const identifier = (value) => (decimalIdentifier(value) ? value : null);
+  const correlation = {
+    revision: typeof revision === 'string' && /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(revision) ? revision : null,
+    runId: identifier(process.env.GITHUB_RUN_ID), attempt: identifier(process.env.GITHUB_RUN_ATTEMPT),
+  };
+  const warn = (warning) => { try { printTelemetryWarning(warning); } catch { /* Logging only. */ } };
+  let telemetry = null;
+  try { telemetry = await createMigrationTelemetry({ env: process.env, warn }); }
+  catch { warn({ code: 'telemetry-unavailable' }); }
+  return {
+    emit(event) {
+      const record = { ...event, ...correlation };
+      try { console.log(JSON.stringify(record)); } catch { /* Logging only. */ }
+      try { telemetry?.emit(record); } catch { /* Telemetry never reaches the copy. */ }
+    },
+    async close() {
+      try { await telemetry?.close(); } catch { /* Never masks the copy outcome. */ }
+    },
+  };
 }
 
 export function requireProtectedProduction(env = process.env) {
@@ -621,16 +668,26 @@ async function main() {
       || !Number.isSafeInteger(atomicity.verifiedAt) || atomicity.verifiedAt <= 0 || atomicity.verifiedAt > Date.now()) {
       throw new Error('this deployment has no verified native D1 REST batch atomicity/text transport control; source copy forbidden');
     }
-    // Setup/drain/atomicity prerequisites stay unbudgeted. Copy data requests and
-    // fresh health gates share this process's non-persisted pass boundary.
-    const requestGate = args['pass-budget-ms'] === undefined ? undefined
-      : createCopyPassRequestGate(Number(args['pass-budget-ms']));
-    const copyApi = requestGate ? indexControlClient(account, process.env.CLOUDFLARE_API_TOKEN, { requestGate }) : api;
-    const result = await runCopyPass({
-      source: copyApi.db(config.d1_databases[0].database_id),
-      shards: config.d1_databases.slice(1).map((db) => copyApi.db(db.database_id)),
-      gate: async () => await health(config, 'maintenance', { command, requestGate }),
-    });
+    // The telemetry sink is prepared once, outside the copy budget, and closes even
+    // on failure. Its final warnings precede the unchanged result line, which stays
+    // the last stdout line; a failed pass prints no result and keeps its own error.
+    const sink = await copyProgressSink(config.vars.DEPLOYMENT_REVISION);
+    let result;
+    try {
+      // Setup/drain/atomicity prerequisites stay unbudgeted. Copy data requests and
+      // fresh health gates share this process's non-persisted pass boundary.
+      const requestGate = args['pass-budget-ms'] === undefined ? undefined
+        : createCopyPassRequestGate(Number(args['pass-budget-ms']));
+      const copyApi = requestGate ? indexControlClient(account, process.env.CLOUDFLARE_API_TOKEN, { requestGate }) : api;
+      result = await runCopyPass({
+        source: copyApi.db(config.d1_databases[0].database_id),
+        shards: config.d1_databases.slice(1).map((db) => copyApi.db(db.database_id)),
+        gate: async () => await health(config, 'maintenance', { command, requestGate }),
+        progress: { emit: sink.emit },
+      });
+    } finally {
+      await sink.close();
+    }
     console.log(JSON.stringify(result));
     if (result.status === 'partial') process.exitCode = 78;
   } else if (command === 'seed-catalog') {

@@ -13,7 +13,7 @@
     "deploy": "node -e \"console.error('Production deployment is protected main CI only; do not authenticate production locally.'); process.exit(1)\"",
     "deploy:preview": "node scripts/deploy-preview.mjs",
     "typecheck": "tsc --noEmit && tsc --noEmit -p tsconfig.e2e.json",
-    "test": "vitest run && npm run test:migrations && npm run test:cloudflare-api-budget && npm run test:dev-lifecycle && npm run test:preview-open && npm run test:preview-upload && npm run test:preview-seed && npm run test:preview-smoke && npm run test:provision-queues",
+    "test": "vitest run && npm run test:migrations && npm run test:migration-progress && npm run test:cloudflare-api-budget && npm run test:dev-lifecycle && npm run test:preview-open && npm run test:preview-upload && npm run test:preview-seed && npm run test:preview-smoke && npm run test:provision-queues",
     "test:e2e": "playwright test",
     "test:dev-lifecycle": "node --test test/dev-lifecycle.node.test.mjs",
     "test:preview-open": "node --test test/preview-open.node.test.mjs",
@@ -22,6 +22,7 @@
     "test:preview-smoke": "node --test test/preview-control-smoke.node.test.mjs",
     "test:provision-queues": "node --test test/provision-queues.node.test.mjs",
     "test:migrations": "node --test test/migrations.acceptance.mjs test/index-migration.node.test.mjs test/catalog-migrations.node.test.mjs",
+    "test:migration-progress": "node --test test/migration-telemetry.node.test.mjs test/monitor-main-run.node.test.mjs",
     "test:cloudflare-api-budget": "node --test test/cloudflare-api-budget.node.test.mjs",
     "migrations": "node scripts/migrations.mjs"
   },

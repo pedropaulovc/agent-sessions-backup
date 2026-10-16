@@ -1069,7 +1069,7 @@ Catalog seeding has durable checkpoints, and a completed copy can be revalidated
 even after legacy blocks are retired. A hard timeout is not the explicit partial
 result below: inspect the failed operation and durable state before continuing.
 
-A budget stop emits exactly `{"status":"partial","reason":"pass-budget-exhausted"}`
+A budget stop prints the result line exactly `{"status":"partial","reason":"pass-budget-exhausted"}`
 and exits **78**, leaving the job failed and production in maintenance with consumers
 detached. It does not mark the copy complete or acknowledge additional rows. Subsequent
 main migrations, catalog seeding, activation, and consumer restoration do not run.
@@ -1095,6 +1095,56 @@ Cloudflare documents
 [unlimited HTTP duration while a client remains connected](https://developers.cloudflare.com/workers/platform/limits/#duration).
 Do not treat the queue/cron drain as proof that old HTTP writes have ended. The SQL
 barrier, exact full-column compare/delete, and transaction rollback are that proof.
+
+### Copy progress telemetry
+
+`copy` prints progress as JSON lines on stdout before its unchanged final result line
+(failed passes print no result line; stderr keeps the redacted error). Each
+`migration.copy.progress` event (`schemaVersion: 1`, from
+`infra/cf/migration-progress.mjs`) is flat and aggregate-only: `status`
+(`running`, then exactly one terminal `complete`/`partial`/`failed` with no error
+text), `phase` (`initializing`, `recovering`, `planning`, `copying`, `verifying`,
+`retiring`, `finalizing`, `complete`; anything else is `unknown`), `recordedAt`,
+`elapsedMs`, `acknowledgedRows`, `passRows`, `pendingRows`, `rowsPerSecond`,
+`remainingRows`, `etaSeconds` and `lastProgressAt`, plus the CLI's `revision`,
+`runId` and `attempt` (null unless well-formed). No database or session ID, cursor,
+digest, SQL or text is ever included. The same records go to the Azure sink from
+`infra/azure/migration-telemetry.mjs` (see `telemetry.md`); sink problems print one
+`migration.telemetry.warning` line with an allowlisted code and aggregate counts,
+and never change the copy outcome.
+
+Counters come only from durable state: the validated stored copy checkpoint at
+start, then each fenced checkpoint write whose single-row witness returned. An
+attempted, rejected, or response-lost write is never reported, so a resumed pass
+starts from the stored count (`passRows: 0`) and `null` means not yet known, never
+zero. `lastProgressAt` is the time this process observed a durable ACK increase; the
+initially stored count, heartbeats and phase changes never set it.
+`rowsPerSecond` is the unrounded ACK delta over at most the last ten minutes (a
+shorter span only at startup or when the bounded sample history no longer reaches
+that far), falls to 0 once no ACK lands within the window, and stays null until
+this pass acknowledges a page. `etaSeconds` is the remaining count divided by that
+same published rate, rounded up.
+
+`remainingRows` comes from one bounded `COUNT(*)` of source rows past the durable
+cursor, issued once per pass and only once the source is provably frozen: the
+stored checkpoint already acknowledges rows. That ACK is a separate fenced
+destination write, made only after the source retirement transaction that
+installs the freeze barrier has committed. Before that, maintenance
+does not stop a late in-flight source write, so a fresh copy reports `null`
+until its first ACK. The stored state must also be unambiguous: no pending page,
+or a page still `copying` (source retirement requires the persisted `verified`
+transition first). A `verified` or `recovering` page may already be deleted
+without its ACK, so the count waits until that page is acknowledged.
+The read uses the copy's request budget; a budget stop there is still the partial
+result, while any other failure leaves `remainingRows` and `etaSeconds` null for
+the pass. `etaSeconds` exists only with both a known remainder and a positive rate.
+
+Events are emitted at start, when counters first become known, on coarse stage
+changes (setup, legacy recovery, the page loop, finalizing), every 30 seconds by
+heartbeat, and once at the end. Per-page steps (`planning` → `copying` →
+`verifying` → `retiring`) appear only in the next heartbeat's `phase`, bounding log
+volume. Heartbeats read nothing from D1 and never block a checkpoint; the timer is
+cleared at the terminal event, after which nothing is emitted.
 
 ## Standing preview deployment
 

@@ -272,3 +272,167 @@ export, its destinations live in the same shared namespace as
 `agent-backup-azure-{logs,traces}`. Double-check destination names don't
 collide before creating them — there's no CLI to list them either; check the
 dashboard (Workers & Pages → Observability → Pipelines).
+
+## Protected migration progress (GitHub Actions → Azure)
+
+The production copy CLI also writes aggregate `migration.copy.progress` events
+directly to the **same existing DCR OTLP logs endpoint**. This is a separate
+credential path from the Worker gateway: GitHub's protected `production`
+environment exchanges its OIDC assertion for the existing
+`mi-agent-backup-cloudflare-wu2` identity's DCR-scoped Monitoring Metrics Publisher
+token. No gateway bearer, Azure key, collector change, or Cloudflare login is
+required. The existing `cf-worker-federation` credential stays untouched.
+
+Provision only this additional trust, using the owner's Azure login:
+
+```sh
+node infra/azure/provision-migration-federation.mjs --observe
+node infra/azure/provision-migration-federation.mjs --apply
+```
+
+This helper pins the existing subscription, tenant, identity and DCR, checks the
+existing publisher role, and creates only `migration-github-production` when
+absent. It refuses credential drift instead of rewriting trust. It does **not**
+run `provision.sh`, change roles, deploy Workers, or update alerts/workbooks.
+The exact trust is issuer `https://token.actions.githubusercontent.com`, audience
+`api://AzureADTokenExchange`, subject
+`repo:pedropaulovc/agent-sessions-backup:environment:production`.
+
+Copy the helper's three **nonsecret** `variables` values into GitHub environment
+`production` variables:
+
+| Variable | Value source |
+|---|---|
+| `MIGRATION_AZURE_TENANT_ID` | Existing Azure tenant |
+| `MIGRATION_AZURE_CLIENT_ID` | Existing managed identity's client ID, not principal ID |
+| `MIGRATION_AZURE_LOGS_ENDPOINT` | Full DCE/DCR immutable-ID `/streams/Microsoft-OTLP-Logs/otlp/v1/logs` URL |
+
+Only the deploy job has `id-token: write`; previews and PR tests receive neither
+this permission nor these environment variables. Production authentication uses
+only `ACTIONS_ID_TOKEN_REQUEST_URL` / `ACTIONS_ID_TOKEN_REQUEST_TOKEN`; there is no
+environment-variable access-token override. GitHub and Entra redirects are
+rejected. Endpoint validation limits credential-bearing requests to GitHub
+Actions OIDC, `login.microsoftonline.com`, and Azure Monitor's OTLP logs route.
+The token is cached with a 60-second refresh margin, and a fresh GitHub assertion
+is requested on refresh, including during multi-hour copies.
+
+The sink reuses `hub/gateway/otlp-protobuf.ts` through a **configured-only dynamic
+import**. CI pins Node **22.22.2**, whose native type stripping supports that
+encoder without build output or dependencies. Configured standalone telemetry
+requires native type stripping (older Node 22 releases may require
+`--experimental-strip-types`); unconfigured local/preview copy invocations never
+import TypeScript. An unavailable encoder produces a typed warning rather than
+breaking copying.
+
+`createMigrationTelemetry({ env, fetch?, now?, warn?, getAccessToken? })` resolves
+to `{ emit(event), close() }`. `emit` is synchronous/nonblocking and copies only
+the aggregate event allowlist plus full revision/run/attempt correlation. It
+keeps one in-flight event and at most one newest pending event, coalescing older
+pending heartbeats. Each network operation has a one-second deadline; `close()`
+has a separate one-second total flush deadline. Its synchronous deadline/summary
+warnings are emitted before it resolves; no diagnostics or follow-on HTTP
+requests are issued after close, even if an existing request ignores abort and
+settles later. Delivery, including the terminal Azure event, is best-effort,
+with no replay/retry loop and no telemetry I/O in checkpoint ACKs. Failures produce
+`migration.telemetry.warning` codes and aggregate delivery counts, never tokens,
+headers, upstream bodies, errors, row IDs, hashes, or session text. CLI stdout
+remains the independent progress record if Azure delivery fails.
+
+### Verify ingestion without Cloudflare credentials
+
+Use the owner's existing authorized Azure session for a **smoke only**. The
+programmatic `getAccessToken({ signal })` injection returns a token string and
+exists for tests/this smoke; production does not use it. Keep a smoke's run ID
+separate from any real/protected workflow (for example synthetic run ID `1`) so
+its unknown counters cannot be mistaken for real migration evidence.
+
+With the three nonsecret variables exported and `SMOKE_REVISION` set to the
+feature's full SHA, run from the repository root:
+
+```sh
+node --input-type=module <<'NODE'
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { createMigrationTelemetry } from './infra/azure/migration-telemetry.mjs';
+const execute = promisify(execFile);
+// Fetch once outside the sink's one-second callback deadline. Never print the token.
+const { stdout } = await execute('az', ['account', 'get-access-token',
+  '--resource', 'https://monitor.azure.com', '--query', 'accessToken', '-o', 'tsv'],
+  { timeout: 30_000, maxBuffer: 64 * 1024 });
+const warnings = [];
+const sink = await createMigrationTelemetry({
+  getAccessToken: async () => stdout.trim(),
+  warn: (event) => { warnings.push(event); console.warn(JSON.stringify(event)); },
+});
+sink.emit({
+  event: 'migration.copy.progress', schemaVersion: 1, status: 'running', phase: 'unknown',
+  revision: process.env.SMOKE_REVISION, runId: '1', attempt: '1',
+  recordedAt: new Date().toISOString(), acknowledgedRows: null, passRows: null,
+  pendingRows: null, elapsedMs: 0, rowsPerSecond: null, remainingRows: null,
+  etaSeconds: null, lastProgressAt: null,
+});
+await sink.close();
+if (warnings.length) process.exitCode = 1;
+NODE
+```
+
+A quiet sink close alone is **not** proof of Log Analytics visibility. Resolve
+the workspace customer ID read-only, then query the exact smoke correlation:
+
+```sh
+az monitor log-analytics workspace show --subscription 07aba226-fd59-489a-b07b-4158fef12a5d \
+  --resource-group rg-agent-backup --workspace-name law-agent-backup --query customerId -o tsv
+```
+
+`migrationProgressQuery({ revision, runId: '1', attempt: '1' })` exported by
+`infra/cf/monitor-main-run.mjs` supplies the same KQL used by the live monitor.
+Run it using `az monitor log-analytics query --workspace <customer-ID>
+--analytics-query <query> --timespan P1D --output json`. Allow for ingestion
+delay; require the exact revision/run/attempt and inspect `Body`, `IngestedAt`,
+and `TimeGenerated`, not just an HTTP acceptance. Passing those actual query
+rows to `migrationProgressEvidence(rows, correlation)` gives the monitor's
+aggregate-only interpretation. The tests exercise protobuf bytes, auth/expiry,
+coalescing, deadline/error isolation and stale/cross-run evidence independently;
+they do not substitute for live ingestion proof.
+
+### Read-only live monitor successor
+
+After the existing private monitor **has settled**, start only one successor:
+
+```sh
+node infra/cf/monitor-main-run.mjs --run-id <run-ID> --head <full-SHA> \
+  --attempt <attempt-number> --workspace <workspace-customer-ID>
+```
+
+It reads GitHub run/job/step metadata (never running-job logs) every 30 seconds
+and queries Azure at most once per minute plus a final query. GitHub calls have
+a 30-second deadline; Azure queries have a 20-second deadline. HTTP 502 gets at
+most three consecutive read attempts; no workflow rerun is performed. It
+validates GitHub revision, run ID and attempt, and Azure events are filtered by
+all three both in KQL and locally. Only changed evidence/transitions and
+explicit failures are printed. CLI exit status `0` means the observed workflow
+concluded successfully; `1` means it concluded non-successfully; `2` means the
+monitor itself failed (invalid arguments, a blind GitHub read, or an identity
+mismatch), not evidence that the workflow failed.
+
+`heartbeatRecordedAt` is the reporter timestamp; `heartbeatAgeSeconds` shows its
+age when the evidence line was printed. `ingestedAt` and `ingestionLagSeconds`
+show Azure delay separately. `lastProgressAt` advances only on a durable ACK,
+never because another heartbeat arrived. For a fresh heartbeat, `ackEvidence`
+measures ACK recency **as of that heartbeat** (`recordedAt - lastProgressAt`),
+not the later query time: ingestion lag and reused query results cannot turn a
+recent ACK into `no-recent-ack`. A heartbeat older than three minutes is
+**stale**, even if Azure just ingested it; ACK recency/rate/ETA become unknown.
+For fresh evidence, known-zero remaining rows have ETA zero even when the recent
+rate is unknown; unknown remaining rows never become zero ETA.
+A fresh heartbeat whose ACK was already more than three minutes old says
+`no-recent-ack`, not that the copy is proven stalled. Missing/query-failed/
+cross-run evidence is unknown, never zero. `--no-azure` is an explicit
+metadata-only opt-out and labels durable progress/rate/ETA unknown. A successful
+workflow may finish before the final Azure event lands; the monitor says so
+rather than claiming delivery.
+
+These migration events do not change the existing D1 metrics, alert thresholds,
+or workbook consumers. In particular they are not evidence that an independent
+D1 metrics acceptance gate has been met.
+

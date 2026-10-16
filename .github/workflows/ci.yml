@@ -5,9 +5,9 @@ on:
   push:
     branches: [main]
 
-# Least privilege for every job: checkout and the deploy job's current-main read only need
-# contents: read. The preview job additionally grants pull-requests: write so it can publish
-# the disposable preview's derived login code in the PR.
+# Least privilege: every job needs only contents: read by default. Preview adds
+# pull-requests: write to publish its disposable derived login code; protected
+# production deploy alone adds id-token: write for Azure workload federation.
 permissions:
   contents: read
 
@@ -252,9 +252,16 @@ jobs:
     runs-on: ubuntu-latest
     environment: production
     timeout-minutes: 360
+    permissions:
+      contents: read
+      id-token: write
     env:
       PROTECTED_PRODUCTION_MIGRATION: "1"
       CLOUDFLARE_ACCOUNT_ID: "18ef3246e9f36d1560485ef53889c0ab"
+      # Nonsecret identifiers; only protected production can exchange the GitHub OIDC assertion.
+      MIGRATION_AZURE_TENANT_ID: ${{ vars.MIGRATION_AZURE_TENANT_ID }}
+      MIGRATION_AZURE_CLIENT_ID: ${{ vars.MIGRATION_AZURE_CLIENT_ID }}
+      MIGRATION_AZURE_LOGS_ENDPOINT: ${{ vars.MIGRATION_AZURE_LOGS_ENDPOINT }}
     concurrency:
       group: production-deploy
       cancel-in-progress: false
