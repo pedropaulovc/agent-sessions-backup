@@ -7,7 +7,10 @@ import {
 } from '../../src/index-layout.mjs';
 import { CLOUDFLARE_REQUEST_RATE_PER_SECOND } from './cloudflare-api-budget.mjs';
 
-export const COPY_CHECKPOINT = 'full-fidelity-index-copy-v1';
+export const COPY_CHECKPOINT = 'full-fidelity-index-copy-v2';
+// Inert archive of the unfenced copier. Only the explicit initialize import reads it,
+// and only while the fenced key is absent; no reader ever falls back to it.
+const LEGACY_COPY_CHECKPOINT = 'full-fidelity-index-copy-v1';
 export const SEED_CHECKPOINT = 'full-fidelity-index-catalog-v1';
 export const READY_CHECKPOINT = 'full-fidelity-index-ready-v1';
 export const ACTIVATION_CHECKPOINT = 'full-fidelity-index-activated-v1';
@@ -48,6 +51,7 @@ export const COPY_INVARIANTS = Object.freeze({
   SOURCE_MISSING: 'source-missing', SOURCE_DELETE: 'source-delete',
   SOURCE_REAPPEARED: 'source-reappeared', SOURCE_RANGE: 'source-range',
   SOURCE_COLUMNS: 'source-columns', SOURCE_BEHIND_CURSOR: 'source-behind-cursor',
+  CHECKPOINT_FENCE: 'checkpoint-fence',
 });
 
 function copyInvariant(code, message, phase) {
@@ -213,23 +217,118 @@ export function assertMaintenanceHealth(health, revision, count) {
   }
 }
 
-export async function readCheckpoint(db, name) {
+// The stored row as { raw, value }: `raw` is the exact stored value as returned by the
+// transport (never re-serialized), `value` its parsed record.
+async function readStoredCheckpointRow(db, name) {
   if (!db[DIAGNOSTIC_DB]) db = phaseDb(db, COPY_PHASES.GENERAL_CHECKPOINT_READ);
   const rows = await db.query('SELECT value FROM index_migration_state WHERE name = ?', [name]);
   if (!rows.length) return null;
+  const raw = rows[0].value;
   let value;
-  try { value = JSON.parse(rows[0].value); }
+  try { value = JSON.parse(raw); }
   catch { throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_PAYLOAD, 'invalid index migration checkpoint payload'); }
   // Only a missing row is absence. Stored null/primitives/arrays are corruption,
   // never permission to initialize or overwrite a workflow checkpoint.
   if (!isProofRecord(value)) throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_PAYLOAD, 'invalid index migration checkpoint payload');
-  return value;
+  return { raw, value };
+}
+
+async function readStoredCheckpoint(db, name) {
+  return (await readStoredCheckpointRow(db, name))?.value ?? null;
+}
+
+const isCopyCheckpointName = (name) => name === COPY_CHECKPOINT || name === LEGACY_COPY_CHECKPOINT;
+
+export async function readCheckpoint(db, name) {
+  if (isCopyCheckpointName(name)) {
+    throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_FENCE, 'copy checkpoint reads require the fenced envelope reader', COPY_PHASES.CHECKPOINT_READ);
+  }
+  return await readStoredCheckpoint(db, name);
 }
 
 export async function writeCheckpoint(db, name, value) {
+  if (isCopyCheckpointName(name)) {
+    throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_FENCE, 'copy checkpoint writes require the generation fence', COPY_PHASES.CHECKPOINT_WRITE);
+  }
   if (!db[DIAGNOSTIC_DB]) db = phaseDb(db, COPY_PHASES.GENERAL_CHECKPOINT_WRITE);
   await db.query(`INSERT INTO index_migration_state (name, value) VALUES (?, ?)
     ON CONFLICT (name) DO UPDATE SET value = excluded.value`, [name, JSON.stringify(value)]);
+}
+
+// The copy checkpoint alone authorizes source retirement. Its stored value is the
+// envelope {format: 1, generation, state}: `state` is the exact semantic copy state
+// every consumer and proof hashes, and the monotonic `generation` outside it fences
+// each persisted transition as a compare-and-set. A delayed request built from an
+// older state therefore never commits after a newer one, including an identical
+// (ABA) state. Generation 0 means "not yet persisted": only an insert-if-absent.
+// The CASE guards keep malformed stored JSON from raising, json_type keeps a TEXT or
+// REAL generation from comparing equal, and the shape checks refuse an envelope with
+// extra keys or a non-object state: any of these simply matches no row, so a corrupt
+// stored value fails closed instead of being overwritten.
+const COPY_CHECKPOINT_FORMAT = 1;
+const COPY_CHECKPOINT_INSERT_SQL = `INSERT INTO index_migration_state (name, value) VALUES (?1, ?2)
+  ON CONFLICT (name) DO NOTHING RETURNING json_extract(value, '$.generation') AS generation`;
+const COPY_CHECKPOINT_UPDATE_SQL = `UPDATE index_migration_state SET value = ?2
+  WHERE name = ?1 AND CASE WHEN json_valid(value)
+    THEN json_type(value) = 'object' AND json_remove(value, '$.format', '$.generation', '$.state') = '{}'
+      AND json_type(value, '$.format') = 'integer' AND json_extract(value, '$.format') = ${COPY_CHECKPOINT_FORMAT}
+      AND json_type(value, '$.state') = 'object'
+      AND json_type(value, '$.generation') = 'integer' AND json_extract(value, '$.generation') = ?3
+    ELSE 0 END
+  RETURNING json_extract(value, '$.generation') AS generation`;
+
+// The one-time import inserts the envelope only while the unfenced key still holds
+// the exact TEXT bytes that were read and validated, and only if the fenced key is
+// absent. A concurrent unfenced rewrite or deletion between that read and this insert
+// matches no row and fails closed. The STRICT TEXT column already refuses BLOBs; the
+// typeof/BLOB comparison only makes the match exact bytes, never collated/normalized.
+// This closes only that window: it cannot detect unfenced history that was already
+// stale when read, or a rewrite back to the identical bytes before the insert (ABA).
+const COPY_CHECKPOINT_IMPORT_SQL = `INSERT INTO index_migration_state (name, value)
+  SELECT ?1, ?2 FROM index_migration_state
+  WHERE name = ?3 AND typeof(value) = 'text' AND CAST(value AS BLOB) = CAST(?4 AS BLOB)
+  ON CONFLICT (name) DO NOTHING
+  RETURNING json_extract(value, '$.generation') AS generation`;
+
+/**
+ * The fenced copy checkpoint as `{ generation, state }`, or null when absent.
+ * Any envelope other than exactly {format: 1, generation: safe integer >= 1,
+ * state: plain object} is corruption and fails closed; it is never rewritten.
+ */
+export async function readCopyCheckpoint(db) {
+  if (!db[DIAGNOSTIC_DB]) db = phaseDb(db, COPY_PHASES.CHECKPOINT_READ);
+  const envelope = await readStoredCheckpoint(db, COPY_CHECKPOINT);
+  if (envelope === null) return null;
+  if (Object.keys(envelope).sort().join() !== 'format,generation,state'
+    || envelope.format !== COPY_CHECKPOINT_FORMAT || !Number.isSafeInteger(envelope.generation)
+    || envelope.generation < 1 || !isProofRecord(envelope.state)) {
+    throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_PAYLOAD, 'invalid fenced copy checkpoint envelope', db[DIAGNOSTIC_PHASE]);
+  }
+  return { generation: envelope.generation, state: envelope.state };
+}
+
+/**
+ * Persist `state` at generation expectedGeneration + 1 only if the stored envelope
+ * still carries expectedGeneration, or is absent for 0, and return the new
+ * generation. Exactly one RETURNING witness row is required; anything else is a
+ * fence rejection. Never retried: a lost response is resolved by the next run's read.
+ */
+export async function writeCopyCheckpoint(db, state, expectedGeneration) {
+  if (!db[DIAGNOSTIC_DB]) db = phaseDb(db, COPY_PHASES.CHECKPOINT_WRITE);
+  const phase = db[DIAGNOSTIC_PHASE];
+  if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 0
+    || !Number.isSafeInteger(expectedGeneration + 1) || !isProofRecord(state)) {
+    throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_FENCE, 'invalid or exhausted copy checkpoint generation', phase);
+  }
+  const generation = expectedGeneration + 1;
+  const envelope = JSON.stringify({ format: COPY_CHECKPOINT_FORMAT, generation, state });
+  const rows = expectedGeneration === 0
+    ? await db.query(COPY_CHECKPOINT_INSERT_SQL, [COPY_CHECKPOINT, envelope])
+    : await db.query(COPY_CHECKPOINT_UPDATE_SQL, [COPY_CHECKPOINT, envelope, expectedGeneration]);
+  if (!Array.isArray(rows) || rows.length !== 1 || rows[0]?.generation !== generation) {
+    throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_FENCE, 'copy checkpoint generation fence rejected the write', phase);
+  }
+  return generation;
 }
 
 export async function initializeShardLayouts(shards) {
@@ -1348,13 +1447,25 @@ export async function copyFrozenIndex({ source, shards, gate, checkpointHook }) 
   shards = shards.map((db) => phaseDb(db, COPY_PHASES.SETUP));
   await gate();
   const identity = copyIdentity(source, shards);
+  const checkpointDb = phaseDb(shards[0], COPY_PHASES.CHECKPOINT_WRITE);
+  const stored = await readCopyCheckpoint(phaseDb(shards[0], COPY_PHASES.CHECKPOINT_READ));
+  // Advanced only by a single-row witness; a rejected or lost write leaves this
+  // invocation unable to persist anything further or retire any source row.
+  let generation = stored?.generation ?? 0;
   const checkpoint = async (state) => {
     validateCopyState(state, shards.length);
-    await writeCheckpoint(phaseDb(shards[0], COPY_PHASES.CHECKPOINT_WRITE), COPY_CHECKPOINT, state);
+    generation = await writeCopyCheckpoint(checkpointDb, state, generation);
     await checkpointHook?.(structuredClone(state));
   };
-  let state = await readCheckpoint(phaseDb(shards[0], COPY_PHASES.CHECKPOINT_READ), COPY_CHECKPOINT);
+  let state = stored?.state ?? null;
   if (state) { assertIdentity(state, identity); validateCopyState(state, shards.length); }
+  // The unfenced key is never read as progress. While it exists without its explicit
+  // initialize import, a fresh copy would rewind acknowledged source retirement.
+  else if ((await phaseDb(shards[0], COPY_PHASES.CHECKPOINT_READ).query(
+    'SELECT name FROM index_migration_state WHERE name = ?', [LEGACY_COPY_CHECKPOINT])).length) {
+    throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_STATE,
+      'unfenced copy checkpoint has not been imported by index control initialize', COPY_PHASES.CHECKPOINT_READ);
+  }
   if (state?.state === 'complete') {
     const tables = await source.query("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'blocks'");
     if (tables.length && (await source.query('SELECT id FROM blocks LIMIT 1')).length) {
@@ -1418,6 +1529,41 @@ export async function copyFrozenIndex({ source, shards, gate, checkpointHook }) 
   } finally {
     tokenizer.close();
   }
+}
+
+/**
+ * One-time explicit cutover of the unfenced copy checkpoint to the fenced key.
+ * Index control `initialize` is its only caller, before any classify or copy reader.
+ * Once the fenced key exists the unfenced key is never read again, so a delayed
+ * unfenced UPSERT whose original outcome was unknown is permanently inert. The
+ * unfenced row is retained as archive data, never as a fallback.
+ */
+export async function importLegacyCopyCheckpoint({ source, shards }) {
+  const identity = copyIdentity(source, shards);
+  const current = await readCopyCheckpoint(phaseDb(shards[0], COPY_PHASES.GENERAL_CHECKPOINT_READ));
+  if (current) {
+    assertIdentity(current.state, identity);
+    validateCopyState(current.state, shards.length);
+    return 'current';
+  }
+  const legacy = await readStoredCheckpointRow(phaseDb(shards[0], COPY_PHASES.GENERAL_CHECKPOINT_READ), LEGACY_COPY_CHECKPOINT);
+  if (!legacy) return 'absent';
+  if (typeof legacy.raw !== 'string') {
+    throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_PAYLOAD, 'invalid index migration checkpoint payload', COPY_PHASES.GENERAL_CHECKPOINT_READ);
+  }
+  // The exact semantic state is wrapped verbatim, so proofs sealed over it still bind it.
+  assertIdentity(legacy.value, identity);
+  validateCopyState(legacy.value, shards.length);
+  const envelope = JSON.stringify({ format: COPY_CHECKPOINT_FORMAT, generation: 1, state: legacy.value });
+  const rows = await phaseDb(shards[0], COPY_PHASES.GENERAL_CHECKPOINT_WRITE).query(COPY_CHECKPOINT_IMPORT_SQL,
+    [COPY_CHECKPOINT, envelope, LEGACY_COPY_CHECKPOINT, legacy.raw]);
+  // Never retried: a changed/absent unfenced value or an existing fenced key is resolved
+  // by rerunning initialize, which re-reads both keys; so is a lost response.
+  if (!Array.isArray(rows) || rows.length !== 1 || rows[0]?.generation !== 1) {
+    throw copyInvariant(COPY_INVARIANTS.CHECKPOINT_FENCE, 'unfenced copy checkpoint changed during its import',
+      COPY_PHASES.GENERAL_CHECKPOINT_WRITE);
+  }
+  return 'imported';
 }
 
 /** Read-only sampled cost estimate, not a throughput or completion-time promise. */
@@ -1534,7 +1680,7 @@ function catalogRows(rows, columns) {
 /** Full metadata/stars seed after main DDL; a page is acknowledged only after all shards agree. */
 export async function seedFrozenCatalog({ source, shards, gate, checkpointHook }) {
   await gate();
-  const copied = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+  const copied = (await readCopyCheckpoint(shards[0]))?.state ?? null;
   const identity = copyIdentity(source, shards);
   if (copied?.state !== 'complete') throw new Error('catalog seed requires a completed verified index copy');
   assertIdentity(copied, identity);
@@ -1648,7 +1794,7 @@ export async function seedFrozenCatalog({ source, shards, gate, checkpointHook }
 /** Read-only bounded operational evidence; exact full-copy proof lives in COPY_CHECKPOINT. */
 export async function verifyIndexRecords({ source, shards, catalogConsistency = 'observe' }) {
   if (!['required', 'observe'].includes(catalogConsistency)) throw new Error('invalid catalog consistency mode');
-  const copy = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+  const copy = (await readCopyCheckpoint(shards[0]))?.state ?? null;
   if (copy) { assertIdentity(copy, copyIdentity(source, shards)); validateCopyState(copy, shards.length); }
   const [main] = await source.query(`SELECT
     (SELECT COUNT(*) FROM sessions) AS sessions,

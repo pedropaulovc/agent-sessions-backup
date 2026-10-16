@@ -306,8 +306,11 @@ async function runController(command, scenario = {}) {
             const statements = body.batch ?? [{ sql: body.sql, params: body.params ?? [] }];
             const execute = ({ sql, params = [] }) => {
               const statement = native.prepare(sql);
-              const rows = statement.columns().length ? plainRows(native, sql, params, statement)
-                : (statement.run(...params), []);
+              // D1 returns DML RETURNING rows directly; SQLite cannot nest DML in the
+              // SELECT transport CTE (the fenced copy checkpoint returns only integers).
+              const rows = !statement.columns().length ? (statement.run(...params), [])
+                : /^\\s*(?:INSERT|UPDATE|DELETE|REPLACE)\\b/i.test(sql) ? statement.all(...params).map((row) => ({ ...row }))
+                  : plainRows(native, sql, params, statement);
               if (${native} && sql.startsWith('INSERT INTO blocks (') && sql.includes('FROM json_each(?)')) {
                 emit({ kind: 'native-fixture-seed', databaseId: id, tuples: JSON.parse(params[0]) });
               }
@@ -1254,6 +1257,21 @@ test('native-copy-proof runs the real helper through CLI schema bindings and cle
     && event.sql === 'SELECT COUNT(*) AS rows FROM blocks').at(-1);
   assert.ok(result.events.indexOf(recoveredSourceCount) > diagnosticStart);
   assert.deepEqual(recoveredSourceCount.rows, [{ rows: 0 }], 'the recovered source must be fully retired');
+  // The fenced copy checkpoint executes through the same REST transport: each committed
+  // transition returns one generation witness, and the two stale replays match no row.
+  const fencedWrites = result.events.filter((event) => event.kind === 'probe-sql'
+    && /^(?:INSERT INTO|UPDATE) index_migration_state\b/.test(event.sql)
+    && /RETURNING json_extract\(value, '\$\.generation'\) AS generation$/.test(event.sql));
+  assert.ok(fencedWrites.filter(({ rows }) => rows.length === 1)
+    .every(({ rows }) => Number.isSafeInteger(rows[0].generation) && rows[0].generation >= 1));
+  assert.ok(fencedWrites.filter(({ rows }) => rows.length === 1).length >= 6);
+  const isImport = ({ sql }) => /^INSERT INTO index_migration_state \(name, value\)\s+SELECT\b/.test(sql);
+  assert.deepEqual(fencedWrites.filter((event) => !isImport(event) && event.rows.length === 0).map(({ sql }) => sql.split(' ')[0]),
+    ['UPDATE', 'INSERT'], 'only the native control\'s two stale checkpoint replays are fenced');
+  // The conditional one-time import: changed and deleted unfenced values match no row;
+  // the stable value commits exactly one generation-1 witness.
+  assert.deepEqual(fencedWrites.filter(isImport).map(({ rows }) => rows.map(({ generation }) => generation)), [[], [], [1]]);
+  assert.ok(fencedWrites.every(({ rows }) => rows.length <= 1));
   const migrations = result.events.filter((event) => event.kind === 'migrate');
   assert.equal(migrations.length, 3);
   const creations = result.events.filter((event) => event.kind === 'request' && event.method === 'POST'

@@ -6,11 +6,11 @@ import {
   PREVIEW_ACCOUNT_ID, PRODUCTION_ACCOUNT_ID, paginatedList, parseArgs,
 } from './preview-trust.mjs';
 import {
-  COPY_CHECKPOINT, SEED_CHECKPOINT, READY_CHECKPOINT, ACTIVATION_CHECKPOINT,
+  SEED_CHECKPOINT, READY_CHECKPOINT, ACTIVATION_CHECKPOINT,
   DRAIN_MILLISECONDS, assertMaintenanceHealth, assertReadyProof, assertActivationProof,
   buildReadyProof, buildActivationProof, SOURCE_FREEZE_TABLE, classifyIndexMigration,
-  copyFrozenIndex, initializeShardLayouts, readCheckpoint, reconcileIndexCatalog,
-  seedFrozenCatalog, sourceCopyForecast, verifyIndexRecords, writeCheckpoint,
+  copyFrozenIndex, importLegacyCopyCheckpoint, initializeShardLayouts, readCheckpoint, readCopyCheckpoint,
+  reconcileIndexCatalog, seedFrozenCatalog, sourceCopyForecast, verifyIndexRecords, writeCheckpoint,
 } from '../../hub/scripts/lib/index-migration.mjs';
 import { indexShardBindingName } from '../../hub/src/index-layout.mjs';
 import {
@@ -449,7 +449,7 @@ export async function pauseConsumers(api, config) {
 /** Persist readiness only after the actual frozen data and final outbox checks pass. */
 export async function verifyReadyIndex({ source, shards, revision, cycle, gate }) {
   await gate();
-  const copied = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+  const copied = (await readCopyCheckpoint(shards[0]))?.state ?? null;
   const seeded = await readCheckpoint(shards[0], SEED_CHECKPOINT);
   const existingReady = await readCheckpoint(shards[0], READY_CHECKPOINT);
   const activation = await readCheckpoint(shards[0], ACTIVATION_CHECKPOINT);
@@ -481,7 +481,7 @@ export async function verifyReadyIndex({ source, shards, revision, cycle, gate }
 
 /** The initial activation marker is written only after real active/login checks. */
 export async function verifyActiveIndex({ source, shards, revision, cycle, gate, login }) {
-  const copied = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+  const copied = (await readCopyCheckpoint(shards[0]))?.state ?? null;
   const seeded = await readCheckpoint(shards[0], SEED_CHECKPOINT);
   const ready = await readCheckpoint(shards[0], READY_CHECKPOINT);
   const activation = await readCheckpoint(shards[0], ACTIVATION_CHECKPOINT);
@@ -539,7 +539,7 @@ async function main() {
       AND name IN ('blocks', 'blocks_fts', '${SOURCE_FREEZE_TABLE}')`);
     const layoutState = classifyIndexMigration({
       source, shards, legacyTables: legacy.map((row) => row.name),
-      copy: await readCheckpoint(shards[0], COPY_CHECKPOINT),
+      copy: (await readCopyCheckpoint(shards[0]))?.state ?? null,
       seed: await readCheckpoint(shards[0], SEED_CHECKPOINT),
       ready: await readCheckpoint(shards[0], READY_CHECKPOINT),
       activation: await readCheckpoint(shards[0], ACTIVATION_CHECKPOINT),
@@ -559,12 +559,14 @@ async function main() {
   }
   if (command === 'initialize') {
     await initializeShardLayouts(shards);
+    // The sole, explicit fenced-checkpoint cutover; it precedes `state` and `copy`.
+    const copyCheckpoint = await importLegacyCopyCheckpoint({ source, shards });
     const atomicity = await verifyD1BatchAtomicity(shards[0]);
     await writeCheckpoint(shards[0], ATOMICITY_CHECKPOINT, {
       ...atomicity, revision: config.vars.DEPLOYMENT_REVISION,
       cycle: `${process.env.GITHUB_RUN_ID}:${process.env.GITHUB_RUN_ATTEMPT}`, verifiedAt: Date.now(),
     });
-    console.log(JSON.stringify({ initializedShards: shards.length, atomicity }));
+    console.log(JSON.stringify({ initializedShards: shards.length, copyCheckpoint, atomicity }));
     return;
   }
   if (command === 'verify-active') {

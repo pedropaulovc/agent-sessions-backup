@@ -389,6 +389,11 @@ The one-time cutover runs these operations in order, from the same checked-out m
    absent. A partially committed probe is cleaned up by its own name only and fails
    closed. A durable `index-rest-batch-atomicity-v1` proof binds revision/run/attempt
    and shard ID; `copy` refuses a different or missing proof. The source is untouched.
+   `initialize` is also the sole, one-time importer of the unfenced copy checkpoint
+   (see the fenced copy checkpoint below). It reports `copyCheckpoint` as `current`
+   (the fenced key exists; the unfenced key is never read), `imported` (the unfenced
+   state passed the identity and full shape checks and was wrapped verbatim at
+   generation 1 by the conditional import below), or `absent`.
 3. `index-control.mjs state` checks source objects and durable checkpoint identities,
    then reports a bounded first/middle/last source sample as `copyForecast`. It logs
    aggregate row bytes, page occupancy, shard fanout, estimated remaining requests,
@@ -530,7 +535,7 @@ durable readiness/activation proofs and CLI results use `state: "ready"` or
 identities or changed proof digests fail closed; none is treated as a missing
 checkpoint or accepted as a compatibility format.
 
-`IDX00.index_migration_state` stores `full-fidelity-index-copy-v1`,
+`IDX00.index_migration_state` stores `full-fidelity-index-copy-v2`,
 `full-fidelity-index-catalog-v1`, `index-maintenance-freeze-v1`, the current
 `index-rest-batch-atomicity-v1`, and READY/ACTIVATION proofs. The copy records the
 immutable source/shard IDs, complete column list, acknowledged ID cursor, verified row
@@ -552,6 +557,57 @@ requests can still complete; the full catalog seed then drains all captured outb
 versions, including changes behind its saved scan cursor, with readback before ack.
 Database-bound migration journals are useful per-run evidence; the durable shard
 checkpoint and D1 migration/checksum ledgers, not runner-temporary files, carry recovery.
+
+The copy checkpoint is fenced. `full-fidelity-index-copy-v2` stores exactly
+`{format: 1, generation, state}`: `state` is the semantic copy checkpoint every reader,
+classifier and READY/ACTIVATION digest uses, unchanged; `generation` is a positive
+safe integer outside it. Each transition is one statement: an insert-if-absent for
+the first write, then `UPDATE ... WHERE generation = expected RETURNING generation`.
+Exactly one returned row equal to `expected + 1` is required. Any other result is the
+`checkpoint-fence` invariant, distinct from a transport/HTTP failure; it is never
+retried, and no later checkpoint or source write in that run follows it. A delayed
+request from an earlier run (lost response, unknown commit) can therefore never
+rewind the checkpoint, even to an identical earlier state. After an unknown
+checkpoint-write outcome, rerun the protected workflow: the next run reads the durable
+envelope and either resumes from the committed write or repeats the uncommitted one.
+Any other envelope shape fails closed and is never rewritten. Generic checkpoint
+reads and writes refuse both copy keys.
+
+`full-fidelity-index-copy-v1` is the unfenced copier's key. It is an inert archive:
+`initialize` reads it only while the fenced key is absent, and no reader falls back to
+it, so a late UPSERT to it changes nothing. It is never deleted. While it exists
+without the fenced key, `copy` fails closed before any write instead of starting a
+fresh copy; run `initialize` (the normal workflow does so before `state`).
+
+The import is one conditional `INSERT ... SELECT`: it writes the generation-1 envelope
+only while the unfenced key still holds, as TEXT, exactly the bytes `initialize` read
+and validated (`typeof(value) = 'text' AND CAST(value AS BLOB) = CAST(? AS BLOB)`; no
+re-serialized or normalized comparison), and only while the fenced key is absent. It
+requires exactly one returned row with generation 1. A late unfenced write that
+commits between that read and the insert (a newer value or a deletion) or a
+concurrently created fenced key matches no row: that is the `checkpoint-fence`
+invariant, never retried, and nothing is written. Rerun the workflow; `initialize`
+re-reads both keys. A lost import response is resolved the same way (`current` if it
+committed). The `STRICT` table's `value TEXT` column already refuses BLOB values; the
+`typeof`/BLOB-byte comparison only makes the match exact bytes rather than a
+collation or normalized comparison. Boundaries: this closes only the window between
+the import's read and its insert. It cannot detect unfenced history that was already
+stale when read (a delayed older UPSERT that landed before the import, as the
+delayed-UPSERT regression fixtures reproduce; no production rewind has been
+observed), nor a rewrite back to the identical bytes before the insert (ABA); the
+copier's own source/destination proofs still apply to whatever is imported, and this
+is not a repair of earlier unfenced history.
+
+Historical regression controls predate the fence. Whenever `INDEX_COPY_MODULE_PATH`,
+`INDEX_CONTROL_CLI_PATH` or `NATIVE_COPY_CONTROL_MODULE_PATH` selects a pre-fence
+revision (every historical control in this runbook), also set
+`INDEX_COPY_CHECKPOINT_FORMAT=unfenced-v1` so the test observers read that
+implementation's flat `full-fidelity-index-copy-v1` checkpoint. The default,
+`fenced-v2`, reads only the strict envelope; the observer never chooses a layout from
+whichever key exists, and a mismatched selected copy module refuses to load. To show
+the fence is load-bearing, run the `unfenced checkpoint UPSERT` cases with the
+pre-fence `f44a39c` module and CLI selected this way: they must fail at the rewound
+copy, and pass with the variables unset.
 
 An absent copy `encoding` is accepted only by the explicit one-time legacy
 checkpoint upgrade, not by a general alternate-reader fallback. Before changing a
@@ -681,6 +737,18 @@ Its deliberately late, equal-length byte mutation must yield one bounded mismatc
 comparison and preserve all four source/destination/freeze/checkpoint fences. An
 unavailable or false comparison fails the proof; a destination compile control is
 not an alternate oracle or permission to turn that failure into success.
+
+On its owned scratch IDX00 only, the control's `byte-exact-checkpoint-fence` phase
+proves one advanced-generation witness and zero-row stale UPDATE/insert replays, and
+`byte-exact-checkpoint-import` then runs the real conditional import natively: with the
+fenced key present the import reports `current` and leaves both raw keys unchanged;
+after a scratch-only reset, an unfenced value changed and then deleted between the
+import's read and its insert each match zero rows (the fence, no fenced key written);
+the stable value imports exactly `{format: 1, generation: 1, state}` with the unfenced
+TEXT archive byte-identical. These key resets/reseeds exist only in this disposable
+fixture, never in the product importer. A local controller/stub run including this
+phase measured 656 Cloudflare requests in total (574 `/query`), 21 more `/query`
+requests than without it, within the unchanged caps below.
 
 The control is paced, not CPU-bound. Timestamped local controller/stub runs measured
 328 Cloudflare requests in 104 s for `359f3e2` (252 positive, 76 old diagnostic) and

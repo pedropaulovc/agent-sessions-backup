@@ -5,13 +5,14 @@ import {
 } from './preview-trust.mjs';
 import {
   COPY_CHECKPOINT, COPY_INVARIANTS, COPY_PAGE_BYTES, COPY_PAGE_ROWS, COPY_PHASES, SOURCE_FREEZE_TABLE, canonicalRow,
-  copyFrozenIndex, readCheckpoint, writeCheckpoint,
+  copyFrozenIndex, importLegacyCopyCheckpoint, readCopyCheckpoint, writeCopyCheckpoint,
 } from '../../hub/scripts/lib/index-migration.mjs';
 import { BLOCK_COLUMNS, INDEX_ID_SPAN, indexShardForSessionId } from '../../hub/src/index-layout.mjs';
 import { D1_FAILURE_KINDS, D1_SQL_FAILURE_REASONS } from './d1-batch-atomicity.mjs';
 
 const copyPhases = Object.freeze(Object.values(COPY_PHASES));
 const copyInvariants = Object.freeze(Object.values(COPY_INVARIANTS));
+const readCopyState = async (db) => (await readCopyCheckpoint(db))?.state ?? null;
 
 // No causes/stacks from a provider or subprocess are retained in public diagnostics.
 export class NativeCopyControlError extends Error {
@@ -618,8 +619,83 @@ async function proveByteExactRecovery({ source, shards, gate, positive, positive
     sha256: sha256(`${sha256('')}:${JSON.stringify(prefixItems)}`),
     pending: { phase: 'verified', rows: legacyItems }, state: 'pending',
   };
-  await writeCheckpoint(shards[0], COPY_CHECKPOINT, legacyState);
-  requireProof(JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === JSON.stringify(legacyState), phase);
+  // Native generation fence: one valid compare-and-set with its RETURNING witness,
+  // then a stale replay of that transition and a stale insert-if-absent must each
+  // match zero rows, surface as the fence invariant (never as a transport failure,
+  // never retried) and leave the durable envelope byte-identical.
+  phase = 'byte-exact-checkpoint-fence';
+  const positiveStored = await readCopyCheckpoint(shards[0]);
+  requireProof(JSON.stringify(positiveStored?.state) === JSON.stringify(positive), phase);
+  const fencedGeneration = await writeCopyCheckpoint(shards[0], legacyState, positiveStored.generation);
+  requireProof(fencedGeneration === positiveStored.generation + 1, phase);
+  const staleFences = [];
+  for (const expected of [positiveStored.generation, 0]) {
+    try { await writeCopyCheckpoint(shards[0], positive, expected); } catch (error) {
+      if (error?.code !== COPY_INVARIANTS.CHECKPOINT_FENCE) throw safeFailure(error, phase);
+      requireProof(error.d1Phase === COPY_PHASES.CHECKPOINT_WRITE && error.d1FailureKind === undefined, phase);
+      staleFences.push(expected);
+    }
+  }
+  requireProof(staleFences.length === 2, phase);
+  const fencedStored = await readCopyCheckpoint(shards[0]);
+  requireProof(fencedStored.generation === fencedGeneration
+    && JSON.stringify(fencedStored.state) === JSON.stringify(legacyState), phase);
+  // Native one-time import: the real conditional INSERT ... SELECT executes on the owned
+  // scratch IDX00. An existing fenced key wins; an unfenced value changed or deleted
+  // between the import's read and its insert matches zero rows and fails closed as the
+  // fence; a stable value is imported at generation 1. Key resets are scratch-only.
+  phase = 'byte-exact-checkpoint-import';
+  const unfencedKey = 'full-fidelity-index-copy-v1';
+  const unfencedText = JSON.stringify(legacyState);
+  const rawKeys = async () => Object.fromEntries((await shards[0].query(
+    'SELECT name, typeof(value) AS type, value FROM index_migration_state WHERE name IN (?, ?) ORDER BY name',
+    [COPY_CHECKPOINT, unfencedKey])).map(({ name, type, value }) => [name, { type, value }]));
+  const setUnfenced = { sql: `INSERT INTO index_migration_state (name, value) VALUES (?, ?)
+    ON CONFLICT (name) DO UPDATE SET value = excluded.value`, params: [unfencedKey, unfencedText] };
+  await shards[0].query(setUnfenced.sql, [unfencedKey, JSON.stringify(positive)]);
+  const fencedRaw = (await rawKeys())[COPY_CHECKPOINT];
+  requireProof(await importLegacyCopyCheckpoint({ source, shards }) === 'current', phase);
+  const precedence = await rawKeys();
+  requireProof(JSON.stringify(precedence[COPY_CHECKPOINT]) === JSON.stringify(fencedRaw)
+    && precedence[unfencedKey]?.value === JSON.stringify(positive), phase);
+  const importFences = [];
+  for (const [race, raceSql, raceParams] of [
+    ['changed', 'UPDATE index_migration_state SET value = ? WHERE name = ?', [JSON.stringify(positive), unfencedKey]],
+    ['deleted', 'DELETE FROM index_migration_state WHERE name = ?', [unfencedKey]],
+  ]) {
+    await shards[0].batch([
+      { sql: 'DELETE FROM index_migration_state WHERE name = ?', params: [COPY_CHECKPOINT] },
+      setUnfenced,
+    ]);
+    let raced = 0;
+    const racing = {
+      id: shards[0].id,
+      batch: (statements) => shards[0].batch(statements),
+      async query(sql, params = []) {
+        if (!raced && /^INSERT INTO index_migration_state \(name, value\)\s+SELECT\b/.test(sql)
+          && params[0] === COPY_CHECKPOINT && params[2] === unfencedKey && params[3] === unfencedText) {
+          raced += 1;
+          await shards[0].query(raceSql, raceParams);
+        }
+        return shards[0].query(sql, params);
+      },
+    };
+    try { await importLegacyCopyCheckpoint({ source, shards: [racing, ...shards.slice(1)] }); } catch (error) {
+      if (error?.code !== COPY_INVARIANTS.CHECKPOINT_FENCE) throw safeFailure(error, phase);
+      requireProof(error.d1Phase === COPY_PHASES.GENERAL_CHECKPOINT_WRITE && error.d1FailureKind === undefined, phase);
+      importFences.push(race);
+    }
+    const after = await rawKeys();
+    requireProof(raced === 1 && after[COPY_CHECKPOINT] === undefined
+      && (race === 'changed' ? after[unfencedKey]?.value === JSON.stringify(positive) : after[unfencedKey] === undefined), phase);
+  }
+  requireProof(importFences.length === 2, phase);
+  await shards[0].query(setUnfenced.sql, setUnfenced.params);
+  requireProof(await importLegacyCopyCheckpoint({ source, shards }) === 'imported', phase);
+  const imported = await rawKeys();
+  requireProof(imported[COPY_CHECKPOINT]?.type === 'text' && imported[unfencedKey]?.type === 'text'
+    && imported[unfencedKey].value === unfencedText
+    && imported[COPY_CHECKPOINT].value === JSON.stringify({ format: 1, generation: 1, state: legacyState }), phase);
   phase = 'byte-exact-legacy-loss';
   let lossyReplicaCells = 0;
   for (const [index, row] of legacy.entries()) {
@@ -682,7 +758,7 @@ async function proveByteExactRecovery({ source, shards, gate, positive, positive
       trace.sourceWrites += 1;
       let armed = false;
       if (statements.some(({ sql }) => /\bDELETE FROM blocks\b/.test(sql))) {
-        const durable = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+        const durable = await readCopyState(shards[0]);
         requireProof(durable?.pending?.phase === 'verified' && JSON.stringify(durable) === verifiedSnapshot, phase);
         await assertFrozen(source);
         const retiring = ids(durable.pending.rows);
@@ -723,7 +799,7 @@ async function proveByteExactRecovery({ source, shards, gate, positive, positive
   const checkpointHook = async (checkpoint) => {
     trace.hooks += 1;
     requireProof(!trace.failure, 'byte-exact-guard');
-    const durable = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+    const durable = await readCopyState(shards[0]);
     requireProof(JSON.stringify(durable) === JSON.stringify(checkpoint), 'checkpoint-observation');
     const pending = checkpoint.pending;
     if (recovering === 0 && pending?.phase !== 'recovering') {
@@ -795,7 +871,7 @@ async function proveByteExactRecovery({ source, shards, gate, positive, positive
     }
     throw error;
   }
-  requireProof(JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === verifiedSnapshot, phase);
+  requireProof(JSON.stringify(await readCopyState(shards[0])) === verifiedSnapshot, phase);
   const remaining = await source.query('SELECT id FROM blocks ORDER BY id');
   requireProof(JSON.stringify(ids(remaining)) === JSON.stringify(ids([...longRows, ...short])), phase);
   await assertGuardByte('fe');
@@ -810,7 +886,7 @@ async function proveByteExactRecovery({ source, shards, gate, positive, positive
   try { await copy(); } catch (error) { stale = error; }
   if (stale?.code !== COPY_INVARIANTS.SOURCE_CHANGED) throw stale ? safeFailure(stale, phase) : new NativeCopyControlError(phase, 'assertion');
   requireProof(trace.sourceWrites === 0 && trace.shardWrites === 0 && trace.hooks === 0
-    && JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === verifiedSnapshot, phase);
+    && JSON.stringify(await readCopyState(shards[0])) === verifiedSnapshot, phase);
   await assertGuardByte('fe');
 
   // Run 3: the restored authoritative bytes complete from the retained checkpoint.
@@ -823,7 +899,7 @@ async function proveByteExactRecovery({ source, shards, gate, positive, positive
     && JSON.stringify(trace.pages) === JSON.stringify([[guard.row.id], [longRows[1].id], ids(short)])
     && JSON.stringify(trace.retirements) === JSON.stringify([ids(legacy), [guard.row.id], [guard.row.id], [longRows[1].id], ids(short)])
     && trace.boundPages === 1 && trace.jsonPages >= 3 && trace.maxBoundParams <= 100, phase);
-  requireProof(JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === JSON.stringify(state), phase);
+  requireProof(JSON.stringify(await readCopyState(shards[0])) === JSON.stringify(state), phase);
   requireProof((await source.query('SELECT COUNT(*) AS rows FROM blocks'))[0]?.rows === 0, 'source-empty');
   await assertFrozen(source);
 
@@ -930,7 +1006,7 @@ async function proveNativeCopy({ source, shards, gate }) {
       async batch(statements) {
         const retiresRows = statements.some(({ sql }) => /\bDELETE FROM blocks\b/.test(sql));
         if (!retiresRows) return await source.batch(statements);
-        const durable = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+        const durable = await readCopyState(shards[0]);
         requireProof(durable?.pending?.phase === 'verified' && verifiedCheckpoint !== undefined
           && JSON.stringify(durable.pending) === verifiedCheckpoint, 'source-retirement');
         const before = (await source.query('SELECT COUNT(*) AS rows FROM blocks'))[0]?.rows;
@@ -970,7 +1046,7 @@ async function proveNativeCopy({ source, shards, gate }) {
     const state = await copyFrozenIndex({
       source: observedSource, shards: observedShards, gate,
       checkpointHook: async (checkpoint) => {
-        const durable = await readCheckpoint(shards[0], COPY_CHECKPOINT);
+        const durable = await readCopyState(shards[0]);
         requireProof(JSON.stringify(durable) === JSON.stringify(checkpoint), 'checkpoint-observation');
         if (checkpoint.pending?.phase === 'copying') {
           const wanted = expected.slice(checkpoint.rows, checkpoint.rows + checkpoint.pending.rows.length);
@@ -1017,7 +1093,7 @@ async function proveNativeCopy({ source, shards, gate }) {
       && growthVerifiedRows === growth.length && splitFtsProbePages > 0
       && maxFtsParametersBytes <= COPY_PAGE_BYTES, 'copy-complete');
     phase = 'checkpoint-proof';
-    requireProof(JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === JSON.stringify(state), phase);
+    requireProof(JSON.stringify(await readCopyState(shards[0])) === JSON.stringify(state), phase);
     requireProof((await source.query('SELECT COUNT(*) AS rows FROM blocks'))[0]?.rows === 0, 'source-empty');
     await assertFrozen(source);
     phase = 'destination-readback';
@@ -1091,7 +1167,7 @@ async function proveNativeCopy({ source, shards, gate }) {
     requireProof(rowsSha256(await readRows(source, phase)) === beforeRejectedWrite, phase);
     requireProof((await source.query('SELECT COUNT(*) AS rows FROM blocks'))[0]?.rows === 0, 'source-empty');
     await assertFrozen(source);
-    requireProof(JSON.stringify(await readCheckpoint(shards[0], COPY_CHECKPOINT)) === JSON.stringify(state), 'checkpoint-proof');
+    requireProof(JSON.stringify(await readCopyState(shards[0])) === JSON.stringify(state), 'checkpoint-proof');
     phase = 'byte-exact-recovery';
     const byteExactRecovery = await proveByteExactRecovery({ source, shards, gate, positive: state, positiveRows: expected });
     await gate();
