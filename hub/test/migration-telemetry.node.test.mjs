@@ -25,7 +25,7 @@ const provider = {
 const failure = (changes = {}) => ({
   event: 'migration.copy.failure', schemaVersion: 1,
   recordedAt: new Date(initial).toISOString(), revision: 'c'.repeat(40), runId: '38887942689', attempt: '2',
-  phase: 'copy-checkpoint-write', failureKind: 'http', ...provider, requestAttempt: 1,
+  phase: 'retiring', operationPhase: 'copy-checkpoint-write', failureKind: 'http', ...provider, requestAttempt: 1,
   lastSuccessfulRequestAt: new Date(initial - 500).toISOString(),
   statementCount: 1, parameterCount: 3, bodyBytes: 240, parameterJsonBytes: 120,
   databaseId: '11111111-2222-3333-4444-555555555555', ...changes,
@@ -115,7 +115,8 @@ test('finite failure and auth allowlists preserve safe context without accepting
     params: ['private parameter'], session: 'private session', url: 'https://private.test/?token=private' };
   const codes = [10000];
   const event = migrationTelemetryEvent(failure({ ...secrets, providerCodes: codes }));
-  assert.equal(event.phase, 'copy-checkpoint-write');
+  assert.equal(event.phase, 'retiring');
+  assert.equal(event.operationPhase, 'copy-checkpoint-write');
   assert.equal(event.httpStatus, 401);
   assert.equal(event.providerReason, 'authentication', '401 is not evidence of token expiry');
   assert.ok(Object.isFrozen(event));
@@ -146,7 +147,8 @@ test('diagnostic bounds reject malformed correlation, statuses, dates, provider 
     assert.equal(migrationTelemetryEvent(failure(changes)), null, JSON.stringify(changes));
     assert.equal(migrationTelemetryEvent(auth(changes)), null, JSON.stringify(changes));
   }
-  for (const changes of [{ phase: 'copying' }, { phase: 'private phase' }, { failureKind: 'private error' },
+  for (const changes of [{ phase: 'copy-checkpoint-write' }, { phase: 'private phase' },
+    { operationPhase: 'copying' }, { operationPhase: undefined }, { operationPhase: 'private operation' }, { failureKind: 'private error' },
     { requestAttempt: 0 }, { requestAttempt: 1.5 }, { lastSuccessfulRequestAt: 'private date' },
     { statementCount: -1 }, { parameterCount: 0.5 }, { bodyBytes: NaN }, { parameterJsonBytes: '120' },
     { databaseId: 'private database' }]) assert.equal(migrationTelemetryEvent(failure(changes)), null);
@@ -154,7 +156,7 @@ test('diagnostic bounds reject malformed correlation, statuses, dates, provider 
     { verification: 'active', tokenStatus: 'disabled' }, { verification: 'inactive', tokenStatus: 'active' },
     { verification: 'unavailable', tokenStatus: 'active' }, { notBefore: 'private date' },
     { expiresOn: '2026-11-15' }]) assert.equal(migrationTelemetryEvent(auth(changes)), null);
-  const unknown = migrationTelemetryEvent(failure({ phase: 'unknown', failureKind: 'unknown', httpStatus: null,
+  const unknown = migrationTelemetryEvent(failure({ phase: 'unknown', operationPhase: 'unknown', failureKind: 'unknown', httpStatus: null,
     providerCodes: [], providerReason: 'unknown', cfRay: null, providerDate: null, requestDurationMs: null,
     requestAttempt: null, lastSuccessfulRequestAt: null, statementCount: null, parameterCount: null,
     bodyBytes: null, parameterJsonBytes: null, databaseId: null }));
@@ -236,6 +238,108 @@ test('GitHub OIDC audience, Entra scope, cached token and expiry refresh use the
   assert.equal(bodies.length, 8);
   assert.equal(bodies[0].acknowledgedRows, null);
   assert.equal(bodies[0].remainingRows, null);
+});
+
+test('eager cold two-hop authentication leaves the one-shot close budget for protobuf ingestion', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  let time = initial;
+  let ready = false;
+  const entered = { github: deferred(), entra: deferred(), ingest: deferred() };
+  const requests = [];
+  const bodies = [];
+  const warnings = [];
+  const creating = createMigrationTelemetry({ env, authentication: 'eager', now: () => time,
+    warn: (event) => warnings.push(event), fetch(url, options) {
+      const stage = url.includes('actions.githubusercontent.com') ? 'github'
+        : url.includes('login.microsoftonline.com') ? 'entra' : 'ingest';
+      requests.push({ stage, started: time - initial });
+      if (stage === 'ingest') bodies.push(...logBodies(options.body));
+      const response = stage === 'github' ? Response.json({ value: 'private-assertion' })
+        : stage === 'entra' ? Response.json({ access_token: 'private-token', expires_in: 3600 })
+          : new Response(null, { status: 204 });
+      const result = new Promise((resolve) => setTimeout(() => resolve(response), 550));
+      entered[stage].resolve();
+      return result;
+    },
+  }).then((sink) => { ready = true; return sink; });
+  await Promise.race([entered.github.promise,
+    creating.then(() => assert.fail('eager creation must enter authentication before returning'))]);
+  time += 550;
+  t.mock.timers.tick(550);
+  await entered.entra.promise;
+  assert.equal(ready, false, 'the second healthy authentication hop must finish before returning');
+  time += 550;
+  t.mock.timers.tick(550);
+  const sink = await creating;
+  assert.deepEqual(requests, [{ stage: 'github', started: 0 }, { stage: 'entra', started: 550 }]);
+  sink.emit(auth());
+  const closing = sink.close();
+  await entered.ingest.promise;
+  time += 550;
+  t.mock.timers.tick(550);
+  await closing;
+  assert.deepEqual(requests, [
+    { stage: 'github', started: 0 }, { stage: 'entra', started: 550 }, { stage: 'ingest', started: 1100 },
+  ]);
+  assert.deepEqual(bodies, [migrationTelemetryEvent(auth())]);
+  assert.deepEqual(warnings, []);
+});
+
+test('eager authentication failures are sanitized and never retried by later event batches', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  for (const stage of ['github', 'entra', 'injected-rejection', 'injected-deadline']) {
+    const warnings = [];
+    const attempts = { github: 0, entra: 0, injected: 0, ingest: 0 };
+    const entered = deferred();
+    const held = deferred();
+    const creating = createMigrationTelemetry({ env, authentication: 'eager',
+      warn: (event) => warnings.push(event),
+      ...(stage.startsWith('injected') ? { getAccessToken: async () => {
+        attempts.injected += 1;
+        entered.resolve();
+        if (stage === 'injected-deadline') return held.promise; // Ignores abort.
+        throw Object.assign(new Error('private startup exception'), { code: 'private code', status: 599 });
+      } } : {}),
+      async fetch(url) {
+        const current = url.includes('actions.githubusercontent.com') ? 'github'
+          : url.includes('login.microsoftonline.com') ? 'entra' : 'ingest';
+        attempts[current] += 1;
+        if (current === stage) return new Response('private provider response', { status: 403 });
+        if (current === 'github') return Response.json({ value: 'private-assertion' });
+        if (current === 'entra') return Response.json({ access_token: 'private-token', expires_in: 3600 });
+        return new Response(null, { status: 204 });
+      },
+    });
+    if (stage === 'injected-deadline') {
+      await entered.promise;
+      t.mock.timers.tick(1000);
+    }
+    const sink = await creating;
+    const expected = { github: stage === 'github' || stage === 'entra' ? 1 : 0,
+      entra: stage === 'entra' ? 1 : 0, injected: stage.startsWith('injected') ? 1 : 0, ingest: 0 };
+    assert.deepEqual(attempts, expected, `${stage}: exactly one startup identity attempt`);
+    assert.deepEqual(warnings, [], 'startup failure is accounted against events, not a fictional delivery');
+    sink.emit(auth());
+    await immediate();
+    sink.emit(auth({ stage: 'copy_failure' }));
+    await sink.close();
+    if (stage === 'injected-deadline') {
+      held.resolve('private-late-token');
+      await immediate();
+    }
+    assert.deepEqual(attempts, expected, `${stage}: emit/send cannot retry startup authentication or ingest`);
+    const summary = warnings.find((event) => event.code === 'delivery-summary');
+    assert.ok(summary);
+    assert.equal(summary.sentEvents, 0);
+    assert.equal(summary.failedEvents, 2);
+    assert.equal(summary.abandonedEvents, 0);
+    const code = stage === 'github' ? 'github-oidc-http' : stage === 'entra' ? 'entra-http'
+      : stage === 'injected-deadline' ? 'request-deadline' : 'transport-failed';
+    assert.ok(warnings.some((event) => event.code === code));
+    assert.equal(warnings.find((event) => event.code === code).httpStatus,
+      stage === 'github' || stage === 'entra' ? 403 : undefined);
+    assert.doesNotMatch(JSON.stringify(warnings), /private|assertion|bearer|599/);
+  }
 });
 
 test('oversized authentication responses and invalid token expiry never reach ingestion', async () => {
@@ -416,6 +520,77 @@ test('hung network and throwing diagnostics cannot hang close or mask the caller
   await assert.rejects(async () => { try { throw primary; } finally { await sink.close(); } }, (error) => error === primary);
   assert.ok(Date.now() - started < 1800, 'close is bounded independently of network');
   sink.emit(progress({ acknowledgedRows: 1 }));
+});
+
+test('close accounts in-flight and all pending records once and remains terminal after late settlements', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  for (const outcome of ['resolve', 'reject', 'request-deadline']) {
+    let time = initial;
+    const identityEntered = deferred();
+    const identity = deferred();
+    const ingestEntered = deferred();
+    const held = deferred();
+    const warnings = [];
+    const requests = [];
+    const sink = await createMigrationTelemetry({ env, now: () => time,
+      getAccessToken: async () => {
+        identityEntered.resolve();
+        return identity.promise;
+      },
+      warn: (event) => warnings.push(event), fetch(_url, options) {
+        requests.push({ records: logBodies(options.body), signal: options.signal });
+        ingestEntered.resolve();
+        return held.promise; // Intentionally ignores the close abort.
+      },
+    });
+    sink.emit(progress({ acknowledgedRows: 1 }));
+    await identityEntered.promise;
+    sink.emit(progress({ acknowledgedRows: 2 }));
+    sink.emit(progress({ acknowledgedRows: 3 }));
+    sink.emit(failure());
+    sink.emit(auth());
+    sink.emit(auth({ stage: 'copy_failure' }));
+    const closing = sink.close();
+    const alsoClosing = sink.close();
+    // Start ingestion later than close so its independent request deadline
+    // cannot win the race and misclassify the still-unknown in-flight outcome.
+    time += 250;
+    t.mock.timers.tick(250);
+    identity.resolve('private-token');
+    await ingestEntered.promise;
+    time += 750;
+    t.mock.timers.tick(750);
+    await Promise.all([closing, alsoClosing]);
+    assert.equal(requests.length, 1);
+    assert.deepEqual(requests[0].records, [migrationTelemetryEvent(progress({ acknowledgedRows: 1 }))]);
+    assert.equal(requests[0].signal.aborted, true);
+    assert.deepEqual(warnings.map((event) => event.code), ['close-deadline', 'delivery-summary']);
+    for (const warning of warnings) {
+      assert.equal(warning.sentEvents, 0);
+      assert.equal(warning.failedEvents, 0, 'an abandoned in-flight outcome is not a confirmed failure');
+      assert.equal(warning.abandonedEvents, 5, 'one in-flight record plus four pending kinds/stages');
+      assert.equal(warning.coalescedEvents, 1);
+      assert.equal(warning.droppedEvents, 0);
+    }
+    const atClose = JSON.stringify(warnings);
+    if (outcome === 'request-deadline') {
+      time += 250;
+      t.mock.timers.tick(250);
+      await immediate();
+    }
+    if (outcome === 'reject') held.reject(new Error('private late transport error'));
+    else held.resolve(new Response(null, { status: 204 }));
+    await immediate();
+    await immediate();
+    time += 2000;
+    t.mock.timers.tick(2000);
+    await immediate();
+    sink.emit(progress({ acknowledgedRows: 100 }));
+    sink.emit({ invalid: true });
+    await sink.close();
+    assert.equal(JSON.stringify(warnings), atClose, `${outcome}: no late accounting or repeated summary`);
+    assert.equal(requests.length, 1, `${outcome}: pending evidence must not replay after close`);
+  }
 });
 
 test('close is a quiescent diagnostics boundary even when authentication or ingestion ignores abort', async () => {

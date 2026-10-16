@@ -345,11 +345,26 @@ jobs:
         run: |
           node ../infra/cf/index-control.mjs health --config "$RUNNER_TEMP/index-maintenance.json" --mode maintenance
           node ../infra/cf/index-control.mjs drain --config "$RUNNER_TEMP/index-maintenance.json"
+      - name: Record migration token validity before copy
+        if: steps.index-layout.outputs.layout_state != 'active'
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
+        run: node ../infra/cf/migration-auth-diagnostics.mjs --stage preflight
       - name: Resume full-fidelity copy and verified source deletion
+        id: index-copy
         if: steps.index-layout.outputs.layout_state != 'active'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
         run: node ../infra/cf/index-control.mjs copy --config "$RUNNER_TEMP/index-maintenance.json" --pass-budget-ms 18000000
+      - name: Record migration token validity after failed copy
+        if: ${{ failure() && steps.index-copy.outcome == 'failure' }}
+        continue-on-error: true
+        timeout-minutes: 1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
+        run: node ../infra/cf/migration-auth-diagnostics.mjs --stage copy_failure
       - name: Apply and verify main migrations after any required source copy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}

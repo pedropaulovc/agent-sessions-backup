@@ -1151,8 +1151,9 @@ cleared at the terminal progress event, after which the reporter emits no progre
 
 A terminal copy error additionally emits one `migration.copy.failure` record to
 stdout and the existing Azure sink without changing the original error, failure
-status, source/checkpoint state or retry rules. It carries the allowlisted copy
-operation phase (for example `copy-checkpoint-write`), failure category, actual
+status, source/checkpoint state or retry rules. It carries the last observed coarse
+copy `phase` from progress (or `unknown`) separately from the allowlisted
+`operationPhase` (for example `copy-checkpoint-write`, or `unknown`), failure category, actual
 HTTP status, bounded numeric provider codes and closed-category reason, validated
 Cloudflare ray/provider timestamp, request duration/attempt, last successful
 request timestamp, statement/parameter/body-size aggregates, and a validated D1
@@ -1164,20 +1165,28 @@ credentials, token ID/value/fingerprint or exception message. In particular a
 Immediately before a required copy, the protected production main-push workflow
 runs `migration-auth-diagnostics.mjs --stage preflight`; after the **copy step
 itself fails**, it runs `--stage copy_failure`. An unrelated earlier failure or
-skipped copy does not trigger the post-copy probe. Both steps are best-effort,
-with one-minute hard caps; they cannot mask a failed copy, relabel a provider error
-as partial, change exit 78 or allow later migrations/activation to run after a
-failure. The existing five-hour copy-process budget and fail-closed cleanup stay
-unchanged.
+skipped copy does not trigger the post-copy probe. `copy_failure` describes the
+failed GitHub Actions step, not an authentication-failure diagnosis: it also runs
+for an expected copy-process budget exit 78 because GitHub marks that step failed.
+Both steps are best-effort, with one-minute hard caps; they cannot mask a failed
+copy, relabel a provider error as partial, change original exit 78/partial-copy
+semantics or allow later migrations/activation to run after a failure. The existing
+five-hour copy-process budget and fail-closed cleanup stay unchanged.
 
 Each diagnostic makes one GET to the fixed Cloudflare **user-token**
 `/client/v4/user/tokens/verify` endpoint using the existing migration secret,
 under the protected main-push guard only. The request/body deadline is at most
-one second; redirects and retries are forbidden. The existing Azure close has its
-own one-second total deadline. There is no endpoint/account-token fallback or new
-secret/scope. Do not run real production-token diagnostics from a workstation,
-PR or preview; local tests inject synthetic fetches only. The CLI guard does not
-replace production-environment security.
+one second; redirects and retries are forbidden. Only this one-shot CLI requests
+eager Azure authentication before emitting its record: one GitHub OIDC hop and
+one Entra hop, each bounded by the existing one-second request/body deadline
+(or one at-most-one-second injected token acquisition in local tests). A failed
+eager acquisition is sanitized and counted as failed delivery for emitted records,
+with no identity retry or ingest request. Normal copying remains lazy. The
+unchanged Azure close has its own one-second total deadline. There is no
+endpoint/account-token fallback or new secret/scope. Do not run real
+production-token diagnostics from a workstation, PR or preview; local tests
+inject synthetic fetches only. The CLI guard does not replace
+production-environment security.
 
 The safe `migration.auth.diagnostic` record reports its stage, own `recordedAt`,
 `verification` (`active`, `inactive`, `unavailable`, `not_configured`), endpoint
@@ -1195,8 +1204,13 @@ progress, copy failure and preflight/post-failure auth **separately**. Auth/fail
 observations have their own age and ingestion lag and never replace durable ACK
 progress or refresh its ETA. The bounded sink preserves one pending record per
 kind/stage and prioritizes critical records in a batch, but close/transport loss
-can still prevent Azure delivery; retain stdout evidence. The final monitor query
-does not wait for ingestion or prove the absence of a missing final record.
+can still prevent Azure delivery; retain stdout evidence. On close deadline the
+separate `abandonedEvents` count includes the in-flight batch and every pending
+record exactly once, not a claimed failed delivery whose in-flight outcome is
+unknown. Deadline/summary warnings include that count; late settlements or repeated
+closes cannot change the terminal counters or emit more warnings. The final
+monitor query does not wait for ingestion or prove the absence of a missing final
+record.
 Keep maintenance and consumers paused, inspect the original failed operation and
 durable recovery state, and obtain approval for a protected continuation. No
 credential rotation/repair, policy change, automatic resume or new attempt follows

@@ -5,7 +5,7 @@ import { COPY_PHASES } from '../../hub/scripts/lib/index-migration.mjs';
 
 const GUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const PHASES = new Set(MIGRATION_COPY_PHASES);
-const FAILURE_PHASES = new Set([...Object.values(COPY_PHASES), 'unknown']);
+const OPERATION_PHASES = new Set([...Object.values(COPY_PHASES), 'unknown']);
 const STATUSES = new Set(['running', 'complete', 'partial', 'failed']);
 const COUNTERS = ['acknowledgedRows', 'passRows', 'pendingRows', 'remainingRows'];
 const MEASURES = ['elapsedMs', 'rowsPerSecond', 'etaSeconds'];
@@ -77,11 +77,12 @@ export function migrationTelemetryEvent(input) {
   event.providerDate = input.providerDate;
   event.requestDurationMs = input.requestDurationMs;
   if (input.event === 'migration.copy.failure') {
-    if (!FAILURE_PHASES.has(input.phase) || !FAILURE_KINDS.has(input.failureKind)
+    if (!PHASES.has(input.phase) || !OPERATION_PHASES.has(input.operationPhase) || !FAILURE_KINDS.has(input.failureKind)
       || (input.requestAttempt !== null && (!Number.isSafeInteger(input.requestAttempt) || input.requestAttempt < 1))
       || (input.lastSuccessfulRequestAt !== null && !validDate(input.lastSuccessfulRequestAt))
       || (input.databaseId !== null && (typeof input.databaseId !== 'string' || !GUID.test(input.databaseId)))) return null;
     event.phase = input.phase;
+    event.operationPhase = input.operationPhase;
     event.failureKind = input.failureKind;
     event.requestAttempt = input.requestAttempt;
     event.lastSuccessfulRequestAt = input.lastSuccessfulRequestAt;
@@ -162,12 +163,13 @@ async function deadline(operation, controller, milliseconds, code = 'request-dea
 
 export async function createMigrationTelemetry({
   env = process.env, fetch = globalThis.fetch, now = Date.now,
-  warn = (event) => console.warn(JSON.stringify(event)), getAccessToken,
+  warn = (event) => console.warn(JSON.stringify(event)), getAccessToken, authentication = 'lazy',
 } = {}) {
   let sentEvents = 0;
   let failedEvents = 0;
   let coalescedEvents = 0;
   let droppedEvents = 0;
+  let abandonedEvents = 0;
   let diagnosticsClosed = false;
   const warningAt = new Map();
   const warning = (code, status) => {
@@ -178,13 +180,14 @@ export async function createMigrationTelemetry({
     try {
       warn(Object.freeze({ event: 'migration.telemetry.warning', code,
         ...(Number.isInteger(status) ? { httpStatus: status } : {}),
-        sentEvents, failedEvents, coalescedEvents, droppedEvents }));
+        sentEvents, failedEvents, coalescedEvents, droppedEvents, abandonedEvents }));
     } catch { /* Telemetry diagnostics cannot replace a migration error. */ }
   };
   const disabled = (code) => {
     warning(code);
     return { emit() {}, async close() {} };
   };
+  if (authentication !== 'lazy' && authentication !== 'eager') return disabled('authentication-invalid');
   const tenant = env.MIGRATION_AZURE_TENANT_ID;
   const client = env.MIGRATION_AZURE_CLIENT_ID;
   const endpoint = logsEndpoint(env.MIGRATION_AZURE_LOGS_ENDPOINT);
@@ -203,9 +206,11 @@ export async function createMigrationTelemetry({
   let cache = null;
   const pending = new Map();
   let inflight = null;
+  let inflightEvents = 0;
   let activeController = null;
   let scheduled = false;
   let closing = false;
+  let closePromise = null;
   let stopped = false;
 
   async function request(url, options, stage, readJson = false) {
@@ -261,8 +266,24 @@ export async function createMigrationTelemetry({
     return cache.token;
   }
 
+  let startupToken = null;
+  let startupFailure = null;
+  if (authentication === 'eager') {
+    try {
+      const accessToken = await token();
+      // Real OIDC auth already populated the expiring cache. An injected token
+      // has no expiry contract, so consume its eager result only once.
+      if (getAccessToken) startupToken = accessToken;
+    } catch (error) {
+      startupFailure = error instanceof TelemetryFailure
+        ? new TelemetryFailure(error.code, error.status) : new TelemetryFailure('transport-failed');
+    }
+  }
+
   async function send(events) {
-    const accessToken = await token();
+    if (startupFailure) throw startupFailure;
+    const accessToken = startupToken ?? await token();
+    startupToken = null;
     if (stopped) return;
     const { chunks, dropped } = encodeLogsChunks({ resourceLogs: [{
       resource: { attributes: [{ key: 'service.name', value: { stringValue: 'sessions-index-migration' } }] },
@@ -276,9 +297,9 @@ export async function createMigrationTelemetry({
       await request(endpoint, { method: 'POST',
         headers: { 'Content-Type': 'application/x-protobuf', Authorization: `Bearer ${accessToken}` },
         body: chunks[0] }, 'ingest');
-      sentEvents += events.length;
+      if (!stopped) sentEvents += events.length;
     } catch (error) {
-      if (error?.status === 401 || error?.status === 403) cache = null;
+      if (!stopped && (error?.status === 401 || error?.status === 403)) cache = null;
       throw error;
     }
   }
@@ -290,13 +311,19 @@ export async function createMigrationTelemetry({
       while (pending.size && !stopped) {
         const events = DELIVERY_ORDER.filter((key) => pending.has(key)).map((key) => pending.get(key));
         pending.clear();
+        inflightEvents = events.length;
         try { await send(events); }
         catch (error) {
-          failedEvents += events.length;
-          warning(error instanceof TelemetryFailure ? error.code : 'transport-failed', error?.status);
+          if (!stopped) {
+            failedEvents += events.length;
+            warning(error instanceof TelemetryFailure ? error.code : 'transport-failed', error?.status);
+          }
+        } finally {
+          if (!stopped) inflightEvents = 0;
         }
       }
     })().finally(() => {
+      if (stopped) return;
       inflight = null;
       if (pending.size && !stopped) start();
     });
@@ -314,24 +341,33 @@ export async function createMigrationTelemetry({
         if (!inflight && !scheduled) { scheduled = true; queueMicrotask(start); }
       } catch { droppedEvents += 1; warning('event-invalid'); }
     },
-    async close() {
-      if (stopped) return;
+    close() {
+      if (closePromise) return closePromise;
       closing = true;
-      start();
-      const controller = new AbortController();
-      try {
-        await deadline(() => inflight, controller, CLOSE_MS, 'close-deadline');
-      } catch { warning('close-deadline'); }
-      finally {
-        stopped = true;
-        activeController?.abort();
-        pending.clear();
-        cache = null;
-      }
-      if (failedEvents || coalescedEvents || droppedEvents) warning('delivery-summary');
-      // Existing asynchronous fetch/body operations may ignore abort and settle
-      // later. close() is the terminal diagnostics boundary, not a network join.
-      diagnosticsClosed = true;
+      closePromise = (async () => {
+        start();
+        const controller = new AbortController();
+        try {
+          await deadline(() => inflight, controller, CLOSE_MS, 'close-deadline');
+        } catch {
+          // The in-flight outcome is unknown, not a confirmed delivery failure.
+          abandonedEvents += inflightEvents + pending.size;
+          warning('close-deadline');
+        } finally {
+          stopped = true;
+          activeController?.abort();
+          pending.clear();
+          inflight = null;
+          inflightEvents = 0;
+          cache = null;
+          startupToken = null;
+        }
+        if (failedEvents || coalescedEvents || droppedEvents || abandonedEvents) warning('delivery-summary');
+        // Ignored aborts may settle later; neither counters nor diagnostics may
+        // change after this terminal boundary. Concurrent closes share it.
+        diagnosticsClosed = true;
+      })();
+      return closePromise;
     },
   };
 }

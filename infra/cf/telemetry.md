@@ -326,9 +326,19 @@ requires native type stripping (older Node 22 releases may require
 import TypeScript. An unavailable encoder produces a typed warning rather than
 breaking copying.
 
-`createMigrationTelemetry({ env, fetch?, now?, warn?, getAccessToken? })` resolves
-to `{ emit(event), close() }`. `emit` is synchronous/nonblocking and copies only
-the finite event allowlist plus full revision/run/attempt correlation. Progress's
+`createMigrationTelemetry({ env, fetch?, now?, warn?, getAccessToken?, authentication? })`
+resolves to `{ emit(event), close() }`. Authentication is the explicit
+`'lazy' | 'eager'` option, defaulting to `'lazy'` for normal copying. Only the
+one-shot auth-diagnostics CLI opts into `'eager'`: sink creation waits for one
+bounded token acquisition before returning, leaving close's flush budget for
+ingestion. GitHub OIDC and Entra each retain their separate at-most-one-second
+request/body deadline (at most two seconds total); an injected `getAccessToken`
+has its existing one-second deadline. A failed eager acquisition is retained only
+as a sanitized typed failure: emitted records enter failed-event accounting
+without retrying identity or attempting ingestion.
+
+`emit` is synchronous/nonblocking and copies only the finite event allowlist plus
+full revision/run/attempt correlation. Progress's
 schema is unchanged. It keeps one in-flight request and at most four pending
 records: the newest progress, copy failure, preflight auth and copy-failure auth.
 Coalescing is per kind/stage, so a heartbeat or generic failed progress cannot
@@ -338,20 +348,27 @@ copy failure, post-failure auth, preflight auth, then progress. No per-successfu
 Cloudflare-request logs are added. Each network operation has a one-second
 deadline; `close()` has a separate one-second total flush deadline. Its synchronous
 deadline/summary warnings are emitted before it resolves; no diagnostics or
-follow-on HTTP requests are issued after close, even if an existing request ignores
-abort and settles later. Delivery, including terminal evidence, is best-effort:
-an in-flight stall can still exhaust close before a pending batch is delivered.
-There is no replay/retry loop or telemetry I/O in checkpoint ACKs. Failures produce
-`migration.telemetry.warning` codes and aggregate delivery counts, never tokens,
-headers, upstream bodies, errors, row IDs, hashes, or session text. CLI stdout
-remains the independent telemetry record if Azure delivery fails.
+follow-on HTTP requests are issued after close resolves, even if an existing
+request ignores abort and settles later. Delivery, including terminal evidence,
+is best-effort: an in-flight stall can still exhaust close before a pending batch
+is delivered. `abandonedEvents` counts both the in-flight batch and all pending
+records left at that deadline, exactly once. These are not added to `failedEvents`:
+the in-flight delivery outcome is unknown. Warnings and the delivery summary
+include `sentEvents`, `failedEvents`, `coalescedEvents`, `droppedEvents` and
+`abandonedEvents`; late settlements cannot mutate counters or emit another
+warning/summary, and repeated/concurrent closes share the same terminal boundary.
+There is no replay/retry loop or telemetry I/O in checkpoint ACKs. Warnings contain
+only typed codes and aggregate delivery counts, never tokens, headers, upstream
+bodies, errors, row IDs, hashes, or session text. CLI stdout remains the independent
+telemetry record if Azure delivery fails.
 
 ### Failure context and token validity
 
 Both new kinds are flat `schemaVersion: 1` records with their own ISO `recordedAt`
 and the same strict full revision/run/attempt correlation. Unknown fields are
-dropped, not forwarded. `migration.copy.failure` carries an allowlisted copy
-operation `phase` (for example `copy-checkpoint-write`), `failureKind`, actual
+dropped, not forwarded. `migration.copy.failure` carries the last observed coarse
+copy `phase` (the same vocabulary as progress, or `unknown`) and allowlisted
+`operationPhase` (for example `copy-checkpoint-write`, or `unknown`), `failureKind`, actual
 `httpStatus`, at most 16 numeric `providerCodes`, closed-category `providerReason`,
 validated `cfRay`, normalized `providerDate`, `requestDurationMs`, `requestAttempt`,
 `lastSuccessfulRequestAt`, request size/count aggregates (`statementCount`,
@@ -360,6 +377,9 @@ Unknown values are null, never inferred from an exception message. No SQL,
 parameters, row/session content, raw provider message/body, request URL, token ID,
 token value or fingerprint is emitted. The original copy error and outcome remain
 unchanged. HTTP 401 or code 10000 alone is not evidence of token expiry.
+After guarded configuration setup, failure context covers the initial maintenance
+health and drain/atomicity prerequisites as well as the pass. A prerequisite
+failure can have `phase: "unknown"` and no preceding progress event.
 
 `migration.auth.diagnostic` adds `stage` (`preflight` or `copy_failure`),
 `verification` (`active`, `inactive`, `unavailable`, `not_configured`),
@@ -367,10 +387,12 @@ unchanged. HTTP 401 or code 10000 alone is not evidence of token expiry.
 `expiresOn` (or null), and the same bounded provider HTTP/code/reason/ray/date/
 duration fields. It makes one read-only GET to the fixed **user-token** endpoint
 `https://api.cloudflare.com/client/v4/user/tokens/verify`, with the existing
-migration secret supplied only as `MIGRATION_TOKEN`. A reported active token is
+migration secret supplied only as `CLOUDFLARE_API_TOKEN`. A reported active token is
 **not proof of D1 permissions, account access, or whole-pass health**. Unsupported,
 unavailable or malformed verification is unknown, not proof of an invalid token or
 missing D1 permission. There is no account-token probe or endpoint fallback.
+Only a well-formed HTTP 200 verification response supplies token metadata;
+other HTTP statuses leave that metadata unknown, including other 2xx responses.
 
 The diagnostic CLI permits a real request only with `GITHUB_ACTIONS=true`,
 `GITHUB_REF=refs/heads/main`, `GITHUB_EVENT_NAME=push`,
@@ -379,13 +401,18 @@ The diagnostic CLI permits a real request only with `GITHUB_ACTIONS=true`,
 production-environment protections. PR/PPE/local tests use only injected synthetic
 fetches; do not export production Cloudflare credentials locally to try this CLI.
 The single verification deadline is at most one second, including response-body
-reading; redirects are rejected and there are no retries. The existing sink close
-adds at most one second of flushing. Workflow diagnostic steps have an additional
-one-minute hard cap and are best-effort; a preflight problem cannot block copying,
-and a post-failure diagnostic cannot turn a failed copy (including exit 78) into
-success. The post-failure step is conditioned on the actual copy step's failure,
-not any unrelated job failure. Neither diagnostic performs credential repair,
-changes scopes/policy, resumes copying or starts another attempt.
+reading; redirects are rejected and there are no retries. The CLI then eagerly
+authenticates the Azure sink within the existing two-hop limits above before
+emitting its one record; the unchanged sink close adds at most one second of
+flushing. Workflow diagnostic steps have an additional one-minute hard cap and
+are best-effort; a preflight problem cannot block copying, and a post-failure
+diagnostic cannot turn a failed copy into success. The `copy_failure` stage
+observes the actual **failed GitHub Actions copy step**, including an expected
+copy-process budget exit 78 because GitHub marks that step failed; it does not
+imply an authentication failure. Original exit 78/partial-copy semantics remain
+unchanged. An unrelated job failure does not trigger this observation. Neither
+diagnostic performs credential repair, changes scopes/policy, resumes copying or
+starts another attempt.
 
 ### Verify ingestion without Cloudflare credentials
 

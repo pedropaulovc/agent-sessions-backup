@@ -5052,6 +5052,7 @@ async function copyCliFixture(context) {
         let copyStarted;
         let faultIndex = 0;
         let awaitingRetry = false;
+        let authRejected = false;
         let expired = false;
         let longPage = false;
         const requests = [];
@@ -5169,6 +5170,24 @@ async function copyCliFixture(context) {
           const adapter = adapters.find((db) => db.id === id);
           assert.ok(adapter, 'D1 requests must address actual fixture databases');
           const body = JSON.parse(init.body);
+          // A synthetic provider credential rejection of the first matching IDX00 request:
+          // the fenced copy checkpoint update, or a named prerequisite checkpoint read.
+          // Its provider message and SQL never reach any log or telemetry event.
+          const rejects = scenario.authReject === 'copy-checkpoint'
+            ? /^UPDATE index_migration_state SET value = \\?2/.test(body.sql ?? '')
+            : /^SELECT value FROM index_migration_state WHERE name = \\?$/.test(body.sql ?? '')
+              && body.params?.[0] === scenario.authReject;
+          if (scenario.authReject && !authRejected && id === f.shards[0].id && rejects) {
+            authRejected = true;
+            now += 11;
+            const providerDate = new Date(now).toUTCString();
+            requests.push({ kind: 'd1-auth-reject', started, providerDate,
+              bodyBytes: Buffer.byteLength(init.body, 'utf8'),
+              parameterJsonBytes: Buffer.byteLength(JSON.stringify(body.params), 'utf8') });
+            return Response.json({ success: false, errors: [{ code: 10000, message: 'Authentication error' }],
+              messages: [${JSON.stringify(copyCliCanary)}] },
+            { status: 401, headers: { 'cf-ray': 'a4b8dcbe9f86579a-IAD', date: providerDate } });
+          }
           requests.push({ kind: 'd1', started, aborted: init.signal.aborted });
           const result = body.batch ? await adapter.batch(body.batch)
             : [{ success: true, results: await adapter.query(body.sql, body.params) }];
@@ -5302,6 +5321,95 @@ test('copy CLI exhausted health transport is sanitized and preserves the verifie
       assertCopied(f, rows);
       assert.deepEqual(f.shards.map((db) => db.rows('SELECT * FROM blocks ORDER BY id')), snapshots,
         'durable copying-page resume retains every column while rebuilding and checking actual FTS');
+    });
+  }
+});
+
+test('copy CLI credential rejection is terminal and emits one bounded structured failure event', async (context) => {
+  const { f, rows, run } = await copyCliFixture(context);
+  const result = await run({ authReject: 'copy-checkpoint' });
+  assert.equal(result.status, 1);
+  assertCopyCliPrivate(result);
+  const output = `${result.stdout}${result.stderr}`;
+  for (const secret of ['Authentication error', 'index_migration_state', 'Bearer']) {
+    assert.ok(!output.includes(secret), 'provider text, SQL and credentials never reach CI logs');
+  }
+  const { events, result: copied } = copyCliStdout(result);
+  assert.equal(copied, null, 'a failed pass prints no result line');
+  const rejectIndex = result.requests.findIndex(({ kind }) => kind === 'd1-auth-reject');
+  assert.ok(rejectIndex >= 0, 'the fixture must reject an actual IDX00 checkpoint update');
+  assert.deepEqual(result.requests.slice(rejectIndex + 1), [], 'no replay and no later request follows the rejection');
+  const rejection = result.requests[rejectIndex];
+  const failures = events.filter(({ event }) => event === 'migration.copy.failure');
+  assert.equal(failures.length, 1);
+  const [failure] = failures;
+  const progress = events.filter(({ event }) => event === 'migration.copy.progress');
+  assert.equal(progress.at(-1).status, 'failed');
+  assert.ok(events.indexOf(progress.at(-1)) < events.indexOf(failure), 'the failed progress event is retained, not replaced');
+  const lastSuccess = Date.parse(failure.lastSuccessfulRequestAt);
+  assert.ok(lastSuccess >= copyCliStart && lastSuccess <= rejection.started);
+  assert.ok(MIGRATION_COPY_PHASES.includes(progress.at(-1).phase));
+  assert.deepEqual(failure, {
+    event: 'migration.copy.failure', schemaVersion: 1, recordedAt: failure.recordedAt,
+    phase: progress.at(-1).phase, operationPhase: 'copy-checkpoint-write',
+    failureKind: 'http', httpStatus: 401, providerCodes: [10000],
+    providerReason: 'authentication', cfRay: 'a4b8dcbe9f86579a-IAD',
+    providerDate: new Date(Date.parse(rejection.providerDate)).toISOString(),
+    requestDurationMs: 11, requestAttempt: 1, lastSuccessfulRequestAt: failure.lastSuccessfulRequestAt,
+    statementCount: 1, parameterCount: 3, bodyBytes: rejection.bodyBytes,
+    parameterJsonBytes: rejection.parameterJsonBytes, databaseId: f.shards[0].id,
+    revision: copyCliRevision, runId: '12345', attempt: '1',
+  });
+  assert.ok(Date.parse(failure.recordedAt) >= rejection.started);
+  assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), rows, 'a rejected checkpoint acknowledges nothing');
+  f.restart();
+  const resumed = await run();
+  assert.equal(resumed.status, 0, resumed.stderr);
+  assert.equal(copyCliStdout(resumed).result.state, 'complete');
+  assert.ok(!copyCliStdout(resumed).events.some(({ event }) => event === 'migration.copy.failure'));
+  assertCopied(f, rows);
+});
+
+test('copy CLI prerequisite credential rejection reports the same bounded failure before any copy request', async (context) => {
+  for (const checkpoint of ['index-maintenance-freeze-v1', 'index-rest-batch-atomicity-v1']) {
+    await context.test(checkpoint, async (child) => {
+      const { f, rows, run } = await copyCliFixture(child);
+      const result = await run({ authReject: checkpoint });
+      assert.equal(result.status, 1);
+      assertCopyCliPrivate(result);
+      const output = `${result.stdout}${result.stderr}`;
+      for (const secret of ['Authentication error', 'index_migration_state', 'Bearer']) {
+        assert.ok(!output.includes(secret), 'provider text, SQL and credentials never reach CI logs');
+      }
+      const { events, result: copied } = copyCliStdout(result);
+      assert.equal(copied, null, 'a failed prerequisite prints no result line');
+      const rejectIndex = result.requests.findIndex(({ kind }) => kind === 'd1-auth-reject');
+      assert.ok(rejectIndex >= 0, 'the fixture must reject the actual prerequisite read');
+      assert.deepEqual(result.requests.slice(rejectIndex + 1), [], 'no replay and no later request follows the rejection');
+      assert.equal(result.healthCalls.length, 1, 'only the initial maintenance gate precedes the prerequisites');
+      assert.ok(!events.some(({ event }) => event === 'migration.copy.progress'), 'no copy pass started');
+      const rejection = result.requests[rejectIndex];
+      const failures = events.filter(({ event }) => event === 'migration.copy.failure');
+      assert.equal(failures.length, 1);
+      const [failure] = failures;
+      const freeze = checkpoint === 'index-maintenance-freeze-v1';
+      // The freeze read is this invocation's first D1 request; the atomicity read follows it.
+      if (freeze) assert.equal(failure.lastSuccessfulRequestAt, null);
+      else assert.ok(Date.parse(failure.lastSuccessfulRequestAt) <= rejection.started);
+      assert.deepEqual(failure, {
+        event: 'migration.copy.failure', schemaVersion: 1, recordedAt: failure.recordedAt,
+        phase: 'unknown', operationPhase: 'checkpoint-read',
+        failureKind: 'http', httpStatus: 401, providerCodes: [10000],
+        providerReason: 'authentication', cfRay: 'a4b8dcbe9f86579a-IAD',
+        providerDate: new Date(Date.parse(rejection.providerDate)).toISOString(),
+        requestDurationMs: 11, requestAttempt: 1, lastSuccessfulRequestAt: failure.lastSuccessfulRequestAt,
+        statementCount: 1, parameterCount: 1, bodyBytes: rejection.bodyBytes,
+        parameterJsonBytes: rejection.parameterJsonBytes, databaseId: f.shards[0].id,
+        revision: copyCliRevision, runId: '12345', attempt: '1',
+      });
+      assert.ok(!result.trace.some((event) => event.sql && isWrite(event.sql)), 'no D1 write follows the rejection');
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), rows);
+      assert.equal(result.checkpoint, null, 'no copy checkpoint is written');
     });
   }
 });

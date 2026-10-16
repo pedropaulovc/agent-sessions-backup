@@ -32,7 +32,7 @@ const auth = (changes = {}) => ({
 });
 const failure = (changes = {}) => ({
   event: 'migration.copy.failure', schemaVersion: 1, ...correlation,
-  recordedAt: new Date(time).toISOString(), phase: 'copy-checkpoint-write', failureKind: 'http',
+  recordedAt: new Date(time).toISOString(), phase: 'retiring', operationPhase: 'copy-checkpoint-write', failureKind: 'http',
   httpStatus: 401, providerCodes: [10000], providerReason: 'authentication', cfRay: '0123456789abcdef-LAX',
   providerDate: new Date(time).toISOString(), requestDurationMs: 25, requestAttempt: 1,
   lastSuccessfulRequestAt: null, statementCount: 1, parameterCount: 2, bodyBytes: 100,
@@ -297,6 +297,8 @@ test('diagnostics independently select newest correlated kind and stage, rejecti
   const evidence = migrationDiagnosticEvidence(rows, correlation, time + 40_000);
   assert.equal(evidence.copyFailure.httpStatus, 403);
   assert.equal(evidence.copyFailure.recordedAt, latest);
+  assert.equal(evidence.copyFailure.phase, 'retiring');
+  assert.equal(evidence.copyFailure.operationPhase, 'copy-checkpoint-write');
   assert.equal(evidence.auth.preflight.requestDurationMs, 50);
   assert.equal(evidence.auth.copy_failure.verification, 'unavailable');
   assert.equal(evidence.auth.preflight.permissionEvidence, 'not-established');
@@ -346,7 +348,8 @@ test('diagnostic evidence and monitor output exclude raw errors, headers, SQL, p
   });
   assert.doesNotMatch(logs.join('\n'), /PRIVATE_|999/);
   assert.ok(logs.some((line) => line.startsWith('migration auth preflight ') && line.includes('"verification":"active"')));
-  assert.ok(logs.some((line) => line.startsWith('migration copy failure ') && line.includes('"httpStatus":401')));
+  assert.ok(logs.some((line) => line.startsWith('migration copy failure ') && line.includes('"httpStatus":401')
+    && line.includes('"phase":"retiring"') && line.includes('"operationPhase":"copy-checkpoint-write"')));
   assert.ok(logs.some((line) => line.startsWith('migration progress ') && line.includes('"delivery":"unknown"')));
 });
 

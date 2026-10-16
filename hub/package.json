@@ -22,7 +22,7 @@
     "test:preview-smoke": "node --test test/preview-control-smoke.node.test.mjs",
     "test:provision-queues": "node --test test/provision-queues.node.test.mjs",
     "test:migrations": "node --test test/migrations.acceptance.mjs test/index-migration.node.test.mjs test/catalog-migrations.node.test.mjs",
-    "test:migration-progress": "node --test test/migration-telemetry.node.test.mjs test/monitor-main-run.node.test.mjs",
+    "test:migration-progress": "node --test test/migration-telemetry.node.test.mjs test/monitor-main-run.node.test.mjs test/migration-auth-diagnostics.node.test.mjs",
     "test:cloudflare-api-budget": "node --test test/cloudflare-api-budget.node.test.mjs",
     "migrations": "node scripts/migrations.mjs"
   },
