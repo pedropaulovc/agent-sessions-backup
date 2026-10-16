@@ -389,6 +389,11 @@ The one-time cutover runs these operations in order, from the same checked-out m
    absent. A partially committed probe is cleaned up by its own name only and fails
    closed. A durable `index-rest-batch-atomicity-v1` proof binds revision/run/attempt
    and shard ID; `copy` refuses a different or missing proof. The source is untouched.
+   `initialize` is also the sole, one-time importer of the unfenced copy checkpoint
+   (see the fenced copy checkpoint below). It reports `copyCheckpoint` as `current`
+   (the fenced key exists; the unfenced key is never read), `imported` (the unfenced
+   state passed the identity and full shape checks and was wrapped verbatim at
+   generation 1), or `absent`.
 3. `index-control.mjs state` checks source objects and durable checkpoint identities,
    then reports a bounded first/middle/last source sample as `copyForecast`. It logs
    aggregate row bytes, page occupancy, shard fanout, estimated remaining requests,
@@ -530,7 +535,7 @@ durable readiness/activation proofs and CLI results use `state: "ready"` or
 identities or changed proof digests fail closed; none is treated as a missing
 checkpoint or accepted as a compatibility format.
 
-`IDX00.index_migration_state` stores `full-fidelity-index-copy-v1`,
+`IDX00.index_migration_state` stores `full-fidelity-index-copy-v2`,
 `full-fidelity-index-catalog-v1`, `index-maintenance-freeze-v1`, the current
 `index-rest-batch-atomicity-v1`, and READY/ACTIVATION proofs. The copy records the
 immutable source/shard IDs, complete column list, acknowledged ID cursor, verified row
@@ -552,6 +557,27 @@ requests can still complete; the full catalog seed then drains all captured outb
 versions, including changes behind its saved scan cursor, with readback before ack.
 Database-bound migration journals are useful per-run evidence; the durable shard
 checkpoint and D1 migration/checksum ledgers, not runner-temporary files, carry recovery.
+
+The copy checkpoint is fenced. `full-fidelity-index-copy-v2` stores exactly
+`{format: 1, generation, state}`: `state` is the semantic copy checkpoint every reader,
+classifier and READY/ACTIVATION digest uses, unchanged; `generation` is a positive
+safe integer outside it. Each transition is one statement: an insert-if-absent for
+the first write, then `UPDATE ... WHERE generation = expected RETURNING generation`.
+Exactly one returned row equal to `expected + 1` is required. Any other result is the
+`checkpoint-fence` invariant, distinct from a transport/HTTP failure; it is never
+retried, and no later checkpoint or source write in that run follows it. A delayed
+request from an earlier run (lost response, unknown commit) can therefore never
+rewind the checkpoint, even to an identical earlier state. After an unknown
+checkpoint-write outcome, rerun the protected workflow: the next run reads the durable
+envelope and either resumes from the committed write or repeats the uncommitted one.
+Any other envelope shape fails closed and is never rewritten. Generic checkpoint
+reads and writes refuse both copy keys.
+
+`full-fidelity-index-copy-v1` is the unfenced copier's key. It is an inert archive:
+`initialize` reads it only while the fenced key is absent, and no reader falls back to
+it, so a late UPSERT to it changes nothing. It is never deleted. While it exists
+without the fenced key, `copy` fails closed before any write instead of starting a
+fresh copy; run `initialize` (the normal workflow does so before `state`).
 
 An absent copy `encoding` is accepted only by the explicit one-time legacy
 checkpoint upgrade, not by a general alternate-reader fallback. Before changing a

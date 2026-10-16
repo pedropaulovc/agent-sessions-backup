@@ -626,8 +626,8 @@ async function proveByteExactRecovery({ source, shards, gate, positive, positive
   phase = 'byte-exact-checkpoint-fence';
   const positiveStored = await readCopyCheckpoint(shards[0]);
   requireProof(JSON.stringify(positiveStored?.state) === JSON.stringify(positive), phase);
-  const fenced = await writeCopyCheckpoint(shards[0], legacyState, positiveStored.generation);
-  requireProof(fenced === positiveStored.generation + 1, phase);
+  const fencedGeneration = await writeCopyCheckpoint(shards[0], legacyState, positiveStored.generation);
+  requireProof(fencedGeneration === positiveStored.generation + 1, phase);
   const staleFences = [];
   for (const expected of [positiveStored.generation, 0]) {
     try { await writeCopyCheckpoint(shards[0], positive, expected); } catch (error) {
@@ -638,7 +638,7 @@ async function proveByteExactRecovery({ source, shards, gate, positive, positive
   }
   requireProof(staleFences.length === 2, phase);
   const fencedStored = await readCopyCheckpoint(shards[0]);
-  requireProof(fencedStored.generation === fenced
+  requireProof(fencedStored.generation === fencedGeneration
     && JSON.stringify(fencedStored.state) === JSON.stringify(legacyState), phase);
   phase = 'byte-exact-legacy-loss';
   let lossyReplicaCells = 0;

@@ -7000,3 +7000,396 @@ test('catalog copy rejects malformed stored UTF-8 before scalar builders or iden
     });
   }
 });
+
+// The unfenced copier's key and its exact checkpoint write, as still in flight from
+// runs that predate the generation fence (production attempt 3 lost this response).
+const LEGACY_COPY_KEY = 'full-fidelity-index-copy-v1';
+const UNFENCED_COPY_UPSERT = `INSERT INTO index_migration_state (name, value) VALUES (?, ?)
+    ON CONFLICT (name) DO UPDATE SET value = excluded.value`;
+const CHECKPOINT_FENCE = 'checkpoint-fence';
+const fencedCopyWrite = /^(?:INSERT INTO|UPDATE) index_migration_state\b/;
+const storedValue = (db, name) =>
+  db.rows('SELECT value FROM index_migration_state WHERE name = ?', [name])[0]?.value ?? null;
+const isCopyWrite = ({ sql, params }) => fencedCopyWrite.test(sql) && params[0] === COPY_CHECKPOINT;
+const copyWriteState = ({ params }) => JSON.parse(params[1]).state;
+const lateUnfencedWrite = (db, state) => db.database.prepare(UNFENCED_COPY_UPSERT).run(LEGACY_COPY_KEY, JSON.stringify(state));
+// Several ~560 KB rows cannot share one ~1 MiB page, so the copy acknowledges more than one page.
+const multiPageRows = () => [0, 1, 2].map((index) => block(61_001 + index, index % 2,
+  { text: `fencepage${index} ${'fenceword '.repeat(56_000)}` }));
+
+test('a delayed unfenced checkpoint UPSERT after completion cannot rewind the fenced copy or its retirement', async (context) => {
+  const f = await fixture(context);
+  const rows = multiPageRows();
+  seedBlocks(f.source, rows);
+  const states = [];
+  const done = await copyWithNativeParameters(f.args({ checkpointHook: (state) => states.push(state) }));
+  assert.equal(done.state, 'complete');
+  const earlier = states.find((state) => state.rows > 0 && state.pending === null && state.state === 'pending');
+  assert.ok(earlier && earlier.rows < done.rows, 'an earlier acknowledged multi-page state must exist');
+  const durable = storedValue(f.shards[0], COPY_CHECKPOINT);
+  const shardSnapshots = f.shards.map(blockSnapshot);
+  lateUnfencedWrite(f.shards[0], earlier);
+  f.restart();
+  f.trace.length = 0;
+  assert.equal(await importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), 'current');
+  assert.deepEqual(await copyWithNativeParameters(f.args()), done);
+  assert.equal(storedValue(f.shards[0], COPY_CHECKPOINT), durable, 'the fenced checkpoint must be byte-identical');
+  assert.equal(storedValue(f.shards[0], LEGACY_COPY_KEY), JSON.stringify(earlier), 'the archive stays inert, never rewritten or deleted');
+  assert.deepEqual(f.shards.map(blockSnapshot), shardSnapshots);
+  assert.deepEqual(sourceWrites(f).filter(({ sql }) => /\bblocks\b/.test(sql)), []);
+  assert.equal(destinationBatchCount(f), 0);
+  assertCopied(f, rows);
+});
+
+test('copy CLI rerun after a delayed unfenced checkpoint UPSERT keeps the completed fenced copy', async (context) => {
+  const { f, rows, run } = await copyCliFixture(context);
+  const first = await run();
+  assert.equal(first.status, 0, first.stderr);
+  const completed = JSON.parse(first.stdout.trim());
+  const stale = first.trace.filter((event) => event.kind === 'query' && event.db === f.shards[0].id
+    && isCopyWrite(event) && event.rows?.length === 1).map(copyWriteState)
+    .find((state) => state.pending?.phase === 'copying');
+  assert.ok(stale, 'the actual CLI must have persisted a copying page before completion');
+  const durable = storedValue(f.shards[0], COPY_CHECKPOINT);
+  const snapshots = f.shards.map((db) => db.rows('SELECT * FROM blocks ORDER BY id'));
+  f.restart();
+  lateUnfencedWrite(f.shards[0], stale);
+  const rerun = await run();
+  assert.equal(rerun.status, 0, rerun.stderr);
+  assert.deepEqual(JSON.parse(rerun.stdout.trim()), completed);
+  assert.equal(storedValue(f.shards[0], COPY_CHECKPOINT), durable);
+  assert.deepEqual(rerun.checkpoint, first.checkpoint);
+  assert.ok(!rerun.trace.some((event) => event.sql && isWrite(event.sql) && /\bblocks\b/.test(event.sql)));
+  assert.deepEqual(f.shards.map((db) => db.rows('SELECT * FROM blocks ORDER BY id')), snapshots);
+  assertCopied(f, rows);
+});
+
+test('fenced copy writes reject stale, duplicate, ABA and replayed transitions with zero changed rows', async (context) => {
+  const f = await fixture(context);
+  const db = f.shards[0];
+  const s0 = { state: 'pending', rows: 0, pending: null };
+  const page = { state: 'pending', rows: 0, pending: { phase: 'copying' } };
+  const rejectsFence = (promise) => assert.rejects(promise, (error) => error.code === CHECKPOINT_FENCE);
+  assert.equal(await writeCopyCheckpoint(db, s0, 0), 1);
+  await rejectsFence(writeCopyCheckpoint(db, page, 0));
+  assert.equal(await writeCopyCheckpoint(db, page, 1), 2);
+  await rejectsFence(writeCopyCheckpoint(db, s0, 1));
+  // A replan back to an identical S0 value must not re-enable the older S0 -> page request.
+  assert.equal(await writeCopyCheckpoint(db, s0, 2), 3);
+  const replanned = storedValue(db, COPY_CHECKPOINT);
+  f.trace.length = 0;
+  await rejectsFence(writeCopyCheckpoint(db, page, 1));
+  await rejectsFence(writeCopyCheckpoint(db, page, 2));
+  await rejectsFence(writeCopyCheckpoint(db, page, 0));
+  assert.equal(storedValue(db, COPY_CHECKPOINT), replanned);
+  assert.deepEqual(f.trace.map(({ rows }) => rows), [[], [], []], 'each stale request executes once and changes no row');
+  assert.deepEqual(await readCopyCheckpoint(db), { generation: 3, state: s0 });
+});
+
+test('fenced copy writes refuse invalid or exhausted generations and non-record states before any request', async (context) => {
+  const f = await fixture(context);
+  const db = f.shards[0];
+  await writeCopyCheckpoint(db, { state: 'pending' }, 0);
+  const stored = storedValue(db, COPY_CHECKPOINT);
+  f.trace.length = 0;
+  for (const expected of [-1, 1.5, '1', NaN, Infinity, null, undefined, Number.MAX_SAFE_INTEGER, 2 ** 53]) {
+    await assert.rejects(writeCopyCheckpoint(db, { state: 'pending' }, expected), (error) => error.code === CHECKPOINT_FENCE);
+  }
+  for (const state of [null, [], 'pending', Object.create({ inherited: true })]) {
+    await assert.rejects(writeCopyCheckpoint(db, state, 1), (error) => error.code === CHECKPOINT_FENCE);
+  }
+  assert.deepEqual(f.trace, []);
+  assert.equal(storedValue(db, COPY_CHECKPOINT), stored);
+  for (const name of [COPY_CHECKPOINT, LEGACY_COPY_KEY]) {
+    await assert.rejects(writeCheckpoint(db, name, { state: 'pending' }), (error) => error.code === CHECKPOINT_FENCE);
+    await assert.rejects(readCheckpoint(db, name), (error) => error.code === CHECKPOINT_FENCE);
+  }
+  assert.deepEqual(f.trace, [], 'generic checkpoint access cannot read or write either copy key');
+  assert.equal(storedValue(db, LEGACY_COPY_KEY), null);
+});
+
+test('malformed fenced envelopes fail closed for readers, writers and the copier without being rewritten', async (context) => {
+  const state = { state: 'pending', rows: 0, pending: null };
+  for (const [label, raw] of [
+    ['extra-key', JSON.stringify({ format: 1, generation: 1, state, extra: true })],
+    ['missing-generation', JSON.stringify({ format: 1, state })],
+    ['zero-generation', JSON.stringify({ format: 1, generation: 0, state })],
+    ['text-generation', JSON.stringify({ format: 1, generation: '1', state })],
+    ['real-generation', '{"format":1,"generation":1.0,"state":{}}'],
+    ['fractional-generation', JSON.stringify({ format: 1, generation: 1.5, state })],
+    ['format-2', JSON.stringify({ format: 2, generation: 1, state })],
+    ['array-state', JSON.stringify({ format: 1, generation: 1, state: [] })],
+    ['null-state', JSON.stringify({ format: 1, generation: 1, state: null })],
+    ['flat-state', JSON.stringify({ ...state, generation: 1 })],
+    ['malformed-json', '{"format":1,'],
+  ]) {
+    await context.test(label, async (child) => {
+      const f = await fixture(child);
+      seedBlocks(f.source, [block(62_001)]);
+      const db = f.shards[0];
+      db.database.prepare('INSERT INTO index_migration_state (name, value) VALUES (?, ?)').run(COPY_CHECKPOINT, raw);
+      f.trace.length = 0;
+      // JSON.parse reads 1.0 as the integer 1, but the stored SQL REAL still never satisfies the CAS.
+      if (label === 'real-generation') assert.deepEqual(await readCopyCheckpoint(db), { generation: 1, state: {} });
+      else await assert.rejects(readCopyCheckpoint(db), (error) => error.code === 'checkpoint-payload');
+      await assert.rejects(writeCopyCheckpoint(db, state, 1), (error) => error.code === CHECKPOINT_FENCE);
+      await assert.rejects(writeCopyCheckpoint(db, state, 0), (error) => error.code === CHECKPOINT_FENCE);
+      await assert.rejects(copyWithNativeParameters(f.args()));
+      await assert.rejects(importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }));
+      assert.equal(storedValue(db, COPY_CHECKPOINT), raw);
+      assert.deepEqual(sourceWrites(f), []);
+      assert.equal(destinationBatchCount(f), 0);
+      assert.equal(f.source.rows('SELECT COUNT(*) AS n FROM blocks')[0].n, 1);
+    });
+  }
+});
+
+test('a concurrent first checkpoint or a generation bump before verification stops the copier before any source write', async (context) => {
+  for (const race of ['initial-insert', 'before-verified']) {
+    await context.test(race, async (child) => {
+      const f = await fixture(child);
+      const rows = [block(63_001, 0), block(63_002, 1)];
+      seedBlocks(f.source, rows);
+      let raced = 0;
+      f.shards[0].beforeQuery = ({ sql, params }) => {
+        if (!isCopyWrite({ sql, params }) || raced) return;
+        const { state } = JSON.parse(params[1]);
+        if (race === 'initial-insert' && sql.startsWith('INSERT')) {
+          raced += 1;
+          f.shards[0].database.prepare('INSERT INTO index_migration_state (name, value) VALUES (?, ?)')
+            .run(COPY_CHECKPOINT, JSON.stringify({ format: 1, generation: 1, state }));
+        } else if (race === 'before-verified' && state.pending?.phase === 'verified') {
+          raced += 1;
+          f.shards[0].database.prepare(`UPDATE index_migration_state
+            SET value = json_set(value, '$.generation', json_extract(value, '$.generation') + 1) WHERE name = ?`).run(COPY_CHECKPOINT);
+        }
+      };
+      await assert.rejects(copyWithNativeParameters(f.args()), (error) => error.code === CHECKPOINT_FENCE);
+      assert.equal(raced, 1);
+      const raw = storedValue(f.shards[0], COPY_CHECKPOINT);
+      assert.deepEqual(sourceWrites(f), [], 'a rejected fence never authorizes the source barrier or DELETE');
+      assert.deepEqual(f.source.rows('SELECT * FROM blocks ORDER BY id'), rows);
+      if (race === 'initial-insert') assert.equal(destinationBatchCount(f), 0);
+      else assert.equal((await readCopyState(f.shards[0])).pending.phase, 'copying');
+      const writes = f.trace.filter((event) => event.kind === 'query' && isCopyWrite(event));
+      assert.deepEqual(writes.at(-1).rows, [], 'the rejected write is the last checkpoint request');
+      f.restart();
+      f.trace.length = 0;
+      assert.equal(storedValue(f.shards[0], COPY_CHECKPOINT), raw);
+      assert.equal((await copyWithNativeParameters(f.args())).state, 'complete',
+        'the next run reads the durable fenced state instead of retrying');
+      assertCopied(f, rows);
+    });
+  }
+});
+
+test('captured fenced checkpoint requests replayed after completion change nothing', async (context) => {
+  const f = await fixture(context);
+  const rows = multiPageRows();
+  seedBlocks(f.source, rows);
+  const done = await copyWithNativeParameters(f.args());
+  const captured = f.trace.filter((event) => event.kind === 'query' && event.db === f.shards[0].id
+    && isCopyWrite(event) && event.rows?.length === 1);
+  assert.ok(captured.filter(({ sql }) => sql.startsWith('UPDATE')).length >= 6, 'multiple pages of fenced transitions');
+  const durable = storedValue(f.shards[0], COPY_CHECKPOINT);
+  const snapshots = f.shards.map(blockSnapshot);
+  for (const { sql, params } of captured) assert.deepEqual(await f.shards[0].query(sql, params), []);
+  assert.equal(storedValue(f.shards[0], COPY_CHECKPOINT), durable);
+  f.trace.length = 0;
+  assert.deepEqual(await copyWithNativeParameters(f.args()), done);
+  assert.deepEqual(f.shards.map(blockSnapshot), snapshots);
+  assert.equal(destinationBatchCount(f), 0);
+});
+
+test('lost checkpoint responses before or after commit resume to the exact typed copy, FTS and digest', async (context) => {
+  const rows = [
+    block(64_001, 0, { text: 'fence_needle café\u0000tail 😀', row_hash: Number.MAX_SAFE_INTEGER }),
+    block(64_002, 1, { text: 'fence_needle 会話\u0000tail', role: '', tool_name: null }),
+    block(64_003, 0, { text: null, role: null, byte_start: null, byte_len: null }),
+  ];
+  const phaseOf = (state) => state.pending?.phase ?? (state.rows > 0 && state.state === 'pending' ? 'ack' : null);
+  for (const target of ['copying', 'verified', 'ack']) {
+    for (const boundary of ['before-commit', 'after-commit']) {
+      await context.test(`${target}-${boundary}`, async (child) => {
+        const baseline = await fixture(child);
+        seedBlocks(baseline.source, rows);
+        const expected = await copyFrozenIndex(baseline.args());
+        const f = await fixture(child);
+        seedBlocks(f.source, rows);
+        const lost = new Error('checkpoint response lost');
+        let injected = 0;
+        const matches = (event) => !injected && isCopyWrite(event) && phaseOf(copyWriteState(event)) === target;
+        if (boundary === 'before-commit') {
+          f.shards[0].beforeQuery = (event) => { if (matches(event)) { injected += 1; throw lost; } };
+        } else {
+          f.shards[0].transformQuery = (event, result) => {
+            if (matches(event)) { injected += 1; throw lost; }
+            return result;
+          };
+        }
+        await assert.rejects(copyWithNativeParameters(f.args()), (error) => error === lost);
+        assert.equal(injected, 1);
+        const durable = await readCopyState(f.shards[0]);
+        if (boundary === 'after-commit') assert.equal(phaseOf(durable), target);
+        else assert.notEqual(phaseOf(durable), target);
+        f.restart();
+        const resumed = await copyWithNativeParameters(f.args());
+        assert.deepEqual(resumed, expected);
+        assert.deepEqual(await readCopyState(f.shards[0]), expected);
+        assertCopied(f, rows);
+        assert.deepEqual(f.shards.map((db) => db.rows('SELECT * FROM blocks ORDER BY id')),
+          baseline.shards.map((db) => db.rows('SELECT * FROM blocks ORDER BY id')),
+          'resumed typed bytes equal an uninterrupted copy');
+        const matched = (db) => db.rows('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ? ORDER BY rowid',
+          ['"fence_needle"']).map(({ rowid }) => rowid);
+        assert.deepEqual(f.shards.map(matched), [[64_001], [64_002]], 'resumed FTS answers the indexed term exactly once');
+        assert.deepEqual(f.shards.map(matched), baseline.shards.map(matched));
+      });
+    }
+  }
+});
+
+test('the one-time initialize import wraps an unfenced checkpoint verbatim and never reads it again', async (context) => {
+  await context.test('absent', async (child) => {
+    const f = await fixture(child);
+    assert.equal(await importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), 'absent');
+    assert.deepEqual(f.shards[0].rows('SELECT name FROM index_migration_state ORDER BY name'), []);
+  });
+  await context.test('import-once-and-resume', async (child) => {
+    const f = await fixture(child);
+    const rows = multiPageRows();
+    seedBlocks(f.source, rows);
+    const stop = new Error('stop after an acknowledged page');
+    await assert.rejects(copyWithNativeParameters(f.args({ checkpointHook: (state) => {
+      if (state.rows > 0 && state.pending === null) throw stop;
+    } })), (error) => error === stop);
+    // Recreate the pre-fence layout: only the unfenced key holds the semantic state.
+    const legacy = await readCopyState(f.shards[0]);
+    f.shards[0].database.prepare('DELETE FROM index_migration_state WHERE name = ?').run(COPY_CHECKPOINT);
+    lateUnfencedWrite(f.shards[0], legacy);
+    f.trace.length = 0;
+    await assert.rejects(copyWithNativeParameters(f.args()), /not been imported/);
+    assert.deepEqual(f.trace.filter((event) => event.sql && isWrite(event.sql)), [], 'an unimported archive never starts a fresh copy');
+    assert.equal(storedValue(f.shards[0], COPY_CHECKPOINT), null);
+    assert.equal(await importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), 'imported');
+    assert.deepEqual(await readCopyCheckpoint(f.shards[0]), { generation: 1, state: legacy });
+    const imported = storedValue(f.shards[0], COPY_CHECKPOINT);
+    lateUnfencedWrite(f.shards[0], { ...legacy, rows: 0, after: -1 });
+    assert.equal(await importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), 'current');
+    assert.equal(storedValue(f.shards[0], COPY_CHECKPOINT), imported, 'the archive is never read once the fenced key exists');
+    const done = await copyWithNativeParameters(f.args());
+    assert.equal(done.state, 'complete');
+    assert.equal(done.rows, rows.length);
+    assertCopied(f, rows);
+    assert.notEqual(storedValue(f.shards[0], LEGACY_COPY_KEY), null, 'the archive is retained');
+  });
+  await context.test('late-write-before-import', async (child) => {
+    // The dead run's in-flight write lands after it stopped but before the import:
+    // the import captures that newest state and the copy completes from it.
+    const f = await fixture(child);
+    const rows = multiPageRows();
+    seedBlocks(f.source, rows);
+    const lost = new Error('verified checkpoint response lost');
+    let inFlight;
+    f.shards[0].beforeQuery = (event) => {
+      if (inFlight || !isCopyWrite(event) || copyWriteState(event).pending?.phase !== 'verified') return;
+      inFlight = copyWriteState(event);
+      throw lost;
+    };
+    await assert.rejects(copyWithNativeParameters(f.args()), (error) => error === lost);
+    f.restart();
+    const durable = await readCopyState(f.shards[0]);
+    f.shards[0].database.prepare('DELETE FROM index_migration_state WHERE name = ?').run(COPY_CHECKPOINT);
+    lateUnfencedWrite(f.shards[0], durable);
+    lateUnfencedWrite(f.shards[0], inFlight);
+    assert.equal(await importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), 'imported');
+    assert.deepEqual(await readCopyState(f.shards[0]), inFlight);
+    assert.equal((await copyWithNativeParameters(f.args())).rows, rows.length);
+    assertCopied(f, rows);
+  });
+  await context.test('partial-pass-then-late-write', async (child) => {
+    // A later acknowledged page, then the old run's earlier write lands on the archive.
+    const f = await fixture(child);
+    const rows = multiPageRows();
+    seedBlocks(f.source, rows);
+    const states = [];
+    const stop = new Error('pass budget exhausted');
+    await assert.rejects(copyWithNativeParameters(f.args({ checkpointHook: (state) => {
+      states.push(state);
+      if (state.rows > 0 && state.pending === null) throw stop;
+    } })), (error) => error === stop);
+    lateUnfencedWrite(f.shards[0], states[0]);
+    f.restart();
+    assert.equal(await importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), 'current');
+    assert.deepEqual(await readCopyState(f.shards[0]), states.at(-1));
+    assert.equal((await copyWithNativeParameters(f.args())).rows, rows.length);
+    assertCopied(f, rows);
+  });
+  for (const [label, legacy, error] of [
+    ['malformed-json', '{"state":', /invalid index migration checkpoint payload/],
+    ['array', '[]', /invalid index migration checkpoint payload/],
+    ['invalid-shape', JSON.stringify({ state: 'pending', rows: -1 }), /invalid copy checkpoint proof|different databases\/layout/],
+  ]) {
+    await context.test(label, async (child) => {
+      const f = await fixture(child);
+      f.shards[0].database.prepare('INSERT INTO index_migration_state (name, value) VALUES (?, ?)').run(LEGACY_COPY_KEY, legacy);
+      await assert.rejects(importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), error);
+      assert.equal(storedValue(f.shards[0], COPY_CHECKPOINT), null);
+      assert.equal(storedValue(f.shards[0], LEGACY_COPY_KEY), legacy);
+    });
+  }
+  await context.test('foreign-identity', async (child) => {
+    const f = await fixture(child);
+    seedBlocks(f.source, [block(65_001)]);
+    await assert.rejects(copyWithNativeParameters(f.args({ checkpointHook: () => { throw new Error('stop'); } })), /stop/);
+    const state = await readCopyState(f.shards[0]);
+    f.shards[0].database.prepare('DELETE FROM index_migration_state WHERE name = ?').run(COPY_CHECKPOINT);
+    const foreign = { ...state, identity: { ...state.identity, source: 'foreign-main' } };
+    lateUnfencedWrite(f.shards[0], foreign);
+    await assert.rejects(importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), /different databases\/layout/);
+    assert.equal(storedValue(f.shards[0], COPY_CHECKPOINT), null);
+    assert.equal(storedValue(f.shards[0], LEGACY_COPY_KEY), JSON.stringify(foreign));
+  });
+});
+
+test('importing a completed unfenced copy keeps its sealed READY and ACTIVATION proofs valid byte for byte', async (context) => {
+  const sid = 'catalog-00';
+  const row = block(66_001, indexShardForSessionId(sid, 2), { session_id: sid, text: 'fence_import_needle\u0000tail' });
+  const f = await catalogFixture(context, [row], 3);
+  await seedFrozenCatalog(f.args());
+  const proofRevision = '3'.repeat(40);
+  const args = { source: f.source, shards: f.shards, revision: proofRevision, cycle: '99999:1' };
+  await verifyReadyIndex({ ...args, gate: async () => ({ ...health, deploymentRevision: proofRevision }) });
+  const activeGate = async () => ({ ...health, indexMode: 'active', deploymentRevision: proofRevision });
+  await verifyActiveIndex({ ...args, gate: activeGate, login: async () => {} });
+  const proofs = async () => ({
+    copy: await readCopyState(f.shards[0]),
+    seed: await readCheckpoint(f.shards[0], SEED_CHECKPOINT),
+    ready: await readCheckpoint(f.shards[0], READY_CHECKPOINT),
+    activation: await readCheckpoint(f.shards[0], ACTIVATION_CHECKPOINT),
+  });
+  const legacyTables = () => f.source.rows(`SELECT name FROM sqlite_master WHERE type = 'table'
+    AND name IN ('blocks', 'blocks_fts', '${SOURCE_FREEZE_TABLE}')`).map(({ name }) => name);
+  const sealed = [READY_CHECKPOINT, ACTIVATION_CHECKPOINT].map((name) => storedValue(f.shards[0], name));
+  // Recreate an environment sealed by the unfenced copier.
+  const completed = await readCopyState(f.shards[0]);
+  f.shards[0].database.prepare('DELETE FROM index_migration_state WHERE name = ?').run(COPY_CHECKPOINT);
+  lateUnfencedWrite(f.shards[0], completed);
+  assert.equal(await importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), 'imported');
+  f.restart();
+  const imported = { ...args, source: f.source, shards: f.shards };
+  assertActivationProof({ ...imported, ...await proofs() });
+  assert.equal(classifyIndexMigration({ ...imported, ...await proofs(), legacyTables: legacyTables() }), 'active');
+  const redeployed = await verifyActiveIndex({ ...imported, gate: activeGate, login: async () => {} });
+  assert.equal(redeployed.activationState, 'existing');
+  assert.deepEqual([READY_CHECKPOINT, ACTIVATION_CHECKPOINT].map((name) => storedValue(f.shards[0], name)), sealed,
+    'the import never re-signs, deletes or replaces derived proofs');
+  lateUnfencedWrite(f.shards[0], { ...completed, rows: completed.rows + 1 });
+  assert.equal(await importLegacyCopyCheckpoint({ source: f.source, shards: f.shards }), 'current');
+  assertActivationProof({ ...imported, ...await proofs() });
+  // The seals still bind the complete semantic state: changed content is refused.
+  const { generation } = await readCopyCheckpoint(f.shards[0]);
+  await writeCopyCheckpoint(f.shards[0], { ...completed, sha256: '0'.repeat(64) }, generation);
+  const changed = await proofs();
+  assert.throws(() => assertActivationProof({ ...imported, ...changed }), /proof/);
+});

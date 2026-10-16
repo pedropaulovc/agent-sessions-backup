@@ -254,14 +254,18 @@ export async function writeCheckpoint(db, name, value) {
 // each persisted transition as a compare-and-set. A delayed request built from an
 // older state therefore never commits after a newer one, including an identical
 // (ABA) state. Generation 0 means "not yet persisted": only an insert-if-absent.
-// The CASE guards keep malformed stored JSON from raising, and json_type keeps a
-// TEXT or REAL generation from comparing equal; either simply matches no row.
+// The CASE guards keep malformed stored JSON from raising, json_type keeps a TEXT or
+// REAL generation from comparing equal, and the shape checks refuse an envelope with
+// extra keys or a non-object state: any of these simply matches no row, so a corrupt
+// stored value fails closed instead of being overwritten.
 const COPY_CHECKPOINT_FORMAT = 1;
 const COPY_CHECKPOINT_INSERT_SQL = `INSERT INTO index_migration_state (name, value) VALUES (?1, ?2)
   ON CONFLICT (name) DO NOTHING RETURNING json_extract(value, '$.generation') AS generation`;
 const COPY_CHECKPOINT_UPDATE_SQL = `UPDATE index_migration_state SET value = ?2
   WHERE name = ?1 AND CASE WHEN json_valid(value)
-    THEN json_type(value, '$.format') = 'integer' AND json_extract(value, '$.format') = ${COPY_CHECKPOINT_FORMAT}
+    THEN json_type(value) = 'object' AND json_remove(value, '$.format', '$.generation', '$.state') = '{}'
+      AND json_type(value, '$.format') = 'integer' AND json_extract(value, '$.format') = ${COPY_CHECKPOINT_FORMAT}
+      AND json_type(value, '$.state') = 'object'
       AND json_type(value, '$.generation') = 'integer' AND json_extract(value, '$.generation') = ?3
     ELSE 0 END
   RETURNING json_extract(value, '$.generation') AS generation`;
