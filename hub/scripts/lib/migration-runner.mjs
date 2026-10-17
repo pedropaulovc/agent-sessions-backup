@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
+import { mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
+import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
@@ -61,7 +62,12 @@ async function defaultRunProcess(args) {
             } catch {}
           }
         }
-        reject(new Error(`Wrangler exited with ${code ?? signal}: ${stderr || stdout}`, { cause }));
+        const error = new Error(`Wrangler exited with ${code ?? signal}`, { cause });
+        error.stdout = stdout;
+        error.stderr = stderr;
+        error.exitCode = code;
+        error.signal = signal;
+        reject(error);
       }
     });
   });
@@ -99,6 +105,67 @@ function sqlLiteral(value) {
   return `'${String(value).replaceAll("'", "''")}'`;
 }
 
+// Do not print arbitrary subprocess output: Wrangler logs can contain HTTP headers,
+// SQL values or credentials. Retain both original streams on the internal error,
+// and expose only fingerprints and a deliberately narrow vocabulary of failures.
+export function migrationFailureDiagnostic(error) {
+  const result = { phase: error.phase ?? 'validation', operation: error.operation ?? 'validate' };
+  if (error.sqlDigest) result.sqlDigest = error.sqlDigest;
+  const signals = new Set();
+  for (const stream of ['stdout', 'stderr']) {
+    if (typeof error[stream] !== 'string') continue;
+    const text = error[stream];
+    result[stream] = { bytes: Buffer.byteLength(text), sha256: sha256(text) };
+    if (stream === 'stdout' && Array.isArray(error.migrationNames)) {
+      const migrations = [];
+      for (const line of text.split('\n')) {
+        const cells = line.split(/[│|]/).map((cell) => cell.trim());
+        const filename = error.migrationNames.find((name) => cells.includes(name));
+        if (!filename) continue;
+        const status = cells.find((cell) => ['✅', '❌', '🕒', 'applied', 'pending', 'failed'].includes(cell));
+        migrations.push({ filename, ...(status ? { status } : {}) });
+      }
+      if (migrations.length) result[stream].migrations = migrations;
+    }
+    for (const match of text.matchAll(/\[code:\s*\d+\]|no such (?:table|column): [a-zA-Z_][a-zA-Z_0-9]*|fetch failed|ECONNRESET|socket|other side closed|D1 DB storage operation exceeded timeout which caused object to be reset/g)) {
+      signals.add(match[0]);
+    }
+  }
+  if (error.message === 'Wrangler D1 response contains no result rows') signals.add(error.message);
+  for (const category of [
+    'requires independent policy evidence',
+    'initial 0001 baseline with ledgerStartsAt=1',
+    'no manifest or independent policy evidence',
+    'immutable base migration changed',
+    'cannot fetch migration base',
+    'migration database ID does not match binding',
+    'must identify exactly one configured binding and database ID',
+    'migration directory does not match binding',
+    'require an explicit persistTo directory',
+    'require a trusted generated config',
+    'unknown migration target',
+  ]) {
+    if (error.message?.includes(category)) signals.add(category);
+  }
+  if (Number.isInteger(error.exitCode)) result.exitCode = error.exitCode;
+  if (signals.size) result.signals = [...signals];
+  return result;
+}
+
+async function migrationOperation(phase, operation, sql, action) {
+  try {
+    return await action();
+  } catch (error) {
+    error.phase ??= phase;
+    error.operation ??= operation;
+    if (sql) error.sqlDigest ??= sha256(sql);
+    if (typeof error.stdout === 'string' || typeof error.stderr === 'string') {
+      error.message = `Migration operation failed: ${JSON.stringify(migrationFailureDiagnostic(error))}`;
+    }
+    throw error;
+  }
+}
+
 function wranglerClient(options) {
   const runProcess = options.runProcess ?? defaultRunProcess;
   const common = targetArguments({
@@ -107,15 +174,26 @@ function wranglerClient(options) {
   });
   const database = options.database ?? 'DB';
   const run = async (args) => await runProcess(args);
+  let phase = 'inspection';
   return {
+    setPhase(value) { phase = value; },
     async apply() {
-      return await run(['d1', 'migrations', 'apply', database, ...common]);
+      try {
+        return await migrationOperation(phase, 'canonical-wrangler-apply', null,
+          () => run(['d1', 'migrations', 'apply', database, ...common]));
+      } catch (error) {
+        error.migrationNames = options.trustedMigrationNames;
+        error.message = `Migration operation failed: ${JSON.stringify(migrationFailureDiagnostic(error))}`;
+        throw error;
+      }
     },
     async query(sql) {
-      const { stdout } = await run(['d1', 'execute', database, ...common, '--command', sql, '--json', '--yes']);
-      const rows = rowsFromWrangler(parseWranglerJson(stdout));
-      if (!rows) throw new Error('Wrangler D1 response contains no result rows');
-      return rows;
+      return await migrationOperation(phase, 'd1-query', sql, async () => {
+        const { stdout } = await run(['d1', 'execute', database, ...common, '--command', sql, '--json', '--yes']);
+        const rows = rowsFromWrangler(parseWranglerJson(stdout));
+        if (!rows) throw new Error('Wrangler D1 response contains no result rows');
+        return rows;
+      });
     },
   };
 }
@@ -316,6 +394,100 @@ export async function measureRemoteSchemaDigest(options) {
   return schemaDigest(await remoteSchemaSnapshot(client));
 }
 
+// Fixed metadata reads only: never open a journal, apply, or initialize a ledger.
+export async function inspectMigrations(options = {}) {
+  const snapshot = { formatVersion: 1, status: 'failed', identity: null, sections: {}, errors: [] };
+  let client;
+  try {
+    const migrationsDir = options.migrationsDir ?? defaultMigrationsDir;
+    const { manifest, digest } = await loadAndValidateManifest({
+      migrationsDir,
+      manifestPath: options.manifestPath ?? path.join(migrationsDir, 'manifest.json'),
+      baseManifestPath: options.baseManifestPath ?? path.join(migrationsDir, 'source-baseline.json'),
+    });
+    await validateHistory(options, manifest);
+    snapshot.identity = {
+      target: options.target, ...await migrationDatabaseIdentity(options), migrationDigest: digest,
+    };
+    client = wranglerClient(options);
+  } catch (error) {
+    snapshot.errors.push(migrationFailureDiagnostic(error));
+    return snapshot;
+  }
+  const capture = async (name, action) => {
+    try {
+      snapshot.sections[name] = await action();
+    } catch (error) {
+      error.operation = `inspect-${name}`;
+      snapshot.sections[name] = { status: 'unavailable' };
+      snapshot.errors.push(migrationFailureDiagnostic(error));
+    }
+  };
+  const tableExists = async (name) => {
+    const rows = await client.query(`SELECT name FROM sqlite_master WHERE type = 'table' AND name = ${sqlLiteral(name)}`);
+    return rows.length > 0;
+  };
+  await capture('schema', async () => {
+    const objects = await client.query('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name');
+    return {
+      status: 'complete',
+      objects: objects.map(({ type, name, tbl_name, sql }) => ({
+        type, name, parent: tbl_name, definitionSha256: sql == null ? null : sha256(sql),
+      })),
+    };
+  });
+  await capture('appliedMigrations', async () => {
+    if (!await tableExists('d1_migrations')) return { status: 'missing' };
+    return { status: 'complete', names: await readAppliedNames(client) };
+  });
+  await capture('checksumLedger', async () => {
+    if (!await tableExists('migration_checksum_ledger')) return { status: 'missing' };
+    const rows = await client.query(`
+      SELECT sequence, filename, sha256, artifact_sha256, deployment_id, recorded_at
+        FROM migration_checksum_ledger ORDER BY sequence
+    `);
+    return { status: 'complete', rows };
+  });
+  await capture('legacyBlocks', async () => {
+    if (!await tableExists('blocks')) return { status: 'missing' };
+    const rows = await client.query('SELECT EXISTS(SELECT 1 FROM blocks LIMIT 1) AS has_blocks');
+    if (rows.length !== 1 || ![0, 1].includes(Number(rows[0].has_blocks))) {
+      throw new Error('invalid block existence result');
+    }
+    return { status: Number(rows[0].has_blocks) === 1 ? 'nonempty' : 'empty' };
+  });
+  snapshot.status = snapshot.errors.length === 0 ? 'complete'
+    : Object.values(snapshot.sections).some((section) => section.status !== 'unavailable') ? 'partial' : 'failed';
+  return snapshot;
+}
+
+export async function writeMigrationInspection(filePath, snapshot) {
+  const directory = path.dirname(filePath);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  const temporary = `${filePath}.${process.pid}.${randomBytes(8).toString('hex')}.tmp`;
+  let handle;
+  try {
+    handle = await open(temporary, 'wx', 0o600);
+    await handle.writeFile(`${JSON.stringify(snapshot, null, 2)}\n`, 'utf8');
+    await handle.sync();
+    await handle.close();
+    handle = null;
+    await rename(temporary, filePath);
+    let directoryHandle;
+    try {
+      directoryHandle = await open(directory, 'r');
+      await directoryHandle.sync();
+    } catch (error) {
+      if (!['EINVAL', 'EPERM', 'EISDIR'].includes(error.code)) throw error;
+    } finally {
+      await directoryHandle?.close();
+    }
+  } finally {
+    await handle?.close();
+    await unlink(temporary).catch(() => {});
+  }
+}
+
 export async function runMigrations(options) {
   if (!options?.journalPath) throw new Error('migrations require a trusted journalPath');
   if (!DIGEST.test(options.artifactDigest ?? '')) throw new Error('migrations require an artifact SHA-256');
@@ -339,7 +511,7 @@ export async function runMigrations(options) {
     throw new Error('signed release manifest and public key must be supplied together');
   }
   const databaseIdentity = await migrationDatabaseIdentity(options);
-  const client = wranglerClient(options);
+  const client = wranglerClient({ ...options, trustedMigrationNames: manifest.migrations.map(({ filename }) => filename) });
   const identity = {
     target: options.target,
     deploymentId: options.deploymentId,
@@ -350,22 +522,25 @@ export async function runMigrations(options) {
   const { result } = await runJournaledMigration({
     journalPath: options.journalPath,
     identity,
-    apply: async () => {
+    apply: async () => await migrationOperation('apply', 'apply-and-prefix-guard', null, async () => {
+      client.setPhase('apply');
       if (options.target === 'production') {
         const phase = manifest.ledgerStartsAt === 1 ? 'pre-apply' : 'installed';
         assertAppliedManifestPrefix(manifest, await readAppliedNames(client, phase));
       }
       await client.apply();
-    },
-    recordChecksums: async () => {
+    }),
+    recordChecksums: async () => await migrationOperation('checksums', 'record-and-validate-checksums', null, async () => {
+      client.setPhase('checksums');
       assertAppliedManifest(manifest, await readAppliedNames(client));
       await recordLedger(client, manifest, options.artifactDigest, options.deploymentId);
       const ledger = await client.query(`
         SELECT sequence, filename, sha256 FROM migration_checksum_ledger ORDER BY sequence
       `);
       assertLedger(manifest, ledger);
-    },
-    verify: async () => {
+    }),
+    verify: async () => await migrationOperation('verify', 'verify-installed-state', null, async () => {
+      client.setPhase('verify');
       const applied = await readAppliedNames(client);
       const pendingMigrations = countPendingMigrations(manifest, applied);
       assertAppliedManifest(manifest, applied);
@@ -381,7 +556,7 @@ export async function runMigrations(options) {
         schemaDigest: liveSchemaDigest,
         pendingMigrations,
       };
-    },
+    }),
     now: options.now,
   });
   return result;
