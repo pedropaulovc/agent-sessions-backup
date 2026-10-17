@@ -203,6 +203,22 @@ with `union isfuzzy=true` and an empty typed datatable. A new workspace shows an
 empty or `No data` panel until the first signal lands; it does not fail just
 because Azure has not created the table yet.
 
+Search emits one structured `console.warn` event, `hub.search.unavailable`, when
+the bounded global catalog-outbox drain remains pending and the request returns
+HTTP 503 with `index_catalog_pending`. Its JSON fields are `event`
+(`hub.search.unavailable`), `code` (`index_catalog_pending`), `status` (`503`),
+`catalog_synced` (sessions accepted by every index shard and retired from the
+outbox during this drain), and `catalog_subrequests` (D1 calls made by this
+drain). These counters describe the bounded drain, not the remaining backlog.
+The warning adds no database reads and no success-path request logs; it contains
+no query, filter, session/source text, grants, tokens, or URLs.
+
+Find the event in `OTelLogs.Body` and use the existing OTEL envelope's `TraceId`
+and `SpanId` to correlate it with `OTelSpans`; no new request ID is needed.
+The warning identifies this specific 503 guard without changing its freshness
+contract. A historical 503 whose response body was not retained is not directly
+confirmed as `index_catalog_pending` by this new event.
+
 ## What the alerts do (and don't) cover
 
 Only `sessions-hub` gets `observability.logs`/`traces` destinations pointed at
@@ -225,6 +241,14 @@ through the same broken gateway — which is what
 Azure telemetry pipeline at all) are for. If gateway-specific diagnostics ever
 need to reach Azure, that requires a separate non-recursive sink, not
 `sessions-hub`'s destinations.
+
+Remote preview browser failures are separate: the `preview` CI job uploads
+`hub/test-results/` and `hub/playwright-report/` as the `preview-browser-e2e`
+artifact, retained for 14 days. Inspect its screenshots, error context and
+Playwright traces when those were produced, rather than inferring the response
+from a locator timeout. The smoke fixtures are synthetic and the derived per-PR
+bearer is public by design. Keep sensitive session data and the preview bearer
+seed out of the retained artifacts.
 
 ## Rotating the signing key
 

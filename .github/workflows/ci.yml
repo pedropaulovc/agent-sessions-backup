@@ -222,6 +222,16 @@ jobs:
           BASE_URL: ${{ steps.provision.outputs.url }}
           PREVIEW_BEARER_SEED: ${{ secrets.PREVIEW_BEARER_SEED }}
         run: npm --prefix hub run test:e2e
+      - name: Upload preview browser failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: preview-browser-e2e
+          if-no-files-found: warn
+          retention-days: 14
+          path: |
+            hub/test-results/
+            hub/playwright-report/
       - name: Publish public preview login code
         if: github.event.pull_request.head.repo.full_name == github.repository
         env:
