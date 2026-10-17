@@ -19,7 +19,6 @@ export default defineConfig(async () => {
         wrangler: { configPath },
         miniflare: {
           bindings: {
-            ENVIRONMENT: 'development',
             SETUP_TOKEN: 'test-setup-token',
             TEST_MIGRATIONS: migrations,
             TEST_INDEX_MIGRATIONS: indexMigrations,
