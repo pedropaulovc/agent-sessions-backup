@@ -3,7 +3,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import { route } from '../src/router';
 import { runSessionRollup } from '../src/session-rollup';
 import { consumeSessionRollup, enqueueSessionRollup, getSessionRollupJob } from '../src/session-rollup-jobs';
-import { API } from './hosts';
+import { API, VIEWER } from './hosts';
 import { assertIndexLayout, indexDbFor, indexDbs, reserveBlockIds } from '../src/index-shards';
 
 const testEnv = env as unknown as Env;
@@ -364,7 +364,7 @@ describe('rollup job route authorization', () => {
       VALUES (?1, ?2, 'rollup reader', ?3, ?4)`).bind(PREFIX + 'grant', hash, now, now + 3_600_000).run();
     const accepted = await enqueue();
     vi.mocked(testEnv.ROLLUP_QUEUE.send).mockClear();
-    const request = (path: string, method = 'GET') => new Request(`${API}${path}`, {
+    const request = (path: string, method = 'GET') => new Request(`${VIEWER}${path}`, {
       method, headers: { authorization: `Bearer ${token}` },
     });
     // Positive control: denial below is admin isolation, not an invalid bearer fixture.

@@ -26,6 +26,8 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from .identity import USER_AGENT
+
 DEFAULT_VIEWER_URL = "https://sessions.pedrovc.com.br"
 
 _TTL_RE = re.compile(r"^(\d+)([smh]?)$")
@@ -65,17 +67,44 @@ def _b64u(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
 
+def viewer_origin(url: str) -> str:
+    """Validate and normalize an HTTP(S) viewer origin, without credentials or a path."""
+    parsed = urllib.parse.urlsplit(url)
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in ("", "/")
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("invalid viewer_url: expected an http(s) origin without credentials, path, query, or fragment")
+    host = parsed.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    port = parsed.port
+    if port is not None and port != (443 if parsed.scheme == "https" else 80):
+        host = f"{host}:{port}"
+    return f"{parsed.scheme}://{host}"
+
+
 def mint_grant(
     *,
-    hub_url: str,
     viewer_url: str = DEFAULT_VIEWER_URL,
     label: str | None = None,
     ttl_seconds: int = 14_400,
     open_url=webbrowser.open,
     timeout: float = 300.0,
 ) -> dict:
-    """Run the full grant ceremony; returns the exchange response
-    ({token, tokenType, label, expiresAt}) or raises GrantError."""
+    """Run approval and PKCE exchange on one viewer origin.
+
+    Returns the exchange response plus the client-selected viewerUrl cache binding.
+    """
+    try:
+        viewer_url = viewer_origin(viewer_url)
+    except ValueError as e:
+        raise GrantError(str(e)) from e
     label = label or default_label()
     verifier = _b64u(secrets.token_bytes(32))
     challenge = _b64u(hashlib.sha256(verifier.encode("ascii")).digest())
@@ -124,16 +153,19 @@ def mint_grant(
     if not code:
         raise GrantError(f"timed out after {timeout:.0f}s waiting for browser approval")
 
-    exchange_url = f"{hub_url.rstrip('/')}/api/v1/grants/exchange"
+    exchange_url = f"{viewer_url}/api/v1/grants/exchange"
     request = urllib.request.Request(
         exchange_url,
         data=json.dumps({"code": code, "codeVerifier": verifier}).encode(),
-        headers={"content-type": "application/json"},
+        headers={"content-type": "application/json", "user-agent": USER_AGENT},
         method="POST",
     )
     try:
         with urllib.request.urlopen(request, timeout=30.0) as fp:
-            return json.loads(fp.read())
+            grant = json.loads(fp.read())
+            # The server cannot choose where a cached bearer will later be sent.
+            grant["viewerUrl"] = viewer_url
+            return grant
     except urllib.error.HTTPError as e:
         try:
             detail = e.read().decode("utf-8", errors="replace")
@@ -145,7 +177,7 @@ def mint_grant(
 
 
 def save_grant(grant: dict, cache_path: Path | None = None) -> Path:
-    """Persist a minted grant for load_cached_token(); owner-only file mode where supported.
+    """Persist a minted grant for load_cached_grant(); owner-only file mode where supported.
 
     The token is written to a same-directory temp file created 0o600 (O_EXCL, so an existing
     symlink at the temp path can't be followed) and atomically renamed into place — a plain
@@ -158,6 +190,7 @@ def save_grant(grant: dict, cache_path: Path | None = None) -> Path:
         "token": grant["token"],
         "expiresAt": grant["expiresAt"],
         "label": grant.get("label"),
+        "viewerUrl": viewer_origin(grant["viewerUrl"]),
     })
     temporary_path = path.with_name(f".{path.name}.{secrets.token_hex(16)}.tmp")
     try:
@@ -171,19 +204,22 @@ def save_grant(grant: dict, cache_path: Path | None = None) -> Path:
     return path
 
 
-def load_cached_token(cache_path: Path | None = None) -> str | None:
-    """The cached bearer, or None if absent/corrupt/expiring within 60s (expiresAt is ms)."""
+def load_cached_grant(cache_path: Path | None = None) -> dict | None:
+    """A valid origin-bound grant, or None if absent/corrupt/expiring within 60s."""
     path = cache_path or default_grant_cache_path()
     if not path.is_file():
         return None
     try:
         data = json.loads(path.read_text())
-    except (OSError, ValueError):
+        if not isinstance(data, dict):
+            return None
+        data["viewerUrl"] = viewer_origin(data["viewerUrl"])
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
         return None
     token = data.get("token")
     expires_at = data.get("expiresAt")
-    if not isinstance(token, str) or not isinstance(expires_at, (int, float)):
+    if not isinstance(token, str) or not token or not isinstance(expires_at, (int, float)):
         return None
     if expires_at <= (time.time() + 60) * 1000:
         return None
-    return token
+    return data

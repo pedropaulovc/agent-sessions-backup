@@ -13,8 +13,9 @@
   // without a dns_records scope: custom domains are provisioned through the
   // Workers API (Cloudflare manages the proxied DNS record + edge cert itself),
   // whereas a zone route requires a pre-existing proxied DNS record we cannot
-  // create with this token. Both hostnames stay fully proxied, so API Shield
-  // mTLS + the WAF cert-verified rule apply identically.
+  // create with this token. Both hostnames stay fully proxied. API Shield mTLS and
+  // the cert-verified WAF rule are scoped to API_HOST; VIEWER_HOST serves passkeys,
+  // the PKCE grant exchange, and bearer read APIs without a client certificate.
   //
   // THIS ARRAY IS THE COMPLETE DESIRED SET, NOT A PARTIAL LIST. `wrangler
   // deploy` sends one `PUT /accounts/{id}/workers/scripts/{name}/domains/records`
@@ -35,8 +36,8 @@
   "account_id": "18ef3246e9f36d1560485ef53889c0ab",
   // Fail-closed default: an unconfigured `wrangler deploy` (no environment override) must NOT
   // accept the loopback-only x-dev-machine identity (see src/auth/identity.ts). `npm run dev:up`
-  // migrates first, binds to loopback, and passes ENVIRONMENT:development explicitly; Vitest
-  // supplies its independent Miniflare bindings in vitest.config.ts.
+  // migrates first, binds to loopback, and uses the generated development configuration.
+  // Vitest uses that same generated config plus test-only Miniflare bindings in vitest.config.ts.
   "vars": {
     "ENVIRONMENT": "production",
     "INDEX_SHARD_COUNT": "16",

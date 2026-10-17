@@ -41,6 +41,7 @@ export function generatedLocalConfig({ baseConfig, hubRoot, revision }) {
     vars: {
       ...baseConfig.vars,
       ENVIRONMENT: 'development',
+      VIEWER_HOST: '127.0.0.1',
       INDEX_SHARD_COUNT: '2',
       INDEX_MODE: 'active',
       DEPLOYMENT_REVISION: revision,

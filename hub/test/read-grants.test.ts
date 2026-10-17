@@ -3,8 +3,9 @@ import { isoBase64URL } from '@simplewebauthn/server/helpers';
 import { describe, expect, it } from 'vitest';
 import { grantIdentity, readGrantApiRoute, readGrantBrowserRoute } from '../src/auth/read-grants';
 import { viewerRoute } from '../src/viewer/router';
+import { route } from '../src/router';
 import type { WebAuthnDeps } from '../src/auth/webauthn';
-import { API, VIEWER } from './hosts';
+import { VIEWER } from './hosts';
 
 const testEnv = env as unknown as Env;
 const encoder = new TextEncoder();
@@ -89,17 +90,13 @@ async function approveGrant(params: GrantParams, credentialId: string): Promise<
 }
 
 async function exchange(code: string, codeVerifier: string): Promise<Response> {
-  const url = new URL('/api/v1/grants/exchange', API);
-  const request = new Request(url, {
+  return SELF.fetch(`${VIEWER}/api/v1/grants/exchange`, {
     method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ code, codeVerifier }),
   });
-  const response = await readGrantApiRoute(request, url, testEnv);
-  expect(response).not.toBeNull();
-  return response!;
 }
 
 function bearerRequest(path: string, token: string, method = 'GET'): Promise<Response> {
-  return SELF.fetch(`${API}${path}`, { method, headers: { authorization: `Bearer ${token}` } });
+  return SELF.fetch(`${VIEWER}${path}`, { method, headers: { authorization: `Bearer ${token}` } });
 }
 
 describe('passkey-minted read grants', () => {
@@ -138,6 +135,66 @@ describe('passkey-minted read grants', () => {
     expect(statusPayload.sessions).toBeTruthy();
   });
 
+  it('accepts exchange and bearer reads only on the viewer host, without consuming codes on other hosts', async () => {
+    const credentialId = `grant-cred-${crypto.randomUUID()}`;
+    await seedCredential(credentialId);
+    const { verifier, challenge } = await pkcePair();
+    const code = await approveGrant(grantParams(challenge), credentialId);
+    const split = { ...testEnv, ENVIRONMENT: 'production', API_HOST: 'machine.example', VIEWER_HOST: 'viewer.example' } as Env;
+    const ctx = {} as ExecutionContext; // These routes do not schedule background work.
+    for (const host of [split.API_HOST, 'unrelated.example', 'localhost', '127.0.0.1']) {
+      const denied = await route(new Request(`https://${host}/api/v1/grants/exchange`, {
+        method: 'POST', body: JSON.stringify({ code, codeVerifier: verifier }),
+      }), split, ctx);
+      expect(denied.status, host).toBe(401);
+    }
+    const exchanged = await route(new Request(`https://${split.VIEWER_HOST}/api/v1/grants/exchange`, {
+      method: 'POST', body: JSON.stringify({ code, codeVerifier: verifier }),
+    }), split, ctx);
+    expect(exchanged.status).toBe(200);
+    const { token } = await exchanged.json() as { token: string };
+    for (const host of [split.VIEWER_HOST, split.API_HOST, 'unrelated.example', 'localhost', '127.0.0.1']) {
+      const response = await route(new Request(`https://${host}/api/v1/status`, {
+        headers: { authorization: `Bearer ${token}` },
+      }), split, ctx);
+      expect(response.status, host).toBe(host === split.VIEWER_HOST ? 200 : 401);
+    }
+  });
+
+  it.each(['http://127.0.0.1:49123', 'http://localhost:8787'])(
+    'exchanges and reads on the supported local origin %s with generated local bindings', async (origin) => {
+      const credentialId = `grant-cred-${crypto.randomUUID()}`;
+      await seedCredential(credentialId);
+      const { verifier, challenge } = await pkcePair();
+      const code = await approveGrant(grantParams(challenge), credentialId);
+      // testEnv comes from writeLocalConfig, just like dev:up. Do not hand-set
+      // VIEWER_HOST to the request hostname: that masked the production-host leak.
+      const ctx = {} as ExecutionContext; // These routes do not schedule background work.
+      for (const deniedOrigin of ['http://unrelated.example', 'http://localhost.evil.example', 'http://127.0.0.2']) {
+        const denied = await route(new Request(`${deniedOrigin}/api/v1/grants/exchange`, {
+          method: 'POST', body: JSON.stringify({ code, codeVerifier: verifier }),
+        }), testEnv, ctx);
+        expect(denied.status, deniedOrigin).toBe(401);
+      }
+      const exchanged = await route(new Request(`${origin}/api/v1/grants/exchange`, {
+        method: 'POST', body: JSON.stringify({ code, codeVerifier: verifier }),
+      }), testEnv, ctx);
+      expect(exchanged.status).toBe(200);
+      const { token } = await exchanged.json() as { token: string };
+      const response = await route(new Request(`${origin}/api/v1/status`, {
+        headers: { authorization: `Bearer ${token}` },
+      }), testEnv, ctx);
+      expect(response.status).toBe(200);
+      const payload = await response.json() as { identity: { kind: string } };
+      expect(payload.identity.kind).toBe('grant');
+      for (const deniedOrigin of ['http://unrelated.example', 'http://localhost.evil.example', 'http://127.0.0.2']) {
+        expect(await grantIdentity(new Request(`${deniedOrigin}/api/v1/status`, {
+          headers: { authorization: `Bearer ${token}` },
+        }), testEnv), deniedOrigin).toBeNull();
+      }
+    },
+  );
+
   it('rejects the exchange for a wrong or mismatched PKCE verifier', async () => {
     const credentialId = `grant-cred-${crypto.randomUUID()}`;
     await seedCredential(credentialId);
@@ -172,6 +229,9 @@ describe('passkey-minted read grants', () => {
     // Exactly 401 everywhere: each of these must fail the machine-identity gate itself, not
     // 404/405 out of some unrelated route mismatch that would mask a widened grant surface.
     const denied: Array<[string, string]> = [
+      ['POST', '/api/v1/sessions'],
+      ['DELETE', '/api/v1/sessions/some-session'],
+      ['POST', '/api/v1/search'],
       ['GET', '/api/v1/bootstrap'],
       ['POST', '/api/v1/heartbeat'],
       ['PUT', '/api/v1/files/some-machine/claude-projects/a.jsonl'],
@@ -201,9 +261,10 @@ describe('passkey-minted read grants', () => {
     await expect(revoked.json()).resolves.toEqual({ revoked: true });
 
     const identity = await grantIdentity(
-      new Request(`${API}/api/v1/sessions`, { headers: { authorization: `Bearer ${token}` } }), testEnv,
+      new Request(`${VIEWER}/api/v1/sessions`, { headers: { authorization: `Bearer ${token}` } }), testEnv,
     );
     expect(identity).toBeNull();
+    expect((await bearerRequest('/api/v1/sessions', token)).status).toBe(401);
 
     const again = await browserCall(post(`/grants/${encodeURIComponent(row!.grant_id)}/revoke`, {}));
     expect(again.status).toBe(404);
@@ -216,9 +277,11 @@ describe('passkey-minted read grants', () => {
       'INSERT INTO read_grants (grant_id, token_hash, label, created_at, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)',
     ).bind(`expired-${crypto.randomUUID()}`, await tokenHash(staleToken), 'expired', now - 7_200_000, now - 3_600_000).run();
     const identity = await grantIdentity(
-      new Request(`${API}/api/v1/sessions`, { headers: { authorization: `Bearer ${staleToken}` } }), testEnv,
+      new Request(`${VIEWER}/api/v1/sessions`, { headers: { authorization: `Bearer ${staleToken}` } }), testEnv,
     );
     expect(identity).toBeNull();
+    expect((await bearerRequest('/api/v1/sessions', staleToken)).status).toBe(401);
+    expect((await bearerRequest('/api/v1/sessions', `agsr_${'z'.repeat(43)}`)).status).toBe(401);
 
     const { verifier, challenge } = await pkcePair();
     const credentialId = `grant-cred-${crypto.randomUUID()}`;
@@ -255,21 +318,30 @@ describe('passkey-minted read grants', () => {
 
   it('is unreachable in preview: no page, no exchange, no bearer', async () => {
     const preview = { ...testEnv, ENVIRONMENT: 'preview' } as Env;
-    const { challenge } = await pkcePair();
+    const { verifier, challenge } = await pkcePair();
+    const credentialId = `grant-cred-${crypto.randomUUID()}`;
+    await seedCredential(credentialId);
+    const code = await approveGrant(grantParams(challenge), credentialId);
 
     const pageUrl = new URL(`/grant?challenge=${challenge}&callback=${encodeURIComponent('http://127.0.0.1:43210/cb')}&label=ok`, VIEWER);
     const page = await viewerRoute(new Request(pageUrl), pageUrl, preview);
     expect(page.status).toBe(401);
 
-    const exchangeUrl = new URL('/api/v1/grants/exchange', API);
+    const exchangeUrl = new URL('/api/v1/grants/exchange', VIEWER);
     const exchangeResponse = await readGrantApiRoute(
-      new Request(exchangeUrl, { method: 'POST', body: '{}' }), exchangeUrl, preview,
+      new Request(exchangeUrl, { method: 'POST', body: JSON.stringify({ code, codeVerifier: verifier }) }), exchangeUrl, preview,
     );
     expect(exchangeResponse).toBeNull();
+    const { token } = await (await exchange(code, verifier)).json() as { token: string };
+    expect((await bearerRequest('/api/v1/sessions', token)).status).toBe(200);
 
     const identity = await grantIdentity(
-      new Request(`${API}/api/v1/sessions`, { headers: { authorization: `Bearer agsr_${'a'.repeat(43)}` } }), preview,
+      new Request(`${VIEWER}/api/v1/sessions`, { headers: { authorization: `Bearer ${token}` } }), preview,
     );
     expect(identity).toBeNull();
+    const denied = await route(new Request(`${VIEWER}/api/v1/sessions`, {
+      headers: { authorization: `Bearer ${token}` },
+    }), preview, {} as ExecutionContext); // This denied route schedules no background work.
+    expect(denied.status).toBe(401);
   });
 });

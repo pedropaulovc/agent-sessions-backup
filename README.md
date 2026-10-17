@@ -9,6 +9,14 @@ Backup, index, search, and render AI agent/chat sessions from every machine and 
 - **Agent API**: JSON search/fetch endpoints (e.g. everything from today as NDJSON) for downstream AI agents
 - **Observability**: Cloudflare Workers observability → OTLP gateway → Azure Application Insights (Entra workload identity federation, zero Azure secrets), email alerts
 
+Passkey approval, the single-use PKCE grant exchange, and read-grant bearer APIs now share
+`https://sessions.pedrovc.com.br`; the former API-host grant path is not an alias.
+`agent-sessions auth` uses `--viewer-url` for both approval and exchange. Cached grants
+bind reads to that viewer origin (`viewerUrl`); old originless caches require re-authentication,
+and conflicting explicit read endpoints are rejected. Collectors, certificate operations,
+and machine/fleet/admin APIs stay on `https://api.sessions.pedrovc.com.br` with unchanged
+mTLS policy. See the [agent API guide](docs/agents-api.md#base-url--auth).
+
 Index sharding preserves the matching transcript blocks and text. Search relevance now uses shard-local BM25, so ranking can differ from the former single index; duration/token/cost priorities, global facet counts, media URLs, and the viewer's offset pager remain. Reads use bounded shard fan-out, not an unlimited-capacity promise. Search returns 503 while its catalog reconciliation backlog remains rather than using stale filters or costs. Offset pages are not snapshots under concurrent writes; see the [search API contract](docs/agents-api.md#get-apiv1search).
 
 Session details keep the transcript visible by default. Expand **Activity trace** for the current page's model and tool activity, event/error filters, and links back to turns. Duration shows recorded OMP timing spans or timestamp markers; Sequence also includes events without timestamps. Per-tool totals include only recorded durations and may overlap.

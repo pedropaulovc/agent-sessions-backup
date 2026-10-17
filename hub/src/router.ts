@@ -92,8 +92,8 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
 
  if (url.pathname === '/api/v1/preview/diagnostics') return previewDiagnostics(request, env);
 
- // Read-grant exchange authenticates itself (single-use code + PKCE verifier); it never
- // mints anything beyond the read-only bearer the passkey ceremony approved.
+ // Viewer-host read-grant exchange authenticates itself (single-use code + PKCE verifier);
+ // it never mints anything beyond the read-only bearer the passkey ceremony approved.
  const grantExchange = await readGrantApiRoute(request, url, env);
  if (grantExchange) return grantExchange;
 
@@ -128,8 +128,8 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
  if (path === '/api/v1/certs/renew' && method === 'POST') return renewCert(request, env, identity);
 
  // Read APIs: any enrolled machine (or dev identity) may query. A passkey-minted read
- // grant reaches ONLY the explicit allow-list below — never the machine/admin routes —
- // so anything added after this gate stays machine-only by construction.
+ // grant is accepted only on VIEWER_HOST and reaches ONLY the explicit allow-list below —
+ // never the machine/admin routes — so additions after this gate stay machine-only.
  if (identity.kind !== 'machine') {
   const grant = await grantIdentity(request, env);
   const granted = grant ? await grantReadRoute(request, url, env, grant) : null;

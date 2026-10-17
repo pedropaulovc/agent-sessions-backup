@@ -6,7 +6,7 @@ description: Generate a markdown daily activity report for the AI agent session 
 # Daily report
 
 Produce a markdown report of AI agent activity for a given day, using the sessions hub's
-machine API. Full endpoint contract, auth modes, and known gaps: `docs/agents-api.md`.
+viewer-origin bearer read API. Full endpoint contract and auth modes: `docs/agents-api.md`.
 
 ## Steps
 
@@ -23,6 +23,11 @@ machine API. Full endpoint contract, auth modes, and known gaps: `docs/agents-ap
    with a passkey; the token caches for ~4 h) — run it from a trusted checkout (`main` or a
    reviewed branch), never an untrusted PR branch; see the auth section of
    `docs/agents-api.md`. `--out <path>` writes the markdown to a file instead of stdout.
+   Approval, PKCE exchange, and bearer reads use `https://sessions.pedrovc.com.br`
+   (`auth --viewer-url` selects a different viewer). Cached `viewerUrl` binds default
+   reads to that origin; an old originless cache requires re-authentication, and a
+   conflicting explicit read `--hub-url` is rejected. The automatically discovered
+   collector config remains machine/mTLS-only on `https://api.sessions.pedrovc.com.br`.
 
 2. **If the CLI isn't available** (no `client/` checkout, or you need a breakdown the built-in
    report doesn't produce), call the API directly per `docs/agents-api.md`. The three calls the

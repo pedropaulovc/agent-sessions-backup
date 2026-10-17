@@ -7,6 +7,15 @@ a zone WAF rule blocks anything unverified, and the Worker maps
 `request.cf.tlsClientAuth.certFingerprintSHA256` to a `machines` row (defense in
 depth). This file is the runbook for standing that up on the `pedrovc.com.br` zone.
 
+The user/read origin is separate: `https://sessions.pedrovc.com.br` serves passkey grant
+approval, `POST /api/v1/grants/exchange` (single-use code + PKCE), and the explicit
+read-only bearer API allow-list. Those requests do not need a machine certificate.
+`https://api.sessions.pedrovc.com.br` remains the strict mTLS machine/collector origin;
+it does not accept read grants as a compatibility alias. This contract repair does not
+change production WAF rules or mTLS associations. An observed Cloudflare HTML 403 on the
+former normal CLI API-host exchange establishes an edge block, not which rule fired.
+See `docs/agents-api.md` for client endpoint selection and origin-bound grant caches.
+
 ## S4 findings (what M3 verified)
 
 - **The worker and all data-plane resources are deployed and fail-closed.** With no
@@ -61,7 +70,8 @@ PUT /zones/{zone}/certificate_authorities/hostname_associations
   { "hostnames": ["<each existing host>", "api.sessions.pedrovc.com.br"] }
 ```
 
-Do **not** associate `sessions.pedrovc.com.br` — the viewer uses passkeys, never client certs.
+Do **not** associate `sessions.pedrovc.com.br` — the viewer uses passkeys and read-grant
+bearers, never client certs.
 
 ## Step 2 — add the WAF rule blocking unverified certs (one-time)
 

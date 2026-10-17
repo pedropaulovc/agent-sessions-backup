@@ -210,6 +210,12 @@ using absolute entrypoint/migration paths and stable local shard IDs. Vitest gen
 the same topology under `hub/.dev/vitest/`, applies both schema trees to their respective
 databases, and initializes shard layout metadata in `beforeAll` before per-test rollback.
 
+The generated local viewer host is `127.0.0.1`, matching the advertised loopback URL
+and its selected port. Development read-grant exchange and bearer reads also accept
+the literal `localhost` hostname, so both local WebAuthn origins remain usable.
+This is a development-only loopback allowance, not an arbitrary-host auth bypass:
+production keeps exact `VIEWER_HOST` checks and preview still rejects read grants.
+
 Startup finishes all three migration histories and checksum ledgers before it inserts
 fixture prices into `DB`, starts the worker, or uploads synthetic fixtures. Fixture uploads
 still use the normal worker/queue ingest path; no local seeder writes blocks directly.

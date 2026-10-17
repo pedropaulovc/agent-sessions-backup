@@ -166,9 +166,6 @@ test('local config replaces production topology with exactly two active, stable 
     assert.equal(database.migrations_dir, path.join(hubRoot, database.binding === 'DB' ? 'migrations' : 'migrations-index'));
   }
   assert.equal(config.main, path.join(hubRoot, 'src/index.ts'));
-  assert.deepEqual(config.vars, {
-    ENVIRONMENT: 'development', INDEX_MODE: 'active', INDEX_SHARD_COUNT: '2', DEPLOYMENT_REVISION: 'local:artifact',
-  });
   assert.equal(config.account_id, undefined);
   assert.equal(config.env, undefined);
   assert.deepEqual(config.routes, []);

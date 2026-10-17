@@ -1,7 +1,7 @@
 import { env, SELF } from 'cloudflare:test';
 import { describe, expect, it } from 'vitest';
 import { route } from '../src/router';
-import { API } from './hosts';
+import { API, VIEWER } from './hosts';
 
 /**
  * "No agent moves prod bytes without my passkey": in production, machine certs are ingest
@@ -77,7 +77,7 @@ describe('production machine certs cannot read session content', () => {
     const token = `agsr_${'g'.repeat(43)}`;
     await seedGrant(token);
     const response = await route(
-      new Request(`${API}/api/v1/sessions`, { headers: { authorization: `Bearer ${token}` } }),
+      new Request(`${VIEWER}/api/v1/sessions`, { headers: { authorization: `Bearer ${token}` } }),
       prodEnv,
       ctx,
     );

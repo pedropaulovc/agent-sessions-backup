@@ -19,7 +19,7 @@ from enum import Enum
 from pathlib import Path
 from urllib.parse import urlparse
 
-from .grant import load_cached_token
+from .grant import DEFAULT_VIEWER_URL, load_cached_grant, viewer_origin
 
 DEFAULT_HUB_URL = "https://api.sessions.pedrovc.com.br"
 
@@ -76,27 +76,43 @@ def load_config(
 ) -> ClientConfig:
     """Resolve hub connection settings.
 
-    Precedence (highest first): explicit keyword args > environment variables > the token
-    cache `agent-sessions auth` wrote > ~/.config/agent-collector/config.toml (or
-    $XDG_CONFIG_HOME override). A usable grant token wins over mTLS whenever both exist —
-    the grant is the intended read credential; the cert read path is transitional.
+    Explicit endpoint selection is args > environment > an explicitly supplied config
+    file. Discovered collector settings apply only to mTLS. Caller-supplied grants use
+    the viewer default unless an endpoint is selected; cached grants use their minted
+    viewer origin and reject a conflicting selection. A usable grant still wins over mTLS.
     """
     env = os.environ
-    # Read the config file BEFORE branching on auth mode, so a non-default hub_url configured
-    # there applies to grant mode too — both modes resolve hub_url with the same
-    # arg > env > file > default precedence.
     path = config_path or default_config_path()
     file_data: dict = {}
     if path.is_file():
         file_data = tomllib.loads(path.read_text())
-    resolved_hub_url = hub_url or env.get("AGENT_SESSIONS_HUB_URL") or file_data.get("hub_url") or DEFAULT_HUB_URL
+    selected_hub_url = hub_url or env.get("AGENT_SESSIONS_HUB_URL")
+    if selected_hub_url is None and config_path is not None:
+        selected_hub_url = file_data.get("hub_url")
 
-    resolved_grant = grant_token or env.get("AGENT_SESSIONS_GRANT_TOKEN") or load_cached_token(grant_cache_path)
+    resolved_grant = grant_token or env.get("AGENT_SESSIONS_GRANT_TOKEN")
     if resolved_grant:
         return ClientConfig(
-            hub_url=resolved_hub_url,
+            hub_url=selected_hub_url or DEFAULT_VIEWER_URL,
             auth_mode=AuthMode.GRANT,
             grant_token=resolved_grant,
+        )
+
+    cached_grant = load_cached_grant(grant_cache_path)
+    if cached_grant:
+        if selected_hub_url:
+            parsed = urlparse(selected_hub_url)
+            selected_origin = viewer_origin(parsed._replace(path="", params="", query="", fragment="").geturl())
+            if selected_origin != cached_grant["viewerUrl"]:
+                raise ValueError(
+                    "selected hub_url conflicts with the cached read grant's viewer origin; "
+                    "remove the endpoint override or run `agent-sessions auth --viewer-url` "
+                    "with the intended viewer origin"
+                )
+        return ClientConfig(
+            hub_url=selected_hub_url or cached_grant["viewerUrl"],
+            auth_mode=AuthMode.GRANT,
+            grant_token=cached_grant["token"],
         )
 
     resolved_cert = client_cert_path or env.get("AGENT_SESSIONS_CLIENT_CERT") or file_data.get("client_cert_path")
@@ -108,7 +124,7 @@ def load_config(
             "grant, or pass --grant-token"
         )
     return ClientConfig(
-        hub_url=resolved_hub_url,
+        hub_url=selected_hub_url or file_data.get("hub_url") or DEFAULT_HUB_URL,
         auth_mode=AuthMode.MTLS,
         client_cert_path=Path(resolved_cert).expanduser(),
         client_key_path=Path(resolved_key).expanduser(),
