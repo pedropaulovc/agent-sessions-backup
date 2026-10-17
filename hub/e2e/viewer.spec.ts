@@ -25,18 +25,16 @@ test.describe('synthetic sessions viewer', () => {
     });
     await page.goto(appURL(`/grant?${params}`));
 
-    const blockedConnection = await page.evaluate(() => {
-      const { promise, resolve } = Promise.withResolvers<{
-        effectiveDirective: string; disposition: string; blockedURI: string;
-      }>();
+    const blockedConnection = await page.evaluate(() => new Promise<{
+      effectiveDirective: string; disposition: string; blockedURI: string;
+    }>((resolve) => {
       document.addEventListener('securitypolicyviolation', (event) => resolve({
         effectiveDirective: event.effectiveDirective,
         disposition: event.disposition,
         blockedURI: event.blockedURI,
       }), { once: true });
       void fetch('https://csp-probe.invalid/', { credentials: 'omit' }).catch(() => {});
-      return promise;
-    });
+    }));
     expect(blockedConnection).toMatchObject({
       effectiveDirective: 'connect-src',
       disposition: 'enforce',
