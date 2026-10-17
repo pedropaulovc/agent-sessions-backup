@@ -297,6 +297,10 @@ subject even when `use_default: true`. This repository's `sub_claim_prefix` is
 environment adds `:environment:production`. See GitHub's
 [OIDC subject customization response contract](https://docs.github.com/en/rest/actions/oidc#get-the-customization-template-for-an-oidc-subject-claim-for-a-repository).
 
+Stop unless the response has `use_default: true`, `use_immutable_subject: true`,
+and the exact `sub_claim_prefix` above. A mismatch requires a reviewed change to
+the pinned trust contract before provisioning, not a manual workaround.
+
 Using the owner's Azure login, observe the trust first. Only when the credential
 is absent may `--apply` create it:
 
