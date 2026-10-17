@@ -1,4 +1,4 @@
-"""Low-level auth-aware HTTP wrapper for the machine API. Stdlib-only (urllib + ssl) —
+"""Low-level auth-aware HTTP wrapper for the hub API. Stdlib-only (urllib + ssl) —
 matches the collector's zero-runtime-dependency policy; mTLS via file-based cert+key works
 fine with Python's ssl module directly (the collector shells out to curl only because TPM-
 backed keys aren't file-based; this client never touches a TPM key).
@@ -18,8 +18,7 @@ from http.client import HTTPResponse
 from typing import Any
 
 from .config import AuthMode, ClientConfig
-
-USER_AGENT = "agent-sessions-client/0.1"
+from .identity import USER_AGENT
 
 
 class HubError(RuntimeError):
@@ -97,7 +96,7 @@ class HubResponse:
 
 
 class HubClient:
-    """Auth-aware HTTP wrapper for the hub API (default https://api.sessions.pedrovc.com.br).
+    """Auth-aware read API transport using the origin selected by ClientConfig.
 
     Read API only — every read endpoint under /api/v1 requires an identity of
     kind='machine' or 'grant' (see hub/src/router.ts::apiRoute), which this client's two

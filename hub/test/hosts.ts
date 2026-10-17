@@ -21,8 +21,8 @@ const testEnv = env as unknown as Env;
 export const API_HOST = testEnv.API_HOST;
 export const VIEWER_HOST = testEnv.VIEWER_HOST;
 
-/** `https://<API_HOST>` — mTLS/machine + read-grant API surface. */
+/** `https://<API_HOST>` — mTLS/machine API surface. */
 export const API = `https://${API_HOST}`;
 
-/** `https://<VIEWER_HOST>` — passkey-authenticated viewer surface. */
+/** `https://<VIEWER_HOST>` — passkey viewer, grant exchange, and bearer read API surface. */
 export const VIEWER = `https://${VIEWER_HOST}`;

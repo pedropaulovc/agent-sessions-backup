@@ -12,7 +12,7 @@ from datetime import datetime as datetime_cls
 from datetime import timezone
 from pathlib import Path
 
-from .config import DEFAULT_HUB_URL, load_config
+from .config import load_config
 from .endpoints import SessionsApi
 from .grant import DEFAULT_VIEWER_URL, GrantError, mint_grant, parse_ttl, save_grant
 from .http import HubClient, HubError
@@ -101,7 +101,6 @@ def _auth(args: argparse.Namespace) -> int:
 
     try:
         grant = mint_grant(
-            hub_url=args.hub_url or DEFAULT_HUB_URL,
             viewer_url=args.viewer_url,
             label=args.label,
             ttl_seconds=ttl_seconds,
@@ -127,7 +126,7 @@ def _auth(args: argparse.Namespace) -> int:
 
 
 def _add_connection_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--hub-url", help=f"Override hub base URL (default from config.toml, else {DEFAULT_HUB_URL})")
+    parser.add_argument("--hub-url", help="Explicit API endpoint (grant default: minted viewer origin; mTLS default: collector config)")
     parser.add_argument("--config", help="Path to agent-collector config.toml (default ~/.config/agent-collector/config.toml)")
     parser.add_argument("--client-cert", help="mTLS client cert path (overrides config)")
     parser.add_argument("--client-key", help="mTLS client key path (overrides config)")
@@ -141,8 +140,7 @@ def build_parser() -> argparse.ArgumentParser:
     auth_cmd = sub.add_parser("auth", help="Mint a passkey-approved read grant (browser approval + PKCE loopback)")
     auth_cmd.add_argument("--label", help="Shown on the approval page and /settings (default agent@<hostname>)")
     auth_cmd.add_argument("--ttl", default="4h", help="Grant lifetime: e.g. 4h, 30m, 900 (seconds); 5m–24h (default 4h)")
-    auth_cmd.add_argument("--hub-url", help=f"Hub API base URL for the token exchange (default {DEFAULT_HUB_URL})")
-    auth_cmd.add_argument("--viewer-url", default=DEFAULT_VIEWER_URL, help=f"Viewer base URL serving /grant (default {DEFAULT_VIEWER_URL})")
+    auth_cmd.add_argument("--viewer-url", default=DEFAULT_VIEWER_URL, help=f"Viewer origin for approval and token exchange (default {DEFAULT_VIEWER_URL})")
     auth_cmd.add_argument("--grant-cache", help="Write the token here instead of ~/.config/agent-sessions/grant.json")
     auth_cmd.add_argument("--timeout", type=float, default=300.0, help="Seconds to wait for browser approval (default 300)")
     auth_cmd.add_argument("--no-browser", action="store_true", help="Print the approval URL instead of opening a browser")

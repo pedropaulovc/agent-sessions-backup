@@ -1,10 +1,8 @@
 # Agent-facing API guide
 
 This hub exposes a read API for AI agents (not just the human viewer). This doc is written
-for you, the calling agent — endpoint shapes here are verified against the *deployed* hub
-code (`hub/src/api/*.ts`, `hub/src/router.ts`) and against a live smoke test on 2026-07-18,
-not just the planning doc, which has since drifted in a few places (see "Known contract
-gaps" below).
+for you, the calling agent. Endpoint shapes follow `hub/src/api/*.ts` and `hub/src/router.ts`;
+the user/machine origin separation below replaces the former API-host read-grant contract.
 
 If you'd rather not hand-roll HTTP calls, `client/` ships a small stdlib-only Python package
 that wraps everything here, plus an `agent-sessions daily-report` CLI. See the bottom of
@@ -12,15 +10,24 @@ this doc.
 
 ## Base URL & auth
 
-Production: `https://api.sessions.pedrovc.com.br`.
+Production has two distinct origins:
+
+- **User/read origin:** `https://sessions.pedrovc.com.br` — passkey approval,
+  single-use PKCE grant exchange, and every read-grant bearer request.
+- **Machine origin:** `https://api.sessions.pedrovc.com.br` — collector ingestion,
+  certificate operations, fleet aggregates, and machine/admin APIs over strict mTLS.
+
+Read grants are not accepted on the machine origin or unrelated hostnames; there is no
+API-host alias or fallback. Both origins reach the same Worker, but have separate auth
+surfaces. Do not weaken the machine hostname's mTLS policy to enable user reads.
 
 Every protected data endpoint under `/api/v1/` — including plain reads like `/sessions` and
 `/search` — requires an authenticated identity (`hub/src/router.ts::apiRoute`). The one
-exception is `POST /api/v1/grants/exchange`, which authenticates itself: the single-use
-code plus the PKCE verifier that never left the agent's process IS the credential. There is
-no unauthenticated data-read or human-cookie path into this API; the viewer's passkey
-session is a completely separate auth path that doesn't apply here. Two ways to
-authenticate:
+exception is `POST /api/v1/grants/exchange` **on the user/read origin**, which authenticates
+itself: the single-use code plus the PKCE verifier that never left the agent's process IS
+the credential. There is no unauthenticated data-read or human-cookie path into this API;
+the viewer's passkey session approves grants but is not a bearer read credential. Two ways
+to authenticate:
 
 1. **Read grant (preferred for agents).** A short-lived read-only bearer the owner mints
    with a passkey touch — the system rule is *machine certs ingest, passkeys egress*: no
@@ -30,10 +37,12 @@ authenticate:
    ```bash
    cd client && uv run agent-sessions auth --ttl 4h   # --label defaults to agent@<hostname>
    ```
-   Then send `Authorization: Bearer agsr_…` on every request. The grant reaches ONLY the
-   read allow-list (`/sessions` list/get/raw, `/search`, `/usage`, `/machines`, `/status`)
-   — never uploads, bootstrap, cert, or admin routes. Default TTL 4 h, max 24 h; active
-   grants are listed and revocable on the viewer's `/settings` page.
+   Then send `Authorization: Bearer agsr_…` to the **same viewer origin** on every request.
+   Approval, exchange, and bearer reads all use one origin (`--viewer-url` selects it for
+   `auth`; there is no auth-only `--hub-url`). The grant reaches ONLY the GET read allow-list
+   (`/sessions` list/get/raw, `/search`, `/usage`, `/machines`, `/status`) — never uploads,
+   bootstrap, cert, or admin routes. Default TTL 4 h, max 24 h; active grants are listed
+   and revocable on the viewer's `/settings` page.
 
    The approval page's CSP must allow same-origin `/grant/options` and `/grant/verify`
    requests. If approval fails before the passkey prompt, check the browser console
@@ -373,6 +382,16 @@ CLI: `cd client && uv run agent-sessions auth` mints and caches a read grant;
 `uv run agent-sessions daily-report [--date YYYY-MM-DD]` uses it automatically — see
 `.claude/skills/daily-report/SKILL.md` for how an agent should drive it.
 
+The cache records `viewerUrl` alongside the token, label, and expiry. Default reads use
+that minted viewer origin, never the automatically discovered collector's `hub_url`.
+Old caches without `viewerUrl` are invalid: run `agent-sessions auth` again. Read commands
+and `load_config(hub_url=...)` still accept explicit endpoints (`--hub-url`,
+`AGENT_SESSIONS_HUB_URL`, or a `hub_url` in an explicitly selected config file), but a
+conflicting origin with a cached grant is rejected before HTTP. Explicit grant tokens
+(`--grant-token`, `grant_token=...`, or `AGENT_SESSIONS_GRANT_TOKEN`) are caller-controlled:
+they default to the viewer origin and may use an explicitly selected endpoint. Collector
+configuration and mTLS discovery remain unchanged.
+
 ## curl examples
 
 ```bash
@@ -380,7 +399,7 @@ CLI: `cd client && uv run agent-sessions auth` mints and caches a read grant;
 # cache the CLI wrote.
 TOKEN=$(jq -r .token ~/.config/agent-sessions/grant.json)
 AUTH="authorization: Bearer $TOKEN"
-BASE=https://api.sessions.pedrovc.com.br
+BASE=$(jq -r .viewerUrl ~/.config/agent-sessions/grant.json)
 
 # today's sessions, meta only (cheap) — limit=1000 to match the CLI's request and hit the
 # hard per-page cap, not the hub's 200-row default (which would need more page fetches on a
@@ -397,8 +416,8 @@ curl -H "$AUTH" "$BASE/api/v1/usage?group_by=model&from=2026-07-18&to=2026-07-18
 # fleet freshness — check before trusting a report's counts
 curl -H "$AUTH" "$BASE/api/v1/status"
 
-# mTLS works for the content-free aggregates only (/status, /machines, /usage): replace
-# -H "$AUTH" with
+# mTLS works for the content-free aggregates only (/status, /machines, /usage):
+# set BASE=https://api.sessions.pedrovc.com.br and replace -H "$AUTH" with
 #   --cert ~/.config/agent-collector/<machine>.client.pem \
 #   --key  ~/.config/agent-collector/<machine>.client.key
 # A cert request to /sessions* or /search returns 403 passkey_grant_required in production.

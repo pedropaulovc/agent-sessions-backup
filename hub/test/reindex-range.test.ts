@@ -4,7 +4,7 @@ import worker from '../src/index';
 import { createReindexRange, continueReindexRange, getReindexRange } from '../src/reindex-range';
 import { route } from '../src/router';
 import { ccLine } from './fixtures';
-import { API } from './hosts';
+import { API, VIEWER } from './hosts';
 import { indexDbFor } from '../src/index-shards';
 import { syncSessionCatalog } from '../src/session-catalog';
 
@@ -577,7 +577,7 @@ describe('date reindex route authorization', () => {
     await seed();
     const accepted = await create();
     const before = await status(accepted.job_id);
-    const grantRequest = (path: string, method = 'GET') => new Request(`${API}${path}`, {
+    const grantRequest = (path: string, method = 'GET') => new Request(`${VIEWER}${path}`, {
       method, headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
       ...(path === PATH ? { body: JSON.stringify({ from: FROM, to: TO }) } : {}),
     });
