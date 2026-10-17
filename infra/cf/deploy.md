@@ -370,6 +370,7 @@ node scripts/migrations.mjs inspect \
   --target production \
   --config wrangler.jsonc \
   --database DB \
+  --database-id 5ff65cf3-89c8-4fe6-a3c2-a370293ecea6 \
   --base-manifest migrations/source-baseline.json \
   --history migrations/historical-baseline.json \
   --output "$RUNNER_TEMP/main-migration-inspection/preflight.json"
@@ -377,22 +378,33 @@ node scripts/migrations.mjs inspect \
 
 The base configuration identifies account `18ef3246e9f36d1560485ef53889c0ab` and main
 database `5ff65cf3-89c8-4fe6-a3c2-a370293ecea6`. Inspection issues fixed read-only
-metadata SELECTs: ordered applied migration names, all checksum-ledger columns,
-schema object identities/types/parents and definition digests, and a bounded
+metadata SELECTs: ordered applied migration IDs, names and timestamps, all checksum-ledger
+columns, schema object identities/types/parents and definition digests, and a bounded
 `SELECT 1 ... LIMIT 1` existence probe for legacy `blocks`. It does not return
-session content, block text or stored row IDs. FTS shadow-object metadata is
+session content, block text or session/block row IDs. FTS shadow-object metadata is
 permitted; copying, whole-data counts, repair SQL, registry bootstrap, ledger
 writes, journal creation and checkpoint changes are not inspection operations.
 Missing objects/ledgers and unavailable query results are distinct from empty
 results. A failed query retains partial structured evidence and fails the command;
 it does not retry or authorize later mutations.
 
+The migration runner explicitly selects Wrangler's top-level environment (`--env ''`)
+to match the validated configuration and database ID, even when `CLOUDFLARE_ENV`
+is inherited. Every inspection statement must report native `changed_db: false` and
+`rows_written: 0`; missing, malformed or contradictory metadata fails its section
+and the command. `queryMetadata` retains each fixed SQL digest and statement index,
+the read-only verification state, and valid provider-reported `rows_read` and
+`size_after` (database bytes) when available. These are provider reports, not inferred
+counts or a guarantee that a future migration will fit within D1's write timeout.
+
 After successful inspection, `inspect` mode deliberately fails the main deployment
 with `read-only inspection complete; retirement remains held`. That failure is the
 expected diagnostic outcome, **not** successful deployment or activation. All
-provisioning and subsequent mutating steps remain skipped. The existing failure
-cleanup requires successful provisioning and an attempted consumer pause, so this
-hold cannot trigger a maintenance redeploy or queue-consumer changes.
+provisioning and subsequent mutating steps remain skipped. Every cutover stage,
+including catalog reconciliation and failure cleanup, also requires mode `apply`;
+the hold is not the sole mutation barrier. Cleanup additionally retains its original
+successful-provisioning and attempted-consumer-pause requirements. This hold cannot
+trigger a maintenance redeploy or queue-consumer changes.
 
 On failure, intentional hold or cancellation, the run's Actions artifacts retain
 `production-main-migration-evidence-<run_id>-<run_attempt>` for 14 days. Its whitelist
@@ -411,6 +423,9 @@ The subsequent main migration attempt failed with D1 storage timeout/reset code
 exact failed SQL or its commit state. **No further retirement attempt is authorized
 until the read-only production snapshot and a repair are independently reviewed.**
 Do not infer an applied registry prefix from copy/classification logs alone.
+Wrangler can throw an `APIError` before printing a failed migration status. Any
+candidate inferred from the last migration table's first pending entry is only an
+**inferred candidate**, never evidence of the actual failed statement or commit.
 Do not use workstation production Cloudflare authentication, an arbitrary-SQL
 endpoint, manual ledger/checkpoint edits, topology resets/rebuilds or FTS shadow
 table hacks to investigate or bypass this hold.

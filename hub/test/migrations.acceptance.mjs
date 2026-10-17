@@ -158,6 +158,10 @@ async function createRemoteMigrationFixture(context, { fault, migrationDirectory
       binding, database_name: `remote-migration-test-${binding.toLowerCase()}`, database_id: databaseId,
       migrations_dir: migrationDirectory,
     }],
+    env: { preview: { d1_databases: [{
+      binding, database_name: 'wrong-preview-database', database_id: '00000000-0000-0000-0000-000000000001',
+      migrations_dir: migrationDirectory,
+    }] } },
   }));
   await writeFile(runnerPath, `
     import { migrationFailureDiagnostic, runMigrations } from ${JSON.stringify(migrationRunnerUrl)};
@@ -212,9 +216,23 @@ async function createRemoteMigrationFixture(context, { fault, migrationDirectory
       try {
         results = splitSqlQuery(actualSql).map((statementSql) => {
           const statement = database.prepare(statementSql);
+          const beforeChanges = database.prepare('SELECT total_changes() AS value').get().value;
+          const beforeSchema = database.prepare('PRAGMA schema_version').get().schema_version;
+          if (inspect) assert.equal(database.prepare('PRAGMA query_only').get().query_only, 1);
           const rows = statement.columns().length ? statement.all().map((row) => ({ ...row }))
             : (statement.run(), []);
-          return { success: true, results: rows, meta: { duration: 0 } };
+          const rowsWritten = database.prepare('SELECT total_changes() AS value').get().value - beforeChanges;
+          const changedDb = rowsWritten !== 0 || database.prepare('PRAGMA schema_version').get().schema_version !== beforeSchema;
+          const sizeAfter = database.prepare('PRAGMA page_count').get().page_count
+            * database.prepare('PRAGMA page_size').get().page_size;
+          const meta = { duration: 0, changed_db: changedDb, rows_written: rowsWritten, rows_read: rows.length, size_after: sizeAfter };
+          if (sql === 'SELECT id, name, applied_at FROM d1_migrations ORDER BY id') {
+            if (fault === 'metadata-missing') delete meta.changed_db;
+            if (fault === 'metadata-changed') meta.changed_db = true;
+            if (fault === 'metadata-writes') meta.rows_written = 1;
+            if (fault === 'metadata-malformed') meta.rows_written = '0';
+          }
+          return { success: true, results: rows, meta };
         });
         database.exec('COMMIT');
       } catch (error) {
@@ -253,6 +271,7 @@ async function createRemoteMigrationFixture(context, { fault, migrationDirectory
     const argv = inspect ? [
       path.join(hubRoot, 'scripts/migrations.mjs'), 'inspect',
       '--target', options.target, '--config', configPath, '--database', binding,
+      '--database-id', databaseId,
       '--base-manifest', options.baseManifestPath, '--migrations-dir', migrationDirectory,
       '--output', inspectionOutput,
     ] : [runnerPath, JSON.stringify(options)];
@@ -262,6 +281,7 @@ async function createRemoteMigrationFixture(context, { fault, migrationDirectory
         ...process.env,
         NODE_OPTIONS: '',
         CI: 'true',
+        CLOUDFLARE_ENV: 'preview',
         CLOUDFLARE_ACCOUNT_ID: accountId,
         CLOUDFLARE_API_TOKEN: 'synthetic-migration-test-token',
         CLOUDFLARE_API_KEY: '',
@@ -291,7 +311,7 @@ test('read-only remote inspection captures native physical metadata before and a
   for (const [through, populated] of [[34, true], [34, false], [35, false], [36, false]]) {
     await context.test(`prefix ${through}, populated ${populated}`, async (child) => {
       const remote = await createRemoteMigrationFixture(child, { migrationDirectory: migrationsDir, inspect: true });
-      remote.database.exec('CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)');
+      remote.database.exec("CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, applied_at TEXT DEFAULT '2026-10-16T00:00:00Z')");
       applyPending(remote.database, fixture, through);
       const sentinel = 'private-block-text-not-for-inspection-7fe120';
       if (populated) remote.database.prepare(`
@@ -307,8 +327,18 @@ test('read-only remote inspection captures native physical metadata before and a
       assert.deepEqual(JSON.parse(await readFile(remote.inspectionOutput, 'utf8')), snapshot);
       assert.equal(snapshot.status, 'complete');
       assert.equal(snapshot.identity.databaseId, remote.options.databaseId);
-      assert.deepEqual(snapshot.sections.appliedMigrations.names,
+      assert.deepEqual(snapshot.sections.appliedMigrations.rows.map(({ name }) => name),
         fixture.manifest.migrations.filter(({ sequence }) => sequence <= through).map(({ filename }) => filename));
+      assert.deepEqual(snapshot.sections.appliedMigrations.rows,
+        remote.database.prepare('SELECT id, name, applied_at FROM d1_migrations ORDER BY id').all().map((row) => ({ ...row })));
+      assert.ok(snapshot.queryMetadata.length > 0);
+      for (const { status, meta } of snapshot.queryMetadata) {
+        assert.equal(status, 'verified-read-only');
+        assert.equal(meta.changed_db, false);
+        assert.equal(meta.rows_written, 0);
+        assert.ok(meta.rows_read >= 0);
+        assert.ok(meta.size_after > 0);
+      }
       assert.equal(snapshot.sections.legacyBlocks.status, through < 35 ? populated ? 'nonempty' : 'empty' : 'missing');
       assert.deepEqual(snapshot.sections.schema.objects.map(({ type, name, parent }) => [type, name, parent]),
         beforeSchema.map(({ type, name, tbl_name }) => [type, name, tbl_name]));
@@ -346,7 +376,7 @@ test('inspection distinguishes missing ledgers from failed reads and preserves p
     const remote = await createRemoteMigrationFixture(child, {
       migrationDirectory: migrationsDir, inspect: true, fault: 'inspection-ledger',
     });
-    remote.database.exec('CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)');
+    remote.database.exec("CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, applied_at TEXT DEFAULT '2026-10-16T00:00:00Z')");
     applyPending(remote.database, fixture, 34);
     remote.database.exec('PRAGMA query_only = ON');
     const inspected = await remote.run();
@@ -369,6 +399,31 @@ test('inspection distinguishes missing ledgers from failed reads and preserves p
   });
 });
 
+test('inspection fails closed on missing or non-read-only native statement metadata', async (context) => {
+  for (const fault of ['metadata-missing', 'metadata-changed', 'metadata-writes', 'metadata-malformed']) {
+    await context.test(fault, async (child) => {
+      const remote = await createRemoteMigrationFixture(child, { migrationDirectory: migrationsDir, inspect: true, fault });
+      remote.database.exec(`
+        CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY, name TEXT, applied_at TEXT);
+        INSERT INTO d1_migrations VALUES (1, '0001_init.sql', '2026-10-16T00:00:00Z');
+        PRAGMA query_only = ON;
+      `);
+      const inspected = await remote.run();
+      assert.notEqual(inspected.status, 0);
+      const snapshot = JSON.parse(inspected.stdout);
+      assert.deepEqual(JSON.parse(await readFile(remote.inspectionOutput, 'utf8')), snapshot);
+      assert.equal(snapshot.status, 'partial');
+      assert.equal(snapshot.sections.appliedMigrations.status, 'unavailable');
+      assert.equal(snapshot.sections.schema.status, 'complete');
+      assert.ok(snapshot.queryMetadata.some(({ status }) => status === 'unavailable'));
+      assert.match(snapshot.errors[0].message, /requires native changed_db=false and rows_written=0/);
+      assert.deepEqual({ ...remote.database.prepare('SELECT id, name, applied_at FROM d1_migrations').get() },
+        { id: 1, name: '0001_init.sql', applied_at: '2026-10-16T00:00:00Z' });
+      await assert.rejects(readFile(remote.options.journalPath), { code: 'ENOENT' });
+    });
+  }
+});
+
 test('canonical apply failures expose safe phase and both real Wrangler stream summaries', async (context) => {
   const fixture = await loadFixture();
   const remote = await createRemoteMigrationFixture(context, { migrationDirectory: migrationsDir });
@@ -388,6 +443,8 @@ test('canonical apply failures expose safe phase and both real Wrangler stream s
     assert.match(diagnostic[stream].sha256, /^[a-f0-9]{64}$/);
   }
   assert.ok(diagnostic.stdout.migrations.some(({ filename }) => filename === '0035_drop_legacy_blocks.sql'));
+  assert.equal(new Set(diagnostic.stdout.migrations.map(({ filename }) => filename)).size, diagnostic.stdout.migrations.length);
+  assert.deepEqual(diagnostic.stdout.inFlightCandidate, { filename: '0035_drop_legacy_blocks.sql', classification: 'inferred' });
   assert.doesNotMatch(rejected.stderr, /private-failed-session|private failed apply content|synthetic-migration-test-token|Bearer|--command/);
   assert.equal(remote.database.prepare('SELECT text FROM blocks').get().text, 'private failed apply content');
   assert.equal(JSON.parse(await readFile(remote.options.journalPath, 'utf8')).phase, 'intended');
