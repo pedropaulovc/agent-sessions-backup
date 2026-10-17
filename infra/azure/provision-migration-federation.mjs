@@ -11,7 +11,7 @@ const credentialName = 'migration-github-production';
 const desired = Object.freeze({
   name: credentialName,
   issuer: 'https://token.actions.githubusercontent.com',
-  subject: 'repo:pedropaulovc/agent-sessions-backup:environment:production',
+  subject: 'repo:pedropaulovc@577970/agent-sessions-backup@1303581136:environment:production',
   audiences: ['api://AzureADTokenExchange'],
 });
 

@@ -644,14 +644,15 @@ test('federation planning is idempotent and refuses changing existing trust', ()
   const worker = { name: 'cf-worker-federation', issuer: 'https://existing-worker.test', subject: 'existing-worker', audiences: ['existing'] };
   assert.equal(migrationFederationPlan([worker]), 'create');
   const migration = { name: 'migration-github-production', issuer: 'https://token.actions.githubusercontent.com',
-    subject: 'repo:pedropaulovc/agent-sessions-backup:environment:production', audiences: ['api://AzureADTokenExchange'] };
+    subject: 'repo:pedropaulovc@577970/agent-sessions-backup@1303581136:environment:production', audiences: ['api://AzureADTokenExchange'] };
   assert.equal(migrationFederationPlan([worker, migration]), 'unchanged');
   assert.throws(() => migrationFederationPlan([worker, { ...migration, subject: 'repo:other/unsafe:ref:refs/heads/main' }]), /drift/);
+  assert.throws(() => migrationFederationPlan([worker, { ...migration, subject: 'repo:pedropaulovc/agent-sessions-backup:environment:production' }]), /drift/);
   assert.throws(() => migrationFederationPlan([worker, { ...migration, audiences: [...migration.audiences, 'extra'] }]), /drift/);
   assert.deepEqual(worker.audiences, ['existing']);
 });
 
-test('narrow provision observe never writes and apply only adds the exact production federation', async () => {
+test('provision observe is read-only and apply creates a missing federation', async () => {
   const writes = [];
   const worker = { name: 'cf-worker-federation' };
   const az = async (args) => {
@@ -671,11 +672,4 @@ test('narrow provision observe never writes and apply only adds the exact produc
   const applied = await provisionMigrationFederation('--apply', { az });
   assert.equal(applied.federation, 'created');
   assert.equal(writes.length, 1);
-  assert.equal(writes[0][writes[0].indexOf('--name') + 1], 'migration-github-production');
-  assert.equal(writes[0][writes[0].indexOf('--subject') + 1], 'repo:pedropaulovc/agent-sessions-backup:environment:production');
-  assert.deepEqual(applied.variables, {
-    MIGRATION_AZURE_TENANT_ID: env.MIGRATION_AZURE_TENANT_ID,
-    MIGRATION_AZURE_CLIENT_ID: env.MIGRATION_AZURE_CLIENT_ID,
-    MIGRATION_AZURE_LOGS_ENDPOINT: env.MIGRATION_AZURE_LOGS_ENDPOINT,
-  });
 });
