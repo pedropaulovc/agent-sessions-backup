@@ -35,6 +35,10 @@ authenticate:
    — never uploads, bootstrap, cert, or admin routes. Default TTL 4 h, max 24 h; active
    grants are listed and revocable on the viewer's `/settings` page.
 
+   The approval page's CSP must allow same-origin `/grant/options` and `/grant/verify`
+   requests. If approval fails before the passkey prompt, check the browser console
+   for blocked connections; do not disable CSP or bypass passkey verification.
+
    Run the auth CLI from a **trusted checkout** (`main`, or your own reviewed branch) —
    the CLI handles the minted token, so an untrusted PR branch's copy could leak it. A
    read grant is short-lived, read-only, revocable at `/settings`, and every mint requires
