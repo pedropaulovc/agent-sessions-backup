@@ -648,9 +648,12 @@ The one-time cutover runs these operations in order, from the same checked-out m
 
 The authoritative workflow is `.github/workflows/ci.yml`; the production CLI refuses
 non-GitHub, PR/fork, non-main, wrong-account or malformed-revision contexts **before**
-reading credentials. Once a reviewed repair explicitly releases the diagnostic hold,
-operators resume through the protected main deployment, never by running the
-production copier locally.
+reading credentials. Operators continue only through a protected main deployment
+of a reviewed revision under its source-controlled `PRODUCTION_MAIN_MIGRATION_MODE`;
+never run the production copier locally. A failed apply does not activate production
+or reset that mode: later main pushes will try `apply` again. Unless an incident
+disposition authorizes continuation, the next reviewed main change must restore
+`inspect`.
 
 ### Abort, resume, and failure policy
 
