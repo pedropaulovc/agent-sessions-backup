@@ -8,7 +8,7 @@ import {
   migrationManifestAtRef,
   validateManifestShape,
 } from './lib/migration-manifest.mjs';
-import { runMigrations } from './lib/migration-runner.mjs';
+import { inspectMigrations, migrationFailureDiagnostic, runMigrations, writeMigrationInspection } from './lib/migration-runner.mjs';
 
 const hubRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const repositoryRoot = path.resolve(hubRoot, '..');
@@ -110,7 +110,24 @@ async function main() {
     process.stdout.write(`${JSON.stringify({ migrationDigest: result.digest })}\n`);
     return;
   }
-  if (command !== 'apply') throw new Error('usage: migrations.mjs <check|check-base|apply> [--name value ...]');
+  if (command === 'inspect') {
+    const snapshot = await inspectMigrations({
+      target: options.target,
+      config: resolveOption(options.config),
+      database: options.database ?? 'DB',
+      databaseId: options['database-id'],
+      persistTo: resolveOption(options['persist-to']),
+      migrationsDir,
+      manifestPath,
+      baseManifestPath: resolveOption(options['base-manifest']),
+      historyPath: resolveOption(options.history),
+    });
+    process.stdout.write(`${JSON.stringify(snapshot)}\n`);
+    if (options.output) await writeMigrationInspection(resolveOption(options.output), snapshot);
+    if (snapshot.status !== 'complete') process.exitCode = 1;
+    return;
+  }
+  if (command !== 'apply') throw new Error('usage: migrations.mjs <check|check-base|inspect|apply> [--name value ...]');
   let releaseManifest;
   let releasePublicKey;
   if (options['release-manifest']) releaseManifest = JSON.parse(await readFile(resolveOption(options['release-manifest']), 'utf8'));
@@ -135,6 +152,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  process.stderr.write(`${error.stack ?? error.message}\n`);
+  process.stderr.write(`${JSON.stringify({ error: 'migration command failed', ...migrationFailureDiagnostic(error) })}\n`);
   process.exitCode = 1;
 });

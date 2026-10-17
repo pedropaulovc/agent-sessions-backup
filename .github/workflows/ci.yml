@@ -257,6 +257,8 @@ jobs:
       id-token: write
     env:
       PROTECTED_PRODUCTION_MIGRATION: "1"
+      # Diagnostic release: only a later reviewed repair may change this to apply.
+      PRODUCTION_MAIN_MIGRATION_MODE: inspect
       CLOUDFLARE_ACCOUNT_ID: "18ef3246e9f36d1560485ef53889c0ab"
       # Nonsecret identifiers; only protected production can exchange the GitHub OIDC assertion.
       MIGRATION_AZURE_TENANT_ID: ${{ vars.MIGRATION_AZURE_TENANT_ID }}
@@ -288,8 +290,36 @@ jobs:
             echo "Refusing stale deployment: run=$GITHUB_SHA current=$current_head" >&2
             exit 1
           fi
+      - name: Validate the production main migration mode
+        run: |
+          set -euo pipefail
+          case "$PRODUCTION_MAIN_MIGRATION_MODE" in
+            inspect|apply) ;;
+            *) echo "Invalid production main migration mode; refusing Cloudflare operations." >&2; exit 1 ;;
+          esac
+      - name: Inspect main migration metadata before any production mutation
+        id: main-inspection
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/main-migration-inspection"
+          node scripts/migrations.mjs inspect \
+            --target production \
+            --config wrangler.jsonc \
+            --database DB \
+            --database-id 5ff65cf3-89c8-4fe6-a3c2-a370293ecea6 \
+            --base-manifest migrations/source-baseline.json \
+            --history migrations/historical-baseline.json \
+            --output "$RUNNER_TEMP/main-migration-inspection/preflight.json"
+      - name: Hold retirement after read-only inspection
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'inspect'
+        run: |
+          echo "read-only inspection complete; retirement remains held" >&2
+          exit 1
       - name: Provision immutable production index bindings
         id: index-provision
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
         run: >-
@@ -298,6 +328,7 @@ jobs:
           --output "$RUNNER_TEMP/index-maintenance.json"
           --active-output "$RUNNER_TEMP/index-active.json"
       - name: Apply schema and ledger only to index shards
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
         run: |
@@ -317,6 +348,7 @@ jobs:
           node ../infra/cf/index-control.mjs initialize --config "$RUNNER_TEMP/index-maintenance.json"
       - name: Classify the durable index layout
         id: index-layout
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
         run: >-
@@ -324,29 +356,30 @@ jobs:
           --config "$RUNNER_TEMP/index-maintenance.json"
           --github-output "$GITHUB_OUTPUT"
       - name: Ensure dedicated production rollup queue
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply'
         run: node ../infra/cf/provision-queues.mjs --target production
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
       - name: Pause production queue consumers without draining messages
         id: index-pause
-        if: steps.index-layout.outputs.layout_state != 'active'
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply' && steps.index-layout.outputs.layout_state != 'active'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
         run: node ../infra/cf/index-control.mjs pause-consumers --config "$RUNNER_TEMP/index-active.json"
       - name: Deploy exact maintenance revision
-        if: steps.index-layout.outputs.layout_state != 'active'
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply' && steps.index-layout.outputs.layout_state != 'active'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
         run: npx wrangler deploy --config "$RUNNER_TEMP/index-maintenance.json" --env=""
       - name: Verify maintenance revision and drain old queues and crons
-        if: steps.index-layout.outputs.layout_state != 'active'
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply' && steps.index-layout.outputs.layout_state != 'active'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
         run: |
           node ../infra/cf/index-control.mjs health --config "$RUNNER_TEMP/index-maintenance.json" --mode maintenance
           node ../infra/cf/index-control.mjs drain --config "$RUNNER_TEMP/index-maintenance.json"
       - name: Record migration token validity before copy
-        if: steps.index-layout.outputs.layout_state != 'active'
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply' && steps.index-layout.outputs.layout_state != 'active'
         continue-on-error: true
         timeout-minutes: 1
         env:
@@ -354,18 +387,20 @@ jobs:
         run: node ../infra/cf/migration-auth-diagnostics.mjs --stage preflight
       - name: Resume full-fidelity copy and verified source deletion
         id: index-copy
-        if: steps.index-layout.outputs.layout_state != 'active'
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply' && steps.index-layout.outputs.layout_state != 'active'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
         run: node ../infra/cf/index-control.mjs copy --config "$RUNNER_TEMP/index-maintenance.json" --pass-budget-ms 18000000
       - name: Record migration token validity after failed copy
-        if: ${{ failure() && steps.index-copy.outcome == 'failure' }}
+        if: ${{ failure() && env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply' && steps.index-copy.outcome == 'failure' }}
         continue-on-error: true
         timeout-minutes: 1
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
         run: node ../infra/cf/migration-auth-diagnostics.mjs --stage copy_failure
       - name: Apply and verify main migrations after any required source copy
+        id: main-migrations
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
         run: |
@@ -380,14 +415,30 @@ jobs:
             --deployment-id "production:${GITHUB_SHA}:DB" \
             --base-manifest migrations/source-baseline.json \
             --history migrations/historical-baseline.json
+      - name: Inspect main migration metadata after failed apply
+        if: ${{ failure() && env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply' && steps.main-migrations.outcome == 'failure' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/main-migration-inspection"
+          node scripts/migrations.mjs inspect \
+            --target production \
+            --config wrangler.jsonc \
+            --database DB \
+            --database-id 5ff65cf3-89c8-4fe6-a3c2-a370293ecea6 \
+            --base-manifest migrations/source-baseline.json \
+            --history migrations/historical-baseline.json \
+            --output "$RUNNER_TEMP/main-migration-inspection/post-failure.json"
       - name: Seed and readback-verify the complete session and star catalogs
-        if: steps.index-layout.outputs.layout_state != 'active'
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply' && steps.index-layout.outputs.layout_state != 'active'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
         run: |
           node ../infra/cf/index-control.mjs seed-catalog --config "$RUNNER_TEMP/index-maintenance.json"
           node ../infra/cf/index-control.mjs ready --config "$RUNNER_TEMP/index-maintenance.json"
       - name: Reject a stale activation
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -398,10 +449,12 @@ jobs:
             exit 1
           fi
       - name: Deploy active revision and restore queue consumers
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
         run: npx wrangler deploy --config "$RUNNER_TEMP/index-active.json" --env=""
       - name: Verify active revision, shard SQL and viewer login
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
         run: |
@@ -409,7 +462,7 @@ jobs:
           node ../infra/cf/index-control.mjs reconcile-catalog --config "$RUNNER_TEMP/index-active.json"
           node ../infra/cf/index-control.mjs verify-active --config "$RUNNER_TEMP/index-active.json"
       - name: Fail closed after an interrupted or failed cutover
-        if: ${{ always() && (failure() || cancelled()) && steps.index-provision.outcome == 'success' && steps.index-layout.outputs.layout_state != 'active' && (steps.index-pause.outcome == 'success' || steps.index-pause.outcome == 'failure' || steps.index-pause.outcome == 'cancelled') }}
+        if: ${{ always() && env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply' && (failure() || cancelled()) && steps.index-provision.outcome == 'success' && steps.index-layout.outputs.layout_state != 'active' && (steps.index-pause.outcome == 'success' || steps.index-pause.outcome == 'failure' || steps.index-pause.outcome == 'cancelled') }}
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_DEPLOY_TOKEN }}
         run: |
@@ -417,3 +470,30 @@ jobs:
           node ../infra/cf/index-control.mjs pause-consumers --config "$RUNNER_TEMP/index-active.json" || pause_status=$?
           npx wrangler deploy --config "$RUNNER_TEMP/index-maintenance.json" --env=""
           exit "$pause_status"
+      - name: Warn about missing main migration evidence
+        if: ${{ always() && (failure() || cancelled()) }}
+        env:
+          MAIN_MIGRATION_OUTCOME: ${{ steps.main-migrations.outcome }}
+        run: |
+          if [[ ! -s "$RUNNER_TEMP/main-migration-inspection/preflight.json" ]]; then
+            echo "::warning::Main migration preflight evidence is missing; do not infer database state."
+          fi
+          if [[ "$MAIN_MIGRATION_OUTCOME" == "failure" ]]; then
+            if [[ ! -s "$RUNNER_TEMP/main-migration-inspection/post-failure.json" ]]; then
+              echo "::warning::Main migration post-failure evidence is missing; retirement remains held."
+            fi
+            if [[ ! -s "$RUNNER_TEMP/production-DB-${GITHUB_SHA}.json" ]]; then
+              echo "::warning::Main migration runner journal is missing; commit state is not established."
+            fi
+          fi
+      - name: Retain structured main migration evidence on failure or hold
+        if: ${{ always() && (failure() || cancelled()) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-main-migration-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/main-migration-inspection/preflight.json
+            ${{ runner.temp }}/main-migration-inspection/post-failure.json
+            ${{ runner.temp }}/production-DB-${{ github.sha }}.json

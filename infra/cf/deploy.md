@@ -353,9 +353,96 @@ local production deployment; do not bypass it with a local production Wrangler l
   is exercised after deployment through the existing owner-authorized collector/viewer
   flow, not a new production bearer or synthetic authentication bypass.
 
+### Read-only diagnostic hold before further retirement
+
+The current diagnostic release sets the source-controlled production job environment
+`PRODUCTION_MAIN_MIGRATION_MODE: inspect` in `.github/workflows/ci.yml`. The only
+accepted values are `inspect` and `apply`; validation follows the stale-main guard
+and precedes all Cloudflare operations. This is not a workflow input or a dispatch
+path. Keep the protected push/main/environment/concurrency and existing secret
+selection unchanged.
+
+Before provisioning, schema writes, queue changes, deployment, drain or copying,
+the protected job uses `CLOUDFLARE_MIGRATION_TOKEN` for this fixed inspection:
+
+```sh
+node scripts/migrations.mjs inspect \
+  --target production \
+  --config wrangler.jsonc \
+  --database DB \
+  --database-id 5ff65cf3-89c8-4fe6-a3c2-a370293ecea6 \
+  --base-manifest migrations/source-baseline.json \
+  --history migrations/historical-baseline.json \
+  --output "$RUNNER_TEMP/main-migration-inspection/preflight.json"
+```
+
+The base configuration identifies account `18ef3246e9f36d1560485ef53889c0ab` and main
+database `5ff65cf3-89c8-4fe6-a3c2-a370293ecea6`. Inspection issues fixed read-only
+metadata SELECTs: ordered applied migration IDs, names and timestamps, all checksum-ledger
+columns, schema object identities/types/parents and definition digests, and a bounded
+`SELECT 1 ... LIMIT 1` existence probe for legacy `blocks`. It does not return
+session content, block text or session/block row IDs. FTS shadow-object metadata is
+permitted; copying, whole-data counts, repair SQL, registry bootstrap, ledger
+writes, journal creation and checkpoint changes are not inspection operations.
+Missing objects/ledgers and unavailable query results are distinct from empty
+results. A failed query retains partial structured evidence and fails the command;
+it does not retry or authorize later mutations.
+
+The migration runner explicitly selects Wrangler's top-level environment (`--env ''`)
+to match the validated configuration and database ID, even when `CLOUDFLARE_ENV`
+is inherited. Every inspection statement must report native `changed_db: false` and
+`rows_written: 0`; missing, malformed or contradictory metadata fails its section
+and the command. `queryMetadata` retains each fixed SQL digest and statement index,
+the read-only verification state, and valid provider-reported `rows_read` and
+`size_after` (database bytes) when available. These are provider reports, not inferred
+counts or a guarantee that a future migration will fit within D1's write timeout.
+
+After successful inspection, `inspect` mode deliberately fails the main deployment
+with `read-only inspection complete; retirement remains held`. That failure is the
+expected diagnostic outcome, **not** successful deployment or activation. All
+provisioning and subsequent mutating steps remain skipped. Every cutover stage,
+including catalog reconciliation and failure cleanup, also requires mode `apply`;
+the hold is not the sole mutation barrier. Cleanup additionally retains its original
+successful-provisioning and attempted-consumer-pause requirements. This hold cannot
+trigger a maintenance redeploy or queue-consumer changes.
+
+On failure, intentional hold or cancellation, the run's Actions artifacts retain
+`production-main-migration-evidence-<run_id>-<run_attempt>` for 14 days. Its whitelist
+is only `main-migration-inspection/preflight.json`,
+`main-migration-inspection/post-failure.json` and the trusted runner journal
+`production-DB-<revision>.json` (when produced). No Wrangler debug logs, raw HTTP,
+environment dumps or copied data are uploaded. Missing evidence produces a warning;
+absence is not an empty database or proof that an operation did not commit.
+Read the snapshot's complete/partial/failed status and each unavailable/missing
+section before interpreting migration-prefix, checksum or schema state.
+
+The full 3,539,584-block copy completed with SHA-256
+`a92035b0b65764aa6c27b1103746b7ea84b89f9f6f066d2cbaa9a929f525d1d9`.
+The subsequent main migration attempt failed with D1 storage timeout/reset code
+7429; catalog seeding and activation did not run. That code does not identify the
+exact failed SQL or its commit state. **No further retirement attempt is authorized
+until the read-only production snapshot and a repair are independently reviewed.**
+Do not infer an applied registry prefix from copy/classification logs alone.
+Wrangler can throw an `APIError` before printing a failed migration status. Any
+candidate inferred from the last migration table's first pending entry is only an
+**inferred candidate**, never evidence of the actual failed statement or commit.
+Do not use workstation production Cloudflare authentication, an arbitrary-SQL
+endpoint, manual ledger/checkpoint edits, topology resets/rebuilds or FTS shadow
+table hacks to investigate or bypass this hold.
+
+Only a later reviewed, evidence-backed repair may change the source-controlled mode
+to `apply`. In that mode the same preflight must succeed before the original guarded
+cutover can proceed. A failed main migration additionally runs the same fixed
+read-only inspection into `post-failure.json`; it neither retries apply nor suppresses
+the migration or snapshot failure. Review that evidence before any further attempt.
+Recovery to two full backups and cancellation of paid PPE only after recovery remain
+separate requirements; a diagnostic hold authorizes neither cancellation nor a
+claim of recovered service.
+
 ### Enforced ordering
 
-The protected job classifies the durable layout as `legacy`, `pending`, or `active`.
+In reviewed `apply` mode, after the read-only preflight, the protected job classifies
+the durable layout as `legacy`, `pending`, or `active`.
 Completed copy and seed checkpoints alone are **pending**, including after a failed
 readiness check or first activation smoke. `active` requires valid durable readiness
 and initial-activation proofs bound to the exact completed copy/seed snapshots.
@@ -524,8 +611,9 @@ The one-time cutover runs these operations in order, from the same checked-out m
 
 The authoritative workflow is `.github/workflows/ci.yml`; the production CLI refuses
 non-GitHub, PR/fork, non-main, wrong-account or malformed-revision contexts **before**
-reading credentials. Operators resume by re-running the protected main deployment,
-not by running the production copier locally.
+reading credentials. Once a reviewed repair explicitly releases the diagnostic hold,
+operators resume through the protected main deployment, never by running the
+production copier locally.
 
 ### Abort, resume, and failure policy
 
