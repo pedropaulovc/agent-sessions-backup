@@ -180,7 +180,15 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   if (!q) return { hits: [], error: 'missing_q' };
   // Only a bounded reconciliation slice belongs on a read request. A remaining backlog is an
   // unavailable index, not permission to return hits with stale metadata, stars or costs.
-  if ((await drainIndexCatalog(env)).state === 'pending') {
+  const catalog = await drainIndexCatalog(env);
+  if (catalog.state === 'pending') {
+    console.warn(JSON.stringify({
+      event: 'hub.search.unavailable',
+      code: 'index_catalog_pending',
+      status: 503,
+      catalog_synced: catalog.synced,
+      catalog_subrequests: catalog.subrequests,
+    }));
     return { hits: [], error: 'index_catalog_pending', status: 503 };
   }
 
