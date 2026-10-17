@@ -55,7 +55,6 @@ describe('Cloudflare OAuth broker', () => {
   const url = await authorizationUrl();
   expect(url.origin + url.pathname).toBe('https://dash.cloudflare.com/oauth2/auth');
   expect(url.searchParams.get('client_id')).toBe('test-oauth-client');
-  expect(url.searchParams.get('redirect_uri')).toBe(`${VIEWER}/oauth/cloudflare/callback`);
   expect(url.searchParams.get('response_type')).toBe('code');
   expect(url.searchParams.get('scope')).toBe(grantedScope);
   expect(url.searchParams.get('code_challenge_method')).toBe('S256');
@@ -63,12 +62,15 @@ describe('Cloudflare OAuth broker', () => {
   expect(url.searchParams.get('state')).toMatch(/^[A-Za-z0-9_-]{43}$/);
  });
 
- it('exchanges a one-use callback without a client secret and stores only broker-visible status', async () => {
+ it('exchanges a one-use callback with the authorized redirect URI and no client secret, storing only broker-visible status', async () => {
   const authorizeUrl = await authorizationUrl();
   const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
    const form = new URLSearchParams(String(init?.body));
    expect(form.get('grant_type')).toBe('authorization_code');
    expect(form.get('client_id')).toBe('test-oauth-client');
+   // OAuth requires the same redirect URI in both legs; it is independently
+   // registered/configured, not derived from the browser callback request host.
+   expect(form.get('redirect_uri')).toBe(authorizeUrl.searchParams.get('redirect_uri'));
    expect(form.get('client_secret')).toBeNull();
    expect(form.get('code_verifier')).toMatch(/^[A-Za-z0-9_-]{64}$/);
    return tokenResponse();

@@ -24,6 +24,9 @@ export default defineConfig(async () => {
             TEST_MIGRATIONS: migrations,
             TEST_INDEX_MIGRATIONS: indexMigrations,
             CF_OAUTH_CLIENT_ID: 'test-oauth-client',
+            // OAuth registration is independent of VIEWER_HOST. Keep these distinct
+            // so broker tests cannot accidentally rely on matching production defaults.
+            CF_OAUTH_REDIRECT_URI: 'https://registered-oauth.example/callback',
           },
           // The local queue simulator auto-delivers parse and rollup messages on its own real-time
           // timer (the base Wrangler config sets no max_batch_timeout, so it falls back to a short local
