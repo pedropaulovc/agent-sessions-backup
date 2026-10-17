@@ -353,14 +353,15 @@ local production deployment; do not bypass it with a local production Wrangler l
   is exercised after deployment through the existing owner-authorized collector/viewer
   flow, not a new production bearer or synthetic authentication bypass.
 
-### Read-only diagnostic hold before further retirement
+### Inspected-state continuation and read-only diagnostic hold
 
-The current diagnostic release sets the source-controlled production job environment
-`PRODUCTION_MAIN_MIGRATION_MODE: inspect` in `.github/workflows/ci.yml`. The only
-accepted values are `inspect` and `apply`; validation follows the stale-main guard
-and precedes all Cloudflare operations. This is not a workflow input or a dispatch
-path. Keep the protected push/main/environment/concurrency and existing secret
-selection unchanged.
+The protected production job sets the source-controlled environment variable
+`PRODUCTION_MAIN_MIGRATION_MODE: apply` in `.github/workflows/ci.yml` for the
+inspected-state continuation below. The only accepted values are `inspect` and
+`apply`; validation follows the stale-main guard and precedes all Cloudflare
+operations. Changing the mode requires a reviewed source change and protected
+main push, not a workflow input or dispatch. Keep the production environment,
+concurrency and existing secret selection unchanged.
 
 Before provisioning, schema writes, queue changes, deployment, drain or copying,
 the protected job uses `CLOUDFLARE_MIGRATION_TOKEN` for this fixed inspection:
@@ -418,26 +419,62 @@ section before interpreting migration-prefix, checksum or schema state.
 
 The full 3,539,584-block copy completed with SHA-256
 `a92035b0b65764aa6c27b1103746b7ea84b89f9f6f066d2cbaa9a929f525d1d9`.
-The subsequent main migration attempt failed with D1 storage timeout/reset code
-7429; catalog seeding and activation did not run. That code does not identify the
-exact failed SQL or its commit state. **No further retirement attempt is authorized
-until the read-only production snapshot and a repair are independently reviewed.**
-Do not infer an applied registry prefix from copy/classification logs alone.
-Wrangler can throw an `APIError` before printing a failed migration status. Any
-candidate inferred from the last migration table's first pending entry is only an
-**inferred candidate**, never evidence of the actual failed statement or commit.
-Do not use workstation production Cloudflare authentication, an arbitrary-SQL
-endpoint, manual ledger/checkpoint edits, topology resets/rebuilds or FTS shadow
-table hacks to investigate or bypass this hold.
+Protected read-only run `39013836201` confirmed that `0035_drop_legacy_blocks.sql`
+is in applied history, while the checksum ledger ends at `0034`. All legacy
+`blocks`, FTS and freeze objects are absent. `0036_session_catalog_outbox.sql`
+is the only pending migration, with no catalog objects present. The earlier
+7429 timeout does not identify its failed statement or commit outcome; it is
+not evidence that retirement must run again.
 
-Only a later reviewed, evidence-backed repair may change the source-controlled mode
-to `apply`. In that mode the same preflight must succeed before the original guarded
-cutover can proceed. A failed main migration additionally runs the same fixed
-read-only inspection into `post-failure.json`; it neither retries apply nor suppresses
-the migration or snapshot failure. Review that evidence before any further attempt.
-Recovery to two full backups and cancellation of paid PPE only after recovery remain
-separate requirements; a diagnostic hold authorizes neither cancellation nor a
-claim of recovered service.
+Continue through the existing guarded pipeline, not repair SQL. Initialization
+preserves the genuine completed copy checkpoint and classifies the retired main
+as pending. Deploy the new exact maintenance revision, wait the unchanged
+16-minute drain, then let completed-copy re-entry verify the checkpoint without
+recreating source tables or a freeze. Normal migration apply skips applied
+`0035`, applies canonical `0036`, and records both missing checksum entries.
+Use the new deployment's normally created trusted journal; do not copy or
+fabricate an old journal. A checksum entry's deployment identity records the
+current attesting run, not necessarily the earlier run that executed its SQL.
+Catalog seeding/readback, READY, stale-main rejection and active verification
+remain required after apply.
+
+Wrangler submits a migration's SQL and history INSERT in one query. Its
+[migration-command contract](https://developers.cloudflare.com/workers/wrangler/commands/d1/#d1-migrations-apply)
+rolls back a failed migration while retaining previous successful migrations.
+A lost reply can leave a whole committed migration unsealed; the normal runner
+can finalize it from durable history with a fresh, identity-bound journal.
+This is the documented command contract, not an empirical reconstruction of
+the original timeout. The verifier's returned schema digest is a live
+measurement, not a comparison against canonical object definitions.
+
+The ordered native 16-shard rehearsal passed completed-copy re-entry, apply,
+catalog seeding and READY with the full real-time drain. It used 32 synthetic
+blocks and 33 sessions; Cloudflare transport, health and provider metadata were
+simulated. It did not prove production scale, live consumer quiescence or
+`verify-active`/viewer behavior. The number of distinct production session IDs
+seeded by `0036` is unknown; its set-based writes can still fail on provider
+storage or execution limits. Do not retry such a failure automatically.
+
+A failed main apply runs the same fixed inspection into `post-failure.json`;
+seed, READY and active deployment remain skipped, and fail-closed cleanup
+attempts to keep consumers paused and the Worker in maintenance. Retain the
+genuine journal and structured evidence before selecting another action:
+
+- Any `session_catalog_*` object without `0036` in applied history is a partial
+  state requiring a separately reviewed repair. Include both tables, the
+  `session_catalog_outbox_session` index and all eight triggers.
+- Conversely, `0036` history with absent or divergent catalog objects is an
+  out-of-contract incident, not proof of a healthy or sealed schema. If
+  observed, stop in maintenance and investigate before further continuation.
+  The existing runner does not perform a canonical-DDL comparison.
+
+Do not infer applied history from copy/classification logs or a pending
+migration table. Wrangler can throw before printing a failed status; a candidate
+inferred from its last table remains an inference. No workstation production
+Cloudflare authentication, arbitrary-SQL endpoint, manual ledger/checkpoint
+edits, topology reset/rebuild or FTS shadow-table workaround is authorized.
+Recovery of both complete backups and cancellation of paid PPE only afterward
+remain separate acceptance requirements; migration progress is not recovery.
 
 ### Enforced ordering
 

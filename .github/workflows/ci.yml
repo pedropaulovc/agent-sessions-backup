@@ -257,8 +257,8 @@ jobs:
       id-token: write
     env:
       PROTECTED_PRODUCTION_MIGRATION: "1"
-      # Diagnostic release: only a later reviewed repair may change this to apply.
-      PRODUCTION_MAIN_MIGRATION_MODE: inspect
+      # Normal guarded apply; inspect remains the read-only incident hold.
+      PRODUCTION_MAIN_MIGRATION_MODE: apply
       CLOUDFLARE_ACCOUNT_ID: "18ef3246e9f36d1560485ef53889c0ab"
       # Nonsecret identifiers; only protected production can exchange the GitHub OIDC assertion.
       MIGRATION_AZURE_TENANT_ID: ${{ vars.MIGRATION_AZURE_TENANT_ID }}
