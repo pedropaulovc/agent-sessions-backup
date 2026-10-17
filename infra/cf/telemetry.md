@@ -242,6 +242,14 @@ Azure telemetry pipeline at all) are for. If gateway-specific diagnostics ever
 need to reach Azure, that requires a separate non-recursive sink, not
 `sessions-hub`'s destinations.
 
+Remote preview browser failures are separate: the `preview` CI job uploads
+`hub/test-results/` and `hub/playwright-report/` as the `preview-browser-e2e`
+artifact, retained for 14 days. Inspect its screenshots, error context and
+Playwright traces when those were produced, rather than inferring the response
+from a locator timeout. The smoke fixtures are synthetic and the derived per-PR
+bearer is public by design. Keep sensitive session data and the preview bearer
+seed out of the retained artifacts.
+
 ## Rotating the signing key
 
 The issuer publishes a **JWKS array** (`PUBLIC_JWKS` in
