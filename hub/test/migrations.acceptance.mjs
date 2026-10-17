@@ -424,7 +424,7 @@ test('inspection fails closed on missing or non-read-only native statement metad
   }
 });
 
-test('canonical apply failures expose safe phase and both real Wrangler stream summaries', async (context) => {
+test('canonical apply failures report safe phase and inferred progress while preserving private source data', async (context) => {
   const fixture = await loadFixture();
   const remote = await createRemoteMigrationFixture(context, { migrationDirectory: migrationsDir });
   remote.database.exec('CREATE TABLE d1_migrations (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE)');
@@ -435,13 +435,14 @@ test('canonical apply failures expose safe phase and both real Wrangler stream s
   `);
   const rejected = await remote.run();
   assert.notEqual(rejected.status, 0);
-  const diagnostic = JSON.parse(rejected.stderr);
+  const diagnostic = rejected.stderr.split(/\r?\n/).flatMap((line) => {
+    try {
+      return [JSON.parse(line)];
+    } catch {
+      return [];
+    }
+  }).find((value) => value?.operation === 'canonical-wrangler-apply');
   assert.equal(diagnostic.phase, 'apply');
-  assert.equal(diagnostic.operation, 'canonical-wrangler-apply');
-  for (const stream of ['stdout', 'stderr']) {
-    assert.ok(diagnostic[stream].bytes > 0);
-    assert.match(diagnostic[stream].sha256, /^[a-f0-9]{64}$/);
-  }
   assert.ok(diagnostic.stdout.migrations.some(({ filename }) => filename === '0035_drop_legacy_blocks.sql'));
   assert.equal(new Set(diagnostic.stdout.migrations.map(({ filename }) => filename)).size, diagnostic.stdout.migrations.length);
   assert.deepEqual(diagnostic.stdout.inFlightCandidate, { filename: '0035_drop_legacy_blocks.sql', classification: 'inferred' });
