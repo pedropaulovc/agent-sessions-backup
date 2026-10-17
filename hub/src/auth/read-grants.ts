@@ -41,6 +41,12 @@ const TEXT = new TextEncoder();
 
 export interface GrantIdentity { kind: 'grant'; grantId: string; label: string; expiresAt: number }
 
+/** Dev advertises 127.0.0.1, while passkey users may also open localhost. */
+function grantHostOk(url: URL, env: Env): boolean {
+  return url.hostname === env.VIEWER_HOST
+    || (env.ENVIRONMENT === 'development' && (url.hostname === '127.0.0.1' || url.hostname === 'localhost'));
+}
+
 function json(data: unknown, status = 200): Response {
   return Response.json(data, {
     status,
@@ -179,7 +185,7 @@ export async function readGrantBrowserRoute(request: Request, url: URL, env: Env
  * plus the verifier (never left the requesting process) is the credential.
  */
 export async function readGrantApiRoute(request: Request, url: URL, env: Env): Promise<Response | null> {
-  if (env.ENVIRONMENT === 'preview' || url.hostname !== env.VIEWER_HOST) return null;
+  if (env.ENVIRONMENT === 'preview' || !grantHostOk(url, env)) return null;
   if (url.pathname !== '/api/v1/grants/exchange' || request.method !== 'POST') return null;
   const body = await bodyJson<{ code?: unknown; codeVerifier?: unknown }>(request);
   if (!body || typeof body.code !== 'string' || !CODE_RE.test(body.code)
@@ -207,7 +213,7 @@ export async function readGrantApiRoute(request: Request, url: URL, env: Env): P
 
 /** Resolve a viewer-host read-grant bearer, or null. Preview never accepts production bearers. */
 export async function grantIdentity(request: Request, env: Env): Promise<GrantIdentity | null> {
-  if (env.ENVIRONMENT === 'preview' || new URL(request.url).hostname !== env.VIEWER_HOST) return null;
+  if (env.ENVIRONMENT === 'preview' || !grantHostOk(new URL(request.url), env)) return null;
   const match = request.headers.get('authorization')?.match(BEARER_RE);
   if (!match) return null;
   const now = Date.now();

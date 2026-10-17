@@ -142,7 +142,7 @@ describe('passkey-minted read grants', () => {
     const code = await approveGrant(grantParams(challenge), credentialId);
     const split = { ...testEnv, ENVIRONMENT: 'production', API_HOST: 'machine.example', VIEWER_HOST: 'viewer.example' } as Env;
     const ctx = {} as ExecutionContext; // These routes do not schedule background work.
-    for (const host of [split.API_HOST, 'unrelated.example']) {
+    for (const host of [split.API_HOST, 'unrelated.example', 'localhost', '127.0.0.1']) {
       const denied = await route(new Request(`https://${host}/api/v1/grants/exchange`, {
         method: 'POST', body: JSON.stringify({ code, codeVerifier: verifier }),
       }), split, ctx);
@@ -153,7 +153,7 @@ describe('passkey-minted read grants', () => {
     }), split, ctx);
     expect(exchanged.status).toBe(200);
     const { token } = await exchanged.json() as { token: string };
-    for (const host of [split.VIEWER_HOST, split.API_HOST, 'unrelated.example']) {
+    for (const host of [split.VIEWER_HOST, split.API_HOST, 'unrelated.example', 'localhost', '127.0.0.1']) {
       const response = await route(new Request(`https://${host}/api/v1/status`, {
         headers: { authorization: `Bearer ${token}` },
       }), split, ctx);
@@ -161,23 +161,39 @@ describe('passkey-minted read grants', () => {
     }
   });
 
-  it('preserves exchange and bearer reads when development shares one hostname', async () => {
-    const credentialId = `grant-cred-${crypto.randomUUID()}`;
-    await seedCredential(credentialId);
-    const { verifier, challenge } = await pkcePair();
-    const code = await approveGrant(grantParams(challenge), credentialId);
-    const local = { ...testEnv, ENVIRONMENT: 'development', API_HOST: 'localhost', VIEWER_HOST: 'localhost' } as Env;
-    const ctx = {} as ExecutionContext; // These routes do not schedule background work.
-    const exchanged = await route(new Request('http://localhost:8787/api/v1/grants/exchange', {
-      method: 'POST', body: JSON.stringify({ code, codeVerifier: verifier }),
-    }), local, ctx);
-    expect(exchanged.status).toBe(200);
-    const { token } = await exchanged.json() as { token: string };
-    const response = await route(new Request('http://localhost:8787/api/v1/status', {
-      headers: { authorization: `Bearer ${token}` },
-    }), local, ctx);
-    expect(response.status).toBe(200);
-  });
+  it.each(['http://127.0.0.1:49123', 'http://localhost:8787'])(
+    'exchanges and reads on the supported local origin %s with generated local bindings', async (origin) => {
+      const credentialId = `grant-cred-${crypto.randomUUID()}`;
+      await seedCredential(credentialId);
+      const { verifier, challenge } = await pkcePair();
+      const code = await approveGrant(grantParams(challenge), credentialId);
+      // testEnv comes from writeLocalConfig, just like dev:up. Do not hand-set
+      // VIEWER_HOST to the request hostname: that masked the production-host leak.
+      const ctx = {} as ExecutionContext; // These routes do not schedule background work.
+      for (const deniedOrigin of ['http://unrelated.example', 'http://localhost.evil.example', 'http://127.0.0.2']) {
+        const denied = await route(new Request(`${deniedOrigin}/api/v1/grants/exchange`, {
+          method: 'POST', body: JSON.stringify({ code, codeVerifier: verifier }),
+        }), testEnv, ctx);
+        expect(denied.status, deniedOrigin).toBe(401);
+      }
+      const exchanged = await route(new Request(`${origin}/api/v1/grants/exchange`, {
+        method: 'POST', body: JSON.stringify({ code, codeVerifier: verifier }),
+      }), testEnv, ctx);
+      expect(exchanged.status).toBe(200);
+      const { token } = await exchanged.json() as { token: string };
+      const response = await route(new Request(`${origin}/api/v1/status`, {
+        headers: { authorization: `Bearer ${token}` },
+      }), testEnv, ctx);
+      expect(response.status).toBe(200);
+      const payload = await response.json() as { identity: { kind: string } };
+      expect(payload.identity.kind).toBe('grant');
+      for (const deniedOrigin of ['http://unrelated.example', 'http://localhost.evil.example', 'http://127.0.0.2']) {
+        expect(await grantIdentity(new Request(`${deniedOrigin}/api/v1/status`, {
+          headers: { authorization: `Bearer ${token}` },
+        }), testEnv), deniedOrigin).toBeNull();
+      }
+    },
+  );
 
   it('rejects the exchange for a wrong or mismatched PKCE verifier', async () => {
     const credentialId = `grant-cred-${crypto.randomUUID()}`;
