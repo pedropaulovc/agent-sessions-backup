@@ -644,23 +644,24 @@ test('federation planning is idempotent and refuses changing existing trust', ()
   const worker = { name: 'cf-worker-federation', issuer: 'https://existing-worker.test', subject: 'existing-worker', audiences: ['existing'] };
   assert.equal(migrationFederationPlan([worker]), 'create');
   const migration = { name: 'migration-github-production', issuer: 'https://token.actions.githubusercontent.com',
-    subject: 'repo:pedropaulovc/agent-sessions-backup:environment:production', audiences: ['api://AzureADTokenExchange'] };
+    subject: 'repo:pedropaulovc@577970/agent-sessions-backup@1303581136:environment:production', audiences: ['api://AzureADTokenExchange'] };
   assert.equal(migrationFederationPlan([worker, migration]), 'unchanged');
   assert.throws(() => migrationFederationPlan([worker, { ...migration, subject: 'repo:other/unsafe:ref:refs/heads/main' }]), /drift/);
   assert.throws(() => migrationFederationPlan([worker, { ...migration, audiences: [...migration.audiences, 'extra'] }]), /drift/);
   assert.deepEqual(worker.audiences, ['existing']);
 });
 
-test('narrow provision observe never writes and apply only adds the exact production federation', async () => {
+test('provisioning observes, creates only missing trust, and refuses legacy trust', async (t) => {
   const writes = [];
   const worker = { name: 'cf-worker-federation' };
+  let credentials = [worker];
   const az = async (args) => {
     if (args[0] === 'account') return { id: '07aba226-fd59-489a-b07b-4158fef12a5d', tenantId: env.MIGRATION_AZURE_TENANT_ID };
     if (args[0] === 'role') return [{ scope: '/existing/dcr', roleDefinitionName: 'Monitoring Metrics Publisher' }];
     if (args[0] === 'monitor' && args[2] === 'rule') return { id: '/existing/dcr', immutableId: 'dcr-cf864bcaac834a3da25f1ae1fa86a408' };
     if (args[0] === 'monitor') return { logsIngestion: { endpoint: 'https://dce-agent-backup-payj.westus2-1.ingest.monitor.azure.com' } };
     if (args[1] === 'show') return { clientId: env.MIGRATION_AZURE_CLIENT_ID, principalId: 'existing-principal' };
-    if (args[2] === 'list') return [worker];
+    if (args[2] === 'list') return credentials;
     assert.deepEqual(args.slice(0, 3), ['identity', 'federated-credential', 'create']);
     writes.push(args);
     return {};
@@ -671,11 +672,17 @@ test('narrow provision observe never writes and apply only adds the exact produc
   const applied = await provisionMigrationFederation('--apply', { az });
   assert.equal(applied.federation, 'created');
   assert.equal(writes.length, 1);
-  assert.equal(writes[0][writes[0].indexOf('--name') + 1], 'migration-github-production');
-  assert.equal(writes[0][writes[0].indexOf('--subject') + 1], 'repo:pedropaulovc/agent-sessions-backup:environment:production');
-  assert.deepEqual(applied.variables, {
-    MIGRATION_AZURE_TENANT_ID: env.MIGRATION_AZURE_TENANT_ID,
-    MIGRATION_AZURE_CLIENT_ID: env.MIGRATION_AZURE_CLIENT_ID,
-    MIGRATION_AZURE_LOGS_ENDPOINT: env.MIGRATION_AZURE_LOGS_ENDPOINT,
-  });
+  credentials = [worker, {
+    name: 'migration-github-production',
+    issuer: 'https://token.actions.githubusercontent.com',
+    subject: 'repo:pedropaulovc/agent-sessions-backup:environment:production',
+    audiences: ['api://AzureADTokenExchange'],
+  }];
+  const writesBeforeDrift = writes.length;
+  for (const mode of ['--observe', '--apply']) {
+    await t.test(`${mode} refuses legacy trust without writes`, async () => {
+      await assert.rejects(() => provisionMigrationFederation(mode, { az }), /drift/);
+      assert.equal(writes.length, writesBeforeDrift);
+    });
+  }
 });

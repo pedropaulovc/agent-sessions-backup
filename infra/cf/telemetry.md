@@ -285,7 +285,24 @@ environment exchanges its OIDC assertion for the existing
 token. No gateway bearer, Azure key, collector change, or Cloudflare login is
 required. The existing `cf-worker-federation` credential stays untouched.
 
-Provision only this additional trust, using the owner's Azure login:
+Discover the repository's OIDC subject configuration read-only before provisioning:
+
+```sh
+gh api repos/pedropaulovc/agent-sessions-backup/actions/oidc/customization/sub
+```
+
+With `use_immutable_subject: true`, GitHub uses stable owner/repository IDs in the
+subject even when `use_default: true`. This repository's `sub_claim_prefix` is
+`repo:pedropaulovc@577970/agent-sessions-backup@1303581136`; the protected
+environment adds `:environment:production`. See GitHub's
+[OIDC subject customization response contract](https://docs.github.com/en/rest/actions/oidc#get-the-customization-template-for-an-oidc-subject-claim-for-a-repository).
+
+Stop unless the response has `use_default: true`, `use_immutable_subject: true`,
+and the exact `sub_claim_prefix` above. A mismatch requires a reviewed change to
+the pinned trust contract before provisioning, not a manual workaround.
+
+Using the owner's Azure login, observe the trust first. Only when the credential
+is absent may `--apply` create it:
 
 ```sh
 node infra/azure/provision-migration-federation.mjs --observe
@@ -298,7 +315,16 @@ absent. It refuses credential drift instead of rewriting trust. It does **not**
 run `provision.sh`, change roles, deploy Workers, or update alerts/workbooks.
 The exact trust is issuer `https://token.actions.githubusercontent.com`, audience
 `api://AzureADTokenExchange`, subject
-`repo:pedropaulovc/agent-sessions-backup:environment:production`.
+`repo:pedropaulovc@577970/agent-sessions-backup@1303581136:environment:production`.
+
+An existing credential with the old mutable-name subject
+`repo:pedropaulovc/agent-sessions-backup:environment:production` is drift:
+**both `--observe` and `--apply` refuse it**. Updating that credential requires a
+one-time, separately reviewed owner operation outside this helper, after
+independently verifying the full protected-environment subject. Do not add a
+mutable-subject fallback or replace trust automatically. The issuer, audience,
+managed identity, and existing DCR-scoped Monitoring Metrics Publisher role stay
+unchanged; the repair grants no additional permissions.
 
 Copy the helper's three **nonsecret** `variables` values into GitHub environment
 `production` variables:
