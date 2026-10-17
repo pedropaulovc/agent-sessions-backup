@@ -257,6 +257,8 @@ jobs:
       id-token: write
     env:
       PROTECTED_PRODUCTION_MIGRATION: "1"
+      # Diagnostic release: only a later reviewed repair may change this to apply.
+      PRODUCTION_MAIN_MIGRATION_MODE: inspect
       CLOUDFLARE_ACCOUNT_ID: "18ef3246e9f36d1560485ef53889c0ab"
       # Nonsecret identifiers; only protected production can exchange the GitHub OIDC assertion.
       MIGRATION_AZURE_TENANT_ID: ${{ vars.MIGRATION_AZURE_TENANT_ID }}
@@ -288,6 +290,32 @@ jobs:
             echo "Refusing stale deployment: run=$GITHUB_SHA current=$current_head" >&2
             exit 1
           fi
+      - name: Validate the production main migration mode
+        run: |
+          set -euo pipefail
+          case "$PRODUCTION_MAIN_MIGRATION_MODE" in
+            inspect|apply) ;;
+            *) echo "Invalid production main migration mode; refusing Cloudflare operations." >&2; exit 1 ;;
+          esac
+      - name: Inspect main migration metadata before any production mutation
+        id: main-inspection
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/main-migration-inspection"
+          node scripts/migrations.mjs inspect \
+            --target production \
+            --config wrangler.jsonc \
+            --database DB \
+            --base-manifest migrations/source-baseline.json \
+            --history migrations/historical-baseline.json \
+            --output "$RUNNER_TEMP/main-migration-inspection/preflight.json"
+      - name: Hold retirement after read-only inspection
+        if: env.PRODUCTION_MAIN_MIGRATION_MODE == 'inspect'
+        run: |
+          echo "read-only inspection complete; retirement remains held" >&2
+          exit 1
       - name: Provision immutable production index bindings
         id: index-provision
         env:
@@ -366,6 +394,7 @@ jobs:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
         run: node ../infra/cf/migration-auth-diagnostics.mjs --stage copy_failure
       - name: Apply and verify main migrations after any required source copy
+        id: main-migrations
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
         run: |
@@ -380,6 +409,20 @@ jobs:
             --deployment-id "production:${GITHUB_SHA}:DB" \
             --base-manifest migrations/source-baseline.json \
             --history migrations/historical-baseline.json
+      - name: Inspect main migration metadata after failed apply
+        if: ${{ failure() && env.PRODUCTION_MAIN_MIGRATION_MODE == 'apply' && steps.main-migrations.outcome == 'failure' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_MIGRATION_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/main-migration-inspection"
+          node scripts/migrations.mjs inspect \
+            --target production \
+            --config wrangler.jsonc \
+            --database DB \
+            --base-manifest migrations/source-baseline.json \
+            --history migrations/historical-baseline.json \
+            --output "$RUNNER_TEMP/main-migration-inspection/post-failure.json"
       - name: Seed and readback-verify the complete session and star catalogs
         if: steps.index-layout.outputs.layout_state != 'active'
         env:
@@ -417,3 +460,30 @@ jobs:
           node ../infra/cf/index-control.mjs pause-consumers --config "$RUNNER_TEMP/index-active.json" || pause_status=$?
           npx wrangler deploy --config "$RUNNER_TEMP/index-maintenance.json" --env=""
           exit "$pause_status"
+      - name: Warn about missing main migration evidence
+        if: ${{ always() && (failure() || cancelled()) }}
+        env:
+          MAIN_MIGRATION_OUTCOME: ${{ steps.main-migrations.outcome }}
+        run: |
+          if [[ ! -s "$RUNNER_TEMP/main-migration-inspection/preflight.json" ]]; then
+            echo "::warning::Main migration preflight evidence is missing; do not infer database state."
+          fi
+          if [[ "$MAIN_MIGRATION_OUTCOME" == "failure" ]]; then
+            if [[ ! -s "$RUNNER_TEMP/main-migration-inspection/post-failure.json" ]]; then
+              echo "::warning::Main migration post-failure evidence is missing; retirement remains held."
+            fi
+            if [[ ! -s "$RUNNER_TEMP/production-DB-${GITHUB_SHA}.json" ]]; then
+              echo "::warning::Main migration runner journal is missing; commit state is not established."
+            fi
+          fi
+      - name: Retain structured main migration evidence on failure or hold
+        if: ${{ always() && (failure() || cancelled()) }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-main-migration-evidence-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 14
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/main-migration-inspection/preflight.json
+            ${{ runner.temp }}/main-migration-inspection/post-failure.json
+            ${{ runner.temp }}/production-DB-${{ github.sha }}.json
