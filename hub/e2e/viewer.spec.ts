@@ -14,6 +14,48 @@ test.describe('synthetic sessions viewer', () => {
     await expect(page.getByRole('heading', { name: 'Recent sessions' })).toBeVisible();
   });
 
+  test('fetches fresh passkey options when approving a read grant', async ({ page, appURL }) => {
+    test.skip(!!process.env.BASE_URL?.trim(), 'Remote preview intentionally exposes no grant or login routes');
+
+    const params = new URLSearchParams({
+      challenge: 'A'.repeat(43),
+      callback: 'http://127.0.0.1:54321/cb',
+      label: 'E2E read grant',
+      ttl: '300',
+    });
+    await page.goto(appURL(`/grant?${params}`));
+
+    const blockedConnection = await page.evaluate(() => new Promise<{
+      effectiveDirective: string; disposition: string; blockedURI: string;
+    }>((resolve) => {
+      document.addEventListener('securitypolicyviolation', (event) => resolve({
+        effectiveDirective: event.effectiveDirective,
+        disposition: event.disposition,
+        blockedURI: event.blockedURI,
+      }), { once: true });
+      void fetch('https://csp-probe.invalid/', { credentials: 'omit' }).catch(() => {});
+    }));
+    expect(blockedConnection).toMatchObject({
+      effectiveDirective: 'connect-src',
+      disposition: 'enforce',
+    });
+    expect(new URL(blockedConnection.blockedURI).origin).toBe('https://csp-probe.invalid');
+
+    const optionsURL = new URL('/grant/options', page.url());
+    // Listen before the real page handler fetches: a direct API request would bypass its CSP.
+    const optionsResponse = page.waitForResponse((response) =>
+      response.url() === optionsURL.toString() && response.request().method() === 'POST',
+    );
+    await page.getByRole('button', { name: 'Approve with passkey', exact: true }).click();
+    const response = await optionsResponse;
+    expect(response.status()).toBe(200);
+    expect(await response.json()).toMatchObject({
+      rpId: optionsURL.hostname,
+      userVerification: 'required',
+    });
+    // Stop before completing WebAuthn; fixture context cleanup dismisses any authenticator UI.
+  });
+
   test('navigates the Skills tab and reads a backed-up managed skill', async ({ page, appURL }) => {
     await page.goto(appURL('/'));
     await page.getByRole('link', { name: 'Skills', exact: true }).click();

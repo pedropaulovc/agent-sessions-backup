@@ -52,7 +52,7 @@ function pageHeaders(): Headers {
   const headers = new Headers({ 'content-type': 'text/html; charset=utf-8' });
   headers.set('cache-control', 'no-store');
   headers.set('referrer-policy', 'no-referrer');
-  headers.set('content-security-policy', "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+  headers.set('content-security-policy', "default-src 'none'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
   headers.set('x-frame-options', 'DENY');
   return headers;
 }
