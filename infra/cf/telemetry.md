@@ -219,6 +219,52 @@ The warning identifies this specific 503 guard without changing its freshness
 contract. A historical 503 whose response body was not retained is not directly
 confirmed as `index_catalog_pending` by this new event.
 
+## D1 consumption attribution
+
+Use Cloudflare's account billing page for billed totals. Azure spans identify
+expensive Worker paths, but export loss, duplicate delivery, sampling and direct
+control-plane operations prevent an exact account reconciliation. The queries
+below return aggregates, not SQL text or session identifiers.
+
+Pricing candidate reads in `law-agent-backup`:
+
+```kusto
+OTelSpans
+| where TimeGenerated >= ago(1d) and Name == "d1_all"
+| where tostring(Attributes["service.name"]) == "sessions-hub"
+| extend q=tostring(Attributes["db.query.text"]),
+    rows=tolong(Attributes["cloudflare.d1.response.rows_read"])
+| where q contains "priced_version"
+| extend selector=case(q startswith "SELECT u.id AS id", "legacy",
+    q contains "AS MATERIALIZED", "materialized", "unclassified")
+| summarize calls=count(), measuredCalls=countif(isnotnull(rows)),
+    rowsRead=sum(rows), p95Reads=percentile(rows, 95) by selector
+| project selector, calls, measuredCalls,
+    rowsRead=iff(measuredCalls == 0, long(null), rowsRead), p95Reads
+```
+
+Catalog replication writes, including zero-write replays:
+
+```kusto
+OTelSpans
+| where TimeGenerated >= ago(1d) and Name == "d1_batch"
+| where tostring(Attributes["service.name"]) == "sessions-hub"
+| extend q=tostring(Attributes["db.query.text"]),
+    rows=tolong(Attributes["cloudflare.d1.response.rows_written"])
+| where q startswith "INSERT INTO catalog_versions"
+| summarize calls=count(), measuredCalls=countif(isnotnull(rows)),
+    rowsWritten=sum(rows), zeroWriteCalls=countif(rows == 0)
+| project calls, measuredCalls,
+    rowsWritten=iff(measuredCalls == 0, long(null), rowsWritten), zeroWriteCalls
+```
+
+These selectors match the current SQL shapes; revise them if the query builders
+change. A missing measurement is unknown, not zero. Compare equivalent workloads
+before attributing a change in average reads or writes to a deployment.
+`selectionRowsRead` in pricing results covers candidate queries only; it excludes
+catalog loading, cost writes and session-subtotal refreshes. Storage retention
+needs a separate inventory: observed R2 operations are not current stored bytes.
+
 ## What the alerts do (and don't) cover
 
 Only `sessions-hub` gets `observability.logs`/`traces` destinations pointed at
