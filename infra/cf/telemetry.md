@@ -259,7 +259,8 @@ OTelSpans
 ```
 
 These selectors match the current SQL shapes; revise them if the query builders
-change. A missing measurement is unknown, not zero. Compare equivalent workloads
+change. A missing measurement is unknown, not zero. Totals cover measured calls
+only; `measuredCalls < calls` means partial coverage. Compare equivalent workloads
 before attributing a change in average reads or writes to a deployment.
 `selectionRowsRead` in pricing results covers candidate queries only; it excludes
 catalog loading, cost writes and session-subtotal refreshes. Storage retention
