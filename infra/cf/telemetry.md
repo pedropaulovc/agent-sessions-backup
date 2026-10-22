@@ -223,8 +223,9 @@ confirmed as `index_catalog_pending` by this new event.
 
 Use Cloudflare's account billing page for billed totals. Azure spans identify
 expensive Worker paths, but export loss, duplicate delivery, sampling and direct
-control-plane operations prevent an exact account reconciliation. The queries
-below return aggregates, not SQL text or session identifiers.
+control-plane operations prevent an exact account reconciliation.
+The queries below cover a rolling 24-hour window and return aggregates only,
+without SQL text or session identifiers.
 
 Pricing candidate reads in `law-agent-backup`:
 
