@@ -78,6 +78,9 @@ export interface PricingPassResult {
    * pricing state, so the row is still due and the next pass prices what it now holds. Counted
    * because a silently-dropped write and a successful one must not look the same. */
   superseded: number;
+  /** Actual D1 rows read by candidate selection and its bounded projection, excluding the catalog
+   * load and transactional writes/subtotal refreshes. NULL if the binding omitted read metadata. */
+  selectionRowsRead: number | null;
   /** True when the pass stopped on its row budget rather than because it ran out of work — the
    * signal that a backfill needs another run, as opposed to being done. */
   more: boolean;
@@ -98,23 +101,26 @@ interface UnpricedRow extends UsageAggRow {
   cas_w1h: number | null;
 }
 
-/** Prices rows whose `usd` is still NULL.
+/** Prices due rows, optionally restricted to the union of sessions whose usage ingest changed.
  *
- * `sessionId` scopes it to one session, which is what the ingest path uses so a freshly indexed
- * session shows real dollars immediately instead of NULL until the next nightly run.
+ * Omitting `sessionIds` is the global recovery pass (nightly/admin). An explicit empty scope is
+ * no work, never an alias for global recovery.
  */
 export async function priceUsage(
   db: D1Database,
-  opts: { sessionId?: string; maxRows?: number; readBatch?: number; now?: Date } = {},
+  opts: { sessionIds?: readonly string[]; maxRows?: number; readBatch?: number; now?: Date } = {},
 ): Promise<PricingPassResult> {
   const startedAt = (opts.now ?? new Date()).toISOString();
   const maxRows = opts.maxRows ?? PRICING_READ_BATCH;
   // Injectable so the loop's re-read behaviour is testable at all: with the production batch
   // size, reaching a second iteration takes 500 seeded rows.
   const readBatch = opts.readBatch ?? PRICING_READ_BATCH;
+  const result: PricingPassResult = {
+    examined: 0, priced: 0, unpriceable: 0, superseded: 0, selectionRowsRead: 0, more: false,
+  };
+  const sessionIds = opts.sessionIds === undefined ? undefined : [...new Set(opts.sessionIds)];
+  if (sessionIds?.length === 0) return result;
   const prices = await loadPrices(db);
-
-  const result: PricingPassResult = { examined: 0, priced: 0, unpriceable: 0, superseded: 0, more: false };
   // `ranDry` is set when a read came back short. Every exit from the loop below must reach the
   // `more` derivation, so the two "ran out of work" cases are `break`s that record WHY here
   // rather than early returns — keeping `more` exact: true only when the ROW BUDGET stopped the
@@ -123,7 +129,11 @@ export async function priceUsage(
 
   while (!ranDry && result.examined < maxRows) {
     const take = Math.min(readBatch, maxRows - result.examined);
-    const rows = await selectUnpriced(db, prices, startedAt, opts.sessionId, take);
+    const selected = await selectUnpriced(db, prices, startedAt, sessionIds, take);
+    const rows = selected.results ?? [];
+    const rowsRead = selected.meta?.rows_read;
+    result.selectionRowsRead = result.selectionRowsRead === null || rowsRead === undefined
+      ? null : result.selectionRowsRead + rowsRead;
     // A short read means the query ran out of rows, not that the budget ran out. Distinguishing
     // them is the whole value of `more`: a caller that re-runs on `more` would otherwise loop
     // forever against a corpus that is fully priced.
@@ -257,56 +267,68 @@ const ZERO_COST: StoredCost = Object.freeze({
   byClass: Object.freeze({ input: 0, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0 }),
 }) as StoredCost;
 
-/** One row per `usage` row, carrying the shape flags and clamped token sums the shared fragments
- * define.
+/** One row per bounded candidate, with the unchanged shared epoch, shape and token expressions.
  *
- * `GROUP BY u.id` is what makes that reuse possible: the fragments are written for a group that
- * could have been a single call, and grouping on the primary key produces exactly that — a group
- * of one — so the per-row clamps and the class-presence booleans apply verbatim rather than being
- * re-derived here for the single-row case.
+ * `GROUP BY u.id` makes the aggregate fragments groups of one. Candidate selection MUST precede
+ * this projection: grouping the entire due corpus and only then applying LIMIT reads every due
+ * row on every invocation, even when ingest asks for just 100.
  */
 async function selectUnpriced(
   db: D1Database,
   prices: Map<string, ModelPrice[]>,
   startedAt: string,
-  sessionId: string | undefined,
+  sessionIds: readonly string[] | undefined,
   limit: number,
-): Promise<UnpricedRow[]> {
-  const binds: unknown[] = [startedAt, PRICING_VERSION];
-  const scope = sessionId ? `AND u.session_id = ?${binds.push(sessionId)}` : '';
-  // ONE predicate, deliberately. Every reason a row is due collapses into "its stored version is
-  // below the current one":
-  //   0                never priced by any version (the column's default).
-  //   < PRICING_VERSION priced by an older shape or an older arithmetic -- the repricing path,
-  //                    which is what makes a constant bump sufficient.
-  //   also 0           priced, and the answer was "no rate". A failed attempt does NOT advance the
-  //                    version (see the write), so such a row stays due forever and is retried once
-  //                    per run -- which is what we want, since "unpriceable" is a claim about the
-  //                    catalog on the day it was made and catalogs gain models.
-  //
-  // The obvious spelling -- `priced_version IS NULL OR priced_version < ?2 OR usd IS NULL` -- reads
-  // more explicitly and is unusable: SQLite cannot serve an OR across a NULL test and a range from
-  // one index, so it plans as `SCAN u`, a full 776k-row scan on every run including the ones with
-  // nothing to do. Verified on D1; see migration 0019.
-  //
-  // The priced_at clause is orthogonal: it is what stops a run re-reading rows it has already
-  // attempted this pass. See the module comment.
-  const rows = await db
+): Promise<D1Result<UnpricedRow>> {
+  const binds: unknown[] = [startedAt];
+  let candidates: string;
+  if (sessionIds !== undefined) {
+    binds.push(JSON.stringify(sessionIds));
+    // Scope first, then indexed session seeks: unrelated due debt must not be walked just to
+    // discover that it is outside this batch. JSON keeps a large export slice under D1's bind
+    // parameter limit without per-session round trips. The LIMIT is still before aggregation.
+    candidates = `SELECT u.id, u.priced_at
+      FROM json_each(?2) scope
+      CROSS JOIN usage u INDEXED BY usage_session ON u.session_id = scope.value
+      WHERE u.priced_version < ${PRICING_VERSION}
+        AND (u.priced_at IS NULL OR u.priced_at < ?1)
+      ORDER BY u.priced_at, u.id
+      LIMIT ${limit}`;
+  } else {
+    // The index is (priced_version, priced_at, id). A RANGE on version cannot provide the
+    // cross-version attempt order, and sorting that range before LIMIT walks the whole debt.
+    // Seek each supported old version by EQUALITY instead, with separate NULL and timestamp
+    // ranges so already-attempted rows cannot turn an empty read into a scan of that version.
+    // Each branch contributes at most `limit` rows in the final priority order. No row behind
+    // that prefix could win the merged LIMIT, so this is exactly the original ordering, with
+    // at most 2 * PRICING_VERSION * limit index candidates and `limit` full usage projections.
+    // Versions 0..N-1 include never-priced, failed attempts (0), and every historic stored cost.
+    const branches = Array.from({ length: PRICING_VERSION }, (_, version) =>
+      ['priced_at IS NULL', 'priced_at < ?1'].map((attempt) =>
+        `SELECT id, priced_at FROM (
+          SELECT id, priced_at FROM usage INDEXED BY usage_due_for_pricing
+          WHERE priced_version = ${version} AND ${attempt}
+          ORDER BY priced_at, id LIMIT ${limit}
+        )`,
+      ),
+    ).flat();
+    candidates = `SELECT id, priced_at FROM (${branches.join('\nUNION ALL\n')})
+      ORDER BY priced_at, id LIMIT ${limit}`;
+  }
+  return db
     .prepare(
-      `SELECT u.id AS id, u.session_id AS session_id, u.model AS model, ${priceEpochExpr(prices)} AS epoch,
+      `WITH candidates AS MATERIALIZED (${candidates})
+       SELECT u.id AS id, u.session_id AS session_id, u.model AS model, ${priceEpochExpr(prices)} AS epoch,
               u.model AS cas_model, u.cache_basis AS cas_cache_basis,
               COALESCE(u.input_tokens,0) AS cas_input, COALESCE(u.output_tokens,0) AS cas_output,
               COALESCE(u.cache_read_tokens,0) AS cas_cache_read,
               COALESCE(u.cache_creation_5m_tokens,0) AS cas_w5,
               COALESCE(u.cache_creation_1h_tokens,0) AS cas_w1h,
               ${USAGE_SHAPE_SELECT}, ${USAGE_TOKEN_SUMS}
-         FROM usage u
-        WHERE u.priced_version < ?2 AND (u.priced_at IS NULL OR u.priced_at < ?1) ${scope}
+         FROM candidates c CROSS JOIN usage u ON u.id = c.id
         GROUP BY u.id, u.session_id, u.model, epoch, ${USAGE_SHAPE_GROUP_BY}
-        ORDER BY u.priced_at, u.id
-        LIMIT ${limit}`,
+        ORDER BY u.priced_at, u.id`,
     )
     .bind(...binds)
     .all<UnpricedRow>();
-  return rows.results ?? [];
 }
