@@ -7,6 +7,7 @@ import { PRICING_VERSION } from '../src/pricing-pass';
 import { runSessionRollup } from '../src/session-rollup';
 import { cacheBasisForHarness } from '../src/cache-basis';
 import { indexDbFor, reserveBlockIds } from '../src/index-shards';
+import { consumeParseBatch } from '../src/ingest/consumer';
 
 const testEnv = env as unknown as Env;
 
@@ -1903,7 +1904,7 @@ describe('re-parse invalidates a stored cost', () => {
     );
   }
 
-  it('re-prices a turn whose tokens changed, through writeSession', async () => {
+  async function seedReparsePrice(): Promise<void> {
     await testEnv.DB.prepare(
       `INSERT OR REPLACE INTO model_prices
          (model, effective_from, litellm_key, provider, input_cost, output_cost, cache_read_cost,
@@ -1911,6 +1912,18 @@ describe('re-parse invalidates a stored cost', () => {
        VALUES ('reparse-model', '2026-01-01', 'reparse-model', 'anthropic', 1, 10, 0.1, 2, 4,
                'test', '2026-07-31T00:00:00Z')`,
     ).run();
+  }
+
+  async function seedUnrelatedDebt(sessionId: string, count = 1): Promise<void> {
+    await testEnv.DB.prepare(
+      `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
+       INSERT INTO usage (session_id, turn_index, model, cache_basis, input_tokens)
+       SELECT ?1, i, 'never-published-ingest-debt', 'disjoint', 1000000 FROM n`,
+    ).bind(sessionId, count).run();
+  }
+
+  it('re-prices a turn whose tokens changed, through writeSession', async () => {
+    await seedReparsePrice();
 
     await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${SID}.jsonl`, transcript(1_000_000));
     await drainQueue();
@@ -1971,6 +1984,127 @@ describe('re-parse invalidates a stored cost', () => {
         .bind(BASIS_SID)
         .first<{ cache_basis: string | null }>())?.cache_basis,
     ).toBe('disjoint');
+  });
+
+  it.each(['empty', 'missing-file'] as const)('does not run global pricing for a %s parse batch', async (kind) => {
+    const debt = `ingest-noop-pricing-${kind}`;
+    await seedUnrelatedDebt(debt);
+    try {
+      if (kind === 'empty') {
+        await consumeParseBatch({ messages: [] }, testEnv);
+      } else {
+        await deliverOne(-1, 'raw/testbox-wsl/claude-projects/no-such-file.jsonl');
+      }
+      const row = await testEnv.DB.prepare('SELECT usd, priced_at FROM usage WHERE session_id = ?1')
+        .bind(debt).first<{ usd: number | null; priced_at: string | null }>();
+      expect(row).toEqual({ usd: null, priced_at: null });
+    } finally {
+      await testEnv.DB.prepare('DELETE FROM usage WHERE session_id = ?1').bind(debt).run();
+    }
+  });
+
+  it('does not price retained unchanged usage just because a delivery rewrites session metadata', async () => {
+    const sid = '11111111-2222-4333-8444-555555555557';
+    await seedReparsePrice();
+    await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${sid}.jsonl`, transcript(1_000_000, sid));
+    await drainQueue();
+    const file = await testEnv.DB.prepare('SELECT id, r2_key FROM files WHERE session_id = ?1')
+      .bind(sid).first<{ id: number; r2_key: string }>();
+    expect(file).toBeTruthy();
+    // Leave recovery debt on an otherwise byte-identical turn. sameUsage must retain it; an
+    // ingest delivery that changed no usage is not a reason to sweep that debt.
+    await testEnv.DB.prepare('UPDATE usage SET usd = NULL, priced_at = NULL, priced_version = 0 WHERE session_id = ?1')
+      .bind(sid).run();
+
+    await deliverOne(file!.id, file!.r2_key);
+
+    expect(
+      await testEnv.DB.prepare('SELECT usd, priced_at, priced_version FROM usage WHERE session_id = ?1')
+        .bind(sid).first(),
+    ).toEqual({ usd: null, priced_at: null, priced_version: 0 });
+    expect(
+      (await testEnv.DB.prepare('SELECT index_state FROM sessions WHERE session_id = ?1').bind(sid)
+        .first<{ index_state: string }>())?.index_state,
+    ).toBe('ready');
+  });
+
+  it('prices multiple changed sessions in one batch ahead of unrelated recovery debt', async () => {
+    const sessions = ['11111111-2222-4333-8444-555555555558', '11111111-2222-4333-8444-555555555559'];
+    const debt = 'ingest-multiple-session-pricing-debt';
+    await seedReparsePrice();
+    await seedUnrelatedDebt(debt, 150); // More than the entire ingest pricing budget, and older ids.
+    try {
+      for (const sid of sessions) {
+        expect(
+          (await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${sid}.jsonl`, transcript(1_000_000, sid))).status,
+        ).toBe(201);
+      }
+      const files = await testEnv.DB.prepare('SELECT id, r2_key FROM files WHERE session_id IN (SELECT value FROM json_each(?1))')
+        .bind(JSON.stringify(sessions)).all<{ id: number; r2_key: string }>();
+      expect(files.results).toHaveLength(2);
+      const ack = vi.fn();
+      const retry = vi.fn();
+      await consumeParseBatch({
+        messages: files.results.map((file) => ({
+          id: String(file.id), timestamp: new Date(), attempts: 1,
+          body: { file_id: file.id, r2_key: file.r2_key, reason: 'upload' as const },
+          ack, retry,
+        })),
+      }, testEnv);
+
+      expect(ack).toHaveBeenCalledTimes(2);
+      expect(retry).not.toHaveBeenCalled();
+      const priced = await testEnv.DB.prepare(
+        'SELECT session_id, usd, priced_version FROM usage WHERE session_id IN (SELECT value FROM json_each(?1)) ORDER BY session_id',
+      ).bind(JSON.stringify(sessions)).all();
+      expect(priced.results).toEqual(sessions.map((session_id) => ({ session_id, usd: 1, priced_version: PRICING_VERSION })));
+      expect(
+        (await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM usage WHERE session_id = ?1 AND priced_at IS NOT NULL')
+          .bind(debt).first<{ n: number }>())?.n,
+      ).toBe(0);
+    } finally {
+      await testEnv.DB.prepare('DELETE FROM usage WHERE session_id = ?1').bind(debt).run();
+    }
+  });
+
+  it('keeps successful parse acknowledgements when the scoped pricing write fails', async () => {
+    const sid = '11111111-2222-4333-8444-55555555555a';
+    await seedReparsePrice();
+    await putFile('testbox-wsl', 'claude-projects', `-home-tester-src-demo/${sid}.jsonl`, transcript(1_000_000, sid));
+    const file = await testEnv.DB.prepare('SELECT id, r2_key FROM files WHERE session_id = ?1')
+      .bind(sid).first<{ id: number; r2_key: string }>();
+    expect(file).toBeTruthy();
+    await testEnv.DB.prepare(
+      `CREATE TRIGGER fail_ingest_pricing BEFORE UPDATE OF usd ON usage
+       WHEN NEW.session_id = '${sid}' BEGIN SELECT RAISE(FAIL, 'pricing_write_rejected'); END`,
+    ).run();
+    const ack = vi.fn();
+    const retry = vi.fn();
+    const logged = vi.spyOn(console, 'log');
+    try {
+      await consumeParseBatch({
+        messages: [{
+          id: String(file!.id), timestamp: new Date(), attempts: 1,
+          body: { file_id: file!.id, r2_key: file!.r2_key, reason: 'upload' },
+          ack, retry,
+        }],
+      }, testEnv);
+
+      expect(ack).toHaveBeenCalledOnce();
+      expect(retry).not.toHaveBeenCalled();
+      expect(logged.mock.calls.some(([line]) => typeof line === 'string' &&
+        line.includes('"event":"hub.pricing.batch_pass_failed"'))).toBe(true);
+      expect(
+        (await testEnv.DB.prepare('SELECT parse_state FROM files WHERE id = ?1').bind(file!.id)
+          .first<{ parse_state: string }>())?.parse_state,
+      ).toBe('parsed');
+      expect(
+        await testEnv.DB.prepare('SELECT usd, priced_at FROM usage WHERE session_id = ?1').bind(sid).first(),
+      ).toEqual({ usd: null, priced_at: null });
+    } finally {
+      logged.mockRestore();
+      await testEnv.DB.prepare('DROP TRIGGER fail_ingest_pricing').run();
+    }
   });
 });
 

@@ -38,6 +38,8 @@ type WrittenSessions = Map<string, string>;
 
 interface ParseAttempt {
   written: WrittenSessions;
+  /** Shared invocation scope, populated only by usage inserts/upserts that actually changed rows. */
+  pricingSessions: Set<string>;
   sourceHash?: string;
 }
 
@@ -132,6 +134,7 @@ export async function consumeParseBatch(batch: Pick<MessageBatch<ParseMessage>, 
   // is guaranteed — each invocation runs at least the first message.
   let invocationSpent = 0;
   let deferRest = false;
+  const pricingSessions = new Set<string>();
   for (const msg of batch.messages) {
     if (deferRest) {
       await deferMessage(msg, env);
@@ -168,7 +171,7 @@ export async function consumeParseBatch(batch: Pick<MessageBatch<ParseMessage>, 
     }
     const parseBudget = Math.max(0, INVOCATION_SUBREQUEST_BUDGET - invocationSpent
       + (isExport ? EXPORT_QUERY_BUDGET : NORMAL_RESERVE));
-    const attempt: ParseAttempt = { written: new Map() };
+    const attempt: ParseAttempt = { written: new Map(), pricingSessions };
     try {
       const spent = await parseOne(msg.body, env, attempt, parseBudget);
       msg.ack();
@@ -295,20 +298,18 @@ export async function consumeParseBatch(batch: Pick<MessageBatch<ParseMessage>, 
     }
   }
 
-  // Price whatever this invocation just wrote, once for the WHOLE batch rather than once per
-  // session. Per session it cost 2 subrequests each, which is charged against the same
-  // ~1000-per-invocation cap the loop above rations — and the export-slicing tests caught exactly
-  // that: sessions that used to fit began deferring. The pass is unscoped for the same reason,
-  // since one query covering every session the batch wrote beats one query per session.
+  // Price the union of sessions whose usage this invocation actually changed, once for the WHOLE
+  // batch. Per-session passes cost extra subrequests, but an unscoped pass would walk unrelated
+  // recovery debt on every ingest delivery — even a stale/skipped/no-op one.
   //
   // Skipped entirely, not deferred, when the budget is already spent: the nightly pass exists and
   // will pick these rows up. Trading a deferred (re-delivered, re-parsed) message for a dollar
   // figure arriving a few hours sooner is a bad trade.
-  if (invocationSpent + PRICING_SUBREQUESTS < INVOCATION_SUBREQUEST_BUDGET) {
+  if (pricingSessions.size > 0 && invocationSpent + PRICING_SUBREQUESTS < INVOCATION_SUBREQUEST_BUDGET) {
     // Failure must not fail the batch: every message is already acked, the sessions are indexed
     // and searchable, and an unpriced row is a NULL the nightly pass is designed to find. A throw
     // here would re-deliver work that already succeeded.
-    await priceUsage(env.DB, { maxRows: PRICING_MAX_ROWS }).catch((e: unknown) =>
+    await priceUsage(env.DB, { sessionIds: [...pricingSessions], maxRows: PRICING_MAX_ROWS }).catch((e: unknown) =>
       console.log(
         JSON.stringify({
           event: 'hub.pricing.batch_pass_failed',
@@ -467,6 +468,7 @@ async function parseOne(job: ParseMessage, env: Env, attempt: ParseAttempt, budg
     return 2 + (await parseExportInto(
       file,
       env,
+      attempt.pricingSessions,
       job.reason,
       job.content_hash ?? file.content_hash,
       job.offset ?? 0,
@@ -597,7 +599,7 @@ async function parseOne(job: ParseMessage, env: Env, attempt: ParseAttempt, budg
   }
 
   const written = attempt.written;
-  const wrote = await writeSession(parsed, file, env, written);
+  const wrote = await writeSession(parsed, file, env, written, attempt.pricingSessions);
   // The ready upsert checked the source atomically; markParsed covers the later window too.
   const { updated } = await markParsed(file.id, env, 'parsed', file.size, undefined, file.content_hash,
     { sessionId: det.sessionId, generation: written.get(det.sessionId)! });
@@ -888,6 +890,7 @@ function isOwnerNewer(ownerMtime: string | null, ourMtime: string | null): boole
 async function parseExportInto(
   file: FileRow,
   env: Env,
+  pricingSessions: Set<string>,
   reason: ParseMessage['reason'],
   contentHash?: string,
   offset = 0,
@@ -905,7 +908,7 @@ async function parseExportInto(
     const exportFile: ExportFileRow = {
       ...file, readyGenerations: new Map(owned.results.map((row) => [row.session_id, row.generation])),
     };
-    return 1 + await runExportParse(exportFile, env, reason, contentHash, offset, cleanupCursor, cleanupPhase, kickCursor, reservationCount, written, reservationDelivery);
+    return 1 + await runExportParse(exportFile, env, reason, contentHash, offset, cleanupCursor, cleanupPhase, kickCursor, reservationCount, written, pricingSessions, reservationDelivery);
   } catch (e) {
     if (e instanceof ExportRetry) throw e; // raising site already reverted + restored retryable state; pass through
     return await raiseExportRetry(file, env, written, contentHash, e, reservationDelivery);
@@ -923,6 +926,7 @@ async function runExportParse(
   kickCursor: number | undefined,
   reservationCount: number,
   written: WrittenSessions,
+  pricingSessions: Set<string>,
   reservationDelivery: ReservationDelivery,
 ): Promise<number> {
   const obj = await env.RAW.get(file.r2_key);
@@ -1088,7 +1092,7 @@ async function runExportParse(
       // 'off': an export writes each conversation once, so a prefix probe would buy nothing here — and
       // it would add a subrequest per conversation that estimateWriteSubrequests (and the slice arithmetic
       // built on it) would have to carry for every archive.
-      spent += await writeSession(session, file, env, written, 'off');
+      spent += await writeSession(session, file, env, written, pricingSessions, 'off');
       file.readyGenerations.set(session.id, written.get(session.id) ?? file.readyGenerations.get(session.id) ?? null);
       // Cut once the query budget is spent — but only AFTER writing this conversation, so a single
       // over-budget conversation still makes progress alone rather than looping forever.
@@ -2026,6 +2030,7 @@ async function writeSession(
   file: FileRow,
   env: Env,
   written: WrittenSessions,
+  pricingSessions: Set<string>,
   retention: 'prefix' | 'off' = 'prefix',
 ): Promise<number> {
   const db = env.DB;
@@ -2294,7 +2299,12 @@ async function writeSession(
     }
     for (const chunk of usageChunks) {
       batchesRun++;
-      insertRows += sumRowsWritten(await db.batch(chunk));
+      const results = await db.batch(chunk);
+      insertRows += sumRowsWritten(results);
+      // Guarded writes can match nothing after supersession; planned statements and `written`
+      // track attempts, not changes. Retained identical usage has no statements at all. Record
+      // successful chunks immediately so even a later failure keeps this scope exact.
+      if (results.some((result) => (result.meta?.changes ?? 0) > 0)) pricingSessions.add(s.id);
     }
 
     const machineOs = (

@@ -92,6 +92,21 @@ not undo the completed snapshot, and continuing a terminal job never reparses it
 refused the job. Aggregate `errors` describe missing/changed targets and parse failures without identifiers.
 Neither terminal failure state is successful indexing.
 
+## Pricing work and D1 consumption
+
+After parsing, one bounded pricing pass covers only sessions whose usage changed in that
+queue batch. Empty batches and retained, unchanged usage do not trigger a pricing pass.
+Nightly pricing and the admin backfill continue to cover the full corpus.
+
+Global pricing selects bounded candidates through the existing version/attempt index before
+evaluating token and historical-rate expressions. Never-attempted rows retain priority over
+retries; unpriceable rows remain unknown and eligible for a later pass. Pricing arithmetic
+and stored pricing versions are unchanged.
+
+Pricing results include `selectionRowsRead`, the sum of D1 row-read metadata for candidate
+queries, or `null` when that metadata is unavailable. This measures selection work only,
+not catalog loading, cost updates, subtotal refreshes, or account-level billing.
+
 ## Run a bounded session-rollup pass
 
 Using the current admin machine certificate, send `POST /api/v1/admin/session-rollup`.
