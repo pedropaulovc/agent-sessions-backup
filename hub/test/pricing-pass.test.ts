@@ -105,6 +105,40 @@ async function withRaceBeforeWrite<T>(mutate: () => Promise<void>, body: () => P
   }
 }
 
+/** Observe native D1 read metadata without replacing any query or result. Only `.all()` reads
+ * are recorded: the catalog load and selector, not usage writes or subtotal refresh batches.
+ * Unwrapping statements at `batch` keeps the real D1 transaction/CAS path intact. */
+async function measurePricingReads(opts: Parameters<typeof priceUsage>[1]) {
+  const reads: Array<number | undefined> = [];
+  const originals = new WeakMap<D1PreparedStatement, D1PreparedStatement>();
+  function observe(statement: D1PreparedStatement): D1PreparedStatement {
+    const wrapped = new Proxy(statement, {
+      get(target, key) {
+        if (key === 'bind') return (...values: unknown[]) => observe(target.bind(...values));
+        if (key === 'all') return async () => {
+          const result = await target.all();
+          reads.push(result.meta?.rows_read);
+          return result;
+        };
+        const value = Reflect.get(target, key, target);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+    originals.set(wrapped, statement);
+    return wrapped;
+  }
+  const db = new Proxy(testEnv.DB, {
+    get(target, key) {
+      if (key === 'prepare') return (sql: string) => observe(target.prepare(sql));
+      if (key === 'batch') return (statements: D1PreparedStatement[]) =>
+        target.batch(statements.map((statement) => originals.get(statement) ?? statement));
+      const value = Reflect.get(target, key, target);
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+  return { result: await priceUsage(db, opts), reads };
+}
+
 describe('priceUsage', () => {
   beforeEach(async () => {
     // Storage is shared across tests in this pool, so every fixture here starts from an empty
@@ -291,7 +325,7 @@ describe('priceUsage', () => {
           .bind(nope)
           .run()
           .then(() => undefined),
-      () => priceUsage(testEnv.DB, { now: NOW }),
+      () => priceUsage(testEnv.DB, { sessionIds: ['s1'], now: NOW }),
     );
 
     expect(res.superseded).toBe(1);
@@ -366,13 +400,23 @@ describe('priceUsage', () => {
     // read comes back FULL, so with the production batch size this needs 500 seeded rows.
     // examined is the assertion because it counts reads, not distinct rows — spinning inflates it
     // while every visible side effect on the two rows stays identical.
-    await seedTurn('s1', { model: 'never-published' });
-    await seedTurn('s1', { model: 'also-never-published' });
+    const unknown: number[] = [];
+    for (let version = 0; version < PRICING_VERSION; version++) {
+      const id = await seedTurn('s1', { model: 'never-published' });
+      unknown.push(id);
+      await testEnv.DB.prepare('UPDATE usage SET priced_version = ?1 WHERE id = ?2').bind(version, id).run();
+    }
+    await seedPrice();
+    const known = await seedTurn('s1');
 
-    const res = await priceUsage(testEnv.DB, { maxRows: 20, readBatch: 2, now: NOW });
+    const res = await priceUsage(testEnv.DB, { maxRows: 20, readBatch: 1, now: NOW });
 
-    expect(res.examined, 'the pass re-read rows it had already attempted').toBe(2);
-    expect(res).toMatchObject({ unpriceable: 2, more: false });
+    expect(res.examined, 'the pass re-read rows it had already attempted').toBe(PRICING_VERSION + 1);
+    expect(res).toMatchObject({ priced: 1, unpriceable: PRICING_VERSION, more: false });
+    expect((await priced(known)).usd).toBe(1);
+    for (const id of unknown) {
+      expect(await priced(id)).toMatchObject({ usd: null, priced_at: NOW.toISOString(), priced_version: 0 });
+    }
   });
 
   it('serves never-attempted rows before retrying known failures', async () => {
@@ -389,6 +433,80 @@ describe('priceUsage', () => {
     await priceUsage(testEnv.DB, { maxRows: 1, readBatch: 1, now: later });
 
     expect((await priced(fresh)).usd, 'the budget went to the retry instead of the new row').toBeCloseTo(1, 9);
+  });
+
+  it('merges every old version by never-attempted, oldest-attempt, then id priority', async () => {
+    await seedPrice();
+    const versions = Array.from({ length: PRICING_VERSION }, (_, version) => version).reverse();
+    const retries: number[] = [];
+    const fresh: number[] = [];
+    // Higher version first deliberately disagrees with index version order. All but version 0
+    // share the oldest timestamp, so their ids, not versions, must break the tie.
+    for (const version of versions) {
+      const id = await seedTurn('priority');
+      retries.push(id);
+      await testEnv.DB.prepare('UPDATE usage SET priced_version = ?1, priced_at = ?2 WHERE id = ?3')
+        .bind(version, version === 0 ? '2026-07-30T00:00:00Z' : '2026-07-01T00:00:00Z', id).run();
+    }
+    for (const version of versions) {
+      const id = await seedTurn('priority');
+      fresh.push(id);
+      await testEnv.DB.prepare('UPDATE usage SET priced_version = ?1 WHERE id = ?2').bind(version, id).run();
+    }
+    const current = await seedTurn('priority');
+    const future = await seedTurn('priority');
+    const alreadyAttempted = await seedTurn('priority');
+    await testEnv.DB.batch([
+      testEnv.DB.prepare('UPDATE usage SET priced_version = ?1 WHERE id = ?2').bind(PRICING_VERSION, current),
+      testEnv.DB.prepare('UPDATE usage SET priced_version = ?1 WHERE id = ?2').bind(PRICING_VERSION + 1, future),
+      testEnv.DB.prepare('UPDATE usage SET priced_at = ?1 WHERE id = ?2').bind(NOW.toISOString(), alreadyAttempted),
+    ]);
+
+    const expected = [...fresh, ...retries];
+    for (let i = 0; i < expected.length; i++) {
+      const result = await priceUsage(testEnv.DB, { maxRows: 1, now: NOW });
+      expect(result).toMatchObject({ examined: 1, priced: 1 });
+      expect((await priced(expected[i]!)).priced_at, `wrong priority at position ${i}`).toBe(NOW.toISOString());
+      for (const waiting of expected.slice(i + 1)) {
+        expect((await priced(waiting)).priced_at, 'a lower-priority row consumed the one-row budget').not.toBe(NOW.toISOString());
+      }
+    }
+    expect((await priceUsage(testEnv.DB, { now: NOW })).examined).toBe(0);
+    expect((await priced(current)).priced_at).toBeNull();
+    expect((await priced(future)).priced_at).toBeNull();
+    expect((await priced(alreadyAttempted)).usd).toBeNull();
+  });
+
+  it('bounds actual D1 selector reads as due debt grows at the same pricing budget', async () => {
+    async function debt(count: number, offset: number): Promise<void> {
+      await testEnv.DB.prepare(
+        `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1)
+         INSERT INTO usage (session_id, turn_index, model, cache_basis, input_tokens, priced_version, priced_at)
+         SELECT 'read-bound', i + ?2, 'never-published', 'disjoint', 1, i % ?3,
+                CASE WHEN i % 2 = 0 THEN NULL ELSE '2026-07-01T00:00:00Z' END FROM n`,
+      ).bind(count, offset, PRICING_VERSION).run();
+    }
+    await seedSession('read-bound');
+    await debt(1_000, 0);
+    const small = await measurePricingReads({ maxRows: 5, now: NOW });
+    await debt(9_000, 1_000);
+    const large = await measurePricingReads({ maxRows: 5, now: NOW });
+
+    expect(small.result.examined).toBe(5);
+    expect(large.result.examined).toBe(5);
+    expect(small.reads).toHaveLength(2);
+    expect(large.reads).toHaveLength(2);
+    const smallRead = small.reads[1]!;
+    const largeRead = large.reads[1]!;
+    // Real rows_read, not a plan/source assertion: the old aggregate-before-LIMIT selector
+    // reads thousands of rows here; indexed bounded prefixes remain in the hundreds or less.
+    expect(smallRead, 'the harness must expose native D1 read accounting').toBeGreaterThan(0);
+    expect(largeRead).toBeGreaterThan(0);
+    expect(smallRead).toBeLessThanOrEqual(400);
+    expect(largeRead).toBeLessThanOrEqual(400);
+    expect(largeRead).toBeLessThanOrEqual(smallRead + 100);
+    expect(small.result.selectionRowsRead).toBe(smallRead);
+    expect(large.result.selectionRowsRead).toBe(largeRead);
   });
 
   it('retries yesterday’s unpriceable rows once a rate lands', async () => {
@@ -421,11 +539,59 @@ describe('priceUsage', () => {
     const mine = await seedTurn('mine');
     const other = await seedTurn('other');
 
-    const res = await priceUsage(testEnv.DB, { sessionId: 'mine', now: NOW });
+    const res = await priceUsage(testEnv.DB, { sessionIds: ['mine'], now: NOW });
 
     expect((await priced(mine)).usd).toBeCloseTo(1, 9);
     expect((await priced(other)).usd, 'the scope leaked into another session').toBeNull();
     expect(res.examined).toBe(1);
+  });
+
+  it('treats an explicit empty session scope as no work, without even loading prices', async () => {
+    await seedPrice();
+    const unrelated = await seedTurn('other');
+    const { result, reads } = await measurePricingReads({ sessionIds: [], now: NOW });
+
+    expect(result).toMatchObject({ examined: 0, more: false, selectionRowsRead: 0 });
+    expect(reads).toEqual([]);
+    expect((await priced(unrelated)).priced_at).toBeNull();
+  });
+
+  it('prices the union of changed sessions once without walking unrelated due debt', async () => {
+    await seedPrice();
+    await testEnv.DB.prepare(
+      `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 2000)
+       INSERT INTO usage (session_id, turn_index, model, cache_basis, input_tokens)
+       SELECT 'unrelated-debt', i, 'never-published', 'disjoint', 1 FROM n`,
+    ).run();
+    const first = await seedTurn('changed-first');
+    const second = await seedTurn('changed-second');
+    const { result, reads } = await measurePricingReads({
+      sessionIds: ['changed-second', 'changed-first', 'changed-second'], maxRows: 2, now: NOW,
+    });
+
+    expect(result).toMatchObject({ examined: 2, priced: 2 });
+    expect((await priced(first)).usd).toBe(1);
+    expect((await priced(second)).usd).toBe(1);
+    expect(reads, 'session scoping must not issue one selector per session').toHaveLength(2);
+    expect(reads[1], 'the scoped selector walked unrelated debt').toBeLessThanOrEqual(30);
+    expect(
+      (await testEnv.DB.prepare("SELECT COUNT(*) AS n FROM usage WHERE session_id = 'unrelated-debt' AND priced_at IS NOT NULL")
+        .first<{ n: number }>())?.n,
+    ).toBe(0);
+  });
+
+  it('accepts a union larger than the D1 bind parameter limit in one selector', async () => {
+    await seedPrice();
+    const sessions = Array.from({ length: 110 }, (_, i) => `wide-scope-${i}`);
+    await testEnv.DB.prepare(
+      `INSERT INTO usage (session_id, turn_index, model, cache_basis, input_tokens)
+       SELECT value, 1, 'm1', 'disjoint', 1000000 FROM json_each(?1)`,
+    ).bind(JSON.stringify(sessions)).run();
+
+    const { result, reads } = await measurePricingReads({ sessionIds: sessions, maxRows: 200, now: NOW });
+
+    expect(result).toMatchObject({ examined: sessions.length, priced: sessions.length, more: false });
+    expect(reads).toHaveLength(2);
   });
 
   it('reports `more` only when it stopped on the budget, not when it ran out of work', async () => {

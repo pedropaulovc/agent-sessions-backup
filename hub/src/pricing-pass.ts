@@ -282,6 +282,7 @@ async function selectUnpriced(
 ): Promise<D1Result<UnpricedRow>> {
   const binds: unknown[] = [startedAt];
   let candidates: string;
+  const candidateCtes: string[] = [];
   if (sessionIds !== undefined) {
     binds.push(JSON.stringify(sessionIds));
     // Scope first, then indexed session seeks: unrelated due debt must not be walked just to
@@ -303,21 +304,50 @@ async function selectUnpriced(
     // that prefix could win the merged LIMIT, so this is exactly the original ordering, with
     // at most 2 * PRICING_VERSION * limit index candidates and `limit` full usage projections.
     // Versions 0..N-1 include never-priced, failed attempts (0), and every historic stored cost.
-    const branches = Array.from({ length: PRICING_VERSION }, (_, version) =>
-      ['priced_at IS NULL', 'priced_at < ?1'].map((attempt) =>
+    // D1 rejects the six-term compound needed at v3. Materialize each version's two ranges
+    // independently instead of flattening every version/range into one UNION.
+    let level = Array.from({ length: PRICING_VERSION }, (_, version) => {
+      const name = `due_version_${version}`;
+      const branches = ['priced_at IS NULL', 'priced_at < ?1'].map((attempt) =>
         `SELECT id, priced_at FROM (
           SELECT id, priced_at FROM usage INDEXED BY usage_due_for_pricing
           WHERE priced_version = ${version} AND ${attempt}
           ORDER BY priced_at, id LIMIT ${limit}
         )`,
-      ),
-    ).flat();
-    candidates = `SELECT id, priced_at FROM (${branches.join('\nUNION ALL\n')})
-      ORDER BY priced_at, id LIMIT ${limit}`;
+      );
+      candidateCtes.push(`${name} AS MATERIALIZED (
+        ${branches.join('\nUNION ALL\n')} ORDER BY priced_at, id LIMIT ${limit}
+      )`);
+      return name;
+    });
+    // Pairwise bounded merges keep every compound at two terms even after future version bumps.
+    // Each materialized prefix is already in the final priority order, so truncating it cannot
+    // discard a row that could win the final LIMIT.
+    let merge = 0;
+    while (level.length > 1) {
+      const next: string[] = [];
+      for (let i = 0; i < level.length; i += 2) {
+        const left = level[i]!;
+        const right = level[i + 1];
+        if (right === undefined) {
+          next.push(left);
+          continue;
+        }
+        const name = `due_merge_${merge++}`;
+        candidateCtes.push(`${name} AS MATERIALIZED (
+          SELECT id, priced_at FROM ${left}
+          UNION ALL SELECT id, priced_at FROM ${right}
+          ORDER BY priced_at, id LIMIT ${limit}
+        )`);
+        next.push(name);
+      }
+      level = next;
+    }
+    candidates = `SELECT id, priced_at FROM ${level[0]!}`;
   }
   return db
     .prepare(
-      `WITH candidates AS MATERIALIZED (${candidates})
+      `WITH ${[...candidateCtes, `candidates AS MATERIALIZED (${candidates})`].join(',\n')}
        SELECT u.id AS id, u.session_id AS session_id, u.model AS model, ${priceEpochExpr(prices)} AS epoch,
               u.model AS cas_model, u.cache_basis AS cas_cache_basis,
               COALESCE(u.input_tokens,0) AS cas_input, COALESCE(u.output_tokens,0) AS cas_output,
