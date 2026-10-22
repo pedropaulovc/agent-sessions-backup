@@ -107,6 +107,18 @@ Pricing results include `selectionRowsRead`, the sum of D1 row-read metadata for
 queries, or `null` when that metadata is unavailable. This measures selection work only,
 not catalog loading, cost updates, subtotal refreshes, or account-level billing.
 
+## Catalog replication writes
+
+Catalog snapshots retain version-fenced, atomic application on every index shard. Normal
+JSON batches update session rows only when a mirrored value changes, delete only removed
+stars, and update only new or changed star values. An intact equal-version replay performs
+no shard writes; replay still repairs missing or incorrect data at that version. Older
+snapshots cannot overwrite newer shard state.
+
+Snapshots larger than the JSON payload cap use individually bound statements. They also
+avoid unchanged session writes, but still replace the full star set in bounded chunks.
+Outbox entries retire only after every shard accepts the captured version.
+
 ## Run a bounded session-rollup pass
 
 Using the current admin machine certificate, send `POST /api/v1/admin/session-rollup`.
