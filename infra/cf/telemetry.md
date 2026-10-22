@@ -232,7 +232,7 @@ Pricing candidate reads in `law-agent-backup`:
 ```kusto
 OTelSpans
 | where TimeGenerated >= ago(1d) and Name == "d1_all"
-| where tostring(Attributes["service.name"]) == "sessions-hub"
+| where ServiceName == "sessions-hub"
 | extend q=tostring(Attributes["db.query.text"]),
     rows=tolong(Attributes["cloudflare.d1.response.rows_read"])
 | where q contains "priced_version"
@@ -249,7 +249,7 @@ Catalog replication writes, including zero-write replays:
 ```kusto
 OTelSpans
 | where TimeGenerated >= ago(1d) and Name == "d1_batch"
-| where tostring(Attributes["service.name"]) == "sessions-hub"
+| where ServiceName == "sessions-hub"
 | extend q=tostring(Attributes["db.query.text"]),
     rows=tolong(Attributes["cloudflare.d1.response.rows_written"])
 | where q startswith "INSERT INTO catalog_versions"
