@@ -112,7 +112,7 @@ export const SESSION_CATALOG_PAYLOAD_BYTES = 1_000_000;
 // starred_turns for the session)}.
 // json_extract yields INTEGER, REAL, TEXT or NULL exactly as the JSON scalar was written, so every
 // column keeps its value and NULL. `applied` holds the entries whose version the shard now records:
-// a newer version just replaced the shard's, or the same version re-applies identically. An older
+// a newer version just replaced the shard's, or the same version may repair divergent rows. An older
 // version is absent from it, so every guarded statement skips it.
 const CATALOG_APPLIED = `WITH applied AS (
   SELECT c.session_id, e.value AS entry
@@ -120,31 +120,48 @@ const CATALOG_APPLIED = `WITH applied AS (
     JOIN catalog_versions c
       ON c.session_id = json_extract(e.value, '$.s') AND c.version = json_extract(e.value, '$.v'))`;
 
+// Equal versions remain eligible for repair, but intact rows must not be rewritten. IS NOT keeps
+// NULL distinct from every stored value, including empty text and zero, across all catalog fields.
+const CATALOG_SESSION_UPSERT = `ON CONFLICT (session_id) DO UPDATE SET
+   ${SESSION_CATALOG_COLUMNS.slice(1).map((column) => `${column} = excluded.${column}`).join(', ')}
+   WHERE ${SESSION_CATALOG_COLUMNS.slice(1).map((column) => `sessions.${column} IS NOT excluded.${column}`).join(' OR ')}`;
+
 // Set-based form: run in order as ONE shard batch, each statement bound to the same payload string.
 const CATALOG_PAYLOAD_SQL = [
   `INSERT INTO catalog_versions (session_id, version, presence)
    SELECT json_extract(value, '$.s'), json_extract(value, '$.v'), json_extract(value, '$.p') FROM json_each(?1) WHERE true
    ON CONFLICT (session_id) DO UPDATE SET version = excluded.version, presence = excluded.presence
    WHERE excluded.version > catalog_versions.version`,
-  `${CATALOG_APPLIED} DELETE FROM sessions WHERE session_id IN (SELECT session_id FROM applied)`,
-  `${CATALOG_APPLIED} DELETE FROM starred_turns WHERE session_id IN (SELECT session_id FROM applied)`,
+  `${CATALOG_APPLIED} DELETE FROM sessions WHERE session_id IN (
+   SELECT session_id FROM applied WHERE json_extract(entry, '$.p') = 'deleted')`,
+  `${CATALOG_APPLIED} DELETE FROM starred_turns
+   WHERE session_id IN (SELECT session_id FROM applied)
+     AND NOT EXISTS (
+       SELECT 1 FROM applied, json_each(applied.entry, '$.t') AS star
+        WHERE applied.session_id = starred_turns.session_id
+          AND json_extract(star.value, '$[0]') = starred_turns.turn_key)`,
   `${CATALOG_APPLIED} INSERT INTO sessions (${SESSION_CATALOG_COLUMNS.join(', ')})
    SELECT ${SESSION_CATALOG_COLUMNS.map((_, index) => `json_extract(entry, '$.r[${index}]')`).join(', ')}
-     FROM applied WHERE json_type(entry, '$.r') = 'array'`,
+     FROM applied WHERE json_type(entry, '$.r') = 'array'
+   ${CATALOG_SESSION_UPSERT}`,
   `${CATALOG_APPLIED} INSERT INTO starred_turns (${STAR_CATALOG_COLUMNS.join(', ')})
    SELECT applied.session_id, json_extract(star.value, '$[0]'), json_extract(star.value, '$[1]')
-     FROM applied, json_each(applied.entry, '$.t') AS star`,
+     FROM applied, json_each(applied.entry, '$.t') AS star WHERE true
+   ON CONFLICT (session_id, turn_key) DO UPDATE SET starred_at = excluded.starred_at
+   WHERE starred_turns.starred_at IS NOT excluded.starred_at`,
 ];
 
 // Single-entry form for an entry whose JSON exceeds the payload cap. Same guard: ?1 session_id,
 // ?2 version. Each sessions value and each star value is its own bind, so only D1's per-value limit
-// applies, which main's own row already satisfies.
+// applies, which main's own row already satisfies. Stars still use full replacement in this fallback
+// (including equal-version replay), keeping the complete snapshot without a staging protocol.
 const CATALOG_ENTRY_GUARD = 'EXISTS (SELECT 1 FROM catalog_versions WHERE session_id = ?1 AND version = ?2)';
 const CATALOG_ENTRY_VERSION_SQL = `INSERT INTO catalog_versions (session_id, version, presence) VALUES (?1, ?2, ?3)
    ON CONFLICT (session_id) DO UPDATE SET version = excluded.version, presence = excluded.presence
    WHERE excluded.version > catalog_versions.version`;
 const CATALOG_ENTRY_SESSION_SQL = `INSERT INTO sessions (${SESSION_CATALOG_COLUMNS.join(', ')})
-   SELECT ${SESSION_CATALOG_COLUMNS.map((_, index) => `?${index + 3}`).join(', ')} WHERE ${CATALOG_ENTRY_GUARD}`;
+   SELECT ${SESSION_CATALOG_COLUMNS.map((_, index) => `?${index + 3}`).join(', ')} WHERE ${CATALOG_ENTRY_GUARD}
+   ${CATALOG_SESSION_UPSERT}`;
 // 2 binds per star plus the 2 guard binds stays under D1's 100-bind limit.
 const CATALOG_ENTRY_STARS_PER_INSERT = 48;
 
@@ -158,15 +175,20 @@ export const SESSION_CATALOG_RETIRE_SQL = `DELETE FROM session_catalog_outbox WH
 function entryStatements({ sessionId, version, session, stars }) {
   const statements = [
     { sql: CATALOG_ENTRY_VERSION_SQL, params: [sessionId, version, session ? 'present' : 'deleted'] },
-    { sql: `DELETE FROM sessions WHERE session_id = ?1 AND ${CATALOG_ENTRY_GUARD}`, params: [sessionId, version] },
-    { sql: `DELETE FROM starred_turns WHERE session_id = ?1 AND ${CATALOG_ENTRY_GUARD}`, params: [sessionId, version] },
   ];
   if (session) {
     statements.push({
       sql: CATALOG_ENTRY_SESSION_SQL,
       params: [sessionId, version, ...SESSION_CATALOG_COLUMNS.map((column) => session[column] ?? null)],
     });
+  } else {
+    statements.push({
+      sql: `DELETE FROM sessions WHERE session_id = ?1 AND ${CATALOG_ENTRY_GUARD}`, params: [sessionId, version],
+    });
   }
+  statements.push({
+    sql: `DELETE FROM starred_turns WHERE session_id = ?1 AND ${CATALOG_ENTRY_GUARD}`, params: [sessionId, version],
+  });
   for (let start = 0; start < stars.length; start += CATALOG_ENTRY_STARS_PER_INSERT) {
     const slice = stars.slice(start, start + CATALOG_ENTRY_STARS_PER_INSERT);
     const values = slice.map((_, index) => `(?${3 + index * 2}, ?${4 + index * 2})`).join(', ');
