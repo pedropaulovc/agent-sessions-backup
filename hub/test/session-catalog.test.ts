@@ -295,7 +295,8 @@ describe('session catalog native D1 write reconciliation', () => {
   it('guards each entry independently when a JSON batch mixes older, newer, and missing versions', async () => {
     const first = snapshot('catalog-native-mixed-first', 3);
     const second = snapshot('catalog-native-mixed-second', 3);
-    const third = snapshot('catalog-native-mixed-third', 2);
+    // Third retains the same key that newer removes from second: membership must include session_id.
+    const third = snapshot('catalog-native-mixed-third', 3);
     const stale = { ...first, version: first.version - 1, session: null, stars: [] };
     const newer = {
       ...second, version: second.version + 1, session: { ...second.session, title: '' },
@@ -308,11 +309,38 @@ describe('session catalog native D1 write reconciliation', () => {
       await applyCatalog(db, second);
       const statements = batches[0]!.statements.map(({ sql, params }) => db.prepare(sql).bind(...params));
       const results = await db.batch(statements);
-      expect(results.map(({ meta }) => meta.changes)).toEqual([2, 0, 1, 2, 2]);
+      expect(results.map(({ meta }) => meta.changes)).toEqual([2, 0, 1, 2, 3]);
       await expectCatalog(db, first);
       await expectCatalog(db, newer);
       await expectCatalog(db, third);
       expect((await db.batch(statements)).map(({ meta }) => meta.rows_written)).toEqual([0, 0, 0, 0, 0]);
+    }
+  });
+
+  it('bounds full-batch native D1 reads for 64-session star replay and removal', async () => {
+    const initial = Array.from({ length: 64 }, (_, index) => snapshot(`catalog-native-read-bound-${index}`));
+    for (const db of indexDbs(testEnv)) {
+      const apply = async (entries: SessionCatalogEntry[]) => {
+        const batches = sessionCatalogBatches(entries);
+        expect(batches).toHaveLength(1);
+        return db.batch(batches[0]!.statements.map(({ sql, params }) => db.prepare(sql).bind(...params)));
+      };
+      expect((await apply(initial)).map(({ meta }) => meta.changes)).toEqual([64, 0, 0, 64, 1_280]);
+      const half = initial.map((entry) => ({
+        ...entry, version: entry.version + 1, stars: entry.stars.slice(10),
+      }));
+      const empty = half.map((entry) => ({ ...entry, version: entry.version + 1, stars: [] }));
+      for (const [entries, changes] of [
+        [initial, [0, 0, 0, 0, 0]],
+        [half, [64, 0, 640, 0, 0]],
+        [empty, [64, 0, 640, 0, 0]],
+      ] as const) {
+        const results = await apply(entries);
+        expect(results.map(({ meta }) => meta.changes)).toEqual(changes);
+        // Sum real D1 counters over every statement, not just the absent-star deletion.
+        expect(results.reduce((sum, { meta }) => sum + meta.rows_read, 0)).toBeLessThan(50_000);
+        for (const entry of entries) await expectCatalog(db, entry);
+      }
     }
   });
 
@@ -401,8 +429,13 @@ describe('session catalog native D1 write reconciliation', () => {
     }
   });
 
-  it.each(['json', 'oversized'])('rolls back every %s statement and its version when a later star fails', async (transport) => {
-    const original = snapshot(`catalog-native-atomic-${transport}`, 49);
+  it.each([
+    { transport: 'json', invalidColumn: 'starred_at' },
+    { transport: 'json', invalidColumn: 'turn_key' },
+    { transport: 'oversized', invalidColumn: 'starred_at' },
+    { transport: 'oversized', invalidColumn: 'turn_key' },
+  ])('rolls back every $transport statement and its version when a later star has null $invalidColumn', async ({ transport, invalidColumn }) => {
+    const original = snapshot(`catalog-native-atomic-${transport}-${invalidColumn}`, 49);
     const entry = transport === 'oversized'
       ? { ...original, session: { ...original.session, title: '😀'.repeat(250_001) } }
       : original;
@@ -412,7 +445,7 @@ describe('session catalog native D1 write reconciliation', () => {
       stars: entry.stars.map((star) => ({ ...star, starred_at: 'new timestamp' })),
     };
     const invalid = {
-      ...newer, stars: newer.stars.map((star, index) => index === 48 ? { ...star, starred_at: null } : star),
+      ...newer, stars: newer.stars.map((star, index) => index === 48 ? { ...star, [invalidColumn]: null } : star),
     };
     for (const db of indexDbs(testEnv)) {
       await applyCatalog(db, entry);

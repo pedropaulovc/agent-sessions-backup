@@ -134,12 +134,17 @@ const CATALOG_PAYLOAD_SQL = [
    WHERE excluded.version > catalog_versions.version`,
   `${CATALOG_APPLIED} DELETE FROM sessions WHERE session_id IN (
    SELECT session_id FROM applied WHERE json_extract(entry, '$.p') = 'deleted')`,
-  `${CATALOG_APPLIED} DELETE FROM starred_turns
+  `${CATALOG_APPLIED},
+   incoming_stars AS MATERIALIZED (
+     SELECT applied.session_id, json_extract(star.value, '$[0]') AS turn_key
+       FROM applied, json_each(applied.entry, '$.t') AS star
+      WHERE json_extract(star.value, '$[0]') IS NOT NULL)
+   DELETE FROM starred_turns
    WHERE session_id IN (SELECT session_id FROM applied)
      AND NOT EXISTS (
-       SELECT 1 FROM applied, json_each(applied.entry, '$.t') AS star
-        WHERE applied.session_id = starred_turns.session_id
-          AND json_extract(star.value, '$[0]') = starred_turns.turn_key)`,
+       SELECT 1 FROM incoming_stars
+        WHERE incoming_stars.session_id = starred_turns.session_id
+          AND incoming_stars.turn_key = starred_turns.turn_key)`,
   `${CATALOG_APPLIED} INSERT INTO sessions (${SESSION_CATALOG_COLUMNS.join(', ')})
    SELECT ${SESSION_CATALOG_COLUMNS.map((_, index) => `json_extract(entry, '$.r[${index}]')`).join(', ')}
      FROM applied WHERE json_type(entry, '$.r') = 'array'
