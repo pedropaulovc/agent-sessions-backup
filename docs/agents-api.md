@@ -191,12 +191,19 @@ The response shape depends on what the session's canonical file actually is
 
 ### `GET /api/v1/search`
 
-Params: `q` (FTS5 MATCH syntax — invalid syntax is retried as a quoted literal phrase, then
-degrades to an empty result set rather than a 500), `harness`, `machine`, `os`, `model`,
+Params: `q` (FTS5 MATCH syntax — a trailing `*` is appended unless already present;
+invalid syntax is retried as a quoted literal phrase with `*` outside its closing quote,
+then degrades to an empty result set rather than a 500), `harness`, `machine`, `os`, `model`,
 `repo`, `project`, `cwd`, `session_date`, `session_time`, `cost`, `has_star=1`, `subagent=no|yes`
 (defaults to `no`), `from`, `to`, `sort` (`relevance`, `session_time`, `total_tokens`, or
 `cost`), `limit` (default 100, max 100), `cursor` (opaque, paginates), `facets=1` (adds
 counts for registered facets, including `has_star` and `subagent`).
+
+This prefixes only the final term, including the final term of a quoted phrase, not
+every word or an arbitrary substring. For example, `EXPOSE CREDENTIALS` and
+`"EXPOSE CREDENTIALS"` match indexed `EXPOSE CREDENTIALS.`: the tokenizer retains
+periods, underscores, and hyphens within tokens. Explicit trailing wildcards are
+preserved, and empty or whitespace-only queries still return `missing_q`.
 
 The block index is session-hash sharded; every shard has the complete session/star
 catalog for filters and descendant-inclusive costs. All shards participate in hits

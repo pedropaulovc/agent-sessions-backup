@@ -109,6 +109,57 @@ describe('the local queue simulator does not auto-deliver PARSE_QUEUE messages o
   }, 10000);
 });
 
+describe('search automatically prefixes the final query term', () => {
+  const SESSION_ID = 'f0000000-0000-4000-8000-0000000000ab';
+
+  beforeAll(async () => {
+    const content = `${[
+      ccUserLine({ uuid: 'prefix-u1', text: 'prefixregression STOP USING TOOLS NEVER EXPOSE CREDENTIALS.' }),
+      ccUserLine({ uuid: 'prefix-u2', text: 'fallbackregression CREDENTIALS.' }),
+      ccUserLine({ uuid: 'prefix-u3', text: 'wildcardalternative' }),
+    ].join('\n')}\n`;
+    const res = await putFile('claude-projects', `prefix-demo/${SESSION_ID}.jsonl`, content);
+    expect(res.status).toBe(201);
+    await drainQueue();
+  });
+
+  it.each([
+    ['an unquoted query missing the indexed final period', 'prefixregression STOP USING TOOLS NEVER EXPOSE CREDENTIALS', 1],
+    ['a quoted phrase missing the indexed final period', '"prefixregression STOP USING TOOLS NEVER EXPOSE CREDENTIALS"', 1],
+    ['an explicit trailing wildcard', 'prefixregression CREDENTIALS*', 1],
+    ['an explicit wildcard with OR semantics', 'wildcardalternative OR prefixregression*', 2],
+    ['a quoted phrase with an explicit wildcard', '"prefixregression STOP USING TOOLS NEVER EXPOSE CREDENTIALS"*', 1],
+    ['an invalid column filter retried as a prefixed phrase', 'fallbackregression: CREDENTIALS', 1],
+    ['a fallback that must escape the original quotes', 'fallbackregression: "CREDENTIALS"', 1],
+    ['an invalid query already ending in a wildcard', 'fallbackregression: CREDENTIALS*', 1],
+    ['surrounding whitespace', '  prefixregression CREDENTIALS  ', 1],
+    ['no automatic prefix on earlier terms', 'prefixregression STO USING TOOLS NEVER EXPOSE CREDENTIALS', 0],
+    ['no substring matching', 'prefixregression REDENTIALS', 0],
+    ['quoted phrase adjacency is preserved', '"prefixregression USING CREDENTIALS"', 0],
+  ] as const)('%s', async (_label, q, count) => {
+    const res = await SELF.fetch(`${API}/api/v1/search?q=${encodeURIComponent(q)}&facets=1`, {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      hits: { session_id: string }[];
+      facets: Record<string, Record<string, number>>;
+    };
+    expect(body.hits).toHaveLength(count);
+    for (const hit of body.hits) expect(hit.session_id).toBe(SESSION_ID);
+    // Facets must use the same prefixed match string, including after phrase fallback.
+    expect(body.facets.machine_id).toEqual(count ? { [MACHINE]: 1 } : {});
+  });
+
+  it.each(['', '   '])('keeps an empty query empty (%j)', async (q) => {
+    const res = await SELF.fetch(`${API}/api/v1/search?q=${encodeURIComponent(q)}`, {
+      headers: { 'x-dev-machine': MACHINE },
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'missing_q' });
+  });
+});
+
 describe('search handles a query whose quoted-phrase fallback is ALSO invalid FTS5 (regression: some queries made even the fallback throw an uncaught error, 500ing instead of returning empty results)', () => {
   // Note: the literal repro suggested in review (q='"', a lone double quote) does NOT actually
   // reproduce on this D1/FTS5 build — verified directly: MATCH '"' throws "unterminated string"
