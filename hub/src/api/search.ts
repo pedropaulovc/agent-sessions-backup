@@ -297,15 +297,17 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
     return merged;
   };
 
-  // User query wasn't valid FTS5 syntax — retry as a quoted phrase. That fallback can ALSO be
-  // invalid (e.g. q is a single '"', producing an unterminated `""""` that FTS5 rejects too) —
-  // a garbage query should read as "no results", not a 500. effectiveMatch stays null in that
-  // case so the facets query below (which also runs against FTS5) doesn't inherit a match string
-  // already known to be broken.
-  let rows = await run(q);
-  let effectiveMatch: string | null = q;
+  // Prefix-match the final term (including a quoted phrase's final term), leaving explicit
+  // wildcards and queries ending in ')' (groups/NEAR expressions) unchanged to preserve syntax.
+  // Retry invalid syntax using the ORIGINAL query as a quoted phrase, with the wildcard outside
+  // its closing quote so FTS5 treats it as a prefix operator.
+  // The fallback can also be invalid (e.g. an embedded NUL); keep effectiveMatch null then so
+  // facets do not inherit a match string already known to be broken.
+  const match = q.endsWith('*') || q.endsWith(')') ? q : `${q}*`;
+  let rows = await run(match);
+  let effectiveMatch: string | null = match;
   if (!rows) {
-    const quoted = `"${q.replaceAll('"', '""')}"`;
+    const quoted = `"${q.replaceAll('"', '""')}"*`;
     rows = await run(quoted);
     effectiveMatch = rows ? quoted : null;
   }
