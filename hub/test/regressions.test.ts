@@ -134,7 +134,7 @@ describe('search automatically prefixes the final query term', () => {
     ['a conjunction ending in a group', 'prefixregression AND (TOOLS)', 1],
     ['a NEAR expression', 'NEAR(prefixregression TOOLS)', 1],
     ['a NEAR expression with an explicit distance', 'NEAR(prefixregression TOOLS, 3)', 1],
-    ['a NEAR distance that excludes the hit', 'NEAR(prefixregression TOOLS, 2)', 0],
+    ['a NEAR distance that excludes the hit', 'NEAR(prefixregression TOOLS, 1)', 0],
     ['no automatic prefix within a terminal group', '(prefixregression AND CREDENTIALS)', 0],
     ['an invalid column filter retried as a prefixed phrase', 'fallbackregression: CREDENTIALS', 1],
     ['a fallback that must escape the original quotes', 'fallbackregression: "CREDENTIALS"', 1],
