@@ -297,12 +297,13 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
     return merged;
   };
 
-  // Prefix-match the final term (including a quoted phrase's final term), leaving an explicit
-  // trailing wildcard alone. Retry invalid syntax using the ORIGINAL query as a quoted phrase,
-  // with the wildcard outside its closing quote so FTS5 treats it as a prefix operator.
+  // Prefix-match the final term (including a quoted phrase's final term), leaving explicit
+  // wildcards and queries ending in ')' (groups/NEAR expressions) unchanged to preserve syntax.
+  // Retry invalid syntax using the ORIGINAL query as a quoted phrase, with the wildcard outside
+  // its closing quote so FTS5 treats it as a prefix operator.
   // The fallback can also be invalid (e.g. an embedded NUL); keep effectiveMatch null then so
   // facets do not inherit a match string already known to be broken.
-  const match = q.endsWith('*') ? q : `${q}*`;
+  const match = q.endsWith('*') || q.endsWith(')') ? q : `${q}*`;
   let rows = await run(match);
   let effectiveMatch: string | null = match;
   if (!rows) {
