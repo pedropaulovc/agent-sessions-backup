@@ -1,3 +1,17 @@
+<#
+.SYNOPSIS
+Update an already-enrolled Windows collector from main.
+.DESCRIPTION
+Requires uv on PATH and an existing collector enrollment for the current Windows
+user. Waits for an active scheduled run, reinstalls the collector from main,
+replaces the scheduled task, and sends an immediate heartbeat (not a full upload).
+This script does not mint certificates or enroll a new machine. For fresh
+enrollment, use scripts\enroll-windows-collector.ps1 from a complete checkout.
+.PARAMETER IntervalMinutes
+Scheduled collector interval in minutes; defaults to 15.
+.EXAMPLE
+.\scripts\update-windows-collector.ps1 -IntervalMinutes 15
+#>
 [CmdletBinding()]
 param(
     [ValidateRange(1, 1440)]
