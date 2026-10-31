@@ -345,25 +345,48 @@ class State:
             )
         self.conn.commit()
 
-    def drain_events(self) -> tuple[list[int], list[dict]]:
+    def drain_events(self, limit: int = 1000, after_id: int = 0) -> tuple[list[int], list[dict]]:
+        """Read one bounded FIFO page without removing anything; only an ACK permits deletion."""
+        if limit <= 0:
+            raise ValueError("event page limit must be positive")
         rows = self.conn.execute(
-            "SELECT * FROM pending_events ORDER BY id"
-        ).fetchall()
-        ids = [r["id"] for r in rows]
+            "SELECT * FROM pending_events WHERE id > ? ORDER BY id LIMIT ?",
+            (after_id, limit),
+        )
+        ids = []
         events = []
+        chars = 0
         for r in rows:
+            row_chars = sum(len(r[key] or "") for key in ("level", "code", "message", "store"))
+            if events and chars + row_chars > 256 * 1024:
+                break
+            chars += row_chars
+            ids.append(r["id"])
             e = {"level": r["level"], "code": r["code"], "message": r["message"],
                  "count": r["count"]}
-            if r["store"]:
+            if r["store"] is not None:
                 e["store"] = r["store"]
             events.append(e)
         return ids, events
+
+    def event_cursor(self) -> int:
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key = 'heartbeat_event_cursor'"
+        ).fetchone()
+        return int(row["value"]) if row else 0
+
+    def set_event_cursor(self, event_id: int) -> None:
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('heartbeat_event_cursor', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(event_id),),
+        )
+        self.conn.commit()
 
     def delete_events(self, ids: list[int]) -> None:
         if not ids:
             return
         self.conn.executemany(
-            "DELETE FROM pending_events WHERE id = ?", [(i,) for i in ids]
+            "DELETE FROM pending_events WHERE id = ?", ((i,) for i in ids)
         )
         self.conn.commit()
 

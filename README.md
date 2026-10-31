@@ -163,6 +163,33 @@ refuses production deployment: protected main CI is the sole production control 
 | `scripts/` | Local corpus seeding + verification tooling |
 | `memory/` | Project memory for AI agents working on this repo |
 
+## Collector heartbeat delivery (0.4.5)
+
+Current-run events are committed to the local SQLite queue before heartbeat delivery.
+Each pass reads pages of at most 1,000 rows (also bounded by 256 KiB of text, except
+an individually oversized row), sends at most 64 requests, and caps each encoded
+JSON request at 256 KiB. This stays below [D1's 2 MB row/string limit](https://developers.cloudflare.com/d1/platform/limits/): the hub stores
+the entire heartbeat's stores and events together. Large queues are resumed across
+runs, never loaded wholesale. A pass can acknowledge up to 64,000 rows; large or
+heavily escaped messages can reduce that throughput.
+
+Within a page, exact matches of level, code, message, and store are coalesced by
+summing `count`; original rows are deleted only after HTTP 200. Local timestamps
+were never transmitted. Failed requests retain every unacknowledged row, including
+new events, and stderr reports HTTP status plus a bounded, escaped response excerpt.
+Delivery remains **at least once**: a lost response or interruption after remote
+acceptance can replay events. No local queue reset or discard is needed for recovery.
+
+An individual event that cannot fit is retained verbatim and diagnosed, not
+truncated or dropped. A persisted inspection cursor lets later events progress
+past such a prefix on subsequent passes. Such a pass reports failure even if its
+bounded liveness heartbeat succeeds. An oversized stores envelope is rejected
+locally with all events retained. These cases need operator investigation.
+When queued rows remain, stderr reports acknowledged and pending row counts:
+a fresh heartbeat proves liveness, **not** a fully delivered queue. Repeated
+`agent-collector run --heartbeat-only` invocations drain bounded passes without
+rescanning stores; normal scheduled runs also continue delivery.
+
 ## Update a Windows collector
 
 Run this in PowerShell to update an enrolled collector to the current `main` branch, replace its scheduled task, and send an immediate heartbeat. It waits for an in-progress scheduled run before replacing the tool, so it never updates the executable under that process.
