@@ -151,8 +151,10 @@ checkout with an environment assignment:
 CLOUDFLARE_API_TOKEN='<token from above>' uv run infra/cf/enroll-cert.py
 ```
 
-The token is sent only in Cloudflare HTTPS headers. It is never placed in argv, written to
-disk, logged, or inherited by `uv` or collector subprocesses.
+The launching `uv run` process and the Python enroller inherit the token through
+`CLOUDFLARE_API_TOKEN`. The enroller sends it only in Cloudflare HTTPS headers,
+never in argv or logs or to disk, and removes it from the environments of the
+collector and `uv tool install` subprocesses it launches.
 
 ## Windows / Schannel mTLS
 
