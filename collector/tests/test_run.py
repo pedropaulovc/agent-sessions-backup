@@ -76,7 +76,7 @@ def test_run_uploads_managed_skills_from_legacy_config(tmp_path, hub, tmp_env):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         f'machine_id = "m1"\nhub_url = "{hub.url}"\nauth = "dev"\n\n'
-        f'[stores]\nclaude = "{claude}"\n'
+        f'[stores]\nclaude = "{claude.as_posix()}"\n'
     )
 
     cfg = config.load(path)
