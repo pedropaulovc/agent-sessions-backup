@@ -216,6 +216,7 @@ Create the short-lived Cloudflare enrollment token described in
 ```powershell
 git clone https://github.com/pedropaulovc/agent-sessions-backup.git
 Set-Location agent-sessions-backup
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 $env:CLOUDFLARE_API_TOKEN = '<short-lived enrollment token>'
 try {
     .\scripts\enroll-windows-collector.ps1
@@ -223,6 +224,8 @@ try {
     Remove-Item Env:CLOUDFLARE_API_TOKEN
 }
 ```
+
+The execution-policy change applies only to this PowerShell session.
 
 The wrapper delegates to `uv run <checkout>/infra/cf/enroll-cert.py`: enrollment
 installs a compatible collector when needed, imports the certificate, verifies

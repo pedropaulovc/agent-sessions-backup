@@ -100,6 +100,7 @@ source, so downloading the PowerShell script alone is insufficient.
 ```powershell
 git clone https://github.com/pedropaulovc/agent-sessions-backup.git
 Set-Location agent-sessions-backup
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 $env:CLOUDFLARE_API_TOKEN = '<token from above>'
 try {
     .\scripts\enroll-windows-collector.ps1
@@ -107,6 +108,8 @@ try {
     Remove-Item Env:CLOUDFLARE_API_TOKEN
 }
 ```
+
+The execution-policy change applies only to this PowerShell session.
 
 The Python script handles the complete local flow: it preflights both token permissions,
 installs or upgrades the sibling collector with `uv tool install` when a compatible
