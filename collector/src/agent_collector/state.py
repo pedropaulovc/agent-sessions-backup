@@ -345,25 +345,95 @@ class State:
             )
         self.conn.commit()
 
-    def drain_events(self) -> tuple[list[int], list[dict]]:
+    def compact_events(self, after_id: int = 0, limit: int = 100_000) -> int | None:
+        """Durably coalesce one bounded input window, retaining its earliest identities.
+
+        Never merge across the delivery cursor: a representative behind it would be
+        skipped. The returned original upper ID also bounds subsequent delivery reads.
+        All selection, count updates and duplicate removal share a write transaction;
+        interruption leaves either the original rows or their exact summed counts.
+        """
+        if limit <= 0:
+            raise ValueError("event compaction limit must be positive")
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            row = self.conn.execute(
+                "SELECT MAX(id) FROM ("
+                "SELECT id FROM pending_events WHERE id > ? ORDER BY id LIMIT ?)",
+                (after_id, limit),
+            ).fetchone()
+            through_id = row[0]
+            if through_id is None:
+                return None
+            self.conn.execute(
+                "CREATE TEMP TABLE IF NOT EXISTS heartbeat_event_groups "
+                "(id INTEGER PRIMARY KEY, count INTEGER NOT NULL)"
+            )
+            self.conn.execute("DELETE FROM heartbeat_event_groups")
+            self.conn.execute(
+                "INSERT INTO heartbeat_event_groups (id, count) "
+                "SELECT MIN(id), SUM(count) FROM pending_events "
+                "WHERE id > ? AND id <= ? GROUP BY level, code, message, store",
+                (after_id, through_id),
+            )
+            self.conn.execute(
+                "UPDATE pending_events SET count = "
+                "(SELECT count FROM heartbeat_event_groups g WHERE g.id = pending_events.id) "
+                "WHERE id IN (SELECT id FROM heartbeat_event_groups)"
+            )
+            self.conn.execute(
+                "DELETE FROM pending_events WHERE id > ? AND id <= ? "
+                "AND id NOT IN (SELECT id FROM heartbeat_event_groups)",
+                (after_id, through_id),
+            )
+            self.conn.execute("DELETE FROM heartbeat_event_groups")
+        return through_id
+
+    def drain_events(self, limit: int = 1000, after_id: int = 0,
+                     through_id: int | None = None) -> tuple[list[int], list[dict]]:
+        """Read one bounded FIFO page without removing anything; only an ACK permits deletion."""
+        if limit <= 0:
+            raise ValueError("event page limit must be positive")
+        upper = "" if through_id is None else " AND id <= ?"
+        params = (after_id, limit) if through_id is None else (after_id, through_id, limit)
         rows = self.conn.execute(
-            "SELECT * FROM pending_events ORDER BY id"
-        ).fetchall()
-        ids = [r["id"] for r in rows]
+            f"SELECT * FROM pending_events WHERE id > ?{upper} ORDER BY id LIMIT ?",
+            params,
+        )
+        ids = []
         events = []
+        chars = 0
         for r in rows:
+            row_chars = sum(len(r[key] or "") for key in ("level", "code", "message", "store"))
+            if events and chars + row_chars > 256 * 1024:
+                break
+            chars += row_chars
+            ids.append(r["id"])
             e = {"level": r["level"], "code": r["code"], "message": r["message"],
                  "count": r["count"]}
-            if r["store"]:
+            if r["store"] is not None:
                 e["store"] = r["store"]
             events.append(e)
         return ids, events
+
+    def event_cursor(self) -> int:
+        row = self.conn.execute(
+            "SELECT value FROM meta WHERE key = 'heartbeat_event_cursor'"
+        ).fetchone()
+        return int(row["value"]) if row else 0
+
+    def set_event_cursor(self, event_id: int) -> None:
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('heartbeat_event_cursor', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value", (str(event_id),),
+        )
+        self.conn.commit()
 
     def delete_events(self, ids: list[int]) -> None:
         if not ids:
             return
         self.conn.executemany(
-            "DELETE FROM pending_events WHERE id = ?", [(i,) for i in ids]
+            "DELETE FROM pending_events WHERE id = ?", ((i,) for i in ids)
         )
         self.conn.commit()
 

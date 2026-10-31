@@ -163,6 +163,45 @@ refuses production deployment: protected main CI is the sole production control 
 | `scripts/` | Local corpus seeding + verification tooling |
 | `memory/` | Project memory for AI agents working on this repo |
 
+## Collector heartbeat delivery (0.4.6)
+
+Current-run events are committed to the local SQLite queue before heartbeat delivery.
+Each pass reads pages of at most 1,000 rows (also bounded by 256 KiB of text, except
+an individually oversized row), sends at most 64 requests, and caps each encoded
+JSON request at 256 KiB. This stays below [D1's 2 MB row/string limit](https://developers.cloudflare.com/d1/platform/limits/): the hub stores
+the entire heartbeat's stores and events together. Large queues are resumed across
+runs, never loaded wholesale. Before paging each window of at most 100,000 queued
+rows, a single SQLite transaction groups exact matches of level, code, message,
+and store (including the distinction between absent and empty store), sums `count`
+onto the earliest row, and removes only its merged duplicates. Selection is bounded
+before grouping; neither the whole queue nor a window's messages are loaded into
+Python. Windows start above the saved inspection cursor, and delivery reads stay
+within the compacted window before moving to the next.
+
+A pass can acknowledge up to 64,000 compacted rows; large or heavily escaped
+messages reduce throughput. For example, 100,000 rows repeating about 3,100 exact
+per-path messages become about 3,100 events with conserved counts, rather than
+repeating those messages in every 1,000-row page. Unique messages still require
+separate delivery.
+
+Compaction is durable before any network request. Representatives are deleted only
+after HTTP 200; failed requests retain all unacknowledged counts, including new
+events. Local timestamps were never transmitted. Stderr reports HTTP status plus a
+bounded, escaped response excerpt. Delivery remains **at least once**: a lost response
+or interruption after remote acceptance can replay events. No local queue reset or
+discard is needed for recovery.
+
+An individual event that cannot fit is retained without truncation or dropped
+counts and diagnosed. A persisted inspection cursor lets later events progress
+past such a prefix on subsequent passes; stale cursors (including reused SQLite
+IDs) reset and requery from the start in the same pass. Such a pass reports failure even if its
+bounded liveness heartbeat succeeds. An oversized stores envelope is rejected
+locally with all events retained. These cases need operator investigation.
+When queued rows remain, stderr reports acknowledged and pending row counts:
+a fresh heartbeat proves liveness, **not** a fully delivered queue. Repeated
+`agent-collector run --heartbeat-only` invocations drain bounded passes without
+rescanning stores; normal scheduled runs also continue delivery.
+
 ## Update a Windows collector
 
 Run this in PowerShell to update an enrolled collector to the current `main` branch, replace its scheduled task, and send an immediate heartbeat. It waits for an in-progress scheduled run before replacing the tool, so it never updates the executable under that process.

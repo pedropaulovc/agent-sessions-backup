@@ -146,3 +146,93 @@ def test_runs_lifecycle(tmp_path):
         last = st.last_run()
         assert last["mode"] == "run" and last["files_scanned"] == 5
         assert last["bytes_uploaded"] == 100 and last["finished_at"] is not None
+
+
+def test_compact_events_preserves_exact_identity_counts_and_minimum_ids(tmp_path):
+    path = tmp_path / "state.db"
+    rows = [
+        ("warn", "missing", "path/A", 2, None),
+        ("warn", "missing", "path/A", 3, ""),
+        ("warn", "missing", "path/A", 5, None),
+        ("error", "missing", "path/A", 7, None),
+        ("warn", "other", "path/A", 11, None),
+        ("warn", "missing", "path/a", 13, None),
+        ("warn", "missing", "path/A", 17, ""),
+    ]
+    with State(path) as st:
+        st.conn.executemany(
+            "INSERT INTO pending_events (level, code, message, count, store, created_at) "
+            "VALUES (?, ?, ?, ?, ?, '2026-01-01T00:00:00Z')",
+            rows,
+        )
+        st.conn.commit()
+        assert st.compact_events() == 7
+        expected = [
+            (1, "warn", "missing", "path/A", 7, None),
+            (2, "warn", "missing", "path/A", 20, ""),
+            (4, "error", "missing", "path/A", 7, None),
+            (5, "warn", "other", "path/A", 11, None),
+            (6, "warn", "missing", "path/a", 13, None),
+        ]
+        actual = [tuple(row) for row in st.conn.execute(
+            "SELECT id, level, code, message, count, store FROM pending_events ORDER BY id"
+        )]
+        assert actual == expected
+        st.compact_events()
+    with State(path) as st:
+        assert [tuple(row) for row in st.conn.execute(
+            "SELECT id, level, code, message, count, store FROM pending_events ORDER BY id"
+        )] == expected
+
+
+def test_compact_events_only_merges_first_bounded_window_after_cursor(tmp_path):
+    with State(tmp_path / "state.db") as st:
+        st.buffer_events([
+            {"level": "warn", "code": "missing", "message": "same", "count": n}
+            for n in (1, 2, 3, 4, 5, 6)
+        ])
+        assert st.compact_events(after_id=1, limit=3) == 4
+        assert [tuple(row) for row in st.conn.execute(
+            "SELECT id, count FROM pending_events ORDER BY id"
+        )] == [(1, 1), (2, 9), (5, 5), (6, 6)]
+        ids, events = st.drain_events(limit=100, after_id=1, through_id=4)
+        assert ids == [2]
+        assert events[0]["count"] == 9
+        assert st.compact_events(after_id=4, limit=2) == 6
+        assert [tuple(row) for row in st.conn.execute(
+            "SELECT id, count FROM pending_events ORDER BY id"
+        )] == [(1, 1), (2, 9), (5, 11)]
+        assert st.compact_events(after_id=6, limit=2) is None
+
+
+def test_compact_events_rolls_back_all_changes_and_retries_after_restart(tmp_path):
+    path = tmp_path / "state.db"
+    with State(path) as st:
+        st.buffer_events([
+            {"level": "warn", "code": "missing", "message": message, "count": count}
+            for message, count in (("a", 2), ("a", 3), ("b", 5), ("b", 7))
+        ])
+        before = [tuple(row) for row in st.conn.execute(
+            "SELECT * FROM pending_events ORDER BY id"
+        )]
+        st.conn.execute(
+            "CREATE TRIGGER fail_compaction BEFORE DELETE ON pending_events "
+            "BEGIN SELECT RAISE(ABORT, 'injected compaction failure'); END"
+        )
+        st.conn.commit()
+        with pytest.raises(sqlite3.DatabaseError, match="injected compaction failure"):
+            st.compact_events()
+        assert [tuple(row) for row in st.conn.execute(
+            "SELECT * FROM pending_events ORDER BY id"
+        )] == before
+    with State(path) as st:
+        assert [tuple(row) for row in st.conn.execute(
+            "SELECT * FROM pending_events ORDER BY id"
+        )] == before
+        st.conn.execute("DROP TRIGGER fail_compaction")
+        st.conn.commit()
+        st.compact_events()
+    with State(path) as st:
+        assert [tuple(row) for row in st.conn.execute(
+            "SELECT id, message, count FROM pending_events ORDER BY id"
+        )] == [(1, "a", 5), (3, "b", 12)]
