@@ -134,6 +134,15 @@ scheduling uninstalled. `-InstallStaged` installs an already-registered staged
 certificate without a Cloudflare token; it is recovery, not fresh enrollment.
 See `Get-Help .\scripts\enroll-windows-collector.ps1 -Full`.
 
+For staged recovery, skip token creation and run from the checkout, using the machine
+ID and directory supplied with the already-registered certificate:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+Remove-Item Env:CLOUDFLARE_API_TOKEN -ErrorAction SilentlyContinue
+.\scripts\enroll-windows-collector.ps1 -InstallStaged -MachineId workstation-windows -Out 'C:\cert material'
+```
+
 The Python equivalents are `--admin`, `--machine-id`, `--out`, `--no-schedule`,
 and `--install-staged`. On POSIX, run the Python script from the same complete
 checkout with an environment assignment:

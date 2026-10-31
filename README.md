@@ -210,7 +210,7 @@ Git, then clone the complete repository: the enrollment wrapper needs both
 `infra/cf/enroll-cert.py` and the sibling `collector/` source. A preinstalled
 collector is not required.
 
-Create the short-lived Cloudflare enrollment token described in
+For fresh enrollment only, create the short-lived Cloudflare token described in
 [the mTLS runbook](infra/cf/mtls.md#mint-the-enrollment-token-dashboard-1-min), then:
 
 ```powershell
@@ -234,6 +234,17 @@ The scheduled task performs the uploads; enrollment does not wait for a full pas
 Use `-NoSchedule` to run one full pass instead and leave scheduling uninstalled.
 `Get-Help .\scripts\enroll-windows-collector.ps1 -Full` documents `-MachineId`,
 `-Out`, `-Admin`, and the already-registered `-InstallStaged` recovery mode.
+
+For recovery with a certificate already staged and registered by a hub administrator,
+use the same checkout without creating or setting a Cloudflare token:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+Remove-Item Env:CLOUDFLARE_API_TOKEN -ErrorAction SilentlyContinue
+.\scripts\enroll-windows-collector.ps1 -InstallStaged -MachineId workstation-windows -Out 'C:\cert material'
+```
+
+Replace the machine ID and directory with those supplied with the staged certificate.
 
 ## Update a Windows collector
 
