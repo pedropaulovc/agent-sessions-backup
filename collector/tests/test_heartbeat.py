@@ -1,4 +1,5 @@
 """Heartbeat queue conservation, request limits, and bounded recovery work."""
+from collections import Counter
 import json
 from types import SimpleNamespace
 
@@ -37,19 +38,29 @@ def test_large_backlog_and_26000_new_events_shrink_with_count_conservation(tmp_p
     cfg = SimpleNamespace(hub_url="https://hub.invalid")
     transport = RecordingTransport()
     path = tmp_path / "state.db"
+    messages = [
+        f"missing source: C:/Users/collector/sessions/{i:04d}/" + "a" * 100 + ".jsonl"
+        for i in range(3100)
+    ]
+    expected = Counter(messages[i % len(messages)] for i in range(100_000))
+    expected["same warning"] += 52_000
     with State(path) as st:
-        # Larger than one pass, but real-sized repeating warnings, not tiny placeholders.
-        st.buffer_events([event("missing source: " + "a" * 100)] * 100_000)
+        st.conn.executemany(
+            "INSERT INTO pending_events (level, code, message, count, store, created_at) "
+            "VALUES ('warn', 'missing_source', ?, 1, 'omp', '2026-01-01T00:00:00Z')",
+            ((messages[i % len(messages)],) for i in range(100_000)),
+        )
+        st.conn.commit()
         assert run._heartbeat(cfg, st, transport, {}, [event(count=2)] * 26_000)
-        assert 0 < st.pending_event_count() < 100_000
-        assert sent_count(transport) + pending_count(st) == 152_000
+        assert st.pending_event_count() == 0
         assert len(transport.bodies) <= 64
-    # Resume from durable state, rather than an in-memory cursor.
     with State(path) as st:
-        while st.pending_event_count():
-            assert run._heartbeat(cfg, st, transport, {}, [])
-        assert sent_count(transport) == 152_000
-    assert any(e["count"] > 1 for body in transport.bodies for e in body["events"])
+        assert st.pending_event_count() == 0
+    actual = Counter()
+    for body in transport.bodies:
+        for item in body["events"]:
+            actual[item["message"]] += item["count"]
+    assert actual == expected
 
 
 def test_escaped_unique_events_split_by_encoded_bytes(tmp_path):
@@ -103,22 +114,22 @@ def test_transport_exception_leaves_current_events_durable(tmp_path):
         assert st.pending_event_count() == 1
 
 
-def test_oversized_prefix_does_not_starve_later_events_across_passes(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(run, "HEARTBEAT_MAX_BATCHES", 1)
+def test_oversized_prefix_does_not_starve_later_events_across_passes(tmp_path, capsys):
     cfg = SimpleNamespace(hub_url="https://hub.invalid")
     path = tmp_path / "state.db"
     huge = event("x" * (256 * 1024))
+    transport = RecordingTransport()
     with State(path) as st:
         st.buffer_events([huge, huge, event("deliver me")])
-        assert not run._heartbeat(cfg, st, RecordingTransport(), {}, [])
-        assert st.pending_event_count() == 3
-    with State(path) as st:
-        assert not run._heartbeat(cfg, st, RecordingTransport(), {}, [])
-        transport = RecordingTransport()
-        assert run._heartbeat(cfg, st, transport, {}, [])
+        assert not run._heartbeat(cfg, st, transport, {}, [])
         assert sent_count(transport) == 1
-        assert st.pending_event_count() == 2
-        assert st.conn.execute("SELECT message FROM pending_events LIMIT 1").fetchone()[0] == huge["message"]
+        assert st.pending_event_count() == 1
+        assert pending_count(st) == 2
+    with State(path) as st:
+        assert not run._heartbeat(cfg, st, transport, {}, [])
+        assert sent_count(transport) == 1
+        assert pending_count(st) == 2
+        assert st.conn.execute("SELECT message FROM pending_events").fetchone()[0] == huge["message"]
     assert "retained" in capsys.readouterr().err
 
 
@@ -143,3 +154,154 @@ def test_event_page_is_bounded_and_ack_does_not_use_variable_sized_in_clause(tmp
         assert st.pending_event_count() == 1983
         assert any("LIMIT 17" in sql for sql in statements)
         assert not any(" IN (" in sql for sql in statements)
+
+
+def event_counts(events):
+    totals = Counter()
+    for item in events:
+        totals[(item["level"], item["code"], item["message"], item.get("store"))] += item["count"]
+    return totals
+
+
+def test_compacted_http_failure_and_restart_conserve_exact_identities(tmp_path, monkeypatch):
+    monkeypatch.setattr(run, "HEARTBEAT_MAX_EVENTS", 2)
+    cfg = SimpleNamespace(hub_url="https://hub.invalid")
+    path = tmp_path / "state.db"
+    events = [
+        event("same path", count=2, store=None),
+        event("same path", count=3, store=""),
+        event("same path", count=5, store=None),
+        dict(event("same path", count=7), level="error"),
+        dict(event("same path", count=11), code="other"),
+        event("Same path", count=13),
+        event("same path", count=17, store=""),
+    ]
+    expected = event_counts(events)
+    failed = RecordingTransport([(200, "ok"), (503, "unavailable")])
+    with State(path) as st:
+        st.buffer_events(events[:3])
+        assert not run._heartbeat(cfg, st, failed, {}, events[3:])
+        acknowledged = event_counts(failed.bodies[0]["events"])
+        _, remaining = st.drain_events()
+        assert acknowledged + event_counts(remaining) == expected
+        assert len(failed.bodies) == 2
+    retry = RecordingTransport()
+    with State(path) as st:
+        assert run._heartbeat(cfg, st, retry, {}, [])
+        assert st.pending_event_count() == 0
+    delivered = event_counts(item for body in retry.bodies for item in body["events"])
+    assert acknowledged + delivered == expected
+
+
+def test_compaction_failure_retains_current_events_before_restart(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(hub_url="https://hub.invalid")
+    path = tmp_path / "state.db"
+    transport = RecordingTransport()
+    original = State.compact_events
+
+    def fail_compaction(self, *args, **kwargs):
+        raise OSError("compaction unavailable")
+
+    with State(path) as st:
+        st.buffer_events([event(count=3)])
+        with monkeypatch.context() as patch:
+            patch.setattr(State, "compact_events", fail_compaction)
+            with pytest.raises(OSError, match="compaction unavailable"):
+                run._heartbeat(cfg, st, transport, {}, [event(count=5)])
+        assert State.compact_events is original
+        assert pending_count(st) == 8
+        assert transport.bodies == []
+    with State(path) as st:
+        assert pending_count(st) == 8
+        assert run._heartbeat(cfg, st, transport, {}, [])
+        assert st.pending_event_count() == 0
+    assert sent_count(transport) == 8
+
+
+@pytest.mark.parametrize("reused_id", [False, True])
+def test_stale_cursor_requeries_and_delivers_in_same_pass(tmp_path, reused_id):
+    cfg = SimpleNamespace(hub_url="https://hub.invalid")
+    path = tmp_path / "state.db"
+    with State(path) as st:
+        st.buffer_events([event("previous")])
+        ids, _ = st.drain_events()
+        st.set_event_cursor(ids[-1] if reused_id else 10_000)
+        st.delete_events(ids)
+    transport = RecordingTransport()
+    with State(path) as st:
+        st.buffer_events([event("new", count=7)])
+        if reused_id:
+            assert st.conn.execute("SELECT id FROM pending_events").fetchone()[0] == 1
+        assert run._heartbeat(cfg, st, transport, {}, [])
+        assert st.pending_event_count() == 0
+    assert event_counts(item for body in transport.bodies for item in body["events"]) == event_counts(
+        [event("new", count=7)]
+    )
+
+
+def test_nonzero_cursor_compacts_only_unvisited_window_before_delivery(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(hub_url="https://hub.invalid")
+    transport = RecordingTransport()
+    original = State.compact_events
+    calls = []
+
+    def record_compaction(self, after_id=0, limit=100_000):
+        calls.append(after_id)
+        return original(self, after_id=after_id, limit=limit)
+
+    monkeypatch.setattr(State, "compact_events", record_compaction)
+    with State(tmp_path / "state.db") as st:
+        st.buffer_events([event("earlier"), event("later", count=2), event("later", count=3)])
+        st.set_event_cursor(1)
+        assert run._heartbeat(cfg, st, transport, {}, [])
+        assert calls[0] == 1
+        assert st.pending_event_count() == 1
+        assert st.event_cursor() == 0
+        assert event_counts(
+            item for body in transport.bodies for item in body["events"]
+        ) == event_counts([event("later", count=5)])
+        assert run._heartbeat(cfg, st, transport, {}, [])
+        assert 0 in calls
+        assert st.pending_event_count() == 0
+    assert event_counts(item for body in transport.bodies for item in body["events"]) == event_counts(
+        [event("earlier"), event("later", count=5)]
+    )
+
+
+def test_compacted_window_exhaustion_advances_past_removed_high_water_id(tmp_path, monkeypatch):
+    cfg = SimpleNamespace(hub_url="https://hub.invalid")
+    transport = RecordingTransport()
+    original = State.compact_events
+    calls = []
+
+    def small_window(self, after_id=0, limit=100_000):
+        calls.append(after_id)
+        return original(self, after_id=after_id, limit=min(limit, 3))
+
+    monkeypatch.setattr(State, "compact_events", small_window)
+    events = [event("a", count=2), event("b", count=3), event("a", count=5)] * 4
+    with State(tmp_path / "state.db") as st:
+        assert run._heartbeat(cfg, st, transport, {}, events)
+        assert st.pending_event_count() == 0
+    assert calls[:4] == [0, 3, 6, 9]
+    assert event_counts(item for body in transport.bodies for item in body["events"]) == event_counts(events)
+    assert len(transport.bodies) <= 64
+
+
+def test_page_budget_remains_bounded_with_compaction_and_restart(tmp_path, monkeypatch):
+    monkeypatch.setattr(run, "HEARTBEAT_MAX_EVENTS", 1)
+    cfg = SimpleNamespace(hub_url="https://hub.invalid")
+    path = tmp_path / "state.db"
+    first = RecordingTransport()
+    events = [event(f"path/{i}", count=i + 1) for i in range(70)]
+    with State(path) as st:
+        assert run._heartbeat(cfg, st, first, {}, events)
+        assert len(first.bodies) == 64
+        assert st.pending_event_count() == 6
+    retry = RecordingTransport()
+    with State(path) as st:
+        assert run._heartbeat(cfg, st, retry, {}, [])
+        assert st.pending_event_count() == 0
+    assert event_counts(
+        item for body in first.bodies + retry.bodies for item in body["events"]
+    ) == event_counts(events)

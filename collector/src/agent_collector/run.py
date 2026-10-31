@@ -559,6 +559,7 @@ def _upload_multipart(cfg, transport: Transport, item: ScanItem, sha: str) -> tu
 HEARTBEAT_MAX_BYTES = 256 * 1024
 HEARTBEAT_MAX_EVENTS = 1000
 HEARTBEAT_MAX_BATCHES = 64
+HEARTBEAT_COMPACT_ROWS = 100_000
 
 
 def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: list[dict]) -> bool:
@@ -572,14 +573,27 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
         return False
 
     after_id = st.event_cursor()
+    window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
     oversized = False
     delivered = 0
     for _batch in range(HEARTBEAT_MAX_BATCHES):
-        ids, events = st.drain_events(HEARTBEAT_MAX_EVENTS, after_id)
+        ids, events = st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
+        if not ids and window_end is not None:
+            # Compaction can remove the window's final IDs. Advance over only those
+            # removed rows before selecting the next bounded input window.
+            after_id = window_end
+            window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
+            ids, events = (st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
+                           if window_end is not None else ([], []))
         if not ids and after_id:
             st.set_event_cursor(0)
             if _batch:
                 break
+            # A saved cursor can outlive all pending IDs, including when SQLite
+            # reuses IDs after deletion. Requery from zero in this same pass.
+            after_id = 0
+            window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
+            ids, events = st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
         ack_ids = []
         grouped = {}
         size = base_size

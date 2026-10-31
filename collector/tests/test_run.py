@@ -69,7 +69,7 @@ def test_run_records_heartbeat_with_stats(tmp_path, hub):
 def test_run_uploads_managed_skills_from_legacy_config(tmp_path, hub, tmp_env):
     skills = tmp_env / "home" / ".omp" / "agent" / "managed-skills"
     (skills / "example" / "references").mkdir(parents=True)
-    (skills / "example" / "SKILL.md").write_text("---\nname: example\n---\n")
+    (skills / "example" / "SKILL.md").write_bytes(b"---\nname: example\n---\n")
     (skills / "example" / "references" / "guide.md").write_text("guide")
     claude = tmp_path / "claude"
     path = config.config_path()
