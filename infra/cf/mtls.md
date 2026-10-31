@@ -42,7 +42,7 @@ Cloudflare dashboard → My Profile → API Tokens → Create Token → Custom t
 | Permission | Scope |
 |---|---|
 | Zone · **SSL and Certificates** · Edit | Zone: `pedrovc.com.br` — mint and revoke client certificates |
-| Account · **D1** · Edit | Account: `Pedro@vezza.com.br` — register and verify the machine row |
+| Account · **D1** · Edit | Production account `18ef3246e9f36d1560485ef53889c0ab` (owner `pedro@vza.net`) — register and verify the machine row |
 
 Set TTL to about one hour. `enroll-cert.py` uses this token directly with the
 Cloudflare REST API; it does not need Wrangler login or a second credential. If you
@@ -91,21 +91,35 @@ edge before it reaches the Worker.
 
 ## Step 3 — enroll each machine (repeatable)
 
-From native PowerShell, set the short-lived token and run one command:
+On native Windows, install [uv](https://docs.astral.sh/uv/getting-started/installation/)
+and Git, then clone the complete repository. Run from PowerShell as the Windows user
+who will own the collector and its certificate store (not WSL or Git Bash). No
+preinstalled collector is needed; the wrapper requires the sibling `collector/`
+source, so downloading the PowerShell script alone is insufficient.
 
 ```powershell
+git clone https://github.com/pedropaulovc/agent-sessions-backup.git
+Set-Location agent-sessions-backup
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 $env:CLOUDFLARE_API_TOKEN = '<token from above>'
-uv run infra/cf/enroll-cert.py
-Remove-Item Env:CLOUDFLARE_API_TOKEN
+try {
+    .\scripts\enroll-windows-collector.ps1
+} finally {
+    Remove-Item Env:CLOUDFLARE_API_TOKEN
+}
 ```
 
+The execution-policy change applies only to this PowerShell session.
+
 The Python script handles the complete local flow: it preflights both token permissions,
-installs the sibling collector with `uv tool install` only when it is missing, derives the
-collector's exact machine id, generates the P-256 key and CSR, mints and validates the
-certificate, performs a guarded fresh-only D1 registration, and independently verifies
-the complete stored tuple. It then configures the collector, runs `doctor` with an
-authenticated `/api/v1/status` probe, performs one live collector pass, and installs the
-15-minute schedule.
+installs or upgrades the sibling collector with `uv tool install` when a compatible
+collector is unavailable, derives the collector's exact machine id, generates the
+P-256 key and CSR, mints and validates the certificate, performs a guarded fresh-only
+D1 registration, and independently verifies the complete stored tuple. It then
+configures the collector, runs `doctor --require-current-cert` with an authenticated
+`/api/v1/status` probe, sends an authenticated heartbeat, and installs the 15-minute
+schedule. The scheduled task performs uploads; default enrollment does not wait for
+a full collector pass.
 
 When an older Git Bash run left material in a repository-local `.config/agent-collector`,
 the script checks a bounded set of current and legacy checkout locations for the exact
@@ -113,17 +127,34 @@ machine id and resumes that verified material in place. If more than one locatio
 matches, it stops and lists them; select one explicitly with `--out <directory>` after
 inspection.
 
-Use `--admin` when this machine needs hub admin endpoints, `--machine-id <id>` only to
-override the collector-derived id, `--out <directory>` to move the working material, or
-`--no-schedule` to stop after the verified one-shot upload. On POSIX, use the same command
-with an environment assignment:
+The PowerShell wrapper exposes `-Admin` for hub admin endpoints, `-MachineId <id>`
+to override the collector-derived id, `-Out <directory>` to select working material,
+and `-NoSchedule` to run one full collector pass instead of a heartbeat and leave
+scheduling uninstalled. `-InstallStaged` installs an already-registered staged
+certificate without a Cloudflare token; it is recovery, not fresh enrollment.
+See `Get-Help .\scripts\enroll-windows-collector.ps1 -Full`.
+
+For staged recovery, skip token creation and run from the checkout, using the machine
+ID and directory supplied with the already-registered certificate:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+Remove-Item Env:CLOUDFLARE_API_TOKEN -ErrorAction SilentlyContinue
+.\scripts\enroll-windows-collector.ps1 -InstallStaged -MachineId workstation-windows -Out 'C:\cert material'
+```
+
+The Python equivalents are `--admin`, `--machine-id`, `--out`, `--no-schedule`,
+and `--install-staged`. On POSIX, run the Python script from the same complete
+checkout with an environment assignment:
 
 ```bash
 CLOUDFLARE_API_TOKEN='<token from above>' uv run infra/cf/enroll-cert.py
 ```
 
-The token is sent only in Cloudflare HTTPS headers. It is never placed in argv, written to
-disk, logged, or inherited by `uv` or collector subprocesses.
+The launching `uv run` process and the Python enroller inherit the token through
+`CLOUDFLARE_API_TOKEN`. The enroller sends it only in Cloudflare HTTPS headers,
+never in argv or logs or to disk, and removes it from the environments of the
+collector and `uv tool install` subprocesses it launches.
 
 ## Windows / Schannel mTLS
 
@@ -146,9 +177,10 @@ This is also the future TPM/PCP path (S2): a PCP-backed key surfaces as the same
 a randomly password-protected PFX in memory/on the local working directory, passes the
 password to the collector only through a scrubbed child environment, imports the key as
 non-exportable into `Cert:\CurrentUser\My`, and confirms that the collector deleted the
-PFX. The exportable PEM key is kept through `doctor`'s authenticated hub check and the live
-collector pass, then deleted only after both succeed. If import, the authenticated check, or
-the pass fails, the key is retained and scheduling does not occur.
+PFX. The exportable PEM key is kept through `doctor`'s authenticated hub check and the
+heartbeat (or full collector pass with `-NoSchedule`), then deleted only after both
+succeed. If import, the authenticated check, or that run fails, the key is retained
+and scheduling does not occur.
 
 ## Notes
 

@@ -202,12 +202,56 @@ a fresh heartbeat proves liveness, **not** a fully delivered queue. Repeated
 `agent-collector run --heartbeat-only` invocations drain bounded passes without
 rescanning stores; normal scheduled runs also continue delivery.
 
+## Enroll a new Windows collector
+
+Use native Windows PowerShell as the user who will run the collector, not WSL or
+Git Bash. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) and
+Git, then clone the complete repository: the enrollment wrapper needs both
+`infra/cf/enroll-cert.py` and the sibling `collector/` source. A preinstalled
+collector is not required.
+
+For fresh enrollment only, create the short-lived Cloudflare token described in
+[the mTLS runbook](infra/cf/mtls.md#mint-the-enrollment-token-dashboard-1-min), then:
+
+```powershell
+git clone https://github.com/pedropaulovc/agent-sessions-backup.git
+Set-Location agent-sessions-backup
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+$env:CLOUDFLARE_API_TOKEN = '<short-lived enrollment token>'
+try {
+    .\scripts\enroll-windows-collector.ps1
+} finally {
+    Remove-Item Env:CLOUDFLARE_API_TOKEN
+}
+```
+
+The execution-policy change applies only to this PowerShell session.
+
+The wrapper delegates to `uv run <checkout>/infra/cf/enroll-cert.py`: enrollment
+installs a compatible collector when needed, imports the certificate, verifies
+authenticated hub access, sends a heartbeat, and installs the 15-minute task.
+The scheduled task performs the uploads; enrollment does not wait for a full pass.
+Use `-NoSchedule` to run one full pass instead and leave scheduling uninstalled.
+`Get-Help .\scripts\enroll-windows-collector.ps1 -Full` documents `-MachineId`,
+`-Out`, `-Admin`, and the already-registered `-InstallStaged` recovery mode.
+
+For recovery with a certificate already staged and registered by a hub administrator,
+use the same checkout without creating or setting a Cloudflare token:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+Remove-Item Env:CLOUDFLARE_API_TOKEN -ErrorAction SilentlyContinue
+.\scripts\enroll-windows-collector.ps1 -InstallStaged -MachineId workstation-windows -Out 'C:\cert material'
+```
+
+Replace the machine ID and directory with those supplied with the staged certificate.
+
 ## Update a Windows collector
 
 Run this in PowerShell to update an enrolled collector to the current `main` branch, replace its scheduled task, and send an immediate heartbeat. It waits for an in-progress scheduled run before replacing the tool, so it never updates the executable under that process.
 
 ```powershell
-iwr https://raw.githubusercontent.com/pedropaulovc/agent-sessions-backup/main/scripts/setup-windows-collector.ps1 | iex
+iwr https://raw.githubusercontent.com/pedropaulovc/agent-sessions-backup/main/scripts/update-windows-collector.ps1 | iex
 ```
 
 ## Update a Linux or WSL collector
