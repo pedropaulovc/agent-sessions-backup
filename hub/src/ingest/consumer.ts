@@ -529,8 +529,8 @@ async function parseOne(job: ParseMessage, env: Env, attempt: ParseAttempt, budg
       if (session?.canonical_file_id === file.id) {
         // This file WAS the session's canonical, and the search index still reflects its OLD,
         // actually-parseable content — now stale, since the current bytes produced nothing.
-        // Clear the derived rows (keep the sessions row itself so facets/raw access still
-        // resolve) and mark the session errored.
+        // Clear index rows and titles from those old bytes (keep the sessions row itself so
+        // facets/raw access still resolve) and mark the session errored.
         const sourceComplete =
           parsed.stats.parseErrorLines === 0 && (parsed.stats.skippedLineTypes['oversized-line'] ?? 0) === 0;
         cleanupSpent += await clearSessionDerived(det.sessionId, file, env, false, sourceComplete, file.content_hash, attempt.written);
@@ -1965,7 +1965,7 @@ async function clearSessionDerived(
   const sourceGuard = 'canonical_file_id = ?2 AND EXISTS (SELECT 1 FROM files WHERE id = ?2 AND content_hash = ?3)';
   const started = await db.batch([
     db.prepare(`UPDATE sessions SET index_state = '${removeSession ? 'parsing' : 'error'}'
-      ${removeSession ? '' : ', first_interaction_title = NULL'} WHERE session_id = ?1 AND ${sourceGuard}`)
+      ${removeSession ? '' : ', title = NULL, first_interaction_title = NULL'} WHERE session_id = ?1 AND ${sourceGuard}`)
       .bind(sessionId, file.id, contentHash),
     db.prepare(`INSERT INTO session_rollup_state (session_id, generation, eligible)
       SELECT ?1, ?4, 0 WHERE EXISTS (SELECT 1 FROM sessions WHERE session_id = ?1 AND ${sourceGuard})`)

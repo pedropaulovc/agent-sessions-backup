@@ -972,8 +972,8 @@ test('fresh remote shard apply bootstraps through Wrangler and commits the verif
   assert.equal(result.schemaDigest, schemaDigest(schemaSnapshotFromDatabase(remote.database)));
   assert.ok(remote.requests.some(({ sql }) => /^\s*CREATE TABLE IF NOT EXISTS "d1_migrations"/.test(sql ?? '')),
     'normal Wrangler apply must own the canonical ledger bootstrap');
-  assert.equal(remote.requests.filter(({ sql }) => /INSERT INTO\s+"d1_migrations"/i.test(sql ?? '')).length, 1,
-    'Wrangler must really execute the checked-in shard migration');
+  assert.equal(remote.requests.filter(({ sql }) => /INSERT INTO\s+"d1_migrations"/i.test(sql ?? '')).length,
+    fixture.manifest.migrations.length, 'Wrangler must really execute every checked-in shard migration');
   assert.deepEqual(
     remote.database.prepare('SELECT name FROM d1_migrations ORDER BY id').all().map(({ name }) => name),
     fixture.manifest.migrations.map(({ filename }) => filename),

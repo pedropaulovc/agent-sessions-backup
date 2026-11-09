@@ -1,6 +1,7 @@
 import { env, SELF } from 'cloudflare:test';
 import { beforeAll, describe, expect, it, vi } from 'vitest';
 import worker from '../src/index';
+import type { SearchResult } from '../src/api/search';
 import { clampLimit } from '../src/api/sessions';
 import { hex } from '../src/api/ops';
 import { convergeR2WithRow } from '../src/api/upload';
@@ -124,38 +125,39 @@ describe('search automatically prefixes the final query term', () => {
   });
 
   it.each([
-    ['an unquoted query missing the indexed final period', 'prefixregression STOP USING TOOLS NEVER EXPOSE CREDENTIALS', 1],
-    ['a quoted phrase missing the indexed final period', '"prefixregression STOP USING TOOLS NEVER EXPOSE CREDENTIALS"', 1],
-    ['an explicit trailing wildcard', 'prefixregression CREDENTIALS*', 1],
-    ['an explicit wildcard with OR semantics', 'wildcardalternative OR prefixregression*', 2],
-    ['a quoted phrase with an explicit wildcard', '"prefixregression STOP USING TOOLS NEVER EXPOSE CREDENTIALS"*', 1],
-    ['a grouped OR expression', '(wildcardalternative OR prefixregression)', 2],
-    ['a column-filtered grouped OR expression', 'text: (wildcardalternative OR prefixregression)', 2],
-    ['a conjunction ending in a group', 'prefixregression AND (TOOLS)', 1],
-    ['a NEAR expression', 'NEAR(prefixregression TOOLS)', 1],
-    ['a NEAR expression with an explicit distance', 'NEAR(prefixregression TOOLS, 3)', 1],
-    ['a NEAR distance that excludes the hit', 'NEAR(prefixregression TOOLS, 1)', 0],
-    ['no automatic prefix within a terminal group', '(prefixregression AND CREDENTIALS)', 0],
-    ['an invalid column filter retried as a prefixed phrase', 'fallbackregression: CREDENTIALS', 1],
-    ['a fallback that must escape the original quotes', 'fallbackregression: "CREDENTIALS"', 1],
-    ['an invalid query already ending in a wildcard', 'fallbackregression: CREDENTIALS*', 1],
-    ['surrounding whitespace', '  prefixregression CREDENTIALS  ', 1],
-    ['no automatic prefix on earlier terms', 'prefixregression STO USING TOOLS NEVER EXPOSE CREDENTIALS', 0],
-    ['no substring matching', 'prefixregression REDENTIALS', 0],
-    ['quoted phrase adjacency is preserved', '"prefixregression USING CREDENTIALS"', 0],
-  ] as const)('%s', async (_label, q, count) => {
+    ['an unquoted query missing the indexed final period', 'prefixregression STOP USING TOOLS NEVER EXPOSE CREDENTIALS', 1, 1],
+    ['a quoted phrase missing the indexed final period', '"prefixregression STOP USING TOOLS NEVER EXPOSE CREDENTIALS"', 1, 1],
+    ['an explicit trailing wildcard', 'prefixregression CREDENTIALS*', 1, 1],
+    ['an explicit wildcard with OR semantics', 'wildcardalternative OR prefixregression*', 2, 1],
+    ['a quoted phrase with an explicit wildcard', '"prefixregression STOP USING TOOLS NEVER EXPOSE CREDENTIALS"*', 1, 1],
+    ['a grouped OR expression', '(wildcardalternative OR prefixregression)', 2, 1],
+    ['a column-filtered grouped OR expression', 'text: (wildcardalternative OR prefixregression)', 2, 1],
+    ['a conjunction ending in a group', 'prefixregression AND (TOOLS)', 1, 1],
+    ['a NEAR expression', 'NEAR(prefixregression TOOLS)', 1, 1],
+    ['a NEAR expression with an explicit distance', 'NEAR(prefixregression TOOLS, 3)', 1, 1],
+    ['a NEAR distance that excludes the hit', 'NEAR(prefixregression TOOLS, 1)', 0, 0],
+    ['no automatic prefix within a terminal group', '(prefixregression AND CREDENTIALS)', 0, 0],
+    ['an invalid column filter retried as a prefixed phrase', 'fallbackregression: CREDENTIALS', 1, 0],
+    ['a fallback that must escape the original quotes', 'fallbackregression: "CREDENTIALS"', 1, 0],
+    ['an invalid query already ending in a wildcard', 'fallbackregression: CREDENTIALS*', 1, 0],
+    ['surrounding whitespace', '  prefixregression CREDENTIALS  ', 1, 1],
+    ['no automatic prefix on earlier terms', 'prefixregression STO USING TOOLS NEVER EXPOSE CREDENTIALS', 0, 0],
+    ['no substring matching', 'prefixregression REDENTIALS', 0, 0],
+    ['quoted phrase adjacency is preserved', '"prefixregression USING CREDENTIALS"', 0, 0],
+  ] as const)('%s', async (_label, q, blockCount, titleCount) => {
     const res = await SELF.fetch(`${API}/api/v1/search?q=${encodeURIComponent(q)}&facets=1`, {
       headers: { 'x-dev-machine': MACHINE },
     });
     expect(res.status).toBe(200);
-    const body = (await res.json()) as {
-      hits: { session_id: string }[];
-      facets: Record<string, Record<string, number>>;
-    };
-    expect(body.hits).toHaveLength(count);
+    const body = await res.json() as SearchResult;
+    expect(body.hits.filter((hit) => hit.match_kind === 'block')).toHaveLength(blockCount);
+    const titles = body.hits.filter((hit) => hit.match_kind === 'title');
+    expect(titles).toHaveLength(titleCount);
+    for (const title of titles) expect(title.block).toBeNull();
+    expect(body.hits).toHaveLength(blockCount + titleCount);
     for (const hit of body.hits) expect(hit.session_id).toBe(SESSION_ID);
     // Facets must use the same prefixed match string, including after phrase fallback.
-    expect(body.facets.machine_id).toEqual(count ? { [MACHINE]: 1 } : {});
+    expect(body.facets!.machine_id).toEqual(blockCount || titleCount ? { [MACHINE]: 1 } : {});
   });
 
   it.each(['', '   '])('keeps an empty query empty (%j)', async (q) => {

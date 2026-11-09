@@ -385,6 +385,7 @@ function renderHit(h: SearchHit, cost: SubtreeCost | undefined): string {
   const title = sessionDisplayTitle(null, s.title, h.session_id, s.harness);
   const meta = [
     `<span class="badge">${esc(s.harness)}</span>`,
+    h.match_kind === 'title' ? '<span class="badge">Title match</span>' : '',
     s.subagent === 'yes' ? `<span class="badge">Subagent session</span>` : '',
     s.machine_id ? `<span class="chip">${esc(s.machine_id)}</span>` : '',
     s.primary_model ? `<span class="chip">${esc(s.primary_model)}</span>` : '',
@@ -395,9 +396,10 @@ function renderHit(h: SearchHit, cost: SubtreeCost | undefined): string {
   ]
     .filter(Boolean)
     .join('');
-  // Deep-link to the page (turn_index bucket) that holds the matching turn, anchored at that turn.
-  const hitPage = Math.floor(h.block.turn_index / TURNS_PER_PAGE) + 1;
-  const href = `/s/${q(h.session_id)}?page=${hitPage}#t${h.block.turn_index}`;
+  // Title metadata has no transcript turn. Only real block hits get page/turn deep links.
+  const href = h.block
+    ? `/s/${q(h.session_id)}?page=${Math.floor(h.block.turn_index / TURNS_PER_PAGE) + 1}#t${h.block.turn_index}`
+    : `/s/${q(h.session_id)}`;
   return `<div class="hit">` +
     `<div class="title"><a href="${esc(href)}">${esc(title)}</a></div>` +
     `<div class="snip">${sanitizeSnippet(h.snippet)}</div>` +

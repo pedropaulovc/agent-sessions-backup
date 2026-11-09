@@ -168,6 +168,7 @@ def test_search(hub):
         {
             "session_id": "s1",
             "snippet": "<mark>hello</mark>",
+            "match_kind": "block",
             "block": {"turn_index": 0, "block_index": 0, "role": "user", "btype": "text", "tool_name": None, "ts": None},
             "session": {"harness": "claude-code"},
         }
@@ -175,9 +176,28 @@ def test_search(hub):
     result = api_for(hub).search("hello")
     assert len(result.hits) == 1
     assert result.hits[0].snippet == "<mark>hello</mark>"
+    assert result.hits[0].match_kind == "block"
+    assert result.hits[0].block["turn_index"] == 0
     request = hub.requests[-1]
     assert request["path"] == "/api/v1/search"
     assert request["params"]["limit"] == ["100"]
+
+
+def test_search_title_hit_has_no_fabricated_block(hub):
+    hub.search_hits = [
+        {
+            "session_id": "title-only",
+            "snippet": "<mark>Square</mark> up tapered bar stock",
+            "match_kind": "title",
+            "block": None,
+            "session": {"harness": "omp", "title": "Square up tapered bar stock"},
+        }
+    ]
+    result = api_for(hub).search("Square")
+    assert len(result.hits) == 1
+    assert result.hits[0].match_kind == "title"
+    assert result.hits[0].block is None
+    assert result.hits[0].session["title"] == "Square up tapered bar stock"
 
 
 def test_search_preserves_explicit_lower_limit(hub):

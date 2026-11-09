@@ -1,6 +1,7 @@
 import { SELF } from 'cloudflare:test';
 import { beforeAll, beforeEach, describe, expect, it } from 'vitest';
 import { env as testEnvRaw } from 'cloudflare:test';
+import type { SearchResult } from '../src/api/search';
 import worker from '../src/index';
 import { flipOwnedSessionsToParsing } from '../src/api/upload';
 import { chatgptExportZip, chatgptWebConversation, claudeWebConversation, historyLines, unrecognizedExportZip } from './web-fixtures';
@@ -177,7 +178,10 @@ describe('prompt-log ingest is machine-scoped (two machines, two sessions)', () 
     expect(ids).toContain('promptlog:boxB:claude');
 
     const res = await SELF.fetch(`${API}/api/v1/search?q=gamma`, { headers: { 'x-dev-machine': 'boxA' } });
-    expect(((await res.json()) as { hits: unknown[] }).hits.length).toBe(1);
+    const { hits } = await res.json() as SearchResult;
+    expect(hits.map((hit) => [hit.session_id, hit.match_kind]).sort()).toEqual([
+      ['promptlog:boxA:claude', 'block'], ['promptlog:boxA:claude', 'title'],
+    ]);
   });
 
   it('stamps the machine-scoped session id onto the files row and flips it to parsing on changed re-upload', async () => {
@@ -240,7 +244,11 @@ describe('export ZIP ingest fans out and only backfills gaps', () => {
       expect(row?.index_state).toBe('ready');
     }
     const search = await SELF.fetch(`${API}/api/v1/search?q=archived`, { headers: { 'x-dev-machine': 'webbox' } });
-    expect(((await search.json()) as { hits: unknown[] }).hits.length).toBe(2);
+    const { hits } = await search.json() as SearchResult;
+    expect(hits.map((hit) => [hit.session_id, hit.match_kind]).sort()).toEqual([
+      ['exp-ingest-a', 'block'], ['exp-ingest-a', 'title'],
+      ['exp-ingest-b', 'block'], ['exp-ingest-b', 'title'],
+    ]);
   });
 
   it('does not overwrite a conversation already captured live by CDP', async () => {

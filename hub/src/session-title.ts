@@ -118,7 +118,8 @@ function* titleRepresentatives(blocks: TitleBlock[]): Generator<TitleRepresentat
 
 /** Resolve the display title: OMP stores an authoritative title in JSONL, so use it before the
  * derived first-interaction fallback. Other harnesses retain the derived-first behavior for
- * legacy titles that may be stale. */
+ * legacy titles that may be stale. The shard session_title_content view mirrors this choice
+ * when deciding whether to index first_interaction_title (index migration 0002). */
 export function sessionDisplayTitle(
   firstInteractionTitle: string | null,
   storedTitle: string | null,

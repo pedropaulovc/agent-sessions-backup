@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
-import { SESSION_CATALOG_COLUMNS } from '../src/index-layout.mjs';
+import { SESSION_CATALOG_COLUMNS, sessionCatalogBatches } from '../src/index-layout.mjs';
 
 const migrationsDir = path.resolve(import.meta.dirname, '../migrations');
 const catalogPath = process.env.CATALOG_MIGRATION_PATH ?? path.join(migrationsDir, '0036_session_catalog_outbox.sql');
@@ -144,6 +144,74 @@ test('0035 refuses populated legacy blocks without losing rows or searchable FTS
     }
     assert.deepEqual(database.prepare("SELECT name FROM sqlite_master WHERE name IN ('blocks', 'blocks_fts', 'legacy_blocks_retirement_guard')").all(), []);
     assert.equal(database.prepare('SELECT COUNT(*) AS count FROM files').get().count, 1);
+  } finally {
+    database.close();
+  }
+});
+
+test('index 0002 backfills existing title metadata without changing transcript rows and follows fenced catalog mutations', async () => {
+  const database = new DatabaseSync(':memory:');
+  const indexMigrations = path.resolve(import.meta.dirname, '../migrations-index');
+  try {
+    database.exec(await readFile(path.join(indexMigrations, '0001_index_init.sql'), 'utf8'));
+    database.exec(`
+      INSERT INTO sessions (session_id, harness, title, first_interaction_title)
+      VALUES ('existing-omp', 'omp', 'SQUARE: Square up tapered bar stock', 'hiddenfirstinteraction'),
+             ('existing-cc', 'claude-code', 'retainedstoredtitle', 'displayedfirstinteraction');
+      INSERT INTO blocks (id, session_id, file_id, turn_index, block_index, btype, text)
+      VALUES (101, 'existing-omp', 1, 0, 0, 'text', 'A synthetic lavender lantern.');
+      INSERT INTO blocks_fts (rowid, text) SELECT id, text FROM blocks;
+    `);
+    const rowsBefore = database.prepare('SELECT * FROM blocks ORDER BY id').all();
+    const sessionsBefore = database.prepare('SELECT * FROM sessions ORDER BY session_id').all();
+    // Pre-migration block-only control: metadata is present, but the phrase is not searchable.
+    const match = '"SQUARE: Square up tapered bar stock"*';
+    assert.deepEqual(database.prepare('SELECT rowid FROM blocks_fts WHERE blocks_fts MATCH ?').all(match), []);
+    database.exec(await readFile(path.join(indexMigrations, '0002_session_title_search.sql'), 'utf8'));
+    const matches = (query) => database.prepare(`
+      SELECT s.session_id FROM session_titles_fts
+      JOIN sessions s ON s.rowid = session_titles_fts.rowid
+      WHERE session_titles_fts MATCH ? ORDER BY s.session_id
+    `).all(query).map(({ session_id }) => session_id);
+    assert.deepEqual(matches(match), ['existing-omp'], 'backfill must not require reparse or a later catalog change');
+    assert.deepEqual(matches('displayedfirstinteraction'), ['existing-cc']);
+    assert.deepEqual(matches('text:retainedstoredtitle'), ['existing-cc']);
+    assert.deepEqual(matches('hiddenfirstinteraction'), []);
+    assert.deepEqual(database.prepare('SELECT * FROM blocks ORDER BY id').all(), rowsBefore);
+    assert.deepEqual(database.prepare('SELECT * FROM sessions ORDER BY session_id').all(), sessionsBefore);
+
+    const original = sessionsBefore.find(({ session_id }) => session_id === 'existing-omp');
+    const apply = (version, session) => {
+      database.exec('BEGIN');
+      try {
+        for (const batch of sessionCatalogBatches([{ sessionId: 'existing-omp', version, session, stars: [] }])) {
+          for (const { sql, params } of batch.statements) database.prepare(sql).run(...params);
+        }
+        database.exec('COMMIT');
+      } catch (error) {
+        database.exec('ROLLBACK');
+        throw error;
+      }
+    };
+    apply(2, { ...original, title: 'replacementtitle' });
+    assert.deepEqual(matches(match), []);
+    assert.deepEqual(matches('replacementtitle'), ['existing-omp']);
+    apply(1, original);
+    assert.deepEqual(matches(match), [], 'a stale catalog sync must not restore stale title postings');
+    apply(2, { ...original, title: 'replacementtitle' });
+    assert.deepEqual(matches('replacementtitle'), ['existing-omp'], 'equal-version replay must not duplicate postings');
+    apply(3, { ...original, title: '' });
+    assert.deepEqual(matches('replacementtitle'), []);
+    assert.deepEqual(matches('hiddenfirstinteraction'), ['existing-omp'], 'empty stored title exposes the displayed fallback');
+    apply(4, { ...original, title: null, first_interaction_title: null });
+    assert.deepEqual(matches('hiddenfirstinteraction'), []);
+    apply(5, { ...original, title: 'deletiontitle' });
+    apply(6, null);
+    assert.deepEqual(matches('deletiontitle'), []);
+    apply(5, { ...original, title: 'deletiontitle' });
+    assert.deepEqual(matches('deletiontitle'), [], 'late sync must not resurrect deleted title postings');
+    database.exec("INSERT INTO session_titles_fts (session_titles_fts, rank) VALUES ('integrity-check', 1)");
+    assert.deepEqual(database.prepare('SELECT * FROM blocks ORDER BY id').all(), rowsBefore);
   } finally {
     database.close();
   }

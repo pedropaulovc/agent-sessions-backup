@@ -207,15 +207,32 @@ periods, underscores, and hyphens within tokens. Explicit trailing wildcards and
 queries ending in `)` (including grouped and NEAR expressions) are preserved without
 adding a prefix operator. Empty or whitespace-only queries still return `missing_q`.
 
+Search covers transcript blocks **and session titles**. Stored titles are indexed in
+full; the derived first-interaction title is also indexed when it is the displayed
+title (OMP prefers a nonempty stored title, other harnesses prefer the derived title).
+The fallback session ID is not indexed as a title. Title metadata never becomes a
+synthetic transcript block.
+
+Each hit has `match_kind: "block" | "title"`. Block hits retain their `block` object
+with turn/block coordinates; title hits have `block: null` and link to `/s/{session_id}`
+without a page or turn anchor. `snippet` uses the existing highlight-marked text
+contract and must be sanitized before HTML rendering. A session matching both sources
+returns one title hit plus its real matching block hits. Facets count that session
+once, not once per hit.
+
 The block index is session-hash sharded; every shard has the complete session/star
-catalog for filters and descendant-inclusive costs. All shards participate in hits
-and facet counts. Facet limits apply after global aggregation, not within each shard.
+catalog for filters and descendant-inclusive costs. A separate title FTS index uses
+the same tokenizer, with `text` for the stored title and `first_interaction_title` for
+the displayed derived title. Unqualified queries search both title fields; `text:`
+retains its column restriction. Title hits are emitted only from shard zero, and
+facet aggregation excludes replicated title matches from the other shards.
+Facet limits apply after global aggregation, not within each shard.
 No transcript or searchable block text is shortened to make the index fit.
 
-Relevance uses **shard-local FTS5 BM25** followed by globally unique block ID. This
-intentionally changes relevance order from the former single-corpus index; it does
-not change the matching corpus. The other sorts retain their primary descending
-session duration, token, or subtree-cost order, with the same relevance/ID tie-break.
+Relevance uses **source-local FTS5 BM25** (the block shard or title index), followed
+by match kind and row ID. Scores across sources are not a single-corpus relevance
+estimate. The other sorts retain their primary descending session duration, token,
+or subtree-cost order, with the same relevance/kind/ID tie-break.
 NULL duration and unknown subtree cost sort last; unknown cost is not treated as $0.
 
 The cursor still encodes a **global result offset**, with lazy bounded shard pages.
@@ -228,6 +245,12 @@ Before searching, the hub reconciles a bounded slice of the durable catalog outb
 A remaining backlog returns `503 {"error":"index_catalog_pending"}`, never stale
 filter/cost results. Database/schema failures remain errors; they are not classified
 as invalid MATCH syntax or silently replaced by partial-shard results.
+
+Index migration `0002_session_title_search.sql` backfills existing shard catalog
+metadata directly; raw-session reindexing is not required for title search. Shard
+catalog insert/update/delete triggers maintain title postings in the same transaction
+as version-fenced replication, including empty/NULL titles and deletion tombstones.
+Apply the index migration on every shard before deploying the title-search Worker.
 
 ### `GET /api/v1/usage?group_by=day|model|machine|repo&from&to&machine&harness&batch`
 

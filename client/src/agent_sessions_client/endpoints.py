@@ -196,7 +196,7 @@ class SessionsApi:
         cursor: str | None = None,
         facets: bool = False,
     ) -> SearchResult:
-        """GET /api/v1/search — FTS5 over blocks with session-level filters and facet counts."""
+        """GET /api/v1/search — FTS5 over blocks and titles with session-level filters and facet counts."""
         resp = self._client.get(
             "/api/v1/search",
             {
