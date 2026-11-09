@@ -191,8 +191,8 @@ The response shape depends on what the session's canonical file actually is
 
 ### `GET /api/v1/search`
 
-Params: `q` (FTS5 MATCH syntax — a trailing `*` is appended unless already present or
-the query ends in `)`, preserving grouped/NEAR expressions unchanged;
+Params: `q` (FTS5 MATCH syntax, with `text` as the only supported column qualifier;
+a trailing `*` is appended unless already present or the query ends in `)`, preserving grouped/NEAR expressions unchanged;
 invalid syntax is retried as a quoted literal phrase with `*` outside its closing quote,
 then degrades to an empty result set rather than a 500), `harness`, `machine`, `os`, `model`,
 `repo`, `project`, `cwd`, `session_date`, `session_time`, `cost`, `has_star=1`, `subagent=no|yes`
@@ -222,9 +222,10 @@ once, not once per hit.
 
 The block index is session-hash sharded; every shard has the complete session/star
 catalog for filters and descendant-inclusive costs. A separate title FTS index uses
-the same tokenizer, with `text` for the stored title and `first_interaction_title` for
-the displayed derived title. Unqualified queries search both title fields; `text:`
-retains its column restriction. Title hits are emitted only from shard zero, and
+the same tokenizer. Unqualified queries search transcript text, stored titles, and
+eligible displayed derived titles. The supported `text:` qualifier searches transcript
+text and stored titles only. Other column qualifiers are unsupported and take the
+whole-query literal fallback described above. Title hits are emitted only from shard zero, and
 facet aggregation excludes replicated title matches from the other shards.
 Facet limits apply after global aggregation, not within each shard.
 No transcript or searchable block text is shortened to make the index fit.
