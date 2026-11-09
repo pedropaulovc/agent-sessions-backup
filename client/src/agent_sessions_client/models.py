@@ -119,13 +119,17 @@ class SessionRecord:
 class SearchHit:
     session_id: str
     snippet: str
-    block: dict
+    match_kind: str  # "block" or "title"
+    block: dict | None  # Title matches have no transcript coordinates.
     session: dict
     raw: dict = field(repr=False)
 
     @classmethod
     def from_row(cls, row: dict) -> SearchHit:
-        return cls(session_id=row["session_id"], snippet=row["snippet"], block=row["block"], session=row["session"], raw=row)
+        return cls(
+            session_id=row["session_id"], snippet=row["snippet"], match_kind=row["match_kind"],
+            block=row["block"], session=row["session"], raw=row,
+        )
 
 
 @dataclass(frozen=True)

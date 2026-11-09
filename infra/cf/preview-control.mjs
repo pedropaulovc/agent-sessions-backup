@@ -952,13 +952,29 @@ async function seed() {
     skillRelpath,
     skillStore,
     store,
+    titleOnlySessionId,
+    titleOnlyStore,
+    titleOnlyRelpath,
+    titleOnlyTitle,
+    titleOnlyBody,
+    titleOnlyBodySearchPhrase,
   } = SYNTHETIC_EXPECTATIONS;
   if (sha256Bytes(asset) !== externalDigest) fail('synthetic external asset digest does not match fixture contract');
+  // Independent bytes from the local seeder; shared expectations describe the public contract.
+  const titleOnly = Buffer.from([
+    { type: 'title', title: titleOnlyTitle },
+    { type: 'session', version: '0.9.7', title: titleOnlyTitle, cwd: '/workspace/e2e-fixtures', timestamp: '2026-07-03T10:00:00.000Z' },
+    { type: 'title_change', title: titleOnlyTitle },
+    { type: 'message', id: 'title-only-u1', timestamp: '2026-07-03T10:00:01.000Z', message: {
+      role: 'user', content: [{ type: 'text', text: titleOnlyBody }], timestamp: '2026-07-03T10:00:01.000Z',
+    } },
+  ].map((entry) => JSON.stringify(entry)).join('\n') + '\n');
   const uploads = [
     [store, externalRelpath, asset],
     [store, primaryRelpath, primary],
     [store, pagerRelpath, pager],
     [skillStore, skillRelpath, skill],
+    [titleOnlyStore, titleOnlyRelpath, titleOnly],
     // The cost fan-out, parent first: OMP subagent identity comes from the sidecar's path under
     // the parent's directory, so the parent row must exist before its children are parsed.
     ...await Promise.all(costFixtures.map(async (fixture) => [
@@ -1030,6 +1046,8 @@ async function seed() {
   const expected = [
     [primarySessionId, searchPhrase, 'main'],
     [pagerSessionId, pagerSearchPhrase, 'main'],
+    // Readiness must work before title-only search is deployed.
+    [titleOnlySessionId, titleOnlyBodySearchPhrase, 'main'],
     ...costFixtures.map((fixture) => [fixture.sessionId, fixture.marker, fixture.kind]),
   ];
   for (const [sessionId, marker, kind] of expected) {

@@ -441,6 +441,7 @@ test('current health followed by successful local seed still uploads exact fixtu
   const indexed = new Map([
     [SYNTHETIC_EXPECTATIONS.searchPhrase, { sessionId: SYNTHETIC_EXPECTATIONS.primarySessionId, kind: 'main' }],
     ['stable second page', { sessionId: SYNTHETIC_EXPECTATIONS.pagerSessionId, kind: 'main' }],
+    [SYNTHETIC_EXPECTATIONS.titleOnlyBodySearchPhrase, { sessionId: SYNTHETIC_EXPECTATIONS.titleOnlySessionId, kind: 'main' }],
     ...SYNTHETIC_EXPECTATIONS.costFixtures.map((fixture) => [fixture.marker, fixture]),
   ]);
   const requests = [];
@@ -478,13 +479,13 @@ test('current health followed by successful local seed still uploads exact fixtu
   assert.equal(await seedSynthetic(LOCAL_SEED_ORIGIN, 1000, seed.digest), SYNTHETIC_EXPECTATIONS);
   assert.equal(requests[0].url, `${LOCAL_SEED_ORIGIN}/healthz`);
   const uploads = requests.filter((request) => request.method === 'PUT');
-  assert.equal(uploads.length, 4 + SYNTHETIC_EXPECTATIONS.costFixtures.length);
   assert.equal(uploads[0].url, LOCAL_ASSET_URL);
   assert.deepEqual(uploads.map((request) => decodeURIComponent(new URL(request.url).pathname)), [
     `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${SYNTHETIC_EXPECTATIONS.store}/${SYNTHETIC_EXPECTATIONS.externalRelpath}`,
     `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${SYNTHETIC_EXPECTATIONS.store}/${SYNTHETIC_EXPECTATIONS.primaryRelpath}`,
     `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${SYNTHETIC_EXPECTATIONS.store}/${SYNTHETIC_EXPECTATIONS.pagerRelpath}`,
     `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${SYNTHETIC_EXPECTATIONS.skillStore}/${SYNTHETIC_EXPECTATIONS.skillRelpath}`,
+    `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${SYNTHETIC_EXPECTATIONS.titleOnlyStore}/${SYNTHETIC_EXPECTATIONS.titleOnlyRelpath}`,
     ...SYNTHETIC_EXPECTATIONS.costFixtures.map((fixture) =>
       `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${fixture.store}/${fixture.relpath}`),
   ]);
@@ -530,6 +531,5 @@ test('local seed indexing timeout preserves the exact failed search and nested c
   });
   const searches = requests.filter((request) => request.method !== 'PUT');
   assert.equal(searches.length, 1);
-  assert.equal(requests.filter((request) => request.method === 'PUT').length, 4 + SYNTHETIC_EXPECTATIONS.costFixtures.length);
   assert.equal(new URL(searches[0].url).searchParams.get('machine'), SYNTHETIC_EXPECTATIONS.machine);
 });

@@ -144,6 +144,9 @@ async function createRemoteMigrationFixture(context, { fault, migrationDirectory
   const database = new DatabaseSync(':memory:');
   context.after(() => database.close());
   const { unstable_splitSqlQuery: splitSqlQuery } = await import('wrangler');
+  const expectedMigrationNames = JSON.parse(
+    await readFile(path.join(migrationDirectory, 'manifest.json'), 'utf8'),
+  ).migrations.map(({ filename }) => filename);
   const accountId = '1'.repeat(32);
   const databaseId = 'ac2e6cc9-6ef5-4943-ac40-b7076848bd05';
   const binding = migrationDirectory === migrationsDir ? 'DB' : 'IDX00';
@@ -241,7 +244,12 @@ async function createRemoteMigrationFixture(context, { fault, migrationDirectory
       }
       event.success = true;
       if (fault === 'missing-after-apply' && /INSERT INTO\s+"d1_migrations"/i.test(sql)) {
-        database.exec('DROP TABLE d1_migrations');
+        // Inject a post-apply failure, not a failure midway through a multi-migration apply.
+        const appliedNames = database.prepare('SELECT name FROM d1_migrations ORDER BY id').all().map(({ name }) => name);
+        if (appliedNames.length === expectedMigrationNames.length
+            && appliedNames.every((name, index) => name === expectedMigrationNames[index])) {
+          database.exec('DROP TABLE d1_migrations');
+        }
       }
       send(200, { success: true, result: results, errors: [], messages: [] });
     } catch (error) {
@@ -972,8 +980,8 @@ test('fresh remote shard apply bootstraps through Wrangler and commits the verif
   assert.equal(result.schemaDigest, schemaDigest(schemaSnapshotFromDatabase(remote.database)));
   assert.ok(remote.requests.some(({ sql }) => /^\s*CREATE TABLE IF NOT EXISTS "d1_migrations"/.test(sql ?? '')),
     'normal Wrangler apply must own the canonical ledger bootstrap');
-  assert.equal(remote.requests.filter(({ sql }) => /INSERT INTO\s+"d1_migrations"/i.test(sql ?? '')).length, 1,
-    'Wrangler must really execute the checked-in shard migration');
+  assert.equal(remote.requests.filter(({ sql }) => /INSERT INTO\s+"d1_migrations"/i.test(sql ?? '')).length,
+    fixture.manifest.migrations.length, 'Wrangler must really execute every checked-in shard migration');
   assert.deepEqual(
     remote.database.prepare('SELECT name FROM d1_migrations ORDER BY id').all().map(({ name }) => name),
     fixture.manifest.migrations.map(({ filename }) => filename),
@@ -1085,14 +1093,16 @@ test('a populated remote index without a ledger fails canonical apply and preser
 });
 
 test('a missing remote migration table after Wrangler apply cannot masquerade as a fresh database', async (context) => {
+  const fixture = await loadFixture(indexMigrationsDir);
   const remote = await createRemoteMigrationFixture(context, { fault: 'missing-after-apply' });
   const rejected = await remote.run();
   assert.equal(rejected.signal, null, rejected.stderr);
   assert.notEqual(rejected.status, 0, rejected.stdout);
   assert.match(rejected.stderr, /no such table: d1_migrations/);
   assert.match(rejected.stderr, /\[code: 7500\]/);
-  assert.ok(remote.requests.some(({ sql, success }) => success && /INSERT INTO\s+"d1_migrations"/i.test(sql ?? '')),
-    'the failure must follow genuine schema installation, not the original preflight defect');
+  assert.equal(remote.requests.filter(({ sql, success }) =>
+    success && /INSERT INTO\s+"d1_migrations"/i.test(sql ?? '')).length, fixture.manifest.migrations.length,
+  'the failure must follow every checked-in migration, not interrupt schema installation');
   assert.equal(remote.database.prepare("SELECT COUNT(*) AS count FROM sqlite_master WHERE name = 'blocks'").get().count, 1);
   assert.equal(remote.database.prepare('SELECT COUNT(*) AS count FROM migration_checksum_ledger').get().count, 0);
   const journal = JSON.parse(await readFile(remote.options.journalPath, 'utf8'));

@@ -24,6 +24,7 @@ const SHARD_HIT_PAGE_SIZE = 256;
 
 interface SearchRow {
   id: number;
+  match_kind: 'block' | 'title';
   rank: number;
   duration_seconds: number | null;
   total_tokens: number;
@@ -44,7 +45,7 @@ function compareHits(a: SearchRow, b: SearchRow, sort: string | null): number {
   if (sort === 'session_time') primary = compareNumber(b.duration_seconds, a.duration_seconds);
   if (sort === 'total_tokens') primary = compareNumber(b.total_tokens, a.total_tokens);
   if (sort === 'cost') primary = compareNumber(b.subtree_usd, a.subtree_usd);
-  return primary || compareNumber(a.rank, b.rank) || a.id - b.id;
+  return primary || compareNumber(a.rank, b.rank) || compareText(a.match_kind, b.match_kind) || a.id - b.id;
 }
 
 /** BINARY text order is UTF-8/code-point order, not locale or JS UTF-16 order. */
@@ -100,13 +101,13 @@ function costRollupJoin(): string {
 }
 
 function searchOrder(sort: string | null): string {
-  if (sort === 'session_time') return `ORDER BY ${sessionDurationSql('s')} DESC, rank, b.id`;
-  if (sort === 'total_tokens') return `ORDER BY ${totalTokensSql('s')} DESC, rank, b.id`;
+  if (sort === 'session_time') return `ORDER BY ${sessionDurationSql('s')} DESC, rank, b.match_kind, b.id`;
+  if (sort === 'total_tokens') return `ORDER BY ${totalTokensSql('s')} DESC, rank, b.match_kind, b.id`;
   // Unpriced subtrees last: sorting "no known cost" as if it were $0 would bury every session we
   // could not price at the cheap end of a cost ranking. `rank` still breaks ties, so hits within
   // one session stay in relevance order.
-  if (sort === 'cost') return 'ORDER BY (c.usd IS NULL) ASC, c.usd DESC, rank, b.id';
-  return 'ORDER BY rank, b.id';
+  if (sort === 'cost') return 'ORDER BY (c.usd IS NULL) ASC, c.usd DESC, rank, b.match_kind, b.id';
+  return 'ORDER BY rank, b.match_kind, b.id';
 }
 
 /** @internal Exported so the query-plan regression exercises the exact production query. */
@@ -116,29 +117,45 @@ export function searchHitsSql(
   sort: string | null,
   limit: number,
   offset: number,
+  includeTitles = true,
 ): string {
   // The rollup is joined for the cost sort and for a selected cost band; `where` never contains
   // the band, so the CTE's roots stay independent of what the band filters.
   const cost = sort === 'cost' || costWhere !== '';
+  // Each source remains FTS-driven. A title hit has no transcript coordinates; keep it distinct
+  // from real block hits, even when both match. The title catalog is replicated, so only shard
+  // zero emits those hits. The merge's final (kind, id) key disambiguates the two rowid domains.
+  const matching = `SELECT b.id, b.session_id, b.turn_index, b.block_index, b.role, b.btype, b.tool_name, b.ts,
+                          'block' AS match_kind,
+                          snippet(blocks_fts, 0, '<mark>', '</mark>', '…', 16) AS snip,
+                          bm25(blocks_fts) AS rank
+                     FROM blocks_fts JOIN blocks b ON b.id = blocks_fts.rowid
+                    WHERE blocks_fts MATCH ?1${includeTitles ? `
+                    UNION ALL
+                   SELECT s.rowid AS id, s.session_id, NULL, NULL, NULL, NULL, NULL, NULL,
+                          'title' AS match_kind,
+                          snippet(session_titles_fts, -1, '<mark>', '</mark>', '…', 16) AS snip,
+                          bm25(session_titles_fts) AS rank
+                     FROM session_titles_fts JOIN sessions s ON s.rowid = session_titles_fts.rowid
+                    WHERE session_titles_fts MATCH ?1` : ''}`;
   return `${cost ? costRollupCte(where) : ''}SELECT b.id, b.session_id, b.turn_index, b.block_index, b.role, b.btype, b.tool_name, b.ts,
-                 snippet(blocks_fts, 0, '<mark>', '</mark>', '…', 16) AS snip,
-                 bm25(blocks_fts) AS rank,
+                 b.match_kind, b.snip, b.rank,
                  s.harness, s.machine_id, s.os, s.cwd, s.repo_url, s.primary_model, ${subagentSessionSql('s')} AS subagent,
                  s.first_interaction_title, s.title AS stored_title, s.started_at, s.index_state,
                  ${sessionDurationSql('s')} AS duration_seconds, ${totalTokensSql('s')} AS total_tokens,
                  ${cost ? `${SUBTREE_COST_ALIAS}.usd` : 'NULL'} AS subtree_usd
-          FROM blocks_fts
-          JOIN blocks b ON b.id = blocks_fts.rowid
+          FROM (${matching}) b
           JOIN sessions s ON s.session_id = b.session_id
           ${cost ? costRollupJoin() : ''}
-          WHERE blocks_fts MATCH ?1 ${where} ${costWhere ? `AND ${costWhere}` : ''}
+          WHERE 1 = 1 ${where} ${costWhere ? `AND ${costWhere}` : ''}
           ${searchOrder(sort)} LIMIT ${limit + 1} OFFSET ${offset}`;
 }
 
 export interface SearchHit {
   session_id: string;
   snippet: string;
-  block: { turn_index: number; block_index: number; role: string; btype: string; tool_name: string | null; ts: string | null };
+  match_kind: 'block' | 'title';
+  block: { turn_index: number; block_index: number; role: string; btype: string; tool_name: string | null; ts: string | null } | null;
   session: {
     harness: string;
     machine_id: string | null;
@@ -163,7 +180,7 @@ export interface SearchResult {
   status?: 400 | 503;
 }
 
-/** Core FTS search over blocks with session-level filters and optional facet counts. Shared by the API and the viewer. */
+/** Core FTS search over blocks and titles with session-level filters and optional facet counts. Shared by the API and viewer. */
 export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } = {}): Promise<SearchResult> {
   const q = url.searchParams.get('q')?.trim() ?? '';
   const limit = clampLimit(url.searchParams.get('limit'), DEFAULT_RESULT_PAGE_SIZE, DEFAULT_RESULT_PAGE_SIZE);
@@ -231,10 +248,10 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
     return ftsProbeOk(db, '"x"');
   };
   const sort = p.get('sort');
-  const readPage = async (db: D1Database, match: string, localOffset: number): Promise<SearchRow[] | null> => {
+  const readPage = async (db: D1Database, match: string, localOffset: number, includeTitles: boolean): Promise<SearchRow[] | null> => {
     try {
       const rows = await db.prepare(
-        searchHitsSql(where, costWhere, sort, shardPageSize, localOffset),
+        searchHitsSql(where, costWhere, sort, shardPageSize, localOffset, includeTitles),
       ).bind(match, ...binds).all<SearchRow>();
       return rows.results;
     } catch (e) {
@@ -246,7 +263,7 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
     // Do not allocate offset+limit hits per shard. Each sorted stream holds one bounded page;
     // only the stream whose head wins the merge can need another page.
     const dbs = indexDbs(env);
-    const initial = await mapIndexDbs(env, (db) => readPage(db, match, 0));
+    const initial = await mapIndexDbs(env, (db, shard) => readPage(db, match, 0, shard === 0));
     if (initial.some((rows) => rows === null)) return null;
     const streams = initial.map((rows, shard) => ({
       db: dbs[shard]!,
@@ -272,7 +289,7 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
       if (merged.length === limit + 1) break;
       stream.position++;
       if (stream.position === stream.rows.length && !stream.done) {
-        const rows = await readPage(stream.db, match, stream.nextOffset);
+        const rows = await readPage(stream.db, match, stream.nextOffset, shard === 0);
         if (rows === null) return null;
         stream.rows = rows;
         stream.position = 0;
@@ -318,7 +335,8 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   const hits: SearchHit[] = returnedResults.map((r) => ({
     session_id: r.session_id as string,
     snippet: r.snip as string,
-    block: {
+    match_kind: r.match_kind,
+    block: r.match_kind === 'title' ? null : {
       turn_index: r.turn_index as number,
       block_index: r.block_index as number,
       role: r.role as string,
@@ -352,7 +370,7 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   // facets clause would ALSO reject. Skip it and report empty facets rather than retrying with a
   // match string already known to be broken.
   if (wantFacets && effectiveMatch !== null) {
-    const shardFacets = await mapIndexDbs(env, async (db) => {
+    const shardFacets = await mapIndexDbs(env, async (db, shard) => {
       const statements = FACET_DEFINITIONS.map((definition) => {
         const filter = buildSessionFilterSql(p, 's', 2, definition.key);
         const filtered = filter.clause ? ` AND ${filter.clause}` : '';
@@ -361,12 +379,20 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
         // to another shard. Omit only this facet's own selected predicate, as before.
         const rollup = definition.kind === 'cost' || filter.costClause !== '';
         const banded = filter.costClause ? ` AND ${filter.costClause}` : '';
+        // Every title is emitted from shard zero, regardless of its transcript's home shard.
+        // Count title-matching sessions there only; other shards subtract them from their block
+        // match set. UNION also counts a title+block session only once on shard zero.
+        const titleSessions = `SELECT s.session_id FROM session_titles_fts
+          JOIN sessions s ON s.rowid = session_titles_fts.rowid WHERE session_titles_fts MATCH ?1`;
+        const matchedSessions = `SELECT b.session_id FROM blocks_fts
+          JOIN blocks b ON b.id = blocks_fts.rowid WHERE blocks_fts MATCH ?1
+          ${shard === 0 ? 'UNION' : 'EXCEPT'} ${titleSessions}`;
         return db.prepare(
           `${rollup ? costRollupCte(filter.clause ? `AND ${filter.clause}` : '') : ''}` +
           `SELECT ${expression} AS v, COUNT(DISTINCT s.session_id) AS n
-           FROM blocks_fts JOIN blocks b ON b.id = blocks_fts.rowid JOIN sessions s ON s.session_id = b.session_id
+           FROM (${matchedSessions}) matched JOIN sessions s ON s.session_id = matched.session_id
            ${rollup ? costRollupJoin() : ''}
-           WHERE blocks_fts MATCH ?1${filtered}${banded} AND ${expression} IS NOT NULL
+           WHERE 1 = 1${filtered}${banded} AND ${expression} IS NOT NULL
            GROUP BY v ORDER BY ${facetOrderSql(definition)}`,
         ).bind(effectiveMatch, ...filter.binds);
       });
@@ -405,7 +431,7 @@ export async function runSearch(url: URL, env: Env, opts: { facets?: boolean } =
   };
 }
 
-/** GET /api/v1/search — FTS over blocks with session-level filters and facet counts. */
+/** GET /api/v1/search — FTS over blocks and titles with session-level filters and facet counts. */
 export async function search(url: URL, env: Env): Promise<Response> {
   const result = await runSearch(url, env);
   if (result.error) return Response.json({ error: result.error }, { status: result.status ?? 400 });

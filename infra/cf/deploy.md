@@ -446,6 +446,8 @@ can finalize it from durable history with a fresh, identity-bound journal.
 This is the documented command contract, not an empirical reconstruction of
 the original timeout. The verifier's returned schema digest is a live
 measurement, not a comparison against canonical object definitions.
+Local and remote schema snapshots include the same table and view column metadata;
+external-content FTS views are part of that digest, not omitted from remote readback.
 
 The ordered native 16-shard rehearsal passed completed-copy re-entry, apply,
 catalog seeding and READY with the full real-time drain. It used 32 synthetic

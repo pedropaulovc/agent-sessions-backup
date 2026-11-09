@@ -10,6 +10,8 @@
 // identically, and an older (late, concurrent) sync changes nothing. A session absent from main is
 // recorded as a tombstone (presence 'deleted'), so a late older sync cannot resurrect it. Stars always
 // mirror main's starred_turns for the session, which survive a session delete exactly as on main.
+// Shard session triggers maintain session_titles_fts in these same version-fenced transactions.
+// No parser replay or separate title-index reconciliation is needed for metadata-only changes.
 //
 // Writers call syncSessionCatalog with the ids they changed after their main commit. Once every
 // shard has accepted a version, the sync retires that session's outbox entries up to it. The outbox

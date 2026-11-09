@@ -92,7 +92,7 @@ async function search(params: URLSearchParams): Promise<SearchResult> {
 }
 
 function hitKey(hit: SearchHit): string {
-  return `${hit.session_id}:${hit.block.turn_index}:${hit.block.block_index}`;
+  return hit.block ? `${hit.session_id}:${hit.block.turn_index}:${hit.block.block_index}` : `${hit.session_id}:title`;
 }
 
 function fixtureKey(block: BlockFixture): string {

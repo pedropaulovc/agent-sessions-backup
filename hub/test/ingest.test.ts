@@ -797,12 +797,13 @@ describe('a canonical file reparsed to zero turns clears the stale index and rec
       .first<{ parse_state: string }>();
     expect(rowA?.parse_state).toBe('error');
 
-    const sessionAfterGarbage = await testEnv.DB.prepare('SELECT canonical_file_id, index_state, first_interaction_title FROM sessions WHERE session_id = ?1')
+    const sessionAfterGarbage = await testEnv.DB.prepare('SELECT canonical_file_id, index_state, title, first_interaction_title FROM sessions WHERE session_id = ?1')
       .bind(SESSION_ID)
-      .first<{ canonical_file_id: number; index_state: string; first_interaction_title: string | null }>();
+      .first<{ canonical_file_id: number; index_state: string; title: string | null; first_interaction_title: string | null }>();
     expect(sessionAfterGarbage?.index_state).toBe('error');
     expect(sessionAfterGarbage?.canonical_file_id).toBe(fileIdA); // kept so raw access still resolves
-    // The derived title is cleared with the blocks it came from — no stale title survives the wipe.
+    // Both stored and derived titles came from the old bytes; neither may keep stale search hits.
+    expect(sessionAfterGarbage?.title).toBe(null);
     expect(sessionAfterGarbage?.first_interaction_title).toBe(null);
 
     const blocksLeft = await indexDbFor(testEnv, SESSION_ID).prepare('SELECT COUNT(*) AS n FROM blocks WHERE session_id = ?1')

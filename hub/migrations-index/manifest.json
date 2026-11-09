@@ -8,6 +8,11 @@
       "sequence": 1,
       "filename": "0001_index_init.sql",
       "sha256": "df97dfff02fb5ab7c4f6c25570a30dce0e53340e0398d7195f4ee0a3931032c6"
+    },
+    {
+      "sequence": 2,
+      "filename": "0002_session_title_search.sql",
+      "sha256": "491ab7743882b1b6aa343719208626cd327bf609fc5ab1f97476c7897225f840"
     }
   ]
 }
