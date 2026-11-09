@@ -16,7 +16,7 @@ const CLOUDFLARE_404 = '<!DOCTYPE html><html><head><title>Page not found</title>
 const controller = process.env.PREVIEW_CONTROL_PATH
   ?? fileURLToPath(new URL('../../infra/cf/preview-control.mjs', import.meta.url));
 
-async function runSeed(scenario) {
+async function runSeed(scenario, { local = false } = {}) {
   const temporary = await mkdtemp(path.join(os.tmpdir(), 'preview-seed-test-'));
   const reportPath = path.join(temporary, 'report.json');
   const preload = path.join(temporary, 'preload.mjs');
@@ -82,7 +82,8 @@ async function runSeed(scenario) {
           // subagent=yes must observe nothing here too — the probe, not the index, is at fault.
           const hidden = fixture?.kind === 'subagent' && url.searchParams.get('subagent') !== 'yes';
           const sessionId = query === expected.searchPhrase ? expected.primarySessionId
-            : query === expected.pagerSearchPhrase ? expected.pagerSessionId
+            : query === expected.pagerSearchPhrase || query === 'stable second page' ? expected.pagerSessionId
+            : query === expected.titleOnlyBodySearchPhrase ? expected.titleOnlySessionId
             : fixture && !hidden ? fixture.sessionId : null;
           response = Response.json({ hits: sessionId ? [{ session_id: sessionId }] : [] });
         } else {
@@ -92,9 +93,12 @@ async function runSeed(scenario) {
         return response;
       };
     `);
-    const result = spawnSync(process.execPath, [
-      '--import', pathToFileURL(preload).href, controller, 'seed', '--pr', '150', '--repository', 'example/sessions',
-    ], {
+    const localSeeder = new URL('../scripts/lib/dev-seed.mjs', import.meta.url).href;
+    const args = local
+      ? ['--import', pathToFileURL(preload).href, '--input-type=module', '--eval',
+        `import { seedSynthetic } from ${JSON.stringify(localSeeder)}; await seedSynthetic(${JSON.stringify(ORIGIN)});`]
+      : ['--import', pathToFileURL(preload).href, controller, 'seed', '--pr', '150', '--repository', 'example/sessions'];
+    const result = spawnSync(process.execPath, args, {
       encoding: 'utf8', timeout: 10_000,
       env: { ...process.env, PREVIEW_BEARER_SEED: SEED },
     });
@@ -118,6 +122,36 @@ async function runSeed(scenario) {
   }
 }
 
+function assertTitleOnlyFixture(result) {
+  const expected = SYNTHETIC_EXPECTATIONS;
+  const target = `/api/v1/files/${expected.machine}/${expected.titleOnlyStore}/${expected.titleOnlyRelpath}`;
+  const uploads = result.requests.filter((request) => request.method === 'PUT'
+    && decodeURIComponent(new URL(request.url).pathname) === target);
+  assert.equal(uploads.length, 1, 'the independent seeder must upload the title-only OMP fixture once');
+  const entries = Buffer.from(uploads[0].body, 'base64').toString('utf8').trim().split('\n').map(JSON.parse);
+  assert.deepEqual(entries.map((entry) => entry.type), ['title', 'session', 'title_change', 'message']);
+  assert.equal(entries[0].title, 'SQUARE: Square up tapered bar stock');
+  assert.equal(entries[1].title, expected.titleOnlyTitle);
+  assert.equal(entries[2].title, expected.titleOnlyTitle);
+  const message = entries[3].message;
+  assert.equal(message.role, 'user');
+  assert.deepEqual(message.content, [{ type: 'text', text: 'Observe the synthetic lavender lantern fixture.' }]);
+  assert.ok(!JSON.stringify(message).toLowerCase().includes('square'),
+    'title query must not match transcript content');
+  const queries = result.requests.filter((request) => request.method === 'GET')
+    .map((request) => new URL(request.url).searchParams.get('q'));
+  assert.equal(queries.filter((query) => query === expected.titleOnlyBodySearchPhrase).length, 1,
+    'readiness must prove the title-only fixture indexed through its unrelated transcript');
+  assert.ok(!queries.includes(expected.titleOnlySearchPhrase) && !queries.includes(expected.titleOnlyTitle),
+    'provisioning must not depend on title search being deployed');
+}
+
+test('local seeder independently uploads the title-only fixture and probes its transcript', async () => {
+  const result = await runSeed({ failures: 0 }, { local: true });
+  assert.equal(result.status, 0, result.output);
+  assertTitleOnlyFixture(result);
+});
+
 test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then observes indexed sessions', async () => {
   const result = await runSeed({});
   assert.equal(result.status, 0, result.output);
@@ -127,8 +161,8 @@ test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then o
   assert.ok(result.requests.every((request) =>
     request.method === 'PUT' ? new URL(request.url).pathname.startsWith('/api/v1/files/')
       : new URL(request.url).pathname === '/api/v1/search'));
-  // Asset, primary, pager, skill and one file per cost fixture, plus the replayed first upload.
-  const distinctUploads = 4 + SYNTHETIC_EXPECTATIONS.costFixtures.length;
+  // Asset, primary, pager, skill, title-only and one file per cost fixture, plus the replay.
+  const distinctUploads = 5 + SYNTHETIC_EXPECTATIONS.costFixtures.length;
   assert.equal(uploads.length, distinctUploads + 1);
   const { budget: firstBudget, started: firstStarted, ...first } = uploads[0];
   const { budget: secondBudget, started: secondStarted, ...second } = uploads[1];
@@ -148,6 +182,7 @@ test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then o
   const skillUpload = uploads.find((upload) => upload.url === `${ORIGIN}${SKILL_PATH}`);
   assert.ok(skillUpload, 'the managed skill package must be uploaded');
   assert.match(Buffer.from(skillUpload.body, 'base64').toString('utf8'), new RegExp(SYNTHETIC_EXPECTATIONS.skillSourceMarker));
+  assertTitleOnlyFixture(result);
   // The /reports page has nothing to aggregate unless the bytes carrying the `xd://report_issue`
   // calls reach the preview too. The browser suite only ever sees the LOCAL seeder, so without
   // this a green Playwright run can sit beside a deployed preview whose report list is empty —
@@ -164,13 +199,14 @@ test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then o
     assert.ok(transcript.includes(report.body), `${fixture.file} must carry its report body verbatim`);
   }
   // One indexing probe per seeded session, and every response body read exactly once.
-  const probes = 2 + SYNTHETIC_EXPECTATIONS.costFixtures.length;
+  const probes = 3 + SYNTHETIC_EXPECTATIONS.costFixtures.length;
   assert.equal(result.requests.filter((request) => request.method === 'GET').length, probes);
   assert.deepEqual(result.consumed, new Array(uploads.length + probes).fill(true));
   const summary = JSON.parse(result.stdout.trim().split('\n').at(-1));
   assert.deepEqual(summary.seeded, [
     SYNTHETIC_EXPECTATIONS.primarySessionId,
     SYNTHETIC_EXPECTATIONS.pagerSessionId,
+    SYNTHETIC_EXPECTATIONS.titleOnlySessionId,
     ...SYNTHETIC_EXPECTATIONS.costFixtures.map((fixture) => fixture.sessionId),
   ]);
   assert.ok(result.output.includes(ASSET_PATH), result.output);

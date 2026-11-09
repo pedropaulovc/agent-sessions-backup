@@ -1,3 +1,4 @@
+import { fileURLToPath } from 'node:url';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { HUB_ROOT } from './dev-paths.mjs';
@@ -20,6 +21,23 @@ const EXTERNAL_RELPATH = `${PRIMARY_RELPATH}.assets/${EXTERNAL_DIGEST}/fixture-e
 const SKILL_STORE = 'omp-skills';
 const SKILL_NAME = 'e2e-managed-skill';
 const SKILL_RELPATH = `${SKILL_NAME}/SKILL.md`;
+
+const TITLE_ONLY_SESSION_ID = '00000000-0000-4000-8000-000000000005';
+const TITLE_ONLY_RELPATH = `-workspace-e2e-fixtures/2026-07-03_${TITLE_ONLY_SESSION_ID}.jsonl`;
+const TITLE_ONLY_TITLE = 'SQUARE: Square up tapered bar stock';
+const TITLE_ONLY_BODY = 'Observe the synthetic lavender lantern fixture.';
+
+// Kept independent of the preview seeder so either upload path can regress on its own.
+function titleOnlySessionBytes() {
+  return Buffer.from([
+    { type: 'title', title: TITLE_ONLY_TITLE },
+    { type: 'session', version: '0.9.7', title: TITLE_ONLY_TITLE, cwd: '/workspace/e2e-fixtures', timestamp: '2026-07-03T10:00:00.000Z' },
+    { type: 'title_change', title: TITLE_ONLY_TITLE },
+    { type: 'message', id: 'title-only-u1', timestamp: '2026-07-03T10:00:01.000Z', message: {
+      role: 'user', content: [{ type: 'text', text: TITLE_ONLY_BODY }], timestamp: '2026-07-03T10:00:01.000Z',
+    } },
+  ].map((entry) => JSON.stringify(entry)).join('\n') + '\n');
+}
 
 // The cost fan-out fixture: one OMP main session plus three subagent sidecars, each on a
 // different model. It exists because a viewer that shows money must be provable with money on
@@ -191,6 +209,13 @@ export const SYNTHETIC_EXPECTATIONS = Object.freeze({
   pagerRelpath: PAGER_RELPATH,
   pagerSearchPhrase: 'machine-filtered',
   searchPhrase: 'saffron telescope',
+  titleOnlySessionId: TITLE_ONLY_SESSION_ID,
+  titleOnlyStore: 'omp',
+  titleOnlyRelpath: TITLE_ONLY_RELPATH,
+  titleOnlyTitle: TITLE_ONLY_TITLE,
+  titleOnlySearchPhrase: 'Square up tapered bar stock',
+  titleOnlyBody: TITLE_ONLY_BODY,
+  titleOnlyBodySearchPhrase: 'lavender lantern',
   externalDigest: EXTERNAL_DIGEST,
   externalFileName: 'fixture-external.png',
   externalRelpath: EXTERNAL_RELPATH,
@@ -275,7 +300,7 @@ export const SYNTHETIC_EXPECTATIONS = Object.freeze({
 
 export async function syntheticSeedManifest() {
   return seedManifest([
-    PRIMARY, PAGER, EXTERNAL_BASE64, SKILL,
+    PRIMARY, PAGER, EXTERNAL_BASE64, SKILL, fileURLToPath(import.meta.url),
     ...COST_FIXTURES.map((fixture) => join(FIXTURE_DIR, fixture.file)),
   ]);
 }
@@ -345,6 +370,7 @@ export async function seedSynthetic(baseUrl, timeoutMs = 30_000, expectedDigest)
   await upload(baseUrl, STORE, PRIMARY_RELPATH, primary);
   await upload(baseUrl, STORE, PAGER_RELPATH, pager);
   await upload(baseUrl, SKILL_STORE, SKILL_RELPATH, skill);
+  await upload(baseUrl, 'omp', TITLE_ONLY_RELPATH, titleOnlySessionBytes());
   // The parent goes up before its sidecars so a subagent row never briefly points at a missing
   // parent, which is also the order the collector produces them in.
   for (const fixture of COST_FIXTURES) {
@@ -356,6 +382,8 @@ export async function seedSynthetic(baseUrl, timeoutMs = 30_000, expectedDigest)
   const probe = (sessionId, marker, kind) => waitForIndexed(baseUrl, sessionId, marker, Date.now() + timeoutMs, kind);
   await probe(PRIMARY_SESSION_ID, 'saffron telescope');
   await probe(PAGER_SESSION_ID, 'stable second page');
+  // Provisioning proves ingestion through transcript content, not the title-search feature.
+  await probe(TITLE_ONLY_SESSION_ID, SYNTHETIC_EXPECTATIONS.titleOnlyBodySearchPhrase);
   for (const fixture of COST_FIXTURES) await probe(fixture.sessionId, fixture.marker, fixture.kind);
   return SYNTHETIC_EXPECTATIONS;
 }
