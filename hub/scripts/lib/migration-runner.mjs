@@ -314,9 +314,11 @@ async function remoteSchemaSnapshot(client) {
        AND name NOT GLOB '_cf_*' AND name <> 'd1_migrations'
      ORDER BY type, name
   `);
+  // Match schemaSnapshotFromDatabase: views expose columns too (including title FTS content
+  // views), even though they have no physical indexes or foreign keys of their own.
   const tableColumns = await client.query(`
     SELECT m.name AS table_name, p.* FROM sqlite_master AS m, pragma_table_xinfo(m.name) AS p
-     WHERE m.type = 'table'
+     WHERE m.type IN ('table', 'view')
        AND m.name IN (SELECT name FROM pragma_table_list() WHERE schema = 'main' AND type <> 'shadow')
        AND m.name NOT LIKE 'sqlite_%' AND m.name NOT GLOB '_cf_*' AND m.name <> 'd1_migrations'
      ORDER BY m.name, p.cid
