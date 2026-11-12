@@ -346,7 +346,7 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
                 if assets_res.error:
                     errors += 1
             # Only a complete walk proves a parent is gone; a missing root, an unreadable
-            # subtree, an entry that failed to stat, or an empty (e.g. unmounted) mountpoint
+            # subtree, an existing entry that could not be read, or an empty (e.g. unmounted) mountpoint
             # would otherwise forget warnings that are still current.
             if seen and scanner.walk_state(store) == WALK_COMPLETE:
                 st.prune_asset_events(store, seen)
