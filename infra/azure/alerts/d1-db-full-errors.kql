@@ -39,10 +39,11 @@ otel
 | where TimeGenerated > ago(1h)
 | where ServiceName == 'sessions-hub'
 | where Body contains "D1_ERROR"
-| extend event = tostring(todynamic(Body).event)
+| extend body = todynamic(Body)
+| extend event = tostring(body.event)
 | extend d1_error = case(
     Body startswith_cs "D1_ERROR", Body,
-    isnotempty(event) and event != "collector.event" and not(event startswith_cs "access."), tostring(todynamic(Body).error),
+    isnotempty(event) and event != "collector.event" and not(event startswith_cs "access."), tostring(body.error),
     "")
 | where d1_error startswith_cs "D1_ERROR" or d1_error startswith_cs "Error: D1_ERROR"
 | where d1_error contains "SQLITE_FULL"
