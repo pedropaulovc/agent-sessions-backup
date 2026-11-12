@@ -82,20 +82,29 @@ az monitor scheduled-query show --subscription "$SUBSCRIPTION_ID" \
 The command fails unless the deployed query matches the file and readback is 1h/24h/24h.
 
 **Creating a NEW alert** needs `create`, not `update` (update fails on a nonexistent alert), and
-unlike update it needs the scope/location/severity/action-group too — values used 2026-07-28:
+unlike update it needs the scope/location/severity/action-group too. Take the rule's window,
+frequency, and severity from `alert_window_for()`, `alert_frequency_for()`, and
+`alert_severity_for()` in provision.sh — never hardcode them (e.g. `d1-size-forecast` is 48h/1h,
+`fleet-heartbeat-silent` 2h/15m, `d1-size-critical` 1h/15m Sev1, `d1-db-full-errors` 1h/15m Sev1):
 ```
 az monitor scheduled-query create --name agent-backup-<base> --resource-group rg-agent-backup \
   --scopes "$(az monitor log-analytics workspace show -g rg-agent-backup -n law-agent-backup --query id -o tsv)" \
   --location westus2 --condition "count 'Placeholder_1' > 0" \
   --condition-query Placeholder_1="$(cat infra/azure/alerts/<base>.kql)" \
-  --evaluation-frequency 1h --window-size 1h --severity 2 \
+  --evaluation-frequency <alert_frequency_for> --window-size <alert_window_for> \
+  --severity <alert_severity_for> \
   --action-groups "$(az monitor action-group show -g rg-agent-backup -n ag-pedro-email --query id -o tsv)" \
   --skip-query-validation true
 ```
-For a new `collector-errors` rule, use the 1h frequency and 24h window, then set
-`overrideQueryTimeRange` to `P1D` as in the collector-specific procedure above.
-Register its window in `alert_window_for()` and, when different, its frequency in
-`alert_frequency_for()` in provision.sh; provisioning reconciles query and timing drift.
+When provision.sh's query-range case lists the rule — `P1D` for `collector-errors` (see the
+collector-specific procedure above), `P2D` for `d1-size-forecast` and `session-rollup-missing`,
+`PT1H` for `session-rollup-errors` — reconcile `overrideQueryTimeRange` with the `az rest` patch
+and readback in the rollup procedure below. A freshly created rule already queries its full
+window (the range defaults to `--window-size`), so this is a no-op there; it guards an existing
+rule against a pre-existing shorter override that would silently truncate the query.
+Register a new rule's window in `alert_window_for()` and, when different, its frequency in
+`alert_frequency_for()` and severity in `alert_severity_for()` in provision.sh; provisioning
+reconciles query, timing, severity, and query-range drift.
 
 `<base>` = the .kql basename (e.g. `parse-errors` → alert `agent-backup-parse-errors`). The shared
 `count 'Placeholder_1' > 0` condition is generic across all alerts, so any summarize/threshold logic
@@ -216,7 +225,8 @@ The missing rule uses the supported 48h scan window with hourly evaluation; KQL
 itself applies the exact 26h horizon. Do not change the frequency to 26h or shrink
 its window to 1h. Provisioning and the surgical commands explicitly reconcile
 `overrideQueryTimeRange` to `P2D` for missing completion, `P1D` for collector
-errors, and `PT1H` for rollup errors, then fail on a readback mismatch (equivalent
+errors, and `PT1H` for rollup errors (provisioning also reconciles `P2D` for
+`d1-size-forecast`), then fail on a readback mismatch (equivalent
 ISO duration spellings are accepted). This prevents a preexisting short override
 from silently truncating these queries.
 The current [scheduled-query CLI](https://learn.microsoft.com/en-us/cli/azure/monitor/scheduled-query)

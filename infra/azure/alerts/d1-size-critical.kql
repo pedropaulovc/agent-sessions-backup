@@ -1,0 +1,26 @@
+// Sev1: fires when any D1 database's latest size gauge exceeds 9 GiB
+// (9,663,676,416 bytes, ~97% of the cap). The 7 GiB warning stays in
+// d1-size.kql at Sev2; this rule labels an imminent write outage Sev1 (same
+// email action group as every rule — see provision.sh alert_severity_for).
+//
+// D1's hard cap is 10 GB decimal: production `main` plateaued at
+// 9,999,998,976 bytes when writes began failing with `Exceeded maximum DB size`
+// (2026-11-12 00:05 UTC). At the observed ~0.6 GB/day growth, 9 GiB leaves
+// roughly half a day of headroom; d1-size-forecast.kql alerts earlier on rate.
+//
+// Failed probes (bytes=-1) are excluded: probe failure is owned by d1-size.kql.
+// Source and database defaulting match d1-size.kql. A 1h window always holds
+// the */15 watchdog gauge; provision.sh evaluates every 15m and sets Sev1.
+let otel = union isfuzzy=true
+    (datatable(TimeGenerated:datetime, Body:string, ServiceName:string)[]),
+    (OTelLogs | project TimeGenerated, Body, ServiceName);
+otel
+| where TimeGenerated > ago(1h)
+| where ServiceName == 'sessions-hub'
+| extend body = todynamic(Body)
+| where body.event == "hub.d1.db_size_bytes"
+| extend bytes = tolong(body.bytes), database = iff(isempty(tostring(body.database)), "main", tostring(body.database))
+| where bytes >= 0
+| summarize arg_max(TimeGenerated, bytes) by database
+| where bytes > 9 * 1024 * 1024 * 1024
+| project TimeGenerated, database, bytes

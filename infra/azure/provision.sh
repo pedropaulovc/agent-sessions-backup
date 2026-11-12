@@ -347,6 +347,10 @@ alert_window_for() {
         missed-heartbeat) echo "1h" ;;
         collector-errors) echo "24h" ;;
         d1-size) echo "1h" ;;
+        d1-size-critical) echo "1h" ;;
+        d1-size-forecast) echo "48h" ;;
+        d1-db-full-errors) echo "1h" ;;
+        fleet-heartbeat-silent) echo "2h" ;;
         cf-auth-failed) echo "1h" ;;
         cert-orphan-leaked) echo "1h" ;;
         collector-outdated) echo "1h" ;;
@@ -358,14 +362,33 @@ alert_window_for() {
 }
 
 # The collector KQL filters to 7h within Azure's 24h query range but still
-# evaluates hourly. Rollup liveness similarly scans 26h within a 48h window.
-# Error scans overlap to tolerate ingestion delay at evaluation boundaries.
+# evaluates hourly. Rollup liveness similarly scans 26h within a 48h window, and
+# the D1 growth forecast fits 48h of gauges hourly. Error scans (rollup errors,
+# D1 capacity errors) overlap to tolerate ingestion delay at evaluation
+# boundaries. The D1 critical size and fleet heartbeat silence rules evaluate at
+# the */15 watchdog cadence.
 alert_frequency_for() {
     case "$1" in
         collector-errors) echo "1h" ;;
+        d1-db-full-errors) echo "15m" ;;
+        d1-size-critical) echo "15m" ;;
+        d1-size-forecast) echo "1h" ;;
+        fleet-heartbeat-silent) echo "15m" ;;
         session-rollup-errors) echo "15m" ;;
         session-rollup-missing) echo "1h" ;;
         *) alert_window_for "$1" ;;
+    esac
+}
+
+# Sev1 marks an imminent or actual D1 write outage; everything else is Sev2.
+# Severity is a label only: every rule notifies through the same email-only
+# action group ($AG_NAME), so a Sev1 arrives exactly like a Sev2. Escalating
+# Sev1 (SMS, push, or voice) needs a separate action group.
+alert_severity_for() {
+    case "$1" in
+        d1-size-critical) echo "1" ;;
+        d1-db-full-errors) echo "1" ;;
+        *) echo "2" ;;
     esac
 }
 
@@ -383,6 +406,7 @@ for kql_file in "$REPO_ROOT"/infra/azure/alerts/*.kql; do
     alert_name="agent-backup-$base_name"
     window=$(alert_window_for "$base_name")
     frequency=$(alert_frequency_for "$base_name")
+    severity=$(alert_severity_for "$base_name")
     query=$(cat "$kql_file")
 
     # --skip-query-validation: this script can run before the gateway has ever
@@ -399,25 +423,27 @@ for kql_file in "$REPO_ROOT"/infra/azure/alerts/*.kql; do
             --condition-query Placeholder_1="$query" \
             --description "agent-sessions-backup: $base_name (see infra/azure/alerts/$base_name.kql)" \
             --evaluation-frequency "$frequency" --window-size "$window" \
-            --severity 2 --action-groups "$AG_ID" --skip-query-validation true --only-show-errors >/dev/null
+            --severity "$severity" --action-groups "$AG_ID" --skip-query-validation true --only-show-errors >/dev/null
         alert_action="created"
     else
-        # Reconcile both query and timing drift. Normalize Azure ISO durations
-        # before comparing: 48h can round-trip as P2D rather than PT48H.
+        # Reconcile query, timing, and severity drift. Normalize Azure ISO
+        # durations before comparing: 48h can round-trip as P2D rather than PT48H.
         CURRENT_RULE=$(az monitor scheduled-query show --name "$alert_name" --resource-group "$RG_NAME" -o json)
         CURRENT_QUERY=$(printf '%s' "$CURRENT_RULE" | jq -r '.criteria.allOf[0].query')
         CURRENT_TIMING=$(printf '%s' "$CURRENT_RULE" | jq -r "$ISO_DURATION_MINUTES
             [(.evaluationFrequency | minutes), (.windowSize | minutes)] | @tsv")
+        CURRENT_SEVERITY=$(printf '%s' "$CURRENT_RULE" | jq -r '.severity')
         EXPECTED_TIMING=$(jq -nr --arg frequency "$frequency" --arg window "$window" '
             def minutes:
                 capture("^(?<n>[0-9]+)(?<unit>[hm])$")
                 | (.n | tonumber) * (if .unit == "h" then 60 else 1 end);
             [($frequency | minutes), ($window | minutes)] | @tsv')
-        if [ "$CURRENT_QUERY" != "$query" ] || [ "$CURRENT_TIMING" != "$EXPECTED_TIMING" ]; then
+        if [ "$CURRENT_QUERY" != "$query" ] || [ "$CURRENT_TIMING" != "$EXPECTED_TIMING" ] || [ "$CURRENT_SEVERITY" != "$severity" ]; then
             az monitor scheduled-query update --name "$alert_name" --resource-group "$RG_NAME" \
                 --condition "count 'Placeholder_1' > 0" \
                 --condition-query Placeholder_1="$query" \
                 --evaluation-frequency "$frequency" --window-size "$window" \
+                --severity "$severity" \
                 --skip-query-validation true --only-show-errors >/dev/null
             alert_action="updated"
         else
@@ -427,10 +453,12 @@ for kql_file in "$REPO_ROOT"/infra/azure/alerts/*.kql; do
 
     # CLI updates preserve overrideQueryTimeRange and offer no dedicated setter.
     # Reconcile long-query-range drift explicitly, including short overrides that
-    # would otherwise truncate the six-hour persistence or rollup liveness query.
+    # would otherwise truncate the six-hour persistence, rollup liveness, or D1
+    # growth-forecast query.
     query_range=""
     case "$base_name" in
         collector-errors) query_range="P1D" ;;
+        d1-size-forecast) query_range="P2D" ;;
         session-rollup-errors) query_range="PT1H" ;;
         session-rollup-missing) query_range="P2D" ;;
     esac
@@ -451,7 +479,7 @@ for kql_file in "$REPO_ROOT"/infra/azure/alerts/*.kql; do
             exit 1
         fi
     fi
-    echo "OK: $alert_name ($alert_action, frequency=$frequency, window=$window)"
+    echo "OK: $alert_name ($alert_action, frequency=$frequency, window=$window, severity=$severity)"
 done
 
 echo ""
