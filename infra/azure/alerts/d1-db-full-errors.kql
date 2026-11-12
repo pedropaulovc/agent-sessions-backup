@@ -1,30 +1,33 @@
-// Sev1: fires on any hub-originated sessions-hub log line in the last hour that
-// carries a D1 capacity rejection, i.e. a D1 database (or the account's D1
-// storage) is full and the hub can no longer persist uploads/heartbeats.
+// Sev1: fires on any sessions-hub D1 capacity rejection in the last hour, i.e.
+// a D1 database (or the account's D1 storage) is full and the hub can no
+// longer persist uploads/heartbeats.
 //
 // Capacity set: the `capacity` class of infra/cf/d1-batch-atomicity.mjs —
 // SQLITE_FULL, `database or disk is full`, `Exceeded maximum DB size`, and
-// `Your account has exceeded D1's maximum account storage limit`. Each must
-// appear in a D1_ERROR line, mirroring parse-errors.kql's transientD1 origin
-// anchor, so a user-controlled path that merely embeds a phrase cannot page.
+// `Your account has exceeded D1's maximum account storage limit`.
 //
-// Matches the raw Body, not a structured `event`: in the 2026-11-12 outage
-// ~14,100 of the ~14,700 such lines were bare `D1_ERROR: Exceeded maximum DB
-// size` strings with no event field; the rest arrived inside parse.error and
-// hub.pricing.batch_pass_failed events. parse-errors.kql excludes the same D1
-// capacity set so the outage pages here, at Sev1.
-//
-// `collector.event` lines are dropped first: their `payload` is
-// collector-controlled (hub/src/api/ops.ts), and replayed collector upload
-// errors can quote hub responses, so they must neither forge nor re-raise this.
+// Only D1-originated text is matched, never a whole raw Body: hub lines such
+// as access.upload / access.multipart_* embed collector-controlled relpaths in
+// their R2 keys, and collector.event carries a collector-controlled payload, so
+// a Body-wide match would let any enrolled machine forge this Sev1. Two shapes
+// carry the error, both anchored at the start of the D1 message, as the queue
+// consumer's own `message.startsWith('D1_ERROR')` check does:
+//   1. Bare Workers runtime exception lines whose whole Body starts with
+//      `D1_ERROR` (no JSON, no event). 21,091 of the 21,697 capacity lines in
+//      the 2026-11-12 outage had this shape (`D1_ERROR: Exceeded maximum DB size`).
+//   2. The `error` field of the hub events that log a caught D1 failure:
+//      parse.error (`Error: D1_ERROR: ...`, 603 lines) and
+//      hub.pricing.batch_pass_failed (`D1_ERROR: ...`, 3 lines).
+// parse-errors.kql excludes the same D1-anchored capacity set, so the outage
+// pages here at Sev1 instead.
 //
 // Window 1h, evaluated every 15m (provision.sh): the overlap tolerates
 // OTLP/DCR ingestion delay at evaluation boundaries; the alert is stateful.
 // `contains` (substring, case-insensitive), not `has`: `has` is term-based and
-// does not reliably match multi-word phrases or the underscored D1_ERROR token.
-// A bare summarize always yields one row, so `where lines > 0` drops it on a
-// healthy window; otherwise that one compact row trips provision.sh's
-// `count > 0`. Missing OTelLogs degrades to empty.
+// does not reliably match multi-word phrases. A bare summarize always yields
+// one row, so `where lines > 0` drops it on a healthy window; otherwise that
+// one compact row trips provision.sh's `count > 0`. Missing OTelLogs degrades
+// to empty.
 let otel = union isfuzzy=true
     (datatable(TimeGenerated:datetime, Body:string, ServiceName:string)[]),
     (OTelLogs | project TimeGenerated, Body, ServiceName);
@@ -32,11 +35,15 @@ otel
 | where TimeGenerated > ago(1h)
 | where ServiceName == 'sessions-hub'
 | where Body contains "D1_ERROR"
-| where tostring(todynamic(Body).event) != "collector.event"
-| where Body contains "SQLITE_FULL"
-    or Body contains "database or disk is full"
-    or Body contains "Exceeded maximum DB size"
-    or Body contains "exceeded D1's maximum account storage limit"
+| extend d1_error = case(
+    Body startswith_cs "D1_ERROR", Body,
+    tostring(todynamic(Body).event) in ("parse.error", "hub.pricing.batch_pass_failed"), tostring(todynamic(Body).error),
+    "")
+| where d1_error startswith_cs "D1_ERROR" or d1_error startswith_cs "Error: D1_ERROR"
+| where d1_error contains "SQLITE_FULL"
+    or d1_error contains "database or disk is full"
+    or d1_error contains "Exceeded maximum DB size"
+    or d1_error contains "exceeded D1's maximum account storage limit"
 | summarize lines = count(), first_at = min(TimeGenerated), last_at = max(TimeGenerated),
     samples = make_set(substring(Body, 0, 300), 5)
 | where lines > 0

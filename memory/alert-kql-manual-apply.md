@@ -96,11 +96,12 @@ az monitor scheduled-query create --name agent-backup-<base> --resource-group rg
   --action-groups "$(az monitor action-group show -g rg-agent-backup -n ag-pedro-email --query id -o tsv)" \
   --skip-query-validation true
 ```
-Then set `overrideQueryTimeRange` when provision.sh's query-range case lists the rule: `P1D` for
-`collector-errors` (see the collector-specific procedure above), `P2D` for `d1-size-forecast`
-(without it the forecast's 12h-minimum fit never sees enough gauges), `P2D` for
-`session-rollup-missing`, and `PT1H` for `session-rollup-errors`, using the `az rest` patch and
-readback in the rollup procedure below.
+When provision.sh's query-range case lists the rule — `P1D` for `collector-errors` (see the
+collector-specific procedure above), `P2D` for `d1-size-forecast` and `session-rollup-missing`,
+`PT1H` for `session-rollup-errors` — reconcile `overrideQueryTimeRange` with the `az rest` patch
+and readback in the rollup procedure below. A freshly created rule already queries its full
+window (the range defaults to `--window-size`), so this is a no-op there; it guards an existing
+rule against a pre-existing shorter override that would silently truncate the query.
 Register a new rule's window in `alert_window_for()` and, when different, its frequency in
 `alert_frequency_for()` and severity in `alert_severity_for()` in provision.sh; provisioning
 reconciles query, timing, severity, and query-range drift.

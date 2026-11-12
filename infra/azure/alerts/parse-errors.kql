@@ -57,9 +57,11 @@ otel
 | where not(transientD1)
 // A full D1 database (or account storage) fails every parse with a capacity
 // error; that outage pages at Sev1 via d1-db-full-errors.kql, so the same
-// capacity set is excluded here — anchored to the D1_ERROR origin like
-// transientD1, so a user-controlled path embedding a phrase still counts.
-| extend capacityD1 = err contains "D1_ERROR" and (
+// capacity set is excluded here. The anchor is the one d1-db-full-errors.kql
+// uses — the error must START with the D1 message — so exactly the rows that
+// rule pages on are excluded, and a user-controlled path embedding the
+// phrases (even after a D1_ERROR token) still counts toward dcount(fid).
+| extend capacityD1 = (err startswith_cs "D1_ERROR" or err startswith_cs "Error: D1_ERROR") and (
        err contains "SQLITE_FULL"
     or err contains "database or disk is full"
     or err contains "Exceeded maximum DB size"
