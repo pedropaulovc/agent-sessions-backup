@@ -186,8 +186,10 @@ messages reduce throughput. For example, 100,000 rows repeating about 3,100 exac
 per-path messages become about 3,100 events with conserved counts, rather than
 repeating those messages in every 1,000-row page. Unique messages still require
 separate delivery. The run's own events (upload, walk, and snapshot failures) are
-sent first, compacted the same way, so an older backlog does not delay them; requests
-left in the budget continue the backlog from the saved cursor.
+sent first, compacted the same way, so an older backlog does not delay them. When
+older rows are queued, at least one request stays reserved for them, so fresh traffic
+above the budget cannot starve the backlog; requests left in the budget continue the
+backlog in ID order from the saved cursor.
 
 External-asset warnings from transcript discovery are queued once per store, parent
 transcript, code, and message. The collector still re-runs discovery for retryable
