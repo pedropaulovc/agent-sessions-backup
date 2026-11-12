@@ -55,9 +55,16 @@ otel
     or err contains "reset because its code was updated"
     or err contains "Cannot resolve Durable Object")
 | where not(transientD1)
-// A full D1 database fails every parse with `Exceeded maximum DB size`; that
-// outage pages once at Sev1 via d1-db-full-errors.kql, so it is excluded here.
-| where not(err contains "Exceeded maximum DB size")
+// A full D1 database (or account storage) fails every parse with a capacity
+// error; that outage pages at Sev1 via d1-db-full-errors.kql, so the same
+// capacity set is excluded here — anchored to the D1_ERROR origin like
+// transientD1, so a user-controlled path embedding a phrase still counts.
+| extend capacityD1 = err contains "D1_ERROR" and (
+       err contains "SQLITE_FULL"
+    or err contains "database or disk is full"
+    or err contains "Exceeded maximum DB size"
+    or err contains "exceeded D1's maximum account storage limit")
+| where not(capacityD1)
 // A bare summarize (no `by`) yields exactly one row — files counts DISTINCT
 // affected file_ids (not rows: a retried terminal failure logs several), errors
 // samples the messages for the notification. `where files > 1` emits that row

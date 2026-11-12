@@ -1,38 +1,57 @@
 // Fires when any D1 database is projected to reach its cap in under 3 days at
-// its growth rate over the last 48h.
+// its current growth trend.
 //
 // Cap: 10 GB decimal (10,000,000,000 bytes). Production `main` plateaued at
 // 9,999,998,976 bytes when writes began failing with `Exceeded maximum DB size`
 // (2026-11-12 00:05 UTC), so the cap is decimal GB, not GiB. The GiB thresholds
 // in d1-size.kql / d1-size-critical.kql are fixed fractions below that cap.
 //
-// Rate: (newest - oldest healthy gauge) / elapsed, per database, from the */15
-// watchdog's hub.d1.db_size_bytes gauges (see d1-size.kql). At least 24h of
-// span is required so a short-lived burst right after a deploy, new shard, or
+// Trend: per database, a least-squares line through the healthy */15 watchdog
+// hub.d1.db_size_bytes gauges (see d1-size.kql) of the last 48h, restricted to
+// readings since the database last shrank by more than 1% between consecutive
+// gauges. A cleanup that shrinks the database therefore restarts the fit
+// instead of a pre-shrink endpoint masking regrowth; sub-1% wobble (index
+// shards dip by <1 MB) does not. At least 12h of readings in the fitted
+// segment are required so a burst right after a deploy, new shard, shrink, or
 // rule bootstrap cannot extrapolate a false deadline. Failed probes (bytes=-1)
-// are excluded and stay owned by d1-size.kql. Shrinking or flat databases
-// (rate <= 0) never fire. A database that reached the cap keeps firing here
-// (days_to_full <= 0) until its pre-cap growth ages out of the 48h window;
-// d1-size-critical.kql and d1-db-full-errors.kql own the at-cap state.
+// are excluded and stay owned by d1-size.kql. Shrinking or flat trends never
+// fire. A database that reached the cap keeps firing here (days_to_full <= 0)
+// until its pre-cap growth ages out of the 48h window; d1-size-critical.kql
+// and d1-db-full-errors.kql own the at-cap state.
 //
 // Provision.sh evaluates hourly over a 48h window with overrideQueryTimeRange
 // P2D so the oldest gauge stays inside the query range.
 let otel = union isfuzzy=true
     (datatable(TimeGenerated:datetime, Body:string, ServiceName:string)[]),
     (OTelLogs | project TimeGenerated, Body, ServiceName);
-let cap_bytes = 10000000000.0;
-otel
-| where TimeGenerated > ago(48h)
-| where ServiceName == 'sessions-hub'
-| extend body = todynamic(Body)
-| where body.event == "hub.d1.db_size_bytes"
-| extend bytes = tolong(body.bytes), database = iff(isempty(tostring(body.database)), "main", tostring(body.database))
-| where bytes >= 0
-| summarize arg_min(TimeGenerated, oldest_bytes = bytes), arg_max(TimeGenerated, newest_bytes = bytes) by database
-| project database, oldest_at = TimeGenerated, newest_at = TimeGenerated1, oldest_bytes, newest_bytes
-| where newest_at - oldest_at >= 24h
-| extend bytes_per_day = (newest_bytes - oldest_bytes) / ((newest_at - oldest_at) / 1d)
-| where bytes_per_day > 0
-| extend days_to_full = (cap_bytes - newest_bytes) / bytes_per_day
+let cap_gb = 10.0;
+let window_start = ago(48h);
+let readings = otel
+    | where TimeGenerated > window_start
+    | where ServiceName == 'sessions-hub'
+    | extend body = todynamic(Body)
+    | where body.event == "hub.d1.db_size_bytes"
+    | extend bytes = tolong(body.bytes), database = iff(isempty(tostring(body.database)), "main", tostring(body.database))
+    | where bytes >= 0
+    | project database, TimeGenerated, bytes;
+let segment_start = readings
+    | order by database asc, TimeGenerated asc
+    | serialize
+    | extend shrank = database == prev(database) and bytes < 0.99 * prev(bytes)
+    | summarize last_shrink_at = maxif(TimeGenerated, shrank) by database
+    | extend segment_start = iff(isnull(last_shrink_at), window_start, last_shrink_at);
+readings
+| join kind=inner segment_start on database
+| where TimeGenerated >= segment_start
+// x in days since window_start, y in GB: small magnitudes keep the
+// closed-form least-squares sums numerically well-conditioned.
+| extend x = (TimeGenerated - window_start) / 1d, y = bytes / 1e9
+| summarize n = count(), sx = sum(x), sy = sum(y), sxx = sum(x * x), sxy = sum(x * y),
+    oldest_at = min(TimeGenerated), arg_max(TimeGenerated, newest_bytes = bytes) by database
+| where TimeGenerated - oldest_at >= 12h
+| extend gb_per_day = (n * sxy - sx * sy) / (n * sxx - sx * sx)
+| where gb_per_day > 0
+| extend days_to_full = (cap_gb - newest_bytes / 1e9) / gb_per_day
 | where days_to_full < 3
-| project newest_at, database, newest_bytes, bytes_per_day = tolong(bytes_per_day), days_to_full = round(days_to_full, 2)
+| project newest_at = TimeGenerated, database, newest_bytes, bytes_per_day = tolong(gb_per_day * 1e9),
+    days_to_full = round(days_to_full, 2), fitted_since = oldest_at

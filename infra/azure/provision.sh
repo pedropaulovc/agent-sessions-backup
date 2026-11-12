@@ -349,7 +349,7 @@ alert_window_for() {
         d1-size) echo "1h" ;;
         d1-size-critical) echo "1h" ;;
         d1-size-forecast) echo "48h" ;;
-        d1-db-full-errors) echo "15m" ;;
+        d1-db-full-errors) echo "1h" ;;
         fleet-heartbeat-silent) echo "2h" ;;
         cf-auth-failed) echo "1h" ;;
         cert-orphan-leaked) echo "1h" ;;
@@ -363,12 +363,14 @@ alert_window_for() {
 
 # The collector KQL filters to 7h within Azure's 24h query range but still
 # evaluates hourly. Rollup liveness similarly scans 26h within a 48h window, and
-# the D1 growth forecast fits 48h of gauges hourly. Error scans overlap to
-# tolerate ingestion delay at evaluation boundaries. The D1 critical size and
-# fleet heartbeat silence rules evaluate at the */15 watchdog cadence.
+# the D1 growth forecast fits 48h of gauges hourly. Error scans (rollup errors,
+# D1 capacity errors) overlap to tolerate ingestion delay at evaluation
+# boundaries. The D1 critical size and fleet heartbeat silence rules evaluate at
+# the */15 watchdog cadence.
 alert_frequency_for() {
     case "$1" in
         collector-errors) echo "1h" ;;
+        d1-db-full-errors) echo "15m" ;;
         d1-size-critical) echo "15m" ;;
         d1-size-forecast) echo "1h" ;;
         fleet-heartbeat-silent) echo "15m" ;;
@@ -378,7 +380,10 @@ alert_frequency_for() {
     esac
 }
 
-# Sev1 pages for an imminent or actual D1 write outage; everything else is Sev2.
+# Sev1 marks an imminent or actual D1 write outage; everything else is Sev2.
+# Severity is a label only: every rule notifies through the same email-only
+# action group ($AG_NAME), so a Sev1 arrives exactly like a Sev2. Escalating
+# Sev1 (SMS, push, or voice) needs a separate action group.
 alert_severity_for() {
     case "$1" in
         d1-size-critical) echo "1" ;;

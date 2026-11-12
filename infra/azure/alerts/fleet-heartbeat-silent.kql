@@ -10,7 +10,11 @@
 //
 // The beacon guard hands total telemetry silence to missed-heartbeat.kql's
 // __pipeline_silent__ / __pipeline_gap__ legs: with no beacons this rule
-// returns nothing, so one outage does not page twice.
+// returns nothing, so one outage does not page twice. Only beacons reporting a
+// non-empty roster (machine_count > 0) count: an empty roster (fresh deploy, or
+// every machine decommissioned) is a legitimate live state with no heartbeats,
+// as missed-heartbeat.kql notes. A failed roster read can report machine_count
+// 0; that state is owned by missed-heartbeat.kql's __roster_unavailable__ leg.
 //
 // Window 2h: collectors heartbeat many times per hour; outside outages the
 // largest fleet-wide gap Nov 1-11 2026 was ~22m, except two whole-host
@@ -24,8 +28,10 @@ let otel = union isfuzzy=true
 otel
 | where TimeGenerated > ago(2h)
 | where ServiceName == 'sessions-hub'
-| extend event = tostring(todynamic(Body).event)
+| extend body = todynamic(Body)
+| extend event = tostring(body.event)
 | where event in ("hub.heartbeat", "hub.watchdog.run")
-| summarize heartbeats = countif(event == "hub.heartbeat"), watchdog_runs = countif(event == "hub.watchdog.run"),
+| summarize heartbeats = countif(event == "hub.heartbeat"),
+    watchdog_runs = countif(event == "hub.watchdog.run" and toint(body.machine_count) > 0),
     last_watchdog_at = maxif(TimeGenerated, event == "hub.watchdog.run")
 | where heartbeats == 0 and watchdog_runs > 0
