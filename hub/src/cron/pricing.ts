@@ -11,9 +11,10 @@ import { priceUsage, type PricingPassResult } from '../pricing-pass';
 
 /** Rows per nightly run.
  *
- * Bounded by the invocation's subrequest budget (~1000, shared with the prune jobs running
- * alongside), not by the clock: at PRICING_READ_BATCH=500 and PRICING_WRITE_BATCH=100 this is 40
- * reads plus 200 write batches, so ~240 of that budget. It is deliberately NOT sized to finish a
+ * Bounded by the invocation's subrequest budget (~1000, shared with the rest of the sequential
+ * daily maintenance chain and the concurrent R2 staging sweep), not by the clock: at
+ * PRICING_READ_BATCH=500 and PRICING_WRITE_BATCH=100 this is 40 reads plus 200 write batches, so
+ * ~240 of that budget. It is deliberately NOT sized to finish a
  * cold 776k-row corpus — 39 days of nightly runs is not a backfill strategy, which is why the
  * script exists. This is the steady-state trickle plus retries.
  */
@@ -25,8 +26,8 @@ export async function runDailyPricing(env: Env): Promise<void> {
     const res = await priceUsage(env.DB, { maxRows: MAX_ROWS_PER_RUN });
     emit('hub.pricing.daily', { ...res, ms: Date.now() - started, ok: true });
   } catch (e) {
-    // Swallowed, not rethrown: this runs under waitUntil alongside the prunes, and an unhandled
-    // rejection there is a silent scheduled-invocation failure. The log line IS the signal.
+    // Rethrown after the `ok: false` line so the daily chain records this step as failed; the
+    // chain catches it and still runs the steps after pricing.
     emit('hub.pricing.daily', {
       examined: 0,
       priced: 0,
@@ -38,6 +39,7 @@ export async function runDailyPricing(env: Env): Promise<void> {
       ok: false,
       error: e instanceof Error ? e.message : String(e),
     });
+    throw e;
   }
 }
 

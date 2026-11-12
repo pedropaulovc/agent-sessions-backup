@@ -25,17 +25,14 @@ export async function heartbeat(request: Request, env: Env, identity: Identity):
     stores?: Record<string, unknown>;
     events?: Array<{ level: string; code: string; message: string; count?: number; store?: string }>;
   };
-  await env.DB.batch([
-    env.DB.prepare('INSERT INTO heartbeats (machine_id, collector_version, stats) VALUES (?1, ?2, ?3)').bind(
-      identity.machineId,
-      body.collector_version ?? null,
-      JSON.stringify({ stores: body.stores ?? {}, events: body.events ?? [] }),
-    ),
-    env.DB.prepare(
-      `UPDATE machines SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), collector_version = ?2 WHERE machine_id = ?1`,
-    ).bind(identity.machineId, body.collector_version ?? null),
-  ]);
-  console.log(JSON.stringify({ event: 'hub.heartbeat', machine: identity.machineId }));
+  await env.DB.prepare(
+    `UPDATE machines SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), collector_version = ?2 WHERE machine_id = ?1`,
+  )
+    .bind(identity.machineId, body.collector_version ?? null)
+    .run();
+  // Per-store run counters (files_seen/files_uploaded/bytes_uploaded) are small and the only record
+  // of collector throughput, so they ride on this line; machine-supplied, they stay nested.
+  console.log(JSON.stringify({ event: 'hub.heartbeat', machine: identity.machineId, stores: body.stores ?? {} }));
   for (const e of body.events ?? []) {
     // Nest the machine-supplied event under `payload` — NEVER spread it at top level. Spreading let a
     // collector set `event`/`machine` itself and forge a hub log line (e.g. hub.certs.cf_auth_failed) to

@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import { env, createExecutionContext, waitOnExecutionContext } from 'cloudflare:test';
+import { DAILY_CRON, WATCHDOG_CRON } from '../src/cron/schedule';
 import { runWatchdog } from '../src/cron/watchdog';
 import { EXPECTED_COLLECTOR_VERSION } from '../src/collector-version';
 import worker from '../src/worker';
@@ -508,7 +509,7 @@ describe('maintenance freeze', () => {
       expect(message.retry).toHaveBeenCalledWith({ delaySeconds: 60 });
       expect(message.ack).not.toHaveBeenCalled();
     }
-    for (const cron of ['*/15 * * * *', '30 4 * * *']) {
+    for (const cron of [WATCHDOG_CRON, DAILY_CRON]) {
       await worker.scheduled({ cron, scheduledTime: 0, noRetry: () => {} } as ScheduledController, testEnv, ctx);
     }
     await waitOnExecutionContext(ctx);

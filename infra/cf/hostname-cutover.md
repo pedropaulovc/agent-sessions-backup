@@ -873,7 +873,7 @@ UPDATE machines
    AND prev_cert_fp_sha256 = '<new fp>';
 ```
 
-Promote before `cert_revoke_at` elapses. If it elapses first, the daily prune (`30 4`) moves the
+Promote before `cert_revoke_at` elapses. If it elapses first, the daily prune (`37 4`) moves the
 staged fingerprint into `retired_certs` and clears the grace slot
 (`hub/src/cron/prune.ts:52-78`), and you would have to re-stage.
 

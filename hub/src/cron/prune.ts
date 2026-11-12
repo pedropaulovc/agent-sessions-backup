@@ -1,6 +1,6 @@
 import { pollRetired } from '../api/certs';
 
-// Daily prune (runs on the `30 4 * * *` cron — see wrangler.jsonc triggers).
+// Daily prune (runs on the `37 4 * * *` cron — see wrangler.jsonc triggers).
 //
 // Multipart uploads assemble onto a staging key (mpu-staging/...) and complete copies staging ->
 // canonical then deletes staging. Two leaks are possible and both are swept here:
@@ -53,7 +53,7 @@ export async function runPrune(env: Env, nowMs: number = Date.now()): Promise<vo
   console.log(JSON.stringify({ event: 'hub.prune.staging', scanned, deleted }));
 }
 
-/** Daily prune (cron `30 4`), two phases over the cert-rotation state.
+/** Daily prune (cron `37 4`), two phases over the cert-rotation state.
  *
  * Phase 1 — retire expired grace windows: for each machine whose prev-cert grace window has elapsed,
  * move the prev entry into the durable retired_certs queue and clear the prev columns (which now mean

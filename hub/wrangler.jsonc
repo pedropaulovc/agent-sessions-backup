@@ -115,7 +115,7 @@
       }
     ]
   },
-  "triggers": { "crons": ["*/15 * * * *", "30 4 * * *"] },
+  "triggers": { "crons": ["*/15 * * * *", "37 4 * * *"] },
   "observability": {
     "enabled": true,
     "head_sampling_rate": 1,

@@ -42,6 +42,9 @@ export async function runSessionRollupPass(
   return outcome;
 }
 
+/** The daily chain's rollup step. A pass that `failed` throws so the chain records the step as
+ * failed; `partial` is a completed pass with per-session failures, already logged as such. */
 export async function runScheduledSessionRollup(env: Env): Promise<void> {
-  await runSessionRollupPass(env, { run_id: crypto.randomUUID(), trigger: 'scheduled' });
+  const outcome = await runSessionRollupPass(env, { run_id: crypto.randomUUID(), trigger: 'scheduled' });
+  if (outcome.outcome === 'failed') throw new Error(`session rollup failed: ${outcome.error}`);
 }
