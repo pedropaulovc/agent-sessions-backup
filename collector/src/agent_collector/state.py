@@ -516,6 +516,11 @@ class State:
             self.conn.execute("SELECT COUNT(*) FROM pending_events").fetchone()[0]
         )
 
+    def max_event_id(self) -> int:
+        """Highest queued event ID, or 0. Rows buffered afterwards get larger IDs (rowid = max+1),
+        so this separates a run's own events from the older backlog."""
+        return int(self.conn.execute("SELECT coalesce(MAX(id), 0) FROM pending_events").fetchone()[0])
+
     # -- webcapture watermarks --------------------------------------------
     def get_webcapture_watermark(self, product: str, conv_id: str) -> str | None:
         """The conversation's last-captured update watermark, or None if never captured."""

@@ -98,8 +98,8 @@ def _safe_unlink(path: Path) -> None:
         pass
 
 
-# Windows reparse tag of an AF_UNIX socket file; the stat module only defines it on some builds.
-_IO_REPARSE_TAG_AF_UNIX = getattr(stat, "IO_REPARSE_TAG_AF_UNIX", 0x80000023)
+# IO_REPARSE_TAG_AF_UNIX from the Windows SDK (winnt.h); CPython's stat module does not export it.
+_IO_REPARSE_TAG_AF_UNIX = 0x80000023
 
 
 def _is_plain_file(path: Path) -> bool:

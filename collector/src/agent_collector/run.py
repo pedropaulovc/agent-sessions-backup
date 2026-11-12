@@ -326,7 +326,10 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
                     })
                     continue
                 # A transcript is the owner of its assets. Never inspect/upload references when
-                # its own bytes failed to reach the hub.
+                # its own bytes failed to reach the hub. SQLite snapshots are databases, not JSONL
+                # transcripts, and their temp copy is already deleted (as in backfill).
+                if item.is_snapshot:
+                    continue
                 assets_res = _discover_upload_assets(cfg, st, transport, scanner, item, events,
                                                      force=res.changed)
                 scanned += assets_res.seen
@@ -340,11 +343,12 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
                     stats[store]["bytes_uploaded"] += assets_res.bytes
                 if assets_res.error:
                     errors += 1
-            # Only a complete walk proves a parent is gone; a missing root or an unreadable
-            # subtree would otherwise forget warnings that are still current.
+            # Only a complete walk proves a parent is gone; a missing root, an unreadable
+            # subtree, or an empty (e.g. unmounted) mountpoint would otherwise forget warnings
+            # that are still current.
             walk_failed = any(e["code"] == "walk_error" and e.get("store") == store
                               for e in scanner.events)
-            if root.exists() and not walk_failed:
+            if seen and not walk_failed:
                 st.prune_asset_events(store, seen)
         # Traversal/snapshot warnings (walk_error, snapshot_timeout) raised during the walk.
         events.extend(scanner.events)
@@ -576,9 +580,55 @@ HEARTBEAT_MAX_BATCHES = 8
 HEARTBEAT_COMPACT_ROWS = 100_000
 
 
+def _post_event_page(cfg, st: State, transport: Transport, body: dict, base_size: int,
+                     ids: list[int], events: list[dict]) -> tuple[bool, int, int | None, bool]:
+    """Coalesce one drained page into a request and acknowledge it on HTTP 200.
+
+    Returns (ok, acknowledged_rows, last_inspected_id, oversized). Rows after the last inspected
+    ID did not fit this request and stay queued; an individually oversized row is retained.
+    """
+    ack_ids = []
+    grouped = {}
+    size = base_size
+    last_id = None
+    oversized = False
+    max_count = sum(abs(e["count"]) for e in events)
+    for event_id, event in zip(ids, events):
+        key = (event["level"], event["code"], event["message"], event.get("store"))
+        if key in grouped:
+            grouped[key]["count"] += event["count"]
+            ack_ids.append(event_id)
+            last_id = event_id
+            continue
+        # Reserve the largest count this group can have after coalescing the page.
+        added = len(json.dumps(dict(event, count=-max_count)).encode("utf-8"))
+        if base_size + added > HEARTBEAT_MAX_BYTES:
+            print(f"heartbeat event {event_id} exceeds payload budget; retained", file=sys.stderr)
+            oversized = True
+            last_id = event_id
+            continue
+        added += 2 if grouped else 0
+        if size + added > HEARTBEAT_MAX_BYTES:
+            break
+        grouped[key] = event.copy()
+        ack_ids.append(event_id)
+        size += added
+        last_id = event_id
+    body["events"] = list(grouped.values())
+    status, response = transport.post_json(f"{cfg.hub_url}/api/v1/heartbeat", body)
+    if status != 200:
+        # Escape controls and bound diagnostics; never print the request or credentials.
+        detail = json.dumps(response[:512], ensure_ascii=True)
+        print(f"heartbeat failed: HTTP {status}; response={detail}; events retained", file=sys.stderr)
+        return False, 0, last_id, oversized
+    st.delete_events(ack_ids)
+    return True, len(ack_ids), last_id, oversized
+
+
 def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: list[dict]) -> bool:
     # Commit before the first network call: failure, exception, or process interruption must
     # never lose current-run events. Delivery is at least once if the remote ACK is lost.
+    fresh_after = st.max_event_id()
     st.buffer_events(run_events)
     body = {"collector_version": __version__, "stores": stats, "events": []}
     base_size = len(json.dumps(body).encode("utf-8"))
@@ -586,11 +636,33 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
         print("heartbeat failed: stores envelope exceeds payload budget; events retained", file=sys.stderr)
         return False
 
-    after_id = st.event_cursor()
-    window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
     oversized = False
     delivered = 0
-    for _batch in range(HEARTBEAT_MAX_BATCHES):
+    sent = 0
+    # This run's own events (upload/walk/snapshot failures) go first, so the request budget never
+    # leaves fresh errors queued behind an older backlog. They carry the highest IDs, so the FIFO
+    # cursor below is untouched; whatever of them this budget cannot send, that FIFO pass delivers.
+    if run_events:
+        fresh_cursor = fresh_after
+        fresh_end = st.compact_events(fresh_cursor, HEARTBEAT_COMPACT_ROWS)
+        while fresh_end is not None and sent < HEARTBEAT_MAX_BATCHES:
+            ids, events = st.drain_events(HEARTBEAT_MAX_EVENTS, fresh_cursor, fresh_end)
+            if not ids:
+                fresh_cursor = fresh_end
+                fresh_end = st.compact_events(fresh_cursor, HEARTBEAT_COMPACT_ROWS)
+                continue
+            ok, acked, last_id, page_oversized = _post_event_page(
+                cfg, st, transport, body, base_size, ids, events)
+            sent += 1
+            if not ok:
+                return False
+            delivered += acked
+            oversized |= page_oversized
+            fresh_cursor = last_id
+
+    after_id = st.event_cursor()
+    window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
+    for _batch in range(HEARTBEAT_MAX_BATCHES - sent):
         ids, events = st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
         if not ids and window_end is not None:
             # Compaction can remove the window's final IDs. Advance over only those
@@ -608,40 +680,19 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
             after_id = 0
             window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
             ids, events = st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
-        ack_ids = []
-        grouped = {}
-        size = base_size
-        max_count = sum(abs(e["count"]) for e in events)
-        for event_id, event in zip(ids, events):
-            key = (event["level"], event["code"], event["message"], event.get("store"))
-            if key in grouped:
-                grouped[key]["count"] += event["count"]
-                ack_ids.append(event_id)
-                after_id = event_id
-                continue
-            # Reserve the largest count this group can have after coalescing the page.
-            added = len(json.dumps(dict(event, count=-max_count)).encode("utf-8"))
-            if base_size + added > HEARTBEAT_MAX_BYTES:
-                print(f"heartbeat event {event_id} exceeds payload budget; retained", file=sys.stderr)
-                oversized = True
-                after_id = event_id
-                continue
-            added += 2 if grouped else 0
-            if size + added > HEARTBEAT_MAX_BYTES:
-                break
-            grouped[key] = event.copy()
-            ack_ids.append(event_id)
-            size += added
-            after_id = event_id
-        body["events"] = list(grouped.values())
-        status, response = transport.post_json(f"{cfg.hub_url}/api/v1/heartbeat", body)
-        if status != 200:
-            # Escape controls and bound diagnostics; never print the request or credentials.
-            detail = json.dumps(response[:512], ensure_ascii=True)
-            print(f"heartbeat failed: HTTP {status}; response={detail}; events retained", file=sys.stderr)
+        if not ids and sent:
+            # The current-run pass already proved liveness; skip an empty request.
+            st.set_event_cursor(0)
+            break
+        ok, acked, last_id, page_oversized = _post_event_page(
+            cfg, st, transport, body, base_size, ids, events)
+        sent += 1
+        if not ok:
             return False
-        st.delete_events(ack_ids)
-        delivered += len(ack_ids)
+        delivered += acked
+        oversized |= page_oversized
+        if last_id is not None:
+            after_id = last_id
         st.set_event_cursor(after_id)
         if not ids:
             st.set_event_cursor(0)

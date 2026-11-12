@@ -185,19 +185,36 @@ A pass can acknowledge up to 8,000 compacted rows; large or heavily escaped
 messages reduce throughput. For example, 100,000 rows repeating about 3,100 exact
 per-path messages become about 3,100 events with conserved counts, rather than
 repeating those messages in every 1,000-row page. Unique messages still require
-separate delivery.
+separate delivery. The run's own events (upload, walk, and snapshot failures) are
+sent first, compacted the same way, so an older backlog does not delay them; requests
+left in the budget continue the backlog from the saved cursor.
 
-External-asset warnings (missing, outside-root, unreadable, or oversized referenced
-images) are queued once per store, parent transcript, code, and message; the message
-names the referenced digest and filename. The collector still re-runs discovery for
-retryable rejections every pass, so a source that appears later is uploaded, but neither
-an unchanged nor a growing transcript re-reports a warning already queued; a broken
-reference appended later is a new warning and reports once. Identical warnings within
-one pass keep their summed count. After a complete walk of a store (root present, no
-walk errors), warnings of transcripts no longer found are forgotten, so a returning
-transcript reports afresh. Rules-version and machine/hub identity changes clear them
-all. Snapshot and upload failures for external assets are errors and are reported on
-every attempt.
+External-asset warnings from transcript discovery are queued once per store, parent
+transcript, code, and message. The collector still re-runs discovery for retryable
+rejections every pass, so a source that appears later is uploaded, but neither an
+unchanged nor a growing transcript re-reports a warning already queued. Identical
+warnings within one pass are queued as one event with their summed count. Limits:
+
+- Per-reference codes (missing source, outside root, not a regular file, excluded,
+  unsupported type, too large, digest mismatch, unreadable source, invalid digest) name
+  the reference's digest and/or filename, so a different broken reference appended
+  later reports once. Discovery keeps at most 256 events per transcript in transcript
+  order, and repeats of already-reported references use up that cap, so references
+  past it are not reported.
+- `line_too_large`, `asset_limit`, and an unreadable transcript carry no identifier:
+  only their first pass is reported, with that pass's count; later occurrences in the
+  same transcript are not.
+- After a store walk that found at least one file and had no walk errors, warnings of
+  transcripts no longer found are forgotten. A returning transcript re-reports retryable
+  warnings (missing, outside-root, not regular, too large, unreadable); warnings from a
+  scan that was cached before it vanished (for example `excluded`) are not re-reported
+  while it is unchanged. A missing or empty store root forgets nothing.
+- Rules-version and machine/hub identity changes clear all reported warnings and
+  cached scans.
+
+SQLite databases are snapshotted, not parsed as transcripts, so they are never scanned
+for external assets. Snapshot and upload failures for external assets are errors and
+are reported on every attempt.
 
 Compaction is durable before any network request. Representatives are deleted only
 after HTTP 200; failed requests retain all unacknowledged counts, including new

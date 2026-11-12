@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -551,6 +552,7 @@ def test_run_prunes_reported_warnings_of_vanished_parent(tmp_path, hub):
     transcript = root / "session.jsonl"
     _transcript(transcript, str(tmp_path), digest, str(image))
     body = transcript.read_bytes()
+    (root / "other.jsonl").write_text("{}\n")  # the walk still finds files: it is complete
     cfg = config.Config(machine_id="m1", hub_url=hub.url, auth="dev", stores={"omp": str(root)})
 
     def keys(st):
@@ -572,7 +574,8 @@ def test_run_prunes_reported_warnings_of_vanished_parent(tmp_path, hub):
 
 
 @requires_curl
-def test_run_keeps_reported_warnings_when_store_root_is_missing(tmp_path, hub):
+@pytest.mark.parametrize("unmounted", ["missing", "empty"])
+def test_run_keeps_reported_warnings_when_store_root_is_unavailable(tmp_path, hub, unmounted):
     root = tmp_path / "omp"
     root.mkdir()
     transcript = root / "session.jsonl"
@@ -583,8 +586,29 @@ def test_run_keeps_reported_warnings_when_store_root_is_missing(tmp_path, hub):
     with State(tmp_path / "state.db") as st:
         assert run_mod._do_run(cfg, st) == 0
         root.rename(tmp_path / "unmounted")
+        if unmounted == "empty":
+            root.mkdir()  # an unmounted mountpoint: exists, walks cleanly, yields nothing
         assert run_mod._do_run(cfg, st) == 0
         assert st.conn.execute("SELECT COUNT(*) FROM asset_event_emissions").fetchone()[0] == 1
+
+
+@requires_curl
+def test_run_does_not_scan_sqlite_snapshots_for_external_assets(tmp_path, hub):
+    root = tmp_path / "codex"
+    root.mkdir()
+    db = sqlite3.connect(root / "state.sqlite")
+    db.execute("CREATE TABLE t (x)")
+    db.commit()
+    db.close()
+    cfg = config.Config(machine_id="m1", hub_url=hub.url, auth="dev", stores={"codex": str(root)})
+
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_run(cfg, st) == 0
+        assert run_mod._do_run(cfg, st) == 0
+        assert st.conn.execute("SELECT COUNT(*) FROM asset_event_emissions").fetchone()[0] == 0
+    assert ("m1", "codex", "state.sqlite") in hub.files
+    assert not [e for body in hub.heartbeats for e in body["events"]
+                if e["code"] == "asset_read_failed"]
 
 
 @requires_curl

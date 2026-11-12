@@ -313,3 +313,31 @@ def test_page_budget_remains_bounded_with_compaction_and_restart(tmp_path, monke
     assert event_counts(
         item for transport in passes for body in transport.bodies for item in body["events"]
     ) == event_counts(events)
+
+
+def test_current_run_errors_are_delivered_ahead_of_backlog(tmp_path, monkeypatch):
+    # A backlog larger than one run's request budget must not leave this run's failures queued.
+    monkeypatch.setattr(run, "HEARTBEAT_MAX_EVENTS", 1)
+    cfg = SimpleNamespace(hub_url="https://hub.invalid")
+    path = tmp_path / "state.db"
+    budget = run.HEARTBEAT_MAX_BATCHES
+    backlog = [event(f"old/{i}") for i in range(3 * budget)]
+    current = [dict(event("upload failed now"), level="error", code="upload_failed")]
+    transport = RecordingTransport()
+    with State(path) as st:
+        st.buffer_events(backlog)
+        assert run._heartbeat(cfg, st, transport, {}, current)
+        assert len(transport.bodies) == budget
+        assert transport.bodies[0]["events"] == current
+        assert st.pending_event_count() == 2 * budget + 1
+    passes = [transport]
+    for expected_pending in (budget + 1, 1, 0):
+        retry = RecordingTransport()
+        with State(path) as st:
+            assert run._heartbeat(cfg, st, retry, {}, [])
+            assert len(retry.bodies) <= budget
+            assert st.pending_event_count() == expected_pending
+        passes.append(retry)
+    assert event_counts(
+        item for t in passes for body in t.bodies for item in body["events"]
+    ) == event_counts(backlog + current)
