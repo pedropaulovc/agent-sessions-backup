@@ -193,7 +193,8 @@ older plain-rowid queue is rebuilt in place with its IDs, and its cursor is rese
 so rows already stranded below it are delivered first. When a pass reaches the end
 with requests left, it requeries once from ID 0 to pick up deliverable rows below the
 cursor. Retained oversized rows are stepped over without spending a request, and each
-is diagnosed once per pass; they are never delivered.
+is diagnosed once per pass; they are never delivered. A pass also reads at most 32
+pages, so a long run of such rows is resumed from the saved cursor on the next run.
 
 External-asset warnings from transcript discovery are queued once per store, parent
 transcript, code, and message. The collector still re-runs discovery for retryable
@@ -210,9 +211,10 @@ warnings within one pass are queued as one event with their summed count. Limits
 - `line_too_large`, `asset_limit`, and an unreadable transcript carry no identifier:
   only their first pass is reported, with that pass's count; later occurrences in the
   same transcript are not.
-- After a store walk that found at least one file, had no walk errors, and could stat
-  every entry it listed, warnings of transcripts no longer found are forgotten. A
-  returning transcript re-reports retryable
+- After a store walk that found at least one file and had no walk errors, warnings of
+  transcripts no longer found are forgotten. Entries deleted between listing and stat
+  count as gone; any other stat failure (permission, I/O, sharing) leaves the walk
+  incomplete and nothing is forgotten. A returning transcript re-reports retryable
   warnings (missing, outside-root, not regular, too large, unreadable); warnings from a
   scan that was cached before it vanished (for example `excluded`) are not re-reported
   while it is unchanged. A missing or empty store root forgets nothing.

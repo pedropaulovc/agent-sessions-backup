@@ -577,6 +577,9 @@ def _upload_multipart(cfg, transport: Transport, item: ScanItem, sha: str) -> tu
 HEARTBEAT_MAX_BYTES = 256 * 1024
 HEARTBEAT_MAX_EVENTS = 1000
 HEARTBEAT_MAX_BATCHES = 8
+# Pages read per pass, including pages of only retained oversized rows that cost no request:
+# bounds queue reads when many such rows sit ahead. The cursor resumes there next run.
+HEARTBEAT_MAX_PAGES = 4 * HEARTBEAT_MAX_BATCHES
 HEARTBEAT_COMPACT_ROWS = 100_000
 
 # Per-pass wrap state (enum): whether delivery already requeried from ID 0 after reaching the end.
@@ -603,8 +606,10 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
     oversized_ids: set[int] = set()
     delivered = 0
     posted = 0
+    pages = 0
     wrap = WRAP_PENDING
-    while posted < HEARTBEAT_MAX_BATCHES:
+    while posted < HEARTBEAT_MAX_BATCHES and pages < HEARTBEAT_MAX_PAGES:
+        pages += 1
         ids, events = st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
         if not ids and window_end is not None:
             # Compaction can remove the window's final IDs. Advance over only those

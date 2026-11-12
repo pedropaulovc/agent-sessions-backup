@@ -452,3 +452,40 @@ def test_legacy_stranded_rows_drain_after_migration_under_sustained_traffic(tmp_
     with State(path) as st:
         assert st.conn.execute(
             "SELECT COUNT(*) FROM pending_events WHERE message LIKE 'legacy/%'").fetchone()[0] == 0
+
+
+def test_oversized_only_pages_are_bounded_per_pass_and_resume_next_run(tmp_path, monkeypatch,
+                                                                        capsys):
+    # Pages of only retained oversized rows cost no request, so the page-read cap is what bounds
+    # a pass. Reads stop at the cap; the next run resumes from the saved cursor.
+    monkeypatch.setattr(run, "HEARTBEAT_MAX_EVENTS", 1)
+    monkeypatch.setattr(run, "HEARTBEAT_MAX_BYTES", 1024)
+    cfg = SimpleNamespace(hub_url="https://hub.invalid")
+    path = tmp_path / "state.db"
+    cap = run.HEARTBEAT_MAX_PAGES
+    oversized = [event(f"{i}:" + "x" * 2000) for i in range(cap + 8)]
+    original = State.drain_events
+    pages = []
+
+    def counting_drain(self, *args, **kwargs):
+        ids, events = original(self, *args, **kwargs)
+        if ids:
+            pages.append(ids)
+        return ids, events
+
+    monkeypatch.setattr(State, "drain_events", counting_drain)
+    first = RecordingTransport()
+    with State(path) as st:
+        st.buffer_events(oversized + [event("deliverable")])
+        assert not run._heartbeat(cfg, st, first, {}, [])
+        assert len(pages) == cap
+        assert st.event_cursor() == cap
+        assert st.pending_event_count() == cap + 9
+    assert [body["events"] for body in first.bodies] == [[]]  # liveness only
+    second = RecordingTransport()
+    with State(path) as st:
+        assert not run._heartbeat(cfg, st, second, {}, [])
+        assert pages[cap][0] == cap + 1  # resumed after the saved cursor
+        assert st.pending_event_count() == cap + 8
+    assert event_counts(item for body in second.bodies for item in body["events"]) == event_counts(
+        [event("deliverable")])
