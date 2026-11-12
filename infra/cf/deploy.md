@@ -342,8 +342,8 @@ Deploying first also risks a failed `main` run, since its migration and smoke st
 to write D1.
 
 **1. Empty `heartbeats` in bounded chunks.** From the repo root (`hub/node_modules` must be
-installed; the script runs `npx --no-install wrangler` in `hub/` and reads the `DB` database
-name from `hub/wrangler.jsonc`):
+installed; the script runs `hub/node_modules/wrangler/bin/wrangler.js` under the current Node
+against the `DB` binding of `hub/wrangler.jsonc`):
 
 ```bash
 node infra/cf/prune-heartbeats.mjs --dry-run      # SELECT COUNT(*) only; may be slow on a full table
@@ -352,11 +352,14 @@ node infra/cf/prune-heartbeats.mjs                # DELETE 500 rows per statemen
 
 Each chunk is one independent `DELETE FROM heartbeats WHERE id IN (SELECT id FROM heartbeats
 ORDER BY id LIMIT n) RETURNING id` and prints one JSON line with `deleted` and the running
-`total`; the run ends with `"state":"empty"`. `--chunk <n>` changes the statement size (lower
-it if a statement times out), `--max-chunks <n>` stops early (`"state":"max_chunks_reached"`),
-and `--retries <n>` (default 5) bounds the per-chunk retry with exponential backoff (2 s doubling,
-capped at 60 s). Interrupting or exhausting retries leaves a partly pruned table; re-run the
-same command. The script drops `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID`/
+`total`; the run ends with `"state":"empty"`. `--chunk <n>` changes the statement size: lower
+it if a statement times out, or raise it if the ~1–2 s of wrangler process start-up per chunk
+dominates the run. `--max-chunks <n>` stops early (`"state":"max_chunks_reached"`). A chunk that
+fails with a recognisably transient error (network, D1 overloaded or internal error, timeout) is
+retried up to `--retries <n>` times (default 5; `0` disables retry) with exponential backoff
+(2 s doubling, capped at 60 s); any other failure — authentication or profile, an SQL error,
+unparseable output — stops at once. Interrupting or failing leaves a partly pruned table;
+re-run the same command. The script drops `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID`/
 `CLOUDFLARE_API_KEY`/`CLOUDFLARE_EMAIL` from wrangler's environment so the `production`
 profile (or `--profile`/`WRANGLER_PROFILE`) is the only credential in play.
 

@@ -22,6 +22,7 @@ export async function heartbeat(request: Request, env: Env, identity: Identity):
   if (identity.kind !== 'machine') return Response.json({ error: 'unauthorized' }, { status: 401 });
   const body = (await request.json()) as {
     collector_version?: string;
+    stores?: Record<string, unknown>;
     events?: Array<{ level: string; code: string; message: string; count?: number; store?: string }>;
   };
   await env.DB.prepare(
@@ -29,7 +30,9 @@ export async function heartbeat(request: Request, env: Env, identity: Identity):
   )
     .bind(identity.machineId, body.collector_version ?? null)
     .run();
-  console.log(JSON.stringify({ event: 'hub.heartbeat', machine: identity.machineId }));
+  // Per-store run counters (files_seen/files_uploaded/bytes_uploaded) are small and the only record
+  // of collector throughput, so they ride on this line; machine-supplied, they stay nested.
+  console.log(JSON.stringify({ event: 'hub.heartbeat', machine: identity.machineId, stores: body.stores ?? {} }));
   for (const e of body.events ?? []) {
     // Nest the machine-supplied event under `payload` — NEVER spread it at top level. Spreading let a
     // collector set `event`/`machine` itself and forge a hub log line (e.g. hub.certs.cf_auth_failed) to

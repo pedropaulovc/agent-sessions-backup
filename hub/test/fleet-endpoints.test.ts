@@ -1809,6 +1809,7 @@ describe('POST /api/v1/heartbeat collector-event relay', () => {
       machine('hb-nostore'),
     );
     const relayed = spy.mock.calls.filter(([line]) => String(line).startsWith('{"event":"collector.event"'));
+    const heartbeatLines = spy.mock.calls.map(([line]) => String(line)).filter((line) => line.startsWith('{"event":"hub.heartbeat"'));
     spy.mockRestore();
     expect(res.status).toBe(200);
     const after = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM heartbeats').first<{ n: number }>();
@@ -1818,6 +1819,10 @@ describe('POST /api/v1/heartbeat collector-event relay', () => {
     expect(m?.last_seen_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
     expect(m?.collector_version).toBe('9.9.9');
     expect(relayed).toHaveLength(events.length); // the events still reach the logs
+    // ...and so do the per-store throughput counters, on the one hub.heartbeat line.
+    expect(heartbeatLines.map((line) => JSON.parse(line))).toEqual([
+      { event: 'hub.heartbeat', machine: 'hb-nostore', stores: { claude: { files_seen: 1 } } },
+    ]);
   });
 });
 

@@ -1,5 +1,7 @@
 import { env } from 'cloudflare:test';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import wranglerSource from '../wrangler.jsonc?raw';
+import { DAILY_CRON, WATCHDOG_CRON } from '../src/cron/schedule';
 import worker from '../src/worker';
 
 /** The scheduled-handler routing. Pricing "stays current automatically" only if the daily cron
@@ -16,6 +18,21 @@ async function auditCount(): Promise<number> {
   const r = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM model_prices_sync').first<{ n: number }>();
   return r?.n ?? 0;
 }
+
+/** Every JSON log line `fire` emitted on `stream`, parsed. */
+function captureLogs(stream: 'log' | 'error'): { lines: Array<Record<string, unknown>>; restore: () => void } {
+  const lines: Array<Record<string, unknown>> = [];
+  const spy = vi.spyOn(console, stream).mockImplementation((...args: unknown[]) => {
+    try {
+      lines.push(JSON.parse(String(args[0])));
+    } catch {
+      // Non-JSON output is not a structured event.
+    }
+  });
+  return { lines, restore: () => spy.mockRestore() };
+}
+
+const D1_CHAIN = ['model_price_sync', 'pricing', 'catalog_reconcile', 'session_rollup', 'cert_prune', 'omp_qa_reports_prune'];
 
 /** Collects waitUntil promises so assertions run after the handler's async work completes. */
 function ctx(): ExecutionContext & { settled: () => Promise<unknown[]> } {
@@ -74,7 +91,7 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe('scheduled handler', () => {
   it('refreshes model prices on the daily cron', async () => {
-    await fire('37 4 * * *');
+    await fire(DAILY_CRON);
     expect(await auditCount(), 'the daily cron never reached runModelPriceSync').toBe(1);
     // Reaching the sync is not the same as the sync WORKING. Assert the run succeeded and that a
     // price actually landed, or a change that makes every cron sync fail stays green here.
@@ -99,7 +116,7 @@ describe('scheduled handler', () => {
     // emptied in beforeEach -- so a pass that ran first cannot price it.
     await testEnv.DB.prepare('UPDATE usage SET input_tokens = 1000000 WHERE session_id = ?1').bind('cron-sess').run();
 
-    await fire('37 4 * * *');
+    await fire(DAILY_CRON);
 
     const row = await testEnv.DB.prepare('SELECT usd, price_epoch FROM usage WHERE session_id = ?1')
       .bind('cron-sess')
@@ -128,7 +145,14 @@ describe('scheduled handler', () => {
     ).run();
     await testEnv.DB.prepare('UPDATE usage SET input_tokens = 1000000 WHERE session_id = ?1').bind('cron-sess').run();
 
-    await fire('37 4 * * *');
+    const logs = captureLogs('log');
+    const errors = captureLogs('error');
+    try {
+      await fire(DAILY_CRON);
+    } finally {
+      logs.restore();
+      errors.restore();
+    }
 
     // Assert the FAILURE actually happened before asserting what survived it. The pricing
     // assertion alone would also pass if the handler stopped calling runModelPriceSync alogether,
@@ -143,43 +167,67 @@ describe('scheduled handler', () => {
       .bind('cron-sess')
       .first<{ usd: number | null }>();
     expect(row?.usd, 'a failed price sync took the pricing pass down with it').toBeCloseTo(1, 6);
+
+    // The failed first step is logged under the one generic event, and every later step of the
+    // chain still ran, in order, after it.
+    expect(errors.lines.filter((o) => o.event === 'hub.cron.daily_step_failed')).toEqual([
+      { event: 'hub.cron.daily_step_failed', step: 'model_price_sync', ms: expect.any(Number), error: expect.any(String) },
+    ]);
+    const chain = logs.lines.filter((o) => o.event === 'hub.cron.daily_step' && o.step !== 'staging_prune');
+    expect(chain.map((o) => [o.step, o.outcome])).toEqual(
+      D1_CHAIN.map((step) => [step, step === 'model_price_sync' ? 'failed' : 'ok']),
+    );
   });
 
-  it('runs every later daily step when an earlier one throws, and logs the failed step', async () => {
-    // The first step (staging prune) lists R2. Failing it must not take the rest of the daily
-    // sequence down: the sync and the pricing pass after it still have to land.
+  it('runs the R2 staging sweep beside the D1 chain, so its failure costs the chain nothing', async () => {
     let listCalls = 0;
     const list = vi.spyOn(testEnv.RAW, 'list').mockImplementation(async () => {
       listCalls++;
       throw new Error('r2 list unavailable');
     });
-    const errors: string[] = [];
-    const errorSpy = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => { errors.push(String(args[0])); });
+    const logs = captureLogs('log');
+    const errors = captureLogs('error');
     await testEnv.DB.prepare('UPDATE usage SET input_tokens = 1000000 WHERE session_id = ?1').bind('cron-sess').run();
 
     try {
-      await fire('37 4 * * *');
+      await fire(DAILY_CRON);
     } finally {
       list.mockRestore();
-      errorSpy.mockRestore();
+      logs.restore();
+      errors.restore();
     }
 
-    // Positive control: the prune really failed, so the later steps ran PAST a failure. Counted by
-    // hand because mockRestore() above also clears the spy's recorded calls.
+    // Positive control: the sweep really failed. Counted by hand because mockRestore() above also
+    // clears the spy's recorded calls.
     expect(listCalls).toBeGreaterThan(0);
-    const failed = errors.map((line) => JSON.parse(line) as Record<string, unknown>)
-      .filter((o) => o.event === 'hub.cron.daily_step_failed');
-    expect(failed).toEqual([{ event: 'hub.cron.daily_step_failed', step: 'prune', error: 'r2 list unavailable' }]);
-    expect(await auditCount(), 'a failed prune skipped the price sync').toBe(1);
+    expect(errors.lines.filter((o) => o.event === 'hub.cron.daily_step_failed')).toEqual([
+      { event: 'hub.cron.daily_step_failed', step: 'staging_prune', ms: expect.any(Number), error: 'r2 list unavailable' },
+    ]);
+    const chain = logs.lines.filter((o) => o.event === 'hub.cron.daily_step' && o.step !== 'staging_prune');
+    expect(chain.map((o) => [o.step, o.outcome])).toEqual(D1_CHAIN.map((step) => [step, 'ok']));
+    // Every step announces itself before running, so a run cut off mid-chain names its last step.
+    expect(logs.lines.filter((o) => o.event === 'hub.cron.daily_step_started').map((o) => o.step).sort())
+      .toEqual(['staging_prune', ...D1_CHAIN].sort());
     const row = await testEnv.DB.prepare('SELECT usd FROM usage WHERE session_id = ?1')
       .bind('cron-sess')
       .first<{ usd: number | null }>();
-    expect(row?.usd, 'a failed prune skipped the pricing pass').toBeCloseTo(5, 6);
+    expect(row?.usd, 'a failed staging sweep skipped the pricing pass').toBeCloseTo(5, 6);
+  });
+
+  it('matches the crons wrangler.jsonc schedules', () => {
+    // A schedule in wrangler.jsonc that scheduled() does not recognise is silently ignored, and one
+    // scheduled() expects but wrangler never fires is silently dead. Strip comments outside string
+    // values (the `//` in URLs survives), then read the top-level triggers.
+    const config = JSON.parse(
+      wranglerSource.replace(/("(?:\\.|[^"\\])*")|\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, (_, str: string | undefined) => str ?? ''),
+    ) as { triggers: { crons: string[] } };
+    expect(config.triggers.crons).toHaveLength(2);
+    expect(new Set(config.triggers.crons)).toEqual(new Set([WATCHDOG_CRON, DAILY_CRON]));
   });
 
   it('does not refresh prices on the 15-minute watchdog tick', async () => {
     // 96 needless upstream fetches a day, and 96 audit rows, if these ever get crossed.
-    await fire('*/15 * * * *');
+    await fire(WATCHDOG_CRON);
     // Assert the fetch, not just the audit row: a sync that fetches and then FAILS writes an
     // audit row too, so the count alone cannot tell "never ran" from "ran and errored".
     expect(fetch, 'the watchdog tick hit the upstream catalog').not.toHaveBeenCalled();
