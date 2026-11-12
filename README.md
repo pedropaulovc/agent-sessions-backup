@@ -165,13 +165,14 @@ refuses production deployment: protected main CI is the sole production control 
 | `scripts/` | Local corpus seeding + verification tooling |
 | `memory/` | Project memory for AI agents working on this repo |
 
-## Collector heartbeat delivery (0.4.6)
+## Collector heartbeat delivery (0.4.7)
 
 Current-run events are committed to the local SQLite queue before heartbeat delivery.
 Each pass reads pages of at most 1,000 rows (also bounded by 256 KiB of text, except
-an individually oversized row), sends at most 64 requests, and caps each encoded
-JSON request at 256 KiB. This stays below [D1's 2 MB row/string limit](https://developers.cloudflare.com/d1/platform/limits/): the hub stores
-the entire heartbeat's stores and events together. Large queues are resumed across
+an individually oversized row), sends at most 8 requests, and caps each encoded
+JSON request at 256 KiB. The hub stores no heartbeat bodies: it updates the machine's
+last-seen time and collector version and relays each event to the logs as
+`collector.event`. Large queues are resumed across
 runs, never loaded wholesale. Before paging each window of at most 100,000 queued
 rows, a single SQLite transaction groups exact matches of level, code, message,
 and store (including the distinction between absent and empty store), sums `count`
@@ -180,11 +181,18 @@ before grouping; neither the whole queue nor a window's messages are loaded into
 Python. Windows start above the saved inspection cursor, and delivery reads stay
 within the compacted window before moving to the next.
 
-A pass can acknowledge up to 64,000 compacted rows; large or heavily escaped
+A pass can acknowledge up to 8,000 compacted rows; large or heavily escaped
 messages reduce throughput. For example, 100,000 rows repeating about 3,100 exact
 per-path messages become about 3,100 events with conserved counts, rather than
 repeating those messages in every 1,000-row page. Unique messages still require
 separate delivery.
+
+External-asset warnings (missing, outside-root, unreadable, or oversized referenced
+images) are queued at most once per parent transcript fingerprint (size, mtime). The
+collector still re-runs discovery for retryable rejections every pass, so a source that
+appears later is uploaded, but an unchanged transcript does not re-report the same
+warning; changing the transcript re-reports its current conditions. Snapshot and upload
+failures for external assets are errors and are reported on every attempt.
 
 Compaction is durable before any network request. Representatives are deleted only
 after HTTP 200; failed requests retain all unacknowledged counts, including new

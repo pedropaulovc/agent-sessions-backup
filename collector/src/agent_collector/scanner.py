@@ -13,6 +13,7 @@ import fnmatch
 import hashlib
 import os
 import sqlite3
+import stat
 import tempfile
 import time
 import urllib.parse
@@ -95,6 +96,23 @@ def _safe_unlink(path: Path) -> None:
         path.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+def _is_plain_file(path: Path) -> bool:
+    """True only for a regular file that is not a link or reparse point, from ONE lstat.
+
+    Symlinks, sockets and FIFOs fail S_ISREG. On Windows an AF_UNIX socket (e.g. codex's
+    app-server-daemon socket) is a reparse point that lstat still reports as a regular file, and
+    opening it fails; the reparse-point attribute excludes it. POSIX stat results have no
+    st_file_attributes, so that check is inert there.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+        return False
+    return stat.S_ISREG(st.st_mode)
 
 
 def _snapshot_sqlite(src: Path, dst: Path, deadline_s: float = SNAPSHOT_DEADLINE_S) -> str:
@@ -241,7 +259,7 @@ class Scanner:
                     self.excluded_counts[store][hit] += 1
                     continue
                 path = Path(dirpath) / fname
-                if not path.is_file() or path.is_symlink():
+                if not _is_plain_file(path):
                     continue
                 item = self._make_item(store, relpath, path)
                 if item:

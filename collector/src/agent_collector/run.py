@@ -192,7 +192,10 @@ def _discover_upload_assets(
         )
     else:
         assets, asset_events = discovered
-    events.extend(_asset_event_dict(e, parent.store) for e in asset_events)
+    # Queued straight to the heartbeat buffer, once per parent fingerprint: retryable rejections
+    # re-run discovery every pass, and an unchanged transcript must not re-report them each time.
+    st.queue_asset_events(parent.store, parent.relpath, parent.size, parent.mtime_ns,
+                          [_asset_event_dict(e, parent.store) for e in asset_events])
     out = ItemResult(seen=len(assets))
     # Stable rejection warnings can be cached, but source/file failures must be retried: the
     # transcript can reference a file that appears or is repaired without changing its own mtime.
@@ -556,9 +559,11 @@ def _upload_multipart(cfg, transport: Transport, item: ScanItem, sha: str) -> tu
 # D1 stores the whole heartbeat stats JSON in one row (2 MB row/string limit).
 # Stay well below that and the edge request cap, measuring the SAME default JSON encoding
 # as Transport.post_json (including ASCII escaping). Bound both queue reads and HTTP work.
+# Each batch is one hub request; a backlog larger than one run's budget stays queued and
+# drains over subsequent scheduled runs (the cursor and compaction survive restarts).
 HEARTBEAT_MAX_BYTES = 256 * 1024
 HEARTBEAT_MAX_EVENTS = 1000
-HEARTBEAT_MAX_BATCHES = 64
+HEARTBEAT_MAX_BATCHES = 8
 HEARTBEAT_COMPACT_ROWS = 100_000
 
 

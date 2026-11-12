@@ -62,7 +62,18 @@ CREATE TABLE IF NOT EXISTS asset_scans (
   PRIMARY KEY (store, parent_relpath)
 ) STRICT;
 
-
+-- External-asset warnings already queued for a parent transcript at a given (size, mtime_ns).
+-- Retryable rejections keep discovery re-running every pass; this table keeps the heartbeat
+-- from re-reporting the same unchanged condition each time.
+CREATE TABLE IF NOT EXISTS asset_event_emissions (
+  store TEXT NOT NULL,
+  parent_relpath TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  mtime_ns INTEGER NOT NULL,
+  code TEXT NOT NULL,
+  message TEXT NOT NULL,
+  PRIMARY KEY (store, parent_relpath, code, message)
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -132,12 +143,15 @@ class State:
             self._reconcile_identity(machine_id, hub_url)
 
     def _reconcile_asset_scan_rules(self) -> None:
-        """Invalidate cached external-asset scans when collector behavior changes."""
+        """Invalidate cached external-asset scans and reported asset warnings when collector
+        behavior changes: new rules may classify the same references differently."""
         key = "asset_scan_rules_version"
         row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         if row is None:
             self.conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (key, __version__))
-            changed = self.conn.execute("SELECT 1 FROM asset_scans LIMIT 1").fetchone() is not None
+            changed = self.conn.execute(
+                "SELECT 1 FROM asset_scans UNION ALL SELECT 1 FROM asset_event_emissions LIMIT 1"
+            ).fetchone() is not None
         else:
             changed = row["value"] != __version__
             if changed:
@@ -146,6 +160,7 @@ class State:
             self.conn.commit()
             return
         self.conn.execute("DELETE FROM asset_scans")
+        self.conn.execute("DELETE FROM asset_event_emissions")
         self.buffer_events([{
             "level": "info",
             "code": "asset_scan_rules_changed",
@@ -169,6 +184,7 @@ class State:
             return
         self.conn.execute("UPDATE files SET status = 'pending', error = NULL")
         self.conn.execute("DELETE FROM asset_scans")
+        self.conn.execute("DELETE FROM asset_event_emissions")
         self.conn.commit()
         self.buffer_events(events)
         self.machine_id_changed = m_changed
@@ -269,7 +285,40 @@ class State:
         )
         self.conn.commit()
 
+    def queue_asset_events(self, store: str, parent_relpath: str, size: int, mtime_ns: int,
+                           events: list[dict]) -> list[dict]:
+        """Buffer each external-asset warning at most once per parent fingerprint.
 
+        Discovery re-runs for retryable rejections, so an unchanged transcript reproduces the
+        same warnings every pass. Keys recorded under an older (size, mtime_ns) are dropped first,
+        so a changed parent reports its conditions afresh. The emission keys and the
+        pending_events rows commit together: a key is never recorded for an unqueued warning.
+        Returns the events newly queued.
+        """
+        queued = []
+        created_at = now_iso()
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM asset_event_emissions WHERE store = ? AND parent_relpath = ? "
+                "AND (size != ? OR mtime_ns != ?)",
+                (store, parent_relpath, size, mtime_ns),
+            )
+            for e in events:
+                cur = self.conn.execute(
+                    "INSERT INTO asset_event_emissions "
+                    "(store, parent_relpath, size, mtime_ns, code, message) "
+                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                    (store, parent_relpath, size, mtime_ns, e["code"], e["message"]),
+                )
+                if cur.rowcount != 1:
+                    continue
+                self.conn.execute(
+                    "INSERT INTO pending_events (level, code, message, count, store, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
+                    (e["level"], e["code"], e["message"], e.get("count", 1), store, created_at),
+                )
+                queued.append(e)
+        return queued
 
     def touch_seen(self, store: str, relpath: str) -> None:
         self.conn.execute(

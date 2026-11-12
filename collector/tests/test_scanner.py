@@ -1,7 +1,12 @@
 import hashlib
 import os
+import socket
 import sqlite3
+import stat
+import tempfile
 import time
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -465,3 +470,47 @@ def test_walk_error_recorded_as_event(tmp_path):
     assert "projects/a.jsonl" in found  # scan continues past the error
     ev = next(e for e in scanner.events if e["code"] == "walk_error")
     assert ev["store"] == "claude" and "secret" in ev["message"]
+
+
+def test_scan_skips_windows_reparse_point_reported_as_regular_file(tmp_path, monkeypatch):
+    # Windows lstat reports an AF_UNIX socket (codex app-server-daemon) as a regular-mode file
+    # carrying FILE_ATTRIBUTE_REPARSE_POINT; opening it fails, so the scan must not yield it.
+    root = tmp_path / ".codex"
+    daemon = root / "app-server-daemon"
+    daemon.mkdir(parents=True)
+    (daemon / "control.sock").write_text("")
+    (root / "session.jsonl").write_text("{}")
+    real_lstat = os.lstat
+
+    def windows_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if not os.fspath(path).endswith("control.sock"):
+            return result
+        assert stat.S_ISREG(result.st_mode)  # the attribute alone must exclude it
+        return SimpleNamespace(st_mode=result.st_mode,
+                               st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+    monkeypatch.setattr(scanner_mod.os, "lstat", windows_lstat)
+    with Scanner([]) as s:
+        found = [i.relpath for i in s.scan_store("codex", root)]
+    assert found == ["session.jsonl"]
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX") or os.name == "nt",
+                    reason="POSIX AF_UNIX sockets only")
+def test_scan_skips_posix_unix_socket_and_fifo():
+    # AF_UNIX paths are capped near 100 bytes; pytest's tmp_path can exceed that.
+    with tempfile.TemporaryDirectory(prefix="ac-", dir="/tmp") as tmp:
+        root = os.path.join(tmp, "r")
+        os.mkdir(root)
+        with open(os.path.join(root, "session.jsonl"), "w") as f:
+            f.write("{}")
+        os.mkfifo(os.path.join(root, "pipe"))
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(os.path.join(root, "daemon.sock"))
+            with Scanner([]) as s:
+                found = [i.relpath for i in s.scan_store("codex", Path(root))]
+        finally:
+            sock.close()
+    assert found == ["session.jsonl"]

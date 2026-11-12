@@ -493,3 +493,78 @@ def test_backfill_dry_run_counts_missing_external_asset(tmp_path, hub, capsys):
         assert run_mod._do_backfill(cfg, st, 1, True) == 0
     assert '"would_upload": 2' in capsys.readouterr().out
     assert hub.files == {}
+
+
+def _missing_image_events(hub):
+    return [
+        e for body in hub.heartbeats for e in body["events"]
+        if e["code"] == "outside_cwd_or_missing"
+    ]
+
+
+@requires_curl
+def test_run_reports_missing_external_image_once_per_parent_fingerprint(tmp_path, hub):
+    root = tmp_path / "omp"
+    root.mkdir()
+    image = tmp_path / "001_img01.jpeg"
+    digest = hashlib.sha256(b"never written").hexdigest()
+    transcript = root / "session.jsonl"
+    _transcript(transcript, str(tmp_path), digest, str(image))
+    cfg = config.Config(machine_id="m1", hub_url=hub.url, auth="dev", stores={"omp": str(root)})
+
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_run(cfg, st) == 0
+        assert run_mod._do_run(cfg, st) == 0
+        reported = _missing_image_events(hub)
+        assert len(reported) == 1
+        assert reported[0]["count"] == 1 and reported[0]["store"] == "omp"
+        assert digest in reported[0]["message"]
+
+        # Same size, new mtime: the parent's fingerprint changed, so the condition is re-reported.
+        stat = transcript.stat()
+        os.utime(transcript, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        assert run_mod._do_run(cfg, st) == 0
+        assert len(_missing_image_events(hub)) == 2
+        assert run_mod._do_run(cfg, st) == 0
+        assert len(_missing_image_events(hub)) == 2
+
+        # Growth changes size too; the stale key from the previous fingerprint is pruned.
+        with transcript.open("a") as f:
+            f.write("{}\n")
+        assert run_mod._do_run(cfg, st) == 0
+        assert len(_missing_image_events(hub)) == 3
+        keys = st.conn.execute(
+            "SELECT size, mtime_ns FROM asset_event_emissions WHERE parent_relpath = 'session.jsonl'"
+        ).fetchall()
+        current = transcript.stat()
+        assert [tuple(k) for k in keys] == [(current.st_size, current.st_mtime_ns)]
+
+
+@requires_curl
+def test_backfill_reports_missing_external_image_once_per_parent_fingerprint(tmp_path, hub):
+    root = tmp_path / "omp"
+    root.mkdir()
+    image = tmp_path / "001_img01.jpeg"
+    digest = hashlib.sha256(b"never written").hexdigest()
+    transcript = root / "session.jsonl"
+    _transcript(transcript, str(tmp_path), digest, str(image))
+    cfg = config.Config(machine_id="m1", hub_url=hub.url, auth="dev", stores={"omp": str(root)})
+
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_backfill(cfg, st, 1, False) == 0
+        assert run_mod._do_backfill(cfg, st, 1, False) == 0
+        _ids, queued = st.drain_events()
+    assert [e["code"] for e in queued].count("outside_cwd_or_missing") == 1
+
+
+def test_asset_warning_keys_reset_when_collector_rules_change(tmp_path):
+    db = tmp_path / "state.db"
+    warning = {"level": "warn", "code": "outside_cwd_or_missing",
+               "message": "external asset rejected d/x.jpeg", "count": 1, "store": "omp"}
+    with State(db) as st:
+        assert st.queue_asset_events("omp", "s.jsonl", 10, 123, [warning]) == [warning]
+        assert st.queue_asset_events("omp", "s.jsonl", 10, 123, [warning]) == []
+        st.conn.execute("UPDATE meta SET value = '0.0.0' WHERE key = 'asset_scan_rules_version'")
+        st.conn.commit()
+    with State(db) as st:
+        assert st.queue_asset_events("omp", "s.jsonl", 10, 123, [warning]) == [warning]

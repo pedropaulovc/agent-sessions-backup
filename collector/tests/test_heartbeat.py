@@ -53,7 +53,7 @@ def test_large_backlog_and_26000_new_events_shrink_with_count_conservation(tmp_p
         st.conn.commit()
         assert run._heartbeat(cfg, st, transport, {}, [event(count=2)] * 26_000)
         assert st.pending_event_count() == 0
-        assert len(transport.bodies) <= 64
+        assert len(transport.bodies) <= run.HEARTBEAT_MAX_BATCHES
     with State(path) as st:
         assert st.pending_event_count() == 0
     actual = Counter()
@@ -285,23 +285,31 @@ def test_compacted_window_exhaustion_advances_past_removed_high_water_id(tmp_pat
         assert st.pending_event_count() == 0
     assert calls[:4] == [0, 3, 6, 9]
     assert event_counts(item for body in transport.bodies for item in body["events"]) == event_counts(events)
-    assert len(transport.bodies) <= 64
+    assert len(transport.bodies) <= run.HEARTBEAT_MAX_BATCHES
 
 
 def test_page_budget_remains_bounded_with_compaction_and_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(run, "HEARTBEAT_MAX_EVENTS", 1)
     cfg = SimpleNamespace(hub_url="https://hub.invalid")
     path = tmp_path / "state.db"
-    first = RecordingTransport()
-    events = [event(f"path/{i}", count=i + 1) for i in range(70)]
+    budget = run.HEARTBEAT_MAX_BATCHES
+    events = [event(f"path/{i}", count=i + 1) for i in range(2 * budget + 6)]
+    passes = []
     with State(path) as st:
+        first = RecordingTransport()
         assert run._heartbeat(cfg, st, first, {}, events)
-        assert len(first.bodies) == 64
-        assert st.pending_event_count() == 6
-    retry = RecordingTransport()
-    with State(path) as st:
-        assert run._heartbeat(cfg, st, retry, {}, [])
-        assert st.pending_event_count() == 0
+        passes.append(first)
+        assert len(first.bodies) == budget
+        assert st.pending_event_count() == budget + 6
+    # Each scheduled run is a fresh process: the backlog drains across restarts, one bounded
+    # request budget per run, without losing or duplicating any event.
+    for expected_pending in (6, 0):
+        retry = RecordingTransport()
+        with State(path) as st:
+            assert run._heartbeat(cfg, st, retry, {}, [])
+            assert len(retry.bodies) <= budget
+            assert st.pending_event_count() == expected_pending
+        passes.append(retry)
     assert event_counts(
-        item for body in first.bodies + retry.bodies for item in body["events"]
+        item for transport in passes for body in transport.bodies for item in body["events"]
     ) == event_counts(events)
