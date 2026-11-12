@@ -161,9 +161,10 @@ class State:
 
         A plain INTEGER PRIMARY KEY reissues max(id)+1, so once the queue drained, new events
         could get IDs at or below the saved delivery cursor and be stranded behind it. The rebuild
-        keeps every row and ID, and seeds the sequence above both the highest ID and the cursor,
-        so no future ID can land at or below either. One write transaction: interruption leaves
-        the legacy table intact, and a concurrent opener re-checks after taking the lock.
+        keeps every row and ID; inserting them seeds the AUTOINCREMENT sequence at MAX(id). The
+        delivery cursor is reset to 0 so rows already stranded below it are delivered first,
+        oldest ID first. One write transaction: interruption leaves the legacy table and cursor
+        intact, and a concurrent opener re-checks after taking the lock.
         """
         if self._pending_event_id_scheme() == ID_SCHEME_AUTOINCREMENT:
             return
@@ -180,14 +181,10 @@ class State:
             )
             self.conn.execute("DROP TABLE pending_events")
             self.conn.execute("ALTER TABLE pending_events_migrating RENAME TO pending_events")
-            floor = self.conn.execute(
-                "SELECT max(coalesce((SELECT MAX(id) FROM pending_events), 0), "
-                "coalesce((SELECT CAST(value AS INTEGER) FROM meta "
-                "WHERE key = 'heartbeat_event_cursor'), 0))"
-            ).fetchone()[0]
-            self.conn.execute("DELETE FROM sqlite_sequence WHERE name = 'pending_events'")
-            self.conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('pending_events', ?)",
-                              (floor,))
+            self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('heartbeat_event_cursor', '0') "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            )
 
     def _pending_event_id_scheme(self) -> str:
         """The pending_events ID scheme recorded in sqlite_master."""

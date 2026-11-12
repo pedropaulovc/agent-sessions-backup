@@ -188,11 +188,12 @@ repeating those messages in every 1,000-row page. Unique messages still require
 separate delivery. Delivery is strictly FIFO from the saved cursor, at most 8 requests
 per run, so the run's own events (including upload, walk, and snapshot failures) wait
 behind an older backlog until it drains over subsequent runs. Queue IDs are
-`AUTOINCREMENT` (older plain-rowid queues are rebuilt in place with their IDs, and the
-sequence starts above both the highest ID and the cursor), so an emptied queue never
-reissues an ID at or below the cursor. When a pass reaches the end with requests left,
-it requeries once from ID 0, picking up rows below the cursor such as retained oversized
-rows.
+`AUTOINCREMENT`, so an emptied queue never reissues an ID at or below the cursor. An
+older plain-rowid queue is rebuilt in place with its IDs, and its cursor is reset to 0
+so rows already stranded below it are delivered first. When a pass reaches the end
+with requests left, it requeries once from ID 0 to pick up deliverable rows below the
+cursor. Retained oversized rows are stepped over without spending a request, and each
+is diagnosed once per pass; they are never delivered.
 
 External-asset warnings from transcript discovery are queued once per store, parent
 transcript, code, and message. The collector still re-runs discovery for retryable

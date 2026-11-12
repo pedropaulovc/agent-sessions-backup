@@ -583,6 +583,10 @@ HEARTBEAT_COMPACT_ROWS = 100_000
 WRAP_PENDING = "pending"
 WRAP_DONE = "done"
 
+# Heartbeat POST outcome (enum).
+POST_ACCEPTED = "accepted"
+POST_REJECTED = "rejected"
+
 
 def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: list[dict]) -> bool:
     # Commit before the first network call: failure, exception, or process interruption must
@@ -596,10 +600,11 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
 
     after_id = st.event_cursor()
     window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
-    oversized = False
+    oversized_ids: set[int] = set()
     delivered = 0
+    posted = 0
     wrap = WRAP_PENDING
-    for sent in range(HEARTBEAT_MAX_BATCHES):
+    while posted < HEARTBEAT_MAX_BATCHES:
         ids, events = st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
         if not ids and window_end is not None:
             # Compaction can remove the window's final IDs. Advance over only those
@@ -610,8 +615,8 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
                            if window_end is not None else ([], []))
         if not ids and after_id:
             # Reached the end above the cursor. Rows below it (retained oversized rows, a stale
-            # cursor from before IDs were monotonic) are revisited from zero once per pass, with
-            # whatever budget remains, instead of waiting for a later run.
+            # cursor) are revisited from zero once per pass, with whatever budget remains,
+            # instead of waiting for a later run.
             st.set_event_cursor(0)
             if wrap == WRAP_DONE:
                 break
@@ -619,8 +624,9 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
             after_id = 0
             window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
             ids, events = st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
-            if not ids and sent:
-                break  # queue empty; an earlier request already proved liveness
+        if not ids:
+            st.set_event_cursor(0)
+            break
         ack_ids = []
         grouped = {}
         size = base_size
@@ -635,8 +641,9 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
             # Reserve the largest count this group can have after coalescing the page.
             added = len(json.dumps(dict(event, count=-max_count)).encode("utf-8"))
             if base_size + added > HEARTBEAT_MAX_BYTES:
-                print(f"heartbeat event {event_id} exceeds payload budget; retained", file=sys.stderr)
-                oversized = True
+                if event_id not in oversized_ids:
+                    print(f"heartbeat event {event_id} exceeds payload budget; retained", file=sys.stderr)
+                    oversized_ids.add(event_id)
                 after_id = event_id
                 continue
             added += 2 if grouped else 0
@@ -646,23 +653,37 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
             ack_ids.append(event_id)
             size += added
             after_id = event_id
+        if not ack_ids:
+            # Only retained oversized rows: step past them without spending a request.
+            st.set_event_cursor(after_id)
+            continue
         body["events"] = list(grouped.values())
-        status, response = transport.post_json(f"{cfg.hub_url}/api/v1/heartbeat", body)
-        if status != 200:
-            # Escape controls and bound diagnostics; never print the request or credentials.
-            detail = json.dumps(response[:512], ensure_ascii=True)
-            print(f"heartbeat failed: HTTP {status}; response={detail}; events retained", file=sys.stderr)
+        if _post_heartbeat(cfg, transport, body) != POST_ACCEPTED:
             return False
+        posted += 1
         st.delete_events(ack_ids)
         delivered += len(ack_ids)
         st.set_event_cursor(after_id)
-        if not ids:
-            st.set_event_cursor(0)
-            break
+    if not posted:
+        # No deliverable events: the heartbeat itself still proves an authenticated write.
+        body["events"] = []
+        if _post_heartbeat(cfg, transport, body) != POST_ACCEPTED:
+            return False
     remaining = st.pending_event_count()
     if remaining:
         print(f"heartbeat events: acknowledged_rows={delivered} pending_rows={remaining}", file=sys.stderr)
-    return not oversized
+    return not oversized_ids
+
+
+def _post_heartbeat(cfg, transport: Transport, body: dict) -> str:
+    """POST one heartbeat body: POST_ACCEPTED on HTTP 200, else POST_REJECTED (diagnosed)."""
+    status, response = transport.post_json(f"{cfg.hub_url}/api/v1/heartbeat", body)
+    if status == 200:
+        return POST_ACCEPTED
+    # Escape controls and bound diagnostics; never print the request or credentials.
+    detail = json.dumps(response[:512], ensure_ascii=True)
+    print(f"heartbeat failed: HTTP {status}; response={detail}; events retained", file=sys.stderr)
+    return POST_REJECTED
 
 
 # ---------------------------------------------------------------------- backfill

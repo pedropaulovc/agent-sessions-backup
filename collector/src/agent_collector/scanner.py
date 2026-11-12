@@ -112,11 +112,12 @@ _UNOPENABLE_REPARSE_TAGS = frozenset({
 # Directory-entry kinds (enum, not a bool): only ENTRY_REGULAR is captured.
 ENTRY_REGULAR = "regular"
 ENTRY_NOT_REGULAR = "not_regular"  # symlink, socket, FIFO, device, unopenable reparse point
-ENTRY_VANISHED = "vanished"        # lstat failed
+ENTRY_GONE = "gone"                # lstat: FileNotFoundError (deleted since listing)
+ENTRY_UNREADABLE = "unreadable"    # lstat: any other OSError (permission, EIO, sharing)
 
 # Per-store walk outcome (enum). Only a complete walk proves an unseen file is gone.
 WALK_COMPLETE = "complete"
-WALK_INCOMPLETE = "incomplete"     # missing root, walk_error, or an entry that failed to stat
+WALK_INCOMPLETE = "incomplete"     # missing root, walk_error, or an unreadable entry
 
 
 def _entry_kind(path: Path) -> str:
@@ -130,8 +131,10 @@ def _entry_kind(path: Path) -> str:
     """
     try:
         st = os.lstat(path)
+    except FileNotFoundError:
+        return ENTRY_GONE
     except OSError:
-        return ENTRY_VANISHED
+        return ENTRY_UNREADABLE
     if getattr(st, "st_reparse_tag", 0) in _UNOPENABLE_REPARSE_TAGS:
         return ENTRY_NOT_REGULAR
     return ENTRY_REGULAR if stat.S_ISREG(st.st_mode) else ENTRY_NOT_REGULAR
@@ -290,11 +293,11 @@ class Scanner:
                     continue
                 path = Path(dirpath) / fname
                 kind = _entry_kind(path)
-                if kind == ENTRY_VANISHED:
+                if kind == ENTRY_UNREADABLE:
                     self.walk_states[store] = WALK_INCOMPLETE
                     continue
                 if kind != ENTRY_REGULAR:
-                    continue
+                    continue  # not a regular file, or deleted since listing (proven gone)
                 item = self._make_item(store, relpath, path)
                 if item:
                     yield item
@@ -302,6 +305,8 @@ class Scanner:
     def _make_item(self, store: str, relpath: str, path: Path) -> ScanItem | None:
         try:
             st = path.stat()
+        except FileNotFoundError:
+            return None  # deleted since listing: proven gone, the walk stays complete
         except OSError:
             self.walk_states[store] = WALK_INCOMPLETE
             return None

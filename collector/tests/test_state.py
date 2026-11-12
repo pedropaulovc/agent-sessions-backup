@@ -266,13 +266,14 @@ def test_legacy_rowid_pending_events_migrate_to_monotonic_ids(tmp_path):
         assert "AUTOINCREMENT" in sql.upper()
         assert [tuple(r) for r in st.conn.execute(
             "SELECT * FROM pending_events ORDER BY id")] == before
-        assert st.event_cursor() == 12
-        # New IDs start above both the highest row and the saved cursor, and are never reissued
-        # after the queue empties.
+        # The cursor restarts at 0 so rows stranded below it are delivered oldest first.
+        assert st.event_cursor() == 0
+        # New IDs continue above the highest kept row and are never reissued after the queue
+        # empties.
         st.buffer_events([{"level": "warn", "code": "c", "message": "z"}])
         ids, _ = st.drain_events()
-        assert ids == [3, 7, 13]
+        assert ids == [3, 7, 8]
         st.delete_events(ids)
     with State(db) as st:
         st.buffer_events([{"level": "warn", "code": "c", "message": "again"}])
-        assert st.conn.execute("SELECT id FROM pending_events").fetchone()[0] == 14
+        assert st.conn.execute("SELECT id FROM pending_events").fetchone()[0] == 9

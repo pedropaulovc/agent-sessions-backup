@@ -1,6 +1,7 @@
 """Heartbeat queue conservation, request limits, and bounded recovery work."""
 from collections import Counter
 import json
+import sqlite3
 from types import SimpleNamespace
 
 import pytest
@@ -397,3 +398,57 @@ def test_backlog_progresses_every_run_under_sustained_overflow(tmp_path, monkeyp
         if run_no == 0:
             assert [b["events"][0]["message"] for b in transport.bodies[:3]] == [
                 "old/0", "old/1", "old/2"]
+
+
+def test_retained_oversized_row_costs_no_request_and_warns_once_per_pass(tmp_path, capsys):
+    cfg = SimpleNamespace(hub_url="https://hub.invalid")
+    path = tmp_path / "state.db"
+    huge = event("x" * (256 * 1024))
+    with State(path) as st:
+        st.buffer_events([huge])
+    for run_no in range(3):
+        transport = RecordingTransport()
+        with State(path) as st:
+            assert not run._heartbeat(cfg, st, transport, {}, [event(f"fresh/{run_no}")])
+            assert st.pending_event_count() == 1
+        # One request carrying the deliverable event; no trailing empty POST for the wrap
+        # that revisits the retained row.
+        assert [body["events"] for body in transport.bodies] == [[event(f"fresh/{run_no}")]]
+        assert capsys.readouterr().err.count("exceeds payload budget; retained") == 1
+    # With only the retained row queued, the heartbeat still proves liveness with one request.
+    transport = RecordingTransport()
+    with State(path) as st:
+        assert not run._heartbeat(cfg, st, transport, {}, [])
+    assert [body["events"] for body in transport.bodies] == [[]]
+
+
+def test_legacy_stranded_rows_drain_after_migration_under_sustained_traffic(tmp_path, monkeypatch):
+    # A legacy plain-rowid queue already stranded: cursor=16 with rows 9..30, so 9..16 sit below
+    # the cursor while fresh rows keep the FIFO pass busy above it every run.
+    monkeypatch.setattr(run, "HEARTBEAT_MAX_EVENTS", 1)
+    cfg = SimpleNamespace(hub_url="https://hub.invalid")
+    path = tmp_path / "state.db"
+    legacy = sqlite3.connect(path)
+    legacy.executescript("""
+        CREATE TABLE pending_events (
+          id INTEGER PRIMARY KEY, level TEXT NOT NULL, code TEXT NOT NULL,
+          message TEXT NOT NULL, count INTEGER NOT NULL DEFAULT 1, store TEXT,
+          created_at TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT) STRICT;
+        INSERT INTO meta VALUES ('heartbeat_event_cursor', '16');
+    """)
+    legacy.executemany(
+        "INSERT INTO pending_events VALUES (?, 'warn', 'missing_source', ?, 1, 'omp', "
+        "'2026-01-01T00:00:00Z')",
+        ((i, f"legacy/{i}") for i in range(9, 31)),
+    )
+    legacy.commit()
+    legacy.close()
+    for run_no in range(30):
+        with State(path) as st:
+            assert run._heartbeat(cfg, st, RecordingTransport(), {},
+                                  [event(f"fresh/{run_no}/{i}") for i in range(10)])
+    with State(path) as st:
+        assert st.conn.execute(
+            "SELECT COUNT(*) FROM pending_events WHERE message LIKE 'legacy/%'").fetchone()[0] == 0
