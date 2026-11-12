@@ -527,3 +527,24 @@ def test_scan_skips_posix_unix_socket_and_fifo():
         finally:
             sock.close()
     assert found == ["session.jsonl"]
+
+
+def test_walk_state_incomplete_when_an_entry_fails_to_stat(tmp_path, monkeypatch):
+    root = tmp_path / ".claude"
+    root.mkdir()
+    (root / "a.jsonl").write_text("{}")
+    (root / "b.jsonl").write_text("{}")
+    with Scanner([]) as s:
+        assert [i.relpath for i in s.scan_store("claude", root)] == ["a.jsonl", "b.jsonl"]
+        assert s.walk_state("claude") == scanner_mod.WALK_COMPLETE
+        real_lstat = os.lstat
+
+        def failing_lstat(path, *args, **kwargs):
+            if os.fspath(path).endswith("b.jsonl"):
+                raise FileNotFoundError(2, "vanished", os.fspath(path))
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(scanner_mod.os, "lstat", failing_lstat)
+        assert [i.relpath for i in s.scan_store("claude", root)] == ["a.jsonl"]
+        assert s.walk_state("claude") == scanner_mod.WALK_INCOMPLETE
+        assert s.walk_state("never-scanned") == scanner_mod.WALK_INCOMPLETE

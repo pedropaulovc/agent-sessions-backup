@@ -27,7 +27,9 @@ from .external_images import (
     discover_external_assets,
     open_external_asset,
 )
-from .scanner import Scanner, ScanItem, read_exact, read_range, hash_bytes, hash_file_prefix
+from .scanner import (
+    WALK_COMPLETE, Scanner, ScanItem, read_exact, read_range, hash_bytes, hash_file_prefix,
+)
 from .state import State, OverlapLock, now_iso, state_path
 from .transport import Transport, DevAuth, MtlsAuth, Upload, MIN_CURL_VERSION, normalize_thumbprint
 
@@ -344,11 +346,9 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
                 if assets_res.error:
                     errors += 1
             # Only a complete walk proves a parent is gone; a missing root, an unreadable
-            # subtree, or an empty (e.g. unmounted) mountpoint would otherwise forget warnings
-            # that are still current.
-            walk_failed = any(e["code"] == "walk_error" and e.get("store") == store
-                              for e in scanner.events)
-            if seen and not walk_failed:
+            # subtree, an entry that failed to stat, or an empty (e.g. unmounted) mountpoint
+            # would otherwise forget warnings that are still current.
+            if seen and scanner.walk_state(store) == WALK_COMPLETE:
                 st.prune_asset_events(store, seen)
         # Traversal/snapshot warnings (walk_error, snapshot_timeout) raised during the walk.
         events.extend(scanner.events)
@@ -579,6 +579,10 @@ HEARTBEAT_MAX_EVENTS = 1000
 HEARTBEAT_MAX_BATCHES = 8
 HEARTBEAT_COMPACT_ROWS = 100_000
 
+# Per-pass wrap state (enum): whether delivery already requeried from ID 0 after reaching the end.
+WRAP_PENDING = "pending"
+WRAP_DONE = "done"
+
 
 def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: list[dict]) -> bool:
     # Commit before the first network call: failure, exception, or process interruption must
@@ -594,7 +598,8 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
     window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
     oversized = False
     delivered = 0
-    for _batch in range(HEARTBEAT_MAX_BATCHES):
+    wrap = WRAP_PENDING
+    for sent in range(HEARTBEAT_MAX_BATCHES):
         ids, events = st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
         if not ids and window_end is not None:
             # Compaction can remove the window's final IDs. Advance over only those
@@ -604,14 +609,18 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
             ids, events = (st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
                            if window_end is not None else ([], []))
         if not ids and after_id:
+            # Reached the end above the cursor. Rows below it (retained oversized rows, a stale
+            # cursor from before IDs were monotonic) are revisited from zero once per pass, with
+            # whatever budget remains, instead of waiting for a later run.
             st.set_event_cursor(0)
-            if _batch:
+            if wrap == WRAP_DONE:
                 break
-            # A saved cursor can outlive all pending IDs, including when SQLite
-            # reuses IDs after deletion. Requery from zero in this same pass.
+            wrap = WRAP_DONE
             after_id = 0
             window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
             ids, events = st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
+            if not ids and sent:
+                break  # queue empty; an earlier request already proved liveness
         ack_ids = []
         grouped = {}
         size = base_size

@@ -111,9 +111,12 @@ _UNOPENABLE_REPARSE_TAGS = frozenset({
 
 # Directory-entry kinds (enum, not a bool): only ENTRY_REGULAR is captured.
 ENTRY_REGULAR = "regular"
-ENTRY_NOT_REGULAR = "not_regular"          # symlink, socket, FIFO, device, directory
-ENTRY_UNOPENABLE_REPARSE = "unopenable_reparse"
-ENTRY_VANISHED = "vanished"                # lstat failed
+ENTRY_NOT_REGULAR = "not_regular"  # symlink, socket, FIFO, device, unopenable reparse point
+ENTRY_VANISHED = "vanished"        # lstat failed
+
+# Per-store walk outcome (enum). Only a complete walk proves an unseen file is gone.
+WALK_COMPLETE = "complete"
+WALK_INCOMPLETE = "incomplete"     # missing root, walk_error, or an entry that failed to stat
 
 
 def _entry_kind(path: Path) -> str:
@@ -130,7 +133,7 @@ def _entry_kind(path: Path) -> str:
     except OSError:
         return ENTRY_VANISHED
     if getattr(st, "st_reparse_tag", 0) in _UNOPENABLE_REPARSE_TAGS:
-        return ENTRY_UNOPENABLE_REPARSE
+        return ENTRY_NOT_REGULAR
     return ENTRY_REGULAR if stat.S_ISREG(st.st_mode) else ENTRY_NOT_REGULAR
 
 
@@ -230,6 +233,11 @@ class Scanner:
         # Heartbeat warning events raised during the walk (snapshot_timeout, walk_error).
         # Drained by run/backfill so they reach the hub, and printed by doctor.
         self.events: list[dict] = []
+        self.walk_states: dict[str, str] = {}
+
+    def walk_state(self, store: str) -> str:
+        """WALK_COMPLETE only if the latest scan_store(store) walked everything it listed."""
+        return self.walk_states.get(store, WALK_INCOMPLETE)
 
     def close(self) -> None:
         self._tmp.cleanup()
@@ -242,11 +250,14 @@ class Scanner:
 
     def scan_store(self, store: str, root: Path) -> Iterator[ScanItem]:
         if not root.exists():
+            self.walk_states[store] = WALK_INCOMPLETE
             return
+        self.walk_states[store] = WALK_COMPLETE
 
         def _onerror(err: OSError) -> None:
             # os.walk silently drops an unreadable/vanished subtree without a callback;
             # surface it so capture-all never loses transcripts without a signal.
+            self.walk_states[store] = WALK_INCOMPLETE
             self.events.append({
                 "level": "error", "code": "walk_error",
                 "message": f"{getattr(err, 'filename', root)}: {err} "
@@ -278,7 +289,11 @@ class Scanner:
                     self.excluded_counts[store][hit] += 1
                     continue
                 path = Path(dirpath) / fname
-                if _entry_kind(path) != ENTRY_REGULAR:
+                kind = _entry_kind(path)
+                if kind == ENTRY_VANISHED:
+                    self.walk_states[store] = WALK_INCOMPLETE
+                    continue
+                if kind != ENTRY_REGULAR:
                     continue
                 item = self._make_item(store, relpath, path)
                 if item:
@@ -288,6 +303,7 @@ class Scanner:
         try:
             st = path.stat()
         except OSError:
+            self.walk_states[store] = WALK_INCOMPLETE
             return None
         if path.name.lower().endswith(DB_SUFFIXES):  # case-insensitive: State.DB is a DB too
             self._snap_seq += 1

@@ -653,3 +653,31 @@ def test_asset_warning_keys_reset_on_rules_or_identity_change(tmp_path):
         assert st.queue_asset_events("omp", "s.jsonl", [warning]) == [warning]
     with State(db, machine_id="B") as st:
         assert st.queue_asset_events("omp", "s.jsonl", [warning]) == [warning]
+
+
+@requires_curl
+def test_run_keeps_reported_warnings_when_an_entry_fails_to_stat(tmp_path, hub, monkeypatch):
+    # An lstat failure mid-walk means the walk cannot prove which transcripts are gone.
+    root = tmp_path / "omp"
+    root.mkdir()
+    transcript = root / "session.jsonl"
+    _transcript(transcript, str(tmp_path), hashlib.sha256(b"x").hexdigest(),
+                str(tmp_path / "001_img01.jpeg"))
+    (root / "other.jsonl").write_text("{}\n")
+    (root / "flaky.jsonl").write_text("{}\n")
+    cfg = config.Config(machine_id="m1", hub_url=hub.url, auth="dev", stores={"omp": str(root)})
+
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_run(cfg, st) == 0
+        transcript.unlink()
+        real_lstat = os.lstat
+
+        def failing_lstat(path, *args, **kwargs):
+            if os.fspath(path).endswith("flaky.jsonl"):
+                raise PermissionError(13, "denied", os.fspath(path))
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", failing_lstat)
+        assert run_mod._do_run(cfg, st) == 0
+        monkeypatch.undo()
+        assert st.conn.execute("SELECT COUNT(*) FROM asset_event_emissions").fetchone()[0] == 1

@@ -218,20 +218,21 @@ def test_compaction_failure_retains_current_events_before_restart(tmp_path, monk
     assert sent_count(transport) == 8
 
 
-@pytest.mark.parametrize("reused_id", [False, True])
-def test_stale_cursor_requeries_and_delivers_in_same_pass(tmp_path, reused_id):
+@pytest.mark.parametrize("cursor_at", ["last_delivered_id", "far_above"])
+def test_stale_cursor_requeries_and_delivers_in_same_pass(tmp_path, cursor_at):
     cfg = SimpleNamespace(hub_url="https://hub.invalid")
     path = tmp_path / "state.db"
     with State(path) as st:
         st.buffer_events([event("previous")])
         ids, _ = st.drain_events()
-        st.set_event_cursor(ids[-1] if reused_id else 10_000)
+        st.set_event_cursor(ids[-1] if cursor_at == "last_delivered_id" else 10_000)
         st.delete_events(ids)
     transport = RecordingTransport()
     with State(path) as st:
         st.buffer_events([event("new", count=7)])
-        if reused_id:
-            assert st.conn.execute("SELECT id FROM pending_events").fetchone()[0] == 1
+        if cursor_at == "last_delivered_id":
+            # AUTOINCREMENT: the emptied queue does not reissue the delivered ID.
+            assert st.conn.execute("SELECT id FROM pending_events").fetchone()[0] == ids[-1] + 1
         assert run._heartbeat(cfg, st, transport, {}, [])
         assert st.pending_event_count() == 0
     assert event_counts(item for body in transport.bodies for item in body["events"]) == event_counts(
@@ -254,15 +255,13 @@ def test_nonzero_cursor_compacts_only_unvisited_window_before_delivery(tmp_path,
         st.buffer_events([event("earlier"), event("later", count=2), event("later", count=3)])
         st.set_event_cursor(1)
         assert run._heartbeat(cfg, st, transport, {}, [])
+        # The unvisited window above the cursor is compacted and delivered first; reaching its
+        # end then wraps to ID 0 once, delivering the row below the cursor in the same pass.
         assert calls[0] == 1
-        assert st.pending_event_count() == 1
-        assert st.event_cursor() == 0
-        assert event_counts(
-            item for body in transport.bodies for item in body["events"]
-        ) == event_counts([event("later", count=5)])
-        assert run._heartbeat(cfg, st, transport, {}, [])
-        assert 0 in calls
+        assert 0 in calls[1:]
         assert st.pending_event_count() == 0
+        assert st.event_cursor() == 0
+    assert event_counts(transport.bodies[0]["events"]) == event_counts([event("later", count=5)])
     assert event_counts(item for body in transport.bodies for item in body["events"]) == event_counts(
         [event("earlier"), event("later", count=5)]
     )
@@ -315,26 +314,86 @@ def test_page_budget_remains_bounded_with_compaction_and_restart(tmp_path, monke
     ) == event_counts(events)
 
 
-def test_budget_exhausted_on_empty_queue_then_reused_low_ids_still_deliver(tmp_path, monkeypatch):
-    # Run A spends its whole request budget draining the queue exactly, so it never observes the
-    # empty queue and leaves the cursor at its last ID. SQLite then reuses low IDs for run B's
-    # rows (rowid = max + 1 on an empty table); B must requery from zero and deliver them now.
-    monkeypatch.setattr(run, "HEARTBEAT_MAX_EVENTS", 2)
+def test_reviewer_stranded_reused_ids_scenario_drains_fully(tmp_path, monkeypatch):
+    # Run A drains 16 rows exactly (cursor=16, queue empty). Run B queues 30 rows and sends 8
+    # (cursor=24). Then 40 runs each add 10 fresh rows. With reused rowids B's rows landed at
+    # IDs 1..30, so 1..16 sat below the cursor forever while fresh rows kept it busy above.
     cfg = SimpleNamespace(hub_url="https://hub.invalid")
     path = tmp_path / "state.db"
     budget = run.HEARTBEAT_MAX_BATCHES
-    first = [event(f"a/{i}") for i in range(2 * budget)]
-    a = RecordingTransport()
+    monkeypatch.setattr(run, "HEARTBEAT_MAX_EVENTS", 2)
+    passes = []
+    produced = [event(f"a/{i}") for i in range(2 * budget)]
     with State(path) as st:
-        assert run._heartbeat(cfg, st, a, {}, first)
-        assert len(a.bodies) == budget
+        passes.append(RecordingTransport())
+        assert run._heartbeat(cfg, st, passes[-1], {}, produced)
         assert st.pending_event_count() == 0
         assert st.event_cursor() == 2 * budget
-    second = [event(f"b/{i}") for i in range(budget)]
-    b = RecordingTransport()
+    monkeypatch.setattr(run, "HEARTBEAT_MAX_EVENTS", 1)
+    b_rows = [event(f"b/{i}") for i in range(30)]
+    produced += b_rows
     with State(path) as st:
-        st.buffer_events(second)
-        assert max(row[0] for row in st.conn.execute("SELECT id FROM pending_events")) < 2 * budget
-        assert run._heartbeat(cfg, st, b, {}, [])
+        passes.append(RecordingTransport())
+        assert run._heartbeat(cfg, st, passes[-1], {}, b_rows)
+        assert min(r[0] for r in st.conn.execute("SELECT id FROM pending_events")) > 2 * budget
+    for run_no in range(40):
+        fresh = [event(f"fresh/{run_no}/{i}") for i in range(10)]
+        produced += fresh
+        with State(path) as st:
+            passes.append(RecordingTransport())
+            assert run._heartbeat(cfg, st, passes[-1], {}, fresh)
+    with State(path) as st:
+        stranded = st.conn.execute(
+            "SELECT COUNT(*) FROM pending_events WHERE message LIKE 'b/%'").fetchone()[0]
+        assert stranded == 0
+    for _ in range(20):
+        with State(path) as st:
+            passes.append(RecordingTransport())
+            assert run._heartbeat(cfg, st, passes[-1], {}, [])
+            if st.pending_event_count() == 0:
+                break
+    else:
+        pytest.fail("queue did not drain once fresh traffic stopped")
+    assert event_counts(
+        item for t in passes for body in t.bodies for item in body["events"]
+    ) == event_counts(produced)
+
+
+def test_rows_below_cursor_are_revisited_after_reaching_the_end_in_the_same_pass(tmp_path,
+                                                                              monkeypatch):
+    # Reaching the end on a later batch with budget left wraps to ID 0 once, so a row below the
+    # cursor is delivered this run instead of waiting for a later one.
+    monkeypatch.setattr(run, "HEARTBEAT_MAX_EVENTS", 1)
+    cfg = SimpleNamespace(hub_url="https://hub.invalid")
+    transport = RecordingTransport()
+    with State(tmp_path / "state.db") as st:
+        st.buffer_events([event("below"), event("above/1"), event("above/2")])
+        st.set_event_cursor(1)
+        assert run._heartbeat(cfg, st, transport, {}, [])
         assert st.pending_event_count() == 0
-    assert event_counts(item for body in b.bodies for item in body["events"]) == event_counts(second)
+        assert st.event_cursor() == 0
+    assert [body["events"][0]["message"] for body in transport.bodies] == [
+        "above/1", "above/2", "below"]
+
+
+def test_backlog_progresses_every_run_under_sustained_overflow(tmp_path, monkeypatch):
+    # Every run adds more rows than its 8 requests can carry. Strict FIFO still sends the oldest
+    # rows first each run, so the oldest pending ID always advances and nothing is starved.
+    monkeypatch.setattr(run, "HEARTBEAT_MAX_EVENTS", 1)
+    cfg = SimpleNamespace(hub_url="https://hub.invalid")
+    path = tmp_path / "state.db"
+    budget = run.HEARTBEAT_MAX_BATCHES
+    backlog = [event(f"old/{i}") for i in range(3)]
+    with State(path) as st:
+        st.buffer_events(backlog)
+    for run_no in range(5):
+        with State(path) as st:
+            oldest = st.conn.execute("SELECT MIN(id) FROM pending_events").fetchone()[0]
+            transport = RecordingTransport()
+            fresh = [event(f"run{run_no}/{i}") for i in range(budget + 2)]
+            assert run._heartbeat(cfg, st, transport, {}, fresh)
+            assert len(transport.bodies) == budget
+            assert st.conn.execute("SELECT MIN(id) FROM pending_events").fetchone()[0] == oldest + budget
+        if run_no == 0:
+            assert [b["events"][0]["message"] for b in transport.bodies[:3]] == [
+                "old/0", "old/1", "old/2"]

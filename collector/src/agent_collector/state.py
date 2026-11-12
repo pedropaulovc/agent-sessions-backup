@@ -8,6 +8,21 @@ from pathlib import Path
 
 from . import __version__
 
+# AUTOINCREMENT: an ID at or below the heartbeat inspection cursor is never issued again, so a
+# newly buffered event can never land behind the cursor (plain rowids reuse max(id)+1 after the
+# queue empties). Shared with the legacy-table migration in State._reconcile_pending_event_ids.
+_PENDING_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS {table} (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  level TEXT NOT NULL,
+  code TEXT NOT NULL,
+  message TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 1,
+  store TEXT,
+  created_at TEXT NOT NULL
+) STRICT;
+"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
   id INTEGER PRIMARY KEY,
@@ -36,15 +51,7 @@ CREATE TABLE IF NOT EXISTS runs (
   errors INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS pending_events (
-  id INTEGER PRIMARY KEY,
-  level TEXT NOT NULL,
-  code TEXT NOT NULL,
-  message TEXT NOT NULL,
-  count INTEGER NOT NULL DEFAULT 1,
-  store TEXT,
-  created_at TEXT NOT NULL
-) STRICT;
+""" + _PENDING_EVENTS_DDL.format(table="pending_events") + """
 
 CREATE TABLE IF NOT EXISTS webcapture_convs (
   product TEXT NOT NULL,          -- chatgpt | claude
@@ -86,6 +93,10 @@ ASSET_EMISSION_PRUNE_PAGE = 1000
 
 SQLITE_BUSY = 5
 SQLITE_LOCKED = 6
+
+# pending_events ID schemes (enum): legacy plain rowids, or monotonic AUTOINCREMENT IDs.
+ID_SCHEME_ROWID = "rowid"
+ID_SCHEME_AUTOINCREMENT = "autoincrement"
 
 
 def _is_lock_contention(e: sqlite3.OperationalError) -> bool:
@@ -138,11 +149,52 @@ class State:
         self.conn.execute("PRAGMA synchronous = NORMAL")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        self._reconcile_pending_event_ids()
         self._reconcile_asset_scan_rules()
         self.machine_id_changed = False
         self.hub_url_changed = False
         if machine_id is not None or hub_url is not None:
             self._reconcile_identity(machine_id, hub_url)
+
+    def _reconcile_pending_event_ids(self) -> None:
+        """Migrate a legacy plain-rowid pending_events table to AUTOINCREMENT IDs.
+
+        A plain INTEGER PRIMARY KEY reissues max(id)+1, so once the queue drained, new events
+        could get IDs at or below the saved delivery cursor and be stranded behind it. The rebuild
+        keeps every row and ID, and seeds the sequence above both the highest ID and the cursor,
+        so no future ID can land at or below either. One write transaction: interruption leaves
+        the legacy table intact, and a concurrent opener re-checks after taking the lock.
+        """
+        if self._pending_event_id_scheme() == ID_SCHEME_AUTOINCREMENT:
+            return
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            if self._pending_event_id_scheme() == ID_SCHEME_AUTOINCREMENT:
+                return
+            self.conn.execute("DROP TABLE IF EXISTS pending_events_migrating")
+            self.conn.execute(_PENDING_EVENTS_DDL.format(table="pending_events_migrating"))
+            self.conn.execute(
+                "INSERT INTO pending_events_migrating "
+                "(id, level, code, message, count, store, created_at) "
+                "SELECT id, level, code, message, count, store, created_at FROM pending_events"
+            )
+            self.conn.execute("DROP TABLE pending_events")
+            self.conn.execute("ALTER TABLE pending_events_migrating RENAME TO pending_events")
+            floor = self.conn.execute(
+                "SELECT max(coalesce((SELECT MAX(id) FROM pending_events), 0), "
+                "coalesce((SELECT CAST(value AS INTEGER) FROM meta "
+                "WHERE key = 'heartbeat_event_cursor'), 0))"
+            ).fetchone()[0]
+            self.conn.execute("DELETE FROM sqlite_sequence WHERE name = 'pending_events'")
+            self.conn.execute("INSERT INTO sqlite_sequence (name, seq) VALUES ('pending_events', ?)",
+                              (floor,))
+
+    def _pending_event_id_scheme(self) -> str:
+        """The pending_events ID scheme recorded in sqlite_master."""
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pending_events'"
+        ).fetchone()
+        return ID_SCHEME_AUTOINCREMENT if "AUTOINCREMENT" in row[0].upper() else ID_SCHEME_ROWID
 
     def _reconcile_asset_scan_rules(self) -> None:
         """Invalidate cached external-asset scans and reported asset warnings when collector
