@@ -37,11 +37,11 @@ const CONFIG = path.join(HUB_DIR, 'wrangler.jsonc');
 const WRANGLER_BIN = path.join(HUB_DIR, 'node_modules', 'wrangler', 'bin', 'wrangler.js');
 const IGNORED_CF_ENV = ['CLOUDFLARE_API_TOKEN', 'CLOUDFLARE_ACCOUNT_ID', 'CLOUDFLARE_API_KEY', 'CLOUDFLARE_EMAIL'];
 
-// Retried only when the error text says the failure was in transit or in D1's own availability.
-// Anything unrecognised is treated as deterministic: a retry loop around an auth or SQL error
-// only delays the operator seeing it.
-const DETERMINISTIC_ERROR = /no such table|no such column|syntax error|SQLITE_(?:ERROR|CONSTRAINT|AUTH)|authenticat|unauthori[sz]ed|forbidden|not logged in|wrangler login|(?:unknown|no such|invalid|missing) profile|profile \S+ (?:does not exist|not found)|couldn't find|could not find|\b(?:400|401|403|404)\b/i;
-const TRANSIENT_ERROR = /overloaded|internal error|timed? ?out|timeout|network connection lost|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|fetch failed|object to be reset|too many requests|\b(?:429|500|502|503|504)\b/i;
+// Retried only when the error text carries a known transient marker: the failure was in transit
+// or in D1's own availability. Everything else — auth or profile, SQL (no such table, syntax
+// error), unparseable output, and anything unrecognised — fails fast: a retry loop around it only
+// delays the operator seeing it.
+const TRANSIENT_ERROR = /overloaded|internal error|network connection lost|object to be reset|reset because|timed? ?out|timeout|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENOTFOUND|socket hang up|fetch failed|too many requests|\b(?:429|50[0-4])\b/i;
 
 function nonNegativeInt(value, name, min) {
   const n = Number(value);
@@ -82,9 +82,7 @@ class ExecuteError extends Error {
 }
 
 function classify(text) {
-  if (DETERMINISTIC_ERROR.test(text)) return 'deterministic';
-  if (TRANSIENT_ERROR.test(text)) return 'transient';
-  return 'deterministic';
+  return TRANSIENT_ERROR.test(text) ? 'transient' : 'deterministic';
 }
 
 function wrangler(argv) {
@@ -100,7 +98,8 @@ function wrangler(argv) {
     child.stdout.setEncoding('utf8').on('data', (data) => { stdout += data; });
     child.stderr.setEncoding('utf8').on('data', (data) => { stderr += data; });
     child.once('error', reject);
-    child.once('exit', (code, signal) => resolve({ code, signal, stdout, stderr }));
+    // 'close', not 'exit': 'exit' can fire before the stdio pipes drain, truncating the JSON.
+    child.once('close', (code, signal) => resolve({ code, signal, stdout, stderr }));
   });
 }
 

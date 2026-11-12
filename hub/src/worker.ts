@@ -10,11 +10,17 @@ import { route } from './router';
 import { consumeSessionRollup } from './session-rollup-jobs';
 import { drainIndexCatalog } from './session-catalog';
 
+/** One bounded catalog drain, re-queueing itself while entries remain. Throws on failure; the
+ * daily chain runs it directly so a failed drain is a failed step. */
+async function drainCatalogBackstop(env: Env): Promise<void> {
+  // Leave room for the parse/maintenance work that triggered this backstop.
+  const result = await drainIndexCatalog(env, { maxSubrequests: 64 });
+  if (result.state === 'pending') await env.ROLLUP_QUEUE.send({ kind: 'index-catalog' });
+}
+
 async function reconcileCatalog(env: Env): Promise<void> {
   try {
-    // Leave room for the parse/maintenance work that triggered this backstop.
-    const result = await drainIndexCatalog(env, { maxSubrequests: 64 });
-    if (result.state === 'pending') await env.ROLLUP_QUEUE.send({ kind: 'index-catalog' });
+    await drainCatalogBackstop(env);
   } catch (error) {
     // The durable outbox remains pending; the next request, queue delivery, or cron retries it.
     console.error(JSON.stringify({
@@ -40,7 +46,7 @@ interface DailyStep {
 const DAILY_D1_STEPS: ReadonlyArray<DailyStep> = [
   { step: 'model_price_sync', run: runModelPriceSync },
   { step: 'pricing', run: runDailyPricing },
-  { step: 'catalog_reconcile', run: reconcileCatalog },
+  { step: 'catalog_reconcile', run: drainCatalogBackstop },
   { step: 'session_rollup', run: runScheduledSessionRollup },
   { step: 'cert_prune', run: runDailyPrune },
   { step: 'omp_qa_reports_prune', run: pruneOmpQaReports },

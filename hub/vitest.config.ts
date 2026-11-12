@@ -1,6 +1,7 @@
 import { cloudflareTest, readD1Migrations } from '@cloudflare/vitest-pool-workers';
 import { availableParallelism } from 'node:os';
 import { fileURLToPath } from 'node:url';
+import { experimental_readRawConfig } from 'wrangler';
 import { writeLocalConfig } from './scripts/lib/local-config.mjs';
 import { configDefaults, defineConfig } from 'vitest/config';
 
@@ -13,6 +14,12 @@ export default defineConfig(async () => {
     hubRoot,
     revision: 'test',
   });
+  // The checked-in schedule, read with wrangler's own JSONC reader (as scripts/lib/local-config.mjs
+  // does) and handed to worker-cron.test.ts, which asserts scheduled() handles exactly these.
+  const { rawConfig } = experimental_readRawConfig(
+    { config: fileURLToPath(new URL('./wrangler.jsonc', import.meta.url)) },
+    { redirect: false },
+  );
   return {
     plugins: [
       cloudflareTest({
@@ -47,6 +54,7 @@ export default defineConfig(async () => {
       }),
     ],
     test: {
+      provide: { wranglerCrons: rawConfig.triggers?.crons ?? null },
       // Suites that run under `node --test` (own npm script each) carry a `.node.test.mjs`
       // suffix so this stays ONE pattern. It used to be a hand-maintained list of filenames,
       // and adding a file without adding its line handed it to the wrong runner: vitest loaded

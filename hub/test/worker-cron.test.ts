@@ -1,6 +1,5 @@
 import { env } from 'cloudflare:test';
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import wranglerSource from '../wrangler.jsonc?raw';
+import { afterEach, beforeEach, describe, expect, inject, it, vi } from 'vitest';
 import { DAILY_CRON, WATCHDOG_CRON } from '../src/cron/schedule';
 import worker from '../src/worker';
 
@@ -214,15 +213,50 @@ describe('scheduled handler', () => {
     expect(row?.usd, 'a failed staging sweep skipped the pricing pass').toBeCloseTo(5, 6);
   });
 
-  it('matches the crons wrangler.jsonc schedules', () => {
+  it('records pricing, catalog and rollup failures as failed steps and still runs the rest', async () => {
+    // Each of these used to catch its own error, so the chain would have logged `ok` for a step
+    // that did nothing. Fail one query in each and nothing else.
+    const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
+    const failing: Array<[step: string, marker: string]> = [
+      ['pricing', 'usage_due_for_pricing'],
+      ['catalog_reconcile', 'FROM session_catalog_outbox ORDER BY seq'],
+      ['session_rollup', 'FROM session_rollup_state\n      WHERE'],
+    ];
+    const prepare = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
+      const hit = failing.find(([, marker]) => sql.includes(marker));
+      if (hit) throw new Error(`injected ${hit[0]} failure`);
+      return realPrepare(sql);
+    });
+    const logs = captureLogs('log');
+    const errors = captureLogs('error');
+    try {
+      await fire(DAILY_CRON);
+    } finally {
+      prepare.mockRestore();
+      logs.restore();
+      errors.restore();
+    }
+
+    expect(errors.lines.filter((o) => o.event === 'hub.cron.daily_step_failed').map((o) => [o.step, o.error])).toEqual([
+      ['pricing', 'injected pricing failure'],
+      ['catalog_reconcile', 'injected catalog_reconcile failure'],
+      ['session_rollup', 'session rollup failed: injected session_rollup failure'],
+    ]);
+    const chain = logs.lines.filter((o) => o.event === 'hub.cron.daily_step' && o.step !== 'staging_prune');
+    expect(chain.map((o) => [o.step, o.outcome])).toEqual(
+      D1_CHAIN.map((step) => [step, failing.some(([failed]) => failed === step) ? 'failed' : 'ok']),
+    );
+    // The pricing pass still reports its own failure line before rethrowing.
+    expect(logs.lines.some((o) => o.event === 'hub.pricing.daily' && o.ok === false)).toBe(true);
+  });
+
+  it('handles exactly the crons wrangler.jsonc schedules', () => {
     // A schedule in wrangler.jsonc that scheduled() does not recognise is silently ignored, and one
-    // scheduled() expects but wrangler never fires is silently dead. Strip comments outside string
-    // values (the `//` in URLs survives), then read the top-level triggers.
-    const config = JSON.parse(
-      wranglerSource.replace(/("(?:\\.|[^"\\])*")|\/\*[\s\S]*?\*\/|\/\/[^\n]*/g, (_, str: string | undefined) => str ?? ''),
-    ) as { triggers: { crons: string[] } };
-    expect(config.triggers.crons).toHaveLength(2);
-    expect(new Set(config.triggers.crons)).toEqual(new Set([WATCHDOG_CRON, DAILY_CRON]));
+    // scheduled() expects but wrangler never fires is silently dead. vitest.config.ts reads the
+    // top-level triggers with wrangler's own config reader and provides them here.
+    const crons = inject('wranglerCrons');
+    expect(crons).toHaveLength(2);
+    expect(new Set(crons)).toEqual(new Set([WATCHDOG_CRON, DAILY_CRON]));
   });
 
   it('does not refresh prices on the 15-minute watchdog tick', async () => {

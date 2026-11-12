@@ -26,8 +26,8 @@ export async function runDailyPricing(env: Env): Promise<void> {
     const res = await priceUsage(env.DB, { maxRows: MAX_ROWS_PER_RUN });
     emit('hub.pricing.daily', { ...res, ms: Date.now() - started, ok: true });
   } catch (e) {
-    // Swallowed, not rethrown: the daily chain therefore logs this step's outcome as `ok`, and
-    // `hub.pricing.daily` with `ok: false` below is the failure signal.
+    // Rethrown after the `ok: false` line so the daily chain records this step as failed; the
+    // chain catches it and still runs the steps after pricing.
     emit('hub.pricing.daily', {
       examined: 0,
       priced: 0,
@@ -39,6 +39,7 @@ export async function runDailyPricing(env: Env): Promise<void> {
       ok: false,
       error: e instanceof Error ? e.message : String(e),
     });
+    throw e;
   }
 }
 
