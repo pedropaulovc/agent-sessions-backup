@@ -27,7 +27,9 @@ from .external_images import (
     discover_external_assets,
     open_external_asset,
 )
-from .scanner import Scanner, ScanItem, read_exact, read_range, hash_bytes, hash_file_prefix
+from .scanner import (
+    WALK_COMPLETE, Scanner, ScanItem, read_exact, read_range, hash_bytes, hash_file_prefix,
+)
 from .state import State, OverlapLock, now_iso, state_path
 from .transport import Transport, DevAuth, MtlsAuth, Upload, MIN_CURL_VERSION, normalize_thumbprint
 
@@ -192,7 +194,11 @@ def _discover_upload_assets(
         )
     else:
         assets, asset_events = discovered
-    events.extend(_asset_event_dict(e, parent.store) for e in asset_events)
+    # Queued straight to the heartbeat buffer, once per (parent, code, message): retryable
+    # rejections re-run discovery every pass, and an active transcript grows every turn, so the
+    # same conditions recur on each pass and must not be re-reported.
+    st.queue_asset_events(parent.store, parent.relpath,
+                          [_asset_event_dict(e, parent.store) for e in asset_events])
     out = ItemResult(seen=len(assets))
     # Stable rejection warnings can be cached, but source/file failures must be retried: the
     # transcript can reference a file that appears or is repaired without changing its own mtime.
@@ -300,7 +306,9 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
     try:
         for store, root in cfg.store_roots().items():
             stats.setdefault(store, {"files_seen": 0, "files_uploaded": 0, "bytes_uploaded": 0})
+            seen: set[str] = set()
             for item in scanner.scan_store(store, root):
+                seen.add(item.relpath)
                 scanned += 1
                 stats[store]["files_seen"] += 1
                 res = _process_item(cfg, st, transport, scanner, item)
@@ -320,7 +328,10 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
                     })
                     continue
                 # A transcript is the owner of its assets. Never inspect/upload references when
-                # its own bytes failed to reach the hub.
+                # its own bytes failed to reach the hub. SQLite snapshots are databases, not JSONL
+                # transcripts, and their temp copy is already deleted (as in backfill).
+                if item.is_snapshot:
+                    continue
                 assets_res = _discover_upload_assets(cfg, st, transport, scanner, item, events,
                                                      force=res.changed)
                 scanned += assets_res.seen
@@ -334,6 +345,11 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
                     stats[store]["bytes_uploaded"] += assets_res.bytes
                 if assets_res.error:
                     errors += 1
+            # Only a complete walk proves a parent is gone; a missing root, an unreadable
+            # subtree, an existing entry that could not be read, or an empty (e.g. unmounted) mountpoint
+            # would otherwise forget warnings that are still current.
+            if seen and scanner.walk_state(store) == WALK_COMPLETE:
+                st.prune_asset_events(store, seen)
         # Traversal/snapshot warnings (walk_error, snapshot_timeout) raised during the walk.
         events.extend(scanner.events)
         errors += sum(1 for e in scanner.events if e["level"] == "error")
@@ -553,13 +569,26 @@ def _upload_multipart(cfg, transport: Transport, item: ScanItem, sha: str) -> tu
     return MULTIPART_FAILED, last_error or "multipart upload failed"
 
 
-# D1 stores the whole heartbeat stats JSON in one row (2 MB row/string limit).
-# Stay well below that and the edge request cap, measuring the SAME default JSON encoding
-# as Transport.post_json (including ASCII escaping). Bound both queue reads and HTTP work.
+# Each batch is one hub request. Bound the encoded JSON well below the edge request-size cap,
+# measuring the SAME default JSON encoding as Transport.post_json (including ASCII escaping), and
+# bound per-run queue reads and request count so a backlog cannot flood the hub's event logs.
+# A backlog larger than one run's budget stays queued and drains over subsequent scheduled runs
+# (the cursor and compaction survive restarts).
 HEARTBEAT_MAX_BYTES = 256 * 1024
 HEARTBEAT_MAX_EVENTS = 1000
-HEARTBEAT_MAX_BATCHES = 64
+HEARTBEAT_MAX_BATCHES = 8
+# Pages read per pass, including pages of only retained oversized rows that cost no request:
+# bounds queue reads when many such rows sit ahead. The cursor resumes there next run.
+HEARTBEAT_MAX_PAGES = 4 * HEARTBEAT_MAX_BATCHES
 HEARTBEAT_COMPACT_ROWS = 100_000
+
+# Per-pass wrap state (enum): whether delivery already requeried from ID 0 after reaching the end.
+WRAP_PENDING = "pending"
+WRAP_DONE = "done"
+
+# Heartbeat POST outcome (enum).
+POST_ACCEPTED = "accepted"
+POST_REJECTED = "rejected"
 
 
 def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: list[dict]) -> bool:
@@ -574,9 +603,13 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
 
     after_id = st.event_cursor()
     window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
-    oversized = False
+    oversized_ids: set[int] = set()
     delivered = 0
-    for _batch in range(HEARTBEAT_MAX_BATCHES):
+    posted = 0
+    pages = 0
+    wrap = WRAP_PENDING
+    while posted < HEARTBEAT_MAX_BATCHES and pages < HEARTBEAT_MAX_PAGES:
+        pages += 1
         ids, events = st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
         if not ids and window_end is not None:
             # Compaction can remove the window's final IDs. Advance over only those
@@ -586,14 +619,19 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
             ids, events = (st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
                            if window_end is not None else ([], []))
         if not ids and after_id:
+            # Reached the end above the cursor. Rows below it (retained oversized rows, a stale
+            # cursor) are revisited from zero once per pass, with whatever budget remains,
+            # instead of waiting for a later run.
             st.set_event_cursor(0)
-            if _batch:
+            if wrap == WRAP_DONE:
                 break
-            # A saved cursor can outlive all pending IDs, including when SQLite
-            # reuses IDs after deletion. Requery from zero in this same pass.
+            wrap = WRAP_DONE
             after_id = 0
             window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
             ids, events = st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
+        if not ids:
+            st.set_event_cursor(0)
+            break
         ack_ids = []
         grouped = {}
         size = base_size
@@ -608,8 +646,9 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
             # Reserve the largest count this group can have after coalescing the page.
             added = len(json.dumps(dict(event, count=-max_count)).encode("utf-8"))
             if base_size + added > HEARTBEAT_MAX_BYTES:
-                print(f"heartbeat event {event_id} exceeds payload budget; retained", file=sys.stderr)
-                oversized = True
+                if event_id not in oversized_ids:
+                    print(f"heartbeat event {event_id} exceeds payload budget; retained", file=sys.stderr)
+                    oversized_ids.add(event_id)
                 after_id = event_id
                 continue
             added += 2 if grouped else 0
@@ -619,23 +658,37 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
             ack_ids.append(event_id)
             size += added
             after_id = event_id
+        if not ack_ids:
+            # Only retained oversized rows: step past them without spending a request.
+            st.set_event_cursor(after_id)
+            continue
         body["events"] = list(grouped.values())
-        status, response = transport.post_json(f"{cfg.hub_url}/api/v1/heartbeat", body)
-        if status != 200:
-            # Escape controls and bound diagnostics; never print the request or credentials.
-            detail = json.dumps(response[:512], ensure_ascii=True)
-            print(f"heartbeat failed: HTTP {status}; response={detail}; events retained", file=sys.stderr)
+        if _post_heartbeat(cfg, transport, body) != POST_ACCEPTED:
             return False
+        posted += 1
         st.delete_events(ack_ids)
         delivered += len(ack_ids)
         st.set_event_cursor(after_id)
-        if not ids:
-            st.set_event_cursor(0)
-            break
+    if not posted:
+        # No deliverable events: the heartbeat itself still proves an authenticated write.
+        body["events"] = []
+        if _post_heartbeat(cfg, transport, body) != POST_ACCEPTED:
+            return False
     remaining = st.pending_event_count()
     if remaining:
         print(f"heartbeat events: acknowledged_rows={delivered} pending_rows={remaining}", file=sys.stderr)
-    return not oversized
+    return not oversized_ids
+
+
+def _post_heartbeat(cfg, transport: Transport, body: dict) -> str:
+    """POST one heartbeat body: POST_ACCEPTED on HTTP 200, else POST_REJECTED (diagnosed)."""
+    status, response = transport.post_json(f"{cfg.hub_url}/api/v1/heartbeat", body)
+    if status == 200:
+        return POST_ACCEPTED
+    # Escape controls and bound diagnostics; never print the request or credentials.
+    detail = json.dumps(response[:512], ensure_ascii=True)
+    print(f"heartbeat failed: HTTP {status}; response={detail}; events retained", file=sys.stderr)
+    return POST_REJECTED
 
 
 # ---------------------------------------------------------------------- backfill

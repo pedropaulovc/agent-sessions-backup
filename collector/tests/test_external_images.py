@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import sqlite3
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -493,3 +494,190 @@ def test_backfill_dry_run_counts_missing_external_asset(tmp_path, hub, capsys):
         assert run_mod._do_backfill(cfg, st, 1, True) == 0
     assert '"would_upload": 2' in capsys.readouterr().out
     assert hub.files == {}
+
+
+def _missing_image_events(hub):
+    return [
+        e for body in hub.heartbeats for e in body["events"]
+        if e["code"] == "outside_cwd_or_missing"
+    ]
+
+
+def _append_image_ref(transcript: Path, digest: str, source: str, times: int = 1) -> None:
+    image = {"type": "image", "data": f"blob:sha256:{digest}",
+             "details": {"meta": {"source": {"value": source}}}}
+    with transcript.open("a") as f:
+        for _ in range(times):
+            f.write(json.dumps({"type": "tool_result", "content": [image]}) + "\n")
+
+
+@requires_curl
+def test_run_reports_each_missing_external_image_once_while_transcript_grows(tmp_path, hub):
+    root = tmp_path / "omp"
+    root.mkdir()
+    image = tmp_path / "001_img01.jpeg"
+    digest = hashlib.sha256(b"never written").hexdigest()
+    transcript = root / "session.jsonl"
+    _transcript(transcript, str(tmp_path), digest, str(image))
+    cfg = config.Config(machine_id="m1", hub_url=hub.url, auth="dev", stores={"omp": str(root)})
+
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_run(cfg, st) == 0
+        assert run_mod._do_run(cfg, st) == 0
+        reported = _missing_image_events(hub)
+        assert len(reported) == 1
+        assert reported[0]["count"] == 1 and reported[0]["store"] == "omp"
+        assert digest in reported[0]["message"]
+
+        # An active session appends turns: the old broken reference is not re-reported, but a
+        # newly appended one is a new key and reports exactly once.
+        _append_image_ref(transcript, digest, str(image), times=3)
+        assert run_mod._do_run(cfg, st) == 0
+        assert len(_missing_image_events(hub)) == 1
+        late_digest = hashlib.sha256(b"also never written").hexdigest()
+        _append_image_ref(transcript, late_digest, str(tmp_path / "002_img02.jpeg"))
+        assert run_mod._do_run(cfg, st) == 0
+        assert run_mod._do_run(cfg, st) == 0
+        reported = _missing_image_events(hub)
+        assert len(reported) == 2
+        assert late_digest in reported[1]["message"]
+
+
+@requires_curl
+def test_run_prunes_reported_warnings_of_vanished_parent(tmp_path, hub):
+    root = tmp_path / "omp"
+    root.mkdir()
+    image = tmp_path / "001_img01.jpeg"
+    digest = hashlib.sha256(b"never written").hexdigest()
+    transcript = root / "session.jsonl"
+    _transcript(transcript, str(tmp_path), digest, str(image))
+    body = transcript.read_bytes()
+    (root / "other.jsonl").write_text("{}\n")  # the walk still finds files: it is complete
+    cfg = config.Config(machine_id="m1", hub_url=hub.url, auth="dev", stores={"omp": str(root)})
+
+    def keys(st):
+        return st.conn.execute(
+            "SELECT COUNT(*) FROM asset_event_emissions WHERE parent_relpath = 'session.jsonl'"
+        ).fetchone()[0]
+
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_run(cfg, st) == 0
+        assert keys(st) == 1
+        transcript.unlink()
+        assert run_mod._do_run(cfg, st) == 0
+        assert keys(st) == 0
+        # A returning parent is a new appearance and reports its conditions afresh.
+        transcript.write_bytes(body)
+        assert run_mod._do_run(cfg, st) == 0
+        assert keys(st) == 1
+    assert len(_missing_image_events(hub)) == 2
+
+
+@requires_curl
+@pytest.mark.parametrize("unmounted", ["missing", "empty"])
+def test_run_keeps_reported_warnings_when_store_root_is_unavailable(tmp_path, hub, unmounted):
+    root = tmp_path / "omp"
+    root.mkdir()
+    transcript = root / "session.jsonl"
+    _transcript(transcript, str(tmp_path), hashlib.sha256(b"x").hexdigest(),
+                str(tmp_path / "001_img01.jpeg"))
+    cfg = config.Config(machine_id="m1", hub_url=hub.url, auth="dev", stores={"omp": str(root)})
+
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_run(cfg, st) == 0
+        root.rename(tmp_path / "unmounted")
+        if unmounted == "empty":
+            root.mkdir()  # an unmounted mountpoint: exists, walks cleanly, yields nothing
+        assert run_mod._do_run(cfg, st) == 0
+        assert st.conn.execute("SELECT COUNT(*) FROM asset_event_emissions").fetchone()[0] == 1
+
+
+@requires_curl
+def test_run_does_not_scan_sqlite_snapshots_for_external_assets(tmp_path, hub):
+    root = tmp_path / "codex"
+    root.mkdir()
+    db = sqlite3.connect(root / "state.sqlite")
+    db.execute("CREATE TABLE t (x)")
+    db.commit()
+    db.close()
+    cfg = config.Config(machine_id="m1", hub_url=hub.url, auth="dev", stores={"codex": str(root)})
+
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_run(cfg, st) == 0
+        assert run_mod._do_run(cfg, st) == 0
+        assert st.conn.execute("SELECT COUNT(*) FROM asset_event_emissions").fetchone()[0] == 0
+    assert ("m1", "codex", "state.sqlite") in hub.files
+    assert not [e for body in hub.heartbeats for e in body["events"]
+                if e["code"] == "asset_read_failed"]
+
+
+@requires_curl
+def test_backfill_reports_missing_external_image_once(tmp_path, hub):
+    root = tmp_path / "omp"
+    root.mkdir()
+    image = tmp_path / "001_img01.jpeg"
+    digest = hashlib.sha256(b"never written").hexdigest()
+    transcript = root / "session.jsonl"
+    _transcript(transcript, str(tmp_path), digest, str(image))
+    cfg = config.Config(machine_id="m1", hub_url=hub.url, auth="dev", stores={"omp": str(root)})
+
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_backfill(cfg, st, 1, False) == 0
+        _append_image_ref(transcript, digest, str(image))
+        assert run_mod._do_backfill(cfg, st, 1, False) == 0
+        _ids, queued = st.drain_events()
+    assert [e["code"] for e in queued].count("outside_cwd_or_missing") == 1
+
+
+def test_identical_asset_warnings_in_one_pass_keep_their_count(tmp_path):
+    warning = {"level": "warn", "code": "line_too_large",
+               "message": "external asset rejected", "count": 1, "store": "omp"}
+    with State(tmp_path / "state.db") as st:
+        queued = st.queue_asset_events("omp", "s.jsonl", [warning] * 40)
+        assert [e["count"] for e in queued] == [40]
+        _ids, pending = st.drain_events()
+        assert [(e["code"], e["count"]) for e in pending] == [("line_too_large", 40)]
+        assert st.queue_asset_events("omp", "s.jsonl", [warning] * 40) == []
+
+
+def test_asset_warning_keys_reset_on_rules_or_identity_change(tmp_path):
+    db = tmp_path / "state.db"
+    warning = {"level": "warn", "code": "outside_cwd_or_missing",
+               "message": "external asset rejected d/x.jpeg", "count": 1, "store": "omp"}
+    with State(db, machine_id="A") as st:
+        assert st.queue_asset_events("omp", "s.jsonl", [warning]) == [warning]
+        assert st.queue_asset_events("omp", "s.jsonl", [warning]) == []
+        st.conn.execute("UPDATE meta SET value = '0.0.0' WHERE key = 'asset_scan_rules_version'")
+        st.conn.commit()
+    with State(db, machine_id="A") as st:
+        assert st.queue_asset_events("omp", "s.jsonl", [warning]) == [warning]
+    with State(db, machine_id="B") as st:
+        assert st.queue_asset_events("omp", "s.jsonl", [warning]) == [warning]
+
+
+@requires_curl
+def test_run_keeps_reported_warnings_when_an_entry_fails_to_stat(tmp_path, hub, monkeypatch):
+    # An lstat failure mid-walk means the walk cannot prove which transcripts are gone.
+    root = tmp_path / "omp"
+    root.mkdir()
+    transcript = root / "session.jsonl"
+    _transcript(transcript, str(tmp_path), hashlib.sha256(b"x").hexdigest(),
+                str(tmp_path / "001_img01.jpeg"))
+    (root / "other.jsonl").write_text("{}\n")
+    (root / "flaky.jsonl").write_text("{}\n")
+    cfg = config.Config(machine_id="m1", hub_url=hub.url, auth="dev", stores={"omp": str(root)})
+
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_run(cfg, st) == 0
+        transcript.unlink()
+        real_lstat = os.lstat
+
+        def failing_lstat(path, *args, **kwargs):
+            if os.fspath(path).endswith("flaky.jsonl"):
+                raise PermissionError(13, "denied", os.fspath(path))
+            return real_lstat(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "lstat", failing_lstat)
+        assert run_mod._do_run(cfg, st) == 0
+        monkeypatch.undo()
+        assert st.conn.execute("SELECT COUNT(*) FROM asset_event_emissions").fetchone()[0] == 1

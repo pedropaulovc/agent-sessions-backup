@@ -1,7 +1,12 @@
 import hashlib
 import os
+import socket
 import sqlite3
+import stat
+import tempfile
 import time
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -465,3 +470,97 @@ def test_walk_error_recorded_as_event(tmp_path):
     assert "projects/a.jsonl" in found  # scan continues past the error
     ev = next(e for e in scanner.events if e["code"] == "walk_error")
     assert ev["store"] == "claude" and "secret" in ev["message"]
+
+
+@pytest.mark.parametrize("reparse_tag, scanned", [
+    (0x80000023, False),  # IO_REPARSE_TAG_AF_UNIX: codex app-server-daemon socket
+    (0xA000001D, False),  # IO_REPARSE_TAG_LX_SYMLINK: WSL symlink
+    (0x80000024, False),  # IO_REPARSE_TAG_LX_FIFO
+    (0x80000025, False),  # IO_REPARSE_TAG_LX_CHR
+    (0x80000026, False),  # IO_REPARSE_TAG_LX_BLK
+    (0x9000001A, True),   # IO_REPARSE_TAG_CLOUD_A: OneDrive placeholder holding a real file
+    (0x80000013, True),   # IO_REPARSE_TAG_DEDUP: deduplicated real file
+])
+def test_scan_windows_reparse_point_skipped_only_for_unopenable_tags(tmp_path, monkeypatch,
+                                                                     reparse_tag, scanned):
+    # Windows lstat reports these reparse points as regular-mode files carrying
+    # FILE_ATTRIBUTE_REPARSE_POINT. AF_UNIX sockets and WSL LX special files cannot be opened
+    # as files, so only those tags are skipped.
+    root = tmp_path / ".codex"
+    daemon = root / "app-server-daemon"
+    daemon.mkdir(parents=True)
+    (daemon / "control.sock").write_text("")
+    (root / "session.jsonl").write_text("{}")
+    real_lstat = os.lstat
+
+    def windows_lstat(path, *args, **kwargs):
+        result = real_lstat(path, *args, **kwargs)
+        if not os.fspath(path).endswith("control.sock"):
+            return result
+        assert stat.S_ISREG(result.st_mode)  # the tag alone must decide
+        return SimpleNamespace(st_mode=result.st_mode,
+                               st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+                               st_reparse_tag=reparse_tag)
+
+    monkeypatch.setattr(scanner_mod.os, "lstat", windows_lstat)
+    with Scanner([]) as s:
+        found = [i.relpath for i in s.scan_store("codex", root)]
+    expected = {"app-server-daemon/control.sock", "session.jsonl"} if scanned else {"session.jsonl"}
+    assert set(found) == expected
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX") or os.name == "nt",
+                    reason="POSIX AF_UNIX sockets only")
+def test_scan_skips_posix_unix_socket_and_fifo():
+    # AF_UNIX paths are capped near 100 bytes; pytest's tmp_path can exceed that.
+    with tempfile.TemporaryDirectory(prefix="ac-", dir="/tmp") as tmp:
+        root = os.path.join(tmp, "r")
+        os.mkdir(root)
+        with open(os.path.join(root, "session.jsonl"), "w") as f:
+            f.write("{}")
+        os.mkfifo(os.path.join(root, "pipe"))
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            sock.bind(os.path.join(root, "daemon.sock"))
+            with Scanner([]) as s:
+                found = [i.relpath for i in s.scan_store("codex", Path(root))]
+        finally:
+            sock.close()
+    assert found == ["session.jsonl"]
+
+
+@pytest.mark.parametrize("stage", ["lstat", "stat"])
+@pytest.mark.parametrize("error, walk", [
+    (FileNotFoundError(2, "vanished"), "complete"),   # deleted since listing: proven gone
+    (PermissionError(13, "denied"), "incomplete"),    # exists but unreadable: proves nothing
+    (OSError(5, "I/O error"), "incomplete"),
+])
+def test_walk_state_after_an_entry_fails_to_stat(tmp_path, monkeypatch, stage, error, walk):
+    root = tmp_path / ".claude"
+    root.mkdir()
+    (root / "a.jsonl").write_text("{}")
+    (root / "b.jsonl").write_text("{}")
+    with Scanner([]) as s:
+        assert [i.relpath for i in s.scan_store("claude", root)] == ["a.jsonl", "b.jsonl"]
+        assert s.walk_state("claude") == scanner_mod.WALK_COMPLETE
+        if stage == "lstat":
+            real_lstat = os.lstat
+
+            def failing_lstat(path, *args, **kwargs):
+                if os.fspath(path).endswith("b.jsonl"):
+                    raise error
+                return real_lstat(path, *args, **kwargs)
+
+            monkeypatch.setattr(scanner_mod.os, "lstat", failing_lstat)
+        else:
+            real_stat = Path.stat
+
+            def failing_stat(self, *args, **kwargs):
+                if self.name == "b.jsonl":
+                    raise error
+                return real_stat(self, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "stat", failing_stat)
+        assert [i.relpath for i in s.scan_store("claude", root)] == ["a.jsonl"]
+        assert s.walk_state("claude") == walk
+        assert s.walk_state("never-scanned") == scanner_mod.WALK_INCOMPLETE

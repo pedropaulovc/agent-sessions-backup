@@ -13,6 +13,7 @@ import fnmatch
 import hashlib
 import os
 import sqlite3
+import stat
 import tempfile
 import time
 import urllib.parse
@@ -95,6 +96,48 @@ def _safe_unlink(path: Path) -> None:
         path.unlink(missing_ok=True)
     except OSError:
         pass
+
+
+# Reparse tags (Windows SDK winnt.h; CPython's stat module exports none of them) whose files
+# lstat reports as regular but that cannot be opened and read as files: AF_UNIX sockets (e.g.
+# codex's app-server-daemon socket) and WSL's LX symlink/FIFO/character/block-device entries.
+_UNOPENABLE_REPARSE_TAGS = frozenset({
+    0x80000023,  # IO_REPARSE_TAG_AF_UNIX
+    0xA000001D,  # IO_REPARSE_TAG_LX_SYMLINK
+    0x80000024,  # IO_REPARSE_TAG_LX_FIFO
+    0x80000025,  # IO_REPARSE_TAG_LX_CHR
+    0x80000026,  # IO_REPARSE_TAG_LX_BLK
+})
+
+# Directory-entry kinds (enum, not a bool): only ENTRY_REGULAR is captured.
+ENTRY_REGULAR = "regular"
+ENTRY_NOT_REGULAR = "not_regular"  # symlink, socket, FIFO, device, unopenable reparse point
+ENTRY_GONE = "gone"                # lstat: FileNotFoundError (deleted since listing)
+ENTRY_UNREADABLE = "unreadable"    # lstat: any other OSError (permission, EIO, sharing)
+
+# Per-store walk outcome (enum). Only a complete walk proves an unseen file is gone.
+WALK_COMPLETE = "complete"
+WALK_INCOMPLETE = "incomplete"     # missing root, walk_error, or an unreadable entry
+
+
+def _entry_kind(path: Path) -> str:
+    """Classify a walked entry from ONE lstat.
+
+    Symlinks, sockets and FIFOs fail S_ISREG. On Windows, AF_UNIX sockets and WSL LX special
+    files are reparse points that lstat still reports as regular files, and opening them fails;
+    their reparse tag excludes them. Other reparse points (OneDrive/cloud placeholders, dedup
+    files) hold real transcripts and stay. POSIX stat results have no st_reparse_tag, so that
+    check is inert there.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return ENTRY_GONE
+    except OSError:
+        return ENTRY_UNREADABLE
+    if getattr(st, "st_reparse_tag", 0) in _UNOPENABLE_REPARSE_TAGS:
+        return ENTRY_NOT_REGULAR
+    return ENTRY_REGULAR if stat.S_ISREG(st.st_mode) else ENTRY_NOT_REGULAR
 
 
 def _snapshot_sqlite(src: Path, dst: Path, deadline_s: float = SNAPSHOT_DEADLINE_S) -> str:
@@ -193,6 +236,11 @@ class Scanner:
         # Heartbeat warning events raised during the walk (snapshot_timeout, walk_error).
         # Drained by run/backfill so they reach the hub, and printed by doctor.
         self.events: list[dict] = []
+        self.walk_states: dict[str, str] = {}
+
+    def walk_state(self, store: str) -> str:
+        """WALK_COMPLETE only if the latest scan_store(store) walked everything it listed."""
+        return self.walk_states.get(store, WALK_INCOMPLETE)
 
     def close(self) -> None:
         self._tmp.cleanup()
@@ -205,11 +253,14 @@ class Scanner:
 
     def scan_store(self, store: str, root: Path) -> Iterator[ScanItem]:
         if not root.exists():
+            self.walk_states[store] = WALK_INCOMPLETE
             return
+        self.walk_states[store] = WALK_COMPLETE
 
         def _onerror(err: OSError) -> None:
             # os.walk silently drops an unreadable/vanished subtree without a callback;
             # surface it so capture-all never loses transcripts without a signal.
+            self.walk_states[store] = WALK_INCOMPLETE
             self.events.append({
                 "level": "error", "code": "walk_error",
                 "message": f"{getattr(err, 'filename', root)}: {err} "
@@ -241,8 +292,12 @@ class Scanner:
                     self.excluded_counts[store][hit] += 1
                     continue
                 path = Path(dirpath) / fname
-                if not path.is_file() or path.is_symlink():
+                kind = _entry_kind(path)
+                if kind == ENTRY_UNREADABLE:
+                    self.walk_states[store] = WALK_INCOMPLETE
                     continue
+                if kind != ENTRY_REGULAR:
+                    continue  # not a regular file, or deleted since listing (proven gone)
                 item = self._make_item(store, relpath, path)
                 if item:
                     yield item
@@ -250,7 +305,10 @@ class Scanner:
     def _make_item(self, store: str, relpath: str, path: Path) -> ScanItem | None:
         try:
             st = path.stat()
+        except FileNotFoundError:
+            return None  # deleted since listing: proven gone, the walk stays complete
         except OSError:
+            self.walk_states[store] = WALK_INCOMPLETE
             return None
         if path.name.lower().endswith(DB_SUFFIXES):  # case-insensitive: State.DB is a DB too
             self._snap_seq += 1

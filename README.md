@@ -165,13 +165,14 @@ refuses production deployment: protected main CI is the sole production control 
 | `scripts/` | Local corpus seeding + verification tooling |
 | `memory/` | Project memory for AI agents working on this repo |
 
-## Collector heartbeat delivery (0.4.6)
+## Collector heartbeat delivery (0.4.7)
 
 Current-run events are committed to the local SQLite queue before heartbeat delivery.
 Each pass reads pages of at most 1,000 rows (also bounded by 256 KiB of text, except
-an individually oversized row), sends at most 64 requests, and caps each encoded
-JSON request at 256 KiB. This stays below [D1's 2 MB row/string limit](https://developers.cloudflare.com/d1/platform/limits/): the hub stores
-the entire heartbeat's stores and events together. Large queues are resumed across
+an individually oversized row), sends at most 8 requests, and caps each encoded
+JSON request at 256 KiB. The hub stores no heartbeat bodies: it updates the machine's
+last-seen time and collector version and relays each event to the logs as
+`collector.event`. Large queues are resumed across
 runs, never loaded wholesale. Before paging each window of at most 100,000 queued
 rows, a single SQLite transaction groups exact matches of level, code, message,
 and store (including the distinction between absent and empty store), sums `count`
@@ -180,11 +181,49 @@ before grouping; neither the whole queue nor a window's messages are loaded into
 Python. Windows start above the saved inspection cursor, and delivery reads stay
 within the compacted window before moving to the next.
 
-A pass can acknowledge up to 64,000 compacted rows; large or heavily escaped
+A pass can acknowledge up to 8,000 compacted rows; large or heavily escaped
 messages reduce throughput. For example, 100,000 rows repeating about 3,100 exact
 per-path messages become about 3,100 events with conserved counts, rather than
 repeating those messages in every 1,000-row page. Unique messages still require
-separate delivery.
+separate delivery. Delivery is strictly FIFO from the saved cursor, at most 8 requests
+per run, so the run's own events (including upload, walk, and snapshot failures) wait
+behind an older backlog until it drains over subsequent runs. Queue IDs are
+`AUTOINCREMENT`, so an emptied queue never reissues an ID at or below the cursor. An
+older plain-rowid queue is rebuilt in place with its IDs, and its cursor is reset to 0
+so rows already stranded below it are delivered first. When a pass reaches the end
+with requests left, it requeries once from ID 0 to pick up deliverable rows below the
+cursor. Retained oversized rows are stepped over without spending a request, and each
+is diagnosed once per pass; they are never delivered. A pass also reads at most 32
+pages, so a long run of such rows is resumed from the saved cursor on the next run.
+
+External-asset warnings from transcript discovery are queued once per store, parent
+transcript, code, and message. The collector still re-runs discovery for retryable
+rejections every pass, so a source that appears later is uploaded, but neither an
+unchanged nor a growing transcript re-reports a warning already queued. Identical
+warnings within one pass are queued as one event with their summed count. Limits:
+
+- Per-reference codes (missing source, outside root, not a regular file, excluded,
+  unsupported type, too large, digest mismatch, unreadable source, invalid digest) name
+  the reference's digest and/or filename, so a different broken reference appended
+  later reports once. Discovery keeps at most 256 events per transcript in transcript
+  order, and repeats of already-reported references use up that cap, so references
+  past it are not reported.
+- `line_too_large`, `asset_limit`, and an unreadable transcript carry no identifier:
+  only their first pass is reported, with that pass's count; later occurrences in the
+  same transcript are not.
+- After a store walk that found at least one file and had no walk errors, warnings of
+  transcripts no longer found are forgotten. Entries deleted between listing and stat
+  count as gone; any other stat failure (permission, I/O, sharing) leaves the walk
+  incomplete and nothing is forgotten. A returning transcript re-reports retryable
+  warnings (missing, outside-root, not regular, too large, unreadable); warnings from a
+  scan that was cached before it vanished (for example `excluded`) are not re-reported
+  while it is unchanged. A missing or empty store root forgets nothing.
+- Rules-version and machine/hub identity changes clear all reported warnings and
+  cached scans.
+
+SQLite databases are snapshotted, not parsed as transcripts, so they are never scanned
+for external assets. Snapshot and upload failures for external assets are errors and
+are reported on every attempt.
 
 Compaction is durable before any network request. Representatives are deleted only
 after HTTP 200; failed requests retain all unacknowledged counts, including new

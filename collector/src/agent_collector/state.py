@@ -8,6 +8,21 @@ from pathlib import Path
 
 from . import __version__
 
+# AUTOINCREMENT: an ID at or below the heartbeat inspection cursor is never issued again, so a
+# newly buffered event can never land behind the cursor (plain rowids reuse max(id)+1 after the
+# queue empties). Shared with the legacy-table migration in State._reconcile_pending_event_ids.
+_PENDING_EVENTS_DDL = """
+CREATE TABLE IF NOT EXISTS {table} (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  level TEXT NOT NULL,
+  code TEXT NOT NULL,
+  message TEXT NOT NULL,
+  count INTEGER NOT NULL DEFAULT 1,
+  store TEXT,
+  created_at TEXT NOT NULL
+) STRICT;
+"""
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
   id INTEGER PRIMARY KEY,
@@ -36,15 +51,7 @@ CREATE TABLE IF NOT EXISTS runs (
   errors INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS pending_events (
-  id INTEGER PRIMARY KEY,
-  level TEXT NOT NULL,
-  code TEXT NOT NULL,
-  message TEXT NOT NULL,
-  count INTEGER NOT NULL DEFAULT 1,
-  store TEXT,
-  created_at TEXT NOT NULL
-) STRICT;
+""" + _PENDING_EVENTS_DDL.format(table="pending_events") + """
 
 CREATE TABLE IF NOT EXISTS webcapture_convs (
   product TEXT NOT NULL,          -- chatgpt | claude
@@ -62,7 +69,17 @@ CREATE TABLE IF NOT EXISTS asset_scans (
   PRIMARY KEY (store, parent_relpath)
 ) STRICT;
 
-
+-- External-asset warnings already queued for a parent transcript. Retryable rejections keep
+-- discovery re-running every pass, and append-only transcripts grow every turn; this table keeps
+-- the heartbeat from re-reporting a condition it already reported. The message embeds the
+-- referenced digest/filename, so a newly appended broken reference is a new key.
+CREATE TABLE IF NOT EXISTS asset_event_emissions (
+  store TEXT NOT NULL,
+  parent_relpath TEXT NOT NULL,
+  code TEXT NOT NULL,
+  message TEXT NOT NULL,
+  PRIMARY KEY (store, parent_relpath, code, message)
+) STRICT;
 
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
@@ -71,8 +88,15 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
+# Distinct parents read per page when pruning reported external-asset warnings.
+ASSET_EMISSION_PRUNE_PAGE = 1000
+
 SQLITE_BUSY = 5
 SQLITE_LOCKED = 6
+
+# pending_events ID schemes (enum): legacy plain rowids, or monotonic AUTOINCREMENT IDs.
+ID_SCHEME_ROWID = "rowid"
+ID_SCHEME_AUTOINCREMENT = "autoincrement"
 
 
 def _is_lock_contention(e: sqlite3.OperationalError) -> bool:
@@ -125,19 +149,60 @@ class State:
         self.conn.execute("PRAGMA synchronous = NORMAL")
         self.conn.executescript(SCHEMA)
         self.conn.commit()
+        self._reconcile_pending_event_ids()
         self._reconcile_asset_scan_rules()
         self.machine_id_changed = False
         self.hub_url_changed = False
         if machine_id is not None or hub_url is not None:
             self._reconcile_identity(machine_id, hub_url)
 
+    def _reconcile_pending_event_ids(self) -> None:
+        """Migrate a legacy plain-rowid pending_events table to AUTOINCREMENT IDs.
+
+        A plain INTEGER PRIMARY KEY reissues max(id)+1, so once the queue drained, new events
+        could get IDs at or below the saved delivery cursor and be stranded behind it. The rebuild
+        keeps every row and ID; inserting them seeds the AUTOINCREMENT sequence at MAX(id). The
+        delivery cursor is reset to 0 so rows already stranded below it are delivered first,
+        oldest ID first. One write transaction: interruption leaves the legacy table and cursor
+        intact, and a concurrent opener re-checks after taking the lock.
+        """
+        if self._pending_event_id_scheme() == ID_SCHEME_AUTOINCREMENT:
+            return
+        with self.conn:
+            self.conn.execute("BEGIN IMMEDIATE")
+            if self._pending_event_id_scheme() == ID_SCHEME_AUTOINCREMENT:
+                return
+            self.conn.execute("DROP TABLE IF EXISTS pending_events_migrating")
+            self.conn.execute(_PENDING_EVENTS_DDL.format(table="pending_events_migrating"))
+            self.conn.execute(
+                "INSERT INTO pending_events_migrating "
+                "(id, level, code, message, count, store, created_at) "
+                "SELECT id, level, code, message, count, store, created_at FROM pending_events"
+            )
+            self.conn.execute("DROP TABLE pending_events")
+            self.conn.execute("ALTER TABLE pending_events_migrating RENAME TO pending_events")
+            self.conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('heartbeat_event_cursor', '0') "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+            )
+
+    def _pending_event_id_scheme(self) -> str:
+        """The pending_events ID scheme recorded in sqlite_master."""
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'pending_events'"
+        ).fetchone()
+        return ID_SCHEME_AUTOINCREMENT if "AUTOINCREMENT" in row[0].upper() else ID_SCHEME_ROWID
+
     def _reconcile_asset_scan_rules(self) -> None:
-        """Invalidate cached external-asset scans when collector behavior changes."""
+        """Invalidate cached external-asset scans and reported asset warnings when collector
+        behavior changes: new rules may classify the same references differently."""
         key = "asset_scan_rules_version"
         row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         if row is None:
             self.conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (key, __version__))
-            changed = self.conn.execute("SELECT 1 FROM asset_scans LIMIT 1").fetchone() is not None
+            changed = self.conn.execute(
+                "SELECT 1 FROM asset_scans UNION ALL SELECT 1 FROM asset_event_emissions LIMIT 1"
+            ).fetchone() is not None
         else:
             changed = row["value"] != __version__
             if changed:
@@ -146,6 +211,7 @@ class State:
             self.conn.commit()
             return
         self.conn.execute("DELETE FROM asset_scans")
+        self.conn.execute("DELETE FROM asset_event_emissions")
         self.buffer_events([{
             "level": "info",
             "code": "asset_scan_rules_changed",
@@ -169,6 +235,7 @@ class State:
             return
         self.conn.execute("UPDATE files SET status = 'pending', error = NULL")
         self.conn.execute("DELETE FROM asset_scans")
+        self.conn.execute("DELETE FROM asset_event_emissions")
         self.conn.commit()
         self.buffer_events(events)
         self.machine_id_changed = m_changed
@@ -269,7 +336,62 @@ class State:
         )
         self.conn.commit()
 
+    def queue_asset_events(self, store: str, parent_relpath: str,
+                           events: list[dict]) -> list[dict]:
+        """Buffer each external-asset warning at most once per (store, parent, code, message).
 
+        Discovery re-runs for retryable rejections, and an active transcript grows every turn,
+        so the same warnings recur on every pass; only keys not reported before are queued.
+        Identical warnings within this pass become one event carrying their summed count. The
+        emission keys and the pending_events rows commit together: a key is never recorded for
+        an unqueued warning. Returns the events newly queued.
+        """
+        grouped: dict[tuple[str, str], dict] = {}
+        for e in events:
+            key = (e["code"], e["message"])
+            if key in grouped:
+                grouped[key]["count"] += e.get("count", 1)
+                continue
+            grouped[key] = dict(e, count=e.get("count", 1), store=store)
+        queued = []
+        with self.conn:
+            for (code, message), e in grouped.items():
+                cur = self.conn.execute(
+                    "INSERT INTO asset_event_emissions (store, parent_relpath, code, message) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                    (store, parent_relpath, code, message),
+                )
+                if cur.rowcount != 1:
+                    continue
+                self._insert_pending_event(e)
+                queued.append(e)
+        return queued
+
+    def prune_asset_events(self, store: str, seen_relpaths: set[str],
+                           page: int = ASSET_EMISSION_PRUNE_PAGE) -> int:
+        """Forget reported warnings of parents the latest complete scan of `store` did not yield
+        (deleted, moved, or newly excluded), so a returning parent reports afresh. Walks the
+        distinct parents in keyset pages; never loads the whole table. Returns parents pruned."""
+        pruned = 0
+        after = ""
+        while True:
+            parents = [r[0] for r in self.conn.execute(
+                "SELECT DISTINCT parent_relpath FROM asset_event_emissions "
+                "WHERE store = ? AND parent_relpath > ? ORDER BY parent_relpath LIMIT ?",
+                (store, after, page),
+            )]
+            if not parents:
+                return pruned
+            after = parents[-1]
+            gone = [p for p in parents if p not in seen_relpaths]
+            if not gone:
+                continue
+            with self.conn:
+                self.conn.executemany(
+                    "DELETE FROM asset_event_emissions WHERE store = ? AND parent_relpath = ?",
+                    ((store, p) for p in gone),
+                )
+            pruned += len(gone)
 
     def touch_seen(self, store: str, relpath: str) -> None:
         self.conn.execute(
@@ -333,16 +455,17 @@ class State:
         return dict(row) if row else None
 
     # -- pending events (heartbeat buffer) --------------------------------
+    def _insert_pending_event(self, e: dict) -> None:
+        """Insert one heartbeat event row; the caller owns the transaction/commit."""
+        self.conn.execute(
+            "INSERT INTO pending_events (level, code, message, count, store, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (e["level"], e["code"], e["message"], e.get("count", 1), e.get("store"), now_iso()),
+        )
+
     def buffer_events(self, events: list[dict]) -> None:
         for e in events:
-            self.conn.execute(
-                """
-                INSERT INTO pending_events (level, code, message, count, store, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (e["level"], e["code"], e["message"], e.get("count", 1),
-                 e.get("store"), now_iso()),
-            )
+            self._insert_pending_event(e)
         self.conn.commit()
 
     def compact_events(self, after_id: int = 0, limit: int = 100_000) -> int | None:

@@ -236,3 +236,44 @@ def test_compact_events_rolls_back_all_changes_and_retries_after_restart(tmp_pat
         assert [tuple(row) for row in st.conn.execute(
             "SELECT id, message, count FROM pending_events ORDER BY id"
         )] == [(1, "a", 5), (3, "b", 12)]
+
+
+def test_legacy_rowid_pending_events_migrate_to_monotonic_ids(tmp_path):
+    db = tmp_path / "state.db"
+    legacy = sqlite3.connect(db)
+    legacy.executescript("""
+        CREATE TABLE pending_events (
+          id INTEGER PRIMARY KEY,
+          level TEXT NOT NULL,
+          code TEXT NOT NULL,
+          message TEXT NOT NULL,
+          count INTEGER NOT NULL DEFAULT 1,
+          store TEXT,
+          created_at TEXT NOT NULL
+        ) STRICT;
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT) STRICT;
+        INSERT INTO pending_events VALUES (3, 'warn', 'a', 'x', 4, NULL, '2026-01-01T00:00:00Z');
+        INSERT INTO pending_events VALUES (7, 'error', 'b', 'y', 9, '', '2026-01-02T00:00:00Z');
+        INSERT INTO meta VALUES ('heartbeat_event_cursor', '12');
+    """)
+    legacy.commit()
+    before = [tuple(r) for r in legacy.execute("SELECT * FROM pending_events ORDER BY id")]
+    legacy.close()
+
+    with State(db) as st:
+        sql = st.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'pending_events'").fetchone()[0]
+        assert "AUTOINCREMENT" in sql.upper()
+        assert [tuple(r) for r in st.conn.execute(
+            "SELECT * FROM pending_events ORDER BY id")] == before
+        # The cursor restarts at 0 so rows stranded below it are delivered oldest first.
+        assert st.event_cursor() == 0
+        # New IDs continue above the highest kept row and are never reissued after the queue
+        # empties.
+        st.buffer_events([{"level": "warn", "code": "c", "message": "z"}])
+        ids, _ = st.drain_events()
+        assert ids == [3, 7, 8]
+        st.delete_events(ids)
+    with State(db) as st:
+        st.buffer_events([{"level": "warn", "code": "c", "message": "again"}])
+        assert st.conn.execute("SELECT id FROM pending_events").fetchone()[0] == 9
