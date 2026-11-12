@@ -98,19 +98,24 @@ def _safe_unlink(path: Path) -> None:
         pass
 
 
+# Windows reparse tag of an AF_UNIX socket file; the stat module only defines it on some builds.
+_IO_REPARSE_TAG_AF_UNIX = getattr(stat, "IO_REPARSE_TAG_AF_UNIX", 0x80000023)
+
+
 def _is_plain_file(path: Path) -> bool:
-    """True only for a regular file that is not a link or reparse point, from ONE lstat.
+    """True only for a regular file that is not a link or socket, from ONE lstat.
 
     Symlinks, sockets and FIFOs fail S_ISREG. On Windows an AF_UNIX socket (e.g. codex's
     app-server-daemon socket) is a reparse point that lstat still reports as a regular file, and
-    opening it fails; the reparse-point attribute excludes it. POSIX stat results have no
-    st_file_attributes, so that check is inert there.
+    opening it fails; its reparse tag excludes it. Other reparse points (OneDrive/cloud
+    placeholders, dedup files) hold real transcripts and stay. POSIX stat results have no
+    st_reparse_tag, so that check is inert there.
     """
     try:
         st = os.lstat(path)
     except OSError:
         return False
-    if getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+    if getattr(st, "st_reparse_tag", 0) == _IO_REPARSE_TAG_AF_UNIX:
         return False
     return stat.S_ISREG(st.st_mode)
 

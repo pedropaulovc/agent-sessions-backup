@@ -472,9 +472,15 @@ def test_walk_error_recorded_as_event(tmp_path):
     assert ev["store"] == "claude" and "secret" in ev["message"]
 
 
-def test_scan_skips_windows_reparse_point_reported_as_regular_file(tmp_path, monkeypatch):
-    # Windows lstat reports an AF_UNIX socket (codex app-server-daemon) as a regular-mode file
-    # carrying FILE_ATTRIBUTE_REPARSE_POINT; opening it fails, so the scan must not yield it.
+@pytest.mark.parametrize("reparse_tag, scanned", [
+    (0x80000023, False),  # IO_REPARSE_TAG_AF_UNIX: codex app-server-daemon socket
+    (0x9000001A, True),   # IO_REPARSE_TAG_CLOUD_A: OneDrive placeholder holding a real file
+    (0x80000013, True),   # IO_REPARSE_TAG_DEDUP: deduplicated real file
+])
+def test_scan_windows_reparse_point_skipped_only_for_af_unix(tmp_path, monkeypatch,
+                                                             reparse_tag, scanned):
+    # Windows lstat reports these reparse points as regular-mode files carrying
+    # FILE_ATTRIBUTE_REPARSE_POINT. Opening an AF_UNIX socket fails, so only that tag is skipped.
     root = tmp_path / ".codex"
     daemon = root / "app-server-daemon"
     daemon.mkdir(parents=True)
@@ -486,14 +492,16 @@ def test_scan_skips_windows_reparse_point_reported_as_regular_file(tmp_path, mon
         result = real_lstat(path, *args, **kwargs)
         if not os.fspath(path).endswith("control.sock"):
             return result
-        assert stat.S_ISREG(result.st_mode)  # the attribute alone must exclude it
+        assert stat.S_ISREG(result.st_mode)  # the tag alone must decide
         return SimpleNamespace(st_mode=result.st_mode,
-                               st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT)
+                               st_file_attributes=stat.FILE_ATTRIBUTE_REPARSE_POINT,
+                               st_reparse_tag=reparse_tag)
 
     monkeypatch.setattr(scanner_mod.os, "lstat", windows_lstat)
     with Scanner([]) as s:
         found = [i.relpath for i in s.scan_store("codex", root)]
-    assert found == ["session.jsonl"]
+    expected = {"app-server-daemon/control.sock", "session.jsonl"} if scanned else {"session.jsonl"}
+    assert set(found) == expected
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX") or os.name == "nt",

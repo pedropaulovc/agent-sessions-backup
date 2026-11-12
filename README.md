@@ -188,11 +188,16 @@ repeating those messages in every 1,000-row page. Unique messages still require
 separate delivery.
 
 External-asset warnings (missing, outside-root, unreadable, or oversized referenced
-images) are queued at most once per parent transcript fingerprint (size, mtime). The
-collector still re-runs discovery for retryable rejections every pass, so a source that
-appears later is uploaded, but an unchanged transcript does not re-report the same
-warning; changing the transcript re-reports its current conditions. Snapshot and upload
-failures for external assets are errors and are reported on every attempt.
+images) are queued once per store, parent transcript, code, and message; the message
+names the referenced digest and filename. The collector still re-runs discovery for
+retryable rejections every pass, so a source that appears later is uploaded, but neither
+an unchanged nor a growing transcript re-reports a warning already queued; a broken
+reference appended later is a new warning and reports once. Identical warnings within
+one pass keep their summed count. After a complete walk of a store (root present, no
+walk errors), warnings of transcripts no longer found are forgotten, so a returning
+transcript reports afresh. Rules-version and machine/hub identity changes clear them
+all. Snapshot and upload failures for external assets are errors and are reported on
+every attempt.
 
 Compaction is durable before any network request. Representatives are deleted only
 after HTTP 200; failed requests retain all unacknowledged counts, including new

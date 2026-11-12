@@ -62,14 +62,13 @@ CREATE TABLE IF NOT EXISTS asset_scans (
   PRIMARY KEY (store, parent_relpath)
 ) STRICT;
 
--- External-asset warnings already queued for a parent transcript at a given (size, mtime_ns).
--- Retryable rejections keep discovery re-running every pass; this table keeps the heartbeat
--- from re-reporting the same unchanged condition each time.
+-- External-asset warnings already queued for a parent transcript. Retryable rejections keep
+-- discovery re-running every pass, and append-only transcripts grow every turn; this table keeps
+-- the heartbeat from re-reporting a condition it already reported. The message embeds the
+-- referenced digest/filename, so a newly appended broken reference is a new key.
 CREATE TABLE IF NOT EXISTS asset_event_emissions (
   store TEXT NOT NULL,
   parent_relpath TEXT NOT NULL,
-  size INTEGER NOT NULL,
-  mtime_ns INTEGER NOT NULL,
   code TEXT NOT NULL,
   message TEXT NOT NULL,
   PRIMARY KEY (store, parent_relpath, code, message)
@@ -81,6 +80,9 @@ CREATE TABLE IF NOT EXISTS meta (
 ) STRICT;
 """
 
+
+# Distinct parents read per page when pruning reported external-asset warnings.
+ASSET_EMISSION_PRUNE_PAGE = 1000
 
 SQLITE_BUSY = 5
 SQLITE_LOCKED = 6
@@ -285,40 +287,62 @@ class State:
         )
         self.conn.commit()
 
-    def queue_asset_events(self, store: str, parent_relpath: str, size: int, mtime_ns: int,
+    def queue_asset_events(self, store: str, parent_relpath: str,
                            events: list[dict]) -> list[dict]:
-        """Buffer each external-asset warning at most once per parent fingerprint.
+        """Buffer each external-asset warning at most once per (store, parent, code, message).
 
-        Discovery re-runs for retryable rejections, so an unchanged transcript reproduces the
-        same warnings every pass. Keys recorded under an older (size, mtime_ns) are dropped first,
-        so a changed parent reports its conditions afresh. The emission keys and the
-        pending_events rows commit together: a key is never recorded for an unqueued warning.
-        Returns the events newly queued.
+        Discovery re-runs for retryable rejections, and an active transcript grows every turn,
+        so the same warnings recur on every pass; only keys not reported before are queued.
+        Identical warnings within this pass become one event carrying their summed count. The
+        emission keys and the pending_events rows commit together: a key is never recorded for
+        an unqueued warning. Returns the events newly queued.
         """
+        grouped: dict[tuple[str, str], dict] = {}
+        for e in events:
+            key = (e["code"], e["message"])
+            if key in grouped:
+                grouped[key]["count"] += e.get("count", 1)
+                continue
+            grouped[key] = dict(e, count=e.get("count", 1), store=store)
         queued = []
-        created_at = now_iso()
         with self.conn:
-            self.conn.execute(
-                "DELETE FROM asset_event_emissions WHERE store = ? AND parent_relpath = ? "
-                "AND (size != ? OR mtime_ns != ?)",
-                (store, parent_relpath, size, mtime_ns),
-            )
-            for e in events:
+            for (code, message), e in grouped.items():
                 cur = self.conn.execute(
-                    "INSERT INTO asset_event_emissions "
-                    "(store, parent_relpath, size, mtime_ns, code, message) "
-                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-                    (store, parent_relpath, size, mtime_ns, e["code"], e["message"]),
+                    "INSERT INTO asset_event_emissions (store, parent_relpath, code, message) "
+                    "VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                    (store, parent_relpath, code, message),
                 )
                 if cur.rowcount != 1:
                     continue
-                self.conn.execute(
-                    "INSERT INTO pending_events (level, code, message, count, store, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (e["level"], e["code"], e["message"], e.get("count", 1), store, created_at),
-                )
+                self._insert_pending_event(e)
                 queued.append(e)
         return queued
+
+    def prune_asset_events(self, store: str, seen_relpaths: set[str],
+                           page: int = ASSET_EMISSION_PRUNE_PAGE) -> int:
+        """Forget reported warnings of parents the latest complete scan of `store` did not yield
+        (deleted, moved, or newly excluded), so a returning parent reports afresh. Walks the
+        distinct parents in keyset pages; never loads the whole table. Returns parents pruned."""
+        pruned = 0
+        after = ""
+        while True:
+            parents = [r[0] for r in self.conn.execute(
+                "SELECT DISTINCT parent_relpath FROM asset_event_emissions "
+                "WHERE store = ? AND parent_relpath > ? ORDER BY parent_relpath LIMIT ?",
+                (store, after, page),
+            )]
+            if not parents:
+                return pruned
+            after = parents[-1]
+            gone = [p for p in parents if p not in seen_relpaths]
+            if not gone:
+                continue
+            with self.conn:
+                self.conn.executemany(
+                    "DELETE FROM asset_event_emissions WHERE store = ? AND parent_relpath = ?",
+                    ((store, p) for p in gone),
+                )
+            pruned += len(gone)
 
     def touch_seen(self, store: str, relpath: str) -> None:
         self.conn.execute(
@@ -382,16 +406,17 @@ class State:
         return dict(row) if row else None
 
     # -- pending events (heartbeat buffer) --------------------------------
+    def _insert_pending_event(self, e: dict) -> None:
+        """Insert one heartbeat event row; the caller owns the transaction/commit."""
+        self.conn.execute(
+            "INSERT INTO pending_events (level, code, message, count, store, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (e["level"], e["code"], e["message"], e.get("count", 1), e.get("store"), now_iso()),
+        )
+
     def buffer_events(self, events: list[dict]) -> None:
         for e in events:
-            self.conn.execute(
-                """
-                INSERT INTO pending_events (level, code, message, count, store, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (e["level"], e["code"], e["message"], e.get("count", 1),
-                 e.get("store"), now_iso()),
-            )
+            self._insert_pending_event(e)
         self.conn.commit()
 
     def compact_events(self, after_id: int = 0, limit: int = 100_000) -> int | None:

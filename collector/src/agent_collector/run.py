@@ -192,9 +192,10 @@ def _discover_upload_assets(
         )
     else:
         assets, asset_events = discovered
-    # Queued straight to the heartbeat buffer, once per parent fingerprint: retryable rejections
-    # re-run discovery every pass, and an unchanged transcript must not re-report them each time.
-    st.queue_asset_events(parent.store, parent.relpath, parent.size, parent.mtime_ns,
+    # Queued straight to the heartbeat buffer, once per (parent, code, message): retryable
+    # rejections re-run discovery every pass, and an active transcript grows every turn, so the
+    # same conditions recur on each pass and must not be re-reported.
+    st.queue_asset_events(parent.store, parent.relpath,
                           [_asset_event_dict(e, parent.store) for e in asset_events])
     out = ItemResult(seen=len(assets))
     # Stable rejection warnings can be cached, but source/file failures must be retried: the
@@ -303,7 +304,9 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
     try:
         for store, root in cfg.store_roots().items():
             stats.setdefault(store, {"files_seen": 0, "files_uploaded": 0, "bytes_uploaded": 0})
+            seen: set[str] = set()
             for item in scanner.scan_store(store, root):
+                seen.add(item.relpath)
                 scanned += 1
                 stats[store]["files_seen"] += 1
                 res = _process_item(cfg, st, transport, scanner, item)
@@ -337,6 +340,12 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
                     stats[store]["bytes_uploaded"] += assets_res.bytes
                 if assets_res.error:
                     errors += 1
+            # Only a complete walk proves a parent is gone; a missing root or an unreadable
+            # subtree would otherwise forget warnings that are still current.
+            walk_failed = any(e["code"] == "walk_error" and e.get("store") == store
+                              for e in scanner.events)
+            if root.exists() and not walk_failed:
+                st.prune_asset_events(store, seen)
         # Traversal/snapshot warnings (walk_error, snapshot_timeout) raised during the walk.
         events.extend(scanner.events)
         errors += sum(1 for e in scanner.events if e["level"] == "error")
@@ -556,11 +565,11 @@ def _upload_multipart(cfg, transport: Transport, item: ScanItem, sha: str) -> tu
     return MULTIPART_FAILED, last_error or "multipart upload failed"
 
 
-# D1 stores the whole heartbeat stats JSON in one row (2 MB row/string limit).
-# Stay well below that and the edge request cap, measuring the SAME default JSON encoding
-# as Transport.post_json (including ASCII escaping). Bound both queue reads and HTTP work.
-# Each batch is one hub request; a backlog larger than one run's budget stays queued and
-# drains over subsequent scheduled runs (the cursor and compaction survive restarts).
+# Each batch is one hub request. Bound the encoded JSON well below the edge request-size cap,
+# measuring the SAME default JSON encoding as Transport.post_json (including ASCII escaping), and
+# bound per-run queue reads and request count so a backlog cannot flood the hub's event logs.
+# A backlog larger than one run's budget stays queued and drains over subsequent scheduled runs
+# (the cursor and compaction survive restarts).
 HEARTBEAT_MAX_BYTES = 256 * 1024
 HEARTBEAT_MAX_EVENTS = 1000
 HEARTBEAT_MAX_BATCHES = 8
