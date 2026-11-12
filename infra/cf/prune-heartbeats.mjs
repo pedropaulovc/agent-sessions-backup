@@ -67,12 +67,15 @@ const retries = nonNegativeInt(args.retries, 'retries', 0);
 
 // `DB` is the binding name; wrangler resolves the database from hub/wrangler.jsonc, as
 // hub/scripts/environment.mjs does for the local fixture prices.
+// wrangler ignores `--profile` on `d1 execute` (it falls back to the default login and fails
+// non-interactively); only the WRANGLER_PROFILE environment variable selects the profile.
 const target = args['persist-to'] === undefined
-  ? ['--remote', '--profile', args.profile]
+  ? ['--remote']
   : ['--local', '--persist-to', path.resolve(args['persist-to'])];
 const where = args['persist-to'] === undefined ? `remote:DB(profile ${args.profile})` : `local:DB(${path.resolve(args['persist-to'])})`;
 const childEnv = { ...process.env };
 for (const name of IGNORED_CF_ENV) delete childEnv[name];
+if (args['persist-to'] === undefined) childEnv.WRANGLER_PROFILE = args.profile;
 
 class ExecuteError extends Error {
   constructor(message, kind) {
