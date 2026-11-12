@@ -15,9 +15,13 @@
 //   1. Bare Workers runtime exception lines whose whole Body starts with
 //      `D1_ERROR` (no JSON, no event). 21,091 of the 21,697 capacity lines in
 //      the 2026-11-12 outage had this shape (`D1_ERROR: Exceeded maximum DB size`).
-//   2. The `error` field of the hub events that log a caught D1 failure:
-//      parse.error (`Error: D1_ERROR: ...`, 603 lines) and
-//      hub.pricing.batch_pass_failed (`D1_ERROR: ...`, 3 lines).
+//   2. The `error` field of ANY structured hub event except collector.event and
+//      access.*. Every hub emitter that logs a caught failure does so as
+//      `error: String(e)` (hub/src: parse.error, parse.export.transient,
+//      hub.index_catalog.sync_failed, hub.certs.*, hub.watchdog.warn, ...), so
+//      a D1 failure there reads `Error: D1_ERROR: ...` or `D1_ERROR: ...`. An
+//      IDX shard or catalog DB filling while main is healthy surfaces only here
+//      (no bare lines). Outage counts: parse.error 603, pricing 3.
 // parse-errors.kql excludes the same D1-anchored capacity set, so the outage
 // pages here at Sev1 instead.
 //
@@ -35,9 +39,10 @@ otel
 | where TimeGenerated > ago(1h)
 | where ServiceName == 'sessions-hub'
 | where Body contains "D1_ERROR"
+| extend event = tostring(todynamic(Body).event)
 | extend d1_error = case(
     Body startswith_cs "D1_ERROR", Body,
-    tostring(todynamic(Body).event) in ("parse.error", "hub.pricing.batch_pass_failed"), tostring(todynamic(Body).error),
+    isnotempty(event) and event != "collector.event" and not(event startswith_cs "access."), tostring(todynamic(Body).error),
     "")
 | where d1_error startswith_cs "D1_ERROR" or d1_error startswith_cs "Error: D1_ERROR"
 | where d1_error contains "SQLITE_FULL"

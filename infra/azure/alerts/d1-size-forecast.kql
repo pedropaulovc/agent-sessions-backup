@@ -12,14 +12,21 @@
 // a pre-shrink endpoint masking regrowth.
 //   - Readings <= 0 are dropped: -1 is a failed probe (owned by d1-size.kql)
 //     and a 0-byte size is never a real database.
-//   - A drop is a reading below its predecessor by more than
+//   - A step is a change from the neighbouring reading of more than
 //     max(1%, 50 MB). The absolute floor keeps small shards' sub-MB wobble
-//     (IDX shards dip by <1 MB) from restarting the fit.
-//   - A drop counts as a shrink only when the next reading confirms it (also
-//     below that threshold); the fit then starts at the first post-shrink
-//     reading. An unconfirmed drop (one low glitch, or the newest reading) is
-//     excluded from the fit, so a lone outlier gets neither a restart nor the
-//     leverage of the first point.
+//     (IDX shards dip by <1 MB) from counting as a step.
+//   - Outliers are handled symmetrically and excluded from the fit, so a lone
+//     bad gauge gets neither a restart nor endpoint leverage:
+//       * high spike: a step up from its predecessor that is not sustained
+//         (also a step above its successor, or it is the newest reading). It
+//         is removed BEFORE drop detection, so the fall back from a spike is
+//         not mistaken for a shrink;
+//       * low glitch: a step down that the next reading does not confirm
+//         (next reading back within the step of the predecessor, or it is the
+//         newest reading).
+//   - A step down confirmed by the next reading is a shrink; the fit then
+//     starts at the first post-shrink reading.
+//   An unconfirmed newest step (either direction) only waits one */15 reading.
 // The fitted segment needs >= 12h span and >= 24 readings, so a burst right
 // after a deploy, new shard, shrink, or rule bootstrap cannot extrapolate a
 // false deadline. Shrinking or flat trends never fire. A database that reached
@@ -42,6 +49,13 @@ let classified = materialize(otel
     | where body.event == "hub.d1.db_size_bytes"
     | extend bytes = tolong(body.bytes), database = iff(isempty(tostring(body.database)), "main", tostring(body.database))
     | where bytes > 0
+    | project database, TimeGenerated, bytes
+    | order by database asc, TimeGenerated asc
+    | extend prev_bytes = iff(prev(database) == database, prev(bytes), long(null)),
+        next_bytes = iff(next(database) == database, next(bytes), long(null))
+    | extend spike = isnotnull(prev_bytes) and bytes > prev_bytes + max_of(0.01 * prev_bytes, 50e6)
+        and (isnull(next_bytes) or bytes > next_bytes + max_of(0.01 * next_bytes, 50e6))
+    | where not(spike)
     | project database, TimeGenerated, bytes
     | order by database asc, TimeGenerated asc
     | extend prev_bytes = iff(prev(database) == database, prev(bytes), long(null)),
