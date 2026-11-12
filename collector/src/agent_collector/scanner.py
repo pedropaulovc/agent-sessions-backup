@@ -98,26 +98,40 @@ def _safe_unlink(path: Path) -> None:
         pass
 
 
-# IO_REPARSE_TAG_AF_UNIX from the Windows SDK (winnt.h); CPython's stat module does not export it.
-_IO_REPARSE_TAG_AF_UNIX = 0x80000023
+# Reparse tags (Windows SDK winnt.h; CPython's stat module exports none of them) whose files
+# lstat reports as regular but that cannot be opened and read as files: AF_UNIX sockets (e.g.
+# codex's app-server-daemon socket) and WSL's LX symlink/FIFO/character/block-device entries.
+_UNOPENABLE_REPARSE_TAGS = frozenset({
+    0x80000023,  # IO_REPARSE_TAG_AF_UNIX
+    0xA000001D,  # IO_REPARSE_TAG_LX_SYMLINK
+    0x80000024,  # IO_REPARSE_TAG_LX_FIFO
+    0x80000025,  # IO_REPARSE_TAG_LX_CHR
+    0x80000026,  # IO_REPARSE_TAG_LX_BLK
+})
+
+# Directory-entry kinds (enum, not a bool): only ENTRY_REGULAR is captured.
+ENTRY_REGULAR = "regular"
+ENTRY_NOT_REGULAR = "not_regular"          # symlink, socket, FIFO, device, directory
+ENTRY_UNOPENABLE_REPARSE = "unopenable_reparse"
+ENTRY_VANISHED = "vanished"                # lstat failed
 
 
-def _is_plain_file(path: Path) -> bool:
-    """True only for a regular file that is not a link or socket, from ONE lstat.
+def _entry_kind(path: Path) -> str:
+    """Classify a walked entry from ONE lstat.
 
-    Symlinks, sockets and FIFOs fail S_ISREG. On Windows an AF_UNIX socket (e.g. codex's
-    app-server-daemon socket) is a reparse point that lstat still reports as a regular file, and
-    opening it fails; its reparse tag excludes it. Other reparse points (OneDrive/cloud
-    placeholders, dedup files) hold real transcripts and stay. POSIX stat results have no
-    st_reparse_tag, so that check is inert there.
+    Symlinks, sockets and FIFOs fail S_ISREG. On Windows, AF_UNIX sockets and WSL LX special
+    files are reparse points that lstat still reports as regular files, and opening them fails;
+    their reparse tag excludes them. Other reparse points (OneDrive/cloud placeholders, dedup
+    files) hold real transcripts and stay. POSIX stat results have no st_reparse_tag, so that
+    check is inert there.
     """
     try:
         st = os.lstat(path)
     except OSError:
-        return False
-    if getattr(st, "st_reparse_tag", 0) == _IO_REPARSE_TAG_AF_UNIX:
-        return False
-    return stat.S_ISREG(st.st_mode)
+        return ENTRY_VANISHED
+    if getattr(st, "st_reparse_tag", 0) in _UNOPENABLE_REPARSE_TAGS:
+        return ENTRY_UNOPENABLE_REPARSE
+    return ENTRY_REGULAR if stat.S_ISREG(st.st_mode) else ENTRY_NOT_REGULAR
 
 
 def _snapshot_sqlite(src: Path, dst: Path, deadline_s: float = SNAPSHOT_DEADLINE_S) -> str:
@@ -264,7 +278,7 @@ class Scanner:
                     self.excluded_counts[store][hit] += 1
                     continue
                 path = Path(dirpath) / fname
-                if not _is_plain_file(path):
+                if _entry_kind(path) != ENTRY_REGULAR:
                     continue
                 item = self._make_item(store, relpath, path)
                 if item:

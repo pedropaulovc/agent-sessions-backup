@@ -580,109 +580,9 @@ HEARTBEAT_MAX_BATCHES = 8
 HEARTBEAT_COMPACT_ROWS = 100_000
 
 
-def _post_event_page(cfg, st: State, transport: Transport, body: dict, base_size: int,
-                     ids: list[int], events: list[dict]) -> tuple[bool, int, int | None, bool]:
-    """Coalesce one drained page into a request and acknowledge it on HTTP 200.
-
-    Returns (ok, acknowledged_rows, last_inspected_id, oversized). Rows after the last inspected
-    ID did not fit this request and stay queued; an individually oversized row is retained.
-    """
-    ack_ids = []
-    grouped = {}
-    size = base_size
-    last_id = None
-    oversized = False
-    max_count = sum(abs(e["count"]) for e in events)
-    for event_id, event in zip(ids, events):
-        key = (event["level"], event["code"], event["message"], event.get("store"))
-        if key in grouped:
-            grouped[key]["count"] += event["count"]
-            ack_ids.append(event_id)
-            last_id = event_id
-            continue
-        # Reserve the largest count this group can have after coalescing the page.
-        added = len(json.dumps(dict(event, count=-max_count)).encode("utf-8"))
-        if base_size + added > HEARTBEAT_MAX_BYTES:
-            print(f"heartbeat event {event_id} exceeds payload budget; retained", file=sys.stderr)
-            oversized = True
-            last_id = event_id
-            continue
-        added += 2 if grouped else 0
-        if size + added > HEARTBEAT_MAX_BYTES:
-            break
-        grouped[key] = event.copy()
-        ack_ids.append(event_id)
-        size += added
-        last_id = event_id
-    body["events"] = list(grouped.values())
-    status, response = transport.post_json(f"{cfg.hub_url}/api/v1/heartbeat", body)
-    if status != 200:
-        # Escape controls and bound diagnostics; never print the request or credentials.
-        detail = json.dumps(response[:512], ensure_ascii=True)
-        print(f"heartbeat failed: HTTP {status}; response={detail}; events retained", file=sys.stderr)
-        return False, 0, last_id, oversized
-    st.delete_events(ack_ids)
-    return True, len(ack_ids), last_id, oversized
-
-
-@dataclass(frozen=True)
-class _Delivery:
-    ok: bool
-    sent: int
-    acked: int
-    oversized: bool
-
-
-def _deliver_range(cfg, st: State, transport: Transport, body: dict, base_size: int,
-                   after_id: int, budget: int, persist_cursor: bool) -> _Delivery:
-    """Deliver queued rows above `after_id` in ID order, using at most `budget` requests.
-
-    Each bounded input window is compacted before it is paged. With `persist_cursor`, this is
-    the backlog pass: progress is saved as the inspection cursor (reset to 0 once the queue is
-    exhausted), and a stale cursor with nothing above it is requeried from zero once.
-    """
-    sent = acked = 0
-    oversized = False
-    requeried = False
-    window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
-    while sent < budget:
-        ids, events = (st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
-                       if window_end is not None else ([], []))
-        if not ids and window_end is not None:
-            # Compaction can remove the window's final IDs. Advance over only those
-            # removed rows before selecting the next bounded input window.
-            after_id = window_end
-            window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
-            continue
-        if not ids:
-            if not persist_cursor:
-                break
-            st.set_event_cursor(0)
-            if sent or requeried or not after_id:
-                break
-            # A saved cursor can outlive all pending IDs, including when SQLite
-            # reuses IDs after deletion. Requery from zero in this same pass.
-            requeried = True
-            after_id = 0
-            window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
-            continue
-        ok, page_acked, last_id, page_oversized = _post_event_page(
-            cfg, st, transport, body, base_size, ids, events)
-        sent += 1
-        oversized |= page_oversized
-        if not ok:
-            return _Delivery(False, sent, acked, oversized)
-        acked += page_acked
-        after_id = last_id
-        if persist_cursor:
-            st.set_event_cursor(after_id)
-    return _Delivery(True, sent, acked, oversized)
-
-
 def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: list[dict]) -> bool:
     # Commit before the first network call: failure, exception, or process interruption must
     # never lose current-run events. Delivery is at least once if the remote ACK is lost.
-    fresh_after = st.max_event_id()
     st.buffer_events(run_events)
     body = {"collector_version": __version__, "stores": stats, "events": []}
     base_size = len(json.dumps(body).encode("utf-8"))
@@ -690,31 +590,66 @@ def _heartbeat(cfg, st: State, transport: Transport, stats: dict, run_events: li
         print("heartbeat failed: stores envelope exceeds payload budget; events retained", file=sys.stderr)
         return False
 
-    sent = delivered = 0
+    after_id = st.event_cursor()
+    window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
     oversized = False
-    # This run's own events (upload/walk/snapshot failures) go first, so fresh errors never wait
-    # behind an older backlog. They carry the highest IDs, so the backlog cursor is untouched.
-    # When older rows exist (fresh_after > 0), one request stays reserved for the backlog pass:
-    # otherwise fresh traffic at or above the budget would starve the backlog every run.
-    if run_events:
-        fresh_budget = HEARTBEAT_MAX_BATCHES - (1 if fresh_after else 0)
-        fresh = _deliver_range(cfg, st, transport, body, base_size, fresh_after,
-                               fresh_budget, persist_cursor=False)
-        sent, delivered, oversized = fresh.sent, fresh.acked, fresh.oversized
-        if not fresh.ok:
+    delivered = 0
+    for _batch in range(HEARTBEAT_MAX_BATCHES):
+        ids, events = st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
+        if not ids and window_end is not None:
+            # Compaction can remove the window's final IDs. Advance over only those
+            # removed rows before selecting the next bounded input window.
+            after_id = window_end
+            window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
+            ids, events = (st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
+                           if window_end is not None else ([], []))
+        if not ids and after_id:
+            st.set_event_cursor(0)
+            if _batch:
+                break
+            # A saved cursor can outlive all pending IDs, including when SQLite
+            # reuses IDs after deletion. Requery from zero in this same pass.
+            after_id = 0
+            window_end = st.compact_events(after_id, HEARTBEAT_COMPACT_ROWS)
+            ids, events = st.drain_events(HEARTBEAT_MAX_EVENTS, after_id, window_end)
+        ack_ids = []
+        grouped = {}
+        size = base_size
+        max_count = sum(abs(e["count"]) for e in events)
+        for event_id, event in zip(ids, events):
+            key = (event["level"], event["code"], event["message"], event.get("store"))
+            if key in grouped:
+                grouped[key]["count"] += event["count"]
+                ack_ids.append(event_id)
+                after_id = event_id
+                continue
+            # Reserve the largest count this group can have after coalescing the page.
+            added = len(json.dumps(dict(event, count=-max_count)).encode("utf-8"))
+            if base_size + added > HEARTBEAT_MAX_BYTES:
+                print(f"heartbeat event {event_id} exceeds payload budget; retained", file=sys.stderr)
+                oversized = True
+                after_id = event_id
+                continue
+            added += 2 if grouped else 0
+            if size + added > HEARTBEAT_MAX_BYTES:
+                break
+            grouped[key] = event.copy()
+            ack_ids.append(event_id)
+            size += added
+            after_id = event_id
+        body["events"] = list(grouped.values())
+        status, response = transport.post_json(f"{cfg.hub_url}/api/v1/heartbeat", body)
+        if status != 200:
+            # Escape controls and bound diagnostics; never print the request or credentials.
+            detail = json.dumps(response[:512], ensure_ascii=True)
+            print(f"heartbeat failed: HTTP {status}; response={detail}; events retained", file=sys.stderr)
             return False
-    backlog = _deliver_range(cfg, st, transport, body, base_size, st.event_cursor(),
-                             HEARTBEAT_MAX_BATCHES - sent, persist_cursor=True)
-    if not backlog.ok:
-        return False
-    sent += backlog.sent
-    delivered += backlog.acked
-    oversized |= backlog.oversized
-    if not sent:
-        # Nothing queued: the heartbeat itself still proves an authenticated write.
-        ok, _acked, _last, _over = _post_event_page(cfg, st, transport, body, base_size, [], [])
-        if not ok:
-            return False
+        st.delete_events(ack_ids)
+        delivered += len(ack_ids)
+        st.set_event_cursor(after_id)
+        if not ids:
+            st.set_event_cursor(0)
+            break
     remaining = st.pending_event_count()
     if remaining:
         print(f"heartbeat events: acknowledged_rows={delivered} pending_rows={remaining}", file=sys.stderr)

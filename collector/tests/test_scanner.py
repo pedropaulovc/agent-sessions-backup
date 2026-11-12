@@ -474,13 +474,18 @@ def test_walk_error_recorded_as_event(tmp_path):
 
 @pytest.mark.parametrize("reparse_tag, scanned", [
     (0x80000023, False),  # IO_REPARSE_TAG_AF_UNIX: codex app-server-daemon socket
+    (0xA000001D, False),  # IO_REPARSE_TAG_LX_SYMLINK: WSL symlink
+    (0x80000024, False),  # IO_REPARSE_TAG_LX_FIFO
+    (0x80000025, False),  # IO_REPARSE_TAG_LX_CHR
+    (0x80000026, False),  # IO_REPARSE_TAG_LX_BLK
     (0x9000001A, True),   # IO_REPARSE_TAG_CLOUD_A: OneDrive placeholder holding a real file
     (0x80000013, True),   # IO_REPARSE_TAG_DEDUP: deduplicated real file
 ])
-def test_scan_windows_reparse_point_skipped_only_for_af_unix(tmp_path, monkeypatch,
-                                                             reparse_tag, scanned):
+def test_scan_windows_reparse_point_skipped_only_for_unopenable_tags(tmp_path, monkeypatch,
+                                                                     reparse_tag, scanned):
     # Windows lstat reports these reparse points as regular-mode files carrying
-    # FILE_ATTRIBUTE_REPARSE_POINT. Opening an AF_UNIX socket fails, so only that tag is skipped.
+    # FILE_ATTRIBUTE_REPARSE_POINT. AF_UNIX sockets and WSL LX special files cannot be opened
+    # as files, so only those tags are skipped.
     root = tmp_path / ".codex"
     daemon = root / "app-server-daemon"
     daemon.mkdir(parents=True)

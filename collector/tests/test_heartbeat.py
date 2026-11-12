@@ -315,70 +315,26 @@ def test_page_budget_remains_bounded_with_compaction_and_restart(tmp_path, monke
     ) == event_counts(events)
 
 
-def test_current_run_errors_are_delivered_ahead_of_backlog(tmp_path, monkeypatch):
-    # A backlog larger than one run's request budget must not leave this run's failures queued.
-    monkeypatch.setattr(run, "HEARTBEAT_MAX_EVENTS", 1)
+def test_budget_exhausted_on_empty_queue_then_reused_low_ids_still_deliver(tmp_path, monkeypatch):
+    # Run A spends its whole request budget draining the queue exactly, so it never observes the
+    # empty queue and leaves the cursor at its last ID. SQLite then reuses low IDs for run B's
+    # rows (rowid = max + 1 on an empty table); B must requery from zero and deliver them now.
+    monkeypatch.setattr(run, "HEARTBEAT_MAX_EVENTS", 2)
     cfg = SimpleNamespace(hub_url="https://hub.invalid")
     path = tmp_path / "state.db"
     budget = run.HEARTBEAT_MAX_BATCHES
-    backlog = [event(f"old/{i}") for i in range(3 * budget)]
-    current = [dict(event("upload failed now"), level="error", code="upload_failed")]
-    transport = RecordingTransport()
+    first = [event(f"a/{i}") for i in range(2 * budget)]
+    a = RecordingTransport()
     with State(path) as st:
-        st.buffer_events(backlog)
-        assert run._heartbeat(cfg, st, transport, {}, current)
-        assert len(transport.bodies) == budget
-        assert transport.bodies[0]["events"] == current
-        assert st.pending_event_count() == 2 * budget + 1
-    passes = [transport]
-    for expected_pending in (budget + 1, 1, 0):
-        retry = RecordingTransport()
-        with State(path) as st:
-            assert run._heartbeat(cfg, st, retry, {}, [])
-            assert len(retry.bodies) <= budget
-            assert st.pending_event_count() == expected_pending
-        passes.append(retry)
-    assert event_counts(
-        item for t in passes for body in t.bodies for item in body["events"]
-    ) == event_counts(backlog + current)
-
-
-def test_backlog_drains_while_fresh_traffic_exceeds_the_request_budget(tmp_path, monkeypatch):
-    # Every run produces more fresh events than its request budget can carry. One request per
-    # run stays reserved for the backlog, so the oldest rows still drain in FIFO order.
-    monkeypatch.setattr(run, "HEARTBEAT_MAX_EVENTS", 1)
-    cfg = SimpleNamespace(hub_url="https://hub.invalid")
-    path = tmp_path / "state.db"
-    budget = run.HEARTBEAT_MAX_BATCHES
-    backlog = [event(f"old/{i}") for i in range(3)]
+        assert run._heartbeat(cfg, st, a, {}, first)
+        assert len(a.bodies) == budget
+        assert st.pending_event_count() == 0
+        assert st.event_cursor() == 2 * budget
+    second = [event(f"b/{i}") for i in range(budget)]
+    b = RecordingTransport()
     with State(path) as st:
-        st.buffer_events(backlog)
-    produced = list(backlog)
-    passes = []
-    for run_no in range(len(backlog)):
-        fresh = [dict(event(f"run{run_no}/{i}"), level="error") for i in range(budget + 2)]
-        produced += fresh
-        transport = RecordingTransport()
-        with State(path) as st:
-            assert run._heartbeat(cfg, st, transport, {}, fresh)
-        assert len(transport.bodies) == budget
-        # Fresh events lead; the final request carries the oldest backlog row.
-        assert all(body["events"][0]["message"].startswith(f"run{run_no}/")
-                   for body in transport.bodies[:-1])
-        assert transport.bodies[-1]["events"][0]["message"] == f"old/{run_no}"
-        passes.append(transport)
-    with State(path) as st:
-        remaining = {row[0] for row in st.conn.execute("SELECT message FROM pending_events")}
-    assert not remaining & {e["message"] for e in backlog}
-    for _ in range(10):
-        transport = RecordingTransport()
-        with State(path) as st:
-            assert run._heartbeat(cfg, st, transport, {}, [])
-            passes.append(transport)
-            if st.pending_event_count() == 0:
-                break
-    else:
-        pytest.fail("backlog did not drain once fresh traffic stopped")
-    assert event_counts(
-        item for t in passes for body in t.bodies for item in body["events"]
-    ) == event_counts(produced)
+        st.buffer_events(second)
+        assert max(row[0] for row in st.conn.execute("SELECT id FROM pending_events")) < 2 * budget
+        assert run._heartbeat(cfg, st, b, {}, [])
+        assert st.pending_event_count() == 0
+    assert event_counts(item for body in b.bodies for item in body["events"]) == event_counts(second)
