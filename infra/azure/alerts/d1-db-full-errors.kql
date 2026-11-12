@@ -1,0 +1,24 @@
+// Sev1: fires on ANY sessions-hub log line in the last 15 minutes whose Body
+// contains D1's `Exceeded maximum DB size` write rejection, i.e. a D1 database
+// has hit its 10 GB cap and the hub can no longer persist uploads/heartbeats.
+//
+// Matches the raw Body, not a structured `event`: in the 2026-11-12 outage
+// 13,600 of the ~14,200 such lines were bare `D1_ERROR: Exceeded maximum DB size`
+// strings with no event field; the rest arrived inside parse.error and
+// hub.pricing.batch_pass_failed events. parse-errors.kql excludes this error
+// so the outage pages here, once, at Sev1.
+//
+// `contains` (substring), not `has`: `has` is term-based and does not reliably
+// match a multi-word phrase. A bare summarize always yields one row, so
+// `where lines > 0` drops it on a healthy window; otherwise that one compact
+// row trips provision.sh's `count > 0`. Missing OTelLogs degrades to empty.
+let otel = union isfuzzy=true
+    (datatable(TimeGenerated:datetime, Body:string, ServiceName:string)[]),
+    (OTelLogs | project TimeGenerated, Body, ServiceName);
+otel
+| where TimeGenerated > ago(15m)
+| where ServiceName == 'sessions-hub'
+| where Body contains "Exceeded maximum DB size"
+| summarize lines = count(), first_at = min(TimeGenerated), last_at = max(TimeGenerated),
+    samples = make_set(substring(Body, 0, 300), 5)
+| where lines > 0

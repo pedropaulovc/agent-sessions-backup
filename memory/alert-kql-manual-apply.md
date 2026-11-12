@@ -88,7 +88,7 @@ az monitor scheduled-query create --name agent-backup-<base> --resource-group rg
   --scopes "$(az monitor log-analytics workspace show -g rg-agent-backup -n law-agent-backup --query id -o tsv)" \
   --location westus2 --condition "count 'Placeholder_1' > 0" \
   --condition-query Placeholder_1="$(cat infra/azure/alerts/<base>.kql)" \
-  --evaluation-frequency 1h --window-size 1h --severity 2 \
+  --evaluation-frequency 1h --window-size 1h --severity <alert_severity_for in provision.sh: 1 for d1-size-critical/d1-db-full-errors, else 2> \
   --action-groups "$(az monitor action-group show -g rg-agent-backup -n ag-pedro-email --query id -o tsv)" \
   --skip-query-validation true
 ```

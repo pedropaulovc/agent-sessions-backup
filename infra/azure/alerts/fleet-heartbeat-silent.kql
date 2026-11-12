@@ -1,0 +1,31 @@
+// Fires when the hub accepted ZERO collector heartbeats in the last 2h while
+// its own watchdog is demonstrably alive (hub.watchdog.run beacons present).
+//
+// missed-heartbeat.kql keys on the watchdog's per-machine age gauge, read from
+// D1 `machines.last_seen_at`, with a 72h tolerance. It cannot see a hub that
+// rejects every heartbeat: in the 2026-11-12 outage D1 was full, POST
+// /api/v1/heartbeat threw before logging `hub.heartbeat` (last one at
+// 00:05 UTC), and nothing paged. This rule watches the hub-side acceptance log
+// instead, fleet-wide, so a hub/D1 failure surfaces within hours, not days.
+//
+// The beacon guard hands total telemetry silence to missed-heartbeat.kql's
+// __pipeline_silent__ / __pipeline_gap__ legs: with no beacons this rule
+// returns nothing, so one outage does not page twice.
+//
+// Window 2h: collectors heartbeat many times per hour; outside outages the
+// largest fleet-wide gap Nov 1-11 2026 was ~22m, except two whole-host
+// sleeps (7.9h on Nov 2, 9.6h on Nov 6) when every machine was off. Those
+// fire here too; a silent fleet is worth one Sev2 email. Evaluated every 15m
+// (provision.sh) to match the watchdog cadence: the alert is stateful, so the
+// shorter cadence detects sooner without repeat notifications.
+let otel = union isfuzzy=true
+    (datatable(TimeGenerated:datetime, Body:string, ServiceName:string)[]),
+    (OTelLogs | project TimeGenerated, Body, ServiceName);
+otel
+| where TimeGenerated > ago(2h)
+| where ServiceName == 'sessions-hub'
+| extend event = tostring(todynamic(Body).event)
+| where event in ("hub.heartbeat", "hub.watchdog.run")
+| summarize heartbeats = countif(event == "hub.heartbeat"), watchdog_runs = countif(event == "hub.watchdog.run"),
+    last_watchdog_at = maxif(TimeGenerated, event == "hub.watchdog.run")
+| where heartbeats == 0 and watchdog_runs > 0

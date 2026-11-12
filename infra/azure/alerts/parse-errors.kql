@@ -55,6 +55,9 @@ otel
     or err contains "reset because its code was updated"
     or err contains "Cannot resolve Durable Object")
 | where not(transientD1)
+// A full D1 database fails every parse with `Exceeded maximum DB size`; that
+// outage pages once at Sev1 via d1-db-full-errors.kql, so it is excluded here.
+| where not(err contains "Exceeded maximum DB size")
 // A bare summarize (no `by`) yields exactly one row — files counts DISTINCT
 // affected file_ids (not rows: a retried terminal failure logs several), errors
 // samples the messages for the notification. `where files > 1` emits that row
