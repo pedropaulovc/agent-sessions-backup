@@ -326,6 +326,98 @@ by the derived bearer. No production credential, encryption envelope, or cross-a
 is involved; "no agent moves prod bytes without my passkey" holds because the passkey-gated
 export is the only way bytes leave production.
 
+## Recovering a full production main D1 (`heartbeats` prune)
+
+Production `sessions-index` reached D1's 10 GB cap because every collector heartbeat was
+inserted, events JSON and all, into `heartbeats`, which nothing reads. The hub no longer
+writes that table. Uploads that were parsed while the database was full failed with
+`Exceeded maximum DB size`, and the daily pricing/rollup passes could not write. Recovery is
+an owner-at-keyboard operation with the `production` Wrangler profile (agents never run it).
+Do the steps in order; each one is resumable.
+
+**0. Do not wait for the deploy.** Prune immediately; the database is unwritable until you
+do. The old Worker keeps inserting one `heartbeats` row per heartbeat request until the hub
+change that stops it is deployed, which refills a negligible fraction of what the prune frees.
+Deploying first also risks a failed `main` run, since its migration and smoke steps may need
+to write D1.
+
+**1. Empty `heartbeats` in bounded chunks.** From the repo root (`hub/node_modules` must be
+installed; the script runs `npx --no-install wrangler` in `hub/` and reads the `DB` database
+name from `hub/wrangler.jsonc`):
+
+```bash
+node infra/cf/prune-heartbeats.mjs --dry-run      # SELECT COUNT(*) only; may be slow on a full table
+node infra/cf/prune-heartbeats.mjs                # DELETE 500 rows per statement until a chunk deletes 0
+```
+
+Each chunk is one independent `DELETE FROM heartbeats WHERE id IN (SELECT id FROM heartbeats
+ORDER BY id LIMIT n) RETURNING id` and prints one JSON line with `deleted` and the running
+`total`; the run ends with `"state":"empty"`. `--chunk <n>` changes the statement size (lower
+it if a statement times out), `--max-chunks <n>` stops early (`"state":"max_chunks_reached"`),
+and `--retries <n>` (default 5) bounds the per-chunk retry with exponential backoff (2 s doubling,
+capped at 60 s). Interrupting or exhausting retries leaves a partly pruned table; re-run the
+same command. The script drops `CLOUDFLARE_API_TOKEN`/`CLOUDFLARE_ACCOUNT_ID`/
+`CLOUDFLARE_API_KEY`/`CLOUDFLARE_EMAIL` from wrangler's environment so the `production`
+profile (or `--profile`/`WRANGLER_PROFILE`) is the only credential in play.
+
+No `VACUUM` is needed: deleted pages go on SQLite's freelist and are reused by later writes,
+so the database accepts writes again without the file shrinking. The table and its index stay;
+dropping them is a later migration once the table is empty.
+
+**2. Re-parse the files that failed while the database was full.** List them (expect about 25):
+
+```bash
+cd hub
+npx --no-install wrangler d1 execute sessions-index --remote --profile production --json --command \
+  "SELECT id, machine_id, store, relpath, r2_key, parse_state FROM files
+    WHERE parse_state = 'error' AND parse_error LIKE '%Exceeded maximum DB size%' ORDER BY id" \
+  | jq -r '.[0].results[].r2_key' > /tmp/db-full-failed-keys.txt
+wc -l /tmp/db-full-failed-keys.txt
+```
+
+A parse error is terminal (the queue does not retry it and the collector does not re-upload an
+unchanged file), so re-enqueue each one through the existing admin reindex, using its exact
+`r2_key` as the prefix. Use the current admin machine certificate against the API host; `ADMIN_CERT`/
+`ADMIN_KEY` as in the README's reindex example (or the equivalent TPM-backed client invocation):
+
+```bash
+API=https://api.sessions.pedrovc.com.br
+while read -r key; do
+  until code=$(curl --silent --show-error --output /dev/stderr --write-out '%{http_code}' \
+      --cert "$ADMIN_CERT" --key "$ADMIN_KEY" -H 'Content-Type: application/json' \
+      --data "$(jq -nc --arg p "$key" '{prefix:$p}')" "$API/api/v1/admin/reindex") && [ "$code" = 200 ]; do
+    [ "$code" = 202 ] || { echo "reindex $key failed: HTTP $code" >&2; exit 1; }
+  done
+done < /tmp/db-full-failed-keys.txt
+```
+
+`202`/`done:false` means more of the prefix remains; `200`/`done:true` means it is enqueued, not
+yet parsed. A prefix also matches any longer key that starts with it, which only re-enqueues
+those files too. Re-run the listing query until it returns no rows once the parse queue drains.
+
+**3. Re-run pricing and the session rollup.** The daily cron cannot be triggered by hand on the
+deployed Worker; use the admin routes, which run the same passes in bounded slices:
+
+```bash
+# Pricing backfill: 202 while unpriced rows remain, 200 when the pass ran out of work.
+until code=$(curl --silent --show-error --output /dev/stderr --write-out '%{http_code}' -X POST \
+    --cert "$ADMIN_CERT" --key "$ADMIN_KEY" "$API/api/v1/admin/price-usage") && [ "$code" = 200 ]; do
+  [ "$code" = 202 ] || { echo "price-usage failed: HTTP $code" >&2; exit 1; }
+done
+
+# Session rollup: one bounded job per POST; poll it, then submit another while work remains.
+job=$(curl --fail-with-body --silent --show-error -X POST \
+  --cert "$ADMIN_CERT" --key "$ADMIN_KEY" "$API/api/v1/admin/session-rollup")
+status_url=$(jq -er '.status_url' <<<"$job")
+curl --fail-with-body --silent --show-error --cert "$ADMIN_CERT" --key "$ADMIN_KEY" "$API$status_url" \
+  | jq '{status, result}'
+```
+
+Poll the rollup job until `status` is `complete`, `partial`, or `failed` (see "Run a bounded
+session-rollup pass" in the README), and submit another job while `result.remaining` is
+`pending`. There is no admin route for the LiteLLM model-price sync; it runs at the next daily
+cron (`37 4 * * *` UTC), which then prices any rows that needed newly published rates.
+
 ## Protected production full-fidelity index cutover
 
 Production now has one authoritative metadata database (`DB`, `sessions-index`) and

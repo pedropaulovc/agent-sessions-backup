@@ -22,19 +22,13 @@ export async function heartbeat(request: Request, env: Env, identity: Identity):
   if (identity.kind !== 'machine') return Response.json({ error: 'unauthorized' }, { status: 401 });
   const body = (await request.json()) as {
     collector_version?: string;
-    stores?: Record<string, unknown>;
     events?: Array<{ level: string; code: string; message: string; count?: number; store?: string }>;
   };
-  await env.DB.batch([
-    env.DB.prepare('INSERT INTO heartbeats (machine_id, collector_version, stats) VALUES (?1, ?2, ?3)').bind(
-      identity.machineId,
-      body.collector_version ?? null,
-      JSON.stringify({ stores: body.stores ?? {}, events: body.events ?? [] }),
-    ),
-    env.DB.prepare(
-      `UPDATE machines SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), collector_version = ?2 WHERE machine_id = ?1`,
-    ).bind(identity.machineId, body.collector_version ?? null),
-  ]);
+  await env.DB.prepare(
+    `UPDATE machines SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%fZ','now'), collector_version = ?2 WHERE machine_id = ?1`,
+  )
+    .bind(identity.machineId, body.collector_version ?? null)
+    .run();
   console.log(JSON.stringify({ event: 'hub.heartbeat', machine: identity.machineId }));
   for (const e of body.events ?? []) {
     // Nest the machine-supplied event under `payload` — NEVER spread it at top level. Spreading let a

@@ -1787,6 +1787,38 @@ describe('POST /api/v1/heartbeat collector-event relay', () => {
     // positive control: NO emitted line carries the forged event at top level (nothing to page on)
     expect(parsed.some((o) => o.event === 'hub.certs.cf_auth_failed')).toBe(false);
   });
+
+  it('records liveness on the machine row and stores no heartbeat history, however large the events', async () => {
+    // Every heartbeat used to INSERT its full events JSON into `heartbeats`, and collectors resend
+    // the same warnings every run — that table filled production D1 to its 10 GB cap. Nothing
+    // reads it; the events already reach the logs as collector.event lines.
+    await seedMachine('hb-nostore', { fp: hexfp('hb-nostore-fp') });
+    await testEnv.DB.prepare(`UPDATE machines SET last_seen_at = NULL, collector_version = NULL WHERE machine_id = 'hb-nostore'`).run();
+    const before = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM heartbeats').first<{ n: number }>();
+    const events = Array.from({ length: 5000 }, (_, i) => ({
+      level: 'warning', code: 'external_asset', message: `asset ${i} ${'x'.repeat(200)}`, store: 'claude',
+    }));
+    const spy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const res = await heartbeat(
+      new Request(`${API}/api/v1/heartbeat`, {
+        method: 'POST',
+        body: JSON.stringify({ collector_version: '9.9.9', stores: { claude: { files_seen: 1 } }, events }),
+        headers: { 'content-type': 'application/json' },
+      }),
+      testEnv,
+      machine('hb-nostore'),
+    );
+    const relayed = spy.mock.calls.filter(([line]) => String(line).startsWith('{"event":"collector.event"'));
+    spy.mockRestore();
+    expect(res.status).toBe(200);
+    const after = await testEnv.DB.prepare('SELECT COUNT(*) AS n FROM heartbeats').first<{ n: number }>();
+    expect(after?.n).toBe(before?.n);
+    const m = await testEnv.DB.prepare(`SELECT last_seen_at, collector_version FROM machines WHERE machine_id = 'hb-nostore'`)
+      .first<{ last_seen_at: string | null; collector_version: string | null }>();
+    expect(m?.last_seen_at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+    expect(m?.collector_version).toBe('9.9.9');
+    expect(relayed).toHaveLength(events.length); // the events still reach the logs
+  });
 });
 
 describe('daily prune (cert revoke)', () => {

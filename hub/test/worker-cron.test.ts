@@ -74,7 +74,7 @@ afterEach(() => vi.unstubAllGlobals());
 
 describe('scheduled handler', () => {
   it('refreshes model prices on the daily cron', async () => {
-    await fire('30 4 * * *');
+    await fire('37 4 * * *');
     expect(await auditCount(), 'the daily cron never reached runModelPriceSync').toBe(1);
     // Reaching the sync is not the same as the sync WORKING. Assert the run succeeded and that a
     // price actually landed, or a change that makes every cron sync fail stays green here.
@@ -92,14 +92,14 @@ describe('scheduled handler', () => {
   });
 
   it('prices unpriced usage rows AFTER the sync, using the rates it just wrote', async () => {
-    // The ordering is the assertion. The pricing pass is chained onto runModelPriceSync rather
-    // than being a third waitUntil, because a model whose rate upstream published TODAY would
-    // otherwise be examined before that rate landed, be recorded as unpriceable, and stay that way
-    // for another full day. The seeded row's model exists ONLY in the catalog this cron fetches --
-    // `model_prices` is emptied in beforeEach -- so a concurrent pass cannot price it.
+    // The ordering is the assertion. The pricing pass runs after runModelPriceSync in the daily
+    // sequence, because a model whose rate upstream published TODAY would otherwise be examined
+    // before that rate landed, be recorded as unpriceable, and stay that way for another full day.
+    // The seeded row's model exists ONLY in the catalog this cron fetches -- `model_prices` is
+    // emptied in beforeEach -- so a pass that ran first cannot price it.
     await testEnv.DB.prepare('UPDATE usage SET input_tokens = 1000000 WHERE session_id = ?1').bind('cron-sess').run();
 
-    await fire('30 4 * * *');
+    await fire('37 4 * * *');
 
     const row = await testEnv.DB.prepare('SELECT usd, price_epoch FROM usage WHERE session_id = ?1')
       .bind('cron-sess')
@@ -110,8 +110,8 @@ describe('scheduled handler', () => {
   });
 
   it('still prices when the upstream sync fails', async () => {
-    // runModelPriceSync RETHROWS after writing its audit row, so chaining the pass with a bare
-    // `.then` skips it entirely on any upstream hiccup — and rejects the waitUntil on the way out.
+    // runModelPriceSync RETHROWS after writing its audit row, so a sequence that stops on the first
+    // failure would skip the pricing pass on any upstream hiccup.
     // A stale catalog is not a reason to stop pricing: the rows that need it mostly need rates
     // that already exist, and a backfill in progress must not be held hostage to a 500 from
     // GitHub raw. Failing the fetch is the whole fixture.
@@ -128,7 +128,7 @@ describe('scheduled handler', () => {
     ).run();
     await testEnv.DB.prepare('UPDATE usage SET input_tokens = 1000000 WHERE session_id = ?1').bind('cron-sess').run();
 
-    await fire('30 4 * * *');
+    await fire('37 4 * * *');
 
     // Assert the FAILURE actually happened before asserting what survived it. The pricing
     // assertion alone would also pass if the handler stopped calling runModelPriceSync alogether,
@@ -143,6 +143,38 @@ describe('scheduled handler', () => {
       .bind('cron-sess')
       .first<{ usd: number | null }>();
     expect(row?.usd, 'a failed price sync took the pricing pass down with it').toBeCloseTo(1, 6);
+  });
+
+  it('runs every later daily step when an earlier one throws, and logs the failed step', async () => {
+    // The first step (staging prune) lists R2. Failing it must not take the rest of the daily
+    // sequence down: the sync and the pricing pass after it still have to land.
+    let listCalls = 0;
+    const list = vi.spyOn(testEnv.RAW, 'list').mockImplementation(async () => {
+      listCalls++;
+      throw new Error('r2 list unavailable');
+    });
+    const errors: string[] = [];
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation((...args: unknown[]) => { errors.push(String(args[0])); });
+    await testEnv.DB.prepare('UPDATE usage SET input_tokens = 1000000 WHERE session_id = ?1').bind('cron-sess').run();
+
+    try {
+      await fire('37 4 * * *');
+    } finally {
+      list.mockRestore();
+      errorSpy.mockRestore();
+    }
+
+    // Positive control: the prune really failed, so the later steps ran PAST a failure. Counted by
+    // hand because mockRestore() above also clears the spy's recorded calls.
+    expect(listCalls).toBeGreaterThan(0);
+    const failed = errors.map((line) => JSON.parse(line) as Record<string, unknown>)
+      .filter((o) => o.event === 'hub.cron.daily_step_failed');
+    expect(failed).toEqual([{ event: 'hub.cron.daily_step_failed', step: 'prune', error: 'r2 list unavailable' }]);
+    expect(await auditCount(), 'a failed prune skipped the price sync').toBe(1);
+    const row = await testEnv.DB.prepare('SELECT usd FROM usage WHERE session_id = ?1')
+      .bind('cron-sess')
+      .first<{ usd: number | null }>();
+    expect(row?.usd, 'a failed prune skipped the pricing pass').toBeCloseTo(5, 6);
   });
 
   it('does not refresh prices on the 15-minute watchdog tick', async () => {

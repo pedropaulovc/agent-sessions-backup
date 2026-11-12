@@ -6,7 +6,7 @@ import { perM } from '../src/upstream-catalog.mjs';
 /** The unattended refresh path. Without these, "prices stay current" rests on a cron trigger
  * nobody ever exercised — and a silently stale price table produces confident, wrong dollars.
  *
- * The cron wiring itself (`30 4 * * *` -> runModelPriceSync) lives in src/worker.ts and is
+ * The cron wiring itself (`37 4 * * *` -> runModelPriceSync) lives in src/worker.ts and is
  * asserted in worker-cron.test.ts; this file covers what the sync actually writes. */
 
 const testEnv = env as unknown as Env;

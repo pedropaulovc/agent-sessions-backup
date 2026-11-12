@@ -508,7 +508,7 @@ describe('maintenance freeze', () => {
       expect(message.retry).toHaveBeenCalledWith({ delaySeconds: 60 });
       expect(message.ack).not.toHaveBeenCalled();
     }
-    for (const cron of ['*/15 * * * *', '30 4 * * *']) {
+    for (const cron of ['*/15 * * * *', '37 4 * * *']) {
       await worker.scheduled({ cron, scheduledTime: 0, noRetry: () => {} } as ScheduledController, testEnv, ctx);
     }
     await waitOnExecutionContext(ctx);

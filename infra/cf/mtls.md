@@ -223,7 +223,7 @@ Three mTLS-authenticated endpoints back centrally-managed fleet ops (`hub/src/ap
 - **`POST /api/v1/certs/renew`** (authenticated by the still-valid current OR in-grace previous cert)
   — body `{ "csr": "<PEM CSR>" }`. The hub has the managed CA sign it, swaps the new fingerprint in as
   current, and keeps the previous fingerprint valid for 7 days (`machines.prev_cert_fp_sha256` +
-  `cert_revoke_at`; `machineIdentity` matches current OR prev-in-window). The daily prune cron (`30 4`)
+  `cert_revoke_at`; `machineIdentity` matches current OR prev-in-window). The daily prune cron (`37 4`)
   revokes the previous cert at the CA once the window elapses. A second renew inside the window replaces
   the previous cert and resets the clock — at most one generation is ever in grace. Renewal is therefore
   authenticated by the current client certificate and does not reuse the fresh-enrollment D1 token.

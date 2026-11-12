@@ -23,6 +23,39 @@ async function reconcileCatalog(env: Env): Promise<void> {
   }
 }
 
+const DAILY_CRON = '37 4 * * *';
+
+/** Daily maintenance, strictly in this order. Every step reads or writes the main D1, so running
+ * them concurrently (as separate waitUntil promises) overloaded it once a day; one at a time keeps
+ * the load to a single query stream. The price sync precedes pricing because the pass reads the
+ * catalog the sync just wrote: a model upstream published TODAY would otherwise be recorded as
+ * unpriceable for another full day. A step that throws is logged and the next step still runs —
+ * runModelPriceSync rethrows after writing its audit row, and a stale catalog is no reason to stop
+ * pricing rows whose rates already exist. */
+const DAILY_STEPS: ReadonlyArray<{ step: string; failureEvent: string; run: (env: Env) => Promise<unknown> }> = [
+  { step: 'prune', failureEvent: 'hub.cron.daily_step_failed', run: runPrune },
+  { step: 'omp_qa_reports_prune', failureEvent: 'hub.cron.daily_step_failed', run: pruneOmpQaReports },
+  { step: 'cert_prune', failureEvent: 'hub.cron.daily_step_failed', run: runDailyPrune },
+  { step: 'session_rollup', failureEvent: 'hub.cron.daily_step_failed', run: runScheduledSessionRollup },
+  { step: 'model_price_sync', failureEvent: 'hub.model_prices.sync_failed_before_pricing', run: runModelPriceSync },
+  { step: 'pricing', failureEvent: 'hub.cron.daily_step_failed', run: runDailyPricing },
+  { step: 'catalog_reconcile', failureEvent: 'hub.cron.daily_step_failed', run: reconcileCatalog },
+];
+
+async function runDailyMaintenance(env: Env): Promise<void> {
+  for (const { step, failureEvent, run } of DAILY_STEPS) {
+    try {
+      await run(env);
+    } catch (error) {
+      console.error(JSON.stringify({
+        event: failureEvent,
+        step,
+        error: error instanceof Error ? error.message : String(error),
+      }));
+    }
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const path = new URL(request.url).pathname;
@@ -83,48 +116,18 @@ export default {
     if (env.INDEX_MODE === 'maintenance') return;
     await assertIndexLayout(env);
     // */15 = observability watchdog (per-machine heartbeat-age gauge + D1 size).
-    // 30 4 * * * = daily prune: sweep leaked multipart staging objects (mpu-staging/) older than 7d.
-    // It also revokes rotated-out client certs whose grace window elapsed. Incomplete multipart
-    // uploads themselves are auto-aborted by R2 after 7 days.
-    // Audit-log polling (CF Audit Logs API) is a later M4 step, wired here once added.
+    // DAILY_CRON = sequential daily maintenance (runDailyMaintenance). Its minute is deliberately
+    // off the quarter hour so it never fires in the same minute as the */15 watchdog.
     if (controller.cron === '*/15 * * * *') {
       ctx.waitUntil(runWatchdog(env));
       ctx.waitUntil(reconcileCatalog(env));
       return;
     }
 
-    if (controller.cron !== '30 4 * * *') {
+    if (controller.cron !== DAILY_CRON) {
       return;
     }
 
-    ctx.waitUntil(runPrune(env));
-    ctx.waitUntil(pruneOmpQaReports(env));
-    ctx.waitUntil(runDailyPrune(env));
-    // Block-only accounting has no dependency on the pricing catalog or its upstream network.
-    ctx.waitUntil(runScheduledSessionRollup(env));
-    // Refresh model pricing from LiteLLM (ccusage's source), THEN fill in `usage.usd` for rows
-    // that still have none. Chained rather than independent waitUntil: the pass reads the catalog the
-    // sync just wrote, so running them concurrently would price today's rows against yesterday's
-    // rates and, worse, mark a model that upstream published TODAY as unpriceable for another
-    // full day. `.then` and not `await` — the two prunes above should not queue behind this.
-    //
-    // `.catch` before the chain, not after: runModelPriceSync RETHROWS after writing its audit
-    // row, so a bare `.then` would skip the pricing pass entirely on any upstream hiccup AND
-    // reject the waitUntil. A stale catalog is not a reason to stop pricing — the rows that need
-    // it mostly need rates that already exist, and a backfill in progress must not be held
-    // hostage to a 500 from GitHub raw. The sync's own audit row is what records the failure.
-    ctx.waitUntil(
-      runModelPriceSync(env)
-        .catch((e: unknown) =>
-          console.log(
-            JSON.stringify({
-              event: 'hub.model_prices.sync_failed_before_pricing',
-              error: e instanceof Error ? e.message : String(e),
-            }),
-          ),
-        )
-        .then(() => runDailyPricing(env))
-        .then(() => reconcileCatalog(env)),
-    );
+    ctx.waitUntil(runDailyMaintenance(env));
   },
 } satisfies ExportedHandler<Env, HubQueueMessage>;
