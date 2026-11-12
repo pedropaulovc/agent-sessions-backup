@@ -217,13 +217,13 @@ describe('scheduled handler', () => {
     // Each of these used to catch its own error, so the chain would have logged `ok` for a step
     // that did nothing. Fail one query in each and nothing else.
     const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
-    const failing: Array<[step: string, marker: string]> = [
-      ['pricing', 'usage_due_for_pricing'],
-      ['catalog_reconcile', 'FROM session_catalog_outbox ORDER BY seq'],
-      ['session_rollup', 'FROM session_rollup_state\n      WHERE'],
+    const failing: Array<[step: string, marker: RegExp]> = [
+      ['pricing', /usage_due_for_pricing/],
+      ['catalog_reconcile', /FROM\s+session_catalog_outbox\s+ORDER\s+BY\s+seq/],
+      ['session_rollup', /FROM\s+session_rollup_state\s+WHERE/],
     ];
     const prepare = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
-      const hit = failing.find(([, marker]) => sql.includes(marker));
+      const hit = failing.find(([, marker]) => marker.test(sql));
       if (hit) throw new Error(`injected ${hit[0]} failure`);
       return realPrepare(sql);
     });
