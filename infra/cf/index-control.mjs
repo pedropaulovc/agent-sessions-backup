@@ -563,6 +563,22 @@ export async function awaitHealth(config, mode, {
   }
 }
 
+/** The gate for one CLI process. Rollout lag only exists right after a deploy, so only the
+ * process's FIRST gate waits for convergence (`awaitHealth`); once a stable streak has been seen,
+ * any later mismatch is evidence the revision changed under the work (a concurrent deploy or a
+ * rollback) and every later gate is a strict single read that fails closed. `policy: 'strict'`
+ * skips the wait entirely, for commands that only run after convergence was already established
+ * by an earlier process (seed-catalog and ready run behind the durable 16-minute drain). */
+export function revisionGate(config, mode, command, policy, options = {}) {
+  let converged = policy === 'strict';
+  return async () => {
+    if (converged) return await health(config, mode, { command });
+    const value = await awaitHealth(config, mode, { command, ...options });
+    converged = true;
+    return value;
+  };
+}
+
 /** Safe native GET schema facts only; this projection never authorizes deletion. */
 export function queueConsumerIdentityFacts(consumer) {
   const workerName = (value) => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,63}$/.test(value)
@@ -710,9 +726,10 @@ async function main() {
     return;
   }
   if (command === 'reconcile-catalog') {
-    await awaitHealth(config, 'active', { command });
+    const gate = revisionGate(config, 'active', command, 'converge-first');
+    await gate();
     const result = await reconcileIndexCatalog({ source, shards });
-    await awaitHealth(config, 'active', { command });
+    await gate();
     console.log(JSON.stringify(result));
     return;
   }
@@ -731,7 +748,7 @@ async function main() {
   if (command === 'verify-active') {
     const result = await verifyActiveIndex({
       source, shards, revision: config.vars.DEPLOYMENT_REVISION, cycle,
-      gate: async () => await awaitHealth(config, 'active', { command }),
+      gate: revisionGate(config, 'active', command, 'converge-first'),
       login: async () => {
         const response = await fetch(`https://${config.vars.VIEWER_HOST}/login`, {
           redirect: 'error', signal: AbortSignal.timeout(30000),
@@ -745,9 +762,10 @@ async function main() {
     console.log(JSON.stringify(result));
     return;
   }
-  // drain, seed-catalog and ready wait for a converged maintenance revision; copy's own gates
-  // stay strict single reads under its pass budget (see awaitHealth).
-  const gate = async () => await awaitHealth(config, 'maintenance', { command });
+  // drain's first gate waits for the freshly deployed maintenance revision to converge and its
+  // later gates are strict; seed-catalog and ready run behind the durable drain, so theirs are
+  // strict from the start. copy's own gates stay strict single reads under its pass budget.
+  const gate = revisionGate(config, 'maintenance', command, command === 'drain' ? 'converge-first' : 'strict');
   // The durable drain gate that copy, seed-catalog and ready require; drain writes it.
   const assertDrained = async () => {
     const frozen = await readCheckpoint(shards[0], FREEZE_CHECKPOINT);

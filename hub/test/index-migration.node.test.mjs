@@ -21,7 +21,7 @@ import {
   STAR_CATALOG_COLUMNS, indexIdBase, indexShardForSessionId,
 } from '../src/index-layout.mjs';
 import {
-  CopyPassBudgetExhausted, awaitHealth, cloudflareRetryDelay, createCopyPassRequestGate, indexControlClient,
+  CopyPassBudgetExhausted, awaitHealth, revisionGate, cloudflareRetryDelay, createCopyPassRequestGate, indexControlClient,
   pauseConsumers, requireProtectedProduction, runCopyPass, verifyActiveIndex, verifyReadyIndex,
 } from '../../infra/cf/index-control.mjs';
 import { PREVIEW_ACCOUNT_ID, PRODUCTION_ACCOUNT_ID } from '../../infra/cf/preview-trust.mjs';
@@ -8255,4 +8255,37 @@ test('a deploy gate passes only on a stable converged revision, waits out lag, a
   reads = serve([503, 'rev-new', 'rev-new', 'rev-new']);
   assert.equal((await gate({ retry: 'any' })).deploymentRevision, 'rev-new');
   assert.equal(reads(), 4);
+});
+
+test('only a process\'s first gate waits for convergence; later gates and post-drain commands fail closed', async (context) => {
+  const config = { vars: { VIEWER_HOST: 'viewer.example.test', DEPLOYMENT_REVISION: 'rev-new' } };
+  const live = (revision) => Response.json({
+    ok: true, environment: 'production', indexMode: 'active', deploymentRevision: revision, indexShardCount: 16,
+  });
+  const realFetch = globalThis.fetch;
+  const realError = console.error;
+  console.error = () => {};
+  context.after(() => { globalThis.fetch = realFetch; console.error = realError; });
+  const queue = [];
+  globalThis.fetch = async () => live(queue.shift());
+  let clock = 0;
+  const wait = async (ms) => { clock += ms; };
+  const options = { wait, now: () => clock };
+  const mismatch = /failure=mismatch HTTP=200 attempts=1$/;
+
+  // converge-first: the first gate waits out deploy lag...
+  const gate = revisionGate(config, 'active', 'reconcile-catalog', 'converge-first', options);
+  queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');
+  assert.equal((await gate()).deploymentRevision, 'rev-new');
+  assert.equal(queue.length, 0);
+  // ...but once converged, the revision changing under the work fails closed on one read.
+  queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');
+  await assert.rejects(gate(), { message: mismatch });
+  assert.equal(queue.length, 3);
+
+  // strict (seed-catalog/ready behind the durable drain): no wait even on the first gate.
+  queue.length = 0;
+  queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');
+  await assert.rejects(revisionGate(config, 'active', 'ready', 'strict', options)(), { message: mismatch });
+  assert.equal(queue.length, 3);
 });
