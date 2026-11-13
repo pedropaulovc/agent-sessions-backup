@@ -1,3 +1,4 @@
+import { type DailyStep, runDailyStep } from './cron/daily-step';
 import { runModelPriceSync } from './cron/model-prices';
 import { runDailyPricing } from './cron/pricing';
 import { pruneOmpQaReports, runDailyPrune, runPrune } from './cron/prune';
@@ -30,11 +31,6 @@ async function reconcileCatalog(env: Env): Promise<void> {
   }
 }
 
-interface DailyStep {
-  step: string;
-  run: (env: Env) => Promise<unknown>;
-}
-
 /** The daily D1 maintenance, run one step at a time: running these concurrently (as separate
  * waitUntil promises) overloaded the main D1 once a day. Most valuable first, so a run cut off by
  * the invocation's wall-clock or subrequest limits loses the cheapest work: the price sync precedes
@@ -54,27 +50,6 @@ const DAILY_D1_STEPS: ReadonlyArray<DailyStep> = [
 
 /** The staging sweep touches only R2, so it runs alongside the D1 chain instead of queueing in it. */
 const STAGING_PRUNE: DailyStep = { step: 'staging_prune', run: runPrune };
-
-/** One start line and one completion line (`hub.cron.daily_step`, with `ms` and `outcome`) per
- * step, so a run truncated mid-chain shows exactly which step it stopped in. A failure also emits
- * `hub.cron.daily_step_failed` with the error. */
-async function runDailyStep(env: Env, { step, run }: DailyStep): Promise<void> {
-  console.log(JSON.stringify({ event: 'hub.cron.daily_step_started', step }));
-  const started = Date.now();
-  try {
-    await run(env);
-    console.log(JSON.stringify({ event: 'hub.cron.daily_step', step, ms: Date.now() - started, outcome: 'ok' }));
-  } catch (error) {
-    const ms = Date.now() - started;
-    console.log(JSON.stringify({ event: 'hub.cron.daily_step', step, ms, outcome: 'failed' }));
-    console.error(JSON.stringify({
-      event: 'hub.cron.daily_step_failed',
-      step,
-      ms,
-      error: error instanceof Error ? error.message : String(error),
-    }));
-  }
-}
 
 async function runDailyD1Maintenance(env: Env): Promise<void> {
   for (const step of DAILY_D1_STEPS) await runDailyStep(env, step);
