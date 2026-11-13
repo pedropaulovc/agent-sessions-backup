@@ -256,13 +256,13 @@ describe('scheduled handler', () => {
     // same 10-second window fails with it too unless the chain waits the window out.
     const OVERLOAD = 'D1_ERROR: D1 DB is overloaded. Too many resources consumed within a 10 second window.';
 
-    /** Fires the daily cron with the pricing pass's first query throwing `errorFor(hit)` on the
-     * hits it returns a message for, and the real query otherwise. */
-    async function fireWithPricingErrors(errorFor: (hit: number) => string | undefined) {
+    /** Fires the daily cron with the first query matching `marker` (pricing's by default) throwing
+     * `errorFor(hit)` on the hits it returns a message for, and the real query otherwise. */
+    async function fireWithPricingErrors(errorFor: (hit: number) => string | undefined, marker = /usage_due_for_pricing/) {
       const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
       let hits = 0;
       const prepare = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
-        if (/usage_due_for_pricing/.test(sql)) {
+        if (marker.test(sql)) {
           const message = errorFor(++hits);
           if (message) throw new Error(message);
         }
@@ -335,6 +335,17 @@ describe('scheduled handler', () => {
       expect(run.sleeps).toEqual([]);
       expect(run.pricing.map((o) => o.outcome)).toEqual(['failed']);
       expect(run.failed.map((o) => [o.step, o.error])).toEqual([['pricing', other]]);
+    });
+
+    it('retries the session rollup step on an overload escaping the pass', async () => {
+      // runScheduledSessionRollup must rethrow the pass error unprefixed, or the overload
+      // classifier stops recognising it and rollup is never retried.
+      const run = await fireWithPricingErrors((hit) => (hit === 1 ? OVERLOAD : undefined), /FROM\s+session_rollup_state\s+WHERE/);
+
+      expect(run.retries.map((o) => [o.step, o.error])).toEqual([['session_rollup', OVERLOAD]]);
+      expect(run.sleeps).toEqual([11_000]);
+      expect(run.failed).toEqual([]);
+      expect(run.chain.map((o) => [o.step, o.outcome])).toEqual(D1_CHAIN.map((step) => [step, 'ok']));
     });
   });
 
