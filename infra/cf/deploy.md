@@ -1285,10 +1285,11 @@ is retried for at most 180 seconds, after which the gate fails with
 attempts above), HTTP and JSON failures still fail these gates at once, since rollout
 lag only explains a mismatch; the standalone `health` command keeps retrying any
 failure for 180 seconds, as it always has. Three matches make convergence likely, not
-certain, so a gate in that process within 60 seconds of the first wait ending waits
-the same way; after that settle window every gate is a strict single read: a mismatch
-then means the revision changed under the work (a concurrent deploy or rollback) and
-fails closed. `seed-catalog` and
+certain, so for 60 seconds after a convergence wait ends, a later gate in that process
+reads once and, only if that read is a revision mismatch, converges again the same way
+(restarting the 60-second window); other failures still fail at once. After that settle
+window every gate is a strict single read: a mismatch then means the revision changed
+under the work (a concurrent deploy or rollback) and fails closed. `seed-catalog` and
 `ready` run behind the durable 16-minute drain, so all of their gates are strict.
 
 Health errors emit only `operation=revision-gate`, an allowlisted command and mode,

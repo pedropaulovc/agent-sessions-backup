@@ -8273,7 +8273,7 @@ test('a converge-first gate tolerates rollout lag until its settle window ends, 
   console.error = () => {};
   context.after(() => { globalThis.fetch = realFetch; console.error = realError; });
   const queue = [];
-  globalThis.fetch = async () => live(queue.shift());
+  globalThis.fetch = async () => { const next = queue.shift(); return typeof next === 'number' ? new Response('x', { status: next }) : live(next); };
   let clock = 0;
   const wait = async (ms) => { clock += ms; };
   const options = { wait, now: () => clock };
@@ -8289,12 +8289,23 @@ test('a converge-first gate tolerates rollout lag until its settle window ends, 
   queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');
   assert.equal((await gate()).deploymentRevision, 'rev-new');
   assert.equal(queue.length, 0);
-  // ...while a gate whose read already matches inside the window costs just that read.
+  // ...while a gate whose read already matches inside the window costs just that read...
   queue.push('rev-new', 'rev-old');
   assert.equal((await gate()).deploymentRevision, 'rev-new');
   assert.equal(queue.length, 1);
   queue.length = 0;
-  // ...but after it, the revision changing under the work fails closed on one read.
+  // ...and an in-window HTTP failure is not lag: it fails at once, without waiting.
+  const before = clock;
+  queue.push(503, 'rev-new', 'rev-new', 'rev-new');
+  await assert.rejects(gate(), { message: /failure=http HTTP=503 attempts=1$/ });
+  assert.equal(clock, before);
+  queue.length = 0;
+  // The re-convergence above restarted the window: 50 s on (64 s after the first) is still lag.
+  clock += 50000;
+  queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');
+  assert.equal((await gate()).deploymentRevision, 'rev-new');
+  assert.equal(queue.length, 0);
+  // ...but after the window, the revision changing under the work fails closed on one read.
   clock += 60000;
   queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');
   await assert.rejects(gate(), { message: mismatch });

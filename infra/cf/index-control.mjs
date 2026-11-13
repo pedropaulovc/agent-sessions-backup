@@ -598,7 +598,9 @@ export function revisionGate(config, mode, command, policy, { settleMs = 60000, 
       return await health(config, mode, { command });
     } catch (error) {
       if (error?.failure !== 'mismatch') throw error;
-      return await awaitHealth(config, mode, { command, now, ...options });
+      const value = await awaitHealth(config, mode, { command, now, ...options });
+      convergedAt = now(); // The lag was real; restart the window from this convergence.
+      return value;
     }
   };
 }
