@@ -1,6 +1,6 @@
 import { env } from 'cloudflare:test';
-import { afterEach, beforeAll, describe, expect, it } from 'vitest';
-import { runSessionRollup } from '../src/session-rollup';
+import { afterEach, beforeAll, describe, expect, it, vi, type MockInstance } from 'vitest';
+import { ROLLUP_PACING, runSessionRollup } from '../src/session-rollup';
 import { parseChatgptWeb } from '../src/ingest/parsers/chatgpt-web';
 import { assertIndexLayout, indexDbFor, indexDbs, reserveBlockIds } from '../src/index-shards';
 
@@ -92,6 +92,7 @@ beforeAll(async () => {
 });
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const shard of indexDbs(testEnv)) {
     await shard.prepare('DELETE FROM blocks WHERE session_id LIKE ?1').bind(PREFIX + '%').run();
   }
@@ -311,5 +312,85 @@ describe('nightly session rollup', () => {
     expect(await published(id)).toEqual([]);
     expect(await db.prepare('SELECT status, eligible, completed_at FROM session_rollup_state WHERE session_id = ?1')
       .bind(id).first()).toBeNull();
+  });
+});
+
+describe('rollup page telemetry and pacing', () => {
+  const run = { run_id: 'telemetry-run', trigger: 'manual' } as const;
+  const events = (spy: MockInstance, event: string) => spy.mock.calls
+    .map(([entry]) => JSON.parse(String(entry)) as Record<string, unknown>)
+    .filter((entry) => entry.event === event);
+
+  it('logs one line per page with its phase, call volume, commit size, outcome, and stage timings', async () => {
+    const id = await seedSession('telemetry');
+    await block(id, 0, 0);
+    await block(id, 0, 1); // Same exact call: one unique comparable call on the first page.
+    await block(id, 1, 0, { text: 'é' });
+    await block(id, 1, 1, { text: 'x' });
+    const logs = vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(await runSessionRollup(testEnv, { pageSize: 2, run, now: new Date(DAY) }))
+      .toMatchObject({ pages: 4, examined: 4, completed: 1, failed: 0 });
+    const timings = { read_ms: expect.any(Number), usage_ms: expect.any(Number),
+      seen_ms: expect.any(Number), commit_ms: expect.any(Number) };
+    const page = { event: 'hub.session_rollup.page', ...run, session_id: id, ...timings };
+    // Bytes are UTF-8 tool_name + text: 'read' + 'read {"path":"a"}' = 21; 'read' + 'é' = 6; 'read' + 'x' = 5.
+    // Statements: cursor update + bucket upsert + one seen-call insert per unique call, plus the
+    // checkpointed cleanup DELETE and ready flip once the source is exhausted. Three seen calls
+    // exceed one 2-row cleanup, so a block-free finishing page completes the session.
+    expect(events(logs, 'hub.session_rollup.page')).toEqual([
+      { ...page, phase: 'scan', blocks: 2, calls: 1, call_text_bytes: 21, statements: 3, outcome: 'committed' },
+      { ...page, phase: 'scan', blocks: 2, calls: 2, call_text_bytes: 11, statements: 4, outcome: 'committed' },
+      { ...page, phase: 'scan', blocks: 0, calls: 0, call_text_bytes: 0, statements: 4, outcome: 'committed' },
+      { ...page, phase: 'finishing', blocks: 0, calls: 0, call_text_bytes: 0, statements: 4, outcome: 'completed' },
+    ]);
+  });
+
+  it('names the stage a failed page threw in, with timings for the stages it completed', async () => {
+    // The unreadable session sorts first, so the intercepted first read on its shard is its own.
+    const unreadable = await seedSession('a-stage-read');
+    const poisoned = await seedSession('b-stage-poison');
+    await block(unreadable, 0, 0);
+    await block(poisoned, 0, 0);
+    await db.prepare('UPDATE session_rollup_state SET turn_state = ?2 WHERE session_id = ?1')
+      .bind(poisoned, '{invalid json').run();
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    expect(await sourceRead(unreadable, async () => {}, () => runSessionRollup(testEnv, { run }), true))
+      .toMatchObject({ failed: 2, pages: 2 });
+    expect(events(errors, 'hub.session_rollup.page_failed')).toEqual([
+      { event: 'hub.session_rollup.page_failed', ...run, session_id: unreadable, stage: 'read',
+        error: 'injected source read failure' },
+      { event: 'hub.session_rollup.page_failed', ...run, session_id: poisoned, stage: 'aggregate',
+        read_ms: expect.any(Number), usage_ms: expect.any(Number), seen_ms: expect.any(Number),
+        error: expect.stringContaining('JSON') },
+    ]);
+  });
+
+  it('pauses between pages, never before the first or after the last', async () => {
+    for (const suffix of ['pace-a', 'pace-b', 'pace-c']) await block(await seedSession(suffix), 0, 0, { type: 'text' });
+    const sleep = vi.spyOn(ROLLUP_PACING, 'sleep').mockResolvedValue();
+    expect(await runSessionRollup(testEnv, { pagePauseMs: 250 }))
+      .toMatchObject({ pages: 3, completed: 3, pending: 0, options: { pagePauseMs: 250 } });
+    expect(sleep.mock.calls).toEqual([[250], [250]]);
+    sleep.mockClear();
+    await block(await seedSession('pace-d'), 0, 0, { type: 'text' });
+    await block(await seedSession('pace-e'), 0, 0, { type: 'text' });
+    expect(await runSessionRollup(testEnv)).toMatchObject({ pages: 2, options: { pagePauseMs: 0 } });
+    expect(sleep).not.toHaveBeenCalled();
+  });
+
+  it('stops a paced pass before a pause would exceed its wall-clock budget, leaving work pending', async () => {
+    for (const suffix of ['budget-a', 'budget-b']) await block(await seedSession(suffix), 0, 0, { type: 'text' });
+    const sleep = vi.spyOn(ROLLUP_PACING, 'sleep').mockResolvedValue();
+    const logs = vi.spyOn(console, 'log').mockImplementation(() => {});
+    const budget = ROLLUP_PACING.maxPassMs;
+    ROLLUP_PACING.maxPassMs = 100;
+    try {
+      expect(await runSessionRollup(testEnv, { pagePauseMs: 250, run }))
+        .toMatchObject({ pages: 1, completed: 1, pending: 1, remaining: 'pending' });
+    } finally { ROLLUP_PACING.maxPassMs = budget; }
+    expect(sleep).not.toHaveBeenCalled();
+    expect(events(logs, 'hub.session_rollup.time_budget')).toEqual([{ event: 'hub.session_rollup.time_budget',
+      ...run, ms: expect.any(Number), pages: 1, max_pass_ms: 100 }]);
   });
 });

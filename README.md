@@ -125,13 +125,32 @@ Outbox entries retire only after every shard accepts the captured version.
 ## Run a bounded session-rollup pass
 
 Using the current admin machine certificate, send `POST /api/v1/admin/session-rollup`.
-It returns `202` with `{ "job_id": "...", "status": "queued", "status_url": "/api/v1/admin/session-rollup/..." }`
+It returns `202` with `{ "job_id": "...", "status": "queued", "status_url": "/api/v1/admin/session-rollup/...", "options": {...} }`
 only after the dedicated queue accepts the job. Queue acceptance errors return `503` with the job ID and poll URL.
 `GET` the returned URL with the same current-admin authorization; reader grants, non-admin certificates,
 and rotated-out certificates cannot submit or inspect jobs.
 
+The request body is optional. With no body (or `{}`) the job runs the scheduled pass's limits. A JSON object
+may override any of these integers; omitted keys keep their defaults:
+
+| Option | Default | Allowed |
+| --- | --- | --- |
+| `maxPages` | 80 | 1–80 |
+| `maxBlocks` | 20000 | 1–20000 |
+| `pageSize` | 250 | 1–500 |
+| `pagePauseMs` | 0 | 0–10000 |
+
+Unknown keys, non-integers, and out-of-range values return `400 {"error":"invalid_options","detail":...}`;
+malformed JSON returns `400 {"error":"bad_json"}`. Neither creates a job. The effective options are echoed
+as `options` in the `202` response, carried in the queue message (so a redelivery runs the same bounds),
+and recorded as `result.options` in the finished job. `pagePauseMs` waits between consecutive pages, never
+before the first or after the last, to spread a pass's main-D1 load. Every pass, paced or not, stops before
+a page whose pause would carry it past 10 minutes of wall time, well inside the 20-minute attempt lease;
+the rest stays pending and the stop is logged as `hub.session_rollup.time_budget`. For example, a slow
+drain: `-H 'content-type: application/json' -d '{"maxPages":20,"pagePauseMs":5000}'`.
+
 Poll until `status` is `complete`, `partial`, or `failed`; `queued` and `running` are nonterminal.
-Each job attempts at most 20,000 blocks across 80 pages, not a full-corpus drain.
+Each job attempts at most `maxBlocks` blocks across `maxPages` pages, not a full-corpus drain.
 `complete` means that bounded pass had no session failures, even when `result.pending > 0`
 and `result.remaining` is `pending`. `partial` means one or more sessions failed; `failed`
 includes an error and may have committed checkpoints before interruption. Submit another job explicitly
@@ -139,10 +158,18 @@ to continue remaining work. Replayed deliveries never rerun a terminal job. An i
 attempt is marked failed after 20 minutes, and a job not started within 24 hours expires; polling
 also resolves these timeouts if queue retries were exhausted. Late deliveries cannot restart expired jobs.
 
-Scheduled and manual passes emit `hub.session_rollup.started` and `hub.session_rollup.run` with
-`run_id` (the job ID for manual runs) and `trigger` (`scheduled` or `manual`). Run summaries include
-`outcome`, elapsed `ms`, and the available counters; partial/failed outcomes and page failures use error
-severity. Successful manual completion is logged only after its durable result commits.
+Scheduled and manual passes emit `hub.session_rollup.started` (with the effective `options`) and
+`hub.session_rollup.run` with `run_id` (the job ID for manual runs) and `trigger` (`scheduled` or `manual`).
+Run summaries include `outcome`, elapsed `ms`, and the available counters; partial/failed outcomes and page
+failures use error severity. Successful manual completion is logged only after its durable result commits.
+
+Each page logs one `hub.session_rollup.page` line: `run_id`, `trigger`, `session_id`, `phase` (`scan`, or
+`finishing` for a block-free cleanup page), `blocks`, `calls` (unique comparable calls on the page),
+`call_text_bytes` (UTF-8 bytes of those calls' tool names and text), `statements` (commit batch size),
+`outcome` (`committed`, `superseded`, or `completed`), and per-stage milliseconds: `read_ms` (shard page
+query), `usage_ms`, `seen_ms` (all seen-call lookups), and `commit_ms`. A failed page's
+`hub.session_rollup.page_failed` also names the `stage` that threw (`read`, `usage`, `seen`, `aggregate`,
+or `commit`) and carries the `*_ms` of each stage it completed.
 
 The `ROLLUP_QUEUE` consumer is separate from parsing, with one message per invocation.
 Local development uses the local queue simulator without a Cloudflare login. Protected main CI

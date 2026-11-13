@@ -1,7 +1,7 @@
 import { env } from 'cloudflare:test';
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { route } from '../src/router';
-import { runSessionRollup } from '../src/session-rollup';
+import { DEFAULT_ROLLUP_LIMITS, ROLLUP_PACING, runSessionRollup } from '../src/session-rollup';
 import { consumeSessionRollup, enqueueSessionRollup, getSessionRollupJob } from '../src/session-rollup-jobs';
 import { API, VIEWER } from './hosts';
 import { assertIndexLayout, indexDbFor, indexDbs, reserveBlockIds } from '../src/index-shards';
@@ -18,16 +18,16 @@ interface AcceptedJob {
   status_url: string;
 }
 
-function delivery(jobId: string) {
+function delivery(jobId: string, body: SessionRollupMessage = { kind: 'session-rollup', job_id: jobId }) {
   return {
     id: crypto.randomUUID(), timestamp: new Date(), attempts: 1,
-    body: { kind: 'session-rollup' as const, job_id: jobId },
+    body,
     ack: vi.fn(), retry: vi.fn(),
   } satisfies Message<SessionRollupMessage>;
 }
 
 async function enqueue(): Promise<AcceptedJob> {
-  const response = await enqueueSessionRollup(testEnv, ADMIN);
+  const response = await enqueueSessionRollup(testEnv, ADMIN, DEFAULT_ROLLUP_LIMITS);
   expect(response.status).toBe(202);
   return response.json<AcceptedJob>();
 }
@@ -64,9 +64,10 @@ async function markRunning(jobId: string, leaseUntil: number): Promise<void> {
     .bind(jobId, new Date(Date.now() - 25 * 60_000).toISOString(), leaseUntil).run();
 }
 
-function certRequest(path: string, method: string, fingerprint?: string): Request {
+function certRequest(path: string, method: string, fingerprint?: string, body?: string): Request {
   return new Request(`${API}${path}`, {
     method,
+    ...(body === undefined ? {} : { body }),
     ...(fingerprint ? { cf: { tlsClientAuth: { certVerified: 'SUCCESS', certFingerprintSHA256: fingerprint } } } : {}),
   } as unknown as RequestInit);
 }
@@ -103,10 +104,11 @@ describe('durable bounded session rollup jobs', () => {
       expect(await job(message.job_id)).toMatchObject({ status: 'queued', result: null, finished_at: null });
       return { metadata: { metrics: { backlogCount: 1, backlogBytes: 0 } } };
     });
-    const response = await enqueueSessionRollup(testEnv, ADMIN);
+    const response = await enqueueSessionRollup(testEnv, ADMIN, DEFAULT_ROLLUP_LIMITS);
     expect(response.status).toBe(202);
     const accepted = await response.json<AcceptedJob & { status: string }>();
-    expect(accepted).toEqual({ job_id: accepted.job_id, status: 'queued', status_url: `${PATH}/${accepted.job_id}` });
+    expect(accepted).toEqual({ job_id: accepted.job_id, status: 'queued', status_url: `${PATH}/${accepted.job_id}`,
+      options: DEFAULT_ROLLUP_LIMITS });
     expect(response.headers.get('Location')).toBe(accepted.status_url);
     expect(response.headers.get('Cache-Control')).toBe('no-store');
     expect(await checkpoint(id)).toMatchObject({ cursor_id: 0 });
@@ -118,7 +120,7 @@ describe('durable bounded session rollup jobs', () => {
     const completed = await job(accepted.job_id);
     expect(completed).toMatchObject({
       status: 'complete', error: null, started_at: expect.any(String), finished_at: expect.any(String),
-      result: { examined: 1, completed: 1, failed: 0, pending: 0, remaining: 'complete' },
+      result: { examined: 1, completed: 1, failed: 0, pending: 0, remaining: 'complete', options: DEFAULT_ROLLUP_LIMITS },
     });
     expect(await db.prepare('SELECT assistant_turns FROM session_rollup WHERE session_id = ?1')
       .bind(id).first()).toEqual({ assistant_turns: 1 });
@@ -128,7 +130,7 @@ describe('durable bounded session rollup jobs', () => {
     const id = await seedSession('rejected');
     const before = await checkpoint(id);
     vi.mocked(testEnv.ROLLUP_QUEUE.send).mockRejectedValue(new Error('queue unavailable'));
-    const response = await enqueueSessionRollup(testEnv, ADMIN);
+    const response = await enqueueSessionRollup(testEnv, ADMIN, DEFAULT_ROLLUP_LIMITS);
     expect(response.status).toBe(503);
     const rejected = await response.json<AcceptedJob & { error: string }>();
     expect(rejected.error).toBe('queue_acceptance_failed');
@@ -377,5 +379,77 @@ describe('rollup job route authorization', () => {
     expect(await job(accepted.job_id)).toMatchObject({ status: 'queued', result: null });
     expect(await db.prepare('SELECT COUNT(*) AS n FROM session_rollup_jobs WHERE requested_by LIKE ?1')
       .bind(PREFIX + '%').first()).toEqual({ n: 1 });
+  });
+
+  const submit = (body?: string) => route(certRequest(PATH, 'POST', current, body), production, ctx);
+
+  it('runs a submitted job with its validated options, carried in the message, and echoes them', async () => {
+    for (const suffix of ['options-a', 'options-b', 'options-c']) await seedSession(suffix);
+    const sleep = vi.spyOn(ROLLUP_PACING, 'sleep').mockResolvedValue();
+    const response = await submit(JSON.stringify({ maxPages: 2, pageSize: 1, pagePauseMs: 5 }));
+    expect(response.status).toBe(202);
+    const options = { maxPages: 2, maxBlocks: 20_000, pageSize: 1, pagePauseMs: 5 };
+    const accepted = await response.json<AcceptedJob & { options: unknown }>();
+    expect(accepted.options).toEqual(options);
+    expect(testEnv.ROLLUP_QUEUE.send).toHaveBeenCalledExactlyOnceWith(
+      { kind: 'session-rollup', job_id: accepted.job_id, options });
+    const sent = vi.mocked(testEnv.ROLLUP_QUEUE.send).mock.calls[0]![0] as SessionRollupMessage;
+    await consumeSessionRollup(delivery(accepted.job_id, sent), production);
+    // The defaults would finish all three one-block sessions; the submitted bounds stop after
+    // two one-block pages, each exactly full, so nothing completes.
+    expect(await job(accepted.job_id)).toMatchObject({ status: 'complete',
+      result: { pages: 2, examined: 2, completed: 0, failed: 0, pending: 3, remaining: 'pending', options } });
+    expect(sleep).toHaveBeenCalledExactlyOnceWith(5);
+  });
+
+  it('bounds a submitted job by its maxBlocks', async () => {
+    for (const suffix of ['blocks-a', 'blocks-b']) await seedSession(suffix);
+    const response = await submit(JSON.stringify({ maxBlocks: 1 }));
+    expect(response.status).toBe(202);
+    const accepted = await response.json<AcceptedJob>();
+    const sent = vi.mocked(testEnv.ROLLUP_QUEUE.send).mock.calls[0]![0] as SessionRollupMessage;
+    await consumeSessionRollup(delivery(accepted.job_id, sent), production);
+    expect(await job(accepted.job_id)).toMatchObject({ status: 'complete', result: { pages: 1, examined: 1,
+      completed: 0, pending: 2, options: { ...DEFAULT_ROLLUP_LIMITS, maxBlocks: 1 } } });
+  });
+
+  it.each([
+    ['no body', undefined],
+    ['an empty body', ''],
+    ['a blank body', ' \n'],
+    ['an empty object', '{}'],
+  ] as const)('submits the default limits for %s', async (_label, body) => {
+    const response = await submit(body);
+    expect(response.status).toBe(202);
+    const accepted = await response.json<AcceptedJob & { options: unknown }>();
+    expect(accepted.options).toEqual(DEFAULT_ROLLUP_LIMITS);
+    expect(DEFAULT_ROLLUP_LIMITS).toEqual({ maxPages: 80, maxBlocks: 20_000, pageSize: 250, pagePauseMs: 0 });
+    expect(testEnv.ROLLUP_QUEUE.send).toHaveBeenCalledExactlyOnceWith(
+      { kind: 'session-rollup', job_id: accepted.job_id, options: DEFAULT_ROLLUP_LIMITS });
+  });
+
+  it.each([
+    ['an unknown key', '{"maxPages":2,"bogus":1}', 'unknown option bogus'],
+    ['zero maxPages', '{"maxPages":0}', 'maxPages must be an integer from 1 to 80'],
+    ['maxPages above the cap', '{"maxPages":81}', 'maxPages must be an integer from 1 to 80'],
+    ['maxBlocks above the cap', '{"maxBlocks":20001}', 'maxBlocks must be an integer from 1 to 20000'],
+    ['pageSize above the cap', '{"pageSize":501}', 'pageSize must be an integer from 1 to 500'],
+    ['a negative pause', '{"pagePauseMs":-1}', 'pagePauseMs must be an integer from 0 to 10000'],
+    ['a pause above the cap', '{"pagePauseMs":10001}', 'pagePauseMs must be an integer from 0 to 10000'],
+    ['a fractional value', '{"maxPages":1.5}', 'maxPages must be an integer from 1 to 80'],
+    ['a numeric string', '{"pageSize":"10"}', 'pageSize must be an integer from 1 to 500'],
+    ['a null value', '{"maxBlocks":null}', 'maxBlocks must be an integer from 1 to 20000'],
+    ['an array body', '[]', 'body must be a JSON object'],
+    ['a null body', 'null', 'body must be a JSON object'],
+    ['truncated JSON', '{"maxPages":', null],
+    ['an unterminated object', '{', null],
+    ['a form body', 'maxPages=2', null],
+  ] as const)('rejects %s without creating or sending a job', async (_label, body, detail) => {
+    const response = await submit(body);
+    expect(response.status).toBe(400);
+    expect(await response.json()).toEqual(detail === null ? { error: 'bad_json' } : { error: 'invalid_options', detail });
+    expect(testEnv.ROLLUP_QUEUE.send).not.toHaveBeenCalled();
+    expect(await db.prepare('SELECT COUNT(*) AS n FROM session_rollup_jobs WHERE requested_by LIKE ?1')
+      .bind(PREFIX + '%').first()).toEqual({ n: 0 });
   });
 });

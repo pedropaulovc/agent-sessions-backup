@@ -1,5 +1,5 @@
 import { logRollupOutcome, runSessionRollupPass, type RollupOutcome } from './cron/session-rollup';
-import type { SessionRollupResult } from './session-rollup';
+import { DEFAULT_ROLLUP_LIMITS, type RollupLimits, type SessionRollupResult } from './session-rollup';
 
 // Queue invocations have a 15-minute wall-time limit. Never take an active attempt's work:
 // after 20 minutes its terminal result is unknown, so fail it rather than run a second pass.
@@ -18,14 +18,56 @@ interface RollupJobRow {
   ms: number | null;
 }
 
-export async function enqueueSessionRollup(env: Env, requestedBy: string): Promise<Response> {
+/** Inclusive bounds an operator may set per manual job. The upper bounds of the work limits are the
+ * scheduled defaults; the pause is capped so a paced pass still makes progress, and the pass's
+ * own wall-clock budget (ROLLUP_PACING.maxPassMs) stops it well inside the attempt lease. */
+const LIMIT_RANGES: Record<keyof RollupLimits, { min: number; max: number }> = {
+  maxPages: { min: 1, max: DEFAULT_ROLLUP_LIMITS.maxPages },
+  maxBlocks: { min: 1, max: DEFAULT_ROLLUP_LIMITS.maxBlocks },
+  pageSize: { min: 1, max: 500 },
+  pagePauseMs: { min: 0, max: 10_000 },
+};
+
+export type ParsedRollupLimits =
+  | { kind: 'valid'; limits: RollupLimits }
+  | { kind: 'malformed_json' }
+  | { kind: 'invalid'; detail: string };
+
+/** Strict parse of the optional submission body: empty means the defaults; otherwise a JSON object
+ * whose keys are a subset of RollupLimits, each an integer within LIMIT_RANGES. Omitted keys keep
+ * their defaults. */
+export function parseRollupLimits(body: string): ParsedRollupLimits {
+  if (body.trim() === '') return { kind: 'valid', limits: { ...DEFAULT_ROLLUP_LIMITS } };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return { kind: 'malformed_json' };
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+    return { kind: 'invalid', detail: 'body must be a JSON object' };
+  }
+  const limits = { ...DEFAULT_ROLLUP_LIMITS };
+  for (const [key, value] of Object.entries(parsed)) {
+    if (!Object.hasOwn(LIMIT_RANGES, key)) return { kind: 'invalid', detail: `unknown option ${key}` };
+    const range = LIMIT_RANGES[key as keyof RollupLimits];
+    if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < range.min || value > range.max) {
+      return { kind: 'invalid', detail: `${key} must be an integer from ${range.min} to ${range.max}` };
+    }
+    limits[key as keyof RollupLimits] = value;
+  }
+  return { kind: 'valid', limits };
+}
+
+export async function enqueueSessionRollup(env: Env, requestedBy: string, options: RollupLimits): Promise<Response> {
   const jobId = crypto.randomUUID();
   const createdAt = new Date().toISOString();
   await env.DB.prepare(`INSERT INTO session_rollup_jobs (job_id, requested_by, status, created_at)
     VALUES (?1, ?2, 'queued', ?3)`).bind(jobId, requestedBy, createdAt).run();
   const statusUrl = `/api/v1/admin/session-rollup/${jobId}`;
   try {
-    await env.ROLLUP_QUEUE.send({ kind: 'session-rollup', job_id: jobId });
+    // The options ride in the message, so every redelivery of this job runs the same bounds.
+    await env.ROLLUP_QUEUE.send({ kind: 'session-rollup', job_id: jobId, options });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     const failed = await env.DB.prepare(`UPDATE session_rollup_jobs SET status = 'failed', error = ?2,
@@ -39,7 +81,7 @@ export async function enqueueSessionRollup(env: Env, requestedBy: string): Promi
     // The durable row fences a late delivery, or exposes the running attempt to the caller.
     return Response.json({ error: 'queue_acceptance_failed', job_id: jobId, status_url: statusUrl }, { status: 503 });
   }
-  return Response.json({ job_id: jobId, status: 'queued', status_url: statusUrl },
+  return Response.json({ job_id: jobId, status: 'queued', status_url: statusUrl, options },
     { status: 202, headers: { Location: statusUrl, 'Cache-Control': 'no-store' } });
 }
 
@@ -91,7 +133,8 @@ export async function consumeSessionRollup(message: Message<SessionRollupMessage
       message.ack(); // Terminal replay (or no durable job) must never start another pass.
       return;
     }
-    await runSessionRollupPass(env, { run_id: jobId, trigger: 'manual' }, async (outcome: RollupOutcome) => {
+    const options = message.body.options ?? DEFAULT_ROLLUP_LIMITS;
+    await runSessionRollupPass(env, { run_id: jobId, trigger: 'manual' }, options, async (outcome: RollupOutcome) => {
       const saved = await env.DB.prepare(`UPDATE session_rollup_jobs SET status = ?3, result_json = ?4,
         error = ?5, ms = ?6, finished_at = ?7, attempt_token = NULL, lease_until = NULL
         WHERE job_id = ?1 AND status = 'running' AND attempt_token = ?2`)
