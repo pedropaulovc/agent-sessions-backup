@@ -21,7 +21,7 @@ import {
   STAR_CATALOG_COLUMNS, indexIdBase, indexShardForSessionId,
 } from '../src/index-layout.mjs';
 import {
-  CopyPassBudgetExhausted, cloudflareRetryDelay, createCopyPassRequestGate, indexControlClient,
+  CopyPassBudgetExhausted, awaitHealth, revisionGate, cloudflareRetryDelay, createCopyPassRequestGate, indexControlClient,
   pauseConsumers, requireProtectedProduction, runCopyPass, verifyActiveIndex, verifyReadyIndex,
 } from '../../infra/cf/index-control.mjs';
 import { PREVIEW_ACCOUNT_ID, PRODUCTION_ACCOUNT_ID } from '../../infra/cf/preview-trust.mjs';
@@ -8201,4 +8201,119 @@ test('importing a completed unfenced copy keeps its sealed READY and ACTIVATION 
   await writeCopyCheckpoint(f.shards[0], { ...completed, sha256: '0'.repeat(64) }, generation);
   const changed = await proofs();
   assert.throws(() => assertActivationProof({ ...imported, ...changed }), /proof/);
+});
+
+test('a deploy gate passes only on a stable converged revision, waits out lag, and fails fast otherwise', async (context) => {
+  // Production run 43492395254: `health` saw the new revision, then reconcile-catalog's first gate
+  // read the previous one 0.2 s later and failed the deploy.
+  const config = { vars: { VIEWER_HOST: 'viewer.example.test', DEPLOYMENT_REVISION: 'rev-new' } };
+  const live = (revision) => Response.json({
+    ok: true, environment: 'production', indexMode: 'active', deploymentRevision: revision, indexShardCount: 16,
+  });
+  const realFetch = globalThis.fetch;
+  const realError = console.error;
+  const stderr = [];
+  console.error = (line) => { stderr.push(line); };
+  context.after(() => { globalThis.fetch = realFetch; console.error = realError; });
+  let clock = 0;
+  const waits = [];
+  const wait = async (ms) => { waits.push(ms); clock += ms; };
+  const gate = (options = {}) => awaitHealth(config, 'active', { command: 'reconcile-catalog', wait, now: () => clock, ...options });
+  const serve = (sequence) => {
+    const queue = [...sequence];
+    let reads = 0;
+    globalThis.fetch = async () => { reads += 1; const next = queue.shift(); return typeof next === 'number' ? new Response('x', { status: next }) : live(next); };
+    return () => reads;
+  };
+  const reset = () => { clock = 0; waits.length = 0; stderr.length = 0; };
+
+  // A mixed edge: one new read between old ones is not convergence; three consecutive are.
+  let reads = serve(['rev-old', 'rev-new', 'rev-old', 'rev-new', 'rev-new', 'rev-new']);
+  assert.equal((await gate()).deploymentRevision, 'rev-new');
+  assert.equal(reads(), 6);
+  assert.deepEqual(waits, [2000, 2000, 2000, 2000, 2000]);
+  assert.deepEqual(stderr, [
+    'health operation=revision-gate command=reconcile-catalog mode=active wait=converging failure=mismatch reads=1 elapsed_ms=0',
+    'health operation=revision-gate command=reconcile-catalog mode=active wait=converging failure=mismatch reads=3 elapsed_ms=4000',
+  ]);
+
+  // A revision that never converges fails closed, reporting every read and the time waited.
+  reset();
+  serve(Array(10).fill('rev-old'));
+  await assert.rejects(gate({ deadlineMs: 5000 }), {
+    message: 'health operation=revision-gate command=reconcile-catalog mode=active failure=mismatch HTTP=200 reads=3 waited_ms=4000',
+  });
+  // A streak the deadline cuts short reports the latest read's outcome, not an earlier failure.
+  reset();
+  serve(['rev-old', 'rev-new', 'rev-new', 'rev-new']);
+  await assert.rejects(gate({ deadlineMs: 5000 }), {
+    message: 'health operation=revision-gate command=reconcile-catalog mode=active failure=unstable HTTP=200 reads=3 waited_ms=4000',
+  });
+
+  // Rollout lag only explains a mismatch: an HTTP failure is not waited out by a gate...
+  reset();
+  reads = serve([503, 'rev-new', 'rev-new', 'rev-new']);
+  await assert.rejects(gate(), { message: /failure=http HTTP=503 attempts=1$/ });
+  assert.equal(reads(), 1);
+  assert.deepEqual(waits, []);
+  // ...but the standalone `health` command keeps retrying any failure, as it always did.
+  reset();
+  reads = serve([503, 'rev-new', 'rev-new', 'rev-new']);
+  assert.equal((await gate({ retry: 'any' })).deploymentRevision, 'rev-new');
+  assert.equal(reads(), 4);
+});
+
+test('a converge-first gate tolerates rollout lag until its settle window ends, then fails closed; strict never waits', async (context) => {
+  const config = { vars: { VIEWER_HOST: 'viewer.example.test', DEPLOYMENT_REVISION: 'rev-new' } };
+  const live = (revision) => Response.json({
+    ok: true, environment: 'production', indexMode: 'active', deploymentRevision: revision, indexShardCount: 16,
+  });
+  const realFetch = globalThis.fetch;
+  const realError = console.error;
+  console.error = () => {};
+  context.after(() => { globalThis.fetch = realFetch; console.error = realError; });
+  const queue = [];
+  globalThis.fetch = async () => { const next = queue.shift(); return typeof next === 'number' ? new Response('x', { status: next }) : live(next); };
+  let clock = 0;
+  const wait = async (ms) => { clock += ms; };
+  const options = { wait, now: () => clock };
+  const mismatch = /failure=mismatch HTTP=200 attempts=1$/;
+
+  // converge-first: the first gate waits out deploy lag...
+  const gate = revisionGate(config, 'active', 'reconcile-catalog', 'converge-first', options);
+  queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');
+  assert.equal((await gate()).deploymentRevision, 'rev-new');
+  assert.equal(queue.length, 0);
+  // ...and a residual stale read inside the 60 s settle window is still rollout lag...
+  clock += 10000;
+  queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');
+  assert.equal((await gate()).deploymentRevision, 'rev-new');
+  assert.equal(queue.length, 0);
+  // ...while a gate whose read already matches inside the window costs just that read...
+  queue.push('rev-new', 'rev-old');
+  assert.equal((await gate()).deploymentRevision, 'rev-new');
+  assert.equal(queue.length, 1);
+  queue.length = 0;
+  // ...and an in-window HTTP failure is not lag: it fails at once, without waiting.
+  const before = clock;
+  queue.push(503, 'rev-new', 'rev-new', 'rev-new');
+  await assert.rejects(gate(), { message: /failure=http HTTP=503 attempts=1$/ });
+  assert.equal(clock, before);
+  queue.length = 0;
+  // The re-convergence above restarted the window: 50 s on (64 s after the first) is still lag.
+  clock += 50000;
+  queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');
+  assert.equal((await gate()).deploymentRevision, 'rev-new');
+  assert.equal(queue.length, 0);
+  // ...but after the window, the revision changing under the work fails closed on one read.
+  clock += 60000;
+  queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');
+  await assert.rejects(gate(), { message: mismatch });
+  assert.equal(queue.length, 3);
+
+  // strict (seed-catalog/ready behind the durable drain): no wait even on the first gate.
+  queue.length = 0;
+  queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');
+  await assert.rejects(revisionGate(config, 'active', 'ready', 'strict', options)(), { message: mismatch });
+  assert.equal(queue.length, 3);
 });
