@@ -470,12 +470,18 @@ async function generatedConfig(args) {
   return config;
 }
 
-function healthFailure(command, mode, failure, attempts, status) {
-  const safeCommand = ['health', 'reconcile-catalog', 'verify-active', 'drain', 'copy', 'seed-catalog', 'ready']
+function safeHealthCommand(command) {
+  return ['health', 'reconcile-catalog', 'verify-active', 'drain', 'copy', 'seed-catalog', 'ready']
     .includes(command) ? command : 'unknown';
-  return new Error(`health operation=revision-gate command=${safeCommand} mode=${mode === 'active' ? 'active' : 'maintenance'}`
+}
+
+function healthFailure(command, mode, failure, attempts, status) {
+  const error = new Error(`health operation=revision-gate command=${safeHealthCommand(command)} mode=${mode === 'active' ? 'active' : 'maintenance'}`
     + ` failure=${failure} HTTP=${Number.isInteger(status) && status >= 100 && status <= 599 ? status : 'unknown'}`
     + ` attempts=${attempts}`);
+  error.failure = failure;
+  error.status = status;
+  return error;
 }
 
 async function health(config, mode, { command, requestGate } = {}) {
@@ -513,16 +519,47 @@ async function health(config, mode, { command, requestGate } = {}) {
 }
 
 /** A deploy rolls the new Worker version out across Cloudflare's edge over seconds, so one
- * /healthz read can still reach the previous revision right after a check that saw the new one
+ * /healthz read can reach the previous revision right after a read that saw the new one
  * (production run 43492395254: `health` passed, then reconcile-catalog's gate read the old
- * revision 0.2 s later and failed the deploy). Active-mode gates therefore wait, bounded, for the
- * live revision to converge instead of failing on the first lagging read. Every attempt is still
- * the full strict check; nothing proceeds on a mismatch. */
-export async function awaitHealth(config, mode, { command, deadlineMs = 180000, wait = sleep, now = Date.now } = {}) {
-  const deadline = now() + deadlineMs;
+ * revision 0.2 s later and failed the deploy). One matching read therefore proves nothing about
+ * convergence. This gate passes only after `stableReads` CONSECUTIVE strict matches spaced
+ * `intervalMs` apart; a failed read resets the streak and is waited out (logged to stderr) until
+ * `deadlineMs`. With `retry: 'mismatch'` (the gates) any other failure (transport after health's
+ * own retries, http, json) fails at once, since rollout lag only explains a mismatch; the
+ * standalone `health` command keeps its original `retry: 'any'` contract. The final error
+ * carries the total read count and the waited time. The copy pass keeps its own strict,
+ * budgeted single-read gate: a failed pass resumes from its durable checkpoint. */
+export async function awaitHealth(config, mode, {
+  command, retry = 'mismatch', deadlineMs = 180000, stableReads = 3, intervalMs = 2000, wait = sleep, now = Date.now,
+} = {}) {
+  const started = now();
+  let reads = 0;
+  let streak = 0;
+  let last;
   for (;;) {
-    try { return await health(config, mode, { command }); }
-    catch (error) { if (now() >= deadline) throw error; await wait(2000); }
+    let value;
+    try {
+      value = await health(config, mode, { command });
+    } catch (error) {
+      if (retry === 'mismatch' && error?.failure !== 'mismatch') throw error;
+      last = error;
+    }
+    reads += 1;
+    streak = value === undefined ? 0 : streak + 1;
+    if (streak >= stableReads) return value;
+    const elapsed = now() - started;
+    if (value === undefined) {
+      console.error(`health operation=revision-gate command=${safeHealthCommand(command)}`
+        + ` mode=${mode === 'active' ? 'active' : 'maintenance'} wait=converging failure=${last?.failure ?? 'unknown'}`
+        + ` reads=${reads} elapsed_ms=${elapsed}`);
+    }
+    if (elapsed + intervalMs > deadlineMs) {
+      // A streak cut short by the deadline is still unproven convergence.
+      const error = healthFailure(command, mode, last?.failure ?? 'mismatch', reads, last?.status);
+      error.message += ` waited_ms=${elapsed}`;
+      throw error;
+    }
+    await wait(intervalMs);
   }
 }
 
@@ -650,7 +687,7 @@ async function main() {
   }
   if (command === 'health') {
     if (!['maintenance', 'active'].includes(args.mode)) throw new Error('health requires --mode maintenance|active');
-    console.log(JSON.stringify(await awaitHealth(config, args.mode, { command })));
+    console.log(JSON.stringify(await awaitHealth(config, args.mode, { command, retry: 'any' })));
     return;
   }
   const source = api.db(config.d1_databases[0].database_id);
@@ -708,7 +745,9 @@ async function main() {
     console.log(JSON.stringify(result));
     return;
   }
-  const gate = async () => await health(config, 'maintenance', { command });
+  // drain, seed-catalog and ready wait for a converged maintenance revision; copy's own gates
+  // stay strict single reads under its pass budget (see awaitHealth).
+  const gate = async () => await awaitHealth(config, 'maintenance', { command });
   // The durable drain gate that copy, seed-catalog and ready require; drain writes it.
   const assertDrained = async () => {
     const frozen = await readCheckpoint(shards[0], FREEZE_CHECKPOINT);
@@ -730,7 +769,7 @@ async function main() {
     // The copy state of the last progress event (including the terminal `failed` one).
     let copyPhase;
     try {
-      await gate();
+      await health(config, 'maintenance', { command });
       await assertDrained();
       const atomicity = await readCheckpoint(shards[0], ATOMICITY_CHECKPOINT);
       if (atomicity?.state !== 'verified' || atomicity.databaseId !== shards[0].id

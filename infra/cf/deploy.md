@@ -1269,11 +1269,21 @@ between attempts (at most two waits). Each attempt makes a fresh uncached GET wi
 the existing 30-second request timeout. A successful attempt must still assert the
 exact expected mode, deployment revision, production environment, and 16-shard layout
 before it authorizes further copy work. HTTP errors (including 429/5xx), malformed
-JSON, and health-payload mismatches are terminal at direct gates: they are not
-transport failures and are never retried into source acknowledgment. There is no
-cached-health fallback. The standalone `health` command retains its separate,
-existing 180-second deployment-propagation settle loop; that command-only polling
-does not weaken the gates used by `copy`, readiness, or activation.
+JSON, and health-payload mismatches are terminal at the copy pass's direct gates:
+they are not transport failures and are never retried into source acknowledgment.
+There is no cached-health fallback.
+
+Every other revision gate (`drain`, `seed-catalog`, `ready`, `reconcile-catalog`,
+`verify-active`) waits for edge convergence instead: a deploy rolls the new Worker
+version across Cloudflare's edge over seconds, so one read can see the new revision
+and the next (0.2 s later in production run 43492395254) the previous one. Such a
+gate passes only after **three consecutive** strict matches two seconds apart; a
+payload mismatch resets the streak, logs `wait=converging failure=mismatch reads=N
+elapsed_ms=M` to stderr, and is retried for at most 180 seconds, after which the gate
+fails with `failure=mismatch attempts=<reads> waited_ms=<ms>`. Transport (after the
+three attempts above), HTTP and JSON failures still fail these gates at once, since
+rollout lag only explains a mismatch. The standalone `health` command uses the same
+stable-read wait but keeps retrying any failure for 180 seconds, as it always has.
 
 Health errors emit only `operation=revision-gate`, an allowlisted command and mode,
 `failure=transport|http|json|mismatch`, safe actual HTTP status (or `unknown`), and

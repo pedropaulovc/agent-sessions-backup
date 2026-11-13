@@ -8203,7 +8203,7 @@ test('importing a completed unfenced copy keeps its sealed READY and ACTIVATION 
   assert.throws(() => assertActivationProof({ ...imported, ...changed }), /proof/);
 });
 
-test('an active-mode gate waits for the edge to converge on the deployed revision, and only that long', async (context) => {
+test('a deploy gate passes only on a stable converged revision, waits out lag, and fails fast otherwise', async (context) => {
   // Production run 43492395254: `health` saw the new revision, then reconcile-catalog's first gate
   // read the previous one 0.2 s later and failed the deploy.
   const config = { vars: { VIEWER_HOST: 'viewer.example.test', DEPLOYMENT_REVISION: 'rev-new' } };
@@ -8211,24 +8211,48 @@ test('an active-mode gate waits for the edge to converge on the deployed revisio
     ok: true, environment: 'production', indexMode: 'active', deploymentRevision: revision, indexShardCount: 16,
   });
   const realFetch = globalThis.fetch;
-  context.after(() => { globalThis.fetch = realFetch; });
-
-  let served = ['rev-old', 'rev-old', 'rev-new'];
-  globalThis.fetch = async () => live(served.shift());
+  const realError = console.error;
+  const stderr = [];
+  console.error = (line) => { stderr.push(line); };
+  context.after(() => { globalThis.fetch = realFetch; console.error = realError; });
   let clock = 0;
   const waits = [];
   const wait = async (ms) => { waits.push(ms); clock += ms; };
-  const value = await awaitHealth(config, 'active', { command: 'reconcile-catalog', wait, now: () => clock });
-  assert.equal(value.deploymentRevision, 'rev-new');
-  assert.deepEqual(waits, [2000, 2000]);
+  const gate = (options = {}) => awaitHealth(config, 'active', { command: 'reconcile-catalog', wait, now: () => clock, ...options });
+  const serve = (sequence) => {
+    const queue = [...sequence];
+    let reads = 0;
+    globalThis.fetch = async () => { reads += 1; const next = queue.shift(); return typeof next === 'number' ? new Response('x', { status: next }) : live(next); };
+    return () => reads;
+  };
+  const reset = () => { clock = 0; waits.length = 0; stderr.length = 0; };
 
-  // A revision that never converges still fails closed, with the strict mismatch diagnostic.
-  globalThis.fetch = async () => live('rev-old');
-  clock = 0;
-  waits.length = 0;
-  await assert.rejects(
-    awaitHealth(config, 'active', { command: 'reconcile-catalog', deadlineMs: 5000, wait, now: () => clock }),
-    { message: 'health operation=revision-gate command=reconcile-catalog mode=active failure=mismatch HTTP=200 attempts=1' },
-  );
-  assert.deepEqual(waits, [2000, 2000, 2000]);
+  // A mixed edge: one new read between old ones is not convergence; three consecutive are.
+  let reads = serve(['rev-old', 'rev-new', 'rev-old', 'rev-new', 'rev-new', 'rev-new']);
+  assert.equal((await gate()).deploymentRevision, 'rev-new');
+  assert.equal(reads(), 6);
+  assert.deepEqual(waits, [2000, 2000, 2000, 2000, 2000]);
+  assert.deepEqual(stderr, [
+    'health operation=revision-gate command=reconcile-catalog mode=active wait=converging failure=mismatch reads=1 elapsed_ms=0',
+    'health operation=revision-gate command=reconcile-catalog mode=active wait=converging failure=mismatch reads=3 elapsed_ms=4000',
+  ]);
+
+  // A revision that never converges fails closed, reporting every read and the time waited.
+  reset();
+  serve(Array(10).fill('rev-old'));
+  await assert.rejects(gate({ deadlineMs: 5000 }), {
+    message: 'health operation=revision-gate command=reconcile-catalog mode=active failure=mismatch HTTP=200 attempts=3 waited_ms=4000',
+  });
+
+  // Rollout lag only explains a mismatch: an HTTP failure is not waited out by a gate...
+  reset();
+  reads = serve([503, 'rev-new', 'rev-new', 'rev-new']);
+  await assert.rejects(gate(), { message: /failure=http HTTP=503 attempts=1$/ });
+  assert.equal(reads(), 1);
+  assert.deepEqual(waits, []);
+  // ...but the standalone `health` command keeps retrying any failure, as it always did.
+  reset();
+  reads = serve([503, 'rev-new', 'rev-new', 'rev-new']);
+  assert.equal((await gate({ retry: 'any' })).deploymentRevision, 'rev-new');
+  assert.equal(reads(), 4);
 });
