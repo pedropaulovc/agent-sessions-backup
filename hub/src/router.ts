@@ -188,13 +188,13 @@ async function apiRoute(request: Request, url: URL, env: Env): Promise<Response>
   return priceUsageSlice(request, env, identity);
  }
  if (path === '/api/v1/admin/session-rollup' && method === 'POST') {
-  return sessionRollupJob(env, identity);
+  return sessionRollupJob(request, env, identity);
  }
  const rollupJobMatch = path.match(/^\/api\/v1\/admin\/session-rollup\/([^/]+)$/);
  if (rollupJobMatch && method === 'GET') {
   const jobId = safeDecode(rollupJobMatch[1]!);
   if (jobId === null) return Response.json({ error: 'bad_job_id' }, { status: 400 });
-  return sessionRollupJob(env, identity, jobId);
+  return sessionRollupJob(request, env, identity, jobId);
  }
  if (path === '/api/v1/admin/machines' && method === 'POST') {
   if (identity.certSlot !== 'current') return Response.json({ error: 'admin_requires_current_cert' }, { status: 403 });

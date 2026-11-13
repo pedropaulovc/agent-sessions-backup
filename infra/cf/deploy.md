@@ -409,17 +409,24 @@ until code=$(curl --silent --show-error --output /dev/stderr --write-out '%{http
 done
 
 # Session rollup: one bounded job per POST; poll it, then submit another while work remains.
+# The body is optional; omit it for the scheduled limits. This one paces a slow drain.
 job=$(curl --fail-with-body --silent --show-error -X POST \
+  -H 'content-type: application/json' -d '{"maxPages":20,"pagePauseMs":5000}' \
   --cert "$ADMIN_CERT" --key "$ADMIN_KEY" "$API/api/v1/admin/session-rollup")
+jq '.options' <<<"$job"
 status_url=$(jq -er '.status_url' <<<"$job")
 curl --fail-with-body --silent --show-error --cert "$ADMIN_CERT" --key "$ADMIN_KEY" "$API$status_url" \
   | jq '{status, result}'
 ```
 
 Poll the rollup job until `status` is `complete`, `partial`, or `failed` (see "Run a bounded
-session-rollup pass" in the README), and submit another job while `result.remaining` is
-`pending`. There is no admin route for the LiteLLM model-price sync; it runs at the next daily
-cron (`37 4 * * *` UTC), which then prices any rows that needed newly published rates.
+session-rollup pass" in the README for the `maxPages`/`maxBlocks`/`pageSize`/`pagePauseMs` options,
+their ranges, and the per-page `hub.session_rollup.page` timings), and submit another job while
+`result.remaining` is `pending`. If D1 reports `D1 DB is overloaded`, resubmit with fewer pages, a
+smaller `pageSize`, or a longer `pagePauseMs`, and use the page lines' `read_ms`/`usage_ms`/
+`seen_ms`/`commit_ms` to see which stage is expensive. There is no admin route for the LiteLLM
+model-price sync; it runs at the next daily cron (`37 4 * * *` UTC), which then prices any rows
+that needed newly published rates.
 
 ## Protected production full-fidelity index cutover
 

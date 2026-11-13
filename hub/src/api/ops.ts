@@ -3,7 +3,7 @@ import { detect } from '../ingest/detect';
 import { priceUsage } from '../pricing-pass';
 import { classifyModel, costOfUsage, loadPrices } from '../pricing';
 import { reservationCutoffIso } from '../queue';
-import { enqueueSessionRollup, getSessionRollupJob } from '../session-rollup-jobs';
+import { enqueueSessionRollup, getSessionRollupJob, parseRollupLimits } from '../session-rollup-jobs';
 import {
   priceEpochExpr,
   priceForGroup,
@@ -978,9 +978,15 @@ export async function priceUsageSlice(request: Request, env: Env, identity: Iden
   return Response.json(res, { status: res.more ? 202 : 200 });
 }
 
-/** Admin-only bounded job submission and polling; both require the current certificate slot. */
-export async function sessionRollupJob(env: Env, identity: Identity, jobId?: string): Promise<Response> {
+/** Admin-only bounded job submission and polling; both require the current certificate slot.
+ * Submission takes an optional JSON body of limits (see parseRollupLimits); it is read only after
+ * authorization, and an invalid body creates no job and sends nothing. */
+export async function sessionRollupJob(request: Request, env: Env, identity: Identity, jobId?: string): Promise<Response> {
   if (identity.kind !== 'machine' || !identity.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
   if (identity.certSlot !== 'current') return Response.json({ error: 'admin_requires_current_cert' }, { status: 403 });
-  return jobId === undefined ? enqueueSessionRollup(env, identity.machineId) : getSessionRollupJob(env, jobId);
+  if (jobId !== undefined) return getSessionRollupJob(env, jobId);
+  const parsed = parseRollupLimits(await request.text());
+  if (parsed.kind === 'malformed_json') return Response.json({ error: 'bad_json' }, { status: 400 });
+  if (parsed.kind === 'invalid') return Response.json({ error: 'invalid_options', detail: parsed.detail }, { status: 400 });
+  return enqueueSessionRollup(env, identity.machineId, parsed.limits);
 }

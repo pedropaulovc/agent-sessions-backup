@@ -1,13 +1,33 @@
 import { UNKNOWN_MODEL_LABEL } from './usage-agg';
 import { indexDbFor } from './index-shards';
 
-export interface SessionRollupOptions {
-  /** Hard bounds on source blocks and pages, including unfinished giant sessions. */
-  maxBlocks?: number;
-  maxPages?: number;
-  pageSize?: number;
+/** Work and pacing bounds for one pass. The scheduled pass always runs DEFAULT_ROLLUP_LIMITS; an
+ * admin manual job may override them within validated ranges (POST /api/v1/admin/session-rollup). */
+export interface RollupLimits {
+  maxPages: number;
+  maxBlocks: number;
+  pageSize: number;
+  /** Pause before each page after the first, before choosing its checkpoint, so a pass spreads its
+   * main-D1 load. A pass that runs out of work therefore pauses once more before noticing. */
+  pagePauseMs: number;
+}
+
+/** Engine clamp on a page; the admin API's accepted range uses the same bound. */
+export const MAX_ROLLUP_PAGE_SIZE = 500;
+export const DEFAULT_ROLLUP_LIMITS: RollupLimits = { maxPages: 80, maxBlocks: 20_000, pageSize: 250, pagePauseMs: 0 };
+
+/** How a pass waits between pages and how long it may run. A mutable object so tests can replace
+ * `sleep` and the budget. The budget stops a paced pass well inside the manual job's 20-minute
+ * attempt lease (and the queue's 15-minute invocation limit): before each page after the first,
+ * a pass whose elapsed time plus the coming pause would exceed it stops, leaving the rest pending. */
+export const ROLLUP_PACING = {
+  maxPassMs: 10 * 60 * 1000,
+  sleep: (ms: number): Promise<void> => scheduler.wait(ms),
+};
+
+export interface SessionRollupOptions extends Partial<RollupLimits> {
   now?: Date;
-  /** Correlates page failures with the scheduled or manual bounded pass. */
+  /** Correlates page telemetry and failures with the scheduled or manual bounded pass. */
   run?: { run_id: string; trigger: 'scheduled' | 'manual' };
 }
 
@@ -19,6 +39,19 @@ export interface SessionRollupResult {
   failed: number;
   pending: number;
   remaining: 'pending' | 'complete';
+  /** The effective bounds this pass ran with. */
+  options: RollupLimits;
+}
+
+/** Where a page is, so a failure names the stage that threw. Each D1 stage's ms is recorded only
+ * once it completes; `aggregate` is the in-memory accounting between the seen lookups and commit. */
+type PageStage = 'read' | 'usage' | 'seen' | 'aggregate' | 'commit';
+interface PageTrace {
+  stage: PageStage;
+  read_ms?: number;
+  usage_ms?: number;
+  seen_ms?: number;
+  commit_ms?: number;
 }
 
 interface Checkpoint {
@@ -42,6 +75,8 @@ interface SourceBlock {
   call_key_id: number | null;
   tool_name: string | null;
   text: string | null;
+  /** UTF-8 bytes of tool_name + text, on a page's representative comparable call only. */
+  call_bytes: number | null;
   on_main_path: number;
   byte_len: number | null;
   ts: string | null;
@@ -83,20 +118,37 @@ const COMPARABLE_CALL = `b.role = 'assistant' AND b.btype = 'tool_use' AND b.tru
  * invalid timestamps belong to ''. Model evidence comes only from the unique usage turn row.
  * A turn crossing pages carries its flags, so neither assistant nor rewound turns double-count.
  * Exact complete stored tool arguments are a diagnostic proxy, never proof of wasted work.
+ * Every page logs one `hub.session_rollup.page` line with its per-stage D1 timings.
  */
 export async function runSessionRollup(
   env: Env,
   options: SessionRollupOptions = {},
 ): Promise<SessionRollupResult> {
   const db = env.DB;
-  const maxBlocks = positiveInteger(options.maxBlocks ?? 20_000, 'maxBlocks');
-  const maxPages = positiveInteger(options.maxPages ?? 80, 'maxPages');
-  const pageSize = Math.min(500, positiveInteger(options.pageSize ?? 250, 'pageSize'));
+  const started = Date.now();
+  const limits: RollupLimits = {
+    maxPages: positiveInteger(options.maxPages ?? DEFAULT_ROLLUP_LIMITS.maxPages, 'maxPages'),
+    maxBlocks: positiveInteger(options.maxBlocks ?? DEFAULT_ROLLUP_LIMITS.maxBlocks, 'maxBlocks'),
+    pageSize: Math.min(MAX_ROLLUP_PAGE_SIZE, positiveInteger(options.pageSize ?? DEFAULT_ROLLUP_LIMITS.pageSize, 'pageSize')),
+    pagePauseMs: nonNegativeInteger(options.pagePauseMs ?? DEFAULT_ROLLUP_LIMITS.pagePauseMs, 'pagePauseMs'),
+  };
   const result: SessionRollupResult = {
     examined: 0, pages: 0, completed: 0, superseded: 0, failed: 0, pending: 0, remaining: 'complete',
+    options: limits,
   };
   const failedSessions: string[] = [];
-  while (result.pages < maxPages && result.examined < maxBlocks) {
+  let budgetStopMs: number | null = null;
+  while (result.pages < limits.maxPages && result.examined < limits.maxBlocks) {
+    if (result.pages > 0) {
+      const elapsed = Date.now() - started;
+      if (elapsed + limits.pagePauseMs > ROLLUP_PACING.maxPassMs) {
+        budgetStopMs = elapsed;
+        break;
+      }
+      // Pause BEFORE choosing the next checkpoint, so a concurrent pass cannot advance it while
+      // this one sleeps and turn the page's D1 reads into superseded work.
+      if (limits.pagePauseMs > 0) await ROLLUP_PACING.sleep(limits.pagePauseMs);
+    }
     // Least recently attempted, not lowest session id: unfinished sessions rotate fairly.
     const checkpoint = await db.prepare(`SELECT session_id, generation, cursor_turn, cursor_block,
       cursor_id, turn_state, last_attempt, finishing, commit_token FROM session_rollup_state
@@ -105,9 +157,10 @@ export async function runSessionRollup(
       .bind(JSON.stringify(failedSessions)).first<Checkpoint>();
     if (!checkpoint) break;
     result.pages++;
+    const trace: PageTrace = { stage: 'read' };
     try {
-      await rollupPage(env, checkpoint, Math.min(pageSize, maxBlocks - result.examined),
-        pageSize, options.now ?? new Date(), result);
+      await rollupPage(env, checkpoint, Math.min(limits.pageSize, limits.maxBlocks - result.examined),
+        limits.pageSize, options.now ?? new Date(), result, trace, options.run);
     } catch (error) {
       // Do not advance a failed checkpoint or overwrite a concurrent winner. If D1 itself is
       // unavailable this bookkeeping also throws, propagating the invocation-level failure.
@@ -121,12 +174,17 @@ export async function runSessionRollup(
       result.failed++;
       failedSessions.push(checkpoint.session_id);
       console.error(JSON.stringify({ event: 'hub.session_rollup.page_failed', ...options.run, session_id: checkpoint.session_id,
-        error: error instanceof Error ? error.message : String(error) }));
+        ...trace, error: error instanceof Error ? error.message : String(error) }));
     }
   }
   result.pending = (await db.prepare(`SELECT COUNT(*) AS n FROM session_rollup_state
     WHERE ${ELIGIBLE}`).first<{ n: number }>())?.n ?? 0;
   result.remaining = result.pending > 0 ? 'pending' : 'complete';
+  // Only a stop that actually left work behind is a budget stop worth resubmitting for.
+  if (budgetStopMs !== null && result.pending > 0) {
+    console.log(JSON.stringify({ event: 'hub.session_rollup.time_budget', ...options.run,
+      ms: budgetStopMs, pages: result.pages, pending: result.pending, max_pass_ms: ROLLUP_PACING.maxPassMs }));
+  }
   return result;
 }
 
@@ -137,8 +195,11 @@ async function rollupPage(
   pageSize: number,
   now: Date,
   result: SessionRollupResult,
+  trace: PageTrace,
+  run: SessionRollupOptions['run'],
 ): Promise<void> {
     const db = env.DB;
+    let stageStarted = Date.now();
     // Window the exact tuple page on its shard. Carry full comparable identities only once per
     // page; repeated blocks refer to that representative rather than copying large tool arguments.
     const blocks: SourceBlock[] = checkpoint.finishing ? [] : (await indexDbFor(env, checkpoint.session_id)
@@ -157,13 +218,18 @@ async function rollupPage(
       SELECT p.id, p.turn_index, p.block_index, p.role, p.btype, p.on_main_path, p.byte_len, p.ts,
         CASE WHEN c.id IS NULL THEN 0 ELSE 1 END AS comparable_call, c.call_key_id,
         CASE WHEN p.id = c.call_key_id THEN p.tool_name END AS tool_name,
-        CASE WHEN p.id = c.call_key_id THEN p.text END AS text
+        CASE WHEN p.id = c.call_key_id THEN p.text END AS text,
+        CASE WHEN p.id = c.call_key_id
+          THEN length(CAST(p.tool_name AS BLOB)) + length(CAST(p.text AS BLOB)) END AS call_bytes
       FROM page p LEFT JOIN comparable_calls c ON c.id = p.id
       ORDER BY p.turn_index, p.block_index, p.id`)
       .bind(checkpoint.session_id, checkpoint.cursor_turn, checkpoint.cursor_block,
         checkpoint.cursor_id, limit).all<SourceBlock>()).results;
     result.examined += blocks.length;
+    trace.read_ms = Date.now() - stageStarted;
 
+    trace.stage = 'usage';
+    stageStarted = Date.now();
     const models = new Map<number, string | null>();
     if (blocks.length > 0) {
       const turns = [...new Set(blocks.map((block) => block.turn_index))];
@@ -172,6 +238,10 @@ async function rollupPage(
         .bind(checkpoint.session_id, JSON.stringify(turns)).all<{ turn_index: number; model: string | null }>();
       for (const row of usage.results) models.set(row.turn_index, row.model);
     }
+    trace.usage_ms = Date.now() - stageStarted;
+
+    trace.stage = 'seen';
+    stageStarted = Date.now();
     const calls = blocks.filter((block) => block.id === block.call_key_id);
     const seen = new Set<number>();
     // Separate bound values, not one JSON array: JSON escaping of a maximum page can exceed
@@ -186,7 +256,9 @@ async function rollupPage(
         if (prior[i]?.results[0]?.seen) seen.add(chunk[i]!.id);
       }
     }
+    trace.seen_ms = Date.now() - stageStarted;
 
+    trace.stage = 'aggregate';
     let turn: TurnState | null = checkpoint.turn_state ? JSON.parse(checkpoint.turn_state) : null;
     const buckets = new Map<string, Bucket>();
     for (const block of blocks) {
@@ -257,9 +329,21 @@ async function rollupPage(
           .bind(checkpoint.session_id, token, now.toISOString()),
       );
     }
+    trace.stage = 'commit';
+    stageStarted = Date.now();
     const committed = await db.batch(statements);
-    if ((committed[0]?.meta.changes ?? 0) === 0) result.superseded++;
-    else if (complete && (committed.at(-1)?.meta.changes ?? 0) > 0) result.completed++;
+    trace.commit_ms = Date.now() - stageStarted;
+    let outcome: 'committed' | 'superseded' | 'completed' = 'committed';
+    if ((committed[0]?.meta.changes ?? 0) === 0) outcome = 'superseded';
+    else if (complete && (committed.at(-1)?.meta.changes ?? 0) > 0) outcome = 'completed';
+    if (outcome === 'superseded') result.superseded++;
+    if (outcome === 'completed') result.completed++;
+    let callTextBytes = 0;
+    for (const call of calls) callTextBytes += call.call_bytes ?? 0;
+    console.log(JSON.stringify({ event: 'hub.session_rollup.page', ...run, session_id: checkpoint.session_id,
+      phase: checkpoint.finishing ? 'finishing' : 'scan', blocks: blocks.length, calls: calls.length,
+      call_text_bytes: callTextBytes, statements: statements.length, outcome,
+      read_ms: trace.read_ms, usage_ms: trace.usage_ms, seen_ms: trace.seen_ms, commit_ms: trace.commit_ms }));
 }
 
 
@@ -277,5 +361,10 @@ function utcDay(timestamp: string | null): string {
 
 function positiveInteger(value: number, name: string): number {
   if (!Number.isSafeInteger(value) || value < 1) throw new RangeError(`${name} must be a positive integer`);
+  return value;
+}
+
+function nonNegativeInteger(value: number, name: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) throw new RangeError(`${name} must be a non-negative integer`);
   return value;
 }

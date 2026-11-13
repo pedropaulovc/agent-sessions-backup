@@ -74,6 +74,9 @@ interface IndexCatalogMessage {
 interface SessionRollupMessage {
   kind: 'session-rollup';
   job_id: string;
+  /** The submitted bounds; a redelivery reuses them. Absent on messages enqueued before options
+   * existed, which run the defaults they were submitted under. */
+  options?: import('./session-rollup').RollupLimits;
 }
 
 interface ParseMessage {
