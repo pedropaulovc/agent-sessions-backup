@@ -295,7 +295,8 @@ describe('scheduled handler', () => {
         failed: errors.lines.filter((o) => o.event === 'hub.cron.daily_step_failed'),
         chain: logs.lines.filter((o) => o.event === 'hub.cron.daily_step' && o.step !== 'staging_prune'),
         rollupStarts: logs.lines.filter((o) => o.event === 'hub.session_rollup.started' && o.trigger === 'scheduled'),
-        rollupRuns: logs.lines.filter((o) => o.event === 'hub.session_rollup.run' && o.trigger === 'scheduled'),
+        // logRollupOutcome sends failed/partial passes to console.error and complete ones to console.log.
+        rollupRuns: [...errors.lines, ...logs.lines].filter((o) => o.event === 'hub.session_rollup.run' && o.trigger === 'scheduled'),
       };
     }
 
@@ -351,7 +352,7 @@ describe('scheduled handler', () => {
       expect(run.retries.map((o) => [o.step, o.error])).toEqual([['session_rollup', OVERLOAD]]);
       expect(run.sleeps).toEqual([11_000]);
       expect(run.rollupStarts, 'the retried rollup pass did not run again').toHaveLength(2);
-      expect(run.rollupRuns.map((o) => o.outcome)).toEqual(['complete']);
+      expect(run.rollupRuns.map((o) => o.outcome), 'the first pass must record its overload').toEqual(['failed', 'complete']);
       expect(run.stepRuns.map((o) => o.outcome)).toEqual(['ok']);
       expect(run.failed).toEqual([]);
       expect(run.chain.map((o) => [o.step, o.outcome])).toEqual(D1_CHAIN.map((step) => [step, 'ok']));
