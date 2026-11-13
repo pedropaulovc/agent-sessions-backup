@@ -366,12 +366,19 @@ describe('rollup page telemetry and pacing', () => {
     ]);
   });
 
-  it('pauses between pages, never before the first or after the last', async () => {
+  it('pauses before each page after the first, never before the first or after a maxPages stop', async () => {
     for (const suffix of ['pace-a', 'pace-b', 'pace-c']) await block(await seedSession(suffix), 0, 0, { type: 'text' });
     const sleep = vi.spyOn(ROLLUP_PACING, 'sleep').mockResolvedValue();
+    // Bounded by maxPages: pages - 1 pauses.
+    expect(await runSessionRollup(testEnv, { pagePauseMs: 250, maxPages: 2 }))
+      .toMatchObject({ pages: 2, options: { pagePauseMs: 250 } });
+    expect(sleep.mock.calls).toEqual([[250]]);
+    sleep.mockClear();
+    // Running out of work: the pause precedes the checkpoint select, so the pass pauses once more
+    // before discovering nothing is left.
     expect(await runSessionRollup(testEnv, { pagePauseMs: 250 }))
-      .toMatchObject({ pages: 3, completed: 3, pending: 0, options: { pagePauseMs: 250 } });
-    expect(sleep.mock.calls).toEqual([[250], [250]]);
+      .toMatchObject({ pages: 1, completed: 1, pending: 0 });
+    expect(sleep.mock.calls).toEqual([[250]]);
     sleep.mockClear();
     await block(await seedSession('pace-d'), 0, 0, { type: 'text' });
     await block(await seedSession('pace-e'), 0, 0, { type: 'text' });

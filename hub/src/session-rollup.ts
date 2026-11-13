@@ -11,6 +11,8 @@ export interface RollupLimits {
   pagePauseMs: number;
 }
 
+/** Engine clamp on a page; the admin API's accepted range uses the same bound. */
+export const MAX_ROLLUP_PAGE_SIZE = 500;
 export const DEFAULT_ROLLUP_LIMITS: RollupLimits = { maxPages: 80, maxBlocks: 20_000, pageSize: 250, pagePauseMs: 0 };
 
 /** How a pass waits between pages and how long it may run. A mutable object so tests can replace
@@ -126,7 +128,7 @@ export async function runSessionRollup(
   const limits: RollupLimits = {
     maxPages: positiveInteger(options.maxPages ?? DEFAULT_ROLLUP_LIMITS.maxPages, 'maxPages'),
     maxBlocks: positiveInteger(options.maxBlocks ?? DEFAULT_ROLLUP_LIMITS.maxBlocks, 'maxBlocks'),
-    pageSize: Math.min(500, positiveInteger(options.pageSize ?? DEFAULT_ROLLUP_LIMITS.pageSize, 'pageSize')),
+    pageSize: Math.min(MAX_ROLLUP_PAGE_SIZE, positiveInteger(options.pageSize ?? DEFAULT_ROLLUP_LIMITS.pageSize, 'pageSize')),
     pagePauseMs: nonNegativeInteger(options.pagePauseMs ?? DEFAULT_ROLLUP_LIMITS.pagePauseMs, 'pagePauseMs'),
   };
   const result: SessionRollupResult = {
@@ -135,13 +137,6 @@ export async function runSessionRollup(
   };
   const failedSessions: string[] = [];
   while (result.pages < limits.maxPages && result.examined < limits.maxBlocks) {
-    // Least recently attempted, not lowest session id: unfinished sessions rotate fairly.
-    const checkpoint = await db.prepare(`SELECT session_id, generation, cursor_turn, cursor_block,
-      cursor_id, turn_state, last_attempt, finishing, commit_token FROM session_rollup_state
-      WHERE ${ELIGIBLE} AND session_id NOT IN (SELECT value FROM json_each(?1))
-      ORDER BY last_attempt, session_id LIMIT 1`)
-      .bind(JSON.stringify(failedSessions)).first<Checkpoint>();
-    if (!checkpoint) break;
     if (result.pages > 0) {
       const elapsed = Date.now() - started;
       if (elapsed + limits.pagePauseMs > ROLLUP_PACING.maxPassMs) {
@@ -149,9 +144,17 @@ export async function runSessionRollup(
           ms: elapsed, pages: result.pages, max_pass_ms: ROLLUP_PACING.maxPassMs }));
         break;
       }
-      // A checkpoint read before the pause stays safe: every commit is guarded by its cursor.
+      // Pause BEFORE choosing the next checkpoint, so a concurrent pass cannot advance it while
+      // this one sleeps and turn the page's D1 reads into superseded work.
       if (limits.pagePauseMs > 0) await ROLLUP_PACING.sleep(limits.pagePauseMs);
     }
+    // Least recently attempted, not lowest session id: unfinished sessions rotate fairly.
+    const checkpoint = await db.prepare(`SELECT session_id, generation, cursor_turn, cursor_block,
+      cursor_id, turn_state, last_attempt, finishing, commit_token FROM session_rollup_state
+      WHERE ${ELIGIBLE} AND session_id NOT IN (SELECT value FROM json_each(?1))
+      ORDER BY last_attempt, session_id LIMIT 1`)
+      .bind(JSON.stringify(failedSessions)).first<Checkpoint>();
+    if (!checkpoint) break;
     result.pages++;
     const trace: PageTrace = { stage: 'read' };
     try {

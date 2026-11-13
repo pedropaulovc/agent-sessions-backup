@@ -1,5 +1,5 @@
 import { logRollupOutcome, runSessionRollupPass, type RollupOutcome } from './cron/session-rollup';
-import { DEFAULT_ROLLUP_LIMITS, type RollupLimits, type SessionRollupResult } from './session-rollup';
+import { DEFAULT_ROLLUP_LIMITS, MAX_ROLLUP_PAGE_SIZE, type RollupLimits, type SessionRollupResult } from './session-rollup';
 
 // Queue invocations have a 15-minute wall-time limit. Never take an active attempt's work:
 // after 20 minutes its terminal result is unknown, so fail it rather than run a second pass.
@@ -24,7 +24,7 @@ interface RollupJobRow {
 const LIMIT_RANGES: Record<keyof RollupLimits, { min: number; max: number }> = {
   maxPages: { min: 1, max: DEFAULT_ROLLUP_LIMITS.maxPages },
   maxBlocks: { min: 1, max: DEFAULT_ROLLUP_LIMITS.maxBlocks },
-  pageSize: { min: 1, max: 500 },
+  pageSize: { min: 1, max: MAX_ROLLUP_PAGE_SIZE },
   pagePauseMs: { min: 0, max: 10_000 },
 };
 

@@ -143,8 +143,8 @@ may override any of these integers; omitted keys keep their defaults:
 Unknown keys, non-integers, and out-of-range values return `400 {"error":"invalid_options","detail":...}`;
 malformed JSON returns `400 {"error":"bad_json"}`. Neither creates a job. The effective options are echoed
 as `options` in the `202` response, carried in the queue message (so a redelivery runs the same bounds),
-and recorded as `result.options` in the finished job. `pagePauseMs` waits between consecutive pages, never
-before the first or after the last, to spread a pass's main-D1 load. Every pass, paced or not, stops before
+and recorded as `result.options` in the finished job. `pagePauseMs` waits before each page after the first,
+before choosing that page's checkpoint, to spread a pass's main-D1 load. Every pass, paced or not, stops before
 a page whose pause would carry it past 10 minutes of wall time, well inside the 20-minute attempt lease;
 the rest stays pending and the stop is logged as `hub.session_rollup.time_budget`. For example, a slow
 drain: `-H 'content-type: application/json' -d '{"maxPages":20,"pagePauseMs":5000}'`.
