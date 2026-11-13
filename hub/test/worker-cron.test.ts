@@ -256,13 +256,18 @@ describe('scheduled handler', () => {
     // same 10-second window fails with it too unless the chain waits the window out.
     const OVERLOAD = 'D1_ERROR: D1 DB is overloaded. Too many resources consumed within a 10 second window.';
 
-    /** Fires the daily cron with the first query matching `marker` (pricing's by default) throwing
-     * `errorFor(hit)` on the hits it returns a message for, and the real query otherwise. */
-    async function fireWithPricingErrors(errorFor: (hit: number) => string | undefined, marker = /usage_due_for_pricing/) {
+    type Injection = { step: string; marker: RegExp };
+    const PRICING: Injection = { step: 'pricing', marker: /usage_due_for_pricing/ };
+    const ROLLUP: Injection = { step: 'session_rollup', marker: /FROM\s+session_rollup_state\s+WHERE/ };
+
+    /** Fires the daily cron with the first query matching `target.marker` throwing `errorFor(hit)`
+     * on the hits it returns a message for, and the real query otherwise. `stepRuns` is the
+     * targeted step's own daily_step lines. */
+    async function fireWithQueryErrors(errorFor: (hit: number) => string | undefined, target: Injection = PRICING) {
       const realPrepare = testEnv.DB.prepare.bind(testEnv.DB);
       let hits = 0;
       const prepare = vi.spyOn(testEnv.DB, 'prepare').mockImplementation((sql: string) => {
-        if (marker.test(sql)) {
+        if (target.marker.test(sql)) {
           const message = errorFor(++hits);
           if (message) throw new Error(message);
         }
@@ -282,27 +287,28 @@ describe('scheduled handler', () => {
         logs.restore();
         errors.restore();
       }
-      const pricing = logs.lines.filter((o) => o.event === 'hub.cron.daily_step' && o.step === 'pricing');
       return {
         hits,
         sleeps,
         retries: logs.lines.filter((o) => o.event === 'hub.cron.daily_step_retry'),
-        pricing,
+        stepRuns: logs.lines.filter((o) => o.event === 'hub.cron.daily_step' && o.step === target.step),
         failed: errors.lines.filter((o) => o.event === 'hub.cron.daily_step_failed'),
         chain: logs.lines.filter((o) => o.event === 'hub.cron.daily_step' && o.step !== 'staging_prune'),
+        rollupStarts: logs.lines.filter((o) => o.event === 'hub.session_rollup.started' && o.trigger === 'scheduled'),
+        rollupRuns: logs.lines.filter((o) => o.event === 'hub.session_rollup.run' && o.trigger === 'scheduled'),
       };
     }
 
     it('waits out the window and retries the step once, which then succeeds', async () => {
       await testEnv.DB.prepare('UPDATE usage SET input_tokens = 1000000 WHERE session_id = ?1').bind('cron-sess').run();
-      const run = await fireWithPricingErrors((hit) => (hit === 1 ? OVERLOAD : undefined));
+      const run = await fireWithQueryErrors((hit) => (hit === 1 ? OVERLOAD : undefined));
 
       expect(run.hits, 'the overloaded step was not run a second time').toBe(2);
       expect(run.retries).toEqual([
         { event: 'hub.cron.daily_step_retry', step: 'pricing', ms: expect.any(Number), error: OVERLOAD, backoff_ms: 11_000 },
       ]);
       expect(run.sleeps).toEqual([11_000]);
-      expect(run.pricing.map((o) => o.outcome)).toEqual(['ok']);
+      expect(run.stepRuns.map((o) => o.outcome)).toEqual(['ok']);
       expect(run.failed).toEqual([]);
       expect(run.chain.map((o) => [o.step, o.outcome])).toEqual(D1_CHAIN.map((step) => [step, 'ok']));
       const row = await testEnv.DB.prepare('SELECT usd FROM usage WHERE session_id = ?1')
@@ -312,12 +318,12 @@ describe('scheduled handler', () => {
     });
 
     it('fails the step when the retry is overloaded too, and runs the rest of the chain', async () => {
-      const run = await fireWithPricingErrors(() => OVERLOAD);
+      const run = await fireWithQueryErrors(() => OVERLOAD);
 
       expect(run.hits, 'an overloaded step must be retried exactly once').toBe(2);
       expect(run.retries.map((o) => o.step)).toEqual(['pricing']);
       expect(run.sleeps).toEqual([11_000]);
-      expect(run.pricing.map((o) => o.outcome)).toEqual(['failed']);
+      expect(run.stepRuns.map((o) => o.outcome)).toEqual(['failed']);
       expect(run.failed).toEqual([
         { event: 'hub.cron.daily_step_failed', step: 'pricing', ms: expect.any(Number), error: OVERLOAD },
       ]);
@@ -328,22 +334,25 @@ describe('scheduled handler', () => {
 
     it('does not retry any other error', async () => {
       const other = 'D1_ERROR: no such table: usage_due_for_pricing';
-      const run = await fireWithPricingErrors(() => other);
+      const run = await fireWithQueryErrors(() => other);
 
       expect(run.hits).toBe(1);
       expect(run.retries).toEqual([]);
       expect(run.sleeps).toEqual([]);
-      expect(run.pricing.map((o) => o.outcome)).toEqual(['failed']);
+      expect(run.stepRuns.map((o) => o.outcome)).toEqual(['failed']);
       expect(run.failed.map((o) => [o.step, o.error])).toEqual([['pricing', other]]);
     });
 
     it('retries the session rollup step on an overload escaping the pass', async () => {
       // runScheduledSessionRollup must rethrow the pass error unprefixed, or the overload
       // classifier stops recognising it and rollup is never retried.
-      const run = await fireWithPricingErrors((hit) => (hit === 1 ? OVERLOAD : undefined), /FROM\s+session_rollup_state\s+WHERE/);
+      const run = await fireWithQueryErrors((hit) => (hit === 1 ? OVERLOAD : undefined), ROLLUP);
 
       expect(run.retries.map((o) => [o.step, o.error])).toEqual([['session_rollup', OVERLOAD]]);
       expect(run.sleeps).toEqual([11_000]);
+      expect(run.rollupStarts, 'the retried rollup pass did not run again').toHaveLength(2);
+      expect(run.rollupRuns.map((o) => o.outcome)).toEqual(['complete']);
+      expect(run.stepRuns.map((o) => o.outcome)).toEqual(['ok']);
       expect(run.failed).toEqual([]);
       expect(run.chain.map((o) => [o.step, o.outcome])).toEqual(D1_CHAIN.map((step) => [step, 'ok']));
     });
