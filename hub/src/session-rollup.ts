@@ -7,7 +7,8 @@ export interface RollupLimits {
   maxPages: number;
   maxBlocks: number;
   pageSize: number;
-  /** Pause between consecutive pages, so a pass spreads its main-D1 load over time. */
+  /** Pause before each page after the first, before choosing its checkpoint, so a pass spreads its
+   * main-D1 load. A pass that runs out of work therefore pauses once more before noticing. */
   pagePauseMs: number;
 }
 
@@ -136,12 +137,12 @@ export async function runSessionRollup(
     options: limits,
   };
   const failedSessions: string[] = [];
+  let budgetStopMs: number | null = null;
   while (result.pages < limits.maxPages && result.examined < limits.maxBlocks) {
     if (result.pages > 0) {
       const elapsed = Date.now() - started;
       if (elapsed + limits.pagePauseMs > ROLLUP_PACING.maxPassMs) {
-        console.log(JSON.stringify({ event: 'hub.session_rollup.time_budget', ...options.run,
-          ms: elapsed, pages: result.pages, max_pass_ms: ROLLUP_PACING.maxPassMs }));
+        budgetStopMs = elapsed;
         break;
       }
       // Pause BEFORE choosing the next checkpoint, so a concurrent pass cannot advance it while
@@ -179,6 +180,11 @@ export async function runSessionRollup(
   result.pending = (await db.prepare(`SELECT COUNT(*) AS n FROM session_rollup_state
     WHERE ${ELIGIBLE}`).first<{ n: number }>())?.n ?? 0;
   result.remaining = result.pending > 0 ? 'pending' : 'complete';
+  // Only a stop that actually left work behind is a budget stop worth resubmitting for.
+  if (budgetStopMs !== null && result.pending > 0) {
+    console.log(JSON.stringify({ event: 'hub.session_rollup.time_budget', ...options.run,
+      ms: budgetStopMs, pages: result.pages, pending: result.pending, max_pass_ms: ROLLUP_PACING.maxPassMs }));
+  }
   return result;
 }
 

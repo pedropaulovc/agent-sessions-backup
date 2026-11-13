@@ -146,7 +146,8 @@ as `options` in the `202` response, carried in the queue message (so a redeliver
 and recorded as `result.options` in the finished job. `pagePauseMs` waits before each page after the first,
 before choosing that page's checkpoint, to spread a pass's main-D1 load. Every pass, paced or not, stops before
 a page whose pause would carry it past 10 minutes of wall time, well inside the 20-minute attempt lease;
-the rest stays pending and the stop is logged as `hub.session_rollup.time_budget`. For example, a slow
+the rest stays pending and, when work is in fact left, the stop is logged as `hub.session_rollup.time_budget`.
+A pass that runs out of work pauses once more before noticing. For example, a slow
 drain: `-H 'content-type: application/json' -d '{"maxPages":20,"pagePauseMs":5000}'`.
 
 Poll until `status` is `complete`, `partial`, or `failed`; `queued` and `running` are nonterminal.

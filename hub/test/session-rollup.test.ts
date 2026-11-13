@@ -395,9 +395,14 @@ describe('rollup page telemetry and pacing', () => {
     try {
       expect(await runSessionRollup(testEnv, { pagePauseMs: 250, run }))
         .toMatchObject({ pages: 1, completed: 1, pending: 1, remaining: 'pending' });
+      expect(events(logs, 'hub.session_rollup.time_budget')).toEqual([{ event: 'hub.session_rollup.time_budget',
+        ...run, ms: expect.any(Number), pages: 1, pending: 1, max_pass_ms: 100 }]);
+      logs.mockClear();
+      // The same stop with nothing left after the page is not a budget stop.
+      expect(await runSessionRollup(testEnv, { pagePauseMs: 250, run }))
+        .toMatchObject({ pages: 1, completed: 1, pending: 0, remaining: 'complete' });
+      expect(events(logs, 'hub.session_rollup.time_budget')).toEqual([]);
     } finally { ROLLUP_PACING.maxPassMs = budget; }
     expect(sleep).not.toHaveBeenCalled();
-    expect(events(logs, 'hub.session_rollup.time_budget')).toEqual([{ event: 'hub.session_rollup.time_budget',
-      ...run, ms: expect.any(Number), pages: 1, max_pass_ms: 100 }]);
   });
 });
