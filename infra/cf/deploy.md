@@ -1281,17 +1281,20 @@ and the standalone `health` command, wait for edge convergence: they pass only a
 **three consecutive** strict matches two seconds apart; a payload mismatch resets the
 streak, logs `wait=converging failure=mismatch reads=N elapsed_ms=M` to stderr, and
 is retried for at most 180 seconds, after which the gate fails with
-`failure=mismatch attempts=<reads> waited_ms=<ms>`. Transport (after the three
+`failure=<latest read: mismatch, or unstable when its streak was cut short> reads=<reads> waited_ms=<ms>`. Transport (after the three
 attempts above), HTTP and JSON failures still fail these gates at once, since rollout
 lag only explains a mismatch; the standalone `health` command keeps retrying any
-failure for 180 seconds, as it always has. Every LATER gate in that process is a
-strict single read: after convergence, a mismatch means the revision changed under
-the work (a concurrent deploy or rollback) and fails closed. `seed-catalog` and
+failure for 180 seconds, as it always has. Three matches make convergence likely, not
+certain, so a gate in that process within 60 seconds of the first wait ending waits
+the same way; after that settle window every gate is a strict single read: a mismatch
+then means the revision changed under the work (a concurrent deploy or rollback) and
+fails closed. `seed-catalog` and
 `ready` run behind the durable 16-minute drain, so all of their gates are strict.
 
 Health errors emit only `operation=revision-gate`, an allowlisted command and mode,
-`failure=transport|http|json|mismatch`, safe actual HTTP status (or `unknown`),
-attempt count, and (after a convergence wait) `waited_ms`. Each convergence-wait
+`failure=transport|http|json|mismatch`, safe actual HTTP status (or `unknown`), and
+per-read attempt count; a convergence wait's exhaustion error instead reports the
+latest read's `failure` (or `unstable`), its HTTP status, `reads`, and `waited_ms`. Each convergence-wait
 stderr line carries only the same allowlisted command and mode, `wait=converging`,
 `failure`, `reads`, and `elapsed_ms`. Raw URLs, headers, response bodies, exception messages, stacks, and
 nested causes are not logged. Exhaustion leaves the source authoritative and the

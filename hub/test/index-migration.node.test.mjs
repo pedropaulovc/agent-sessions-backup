@@ -8241,7 +8241,13 @@ test('a deploy gate passes only on a stable converged revision, waits out lag, a
   reset();
   serve(Array(10).fill('rev-old'));
   await assert.rejects(gate({ deadlineMs: 5000 }), {
-    message: 'health operation=revision-gate command=reconcile-catalog mode=active failure=mismatch HTTP=200 attempts=3 waited_ms=4000',
+    message: 'health operation=revision-gate command=reconcile-catalog mode=active failure=mismatch HTTP=200 reads=3 waited_ms=4000',
+  });
+  // A streak the deadline cuts short reports the latest read's outcome, not an earlier failure.
+  reset();
+  serve(['rev-old', 'rev-new', 'rev-new', 'rev-new']);
+  await assert.rejects(gate({ deadlineMs: 5000 }), {
+    message: 'health operation=revision-gate command=reconcile-catalog mode=active failure=unstable HTTP=200 reads=3 waited_ms=4000',
   });
 
   // Rollout lag only explains a mismatch: an HTTP failure is not waited out by a gate...
@@ -8257,7 +8263,7 @@ test('a deploy gate passes only on a stable converged revision, waits out lag, a
   assert.equal(reads(), 4);
 });
 
-test('only a process\'s first gate waits for convergence; later gates and post-drain commands fail closed', async (context) => {
+test('a converge-first gate tolerates rollout lag until its settle window ends, then fails closed; strict never waits', async (context) => {
   const config = { vars: { VIEWER_HOST: 'viewer.example.test', DEPLOYMENT_REVISION: 'rev-new' } };
   const live = (revision) => Response.json({
     ok: true, environment: 'production', indexMode: 'active', deploymentRevision: revision, indexShardCount: 16,
@@ -8278,7 +8284,13 @@ test('only a process\'s first gate waits for convergence; later gates and post-d
   queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');
   assert.equal((await gate()).deploymentRevision, 'rev-new');
   assert.equal(queue.length, 0);
-  // ...but once converged, the revision changing under the work fails closed on one read.
+  // ...and a residual stale read inside the 60 s settle window is still rollout lag...
+  clock += 10000;
+  queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');
+  assert.equal((await gate()).deploymentRevision, 'rev-new');
+  assert.equal(queue.length, 0);
+  // ...but after it, the revision changing under the work fails closed on one read.
+  clock += 60000;
   queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');
   await assert.rejects(gate(), { message: mismatch });
   assert.equal(queue.length, 3);

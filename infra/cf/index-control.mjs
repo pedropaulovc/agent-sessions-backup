@@ -538,6 +538,7 @@ export async function awaitHealth(config, mode, {
   let last;
   for (;;) {
     let value;
+    last = undefined;
     try {
       value = await health(config, mode, { command });
     } catch (error) {
@@ -553,28 +554,39 @@ export async function awaitHealth(config, mode, {
         + ` mode=${mode === 'active' ? 'active' : 'maintenance'} wait=converging failure=${last?.failure ?? 'unknown'}`
         + ` reads=${reads} elapsed_ms=${elapsed}`);
     }
-    if (elapsed + intervalMs > deadlineMs) {
-      // A streak cut short by the deadline is still unproven convergence.
-      const error = healthFailure(command, mode, last?.failure ?? 'mismatch', reads, last?.status);
-      error.message += ` waited_ms=${elapsed}`;
-      throw error;
+    if (elapsed + intervalMs <= deadlineMs) {
+      await wait(intervalMs);
+      continue;
     }
-    await wait(intervalMs);
+    // A non-health error (retry 'any' only) is rethrown as it was raised.
+    if (last && last.failure === undefined) throw last;
+    // The LATEST read's outcome: a streak cut short by the deadline is `unstable`, not a failure
+    // kind from an earlier read. `reads` counts outer reads; `attempts` stays the inner
+    // per-read attempt count everywhere else.
+    const failure = last?.failure ?? 'unstable';
+    const status = last ? last.status : 200;
+    throw Object.assign(new Error(`health operation=revision-gate command=${safeHealthCommand(command)}`
+      + ` mode=${mode === 'active' ? 'active' : 'maintenance'} failure=${failure}`
+      + ` HTTP=${Number.isInteger(status) && status >= 100 && status <= 599 ? status : 'unknown'}`
+      + ` reads=${reads} waited_ms=${elapsed}`), { failure, status });
   }
 }
 
-/** The gate for one CLI process. Rollout lag only exists right after a deploy, so only the
- * process's FIRST gate waits for convergence (`awaitHealth`); once a stable streak has been seen,
- * any later mismatch is evidence the revision changed under the work (a concurrent deploy or a
- * rollback) and every later gate is a strict single read that fails closed. `policy: 'strict'`
- * skips the wait entirely, for commands that only run after convergence was already established
+/** The gate for one CLI process. Rollout lag only exists right after a deploy, so a
+ * 'converge-first' gate waits for convergence (`awaitHealth`) on its first call AND on any call
+ * within `settleMs` (default 60 s) of the end of that wait: three matching reads make convergence
+ * likely, not certain, and a residual stale read seconds later is still rollout lag (reconcile and
+ * verify-active run seconds after `wrangler deploy`; failing there would roll the cutover back).
+ * After the settle window, a mismatch is evidence the revision changed under the work (a
+ * concurrent deploy or a rollback) and every gate is a strict single read that fails closed.
+ * `policy: 'strict'` never waits, for commands that only run after convergence was established
  * by an earlier process (seed-catalog and ready run behind the durable 16-minute drain). */
-export function revisionGate(config, mode, command, policy, options = {}) {
-  let converged = policy === 'strict';
+export function revisionGate(config, mode, command, policy, { settleMs = 60000, now = Date.now, ...options } = {}) {
+  let convergedAt = policy === 'strict' ? -Infinity : null;
   return async () => {
-    if (converged) return await health(config, mode, { command });
-    const value = await awaitHealth(config, mode, { command, ...options });
-    converged = true;
+    if (convergedAt !== null && now() - convergedAt >= settleMs) return await health(config, mode, { command });
+    const value = await awaitHealth(config, mode, { command, now, ...options });
+    convergedAt ??= now();
     return value;
   };
 }
