@@ -1290,8 +1290,10 @@ the work (a concurrent deploy or rollback) and fails closed. `seed-catalog` and
 `ready` run behind the durable 16-minute drain, so all of their gates are strict.
 
 Health errors emit only `operation=revision-gate`, an allowlisted command and mode,
-`failure=transport|http|json|mismatch`, safe actual HTTP status (or `unknown`), and
-attempt count. Raw URLs, headers, response bodies, exception messages, stacks, and
+`failure=transport|http|json|mismatch`, safe actual HTTP status (or `unknown`),
+attempt count, and (after a convergence wait) `waited_ms`. Each convergence-wait
+stderr line carries only the same allowlisted command and mode, `wait=converging`,
+`failure`, `reads`, and `elapsed_ms`. Raw URLs, headers, response bodies, exception messages, stacks, and
 nested causes are not logged. Exhaustion leaves the source authoritative and the
 unacknowledged copy page/checkpoint intact; a later protected pass revalidates that
 durable work. This policy and its local CLI/native-SQLite regressions neither
