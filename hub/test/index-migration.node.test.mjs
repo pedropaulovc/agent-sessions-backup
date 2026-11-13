@@ -8289,6 +8289,11 @@ test('a converge-first gate tolerates rollout lag until its settle window ends, 
   queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');
   assert.equal((await gate()).deploymentRevision, 'rev-new');
   assert.equal(queue.length, 0);
+  // ...while a gate whose read already matches inside the window costs just that read.
+  queue.push('rev-new', 'rev-old');
+  assert.equal((await gate()).deploymentRevision, 'rev-new');
+  assert.equal(queue.length, 1);
+  queue.length = 0;
   // ...but after it, the revision changing under the work fails closed on one read.
   clock += 60000;
   queue.push('rev-old', 'rev-new', 'rev-new', 'rev-new');

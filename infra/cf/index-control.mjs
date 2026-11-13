@@ -475,10 +475,18 @@ function safeHealthCommand(command) {
     .includes(command) ? command : 'unknown';
 }
 
-function healthFailure(command, mode, failure, attempts, status) {
-  const error = new Error(`health operation=revision-gate command=${safeHealthCommand(command)} mode=${mode === 'active' ? 'active' : 'maintenance'}`
-    + ` failure=${failure} HTTP=${Number.isInteger(status) && status >= 100 && status <= 599 ? status : 'unknown'}`
-    + ` attempts=${attempts}`);
+/** The one allowlisted revision-gate log prefix and status sanitizer (deploy.md documents them). */
+function healthPrefix(command, mode) {
+  return `health operation=revision-gate command=${safeHealthCommand(command)} mode=${mode === 'active' ? 'active' : 'maintenance'}`;
+}
+
+function safeStatus(status) {
+  return Number.isInteger(status) && status >= 100 && status <= 599 ? status : 'unknown';
+}
+
+/** `count` is `attempts=N` (inner per-read attempts) or `reads=N waited_ms=M` (a convergence wait). */
+function healthFailure(command, mode, failure, attempts, status, count = `attempts=${attempts}`) {
+  const error = new Error(`${healthPrefix(command, mode)} failure=${failure} HTTP=${safeStatus(status)} ${count}`);
   error.failure = failure;
   error.status = status;
   return error;
@@ -550,8 +558,7 @@ export async function awaitHealth(config, mode, {
     if (streak >= stableReads) return value;
     const elapsed = now() - started;
     if (value === undefined) {
-      console.error(`health operation=revision-gate command=${safeHealthCommand(command)}`
-        + ` mode=${mode === 'active' ? 'active' : 'maintenance'} wait=converging failure=${last?.failure ?? 'unknown'}`
+      console.error(`${healthPrefix(command, mode)} wait=converging failure=${last?.failure ?? 'unknown'}`
         + ` reads=${reads} elapsed_ms=${elapsed}`);
     }
     if (elapsed + intervalMs <= deadlineMs) {
@@ -564,30 +571,35 @@ export async function awaitHealth(config, mode, {
     // kind from an earlier read. `reads` counts outer reads; `attempts` stays the inner
     // per-read attempt count everywhere else.
     const failure = last?.failure ?? 'unstable';
-    const status = last ? last.status : 200;
-    throw Object.assign(new Error(`health operation=revision-gate command=${safeHealthCommand(command)}`
-      + ` mode=${mode === 'active' ? 'active' : 'maintenance'} failure=${failure}`
-      + ` HTTP=${Number.isInteger(status) && status >= 100 && status <= 599 ? status : 'unknown'}`
-      + ` reads=${reads} waited_ms=${elapsed}`), { failure, status });
+    throw healthFailure(command, mode, failure, null, last ? last.status : 200, `reads=${reads} waited_ms=${elapsed}`);
   }
 }
 
 /** The gate for one CLI process. Rollout lag only exists right after a deploy, so a
- * 'converge-first' gate waits for convergence (`awaitHealth`) on its first call AND on any call
- * within `settleMs` (default 60 s) of the end of that wait: three matching reads make convergence
- * likely, not certain, and a residual stale read seconds later is still rollout lag (reconcile and
- * verify-active run seconds after `wrangler deploy`; failing there would roll the cutover back).
- * After the settle window, a mismatch is evidence the revision changed under the work (a
- * concurrent deploy or a rollback) and every gate is a strict single read that fails closed.
- * `policy: 'strict'` never waits, for commands that only run after convergence was established
- * by an earlier process (seed-catalog and ready run behind the durable 16-minute drain). */
+ * 'converge-first' gate waits for convergence (`awaitHealth`) on its first call. Within `settleMs`
+ * (default 60 s) of that wait ending, three matching reads made convergence likely, not certain:
+ * a later gate reads once and, only if that read is a revision mismatch (residual rollout lag),
+ * waits for convergence again; reconcile and verify-active run seconds after `wrangler deploy`,
+ * where failing would roll the cutover back. After the settle window, a mismatch is evidence the
+ * revision changed under the work (a concurrent deploy or a rollback) and every gate is a strict
+ * single read that fails closed. `policy: 'strict'` never waits, for commands that only run after
+ * convergence was established by an earlier process (seed-catalog and ready run behind the
+ * durable 16-minute drain). */
 export function revisionGate(config, mode, command, policy, { settleMs = 60000, now = Date.now, ...options } = {}) {
   let convergedAt = policy === 'strict' ? -Infinity : null;
   return async () => {
-    if (convergedAt !== null && now() - convergedAt >= settleMs) return await health(config, mode, { command });
-    const value = await awaitHealth(config, mode, { command, now, ...options });
-    convergedAt ??= now();
-    return value;
+    if (convergedAt === null) {
+      const value = await awaitHealth(config, mode, { command, now, ...options });
+      convergedAt = now();
+      return value;
+    }
+    if (now() - convergedAt >= settleMs) return await health(config, mode, { command });
+    try {
+      return await health(config, mode, { command });
+    } catch (error) {
+      if (error?.failure !== 'mismatch') throw error;
+      return await awaitHealth(config, mode, { command, now, ...options });
+    }
   };
 }
 
