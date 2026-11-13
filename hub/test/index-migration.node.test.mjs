@@ -21,7 +21,7 @@ import {
   STAR_CATALOG_COLUMNS, indexIdBase, indexShardForSessionId,
 } from '../src/index-layout.mjs';
 import {
-  CopyPassBudgetExhausted, cloudflareRetryDelay, createCopyPassRequestGate, indexControlClient,
+  CopyPassBudgetExhausted, awaitHealth, cloudflareRetryDelay, createCopyPassRequestGate, indexControlClient,
   pauseConsumers, requireProtectedProduction, runCopyPass, verifyActiveIndex, verifyReadyIndex,
 } from '../../infra/cf/index-control.mjs';
 import { PREVIEW_ACCOUNT_ID, PRODUCTION_ACCOUNT_ID } from '../../infra/cf/preview-trust.mjs';
@@ -8201,4 +8201,34 @@ test('importing a completed unfenced copy keeps its sealed READY and ACTIVATION 
   await writeCopyCheckpoint(f.shards[0], { ...completed, sha256: '0'.repeat(64) }, generation);
   const changed = await proofs();
   assert.throws(() => assertActivationProof({ ...imported, ...changed }), /proof/);
+});
+
+test('an active-mode gate waits for the edge to converge on the deployed revision, and only that long', async (context) => {
+  // Production run 43492395254: `health` saw the new revision, then reconcile-catalog's first gate
+  // read the previous one 0.2 s later and failed the deploy.
+  const config = { vars: { VIEWER_HOST: 'viewer.example.test', DEPLOYMENT_REVISION: 'rev-new' } };
+  const live = (revision) => Response.json({
+    ok: true, environment: 'production', indexMode: 'active', deploymentRevision: revision, indexShardCount: 16,
+  });
+  const realFetch = globalThis.fetch;
+  context.after(() => { globalThis.fetch = realFetch; });
+
+  let served = ['rev-old', 'rev-old', 'rev-new'];
+  globalThis.fetch = async () => live(served.shift());
+  let clock = 0;
+  const waits = [];
+  const wait = async (ms) => { waits.push(ms); clock += ms; };
+  const value = await awaitHealth(config, 'active', { command: 'reconcile-catalog', wait, now: () => clock });
+  assert.equal(value.deploymentRevision, 'rev-new');
+  assert.deepEqual(waits, [2000, 2000]);
+
+  // A revision that never converges still fails closed, with the strict mismatch diagnostic.
+  globalThis.fetch = async () => live('rev-old');
+  clock = 0;
+  waits.length = 0;
+  await assert.rejects(
+    awaitHealth(config, 'active', { command: 'reconcile-catalog', deadlineMs: 5000, wait, now: () => clock }),
+    { message: 'health operation=revision-gate command=reconcile-catalog mode=active failure=mismatch HTTP=200 attempts=1' },
+  );
+  assert.deepEqual(waits, [2000, 2000, 2000]);
 });

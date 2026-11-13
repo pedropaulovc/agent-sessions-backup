@@ -512,6 +512,20 @@ async function health(config, mode, { command, requestGate } = {}) {
   }
 }
 
+/** A deploy rolls the new Worker version out across Cloudflare's edge over seconds, so one
+ * /healthz read can still reach the previous revision right after a check that saw the new one
+ * (production run 43492395254: `health` passed, then reconcile-catalog's gate read the old
+ * revision 0.2 s later and failed the deploy). Active-mode gates therefore wait, bounded, for the
+ * live revision to converge instead of failing on the first lagging read. Every attempt is still
+ * the full strict check; nothing proceeds on a mismatch. */
+export async function awaitHealth(config, mode, { command, deadlineMs = 180000, wait = sleep, now = Date.now } = {}) {
+  const deadline = now() + deadlineMs;
+  for (;;) {
+    try { return await health(config, mode, { command }); }
+    catch (error) { if (now() >= deadline) throw error; await wait(2000); }
+  }
+}
+
 /** Safe native GET schema facts only; this projection never authorizes deletion. */
 export function queueConsumerIdentityFacts(consumer) {
   const workerName = (value) => typeof value === 'string' && /^[a-zA-Z0-9_-]{1,63}$/.test(value)
@@ -636,11 +650,8 @@ async function main() {
   }
   if (command === 'health') {
     if (!['maintenance', 'active'].includes(args.mode)) throw new Error('health requires --mode maintenance|active');
-    const deadline = Date.now() + 180000;
-    for (;;) {
-      try { console.log(JSON.stringify(await health(config, args.mode, { command }))); return; }
-      catch (error) { if (Date.now() >= deadline) throw error; await sleep(2000); }
-    }
+    console.log(JSON.stringify(await awaitHealth(config, args.mode, { command })));
+    return;
   }
   const source = api.db(config.d1_databases[0].database_id);
   const shards = config.d1_databases.slice(1).map((db) => api.db(db.database_id));
@@ -662,9 +673,9 @@ async function main() {
     return;
   }
   if (command === 'reconcile-catalog') {
-    await health(config, 'active', { command });
+    await awaitHealth(config, 'active', { command });
     const result = await reconcileIndexCatalog({ source, shards });
-    await health(config, 'active', { command });
+    await awaitHealth(config, 'active', { command });
     console.log(JSON.stringify(result));
     return;
   }
@@ -683,7 +694,7 @@ async function main() {
   if (command === 'verify-active') {
     const result = await verifyActiveIndex({
       source, shards, revision: config.vars.DEPLOYMENT_REVISION, cycle,
-      gate: async () => await health(config, 'active', { command }),
+      gate: async () => await awaitHealth(config, 'active', { command }),
       login: async () => {
         const response = await fetch(`https://${config.vars.VIEWER_HOST}/login`, {
           redirect: 'error', signal: AbortSignal.timeout(30000),
