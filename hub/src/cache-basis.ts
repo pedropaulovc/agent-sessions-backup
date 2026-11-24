@@ -12,6 +12,8 @@ export const CACHE_BASIS_BY_HARNESS: Readonly<Record<string, CacheBasis>> = {
   omp: 'disjoint',
   'claude-code': 'disjoint',
   codex: 'subset',
+  agy: 'disjoint',
+  antigravity: 'disjoint',
 };
 
 export function cacheBasisForHarness(harness: string | null | undefined): CacheBasis | null {

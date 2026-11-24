@@ -133,6 +133,11 @@ describe('computeFirstInteractionTitle', () => {
       computeFirstInteractionTitle(turns('<command-message>run the &lt;thing&gt;</command-message>')),
     ).toBe('run the <thing>');
     expect(computeFirstInteractionTitle(turns('<task>\ndo the work\n</task>'))).toBe('do the work');
+    expect(
+      computeFirstInteractionTitle(
+        turns('<USER_REQUEST>\nadd agy support\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\ntime\n</ADDITIONAL_METADATA>'),
+      ),
+    ).toBe('add agy support');
   });
 
   it('does not treat <taskboard> as a <task> element', () => {

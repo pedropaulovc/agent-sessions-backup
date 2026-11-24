@@ -2,6 +2,7 @@ import { indexDbFor } from '../index-shards';
 import { jsonlLineLimit, readJsonlLines } from '../ingest/jsonl';
 import { isWebHarness } from '../ingest/parse';
 import type { NormalizedBlock, NormalizedSession, NormalizedTurn } from '../ingest/normalize';
+import { parseAntigravity } from '../ingest/parsers/antigravity';
 import { parseChatgptWeb } from '../ingest/parsers/chatgpt-web';
 import { parseClaudeCode } from '../ingest/parsers/claude-code';
 import { parseClaudeWeb } from '../ingest/parsers/claude-web';
@@ -385,6 +386,7 @@ async function parseRange(
   const lines = readJsonlLines(obj.body, startByte ?? 0, jsonlLineLimit(harness));
   if (harness === 'codex') return parseCodex(lines, sessionId, 'render');
   if (harness === 'prompt-log') return parsePromptLog(lines, sessionId);
+  if (harness === 'agy' || harness === 'antigravity') return parseAntigravity(lines, sessionId, harness);
   return parseClaudeCode(lines, sessionId);
 }
 

@@ -138,6 +138,7 @@ function deriveTitle(text: string): string {
     nestedElementTitle(text, '<task-notification>', '<summary>', '</summary>') ??
     nestedElementTitle(text, '<command-message>', '<command-message>', '</command-message>') ??
     nestedElementTitle(text, '<task>', '<task>', '</task>') ??
+    nestedElementTitle(text, '<USER_REQUEST>', '<USER_REQUEST>', '</USER_REQUEST>') ??
     text.trim().slice(0, TITLE_LIMIT)
   );
 }

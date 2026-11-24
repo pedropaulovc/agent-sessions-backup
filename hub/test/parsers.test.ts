@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { MAX_CODEX_JSONL_LINE_BYTES, MAX_JSONL_LINE_BYTES, jsonlLineLimit, readJsonlLines, type JsonlLine } from '../src/ingest/jsonl';
 import { parseObject } from '../src/ingest/parse';
+import { parseAntigravity, workspaceUriToPath } from '../src/ingest/parsers/antigravity';
 import { parseClaudeCode } from '../src/ingest/parsers/claude-code';
 import { parseOmp } from '../src/ingest/parsers/omp';
 import { parseCodex } from '../src/ingest/parsers/codex';
@@ -602,6 +603,271 @@ describe('parseOmp', () => {
       parentSessionId: 'main123',
       kind: 'subagent',
     });
+  });
+});
+
+describe('parseAntigravity', () => {
+  const SESSION_ID = '1c8be7ee-bfa4-42b3-844c-13d71a0fca7a';
+  const PARENT_ID = 'acddf9c5-82cd-4381-ba1a-cbab335cbe13';
+  const CHILD_ID = '4297c3c4-5b32-4681-b021-c05c8457ea35';
+
+  it('detects agy and antigravity transcripts, subagent-meta, history.jsonl, and skips compact siblings', () => {
+    expect(
+      detect('agy', `brain/${SESSION_ID}/.system_generated/logs/transcript_full.jsonl`, 'amet-wsl'),
+    ).toEqual({ harness: 'agy', sessionId: SESSION_ID, kind: 'session' });
+    expect(
+      detect('antigravity', `brain/${SESSION_ID.toUpperCase()}/.system_generated/logs/transcript_full.jsonl`, 'amet-windows'),
+    ).toEqual({ harness: 'antigravity', sessionId: SESSION_ID, kind: 'session' });
+    // Compact sibling transcript.jsonl is stored raw as other so it never races canonical selection.
+    expect(
+      detect('agy', `brain/${SESSION_ID}/.system_generated/logs/transcript.jsonl`, 'amet-wsl'),
+    ).toEqual({ harness: 'unknown', kind: 'other' });
+    // Redundant chunks are not detected as sessions.
+    expect(
+      detect('agy', `brain/${SESSION_ID}/.system_generated/logs/chunks/transcript_full/00000000.jsonl`, 'amet-wsl'),
+    ).toEqual({ harness: 'unknown', kind: 'other' });
+    // Parent-side subagent descriptor leaves sessionId undefined so it never enters chooseCanonical.
+    expect(
+      detect('agy', `brain/${PARENT_ID}/.system_generated/subagents/${CHILD_ID}.json`, 'amet-windows'),
+    ).toEqual({ harness: 'agy', parentSessionId: PARENT_ID, kind: 'subagent-meta' });
+    // Store-root history.jsonl maps to a machine-scoped prompt-log; nested scratch/history.jsonl does not.
+    expect(detect('agy', 'history.jsonl', 'amet-wsl')).toEqual({
+      harness: 'prompt-log',
+      kind: 'prompt-log',
+      sessionId: 'promptlog:amet-wsl:agy',
+    });
+    expect(detect('agy', `brain/${SESSION_ID}/scratch/history.jsonl`, 'amet-wsl')).toEqual({
+      harness: 'unknown',
+      kind: 'other',
+    });
+  });
+
+  it('parses agy CLI steps, disjoint usage, FIFO tool pairing, recorded timing, checkpoint compaction, and subagent links', async () => {
+    const records = [
+      {
+        step_index: 0,
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        status: 'DONE',
+        created_at: '2026-11-24T22:10:42Z',
+        content:
+          '<USER_REQUEST>\ninvestigate gemini neon support\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nlocal time\n</ADDITIONAL_METADATA>',
+      },
+      {
+        step_index: 1,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-24T22:10:43Z',
+        model: 'gemini-4-neon-high',
+        input_tokens: 10716,
+        cache_read_tokens: 0,
+        output_tokens: 428,
+        thinking: 'Checking files and spawning a subagent.',
+        tool_calls: [
+          { name: 'run_command', args: { CommandLine: 'ls -la' } },
+          { name: 'invoke_subagent', args: { Role: 'Explorer', Prompt: 'Check docs' } },
+        ],
+      },
+      {
+        step_index: 2,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'DONE',
+        created_at: '2026-11-24T22:10:47Z',
+        content: 'Created At: 2026-11-24T14:10:47-08:00\nCompleted At: 2026-11-24T14:10:49-08:00\nCommand exited with code 0.\nREADME.md',
+      },
+      {
+        step_index: 3,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'DONE',
+        created_at: '2026-11-24T22:10:50Z',
+        content: `Created At: 2026-11-24T14:10:50-08:00\nCompleted At: 2026-11-24T14:10:51-08:00\nCreated the following subagent:\n{\n  "conversationId": "${CHILD_ID}"\n}`,
+      },
+      {
+        step_index: 4,
+        source: 'SYSTEM',
+        type: 'CHECKPOINT',
+        status: 'DONE',
+        created_at: '2026-11-24T22:11:00Z',
+        input_tokens: 5000,
+        cache_read_tokens: 10717,
+        output_tokens: 300,
+        content: '# Resuming from a compaction\nSummary of progress.',
+      },
+      {
+        step_index: 5,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-24T22:11:10Z',
+        model: 'gemini-4-neon-high',
+        input_tokens: 2144,
+        cache_read_tokens: 10717,
+        output_tokens: 357,
+        content: 'Investigation complete.',
+      },
+      {
+        step_index: 6,
+        source: 'MODEL',
+        type: 'GENERIC',
+        status: 'ERROR',
+        error: 'invalid ByteOffset',
+        created_at: '2026-11-24T22:11:15Z',
+        content: 'Created At: 2026-11-24T14:11:15-08:00\nCompleted At: 2026-11-24T14:11:15-08:00\nEncountered error: invalid ByteOffset',
+      },
+    ].map((r) => JSON.stringify(r));
+
+    const session = await parseAntigravity(readJsonlLines(toStream(records)), SESSION_ID, 'agy');
+    expect(session.harness).toBe('agy');
+    expect(session.title).toBe('investigate gemini neon support');
+    expect(session.primaryModel).toBe('gemini-4-neon-high');
+    expect(session.startedAt).toBe('2026-11-24T22:10:42.000Z');
+    expect(session.endedAt).toBe('2026-11-24T22:11:15.000Z');
+    expect(session.stats.parseErrorLines).toBe(0);
+    expect(session.turns).toHaveLength(7);
+
+    // Planner response blocks + tool call pairing
+    const planner = session.turns[1]!;
+    expect(planner.role).toBe('assistant');
+    expect(planner.usage).toEqual({
+      model: 'gemini-4-neon-high',
+      inputTokens: 10716,
+      outputTokens: 428,
+      reasoningTokens: undefined,
+      cacheReadTokens: 0,
+      cacheCreation5mTokens: undefined,
+    });
+    expect(planner.blocks.map((b) => b.type)).toEqual(['thinking', 'tool_use', 'tool_use']);
+    const call0 = planner.blocks[1]!;
+    const call1 = planner.blocks[2]!;
+
+    const res0 = session.turns[2]!.blocks[0]!;
+    expect(res0.type).toBe('tool_result');
+    expect(res0.toolName).toBe('run_command');
+    expect(res0.toolCallKey).toBe(call0.toolCallKey);
+    expect(res0.timing).toEqual({
+      startMs: Date.parse('2026-11-24T14:10:47-08:00'),
+      endMs: Date.parse('2026-11-24T14:10:49-08:00'),
+    });
+
+    const res1 = session.turns[3]!.blocks[0]!;
+    expect(res1.toolName).toBe('invoke_subagent');
+    expect(res1.toolCallKey).toBe(call1.toolCallKey);
+    expect(res1.subagentSessionId).toBe(CHILD_ID);
+
+    // Checkpoint compaction retains usage and inherits lastModel
+    const checkpoint = session.turns[4]!;
+    expect(checkpoint.compaction?.kind).toBe('claude-compact');
+    expect(checkpoint.usage?.model).toBe('gemini-4-neon-high');
+    expect(checkpoint.usage?.cacheReadTokens).toBe(10717);
+
+    // Error tool step sets isError
+    expect(session.turns[6]!.isError).toBe(true);
+    expect(session.turns[6]!.blocks[0]!.isError).toBe(true);
+  });
+
+  it('parses Antigravity App transcripts (without model/usage) and skips CONVERSATION_HISTORY', async () => {
+    const records = [
+      {
+        step_index: 0,
+        source: 'USER_EXPLICIT',
+        type: 'USER_INPUT',
+        status: 'DONE',
+        created_at: '2026-06-18T13:52:34Z',
+        content: '<USER_REQUEST>\nremove photo glare\n</USER_REQUEST>',
+      },
+      { step_index: 1, source: 'SYSTEM', type: 'CONVERSATION_HISTORY', status: 'DONE', created_at: '2026-06-18T13:52:34Z' },
+      { step_index: 2, source: 'SYSTEM', type: 'EPHEMERAL_MESSAGE', status: 'DONE', created_at: '2026-06-18T13:52:34Z', content: '<EPHEMERAL_MESSAGE>reminder</EPHEMERAL_MESSAGE>' },
+      {
+        step_index: 3,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-06-18T13:52:35Z',
+        thinking: 'Using generate_image.',
+        tool_calls: [{ name: 'generate_image', args: { Prompt: 'remove glare' } }],
+      },
+      {
+        step_index: 4,
+        source: 'MODEL',
+        type: 'GENERATE_IMAGE',
+        status: 'DONE',
+        created_at: '2026-06-18T13:52:40Z',
+        content: 'Created At: 2026-06-18T13:52:40Z\nCompleted At: 2026-06-18T13:52:52Z\nGenerated image is saved.',
+      },
+    ].map((r) => JSON.stringify(r));
+
+    const session = await parseAntigravity(readJsonlLines(toStream(records)), SESSION_ID, 'antigravity');
+    expect(session.harness).toBe('antigravity');
+    expect(session.primaryModel).toBeUndefined();
+    expect(session.stats.skippedLineTypes['CONVERSATION_HISTORY']).toBe(1);
+    expect(session.turns.map((t) => t.role)).toEqual(['user', 'system', 'assistant', 'tool']);
+    expect(session.turns[3]!.blocks[0]!.toolName).toBe('generate_image');
+  });
+
+  it('extracts parent session id from subagent step 0 SYSTEM_MESSAGE but ignores background task senders', async () => {
+    const subagentRecords = [
+      {
+        step_index: 0,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        created_at: '2026-11-24T19:28:26Z',
+        content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-24T19:28:26Z sender=${PARENT_ID} priority=MESSAGE_PRIORITY_HIGH content=Analyze all review PDFs\n</SYSTEM_MESSAGE>`,
+      },
+      {
+        step_index: 1,
+        source: 'MODEL',
+        type: 'PLANNER_RESPONSE',
+        status: 'DONE',
+        created_at: '2026-11-24T19:28:30Z',
+        model: 'gemini-4-carbon-medium',
+        content: 'Done analyzing.',
+      },
+    ].map((r) => JSON.stringify(r));
+
+    const sub = await parseAntigravity(readJsonlLines(toStream(subagentRecords)), CHILD_ID, 'agy');
+    expect(sub.parentSessionId).toBe(PARENT_ID);
+    expect(sub.parentSessionLink).toBe('linked');
+    expect(sub.isSidechain).toBe(true);
+    expect(sub.title).toBe('Analyze all review PDFs');
+
+    // Background task notification sender=<uuid>/task-23 must NOT link as parent.
+    const bgRecords = [
+      {
+        step_index: 0,
+        source: 'SYSTEM',
+        type: 'SYSTEM_MESSAGE',
+        status: 'DONE',
+        created_at: '2026-11-24T22:11:38Z',
+        content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-24T22:11:23Z sender=${PARENT_ID}/task-23 priority=MESSAGE_PRIORITY_HIGH content=Task finished\n</SYSTEM_MESSAGE>`,
+      },
+    ].map((r) => JSON.stringify(r));
+    const bg = await parseAntigravity(readJsonlLines(toStream(bgRecords)), SESSION_ID, 'agy');
+    expect(bg.parentSessionId).toBeUndefined();
+    expect(bg.isSidechain).toBe(false);
+  });
+
+  it('converts Windows and Linux file:// workspace URIs and parses agy history.jsonl workspace as cwd', async () => {
+    expect(workspaceUriToPath('file:///C:/src/entrepreneurship')).toBe('C:/src/entrepreneurship');
+    expect(workspaceUriToPath('file:///home/pedro/src/agent-sessions-backup')).toBe('/home/pedro/src/agent-sessions-backup');
+
+    const hist = await parsePromptLog(
+      readJsonlLines(
+        toStream([
+          JSON.stringify({
+            display: 'add agy support',
+            timestamp: 1795559433258,
+            workspace: '/home/pedro/src/agent-sessions-backup',
+          }),
+        ]),
+      ),
+      'promptlog:amet-wsl:agy',
+    );
+    expect(hist.cwd).toBe('/home/pedro/src/agent-sessions-backup');
+    expect(hist.turns).toHaveLength(1);
   });
 });
 

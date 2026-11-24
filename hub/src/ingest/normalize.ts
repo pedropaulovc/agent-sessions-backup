@@ -8,6 +8,8 @@ export type Harness =
   | 'claude-cowork'
   | 'prompt-log'
   | 'omp'
+  | 'agy'
+  | 'antigravity'
   | 'unknown';
 
 export type Role = 'user' | 'assistant' | 'system' | 'developer' | 'tool';

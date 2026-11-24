@@ -26,6 +26,9 @@ DEFAULT_EXCLUDES: list[str] = [
     "*auth.json*",
     "**/cred-profiles/**",
     "**/oauth*",
+    "*oauth-token*",
+    "*oauth_token*",
+    "mcp_config.json*",
     "*.key",
     "*.pem",
     # Cache/temp directories occur below plugin trees as well as at the store root. The
@@ -49,6 +52,18 @@ DEFAULT_EXCLUDES: list[str] = [
     "ide/**",
     "shell-snapshots/**",
     "projects/**/backups/**",
+    # Antigravity CLI (agy) & App runtime binaries, bundled builtins, ephemeral logs/presence,
+    # redundant transcript chunks, and WAL-churning binary protobuf conversation DBs/blobs
+    # (canonical transcripts live under brain/<uuid>/.system_generated/logs/transcript_full.jsonl).
+    "bin/**",
+    "builtin/**",
+    "updater/**",
+    "crashes/**",
+    "presence/**",
+    "cli.log",
+    "last_check.timestamp",
+    "conversations/**",
+    "brain/*/.system_generated/logs/chunks/**",
     # The collector reserves each transcript's synthetic external-asset subtree so a normal file
     # cannot collide with the digest-keyed R2 object.
     "*.assets/**",
@@ -59,11 +74,13 @@ DEFAULT_STORES: dict[str, str] = {
     "codex": "~/.codex",
     "omp": "~/.omp/agent/sessions",
     "omp-skills": "~/.omp/agent/managed-skills",
+    "agy": "~/.gemini/antigravity-cli",
+    "antigravity": "~/.gemini/antigravity",
 }
 # These roots were added after the original collector shipped. Loaded persisted configs gain
 # them additively; explicit custom roots win. Direct Config instances remain exact unless they
 # carry `source`, which marks them as persisted and activates the same compatibility path.
-ADDITIVE_DEFAULT_STORES = ("omp", "omp-skills")
+ADDITIVE_DEFAULT_STORES = ("omp", "omp-skills", "agy", "antigravity")
 
 # Staging stores the webcapture host writes into (CDP JSON) or an operator drops export ZIPs
 # into. They are ordinary `stores` entries on that host so the normal run/backfill scan uploads

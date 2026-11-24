@@ -37,6 +37,8 @@ def test_default_config_exposes_omp_stores():
         "codex": "~/.codex",
         "omp": "~/.omp/agent/sessions",
         "omp-skills": "~/.omp/agent/managed-skills",
+        "agy": "~/.gemini/antigravity-cli",
+        "antigravity": "~/.gemini/antigravity",
     }
 
 
@@ -307,14 +309,23 @@ def test_store_roots_injects_omp_defaults_for_persisted_config_and_preserves_cus
     roots = persisted.store_roots()
     assert roots["omp"] == home / ".omp" / "agent" / "sessions"
     assert roots["omp-skills"] == home / ".omp" / "agent" / "managed-skills"
+    assert roots["agy"] == home / ".gemini" / "antigravity-cli"
+    assert roots["antigravity"] == home / ".gemini" / "antigravity"
 
     custom = config.Config(
         machine_id="m",
         hub_url="http://h",
-        stores={"omp": "/custom/omp", "omp-skills": "/custom/skills"},
+        stores={
+            "omp": "/custom/omp",
+            "omp-skills": "/custom/skills",
+            "agy": "/custom/agy",
+            "antigravity": "/custom/antigravity",
+        },
     )
     assert custom.store_roots()["omp"] == Path("/custom/omp")
     assert custom.store_roots()["omp-skills"] == Path("/custom/skills")
+    assert custom.store_roots()["agy"] == Path("/custom/agy")
+    assert custom.store_roots()["antigravity"] == Path("/custom/antigravity")
 
 
 def test_load_adds_new_omp_defaults_to_legacy_store_map(tmp_path):
@@ -328,6 +339,8 @@ def test_load_adds_new_omp_defaults_to_legacy_store_map(tmp_path):
 
     assert loaded.stores["omp"] == "/custom/sessions"
     assert loaded.stores["omp-skills"] == "~/.omp/agent/managed-skills"
+    assert loaded.stores["agy"] == "~/.gemini/antigravity-cli"
+    assert loaded.stores["antigravity"] == "~/.gemini/antigravity"
 
 
 def test_hermetic_by_construction_never_resolves_real_data_dir(tmp_path, monkeypatch):
@@ -429,8 +442,12 @@ def test_wsl_drops_injected_omp_roots_for_persisted_config(tmp_path, monkeypatch
     dropped = cfg.dropped_store_roots()
     assert "omp" not in roots
     assert "omp-skills" not in roots
+    assert "agy" not in roots
+    assert "antigravity" not in roots
     assert dropped["omp"] == Path("/mnt/c/Users/legacy/.omp/agent/sessions")
     assert dropped["omp-skills"] == Path("/mnt/c/Users/legacy/.omp/agent/managed-skills")
+    assert dropped["agy"] == Path("/mnt/c/Users/legacy/.gemini/antigravity-cli")
+    assert dropped["antigravity"] == Path("/mnt/c/Users/legacy/.gemini/antigravity")
 
 
 def test_wsl_drops_windows_staging_roots(monkeypatch):

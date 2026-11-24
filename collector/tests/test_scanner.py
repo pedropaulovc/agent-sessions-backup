@@ -157,6 +157,89 @@ def test_scan_default_omp_managed_skills_root_from_temp_home(tmp_env):
     ]
 
 
+def test_scan_default_agy_and_antigravity_roots_and_excludes(tmp_env):
+    sid = "1c8be7ee-bfa4-42b3-844c-13d71a0fca7a"
+    child_id = "4297c3c4-5b32-4681-b021-c05c8457ea35"
+    agy_root = tmp_env / "home" / ".gemini" / "antigravity-cli"
+    app_root = tmp_env / "home" / ".gemini" / "antigravity"
+
+    # Keep: transcripts, subagent descriptors, history.jsonl, artifacts
+    agy_logs = agy_root / "brain" / sid / ".system_generated" / "logs"
+    agy_logs.mkdir(parents=True)
+    (agy_logs / "transcript_full.jsonl").write_text('{"type":"USER_INPUT"}\n')
+    (agy_logs / "transcript.jsonl").write_text('{"type":"USER_INPUT"}\n')
+    agy_sub = agy_root / "brain" / sid / ".system_generated" / "subagents"
+    agy_sub.mkdir(parents=True)
+    (agy_sub / f"{child_id}.json").write_text('{"conversationId":"' + child_id + '"}\n')
+    (agy_root / "history.jsonl").write_text('{"display":"hi","timestamp":1795558242850}\n')
+    (agy_root / "brain" / sid / "plan_for_oauth.md").write_text("# Keep non-token artifacts mentioning oauth\n")
+
+    # Exclude: credentials, binaries, builtins, updater, crashes, presence, cli.log, chunks, conversations
+    (agy_root / "antigravity-oauth-token").write_text("secret-token")
+    (agy_root / "antigravity-oauth-token.bak").write_text("secret-token-bak")
+    (agy_root / "mcp_config.json").write_text('{"apiKey":"secret"}')
+    (agy_root / "bin").mkdir()
+    (agy_root / "bin" / "agy.exe").write_bytes(b"MZ")
+    (agy_root / "builtin").mkdir()
+    (agy_root / "builtin" / "skill.md").write_text("builtin")
+    (agy_root / "updater").mkdir()
+    (agy_root / "updater" / "state.json").write_text("{}")
+    (agy_root / "crashes").mkdir()
+    (agy_root / "crashes" / "dump.dmp").write_bytes(b"x")
+    (agy_root / "presence").mkdir()
+    (agy_root / "presence" / "live.json").write_text("{}")
+    (agy_root / "cli.log").write_text("debug")
+    (agy_root / "last_check.timestamp").write_text("")
+    chunks = agy_logs / "chunks" / "transcript_full"
+    chunks.mkdir(parents=True)
+    (chunks / "00000000.jsonl").write_text('{"type":"USER_INPUT"}\n')
+    (agy_root / "conversations").mkdir()
+    (agy_root / "conversations" / f"{sid}.db").write_bytes(b"not-a-db-blob")
+
+    # Antigravity App store (~/.gemini/antigravity)
+    app_sid = "ec147dc8-c704-4ea1-8c53-e1a3c2162f1a"
+    app_logs = app_root / "brain" / app_sid / ".system_generated" / "logs"
+    app_logs.mkdir(parents=True)
+    (app_logs / "transcript_full.jsonl").write_text('{"type":"USER_INPUT"}\n')
+    (app_root / "conversations").mkdir()
+    (app_root / "conversations" / f"{app_sid}.pb").write_bytes(b"\x85\x48\xc8")
+    (app_root / "bin").mkdir()
+    (app_root / "bin" / "antigravity.exe").write_bytes(b"MZ")
+
+    cfg = config.Config(machine_id="m", hub_url="http://h")
+    with Scanner(cfg.effective_excludes()) as scanner:
+        found = {
+            (store, item.relpath)
+            for store, store_root in cfg.store_roots().items()
+            for item in scanner.scan_store(store, store_root)
+            if store in ("agy", "antigravity")
+        }
+
+    assert ("agy", f"brain/{sid}/.system_generated/logs/transcript_full.jsonl") in found
+    assert ("agy", f"brain/{sid}/.system_generated/subagents/{child_id}.json") in found
+    assert ("agy", f"brain/{sid}/plan_for_oauth.md") in found
+    assert ("agy", "history.jsonl") in found
+    assert ("antigravity", f"brain/{app_sid}/.system_generated/logs/transcript_full.jsonl") in found
+
+    excluded = {
+        ("agy", "antigravity-oauth-token"),
+        ("agy", "antigravity-oauth-token.bak"),
+        ("agy", "mcp_config.json"),
+        ("agy", "bin/agy.exe"),
+        ("agy", "builtin/skill.md"),
+        ("agy", "updater/state.json"),
+        ("agy", "crashes/dump.dmp"),
+        ("agy", "presence/live.json"),
+        ("agy", "cli.log"),
+        ("agy", "last_check.timestamp"),
+        ("agy", f"brain/{sid}/.system_generated/logs/chunks/transcript_full/00000000.jsonl"),
+        ("agy", f"conversations/{sid}.db"),
+        ("antigravity", f"conversations/{app_sid}.pb"),
+        ("antigravity", "bin/antigravity.exe"),
+    }
+    assert found.isdisjoint(excluded)
+
+
 def test_prefix_capture_on_growing_file(tmp_path):
     root = tmp_path / ".claude"
     root.mkdir()
