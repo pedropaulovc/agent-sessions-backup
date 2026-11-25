@@ -164,11 +164,14 @@ def _snapshot_sqlite(src: Path, dst: Path, deadline_s: float = SNAPSHOT_DEADLINE
             raise TimeoutError("sqlite snapshot exceeded deadline")
 
     try:
-        src_conn.execute("PRAGMA busy_timeout = 1000")
+        busy_ms = min(1000, max(1, int(deadline_s * 1000)))
+        sleep_s = min(0.1, max(0.005, deadline_s / 4))
+        src_conn.execute(f"PRAGMA busy_timeout = {busy_ms}")
         dst_conn = sqlite3.connect(str(dst))
         try:
+            dst_conn.execute("PRAGMA synchronous = OFF")
             with dst_conn:
-                src_conn.backup(dst_conn, pages=SNAPSHOT_PAGES, progress=_progress, sleep=0.1)
+                src_conn.backup(dst_conn, pages=SNAPSHOT_PAGES, progress=_progress, sleep=sleep_s)
         finally:
             dst_conn.close()
     except TimeoutError:

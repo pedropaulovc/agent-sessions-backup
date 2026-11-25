@@ -335,8 +335,14 @@ test('local readiness rejects every stale identity field before accepting the fu
   const child = { exitCode: null, signalCode: null };
   const current = { ok: true, environment: 'development', ...READINESS_IDENTITY };
   const requests = [];
+  const delays = [];
   let staleField;
   let attempts;
+  t.mock.method(globalThis, 'setTimeout', (callback, delay, ...args) => {
+    delays.push(delay);
+    queueMicrotask(() => callback(...args));
+    return 0;
+  });
   t.mock.method(globalThis, 'fetch', async (url) => {
     requests.push(url);
     attempts += 1;
@@ -352,6 +358,7 @@ test('local readiness rejects every stale identity field before accepting the fu
     assert.deepEqual(await waitForReadiness('http://127.0.0.1:9857', READINESS_IDENTITY, child, 2000), current);
     assert.equal(attempts, 2, `${field} must match before readiness can succeed`);
   }
+  assert.deepEqual(delays, Object.keys(READINESS_IDENTITY).map(() => 150));
   assert.ok(requests.every((url) => url === 'http://127.0.0.1:9857/healthz'),
     'readiness probes only health; fixture uploads and DB checks stay in their existing phases');
 });
