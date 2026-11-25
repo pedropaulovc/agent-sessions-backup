@@ -12,6 +12,7 @@ const SEED = 'synthetic-preview-seed-for-cli-regression-only';
 const ORIGIN = 'https://pr-150-app.sessions-ppe.workers.dev';
 const ASSET_PATH = `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${SYNTHETIC_EXPECTATIONS.store}/${SYNTHETIC_EXPECTATIONS.externalRelpath}`;
 const SKILL_PATH = `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${SYNTHETIC_EXPECTATIONS.skillStore}/${SYNTHETIC_EXPECTATIONS.skillRelpath}`;
+const MEMORY_SKILL_PATH = `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${SYNTHETIC_EXPECTATIONS.memorySkillStore}/${SYNTHETIC_EXPECTATIONS.memorySkillRelpath}`;
 const CLOUDFLARE_404 = '<!DOCTYPE html><html><head><title>Page not found</title><link rel="icon" href="https://workers.cloudflare.com/favicon.ico"></head><body>Not found</body></html>';
 const controller = process.env.PREVIEW_CONTROL_PATH
   ?? fileURLToPath(new URL('../../infra/cf/preview-control.mjs', import.meta.url));
@@ -161,8 +162,8 @@ test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then o
   assert.ok(result.requests.every((request) =>
     request.method === 'PUT' ? new URL(request.url).pathname.startsWith('/api/v1/files/')
       : new URL(request.url).pathname === '/api/v1/search'));
-  // Asset, primary, pager, skill, title-only and one file per cost fixture, plus the replay.
-  const distinctUploads = 5 + SYNTHETIC_EXPECTATIONS.costFixtures.length;
+  // Asset, primary, pager, managed skill, memory skill, title-only and one file per cost fixture, plus the replay.
+  const distinctUploads = 6 + SYNTHETIC_EXPECTATIONS.costFixtures.length;
   assert.equal(uploads.length, distinctUploads + 1);
   const { budget: firstBudget, started: firstStarted, ...first } = uploads[0];
   const { budget: secondBudget, started: secondStarted, ...second } = uploads[1];
@@ -182,6 +183,9 @@ test('seed replays the same fixture PUT after a Cloudflare no-worker 404, then o
   const skillUpload = uploads.find((upload) => upload.url === `${ORIGIN}${SKILL_PATH}`);
   assert.ok(skillUpload, 'the managed skill package must be uploaded');
   assert.match(Buffer.from(skillUpload.body, 'base64').toString('utf8'), new RegExp(SYNTHETIC_EXPECTATIONS.skillSourceMarker));
+  const memorySkillUpload = uploads.find((upload) => upload.url === `${ORIGIN}${MEMORY_SKILL_PATH}`);
+  assert.ok(memorySkillUpload, 'the memory skill package must be uploaded');
+  assert.match(Buffer.from(memorySkillUpload.body, 'base64').toString('utf8'), new RegExp(SYNTHETIC_EXPECTATIONS.memorySkillSourceMarker));
   assertTitleOnlyFixture(result);
   // The /reports page has nothing to aggregate unless the bytes carrying the `xd://report_issue`
   // calls reach the preview too. The browser suite only ever sees the LOCAL seeder, so without

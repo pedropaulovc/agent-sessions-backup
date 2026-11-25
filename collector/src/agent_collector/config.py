@@ -74,13 +74,14 @@ DEFAULT_STORES: dict[str, str] = {
     "codex": "~/.codex",
     "omp": "~/.omp/agent/sessions",
     "omp-skills": "~/.omp/agent/managed-skills",
+    "omp-memories": "~/.omp/agent/memories",
     "agy": "~/.gemini/antigravity-cli",
     "antigravity": "~/.gemini/antigravity",
 }
 # These roots were added after the original collector shipped. Loaded persisted configs gain
 # them additively; explicit custom roots win. Direct Config instances remain exact unless they
 # carry `source`, which marks them as persisted and activates the same compatibility path.
-ADDITIVE_DEFAULT_STORES = ("omp", "omp-skills", "agy", "antigravity")
+ADDITIVE_DEFAULT_STORES = ("omp", "omp-skills", "omp-memories", "agy", "antigravity")
 
 # Staging stores the webcapture host writes into (CDP JSON) or an operator drops export ZIPs
 # into. They are ordinary `stores` entries on that host so the normal run/backfill scan uploads

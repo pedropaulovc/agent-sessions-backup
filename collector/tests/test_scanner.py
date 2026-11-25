@@ -157,6 +157,34 @@ def test_scan_default_omp_managed_skills_root_from_temp_home(tmp_env):
     ]
 
 
+def test_scan_default_omp_memories_root_from_temp_home(tmp_env):
+    root = tmp_env / "home" / ".omp" / "agent" / "memories"
+    scope = root / "--home-user-src-demo--"
+    examples = scope / "skills" / "safe-reset" / "examples"
+    examples.mkdir(parents=True)
+    memory_doc = scope / "MEMORY.md"
+    memory_doc.write_text("# Memory\n")
+    skill = scope / "skills" / "safe-reset" / "SKILL.md"
+    skill.write_text("---\nname: safe-reset\n---\n")
+    example = examples / "usage.md"
+    example.write_text("usage")
+
+    cfg = config.Config(machine_id="m", hub_url="http://h")
+    with Scanner(cfg.effective_excludes()) as scanner:
+        items = [
+            item
+            for store, store_root in cfg.store_roots().items()
+            for item in scanner.scan_store(store, store_root)
+            if store == "omp-memories"
+        ]
+
+    assert [(item.relpath, item.source_path) for item in items] == [
+        ("--home-user-src-demo--/MEMORY.md", memory_doc),
+        ("--home-user-src-demo--/skills/safe-reset/SKILL.md", skill),
+        ("--home-user-src-demo--/skills/safe-reset/examples/usage.md", example),
+    ]
+
+
 def test_scan_default_agy_and_antigravity_roots_and_excludes(tmp_env):
     sid = "1c8be7ee-bfa4-42b3-844c-13d71a0fca7a"
     child_id = "4297c3c4-5b32-4681-b021-c05c8457ea35"

@@ -2,7 +2,7 @@
 
 Backup, index, search, and render AI agent/chat sessions from every machine and harness in one place.
 
-- **Harnesses and skills**: Claude Code, Codex CLI, OMP (Oh My Pi), OMP managed skills, ChatGPT web, Claude web
+- **Harnesses and skills**: Claude Code, Codex CLI, OMP (Oh My Pi), OMP managed skills & memory skills, ChatGPT web, Claude web
 - **Hub**: Cloudflare Workers + D1 (main catalog and session-hash-sharded SQLite FTS5 indexes) + R2 (raw files, source of truth) + Queues
 - **Collector**: Python (uv) agent on each machine — incremental uploads over mTLS (TPM-bound client certs), heartbeats
 - **Viewer**: chat-style session rendering + faceted full-text search, passkey login
@@ -27,7 +27,7 @@ Codex CLI prompts containing embedded raster sheets are shown with their text an
 
 OMP's collapsed System entry includes captured tool declarations and tool configuration as formatted JSON when the raw `omp-system-prompt` record contains `data.providerContext`. Older records without those fields cannot recover historical schemas. After deploying a parser update, refresh affected sessions with the current admin machine certificate: `POST /api/v1/admin/reindex` with `{"prefix":"raw/<machine>/<omp-store>/"}`. Repeat while the response is `202` / `done:false`; `200` / `done:true` means enqueueing finished, not indexing. Wait for the sessions to return to `index_state: "ready"` before checking declaration search results and transcript links.
 
-The **Skills** tab lists every current `SKILL.md` backup from `~/.omp/agent/managed-skills`, identifies its source machine and hash, shows the escaped source text, and inventories the other files captured with that skill.
+The **Skills** tab lists every current `SKILL.md` backup from `~/.omp/agent/managed-skills` and `~/.omp/agent/memories/*/skills/`, identifies its source, machine, and hash, shows the escaped source text, and inventories the other files captured with that skill.
 
 **Statistics** starts with usage counts, separate reported token counters, model shares, and linked session rankings. Rank by activity or known cost, or select a model to filter the page. Cost and context analysis stays available in a disclosure. Unpriced records are marked unknown; partial costs are subtotals, and overlapping input/cache counters are not added into a token total.
 

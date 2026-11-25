@@ -56,7 +56,7 @@ test.describe('synthetic sessions viewer', () => {
     // Stop before completing WebAuthn; fixture context cleanup dismisses any authenticator UI.
   });
 
-  test('navigates the Skills tab and reads a backed-up managed skill', async ({ page, appURL }) => {
+  test('navigates the Skills tab and reads backed-up managed and memory skills', async ({ page, appURL }) => {
     await page.goto(appURL('/'));
     await page.getByRole('link', { name: 'Skills', exact: true }).click();
 
@@ -64,10 +64,20 @@ test.describe('synthetic sessions viewer', () => {
     await expect(page.getByRole('heading', { name: 'Skills', exact: true })).toBeVisible();
     const skill = page.getByRole('link', { name: fixture.skillName, exact: true });
     await expect(skill).toBeVisible();
+    const memorySkill = page.getByRole('link', { name: fixture.memorySkillName, exact: true });
+    await expect(memorySkill).toBeVisible();
     await skill.click();
 
     await expect(page.getByRole('heading', { name: fixture.skillName, exact: true })).toBeVisible();
     await expect(page.locator('.skill-source')).toContainText(fixture.skillSourceMarker);
+    await expect(page.getByText('1 backed-up package file', { exact: true })).toBeVisible();
+
+    await page.getByRole('link', { name: '← All skills', exact: true }).click();
+    await expect(page).toHaveURL((url) => url.pathname === '/skills');
+    await page.getByRole('link', { name: fixture.memorySkillName, exact: true }).click();
+    await expect(page.getByRole('heading', { name: fixture.memorySkillName, exact: true })).toBeVisible();
+    await expect(page.locator('.sesshead')).toContainText(fixture.memorySkillScope);
+    await expect(page.locator('.skill-source')).toContainText(fixture.memorySkillSourceMarker);
     await expect(page.getByText('1 backed-up package file', { exact: true })).toBeVisible();
   });
 

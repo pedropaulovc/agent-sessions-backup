@@ -10,6 +10,7 @@ const PRIMARY = join(FIXTURE_DIR, 'e2e-synthetic-session.jsonl');
 const PAGER = join(FIXTURE_DIR, 'e2e-pager-session.jsonl');
 const EXTERNAL_BASE64 = join(FIXTURE_DIR, 'fixture-external.png.base64');
 const SKILL = join(FIXTURE_DIR, 'e2e-managed-skill.md');
+const MEMORY_SKILL = join(FIXTURE_DIR, 'e2e-memory-skill.md');
 const MACHINE = 'e2e-machine';
 const STORE = 'claude-projects';
 const PRIMARY_SESSION_ID = '00000000-0000-4000-8000-000000000001';
@@ -21,6 +22,10 @@ const EXTERNAL_RELPATH = `${PRIMARY_RELPATH}.assets/${EXTERNAL_DIGEST}/fixture-e
 const SKILL_STORE = 'omp-skills';
 const SKILL_NAME = 'e2e-managed-skill';
 const SKILL_RELPATH = `${SKILL_NAME}/SKILL.md`;
+const MEMORY_SKILL_STORE = 'omp-memories';
+const MEMORY_SKILL_SCOPE = '--workspace-e2e-fixtures--';
+const MEMORY_SKILL_NAME = 'e2e-memory-skill';
+const MEMORY_SKILL_RELPATH = `${MEMORY_SKILL_SCOPE}/skills/${MEMORY_SKILL_NAME}/SKILL.md`;
 
 const TITLE_ONLY_SESSION_ID = '00000000-0000-4000-8000-000000000005';
 const TITLE_ONLY_RELPATH = `-workspace-e2e-fixtures/2026-07-03_${TITLE_ONLY_SESSION_ID}.jsonl`;
@@ -223,6 +228,11 @@ export const SYNTHETIC_EXPECTATIONS = Object.freeze({
   skillStore: SKILL_STORE,
   skillRelpath: SKILL_RELPATH,
   skillSourceMarker: 'deterministic indigo compass skill marker',
+  memorySkillName: MEMORY_SKILL_NAME,
+  memorySkillStore: MEMORY_SKILL_STORE,
+  memorySkillScope: MEMORY_SKILL_SCOPE,
+  memorySkillRelpath: MEMORY_SKILL_RELPATH,
+  memorySkillSourceMarker: 'deterministic amber sextant memory skill marker',
   costParentSessionId: COST_PARENT_SESSION_ID,
   costParentTitle: 'Cost fixture: cerulean abacus fan-out',
   costSearchPhrase: 'cerulean abacus',
@@ -300,7 +310,7 @@ export const SYNTHETIC_EXPECTATIONS = Object.freeze({
 
 export async function syntheticSeedManifest() {
   return seedManifest([
-    PRIMARY, PAGER, EXTERNAL_BASE64, SKILL, fileURLToPath(import.meta.url),
+    PRIMARY, PAGER, EXTERNAL_BASE64, SKILL, MEMORY_SKILL, fileURLToPath(import.meta.url),
     ...COST_FIXTURES.map((fixture) => join(FIXTURE_DIR, fixture.file)),
   ]);
 }
@@ -357,11 +367,12 @@ export async function seedSynthetic(baseUrl, timeoutMs = 30_000, expectedDigest)
   if (expectedDigest && liveManifest.digest !== expectedDigest) {
     throw new Error('synthetic fixtures changed after the environment manifest was recorded');
   }
-  const [primary, pager, assetText, skill] = await Promise.all([
+  const [primary, pager, assetText, skill, memorySkill] = await Promise.all([
     readFile(PRIMARY),
     readFile(PAGER),
     readFile(EXTERNAL_BASE64, 'utf8'),
     readFile(SKILL),
+    readFile(MEMORY_SKILL),
   ]);
   const asset = Buffer.from(assetText.trim(), 'base64');
   if (sha256(asset) !== EXTERNAL_DIGEST) throw new Error('synthetic external asset digest does not match its fixture contract');
@@ -370,6 +381,7 @@ export async function seedSynthetic(baseUrl, timeoutMs = 30_000, expectedDigest)
   await upload(baseUrl, STORE, PRIMARY_RELPATH, primary);
   await upload(baseUrl, STORE, PAGER_RELPATH, pager);
   await upload(baseUrl, SKILL_STORE, SKILL_RELPATH, skill);
+  await upload(baseUrl, MEMORY_SKILL_STORE, MEMORY_SKILL_RELPATH, memorySkill);
   await upload(baseUrl, 'omp', TITLE_ONLY_RELPATH, titleOnlySessionBytes());
   // The parent goes up before its sidecars so a subagent row never briefly points at a missing
   // parent, which is also the order the collector produces them in.
