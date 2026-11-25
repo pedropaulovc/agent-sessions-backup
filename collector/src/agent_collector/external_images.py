@@ -12,8 +12,15 @@ from typing import BinaryIO, Iterator
 
 from .scanner import first_matching_pattern
 
+# Bump ONLY when external-asset discovery/classification rules change so unrelated collector
+# releases do not wipe the local asset_scans cache and force a full-corpus re-parse.
+ASSET_SCAN_RULES_VERSION = "1"
+
 _DIGEST_RE = re.compile(r"^blob:sha256:([0-9a-fA-F]{64})$")
 _BLOB_SEARCH_RE = re.compile(r"blob:sha256:[0-9a-fA-F]{64}")
+_BLOB_MARKER_BYTES = b"blob:sha256:"
+_BLOB_MARKER_OVERLAP = len(_BLOB_MARKER_BYTES) - 1
+_CWD_MARKER_BYTES = b'"cwd"'
 _WINDOWS_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _SAFE_MIME = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 _SAFE_EXT = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
@@ -277,6 +284,83 @@ def _append_event(events: list[AssetEvent], event: AssetEvent) -> None:
         events.append(event)
 
 
+def _file_contains_blob_marker(transcript: Path) -> bool:
+    """Fast zero-copy binary scan for the literal blob:sha256: prefix."""
+    tail = b""
+    with transcript.open("rb") as raw_file:
+        while True:
+            chunk = raw_file.read(1024 * 1024)
+            if not chunk:
+                return False
+            if _BLOB_MARKER_BYTES in chunk or (
+                tail and _BLOB_MARKER_BYTES in (tail + chunk[:_BLOB_MARKER_OVERLAP])
+            ):
+                return True
+            tail = chunk[-_BLOB_MARKER_OVERLAP:]
+
+
+def _drain_binary_line(raw_file: BinaryIO, chunk: bytes, limit: int) -> None:
+    while chunk and not chunk.endswith(b"\n"):
+        chunk = raw_file.readline(limit + 1)
+
+
+def _iter_asset_records(transcript: Path, need_cwd) -> Iterator[dict | None]:
+    """Stream candidate JSONL records for external-asset discovery without JSON-parsing unrelated lines.
+
+    Preserves exact MAX_EXTERNAL_SCAN_LINE_CHARS oversized-line detection (`yield None`).
+    """
+    limit = MAX_EXTERNAL_SCAN_LINE_CHARS
+    file_size = transcript.stat().st_size
+    # If the whole file is <= limit bytes, no UTF-8 line can exceed limit characters; skip
+    # decoding and JSON parsing completely when the file never mentions blob:sha256:.
+    if file_size <= limit and not _file_contains_blob_marker(transcript):
+        return
+
+    with transcript.open("rb") as raw_file:
+        while True:
+            raw = raw_file.readline(limit + 1)
+            if not raw:
+                break
+            if len(raw) <= limit:
+                if _BLOB_MARKER_BYTES not in raw and not (need_cwd() and _CWD_MARKER_BYTES in raw):
+                    continue
+                line = raw.decode("utf-8", errors="replace")
+            else:
+                # Over limit bytes: pure ASCII without CR is strictly > limit chars.
+                if raw.isascii() and b"\r" not in raw:
+                    _drain_binary_line(raw_file, raw, limit)
+                    yield None
+                    continue
+                # Multi-byte UTF-8 or CRLF edge case: collect up to 4*limit bytes to measure chars.
+                parts = [raw]
+                total_bytes = len(raw)
+                max_utf8_bytes = limit * 4 + 2
+                cur = raw
+                while cur and not cur.endswith(b"\n") and total_bytes < max_utf8_bytes:
+                    cur = raw_file.readline(min(limit + 1, max_utf8_bytes - total_bytes))
+                    if not cur:
+                        break
+                    parts.append(cur)
+                    total_bytes += len(cur)
+                if cur and not cur.endswith(b"\n"):
+                    _drain_binary_line(raw_file, cur, limit)
+                    yield None
+                    continue
+                joined = b"".join(parts)
+                line = joined.decode("utf-8", errors="replace").replace("\r\n", "\n")
+                if len(line) > limit:
+                    yield None
+                    continue
+                if "blob:sha256:" not in line and not (need_cwd() and '"cwd"' in line):
+                    continue
+            try:
+                record = json.loads(line)
+            except (ValueError, TypeError, RecursionError):
+                continue
+            if isinstance(record, dict):
+                yield record
+
+
 def discover_external_assets(transcript: Path, parent_relpath: str, cwd: str | Path | None,
                              excludes: list[str] | None = None,
                              trusted_roots: list[str | Path] | None = None) -> tuple[list[ExternalAsset], list[AssetEvent]]:
@@ -284,8 +368,10 @@ def discover_external_assets(transcript: Path, parent_relpath: str, cwd: str | P
     unique: dict[str, ExternalAsset] = {}
     events: list[AssetEvent] = []
     declared_cwd = str(cwd) if cwd else None
+    roots_cwd_key: str | None = None
+    cached_roots: list[Path] | None = None
     try:
-        for record in iter_jsonl_records(transcript):
+        for record in _iter_asset_records(transcript, lambda: declared_cwd is None):
             if record is None:
                 _append_event(events, _event("line_too_large"))
                 continue
@@ -321,7 +407,10 @@ def discover_external_assets(transcript: Path, parent_relpath: str, cwd: str | P
                 else:
                     _append_event(events, _event("missing_source_or_cwd", digest, filename))
                     continue
-                roots = _resolved_roots(declared_cwd, trusted_roots)
+                if cached_roots is None or roots_cwd_key != declared_cwd:
+                    cached_roots = _resolved_roots(declared_cwd, trusted_roots)
+                    roots_cwd_key = declared_cwd
+                roots = cached_roots
                 try:
                     if source.is_symlink():
                         _append_event(events, _event("not_regular_file", digest, filename))

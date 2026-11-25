@@ -185,6 +185,8 @@ def _discover_upload_assets(
     missing: set[tuple[str, str]] | None = None,
     discovered: tuple[list[ExternalAsset], list] | None = None,
 ) -> ItemResult:
+    if not parent.relpath.lower().endswith(".jsonl"):
+        return ItemResult()
     if not force and st.asset_scan_ok(parent.store, parent.relpath, parent.size, parent.mtime_ns):
         return ItemResult()
     if discovered is None:
@@ -304,52 +306,56 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
 
     scanner = Scanner(cfg.effective_excludes())
     try:
-        for store, root in cfg.store_roots().items():
-            stats.setdefault(store, {"files_seen": 0, "files_uploaded": 0, "bytes_uploaded": 0})
-            seen: set[str] = set()
-            for item in scanner.scan_store(store, root):
-                seen.add(item.relpath)
-                scanned += 1
-                stats[store]["files_seen"] += 1
-                res = _process_item(cfg, st, transport, scanner, item)
-                _cleanup_snapshot(item)
-                if res.changed:
-                    changed += 1
-                if res.uploaded:
-                    uploaded += 1
-                    total_bytes += res.bytes
-                    stats[store]["files_uploaded"] += 1
-                    stats[store]["bytes_uploaded"] += res.bytes
-                if res.error:
-                    errors += 1
-                    events.append({
-                        "level": "error", "code": "upload_failed",
-                        "message": res.error[:500], "count": 1, "store": store,
-                    })
-                    continue
-                # A transcript is the owner of its assets. Never inspect/upload references when
-                # its own bytes failed to reach the hub. SQLite snapshots are databases, not JSONL
-                # transcripts, and their temp copy is already deleted (as in backfill).
-                if item.is_snapshot:
-                    continue
-                assets_res = _discover_upload_assets(cfg, st, transport, scanner, item, events,
-                                                     force=res.changed)
-                scanned += assets_res.seen
-                stats[store]["files_seen"] += assets_res.seen
-                if assets_res.changed:
-                    changed += 1
-                if assets_res.uploaded:
-                    uploaded += assets_res.uploaded_count
-                    total_bytes += assets_res.bytes
-                    stats[store]["files_uploaded"] += assets_res.uploaded_count
-                    stats[store]["bytes_uploaded"] += assets_res.bytes
-                if assets_res.error:
-                    errors += 1
-            # Only a complete walk proves a parent is gone; a missing root, an unreadable
-            # subtree, an existing entry that could not be read, or an empty (e.g. unmounted) mountpoint
-            # would otherwise forget warnings that are still current.
-            if seen and scanner.walk_state(store) == WALK_COMPLETE:
-                st.prune_asset_events(store, seen)
+        with st.batch_metadata():
+            for store, root in cfg.store_roots().items():
+                stats.setdefault(store, {"files_seen": 0, "files_uploaded": 0, "bytes_uploaded": 0})
+                seen: set[str] = set()
+                for item in scanner.scan_store(store, root):
+                    seen.add(item.relpath)
+                    scanned += 1
+                    stats[store]["files_seen"] += 1
+                    res = _process_item(cfg, st, transport, scanner, item)
+                    _cleanup_snapshot(item)
+                    if res.changed:
+                        changed += 1
+                    if res.uploaded:
+                        uploaded += 1
+                        total_bytes += res.bytes
+                        stats[store]["files_uploaded"] += 1
+                        stats[store]["bytes_uploaded"] += res.bytes
+                    if res.error:
+                        errors += 1
+                        events.append({
+                            "level": "error", "code": "upload_failed",
+                            "message": res.error[:500], "count": 1, "store": store,
+                        })
+                        continue
+                    # A transcript is the owner of its assets. Never inspect/upload references when
+                    # its own bytes failed to reach the hub. SQLite snapshots are databases, not JSONL
+                    # transcripts, and their temp copy is already deleted (as in backfill).
+                    if item.is_snapshot:
+                        continue
+                    assets_res = _discover_upload_assets(
+                        cfg, st, transport, scanner, item, events,
+                        force=res.changed,
+                    )
+                    scanned += assets_res.seen
+                    stats[store]["files_seen"] += assets_res.seen
+                    if assets_res.changed:
+                        changed += 1
+                    if assets_res.uploaded:
+                        uploaded += assets_res.uploaded_count
+                        total_bytes += assets_res.bytes
+                        stats[store]["files_uploaded"] += assets_res.uploaded_count
+                        stats[store]["bytes_uploaded"] += assets_res.bytes
+                    if assets_res.error:
+                        errors += 1
+                st.flush_metadata_batches()
+                # Only a complete walk proves a parent is gone; a missing root, an unreadable
+                # subtree, an existing entry that could not be read, or an empty (e.g. unmounted) mountpoint
+                # would otherwise forget warnings that are still current.
+                if seen and scanner.walk_state(store) == WALK_COMPLETE:
+                    st.prune_asset_events(store, seen)
         # Traversal/snapshot warnings (walk_error, snapshot_timeout) raised during the walk.
         events.extend(scanner.events)
         errors += sum(1 for e in scanner.events if e["level"] == "error")
@@ -358,6 +364,7 @@ def _do_run(cfg: config_mod.Config, st: State) -> int:
 
     st.finish_run(run_id, scanned, changed, uploaded, total_bytes, errors)
     heartbeat_ok = _heartbeat(cfg, st, transport, stats, events)
+    st.vacuum_if_bloated()
     print(json.dumps({
         "mode": "run", "files_scanned": scanned, "files_changed": changed,
         "files_uploaded": uploaded, "bytes_uploaded": total_bytes, "errors": errors,
@@ -851,7 +858,7 @@ def _backfill_chunk(cfg, st: State, transport: Transport, scanner: Scanner,
         discovered_parents: list[tuple[ScanItem, tuple[list[ExternalAsset], list]]] = []
         asset_triples = []
         for parent, _sha in hashed:
-            if parent.is_snapshot:
+            if parent.is_snapshot or not parent.relpath.lower().endswith(".jsonl"):
                 _cleanup_snapshot(parent)
                 continue
             discovered = discover_external_assets(

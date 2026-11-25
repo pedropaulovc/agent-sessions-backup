@@ -311,6 +311,61 @@ def test_discovery_bounds_oversized_jsonl_lines(monkeypatch, tmp_path):
     assert assets[0].source_path == image
 
 
+def test_discovery_skips_json_parsing_for_lines_without_blob_marker(monkeypatch, tmp_path):
+    image = tmp_path / "001_img01.jpeg"
+    body = b"jpeg bytes"
+    image.write_bytes(body)
+    digest = hashlib.sha256(body).hexdigest()
+    transcript = tmp_path / "session.jsonl"
+    # Exceed MAX_EXTERNAL_SCAN_LINE_CHARS in total file size so we exercise line-by-line prefiltering.
+    monkeypatch.setattr(external_images, "MAX_EXTERNAL_SCAN_LINE_CHARS", 512)
+    filler = json.dumps({"type": "message", "text": "a" * 200}) + "\n"
+    image_rec = json.dumps({
+        "type": "tool_result",
+        "content": [{
+            "type": "image",
+            "data": f"blob:sha256:{digest}",
+            "details": {"meta": {"source": {"value": str(image)}}},
+        }],
+    }) + "\n"
+    transcript.write_text(
+        json.dumps({"type": "session_meta", "cwd": str(tmp_path)}) + "\n"
+        + filler * 10
+        + image_rec
+    )
+
+    real_loads = external_images.json.loads
+    loads_calls = 0
+
+    def counting_loads(s, *args, **kwargs):
+        nonlocal loads_calls
+        loads_calls += 1
+        return real_loads(s, *args, **kwargs)
+
+    monkeypatch.setattr(external_images.json, "loads", counting_loads)
+    assets, events = discover_external_assets(transcript, "session.jsonl", None, [])
+
+    assert not events
+    assert len(assets) == 1 and assets[0].source_path == image
+    assert loads_calls == 2  # only session_meta (cwd) + the blob:sha256: line
+
+
+def test_discovery_skips_non_jsonl_files_in_run(monkeypatch, tmp_path):
+    md = tmp_path / "MEMORY.md"
+    md.write_text("# Memory\n")
+    parent = run_mod.ScanItem("omp-memories", "demo/MEMORY.md", md.stat().st_size,
+                              md.stat().st_mtime_ns, md, False)
+    called = []
+    monkeypatch.setattr(run_mod, "discover_external_assets", lambda *args: called.append(args) or ([], []))
+    cfg = SimpleNamespace(effective_excludes=lambda: [])
+
+    with State(tmp_path / "state.db") as st:
+        result = run_mod._discover_upload_assets(cfg, st, None, None, parent, [], force=True)
+
+    assert result.seen == 0
+    assert called == []
+
+
 def test_discovery_limits_unique_asset_relpaths(monkeypatch, tmp_path):
     monkeypatch.setattr(external_images, "MAX_EXTERNAL_ASSETS", 2)
     image1 = tmp_path / "001.jpeg"
