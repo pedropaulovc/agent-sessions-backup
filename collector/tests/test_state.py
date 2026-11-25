@@ -87,6 +87,37 @@ def test_asset_scan_cache_resets_after_collector_version_change(tmp_path, stored
         _ids, events = st.drain_events()
         assert any(e["code"] == "asset_scan_rules_changed" for e in events)
 
+
+def test_asset_scan_cache_survives_unrelated_collector_version_bump(tmp_path, monkeypatch):
+    import agent_collector
+
+    db = tmp_path / "state.db"
+    with State(db) as st:
+        st.mark_asset_scan("omp", "session.jsonl", 10, 123)
+        assert st.asset_scan_ok("omp", "session.jsonl", 10, 123)
+
+    monkeypatch.setattr(agent_collector, "__version__", "9.9.9")
+    with State(db) as st:
+        assert st.asset_scan_ok("omp", "session.jsonl", 10, 123)
+        assert st.pending_event_count() == 0
+
+
+def test_vacuum_if_bloated_reclaims_freelist_pages(tmp_path):
+    db = tmp_path / "state.db"
+    with State(db) as st:
+        st.conn.executemany(
+            "INSERT INTO asset_scans(store, parent_relpath, size, mtime_ns, scanned_at) VALUES (?, ?, ?, ?, ?)",
+            [("omp", f"s-{i:04d}-{'x' * 80}.jsonl", i, i, "2026-01-01T00:00:00Z") for i in range(1500)],
+        )
+        st.conn.commit()
+        st.conn.execute("DELETE FROM asset_scans")
+        st.conn.commit()
+        freelist_before = st.conn.execute("PRAGMA freelist_count").fetchone()[0]
+        assert freelist_before > 5
+        assert st.vacuum_if_bloated(min_freelist_pages=5) is True
+        assert st.conn.execute("PRAGMA freelist_count").fetchone()[0] == 0
+        assert st.vacuum_if_bloated(min_freelist_pages=5) is False
+
 def test_hub_url_trailing_slash_is_noop(tmp_path):
     db = tmp_path / "state.db"
     with State(db, machine_id="A", hub_url="http://hub-a") as st:

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import __version__
+from .external_images import ASSET_SCAN_RULES_VERSION
 
 # AUTOINCREMENT: an ID at or below the heartbeat inspection cursor is never issued again, so a
 # newly buffered event can never land behind the cursor (plain rowids reuse max(id)+1 after the
@@ -153,6 +154,9 @@ class State:
         self._reconcile_asset_scan_rules()
         self.machine_id_changed = False
         self.hub_url_changed = False
+        self._batch_depth = 0
+        self._pending_touches: list[tuple[str, str]] = []
+        self._pending_asset_scans: dict[tuple[str, str], tuple[int, int]] = {}
         if machine_id is not None or hub_url is not None:
             self._reconcile_identity(machine_id, hub_url)
 
@@ -194,19 +198,19 @@ class State:
         return ID_SCHEME_AUTOINCREMENT if "AUTOINCREMENT" in row[0].upper() else ID_SCHEME_ROWID
 
     def _reconcile_asset_scan_rules(self) -> None:
-        """Invalidate cached external-asset scans and reported asset warnings when collector
-        behavior changes: new rules may classify the same references differently."""
+        """Invalidate cached external-asset scans and reported asset warnings only when
+        ASSET_SCAN_RULES_VERSION changes: unrelated collector releases keep the scan cache."""
         key = "asset_scan_rules_version"
         row = self.conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
         if row is None:
-            self.conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (key, __version__))
+            self.conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (key, ASSET_SCAN_RULES_VERSION))
             changed = self.conn.execute(
                 "SELECT 1 FROM asset_scans UNION ALL SELECT 1 FROM asset_event_emissions LIMIT 1"
             ).fetchone() is not None
         else:
-            changed = row["value"] != __version__
+            changed = row["value"] != ASSET_SCAN_RULES_VERSION
             if changed:
-                self.conn.execute("UPDATE meta SET value = ? WHERE key = ?", (__version__, key))
+                self.conn.execute("UPDATE meta SET value = ? WHERE key = ?", (ASSET_SCAN_RULES_VERSION, key))
         if not changed:
             self.conn.commit()
             return
@@ -320,6 +324,9 @@ class State:
         self.conn.commit()
 
     def asset_scan_ok(self, store: str, parent_relpath: str, size: int, mtime_ns: int) -> bool:
+        pending = self._pending_asset_scans.get((store, parent_relpath))
+        if pending is not None:
+            return pending == (size, mtime_ns)
         row = self.conn.execute(
             "SELECT 1 FROM asset_scans WHERE store = ? AND parent_relpath = ? "
             "AND size = ? AND mtime_ns = ?",
@@ -328,6 +335,11 @@ class State:
         return row is not None
 
     def mark_asset_scan(self, store: str, parent_relpath: str, size: int, mtime_ns: int) -> None:
+        if self._batch_depth > 0:
+            self._pending_asset_scans[(store, parent_relpath)] = (size, mtime_ns)
+            if len(self._pending_asset_scans) >= 2000:
+                self.flush_metadata_batches()
+            return
         self.conn.execute(
             "INSERT INTO asset_scans(store, parent_relpath, size, mtime_ns, scanned_at) "
             "VALUES (?, ?, ?, ?, ?) ON CONFLICT(store, parent_relpath) DO UPDATE SET "
@@ -335,6 +347,41 @@ class State:
             (store, parent_relpath, size, mtime_ns, now_iso()),
         )
         self.conn.commit()
+
+    def mark_asset_scan_batch(self, entries: list[tuple[str, str, int, int]]) -> None:
+        if not entries:
+            return
+        ts = now_iso()
+        with self.conn:
+            self.conn.executemany(
+                "INSERT INTO asset_scans(store, parent_relpath, size, mtime_ns, scanned_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(store, parent_relpath) DO UPDATE SET "
+                "size = excluded.size, mtime_ns = excluded.mtime_ns, scanned_at = excluded.scanned_at",
+                ((store, relpath, size, mtime_ns, ts) for store, relpath, size, mtime_ns in entries),
+            )
+
+    def flush_metadata_batches(self) -> None:
+        if self._pending_touches:
+            self.touch_seen_batch(self._pending_touches)
+            self._pending_touches.clear()
+        if self._pending_asset_scans:
+            entries = [
+                (store, relpath, size, mtime_ns)
+                for (store, relpath), (size, mtime_ns) in self._pending_asset_scans.items()
+            ]
+            self.mark_asset_scan_batch(entries)
+            self._pending_asset_scans.clear()
+
+    @contextmanager
+    def batch_metadata(self):
+        """Batch touch_seen and mark_asset_scan writes into chunked transactions."""
+        self._batch_depth += 1
+        try:
+            yield
+        finally:
+            self._batch_depth -= 1
+            if self._batch_depth == 0:
+                self.flush_metadata_batches()
 
     def queue_asset_events(self, store: str, parent_relpath: str,
                            events: list[dict]) -> list[dict]:
@@ -394,11 +441,36 @@ class State:
             pruned += len(gone)
 
     def touch_seen(self, store: str, relpath: str) -> None:
+        if self._batch_depth > 0:
+            self._pending_touches.append((store, relpath))
+            if len(self._pending_touches) >= 2000:
+                self.flush_metadata_batches()
+            return
         self.conn.execute(
             "UPDATE files SET last_seen_at = ? WHERE store = ? AND relpath = ?",
             (now_iso(), store, relpath),
         )
         self.conn.commit()
+
+    def touch_seen_batch(self, entries: list[tuple[str, str]]) -> None:
+        if not entries:
+            return
+        ts = now_iso()
+        with self.conn:
+            self.conn.executemany(
+                "UPDATE files SET last_seen_at = ? WHERE store = ? AND relpath = ?",
+                ((ts, store, relpath) for store, relpath in entries),
+            )
+
+    def vacuum_if_bloated(self, min_freelist_pages: int = 10_000) -> bool:
+        """Reclaim disk space when >50% of pages (and >min_freelist_pages) are dead freelist pages."""
+        page_count = self.conn.execute("PRAGMA page_count").fetchone()[0]
+        freelist_count = self.conn.execute("PRAGMA freelist_count").fetchone()[0]
+        if freelist_count > min_freelist_pages and freelist_count * 2 > page_count:
+            self.conn.commit()
+            self.conn.execute("VACUUM")
+            return True
+        return False
 
     def error_files(self) -> list[FileRow]:
         rows = self.conn.execute(
