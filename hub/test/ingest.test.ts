@@ -96,6 +96,8 @@ describe('cache basis classification', () => {
     expect(cacheBasisForHarness('omp')).toBe('disjoint');
     expect(cacheBasisForHarness('claude-code')).toBe('disjoint');
     expect(cacheBasisForHarness('codex')).toBe('subset');
+    expect(cacheBasisForHarness('agy')).toBe('disjoint');
+    expect(cacheBasisForHarness('antigravity')).toBe('disjoint');
     expect(cacheBasisForHarness('future-harness')).toBeNull();
     expect(cacheBasisForHarness('toString')).toBeNull();
     expect(cacheBasisForHarness(null)).toBeNull();
@@ -1853,6 +1855,267 @@ describe('OMP ingest end-to-end', () => {
       is_sidechain: 1,
       index_state: 'ready',
     });
+  });
+});
+
+describe('Antigravity CLI (agy) and Antigravity App end-to-end ingest', () => {
+  const AGY_PARENT_ID = 'acddf9c5-82cd-4381-ba1a-cbab335cbe13';
+  const AGY_CHILD_ID = '4297c3c4-5b32-4681-b021-c05c8457ea35';
+  const APP_SESSION_ID = 'ec147dc8-c704-4ea1-8c53-e1a3c2162f1a';
+
+  const AGY_PARENT_CONTENT = [
+    {
+      step_index: 0,
+      source: 'USER_EXPLICIT',
+      type: 'USER_INPUT',
+      status: 'DONE',
+      created_at: '2026-11-24T19:20:00Z',
+      content: '<USER_REQUEST>\nexplore agyneedle opportunities\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nnow\n</ADDITIONAL_METADATA>',
+    },
+    {
+      step_index: 1,
+      source: 'MODEL',
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-24T19:20:05Z',
+      model: 'gemini-4-neon-high',
+      input_tokens: 1000,
+      cache_read_tokens: 2500,
+      output_tokens: 200,
+      thinking: 'Planning agyneedle search.',
+      tool_calls: [{ name: 'run_command', args: { CommandLine: 'echo agyneedle-cmd' } }],
+    },
+    {
+      step_index: 2,
+      source: 'MODEL',
+      type: 'GENERIC',
+      status: 'DONE',
+      created_at: '2026-11-24T19:20:06Z',
+      content: 'Created At: 2026-11-24T11:20:06-08:00\nCompleted At: 2026-11-24T11:20:07-08:00\nagyneedle tool output',
+    },
+    {
+      step_index: 3,
+      source: 'MODEL',
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-24T19:20:10Z',
+      model: 'gemini-4-neon-high',
+      input_tokens: 400,
+      cache_read_tokens: 3500,
+      output_tokens: 100,
+      content: 'Here are the agyneedle findings.',
+    },
+  ]
+    .map((r) => JSON.stringify(r))
+    .join('\n');
+
+  const AGY_CHILD_CONTENT = [
+    {
+      step_index: 0,
+      source: 'SYSTEM',
+      type: 'SYSTEM_MESSAGE',
+      status: 'DONE',
+      created_at: '2026-11-24T19:21:00Z',
+      content: `<SYSTEM_MESSAGE>\n[Message] timestamp=2026-11-24T19:21:00Z sender=${AGY_PARENT_ID} priority=MESSAGE_PRIORITY_HIGH content=Analyze agyneedle PDFs\n</SYSTEM_MESSAGE>`,
+    },
+    {
+      step_index: 1,
+      source: 'MODEL',
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-11-24T19:21:05Z',
+      model: 'gemini-4-carbon-medium',
+      input_tokens: 500,
+      cache_read_tokens: 0,
+      output_tokens: 80,
+      content: 'Child agyneedle report ready.',
+    },
+  ]
+    .map((r) => JSON.stringify(r))
+    .join('\n');
+
+  const APP_CONTENT = [
+    {
+      step_index: 0,
+      source: 'USER_EXPLICIT',
+      type: 'USER_INPUT',
+      status: 'DONE',
+      created_at: '2026-06-18T13:52:34Z',
+      content: '<USER_REQUEST>\nremove appneedle glare from photo\n</USER_REQUEST>',
+    },
+    {
+      step_index: 1,
+      source: 'MODEL',
+      type: 'PLANNER_RESPONSE',
+      status: 'DONE',
+      created_at: '2026-06-18T13:52:35Z',
+      thinking: 'Running image generation.',
+      tool_calls: [{ name: 'generate_image', args: { Prompt: 'remove appneedle glare' } }],
+    },
+    {
+      step_index: 2,
+      source: 'MODEL',
+      type: 'GENERATE_IMAGE',
+      status: 'DONE',
+      created_at: '2026-06-18T13:52:40Z',
+      content: 'Created At: 2026-06-18T13:52:40Z\nCompleted At: 2026-06-18T13:52:52Z\nGenerated appneedle image.',
+    },
+  ]
+    .map((r) => JSON.stringify(r))
+    .join('\n');
+
+  beforeAll(async () => {
+    expect(
+      (
+        await putFile(
+          'amet-windows',
+          'agy',
+          `brain/${AGY_PARENT_ID}/.system_generated/logs/transcript_full.jsonl`,
+          AGY_PARENT_CONTENT,
+        )
+      ).status,
+    ).toBe(201);
+    // Compact sibling should be stored and skipped without competing.
+    expect(
+      (
+        await putFile(
+          'amet-windows',
+          'agy',
+          `brain/${AGY_PARENT_ID}/.system_generated/logs/transcript.jsonl`,
+          AGY_PARENT_CONTENT,
+        )
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await putFile(
+          'amet-windows',
+          'agy',
+          `brain/${AGY_CHILD_ID}/.system_generated/logs/transcript_full.jsonl`,
+          AGY_CHILD_CONTENT,
+        )
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await putFile(
+          'amet-windows',
+          'agy',
+          `brain/${AGY_PARENT_ID}/.system_generated/subagents/${AGY_CHILD_ID}.json`,
+          JSON.stringify({
+            conversationId: AGY_CHILD_ID,
+            workspaceUris: ['file:///C:/src/entrepreneurship'],
+          }),
+        )
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await putFile(
+          'amet-windows',
+          'antigravity',
+          `brain/${APP_SESSION_ID}/.system_generated/logs/transcript_full.jsonl`,
+          APP_CONTENT,
+        )
+      ).status,
+    ).toBe(201);
+    await drainQueue();
+  });
+
+  it('indexes agy sessions with disjoint usage, derived USER_REQUEST title, FTS search, and viewer rendering', async () => {
+    const row = await testEnv.DB.prepare(
+      'SELECT harness, title, first_interaction_title, primary_model, index_state, tokens_in, tokens_out, tokens_cached FROM sessions WHERE session_id = ?1',
+    )
+      .bind(AGY_PARENT_ID)
+      .first<{
+        harness: string;
+        title: string | null;
+        first_interaction_title: string | null;
+        primary_model: string | null;
+        index_state: string;
+        tokens_in: number;
+        tokens_out: number;
+        tokens_cached: number;
+      }>();
+    expect(row).toMatchObject({
+      harness: 'agy',
+      title: 'explore agyneedle opportunities',
+      first_interaction_title: 'explore agyneedle opportunities',
+      primary_model: 'gemini-4-neon-high',
+      index_state: 'ready',
+    });
+    expect(Number(row?.tokens_in)).toBe(1400);
+    expect(Number(row?.tokens_out)).toBe(300);
+    expect(Number(row?.tokens_cached)).toBe(6000);
+
+    const basis = await testEnv.DB.prepare('SELECT DISTINCT cache_basis FROM usage WHERE session_id = ?1')
+      .bind(AGY_PARENT_ID)
+      .all<{ cache_basis: string | null }>();
+    expect(basis.results).toEqual([{ cache_basis: 'disjoint' }]);
+
+    const compactFile = await testEnv.DB.prepare(
+      "SELECT parse_state, session_id FROM files WHERE machine_id = 'amet-windows' AND store = 'agy' AND relpath = ?1",
+    )
+      .bind(`brain/${AGY_PARENT_ID}/.system_generated/logs/transcript.jsonl`)
+      .first<{ parse_state: string; session_id: string | null }>();
+    expect(compactFile).toEqual({ parse_state: 'skipped', session_id: null });
+
+    const search = await SELF.fetch(`${API}/api/v1/search?q=agyneedle`, {
+      headers: { 'x-dev-machine': 'amet-windows' },
+    });
+    expect(search.status).toBe(200);
+    const searchBody = (await search.json()) as { hits: Array<{ session_id: string }> };
+    expect(searchBody.hits.some((hit) => hit.session_id === AGY_PARENT_ID)).toBe(true);
+
+    const listHtml = await (await SELF.fetch(`${VIEWER}/?harness=agy`)).text();
+    expect(listHtml).toContain(`<a href="/s/${AGY_PARENT_ID}">explore agyneedle opportunities</a>`);
+
+    const detailHtml = await (await SELF.fetch(`${VIEWER}/s/${AGY_PARENT_ID}`)).text();
+    expect(detailHtml).toContain('Here are the agyneedle findings.');
+    expect(detailHtml).toContain('agyneedle tool output');
+    expect(detailHtml).toContain(`/s/${AGY_CHILD_ID}`);
+  });
+
+  it('links agy subagent sessions and hydrates workspace cwd/project from subagent-meta', async () => {
+    const child = await testEnv.DB.prepare(
+      'SELECT harness, parent_session_id, is_sidechain, cwd, project_name, index_state FROM sessions WHERE session_id = ?1',
+    )
+      .bind(AGY_CHILD_ID)
+      .first<{
+        harness: string;
+        parent_session_id: string | null;
+        is_sidechain: number;
+        cwd: string | null;
+        project_name: string | null;
+        index_state: string;
+      }>();
+    expect(child).toMatchObject({
+      harness: 'agy',
+      parent_session_id: AGY_PARENT_ID,
+      is_sidechain: 1,
+      cwd: 'C:/src/entrepreneurship',
+      project_name: 'entrepreneurship',
+      index_state: 'ready',
+    });
+  });
+
+  it('indexes and renders Antigravity App Windows sessions', async () => {
+    const appRow = await testEnv.DB.prepare(
+      'SELECT harness, first_interaction_title, index_state FROM sessions WHERE session_id = ?1',
+    )
+      .bind(APP_SESSION_ID)
+      .first<{ harness: string; first_interaction_title: string | null; index_state: string }>();
+    expect(appRow).toMatchObject({
+      harness: 'antigravity',
+      first_interaction_title: 'remove appneedle glare from photo',
+      index_state: 'ready',
+    });
+
+    const listHtml = await (await SELF.fetch(`${VIEWER}/?harness=antigravity`)).text();
+    expect(listHtml).toContain(`<a href="/s/${APP_SESSION_ID}">remove appneedle glare from photo</a>`);
+
+    const detailHtml = await (await SELF.fetch(`${VIEWER}/s/${APP_SESSION_ID}`)).text();
+    expect(detailHtml).toContain('Generated appneedle image.');
   });
 });
 });

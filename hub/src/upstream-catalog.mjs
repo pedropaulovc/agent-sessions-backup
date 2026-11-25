@@ -113,7 +113,7 @@ export function lookupEntry(catalog, key) {
   return entry !== null && typeof entry === 'object' ? entry : undefined;
 }
 
-const PROVIDER_PREFIXES = ['anthropic', 'openai', 'deepseek'];
+const PROVIDER_PREFIXES = ['anthropic', 'openai', 'deepseek', 'gemini'];
 
 export function priceKeyCandidates(model) {
   const undated = undatedModel(model);

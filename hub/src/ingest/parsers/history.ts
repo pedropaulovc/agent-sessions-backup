@@ -50,7 +50,7 @@ export async function parsePromptLog(
       continue;
     }
 
-    session.cwd ??= str(o.project) ?? str(o.cwd);
+    session.cwd ??= str(o.project) ?? str(o.cwd) ?? str(o.workspace);
     const ts = normalizeTs(o.timestamp) ?? normalizeTs(o.time) ?? normalizeTs(o.created_at);
     if (ts) {
       if (!session.startedAt || ts < session.startedAt) session.startedAt = ts;

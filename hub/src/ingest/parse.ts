@@ -1,5 +1,6 @@
 import { jsonlLineLimit, readJsonlLines } from './jsonl';
 import type { Harness, NormalizedSession } from './normalize';
+import { parseAntigravity } from './parsers/antigravity';
 import { parseChatgptWeb } from './parsers/chatgpt-web';
 import { parseClaudeCode } from './parsers/claude-code';
 import { parseClaudeWeb } from './parsers/claude-web';
@@ -18,6 +19,8 @@ export const SINGLE_SESSION_HARNESSES: ReadonlySet<Harness> = new Set<Harness>([
   'claude-web',
   'prompt-log',
   'omp',
+  'agy',
+  'antigravity',
 ]);
 
 /** Web-capture conversations are one JSON document (no line structure) — read whole, never windowed. */
@@ -37,5 +40,6 @@ export async function parseObject(
   if (harness === 'codex') return parseCodex(lines, sessionId);
   if (harness === 'prompt-log') return parsePromptLog(lines, sessionId);
   if (harness === 'omp') return parseOmp(lines, sessionId);
+  if (harness === 'agy' || harness === 'antigravity') return parseAntigravity(lines, sessionId, harness);
   return parseClaudeCode(lines, sessionId);
 }

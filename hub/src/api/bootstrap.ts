@@ -20,12 +20,13 @@ export const DEFAULT_COLLECTOR_CONFIG = {
   // of truth; when the collector's is exported into the shared config, reference it here.
   max_upload_bytes: 90_000_000,
   // Store catalog for fleet and control-plane clients. The collector does not consult these
-  // booleans when building filesystem roots: ADDITIVE_DEFAULT_STORES ('omp', 'omp-skills') are
-  // re-added to persisted configs, WEBCAPTURE_STORES are setdefault-ed, and other roots come from
-  // the machine's local `stores` map. These keys MUST still be actual store names. Source of truth:
-  // collector/src/agent_collector/config.py — DEFAULT_STORES + WEBCAPTURE_STORES. Note the local
-  // Claude Code store key is 'claude' (the harness dir ~/.claude), NOT 'claude-code'.
-  // fleet-endpoints.test.ts asserts this catalog is a subset of those sets.
+  // booleans when building filesystem roots: ADDITIVE_DEFAULT_STORES ('omp', 'omp-skills', 'agy',
+  // 'antigravity') are re-added to persisted configs, WEBCAPTURE_STORES are setdefault-ed, and
+  // other roots come from the machine's local `stores` map. These keys MUST still be actual store
+  // names. Source of truth: collector/src/agent_collector/config.py — DEFAULT_STORES +
+  // WEBCAPTURE_STORES. Note the local Claude Code store key is 'claude' (the harness dir
+  // ~/.claude), NOT 'claude-code'. fleet-endpoints.test.ts asserts this catalog is a subset of
+  // those sets.
   store_toggles: {
     claude: true,
     codex: true,
@@ -34,6 +35,8 @@ export const DEFAULT_COLLECTOR_CONFIG = {
     'export-inbox': true,
     omp: true,
     'omp-skills': true,
+    agy: true,
+    antigravity: true,
   },
   redact_env: true,
 } as const;

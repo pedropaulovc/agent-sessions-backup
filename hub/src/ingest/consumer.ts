@@ -2,6 +2,7 @@ import { cacheBasisForHarness, type CacheBasis } from '../cache-basis';
 import { detect } from './detect';
 import type { NormalizedSession } from './normalize';
 import { SINGLE_SESSION_HARNESSES, parseObject } from './parse';
+import { workspaceUriToPath } from './parsers/antigravity';
 import { parseExportArchive } from './parsers/export-inbox';
 import { isFreshReservation, markPendingAndEnqueue, reservationCutoffIso } from '../queue';
 import { priceUsage, PRICING_WRITE_BATCH } from '../pricing-pass';
@@ -563,6 +564,16 @@ async function parseOne(job: ParseMessage, env: Env, attempt: ParseAttempt, budg
   if (det.kind === 'subagent') {
     const meta = await readSiblingMeta(file.r2_key, env);
     if (meta?.toolUseId) parsed.parentToolUseId = meta.toolUseId;
+  }
+  if ((det.harness === 'agy' || det.harness === 'antigravity') && parsed.parentSessionId && !parsed.cwd) {
+    const meta = await readAntigravitySubagentMeta(
+      file.machine_id,
+      file.store,
+      parsed.parentSessionId,
+      det.sessionId,
+      env,
+    );
+    if (meta?.cwd) parsed.cwd = meta.cwd;
   }
 
   // The parse queue runs with max_concurrency: 1 (wrangler.jsonc), so there's no other consumer
@@ -1772,6 +1783,38 @@ async function chooseRecoveryCandidate(
 async function linkSubagentMeta(file: FileRow, env: Env, budget: number): Promise<number> {
   const obj = await env.RAW.get(file.r2_key);
   if (!obj) return 0;
+  if (file.store === 'agy' || file.store === 'antigravity') {
+    let meta: { conversationId?: unknown; workspaceUris?: unknown };
+    try {
+      meta = (await obj.json()) as { conversationId?: unknown; workspaceUris?: unknown };
+    } catch {
+      return 0;
+    }
+    const parts = file.relpath.split('/');
+    const parentId = parts[1]?.toLowerCase();
+    const fileChildId = parts[4]?.replace(/\.json$/, '').toLowerCase();
+    const childId =
+      typeof meta.conversationId === 'string' && meta.conversationId.length > 0
+        ? meta.conversationId.toLowerCase()
+        : fileChildId;
+    if (!parentId || !childId || parentId === childId) return 0;
+    const rawUri = Array.isArray(meta.workspaceUris) && typeof meta.workspaceUris[0] === 'string'
+      ? meta.workspaceUris[0]
+      : undefined;
+    const cwd = rawUri ? workspaceUriToPath(rawUri) ?? null : null;
+    const projectName = deriveProjectName(cwd, null);
+    const updated = await env.DB.prepare(
+      `UPDATE sessions
+          SET parent_session_id = COALESCE(parent_session_id, ?2),
+              is_sidechain = 1,
+              cwd = COALESCE(cwd, ?3),
+              project_name = COALESCE(project_name, ?4)
+        WHERE session_id = ?1`,
+    )
+      .bind(childId, parentId, cwd, projectName)
+      .run();
+    return 1 + ((updated.meta.changes ?? 0) > 0 ? await syncCommittedCatalog(env, [childId], Math.max(0, budget - 1)) : 0);
+  }
   let meta: { toolUseId?: string; agentType?: string };
   try {
     meta = (await obj.json()) as { toolUseId?: string; agentType?: string };
@@ -1787,6 +1830,28 @@ async function linkSubagentMeta(file: FileRow, env: Env, budget: number): Promis
     return 1 + ((updated.meta.changes ?? 0) > 0 ? await syncCommittedCatalog(env, [agentId], Math.max(0, budget - 1)) : 0);
   }
   return 0;
+}
+
+async function readAntigravitySubagentMeta(
+  machineId: string,
+  store: string,
+  parentSessionId: string,
+  childSessionId: string,
+  env: Env,
+): Promise<{ cwd?: string } | null> {
+  const metaKey = `raw/${machineId}/${store}/brain/${parentSessionId}/.system_generated/subagents/${childSessionId}.json`;
+  const obj = await env.RAW.get(metaKey);
+  if (!obj) return null;
+  try {
+    const meta = (await obj.json()) as { workspaceUris?: unknown };
+    const rawUri = Array.isArray(meta.workspaceUris) && typeof meta.workspaceUris[0] === 'string'
+      ? meta.workspaceUris[0]
+      : undefined;
+    const cwd = rawUri ? workspaceUriToPath(rawUri) : undefined;
+    return cwd ? { cwd } : null;
+  } catch {
+    return null;
+  }
 }
 
 /** Read the .meta.json sibling of a subagent transcript's r2_key (agent-X.jsonl -> agent-X.meta.json), if present. */

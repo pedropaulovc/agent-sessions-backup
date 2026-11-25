@@ -64,6 +64,10 @@ export function detect(store: string, relpath: string, machineId?: string): Dete
 
   if (store === 'omp' && base.endsWith('.jsonl')) return detectOmp(parts);
 
+  if (store === 'agy' || store === 'antigravity') {
+    return detectAntigravity(store, relpath, parts, machineId);
+  }
+
   if (store === 'chatgpt-web' && base.endsWith('.json')) {
     return { harness: 'chatgpt-web', sessionId: base.slice(0, -'.json'.length), kind: 'session' };
   }
@@ -99,6 +103,45 @@ function detectOmp(parts: string[]): Detection {
   // timestamp convention still gets an identity and is parsed/validated by the hub.
   const stem = base.slice(0, -'.jsonl'.length);
   return { harness: 'omp', sessionId: stem, kind: 'session' };
+}
+
+function detectAntigravity(
+  store: 'agy' | 'antigravity',
+  relpath: string,
+  parts: string[],
+  machineId: string | undefined,
+): Detection {
+  const harness = store;
+  if (relpath === 'history.jsonl') return promptLog(store, machineId);
+  // Canonical full transcript: brain/<uuid>/.system_generated/logs/transcript_full.jsonl
+  // The compact sibling `transcript.jsonl` stays stored raw as 'other' so it never races
+  // canonical selection against the untruncated transcript.
+  if (
+    parts.length === 5 &&
+    parts[0] === 'brain' &&
+    UUID_RE.test(parts[1]!) &&
+    parts[2] === '.system_generated' &&
+    parts[3] === 'logs' &&
+    parts[4] === 'transcript_full.jsonl'
+  ) {
+    return { harness, sessionId: parts[1]!.toLowerCase(), kind: 'session' };
+  }
+  // Parent-side subagent descriptor: brain/<parent-uuid>/.system_generated/subagents/<child-uuid>.json
+  // Leaves sessionId undefined so it never competes in chooseCanonical against the child transcript.
+  if (
+    parts.length === 5 &&
+    parts[0] === 'brain' &&
+    UUID_RE.test(parts[1]!) &&
+    parts[2] === '.system_generated' &&
+    parts[3] === 'subagents' &&
+    parts[4]!.endsWith('.json')
+  ) {
+    const childId = parts[4]!.slice(0, -'.json'.length);
+    if (UUID_RE.test(childId)) {
+      return { harness, parentSessionId: parts[1]!.toLowerCase(), kind: 'subagent-meta' };
+    }
+  }
+  return { harness: 'unknown', kind: 'other' };
 }
 
 /**
