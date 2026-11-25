@@ -1,6 +1,7 @@
 ## Collector releases
 
 - Any collector behavior change MUST bump `collector/src/agent_collector/__init__.py` and update `hub/src/collector-version.ts` in the same change. The package version is derived from `__version__`, the heartbeat reports it, and installed collectors use it to distinguish feature builds.
+- After merging a collector version bump to `main`, upgrade both the WSL collector (`scripts/setup-linux-collector.sh`) and the Windows collector (`scripts/update-windows-collector.ps1`) so both machines run the newly published version.
 
 ## Developer workflow
 

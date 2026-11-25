@@ -492,6 +492,7 @@ test('current health followed by successful local seed still uploads exact fixtu
     `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${SYNTHETIC_EXPECTATIONS.store}/${SYNTHETIC_EXPECTATIONS.primaryRelpath}`,
     `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${SYNTHETIC_EXPECTATIONS.store}/${SYNTHETIC_EXPECTATIONS.pagerRelpath}`,
     `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${SYNTHETIC_EXPECTATIONS.skillStore}/${SYNTHETIC_EXPECTATIONS.skillRelpath}`,
+    `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${SYNTHETIC_EXPECTATIONS.memorySkillStore}/${SYNTHETIC_EXPECTATIONS.memorySkillRelpath}`,
     `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${SYNTHETIC_EXPECTATIONS.titleOnlyStore}/${SYNTHETIC_EXPECTATIONS.titleOnlyRelpath}`,
     ...SYNTHETIC_EXPECTATIONS.costFixtures.map((fixture) =>
       `/api/v1/files/${SYNTHETIC_EXPECTATIONS.machine}/${fixture.store}/${fixture.relpath}`),

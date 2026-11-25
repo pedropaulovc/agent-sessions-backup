@@ -90,6 +90,38 @@ def test_run_uploads_managed_skills_from_legacy_config(tmp_path, hub, tmp_env):
     assert stats["files_uploaded"] == 2
 
 
+def test_run_uploads_omp_memories_from_legacy_config(tmp_path, hub, tmp_env):
+    memories = tmp_env / "home" / ".omp" / "agent" / "memories" / "--home-user-src-demo--"
+    (memories / "skills" / "safe-reset" / "examples").mkdir(parents=True)
+    (memories / "MEMORY.md").write_bytes(b"# Memory\n")
+    (memories / "skills" / "safe-reset" / "SKILL.md").write_bytes(b"---\nname: safe-reset\n---\n")
+    (memories / "skills" / "safe-reset" / "examples" / "note.md").write_text("note")
+    claude = tmp_path / "claude"
+    path = config.config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f'machine_id = "m1"\nhub_url = "{hub.url}"\nauth = "dev"\n\n'
+        f'[stores]\nclaude = "{claude.as_posix()}"\n'
+    )
+
+    cfg = config.load(path)
+    with State(tmp_path / "state.db") as st:
+        assert run_mod._do_run(cfg, st) == 0
+
+    assert hub.files[("m1", "omp-memories", "--home-user-src-demo--/MEMORY.md")]["body"] == b"# Memory\n"
+    assert (
+        hub.files[("m1", "omp-memories", "--home-user-src-demo--/skills/safe-reset/SKILL.md")]["body"]
+        == b"---\nname: safe-reset\n---\n"
+    )
+    assert (
+        hub.files[("m1", "omp-memories", "--home-user-src-demo--/skills/safe-reset/examples/note.md")]["body"]
+        == b"note"
+    )
+    stats = hub.heartbeats[-1]["stores"]["omp-memories"]
+    assert stats["files_seen"] == 3
+    assert stats["files_uploaded"] == 3
+
+
 def test_heartbeat_only_writes_without_scanning(tmp_path, hub, tmp_env, monkeypatch, capsys):
     path = config.config_path()
     config.enroll(hub.url, dev=True, path=path, machine_id="m1")

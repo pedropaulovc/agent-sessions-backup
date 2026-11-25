@@ -938,11 +938,14 @@ async function seed() {
   const pager = await readFile(new URL('e2e-pager-session.jsonl', fixtureRoot));
   const asset = Buffer.from((await readFile(new URL('fixture-external.png.base64', fixtureRoot), 'utf8')).trim(), 'base64');
   const skill = await readFile(new URL('e2e-managed-skill.md', fixtureRoot));
+  const memorySkill = await readFile(new URL('e2e-memory-skill.md', fixtureRoot));
   const {
     costFixtures,
     externalDigest,
     externalRelpath,
     machine,
+    memorySkillRelpath,
+    memorySkillStore,
     pagerRelpath,
     pagerSearchPhrase,
     pagerSessionId,
@@ -974,6 +977,7 @@ async function seed() {
     [store, primaryRelpath, primary],
     [store, pagerRelpath, pager],
     [skillStore, skillRelpath, skill],
+    [memorySkillStore, memorySkillRelpath, memorySkill],
     [titleOnlyStore, titleOnlyRelpath, titleOnly],
     // The cost fan-out, parent first: OMP subagent identity comes from the sidecar's path under
     // the parent's directory, so the parent row must exist before its children are parsed.
