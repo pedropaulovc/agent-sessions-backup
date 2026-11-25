@@ -1,6 +1,46 @@
+from pathlib import Path
+import sqlite3
+
 import pytest
 
 from fake_hub import FakeHub
+
+
+class _FastTestConnection(sqlite3.Connection):
+    """Disable fsync and WAL checkpoint churn on test State databases while preserving locking/rollback."""
+
+    def execute(self, sql, parameters=()):
+        if isinstance(sql, str):
+            upper = sql.strip().upper()
+            if upper == "PRAGMA JOURNAL_MODE = WAL":
+                super().execute("PRAGMA synchronous = OFF")
+                return super().execute("PRAGMA journal_mode = MEMORY")
+            if upper == "PRAGMA SYNCHRONOUS = NORMAL":
+                return super().execute("PRAGMA synchronous = OFF")
+        return super().execute(sql, parameters)
+
+
+@pytest.fixture(autouse=True)
+def fast_test_sqlite(monkeypatch):
+    real_connect = sqlite3.connect
+
+    def _connect(*args, **kwargs):
+        is_uri = bool(kwargs.get("uri"))
+        db_arg = args[0] if args else kwargs.get("database")
+        is_new_file = (
+            not is_uri
+            and db_arg is not None
+            and str(db_arg) != ":memory:"
+            and not Path(db_arg).exists()
+        )
+        if "factory" not in kwargs and not is_uri:
+            kwargs["factory"] = _FastTestConnection
+        conn = real_connect(*args, **kwargs)
+        if is_new_file and isinstance(conn, _FastTestConnection):
+            conn.execute("PRAGMA synchronous = OFF")
+        return conn
+
+    monkeypatch.setattr(sqlite3, "connect", _connect)
 
 
 @pytest.fixture(autouse=True)

@@ -192,6 +192,7 @@ async function runController(command, scenario = {}) {
         if (binding.database_id !== options['database-id'] || binding.migrations_dir !== options['migrations-dir']
           || config.account_id !== ${JSON.stringify(PREVIEW_ACCOUNT_ID)}) throw new Error('invalid native schema identity');
         const database = new DatabaseSync(path.join(${JSON.stringify(sqliteDirectory)}, binding.database_id + '.sqlite'));
+        database.exec('PRAGMA synchronous = OFF');
         for (const migration of manifest.migrations) database.exec(readFileSync(path.join(options['migrations-dir'], migration.filename), 'utf8'));
         database.close();
       }
@@ -206,6 +207,21 @@ async function runController(command, scenario = {}) {
       import { createHash } from 'node:crypto';
       import { DatabaseSync } from 'node:sqlite';
       import { INDEX_LAYOUT } from ${JSON.stringify(layoutModule)};
+      let now = 0;
+      let nextTimerId = 1;
+      const cancelledTimers = new Set();
+      Date.now = () => now;
+      globalThis.setTimeout = (callback, delay = 0, ...args) => {
+        const id = nextTimerId++;
+        const ms = Math.max(0, Number(delay) || 0);
+        queueMicrotask(() => {
+          if (cancelledTimers.delete(id)) return;
+          now += ms;
+          callback(...args);
+        });
+        return id;
+      };
+      globalThis.clearTimeout = (id) => { cancelledTimers.add(id); };
       ${plainRows.toString()}
       ${textEvidence.toString()}
       const scenario = ${JSON.stringify(scenario)};
@@ -300,6 +316,7 @@ async function runController(command, scenario = {}) {
             let native = probeDatabases.get(id);
             if (!native) {
               native = new DatabaseSync(${native} ? ${JSON.stringify(sqliteDirectory)} + '/' + id + '.sqlite' : ':memory:');
+              if (${native}) native.exec('PRAGMA synchronous = OFF');
               if (!${native}) native.exec("CREATE TABLE unrelated_user_table (value TEXT NOT NULL); INSERT INTO unrelated_user_table VALUES ('untouched')");
               probeDatabases.set(id, native);
             }

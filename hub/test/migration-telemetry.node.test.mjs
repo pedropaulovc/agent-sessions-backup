@@ -505,7 +505,8 @@ test('authorization failures drop without replay and never reveal response or ex
   assert.doesNotMatch(JSON.stringify(warnings), /private exception/);
 });
 
-test('hung network and throwing diagnostics cannot hang close or mask the caller error', async () => {
+test('hung network and throwing diagnostics cannot hang close or mask the caller error', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   const entered = deferred();
   const sink = await createMigrationTelemetry({ env, getAccessToken: async () => 'private-token',
     warn() { throw new Error('diagnostic failure'); }, fetch(_url, options) {
@@ -517,7 +518,18 @@ test('hung network and throwing diagnostics cannot hang close or mask the caller
   await entered.promise;
   const started = Date.now();
   const primary = new Error('primary migration failure');
-  await assert.rejects(async () => { try { throw primary; } finally { await sink.close(); } }, (error) => error === primary);
+  let closeStarted = false;
+  const failing = (async () => {
+    try { throw primary; }
+    finally {
+      closeStarted = true;
+      await sink.close();
+    }
+  })();
+  await immediate();
+  assert.equal(closeStarted, true);
+  t.mock.timers.tick(1000);
+  await assert.rejects(failing, (error) => error === primary);
   assert.ok(Date.now() - started < 1800, 'close is bounded independently of network');
   sink.emit(progress({ acknowledgedRows: 1 }));
 });
@@ -593,7 +605,8 @@ test('close accounts in-flight and all pending records once and remains terminal
   }
 });
 
-test('close is a quiescent diagnostics boundary even when authentication or ingestion ignores abort', async () => {
+test('close is a quiescent diagnostics boundary even when authentication or ingestion ignores abort', async (t) => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
   for (const stage of ['github', 'entra', 'ingest']) {
     for (const outcome of ['resolve', 'reject']) {
       const entered = deferred();
@@ -622,6 +635,7 @@ test('close is a quiescent diagnostics boundary even when authentication or inge
       // its earlier total deadline rather than only the per-request timeout.
       const closing = sink.close();
       await entered.promise;
+      t.mock.timers.tick(1000);
       await closing;
       const diagnosticsAtClose = JSON.stringify(warnings);
       const requestsAtClose = requests.length;
@@ -631,6 +645,8 @@ test('close is a quiescent diagnostics boundary even when authentication or inge
         : stage === 'entra' ? Response.json({ access_token: 'private-token', expires_in: 3600 })
           : new Response(null, { status: 204 }));
       await immediate();
+      await immediate();
+      t.mock.timers.tick(5000);
       await immediate();
       sink.emit(progress({ acknowledgedRows: 100 }));
       await sink.close();

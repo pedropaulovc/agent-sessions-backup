@@ -308,7 +308,7 @@ def test_snapshot_bounded_when_source_locked(tmp_path):
     holder.execute("BEGIN EXCLUSIVE")
     try:
         start = time.monotonic()
-        outcome = _snapshot_sqlite(db, tmp_path / "snap.sqlite", deadline_s=0.5)
+        outcome = _snapshot_sqlite(db, tmp_path / "snap.sqlite", deadline_s=0.15)
         elapsed = time.monotonic() - start
     finally:
         holder.execute("ROLLBACK")
@@ -468,7 +468,7 @@ def test_locked_db_skipped_with_event_garbage_db_raw_captured(tmp_path):
     garbage.write_bytes(b"just text, not sqlite")
 
     scanner = Scanner([])
-    scanner.snapshot_deadline_s = 0.3  # short deadline so the locked DB aborts fast
+    scanner.snapshot_deadline_s = 0.15  # short deadline so the locked DB aborts fast
     try:
         items = {it.relpath: it for it in scanner.scan_store("claude", root)}
     finally:

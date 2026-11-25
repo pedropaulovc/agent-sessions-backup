@@ -49,7 +49,9 @@ class FakeHub:
         hub = self
         handler = _make_handler(hub)
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
-        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever, kwargs={"poll_interval": 0.005}, daemon=True,
+        )
         self._thread.start()
         return self
 

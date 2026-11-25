@@ -1,14 +1,15 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { accessSync, constants as fsConstants } from 'node:fs';
+import { copyFile, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { isDeepStrictEqual } from 'node:util';
-import test from 'node:test';
+import test, { after } from 'node:test';
 import {
   ACTIVATION_CHECKPOINT, COPY_CHECKPOINT, COPY_ENCODING, COPY_PAGE_BYTES, READY_CHECKPOINT, SEED_CHECKPOINT, SOURCE_FREEZE_TABLE,
   assertActivationProof, assertMaintenanceHealth, assertReadyProof, buildActivationProof, buildReadyProof, canonicalRow,
@@ -159,7 +160,7 @@ class SqliteD1 {
     this.filename = filename;
     this.trace = trace;
     this.database = new DatabaseSync(filename);
-    this.database.exec('PRAGMA foreign_keys = ON');
+    this.database.exec('PRAGMA synchronous = OFF; PRAGMA foreign_keys = ON');
     this.atomicBatch = true;
     this.beforeQuery = null;
     this.beforeStatement = null;
@@ -231,36 +232,94 @@ class SqliteD1 {
   }
 }
 
-async function migrations(directory) {
-  const names = (await readdir(directory)).filter((name) => /^\d{4}_.+\.sql$/.test(name)).sort();
-  return Promise.all(names.map(async (name) => ({
-    sequence: Number(name.slice(0, 4)), sql: await readFile(path.join(directory, name), 'utf8'),
-  })));
+const migrationCache = new Map();
+function migrations(directory) {
+  if (!migrationCache.has(directory)) {
+    migrationCache.set(directory, (async () => {
+      const names = (await readdir(directory)).filter((name) => /^\d{4}_.+\.sql$/.test(name)).sort();
+      return Promise.all(names.map(async (name) => ({
+        sequence: Number(name.slice(0, 4)), sql: await readFile(path.join(directory, name), 'utf8'),
+      })));
+    })());
+  }
+  return migrationCache.get(directory);
+}
+
+const fastTmpRoot = (() => {
+  if (process.platform !== 'linux') return tmpdir();
+  try {
+    accessSync('/dev/shm', fsConstants.W_OK);
+    return '/dev/shm';
+  } catch {
+    return tmpdir();
+  }
+})();
+
+let sqliteTemplatePromise = null;
+function sqliteTemplates() {
+  if (!sqliteTemplatePromise) {
+    sqliteTemplatePromise = (async () => {
+      const directory = await mkdtemp(path.join(fastTmpRoot, 'index-migration-templates-'));
+      const mainMigrations = await migrations(path.join(hubRoot, 'migrations'));
+      const indexMigrations = await migrations(path.join(hubRoot, 'migrations-index'));
+      const mainPath = path.join(directory, 'main-v34.sqlite');
+      const shardBasePath = path.join(directory, 'shard-base.sqlite');
+      const shard0Path = path.join(directory, 'shard-00.sqlite');
+      const shard1Path = path.join(directory, 'shard-01.sqlite');
+      const mainDb = new DatabaseSync(mainPath);
+      mainDb.exec('PRAGMA synchronous = OFF; PRAGMA foreign_keys = ON');
+      // Reconstruct the actual legacy schema, not a shortened synthetic blocks table. The new main
+      // migrations drop legacy blocks and create the catalog outbox only AFTER the verified copy.
+      for (const migration of mainMigrations.filter(({ sequence }) => sequence <= 34)) {
+        mainDb.exec(migration.sql);
+      }
+      mainDb.close();
+      const shardBaseDb = new DatabaseSync(shardBasePath);
+      shardBaseDb.exec('PRAGMA synchronous = OFF; PRAGMA foreign_keys = ON');
+      for (const migration of indexMigrations) shardBaseDb.exec(migration.sql);
+      shardBaseDb.close();
+      await Promise.all([copyFile(shardBasePath, shard0Path), copyFile(shardBasePath, shard1Path)]);
+      const initTrace = [];
+      const defaultShards = [
+        new SqliteD1('template-00', shard0Path, initTrace),
+        new SqliteD1('template-01', shard1Path, initTrace),
+      ];
+      await initializeShardLayouts(defaultShards);
+      for (const db of defaultShards) db.close();
+      return { directory, mainPath, shardBasePath, shard0Path, shard1Path, mainMigrations };
+    })();
+  }
+  return sqliteTemplatePromise;
 }
 
 async function fixture(context, { identities = ['main-database', 'index-database-00', 'index-database-01'] } = {}) {
-  const directory = await mkdtemp(path.join(tmpdir(), 'index-migration-test-'));
+  const templates = await sqliteTemplates();
+  const directory = await mkdtemp(path.join(fastTmpRoot, 'index-migration-test-'));
   const trace = [];
   const filenames = identities.map((id) => path.join(directory, `${id}.sqlite`));
+  if (identities.length === 3) {
+    await Promise.all([
+      copyFile(templates.mainPath, filenames[0]),
+      copyFile(templates.shard0Path, filenames[1]),
+      copyFile(templates.shard1Path, filenames[2]),
+    ]);
+  } else {
+    await Promise.all([
+      copyFile(templates.mainPath, filenames[0]),
+      ...filenames.slice(1).map((filename) => copyFile(templates.shardBasePath, filename)),
+    ]);
+  }
   let adapters = identities.map((id, index) => new SqliteD1(id, filenames[index], trace));
-  const mainMigrations = await migrations(path.join(hubRoot, 'migrations'));
-  const indexMigrations = await migrations(path.join(hubRoot, 'migrations-index'));
-  // Reconstruct the actual legacy schema, not a shortened synthetic blocks table. The new main
-  // migrations drop legacy blocks and create the catalog outbox only AFTER the verified copy.
-  for (const migration of mainMigrations.filter(({ sequence }) => sequence <= 34)) {
-    adapters[0].database.exec(migration.sql);
+  if (identities.length !== 3) {
+    await initializeShardLayouts(adapters.slice(1));
   }
-  for (const shard of adapters.slice(1)) {
-    for (const migration of indexMigrations) shard.database.exec(migration.sql);
-  }
-  await initializeShardLayouts(adapters.slice(1));
   trace.length = 0;
   const result = {
     trace,
     get source() { return adapters[0]; },
     get shards() { return adapters.slice(1); },
     async migrateMain() {
-      for (const migration of mainMigrations.filter(({ sequence }) => sequence > 34)) {
+      for (const migration of templates.mainMigrations.filter(({ sequence }) => sequence > 34)) {
         adapters[0].database.exec(migration.sql);
       }
     },
@@ -331,29 +390,93 @@ class WorkerdD1 {
   }
 }
 
-async function workerdFixture(context) {
+const WORKERD_IDENTITIES = Object.freeze({
+  DB: 'workerd-copy-source', IDX00: 'workerd-copy-index-00', IDX01: 'workerd-copy-index-01',
+});
+let sharedWorkerdPromise = null;
+
+async function createWorkerdInstance() {
   const { Miniflare } = await import('miniflare');
   const { unstable_splitSqlQuery: splitSqlQuery } = await import('wrangler');
-  const identities = { DB: 'workerd-copy-source', IDX00: 'workerd-copy-index-00', IDX01: 'workerd-copy-index-01' };
+  const persistDir = await mkdtemp(path.join(fastTmpRoot, 'index-migration-workerd-'));
   const native = new Miniflare({
     modules: true,
     script: 'export default { fetch() { return new Response("index-copy-test"); } };',
     compatibilityDate: '2026-07-17',
-    d1Databases: identities,
+    d1Databases: WORKERD_IDENTITIES,
+    d1Persist: persistDir,
   });
-  // Register disposal before setup so failures cannot leave the native process running.
-  context.after(() => native.dispose());
-  const trace = [];
-  const adapters = await Promise.all(Object.entries(identities).map(async ([binding, id]) =>
-    new WorkerdD1(id, await native.getD1Database(binding), trace)));
+  const databases = await Promise.all(Object.entries(WORKERD_IDENTITIES).map(async ([binding, id]) => ({
+    id, database: await native.getD1Database(binding),
+  })));
   const indexMigrations = await migrations(path.join(hubRoot, 'migrations-index'));
   // Like the isolated native-copy control, use the actual index schema for its
   // source as well as both shards; its blocks layout/tokenizer is the legacy layout.
-  for (const adapter of adapters) {
+  for (const { database } of databases) {
     for (const migration of indexMigrations) {
-      await adapter.batch(splitSqlQuery(migration.sql).map((sql) => ({ sql, params: [] })));
+      await database.batch(splitSqlQuery(migration.sql).map((sql) => database.prepare(sql)));
     }
   }
+  return {
+    native,
+    databases,
+    async dispose() {
+      try { await native.dispose(); }
+      finally { await rm(persistDir, { recursive: true, force: true }); }
+    },
+  };
+}
+
+async function resetWorkerdDatabase(database) {
+  const dynamicObjects = (await database.prepare(
+    `SELECT type, name FROM sqlite_master
+      WHERE (type = 'trigger' AND name LIKE 'index_migration_blocks_%')
+         OR (type = 'table' AND (name = ? OR name LIKE '__index_batch_probe_%'))`,
+  ).bind(SOURCE_FREEZE_TABLE).all()).results;
+  const statements = [];
+  for (const { type, name } of dynamicObjects) {
+    statements.push(database.prepare(`DROP ${type === 'trigger' ? 'TRIGGER' : 'TABLE'} IF EXISTS ${quoted(name)}`));
+  }
+  for (const sql of [
+    'DELETE FROM blocks',
+    "INSERT INTO blocks_fts (blocks_fts) VALUES ('delete-all')",
+    'DELETE FROM index_migration_state',
+    'DELETE FROM shard_meta',
+    'DELETE FROM sessions',
+    'DELETE FROM starred_turns',
+    'DELETE FROM catalog_versions',
+    'DELETE FROM index_write_versions',
+    'DELETE FROM migration_checksum_ledger',
+    "INSERT INTO session_titles_fts (session_titles_fts) VALUES ('rebuild')",
+  ]) {
+    statements.push(database.prepare(sql));
+  }
+  await database.batch(statements);
+}
+
+after(async () => {
+  if (sharedWorkerdPromise) {
+    const instance = await sharedWorkerdPromise.catch(() => null);
+    if (instance) await instance.dispose();
+  }
+  if (sqliteTemplatePromise) {
+    const templates = await sqliteTemplatePromise.catch(() => null);
+    if (templates) await rm(templates.directory, { recursive: true, force: true });
+  }
+});
+
+async function workerdFixture(context, { isolated = false } = {}) {
+  let instance;
+  if (isolated) {
+    instance = await createWorkerdInstance();
+    context.after(() => instance.dispose());
+  } else {
+    if (!sharedWorkerdPromise) sharedWorkerdPromise = createWorkerdInstance();
+    instance = await sharedWorkerdPromise;
+    await Promise.all(instance.databases.map(({ database }) => resetWorkerdDatabase(database)));
+  }
+  const trace = [];
+  const adapters = instance.databases.map(({ id, database }) => new WorkerdD1(id, database, trace));
   const [source, ...shards] = adapters;
   await initializeShardLayouts(shards);
   trace.length = 0;
@@ -4538,7 +4661,7 @@ test('retirement failure diagnostics preserve the native error and source checkp
 test('retirement aggregate preserves exact storage classes and mixed storage byte flags on native adapters', async (context) => {
   for (const backend of ['sqlite', 'workerd']) {
     await context.test(backend, async (child) => {
-      const f = backend === 'sqlite' ? await fixture(child) : await workerdFixture(child);
+      const f = backend === 'sqlite' ? await fixture(child) : await workerdFixture(child, { isolated: true });
       const added = [['public_untyped', 'ANY'], ['public_text', 'TEXT'], ['public_integer', 'INTEGER']];
       const columns = [...BLOCK_COLUMNS, ...added.map(([name]) => name)];
       for (const db of [f.source, ...f.shards]) for (const [name, affinity] of added) {
@@ -7313,7 +7436,7 @@ for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerd
   });
 
   test(`byte-exact ${backend} REAL transport expansion preserves logical checkpoints and atomic multi-group source CAS`, async (context) => {
-    const f = await createFixture(context);
+    const f = await createFixture(context, { isolated: true });
     for (const db of [f.source, ...f.shards]) {
       const sql = 'ALTER TABLE blocks ADD COLUMN future_real REAL';
       if (db instanceof SqliteD1) db.database.exec(sql);
@@ -7437,7 +7560,7 @@ for (const [backend, createFixture] of [['SQLite', fixture], ['workerd', workerd
   });
 
   test(`byte-exact ${backend} copier preserves short and sliced malformed TEXT in every scalar text column and exact FTS`, async (context) => {
-    const f = await createFixture(context);
+    const f = await createFixture(context, { isolated: true });
     for (const db of [f.source, ...f.shards]) {
       const changes = ['ALTER TABLE blocks ADD COLUMN public_extra TEXT', 'ALTER TABLE blocks ADD COLUMN public_any ANY'];
       if (db instanceof SqliteD1) for (const sql of changes) db.database.exec(sql);
